@@ -6,7 +6,7 @@
 #![cfg(unix)]
 
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -19,11 +19,15 @@ use headless_boot::{Instance, boot_session, client_command, ctl, ctl_ok, field};
 /// `claude` (`exec -a`), from the instance's scratch home.
 const STANDIN: &str = "#!/bin/sh\n\
     case \"$1\" in --version) echo '2.1.0 (Claude Code)'; exit 0 ;; esac\n\
+    printf 'owned worker stand-in\\n' > \"$HOME/worker-standin-ran\"\n\
     exec /bin/bash -c 'exec -a claude /bin/sh \"$HOME/fake.sh\" \"$HOME/screens\"'\n";
 
 /// Fake raw-mode Claude worker: transitions `ready` -> `landed` (on LAND Enter,
 /// word-wrapping the submitted prompt under `❯ ` so `answered_prompt` matches) ->
-/// `box` (on follow-up Enter) -> `back` (on Esc).
+/// `box` (on follow-up Enter: Claude Code's working frame, the prompt in the
+/// transcript over an empty composer, which `turn` reads as taken; the box once the
+/// test leaves the `held` cue ([`held_cue`]), drawn by a poll that ends with the fake,
+/// so the input loop never blocks) -> `back` (on Esc).
 const FAKE: &str = r#"#!/bin/sh
 dir="$1"
 stty raw -echo
@@ -43,7 +47,11 @@ enter() {
       printf '%s\n' "$buf" | fold -s -w 96 | awk 'NR>1{printf "  %s\r\n",$0;next}{printf "\342\235\257 %s\r\n",$0}'
       printf '\r\n'; cat "$dir/defense.top"; } > "$dir/landed.top"
     at=landed; buf=""; screen "$dir/landed.top" ""
-  else at=box; buf=""; draw box; fi
+  else
+    at=box; buf=""; draw working
+    ( while [ ! -e "$dir/held" ] && kill -0 $$ 2>/dev/null; do sleep 0.1; done
+      [ -e "$dir/held" ] && draw box ) &
+  fi
 }
 feed() {
   rest="$1"
@@ -107,18 +115,34 @@ const DEFENSE: [&str; 2] = [
 ];
 const FOLLOW_UP: &str = "go on with the docs";
 
+/// The stand-in's home in an instance's scratch `tmp` (its `$HOME`).
+fn home(tmp: &Path) -> PathBuf {
+    tmp.join("home")
+}
+
+/// The stand-in's screens under `home` (`$HOME/screens`, the fake's `$dir`).
+fn screens(home: &Path) -> PathBuf {
+    home.join("screens")
+}
+
+/// The file whose presence tells the fake, holding its working frame, to draw the box.
+fn held_cue(tmp: &Path) -> PathBuf {
+    screens(&home(tmp)).join("held")
+}
+
 fn write_worker(home: &Path) {
-    let dir = home.join("screens");
+    let dir = screens(home);
     std::fs::create_dir_all(&dir).expect("the screens' folder");
     std::fs::write(home.join("fake.sh"), FAKE).expect("the fake");
     let top = |rows: &[&str]| rows.iter().map(|r| format!("{r}\r\n")).collect::<String>();
     std::fs::write(dir.join("ready.top"), top(&TASK_TURN)).expect("ready");
     std::fs::write(dir.join("defense.top"), top(&DEFENSE)).expect("the defense");
     std::fs::write(dir.join("rule"), "─".repeat(COLUMNS)).expect("the rule");
+    let asked = format!("❯ {FOLLOW_UP}");
     let mut held: Vec<String> = TASK_TURN.iter().map(|r| (*r).to_string()).collect();
     held.extend(
         [
-            &format!("❯ {FOLLOW_UP}"),
+            asked.as_str(),
             "",
             "We're changing auto mode to no longer charge for classifier requests in Claude Code.",
             "However, this session isn't eligible because your requests go through 127.0.0.1:4000,",
@@ -133,15 +157,20 @@ fn write_worker(home: &Path) {
     );
     let at = held.len() - 1;
     std::fs::write(dir.join("box.scr"), render(&held, (at, 0))).expect("box");
-    let mut back: Vec<&str> = TASK_TURN.to_vec();
-    let asked = format!("❯ {FOLLOW_UP}");
-    back.extend([asked.as_str(), "", "⏺ Wrote the docs.", ""]);
-    let (back, caret) = composed(&back);
-    std::fs::write(dir.join("back.scr"), render(&back, (caret, 2))).expect("back");
+    // The task's turn, the follow-up asked, then `said` over Claude Code's empty composer.
+    let answered = |said: &str| {
+        let mut rows: Vec<&str> = TASK_TURN.to_vec();
+        rows.extend([asked.as_str(), "", said, ""]);
+        let (rows, caret) = composed(&rows);
+        render(&rows, (caret, 2))
+    };
+    let working = answered("✻ Cooking… (1s · ↓ 12 tokens · esc to interrupt)");
+    std::fs::write(dir.join("working.scr"), working).expect("working");
+    std::fs::write(dir.join("back.scr"), answered("⏺ Wrote the docs.")).expect("back");
 }
 
 /// One headless instance whose harness supervises its workers, the held
-/// deadline `held_ms`, the stand-in first on its PATH.
+/// deadline `held_ms`, the stand-in first on its PATH and excluded from worker auto-install.
 #[track_caller]
 fn boot(tag: &str, held_ms: &str) -> Instance {
     headless_boot::boot_with(
@@ -151,6 +180,10 @@ fn boot(tag: &str, held_ms: &str) -> Instance {
             let base = std::fs::read_to_string(&cfg).expect("the isolation config");
             assert!(base.contains(launch_isolation::HARNESS_OFF), "{base}");
             let base = base.replace(launch_isolation::HARNESS_OFF, "");
+            // A worker can install its missing CLI even with background package updates off.
+            // This fixture runs its own fake, never a vendor Claude downloaded at admission.
+            assert!(base.contains("[packages]\n"), "the isolation package table");
+            let base = base.replacen("[packages]\n", "[packages]\nexclude = [\"claude\"]\n", 1);
             std::fs::write(
                 &cfg,
                 format!("{base}[harness]\nrelaunch = false\nupgrade = false\n"),
@@ -158,7 +191,7 @@ fn boot(tag: &str, held_ms: &str) -> Instance {
             .expect("write the config");
             let bin = tmp.join("bin");
             headless_boot::standin(&bin.join("claude"), STANDIN);
-            write_worker(&tmp.join("home"));
+            write_worker(&home(tmp));
             std::fs::create_dir_all(tmp.join("work")).expect("the worker's folder");
             cmd.env("SHELL", "/bin/zsh")
                 .env(
@@ -257,7 +290,14 @@ fn a_worker_held_at_a_screen_no_rule_knows_is_stalled_and_its_manager_answered()
 
     let done = await_task(&inst, &format!("@{worker}:0"), &worker);
     assert_eq!(field(&done, "state"), Some("done"), "{done}");
+    assert_eq!(
+        std::fs::read_to_string(home(&inst.tmp).join("worker-standin-ran"))
+            .expect("the owned worker stand-in actually ran"),
+        "owned worker stand-in\n"
+    );
 
+    // The submit must show: a one-minute hang detector, not the verb's 2 s window.
+    let window = HANG_MS.replacen("timeout=", "submit_window=", 1);
     let turn = ctl(
         &inst,
         &[
@@ -265,6 +305,8 @@ fn a_worker_held_at_a_screen_no_rule_knows_is_stalled_and_its_manager_answered()
             "turn",
             "typed=1",
             "settle=submitted",
+            &window,
+            HANG_MS,
             FOLLOW_UP,
         ],
     );
@@ -280,6 +322,8 @@ fn a_worker_held_at_a_screen_no_rule_knows_is_stalled_and_its_manager_answered()
         .unwrap_or_else(|| panic!("a worker's verdict: {said}"));
     assert_eq!(field(verdict, "submitted"), Some("1"), "{verdict}");
     let found = field(verdict, "task_rev").expect("task_rev=").to_string();
+    // The follow-up was taken; now the stand-in holds the worker at the box.
+    std::fs::write(held_cue(&inst.tmp), "").expect("the box's cue");
 
     let unknown = ctl(
         &inst,

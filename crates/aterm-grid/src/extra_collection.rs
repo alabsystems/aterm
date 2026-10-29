@@ -5,6 +5,7 @@
 //! Cell extras collection: HashMap-backed storage for grid-wide extras (the per-cell type is [`crate::extra::CellExtra`]).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use aterm_hash::FxHashMap;
 
@@ -49,20 +50,20 @@ impl ComplexCharRing {
         (self.ring_row(row) as usize) * (self.stride as usize) + (col as usize)
     }
 
-    /// The complex char codepoint at (row, col); `None` if `col >= stride`.
+    /// The complex char codepoint at (row, col); `None` if `row >= visible_rows` or `col >= stride`.
     #[inline]
     pub(crate) fn get(&self, row: u16, col: u16) -> Option<char> {
-        if col >= self.stride {
+        if row >= self.visible_rows || col >= self.stride {
             return None;
         }
         let idx = self.index(row, col);
         self.entries.get(idx).copied().filter(|&c| c != '\0')
     }
 
-    /// Store a complex char codepoint at (row, col); no-op if `col >= stride` (stale dimensions after resize).
+    /// Store a complex char codepoint at (row, col); no-op if `row >= visible_rows` or `col >= stride` (stale dimensions after resize).
     #[inline]
     pub(crate) fn set(&mut self, row: u16, col: u16, value: char) {
-        if col >= self.stride {
+        if row >= self.visible_rows || col >= self.stride {
             return;
         }
         let idx = self.index(row, col);
@@ -75,7 +76,7 @@ impl ComplexCharRing {
     #[inline]
     #[cfg(test)]
     pub(crate) fn set_wide_run(&mut self, row: u16, start_col: u16, chars: &[char]) {
-        if chars.is_empty() || start_col >= self.stride {
+        if chars.is_empty() || row >= self.visible_rows || start_col >= self.stride {
             return;
         }
         let base = (self.ring_row(row) as usize) * (self.stride as usize);
@@ -99,6 +100,14 @@ impl ComplexCharRing {
         }
     }
 
+    /// Clear complex-char entries for a range of rows via `clear_row`.
+    #[inline]
+    pub(crate) fn clear_rows(&mut self, rows: core::ops::Range<u16>) {
+        for row in rows {
+            self.clear_row(row);
+        }
+    }
+
     /// Clear a rectangular `[rows] x [cols]` region, so a rect overwrite (e.g. DECCRA) cannot read the prior destination codepoint from this ring.
     pub(crate) fn clear_rect(&mut self, rows: core::ops::Range<u16>, cols: core::ops::Range<u16>) {
         for row in rows {
@@ -118,7 +127,7 @@ impl ComplexCharRing {
 
     /// Column shift right (ICH) on one row.
     pub(crate) fn shift_cols_right(&mut self, row: u16, start_col: u16, count: u16, max_col: u16) {
-        if count == 0 {
+        if count == 0 || row >= self.visible_rows {
             return;
         }
         let hi = max_col.min(self.stride);
@@ -131,7 +140,7 @@ impl ComplexCharRing {
 
     /// Column shift left (DCH) on one row.
     pub(crate) fn shift_cols_left(&mut self, row: u16, start_col: u16, count: u16, max_col: u16) {
-        if count == 0 {
+        if count == 0 || row >= self.visible_rows {
             return;
         }
         let hi = max_col.min(self.stride);
@@ -167,6 +176,9 @@ impl RingSpans for ComplexCharRing {
     /// Clear a single external row's entries.
     #[inline]
     fn clear_row(&mut self, row: u16) {
+        if row >= self.visible_rows {
+            return;
+        }
         let stride = self.stride as usize;
         let start = (self.ring_row(row) as usize) * stride;
         let end = start + stride;
@@ -188,6 +200,9 @@ impl RingSpans for ComplexCharRing {
     /// `fill`.
     #[inline]
     fn clear_range(&mut self, row: u16, left: u16, right_excl: u16) {
+        if row >= self.visible_rows {
+            return;
+        }
         let end = right_excl.min(self.stride);
         if left >= end {
             return;
@@ -270,10 +285,10 @@ impl RgbColorRing {
         (self.ring_row(row) as usize) * (self.stride as usize) + (col as usize)
     }
 
-    /// Read `plane`'s RGB at (row, col); `None` if `col >= stride`.
+    /// Read `plane`'s RGB at (row, col); `None` if `row >= visible_rows` or `col >= stride`.
     #[inline]
     fn read(&self, plane: Option<&[u32]>, row: u16, col: u16) -> Option<[u8; 3]> {
-        if col >= self.stride {
+        if row >= self.visible_rows || col >= self.stride {
             return None;
         }
         let packed = *plane?.get(self.index(row, col))?;
@@ -292,11 +307,11 @@ impl RgbColorRing {
         self.read(self.bg.as_deref(), row, col)
     }
 
-    /// Store fg RGB at (row, col); no-op if `col >= stride`.
+    /// Store fg RGB at (row, col); no-op if `row >= visible_rows` or `col >= stride`.
     #[cfg(test)]
     #[inline]
     pub(crate) fn set_fg(&mut self, row: u16, col: u16, rgb: [u8; 3]) {
-        if col >= self.stride {
+        if row >= self.visible_rows || col >= self.stride {
             return;
         }
         let idx = self.index(row, col);
@@ -310,7 +325,7 @@ impl RgbColorRing {
     #[cfg(test)]
     #[inline]
     pub(crate) fn set_bg(&mut self, row: u16, col: u16, rgb: [u8; 3]) {
-        if col >= self.stride {
+        if row >= self.visible_rows || col >= self.stride {
             return;
         }
         let idx = self.index(row, col);
@@ -338,6 +353,9 @@ impl RgbColorRing {
         fg: Option<[u8; 3]>,
         bg: Option<[u8; 3]>,
     ) {
+        if row >= self.visible_rows {
+            return;
+        }
         let end = col_end.min(self.stride);
         if col_start >= end {
             return;
@@ -385,7 +403,7 @@ impl RgbColorRing {
 
     /// Column shift right (ICH) on one row.
     pub(crate) fn shift_cols_right(&mut self, row: u16, start_col: u16, count: u16, max_col: u16) {
-        if count == 0 {
+        if count == 0 || row >= self.visible_rows {
             return;
         }
         let hi = max_col.min(self.stride);
@@ -403,7 +421,7 @@ impl RgbColorRing {
 
     /// Column shift left (DCH) on one row.
     pub(crate) fn shift_cols_left(&mut self, row: u16, start_col: u16, count: u16, max_col: u16) {
-        if count == 0 {
+        if count == 0 || row >= self.visible_rows {
             return;
         }
         let hi = max_col.min(self.stride);
@@ -449,6 +467,9 @@ impl RingSpans for RgbColorRing {
     /// Clear one external row's entries.
     #[inline]
     fn clear_row(&mut self, row: u16) {
+        if row >= self.visible_rows {
+            return;
+        }
         let ring_row = self.ring_row(row);
         let stride = self.stride as usize;
         let start = (ring_row as usize) * stride;
@@ -484,6 +505,9 @@ impl RingSpans for RgbColorRing {
     /// not keep ring RGB that would shadow their default colors.
     #[inline]
     fn clear_range(&mut self, row: u16, start_col: u16, end_col: u16) {
+        if row >= self.visible_rows {
+            return;
+        }
         let end = end_col.min(self.stride);
         if start_col >= end {
             return;
@@ -514,22 +538,18 @@ trait RingSpans {
 
     fn clear_row(&mut self, row: u16);
 
-    /// Map an external row to its ring index.
+    /// Map an external row `< visible_rows` to its ring index.
     #[inline(always)]
     fn ring_row(&self, external_row: u16) -> u16 {
-        let r = external_row.wrapping_add(self.ring_offset());
-        if r >= self.visible_rows() {
-            r - self.visible_rows()
-        } else {
-            r
-        }
+        let v = u32::from(self.visible_rows());
+        let r = u32::from(external_row) + u32::from(self.ring_offset());
+        let wrapped = if r >= v { r - v } else { r };
+        u16::try_from(wrapped).unwrap_or(0)
     }
 
     fn scroll_up(&mut self, n: u16) {
         // Over-scroll: when the whole visible area (or more) scrolls off, the
-        // ring is fully recycled and the offset resets to 0. `ring_row` only
-        // normalizes inputs < 2*visible_rows, so a huge `n` (e.g. `CSI 65535 S`)
-        // would otherwise leave `ring_offset >= visible_rows`.
+        // ring is fully recycled and the offset resets to 0.
         if n >= self.visible_rows() {
             self.clear();
             return;
@@ -546,9 +566,11 @@ trait RingSpans {
     fn clear_range(&mut self, row: u16, left: u16, right_excl: u16);
 
     fn shift_rect_up(&mut self, top: u16, bottom: u16, left: u16, right: u16, n: u16) {
-        if n == 0 || top > bottom || left > right {
+        let v = self.visible_rows();
+        if n == 0 || v == 0 || top >= v || top > bottom || left > right {
             return;
         }
+        let bottom = bottom.min(v - 1);
         let n = n.min(bottom - top + 1);
         if let Some(shift_start) = top.checked_add(n) {
             let mut dst = top;
@@ -565,9 +587,11 @@ trait RingSpans {
     }
 
     fn shift_rect_down(&mut self, top: u16, bottom: u16, left: u16, right: u16, n: u16) {
-        if n == 0 || top > bottom || left > right {
+        let v = self.visible_rows();
+        if n == 0 || v == 0 || top >= v || top > bottom || left > right {
             return;
         }
+        let bottom = bottom.min(v - 1);
         let n = n.min(bottom - top + 1);
         let mut src = bottom + 1 - n;
         while src > top {
@@ -676,6 +700,75 @@ impl<'a> CellRenderData<'a> {
     }
 }
 
+/// Cached upper bound on internal `coord.row` across [`CellExtras::data`] so
+/// [`CellExtras::is_empty`] and [`CellExtras::len`] stay O(1) across O(1)
+/// `row_offset` scrolls without walking scrolled-off entries.
+#[derive(Debug, Default)]
+pub(crate) struct MaxRowCache(AtomicU32);
+
+impl Clone for MaxRowCache {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self(AtomicU32::new(self.0.load(Ordering::Relaxed)))
+    }
+}
+
+impl MaxRowCache {
+    const EMPTY: u32 = 0;
+    const EXACT_BIT: u32 = 1 << 16;
+    const UPPER_BIT: u32 = 2 << 16;
+    const ROW_MASK: u32 = 0xFFFF;
+
+    #[inline(always)]
+    pub(crate) const fn new() -> Self {
+        Self(AtomicU32::new(Self::EMPTY))
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_empty(&self) {
+        self.0.store(Self::EMPTY, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_exact(&self, row: u16) {
+        self.0
+            .store(Self::EXACT_BIT | u32::from(row), Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_exact_opt(&self, max_row: Option<u16>) {
+        match max_row {
+            Some(row) => self.set_exact(row),
+            None => self.set_empty(),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn on_insert(&self, row: u16, was_empty: bool) {
+        if was_empty {
+            self.set_exact(row);
+            return;
+        }
+        let raw = self.0.load(Ordering::Relaxed);
+        if raw == Self::EMPTY || u32::from(row) >= (raw & Self::ROW_MASK) {
+            self.set_exact(row);
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn on_remove(&self, removed_row: u16, now_empty: bool) {
+        if now_empty {
+            self.set_empty();
+            return;
+        }
+        let raw = self.0.load(Ordering::Relaxed);
+        if (raw & Self::EXACT_BIT) != 0 && (raw & Self::ROW_MASK) == u32::from(removed_row) {
+            self.0
+                .store(Self::UPPER_BIT | u32::from(removed_row), Ordering::Relaxed);
+        }
+    }
+}
+
 /// Storage for cell extras across the grid.
 #[derive(Debug, Clone, Default)]
 pub struct CellExtras {
@@ -683,6 +776,8 @@ pub struct CellExtras {
     pub(crate) data: FxHashMap<CellCoord, CellExtra>,
     /// Accumulated row offset for O(1) full-screen scroll.
     row_offset: u16,
+    /// Cached upper bound on internal `coord.row` across `data`.
+    pub(crate) max_row_cache: MaxRowCache,
     /// Dense ring for non-BMP complex chars, allocated on first non-BMP write.
     complex_ring: Option<Box<ComplexCharRing>>,
     /// Dense ring for cells whose only extra is fg/bg RGB, allocated on first
@@ -729,6 +824,7 @@ impl CellExtras {
         Self {
             data: FxHashMap::default(),
             row_offset: 0,
+            max_row_cache: MaxRowCache::new(),
             complex_ring: None,
             rgb_ring: None,
             hyperlink_scratch: Vec::new(),
@@ -783,7 +879,7 @@ impl CellExtras {
         let ring = self
             .complex_ring
             .get_or_insert_with(|| Box::new(ComplexCharRing::new(visible_rows, cols)));
-        if start_col >= ring.stride {
+        if row >= ring.visible_rows || start_col >= ring.stride {
             return;
         }
         let base = (ring.ring_row(row) as usize) * (ring.stride as usize);
@@ -796,6 +892,14 @@ impl CellExtras {
         }
     }
 
+    /// Clear the dense complex-char ring entries for a `width`-cell span starting at `(row, col)`, if a ring exists.
+    #[inline]
+    pub(crate) fn clear_complex_ring_cell(&mut self, row: u16, col: u16, width: u16) {
+        if let Some(ring) = &mut self.complex_ring {
+            ring.clear_range(row, col, col.saturating_add(width));
+        }
+    }
+
     /// Look up a complex char codepoint in the ring first, then the map.
     #[inline]
     pub fn complex_codepoint_for(&self, row: u16, col: u16) -> Option<char> {
@@ -804,8 +908,9 @@ impl CellExtras {
         {
             return Some(c);
         }
+        let coord = self.internal_coord_checked(CellCoord::new(row, col))?;
         self.data
-            .get(&self.internal_coord(CellCoord::new(row, col)))
+            .get(&coord)
             .and_then(|e| e.complex_char())
             .and_then(|s| s.chars().next())
     }
@@ -813,9 +918,8 @@ impl CellExtras {
     /// Look up a complex char as `Arc<str>` in the map.
     #[inline]
     pub fn complex_char_arc_for(&self, row: u16, col: u16) -> Option<&Arc<str>> {
-        self.data
-            .get(&self.internal_coord(CellCoord::new(row, col)))
-            .and_then(|e| e.complex_char())
+        let coord = self.internal_coord_checked(CellCoord::new(row, col))?;
+        self.data.get(&coord).and_then(|e| e.complex_char())
     }
 
     /// Append a complex char's full text to `out` from the ring or map.
@@ -826,11 +930,10 @@ impl CellExtras {
             out.push(c);
             return true;
         }
-        match self
-            .data
-            .get(&self.internal_coord(CellCoord::new(row, col)))
-            .and_then(|e| e.complex_char())
-        {
+        let Some(coord) = self.internal_coord_checked(CellCoord::new(row, col)) else {
+            return false;
+        };
+        match self.data.get(&coord).and_then(|e| e.complex_char()) {
             Some(s) => {
                 out.push_str(s);
                 true
@@ -876,9 +979,8 @@ impl CellExtras {
         {
             return Some(rgb);
         }
-        self.data
-            .get(&self.internal_coord(CellCoord::new(row, col)))
-            .and_then(|e| e.fg_rgb())
+        let coord = self.internal_coord_checked(CellCoord::new(row, col))?;
+        self.data.get(&coord).and_then(|e| e.fg_rgb())
     }
 
     /// Look up background RGB in the ring buffer first, then the map.
@@ -889,9 +991,8 @@ impl CellExtras {
         {
             return Some(rgb);
         }
-        self.data
-            .get(&self.internal_coord(CellCoord::new(row, col)))
-            .and_then(|e| e.bg_rgb())
+        let coord = self.internal_coord_checked(CellCoord::new(row, col))?;
+        self.data.get(&coord).and_then(|e| e.bg_rgb())
     }
 
     /// Read all render-relevant extras for a cell in one pass.
@@ -929,7 +1030,9 @@ impl CellExtras {
             return data;
         }
 
-        let coord = self.internal_coord(CellCoord::new(row, col));
+        let Some(coord) = self.internal_coord_checked(CellCoord::new(row, col)) else {
+            return data;
+        };
         let extra = self.data.get(&coord);
 
         if wants_extra {
@@ -951,30 +1054,63 @@ impl CellExtras {
         data
     }
 
-    /// Translate an external row to the internal HashMap key row.
+    /// Translate an external row to the internal HashMap key row, returning `None` if `row + row_offset` overflows `u16::MAX`.
     #[inline(always)]
-    pub(crate) const fn internal_row(&self, row: u16) -> u16 {
-        row.wrapping_add(self.row_offset)
+    pub(crate) const fn internal_row_checked(&self, row: u16) -> Option<u16> {
+        row.checked_add(self.row_offset)
     }
 
-    /// Translate an external coordinate to the internal HashMap key.
+    /// Translate an external coordinate to the internal HashMap key, returning `None` if `coord.row + row_offset` overflows `u16::MAX`.
     #[inline(always)]
-    const fn internal_coord(&self, coord: CellCoord) -> CellCoord {
-        CellCoord::new(self.internal_row(coord.row), coord.col)
+    const fn internal_coord_checked(&self, coord: CellCoord) -> Option<CellCoord> {
+        match self.internal_row_checked(coord.row) {
+            Some(row) => Some(CellCoord::new(row, coord.col)),
+            None => None,
+        }
     }
 
-    /// Returns `true` when the map holds no entry.
+    /// Translate an external row for a map insertion, compacting `row_offset` first if `row + row_offset` would overflow `u16::MAX`.
+    #[inline]
+    fn internal_row_for_write(&mut self, row: u16) -> u16 {
+        if let Some(r) = row.checked_add(self.row_offset) {
+            r
+        } else {
+            self.compact();
+            row
+        }
+    }
+
+    /// Returns `true` when the map holds no non-stale entry (`len() == 0`).
     #[must_use]
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        if self.data.is_empty() {
+            return true;
+        }
+        if self.row_offset == 0 {
+            return false;
+        }
+        let raw = self.max_row_cache.0.load(Ordering::Relaxed);
+        if raw == MaxRowCache::EMPTY {
+            return true;
+        }
+        let cached_row = u16::try_from(raw & MaxRowCache::ROW_MASK).unwrap_or(u16::MAX);
+        if cached_row < self.row_offset {
+            return true;
+        }
+        if (raw & MaxRowCache::EXACT_BIT) != 0 {
+            return false;
+        }
+        let exact = self.data.keys().map(|c| c.row).max();
+        self.max_row_cache.set_exact_opt(exact);
+        exact.is_none_or(|row| row < self.row_offset)
     }
 
     /// Returns `true` when any storage layer holds data.
     #[must_use]
     #[inline]
     pub fn has_any_data(&self) -> bool {
-        !self.data.is_empty() || self.complex_ring.is_some() || self.rgb_ring.is_some()
+        !self.is_empty() || self.complex_ring.is_some() || self.rgb_ring.is_some()
     }
 
     /// Iterate over all non-stale `(coord, extra)` pairs in external coordinates.
@@ -993,10 +1129,12 @@ impl CellExtras {
     /// Whether the map may hold an entry on external row `row`.
     #[must_use]
     pub(crate) fn map_may_have_row(&self, row: u16, scan_budget: usize) -> bool {
+        let Some(key) = self.internal_row_checked(row) else {
+            return false;
+        };
         if self.data.len() > scan_budget {
             return true;
         }
-        let key = self.internal_row(row);
         self.data.keys().any(|coord| coord.row == key)
     }
 
@@ -1004,13 +1142,17 @@ impl CellExtras {
     #[must_use]
     #[inline]
     pub fn get(&self, coord: CellCoord) -> Option<&CellExtra> {
-        self.data.get(&self.internal_coord(coord))
+        let key = self.internal_coord_checked(coord)?;
+        self.data.get(&key)
     }
 
     /// Get mutable extras for a cell, creating an entry if needed.
     #[inline]
     pub fn get_or_create(&mut self, coord: CellCoord) -> &mut CellExtra {
-        let key = self.internal_coord(coord);
+        let internal_row = self.internal_row_for_write(coord.row);
+        let key = CellCoord::new(internal_row, coord.col);
+        let was_empty = self.data.is_empty();
+        self.max_row_cache.on_insert(internal_row, was_empty);
         let bound = &mut self.hyperlink_upper_bound;
         let extra = self.data.entry(key).or_default();
         if extra.hyperlink().is_none() {
@@ -1022,7 +1164,10 @@ impl CellExtras {
     /// Return a fresh entry for `coord`, replacing any existing entry.
     #[inline]
     pub fn fresh(&mut self, coord: CellCoord) -> &mut CellExtra {
-        let key = self.internal_coord(coord);
+        let internal_row = self.internal_row_for_write(coord.row);
+        let key = CellCoord::new(internal_row, coord.col);
+        let was_empty = self.data.is_empty();
+        self.max_row_cache.on_insert(internal_row, was_empty);
         let bound = &mut self.hyperlink_upper_bound;
         let (extra, had_link) = fresh_slot(&mut self.data, key);
         if had_link {
@@ -1056,8 +1201,10 @@ impl CellExtras {
     /// Set extras for a cell, removing the entry when `extra` has no data.
     #[inline]
     pub fn set(&mut self, coord: CellCoord, extra: CellExtra) {
-        let internal = self.internal_coord(coord);
         if extra.has_data() {
+            let internal_row = self.internal_row_for_write(coord.row);
+            let internal = CellCoord::new(internal_row, coord.col);
+            let was_empty = self.data.is_empty();
             // Charge only for a value that carries a link: reflow and DECCRA's
             // rect copy also store link-free extras here.
             if extra.hyperlink().is_some() {
@@ -1067,27 +1214,36 @@ impl CellExtras {
                 self.any_image = true;
             }
             self.data.insert(internal, extra);
-        } else {
-            self.data.remove(&internal);
+            self.max_row_cache.on_insert(internal_row, was_empty);
+        } else if let Some(internal) = self.internal_coord_checked(coord)
+            && self.data.remove(&internal).is_some()
+        {
+            self.max_row_cache
+                .on_remove(internal.row, self.data.is_empty());
         }
     }
 
     /// Remove extras for a single cell; `true` if an entry was removed.
     #[inline]
     pub(crate) fn remove(&mut self, coord: CellCoord) -> bool {
-        let key = self.internal_coord(coord);
+        let Some(key) = self.internal_coord_checked(coord) else {
+            return false;
+        };
         let Some(extra) = self.data.remove(&key) else {
             return false;
         };
         if extra.hyperlink().is_some() {
             self.hyperlink_upper_bound = self.hyperlink_upper_bound.saturating_sub(1);
         }
+        self.max_row_cache.on_remove(key.row, self.data.is_empty());
         true
     }
 
     /// Strip what a cell without HAS_EXTRAS cannot own from its entry ([`CellExtra::retain_overflow_colors`]): everything but truecolor fg/bg bytes, which a BCE blank owns through its RGB marker.
     pub(crate) fn strip_unclaimed(&mut self, coord: CellCoord) {
-        let key = self.internal_coord(coord);
+        let Some(key) = self.internal_coord_checked(coord) else {
+            return;
+        };
         let Some(extra) = self.data.get_mut(&key) else {
             return;
         };
@@ -1101,12 +1257,16 @@ impl CellExtras {
         } else if extra.has_data() {
             return;
         }
-        self.data.remove(&key);
+        if self.data.remove(&key).is_some() {
+            self.max_row_cache.on_remove(key.row, self.data.is_empty());
+        }
     }
 
     /// Strip a cell's combining marks and complex-char string, keeping SGR colors and every other overflow field (DECSERA's selective wipe).
     pub(crate) fn scrub_char_marks(&mut self, row: u16, col: u16) -> bool {
-        let coord = self.internal_coord(CellCoord::new(row, col));
+        let Some(coord) = self.internal_coord_checked(CellCoord::new(row, col)) else {
+            return false;
+        };
         let Some(extra) = self.data.get_mut(&coord) else {
             return false;
         };
@@ -1114,50 +1274,86 @@ impl CellExtras {
         !extra.has_data()
     }
 
-    /// Clear extras for a single row (cleared or scrolled off), including the RGB ring.
+    /// Clear extras for a single row (cleared or scrolled off), including both rings.
     pub(crate) fn clear_row(&mut self, row: u16) {
-        // The RGB ring first: RGB-only writes bypass the map, so it may hold
-        // data even when the map is empty.
+        // Rings first: ring-only writes bypass the map, so they may hold data
+        // even when the map is empty.
         if let Some(ring) = &mut self.rgb_ring {
+            ring.clear_row(row);
+        }
+        if let Some(ring) = &mut self.complex_ring {
             ring.clear_row(row);
         }
         if self.data.is_empty() {
             return;
         }
+        let Some(internal_row) = self.internal_row_checked(row) else {
+            return;
+        };
         #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_clear_ops(self.data.len());
-        let internal_row = self.internal_row(row);
-        self.data.retain(|coord, _| coord.row != internal_row);
+        let mut max_row: Option<u16> = None;
+        self.data.retain(|coord, _| {
+            let keep = coord.row != internal_row;
+            if keep {
+                max_row = Some(max_row.map_or(coord.row, |m| m.max(coord.row)));
+            }
+            keep
+        });
+        self.max_row_cache.set_exact_opt(max_row);
         self.maybe_shrink();
     }
 
-    /// Clear extras for a range of columns in a row, including the RGB ring.
+    /// Clear extras for a range of columns in a row, including both rings.
     pub fn clear_range(&mut self, row: u16, start_col: u16, end_col: u16) {
         if let Some(ring) = &mut self.rgb_ring {
+            ring.clear_range(row, start_col, end_col);
+        }
+        if let Some(ring) = &mut self.complex_ring {
             ring.clear_range(row, start_col, end_col);
         }
         if self.data.is_empty() {
             return;
         }
+        let Some(internal_row) = self.internal_row_checked(row) else {
+            return;
+        };
         #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_clear_ops(self.data.len());
-        let internal_row = self.internal_row(row);
         let width = usize::from(end_col.saturating_sub(start_col));
         if width.saturating_mul(2) <= self.data.len() {
+            let mut removed_any = false;
             for col in start_col..end_col {
-                self.data.remove(&CellCoord::new(internal_row, col));
+                removed_any |= self
+                    .data
+                    .remove(&CellCoord::new(internal_row, col))
+                    .is_some();
+            }
+            if removed_any {
+                self.max_row_cache
+                    .on_remove(internal_row, self.data.is_empty());
             }
         } else {
+            let mut max_row: Option<u16> = None;
             self.data.retain(|coord, _| {
-                !(coord.row == internal_row && coord.col >= start_col && coord.col < end_col)
+                let keep =
+                    !(coord.row == internal_row && coord.col >= start_col && coord.col < end_col);
+                if keep {
+                    max_row = Some(max_row.map_or(coord.row, |m| m.max(coord.row)));
+                }
+                keep
             });
+            self.max_row_cache.set_exact_opt(max_row);
         }
         self.maybe_shrink();
     }
 
-    /// Clear extras for a range of rows in a single pass, including the RGB ring.
+    /// Clear extras for a range of rows in a single pass, including both rings.
     pub(crate) fn clear_rows(&mut self, rows: core::ops::Range<u16>) {
         if let Some(ring) = &mut self.rgb_ring {
+            ring.clear_rows(rows.clone());
+        }
+        if let Some(ring) = &mut self.complex_ring {
             ring.clear_rows(rows.clone());
         }
         if rows.is_empty() || self.data.is_empty() {
@@ -1166,10 +1362,15 @@ impl CellExtras {
         #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_clear_ops(self.data.len());
         let offset = self.row_offset;
+        let mut max_row: Option<u16> = None;
         self.data.retain(|coord, _| {
-            let external = coord.row.wrapping_sub(offset);
-            !rows.contains(&external)
+            let keep = coord.row >= offset && !rows.contains(&(coord.row - offset));
+            if keep {
+                max_row = Some(max_row.map_or(coord.row, |m| m.max(coord.row)));
+            }
+            keep
         });
+        self.max_row_cache.set_exact_opt(max_row);
         self.maybe_shrink();
     }
 
@@ -1187,66 +1388,43 @@ impl CellExtras {
         #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_clear_ops(self.data.len());
         let offset = self.row_offset;
+        let mut max_row: Option<u16> = None;
         self.data.retain(|coord, _| {
-            let external_row = coord.row.wrapping_sub(offset);
-            !(rows.contains(&external_row) && cols.contains(&coord.col))
+            let keep = coord.row >= offset
+                && !(rows.contains(&(coord.row - offset)) && cols.contains(&coord.col));
+            if keep {
+                max_row = Some(max_row.map_or(coord.row, |m| m.max(coord.row)));
+            }
+            keep
         });
+        self.max_row_cache.set_exact_opt(max_row);
         self.maybe_shrink();
     }
 
-    /// Shift rows up by `n` starting at `start_row`.
-    pub fn shift_rows_up_by(&mut self, start_row: u16, n: u16) {
+    /// Scroll every row up by `n` (a full-screen scroll).
+    pub fn shift_rows_up_by(&mut self, n: u16) {
+        if n == 0 {
+            return;
+        }
         if let Some(ring) = &mut self.complex_ring {
-            if start_row == 0 {
-                ring.scroll_up(n);
-            } else {
-                ring.clear();
-            }
+            ring.scroll_up(n);
         }
         if let Some(ring) = &mut self.rgb_ring {
-            if start_row == 0 {
-                ring.scroll_up(n);
-            } else {
-                ring.clear();
-            }
+            ring.scroll_up(n);
         }
-        if n == 0 || self.data.is_empty() {
+        if self.data.is_empty() {
             return;
         }
-        if start_row == 0 {
-            // O(1) fast path for full-screen scroll.
-            if let Some(new_offset) = self.row_offset.checked_add(n)
-                && new_offset < COMPACT_THRESHOLD
-            {
-                #[cfg(any(test, debug_assertions))]
-                crate::test_counters::count_extras_shift_ops(0);
-                self.row_offset = new_offset;
-                return;
-            }
-            self.apply_offset_and_shift(n);
+        // O(1) fast path: fold the scroll into the pending row offset.
+        if let Some(new_offset) = self.row_offset.checked_add(n)
+            && new_offset < COMPACT_THRESHOLD
+        {
+            #[cfg(any(test, debug_assertions))]
+            crate::test_counters::count_extras_shift_ops(0);
+            self.row_offset = new_offset;
             return;
         }
-        self.compact();
-        #[cfg(any(test, debug_assertions))]
-        crate::test_counters::count_extras_shift_ops(self.data.len());
-        let shift_start = start_row.checked_add(n);
-        let mut new_data =
-            FxHashMap::with_capacity_and_hasher(self.data.len(), aterm_hash::FxBuildHasher);
-        for (coord, extra) in self.data.drain() {
-            if coord.row < start_row {
-                new_data.insert(coord, extra);
-                continue;
-            }
-            if let Some(shift_start) = shift_start
-                && coord.row >= shift_start
-            {
-                new_data.insert(
-                    CellCoord::new(coord.row.saturating_sub(n), coord.col),
-                    extra,
-                );
-            }
-        }
-        self.data = new_data;
+        self.apply_offset_and_shift(n);
     }
 
     /// Set the same extras on a contiguous column range of one row (an RGB-styled ASCII run) in one pass; RGB-only extras go to the dense ring.
@@ -1288,7 +1466,8 @@ impl CellExtras {
             })
         });
 
-        let internal_row = self.internal_row(row);
+        let internal_row = self.internal_row_for_write(row);
+        let was_empty = self.data.is_empty();
         let mut replaced_links = 0usize;
         for col in col_start..col_end {
             let coord = CellCoord::new(internal_row, col);
@@ -1310,6 +1489,7 @@ impl CellExtras {
                 extra.set_hyperlink_data(Some(Arc::clone(data)));
             }
         }
+        self.max_row_cache.on_insert(internal_row, was_empty);
 
         self.hyperlink_upper_bound = self.hyperlink_upper_bound.saturating_sub(replaced_links);
         if vals.hyperlink.is_some() {
@@ -1323,6 +1503,7 @@ impl CellExtras {
     pub fn clear(&mut self) {
         self.data = FxHashMap::default();
         self.row_offset = 0;
+        self.max_row_cache.set_empty();
         self.hyperlink_upper_bound = 0;
         self.any_image = false;
         if let Some(ring) = &mut self.complex_ring {
@@ -1464,6 +1645,7 @@ impl CellExtras {
             None => {
                 self.data.clear();
                 self.row_offset = 0;
+                self.max_row_cache.set_empty();
                 return;
             }
         };
@@ -1471,13 +1653,17 @@ impl CellExtras {
         crate::test_counters::count_extras_shift_ops(self.data.len());
         let mut new_data =
             FxHashMap::with_capacity_and_hasher(self.data.len(), aterm_hash::FxBuildHasher);
+        let mut max_row: Option<u16> = None;
         for (coord, extra) in self.data.drain() {
             if coord.row >= total {
-                new_data.insert(CellCoord::new(coord.row - total, coord.col), extra);
+                let new_row = coord.row - total;
+                max_row = Some(max_row.map_or(new_row, |m| m.max(new_row)));
+                new_data.insert(CellCoord::new(new_row, coord.col), extra);
             }
         }
         self.data = new_data;
         self.row_offset = 0;
+        self.max_row_cache.set_exact_opt(max_row);
     }
 
     /// Shrink the map after retain-style removals when capacity exceeds 4x len (and 64, to avoid thrashing small maps).
@@ -1512,6 +1698,8 @@ impl CellExtras {
     pub fn len(&self) -> usize {
         if self.row_offset == 0 {
             self.data.len()
+        } else if self.is_empty() {
+            0
         } else {
             self.data
                 .keys()
@@ -1545,7 +1733,15 @@ impl CellExtras {
             return;
         }
         self.compact();
-        self.data.retain(|coord, _| coord.row < max_row);
+        let mut kept_max: Option<u16> = None;
+        self.data.retain(|coord, _| {
+            let keep = coord.row < max_row;
+            if keep {
+                kept_max = Some(kept_max.map_or(coord.row, |m| m.max(coord.row)));
+            }
+            keep
+        });
+        self.max_row_cache.set_exact_opt(kept_max);
         self.maybe_shrink();
     }
 
@@ -1555,7 +1751,15 @@ impl CellExtras {
             return;
         }
         self.compact();
-        self.data.retain(|coord, _| coord.col < max_col);
+        let mut kept_max: Option<u16> = None;
+        self.data.retain(|coord, _| {
+            let keep = coord.col < max_col;
+            if keep {
+                kept_max = Some(kept_max.map_or(coord.row, |m| m.max(coord.row)));
+            }
+            keep
+        });
+        self.max_row_cache.set_exact_opt(kept_max);
         self.maybe_shrink();
     }
 
@@ -1563,7 +1767,9 @@ impl CellExtras {
     #[must_use]
     #[cfg(test)]
     pub fn row_has_hyperlinks(&self, row: u16) -> bool {
-        let internal_row = self.internal_row(row);
+        let Some(internal_row) = self.internal_row_checked(row) else {
+            return false;
+        };
         self.data
             .iter()
             .any(|(coord, extra)| coord.row == internal_row && extra.hyperlink().is_some())
@@ -1627,8 +1833,9 @@ impl CellExtras {
             for &coord in &coords[..to_evict] {
                 if let Some(extra) = self.data.get_mut(&coord) {
                     extra.set_hyperlink(None);
-                    if !extra.has_data() {
-                        self.data.remove(&coord);
+                    if !extra.has_data() && self.data.remove(&coord).is_some() {
+                        self.max_row_cache
+                            .on_remove(coord.row, self.data.is_empty());
                     }
                 }
             }
@@ -1768,8 +1975,16 @@ mod tests {
                         4,
                         10,
                     );
+                    let emoji = char::from_u32(0x1F600 + u32::from(r) * 16 + u32::from(c))
+                        .expect("valid emoji");
+                    extras.set_complex_char_ring(r, c, emoji, 4, 10);
                 }
                 clear(&mut extras);
+                assert_eq!(
+                    extras.is_empty(),
+                    usize::eq(&extras.len(), &0),
+                    "{name} (dense {dense}): is_empty vs len"
+                );
                 for &(r, c) in &cells {
                     let kept = !cleared(r, c);
                     let map = extras.get(CellCoord::new(r, c)).and_then(CellExtra::fg_rgb);
@@ -1782,7 +1997,13 @@ mod tests {
                     assert_eq!(
                         ring.is_some(),
                         kept,
-                        "{name} (dense {dense}): ring ({r}, {c})"
+                        "{name} (dense {dense}): rgb_ring ({r}, {c})"
+                    );
+                    let complex = extras.complex_codepoint_for(r, c);
+                    assert_eq!(
+                        complex.is_some(),
+                        kept,
+                        "{name} (dense {dense}): complex_ring ({r}, {c})"
                     );
                 }
             }
@@ -1838,6 +2059,9 @@ mod tests {
     #[test]
     fn clear_range_matches_per_cell_clear() {
         fn clear_range_per_cell(ring: &mut RgbColorRing, row: u16, start_col: u16, end_col: u16) {
+            if row >= ring.visible_rows {
+                return;
+            }
             for col in start_col..end_col {
                 if col >= ring.stride {
                     break;
@@ -1864,7 +2088,9 @@ mod tests {
             (4, 10, 3, 6, 20, 0),
             (4, 10, 0, 10, 12, 0),
             (4, 10, 0, 12, 15, 0),
+            (4, 10, 5, 2, 5, 0),
             (4, 10, 9, 2, 5, 0),
+            (4, 10, u16::MAX, 0, 10, 2),
             (4, 10, 1, 0, 10, 2),
             (4, 10, 3, 2, 8, 3),
             (24, 8, 23, 0, 8, 0),
@@ -1904,6 +2130,9 @@ mod tests {
     #[test]
     fn complex_clear_range_matches_per_cell_clear() {
         fn clear_range_per_cell(ring: &mut ComplexCharRing, row: u16, left: u16, right_excl: u16) {
+            if row >= ring.visible_rows {
+                return;
+            }
             let base = (ring.ring_row(row) as usize) * (ring.stride as usize);
             for col in left..right_excl.min(ring.stride) {
                 let idx = base + col as usize;
@@ -1920,7 +2149,9 @@ mod tests {
             (4, 10, 2, 7, 3, 0),
             (4, 10, 3, 6, 20, 0),
             (4, 10, 0, 10, 12, 0),
+            (4, 10, 5, 2, 5, 0),
             (4, 10, 9, 2, 5, 0),
+            (4, 10, u16::MAX, 0, 10, 2),
             (4, 10, 1, 0, 10, 2),
             (24, 8, 23, 0, 8, 0),
         ];

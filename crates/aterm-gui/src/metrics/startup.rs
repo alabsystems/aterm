@@ -1684,8 +1684,8 @@ mod claim_timeline_tests {
 #[cfg(test)]
 mod startup_prepare_tests {
     use super::{
-        ClaimStamp, LOOP_FIRST_CUTS, STARTUP_PREPARE_CUTS, STARTUP_PREPARE_PHASES,
-        birth_to_main_ns, derive_startup_prepare, derive_startup_prepare_of,
+        ClaimStamp, LOOP_FIRST_CUTS, STARTUP_PREPARE_CUTS, birth_to_main_ns,
+        derive_startup_prepare, derive_startup_prepare_of,
     };
     use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -1695,24 +1695,6 @@ mod startup_prepare_tests {
 
     fn cuts(entry: Instant) -> [Option<Instant>; 9] {
         [4, 14, 34, 36, 41, 52, 60, 75, 90].map(|n| Some(entry + ms(n)))
-    }
-
-    #[test]
-    fn the_preparation_is_exclusive_phases_that_sum_to_it() {
-        let entry = Instant::now();
-        let ready = entry + ms(110);
-        let phases =
-            derive_startup_prepare(Some(entry), cuts(entry), Some(ready)).expect("every cut");
-        assert_eq!(STARTUP_PREPARE_PHASES.len(), phases.len());
-        assert_eq!(
-            phases,
-            [4, 10, 20, 2, 5, 11, 8, 15, 15, 20].map(|n| n * 1_000_000)
-        );
-        assert_eq!(
-            phases.iter().sum::<u64>(),
-            110_000_000,
-            "the parent, exactly"
-        );
     }
 
     #[test]

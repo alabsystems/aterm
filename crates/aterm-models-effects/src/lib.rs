@@ -10,9 +10,11 @@
 mod models_console_life;
 mod models_effects;
 mod models_fx;
+mod models_light_latch;
 mod models_pet_observation_admission;
 mod models_rainbow_composer_newline;
 mod models_rainbow_continuity;
+mod models_rainbow_ribbon_laws;
 mod models_rainbow_short_wrap;
 mod models_ribbon_follow;
 mod models_ribbon_row_hold;
@@ -22,9 +24,13 @@ mod models_tricks;
 pub use models_console_life::*;
 pub use models_effects::*;
 pub use models_fx::*;
+pub use models_light_latch::light_latch_model;
 pub use models_pet_observation_admission::*;
 pub use models_rainbow_composer_newline::rainbow_composer_newline_gate_model;
 pub use models_rainbow_continuity::*;
+pub use models_rainbow_ribbon_laws::{
+    rainbow_occupied_coverage_model, rainbow_retract_rearm_model,
+};
 pub use models_rainbow_short_wrap::rainbow_short_wrap_park_model;
 pub use models_ribbon_follow::*;
 pub use models_ribbon_row_hold::*;

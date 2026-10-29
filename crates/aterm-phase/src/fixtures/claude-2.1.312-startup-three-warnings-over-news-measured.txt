@@ -1,0 +1,22 @@
+# claude-code 2.1.312 · MEASURED 2026-10-27, `aterm ctl text` of aterm's jailed real-Claude lab (100x50, aterm 0.145.0 dev build e725d40263, Autopilot Cruise) running the real Claude Code 2.1.312 against a stub API: three warnings stacked (safe mode with its own 2-space sub-row, prompt caching off, the persistent emergency tip) above a barred slot (startup announcement, accentBar true) with a hidden-count row (the debug-mode info notice held back); claude launched with --safe-mode --debug; settings.json env DISABLE_PROMPT_CACHING=1; cachedGrowthBookFeatures.tengu-top-of-feed-tip = {tip, color warning, persistent true}; cachedGrowthBookFeatures.tengu_startup_announcements = [{id lab-barred-h, title, text, footer, priority 100, maxImpressions 1000, accentBar true}]
+ ▐▛███▛█   Claude Code v2.1.312
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.AyU2/proj
+
+⚠ Safe mode: all customizations are disabled (CLAUDE.md, skills, plugins, hooks, MCP, agents, and
+  more)
+  Restart without --safe-mode to re-enable
+⚠ Prompt caching off (DISABLE_PROMPT_CACHING), requests will be slower and cost more · unset it to
+  re-enable
+  Lab emergency tip: a persistent warning-colored tip whose words wrap at sixty columns.
+
+▎ Lab news title
+▎ A lab startup announcement with its accent bar on, its words long enough to wrap at sixty columns.
+▎ Lab footer: learn more at example.invalid
+  1 more notice hidden
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                           ◐ medium · /effort
+                                                                                             Debug

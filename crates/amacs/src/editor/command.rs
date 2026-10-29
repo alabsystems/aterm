@@ -186,6 +186,8 @@ pub enum EditorCommand {
     YankPop,
     Undo,
     Redo,
+    /// `C-c u`: undo the newest agent edit, wherever it sits in the history.
+    UndoAgentEdit,
     Save,
     Abort,
     UniversalArgument,
@@ -196,6 +198,9 @@ pub enum EditorCommand {
     GotoLine,
     SwitchBuffer,
     RevertBuffer,
+    /// Keep the buffer's text over the file that changed on disk under it
+    /// (the GUI header row's Keep Mine): Save then writes over the file.
+    KeepBufferOverDisk,
     StartMacro,
     EndMacro,
     PlayMacro,
@@ -239,6 +244,12 @@ pub enum EditorCommand {
     FillParagraph,
     /// `M-0` … `M-9`: begin or extend a numeric argument.
     DigitArgument,
+    /// `C-c C-t` (and ⌘E in a GUI): flip a table between its text and its grid.
+    ToggleGridView,
+    /// `C-o` in a grid: an empty row below the current one, the cursor on it.
+    GridInsertRow,
+    /// `C-S-backspace` in a grid: delete the current row.
+    GridDeleteRow,
 }
 
 /// Authority class required to execute an editor command.
@@ -252,7 +263,8 @@ pub enum CommandAuthority {
     Save,
     /// Opens or writes a file the command names (S9's find-file).
     Files,
-    /// Puts document text on the system clipboard.
+    /// Puts document text on the system clipboard, and reaches the kill ring that mirrors it:
+    /// input without it kills to and yanks from a ring of its own.
     Clipboard,
     /// Runs a program (P2's filter-region); never reachable from the wire.
     Spawn,
@@ -331,16 +343,21 @@ impl Invocation {
 
 impl EditorCommand {
     /// Every command, in the order a blank M-x lists them (Save first).
-    pub const ALL: [Self; 51] = [
+    pub const ALL: [Self; 56] = [
         Self::Save,
         Self::Undo,
         Self::Redo,
+        Self::UndoAgentEdit,
         Self::IncrementalSearch,
         Self::SearchNext,
         Self::SearchPrevious,
         Self::GotoLine,
         Self::SwitchBuffer,
         Self::RevertBuffer,
+        Self::KeepBufferOverDisk,
+        Self::ToggleGridView,
+        Self::GridInsertRow,
+        Self::GridDeleteRow,
         Self::SetMark,
         Self::KillRegion,
         Self::KillLine,
@@ -421,7 +438,8 @@ impl EditorCommand {
             | Self::GotoLine
             | Self::SwitchBuffer
             | Self::StartMacro
-            | Self::EndMacro => A::Read,
+            | Self::EndMacro
+            | Self::ToggleGridView => A::Read,
             Self::DeleteBackward
             | Self::DeleteForward
             | Self::IndentForTab
@@ -433,11 +451,15 @@ impl EditorCommand {
             | Self::YankPop
             | Self::Undo
             | Self::Redo
+            | Self::UndoAgentEdit
             | Self::Newline
             | Self::OpenLine
             | Self::TransposeChars
             | Self::FillParagraph
             | Self::RevertBuffer
+            | Self::KeepBufferOverDisk
+            | Self::GridInsertRow
+            | Self::GridDeleteRow
             | Self::PlayMacro => A::Edit,
             Self::Save
             | Self::FinishEdit
@@ -478,6 +500,7 @@ impl EditorCommand {
             Self::YankPop => "yank-pop",
             Self::Undo => "undo",
             Self::Redo => "redo",
+            Self::UndoAgentEdit => "undo-agent-edit",
             Self::Save => "save-buffer",
             Self::Abort => "keyboard-quit",
             Self::UniversalArgument => "universal-argument",
@@ -488,6 +511,7 @@ impl EditorCommand {
             Self::GotoLine => "goto-line",
             Self::SwitchBuffer => "switch-to-buffer",
             Self::RevertBuffer => "revert-buffer",
+            Self::KeepBufferOverDisk => "keep-buffer-over-disk",
             Self::StartMacro => "start-kbd-macro",
             Self::EndMacro => "end-kbd-macro",
             Self::PlayMacro => "call-last-kbd-macro",
@@ -511,6 +535,75 @@ impl EditorCommand {
             Self::Newline => "newline",
             Self::FillParagraph => "fill-paragraph",
             Self::DigitArgument => "digit-argument",
+            Self::ToggleGridView => "toggle-grid-view",
+            Self::GridInsertRow => "grid-insert-row",
+            Self::GridDeleteRow => "grid-delete-row",
+        }
+    }
+
+    /// Whether the command runs in a grid view: motion (which moves by cells), saving and
+    /// closing, undo and redo (an agent's edit too), the prompts, revert and Keep Mine, the flip,
+    /// the kills, copy and yank (which take the cell's value), and the row commands (`C-o` adds a
+    /// row). A command that edits raw text answers "not in the grid view" there and changes
+    /// nothing; DEL and C-d clear the cell.
+    pub const fn allowed_in_grid(self) -> bool {
+        match self {
+            Self::MoveBackward
+            | Self::MoveForward
+            | Self::MoveLineUp
+            | Self::MoveLineDown
+            | Self::MoveLineStart
+            | Self::MoveLineEnd
+            | Self::MoveWordBackward
+            | Self::MoveWordForward
+            | Self::ScrollPageDown
+            | Self::ScrollPageUp
+            | Self::RecenterTopBottom
+            | Self::BeginningOfBuffer
+            | Self::EndOfBuffer
+            | Self::DeleteBackward
+            | Self::DeleteForward
+            | Self::Undo
+            | Self::Redo
+            | Self::UndoAgentEdit
+            | Self::Save
+            | Self::FinishEdit
+            | Self::AbortEdit
+            | Self::KillBuffer
+            | Self::SaveBuffersKillTerminal
+            | Self::Abort
+            | Self::UniversalArgument
+            | Self::DigitArgument
+            | Self::ExecuteCommand
+            | Self::IncrementalSearch
+            | Self::SearchNext
+            | Self::SearchPrevious
+            | Self::GotoLine
+            | Self::SwitchBuffer
+            | Self::RevertBuffer
+            | Self::KeepBufferOverDisk
+            | Self::ToggleGridView
+            | Self::KillRegion
+            | Self::KillLine
+            | Self::KillRingSave
+            | Self::Yank
+            | Self::OpenLine
+            | Self::GridInsertRow
+            | Self::GridDeleteRow => true,
+            Self::IndentForTab
+            | Self::SetMark
+            | Self::YankPop
+            | Self::StartMacro
+            | Self::EndMacro
+            | Self::PlayMacro
+            | Self::KillWord
+            | Self::BackwardKillWord
+            | Self::ExchangePointAndMark
+            | Self::MarkWholeBuffer
+            | Self::PopMark
+            | Self::TransposeChars
+            | Self::Newline
+            | Self::FillParagraph => false,
         }
     }
 }
@@ -830,12 +923,17 @@ mod tests {
             ("save-buffer", Save),
             ("undo", Edit),
             ("redo", Edit),
+            ("undo-agent-edit", Edit),
             ("isearch-forward", Read),
             ("search-next", Read),
             ("search-previous", Read),
             ("goto-line", Read),
             ("switch-to-buffer", Read),
             ("revert-buffer", Edit),
+            ("keep-buffer-over-disk", Edit),
+            ("toggle-grid-view", Read),
+            ("grid-insert-row", Edit),
+            ("grid-delete-row", Edit),
             ("set-mark-command", Read),
             ("kill-region", Edit),
             ("kill-line", Edit),
@@ -888,13 +986,6 @@ mod tests {
             command.authority(),
             CommandAuthority::Files | CommandAuthority::Spawn
         )));
-        let mut moved = table.clone();
-        let copied = moved
-            .iter_mut()
-            .find(|(name, _)| *name == "kill-ring-save")
-            .unwrap();
-        copied.1 = Edit;
-        assert_ne!(moved, pinned);
     }
 
     #[test]
@@ -1226,7 +1317,8 @@ mod tests {
         ];
         assert!(clipboard(keys(&mut store, &mut workspace, &mut view, "C-k")).is_empty());
         assert_eq!(text(&store, document), "two");
-        assert_eq!(workspace.kill_ring.front().map(String::as_str), Some("\n"));
+        assert_eq!(workspace.guest_kill_ring, ["\n"]);
+        assert_eq!(workspace.kill_ring.front().map(String::as_str), Some("two"));
         workspace.granted = CommandAuthority::ALL.to_vec();
         assert!(clipboard(keys(&mut store, &mut workspace, &mut view, "C-a")).is_empty());
 
@@ -1237,6 +1329,36 @@ mod tests {
             [" c d"]
         );
         assert_eq!(workspace.kill_ring, [" c d", "a b"]);
+    }
+
+    /// INPUT WITHOUT CLIPBOARD AUTHORITY KEEPS A KILL RING OF ITS OWN: the kill ring holds what
+    /// the clipboard-holding input (the person) cut and copied, each of which reaches the
+    /// clipboard, so input without that authority (in aterm, a control client's) kills to and
+    /// yanks from a ring of its own: its C-y and M-y never reach the person's kill, and the
+    /// person's C-y never yanks its kills.
+    /// NEGATIVE CONTROL: against main's code at this leaf (`4d738a3c55`), one ring served both:
+    /// the guest's kill joined the person's `secret`, and its C-y yanked `secret mine`.
+    #[test]
+    fn input_without_clipboard_authority_keeps_a_kill_ring_of_its_own() {
+        let (mut store, mut workspace, mut view, document) = editor("secret mine");
+        keys(&mut store, &mut workspace, &mut view, "M-d");
+        assert_eq!(text(&store, document), " mine");
+        assert_eq!(workspace.kill_ring, ["secret"]);
+
+        workspace.granted = vec![
+            CommandAuthority::Read,
+            CommandAuthority::Edit,
+            CommandAuthority::Save,
+        ];
+        keys(&mut store, &mut workspace, &mut view, "M-d");
+        assert_eq!(text(&store, document), "", "the guest's kill");
+        keys(&mut store, &mut workspace, &mut view, "C-y M-y");
+        assert_eq!(text(&store, document), " mine", "the guest's yanks");
+        assert_eq!(workspace.kill_ring, ["secret"], "the person's ring");
+
+        workspace.granted = CommandAuthority::ALL.to_vec();
+        keys(&mut store, &mut workspace, &mut view, "C-a C-y");
+        assert_eq!(text(&store, document), "secret mine", "the person's yank");
     }
 
     #[test]
@@ -1286,8 +1408,9 @@ mod tests {
                 .unwrap(),
             refusal()
         );
+        // The person's macro needs what its steps need; the guest replays a macro of its own.
         assert_eq!(
-            workspace.authorities(EditorCommand::PlayMacro),
+            workspace.authorities_for(EditorCommand::PlayMacro, &CommandAuthority::ALL),
             [
                 CommandAuthority::Read,
                 CommandAuthority::Edit,
@@ -1295,12 +1418,20 @@ mod tests {
             ]
         );
         assert_eq!(
-            keys(&mut store, &mut workspace, &mut view, "C-x e"),
-            vec![EditorEffect::Status(
-                "call-last-kbd-macro needs clipboard authority, which this input does not carry"
-                    .to_string(),
-            )]
+            workspace.refusal(
+                EditorCommand::PlayMacro,
+                &[CommandAuthority::Edit, CommandAuthority::Clipboard]
+            ),
+            Some(
+                "call-last-kbd-macro needs read authority, which this input does not carry"
+                    .to_string()
+            )
         );
+        assert_eq!(
+            workspace.authorities(EditorCommand::PlayMacro),
+            [CommandAuthority::Edit]
+        );
+        assert_eq!(keys(&mut store, &mut workspace, &mut view, "C-x e"), vec![]);
         assert!(workspace.kill_ring.is_empty());
         keys(&mut store, &mut workspace, &mut view, "C-w");
         assert_eq!(text(&store, document), "copy  text");

@@ -1452,7 +1452,7 @@ fn a_stopped_childs_counters_and_threads_read_its_cpu_time_as_wait4_counts_it() 
         let threads = f.threads?.iter().map(|t| t.cpu_ns).sum::<Option<u64>>()?;
         Some((f.counters?.cpu_ns, threads))
     };
-    let (both, kernel) = read(|pid| cpu(pid).is_some_and(|(c, _)| c >= 50_000_000), cpu);
+    let (both, kernel) = read(50_000_000, |pid| cpu(pid).map(|(c, _)| c), cpu);
     let (counters, threads) = both.expect("the probe reads its own child");
     assert!(
         within_2x(counters, kernel) && within_2x(threads, kernel),

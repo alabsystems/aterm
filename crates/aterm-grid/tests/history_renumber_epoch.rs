@@ -95,4 +95,10 @@ fn a_width_reflow_with_no_scrollback_still_advances_the_renumber_epoch() {
         epoch_after_width,
         "a resize to the SAME dimensions rewraps nothing and must not bump"
     );
+    grid.resize(16, 10);
+    assert_eq!(
+        grid.history_renumber_epoch(),
+        epoch_after_width,
+        "a rows-only resize with no history splice rewraps nothing and must not bump"
+    );
 }

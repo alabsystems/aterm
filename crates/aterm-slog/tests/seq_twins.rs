@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Equivalence harness verifying that each ported `.seq` file matches its Rust replay test.
+//! Equivalence harness verifying that each ported `.seq` file matches its Rust replay. A twinned
+//! replay is no test of its own: it runs, every assert of it, inside
+//! `each_ported_sequence_folds_as_its_rust_twin`.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
@@ -338,12 +340,9 @@ pub const TX_TWINS: &[Twin] = &[
         tail: None,
     },
     Twin {
-        name: "a_tool_use_for_a_closed_or_unmapped_turn_never_opens_a_step",
-        rust: xr::a_tool_use_for_a_closed_or_unmapped_turn_never_opens_a_step,
-        files: &[
-            "tx-twin-a-tool-use-for-a-closed-turn.seq",
-            "tx-twin-a-tool-use-for-an-unmapped-turn.seq",
-        ],
+        name: "a_tool_use_for_a_closed_turn_never_opens_a_step",
+        rust: xr::a_tool_use_for_a_closed_turn_never_opens_a_step,
+        files: &["tx-twin-a-tool-use-for-a-closed-turn.seq"],
         tail: None,
     },
     Twin {
@@ -520,7 +519,7 @@ fn each_ported_sequence_folds_as_its_rust_twin() {
     let screen = check_twins(TURN_TWINS, &all).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!((TURN_TWINS.len(), screen.len()), (14, 15), "{screen:?}");
     let tx = check_twins(TX_TWINS, &all).unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!((TX_TWINS.len(), tx.len()), (35, 46), "{tx:?}");
+    assert_eq!((TX_TWINS.len(), tx.len()), (35, 45), "{tx:?}");
     for f in screen.iter().chain(&tx) {
         let seq = all.iter().find(|s| s.name == *f).expect("held");
         let rig = if f.starts_with("tx-") {

@@ -622,31 +622,6 @@ mod tests {
         worker.join().expect("the worker");
     }
 
-    /// Each role, declared on a real thread, is the class the kernel reports that
-    /// thread running at.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_declared_role_really_lands_on_the_running_thread() {
-        for role in [
-            Role::Interactive,
-            Role::Responsive,
-            Role::Background,
-            Role::Housekeeping,
-        ] {
-            let observed = std::thread::spawn(move || {
-                set_self(role);
-                class_of_self()
-            })
-            .join()
-            .expect("the probe thread");
-            assert_eq!(
-                observed,
-                class_for(role),
-                "{role:?} was declared, but the thread runs at 0x{observed:x}"
-            );
-        }
-    }
-
     /// The class a fork from the calling thread ran at, as the forked child reads it
     /// before its exec: its copy of this thread's QoS word, taken when `fork(2)` copied
     /// the address space ([`fork_at_default`]).

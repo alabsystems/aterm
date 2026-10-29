@@ -226,10 +226,6 @@ pub(crate) fn reset_templates() -> Vec<(&'static str, Vec<String>)> {
                 .to_string(),
         ),
         (
-            "spent heads",
-            switch(&|kind| kind.done().replace('·', "\\xB7")),
-        ),
-        (
             "spent line",
             format!("{{done}} \\xB7 {stays} {{week}} \\xB7 {{kindResets}} {left}"),
         ),
@@ -246,18 +242,6 @@ pub(crate) fn reset_templates() -> Vec<(&'static str, Vec<String>)> {
         ),
         ("lifted line", escaped("reset.lifted")),
         ("login line", format!("{} \\xB7 ", anchor("reset.login"))),
-        (
-            "limit names",
-            format!(
-                "case\"five_hour\":{n}.add(\"{}\");break;case\"seven_day\":{n}.add(\"{}\");break;\
-                 case\"seven_day_overage_included\":{n}.add({n}.givesBackWeekly?\"Fable\":\"{}\");\
-                 break;",
-                limit_name("five_hour"),
-                limit_name("seven_day"),
-                limit_name("seven_day_overage_included"),
-                n = JS_NAME,
-            ),
-        ),
         (
             "model limit names",
             format!(
@@ -278,7 +262,41 @@ pub(crate) fn reset_templates() -> Vec<(&'static str, Vec<String>)> {
     .collect();
     const REPLACE: &str = ".replace(/ limit$/,\"\")";
     let call = |strip: &str| format!("{strip});break;case\"seven_day_sonnet\":");
+    let spent =
+        |done: &dyn Fn(ResetKind) -> &'static str| switch(&|kind| done(kind).replace('·', "\\xB7"));
+    let before_2_1_312 = |kind: ResetKind| match kind {
+        ResetKind::Session => crate::reset::SESSION_DONE_BEFORE_2_1_312,
+        _ => kind.done(),
+    };
+    let names = |five_hour: &str| {
+        format!(
+            "case\"five_hour\":{n}.add(\"{five_hour}\");break;case\"seven_day\":{n}.add(\"{}\");\
+             break;case\"seven_day_overage_included\":{n}.add({n}.givesBackWeekly?\"Fable\":\"{}\");\
+             break;",
+            limit_name("seven_day"),
+            limit_name("seven_day_overage_included"),
+            n = JS_NAME,
+        )
+    };
     templates.extend([
+        (
+            "spent heads",
+            vec![spent(&before_2_1_312), spent(&ResetKind::done)],
+        ),
+        (
+            "once-a-week row",
+            vec![
+                crate::reset::WEEKLY_ROW_BEFORE_2_1_312.to_string(),
+                anchor("reset.weekly_row").to_string(),
+            ],
+        ),
+        (
+            "limit names",
+            vec![
+                names(crate::reset::FIVE_HOUR_LIMIT_BEFORE_2_1_312),
+                names(limit_name("five_hour")),
+            ],
+        ),
         (
             "model limit names' strip",
             vec![call(REPLACE), call(",\" limit\")")],
@@ -292,6 +310,32 @@ pub(crate) fn reset_templates() -> Vec<(&'static str, Vec<String>)> {
         ),
     ]);
     templates
+}
+
+/// The templates a composed anchor is drawn by, each spelling one build's: `effort.auto`, a
+/// literal before 2.1.312, which 2.1.312 draws as `effort.auto_head` and `${E1()}`, the word
+/// `"auto"` only while the flag beside it is compiled off
+/// (`function Re(){return!1}function E1(){return Re()?"adaptive":"auto"}`).
+pub(crate) fn composed_templates() -> Vec<(&'static str, Vec<String>)> {
+    let (whole, head) = (anchor("effort.auto"), anchor("effort.auto_head"));
+    let word = whole
+        .strip_prefix(head)
+        .expect("the auto notice opens with its head");
+    vec![
+        (
+            "effort auto notice",
+            vec![whole.to_string(), format!("{head}${{{JS_NAME}()}}")],
+        ),
+        (
+            "effort auto word",
+            vec![
+                whole.to_string(),
+                format!(
+                    "{{return!1}}function {JS_NAME}(){{return {JS_NAME}()?\"adaptive\":\"{word}\"}}"
+                ),
+            ],
+        ),
+    ]
 }
 
 /// The names of the `templates` that `bytes` hold whole ([`holds`]) in none of their spellings.

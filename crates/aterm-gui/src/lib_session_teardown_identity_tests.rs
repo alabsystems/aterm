@@ -93,18 +93,34 @@ fn dropping_an_adopted_session_before_commit_leaves_its_shell_alive() {
         session.handoff_commit = Some(Arc::clone(&commit));
         assert!(session.shell_identity.verify(), "PRECONDITION");
         drop(session);
-        let deadline = Instant::now() + Duration::from_millis(if committed { 60_000 } else { 500 });
-        while running(&mut shell) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
+        if committed {
+            let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+            while running(&mut shell) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let hung_up = !running(&mut shell);
+            let _ = shell.kill();
+            let _ = shell.wait();
+            assert!(
+                hung_up,
+                "committed = true: a committed session's shell is hung up"
+            );
+        } else {
+            assert!(
+                aterm_pty::wait_for_reaps(aterm_spec::wait::MUST_HAPPEN),
+                "the teardown's reaps never settled"
+            );
+            // SAFETY: signals the test's own child, not yet reaped.
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            let status = shell
+                .wait()
+                .expect("the predecessor's shell is the test's to reap");
+            assert_eq!(
+                std::os::unix::process::ExitStatusExt::signal(&status),
+                Some(libc::SIGTERM),
+                "committed = false: the predecessor's shell survives an uncommitted drop: {status}"
+            );
         }
-        let alive = running(&mut shell);
-        let _ = shell.kill();
-        let _ = shell.wait();
-        assert_eq!(
-            alive, !committed,
-            "committed = {committed}: the predecessor's shell survives an uncommitted drop, \
-             and a committed session's shell is hung up"
-        );
     }
 }
 
@@ -197,19 +213,36 @@ fn a_session_built_through_the_spawn_s_latch_keeps_only_an_uncommitted_adopted_s
             crate::spawn::adopted_handoff_commit(adopted, recovered, factory_latch);
         assert!(session.shell_identity.verify(), "PRECONDITION");
         drop(session);
-        let deadline = Instant::now() + Duration::from_millis(if survives { 500 } else { 60_000 });
-        while running(&mut shell) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
+        if survives {
+            assert!(
+                aterm_pty::wait_for_reaps(aterm_spec::wait::MUST_HAPPEN),
+                "the teardown's reaps never settled"
+            );
+            // SAFETY: signals the test's own child, not yet reaped.
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            let status = shell
+                .wait()
+                .expect("the surviving adopted shell is the test's to reap");
+            assert_eq!(
+                std::os::unix::process::ExitStatusExt::signal(&status),
+                Some(libc::SIGTERM),
+                "adopted = {adopted}, recovered = {recovered}, overlap = {}: {status}",
+                factory_latch.is_some()
+            );
+        } else {
+            let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+            while running(&mut shell) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let hung_up = !running(&mut shell);
+            let _ = shell.kill();
+            let _ = shell.wait();
+            assert!(
+                hung_up,
+                "adopted = {adopted}, recovered = {recovered}, overlap = {}",
+                factory_latch.is_some()
+            );
         }
-        let alive = running(&mut shell);
-        let _ = shell.kill();
-        let _ = shell.wait();
-        assert_eq!(
-            alive,
-            survives,
-            "adopted = {adopted}, recovered = {recovered}, overlap = {}",
-            factory_latch.is_some()
-        );
     }
     assert!(!overlap.released(), "PRECONDITION: no Commit in this test");
 }

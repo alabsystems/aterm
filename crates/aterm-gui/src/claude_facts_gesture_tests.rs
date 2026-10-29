@@ -143,6 +143,10 @@ fn a_click_on_the_branch_greys_it_off_and_a_click_on_off_brings_it_back() {
     let row = footer_row(&app, wid);
     let rule_cell = cell_at(&app, wid, (row, 1));
     assert_eq!(rule_cell.ch, '\u{2500}', "CONTROL: Claude's own rule glyph");
+    assert!(
+        crate::claude_card::dark_ground(rule_cell),
+        "CONTROL: the app's own theme lays a dark ground"
+    );
 
     click_fact(&mut app, wid, Fact::Branch);
     assert_eq!(app.fact_mask(session), mask(&[FactKind::Branch]));
@@ -175,7 +179,7 @@ fn a_click_on_the_branch_greys_it_off_and_a_click_on_off_brings_it_back() {
     frame(&mut app, wid);
     let rest = o(&app);
     assert_eq!(rest.fg, rule_cell.fg, "the stub is in Claude's rule gray");
-    assert!(!rest.bold, "and not bold");
+    assert!(!rest.bold, "and thin, as main draws a dark ground's stub");
     assert_eq!(rest.underline, UnderlineStyle::None);
     let name = of(&app, 'm');
     assert_eq!(
@@ -279,7 +283,7 @@ fn a_click_on_the_context_greys_it_off_and_a_click_on_its_stub_brings_it_back() 
         assert_eq!(
             (cell.fg, cell.bold),
             (rule_cell.fg, false),
-            "{ch:?}: greyed in Claude's rule gray"
+            "{ch:?}: greyed in Claude's rule gray, thin on the dark ground"
         );
     }
 

@@ -25,6 +25,7 @@ fn scratch(tag: &str) -> (crate::supervise::ScratchDir, Opts) {
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
         land: false,
+        press: None,
         timings: crate::harness::Timings::FAST,
     };
     (dir, opts)

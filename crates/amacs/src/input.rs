@@ -31,6 +31,19 @@ pub enum EditorInput {
         extend: bool,
         visible_lines: usize,
     },
+    /// A press on a grid cell a face's hit test found; `open` (a double-click) opens its editor.
+    GridPointer {
+        record: usize,
+        column: usize,
+        open: bool,
+    },
+    /// A sideways scroll of a grid by whole columns (a sideways wheel or swipe, or a press on a
+    /// `◂`/`▸` mark): negative shows the columns to the left.
+    GridScroll { columns: i32 },
+    /// A press in a grid's cell panel at byte `byte` of the value it shows
+    /// ([`crate::editor::GridProjection::panel_byte`]): the caret goes there, the cell's editor
+    /// opening first when it was closed.
+    GridPanelPointer { byte: usize },
     /// The view gained (`true`) or lost keyboard focus.
     Focus(bool),
 }
@@ -82,10 +95,12 @@ enum Shortcut {
     SelectAll,
     Undo,
     Redo,
+    /// ⌘E: a table's grid view ([`EditorCommand::ToggleGridView`]).
+    ToggleGrid,
 }
 
 impl Shortcut {
-    /// The shortcut Super+`key` runs (⌘A, ⌘Z, ⌘⇧Z, ⌘Y). ⌘S is not here: it
+    /// The shortcut Super+`key` runs (⌘A, ⌘Z, ⌘⇧Z, ⌘Y, ⌘E). ⌘S is not here: it
     /// saves ahead of every other reading of a key (see `reduce_editor_key`).
     #[inline]
     const fn of(key: char, mods: Modifiers) -> Option<Self> {
@@ -94,6 +109,7 @@ impl Shortcut {
             'z' | 'Z' if mods.contains(Modifiers::SHIFT) => Some(Self::Redo),
             'z' | 'Z' => Some(Self::Undo),
             'y' | 'Y' => Some(Self::Redo),
+            'e' | 'E' => Some(Self::ToggleGrid),
             _ => None,
         }
     }
@@ -107,6 +123,9 @@ impl EditorWorkspace {
         view: &mut EditorBufferView,
         input: EditorInput,
     ) -> Result<Reduction, EditorError> {
+        if view.grid().is_some() && !view.minibuffer_active() {
+            return self.grid_input(store, view, input);
+        }
         match input {
             EditorInput::Key { key, mods, text } => {
                 self.reduce_editor_key(store, view, key, mods, text)
@@ -135,7 +154,10 @@ impl EditorWorkspace {
                     },
                 )
             }
-            EditorInput::Focus(_) => Ok(Reduction::ignored()),
+            EditorInput::Focus(_)
+            | EditorInput::GridPointer { .. }
+            | EditorInput::GridScroll { .. }
+            | EditorInput::GridPanelPointer { .. } => Ok(Reduction::ignored()),
         }
     }
 
@@ -147,6 +169,9 @@ impl EditorWorkspace {
     ) -> Result<Vec<EditorEffect>, EditorError> {
         if let Some(effects) = self.minibuffer_blocks_document_input(view) {
             return Ok(effects);
+        }
+        if view.grid().is_some() {
+            return Ok(Vec::new());
         }
         let len = store
             .snapshot(view.document)
@@ -234,6 +259,9 @@ impl EditorWorkspace {
                         }
                         Some(Shortcut::Redo) => {
                             self.document_gesture(store, view, EditorCommand::Redo)?
+                        }
+                        Some(Shortcut::ToggleGrid) => {
+                            self.execute(store, view, EditorCommand::ToggleGridView)?
                         }
                         None => return Ok(Reduction::ignored()),
                     }

@@ -332,3 +332,67 @@ fn the_label_reaches_no_loops_read_or_claim() {
         "CONTROL"
     );
 }
+
+/// A LINE LEFT IN THE COMPOSER KEEPS ITS DOOR'S CLAIM UNTIL THE LOOP'S LOOK GIVES IT BACK (the
+/// slice-2 plan's 2.9b): the wake claimed for a break's line its loop found written and not
+/// submitted stays claimed through another door's claim (`Busy`, no second grant), an `await
+/// wake` parked before the claim (no answer), the owner's mode turned `observe`, its loop's
+/// going (`left`: a successor's look settles it) and half an hour of ticks; the look's release
+/// (the composer cleared unsent) makes it ready, and the parked await is answered. NEGATIVE
+/// CONTROL: with no claim standing, the same await is answered at once.
+#[test]
+fn a_left_lines_claim_stands_until_the_look_gives_it_back() {
+    let run = |claim: bool| {
+        let rig = Rig::new(Occupancy::Prompt);
+        let host = WakeHost::default();
+        host.seen_for(&rig, A);
+        let episode = ready_job(&rig, &host, "");
+        // Parked first: an await asked over a claim already standing finds no wake open.
+        host.park(&rig, &seat_a(), Some(400), 1).expect("parks");
+        if claim {
+            assert!(
+                host.claim_for(&rig, A, 1, episode, WakeDoor::Break, None)
+                    .lets()
+            );
+        }
+        let pass = host.pass(&rig, A, 1);
+        (rig, host, episode, pass)
+    };
+    let (rig, host, episode, pass) = run(true);
+    assert_eq!(pass, Pass::Wait, "no await answered while the line stands");
+    let claimed = state(&host, A, 1);
+    assert!(
+        matches!(
+            claimed,
+            Some(WakeState::Claimed {
+                door: WakeDoor::Break,
+                ..
+            })
+        ),
+        "{claimed:?}"
+    );
+    assert_eq!(
+        host.claim_for(&rig, A, 1, episode, WakeDoor::Point, None),
+        WakeClaim::Busy,
+        "no second grant"
+    );
+    rig.set_mode(Occupancy::Observe);
+    host.left(&rig, A);
+    host.seen_for(&rig, A);
+    for _ in 0..30 {
+        rig.advance(60_000);
+        host.tick(&rig, false);
+    }
+    assert_eq!(host.pass(&rig, A, 1), Pass::Wait);
+    assert_eq!(state(&host, A, 1), claimed, "the claim stands");
+    host.release_for(&rig, A, 1, episode, WakeDoor::Break);
+    assert!(
+        matches!(host.pass(&rig, A, 1), Pass::Reply { ord: Some(1), .. }),
+        "released, the parked await is answered"
+    );
+    let (_, _, _, pass) = run(false);
+    assert!(
+        matches!(pass, Pass::Reply { ord: Some(1), .. }),
+        "CONTROL: {pass:?}"
+    );
+}

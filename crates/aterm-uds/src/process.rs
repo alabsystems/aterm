@@ -1790,6 +1790,70 @@ pub fn kill_self_now() -> ! {
     std::process::abort()
 }
 
+/// How long [`kill_group_until_empty`] signals a group that has not emptied: a member `SIGKILL`
+/// cannot end (one blocked in the kernel, on a stale mount) is left to the kernel after this
+/// rather than holding the caller.
+#[cfg(target_vendor = "apple")]
+const GROUP_KILL_CAP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The longest pause between two of [`kill_group_until_empty`]'s signals.
+#[cfg(target_vendor = "apple")]
+const GROUP_KILL_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// `SIGKILL` every member of process group `pgid`, whose leader the caller has spawned and not
+/// yet reaped: the unreaped leader keeps its pid, and with it the group id, from being reused.
+///
+/// One signal reaches every member on Linux, whose fork restarts when a group signal lands
+/// during it (`copy_process`). XNU's fork does not: the child of a fork a member is making as
+/// the signal lands joins the group unsignalled and runs on once its parent dies, so a shell
+/// forking its next command at that moment leaves the command running. On Apple targets this
+/// therefore signals again, before the leader is reaped, until the kernel finds no member it
+/// can signal, for at most five seconds: a member puts the child it forks in the group before it
+/// can exit, so no fork outlives the last round, and XNU answers `EPERM` once the members left
+/// are zombies (the unreaped leader among them) and `ESRCH` once there are none. Elsewhere it
+/// signals once.
+///
+/// # Errors
+/// `InvalidInput` for a `pgid` of 1 or less, which names no one group (`kill(0)` and `kill(-1)`
+/// reach far more), with nothing sent; otherwise the first signal's error: `ESRCH` (no such
+/// group) or `EPERM` (only zombies, or only members this user may not signal).
+#[cfg(unix)]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn kill_group_until_empty(pgid: i32) -> std::io::Result<()> {
+    if pgid <= 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{pgid} names no one process group"),
+        ));
+    }
+    if !signal_group(pgid) {
+        return Err(std::io::Error::last_os_error());
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        let until = std::time::Instant::now() + GROUP_KILL_CAP;
+        let mut pause = std::time::Duration::from_millis(1);
+        while signal_group(pgid) && std::time::Instant::now() < until {
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(GROUP_KILL_PAUSE);
+        }
+    }
+    Ok(())
+}
+
+/// `kill(-pgid, SIGKILL)`: whether the kernel found a member of group `pgid` it could signal.
+#[cfg(unix)]
+#[cfg_attr(trust_verify, trust::skip)]
+fn signal_group(pgid: i32) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    const SIGKILL: i32 = 9;
+    // SAFETY: a plain syscall taking no pointer. `pgid` > 1, so it names one group, never this
+    // process's own (0) or every process (-1).
+    unsafe { kill(-pgid, SIGKILL) == 0 }
+}
+
 /// Returns this machine's configured host name.
 #[must_use]
 pub fn host_name() -> Option<String> {
@@ -2127,6 +2191,39 @@ pub fn take_stop_signals(name: &str, on_stop: impl FnOnce(i32) + Send + 'static)
         return false;
     }
     true
+}
+
+static ALLOCATOR_RELIEF_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Register a process-allocator hook that [`release_free_memory`] calls alongside the OS trim.
+pub fn register_allocator_relief(hook: fn()) {
+    let _ = ALLOCATOR_RELIEF_HOOK.set(hook);
+}
+
+/// Ask the process allocator to return unused free pages to the operating system.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn release_free_memory() {
+    if let Some(&hook) = ALLOCATOR_RELIEF_HOOK.get() {
+        hook();
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        unsafe extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // SAFETY: a null zone and a zero goal ask libsystem_malloc to relieve every
+        // registered zone of its cached reusable pages; no caller pointer is dereferenced.
+        let _ = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        // SAFETY: `malloc_trim(0)` asks glibc's allocator to release free pages in its
+        // arenas without touching live allocations.
+        let _ = unsafe { malloc_trim(0) };
+    }
 }
 
 #[cfg(test)]
@@ -2549,7 +2646,7 @@ mod start_tests {
     #[cfg(unix)]
     #[test]
     fn a_child_started_after_a_boot_clock_reading_reads_later() {
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
         let own = i32::try_from(std::process::id()).unwrap();
         let Some(moment) = super::boot_clock_now() else {
             if super::translation() == super::Translation::Translated {
@@ -2561,7 +2658,23 @@ mod start_tests {
             assert_eq!(super::read_process_start(own), None);
             return;
         };
-        std::thread::sleep(Duration::from_millis(20));
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let step = {
+            let (_, per_second) = super::linux_reader().expect("linux clock ticks");
+            (1_000_000_000u64 / per_second.max(1))
+                .saturating_mul(2)
+                .max(1)
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let step = 1u64;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while super::boot_clock_now().expect("boot clock").0 < moment.0.saturating_add(step) {
+            assert!(
+                Instant::now() < deadline,
+                "boot clock did not advance past {step}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let mut child = crate::spawnfd::command("/bin/sleep")
             .arg("30")
             .spawn()
@@ -2585,9 +2698,15 @@ mod start_tests {
 
     #[cfg(unix)]
     fn a_child_started_after_a_wall_reading_reads_later() {
-        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
         let moment = SystemTime::now();
-        std::thread::sleep(Duration::from_millis(20));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while SystemTime::now().duration_since(moment).unwrap_or_default()
+            < Duration::from_millis(2)
+        {
+            assert!(Instant::now() < deadline, "wall clock did not advance");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let mut child = crate::spawnfd::command("/bin/sleep")
             .arg("30")
             .spawn()
@@ -3065,14 +3184,20 @@ mod tests {
     #[test]
     fn a_child_born_after_a_wall_reading_reads_later_and_none_once_exited() {
         use crate::spawnfd::Stdio;
-        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
         let on_wall = |birth: super::ProcessBirth| {
             UNIX_EPOCH
                 + Duration::from_secs(birth.seconds)
                 + Duration::from_micros(birth.microseconds)
         };
         let moment = SystemTime::now();
-        std::thread::sleep(Duration::from_millis(50));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while SystemTime::now().duration_since(moment).unwrap_or_default()
+            < Duration::from_millis(2)
+        {
+            assert!(Instant::now() < deadline, "wall clock did not advance");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let mut child = crate::spawnfd::command("cmd")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())

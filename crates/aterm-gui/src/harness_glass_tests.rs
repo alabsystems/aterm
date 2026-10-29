@@ -210,6 +210,52 @@ fn an_act_that_may_not_light_keeps_only_its_trail_entry() {
     assert!(g.take(Act::Continued, at(t0, 500), true).lit, "no quiet");
 }
 
+#[test]
+fn a_self_claims_act_is_named_for_its_holder_and_never_joins_aterms() {
+    let t0 = Instant::now();
+    let today = T0_UNIX.div_euclid(86_400);
+    let codex = Some(claimant("codex-alab@4242"));
+    assert_eq!(
+        codex.map(|c| c.as_str().to_owned()).as_deref(),
+        Some("codex-alab")
+    );
+    let mut g = SessionGlass::default();
+    // NEGATIVE CONTROL: aterm's own act carries no holder and reads as before.
+    g.take(Act::Approved, at(t0, 0), true);
+    assert_eq!(g.chip().last_by, None);
+    assert_eq!(g.trail_text(T0_UNIX, today), "\u{2713} approved 14:05");
+    assert_eq!(
+        g.spoken_last(T0_UNIX, today).as_deref(),
+        Some("Last: approved at 14:05.")
+    );
+    g.take_by(Act::Approved, codex, at(t0, 200), true);
+    assert_eq!(
+        trail(&g),
+        [Act::Approved, Act::Approved],
+        "another hand's act is an entry of its own"
+    );
+    assert_eq!(g.chip().last_by, codex);
+    assert_eq!(
+        g.trail_text(T0_UNIX, today),
+        "codex-alab: \u{2713} approved 14:05, \u{2713} approved 14:05"
+    );
+    g.take_by(Act::Approved, codex, at(t0, 400), true);
+    assert_eq!(trail(&g).len(), 2, "its own repeat joins its entry");
+    g.take(Act::Approved, at(t0, 600), true);
+    assert_eq!(trail(&g).len(), 3, "aterm's never joins the holder's");
+    assert_eq!(g.chip().last_by, None);
+    g.take_by(Act::Continued, codex, at(t0, 800), true);
+    assert_eq!(
+        g.spoken_last(T0_UNIX, today).as_deref(),
+        Some("Last: codex-alab kept going at 14:05.")
+    );
+    assert_eq!(
+        act_words(Act::Continued, codex),
+        "codex-alab: \u{21bb} kept going"
+    );
+    assert_eq!(act_words(Act::Continued, None), "\u{21bb} kept going");
+}
+
 struct Hosted(crate::harness_host::HostHandle);
 
 impl Drop for Hosted {
@@ -233,6 +279,70 @@ fn acts(app: &mut App, on: bool) {
         acts: Some(on),
         ..crate::app_config::ClaudeFooterConfig::default()
     });
+}
+
+#[test]
+fn a_proven_holders_act_on_the_wire_lights_the_chip_as_its_holders() {
+    let (mut app, _host) = hosted();
+    let (term, ctx) = {
+        let shell = app.pool.get(0).expect("pooled");
+        (
+            std::sync::Arc::clone(&shell.term),
+            std::sync::Arc::clone(&shell.ctx),
+        )
+    };
+    crate::session_timeline::claim_supervisor_as(
+        &ctx,
+        &format!("codex-alab@{}", std::process::id()),
+        Some(1),
+        None,
+        Some(crate::self_claim::stand_in::running()),
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("a proof takes a free session");
+    let store = std::sync::Arc::clone(&app.store);
+    let serve = |app: &mut App, rest: &str, conn| {
+        let (reply, wakes) =
+            crate::control::meta_wakes_for_test(&store, &term, 0, &ctx, rest, conn);
+        let mut acts = 0;
+        for wake in wakes {
+            match wake {
+                crate::Wake::MetaChanged { session } => app.on_meta_changed(session),
+                crate::Wake::HarnessFact { sid, fact } => {
+                    acts += usize::from(matches!(fact, crate::HarnessFact::SelfAct));
+                    app.apply_harness_fact(&sid, fact);
+                }
+                other => panic!("the meta arm posts no {other:?}"),
+            }
+        }
+        (reply, acts)
+    };
+    // NEGATIVE CONTROLS: a refused act and a lease light nothing.
+    let (reply, acts) = serve(&mut app, "set harness_act approve-all@v1", Some(2));
+    assert_eq!((reply.as_str(), acts), ("ERR denied\n", 0));
+    let (reply, acts) = serve(&mut app, "prepare harness_act", Some(1));
+    assert!(reply.starts_with("OK until_us="), "{reply}");
+    assert_eq!(acts, 0);
+    assert_eq!(app.chip_glass(0).last, None);
+
+    let (reply, acts) = serve(&mut app, "set harness_act approve-all@v1", Some(1));
+    assert_eq!((reply.as_str(), acts), ("OK\n", 1));
+    let glass = app.chip_glass(0);
+    assert_eq!(glass.lit, Some(Act::Approved), "the chip flashes");
+    assert_eq!(glass.last.map(|(act, _)| act), Some(Act::Approved));
+    assert_eq!(
+        glass.last_by.as_ref().map(Claimant::as_str),
+        Some("codex-alab"),
+        "the trail names who did it"
+    );
+    // NEGATIVE CONTROL: aterm's own act that follows is aterm's.
+    on_act(&mut app, 0, Act::Continued);
+    let glass = app.chip_glass(0);
+    assert_eq!(
+        (glass.last.map(|(act, _)| act), glass.last_by),
+        (Some(Act::Continued), None)
+    );
 }
 
 #[test]

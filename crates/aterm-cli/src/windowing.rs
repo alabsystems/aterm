@@ -257,17 +257,47 @@ pub fn plain_launch_is_policy_eligible(scan: &[std::ffi::OsString], env: LaunchE
     true
 }
 
-/// The raw `-d <dir>` operand of a plain launch, for the caller to resolve.
+/// The raw `-d <dir>` operand of a plain launch (the last one when repeated, matching
+/// [`parse_window_request`]), for the caller to resolve.
 #[must_use]
 pub fn plain_launch_dir_operand(scan: &[std::ffi::OsString]) -> Option<String> {
     let mut it = scan.iter();
+    let mut last = None;
     while let Some(raw) = it.next() {
-        let arg = raw.to_string_lossy().into_owned();
-        if PLAIN_LAUNCH_DIR_FLAGS.contains(&arg.as_str()) {
-            return it.next().map(|v| v.to_string_lossy().into_owned());
+        let arg = raw.to_string_lossy();
+        if PLAIN_LAUNCH_DIR_FLAGS.contains(&arg.as_ref()) {
+            last = Some(it.next()?.to_string_lossy().into_owned());
         }
     }
-    None
+    last
+}
+
+/// Incremental UTF-16 code-unit to UTF-8 transcoder, emitting one U+FFFD per unpaired surrogate.
+#[cfg(any(windows, test))]
+pub(crate) fn push_utf16_unit(unit: u16, pending: &mut Option<u16>, out: &mut Vec<u8>) {
+    fn push_char(c: char, out: &mut Vec<u8>) {
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    }
+    if let Some(high) = pending.take() {
+        if (0xDC00..=0xDFFF).contains(&unit) {
+            let c = 0x10000 + ((u32::from(high) - 0xD800) << 10) + (u32::from(unit) - 0xDC00);
+            push_char(
+                char::from_u32(c).unwrap_or(char::REPLACEMENT_CHARACTER),
+                out,
+            );
+            return;
+        }
+        push_char(char::REPLACEMENT_CHARACTER, out);
+    }
+    match unit {
+        0xD800..=0xDBFF => *pending = Some(unit),
+        0xDC00..=0xDFFF => push_char(char::REPLACEMENT_CHARACTER, out),
+        u => push_char(
+            char::from_u32(u32::from(u)).unwrap_or(char::REPLACEMENT_CHARACTER),
+            out,
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -537,6 +567,62 @@ mod tests {
                 "{verb_only_spelling:?} must stay legal on the explicit verbs"
             );
         }
+        let repeated = args(&["-d", "/first", "--working-directory", "/second"]);
+        assert!(plain_launch_is_policy_eligible(&repeated, plain));
+        assert_eq!(
+            plain_launch_dir_operand(&repeated).as_deref(),
+            Some("/second")
+        );
+        assert_eq!(
+            parse_window_request("new-tab", &repeated, echo_dir)
+                .expect("valid")
+                .dir
+                .as_deref(),
+            Some("/second")
+        );
+        assert_eq!(
+            plain_launch_dir_operand(&args(&["-d", "/first", "-d"])),
+            None
+        );
         assert_eq!(plain_launch_dir_operand(&args(&["--window"])), None);
+    }
+
+    #[test]
+    fn push_utf16_unit_pairs_surrogates_and_replaces_unpaired_ones() {
+        let cases: &[(&[u16], &str)] = &[
+            (&[b'a' as u16, 0x00E9, 0x65E5], "a\u{00e9}\u{65e5}"),
+            (&[0xD83D, 0xDE00], "\u{1F600}"),
+            (&[0xD83D, b'x' as u16], "\u{FFFD}x"),
+            (&[0xD83D, 0xD83D, 0xDE00], "\u{FFFD}\u{1F600}"),
+            (&[0xDE00, b'y' as u16], "\u{FFFD}y"),
+            (&[0xDE00], "\u{FFFD}"),
+        ];
+        for &(units, want) in cases {
+            let mut pending = None;
+            let mut out = Vec::new();
+            for &u in units {
+                push_utf16_unit(u, &mut pending, &mut out);
+            }
+            if pending.take().is_some() {
+                out.extend_from_slice(
+                    char::REPLACEMENT_CHARACTER
+                        .encode_utf8(&mut [0; 4])
+                        .as_bytes(),
+                );
+            }
+            assert_eq!(
+                std::str::from_utf8(&out).expect("utf-8"),
+                want,
+                "{units:x?}"
+            );
+        }
+        let mut pending = None;
+        let mut out = Vec::new();
+        push_utf16_unit(0xD83D, &mut pending, &mut out);
+        assert_eq!(pending, Some(0xD83D));
+        assert!(out.is_empty());
+        push_utf16_unit(0xDE00, &mut pending, &mut out);
+        assert_eq!(pending, None);
+        assert_eq!(std::str::from_utf8(&out).expect("utf-8"), "\u{1F600}");
     }
 }

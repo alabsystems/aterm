@@ -1309,16 +1309,16 @@ fn a_full_queue_drops_its_oldest_and_unread_rows_are_counted() {
 /// A build the measured set names is exact, and any other is partial.
 #[test]
 fn every_build_is_partial_until_one_is_measured() {
-    assert_eq!(MEASURED_BUILDS, ["2.1.303"]);
-    assert_eq!(state_for(MEASURED_BUILDS, Some("2.1.303")), StepState::On);
+    let measured: &[&str] = &["2.1.303"];
+    assert_eq!(state_for(measured, Some("2.1.303")), StepState::On);
     for other in ["2.1.300", "2.1.302", "2.1.304", "2.1.3030", "2.1.30"] {
         assert_eq!(
-            state_for(MEASURED_BUILDS, Some(other)),
+            state_for(measured, Some(other)),
             StepState::Partial,
             "{other}"
         );
     }
-    assert_eq!(state_for(MEASURED_BUILDS, None), StepState::Partial);
+    assert_eq!(state_for(measured, None), StepState::Partial);
     assert_eq!(state_for(&["2.1.300"], Some("2.1.300")), StepState::On);
     assert_eq!(state_for(&["2.1.300"], Some("2.1.299")), StepState::Partial);
     assert_eq!(state_for(&["2.1.300"], Some("2.1.301")), StepState::Partial);
@@ -1397,6 +1397,45 @@ fn measured_builds_hold(dir: &std::path::Path, builds: &[&str]) -> Result<(), St
 fn a_build_is_exact_iff_its_reduction_is_committed() {
     measured_builds_hold(std::path::Path::new(MEASURED_DIR), MEASURED_BUILDS)
         .expect("the measured builds and their reductions agree");
+}
+
+/// The build a Claude Code reduction's own line names (`# claude <build> · lab reduce …`).
+fn claude_build_of(header: &str) -> Option<&str> {
+    header
+        .strip_prefix("# claude ")?
+        .split(' ')
+        .next()
+        .filter(|b| !b.is_empty() && *b != "-")
+}
+
+/// `MEASURED_BUILDS` is no hand-kept list: it is the builds the committed Claude Code reductions'
+/// own lines name (`build.rs`), sorted and once each, and each reduction is named for its build.
+#[test]
+fn the_measured_builds_are_what_the_committed_reductions_name() {
+    let mut named = Vec::new();
+    for e in std::fs::read_dir(MEASURED_DIR)
+        .expect("the step testdata")
+        .filter_map(Result::ok)
+    {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with(CODEX_REDUCTION) || !name.ends_with(".jsonl") {
+            continue;
+        }
+        let text = std::fs::read_to_string(e.path()).expect("a reduction");
+        let build = claude_build_of(text.lines().next().unwrap_or(""))
+            .unwrap_or_else(|| panic!("{name} opens with the reducer's line"));
+        assert_eq!(name, format!("{build}.jsonl"), "named for its build");
+        named.push(build.to_string());
+    }
+    named.sort();
+    named.dedup();
+    assert!(named.contains(&"2.1.303".to_string()), "{named:?}");
+    assert_eq!(
+        MEASURED_BUILDS, named,
+        "the builds the committed reductions name, and no other"
+    );
+    assert_eq!(claude_build_of("# claude - · lab reduce"), None);
+    assert_eq!(claude_build_of("# codex 2.1.303 · lab reduce"), None);
 }
 
 /// A listed build with no reduction fails the guard, and so does a reduction no listed build names.

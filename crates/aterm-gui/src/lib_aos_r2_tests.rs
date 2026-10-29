@@ -304,47 +304,64 @@ fn secure_keyboard_entry_refuses_an_attach_and_a_key_under_it_detaches() {
 }
 
 #[test]
-fn sparkles_paper_gold_is_not_recorded_and_putting_it_on_detaches_with_a_timeline_row() {
+fn sparkles_paper_gold_is_recorded_in_tick_config_and_stays_attached_across_style_switches() {
     let t0 = Instant::now();
     let mut gold = momentum_app(true);
     gold.config.cursor_trail_style = Some("sparkle".into());
     gold.kitty_cursor_enabled_cache = None;
     gold.recompute_sparkle();
     gold.redraw_window_at(WID, t0);
+    gold.aos_attach_at(MomentumCode::Shipped, t0)
+        .expect("Sparkle on a light theme attaches under schema v2");
+    assert!(status(&gold).attached);
+    let at = type_keys(&mut gold, t0 + KEY_GAP, 4);
+    let log = exported_log(&gold, t0);
     assert!(
-        gold.windows[&WID].fx.cursor().momentum.light_vivid(),
-        "fixture: Sparkle on a light theme wears its paper gold"
+        log.iter().any(|ev| matches!(
+            ev,
+            MomentumEvent::Tick { cfg, .. } if cfg.light_vivid
+        )),
+        "Sparkle on a light theme records light_vivid = true in Tick configs: {log:?}"
     );
-    assert_eq!(
-        gold.aos_attach_at(MomentumCode::Shipped, t0).err(),
-        Some(AosRefusal::VividInk)
+    let exported = gold.aos_export_now(None).expect("exports trace");
+    let trace = MomentumTrace::decode(&exported.bytes).expect("decodes");
+    let build = aterm_types::version::build_id();
+    assert!(
+        trace.check(t0, &build).is_ok(),
+        "the exported paper-gold trace checks cleanly"
     );
-    assert!(!status(&gold).attached);
+    gold.aos_repair_at(MomentumCode::Shipped, at + KEY_GAP)
+        .expect("repairs over Sparkle's paper gold");
+    assert!(status(&gold).attached);
 
     let mut app = momentum_app(true);
     app.redraw_window_at(WID, t0);
     app.aos_attach_at(MomentumCode::Shipped, t0)
         .expect("the walk-toward-white ink attaches");
-    let at = type_keys(&mut app, t0 + KEY_GAP, 2);
-    app.windows
-        .get_mut(&WID)
-        .expect("window")
-        .fx
-        .cursor_mut()
-        .momentum
-        .set_light_vivid(true);
-    assert!(!status(&app).attached, "putting the ink on detached");
+    let switched = type_keys(&mut app, t0 + KEY_GAP, 2);
+    app.config.cursor_trail_style = Some("sparkle".into());
+    app.kitty_cursor_enabled_cache = None;
+    app.recompute_sparkle();
+    let _ = type_keys(&mut app, switched + KEY_GAP, 2);
+    assert!(
+        status(&app).attached,
+        "putting Sparkle's paper gold on keeps the recording attached"
+    );
     app.aos_watch();
     assert!(
-        app.aos_ls_now()
-            .iter()
-            .any(|l| l == "slot=0 row=0 detached why=vivid_light-page_ink"),
+        !app.aos_ls_now().iter().any(|l| l.contains("detached why=")),
         "{:?}",
         app.aos_ls_now()
     );
-    assert_eq!(
-        app.aos_attach_at(MomentumCode::Shipped, at).err(),
-        Some(AosRefusal::VividInk)
+    let switched_log = exported_log(&app, t0);
+    assert!(
+        switched_log
+            .iter()
+            .any(|ev| matches!(ev, MomentumEvent::Tick { cfg, .. } if !cfg.light_vivid))
+            && switched_log
+                .iter()
+                .any(|ev| matches!(ev, MomentumEvent::Tick { cfg, .. } if cfg.light_vivid)),
+        "the recording spans both inks in one epoch: {switched_log:?}"
     );
 }
 

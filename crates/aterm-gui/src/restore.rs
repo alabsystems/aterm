@@ -574,9 +574,13 @@ impl AgentRestore {
                         .is_some_and(aterm_agent::harness::upgrade_agy::is_conversation_uuid)
                         && aterm_agent::harness::upgrade_agy::is_tui_argv(&self.argv)
                 }
-                Some(RunRestore::Codex(_)) | None => {
-                    agent_resumes(self.session.as_deref(), &self.argv)
+                Some(RunRestore::Codex(_)) => {
+                    self.session
+                        .as_deref()
+                        .is_some_and(aterm_agent::harness::upgrade::is_session_id)
+                        && aterm_agent::harness::codex_alab::is_tui_argv(&self.argv)
                 }
+                None => agent_resumes(self.session.as_deref(), &self.argv),
             }
     }
 
@@ -605,9 +609,46 @@ impl AgentRestore {
         })
     }
 
-    /// THE LINE A PERSON TYPES IN THE REOPENED TAB TO RESUME THIS AGENT ON ITS CONVERSATION.
+    #[cfg(test)]
     pub(crate) fn resume_line(&self) -> Option<String> {
-        use aterm_agent::harness::accounts::{HOME_ENV, LOGIN_ENV};
+        self.resume_line_at(None)
+    }
+
+    /// THE LINE A PERSON TYPES IN THE REOPENED TAB TO RESUME THIS AGENT ON ITS CONVERSATION.
+    ///
+    /// Routes a Codex conversation off a pool row `seat`'s records mark limited, signed out or not
+    /// signed in here ([`aterm_agent::harness::accounts_pool::cold_resume_env`]). Called off the
+    /// main thread when `seat` is present: the recorded executable's capability is read there.
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "ColdResumeEnvironment",
+            action = "NextCase",
+            reason = "Select a healthy account or either direction of a held account reroute."
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "ColdResumeEnvironment",
+            action = "Contaminate",
+            reason = "Run the native command in a shell with inherited account selectors."
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "ColdResumeEnvironment",
+            action = "Render",
+            project = "aterm_gui::restore::cold_resume_environment_tests::environment_transition"
+        )
+    )]
+    pub(crate) fn resume_line_at(
+        &self,
+        seat: Option<&aterm_agent::harness::accounts_pool::Seat<'_>>,
+    ) -> Option<String> {
+        use aterm_agent::harness::accounts::{Cli, HOME_ENV, LOGIN_ENV};
+        use aterm_agent::harness::codex_alab::{AUTH_PATH_ENV, HOME_ENV as CODEX_HOME_ENV};
         use aterm_agent::harness::upgrade::{Agent, Dialect, is_session_id, quote};
         let word = |w: &str| -> Option<String> {
             if w.chars()
@@ -647,6 +688,8 @@ impl AgentRestore {
             }
         };
         let conversation = self.session.as_deref().filter(|id| is_session_id(id))?;
+        let mut routed_alab: Option<AlabRestore> = None;
+        let mut routed_unset = Vec::new();
         let (env, line) = match run {
             None => (
                 [
@@ -664,25 +707,85 @@ impl AgentRestore {
             ),
             Some(RunRestore::Codex(CodexRestore {
                 alab: Some(alab), ..
-            })) if alab.is_valid() => (
-                alab.codex_home
-                    .as_deref()
-                    .map(|home| ("CODEX_HOME", home))
-                    .into_iter()
-                    .chain(
-                        alab.codex_auth_path
-                            .as_deref()
-                            .map(|auth| ("CODEX_AUTH_PATH", auth)),
+            })) if alab.is_valid() => {
+                if let Some(seat) = seat {
+                    let ran_env: Vec<(&str, &str)> = alab
+                        .codex_home
+                        .as_deref()
+                        .map(|home| (CODEX_HOME_ENV, home))
+                        .into_iter()
+                        .chain(
+                            alab.codex_auth_path
+                                .as_deref()
+                                .map(|auth| (AUTH_PATH_ENV, auth)),
+                        )
+                        .collect();
+                    if let Some(pick) = aterm_agent::harness::accounts_pool::cold_resume_env(
+                        seat,
+                        Cli::Codex,
+                        &ran_env,
+                        std::path::Path::new(alab.argv.first()?),
                     )
-                    .collect(),
-                alab.argv
-                    .iter()
-                    .map(|w| word(w))
-                    .collect::<Option<Vec<_>>>()?
-                    .join(" "),
-            ),
+                    .ok()?
+                    {
+                        let mut unset =
+                            aterm_agent::harness::relaunch::pool_args(Cli::Codex, &pick, None, &[])
+                                .ok()?
+                                .unset;
+                        let mut candidate = alab.clone();
+                        candidate.codex_auth_path = pick.value;
+                        if !candidate.is_valid() {
+                            return None;
+                        }
+                        if candidate.codex_home.as_deref().is_none_or(str::is_empty)
+                            && !unset.contains(&CODEX_HOME_ENV)
+                        {
+                            unset.push(CODEX_HOME_ENV);
+                        }
+                        routed_unset = unset;
+                        routed_alab = Some(candidate);
+                    }
+                }
+                let effective = routed_alab.as_ref().unwrap_or(alab);
+                (
+                    effective
+                        .codex_home
+                        .as_deref()
+                        .filter(|home| !(routed_alab.is_some() && home.is_empty()))
+                        .map(|home| (CODEX_HOME_ENV, home))
+                        .into_iter()
+                        .chain(
+                            effective
+                                .codex_auth_path
+                                .as_deref()
+                                .map(|auth| (AUTH_PATH_ENV, auth)),
+                        )
+                        .collect(),
+                    effective
+                        .argv
+                        .iter()
+                        .map(|w| word(w))
+                        .collect::<Option<Vec<_>>>()?
+                        .join(" "),
+                )
+            }
             Some(RunRestore::Muse(_) | RunRestore::Agy(_) | RunRestore::Codex(_)) => return None,
         };
+        if let Some(alab) = &routed_alab {
+            let (exe, args) = alab.argv.split_first()?;
+            // A routed suggestion must carry its removals even when the original
+            // shell has acquired another login or home since the session ended.
+            return aterm_agent::harness::upgrade::relaunch_line_env_clear(
+                Dialect::Zsh,
+                None,
+                None,
+                &env,
+                &routed_unset,
+                Path::new(exe),
+                args,
+            )
+            .ok();
+        }
         let mut said = String::new();
         for (name, value) in env {
             said.push_str(name);
@@ -3745,6 +3848,10 @@ fn store_cell_metrics_to(
     .map_err(String::from)
 }
 
+#[cfg(all(test, unix))]
+#[path = "cold_resume_environment_tests.rs"]
+mod cold_resume_environment_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6595,7 +6702,7 @@ metadata = "opaque=copy-me"
                 "{format}: the validated line, unchanged"
             );
         }
-        let wire = aterm_toml::to_string(&AgentRestore::of(alab)).expect("the leaf");
+        let wire = aterm_toml::to_string(&AgentRestore::of(alab.clone())).expect("the leaf");
         assert!(wire.contains("[codex.alab]"), "{wire}");
         assert_eq!(
             aterm_toml::from_str::<AgentRestore>(&wire)
@@ -6607,6 +6714,30 @@ metadata = "opaque=copy-me"
                  /Users//me/.aterm/agents/codex --no-alt-screen resume {SESSION}"
             )),
             "the person's line is the validated one"
+        );
+        let with_profile = AgentRestore::of(Snapshot {
+            argv: vec![
+                "/Users//me/.aterm/agents/codex".into(),
+                "-p".into(),
+                "work".into(),
+            ],
+            ..alab.clone()
+        });
+        assert!(
+            with_profile.resumes(),
+            "Codex's -p <profile> is an interactive TUI flag, not Claude's -p one-shot"
+        );
+        let non_tui = AgentRestore::of(Snapshot {
+            argv: vec![
+                "/Users//me/.aterm/agents/codex".into(),
+                "exec".into(),
+                "hi".into(),
+            ],
+            ..alab
+        });
+        assert!(
+            !non_tui.resumes(),
+            "a non-TUI Codex subcommand never marks resumes"
         );
         let older = wire
             .split("[codex.alab]")
@@ -7274,5 +7405,133 @@ metadata = "opaque=copy-me"
             }
         }
         assert!(wrong.is_empty(), "made under umask 002: {wrong:#?}");
+    }
+
+    #[test]
+    fn held_codex_resume_line_at_routes_off_recorded_limited_or_unenrolled_row() {
+        use aterm_agent::harness::accounts::{self, Cli, Store};
+        use aterm_agent::harness::accounts_pool::Seat;
+
+        const SESSION: &str = "0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c";
+        const NOW: i64 = 1_800_000_000;
+
+        let tmp = aterm_tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonical tempdir");
+        let cfg = root.join("cfg");
+        let state_dir = root.join("state");
+        let home = root.join("home");
+        let default_codex = home.join(".codex");
+        let work_dir = root.join("work-codex");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(&default_codex).unwrap();
+        std::fs::create_dir_all(&work_dir).unwrap();
+        std::fs::write(default_codex.join("auth.json"), "{}\n").unwrap();
+        let work_auth = work_dir.join("auth.json");
+        std::fs::write(&work_auth, "{}\n").unwrap();
+        let roster_path = cfg.join(Cli::Codex.accounts().roster_file);
+        std::fs::write(
+            &roster_path,
+            format!(
+                "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = {:?}\n",
+                work_dir.display().to_string()
+            ),
+        )
+        .unwrap();
+
+        let seat = Seat {
+            config_dir: &cfg,
+            state: &state_dir,
+            home: &home,
+            now: NOW,
+        };
+        let work_auth_str = work_auth.display().to_string();
+        let exe = aterm_agent::harness::codex_alab::lay_package(&root.join("package"), true);
+        let exe = exe.to_str().unwrap();
+        let make_restore = |auth_path: Option<&str>| {
+            AgentRestore::of(aterm_agent::harness::relaunch::Snapshot {
+                tab: "s-held".into(),
+                pid: 4242,
+                start: "Wed Oct 28 08:00:00 2026".into(),
+                shell: 4141,
+                program: exe.into(),
+                argv: vec![exe.into()],
+                session: Some(SESSION.into()),
+                cwd: "/work".into(),
+                version: Some("0.1.0".into()),
+                run: AgentRun::Codex(aterm_agent::harness::relaunch::CodexRun {
+                    home: default_codex.clone(),
+                    home_env: None,
+                    self_claimed: Some(aterm_agent::harness::self_claimed::Resume {
+                        argv: vec![
+                            exe.into(),
+                            "--no-alt-screen".into(),
+                            "resume".into(),
+                            SESSION.into(),
+                        ],
+                        session: SESSION.into(),
+                        codex_home: None,
+                        codex_auth_path: auth_path.map(str::to_owned),
+                        cwd: Some("/work".into()),
+                    }),
+                }),
+                dialect: None,
+                claude_dir: None,
+                login: None,
+                home: None,
+                stored_login: false,
+                profile: None,
+            })
+        };
+
+        let on_work = make_restore(Some(&work_auth_str));
+        // Negative control: while `work` still serves, `resume_line_at` keeps `work`'s `CODEX_AUTH_PATH`.
+        assert_eq!(
+            on_work.resume_line_at(Some(&seat)),
+            Some(format!(
+                "CODEX_AUTH_PATH={work_auth_str} {exe} --no-alt-screen resume {SESSION}"
+            ))
+        );
+
+        // Record a wall on `work`: the default row explicitly clears inherited selectors.
+        let store = Store::at_for(&state_dir, Cli::Codex, &home);
+        store
+            .transact_within(&accounts::LOCK_LADDER, NOW, &mut None, |state| {
+                Ok(accounts::note_wall(
+                    state,
+                    "work",
+                    "5h",
+                    Some(NOW + 3_600),
+                    NOW,
+                    NOW,
+                ))
+            })
+            .expect("record wall");
+        assert_eq!(
+            on_work.resume_line_at(Some(&seat)),
+            Some(format!(
+                " '/usr/bin/env' -u 'CODEX_AUTH_PATH' -u 'CODEX_API_KEY' -u 'CODEX_ACCESS_TOKEN' \
+                 -u 'CODEX_HOME' '{exe}' '--no-alt-screen' 'resume' '{SESSION}'"
+            )),
+            "limited `work` routes onto serving default row `main`"
+        );
+
+        // Reverse direction: a held tab on `main` whose default `auth.json` is missing routes onto
+        // `work` once `work`'s wall has expired.
+        std::fs::remove_file(default_codex.join("auth.json")).unwrap();
+        let on_main = make_restore(None);
+        let later = Seat {
+            now: NOW + 7_200,
+            ..seat
+        };
+        assert_eq!(
+            on_main.resume_line_at(Some(&later)),
+            Some(format!(
+                " '/usr/bin/env' -u 'CODEX_API_KEY' -u 'CODEX_ACCESS_TOKEN' -u 'CODEX_HOME' \
+                 'CODEX_AUTH_PATH={work_auth_str}' '{exe}' \
+                 '--no-alt-screen' 'resume' '{SESSION}'"
+            )),
+            "unenrolled default row `main` routes onto serving `work`"
+        );
     }
 }

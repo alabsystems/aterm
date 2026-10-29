@@ -13,12 +13,14 @@ impl Row {
     #[inline]
     pub fn write_char(&mut self, col: u16, c: char) -> bool {
         let col_usize = col as usize;
+        if col_usize >= self.cells.len() {
+            return false;
+        }
         let old_len = self.len as usize;
         let mut end_half_blanked = false;
 
-        if self.flags.contains(RowFlags::HAS_WIDE_CHARS)
-            && let Some(current_flags) = self.cells.get(col_usize).map(|c| c.flags())
-        {
+        if self.flags.contains(RowFlags::HAS_WIDE_CHARS) {
+            let current_flags = self.cells[col_usize].flags();
             if self.is_cell_wide_continuation(col)
                 && let Some(prev_cell) = self.cells.get_mut((col - 1) as usize)
             {
@@ -32,9 +34,6 @@ impl Row {
             }
         }
 
-        if col_usize >= self.cells.len() {
-            return false;
-        }
         self.cells[col_usize].set_char(c);
         self.note_write_through(col_usize + 1);
         self.settle_len_after_write(old_len, col_usize + 1, end_half_blanked);

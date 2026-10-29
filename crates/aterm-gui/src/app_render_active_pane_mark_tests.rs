@@ -146,12 +146,22 @@ fn the_repaint_key_term_is_zero_for_no_mark_and_moves_with_the_rectangle() {
     assert_eq!(ActivePaneMark::key_term(None), 0);
     let left = ActivePaneMark::resolve(true, true, (0, 0, 4, 5));
     let right = ActivePaneMark::resolve(true, true, (0, 6, 4, 5));
-    assert_ne!(ActivePaneMark::key_term(left), 0);
-    assert_ne!(
+    let tall = ActivePaneMark::resolve(true, true, (0, 0, 5, 5));
+    let wide = ActivePaneMark::resolve(true, true, (0, 0, 4, 6));
+    let lower = ActivePaneMark::resolve(true, true, (1, 0, 4, 5));
+    let terms = [
         ActivePaneMark::key_term(left),
         ActivePaneMark::key_term(right),
-        "focus moving to the sibling pane must reach glass"
-    );
+        ActivePaneMark::key_term(tall),
+        ActivePaneMark::key_term(wide),
+        ActivePaneMark::key_term(lower),
+    ];
+    for (i, &a) in terms.iter().enumerate() {
+        assert_ne!(a, 0);
+        for &b in &terms[i + 1..] {
+            assert_ne!(a, b, "distinct pane rectangles must pack to distinct keys");
+        }
+    }
 }
 
 #[test]

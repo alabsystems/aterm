@@ -351,13 +351,13 @@ pub fn semver_class(version: &str) -> String {
     if major != "0" {
         return major.to_string();
     }
-    let minor = parts.next().unwrap_or_default();
-    if minor != "0" {
-        return format!("0.{minor}");
-    }
     match parts.next() {
-        Some(patch) => format!("0.0.{patch}"),
-        None => "0.0".to_string(),
+        None | Some("") => "0".to_string(),
+        Some(minor) if minor != "0" => format!("0.{minor}"),
+        Some(_) => match parts.next() {
+            None | Some("") => "0.0".to_string(),
+            Some(patch) => format!("0.0.{patch}"),
+        },
     }
 }
 
@@ -379,6 +379,9 @@ fn known_semver_class(version: &str) -> Option<String> {
                 || p.parse::<u64>().is_err()
         })
     {
+        return None;
+    }
+    if parts[0] == "0" && (parts.len() == 1 || (parts[1] == "0" && parts.len() < 3)) {
         return None;
     }
     Some(semver_class(number))
@@ -599,17 +602,17 @@ mod tests {
 loc_method = "rs-physical-all-files-v1"
 graph_method = "cargo-tree-normal-no-dedupe-locked-offline-v1"
 
-# --- winit 0.30.13 -----------------------------------------------------------
-# The Wayland DnD patch. THIS PARAGRAPH is why the fork exists, and a round-trip
+# --- indexmap 2.14.0 ---------------------------------------------------------
+# Vendored patch fixture. THIS PARAGRAPH is why the fork exists, and a round-trip
 # that eats it defeats the file.
 [[fork]]
-name = "winit"
-version = "0.30.13"
-path = "vendor/winit"
+name = "indexmap"
+version = "2.14.0"
+path = "vendor/indexmap"
 license = "Apache-2.0"
 apache_notice = true
 census.mode = "scanned"
-census.namespace = "winit"
+census.namespace = "indexmap"
 
 # smol_str is dual-licensed, so it owes no §4(b) notices.
 [[fork]]
@@ -625,16 +628,16 @@ census.namespace = "smol_str"
     fn forks_are_modeled_including_census_and_notice() {
         let p = parse(SAMPLE).unwrap();
         assert_eq!(p.forks.len(), 2);
-        let winit = p
+        let idx = p
             .forks
             .iter()
-            .find(|f| f.name == "winit")
-            .expect("winit block");
-        assert_eq!(winit.version, "0.30.13");
-        assert_eq!(winit.license, "Apache-2.0");
-        assert!(winit.apache_notice);
-        assert_eq!(winit.census_mode, CensusMode::Scanned);
-        assert_eq!(winit.census_namespace.as_deref(), Some("winit"));
+            .find(|f| f.name == "indexmap")
+            .expect("indexmap block");
+        assert_eq!(idx.version, "2.14.0");
+        assert_eq!(idx.license, "Apache-2.0");
+        assert!(idx.apache_notice);
+        assert_eq!(idx.census_mode, CensusMode::Scanned);
+        assert_eq!(idx.census_namespace.as_deref(), Some("indexmap"));
         let ss = p
             .forks
             .iter()
@@ -647,11 +650,14 @@ census.namespace = "smol_str"
     #[test]
     fn a_ledger_that_does_not_parse_cleanly_is_refused() {
         let dup = format!(
-            "{SAMPLE}\n[[fork]]\nname = \"winit\"\nversion = \"0.30.13\"\n\
-             path = \"vendor/winit\"\nlicense = \"Apache-2.0\"\ncensus.mode = \"scanned\"\n\
-             census.namespace = \"winit\"\n"
+            "{SAMPLE}\n[[fork]]\nname = \"indexmap\"\nversion = \"2.14.0\"\n\
+             path = \"vendor/indexmap\"\nlicense = \"Apache-2.0\"\ncensus.mode = \"scanned\"\n\
+             census.namespace = \"indexmap\"\n"
         );
-        let headerless = format!("# --- winit{}", SAMPLE.split("# --- winit").nth(1).unwrap());
+        let headerless = format!(
+            "# --- indexmap{}",
+            SAMPLE.split("# --- indexmap").nth(1).unwrap()
+        );
         for (name, text) in [
             (
                 "an unknown key",
@@ -663,7 +669,7 @@ census.namespace = "smol_str"
             ),
             (
                 "a scanned fork without a namespace",
-                SAMPLE.replace("census.namespace = \"winit\"\n", ""),
+                SAMPLE.replace("census.namespace = \"indexmap\"\n", ""),
             ),
             (
                 "a retired census mode",
@@ -689,6 +695,8 @@ census.namespace = "smol_str"
         for (v, class) in [
             ("1.4.2", "1"),
             ("^1.4", "1"),
+            ("0", "0"),
+            ("0.0", "0.0"),
             ("0.52.0", "0.52"),
             ("0.52", "0.52"),
             ("=0.52.0", "0.52"),
@@ -706,6 +714,12 @@ census.namespace = "smol_str"
         assert!(in_row_scope(true, Some("0.52.0"), "0.52.3"));
         assert!(!in_row_scope(true, Some("0.52.0"), "0.61.2"));
         assert!(!in_row_scope(true, Some("0.52.0"), "0.61"));
+        assert!(in_row_scope(true, Some("0.52.0"), "0"));
+        assert!(in_row_scope(true, Some("0.52.0"), "0.0"));
+        assert!(in_row_scope(true, Some("0.0.3"), "0"));
+        assert!(in_row_scope(true, Some("0.0.3"), "0.0"));
+        assert!(in_row_scope(true, Some("0.0.3"), "0.0.3"));
+        assert!(!in_row_scope(true, Some("0.0.3"), "0.0.4"));
         assert!(in_row_scope(false, Some("0.52.0"), "0.61.2"));
         assert!(in_row_scope(true, None, "0.61.2"));
     }

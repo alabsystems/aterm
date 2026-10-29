@@ -23,7 +23,7 @@ impl MotionMode {
         !matches!(self, Self::Full)
     }
 
-    /// Parse a config string (case-insensitive, trimmed); unknown → [`Self::Auto`] (use the platform accessibility sample when available).
+    /// Parse a config string (case-insensitive, trimmed); unknown → [`Self::Auto`] (use the platform accessibility sample when available). `none` and `off` ask for no motion, so they read as [`Self::Reduced`]: read as unknown, a config written to stop motion played it in full wherever the system allowed.
     #[must_use]
     #[inline]
     pub const fn parse(s: &str) -> Self {
@@ -31,7 +31,11 @@ impl MotionMode {
         let s = trim_whitespace_bytes(s);
         if eq_ascii_ci(s, "full") {
             Self::Full
-        } else if eq_ascii_ci(s, "reduced") || eq_ascii_ci(s, "reduce") {
+        } else if eq_ascii_ci(s, "reduced")
+            || eq_ascii_ci(s, "reduce")
+            || eq_ascii_ci(s, "none")
+            || eq_ascii_ci(s, "off")
+        {
             Self::Reduced
         } else {
             Self::Auto
@@ -256,7 +260,7 @@ mod tests {
     /// depends on focus and the brightness knob, never on the motion policy.
     #[test]
     fn reduce_motion_never_mutes_typing() {
-        use crate::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
+        use crate::cursor_glow::{CursorGlow, Geom, GlowConfig};
         use std::time::{Duration, Instant};
 
         let geom = Geom {
@@ -271,15 +275,6 @@ mod tests {
             head: 0,
         };
         let base = GlowConfig {
-            classic_mono: false,
-            ribbon_tall: true,
-            ribbon_flat: false,
-            enabled: true,
-            dark_theme: true,
-            theme_fg: 0x00C8_D3F5,
-            theme_bg: 0x001A_1B26,
-            style: GlowStyle::RainbowKitty,
-            color: 0x0050_FA7B,
             accent: 0x007A_A2F7,
             duration: Duration::from_millis(240),
             length: 18,
@@ -287,8 +282,7 @@ mod tests {
             audible: true,
             radius: 0.6,
             ring: true,
-            beam: false,
-            head_dx: 0.5,
+            ..Default::default()
         };
         let t0 = Instant::now();
         let mut seen_dark_and_heard = false;
@@ -415,7 +409,8 @@ mod tests {
     }
 
     /// Config parsing: the three documented spellings map to their modes
-    /// (case-insensitively); anything else — including empty — is `Auto`.
+    /// (case-insensitively), `none` and `off` ask for no motion (`Reduced`);
+    /// anything else — including empty — is `Auto`.
     #[test]
     fn mode_parses_documented_spellings() {
         const REDUCED: MotionMode = MotionMode::parse("\u{00a0}REDUCE\u{2003}");
@@ -426,6 +421,8 @@ mod tests {
         assert_eq!(MotionMode::parse("Full"), MotionMode::Full);
         assert_eq!(MotionMode::parse(" REDUCED "), MotionMode::Reduced);
         assert_eq!(MotionMode::parse("reduce"), MotionMode::Reduced);
+        assert_eq!(MotionMode::parse("none"), MotionMode::Reduced);
+        assert_eq!(MotionMode::parse(" Off "), MotionMode::Reduced);
         for (raw, want) in [
             ("\u{00a0}Full\u{2003}", MotionMode::Full),
             ("\u{2003}REDUCED\u{00a0}", MotionMode::Reduced),

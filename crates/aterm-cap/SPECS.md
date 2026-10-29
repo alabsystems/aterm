@@ -45,10 +45,11 @@ that closes it, but the machine's `trust` channel has not been flipped to it.
 - `MintModel` is the claim `NoUntrustedTop`: no crate outside `Launchers` obtains a root
   `Authority`. No derived model encodes it; its earlier one was unbound and was deleted.
 - `Guard` is the aterm-census `launcher-mint` guard (`crates/aterm-census/src/guards/mint.rs`, run by
-  `verify census`). Outside `Launchers` it reports every shipped line under a crate's `src/` whose
-  code names `root_authority`, and every shipped table of the root `Cargo.toml` or a
-  `crates/<name>/Cargo.toml` that enables `aterm-cap/launcher-mint`. Test items, test files and
-  dev-dependency edges are not read.
+  `verify census`). Outside `Launchers` it reports every shipped non-test product `.rs` line (`src/`,
+  `build.rs`, `examples/` and `benches/`) whose code names `root_authority`, and every shipped table
+  of the root `Cargo.toml` or a `crates/<name>/Cargo.toml` that enables `aterm-cap/launcher-mint`
+  (including dotted `[dependencies.*]` tables and renamed `package = "aterm-cap"` / path aliases).
+  Test items, test files and dev-dependency edges are not read.
 
 ## 1. Specs (TSV)
 
@@ -119,16 +120,16 @@ src/lib.rs	require_gates_on_tier	require-gate	cap-grant-tier, cap-satisfies-is-t
    among them), which the shipped `aterm` crate depends on. It checks only who names the symbol,
    not who can reach a call of it through a launcher's library API, which is what
    `NoUntrustedTop` claims. That is clause (e).
-3. **`Guard` is a text check.** It closes two holes of the deleted scan: it masks only the items
-   whose `cfg` proves them test-only, so a production call after a `#[cfg(test)]` item is still
-   read, and it matches the word `root_authority`, so a call through an alias of `Authority` is
-   still found. It reads only files under a crate's `src/`, so a mint in `build.rs`, `examples/` or
-   `benches/` is not inspected. The MIR call-edge statement in clause (b) has none of these holes.
-4. **`Guard` reads manifests as TOML.** It reads `[dependencies]`, `[target.…]` and
-   `[workspace.dependencies]` edges keyed `aterm-cap`, and `[features]` items forwarding
-   `aterm-cap/launcher-mint` or `aterm-cap?/launcher-mint`; dev and build edges are skipped. It
-   finds the dependency by its key, so a renamed dependency (`cap = { package = "aterm-cap", ... }`)
-   is not read. Clause (c) should be read from `cargo metadata`'s resolved features.
+3. *(Partially resolved)* **`Guard` is a text check.** It closes the deleted scan's holes and now
+   inspects every non-test `.rs` target under `crates/` (`src/`, `build.rs`, `examples/`, and
+   `benches/`), masking only items whose `cfg` proves them test-only and matching the word
+   `root_authority` across aliases of `Authority`. The MIR call-edge statement in clause (b) still
+   replaces lexical scanning when Trust exposes workspace call graphs.
+4. *(Partially resolved)* **`Guard` reads manifests as TOML.** It reads `[dependencies]`,
+   `[dependencies.<name>]`, `[target.…]` and `[workspace.dependencies]` edges targeting `aterm-cap`
+   (by key, `package = "aterm-cap"`, or `path`), and `[features]` items forwarding
+   `<alias>/launcher-mint` or `<alias>?/launcher-mint`; dev and build edges are skipped. Clause (c)
+   will still move to `cargo metadata`'s resolved features when proved.
 5. **The seal has no negative control.** The cfg itself is the seal: without `test` or
    `launcher-mint` the item does not exist. `#[doc(hidden)]` has no effect on reachability.
    Nothing compiles a crate without the feature and checks that naming the mint fails; that

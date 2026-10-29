@@ -511,6 +511,9 @@ pub fn supervisor_cruise_model() -> Model {
             var rested = 0;
             var same = 0;
             var typed_same = 0;
+            var down = 0;
+            var capped = 0;
+            var typed_down = 0;
 
             action Tasked when (managed == 0) {
                 managed = 1;
@@ -575,6 +578,19 @@ pub fn supervisor_cruise_model() -> Model {
             action BackgroundEnds when (bg == 1) {
                 bg = 0;
             }
+            action NetDown when (down == 0) {
+                down = 1;
+            }
+            action NetUp when (down == 1) {
+                down = 2;
+            }
+            action OutageCapDue when (
+                down == 1 && capped == 0 && pending == 0 && bg == 0 && walled == 0 &&
+                rested == 0 && (same <= 1 || Buggy == 2) &&
+                (backoff == 0 || (managed == 1 && short <= 3 && (claim == 1 || asked == 1)))
+            ) {
+                capped = 1;
+            }
             action FinishOverBackground when (Buggy == 1 && bg == 1 && rested == 0) {
                 rested = 1;
             }
@@ -589,31 +605,38 @@ pub fn supervisor_cruise_model() -> Model {
             action Continue when (
                 pending == 0 && bg == 0 && walled == 0 && asked == 0 && rested == 0 &&
                 (backoff == 0 || Buggy == 1) && (claim == 0 || Buggy == 1) &&
-                (same <= 1 || Buggy == 2)
+                (same <= 1 || Buggy == 2) &&
+                (down == 0 || down == 2 || capped == 1 || Buggy == 3)
             ) {
                 unchecked = if claim == 1 { 1 } else { unchecked };
                 typed_same = if same == 2 { 1 } else { typed_same };
+                typed_down = if down == 1 && capped == 0 { 1 } else { typed_down };
                 open = 0;
                 pending = 1;
             }
             action Check when (
                 pending == 0 && (bg == 0 || Buggy == 1) && walled == 0 && claim == 1 &&
                 rested == 0 && (same <= 1 || Buggy == 2) &&
-                (backoff == 0 || (managed == 1 && short <= 3 && (Buggy == 0 || Buggy == 2)))
+                (down == 0 || down == 2 || capped == 1 || Buggy == 3) &&
+                (backoff == 0 ||
+                    (managed == 1 && short <= 3 && (Buggy == 0 || Buggy == 2 || Buggy == 3)))
             ) {
                 rushed = if backoff == 1 && short > 3 { 1 } else { rushed };
                 typed_same = if same == 2 { 1 } else { typed_same };
                 typed_busy = if bg == 1 { 1 } else { typed_busy };
+                typed_down = if down == 1 && capped == 0 { 1 } else { typed_down };
                 open = 0;
                 pending = 2;
             }
             action Answer when (
                 pending == 0 && bg == 0 && walled == 0 && asked == 1 && claim == 0 &&
                 rested == 0 && (same <= 1 || Buggy == 2) &&
+                (down == 0 || down == 2 || capped == 1 || Buggy == 3) &&
                 (backoff == 0 || (managed == 1 && (short <= 3 || Buggy == 1)))
             ) {
                 rushed = if backoff == 1 && short > 3 { 1 } else { rushed };
                 typed_same = if same == 2 { 1 } else { typed_same };
+                typed_down = if down == 1 && capped == 0 { 1 } else { typed_down };
                 asked = 0;
                 pending = 4;
             }
@@ -622,7 +645,8 @@ pub fn supervisor_cruise_model() -> Model {
                 (same <= 1 || Buggy == 2) && (
                     (claim == 0 && asked == 0) ||
                     (claim == 1 && (managed == 0 || short > 3 || Buggy == 1)) ||
-                    (asked == 1 && (managed == 0 || (short > 3 && (Buggy == 0 || Buggy == 2))))
+                    (asked == 1 &&
+                        (managed == 0 || (short > 3 && (Buggy == 0 || Buggy == 2 || Buggy == 3))))
                 )
             ) {
                 waited = if managed == 1 && short <= 3 && (claim == 1 || asked == 1) {
@@ -709,6 +733,7 @@ pub fn supervisor_cruise_model() -> Model {
             invariant AWorkerThatKeepsAskingWaitsTheBackOff: rushed == 0;
             invariant TheBusyScreenGetsNoAct: typed_busy == 0;
             invariant ANoWorkReplyGetsOneMoreActAtMost: typed_same == 0;
+            invariant NoContinuationIsTypedIntoAMeasuredOutageBeforeItsCap: typed_down == 0;
         }
     }
 }
@@ -732,7 +757,6 @@ pub fn supervisor_land_model() -> Model {
             var short = 0;
             var backoff = 0;
             var landed = 0;
-            var left = 0;
             var other = 0;
             var told = 0;
             var nudges = 0;
@@ -746,13 +770,31 @@ pub fn supervisor_land_model() -> Model {
             var same = 0;
             var typed_same = 0;
             var withheld = 0;
+            var down = 0;
+            var capped = 0;
+            var typed_down = 0;
 
+            action NetDown when (down == 0) {
+                down = 1;
+            }
+            action NetUp when (down == 1) {
+                down = 2;
+            }
+            action OutageCapDue when (
+                down == 1 && capped == 0 && pending == 0 && walled == 0 && other == 0 &&
+                quiet == 0 && held == 0 && (same <= 1 || Buggy == 3) &&
+                (backoff == 0 || (typed == 0 && asked == 0))
+            ) {
+                capped = 1;
+            }
             action Instruction when (
                 pending == 0 && walled == 0 && asked == 0 && typed == 0 &&
-                (if Buggy == 4 { backoff } else { 0 }) == 0 && landed == 0 && left == 0 &&
-                other == 0 && quiet == 0 && held == 0 && (same <= 1 || Buggy == 3)
+                (if Buggy == 4 { backoff } else { 0 }) == 0 && landed == 0 && other == 0 &&
+                quiet == 0 && held == 0 && (same <= 1 || Buggy == 3) &&
+                (down == 0 || down == 2 || capped == 1 || Buggy == 5)
             ) {
                 typed_same = if same == 2 { 1 } else { typed_same };
+                typed_down = if down == 1 && capped == 0 { 1 } else { typed_down };
                 typed = 1;
                 pending = 1;
                 relanded = 0;
@@ -761,11 +803,13 @@ pub fn supervisor_land_model() -> Model {
             }
             action Nudge when (
                 pending == 0 && walled == 0 && asked == 0 && typed == 1 && backoff == 0 &&
-                (landed == 0 || Buggy == 1) && left == 0 && other == 0 && quiet == 0 &&
-                held == 0 && (same <= 1 || Buggy == 3)
+                (landed == 0 || Buggy == 1) && other == 0 && quiet == 0 &&
+                held == 0 && (same <= 1 || Buggy == 3) &&
+                (down == 0 || down == 2 || capped == 1 || Buggy == 5)
             ) {
                 typed_landed = if landed == 1 { 1 } else { typed_landed };
                 typed_same = if same == 2 { 1 } else { typed_same };
+                typed_down = if down == 1 && capped == 0 { 1 } else { typed_down };
                 nudges = if Buggy == 1 && nudges <= 1 { nudges + 1 } else { nudges };
                 pending = 1;
                 relanded = 0;
@@ -774,9 +818,11 @@ pub fn supervisor_land_model() -> Model {
             }
             action Answer when (
                 pending == 0 && walled == 0 && asked == 1 && backoff == 0 && landed == 0 &&
-                left == 0 && other == 0 && quiet == 0 && held == 0 && (same <= 1 || Buggy == 3)
+                other == 0 && quiet == 0 && held == 0 && (same <= 1 || Buggy == 3) &&
+                (down == 0 || down == 2 || capped == 1 || Buggy == 5)
             ) {
                 typed_same = if same == 2 { 1 } else { typed_same };
+                typed_down = if down == 1 && capped == 0 { 1 } else { typed_down };
                 asked = 0;
                 pending = if typed == 1 { 1 } else { 2 };
                 relanded = 0;
@@ -784,15 +830,15 @@ pub fn supervisor_land_model() -> Model {
                 hlegs = if typed == 0 { 0 } else { hlegs };
             }
             action WallAct when (
-                pending == 0 && walled == 1 && landed == 0 && left == 0 && (same <= 1 || Buggy == 3)
+                pending == 0 && walled == 1 && landed == 0 && (same <= 1 || Buggy == 3)
             ) {
                 typed_same = if same == 2 { 1 } else { typed_same };
                 walled = 0;
                 pending = 3;
             }
             action BackoffDue when (
-                pending == 0 && walled == 0 && backoff == 1 && landed == 0 && left == 0 &&
-                other == 0 && (same <= 1 || Buggy == 3) &&
+                pending == 0 && walled == 0 && backoff == 1 && landed == 0 && other == 0 &&
+                (same <= 1 || Buggy == 3) &&
                 (typed == 1 || asked == 1 || Buggy == 4)
             ) {
                 withheld = if typed == 0 && asked == 0 { 1 } else { withheld };
@@ -1099,7 +1145,6 @@ pub fn supervisor_land_model() -> Model {
                 short = 0;
                 backoff = 0;
                 landed = 0;
-                left = 0;
                 other = 0;
                 told = 0;
                 judged = 0;
@@ -1116,7 +1161,6 @@ pub fn supervisor_land_model() -> Model {
                 short = 0;
                 backoff = 0;
                 landed = 0;
-                left = 0;
                 other = 0;
                 told = 0;
                 judged = 0;
@@ -1124,21 +1168,23 @@ pub fn supervisor_land_model() -> Model {
                 hlegs = 0;
                 same = 0;
             }
-            action PersonExchange when (
-                pending == 0 && walled == 0 && left == 0 && (said > 0 || landed == 1)
-            ) {
+            // A person's own exchange once the session worked (a reply, or a landing): under Land it
+            // interrupts the work, a turn end Land carries on from as from a person's work (owner
+            // ruling 2026-10-27). The exchange that opens a session is theirs, and lies outside
+            // this model, whose walks begin after a point.
+            action PersonExchange when (pending == 0 && walled == 0 && (said > 0 || landed == 1)) {
                 said = 0;
                 need = 0;
                 dirty = 0;
                 asked = 0;
                 cut = 0;
+                short = 0;
                 backoff = 0;
                 landed = 0;
-                left = 1;
                 other = 0;
-                told = 2;
+                told = 0;
                 judged = 0;
-                hold = 0;
+                hold = if typed == 1 && relanded == 0 { 1 } else { 0 };
                 hlegs = 0;
                 same = 0;
             }
@@ -1150,7 +1196,6 @@ pub fn supervisor_land_model() -> Model {
                 cut = 0;
                 backoff = short;
                 landed = 0;
-                left = 0;
                 other = 0;
                 told = 0;
                 judged = 0;
@@ -1159,8 +1204,7 @@ pub fn supervisor_land_model() -> Model {
                 same = 0;
             }
             action SeedLanded when (
-                pending == 0 && (walled == 0 || Buggy == 1) && need == 0 && left == 0 &&
-                other == 0
+                pending == 0 && (walled == 0 || Buggy == 1) && need == 0 && other == 0
             ) {
                 landed = 1;
                 said = 2;
@@ -1173,13 +1217,13 @@ pub fn supervisor_land_model() -> Model {
             }
             action SpentAfterTwo when (
                 Buggy == 1 && nudges == 2 && pending == 0 && walled == 0 && landed == 0 &&
-                left == 0 && other == 0 && quiet == 0
+                other == 0 && quiet == 0
             ) {
                 quiet = 1;
             }
             action AskHolds when (
                 Buggy == 1 && need == 1 && pending == 0 && walled == 0 && landed == 0 &&
-                left == 0 && other == 0 && held == 0
+                other == 0 && held == 0
             ) {
                 held = 1;
             }
@@ -1191,16 +1235,16 @@ pub fn supervisor_land_model() -> Model {
             invariant NeverTypeIntoALandedTask: typed_landed == 0;
             invariant AWallIsNeverLeftOnALandedTask: walled == 0 || landed == 0;
             invariant ANoWorkReplyGetsOneMoreActAtMost: typed_same == 0;
+            invariant NoContinuationIsTypedIntoAMeasuredOutageBeforeItsCap: typed_down == 0;
             invariant TheInstructionWaitsNoBackOff: withheld == 0;
             invariant TheHostIsToldTheTasksFace:
                 (other == 1 && told == 0) ||
-                (other == 0 && left == 1 && told == 2) ||
-                (other == 0 && left == 0 && landed == 1 && told == 1) ||
-                (other == 0 && left == 0 && landed == 0 && told == 0);
+                (other == 0 && landed == 1 && told == 1) ||
+                (other == 0 && landed == 0 && told == 0);
             invariant TheHostIsToldWhatHoldsTheLanding:
                 (hold == 0 && hlegs == 0 &&
-                    (typed == 0 || relanded == 1 || (other == 0 && (landed == 1 || left == 1)))) ||
-                (typed == 1 && relanded == 0 && (other == 1 || (landed == 0 && left == 0)) &&
+                    (typed == 0 || relanded == 1 || (other == 0 && landed == 1))) ||
+                (typed == 1 && relanded == 0 && (other == 1 || landed == 0) &&
                     ((hold == 1 && judged == 0 && hlegs == 0) ||
                         (hold == 2 && judged == 1 &&
                             (cut == 1 ||
@@ -1226,11 +1270,18 @@ pub fn supervisor_land_liveness() -> Liveness {
                 eq(var("pending"), int(3)),
             ),
             or_(
-                or_(eq(var("landed"), int(1)), eq(var("left"), int(1))),
+                eq(var("landed"), int(1)),
                 or_(eq(var("other"), int(1)), eq(var("same"), int(2))),
             ),
         ),
-        weak: vec!["Instruction", "Nudge", "Answer", "WallAct", "BackoffDue"],
+        weak: vec![
+            "Instruction",
+            "Nudge",
+            "Answer",
+            "WallAct",
+            "BackoffDue",
+            "OutageCapDue",
+        ],
         strong: vec![],
         mutants: vec!["SpentAfterTwo", "AskHolds"],
     }

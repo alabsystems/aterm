@@ -2213,6 +2213,7 @@ mod tests {
     #[test]
     fn the_menu_bar_publishes_what_the_palette_resolves() {
         use crate::menu::{MenuAction, menu_live, native_live_title, set_menu_live};
+        use crate::native_app::{AppEvent, TextInputEvent};
         let before = menu_live();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -2232,6 +2233,7 @@ mod tests {
             assert_eq!(bar.rain_on, palette.rain_on);
             assert_eq!(bar.kitty_favourited, palette.kitty_favourited);
             assert_eq!(bar.front_tab_split, palette.front_tab_split);
+            assert_eq!(bar.can_rewind, palette.can_rewind);
             bar
         };
         let one = agrees(&app);
@@ -2251,6 +2253,19 @@ mod tests {
             two.multi_tab && !two.front_tab_split,
             "a fresh one-pane tab is front"
         );
+
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        assert!(!agrees(&app).has_selection);
+        app.find_requested_in(wid);
+        app.dispatch_native_event(
+            wid,
+            AppEvent::TextInput(TextInputEvent::Commit("native selection".into())),
+        )
+        .unwrap();
+        app.dispatch_native_event(wid, AppEvent::TextInput(TextInputEvent::SelectAll))
+            .unwrap();
+        assert!(agrees(&app).has_selection);
+
         set_menu_live(before);
     }
 
@@ -2313,17 +2328,6 @@ mod tests {
         app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
         app.on_key(wid, press(KeyCode::KeyC, "c"));
         assert!(query(&app).contains("query=\"c\""), "{}", query(&app));
-    }
-
-    #[test]
-    fn toggle_opens_and_closes_palette() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        assert!(app.windows.get(&wid).unwrap().palette().is_none());
-        app.toggle_palette();
-        assert!(app.windows.get(&wid).unwrap().palette().is_some(), "opened");
-        app.toggle_palette();
-        assert!(app.windows.get(&wid).unwrap().palette().is_none(), "closed");
     }
 
     /// `find_next`/`find_prev` ship unseeded (F3 belongs to the program behind the PTY).

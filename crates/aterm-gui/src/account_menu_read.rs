@@ -387,6 +387,7 @@ fn read_rows(input: Input) -> ResultRows {
         &roster,
         &state,
         &enrolled,
+        true,
         account.as_deref(),
         email.as_deref(),
         week,

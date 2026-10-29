@@ -719,7 +719,12 @@ impl PetWorld {
         }
         self.stamp = Some(facts.stamp);
         self.progress = facts.progress;
-        self.selection_target = selection_target(input, pane);
+        let any_selection = input.any_selection();
+        self.selection_target = if any_selection {
+            selection_target(input, pane)
+        } else {
+            None
+        };
         let held_center = match held_center {
             Some((row, col))
                 if input.display_offset == 0
@@ -760,7 +765,6 @@ impl PetWorld {
             rows,
             cols,
         };
-        let any_selection = input.any_selection();
         let track_ground = any_selection || !overlays.is_empty();
         const PREFIX_LEN: usize = (MAX_WORLD_ROWS + 1) * (MAX_WORLD_COLS + 1);
         if self.cells.is_empty() {
@@ -788,6 +792,12 @@ impl PetWorld {
         let mut overlay_spans_buf = [(0, 0); MAX_REGIONS];
         let mut typed_spans_buf = [(0, 0); MAX_REGIONS];
         let mut blanked_spans_buf = [(0, 0); MAX_REGIONS];
+        let (mut sel_r0, mut sel_c0, mut sel_r1, mut sel_c1) =
+            (usize::MAX, usize::MAX, 0usize, 0usize);
+        let cov_row = self.coverage.row;
+        let cov_col = self.coverage.col;
+        let frame_row_base = pane.row + cov_row;
+        let frame_col_base = pane.col + cov_col;
         let mut next_r = 0;
         while next_r < rows {
             let r = next_r;
@@ -804,8 +814,8 @@ impl PetWorld {
             let mut row_protected = 0u16;
             let mut row_ground_blocked = 0u16;
             let mut row_ground_protected = 0u16;
-            let local_r = self.coverage.row + r;
-            let frame_r = pane.row + local_r;
+            let local_r = cov_row + r;
+            let frame_r = frame_row_base + r;
             let Some(row) = input.cells.get(frame_r) else {
                 self.cells[row_base..row_base + cols].fill(PetCell::Unknown);
                 self.glyphs[row_base..row_base + cols].fill(None);
@@ -880,12 +890,15 @@ impl PetWorld {
             let cursor_row_near = input.cursor_visible
                 && input.display_offset == 0
                 && frame_r.abs_diff(input.cursor_row) <= 1;
+            self.examined_cells += cols;
+            let row_cells = &mut self.cells[row_base..row_base + cols];
+            let row_glyphs = &mut self.glyphs[row_base..row_base + cols];
             let mut next_c = 0;
             while next_c < cols {
                 let c = next_c;
                 next_c += 1;
-                let local_c = self.coverage.col + c;
-                let frame_c = pane.col + local_c;
+                let local_c = cov_col + c;
+                let frame_c = frame_col_base + c;
                 let default_bg = scan.default_bg(frame_c);
                 if implicit_bg != default_bg {
                     implicit_bg = default_bg;
@@ -902,7 +915,6 @@ impl PetWorld {
                     Some(c) if !glass_blank => c,
                     _ => &implicit,
                 };
-                self.examined_cells += 1;
                 row_strokes += usize::from(cell.ch == RULE_STROKE);
                 let selected = any_selection
                     && input.selection_contains_cell(
@@ -912,16 +924,12 @@ impl PetWorld {
                         cell.wide,
                     );
                 if selected {
-                    let rect = PetRect::new(local_r as f32, local_c as f32, 1.0, 1.0);
-                    self.selection_rect = Some(match self.selection_rect {
-                        Some(old) => old.union(rect),
-                        None => rect,
-                    });
+                    sel_r0 = sel_r0.min(local_r);
+                    sel_c0 = sel_c0.min(local_c);
+                    sel_r1 = sel_r1.max(local_r);
+                    sel_c1 = sel_c1.max(local_c);
                 }
                 let cursor = cursor_row_near && frame_c.abs_diff(input.cursor_col) <= 1;
-                let bg = (u32::from(cell.bg[0]) << 16)
-                    | (u32::from(cell.bg[1]) << 8)
-                    | u32::from(cell.bg[2]);
                 let decorated =
                     cell.underline != UnderlineStyle::None || cell.strikethrough || cell.overline;
                 let compound = row_has_compounds
@@ -936,7 +944,7 @@ impl PetWorld {
                     && is_single_braille_dot(cell.ch)
                     && c > 0
                     && c + 1 < cols
-                    && self.glyphs[row_base + c - 1] == Some(PetGlyph::Blank)
+                    && row_glyphs[c - 1] == Some(PetGlyph::Blank)
                     && {
                         let column = frame_c + 1;
                         let neighbour = match row.get(column) {
@@ -955,13 +963,13 @@ impl PetWorld {
                                 || (input.cluster_at(frame_r, column).is_none()
                                     && input.combining_at(frame_r, column).is_none()))
                     };
-                self.glyphs[row_base + c] = if line == LineSize::SingleWidth {
+                row_glyphs[c] = if line == LineSize::SingleWidth {
                     Some(if !glyph {
                         PetGlyph::Blank
                     } else if speck {
                         PetGlyph::Speck
                     } else if if cell.wide {
-                        c > 0 && self.glyphs[row_base + c - 1] == Some(PetGlyph::Letter)
+                        c > 0 && row_glyphs[c - 1] == Some(PetGlyph::Letter)
                     } else if cell.ch.is_ascii() {
                         cell.ch.is_ascii_alphanumeric()
                     } else {
@@ -979,8 +987,12 @@ impl PetWorld {
                     || scan.image(frame_c).is_some();
                 let transient = selected || span_contains(overlay_spans, local_c);
                 let others = lasting || transient;
-                let hull_ink =
-                    (glyph && !speck) || bg != default_bg || span_contains(typed_spans, local_c);
+                let hull_ink = (glyph && !speck)
+                    || ((u32::from(cell.bg[0]) << 16)
+                        | (u32::from(cell.bg[1]) << 8)
+                        | u32::from(cell.bg[2]))
+                        != default_bg
+                    || span_contains(typed_spans, local_c);
                 let painted = hull_ink || speck;
                 if hull_ink {
                     hull_lo = hull_lo.min(c as u16);
@@ -1001,7 +1013,7 @@ impl PetWorld {
                 } else {
                     PetCell::Clear
                 };
-                self.cells[row_base + c] = class;
+                row_cells[c] = class;
                 let prev_row_blocked = row_blocked;
                 let prev_row_protected = row_protected;
                 let index = prefix_row + c + 1;
@@ -1010,20 +1022,19 @@ impl PetWorld {
                 self.blocked_prefix[index] = self.blocked_prefix[index - stride] + row_blocked;
                 self.protected_prefix[index] =
                     self.protected_prefix[index - stride] + row_protected;
-                if track_ground
-                    && cursor
-                    && transient
-                    && !lasting
-                    && n_ground_caret_cells < self.ground_caret_cells.len()
-                {
-                    self.ground_caret_cells[n_ground_caret_cells] = CaretCell {
-                        row: r,
-                        col: c,
-                        blank: !painted,
-                    };
-                    n_ground_caret_cells += 1;
-                }
                 if track_ground {
+                    if cursor
+                        && transient
+                        && !lasting
+                        && n_ground_caret_cells < self.ground_caret_cells.len()
+                    {
+                        self.ground_caret_cells[n_ground_caret_cells] = CaretCell {
+                            row: r,
+                            col: c,
+                            blank: !painted,
+                        };
+                        n_ground_caret_cells += 1;
+                    }
                     if transient && !self.ground_split {
                         self.ground_split = true;
                         if self.ground_blocked_prefix.is_empty() {
@@ -1068,12 +1079,22 @@ impl PetWorld {
         }
         self.caret_cells_len = n_caret_cells as u8;
         self.ground_caret_cells_len = n_ground_caret_cells as u8;
-        if self.selection_rect.is_none() {
+        if sel_r0 <= sel_r1 {
+            self.selection_rect = Some(PetRect::new(
+                sel_r0 as f32,
+                sel_c0 as f32,
+                (sel_r1 - sel_r0 + 1) as f32,
+                (sel_c1 - sel_c0 + 1) as f32,
+            ));
+        } else {
             self.selection_target = None;
         }
         if !s.alt_screen {
             let top = facts.stamp.top_absolute_row;
             let end = top.saturating_add(pane.rows as u64);
+            let cov_row = self.coverage.row;
+            let cov_top = top.saturating_add(cov_row as u64);
+            let cov_col_plus_1 = self.coverage.col + 1;
             let mut ai = 0;
             while ai < MAX_WORLD_ANCHORS {
                 let Some(block) = &facts.blocks[ai] else {
@@ -1092,25 +1113,35 @@ impl PetWorld {
                 }
                 let mut absolute_row = start;
                 let mut col = 0.0;
-                let mut r = rows;
-                'rows: while r > 0 {
-                    r -= 1;
-                    let abs = top.saturating_add((self.coverage.row + r) as u64);
-                    if abs < start || abs > last {
-                        continue;
-                    }
-                    let row_base = r * MAX_WORLD_COLS;
-                    let row_glyphs = &self.glyphs[row_base..row_base + cols];
-                    let mut c = cols;
-                    while c > 0 {
-                        c -= 1;
-                        if matches!(
-                            row_glyphs[c],
-                            Some(PetGlyph::Speck | PetGlyph::Substantive | PetGlyph::Letter)
-                        ) {
-                            absolute_row = abs;
-                            col = (self.coverage.col + c + 1) as f32;
-                            break 'rows;
+                if last >= cov_top {
+                    let r_lo = start.saturating_sub(cov_top).min(rows as u64) as usize;
+                    let r_hi = last
+                        .saturating_sub(cov_top)
+                        .saturating_add(1)
+                        .min(rows as u64) as usize;
+                    let mut r = r_hi;
+                    'rows: while r > r_lo {
+                        r -= 1;
+                        let abs = top.saturating_add((cov_row + r) as u64);
+                        if abs < start || abs > last {
+                            continue;
+                        }
+                        if self.blocked(self.blocked_prefix.as_slice(), r, 0, r + 1, cols) == 0 {
+                            continue;
+                        }
+                        let row_base = r * MAX_WORLD_COLS;
+                        let row_glyphs = &self.glyphs[row_base..row_base + cols];
+                        let mut c = cols;
+                        while c > 0 {
+                            c -= 1;
+                            if matches!(
+                                row_glyphs[c],
+                                Some(PetGlyph::Speck | PetGlyph::Substantive | PetGlyph::Letter)
+                            ) {
+                                absolute_row = abs;
+                                col = (cov_col_plus_1 + c) as f32;
+                                break 'rows;
+                            }
                         }
                     }
                 }
@@ -1466,12 +1497,13 @@ impl PetWorld {
         if matches!(forgive, Forgive::Nothing) {
             return 0;
         }
+        let any_caret = matches!(forgive, Forgive::AnyCaret);
         let mut count = 0;
         let len = self.caret_cells_len as usize;
         let mut i = 0;
         while i < len {
             let cell = self.caret_cells[i];
-            if (matches!(forgive, Forgive::AnyCaret) || cell.blank)
+            if (any_caret || cell.blank)
                 && cell.row >= r0
                 && cell.row < r1
                 && cell.col >= c0
@@ -1486,7 +1518,7 @@ impl PetWorld {
             let mut j = 0;
             while j < glen {
                 let cell = self.ground_caret_cells[j];
-                if (matches!(forgive, Forgive::AnyCaret) || cell.blank)
+                if (any_caret || cell.blank)
                     && cell.row >= r0
                     && cell.row < r1
                     && cell.col >= c0
@@ -1556,16 +1588,10 @@ impl PetWorld {
         }
         let (r0, c0) = (r0.floor() as usize, c0.floor() as usize);
         // A valid rectangle touches at least the cell it starts in, however thin.
-        let r1 = if r1.ceil() as usize > r0 {
-            r1.ceil() as usize
-        } else {
-            r0 + 1
-        };
-        let c1 = if c1.ceil() as usize > c0 {
-            c1.ceil() as usize
-        } else {
-            c0 + 1
-        };
+        let r1_ceil = r1.ceil() as usize;
+        let r1 = if r1_ceil > r0 { r1_ceil } else { r0 + 1 };
+        let c1_ceil = c1.ceil() as usize;
+        let c1 = if c1_ceil > c0 { c1_ceil } else { c0 + 1 };
         Window::Cells(
             r0 - self.coverage.row,
             c0 - self.coverage.col,
@@ -1669,7 +1695,7 @@ impl PetWorld {
             return Some(false);
         }
         let bottom = rect.row + rect.rows;
-        let feet_top = Self::feet_row_of(rect).row;
+        let feet_top = ((bottom - 1e-3).ceil() - 1.0).max(rect.row);
         let feet = PetRect::new(
             feet_top + margin,
             rect.col,
@@ -2021,16 +2047,16 @@ impl PetWorld {
         while step <= last_band {
             let mut live_band = false;
             let bands = [home_band + step, home_band - step];
+            let band_count = if step == 0 { 1 } else { 2 };
             let mut bi = 0;
-            while bi < 2 {
+            while bi < band_count {
                 let band = bands[bi];
                 bi += 1;
-                if band < 0 || band > last_band || (step == 0 && band != home_band) {
+                if band < 0 || band > last_band {
                     continue;
                 }
                 let band_top = cov_row_f + band as f32 + inset_r;
                 let row_distance = (band_top - near.row).abs() * 2.0;
-                let reach = max_distance.min(best_distance);
                 if row_distance > max_distance || row_distance >= best_distance {
                     continue;
                 }
@@ -2049,6 +2075,7 @@ impl PetWorld {
                 if reach_hi < reach_lo + span_c {
                     continue;
                 }
+                let reach = max_distance.min(best_distance);
                 let span = crate::color_math::sqrt_f32(
                     (reach * reach - row_distance * row_distance).max(0.0),
                 );
@@ -2071,21 +2098,26 @@ impl PetWorld {
                     continue;
                 }
                 let (c_lo, c_hi) = (lo as usize, hi as usize + span_c);
-                let width = (c_hi - c_lo) as u16;
+                let max_row_blocked = (c_hi - c_lo) as u16 - span_c_u16;
+                let mut row_base = r0 * (MAX_WORLD_COLS + 1);
+                let (_, r0_row) = prefix.split_at(row_base);
+                let (_, r1_row) = prefix.split_at(r1 * (MAX_WORLD_COLS + 1));
+                let mut prev_span = r0_row[c_hi] - r0_row[c_lo];
                 let mut any_row_short = false;
                 let mut rr = r0;
                 while rr < r1 {
-                    if width - self.blocked(prefix, rr, c_lo, rr + 1, c_hi) < span_c_u16 {
+                    row_base += MAX_WORLD_COLS + 1;
+                    let next_span = prefix[row_base + c_hi] - prefix[row_base + c_lo];
+                    if next_span - prev_span > max_row_blocked {
                         any_row_short = true;
                         break;
                     }
+                    prev_span = next_span;
                     rr += 1;
                 }
                 if any_row_short {
                     continue;
                 }
-                let (_, r0_row) = prefix.split_at(r0 * (MAX_WORLD_COLS + 1));
-                let (_, r1_row) = prefix.split_at(r1 * (MAX_WORLD_COLS + 1));
                 let mut right = None;
                 let mut c = if home_col > lo { home_col } else { lo };
                 while c <= hi {
@@ -2138,8 +2170,12 @@ impl PetWorld {
                 while ci < 2 {
                     if let Some(col) = candidates[ci] {
                         let col_left = cov_col_f + col as f32 + inset_c;
-                        let distance =
-                            crate::color_math::hypot_f32(row_distance, (col_left - near.col).abs());
+                        let dx = if ci == 0 {
+                            r_dx
+                        } else {
+                            (col_left - near.col).abs()
+                        };
+                        let distance = crate::color_math::hypot_f32(row_distance, dx);
                         if distance <= max_distance && distance < best_distance {
                             best = Some(PetRect::new(band_top, col_left, near.rows, near.cols));
                             best_distance = distance;
@@ -2306,6 +2342,15 @@ impl PetWorld {
         } else {
             self.coverage.cols
         };
+        let from_foot = if under_text {
+            match from {
+                Some(f) => Some((f, f.foot_row())),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let mut from_clear: Option<bool> = None;
         let mut i = 0;
         while i < rows.len() {
             let row = rows[i];
@@ -2333,19 +2378,27 @@ impl PetWorld {
             }
             let r0 = r0_f.floor() as usize - self.coverage.row;
             let r1 = r1_f.ceil() as usize - self.coverage.row;
-            let r0_base = r0 * (MAX_WORLD_COLS + 1);
-            let r1_base = r1 * (MAX_WORLD_COLS + 1);
-            let same_ground_from = if under_text {
-                match from {
-                    Some(f)
-                        if Self::same_ground(f, PetRect::new(row, 0.0, body.rows, body.cols)) =>
-                    {
-                        Some(f)
+            let (_, r0_row) = prefix.split_at(r0 * (MAX_WORLD_COLS + 1));
+            let (_, r1_row) = prefix.split_at(r1 * (MAX_WORLD_COLS + 1));
+            let same_ground_from = match from_foot {
+                Some((f, f_foot)) if (f_foot - (row + body.rows - 1.0)).abs() < 0.5 => {
+                    let f_clear = match from_clear {
+                        Some(c) => c,
+                        None => {
+                            let c = matches!(
+                                self.ground_under_text_clearance_past_caret(f, 0.0),
+                                Some(true)
+                            );
+                            from_clear = Some(c);
+                            c
+                        }
+                    };
+                    if !f_clear {
+                        continue;
                     }
-                    _ => None,
+                    Some(f)
                 }
-            } else {
-                None
+                _ => None,
             };
             let mut max_min_best = col_reach(max_distance, row_dist, best_distance, best_tie);
             let rfc = (target.1 - max_min_best - cov_left - margin)
@@ -2353,14 +2406,20 @@ impl PetWorld {
                 .max(0.0) as usize;
             let row_first_col = if rfc > first_col { rfc } else { first_col };
             let total_steps = 1 + end_col.saturating_sub(row_first_col);
+            let base_col = (self.coverage.col + row_first_col) as f32 + margin;
             let mut col_step = 0;
             while col_step < total_steps {
-                let col = if col_step == 0 {
+                let is_grid_step = col_step > 0;
+                let col = if !is_grid_step {
                     target.1
                 } else {
-                    (self.coverage.col + row_first_col + col_step - 1) as f32 + margin
+                    base_col + (col_step - 1) as f32
                 };
                 col_step += 1;
+                let c1_f = col + body.cols + margin;
+                if is_grid_step && c1_f > cov_right {
+                    break;
+                }
                 if col > target.1 && col - target.1 > max_min_best {
                     break;
                 }
@@ -2371,15 +2430,10 @@ impl PetWorld {
                     && (distance < best_distance || (distance == best_distance && tie < best_tie))
                 {
                     let c0_f = col - margin;
-                    let c1_f = col + body.cols + margin;
                     if c0_f >= cov_left && c1_f <= cov_right {
                         let c0 = c0_f.floor() as usize - self.coverage.col;
                         let c1 = c1_f.ceil() as usize - self.coverage.col;
-                        if prefix[r1_base + c1] + prefix[r0_base + c0]
-                            - prefix[r1_base + c0]
-                            - prefix[r0_base + c1]
-                            == 0
-                        {
+                        if r1_row[c1] + r0_row[c0] - r1_row[c0] - r0_row[c1] == 0 {
                             let rect = PetRect::new(row, col, body.rows, body.cols);
                             let corridor_ok = match same_ground_from {
                                 Some(from) => self.ground_corridor_clear(from, rect),
@@ -2606,14 +2660,25 @@ impl PetReading {
         reserve: PetReserve<'_>,
         held_center: Option<(f32, f32)>,
     ) -> bool {
+        let Some(kept) = &self.key else {
+            return false;
+        };
+        let expected_gen = match fill {
+            PetFill::Retained { prior } => prior,
+            _ => input.extract_gen,
+        };
+        if kept.extract_gen != expected_gen
+            || kept.content_seq != input.content_seq
+            || kept.snapshot_seq != input.snapshot_seq
+            || kept.cursor != (input.cursor_row, input.cursor_col, input.cursor_visible)
+        {
+            return false;
+        }
         let Some(mut now) = ReadingKey::of(input, fill, facts, pane, held_center) else {
             return false;
         };
-        if let PetFill::Retained { prior } = fill {
-            // The rows are those of the fill that stamped `prior`.
-            now.extract_gen = prior;
-        }
-        self.key == Some(now)
+        now.extract_gen = expected_gen;
+        *kept == now
             && self.selection == input.selection
             && self.selections == input.selections
             && same_rects(&self.protected, reserve.protected)

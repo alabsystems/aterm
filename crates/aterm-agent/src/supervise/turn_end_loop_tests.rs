@@ -4967,6 +4967,23 @@ struct ReachHost {
     asks: std::sync::atomic::AtomicUsize,
     /// Every plan the loop told the host, in order ([`IdleHost::waiting`]).
     told: std::sync::Mutex<Vec<Option<crate::supervise::WaitPlan>>>,
+    /// A measure that lands on the run's clock, over the script ([`Lands`]).
+    landing: std::sync::Mutex<Option<Lands>>,
+    /// Whether the host answers [`IdleHost::reach_peek`] (what the next ask would answer, its
+    /// script left as it is); the trait's Unknown when not.
+    peeks: std::sync::atomic::AtomicBool,
+    /// Every peek, counted.
+    peeked: std::sync::atomic::AtomicUsize,
+}
+
+/// A measure that lands at `at` on the run's clock: an ask from then on answers `lands`.
+/// [`IdleHost::reach_at`] names `at` until then when `told`, and nothing when not.
+#[derive(Debug)]
+struct Lands {
+    clock: Arc<crate::supervise::fx::ScriptedClock>,
+    at: Instant,
+    lands: Reach,
+    told: bool,
 }
 
 impl ReachHost {
@@ -4995,6 +5012,10 @@ impl ReachHost {
 
     fn asks(&self) -> usize {
         self.asks.load(Ordering::SeqCst)
+    }
+
+    fn peeked(&self) -> usize {
+        self.peeked.load(Ordering::SeqCst)
     }
 
     fn told(&self) -> Vec<Option<crate::supervise::WaitPlan>> {
@@ -5031,7 +5052,40 @@ impl IdleHost for ReachHost {
                 next => next,
             };
         }
+        if let Some(landed) = self
+            .landing
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|l| l.clock.mono() >= l.at)
+        {
+            *last = landed.lands;
+        }
         *last
+    }
+    fn reach_at(&self) -> Option<Instant> {
+        self.landing
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|l| l.told && l.clock.mono() < l.at)
+            .map(|l| l.at)
+    }
+    fn reach_peek(&self) -> Reach {
+        if !self.peeks.load(Ordering::SeqCst) {
+            return Reach::Unknown;
+        }
+        self.peeked.fetch_add(1, Ordering::SeqCst);
+        let landed = self
+            .landing
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|l| l.clock.mono() >= l.at)
+            .map(|l| l.lands);
+        landed
+            .or_else(|| self.script.lock().unwrap().front().copied())
+            .unwrap_or_else(|| *self.last.lock().unwrap())
     }
 }
 
@@ -5058,13 +5112,27 @@ fn outage_timed(
     max_s: u64,
     timing: TurnEndTiming,
 ) -> (Vec<String>, Arc<ReachHost>, Mock, Vec<String>) {
+    outage_on("te-outage", enotfound(), script, max_s, timing, |_| {})
+}
+
+/// [`outage_timed`] with `wall` as the screen the turn ends on, the mock edited by `edit`, and
+/// the journal named by `name`.
+fn outage_on(
+    name: &str,
+    wall: Vec<String>,
+    script: &[Reach],
+    max_s: u64,
+    timing: TurnEndTiming,
+    edit: impl FnOnce(&mut Mock),
+) -> (Vec<String>, Arc<ReachHost>, Mock, Vec<String>) {
     let host = ReachHost::edged(script);
     let tag = timing.net_backoff.first().map_or(0, Duration::as_secs);
-    let (dir, path) = journal_file(&format!("te-outage-{}-{max_s}-{tag}", script.len()));
-    let mut m = Mock::new(vec![busy_screen(), enotfound(), busy_screen(), ended(STOP)]);
+    let (dir, path) = journal_file(&format!("{name}-{}-{max_s}-{tag}", script.len()));
+    let mut m = Mock::new(vec![busy_screen(), wall, busy_screen(), ended(STOP)]);
     m.turn_releases = Some(1);
     m.vanish_after = Some(2);
     m.stall_sleep = Some(Duration::from_millis(5));
+    edit(&mut m);
     let opts = SuperviseOpts {
         idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
         journal: Some(path.clone()),
@@ -5398,6 +5466,9 @@ fn awaits_before_turn(m: &Mock) -> usize {
         .count()
 }
 
+/// A measured Up mid-wait resumes a Claude Code outage within one step. agy, whose reach the
+/// GUI host reads from the network path alone, waits through a Down typing nothing, a due rung or
+/// not, and its path's return (Down to Unknown) re-decides the wait, which resumes once, blind.
 #[test]
 fn an_up_measure_mid_wait_continues_the_outage_within_one_step() {
     let t = Instant::now();
@@ -5471,9 +5542,10 @@ fn an_up_measure_mid_wait_continues_the_outage_within_one_step() {
                 }
             })
             .collect();
-    let run_agy = |script: &[Reach], max_s: u64| {
+    let run_agy = |script: &[Reach], max_s: u64, timing: TurnEndTiming| {
         let host = ReachHost::edged(script);
-        let (dir, path) = journal_file(&format!("te-agy-outage-{}-{max_s}", script.len()));
+        let tag = timing.outage_first.as_millis();
+        let (dir, path) = journal_file(&format!("te-agy-outage-{}-{max_s}-{tag}", script.len()));
         let mut m = agy_mock(vec![
             agy_busy.clone(),
             agy_net_outage.clone(),
@@ -5490,7 +5562,7 @@ fn an_up_measure_mid_wait_continues_the_outage_within_one_step() {
         };
         let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
             host.stamps_on(s);
-            s.set_turn_end_timing(far_rungs());
+            s.set_turn_end_timing(timing);
         });
         let (records, _) = journal_records(&path);
         let _ = std::fs::remove_dir_all(&dir);
@@ -5501,32 +5573,49 @@ fn an_up_measure_mid_wait_continues_the_outage_within_one_step() {
             .collect();
         (lines, host, m, waiting)
     };
-    let (lines, host, m, waiting) = run_agy(&[down], 1);
-    assert_eq!(count(&m, "turn"), 0, "{lines:#?}\n{:#?}", m.requests);
-    assert!(
-        !lines.iter().any(|l| l.starts_with("CONTINUED")),
-        "agy must not send messages during a network outage: {lines:#?}"
-    );
-    assert!(
-        waiting
-            .iter()
-            .any(|w| w.ends_with("waiting: connection error")),
-        "{waiting:#?}"
-    );
-    assert!(host.asks() > 2, "{lines:#?}");
+    // What the GUI host gives agy (`WorkerIdle::reach`, the network path alone): Down while the
+    // path is lost or settling, then Unknown, never Up. Its blind rung is due here.
+    let path_back = TurnEndTiming {
+        outage_first: Duration::from_millis(50),
+        ..far_rungs()
+    };
+    for timing in [far_rungs(), path_back.clone()] {
+        let (lines, host, m, waiting) = run_agy(&[down], 1, timing);
+        assert_eq!(count(&m, "turn"), 0, "{lines:#?}\n{:#?}", m.requests);
+        assert!(
+            !lines.iter().any(|l| l.starts_with("CONTINUED")),
+            "agy must not send messages during a network outage, a due rung or not: {lines:#?}"
+        );
+        assert!(
+            waiting
+                .iter()
+                .any(|w| w.ends_with("waiting: connection error")),
+            "{waiting:#?}"
+        );
+        assert!(host.asks() > 2, "{lines:#?}");
+    }
 
-    let (lines, _, m, waiting) = run_agy(&[down, down, down, up], 30);
+    let (lines, _, m, waiting) = run_agy(&[down, down, down, Reach::Unknown], 30, path_back);
     let continued: Vec<&String> = lines
         .iter()
         .filter(|l| l.starts_with("CONTINUED"))
         .collect();
-    assert_eq!(continued.len(), 1, "{lines:#?}");
-    assert!(continued[0].starts_with(&resumed), "{lines:#?}");
+    assert_eq!(
+        continued.len(),
+        1,
+        "the path's return resumes once, blind: {lines:#?}"
+    );
+    let blind = format!(
+        "CONTINUED seq=102 rule={RULE_OUTAGE_RESUME} {}",
+        cleared_text(Cleared::Outage(Outage::Connection), Clearing::Blind)
+    );
+    assert!(continued[0].starts_with(&blind), "{lines:#?}");
     assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
-    assert_eq!(waiting.len(), 1, "{waiting:#?}");
     assert!(
-        waiting[0].ends_with("waiting: connection error"),
-        "{waiting:?}"
+        waiting
+            .first()
+            .is_some_and(|w| w.ends_with("waiting: connection error")),
+        "the wait, said first: {waiting:#?}"
     );
 }
 
@@ -5606,6 +5695,132 @@ fn a_connection_measured_down_types_nothing_then_resumes_once_on_the_edge_up() {
                 .all(|w| w.ends_with("waiting: connection error")),
         "{waiting:#?}"
     );
+}
+
+/// The owner's tab of 2026-10-26 (`claude-2.1.310-wall-goal-api-unreachable-measured.txt`): a
+/// `/goal` turn ended on Claude Code 2.1.310's `Goal still active · the API was unavailable …`
+/// echo under the ENOTFOUND error row it reads through to. A measured outage waits at the point,
+/// typing nothing, and the Up measure resumes it once (`outage-resume@v1`); a person who typed
+/// before the Up keeps it theirs, as the owner's own message was in the incident.
+#[test]
+fn the_owners_goal_outage_is_continued_at_the_up_measure_unless_a_person_typed() {
+    let goal_outage = || {
+        aterm_phase::prompt::fixtures::screen(
+            aterm_phase::prompt::fixtures::WALL_GOAL_API_UNREACHABLE_2_1_310,
+        )
+    };
+    let t = Instant::now();
+    let down = Reach::Down { since: t };
+    let up = Reach::Up {
+        since: t + Duration::from_secs(1),
+    };
+    let script = [down, down, up];
+    let (lines, host, m, waiting) = outage_on(
+        "te-goal-outage",
+        goal_outage(),
+        &script,
+        30,
+        far_rungs(),
+        |_| {},
+    );
+    let continued: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("CONTINUED"))
+        .collect();
+    assert_eq!(continued.len(), 1, "{lines:#?}");
+    let resumed = format!(
+        "CONTINUED seq=102 rule={RULE_OUTAGE_RESUME} {}",
+        cleared_text(Cleared::Outage(Outage::Connection), Clearing::Measured)
+    );
+    assert!(continued[0].starts_with(&resumed), "{lines:#?}");
+    assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
+    assert_eq!(waiting.len(), 1, "the wait, said once: {waiting:#?}");
+    assert!(
+        waiting[0].ends_with("waiting: connection error"),
+        "{waiting:?}"
+    );
+    assert!(host.asks() >= script.len(), "{lines:#?}");
+
+    let (lines, host, m, waiting) = outage_on(
+        "te-goal-outage-person",
+        goal_outage(),
+        &script,
+        1,
+        far_rungs(),
+        |m| m.human_ms = Some(2_000),
+    );
+    assert!(
+        !lines.iter().any(|l| l.starts_with("CONTINUED")),
+        "{lines:#?}"
+    );
+    assert_eq!(count(&m, "turn"), 0, "{lines:#?}\n{:#?}", m.requests);
+    assert!(
+        host.asks() >= script.len(),
+        "the Up was measured: {lines:#?}"
+    );
+    assert_eq!(waiting.len(), 2, "{waiting:#?}");
+    assert!(
+        waiting[0].ends_with("waiting: connection error"),
+        "{waiting:?}"
+    );
+    assert!(waiting[1].ends_with("a person is typing"), "{waiting:?}");
+}
+
+/// Claude Code's `/goal` echo that the API was unavailable, read with no error row over it
+/// (`claude-2.1.310-wall-goal-api-unavailable-alone-hand-built.txt`, its measurement still owed),
+/// retrying or past its three retries, is a generic API error, not the owner's connection wall:
+/// Claude Code gives that reason an overload and a server error too, so a measured Up of the
+/// route (a 529 completes TLS) does not clear it. It is waited out blind on its own rung and
+/// resumed once with the blind line (`outage-resume@v1`, *may have cleared*), whatever the reach.
+#[test]
+fn a_goal_echo_that_the_api_was_unavailable_read_alone_is_waited_out_blind() {
+    let alone = aterm_phase::prompt::fixtures::screen(
+        aterm_phase::prompt::fixtures::WALL_GOAL_API_UNAVAILABLE_ALONE_2_1_310,
+    );
+    let echo = alone
+        .iter()
+        .rposition(|r| r.starts_with("⏺ Goal still active"))
+        .expect("the later echo");
+    let mut paused = alone.clone();
+    paused[echo] = "⏺ Goal paused after 3 automatic retries · the API was unavailable or the \
+                    connection dropped · send a message to continue"
+        .to_string();
+    let t = Instant::now();
+    let up = Reach::Up {
+        since: t + Duration::from_secs(1),
+    };
+    let script = [up, up, up];
+    let blind = format!(
+        "CONTINUED seq=102 rule={RULE_OUTAGE_RESUME} {}",
+        cleared_text(Cleared::Outage(Outage::ApiError), Clearing::Blind)
+    );
+    let rung = TurnEndTiming {
+        outage_first: Duration::from_millis(50),
+        outage_cap: Duration::from_millis(50),
+        ..far_rungs()
+    };
+    for (name, wall) in [("te-goal-alone", alone), ("te-goal-alone-paused", paused)] {
+        let (lines, _, m, waiting) = outage_on(name, wall, &script, 30, rung.clone(), |_| {});
+        let continued: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.starts_with("CONTINUED"))
+            .collect();
+        assert_eq!(continued.len(), 1, "{name}: {lines:#?}");
+        assert!(
+            continued[0].starts_with(&blind),
+            "{name}: the blind line, not the measured one: {lines:#?}"
+        );
+        assert_eq!(count(&m, "turn"), 1, "{name}: {:#?}", m.requests);
+        assert_eq!(
+            waiting.len(),
+            1,
+            "{name}: the wait, said once: {waiting:#?}"
+        );
+        assert!(
+            waiting[0].ends_with("waiting: API error"),
+            "{name}: {waiting:?}"
+        );
+    }
 }
 
 #[test]
@@ -7788,6 +8003,7 @@ fn the_wall_cache_is_dropped_when_the_worker_has_worked() {
         frame_open: false,
         inputs_before: None,
         inputs_after: None,
+        title: None,
     };
     let wall = of(memory_wall_in("3h"));
     let r = s.turn_end_reading(&wall, None, &opts);
@@ -8209,6 +8425,87 @@ fn a_back_off_the_mac_slept_through_is_over_once_the_wake_settles() {
     assert_eq!(typed, 0, "{:#?}", settled.lines);
 }
 
+/// A wait that stands on the reach ends its step at the host's next measure
+/// ([`IdleHost::reach_at`]): an Up that lands 50 ms into a measured Down's hour-long hold is
+/// continued in that same wait, its first step at most the 50 ms. The control: a host that
+/// names no next measure keeps the step whole (to the wait's deadline here), so the same Up is
+/// not met inside the wait and nothing is typed.
+#[test]
+fn a_wait_on_the_reach_steps_to_the_hosts_next_measure_and_continues_its_up() {
+    let soon = Duration::from_millis(50);
+    let run = |told: bool| {
+        let clock = virtual_clock();
+        let host = ReachHost::scripted(&[Reach::Down {
+            since: clock.mono(),
+        }]);
+        let mut m = Mock::new(vec![enotfound()]);
+        // Each await on the still screen passes its whole step on the run's clock.
+        m.stall_sleep = Some(Duration::from_secs(3600));
+        m.run_on(&clock);
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            ..hosted(30)
+        };
+        let mut heard = Heard::default();
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_fx(Fx::over(ClockSource::Scripted(Arc::clone(&clock))));
+        s.set_clock(TEST_NOW, PDT);
+        s.set_turn_end_timing(far_rungs());
+        let screen = s.screen().expect("the wall's screen");
+        let point = s.turn_of(screen);
+        let action = s
+            .turn_end_at_point(&point, Some(Duration::from_secs(180)), &opts)
+            .expect("a decision");
+        assert!(
+            matches!(&action, TurnEndAction::WaitUntil { .. }),
+            "the measured Down waits: {action:?}"
+        );
+        s.turn_end_execute(&point, action, &opts, &[], &mut heard)
+            .expect("the hold's wait");
+        let at = s.fx.mono() + soon;
+        *host.landing.lock().unwrap() = Some(Lands {
+            clock: Arc::clone(&clock),
+            at,
+            lands: Reach::Up { since: at },
+            told,
+        });
+        let from = s.ctl.requests.len();
+        let waited = wait_once(&mut s, &point, &opts, &mut heard);
+        let first_step = s.ctl.requests[from..]
+            .iter()
+            .find(|r| r.contains("await "))
+            .and_then(|r| r.rsplit_once(" timeout ")?.1.parse::<u64>().ok());
+        let requests = s.ctl.requests[from..].to_vec();
+        drop(s);
+        let typed = count(&m, "@s-1 turn") + count(&m, "@s-1 send");
+        (waited, first_step, typed, requests)
+    };
+    let (waited, first_step, typed, requests) = run(true);
+    let first_step = first_step.expect("the wait awaited");
+    assert!(
+        u128::from(first_step) <= soon.as_millis(),
+        "the step ends at the next measure: {first_step} ms\n{requests:#?}"
+    );
+    assert!(
+        continued(&waited.lines, RULE_OUTAGE_RESUME),
+        "the Up is continued in this wait: {:#?}\n{requests:#?}",
+        waited.lines
+    );
+    assert_eq!(typed, 1, "{requests:#?}");
+    let (waited, first_step, typed, requests) = run(false);
+    let first_step = first_step.expect("the control awaited");
+    assert!(
+        u128::from(first_step) > soon.as_millis(),
+        "the control's step is whole: {first_step} ms\n{requests:#?}"
+    );
+    assert!(
+        !continued(&waited.lines, RULE_OUTAGE_RESUME),
+        "the control meets the Up only at its next wait: {:#?}",
+        waited.lines
+    );
+    assert_eq!(typed, 0, "{requests:#?}");
+}
+
 #[test]
 fn an_edge_at_the_wake_types_nothing_before_the_settle() {
     let run = |slept: bool| {
@@ -8583,6 +8880,7 @@ fn read_screen(rows: Vec<String>) -> Screen {
         frame_open: false,
         inputs_before: None,
         inputs_after: None,
+        title: None,
     }
 }
 
@@ -8605,19 +8903,18 @@ fn a_sessions_jitter_is_stable_bounded_and_spread() {
         let unix = s.wall_reset.as_ref().and_then(|(_, u)| *u);
         (first.jitter, unix)
     };
-    let mut shares = std::collections::BTreeSet::new();
     for k in 0..20 {
         let sid = format!("@s-{k}");
         let (jitter, unix) = read(Some(&sid), memory_wall_in("3h"));
         let unix = unix.expect("the placed reset");
         assert_eq!(jitter, resume_jitter(&sid, unix, span), "{sid}");
         assert!(jitter < span);
-        shares.insert(jitter.as_secs());
+        assert_eq!(
+            resume_jitter(&sid, unix, Duration::ZERO),
+            Duration::ZERO,
+            "zero span yields zero jitter"
+        );
     }
-    assert!(
-        shares.len() >= 8,
-        "twenty sessions, several seconds: {shares:?}"
-    );
     assert_eq!(
         read(None, memory_wall_in("3h")).0,
         Duration::ZERO,
@@ -10275,7 +10572,8 @@ fn a_claim_over_uncommitted_work_gets_the_repo_suffix_through_the_loop() {
     );
 }
 /// A DISK-FREE WORKER'S REPOSITORY READS CLEAN BY ITS TASK RECORD
-/// (`Session::repo_asked`, `docs/DESIGN-disk-free-ask-2026-10-24.md` §8.4): at a
+/// (`Session::repo_asked`, `docs/DESIGN-disk-free-ask-2026-10-24.md` §8.4), and a
+/// credit-claim worker's by its claim folder: at a
 /// done claim of a session whose trusted folder is the worker folder, the host's
 /// probe, which would read uncommitted work where the worker stands, is never
 /// asked, and the done check carries no repository suffix. NEGATIVE CONTROL:
@@ -10309,14 +10607,18 @@ fn a_disk_workers_repository_reads_clean_without_asking_the_host() {
             host.asked.load(std::sync::atomic::Ordering::SeqCst),
         )
     };
-    let (turns, lines, asked) =
-        run("/Users//a/Library/Application Support/aterm/harness/claude-harness/disk-worker");
-    assert_eq!(asked, 0, "the worker's probe is never asked: {lines:#?}");
-    assert_eq!(
-        turns.first(),
-        Some(&continue_request(&done_check_words(0))),
-        "the plain check: {lines:#?}"
-    );
+    for worker in [
+        "/Users//a/Library/Application Support/aterm/harness/claude-harness/disk-worker",
+        "/Users//a/Library/Application Support/aterm/harness/claude-harness/credit-claim",
+    ] {
+        let (turns, lines, asked) = run(worker);
+        assert_eq!(asked, 0, "{worker}: the probe is never asked: {lines:#?}");
+        assert_eq!(
+            turns.first(),
+            Some(&continue_request(&done_check_words(0))),
+            "{worker}: the plain check: {lines:#?}"
+        );
+    }
     let (turns, lines, asked) = run("/Users//a/Developer/parser");
     assert!(asked >= 1, "another session's probe is asked: {lines:#?}");
     assert_eq!(
@@ -10533,7 +10835,8 @@ fn a_persons_greeting_left_to_them_stays_theirs_in_the_next_loop() {
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
             human_grace_s: 0,
-            // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+            // The person's own exchange is Land's to leave where it opens the session (owner
+            // rulings 2026-10-26 and 2026-10-27).
             autopilot: Autopilot::Land,
             ..owners_policy()
         },
@@ -10572,6 +10875,36 @@ fn a_persons_greeting_left_to_them_stays_theirs_in_the_next_loop() {
     assert!(
         !lines.iter().any(|l| l.starts_with("CONTINUED ")),
         "{lines:#?}"
+    );
+    // The record says it opened the session, so a loop that follows keeps it theirs however the
+    // tab's books read before it: an act typed to a program that ran in the tab before.
+    assert!(
+        left[0].contains(&format!("{}\",\"box_seq\"", approvals::LEFT_OPENS)),
+        "{body}"
+    );
+    let earlier = approvals::Row {
+        rule_id: RULE_CONTINUE,
+        outcome: approvals::Outcome::Typed,
+        command: "keep going",
+        reason: "the turn-end policy",
+        box_seq: 0,
+    }
+    .to_json(1, None);
+    std::fs::write(&ledger, format!("{earlier}\n{body}")).expect("ledger");
+    let (turns, lines) = run(&ledger, false);
+    assert_eq!(turns, 0, "an earlier program's act: {lines:#?}");
+    assert!(
+        !lines.iter().any(|l| l.starts_with("CONTINUED ")),
+        "an earlier program's act: {lines:#?}"
+    );
+    // A record without those words (an older build's) after that act was left after work: Land
+    // carries the work on (owner ruling 2026-10-27).
+    let older = body.replace(approvals::LEFT_OPENS, "");
+    std::fs::write(&ledger, format!("{earlier}\n{older}")).expect("ledger");
+    let (_, lines) = run(&ledger, false);
+    assert!(
+        lines.iter().any(|l| l.starts_with("CONTINUED ")),
+        "an older build's record after work: {lines:#?}"
     );
     let closed = format!(
         "{}\n{}\n",
@@ -10669,7 +11002,8 @@ fn a_persons_exchange_is_left_under_its_prompts_key() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
-                // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+                // The person's own exchange is Land's to leave where it opens the session (owner
+                // rulings 2026-10-26 and 2026-10-27).
                 autopilot: Autopilot::Land,
                 ..owners_policy()
             },
@@ -10792,7 +11126,8 @@ fn a_persons_exchange_an_older_build_noted_left_stays_theirs_in_the_next_loop() 
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
-                // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+                // The person's own exchange is Land's to leave where it opens the session (owner
+                // rulings 2026-10-26 and 2026-10-27).
                 autopilot: Autopilot::Land,
                 ..owners_policy()
             },
@@ -10908,7 +11243,8 @@ fn a_persons_exchange_at_a_wall_stays_theirs_in_the_next_loop() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
-                // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+                // The person's own exchange is Land's to leave where it opens the session (owner
+                // rulings 2026-10-26 and 2026-10-27).
                 autopilot: Autopilot::Land,
                 ..owners_policy()
             },
@@ -11007,7 +11343,8 @@ fn a_persons_exchange_retried_at_a_wall_stays_theirs_in_the_next_loop() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
-                // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+                // The person's own exchange is Land's to leave where it opens the session (owner
+                // rulings 2026-10-26 and 2026-10-27).
                 autopilot: Autopilot::Land,
                 ..owners_policy()
             },
@@ -11138,7 +11475,8 @@ fn a_persons_question_answered_at_length_is_left_to_them() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
-                // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+                // The person's own exchange is Land's to leave where it opens the session (owner
+                // rulings 2026-10-26 and 2026-10-27).
                 autopilot: Autopilot::Land,
                 ..owners_policy()
             },
@@ -11245,7 +11583,8 @@ fn claude_codes_idle_compaction_is_no_turn() {
             true,
         ),
     ];
-    // The person's own exchange is Land's to leave; Cruise carries it (owner ruling 2026-10-26).
+    // The person's own exchange is Land's to leave where it opens the session; Cruise carries it
+    // (owner rulings 2026-10-26 and 2026-10-27).
     let cruise_left = (
         "left, under Cruise",
         run(vec![greeted.clone(), left.clone()]),
@@ -11389,7 +11728,8 @@ fn a_persons_exchange_stays_theirs_under_an_idle_compaction() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
-                // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+                // The person's own exchange is Land's to leave where it opens the session (owner
+                // rulings 2026-10-26 and 2026-10-27).
                 autopilot: Autopilot::Land,
                 ..owners_policy()
             },
@@ -11964,6 +12304,83 @@ fn a_move_ahead_of_a_wall_types_nothing_and_its_point_is_decided_as_with_no_move
     assert_eq!(host.said("carry-on"), ["carry-on"], "{log}");
     assert!(carried.is_empty(), "the host's turn took the point: {log}");
     assert_ne!(carried, unmoved, "{log}");
+}
+
+/// A move ahead of a wall whose landing the host could not read when it was made
+/// (`wait:account-unverified`) is deferred and the point goes on. Once it has landed the host
+/// tells it as made at the next turn end, where the loop asks for it again: the loop adopts it
+/// (`adopted`, nothing relaunched), the host's step there stands (`done:landed`), and the point
+/// is decided as with no move, its continuation typed. The move is then on the books, made at a
+/// turn end and still to be answered, so the turn it serves next is told.
+#[test]
+fn a_move_ahead_told_as_made_at_a_later_turn_end_is_adopted_and_the_point_goes_on() {
+    let (dir, ledger) = ledger_at("account-ahead-told");
+    let host = AccountHost::scripted(
+        &[Some(AccountAdvice::Move {
+            to: "work-2".to_string(),
+        })],
+        &["wait:account-unverified", "adopted"],
+    );
+    host.parks.store(true, Ordering::SeqCst);
+    *host.step.lock().unwrap() = Some("done:landed");
+    let screens = vec![
+        busy_screen(),
+        ended("Stage 3 done; the suite is green."),
+        busy_screen(),
+        ended("Stage 4 done; the suite is green."),
+        ended("Stage 4 done; the suite is green."),
+    ];
+    let (lines, m, journal) =
+        account_run_with("te-account-ahead-told", screens, &host, &ledger, |m| {
+            m.vanish_after = Some(6);
+            m.cursor_on_caret = true;
+        });
+    let log = format!("{lines:#?}\n{journal:#?}\n{:#?}", host.all());
+    assert_eq!(
+        host.said("restart"),
+        [
+            "restart:account-ahead:work-2",
+            "restart:account-ahead:work-2"
+        ],
+        "{log}"
+    );
+    assert!(
+        journal.iter().any(|l| l.starts_with("DEFERRED ")
+            && l.contains("restart:account-ahead")
+            && l.contains("wait:account-unverified")),
+        "{log}"
+    );
+    assert!(
+        journal.iter().any(|l| l.starts_with("RESTARTED seq=")
+            && l.ends_with("(at a turn end; the same conversation)")),
+        "{log}"
+    );
+    assert_eq!(host.said("carry-on"), ["carry-on"], "{log}");
+    assert!(
+        journal
+            .iter()
+            .any(|l| l.starts_with("HOST seq=") && l.ends_with(" carry-on step=done:landed")),
+        "{log}"
+    );
+    let typed: Vec<&String> = m
+        .requests
+        .iter()
+        .filter(|r| r.starts_with("turn"))
+        .collect();
+    assert_eq!(
+        typed,
+        [
+            &continue_request("keep going"),
+            &continue_request("keep going")
+        ],
+        "each point's continuation typed, the adopted one's too: {log}"
+    );
+    assert_eq!(
+        crate::supervise::approvals::open_account_move(&ledger, None).map(|o| (o.to, o.at)),
+        Some(("work-2".to_string(), AccountAt::Ahead)),
+        "{log}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A window host whose live upgrade takes idle points as a quiet round at rung land does
@@ -14280,6 +14697,204 @@ fn a_lost_login_no_read_saw_busy_is_struck_before_the_host_is_asked() {
             .iter()
             .any(|s| s == "answered:signed-out" || s == "account:wall:auth"),
         "{said:?}"
+    );
+}
+
+/// `claude-rotation-proof`'s live run (lab `rp2`): the moved-to Claude Code answered the
+/// harness's resume in no time (`✻ Sautéed for 0s`), no read saw it busy, and the host was never
+/// told the move served, so no `proven` row was booked and the row's next wall struck it.
+#[test]
+fn a_turn_the_moved_to_login_answered_before_any_read_saw_it_busy_is_told_served() {
+    use crate::supervise::policy::turn_end::RULE_LIMIT_RESUME;
+    let transcript = [
+        "❯ Write one sentence about harbours, then stop.",
+        "  ⎿  You've hit your session limit · resets 10:01am (America/Los_Angeles)",
+        "     /upgrade or /usage-credits to finish what you’re working on.",
+        "",
+        "⏺ Usage limit reached · continuing automatically at 10:01am · esc to cancel",
+        "",
+        "✻ Cooked for 0s · done 9:58 AM",
+        "",
+    ];
+    let mut wall = rows(&transcript);
+    wall.extend(composer("  ⏵⏵ auto mode on (shift+tab to cycle)"));
+    let answered_with = |reply: &str| {
+        let mut r = rows(&transcript);
+        r.extend(rows(&[
+            &format!("❯ {CLEARED}"),
+            "",
+            reply,
+            "",
+            "✻ Sautéed for 0s · done 9:59 AM",
+            "",
+        ]));
+        r.extend(composer("  ⏵⏵ auto mode on (shift+tab to cycle)"));
+        r
+    };
+    let run = |point: Vec<String>, asked: bool| {
+        let host = AccountHost::scripted(&[None], &[]);
+        let opts = account_opts(&host);
+        let mut m = Mock::new(vec![point.clone()]);
+        {
+            let mut s = session(&mut m, Some("@s-1".to_string()));
+            s.set_clock(ACCOUNT_NOW, PDT);
+            s.set_zone_lookup(test_zones);
+            let r = crate::supervise::policy::turn_end::TurnEndReading::of(
+                &aterm_phase::ClaudeReader.read(&wall, Some(2)),
+                &wall,
+                false,
+                None,
+                None,
+                None,
+            );
+            let now = Instant::now();
+            s.turn_end.restarted(
+                &Restart::Account {
+                    to: "lab-b".to_string(),
+                    at: AccountAt::Wall,
+                },
+                true,
+                &r,
+                now,
+            );
+            if asked {
+                s.turn_end.acted(
+                    &TurnEndAction::Type {
+                        text: CLEARED.to_string(),
+                        rule_id: RULE_LIMIT_RESUME,
+                    },
+                    &r,
+                    now,
+                );
+            }
+            let point = point_at(&s, point, 102);
+            s.turn_end_at_point(&point, None, &opts)
+                .expect("a decision");
+        }
+        host.all()
+    };
+    let said = run(
+        answered_with("⏺ Hi! I am the local lab stub, not a model. (reply 3)"),
+        true,
+    );
+    assert_eq!(
+        said.iter().filter(|s| *s == "served").count(),
+        1,
+        "the resume answered at once: {said:?}"
+    );
+    assert!(
+        !run(
+            answered_with("⏺ Hi! I am the local lab stub, not a model. (reply 3)"),
+            false
+        )
+        .iter()
+        .any(|s| s == "served"),
+        "CONTROL: no turn asked under the move"
+    );
+    assert!(
+        !run(wall.clone(), true).iter().any(|s| s == "served"),
+        "CONTROL: the resume not answered yet"
+    );
+}
+
+/// `claude-rotation-proof`'s live runs (labs `rp4`, seq 720, and `rp5`, seq 727): the move onto
+/// `lab-c` ahead of a wall came at a turn end and asked no turn; the lab's next prompt was
+/// answered in no time (`✻ Cogitated for 0s`), no read saw it busy, and the host was never told
+/// the move served. In `rp4` a point read the resumed transcript first; in `rp5` the prompt's
+/// answer was the restart's first point.
+#[test]
+fn a_prompt_typed_under_a_move_ahead_and_answered_at_once_is_told_served() {
+    let transcript = [
+        "❯ Write one sentence about sails, then stop.",
+        "",
+        "⏺ Hi! I am the local lab stub, not a model. (reply 9)",
+        "",
+        "✻ Brewed for 0s · done 11:30 AM",
+        "",
+        "❯ Write one sentence about buoys, then stop.",
+        "",
+        "⏺ Hi! I am the local lab stub, not a model. (reply 10)",
+        "",
+        "✻ Cogitated for 0s · done 11:30 AM",
+        "",
+    ];
+    let screen = |more: &[&str]| {
+        let mut r = rows(&transcript);
+        r.extend(rows(more));
+        r.extend(composer(
+            "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+        ));
+        r
+    };
+    let resumed = screen(&[]);
+    let answered = screen(&[
+        "❯ Write one sentence about jetties, then stop.",
+        "",
+        "⏺ Hi! I am the local lab stub, not a model. (reply 11)",
+        "",
+        "✻ Cogitated for 0s · done 11:30 AM",
+        "",
+    ]);
+    let mut opened = rows(&["⏺ Hi! I am the local lab stub, not a model. (reply 10)", ""]);
+    opened.extend(composer(
+        "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+    ));
+    let read = |screen: &Vec<String>| {
+        crate::supervise::policy::turn_end::TurnEndReading::of(
+            &aterm_phase::ClaudeReader.read(screen, Some(2)),
+            screen,
+            false,
+            None,
+            None,
+            None,
+        )
+    };
+    let run = |point: Vec<String>, moved_at: &Vec<String>, started: bool| {
+        let host = AccountHost::scripted(&[None], &[]);
+        let opts = account_opts(&host);
+        let mut m = Mock::new(vec![point.clone()]);
+        {
+            let mut s = session(&mut m, Some("@s-1".to_string()));
+            s.set_clock(ACCOUNT_NOW, PDT);
+            s.set_zone_lookup(test_zones);
+            let r = read(&resumed);
+            let now = Instant::now();
+            s.turn_end.observe(&r, now);
+            s.turn_end.restarted(
+                &Restart::Account {
+                    to: "lab-c".to_string(),
+                    at: AccountAt::Ahead,
+                },
+                true,
+                &read(moved_at),
+                now,
+            );
+            if started {
+                s.turn_end.observe(&r, now);
+            }
+            let point = point_at(&s, point, 720);
+            s.turn_end_at_point(&point, None, &opts)
+                .expect("a decision");
+        }
+        host.all()
+    };
+    for started in [true, false] {
+        let said = run(answered.clone(), &resumed, started);
+        assert_eq!(
+            said.iter().filter(|s| *s == "served").count(),
+            1,
+            "the prompt answered at once (a point read the restart first: {started}): {said:?}"
+        );
+        assert!(
+            !run(resumed.clone(), &resumed, started)
+                .iter()
+                .any(|s| s == "served"),
+            "CONTROL: the resumed transcript, its prompts answered before the move ({started})"
+        );
+    }
+    assert!(
+        !run(answered, &opened, false).iter().any(|s| s == "served"),
+        "CONTROL: the move's point closed no prompt, so the restart's first point proves nothing"
     );
 }
 
@@ -24571,6 +25186,7 @@ fn a_try_inside_its_take_window_is_awaited_by_a_loop_that_follows() {
         let (mut seen, mut books) = (0, Vec::new());
         let mut m = Mock::new(vec![spend.clone()]);
         let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_mono_standing();
         s.set_zone_lookup(test_zones);
         s.ledger = Ledger::open(Some(&ledger), Some("@s-1"), &mut Vec::new());
         let window = if work.is_none() {
@@ -24630,7 +25246,7 @@ fn a_try_inside_its_take_window_is_awaited_by_a_loop_that_follows() {
                 (first, end_at)
             }
             None => {
-                std::thread::sleep(window * 2);
+                s.test_clock().skip(window * 2);
                 s.set_clock(try_at + 40, PDT);
                 let _ = decided(&mut s, &spend, 103, None);
                 stamp_rows(&ledger, &mut seen, &mut books, (try_at + 40) * 1000);
@@ -24660,15 +25276,17 @@ fn a_try_inside_its_take_window_is_awaited_by_a_loop_that_follows() {
         let attach = try_at + attach_s;
         let mut m2 = Mock::new(vec![spend.clone()]);
         let mut s2 = session(&mut m2, Some("@s-1".to_string()));
+        s2.set_mono_standing();
         s2.set_clock(attach, PDT);
         s2.set_zone_lookup(test_zones);
         s2.ledger = Ledger::open(Some(&books_path), Some("@s-1"), &mut Vec::new());
+        let seeded_at = s2.fx.mono();
         seed_usage_act(
             &mut s2.turn_end,
             &books_path,
             s2.setup.sid.as_deref(),
             attach * 1000,
-            Instant::now(),
+            seeded_at,
         );
         s2.seed_wall_memory(open_wall(&books_path, Some("@s-1")));
         let mut next = None;
@@ -27369,6 +27987,52 @@ fn a_restart_whose_process_was_taken_reads_the_count_again() {
     );
 }
 
+/// A RELAUNCH THE HOST MADE RESUMES THE SESSION'S CONVERSATION, so a taskless screen just after
+/// it is that resume's banner, not a program started fresh (`TurnEndState::resumed`); one that
+/// started the agent afresh (`done:fresh`: nothing to resume) is a fresh start, and a restart the
+/// host refused is no relaunch.
+/// NEGATIVE CONTROL: with `relaunched_afresh` out of `restart_agent`, `done:fresh` reads as a
+/// resume.
+#[test]
+fn a_relaunch_that_resumes_reads_its_banner_as_the_session_and_one_afresh_does_not() {
+    let run = |answer: &'static str| {
+        let host = AccountHost::scripted(&[None], &[answer]);
+        let mut m = Mock::new(vec![idle_screen(), idle_screen()]);
+        m.cursor_on_caret = true;
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            ..hosted(30)
+        };
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(TEST_NOW, PDT);
+        let screen = s.screen().expect("the point");
+        let point = s.turn_of(screen);
+        let _ = s
+            .turn_end_at_point(&point, Some(Duration::from_secs(6)), &opts)
+            .expect("the decision");
+        s.restart_agent(
+            &point,
+            &Restart::Memory,
+            "memory-restart@v1",
+            TurnEndAction::Nothing,
+            &opts,
+            &[],
+            &mut Alone,
+        )
+        .expect("the restart");
+        assert_eq!(host.said("restart"), ["restart:memory"], "{answer}");
+        s.turn_end.resumed_at().is_some()
+    };
+    for answer in ["adopted", "relaunched", "done:resumed"] {
+        assert!(run(answer), "{answer}: the session resumed");
+    }
+    assert!(!run("done:fresh"), "a relaunch afresh resumes nothing");
+    assert!(
+        !run("refused:not-a-shell-job"),
+        "a restart the host did not make"
+    );
+}
+
 #[test]
 fn a_restarts_count_baseline_is_marked_as_a_reading_marks_its_conversation() {
     let answered = answered_turn(
@@ -27427,4 +28091,226 @@ fn a_restarts_count_baseline_is_marked_as_a_reading_marks_its_conversation() {
         before,
         "a person's prompt answered since the restart is folded as a turn: {a:?}"
     );
+}
+
+#[test]
+fn fold_point_asks_host_agent_resumed_so_an_external_resume_banner_stays_in_session() {
+    #[derive(Debug)]
+    struct ExternalResumeHost(AgentResumed);
+    impl IdleHost for ExternalResumeHost {
+        fn wants(&self) -> bool {
+            false
+        }
+        fn at_idle(&self) -> Option<HostStep> {
+            None
+        }
+        fn owns_turn_end(&self) -> bool {
+            false
+        }
+        fn agent_resumed(&self) -> Option<AgentResumed> {
+            Some(self.0)
+        }
+    }
+
+    let check = |resumed: bool| {
+        let host: Arc<dyn IdleHost> = Arc::new(ExternalResumeHost(AgentResumed {
+            pid: 777,
+            started: Some(1_793_000_000),
+            resumed,
+        }));
+        let mut m = Mock::new(vec![idle_screen()]);
+        let opts = SuperviseOpts {
+            idle_host: Some(host),
+            policy: SupervisorConfig {
+                autopilot: Autopilot::Land,
+                ..SupervisorConfig::default()
+            },
+            ..hosted(30)
+        };
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.turn_end.seed_worked();
+        let now = Instant::now();
+        let screen = s.screen().expect("point");
+        let mut banner = s.turn_end_reading(&screen, None, &opts);
+        banner.autopilot = Autopilot::Land;
+        banner.taskless = true;
+        s.fold_point(&mut banner, now, screen.seq, &opts);
+        s.turn_end.opened_fresh()
+    };
+    assert!(
+        !check(true),
+        "external resume banner folded through IdleHost::agent_resumed stays in session"
+    );
+    assert!(
+        check(false),
+        "control: fresh agent banner sets opened_fresh"
+    );
+}
+
+/// A Cruise point after real work, no wall on it, whose host peeks the API's reach as
+/// `script` says ([`ReachHost::peeks`] when `peeks`), run for `max_s`.
+fn wall_less_outage(
+    script: &[Reach],
+    max_s: u64,
+    peeks: bool,
+) -> (Vec<String>, Arc<ReachHost>, Mock, Vec<String>) {
+    let host = ReachHost::scripted(script);
+    host.peeks.store(peeks, Ordering::SeqCst);
+    let (dir, path) = journal_file(&format!(
+        "te-wall-less-outage-{}-{max_s}-{peeks}",
+        script.len()
+    ));
+    let mut m = Mock::new(vec![
+        busy_screen(),
+        ended("Fixed the parser; the suite is green."),
+        busy_screen(),
+        ended(STOP),
+    ]);
+    m.turn_releases = Some(1);
+    m.vanish_after = Some(2);
+    m.stall_sleep = Some(Duration::from_millis(5));
+    let opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        journal: Some(path.clone()),
+        ..hosted(max_s)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| s.set_turn_end_timing(far_rungs()));
+    let (records, _) = journal_records(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+    let waiting = records
+        .into_iter()
+        .filter(|r| r.kind == "waiting")
+        .map(|r| r.summary)
+        .collect();
+    (lines, host, m, waiting)
+}
+
+/// A MEASURED OUTAGE HOLDS A WALL-LESS CONTINUATION AND ITS UP RESUMES IT (owner, 2026-10-26:
+/// "you (the claude harness) need to auto recover when the network status is restored"): at a
+/// Cruise point after real work, no wall on it, a peek that says Down makes the loop ask the
+/// reach (its lease keeps the probe measuring) and hold the continuation (`UNREACHABLE_HOLD`);
+/// the Up edge decides the point again and types continue@v1, once. Controls: an outage that
+/// never ends types nothing for the whole run; a host whose peek is the trait's (Unknown) is
+/// asked nothing and the continuation goes at once, as before. NEGATIVE CONTROL (run): with the
+/// loop's peek arm removed (`Some(h) if self.peeks_down(..)`), the continuation is typed at once
+/// into the outage and the test fails on "the hold is said", as it failed on main before the
+/// hold.
+#[test]
+fn a_measured_outage_holds_a_wall_less_continuation_until_its_up() {
+    use crate::supervise::policy::turn_end::UNREACHABLE_HOLD;
+    let t = Instant::now();
+    let down = Reach::Down { since: t };
+    let up = Reach::Up {
+        since: t + Duration::from_secs(1),
+    };
+    let (lines, host, m, waiting) = wall_less_outage(&[down, down, down, up], 30, true);
+    let continued: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("CONTINUED"))
+        .collect();
+    assert_eq!(continued.len(), 1, "{lines:#?}");
+    assert_eq!(
+        continued[0], "CONTINUED seq=102 rule=continue@v1 keep going",
+        "{lines:#?}"
+    );
+    assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
+    assert!(
+        waiting.iter().any(|w| w.contains(UNREACHABLE_HOLD)),
+        "the hold is said: {waiting:#?}"
+    );
+    assert!(
+        host.asks() >= 4,
+        "the Up was asked before the continuation went: {} asks\n{lines:#?}",
+        host.asks()
+    );
+    assert!(host.peeked() >= 1, "the point peeked");
+
+    let (lines, host, m, waiting) = wall_less_outage(&[down], 1, true);
+    assert_eq!(count(&m, "turn"), 0, "{lines:#?}\n{:#?}", m.requests);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("CONTINUED")),
+        "nothing is typed into the outage: {lines:#?}"
+    );
+    assert!(
+        waiting.iter().any(|w| w.contains(UNREACHABLE_HOLD)),
+        "{waiting:#?}"
+    );
+    assert!(host.asks() > 1, "asked at each step while it waited");
+
+    let (lines, host, m, _) = wall_less_outage(&[down], 30, false);
+    assert!(
+        lines.contains(&"CONTINUED seq=102 rule=continue@v1 keep going".to_string()),
+        "{lines:#?}"
+    );
+    assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
+    assert_eq!(
+        host.asks(),
+        0,
+        "a host with no peek is asked nothing: {lines:#?}"
+    );
+}
+
+/// A POINT'S ACT SPENDS THE POINT'S REACH READ: a Cruise point whose peek read Down holds the
+/// continuation (`UNREACHABLE_HOLD`) and holds a break's line on it (`Guard::Reach`); once an act
+/// is typed there anyway (an arm that types at any reach, such as a limit's resume, or the
+/// outage's cap), the breaks of the turn it opens are not held on that read, though the reread
+/// after the act peeked Down again: the next point reads its own, and a break's write reads the
+/// reach afresh. NEGATIVE CONTROL (run): with `turn_end_execute`'s `self.reach_seen = None`
+/// removed, "the act spent the point's Down" fails (the reread's Down stands, and every break
+/// line of the turn the act opened is held on it).
+#[test]
+fn an_act_typed_at_a_down_point_leaves_no_reach_hold_for_the_breaks_after_it() {
+    use crate::supervise::policy::turn_end::{RULE_LIMIT_RESUME, UNREACHABLE_HOLD};
+    let host = ReachHost::scripted(&[]);
+    host.peeks.store(true, Ordering::SeqCst);
+    let opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        ..hosted(30)
+    };
+    let said = ended("Fixed the parser; the suite is green.");
+    let mut m = Mock::new(vec![said.clone(); 6]);
+    let mut s = session(&mut m, Some("@s-1".to_string()));
+    let down = Reach::Down { since: s.fx.mono() };
+    host.script.lock().unwrap().push_back(down);
+    let read = s.screen().expect("the point's read");
+    let point = s.turn_of(read);
+    let held = s
+        .turn_end_at_point(&point, Some(Duration::from_secs(300)), &opts)
+        .expect("a decision");
+    assert!(
+        matches!(&held, TurnEndAction::WaitUntil { why, .. } if why == UNREACHABLE_HOLD),
+        "the point's Down holds the continuation: {held:?}"
+    );
+    let now = s.fx.mono();
+    assert!(
+        s.occupancy_guards(now, &opts.policy, &said).reach_down,
+        "the point's Down holds a break's line"
+    );
+    let resume = TurnEndAction::Type {
+        text: "Continue where you left off.".to_string(),
+        rule_id: RULE_LIMIT_RESUME,
+    };
+    let asks = host.asks();
+    let mut heard = Heard::default();
+    s.turn_end_execute(&point, resume, &opts, &[], &mut heard)
+        .expect("the act is typed");
+    assert!(
+        heard
+            .said
+            .iter()
+            .any(|l| l.starts_with("CONTINUED ") && l.contains(RULE_LIMIT_RESUME)),
+        "{:#?}",
+        heard.said
+    );
+    assert!(
+        host.asks() > asks,
+        "the reread after the act read the Down again"
+    );
+    assert!(
+        !s.occupancy_guards(s.fx.mono(), &opts.policy, &said)
+            .reach_down,
+        "the act spent the point's Down"
+    );
+    drop(s);
+    assert_eq!(count(&m, "@s-1 turn"), 1, "{:#?}", m.requests);
 }

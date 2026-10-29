@@ -687,6 +687,9 @@ impl Parser {
     /// Decode one multi-byte UTF-8 character from `lead` plus the prefix of `rem`.
     #[inline]
     pub(crate) fn decode_multibyte_char(lead: u8, rem: &[u8]) -> Option<(char, usize)> {
+        if !(0xC2..=0xF4).contains(&lead) {
+            return None;
+        }
         if lead >= 0xF0 {
             if let &[c0, c1, c2, ..] = rem
                 && (c0 & 0xC0) == 0x80

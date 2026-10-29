@@ -1,0 +1,25 @@
+# claude-code 2.1.311 · MEASURED 2026-10-27, `aterm ctl text` of a private headless aterm (144x24, aterm 0.145.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · vim editor mode (`editorMode: "vim"`), fullscreen renderer (CLAUDE_CODE_NO_FLICKER=1, CLAUDE_CODE_NATIVE_CURSOR=1), at the end of `lab trail-keys --vim`: shell mode (`!` typed into an empty prompt), `echo` typed, Escape, `h` three times, `i`, `xyz` typed: the box's caret is `!` and the mode row under its bottom rule opens with `-- INSERT --` at column 2, `! for shell mode` after it
+
+ ▐▛███▛█   Claude Code v2.1.311
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.A4eA/proj
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+! xyzecho
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  -- INSERT -- ! for shell mode

@@ -1700,8 +1700,15 @@ pub(crate) fn summarize_not_started(detail: &str) -> Message {
 
 pub(crate) const KEY_STOP_WORKER: &str = "harness.stop-worker";
 
-/// Builds the error message when Stop Worker fails to signal the tab's agent.
-pub(crate) fn stop_worker_failed(label: &str, detail: &str) -> Message {
+/// The key of tab `session`'s Stop Worker row: its session, never its label, which can be the
+/// program's own title (and which aterm.log never keeps, DESIGN §3.6).
+fn stop_worker_key(session: u64) -> String {
+    format!("{KEY_STOP_WORKER}.{session}")
+}
+
+/// Builds the error message when Stop Worker fails to signal the agent of tab `session`
+/// (`label`, as the title names it).
+pub(crate) fn stop_worker_failed(session: u64, label: &str, detail: &str) -> Message {
     gesture_failure(
         tags::HARNESS,
         Severity::Warn,
@@ -1709,11 +1716,11 @@ pub(crate) fn stop_worker_failed(label: &str, detail: &str) -> Message {
         detail,
         Then::step("Close its tab to end it"),
     )
-    .key(format!("{KEY_STOP_WORKER}.{label}").as_str())
+    .key(&stop_worker_key(session))
 }
 
-/// Builds the record when Stop Worker finds no active task to stop.
-pub(crate) fn stop_worker_nothing(label: &str, detail: &str) -> Message {
+/// Builds the record when Stop Worker finds no active task to stop in tab `session`.
+pub(crate) fn stop_worker_nothing(session: u64, label: &str, detail: &str) -> Message {
     Message::new(
         tags::HARNESS,
         Severity::Info,
@@ -1721,7 +1728,7 @@ pub(crate) fn stop_worker_nothing(label: &str, detail: &str) -> Message {
     )
     .line(detail)
     .record()
-    .key(format!("{KEY_STOP_WORKER}.{label}").as_str())
+    .key(&stop_worker_key(session))
 }
 
 /// Builds the error message when an Agents menu or palette command fails.
@@ -2987,13 +2994,17 @@ pub(crate) fn agent_upgrade_stalled(
             "--skip",
         ),
         Some(Remedy::Waits) if row.wait == aterm_agent::harness::upgrade_drive::AUTOPILOT_OFF => (
-            format!("it moves once its autopilot is cruise or land again; {skip}"),
+            format!(
+                "it moves once its autopilot is cruise or land again{}; {skip}",
+                pressed_past(row)
+            ),
             "--skip",
         ),
         Some(Remedy::Waits) if row.rests_on_own_work() => (
             format!(
                 "{now_word} cannot move it past its own work: it moves once that ends or the \
-                 agent stops it; {skip}"
+                 agent stops it{}; {skip}",
+                pressed_past(row)
             ),
             "--skip",
         ),
@@ -4846,6 +4857,64 @@ pub(crate) fn accounts_no_sign_in_entry(rows: &[(String, String)]) -> Option<Ent
 
 pub(crate) const ACCOUNTS_CREDITS_KEY: &str = "harness.accounts.credits";
 
+/// The fact for later when the harness starts a worker to claim a free credit Claude Code offers
+/// (`[harness] claim_credits`, [`crate::harness_host::credit_claim`]): the offer, its link and
+/// the worker's tab.
+pub(crate) fn credit_claim_started_entry(
+    offer: &aterm_agent::harness::credit_offers::Offer,
+    sid: &str,
+) -> Entry {
+    Entry::new(
+        Family::Accounts,
+        offer.id.word(),
+        "claim-started",
+        "Claiming a free Claude credit",
+        Why::Spent {
+            tried: Reason::new(format!(
+                "started a worker in tab @{sid} to claim it in your own Chrome"
+            )),
+            reason: Reason::new("Claude Code's cached offer says this account can claim it"),
+        },
+        Then::step(format!("Read tab @{sid} for the worker's last reply")),
+    )
+    .severity(Severity::Info)
+    .resurface(Resurface::WAIT)
+    .more(format!("Offer: {}", offer.words))
+    .more(format!("Link: {}", offer.url))
+    .log_line(format!(
+        "credit-claim started offer={} tab=@{sid}",
+        offer.id.word()
+    ))
+}
+
+/// [`credit_claim_started_entry`] where no worker started: why, and the link to claim it by hand.
+pub(crate) fn credit_claim_not_started_entry(
+    offer: &aterm_agent::harness::credit_offers::Offer,
+    why: &str,
+) -> Entry {
+    Entry::new(
+        Family::Accounts,
+        offer.id.word(),
+        "claim-not-started",
+        "A free Claude credit is unclaimed",
+        Why::Spent {
+            tried: Reason::new("tried to start a worker to claim it"),
+            reason: Reason::new(atpkg::progress::sanitize_for_tty(
+                why,
+                aterm_messages::DETAIL_LINE_CAP,
+            )),
+        },
+        Then::step(format!("Open {} in your browser to claim it", offer.url)),
+    )
+    .severity(Severity::Info)
+    .resurface(Resurface::WAIT)
+    .more(format!("Offer: {}", offer.words))
+    .log_line(format!(
+        "credit-claim not-started offer={}",
+        offer.id.word()
+    ))
+}
+
 pub(crate) const ACCOUNTS_WINDOW_FULL_KEY: &str = "harness.accounts.window-full";
 
 /// Builds the exceptions digest entry when usage credits are carrying Claude Code sessions.
@@ -5018,23 +5087,57 @@ const fn title_word(cli: aterm_agent::harness::accounts::Cli) -> &'static str {
 
 /// The fact for later of `cli`'s logins due for renewal ([`accounts_due_entry`] for Claude
 /// Code's, word for word): the window's upkeep renews another CLI's due logins that name an email
-/// in the background too (`accounts_sync`'s `renew_pool_due`), so it asks no one to; it names its product and steps
-/// to the read of its pool (`--cli`), keeping its own subject (the CLI's id), so each CLI's entry
-/// stands apart. A renewal that stops for a person is its sign-in task's entry
-/// ([`accounts_sign_in_entry_for`]).
+/// in the background too (`accounts_sync`'s `renew_pool_due`), so it asks no one to; it names its
+/// product and steps to the read of its pool (`--cli`), keeping its own subject (the CLI's id),
+/// so each CLI's entry stands apart. A renewal that stops for a person is its sign-in task's
+/// entry ([`accounts_sign_in_entry_for`]). A CLI whose renewals cannot approve its page by
+/// themselves (`Cli::renews_headlessly`: Grok Build's, whose page answers a headless browser with
+/// a block page, so the upkeep starts none of its renewals) asks the person instead, naming each
+/// row's sign-in on a terminal (`accounts login`); the host passes it only the due logins no
+/// sign-in task names yet, since that task's entry already asks for the same sign-in.
 pub(crate) fn accounts_due_entry_for(
     cli: aterm_agent::harness::accounts::Cli,
     labels: &[String],
 ) -> Option<Entry> {
+    use aterm_agent::harness::accounts::SignInAction;
     if cli == aterm_agent::harness::accounts::Cli::Claude {
         return accounts_due_entry(labels);
     }
-    labels.first()?;
+    let first = labels.first()?;
     let word = title_word(cli);
     let what = match labels.len() {
         1 => format!("{word} login due for renewal"),
         n => format!("{n} {word} logins due for renewal"),
     };
+    if !cli.renews_headlessly() {
+        let mut entry = Entry::new(
+            Family::Accounts,
+            cli.id(),
+            "due",
+            &what,
+            Why::OnlyYou(Reason::new(
+                "Its sign-in page blocks aterm's headless browser, so only your sign-in renews a login",
+            )),
+            Then::step(SignInAction::Login.next_step(cli, first)),
+        )
+        .severity(Severity::Info)
+        .resurface(Resurface::WAIT)
+        .more(format!("{} logins:", cli.connector().product));
+        for label in labels
+            .iter()
+            .take(aterm_messages::exceptions::MORE_LINES - 1)
+        {
+            entry = entry.more(format!(
+                "{label}: {}",
+                SignInAction::Login.next_step(cli, label)
+            ));
+        }
+        return Some(entry.log_line(format!(
+            "accounts cli={} need=due n={}",
+            cli.id(),
+            labels.len()
+        )));
+    }
     let mut entry = Entry::new(
         Family::Accounts,
         cli.id(),
@@ -5066,15 +5169,32 @@ pub(crate) fn accounts_due_entry_for(
 /// tried again once the wrong account's hold and the renewal cooldown have passed, sooner where
 /// the mailbox's configuration changed), so it asks no one to; it names its product and steps to
 /// the read of its pool (`--cli`). A renewal that stops for a person is its sign-in task's entry
-/// ([`accounts_sign_in_entry_for`]).
+/// ([`accounts_sign_in_entry_for`]). A CLI whose renewals cannot approve its page by themselves
+/// (`Cli::renews_headlessly`: Grok Build's, whose renewal the upkeep never starts) is signed in
+/// again by the person, so its entry names the row's sign-in on a terminal (`accounts login`).
 pub(crate) fn accounts_wrong_entry_for(
     cli: aterm_agent::harness::accounts::Cli,
     labels: &[String],
 ) -> Option<Entry> {
+    use aterm_agent::harness::accounts::SignInAction;
     if cli == aterm_agent::harness::accounts::Cli::Claude {
         return accounts_wrong_entry(labels);
     }
     let first = labels.first()?;
+    let (then, again) = if cli.renews_headlessly() {
+        (
+            format!("{ACCOUNTS_READ} --cli {}", cli.id()),
+            "aterm signs the row in again by itself".to_string(),
+        )
+    } else {
+        (
+            SignInAction::Login.next_step(cli, first),
+            format!(
+                "aterm signs no {} row in by itself",
+                cli.connector().product
+            ),
+        )
+    };
     let mut entry = Entry::new(
         Family::Accounts,
         cli.id(),
@@ -5084,14 +5204,14 @@ pub(crate) fn accounts_wrong_entry_for(
             tried: Reason::new("threw away a sign-in that named another account"),
             reason: Reason::new("the row's login is unchanged until it signs in as its own"),
         },
-        Then::step(format!("{ACCOUNTS_READ} --cli {}", cli.id())),
+        Then::step(then),
     )
     .severity(Severity::Info)
     .resurface(Resurface::WAIT)
     .restated_at_once()
     .more(format!(
         "The {} sign-in for {first} signed in an account other than its row's email; \
-         nothing live changed, and aterm signs the row in again by itself.",
+         nothing live changed, and {again}.",
         cli.connector().product
     ));
     for line in labels_lines("Wrong account: ", labels, NOTICE_LABEL_LINES) {
@@ -5104,7 +5224,9 @@ pub(crate) fn accounts_wrong_entry_for(
     )))
 }
 
-/// The remaining human step of a pool's background sign-in, without its URL or code.
+/// The remaining human step of a pool's sign-in that stopped for a person, a background
+/// renewal's or one a person ran (the window starts no Grok Build renewal), without its URL or
+/// code.
 pub(crate) fn accounts_sign_in_entry_for(
     cli: aterm_agent::harness::accounts::Cli,
     tasks: &[(String, aterm_agent::harness::accounts::SignInAction)],
@@ -5116,7 +5238,7 @@ pub(crate) fn accounts_sign_in_entry_for(
         "sign-in",
         &format!("{} sign-in needs you", title_word(cli)),
         Why::OnlyYou(Reason::new(
-            "Its background sign-in stopped for a person before a new login could be bound",
+            "Its sign-in stopped for a person before a new login could be bound",
         )),
         Then::step(action.next_step(cli, first)),
     )
@@ -6068,6 +6190,16 @@ const fn agent_word(agent: aterm_agent::harness::upgrade::Agent) -> &'static str
     }
 }
 
+/// What a press of the ⬆️ adds to the remedy of a wait it moves past (an Autopilot off, the
+/// agent's own work): only a Claude Code tab's press does ([`aterm_agent::harness::upgrade_drive::press`]).
+const fn pressed_past(row: &aterm_agent::harness::upgrade_drive::Row) -> &'static str {
+    if row.agent.presses() {
+        ", or at once on a press of its update arrow"
+    } else {
+        ""
+    }
+}
+
 fn own_work_round(row: &aterm_agent::harness::upgrade_drive::Row, now: u64) -> bool {
     row.phase == aterm_agent::harness::upgrade::Phase::Pending && row.will_ask_again(now)
 }
@@ -6097,10 +6229,10 @@ pub(crate) fn agent_upgrade_words(
         Some(Remedy::AskAgain) => true,
         Some(Remedy::Waits | Remedy::InItsPane | Remedy::ByHand | Remedy::ResumeInTab) => false,
     };
-    use aterm_agent::harness::upgrade::{Request, Version};
+    use aterm_agent::harness::upgrade::Request;
     let deferred = match &row.request {
         Request::DeferUntil(until) => now < *until,
-        Request::Skip(v) if Version::parse(v) == Version::parse(&row.to) => return Vec::new(),
+        Request::Skip(_) if row.request.skips_for(row.agent, &row.to) => return Vec::new(),
         Request::Skip(_) | Request::None | Request::Now => false,
     };
     let mut words = Vec::with_capacity(3);
@@ -6141,10 +6273,12 @@ pub(crate) fn agent_upgrade_capsules(
         .collect()
 }
 
-/// Builds the log record confirming an operator's upgrade action (`Upgrade now`, `Defer`, `Skip`).
+/// Builds the log record confirming an operator's upgrade action (`Upgrade now`, `Defer`, `Skip`),
+/// or their press of the top rule's ⬆️ (`pressed`).
 pub(crate) fn agent_upgrade_worded(
     row: &aterm_agent::harness::upgrade_drive::Row,
     word: aterm_messages::UpgradeWord,
+    pressed: bool,
     place: &str,
     asked_again: bool,
 ) -> Message {
@@ -6153,6 +6287,10 @@ pub(crate) fn agent_upgrade_worded(
     let who = agent_word(row.agent);
     let (from, to) = (clean(&row.from), clean(&row.to));
     let (title, then) = match word {
+        UpgradeWord::Now if pressed => (
+            format!("{who} restarts on {to} and resumes its conversation"),
+            press_then().to_string(),
+        ),
         UpgradeWord::Now if asked_again => (
             format!("{who} is asked again {place}"),
             format!("the upgrade's question is typed once more; it moves once {who} agrees"),
@@ -6261,6 +6399,44 @@ pub(crate) fn agent_upgrade_word_refused(
     }
 }
 
+/// What a press of the ⬆️ does, as its record says it: what it passes and what it waits for
+/// ([`aterm_agent::harness::upgrade::press_gate`]), and the background shells the restart ends
+/// ([`aterm_agent::harness::upgrade::RESTART_ENDS_BACKGROUND`]).
+const fn press_then() -> &'static str {
+    if aterm_agent::harness::upgrade::RESTART_ENDS_BACKGROUND {
+        "the press moves past the Autopilot, the harness switch and the agent's background \
+         shells, which the restart ends; it waits only for a draft, a dialog, a usage limit, a \
+         login or a running turn"
+    } else {
+        "the press moves past the Autopilot, the harness switch and the agent's background \
+         shells; it waits only for a draft, a dialog, a usage limit, a login or a running turn"
+    }
+}
+
+/// Builds the feedback when the owner presses a top rule's ⬆️ for a move nothing performs now:
+/// its tab is set aside (`why`: another supervisor holding it, or for an agent no press moves,
+/// its Autopilot or its harness off), so no Upgrade Now was written for `to`; `then` says what
+/// lets it be asked for.
+pub(crate) fn agent_upgrade_held(
+    agent: aterm_agent::harness::upgrade::Agent,
+    to: &str,
+    why: &str,
+    then: &str,
+    place: &str,
+) -> Message {
+    let who = agent_word(agent);
+    let shown = atpkg::progress::sanitize_for_tty(to, 32);
+    let title = placed_title(&format!("Couldn't upgrade {who}"), place, " now");
+    gesture_failure(
+        tags::HARNESS,
+        Severity::Warn,
+        &title,
+        &format!("{why}, so nothing was written for {shown}"),
+        Then::step(then),
+    )
+    .no_excerpt()
+}
+
 /// Why an owner's upgrade word was refused, short enough for the top rule's label slot
 /// (`press it again`, `a newer build: 2.1.311`, `its restart is already under way`).
 pub(crate) fn agent_upgrade_refused_words(why: &str) -> String {
@@ -6272,7 +6448,7 @@ pub(crate) fn agent_upgrade_refused_words(why: &str) -> String {
             atpkg::progress::sanitize_for_tty(now_to, 32)
         )
     } else if aterm_agent::harness::upgrade_drive::refused_stopped(why).is_some() {
-        "the upgrade stopped before the press reached it".to_string()
+        REFUSED_STOPPED.0.to_string()
     } else {
         refusal_words(why).map_or_else(
             || atpkg::progress::sanitize_for_tty(why, 60),
@@ -6281,15 +6457,46 @@ pub(crate) fn agent_upgrade_refused_words(why: &str) -> String {
     }
 }
 
+/// [`agent_upgrade_refused_words`]' words in the fewest, for a top rule's label slot too narrow
+/// for them (`already under way`); `None` for words with no shorter form.
+pub(crate) fn agent_upgrade_refused_terse(words: &str) -> Option<&'static str> {
+    [
+        REFUSED_STOPPED,
+        REFUSED_UNDER_WAY,
+        REFUSED_QUIT,
+        REFUSED_NONE,
+        REFUSED_FOR_GOOD,
+    ]
+    .into_iter()
+    .find(|(whole, _)| *whole == words)
+    .map(|(_, terse)| terse)
+}
+
+/// A refused word's reason, and it in the fewest words ([`agent_upgrade_refused_terse`]).
+const REFUSED_STOPPED: (&str, &str) = (
+    "the upgrade stopped before the press reached it",
+    "the upgrade stopped",
+);
+const REFUSED_UNDER_WAY: (&str, &str) = ("its restart is already under way", "already under way");
+const REFUSED_QUIT: (&str, &str) = (
+    "it already quit: codex resume in the tab takes it back",
+    "it already quit",
+);
+const REFUSED_NONE: (&str, &str) = ("no upgrade waits in that tab now", "no upgrade waits");
+const REFUSED_FOR_GOOD: (&str, &str) = (
+    "its upgrade stopped and was not asked again",
+    "its upgrade stopped",
+);
+
 fn refusal_words(why: &str) -> Option<&'static str> {
     if why.contains("is already under way") {
-        Some("its restart is already under way")
+        Some(REFUSED_UNDER_WAY.0)
     } else if why.contains("stopped after its `/exit`") {
-        Some("it already quit: codex resume in the tab takes it back")
+        Some(REFUSED_QUIT.0)
     } else if why.starts_with("no upgrade is recorded") {
-        Some("no upgrade waits in that tab now")
+        Some(REFUSED_NONE.0)
     } else if why.contains("stopped for good") || why.contains("re-arms only one that gave up") {
-        Some("its upgrade stopped and was not asked again")
+        Some(REFUSED_FOR_GOOD.0)
     } else {
         None
     }

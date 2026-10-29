@@ -9,7 +9,7 @@ use std::io::{Read as _, Seek as _, SeekFrom};
 
 use crate::chain::open_file;
 use crate::py::{PyPath, bare_os_error, os_error};
-use crate::{Verdict, require};
+use crate::{Refusal, Verdict, require};
 
 /// Hold the file at `path` (not a symbolic link) to the signed `size`, a 64-bit
 /// little-endian ELF executable of `arch`'s machine, and the signed `digest`.
@@ -43,7 +43,11 @@ pub fn verify_binary(path: &OsStr, arch: &str, digest: &str, size: u64) -> Verdi
         word(20) == 1 && half(52) == 64,
         "invalid ELF version/header size",
     )?;
-    let machine = if arch == "x86_64" { 62 } else { 183 };
+    let machine = match arch {
+        "x86_64" => 62,
+        "aarch64" => 183,
+        _ => return Err(Refusal::new("unsupported Linux architecture")),
+    };
     require(
         half(18) == machine,
         "Linux artifact ELF architecture mismatch",

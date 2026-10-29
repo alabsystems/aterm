@@ -65,7 +65,7 @@ impl Tile {
     #[cfg_attr(trust_verify, trust::skip)]
     #[inline]
     pub fn over(&mut self, x: i32, y: i32, rgb: (f32, f32, f32), a: f32) {
-        if x < 0 || y < 0 || x as u32 >= self.w || y as u32 >= self.h || a <= 0.0 {
+        if x < 0 || y < 0 || x as u32 >= self.w || y as u32 >= self.h || a <= 0.0 || a.is_nan() {
             return;
         }
         let i = ((y as u32 * self.w + x as u32) * 4) as usize;
@@ -99,7 +99,7 @@ impl Tile {
     /// Source-over a horizontal run of `len` pixels starting at `(x, y)`.
     #[inline]
     pub(crate) fn over_run(&mut self, x: i32, y: i32, len: u32, rgb: (f32, f32, f32), a: f32) {
-        if y < 0 || y as u32 >= self.h || a <= 0.0 || len == 0 {
+        if y < 0 || y as u32 >= self.h || a <= 0.0 || a.is_nan() || len == 0 {
             return;
         }
         let start = x.max(0);
@@ -259,5 +259,22 @@ impl Tile {
                 ny * ny
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Tile;
+
+    #[test]
+    fn nan_alpha_leaves_painted_pixels_unchanged() {
+        let mut t = Tile::new(4, 1);
+        t.over_run(0, 0, 4, (1.0, 0.5, 0.25), 1.0);
+        let painted = t.pixels().to_vec();
+        assert_ne!(painted, vec![0; 16]);
+
+        t.over(1, 0, (0.0, 1.0, 0.0), f32::NAN);
+        t.over_run(0, 0, 4, (0.0, 0.0, 1.0), f32::NAN);
+        assert_eq!(t.pixels(), &painted[..]);
     }
 }

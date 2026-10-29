@@ -626,3 +626,76 @@ fn every_bounded_delivery_order_conforms_and_replay_or_fork_bypasses_are_caught(
     assert!(!model.check_invariant("ForkWithholds", &bad));
     assert!(!model.successors("Fork", &stopped).contains(&bad));
 }
+
+#[test]
+fn log_backed_account_preparation_survives_log_appends_and_epoch_rotations_until_revoked() {
+    let (lab, a, _) = fixture_on(true, &[Role::Writer, Role::Writer, Role::Writer]);
+    client::sync(&lab.paths[2], None).unwrap();
+    let genesis_out = lab.paths[0].home.join("f18.genesis");
+    client::test_sign_genesis(&lab.paths[0], &genesis_out, &lab.signer).unwrap();
+    let initial_wire = client::load_records(&lab.paths[0]).unwrap().encode();
+    for p in [&lab.paths[1], &lab.paths[2]] {
+        client::save_records(p, &initial_wire).unwrap();
+    }
+
+    let b = Activations::at(lab.paths[1].clone());
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let actor_1 = lab.bootstrap(1).request().unwrap().binding().actor();
+    let actor_2 = lab.bootstrap(2).request().unwrap().binding().actor();
+    let wanted = a
+        .configuration(&admin, ACCOUNT, "one", actor_1, vec![])
+        .unwrap();
+    let (_first, _) = a.issue(&admin, [2; 16], wanted).unwrap();
+    crate::table::tests::repair_commons(&lab, 3);
+
+    let bconfig = client::config(&lab.paths[1]).unwrap().unwrap();
+    assert_eq!(
+        b.prepare(ACCOUNT, &bconfig)
+            .unwrap()
+            .credential()
+            .unwrap()
+            .value()
+            .as_slice(),
+        b"inert-account-token"
+    );
+
+    // 1. Appending an unrelated record to the membership log changes `Access::head()` (`ALCO2`
+    //    digest) without changing `Access::basis()`. `b.prepare` must still succeed.
+    let fresh = client::admin_open(&lab.paths[0]).unwrap();
+    let mut doc = fresh.doc.clone();
+    doc.set_entry(&Audience::Everyone, "unrelated", b"log-append")
+        .unwrap();
+    client::admin_publish(&lab.paths[0], &fresh, &doc).unwrap();
+    client::sync(&lab.paths[1], None).unwrap();
+    assert_eq!(
+        b.prepare(ACCOUNT, &bconfig)
+            .unwrap()
+            .credential()
+            .unwrap()
+            .value()
+            .as_slice(),
+        b"inert-account-token"
+    );
+
+    // 2. Removing a third member (`actor_2`) in the membership log rotates `EpochAudience::Commons`
+    //    to a new epoch (`Access::basis()` changes). `b.prepare` must still succeed on `m2` via
+    //    `Session::historical_writer_in`.
+    client::remove_member_in_log(&lab.paths[0], actor_2).unwrap();
+    let wire_after_rem2 = client::load_records(&lab.paths[0]).unwrap().encode();
+    client::save_records(&lab.paths[1], &wire_after_rem2).unwrap();
+    assert_eq!(
+        b.prepare(ACCOUNT, &bconfig)
+            .unwrap()
+            .credential()
+            .unwrap()
+            .value()
+            .as_slice(),
+        b"inert-account-token"
+    );
+
+    // 3. Once `m2` itself (`actor_1`) is removed in the membership log, `b.prepare` is refused.
+    client::remove_member_in_log(&lab.paths[0], actor_1).unwrap();
+    let wire_after_rem1 = client::load_records(&lab.paths[0]).unwrap().encode();
+    client::save_records(&lab.paths[1], &wire_after_rem1).unwrap();
+    assert!(b.prepare(ACCOUNT, &bconfig).is_err());
+}

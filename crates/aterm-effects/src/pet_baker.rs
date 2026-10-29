@@ -224,10 +224,16 @@ fn paint_eye_dots(
     let bounds = &eye_meta.bounds[..eye_meta.paths.len()];
     let ratios = &eye_meta.ratios[..eye_meta.paths.len()];
     let near_cx = eye_meta.near_cx;
-    let min_gap = EYE_DOT_GAP_PX / xform.scale_x.max(1.0);
+    let inv_sx = 1.0 / xform.scale_x.max(f32::EPSILON);
+    let inv_sy = 1.0 / xform.scale_y.max(f32::EPSILON);
+    let min_gap = if xform.scale_x > 1.0 {
+        EYE_DOT_GAP_PX * inv_sx
+    } else {
+        EYE_DOT_GAP_PX
+    };
     let core_min_w_px = EYE_DOT_FAR_CORE_MIN_W_FRAC * xform.scale_y;
-    let half_inv_sx = 0.5 / xform.scale_x.max(f32::EPSILON);
-    let half_inv_sy = 0.5 / xform.scale_y.max(f32::EPSILON);
+    let half_inv_sx = 0.5 * inv_sx;
+    let half_inv_sy = 0.5 * inv_sy;
     #[inline]
     const fn fx(v: f32) -> u16 {
         (v * (FIXED_ONE as f32))

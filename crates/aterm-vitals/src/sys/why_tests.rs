@@ -261,7 +261,7 @@ fn example_b_a_calm_mac_is_two_lines() {
     assert_eq!(
         why("why", &c),
         "OK 2 sys v=1 view=why subject=global as_of=22:10:02.120 age_ms=120 window_ms=5000 next=7f3a.7
-why     calm: 0.4 of 18 cores busy; memory 16.6 of 128 GiB used, pressure normal; swap 0; no cause open
+why     calm: 0.4 of 18 cores busy; memory 16.6 GiB used · available not reported · 128 GiB total, pressure normal; swap 0; no cause open
 you tab=1 role=minor basis=machine_calm cpu_mc=120 share_pm=300
 "
     );
@@ -1147,6 +1147,23 @@ fn the_byte_cut_moves_rows_into_more_unless_top_is_given() {
     assert_eq!(lines(&with, "e").len(), 4, "{with}");
     assert!(with.len() <= REPLY_MAX, "{} bytes\n{with}", with.len());
     assert!(lines(&with, "who").len() < shown, "{with}");
+
+    let mut hw = s.clone();
+    hw.authorized_cpu_policy = Some(std::sync::Arc::new(Jv::obj([("state", Jv::s("ok"))])));
+    let hw_ctx = Ctx {
+        events: &events,
+        ..ctx(&w, &hw, true)
+    };
+    let with_hw = why("why", &hw_ctx);
+    assert!(
+        with_hw.contains("Authorized CPU policy collection: ok"),
+        "{with_hw}"
+    );
+    assert!(
+        with_hw.len() <= REPLY_MAX,
+        "{} bytes\n{with_hw}",
+        with_hw.len()
+    );
 }
 
 #[test]

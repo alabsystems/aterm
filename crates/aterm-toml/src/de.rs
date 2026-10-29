@@ -151,6 +151,13 @@ impl<'de, 'a> serde::Deserializer<'de> for Deserializer<'a> {
         visitor.visit_newtype_struct(self)
     }
 
+    fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        if matches!(self.node, Node::Value(EValue::Datetime(_))) {
+            return self.mismatch("a table");
+        }
+        self.deserialize_any(visitor)
+    }
+
     fn deserialize_struct<V: Visitor<'de>>(
         self,
         name: &'static str,
@@ -158,12 +165,13 @@ impl<'de, 'a> serde::Deserializer<'de> for Deserializer<'a> {
         visitor: V,
     ) -> Result<V::Value> {
         // Only the exact reserved name takes the date-time path (see `datetime`).
-        if name == DATETIME_STRUCT
-            && let Node::Value(EValue::Datetime(v)) = self.node
-        {
-            return visitor
-                .visit_map(DatetimeAccess::new(v.value()))
-                .map_err(|e| self.locate(e));
+        if let Node::Value(EValue::Datetime(v)) = self.node {
+            if name == DATETIME_STRUCT {
+                return visitor
+                    .visit_map(DatetimeAccess::new(v.value()))
+                    .map_err(|e| self.locate(e));
+            }
+            return self.mismatch("a table");
         }
         self.deserialize_any(visitor)
     }
@@ -203,7 +211,7 @@ impl<'de, 'a> serde::Deserializer<'de> for Deserializer<'a> {
 
     forward_to_deserialize_any! {
         bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
-        bytes byte_buf unit unit_struct seq tuple tuple_struct map identifier
+        bytes byte_buf unit unit_struct seq tuple tuple_struct identifier
         ignored_any
     }
 }
@@ -373,7 +381,7 @@ impl<'de> MapAccess<'de> for DatetimeAccess<'_> {
             return Ok(None);
         }
         self.done = true;
-        seed.deserialize(StrDeserializer {
+        seed.deserialize(BorrowedStrDeserializer {
             text: DATETIME_FIELD,
         })
         .map(Some)
@@ -383,6 +391,24 @@ impl<'de> MapAccess<'de> for DatetimeAccess<'_> {
         seed.deserialize(StringDeserializer {
             text: self.value.to_string(),
         })
+    }
+}
+
+struct BorrowedStrDeserializer<'de> {
+    text: &'de str,
+}
+
+impl<'de> serde::Deserializer<'de> for BorrowedStrDeserializer<'de> {
+    type Error = Error;
+
+    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        visitor.visit_borrowed_str(self.text)
+    }
+
+    forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bytes byte_buf option unit unit_struct newtype_struct seq tuple
+        tuple_struct map struct enum identifier ignored_any
     }
 }
 
@@ -550,8 +576,47 @@ impl<'de> VariantAccess<'de> for VariantValue<'_> {
         _fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value> {
-        serde::Deserializer::deserialize_any(Deserializer::item(self.source, self.item), visitor)
+        serde::Deserializer::deserialize_map(Deserializer::item(self.source, self.item), visitor)
             .map_err(|e| e.with_span(self.source, self.span()))
+    }
+}
+
+enum ValueMapKey {
+    Datetime,
+    Key(String),
+}
+
+impl<'de> serde::Deserialize<'de> for ValueMapKey {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> core::result::Result<Self, D::Error> {
+        struct KeyVisitor;
+
+        impl<'de> Visitor<'de> for KeyVisitor {
+            type Value = ValueMapKey;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a table key")
+            }
+
+            fn visit_borrowed_str<E>(self, v: &'de str) -> core::result::Result<Self::Value, E> {
+                if v == DATETIME_FIELD {
+                    Ok(ValueMapKey::Datetime)
+                } else {
+                    Ok(ValueMapKey::Key(v.to_owned()))
+                }
+            }
+
+            fn visit_str<E>(self, v: &str) -> core::result::Result<Self::Value, E> {
+                Ok(ValueMapKey::Key(v.to_owned()))
+            }
+
+            fn visit_string<E>(self, v: String) -> core::result::Result<Self::Value, E> {
+                Ok(ValueMapKey::Key(v))
+            }
+        }
+
+        deserializer.deserialize_any(KeyVisitor)
     }
 }
 
@@ -621,15 +686,28 @@ impl<'de> Visitor<'de> for ValueVisitor {
         mut map: A,
     ) -> core::result::Result<Self::Value, A::Error> {
         let mut table = crate::Table::new();
-        let Some(first) = map.next_key::<String>()? else {
+        let Some(first) = map.next_key::<ValueMapKey>()? else {
             return Ok(crate::Value::Table(table));
         };
-        if first == DATETIME_FIELD {
-            let text: String = map.next_value()?;
-            let parsed = text.parse().map_err(serde::de::Error::custom)?;
-            return Ok(crate::Value::Datetime(parsed));
+        match first {
+            ValueMapKey::Datetime => {
+                let first_val: crate::Value = map.next_value()?;
+                let second = map.next_key::<String>()?;
+                if second.is_none()
+                    && let crate::Value::String(ref text) = first_val
+                    && let Ok(parsed) = text.parse()
+                {
+                    return Ok(crate::Value::Datetime(parsed));
+                }
+                table.insert(DATETIME_FIELD.to_owned(), first_val);
+                if let Some(key) = second {
+                    table.insert(key, map.next_value()?);
+                }
+            }
+            ValueMapKey::Key(key) => {
+                table.insert(key, map.next_value()?);
+            }
         }
-        table.insert(first, map.next_value()?);
         while let Some(key) = map.next_key::<String>()? {
             table.insert(key, map.next_value()?);
         }
@@ -672,6 +750,11 @@ impl<'de> serde::Deserializer<'de> for crate::Value {
         visitor.visit_newtype_struct(self)
     }
 
+    fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        let item = crate::ser::value_to_item(&self)?;
+        serde::Deserializer::deserialize_map(Deserializer::item(None, &item), visitor)
+    }
+
     fn deserialize_struct<V: Visitor<'de>>(
         self,
         name: &'static str,
@@ -704,7 +787,7 @@ impl<'de> serde::Deserializer<'de> for crate::Value {
 
     forward_to_deserialize_any! {
         bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
-        bytes byte_buf unit unit_struct seq tuple tuple_struct map identifier
+        bytes byte_buf unit unit_struct seq tuple tuple_struct identifier
         ignored_any
     }
 }

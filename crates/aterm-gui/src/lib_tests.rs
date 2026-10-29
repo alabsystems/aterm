@@ -641,6 +641,7 @@ fn lane_wake_census() -> LaneCensus {
             .tick(Some(cell), now, &glow_cfg, geom, &mut out);
         ws.fx.cursor_mut().glow.drain_sound_cues().for_each(drop);
         let caret_cfg = RainbowConfig {
+            light: aterm_effects::cursor_glow::Light::OFF,
             enabled: false,
             intensity: 1.0,
             blinking: false,
@@ -744,6 +745,7 @@ fn the_settling_rainbow_caret_keeps_the_lane_to_its_last_step() {
             true,
             geom,
             &crate::cursor_rainbow::RainbowConfig {
+                light: aterm_effects::cursor_glow::Light::OFF,
                 enabled: true,
                 intensity: 1.0,
                 blinking: false,
@@ -843,6 +845,7 @@ fn the_settling_momentum_glow_keeps_the_lane_to_its_last_frame() {
         head: 0,
     };
     let cfg = MomentumGlowConfig {
+        light: aterm_effects::cursor_glow::Light::OFF,
         enabled: true,
         intensity: 1.0,
         tau_s: MOMENTUM_GLOW_TAU_S,
@@ -854,6 +857,7 @@ fn the_settling_momentum_glow_keeps_the_lane_to_its_last_frame() {
         theme_bg: 0x001A_1B26,
         block: true,
         glyph_span: None,
+        light_vivid: false,
     };
     let mut app = App::headless_for_test();
     let t0 = Instant::now();

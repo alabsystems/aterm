@@ -199,3 +199,42 @@ fn the_capture_window_is_booked_apart_from_the_life() {
     let unwindowed = SchedReading { win_ticks: 0, ..r };
     assert_eq!(unwindowed.deciding(), (4, 70_000));
 }
+
+#[test]
+fn extreme_inputs_classify_and_book_without_overflow() {
+    assert_eq!(
+        classify(&SchedInputs {
+            sampling_hole_us: u64::MAX,
+            nominal_dt_us: (u64::MAX / 2) + 1,
+            wall_us: 1,
+            budget_us: u64::MAX,
+            ..healthy()
+        }),
+        Starvation::KeptCadence {
+            late_max_us: 3_000,
+            threshold_us: DEFAULT_LATE_THRESHOLD_US,
+            ticks: 100,
+        }
+    );
+    assert_eq!(
+        classify(&SchedInputs {
+            wall_us: u64::MAX,
+            budget_us: u64::MAX,
+            ..healthy()
+        }),
+        Starvation::BudgetPressure {
+            wall_us: u64::MAX,
+            budget_us: u64::MAX,
+        }
+    );
+    let mut r = SchedReading {
+        ticks: u64::MAX,
+        late_total_us: u64::MAX - 5,
+        win_ticks: u64::MAX,
+        win_late_total_us: u64::MAX - 5,
+        ..SchedReading::default()
+    };
+    r.book(Duration::ZERO, Duration::from_micros(10), true);
+    assert_eq!((r.ticks, r.late_total_us), (u64::MAX, u64::MAX));
+    assert_eq!((r.win_ticks, r.win_late_total_us), (u64::MAX, u64::MAX));
+}

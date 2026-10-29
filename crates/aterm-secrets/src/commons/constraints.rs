@@ -15,7 +15,10 @@ use astream_wire::sync::{Actor, Digest, Index};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Per-node fact bound. The control journal independently bounds retained nodes.
-pub const MAX_FACTS: usize = 64;
+pub const MAX_FACTS: usize = 256;
+/// The per-node fact bound of 0.145 and earlier, which refuse a node with more facts. A node
+/// over it is written only through the C26 gate (`super::hearing`).
+pub const LEGACY_MAX_FACTS: usize = 64;
 #[cfg(unix)]
 const MAX_RETIRED_ACTORS: usize = 4096;
 #[cfg(unix)]
@@ -345,6 +348,98 @@ impl Constraints {
                 }
             }
             ancestry.insert(id, bits);
+        }
+        Ok(out)
+    }
+
+    /// Collect signed restrictive facts across every retained control node without requiring a
+    /// single ready head, so log-backed Commons tables still honor retained table cutoffs and
+    /// retirements even when the legacy control journal holds competing branches (`F18`).
+    #[cfg(unix)]
+    pub(crate) fn collect_retained<'a>(
+        network: [u8; 16],
+        authority: [u8; 32],
+        nodes: impl IntoIterator<Item = &'a Node>,
+    ) -> Result<Self> {
+        let mut out = Self {
+            network,
+            authority,
+            head: [0; 32],
+            legacy: false,
+            binding_legacy: false,
+            facts: BTreeSet::new(),
+            key_coverage: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+            writer_bindings: BTreeMap::new(),
+            ambiguous_binding: false,
+            missing_retired_binding: false,
+            retired_writers: BTreeSet::new(),
+            retired_recipients: BTreeSet::new(),
+        };
+        for node in nodes {
+            if node.network() != network || node.authority() != authority {
+                return Err(Error::new("control evidence has another trust context"));
+            }
+            out.legacy |= node.legacy();
+            out.binding_legacy |= !node.binding_evidence();
+            out.facts.extend(node.facts().iter().cloned());
+        }
+        let banned: BTreeSet<_> = out
+            .facts
+            .iter()
+            .filter_map(|fact| match fact {
+                Fact::RetireRecipient { recipient } => Some(*recipient),
+                _ => None,
+            })
+            .collect();
+        if banned.len() > MAX_RETIRED_ACTORS {
+            return Err(Error::new(
+                "recipient retirements exceed the policy computation bound",
+            ));
+        }
+        out.retired_recipients.extend(banned);
+        let explicit_retired: BTreeSet<_> = out
+            .facts
+            .iter()
+            .filter_map(|fact| match fact {
+                Fact::Retire { actor } => Some(*actor),
+                _ => None,
+            })
+            .collect();
+        if explicit_retired.len() > MAX_RETIRED_ACTORS {
+            return Err(Error::new(
+                "control retirements exceed the policy computation bound",
+            ));
+        }
+        let mut binding_count = 0;
+        for fact in &out.facts {
+            if let Fact::Bind { binding } = fact {
+                binding_count += 1;
+                if binding_count > MAX_BINDINGS {
+                    return Err(Error::new(
+                        "control bindings exceed the policy computation bound",
+                    ));
+                }
+                if let Some(previous) = out.bindings.insert(binding.actor(), binding.clone()) {
+                    out.ambiguous_binding |= previous != *binding;
+                }
+                let identity = (*binding.machine(), binding.recipient());
+                if let Some(previous) = out.writer_bindings.insert(*binding.writer(), identity) {
+                    out.ambiguous_binding |= previous != identity;
+                }
+            }
+        }
+        for actor in &explicit_retired {
+            if let Some(binding) = out.bindings.get(actor) {
+                out.retired_recipients.insert(binding.recipient());
+            } else {
+                out.missing_retired_binding = true;
+            }
+        }
+        for binding in out.bindings.values() {
+            if out.retired_recipients.contains(&binding.recipient()) {
+                out.retired_writers.insert(*binding.writer());
+            }
         }
         Ok(out)
     }

@@ -9,6 +9,16 @@ use std::time::Duration;
 
 pub use crate::rustup::rustup_home;
 
+/// The seed-first Trust stage2 recreator and seal command shared across remedies.
+#[macro_export]
+macro_rules! trust_recreate_bootstrap_cmd {
+    () => {
+        "python3 scripts/recreate_bootstrap.py --stage 2 --require-seed --fresh-seed --no-register \
+         (stage0 = the pinned Trust seed; it refuses rather than wrap a stock rustc), then \
+         seal it with scripts/promote-toolchain.sh"
+    };
+}
+
 /// Whether `path` is a runnable file: not a directory, with an execute bit.
 #[cfg(unix)]
 #[must_use]
@@ -48,19 +58,98 @@ pub fn tool_file(name: &str) -> String {
     format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
-/// Extract the `channel = "..."` value from `rust-toolchain.toml` text.
+fn table_header(line: &str) -> Option<&str> {
+    let head = line.split('#').next().unwrap_or(line).trim_end();
+    if head.starts_with("[[") {
+        return Some("");
+    }
+    head.strip_prefix('[')?.strip_suffix(']').map(str::trim)
+}
+
+fn strip_toml_key<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix(key)?;
+    if !rest.starts_with([' ', '\t', '=']) {
+        return None;
+    }
+    rest.trim_start().strip_prefix('=').map(str::trim_start)
+}
+
+fn take_hex_scalar(chars: &mut std::str::Chars<'_>, digits: usize) -> Option<char> {
+    let mut code = 0u32;
+    for _ in 0..digits {
+        code = code
+            .checked_mul(16)?
+            .checked_add(chars.next()?.to_digit(16)?)?;
+    }
+    char::from_u32(code)
+}
+
+fn parse_toml_string(rhs: &str) -> Option<String> {
+    if !rhs.starts_with("'''")
+        && let Some(body) = rhs.strip_prefix('\'')
+    {
+        let (value, rest) = body.split_once('\'')?;
+        if value
+            .chars()
+            .any(|ch| ch == '\x7F' || (ch.is_control() && ch != '\t'))
+        {
+            return None;
+        }
+        let tail = rest.trim_start();
+        return (tail.is_empty() || tail.starts_with('#')).then(|| value.to_string());
+    }
+    if rhs.starts_with("\"\"\"") {
+        return None;
+    }
+    let body = rhs.strip_prefix('"')?;
+    let mut chars = body.chars();
+    let mut out = String::new();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                let tail = chars.as_str().trim_start();
+                return (tail.is_empty() || tail.starts_with('#')).then_some(out);
+            }
+            '\\' => match chars.next()? {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                'b' => out.push('\u{0008}'),
+                'f' => out.push('\u{000C}'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' => out.push(take_hex_scalar(&mut chars, 4)?),
+                'U' => out.push(take_hex_scalar(&mut chars, 8)?),
+                _ => return None,
+            },
+            ch if ch == '\x7F' || (ch.is_control() && ch != '\t') => return None,
+            ch => out.push(ch),
+        }
+    }
+    None
+}
+
+/// Extract the `channel = "..."` value from `rust-toolchain.toml` text (under `[toolchain]` or before any table header).
 #[must_use]
 pub fn pinned_channel_in(toml: &str) -> Option<String> {
-    toml.lines()
-        .map(str::trim)
-        .filter(|l| !l.starts_with('#'))
-        .find_map(|l| {
-            let rest = l.strip_prefix("channel")?.trim_start();
-            let rest = rest.strip_prefix('=')?.trim_start();
-            let rest = rest.strip_prefix('"')?;
-            let end = rest.find('"')?;
-            Some(rest[..end].to_string())
-        })
+    let mut in_toolchain = true;
+    for l in toml.lines().map(str::trim) {
+        if l.starts_with('#') {
+            continue;
+        }
+        if l.starts_with('[') {
+            in_toolchain = table_header(l) == Some("toolchain");
+            continue;
+        }
+        if !in_toolchain {
+            continue;
+        }
+        let Some(rhs) = strip_toml_key(l, "channel") else {
+            continue;
+        };
+        return parse_toml_string(rhs);
+    }
+    None
 }
 
 /// [`pinned_channel_in`] over `<root>/rust-toolchain.toml`.
@@ -117,11 +206,24 @@ fn pinned_sysroot(dir: &Path, channel: &str) -> Option<PathBuf> {
 /// Resolve the `atpkg` install prefix from `[packages].prefix` in `aterm.toml`.
 #[must_use]
 pub fn atpkg_prefix(home: &Path, xdg_config_home: Option<&Path>) -> PathBuf {
-    let cfg = xdg_config_home
-        .filter(|d| !d.as_os_str().is_empty())
-        .map_or_else(|| home.join(".config"), Path::to_path_buf)
-        .join("aterm/aterm.toml");
-    if let Ok(text) = std::fs::read_to_string(&cfg)
+    if let Some(xdg) = xdg_config_home.filter(|d| !d.as_os_str().is_empty()) {
+        if let Ok(text) = std::fs::read_to_string(xdg.join("aterm/aterm.toml"))
+            && let Some(configured) = configured_prefix_in(&text, home)
+        {
+            return configured;
+        }
+        return default_atpkg_prefix(home);
+    }
+    #[cfg(windows)]
+    if let Ok(text) = std::fs::read_to_string(
+        home.join("AppData")
+            .join("Roaming")
+            .join("aterm")
+            .join("aterm.toml"),
+    ) {
+        return configured_prefix_in(&text, home).unwrap_or_else(|| default_atpkg_prefix(home));
+    }
+    if let Ok(text) = std::fs::read_to_string(home.join(".config/aterm/aterm.toml"))
         && let Some(configured) = configured_prefix_in(&text, home)
     {
         return configured;
@@ -150,25 +252,27 @@ pub fn configured_prefix_in(toml: &str, home: &Path) -> Option<PathBuf> {
             continue;
         }
         if line.starts_with('[') {
-            in_packages = line == "[packages]";
+            in_packages = table_header(line) == Some("packages");
             continue;
         }
         if !in_packages {
             continue;
         }
-        let Some(rest) = line.strip_prefix("prefix") else {
+        let Some(rhs) = strip_toml_key(line, "prefix") else {
             continue;
         };
-        let rest = rest.trim_start().strip_prefix('=')?.trim_start();
-        let rest = rest.strip_prefix('"')?;
-        let value = rest[..rest.find('"')?].trim();
-        return match value {
-            "" => None,
-            "~" => Some(home.to_path_buf()),
-            v if v.starts_with("~/") => Some(home.join(&v[2..])),
-            v if Path::new(v).is_absolute() => Some(PathBuf::from(v)),
-            _ => None,
-        };
+        let raw = parse_toml_string(rhs)?;
+        let value = raw.trim();
+        if value.is_empty() {
+            return None;
+        }
+        if value == "~" {
+            return Some(home.to_path_buf());
+        }
+        if let Some(tail) = value.strip_prefix("~/") {
+            return Some(home.join(tail));
+        }
+        return Path::new(value).is_absolute().then(|| PathBuf::from(value));
     }
     None
 }
@@ -374,7 +478,13 @@ impl Toolchain {
         path_env: &OsStr,
         pinned: Option<&str>,
     ) -> Self {
-        let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+        let xdg = {
+            let explicit = std::env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty());
+            #[cfg(windows)]
+            let explicit =
+                explicit.or_else(|| std::env::var_os("APPDATA").filter(|d| !d.is_empty()));
+            explicit.map(PathBuf::from)
+        };
         let prefix = atpkg_prefix(home, xdg.as_deref());
         let rustup = rustup_home(std::env::var_os("RUSTUP_HOME").as_deref(), home);
         Self::discover_with_store(stage2_bin, &rustup, Some(&prefix), path_env, pinned)
@@ -529,11 +639,11 @@ impl Toolchain {
     }
 
     /// Remediation instructions for installing or building the pinned Trust toolchain.
-    pub const INSTALL_REMEDY: &'static str = "`aterm pkg install trust` (then `aterm pkg doctor` \
-         to confirm the store); from source instead, in a Trust checkout: python3 \
-         scripts/recreate_bootstrap.py --stage 2 --require-seed --fresh-seed --no-register \
-         (stage0 = the pinned Trust seed; it refuses rather than wrap a stock rustc), then \
-         seal it with scripts/promote-toolchain.sh";
+    pub const INSTALL_REMEDY: &'static str = concat!(
+        "`aterm pkg install trust` (then `aterm pkg doctor` \
+         to confirm the store); from source instead, in a Trust checkout: ",
+        crate::trust_recreate_bootstrap_cmd!()
+    );
 
     /// Remediation instructions when an explicit `TRUST_STAGE2_BIN` is invalid or incomplete.
     pub const OVERRIDE_REMEDY: &'static str =
@@ -1161,6 +1271,29 @@ mod tests {
         );
         assert_eq!(
             configured_prefix_in(
+                "[ packages ] # inline comment\nprefix_note = \"~/decoy\"\nprefix = '~/lab/pkg' # literal\n",
+                home
+            ),
+            Some(PathBuf::from("/fake-home/lab/pkg")),
+            "table header comments/whitespace, sibling prefix_* keys, and literal strings must work"
+        );
+        assert_eq!(
+            configured_prefix_in("[packages]\nprefix = \"~/lab/\\u0070kg\"\n", home),
+            Some(PathBuf::from("/fake-home/lab/pkg")),
+            "basic-string escapes must decode"
+        );
+        assert_eq!(
+            configured_prefix_in("[packages]\nprefix = \"~/lab/pkg\" trailing\n", home),
+            None,
+            "trailing non-comment tokens after closing quote must fail closed"
+        );
+        assert_eq!(
+            configured_prefix_in("[packages.links]\nprefix = \"~/lab/pkg\"\n", home),
+            None,
+            "subtables must not match [packages]"
+        );
+        assert_eq!(
+            configured_prefix_in(
                 &format!(
                     "[packages]\n# prefix = \"~/decoy\"\nprefix = \"{}\"\n",
                     opt("aterm/pkg")
@@ -1403,6 +1536,37 @@ mod tests {
                 .as_deref(),
             Some("trust"),
             "a commented-out channel must not be mistaken for the pin"
+        );
+        assert_eq!(
+            pinned_channel_in(
+                "[other]\nchannel = \"decoy\"\n[toolchain] # comment\nchannel = \"trust\"\n"
+            )
+            .as_deref(),
+            Some("trust"),
+            "a channel key in another table must not be mistaken for [toolchain].channel"
+        );
+        assert_eq!(
+            pinned_channel_in("[other]\nchannel = \"decoy\"\n").as_deref(),
+            None
+        );
+        assert_eq!(
+            pinned_channel_in("channel = \"trust\"\n").as_deref(),
+            Some("trust")
+        );
+        assert_eq!(
+            pinned_channel_in(
+                "[ toolchain ] # comment\nchannels = [\"decoy\"]\nchannel = 'trust' # literal\n"
+            )
+            .as_deref(),
+            Some("trust")
+        );
+        assert_eq!(
+            pinned_channel_in("[toolchain]\nchannel = \"trust\" trailing\n").as_deref(),
+            None
+        );
+        assert_eq!(
+            pinned_channel_in("[toolchain]\nchannel = \"\"\"trust\"\"\"\n").as_deref(),
+            None
         );
         assert_eq!(pinned_channel_in("[toolchain]\n").as_deref(), None);
         assert_eq!(

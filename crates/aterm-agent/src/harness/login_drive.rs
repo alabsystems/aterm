@@ -513,6 +513,11 @@ pub enum Approval {
     NeedsSignIn(String),
     /// It refused the page (another code, another account): why.
     Refused(String),
+    /// It waited on Cloudflare's bot check, which did not clear
+    /// ([`super::headless_oauth::bot_check`]): why, naming Cloudflare and the page's host and
+    /// path, never its text. No person is asked for it: aterm never tries to pass a bot check,
+    /// and the sign-in ends as an error on record (design R-13).
+    BotCheck(String),
 }
 
 /// Approves a sign-in's page ([`drive`]): the headless browser, or a test's stand-in.
@@ -543,6 +548,9 @@ pub enum Outcome {
     /// The approver stopped on the vendor's sign-in page, which the row's browser profile is
     /// signed out of, and it was ended.
     NeedsSignIn(String),
+    /// The approver waited on Cloudflare's bot check, which did not clear, and it was ended
+    /// ([`Approval::BotCheck`]).
+    BotCheck(String),
     /// Sign-in completed without succeeding (provider OAuth error, missing authorization code, or CLI failure).
     Failed,
     /// [`HANG`] ran out, and it was ended.
@@ -563,6 +571,7 @@ impl Outcome {
             Outcome::Refused(_) => "refused".to_owned(),
             Outcome::NeedsYou(_) => "needs-you".to_owned(),
             Outcome::NeedsSignIn(_) => "needs-sign-in".to_owned(),
+            Outcome::BotCheck(_) => "bot-check".to_owned(),
             Outcome::Failed => "failed".to_owned(),
             Outcome::Hung => "hung".to_owned(),
             Outcome::NotRun(_) => "not-run".to_owned(),
@@ -618,12 +627,10 @@ pub struct Spec<'a> {
 }
 
 pub(super) fn end(child: &mut aterm_uds::spawnfd::Child) {
+    // The process group this sign-in made for its own child, which is not yet reaped.
     #[cfg(unix)]
-    if let Ok(pid) = i32::try_from(child.id())
-        && pid > 0
-    {
-        // SAFETY: signals only the process group this sign-in made for its own child.
-        unsafe { libc::kill(-pid, libc::SIGKILL) };
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = aterm_uds::process::kill_group_until_empty(pid);
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -764,6 +771,13 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
                     end(&mut child);
                     return Drove {
                         outcome: Outcome::Refused(why),
+                        host,
+                    };
+                }
+                Approval::BotCheck(why) => {
+                    end(&mut child);
+                    return Drove {
+                        outcome: Outcome::BotCheck(why),
                         host,
                     };
                 }

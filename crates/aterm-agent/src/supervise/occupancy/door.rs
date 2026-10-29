@@ -10,7 +10,7 @@ use super::rules::{self, Books, Guards, HoldSeen, RuleId};
 use super::templates::FactLine;
 use crate::supervise::Guard;
 use crate::supervise::config::{Autopilot, StuckBreakGrant};
-use crate::supervise::facts::{EpisodeKey, FactKind, SeedOutcome};
+use crate::supervise::facts::{EpisodeKey, FactKind, Left, SeedOutcome, Settled};
 use crate::supervise::screen::HumanInput;
 
 /// Ledger rule for the loop's intent to type a fact line before the write.
@@ -387,33 +387,243 @@ pub fn wake_heard_reason(ord: u16, episode: u64) -> String {
     )
 }
 
-/// The reason of a wake's `fact-intent@v1` row at a break (`waiting`, before the claim and the
-/// write): `kind=wake episode=<hex> ord=<n> held_ms=<n> door=break`, which [`seed_rows_in`] reads
-/// as the wake's intent.
+/// The reason of a wake's `fact-intent@v1` row at `door`, a break's or an idle point's (`waiting`,
+/// before the claim and the write): `kind=wake episode=<hex> ord=<n> held_ms=<n> door=<word>`,
+/// which [`seed_rows_in`] reads as the wake's intent.
 #[must_use]
-pub fn wake_intent_reason(ord: u16, episode: u64, held_ms: i64) -> String {
+pub fn wake_intent_reason(
+    ord: u16,
+    episode: u64,
+    held_ms: i64,
+    door: super::wakes_seen::WakeDoor,
+) -> String {
     format!(
         "kind={} episode={episode:016x} ord={ord} held_ms={held_ms} door={}",
         FactKind::Wake.word(),
-        super::wakes_seen::WakeDoor::Break.word()
+        door.word()
     )
 }
 
-/// The reason of a wake's `fact-wake@v1` outcome row at a break, `typed` or `skipped`:
-/// `rule=wake@v1 episode=<hex> held_ms=<n> ord=<n> door=break`, and for a skip `why=<word>`.
-/// [`seed_rows_in`] reads its episode's outcome, [`super::rules::would_rows_in`] a typed one's
-/// place in the session's pace and [`break_lines_in`] its line.
+/// The words a wake's line booked at `door` carries: `rule=wake@v1 episode=<hex> held_ms=<n>
+/// ord=<n> door=<word>`, the reason of its `fact-wake@v1` row typed there
+/// ([`wake_outcome_reason`]) and, under `observe`, of the `fact-would@v1` row an idle point's act
+/// would have carried it on (the slice-2 plan's 2.9), which [`super::rules::would_rows_in`] books
+/// alike.
 #[must_use]
-pub fn wake_outcome_reason(ord: u16, episode: u64, held_ms: i64, told: Told) -> String {
-    let words = format!(
+pub fn wake_line_words(
+    ord: u16,
+    episode: u64,
+    held_ms: i64,
+    door: super::wakes_seen::WakeDoor,
+) -> String {
+    format!(
         "{} ord={ord} door={}",
         super::rules::would_reason(RuleId::Wake, episode, held_ms, false),
-        super::wakes_seen::WakeDoor::Break.word()
-    );
+        door.word()
+    )
+}
+
+/// The reason of a wake's `fact-wake@v1` outcome row at `door`, `typed` or `skipped`: its line's
+/// words ([`wake_line_words`]), and for a skip `why=<word>`. [`seed_rows_in`] reads its episode's
+/// outcome, [`super::rules::would_rows_in`] a typed one's place in the session's pace and
+/// [`break_lines_in`] a break's line (a point's rides an act: no line of its own).
+#[must_use]
+pub fn wake_outcome_reason(
+    ord: u16,
+    episode: u64,
+    held_ms: i64,
+    door: super::wakes_seen::WakeDoor,
+    told: Told,
+) -> String {
+    let words = wake_line_words(ord, episode, held_ms, door);
     match told {
         Told::Typed => words,
         Told::Skipped(why) => format!("{words} why={why}"),
     }
+}
+
+/// THE DOOR THAT LEFT A LINE in the composer ([`Left`]; the slice-2 plan's 2.9b), with the words
+/// its rows carry ([`left_reason`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeftRow {
+    /// A built-in rule's line at a break (`fact-hold@v1`, slice 1's door under `prompt`).
+    Hold {
+        rule: RuleId,
+        /// How long the hold had held at the write.
+        held_ms: i64,
+        declared: bool,
+        /// The hold's start on the loop's clock, where this loop wrote it (`None`: a seed's).
+        since_ms: Option<i64>,
+    },
+    /// A wake's line (`fact-wake@v1`) under `prompt`, at a break or riding a point's act, its
+    /// claim held through `door`.
+    Wake {
+        ord: u16,
+        /// How long the hold had held at the claim (`0`: none stood).
+        held_ms: i64,
+        door: super::wakes_seen::WakeDoor,
+    },
+    /// A hung call's fact (`fact-no-progress@v1`): the stuck line at a break, under the owner's
+    /// `[harness] stuck_break_note` grant, or riding a turn end's act under `[harness] facts`.
+    Fact { door: FactDoor },
+}
+
+impl LeftRow {
+    /// Whether the grant that typed it is still in force, where `prompt` says whether the
+    /// owner's `prompt` is and `stuck` whether the `stuck_break_note` grant is: a rule's or a
+    /// wake's line was typed under `prompt`, the stuck line at a break under `stuck_break_note`,
+    /// and a fact riding a turn end's act rode the policy's own line, which needs neither.
+    #[must_use]
+    pub const fn granted(self, prompt: bool, stuck: bool) -> bool {
+        match self {
+            LeftRow::Hold { .. } | LeftRow::Wake { .. } => prompt,
+            LeftRow::Fact {
+                door: FactDoor::Break,
+            } => stuck,
+            LeftRow::Fact {
+                door: FactDoor::TurnEnd,
+            } => true,
+        }
+    }
+
+    /// Whether it rode an act the policy typed (a point's or a turn end's), so its line is the
+    /// fact's sentence alone, not a line of its own.
+    #[must_use]
+    pub const fn rides(self) -> bool {
+        matches!(
+            self,
+            LeftRow::Wake {
+                door: super::wakes_seen::WakeDoor::Point,
+                ..
+            } | LeftRow::Fact {
+                door: FactDoor::TurnEnd
+            }
+        )
+    }
+}
+
+/// What a left line's row says ([`left_reason`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeftSaid {
+    /// Left in the composer at the session's submit count `submits` (`None`: unserved): a
+    /// `waiting` row, `left [submits=<n>]`.
+    Left { submits: Option<u64> },
+    /// Settled at a look: told (a `typed` row, `settled=<how>`) or released (a `skipped` row,
+    /// `why=<why>`).
+    Settled(Settled),
+}
+
+/// The reason of a left line's row of `key`, the words its door's outcome row carries ([`outcome_reason`],
+/// [`wake_line_words`], [`fact_intent_reason`]) and what it says: `left [submits=<n>]`,
+/// `settled=submitted|turn|uncounted` or `why=cleared|gone`. [`seed_rows_in`] reads a `left` row as
+/// [`SeedOutcome::Left`] and [`left_rows_in`] reads it back whole; every reader of typed rows
+/// takes a `settled=` row as the line typed then, and of skips a `why=` row as a skip.
+#[must_use]
+pub fn left_reason(row: LeftRow, key: EpisodeKey, said: LeftSaid) -> String {
+    let words = match row {
+        LeftRow::Hold {
+            rule,
+            held_ms,
+            declared,
+            ..
+        } => episode_words(rule, key.id, held_ms, declared),
+        LeftRow::Wake { ord, held_ms, door } => wake_line_words(ord, key.id, held_ms, door),
+        LeftRow::Fact { door } => fact_intent_reason(key, door),
+    };
+    match said {
+        LeftSaid::Left { submits: Some(n) } => format!("{words} left submits={n}"),
+        LeftSaid::Left { submits: None } => format!("{words} left"),
+        LeftSaid::Settled(Settled::Told(how)) => format!("{words} settled={how}"),
+        LeftSaid::Settled(Settled::Released(why)) => format!("{words} why={why}"),
+    }
+}
+
+/// THE LINES A LOOP BEFORE THIS ONE LEFT in session `sid`'s composer, from ledger `body`, oldest
+/// first: each `fact-<kind>@v1` row `waiting … left` ([`left_reason`]) read back whole, its row,
+/// its line (the row's `command`), its stamp and the submit count it was left at, each read back
+/// seeded and uncounted (`Left::seeded`, `Left::counted`: the count is another loop's, perhaps
+/// another host process's). A successor keeps those still left
+/// ([`crate::supervise::facts::FactsState::seed_left`]).
+#[must_use]
+pub fn left_rows_in(body: &str, sid: Option<&str>) -> Vec<(EpisodeKey, Left)> {
+    let want = sid.map(|s| s.trim_start_matches('@').to_string());
+    let mut rows = Vec::new();
+    for line in body.lines() {
+        if !line.contains(" left") || !FactKind::ALL.iter().any(|k| line.contains(k.rule())) {
+            continue;
+        }
+        let Ok(v) = aterm_json::from_str::<aterm_json::Value>(line) else {
+            continue;
+        };
+        let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
+        let (Some(kind), Some("waiting"), Some(reason), Some(at_ms)) = (
+            text("rule_id").and_then(FactKind::of_rule),
+            text("decision"),
+            text("reason"),
+            v.get("ts").and_then(aterm_json::Value::as_i64),
+        ) else {
+            continue;
+        };
+        if text("sid").map(str::to_string) != want
+            || is_task_row(reason)
+            || !reason.split(' ').any(|w| w == "left")
+        {
+            continue;
+        }
+        let word = |key: &str| reason.split(' ').find_map(|w| w.strip_prefix(key));
+        let Some(id) = word("episode=").and_then(|hex| u64::from_str_radix(hex, 16).ok()) else {
+            continue;
+        };
+        let held_ms = word("held_ms=").and_then(|n| n.parse::<i64>().ok());
+        let row = match kind {
+            FactKind::Hold => {
+                let (Some(rule), Some(held_ms)) =
+                    (word("rule=").and_then(RuleId::of_name), held_ms)
+                else {
+                    continue;
+                };
+                LeftRow::Hold {
+                    rule,
+                    held_ms,
+                    declared: reason.split(' ').any(|w| w == "declared"),
+                    since_ms: None,
+                }
+            }
+            FactKind::Wake => {
+                let door = super::wakes_seen::WakeDoor::ALL
+                    .into_iter()
+                    .find(|d| word("door=") == Some(d.word()));
+                let (Some(ord), Some(held_ms), Some(door)) = (
+                    word("ord=").and_then(|n| n.parse::<u16>().ok()),
+                    held_ms,
+                    door,
+                ) else {
+                    continue;
+                };
+                LeftRow::Wake { ord, held_ms, door }
+            }
+            FactKind::NoProgress => {
+                let door = [FactDoor::Break, FactDoor::TurnEnd]
+                    .into_iter()
+                    .find(|d| word("door=") == Some(d.word()));
+                let Some(door) = door else {
+                    continue;
+                };
+                LeftRow::Fact { door }
+            }
+        };
+        let left = Left {
+            row,
+            text: text("command").unwrap_or_default().to_string(),
+            at_ms,
+            submits: word("submits=").and_then(|n| n.parse::<u64>().ok()),
+            ran: false,
+            seeded: true,
+            counted: false,
+        };
+        rows.push((EpisodeKey { kind, id }, left));
+    }
+    rows
 }
 
 /// The task door's mark: every row the occupancy loop books for a managed session's fact word
@@ -535,9 +745,9 @@ pub fn task_clear_reason(word: super::FactWord, outcome: super::NoteOutcome) -> 
 
 /// Extracts the fact rows for `sid` from ledger `body`, oldest first, for
 /// [`FactsState::seed`](crate::supervise::facts::FactsState::seed): an intent of the kind its
-/// `kind=` word names (the hold where none), each kind's `typed` or `skipped` row, and a wake's
-/// `waiting` row told by its await ([`wake_heard_reason`]), but none of the task door's rows
-/// ([`is_task_row`]).
+/// `kind=` word names (the hold where none), each kind's `typed` or `skipped` row, a wake's
+/// `waiting` row told by its await ([`wake_heard_reason`]) and each kind's `waiting` row of a
+/// line left ([`left_reason`]), but none of the task door's rows ([`is_task_row`]).
 #[must_use]
 pub fn seed_rows_in(body: &str, sid: Option<&str>) -> Vec<(EpisodeKey, i64, SeedOutcome)> {
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
@@ -581,6 +791,9 @@ pub fn seed_rows_in(body: &str, sid: Option<&str>) -> Vec<(EpisodeKey, i64, Seed
                         && word("door=") == Some(super::wakes_seen::WakeDoor::Await.word()) =>
                 {
                     (FactKind::Wake, SeedOutcome::Answered)
+                }
+                (Some(kind), "waiting") if reason.split(' ').any(|w| w == "left") => {
+                    (kind, SeedOutcome::Left)
                 }
                 _ => continue,
             },

@@ -1628,62 +1628,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// The pass on this host's real process table: this test process stands
-    /// in for a tab's shell.
-    #[test]
-    fn a_pass_over_the_live_table_yields_a_view_and_keeps_it_between_passes() {
-        let Some(sweep) = aterm_sysprobe::processes() else {
-            // A host without a process sweep publishes no jobs.
-            return;
-        };
-        let me = std::process::id();
-        let tabs = [TabRoot {
-            key: 1,
-            tab: 1,
-            shell_pid: me,
-            label: "Tab 1".into(),
-            program: String::new(),
-            tab_id: None,
-        }];
-        let mut pass = JobsPass::new();
-        let first = pass
-            .tick(
-                10_000,
-                || 10_000,
-                Some(&sweep.procs),
-                &tabs,
-                &[],
-                &[],
-                me,
-                false,
-                false,
-            )
-            .expect("a view");
-        let again = pass
-            .tick(
-                10_500,
-                || 10_500,
-                Some(&sweep.procs),
-                &tabs,
-                &[],
-                &[],
-                me,
-                false,
-                false,
-            )
-            .expect("the same view");
-        assert!(
-            Arc::ptr_eq(&first, &again),
-            "inside the cadence nothing is re-read"
-        );
-        assert!(
-            pass.tick(10_600, || 10_600, None, &tabs, &[], &[], me, false, true)
-                .is_some(),
-            "a reading without a sweep keeps the last view"
-        );
-    }
-
-    /// An edge's reading inside the pass's cadence runs the engine anyway.
+    /// The pass on this host's real process table, this test process standing in for a tab's
+    /// shell: inside the cadence it keeps its last view, an edge's reading runs the engine anyway,
+    /// and a reading without a sweep keeps the last view.
     #[test]
     fn an_edges_reading_inside_the_cadence_runs_the_engine() {
         let Some(sweep) = aterm_sysprobe::processes() else {
@@ -1741,6 +1688,11 @@ pub(crate) mod tests {
             )
             .expect("a new view");
         assert!(!Arc::ptr_eq(&first, &edge), "an edge's reading looks");
+        assert!(
+            pass.tick(11_950, || 11_950, None, &tabs, &[], &[], me, false, true)
+                .is_some(),
+            "a reading without a sweep keeps the last view"
+        );
     }
 
     /// Members count by their own reading; of the rest only this user's live rows with at most

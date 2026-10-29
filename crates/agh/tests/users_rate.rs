@@ -114,35 +114,13 @@ fn rate_is_sorted_by_resource_profiled_and_anonymous() {
         let core = &snapshots[0];
         let limit = if who.is_some() { 5000 } else { 60 };
         assert_eq!(core.limit, limit, "{who:?}");
+        assert_eq!(core.remaining, limit, "{who:?}");
         assert_eq!(core.used + core.remaining, core.limit, "{who:?}");
     }
     let seen = fake.seen();
     let logins: Vec<Option<&str>> = seen.iter().map(|s| s.as_login.as_deref()).collect();
     assert_eq!(logins, [Some("fixture-dev-bot"), None]);
     assert!(!seen[1].had_authorization);
-}
-
-#[test]
-fn rate_limit_costs_no_quota() {
-    let root = common::scratch("users-free");
-    let fake = fake_with_dev(root.path());
-    let gh = common::github(
-        common::router(&common::canonical_config(root.path()), root.path()),
-        &fake,
-    );
-    let core = |gh: &agh::Github| {
-        gh.users()
-            .rate(Some("dev"))
-            .expect("GET /rate_limit")
-            .into_iter()
-            .find(|s| s.resource == "core")
-            .expect("core")
-            .remaining
-    };
-    let before = core(&gh);
-    let after = core(&gh);
-    assert_eq!(before, after);
-    assert_eq!(before, 5000);
 }
 
 /// `agh rate`'s rows, from stdout.

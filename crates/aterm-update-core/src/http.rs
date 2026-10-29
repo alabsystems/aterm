@@ -487,10 +487,18 @@ pub fn download_bytes(asset_url: &str, max_filesize: u64) -> Result<Vec<u8>, Str
 /// The marker in a rate-limited asset fetch's error ([`download_error_is_rate_limit`]).
 const RATE_LIMIT_ERROR_PREFIX: &str = "rate limited (HTTP ";
 
-/// Whether a [`download_bytes`] / [`download_to`] error describes a GitHub rate limit.
+/// Whether a [`download_bytes`] / [`download_to`] error (bare or `"fetch <asset>: "`-prefixed)
+/// describes a GitHub rate limit.
 #[must_use]
 pub fn download_error_is_rate_limit(error: &str) -> bool {
-    error.contains(RATE_LIMIT_ERROR_PREFIX)
+    let body = error
+        .strip_prefix("fetch ")
+        .and_then(|rest| {
+            let (asset, body) = rest.split_once(": ")?;
+            (!asset.contains('/')).then_some(body)
+        })
+        .unwrap_or(error);
+    body.starts_with(RATE_LIMIT_ERROR_PREFIX)
 }
 
 /// Prefix of a web-host 404 error (`classify_asset_failure`).
@@ -1657,9 +1665,27 @@ mod tests {
             "{}429) fetching asset",
             super::RATE_LIMIT_ERROR_PREFIX
         )));
+        assert!(super::download_error_is_rate_limit(&format!(
+            "fetch aterm-machines.toml: {}403) fetching asset",
+            super::RATE_LIMIT_ERROR_PREFIX
+        )));
         assert!(!super::download_error_is_rate_limit(
             "curl asset download failed (exit status: 22): 404"
         ));
+
+        let poisoned_web_url = "https://github.com/alabsystems/aterm/releases/download/v0.74.0/rate limited (HTTP 429)";
+        for code in [403, 404] {
+            let verdict = super::classify_asset_failure(poisoned_web_url, &curl_err(code)).unwrap();
+            assert!(
+                !super::download_error_is_rate_limit(&verdict),
+                "web-host {code} URL carrying rate-limit marker must not misclassify: {verdict}"
+            );
+            let wrapped = format!("fetch aterm-machines.toml: {verdict}");
+            assert!(
+                !super::download_error_is_rate_limit(&wrapped),
+                "wrapped web-host {code} URL carrying rate-limit marker must not misclassify: {wrapped}"
+            );
+        }
 
         for code in [403, 429] {
             let verdict =
@@ -2249,10 +2275,9 @@ mod tests {
                     url: URL.into()
                 }
             );
-            let text = err.to_string();
-            assert!(
-                text.contains("vendor host") && !text.contains("GitHub"),
-                "{text}"
+            assert_eq!(
+                err.to_string(),
+                format!("the vendor host answered HTTP {code} for {URL}")
             );
         }
         let mangled = run(Some(0), "<html>portal</html>", "");
@@ -2838,17 +2863,16 @@ mod tests {
         }
     }
 
-    /// The directory [`probe_a_stopped_transfer`] downloads into, set only for the child
+    /// The directory [`probe_a_stopped_transfer_if_asked`] downloads into, set only for the child
     /// [`a_stopped_download_ends_its_curl_and_leaves_no_partial`] starts.
-    #[cfg(unix)]
+    #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
     const STOP_PROBE_ENV: &str = "ATERM_TEST_STOP_PROBE_DIR";
 
     /// The child's half of the stop row: a release-lane download whose curl never finishes,
     /// stopped once that curl has started; records what the call answered and whether its
     /// partial is left, then waits to be killed.
-    #[cfg(unix)]
-    #[test]
-    fn probe_a_stopped_transfer() {
+    #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
+    fn probe_a_stopped_transfer_if_asked() {
         let Some(dir) = std::env::var_os(STOP_PROBE_ENV) else {
             return;
         };
@@ -2883,6 +2907,7 @@ mod tests {
     #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
     #[test]
     fn a_stopped_download_ends_its_curl_and_leaves_no_partial() {
+        probe_a_stopped_transfer_if_asked();
         use std::os::unix::fs::PermissionsExt as _;
         const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
         let dir = aterm_tempfile::tempdir().unwrap();
@@ -2901,7 +2926,7 @@ mod tests {
             .args([
                 "--exact",
                 "--nocapture",
-                "http::tests::probe_a_stopped_transfer",
+                "http::tests::a_stopped_download_ends_its_curl_and_leaves_no_partial",
             ])
             .process_group(0)
             .env(STOP_PROBE_ENV, dir.path())
@@ -2922,9 +2947,9 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
         let pid = i32::try_from(child.id()).unwrap();
-        // SAFETY: process_group(0) made this still-unreaped child its group's leader, so the
-        // group holds the probe and any curl stand-in it left.
-        unsafe { libc::kill(-pid, libc::SIGKILL) };
+        // process_group(0) made this still-unreaped child its group's leader, so the group
+        // holds the probe and any curl stand-in it left.
+        let _ = aterm_uds::process::kill_group_until_empty(pid);
         let _ = child.kill();
         let _ = child.wait();
         assert_eq!(
@@ -3000,10 +3025,9 @@ mod tests {
             if pid <= 1 {
                 return Err(std::io::Error::other("the probe must lead its own group"));
             }
-            // SAFETY: process_group(0) made this exclusively held, still-unreaped
-            // child its group leader; no wait above released its pid for reuse.
-            let killed = unsafe { libc::kill(-pid, libc::SIGKILL) };
-            let group_error = (killed != 0).then(std::io::Error::last_os_error);
+            // process_group(0) made this exclusively held, still-unreaped child its group
+            // leader; no wait above released its pid for reuse.
+            let group_error = aterm_uds::process::kill_group_until_empty(pid).err();
             let _ = child.kill();
             let status = child.wait()?;
             if let Some(error) = group_error
@@ -3433,5 +3457,30 @@ mod tests {
             !range_refused(None, ""),
             "a signal-killed curl proves nothing"
         );
+    }
+
+    #[test]
+    fn local_write_errors_are_recognized_and_stop_resumable_attempts() {
+        for marker in [
+            "curl: (23) Failure writing output to destination",
+            "curl download failed (exit status: 1): Failure writing output to destination",
+            "curl: (23) Failed writing body (0 != 16384)",
+            "Failed writing body",
+        ] {
+            assert!(super::download_error_is_local_write(marker), "{marker}");
+            assert_eq!(
+                super::next_attempt(Some(23), marker, true),
+                super::NextAttempt::Stop,
+                "a local write failure must stop rather than resume even after partial progress: {marker}"
+            );
+        }
+        for other in [
+            "",
+            "curl: (28) Operation too slow",
+            "curl: (22) The requested URL returned error: 503",
+            "rate limited (HTTP 429) fetching asset",
+        ] {
+            assert!(!super::download_error_is_local_write(other), "{other}");
+        }
     }
 }

@@ -96,6 +96,11 @@ pub use silent::{
 #[cfg(all(unix, any(test, debug_assertions)))]
 pub use silent::{cat_echoes, prints};
 
+#[cfg(all(unix, any(test, debug_assertions)))]
+mod stopped;
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub use stopped::{StopReport, await_stopped, spin_stopped, stop_state};
+
 /// Shared gate for in-process calls that can block on macOS `trustd`.
 pub static TRUST: Gate = Gate::new("aterm-trust-check");
 
@@ -1314,6 +1319,63 @@ mod tests {
             dead,
             "the child's descendant {grandchild} outlived the call"
         );
+    }
+
+    /// A child still forking at its deadline is killed with every child it forks. The shell
+    /// forks a `sleep` and kills it, over and over, so the deadline's group `SIGKILL` lands while
+    /// it forks, and on XNU the child of that fork joins the group unsignalled
+    /// ([`crate::process::kill_group_until_empty`]). Negative control: a `kill_group` that
+    /// signals the group once leaves a `sleep 600` in it past the hang detector.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_still_forking_at_its_deadline_is_killed_whole() {
+        let dir = scratch("forking");
+        let pid_file = dir.join("pid");
+        let mut cmd = sh(
+            "echo $$ > \"$0\"; while :; do sleep 600 & kill $!; done",
+            &[&pid_file],
+        );
+        let ready = pid_file.clone();
+        let clock = ClockHeld::until(move || pid_in(&ready).is_some());
+        let result = output_until(&mut cmd, clock.deadline());
+        drop(clock);
+        let group = pid_in(&pid_file);
+        let _ = std::fs::remove_dir_all(&dir);
+        let Some(group) = group.and_then(|pid| i32::try_from(pid).ok()) else {
+            panic!("the shell wrote no pid in a minute");
+        };
+        assert!(matches!(result, Err(RunError::TimedOut)), "{result:?}");
+        assert!(
+            group_emptied(group),
+            "a child forked as group {group} was killed ran on"
+        );
+    }
+
+    /// Whether process group `group`, whose leader is reaped, has emptied (`ESRCH`) within the
+    /// hang detector. One that has not is sent `SIGKILL`, so a failing run leaves nothing behind.
+    #[cfg(unix)]
+    fn group_emptied(group: i32) -> bool {
+        let since = Instant::now();
+        loop {
+            // SAFETY: a plain syscall; signal 0 delivers nothing.
+            if unsafe { libc::kill(-group, 0) } != 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return true;
+            }
+            if since.elapsed() >= HANG {
+                // SAFETY: a plain syscall to the group this test's child made, which a member
+                // still holds (the id of a group with a member is no new process's).
+                unsafe { libc::kill(-group, libc::SIGKILL) };
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_program_fails_at_spawn() {
         assert!(matches!(
             output_until(
                 &mut crate::spawnfd::command("/nonexistent/tool"),

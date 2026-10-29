@@ -1086,11 +1086,16 @@ mod tests {
         (m.dev(), m.ino())
     }
 
-    fn stamps(dir: &Path) -> Vec<(PathBuf, u64, i64, i64, i64, i64)> {
+    type Stamp = (PathBuf, u64, u64, u32, u64, i64, i64, i64, i64);
+
+    fn stamps(dir: &Path) -> Vec<Stamp> {
         let stamp = |p: &Path| {
             let m = std::fs::symlink_metadata(p).unwrap();
             (
                 p.to_path_buf(),
+                m.dev(),
+                m.ino(),
+                m.mode(),
                 m.nlink(),
                 m.ctime(),
                 m.ctime_nsec(),
@@ -1189,7 +1194,6 @@ mod tests {
         let fx = Fx::new("ensure");
         let build = fx.build(8595, Shape::Copy);
         let store_at_first = stamps(&build);
-        std::thread::sleep(std::time::Duration::from_millis(20));
         assert_eq!(
             ensure_root(&fx.layout, &build, Depth::Shallow).unwrap(),
             Ensured::Built
@@ -1246,7 +1250,6 @@ mod tests {
 
         let store_before = stamps(&build);
         let compat_before = stamps(&compat_dir(&fx.layout));
-        std::thread::sleep(std::time::Duration::from_millis(20));
         for depth in [Depth::Shallow, Depth::Deep] {
             assert_eq!(
                 ensure_root(&fx.layout, &build, depth).unwrap(),
@@ -1270,7 +1273,6 @@ mod tests {
         );
         let shim_before = stamps(&fx.layout.bin_dir());
         let store_before = stamps(&build);
-        std::thread::sleep(std::time::Duration::from_millis(20));
         assert!(!reconcile(&fx.layout, Depth::Deep).changed());
         assert_eq!(stamps(&fx.layout.bin_dir()), shim_before);
         assert_eq!(stamps(&build), store_before);
@@ -1369,7 +1371,6 @@ mod tests {
         std::fs::create_dir_all(&locked).unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         let bin_before = stamps(&build.join("bin"));
-        std::thread::sleep(std::time::Duration::from_millis(20));
         let err = ensure_root(&fx.layout, &build, Depth::Shallow);
         let again = ensure_root(&fx.layout, &build, Depth::Deep);
         let bin_after = stamps(&build.join("bin"));
@@ -1629,7 +1630,6 @@ mod tests {
         }
 
         let bin_before = stamps(&fx.layout.bin_dir());
-        std::thread::sleep(std::time::Duration::from_millis(20));
         let again = reconcile(&fx.layout, Depth::Deep);
         assert!(!again.changed(), "{again:?}");
         assert_eq!(stamps(&fx.layout.bin_dir()), bin_before);
@@ -2151,7 +2151,6 @@ mod tests {
         );
         let before = stamps(&fx.layout.bin_dir());
         let store_before = stamps(&build);
-        std::thread::sleep(std::time::Duration::from_millis(20));
         crate::activate::reconcile_aliases(
             &fx.layout,
             &build,
@@ -2245,7 +2244,6 @@ mod tests {
             stamps(&compat_dir(&fx.layout)),
             stamps(&fx.layout.bin_dir()),
         );
-        std::thread::sleep(std::time::Duration::from_millis(20));
         for depth in [Depth::Shallow, Depth::Deep] {
             let report = reconcile(&fx.layout, depth);
             assert!(
@@ -2285,7 +2283,6 @@ mod tests {
         let programs = build.parent().unwrap().to_path_buf();
         let mode = std::fs::symlink_metadata(&programs).unwrap().permissions();
         let before = stamps(&compat_dir(&fx.layout));
-        std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::set_permissions(&programs, std::fs::Permissions::from_mode(0o600)).unwrap();
         let seen = strays(&fx.layout);
         let swept = sweep(&fx.layout);
@@ -2494,7 +2491,6 @@ mod tests {
         let root = root_dir(&fx.layout, 8595);
         let root_bin = ident(&root.join("bin"));
         let store_bin = stamps(&build.join("bin"));
-        std::thread::sleep(std::time::Duration::from_millis(20));
 
         let ds_store = root.join("share").join(".DS_Store");
         std::fs::write(&ds_store, b"Finder").unwrap();

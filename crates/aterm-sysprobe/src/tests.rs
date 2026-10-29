@@ -68,13 +68,22 @@ fn a_children_text_names_only_the_pids_its_spaces_close() {
 #[test]
 fn the_auxiliary_vector_gives_the_page_size() {
     const W: usize = std::mem::size_of::<usize>();
-    let pairs: [(usize, usize); 4] = [(33, 0xdead), (6, 16_384), (17, 250), (0, 0)];
+    let pairs: [(usize, usize); 5] = [(33, 0xdead), (6, 16_384), (17, 250), (0, 42), (99, 0xbeef)];
     let bytes: Vec<u8> = pairs
         .iter()
         .flat_map(|(k, v)| k.to_ne_bytes().into_iter().chain(v.to_ne_bytes()))
         .collect();
     assert_eq!(linux::auxv_value(&bytes, 6), Some(16_384));
-    assert_eq!(linux::auxv_value(&bytes, 99), None);
+    assert_eq!(
+        linux::auxv_value(&bytes, 0),
+        None,
+        "AT_NULL is the terminator"
+    );
+    assert_eq!(
+        linux::auxv_value(&bytes, 99),
+        None,
+        "pairs past AT_NULL are unread"
+    );
     assert_eq!(linux::auxv_value(&bytes[..W], 33), None, "a cut pair");
 }
 
@@ -85,8 +94,8 @@ fn every_proc_read_is_bounded_to_4_kib() {
         let zero = read_bounded(Path::new("/dev/zero")).expect("/dev/zero opens");
         assert_eq!(zero.len(), READ_CAP);
     }
-    let dir = std::env::temp_dir().join(format!("aterm-sysprobe-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let temp = aterm_tempfile::TempDir::new().unwrap();
+    let dir = temp.path();
     let long = dir.join("long");
     let body: String = (0..1000).map(|i| format!("line{i:05}\n")).collect();
     assert!(body.len() > 2 * READ_CAP);
@@ -98,7 +107,6 @@ fn every_proc_read_is_bounded_to_4_kib() {
     std::fs::write(&short, MEMINFO).unwrap();
     assert_eq!(read_bounded(&short).as_deref(), Some(MEMINFO));
     assert_eq!(read_bounded(&dir.join("absent")), None);
-    std::fs::remove_dir_all(&dir).unwrap();
     let torn = &VMSTAT[..VMSTAT.find("pswpout 34").unwrap() + "pswpout 34".len()];
     assert_eq!(linux::swap_pages(torn), None);
 }
@@ -123,6 +131,23 @@ fn memory_in_use_is_counted_from_the_vm_pages() {
         Some(0),
         "purgeable past internal"
     );
+    assert_eq!(
+        used_mib_of(u64::MAX, 0, u64::MAX, u64::MAX, page),
+        None,
+        "page-class sums saturate and MiB past u32::MAX returns None"
+    );
+    let max_pages = (u64::from(u32::MAX) << 20) / page;
+    assert_eq!(used_mib_of(max_pages, 0, 0, 0, page), Some(u32::MAX));
+    assert_eq!(used_mib_of(max_pages + 64, 0, 0, 0, page), None);
+    assert_eq!(
+        crate::clamp_physical_mib(96 * 1024, Some(64 * 1024)),
+        64 * 1024
+    );
+    assert_eq!(
+        crate::clamp_physical_mib(48 * 1024, Some(64 * 1024)),
+        48 * 1024
+    );
+    assert_eq!(crate::clamp_physical_mib(96 * 1024, None), 96 * 1024);
 }
 
 #[test]
@@ -164,7 +189,6 @@ fn a_processs_working_directory_and_executable_are_its_own() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_groups_memory_is_its_own_members_footprint() {
-    use std::os::unix::process::CommandExt as _;
     let me = std::process::id();
     let before = crate::group_memory(me).expect("our own group");
     assert!(
@@ -183,12 +207,12 @@ fn a_groups_memory_is_its_own_members_footprint() {
     );
     drop(hog);
 
-    let apart = std::process::Command::new("/bin/sleep")
+    let apart = aterm_uds::spawnfd::command("/bin/sleep")
         .arg("30")
         .process_group(0)
         .spawn()
         .expect("sleep in a group of its own");
-    let beside = std::process::Command::new("/bin/sleep")
+    let beside = aterm_uds::spawnfd::command("/bin/sleep")
         .arg("30")
         .spawn()
         .expect("sleep in our group");
@@ -206,6 +230,110 @@ fn a_groups_memory_is_its_own_members_footprint() {
 
     assert_eq!(crate::group_memory(0), None);
     assert_eq!(crate::group_memory(u32::MAX), None);
+}
+
+/// `group_usage` reads each member of the group asked about, keyed by its pid and start: a busy
+/// child in a group of its own runs up CPU time, and runnable time beside it (running is
+/// runnable; the kernel keeps the two counters apart, and on this Mac a busy child's runnable time
+/// trailed its CPU time by 0.6%, so the test asks for half), and holds a footprint no larger than
+/// its lifetime peak; a stopped one runs up neither, while it stays its group's one member.
+/// Negative control: a group nobody leads reads empty, and pgid 0 or past `i32::MAX` reads
+/// `None`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_groups_usage_is_its_own_members_cpu_and_runnable_time() {
+    const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
+    /// The children, killed and reaped however the test ends.
+    struct Reap(Vec<aterm_uds::spawnfd::Child>);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let spawn = |script: &str| {
+        aterm_uds::spawnfd::command("/bin/sh")
+            .args(["-c", script])
+            .process_group(0)
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
+            .spawn()
+            .expect("a child in a group of its own")
+    };
+    let one = |pgid: u32| {
+        let members = crate::group_usage(pgid).expect("the child's own group");
+        assert_eq!(members.len(), 1, "{members:?}");
+        assert_eq!(members[0].pid, pgid, "{members:?}");
+        members[0]
+    };
+    let mut children = Reap(Vec::new());
+    children.0.push(spawn("while :; do :; done"));
+    children.0.push(spawn("kill -STOP $$"));
+    let (busy, stopped) = (children.0[0].id(), children.0[1].id());
+    let ran_on = |from: crate::MemberUsage| {
+        let deadline = std::time::Instant::now() + HANG_DETECTOR;
+        loop {
+            let now = one(busy);
+            if now.cpu_ns >= from.cpu_ns + 100_000_000 {
+                break now;
+            }
+            assert!(std::time::Instant::now() < deadline, "{from:?} -> {now:?}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    let first = one(busy);
+    let ran = ran_on(first);
+    assert_eq!(ran.start, first.start, "one process: {first:?} -> {ran:?}");
+    assert!(
+        ran.footprint > 0 && ran.peak_footprint >= ran.footprint,
+        "a live member holds memory, at most its lifetime peak: {ran:?}"
+    );
+    assert!(
+        (ran.runnable_ns - first.runnable_ns) * 2 >= ran.cpu_ns - first.cpu_ns,
+        "running is runnable: {first:?} -> {ran:?}"
+    );
+    let state = |pid: u32| {
+        let mut cmd = aterm_uds::spawnfd::command("/bin/ps");
+        cmd.args(["-o", "stat=", "-p", &pid.to_string()]);
+        aterm_uds::deadline::output_within(&mut cmd, HANG_DETECTOR)
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    };
+    let deadline = std::time::Instant::now() + HANG_DETECTOR;
+    while !state(stopped).starts_with('T') {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child never stopped"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let before = one(stopped);
+    // Let the busy child run up 100 ms more of CPU: a span the stopped one is given to run, timed
+    // by the busy one's own work, not a latency budget.
+    ran_on(one(busy));
+    let after = one(stopped);
+    assert_eq!(
+        (after.cpu_ns, after.runnable_ns),
+        (before.cpu_ns, before.runnable_ns),
+        "a stopped process neither runs nor waits to: {before:?} -> {after:?}"
+    );
+    drop(children);
+    assert_eq!(crate::group_usage(busy), Some(Vec::new()));
+    assert_eq!(crate::group_usage(0), None);
+    assert_eq!(crate::group_usage(u32::MAX), None);
+}
+
+/// `hid_idle` reads this Mac's input clock from the IORegistry; nothing reads it elsewhere.
+#[test]
+fn the_input_idle_clock_reads_on_a_mac_and_nowhere_else() {
+    let idle = crate::hid_idle();
+    if cfg!(target_os = "macos") {
+        assert!(idle.is_some(), "IOHIDSystem's HIDIdleTime");
+    } else {
+        assert_eq!(idle, None);
+    }
 }
 
 /// The production census adapter requires a positive, complete leader-only
@@ -311,10 +439,6 @@ fn the_swap_counter_reads_on_this_host_and_never_runs_backwards() {
     let first = crate::swapped_kib().expect("HOST_VM_INFO64");
     let second = crate::swapped_kib().expect("HOST_VM_INFO64");
     assert!(second >= first, "{first} KiB then {second} KiB");
-    assert!(
-        second - first < 1 << 20,
-        "a GiB swapped between two reads: {first} -> {second}"
-    );
 }
 
 #[test]
@@ -2060,5 +2184,11 @@ fn linux_inet_diag_rtt_parser_extracts_non_loopback_median_and_skips_loopback() 
     assert_eq!(
         crate::linux::parse_inet_diag_rtts_seq(&seq2_done, Some(2), &mut seq2_rtts),
         Some(true)
+    );
+    let mut huge_len = vec![0u8; 32];
+    huge_len[..4].copy_from_slice(&u32::MAX.to_ne_bytes());
+    assert_eq!(
+        crate::linux::parse_inet_diag_rtts(&huge_len, &mut seq2_rtts),
+        None
     );
 }

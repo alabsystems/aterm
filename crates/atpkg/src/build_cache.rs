@@ -3,6 +3,7 @@
 
 //! Rust build intermediates out of Spotlight (macOS).
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -15,6 +16,15 @@ pub mod tooling;
 #[path = "build_cache_retired.rs"]
 pub mod retired;
 
+#[path = "build_cache_registered.rs"]
+pub mod registered;
+
+#[path = "build_cache_remove.rs"]
+pub mod remove;
+
+#[path = "build_cache_fence.rs"]
+mod fence;
+
 pub use stale::RECLAIM_STALE;
 
 /// When a workspace is gone: the rule the window's disk watch uses too.
@@ -23,8 +33,151 @@ pub use aterm_toolchain::checkout;
 pub use aterm_toolchain::build_cache::*;
 
 /// What [`reclaim`] renames a build directory to before removing it, so a build that
-/// starts meanwhile gets a fresh folder instead of one being deleted under it.
+/// starts meanwhile gets a fresh folder instead of one being deleted under it: the first of the
+/// stage names it takes from ([`stage_name`]), and the one fixed name an older aterm staged
+/// under, which a pass still reads as a stage and finishes.
 const DOOMED: &str = ".cargo-build.removing";
+
+/// THE STAGE NAMES FROM `base`, lowest first: `base` itself for `n` 0, then `base-<n>`.
+fn stage_name(base: &OsStr, n: u32) -> OsString {
+    let mut name = base.to_os_string();
+    if n > 0 {
+        name.push(format!("-{n}"));
+    }
+    name
+}
+
+/// Whether `name` is one of the stage names from `base` ([`stage_name`]): `base` itself, or
+/// `base-<n>` with `n` a decimal from 1, written without a leading zero.
+fn is_stage(name: &OsStr, base: &OsStr) -> bool {
+    match name
+        .as_encoded_bytes()
+        .strip_prefix(base.as_encoded_bytes())
+    {
+        Some([]) => true,
+        Some([b'-', first, rest @ ..]) => {
+            (b'1'..=b'9').contains(first) && rest.iter().all(u8::is_ascii_digit)
+        }
+        _ => false,
+    }
+}
+
+/// TAKE A STAGE NAME OF ITS OWN in `holder`: `make` tried at each stage name from `base`, lowest
+/// first, until one is made; a name something stands at (`AlreadyExists`: `make` never replaces
+/// an entry) moves on to the next, so a stage an earlier pass could not finish never keeps
+/// another from being staged beside it. Any other refusal is returned.
+fn take_stage_name(
+    holder: &Path,
+    base: &OsStr,
+    make: &mut dyn FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<PathBuf> {
+    for n in 0..u32::MAX {
+        let path = holder.join(stage_name(base, n));
+        match make(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::ErrorKind::AlreadyExists.into())
+}
+
+/// STAGE `from` ASIDE in `holder` under the lowest stage name from `base` nothing stands at
+/// ([`take_stage_name`]), renamed never over another entry ([`rename_noreplace`]): the stage.
+fn stage_aside(from: &Path, holder: &Path, base: &OsStr) -> std::io::Result<PathBuf> {
+    take_stage_name(holder, base, &mut |to| rename_noreplace(from, to))
+}
+
+/// A NEW EMPTY STAGE in `holder`, made where nothing stands under the lowest stage name from
+/// `base` that is free ([`take_stage_name`]; a folder is never made over another entry).
+fn new_stage(holder: &Path, base: &OsStr) -> std::io::Result<PathBuf> {
+    take_stage_name(holder, base, &mut |to| std::fs::create_dir(to))
+}
+
+/// THE STAGE NAME A PASS WOULD TAKE in `holder` now, read and never acted on: the lowest stage
+/// name from `base` nothing stands at (not even a link), while this user may add a name to
+/// `holder`; `None` when it may not, or a name cannot be looked at. A prune's stage is made only
+/// while it is `Some`; a leaf or tooling entry is staged only while [`stage_for`] is.
+fn free_stage(holder: &Path, base: &OsStr) -> Option<PathBuf> {
+    if !crate::platform::dir_writable_by_caller(holder) {
+        return None;
+    }
+    for n in 0..u32::MAX {
+        let path = holder.join(stage_name(base, n));
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(path),
+            Err(_) => return None,
+            Ok(_) => {}
+        }
+    }
+    None
+}
+
+/// THE STAGE `entry` WOULD BE RENAMED TO in `holder`, read and never acted on: the free stage
+/// name ([`free_stage`]), while `entry` itself can be renamed: it is no link, it is on
+/// `holder`'s volume (a volume mounted at it never moves), and this user may take its name out of
+/// `holder` (`platform::may_take_name`: on macOS its own flags and ACL and its folder's, as the
+/// rename itself is authorized). A leaf or tooling entry is planned, and its intent asked, only
+/// while it is `Some`, so no plan lists, and no pass records, a removal no rename can start.
+fn stage_for(entry: &Path, holder: &Path, base: &OsStr) -> Option<PathBuf> {
+    let stage = free_stage(holder, base)?;
+    let meta = std::fs::symlink_metadata(entry).ok()?;
+    let movable = !meta.file_type().is_symlink()
+        && same_volume(&meta, holder)
+        && crate::platform::may_take_name(entry);
+    movable.then_some(stage)
+}
+
+/// Whether the entry read as `meta` is on the volume of the folder `holder`.
+#[cfg(unix)]
+fn same_volume(meta: &std::fs::Metadata, holder: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(holder).is_ok_and(|h| h.dev() == meta.dev())
+}
+
+/// Off Unix, every entry of a folder is taken to be on its volume.
+#[cfg(not(unix))]
+fn same_volume(_: &std::fs::Metadata, _: &Path) -> bool {
+    true
+}
+
+/// The folders in `holder` named as stages from `base` ([`is_stage`]), sorted; never through a
+/// link.
+fn stages_in(holder: &Path, base: &OsStr) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(holder)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| is_stage(&e.file_name(), base) && e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .collect();
+    found.sort();
+    found
+}
+
+/// Rename `from` to `to` only where nothing stands at `to` (`renameat` with `RENAME_EXCL` on
+/// macOS, `RENAME_NOREPLACE` on Linux): `AlreadyExists` otherwise, and nothing is replaced.
+#[cfg(unix)]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    aterm_dirfd::renameat_with(
+        aterm_dirfd::CWD,
+        from,
+        aterm_dirfd::CWD,
+        to,
+        aterm_dirfd::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
+}
+
+/// Off Unix, a rename to a name nothing stood at when looked at (a folder is never renamed over
+/// another there).
+#[cfg(not(unix))]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(to).is_ok() {
+        return Err(std::io::ErrorKind::AlreadyExists.into());
+    }
+    std::fs::rename(from, to)
+}
 
 /// The locks cargo holds in a profile for a whole build; [`reclaim`] skips a build
 /// directory while a build holds one.
@@ -291,6 +444,12 @@ pub enum Unused {
     Moved { idle: Duration, after: Duration },
     /// What an earlier pass renamed aside and did not finish removing.
     Unfinished,
+    /// NOT A REMOVAL WHOLE: what a removal ([`remove::tree`]) left of the stage it is returned
+    /// beside, a build directory renamed aside or a stage of its parts — `stayed` entries of it
+    /// would not go even once made removable (another user's, on another volume, or still
+    /// refusing), and `freed` bytes of it went. It stays staged: the next pass records it
+    /// ([`Unused::Unfinished`]) and tries what is left; [`remove::stayed_words`] names it.
+    Stayed { stayed: usize, freed: u64 },
     /// A completed pinned tool of the tooling cache nothing ran for `idle`, at least `after` ([`RECLAIM_IDLE`]).
     Tooling { idle: Duration, after: Duration },
     /// A tooling scratch carrying both its give-up exec stamp and a regular run-proof file ([`aterm_uds::deadline::RAN`]); elapsed time and a reboot never replace that proof.
@@ -303,15 +462,19 @@ pub enum Unused {
     },
 }
 
-/// Removes the build directories under the cache `root` that nobody builds into any more, and returns them: one unwritten for [`RECLAIM_GONE`] whose workspace is seen gone ([`checkout::gone`], `home` naming the folders it never looks into), and any unwritten for [`RECLAIM_IDLE`].
+/// Removes the build directories under the cache `root` that nobody builds into or uses any
+/// more, and returns those removed whole: one unwritten for [`RECLAIM_GONE`] whose workspace is
+/// seen gone ([`checkout::gone`], `home` naming the folders it never looks into), and any
+/// unwritten for [`RECLAIM_IDLE`]. A live process or unreadable ownership keeps its cache.
 pub fn reclaim(root: &Path, home: Option<&Path>, now: SystemTime) -> Vec<PathBuf> {
     reclaim_watched(root, home, now, RECLAIM_GONE, None, &mut |_, _| true)
         .into_iter()
+        .filter(|(_, why)| !matches!(why, Unused::Stayed { .. }))
         .map(|(path, _)| path)
         .collect()
 }
 
-/// [`reclaim`] as the window's disk watch runs it, each directory returned with why it went ([`Unused`]): a gone workspace's build directory goes once unwritten for `gone_after` ([`RECLAIM_GONE`] while the volume is only low, [`RECLAIM_GONE_UNDER_PRESSURE`] below the floor); and with `placing` (the home volume's device and a complete mount table), a workspace nested in a removed checkout is gone too ([`checkout::gone_placed`]).
+/// [`reclaim`] as the window's disk watch runs it, each directory returned with why it went ([`Unused`]), and each stage a removal could not finish with what stayed of it ([`Unused::Stayed`]): a gone workspace's build directory goes once unwritten for `gone_after` ([`RECLAIM_GONE`] while the volume is only low, [`RECLAIM_GONE_UNDER_PRESSURE`] below the floor); and with `placing` (the home volume's device and a complete mount table), a workspace nested in a removed checkout is gone too ([`checkout::gone_placed`]).
 pub fn reclaim_watched(
     root: &Path,
     home: Option<&Path>,
@@ -319,6 +482,48 @@ pub fn reclaim_watched(
     gone_after: Duration,
     placing: Option<&checkout::Placing>,
     record: &mut dyn FnMut(&Path, Unused) -> bool,
+) -> Vec<(PathBuf, Unused)> {
+    reclaim_watched_on(
+        root,
+        home,
+        now,
+        gone_after,
+        placing,
+        record,
+        &fence::Fence::default(),
+    )
+}
+
+/// The sweep with an injected ownership probe for headless fixtures.
+#[cfg(any(test, debug_assertions))]
+pub fn reclaim_watched_with_processes(
+    root: &Path,
+    home: Option<&Path>,
+    now: SystemTime,
+    gone_after: Duration,
+    placing: Option<&checkout::Placing>,
+    record: &mut dyn FnMut(&Path, Unused) -> bool,
+    processes: fence::Processes<'_>,
+) -> Vec<(PathBuf, Unused)> {
+    reclaim_watched_on(
+        root,
+        home,
+        now,
+        gone_after,
+        placing,
+        record,
+        &fence::Fence::new(processes),
+    )
+}
+
+fn reclaim_watched_on(
+    root: &Path,
+    home: Option<&Path>,
+    now: SystemTime,
+    gone_after: Duration,
+    placing: Option<&checkout::Placing>,
+    record: &mut dyn FnMut(&Path, Unused) -> bool,
+    fence: &fence::Fence<'_>,
 ) -> Vec<(PathBuf, Unused)> {
     let mut removed = Vec::new();
     if std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
@@ -331,6 +536,7 @@ pub fn reclaim_watched(
             moved: false,
             compiler_store: compiler_store(home),
             record,
+            fence,
             removed: &mut removed,
         };
         sweep.walk(root, 0);
@@ -338,12 +544,13 @@ pub fn reclaim_watched(
     removed
 }
 
-/// THE ROOT THE CACHE MOVED FROM, emptied ([`MOVED_AFTER`]): each build directory under `root` that nothing wrote for [`MOVED_AFTER`] goes whole, its locks held as [`reclaim_watched`] holds them ([`Unused::Moved`]), whatever its workspace's state; nothing is pruned in part, and a build directory a build holds or wrote within the hour stays for a later pass. The root itself goes once nothing is left in it and it is as quiet, or this pass emptied it. `record` is asked before each removal.
+/// THE ROOT THE CACHE MOVED FROM, emptied ([`MOVED_AFTER`]): each build directory under `root` that nothing wrote for [`MOVED_AFTER`] goes whole, its locks held as [`reclaim_watched`] holds them ([`Unused::Moved`]), whatever its workspace's state; nothing is pruned in part, and a build directory a build holds or wrote within the hour stays for a later pass. The root itself goes once nothing is left in it and it is as quiet, or this pass emptied it. `record` is asked before each removal, and a stage a removal could not finish is returned with what stayed of it ([`Unused::Stayed`]).
 pub fn reclaim_moved(
     root: &Path,
     now: SystemTime,
     record: &mut dyn FnMut(&Path, Unused) -> bool,
 ) -> Vec<(PathBuf, Unused)> {
+    let fence = fence::Fence::default();
     let mut removed = Vec::new();
     if std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
         let quiet = last_written(root).is_some_and(|t| age(now, t) >= MOVED_AFTER);
@@ -356,6 +563,7 @@ pub fn reclaim_moved(
             moved: true,
             compiler_store: None,
             record,
+            fence: &fence,
             removed: &mut removed,
         };
         let any = sweep.walk(root, 0);
@@ -381,6 +589,7 @@ struct Sweep<'a> {
     compiler_store: Option<PathBuf>,
     /// Asked before each removal, its locks held: `false` keeps it.
     record: &'a mut dyn FnMut(&Path, Unused) -> bool,
+    fence: &'a fence::Fence<'a>,
     removed: &'a mut Vec<(PathBuf, Unused)>,
 }
 
@@ -391,35 +600,55 @@ const MAX_DEPTH: usize = 64;
 /// earlier pass left, walk its other children, then remove `dir` itself if it ended empty
 /// and is not brand new.
 impl Sweep<'_> {
-    /// Whether the stage at `path` may be cleared: `Some(false)` where there is none (a
-    /// missing stage needs no intent), `Some(true)` where one stands and its intent is on
-    /// record (existing staged bytes need one, even after a crash), `None` to keep it — its
-    /// intent refused, or unknown metadata, or no directory.
-    fn stage_recorded(&mut self, path: &Path) -> Option<bool> {
-        match std::fs::symlink_metadata(path) {
-            Ok(meta) => (meta.is_dir() && (self.record)(path, Unused::Unfinished)).then_some(true),
-            Err(e) => (e.kind() == std::io::ErrorKind::NotFound).then_some(false),
-        }
+    /// Whether the stage at `path` may be cleared: a folder stands there and its intent is on
+    /// record (staged bytes need one, even after a crash); its intent refused, or no folder,
+    /// keeps it as it is.
+    fn stage_recorded(&mut self, path: &Path, original: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+            && self.fence.clear(original, path)
+            && (self.record)(path, Unused::Unfinished)
     }
 
-    /// FINISH A STAGE an earlier pass left, its intent on record ([`Self::stage_recorded`]):
-    /// removed whole, it is returned as [`Unused::Unfinished`], so its outcome is on record
-    /// beside its intent and its bytes are counted; one a removal could not finish stays,
-    /// returned as nothing, for the next pass to record and finish.
-    fn finish_stage(&mut self, stage: &Path) -> bool {
-        let gone = std::fs::remove_dir_all(stage).is_ok();
-        if gone {
-            self.removed.push((stage.to_path_buf(), Unused::Unfinished));
+    /// FINISH A STAGE an earlier pass left, once a pass, its intent on record
+    /// ([`Self::stage_recorded`]): removed whole, it is returned as [`Unused::Unfinished`], so
+    /// its outcome is on record beside its intent and its bytes are counted ([`Self::take`]);
+    /// one a removal could not finish stays for the next pass to record and finish, costing
+    /// only itself: every other stage of its folder is staged under a name of its own
+    /// ([`stage_aside`], [`new_stage`]).
+    fn finish_stage(&mut self, stage: &Path, original: &Path) -> bool {
+        self.take(stage, stage.to_path_buf(), Unused::Unfinished, original)
+    }
+
+    /// REMOVE THE STAGE `stage` ([`remove::tree`], every removal a pass makes): removed whole,
+    /// `went` is returned as gone for `why`, and `true`; one some entry of which stayed is
+    /// returned as [`Unused::Stayed`] (what stayed, and the bytes that went) and stays staged for
+    /// the next pass, and `false`.
+    fn take(&mut self, stage: &Path, went: PathBuf, why: Unused, original: &Path) -> bool {
+        if !self.fence.clear(original, stage) {
+            return false;
         }
-        gone
+        let left = remove::tree(stage);
+        if left.whole() {
+            self.removed.push((went, why));
+        } else {
+            self.removed.push((
+                stage.to_path_buf(),
+                Unused::Stayed {
+                    stayed: left.stayed,
+                    freed: left.freed,
+                },
+            ));
+        }
+        left.whole()
     }
 
     /// WHAT NO BUILD READS AGAIN in the build directory `leaf` that stays ([`stale`]):
     /// surveyed without locks, then every cargo lock it holds taken (one a build holds keeps
     /// it all this pass), and the decision made again from a fresh survey under those locks;
-    /// moved into the stage `dir`/[`DOOMED`] under the locks, recorded as that stage
-    /// ([`Unused::Stale`]; refused, every entry moves back), and removed with the locks let
-    /// go.
+    /// moved under the locks into a new stage of its own in `dir` ([`new_stage`] from
+    /// [`DOOMED`], beside any stage an earlier pass left, which the walk finishes as a stage of
+    /// its own), recorded as that stage ([`Unused::Stale`]; refused, every entry moves back),
+    /// and removed with the locks let go.
     fn prune(&mut self, dir: &Path, leaf: &Path) -> bool {
         let Some(seen) = look(leaf) else {
             return false;
@@ -435,6 +664,9 @@ impl Sweep<'_> {
             self.now,
         );
         if doomed.is_empty() {
+            return false;
+        }
+        if !self.fence.clear(leaf, leaf) {
             return false;
         }
         let Some(held) = hold(&seen.locks) else {
@@ -455,16 +687,12 @@ impl Sweep<'_> {
         if doomed.is_empty() {
             return false;
         }
-        let stage = dir.join(DOOMED);
-        let mut any = false;
-        match self.stage_recorded(&stage) {
-            None => return false,
-            Some(true) => any |= self.finish_stage(&stage),
-            Some(false) => {}
+        if !self.fence.clear(leaf, leaf) {
+            return false;
         }
-        if std::fs::create_dir(&stage).is_err() {
-            return any;
-        }
+        let Ok(stage) = new_stage(dir, OsStr::new(DOOMED)) else {
+            return false;
+        };
         let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
         let (mut incremental, mut units) = (0, 0);
         for one in &doomed {
@@ -488,20 +716,28 @@ impl Sweep<'_> {
             after: RECLAIM_STALE,
         };
         if moved.is_empty() || !(self.record)(&stage, why) {
+            // A new process may have started from a staged image while the intent was
+            // refused. Keep that stage for a later recorded pass rather than move its image.
+            if !self.fence.clear(leaf, &stage) {
+                drop(held);
+                return false;
+            }
             for (from, to) in moved.iter().rev() {
                 let _ = std::fs::rename(to, from);
             }
             let _ = std::fs::remove_dir(&stage);
             drop(held);
-            return any;
+            return false;
         }
         drop(held);
-        if std::fs::remove_dir_all(&stage).is_ok() {
-            self.removed.push((stage, why));
-        }
+        self.take(&stage, stage.clone(), why, leaf);
         true
     }
 
+    /// ONE MIRROR FOLDER `dir`, its children as one listing read them: its [`LEAF`] judged
+    /// (taken whole, under a stage of its own, or pruned), each stage an earlier pass left
+    /// ([`is_stage`]) finished once, every other folder walked; the stages this pass makes are not
+    /// in that listing, so no stage is visited twice in a pass.
     fn walk(&mut self, dir: &Path, depth: usize) -> bool {
         let (root, home, now) = (self.root, self.home, self.now);
         let quiet = last_written(dir).is_some_and(|t| age(now, t) >= RECLAIM_GONE);
@@ -532,29 +768,27 @@ impl Sweep<'_> {
                     }
                     continue;
                 };
-                if !(self.record)(&child, why) {
+                if stage_for(&child, dir, OsStr::new(DOOMED)).is_none()
+                    || !self.fence.clear(&child, &child)
+                    || !(self.record)(&child, why)
+                {
                     drop(held);
                     continue;
                 }
-                let doomed = dir.join(DOOMED);
-                let Some(staged) = self.stage_recorded(&doomed) else {
+                if !self.fence.clear(&child, &child) {
                     drop(held);
                     continue;
-                };
-                if staged {
-                    any |= self.finish_stage(&doomed);
                 }
-                let moved = std::fs::rename(&child, &doomed).is_ok();
+                let staged = stage_aside(&child, dir, OsStr::new(DOOMED));
                 drop(held);
-                if moved {
+                if let Ok(stage) = staged {
                     any = true;
-                    if std::fs::remove_dir_all(&doomed).is_ok() {
-                        self.removed.push((child, why));
-                    }
+                    self.take(&stage, child.clone(), why, &child);
                 }
-            } else if name == DOOMED {
-                if self.stage_recorded(&child) == Some(true) {
-                    any |= self.finish_stage(&child);
+            } else if is_stage(name, OsStr::new(DOOMED)) {
+                let original = dir.join(LEAF);
+                if self.stage_recorded(&child, &original) {
+                    any |= self.finish_stage(&child, &original);
                 }
             } else if depth < MAX_DEPTH {
                 any |= self.walk(&child, depth + 1);
@@ -646,34 +880,89 @@ const UNBUILT_DEPTH: usize = 5;
 /// A cargo target or build directory `dir` that a tool of this repository no longer builds in,
 /// removed whole once no build holds any of its cargo locks ([`CARGO_LOCKS`], up to
 /// [`UNBUILT_DEPTH`] folders down, never through a link): every lock taken without waiting and
-/// looked for again, then `dir` renamed aside to `<dir>.removing` and removed under them.
-/// Builds resolving the original path after its rename get a fresh directory.
-/// A folder an earlier call left aside is removed first. `Ok(false)`: `dir` is no directory, or a
-/// build holds a lock (or one is no regular file, or one came meanwhile), and it stays.
+/// looked for again, then `dir` renamed aside, never over another entry, to the lowest free
+/// stage name from `<dir>.removing` (`<dir>.removing`, then `<dir>.removing-<n>`:
+/// [`stage_aside`]) and removed under them. Builds resolving the original path after its rename
+/// get a fresh directory. Each folder an earlier call left aside (every stage name from
+/// `<dir>.removing`, the one fixed name an older aterm used included) is removed first, each on
+/// its own: one that keeps an entry costs only itself, and `dir` is judged and removed all the
+/// same. Each removal is [`remove::tree`]'s, which no one entry stops. A caller whose `dir` is
+/// gone calls it all the same to finish what earlier calls left aside. `Ok(true)`: `dir` went
+/// whole, and nothing aside stayed. `Ok(false)`: nothing aside stayed, and `dir` is no directory
+/// or a build holds a lock (or one is no regular file, or one came meanwhile), or a process uses
+/// it or cannot be ruled out, and it stays.
 ///
 /// # Errors
-/// A directory scan, an entry's metadata, the rename or a removal failed.
+/// A directory scan, an entry's metadata or the rename failed; or some entry of an aside stayed,
+/// the earlier calls' or the one `dir` was renamed to, whether or not `dir` itself went: the
+/// error names each such aside ([`remove::stayed_words`], joined by `; `), the rest of it went,
+/// and the next call tries it again.
 pub fn remove_unbuilt(dir: &Path) -> std::io::Result<bool> {
-    let mut aside = dir.as_os_str().to_owned();
-    aside.push(".removing");
-    let aside = PathBuf::from(aside);
-    if std::fs::symlink_metadata(&aside).is_ok_and(|m| m.is_dir()) {
-        std::fs::remove_dir_all(&aside)?;
-    }
-    if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
-        return Ok(false);
-    }
-    let locks = locks_under(dir)?;
-    let Some(held) = hold(&locks) else {
+    remove_unbuilt_on(dir, &fence::Fence::default())
+}
+
+/// Remove an old target with an ownership probe supplied by a headless fixture.
+///
+/// # Errors
+/// The same directory, metadata, rename and incomplete-removal errors as [`remove_unbuilt`].
+#[cfg(any(test, debug_assertions))]
+pub fn remove_unbuilt_with_processes(
+    dir: &Path,
+    processes: fence::Processes<'_>,
+) -> std::io::Result<bool> {
+    remove_unbuilt_on(dir, &fence::Fence::new(processes))
+}
+
+fn remove_unbuilt_on(dir: &Path, fence: &fence::Fence<'_>) -> std::io::Result<bool> {
+    let Some(name) = dir.file_name() else {
         return Ok(false);
     };
-    if locks_under(dir)? != locks {
-        return Ok(false);
+    let holder = dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut base = name.to_os_string();
+    base.push(".removing");
+    let mut stayed = Vec::new();
+    let mut held_by_process = false;
+    let mut gone = |aside: &Path| {
+        if !fence.clear(dir, aside) {
+            held_by_process = true;
+            return false;
+        }
+        let left = remove::tree(aside);
+        if !left.whole() {
+            stayed.push(remove::stayed_words(aside, left.stayed));
+        }
+        left.whole()
+    };
+    for aside in stages_in(holder, &base) {
+        gone(&aside);
     }
-    std::fs::rename(dir, &aside)?;
-    std::fs::remove_dir_all(&aside)?;
-    drop(held);
-    Ok(true)
+    let went = 'went: {
+        if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+            break 'went false;
+        }
+        if !fence.clear(dir, dir) {
+            break 'went false;
+        }
+        let locks = locks_under(dir)?;
+        let Some(held) = hold(&locks) else {
+            break 'went false;
+        };
+        if locks_under(dir)? != locks || !fence.clear(dir, dir) {
+            break 'went false;
+        }
+        let aside = stage_aside(dir, holder, &base)?;
+        let whole = gone(&aside);
+        drop(held);
+        whole
+    };
+    if stayed.is_empty() {
+        Ok(went && !held_by_process)
+    } else {
+        Err(std::io::Error::other(stayed.join("; ")))
+    }
 }
 
 /// Cargo's locks under `dir` to [`UNBUILT_DEPTH`] folders down, sorted; no link is followed.
@@ -841,6 +1130,7 @@ pub fn reclaim_home_watched(
         );
         removed.extend(reclaim_moved(&moved_from(&home), now, record));
         removed.extend(tooling::reclaim(&tooling::root(&home), now, record));
+        removed.extend(registered::reclaim(&home, now, gone_after, placing, record));
         removed
     })
 }
@@ -851,20 +1141,25 @@ pub fn reclaim_home() -> Vec<(PathBuf, Unused)> {
     reclaim_home_watched(RECLAIM_GONE, None, &mut |_, _| true)
 }
 
-/// WHAT A PASS WOULD TAKE, read and never acted on ([`plan`]): one build directory that would go whole, the parts that would go from one that stays, or a stage an earlier pass left.
+/// An advisory cleanup candidate from [`plan`]: a whole build directory, its stale parts,
+/// or a stage an earlier pass left. Cleanup rechecks eligibility and active use before
+/// removing anything; this observation does not promise that its footprint will be freed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Planned {
     /// The build directory, or the stage.
     pub path: PathBuf,
-    /// Why, as the pass would record it.
+    /// The observed reason for considering it.
     pub why: Unused,
-    /// What would be removed: `path` itself, or the parts of it.
+    /// Candidate paths whose footprint is reported: `path` itself, or its stale parts.
     pub paths: Vec<PathBuf>,
-    /// Its cargo locks could not all be taken just now (a build holds one): a pass now keeps it whole.
+    /// Cargo locks could not all be taken when checked. False does not rule out active
+    /// process use or unknown ownership; stages and tooling do not probe Cargo locks here.
     pub held: bool,
 }
 
-/// [`reclaim_watched`]'s decisions over the cache `root` at `now`, read and never acted on: nothing is moved or removed and no stage is finished.
+/// Advisory cleanup candidates in `root` at `now`, including observed Cargo lock failures.
+/// Process ownership is not probed here. [`reclaim_watched`] rechecks eligibility and active
+/// use before removal. Nothing is moved or removed and no stage is finished by this read.
 #[must_use]
 pub fn plan(
     root: &Path,
@@ -890,7 +1185,8 @@ pub fn plan(
     planned
 }
 
-/// [`reclaim_moved`]'s decisions over the root the cache moved from, `root`, at `now`, read and never acted on.
+/// Advisory candidates in the root the cache moved from, `root`, at `now`. As in [`plan`],
+/// process ownership is checked by cleanup, not this read-only observation.
 #[must_use]
 pub fn plan_moved(root: &Path, now: SystemTime) -> Vec<Planned> {
     let mut planned = Vec::new();
@@ -901,7 +1197,9 @@ pub fn plan_moved(root: &Path, now: SystemTime) -> Vec<Planned> {
     planned
 }
 
-/// [`plan`] for this user's cache now, with the day's window ([`reclaim_home`]'s), then [`plan_moved`] for the root it moved from and [`tooling::plan`] for its tooling cache; nothing off macOS or without a home.
+/// Advisory candidates for this user's current, moved, tooling and registered caches, with
+/// the day's age window ([`reclaim_home`]'s). Active use is checked by cleanup. Nothing is
+/// listed off macOS or without a home.
 #[must_use]
 pub fn plan_home() -> Vec<Planned> {
     if !cfg!(target_os = "macos") {
@@ -912,6 +1210,7 @@ pub fn plan_home() -> Vec<Planned> {
         let mut planned = plan(&cache_root(&home), Some(&home), now, RECLAIM_GONE, None);
         planned.extend(plan_moved(&moved_from(&home), now));
         planned.extend(tooling::plan(&tooling::root(&home), now));
+        planned.extend(registered::plan(&home, now));
         planned
     })
 }
@@ -928,7 +1227,10 @@ type PlanPass<'a> = (
     bool,
 );
 
-/// [`plan`]'s walk of the mirror folder `dir`, as [`Sweep::walk`] walks it.
+/// [`plan`]'s walk of the mirror folder `dir`, as [`Sweep::walk`] walks it: each stage an
+/// earlier pass left listed once, its leaf nominated whole only while it can be staged
+/// ([`stage_for`]), and its stale parts only while a stage can be made beside it
+/// ([`free_stage`]).
 fn plan_walk(pass: PlanPass<'_>, dir: &Path, depth: usize, planned: &mut Vec<Planned>) {
     let (root, home, now, gone_after, placing, store, was_moved) = pass;
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -943,6 +1245,9 @@ fn plan_walk(pass: PlanPass<'_>, dir: &Path, depth: usize, planned: &mut Vec<Pla
     for child in children {
         let name = child.file_name().unwrap_or_default();
         if name == LEAF {
+            if free_stage(dir, OsStr::new(DOOMED)).is_none() {
+                continue;
+            }
             let Some(seen) = look(&child) else {
                 continue;
             };
@@ -954,12 +1259,14 @@ fn plan_walk(pass: PlanPass<'_>, dir: &Path, depth: usize, planned: &mut Vec<Pla
                     .and_then(|ws| whole(&ws, &seen, home, now, gone_after, placing))
             };
             if let Some(why) = goes {
-                planned.push(Planned {
-                    path: child.clone(),
-                    why,
-                    paths: vec![child],
-                    held,
-                });
+                if stage_for(&child, dir, OsStr::new(DOOMED)).is_some() {
+                    planned.push(Planned {
+                        path: child.clone(),
+                        why,
+                        paths: vec![child],
+                        held,
+                    });
+                }
                 continue;
             }
             if was_moved {
@@ -981,7 +1288,7 @@ fn plan_walk(pass: PlanPass<'_>, dir: &Path, depth: usize, planned: &mut Vec<Pla
                 paths: doomed.into_iter().flat_map(|d| d.paths).collect(),
                 held,
             });
-        } else if name == DOOMED {
+        } else if is_stage(name, OsStr::new(DOOMED)) {
             planned.push(Planned {
                 path: child.clone(),
                 why: Unused::Unfinished,
@@ -997,7 +1304,8 @@ fn plan_walk(pass: PlanPass<'_>, dir: &Path, depth: usize, planned: &mut Vec<Pla
 /// The bytes paths hold on disk: one definition with the capacity ledger's footprints.
 pub use aterm_capacity::footprint::allocated;
 
-/// The workspaces whose build directories the cache under `root` holds.
+/// The workspaces whose build directories the cache under `root` holds; a stage ([`is_stage`])
+/// is never looked into.
 #[must_use]
 pub fn workspaces(root: &Path) -> Vec<PathBuf> {
     fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
@@ -1010,7 +1318,7 @@ pub fn workspaces(root: &Path) -> Vec<PathBuf> {
             }
             if e.file_name() == LEAF {
                 out.extend(workspace_of(root, dir));
-            } else if depth < MAX_DEPTH && e.file_name() != DOOMED {
+            } else if depth < MAX_DEPTH && !is_stage(&e.file_name(), OsStr::new(DOOMED)) {
                 walk(root, &e.path(), depth + 1, out);
             }
         }

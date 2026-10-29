@@ -19,20 +19,26 @@ use super::fleet::{self, Fetched, Fetcher, Held, LiveFetcher};
 use super::login::{self, Done};
 use super::permission::{self, Asker, Choice, Level};
 use super::review;
-use super::state::{self, Mark, Row, State};
+use super::state::{self, Actor, Mark, Row, State};
 use super::store::Store;
 
 /// The usage text.
 pub const USAGE: &str = "\
-aterm ai — this machine's AI CLIs (claude, codex, agy, muse, grok): health, sign-in, cross-AI reviews.
+aterm ai — this machine's AI CLIs (claude, codex, agy, muse, grok, kimi): health, sign-in, cross-AI reviews.
 
-  aterm ai [status] [--json]    one row per CLI and a health line, read-only (exit 0)
+  aterm ai [status] [--json]    one row per CLI, a health line naming what aterm fixes itself
+                                and a NEEDS YOU: line for a sign-in only a person makes (or
+                                what a person does first where one cannot start), read-only
+                                (exit 0)
   aterm ai doctor [--read-only] [--json] [--on <host>[:/abs/aterm],\u{2026} | --fleet]
-                                the same with fixes; for a person at a terminal (no
-                                --read-only or --json) it installs or signs in each CLI that
-                                needs it; exit 1 while one is signed out or not installed;
-                                --on / --fleet ([harness] hosts): those machines too, over ssh
-  aterm ai login <cli>          run one CLI's vendor sign-in (a person at a terminal)
+                                the same with fixes (not with --read-only or --json): aterm's
+                                own, at a terminal or none and under an agent too (installs,
+                                and sign-ins through accounts v2's or a pool's renewal), and a
+                                CLI's own sign-in only for a person at a terminal; exit 1 while
+                                one is signed out or not installed; --on / --fleet ([harness]
+                                hosts): those machines too, over ssh, for a person at a terminal
+  aterm ai login <cli>          sign one CLI in: accounts v2's or its pool's renewal where a
+                                row has an email, else its own sign-in (a person at a terminal)
   aterm ai review [--with <cli>,\u{2026} | --all] [--from <cli>] [--base <ref> | --uncommitted]
                   [--permissions <inherit|yolo|edits|ask|plan>] [--timeout <s>] [--json]
                   [--] [<what to look for> | -]
@@ -218,7 +224,17 @@ pub fn fleet_fetch(env: &Env, fetcher: &dyn Fetcher, force: bool) -> Option<Fetc
 #[must_use]
 pub fn look(env: &Env) -> Look {
     let ai_dir = env.ai_dir();
-    let settings = config::load_with(env.config.as_deref(), ai_dir.as_deref(), env.now);
+    let config_text = env.config.as_deref().and_then(|p| {
+        crate::harness::accounts::read_bounded(p, config::CONFIG_MAX_BYTES)
+            .ok()
+            .flatten()
+    });
+    let (settings, parsed_doc) = config::load_from_text(
+        config_text.as_deref(),
+        env.config.as_deref(),
+        ai_dir.as_deref(),
+        env.now,
+    );
     let held = held_of(&settings, ai_dir.as_deref());
     let store = env.store();
     let (records, store_note) = match store.as_ref().map(Store::load) {
@@ -242,6 +258,33 @@ pub fn look(env: &Env) -> Look {
         ),
     };
     let var = |k: &str| env.var(k);
+    let roster = env
+        .config
+        .as_deref()
+        .and_then(crate::harness::accounts::roster_beside);
+    let has_other_pool = roster
+        .as_deref()
+        .and_then(Path::parent)
+        .is_some_and(|config_dir| {
+            [
+                crate::harness::accounts::Cli::Codex,
+                crate::harness::accounts::Cli::Grok,
+                crate::harness::accounts::Cli::Kimi,
+            ]
+            .into_iter()
+            .any(|cli| config_dir.join(cli.accounts().roster_file).is_file())
+        });
+    let accounts_mode = Some(match (has_other_pool, config_text.as_deref()) {
+        (true, Some(text)) => {
+            crate::supervise::config::SupervisorConfig::from_parsed_aterm_toml(
+                parsed_doc.as_ref(),
+                text,
+            )
+            .0
+            .accounts
+        }
+        _ => crate::supervise::config::SupervisorConfig::default().accounts,
+    });
     let machine = Machine {
         now: env.now,
         home: env.home.clone(),
@@ -250,22 +293,23 @@ pub fn look(env: &Env) -> Look {
         exclude: env.exclude.clone(),
         records,
         harness_state: env.harness_state.clone(),
-        roster: env
-            .config
-            .as_deref()
-            .and_then(crate::harness::accounts::roster_beside),
+        roster,
+        accounts_mode,
+        config: env.config.clone(),
     };
     let facts: Vec<Facts> = connector::connections()
         .map(|c| facts::gather(&machine, c))
         .collect();
     let mut settings = settings;
-    if let Some(why) = facts
-        .iter()
-        .find_map(|f| f.accounts.as_ref().and_then(|a| a.refused.clone()))
-    {
+    let view = facts.iter().find_map(|f| f.accounts.as_ref());
+    if let Some(why) = view.and_then(|a| a.refused.as_deref()) {
         settings.notes.push(format!(
             "accounts.toml is refused ({why}), so Claude reads as having no roster; \
              `aterm harness accounts` says how to fix it"
+        ));
+    } else if let Some(why) = view.and_then(|a| a.unread.as_deref()) {
+        settings.notes.push(format!(
+            "accounts v2's records cannot be read ({why}), so Claude reads as having no roster"
         ));
     }
     let mut rows: Vec<Row> = facts
@@ -292,8 +336,46 @@ fn pad(s: &str, w: usize) -> String {
     format!("{s:<w$}")
 }
 
-/// The doctor's text.
+/// The most of a row's fact the text says: `--json`'s `fact` carries it whole.
+const FACT_MAX: usize = 400;
+
+/// What a clipped fact ends with ([`fact_line`]).
+const FACT_MORE: &str = "\u{2026} (`--json` says it whole)";
+
+/// A row's fact as the text says it, fit for a terminal ([`review::sanitize_block`]) on one
+/// line of at most [`FACT_MAX`] bytes: where it is longer, cut after its last whole word that fits
+/// before [`FACT_MORE`], so a word (a refusal's reason among them) is never cut short unmarked.
+fn fact_line(fact: &str) -> String {
+    let clean = review::sanitize_block(fact, fact.len()).replace('\n', " ");
+    if clean.len() <= FACT_MAX {
+        return clean;
+    }
+    let room = FACT_MAX - FACT_MORE.len();
+    let fits = (0..=room)
+        .rev()
+        .find(|&i| clean.is_char_boundary(i))
+        .unwrap_or(0);
+    // The cut falls at a space that ends a word; a first word longer than the room is cut at
+    // a character instead.
+    let cut = if clean[fits..].starts_with(' ') {
+        fits
+    } else {
+        clean[..fits].rfind(' ').unwrap_or(fits)
+    };
+    let head = clean[..cut].trim_end_matches([' ', '\u{b7}', ',', ';', ':']);
+    format!("{head}{FACT_MORE}")
+}
+
+/// The doctor's text: each row, the reviews and fleet lines, the notes, the `health:` line with
+/// `next`, and the `NEEDS YOU:` line for a sign-in only a person makes
+/// ([`state::Health::needs_you`]).
 pub fn render_text(out: &mut dyn Write, look: &Look, fixes: bool, next: &str) {
+    render_look(out, look, fixes, next, true);
+}
+
+/// [`render_text`], the `NEEDS YOU:` line only where `needs_you` asks for it (not before the
+/// doctor's own fixes, which may make it moot).
+fn render_look(out: &mut dyn Write, look: &Look, fixes: bool, next: &str, needs_you: bool) {
     let s = &look.settings;
     let from = |f: config::From| match f {
         config::From::Default => String::new(),
@@ -307,7 +389,7 @@ pub fn render_text(out: &mut dyn Write, look: &Look, fixes: bool, next: &str) {
         from(s.preferred.1)
     );
     for row in &look.rows {
-        let fact = review::sanitize_block(&row.fact, 400).replace('\n', " ");
+        let fact = fact_line(&row.fact);
         let _ = writeln!(
             out,
             "{}{}{fact}",
@@ -316,7 +398,7 @@ pub fn render_text(out: &mut dyn Write, look: &Look, fixes: bool, next: &str) {
         );
         if fixes
             && row.mark >= Mark::Warn
-            && let Some(fix) = &row.fix
+            && let Some(fix) = row.fix.as_ref().or(row.mend.as_ref())
         {
             let _ = writeln!(out, "{}fix: {fix}", " ".repeat(LABEL_W));
         }
@@ -353,11 +435,13 @@ pub fn render_text(out: &mut dyn Write, look: &Look, fixes: bool, next: &str) {
     }
     let h = state::health(&look.rows);
     let _ = writeln!(out, "\nhealth: {}", h.line(next));
+    if needs_you && let Some(line) = h.needs_you() {
+        let _ = writeln!(out, "{line}");
+    }
 }
 
 /// Whether a review asks `id` unless named: wanted here, and its row not off ([`State::Off`]: no
-/// build for this platform, excluded, uninstalled on purpose, or an opt-in program nobody
-/// installed), which a review would only skip.
+/// build for this platform, excluded, or uninstalled on purpose), which a review would only skip.
 fn asked_by_default(s: &Settings, rows: &[Row], id: &str) -> bool {
     s.wants(id)
         && rows
@@ -476,6 +560,11 @@ pub fn render_json(look: &Look, now: i64, next: &str) -> String {
         o.insert("limited_until_rfc3339".to_string(), rfc(row.limited_until));
         o.insert("fact".to_string(), Value::from(row.fact.as_str()));
         o.insert("fix".to_string(), text(&row.fix));
+        o.insert("mend".to_string(), text(&row.mend));
+        o.insert(
+            "fix_by".to_string(),
+            row.actor.map_or(Value::Null, |a| Value::from(a.word())),
+        );
         clis.push(Value::Object(o));
     }
     let h = state::health(&look.rows);
@@ -492,6 +581,10 @@ pub fn render_json(look: &Look, now: i64, next: &str) -> String {
         } else {
             Value::from(next)
         },
+    );
+    health.insert(
+        "needs_you".to_string(),
+        h.needs_you().map_or(Value::Null, Value::from),
     );
     let asker = look.asker.agent().map_or(s.preferred.0.id, |(id, _)| id);
     let (level, level_why) = review_level(s, look.asker)
@@ -577,10 +670,13 @@ pub fn render_json(look: &Look, now: i64, next: &str) -> String {
     aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| String::from("{}"))
 }
 
-fn may_fix(env: &Env, read_only: bool) -> Result<(), String> {
-    if read_only {
-        return Err("--read-only".to_string());
-    }
+/// Whether a person is at this run to make a fix only a person makes ([`Actor::Person`]: a CLI's
+/// own sign-in, an email Claude's adoption asks): a terminal on stdin and no agent's marker.
+///
+/// # Errors
+///
+/// Why no person is here: stdin is no terminal, or an agent's marker is set.
+fn person_here(env: &Env) -> Result<(), String> {
     if !env.stdin_tty {
         return Err("stdin is not a terminal".to_string());
     }
@@ -588,6 +684,19 @@ fn may_fix(env: &Env, read_only: bool) -> Result<(), String> {
         return Err(format!("{m} is set (an agent runs this)"));
     }
     Ok(())
+}
+
+/// Whether `row`'s fix may run here: aterm's own at any run but `--read-only`'s, a person's
+/// only where [`person_here`] says one is.
+///
+/// # Errors
+///
+/// Why it may not.
+fn may_fix(env: &Env, row: &Row) -> Result<(), String> {
+    match row.actor {
+        Some(Actor::Person) => person_here(env),
+        Some(Actor::Aterm) | None => Ok(()),
+    }
 }
 
 fn ask_line(question: &str) -> Option<String> {
@@ -619,6 +728,7 @@ fn sign_in_one(
         now: &now,
         ask: &ask_line,
         no_desk: Some(Path::new(crate::harness::login_drive::SANDBOX_EXEC)),
+        attended: person_here(env).is_ok(),
     };
     login::sign_in(&host, facts, row, out)
 }
@@ -638,22 +748,22 @@ fn done_line_of(id: &str, done: &Done) -> String {
             id,
             crate::harness::one_line(why, 160)
         ),
+        // aterm's own sentence, whose quoted parts are bounded where they are quoted: folded onto
+        // one line and never cut, since its end is the reason or the next step.
         Done::Refused(why) => format!(
             "{}: not started: {}",
             id,
-            crate::harness::one_line(why, 160)
+            crate::supervise::limit::one_line(why)
         ),
     }
 }
 
-fn next_act(env: &Env, read_only: bool) -> &'static str {
-    match may_fix(env, read_only) {
-        Ok(()) => "aterm ai doctor",
-        Err(_) if login::agent_marker(&|k| env.var(k)).is_some() => {
-            "ask a person to run `aterm ai doctor`"
-        }
-        Err(_) => "aterm ai doctor",
-    }
+/// The health line's next act over `look`'s rows ([`state::Health::next`]): what `aterm ai
+/// doctor` fixes itself, then the sign-ins only a person makes.
+fn next_act(look: &Look) -> String {
+    state::health(&look.rows)
+        .next()
+        .unwrap_or_else(|| "aterm ai doctor".to_string())
 }
 
 fn install(env: &Env, runner: &dyn Runner, id: &str) -> Result<(), String> {
@@ -666,6 +776,10 @@ fn install(env: &Env, runner: &dyn Runner, id: &str) -> Result<(), String> {
     }
 }
 
+/// `aterm ai doctor` here: the look, then each fix it may make ([`may_fix`]): aterm's own
+/// (installs, and sign-ins through accounts v2's or a pool's ladder) at any run but
+/// `--read-only`'s or `--json`'s, under an agent and with no terminal too; a person's only where
+/// one is at this terminal, else said and not started. The look again after.
 fn doctor_here(
     env: &Env,
     runner: &dyn Runner,
@@ -675,30 +789,45 @@ fn doctor_here(
     err: &mut dyn Write,
 ) -> ExitCode {
     let first = look(env);
-    let fix = may_fix(env, read_only);
     let needs: Vec<usize> = first
         .rows
         .iter()
         .enumerate()
-        .filter(|(_, r)| r.state.needs_person(r.wanted))
+        .filter(|(_, r)| r.state.needs_act(r.wanted))
         .map(|(i, _)| i)
         .collect();
-    if json || fix.is_err() || needs.is_empty() {
-        let next = next_act(env, read_only);
+    if json || read_only || needs.is_empty() {
+        let next = next_act(&first);
         if json {
-            let _ = writeln!(out, "{}", render_json(&first, env.now, next));
+            let _ = writeln!(out, "{}", render_json(&first, env.now, &next));
         } else {
-            render_text(out, &first, true, next);
+            render_text(out, &first, true, &next);
         }
         return exit_of(&first.rows);
     }
-    render_text(out, &first, true, "signing in below");
+    render_look(out, &first, true, "fixing below", false);
     let Some(store) = env.store() else {
         let _ = writeln!(
             err,
             "aterm ai doctor: aterm's state directory is unknown; nothing was run"
         );
         return ExitCode::from(1);
+    };
+    // A sign-in that runs nothing wherever it runs ([`login::refusal`]): its reason. A fix only
+    // a person makes, with nobody here to make it: said, never started.
+    let held = |f: &Facts, row: &Row| {
+        login::refusal(f, row).map(Done::Refused).or_else(|| {
+            may_fix(env, row).err().map(|why| {
+                let id = row.connector.id;
+                Done::Refused(format!(
+                    "{why}; no route of aterm's signs {id} in, so a person does, once, at this \
+                     Mac (`{}`)",
+                    row.fix
+                        .clone()
+                        .unwrap_or_else(|| format!("aterm ai login {id}"))
+                ))
+            })
+        })
     };
     for i in needs {
         let row = &first.rows[i];
@@ -729,15 +858,16 @@ fn doctor_here(
             ) else {
                 continue;
             };
-            if r.state.needs_person(r.wanted) {
-                let done = sign_in_one(env, runner, &store, f, r, out);
+            if r.state.needs_act(r.wanted) {
+                let done =
+                    held(f, r).unwrap_or_else(|| sign_in_one(env, runner, &store, f, r, out));
                 let _ = writeln!(out, "{}", done_line(f.connector, &done));
             } else {
                 let _ = writeln!(out, "{}: installed ({})", r.connector.id, r.fact);
             }
             continue;
         }
-        let done = sign_in_one(env, runner, &store, f, row, out);
+        let done = held(f, row).unwrap_or_else(|| sign_in_one(env, runner, &store, f, row, out));
         let _ = writeln!(out, "{}", done_line(f.connector, &done));
     }
     let after = Env {
@@ -746,7 +876,7 @@ fn doctor_here(
     };
     let last = look(&after);
     let _ = writeln!(out);
-    render_text(out, &last, true, "aterm ai doctor");
+    render_text(out, &last, true, &next_act(&last));
     exit_of(&last.rows)
 }
 
@@ -920,7 +1050,7 @@ fn fleet_poll(
             aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
         );
     } else {
-        render_text(out, &here_look, true, next_act(env, true));
+        render_text(out, &here_look, true, &next_act(&here_look));
         for (host, states) in machines.iter().skip(1) {
             let _ = writeln!(out, "\n{host}:");
             match states {
@@ -974,7 +1104,9 @@ fn doctor_away(
             return ExitCode::from(2);
         }
     };
-    if json || may_fix(env, read_only).is_err() {
+    // Each machine's doctor runs on its own terminal over `ssh -t`, where a person makes what
+    // only a person can; with nobody here it is a poll of each machine's look.
+    if json || read_only || person_here(env).is_err() {
         return fleet_poll(env, runner, &hosts, json, out, err);
     }
     let here = doctor_here(env, runner, false, false, out, err);
@@ -1014,6 +1146,15 @@ fn csv(v: &str) -> Vec<String> {
         .collect()
 }
 
+/// `aterm ai login <id>`: the connection's sign-in ([`login::sign_in`]). aterm's own (accounts
+/// v2's or the pool's renewal) runs at a terminal or none; a person's (the CLI's own sign-in, an
+/// email Claude's adoption asks) only at a terminal. A CLI not installed is installed first, as
+/// the doctor does. A sign-in that runs nothing wherever it runs ([`login::refusal`]: a row
+/// nothing here signs in) is refused with its reason, at a terminal or none. With no terminal, a
+/// row whose person's step is a mend ([`state::Row::mend`]: of the pin or roster that refuses its
+/// launches, a pinned row's sign-in the pool's does not make, or the sign-in of this machine's own
+/// login at a terminal and then its pin, [`state::sign_in_then_pin`]) is told that mend and the
+/// refusal, never sent to a sign-in.
 fn login_verb(
     env: &Env,
     runner: &dyn Runner,
@@ -1022,23 +1163,11 @@ fn login_verb(
     err: &mut dyn Write,
 ) -> ExitCode {
     if connector::connector(id).is_none() {
-        if let Some(cli) = pool_only(id) {
-            return pool_login_verb(env, runner, cli, out, err);
-        }
-        let mut ids = connector::ids();
-        ids.extend(POOL_ONLY.iter().map(|cli| cli.id()));
         let _ = writeln!(
             err,
             "aterm ai login: `{}` is no AI CLI ({})",
             crate::harness::one_line(id, 40),
-            ids.join(", ")
-        );
-        return ExitCode::from(2);
-    }
-    if !env.stdin_tty {
-        let _ = writeln!(
-            err,
-            "aterm ai login: stdin is not a terminal; run `aterm ai login {id}` in a terminal"
+            connector::ids().join(", ")
         );
         return ExitCode::from(2);
     }
@@ -1046,7 +1175,17 @@ fn login_verb(
         let _ = writeln!(err, "aterm ai login: aterm's state directory is unknown");
         return ExitCode::from(1);
     };
-    let l = look(env);
+    let mut l = look(env);
+    if l.rows
+        .iter()
+        .any(|r| r.connector.id == id && r.state == State::NotInstalled)
+    {
+        if let Err(why) = install(env, runner, id) {
+            let _ = writeln!(out, "{id}: not installed: {why}");
+            return ExitCode::from(1);
+        }
+        l = look(env);
+    }
     let (Some(row), Some(f)) = (
         l.rows.iter().find(|r| r.connector.id == id),
         l.facts.iter().find(|f| f.connector.id == id),
@@ -1057,96 +1196,53 @@ fn login_verb(
         );
         return ExitCode::from(2);
     };
-    let done = sign_in_one(env, runner, &store, f, row, out);
-    let _ = writeln!(out, "{}", done_line(f.connector, &done));
-    match done {
-        Done::SignedIn(_) | Done::NotChecked => ExitCode::SUCCESS,
-        Done::Refused(_) => ExitCode::from(2),
-        Done::SignedOut | Done::Failed(_) => ExitCode::from(1),
-    }
-}
-
-/// The CLIs with an accounts pool of their own that are no connection of `aterm ai`'s: `aterm
-/// ai login <id>` runs their pool's sign-in alone ([`pool_login_verb`]). Grok Build is a
-/// connection ([`connector::ROWS`]), so its login is the connections' ([`login::sign_in`]).
-const POOL_ONLY: &[crate::harness::accounts::Cli] = &[crate::harness::accounts::Cli::Kimi];
-
-fn pool_only(id: &str) -> Option<crate::harness::accounts::Cli> {
-    POOL_ONLY.iter().copied().find(|cli| cli.id() == id)
-}
-
-/// `aterm ai login kimi`: the pool's `aterm harness accounts renew <label> --cli <id>`
-/// where this machine keeps its roster (`accounts-<id>.toml`); with none, it says how to add a
-/// row and runs nothing.
-fn pool_login_verb(
-    env: &Env,
-    runner: &dyn Runner,
-    cli: crate::harness::accounts::Cli,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-) -> ExitCode {
-    let id = cli.id();
-    if !env.stdin_tty {
+    // A person is sent to a terminal only where a run there would start something; a sign-in
+    // that runs nothing for anyone (a row nothing here signs in) says why instead.
+    if row.actor.unwrap_or_else(|| state::sign_in_actor(f)) == Actor::Person
+        && !env.stdin_tty
+        && login::refusal(f, row).is_none()
+    {
+        // Where the person's step is a mend ([`state::Row::mend`]: a change to the owner's pin or
+        // roster that refuses every launch, or the sign-in of a pinned row the pool's sign-in does
+        // not make), the sign-in `aterm ai login` makes does not end the refusal, so that mend is
+        // the step. Where the mend is that sign-in at a terminal and then a pin
+        // ([`state::sign_in_then_pin`]), it does not end it alone.
+        if let Some(mend) = &row.mend {
+            let alone = if state::sign_in_then_pin(f).is_some() {
+                " alone"
+            } else {
+                ""
+            };
+            let refused = f
+                .pool
+                .as_ref()
+                .and_then(|p| p.launch_refused.as_deref())
+                .map(|why| {
+                    let why = why
+                        .strip_suffix(crate::harness::accounts_pool::NO_WORKER)
+                        .unwrap_or(why);
+                    format!("; a launch of {id} now is refused: {why}")
+                })
+                .unwrap_or_default();
+            let _ = writeln!(
+                err,
+                "aterm ai login: stdin is not a terminal, and `aterm ai login {id}`{alone} does \
+                 not end the refusal of {id}'s launches: a person at this Mac: {mend}{refused}"
+            );
+            return ExitCode::from(2);
+        }
         let _ = writeln!(
             err,
-            "aterm ai login: stdin is not a terminal; run `aterm ai login {id}` in a terminal"
+            "aterm ai login: stdin is not a terminal, and no route of aterm's signs {id} in: a \
+             person runs `{}` in a terminal at this Mac",
+            row.fix
+                .clone()
+                .unwrap_or_else(|| format!("aterm ai login {id}"))
         );
         return ExitCode::from(2);
     }
-    let Some(store) = env.store() else {
-        let _ = writeln!(err, "aterm ai login: aterm's state directory is unknown");
-        return ExitCode::from(1);
-    };
-    let var = |k: &str| env.var(k);
-    if let Some(marker) = login::agent_marker(&var) {
-        let _ = writeln!(
-            out,
-            "{}",
-            done_line_of(
-                id,
-                &Done::Refused(format!(
-                    "{marker} is set: a sign-in is a person's act, not an agent's"
-                ))
-            )
-        );
-        return ExitCode::from(2);
-    }
-    let machine = Machine {
-        now: env.now,
-        home: env.home.clone(),
-        var: &var,
-        pkg: env.pkg.clone(),
-        exclude: env.exclude.clone(),
-        records: Default::default(),
-        harness_state: env.harness_state.clone(),
-        roster: env
-            .config
-            .as_deref()
-            .and_then(crate::harness::accounts::roster_beside),
-    };
-    let done = match facts::pool_for(&machine, cli) {
-        None => Done::Refused(format!(
-            "this machine keeps no `{}`: run `aterm harness accounts add <label> --cli {id} \
-             --email <e>` (kimi also `--region <r>`), then run this again",
-            cli.accounts().roster_file
-        )),
-        Some(pool) => {
-            let now = || crate::supervise::limit::unix_now();
-            let exe = env.exe.clone().unwrap_or_else(|| PathBuf::from("aterm"));
-            let host = login::Host {
-                runner,
-                var: &var,
-                vars: &env.vars,
-                aterm: &exe,
-                store: &store,
-                now: &now,
-                ask: &ask_line,
-                no_desk: Some(Path::new(crate::harness::login_drive::SANDBOX_EXEC)),
-            };
-            login::pool_sign_in(&host, login::PoolCli { id }, &pool)
-        }
-    };
-    let _ = writeln!(out, "{}", done_line_of(id, &done));
+    let done = sign_in_one(env, runner, &store, f, row, out);
+    let _ = writeln!(out, "{}", done_line(f.connector, &done));
     match done {
         Done::SignedIn(_) | Done::NotChecked => ExitCode::SUCCESS,
         Done::Refused(_) => ExitCode::from(2),
@@ -1744,15 +1840,15 @@ pub fn run(
         None | Some("status") => {
             let l = look(env);
             if flag("--json") {
-                let _ = writeln!(out, "{}", render_json(&l, env.now, next_act(env, true)));
+                let _ = writeln!(out, "{}", render_json(&l, env.now, &next_act(&l)));
             } else {
-                render_text(out, &l, false, next_act(env, true));
+                render_text(out, &l, false, &next_act(&l));
             }
             ExitCode::SUCCESS
         }
         Some("--json") => {
             let l = look(env);
-            let _ = writeln!(out, "{}", render_json(&l, env.now, next_act(env, true)));
+            let _ = writeln!(out, "{}", render_json(&l, env.now, &next_act(&l)));
             ExitCode::SUCCESS
         }
         Some("doctor") => {
@@ -1823,7 +1919,7 @@ pub fn run(
 }
 
 /// `aterm ai …`, from the front door.
-#[must_use]
+#[must_use = "return or inspect the command exit status"]
 pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
     let args: Vec<String> = argv
         .into_iter()

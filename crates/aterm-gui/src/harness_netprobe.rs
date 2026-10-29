@@ -7,7 +7,7 @@ use std::io;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs as _};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use aterm_agent::harness::netwatch::{
@@ -16,6 +16,166 @@ use aterm_agent::harness::netwatch::{
 use aterm_agent::supervise::policy::WorkerEnv;
 use aterm_agent::supervise::policy::claude_settings;
 use aterm_agent::supervise::policy::turn_end::Reach;
+
+/// One reading of this Mac's network ([`PathSource::watch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathEvent {
+    /// The path in use: whether it can carry traffic ([`NetState::path`]).
+    #[cfg_attr(
+        all(not(target_os = "macos"), not(test)),
+        expect(dead_code, reason = "only macOS's path monitor reads the path")
+    )]
+    Usable(bool),
+    /// The routes moved (an address or a link changed), which says nothing of whether the path
+    /// can carry traffic ([`NetState::moved`]): a switch between two usable paths, or on a host
+    /// with no path monitor the only word of a change.
+    #[cfg_attr(
+        all(not(any(target_os = "macos", target_os = "linux")), not(test)),
+        expect(dead_code, reason = "the route source is macOS's and Linux's")
+    )]
+    Moved,
+}
+
+/// Where each reading of this Mac's network goes ([`PathSource::watch`]). It may be called once
+/// more after its watch is dropped.
+pub(crate) type PathSink = Box<dyn Fn(PathEvent) + Send + Sync + 'static>;
+
+/// A started path watch, which keeps reading while it lives.
+pub(crate) type PathWatch = Box<dyn std::any::Any + Send>;
+
+/// This Mac's network path ([`NetProbe::watch_path`]), replaceable in tests.
+pub(crate) trait PathSource: Send + Sync {
+    /// Starts a watch whose every reading reaches `sink`, the first of them the path in use now;
+    /// it reads while the returned watch lives. `None` when no watch could start.
+    fn watch(&self, sink: PathSink) -> Option<PathWatch>;
+}
+
+/// The live path source. On macOS, Network.framework's path monitor
+/// ([`aterm_objc::path_monitor::PathMonitor`]): a satisfied path can carry traffic, and so can
+/// a satisfiable one (a connection attempt brings it up, as an on-demand VPN), while an
+/// unsatisfied path cannot (an invalid one says neither, and reaches no sink). On macOS and
+/// Linux, this process's route moves too ([`crate::network_moved`]'s [`Woke::Route`], the
+/// kernel's route socket), each a [`PathEvent::Moved`] at once (the probe dials the API, which no
+/// fleet herd shares, so it waits out no spread: [`crate::network_moved::watch_at_once`]); the
+/// other sources that signal tells of
+/// (the fleet's browse and beacons, the Local Network answer) say nothing of the API's reach and
+/// are not passed on. Elsewhere none.
+///
+/// [`Woke::Route`]: crate::network_moved::Woke::Route
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct SystemPath;
+
+impl PathSource for SystemPath {
+    #[cfg(target_os = "macos")]
+    fn watch(&self, sink: PathSink) -> Option<PathWatch> {
+        use aterm_objc::path_monitor::PathMonitor;
+        let sink: Arc<dyn Fn(PathEvent) + Send + Sync> = Arc::from(sink);
+        let routes = RouteMoves::start(Arc::clone(&sink), crate::network_moved::watch_at_once());
+        let monitor = PathMonitor::start(c"aterm.harness.net-path", move |reading| {
+            if let Some(usable) = usable(reading.status) {
+                sink(PathEvent::Usable(usable));
+            }
+        });
+        match (monitor, routes) {
+            (None, None) => None,
+            (monitor, routes) => Some(Box::new((monitor, routes))),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn watch(&self, sink: PathSink) -> Option<PathWatch> {
+        let routes = RouteMoves::start(Arc::from(sink), crate::network_moved::watch_at_once())?;
+        Some(Box::new(routes))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn watch(&self, _: PathSink) -> Option<PathWatch> {
+        None
+    }
+}
+
+/// Whether a Network.framework path of `status` can carry traffic: a satisfied one can, and so
+/// can a satisfiable one, which a connection attempt brings up (an on-demand VPN); an
+/// unsatisfied one cannot; an invalid one says neither (`None`).
+#[cfg(target_os = "macos")]
+const fn usable(status: aterm_objc::path_monitor::PathStatus) -> Option<bool> {
+    use aterm_objc::path_monitor::PathStatus;
+    match status {
+        PathStatus::Satisfied | PathStatus::Satisfiable => Some(true),
+        PathStatus::Unsatisfied => Some(false),
+        PathStatus::Invalid => None,
+    }
+}
+
+/// Whether a move `woke` heard is passed on as a [`PathEvent::Moved`]: only the kernel's route
+/// socket's, since the fleet's browse and beacons and the Local Network answer say nothing of
+/// the API's reach.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+const fn route_move(woke: crate::network_moved::Woke) -> bool {
+    matches!(woke, crate::network_moved::Woke::Route)
+}
+
+/// [`SystemPath`]'s consumer of this process's route moves: a thread that passes each move its
+/// watch hears from the route socket ([`route_move`]) on as a [`PathEvent::Moved`] while this
+/// lives, and ends at its first wake after its drop, within one [`RouteMoves::SLICE`].
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct RouteMoves(Arc<AtomicBool>);
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl RouteMoves {
+    /// The longest the thread waits at once before it looks whether it was dropped.
+    const SLICE: Duration = Duration::from_secs(60);
+
+    /// Starts the thread over `moved` (this process's signal, [`crate::network_moved::watch_at_once`]);
+    /// `None` when it could not start.
+    fn start(
+        sink: Arc<dyn Fn(PathEvent) + Send + Sync>,
+        mut moved: crate::network_moved::Watch,
+    ) -> Option<Self> {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let ended = Arc::clone(&dropped);
+        let spawned = crate::qos::spawn_lane_thread(
+            "aterm-harness-netmoved",
+            crate::qos::Role::Background,
+            move || {
+                while !ended.load(Ordering::SeqCst) {
+                    if route_move(moved.wait(Self::SLICE)) && !ended.load(Ordering::SeqCst) {
+                        sink(PathEvent::Moved);
+                    }
+                }
+            },
+        );
+        match spawned {
+            Ok(_) => Some(Self(dropped)),
+            Err(e) => {
+                aterm_log::warn!(
+                    "harness: the API reach probe hears no route moves ({e}); its cadence alone \
+                     finds the API's return after a switch between usable networks"
+                );
+                None
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Drop for RouteMoves {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A path source that starts no watch (`Acts::inert`).
+#[cfg(any(test, feature = "bench-support"))]
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct InertPath;
+
+#[cfg(any(test, feature = "bench-support"))]
+impl PathSource for InertPath {
+    fn watch(&self, _: PathSink) -> Option<PathWatch> {
+        None
+    }
+}
 
 /// Network probe operations replaceable in tests.
 pub(crate) trait Probe: Send + Sync {
@@ -190,6 +350,13 @@ pub(crate) struct NetProbe {
     probe: Arc<dyn Probe>,
     /// Threads spawned (one, ever — the tests' witness).
     spawned: AtomicUsize,
+    /// The network path this probe watches from its first ask, peek or path-only read
+    /// ([`Self::path_from`]); none until one is installed.
+    path: OnceLock<Arc<dyn PathSource>>,
+    /// That path's watch while it runs ([`Self::watch_path`]), dropped by [`Self::stop`].
+    watch: Mutex<Option<PathWatch>>,
+    /// A watch was tried ([`Self::watch_path`]), started or not: none is tried again.
+    watched: AtomicBool,
 }
 
 impl std::fmt::Debug for NetProbe {
@@ -209,13 +376,21 @@ impl NetProbe {
 
     /// Creates a probe using `probe` and `budget`.
     pub(crate) fn with(probe: Arc<dyn Probe>, budget: Duration) -> Arc<Self> {
+        Self::with_state(probe, NetState::with_budget(budget))
+    }
+
+    /// Creates a probe using `probe` over `state` (its budget and [`netwatch::Cadence`]).
+    pub(crate) fn with_state(probe: Arc<dyn Probe>, state: NetState) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(NetState::with_budget(budget)),
+            state: Mutex::new(state),
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
             started: AtomicBool::new(false),
             probe,
             spawned: AtomicUsize::new(0),
+            path: OnceLock::new(),
+            watch: Mutex::new(None),
+            watched: AtomicBool::new(false),
         })
     }
 
@@ -231,7 +406,125 @@ impl NetProbe {
         reach
     }
 
-    /// Signals the probe thread to stop at its next wake.
+    /// The verdict now ([`NetState::reach`]) for a session the probe measures, read without an
+    /// ask: it takes no lease, starts no thread and probes nothing, so a loop may read it at
+    /// every point. It starts the installed path source's watch once ([`Self::watch_path`]),
+    /// which sends nothing, so a lost path reads Down before any session asks.
+    pub(crate) fn peek(self: &Arc<Self>) -> Reach {
+        self.watch_path();
+        self.lock().reach(Instant::now(), SystemTime::now())
+    }
+
+    /// Installs `source` as the network path this probe watches, from the first ask, peek or
+    /// path-only read on ([`Self::watch_path`]); `false` when one was installed already (it
+    /// stays).
+    pub(crate) fn path_from(&self, source: Arc<dyn PathSource>) -> bool {
+        self.path.set(source).is_ok()
+    }
+
+    /// Starts the installed path source's watch, once ever: each reading reaches
+    /// [`Self::path_moved`] while this probe lives. Nothing with no source installed, once a
+    /// watch was tried (one that could not start is not tried again), or the probe stopped.
+    pub(crate) fn watch_path(self: &Arc<Self>) {
+        let Some(source) = self.path.get() else {
+            return;
+        };
+        let mut watch = self.watch.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.stop.load(Ordering::SeqCst) || self.watched.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let me = Arc::downgrade(self);
+        *watch = source.watch(Box::new(move |event| {
+            if let Some(me) = me.upgrade() {
+                me.path_moved(event);
+            }
+        }));
+        if watch.is_none() {
+            aterm_log::info!(
+                "harness: no network path watch; the probe's cadence alone finds the API's \
+                 return, and a session it does not measure reads unknown"
+            );
+        }
+    }
+
+    /// The path's watch read whether it can carry traffic ([`NetState::path`]), or heard the
+    /// routes move ([`NetState::moved`]). The reading is recorded under the state's mutex, and
+    /// when it owes a probe the thread is woken under that mutex too, so a thread that checked
+    /// its schedule and is about to park cannot miss the wake. A change of the path after its
+    /// first reading is logged once, and a move that owes a probe once, outside the lock.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "netprobe_shutdown_park",
+            action = "Nudge",
+            project = "harness_netprobe::tests::project_shutdown_park"
+        )
+    )]
+    pub(crate) fn path_moved(&self, event: PathEvent) {
+        let (was, owed) = {
+            let mut st = self.lock();
+            let was = st.path_satisfied();
+            let owed = match event {
+                PathEvent::Usable(satisfied) => {
+                    st.path(satisfied, Instant::now(), SystemTime::now())
+                }
+                PathEvent::Moved => st.moved(Instant::now()),
+            };
+            if owed {
+                self.wake.notify_all();
+            }
+            (was, owed)
+        };
+        let satisfied = match event {
+            PathEvent::Usable(satisfied) => satisfied,
+            PathEvent::Moved => {
+                if owed {
+                    aterm_log::info!(
+                        "harness: the network's routes moved; the API reach is measured again \
+                         once they settle"
+                    );
+                }
+                return;
+            }
+        };
+        match (was, satisfied) {
+            (Some(true), false) => {
+                aterm_log::info!("harness: network path lost; the API reach reads down");
+            }
+            (Some(false), true) => {
+                aterm_log::info!(
+                    "harness: network path back; the API reach is read again once it settles"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// When a new measure can next land ([`NetState::landing`]): always later than now, `None`
+    /// while no lease lives and no probe flies. It takes no lease and never wakes the thread.
+    pub(crate) fn landing(&self) -> Option<Instant> {
+        self.lock().landing(Instant::now(), SystemTime::now())
+    }
+
+    /// The verdict the network path alone gives a session this probe does not measure
+    /// ([`NetState::path_reach`]: Down while the path is lost, for at most
+    /// [`netwatch::LOST_CAP`], or settling, unless a fresh Up was measured since the loss; else
+    /// Unknown). It starts the installed path source's watch once ([`Self::watch_path`]); it
+    /// takes no lease, starts no thread and probes nothing, so a session that only reads the
+    /// path sends nothing to the API host.
+    pub(crate) fn path_reach(self: &Arc<Self>) -> Reach {
+        self.watch_path();
+        self.lock().path_reach(Instant::now(), SystemTime::now())
+    }
+
+    /// When the path-only verdict can next change ([`NetState::path_landing`]): always later
+    /// than now, `None` with no path lost or settling. It starts nothing and takes no lease.
+    pub(crate) fn path_landing(&self) -> Option<Instant> {
+        self.lock().path_landing(Instant::now(), SystemTime::now())
+    }
+
+    /// Signals the probe thread to stop at its next wake, then drops the path's watch (a
+    /// reading it already queued may still land, and changes nothing a stopped thread acts on).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -241,15 +534,26 @@ impl NetProbe {
         )
     )]
     pub(crate) fn stop(&self) {
-        let _state = self.lock();
-        self.stop.store(true, Ordering::SeqCst);
-        self.wake.notify_all();
+        {
+            let _state = self.lock();
+            self.stop.store(true, Ordering::SeqCst);
+            self.wake.notify_all();
+        }
+        let watch = self
+            .watch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        drop(watch);
     }
 
+    /// The probe thread, spawned at the first ask, and the path's watch with it
+    /// ([`Self::watch_path`]).
     fn ensure_thread(self: &Arc<Self>) {
         if self.started.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.watch_path();
         let me = Arc::clone(self);
         let spawned = crate::qos::spawn_lane_thread(
             "aterm-harness-netprobe",
@@ -296,8 +600,20 @@ impl NetProbe {
             }
             let budget = self.lock().budget();
             let outcome = probe_once(&*self.probe, budget);
-            self.lock()
-                .finish(outcome, Instant::now(), SystemTime::now());
+            self.settle(outcome, Instant::now(), SystemTime::now());
+        }
+    }
+
+    /// A probe ended with `outcome`: its measure recorded, and a change of the verdict
+    /// ([`netwatch::Edge`]) logged once, outside the lock. A repeat logs nothing.
+    fn settle(&self, outcome: Outcome, now: Instant, wall: SystemTime) {
+        let (edge, waiting) = {
+            let mut st = self.lock();
+            let edge = st.finish(outcome, now, wall);
+            (edge, st.waiting(now))
+        };
+        if let Some(edge) = edge {
+            aterm_log::info!("{}", edge_line(&edge, waiting));
         }
     }
 
@@ -326,6 +642,23 @@ impl NetProbe {
                     .0
             }
         }
+    }
+}
+
+/// The log line of one change of the measured verdict, `waiting` leases live.
+fn edge_line(edge: &netwatch::Edge, waiting: usize) -> String {
+    let probe = format!("probe {} ms, {waiting} waiting", edge.took.as_millis());
+    match edge.from {
+        Some(from) => format!(
+            "harness: API reach {}→{} after {} ({probe})",
+            from.word(),
+            edge.to.word(),
+            crate::presence::fmt_dur(edge.held),
+        ),
+        None => format!(
+            "harness: API reach {} (no fresh measure before it; {probe})",
+            edge.to.word()
+        ),
     }
 }
 
@@ -427,8 +760,8 @@ mod tests {
 
     const BUDGET: Duration = Duration::from_secs(2);
 
-    /// Which stop publisher the fixture runs: the shipping mutex-guarded one, or the unlocked
-    /// negative control.
+    /// Which publisher of a wake (a stop, or a path's nudge) the fixture runs: the shipping
+    /// mutex-guarded one, or the unlocked negative control.
     #[derive(Clone, Copy)]
     enum ShutdownPublisher {
         MutexGuarded,
@@ -451,8 +784,8 @@ mod tests {
     }
 
     fn project_shutdown_park(observed: &[ShutdownObservation]) -> aterm_spec::interp::State {
-        let park = observed.iter().position(|step| step.action == "Park");
-        let stop = observed.iter().position(|step| step.action == "Stop");
+        let at = |action: &str| observed.iter().position(|step| step.action == action);
+        let (park, stop, nudge) = (at("Park"), at("Stop"), at("Nudge"));
         aterm_spec::interp::State::from([
             ("checked", i64::from(park.is_none())),
             ("parked", i64::from(park.is_some())),
@@ -464,7 +797,550 @@ mod tests {
                 "notified",
                 i64::from(park.zip(stop).is_some_and(|(park, stop)| park < stop)),
             ),
+            ("nudged", i64::from(nudge.is_some())),
+            (
+                "woken",
+                i64::from(park.zip(nudge).is_some_and(|(park, nudge)| park < nudge)),
+            ),
         ])
+    }
+
+    /// A schedule that probes again only an hour after an Up, and at once for a path's return
+    /// (no settle and no gap).
+    fn slow_but_nudged() -> NetState {
+        NetState::with_cadence(
+            BUDGET,
+            netwatch::Cadence {
+                steady: Duration::from_secs(3600),
+                gap: Duration::ZERO,
+                settle: Duration::ZERO,
+            },
+        )
+    }
+
+    /// A probe that measures Up over a loopback listener that never accepts, and says each
+    /// resolve on a channel.
+    struct Answering {
+        listener: TcpListener,
+        resolved: Mutex<mpsc::Sender<()>>,
+    }
+
+    impl Answering {
+        fn new() -> (Arc<Self>, mpsc::Receiver<()>) {
+            let (tx, rx) = mpsc::channel();
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback");
+            (
+                Arc::new(Self {
+                    listener,
+                    resolved: Mutex::new(tx),
+                }),
+                rx,
+            )
+        }
+    }
+
+    impl Probe for Answering {
+        fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+            assert_eq!((host, port), (API_HOST, API_PORT));
+            let _ = self.resolved.lock().unwrap().send(());
+            Ok(vec![self.listener.local_addr()?])
+        }
+        fn connect(&self, addr: SocketAddr, within: Duration) -> io::Result<TcpStream> {
+            SystemProbe.connect(addr, within)
+        }
+        fn handshake(&self, _: TcpStream, _: &str, _: aterm_http::Deadline) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A path source that hands its sink to the test, counts the watches it started, and
+    /// says when the watch is dropped.
+    #[derive(Default)]
+    struct Handing {
+        sink: Mutex<Option<PathSink>>,
+        started: AtomicUsize,
+        dropped: Arc<AtomicBool>,
+    }
+
+    /// [`Handing`]'s watch: its drop is the stop's witness.
+    struct HandedWatch(Arc<AtomicBool>);
+
+    impl Drop for HandedWatch {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl PathSource for Handing {
+        fn watch(&self, sink: PathSink) -> Option<PathWatch> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            *self.sink.lock().unwrap() = Some(sink);
+            Some(Box::new(HandedWatch(Arc::clone(&self.dropped))))
+        }
+    }
+
+    impl Handing {
+        /// The watch reads the path: `satisfied`, on the calling thread.
+        fn read(&self, satisfied: bool) {
+            let sink = self.sink.lock().unwrap();
+            (sink.as_ref().expect("a watch started"))(PathEvent::Usable(satisfied));
+        }
+    }
+
+    /// The real probe loop, parked an hour after an Up, and `event` published at its checked,
+    /// mutex-held park boundary by `publisher`: the shipping [`NetProbe::path_moved`], or a
+    /// notification ahead of the nudge it announces. The event is a path's return (the path
+    /// lost before the park) or a route move (the path usable throughout). Either way the worker
+    /// then probes it (the unlocked one only once rescued) and stops.
+    fn nudge_at_park_trace(
+        publisher: ShutdownPublisher,
+        event: PathEvent,
+    ) -> Vec<ShutdownObservation> {
+        let (probe, resolved) = Answering::new();
+        let np = NetProbe::with_state(probe, slow_but_nudged());
+        let released = Arc::downgrade(&np);
+        let (t, w) = (Instant::now(), SystemTime::now());
+        {
+            let mut st = np.lock();
+            st.ask("s-1", t, w);
+            assert!(!st.path(true, t, w));
+            if event == PathEvent::Usable(true) {
+                assert!(
+                    !st.path(false, t, w),
+                    "PRECONDITION: a lost path owes no probe"
+                );
+            }
+        }
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let (checked_tx, checked_rx) = mpsc::channel();
+        let (park_tx, park_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = {
+            let np = Arc::clone(&np);
+            let trace = Arc::clone(&trace);
+            std::thread::spawn(move || {
+                let mut first_park = true;
+                np.run_before_park(|| {
+                    if first_park {
+                        first_park = false;
+                        checked_tx.send(()).unwrap();
+                        park_rx.recv().unwrap();
+                        trace
+                            .lock()
+                            .unwrap()
+                            .push(ShutdownObservation::read("Park", &np));
+                    }
+                });
+                done_tx.send(()).unwrap();
+            })
+        };
+        resolved
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the lease's first probe");
+        checked_rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("worker reached its checked, mutex-held park boundary after the Up");
+        let nudger = match publisher {
+            ShutdownPublisher::HistoricalUnlocked => {
+                np.wake.notify_all();
+                trace
+                    .lock()
+                    .unwrap()
+                    .push(ShutdownObservation::read("Nudge", &np));
+                None
+            }
+            ShutdownPublisher::MutexGuarded => {
+                let np = Arc::clone(&np);
+                let trace = Arc::clone(&trace);
+                Some(std::thread::spawn(move || {
+                    np.path_moved(event);
+                    trace
+                        .lock()
+                        .unwrap()
+                        .push(ShutdownObservation::read("Nudge", &np));
+                }))
+            }
+        };
+        park_tx.send(()).unwrap();
+        if matches!(publisher, ShutdownPublisher::HistoricalUnlocked) {
+            let owed = match event {
+                PathEvent::Usable(satisfied) => {
+                    np.lock().path(satisfied, Instant::now(), SystemTime::now())
+                }
+                PathEvent::Moved => np.lock().moved(Instant::now()),
+            };
+            assert!(
+                owed,
+                "the nudge its notification announced, published with no wake of its own"
+            );
+            let _state = np.lock();
+            np.wake.notify_all();
+        }
+        if let Some(nudger) = nudger {
+            nudger.join().unwrap();
+        }
+        resolved
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the parked worker woke and probed the path's return");
+        np.stop();
+        done_rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("stopped worker exits without another ask or probe");
+        worker.join().unwrap();
+        drop(np);
+        assert!(released.upgrade().is_none(), "no worker retains the probe");
+        Arc::try_unwrap(trace).unwrap().into_inner().unwrap()
+    }
+
+    /// A path's return reaches a probe thread parked for an hour: `path_moved` publishes the
+    /// owed probe and its wake under the state mutex, so the worker that checked its schedule
+    /// and parks wakes and probes the return at once (NudgedWaiterHasWake). A notification ahead
+    /// of the nudge, outside the mutex, is the model's `Buggy=2`, which the trace replays.
+    #[test]
+    fn a_paths_return_cannot_lose_the_park_wake_and_the_parked_probe_measures_it() {
+        let model = aterm_models_gui::netprobe_shutdown_park_model();
+        let observed =
+            nudge_at_park_trace(ShutdownPublisher::MutexGuarded, PathEvent::Usable(true));
+        assert_eq!(
+            observed.iter().map(|step| step.action).collect::<Vec<_>>(),
+            ["Park", "Nudge"]
+        );
+        let mut state = project_shutdown_park(&[]);
+        assert_eq!(state, model.init_state());
+        for (index, step) in observed.iter().enumerate() {
+            assert!(model.fire(step.action, &mut state), "{step:?}: {state:?}");
+            assert_eq!(state, project_shutdown_park(&observed[..=index]));
+            assert!(model.check_invariant("NudgedWaiterHasWake", &state));
+            assert!(model.check_invariant("StoppedWaiterHasWake", &state));
+        }
+
+        let old_order = nudge_at_park_trace(
+            ShutdownPublisher::HistoricalUnlocked,
+            PathEvent::Usable(true),
+        );
+        assert_eq!(
+            old_order.iter().map(|step| step.action).collect::<Vec<_>>(),
+            ["Nudge", "Park"]
+        );
+        assert!(!model.action_enabled(old_order[0].action, &project_shutdown_park(&[])));
+        let mutant = aterm_spec::interp::with_buggy(&model, 2);
+        let mut state = project_shutdown_park(&[]);
+        assert_eq!(state, mutant.init_state());
+        for (index, step) in old_order.iter().enumerate() {
+            assert!(mutant.fire(step.action, &mut state));
+            assert_eq!(state, project_shutdown_park(&old_order[..=index]));
+        }
+        assert!(
+            !mutant.check_invariant("NudgedWaiterHasWake", &state),
+            "a notification ahead of the nudge must be caught"
+        );
+    }
+
+    /// A route move on a usable path reaches a probe thread parked for an hour the same way: it
+    /// publishes the owed probe and its wake under the state mutex (NudgedWaiterHasWake), so the
+    /// parked worker probes at once, and says so in one line; a notification ahead of it is the
+    /// model's `Buggy=2`.
+    #[test]
+    fn a_route_move_cannot_lose_the_park_wake_and_the_parked_probe_measures_it() {
+        let model = aterm_models_gui::netprobe_shutdown_park_model();
+        let observed = nudge_at_park_trace(ShutdownPublisher::MutexGuarded, PathEvent::Moved);
+        assert_eq!(
+            observed.iter().map(|step| step.action).collect::<Vec<_>>(),
+            ["Park", "Nudge"]
+        );
+        let mut state = project_shutdown_park(&[]);
+        for (index, step) in observed.iter().enumerate() {
+            assert!(model.fire(step.action, &mut state), "{step:?}: {state:?}");
+            assert_eq!(state, project_shutdown_park(&observed[..=index]));
+            assert!(model.check_invariant("NudgedWaiterHasWake", &state));
+        }
+        let old_order =
+            nudge_at_park_trace(ShutdownPublisher::HistoricalUnlocked, PathEvent::Moved);
+        let mutant = aterm_spec::interp::with_buggy(&model, 2);
+        let mut state = project_shutdown_park(&[]);
+        for step in &old_order {
+            assert!(mutant.fire(step.action, &mut state));
+        }
+        assert!(
+            !mutant.check_invariant("NudgedWaiterHasWake", &state),
+            "a notification ahead of the move's nudge must be caught"
+        );
+
+        let (probe, _resolved) = Answering::new();
+        let np = NetProbe::with_state(probe, slow_but_nudged());
+        let moved_lines = || {
+            crate::test_log::logged_while(|| np.path_moved(PathEvent::Moved))
+                .into_iter()
+                .filter(|line| line.starts_with("harness: the network's routes moved"))
+                .count()
+        };
+        assert_eq!(moved_lines(), 0, "no lease: nothing owed, nothing said");
+        let (t, w) = (Instant::now(), SystemTime::now());
+        np.lock().ask("s-1", t, w);
+        assert_eq!(moved_lines(), 1, "a move that owes a probe is said once");
+    }
+
+    /// The installed path source starts at the probe's first ask and only then, once; its
+    /// readings reach the schedule (a loss reads Down at once, a return wakes the parked
+    /// thread to probe it) and each change is logged once; stop drops the watch, and a stopped
+    /// probe starts none.
+    #[test]
+    fn the_first_ask_starts_the_path_watch_once_and_stop_drops_it() {
+        let (probe, resolved) = Answering::new();
+        let np = NetProbe::with_state(probe, slow_but_nudged());
+        np.watch_path();
+        let source = Arc::new(Handing::default());
+        assert!(np.path_from(Arc::clone(&source) as Arc<dyn PathSource>));
+        assert!(
+            !np.path_from(Arc::new(Handing::default())),
+            "one source, installed once"
+        );
+        assert_eq!(
+            source.started.load(Ordering::SeqCst),
+            0,
+            "not before an ask"
+        );
+        assert_eq!(np.ask("s-1"), Reach::Unknown);
+        assert_eq!(source.started.load(Ordering::SeqCst), 1, "the first ask");
+        resolved
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the first probe");
+        let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        while !matches!(np.ask("s-1"), Reach::Up { .. }) {
+            assert!(Instant::now() < until, "the first probe's Up never landed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(source.started.load(Ordering::SeqCst), 1, "only the first");
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&lines);
+        crate::test_log::observe(
+            move |record| {
+                let line = record.args().to_string();
+                if line.starts_with("harness: network path") {
+                    seen.lock().unwrap().push(line);
+                }
+            },
+            || {
+                source.read(true);
+                source.read(false);
+                assert!(
+                    matches!(
+                        np.lock().reach(Instant::now(), SystemTime::now()),
+                        Reach::Down { .. }
+                    ),
+                    "a lost path reads Down at once"
+                );
+                source.read(false);
+                source.read(true);
+            },
+        );
+        resolved
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the return woke the parked thread to probe it");
+        let lines = lines.lock().unwrap();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("network path lost"), "{lines:?}");
+        assert!(lines[1].contains("network path back"), "{lines:?}");
+        assert!(!source.dropped.load(Ordering::SeqCst));
+        np.stop();
+        assert!(
+            source.dropped.load(Ordering::SeqCst),
+            "stop drops the watch"
+        );
+        np.watch_path();
+        assert_eq!(
+            source.started.load(Ordering::SeqCst),
+            1,
+            "a stopped probe starts no watch"
+        );
+    }
+
+    /// A session the probe does not measure reads the path alone: its first read starts the
+    /// installed watch (once ever, shared with a later ask), and no read takes a lease, starts
+    /// the thread or probes the API host. A loss reads Down at once with a look owed, and the
+    /// return (no settle here) Unknown with none.
+    #[test]
+    fn a_path_only_read_starts_the_watch_once_and_probes_nothing() {
+        let (probe, resolved) = Answering::new();
+        let np = NetProbe::with_state(probe, slow_but_nudged());
+        assert_eq!(np.path_reach(), Reach::Unknown, "no source: no reading");
+        let source = Arc::new(Handing::default());
+        assert!(np.path_from(Arc::clone(&source) as Arc<dyn PathSource>));
+        assert_eq!(np.path_reach(), Reach::Unknown, "no reading yet");
+        assert_eq!(source.started.load(Ordering::SeqCst), 1, "the first read");
+        assert_eq!(np.path_reach(), Reach::Unknown);
+        assert_eq!(source.started.load(Ordering::SeqCst), 1, "only the first");
+        assert_eq!(np.path_landing(), None, "nothing lost");
+        source.read(true);
+        source.read(false);
+        let read = Instant::now();
+        let Reach::Down { since } = np.path_reach() else {
+            panic!("a lost path reads Down at once: {:?}", np.path_reach());
+        };
+        assert!(since <= read, "since the loss");
+        assert!(
+            np.path_landing().is_some_and(|at| at > read),
+            "a lost path owes a look"
+        );
+        source.read(true);
+        assert_eq!(np.path_reach(), Reach::Unknown, "the return, settled");
+        assert_eq!(np.path_landing(), None);
+        assert_eq!(np.spawned.load(Ordering::SeqCst), 0, "no thread");
+        assert!(!np.started.load(Ordering::SeqCst));
+        assert_eq!(np.lock().waiting(Instant::now()), 0, "no lease");
+        assert!(resolved.try_recv().is_err(), "nothing probed");
+        assert_eq!(
+            np.ask("s-1"),
+            Reach::Down { since },
+            "a measured session's return stands Down until a probe measures it"
+        );
+        assert_eq!(
+            source.started.load(Ordering::SeqCst),
+            1,
+            "an ask after a path-only read starts no second watch"
+        );
+        resolved
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the ask's probe");
+        np.stop();
+        assert!(source.dropped.load(Ordering::SeqCst), "stop drops it");
+        assert_eq!(np.path_reach(), Reach::Unknown, "the last reading stands");
+        assert_eq!(source.started.load(Ordering::SeqCst), 1, "none after stop");
+    }
+
+    /// A peek reads the verdict a measured session's ask would get, unasked: its first read
+    /// starts the installed path watch (once ever), and no peek takes a lease, starts the thread
+    /// or probes the API host. A path that can carry traffic reads no Up; a lost path reads Down
+    /// at once, and so does its return until a probe measures it; a measure reads as measured.
+    /// NEGATIVE CONTROL (run): with [`NetProbe::peek`]'s `watch_path` call removed, the first
+    /// peek starts no watch and the test fails at "the first peek".
+    #[test]
+    fn a_peek_reads_the_measured_verdict_with_no_lease_thread_or_probe() {
+        let (probe, resolved) = Answering::new();
+        let np = NetProbe::with_state(probe, slow_but_nudged());
+        assert_eq!(np.peek(), Reach::Unknown, "no source: nothing to read");
+        let source = Arc::new(Handing::default());
+        assert!(np.path_from(Arc::clone(&source) as Arc<dyn PathSource>));
+        assert_eq!(np.peek(), Reach::Unknown, "nothing read or measured yet");
+        assert_eq!(source.started.load(Ordering::SeqCst), 1, "the first peek");
+        source.read(true);
+        assert_eq!(np.peek(), Reach::Unknown, "a working path is no Up");
+        source.read(false);
+        let read = Instant::now();
+        let Reach::Down { since } = np.peek() else {
+            panic!("a lost path reads Down at once: {:?}", np.peek());
+        };
+        assert!(since <= read, "since the loss");
+        source.read(true);
+        assert_eq!(
+            np.peek(),
+            Reach::Down { since },
+            "the return stands Down until a probe measures it"
+        );
+        let measured = Instant::now();
+        np.settle(Outcome::Up, measured, SystemTime::now());
+        assert!(
+            matches!(np.peek(), Reach::Up { since } if since == measured),
+            "the measure reads as measured: {:?}",
+            np.peek()
+        );
+        assert_eq!(source.started.load(Ordering::SeqCst), 1, "only the first");
+        assert_eq!(np.spawned.load(Ordering::SeqCst), 0, "no thread");
+        assert!(!np.started.load(Ordering::SeqCst));
+        assert_eq!(np.lock().waiting(Instant::now()), 0, "no lease");
+        assert!(resolved.try_recv().is_err(), "nothing probed");
+        np.stop();
+    }
+
+    /// Network.framework's satisfiable path (a connection attempt brings it up, as an on-demand
+    /// VPN) reads usable, as a satisfied one does; an unsatisfied one does not, and an invalid
+    /// one says nothing. Only the route socket's moves are passed on.
+    #[test]
+    fn a_satisfiable_path_reads_usable_and_only_route_moves_pass() {
+        #[cfg(target_os = "macos")]
+        {
+            use aterm_objc::path_monitor::PathStatus;
+            assert_eq!(usable(PathStatus::Satisfied), Some(true));
+            assert_eq!(
+                usable(PathStatus::Satisfiable),
+                Some(true),
+                "a satisfiable path is one a connection brings up"
+            );
+            assert_eq!(usable(PathStatus::Unsatisfied), Some(false));
+            assert_eq!(usable(PathStatus::Invalid), None);
+        }
+        use crate::network_moved::Woke;
+        assert!(route_move(Woke::Route));
+        // No Windows build constructs `Woke::Browse` (its source is macOS's), tests included.
+        #[cfg(unix)]
+        assert!(!route_move(Woke::Browse));
+        for other in [Woke::Timer, Woke::Beacon, Woke::LocalNetwork] {
+            assert!(!route_move(other), "{other:?}");
+        }
+    }
+
+    /// [`RouteMoves`] passes each route move its watch hears on as one [`PathEvent::Moved`], and
+    /// once dropped its thread ends at the next wake, passing nothing more: its sink, which only
+    /// the thread holds, is released.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn route_moves_pass_each_route_move_and_end_once_dropped() {
+        use crate::network_moved::{Moved, Woke};
+        let moved = Arc::new(Moved::new());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&events);
+        let sink: Arc<dyn Fn(PathEvent) + Send + Sync> =
+            Arc::new(move |event| seen.lock().unwrap().push(event));
+        let held = Arc::downgrade(&sink);
+        let routes = RouteMoves::start(sink, moved.watch()).expect("the thread starts");
+        let until = |count: usize, what: &str| {
+            let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+            while events.lock().unwrap().len() < count {
+                assert!(Instant::now() < deadline, "{what}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        moved.tell(Woke::Route);
+        until(1, "the route move passed on");
+        moved.tell(Woke::Route);
+        until(2, "the next one too");
+        drop(routes);
+        moved.tell(Woke::Route);
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        while held.upgrade().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the dropped watch's thread never ended"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            *events.lock().unwrap(),
+            [PathEvent::Moved, PathEvent::Moved],
+            "nothing passed after the drop"
+        );
+    }
+
+    /// A path source whose watch cannot start is tried once, not at every read.
+    #[test]
+    fn a_watch_that_cannot_start_is_tried_once() {
+        #[derive(Default)]
+        struct Refusing(AtomicUsize);
+        impl PathSource for Refusing {
+            fn watch(&self, _: PathSink) -> Option<PathWatch> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                None
+            }
+        }
+        let (probe, _resolved) = Answering::new();
+        let np = NetProbe::with_state(probe, slow_but_nudged());
+        let source = Arc::new(Refusing::default());
+        assert!(np.path_from(Arc::clone(&source) as Arc<dyn PathSource>));
+        for _ in 0..3 {
+            assert_eq!(np.path_reach(), Reach::Unknown);
+        }
+        np.watch_path();
+        assert_eq!(source.0.load(Ordering::SeqCst), 1);
     }
 
     fn shutdown_at_park_trace(publisher: ShutdownPublisher) -> Vec<ShutdownObservation> {
@@ -572,6 +1448,60 @@ mod tests {
         assert!(
             !mutant.check_invariant("StoppedWaiterHasWake", &state),
             "the old notification before parking must be caught"
+        );
+    }
+
+    /// The probe thread's settle logs one line per change of the measured verdict, on the
+    /// thread that settled, and none for a repeat: Down, Down, Up, Up is two lines, the
+    /// second the Down→Up edge with the lease that was waiting.
+    #[test]
+    fn each_change_of_the_measured_reach_is_logged_once_and_a_repeat_is_not() {
+        const S: Duration = Duration::from_secs(1);
+        let probe = Arc::new(Seam::new(
+            Err(io::Error::other("this fixture must never resolve")),
+            Dial::Unreachable,
+            Dial::Unreachable,
+        ));
+        let np = NetProbe::with(probe, BUDGET);
+        let (t, w) = (Instant::now(), SystemTime::now());
+        assert_eq!(np.lock().ask("s-1", t, w), Reach::Unknown);
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&lines);
+        crate::test_log::observe(
+            move |record| {
+                let line = record.args().to_string();
+                if line.starts_with("harness: API reach") {
+                    seen.lock().unwrap().push(line);
+                }
+            },
+            || {
+                for (outcome, at) in [
+                    (Outcome::Down, 0),
+                    (Outcome::Down, 3),
+                    (Outcome::Up, 18),
+                    (Outcome::Up, 50),
+                ] {
+                    let began = t + at * S;
+                    assert!(np.lock().begin(began));
+                    np.settle(outcome, began + S / 10, w + at * S);
+                }
+            },
+        );
+        let lines = lines.lock().unwrap();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].contains("reach down (no fresh measure"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].contains("down→up after 18s") && lines[1].contains("1 waiting"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            np.lock().reach(t + 51 * S, w + 51 * S),
+            Reach::Up {
+                since: t + 18 * S + S / 10
+            }
         );
     }
 

@@ -210,6 +210,7 @@ fn grid_unscroll_with_scroll_region() {
     let outside = [0u16, 1, 6, 7];
     let before: Vec<String> = outside.iter().map(|&r| row_string(&grid, r)).collect();
 
+    let sb_before = grid.scrollback_lines();
     let unscrolled = grid.unscroll_from_scrollback(2);
     assert_eq!(
         unscrolled, 2,
@@ -224,10 +225,13 @@ fn grid_unscroll_with_scroll_region() {
         );
     }
 
-    assert!(
-        !row_string(&grid, 2).is_empty() || !row_string(&grid, 3).is_empty(),
-        "Scroll region top rows should have scrollback content"
+    let region: Vec<String> = (2..=5).map(|r| row_text(&grid, r)).collect();
+    assert_eq!(
+        region,
+        ["Scroll1", "Scroll2", "Scroll5", "Scroll6"],
+        "newest 2 history lines, oldest first, then the region's old top rows"
     );
+    assert_eq!(grid.scrollback_lines(), sb_before - 2);
 }
 
 #[test]

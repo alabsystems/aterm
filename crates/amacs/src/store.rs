@@ -123,6 +123,21 @@ impl Document {
         self.checkpoint_seq < self.head()
     }
 
+    /// Removing `closing` leaves another view, or detaches a document whose
+    /// head is already durable.
+    fn close_ready(&self, closing: &[DocumentViewId]) -> Result<bool, DocumentError> {
+        if closing.iter().any(|view| !self.views.contains_key(view)) {
+            return Err(DocumentError::UnknownView);
+        }
+        let closing_set = closing.iter().copied().collect::<BTreeSet<_>>();
+        let remaining = self
+            .views
+            .keys()
+            .filter(|view| !closing_set.contains(view))
+            .count();
+        Ok(remaining > 0 || !self.dirty())
+    }
+
     #[inline]
     fn snapshot(&self) -> DocumentSnapshot {
         DocumentSnapshot {
@@ -404,6 +419,20 @@ impl DocumentStore {
         self.transact(id, base, edits)
     }
 
+    /// Whether removing `closing` needs no checkpoint first: [`Self::prepare_close`]
+    /// would answer Ready. Asking starts no close and changes no phase.
+    pub fn close_ready(
+        &self,
+        id: DocumentId,
+        closing: &[DocumentViewId],
+    ) -> Result<bool, DocumentError> {
+        let document = self
+            .documents
+            .get(&id)
+            .ok_or(DocumentError::UnknownDocument)?;
+        document.close_ready(closing)
+    }
+
     /// Prepare removal of `closing`.
     pub fn prepare_close(
         &mut self,
@@ -414,20 +443,8 @@ impl DocumentStore {
             .documents
             .get_mut(&id)
             .ok_or(DocumentError::UnknownDocument)?;
-        if closing
-            .iter()
-            .any(|view| !document.views.contains_key(view))
-        {
-            return Err(DocumentError::UnknownView);
-        }
-        let closing_set = closing.iter().copied().collect::<BTreeSet<_>>();
-        let remaining = document
-            .views
-            .keys()
-            .filter(|view| !closing_set.contains(view))
-            .count();
         let requested = document.head();
-        if remaining > 0 || document.checkpoint_seq >= requested {
+        if document.close_ready(closing)? {
             return Ok(DocumentCloseReadiness::Ready { requested });
         }
         document.phase = match document.phase {
@@ -859,6 +876,39 @@ mod tests {
             assert_eq!(store.phase(id), phase);
             assert_eq!(store.dirty(id), Some(false));
         }
+    }
+
+    #[test]
+    fn asking_whether_a_close_is_ready_starts_no_close() {
+        let (mut store, id) = open();
+        let (first, second) = (DocumentViewId(7), DocumentViewId(8));
+        store.attach_view(id, first).unwrap();
+        store.attach_view(id, second).unwrap();
+        let base = store.snapshot(id).unwrap().seq;
+        let DocumentTxnOutcome::Committed { seq, .. } = store.transact(
+            id,
+            base,
+            vec![TextEdit {
+                range: 0..0,
+                insert: "x".into(),
+            }],
+        ) else {
+            panic!("commit");
+        };
+        assert_eq!(
+            store.close_ready(id, &[first]),
+            Ok(true),
+            "another view stays"
+        );
+        assert_eq!(store.close_ready(id, &[first, second]), Ok(false));
+        assert_eq!(store.phase(id), Some(DocumentPhase::Active));
+        assert_eq!(
+            store.close_ready(id, &[DocumentViewId(9)]),
+            Err(DocumentError::UnknownView)
+        );
+        store.checkpoint_ack(id, seq).unwrap();
+        assert_eq!(store.close_ready(id, &[first, second]), Ok(true));
+        assert_eq!(store.phase(id), Some(DocumentPhase::Active));
     }
 
     #[test]

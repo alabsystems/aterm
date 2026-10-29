@@ -6,6 +6,7 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 
 use aterm_types::control_verbs::{framing_of, Framing};
 
@@ -18,10 +19,35 @@ pub const REPLY_BYTES_MAX: usize = 16 * 1024 * 1024;
 /// The most rows a `Lines`/`Push` reply may declare.
 pub const REPLY_ROWS_MAX: usize = 1024 * 1024;
 
-/// One control connection.
+/// The longest [`dial`] waits for a connect the kernel has not completed. std's connect, which
+/// it replaces on Apple, had no bound.
+#[cfg(target_vendor = "apple")]
+const DIAL_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Connect to the Unix socket `sock`, its descriptor kept out of every child this process
+/// spawns from before the connect, so no child spawned while it connects holds a copy
+/// ([`Ctl::from_stream`] says why that matters): on Apple through
+/// [`aterm_uds::connect::until`], bounded by [`DIAL_BOUND`]. Elsewhere the mark is a no-op
+/// ([`aterm_uds::keep_out_of_children`]), so std's blocking connect is kept, which on Linux
+/// waits out a full listen backlog rather than refusing it.
+///
+/// # Errors
+/// The socket, the mark, or the connect.
+pub fn dial(sock: impl AsRef<Path>) -> io::Result<UnixStream> {
+    #[cfg(target_vendor = "apple")]
+    {
+        aterm_uds::connect::until(sock.as_ref(), std::time::Instant::now() + DIAL_BOUND)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        UnixStream::connect(sock)
+    }
+}
+
+/// One control connection: one descriptor, read through a buffer and written directly, kept out
+/// of every child this process spawns ([`aterm_uds::keep_out_of_children`]).
 pub struct Ctl {
-    reader: BufReader<UnixStream>,
-    writer: UnixStream,
+    stream: BufReader<UnixStream>,
     /// Latched on the first I/O failure. A stream that failed mid-request may be
     /// desynchronised, so nothing further is written to it and every later
     /// request answers the same way.
@@ -87,25 +113,26 @@ impl Ctl {
         Self::from_stream(owned_copy)
     }
 
-    /// Wrap an already-open stream.
+    /// Wrap an already-open stream, marking it so no child this process spawns holds a copy: on
+    /// macOS a child's exec-time close of its copy under a descriptor scan drains the socket for
+    /// good, and every later read of the reply answers `EBADF`.
     ///
     /// # Errors
-    /// If the stream cannot be cloned for the reader half.
+    /// The `fcntl(2)` errno of marking the descriptor.
     pub fn from_stream(stream: UnixStream) -> io::Result<Self> {
-        let reader = BufReader::new(stream.try_clone()?);
+        aterm_uds::keep_out_of_children(&stream)?;
         Ok(Self {
-            reader,
-            writer: stream,
+            stream: BufReader::new(stream),
             lost: false,
         })
     }
 
-    /// Connect to a control socket and authenticate with the instance token.
+    /// Connect to a control socket ([`dial`]) and authenticate with the instance token.
     ///
     /// # Errors
     /// The connect or the write.
     pub fn connect(sock: &str, token: &str) -> io::Result<Self> {
-        Self::authenticate(UnixStream::connect(sock)?, token)
+        Self::authenticate(dial(sock)?, token)
     }
 
     /// [`Ctl::connect`] with the instance's Owner token beside the socket, read only once the connect succeeded ([`aterm_ctl::connect_then_read_token`]).
@@ -121,18 +148,19 @@ impl Ctl {
     /// Present `token` on a connection just made.
     ///
     /// # Errors
-    /// The stream cannot be cloned for the reader half, or the write fails.
+    /// Marking the descriptor ([`Ctl::from_stream`]), or the write.
     pub(crate) fn authenticate(stream: UnixStream, token: &str) -> io::Result<Self> {
         let mut ctl = Self::from_stream(stream)?;
-        ctl.writer.write_all(format!("AUTH {token}\n").as_bytes())?;
-        ctl.writer.flush()?;
+        let s = ctl.stream.get_mut();
+        s.write_all(format!("AUTH {token}\n").as_bytes())?;
+        s.flush()?;
         Ok(ctl)
     }
 
     /// The underlying stream, for a caller that must bound a read.
     #[must_use]
-    pub const fn get_ref(&self) -> &UnixStream {
-        &self.writer
+    pub fn get_ref(&self) -> &UnixStream {
+        self.stream.get_ref()
     }
 
     /// Whether this connection is lost.
@@ -195,12 +223,13 @@ impl Ctl {
             ));
         }
         let sent = (|| {
-            self.writer.write_all(line.as_bytes())?;
-            self.writer.write_all(b"\n")?;
+            let s = self.stream.get_mut();
+            s.write_all(line.as_bytes())?;
+            s.write_all(b"\n")?;
             if !body.is_empty() {
-                self.writer.write_all(body)?;
+                s.write_all(body)?;
             }
-            self.writer.flush()
+            s.flush()
         })();
         self.guarded(sent)?;
         let verb = request_verb(line);
@@ -210,7 +239,7 @@ impl Ctl {
 
     fn read_line(&mut self) -> io::Result<String> {
         let mut s = String::new();
-        if self.reader.read_line(&mut s)? == 0 {
+        if self.stream.read_line(&mut s)? == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "aterm closed the control connection",
@@ -239,7 +268,7 @@ impl Ctl {
             Framing::Bytes => {
                 let n = count_after_ok(&header, REPLY_BYTES_MAX)?;
                 let mut body = Vec::new();
-                let read = std::io::Read::by_ref(&mut self.reader)
+                let read = std::io::Read::by_ref(&mut self.stream)
                     .take(n as u64)
                     .read_to_end(&mut body)?;
                 if read != n {

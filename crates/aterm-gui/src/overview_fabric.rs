@@ -156,10 +156,12 @@ fn mark_of(need: &str) -> Option<ChipMark> {
 }
 
 /// THE GROUP, COMPOSED at `now_ms`: one chip per need the group lists ([`mark_of`]), in the clause's own words (`aterm_slog::need_words`), its age the fold's at the read plus the time since (shown only).
+/// A read ahead of the current clock stays older and has no measured age.
 pub(crate) fn compose(snapshot: &FabricSnapshot, now_ms: u64) -> Vec<FabricChip> {
-    let read_age_ms = now_ms.saturating_sub(snapshot.read_at_ms);
-    let since_read = read_age_ms / 1000;
-    let stale = u128::from(read_age_ms) > crate::fleet_glance::COUNT_FRESH.as_millis();
+    let read_age_ms = now_ms.checked_sub(snapshot.read_at_ms);
+    let since_read = read_age_ms.map(|age| age / 1000);
+    let stale = read_age_ms
+        .is_none_or(|age| u128::from(age) > crate::fleet_glance::COUNT_FRESH.as_millis());
     snapshot
         .needs
         .iter()
@@ -173,7 +175,10 @@ pub(crate) fn compose(snapshot: &FabricSnapshot, now_ms: u64) -> Vec<FabricChip>
                 mark,
                 need: n.need.clone(),
                 words,
-                age_s: n.age_s.map(|a| a.saturating_add(since_read)),
+                age_s: n
+                    .age_s
+                    .zip(since_read)
+                    .map(|(a, elapsed)| a.saturating_add(elapsed)),
                 older: stale || n.gone,
             })
         })

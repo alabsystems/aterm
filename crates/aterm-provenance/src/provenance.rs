@@ -10,7 +10,7 @@ use crate::origin::{Origin, Pty};
 /// A value tagged with its static origin `O` (invariant, `#[repr(transparent)]`).
 #[repr(transparent)]
 pub struct Provenance<T: ?Sized, O: Origin> {
-    // Placed before `value` so unsized `T` (`[u8]`, `str`) can trail.
+    // Placed before `value` because Rust requires a struct's unsized field (`[u8]`, `str`) to come last.
     pub(crate) _origin: PhantomData<fn() -> O>,
     pub(crate) value: T,
 }
@@ -58,7 +58,7 @@ impl<T> Provenance<T, Pty> {
 }
 
 impl<T: ?Sized, O: Origin> Provenance<T, O> {
-    /// Borrow the inner value explicitly (does not implement `AsRef` or `Deref`).
+    /// Borrow the inner value without its [`Origin`] tag (does not implement `AsRef` or `Deref`).
     #[allow(clippy::should_implement_trait)]
     #[inline]
     #[must_use]

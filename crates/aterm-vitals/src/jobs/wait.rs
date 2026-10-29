@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier A kernel-fact wait classification and Tier B sampled leaf-frame mapping.
+//! Tier A kernel-fact wait classification and the Tier B words a sampled stack names.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -60,28 +60,6 @@ impl TierB {
             Self::Children => WaitName::Children,
             Self::Unparsed => WaitName::NamedUnparsed,
         }
-    }
-}
-
-/// Maps one leaf frame of a waiting thread to its [`TierB`] classification.
-#[must_use]
-pub fn map_leaf_frame(frame: &str) -> TierB {
-    let sym = frame.split_whitespace().next().unwrap_or("");
-    let sym = sym.split('$').next().unwrap_or(sym);
-    let sym = sym.strip_suffix("_nocancel").unwrap_or(sym);
-    let sym = sym.trim_start_matches('_');
-    match sym {
-        "semwait_signal" | "nanosleep" | "usleep" | "sleep" => TierB::Timer,
-        "flock" | "fcntl" => TierB::Lock,
-        "read" | "readv" | "pread" => TierB::Read,
-        "select" | "pselect" | "poll" | "kevent" | "kevent64" | "kevent_qos" | "kevent_id" => {
-            TierB::Event
-        }
-        "psynch_mutexwait" | "psynch_cvwait" | "psynch_rw_rdlock" | "psynch_rw_wrlock"
-        | "ulock_wait" | "ulock_wait2" => TierB::Mutex,
-        "sigsuspend" | "wait4" | "waitpid" => TierB::Children,
-        s if s.starts_with("mach_msg") => TierB::Ipc,
-        _ => TierB::Unparsed,
     }
 }
 

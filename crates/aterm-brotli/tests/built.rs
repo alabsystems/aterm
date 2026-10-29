@@ -237,6 +237,11 @@ fn an_error_ends_the_stream_for_good() {
     let br = copy_stream(5);
     let mut decoder = aterm_brotli::Decoder::new(&br[..]);
     assert!(decoder.read(&mut buf).is_err());
+    assert_eq!(
+        decoder.decoded(),
+        0,
+        "bytes written inside a failed step are rolled back from decoded()"
+    );
     assert!(
         decoder.read(&mut buf).is_err(),
         "nothing the failed step wrote"

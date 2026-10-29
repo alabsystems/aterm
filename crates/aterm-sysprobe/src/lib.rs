@@ -368,6 +368,61 @@ pub fn group_memory(pid: u32) -> Option<GroupMemory> {
     }
 }
 
+/// What one member of a process group has used since it started ([`group_usage`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemberUsage {
+    /// Its pid.
+    pub pid: u32,
+    /// When it started (macOS `ri_proc_start_abstime`, Mach absolute ticks): with [`Self::pid`],
+    /// which process this is, so a pid taken anew reads as another member.
+    pub start: u64,
+    /// User plus system CPU time, ns.
+    pub cpu_ns: u64,
+    /// Time its threads were runnable, on a core or waiting for one, ns (`ri_runnable_time`).
+    pub runnable_ns: u64,
+    /// Bytes it read from storage, wrote to storage, and wrote through any descriptor
+    /// (`ri_diskio_bytesread + ri_diskio_byteswritten + ri_logical_writes`, saturating).
+    pub io_bytes: u64,
+    /// Its physical footprint now, bytes (`ri_phys_footprint`): the memory it holds, the pages
+    /// the kernel compressed or swapped out included, so the memory it would have resident again.
+    pub footprint: u64,
+    /// The largest physical footprint it has had since it started, bytes
+    /// (`ri_lifetime_max_phys_footprint`), which the kernel keeps between two reads.
+    pub peak_footprint: u64,
+}
+
+/// What each member of process group `pgid` has used ([`MemberUsage`]), read now: the first
+/// [`MAX_GROUP_PIDS`] members the kernel lists, less those it will not answer for (another
+/// user's), an unreaped zombie's final figures included. `None` for pgid 0 or past `i32::MAX`,
+/// when the listing fails, and off macOS.
+#[must_use]
+pub fn group_usage(pgid: u32) -> Option<Vec<MemberUsage>> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::group_usage(pgid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pgid;
+        None
+    }
+}
+
+/// How long since a person last moved this Mac's mouse or pressed a key (IOKit's `IOHIDSystem`
+/// `HIDIdleTime`, read from the IORegistry: no WindowServer connection). `None` where unread, and
+/// off macOS.
+#[must_use]
+pub fn hid_idle() -> Option<std::time::Duration> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::hid_idle()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// The machine's physical memory in MiB (`hw.memsize` on macOS, `MemTotal` in `/proc/meminfo` on Linux), `None` where unknown.
 #[must_use]
 pub fn physical_memory_mib() -> Option<u64> {
@@ -477,6 +532,17 @@ pub fn machine_memory() -> Option<MachineMemory> {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         None
+    }
+}
+
+/// Cap a MiB reading at `physical_mib` when the host's physical memory is known.
+#[cfg(any(target_os = "macos", test))]
+#[inline]
+#[must_use]
+pub(crate) const fn clamp_physical_mib(mib: u64, physical_mib: Option<u64>) -> u64 {
+    match physical_mib {
+        Some(p) if p < mib => p,
+        _ => mib,
     }
 }
 

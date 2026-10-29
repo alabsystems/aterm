@@ -2522,7 +2522,7 @@ mod tests {
         );
         assert_eq!(document.source_len, source.len());
         assert!(document.blocks.iter().all(|block| {
-            block.source().start <= block.source().end && block.source().end <= source.len()
+            block.source().start < block.source().end && block.source().end <= source.len()
         }));
     }
 

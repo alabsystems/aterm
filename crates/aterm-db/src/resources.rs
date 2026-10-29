@@ -47,12 +47,28 @@ impl Resources {
 
     /// Retain this installation's immutable pin and enroll its resource table.
     /// A conflicting pin or existing debit never authorizes a fresh allocation.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbResourceReservation",
+            action = "LostCustody",
+            project = "aterm_db::resources::tests::reservation_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbResourceReservation",
+            action = "Reenrolled",
+            project = "aterm_db::resources::tests::reservation_transition"
+        )
+    )]
     pub fn initialize(&self) -> Result<Scope> {
-        self.check_existing_pin()?;
-        self.with_store(true, |session, store, scope| {
+        let pinned = self.check_existing_pin()?.is_some();
+        self.with_store(!pinned, |session, store, scope| {
             session.writer()?;
             ledger::Ledger::read(&self.allocation, session, store)?;
-            self.pin(true)?;
+            self.pin(session, store, true)?;
             Ok(scope)
         })
     }
@@ -60,8 +76,8 @@ impl Resources {
     /// Read conservative locally retained accounting. This is not a global
     /// provider balance and an absent peer's unused share is never available here.
     pub fn snapshot(&self) -> Result<Snapshot> {
-        self.with_store(false, |session, store, _| {
-            self.pin(false)?;
+        self.observe_store(|session, store, _| {
+            self.pin(session, store, false)?;
             Ok(ledger::Ledger::read(&self.allocation, session, store)?.snapshot(&self.allocation))
         })
     }
@@ -156,7 +172,7 @@ impl Resources {
             ));
         }
         self.with_store(false, |session, store, _| {
-            self.pin(false)?;
+            self.pin(session, store, false)?;
             session.writer()?;
             let ledger = ledger::Ledger::read(&self.allocation, session, store)?;
             if let Some(old) = ledger.request(&session.actor(), &request) {
@@ -174,7 +190,7 @@ impl Resources {
                 });
             }
             let debit = self.new_debit(session, &ledger, request, cost)?;
-            let receipt = store.commit_catalog(session, &debit.encode())?;
+            let receipt = store.commit_liability(session, &debit.encode())?;
             Ok(Reservation {
                 receipt,
                 fresh: true,
@@ -230,35 +246,59 @@ impl Resources {
         )
     }
 
+    fn observe_store<T>(
+        &self,
+        action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
+    ) -> Result<T> {
+        crate::documents::application::observe_store(
+            &self.paths,
+            |bootstrap| {
+                if bootstrap.trust() != self.allocation.trust() {
+                    return Err(Error::new(
+                        "resource activation belongs to another Commons root",
+                    ));
+                }
+                descriptor(bootstrap, &self.allocation)
+            },
+            action,
+        )
+    }
+
     fn pin_path(&self) -> std::path::PathBuf {
         self.paths
             .dir
             .join("commons/resource-pins")
             .join(hex::encode_lower(&window_id(&self.allocation)))
     }
-    fn check_existing_pin(&self) -> Result<()> {
-        if let Some(bytes) =
-            fsx::read_private(&self.pin_path(), 37).map_err(crate::table::failure)?
-            && bytes.as_slice() != self.pin_bytes()
+    fn check_existing_pin(&self) -> Result<Option<Digest>> {
+        let Some(bytes) = fsx::read_private(&self.pin_path(), 69).map_err(crate::table::failure)?
+        else {
+            return Ok(None);
+        };
+        let bytes = bytes.as_slice();
+        if bytes.len() == 37 && bytes.starts_with(b"ARAP1") {
+            return Err(Error::new(
+                "legacy resource pin has no custody binding; audited migration is required",
+            ));
+        }
+        if bytes.len() != 69 || !bytes.starts_with(b"ARAP2") || bytes[5..37] != self.allocation.id()
         {
             return Err(Error::new(
                 "this resource window already has another retained allocation pin",
             ));
         }
-        Ok(())
+        Ok(Some(bytes[37..].try_into().unwrap()))
     }
-    fn pin_bytes(&self) -> Vec<u8> {
-        let mut bytes = b"ARAP1".to_vec();
+    fn pin_bytes(&self, custody: Digest) -> Vec<u8> {
+        let mut bytes = b"ARAP2".to_vec();
         bytes.extend_from_slice(&self.allocation.id());
+        bytes.extend_from_slice(&custody);
         bytes
     }
-    fn pin(&self, create: bool) -> Result<()> {
+    fn pin(&self, session: &Session<'_>, store: &Store, create: bool) -> Result<()> {
         let path = self.pin_path();
-        self.check_existing_pin()?;
-        if fsx::read_private(&path, 37)
-            .map_err(crate::table::failure)?
-            .is_none()
-        {
+        let custody = store.custody_id(session)?;
+        if self.check_existing_pin()?.is_none() {
             if !create {
                 return Err(Error::new(
                     "resource activation pin is not retained locally",
@@ -268,14 +308,20 @@ impl Resources {
                 .parent()
                 .ok_or_else(|| Error::new("invalid resource pin directory"))?;
             aterm_journal::create_private_dir_durable(dir)?;
-            fsx::write_new(&path, &self.pin_bytes(), 0o600).map_err(crate::table::failure)?;
-            aterm_durable::durable_dir(dir)?;
+            fsx::write_new(&path, &self.pin_bytes(custody), 0o600)
+                .map_err(crate::table::failure)?;
         }
-        let bytes = fsx::read_private(&path, 37)
-            .map_err(crate::table::failure)?
+        let pinned = self
+            .check_existing_pin()?
             .ok_or_else(|| Error::new("resource activation pin was not retained"))?;
-        if bytes.as_slice() != self.pin_bytes() {
-            return Err(Error::new("resource activation pin changed"));
+        if pinned != custody {
+            return Err(Error::new(
+                "resource table custody differs from its retained activation pin",
+            ));
+        }
+        if create {
+            // Finish a possible earlier link whose directory barrier failed.
+            aterm_durable::durable_dir(path.parent().unwrap())?;
         }
         Ok(())
     }

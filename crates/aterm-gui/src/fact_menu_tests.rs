@@ -89,7 +89,111 @@ fn account_recovery_notes_follow_the_observation_not_the_policy_switch() {
     };
     assert_eq!(notes(&before), notes(&after));
     facts.account_progress.as_mut().unwrap().next_at = None;
-    assert_ne!(notes(&after), notes(&rows(Fact::Account, &facts)));
+    let unknown = notes(&rows(Fact::Account, &facts));
+    assert_eq!(
+        notes(&after).len(),
+        unknown.len(),
+        "unknown timing must remain visible"
+    );
+    assert_ne!(notes(&after), unknown);
+    for at in [0, -1] {
+        let progress = facts.account_progress.as_mut().unwrap();
+        progress.observed_at = at;
+        progress.next_at = Some(at);
+        assert!(
+            !notes(&rows(Fact::Account, &facts))
+                .iter()
+                .any(|line| line.contains(&aterm_agent::harness::usage::rfc3339_utc(at)))
+        );
+    }
+}
+
+#[test]
+fn recovery_copy_preserves_full_evidence_and_stays_reachable_in_a_short_menu() {
+    use aterm_agent::harness::account_progress::{AccountProgress, ProgressPhase};
+    let mut progress = AccountProgress::unknown(100);
+    progress.phase = ProgressPhase::SigningIn {
+        label: "current".into(),
+        route: Some("browser".into()),
+    };
+    progress.account = Some("current".into());
+    progress.known = Some(2);
+    progress.eligible = Some(0);
+    progress.wall = Some("weekly".into());
+    progress.next_at = Some(160);
+    let detail = "current: no usable sign-in route; profile(none) mailbox(none configured) vault(no new credential) hosts(none configured)";
+    progress.details = vec![detail.into(); 30];
+    let before = progress.clone();
+    let report = super::recovery_report(&progress);
+    assert!(report.contains(detail));
+    assert_eq!(report.matches(detail).count(), 30);
+    for at in [100, 160] {
+        assert!(report.contains(&aterm_agent::harness::usage::rfc3339_utc(at)));
+    }
+    assert!(
+        report.contains(&aterm_agent::harness::footer::account_progress_phase(
+            &progress
+        ))
+    );
+    assert_eq!(progress, before);
+    for at in [0, -1] {
+        let mut unknown = AccountProgress::unknown(at);
+        unknown.next_at = Some(at);
+        let report = super::recovery_report(&unknown);
+        assert!(
+            !report.contains(&aterm_agent::harness::usage::rfc3339_utc(at)),
+            "an unknown clock must not become an epoch date"
+        );
+    }
+    let mut facts = menu_facts(FactMask::default(), false);
+    facts.account_progress = Some(progress);
+    for next_at in [Some(160), None] {
+        facts.account_progress.as_mut().unwrap().next_at = next_at;
+        let rows = rows(Fact::Account, &facts);
+        let copy = rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row,
+                    MenuRow::Item {
+                        act: MenuAct::Fact(Fact::Account, FactAct::CopyRecovery),
+                        enabled: true,
+                        ..
+                    }
+                )
+            })
+            .expect("copy action");
+        let next_line = super::recovery_next_line(next_at);
+        let next = rows
+            .iter()
+            .position(|row| {
+                matches!(row,
+            MenuRow::Note { text, .. } if text == &next_line)
+            })
+            .expect("timing row");
+        for cols in [40, 60, 120] {
+            let rect =
+                crate::autopilot_menu::place(&rows, (12, 0), (0..14, 0..cols), (cols, 14), 0)
+                    .expect("short account menu");
+            assert!(
+                copy < rect.h - 2,
+                "long notes must not hide the copy action"
+            );
+            assert!(next < rect.h - 2, "long notes must not hide the timing row");
+        }
+    }
+    facts.account_progress = None;
+    assert!(
+        !super::rows(Fact::Account, &facts)
+            .iter()
+            .any(|row| matches!(
+                row,
+                MenuRow::Item {
+                    act: MenuAct::Fact(Fact::Account, FactAct::CopyRecovery),
+                    ..
+                }
+            ))
+    );
 }
 
 fn shown(rows: &[MenuRow]) -> Vec<String> {
@@ -579,6 +683,7 @@ fn an_account_rows_store_figure_carries_its_age() {
             &roster,
             &state,
             &enrolled,
+            true,
             None,
             None,
             SessionWeek::default(),
@@ -617,6 +722,7 @@ fn an_account_rows_store_figure_carries_its_age() {
         &roster,
         &accounts::State::default(),
         &enrolled,
+        true,
         Some("main"),
         None,
         SessionWeek {
@@ -654,6 +760,7 @@ fn an_account_rows_store_figure_carries_its_age() {
             &roster,
             &state,
             &enrolled,
+            true,
             session,
             None,
             SessionWeek {
@@ -700,6 +807,7 @@ fn an_account_rows_store_figure_carries_its_age() {
             &roster,
             &state,
             &enrolled,
+            true,
             Some("main"),
             None,
             SessionWeek {
@@ -758,6 +866,7 @@ fn an_account_rows_store_figure_carries_its_age() {
             &roster,
             &state,
             &enrolled,
+            true,
             label,
             email,
             SessionWeek {
@@ -854,6 +963,7 @@ fn the_sessions_week_reaches_the_row_its_login_is_judged_to() {
             &roster,
             &state,
             &enrolled,
+            true,
             None,
             email,
             SessionWeek {
@@ -946,19 +1056,47 @@ fn account_menu_shows_weekly_meter_and_rotation_accounts() {
         ..menu_facts(FactMask::default(), true)
     };
     let menu = rows(Fact::Account, &facts);
+    for value in [&facts.subscription, &facts.weekly_meter]
+        .into_iter()
+        .flatten()
+    {
+        assert!(
+            menu.iter()
+                .any(|row| matches!(row, MenuRow::Note { text, .. } if text.ends_with(value)))
+        );
+    }
+    let actions: Vec<_> = menu
+        .iter()
+        .filter_map(|row| match row {
+            MenuRow::Item {
+                act: MenuAct::Fact(Fact::Account, act),
+                enabled,
+                checked,
+                ..
+            } => Some((*act, *enabled, *checked)),
+            _ => None,
+        })
+        .collect();
     assert_eq!(
-        shown(&menu),
+        actions,
         [
-            "header Accounts \u{b7} tab 1",
-            "note \u{2386}  sol-m27@example.test \u{b7} max 20x",
-            "note \u{25f7}  \u{25b1}\u{25b1}\u{25b1}\u{25b1}\u{25b1}  weekly 0% left",
-            "rule",
-            "\u{2386} m27 \u{b7} dedicated \u{b7} 0% left (limited) [fact-menu/account/use/m27] true",
-            "\u{2386} m27-2 \u{b7} dedicated \u{b7} 100% left (auto-login) [fact-menu/account/use/m27-2] true",
-            "\u{2386} m27-3 \u{b7} pool \u{b7} 100% left (auto-login) [fact-menu/account/use/m27-3] true",
-            "rule",
-            "\u{21bb} Allow automatic selection [fact-menu/account/auto-rotate] true",
-            "\u{22ef} Account settings\u{2026} [fact-menu/account/account-settings] true",
+            (
+                FactAct::UseAccount(AccountLabel::new("m27").unwrap()),
+                true,
+                true
+            ),
+            (
+                FactAct::UseAccount(AccountLabel::new("m27-2").unwrap()),
+                true,
+                false
+            ),
+            (
+                FactAct::UseAccount(AccountLabel::new("m27-3").unwrap()),
+                true,
+                false
+            ),
+            (FactAct::AutoRotate, true, true),
+            (FactAct::AccountSettings, true, false),
         ]
     );
 
@@ -1089,6 +1227,7 @@ fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
         &roster,
         &state,
         &enrolled,
+        true,
         Some("m15-2"),
         Some("m15-2@example.test"),
         SessionWeek {
@@ -1121,6 +1260,136 @@ fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
     );
     assert!(menu_rows[0].label.contains("0%"));
     assert!(menu_rows[1..].iter().all(|row| !row.label.contains('%')));
+    assert!(
+        menu_rows[3].label.ends_with("signed out (auto-login)"),
+        "{menu_rows:?}"
+    );
+
+    // Where no row signs in by itself (Grok Build's pool), a row with an email that is signed
+    // out or not enrolled is as one with none: it names its condition and cannot be chosen.
+    let (menu_rows, _) = account_menu_rows_from(
+        &roster,
+        &state,
+        &enrolled,
+        false,
+        Some("m15-2"),
+        Some("m15-2@example.test"),
+        SessionWeek::default(),
+        NOW,
+    );
+    assert_eq!(
+        menu_rows.iter().map(|row| row.enabled).collect::<Vec<_>>(),
+        [true, false, false, false, false]
+    );
+    assert!(
+        menu_rows
+            .iter()
+            .all(|row| !row.label.contains("auto-login")),
+        "{menu_rows:?}"
+    );
+}
+
+/// A GROK SESSION'S ACCOUNT MENU OFFERS NO AUTOMATIC SIGN-IN: no Grok renewal starts in the
+/// background (`Cli::renews_headlessly`), so a Grok row with an email that is not enrolled here
+/// cannot be chosen, where choosing it would start nothing. CONTROL: the same row in Kimi's pool
+/// can be chosen, its renewal starting by itself.
+#[test]
+fn a_grok_pools_menu_offers_no_automatic_sign_in() {
+    use aterm_agent::harness::accounts::Cli;
+    const NOW: i64 = 1_792_660_000;
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-pool-menu-")
+        .tempdir()
+        .expect("tempdir");
+    let root = dir.path();
+    let (home, config, state) = (root.join("home"), root.join("config"), root.join("state"));
+    for d in [&home, &config, &state] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let aterm_toml = config.join("aterm.toml");
+    std::fs::write(&aterm_toml, "[fleet]\nmachine = \"m16\"\n").unwrap();
+    for (cli, extra) in [(Cli::Grok, ""), (Cli::Kimi, "region = \"global\"\n")] {
+        let id = cli.id();
+        let login = home.join(format!(".aterm/logins/{id}/{id}-1"));
+        std::fs::write(
+            config.join(format!("accounts-{id}.toml")),
+            format!(
+                "[[account]]\nlabel = \"{id}-1\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+                 email = \"{id}-one@example.com\"\n{extra}",
+                login.display()
+            ),
+        )
+        .unwrap();
+        let (rows, _) =
+            super::pool_menu_rows(cli, (&aterm_toml, &state, &home), (None, None), NOW).unwrap();
+        assert_eq!(rows.len(), 1, "{id}: {rows:?}");
+        assert_eq!(rows[0].enabled, cli != Cli::Grok, "{id}: {rows:?}");
+    }
+}
+
+/// A CODEX POOL'S DEFAULT ROW is signed in here only while `~/.codex/auth.json` is there: with
+/// it gone the menu says the row is not enrolled and offers no switch to it, as a launch passes
+/// it over (`accounts::enrolled_in`). CONTROL: with the file back the row is offered again.
+#[test]
+fn a_default_rows_menu_entry_follows_its_login_file() {
+    use aterm_agent::harness::accounts::{Cli, PinSelection, Roster, Store};
+    const NOW: i64 = 1_792_660_000;
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-pool-menu-default-")
+        .tempdir()
+        .expect("tempdir");
+    let root = dir.path();
+    let (home, config, state) = (root.join("home"), root.join("config"), root.join("state"));
+    for d in [&home, &config, &state] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let aterm_toml = config.join("aterm.toml");
+    std::fs::write(&aterm_toml, "[fleet]\nmachine = \"m16\"\n").unwrap();
+    let work = home.join(".aterm/logins/codex/work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("auth.json"), "{}").unwrap();
+    std::fs::write(
+        config.join("accounts-codex.toml"),
+        format!(
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n[[account]]\n\
+             label = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
+            work.display()
+        ),
+    )
+    .unwrap();
+    let main_row = || {
+        let (rows, _) =
+            super::pool_menu_rows(Cli::Codex, (&aterm_toml, &state, &home), (None, None), NOW)
+                .unwrap();
+        rows.into_iter()
+            .find(|row| row.account.as_str() == "main")
+            .expect("main's row")
+    };
+    // The menu's pin path agrees: no pin on a row a launch would refuse.
+    let roster_path = config.join("accounts-codex.toml");
+    let select = || {
+        let roster = Roster::load_for(Cli::Codex, &roster_path).unwrap();
+        Store::at_for(&state, Cli::Codex, &home).select_account_for(
+            Cli::Codex,
+            &roster,
+            &roster_path,
+            "main",
+            NOW,
+        )
+    };
+    let gone = main_row();
+    assert!(gone.label.contains("not enrolled"), "{gone:?}");
+    assert!(!gone.enabled, "{gone:?}");
+    assert!(select().is_err(), "a row not signed in here is not pinned");
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    std::fs::write(home.join(".codex/auth.json"), "{}").unwrap();
+    let back = main_row();
+    assert!(!back.label.contains("not enrolled"), "{back:?}");
+    assert!(back.enabled, "{back:?}");
+    assert!(
+        matches!(select(), Ok(PinSelection::Pinned)),
+        "signed in again, it is pinned"
+    );
 }
 
 /// A KIMI SESSION'S ACCOUNT MENU lists the rows of Kimi's own roster (`accounts-kimi.toml`),
@@ -1254,16 +1523,10 @@ fn a_muse_sessions_account_menu_is_its_own_login() {
             .any(|row| row.contains("Refresh usage") && row.contains("refresh-usage")),
         "{menu:?}"
     );
-    for borrowed in [
-        "rotation accounts",
-        "automatic selection",
-        "Account settings",
-    ] {
-        assert!(
-            !menu.iter().any(|row| row.contains(borrowed)),
-            "{borrowed} borrowed from the pool: {menu:?}"
-        );
-    }
+    assert!(rows(Fact::Account, &facts).iter().all(|row| match row {
+        MenuRow::Item { act, .. } => *act == MenuAct::Fact(Fact::Account, FactAct::RefreshUsage),
+        _ => true,
+    }));
     let plain = FactMenuFacts {
         title: "Accounts \u{b7} tab 1".into(),
         refresh_usage: false,

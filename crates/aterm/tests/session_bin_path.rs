@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE `--session` LANE HANDS ITS SHELL THE MANAGED `bin/`, LAST AND ONCE, FROM ITS FIRST BYTE
-//! (`crates/aterm/src/main.rs`, through `atpkg::session_bin_dir` and
-//! `atpkg::store::append_bin_to_path`): a script, an agent or a shell that never sources the hook
-//! still finds a tool once its shim lands, and a managed tool never shadows a system one.
+//! THE `--session` LANE HANDS ITS SHELL THE MANAGED `bin/`, AHEAD OF `/usr/bin` AND ONCE, FROM ITS
+//! FIRST BYTE (`crates/aterm/src/main.rs`, through `atpkg::session_bin_dir` and
+//! `atpkg::store::prepend_bin_to_path`): a script, an agent or a shell that never sources the hook
+//! still finds a tool (`git`, `gh`) once its shim lands, ahead of Apple's `/usr/bin/git` CLT stub.
 
 use std::io::Write as _;
 use std::process::Stdio;
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::launch_isolation;
 
-/// The PATH `aterm --session` hands `/bin/sh` over `root`, from `PATH=/usr/bin:/bin`.
+/// The PATH `aterm --session` hands `/bin/sh` over `root`, from `PATH=/usr/bin:/bin:/custom/after-system`.
 fn session_path(root: &std::path::Path) -> String {
     #[expect(
         clippy::disallowed_types,
@@ -21,7 +21,7 @@ fn session_path(root: &std::path::Path) -> String {
     let mut cmd = std::process::Command::new(launch_isolation::aterm_executable());
     launch_isolation::apply(&mut cmd, root);
     cmd.args(["--session", launch_isolation::NO_REROUTE])
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", "/usr/bin:/bin:/custom/after-system")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -68,14 +68,25 @@ fn a_session_hands_its_shell_the_managed_bin_last_and_once_where_the_hook_is() {
     std::fs::write(shell_d.join(hook), "# the seed's hook\n").expect("write the hook");
     let surfaced = session_path(root.path());
     let entries: Vec<&str> = surfaced.split(':').collect();
-    assert_eq!(entries.last(), Some(&bin), "bin/ last: {surfaced:?}");
+    let bin_pos = entries
+        .iter()
+        .position(|entry| *entry == bin)
+        .unwrap_or_else(|| panic!("bin/ present: {surfaced:?}"));
+    let custom_pos = entries
+        .iter()
+        .position(|entry| *entry == "/custom/after-system")
+        .unwrap_or_else(|| panic!("/custom/after-system present: {surfaced:?}"));
+    assert!(
+        bin_pos < custom_pos,
+        "bin/ sits ahead of inherited non-system entries (append_bin_to_path would trail them): {surfaced:?}"
+    );
+    assert!(
+        entries.contains(&"/usr/bin") && entries.contains(&"/bin"),
+        "system entries remain on PATH: {surfaced:?}"
+    );
     assert_eq!(
         entries.iter().filter(|entry| **entry == bin).count(),
         1,
         "bin/ once: {surfaced:?}"
-    );
-    assert!(
-        entries.contains(&"/usr/bin") && entries.contains(&"/bin"),
-        "the inherited PATH stays ahead of it: {surfaced:?}"
     );
 }

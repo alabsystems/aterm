@@ -13,7 +13,7 @@ use crate::wall::{Placement, Wall, WallKind, classify_wall};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 4, "0.4");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 5, "0.5");
 
 /// The worker's phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,11 +343,11 @@ fn background_wall(rows: &[String], busy: Busy) -> Option<Wall> {
     if !BACKGROUND_RULES.contains(&busy.rule) || !no_live_turn(rows) || turn_just_begun(rows) {
         return None;
     }
-    let wall = notice(rows, &classify_wall)?;
+    let wall = notice(rows)?;
     if matches!(wall.placement, Placement::Footer | Placement::Banner) && !turn_over(rows) {
         return None;
     }
-    Some(wall)
+    Some(crate::wall::memory_wall(rows).unwrap_or(wall))
 }
 
 /// The status row above the composer is a done row.
@@ -994,6 +994,15 @@ pub fn prompt_box_holds(rows: &[String], row: usize) -> bool {
 /// The index of the composer's bottom rule, when the frame is on the screen.
 pub fn composer_bottom(rows: &[String]) -> Option<usize> {
     composer_frame(rows).map(|f| f.bottom)
+}
+
+/// The index of the bottom rule of Claude Code's prompt box, when one is on the screen: the
+/// composer's ([`composer_bottom`]), else shell mode's, whose box has a `!` caret and whose
+/// footer opens with the same mode row (vim's `-- INSERT --` included).
+pub fn prompt_box_bottom(rows: &[String]) -> Option<usize> {
+    composer_frame(rows)
+        .or_else(|| shell_mode_frame(rows))
+        .map(|f| f.bottom)
 }
 
 /// Both composer rules, `(top, bottom)`, when the frame is on the screen.
@@ -1679,7 +1688,7 @@ pub fn composer_text(rows: &[String]) -> Option<String> {
 /// Whether the cursor sits inside the composer's typed text.
 #[must_use]
 pub const fn cursor_inside_text(cursor: Option<(usize, usize)>, caret: usize) -> bool {
-    matches!(cursor, Some((row, col)) if row == caret && col != 2)
+    matches!(cursor, Some((row, col)) if row == caret && col > 2)
 }
 
 /// The composer's rows: the caret row's index.
@@ -1708,7 +1717,7 @@ fn is_separator(row: &str) -> bool {
 }
 
 /// Claude Code's own status rows, never the worker's words.
-const STATUS_GLYPHS: &[char] = &['✔', '✓', '✘', '✗', '⚠', 'ℹ'];
+pub(crate) const STATUS_GLYPHS: &[char] = &['✔', '✓', '✘', '✗', '⚠', 'ℹ'];
 
 fn is_status_row(row: &str) -> bool {
     crate::text::trim_start(row)
@@ -1745,6 +1754,15 @@ pub fn last_said_index(rows: &[String]) -> Option<usize> {
         ),
         None => (composer_index(rows).unwrap_or(rows.len()), None),
     };
+    last_said_before(rows, end, width)
+}
+
+/// The index of the last thing said above row `end` (`width`: the composer's, so that its
+/// right-edge hints are not read as said), passing over the vendor's own `⏺` notice paragraphs
+/// ([`vendor_paragraph`]). A `/goal` echo's cause is read from above the echo's own row this way:
+/// a person's `❯` prompt above the echo is a row of the transcript, never the composer
+/// ([`composer_index`]) to read above.
+fn last_said_before(rows: &[String], end: usize, width: Option<usize>) -> Option<usize> {
     let parked = crate::survey::parked_span(rows);
     let mut i = end;
     while i > 0 {
@@ -1839,15 +1857,14 @@ pub(crate) fn is_said(row: &str, width: Option<usize>) -> bool {
 
 /// The usage or rate limit notice the worker's last turn ended on, as `(message, reset)`.
 pub fn limit_notice(rows: &[String]) -> Option<(String, Option<String>)> {
-    notice(rows, &|text| {
-        classify_wall(text).filter(WallKind::reads_limited)
-    })
-    .map(|w| (w.message, w.reset))
+    crate::wall::wall(rows)
+        .filter(|w| w.kind.reads_limited())
+        .map(|w| (w.message, w.reset))
 }
 
-/// The notice the worker's last turn ended on, placed as [`limit_notice`] places it.
-pub(crate) fn notice(rows: &[String], classify: &dyn Fn(&str) -> Option<WallKind>) -> Option<Wall> {
-    let mut found = notice_placed(rows, classify)?;
+/// The notice the worker's last turn ended on, placed as [`crate::wall::wall`] places it.
+pub(crate) fn notice(rows: &[String]) -> Option<Wall> {
+    let mut found = notice_placed(rows)?;
     if let Some(frame) = composer_frame(rows) {
         let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
         let above = found.row + 1..frame.top;
@@ -1872,26 +1889,26 @@ fn says_the_vendor_goes_on(row: &str) -> bool {
         || find_ascii_ci(&flat, "available again \u{b7} continuing now").is_some()
 }
 
-fn notice_placed(rows: &[String], classify: &dyn Fn(&str) -> Option<WallKind>) -> Option<Wall> {
+fn notice_placed(rows: &[String]) -> Option<Wall> {
     if let Some(frame) = composer_frame(rows) {
         let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
-        if let Some(found) = footer_notice(rows, frame.bottom + 1, width, classify)
-            .or_else(|| banner_notice(rows, frame.top, width, classify))
+        if let Some(found) = footer_notice(rows, frame.bottom + 1, width)
+            .or_else(|| banner_notice(rows, frame.top, width))
         {
-            return Some(crate::wall::named_by_the_turn(rows, found, classify));
+            return Some(crate::wall::named_by_the_turn(rows, found));
         }
     }
     let last = last_said_index(rows)?;
     if let Some(echo) = goal_echo_open(rows, last)
-        && let Some(prev) = last_said_index(&rows[..echo])
-        && let Some(mut cause) = notice_at(rows, prev, classify)
+        && let Some(prev) = last_said_before(&rows[..echo], echo, None)
+        && let Some(mut cause) = notice_at(rows, prev)
         && let text = goal_echo_text(rows, echo, last)
         && echo_names_the_cause_of(&text, cause.kind)
     {
         cause.message = format!("{} \u{2014} {text}", cause.message);
         return Some(cause);
     }
-    notice_at(rows, last, classify)
+    notice_at(rows, last)
 }
 
 /// Whether a `/goal` echo's own reason can come from a wall of `cause`'s kind.
@@ -1945,12 +1962,8 @@ fn goal_echo_text(rows: &[String], open: usize, last: usize) -> String {
 }
 
 /// The wall the last thing said (ending at `last`) is, by placement.
-fn notice_at(
-    rows: &[String],
-    last: usize,
-    classify: &dyn Fn(&str) -> Option<WallKind>,
-) -> Option<Wall> {
-    if let Some(found) = error_row_notice(rows, last, classify) {
+fn notice_at(rows: &[String], last: usize) -> Option<Wall> {
+    if let Some(found) = error_row_notice(rows, last) {
         return Some(found);
     }
     let open = gutter_open(rows, last)?;
@@ -1979,7 +1992,7 @@ fn notice_at(
         lines.push(text.to_string());
         i = end + 1;
     }
-    let kind = classify(&lines[0])?;
+    let kind = classify_wall(&lines[0])?;
     let reset = lines.iter().find_map(|l| reset_of(l));
     Some(Wall {
         kind,
@@ -2068,11 +2081,7 @@ pub(crate) fn line_at(rows: &[String], i: usize, until: usize, width: usize) -> 
 const EXPAND_HINT: &str = "(ctrl+o to expand)";
 
 /// The vendor's error row the last turn ended on.
-fn error_row_notice(
-    rows: &[String],
-    last: usize,
-    classify: &dyn Fn(&str) -> Option<WallKind>,
-) -> Option<Wall> {
+fn error_row_notice(rows: &[String], last: usize) -> Option<Wall> {
     let mut open = last;
     while !rows[open].starts_with(['⏺', '●']) {
         if !in_message(&rows[open]) {
@@ -2102,7 +2111,7 @@ fn error_row_notice(
     if !(head.starts_with("API Error") || remedy) {
         return None;
     }
-    let kind = classify(&text)?;
+    let kind = classify_wall(&text)?;
     Some(Wall {
         kind,
         reset: reset_of(&text),
@@ -2438,12 +2447,7 @@ fn is_call_name(name: &str) -> bool {
 }
 
 /// A notice in the footer, under the bottom rule (from row `from`) and above the first blank row.
-fn footer_notice(
-    rows: &[String],
-    from: usize,
-    width: usize,
-    classify: &dyn Fn(&str) -> Option<WallKind>,
-) -> Option<Wall> {
+fn footer_notice(rows: &[String], from: usize, width: usize) -> Option<Wall> {
     let until = footer_end(rows, from);
     (from..until)
         .filter(|&i| !crate::text::trim_start(&rows[i]).starts_with(['◯', '⏺', '●']))
@@ -2455,7 +2459,7 @@ fn footer_notice(
                 .chain(t.match_indices(" · ").map(|(i, s)| i + s.len()));
             starts
                 .map(|at| crate::text::trim_start(&t[at..]))
-                .find_map(|item| classify(item).map(|kind| (item, kind)))
+                .find_map(|item| classify_wall(item).map(|kind| (item, kind)))
                 .map(|(item, kind)| {
                     let item = item.split("  ").next().unwrap_or(item).trim();
                     Wall {
@@ -2505,12 +2509,7 @@ pub(crate) fn footer_end(rows: &[String], from: usize) -> usize {
 }
 
 /// A notice on a banner row under the last thing said.
-fn banner_notice(
-    rows: &[String],
-    top: usize,
-    width: usize,
-    classify: &dyn Fn(&str) -> Option<WallKind>,
-) -> Option<Wall> {
+fn banner_notice(rows: &[String], top: usize, width: usize) -> Option<Wall> {
     let from = last_said_index(rows).map_or(0, |i| i + 1);
     (from..top).rev().find_map(|i| {
         let row = &rows[i];
@@ -2522,7 +2521,7 @@ fn banner_notice(
         }
         let (_, line) = line_at(rows, i, top, width);
         let t = crate::text::trim(&line);
-        classify(t).map(|kind| Wall {
+        classify_wall(t).map(|kind| Wall {
             kind,
             message: t.to_string(),
             reset: reset_of(t),
@@ -2801,6 +2800,43 @@ mod tests {
         let mut r = rows(body);
         r.extend(composer(footer));
         r
+    }
+
+    /// Shell mode's box has a `!` caret, so it has no composer frame, and its footer opens with
+    /// vim's `-- INSERT --` as the composer's does: `prompt_box_bottom` finds its bottom rule.
+    /// Where a composer frame is on the screen, it is the composer's.
+    #[test]
+    fn the_prompt_box_bottom_is_shell_mode_s_where_no_composer_is() {
+        let shell = crate::prompt::fixtures::screen(include_str!(
+            "fixtures/claude-2.1.311-vim-insert-shell-mode-144col.txt"
+        ));
+        assert_eq!(
+            composer_bottom(&shell),
+            None,
+            "shell mode has no `❯` composer"
+        );
+        let bottom = prompt_box_bottom(&shell).expect("shell mode's box");
+        assert!(
+            shell[bottom - 1].starts_with('!'),
+            "{:?}",
+            shell[bottom - 1]
+        );
+        assert!(
+            shell[bottom + 1]
+                .trim_start()
+                .starts_with(crate::anchor!("vim.insert")),
+            "{:?}",
+            shell[bottom + 1]
+        );
+        for text in [
+            include_str!("fixtures/claude-2.1.304-top-vim-insert-120col.txt"),
+            include_str!("fixtures/claude-2.1.304-top-vim-normal-typed-120col.txt"),
+        ] {
+            let rows = crate::prompt::fixtures::screen(text);
+            assert!(composer_bottom(&rows).is_some());
+            assert_eq!(prompt_box_bottom(&rows), composer_bottom(&rows));
+        }
+        assert_eq!(prompt_box_bottom(&rows(&["no box here", ""])), None);
     }
 
     /// `is_rule`'s compare with `PLAIN_RULE` reads every row as the walk of its chars reads it:
@@ -6040,7 +6076,7 @@ mod tests {
             "  ⎿  You've hit your Sonnet limit · resets 4pm (America/Los_Angeles)",
             GENERIC,
         );
-        let read = notice_placed(&bucket, &classify_wall).expect("a wall");
+        let read = notice_placed(&bucket).expect("a wall");
         assert_eq!(
             (read.kind, read.placement, read.reset.as_deref()),
             (
@@ -6066,7 +6102,7 @@ mod tests {
                 WallKind::Spend,
             ),
         ] {
-            let read = notice_placed(&walled(row, footer), &classify_wall);
+            let read = notice_placed(&walled(row, footer));
             assert_eq!(read.map(|w| w.kind), Some(kind), "{row}");
         }
         const WEEKLY: &str =
@@ -6100,7 +6136,7 @@ mod tests {
             "  ⚠ You've hit your session limit · resets 4pm",
         );
         for r in [&session, &named] {
-            let read = notice_placed(r, &classify_wall).expect("a wall");
+            let read = notice_placed(r).expect("a wall");
             assert_eq!(
                 (read.kind, read.placement),
                 (WallKind::UsageSession, Placement::Footer),
@@ -6127,7 +6163,7 @@ mod tests {
             ("continued", &continued),
             ("asked", &asked),
         ] {
-            let read = notice_placed(r, &classify_wall).expect("a wall");
+            let read = notice_placed(r).expect("a wall");
             assert_eq!(
                 (read.kind, read.placement, read.reset.as_deref()),
                 (WallKind::UsageSession, Placement::Footer, Some("4pm")),
@@ -6153,7 +6189,7 @@ mod tests {
                 String::new(),
             ],
         );
-        let read = notice_placed(&own, &classify_wall).expect("a wall");
+        let read = notice_placed(&own).expect("a wall");
         assert_eq!(
             (read.kind, read.placement),
             (WallKind::ModelBucket { consent: false }, Placement::Footer),
@@ -6479,6 +6515,14 @@ mod tests {
         let caret = 55;
         assert!(cursor_inside_text(Some((55, 9)), caret));
         assert!(cursor_inside_text(Some((55, 3)), caret));
+        assert!(
+            !cursor_inside_text(Some((55, 0)), caret),
+            "the caret glyph itself"
+        );
+        assert!(
+            !cursor_inside_text(Some((55, 1)), caret),
+            "the space after the caret"
+        );
         assert!(
             !cursor_inside_text(Some((55, 2)), caret),
             "a placeholder's place"

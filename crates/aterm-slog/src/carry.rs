@@ -133,6 +133,8 @@ struct Victim {
     rec: Rec,
     target: Option<Node>,
     est: usize,
+    /// It rides the open before it ([`super::rides_open`]): the cut sheds it with that open, never alone.
+    glued: bool,
 }
 
 /// Everything a carry needs of a log, copied under its lock.
@@ -239,12 +241,24 @@ impl Log {
         let n = self.ring.len();
         let newest = self.ring.back().map(|e| e.rec.node);
         let shelter: Vec<Node> = newest.map(|nd| self.chain(nd)).unwrap_or_default();
+        let ride = self.riders();
+        let mut riders: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (j, o) in ride.iter().enumerate() {
+            if let Some(o) = *o {
+                riders.entry(o).or_default().push(j);
+            }
+        }
+        let with_riders =
+            |i: usize| std::iter::once(i).chain(riders.get(&i).into_iter().flatten().copied());
         let mut keep = Vec::new();
         let mut buckets: [Vec<usize>; 4] = Default::default();
         for (i, e) in self.ring.iter().enumerate() {
+            if ride[i].is_some() {
+                continue;
+            }
             let class = evict_class(&e.rec, |nd| self.view(nd));
             let slot = match class {
-                _ if i + 1 == n => None,
+                _ if with_riders(i).any(|j| j + 1 == n) => None,
                 EvictClass::Pinned => None,
                 EvictClass::CloseRecord if shelter.contains(&e.rec.node) => None,
                 EvictClass::ClosedDetail => Some(0),
@@ -254,9 +268,10 @@ impl Log {
             };
             match slot {
                 Some(s) => buckets[s].push(i),
-                None => keep.push(i),
+                None => keep.extend(with_riders(i)),
             }
         }
+        keep.sort_unstable();
         let lim = self.effective_limits();
         let (mut count, mut bytes, mut early) = (self.close_count, self.close_bytes, 0);
         for &i in &buckets[2] {
@@ -282,12 +297,14 @@ impl Log {
             }
         };
         let victims = order
-            .map(|&i| {
+            .flat_map(|&i| with_riders(i))
+            .map(|i| {
                 let e = &self.ring[i];
                 Victim {
                     rec: Rec::clone(&e.rec),
                     target: self.loss_target(e.rec.node),
                     est: e.bytes + "r ".len() + 1 + ms_cost(e),
+                    glued: ride[i].is_some(),
                 }
             })
             .collect();
@@ -1241,6 +1258,7 @@ impl PreparedCarry {
         let room = budget.total.saturating_sub(skeleton);
         let records_room = budget.records.saturating_sub(snap.keep.len());
         let victim_bytes = |i: usize| snap.victims[i].est;
+        let n = snap.victims.len();
         let mut rest_bytes: usize = self.detail_bytes();
         let node_cost = |snap: &CarrySnapshot, cut: usize| -> usize {
             line_bytes(
@@ -1252,11 +1270,15 @@ impl PreparedCarry {
             )
         };
         let skeleton_node_bytes = line_bytes(&skeleton_nodes);
-        let n = snap.victims.len();
+        // A victim glued to the one before it ([`Victim::glued`]) is shed with it, never alone.
         loop {
             while cut < n && (rest_bytes > room || n - cut > records_room) {
                 rest_bytes -= victim_bytes(cut);
                 cut += 1;
+                while cut < n && snap.victims[cut].glued {
+                    rest_bytes -= victim_bytes(cut);
+                    cut += 1;
+                }
             }
             let extra_nodes = node_cost(snap, cut).saturating_sub(skeleton_node_bytes);
             let over = (rest_bytes + extra_nodes).saturating_sub(room);
@@ -1268,6 +1290,11 @@ impl PreparedCarry {
                 freed += victim_bytes(cut);
                 rest_bytes -= victim_bytes(cut);
                 cut += 1;
+                while cut < n && snap.victims[cut].glued {
+                    freed += victim_bytes(cut);
+                    rest_bytes -= victim_bytes(cut);
+                    cut += 1;
+                }
             }
         }
         let shed = &snap.victims[..cut];

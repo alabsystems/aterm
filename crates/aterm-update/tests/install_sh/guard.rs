@@ -162,6 +162,96 @@ fn a_truncated_pipe_runs_nothing() {
     assert!(breaches.is_empty(), "{}", breaches.join("\n"));
 }
 
+/// The first line of the whole-file group that stops any shell but bash.
+#[cfg(target_os = "macos")]
+const BASH_ONLY: &str = "if [ -z \"${BASH_VERSION:-}\" ]; then\n";
+
+/// What follows that stop: bash leaves POSIX mode.
+#[cfg(target_os = "macos")]
+const LEAVE_POSIX: &str = "\nset +o posix\nshopt -u inherit_errexit 2>/dev/null || :\n";
+
+/// `<script>` piped into zsh, as `curl … | zsh` runs it, under a scratch home `<name>` with
+/// curl and gh logging stand-ins first on PATH.
+#[cfg(target_os = "macos")]
+fn piped_into_zsh(scratch: &Scratch, script: &Path, name: &str) -> Truncated {
+    let home = scratch.home(name);
+    let log = scratch.join(&format!("{name}/calls.log"));
+    let shim = scratch.mkdir(&format!("{name}/shim"));
+    scratch.stand_in(&format!("{name}/shim/curl"), LOGGER);
+    scratch.stand_in(&format!("{name}/shim/gh"), LOGGER);
+    let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
+    cmd.arg("-c")
+        .arg(format!("exec /bin/zsh -s -- --no-open <{}", q(s(script))))
+        .env_clear();
+    let path = format!("{}:{}", s(&shim), system_path());
+    for (key, value) in hermetic(&home, &[("PATH", &path), ("SHIM_LOG", s(&log))]) {
+        cmd.env(key, value);
+    }
+    Truncated {
+        run: run(&mut cmd),
+        home: tree(&home.home),
+        tmp: tree(&home.tmp),
+        calls: read(&log),
+    }
+}
+
+/// zsh parses the whole-file group and runs it by its own rules, so the group's first command
+/// stops any shell but bash, before a write or a request (round 12: `curl … | zsh` wrote
+/// --no-toolchain's lasting `auto_install = false` though no flag asked for it, and refused
+/// every release tag). The control, the script as it was, writes that exclusion.
+#[cfg(target_os = "macos")]
+#[test]
+fn only_bash_runs_the_installer() {
+    let scratch = Scratch::new();
+    let zsh = piped_into_zsh(&scratch, &install_sh(), "guarded");
+    assert_eq!(zsh.run.code(), 2, "{}", zsh.run.all());
+    assert!(
+        zsh.run.stderr.contains("run this installer with bash")
+            && zsh.run.stderr.contains("| bash"),
+        "{}",
+        zsh.run.all()
+    );
+    assert!(
+        zsh.home.is_empty() && zsh.tmp.is_empty() && zsh.calls.is_empty(),
+        "HOME {:?}, TMPDIR {:?}, calls {:?}",
+        zsh.home,
+        zsh.tmp,
+        zsh.calls
+    );
+
+    // The control is the script as it was: bash's own mode taken only when bash runs it.
+    let text = std::fs::read_to_string(install_sh()).expect("install.sh");
+    let at = text
+        .find(BASH_ONLY)
+        .expect("install.sh stops any shell but bash");
+    let end = at
+        + text[at..]
+            .find(LEAVE_POSIX)
+            .expect("then leaves POSIX mode")
+        + LEAVE_POSIX.len();
+    let unguarded = scratch.write(
+        "unguarded/install.sh",
+        format!(
+            "{}if [ -n \"${{BASH_VERSION:-}}\" ]; then\n{}fi\n{}",
+            &text[..at],
+            LEAVE_POSIX.trim_start_matches('\n'),
+            &text[end..]
+        ),
+    );
+    let control = piped_into_zsh(&scratch, &unguarded, "control");
+    assert!(
+        control.home.iter().any(|e| e.ends_with("aterm/aterm.toml")),
+        "without the stop zsh writes the exclusion: HOME {:?}: {}",
+        control.home,
+        control.run.all()
+    );
+    assert!(
+        control.run.all().contains("bad substitution"),
+        "{}",
+        control.run.all()
+    );
+}
+
 /// A cut inside a word runs nothing either: at every byte of each top-level line's first
 /// word, and of the last line, `main "$@"; }`. The file is one group, which bash runs
 /// only once its closing brace has arrived. With main alone wrapped, bash ran the cut
@@ -878,6 +968,66 @@ fn uninstall_without_an_aterm_refuses_and_lists_what_is_there() {
     assert!(!ran.exists(), "a foreign aterm is never run");
     assert_eq!(read(&rc), profile);
     assert_eq!(tree(&home.home), before);
+}
+
+/// zsh reads `$ZDOTDIR/.zshrc`, never `~/.zshrc`, when ZDOTDIR is set: the hand-edit hint
+/// names that file and the by-hand uninstall list looks there (round 12: both named
+/// `~/.zshrc`, so the hint's edit never ran and the list missed the block). The controls:
+/// with no ZDOTDIR, or a relative one, the hint names `~/.zshrc`, and the list misses a block
+/// in a folder no ZDOTDIR names.
+#[test]
+fn a_zdotdir_names_the_zshrc_to_edit_and_to_sweep() {
+    let scratch = Scratch::new();
+    let home = scratch.home("zdot");
+    let zdot = home.home.join(".config/zsh");
+    let rc = zdot.join(".zshrc");
+    write(
+        &rc,
+        "# >>> aterm ALab toolset (managed by install.sh) >>>\nx\n# <<< aterm ALab toolset <<<\n",
+    );
+    let listed = format!("{}: the marker-fenced aterm block", s(&rc));
+    let control = installer(&install_sh(), &home, &[], &["--uninstall"]);
+    assert_eq!(control.code(), 1, "{}", control.all());
+    assert!(!control.all().contains(&listed), "{}", control.all());
+    let run = installer(
+        &install_sh(),
+        &home,
+        &[("ZDOTDIR", s(&zdot))],
+        &["--uninstall"],
+    );
+    assert_eq!(run.code(), 1, "{}", run.all());
+    assert!(run.all().contains(&listed), "{}", run.all());
+
+    let mut lib = Lib::new();
+    let hint = |zdotdir: &str| {
+        format!(
+            "( {zdotdir}; SHELL=/bin/zsh BIN_DIR=/nowhere/bin ROOT_LOOKUP_PATH=/usr/bin \
+             cli_path_hint ) 2>&1 | head -1"
+        )
+    };
+    let home_var = lib.call("echo \"$HOME\"", &[]);
+    let rows = [
+        ("export ZDOTDIR=/z", Some("/z/.zshrc")),
+        ("unset ZDOTDIR", None),
+        ("export ZDOTDIR=dots", None),
+    ];
+    let calls: Vec<usize> = rows
+        .iter()
+        .map(|(set, _)| lib.call(hint(set), &[]))
+        .collect();
+    let recs = lib.run(&scratch);
+    let zshrc = format!("{}/.zshrc", recs[home_var].out);
+    for ((set, want), i) in rows.iter().zip(calls) {
+        assert_eq!(
+            recs[i].out,
+            format!(
+                "install.sh: NOTE: /nowhere/bin is not on your PATH — add it in {}, e.g.:",
+                want.unwrap_or(&zshrc)
+            ),
+            "{set}: {}",
+            recs[i].err
+        );
+    }
 }
 
 #[test]

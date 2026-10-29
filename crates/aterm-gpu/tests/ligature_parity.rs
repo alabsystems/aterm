@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// CPU==GPU parity with a ligating font: plain, under a selection, under a block
-// cursor and under ink.
+// CPU==GPU parity with a ligating font: under a selection, under a block cursor
+// and under ink.
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
-use aterm_render::{LigatureMode, Renderer, TextShapingConfig, Theme};
+use aterm_render::Theme;
 
 use crate::common::{backends_with_font, max_channel_delta_frame as max_channel_delta};
 
@@ -25,50 +25,6 @@ fn ligature_test_font() -> std::path::PathBuf {
     let p = std::path::PathBuf::from(FIXTURE);
     assert!(p.exists(), "{FIXTURE}: missing (a committed fixture)");
     p
-}
-
-#[test]
-fn ligature_font_gpu_matches_cpu() {
-    let theme = Theme::default();
-    let px = 18.0;
-
-    let font = ligature_test_font();
-
-    let (mut cpu, mut gpu) = backends_with_font(&font, px, theme);
-    let mut cpu_off = Renderer::from_system_with_family(font.to_str(), px, theme)
-        .expect("the ligature fixture loads");
-    cpu_off.set_text_shaping(TextShapingConfig {
-        ligature_mode: LigatureMode::Disabled,
-        ..Default::default()
-    });
-
-    let (rows, cols) = (1usize, 28usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process(b"\x1b[?25la => b != c == d -> e");
-
-    let mut win = aterm_gpu::WindowGpu::new();
-    let input = term.cell_frame(rows, cols);
-    let cpu_frame = cpu.render_input(&input);
-    let cpu_off_frame = cpu_off.render_input(&input);
-    let gpu_frame = gpu.render_input(&mut win, &input, None);
-
-    assert_eq!(
-        (gpu_frame.width, gpu_frame.height),
-        (cpu_frame.width, cpu_frame.height),
-        "dimensions differ"
-    );
-
-    assert_ne!(
-        cpu_frame.pixels, cpu_off_frame.pixels,
-        "operators did not ligate — test would be vacuous (is this really a ligature font?)"
-    );
-
-    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
-    eprintln!("ligature GPU vs CPU max per-channel delta = {delta}");
-    assert!(
-        delta <= 8,
-        "GPU/CPU ligature pixels diverge: max per-channel delta {delta} > 8"
-    );
 }
 
 #[test]

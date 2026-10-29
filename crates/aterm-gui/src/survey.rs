@@ -6,6 +6,7 @@
 use std::fmt::Write as _;
 use std::path::{Component, Path};
 
+use aterm_agent::harness::accounts::Cli;
 use aterm_agent::harness::excerpt::{self, Excerpts};
 
 use crate::control::pct_encode;
@@ -328,7 +329,12 @@ fn number_token(n: Option<u64>) -> String {
     n.map_or_else(|| "-".to_string(), |n| n.to_string())
 }
 
+/// Refresh interval for a listener's cached C16 host/account/server survey facts (§7.2, C16).
+#[cfg(any(unix, test))]
+pub(crate) const FACTS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Host-level survey header fields ([`survey_rows`]).
+#[derive(Clone, Default)]
 pub(crate) struct Here {
     /// LAN hostname for this machine.
     pub(crate) host: Option<String>,
@@ -336,16 +342,49 @@ pub(crate) struct Here {
     pub(crate) instances: usize,
     /// Whether the reader is permitted to drive this machine.
     pub(crate) drive: bool,
+    /// C16 swarm survey facts (`None` in session-only unit fixtures).
+    pub(crate) facts: Option<aterm_agent::survey_facts::SwarmSurveyFacts>,
 }
 
 impl Here {
     /// Snapshot [`Here`] for a non-driving local reader.
     pub(crate) fn now() -> Here {
+        let node = node_id_opt();
         Here {
             host: aterm_uds::process::lan_host_name(),
             instances: 1 + crate::sibling_scan::live_siblings(),
             drive: false,
+            facts: Some(aterm_agent::survey_facts::SwarmSurveyFacts::collect(
+                0, true, node,
+            )),
         }
+    }
+
+    /// Snapshot [`Here`] from the 1-minute listener cache (refreshed once per [`FACTS_CACHE_TTL`],
+    /// or immediately if `<state>/fleet-node` changed).
+    #[cfg(any(unix, test))]
+    pub(crate) fn cached_for_listener() -> Here {
+        static CACHE: std::sync::Mutex<Option<(std::time::Instant, Here)>> =
+            std::sync::Mutex::new(None);
+        let now = std::time::Instant::now();
+        let live_node = node_id_opt();
+        {
+            let guard = CACHE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((at, cached)) = guard.as_ref()
+                && now.saturating_duration_since(*at) < FACTS_CACHE_TTL
+                && cached.facts.as_ref().and_then(|f| f.node.as_deref()) == live_node.as_deref()
+            {
+                return cached.clone();
+            }
+        }
+        let fresh = Self::now();
+        let mut guard = CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some((now, fresh.clone()));
+        fresh
     }
 }
 
@@ -370,20 +409,37 @@ pub(crate) fn survey_rows(store: &Store, level: SurveyLevel, max: usize, here: &
     let snapshot = store.read().unwrap_or_else(|p| p.into_inner()).snapshot();
     let now_us = crate::metrics::now_us();
     let now_unix_ms = aterm_time::unix_millis().unwrap_or(0);
+    let facts = here.facts.as_ref();
     let mut rows: Vec<Option<Row>> = snapshot
         .iter()
-        .map(|h| Some(session_row(h, level, now_us, now_unix_ms)))
+        .map(|h| Some(session_row(h, level, facts, (now_us, now_unix_ms))))
         .collect();
     let host = word_token(here.host.as_deref());
-    let version = pct_encode(aterm_types::version::app_version());
-    let node = node_token();
+    let version = pct_encode(here.facts.as_ref().map_or_else(
+        || aterm_types::version::app_version(),
+        |f| f.version.as_str(),
+    ));
+    let node = here
+        .facts
+        .as_ref()
+        .and_then(|f| f.node.clone())
+        .unwrap_or_else(node_token);
     let instances = here.instances;
+    let facts_tokens = here
+        .facts
+        .as_ref()
+        .map_or_else(String::new, |f| f.header_tokens());
+    let extra_lines: Vec<String> = here
+        .facts
+        .as_ref()
+        .map_or_else(Vec::new, |f| f.extra_lines());
+    let extra_bytes: usize = extra_lines.iter().map(|l| l.len() + 1).sum();
     let drive = if here.drive { " drive=1" } else { "" };
-    let head = |cut: usize, sent: usize| {
+    let head = |cut: usize, sent: usize, extra_count: usize| {
         format!(
             "OK {}\ninstance pid={} host={host} version={version} sessions={} level={} \
-             cut={cut} at_ms={now_unix_ms} node={node} instances={instances}{drive}\n",
-            sent + 1,
+             cut={cut} at_ms={now_unix_ms} node={node} instances={instances}{facts_tokens}{drive}\n",
+            sent + 1 + extra_count,
             std::process::id(),
             snapshot.len(),
             level.word(),
@@ -394,8 +450,12 @@ pub(crate) fn survey_rows(store: &Store, level: SurveyLevel, max: usize, here: &
     };
     let sent = |rows: &[Option<Row>]| rows.iter().flatten().count();
     let cut = |rows: &[Option<Row>]| rows.iter().flatten().filter(|row| row.cut).count();
-    let fits =
-        |rows: &[Option<Row>], total: usize| head(cut(rows), sent(rows)).len() + total <= max;
+    let include_extra = head(0, 0, extra_lines.len()).len() + extra_bytes <= max;
+    let kept_extra: &[String] = if include_extra { &extra_lines } else { &[] };
+    let kept_extra_bytes = if include_extra { extra_bytes } else { 0 };
+    let fits = |rows: &[Option<Row>], total: usize| {
+        head(cut(rows), sent(rows), kept_extra.len()).len() + total + kept_extra_bytes <= max
+    };
     let mut order: Vec<usize> = (0..rows.len()).collect();
     order.sort_by_key(|&at| {
         (
@@ -409,7 +469,12 @@ pub(crate) fn survey_rows(store: &Store, level: SurveyLevel, max: usize, here: &
             if fits(&rows, total) {
                 break;
             }
-            let mut facts = session_row(&snapshot[at], SurveyLevel::Facts, now_us, now_unix_ms);
+            let mut facts = session_row(
+                &snapshot[at],
+                SurveyLevel::Facts,
+                here.facts.as_ref(),
+                (now_us, now_unix_ms),
+            );
             facts.cut = true;
             total = total - rows[at].as_ref().map_or(0, |row| row.text.len()) + facts.text.len();
             rows[at] = Some(facts);
@@ -421,22 +486,32 @@ pub(crate) fn survey_rows(store: &Store, level: SurveyLevel, max: usize, here: &
         }
         total -= rows[at].take().map_or(0, |row| row.text.len() + 1);
     }
-    let mut out = head(cut(&rows), sent(&rows));
+    let mut out = head(cut(&rows), sent(&rows), kept_extra.len());
     for row in rows.into_iter().flatten() {
         out.push_str(&row.text);
+        out.push('\n');
+    }
+    for line in kept_extra {
+        out.push_str(line);
         out.push('\n');
     }
     out
 }
 
-fn node_token() -> String {
+fn node_id_opt() -> Option<String> {
     #[cfg(unix)]
-    if let Some(node) = aterm_types::dirs::state_dir()
-        .and_then(|dir| aterm_net::fleet_member::read_node_id(&dir).ok().flatten())
     {
-        return node;
+        aterm_types::dirs::state_dir()
+            .and_then(|dir| aterm_net::fleet_member::read_node_id(&dir).ok().flatten())
     }
-    "-".to_owned()
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+fn node_token() -> String {
+    node_id_opt().unwrap_or_else(|| "-".to_owned())
 }
 
 struct Row {
@@ -493,7 +568,12 @@ fn claude_tap(sid: &str, pgid: i32, started: u64) -> Option<aterm_agent::harness
     aterm_agent::harness::tap::Reading::read(&dir, sid, pid, started).map(|(reading, _)| reading)
 }
 
-fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: u64) -> Row {
+fn session_row(
+    h: &SessionHandle,
+    level: SurveyLevel,
+    facts: Option<&aterm_agent::survey_facts::SwarmSurveyFacts>,
+    (now_us, now_unix_ms): (u64, u64),
+) -> Row {
     let (
         agent,
         gauges,
@@ -562,6 +642,19 @@ fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: 
         None => (agent.word, agent.age_ms()),
     };
     let codex_facts = codex.as_ref().map(|c| &c.facts);
+    // The account it runs on: Claude Code's as its footer judges its login against the roster,
+    // another pooled CLI's as its pool last read the session.
+    let account = match agent.reader.and_then(crate::harness_host::pool_cli) {
+        Some(Cli::Claude) => footer.as_ref().and_then(|f| f.account.clone()),
+        Some(cli) => facts
+            .and_then(|facts| {
+                facts
+                    .session_accounts
+                    .get(&(cli.id().to_owned(), h.sid.as_str().to_owned()))
+            })
+            .cloned(),
+        None => None,
+    };
     let tapped = claude.and_then(|(pgid, started)| claude_tap(h.sid.as_str(), pgid, started?));
     let usage = Usage::of(gauges.ctx_pct, tapped.as_ref(), codex_facts);
     let excerpts = excerpts.or_else(|| codex.as_ref().map(CodexSurvey::excerpts));
@@ -597,8 +690,8 @@ fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: 
     let mut row = format!(
         "session local={} sid={} state={} program={} program_kind={} agent={} agent_detail={} \
          agent_ms={} human_ms={} bg={} task={} task_rev={} task_from={} task_ms={} model={} \
-         effort={} ctx_left_pct={} usage_5h_pct={} usage_7d_pct={} detail={} doing={} role={} \
-         supervisor={} \
+         effort={} ctx_left_pct={} usage_5h_pct={} usage_7d_pct={} account={} detail={} \
+         doing={} role={} supervisor={} \
          attention={attention} goal={goal} needs={needs} needs_by={needs_by} hold_by={hold_by} \
          held_from={} typed_by={} typed_ms={} {}",
         h.local_id,
@@ -630,6 +723,7 @@ fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: 
         number_token(usage.ctx_left.map(u64::from)),
         number_token(usage.five_hour.map(u64::from)),
         number_token(usage.seven_day.map(u64::from)),
+        word_token(account.as_deref().map(aterm_ctl::masked_label).as_deref()),
         word_token(engine.detail.as_deref()),
         word_token(doing),
         role_token(role.as_deref(), level),
@@ -717,7 +811,7 @@ fn engine_read(h: &SessionHandle, shell: bool) -> EngineRead {
         let whole = !crate::frame_unfinished_now(t);
         let rows = (shell && whole).then(|| last_rows(t)).flatten();
         EngineRead {
-            detail: crate::session_status::executing_detail(t),
+            detail: crate::session_status::executing_detail(t, &h.ctx.ran),
             title: (!title.is_empty()).then(|| title.to_owned()),
             cwd: t
                 .native_working_directory()

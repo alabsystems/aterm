@@ -142,6 +142,7 @@ pub fn items(
             user: user.clone(),
             config: config.clone(),
             after: secrets.map(str::to_owned),
+            revert: std::sync::Mutex::new(None),
         }),
         repos::item(user, &config, recorded),
     ])
@@ -332,17 +333,16 @@ fn stored(sys: &dyn System, user: &User, account: &str) -> Result<Option<Secret>
 pub(crate) const NEEDS_GIT: &str = "GitHub bootstrap needs git, from Apple's Command Line Tools \
                                     or Xcode (aterm init --only base.clt installs the tools)";
 
-fn readiness(
-    sys: &dyn System,
-    user: &User,
-    config: &Github,
-) -> Result<(Lookups, Option<Secret>), String> {
+type Readiness = (Lookups, Option<Secret>, Option<(PathBuf, String)>);
+
+fn readiness(sys: &dyn System, user: &User, config: &Github) -> Result<Readiness, String> {
     let git = Git::keychain(sys);
     if !git.installed(sys) {
         return Err(NEEDS_GIT.into());
     }
-    let helper = git.configured(sys, user, &config.account)?;
-    Ok((helper, stored(sys, user, &config.account)?))
+    let owners = [config.owner.as_str()];
+    let (helper, shadowed) = git.configured_or_shadowed(sys, user, &config.account, &owners)?;
+    Ok((helper, stored(sys, user, &config.account)?, shadowed))
 }
 
 /// Returns the keychain token for the configured account when git's helper is also ready, else
@@ -353,7 +353,7 @@ pub(super) fn auth_ready(
     user: &User,
     config: &Github,
 ) -> Result<Option<Secret>, String> {
-    let (helper, token) = readiness(sys, user, config)?;
+    let (helper, token, _) = readiness(sys, user, config)?;
     Ok(match token.filter(|_| helper.ready()) {
         Some(token) => Some(token),
         None => answered(sys, user, config).ok().flatten(),
@@ -361,7 +361,7 @@ pub(super) fn auth_ready(
 }
 
 /// The token file's token, when git's own lookups already hand it back for every repository
-/// alike ([`native::lookups_answer`]) and GitHub signs it in as the configured account: the
+/// alike ([`native::lookups_answer_for`]) and GitHub signs it in as the configured account: the
 /// keychain is then neither written nor made git's only helper. `None` when they hand back
 /// another token or none, GitHub refuses it or signs it in as another account, or the token file
 /// is unusable; the keychain path then goes on.
@@ -372,7 +372,8 @@ fn answered(sys: &dyn System, user: &User, config: &Github) -> Result<Option<Sec
     let Ok(token) = read_token(sys, user, config) else {
         return Ok(None);
     };
-    if !native::lookups_answer(sys, user, &token) {
+    let owners = [config.owner.as_str()];
+    if !native::lookups_answer_for(sys, user, &config.account, &owners, &token) {
         return Ok(None);
     }
     let account = signs_in_as(sys, user, &token).map_err(|_| {
@@ -385,11 +386,37 @@ fn answered(sys: &dyn System, user: &User, config: &Github) -> Result<Option<Sec
         .map(|_| token))
 }
 
+/// Whether `xdg_file`'s helper hands back the token file's token and GitHub signs it in as
+/// `config.account`.
+fn shadowed_vault_answers(
+    sys: &dyn System,
+    user: &User,
+    config: &Github,
+    xdg_file: &Path,
+) -> Result<bool, String> {
+    let Ok(token) = read_token(sys, user, config) else {
+        return Ok(false);
+    };
+    if !Git::keychain(sys)
+        .fill_with_global_file(sys, user, xdg_file, GITHUB)
+        .is_ok_and(|ans| ans.is_some_and(|got| got.bytes() == token.bytes()))
+    {
+        return Ok(false);
+    }
+    let account = signs_in_as(sys, user, &token).map_err(|_| {
+        "git's XDG helper hands back the GitHub token file's token, but GitHub did not say which \
+         account it signs in as (output withheld); nothing was changed"
+            .to_owned()
+    })?;
+    Ok(account.is_some_and(|account| account.eq_ignore_ascii_case(&config.account)))
+}
+
 struct Auth {
     user: User,
     config: Github,
     /// The secrets item it waits for ([`items`]).
     after: Option<String>,
+    revert: std::sync::Mutex<Option<String>>,
 }
 
 impl Item for Auth {
@@ -409,11 +436,36 @@ impl Item for Auth {
         self.after.iter().cloned().collect()
     }
     fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
-        let (helper, held) = match readiness(sys, &self.user, &self.config) {
-            Ok((Lookups::Ready, Some(_))) => return Probe::Ok { now: self.title() },
+        *self
+            .revert
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let (helper, held, shadowed) = match readiness(sys, &self.user, &self.config) {
             Ok(ready) => ready,
             Err(why) => return Probe::Unusable { why },
         };
+        if let Some((xdg_file, revert)) = shadowed {
+            match shadowed_vault_answers(sys, &self.user, &self.config, &xdg_file) {
+                Ok(true) => {
+                    *self
+                        .revert
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(revert);
+                    return Probe::Change {
+                        from: "git's global file overrides the XDG GitHub credential helper".into(),
+                        to: format!(
+                            "GitHub credential for {}: use git's XDG credential helper",
+                            self.config.account
+                        ),
+                    };
+                }
+                Err(why) => return Probe::Unusable { why },
+                Ok(false) => {}
+            }
+        }
+        if matches!((&helper, &held), (Lookups::Ready, Some(_))) {
+            return Probe::Ok { now: self.title() };
+        }
         match answered(sys, &self.user, &self.config) {
             Ok(Some(_)) => Probe::Ok {
                 now: format!(
@@ -447,7 +499,19 @@ impl Item for Auth {
             return Ok(());
         }
         let git = Git::keychain(sys);
-        let (helper, held) = readiness(sys, &self.user, &self.config)?;
+        let (helper, held, shadowed) = readiness(sys, &self.user, &self.config)?;
+        if let Some((xdg_file, _)) = shadowed
+            && shadowed_vault_answers(sys, &self.user, &self.config, &xdg_file)?
+        {
+            git.unconfigure(sys, &self.user)?;
+            if answered(sys, &self.user, &self.config)?.is_none() {
+                return Err(
+                    "git's XDG GitHub credential helper did not answer after removing the global override"
+                        .into(),
+                );
+            }
+            return Ok(());
+        }
         if held.is_none() {
             crate::port::no_core_dumps();
             let token = read_token(sys, &self.user, &self.config)?;
@@ -478,6 +542,18 @@ impl Item for Auth {
             ));
         }
         Ok(())
+    }
+    fn revert(&self) -> Option<String> {
+        self.revert
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|settings| {
+                format!(
+                    "{settings} (puts back git's GitHub settings; the login keychain's github.com \
+                     credential stays)"
+                )
+            })
     }
 }
 
@@ -621,6 +697,7 @@ mod tests {
                 user: u.clone(),
                 config,
                 after: None,
+                revert: std::sync::Mutex::new(None),
             },
             ctx(&[u]),
         )
@@ -1167,5 +1244,41 @@ mod tests {
             !why.contains("xcode-select") && !why.contains("brew"),
             "{why}"
         );
+    }
+
+    #[test]
+    fn auth_converts_shadowed_keychain_gitconfig_without_writing_keychain() {
+        let (sys, auth, context) = fixture();
+        let u = auth.user.clone();
+        script::shadowed(&sys, &u, "octocat");
+        script::shadowed(&sys, &u, "octocat");
+        script::alike(&sys, &u);
+        script::alike(&sys, &u);
+        script::holds(&sys, Some(&u), GITHUB, "octocat", STORED);
+        script::holds(&sys, Some(&u), GITHUB, "octocat", STORED);
+        script::lookups_hold(&sys, &u, GITHUB, "octocat", STORED);
+        script::lookups_hold(&sys, &u, GITHUB, "octocat", VALUE);
+        script::lookups_hold(&sys, &u, GITHUB, "octocat", VALUE);
+        script::lookups_hold_xdg(&sys, &u, GITHUB, "octocat", VALUE);
+        script::lookups_hold_xdg(&sys, &u, GITHUB, "octocat", VALUE);
+        let unsets = script::unconfigure(&sys, &u);
+        signs_in(&sys, &u, "octocat");
+        let probed = auth.probe(&sys, &context);
+        assert!(matches!(probed, Probe::Change { .. }), "{probed:?}");
+        assert!(
+            auth.revert().as_deref().is_some_and(
+                |r| r.contains("--add credential.https://github.com.helper osxkeychain")
+            )
+        );
+        auth.apply(&sys, &context).unwrap();
+        let calls = sys.calls();
+        assert!(unsets.iter().all(|k| calls.contains(k)), "{calls:?}");
+        assert!(
+            calls
+                .iter()
+                .all(|c| !c.contains("approve") && !c.contains("--replace-all")),
+            "{calls:?}"
+        );
+        clean(&sys);
     }
 }

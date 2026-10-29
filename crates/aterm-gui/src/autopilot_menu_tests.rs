@@ -3147,3 +3147,602 @@ fn a_regrid_between_a_double_clicks_presses_moves_no_pixel_of_it() {
         );
     }
 }
+
+/// Where the program in [`program_app`] draws its own Autopilot face: `(row, col)` of its screen.
+#[cfg(unix)]
+const FACE: (usize, usize) = (20, 40);
+
+/// A codex-alab pane whose program draws its own Autopilot line, as its ALab interface does, so
+/// aterm lays no chip there, under a harness host; the session writes its PTY input to a private
+/// observer, and its scrollback holds rows a scroll back can show.
+#[cfg(unix)]
+fn program_app() -> (
+    App,
+    WindowId,
+    u64,
+    std::os::unix::net::UnixStream,
+    MenuTestHost,
+) {
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("a private PTY observer");
+    reader
+        .set_nonblocking(true)
+        .expect("a nonblocking observer");
+    let mut app = App::headless_for_test_with_sink(std::sync::Arc::new(
+        aterm_session::sink::SinkWriter::new_owned(writer.into()),
+    ));
+    let wid = WindowId(0);
+    assert!(app.apply_term_resize(wid, 24, 100));
+    let session = app.focused_session_id(wid).expect("the front session");
+    let host = crate::harness_host::HostHandle::for_supervised_test(
+        Vec::new(),
+        std::sync::Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
+    );
+    app.harness = Some(host.clone());
+    {
+        let entry = app.pool.get(session).expect("session");
+        let mut timeline = entry.ctx.timeline.lock().unwrap();
+        timeline.note_foreground_group(4343);
+        timeline.set_program(4343, Some("codex".into()));
+    }
+    feed(&app, session, "an earlier row\r\n".repeat(60).as_bytes());
+    let (row, col) = (FACE.0 + 1, FACE.1 + 1);
+    feed(
+        &app,
+        session,
+        format!(
+            "\x1b[2J\x1b[{row};1H\u{2500}\u{2500} codex-alab \u{2500}\u{2500}\x1b[{row};{col}H\u{221e} \
+             \u{2500}[Cruise]\u{2500}[Land]\u{2500}[Off]\u{2500}\u{2500}\u{2500}[ALab on]\x1b[{};1H\
+             \u{203A} \x1b[{};3H",
+            row + 1,
+            row + 1,
+        )
+        .as_bytes(),
+    );
+    (app, wid, session, reader, MenuTestHost(host))
+}
+
+/// What the session typed into its PTY since the last read.
+#[cfg(unix)]
+fn typed(reader: &mut std::os::unix::net::UnixStream) -> Vec<u8> {
+    use std::io::Read;
+    let mut got = Vec::new();
+    let mut buf = [0u8; 256];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("reading the PTY observer: {e}"),
+        }
+    }
+    got
+}
+
+/// The program's request for its menu at `cell` of `session`'s screen, by the pointer or keys.
+fn asked(session: u64, cell: (usize, usize), keyboard: bool) -> ProgramMenu {
+    ProgramMenu {
+        session,
+        cell,
+        keyboard,
+    }
+}
+
+/// The one frame cell of `wid`'s last frame that shows `glyph`: what the glass holds there, not
+/// where a formula puts it.
+fn glass_cell_of(app: &App, wid: WindowId, glyph: char) -> (usize, usize) {
+    let found: Vec<(usize, usize)> = app.windows[&wid]
+        .input_scratch
+        .cells
+        .iter()
+        .enumerate()
+        .flat_map(|(row, cells)| {
+            cells
+                .iter()
+                .enumerate()
+                .filter(|(_, cell)| cell.ch == glyph)
+                .map(move |(col, _)| (row, col))
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "one {glyph} on the glass: {found:?}");
+    found[0]
+}
+
+/// The `meta-change field=autopilot` events on `session`'s timeline.
+#[cfg(unix)]
+fn autopilot_moves(app: &App, session: u64) -> Vec<String> {
+    app.pool
+        .get(session)
+        .expect("session")
+        .ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .since(None)
+        .filter(|e| e.kind == "meta-change" && e.payload.contains("field=autopilot "))
+        .map(|e| e.payload.to_string())
+        .collect()
+}
+
+/// Paint the open menu, click its `key` row, and say what that wrote: the session's word, the
+/// surface it names, and the `meta-change field=autopilot` events it added.
+#[cfg(unix)]
+fn click_row(
+    app: &mut App,
+    wid: WindowId,
+    session: u64,
+    key: &str,
+) -> (
+    Option<String>,
+    Option<crate::autopilot::Surface>,
+    Vec<String>,
+) {
+    frame(app, wid);
+    let moves = autopilot_moves(app, session).len();
+    let i = row_of(app, key).expect("the row");
+    let ((x, y), _) = row_px(app, wid, i);
+    app.on_cursor_moved(wid, x, y);
+    click(app, wid, (x, y), Press::Bare);
+    assert!(app.autopilot_menu.is_none(), "{key}: chosen and closed");
+    let (word, surface) = {
+        let meta = app
+            .pool
+            .get(session)
+            .expect("session")
+            .ctx
+            .meta
+            .lock()
+            .unwrap();
+        (
+            meta.autopilot.clone(),
+            meta.autopilot_set_by.and_then(|by| by.surface),
+        )
+    };
+    (
+        word,
+        surface,
+        autopilot_moves(app, session)[moves..].to_vec(),
+    )
+}
+
+/// THE MENU AT A PROGRAM'S OWN CELL (`@<sid> open autopilot-menu at=`): where codex-alab draws
+/// its own Autopilot face and aterm lays no chip, the menu opens at the frame cell that shows the
+/// face, hung above it at its column, with the chip's rows and none that types, and repaints and
+/// the program's own drawing keep it; `by=keys` lights the first choice, a cell past the pane is
+/// clamped into it, and a tab strip above the pane moves the anchor with the face. Nothing is
+/// typed into the session. CONTROL: the bare form still needs aterm's chip, and opens nothing.
+#[cfg(unix)]
+#[test]
+fn a_program_opens_the_menu_at_its_own_cell_where_no_chip_shows() {
+    let (mut app, wid, session, mut reader, _host) = program_app();
+    frame(&mut app, wid);
+    assert!(
+        app.windows[&wid]
+            .claude_lights
+            .painted_cells(session, crate::claude_lights::Chip::Autopilot)
+            .is_empty(),
+        "no chip of aterm's"
+    );
+    assert_eq!(
+        app.open_front_autopilot_menu(),
+        Err("the focused session shows no Autopilot chip".to_string()),
+        "CONTROL: the bare form opens nothing"
+    );
+    assert!(app.autopilot_menu.is_none());
+    let face = glass_cell_of(&app, wid, '\u{221e}');
+    app.open_program_autopilot_menu(asked(session, FACE, false))
+        .expect("the program's cell opens it");
+    let menu = app.autopilot_menu.as_ref().expect("open");
+    assert_eq!(
+        (menu.session, menu.anchor, menu.highlight),
+        (session, face, None),
+        "at the cell that shows the face"
+    );
+    assert!(
+        !app.shows_autopilot_chip(wid, session, face),
+        "no chip at its anchor"
+    );
+    assert!(
+        menu.rows.iter().all(|row| !matches!(
+            row,
+            MenuRow::Item {
+                act: MenuAct::Fact(..),
+                ..
+            }
+        )),
+        "no row that types"
+    );
+    for _ in 0..3 {
+        frame(&mut app, wid);
+        assert!(app.autopilot_menu.is_some(), "a repaint keeps it");
+    }
+    let rect = rect_of(&app).expect("painted");
+    assert_eq!(
+        (rect.row + rect.h, rect.col),
+        face,
+        "hung above the program's cell, at its column"
+    );
+    assert!(row_text(&app, wid, rect.row + 2).contains("Cruise"));
+    feed(&app, session, b"\x1b7\x1b[3;1Hthe program draws on\x1b8");
+    frame(&mut app, wid);
+    assert!(
+        app.autopilot_menu.is_some(),
+        "the program's own drawing keeps it"
+    );
+    let lines = app.autopilot_menu_controls();
+    assert!(
+        lines[0].starts_with("autopilot-menu open=true session=s-"),
+        "{lines:?}"
+    );
+    app.open_program_autopilot_menu(asked(session, FACE, true))
+        .expect("by=keys");
+    let menu = app.autopilot_menu.as_ref().expect("open");
+    let first = step(&menu.rows, None, true, menu.rows.len());
+    assert!(first.is_some(), "a first choice");
+    assert_eq!(menu.highlight, first, "by=keys lights it");
+    assert_eq!(
+        keys(&menu.rows)[first.expect("a first choice")].as_deref(),
+        Some("autopilot-menu/mode/cruise")
+    );
+    let (_, _, height, width) = app.visible_session_rect(wid, session).expect("its pane");
+    feed(
+        &app,
+        session,
+        format!("\x1b7\x1b[{height};{width}H\u{a4}\x1b8").as_bytes(),
+    );
+    frame(&mut app, wid);
+    let corner = glass_cell_of(&app, wid, '\u{a4}');
+    app.open_program_autopilot_menu(asked(session, (999, 999), false))
+        .expect("a cell past the pane");
+    assert_eq!(
+        app.autopilot_menu.as_ref().map(|m| m.anchor),
+        Some(corner),
+        "clamped into the pane, at its last cell"
+    );
+    frame(&mut app, wid);
+    assert!(app.autopilot_menu.is_some(), "and laid there");
+    app.tab_strip_rows = 1;
+    frame(&mut app, wid);
+    assert!(
+        app.autopilot_menu.is_none(),
+        "the strip moved its pane: closed"
+    );
+    let below = glass_cell_of(&app, wid, '\u{221e}');
+    assert_eq!(
+        below,
+        (face.0 + 1, face.1),
+        "the strip's row above the pane moves the face"
+    );
+    app.open_program_autopilot_menu(asked(session, FACE, false))
+        .expect("under the strip");
+    assert_eq!(
+        app.autopilot_menu.as_ref().map(|m| m.anchor),
+        Some(below),
+        "the anchor moves with it"
+    );
+    frame(&mut app, wid);
+    assert_eq!(
+        rect_of(&app).map(|rect| (rect.row + rect.h, rect.col)),
+        Some(below),
+        "hung above the face under the strip"
+    );
+    assert!(typed(&mut reader).is_empty(), "nothing typed");
+}
+
+/// The program's menu is its session's only while that session is focused: the window where it
+/// is not focused refuses it, it opens at its own pane's cell, and a focus move closes it as it
+/// closes the chip's. CONTROL: the same focus keeps it through a repaint.
+#[test]
+fn a_programs_menu_opens_only_on_a_focused_session_and_closes_when_the_focus_moves() {
+    use crate::pane::SplitDir;
+    let (mut app, wid, first, second, host) = claude_split((30, 100), SplitDir::Vertical);
+    let _host = MenuTestHost(host);
+    feed(&app, second, b"\x1b7\x1b[6;6H\xc2\xa4\x1b8");
+    frame(&mut app, wid);
+    let cell = glass_cell_of(&app, wid, '\u{a4}');
+    assert_eq!(
+        app.open_program_autopilot_menu(asked(first, (5, 5), false)),
+        Err("the session is not focused in the front window".to_string()),
+        "the unfocused pane's session"
+    );
+    assert!(app.autopilot_menu.is_none());
+    app.open_program_autopilot_menu(asked(second, (5, 5), false))
+        .expect("the focused session's");
+    assert_eq!(
+        app.autopilot_menu.as_ref().map(|m| (m.session, m.anchor)),
+        Some((second, cell)),
+        "at the cell its own pane shows there"
+    );
+    frame(&mut app, wid);
+    assert!(
+        app.autopilot_menu.is_some(),
+        "CONTROL: the same focus keeps it"
+    );
+    assert!(app.raise_session_pane(first));
+    assert_eq!(app.focused_session_id(wid), Some(first));
+    frame(&mut app, wid);
+    assert!(app.autopilot_menu.is_none(), "the focus moved: closed");
+}
+
+/// THE FRONT WINDOW'S ALONE: every reader and key of the card is the front window's (`controls
+/// autopilot-menu`, `window autopilot-menu`, the keys that move its light), so a session focused
+/// only in a window behind is refused rather than given a card nothing there can see or drive.
+/// CONTROL: once that window is in front, the same request opens it there.
+#[cfg(unix)]
+#[test]
+fn a_programs_menu_opens_only_in_the_front_window() {
+    let (mut app, wid, session, mut reader, _host) = program_app();
+    frame(&mut app, wid);
+    let other = app.insert_logical_window(crate::stub_session(1), 24, 80);
+    app.frontmost_window = Some(other);
+    assert_eq!(
+        app.focused_session_id(wid),
+        Some(session),
+        "still focused behind"
+    );
+    assert_eq!(
+        app.open_program_autopilot_menu(asked(session, FACE, true)),
+        Err("the session is not focused in the front window".to_string())
+    );
+    assert!(app.autopilot_menu.is_none(), "no card behind");
+    app.frontmost_window = Some(wid);
+    app.open_program_autopilot_menu(asked(session, FACE, true))
+        .expect("CONTROL: in front, it opens");
+    assert_eq!(app.autopilot_menu.as_ref().map(|m| m.wid), Some(wid));
+    assert!(
+        app.autopilot_menu_controls()[0].starts_with("autopilot-menu open=true"),
+        "and the front window's reader sees it"
+    );
+    assert!(typed(&mut reader).is_empty(), "nothing typed");
+}
+
+/// THE SAFE ANCHOR: aterm cannot say where a program redraws its line once its pane scrolls back,
+/// is rewound or re-grids, so the program's menu closes then, as at a focus change, and does not
+/// open on a scrolled-back or rewound pane; the program asks again at its new cell. CONTROL: the
+/// live screen at the same grid keeps it, and opens it again once scrolled home or the Rewind
+/// view is closed.
+#[cfg(unix)]
+#[test]
+fn a_scroll_back_a_rewind_or_a_regrid_closes_a_programs_menu() {
+    let (mut app, wid, session, mut reader, _host) = program_app();
+    assert_eq!(session, 0, "fixture: the recording helpers drive session 0");
+    let term = app.pool.get(session).expect("session").term.clone();
+    frame(&mut app, wid);
+    app.open_program_autopilot_menu(asked(session, FACE, false))
+        .expect("opens");
+    frame(&mut app, wid);
+    assert!(
+        app.autopilot_menu.is_some(),
+        "CONTROL: the live screen keeps it"
+    );
+    term_lock(&term).scroll_display(3);
+    assert_eq!(term_lock(&term).grid().display_offset(), 3, "scrolled back");
+    frame(&mut app, wid);
+    assert!(app.autopilot_menu.is_none(), "scrolled back: closed");
+    assert_eq!(
+        app.open_program_autopilot_menu(asked(session, FACE, false)),
+        Err("the session's pane is scrolled back or rewound".to_string())
+    );
+    term_lock(&term).scroll_display(-3);
+    assert_eq!(term_lock(&term).grid().display_offset(), 0, "home");
+    app.open_program_autopilot_menu(asked(session, FACE, false))
+        .expect("CONTROL: opens again at home");
+    frame(&mut app, wid);
+    assert!(app.autopilot_menu.is_some());
+
+    crate::rewind::tests::start_recording(&app);
+    let _ = crate::rewind::tests::slice(&app, b"\x1b[0m");
+    app.rewind_open(session, crate::rewind::Target::Latest, None)
+        .expect("a Rewind view");
+    assert_eq!(
+        term_lock(&term).grid().display_offset(),
+        0,
+        "the live grid stays home"
+    );
+    frame(&mut app, wid);
+    assert!(app.autopilot_menu.is_none(), "rewound: closed");
+    assert_eq!(
+        app.open_program_autopilot_menu(asked(session, FACE, false)),
+        Err("the session's pane is scrolled back or rewound".to_string())
+    );
+    assert!(app.rewind_close(session));
+    app.open_program_autopilot_menu(asked(session, FACE, false))
+        .expect("CONTROL: opens again once live");
+    frame(&mut app, wid);
+    assert!(app.autopilot_menu.is_some());
+
+    assert!(app.apply_term_resize(wid, 30, 100));
+    frame(&mut app, wid);
+    assert!(app.autopilot_menu.is_none(), "re-gridded: closed");
+    assert!(typed(&mut reader).is_empty(), "nothing typed");
+}
+
+/// THE PROGRAM THAT ASKED: the card stands for the program that drew the face, so once another
+/// job takes the foreground (the program exited, crashed or was replaced and a shell's prompt is
+/// back) or the session's screen flips between main and alternate (a full-screen program gone),
+/// the card closes, and the keys go to what is there now. CONTROL: the same group on the same
+/// screen keeps it through repaints, and the program asking again opens it.
+#[cfg(unix)]
+#[test]
+fn a_programs_menu_closes_when_its_program_leaves_the_foreground_or_the_screen() {
+    let (mut app, wid, session, mut reader, _host) = program_app();
+    let group = |app: &App, pgid: i32| {
+        let entry = app.pool.get(session).expect("session");
+        entry
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .note_foreground_group(pgid);
+    };
+    frame(&mut app, wid);
+    app.open_program_autopilot_menu(asked(session, FACE, true))
+        .expect("opens");
+    for _ in 0..2 {
+        frame(&mut app, wid);
+        assert!(
+            app.autopilot_menu.is_some(),
+            "CONTROL: the same group and screen keep it"
+        );
+    }
+    group(&app, 5151);
+    frame(&mut app, wid);
+    assert!(app.autopilot_menu.is_none(), "another job in front: closed");
+    app.open_program_autopilot_menu(asked(session, FACE, true))
+        .expect("CONTROL: asked again, it opens");
+    frame(&mut app, wid);
+    assert!(app.autopilot_menu.is_some());
+    feed(&app, session, b"\x1b[?1049h");
+    frame(&mut app, wid);
+    assert!(app.autopilot_menu.is_none(), "the alternate screen: closed");
+    app.open_program_autopilot_menu(asked(session, FACE, true))
+        .expect("CONTROL: asked on the alternate screen");
+    frame(&mut app, wid);
+    assert!(app.autopilot_menu.is_some());
+    feed(&app, session, b"\x1b[?1049l");
+    frame(&mut app, wid);
+    assert!(
+        app.autopilot_menu.is_none(),
+        "back to the main screen: closed"
+    );
+    assert!(typed(&mut reader).is_empty(), "nothing typed");
+}
+
+/// A row of the program's menu moves the session's Autopilot word exactly as the same row of the
+/// chip's menu does: the same word, written by the menu (`Surface::Menu`), one
+/// `meta-change field=autopilot`, and nothing typed.
+#[cfg(unix)]
+#[test]
+fn a_programs_menu_row_moves_the_word_as_the_chips_menu_row_does() {
+    use crate::autopilot::Surface;
+    let land = (
+        Some("land".to_string()),
+        Some(Surface::Menu),
+        vec!["field=autopilot value=land".to_string()],
+    );
+    let (mut chip_app, chip_wid, chip_session, host) = claude_app();
+    let _chip_host = MenuTestHost(host);
+    frame(&mut chip_app, chip_wid);
+    chip_app
+        .open_front_autopilot_menu()
+        .expect("the chip's menu");
+    let by_chip = click_row(
+        &mut chip_app,
+        chip_wid,
+        chip_session,
+        "autopilot-menu/mode/land",
+    );
+    assert_eq!(by_chip, land, "the chip's menu");
+
+    let (mut app, wid, session, mut reader, _host) = program_app();
+    frame(&mut app, wid);
+    app.open_program_autopilot_menu(asked(session, FACE, false))
+        .expect("the program's menu");
+    assert_eq!(
+        click_row(&mut app, wid, session, "autopilot-menu/mode/land"),
+        by_chip,
+        "as the chip's menu does"
+    );
+    assert!(typed(&mut reader).is_empty(), "nothing typed");
+}
+
+/// The program's card is the Autopilot menu to every surface that asks for it by that name: a
+/// word moved elsewhere while it is open moves its checked row, as on the chip's card, and
+/// `window autopilot-menu` takes it while `window fact-menu` does not. CONTROL: before the move,
+/// the checked row is not Land's.
+#[cfg(unix)]
+#[test]
+fn a_programs_menu_follows_its_sessions_word_and_is_the_windows_autopilot_menu() {
+    use crate::app_introspect::AuxTarget;
+    let (mut app, wid, session, _reader, _host) = program_app();
+    frame(&mut app, wid);
+    app.open_program_autopilot_menu(asked(session, FACE, false))
+        .expect("opens");
+    frame(&mut app, wid);
+    let checked = |app: &App| {
+        app.autopilot_menu.as_ref().and_then(|menu| {
+            menu.rows.iter().find_map(|row| match row {
+                MenuRow::Item {
+                    act: MenuAct::Mode(mode),
+                    checked: true,
+                    ..
+                } => Some(mode.word()),
+                _ => None,
+            })
+        })
+    };
+    assert_ne!(checked(&app), Some("land"), "CONTROL: not yet Land");
+    wire(&app, session, "set autopilot land");
+    app.on_meta_changed(session);
+    assert!(app.autopilot_menu.is_some(), "still open");
+    assert_eq!(checked(&app), Some("land"), "the word moved its check");
+    assert_eq!(app.window_target_refusal(AuxTarget::AutopilotMenu), None);
+    assert!(
+        app.window_target_refusal(AuxTarget::FactMenu).is_some(),
+        "no fact's menu"
+    );
+}
+
+/// A PRESS THE PROGRAM SAW, RELEASED OVER ITS CARD: a right-click or click on the program's face
+/// is reported to a mouse-tracking program before the program asks for its menu, so the button
+/// comes up while the card is open; the program still gets that release, and no button stays
+/// held, so once the card is gone a still-up pointer's motion reports no drag. CONTROL: the press
+/// itself reaches the program. macOS only, as the other tests that close a card with a key
+/// ([`tap`]).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_press_the_program_saw_is_released_to_it_from_under_its_menu() {
+    use aterm_window::event::{ElementState, MouseButton};
+    use aterm_window::keyboard::{Key, KeyCode, NamedKey};
+    let (mut app, wid, session, mut reader, _host) = program_app();
+    feed(&app, session, b"\x1b[?1002h\x1b[?1006h");
+    frame(&mut app, wid);
+    let face = glass_cell_of(&app, wid, '\u{221e}');
+    let (x, y) = app.frame_cell_centre(wid, face);
+    let (row, col) = (FACE.0 + 1, FACE.1 + 1);
+    for (button, code) in [(MouseButton::Right, 2), (MouseButton::Left, 0)] {
+        app.on_cursor_moved(wid, x, y);
+        let _ = typed(&mut reader);
+        app.mouse_input_then_fold(wid, ElementState::Pressed, button);
+        assert_eq!(
+            typed(&mut reader),
+            format!("\x1b[<{code};{col};{row}M").into_bytes(),
+            "{button:?}: CONTROL: the program saw the press"
+        );
+        app.open_program_autopilot_menu(asked(session, FACE, false))
+            .expect("the program asks");
+        frame(&mut app, wid);
+        app.mouse_input_then_fold(wid, ElementState::Released, button);
+        assert_eq!(
+            typed(&mut reader),
+            format!("\x1b[<{code};{col};{row}m").into_bytes(),
+            "{button:?}: the program gets its release"
+        );
+        assert!(app.autopilot_menu.is_some(), "{button:?}: the card stays");
+        assert_eq!(
+            (
+                app.windows[&wid].reported_buttons,
+                app.windows[&wid].held_mouse_button
+            ),
+            (0, None),
+            "{button:?}: no button held"
+        );
+        tap(
+            &mut app,
+            wid,
+            Key::Named(NamedKey::Escape),
+            KeyCode::Escape,
+            None,
+        );
+        assert!(app.autopilot_menu.is_none(), "{button:?}: Esc closes it");
+        assert!(
+            typed(&mut reader).is_empty(),
+            "{button:?}: Esc typed nothing"
+        );
+        frame(&mut app, wid);
+        app.on_cursor_moved(wid, x + 40.0, y - 40.0);
+        assert!(
+            typed(&mut reader).is_empty(),
+            "{button:?}: a still-up pointer drags nothing"
+        );
+    }
+}

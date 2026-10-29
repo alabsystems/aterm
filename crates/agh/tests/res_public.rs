@@ -67,6 +67,18 @@ fn probe_answers_present_absent_and_unknown() {
     w.fake.fault(
         Match::web("/"),
         Fault::Status {
+            status: 307,
+            body: String::new(),
+            headers: Vec::new(),
+        },
+    );
+    assert_eq!(
+        public.probe(&common::slug(APP), "v1", "app.bin"),
+        agh::github::Probe::Present
+    );
+    w.fake.fault(
+        Match::web("/"),
+        Fault::Status {
             status: 500,
             body: String::new(),
             headers: Vec::new(),
@@ -140,6 +152,10 @@ fn a_dot_segment_tag_or_asset_is_refused_before_any_request() {
         ("v1/", "app.bin"),
         ("v1", "x/../../../../fixture-dev/other/app.bin"),
         ("v1", "./app.bin"),
+        ("v1", ""),
+        ("v1", "/app.bin"),
+        ("v1", "app.bin/"),
+        ("v1", "app\n.bin"),
     ] {
         let error = public
             .fetch(&common::slug(APP), tag, asset, &dest, 1024)

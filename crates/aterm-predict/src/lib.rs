@@ -738,56 +738,6 @@ pub const fn compute_glitch_window_ms(srtt_us: Option<u32>, expiry_backoff: u8) 
     }
 }
 
-/// Computes one fixed-point EWMA SRTT update step in microseconds (`0.7 * prev + 0.3 * sample`).
-#[must_use]
-#[inline]
-pub const fn ewma_srtt_step_us(prev_srtt_us: Option<u32>, sample_us: u32) -> u32 {
-    match prev_srtt_us {
-        None => sample_us,
-        Some(prev) => {
-            let weighted = (prev as u64)
-                .saturating_mul(7)
-                .saturating_add((sample_us as u64).saturating_mul(3))
-                / 10;
-            if weighted > (u32::MAX as u64) {
-                u32::MAX
-            } else {
-                weighted as u32
-            }
-        }
-    }
-}
-
-/// Encodes a predicted ghost cell `(row, col, ch, epoch)` into a 16-byte little-endian wire record.
-#[must_use]
-#[inline]
-pub const fn encode_predicted_ghost_wire_le(row: u16, col: u16, ch: char, epoch: u64) -> [u8; 16] {
-    let r = row.to_le_bytes();
-    let c = col.to_le_bytes();
-    let g = (ch as u32).to_le_bytes();
-    let e = epoch.to_le_bytes();
-    [
-        r[0], r[1], c[0], c[1], g[0], g[1], g[2], g[3], e[0], e[1], e[2], e[3], e[4], e[5], e[6],
-        e[7],
-    ]
-}
-
-/// Decodes a 16-byte little-endian ghost cell record from [`encode_predicted_ghost_wire_le`].
-#[must_use]
-#[inline]
-pub const fn decode_predicted_ghost_wire_le(wire: &[u8; 16]) -> Option<(u16, u16, char, u64)> {
-    let row = u16::from_le_bytes([wire[0], wire[1]]);
-    let col = u16::from_le_bytes([wire[2], wire[3]]);
-    let raw_ch = u32::from_le_bytes([wire[4], wire[5], wire[6], wire[7]]);
-    let Some(ch) = char::from_u32(raw_ch) else {
-        return None;
-    };
-    let epoch = u64::from_le_bytes([
-        wire[8], wire[9], wire[10], wire[11], wire[12], wire[13], wire[14], wire[15],
-    ]);
-    Some((row, col, ch, epoch))
-}
-
 /// Returns `true` if `bytes` is a pure line-submit sequence ending in CR or LF with no control edits.
 #[must_use]
 #[inline]
@@ -1067,6 +1017,9 @@ impl Predictor {
             return false;
         }
         self.observe_coordinates(coords);
+        if self.grid_cols != cols {
+            self.deferred_wrap = false;
+        }
         self.grid_cols = cols;
         self.observe_cancelled_cursor(Some(cursor), now);
         self.settle_chain();
@@ -1272,6 +1225,9 @@ impl Predictor {
             return EditOutcome::Declined;
         }
         self.observe_coordinates(sample.coords);
+        if self.grid_cols != cols {
+            self.deferred_wrap = false;
+        }
         self.grid_cols = cols;
         self.observe_cancelled_cursor(Some(sample.cursor), now);
         self.settle_chain();
@@ -4009,24 +3965,6 @@ mod tests {
     }
 
     #[test]
-    fn expired_prediction_clears_next_deadline() {
-        let mut p = Predictor::new(PredictMode::Always);
-        let now = t0();
-        p.predict_char('a', (0, 0), G, 80, now);
-        assert!(
-            p.next_deadline().is_some(),
-            "a pending guess arms a deadline"
-        );
-        let late = now + Duration::from_millis(GLITCH_FLOOR_MS + 50);
-        let _ = p.overlay(late);
-        assert!(p.idle(), "stale guess flushed past the glitch window");
-        assert!(
-            p.next_deadline().is_none(),
-            "after the expiry flush the deadline self-disarms (no permanently-past wake)"
-        );
-    }
-
-    #[test]
     fn backspace_cancels_pending_prediction() {
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
@@ -4392,6 +4330,18 @@ mod tests {
             (shown[0].row, shown[0].col, shown[0].ch),
             (1, 0, 'b'),
             "a parked cursor wraps the next glyph to the following row"
+        );
+
+        let mut resized = Predictor::new(PredictMode::Always);
+        assert!(at_the_end(&mut resized, 'a', (0, 79), (80, 24), now));
+        resized.reconcile(Some((0, 79)), G, false, now, cell(&[((0, 79), 'a')]));
+        assert!(resized.deferred_wrap);
+        assert!(resized.predict_char_in_grid('b', (0, 99), G, (100, 24), now));
+        let shown = resized.overlay(now);
+        assert_eq!(
+            (shown[0].row, shown[0].col, shown[0].ch),
+            (0, 99, 'b'),
+            "changing cols clears a stale deferred_wrap latched at the previous width"
         );
     }
 
@@ -7183,23 +7133,12 @@ mod tests {
     }
 
     #[test]
-    fn glitch_window_ewma_and_ghost_wire_codec_round_trip() {
+    fn compute_glitch_window_ms_is_floored_backed_off_and_capped() {
         assert_eq!(compute_glitch_window_ms(None, 0), 250);
         assert_eq!(compute_glitch_window_ms(None, 2), 1000);
         assert_eq!(compute_glitch_window_ms(None, 9), 2000);
         assert_eq!(compute_glitch_window_ms(Some(120_000), 0), 360);
         assert_eq!(compute_glitch_window_ms(Some(900_000), 0), 2000);
-
-        let srtt0 = ewma_srtt_step_us(None, 100_000);
-        assert_eq!(srtt0, 100_000);
-        let srtt1 = ewma_srtt_step_us(Some(srtt0), 200_000);
-        assert_eq!(srtt1, 130_000);
-
-        let wire = encode_predicted_ghost_wire_le(4, 19, 'λ', 42);
-        assert_eq!(
-            decode_predicted_ghost_wire_le(&wire),
-            Some((4, 19, 'λ', 42))
-        );
     }
 
     #[test]

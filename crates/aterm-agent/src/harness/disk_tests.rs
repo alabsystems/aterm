@@ -1460,8 +1460,8 @@ fn the_lines_on_four_volumes_hold_the_unwritten_defaults_to_a_small_volumes_shar
     for (total, warn, floor, emergency) in [
         (128_000_000_000, 23, 10, 4),
         (256_000_000_000, 40, 12, 4),
-        (owners_mac, 64, 32, 8),
-        (4_000_000_000_000, 64, 32, 8),
+        (owners_mac, 149, 93, 8),
+        (4_000_000_000_000, 299, 187, 8),
     ] {
         let t = Config::default().thresholds(Some(total));
         assert_eq!(
@@ -1486,7 +1486,7 @@ fn the_lines_on_four_volumes_hold_the_unwritten_defaults_to_a_small_volumes_shar
 
 #[test]
 fn the_volume_share_is_capped_and_a_written_knob_is_read_as_written() {
-    let huge = 4096 * GIB;
+    let huge = 8192 * GIB;
     let t = Config::default().thresholds(Some(huge));
     assert_eq!(
         (t.floor, t.warn, t.emergency),

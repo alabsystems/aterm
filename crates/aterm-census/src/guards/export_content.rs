@@ -501,31 +501,28 @@ enum Lines<'a> {
     },
 }
 
-/// Each line of `text`, as `grep` reads it, held to the rows. The engine reads
-/// the lines its text grep prints as UTF-8 and aborts its whole scan on one
-/// that is not (its BUG-3), so such a line that matches is a finding no tag
-/// clears.
+/// Each line of `text`, as `grep` splits it, held to the rows. The engine runs
+/// its grep under `LC_ALL=C`, so it matches bytes whatever the locale, and it
+/// decodes what grep prints lossily, a byte that is not UTF-8 reading as
+/// U+FFFD, so a text line's tag clears a credential row whatever bytes the
+/// line holds. Each line is held as that lossy reading of it, which is the
+/// engine's verdict.
 fn by_line(rel: &str, text: &[u8], how: Lines<'_>, held: &Held<'_>, out: &mut Vec<Finding>) {
     let binary = !matches!(how, Lines::Text);
-    let lines: Vec<(&[u8], std::borrow::Cow<'_, str>)> = text
+    let lines: Vec<std::borrow::Cow<'_, str>> = text
         .split(|&b| b == b'\n')
-        .map(|raw| (raw, String::from_utf8_lossy(raw)))
+        .map(String::from_utf8_lossy)
         .collect();
     let mut reported = BTreeSet::new();
     for (k, i) in held.candidates(text) {
         if binary && reported.contains(&k) {
             continue;
         }
-        let (raw, line) = &lines[i];
+        let line = &lines[i];
         let row = held.rows[k];
         let source = &row.source;
         let detail = match (row.line.try_is_match(line), how) {
             (Ok(false), _) => continue,
-            (Ok(true), Lines::Text) if std::str::from_utf8(raw).is_err() => format!(
-                "as exported, this line matches {source} and its bytes are not UTF-8: the \
-                 engine's grep prints it and the engine aborts its scan on output that is not \
-                 UTF-8 (its BUG-3), whatever tag the line carries; write the line as UTF-8"
-            ),
             (Ok(true), Lines::Text) if held.credential[k] && line.contains(ALLOW_TAG) => continue,
             (Ok(true), Lines::Text) => format!(
                 "as exported, this line matches {source}; replace the text, or spell what a \

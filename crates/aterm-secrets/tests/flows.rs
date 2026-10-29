@@ -10,12 +10,18 @@ use aterm_secrets::age::Identity;
 use aterm_secrets::client::{
     self, Approval, JoinOptions, JoinOutcome, Membership, Paths, ProbeOutcome, SyncOutcome,
 };
+use aterm_secrets::commons::bootstrap::{Bootstrap, Device};
+use aterm_secrets::commons::journal::Journal;
 use aterm_secrets::envelope::{self, Unsigned};
+use aterm_secrets::members::{Allowed, Bundle, desk, join, joiner};
+use aterm_secrets::phrase::Phrase;
 use aterm_secrets::server::{self, Options, Running};
 use aterm_secrets::text::{Audience, Document};
 use aterm_secrets::transport::{self, Source};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 fn synthetic(label: &str) -> String {
@@ -90,6 +96,22 @@ impl Lab {
         std::fs::remove_dir_all(&store).expect("store removed");
         let copy = self.socket.try_clone().expect("a copy of the socket");
         self.server = Some(start(copy, store, self.hold, self.gap));
+    }
+
+    /// Stop the server: no admin's approver, and no vault, can be reached.
+    fn stop(&mut self) {
+        self.server.take().expect("running").stop();
+    }
+
+    /// Serve the same store again at the same address.
+    fn restart(&mut self) {
+        let copy = self.socket.try_clone().expect("a copy of the socket");
+        self.server = Some(start(
+            copy,
+            self.root.path().join("store"),
+            self.hold,
+            self.gap,
+        ));
     }
 
     fn home(&self, name: &str) -> Paths {
@@ -390,6 +412,7 @@ fn the_server_and_every_reader_refuse_a_key_the_vault_never_endorsed() {
             seq: 99,
             time: 0,
             handoff: Vec::new(),
+            parents: Vec::new(),
             lockers: Vec::new(),
         },
         &seed,
@@ -656,9 +679,215 @@ fn a_machine_that_knows_the_join_password_is_let_in_by_the_admins_subscriber() {
     assert!(!shown, "a member's files hold the join password");
 }
 
+/// `member` lets `joiner` in the way a person does: `joiner` asks its desk, Allow there shows a
+/// phrase, `joiner` runs the phrase and gets the member's bundle. Returns the bundle, whose
+/// Allowed the member signed.
+fn allow_through(member: &Paths, joiner: &Paths, host: &str) -> Bundle {
+    let local = desk::Local::of(member)
+        .expect("member state")
+        .expect("a Commons member");
+    let desk = Mutex::new(desk::Desk::new(local));
+    client::machine_identity(joiner).expect("identity");
+    let device = Device::open(joiner).expect("device").expect("an identity");
+    let joining = joiner::Joining {
+        device: &device,
+        node: [7; 32],
+        name: host.into(),
+        model: "Mac15,3".into(),
+    };
+    let from: std::net::IpAddr = [127, 0, 0, 1].into();
+    let bundle = |handing: &desk::Handing<'_>| client::hand_over(member, handing);
+    let connect = |speak: &dyn Fn(&mut UnixStream)| {
+        let (mut ours, mut theirs) = UnixStream::pair().expect("pair");
+        for end in [&ours, &theirs] {
+            end.set_read_timeout(Some(Duration::from_secs(60)))
+                .expect("a one-minute hang detector");
+        }
+        std::thread::scope(|scope| {
+            let served = scope.spawn(|| desk::serve(&desk, &mut ours, from, &bundle));
+            speak(&mut theirs);
+            drop(theirs);
+            served.join().expect("member").expect("served")
+        })
+    };
+    connect(&|stream| {
+        let greeting = joiner::greeting(stream).expect("greeting");
+        joiner::ask(stream, &greeting, &joining).expect("asked");
+    });
+    let words = {
+        let mut desk = desk.lock().unwrap();
+        let now = aterm_time::Instant::now();
+        let row = desk.rows(now)[0].id;
+        let phrase = desk.allow(row, now).expect("Allow");
+        desk.words(phrase, now).expect("live").join(" ")
+    };
+    let phrase = Phrase::parse(&words).expect("three words");
+    let got = std::cell::RefCell::new(None);
+    let let_in = connect(&|stream| {
+        let greeting = joiner::greeting(stream).expect("greeting");
+        *got.borrow_mut() = Some(joiner::run(stream, &greeting, &joining, &phrase).expect("run"));
+    })
+    .expect("the run sent its bundle");
+    let bundle = got.into_inner().expect("a bundle");
+    assert_eq!(bundle.allowed, let_in.allowed);
+    bundle
+}
+
+/// install.sh's windowless lanes run `aterm members join --no-wait` (§3.3.3): it asks every
+/// member it finds at once and returns within install.sh's bound (`VERIFY_WAIT_SECS`, 60 s),
+/// a member that never answers and one that is gone included, leaving its request on the
+/// member's desk. The phrase a person then reads off that member and types gets the new Mac
+/// GitHub, publishing and AI accounts in `~/.secrets` at once, before any admin's approver
+/// runs; the request it posts with its Allowed is admitted when one does.
 #[test]
-fn an_open_vault_lets_in_every_machine_that_asks_with_no_password() {
-    let lab = Lab::new("open");
+fn the_install_lane_returns_within_its_bound_and_leaves_a_pending_request() {
+    let lab = Lab::changing("lane");
+    let admin = lab.home("ma");
+    let files = [
+        ("gh_access_token", synthetic("gh")),
+        ("gh_access_token_alabsystems", synthetic("publish")),
+        ("ai-accounts.csv", "claude,first@example.com\n".to_owned()),
+    ];
+    for (name, value) in &files {
+        write_private(&admin.home.join(".secrets").join(name), value);
+    }
+    client::create(
+        &admin,
+        &lab.url,
+        Some(&admin.home.join(".secrets")),
+        Some("ma"),
+    )
+    .expect("create");
+    let member = Mutex::new(desk::Desk::new(
+        desk::Local::of(&admin)
+            .expect("member state")
+            .expect("a Commons member"),
+    ));
+    let machine = lab.home("mb");
+    client::machine_identity(&machine).expect("identity");
+    let device = Device::open(&machine)
+        .expect("device")
+        .expect("an identity");
+    let joining = joiner::Joining {
+        device: &device,
+        node: [7; 32],
+        name: "mb".into(),
+        model: "Mac15,3".into(),
+    };
+    let bundle = |handing: &desk::Handing<'_>| client::hand_over(&admin, handing);
+    std::thread::scope(|scope| {
+        let mut silent_ends = Vec::new();
+        let silent = Mutex::new(&mut silent_ends);
+        let dial = |at: &str| -> aterm_secrets::Result<Box<dyn join::Stream>> {
+            let (ours, theirs) = UnixStream::pair()?;
+            match at {
+                "ma" => {
+                    for end in [&ours, &theirs] {
+                        end.set_read_timeout(Some(Duration::from_secs(60)))?;
+                    }
+                    let (member, bundle) = (&member, &bundle);
+                    scope.spawn(move || {
+                        let mut ours = ours;
+                        let _ = desk::serve(member, &mut ours, [10, 0, 0, 9].into(), bundle);
+                    });
+                    Ok(Box::new(theirs))
+                }
+                // A member that takes the connection and never speaks: the dial's own bound,
+                // as `dial_ask`'s handshake has one, ends the wait.
+                "silent" => {
+                    theirs.set_read_timeout(Some(Duration::from_secs(2)))?;
+                    silent.lock().unwrap().push(ours);
+                    Ok(Box::new(theirs))
+                }
+                _ => Err(aterm_secrets::Error::new("connection refused")),
+            }
+        };
+        let ats = ["ma", "silent", "gone"].map(String::from);
+        let started = std::time::Instant::now();
+        let (heard, missed) = join::ask_all(&dial, &joining, &ats);
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "past install.sh's bound: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(heard.len(), 1, "{missed:?}");
+        assert_eq!(heard[0].answer, desk::Answer::Asking);
+        let mut missed: Vec<&str> = missed.iter().map(|(at, _)| at.as_str()).collect();
+        missed.sort_unstable();
+        assert_eq!(missed, ["gone", "silent"]);
+        let now = aterm_time::Instant::now();
+        let rows = member.lock().unwrap().rows(now);
+        assert_eq!(rows.len(), 1, "the request waits on the member's desk");
+        assert_eq!(
+            (rows[0].name.as_str(), rows[0].state),
+            ("mb", desk::RowState::Asking)
+        );
+        assert_eq!(
+            read(&machine, "gh_access_token"),
+            None,
+            "nothing before an Allow"
+        );
+        assert!(
+            join::pick(&heard, None).is_err(),
+            "no phrase is shown for this Mac yet"
+        );
+
+        // A person presses Allow on ma, and types its phrase on mb; no approver runs.
+        let words = {
+            let mut desk = member.lock().unwrap();
+            let phrase = desk.allow(rows[0].id, now).expect("Allow");
+            desk.words(phrase, now).expect("live").join(" ")
+        };
+        let phrase = Phrase::parse(&words).expect("three words");
+        let (heard, _) = join::ask_all(&dial, &joining, &ats);
+        assert_eq!(heard[0].answer, desk::Answer::Allowed);
+        let joined = join::run_phrase(&machine, &dial, &joining, &heard, &phrase, None)
+            .expect("the phrase let it in");
+        assert_eq!((joined.member.as_str(), joined.name.as_str()), ("ma", "mb"));
+        assert!(
+            matches!(joined.admission, join::Admission::Asked(Ok(_))),
+            "a vault with no log asks its server with the Allowed: {:?}",
+            joined.admission
+        );
+        for (name, value) in &files {
+            assert_eq!(
+                read(&machine, name).as_deref(),
+                Some(value.as_str()),
+                "{name}"
+            );
+        }
+        assert!(matches!(
+            client::status(&machine).expect("status").membership,
+            Membership::Pending
+        ));
+        assert_eq!(
+            member.lock().unwrap().rows(aterm_time::Instant::now())[0].state,
+            desk::RowState::Closed
+        );
+    });
+
+    assert_eq!(approved(&admin), ["mb"], "the request carried its Allowed");
+    applied(client::sync(&machine, None).expect("sync"));
+    assert!(matches!(
+        client::status(&machine).expect("status").membership,
+        Membership::In { .. }
+    ));
+}
+
+/// What the approver judged of `admin`'s queue: the names it let in.
+fn approved(admin: &Paths) -> Vec<String> {
+    let mut approved = client::auto_approve(admin).expect("approve").approved;
+    approved.sort_unstable();
+    approved
+}
+
+/// An open vault (`open = yes`) lets no machine in by itself: not one that asks with no
+/// password, nor one that proves an old one. Only a request carrying a member's Allow is
+/// admitted, recorded as a person's decision, and once the vault lets that machine go, its
+/// Allow, still queued, cannot bring it back (docs/DESIGN-fluid-swarm-2026-10-28.md F10).
+#[test]
+fn a_request_with_no_allow_is_never_admitted() {
+    let lab = Lab::changing("open");
     let admin = lab.home("ma");
     let token = synthetic("gh");
     write_private(&admin.home.join(".secrets/gh_access_token"), &token);
@@ -674,27 +903,13 @@ fn an_open_vault_lets_in_every_machine_that_asks_with_no_password() {
         .doc
         .join_password()
         .expect("create makes a join password");
-    let pinned = format!("{}#{}", lab.url, created.signer);
-    let early = lab.home("me");
-    join_unattended(&early, &pinned, "me").expect("join");
-    let closed = client::auto_approve(&admin).expect("approve");
-    assert!(closed.approved.is_empty(), "{:?}", closed.approved);
-
     let opened = client::admin_open(&admin).expect("open");
-    let me = client::requests(&admin, Some(&opened.doc)).expect("requests")[0]
-        .recipient
-        .clone();
     let mut doc = opened.doc.clone();
     doc.set_open(true).expect("open");
-    let published = client::admin_publish(&admin, &opened, &doc).expect("publish");
-    let asked: Vec<&str> = published.held.iter().map(|r| r.host.as_str()).collect();
-    assert_eq!(asked, ["me"]);
-    assert!(!published.kept_out);
+    client::admin_publish(&admin, &opened, &doc).expect("publish");
     let doc = client::admin_open(&admin).expect("open").doc.clone();
-    assert!(doc.open());
-    assert!(doc.join_password().is_none());
-    assert_eq!(doc.code_only(), std::slice::from_ref(&me));
     assert_eq!(Approval::of(&doc), Some(Approval::Open));
+    let pinned = format!("{}#{}", lab.url, created.signer);
 
     let machine = lab.home("mb");
     assert!(matches!(
@@ -703,114 +918,120 @@ fn an_open_vault_lets_in_every_machine_that_asks_with_no_password() {
     ));
     let proving = lab.home("mc");
     join_with(&proving, &pinned, "mc", Some(password.as_slice())).expect("join");
-    let listed = || client::requests(&admin, None).expect("requests");
-    let mut settled = client::Settled::default();
-    let approval = Approval::Open;
-    let source = client::config(&admin).expect("config").expect("configured");
-    assert!(settled.due(&source, held(&admin), &listed(), approval));
     let done = client::auto_approve(&admin).expect("approve");
-    let mut approved = done.approved.clone();
-    approved.sort_unstable();
-    assert_eq!(approved, ["mb", "mc"]);
-    assert!(done.refused.is_empty());
-    assert_eq!(done.code_only, std::slice::from_ref(&me));
-    settled.settle(done.judged);
-    assert_eq!(
-        client::sync(&early, None).expect("sync"),
-        SyncOutcome::NotIn
-    );
-    approve_key(&admin, "me", &me);
-    assert!(
-        client::admin_open(&admin)
-            .expect("open")
-            .doc
-            .code_only()
-            .is_empty()
-    );
-    for member in [&machine, &proving, &early] {
-        applied(client::sync(member, None).expect("sync"));
-        assert_eq!(
-            read(member, "gh_access_token").as_deref(),
-            Some(token.as_str())
-        );
-    }
-    let seq = held(&admin);
-    assert!(settled.due(&source, seq, &listed(), approval));
-    let again = client::auto_approve(&admin).expect("approve");
-    assert!(again.approved.is_empty() && again.code_only.is_empty());
-    assert_eq!(again.seq, None);
-    assert_eq!(held(&admin), seq);
-    settled.settle(again.judged);
-    assert!(!settled.due(&source, held(&admin), &listed(), approval));
-
-    let open = client::admin_open(&admin).expect("open");
-    let mb = recipient_of(&open.doc, "mb");
-    let gone = client::admin_revoke(&admin, &open, "mb", false)
-        .expect("revoke")
-        .published;
-    assert!(gone.kept_out && !gone.password_renewed && gone.held.is_empty());
-    assert!(gone.queued, "a served vault's approver reads its queue");
-    let kept = client::admin_open(&admin).expect("open").doc.clone();
-    assert!(kept.open());
-    assert_eq!(kept.code_only(), std::slice::from_ref(&mb));
-    join_unattended(&machine, &pinned, "mb").expect("join");
-    let after = client::auto_approve(&admin).expect("approve");
-    assert!(after.approved.is_empty(), "{:?}", after.approved);
-    assert_eq!(after.code_only, std::slice::from_ref(&mb));
-    assert_eq!(after.seq, None);
+    assert!(done.approved.is_empty(), "{:?}", done.approved);
+    let mut asking: Vec<&str> = done.asking.iter().map(|a| a.host.as_str()).collect();
+    asking.sort_unstable();
+    assert_eq!(asking, ["mb", "mc"], "both still wait for a person");
     assert_eq!(
         client::sync(&machine, None).expect("sync"),
         SyncOutcome::NotIn
     );
-    set(&admin, &Audience::Everyone, "note", "kept");
-    let noted = client::admin_open(&admin).expect("open").doc.clone();
-    assert!(noted.open());
-    assert_eq!(noted.code_only(), std::slice::from_ref(&mb));
 
-    let open = client::admin_open(&admin).expect("open");
-    let mut doc = open.doc.clone();
-    doc.set_open(false).expect("close");
-    client::admin_publish(&admin, &open, &doc).expect("publish");
-    let closed = client::admin_open(&admin).expect("open").doc.clone();
-    assert!(!closed.open() && closed.join_password().is_none());
-    assert_eq!(Approval::of(&closed), None);
-    let late = lab.home("md");
-    join_unattended(&late, &pinned, "md").expect("join");
-    let refused = client::auto_approve(&admin).expect("approve");
-    assert!(refused.approved.is_empty(), "{:?}", refused.approved);
-    assert_eq!(client::sync(&late, None).expect("sync"), SyncOutcome::NotIn);
-
-    let open = client::admin_open(&admin).expect("open");
-    let md = client::requests(&admin, Some(&open.doc))
-        .expect("requests")
-        .into_iter()
-        .find(|request| request.host == "md")
-        .expect("md asks")
-        .recipient;
-    let mut doc = open.doc.clone();
-    doc.set_open(true).expect("open");
-    let reopened = client::admin_publish(&admin, &open, &doc).expect("publish");
-    let asked: Vec<&str> = reopened.held.iter().map(|r| r.host.as_str()).collect();
-    assert_eq!(asked, ["md"], "mb's key is code-only already");
-    let none = client::auto_approve(&admin).expect("approve");
-    assert!(none.approved.is_empty(), "{:?}", none.approved);
-    let mut waiting = none.code_only.clone();
-    waiting.sort_unstable();
-    let mut want = vec![mb.clone(), md.clone()];
-    want.sort_unstable();
-    assert_eq!(waiting, want);
-
-    approve_key(&admin, "mb", &mb);
-    let back = client::admin_open(&admin).expect("open").doc.clone();
-    assert_eq!(back.code_only(), std::slice::from_ref(&md));
+    let bundle = allow_through(&admin, &machine, "mb");
+    client::post_allowed(&admin, &bundle.allowed).expect("posted");
+    assert_eq!(approved(&admin), ["mb"], "the Allowed request");
+    let doc = client::admin_open(&admin).expect("open").doc.clone();
+    let mb = recipient_of(&doc, "mb");
+    assert_eq!(
+        client::admin_cached(&admin)
+            .expect("admin")
+            .commons_admission("mb")
+            .expect("recorded")
+            .method,
+        client::AdmissionMethod::Manual
+    );
     applied(client::sync(&machine, None).expect("sync"));
+    assert_eq!(
+        read(&machine, "gh_access_token").as_deref(),
+        Some(token.as_str())
+    );
+    assert_eq!(
+        client::sync(&proving, None).expect("sync"),
+        SyncOutcome::NotIn
+    );
+
+    let open = client::admin_open(&admin).expect("open");
+    client::admin_revoke(&admin, &open, "mb", false).expect("revoke");
+    let kept = client::admin_open(&admin).expect("open").doc.clone();
+    assert_eq!(kept.code_only(), std::slice::from_ref(&mb));
+    client::post_allowed(&admin, &bundle.allowed).expect("posted again");
+    assert!(approved(&admin).is_empty(), "a let-go key's old Allow");
+    assert!(matches!(
+        client::sync(&machine, None).expect("sync"),
+        SyncOutcome::NotIn
+    ));
 }
 
-/// A vault `create` makes is open (owner, 2026-10-26: "default ON"): a machine that types no
-/// password is let in by the admin's next approver pass, and the vault holds no join password.
+/// What `paths` holds of Commons control: its state (one head, or a conflict of several) and
+/// every control node it holds; `None` while it holds no Commons control at all.
+fn control(paths: &Paths) -> Option<(String, Vec<String>)> {
+    let bootstrap = Bootstrap::cached(paths).expect("Commons state")?;
+    let journal = Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust())
+        .expect("control journal");
+    let mut nodes: Vec<String> = journal.inventory().map(|id| format!("{id:?}")).collect();
+    nodes.sort_unstable();
+    Some((format!("{:?}", journal.state()), nodes))
+}
+
+/// An Allow writes no Commons control: the member signs an `Allowed` with its writer key, the new
+/// Mac holds no control of its own while it waits, and the admin's approver records a vault
+/// admission, never a control node. Two Allows of two Macs, as members on the two sides of a
+/// split press them, so leave every control history one head; a control node is still written
+/// only by the enrollment an admin's Commons runtime makes (`docs/measured/
+/// swarm-partition-2026-10-28.md`: admins enrolling on both sides fork it until F18).
 #[test]
-fn a_new_vault_is_open_and_lets_in_a_machine_that_types_no_password() {
-    let lab = Lab::new("new-open");
+fn an_allow_writes_no_commons_control_so_two_sides_of_a_split_cannot_fork_it() {
+    let lab = Lab::changing("no-fork");
+    let admin = lab.home("ma");
+    write_private(
+        &admin.home.join(".secrets/gh_access_token"),
+        &synthetic("gh"),
+    );
+    client::create(
+        &admin,
+        &lab.url,
+        Some(&admin.home.join(".secrets")),
+        Some("ma"),
+    )
+    .expect("create");
+    let before = control(&admin).expect("the founder holds Commons control");
+    assert!(before.0.starts_with("Ready"), "{}", before.0);
+
+    let (mb, mc) = (lab.home("mb"), lab.home("mc"));
+    let bundles = [
+        allow_through(&admin, &mb, "mb"),
+        allow_through(&admin, &mc, "mc"),
+    ];
+    for (machine, bundle) in [(&mb, &bundles[0]), (&mc, &bundles[1])] {
+        client::write_from_bundle(machine, bundle).expect("written");
+        assert_eq!(control(machine), None, "a Mac let in by an Allow");
+    }
+    assert_eq!(control(&admin).as_ref(), Some(&before), "an Allow");
+
+    for bundle in &bundles {
+        client::post_allowed(&admin, &bundle.allowed).expect("posted");
+    }
+    assert_eq!(approved(&admin), ["mb", "mc"]);
+    assert_eq!(
+        control(&admin).as_ref(),
+        Some(&before),
+        "the approver's admissions"
+    );
+    for machine in [&mb, &mc] {
+        applied(client::sync(machine, None).expect("sync"));
+        assert!(
+            control(machine).is_none_or(|held| held.1.iter().all(|id| before.1.contains(id))),
+            "an admitted Mac holds a control node the founder does not"
+        );
+    }
+}
+
+/// A vault `create` makes is open (owner, 2026-10-26: "default ON") and holds no join password,
+/// and it lets in only a machine a member Allowed: one that types nothing still waits.
+#[test]
+fn a_new_vault_lets_in_a_machine_a_member_allowed() {
+    let lab = Lab::changing("new-open");
     let admin = lab.home("ma");
     let token = synthetic("gh");
     write_private(&admin.home.join(".secrets/gh_access_token"), &token);
@@ -833,10 +1054,12 @@ fn a_new_vault_is_open_and_lets_in_a_machine_that_types_no_password() {
         join_unattended(&machine, &pinned, "mb").expect("join"),
         JoinOutcome::Pending { .. }
     ));
+    assert!(approved(&admin).is_empty());
+    let bundle = allow_through(&admin, &machine, "mb");
+    client::post_allowed(&admin, &bundle.allowed).expect("posted");
     let done = client::auto_approve(&admin).expect("approve");
     assert_eq!(done.approved, ["mb"]);
     assert!(done.refused.is_empty() && done.code_only.is_empty());
-    assert_eq!(done.seq, Some(2));
     applied(client::sync(&machine, None).expect("sync"));
     assert_eq!(
         read(&machine, "gh_access_token").as_deref(),
@@ -844,12 +1067,114 @@ fn a_new_vault_is_open_and_lets_in_a_machine_that_types_no_password() {
     );
 }
 
-fn approve_key(admin_paths: &Paths, host: &str, key: &str) {
-    let open = client::admin_open(admin_paths).expect("open");
-    let mut doc = open.doc.clone();
-    let host = client::free_name(&doc, host);
-    doc.add_machine(&host, key).expect("add");
-    client::admin_publish(admin_paths, &open, &doc).expect("publish");
+/// An Allow signed by a key the admin's Commons roster binds to no member admits nothing: the
+/// envelope's `[machines]` keys are age keys, which cannot sign, so only the roster says who
+/// allowed.
+#[test]
+fn an_allowed_signed_by_a_key_no_roster_member_binds_is_refused() {
+    let lab = Lab::changing("forged");
+    let admin = lab.home("ma");
+    let created = client::create(&admin, &lab.url, None, Some("ma")).expect("create");
+    let pinned = format!("{}#{}", lab.url, created.signer);
+    let machine = lab.home("mb");
+    join_unattended(&machine, &pinned, "mb").expect("join");
+    let trust = Bootstrap::cached(&admin)
+        .expect("bootstrap")
+        .expect("Commons")
+        .trust();
+    let device = Device::open(&machine).expect("device").expect("identity");
+    let request = device
+        .request(trust.network, trust.authority)
+        .expect("request");
+    let stranger = [0x5a; 32];
+    let forged = Allowed::sign(request.binding(), "mb", &stranger).expect("signed");
+    let post = |allowed: &Allowed| {
+        let recipient = request.binding().recipient();
+        let line = transport::JoinRequest {
+            recipient: recipient.to_bech32(),
+            host: "mb".into(),
+            code: client::join_code(&recipient),
+            time: None,
+            allowed: Some(allowed.to_text()),
+            proof: None,
+        }
+        .line();
+        transport::post_join(&lab.url, &line).expect("posted");
+    };
+    post(&forged);
+    assert!(approved(&admin).is_empty(), "a forged Allow admitted");
+    assert_eq!(
+        client::sync(&machine, None).expect("sync"),
+        SyncOutcome::NotIn
+    );
+    // Control: the same request, Allowed by the member the roster binds, is let in.
+    let bundle = allow_through(&admin, &machine, "mb");
+    post(&bundle.allowed);
+    assert_eq!(approved(&admin), ["mb"]);
+}
+
+/// A Mac a member Allowed while no admin's approver can run writes `~/.secrets` from the
+/// member's bundle at once, stays pending, and the admission it later gets finds those files
+/// already the vault's.
+#[test]
+fn a_mac_allowed_with_no_admin_reachable_writes_its_secrets_from_the_bundle() {
+    let mut lab = Lab::changing("handover");
+    let admin = lab.home("ma");
+    let token = synthetic("gh");
+    write_private(&admin.home.join(".secrets/gh_access_token"), &token);
+    client::create(
+        &admin,
+        &lab.url,
+        Some(&admin.home.join(".secrets")),
+        Some("ma"),
+    )
+    .expect("create");
+    set(
+        &admin,
+        &Audience::Hosts(vec!["ma".into()]),
+        "only_ma",
+        "kept",
+    );
+    let machine = lab.home("mb");
+    let bundle = allow_through(&admin, &machine, "mb");
+    lab.stop();
+    let report = client::write_from_bundle(&machine, &bundle).expect("written");
+    assert_eq!(report.written, ["gh_access_token"]);
+    assert_eq!(
+        read(&machine, "gh_access_token").as_deref(),
+        Some(token.as_str())
+    );
+    assert_eq!(read(&machine, "only_ma"), None, "only [everyone] files");
+    assert_eq!(mode(&machine.home.join(".secrets/gh_access_token")), 0o600);
+    assert!(matches!(
+        client::status(&machine).expect("status").membership,
+        Membership::Pending
+    ));
+    assert!(
+        client::write_from_bundle(&lab.home("mx"), &bundle).is_err(),
+        "a bundle for another Mac's key"
+    );
+
+    lab.restart();
+    client::post_allowed(&admin, &bundle.allowed).expect("posted");
+    assert_eq!(approved(&admin), ["mb"]);
+    assert_eq!(
+        client::config(&machine)
+            .expect("config")
+            .expect("set")
+            .source,
+        Source::Url(lab.url.clone())
+    );
+    let (_, report) = applied(client::sync(&machine, None).expect("sync"));
+    assert!(report.written.is_empty(), "{:?}", report.written);
+    assert!(matches!(
+        client::status(&machine).expect("status").membership,
+        Membership::In { .. }
+    ));
+    assert!(
+        !machine.dir.join("allowed").exists(),
+        "an admitted Mac forgets its Allow"
+    );
 }
 
 fn recipient_of(doc: &Document, name: &str) -> String {
@@ -1391,11 +1716,13 @@ fn the_approver_judges_a_corrected_request_at_once_and_rests_once_all_are_judged
         .expect("configured");
     assert_eq!(held(&other_admin), held(&admin));
     let request = listed().pop().expect("held member request");
+    let allowed = allow_through(&other_admin, &machine, "mb").allowed;
     let line = format!(
-        "{} {} {} proof={}",
+        "{} {} {} allowed={} proof={}",
         request.recipient,
         request.host,
         request.code,
+        allowed.to_text(),
         request.proof.as_deref().expect("its original proof")
     );
     transport::post_join(&other.url, &line).expect("same request to other open vault");
@@ -1878,9 +2205,11 @@ fn a_machine_asking_for_another_machines_code_as_its_name_is_let_in_under_anothe
     };
     let squatter = lab.home("mx");
     join_unattended(&squatter, &pinned, &code).expect("any machine name may be asked for");
-    let mut approved = client::auto_approve(&admin).expect("approve").approved;
-    approved.sort_unstable();
-    assert_eq!(approved, ["machine", "mb"]);
+    for (joiner, host) in [(&mac, "mb"), (&squatter, code.as_str())] {
+        let bundle = allow_through(&admin, joiner, host);
+        client::post_allowed(&admin, &bundle.allowed).expect("posted");
+    }
+    assert_eq!(approved(&admin), ["machine", "mb"]);
     let doc = client::admin_open(&admin).expect("open").doc.clone();
     assert!(doc.machines().iter().all(|machine| machine.name != code));
     assert_eq!(client::machine_named(&doc, &code).expect("its code"), "mb");
@@ -2000,4 +2329,138 @@ fn a_probe_answered_by_something_else_is_not_the_vault() {
             String::from_utf8_lossy(reply)
         );
     }
+}
+
+/// Across `DEFAULT_VAULT_URLS` and `_alab-vault._tcp` browse candidates, the highest verified
+/// `seq` wins while a forged higher `seq` (a vault under another signer, or a tampered `seq`
+/// header with an invalid signature) is ignored; negative control: accepting unverified parsed
+/// envelopes picks the forged higher `seq`.
+#[test]
+fn default_urls_and_browse_pick_the_highest_verified_seq_and_ignore_a_forged_higher_seq() {
+    use aterm_secrets::discover::{DiscoveredVault, candidate_urls};
+    use aterm_secrets::server::VaultTxt;
+
+    let frozen = Lab::new("alab");
+    let admin = frozen.home("ma");
+    let created = client::create(&admin, &frozen.url, None, Some("ma")).expect("create");
+    let signer = aterm_secrets::b64::decode_padded(&created.signer).expect("base64");
+    let pin: [u8; 32] = signer.as_slice().try_into().expect("32 bytes");
+
+    let ProbeOutcome::Found(seq1) = client::probe(&frozen.url, &pin, HANG_DETECTOR).expect("seq1")
+    else {
+        panic!("frozen server holds seq 1");
+    };
+    assert_eq!(seq1.seq, 1);
+
+    // Advance the genuine vault to seq 2 on a second server while `frozen` stays stuck at seq 1.
+    let fresh = Lab::new("alab");
+    aterm_secrets::transport::publish(
+        &aterm_secrets::transport::Source::Url(fresh.url.clone()),
+        &seq1.envelope,
+    )
+    .expect("seed fresh");
+    set(&admin, &Audience::Everyone, "token", "v2\n");
+    let ProbeOutcome::Found(seq2_from_admin) =
+        client::probe(&frozen.url, &pin, HANG_DETECTOR).expect("seq2")
+    else {
+        panic!("seq 2");
+    };
+    assert_eq!(seq2_from_admin.seq, 2);
+    // Reset `frozen` to a fresh server stuck at seq 1, and put seq 2 on `fresh`.
+    let stuck = Lab::new("alab");
+    aterm_secrets::transport::publish(
+        &aterm_secrets::transport::Source::Url(stuck.url.clone()),
+        &seq1.envelope,
+    )
+    .expect("seed stuck at seq 1");
+    aterm_secrets::transport::publish(
+        &aterm_secrets::transport::Source::Url(fresh.url.clone()),
+        &seq2_from_admin.envelope,
+    )
+    .expect("seed fresh at seq 2");
+
+    // Rogue server 1: a validly signed `alab` vault under an attacker's key, advanced to seq 3.
+    let rogue = Lab::new("alab");
+    let rogue_admin = rogue.home("evil");
+    let rogue_created =
+        client::create(&rogue_admin, &rogue.url, None, Some("evil")).expect("create rogue");
+    set(&rogue_admin, &Audience::Everyone, "k", "1\n");
+    set(&rogue_admin, &Audience::Everyone, "k", "2\n");
+    let rogue_signer = aterm_secrets::b64::decode_padded(&rogue_created.signer).expect("base64");
+    let rogue_pin: [u8; 32] = rogue_signer.as_slice().try_into().expect("32 bytes");
+    let ProbeOutcome::Found(rogue_env) =
+        client::probe(&rogue.url, &rogue_pin, HANG_DETECTOR).expect("rogue probe")
+    else {
+        panic!("rogue seq 3");
+    };
+    assert_eq!(rogue_env.seq, 3);
+
+    // Rogue server 2: a tampered envelope claiming `seq: 99` with an invalid signature.
+    let tampered_bytes = String::from_utf8(seq2_from_admin.envelope.clone())
+        .expect("utf8 envelope")
+        .replacen("seq: 2\n", "seq: 99\n", 1)
+        .into_bytes();
+    let mut tampered_reply = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+        tampered_bytes.len()
+    )
+    .into_bytes();
+    tampered_reply.extend_from_slice(&tampered_bytes);
+    let (tampered_url, tampered_heard) = answer_once(Box::leak(tampered_reply.into_boxed_slice()));
+
+    let mk_txt = |seq: u64| {
+        Some(VaultTxt {
+            vault: "alab".into(),
+            signer: created.fingerprint.clone(),
+            seq,
+            head: [0xab; 32],
+            label: None,
+        })
+    };
+    let defaults = ["http://127.0.0.1:9/v1/alab", stuck.url.as_str()];
+    let discovered = [
+        DiscoveredVault {
+            url: fresh.url.clone(),
+            txt: mk_txt(2),
+        },
+        DiscoveredVault {
+            url: rogue.url.clone(),
+            txt: mk_txt(3),
+        },
+        DiscoveredVault {
+            url: tampered_url.clone(),
+            txt: mk_txt(99),
+        },
+    ];
+    let urls = candidate_urls(&defaults, &discovered, "alab");
+    let outcome = client::probe_candidates(&urls, &pin, HANG_DETECTOR).expect("probed");
+    tampered_heard
+        .recv_timeout(HANG_DETECTOR)
+        .expect("tampered server was probed and rejected");
+    let ProbeOutcome::Found(winner) = outcome else {
+        panic!("expected verified winner, got {outcome:?}");
+    };
+    assert_eq!(winner.seq, 2, "highest verified seq wins");
+    assert_eq!(winner.url, fresh.url);
+
+    // Negative control: accepting unverified envelopes by header `seq` picks the forged `seq: 99`.
+    let accept_unverified = |bodies: &[(&str, &[u8])]| -> Option<(String, u64)> {
+        bodies
+            .iter()
+            .filter_map(|(url, bytes)| {
+                let parsed = aterm_secrets::envelope::parse(bytes).ok()?;
+                Some(((*url).to_owned(), parsed.seq))
+            })
+            .max_by_key(|(_, seq)| *seq)
+    };
+    assert_eq!(
+        accept_unverified(&[
+            (&stuck.url, &seq1.envelope),
+            (&fresh.url, &seq2_from_admin.envelope),
+            (&rogue.url, &rogue_env.envelope),
+            (&tampered_url, &tampered_bytes),
+        ]),
+        Some((tampered_url, 99)),
+        "CONTROL: accepting unverified envelopes takes the forged higher seq"
+    );
 }

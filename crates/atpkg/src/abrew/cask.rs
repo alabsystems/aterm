@@ -754,6 +754,12 @@ pub(super) fn git_raw_plan(cask: &Cask) -> Option<Vec<(String, String)>> {
         return None;
     }
     let (branch, only_path) = cask.git_branch_path.as_ref()?;
+    if !super::single_normal_segment(branch)
+        || only_path.is_empty()
+        || !only_path.split('/').all(super::single_normal_segment)
+    {
+        return None;
+    }
     let rest = cask.url.strip_prefix("https://github.com/")?;
     let mut parts = rest.split('/');
     let (owner, repo_git) = (parts.next()?, parts.next()?);
@@ -767,7 +773,7 @@ pub(super) fn git_raw_plan(cask: &Cask) -> Option<Vec<(String, String)>> {
     let mut plan: Vec<(String, String)> = Vec::new();
     for artifact in &cask.artifacts {
         let source = artifact_source(artifact)?;
-        if Path::new(source).components().count() != 1 {
+        if !super::single_normal_segment(source) {
             return None;
         }
         let source = source.to_string();
@@ -842,7 +848,7 @@ fn autodetect_naked(cask: &Cask) -> bool {
         let Some(s) = artifact_source(artifact) else {
             return false;
         };
-        if Path::new(s).components().count() != 1 {
+        if !super::single_normal_segment(s) {
             return false;
         }
         match source {
@@ -895,19 +901,18 @@ fn archive_magic(path: &Path) -> bool {
 }
 
 pub(super) fn download_name(cask: &Cask) -> String {
-    let base = cask
-        .url
+    let substituted = cask.url.replace("#{version}", &cask.version);
+    let without_fragment = substituted.split('#').next().unwrap_or(&substituted);
+    let without_query = without_fragment
         .split('?')
         .next()
-        .unwrap_or(&cask.url)
+        .unwrap_or(without_fragment);
+    let base = without_query
         .rsplit('/')
         .next()
+        .filter(|s| super::single_normal_segment(s))
         .unwrap_or("download");
-    format!(
-        "{}-{}",
-        cask.token,
-        base.replace("#{version}", &cask.version)
-    )
+    format!("{}-{base}", cask.token)
 }
 
 /// Validate the program mapping independently of payload IO, before download.
@@ -2472,6 +2477,22 @@ mod tests {
         c.url = "https://github.com/google/fonts.git".into();
         c.artifacts = vec![Artifact::Font("sub/Foo.ttf".into(), None)];
         assert!(git_raw_plan(&c).is_none());
+        for bad_source in ["..", ".", "/", "Foo.ttf/"] {
+            c.artifacts = vec![Artifact::Font(bad_source.into(), None)];
+            assert!(git_raw_plan(&c).is_none(), "{bad_source:?}");
+        }
+        c.artifacts = vec![Artifact::Font("ABeeZee-Regular.ttf".into(), None)];
+        for (bad_branch, bad_path) in [
+            ("..", "ofl/abeezee"),
+            (".", "ofl/abeezee"),
+            ("main", "ofl//abeezee"),
+            ("main", "/ofl/abeezee"),
+            ("main", "ofl/abeezee/"),
+            ("main", "ofl/../secret"),
+        ] {
+            c.git_branch_path = Some((bad_branch.into(), bad_path.into()));
+            assert!(git_raw_plan(&c).is_none(), "{bad_branch:?} {bad_path:?}");
+        }
     }
 
     #[test]
@@ -2485,6 +2506,27 @@ mod tests {
             "https://example.com/Foo.ttf",
             "Foo.ttf"
         )));
+        for bad_source in ["..", ".", "/", "Foo.ttf/"] {
+            assert!(
+                !autodetect_naked(&font("https://example.com/Foo.ttf", bad_source)),
+                "{bad_source:?}"
+            );
+        }
+        assert_eq!(
+            download_name(&font("https://example.com/download/", "Foo.ttf")),
+            "demo-download"
+        );
+        assert_eq!(
+            download_name(&font("https://example.com/..", "Foo.ttf")),
+            "demo-download"
+        );
+        assert_eq!(
+            download_name(&font(
+                "https://example.com/#{version}/Foo-#{version}.ttf?dl=1#frag",
+                "Foo.ttf"
+            )),
+            "demo-Foo-1.ttf"
+        );
         // Known archives and images are not naked.
         assert!(!autodetect_naked(&font(
             "https://example.com/Foo.zip",

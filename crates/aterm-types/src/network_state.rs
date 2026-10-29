@@ -26,7 +26,9 @@ pub enum Visibility {
     Offline,
     /// The person disabled discovery.
     Disabled,
-    /// Another local process owns transport; its liveness has not been read.
+    /// Another local process owns transport, or this observer waits before it may use the local
+    /// network (System State's Local Network step, or another macOS question of aterm's); the
+    /// owner's liveness has not been read.
     Waiting,
     /// Required control or local observation access is unavailable.
     Unavailable,
@@ -92,6 +94,9 @@ pub struct NetworkObservation {
     pub revision: u64,
     /// Time of this local sample, milliseconds since Unix epoch.
     pub observed_at_ms: u64,
+    /// Kernel-identified local process that relayed this live observation.
+    /// None for direct observation and history-only reads; never persisted.
+    pub via_local_process: Option<u32>,
     /// Local authenticated identity if available.
     pub observer: Option<MachineIdentity>,
     /// Discovery availability, independent of history and service access.

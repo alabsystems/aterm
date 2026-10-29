@@ -258,7 +258,9 @@ const SAT_AND_HOPPED_MS: u64 = 1_400 + 600;
 /// With the cat on dark and the dog on Solarized Dark, the keys typed through the console
 /// and, as the gallery types them (`aterm ctl key`), past it. Negative control: without the
 /// first keys' landing ahead of them ([`OldPath::FirstKeysAhead`]) they are typed under the
-/// cat as it comes down at the prompt. (The first keys' spring,
+/// cat as it comes down at the prompt, with the writing's own law reverted as well
+/// ([`OldPath::StillUnderWriting`], looks10 round 4): it runs a landing the writing reaches
+/// off the keys too, so alone the old landing lies on them 7 frames, not 10. (The first keys' spring,
 /// [`OldPath::FirstKeysSpring`], is not what keeps this replay's start clear: the landing's
 /// re-aim is; `kitty_pet`'s `wall_burst` guards it.)
 #[test]
@@ -325,7 +327,11 @@ fn the_burst_never_lays_a_running_or_resting_companion_on_its_letters() {
         }
         let old =
             |laws: &[OldPath]| coats_driven("rainbow kitty pet", DARK, Scene::Burst, laws, drive);
-        let start = on_letters(&old(&[OldPath::FirstKeysAhead]), first_key, first_key + 700);
+        let start = on_letters(
+            &old(&[OldPath::FirstKeysAhead, OldPath::StillUnderWriting]),
+            first_key,
+            first_key + 700,
+        );
         assert!(
             start >= 10,
             "negative control ({drive:?}): its landing kept where the caret was, the cat lies \

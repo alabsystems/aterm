@@ -739,8 +739,12 @@ fn setup_over_a_real_terminal_shows_the_phrase_there_and_never_on_stdout() {
         .permissions()
         .mode();
     assert_eq!(mode & 0o777, 0o600);
-    let record = std::fs::read_to_string(dir.join(".aterm/machine.toml")).unwrap();
+    let record = std::fs::read_to_string(dir.join(".aterm/release-ring/machine.toml")).unwrap();
     assert!(record.contains("id = \"m3\""), "{record}");
+    assert!(
+        !dir.join(".aterm/machine.toml").exists(),
+        "provisioning writes the release ring record, never ~/.aterm/machine.toml"
+    );
 
     assert!(
         run.stdout.contains("a commit makes it durable"),
@@ -873,6 +877,78 @@ fn a_mistyped_retype_reshows_the_phrase_and_a_correct_one_arms() {
         read_anchor(&src, MASTER_ANCHOR).unwrap().members,
         vec![master_pub]
     );
+}
+
+#[test]
+fn overlong_and_split_utf8_retypes_reprompt_cleanly() {
+    const RETYPE_PROMPT: &str = "retype the phrase FROM YOUR PAPER (echo off; spaces ignored; an empty line or Ctrl-C aborts, nothing is armed): ";
+    let tmp = scratch("setup-retype-overlong");
+    let dir = tmp.path().to_path_buf();
+    std::fs::write(p(&dir, "pins.rs"), pins_fixture("")).expect("unarmed fixture");
+
+    let mut pty = Pty::open();
+    let mut child = pty.spawn(base_command(
+        &dir,
+        &[
+            "setup",
+            "--id",
+            "m3",
+            "--pins",
+            &p(&dir, "pins.rs"),
+            "--roster",
+            &p(&dir, "roster.toml"),
+            "--key",
+            &p(&dir, "m3.key"),
+        ],
+    ));
+    let mut terminal = String::new();
+    let deadline = std::time::Instant::now() + MUST_HAPPEN;
+    let mut step = 0u8;
+    loop {
+        pty.drain(&mut terminal);
+        if step == 0 && terminal.contains(RETYPE_PROMPT) {
+            // 255 spaces + 2-byte UTF-8 'é' crosses the 256-byte read chunk mid-codepoint;
+            // it must report BadChar at position 1 rather than aborting as empty input.
+            let split_utf8 = format!("{}\u{e9}", " ".repeat(255));
+            pty.type_line(&split_utf8);
+            step = 1;
+        } else if step == 1
+            && terminal.contains("character 1 of the master phrase")
+            && terminal.matches(RETYPE_PROMPT).count() >= 2
+        {
+            // Overlong (> 256 byte) input must drain through '\n' and report the full count.
+            pty.type_line(&"7".repeat(300));
+            step = 2;
+        } else if step == 2
+            && terminal.contains("this one has 300")
+            && terminal.matches(RETYPE_PROMPT).count() >= 3
+        {
+            let phrase = phrase_on(&terminal).expect("phrase shown before retype");
+            pty.type_line(&phrase);
+            step = 3;
+        }
+        match child.try_wait().expect("wait on the child") {
+            Some(_) => break,
+            None => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    panic!("the child never exited at step {step}; terminal so far:\n{terminal}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+    pty.drain(&mut terminal);
+    let out = child
+        .wait_with_output()
+        .expect("collect the child's output");
+    assert!(
+        out.status.success(),
+        "setup must recover and arm after overlong/split-utf8 typos.\nstderr: {}\nterminal: {}",
+        String::from_utf8_lossy(&out.stderr),
+        terminal
+    );
+    assert!(terminal.contains("paper proven"), "{terminal}");
 }
 
 #[test]

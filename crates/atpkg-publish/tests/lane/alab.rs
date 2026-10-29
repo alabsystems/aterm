@@ -1006,17 +1006,33 @@ fn a_staged_pack_that_does_not_verify_is_never_pinned_or_packed_over() {
 
 #[test]
 fn a_horizon_inside_thirty_days_is_told() {
-    let w = World::new("alab-horizon");
+    let horizon_secs = atpkg_publish::lane::alab::HORIZON_WARN_DAYS * 86_400;
+    let at_boundary = aterm_types::rfc3339::format_rfc3339(
+        u64::try_from(atpkg_publish::testkit::NOW + horizon_secs).expect("non-negative"),
+    );
+    let w = World::new("alab-horizon-30d");
     let text =
         w.fx.index_text(6, &[("nn", 2)])
-            .replace(atpkg_publish::testkit::FAR_FUTURE, "2026-11-01T00:00:00Z");
+            .replace(atpkg_publish::testkit::FAR_FUTURE, &at_boundary);
+    w.fx.publish_index_text(6, &text);
+    ok(w.run(false));
+    assert!(
+        !w.fx.notes.shown().iter().any(|n| n.contains(&at_boundary)),
+        "exact 30-day boundary does not warn: {:?}",
+        w.fx.notes.shown()
+    );
+
+    let inside = aterm_types::rfc3339::format_rfc3339(
+        u64::try_from(atpkg_publish::testkit::NOW + horizon_secs - 1).expect("non-negative"),
+    );
+    let w = World::new("alab-horizon-under-30d");
+    let text =
+        w.fx.index_text(6, &[("nn", 2)])
+            .replace(atpkg_publish::testkit::FAR_FUTURE, &inside);
     w.fx.publish_index_text(6, &text);
     ok(w.run(false));
     let shown = w.fx.notes.shown();
-    assert!(
-        shown.iter().any(|n| n.contains("2026-11-01T00:00:00Z")),
-        "{shown:?}"
-    );
+    assert!(shown.iter().any(|n| n.contains(&inside)), "{shown:?}");
 }
 
 fn head_with_group(w: &World, n: u64, program: &str, group: &str) {

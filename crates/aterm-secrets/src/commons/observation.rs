@@ -77,7 +77,7 @@ impl Unavailable {
 
 /// One observation under the vault lock. A visible snapshot still requires the
 /// Commons schema, immutable pins, device custody and current membership checks.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Observation {
     Unavailable(Unavailable),
     Visible(Snapshot),

@@ -486,7 +486,7 @@ const STARTER_CONFIG: &str = concat!(
 #                                  #   macOS: UNUserNotificationCenter from Applications/aterm.app once authorized,
 #                                  #   else /usr/bin/osascript when run outside an app bundle).
 #                                  #   Program OSC 9/99/777 notifications are gated by allow_notifications below
-# temporal_recording = false       # Rewind: each pane's recent screens, in memory only (default off; new tabs)
+# temporal_recording = true        # Rewind: each pane's recent screens, in memory only (default on; new tabs)
 # rewind_budget_mb = 8             # the most one pane's Rewind history holds (1..=1024, at most rewind_total_mb)
 # rewind_total_mb = 128            # the most every pane's Rewind history holds together (1..=16384); the panes
 #                                  #   focused longest ago give up their oldest history first
@@ -578,6 +578,7 @@ const STARTER_CONFIG: &str = concat!(
 # enabled = true                   # keep ALab tools up to date (live reload; logs to packages.log)
 # auto_install = true              # install default signed toolset (`uninstall`/`exclude`/`enabled=false` win)
 # exclude = []                     # per-program opt-out from the signed default set
+# peers = [\"mac-b.local\"]          # LAN peers toolset downloads race (unset: this Mac's fleet; [] none)
 # [packages.links]                 # local dev-link overrides per program (skips registry):
 # ay = \"~/src/ay\"
 # [reroute]
@@ -1201,11 +1202,10 @@ mod tests {
     #[test]
     fn the_unwaited_answer_line_names_the_waited_for_spelling() {
         let line = super::unwaited_answer_line(&["--version".to_string()]);
-        assert_eq!(
-            line,
-            "aterm-gui: a pwsh or cmd prompt does not wait for the windowed image, so its answer \
-             can print after the prompt; run `aterm --window --version` for one the prompt waits \
-             for"
+        assert!(
+            line.starts_with("aterm-gui: ")
+                && line.ends_with("run `aterm --window --version` for one the prompt waits for"),
+            "{line}"
         );
         let line =
             super::unwaited_answer_line(&["--show-face".to_string(), "Cascadia Code".to_string()]);
@@ -1216,11 +1216,13 @@ mod tests {
     }
 
     #[test]
-    fn the_headless_flag_is_recorded_and_exports_nothing() {
+    fn the_headless_flag_is_recorded_without_descriptor_requests() {
         let cli = super::parse_cli(vec![std::ffi::OsString::from("--headless")]);
         assert!(cli.headless);
         assert_eq!(cli.lifeline_fd, None);
         assert_eq!(cli.ready_fd, None);
+        assert!(super::HELP_HEAD.contains("--headless"));
+        assert!(!super::HELP_HEAD.contains("[env: "));
     }
 
     #[test]

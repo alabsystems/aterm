@@ -190,11 +190,13 @@ __aterm_body_check() {
     return 0
 }
 
-# Precmd trampoline: captures `$?` and disables XTRACE in one expansion, checks
-# for a newer body, and runs the body's precmd. Always returns 0 so a user's
-# ZERR trap does not fire inside precmd after a failed command.
+# Precmd trampoline: captures `$?` and disables XTRACE in one expansion, ends the
+# command (its D, before the body check can run a program), checks for a newer
+# body, and runs the body's precmd. Always returns 0 so a user's ZERR trap does
+# not fire inside precmd after a failed command.
 __aterm_precmd() {
     local __aterm_status=$?${${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}:+}
+    __aterm_end_command "$__aterm_status"
     __aterm_body_check
     __aterm_body_precmd "$__aterm_status"
     return 0
@@ -235,24 +237,37 @@ typeset -g __aterm_managed_agents_now=""
 __aterm_managed_agents_listing() {
     emulate -L zsh
     __aterm_managed_agents_now=""
-    [[ -n "${ATPKG_AGENTS:-}" ]] || return 0
     local -a __aterm_ls
-    __aterm_ls=("$ATPKG_AGENTS"/*(N))
+    if [[ -n "${ATPKG_AGENTS:-}" ]]; then
+        __aterm_ls+=("$ATPKG_AGENTS"/*(N))
+    fi
+    if [[ -n "${ATPKG_AGENTS:-}" && -n "${ATPKG_BIN:-}" && "${ATPKG_BIN:h}" == "${ATPKG_AGENTS:h}" ]]; then
+        __aterm_ls+=("$ATPKG_BIN"/*(N))
+    fi
     __aterm_managed_agents_now="${(j.:.)__aterm_ls}"
 }
 typeset -ga __aterm_managed_want
+typeset -gi __aterm_managed_bin_on=0
 typeset -gi __aterm_managed_agents_on=0
 typeset -gi __aterm_managed_reroute_on=0
 typeset -g __aterm_managed_agents_seen=""
 __aterm_reroute_path_front() {
     emulate -L zsh
     __aterm_managed_want=()
+    __aterm_managed_bin_on=0
     __aterm_managed_agents_on=0
     __aterm_managed_reroute_on=0
+    if [[ -n "${ATPKG_AGENTS:-}" && -n "${ATPKG_BIN:-}" && "${ATPKG_BIN:h}" == "${ATPKG_AGENTS:h}" && -d "$ATPKG_BIN" ]]; then
+        path=("$ATPKG_BIN" "${(@)path:#$ATPKG_BIN}")
+        __aterm_managed_want=("$ATPKG_BIN")
+        __aterm_managed_bin_on=1
+    fi
     if [[ -n "${ATPKG_AGENTS:-}" && -d "$ATPKG_AGENTS" ]]; then
         path=("$ATPKG_AGENTS" "${(@)path:#$ATPKG_AGENTS}")
-        __aterm_managed_want=("$ATPKG_AGENTS")
+        __aterm_managed_want=("$ATPKG_AGENTS" "${__aterm_managed_want[@]}")
         __aterm_managed_agents_on=1
+    fi
+    if (( __aterm_managed_agents_on || __aterm_managed_bin_on )); then
         __aterm_managed_agents_listing
         __aterm_managed_agents_seen="$__aterm_managed_agents_now"
     fi
@@ -347,6 +362,9 @@ __aterm_managed_path_live() {
         return 0
     fi
     local -i __aterm_refront=0
+    if (( ! __aterm_managed_bin_on )) && [[ -n "${ATPKG_AGENTS:-}" && -n "${ATPKG_BIN:-}" && "${ATPKG_BIN:h}" == "${ATPKG_AGENTS:h}" && -d "$ATPKG_BIN" ]]; then
+        __aterm_refront=1
+    fi
     if (( ! __aterm_managed_agents_on )) && [[ -n "${ATPKG_AGENTS:-}" && -d "$ATPKG_AGENTS" ]]; then
         __aterm_refront=1
     fi
@@ -366,7 +384,7 @@ __aterm_managed_path_live() {
         __aterm_reroute_path_front
         return 0
     fi
-    if (( __aterm_managed_agents_on )); then
+    if (( __aterm_managed_agents_on || __aterm_managed_bin_on )); then
         __aterm_managed_agents_listing
         if [[ "$__aterm_managed_agents_now" != "$__aterm_managed_agents_seen" ]]; then
             __aterm_managed_agents_seen="$__aterm_managed_agents_now"
@@ -378,7 +396,7 @@ __aterm_managed_path_live() {
 
 # Preserve command state across live body reloads; use `typeset -g` in functions
 # that run without `emulate` so user `WARN_NESTED_VAR` does not warn.
-typeset -g __aterm_in_command="${__aterm_in_command:-0}"
+typeset -g __aterm_in_command="${__aterm_in_command:-0}" __aterm_exec_owed="${__aterm_exec_owed:-0}"
 typeset -g __aterm_report_host="${HOST:-${HOSTNAME:-localhost}}"
 
 # Use `printf '\033]%s\a'` rather than `print -n`, which expands `\e` / `\a` /
@@ -388,16 +406,29 @@ __aterm_osc() {
     printf '\033]%s\a' "$1"
 }
 
-# Check and consume a pending nonce re-key file.
-__aterm_rekey_check() {
+# Take a pending nonce re-key with builtins alone, leaving the file: a command's D,
+# signed with it, comes before any program runs.
+__aterm_rekey_take() {
     emulate -L zsh
     [[ -n "$__aterm_rekey_path" && -f "$__aterm_rekey_path" ]] || return 0
     local key=""
     { IFS= read -r key < "$__aterm_rekey_path" } 2>/dev/null
-    command rm -f -- "$__aterm_rekey_path"
     [[ ${#key} -eq 64 && "$key" != *[^0-9a-f]* ]] || return 0
     __aterm_shell_nonce="$key"
     __aterm_id_suffix_str=";id=${key}"
+}
+
+# Check and consume a pending nonce re-key file (zsh/files' builtin `zf_rm` when there
+# is one, else `rm`, a program: only once the command's D is written).
+__aterm_rekey_check() {
+    emulate -L zsh
+    [[ -n "$__aterm_rekey_path" && -f "$__aterm_rekey_path" ]] || return 0
+    __aterm_rekey_take
+    if zmodload -F zsh/files b:zf_rm 2>/dev/null; then
+        zf_rm -f -- "$__aterm_rekey_path"
+    else
+        command rm -f -- "$__aterm_rekey_path"
+    fi
 }
 
 # Print `;id=<64-hex>` when the captured nonce is non-empty. Hot emitters read
@@ -606,6 +637,7 @@ __aterm_body_precmd() {
     : ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
     local last_status=$1
 
+    __aterm_end_command "$last_status"
     __aterm_rekey_check
 
     (( ! __aterm_tty_probe_fd )) || __aterm_tty_repair
@@ -617,11 +649,6 @@ __aterm_body_precmd() {
     (( ! __aterm_line_init_hush )) || builtin unsetopt verbose
 
     __aterm_managed_path_live
-
-    if (( __aterm_in_command )); then
-        __aterm_mark_exec_finish $last_status
-        typeset -g __aterm_in_command=0
-    fi
 
     __aterm_report_cwd
 
@@ -639,8 +666,78 @@ __aterm_body_precmd() {
 
     __aterm_mark_integration_rev
     __aterm_mark_prompt_start
+    __aterm_hooks_order
 
     return 0
+}
+
+# End the running command once: its C if a preexec hook never let it be written, a
+# pending re-key (taken with builtins; its file removed after D), then its D. A
+# command's D must come before anything of aterm's or any user hook can run a
+# program, for a program heard after D is never the command's (a prompt hook's job
+# never names a command). zsh runs a user's `precmd` function before every
+# `precmd_functions` entry, so the wrapper `__aterm_precmd_wrap` puts over it calls
+# this first; `__aterm_precmd`, kept first in `precmd_functions`
+# (`__aterm_hooks_order`), calls it next; the body precmd calls it for a shell whose
+# trampoline predates it. Only the first call writes.
+__aterm_end_command() {
+    : ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
+    emulate -L zsh
+    (( __aterm_in_command )) || return 0
+    (( ! __aterm_exec_owed )) || __aterm_exec_mark
+    __aterm_rekey_take
+    __aterm_mark_exec_finish "$1"
+    typeset -g __aterm_in_command=0
+    __aterm_rekey_check
+}
+
+# Put a wrapper over a user's `precmd` function that ends the command
+# (`__aterm_end_command`) and then runs the user's body with `$?` as it was. Each
+# definition the user makes is kept under its own name, so a wrapper another plugin
+# put over an older one still reaches its own. An autoload stub is left until it has
+# loaded. A `precmd` defined by a command line runs once unwrapped, after that line.
+__aterm_precmd_wrap() {
+    emulate -L zsh
+    (( ${+functions[precmd]} )) || return 0
+    [[ ${functions[precmd]} != "${__aterm_precmd_wrapper-}" ]] || return 0
+    [[ ${functions[precmd]} != *'builtin autoload -X'* ]] || return 0
+    local -i __aterm_n=$(( ${__aterm_precmd_wraps:-0} + 1 ))
+    functions[__aterm_user_precmd_$__aterm_n]=${functions[precmd]}
+    functions[precmd]="local -i __aterm_s=\$?
+__aterm_end_command \$__aterm_s
+if (( __aterm_s )); then
+    __aterm_line_init_status \$__aterm_s || __aterm_user_precmd_$__aterm_n \"\$@\" || return
+else
+    builtin true
+    __aterm_user_precmd_$__aterm_n \"\$@\" || return
+fi"
+    typeset -g __aterm_precmd_wraps=$__aterm_n __aterm_precmd_wrapper=${functions[precmd]}
+}
+
+# Keep aterm's hooks where its marks must fall: `__aterm_precmd` (D) ahead of every
+# other `precmd_functions` entry, and `__aterm_exec_mark` (C) after every other
+# `preexec_functions` entry, so no user hook's program runs inside the command's C..D.
+# zsh runs a hook array from a copy taken as it starts, so an order set here holds
+# from the next command on. Only a hook aterm still has registered is moved.
+__aterm_hooks_order() {
+    emulate -L zsh
+    if (( ${precmd_functions[(Ie)__aterm_precmd]} )) && [[ ${precmd_functions[1]} != __aterm_precmd ]]; then
+        precmd_functions=(__aterm_precmd ${precmd_functions:#__aterm_precmd})
+    fi
+    if (( ${preexec_functions[(Ie)__aterm_preexec]} )) && [[ ${preexec_functions[-1]} != __aterm_exec_mark ]]; then
+        preexec_functions=(${preexec_functions:#__aterm_exec_mark} __aterm_exec_mark)
+    fi
+    __aterm_precmd_wrap
+}
+
+# The command's C, after every user preexec hook (`__aterm_hooks_order` keeps this
+# hook last): owed by `__aterm_preexec`, which wrote its E.
+__aterm_exec_mark() {
+    : ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
+    emulate -L zsh
+    (( __aterm_exec_owed )) || return 0
+    typeset -g __aterm_exec_owed=0
+    __aterm_mark_exec_start
 }
 
 # Encode `$1` for OSC 633;E into caller's `local REPLY` (backslash-hex encoding
@@ -684,7 +781,12 @@ __aterm_preexec() {
         __aterm_osc "0;${cmd//[[:cntrl:]]/}"
     fi
 
-    __aterm_mark_exec_start
+    __aterm_precmd_wrap
+    if (( ${preexec_functions[(Ie)__aterm_exec_mark]} )); then
+        typeset -g __aterm_exec_owed=1
+    else
+        __aterm_mark_exec_start
+    fi
 }
 
 # ─── Prompt Override ───
@@ -977,9 +1079,21 @@ __aterm_spare_rerun() {
     return 0
 }
 
+# Export `EDITOR=$ATERM_DEFAULT_EDITOR` (aterm's own editor, amacs) only when
+# neither `EDITOR` nor `VISUAL` is set once the rc files have run and the word
+# names a program on PATH; drop the hint either way, so no child inherits it.
+__aterm_default_editor() {
+    emulate -L zsh
+    local __aterm_word=${ATERM_DEFAULT_EDITOR-}
+    unset ATERM_DEFAULT_EDITOR
+    [[ -n $__aterm_word && -z ${EDITOR-} && -z ${VISUAL-} ]] || return 0
+    whence -p -- "$__aterm_word" >/dev/null || return 0
+    export EDITOR=$__aterm_word
+}
+
 # One-shot first precmd after all rc files have run: emit the start mark (or
 # hold a warm spare), apply `ATERM_PROMPT_STYLE`, re-front managed PATH dirs,
-# and unregister itself.
+# settle the default editor, and unregister itself.
 __aterm_first_precmd() {
     local __aterm_st=$?${${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}:+}
     if [[ ${__aterm_spare_mode-} == warm ]]; then
@@ -993,6 +1107,7 @@ __aterm_first_precmd() {
     fi
 
     __aterm_reroute_path_front
+    __aterm_default_editor
 
     add-zsh-hook -d precmd __aterm_first_precmd
     return 0

@@ -11,30 +11,50 @@ fn warn(title: &str) -> Message {
     Message::new(tags::CONFIG, Severity::Warn, title).line("why")
 }
 
-/// How long from `now_ms` (unix milliseconds) to the next local midnight: the one
-/// words boundary that can legitimately fall inside a minute at any record age.
-fn to_local_midnight(now_ms: u64) -> std::time::Duration {
-    let offset_ms = crate::presence::local_offset_at(i64::try_from(now_ms / 1000).unwrap_or(0))
-        .unwrap_or(0)
-        * 1000;
-    let local_ms = i64::try_from(now_ms)
-        .unwrap_or(i64::MAX)
-        .saturating_add(offset_ms);
-    std::time::Duration::from_millis(to_midnight_ms(local_ms))
+/// The zones the pinned Settings ▸ Messages tests say their times in: 9 h 17 min east of UTC
+/// and 10 h 43 min west of it. No zone in the tz database is at either offset in 2026, and the
+/// host's zone can be at most one of them, so a page that reads the host's zone in place of the
+/// pinned one fails these tests in at least one of them on every machine.
+const PINNED_ZONES_S: [i64; 2] = [9 * 3600 + 17 * 60, -(10 * 3600 + 43 * 60)];
+/// The midnight that begins 2026-10-29 in UTC, unix ms.
+const UTC_MIDNIGHT_MS: i64 = 1_793_232_000_000;
+const MIN_MS: u64 = 60_000;
+/// How old the record is at each of the [`words_cases`] instants.
+const RECORD_AGE_MS: u64 = 190 * MIN_MS;
+
+/// The instants the page is read at in a zone `zone_s` seconds east of UTC, each with how long
+/// until the words of a record [`RECORD_AGE_MS`] old move. At 15:00 its `3 h ago` becomes
+/// `4 h ago` 50 min on; at 23:59:30 today's `3 h ago` becomes yesterday's clock time at
+/// midnight, 30 s on; at 00:30 the record is yesterday's, and its spoken `3 hours ago` becomes
+/// `4 hours ago` 50 min on.
+fn words_cases(zone_s: i64) -> [(&'static str, u64, std::time::Duration); 3] {
+    // The midnight that begins 2026-10-29 in the zone.
+    let midnight = u64::try_from(UTC_MIDNIGHT_MS - zone_s * 1000).expect("after the epoch");
+    [
+        (
+            "15:00",
+            midnight - 9 * 60 * MIN_MS,
+            std::time::Duration::from_secs(50 * 60),
+        ),
+        (
+            "23:59:30",
+            midnight - 30_000,
+            std::time::Duration::from_secs(30),
+        ),
+        (
+            "00:30",
+            midnight + 30 * MIN_MS,
+            std::time::Duration::from_secs(50 * 60),
+        ),
+    ]
 }
 
-fn to_midnight_ms(local_ms: i64) -> u64 {
-    const DAY_MS: i64 = 86_400_000;
-    u64::try_from(DAY_MS - local_ms.rem_euclid(DAY_MS)).unwrap_or(0)
-}
-
-#[test]
-fn to_midnight_ms_measures_to_the_next_local_midnight() {
-    const HOUR: i64 = 3_600_000;
-    assert_eq!(to_midnight_ms(0), 86_400_000, "at midnight, the next one");
-    assert_eq!(to_midnight_ms(23 * HOUR + 59 * 60_000 + 30_000), 30_000);
-    assert_eq!(to_midnight_ms(12 * HOUR), 12 * 3_600_000);
-    assert_eq!(to_midnight_ms(-1), 1, "before the epoch, euclid holds");
+/// The page's clock standing still at `unix_ms` in a zone `zone_s` seconds east of UTC.
+const fn pinned_wall(unix_ms: u64, zone_s: i64) -> crate::messages_host::WallClock {
+    crate::messages_host::WallClock::Pinned {
+        unix_ms,
+        offset_s: zone_s,
+    }
 }
 
 use crate::toolchain_words::held_row;
@@ -1165,9 +1185,33 @@ fn the_minute_tick_arms_a_wake_while_a_view_is_on_the_route() {
 
 #[test]
 fn a_headless_messages_page_is_republished_only_when_its_time_words_move() {
+    type Post = fn(&mut App, Message) -> MessageId;
+    let posts: [(&str, Post); 2] = [
+        ("post_message", |app, msg| {
+            app.post_message(msg.hold(Hold::LogOnly))
+        }),
+        ("record_message", App::record_message),
+    ];
+    for zone_s in PINNED_ZONES_S {
+        for (at, now, words_move_in) in words_cases(zone_s) {
+            for (by, post) in posts {
+                let at = format!("{at} in a zone {zone_s} s east, the new record by {by}");
+                a_headless_messages_page_republished_at(&at, now, zone_s, words_move_in, post);
+            }
+        }
+    }
+}
+
+fn a_headless_messages_page_republished_at(
+    at: &str,
+    now: u64,
+    zone_s: i64,
+    words_move_in: std::time::Duration,
+    post: fn(&mut App, Message) -> MessageId,
+) {
     use crate::app_native::{MESSAGES_PUBLISH_MIN_GAP as GAP, MESSAGES_PUBLISH_TICK as TICK};
-    const MIN: u64 = 60_000;
     let mut app = App::headless_for_test();
+    app.messages_wall = pinned_wall(now, zone_s);
     assert!(app.headless, "the headless lane");
     let wid = WindowId(0);
     assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Messages));
@@ -1185,32 +1229,33 @@ fn a_headless_messages_page_is_republished_only_when_its_time_words_move() {
     );
     assert_eq!(app.messages_deadline(), None);
 
-    let now = wall_stamp_now().unix_ms;
     app.post_message_at(
         warn("an old record").hold(Hold::LogOnly),
         aterm_messages::WallStamp {
-            unix_ms: now - 190 * MIN,
+            unix_ms: now - RECORD_AGE_MS,
         },
     );
     app.publish_native_messages_state_if_due(opened + GAP);
     let published = app.messages_last_publish.unwrap();
     assert_ne!(published, opened);
-    let until = app
-        .messages_words_change_in
-        .expect("a record's age is said");
-    assert!(
-        (until > TICK || to_local_midnight(now) <= TICK + std::time::Duration::from_secs(5))
-            && until <= std::time::Duration::from_millis(50 * MIN),
-        "its next hour, not the minute (midnight's date words excepted): {until:?}"
+    assert_eq!(
+        app.messages_words_change_in,
+        Some(words_move_in),
+        "at {at}: when the record's words move"
     );
-    assert_eq!(app.messages_publish_due_at(), Some(published + until));
+    assert_eq!(
+        app.messages_publish_due_at(),
+        Some(published + words_move_in.max(TICK)),
+        "at {at}: republished then, and never sooner than the tick"
+    );
 
-    app.post_message(warn("a new record").hold(Hold::LogOnly));
+    post(&mut app, warn("a new record"));
     app.publish_native_messages_state_if_due(published + GAP);
     let fresh = app.messages_last_publish.unwrap();
-    assert!(
-        app.messages_words_change_in
-            .is_some_and(|until| until <= TICK)
+    assert_eq!(
+        app.messages_words_change_in,
+        Some(words_move_in.min(std::time::Duration::from_millis(MIN_MS))),
+        "at {at}: its `just now` moves a minute on, unless the old record's words move first"
     );
     assert_eq!(app.messages_publish_due_at(), Some(fresh + TICK));
 
@@ -1245,52 +1290,69 @@ fn a_headless_messages_page_is_republished_only_when_its_time_words_move() {
 
 #[test]
 fn a_messages_page_that_slept_through_its_words_is_owed_its_publish_on_waking() {
+    for zone_s in PINNED_ZONES_S {
+        for (at, now, words_move_in) in words_cases(zone_s) {
+            let at = format!("{at} in a zone {zone_s} s east");
+            a_messages_page_woken_at(&at, now, zone_s, words_move_in);
+        }
+    }
+}
+
+fn a_messages_page_woken_at(at: &str, now: u64, zone_s: i64, words_move_in: std::time::Duration) {
     use crate::app_native::MESSAGES_PUBLISH_TICK as TICK;
-    const MIN: u64 = 60_000;
-    const NIGHT: std::time::Duration = std::time::Duration::from_secs(8 * 3600);
+    const NIGHT_MS: u64 = 8 * 60 * MIN_MS;
+    const NIGHT: std::time::Duration = std::time::Duration::from_millis(NIGHT_MS);
     let mut app = App::headless_for_test();
+    app.messages_wall = pinned_wall(now, zone_s);
     let wid = WindowId(0);
-    let now = wall_stamp_now().unix_ms;
     app.post_message_at(
         warn("an old record").hold(Hold::LogOnly),
         aterm_messages::WallStamp {
-            unix_ms: now - 190 * MIN,
+            unix_ms: now - RECORD_AGE_MS,
         },
     );
     assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Messages));
     let published = app
         .messages_last_publish
         .expect("opening Settings publishes");
-    let until = app
-        .messages_words_change_in
-        .expect("a record's age is said");
-    assert!(
-        until > TICK || to_local_midnight(now) <= TICK + std::time::Duration::from_secs(5),
-        "`3 h ago` moves at its next hour (midnight's date words excepted): {until:?}"
+    assert_eq!(
+        app.messages_words_change_in,
+        Some(words_move_in),
+        "at {at}: when the record's words move"
     );
-    assert_eq!(app.messages_publish_due_at(), Some(published + until));
+    let due = published + words_move_in.max(TICK);
+    assert_eq!(app.messages_publish_due_at(), Some(due), "at {at}");
 
-    let (instant, wall) = (std::time::Instant::now(), std::time::SystemTime::now());
+    let instant = std::time::Instant::now();
+    let wall = std::time::UNIX_EPOCH + std::time::Duration::from_millis(now);
     app.count_sleep_since_last_turn(instant, wall);
     app.count_sleep_since_last_turn(instant, wall - NIGHT);
     assert_eq!(
         app.messages_publish_due_at(),
-        Some(published + until),
-        "CONTROL: a wall clock stepped back moves nothing"
+        Some(due),
+        "CONTROL at {at}: a wall clock stepped back moves nothing"
     );
     app.count_sleep_since_last_turn(instant, wall + NIGHT);
+    app.messages_wall = pinned_wall(now + NIGHT_MS, zone_s);
     assert_eq!(
         app.messages_publish_due_at(),
         Some(published + TICK),
-        "owed at once, a minute after the last publish at the soonest"
+        "at {at}: owed at once, a minute after the last publish at the soonest"
     );
     app.publish_native_messages_state_if_due(published + TICK);
     let republished = app.messages_last_publish.unwrap();
     assert_ne!(republished, published, "the slept page is republished");
-    let until = app.messages_words_change_in.unwrap();
-    assert!(until > TICK, "and owes its next hour again: {until:?}");
+    assert_eq!(
+        app.messages_words_change_in,
+        Some(std::time::Duration::from_secs(50 * 60)),
+        "at {at} a night on, the record's spoken `11 hours ago` moves at its next hour"
+    );
 
     let read_on = app.messages_words_offset_s;
+    assert_eq!(
+        read_on, zone_s,
+        "at {at}: the page says its times in the clock's zone"
+    );
     app.messages_words_offset_s = read_on + 3600;
     assert_eq!(app.messages_publish_due_at(), Some(republished + TICK));
     app.publish_native_messages_state_if_due(republished + TICK);

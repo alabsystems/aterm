@@ -58,6 +58,26 @@ impl Instance {
     /// # Errors
     /// The file cannot be created or locked, or is not a private, singly linked regular file.
     pub fn try_hold(path: &Path) -> io::Result<Option<Self>> {
+        let Some(held) = Self::take_at(path)? else {
+            return Ok(None);
+        };
+        held.write_holder()?;
+        Ok(Some(held))
+    }
+
+    /// [`Instance::try_hold`] writing nothing into the file, and leaving its text as it was when
+    /// let go: a cleanup's hold, in which a mug that finds the lock held reads no mug's pid.
+    /// # Errors
+    /// The file cannot be created or locked, or is not a private, singly linked regular file.
+    pub fn try_hold_unnamed(path: &Path) -> io::Result<Option<Self>> {
+        Ok(Self::take_at(path)?.map(|mut held| {
+            held.leave_named = true;
+            held
+        }))
+    }
+
+    /// The open, the private-file check and the take of [`Instance::try_hold`].
+    fn take_at(path: &Path) -> io::Result<Option<Self>> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -83,13 +103,11 @@ impl Instance {
         if !take(&file)? {
             return Ok(None);
         }
-        let held = Self {
+        Ok(Some(Self {
             file,
             label: None,
             leave_named: false,
-        };
-        held.write_holder()?;
-        Ok(Some(held))
+        }))
     }
 
     /// Name the launchd job this mug is (`label`), written beside its pid: `quit` boots out that job, and `status` reports it, whichever build asks.
@@ -152,9 +170,10 @@ fn private_lock_file(meta: &std::fs::Metadata) -> bool {
 }
 
 /// [`Instance::adopt`] of descriptor `fd`. On success `fd` itself is retired (closed, or
-/// `/dev/null` placed on it when it is a stdio slot) and the hold lives on a copy; otherwise
-/// `fd` is left as it was, unless it was open on the lock file (then it is retired too: a
-/// stdin on the lock file is never wanted).
+/// `/dev/null` placed on it when it is a stdio slot) and the hold lives on a copy. Otherwise `fd`
+/// is left as it was, unless a copy of it and both stats showed it open on the lock file, a
+/// private one ([`private_lock_file`]), and, for a stdio slot, `/dev/null` opens and takes its
+/// place: then it is retired too, since a stdin on the lock file is never wanted.
 #[cfg(unix)]
 #[cfg_attr(trust_verify, trust::skip)]
 fn adopt_fd(fd: i32, path: &Path) -> Option<Instance> {
@@ -680,7 +699,9 @@ mod tests {
         drop(held);
     }
 
-    /// A descriptor on the lock file that does not hold it, while another does, is refused.
+    /// A descriptor on the lock file that does not hold it, while another does, is refused. It is
+    /// open for writing, as a handed-over hold is, so the refusal is the lock's and not a failed
+    /// write of the pid.
     #[cfg(unix)]
     #[test]
     fn a_descriptor_on_the_lock_another_holds_is_not_adopted() {
@@ -688,7 +709,12 @@ mod tests {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("acaffiene.lock");
         let held = Instance::try_hold(&path).expect("hold").expect("free");
-        let raw = std::fs::File::open(&path).expect("open").into_raw_fd();
+        let raw = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .into_raw_fd();
         assert!(adopt_fd(raw, &path).is_none());
         assert_eq!(running_pid(&path), Some(std::process::id()));
         drop(held);

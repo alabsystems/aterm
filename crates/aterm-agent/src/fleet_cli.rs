@@ -42,7 +42,7 @@ enum Route {
     /// A removed mode, with what does its work ([`gone_to`]).
     Gone(&'static str),
     /// A membership mode the usage names (`init`, `join`, `peers`, `allow`,
-    /// `publish`, `sync`, `leave`).
+    /// `publish`, `sync`, `census`, `leave`).
     Membership,
     /// Any other word.
     Unknown,
@@ -51,7 +51,7 @@ enum Route {
 fn route(mode: Option<&str>) -> Route {
     match mode {
         Some("-h" | "--help") | None => Route::Help,
-        Some("init" | "join" | "peers" | "allow" | "publish" | "sync" | "leave") => {
+        Some("init" | "join" | "peers" | "allow" | "publish" | "sync" | "census" | "leave") => {
             Route::Membership
         }
         Some(mode) => gone_to(mode).map_or(Route::Unknown, Route::Gone),
@@ -91,7 +91,9 @@ mod tests {
         for help in [None, Some("--help"), Some("-h")] {
             assert_eq!(route(help), Route::Help, "{help:?}");
         }
-        for word in ["init", "join", "peers", "allow", "publish", "sync", "leave"] {
+        for word in [
+            "init", "join", "peers", "allow", "publish", "sync", "census", "leave",
+        ] {
             assert_eq!(route(Some(word)), Route::Membership, "{word}");
         }
         for mode in [

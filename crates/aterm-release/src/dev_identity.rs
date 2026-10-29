@@ -78,7 +78,8 @@ fn unanswered(state: &str) -> String {
     )
 }
 
-fn unquote_paths(text: &str) -> Vec<PathBuf> {
+/// The paths `security` prints one per line, each in double quotes.
+pub(crate) fn unquote_paths(text: &str) -> Vec<PathBuf> {
     text.lines()
         .filter_map(|line| {
             line.trim()
@@ -109,7 +110,12 @@ fn identity_hashes(listing: &str) -> Vec<String> {
         .collect()
 }
 
-fn search_list_with(current: &[PathBuf], keychain: &Path) -> Result<Option<Vec<PathBuf>>, String> {
+/// `current` with `keychain` appended, every entry kept in its order: `None` when it is
+/// already there, refused when `current` read back empty (a write would drop login).
+pub(crate) fn search_list_with(
+    current: &[PathBuf],
+    keychain: &Path,
+) -> Result<Option<Vec<PathBuf>>, String> {
     if current.iter().any(|entry| entry == keychain) {
         return Ok(None);
     }

@@ -791,18 +791,30 @@ fn admit_endpoint(
 }
 
 pub(super) struct CloneGuard<'a> {
-    account: &'a str,
+    account: Option<&'a str>,
     current: &'a (dyn Fn() -> Result<(), String> + Sync),
 }
 
 impl<'a> CloneGuard<'a> {
     /// Clones that ask the login keychain alone for `account`'s credential, whatever git's own
     /// settings name, each step only while `current` holds.
-    pub(super) fn new(
+    pub(super) fn pinned(
         account: &'a str,
         current: &'a (dyn Fn() -> Result<(), String> + Sync),
     ) -> Self {
-        Self { account, current }
+        Self {
+            account: Some(account),
+            current,
+        }
+    }
+
+    /// Clones that use git's own configured credential helpers without writing or pinning the
+    /// keychain, while still verifying `current` before every step.
+    pub(super) fn current_only(current: &'a (dyn Fn() -> Result<(), String> + Sync)) -> Self {
+        Self {
+            account: None,
+            current,
+        }
     }
 }
 
@@ -813,7 +825,9 @@ fn network_git(
     guard: Option<&CloneGuard<'_>>,
 ) -> Cmd {
     let cmd = git(sys, user, None);
-    let Some(guard) = guard else { return cmd };
+    let Some(account) = guard.and_then(|guard| guard.account) else {
+        return cmd;
+    };
     // Command-line config only. The exact effective URL outranks less-specific
     // credential settings and clears every inherited helper for this request.
     cmd.env("GIT_ASKPASS", "").args([
@@ -825,7 +839,7 @@ fn network_git(
             crate::git_credential::Git::keychain(sys).helper()
         ),
         "-c".to_owned(),
-        format!("credential.{endpoint}.username={}", guard.account),
+        format!("credential.{endpoint}.username={account}"),
         "-c".to_owned(),
         format!("credential.{endpoint}.useHttpPath=false"),
     ])
@@ -840,7 +854,7 @@ fn clone_endpoint(
     guard: Option<&CloneGuard<'_>>,
 ) -> Result<String, String> {
     let endpoint = admit_endpoint(sys, user, owner, repo, url)?;
-    if guard.is_some()
+    if guard.and_then(|guard| guard.account).is_some()
         && !endpoint
             .to_ascii_lowercase()
             .starts_with("https://github.com/")
@@ -863,7 +877,7 @@ pub(super) fn clone_one_guarded(
         user,
         &repo.owner,
         repo,
-        Some(&CloneGuard { account, current }),
+        Some(&CloneGuard::pinned(account, current)),
         None,
     )
 }
@@ -2279,12 +2293,9 @@ pub(super) mod tests {
                     Ok(())
                 }
             };
-            let guard = CloneGuard {
-                account: "captured-account",
-                current: &current,
-            };
+            let guard = CloneGuard::pinned("captured-account", &current);
             let (repo, _staged, _) = script_clone_with(&sys, &who, false, Some(&guard));
-            let result = clone_one_guarded(&sys, &who, &repo, guard.account, &current);
+            let result = clone_one_guarded(&sys, &who, &repo, "captured-account", &current);
             assert_eq!(result.is_ok(), !changed, "{result:?}");
             let final_path = Path::new(&who.home).join("new");
             assert_eq!(sys.stat(&final_path).is_ok(), !changed);

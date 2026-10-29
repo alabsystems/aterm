@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 
 pub use step::{Fault, Progress, Tick, Track};
 pub use units::Jobs;
-pub use wait::{TierB, map_leaf_frame};
+pub use wait::TierB;
 
 /// How long a job reads `running` after a progress event.
 pub const RUNNING_WINDOW_MS: u64 = 5_000;

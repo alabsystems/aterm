@@ -124,7 +124,7 @@ impl LaneState {
     #[must_use]
     pub fn stalled_since(&self, now_unix: i64) -> Option<i64> {
         let started = i64::try_from(read_number(&self.started).ok().flatten()?).ok()?;
-        (now_unix - started > STALLED_AFTER_SECS).then_some(started)
+        (now_unix.saturating_sub(started) > STALLED_AFTER_SECS).then_some(started)
     }
 
     /// The index this lane last processed (0 when it never ran).
@@ -182,9 +182,17 @@ impl LaneState {
             return Ok(());
         }
         for line in text.lines().skip(skip) {
-            let mut words = line.split_whitespace();
-            let (Some(program), Some(build)) = (words.next(), words.next()) else {
+            if line.trim().is_empty() {
                 continue;
+            }
+            let mut words = line.split_whitespace();
+            let (Some(program), Some(build), None) = (words.next(), words.next(), words.next())
+            else {
+                return Err(Error::refused(format!(
+                    "{} carries an unreadable line `{line}` — a floor that cannot be read is \
+                     never skipped; fix or remove it deliberately",
+                    self.pins_seen.display()
+                )));
             };
             let seen: Build = build.parse().map_err(|_| {
                 Error::refused(format!(
@@ -232,7 +240,11 @@ impl LaneState {
     /// One more run that could not read the channel head; the count so far.
     #[must_use]
     pub fn bump_head_failures(&self, dry_run: bool) -> u64 {
-        let n = read_number(&self.head_failures).ok().flatten().unwrap_or(0) + 1;
+        let n = read_number(&self.head_failures)
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+            .saturating_add(1);
         if !dry_run {
             let _ = std::fs::write(&self.head_failures, format!("{n}\n"));
         }
@@ -260,7 +272,11 @@ impl LaneState {
     #[must_use]
     pub fn bump_attempts(&self, program: &str, build: Build) -> u32 {
         let f = self.attempts_file(program, build);
-        let n = read_number(&f).ok().flatten().unwrap_or(0) + 1;
+        let n = read_number(&f)
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+            .saturating_add(1);
         let _ = std::fs::write(&f, format!("{n}\n"));
         u32::try_from(n).unwrap_or(u32::MAX)
     }
@@ -286,7 +302,7 @@ impl LaneState {
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .and_then(|d| i64::try_from(d.as_secs()).ok())
-                .map(|mtime| now_unix - mtime);
+                .map(|mtime| now_unix.saturating_sub(mtime));
             if age.is_some_and(|a| a > PRUNE_AFTER_SECS) {
                 let _ = std::fs::remove_file(e.path());
             }

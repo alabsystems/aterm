@@ -170,12 +170,40 @@ fn a_fingerprint_fits_the_key_cap_and_stays_distinct() {
         "harness.upgrade.s-3e79b5bde172ad0088ad.own-work"
     );
     assert_eq!(short.as_str().chars().count(), 47);
+
+    // Maximal family (24 chars) + maximal cause (20 chars) + long subject must still fit KEY_CAP
+    // and preserve `family.` prefix while replacing subject with the 4-hex hash alone.
+    let max_family = "f".repeat(24);
+    let max_cause = "c".repeat(20);
+    let tight_a = Fingerprint::new(&max_family, &long_a, &max_cause);
+    let tight_b = Fingerprint::new(&max_family, &long_b, &max_cause);
+    assert!(
+        tight_a.as_str().chars().count() <= crate::KEY_CAP,
+        "{}",
+        tight_a.as_str()
+    );
+    assert!(
+        tight_a.as_str().starts_with(&format!("{max_family}.")),
+        "{}",
+        tight_a.as_str()
+    );
+    assert_ne!(tight_a, tight_b);
+
+    // At room == 4 (22-char family + 20-char cause), the 4-hex hash fits without clipping cause.
+    let room4 = Fingerprint::new(&"f".repeat(22), &long_a, &max_cause);
+    assert_eq!(room4.as_str().chars().count(), crate::KEY_CAP);
+    assert!(
+        room4.as_str().ends_with(&format!(".{max_cause}")),
+        "{}",
+        room4.as_str()
+    );
 }
 
 #[test]
 fn a_persistent_hold_copied_from_another_message_is_a_record() {
     let now = t0();
     let mut c = fresh(now);
+    assert_eq!(c.last_demoted(), None);
     let earned = Ask::standing(
         StandingWhy::OnlyYou(Reason::new("its own work holds the move")),
         Then::step("Stop that work in the tab"),

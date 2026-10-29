@@ -3,14 +3,12 @@
 // Author: Andrew Yates
 
 //! Sequence selector parser and matcher
-//! ([`SequenceSelector`], [`DispatchedSequence`], [`aliases`]).
+//! ([`SequenceSelector`], [`DispatchedSequence`]).
 
 use core::fmt;
 
 #[cfg(feature = "toml")]
 use serde::{Deserialize, Serialize};
-
-use crate::aliases;
 
 /// Top-level function classifier used by [`SequenceSelector`] and [`DispatchedSequence`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -244,8 +242,14 @@ pub(crate) fn expand_alias(src: &str) -> &str {
         "OSC 21 set named" => "OSC 21;<named>",
         "OSC 21 set indexed" => "OSC 21;<indexed>",
         "response any" | "*" => "*",
-        _ if aliases::lookup(trimmed).is_some() => "*",
         _ => src,
+    }
+}
+
+fn split_ws(s: &str) -> (&str, &str) {
+    match s.split_once(char::is_whitespace) {
+        Some((head, tail)) => (head, tail.trim_start()),
+        None => (s, ""),
     }
 }
 
@@ -258,10 +262,8 @@ fn parse_compiled(src: &str) -> Result<SequenceSelector, SelectorParseError> {
         return Ok(SequenceSelector::catch_all());
     }
 
-    let mut head = trimmed.splitn(3, ' ');
-    let fn_tok = head.next().unwrap_or("").trim();
-    let major_tok = head.next().unwrap_or("").trim();
-    let rest = head.next().unwrap_or("").trim();
+    let (fn_tok, after_fn) = split_ws(trimmed);
+    let (major_tok, rest) = split_ws(after_fn);
 
     let function = match fn_tok {
         "OSC" => FunctionKind::Osc,
@@ -436,10 +438,20 @@ mod tests {
                 sel(Osc, Some(52), None, &[Wildcard, NotQuery]),
             ),
             ("OSC 52 query", sel(Osc, Some(52), None, &[Wildcard, Query])),
+            ("OSC 4 query", sel(Osc, Some(4), None, &[Wildcard, Query])),
+            ("OSC 4 set", sel(Osc, Some(4), None, &[Wildcard, NotQuery])),
+            ("OSC 21 set named", sel(Osc, Some(21), None, &[Wildcard])),
+            ("OSC 21 set indexed", sel(Osc, Some(21), None, &[Wildcard])),
             ("CSI 20 t", sel(Csi, Some(20), Some("t"), &[])),
+            ("CSI  20  t", sel(Csi, Some(20), Some("t"), &[])),
             ("CSI t", sel(Csi, None, Some("t"), &[])),
+            ("CSI ? h", sel(Csi, Some(0), Some("h"), &[])),
+            ("CSI  ?  h", sel(Csi, Some(0), Some("h"), &[])),
+            ("OSC  52", sel(Osc, Some(52), None, &[])),
+            ("OSC\t4;*;?", sel(Osc, Some(4), None, &[Wildcard, Query])),
             ("DCS 2000p", sel(Dcs, None, Some("2000p"), &[])),
             ("DCS 2000 p", sel(Dcs, None, Some("2000p"), &[])),
+            ("DCS  2000  p", sel(Dcs, None, Some("2000p"), &[])),
         ] {
             assert_eq!(SequenceSelector::parse(spelling), Ok(want), "{spelling:?}");
         }
@@ -474,6 +486,8 @@ mod tests {
             ("CSI t", csi(1, 'h'), false),
             ("CSI 20 t", csi(20, 't'), true),
             ("CSI 20 t", csi(21, 't'), false),
+            ("CSI ? h", csi(0, 'h'), true),
+            ("CSI ? h", csi(25, 'h'), false),
             ("DCS 2000p", DispatchedSequence::dcs("2000p"), true),
             ("DCS 2000p", DispatchedSequence::dcs("1000p"), false),
             ("OSC 4;*;?", osc(4, &["3"]), false),

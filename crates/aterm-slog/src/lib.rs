@@ -27,9 +27,9 @@ pub use fold::{
     BusFacts, BusTotals, Claim, Clause, ClauseRow, ClosedNode, Fold, Hints, MAIL_LINK_WINDOW_MS,
     MAX_MAIL_WAITING, MailLink, MailLinkOf, MailWaiting, Need, OpenNode, Phase, SessionState,
     SnapError, Tone, Totals, Words, amend_refines_out, clause_of, clause_of_proven, clear_lifts,
-    confidence_law, lifts_failure, mail_in_window, mail_link_of, mark_may_raise, need_precedence,
-    need_raised, need_takes_amend, need_words, shown_label, shown_proven_label, shown_verdicts,
-    starts_epoch, turn_out_rebucket,
+    confidence_law, lifts_failure, mail_in_window, mail_link_of, mark_may_raise, mark_need_node,
+    may_observe, need_precedence, need_raised, need_takes_amend, need_words, observed_need_words,
+    shown_label, shown_proven_label, shown_verdicts, starts_epoch, turn_out_rebucket,
 };
 pub use limit::{MARK_ACTORS, MARK_BURST, MARK_OWED_AUTHORS, MARK_REFILL_MS, MarkLimiter, Owed};
 pub use line::{
@@ -47,13 +47,13 @@ pub use log::{
     IdCounters, JOURNAL_IMAGE_MAX_RECORDS, JournalImage, Journaled, Limits, Log, MAX_BYTES,
     MAX_HOLES, MAX_OPEN, MAX_RECORDS, Mark, NodeView, Notify, Open, OpenEntry, PROGRAM_SHARE_MAX,
     PreparedCarry, ROW_SPAN_MAX, Read, Refused, Rollup, Row, RowRule, SEQ_LIMIT, SharedRead,
-    closes_over_half, evict_class, log_owned, low_water, mark_quota, natural_parent, over_limits,
-    program_share, row_floor,
+    closes_over_half, evict_class, is_decision_step, log_owned, low_water, mark_quota,
+    natural_parent, over_limits, program_share, rides_open, row_floor,
 };
 pub use node_log::{NODE_LOG_RECORDS, NODE_MARKS, NodeLog};
 pub use rec::{Rec, Stamp};
 pub use turn::{
-    ATTRIBUTION_MS, ActWord, Admission, AttributionView, Binding, LastClose, SETTLE_MS,
+    ATTRIBUTION_MS, ActWord, Admission, AttributionView, Binding, Claimed, LastClose, SETTLE_MS,
     STEP_ACT_MS, STEP_INPUT_LEAD_MS, ScreenStep, SettleCause, TX_TOOLS_MAX, TrackerView,
     TurnTracker, TxEvent, TxMark, TxPos, TxState, TxView, Verdict, WallJudge, attributes,
     dismisses, rebase, settle_due, settle_out, tx_close_at, within_lead,

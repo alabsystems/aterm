@@ -69,6 +69,9 @@ fn star_words(f: &mut Fold, s: &Star) {
     f.f32("stream", s.stream);
     f.f32("pull", s.pull);
     f.opt("finish", s.finish, finish_words);
+    f.opt("beside_caret", s.beside_caret, |f, beside: bool| {
+        f.flag("beside", beside);
+    });
 }
 
 #[cfg(test)]
@@ -105,6 +108,8 @@ mod tests {
             stream: 2.0,
             pull: 0.0,
             finish: None,
+            beside_caret: None,
+            edge_cut: false,
         });
         sky.minted = 1;
         let base = words(&sky, t0);
@@ -116,6 +121,13 @@ mod tests {
             span_s: 0.04,
         });
         assert_ne!(words(&finished, t0), base, "a star's finish is hashed");
+        let mut latched = sky.clone();
+        latched.stars[0].beside_caret = Some(true);
+        assert_ne!(
+            words(&latched, t0),
+            base,
+            "a star's read of the caret beside it is hashed"
+        );
         let mut minted = sky.clone();
         minted.minted += 1;
         assert_ne!(words(&minted, t0), base, "the mint is hashed");

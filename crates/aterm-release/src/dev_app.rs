@@ -24,6 +24,12 @@ pub const DEV_APP_NAME: &str = "aterm (dev).app";
 /// The updater's dev mark (`aterm_update::bundle::DEV_BUILD_KEY`).
 pub const DEV_MARK_KEY: &str = "ATermDevBuild";
 
+/// The SHA-256 of the `aterm` executable a dev bundle was assembled from. Two builds of one
+/// dirty tree share their version, build and commit, and a running aCaffiene mug tells that its
+/// bundle was replaced by the `Info.plist` alone (`aterm_acaffiene::code::code_fingerprint`), so
+/// this key is what changes when only the code did.
+pub const DEV_BINARY_KEY: &str = "ATermDevBinarySHA256";
+
 const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/\
                           LaunchServices.framework/Support/lsregister";
 
@@ -491,6 +497,8 @@ fn assemble(
         .map_err(|e| format!("read {}: {e}", plist_path.display()))?;
     let mut plist =
         crate::bundle::set_plist_string(&plist, "CFBundleDisplayName", DEV_DISPLAY_NAME)?;
+    plist =
+        crate::bundle::set_plist_string(&plist, DEV_BINARY_KEY, &crate::dmg::sha256_file(bin)?)?;
     if pin {
         plist = crate::bundle::set_plist_string(&plist, DEV_MARK_KEY, "true")?;
     }
@@ -1117,6 +1125,37 @@ mod tests {
             #[cfg(target_os = "macos")]
             assert_eq!(aterm_update::plist_marks_dev_build(&plist), pin);
         }
+    }
+
+    #[test]
+    fn a_rebuilt_binary_changes_the_dev_bundles_info_plist() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let (_dir, out) = scratch();
+        let bin = out.join("aterm-binary");
+        let stamp = stamp();
+        let plist_of = |bytes: &[u8]| {
+            std::fs::write(&bin, bytes).unwrap();
+            let app = assemble(&root, &out, &stamp, &bin, false).expect("assemble");
+            std::fs::read_to_string(app.join("Contents/Info.plist")).unwrap()
+        };
+        let first = plist_of(b"\xcf\xfa\xed\xfe build one");
+        assert!(
+            first.contains(&format!(
+                "<key>{DEV_BINARY_KEY}</key>\n\t<string>{}</string>",
+                crate::dmg::sha256_file(&bin).unwrap()
+            )),
+            "{first}"
+        );
+        assert_eq!(
+            plist_of(b"\xcf\xfa\xed\xfe build one"),
+            first,
+            "the same code"
+        );
+        assert_ne!(
+            plist_of(b"\xcf\xfa\xed\xfe build two"),
+            first,
+            "one dirty tree's next build, at the same version, build and commit"
+        );
     }
 
     fn bundle_at(dir: &Path) -> PathBuf {

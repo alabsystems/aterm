@@ -2284,6 +2284,7 @@ fn a_typed_relaunch_line_is_recorded_before_anything_after_it() {
         usage_tap: None,
         agents_off: Vec::new(),
         land: false,
+        press: None,
         timings: crate::harness::Timings::FAST,
     };
     std::fs::create_dir_all(state_dir(&o)).expect("state");
@@ -2347,6 +2348,7 @@ fn whether_the_adopted_agent_is_gone_is_the_records_to_say() {
         usage_tap: None,
         agents_off: Vec::new(),
         land: false,
+        press: None,
         timings: crate::harness::Timings::FAST,
     };
     std::fs::create_dir_all(state_dir(&o)).expect("state");
@@ -2435,6 +2437,7 @@ fn a_relaunch_only_lanes_worker_is_owed_its_own_agents_record_alone() {
         usage_tap: None,
         agents_off: Vec::new(),
         land: false,
+        press: None,
         timings: crate::harness::Timings::FAST,
     };
     std::fs::create_dir_all(state_dir(&o)).expect("state");
@@ -2547,6 +2550,7 @@ fn a_limit_row_a_move_left_is_no_standing_limit() {
         instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
         land: false,
+        press: None,
         timings: crate::harness::Timings::FAST,
     };
     std::fs::create_dir_all(state_dir(&o)).expect("state");
@@ -2753,6 +2757,7 @@ fn a_move_to_the_default_login_is_met_by_an_unset_variable_under_the_default_hom
         instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
         land: false,
+        press: None,
         timings: crate::harness::Timings::FAST,
     };
     std::fs::create_dir_all(state_dir(&o)).expect("state");
@@ -3151,6 +3156,7 @@ fn a_dropped_tap_is_recorded_in_the_ledger() {
         instances: super::super::upgrade_drive::Instances::Machine,
         agents_off: Vec::new(),
         land: false,
+        press: None,
         timings: super::super::Timings::for_build(),
     };
     let r = Report {
@@ -3312,6 +3318,7 @@ fn a_relaunch_after_aterm_ended_is_made_on_the_carried_line_as_the_crash_rule_ma
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
         land: false,
+        press: None,
         timings: crate::harness::Timings::FAST,
     };
     let mut gone = aterm_uds::spawnfd::command("/usr/bin/true")
@@ -4920,6 +4927,7 @@ fn a_harness_restart_held_by_keys_is_tried_once_its_own_grace_lets_them_go() {
         usage_tap: None,
         agents_off: Vec::new(),
         land: false,
+        press: None,
         timings: crate::harness::Timings::FAST,
     };
     std::fs::create_dir_all(state_dir(&opts)).expect("state");
@@ -5004,4 +5012,246 @@ fn a_keys_attempt_still_held_does_not_climb_the_back_off() {
         other.pause() > before,
         "control: a miss of another kind climbs"
     );
+}
+
+#[test]
+fn agent_resumed_recognizes_aterm_relaunches_and_refuses_fresh_or_recycled_processes() {
+    const ID: &str = "0badf00d-1111-2222-3333-99990000aaaa";
+    const OTHER_ID: &str = "0badf00d-1111-2222-3333-bbbbccccdddd";
+    const START_OLD: &str = "Wed Oct 28 16:00:00 2026";
+    const START_NEW: &str = "Wed Oct 28 17:00:10 2026";
+    const START_LATE: &str = "Wed Oct 28 18:30:00 2026";
+    let new_began = crate::harness::upgrade_models::parse_lstart(START_NEW).expect("lstart");
+    let dir = crate::supervise::ScratchDir::new("relaunch", "agent-resumed");
+    let o = Opts {
+        home: dir.join("home"),
+        state: dir.join("state"),
+        sock: None,
+        token: None,
+        only_sid: Some("s-resumed".to_string()),
+        dry_run: false,
+        human_grace_s: 0,
+        hand_back: true,
+        background: false,
+        aterm_state: None,
+        ask: false,
+        several_logins: false,
+        usage_credits: false,
+        instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
+        usage_tap: None,
+        agents_off: Vec::new(),
+        land: false,
+        press: None,
+        timings: crate::harness::Timings::FAST,
+    };
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+
+    let claude_snap = |pid: u32, start: &str, argv: &[&str], session: Option<&str>| Snapshot {
+        tab: "s-resumed".to_string(),
+        pid,
+        start: start.to_string(),
+        shell: 100,
+        program: PathBuf::from("/p/claude"),
+        argv: words(argv),
+        session: session.map(str::to_owned),
+        cwd: "/w".to_string(),
+        version: Some("2.1.312".to_string()),
+        run: AgentRun::Claude,
+        dialect: None,
+        login: None,
+        home: None,
+        claude_dir: None,
+        stored_login: true,
+        profile: None,
+    };
+
+    // In-flight cold restore (`CAUSE_HOST`) before `relaunched_pid` is recorded (`0`).
+    save(
+        &o,
+        ID,
+        &St {
+            phase: upgrade::Phase::Relaunched { at_s: new_began },
+            cause: CAUSE_HOST.to_string(),
+            tab: "s-resumed".to_string(),
+            pid: 4100,
+            proc_start: START_OLD.to_string(),
+            relaunched_at: new_began,
+            ..St::default()
+        },
+    );
+    let resumed_banner = claude_snap(4200, START_NEW, &["claude", "--resume", ID], None);
+    assert!(
+        agent_resumed(&o, &resumed_banner),
+        "cold restore banner before session file registers"
+    );
+    let same_pid_after_reboot = claude_snap(4100, START_NEW, &["claude", "--resume", ID], Some(ID));
+    assert!(
+        agent_resumed(&o, &same_pid_after_reboot),
+        "cold restore after reboot reusing the prior PID with a new start"
+    );
+
+    // Explicit restart (`CAUSE_ASKED`) after completion (`Phase::Done`, `resumed_pid` set).
+    save(
+        &o,
+        ID,
+        &St {
+            phase: upgrade::Phase::Done,
+            cause: CAUSE_ASKED.to_string(),
+            tab: "s-resumed".to_string(),
+            pid: 4100,
+            resumed_pid: 4200,
+            relaunched_at: new_began,
+            done_at: new_began + 2,
+            ..St::default()
+        },
+    );
+    let settled = claude_snap(4200, START_NEW, &["claude", "--resume", ID], Some(ID));
+    assert!(agent_resumed(&o, &settled), "settled ctl restart");
+
+    // NEGATIVE CONTROLS on Claude:
+    assert!(
+        !agent_resumed(&o, &claude_snap(4200, START_NEW, &["claude"], None)),
+        "control: fresh claude without --resume"
+    );
+    assert!(
+        !agent_resumed(
+            &o,
+            &claude_snap(4200, START_NEW, &["claude", "--resume", ID], Some(OTHER_ID))
+        ),
+        "control: /clear rotated the live session id"
+    );
+    assert!(
+        !agent_resumed(
+            &o,
+            &claude_snap(4200, START_LATE, &["claude", "--resume", ID], Some(ID))
+        ),
+        "control: recycled PID started long after done_at"
+    );
+    for fresh_cause in [CAUSE_FRESH, CAUSE_UPGRADE_FRESH] {
+        save(
+            &o,
+            ID,
+            &St {
+                phase: upgrade::Phase::Done,
+                cause: fresh_cause.to_string(),
+                tab: "s-resumed".to_string(),
+                pid: 4100,
+                resumed_pid: 4200,
+                relaunched_at: new_began,
+                done_at: new_began + 2,
+                ..St::default()
+            },
+        );
+        assert!(
+            !agent_resumed(&o, &settled),
+            "control: {fresh_cause} starts afresh"
+        );
+    }
+    save(
+        &o,
+        ID,
+        &St {
+            phase: upgrade::Phase::Done,
+            cause: CAUSE_EXIT.to_string(),
+            tab: "s-resumed".to_string(),
+            pid: 4100,
+            resumed_pid: 4200,
+            relaunched_at: 0,
+            done_at: new_began + 2,
+            ..St::default()
+        },
+    );
+    assert!(
+        !agent_resumed(&o, &settled),
+        "control: RESUMED_BY_ANOTHER leaves relaunched_at == 0"
+    );
+
+    // Codex, Muse, and Agy resumed snapshots + start mismatch negative control.
+    save(
+        &o,
+        "codex-rec",
+        &St {
+            phase: upgrade::Phase::Relaunched { at_s: new_began },
+            agent: upgrade::Agent::Codex,
+            cause: CAUSE_EXIT.to_string(),
+            tab: "s-resumed".to_string(),
+            pid: 5100,
+            relaunched_pid: 5200,
+            relaunched_start: START_NEW.to_string(),
+            relaunched_at: new_began,
+            thread: ID.to_string(),
+            ..St::default()
+        },
+    );
+    let mut codex = claude_snap(5200, START_NEW, &["codex", "resume", ID], Some(ID));
+    codex.run = AgentRun::Codex(CodexRun {
+        home: dir.join("codex"),
+        home_env: None,
+        self_claimed: None,
+    });
+    assert!(agent_resumed(&o, &codex), "Codex resume");
+    let mut codex_recycled = codex.clone();
+    codex_recycled.start = START_LATE.to_string();
+    assert!(
+        !agent_resumed(&o, &codex_recycled),
+        "control: Codex PID reused with a different kernel start"
+    );
+
+    save(
+        &o,
+        "muse-rec",
+        &St {
+            phase: upgrade::Phase::Done,
+            agent: upgrade::Agent::Muse,
+            cause: CAUSE_HOST.to_string(),
+            tab: "s-resumed".to_string(),
+            pid: 6100,
+            relaunched_pid: 6200,
+            resumed_pid: 6200,
+            relaunched_start: START_NEW.to_string(),
+            relaunched_at: new_began,
+            done_at: new_began + 1,
+            thread: ID.to_string(),
+            ..St::default()
+        },
+    );
+    let mut muse = claude_snap(6200, START_NEW, &["muse", "resume", ID], Some(ID));
+    muse.run = AgentRun::Muse(MuseRun {
+        data: dir.join("muse"),
+        env: Vec::new(),
+        workspace: None,
+        lock: None,
+        started_ms: 0,
+        block: None,
+    });
+    assert!(agent_resumed(&o, &muse), "Muse resume");
+
+    save(
+        &o,
+        "agy-rec",
+        &St {
+            phase: upgrade::Phase::Done,
+            agent: upgrade::Agent::Agy,
+            cause: CAUSE_ASKED.to_string(),
+            tab: "s-resumed".to_string(),
+            pid: 7100,
+            relaunched_pid: 7200,
+            resumed_pid: 7200,
+            relaunched_start: START_NEW.to_string(),
+            relaunched_at: new_began,
+            done_at: new_began + 1,
+            thread: ID.to_string(),
+            ..St::default()
+        },
+    );
+    let mut agy = claude_snap(7200, START_NEW, &["agy", "--conversation", ID], Some(ID));
+    agy.run = AgentRun::Agy(AgyRun {
+        config: dir.join("agy"),
+        env: Vec::new(),
+        lock: None,
+        crash: None,
+        started_ms: 0,
+        block: None,
+    });
+    assert!(agent_resumed(&o, &agy), "Agy resume");
 }

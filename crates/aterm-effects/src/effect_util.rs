@@ -67,6 +67,8 @@ pub(crate) fn push_grid_quad(
 #[inline]
 #[must_use]
 pub(crate) const fn scale_premul(c: u32, share: f32) -> u32 {
+    // No early return for black or a share of 0 or 1: the rounding already gives them, and
+    // fcb3a95bbf's gained nothing measurable (see `mix_rgb`).
     let share = share.clamp(0.0, 1.0);
     const fn ch(c: u32, share: f32, sh: u32) -> u32 {
         let v = (((c >> sh) & 0xff) as f32 * share).round() as u32;
@@ -92,6 +94,8 @@ pub(crate) const FX_EDGE_FADE_X: f32 = 0.6;
 pub(crate) const fn fx_fade_y(geom: Geom, y: f32) -> f32 {
     let reach = (geom.ch as f32 * FX_EDGE_FADE).max(1.0);
     let d = (y - geom.fx_top() as f32).min(geom.fx_bot() as f32 - y);
+    // No early return outside the band: the clamp already gives 0 and 1, and fcb3a95bbf's
+    // gained nothing measurable (see `mix_rgb`); likewise in `fx_fade_x`.
     let k = (d / reach).clamp(0.0, 1.0);
     k * k * (3.0 - 2.0 * k)
 }
@@ -307,7 +311,9 @@ pub(crate) fn push_fx_ramp(
 
 /// Per-channel linear interpolation between two `0x00RRGGBB` colours, `t` 0..1.
 #[inline]
+#[must_use]
 pub(crate) const fn lerp_rgb(a: u32, b: u32, t: f32) -> u32 {
+    // No early return at the ends or for equal colours: see `mix_rgb`.
     let t = t.clamp(0.0, 1.0);
     const fn mix(a: u32, b: u32, t: f32, sh: u32) -> u32 {
         let ca = ((a >> sh) & 0xff) as f32;
@@ -319,7 +325,13 @@ pub(crate) const fn lerp_rgb(a: u32, b: u32, t: f32) -> u32 {
 
 /// Clamped per-channel RGB mix (`t` from `a` to `b`), rounded to nearest.
 #[inline]
+#[must_use]
 pub(crate) const fn mix_rgb(a: u32, b: u32, t: f32) -> u32 {
+    // No early return at t 0 or 1 or for equal colours, which the arithmetic already gives
+    // exactly. fcb3a95bbf's here cost the card scenes' emit 8 % (episode, 142k to 154k
+    // instructions a frame) and 17 % (scroll, 32k to 37.5k) in effects_harness on 2026-10-28;
+    // its returns in `lerp_rgb`, `scale_premul` and the `fx_fade_*` pair gained nothing
+    // measurable on the typing and composer scenes.
     let t = t.clamp(0.0, 1.0);
     const fn ch(a: u32, b: u32, t: f32, sh: u32) -> u32 {
         let ca = ((a >> sh) & 0xff) as f32;
@@ -331,6 +343,7 @@ pub(crate) const fn mix_rgb(a: u32, b: u32, t: f32) -> u32 {
 
 /// `a + (b - a) t`, `t` clamped to 0..1.
 #[inline]
+#[must_use]
 pub(crate) const fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t.clamp(0.0, 1.0)
 }
@@ -370,18 +383,21 @@ const fn ramp_5stop(stops: &[(f32, u32); 5], t: f32) -> u32 {
 
 /// The black-body-ish fire palette, `t` 0 (cool, deep red) → 1 (hot, white-yellow).
 #[inline]
+#[must_use]
 pub(crate) const fn fire_ramp(t: f32) -> u32 {
     ramp_5stop(&FIRE_STOPS, t)
 }
 
 /// The water palette, `t` 0 (deep navy) → 1 (pale foam crest).
 #[inline]
+#[must_use]
 pub(crate) const fn water_ramp(t: f32) -> u32 {
     ramp_5stop(&WATER_STOPS, t)
 }
 
 /// Return the twinkle family's white (`false`) or gold (`true`) RGB colour.
 #[inline]
+#[must_use]
 pub(crate) const fn twinkle_rgb(gold: bool) -> u32 {
     if gold { 0x00FF_E9A8 } else { 0x00FF_FFFF }
 }
@@ -406,6 +422,7 @@ pub(crate) const STAR_OVER_CENTRE_LAYS: f32 = 3.0;
 
 /// Taper coverage multiplier at fraction `u` from the body's end to the point.
 #[inline]
+#[must_use]
 pub(crate) const fn star_taper_cov(u: f32) -> f32 {
     1.0 - (1.0 - STAR_TIP_COV) * u.clamp(0.0, 1.0)
 }
@@ -455,12 +472,14 @@ const _: () = {
 
 /// A star's arm half-length in px: cell height × [`STAR_ARM`] × a named ratio.
 #[inline]
+#[must_use]
 pub(crate) const fn star_arm(cell_h: f32, ratio: f32) -> f32 {
     cell_h * STAR_ARM * ratio
 }
 
 /// Convert float arm half-length to integer px for the additive star (truncated, floored at 1).
 #[inline]
+#[must_use]
 pub(crate) const fn star_arm_px(arm: f32) -> i32 {
     let px = arm as i32;
     if px < 1 { 1 } else { px }
@@ -471,12 +490,14 @@ pub(crate) const STAR_ACCENT_DEN: u32 = 16;
 
 /// Deal a stored particle seed: `true` is the 4-point accent, `false` a round mote.
 #[inline]
+#[must_use]
 pub(crate) const fn star_accent(seed: u32) -> bool {
     seed.is_multiple_of(STAR_ACCENT_DEN)
 }
 
 /// Seeded stardust mote radius in px.
 #[inline]
+#[must_use]
 pub(crate) const fn dust_r(cell_h: f32, seed01: f32) -> f32 {
     (cell_h * (0.07 + 0.05 * seed01)).max(1.3)
 }
@@ -510,6 +531,7 @@ const _: () = assert!(
 
 /// Brightness multiplier of a twinkling star at `age_s` seconds and `phase` radians.
 #[inline]
+#[must_use]
 pub(crate) const fn twinkle_env(age_s: f32, phase: f32) -> f32 {
     let (s, _) = crate::supernova::sin_cos_f32(age_s * TWINKLE_OMEGA + phase);
     TWINKLE_FLOOR + TWINKLE_DEPTH * s.abs()
@@ -517,12 +539,14 @@ pub(crate) const fn twinkle_env(age_s: f32, phase: f32) -> f32 {
 
 /// Whether a twinkle envelope multiplier `env` is within the peak glint gate.
 #[inline]
+#[must_use]
 pub(crate) const fn twinkle_peak(env: f32) -> bool {
     env >= TWINKLE_FLOOR + TWINKLE_DEPTH * TWINKLE_GLINT_FRAC
 }
 
 /// Integer arm thickness (px) of the additive star for half-length `arm`.
 #[inline]
+#[must_use]
 pub(crate) const fn star_waist_px(arm: i32) -> i32 {
     let w = (2.0 * arm as f32 * STAR_WAIST).round() as i32;
     if w > 1 { w } else { 1 }
@@ -530,6 +554,7 @@ pub(crate) const fn star_waist_px(arm: i32) -> i32 {
 
 /// The additive star's integer nucleus side (px), from the shared [`STAR_CORE`].
 #[inline]
+#[must_use]
 pub(crate) const fn star_core_px(arm: i32) -> i32 {
     let c = (2.0 * arm as f32 * STAR_CORE).round() as i32;
     if c > 1 { c } else { 1 }
@@ -537,6 +562,7 @@ pub(crate) const fn star_core_px(arm: i32) -> i32 {
 
 /// Integer full-coverage body half-length (px) of the additive star for half-length `arm`.
 #[inline]
+#[must_use]
 pub(crate) const fn star_body_px(arm: i32) -> i32 {
     let b = (arm as f32 * STAR_TAPER_BODY).round() as i32;
     if b < 1 {
@@ -795,6 +821,9 @@ pub(crate) fn push_twinkle_star(
         premul_rgb(color, (cov_f * share) as u8)
     }
     let cov_f = f32::from(cov);
+    // No early return for a body that paints nothing (and so a star that paints nothing):
+    // fcb3a95bbf's answered `true` at a full budget, where the loop answers `false` at the
+    // second piece, and gained nothing measurable in effects_harness on 2026-10-28.
     let body_paint = premul_rgb(color, cov);
     let core_paint = star_paint_at(color, cov_f, STAR_CORE_ADD);
     let glint_paint = if gold {
@@ -1167,5 +1196,286 @@ mod tests {
         ] {
             assert_ramps_match_walk(t.to_bits());
         }
+    }
+
+    /// The colour and fade helpers as fcb3a95bbf wrote them, early returns and all: the
+    /// frames main drew with them are the oracle the bodies without the returns must draw.
+    mod early_return_oracle {
+        use super::{FX_EDGE_FADE, FX_EDGE_FADE_X, Geom};
+
+        pub(super) const fn scale_premul(c: u32, share: f32) -> u32 {
+            let rgb = c & 0x00FF_FFFF;
+            if rgb == 0 {
+                return 0;
+            }
+            let share = share.clamp(0.0, 1.0);
+            if share <= 0.0 {
+                return 0;
+            }
+            if share >= 1.0 {
+                return rgb;
+            }
+            const fn ch(c: u32, share: f32, sh: u32) -> u32 {
+                let v = (((c >> sh) & 0xff) as f32 * share).round() as u32;
+                (if v < 255 { v } else { 255 }) << sh
+            }
+            ch(rgb, share, 16) | ch(rgb, share, 8) | ch(rgb, share, 0)
+        }
+
+        pub(super) const fn fx_fade_y(geom: Geom, y: f32) -> f32 {
+            let reach = (geom.ch as f32 * FX_EDGE_FADE).max(1.0);
+            let d = (y - geom.fx_top() as f32).min(geom.fx_bot() as f32 - y);
+            if d >= reach {
+                return 1.0;
+            }
+            if d <= 0.0 {
+                return 0.0;
+            }
+            let k = (d / reach).clamp(0.0, 1.0);
+            k * k * (3.0 - 2.0 * k)
+        }
+
+        pub(super) const fn fx_fade_x(geom: Geom, x: f32) -> f32 {
+            let reach = (geom.cw as f32 * FX_EDGE_FADE_X).max(1.0);
+            let d = (x - geom.fx_left() as f32).min(geom.fx_right() as f32 - x);
+            if d >= reach {
+                return 1.0;
+            }
+            if d <= 0.0 {
+                return 0.0;
+            }
+            let k = (d / reach).clamp(0.0, 1.0);
+            k * k * (3.0 - 2.0 * k)
+        }
+
+        pub(super) const fn lerp_rgb(a: u32, b: u32, t: f32) -> u32 {
+            let t = t.clamp(0.0, 1.0);
+            let a_rgb = a & 0x00FF_FFFF;
+            let b_rgb = b & 0x00FF_FFFF;
+            if t == 0.0 || (t.is_finite() && a_rgb == b_rgb) {
+                return a_rgb;
+            }
+            if t == 1.0 {
+                return b_rgb;
+            }
+            const fn mix(a: u32, b: u32, t: f32, sh: u32) -> u32 {
+                let ca = ((a >> sh) & 0xff) as f32;
+                let cb = ((b >> sh) & 0xff) as f32;
+                ((ca + (cb - ca) * t) + 0.5) as u32
+            }
+            (mix(a_rgb, b_rgb, t, 16) << 16)
+                | (mix(a_rgb, b_rgb, t, 8) << 8)
+                | mix(a_rgb, b_rgb, t, 0)
+        }
+
+        pub(super) const fn mix_rgb(a: u32, b: u32, t: f32) -> u32 {
+            let t = t.clamp(0.0, 1.0);
+            let a_rgb = a & 0x00FF_FFFF;
+            let b_rgb = b & 0x00FF_FFFF;
+            if t == 0.0 || (t.is_finite() && a_rgb == b_rgb) {
+                return a_rgb;
+            }
+            if t == 1.0 {
+                return b_rgb;
+            }
+            const fn ch(a: u32, b: u32, t: f32, sh: u32) -> u32 {
+                let ca = ((a >> sh) & 0xff) as f32;
+                let cb = ((b >> sh) & 0xff) as f32;
+                ((ca + (cb - ca) * t).round().clamp(0.0, 255.0) as u32) << sh
+            }
+            ch(a_rgb, b_rgb, t, 16) | ch(a_rgb, b_rgb, t, 8) | ch(a_rgb, b_rgb, t, 0)
+        }
+    }
+
+    /// The `t` (and shares) the helpers are judged at: both ends and the floats beside them,
+    /// NaN, the infinities, below 0 and above 1 (the clamp's work), and a sweep on and off
+    /// the binary grid.
+    fn judged_ts() -> Vec<f32> {
+        let mut ts = vec![
+            0.0,
+            -0.0,
+            1.0,
+            f32::NAN,
+            -f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -f32::MIN_POSITIVE,
+            -0.25,
+            -1.0,
+            f32::MIN,
+            f32::from_bits(1),
+            f32::MIN_POSITIVE,
+            f32::EPSILON,
+            1.0 - f32::EPSILON / 2.0,
+            1.0 + f32::EPSILON,
+            1.5,
+            f32::MAX,
+        ];
+        ts.extend((1..64).map(|i| i as f32 / 64.0));
+        ts.extend((0..37).map(|i| (i as f32 + 0.5) / 37.0));
+        ts
+    }
+
+    /// The colour mixes without early returns draw what they drew with them, over every pair
+    /// of channel values (in all three channels at once, under a high byte to mask) at every
+    /// one of [`judged_ts`].
+    #[test]
+    fn the_colour_mixes_draw_what_their_early_returns_drew() {
+        let ts = judged_ts();
+        for pair in 0..=u16::MAX {
+            let (ca, cb) = (u32::from(pair >> 8), u32::from(pair & 0xff));
+            let a = (ca * 0x0001_0101) | (u32::from(pair) << 24);
+            let b = (cb * 0x0001_0101) | (u32::from(!pair) << 24);
+            for &t in &ts {
+                assert_eq!(
+                    lerp_rgb(a, b, t),
+                    early_return_oracle::lerp_rgb(a, b, t),
+                    "lerp_rgb({a:#010x}, {b:#010x}, {t:?})"
+                );
+                assert_eq!(
+                    mix_rgb(a, b, t),
+                    early_return_oracle::mix_rgb(a, b, t),
+                    "mix_rgb({a:#010x}, {b:#010x}, {t:?})"
+                );
+            }
+        }
+    }
+
+    /// `scale_premul` and the edge fades without early returns give what they gave with them:
+    /// every channel value (alone, beside black and beside its complement) at every share of
+    /// [`judged_ts`], and every 1/64 px across both edges of the box and past them, on a
+    /// box whose fade reaches less than a pixel and on one that reaches several.
+    #[test]
+    fn the_light_scale_and_edge_fades_give_what_their_early_returns_gave() {
+        let ts = judged_ts();
+        for v in 0..=255u32 {
+            for c in [
+                v * 0x0001_0101,
+                v << 16,
+                (v << 8) | (255 - v),
+                0xFF00_0000 | v,
+            ] {
+                for &share in &ts {
+                    assert_eq!(
+                        scale_premul(c, share),
+                        early_return_oracle::scale_premul(c, share),
+                        "scale_premul({c:#010x}, {share:?})"
+                    );
+                }
+            }
+        }
+        let tiny = Geom {
+            cw: 1,
+            ch: 1,
+            origin_x: 3,
+            origin_y: 5,
+            head: 2,
+            ..geom()
+        };
+        for g in [geom(), tiny] {
+            let same = |what: &str, at: f32, got: f32, want: f32| {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "{what} at {at:?}: {got} for {want}"
+                );
+            };
+            let (left, right) = (g.fx_left() as f32, g.fx_right() as f32);
+            let (top, bot) = (g.fx_top() as f32, g.fx_bot() as f32);
+            let mut xs: Vec<f32> = (-640..=(right as i32 + 10) * 64)
+                .map(|i| i as f32 / 64.0)
+                .collect();
+            let mut ys: Vec<f32> = (-640..=(bot as i32 + 10) * 64)
+                .map(|i| i as f32 / 64.0)
+                .collect();
+            for special in [
+                f32::NAN,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::MAX,
+                f32::MIN,
+            ] {
+                xs.push(special);
+                ys.push(special);
+            }
+            for edge in [left, right] {
+                xs.extend([edge.next_down(), edge, edge.next_up()]);
+            }
+            for edge in [top, bot] {
+                ys.extend([edge.next_down(), edge, edge.next_up()]);
+            }
+            for &x in &xs {
+                same(
+                    "fx_fade_x",
+                    x,
+                    fx_fade_x(g, x),
+                    early_return_oracle::fx_fade_x(g, x),
+                );
+            }
+            for &y in &ys {
+                same(
+                    "fx_fade_y",
+                    y,
+                    fx_fade_y(g, y),
+                    early_return_oracle::fx_fade_y(g, y),
+                );
+            }
+        }
+    }
+
+    /// A star whose body paints nothing draws nothing and answers the budget as the piece
+    /// loop's check at its second piece does: `true` below the cap, `false` at it and past it,
+    /// where the callers stop laying stars. Judged over every coverage that rounds the body to
+    /// black of colours from black to white, arms from one to past the cached ones, plain and
+    /// gold, with the budget empty, under, at and past the cap.
+    #[test]
+    fn a_star_that_paints_nothing_answers_the_budget_as_the_piece_loop_did() {
+        let g = geom();
+        let (mut below, mut at_or_past) = (0u32, 0u32);
+        for color in [
+            0,
+            0x0000_0001,
+            0x0001_0101,
+            0x0000_0080,
+            0xFF00_0080,
+            0x00A9_8BFF,
+            0x00FF_FFFF,
+        ] {
+            for cov in 1..=u8::MAX {
+                if premul_rgb(color, cov) != 0 {
+                    continue;
+                }
+                for arm in [1, 2, 3, 5, 8, 16, 17, 24] {
+                    for gold in [false, true] {
+                        for (filled, cap) in [(0, 0), (0, 1), (0, 4096), (3, 2), (3, 3), (3, 4)] {
+                            let laid = vec![GlowQuad::default(); filled];
+                            let mut out = laid.clone();
+                            let said =
+                                push_twinkle_star(&mut out, g, 100, 40, arm, cov, gold, color, cap);
+                            assert_eq!(
+                                out, laid,
+                                "push_twinkle_star(arm {arm}, cov {cov}, gold {gold}, \
+                                 {color:#010x}) with {filled} of {cap} quads laid drew light"
+                            );
+                            assert_eq!(
+                                said,
+                                filled < cap,
+                                "push_twinkle_star(arm {arm}, cov {cov}, gold {gold}, \
+                                 {color:#010x}) with {filled} of {cap} quads laid answered {said}"
+                            );
+                            if filled < cap {
+                                below += 1;
+                            } else {
+                                at_or_past += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            below > 0 && at_or_past > 0,
+            "no star that paints nothing was laid below the cap ({below}) or at it ({at_or_past})"
+        );
     }
 }

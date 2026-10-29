@@ -185,6 +185,7 @@ impl RelayCtl {
         let id = self.next_id;
         self.next_id += 1;
         if let Ok(handle) = client.transport().try_clone() {
+            let _ = aterm_uds::keep_out_of_children(&handle);
             self.shut
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -679,12 +680,26 @@ mod tests {
 
     #[test]
     fn the_interrupter_ends_a_parked_request() {
-        let dir = std::env::temp_dir().join(format!("aterm-relayctl-cut-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
+        let dir = crate::supervise::ScratchDir::new("relayctl", "cut-parked");
         let sock = dir.join("a.sock");
         let listener = UnixListener::bind(&sock).expect("bind");
-        let h = std::thread::spawn(move || listener.accept().map(|(s, _)| s));
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+        // The server says when the await reached it, and keeps its end open until the join.
+        let h = std::thread::spawn(move || -> std::io::Result<_> {
+            let (s, _) = listener.accept()?;
+            let mut r = BufReader::new(s.try_clone()?);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if r.read_line(&mut line)? == 0 {
+                    return Ok(s);
+                }
+                if line.starts_with("await inbox") {
+                    let _ = parked_tx.send(());
+                    return Ok(s);
+                }
+            }
+        });
         let mut c = RelayCtl::new(
             Endpoint::Socket(sock.to_string_lossy().into_owned()),
             Some("tok".to_string()),
@@ -692,7 +707,9 @@ mod tests {
         c.connect().expect("dial");
         let cut = c.interrupter().expect("interrupter");
         let t = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
+            parked_rx
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("the await reached the server");
             cut();
         });
         let started = std::time::Instant::now();
@@ -708,7 +725,6 @@ mod tests {
         );
         t.join().expect("cutter");
         drop(h.join());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

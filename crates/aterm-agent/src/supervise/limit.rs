@@ -185,6 +185,8 @@ fn parse_span(s: &str) -> Option<Duration> {
         let n: u64 = num.parse().ok()?;
         num.clear();
         secs += match unit {
+            'w' => n * 7 * 86_400,
+            'd' => n * 86_400,
             'h' => n * 3600,
             'm' => n * 60,
             's' => n,

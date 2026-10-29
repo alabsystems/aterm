@@ -5,9 +5,6 @@
 
 use super::*;
 
-/// The comet debris glint's coverage as a fraction of the grain's own.
-pub(super) const COMET_GLINT_COV: f32 = 0.5;
-
 /// The seven names every point-mark of this family snaps to, red → violet (`0x00RRGGBB`): canonical ROYGBIV in spectral order.
 pub(super) const RAINBOW_BANDS: [u32; SPECTRUM_STOPS] = {
     let mut bands = [0u32; SPECTRUM_STOPS];
@@ -479,9 +476,10 @@ pub(super) const fn glyph_ink_bound(fg: u32, bg: u32) -> Option<(GlyphInkSide, f
     if fg > 0x00FF_FFFF || bg > 0x00FF_FFFF || fg == bg {
         return None;
     }
+    let table = crate::color_math::relative_luminance_table();
     let (lfg, lbg) = (
-        crate::color_math::relative_luminance(fg),
-        crate::color_math::relative_luminance(bg),
+        crate::color_math::relative_luminance_with(table, fg),
+        crate::color_math::relative_luminance_with(table, bg),
     );
     let (hi, lo) = if lfg > lbg { (lfg, lbg) } else { (lbg, lfg) };
     let theme = (hi + 0.05) / (lo + 0.05);
@@ -638,6 +636,7 @@ pub(super) const fn fresh_ink_glyph_ink(
 pub(super) type GlyphPaletteMemo = ((u32, u32), Option<[u32; RAINBOW_BANDS.len()]>);
 
 /// The seven band inks for one theme, or `None` when this theme gets no tint.
+#[inline]
 pub(super) const fn fresh_ink_glyph_palette(
     fg: u32,
     bg: u32,
@@ -824,6 +823,7 @@ pub(crate) const fn hold_glow_radii_in_box(
 pub(crate) const SOFT_VEIL_LAYERS: usize = 10;
 
 /// A source-over veil that falls off radially from its centre to nothing at its rim, in `ink` with at most `cap` of opacity at the centre.
+#[inline]
 pub(crate) fn push_soft_veil(
     halos: &mut Vec<RainHalo>,
     geom: Geom,
@@ -991,6 +991,7 @@ pub(super) fn push_light_mote(
 }
 
 /// A bead of ink on paper at `(cx, cy)`: a round disc of radius `r` in the `rim` ink with a disc of the `core` ink inside it (three fifths of the radius), both anti-aliased at their edges and laid source-over at opacity `alpha`, one pixel row at a time.
+#[inline]
 pub(super) fn push_paper_bead(
     out: &mut Vec<GlowQuad>,
     geom: Geom,
@@ -1007,14 +1008,18 @@ pub(super) fn push_paper_bead(
         out: &mut Vec<GlowQuad>,
         geom: Geom,
         (x, y, w): (i32, i32, i32),
-        rgb: u32,
-        alpha: u8,
+        (rgb, alpha, full_premul): (u32, u8, u32),
         f: f32,
         rows: f32,
     ) {
         let a = (f32::from(alpha) * (f * rows).clamp(0.0, 1.0)) as u8;
         if a > 0 && w > 0 {
-            push_fx_quad(out, geom, x, y, w, 1, premul_rgb(rgb, a), a);
+            let premul = if a == alpha {
+                full_premul
+            } else {
+                premul_rgb(rgb, a)
+            };
+            push_fx_quad(out, geom, x, y, w, 1, premul, a);
         }
     }
     #[inline]
@@ -1026,6 +1031,8 @@ pub(super) fn push_paper_bead(
         rgb: u32,
         alpha: u8,
     ) {
+        let full_premul = premul_rgb(rgb, alpha);
+        let ink = (rgb, alpha, full_premul);
         let rr2 = rr * rr;
         let (y0, y1) = ((cy - rr).floor() as i32, (cy + rr).ceil() as i32);
         let mut y = y0;
@@ -1038,21 +1045,13 @@ pub(super) fn push_paper_bead(
                 let (xl, xr) = (cx - half, cx + half);
                 let (pl, pr) = (xl.floor() as i32, (xr.ceil() as i32) - 1);
                 if pl == pr {
-                    lay_px(out, geom, (pl, y, 1), rgb, alpha, xr - xl, rows);
+                    lay_px(out, geom, (pl, y, 1), ink, xr - xl, rows);
                 } else {
-                    lay_px(
-                        out,
-                        geom,
-                        (pl, y, 1),
-                        rgb,
-                        alpha,
-                        (pl + 1) as f32 - xl,
-                        rows,
-                    );
+                    lay_px(out, geom, (pl, y, 1), ink, (pl + 1) as f32 - xl, rows);
                     if pr > pl + 1 {
-                        lay_px(out, geom, (pl + 1, y, pr - pl - 1), rgb, alpha, 1.0, rows);
+                        lay_px(out, geom, (pl + 1, y, pr - pl - 1), ink, 1.0, rows);
                     }
-                    lay_px(out, geom, (pr, y, 1), rgb, alpha, xr - pr as f32, rows);
+                    lay_px(out, geom, (pr, y, 1), ink, xr - pr as f32, rows);
                 }
             }
             y += 1;
@@ -1116,6 +1115,7 @@ pub(crate) const fn tinted_dark_page(page: u32) -> Option<u32> {
 /// moons olive and sage (looks7 round 3); laid this way a moon reads within
 /// a few degrees of its reference gold at every coverage from a quarter up,
 /// and a full one reads as on the reference.
+#[inline]
 #[must_use]
 pub(crate) const fn page_matched(rgb: u32, a: u8, page: u32) -> (u32, u8) {
     if a == 0 {
@@ -1180,7 +1180,95 @@ pub(crate) const fn page_matched(rgb: u32, a: u8, page: u32) -> (u32, u8) {
     (pack(c), alpha as u8)
 }
 
+/// The most the straight colour of a light laid by [`page_matched_held`]
+/// turns off its own hue, degrees.
+pub(crate) const PAGE_MATCHED_HUE_HOLD: f32 = 12.0;
+
+/// [`page_matched`] whose straight colour keeps `rgb`'s own hue
+/// ([`PAGE_MATCHED_HUE_HOLD`]): over the page it lays the same reading,
+/// reached at the least opacity whose colour keeps the light's hue (or reads
+/// as no hue), opaque at worst. The least opacity reached a faint reading
+/// from Solarized Dark's teal with a colour of the teal's missing red, and
+/// laid over the bed under Sparkle's fading rail (not the page it was solved
+/// for) that red turned the rail's last frames rust, `#774f42` at hue 14
+/// under the trail gallery's caret (looks10 round 3's hue ruling); held, the
+/// rail fades by its light, as a dimming gold over the bed.
+#[inline]
+#[must_use]
+pub(crate) const fn page_matched_held(rgb: u32, a: u8, page: u32) -> (u32, u8) {
+    let (c, k) = page_matched(rgb, a, page);
+    if k == 0 || k == 255 {
+        return (c, k);
+    }
+    let (light_h, light_s, _) = crate::color_math::rgb2hsv(rgb & 0x00FF_FFFF);
+    if light_s < HUE_READS_SAT {
+        return (c, k);
+    }
+    #[inline]
+    const fn ch(c: u32, sh: u32) -> f32 {
+        ((c >> sh) & 0xff) as f32
+    }
+    let pg = [ch(page, 16), ch(page, 8), ch(page, 0)];
+    // The reading over the page the least opacity lays, which every
+    // opacity reaches with its own colour.
+    let kf = k as f32 * (1.0 / 255.0);
+    let d = [
+        ch(c, 16) + pg[0] * (1.0 - kf),
+        ch(c, 8) + pg[1] * (1.0 - kf),
+        ch(c, 0) + pg[2] * (1.0 - kf),
+    ];
+    #[inline]
+    const fn straight(d: [f32; 3], pg: [f32; 3], k: u32) -> u32 {
+        let inv = 255.0 / k as f32;
+        let mut out = 0u32;
+        let mut i = 0;
+        while i < 3 {
+            let v = (pg[i] + (d[i] - pg[i]) * inv).round().clamp(0.0, 255.0) as u32;
+            out = (out << 8) | v;
+            i += 1;
+        }
+        out
+    }
+    #[inline]
+    const fn holds(s: u32, light_h: f32) -> bool {
+        let (h, sat, _) = crate::color_math::rgb2hsv(s);
+        let gap = if h > light_h {
+            h - light_h
+        } else {
+            light_h - h
+        };
+        let gap = if gap > 180.0 { 360.0 - gap } else { gap };
+        sat < HUE_READS_SAT || gap <= PAGE_MATCHED_HUE_HOLD
+    }
+    if holds(straight(d, pg, k as u32), light_h) {
+        return (c, k);
+    }
+    let (mut lo, mut hi) = (k as u32, 255u32);
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if holds(straight(d, pg, mid), light_h) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let s = straight(d, pg, hi);
+    let kh = hi as f32 * (1.0 / 255.0);
+    let mut pre = 0u32;
+    let mut sh = 24;
+    while sh > 0 {
+        sh -= 8;
+        pre = (pre << 8) | (ch(s, sh) * kh).round().clamp(0.0, 255.0) as u32;
+    }
+    (pre, hi as u8)
+}
+
+/// The least HSV saturation at which a colour reads as a hue
+/// ([`page_matched_held`]).
+const HUE_READS_SAT: f32 = 0.2;
+
 /// A crescent moon of radius `r` at `(cx, cy)`: the lit disc minus a shadow disc ([`CRESCENT_SHADOW_R`] of its radius, at [`CRESCENT_SHADOW_OFFSET`] from its centre), so a thick limb tapers into two horns.
+#[inline]
 pub(super) fn push_crescent(
     out: &mut Vec<GlowQuad>,
     geom: Geom,
@@ -1212,11 +1300,16 @@ pub(super) fn push_crescent(
         geom: Geom,
         (x, y, w): (i32, i32, i32),
         (rgb, cov, ink): (u32, u8, CrescentInk),
+        full: (u32, u8),
         f: f32,
     ) {
         let a = (f32::from(cov) * f.clamp(0.0, 1.0)) as u8;
         if a > 0 {
-            let (premul, alpha) = crescent_at(rgb, a, ink);
+            let (premul, alpha) = if a == cov {
+                full
+            } else {
+                crescent_at(rgb, a, ink)
+            };
             if premul != 0 || alpha != 0 {
                 push_fx_quad(out, geom, x, y, w, 1, premul, alpha);
             }
@@ -1229,17 +1322,24 @@ pub(super) fn push_crescent(
         y: i32,
         (xl, xr): (f32, f32),
         (rgb, cov, ink): (u32, u8, CrescentInk),
-        (full_premul, full_alpha): (u32, u8),
+        full @ (full_premul, full_alpha): (u32, u8),
     ) {
         if xr - xl < 0.05 {
             return;
         }
         let (pl, pr) = (xl.floor() as i32, (xr.ceil() as i32) - 1);
         if pl == pr {
-            lay_px(out, geom, (pl, y, 1), (rgb, cov, ink), xr - xl);
+            lay_px(out, geom, (pl, y, 1), (rgb, cov, ink), full, xr - xl);
             return;
         }
-        lay_px(out, geom, (pl, y, 1), (rgb, cov, ink), (pl + 1) as f32 - xl);
+        lay_px(
+            out,
+            geom,
+            (pl, y, 1),
+            (rgb, cov, ink),
+            full,
+            (pl + 1) as f32 - xl,
+        );
         if pr > pl + 1 {
             push_fx_quad(
                 out,
@@ -1252,7 +1352,7 @@ pub(super) fn push_crescent(
                 full_alpha,
             );
         }
-        lay_px(out, geom, (pr, y, 1), (rgb, cov, ink), xr - pr as f32);
+        lay_px(out, geom, (pr, y, 1), (rgb, cov, ink), full, xr - pr as f32);
     }
     let full = crescent_at(rgb, cov, ink);
     let (r2, sr2) = (r * r, sr * sr);
@@ -1296,6 +1396,7 @@ pub(super) fn push_halo(
 }
 
 /// The radial-halo band walk behind [`push_halo`], [`push_halo_over`] and the kitty cursor's exit veils: the halo at `(cx, cy)` with radii `(rx, ry)` (rounded, floored to 1) is clamped to the effects box (grid + head band) and split into per-cell-row [`RainHalo`]s in `mode`, sharing centre and radii.
+#[inline]
 pub(crate) fn push_halo_rows(
     out: &mut Vec<RainHalo>,
     geom: Geom,
@@ -1370,6 +1471,7 @@ pub(super) fn push_dust_halo(
 }
 
 /// Push a flattened elliptical annulus at `(cx, cy)` with outer radii `(rx, ry)` and a `thick` px rim, faded near the effects box edges.
+#[inline]
 pub(crate) fn push_ripple_ring(
     out: &mut Vec<GlowQuad>,
     geom: Geom,
@@ -1450,7 +1552,8 @@ pub(super) const fn bolt_flash(u: f32) -> f32 {
 pub(super) const BOLT_HOLD: f32 = 0.15;
 /// How far a bolt's brightness eases down across the rest of its life.
 pub(super) const BOLT_FADE: f32 = 0.60;
-/// Where in a bolt's life its channel starts retracting from its root.
+/// Where in a bolt's life its channel starts burning out: a strike retracts
+/// from its root into the caret, a crackle fades whole.
 pub(super) const BOLT_BURN_START: f32 = 0.55;
 
 /// The beam power envelope: full power for the first 40% of a spark's life, then one cosine down to zero.
@@ -1468,7 +1571,8 @@ pub(super) const fn beam_power(frac: f32) -> f32 {
 /// HSV (all `0..1`; `h` in turns, any real, wrapped) → `0x00RRGGBB`: the colour wheel the classic wake and the phaser turn.
 #[inline]
 pub(crate) const fn hsv2rgb(h: f32, s: f32, v: f32) -> u32 {
-    let h = (h.fract() + 1.0).fract() * 6.0;
+    let f = h.fract();
+    let h = (if f < 0.0 { f + 1.0 } else { f }) * 6.0;
     let i = h.floor() as i32;
     let f = h - i as f32;
     let p = v * (1.0 - s);

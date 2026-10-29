@@ -64,8 +64,27 @@ enum Admit {
     Any,
 }
 
+/// What a read does with a file longer than its cap.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Past {
+    /// Refuse it.
+    Refuse,
+    /// Keep its first `max` bytes.
+    Head,
+}
+
 /// Open and read a regular file under `admit`, at most `max` bytes.
 fn read_admitted(path: &Path, max: usize, admit: Admit) -> crate::Result<Option<Vec<u8>>> {
+    read_admitted_past(path, max, admit, Past::Refuse)
+}
+
+/// [`read_admitted`], doing `past` with a file longer than `max` bytes.
+fn read_admitted_past(
+    path: &Path,
+    max: usize,
+    admit: Admit,
+    past: Past,
+) -> crate::Result<Option<Vec<u8>>> {
     let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -120,7 +139,12 @@ fn read_admitted(path: &Path, max: usize, admit: Admit) -> crate::Result<Option<
         }
     }
     let mut bytes = read_buffer(meta.len(), max);
-    let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
+    let limit = u64::try_from(max).unwrap_or(u64::MAX);
+    let limit = if past == Past::Head {
+        limit
+    } else {
+        limit.saturating_add(1)
+    };
     crate::secret::read_to_end_wiping_on_error(file.take(limit), &mut bytes)
         .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
     if bytes.len() > max {
@@ -151,6 +175,11 @@ pub fn read_private(path: &Path, max: usize) -> crate::Result<Option<SecretBytes
 /// Reads a regular file owned by this user with no group/other write bits, up to `max` bytes.
 pub fn read_owned(path: &Path, max: usize) -> crate::Result<Option<Vec<u8>>> {
     read_admitted(path, max, Admit::Owned)
+}
+
+/// [`read_owned`] that keeps the first `max` bytes of a longer file instead of refusing it.
+pub fn read_owned_head(path: &Path, max: usize) -> crate::Result<Option<Vec<u8>>> {
+    read_admitted_past(path, max, Admit::Owned, Past::Head)
 }
 
 /// Reads any regular file up to `max` bytes, refusing symlinks and non-regular files.

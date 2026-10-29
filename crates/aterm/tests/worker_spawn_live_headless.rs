@@ -217,6 +217,29 @@ fn run_agent_worker(tag: &str, shell: &str, model: Option<&str>, word: &str) {
     let home = inst.tmp.join("home");
     let argv_file = home.join("argv.bin");
     until(&inst, &worker, "the stand-in ran", || argv_file.exists());
+    // The world's config says no to installs, so the launcher of an agent atpkg ships installed
+    // nothing (no download of the CLI, whether or not an atpkg stands beside this aterm) and its
+    // launch line in the instance's log (`$ATERM_STATE_HOME/logs`) named that off beside the
+    // program it kept off.
+    let cli = aterm_agent::harness::worker::WORKERS
+        .iter()
+        .find(|cli| cli.word == word)
+        .unwrap_or_else(|| panic!("{word}: a worker row"));
+    if let Some(program) = cli.atpkg_program() {
+        let log = inst.tmp.join("state/logs/aterm.log");
+        until(
+            &inst,
+            &worker,
+            "the launch line naming the no to installs",
+            || {
+                std::fs::read_to_string(&log).is_ok_and(|log| {
+                    log.lines().any(|line| {
+                        line.contains(atpkg::adoption::UPDATES_OFF) && line.contains(program)
+                    })
+                })
+            },
+        );
+    }
     let text = std::fs::read(&file).expect("the task file");
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -279,6 +302,32 @@ fn run_agent_worker(tag: &str, shell: &str, model: Option<&str>, word: &str) {
         ctl_ok(&inst, &["sessions"]).contains(&format!(" {worker} ")),
         "the worker's session stands"
     );
+}
+
+/// THE LIVE WORLDS DECLINE INSTALLS, so a spawn here runs the test's stand-in and never starts a
+/// download of the agent CLI: the config every boot writes ([`launch_isolation::prepare`]), and
+/// the one this file's supervised boots make of it, say no to unattended installs by atpkg's own
+/// reading ([`atpkg::adoption::unattended_install_off`]), which a spawn's install obeys.
+#[test]
+fn the_live_worlds_config_declines_installs() {
+    let root = launch_isolation::scratch_root("atwsconsent");
+    let written = std::fs::read_to_string(root.path().join("cfg/aterm/aterm.toml"))
+        .expect("the isolation config");
+    let supervised = format!(
+        "{}[harness]\n{SUPERVISED}",
+        written.replace(launch_isolation::HARNESS_OFF, "")
+    );
+    let store = atpkg::store::Layout {
+        prefix: root.path().join("pkg"),
+    };
+    for (which, text) in [("written", &written), ("supervised", &supervised)] {
+        let cfg = atpkg::config::parse_packages(text);
+        assert_eq!(
+            atpkg::adoption::unattended_install_off(&store, &cfg),
+            Some(atpkg::adoption::UPDATES_OFF),
+            "{which}: {text}"
+        );
+    }
 }
 
 #[test]

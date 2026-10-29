@@ -287,8 +287,10 @@ pub(crate) struct BlockFact {
     pub(crate) started_ms: Option<u64>,
     /// How it stands.
     pub(crate) end: BlockEnd,
-    /// Its command reduced to the program ([`crate::session_status::command_detail`]): the line itself is never stored.
+    /// Its command reduced to the program, once the kernel confirms that program ran in its window ([`crate::session_status::command_detail`]): the line itself is never stored, nor a word no program of that name ran under.
     pub(crate) detail: Option<String>,
+    /// Whether `detail` names the command's own program, which no later read betters (`false`: the wrapper or interpreter that ran while the program was not yet heard, [`crate::session_status::Reading::own`]).
+    pub(crate) detail_final: bool,
 }
 
 /// What the status sweep read of the shell's blocks under its one terminal guard ([`crate::session_status::block_read`]): the blocks that ran a command from the log's [`SessionLog::block_cursor`] on, OLDEST first, at most [`crate::session_status::BLOCK_READ_MAX`] of them.
@@ -337,6 +339,53 @@ struct CmdRun {
     node: Node,
     wall_from: Option<u64>,
     child_end: Option<Stamp>,
+    /// What its `detail=` holds so far: nothing, a stand-in a later read may replace once, or
+    /// the program itself.
+    detailed: Detailed,
+}
+
+/// How far a `cmd` run's `detail=` has come ([`SessionLog::amend_detail`]): unwritten, then a
+/// stand-in (the wrapper or interpreter that ran while its program was not yet heard), then the
+/// program itself, each step written at most once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Detailed {
+    /// No detail written.
+    Unwritten,
+    /// A stand-in written: one amend may name the program.
+    StandIn,
+    /// The program written: no amend follows.
+    Program,
+}
+
+impl Detailed {
+    /// What `fact`'s detail would make a run's.
+    fn of(fact: &BlockFact) -> Self {
+        match (&fact.detail, fact.detail_final) {
+            (None, _) => Self::Unwritten,
+            (Some(_), false) => Self::StandIn,
+            (Some(_), true) => Self::Program,
+        }
+    }
+
+    /// Its carry word ([`Self::from_word`]).
+    #[cfg(any(unix, test))]
+    pub(crate) const fn word(self) -> &'static str {
+        match self {
+            Self::Unwritten => "none",
+            Self::StandIn => "stand_in",
+            Self::Program => "program",
+        }
+    }
+
+    /// The state a carry word names; a line with none (written before a detail could come
+    /// later) held its detail from the open, so nothing is amended.
+    pub(crate) fn from_word(word: Option<&str>) -> Self {
+        match word {
+            Some("none") => Self::Unwritten,
+            Some("stand_in") => Self::StandIn,
+            _ => Self::Program,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -977,15 +1026,20 @@ impl SessionLog {
         }
         for fact in &read.facts {
             match (self.cmd.filter(|c| c.blk == fact.id), fact.end) {
-                (Some(_), BlockEnd::Running) => {}
-                (Some(c), BlockEnd::Done(done)) => {
+                (Some(mut c), BlockEnd::Running) => {
+                    self.amend_detail(&mut c, fact, at);
+                    self.cmd = Some(c);
+                }
+                (Some(mut c), BlockEnd::Done(done)) => {
                     let end = stamp_at_wall(at, done.ended_ms.unwrap_or(at.wall_ms));
                     self.cmd = None;
+                    self.amend_detail(&mut c, fact, end);
                     self.end_cmd(c, CmdEnd::Exit(done.exit_code), end);
                 }
-                (Some(c), BlockEnd::Unended { ended_ms }) => {
+                (Some(mut c), BlockEnd::Unended { ended_ms }) => {
                     let end = stamp_at_wall(at, ended_ms.unwrap_or(at.wall_ms));
                     self.cmd = None;
+                    self.amend_detail(&mut c, fact, end);
                     self.end_cmd(c, CmdEnd::Unknown, end);
                 }
                 (None, _) if self.last_blk.is_some_and(|l| fact.id <= l) => {}
@@ -1071,6 +1125,7 @@ impl SessionLog {
                         node,
                         wall_from,
                         child_end: None,
+                        detailed: Detailed::of(fact),
                     });
                 }
             }
@@ -1088,6 +1143,7 @@ impl SessionLog {
                         node,
                         wall_from: Some(start.wall_ms),
                         child_end: None,
+                        detailed: Detailed::of(fact),
                     };
                     self.end_cmd(c, CmdEnd::Exit(done.exit_code), end);
                 }
@@ -1129,6 +1185,34 @@ impl SessionLog {
                 at,
             )
             .ok()
+    }
+
+    /// Write a running or ending `cmd` run's `detail=` once the sweep first reads it confirmed
+    /// (its program heard running, [`crate::session_status::block_read`]): its open carried none,
+    /// since a word the program never ran under is never written, not even for now. A stand-in
+    /// written first (the `time` of `time make` before `make` was heard) is amended once, to the
+    /// program.
+    fn amend_detail(&mut self, c: &mut CmdRun, fact: &BlockFact, at: Stamp) {
+        let next = Detailed::of(fact);
+        if next <= c.detailed {
+            return;
+        }
+        let Some(token) = fact.detail.as_deref().and_then(|d| tok(Key::Detail, d)) else {
+            return;
+        };
+        let at = self.opened_at(c.node).map_or(at, |open| later(at, open));
+        let f = with(Fields::new(), Key::Detail, Some(token));
+        if self
+            .log
+            .amend(
+                c.node,
+                Amend::new(Kind::Cmd, Src::Status, Conf::Strong, f),
+                at,
+            )
+            .is_ok()
+        {
+            c.detailed = next;
+        }
     }
 
     fn end_cmd(&mut self, c: CmdRun, how: CmdEnd, end: Stamp) {

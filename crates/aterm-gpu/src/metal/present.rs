@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use super::acquire_worker::{AcquireOutcome, AcquireWorker, result_is_current};
-use super::encoder::{CommandBuffer, RenderPassDesc, StoreAction};
+use super::encoder::{CommandBuffer, PassEncoder, RenderPassDesc, StoreAction};
 #[cfg(test)]
 use super::ffi::PixelFormat;
 use super::ffi::{self, ClearColor, LoadAction, MtlScissorRect, MtlViewport, Obj, PrimitiveType};
@@ -436,6 +436,10 @@ pub(crate) struct PresentSequence<'a> {
     /// The compose copy's half-open rect from `renderer::present_copy_rect`;
     /// full frame only for the first sync into a fresh copy.
     pub(crate) copy_rect: [u32; 4],
+    /// The compose copy's draw: the blit row at the present copy's format over the offscreen,
+    /// with a uniform that makes it a 1:1 texel copy (`BlitUniform::compose_copy`). Required
+    /// with `present_off`.
+    pub(crate) compose: Option<PostPass<'a>>,
     pub(crate) bloom: Option<BloomPasses<'a>>,
     pub(crate) shimmer: Option<ShimmerPass<'a>>,
     /// The sub-row scroll translate, over the copy (requires `present_off`;
@@ -459,19 +463,60 @@ pub(crate) fn encode_present_sequence(
     (dest_w, dest_h): (u32, u32),
     seq: &PresentSequence<'_>,
 ) -> Result<(), String> {
-    // 1. Compose: clean offscreen → present copy (scissored sub-rect copy).
-    if let Some(present_off) = seq.present_off {
-        let [x0, y0, x1, y1] = seq.copy_rect;
-        if x1 > x0 && y1 > y0 {
-            cb.copy_texture_sub_rect(
-                seq.offscreen,
-                (x0 as usize, y0 as usize),
-                present_off,
-                (x0 as usize, y0 as usize),
-                (x1 - x0) as usize,
-                (y1 - y0) as usize,
-            )?;
+    // 1. Compose: clean offscreen → present copy, scissored to the copy rect. It is a draw in a
+    //    render pass, never a blit: the first blit (or compute) work wakes a second class of the
+    //    GPU driver's working memory, which it keeps until the GPU has been idle for a second or
+    //    two (about 128 MB of an idle window's footprint on an M5 Max), so a blit on every
+    //    frame would keep it resident in every window that draws at least once a second. Where
+    //    the tray is the copy's only writer the copy is the tray pass's first draw; otherwise it
+    //    is a pass of its own, ahead of the writers.
+    let compose = match seq.present_off {
+        Some(copy) => {
+            let [x0, y0, x1, y1] = seq.copy_rect;
+            let draw = seq.compose.as_ref().ok_or_else(|| {
+                "the present copy needs its compose draw (the blit row at the copy's format)"
+                    .to_owned()
+            })?;
+            // The draw `read`s the offscreen at each target texel, and a read outside a
+            // texture is undefined in Metal: the rect stays inside both, as the blit's did.
+            for (what, tex) in [("present copy", copy), ("offscreen", seq.offscreen)] {
+                if x1 as usize > tex.width() || y1 as usize > tex.height() {
+                    return Err(format!(
+                        "the compose rect {:?} leaves the {}x{} {what}",
+                        seq.copy_rect,
+                        tex.width(),
+                        tex.height()
+                    ));
+                }
+            }
+            (x1 > x0 && y1 > y0).then_some((
+                MtlScissorRect {
+                    x: x0 as usize,
+                    y: y0 as usize,
+                    width: (x1 - x0) as usize,
+                    height: (y1 - y0) as usize,
+                },
+                draw,
+            ))
         }
+        None => None,
+    };
+    let compose_in_tray = seq.tray.is_some()
+        && seq.bloom.is_none()
+        && seq.shimmer.is_none()
+        && seq.band_shift.is_none()
+        && seq.apron.is_none();
+    if let (Some(present_off), Some((rect, draw))) = (seq.present_off, compose)
+        && !compose_in_tray
+    {
+        let pass = cb.render_pass(&RenderPassDesc {
+            target: present_off,
+            load: LoadAction::Load,
+            store: StoreAction::Store,
+            viewport: None,
+            scissor: Some(rect),
+        })?;
+        draw_post(&pass, draw)?;
     }
     let composed = seq.present_off.unwrap_or(seq.offscreen);
 
@@ -590,6 +635,16 @@ pub(crate) fn encode_present_sequence(
             viewport: None,
             scissor: None,
         })?;
+        if compose_in_tray && let Some((rect, draw)) = compose {
+            pass.set_scissor(rect);
+            draw_post(&pass, draw)?;
+            pass.set_scissor(MtlScissorRect {
+                x: 0,
+                y: 0,
+                width: composed.width(),
+                height: composed.height(),
+            });
+        }
         pass.set_pipeline(tray.pso);
         pass.set_vertex_buffer(tray.uniform, tray.uniform_slot)?;
         pass.set_fragment_texture(tray.card_tex, tray.tex_slot);
@@ -632,6 +687,16 @@ pub(crate) fn encode_present_sequence(
         }
     }
     Ok(())
+}
+
+/// One fullscreen-triangle post draw (`draw`'s pipeline, texture, sampler and uniform) into
+/// the open `pass`, under whatever scissor the pass holds.
+fn draw_post(pass: &PassEncoder<'_, '_>, draw: &PostPass<'_>) -> Result<(), String> {
+    pass.set_pipeline(draw.pso);
+    pass.set_fragment_texture(draw.tex, draw.tex_slot);
+    pass.set_fragment_sampler(draw.sampler, draw.sampler_slot);
+    pass.set_fragment_buffer(draw.uniform, draw.uniform_slot);
+    pass.draw_fullscreen_triangle()
 }
 
 #[cfg(test)]

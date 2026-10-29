@@ -43,12 +43,18 @@ impl MachineIdentity {
     }
 }
 
-/// `~/.aterm/machine.toml`, beside the key `atpkg-keys setup`/`join` wrote.
-pub fn conventional_identity_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".aterm/machine.toml"))
+/// `home/.aterm/release-ring/machine.toml`, beside the key `atpkg-keys setup`/`join` wrote.
+#[must_use]
+pub fn identity_path_in(home: &Path) -> PathBuf {
+    home.join(atpkg_keys::provision::MACHINE_PUB_REL)
 }
 
-/// What this machine claims its id is: the release-credentials profile's `machine_id` when set (it is part of the command that ran), else `~/.aterm/machine.toml`.
+/// `~/.aterm/release-ring/machine.toml`, beside the key `atpkg-keys setup`/`join` wrote.
+pub fn conventional_identity_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| identity_path_in(Path::new(&home)))
+}
+
+/// What this machine claims its id is: the release-credentials profile's `machine_id` when set (it is part of the command that ran), else `~/.aterm/release-ring/machine.toml`.
 pub fn declared_machine_id(
     profile_machine_id: Option<&str>,
     identity_path: Option<&Path>,
@@ -425,5 +431,37 @@ mod tests {
         std::fs::write(&path, "this is not toml = = =").unwrap();
         assert!(MachineIdentity::read(&path).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Release attribution reads `~/.aterm/release-ring/machine.toml` and ignores the host's own
+    /// `~/.aterm/machine.toml` (`id != m22` in 0.146).
+    /// NEGATIVE CONTROL: reading `.aterm/machine.toml` returns `"m99"` instead of `"m22"` (or
+    /// `Some("m99")` when the release ring is absent).
+    #[test]
+    fn release_ring_identity_path_ignores_host_machine_toml() {
+        let home = std::env::temp_dir().join(format!("aterm-ring-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".aterm")).unwrap();
+        std::fs::write(
+            home.join(".aterm/machine.toml"),
+            "id = \"m99\"\npubkey = \"host-key\"\n",
+        )
+        .unwrap();
+
+        let ring_record = identity_path_in(&home);
+        assert_eq!(
+            declared_machine_id(None, Some(&ring_record)).unwrap(),
+            None,
+            "host machine.toml alone never supplies a release machine id"
+        );
+
+        std::fs::create_dir_all(ring_record.parent().unwrap()).unwrap();
+        std::fs::write(&ring_record, "id = \"m22\"\npubkey = \"ring-key\"\n").unwrap();
+        assert_eq!(
+            declared_machine_id(None, Some(&ring_record)).unwrap(),
+            Some("m22".to_string()),
+            "release-ring/machine.toml wins over ~/.aterm/machine.toml"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

@@ -47,22 +47,26 @@ fn renderer_geometry_follows_the_law_live() {
     .expect("committed JetBrains Mono fixture");
     let mut r = Renderer::from_bytes(&bytes, 16.0, Theme::default()).expect("fixture parses");
 
+    let (asc, desc, gap) = r
+        .debug_geometry_metrics()
+        .expect("committed fixture exposes live vertical metrics");
     let (_, h0) = r.cell_size();
     let b0 = r.baseline();
+    assert_eq!((h0, b0), cell_h_baseline(asc, desc, gap, 1.0));
+
+    for scale in SCALES {
+        r.set_line_height(scale);
+        assert_eq!(
+            (r.cell_size().1, r.baseline()),
+            cell_h_baseline(asc, desc, gap, scale),
+            "live geometry matches cell_h_baseline at scale {scale}"
+        );
+    }
 
     r.set_line_height(1.5);
     let (_, h1) = r.cell_size();
     let b1 = r.baseline();
     assert!(h1 > h0, "1.5 line-height grows the cell box");
-    let natural = h0 as f32; // round(natural*1.0)
-    assert_eq!(h1, (natural * 1.5).round() as usize, "law at scale 1.5");
-    let delta = h1 as f32 - natural;
-    #[allow(clippy::cast_precision_loss, reason = "baseline deltas are tiny")]
-    let moved = (b1 - b0) as f32;
-    assert!(
-        (moved - delta / 2.0).abs() <= 1.5,
-        "baseline moved by ~half the added leading (moved {moved}, delta {delta})"
-    );
 
     r.set_adjust_baseline(3);
     assert_eq!(r.baseline(), b1 + 3, "escape hatch shifts the baseline");

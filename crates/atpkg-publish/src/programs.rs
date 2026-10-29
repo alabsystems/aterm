@@ -68,6 +68,10 @@ pub enum Shape {
     /// everywhere ALab does not build it; no lane reads it, and the index switches its block
     /// to this row only on an explicit `--pin` (`channel::index::plan`).
     Package(PackageDef),
+    /// An upstream formula bottle or release archive relocated into a self-contained store
+    /// payload by `atpkg-publish pack-bottle` (`git`, `gh`). No unattended lane reads it;
+    /// `index --pin` pins it once staged.
+    Bottle(BottleDef),
 }
 
 /// What a harness row's pack is held to beyond a plain row's
@@ -76,8 +80,8 @@ pub enum Shape {
 /// that is absent or not at `MAJOR.MINOR.0`, a checkout that is not clean, a `HEAD` that is not
 /// on `origin/main` of the staging owner's repo, and a build number that is not the checkout's
 /// `HEAD` commit count. It builds `--locked` and calls the pack `MAJOR.MINOR.0+g<9-hex HEAD>`,
-/// the publication rule's spelling of a dev build. The index pins none while some client
-/// reading it would install it unasked (`channel::index::READERS`).
+/// the publication rule's spelling of a dev build. Its pin installs it on every client, as any
+/// program's does (owner ruling 2026-10-27, that page's §11 D45).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Harness {
     /// The one tool it ships and shims: the repo's binary. A repo that declares no `expose`
@@ -91,6 +95,15 @@ pub struct PackageDef {
     /// The tools it shims: the package's entrypoint is `bin/<the one tool>`.
     pub exposes: &'static [&'static str],
     /// The Apple targets one build carries (the client's `AlabAgent::targets`).
+    pub darwin: &'static [Triple],
+}
+
+/// How an upstream bottle or archive tree is packed.
+#[derive(Clone, Copy, Debug)]
+pub struct BottleDef {
+    /// The tools it shims (`bin/<tool>`).
+    pub exposes: &'static [&'static str],
+    /// The Apple targets one build carries.
     pub darwin: &'static [Triple],
 }
 
@@ -146,9 +159,7 @@ const fn plain(
 }
 
 /// An ALab harness: repo = program (the one-word rule), Apple silicon only, ungrouped, packed
-/// to [`Harness`]'s rule, outside the client's default set
-/// (`atpkg::harness::in_default_set`), and pinned only once every client reading the index
-/// keeps it there (`channel::index::READERS`).
+/// to [`Harness`]'s rule, and in the client's default set like every program the index pins.
 const fn harness(name: &'static str, tool: &'static str) -> ProgramDef {
     assert!(
         atpkg::harness::is_harness(name),
@@ -227,6 +238,28 @@ pub static PROGRAMS: &[ProgramDef] = &[
     harness("agy-alab", "agy-alab"),
     harness("grok-alab", "grok-alab"),
     harness("kimi-alab", "kimi-alab"),
+    ProgramDef {
+        name: "gh",
+        repo: "aterm",
+        group: None,
+        system: Some("gh"),
+        unavailable_hint: None,
+        shape: Shape::Bottle(BottleDef {
+            exposes: &["gh"],
+            darwin: DUAL_DARWIN,
+        }),
+    },
+    ProgramDef {
+        name: "git",
+        repo: "aterm",
+        group: None,
+        system: None,
+        unavailable_hint: None,
+        shape: Shape::Bottle(BottleDef {
+            exposes: &["git"],
+            darwin: DUAL_DARWIN,
+        }),
+    },
 ];
 
 /// The program named `name`.
@@ -248,6 +281,7 @@ impl ProgramDef {
             Shape::Plain { darwin, .. } => darwin,
             Shape::Bundle(b) => b.darwin,
             Shape::Package(p) => p.darwin,
+            Shape::Bottle(b) => b.darwin,
         }
     }
 
@@ -262,16 +296,16 @@ impl ProgramDef {
     pub const fn harness(&self) -> Option<Harness> {
         match self.shape {
             Shape::Plain { harness, .. } => harness,
-            Shape::Bundle(_) | Shape::Package(_) => None,
+            Shape::Bundle(_) | Shape::Package(_) | Shape::Bottle(_) => None,
         }
     }
 
-    /// Whether the unattended lanes read it at all: a [`Shape::Package`] row is packed and
-    /// pinned only by a person (`pack-package`, then `index --pin`), so no lane looks for
-    /// its releases, reports it owed or pins it.
+    /// Whether the unattended lanes read it at all: a [`Shape::Package`] or [`Shape::Bottle`]
+    /// row is packed and pinned only by a person (`pack-package` / `pack-bottle`, then
+    /// `index --pin`), so no lane looks for its releases, reports it owed or pins it.
     #[must_use]
     pub const fn lane_tracked(&self) -> bool {
-        !matches!(self.shape, Shape::Package(_))
+        !matches!(self.shape, Shape::Package(_) | Shape::Bottle(_))
     }
 }
 

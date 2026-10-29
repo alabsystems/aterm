@@ -252,16 +252,11 @@ mod tests {
         let missing = std::env::temp_dir()
             .join(format!("aterm-no-such-dir-{}", std::process::id()))
             .join("lock");
-        let start = std::time::Instant::now();
         let err = match FileLock::acquire_within(&missing, std::time::Duration::from_secs(120)) {
             Ok(_) => panic!("acquire must fail on a missing parent"),
             Err(e) => e,
         };
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(60),
-            "permanent error must not burn the retry budget (took {:?})",
-            start.elapsed()
-        );
+        assert_ne!(err.kind(), std::io::ErrorKind::TimedOut);
         assert!(!matches!(err.raw_os_error(), Some(32 | 33)));
     }
 

@@ -87,7 +87,6 @@ pub mod selection;
 mod shell_blocks;
 mod shell_types;
 mod terminal_core;
-pub mod terminal_host;
 mod terminal_modes;
 pub mod text_shaping;
 pub mod vt_level;
@@ -279,5 +278,25 @@ mod tests {
         for invalid in [7, 255, u16::MAX] {
             assert_eq!(CursorStyle::from_param(invalid), None, "{invalid}");
         }
+    }
+
+    #[test]
+    fn luminance_direct_and_srgb_seam_continuity() {
+        assert_eq!(Rgb::new(0, 0, 0).luminance(), 0.0);
+        assert!((Rgb::new(255, 255, 255).luminance() - 1.0).abs() <= f64::EPSILON);
+
+        let seam = 0.04045_f64;
+        let low_branch = seam / 12.92;
+        let high_branch = ((seam + 0.055) / 1.055).powf(2.4);
+        assert!(
+            (low_branch - high_branch).abs() < 1e-6,
+            "IEC 61966-2-1 seam branches agree within 1e-6: {low_branch} vs {high_branch}"
+        );
+        let below = Rgb::new(10, 10, 10).luminance();
+        let above = Rgb::new(11, 11, 11).luminance();
+        assert!(
+            below < low_branch && low_branch < above,
+            "{below} < {low_branch} < {above}"
+        );
     }
 }

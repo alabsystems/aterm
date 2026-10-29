@@ -74,13 +74,22 @@ fn need_raised(seen: &Seen) -> Option<String> {
         .map(|(_, m)| format!("meta {}", crate::util::one_line(m, 120)))
 }
 
-/// A task record the run read where none was given (`OK task -` throughout
-/// is none).
-pub(super) fn invented_record(seen: &Seen) -> Option<&str> {
-    seen.task
+/// Puts on `bad` a task record the run read where none was given (`OK task -` throughout is
+/// none), or says why the record is unknown: a `task` read whose reply failed records nothing,
+/// and a run where none answered proves nothing about the record.
+pub(super) fn invented_record(seen: &Seen, bad: &mut Vec<String>) -> Option<&'static str> {
+    if seen.task.is_empty() {
+        return Some("no task read answered, so the record is unknown");
+    }
+    if let Some(r) = seen
+        .task
         .iter()
         .map(|(_, r)| r.trim())
         .find(|r| *r != "OK task -")
+    {
+        bad.push(format!("a task record where none was given: {r}"));
+    }
+    None
 }
 
 /// A verdict of the same word, `said` before its words.
@@ -283,10 +292,12 @@ pub(super) fn judge_answer(seen: &Seen, t0: i64) -> Verdict {
         ));
     }
     let (mut bad, quiet, window) = landing_quiet(seen, done, false, t0);
-    if let Some(r) = invented_record(seen) {
-        bad.push(format!("a task record where none was given: {r}"));
+    let unread = invented_record(seen, &mut bad);
+    let said = format!("{said}; {quiet}");
+    match unread {
+        Some(why) if bad.is_empty() => Verdict::Unobserved(format!("{said}: {why}")),
+        _ => landed_verdict(bad, said, seen, done.0, window),
     }
-    landed_verdict(bad, format!("{said}; {quiet}"), seen, done.0, window)
 }
 
 /// Judges L13: a person's own exchange and follow-up question under Land.
@@ -1301,16 +1312,12 @@ pub(super) fn judge_wall(
         ));
     }
     let (mut bad, quiet, window) = landing_quiet(seen, done, false, t0);
-    if let Some(r) = invented_record(seen) {
-        bad.push(format!("a task record where none was given: {r}"));
+    let unread = invented_record(seen, &mut bad);
+    let said = format!("{said}; {resumed}; {quiet}");
+    match unread {
+        Some(why) if bad.is_empty() => Verdict::Unobserved(format!("{said}: {why}")),
+        _ => landed_verdict(bad, said, seen, done.0, window),
     }
-    landed_verdict(
-        bad,
-        format!("{said}; {resumed}; {quiet}"),
-        seen,
-        done.0,
-        window,
-    )
 }
 
 /// Judges W2: a remembered usage wall ([`judge_wall`]) after the wall scrolls off screen.

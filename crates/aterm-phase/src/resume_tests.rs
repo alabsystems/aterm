@@ -358,6 +358,246 @@ fn a_goal_echo_is_read_through_only_to_the_wall_its_reason_can_come_from() {
     assert_eq!(l.kind, None);
 }
 
+/// The owner's tab of 2026-10-26 (rows MEASURED): a `/goal` turn's request failed ENOTFOUND
+/// twice, Claude Code 2.1.310 drawing its error row over each `Goal still active · the API was
+/// unavailable or the connection dropped · retrying in N min (k/3)` echo. The last echo is read
+/// through to the error row over it: a network wall, whose row is that later error row.
+#[test]
+fn the_owners_goal_outage_reads_through_its_echo_to_the_unreachable_error_row() {
+    use crate::wall::{ApiCause, Placement, WallKind, wall};
+    let rows = screen(crate::prompt::fixtures::WALL_GOAL_API_UNREACHABLE_2_1_310);
+    let w = wall(&rows).expect("the wall");
+    assert_eq!(
+        w.kind,
+        WallKind::ApiError {
+            code: None,
+            retryable: true,
+            cause: ApiCause::Unreachable,
+        }
+    );
+    assert_eq!(w.placement, Placement::ErrorRow);
+    assert!(
+        w.message.contains("(ENOTFOUND) — Goal still active"),
+        "{}",
+        w.message
+    );
+    assert!(
+        w.message.ends_with("(2/3) · send a message to retry now"),
+        "the last echo: {}",
+        w.message
+    );
+    let error = rows
+        .iter()
+        .rposition(|r| r.starts_with("⏺ API Error"))
+        .expect("the later error row");
+    assert_eq!(w.row, error);
+    let l = look(&rows);
+    assert_eq!((l.phase, l.kind), (Phase::Idle, Some("api-error")));
+
+    let prose: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            if r.starts_with("⏺ API Error") {
+                "⏺ Some prose the worker said.".to_string()
+            } else {
+                r.clone()
+            }
+        })
+        .collect();
+    let alone = wall(&prose).expect("the echo read alone");
+    assert_eq!(
+        alone.kind,
+        WallKind::ApiError {
+            code: None,
+            retryable: true,
+            cause: ApiCause::Server,
+        },
+        "the echo read alone is a generic API error: only its error row names the route"
+    );
+    assert!(
+        alone.message.starts_with("Goal still active"),
+        "the echo's own words, no prose: {}",
+        alone.message
+    );
+    let echo = rows
+        .iter()
+        .rposition(|r| r.starts_with("⏺ Goal still active"))
+        .expect("the later echo");
+    assert_eq!(alone.row, echo, "its row is the echo's");
+    let l = look(&prose);
+    assert_eq!((l.phase, l.kind), (Phase::Idle, Some("api-error")));
+}
+
+/// Claude Code's `/goal` echo that the API was unavailable, read with no error row over it to read
+/// it through to (HAND-BUILT: the owner's measured rows with their error rows taken out; the
+/// measurement is still owed): a wall in its own right, retrying (`Goal still active · … (k/3)`)
+/// or past its retries (`Goal paused after 3 automatic retries · …`), and a generic API error,
+/// since Claude Code gives that reason an overload and a server error too; only an error row it
+/// reads through to names an unreachable route. The lab's measured 2.1.311 screen, a fresh
+/// `/goal` whose first request failed, draws its error row over the echo under the person's
+/// `❯ /goal` prompt: the echo is read through to that row (unreachable), the prompt above being
+/// no composer to read above. Its guard is on the echo's opening, so a message read through to an
+/// error row keeps that row's kind when it is read again by its words (aterm-agent's
+/// `words_kind`): a 529 under the same echo stays an overload, a fresh `/goal`'s included. A
+/// different reason under the same opening is no wall.
+#[test]
+fn a_goal_echo_that_the_api_was_unavailable_read_alone_is_a_generic_api_error() {
+    use crate::wall::{ApiCause, Placement, WallKind, classify_wall, wall};
+    let unreachable = WallKind::ApiError {
+        code: None,
+        retryable: true,
+        cause: ApiCause::Unreachable,
+    };
+    let generic = WallKind::ApiError {
+        code: None,
+        retryable: true,
+        cause: ApiCause::Server,
+    };
+    let rows = screen(crate::prompt::fixtures::WALL_GOAL_API_UNAVAILABLE_ALONE_2_1_310);
+    assert!(
+        !rows.iter().any(|r| r.contains("API Error")),
+        "no error row"
+    );
+    let w = wall(&rows).expect("the echo is the wall");
+    assert_eq!(w.kind, generic);
+    let echo = rows
+        .iter()
+        .rposition(|r| r.starts_with("⏺ Goal still active"))
+        .expect("the later echo");
+    assert_eq!(w.row, echo);
+    assert!(
+        w.message
+            .starts_with("Goal still active · the API was unavailable or the connection dropped")
+            && w.message.ends_with("(2/3) · send a message to retry now"),
+        "{}",
+        w.message
+    );
+    let l = look(&rows);
+    assert_eq!((l.phase, l.kind), (Phase::Idle, Some("api-error")));
+
+    let paused: Vec<String> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            if i == echo {
+                "⏺ Goal paused after 3 automatic retries · the API was unavailable or the connection dropped · send a message to continue".to_string()
+            } else {
+                r.clone()
+            }
+        })
+        .collect();
+    let w = wall(&paused).expect("the paused echo is the wall");
+    assert_eq!(w.kind, generic);
+    assert!(
+        w.message
+            .starts_with("Goal paused after 3 automatic retries"),
+        "{}",
+        w.message
+    );
+    let l = look(&paused);
+    assert_eq!((l.phase, l.kind), (Phase::Idle, Some("api-error")));
+
+    let measured = screen(crate::prompt::fixtures::WALL_GOAL_API_UNAVAILABLE_ECONNREFUSED_2_1_311);
+    let w = wall(&measured).expect("the lab's measured echo under its error row");
+    assert_eq!(w.kind, unreachable);
+    assert_eq!(w.placement, Placement::ErrorRow);
+    assert!(
+        w.message.contains("(ECONNREFUSED) — Goal still active"),
+        "read through: {}",
+        w.message
+    );
+    let error = measured
+        .iter()
+        .position(|r| r.starts_with("⏺ API Error"))
+        .expect("the error row");
+    assert_eq!(w.row, error);
+    let mut alone = measured.clone();
+    alone.drain(error..=error + 1);
+    let w = wall(&alone).expect("the measured echo, its error row taken out");
+    assert_eq!(
+        w.kind, generic,
+        "its error row named the route; the echo alone does not"
+    );
+    assert!(w.message.starts_with("Goal still active"), "{}", w.message);
+    assert_eq!(w.row, error, "the echo's row, where the error row stood");
+
+    for echo in [
+        "⏺ Goal still active · the API was unavailable or the connection dropped · retrying in 1 min (1/3) · send a message to retry now",
+        "⏺ Goal paused after 3 automatic retries · the API was unavailable or the connection dropped · send a message to continue",
+    ] {
+        let l = look(&frame(
+            &["⏺ Some prose the worker said.", "", echo, ""],
+            DONE,
+            "",
+            &[FOOT_PLAIN],
+        ));
+        assert_eq!(
+            (l.phase, l.kind),
+            (Phase::Idle, Some("api-error")),
+            "{echo}"
+        );
+        assert_eq!(classify_wall(&l.message), Some(generic), "{echo}");
+    }
+
+    let overloaded = look(&frame(
+        &[
+            "⏺ API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment.",
+            "",
+            "⏺ Goal still active · the API was unavailable or the connection dropped · retrying in 1 min (1/3) · send a message to retry now",
+            "",
+        ],
+        DONE,
+        "",
+        &[FOOT_PLAIN],
+    ));
+    assert_eq!(overloaded.kind, Some("overloaded"));
+    assert!(
+        overloaded
+            .message
+            .contains(" — Goal still active · the API was unavailable"),
+        "read through: {}",
+        overloaded.message
+    );
+    assert_eq!(
+        classify_wall(&overloaded.message),
+        Some(WallKind::Overloaded),
+        "the read-through message read again by its words is the 529's, not the echo's"
+    );
+    let first_try = look(&frame(
+        &[
+            "❯ /goal finish the work",
+            "  ⎿  Goal set: finish the work",
+            "",
+            "⏺ API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment.",
+            "",
+            "⏺ Goal still active · the API was unavailable or the connection dropped · retrying in 1 min (1/3) · send a message to retry now",
+            "",
+        ],
+        DONE,
+        "",
+        &[FOOT_PLAIN],
+    ));
+    assert_eq!(
+        first_try.kind,
+        Some("overloaded"),
+        "a person's prompt above the error row is no composer to read above: {}",
+        first_try.message
+    );
+
+    let other = look(&frame(
+        &[
+            "⏺ Some prose the worker said.",
+            "",
+            "⏺ Goal still active · the API returned an unexpected response · retrying in 1 min (1/3) · send a message to retry now",
+            "",
+        ],
+        DONE,
+        "",
+        &[FOOT_PLAIN],
+    ));
+    assert_eq!((other.phase, other.kind), (Phase::Idle, None));
+}
+
 #[test]
 fn a_reset_is_a_time_or_nothing() {
     let alone = |echo: &str| {

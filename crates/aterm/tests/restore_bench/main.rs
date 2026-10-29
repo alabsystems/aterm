@@ -20,6 +20,10 @@ mod launch_isolation;
 #[path = "../support/live_ctl.rs"]
 mod live_ctl;
 #[path = "../fabric_bench/profile.rs"]
+#[expect(
+    dead_code,
+    reason = "the verify perf driver also uses this shared profile table's build and CLI methods"
+)]
 mod profile;
 #[expect(
     dead_code,
@@ -34,4 +38,8 @@ mod run_tests;
 mod spec;
 mod spec_tests;
 #[path = "../fabric_bench/stats.rs"]
+#[expect(
+    dead_code,
+    reason = "the fabric bench's table row; this bench writes its own tables"
+)]
 mod stats;

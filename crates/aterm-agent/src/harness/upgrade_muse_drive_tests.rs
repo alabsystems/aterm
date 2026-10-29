@@ -101,8 +101,12 @@ fn line_blocks(exit: Option<i64>) -> String {
 /// Stand-in overrides served after the relaunch line is typed.
 #[derive(Default)]
 struct After {
+    /// The shell's screen before the relaunch line is typed.
+    before_screen: Option<String>,
     /// The relaunched Muse's screen.
     screen: Option<String>,
+    /// The tab's `status` before the relaunch line is typed.
+    before_status: Option<String>,
     /// The tab's `status`.
     status: Option<String>,
     /// The tab's command blocks.
@@ -139,11 +143,18 @@ fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
                 if relaunched {
                     served(&after.screen, &w.after_relaunch)
                 } else {
-                    w.after_exit.clone()
+                    after
+                        .before_screen
+                        .as_ref()
+                        .unwrap_or(&w.after_exit)
+                        .clone()
                 }
             ),
             "cell" => "OK ❯ ccd3db 1e1e1e none".to_string(),
-            "status" => served(&after.status, &w.status),
+            "status" => served(
+                &after.status,
+                after.before_status.as_ref().unwrap_or(&w.status),
+            ),
             "help" if line.contains("help key") => {
                 "OK 2\nkey  key [if-gen=<epoch>.<seq>] [if=<re>] <name>\n     FENCES".to_string()
             }
@@ -417,6 +428,7 @@ impl Rig {
             instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
             agents_off: Vec::new(),
             land: false,
+            press: None,
             timings: crate::harness::Timings::FAST,
         };
         Rig {
@@ -1479,6 +1491,7 @@ fn the_gate_reads_the_composer_past_a_drawn_caret_as_the_loop_does() {
         first: 0,
         generation: None,
         human: crate::supervise::screen::HumanInput::Never,
+        title: None,
     };
     let caret_cell = "OK a 111318 d0d0d0 inverse";
     for (cells, empty) in [
@@ -1495,4 +1508,103 @@ fn the_gate_reads_the_composer_past_a_drawn_caret_as_the_loop_does() {
         drop(c);
         assert_eq!(server.join().expect("server"), asked, "{cells:?}");
     }
+}
+
+#[test]
+fn an_in_flight_muse_relaunch_waits_out_a_hand_and_counts_staleness_from_seen_exit() {
+    let rig = Rig::new("hand-and-exit-clock", 137, true, false, Log::Crash, true);
+    std::fs::create_dir_all(state_dir(&rig.opts)).expect("state");
+    let snap = rig.snap(Some(S1));
+    let now = now_s();
+    let signal = now - STALE_S - 60;
+    let base = St {
+        agent: Agent::Muse,
+        thread: S1.to_string(),
+        muse_data: rig.data.to_string_lossy().into_owned(),
+        argv: snap.argv.clone(),
+        cwd: WORKSPACE.to_string(),
+        twin: rig.twin.to_string_lossy().into_owned(),
+        pid: TUI,
+        shell: SHELL,
+        proc_start: snap.start.clone(),
+        tab: TAB.to_string(),
+        from: VERSION.to_string(),
+        to: VERSION.to_string(),
+        source: super::super::SAME_PROGRAM.to_string(),
+        phase: Phase::Exiting { at_s: signal },
+        ..St::default()
+    };
+
+    // 1. A hand standing on the tab (`hold=1`) is waited out before `expired` is evaluated,
+    // even when `at_s` is past `STALE_S`, and stamps both `hand_seen_s` and `exited_at`.
+    save(&rig.opts, &key(TAB), &base);
+    rig.after.lock().expect("after").before_status =
+        Some("OK schema=1 hold=1 hand=- integration=on".to_string());
+    let held = rig.attempt(&snap, &ExitRecord::Crashed, ExitCause::Exit);
+    assert_eq!(held.step, WAIT_HAND_LIFTS, "{held:?}");
+    assert_eq!(rig.lines(), 0);
+    let st = rig.state();
+    assert_eq!(st.phase, Phase::Exiting { at_s: signal });
+    assert!(st.hand_seen_s >= now && st.exited_at >= now, "{st:?}");
+
+    // Once the hand lifts, `first_mark` requires proof no keys arrived while the hand stood;
+    // once `unkeyed_ms` predates `signal`, the relaunch carries on from the lifted hand's clock.
+    rig.after.lock().expect("after").before_status = None;
+    let unconfirmed_keys = rig.attempt(&snap, &ExitRecord::Crashed, ExitCause::Exit);
+    assert_eq!(
+        unconfirmed_keys.step, "wait:keyed-while-held",
+        "{unconfirmed_keys:?}"
+    );
+    rig.after.lock().expect("after").before_screen = Some(shell_after().replace(
+        r#""human_ms":null"#,
+        r#""human_ms":null,"unkeyed_ms":86400000"#,
+    ));
+    let carried = rig.attempt(&snap, &ExitRecord::Crashed, ExitCause::Exit);
+    assert_eq!(carried.step, "continued", "{carried:?}");
+    assert_eq!(rig.lines(), 1);
+
+    // 2. Without a hand, an exit seen recently (`exited_at` within `STALE_S`) is not stale
+    // even when `at_s` is older than `STALE_S`; one never seen gone (`exited_at == 0`) fails
+    // `stale-exit` and stamps `exited_at`.
+    rig.kernel.relaunched.store(false, Ordering::SeqCst);
+    let fresh_exit = St {
+        exited_at: now - 10,
+        ..base.clone()
+    };
+    save(&rig.opts, &key(TAB), &fresh_exit);
+    let r = carry_in_flight_with(
+        &rig.opts,
+        Report {
+            pid: TUI,
+            tab: TAB.to_string(),
+            session: key(TAB),
+            from: VERSION.to_string(),
+            to: VERSION.to_string(),
+            step: String::new(),
+        },
+        fresh_exit,
+        &key(TAB),
+        &rig.kernel,
+    );
+    assert_eq!(r.step, "continued", "{r:?}");
+
+    save(&rig.opts, &key(TAB), &base);
+    let expired_r = carry_in_flight_with(
+        &rig.opts,
+        Report {
+            pid: TUI,
+            tab: TAB.to_string(),
+            session: key(TAB),
+            from: VERSION.to_string(),
+            to: VERSION.to_string(),
+            step: String::new(),
+        },
+        base,
+        &key(TAB),
+        &rig.kernel,
+    );
+    assert_eq!(expired_r.step, "failed:stale-exit", "{expired_r:?}");
+    let failed = rig.state();
+    assert_eq!(failed.phase, Phase::Failed("stale-exit".to_string()));
+    assert!(failed.exited_at >= now, "{failed:?}");
 }

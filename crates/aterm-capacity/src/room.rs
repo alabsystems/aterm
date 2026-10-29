@@ -66,7 +66,7 @@ impl RoomMeter {
     pub fn observe(&mut self, at_s: i64, free: u64) {
         let minute = at_s.div_euclid(60);
         self.minutes
-            .retain(|(m, _)| *m <= minute && *m > minute - WINDOW_MINUTES);
+            .retain(|(m, _)| *m <= minute && minute.saturating_sub(*m) < WINDOW_MINUTES);
         match self.minutes.back_mut() {
             Some((m, f)) if *m == minute => *f = (*f).max(free),
             _ => self.minutes.push_back((minute, free)),
@@ -74,7 +74,8 @@ impl RoomMeter {
         let peak = self.minutes.iter().map(|(_, f)| *f).max().unwrap_or(free);
         let fall = peak.saturating_sub(free);
         let day = at_s.div_euclid(DAY_S);
-        self.days.retain(|(d, _)| *d <= day && *d > day - ROOM_DAYS);
+        self.days
+            .retain(|(d, _)| *d <= day && day.saturating_sub(*d) < ROOM_DAYS);
         match self.days.last_mut() {
             Some((d, f)) if *d == day => *f = (*f).max(fall),
             _ => self.days.push((day, fall)),
@@ -89,7 +90,7 @@ impl RoomMeter {
         let mut falls: Vec<u64> = self
             .days
             .iter()
-            .filter(|(d, _)| *d <= today && *d > today - ROOM_DAYS)
+            .filter(|(d, _)| *d <= today && today.saturating_sub(*d) < ROOM_DAYS)
             .map(|(_, f)| *f)
             .collect();
         if falls.len() < 2 {

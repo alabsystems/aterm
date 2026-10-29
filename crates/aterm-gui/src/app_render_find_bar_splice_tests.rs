@@ -170,27 +170,35 @@ fn find_bar_100k_history_work_is_logarithmic_plus_visible() {
     let base_y = app.windows[&wid].input_scratch.base_y;
     let display_offset = app.windows[&wid].input_scratch.display_offset;
     assert_eq!(display_offset, 0, "fixture starts at the live viewport");
-    {
-        let search = app.windows.get_mut(&wid).unwrap().search.as_mut().unwrap();
-        search.query = "x".into();
-        search.matches = (-99_976..24).map(|row| (row, 0, 0)).collect();
-        search.current = 99_999;
-        search.match_base_y = base_y;
-        assert_eq!(search.matches.len(), 100_000);
+
+    for n in [rows, 64usize, 1_000, 100_000] {
+        let history = i32::try_from(n - rows).expect("bounded history fixture");
+        let end_row = i32::try_from(rows).expect("bounded viewport rows");
+        {
+            let search = app.windows.get_mut(&wid).unwrap().search.as_mut().unwrap();
+            search.query = "x".into();
+            search.matches = (-history..end_row).map(|row| (row, 0, 0)).collect();
+            search.current = n - 1;
+            search.match_base_y = base_y;
+            assert_eq!(search.matches.len(), n);
+        }
+
+        app.splice_find_bar(wid);
+
+        let ceil_log2_n1 = usize::BITS as usize - n.leading_zeros() as usize;
+        let bound = rows + 2 * ceil_log2_n1;
+        let ws = &app.windows[&wid];
+        assert!(
+            ws.find_bar_match_work <= bound,
+            "n={n}: two <={ceil_log2_n1}-step lower bounds plus <={rows} visible visits = {bound}; got {}",
+            ws.find_bar_match_work
+        );
+        assert!(
+            ws.find_bar_match_work >= rows,
+            "n={n}: fixture must witness all {rows} visible match visits; got {}",
+            ws.find_bar_match_work
+        );
     }
-
-    app.splice_find_bar(wid);
-
-    let ws = &app.windows[&wid];
-    assert!(
-        ws.find_bar_match_work <= rows + 40,
-        "two <=17-step lower bounds plus <=rows visible visits; got {} for {rows} rows",
-        ws.find_bar_match_work
-    );
-    assert!(
-        ws.find_bar_match_work >= rows,
-        "fixture must witness the visible match visits"
-    );
 }
 
 #[test]

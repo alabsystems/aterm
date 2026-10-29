@@ -479,6 +479,87 @@ fn failed_reconciliation_answers_queued_callers_instead_of_leaving_them_pending(
     );
 }
 
+/// An aterm.toml that does not parse is said whole (Manual, the lane's Messages row, a refused
+/// request's answer) and logged by its position ([`aterm_toml::Error::log_words`]): the error's
+/// `Display` prints the line, which holds whatever value the person wrote (DESIGN §3.6).
+#[cfg(unix)]
+#[test]
+fn an_unparsed_aterm_toml_reaches_the_log_by_its_position() {
+    use crate::native_config_service::VersionedConfigService;
+    let scratch = aterm_tempfile::tempdir().expect("scratch config");
+    let path = scratch.path().join("aterm.toml");
+    let observed = |sentinel: &str| {
+        std::fs::write(&path, format!("# x\nfont_family = \"{sentinel}\n")).unwrap();
+        VersionedConfigService::observe_path(&path, false).unwrap()
+    };
+    let mut app = App::headless_for_test();
+    app.native_config_service =
+        VersionedConfigService::new("serious_mode = false\n".to_string()).unwrap();
+    let themes = std::sync::Arc::clone(&app.native_config_service.snapshot().assets.themes);
+    let failed = |sentinel: &str| match VersionedConfigService::prepare_observation(
+        observed(sentinel),
+        std::sync::Arc::clone(&themes),
+    ) {
+        Ok(_) => panic!("an unterminated string is not TOML"),
+        Err(failure) => failure,
+    };
+    let first = failed("QZP7E7D1");
+    assert!(
+        first.said.contains("QZP7E7D1"),
+        "CONTROL: the said form shows the line"
+    );
+    assert!(
+        first.log.contains("TOML error at line 2, column ") && !first.log.contains("QZP7E7D"),
+        "the log form names the position alone"
+    );
+
+    let logged = crate::test_log::logged_while(|| {
+        app.prepare_native_config_external_observation(observed("QZP7E7D2"));
+    });
+    let (reply, completion) = std::sync::mpsc::channel();
+    app.enqueue_control_settings_field_intent(
+        crate::prefs::EDIT_FONT_PX.to_string(),
+        Some("14".to_string()),
+        reply,
+    );
+    assert_eq!(
+        app.native_config_pending.len(),
+        1,
+        "PRECONDITION: one request queued"
+    );
+    let failing = crate::test_log::logged_while(|| {
+        app.fail_native_config_reconciliation(failed("QZP7E7D3"));
+        app.fail_native_config_reconciliation(failed("QZP7E7D4"));
+    });
+    let logged: Vec<String> = logged.into_iter().chain(failing).collect();
+    for head in [
+        "native config: Config observation was not valid TOML: ",
+        "native config: rejecting 1 queued config request(s): config reconciliation failed: ",
+        "native config: Config reconciliation failed; 1 queued change was not written: ",
+        "native config: reconciliation failed with nothing queued: ",
+    ] {
+        assert!(
+            logged.iter().any(
+                |line| line.starts_with(head) && line.contains("TOML error at line 2, column ")
+            ),
+            "{head:?} is logged with the position: {} lines",
+            logged.len()
+        );
+    }
+    assert!(
+        !logged.iter().any(|line| line.contains("QZP7E7D")),
+        "the log keeps aterm.toml's line"
+    );
+    let answer = completion
+        .try_recv()
+        .expect("the control caller is answered")
+        .unwrap_err();
+    assert!(
+        answer.contains("QZP7E7D3"),
+        "CONTROL: the refused request's answer says the line"
+    );
+}
+
 #[test]
 fn a_failed_reconciliation_with_nothing_queued_leaves_the_true_row_standing() {
     let mut app = App::headless_for_test();
@@ -566,13 +647,17 @@ fn a_save_an_unreadable_file_refuses_is_worded_through_the_read_after_it() {
     let Err(read) = &completion.observation else {
         panic!("the read after the save is refused too");
     };
-    assert_eq!(read, &words);
+    assert_eq!(
+        read,
+        &words.as_str().into(),
+        "aterm's own words: said and logged alike"
+    );
     let reply = control_settings_completion_reply(
         "theme",
         Some("Nord"),
         None,
         &completion.outcome,
-        Some(read),
+        Some(&read.said),
     )
     .unwrap_err();
     assert_eq!(reply, format!("save failed: {words}"));
@@ -1139,7 +1224,7 @@ fn applied_completion_observation_failure_closes_gate_before_pumping_next_write(
                 revision: snapshot.revision,
                 undo: Some(undo.get()),
             },
-            observation: Err("exact committed observation was lost".to_string()),
+            observation: Err("exact committed observation was lost".into()),
         },
     );
 
@@ -8446,7 +8531,7 @@ fn exact_observation_handoff_conforms_and_preserves_failed_reconciliation() {
             outcome: ConfigPatchOutcome::Conflict {
                 revision: app.native_config_service.snapshot().revision,
             },
-            observation: Err("publication was overtaken".to_string()),
+            observation: Err("publication was overtaken".into()),
         },
     );
     let after = project(&model, &app, 0, 0, 0, false);
@@ -8461,7 +8546,7 @@ fn exact_observation_handoff_conforms_and_preserves_failed_reconciliation() {
     state = after;
     app.finish_native_config_reconciliation(NativeConfigReconciliationCompletion {
         pending_sequence: app.native_config_external_sequence,
-        observation: Err("transient stable-read failure".to_string()),
+        observation: Err("transient stable-read failure".into()),
     });
     let after = project(&model, &app, 0, 0, 0, true);
     assert_step(&model, &state, &after, "FailReconcile");
@@ -9775,7 +9860,7 @@ fn a_persons_kill_reaches_the_clipboard_and_a_controllers_does_not() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let (mut app, _, _, _) = editor_app(&dir, "kills.txt", "one\ntwo\n");
+    let (mut app, _, document, _) = editor_app(&dir, "kills.txt", "one\ntwo\n");
     let wid = WindowId(0);
     let board = || crate::control::PBPASTE_STUB.with(|board| board.borrow().clone());
     let kill_line = editor_key(Key::Character('k'), Modifiers::CTRL);
@@ -9784,11 +9869,190 @@ fn a_persons_kill_reaches_the_clipboard_and_a_controllers_does_not() {
     assert_eq!(board().as_deref(), Some("one"));
     assert!(app.with_gesture_source(true, |app| app.native_input_event(wid, &kill_line)));
     assert_eq!(
-        app.editor_workspace.kill_ring.front().map(String::as_str),
-        Some("one\n")
+        app.document_store.snapshot(document).unwrap().text.as_ref(),
+        "two\n",
+        "the controller's kill"
+    );
+    assert_eq!(
+        app.editor_workspace.kill_ring,
+        ["one"],
+        "the controller's kill keeps to a ring of its own"
     );
     assert_eq!(board().as_deref(), Some("one"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A CONTROL CLIENT'S YANK READS NONE OF THE PERSON'S KILLS: the person's C-k in one Editor
+/// document puts `TOKEN=…` on the kill ring every Editor view shares (and so on the clipboard); a
+/// control client's `key ctrl+k`, `ctrl+y` and `alt+y` in a second document kill to and yank from
+/// a ring of the client's own, so that document never holds the person's kill, and the person's
+/// C-y there yanks their own kill, not the client's.
+/// NEGATIVE CONTROL: against main's code at this leaf (`4d738a3c55`), the client's M-y walked the
+/// one shared ring onto the person's `TOKEN=…` (and the person's C-y would have yanked the
+/// client's `mine`).
+#[test]
+fn a_controllers_yank_reads_none_of_the_persons_kills() {
+    use aterm_types::keyboard::{Key, Modifiers};
+    const SECRET: &str = "TOKEN=hunter2-secret";
+    let dir = aterm_tempfile::TempDir::new().unwrap();
+    let (mut app, _, _, _) = editor_app(dir.path(), "secrets.env", &format!("{SECRET}\nNEXT=1\n"));
+    let wid = WindowId(0);
+    let board = || crate::control::PBPASTE_STUB.with(|board| board.borrow().clone());
+    assert!(app.native_input_event(wid, &editor_key(Key::Character('k'), Modifiers::CTRL)));
+    assert_eq!(
+        board().as_deref(),
+        Some(SECRET),
+        "PRECONDITION: the person's kill"
+    );
+
+    let scratch = dir.path().join("scratch.txt");
+    std::fs::write(&scratch, "mine\n").unwrap();
+    let uri = crate::native_document_host::path_to_file_uri(&scratch).unwrap();
+    app.open_document_tab(crate::native_app::AppKind::Editor, &uri)
+        .unwrap();
+    let (instance, _) = app.active_native_view(wid).unwrap();
+    let document = app.native_runtime.document_id(instance).unwrap();
+    let text = |app: &App| {
+        app.document_store
+            .snapshot(document)
+            .unwrap()
+            .text
+            .to_string()
+    };
+    let client = |app: &mut App, key: &str| {
+        let ev = crate::control::parse_key(key).expect("a key");
+        let _ = app.input(wid, ev, crate::input::Source::Controller);
+    };
+    client(&mut app, "ctrl+k");
+    assert_eq!(text(&app), "\n", "PRECONDITION: the client's kill");
+    client(&mut app, "ctrl+y");
+    client(&mut app, "alt+y");
+    assert_eq!(text(&app), "mine\n", "the client's yank and yank-pop");
+    assert_eq!(board().as_deref(), Some(SECRET), "the clipboard");
+
+    assert!(app.native_input_event(wid, &editor_key(Key::Character('y'), Modifiers::CTRL)));
+    assert_eq!(text(&app), format!("mine{SECRET}\n"), "the person's yank");
+    crate::control::PBPASTE_STUB.with(|board| *board.borrow_mut() = None);
+}
+
+/// A CONTROL CLIENT'S C-x e REPLAYS NONE OF THE PERSON'S KEYBOARD MACRO: the person records a
+/// macro in an Editor document while typing `TOKEN=…`; a control client's `key ctrl+x` `key e`,
+/// and its `act` of call-last-kbd-macro, replay a macro of the client's own (none), so the
+/// document it reads back never gets the person's typed text again; the person's C-x e replays
+/// it.
+/// NEGATIVE CONTROL: against main's amacs at this leaf (`147b22abdc`), the client's C-x e
+/// replayed the person's macro (`TOKEN=hunter2TOKEN=hunter2end`), as it did again with
+/// amacs' `macros_for` and `macros_mut` mutated to pick the person's macros for every input.
+#[test]
+fn a_controllers_macro_replay_reads_none_of_the_persons_typing() {
+    use crate::input::{InputEvent, Source};
+    use aterm_types::keyboard::{Key, Modifiers};
+    const SECRET: &str = "TOKEN=hunter2";
+    let dir = aterm_tempfile::TempDir::new().unwrap();
+    let (mut app, _, document, _) = editor_app(dir.path(), "notes.txt", "end\n");
+    let wid = WindowId(0);
+    let text = |app: &App| {
+        app.document_store
+            .snapshot(document)
+            .unwrap()
+            .text
+            .to_string()
+    };
+    let person = |app: &mut App, ev: InputEvent| assert!(app.native_input_event(wid, &ev));
+    let c_x = || editor_key(Key::Character('x'), Modifiers::CTRL);
+    person(&mut app, c_x());
+    person(
+        &mut app,
+        editor_key(Key::Character('('), Modifiers::empty()),
+    );
+    person(&mut app, InputEvent::Text(SECRET.to_string()));
+    person(&mut app, c_x());
+    person(
+        &mut app,
+        editor_key(Key::Character(')'), Modifiers::empty()),
+    );
+    assert_eq!(
+        text(&app),
+        format!("{SECRET}end\n"),
+        "PRECONDITION: the person's typing"
+    );
+
+    for key in ["ctrl+x", "e"] {
+        let ev = crate::control::parse_key(key).expect("a key");
+        let _ = app.input(wid, ev, Source::Controller);
+    }
+    assert_eq!(text(&app), format!("{SECRET}end\n"), "the client's C-x e");
+    let _ = app.with_gesture_source(true, |app| {
+        app.dispatch_native_event(
+            wid,
+            AppEvent::EditorCommand(crate::native_editor::EditorCommand::PlayMacro),
+        )
+    });
+    assert_eq!(text(&app), format!("{SECRET}end\n"), "the client's act");
+
+    person(&mut app, c_x());
+    person(
+        &mut app,
+        editor_key(Key::Character('e'), Modifiers::empty()),
+    );
+    assert_eq!(
+        text(&app),
+        format!("{SECRET}{SECRET}end\n"),
+        "the person's C-x e"
+    );
+}
+
+/// A CONTROL CLIENT'S C-s C-s RECALLS NONE OF THE PERSON'S SEARCHES: the person searches an
+/// Editor document for `hunter2` (not in it) and accepts; a control client's `key ctrl+s`
+/// `key ctrl+s` recalls a query of the client's own (none), so the minibuffer it reads (`inspect`
+/// shows its value) never gets the person's typed query; the person's C-s C-s recalls it.
+/// NEGATIVE CONTROL: with amacs' `remembered_search` mutated to pick the person's query for
+/// every input (main's one query per view, `147b22abdc`), the client's C-s C-s opened the search
+/// on the person's `hunter2`.
+#[test]
+fn a_controllers_search_recall_reads_none_of_the_persons_queries() {
+    use crate::input::{InputEvent, Source};
+    use aterm_types::keyboard::{Key, Modifiers, NamedKey};
+    const SECRET: &str = "hunter2";
+    let dir = aterm_tempfile::TempDir::new().unwrap();
+    let (mut app, view, _, _) = editor_app(dir.path(), "notes.txt", "end\n");
+    let wid = WindowId(0);
+    let recalled = |app: &App| match app.native_runtime.view_state(view) {
+        Some(crate::native_app::AppViewState::Editor(state)) => {
+            match &state.buffer.as_ref().expect("a buffer").minibuffer {
+                crate::native_editor::Minibuffer::Search { query, .. } => Some(query.clone()),
+                _ => None,
+            }
+        }
+        _ => panic!("an Editor view"),
+    };
+    let person = |app: &mut App, ev: InputEvent| assert!(app.native_input_event(wid, &ev));
+    let client = |app: &mut App, key: &str| {
+        let ev = crate::control::parse_key(key).expect("a key");
+        let _ = app.input(wid, ev, Source::Controller);
+    };
+    let c_s = || editor_key(Key::Character('s'), Modifiers::CTRL);
+    person(&mut app, c_s());
+    person(&mut app, InputEvent::Text(SECRET.to_string()));
+    person(
+        &mut app,
+        editor_key(Key::Named(NamedKey::Enter), Modifiers::empty()),
+    );
+    assert_eq!(recalled(&app), None, "PRECONDITION: the person accepted it");
+
+    client(&mut app, "ctrl+s");
+    client(&mut app, "ctrl+s");
+    assert_eq!(recalled(&app).as_deref(), Some(""), "the client's C-s C-s");
+    client(&mut app, "ctrl+g");
+    assert_eq!(recalled(&app), None, "the client's C-g");
+
+    person(&mut app, c_s());
+    person(&mut app, c_s());
+    assert_eq!(
+        recalled(&app).as_deref(),
+        Some(SECRET),
+        "the person's C-s C-s"
+    );
 }
 
 #[test]
@@ -10550,4 +10814,48 @@ fn tab_from_the_compact_search_field_goes_on_into_the_list() {
     }
     crate::native_appearance::install_preferences(preferences);
     assert!(faults.is_empty(), "{}", faults.join("\n"));
+}
+
+/// THE PACKAGES PAGE READS THE STORE AGAIN WHEN IT COMES TO THE FRONT: a person who ran
+/// `aterm pkg serve-units --on` in a terminal tab and clicks back to Settings ▸ Packages sees the
+/// LAN sharing switch as the store holds it, not as Settings last read it. Switching away, or to
+/// another Settings page, asks for no read.
+#[test]
+fn the_packages_page_reads_the_store_again_when_it_comes_to_the_front() {
+    use crate::native_settings::SettingsRoute;
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    assert!(app.open_settings_tab(SettingsRoute::Packages));
+    assert!(app.packages_page_in_front(wid));
+    // The headless App has no event proxy, so no worker reads the person's store.
+    let asked = |app: &App| app.packages_reads_asked;
+    app.switch_tab_in(wid, 0);
+    assert!(!app.packages_page_in_front(wid), "on the terminal tab");
+    let away = asked(&app);
+    app.switch_tab_in(wid, 1);
+    assert!(app.packages_page_in_front(wid));
+    assert!(
+        asked(&app) > away,
+        "back on the Packages page, the status is read again"
+    );
+    let back = asked(&app);
+    app.window_focus_event(wid, false);
+    app.window_focus_event(wid, true);
+    assert!(
+        asked(&app) > back,
+        "the window becoming key again reads it again"
+    );
+
+    let (_, view) = app.active_native_view(wid).expect("the Settings tab");
+    match app.native_runtime.view_state_mut(view) {
+        Some(crate::native_app::AppViewState::Settings(state)) => {
+            state.navigate(SettingsRoute::Home);
+        }
+        _ => unreachable!("the Settings view"),
+    }
+    assert!(!app.packages_page_in_front(wid), "on another Settings page");
+    app.switch_tab_in(wid, 0);
+    let away = asked(&app);
+    app.switch_tab_in(wid, 1);
+    assert_eq!(asked(&app), away, "another Settings page asks for no read");
 }

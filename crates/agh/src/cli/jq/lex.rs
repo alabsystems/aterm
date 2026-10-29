@@ -331,9 +331,17 @@ impl Lexer<'_> {
             return Tok::Num(super::eval::from_double(if negative { -v } else { v }));
         }
         let digits = &self.text[start..self.pos];
+        let clamped_float = |raw: &str| {
+            let v: f64 = raw.parse().unwrap_or(0.0);
+            let signed = if negative { -v } else { v };
+            Value::from(if signed.is_infinite() {
+                f64::MAX.copysign(signed)
+            } else {
+                signed
+            })
+        };
         let value = if fraction {
-            let v: f64 = digits.parse().unwrap_or(0.0);
-            Value::from(if negative { -v } else { v })
+            clamped_float(digits)
         } else if let Ok(v) = digits.parse::<u64>() {
             if negative {
                 i64::try_from(v).map_or_else(|_| Value::from(-(v as f64)), |v| Value::from(-v))
@@ -341,8 +349,7 @@ impl Lexer<'_> {
                 Value::from(v)
             }
         } else {
-            let v: f64 = digits.parse().unwrap_or(0.0);
-            Value::from(if negative { -v } else { v })
+            clamped_float(digits)
         };
         Tok::Num(value)
     }

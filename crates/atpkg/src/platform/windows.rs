@@ -17,6 +17,13 @@ pub fn dir_writable_by_caller(_dir: &Path) -> bool {
     true
 }
 
+/// Whether the calling user may take `path`'s name out of its folder: best-effort `true`, as
+/// [`dir_writable_by_caller`] is.
+#[must_use]
+pub fn may_take_name(_path: &Path) -> bool {
+    true
+}
+
 /// Appended to a tool name to form its executable name, only by [`crate::store::ToolName::exe_file`]: the shim and the executable are different files here (`bin/ay.cmd` vs `bin\ay.exe`).
 pub const EXE_SUFFIX: &str = ".exe";
 /// Appended to a tool name to form its `bin/` shim name (a batch wrapper), only by [`crate::store::ToolName::shim_file`]; stripped only by [`crate::store::ToolName::from_shim_file`].
@@ -602,18 +609,21 @@ mod tests {
         assert_eq!(account_home(), Some(account));
     }
 
-    /// The scratch profile [`probe_the_account_home_under_a_scratch_profile`] runs under,
+    /// The scratch profile [`probe_the_account_home_under_a_scratch_profile_if_asked`] runs under,
     /// set only in the child of this test binary that runs it.
     const SCRATCH_PROFILE_ENV: &str = "ATPKG_TEST_SCRATCH_PROFILE";
     /// That probe's name, as `--exact` wants it.
     const SCRATCH_PROFILE_PROBE: &str =
-        "platform::windows::tests::probe_the_account_home_under_a_scratch_profile";
+        "platform::windows::tests::the_account_home_is_not_the_userprofile_a_process_is_given";
 
     /// THE ACCOUNT'S PROFILE IS NOT `%USERPROFILE%`: a process whose `USERPROFILE` and
     /// `HOME` name a scratch folder (a lab instance, a worker) still answers the token's
     /// own profile, with its hive.
     #[test]
     fn the_account_home_is_not_the_userprofile_a_process_is_given() {
+        if probe_the_account_home_under_a_scratch_profile_if_asked() {
+            return;
+        }
         let scratch = crate::testdir::dir("atpkg-scratch-profile-");
         let out = aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"))
             .args(["--exact", "--nocapture", SCRATCH_PROFILE_PROBE])
@@ -635,10 +645,9 @@ mod tests {
     /// [`the_account_home_is_not_the_userprofile_a_process_is_given`]'s child: under the
     /// scratch profile its parent named, the account's home is another folder, and a
     /// loaded profile.
-    #[test]
-    fn probe_the_account_home_under_a_scratch_profile() {
+    fn probe_the_account_home_under_a_scratch_profile_if_asked() -> bool {
         let Some(scratch) = std::env::var_os(SCRATCH_PROFILE_ENV) else {
-            return;
+            return false;
         };
         let scratch = PathBuf::from(scratch);
         assert_eq!(
@@ -655,5 +664,6 @@ mod tests {
             account.display()
         );
         assert!(fs::symlink_metadata(scratch.join("NTUSER.DAT")).is_err());
+        true
     }
 }

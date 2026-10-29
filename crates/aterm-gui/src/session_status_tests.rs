@@ -21,6 +21,16 @@ fn assert_stamp_rides_last(record: &str) {
     );
 }
 use super::*;
+use crate::command_ran::Ran;
+
+/// The text reader alone: the program word (and allowlisted subcommand) it picks from a line,
+/// before the kernel confirms it ran ([`ProgramCandidate::text`]). The rows that call this pin
+/// the reader's choice; what reaches a detail is [`super::command_detail`]'s, which names that
+/// choice only once a program of that name ran
+/// (`a_detail_names_only_a_program_that_ran_or_a_builtin`).
+fn command_detail(cmdline: &str) -> Option<String> {
+    candidate(cmdline).map(|c| c.text())
+}
 
 const QUIET: Duration = Duration::from_millis(5_000);
 const DWELL: Duration = Duration::from_millis(750);
@@ -141,6 +151,103 @@ fn an_exec_into_a_store_or_native_claude_asks_for_the_footer_again() {
     publish("/opt/elsewhere/claude", ImageSource::Unknown, 0);
     assert_eq!(visit(7, true), 4, "an unclassified claude asks nothing");
     crate::claude_footer::CAPTURED_ASKS.with(|asks| *asks.borrow_mut() = None);
+}
+
+/// THE SWEEP ASKS FOR A RELEASED CODEX TAB'S ROLLOUT, READ ONLY
+/// ([`StatusObserver::request_rollout_if_due`]): a codex-alab tab whose proven claim was given
+/// back while its process runs and its record shows no end keeps its rollout asked for while that
+/// process, alive as its claim proved it, leads the group the sweep reads in front. NEGATIVE
+/// CONTROLS: another group in front, or a shell, asks nothing; the asked tab whose process leaves
+/// the front is stopped.
+#[test]
+fn the_sweep_asks_for_a_released_codex_tabs_rollout_while_its_process_fronts_it() {
+    use aterm_agent::harness::self_claimed::{Copy, Record, Seen};
+
+    use crate::session_timeline::{claim_supervisor_as, release_supervisor};
+    const SESSION: u64 = 7596;
+    let handle = crate::session_store::test_handle_on(SESSION, -1);
+    let ctx = &handle.ctx;
+    let sid = ctx.self_id.as_str();
+    let proven = crate::self_claim::stand_in::running();
+    let group = i32::try_from(proven.pid).expect("a pid");
+    let copy = Copy {
+        pid: proven.pid,
+        start: proven.start.clone(),
+        home: "/private/tmp/x/codex-home".into(),
+        seen: Seen::Present(Record {
+            pid: proven.pid,
+            session_id: Some("019a0000-0000-7000-8000-00000000000c".to_string()),
+            resume_argv: None,
+            env: Vec::new(),
+            status: Some("idle".to_string()),
+            exit: None,
+            cwd: None,
+            draft_empty: Some(true),
+            frame: None,
+            goal: None,
+            initializing: false,
+        }),
+        resume: Err("no-resume-line"),
+    };
+    let now_us = crate::metrics::now_us();
+    crate::self_claim::forget(sid);
+    claim_supervisor_as(
+        ctx,
+        &format!("codex-alab@{}", proven.pid),
+        Some(1),
+        None,
+        Some(proven.clone()),
+        now_us,
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("the proven claim");
+    crate::self_claim::set_copy_for_test(sid, Some(copy.clone()));
+    assert!(release_supervisor(
+        ctx,
+        None,
+        now_us,
+        aterm_slog::Actor::Ctl
+    ));
+    let revision = ctx.meta.lock().unwrap().supervisor_revision;
+    assert!(crate::self_claim::released_for_test(
+        ctx,
+        &proven,
+        revision,
+        true,
+        Some(copy)
+    ));
+    assert_eq!(
+        crate::self_claim::rollout_target(ctx),
+        None,
+        "no claim stands"
+    );
+
+    let mut observer = StatusObserver::new(policy(), Duration::from_millis(50));
+    let wake = crate::claude_footer::LogWake::default();
+    let now = Instant::now();
+    let mut sweep = |program, pgid, at| {
+        observer.request_rollout_if_due(SESSION, ctx, Some(program), pgid, at, &wake);
+        observer.rollout_asked.contains_key(&SESSION)
+    };
+    assert!(!sweep("codex", group + 1, now), "another group in front");
+    assert!(!sweep("zsh", group, now), "a shell in front");
+    assert!(
+        sweep("codex", group, now),
+        "the released claim's process fronts its tab: its rollout is asked for"
+    );
+    assert!(
+        sweep("codex", group, now + crate::codex_rollout_tap::RECHECK),
+        "and asked for again at the next recheck"
+    );
+    assert!(
+        !sweep(
+            "codex",
+            group + 1,
+            now + crate::codex_rollout_tap::RECHECK * 2
+        ),
+        "the process left the front: the tap is stopped"
+    );
+    crate::self_claim::forget(sid);
 }
 
 fn blank(seq: u64) -> ActivitySample {
@@ -1090,6 +1197,40 @@ fn the_badge_switch_quiets_chrome_without_stopping_classification() {
     );
 }
 
+/// `units=` (where this Mac's LAN toolset sharing stands, `crate::fleet_listen::units_status_word`)
+/// rides between `fleet=` and `setup=` on both arms of the record; a unit test reads no store,
+/// so it says `-`, as before the first read lands.
+#[test]
+fn the_status_record_says_lan_sharing_beside_fleet() {
+    let mut app = crate::App::headless_for_test();
+    let fields = |record: &str| {
+        let words: Vec<&str> = record.split_whitespace().collect();
+        let at = words
+            .iter()
+            .position(|word| word.starts_with("fleet="))
+            .unwrap_or_else(|| panic!("fleet= in {record}"));
+        (
+            words.get(at + 1).copied().unwrap_or_default().to_owned(),
+            words.get(at + 2).copied().unwrap_or_default().to_owned(),
+        )
+    };
+    let unobserved = app.session_status_record(0).expect("live session");
+    assert!(unobserved.contains(" observed=false "), "{unobserved}");
+    let (units, after) = fields(&unobserved);
+    assert_eq!(units, "units=-", "{unobserved}");
+    assert!(after.starts_with("setup="), "{unobserved}");
+
+    settle_observer(
+        &mut app.session_status,
+        0,
+        &evidence(blank(1)),
+        Instant::now(),
+    );
+    let observed = app.session_status_record(0).expect("live session");
+    assert!(observed.contains(" observed=true "), "{observed}");
+    assert_eq!(fields(&observed), (units, after), "{observed}");
+}
+
 /// `goal=` is the active goal of the agent in front ([`crate::session_timeline::SessionTimeline::goal`]),
 /// percent-encoded; `-` with none.
 #[test]
@@ -1154,7 +1295,7 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
         record.contains(
             " flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- held=- waiting=- end=- end_seen=- \
              end_cheered=- goal=- task_state=- task_rev=0 log_seq=1 log_ep=1 log_base=1 run=- \
-             turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 editing=0 bells=0 bells_sounded=0 last_bell=- gen="
+             turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 editing=0 editor=- bells=0 bells_sounded=0 last_bell=- gen="
         ),
         "{record}"
     );
@@ -1494,6 +1635,37 @@ fn status_reports_editing_count() {
     hold::clear(sid, Ticket(1));
 }
 
+/// `editor=` says whether `amacs` run in the session's tab opens an Editor tab beside it, as
+/// `edit` would: `-` on a headless instance and for a session in no window, which `edit` refuses
+/// before it reads a file, and `amacs` for a session in a window's tab once edits are served.
+#[test]
+fn status_says_whether_amacs_opens_an_editor_tab() {
+    let mut app = crate::App::headless_for_test();
+    let hosted = (1 << 44) + (1 << 12);
+    app.next_session_id = hosted;
+    app.push_stub_tab(crate::WindowId(0), crate::stub_session(hosted));
+    let unhosted = crate::stub_session(hosted + 1);
+    crate::App::register_session(&app.store, &unhosted, None);
+    app.pool.insert(unhosted);
+    let editor = |app: &crate::App, session: u64| {
+        let record = app.session_status_record(session).expect("live session");
+        assert_stamp_rides_last(&record);
+        record
+            .split(' ')
+            .find_map(|word| word.strip_prefix("editor="))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("no editor= in {record}"))
+    };
+    assert_eq!(
+        editor(&app, hosted),
+        "-",
+        "a headless instance opens no tab"
+    );
+    app.serve_edits_headless_for_test();
+    assert_eq!(editor(&app, hosted), "amacs", "a session in a window's tab");
+    assert_eq!(editor(&app, hosted + 1), "-", "a session in no window");
+}
+
 #[test]
 fn fabric_batch_matches_single_status_fields_for_each_session() {
     let mut app = crate::App::headless_for_test();
@@ -1680,7 +1852,8 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
         format!(
             "schema sid subject subject_source observed phase since_ms outcome exit_code signal \
              detail confidence reasons attribution fs_consent conflict revision enabled hold \
-             hold_advisory fabric fabric_rtt_ms fabric_link_age_ms fleet setup hand hand_pid level story why \
+             hold_advisory fabric fabric_rtt_ms fabric_link_age_ms fleet units setup hand hand_pid \
+             level story why \
              needs needs_n needs_told hold_by typed_by typed_ms path program agent agent_detail agent_rev \
              agent_since_ms agent_gen agent_fp program_state program_state_ms \
              last_act os_appearance theme_side reported_scheme scheme_from bg_dark \
@@ -1693,8 +1866,8 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
              journal journal_off integration_rev born render \
              resizes flaps land_at task pause land_held land_nudges land_since held waiting end \
              end_seen end_cheered goal task_state task_rev \
-             log_seq log_ep log_base run turn step need need_since_ms rollout rollout_asks editing bells \
-             bells_sounded last_bell gen seq hash"
+             log_seq log_ep log_base run turn step need need_since_ms rollout rollout_asks editing editor \
+             bells bells_sounded last_bell gen seq hash"
         ),
         "{observed}"
     );
@@ -2599,6 +2772,8 @@ fn a_word_is_an_assignment_only_where_its_reader_takes_it_for_one() {
 
 #[test]
 fn executing_detail_reads_only_an_executing_block() {
+    let ran = Ran::running(&["targo", "claude", "codex"]);
+    let executing_detail = |term: &aterm_core::terminal::Terminal| executing_detail(term, &ran);
     let mut term = aterm_core::terminal::Terminal::new(24, 80);
     assert_eq!(executing_detail(&term), None, "no shell integration");
     term.process(b"\x1b]133;A\x07$ ");
@@ -2626,6 +2801,8 @@ fn executing_detail_reads_only_an_executing_block() {
 
 #[test]
 fn a_full_clear_while_the_command_runs_never_names_what_the_program_drew() {
+    let ran = Ran::running(&["vim", "python3"]);
+    let executing_detail = |term: &aterm_core::terminal::Terminal| executing_detail(term, &ran);
     for named in [false, true] {
         let mut term = aterm_core::terminal::Terminal::new(24, 80);
         let explicit = if named {
@@ -2671,6 +2848,13 @@ fn the_status_record_details_the_executing_block_and_nothing_else() {
     term.lock()
         .unwrap()
         .process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep xyzzy\n\x1b]133;C\x07");
+    let record = app.session_status_record(0).expect("live session");
+    assert!(
+        record.contains(" detail=- "),
+        "no program heard running yet: {record}"
+    );
+    let ran = app.pool.get(0).expect("session 0").ctx.ran.clone();
+    ran.hear_running("sleep");
     let record = app.session_status_record(0).expect("live session");
     assert!(
         record.contains(" observed=false ") && record.contains(" detail=sleep "),
@@ -2740,6 +2924,12 @@ fn the_sweep_publishes_the_running_detail_onto_the_chrome_status() {
     term.lock()
         .unwrap()
         .process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 30\n\x1b]133;C\x07");
+    app.pool
+        .get(0)
+        .expect("session 0")
+        .ctx
+        .ran
+        .hear_running("sleep");
     let t1 = t0 + Duration::from_secs(10);
     app.observe_session_statuses(t1);
     assert_eq!(
@@ -3132,6 +3322,7 @@ fn a_codex_box_needs_you_on_every_reader_and_gives_one_banner() {
             host: None,
             instances: 1,
             drive: false,
+            facts: None,
         };
         let survey = crate::survey::survey_rows(
             &app.store,
@@ -3471,5 +3662,1214 @@ fn a_carried_box_needs_you_in_the_successor() {
             aterm_types::needs::NeedWord::Approval,
             crate::needs::CODEX_APPROVAL_WORDS.to_string()
         ))
+    );
+}
+
+/// The home a `~/` names in the gate's tests.
+const GATE_HOME: &str = "/u/jsmith";
+/// The working directory of every block in the gate's tests.
+const GATE_CWD: &str = "/w";
+/// The `PATH` the shell was spawned with in the gate's tests.
+const GATE_PATH: &str = "/usr/bin:/bin:/opt/bin:/u/jsmith/.local/bin";
+/// The programs of the gate's tests, each an image file `/usr/bin/<name>`.
+const GATE_PROGRAMS: [&str; 23] = [
+    "make", "git", "sudo", "env", "time", "nice", "nohup", "ls", "true", "cat", "mkdir", "perl",
+    "sh", "bash", "python3", "sleep", "vim", "id", "atuin", "zoxide", "tool", "2.1.271", "Python",
+];
+
+/// The gate's tests' file system ([`crate::command_ran::Table`]): each of [`GATE_PROGRAMS`] at
+/// `/usr/bin/<name>` (its file `test_id(name)`), `/bin/sh` and the shell its macOS stub re-execs
+/// (`bash`), the links, scripts and directories the rows name, and no program file a sentinel
+/// names.
+fn gate_files() -> crate::command_ran::Table {
+    let mut table = crate::command_ran::Table::default();
+    for name in GATE_PROGRAMS {
+        table = table.program(&format!("/usr/bin/{name}"), name);
+    }
+    table
+        .program("/bin/sh", "sh")
+        .program("/bin/bash", "bash")
+        .program("/private/var/select/sh", "bash")
+        .program("/usr/bin/vi", "vim")
+        .program("/usr/bin/whoami", "id")
+        .program("/u/jsmith/.local/bin/claude", "2.1.271")
+        .script("/w/deploy.sh", "/bin/sh")
+        .script("/w/QZP/s", "/bin/sh")
+        .script("/opt/bin/deploy", "/usr/bin/env python3")
+        .script("/opt/bin/brew", "/bin/bash")
+        .script("/opt/bin/codex", "/bin/sh")
+        .script("/u/jsmith/bin/mytool", "/bin/bash")
+        .script("/opt/x/pscript", "/bin/sh")
+        .script("/w/run.sh", "/usr/bin/python3")
+        .program("/opt/x/r13witness", "sh")
+        .script("/u/jsmith/x.sh", "/bin/sh")
+        .script("/w/x.sh", "/bin/sh")
+        .program("/opt/homebrew/bin/python3", "python3.14")
+        .program("/usr/bin/gnumake", "gnumake")
+        .dir("/w/QZP7H3")
+        .dir("/w/QZP7H4")
+        .dir("/tmp/QZP7H9")
+        .dir("/w/qzdirQZP8WORD1")
+        .dir("/w/QZP7G71")
+        .dir("/w/QZP7G64")
+}
+
+/// A ran log over [`gate_files`], `~/` being [`GATE_HOME`].
+fn gate_ran() -> Ran {
+    Ran::with_files(
+        Box::new(gate_files()),
+        Some(std::path::Path::new(GATE_HOME).into()),
+    )
+}
+
+/// The gate's detail of `line` against `execs`, run in [`GATE_CWD`] with [`GATE_PATH`].
+fn gated(ran: &Ran, line: &str, execs: Vec<crate::command_ran::Exec>) -> Option<String> {
+    let heard = crate::command_ran::Heard::of(ran, execs, Some(GATE_CWD), Some(GATE_PATH));
+    super::command_detail(line, &heard)
+}
+
+/// A gate row's reading: its detail and whether it names the command's own program.
+type Want = Option<(&'static str, bool)>;
+/// A gate row: a line, the programs its job ran, and its reading.
+type RanRow = (&'static str, &'static [&'static str], Want);
+/// A gate row over execs placed as the row says.
+type ExecRow = (&'static str, Vec<crate::command_ran::Exec>, Want);
+/// A gate row over placed execs in a session whose shell does (`true`) or does not run jobs.
+type ShellRow = (&'static str, Vec<crate::command_ran::Exec>, bool, Want);
+
+/// The gate's reading of `line` against `execs` as `(detail, own)`: whether it names the
+/// command's own program ([`Reading::own`]) or a program that stands in for it.
+fn read_gated(
+    ran: &Ran,
+    line: &str,
+    execs: Vec<crate::command_ran::Exec>,
+) -> Option<(String, bool)> {
+    let heard = crate::command_ran::Heard::of(ran, execs, Some(GATE_CWD), Some(GATE_PATH));
+    super::command_reading(line, &heard).map(|r| (r.text, r.own))
+}
+
+/// `execs`, each placed `during` (a prompt hook's job is `Job(None)`: it runs while no block
+/// does; the next command's is `Job(Some(BLOCK + 1))`).
+fn placed(
+    mut execs: Vec<crate::command_ran::Exec>,
+    during: crate::command_ran::During,
+) -> Vec<crate::command_ran::Exec> {
+    for exec in &mut execs {
+        exec.during = during;
+    }
+    execs
+}
+
+/// `execs`, each handed `words` as the paths of its file (as an exec's `KERN_PROCARGS2` exec path
+/// and `argv[0]` are, which the process may have written: steering only).
+fn handed(
+    mut execs: Vec<crate::command_ran::Exec>,
+    words: &[&str],
+) -> Vec<crate::command_ran::Exec> {
+    for exec in &mut execs {
+        exec.names.handed = words.iter().map(|w| (*w).into()).collect();
+    }
+    execs
+}
+
+/// `execs`, each with the steers the kernel's record of an exec of `exec_path` handed `argv`
+/// gives ([`crate::command_ran::steers_of_procargs`]).
+fn kernel(
+    mut execs: Vec<crate::command_ran::Exec>,
+    exec_path: &str,
+    argv: &[&str],
+) -> Vec<crate::command_ran::Exec> {
+    let argc = i32::try_from(argv.len()).expect("argc");
+    let mut record = argc.to_ne_bytes().to_vec();
+    record.extend_from_slice(exec_path.as_bytes());
+    record.extend_from_slice(&[0; 4]);
+    for word in argv {
+        record.extend_from_slice(word.as_bytes());
+        record.push(0);
+    }
+    let (path, handed) = crate::command_ran::steers_of_procargs(&record);
+    for exec in &mut execs {
+        exec.names.env_path = path.as_deref().map(Into::into);
+        exec.names.handed = handed.clone();
+    }
+    execs
+}
+
+/// Whether `detail` keeps the detail's law against `ran` on [`gate_files`]: its first word is a
+/// listed shell builtin, a name the kernel keeps for an image one of `ran` mapped, or the file
+/// name of a file that, by identity, is one of their images or a `#!` script whose interpreter
+/// is one (the injected file-identity table's own answer, never a word an exec was handed); and
+/// a word after it is that program's allowlisted subcommand.
+fn lawful(detail: &str, ran: &[crate::command_ran::Exec]) -> bool {
+    let (program, sub) = detail
+        .split_once(' ')
+        .map_or((detail, None), |(program, sub)| (program, Some(sub)));
+    let named = SHELL_BUILTINS.contains(&program)
+        || ran
+            .iter()
+            .flat_map(|exec| exec.names.iter())
+            .any(|name| name == program)
+        || gate_files().ran_by_identity(program, ran);
+    let sub_listed = sub.is_none_or(|sub| {
+        SUBCOMMANDS
+            .iter()
+            .any(|(p, vocabulary)| *p == program && vocabulary.contains(&sub))
+    });
+    named && sub_listed
+}
+
+/// Every line of the law's corpus with the images that line really runs: a fixed product of
+/// fragments (assignments, wrappers with value flags split by a continuation or an odd blank,
+/// programs, arguments, comments and list tails), then the shapes the audits found (compound
+/// assignments, comments, expression contexts, brace lists, pwsh expressions, AUTO_CD
+/// directories, paths handed to a program and then typed: `cat ./x; ./x`). A `QZP7` word sits in
+/// every place no program's name is, no image is ever named so, and no file of
+/// [`gate_files`] is.
+fn law_corpus() -> Vec<(String, Vec<&'static str>)> {
+    const ASSIGN: [&str; 4] = ["", "FOO=1 ", "A=QZP7G1 ", "FOO=(a QZP7G2) "];
+    const WRAP: [(&str, &[&str]); 10] = [
+        ("", &[]),
+        ("sudo -n ", &["sudo"]),
+        ("sudo -u \\\n QZP7G3 ", &["sudo"]),
+        ("sudo -u root\u{a0}QZP7G4 ", &["sudo"]),
+        ("env X=QZP7G5 ", &["env"]),
+        ("env -C \\\n /tmp/QZP7G6 ", &["env"]),
+        ("time -o \\\n QZP7G7 ", &["time"]),
+        ("nice -n 5\u{b}QZP7G8 ", &["nice"]),
+        ("exec -a \\\n QZP7G9 ", &[]),
+        ("nohup ", &["nohup"]),
+    ];
+    const PROG: [(&str, &[&str]); 12] = [
+        ("make", &["make"]),
+        ("git push", &["git"]),
+        ("./deploy.sh", &["sh"]),
+        ("/usr/bin/true", &["true"]),
+        ("ls", &["ls"]),
+        ("cd", &[]),
+        ("QZP7G10", &[]),
+        ("'QZP7G11'", &[]),
+        ("~/QZP7G12", &[]),
+        ("./QZP7G64", &[]),
+        ("/tmp/QZP7G65/QZP7G66.pdf", &[]),
+        ("cat", &["cat"]),
+    ];
+    const ARGS: [&str; 5] = [
+        "",
+        " --token QZP7G13",
+        " 'QZP7G14 x' \"QZP7G15\"",
+        " ./QZP7G61/QZP7G69",
+        " /usr/bin/QZP7G70",
+    ];
+    const TAIL: [&str; 10] = [
+        "",
+        " # a; QZP7G16 x",
+        " # then && QZP7G17",
+        "; #QZP7G18",
+        " && QZP7G19 y",
+        " | QZP7G20",
+        "\n#QZP7G21",
+        "; ./QZP7G61/QZP7G69",
+        " && QZP7G70",
+        "; ./QZP7G64",
+    ];
+    let mut corpus = Vec::new();
+    for assign in ASSIGN {
+        for (wrap, wrap_runs) in WRAP {
+            for (prog, prog_runs) in PROG {
+                for args in ARGS {
+                    for tail in TAIL {
+                        let runs = wrap_runs.iter().chain(prog_runs).copied().collect();
+                        corpus.push((format!("{assign}{wrap}{prog}{args}{tail}"), runs));
+                    }
+                }
+            }
+        }
+    }
+    let shapes: [(&str, &[&str]); 41] = [
+        ("arr=(one QZP7WORD1 two)", &[]),
+        ("make # a; QZP7WORD2 x", &["make"]),
+        (
+            "'QZP7WORD3' | ConvertTo-SecureString -AsPlainText -Force",
+            &[],
+        ),
+        ("~/QZP7WORD4", &[]),
+        ("arr=( QZP7G30 )", &[]),
+        ("hosts+=(a QZP7G31)", &[]),
+        ("a[1]=(x QZP7G32)", &[]),
+        ("files=(*.log QZP7G33.txt)", &[]),
+        ("local -a x; x=(a QZP7G34)", &[]),
+        ("arr=(a QZP7G35", &[]),
+        ("#QZP7G36 note", &[]),
+        ("cd x # go\n#QZP7G37", &[]),
+        ("sudo -u root\rQZP7G38 ls", &["sudo", "ls"]),
+        ("env -C $'/tmp/a\\' QZP7G39' make", &["env", "make"]),
+        ("[[ -n $x && QZP7G40 == y ]]", &[]),
+        ("[[ $a == b && QZP7G41 ]]", &[]),
+        ("(( n > 0 && QZP7G42 ))", &[]),
+        ("echo ${x:-a;QZP7G43 b}", &[]),
+        ("echo ${v:-x&&QZP7G44}", &[]),
+        ("{echo,QZP7G45}", &[]),
+        ("{sudo,QZP7G46} ls", &["sudo"]),
+        ("\"QZP7G47\" | Set-Clipboard", &[]),
+        ("[IO.File]::WriteAllText('QZP7G48', $x)", &[]),
+        (
+            "[Environment]::SetEnvironmentVariable('TOKEN','QZP7G49')",
+            &[],
+        ),
+        ("Write-Host(\"QZP7G50\")", &[]),
+        ("$wc.UploadString('QZP7G51')", &[]),
+        ("Get-Content('C:\\Users\\me\\QZP7G52.txt')", &[]),
+        ("@('QZP7G53','b') | ForEach-Object {..}", &[]),
+        ("'QZP7G54'", &[]),
+        ("& 'C:\\Program Files\\QZP7G55\\tool.exe' -x", &["tool"]),
+        ("$env:TOKEN='QZP7G56'; make", &["make"]),
+        ("QZP7G57", &[]),
+        ("./QZP7G58", &[]),
+        ("/tmp/QZP7G59/", &[]),
+        ("QZP7G60/", &[]),
+        ("..", &[]),
+        ("mkdir ./QZP7G71 && ./QZP7G71", &["mkdir"]),
+        ("perl -e 'sleep 2' ./QZP/s; ./QZP/s", &["perl"]),
+        ("ls -d ./QZP7G72 && ./QZP7G72", &["ls"]),
+        ("sleep 0.3 && ./QZP7G73", &["sleep"]),
+        ("ls /usr/bin/QZP7G74; QZP7G74", &["ls"]),
+    ];
+    corpus.extend(
+        shapes
+            .into_iter()
+            .map(|(line, runs)| (line.to_owned(), runs.to_vec())),
+    );
+    corpus
+}
+
+/// Every word of `line` with a `/`, its quotes taken off: what a program handed `line`'s paths
+/// reads in its argument words.
+fn path_words(line: &str) -> Vec<&str> {
+    line.split_whitespace()
+        .map(|w| w.trim_matches(['\'', '"', ';', '&', '|', '(', ')']))
+        .filter(|w| w.contains('/'))
+        .collect()
+}
+
+/// THE DETAIL'S LAW: over the whole corpus, with the execs each line's real programs give (each
+/// handed every path of the line, as a program handed a path argument or a prompt hook handed the
+/// typed line is; then again with an `atuin`-shaped hook exec beside them), every detail is
+/// `None` or names a listed builtin, a name the kernel keeps for an image that ran, or a file
+/// that by identity ran (with an allowlisted subcommand); no `QZP7` word ever appears.
+/// NEGATIVE CONTROLS (scratch): `command_detail` returning the text reader's candidate
+/// unconfirmed fails it (`make && QZP7G19 y`); G1's script rule (a typed path whose file name a
+/// word an exec was handed has confirms) fails it on `make; ./QZP7G61/QZP7G69`; a bare rule by
+/// a handed path's file name alone fails it on `make /usr/bin/QZP7G70 && QZP7G70`; and any
+/// program file confirming, whether or not it ran, fails it.
+#[test]
+fn a_detail_names_only_a_program_that_ran_or_a_builtin() {
+    let corpus = law_corpus();
+    assert!(
+        corpus.len() > 2_000,
+        "a few thousand lines: {}",
+        corpus.len()
+    );
+    let ran = gate_ran();
+    let mut confirmed = 0;
+    let mut broken: Vec<String> = Vec::new();
+    for (line, runs) in &corpus {
+        let paths = path_words(line);
+        let real = handed(crate::command_ran::ran_of(runs), &paths);
+        // The hook's exec is placed where a prompt hook's runs, in no job of this block's
+        // (the shell's own group, its stamp in the window): it counts only for its own file.
+        let mut hooked = real.clone();
+        hooked.push(crate::command_ran::Exec {
+            pid: 3,
+            pgid: 1,
+            during: crate::command_ran::During::Shell(Some(crate::command_ran::Heard::BLOCK)),
+            ..handed(crate::command_ran::ran_of(&["atuin"]), &paths).remove(0)
+        });
+        for execs in [real, hooked] {
+            let got = gated(&ran, line, execs.clone());
+            confirmed += usize::from(got.is_some());
+            if let Some(d) = got.filter(|d| d.contains("QZP7") || !lawful(d, &execs)) {
+                broken.push(format!("{line:?} -> {d:?} (ran {runs:?})"));
+            }
+        }
+    }
+    assert!(broken.is_empty(), "{} broken: {broken:#?}", broken.len());
+    assert!(
+        confirmed > corpus.len() / 2,
+        "the gate keeps real programs: {confirmed} of {}",
+        2 * corpus.len()
+    );
+}
+
+/// Every input of the second audit, with the images its line really runs, reads `None` or the
+/// real program; and the kept rows.
+#[test]
+fn every_audited_line_reads_none_or_the_program_that_ran() {
+    let ran = gate_ran();
+    let cases: &[(&str, &[&str], Option<&str>)] = &[
+        // Compound assignments (PRIV2-1).
+        ("arr=(one QZP7A1 two)", &[], None),
+        ("arr=( QZP7A2 )", &[], None),
+        ("files=(*.log QZP7A3.txt)", &[], None),
+        ("hosts+=(QZP7a QZP7A4)", &[], None),
+        ("a[1]=(x QZP7A5)", &[], None),
+        ("local -a x; x=(QZP7a QZP7A6)", &[], None),
+        ("FOO=(a QZP7A7) make", &["make"], Some("make")),
+        ("arr=(a QZP7A8", &[], None),
+        // Comments (PRIV2-2).
+        ("make # QZP7c; QZP7A9 x", &["make"], Some("make")),
+        (
+            "./deploy.sh # rotated; QZP7A10 next",
+            &["sh"],
+            Some("deploy.sh"),
+        ),
+        ("git push # then && QZP7A11", &["git"], Some("git push")),
+        ("make test; #QZP7A12", &["make"], Some("make test")),
+        ("#QZP7A13 note", &[], None),
+        ("cd x # go\n#QZP7A14", &[], Some("cd")),
+        (
+            "make test # deploy || QZP7A15",
+            &["make"],
+            Some("make test"),
+        ),
+        // Continuations and blanks the shells keep in a word (PRIV2-3).
+        (
+            "env -C \\\n /tmp/QZP7A16 make",
+            &["env", "make"],
+            Some("make"),
+        ),
+        (
+            "time -o \\\n QZP7A17.txt make",
+            &["time", "make"],
+            Some("make"),
+        ),
+        ("exec -a \\\n QZP7A18 ls", &["ls"], Some("ls")),
+        ("sudo -u\\\n QZP7A19 ls", &["sudo", "ls"], Some("ls")),
+        (
+            "sudo -nu \\\n QZP7A20 make",
+            &["sudo", "make"],
+            Some("make"),
+        ),
+        ("time -f \\\n '%e' make", &["time", "make"], Some("make")),
+        ("nice -n \\\n 10 make", &["nice", "make"], Some("make")),
+        (
+            "sudo -u \\\n QZP7A21 ./deploy.sh",
+            &["sudo", "sh"],
+            Some("deploy.sh"),
+        ),
+        // A word the reader cannot place reads the job's first program that is no wrapper (H2
+        // rule 2): a stand-in, never the typed word.
+        ("sudo -u root\rQZP7A22 ls", &["sudo", "ls"], Some("ls")),
+        ("sudo -u root\u{a0}QZP7A23 ls", &["sudo", "ls"], Some("ls")),
+        (
+            "nice -n 5\u{b}QZP7A24 make",
+            &["nice", "make"],
+            Some("make"),
+        ),
+        (
+            "env -C $'/tmp/a\\' QZP7A25' make",
+            &["env", "make"],
+            Some("make"),
+        ),
+        // Expression contexts and brace lists (PRIV2-4).
+        ("[[ -n $x && QZP7A26 == y ]]", &[], None),
+        ("[[ $a == b && QZP7A27 ]]", &[], None),
+        ("(( n > 0 && QZP7A28 ))", &[], None),
+        ("echo ${x:-a;QZP7A29 b}", &[], None),
+        ("echo ${v:-x&&QZP7A30}", &[], None),
+        ("{echo,QZP7A31}", &[], None),
+        ("{sudo,QZP7A32} ls", &["sudo"], None),
+        // pwsh expressions (PLAT2-1). A Windows path is no file here, so it confirms nothing
+        // (Windows reports no exec either; where its job's program is heard, it stands in).
+        (
+            "'QZP7A33' | ConvertTo-SecureString -AsPlainText -Force",
+            &[],
+            None,
+        ),
+        ("\"QZP7A34\" | Set-Clipboard", &[], None),
+        ("[IO.File]::WriteAllText('QZP7A35', $x)", &[], None),
+        (
+            "[Environment]::SetEnvironmentVariable('TOKEN','QZP7A36')",
+            &[],
+            None,
+        ),
+        ("Write-Host(\"QZP7A37\")", &[], None),
+        ("$wc.UploadString('QZP7A38')", &[], None),
+        ("Get-Content('C:\\Users\\me\\QZP7A39.txt')", &[], None),
+        ("@('QZP7A40','b') | ForEach-Object {..}", &[], None),
+        ("'QZP7A41'", &[], None),
+        (
+            "& 'C:\\Program Files\\QZP7A42\\tool.exe' -x",
+            &["tool"],
+            Some("tool"),
+        ),
+        ("$env:TOKEN='QZP7A43'; make", &["make"], Some("make")),
+        // AUTO_CD: a lone directory runs no image (PRIV2-5).
+        ("~/QZP7A44client", &[], None),
+        ("QZP7A45dir", &[], None),
+        // Kept rows.
+        (
+            "sudo -n ./deploy.sh --token X",
+            &["sudo", "sh"],
+            Some("deploy.sh"),
+        ),
+        ("git push", &["git"], Some("git push")),
+        ("cd x", &[], Some("cd")),
+        ("make test", &[], None),
+        ("make test", &["make"], Some("make test")),
+    ];
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter_map(|(line, runs, want)| {
+            let got = gated(&ran, line, crate::command_ran::ran_of(runs));
+            (got.as_deref() != *want)
+                .then(|| format!("{line:?} (ran {runs:?}): {got:?}, want {want:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The wrapper and script rules: a wrapper that execs in place (env, nice, exec) is passed for
+/// the program it ran; sudo, whose program runs in a child no watch follows, is the detail when
+/// only it was heard; a script whose interpreter was not heard shows the interpreter that was,
+/// until its own name is confirmed; a name the kernel cut short confirms nothing longer, and a
+/// bare word no image carries reads the job's own image as a stand-in, never its own word.
+#[test]
+fn a_wrapper_or_a_script_is_confirmed_by_what_the_kernel_mapped() {
+    use crate::command_ran::{Exec, ExecNames, ran_of, test_id};
+    let ran = gate_ran();
+    let gate = |line: &str, execs: &[Exec]| gated(&ran, line, execs.to_vec());
+    let read = |line: &str, execs: &[Exec]| read_gated(&ran, line, execs.to_vec());
+    assert_eq!(
+        gate("sudo -n make", &ran_of(&["sudo"])).as_deref(),
+        Some("sudo")
+    );
+    assert_eq!(
+        read("sudo -n true", &ran_of(&["sudo"])),
+        Some(("sudo".into(), false)),
+        "sudo execs its program: the word after it is a program's, never a builtin's, and the \
+         wrapper that ran stands in"
+    );
+    assert_eq!(
+        gate("env X=1 ls", &ran_of(&["env", "ls"])).as_deref(),
+        Some("ls")
+    );
+    assert_eq!(gate("nice ls", &ran_of(&["nice"])).as_deref(), Some("nice"));
+    assert_eq!(
+        gate("time ls", &[]).as_deref(),
+        Some("time"),
+        "the keyword ran"
+    );
+    assert_eq!(gate("exec -a x QZP7B1", &[]).as_deref(), Some("exec"));
+    let leader = |pid: i32, image: &str, exec: Option<&str>, file: bool| Exec {
+        at_ms: 0,
+        pid,
+        pgid: pid,
+        names: ExecNames {
+            image: Some(image.into()),
+            exec: exec.map(Into::into),
+            file: file.then(|| test_id(image)),
+            ..ExecNames::default()
+        },
+        during: crate::command_ran::During::Window,
+    };
+    let unread = [leader(9, "Python", Some("Python"), false)];
+    assert_eq!(
+        gate("./deploy.sh --token QZP7B2", &unread).as_deref(),
+        Some("Python"),
+        "a script whose interpreter's file was not read: the image that ran stands in"
+    );
+    assert_eq!(
+        gate(
+            "./deploy.sh --token QZP7B2",
+            &[leader(9, "sh", Some("sh"), true)]
+        )
+        .as_deref(),
+        Some("deploy.sh"),
+        "its interpreter's file ran: its own name"
+    );
+    assert_eq!(
+        read("QZP7B4", &unread),
+        Some(("Python".into(), false)),
+        "a bare word is never confirmed by another's image: the job's image stands in"
+    );
+    let git = [
+        leader(9, "python3", Some("git"), true),
+        leader(9, "git", Some("git"), true),
+    ];
+    assert_eq!(gate("git push", &git).as_deref(), Some("git push"));
+    let id = [leader(9, "whoami", Some("id"), false)];
+    assert_eq!(
+        gate("id", &id).as_deref(),
+        Some("id"),
+        "a hard link by macOS's exec name"
+    );
+    let cut = [leader(9, "a-very-long-tool", Some("a-very-long-to"), false)];
+    assert_eq!(
+        read("a-very-long-tool-name", &cut),
+        Some(("a-very-long-tool".into(), false)),
+        "a 16-byte comm confirms nothing longer: the image's file name stands in"
+    );
+}
+
+/// CRITIC H3 (a), THE BUILTIN ARM: a shell builtin's word counts at the command's own place,
+/// typed bare, only with no wrapper that `exec`s its program before it (`sudo`, `env`, `nice`,
+/// `nohup`, `exec`, `/usr/bin/time`): after one, the word is the program the wrapper runs (a
+/// `true` on `PATH`), confirmed only by its file; `command`, `builtin` and the bare `time`
+/// keyword keep the arm, since the shell runs the builtin itself. NEGATIVE CONTROL (scratch):
+/// the arm taken whatever the wrappers (as before H2) fails the `sudo` and `nice` rows with
+/// `true`.
+#[test]
+fn a_builtins_word_counts_only_with_no_execing_wrapper_before_it() {
+    use crate::command_ran::ran_of;
+    let ran = gate_ran();
+    let rows: &[RanRow] = &[
+        ("sudo -n true", &["sudo"], Some(("sudo", false))),
+        ("env true", &["env", "true"], Some(("true", true))),
+        ("nice true", &["nice"], Some(("nice", false))),
+        ("nohup true", &["nohup"], Some(("nohup", false))),
+        ("exec true", &[], Some(("exec", false))),
+        ("/usr/bin/time true", &["time"], Some(("time", false))),
+        ("command true", &[], Some(("true", true))),
+        ("builtin true", &[], Some(("true", true))),
+        ("time true", &[], Some(("true", true))),
+        ("true", &[], Some(("true", true))),
+    ];
+    let wrong: Vec<String> = rows
+        .iter()
+        .filter_map(|(line, runs, want)| {
+            let got = read_gated(&ran, line, ran_of(runs));
+            let want = want.map(|(d, own)| (d.to_owned(), own));
+            (got != want).then(|| format!("{line:?} (ran {runs:?}): {got:?}, want {want:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// CRITIC H3 (b), FISH'S `begin`: a lone `begin` opens a group whose next segment runs, so the
+/// group's program is the candidate; a lone `end` is never the candidate. NEGATIVE CONTROLS
+/// (scratch): no group arm (the opener's own segment read) fails the four group rows with
+/// `begin`; a lone `end` kept as a candidate fails the empty group and the lone `end` with
+/// `end`.
+#[test]
+fn a_fish_begin_group_reads_the_program_it_runs() {
+    use crate::command_ran::ran_of;
+    let ran = gate_ran();
+    let rows: &[RanRow] = &[
+        ("begin; sleep 1; end", &["sleep"], Some(("sleep", true))),
+        ("begin; true; end", &[], Some(("true", true))),
+        ("begin; end", &[], None),
+        (
+            "begin\nmake test\nend",
+            &["make"],
+            Some(("make test", true)),
+        ),
+        ("end", &[], None),
+    ];
+    let wrong: Vec<String> = rows
+        .iter()
+        .filter_map(|(line, runs, want)| {
+            let got = read_gated(&ran, line, ran_of(runs));
+            let want = want.map(|(d, own)| (d.to_owned(), own));
+            (got != want).then(|| format!("{line:?} (ran {runs:?}): {got:?}, want {want:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// CONFIRMED BY FILE IDENTITY: a program reached by a name its image does not carry is the
+/// program that ran when the file the shell would exec for it is that image (`vi -> vim`,
+/// `whoami` = `id`, `~/.local/bin/claude -> versions/2.1.271`), or a `#!` script whose
+/// interpreter's file ran (`./deploy.sh`, `#!/bin/sh`, also through macOS's `/bin/sh` stub to
+/// `bash`; a bare `deploy` on `PATH`, `#!/usr/bin/env python3`; CXP-1's bare `codex`, an atpkg
+/// shim `#!/bin/sh` on `PATH`, at the first read after `sh` or its stub's `bash` is heard, and
+/// after the shim execs its binary; a bare name the shell ran through a link whose path its
+/// exec was given as its file, before and after `/bin/sh`'s stub re-execs). A `#!` script whose
+/// directory no steering `PATH` names reads none of its own: the path the kernel handed its
+/// interpreter is an argument, never a steer, and the interpreter that ran stands in. A word
+/// whose own file did not run reads the job's program as a stand-in (H2 rule 2), never as its
+/// own. NEGATIVE CONTROLS (scratch): comparing no file identity fails the `vi`, `whoami`,
+/// `claude` and script rows; any program file confirming fails `/usr/bin/true` when only `ls`
+/// ran (it reads `true` as its own); no `/bin/sh` stub fails `./deploy.sh` and `codex` run by
+/// `bash`; an `env` line's program never looked up fails the bare `deploy` run by `python3`; no
+/// handed path steering fails both `r13witness` rows; reading argument words as steers again
+/// fails the first `mytool` row (it reads `mytool` as its own).
+#[test]
+fn a_link_or_a_script_is_the_program_whose_file_ran() {
+    use crate::command_ran::ran_of;
+    let ran = gate_ran();
+    let rows: &[ExecRow] = &[
+        ("vi notes.txt", ran_of(&["vim"]), Some(("vi", true))),
+        ("whoami", ran_of(&["id"]), Some(("whoami", true))),
+        (
+            "claude --resume QZP7S1",
+            ran_of(&["2.1.271"]),
+            Some(("claude", true)),
+        ),
+        ("QZP7S2 x", ran_of(&["2.1.271"]), Some(("2.1.271", false))),
+        (
+            "./deploy.sh --token QZP7S5",
+            ran_of(&["sh"]),
+            Some(("deploy.sh", true)),
+        ),
+        ("./deploy.sh", ran_of(&["bash"]), Some(("deploy.sh", true))),
+        ("/w/deploy.sh", ran_of(&["sh"]), Some(("deploy.sh", true))),
+        (
+            "deploy --token QZP7S3",
+            ran_of(&["env", "python3"]),
+            Some(("deploy", true)),
+        ),
+        ("deploy", ran_of(&["python3"]), Some(("deploy", true))),
+        ("brew update", ran_of(&["bash"]), Some(("brew", true))),
+        (
+            "mytool --token QZP7S4",
+            kernel(
+                ran_of(&["bash"]),
+                "/bin/bash",
+                &["/bin/bash", "/u/jsmith/bin/mytool", "--token", "QZP7S4"],
+            ),
+            Some(("bash", false)),
+        ),
+        (
+            "mytool --token QZP7S4",
+            ran_of(&["bash"]),
+            Some(("bash", false)),
+        ),
+        ("codex exec QZP7S6", ran_of(&["sh"]), Some(("codex", true))),
+        (
+            "codex exec QZP7S6",
+            ran_of(&["bash"]),
+            Some(("codex", true)),
+        ),
+        (
+            "codex exec QZP7S6",
+            ran_of(&["sh", "codex"]),
+            Some(("codex", true)),
+        ),
+        (
+            "r13witness",
+            kernel(
+                ran_of(&["sh"]),
+                "/opt/x/r13witness",
+                &["/opt/x/r13witness", "/w/r13witness.sh"],
+            ),
+            Some(("r13witness", true)),
+        ),
+        (
+            "r13witness",
+            kernel(
+                ran_of(&["bash"]),
+                "/bin/bash",
+                &["/opt/x/r13witness", "/w/r13witness.sh"],
+            ),
+            Some(("r13witness", true)),
+        ),
+        ("/usr/bin/true", ran_of(&["true"]), Some(("true", true))),
+        ("/usr/bin/true", ran_of(&["ls"]), Some(("ls", false))),
+    ];
+    let wrong: Vec<String> = rows
+        .iter()
+        .filter_map(|(line, execs, want)| {
+            let got = read_gated(&ran, line, execs.clone());
+            let want = want.map(|(d, own)| (d.to_owned(), own));
+            (got != want).then(|| format!("{line:?}: {got:?}, want {want:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// THE THIRD AUDIT'S LEAKS (PRIV3-1): a path handed to a program (`cat`, `mkdir`, `perl`, a
+/// prompt hook such as atuin's or zoxide's) confirms nothing: a data file, a directory AUTO_CD
+/// or fish's implicit cd changes into, a missing or pasted path, each is never named; a script
+/// handed to a program that is not its interpreter is never named through it. What the
+/// command's own job ran stands in (H2 rule 2: `cat`, `ls`, `sleep`, never as the typed word);
+/// a prompt hook's job (placed where no block runs) never does, and a directory the shell
+/// changed into reads nothing, even with a directory hook's program in its job (zoxide's
+/// `chpwd`). NEGATIVE CONTROLS (scratch): G1's script rule (a typed path whose file name a
+/// handed word has confirms) fails every row with a typed path, with its sentinel (`s` for the
+/// perl row); a bare word confirmed by a handed path's file name alone fails the `QZP7H10` row;
+/// a stand-in taken from any exec in the window (a hook's too) fails the two `atuin` rows; no
+/// directory look fails the `mkdir` and `zoxide` rows with their programs; reading argument
+/// words as steers (as before H1's landing) fails the `pscript` row with its own name, a script
+/// only handed to `sh -n` that the shell's own lookup never finds.
+#[test]
+fn a_path_handed_to_a_program_confirms_nothing() {
+    use crate::command_ran::{During, Exec, ran_of};
+    let ran = gate_ran();
+    let hook = |words: &[&str]| -> Vec<Exec> {
+        placed(handed(ran_of(&["atuin"]), words), During::Job(None))
+            .into_iter()
+            .map(|e| Exec {
+                pid: 3,
+                pgid: 3,
+                ..e
+            })
+            .collect()
+    };
+    let rows: &[ExecRow] = &[
+        (
+            "cat ./QZP7H1/QZP7H2; ./QZP7H1/QZP7H2",
+            handed(ran_of(&["cat"]), &["./QZP7H1/QZP7H2"]),
+            Some(("cat", false)),
+        ),
+        (
+            "mkdir ./QZP7H3 && ./QZP7H3",
+            handed(ran_of(&["mkdir"]), &["./QZP7H3"]),
+            None,
+        ),
+        ("./QZP7H4", hook(&["./QZP7H4"]), None),
+        (
+            "/tmp/QZP7H5/QZP7H6.pdf",
+            hook(&["/tmp/QZP7H5/QZP7H6.pdf"]),
+            None,
+        ),
+        (
+            "/tmp/QZP7H9",
+            handed(ran_of(&["zoxide"]), &["/tmp/QZP7H9"]),
+            None,
+        ),
+        (
+            "ls -d ./QZP7H7 && ./QZP7H7",
+            handed(ran_of(&["ls"]), &["./QZP7H7"]),
+            Some(("ls", false)),
+        ),
+        (
+            "sleep 0.3 && ./QZP7H8",
+            ran_of(&["sleep"]),
+            Some(("sleep", false)),
+        ),
+        (
+            "ls /usr/bin/QZP7H10; QZP7H10",
+            handed(ran_of(&["ls"]), &["/usr/bin/QZP7H10"]),
+            Some(("ls", false)),
+        ),
+        (
+            "perl -e 'sleep 2' ./QZP/s; ./QZP/s",
+            handed(ran_of(&["perl"]), &["./QZP/s"]),
+            Some(("perl", false)),
+        ),
+        (
+            "sh -n /opt/x/pscript; pscript",
+            kernel(ran_of(&["sh"]), "/bin/sh", &["sh", "-n", "/opt/x/pscript"]),
+            Some(("sh", false)),
+        ),
+    ];
+    let wrong: Vec<String> = rows
+        .iter()
+        .filter_map(|(line, execs, want)| {
+            let got = read_gated(&ran, line, execs.clone());
+            let want = want.map(|(d, own)| (d.to_owned(), own));
+            (got != want).then(|| format!("{line:?}: {got:?}, want {want:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// WHAT A STAND-IN MAY BE (GATE3-3, H2 rule 2): the first image the command's own job ran
+/// that is no wrapper, by its file name, never as the typed word's own name; never a prompt
+/// hook's job (it runs while no block does: `Job(None)`), the next or the previous command's,
+/// or the shell's own group where the shell runs jobs (a command substitution's). Each counts
+/// only as its own place says ([`crate::command_ran::Exec::counts`]). NEGATIVE CONTROL
+/// (scratch): a stand-in taken from every exec the window counts (as before H2) fails the hook,
+/// next, previous and shell rows with `perl`.
+#[test]
+fn a_prompt_hooks_program_never_stands_in() {
+    use crate::command_ran::{During, Heard, ran_of};
+    let ran = gate_ran();
+    let at = |name: &str, during: During| placed(ran_of(&[name]), during);
+    let read = |line: &str, execs| read_gated(&ran, line, execs);
+    let own = During::Job(Some(Heard::BLOCK));
+    assert_eq!(
+        read("./run.sh --token QZP7S7", at("perl", own)),
+        Some(("perl".into(), false)),
+        "the job's perl stands in, never as the script's own name"
+    );
+    assert_eq!(
+        read("./run.sh --token QZP7S7", at("python3", own)),
+        Some(("run.sh".into(), true)),
+        "its own interpreter heard: its own name"
+    );
+    assert_eq!(
+        read("./QZP7S8.sh", at("perl", own)),
+        Some(("perl".into(), false)),
+        "a word no file has reads its job's program"
+    );
+    for (why, elsewhere) in [
+        ("a prompt hook's job", During::Job(None)),
+        (
+            "the next command's job",
+            During::Job(Some(Heard::BLOCK + 1)),
+        ),
+        (
+            "the previous command's job",
+            During::Job(Some(Heard::BLOCK - 1)),
+        ),
+        ("the shell's own group", During::Shell(Some(Heard::BLOCK))),
+    ] {
+        assert_eq!(
+            read("./QZP7S8.sh", at("perl", elsewhere)),
+            None,
+            "{why} never stands in"
+        );
+        assert_eq!(
+            read("./run.sh --token QZP7S7", at("perl", elsewhere)),
+            None,
+            "{why} never stands in for a script"
+        );
+    }
+    assert_eq!(
+        read("./run.sh", at("python3", During::Shell(Some(Heard::BLOCK)))),
+        Some(("run.sh".into(), true)),
+        "the shell's own group in the block confirms its own file"
+    );
+}
+
+/// THE THIRD AUDIT'S FALSE NEGATIVES (GATE3, H2): the lines of audit 3's live corpus whose
+/// typed word is not the program, over the injected exec and file seams. An alias's or a
+/// function's program, a path the shell rewrites (`~/`, `$HOME/`, `${HOME}/`; another variable
+/// reads its job's program), a pwsh script (its children run in pwsh's own group, counted by
+/// the block they were placed in), a link and each stage of a re-exec chain (`python3`, `make`,
+/// Homebrew's `python3` read by its first stage, else its `Python` standing in), a wrapper's
+/// builtin word and fish's `begin`: each reads its own name, its job's program as a stand-in,
+/// or nothing where nothing of its own ran. A prompt hook's program is placed where no block
+/// runs (the integration writes D before any user hook: H2 rule 3), so a failed or AUTO_CD
+/// path before it reads nothing, and a directory hook's program in an AUTO_CD's own job never
+/// stands in. H5 (an alias's expansion sent over the PTY) is not built: the stand-in names
+/// what an alias ran, and an alias of a builtin, which runs nothing, reads nothing. NEGATIVE
+/// CONTROLS (scratch): no stand-in (as before H2) fails every `false` row with `None`; no
+/// `$HOME/` expansion fails the two `$HOME` rows with `sh`/`bash`; no directory look fails the
+/// `zoxide` rows with `zoxide`; the stand-in counted by stamp in pwsh's group whatever block it
+/// was placed in fails the pwsh `BLOCK + 1` row with `ls`; the last row is the order rule 3
+/// prevents (a precmd that ran before D, in the block's own job, stands in).
+#[test]
+fn every_gate3_line_reads_its_own_name_its_jobs_program_or_none() {
+    use crate::command_ran::{During, Heard, ran_of};
+    let ran = gate_ran();
+    let hook = During::Job(None);
+    let pwsh = |names: &[&str], at: u64| placed(ran_of(names), During::Shell(Some(at)));
+    let rows: Vec<ShellRow> = vec![
+        ("qzl", ran_of(&["ls"]), true, Some(("ls", false))),
+        ("qzf", ran_of(&["sleep"]), true, Some(("sleep", false))),
+        ("qza", ran_of(&["true"]), true, Some(("true", false))),
+        ("qza", Vec::new(), true, None),
+        ("~/x.sh", ran_of(&["sh"]), true, Some(("x.sh", true))),
+        ("$HOME/x.sh", ran_of(&["sh"]), true, Some(("x.sh", true))),
+        (
+            "${HOME}/x.sh",
+            ran_of(&["bash"]),
+            true,
+            Some(("x.sh", true)),
+        ),
+        ("$QZP9VAR/x.sh", ran_of(&["sh"]), true, Some(("sh", false))),
+        (
+            "./x.sh",
+            pwsh(&["sh"], Heard::BLOCK),
+            false,
+            Some(("x.sh", true)),
+        ),
+        (
+            "qzl",
+            pwsh(&["ls"], Heard::BLOCK),
+            false,
+            Some(("ls", false)),
+        ),
+        ("qzl", pwsh(&["ls"], Heard::BLOCK + 1), false, None),
+        ("vi --version", ran_of(&["vim"]), true, Some(("vi", true))),
+        ("whoami", ran_of(&["id"]), true, Some(("whoami", true))),
+        (
+            "claude --version",
+            ran_of(&["2.1.271"]),
+            true,
+            Some(("claude", true)),
+        ),
+        (
+            "python3 -c 'import time'",
+            ran_of(&["python3", "python3.9", "Python"]),
+            true,
+            Some(("python3", true)),
+        ),
+        (
+            "make --version",
+            ran_of(&["make", "gnumake"]),
+            true,
+            Some(("make", true)),
+        ),
+        (
+            "/opt/homebrew/bin/python3 -c x",
+            ran_of(&["python3.14", "Python"]),
+            true,
+            Some(("python3", true)),
+        ),
+        (
+            "/opt/homebrew/bin/python3 -c x",
+            ran_of(&["Python"]),
+            true,
+            Some(("Python", false)),
+        ),
+        (
+            "sudo -n true",
+            ran_of(&["sudo"]),
+            true,
+            Some(("sudo", false)),
+        ),
+        (
+            "begin; sleep 1; end",
+            ran_of(&["sleep"]),
+            true,
+            Some(("sleep", true)),
+        ),
+        (
+            "./qzdirQZP8WORD1",
+            placed(ran_of(&["date"]), hook),
+            true,
+            None,
+        ),
+        ("./nosuch.sh", placed(ran_of(&["date"]), hook), true, None),
+        (
+            "qzdirQZP8WORD1",
+            placed(ran_of(&["date"]), hook),
+            true,
+            None,
+        ),
+        (
+            "./qzdirQZP8WORD1/",
+            placed(ran_of(&["date"]), hook),
+            true,
+            None,
+        ),
+        ("./qzdirQZP8WORD1", ran_of(&["zoxide"]), true, None),
+        ("qzdirQZP8WORD1", ran_of(&["zoxide"]), true, None),
+        (
+            "./nosuch.sh",
+            ran_of(&["date"]),
+            true,
+            Some(("date", false)),
+        ),
+    ];
+    let wrong: Vec<String> = rows
+        .iter()
+        .filter_map(|(line, execs, jobs, want)| {
+            let heard =
+                Heard::of_shell(&ran, execs.clone(), Some(GATE_CWD), Some(GATE_PATH), *jobs);
+            let got = super::command_reading(line, &heard).map(|r| (r.text, r.own));
+            let want = want.map(|(d, own)| (d.to_owned(), own));
+            let leaked = got.as_ref().is_some_and(|(d, _)| d.contains("QZP"));
+            (leaked || got != want)
+                .then(|| format!("{line:?} (jobs {jobs}): {got:?}, want {want:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// PRIV3-3: off macOS a holder image's `comm` is the process's own to set (`prctl`, perl's
+/// `$0`), so the gather's sampled edge reads none, and a typed word equal to it confirms
+/// nothing; the image's own file still confirms its name. NEGATIVE CONTROL (scratch): the edge
+/// keeping the read `comm` (as before H1) fails the first assertion with `QZP7L1`.
+#[cfg(unix)]
+#[test]
+fn a_name_the_process_set_confirms_nothing() {
+    use crate::command_ran::{ExecNames, RanFeed, Steering, Window};
+    fn renamed(_pid: i32, _steer: Steering<'_>) -> ExecNames {
+        ExecNames {
+            image: Some("perl".into()),
+            exec: Some("QZP7L1 title".into()),
+            ..ExecNames::default()
+        }
+    }
+    let ran = std::sync::Arc::new(gate_ran());
+    let feed = RanFeed::reading(std::sync::Arc::clone(&ran), 60_100, renamed);
+    let image = crate::holder_image::HolderImage::of(
+        60_101,
+        Some(1),
+        Some("/usr/bin/perl".into()),
+        atpkg::image::ImageBuild::unknown(None),
+        0,
+    );
+    feed.image(&image, 0);
+    let execs: Vec<crate::command_ran::Exec> = ran
+        .within(Some(Window { from: 0, to: None }))
+        .iter()
+        .map(|e| (**e).clone())
+        .collect();
+    assert_eq!(execs.len(), 1, "the edge's image was heard");
+    assert_eq!(
+        read_gated(&ran, "QZP7L1", execs.clone()),
+        Some(("perl".into(), false)),
+        "a name the process set confirms nothing; its image's file name stands in: {execs:?}"
+    );
+    assert_eq!(gated(&ran, "perl x.pl", execs).as_deref(), Some("perl"));
+}
+
+/// One batch the gather handed on and the parse stage parsed into `term` at `at`, as the parse
+/// stage does: stopping at each place a held exec waits for, reading the block running there,
+/// then the batch's end ([`crate::command_ran::Places`]).
+fn parse_into(
+    term: &mut aterm_core::terminal::Terminal,
+    ran: &Ran,
+    bytes: &[u8],
+    at: aterm_core::terminal::ClockReading,
+) {
+    let running = |t: &aterm_core::terminal::Terminal| {
+        t.current_block()
+            .filter(|b| b.state == aterm_types::BlockState::Executing)
+            .map(|b| b.id)
+    };
+    let end = ran.handed_on(bytes.len());
+    let mut places = crate::command_ran::Places::default();
+    ran.places_in(end, bytes.len(), &mut places);
+    let mut off = 0;
+    while off < bytes.len() {
+        let to = places
+            .next_cut(off)
+            .map_or(bytes.len(), |cut| cut.min(bytes.len()));
+        term.process_at(&bytes[off..to], at);
+        places.parsed(to, running(term));
+        off = to;
+    }
+    ran.parsed_at(end, bytes.len(), &places, at.wall_ms.unwrap_or(0));
+}
+
+/// PRIV3-2, TYPED AHEAD: block 0's `make` never ran (no exec), block 1's line was typed before
+/// block 0 ended, so its D, the next prompt and block 1's C wait in the PTY when the gather
+/// hears block 1's `make`, whose job holds the terminal then. The exec is placed where the
+/// shell's output stood, past those bytes, so it counts for block 1 alone: block 0 reads `None`,
+/// block 1 its program. NEGATIVE CONTROL (scratch): leaving the PTY's queued bytes out of the
+/// place (the exec placed where the gather had read) gives block 0 `make`.
+#[test]
+fn a_typed_ahead_commands_exec_counts_for_its_own_block() {
+    use crate::command_ran::{Exec, Ran, Spot};
+    let at = |wall_ms: u64| aterm_core::terminal::ClockReading {
+        monotonic: aterm_core::terminal::ClockReading::now().monotonic,
+        wall_ms: Some(wall_ms),
+    };
+    const T: u64 = 1_760_000_000_000;
+    let mut term = aterm_core::terminal::Terminal::new(24, 80);
+    let ran = Ran::default();
+    parse_into(&mut term, &ran, b"\x1b]133;A\x07$ \x1b]133;B\x07", at(T));
+    parse_into(
+        &mut term,
+        &ran,
+        b"make QZP7T1\r\n\x1b]133;C\x07",
+        at(T + 10),
+    );
+    let ahead: &[u8] =
+        b"\x1b]133;D;127\x07\x1b]133;A\x07$ \x1b]133;B\x07make test\r\n\x1b]133;C\x07";
+    ran.hear_at(
+        Exec {
+            pid: 9,
+            pgid: 9,
+            ..crate::command_ran::test_exec(0, "make")
+        },
+        Spot {
+            filled: 0,
+            queued: Some(ahead.len()),
+            job: true,
+        },
+        T + 19,
+    );
+    parse_into(&mut term, &ran, ahead, at(T + 20));
+    let read = block_read(&term, None, None, &ran);
+    let details: Vec<(u64, Option<&str>)> = read
+        .facts
+        .iter()
+        .map(|f| (f.id, f.detail.as_deref()))
+        .collect();
+    assert_eq!(details, [(0, None), (1, Some("make test"))]);
+}
+
+/// A block's detail counts only the execs heard in its window: from its C stamp (less the
+/// lead) through its D (plus the lag). An exec heard earlier (a prompt hook's while the person
+/// typed), or a later command's after D, confirms nothing.
+#[test]
+fn a_block_counts_only_the_execs_heard_in_its_window() {
+    use crate::command_ran::{Exec, ExecNames, LAG_MS, LEAD_MS, Ran};
+    let at = |wall_ms: u64| aterm_core::terminal::ClockReading {
+        monotonic: aterm_core::terminal::ClockReading::now().monotonic,
+        wall_ms: Some(wall_ms),
+    };
+    const T: u64 = 1_760_000_000_000;
+    let heard = |ran: &Ran, at_ms: u64, name: &str| {
+        ran.note(Exec {
+            at_ms,
+            pid: 9,
+            pgid: 9,
+            names: ExecNames {
+                image: Some(name.into()),
+                exec: None,
+                ..ExecNames::default()
+            },
+            during: crate::command_ran::During::Window,
+        });
+    };
+    let mut term = aterm_core::terminal::Terminal::new(24, 80);
+    term.process_at(b"\x1b]133;A\x07$ ", at(T));
+    term.process_at(b"\x1b]133;B\x07", at(T + 5_000));
+    term.process_at(b"make test\n\x1b]133;C\x07", at(T + 9_000));
+    let ran = Ran::default();
+    heard(&ran, T + 9_000 - LEAD_MS - 1, "make");
+    assert_eq!(
+        executing_detail(&term, &ran),
+        None,
+        "a hook's make while it was typed"
+    );
+    heard(&ran, T + 9_000 - LEAD_MS, "make");
+    assert_eq!(executing_detail(&term, &ran).as_deref(), Some("make test"));
+    term.process_at(b"\x1b]133;D;0\x07", at(T + 10_000));
+    let ended = Ran::default();
+    heard(&ended, T + 10_000 + LAG_MS + 1, "make");
+    let read = block_read(&term, None, None, &ended);
+    assert_eq!(read.facts.len(), 1);
+    assert_eq!(read.facts[0].detail, None, "a make heard after D");
+    heard(&ended, T + 9_500, "make");
+    let read = block_read(&term, None, None, &ended);
+    assert_eq!(read.facts[0].detail.as_deref(), Some("make test"));
+}
+
+/// A block whose D the shell never wrote ends at the prompt that closed it: a later command's
+/// exec (here `vim`, heard just after its own C) never names the earlier block, not even through
+/// a script's interpreter fallback. NEGATIVE CONTROL (scratch): a window that ignores the closing
+/// prompt leaves block 0's open, and it reads `vim`.
+#[test]
+fn an_unended_block_ends_at_the_prompt_that_closed_it() {
+    use crate::command_ran::{Exec, ExecNames, Ran};
+    use crate::session_log::BlockEnd;
+    let at = |wall_ms: u64| aterm_core::terminal::ClockReading {
+        monotonic: aterm_core::terminal::ClockReading::now().monotonic,
+        wall_ms: Some(wall_ms),
+    };
+    const T: u64 = 1_760_000_000_000;
+    let mut term = aterm_core::terminal::Terminal::new(24, 80);
+    term.process_at(b"\x1b]133;A\x07$ \x1b]133;B\x07", at(T));
+    term.process_at(b"./build.sh\n\x1b]133;C\x07", at(T + 1_000));
+    term.process_at(b"\x1b]133;A\x07$ \x1b]133;B\x07", at(T + 5_000));
+    term.process_at(b"vim notes\n\x1b]133;C\x07", at(T + 6_000));
+    let ran = Ran::default();
+    ran.note(Exec {
+        at_ms: T + 6_001,
+        pid: 9,
+        pgid: 9,
+        names: ExecNames {
+            image: Some("vim".into()),
+            ..ExecNames::default()
+        },
+        during: crate::command_ran::During::Window,
+    });
+    let read = block_read(&term, None, None, &ran);
+    let facts: Vec<(u64, BlockEnd, Option<&str>)> = read
+        .facts
+        .iter()
+        .map(|f| (f.id, f.end, f.detail.as_deref()))
+        .collect();
+    assert_eq!(
+        facts,
+        [
+            (
+                0,
+                BlockEnd::Unended {
+                    ended_ms: Some(T + 5_000)
+                },
+                None
+            ),
+            (1, BlockEnd::Running, Some("vim")),
+        ]
     );
 }

@@ -245,8 +245,8 @@ fn brief_names_every_need_and_claim() {
     let lines: Vec<&str> = b.text.lines().collect();
     assert!(lines[1].contains("need=approval:bash"), "{}", b.text);
     assert!(
-        lines.iter().any(|l| l.starts_with("need escalated - ")),
-        "{}",
+        lines.iter().any(|l| l.starts_with("need escalated p1 ")),
+        "the escalation raised while the box stands is the box's (fix E3): {}",
         b.text
     );
     assert!(
@@ -607,8 +607,11 @@ fn a_source_or_landing_mark_gives_no_brief_line() {
     assert!(body(&rung).len() > body(&before).len(), "{rung}");
 }
 
+/// `brief` reads a closed turn's outcome refined by an exact amend only, and a step's
+/// outcome likewise, except the cascade's `gone` (fix E1, E2E-7), which any amend the
+/// confidence law admits refines.
 #[test]
-fn brief_reads_an_exact_refinement_and_never_a_strong_one() {
+fn brief_reads_an_exact_refinement_and_a_strong_one_only_of_a_steps_gone() {
     use aterm_slog::{Amend, Close, Open, Out, TurnOut};
     let mut log = Log::new(2);
     let run = agent_session(&mut log, 0);
@@ -669,7 +672,7 @@ fn brief_reads_an_exact_refinement_and_never_a_strong_one() {
         "{}",
         line(&log, &t)
     );
-    assert!(line(&log, &p).contains(" gone "), "{}", line(&log, &p));
+    assert!(line(&log, &p).contains(" ok "), "{}", line(&log, &p));
     amend(
         &mut log,
         turn,

@@ -291,3 +291,158 @@ fn a_seed_holds_a_typed_wake_by_its_own_episode() {
     );
     assert_eq!(next(true), Verdict::Quiet, "a kind-wide seed holds #2 told");
 }
+
+/// A wake's line left at a break, this loop's own, at count `submits`.
+fn own_left(submits: Option<u64>) -> Left {
+    use crate::supervise::occupancy::WakeDoor;
+    use crate::supervise::occupancy::door::LeftRow;
+    Left {
+        row: LeftRow::Wake {
+            ord: 1,
+            held_ms: 0,
+            door: WakeDoor::Break,
+        },
+        text: "the line".to_string(),
+        at_ms: T0,
+        submits,
+        ran: false,
+        seeded: false,
+        counted: true,
+    }
+}
+
+/// What the one line left settles to at a read of a clear composer at `submits`, a turn running
+/// where `live`.
+fn cleared_at(s: &mut FactsState, submits: Option<u64>, live: bool) -> Vec<Settled> {
+    s.look(
+        LeftLook::Read {
+            draft: Some(false),
+            submits,
+            live,
+        },
+        T0 + 1,
+    )
+    .into_iter()
+    .map(|(_, _, how)| how)
+    .collect()
+}
+
+/// A COUNT NO LOOK MAY WEIGH TELLS THE LINE LEFT, NEVER RELEASES IT (the 2.9b safety review's
+/// F2): each host process counts its own submits from 0, so a successor that read the line back
+/// from its predecessor's row (a seamless update's re-adopted session counts again from 0: the
+/// person sent the line, a turn runs, the composer is clear and the count is 1 against the 7 it
+/// was left at), a loop whose host came back from an outage, and a count lower than the line was
+/// left at each book a clear composer's line told (`settled=uncounted`), so it is never typed a
+/// second time. NEGATIVE CONTROLS: this loop's own count, weighed, releases the cleared line; and
+/// with `ReleaseUncounted` planted each of the three is released, the line the person sent typed
+/// again.
+#[test]
+fn a_count_no_look_may_weigh_tells_the_line_left_and_never_releases_it() {
+    use crate::supervise::occupancy::door::{LeftSaid, left_reason, left_rows_in};
+    use crate::supervise::occupancy::fault::{self, Fault};
+    /// How a case builds the account its line is left in.
+    type Account<'a> = &'a dyn Fn() -> FactsState;
+    let key = EpisodeKey {
+        kind: FactKind::Wake,
+        id: 0xabc,
+    };
+    let seeded = || {
+        let reason = left_reason(own_left(None).row, key, LeftSaid::Left { submits: Some(7) });
+        let line = format!(
+            r#"{{"ts":{T0},"rule_id":"fact-wake@v1","decision":"waiting","command":"x","reason":"{reason}","sid":"s1"}}"#
+        );
+        let lefts = left_rows_in(&line, Some("s1"));
+        assert_eq!(lefts.len(), 1, "{line}");
+        assert!(
+            lefts.iter().all(|(_, l)| l.seeded && !l.counted),
+            "{lefts:?}"
+        );
+        let mut s = FactsState::default();
+        s.seed_left(&[(key, T0, SeedOutcome::Left)], lefts);
+        assert!(s.is_left(key));
+        s
+    };
+    let recounted = || {
+        let mut s = FactsState::default();
+        assert!(s.leave(key, own_left(Some(7))));
+        s.recount();
+        s
+    };
+    let went_back = || {
+        let mut s = FactsState::default();
+        assert!(s.leave(key, own_left(Some(7))));
+        s
+    };
+    let runs: [(&str, Account<'_>, Option<u64>, bool); 4] = [
+        ("a successor, the count restarted", &seeded, Some(1), true),
+        ("a successor, the count going on", &seeded, Some(7), false),
+        ("back from an outage", &recounted, Some(7), false),
+        ("a count that went back", &went_back, Some(1), false),
+    ];
+    for (case, account, submits, live) in runs {
+        let told = cleared_at(&mut account(), submits, live);
+        assert_eq!(told, [Settled::Told(UNCOUNTED)], "{case}");
+        let released = fault::with(Fault::ReleaseUncounted, || {
+            cleared_at(&mut account(), submits, live)
+        });
+        assert_eq!(
+            released,
+            [Settled::Released(CLEARED)],
+            "NEGATIVE CONTROL {case}: weighed, released for a retell"
+        );
+    }
+    let mut own = went_back();
+    assert_eq!(
+        cleared_at(&mut own, Some(7), true),
+        [Settled::Released(CLEARED)],
+        "NEGATIVE CONTROL: this loop's own count, weighed: cleared unsent"
+    );
+    let mut standing = seeded();
+    let stands = standing.look(
+        LeftLook::Read {
+            draft: Some(true),
+            submits: Some(1),
+            live: false,
+        },
+        T0 + 1,
+    );
+    assert!(
+        stands.is_empty() && standing.is_left(key),
+        "nothing settles while it stands"
+    );
+}
+
+/// A LINE LEFT IS TOLD BY NO DOOR WHILE IT STANDS: the hung call's fact whose line stands left in
+/// the composer is spoken for (`FactsState::is_spoken_for`, the one test every door's pick makes)
+/// and not the fact to tell (`FactsState::pending`), and once a look settles it, released, it is
+/// again; told, it is spoken for for good. NEGATIVE CONTROL: the same reading with nothing left
+/// tells it.
+#[test]
+fn a_fact_left_in_the_composer_is_not_the_fact_to_tell() {
+    let hung = call(27090, Some(1), 31);
+    let r = reading(T0, vec![hung.clone()]);
+    let key = EpisodeKey::of_call(&hung).expect("born");
+    let mut s = FactsState::default();
+    assert!(!s.is_spoken_for(key));
+    assert_eq!(
+        s.pending(Some(&r), T0).map(|f| f.key),
+        Some(key),
+        "NEGATIVE CONTROL: nothing left, told"
+    );
+    assert!(s.leave(key, own_left(Some(5))));
+    assert!(s.is_spoken_for(key), "left: spoken for");
+    assert_eq!(s.pending(Some(&r), T0), None, "left: told by no door");
+    assert_eq!(
+        cleared_at(&mut s, Some(5), false),
+        [Settled::Released(CLEARED)]
+    );
+    assert!(!s.is_spoken_for(key), "released: free again");
+    assert_eq!(
+        s.pending(Some(&r), T0).map(|f| f.key),
+        Some(key),
+        "released: again"
+    );
+    s.told(key, T0 + 2);
+    assert!(s.is_spoken_for(key), "told: spoken for");
+    assert_eq!(s.pending(Some(&r), T0), None, "told: never again");
+}

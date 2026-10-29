@@ -166,11 +166,11 @@ fn the_turn_wait_sleeps_on_the_log_and_the_screen_decides_the_press() {
     );
     let log = log_of(&m);
     assert_eq!(log.asked, [WAIT_40, WAIT_41], "{:#?}", m.requests);
-    for n in 0..2 {
+    for (n, asked) in log.asked.iter().enumerate() {
         let at = nth_log_wait(&m, n);
         assert_eq!(
             m.requests[at - 2..=at + 1],
-            [READ, "status", &format!("await {}", log.asked[n]), READ],
+            [READ, "status", &format!("await {asked}"), READ],
             "a busy read, the log's head, the wait, and the read that decides: {:#?}",
             m.requests
         );

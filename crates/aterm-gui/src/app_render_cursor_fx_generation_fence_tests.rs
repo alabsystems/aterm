@@ -90,8 +90,10 @@ fn a_coordinate_space_seam_curtains_the_rainbow_ribbon_over_a_quarter_second() {
         "precondition: the lit ribbon cell lays light"
     );
 
-    retire_torn_cursor_fx(app.windows.get_mut(&wid).expect("window"));
     let fell = Instant::now();
+    crate::metrics::pin_host_clock(Some(fell));
+    retire_torn_cursor_fx(app.windows.get_mut(&wid).expect("window"));
+    crate::metrics::pin_host_clock(None);
     assert!(
         app.windows[&wid]
             .fx
@@ -161,6 +163,8 @@ fn entering_the_alternate_screen_curtains_the_band_and_leaving_it_returns_nothin
     let t0 = Instant::now() - Duration::from_millis(300);
     let (mut app, wid, _settled) = rainbow_window_with_a_lit_band(t0);
     assert!(band_peak(&app, wid) > 0, "precondition: a lit band");
+    let fell = Instant::now();
+    crate::metrics::pin_host_clock(Some(fell));
     {
         let ws = app.windows.get_mut(&wid).expect("window");
         super::sync_cursor_effect_coordinate_space(ws, 7, false);
@@ -169,7 +173,7 @@ fn entering_the_alternate_screen_curtains_the_band_and_leaving_it_returns_nothin
             "the alt-screen edge is a coordinate-space change"
         );
     }
-    let fell = Instant::now();
+    crate::metrics::pin_host_clock(None);
     assert!(
         app.windows[&wid]
             .fx
@@ -265,8 +269,10 @@ fn every_coordinate_space_seam_curtains_the_band() {
             band_peak(&app, wid) > 0,
             "{label}: precondition: a lit band"
         );
-        seam(&mut app, wid);
         let fell = Instant::now();
+        crate::metrics::pin_host_clock(Some(fell));
+        seam(&mut app, wid);
+        crate::metrics::pin_host_clock(None);
         assert!(
             app.windows[&wid]
                 .fx

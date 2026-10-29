@@ -1,11 +1,11 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-tempfile: spec recovery from its 7 unit tests
+# aterm-tempfile: spec recovery from its 16 unit tests
 
 > Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 1 test it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
+> deleted are gone, and the spec rows no longer cite those tests. Counts below are reconciled with
+> current `main` (2026-10-29).
 
 > Audit amendment: The 2026-10-16 code audit corrected unique_name's cross-process uniqueness claim (§5.1). The dated inventory below records the earlier snapshot; atomic-create collision retry remains the guarantee.
 
@@ -15,11 +15,11 @@
 > `unique-name-format-and-injective` can retire its test without the effects lane (gap 8).
 
 Source: `crates/aterm-tempfile/src/lib.rs` (read only). Every path below is repo-relative. It is the crate's only source file.
-All 7 `#[test]` fns are in its `mod tests`. One is `cfg(unix)` and one is `cfg(windows)`. I read
+All 16 `#[test]` fns are in its `mod tests` (6 unconditional, 7 `cfg(unix)`, 2 `cfg(target_os = "macos")`, and 1 `cfg(windows)`). I read
 every test and the code it reaches. Nothing was compiled or run. The claims below come from
 reading the code.
 
-Result: **4 specs**, covering **6 tests**. **1 test is not a spec sample** (§4).
+Result: **4 specs**, covering **15 tests**. **1 test is not a spec sample** (§4).
 
 ## 0. Notation used in the statements
 
@@ -47,7 +47,9 @@ Result: **4 specs**, covering **6 tests**. **1 test is not a spec sample** (§4)
   - nothing else under `parent` changed.
 - `SI(path, body)` means `path` is a regular file holding exactly `body` with
   `mode & 0o7777 = 0o555`.
-- `Cache(body) = temp_dir()/"aterm-stand-ins"/hex16(fnv1a(body))`.
+- `Cache(me, tmp) = quiet_in(tmp)/("atv-standins-" ++ dec(me))`, user `me`'s stand-in cache,
+  and `Slot(text, k) = Cache(me, tmp)/(hex16(fnv1a(text)) ++ "-" ++ dec(k))` for `k < 4`
+  (2026-10-28: this replaced the hard-linked `temp_dir()/"aterm-stand-ins"/hex16(fnv1a(body))`).
 - `fnv1a` is the fold that starts at `0xcbf29ce484222325` and maps
   `h ↦ (h ^ b) · 0x100000001b3 mod 2^64` for each byte `b`.
 - **`trust::skip` prerequisite (an aterm-side change, not a Trust gap).** `unique_name`,
@@ -65,9 +67,9 @@ must handle)`, `blocking_gaps` (audit §7 numbers).
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
 unique-name-format-and-injective	contract	unique_name, hex_digit, os_random_u64 (opaque r), no_csprng_fallback (opaque)	∀ prefix:&str, if C = c before the call, then unique_name(prefix) = Name(prefix, std::process::id(), r, c) and C = c+1 after it. Table lemma: ∀ n<16, hex_digit(n) = "0123456789abcdef"[n], and ∀ n≥16, hex_digit(n) = 'f'. Loop lemma: after the 16 iterations of slot := hex_digit(v mod 16); v := v/16 over hex.iter_mut().rev(), hex = hex16(r). Corollary (injectivity within one process): two calls read different counter values c1 ≠ c2 (any two calls do, before 2^64 calls), the suffix after the last '_' is dec(c), and dec is injective. So any two calls return distinct strings, even when their prefixes are equal and their r values are equal.	-	EASY table lemma: a 16-arm match on u64, decidable by evaluation. MEDIUM rest: String::with_capacity and push/push_str contents, u32/u64 to_string (a std Display model), a [char;16] iter_mut().rev() loop and a for-in over the array, u64 div/mod by 16, and the AtomicU64 fetch_add on a static (a sequential atomic model is enough). Lift trust::skip first.	0, 1, 3, 4, 5, 7, 13
-tempdir-creates-fresh-private-dir-under-parent	contract	TempDir::{with_prefix_in,new_in,new}, tempdir, Builder::{new,prefix,prefix_str,tempdir,tempdir_in}, call0	(prefix_str) Builder::new().prefix_str() = ".tmp", and b.prefix(p).prefix_str() = p, with the last prefix call winning. (with_prefix_in) ∀ prefix, dir, in FsEnv: (a) if ¬SingleNormal(prefix ++ Sfx) (on unix exactly '/' ∈ prefix), the result is Err(InvalidInput) on the first attempt and FsEnv is unchanged. Validity depends only on prefix, because Sfx has no separator. (b) Otherwise, on success it returns Ok(d) with Fresh(d, dir), and d.path().file_name() = Name(prefix,pid,r,c), which starts with prefix. A create that fails with AlreadyExists is retried under a new name, up to 5 attempts in all, and then the result is Err(AlreadyExists). Any other io error is returned unchanged. (instances) tempdir() = TempDir::new() = new_in(temp_dir()) = with_prefix_in(".tmp", temp_dir()). For a Builder b, b.tempdir() = with_prefix_in(b.prefix_str(), temp_dir()) and b.tempdir_in(dir) = with_prefix_in(b.prefix_str(), dir). So the prefixes "", ".", ".." and "ordinary_" are accepted, with parent = dir. (placement, 2026-10-26) On macOS, when dir is a shared temporary root (temp_dir() as named or as it resolves, /tmp, /private/tmp), "dir" above reads P = quiet_in(dir): dir/.ubd when made_quiet makes or finds it usable (a real directory owned by this user and closed unless sticky, or root-owned, sticky and open to all), else dir; a dir already holding a .ubd component, any other dir, and every dir off macOS give P = dir. "../x", "a/b" and an absolute path are refused and nothing is created. On windows "..\x" and "C:x" are refused too.	crates/aterm-tempfile/src/lib.rs::builder_prefix, crates/aterm-tempfile/src/lib.rs::a_prefix_cannot_escape_the_requested_parent (also the creation half of tempdir_creates_and_cleans_up)	MEDIUM pure core: the SingleNormal lemma needs a model of std's unix (and windows) Path component parser, and the OsStr==str compare inside matches!. The rest: an Option<String> field match, generic impl AsRef<Path> and call0, Path::join, a bounded for 0..5 loop with continue and early returns, io::Error construction and kind(). Effects: DirBuilder::mode(0o700).create (unix) or fs::create_dir, and std::env::temp_dir. Builder::prefix is trust::skip.	0, 1, 3, 4, 5, 7, 8, 11
+tempdir-creates-fresh-private-dir-under-parent	contract	TempDir::{with_prefix_in,new_in,new,made_in}, tempdir, Builder::{new,heard,prefix,prefix_str,tempdir,tempdir_in}, is_quiet, quiet_in, quiet_place, outside_quiet, placed, is_shared_root, made_quiet, call0	(prefix_str) Builder::new().prefix_str() = ".tmp", Builder::new().heard = false, b.heard() sets heard = true, and b.prefix(p).prefix_str() = p, with the last prefix call winning. (with_prefix_in) ∀ prefix, dir, in FsEnv: (a) if ¬SingleNormal(prefix ++ Sfx) (on unix exactly '/' ∈ prefix), the result is Err(InvalidInput) on the first attempt and FsEnv is unchanged. Validity depends only on prefix, because Sfx has no separator. (b) Otherwise, on success it returns Ok(d) with Fresh(d, dir), and d.path().file_name() = Name(prefix,pid,r,c), which starts with prefix. A create that fails with AlreadyExists is retried under a new name, up to 5 attempts in all, and then the result is Err(AlreadyExists). Any other io error is returned unchanged. (instances) tempdir() = TempDir::new() = new_in(temp_dir()) = with_prefix_in(".tmp", temp_dir()). For a Builder b, b.tempdir() = b.tempdir_in(temp_dir()); when ¬b.heard, b.tempdir_in(dir) = with_prefix_in(b.prefix_str(), dir); when b.heard, b.tempdir_in(dir) = made_in(b.prefix_str(), &outside_quiet(dir)), cutting dir at its first .ubd component so the directory is made outside every quiet folder. So the prefixes "", ".", ".." and "ordinary_" are accepted, with parent = dir. (placement, 2026-10-26) On macOS, when dir is a shared temporary root (temp_dir() as named or as it resolves, /tmp, /private/tmp), "dir" in with_prefix_in reads P = quiet_in(dir): dir/.ubd when made_quiet makes or finds it usable (a real directory owned by this user and closed unless sticky, or root-owned, sticky and open to all), else dir; a dir already holding a .ubd component, any other dir, and every dir off macOS give P = dir. "../x", "a/b" and an absolute path are refused and nothing is created. On windows "..\x" and "C:x" are refused too.	crates/aterm-tempfile/src/lib.rs::builder_prefix, crates/aterm-tempfile/src/lib.rs::a_prefix_cannot_escape_the_requested_parent, crates/aterm-tempfile/src/lib.rs::made_in_sets_private_mode_retries_collisions_and_propagates_errors, crates/aterm-tempfile/src/lib.rs::a_shared_roots_directories_go_in_its_quiet_folder, crates/aterm-tempfile/src/lib.rs::tempdirs_in_shared_roots_land_where_fseventsd_drops_their_events, crates/aterm-tempfile/src/lib.rs::a_heard_directory_is_made_outside_every_quiet_folder, crates/aterm-tempfile/src/lib.rs::a_quiet_folder_is_used_only_while_it_is_safe (also the creation half of tempdir_creates_and_cleans_up)	MEDIUM pure core: the SingleNormal lemma needs a model of std's unix (and windows) Path component parser, and the OsStr==str compare inside matches!. The rest: an Option<String> field match, generic impl AsRef<Path> and call0, Path::join, a bounded for 0..5 loop with continue and early returns, io::Error construction and kind(). Effects: DirBuilder::mode(0o700).create (unix) or fs::create_dir, and std::env::temp_dir. Builder::prefix is trust::skip.	0, 1, 3, 4, 5, 7, 8, 11
 tempdir-drop-removes-keep-transfers	contract	Drop for TempDir::drop, TempDir::{keep,path}, AsRef<Path> for TempDir::as_ref	∀ d:TempDir with d.path = q: path(&d) = as_ref(&d) = q. keep(d) returns q and leaves d.path = PathBuf::new() before d is dropped, so that drop does no fs operation and the tree at q, contents included, is unchanged. Dropping a TempDir with a non-empty path calls remove_dir_all(q) and ignores its result. In FsEnv, when remove_dir_all succeeds, q and everything under it no longer exist. Composed with tempdir-creates-fresh-private-dir-under-parent: after a tempdir() guard drops, its path does not exist. After keep the caller alone owns q, and once the caller removes q the parent holds exactly what it held before the child was created.	crates/aterm-tempfile/src/lib.rs::tempdir_creates_and_cleans_up, crates/aterm-tempfile/src/lib.rs::keeping_a_directory_transfers_cleanup_to_the_caller	EASY pure half: mem::take on a struct field (a two-state x'), the consuming self, then the drop-glue order, OsStr::is_empty. The cleanup half is fs::remove_dir_all, an effect. Drop is trust::skip, so until gap 8 that half can only be an assumed platform contract.	0, 1, 2, 4, 8
-stand-in-read-only-shared-inode	contract	stand_in, link_shared, is_stand_in, write_read_only, fnv1a, unique_name	(This is feature stand-in or cfg(test) code, unix only.) ∀ path, body in FsEnv: if path.file_name() is None, stand_in returns Err(InvalidInput) and changes nothing. Let D be path's parent, or "." when that parent is empty. On Ok, SI(path, body) holds, a write through path fails (mode 0555), and D gains no entry other than path: every branch renames or removes the .stand-in.* temp. Calling it again with the same (path, body) is Ok and leaves the same state. Off macOS, each call lays a fresh inode. On macOS, after Ok, ino(path) = ino(Cache(body)) when is_stand_in(Cache(body), cache, body) held or was re-established, and the hard link passed is_stand_in(tmp, D, body). So two stand-ins of one body share one inode, and different bodies get different inodes. A collision of fnv1a(body) only costs a rewrite, because is_stand_in compares the bytes. A cached copy is replaced by a fresh 0555 copy before linking if its mode ≠ 0555, or its bytes ≠ body, or its owner ≠ the cache dir's owner, so a tampered copy is never linked. If the link into D fails (for example, D is read-only), stand_in returns Err and Cache(body) keeps its inode. fnv1a(bytes) is the pure fold in §0.	crates/aterm-tempfile/src/lib.rs::stand_ins_share_one_read_only_inode_per_body	EASY fnv1a (a slice fold with wrapping_mul). HARD rest: Path/&[u8]/String, Vec<u8> compare, format! hex naming, fs symlink_metadata/metadata/read/rename/hard_link/remove_file, OpenOptions create_new+mode, set_permissions, MetadataExt ino/uid/mode, inspect_err closures, cfg(target_os = "macos") branches. Every claim except fnv1a is a filesystem effect. The race freedom the code argues (only an inode's owner can change it) needs a concurrent FS model.	0, 1, 3, 4, 7, 8, 13
+stand-in-read-only-shared-inode	contract	stand_in, shared_stand_in, shared_in, holds, cached_in, write_read_only, fnv1a, euid, unique_name	(stand_in is unix test-support code: cfg(test), debug_assertions or feature test-support. shared_stand_in (doc-hidden), shared_in, holds and cached_in are unix in every profile, for aterm-verify's standin.) holds(me, F, text): F is a regular file (not a link) owned by me, mode 0555, holding exactly text. cached_in(me, tmp, text): with C = Cache(me, tmp), if C cannot be made, or is not a real directory owned by me with no group or other bits (a symlink, another user's, one others may write), the result is None and nothing is made in C. Otherwise for the least k < 4 at which Slot(text, k) is absent, or holds(me, Slot(text, k), text), the result is Some(Slot(text, k)): an absent slot is created (create_new, 0600), written, closed, and only then made 0555, and a write or chmod that fails gives None. A slot that is not that file is passed over and left as it is; no slot is ever renamed, linked or removed. None when all four are passed over. shared_stand_in(text) = shared_in(M, euid, temp_dir(), text) over the process's memo M: M's file F for text while holds(euid, F, text), checked again on every call; else (none yet, or F made writable and written through, or removed) cached_in(euid, temp_dir(), text), which M names from then on, and None, text unnamed in M, when that is None. So racing first writers in several processes can run up to four slots of one text, one per process, and a later process finds the first whole one. stand_in(path, body): if path.file_name() is None, Err(InvalidInput) and nothing changes. Let D be path's parent, or "." when that parent is empty. On macOS when shared_stand_in(body) = Some(F) and a symlink to F can be made at D/.stand-in.<unique_name>, that link is renamed over path; otherwise (and always off macOS) a fresh file there holding body, mode 0555, is renamed over path. On Ok, reading or running path reads or runs body, metadata(path) is mode 0555 with link count 1, a write through path fails, and D gains no entry other than path: a failed rename removes the temp. On macOS two stand-ins of one body one process lays resolve to one F outside every fixture, link count 1, so a fixture going removes no name of the file another fixture's stand-in runs. A collision of fnv1a(text) only costs a slot, because a slot is used only when it holds the bytes. If the temp cannot be made in D (D is read-only), stand_in returns Err and F is unchanged.	crates/aterm-tempfile/src/lib.rs::stand_ins_of_one_body_run_one_file_of_one_name, crates/aterm-tempfile/src/lib.rs::a_stand_in_laid_again_with_another_body_runs_that_body, crates/aterm-tempfile/src/lib.rs::a_stand_in_file_that_no_longer_holds_its_text_is_passed_over, crates/aterm-tempfile/src/lib.rs::the_stand_in_cache_holds_one_read_only_file_per_text, crates/aterm-tempfile/src/lib.rs::a_slot_still_being_written_or_holding_another_text_is_passed_over, crates/aterm-tempfile/src/lib.rs::a_cache_folder_not_the_users_alone_is_refused	EASY fnv1a (a slice fold with wrapping_mul). HARD rest: Path/&[u8]/String, Vec<u8> compare, format! hex naming, a static Mutex<BTreeMap> memo, fs symlink_metadata/metadata/read/rename/symlink/remove_file, DirBuilder and OpenOptions create_new+mode, set_permissions, MetadataExt uid/mode, cfg(target_os = "macos") branches. Every claim except fnv1a is a filesystem effect. The race freedom the code argues (create_new, a slot used only once whole and 0555, no slot ever removed) needs a concurrent FS model.	0, 1, 3, 4, 7, 8, 13
 ```
 
 ### Distribution by kind (4)
@@ -84,7 +86,7 @@ stand-in-read-only-shared-inode	contract	stand_in, link_shared, is_stand_in, wri
 | 1 | 4 | all |
 | 2 | 1 | tempdir-drop-removes-keep-transfers |
 | 3 | 3 | unique-name-format-and-injective, tempdir-creates-fresh-private-dir-under-parent, stand-in-read-only-shared-inode |
-| 4 | 4 | all (each spec composes callee contracts: hex_digit, unique_name, with_prefix_in, write_read_only/is_stand_in, keep→drop) |
+| 4 | 4 | all (each spec composes callee contracts: hex_digit, unique_name, with_prefix_in, write_read_only/cached_in, keep→drop) |
 | 5 | 2 | unique-name-format-and-injective, tempdir-creates-fresh-private-dir-under-parent |
 | 7 | 3 | unique-name-format-and-injective, tempdir-creates-fresh-private-dir-under-parent, stand-in-read-only-shared-inode |
 | 8 | 3 | tempdir-creates-fresh-private-dir-under-parent, tempdir-drop-removes-keep-transfers, stand-in-read-only-shared-inode |
@@ -108,43 +110,54 @@ crates/aterm-tempfile/src/lib.rs	tempdir_creates_and_cleans_up	tempdir-drop-remo
 crates/aterm-tempfile/src/lib.rs	keeping_a_directory_transfers_cleanup_to_the_caller	tempdir-drop-removes-keep-transfers	tempdir-creates-fresh-private-dir-under-parent
 crates/aterm-tempfile/src/lib.rs	builder_prefix	tempdir-creates-fresh-private-dir-under-parent	
 crates/aterm-tempfile/src/lib.rs	a_prefix_cannot_escape_the_requested_parent	tempdir-creates-fresh-private-dir-under-parent	
-crates/aterm-tempfile/src/lib.rs	stand_ins_share_one_read_only_inode_per_body	stand-in-read-only-shared-inode	unique-name-format-and-injective, tempdir-creates-fresh-private-dir-under-parent
-crates/aterm-tempfile/src/lib.rs	windows_os_random_succeeds_and_differs	(none; §4)	
+crates/aterm-tempfile/src/lib.rs	a_shared_roots_directories_go_in_its_quiet_folder	tempdir-creates-fresh-private-dir-under-parent	
+crates/aterm-tempfile/src/lib.rs	tempdirs_in_shared_roots_land_where_fseventsd_drops_their_events	tempdir-creates-fresh-private-dir-under-parent	tempdir-drop-removes-keep-transfers
+crates/aterm-tempfile/src/lib.rs	a_heard_directory_is_made_outside_every_quiet_folder	tempdir-creates-fresh-private-dir-under-parent	
+crates/aterm-tempfile/src/lib.rs	a_quiet_folder_is_used_only_while_it_is_safe	tempdir-creates-fresh-private-dir-under-parent	
+crates/aterm-tempfile/src/lib.rs	made_in_sets_private_mode_retries_collisions_and_propagates_errors	tempdir-creates-fresh-private-dir-under-parent	
+crates/aterm-tempfile/src/lib.rs	stand_ins_of_one_body_run_one_file_of_one_name	stand-in-read-only-shared-inode	unique-name-format-and-injective, tempdir-creates-fresh-private-dir-under-parent, tempdir-drop-removes-keep-transfers
+crates/aterm-tempfile/src/lib.rs	a_stand_in_laid_again_with_another_body_runs_that_body	stand-in-read-only-shared-inode	tempdir-creates-fresh-private-dir-under-parent
+crates/aterm-tempfile/src/lib.rs	a_stand_in_file_that_no_longer_holds_its_text_is_passed_over	stand-in-read-only-shared-inode	
+crates/aterm-tempfile/src/lib.rs	the_stand_in_cache_holds_one_read_only_file_per_text	stand-in-read-only-shared-inode	
+crates/aterm-tempfile/src/lib.rs	a_slot_still_being_written_or_holding_another_text_is_passed_over	stand-in-read-only-shared-inode	
+crates/aterm-tempfile/src/lib.rs	a_cache_folder_not_the_users_alone_is_refused	stand-in-read-only-shared-inode	
+crates/aterm-tempfile/src/lib.rs	windows_os_random_succeeds	(none; §4)	
 ```
 
 ## 3. Coverage
 
-- 7 tests read. 6 map to one of the 4 specs, and 1 is not a spec sample (§4).
-- `tempdir-creates-fresh-private-dir-under-parent` has 2 primary tests and 3 secondary.
-  `tempdir-drop-removes-keep-transfers` has 2 primary tests. The other two specs have 1 each.
-- No test asserts the `0o700` mode, the 5-attempt `AlreadyExists` retry, or the
-  pass-through of other io errors. The specs state them because the code does them. Proving them
-  adds coverage that the tests never had.
+- 16 `#[test]` functions in `src/lib.rs` (including the `.ubd` quiet-folder suite and the stand-in suite of
+  2026-10-28, plus the non-`#[test]` child helper `stand_in_cache_child_if_asked`). `tempdir-creates-fresh-private-dir-under-parent`
+  now directly tests Unix `0o700` mode, the 5-attempt `AlreadyExists` collision retry and exhaustion, and immediate
+  propagation of other `io::Error` kinds (`made_in_sets_private_mode_retries_collisions_and_propagates_errors`).
 
 ## 4. Tests that are not spec samples
 
 | test | why | recommendation |
 |---|---|---|
-| crates/aterm-tempfile/src/lib.rs::windows_os_random_succeeds_and_differs | It is a `cfg(windows)` smoke check of the BCryptGenRandom FFI. The "differs" assertion is probabilistic: it fails with probability 2^-64, which is not a property of the code. The "succeeds" half is an assumption about the OS. It belongs in the FFI assumption channel as an axiom on `read_os_random` (gap 8), and the Rust body cannot prove it. The only provable fact nearby is that `os_random_u64 = from_ne_bytes(buf)` when `read_os_random(buf)`, and `no_csprng_fallback()` otherwise. That is a trivial branch, and no test samples it. | **move-to-bench**: move it to a Windows environment check, outside the unit-test suite, and record the OS-RNG success assumption as the FFI contract of `read_os_random`. |
+| crates/aterm-tempfile/src/lib.rs::windows_os_random_succeeds | It is a `cfg(windows)` smoke check of the BCryptGenRandom FFI (without the former probabilistic `assert_ne!`). It belongs in the FFI assumption channel as an axiom on `read_os_random` (gap 8). | **move-to-bench**: move it to a Windows environment check, outside the unit-test suite, and record the OS-RNG success assumption as the FFI contract of `read_os_random`. |
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **The doc on `unique_name` overclaims.** It says names "do not collide across processes".
-   The test only samples distinctness within one process. Across processes, uniqueness rests on
-   the pid plus OS randomness, or a nanosecond wall clock when no CSPRNG is available. That is
-   probabilistic, not provable. The provable spec is injectivity within one process, through
-   the counter suffix. The doc should say so. The `AlreadyExists` retry is what actually handles a
-   cross-process collision.
-2. **The windows test uses a probabilistic oracle.** `assert_ne!` on two random 8-byte reads
-   can fail by chance, and the test pins an OS service rather than crate behaviour (§4).
+1. **Resolved — `unique_name` doc.** Updated `unique_name`'s doc to state intra-process injectivity via the
+   atomic counter and cross-process collision retry in `TempDir::made_in`.
+2. **Resolved — probabilistic Windows RNG assertion.** Renamed to `windows_os_random_succeeds` and dropped
+   the `2^-64` `assert_ne!` oracle; it now checks deterministic FFI call success on empty and 8-byte slices (§4).
 3. **`tempdir_creates_and_cleans_up` samples a skipped body.** Its cleanup half exercises
    `Drop::drop`, which is `trust::skip`. The spec it implies can only be assumed, not proved
    about the compiled body, until the skip is lifted and gap 8 lands.
 4. **`stand_in` is test-support code with a real contract.** It is
-   `cfg(any(test, feature = "stand-in"))` and never in a shipped build. But other crates' tests
-   reach it through the feature at 117 call sites, so it keeps a real contract and is not
-   test-only code to delete. Its macOS-only branches (the shared inode, the tamper replacement,
-   the failed link that keeps the copy) are unchecked on Linux, where `shared = false` always.
+   `cfg(all(unix, any(test, debug_assertions, feature = "test-support")))`, so no release build
+   of a crate that leaves the feature off compiles it. Other crates' tests reach it at 14 call
+   sites, one of them install.sh's suite's `Scratch::stand_in` (aterm-update's
+   `tests/install_sh`, which aterm-bootstrap-verify's includes), so it keeps a real contract
+   and is not test-only code to delete. The cache under it (`shared_stand_in`, `shared_in`,
+   `holds`, `cached_in`, `fnv1a`, `STAND_IN_CACHE`) compiles in every unix profile, the
+   aterm-tempfile the shipped `aterm` links included, because aterm-verify's `standin` uses it
+   in every profile aterm-verify builds in; `shared_stand_in` is `#[doc(hidden)]`, as
+   `standin` is, and no shipped code calls it. Its macOS-only branch (the symlink to the shared file) is
+   unchecked on Linux, where `shared = false` always; the cache itself (`cached_in`, the slot
+   and folder rules) is checked on every unix, since aterm-verify's `standin` uses it there.
 5. **"The directory of path" is `.` for a bare file name.** When `path.parent()` is empty,
    `stand_in` lays its temp in `.`, which is the directory a bare relative name resolves in, so
    the code is correct. The spec still has to name `D` explicitly, as §1 does, because

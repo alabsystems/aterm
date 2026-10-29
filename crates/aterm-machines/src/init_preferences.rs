@@ -291,29 +291,6 @@ impl AttachedKeyboard {
     }
 }
 
-/// Remove only Caps Lock's live mapping for a verifier's OFF stage, retaining every other mapping.
-pub(crate) fn clear_attached_caps_lock(
-    sys: &dyn System,
-    user: &User,
-    model: keyboard::Model,
-) -> Result<(), String> {
-    let item = AttachedKeyboard {
-        model,
-        user: user.clone(),
-        reading: LastReading::default(),
-    };
-    let maps = item.mappings(sys)?;
-    let want = common_other_mappings(&maps)?;
-    if maps.iter().any(|map| *map != want) {
-        item.set_mappings(sys, &want)?;
-    }
-    let readback = item.mappings(sys)?;
-    if readback.is_empty() || readback.iter().any(|map| *map != want) {
-        return Err("Caps Lock OFF did not read back with the other mappings preserved".into());
-    }
-    Ok(())
-}
-
 impl Item for AttachedKeyboard {
     fn id(&self) -> String {
         format!(
@@ -1545,43 +1522,6 @@ pub(crate) mod tests {
         let _ = item.mappings(&sys).unwrap();
         assert!(matches!(item.probe(&sys, &c), Probe::Ok { .. }));
         assert_eq!(item.detail(&sys, &c), None);
-
-        let before = "RegistryID Key Value\n10002160e UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 123; HIDKeyboardModifierMappingDst = 456; }, { HIDKeyboardModifierMappingSrc = 30064771129; HIDKeyboardModifierMappingDst = 30064771296; } )\n100021604 UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 123; HIDKeyboardModifierMappingDst = 456; }, { HIDKeyboardModifierMappingSrc = 30064771129; HIDKeyboardModifierMappingDst = 30064771296; } )\n";
-        let after = "RegistryID Key Value\n10002160e UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 123; HIDKeyboardModifierMappingDst = 456; } )\n100021604 UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 123; HIDKeyboardModifierMappingDst = 456; } )\n";
-        let off = Fake::root();
-        off.on(&get, Ran::ok(before)).on(&get, Ran::ok(after));
-        let set_others = item.command().args(["--set", "{\"UserKeyMapping\":[{\"HIDKeyboardModifierMappingDst\":456,\"HIDKeyboardModifierMappingSrc\":123}]}"]).display();
-        off.on(&set_others, Ran::ok(""));
-        clear_attached_caps_lock(&off, &item.user, item.model).unwrap();
-        assert!(off.calls().contains(&set_others));
-        assert!(
-            off.calls()
-                .iter()
-                .all(|call| call.contains("PrimaryUsagePage") && call.contains("PrimaryUsage"))
-        );
-
-        for unknown in [
-            "RegistryID Key Value\n",
-            "10002160e UserKeyMapping (garbage)",
-            "10002160e UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 123; HIDKeyboardModifierMappingDst = 456; } )\n100021604 UserKeyMapping (null)\n",
-        ] {
-            let off = Fake::root();
-            off.on(&get, Ran::ok(unknown));
-            assert!(clear_attached_caps_lock(&off, &item.user, item.model).is_err());
-            assert!(!off.calls().iter().any(|call| call.contains("--set")));
-        }
-        let refused = Fake::root();
-        refused.on(&get, Ran::ok(before));
-        refused.refuse_complete_stdout(&get, "incomplete service inventory");
-        assert!(clear_attached_caps_lock(&refused, &item.user, item.model).is_err());
-        assert!(!refused.calls().iter().any(|call| call.contains("--set")));
-
-        let unchanged = Fake::root();
-        unchanged
-            .on(&get, Ran::ok(before))
-            .on(&set_others, Ran::ok(""));
-        assert!(clear_attached_caps_lock(&unchanged, &item.user, item.model).is_err());
-        assert!(unchanged.calls().contains(&set_others));
     }
 
     #[test]

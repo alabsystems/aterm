@@ -68,14 +68,15 @@ impl TerminalHandler<'_> {
     }
 
     /// OSC 7501 (`state=<word>:app=<codex|grok-build>[:kind=<k>]`, `state=clear`), the root record
-    /// only ([`super::program_state`]).
+    /// only ([`super::program_state`]), at the batch's injected wall clock.
     #[inline]
     fn handle_osc_7501(&mut self, params: &[&[u8]]) {
         let [_, body] = params else {
             return;
         };
         if let Ok(body) = std::str::from_utf8(body) {
-            self.program_state.accept(body);
+            self.program_state
+                .accept_at(body, self.transient.process_wall_ms);
         }
     }
 
@@ -337,6 +338,7 @@ impl TerminalHandler<'_> {
             "\x1b\\"
         };
         let response = format!("\x1b]52;{selection_param};{encoded}{terminator}");
+        self.transient.host_io_ordinal = self.transient.host_io_ordinal.wrapping_add(1);
         self.send_response(cap, response.as_bytes());
     }
 
@@ -969,46 +971,18 @@ mod tests {
         );
 
         term.process(b"\x1b]8;;\x07");
+        term.process(b"\x1b]8;;orca%3A://x\x07");
+        assert!(
+            term.current_hyperlink().is_none(),
+            "a scheme with smuggled chars must fail the shared RFC 3986 shape walk"
+        );
+
+        term.process(b"\x1b]8;;\x07");
         term.revoke_hyperlink_scheme("orca");
         term.process(b"\x1b]8;;orca://focus/w3\x07");
         assert!(
             term.current_hyperlink().is_none(),
             "a revoked scheme must be refused again"
-        );
-    }
-
-    #[test]
-    fn authorize_hyperlink_scheme_refuses_javascript_data_file() {
-        let mut term = Terminal::new(24, 80);
-        for s in ["javascript", "data", "file", "vbscript", "about", "blob"] {
-            assert!(
-                !term.authorize_hyperlink_scheme(s),
-                "never-allow scheme {s:?} must be refused even when the host asks"
-            );
-        }
-        assert!(!term.authorize_hyperlink_scheme("JavaScript"));
-        assert!(!term.authorize_hyperlink_scheme("javascript."));
-        term.process(b"\x1b]8;;javascript:alert(1)\x07");
-        assert!(term.current_hyperlink().is_none());
-    }
-
-    #[test]
-    fn authorize_hyperlink_scheme_refuses_malformed_scheme_shapes() {
-        let mut term = Terminal::new(24, 80);
-        for s in [
-            "orca\t", "orca ", "ORCA%3A", "", "1orca", "+orca", ".orca", "-orca", "orc:a",
-        ] {
-            assert!(
-                !term.authorize_hyperlink_scheme(s),
-                "malformed scheme {s:?} must be refused"
-            );
-        }
-        assert_eq!(term.hyperlink_extra_scheme_count(), 0);
-        assert!(term.authorize_hyperlink_scheme("orca"));
-        term.process(b"\x1b]8;;orca%3A://x\x07");
-        assert!(
-            term.current_hyperlink().is_none(),
-            "a scheme with smuggled chars must fail the shared RFC 3986 shape walk"
         );
     }
 
@@ -1062,10 +1036,12 @@ mod tests {
 
     #[test]
     fn osc_52_standard_policy_wildcard_does_not_overgrant_revoked_set() {
+        use crate::terminal::ClipboardAccess;
         use crate::terminal::ClipboardOperation;
         use std::sync::{Arc, Mutex};
 
         let mut term = Terminal::new(24, 80);
+        term.authorize_clipboard_access(ClipboardAccess::Write);
         let captured = Arc::new(Mutex::new(None::<String>));
         let captured_clone = Arc::clone(&captured);
         term.set_clipboard_callback(move |op| {
@@ -1074,6 +1050,14 @@ mod tests {
             }
             None
         });
+        term.process(b"\x1b]52;c;SGVsbG8=\x07");
+        assert_eq!(
+            captured.lock().expect("poisoned").take().as_deref(),
+            Some("Hello"),
+            "authorized Write works before revocation"
+        );
+
+        term.revoke_clipboard_access(ClipboardAccess::Write);
         term.apply_policy_engine(PolicyEngine::new(profiles::standard()));
 
         term.process(b"\x1b]52;c;SGVsbG8=\x07");
@@ -1137,11 +1121,21 @@ mod tests {
 
     #[test]
     fn osc_52_standard_policy_wildcard_does_not_overgrant_revoked_query() {
+        use crate::terminal::ClipboardAccess;
+
         let mut term = Terminal::new(24, 80);
+        term.authorize_clipboard_access(ClipboardAccess::Query);
         term.set_clipboard_callback(|op| match op {
             crate::terminal::ClipboardOperation::Query { .. } => Some("secret".to_string()),
             _ => None,
         });
+        term.process(b"\x1b]52;c;?\x07");
+        assert!(
+            term.take_response().is_some(),
+            "authorized Query answers before revocation"
+        );
+
+        term.revoke_clipboard_access(ClipboardAccess::Query);
         term.apply_policy_engine(PolicyEngine::new(profiles::standard()));
 
         term.process(b"\x1b]52;c;?\x07");

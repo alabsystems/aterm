@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use super::super::config::{Occupancy, SupervisorConfig};
 use super::super::facts::{EpisodeKey, FactKind, SeedOutcome};
 use super::super::memory;
-use super::super::occupancy::door::{self, AtWrite, PaceGrant, StatusSeen, Told};
+use super::super::occupancy::door::{self, AtWrite, LeftRow, PaceGrant, StatusSeen, Told};
 use super::super::occupancy::due::DueClock;
 use super::super::occupancy::fault::{Fault, armed};
 use super::super::occupancy::hold::{self, Close, HoldChange, HoldClock, HoldEvent, RowSaid};
@@ -26,6 +26,14 @@ use super::super::policy::turn_end::{HostTurn, Reach};
 use super::approvals::Outcome;
 use super::turn_end_loop::Written;
 use super::*;
+
+#[path = "occupancy_door_point.rs"]
+mod point;
+
+#[path = "occupancy_door_left.rs"]
+mod left;
+
+pub(super) use left::LookAt;
 
 /// How long a hold stands before it is booked in the ledger.
 pub(super) const HOLD_ROW_MS: i64 = 10 * 60_000;
@@ -177,6 +185,9 @@ enum Wrote {
     Typed,
     /// Its intent was booked, and nothing was written: why.
     Skipped(&'static str),
+    /// Written and not submitted: its line stands left in the composer, the break's one line,
+    /// settled at a look (`Session::left_write`).
+    Left,
 }
 
 /// What a rule's last `OCCUPANCY` line said.
@@ -271,6 +282,9 @@ impl<C: Ctl> Session<'_, C> {
         // `occupancy`, and a successor must not tell them twice.
         let facts = door::seed_rows_in(body, self.setup.sid.as_deref());
         self.facts.state.seed(&facts, now_ms);
+        // And the lines it left in the composer, each owed this loop's first look at it.
+        let lefts = door::left_rows_in(body, self.setup.sid.as_deref());
+        self.facts.state.seed_left(&facts, lefts);
         self.hold.door.claims = Some(
             facts
                 .iter()
@@ -540,10 +554,12 @@ impl<C: Ctl> Session<'_, C> {
     /// THE SEED'S RECONCILE (the slice-2 plan's S4): each wake of `seen` a loop's door holds claimed
     /// (a loop before this one's: this loop claims nothing before its first read) is decided by its
     /// episode's last row in `rows` ([`reconcile_claim`]). A line typed is told
-    /// (`IdleHost::wake_told` through the claim's door) and leaves the book; any other last row
-    /// (an intent the write never came back from, a skip) gives the claim back through that door
-    /// (`IdleHost::wake_release`, the one retell the book allows) and the wake reads ready. Under
-    /// any mode: nothing is typed, and the claim is the book's own.
+    /// (`IdleHost::wake_told` through the claim's door) and leaves the book; a line left in the
+    /// composer keeps its claim, settled at this loop's look as its predecessor's would have been
+    /// (`FactsState::seed_left`); any other last row (an intent the write never came back from, a
+    /// skip) gives the claim back through that door (`IdleHost::wake_release`, the one retell the
+    /// book allows) and the wake reads ready. Under any mode: nothing is typed, and the claim is
+    /// the book's own.
     fn reconcile_claims(host: &dyn IdleHost, seen: &mut WakesSeen, rows: &[(u64, SeedOutcome)]) {
         seen.wakes.retain_mut(|wake| {
             let WakeState::Claimed { door, .. } = wake.state else {
@@ -560,6 +576,7 @@ impl<C: Ctl> Session<'_, C> {
                     wake.state = WakeState::Ready;
                     true
                 }
+                Reconciled::Left => true,
             }
         });
     }
@@ -733,10 +750,11 @@ impl<C: Ctl> Session<'_, C> {
         let door = &self.hold.door;
         let facts = &self.facts.state;
         let told = |id| {
-            facts.is_told(EpisodeKey {
+            let key = EpisodeKey {
                 kind: FactKind::Wake,
                 id,
-            })
+            };
+            facts.is_spoken_for(key)
         };
         let sight = WakeSight {
             seen: &door.wakes,
@@ -898,6 +916,10 @@ impl<C: Ctl> Session<'_, C> {
             Wrote::Held(guard)
         } else if self.facts.state.is_told(key) {
             Wrote::Told
+        } else if self.facts.state.is_left(key) {
+            // Its line stands left in the composer, a draft its own: settled at a look, never
+            // typed again meanwhile.
+            Wrote::Held(Guard::Draft)
         } else {
             let wrote = if let Some(guard) = self.door_holds(screen, &due, cfg, host.as_ref())? {
                 Wrote::Held(guard)
@@ -924,7 +946,9 @@ impl<C: Ctl> Session<'_, C> {
         self.door_k_wrote(&due, wrote);
         self.door_said(&due, wrote, review);
         self.occupancy_tell(cfg.occupancy, self.hold_wall_ms(due.now_ms));
-        Ok(wrote == Wrote::Typed)
+        // A line left in the composer is the break's one line, as a typed one is: nothing else
+        // is written over it at this break.
+        Ok(matches!(wrote, Wrote::Typed | Wrote::Left))
     }
 
     /// What holds the due line at the write, past the decider: the `status` read and the full
@@ -950,8 +974,10 @@ impl<C: Ctl> Session<'_, C> {
     /// The write's guards, judged again on the one `status` read just before it (whose hands
     /// are on the session, the halt, unread input), the task record before the loop's first fold
     /// read it (`Session::managed_at_write`), the composer's read (a composer the read cannot
-    /// judge is a draft) and the host's `taskless`; `Err` with the guard that holds where a read
-    /// itself says nothing (`Guard::Person` for the status, `Guard::Managed` for the record).
+    /// judge is a draft), the host's `taskless` and its reach (`IdleHost::reach_peek`, then
+    /// `IdleHost::reach` on a Down, which holds the line only within its cap:
+    /// `TurnEndTiming::outage_holds_until`); `Err` with the guard that holds where a read itself
+    /// says nothing (`Guard::Person` for the status, `Guard::Managed` for the record).
     /// Every line at a break goes through it: the door's ([`Self::door_holds`]), the stuck
     /// fact's (`Session::stuck_break`, through `door::stuck_at_break`) and the host's own fact's
     /// (`Session::background_fact`). The halt and another driver's hand are the read's word
@@ -990,6 +1016,14 @@ impl<C: Ctl> Session<'_, C> {
         guards.halted = seen.halted;
         guards.draft |= seen.input_unread || self.door_draft(screen) != Some(false);
         guards.taskless |= host.taskless();
+        // The reach read afresh too: the loop's own was read at its last point, before the
+        // background work began. A peek takes no lease; on a Down the ask's lease keeps the probe
+        // measuring, so the break's line goes once it is no longer Down, or once the outage's cap
+        // has passed (a probe wrong about the route holds no break past the cap a point's act is
+        // held to).
+        if self.peeks_down(host) {
+            guards.reach_down |= self.outage_holds(host.reach(), now);
+        }
         if armed(Fault::DoorIgnoresPerson) {
             guards.person = false;
             guards.halted = false;
@@ -1071,12 +1105,23 @@ impl<C: Ctl> Session<'_, C> {
         }
         let point = self.turn_of(screen.clone());
         let grant = super::super::config::BreakGrant::Occupancy(grant);
-        let why = match self.type_fact(grant, &point, text, rule.name(), review)? {
+        let written = self.type_fact(grant, &point, text, rule.name(), review)?;
+        let why = match written {
             Some(Written::Submitted) => None,
             None => Some("unfenced"),
             Some(Written::Not) => Some("not-written"),
             Some(Written::Left) => Some("not-submitted"),
         };
+        let row = LeftRow::Hold {
+            rule,
+            held_ms,
+            declared,
+            since_ms: Some(due.hold.since_ms),
+        };
+        if written == Some(Written::Left) && self.left_write(key, row, text, due.seq, review) {
+            self.door_left(due);
+            return Ok(Wrote::Left);
+        }
         if let Some(why) = why {
             self.door_skipped(due, why, &outcome_row);
             return Ok(Wrote::Skipped(why));
@@ -1127,7 +1172,7 @@ impl<C: Ctl> Session<'_, C> {
             door::INTENT_RULE,
             Outcome::Waiting,
             "",
-            &door::wake_intent_reason(ord, episode, held_ms),
+            &door::wake_intent_reason(ord, episode, held_ms, WakeDoor::Break),
             due.seq,
         );
         let outcome_row = |s: &mut Self, told: Told, text: &str| {
@@ -1139,7 +1184,7 @@ impl<C: Ctl> Session<'_, C> {
                 FactKind::Wake.rule(),
                 outcome,
                 text,
-                &door::wake_outcome_reason(ord, episode, held_ms, told),
+                &door::wake_outcome_reason(ord, episode, held_ms, WakeDoor::Break, told),
                 due.seq,
             );
         };
@@ -1178,12 +1223,23 @@ impl<C: Ctl> Session<'_, C> {
         };
         let point = self.turn_of(screen.clone());
         let grant = super::super::config::BreakGrant::Occupancy(grant);
-        let why = match self.type_fact(grant, &point, &text, RuleId::Wake.name(), review)? {
+        let written = self.type_fact(grant, &point, &text, RuleId::Wake.name(), review)?;
+        let why = match written {
             Some(Written::Submitted) => None,
             None => Some("unfenced"),
             Some(Written::Not) => Some("not-written"),
             Some(Written::Left) => Some("not-submitted"),
         };
+        let row = LeftRow::Wake {
+            ord,
+            held_ms,
+            door: WakeDoor::Break,
+        };
+        if written == Some(Written::Left) && self.left_write(key, row, &text, due.seq, review) {
+            // The claim stays the door's until a look settles the line.
+            self.door_left(due);
+            return Ok(Wrote::Left);
+        }
         if let Some(why) = why {
             host.wake_release(ord, episode, WakeDoor::Break);
             self.door_skipped(due, why, &|s, told| outcome_row(s, told, &text));
@@ -1262,6 +1318,15 @@ impl<C: Ctl> Session<'_, C> {
         row(self, Told::Skipped(why));
     }
 
+    /// A write whose line stands left in the composer ([`Self::left_write`] booked it): tried
+    /// again, should a look release it, only past the session's pace, as a skip is.
+    fn door_left(&mut self, due: &DueLine) {
+        self.hold.door.again = Some((
+            due.episode,
+            due.now_ms.saturating_add(rules::SESSION_PACE_MS),
+        ));
+    }
+
     /// What the K clock is fed at a break, from the decider's `verdicts` on `hold`: each episode
     /// a guard holds, its pace holds or that is due, with the guard. A due line keeps the guard the
     /// door's last write found ([`Self::door_k_wrote`]) until this break's write finds its own: the
@@ -1336,6 +1401,7 @@ impl<C: Ctl> Session<'_, C> {
         let k_due = &mut self.hold.door.k_due;
         let held = match wrote {
             Wrote::Held(guard) => Some(guard),
+            Wrote::Left => Some(Guard::Draft),
             Wrote::Paced(_) | Wrote::Skipped(_) => None,
             Wrote::Typed | Wrote::Told => {
                 k_due.retain(|(_, named, _)| *named != key);
@@ -1350,8 +1416,9 @@ impl<C: Ctl> Session<'_, C> {
         self.door_k(due.now_ms, true);
     }
 
-    /// The write's `OCCUPANCY` line, once a change: `typed`, `skipped why=<word>`,
-    /// `held:<guard>`, `told`, `paced why=<word>` or `refused why=<word>`.
+    /// The write's `OCCUPANCY` line, once a change: `typed`, `skipped why=<word>`, `left` (said
+    /// as the draft it stands as, so the next break's `held:draft` is no change), `held:<guard>`,
+    /// `told`, `paced why=<word>` or `refused why=<word>`.
     fn door_said(&mut self, due: &DueLine, wrote: Wrote, review: &mut dyn Review) {
         let (said, words) = match wrote {
             Wrote::Held(guard) => (Said::Held(guard), format!("held:{}", guard.word())),
@@ -1366,6 +1433,7 @@ impl<C: Ctl> Session<'_, C> {
                 Said::Skipped(due.episode, why),
                 format!("skipped why={why}"),
             ),
+            Wrote::Left => (Said::Held(Guard::Draft), "left".to_string()),
         };
         let last = &mut self.hold.door.said[due.rule.index()];
         if *last == Some(said) {
@@ -1455,9 +1523,21 @@ impl<C: Ctl> Session<'_, C> {
                     self.memory_told,
                     Some(memory::Verdict::Restart | memory::Verdict::Person)
                 ),
-            reach_down: matches!(self.reach_seen, Some(Reach::Down { .. })),
+            reach_down: self
+                .reach_seen
+                .is_some_and(|seen| self.outage_holds(seen, now)),
             mode: cfg.autopilot_for(self.autopilot.word()),
         }
+    }
+
+    /// Whether `reach`, read at `now`, still holds a line (`Guard::Reach`): a measured outage
+    /// within its cap ([`super::super::policy::turn_end::TurnEndTiming::outage_holds_until`]),
+    /// the same bound a point's act is held to, so no stale or wrong Down holds a break past it.
+    fn outage_holds(&self, reach: Reach, now: Instant) -> bool {
+        self.turn_end
+            .timing
+            .outage_holds_until(reach, now)
+            .is_some()
     }
 
     /// A person typed into the session within `grace_s` of `now`, by what the loop holds

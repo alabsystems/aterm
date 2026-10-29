@@ -12,21 +12,30 @@ pub(crate) enum ConfirmKey {
     Cancel,
     /// Not ours: hand the event straight back to AppKit, unmodified.
     PassThrough,
+    /// A key a control client posted (`aterm ctl hwkey`): swallowed, so it neither presses a
+    /// button nor reaches AppKit's own key handling of the alert (Return's default button,
+    /// Space on a focused button). A confirmation is the person's to answer.
+    Drop,
 }
 
 const KVK_RETURN: u16 = 0x24;
 const KVK_KEYPAD_ENTER: u16 = 0x4c;
 const KVK_ESCAPE: u16 = 0x35;
 
-/// What a keystroke means to a native confirmation alert.
+/// What a keystroke means to a native confirmation alert, `posted` being whether a control
+/// client posted it (`crate::hwkey::event_posted`).
 pub(crate) fn confirm_key(
     confirmation_attached: bool,
+    posted: bool,
     _modifier_flags: u64,
     chars_ignoring_modifiers: Option<&str>,
     key_code: u16,
 ) -> ConfirmKey {
     if !confirmation_attached {
         return ConfirmKey::PassThrough;
+    }
+    if posted {
+        return ConfirmKey::Drop;
     }
     match chars_ignoring_modifiers {
         Some("\r" | "\n" | "\u{3}") => ConfirmKey::Accept,
@@ -132,6 +141,26 @@ mod macos {
         }
     }
 
+    /// Whether `event`, held by a native key monitor before dispatch, is a key a control client
+    /// posted with `aterm ctl hwkey`.
+    ///
+    /// # Safety
+    /// `event` is a live `NSEvent` the monitor was handed, read on the main thread.
+    unsafe fn posted_key(event: Id) -> bool {
+        // SAFETY: `-type` is `-(NSEventType)`, valid on any event; `-keyCode` and `-timestamp`
+        // are read only once `-type` said key-down or key-up, the kinds `-keyCode` is defined
+        // for (it raises on others).
+        unsafe {
+            let kind = appkit::send_usize(event, sel!(type));
+            crate::hwkey::is_key_kind(kind)
+                && crate::hwkey::event_posted(crate::hwkey::PostedKey {
+                    kind,
+                    keycode: appkit::send_u16(event, sel!(keyCode)),
+                    timestamp: appkit::send_f64(event, sel!(timestamp)),
+                })
+        }
+    }
+
     fn click(button: Id) {
         // SAFETY: `-performClick:` is `-(void)(id)` on an `NSButton` this watch
         // retains — one of the two buttons added to the alert that is currently on
@@ -162,8 +191,11 @@ mod macos {
                 appkit::send_u16(event, sel!(keyCode)),
             )
         };
-        match confirm_key(attached, modifier_flags, chars.as_deref(), key_code) {
+        // SAFETY: the live event this monitor holds, main thread (`mtm`).
+        let posted = attached && unsafe { posted_key(event) };
+        match confirm_key(attached, posted, modifier_flags, chars.as_deref(), key_code) {
             ConfirmKey::PassThrough => event,
+            ConfirmKey::Drop => Id::NIL,
             ConfirmKey::Accept => {
                 click(accept.id());
                 Id::NIL
@@ -276,8 +308,11 @@ mod macos {
                             input.field_clicked();
                         }
                     }
+                    // A key a control client posted never types into, submits or cancels the
+                    // person's password sheet.
                     if kind == 10
-                        && !input.key_allowed(owns, appkit::send_u16(event, sel!(keyCode)))
+                        && ((owns && posted_key(event))
+                            || !input.key_allowed(owns, appkit::send_u16(event, sel!(keyCode))))
                     {
                         Id::NIL
                     } else {
@@ -369,7 +404,35 @@ mod tests {
     const LETTER_A: (Option<&str>, u16) = (Some("a"), 0x00);
 
     fn action(attached: bool, mods: u64, key: (Option<&str>, u16)) -> ConfirmKey {
-        confirm_key(attached, mods, key.0, key.1)
+        confirm_key(attached, false, mods, key.0, key.1)
+    }
+
+    /// A key a control client posted (`aterm ctl hwkey`) never answers the person's confirmation,
+    /// a multi-line paste's included: Return, keypad Enter, Escape and any other key are
+    /// swallowed while one is up, and pass untouched when none is.
+    /// NEGATIVE CONTROL: without `confirm_key`'s `posted` arm, a posted Return answers Accept
+    /// and a posted Escape Cancel, and the first assertion fails.
+    #[test]
+    fn a_key_a_control_client_posted_never_answers_a_confirmation() {
+        for key in [RETURN, KEYPAD_ENTER, ESCAPE, LETTER_A] {
+            for mods in [0, COMMAND, SHIFT] {
+                assert_eq!(
+                    confirm_key(true, true, mods, key.0, key.1),
+                    ConfirmKey::Drop,
+                    "a posted {key:?} with modifierFlags {mods:#x}"
+                );
+                assert_eq!(
+                    confirm_key(false, true, mods, key.0, key.1),
+                    ConfirmKey::PassThrough,
+                    "a posted {key:?} with no confirmation up"
+                );
+            }
+        }
+        assert_eq!(
+            action(true, 0, RETURN),
+            ConfirmKey::Accept,
+            "CONTROL: the person's Return"
+        );
     }
 
     #[test]

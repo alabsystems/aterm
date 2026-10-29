@@ -143,7 +143,7 @@ pub(crate) struct NeedFacts {
     pub(crate) reset_unix: Option<i64>,
     /// Now, unix seconds.
     pub(crate) now_unix: i64,
-    /// The worker's needs you sets as its loop told the window's host, whole.
+    /// The worker's needs you sets as whoever drives it told them, whole ([`told_of`]).
     pub(crate) told: ToldNeeds,
     /// This machine's Grok Build sign-in, for a Grok session on a sign-in wall alone.
     pub(crate) grok_signin: Option<GrokSignin>,
@@ -162,12 +162,35 @@ impl NeedFacts {
     }
 }
 
+/// THE NEEDS YOU SETS EVERY READER READS FOR `ctx`'s SESSION (the facts' [`NeedFacts::told`],
+/// so the menu bar's rows one level in, the hover's lines and [`HarnessAsk::others`], and `status
+/// needs_told=`), told by whoever drives it: under a proven self-claim, the sets that claim told
+/// of its own entry while it stands (`meta set harness_needs`,
+/// [`crate::session_timeline::SessionMeta::self_needs`]), else the sets aterm's own loop told the
+/// window's host ([`crate::session_timeline::SessionTimeline::harness_needs`]). Each leaf lock is
+/// taken alone, the meta's first.
+#[must_use]
+pub(crate) fn told_of(ctx: &crate::SessionCtx, now_us: u64) -> ToldNeeds {
+    let claimed = ctx
+        .meta
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .self_needs(now_us);
+    claimed.unwrap_or_else(|| {
+        ctx.timeline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .harness_needs()
+    })
+}
+
 /// The worker's needs you as the window holds them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ToldNeeds {
     /// The set told last.
     current: Option<std::sync::Arc<HarnessNeeds>>,
-    /// The set that described the needs entry standing when [`Self::current`] was told.
+    /// The set that described the needs entry standing when [`Self::current`] was told, while
+    /// that entry stands ([`Self::settle`]).
     outgoing: Option<std::sync::Arc<HarnessNeeds>>,
 }
 
@@ -178,6 +201,7 @@ impl ToldNeeds {
         told: Option<std::sync::Arc<HarnessNeeds>>,
         standing: Option<&str>,
     ) -> bool {
+        self.settle(standing);
         if self.current == told {
             return false;
         }
@@ -195,6 +219,20 @@ impl ToldNeeds {
         self.outgoing = outgoing;
         before.as_deref().map(HarnessNeeds::needs)
             != self.reading(standing).map(|held| held.needs())
+    }
+
+    /// DROP AN OUTGOING SET ONCE THE ENTRY IT DESCRIBED NO LONGER STANDS (`standing`, the needs
+    /// owner's entry as stored now): it bridged only until the told set's entry replaced that one,
+    /// so an entry that goes, or gives way to another, takes it, and the same text set again later
+    /// never reads a set its claimant took down. The set told last still waits for its entry.
+    pub(crate) fn settle(&mut self, standing: Option<&str>) {
+        if self
+            .outgoing
+            .as_ref()
+            .is_some_and(|held| held.words_for(standing).is_none())
+        {
+            self.outgoing = None;
+        }
     }
 
     fn reading(&self, standing: Option<&str>) -> Option<&std::sync::Arc<HarnessNeeds>> {
@@ -295,7 +333,8 @@ pub(crate) struct Need {
 pub(crate) struct HarnessAsk {
     /// The first need without the frame, folded to one line.
     pub(crate) first: String,
-    /// How many further needs stand (the told set's others, else the entry's ` (+N more)`).
+    /// How many further needs stand (the told set's others and the needs its entry's ` (+N more)`
+    /// counts past them, else the entry's ` (+N more)`).
     pub(crate) more: u16,
     /// The further needs, whole, in the worker's order.
     pub(crate) others: Vec<String>,
@@ -329,6 +368,22 @@ impl HarnessAsk {
             others,
             program,
         })
+    }
+
+    /// [`Self::told`] beside an entry that counts `counted` further needs (its ` (+N more)`): THE
+    /// ENTRY COUNTS WHAT THE SET DOES NOT CARRY, since a self-claim tells only its first
+    /// `HARNESS_NEEDS_MAX` needs (`meta set harness_needs`) and its entry counts every need past
+    /// the first, so the needs it counts past the told set's own are counted on in [`Self::more`].
+    #[must_use]
+    pub(crate) fn told_counted(
+        needs: &[String],
+        program: aterm_phase::Program,
+        counted: u16,
+    ) -> Option<Self> {
+        let mut ask = Self::told(needs, program)?;
+        let untold = usize::from(counted).saturating_sub(needs.len().saturating_sub(1));
+        ask.more = u16::try_from(ask.others.len().saturating_add(untold)).unwrap_or(u16::MAX);
+        Some(ask)
     }
 
     /// ` (+N more)`, empty where no further need stands.
@@ -864,7 +919,8 @@ fn harness_ask(text: &str, told: Option<&[String]>) -> Option<HarnessAsk> {
         .into_iter()
         .find(|program| program.name().eq_ignore_ascii_case(head.trim()))?;
     let parsed = need_words(text);
-    told.and_then(|needs| HarnessAsk::told(needs, program))
+    let counted = parsed.map_or(0, |words| words.more);
+    told.and_then(|needs| HarnessAsk::told_counted(needs, program, counted))
         .or_else(|| parsed.map(HarnessAsk::of))
         .or_else(|| {
             let (first, _) = without_carrying_on(rest);

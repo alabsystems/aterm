@@ -9,15 +9,21 @@ fn seed(world: &World, at: i64) {
     seat.now = at;
     let roster = seat.bound_roster(Cli::Codex).unwrap();
     let enrolled = accounts::enrolled_for(Cli::Codex, &roster);
-    record_usage(&seat, Cli::Codex, &roster, &enrolled, &|_, home, now| {
-        (home == work).then(|| Usage {
-            sample: Sample {
-                at: now,
-                ..near_wall()
-            },
-            wall: Some((accounts::SESSION_LIMIT, Some(NOW + HOUR))),
-        })
-    })
+    record_usage(
+        &seat,
+        Cli::Codex,
+        &roster,
+        &enrolled,
+        &|_: Cli, home: &Path, _: Option<&str>, now: i64| {
+            (home == work).then(|| Usage {
+                sample: Sample {
+                    at: now,
+                    ..near_wall()
+                },
+                walls: vec![(accounts::SESSION_LIMIT, Some(NOW + HOUR))],
+            })
+        },
+    )
     .unwrap();
 }
 
@@ -45,12 +51,18 @@ fn only_an_accepted_current_sample_gets_the_new_login_context() {
         let before = std::fs::read(store.state_file()).unwrap();
         let roster = seat.bound_roster(Cli::Codex).unwrap();
         let enrolled = accounts::enrolled_for(Cli::Codex, &roster);
-        record_usage(&seat, Cli::Codex, &roster, &enrolled, &|_, home, _| {
-            (home == work).then(|| Usage {
-                sample: Sample { at, ..near_wall() },
-                wall: None,
-            })
-        })
+        record_usage(
+            &seat,
+            Cli::Codex,
+            &roster,
+            &enrolled,
+            &|_: Cli, home: &Path, _: Option<&str>, _: i64| {
+                (home == work).then(|| Usage {
+                    sample: Sample { at, ..near_wall() },
+                    walls: Vec::new(),
+                })
+            },
+        )
         .unwrap();
         let account = world.load(Cli::Codex).account("work");
         let (logins, _) = store.load_logins(NOW).unwrap();
@@ -91,10 +103,10 @@ fn a_declined_same_time_sample_does_not_certify_an_old_context() {
         Cli::Codex,
         &roster,
         &accounts::enrolled_for(Cli::Codex, &roster),
-        &|_, home, _| {
+        &|_: Cli, home: &Path, _: Option<&str>, _: i64| {
             (home == work).then(|| Usage {
                 sample: near_wall(),
-                wall: None,
+                walls: Vec::new(),
             })
         },
     )
@@ -297,7 +309,7 @@ pub(crate) fn context_transition(
                 Cli::Codex,
                 &roster,
                 &enrolled,
-                &|_, home, _| {
+                &|_: Cli, home: &Path, _: Option<&str>, _: i64| {
                     if home != world.home.join(Cli::Codex.accounts().default_home) {
                         reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }

@@ -1,0 +1,172 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# The glass arm: light/wrapped-3row.trail under live glass, every light scheme (foreach-scheme
+# light: the built-ins and the pack themes) drawing Prism Glass's glass ahead of LIVE, so each
+# commit's trail-diff compares glass frames: a 3-row wrapped Claude Code composer.
+
+foreach-scheme light {
+  grid 24 40
+  style rainbow kitty
+  hz 60
+  live glass
+
+  at 0 pty "\e[?2026h\e[?25l\e[H\e[1;1H\e[K\e[2;1H\e[K\e[3;1H\e[K\e[4;1H\e[K\e[5;1H\e[K\e[6;1H\e[K\e[7;1H\e[K\e[8;1H\e[K\e[9;1H\e[K\e[10;1H\e[K\e[11;1H\e[K\e[12;1H⏺ Agent \"Lint pass: the parser crate\" fa\e[K\e[13;1H  ⎿  Backgrounded agent (↓ to manage · c\e[K\e[14;1H⏺ Goal paused · usage limit reached · co\e[K\e[15;1H✻ Cogitated for 1d 11h 24m · done 4:01 P\e[K\e[16;1H❯ keep going, and check the other tab wh\e[K\e[17;1H✽ Whirlpooling… (37s · ↓ 2.5k tokens · t\e[K\e[18;1H\e[K\e[19;1H────────────────────────────────────────\e[K\e[20;1H❯ \e[K\e[21;1H────────────────────────────────────────\e[K\e[22;1H  ⏵⏵ bypass permissions on · 8 shells\e[K\e[23;1H\e[K\e[24;1H\e[K\e[24;1H\e[20;3H\e[?25h\e[?2026l"
+  at 700 key k
+  at 704 pty "\e[?2026h\e[?25l\e[H\r\e[2C\e[19Bk\e[24;1H\e[20;4H\e[?25h\e[?2026l"
+  at 760 key e
+  at 764 pty "\e[?2026h\e[?25l\e[H\r\e[3C\e[19Be\e[24;1H\e[20;5H\e[?25h\e[?2026l"
+  at 820 key e
+  at 824 pty "\e[?2026h\e[?25l\e[H\r\e[4C\e[19Be\e[24;1H\e[20;6H\e[?25h\e[?2026l"
+  at 880 key p
+  at 884 pty "\e[?2026h\e[?25l\e[H\r\e[5C\e[19Bp\e[24;1H\e[20;7H\e[?25h\e[?2026l"
+  at 940 key space
+  at 944 pty "\e[?2026h\e[?25l\e[20;8H\e[?25h\e[?2026l"
+  at 1000 key g
+  at 1004 pty "\e[?2026h\e[?25l\e[H\r\e[7C\e[19Bg\e[24;1H\e[20;9H\e[?25h\e[?2026l"
+  at 1060 key o
+  at 1064 pty "\e[?2026h\e[?25l\e[H\r\e[8C\e[19Bo\e[24;1H\e[20;10H\e[?25h\e[?2026l"
+  at 1120 key i
+  at 1124 pty "\e[?2026h\e[?25l\e[H\r\e[9C\e[19Bi\e[24;1H\e[20;11H\e[?25h\e[?2026l"
+  at 1180 key n
+  at 1184 pty "\e[?2026h\e[?25l\e[H\r\e[10C\e[19Bn\e[24;1H\e[20;12H\e[?25h\e[?2026l"
+  at 1240 key g
+  at 1244 pty "\e[?2026h\e[?25l\e[H\r\e[11C\e[19Bg\e[24;1H\e[20;13H\e[?25h\e[?2026l"
+  at 1300 key ,
+  at 1304 pty "\e[?2026h\e[?25l\e[H\r\e[12C\e[19B,\e[24;1H\e[20;14H\e[?25h\e[?2026l"
+  at 1360 key space
+  at 1364 pty "\e[?2026h\e[?25l\e[20;15H\e[?25h\e[?2026l"
+  at 1420 key a
+  at 1424 pty "\e[?2026h\e[?25l\e[H\r\e[14C\e[19Ba\e[24;1H\e[20;16H\e[?25h\e[?2026l"
+  at 1480 key n
+  at 1484 pty "\e[?2026h\e[?25l\e[H\r\e[15C\e[19Bn\e[24;1H\e[20;17H\e[?25h\e[?2026l"
+  at 1540 key d
+  at 1544 pty "\e[?2026h\e[?25l\e[H\r\e[16C\e[19Bd\e[24;1H\e[20;18H\e[?25h\e[?2026l"
+  at 1600 key space
+  at 1604 pty "\e[?2026h\e[?25l\e[20;19H\e[?25h\e[?2026l"
+  at 1660 key c
+  at 1664 pty "\e[?2026h\e[?25l\e[H\r\e[18C\e[19Bc\e[24;1H\e[20;20H\e[?25h\e[?2026l"
+  at 1720 key h
+  at 1724 pty "\e[?2026h\e[?25l\e[H\r\e[19C\e[19Bh\e[24;1H\e[20;21H\e[?25h\e[?2026l"
+  at 1780 key e
+  at 1784 pty "\e[?2026h\e[?25l\e[H\r\e[20C\e[19Be\e[24;1H\e[20;22H\e[?25h\e[?2026l"
+  at 1840 key c
+  at 1844 pty "\e[?2026h\e[?25l\e[H\r\e[21C\e[19Bc\e[24;1H\e[20;23H\e[?25h\e[?2026l"
+  at 1900 key k
+  at 1904 pty "\e[?2026h\e[?25l\e[H\r\e[22C\e[19Bk\e[24;1H\e[20;24H\e[?25h\e[?2026l"
+  at 1960 key space
+  at 1964 pty "\e[?2026h\e[?25l\e[20;25H\e[?25h\e[?2026l"
+  at 2020 key t
+  at 2024 pty "\e[?2026h\e[?25l\e[H\r\e[24C\e[19Bt\e[24;1H\e[20;26H\e[?25h\e[?2026l"
+  at 2080 key h
+  at 2084 pty "\e[?2026h\e[?25l\e[H\r\e[25C\e[19Bh\e[24;1H\e[20;27H\e[?25h\e[?2026l"
+  at 2140 key e
+  at 2144 pty "\e[?2026h\e[?25l\e[H\r\e[26C\e[19Be\e[24;1H\e[20;28H\e[?25h\e[?2026l"
+  at 2200 key space
+  at 2204 pty "\e[?2026h\e[?25l\e[20;29H\e[?25h\e[?2026l"
+  at 2260 key o
+  at 2264 pty "\e[?2026h\e[?25l\e[H\r\e[28C\e[19Bo\e[24;1H\e[20;30H\e[?25h\e[?2026l"
+  at 2320 key t
+  at 2324 pty "\e[?2026h\e[?25l\e[H\r\e[29C\e[19Bt\e[24;1H\e[20;31H\e[?25h\e[?2026l"
+  at 2380 key h
+  at 2384 pty "\e[?2026h\e[?25l\e[H\r\e[30C\e[19Bh\e[24;1H\e[20;32H\e[?25h\e[?2026l"
+  at 2440 key e
+  at 2444 pty "\e[?2026h\e[?25l\e[H\r\e[31C\e[19Be\e[24;1H\e[20;33H\e[?25h\e[?2026l"
+  at 2500 key r
+  at 2504 pty "\e[?2026h\e[?25l\e[H\r\e[32C\e[19Br\e[24;1H\e[20;34H\e[?25h\e[?2026l"
+  at 2560 key space
+  at 2564 pty "\e[?2026h\e[?25l\e[20;35H\e[?25h\e[?2026l"
+  at 2620 key t
+  at 2624 pty "\e[?2026h\e[?25l\e[H\r\e[34C\e[19Bt\e[24;1H\e[20;36H\e[?25h\e[?2026l"
+  at 2680 key a
+  at 2684 pty "\e[?2026h\e[?25l\e[H\r\e[35C\e[19Ba\e[24;1H\e[20;37H\e[?25h\e[?2026l"
+  at 2740 key b
+  at 2744 pty "\e[?2026h\e[?25l\e[H\r\e[36C\e[19Bb\e[24;1H\e[20;38H\e[?25h\e[?2026l"
+  at 2800 key space
+  at 2804 pty "\e[?2026h\e[?25l\e[H\e[1;1H\e[K\e[2;1H\e[K\e[3;1H\e[K\e[4;1H\e[K\e[5;1H\e[K\e[6;1H\e[K\e[7;1H\e[K\e[8;1H\e[K\e[9;1H\e[K\e[10;1H\e[K\e[11;1H⏺ Agent \"Lint pass: the parser crate\" fa\e[K\e[12;1H  ⎿  Backgrounded agent (↓ to manage · c\e[K\e[13;1H⏺ Goal paused · usage limit reached · co\e[K\e[14;1H✻ Cogitated for 1d 11h 24m · done 4:01 P\e[K\e[15;1H❯ keep going, and check the other tab wh\e[K\e[16;1H✽ Whirlpooling… (37s · ↓ 2.5k tokens · t\e[K\e[17;1H\e[K\e[18;1H────────────────────────────────────────\e[K\e[19;1H❯ keep going, and check the other tab \e[K\e[20;1H  \e[K\e[21;1H────────────────────────────────────────\e[K\e[22;1H  ⏵⏵ bypass permissions on · 8 shells\e[K\e[23;1H\e[K\e[24;1H\e[K\e[24;1H\e[20;3H\e[?25h\e[?2026l"
+  at 2860 key w
+  at 2864 pty "\e[?2026h\e[?25l\e[H\r\e[2C\e[19Bw\e[24;1H\e[20;4H\e[?25h\e[?2026l"
+  at 2920 key h
+  at 2924 pty "\e[?2026h\e[?25l\e[H\r\e[3C\e[19Bh\e[24;1H\e[20;5H\e[?25h\e[?2026l"
+  at 2980 key e
+  at 2984 pty "\e[?2026h\e[?25l\e[H\r\e[4C\e[19Be\e[24;1H\e[20;6H\e[?25h\e[?2026l"
+  at 3040 key n
+  at 3044 pty "\e[?2026h\e[?25l\e[H\r\e[5C\e[19Bn\e[24;1H\e[20;7H\e[?25h\e[?2026l"
+  at 3100 key space
+  at 3104 pty "\e[?2026h\e[?25l\e[20;8H\e[?25h\e[?2026l"
+  at 3160 key y
+  at 3164 pty "\e[?2026h\e[?25l\e[H\r\e[7C\e[19By\e[24;1H\e[20;9H\e[?25h\e[?2026l"
+  at 3220 key o
+  at 3224 pty "\e[?2026h\e[?25l\e[H\r\e[8C\e[19Bo\e[24;1H\e[20;10H\e[?25h\e[?2026l"
+  at 3280 key u
+  at 3284 pty "\e[?2026h\e[?25l\e[H\r\e[9C\e[19Bu\e[24;1H\e[20;11H\e[?25h\e[?2026l"
+  at 3340 key space
+  at 3344 pty "\e[?2026h\e[?25l\e[20;12H\e[?25h\e[?2026l"
+  at 3400 key c
+  at 3404 pty "\e[?2026h\e[?25l\e[H\r\e[11C\e[19Bc\e[24;1H\e[20;13H\e[?25h\e[?2026l"
+  at 3460 key a
+  at 3464 pty "\e[?2026h\e[?25l\e[H\r\e[12C\e[19Ba\e[24;1H\e[20;14H\e[?25h\e[?2026l"
+  at 3520 key n
+  at 3524 pty "\e[?2026h\e[?25l\e[H\r\e[13C\e[19Bn\e[24;1H\e[20;15H\e[?25h\e[?2026l"
+  at 3580 key ;
+  at 3584 pty "\e[?2026h\e[?25l\e[H\r\e[14C\e[19B;\e[24;1H\e[20;16H\e[?25h\e[?2026l"
+  at 3640 key space
+  at 3644 pty "\e[?2026h\e[?25l\e[20;17H\e[?25h\e[?2026l"
+  at 3700 key t
+  at 3704 pty "\e[?2026h\e[?25l\e[H\r\e[16C\e[19Bt\e[24;1H\e[20;18H\e[?25h\e[?2026l"
+  at 3760 key h
+  at 3764 pty "\e[?2026h\e[?25l\e[H\r\e[17C\e[19Bh\e[24;1H\e[20;19H\e[?25h\e[?2026l"
+  at 3820 key e
+  at 3824 pty "\e[?2026h\e[?25l\e[H\r\e[18C\e[19Be\e[24;1H\e[20;20H\e[?25h\e[?2026l"
+  at 3880 key space
+  at 3884 pty "\e[?2026h\e[?25l\e[20;21H\e[?25h\e[?2026l"
+  at 3940 key b
+  at 3944 pty "\e[?2026h\e[?25l\e[H\r\e[20C\e[19Bb\e[24;1H\e[20;22H\e[?25h\e[?2026l"
+  at 4000 key a
+  at 4004 pty "\e[?2026h\e[?25l\e[H\r\e[21C\e[19Ba\e[24;1H\e[20;23H\e[?25h\e[?2026l"
+  at 4060 key n
+  at 4064 pty "\e[?2026h\e[?25l\e[H\r\e[22C\e[19Bn\e[24;1H\e[20;24H\e[?25h\e[?2026l"
+  at 4120 key d
+  at 4124 pty "\e[?2026h\e[?25l\e[H\r\e[23C\e[19Bd\e[24;1H\e[20;25H\e[?25h\e[?2026l"
+  at 4180 key space
+  at 4184 pty "\e[?2026h\e[?25l\e[20;26H\e[?25h\e[?2026l"
+  at 4240 key s
+  at 4244 pty "\e[?2026h\e[?25l\e[H\r\e[25C\e[19Bs\e[24;1H\e[20;27H\e[?25h\e[?2026l"
+  at 4300 key h
+  at 4304 pty "\e[?2026h\e[?25l\e[H\r\e[26C\e[19Bh\e[24;1H\e[20;28H\e[?25h\e[?2026l"
+  at 4360 key o
+  at 4364 pty "\e[?2026h\e[?25l\e[H\r\e[27C\e[19Bo\e[24;1H\e[20;29H\e[?25h\e[?2026l"
+  at 4420 key u
+  at 4424 pty "\e[?2026h\e[?25l\e[H\r\e[28C\e[19Bu\e[24;1H\e[20;30H\e[?25h\e[?2026l"
+  at 4480 key l
+  at 4484 pty "\e[?2026h\e[?25l\e[H\r\e[29C\e[19Bl\e[24;1H\e[20;31H\e[?25h\e[?2026l"
+  at 4540 key d
+  at 4544 pty "\e[?2026h\e[?25l\e[H\r\e[30C\e[19Bd\e[24;1H\e[20;32H\e[?25h\e[?2026l"
+  at 4600 key space
+  at 4604 pty "\e[?2026h\e[?25l\e[20;33H\e[?25h\e[?2026l"
+  at 4660 key r
+  at 4664 pty "\e[?2026h\e[?25l\e[H\r\e[32C\e[19Br\e[24;1H\e[20;34H\e[?25h\e[?2026l"
+  at 4720 key i
+  at 4724 pty "\e[?2026h\e[?25l\e[H\r\e[33C\e[19Bi\e[24;1H\e[20;35H\e[?25h\e[?2026l"
+  at 4780 key d
+  at 4784 pty "\e[?2026h\e[?25l\e[H\r\e[34C\e[19Bd\e[24;1H\e[20;36H\e[?25h\e[?2026l"
+  at 4840 key e
+  at 4844 pty "\e[?2026h\e[?25l\e[H\r\e[35C\e[19Be\e[24;1H\e[20;37H\e[?25h\e[?2026l"
+  at 4900 key space
+  at 4904 pty "\e[?2026h\e[?25l\e[20;38H\e[?25h\e[?2026l"
+  at 4960 key e
+  at 4964 pty "\e[?2026h\e[?25l\e[H\e[1;1H\e[K\e[2;1H\e[K\e[3;1H\e[K\e[4;1H\e[K\e[5;1H\e[K\e[6;1H\e[K\e[7;1H\e[K\e[8;1H\e[K\e[9;1H\e[K\e[10;1H⏺ Agent \"Lint pass: the parser crate\" fa\e[K\e[11;1H  ⎿  Backgrounded agent (↓ to manage · c\e[K\e[12;1H⏺ Goal paused · usage limit reached · co\e[K\e[13;1H✻ Cogitated for 1d 11h 24m · done 4:01 P\e[K\e[14;1H❯ keep going, and check the other tab wh\e[K\e[15;1H✽ Whirlpooling… (37s · ↓ 2.5k tokens · t\e[K\e[16;1H\e[K\e[17;1H────────────────────────────────────────\e[K\e[18;1H❯ keep going, and check the other tab \e[K\e[19;1H  when you can; the band should ride e\e[K\e[20;1H  \e[K\e[21;1H────────────────────────────────────────\e[K\e[22;1H  ⏵⏵ bypass permissions on · 8 shells\e[K\e[23;1H\e[K\e[24;1H\e[K\e[24;1H\e[20;3H\e[?25h\e[?2026l"
+  at 5020 key v
+  at 5024 pty "\e[?2026h\e[?25l\e[H\r\e[2C\e[19Bv\e[24;1H\e[20;4H\e[?25h\e[?2026l"
+  at 5080 key e
+  at 5084 pty "\e[?2026h\e[?25l\e[H\r\e[3C\e[19Be\e[24;1H\e[20;5H\e[?25h\e[?2026l"
+  at 5140 key r
+  at 5144 pty "\e[?2026h\e[?25l\e[H\r\e[4C\e[19Br\e[24;1H\e[20;6H\e[?25h\e[?2026l"
+  at 5200 key y
+  at 5204 pty "\e[?2026h\e[?25l\e[H\r\e[5C\e[19By\e[24;1H\e[20;7H\e[?25h\e[?2026l"
+  at 5260 key space
+  at 5264 pty "\e[?2026h\e[?25l\e[20;8H\e[?25h\e[?2026l"
+  at 5320 key r
+  at 5324 pty "\e[?2026h\e[?25l\e[H\r\e[7C\e[19Br\e[24;1H\e[20;9H\e[?25h\e[?2026l"
+  run 6880
+}

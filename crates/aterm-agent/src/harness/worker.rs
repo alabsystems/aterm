@@ -47,6 +47,9 @@ pub struct WorkerCli {
     /// CLI flag that names the permission mode a fresh start runs in
     /// ([`Fresh::permission_mode`]), and the modes it takes; `None` for a CLI with no such flag.
     pub permission_flag: Option<ModeFlag>,
+    /// CLI flag that lets the run drive the person's own browser ([`Fresh::chrome`]); `None` for a CLI
+    /// with no such flag.
+    pub chrome_flag: Option<&'static str>,
     /// Environment pairs set on a fresh start and dropped first when tight on space.
     pub nicety: &'static [(&'static str, &'static str)],
     /// Starter environment variables naming directories that must be absolute when carried.
@@ -79,6 +82,10 @@ pub const CLAUDE_PERMISSION_MODE: ModeFlag = ModeFlag {
     flag: "--permission-mode",
     modes: &["default", "acceptEdits", "plan", "bypassPermissions"],
 };
+
+/// Claude Code's `--chrome` (2.1.311: "Enable Claude in Chrome integration"): the run drives the
+/// person's own Chrome, where their sign-ins are.
+pub const CLAUDE_CHROME_FLAG: &str = "--chrome";
 
 /// Why a worker carrying an environment (its variables, then the user's home where known) must
 /// not start: a CLI's sign-in floor ([`grok::signed_out`]).
@@ -135,10 +142,14 @@ fn codex_flag_rides(name: &str, tokens: &[String]) -> bool {
             .map_or("", |rest| rest.strip_prefix('=').unwrap_or(rest)),
         [] => "",
     };
-    let key = value.split('=').next().unwrap_or("").trim();
-    !CODEX_OWN_KEYS
-        .iter()
-        .any(|own| key == *own || key.strip_prefix(own).is_some_and(|r| r.starts_with('.')))
+    let key = value.split('=').next().unwrap_or("");
+    let root = key
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches(['"', '\'']);
+    !CODEX_OWN_KEYS.contains(&root)
 }
 
 /// The `CODEX_HOME` and `CODEX_AUTH_PATH` a Codex starter's worker carries:
@@ -173,6 +184,7 @@ pub static WORKERS: [WorkerCli; 5] = [
         model_flag: "--model",
         trust_flag: None,
         permission_flag: Some(CLAUDE_PERMISSION_MODE),
+        chrome_flag: Some(CLAUDE_CHROME_FLAG),
         nicety: &super::relaunch::CLAUDE_LAUNCH_ENV,
         dirs: &[super::accounts::HOME_ENV, super::accounts::HOMEDIR_ENV],
         launches: Launches::Claude,
@@ -187,6 +199,7 @@ pub static WORKERS: [WorkerCli; 5] = [
         model_flag: "--model",
         trust_flag: None,
         permission_flag: None,
+        chrome_flag: None,
         nicety: &[],
         dirs: &[
             super::codex_alab::HOME_ENV,
@@ -210,6 +223,7 @@ pub static WORKERS: [WorkerCli; 5] = [
         model_flag: "--model",
         trust_flag: None,
         permission_flag: None,
+        chrome_flag: None,
         nicety: &[],
         dirs: &[super::upgrade_agy::HOME_ENV],
         launches: Launches::Image {
@@ -226,6 +240,7 @@ pub static WORKERS: [WorkerCli; 5] = [
         model_flag: "--model",
         trust_flag: Some("--trust-workspace"),
         permission_flag: None,
+        chrome_flag: None,
         nicety: &[],
         dirs: &[
             super::upgrade_muse::DATA_ENV,
@@ -251,6 +266,7 @@ pub static WORKERS: [WorkerCli; 5] = [
         model_flag: "--model",
         trust_flag: None,
         permission_flag: None,
+        chrome_flag: None,
         nicety: &[grok::NO_SELF_UPDATE],
         dirs: &[grok::HOME_ENV],
         launches: Launches::Image {
@@ -266,6 +282,36 @@ pub static WORKERS: [WorkerCli; 5] = [
 #[must_use]
 pub fn worker_cli(agent: Program) -> Option<&'static WorkerCli> {
     WORKERS.iter().find(|w| w.agent == agent)
+}
+
+/// The Codex program a launch aterm makes runs where it finds no starter's own: the program
+/// Codex's row types then ([`WorkerCli::unstarted`]), atpkg's managed twin where it execs
+/// codex-alab, else the bare word `codex`. The bare word is what the worker's own shell finds on
+/// its `PATH`, which aterm does not read before it types the line, so it names no build aterm can
+/// read ([`super::codex_alab::AuthPathUnread::Unnamed`]) and keeps no row's login its own,
+/// whatever `~/.local/bin/codex` is. The judges of whether a launch keeps a row's
+/// `CODEX_AUTH_PATH` login its own read this program where no starter's own program is found:
+/// the accounts report's `next:`, `accounts login|renew`, and the `aterm ai` pool facts (`aterm
+/// ai login`, `aterm ai review`).
+#[must_use]
+pub fn codex_launch_program() -> PathBuf {
+    codex_launch_program_by(super::upgrade_drive::managed_agent_twin)
+}
+
+/// [`codex_launch_program`] with atpkg's managed twin found in `agents`, the `agents/` directory
+/// of an atpkg layout a caller already holds (`None`: no layout, so no twin), as
+/// [`WorkerCli::unstarted`] finds it in the configured one.
+#[must_use]
+pub fn codex_launch_program_in(agents: Option<&Path>) -> PathBuf {
+    codex_launch_program_by(|word| super::upgrade_drive::twin_naming(&agents?.join(word), word))
+}
+
+/// [`codex_launch_program`] with atpkg's managed twin of the Codex row's word read by `twin`.
+fn codex_launch_program_by(twin: impl FnOnce(&str) -> Option<PathBuf>) -> PathBuf {
+    let Some(cli) = worker_cli(Program::Codex) else {
+        return PathBuf::from("codex");
+    };
+    cli.unstarted_by(|| twin(cli.word)).exe
 }
 
 /// The words of the [`WORKERS`] a `spawn` starts, as a usage line names them (`claude|…`): none
@@ -318,21 +364,17 @@ impl WorkerCli {
         ))
     }
 
-    /// The atpkg program `spawn agent=<word>` installs where it is absent: a vendor row outside
-    /// the default set (Grok Build), which no machine installs unasked, so a lead naming it is
-    /// the opt-in; once installed, atpkg's update pass keeps it current. `None` for a row the
-    /// default set keeps (its pass installs it) and for one atpkg does not ship.
+    /// The atpkg program this row runs: the `atpkg::vendor_direct::VENDORS` row of its word, every
+    /// one in atpkg's default set. `None` for a program atpkg does not ship.
     #[must_use]
-    pub fn on_demand(&self) -> Option<&'static str> {
-        atpkg::vendor_direct::spec(self.word)
-            .filter(|spec| !spec.default_set)
-            .map(|spec| spec.program)
+    pub fn atpkg_program(&self) -> Option<&'static str> {
+        atpkg::vendor_direct::spec(self.word).map(|spec| spec.program)
     }
 
     /// Why a worker on `starter` must not start under the user's home `user` (`None`: not
     /// known): a CLI that, signed out, opens a sign-in page by itself and never reads its task
     /// (Grok Build, [`grok::signed_out`]). `None` to start it. [`admit`] asks this first, before
-    /// anything is installed.
+    /// atpkg's store is read or anything is installed.
     #[must_use]
     pub fn signed_out(&self, starter: &Starter, user: Option<&Path>) -> Option<String> {
         self.login.and_then(|login| login(&starter.env, user))
@@ -379,43 +421,51 @@ impl WorkerCli {
 }
 
 /// What a worker's launcher found of the program its CLI runs ([`ensure_program`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Readiness {
-    /// A program the default set keeps, or one atpkg does not ship: nothing to install.
-    Kept,
-    /// An on-demand program ([`WorkerCli::on_demand`]) already installed.
+    /// A program atpkg does not ship ([`WorkerCli::atpkg_program`]): nothing to install.
+    Unshipped,
+    /// atpkg's store holds a build of it.
     Present,
-    /// An on-demand program atpkg's verified install laid just now.
+    /// atpkg's verified install laid it just now.
     Installed,
+    /// atpkg's store holds no build of it and installs none here: why, in the launcher's words
+    /// ([`Admitted::kept_off`]). The line runs any copy of the shell's own.
+    KeptOff(String),
 }
 
-/// Make sure the program `cli` runs is there before its worker's line is typed: an on-demand
-/// program ([`WorkerCli::on_demand`]) that is not `present` is installed by `install` (atpkg's
-/// verified install, as `aterm pkg install <program>` runs it), unless `held` names why a person
-/// keeps it off this machine (`[packages] exclude`, or a removal), which a lead's spawn does not
-/// override.
+/// Make sure the program `cli` runs is there before its worker's line is typed. Every program
+/// atpkg ships is in its default set, so its update pass lands one on every Mac it serves; a
+/// spawn that comes first (a fresh Mac before that pass lands it, or one whose install failed)
+/// installs it now by `install` (atpkg's verified install, as `aterm pkg install <program>`
+/// runs it) where `present` finds no build in atpkg's store, so the line never types a program
+/// that is not there. `held` names why atpkg installs no copy here, where it does not (a person's
+/// `[packages] exclude`, removal or no to unattended installs, which a lead's spawn does not
+/// override, or no atpkg that can install it on this Mac): then nothing is installed, and the
+/// launcher says so and runs any copy of the shell's own. `held` is asked only of an absent
+/// program, and `install` only of one nobody holds.
 ///
 /// # Errors
 ///
-/// Why no worker can start: the program is held back, its install failed, or the install left
-/// nothing installed (atpkg serves no build for this machine).
+/// Why no worker can start: the install failed (atpkg's words), or it left nothing installed.
 pub fn ensure_program(
     cli: &WorkerCli,
     present: impl Fn(&str) -> bool,
     held: impl FnOnce(&str) -> Option<String>,
     install: impl FnOnce(&str) -> Result<(), String>,
 ) -> Result<Readiness, String> {
-    let Some(program) = cli.on_demand() else {
-        return Ok(Readiness::Kept);
+    let Some(program) = cli.atpkg_program() else {
+        return Ok(Readiness::Unshipped);
     };
     if present(program) {
         return Ok(Readiness::Present);
     }
     if let Some(why) = held(program) {
-        return Err(format!(
-            "{program} is not installed and {why}, so `spawn agent={}` installs nothing",
+        return Ok(Readiness::KeptOff(format!(
+            "atpkg keeps no {program} here ({why}), and `spawn agent={}` installs none, so the \
+             line runs any {program} of the shell's own",
             cli.word
-        ));
+        )));
     }
     install(program).map_err(|why| format!("atpkg's install of {program} failed: {why}"))?;
     if !present(program) {
@@ -433,7 +483,7 @@ pub enum Refused {
     /// The CLI is signed out for the login its line would start on ([`WorkerCli::signed_out`]).
     /// Only a person can sign in.
     SignedOut(String),
-    /// The CLI's program is not installed and is held back, or its install failed
+    /// atpkg's install of the CLI's absent program failed, or left nothing installed
     /// ([`ensure_program`]).
     Program(String),
 }
@@ -465,8 +515,18 @@ impl Admitted {
 
     /// What admission found of the CLI's program.
     #[must_use]
-    pub const fn readiness(&self) -> Readiness {
-        self.readiness
+    pub const fn readiness(&self) -> &Readiness {
+        &self.readiness
+    }
+
+    /// What the launcher says where atpkg's store holds no build of the CLI's program and
+    /// installs none here ([`Readiness::KeptOff`]).
+    #[must_use]
+    pub fn kept_off(&self) -> Option<&str> {
+        match &self.readiness {
+            Readiness::KeptOff(said) => Some(said),
+            _ => None,
+        }
     }
 
     /// `starter` taken as admitted, for this crate's line tests.
@@ -474,17 +534,17 @@ impl Admitted {
     pub(crate) const fn assumed(starter: Starter) -> Self {
         Self {
             starter,
-            readiness: Readiness::Kept,
+            readiness: Readiness::Unshipped,
         }
     }
 }
 
 /// ADMIT A WORKER BEFORE ITS LINE IS WRITTEN, SIGN-IN FIRST. A CLI that, signed out, opens a
-/// sign-in page by itself ([`WorkerCli::signed_out`]) is refused before anything is installed.
-/// Installing it would put a signed-out program on every shell's `PATH` (atpkg lays its
-/// `agents/<program>` twin), where any agent that typed its name would open that page in the
-/// person's browser. Only a starter that passes the sign-in check gets
-/// [`ensure_program`]'s install, through `present`, `held` and `install`.
+/// sign-in page by itself ([`WorkerCli::signed_out`]) is refused before atpkg's store is read or
+/// anything is installed: installing it would put a signed-out program on every shell's `PATH`
+/// (atpkg lays its `agents/<program>` twin), and its line would open that page in the person's
+/// browser. Only a starter that passes the sign-in check gets [`ensure_program`]'s install,
+/// through `present`, `held` and `install`.
 ///
 /// # Errors
 ///
@@ -578,6 +638,9 @@ pub struct Fresh<'a> {
     /// `--permission-mode`: the mode the CLI starts in, one its [`WorkerCli::permission_flag`]
     /// takes, or `None` for the one its settings name.
     pub permission_mode: Option<&'a str>,
+    /// Whether the run drives the person's own browser: the CLI's [`WorkerCli::chrome_flag`] (a claim
+    /// worker's, [`super::credit_offers::claim_task`]).
+    pub chrome: bool,
 }
 
 /// Format the shell command line a worker runs at its first prompt, for the starter [`admit`]
@@ -670,7 +733,20 @@ pub(super) fn line_of(
         }
         (Some(mode), Some(flag)) => Some((flag.flag, mode)),
     };
+    let chrome = match (fresh.chrome, cli.chrome_flag) {
+        (false, _) => None,
+        (true, Some(flag)) => Some(flag),
+        (true, None) => {
+            return Err(format!(
+                "{} has no browser flag, so its worker cannot drive the person's browser",
+                cli.agent.product()
+            ));
+        }
+    };
     let mut flags: Vec<String> = args.to_vec();
+    if let Some(flag) = chrome {
+        flags.push(flag.to_string());
+    }
     if let Some(flag) = cli.trust_flag.filter(|_| fresh.trusted_here) {
         flags.push(flag.to_string());
     }

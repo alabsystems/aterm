@@ -639,21 +639,44 @@ fn band_fp_is_zero_with_no_row_and_moves_only_with_what_it_draws() {
         for geom in [g, wide] {
             for motion in [0u64, 0x1234] {
                 assert_eq!(band_fp(0, hover, geom, motion), 0, "no row, no key");
+                let fp = band_fp(0x1234_5678, hover, geom, motion);
+                assert_eq!(fp & 1, 1, "non-empty band_fp is odd");
+                assert_eq!(
+                    fp,
+                    band_fp(0x1234_5678, hover, geom, motion),
+                    "the same inputs, the same key"
+                );
             }
         }
     }
-    let fp = 0x1234_5678_u64;
-    let key = band_fp(fp, None, g, 0);
-    assert_ne!(key, 0);
-    assert_eq!(
-        key,
-        band_fp(fp, None, g, 0),
-        "the same inputs, the same key"
-    );
-    assert_ne!(key, band_fp(fp, hovers[1], g, 0), "a hover moves it");
-    assert_ne!(key, band_fp(fp, None, wide, 0), "the window moves it");
-    assert_ne!(key, band_fp(fp, None, g, 0x1234), "a frame moves it");
-    assert_ne!(band_fp(fp, None, g, 0x1234), band_fp(fp, None, g, 0x5678));
+    for center_fp in [1u64, 2u64, 0x1234_5678, u64::MAX] {
+        for motion in [0u64, 0x1234] {
+            let mut seen = std::collections::HashSet::new();
+            assert!(seen.insert(band_fp(center_fp, None, g, motion)));
+            for row in [0u8, 1, 2, 255] {
+                assert!(seen.insert(band_fp(
+                    center_fp,
+                    Some(Hover {
+                        row,
+                        target: HoverTarget::Body,
+                    }),
+                    g,
+                    motion
+                )));
+                for k in [0u8, 1, 8, 254, 255] {
+                    assert!(seen.insert(band_fp(
+                        center_fp,
+                        Some(Hover {
+                            row,
+                            target: HoverTarget::Capsule(ActionIndex(k)),
+                        }),
+                        g,
+                        motion
+                    )));
+                }
+            }
+        }
+    }
     let now = t0();
     let mut center = MessageCenter::new(MessageLog::empty(), now);
     center.post(
@@ -673,17 +696,17 @@ fn band_fp_is_zero_with_no_row_and_moves_only_with_what_it_draws() {
             .motion(&p, now + crate::ANIM_FRAME * k, look)
             .fingerprint()
     };
-    assert_ne!(at(0, Look::STILL), 0, "the still track is drawn");
+    assert_eq!(at(0, Look::STILL) & 1, 1, "the still track is odd");
     assert_eq!(
         at(0, Look::STILL),
         at(90, Look::STILL),
         "still: no motion term moves"
     );
-    assert_ne!(
-        at(0, Look::MOVING),
-        at(4, Look::MOVING),
-        "moving: the frames move the key"
-    );
+    for k in [0u32, 4] {
+        let mfp = at(k, Look::MOVING);
+        assert_eq!(mfp & 1, 1, "moving frame fingerprint is odd");
+        assert_eq!(mfp, at(k, Look::MOVING), "deterministic per frame");
+    }
 }
 
 #[test]

@@ -26,7 +26,9 @@ use aterm_effects::aos_momentum::search::{
     FileProposer, GridProposer, Mode, Proposer, ProposerId, SearchStats, TrainFeedback,
 };
 
-use crate::aos_workers::{Fault, Pool, PoolArgs, PoolReport, Timed, available, percentiles};
+use crate::aos_workers::{
+    Fault, Phase, Pool, PoolArgs, PoolReport, Timed, available, percentiles, say,
+};
 use crate::instance::{take_flag, take_value, take_values};
 use crate::lab_build::{LAB_BUILD, check_build};
 use crate::paths::{from_caller, paths};
@@ -60,12 +62,17 @@ the wall time and the events the evaluator stepped. One search per proposer, gri
                     `distributed`, and its admitted count rests on workers' claims) or `all` (every admitted claim
                     judged in full; mode `search`)
   --lease-ms MS     (debug builds, with --workers) the lease window, for tests
-  --frames          (debug builds, with --workers) say each worker frame taken and the step it takes on stderr, for
-                    tests' hang detector
+  --hello-ms MS     (debug builds, with --workers) how long a worker may take from its spawn to say hello, for tests:
+                    a test sets it past the run, so a loaded host's slow evaluator build is judged as a stall
+  --grace-ms MS     (debug builds, with --workers) the drain grace after a Cancel, for tests: a test sets it past
+                    the run, so a slow worker's late work is judged however loaded the host
+  --frames          (debug builds, with --workers) say each worker frame taken and the step it takes on stderr, and
+                    each stretch of the coordinator's own work after a search's last claim (check, held-out, verify)
+                    as it begins, for tests' hang detector
   --fault SPEC      (debug builds, with --workers; repeatable) a test fault armed on every worker: NAME@G.S.A[:K]
                     on search serial G, slot S, attempt A (kill, hang and slow take :K; late, late-lie, dup,
-                    dup-lie, post-lie, lie-refusal, lie-best, inflate, garbage, flood do not), or foreign@W
-  --verify FILE     no search: decode the bundle FILE and verify it (CandidateBundle::verify, every row re-evaluated)
+                    dup-lie, close-lie, lie-refusal, lie-best, inflate, garbage, flood do not), or foreign@W
+  --verify FILE     no search: decode the bundle FILE and verify it (CandidateBundle::verify_spread on every core, every row re-evaluated)
                     under an evaluator of this lab's build; a bundle of another build is refused ForeignBuild, and one
                     of a dirty build DirtyBuild, before any evaluator is built. One line per check (pass, fail, not-run,
                     none or declared), then `aos-search verify=pass|fail reason=...`
@@ -115,6 +122,8 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
     let workers = take_value(&mut a, "--workers")?;
     let check = take_value(&mut a, "--check")?;
     let lease_ms = take_value(&mut a, "--lease-ms")?;
+    let hello_ms = take_value(&mut a, "--hello-ms")?;
+    let grace_ms = take_value(&mut a, "--grace-ms")?;
     let faults = take_values(&mut a, "--fault")?;
     let frames = take_flag(&mut a, "--frames");
     if let Some(extra) = a.first() {
@@ -159,33 +168,44 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
             )));
         }
     };
-    if lease_ms.is_some() || !faults.is_empty() || frames {
+    if lease_ms.is_some()
+        || hello_ms.is_some()
+        || grace_ms.is_some()
+        || !faults.is_empty()
+        || frames
+    {
         if workers.is_none() {
             return Err(Fail::usage(
-                "aos-search: --lease-ms, --fault and --frames are for --workers",
+                "aos-search: --lease-ms, --hello-ms, --grace-ms, --fault and --frames are for \
+                 --workers",
             ));
         }
         if !cfg!(debug_assertions) {
             return Err(Fail::usage(
-                "aos-search: --lease-ms, --fault and --frames exist in debug builds only",
+                "aos-search: --lease-ms, --hello-ms, --grace-ms, --fault and --frames exist in \
+                 debug builds only",
             ));
         }
     }
-    let lease_ms = lease_ms
-        .map(|v| {
+    let millis = |flag: &str, v: Option<String>| {
+        v.map(|v| {
             v.parse::<u64>().ok().filter(|&ms| ms >= 1).ok_or_else(|| {
-                Fail::usage(format!(
-                    "aos-search: --lease-ms takes milliseconds, not '{v}'"
-                ))
+                Fail::usage(format!("aos-search: {flag} takes milliseconds, not '{v}'"))
             })
         })
-        .transpose()?;
+        .transpose()
+    };
+    let lease_ms = millis("--lease-ms", lease_ms)?;
+    let hello_ms = millis("--hello-ms", hello_ms)?;
+    let grace_ms = millis("--grace-ms", grace_ms)?;
     for f in &faults {
         Fault::parse(f).map_err(|why| Fail::usage(format!("aos-search: {why}")))?;
     }
     let workers = workers.map(|workers| PoolArgs {
         workers,
         lease_ms,
+        hello_ms,
+        grace_ms,
         faults,
         frames,
     });
@@ -319,6 +339,9 @@ fn distributed<P: Proposer>(
             return Err(Ended::Void(Refusal::Dist(no)));
         }
     }
+    if pool.frames() {
+        say(pool.serial(), Phase::Check);
+    }
     let width = available();
     let threads = Threads(width);
     let timed = Timed::new(&threads);
@@ -361,6 +384,7 @@ fn search<P: Proposer>(
     let stepped_before = ev.stepped();
     let started = Instant::now();
     let mut claimed = None;
+    let frames = matches!(&how, How::Workers(p, _) if p.frames());
     let picked = match how {
         How::Serial => ev.select(&mut rec).map_err(Ended::No),
         How::Threads(n) => ev.select_spread(&mut rec, &Threads(n)).map_err(Ended::No),
@@ -375,6 +399,16 @@ fn search<P: Proposer>(
             None
         }
     };
+    // The search's serial, when `--frames` says the coordinator's own stretches as steps.
+    let said = claimed
+        .as_ref()
+        .filter(|_| frames)
+        .map(|c: &Claimed| c.serial);
+    if let Some(serial) = said
+        && picked.is_ok()
+    {
+        say(serial, Phase::HeldOut);
+    }
     let reading = Instant::now();
     let outcome = picked.and_then(|selection| ev.held_out(selection).map_err(Ended::No));
     let held_out = outcome.is_ok().then(|| reading.elapsed());
@@ -402,6 +436,9 @@ fn search<P: Proposer>(
             let useful = admitted.useful();
             let bundle = admitted.into_bundle();
             let bytes = bundle.encode();
+            if let Some(serial) = said {
+                say(serial, Phase::Verify);
+            }
             let verifying = Instant::now();
             let verified = CandidateBundle::verify(&bytes, ev)
                 .map_err(|r| format!("the winner's bundle does not verify: {r}"))?;
@@ -1365,7 +1402,7 @@ fn run_checks<E: Borrow<Evaluator>>(
         ev.corpus_digest().short()
     );
     let started = Instant::now();
-    let verdict = CandidateBundle::verify(bytes, ev);
+    let verdict = CandidateBundle::verify_spread(bytes, ev, &Threads(available()));
     reached.measured = Some((build_time, started.elapsed()));
     verdict.map(|_| ()).map_err(VerifyRefusal::Bundle)
 }
@@ -2212,6 +2249,8 @@ not a plan
         assert!(usage_of(&["--grid", "--out", "o", "--workers", "17"]).contains("takes 1 to"));
         assert!(usage_of(&["--grid", "--out", "o", "--threads", "0"]).contains("takes 1 to"));
         assert!(usage_of(&["--grid", "--out", "o", "--lease-ms", "10"]).contains("for --workers"));
+        assert!(usage_of(&["--grid", "--out", "o", "--grace-ms", "10"]).contains("for --workers"));
+        assert!(usage_of(&["--grid", "--out", "o", "--hello-ms", "10"]).contains("for --workers"));
         assert!(
             usage_of(&["--grid", "--out", "o", "--fault", "dup@1.0.1"]).contains("for --workers")
         );
@@ -2236,6 +2275,10 @@ not a plan
                 "2",
                 "--lease-ms",
                 "10000",
+                "--hello-ms",
+                "86400000",
+                "--grace-ms",
+                "60000",
                 "--fault",
                 "dup@1.0.1",
                 "--fault",
@@ -2243,7 +2286,10 @@ not a plan
             ]))
             .expect("parses");
             let p = a.workers.expect("workers");
-            assert_eq!(p.lease_ms, Some(10_000));
+            assert_eq!(
+                (p.lease_ms, p.hello_ms, p.grace_ms),
+                (Some(10_000), Some(86_400_000), Some(60_000))
+            );
             assert_eq!(
                 p.faults,
                 vec!["dup@1.0.1".to_owned(), "foreign@1".to_owned()]
@@ -2262,6 +2308,10 @@ not a plan
             );
             assert!(
                 usage_of(&["--grid", "--out", "o", "--workers", "2", "--lease-ms", "0"])
+                    .contains("milliseconds")
+            );
+            assert!(
+                usage_of(&["--grid", "--out", "o", "--workers", "2", "--grace-ms", "0"])
                     .contains("milliseconds")
             );
         }

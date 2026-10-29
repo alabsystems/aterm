@@ -39,7 +39,15 @@ use crate::dispatch::run_on_main;
 /// let seven = bound.get_on_main(|rc| **rc);
 /// assert_eq!(seven, 7);
 /// ```
+#[repr(transparent)]
 pub struct MainThreadBound<T>(ManuallyDrop<T>);
+
+const _: () = {
+    assert!(size_of::<MainThreadBound<u64>>() == size_of::<u64>());
+    assert!(align_of::<MainThreadBound<u64>>() == align_of::<u64>());
+    assert!(size_of::<MainThreadBound<[u8; 3]>>() == size_of::<[u8; 3]>());
+    assert!(align_of::<MainThreadBound<[u8; 3]>>() == align_of::<[u8; 3]>());
+};
 
 // SAFETY: born, read and dropped only on the main thread (`new`, `get`, `get_mut` and `into_inner`
 // take a `MainThread` witness; `Drop` runs through `run_on_main`), so what crosses threads is an

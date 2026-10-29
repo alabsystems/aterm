@@ -18,6 +18,7 @@ fn an_orphan_is_named_with_its_remedy_and_a_live_one_is_not() {
     };
     let note = foreign_note_text(&[(42199, "/tmp/aq/a.sock", &orphan)]).expect("a note");
     assert!(note.contains("`kill 42199`"), "{note}");
+    assert!(note.contains("up 7d 1h"), "{note}");
 
     let live = ForeignFacts::Writer {
         parent: Parent::Other,
@@ -26,6 +27,7 @@ fn an_orphan_is_named_with_its_remedy_and_a_live_one_is_not() {
     };
     let note = foreign_note_text(&[(7, "/tmp/b.sock", &live)]).expect("a note");
     assert!(!note.contains("kill"), "{note}");
+    assert!(note.contains("up 1m 30s"), "{note}");
     assert_eq!(foreign_note_text(&[]), None);
     assert_eq!(ForeignFacts::default().describe(), None);
 }

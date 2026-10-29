@@ -288,6 +288,7 @@ fn a_restored_holder_adopted_before_the_first_sweep_is_still_named() {
     crate::spawn::adopt_restored_holder(
         &term,
         &timeline,
+        &crate::command_ran::RanFeed::blind(std::sync::Arc::default(), pid),
         i32::MAX,
         pid,
         app.session_factory.fg_probe,

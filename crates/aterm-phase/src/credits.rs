@@ -6,17 +6,18 @@
 /// Which window a notice names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Window {
-    /// The five-hour window (`session limit`).
+    /// The five-hour window (`5-hour limit` from 2.1.312, `session limit` before).
     Session,
     /// The seven-day window (`weekly limit`).
     Weekly,
 }
 
 impl Window {
-    /// The vendor's limit name after `Your ` / `of your ` → its window.
+    /// The vendor's limit name after `Your ` / `of your ` → its window: 2.1.312 names the
+    /// five-hour window `5-hour limit` (`Wce.five_hour`), the builds before it `session limit`.
     fn of_name(name: &str) -> Option<Window> {
         match name {
-            "session limit" => Some(Window::Session),
+            "5-hour limit" | "session limit" => Some(Window::Session),
             "weekly limit" => Some(Window::Weekly),
             _ => None,
         }
@@ -157,7 +158,7 @@ fn started(rest: &str) -> Started {
     }
 }
 
-/// The vendor's warning that the session or the weekly window is filling (module docs): `You've used <n>% of your session limit · resets <time>`, or of the `weekly limit`.
+/// The vendor's warning that the session or the weekly window is filling (module docs): `You've used <n>% of your session limit · resets <time>` (`5-hour limit` from 2.1.312), or of the `weekly limit`.
 #[must_use]
 pub fn usage_warning(rows: &[String]) -> Option<Warning> {
     let lead = const { crate::anchor!("usage.warning") };

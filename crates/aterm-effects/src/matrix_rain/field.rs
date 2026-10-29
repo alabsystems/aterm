@@ -28,11 +28,20 @@ pub const fn rain_hash32(mut x: u32) -> u32 {
     x
 }
 
-/// Half-open LSB-first bit slice `(x >> a) & ((1 << (b - a)) - 1)`.
+/// Half-open LSB-first bit slice `(x >> a) & ((1 << (b - a)) - 1)`, returning `0` when `a >= 32` or `b <= a`.
 #[must_use]
 #[inline]
 pub const fn bits(x: u32, a: u32, b: u32) -> u32 {
-    (x >> a) & ((1 << (b - a)) - 1)
+    if a >= 32 || b <= a {
+        return 0;
+    }
+    let shifted = x >> a;
+    let width = b - a;
+    if width >= 32 {
+        shifted
+    } else {
+        shifted & ((1u32 << width) - 1)
+    }
 }
 
 /// Pack `(row, col)` into a 32-bit key `(row << 16) | col` for grids `< 2^16`.
@@ -67,9 +76,15 @@ pub struct FieldParams {
 #[must_use]
 #[inline]
 pub const fn ticks_of(ms: u32, tick_ms: u32) -> u32 {
-    let t = if tick_ms > 1 { tick_ms } else { 1 };
-    let n = (ms + t / 2) / t;
-    if n > 1 { n } else { 1 }
+    let t = (if tick_ms > 1 { tick_ms } else { 1 }) as u64;
+    let n = (ms as u64 + t / 2) / t;
+    if n <= 1 {
+        1
+    } else if n > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        n as u32
+    }
 }
 
 impl FieldParams {
@@ -79,7 +94,7 @@ impl FieldParams {
     pub const fn quanta(tick_ms: u32, mutation_ms: u32) -> (u32, u32, u32) {
         let mq = ticks_of(mutation_ms, tick_ms);
         let floor = ticks_of(350, tick_ms);
-        let dq = mq * floor.div_ceil(mq);
+        let dq = mq.saturating_mul(floor.div_ceil(mq));
         let sq = ticks_of(500, tick_ms);
         (mq, dq, sq)
     }
@@ -106,7 +121,7 @@ pub struct ColParams {
 #[must_use]
 #[inline]
 pub const fn col_params(fp: &FieldParams, col: u32) -> ColParams {
-    let rows = if fp.rows > 3 { fp.rows } else { 3 };
+    let rows = (if fp.rows > 3 { fp.rows } else { 3 }) as u64;
     let h = rain_hash32(fp.seed32 ^ ((col << 1) | 1));
     let p0 = (2 + bits(h, 0, 2)) as i64;
     let speed = if fp.speed < 1 {
@@ -124,7 +139,7 @@ pub const fn col_params(fp: &FieldParams, col: u32) -> ColParams {
     } else {
         p_raw as u32
     };
-    let l0_raw = rows * (3 + bits(h, 2, 4)) / 8;
+    let l0_raw = rows * (3 + bits(h, 2, 4) as u64) / 8;
     let l0 = if l0_raw < 3 {
         3
     } else if l0_raw > rows {
@@ -138,7 +153,7 @@ pub const fn col_params(fp: &FieldParams, col: u32) -> ColParams {
         10
     } else {
         fp.trail
-    };
+    } as u64;
     let l_raw = l0 * trail / 5;
     let l = if l_raw < 3 {
         3
@@ -147,14 +162,31 @@ pub const fn col_params(fp: &FieldParams, col: u32) -> ColParams {
     } else {
         l_raw
     };
-    let g_style = l / 2 + bits(h, 4, 7) * l / 8;
-    let tick_ms = if fp.tick_ms > 1 { fp.tick_ms } else { 1 };
-    let floor_c = 1000u32.div_ceil(p * tick_ms);
+    let g_style = l / 2 + (bits(h, 4, 7) as u64) * l / 8;
+    let tick_ms = (if fp.tick_ms > 1 { fp.tick_ms } else { 1 }) as u64;
+    let floor_c = 1000u64.div_ceil((p as u64) * tick_ms);
     let min_g = floor_c.saturating_sub(rows + l);
-    let g = if g_style > min_g { g_style } else { min_g };
-    let c = rows + l + g;
-    let phi = rain_hash32(h) % (c * p);
-    ColParams { h, p, l, g, c, phi }
+    let g_u64 = if g_style > min_g { g_style } else { min_g };
+    let g = if g_u64 > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        g_u64 as u32
+    };
+    let c_u64 = rows + l + g_u64;
+    let c = if c_u64 > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        c_u64 as u32
+    };
+    let phi = ((rain_hash32(h) as u64) % ((c as u64) * (p as u64))) as u32;
+    ColParams {
+        h,
+        p,
+        l: l as u32,
+        g,
+        c,
+        phi,
+    }
 }
 
 /// Hold bright-head columns one extra tick in the 8th stammer window: `tick - ((tick / sq) % 8 == 7)`.
@@ -445,5 +477,27 @@ mod tests {
         }
         assert_eq!(ring.at(u64::MAX), 11);
         assert_eq!(ring.at(0), 4, "evicted history resolves to the oldest kept");
+    }
+
+    #[test]
+    fn extreme_u32_inputs_never_panic() {
+        assert_eq!(bits(0xDEAD_BEEF, 0, 32), 0xDEAD_BEEF);
+        assert_eq!(bits(0xDEAD_BEEF, 16, 8), 0);
+        assert_eq!(bits(0xDEAD_BEEF, 32, 64), 0);
+        assert_eq!(ticks_of(u32::MAX, 2), u32::MAX / 2 + 1);
+        let (mq, dq, sq) = FieldParams::quanta(1, u32::MAX);
+        let fp = FieldParams {
+            seed32: u32::MAX,
+            rows: u32::MAX,
+            tick_ms: u32::MAX,
+            speed: u32::MAX,
+            trail: u32::MAX,
+            mq,
+            dq,
+            sq,
+        };
+        let cp = col_params(&fp, u32::MAX);
+        assert!((2..=16).contains(&cp.p));
+        assert!(u64::from(cp.phi) < u64::from(cp.c) * u64::from(cp.p));
     }
 }

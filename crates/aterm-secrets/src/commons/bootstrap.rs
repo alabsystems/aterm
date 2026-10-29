@@ -28,12 +28,45 @@ const CLAIM_LEN: usize = 4 + 32 + 16 + 16 + 32;
 const PIN_LEN: usize = 4 + 16 + 32 + 32;
 const MAX_DEVICE: usize = 4096;
 
+fn custody_digest(path: &Path) -> Result<[u8; 32]> {
+    let bytes = fsx::read_private(path, MAX_DEVICE)?
+        .ok_or_else(|| Error::new("Commons immutable custody is missing"))?;
+    Ok(aterm_digest::Sha256::digest(bytes.as_slice()))
+}
+
+/// How long an observation waits for another local holder of `commons.lock`.
+/// Holders do no network I/O and finish in milliseconds, so one that outlasts
+/// this is stuck or one of many back to back: the observation is refused as busy.
+const CUSTODY_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Serializes custody observations independently of the removable control log.
 /// The lock is never replaced, and never held during network I/O.
 struct CustodyLock(std::fs::File);
 
 impl CustodyLock {
+    #[cfg(test)]
+    /// Take `name` in `paths.dir`: with `wait`, for as long as it takes; else
+    /// for at most [`CUSTODY_WAIT`], refused as [`crate::ErrorKind::CustodyBusy`].
     fn acquire_commons_custody(paths: &Paths, name: &str, wait: bool) -> Result<Self> {
+        Self::acquire_until(paths, name, wait, None)
+    }
+
+    fn acquire_until(
+        paths: &Paths,
+        name: &str,
+        wait: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Self> {
+        Self::acquire_until_with(paths, name, wait, deadline, || {})
+    }
+
+    fn acquire_until_with(
+        paths: &Paths,
+        name: &str,
+        wait: bool,
+        deadline: Option<std::time::Instant>,
+        mut held: impl FnMut(),
+    ) -> Result<Self> {
         use std::os::unix::fs::OpenOptionsExt;
         fsx::ensure_private_dir(&paths.dir)?;
         let path = paths.dir.join(name);
@@ -59,25 +92,43 @@ impl CustodyLock {
             .map_err(|error| Error::new(format!("Commons custody lock is not private: {error}")))?;
         let custody_file: std::fs::File = file;
         aterm_uds::keep_out_of_children(&custody_file)?;
-        if wait {
+        let mut observed_held = || {
+            #[cfg(test)]
+            tests::custody_held();
+            held();
+        };
+        let result = if let Some(deadline) = deadline {
+            aterm_uds::private_file::lock_exclusive_until_with(
+                &custody_file,
+                deadline,
+                "another local Commons bootstrap is active",
+                &mut observed_held,
+            )
+        } else if wait {
             #[expect(
                 clippy::disallowed_methods,
                 reason = "CustodyLock is CLOEXEC/CLOFORK and unlocks before close; device creation has no network IO"
             )]
-            custody_file
-                .lock()
-                .map_err(|_| Error::new("cannot lock Commons device custody"))?;
+            custody_file.lock()
         } else {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "CustodyLock is CLOEXEC/CLOFORK and explicitly unlocks before close"
-            )]
-            custody_file
-                .try_lock()
-                .map_err(|_| Error::new("another local Commons bootstrap is active"))?;
-        }
+            aterm_uds::private_file::lock_exclusive_until_with(
+                &custody_file,
+                std::time::Instant::now() + CUSTODY_WAIT,
+                "another local Commons bootstrap is active",
+                &mut observed_held,
+            )
+        };
+        result.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                Error::of_kind(crate::ErrorKind::CustodyBusy, error.to_string())
+            } else {
+                Error::from(error)
+            }
+        })?;
         let lock = Self(custody_file);
-        if fsx::file_id(&path) != Some((metadata.dev(), metadata.ino())) {
+        let (_, current) = aterm_uds::private_file::open_private(&paths.dir, name)
+            .map_err(|error| Error::new(format!("Commons custody lock is not private: {error}")))?;
+        if (current.dev(), current.ino()) != (metadata.dev(), metadata.ino()) {
             return Err(Error::new(
                 "Commons custody lock changed while acquiring it",
             ));
@@ -311,10 +362,37 @@ impl Device {
     }
 
     fn open_identity(paths: &Paths, identity: Identity, require_existing: bool) -> Result<Self> {
+        Self::open_identity_until(paths, identity, require_existing, None)
+    }
+
+    fn open_identity_until(
+        paths: &Paths,
+        identity: Identity,
+        require_existing: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Self> {
+        Self::open_identity_checked(paths, identity, require_existing, deadline, || Ok(()))
+    }
+
+    fn open_identity_checked(
+        paths: &Paths,
+        identity: Identity,
+        require_existing: bool,
+        deadline: Option<std::time::Instant>,
+        validate: impl FnOnce() -> Result<()>,
+    ) -> Result<Self> {
         // Device creation and loss checks share one lock even when invoked
         // without a network bootstrap. No caller holding this lock takes the
         // bootstrap lock, so bootstrap -> device is the sole lock order.
-        let _lock = CustodyLock::acquire_commons_custody(paths, "commons-device.lock", true)?;
+        let _lock = CustodyLock::acquire_until(paths, "commons-device.lock", true, deadline)?;
+        validate()?;
+        if client::read_identity(paths)?
+            .is_none_or(|current| current.recipient() != identity.recipient())
+        {
+            return Err(Error::new(
+                "Commons secrets identity changed while acquiring device custody",
+            ));
+        }
         // The secrets installer flushes identity contents before publishing its
         // name. Order that name before any ciphertext depending on this key.
         aterm_durable::durable_dir(&paths.dir)?;
@@ -490,6 +568,9 @@ pub struct Bootstrap {
     descriptor: Descriptor,
     device: Device,
     journal_dir: PathBuf,
+    paths: Paths,
+    snapshot: Snapshot,
+    immutable: Vec<(PathBuf, [u8; 32])>,
 }
 
 /// One authenticated vault observation followed by Commons custody validation.
@@ -497,6 +578,35 @@ pub struct Bootstrap {
 pub enum Availability {
     Unavailable(super::Unavailable),
     Available(Box<Bootstrap>),
+}
+
+/// Whether this Mac is a current Commons Writer, read from custody it already holds: a Mac
+/// with no device key yet is none, and this never creates one (a credential request's
+/// readiness, docs/DESIGN-credential-requests-2026-10-27.md §9.4). Any failure reads as no.
+pub fn writer_here(paths: &Paths) -> bool {
+    if !matches!(
+        fsx::kind(&paths.dir.join("commons").join("device.age")),
+        Ok(fsx::Kind::File)
+    ) {
+        return false;
+    }
+    let Ok(Some(bootstrap)) = Bootstrap::cached(paths) else {
+        return false;
+    };
+    let Ok(journal) = Journal::open_existing(bootstrap.journal_dir(), bootstrap.trust()) else {
+        return false;
+    };
+    matches!(
+        bootstrap.access_in(&journal),
+        Ok(Some(access)) if access.local().role() == super::roster::Role::Writer
+            && access.is_current(&journal)
+    )
+}
+
+fn is_transient_vault_revalidation(error: &Error) -> bool {
+    let text = error.to_string();
+    text.contains("Commons vault became unavailable while acquiring custody (vault-busy)")
+        || text.contains("Commons vault source or applied version changed while acquiring custody")
 }
 
 impl Bootstrap {
@@ -507,6 +617,52 @@ impl Bootstrap {
         match Self::observe(paths)? {
             Availability::Unavailable(_) => Ok(None),
             Availability::Available(bootstrap) => Ok(Some(*bootstrap)),
+        }
+    }
+
+    /// [`Self::cached`] with one absolute deadline for all local custody and
+    /// control-writer lock waits. Every successful observation still validates
+    /// the authenticated vault, device custody, immutable pins and full history.
+    pub fn cached_until(paths: &Paths, deadline: std::time::Instant) -> Result<Option<Self>> {
+        match Self::observe_until(paths, deadline)? {
+            Availability::Unavailable(_) => Ok(None),
+            Availability::Available(bootstrap) => Ok(Some(*bootstrap)),
+        }
+    }
+
+    /// [`Self::cached_until`], retaining the exclusively locked, freshly observed
+    /// control journal from that same custody admission. Consumers may authorize
+    /// one local batch without reopening or replaying the journal. Revalidate
+    /// custody before authorization, and drop the journal before network I/O.
+    /// This pair grants neither current membership nor application access.
+    pub fn cached_with_journal_until(
+        paths: &Paths,
+        deadline: std::time::Instant,
+    ) -> Result<Option<(Self, Journal)>> {
+        loop {
+            return match super::observe_until(paths, deadline)? {
+                super::Observation::Unavailable(_) => Ok(None),
+                super::Observation::Visible(snapshot) => {
+                    match Self::open_snapshot_with_journal(
+                        paths,
+                        &snapshot,
+                        false,
+                        Some(deadline),
+                        true,
+                        || {},
+                    ) {
+                        Ok(pair) => Ok(Some(pair)),
+                        Err(error)
+                            if std::time::Instant::now() < deadline
+                                && is_transient_vault_revalidation(&error) =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                            continue;
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            };
         }
     }
 
@@ -521,6 +677,31 @@ impl Bootstrap {
         }
     }
 
+    /// [`Self::observe`], waiting for the initial vault observation, then local
+    /// custody and control-writer contention until one shared `deadline`.
+    /// Timeouts retain the vault-busy reason, `CustodyBusy` or `JournalBusy`.
+    /// Revalidation under Commons custody never waits on a vault writer.
+    pub fn observe_until(paths: &Paths, deadline: std::time::Instant) -> Result<Availability> {
+        loop {
+            return match super::observe_until(paths, deadline)? {
+                super::Observation::Unavailable(reason) => Ok(Availability::Unavailable(reason)),
+                super::Observation::Visible(snapshot) => {
+                    match Self::open_snapshot(paths, &snapshot, false, Some(deadline)) {
+                        Ok(bootstrap) => Ok(Availability::Available(Box::new(bootstrap))),
+                        Err(error)
+                            if std::time::Instant::now() < deadline
+                                && is_transient_vault_revalidation(&error) =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                            continue;
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+        }
+    }
+
     /// Open Commons or report the specific unavailable vault boundary.
     pub fn required(paths: &Paths) -> Result<Self> {
         match Self::observe(paths)? {
@@ -530,6 +711,58 @@ impl Bootstrap {
                 reason.code(),
                 reason.explanation()
             ))),
+        }
+    }
+
+    /// [`Self::required`] with the shared local lock deadline of
+    /// [`Self::observe_until`]. Unavailable vaults retain their specific reason.
+    pub fn required_until(paths: &Paths, deadline: std::time::Instant) -> Result<Self> {
+        match Self::observe_until(paths, deadline)? {
+            Availability::Available(bootstrap) => Ok(*bootstrap),
+            Availability::Unavailable(reason) => Err(Error::new(format!(
+                "Commons unavailable ({}): {}",
+                reason.code(),
+                reason.explanation()
+            ))),
+        }
+    }
+
+    /// [`Self::required_until`], retaining the same fresh, exclusively locked
+    /// journal as [`Self::cached_with_journal_until`]. Unavailable vault errors
+    /// retain their specific reason. Revalidate custody before authorization,
+    /// and drop the journal before network I/O.
+    pub fn required_with_journal_until(
+        paths: &Paths,
+        deadline: std::time::Instant,
+    ) -> Result<(Self, Journal)> {
+        loop {
+            return match super::observe_until(paths, deadline)? {
+                super::Observation::Visible(snapshot) => {
+                    match Self::open_snapshot_with_journal(
+                        paths,
+                        &snapshot,
+                        false,
+                        Some(deadline),
+                        true,
+                        || {},
+                    ) {
+                        Ok(pair) => Ok(pair),
+                        Err(error)
+                            if std::time::Instant::now() < deadline
+                                && is_transient_vault_revalidation(&error) =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                            continue;
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                super::Observation::Unavailable(reason) => Err(Error::new(format!(
+                    "Commons unavailable ({}): {}",
+                    reason.code(),
+                    reason.explanation()
+                ))),
+            };
         }
     }
 
@@ -702,16 +935,46 @@ impl Bootstrap {
         )
     )]
     fn from_snapshot(paths: &Paths, snapshot: &Snapshot) -> Result<Self> {
-        Self::open_snapshot(paths, snapshot, false)
+        Self::open_snapshot(paths, snapshot, false, None)
     }
 
     pub(crate) fn from_creation_snapshot(paths: &Paths, snapshot: &Snapshot) -> Result<Self> {
-        Self::open_snapshot(paths, snapshot, true)
+        Self::open_snapshot(paths, snapshot, true, None)
     }
 
-    fn open_snapshot(paths: &Paths, snapshot: &Snapshot, require_device: bool) -> Result<Self> {
+    fn open_snapshot(
+        paths: &Paths,
+        snapshot: &Snapshot,
+        require_device: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Self> {
+        Self::open_snapshot_with(paths, snapshot, require_device, deadline, || {})
+    }
+
+    fn open_snapshot_with(
+        paths: &Paths,
+        snapshot: &Snapshot,
+        require_device: bool,
+        deadline: Option<std::time::Instant>,
+        held: impl FnMut(),
+    ) -> Result<Self> {
+        Self::open_snapshot_with_journal(paths, snapshot, require_device, deadline, false, held)
+            .map(|(bootstrap, _journal)| bootstrap)
+    }
+
+    fn open_snapshot_with_journal(
+        paths: &Paths,
+        snapshot: &Snapshot,
+        require_device: bool,
+        deadline: Option<std::time::Instant>,
+        retain_writer: bool,
+        held: impl FnMut(),
+    ) -> Result<(Self, Journal)> {
         let descriptor = Descriptor::decode(snapshot.control())?;
-        let _lock = CustodyLock::acquire_commons_custody(paths, "commons.lock", false)?;
+        let _lock = CustodyLock::acquire_until_with(paths, "commons.lock", false, deadline, held)?;
+        if deadline.is_some() {
+            Self::validate_snapshot(paths, snapshot)?;
+        }
         let identity = client::read_identity(paths)?
             .ok_or_else(|| Error::new("Commons secrets identity is missing"))?;
         if identity.recipient() != snapshot.recipient() {
@@ -764,7 +1027,21 @@ impl Bootstrap {
                 "established Commons control directory is missing; recovery is required",
             ));
         }
-        let device = Device::open_identity(paths, identity, require_device)?;
+        let device =
+            Device::open_identity_checked(paths, identity, require_device, deadline, || {
+                if deadline.is_some() {
+                    Self::validate_snapshot(paths, snapshot)?;
+                }
+                Ok(())
+            })?;
+        let device_custody = [
+            paths.dir.join("identity"),
+            dir.join("device.age"),
+            dir.join("device.claim"),
+        ]
+        .into_iter()
+        .map(|path| custody_digest(&path).map(|digest| (path, digest)))
+        .collect::<Result<Vec<_>>>()?;
         if !must_exist && !preparing {
             // A crash during the first journal open can resume only with this
             // durable same-trust intent. No bootstrap accessor escapes until
@@ -778,11 +1055,49 @@ impl Bootstrap {
             }
             aterm_durable::durable_dir(&paths.dir)?;
         }
-        let mut journal = if must_exist {
-            Journal::open_existing(&journal_dir, descriptor.trust())?
+        // A settled history that already retains the descriptor's nodes has
+        // nothing to append: observe it without the journal's writer lock, so
+        // a journal writer (peer repair's ingest, a revocation) never refuses
+        // it. The custody lock above is still held.
+        let settled = if !retain_writer
+            && must_exist
+            && !preparing
+            && retained
+                .as_ref()
+                .is_some_and(|kept| kept.as_slice() == claim)
+            && established
+                .as_ref()
+                .is_some_and(|kept| kept.as_slice() == pin)
+        {
+            holds_descriptor(&journal_dir, &descriptor)?
         } else {
-            Journal::open(&journal_dir, descriptor.trust())?
+            None
         };
+        let mut journal = if let Some(journal) = settled {
+            journal
+        } else if must_exist {
+            match deadline {
+                Some(deadline) => {
+                    Journal::open_existing_until(&journal_dir, descriptor.trust(), deadline)?
+                }
+                None => Journal::open_existing(&journal_dir, descriptor.trust())?,
+            }
+        } else {
+            match deadline {
+                Some(deadline) => Journal::open_until(&journal_dir, descriptor.trust(), deadline)?,
+                None => Journal::open(&journal_dir, descriptor.trust())?,
+            }
+        };
+        if deadline.is_some() {
+            Self::validate_snapshot(paths, snapshot)?;
+            for (path, expected) in &device_custody {
+                if &custody_digest(path)? != expected {
+                    return Err(Error::new(
+                        "Commons device custody changed while acquiring control",
+                    ));
+                }
+            }
+        }
         // End the empty-journal initialization window before the first record
         // is ingested. Once any restriction can be acknowledged, both the log
         // and its anchor must survive even if no accessor has returned yet.
@@ -797,9 +1112,11 @@ impl Bootstrap {
             return Err(Error::new("Commons history claim changed during creation"));
         }
         aterm_durable::durable_dir(&paths.dir)?;
-        journal.ingest(descriptor.genesis.bytes())?;
-        for node in &descriptor.repair {
-            journal.ingest(node.bytes())?;
+        if journal.is_writer() {
+            journal.ingest(descriptor.genesis.bytes())?;
+            for node in &descriptor.repair {
+                journal.ingest(node.bytes())?;
+            }
         }
         if established.is_none() {
             fsx::write_new(&dir.join("default.pin"), &pin, 0o600)?;
@@ -810,11 +1127,65 @@ impl Bootstrap {
             return Err(Error::new("Commons network pin changed during creation"));
         }
         aterm_durable::durable_dir(&dir)?;
-        Ok(Self {
-            descriptor,
-            device,
-            journal_dir,
-        })
+        let immutable = [
+            paths.dir.join("identity"),
+            paths.dir.join("commons.claim"),
+            dir.join("device.age"),
+            dir.join("device.claim"),
+            dir.join("default.pin"),
+            journal_dir.join("control.anchor"),
+        ]
+        .into_iter()
+        .map(|path| custody_digest(&path).map(|digest| (path, digest)))
+        .collect::<Result<_>>()?;
+        Ok((
+            Self {
+                descriptor,
+                device,
+                journal_dir,
+                paths: paths.clone(),
+                snapshot: snapshot.clone(),
+                immutable,
+            },
+            journal,
+        ))
+    }
+
+    fn validate_snapshot(paths: &Paths, snapshot: &Snapshot) -> Result<()> {
+        // Never wait on a vault writer while holding Commons/control custody:
+        // source admission is a nonblocking observation, not a cached grant.
+        let current = match super::observe(paths)? {
+            super::Observation::Visible(current) => current,
+            super::Observation::Unavailable(reason) => {
+                return Err(Error::new(format!(
+                    "Commons vault became unavailable while acquiring custody ({}): {}",
+                    reason.code(),
+                    reason.explanation()
+                )));
+            }
+        };
+        if !snapshot.same_observation(&current) {
+            return Err(Error::new(
+                "Commons vault source or applied version changed while acquiring custody",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reobserve this exact authenticated source/version/recipient and immutable
+    /// local custody after acquiring a later lock. Call before using a bootstrap
+    /// across a waiting boundary. The vault observation never waits on a writer;
+    /// changed, missing, busy or no longer private state grants no authorization.
+    pub fn revalidate_custody(&self) -> Result<()> {
+        Self::validate_snapshot(&self.paths, &self.snapshot)?;
+        for (path, expected) in &self.immutable {
+            if &custody_digest(path)? != expected {
+                return Err(Error::new(
+                    "Commons immutable custody changed while acquiring a lock",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn trust(&self) -> Trust {
@@ -826,16 +1197,110 @@ impl Bootstrap {
     pub fn journal_dir(&self) -> &Path {
         &self.journal_dir
     }
+    pub const fn paths(&self) -> &Paths {
+        &self.paths
+    }
     pub fn request(&self) -> Result<Request> {
         self.device
             .request(self.trust().network, self.trust().authority)
     }
 
+    /// Whether Commons control on this Mac is governed by the membership log (`F18`).
+    ///
+    /// # Errors
+    /// Local custody files cannot be read.
+    pub fn is_log_backed(&self) -> Result<bool> {
+        Ok(client::trusted_commons_log(&self.paths, self.trust())?.is_some())
+    }
+
+    /// Encode the minimal causal membership-log chain proving this device's historical seat for
+    /// `ACX2` peer authentication (`F18`).
+    ///
+    /// # Errors
+    /// Local custody or device key cannot be read.
+    pub fn log_witness(&self) -> Result<Option<Vec<u8>>> {
+        type WitnessCacheEntry = ([u8; 32], Vec<u8>, Vec<u8>);
+        static WITNESS_CACHE: std::sync::Mutex<std::collections::VecDeque<WitnessCacheEntry>> =
+            std::sync::Mutex::new(std::collections::VecDeque::new());
+
+        let Some((log, heads_digest)) = client::trusted_commons_log(&self.paths, self.trust())?
+        else {
+            return Ok(None);
+        };
+        let request = self.request()?;
+        let binding_bytes = request.binding().bytes().to_vec();
+        if let Ok(cache) = WITNESS_CACHE.lock()
+            && let Some((_, _, witness)) = cache
+                .iter()
+                .find(|(d, b, _)| *d == heads_digest && *b == binding_bytes)
+        {
+            return Ok(Some(witness.clone()));
+        }
+        let Some(entry_id) = log.historical_seat_entry(request.binding()) else {
+            return Ok(None);
+        };
+        let Some(mut chain) = log.ancestor_chain(&entry_id) else {
+            return Ok(None);
+        };
+        if chain.is_empty() {
+            return Ok(None);
+        }
+        let chain_holds_seat = {
+            let mut iter = chain.iter().cloned();
+            iter.next()
+                .and_then(|g| crate::membership_log::Log::new(g).ok())
+                .is_some_and(|mut sub| {
+                    for rec in iter {
+                        if sub.insert(rec).is_err() {
+                            return false;
+                        }
+                    }
+                    sub.has_historical_seat(request.binding())
+                })
+        };
+        if !chain_holds_seat {
+            let mut targets = vec![entry_id];
+            for rec in log.records().skip(1) {
+                if matches!(rec.body(), crate::membership_log::Body::Remove { .. }) {
+                    targets.push(*rec.id());
+                }
+            }
+            chain = log.ancestor_closure(&targets);
+        }
+        let encoded = crate::membership_log::encode_records(&chain);
+        if let Ok(mut cache) = WITNESS_CACHE.lock() {
+            cache.retain(|(d, b, _)| !(*d == heads_digest && *b == binding_bytes));
+            if cache.len() >= 16 {
+                cache.pop_front();
+            }
+            cache.push_back((heads_digest, binding_bytes, encoded.clone()));
+        }
+        Ok(Some(encoded))
+    }
+
     /// Find historical authority approval for sealed control repair only. This
     /// may name a retired device: current data access is a separate roster check.
     pub fn witness(&self) -> Result<Option<Node>> {
+        let journal = Journal::read_existing(&self.journal_dir, self.trust())?;
+        self.witness_in(&journal)
+    }
+
+    /// [`Self::witness`] with bounded admission to the existing journal's lock.
+    /// The deadline is shared with the caller's other local setup work.
+    pub fn witness_until(&self, deadline: std::time::Instant) -> Result<Option<Node>> {
+        let journal = Journal::open_existing_until(&self.journal_dir, self.trust(), deadline)?;
+        self.revalidate_custody()?;
+        self.witness_in(&journal)
+    }
+
+    /// Find the same historical approval within an already locked control
+    /// observation. The journal must belong to this bootstrap's trust context.
+    /// This grants no current application access.
+    pub fn witness_in(&self, journal: &Journal) -> Result<Option<Node>> {
+        if journal.trust() != self.trust() {
+            return Err(Error::new("Commons witness has another trust context"));
+        }
         let request = self.request()?;
-        let journal = Journal::open_existing(&self.journal_dir, self.trust())?;
         Ok(journal
             .inventory()
             .filter_map(|id| journal.node(id))
@@ -851,17 +1316,40 @@ impl Bootstrap {
     /// the age recipient alone cannot activate a different enrolled writer.
     /// The returned handle still rechecks its journal before exposing any key.
     pub fn access(&self) -> Result<Option<super::roster::Access>> {
-        let journal = Journal::open_existing(&self.journal_dir, self.trust())?;
+        let journal = Journal::read_existing(&self.journal_dir, self.trust())?;
         self.access_in(&journal)
     }
 
-    /// Validate against an already locked journal, allowing a short local batch
-    /// to share one consistent control observation without reopening its lock.
+    /// Validate against an already open journal, a writer or a read-only view,
+    /// so a short local batch shares one consistent control observation.
     pub fn access_in(&self, journal: &Journal) -> Result<Option<super::roster::Access>> {
         if journal.trust() != self.trust() {
             return Err(Error::new("Commons access has another trust context"));
         }
-        let Some(access) = super::roster::current(journal, &self.device.identity)? else {
+        let maybe_access = if let Some((log, heads_digest)) =
+            client::trusted_commons_log(&self.paths, self.trust())?
+        {
+            let me = self.device.identity.recipient();
+            let req = self.request()?;
+            if log.wraps_to(&me)
+                || log.removes(&me)
+                || log.membership().removal(&req.binding().actor()).is_some()
+                || log.has_historical_seat(req.binding())
+            {
+                super::roster::current_from_loaded_log(
+                    &self.paths,
+                    self.trust(),
+                    &self.device.identity,
+                    &log,
+                    heads_digest,
+                )?
+            } else {
+                super::roster::current(journal, &self.device.identity)?
+            }
+        } else {
+            super::roster::current(journal, &self.device.identity)?
+        };
+        let Some(access) = maybe_access else {
             return Ok(None);
         };
         if access.local().binding() != self.request()?.binding() {
@@ -883,6 +1371,11 @@ impl Bootstrap {
             return Err(Error::new(
                 "historical roster has another local trust binding",
             ));
+        }
+        if access.is_log_backed()
+            && let Some(past) = access.historical_from_log(journal, &self.device.identity, basis)?
+        {
+            return Ok(past);
         }
         match access.historical(journal, &self.device.identity, basis) {
             Ok(past) => Ok(past),
@@ -941,8 +1434,11 @@ impl Bootstrap {
         // Native custody already retains these keys. Avoid spending a handoff
         // slot or doing a durable write for redundant transport.
         if access
-            .historical(journal, &self.device.identity, *handoff.source())
-            .is_ok()
+            .historical_from_log(journal, &self.device.identity, *handoff.source())?
+            .is_some()
+            || access
+                .historical(journal, &self.device.identity, *handoff.source())
+                .is_ok()
         {
             return Ok(handoff);
         }
@@ -954,7 +1450,8 @@ impl Bootstrap {
             && let Ok(saved) = super::history::Handoff::decode(saved.as_slice())
             && saved.source() == handoff.source()
             && saved.open(journal, access, &self.device.identity).is_ok()
-            && journal.selected_ancestor(*saved.issued_under(), *handoff.issued_under())
+            && (saved.issued_under() == handoff.issued_under()
+                || journal.selected_ancestor(*saved.issued_under(), *handoff.issued_under()))
         {
             // Keep the earliest usable issuance: an ancestor survives every
             // selected-path recovery that preserves its descendant. Finish a
@@ -979,6 +1476,11 @@ impl Bootstrap {
             ));
         }
         Ok(())
+    }
+
+    /// This device's record of Commons contacts ([`super::hearing::Ledger`]).
+    pub fn heard_file(&self) -> PathBuf {
+        self.journal_dir.parent().unwrap().join("heard")
     }
 
     fn history_dir(&self) -> PathBuf {
@@ -1044,6 +1546,25 @@ fn history_capacity(dir: &Path, target: &str, limit: usize) -> Result<()> {
 
 fn history_name(basis: &[u8; 32]) -> String {
     format!("{}.handoff", aterm_codec::hex::encode_lower(basis))
+}
+
+/// The journal in `journal_dir` when it already holds every node of
+/// `descriptor`, read without its writer. The view may show a checkpoint whose
+/// rename is not yet durable (a writer between its rename and its directory
+/// barrier, or one whose barrier failed), so a journal that holds them is made
+/// durable, as a writer's open would, before this returns it.
+fn holds_descriptor(journal_dir: &Path, descriptor: &Descriptor) -> Result<Option<Journal>> {
+    let holds = Journal::read_existing(journal_dir, descriptor.trust())
+        .ok()
+        .filter(|journal| {
+            std::iter::once(&descriptor.genesis)
+                .chain(&descriptor.repair)
+                .all(|node| journal.node(&node.id()).is_some())
+        });
+    if holds.is_some() {
+        aterm_durable::durable_dir(journal_dir)?;
+    }
+    Ok(holds)
 }
 
 fn pin_bytes(trust: Trust) -> Vec<u8> {

@@ -865,9 +865,10 @@ fn live_typed_upgrade(label: &str, shell: ShellType, sh: &mut LiveShell, bf: &Bo
     assert_eq!(
         sh.value_before("HOOKS=", at)
             .replace(",fish_prompt __aterm_fish_prompt_event", "")
-            .replace(",fish_preexec __aterm_prompt_give_back", ""),
+            .replace(",fish_preexec __aterm_prompt_give_back", "")
+            .replace(",fish_preexec __aterm_fish_exec_mark", ""),
         hooks,
-        "{label}: the same hooks"
+        "{label}: the same hooks, and the body's own C handler"
     );
     let (line, marker) = body_probe(label, 3);
     sh.send(&line);

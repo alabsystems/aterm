@@ -774,6 +774,22 @@ fn an_upload_without_the_staging_token_is_refused_before_anything_is_built() {
         upload::token_preflight(&ctx).is_err(),
         "an empty file is no token"
     );
+    std::fs::write(&ctx.tokens.staging, "  \n\t\r\n").expect("whitespace");
+    assert!(
+        upload::token_preflight(&ctx).is_err(),
+        "a whitespace-only file is no token"
+    );
+    std::fs::write(&ctx.tokens.staging, b"t0ken with space\n").expect("invalid byte");
+    let bad = upload::token_preflight(&ctx).expect_err("invalid byte refused");
+    assert!(
+        bad.to_string()
+            .contains("--upload needs the staging owner's token at ~/.secrets/"),
+        "{bad}"
+    );
+    assert!(
+        !bad.to_string().contains(&ctx.home.display().to_string()),
+        "home path redacted: {bad}"
+    );
     std::fs::write(&ctx.tokens.staging, "t0ken\n").expect("token");
     upload::token_preflight(&ctx).expect("a token file");
 }

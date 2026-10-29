@@ -4376,7 +4376,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn reassert_leaves_a_view_a_live_build_runs_from_and_says_so() {
-        if std::env::var_os(VIEW_PROBE_ENV).is_some() {
+        if probe_parks_in_the_view_if_asked() {
             return;
         }
         let fx = std::mem::ManuallyDrop::new(Fixture::new("view-live"));
@@ -4470,17 +4470,17 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     const VIEW_PROBE_ENV: &str = "ATPKG_SEAM_VIEW_PROBE";
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    const VIEW_PROBE: &str = "seam::tests::probe_parks_in_the_view_until_killed";
+    const VIEW_PROBE: &str =
+        "seam::tests::reassert_leaves_a_view_a_live_build_runs_from_and_says_so";
     /// The line the probe writes once it runs from the view.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     const VIEW_PARKED: &str = "parked in the view";
 
     /// The copy's whole job.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn probe_parks_in_the_view_until_killed() {
+    fn probe_parks_in_the_view_if_asked() -> bool {
         if std::env::var_os(VIEW_PROBE_ENV).is_none() {
-            return;
+            return false;
         }
         println!("{VIEW_PARKED}");
         // SAFETY: `getppid` takes no arguments, reads no memory we own, and cannot fail.
@@ -4489,7 +4489,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
             // SAFETY: `getppid` is safe to call as above.
             if unsafe { libc::getppid() } != spawner {
-                return;
+                return true;
             }
         }
     }

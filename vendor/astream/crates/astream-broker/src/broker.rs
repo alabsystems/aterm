@@ -61,17 +61,17 @@ use crate::proto::{
     append_frame, compute_delivery_crc, decode_request_with_bt, decode_response,
     encode_protocol_refusal, encode_replicate_stamped, encode_response, read_frame, write_frame,
     AttachedProducerStats, FaceStats, Request, Response, WireStats, CAP_EXPIRED_PREFIX,
-    ERR_BAD_FILTER, ERR_BAD_SUBJECT, ERR_RECORD_REFUSED, ERR_REFUSED, ERR_RETIRE_REFUSED,
-    ERR_SUBJECT_BOUND, ERR_TOO_MANY_CONNS, ERR_UNAUTHORIZED, LOG_POISONED_PREFIX, PROTO_VERSION,
-    RETAINED_FROM_PREFIX,
+    ERR_BAD_FILTER, ERR_BAD_SUBJECT, ERR_RATE_LIMITED, ERR_RECORD_REFUSED, ERR_REFUSED,
+    ERR_RETIRE_REFUSED, ERR_SUBJECT_BOUND, ERR_TOO_MANY_CONNS, ERR_UNAUTHORIZED,
+    LOG_POISONED_PREFIX, PROTO_VERSION, RATE_LIMITED_PREFIX, RETAINED_FROM_PREFIX,
 };
 use crate::store::{
     is_hidden_subject, replicated_reserved_msg, reserved_msg, Begun, BrokerLog, Durability,
-    FlushCounts, InjectedFaults, LogStats, OpenOptions, Prepared, StageErr, Told, WillRecord,
-    COMMIT_SUBJECT, MAX_SUBJECTS_PER_PRODUCER, RETIRE_SUBJECT,
+    FlushCounts, InjectedFaults, LogStats, OpenOptions, Prepared, RateLimit, StageErr, Told,
+    WillRecord, COMMIT_SUBJECT, MAX_SUBJECTS_PER_PRODUCER, RETIRE_SUBJECT,
 };
 use astream_wire::{Filter, Offset, Subject};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
@@ -123,6 +123,208 @@ mod tail_wake_island;
 pub use crate::twins::{tail_skip_clamp, tail_wake_head_advance};
 #[cfg(clean_islands)]
 pub use tail_wake_island::{tail_skip_clamp, tail_wake_head_advance};
+
+#[cfg(clean_islands)]
+#[path = "rate_island.rs"]
+mod rate_island;
+#[cfg(not(clean_islands))]
+pub use crate::twins::{rate_clock_advance, rate_tokens_clamp};
+#[cfg(clean_islands)]
+pub use rate_island::{rate_clock_advance, rate_tokens_clamp};
+
+contract_fn! {
+    /// Verified check that a producer's refilled token balance covers `cost`
+    /// (`cost <= tokens`), linked via `clean-kernel-defeq` to `rate_tokens_sufficient_isl`.
+    #[must_use]
+    pub const fn rate_tokens_sufficient(tokens: u64, cost: u64) -> bool
+    clauses [ensures result == (cost <= tokens)]
+    {
+        cost <= tokens
+    }
+}
+
+/// Hard cap on active per-producer / per-principal token buckets held in memory.
+const MAX_RATE_BUCKETS: usize = 4096;
+
+#[derive(Clone, Copy)]
+struct RateBucket {
+    rec_milli: u64,
+    byte_milli: u64,
+    last_ms: u64,
+}
+
+struct RateLimiterState {
+    epoch: Instant,
+    clock_ms: u64,
+    limit: Option<RateLimit>,
+    buckets: BTreeMap<u64, RateBucket>,
+}
+
+impl RateLimiterState {
+    fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            clock_ms: 0,
+            limit: None,
+            buckets: BTreeMap::new(),
+        }
+    }
+
+    fn advance_now(&mut self) -> u64 {
+        let raw_ms = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.clock_ms = rate_clock_advance(self.clock_ms, raw_ms);
+        self.clock_ms
+    }
+
+    fn set_limit(&mut self, limit: Option<RateLimit>) {
+        let now_ms = self.advance_now();
+        self.limit = limit;
+        match limit {
+            None => self.buckets.clear(),
+            Some(lim) => {
+                let burst_rec = lim.burst_records.saturating_mul(1_000);
+                let burst_byte = lim.burst_bytes.saturating_mul(1_000);
+                for bucket in self.buckets.values_mut() {
+                    bucket.rec_milli = rate_tokens_clamp(bucket.rec_milli, burst_rec);
+                    bucket.byte_milli = rate_tokens_clamp(bucket.byte_milli, burst_byte);
+                    bucket.last_ms = rate_clock_advance(bucket.last_ms, now_ms);
+                }
+            }
+        }
+    }
+
+    fn try_acquire(
+        &mut self,
+        producer_id: u64,
+        wire_bytes: usize,
+    ) -> Result<(), (u64, &'static str)> {
+        let now_ms = self.advance_now();
+        let Some(lim) = self.limit else {
+            return Ok(());
+        };
+        let burst_rec_milli = lim.burst_records.saturating_mul(1_000);
+        let burst_byte_milli = lim.burst_bytes.saturating_mul(1_000);
+        let wire_b = (wire_bytes.max(1)) as u64;
+        if lim.bytes_per_sec > 0 && wire_b > lim.burst_bytes {
+            let over = wire_b.saturating_sub(lim.burst_bytes).saturating_mul(1_000);
+            let retry_ms = over
+                .saturating_add(lim.bytes_per_sec.saturating_sub(1))
+                .checked_div(lim.bytes_per_sec)
+                .unwrap_or(1)
+                .max(1);
+            return Err((retry_ms, "record bytes exceed burst_bytes"));
+        }
+
+        if !self.buckets.contains_key(&producer_id) && self.buckets.len() >= MAX_RATE_BUCKETS {
+            let mut full_pid: Option<u64> = None;
+            for (&pid, b) in &self.buckets {
+                let dt = now_ms.saturating_sub(b.last_ms);
+                let r_now = rate_tokens_clamp(
+                    b.rec_milli
+                        .saturating_add(dt.saturating_mul(lim.records_per_sec)),
+                    burst_rec_milli,
+                );
+                let b_full = if lim.bytes_per_sec > 0 {
+                    let b_now = rate_tokens_clamp(
+                        b.byte_milli
+                            .saturating_add(dt.saturating_mul(lim.bytes_per_sec)),
+                        burst_byte_milli,
+                    );
+                    b_now >= burst_byte_milli
+                } else {
+                    true
+                };
+                if r_now >= burst_rec_milli && b_full {
+                    full_pid = Some(pid);
+                    break;
+                }
+            }
+            match full_pid {
+                Some(evict) => {
+                    self.buckets.remove(&evict);
+                }
+                None => {
+                    return Err((50, "active rate buckets at capacity"));
+                }
+            }
+        }
+
+        let cur = match self.buckets.get(&producer_id) {
+            Some(&b) => b,
+            None => RateBucket {
+                rec_milli: burst_rec_milli,
+                byte_milli: burst_byte_milli,
+                last_ms: now_ms,
+            },
+        };
+        let elapsed_ms = now_ms.saturating_sub(cur.last_ms);
+        let rec_refilled = rate_tokens_clamp(
+            cur.rec_milli
+                .saturating_add(elapsed_ms.saturating_mul(lim.records_per_sec)),
+            burst_rec_milli,
+        );
+        let byte_refilled = if lim.bytes_per_sec > 0 {
+            rate_tokens_clamp(
+                cur.byte_milli
+                    .saturating_add(elapsed_ms.saturating_mul(lim.bytes_per_sec)),
+                burst_byte_milli,
+            )
+        } else {
+            0
+        };
+
+        if !rate_tokens_sufficient(rec_refilled, 1_000) {
+            self.buckets.insert(
+                producer_id,
+                RateBucket {
+                    rec_milli: rec_refilled,
+                    byte_milli: byte_refilled,
+                    last_ms: now_ms,
+                },
+            );
+            let deficit = 1_000u64.saturating_sub(rec_refilled);
+            let retry_ms = deficit
+                .saturating_add(lim.records_per_sec.saturating_sub(1))
+                .checked_div(lim.records_per_sec)
+                .unwrap_or(1)
+                .max(1);
+            return Err((retry_ms, "record rate exceeded"));
+        }
+
+        let cost_byte_milli = wire_b.saturating_mul(1_000);
+        if lim.bytes_per_sec > 0 && !rate_tokens_sufficient(byte_refilled, cost_byte_milli) {
+            self.buckets.insert(
+                producer_id,
+                RateBucket {
+                    rec_milli: rec_refilled,
+                    byte_milli: byte_refilled,
+                    last_ms: now_ms,
+                },
+            );
+            let deficit = cost_byte_milli.saturating_sub(byte_refilled);
+            let retry_ms = deficit
+                .saturating_add(lim.bytes_per_sec.saturating_sub(1))
+                .checked_div(lim.bytes_per_sec)
+                .unwrap_or(1)
+                .max(1);
+            return Err((retry_ms, "byte rate exceeded"));
+        }
+
+        self.buckets.insert(
+            producer_id,
+            RateBucket {
+                rec_milli: rec_refilled.saturating_sub(1_000),
+                byte_milli: if lim.bytes_per_sec > 0 {
+                    byte_refilled.saturating_sub(cost_byte_milli)
+                } else {
+                    0
+                },
+                last_ms: now_ms,
+            },
+        );
+        Ok(())
+    }
+}
 
 contract_fn! {
     /// Verified check that unanswered acceptor wake rounds lie within the 10-attempt cap
@@ -1721,6 +1923,12 @@ struct Shared {
     next_parker_id: AtomicU64,
     /// Active subscriber tails registered for selective wakeups (pure leaf lock).
     tail_parkers: Mutex<Vec<Arc<TailParker>>>,
+    /// Fast lock-free gate for [`Self::rate_limiter`] (`false` when unthrottled).
+    has_rate_limit: AtomicBool,
+    /// Per-principal / per-producer monotone token-bucket rate limiter (leaf lock).
+    rate_limiter: Mutex<RateLimiterState>,
+    /// [`BrokerStats::rate_limited`].
+    rate_limited: AtomicU64,
     /// [`BrokerStats::peer_probes`].
     peer_probes: AtomicU64,
     /// [`BrokerStats::parked_tails`].
@@ -3112,6 +3320,9 @@ pub struct BrokerStats {
     /// Per-subscriber `notify_one` wakeups emitted by the writer when
     /// [`Broker::selective_tail_wake`] is active (`cost study B4 step 2`).
     pub selective_tail_wakes: u64,
+    /// `Publish` and `ProcessAndProduce` requests refused with [`ERR_RATE_LIMITED`] by
+    /// [`Broker::set_rate_limit`] (`DESIGN-aterm-fabric` T9 & T17).
+    pub rate_limited: u64,
     /// Times a parked subscriber tail resumed from its wait: woken by a writer
     /// broadcast, a revocation or shutdown, or at the end of its liveness poll
     /// ([`Broker::set_liveness_poll`]). A broadcast resumes every tail parked at that
@@ -3306,12 +3517,27 @@ impl Broker {
                 return Err(empty_secret());
             }
         }
+        let rate_limit = match opts.rate_limit {
+            None => None,
+            Some(lim) => match lim.validate() {
+                Ok(valid) => Some(valid),
+                Err(msg) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid rate_limit: {msg}"),
+                    ));
+                }
+            },
+        };
         let health_every = opts.health_every;
         let selective_tail_wake = opts.selective_tail_wake;
         let log = BrokerLog::open_opts(log_path, opts, prepare)?;
         let broker = Self::start(log, None, guard);
         if selective_tail_wake {
             broker.set_selective_tail_wake(true);
+        }
+        if let Some(lim) = rate_limit {
+            broker.set_rate_limit(Some(lim))?;
         }
         if let Some(every) = health_every {
             // The open has happened (and fired the wills the log held): a sidecar it
@@ -3917,6 +4143,47 @@ impl Broker {
         self.shared.selective_tail_wake.load(Ordering::Acquire)
     }
 
+    /// Install, update, or clear (`None`) the broker's per-principal / per-producer
+    /// monotone token-bucket rate limit (`DESIGN-aterm-fabric` T9 & T17).
+    ///
+    /// Returns `InvalidInput` if `limit` specifies a zero or out-of-range rate/burst.
+    pub fn set_rate_limit(&self, limit: Option<RateLimit>) -> io::Result<()> {
+        let validated = match limit {
+            None => None,
+            Some(lim) => match lim.validate() {
+                Ok(v) => Some(v),
+                Err(msg) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid rate_limit: {msg}"),
+                    ));
+                }
+            },
+        };
+        let mut st = match self.shared.rate_limiter.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        st.set_limit(validated);
+        self.shared
+            .has_rate_limit
+            .store(validated.is_some(), Ordering::Release);
+        Ok(())
+    }
+
+    /// Currently active per-principal / per-producer rate limit, if any.
+    #[must_use]
+    pub fn rate_limit(&self) -> Option<RateLimit> {
+        if !self.shared.has_rate_limit.load(Ordering::Acquire) {
+            return None;
+        }
+        let st = match self.shared.rate_limiter.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        st.limit
+    }
+
     /// Operational snapshot of this broker's log, subscriber-visible head, active
     /// connections, and active listeners (`REQUIREMENTS` R5).
     pub fn stats(&self) -> BrokerStats {
@@ -4158,6 +4425,9 @@ impl Broker {
             selective_mode_epoch: AtomicU64::new(0),
             next_parker_id: AtomicU64::new(1),
             tail_parkers: Mutex::new(Vec::new()),
+            has_rate_limit: AtomicBool::new(false),
+            rate_limiter: Mutex::new(RateLimiterState::new()),
+            rate_limited: AtomicU64::new(0),
             peer_probes: AtomicU64::new(0),
             parked_tails: AtomicUsize::new(0),
             batch: Mutex::new(()),
@@ -5726,6 +5996,7 @@ fn stats_of(shared: &Shared) -> BrokerStats {
         wills_settled: shared.wills_settled.load(Ordering::Relaxed),
         tail_broadcasts: shared.tail_broadcasts.load(Ordering::Relaxed),
         selective_tail_wakes: shared.selective_tail_wakes.load(Ordering::Relaxed),
+        rate_limited: shared.rate_limited.load(Ordering::Relaxed),
         tail_wakeups: shared.tail_wakeups.load(Ordering::Relaxed),
         peer_probes: shared.peer_probes.load(Ordering::Relaxed),
         parked_tails: shared.parked_tails.load(Ordering::Relaxed),
@@ -6971,6 +7242,13 @@ fn dispatch_request(
             if let Some((code, err)) = publish_subject_error(&out_subject) {
                 return emit(stream, pipe, Err((code, format!("output {err}"))));
             }
+            if let Err(err) = check_publish_rate_limit(
+                shared,
+                producer_id,
+                out_subject.len().saturating_add(out_body.len()),
+            ) {
+                return emit(stream, pipe, Err(err));
+            }
             emit_op(
                 shared,
                 stream,
@@ -7327,6 +7605,13 @@ fn serve_publish(
     if let Some(err) = publish_subject_error(&subject) {
         return emit(stream, pipe, Err(err));
     }
+    if let Err(err) = check_publish_rate_limit(
+        shared,
+        producer_id,
+        subject.len().saturating_add(body.len()),
+    ) {
+        return emit(stream, pipe, Err(err));
+    }
     emit_op(
         shared,
         stream,
@@ -7338,6 +7623,33 @@ fn serve_publish(
             body,
         },
     )
+}
+
+fn check_publish_rate_limit(
+    shared: &Shared,
+    producer_id: u64,
+    wire_bytes: usize,
+) -> Result<(), Refusal> {
+    if !shared.has_rate_limit.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let res = {
+        let mut limiter = match shared.rate_limiter.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        limiter.try_acquire(producer_id, wire_bytes)
+    };
+    match res {
+        Ok(()) => Ok(()),
+        Err((retry_ms, why)) => {
+            shared.rate_limited.fetch_add(1, Ordering::Relaxed);
+            Err(refusal(
+                ERR_RATE_LIMITED,
+                format!("{RATE_LIMITED_PREFIX}{retry_ms} ({why})"),
+            ))
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

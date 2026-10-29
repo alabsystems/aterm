@@ -335,6 +335,71 @@ fn the_dead_band_and_the_first_reading_rest_on_the_target() {
     );
 }
 
+/// The frames a reading's episode owes a window (`needle_frames_owed`, what the `measure` spin
+/// row bounds the needle's deadlines by) are the frames a window draws after the reading's own,
+/// to rest: none where it rests at once (under the dead-band, the first reading, a reading no
+/// window animates, a snapped needle), some where a tip or a soak sweeps or a reading lands
+/// mid-sweep.
+#[test]
+fn a_readings_owed_frames_are_the_frames_a_window_draws_after_its_own() {
+    let t0 = Instant::now();
+    let [view, _] = views(Duration::from_micros(16_667));
+    let px = view.px_per_deg;
+    let drawn_after = |n: &Needle| {
+        let mut f = n.frame_at(view, n.t0);
+        let mut frames = 0;
+        while let Some(next) = n.next_after(view, f) {
+            f = n.frame_at(view, next);
+            frames += 1;
+        }
+        frames
+    };
+    let rest = Needle::at_rest(t0, (10.0, 0.30));
+    let moving = swing(t0, START, END, px);
+    let cases = [
+        ("under a pixel", swing(t0, 10.0, 10.0 + 0.9 / px, px), false),
+        (
+            "a pixel and a half",
+            swing(t0, 10.0, 10.0 + 1.5 / px, px),
+            true,
+        ),
+        ("the whole dial", moving, true),
+        (
+            "no window animates a dial",
+            swing(t0, START, END, 0.0),
+            false,
+        ),
+        (
+            "the first reading",
+            Needle::retarget(None, t0, Some((40.0, 0.5)), px).expect("a needle"),
+            false,
+        ),
+        (
+            "the soak alone",
+            Needle::retarget(Some(rest), t0, Some((10.0, 0.30 + 4.0 * SOAK_STEP)), px)
+                .expect("a needle"),
+            true,
+        ),
+        (
+            "mid-sweep, onto where it stands",
+            Needle::retarget(
+                Some(moving),
+                t0 + MS * 100,
+                Some((moving.sample(t0 + MS * 100)[0], 0.2)),
+                px,
+            )
+            .expect("a needle"),
+            true,
+        ),
+        ("snapped", moving.snapped(t0), false),
+    ];
+    for (what, n, sweeps) in cases {
+        let owed = n.frames_owed(view, None);
+        assert_eq!(owed, drawn_after(&n), "{what}: owed as drawn");
+        assert_eq!(owed > 0, sweeps, "{what}: {owed} owed");
+    }
+}
+
 /// What a window draws at each millisecond from `from` to `to` after `n`'s retarget, recording
 /// each frame as the splice does (`WindowState::deck_needle_drawn`), in `view(ms)`: the tip's
 /// angle it draws, degrees, each millisecond.
@@ -592,6 +657,11 @@ fn an_episode_takes_the_frames_the_live_design_quotes() {
                     f = n.frame_at(view, next);
                     frames += 1;
                 }
+                assert_eq!(
+                    n.frames_owed(view, None),
+                    frames - 1,
+                    "{name} 2× at {interval:?}, {from}° to {to}°: owed after the reading's own"
+                );
                 got.push((frames, f.at_ns / 1_000_000));
             }
             let want = want.into_iter().zip(last_ms).collect::<Vec<_>>();

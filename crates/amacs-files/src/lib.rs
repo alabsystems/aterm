@@ -49,6 +49,8 @@ macro_rules! verify_island {
 pub mod host;
 pub mod io;
 pub mod save_words;
+/// The file watch: an open document hears its file change on disk.
+pub mod watch;
 
 /// A document store whose write capability a test mints: a test process that handles no untrusted
 /// input is its own trusted launcher.

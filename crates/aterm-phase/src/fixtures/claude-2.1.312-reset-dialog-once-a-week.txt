@@ -1,0 +1,12 @@
+# claude-code 2.1.312 · COMPOSED 2026-10-28, never captured: the texts are the bundle's (byte offsets into the store's 2.1.312 binary, sha256 6b5ec691…, scratchpad phase-drift-2312/build/wording.md: the once-a-week session reset's row `OJ.label` `Reset your 5-hour limit now` @228882669 (2.1.311 `Reset your session limit now`), drawn only where no grant row is (`F=!Me&&!ji&&ps` @262873250); the dialog's stop row @262875464, its wait and credits rows as 2.1.304's), the frame is the wall dialog's hand-built one (claude-2.1.287-usage-limit-dialog-fullscreen-panel.txt, as the 2.1.304 reset screens), the values are invented · OPEN: replace with a capture (SPEC §6) · the dialog with 2.1.312's once-a-week row where the grant rows go (it claims at once, with no confirmation): no grant row
+⏺ Suites are running; I'll report the number when it lands.
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   What do you want to do?
+
+   ❯ 1. Stop and wait for limit to reset
+     2. Reset your 5-hour limit now
+     3. Wait here, then continue automatically at Oct 9 at 5am
+     4. Switch to usage credits
+
+   Enter to confirm · Esc to cancel

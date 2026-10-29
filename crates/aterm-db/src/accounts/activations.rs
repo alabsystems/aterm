@@ -152,28 +152,38 @@ impl Activations {
     pub fn inspect(&self, account: Digest) -> Result<aterm_json::Value> {
         use aterm_codec::hex::encode_lower as hex;
         use aterm_json::json;
-        self.with_store(false,|session,store,scope| {
-            let history=History::read(session,store,scope.trust())?;
-            let state=history.status(account);
-            let (status,heads)=match state {
-                State::Empty=>("empty",vec![]),State::Pending=>("pending",vec![]),State::Invalid=>("invalid",vec![]),
-                State::Conflict(heads)=>("conflict",heads),State::Stopped(head)=>("stopped",vec![head]),State::Ready(head)=>("ready",vec![head]),
-            };
-            let decisions:Vec<_>=history.records.values().filter(|r|r.request().account==account).map(|r|json!({
+        crate::documents::application::observe_store(
+            &self.paths,
+            descriptor,
+            |session, store, scope| {
+                let history = History::read(session, store, scope.trust())?;
+                let state = history.status(account);
+                let (status, heads) = match state {
+                    State::Empty => ("empty", vec![]),
+                    State::Pending => ("pending", vec![]),
+                    State::Invalid => ("invalid", vec![]),
+                    State::Conflict(heads) => ("conflict", heads),
+                    State::Stopped(head) => ("stopped", vec![head]),
+                    State::Ready(head) => ("ready", vec![head]),
+                };
+                let decisions:Vec<_>=history.records.values().filter(|r|r.request().account==account).map(|r|json!({
                 "decision":hex(&r.id()),"generation":r.request().generation,"parents":r.request().parents.iter().map(|p|hex(p)).collect::<Vec<_>>(),
                 "kind":if matches!(r.request().action,Action::Stop){"stop"}else{"prepare"},"control":hex(&r.control()),
                 "authored_at_unix_ms":r.authored_ms(),"time_source":"root-signed-author-claim"
             })).collect();
-            let transport:Vec<_>=store.metadata_evidence(session)?.into_iter().filter_map(|e| {
+                let transport:Vec<_>=store.metadata_evidence(session)?.into_iter().filter_map(|e| {
                 let payload=e.record.as_ref()?.payload();
                 if payload.get(..5)!=Some(b"AAOP1") || payload.get(5..21)==Some(&[0;16]) {return None}
                 let r=Record::verify(payload.get(21..)?,scope.trust()).ok()?;
                 if r.request().account!=account {return None}
                 Some(json!({"decision":hex(&r.id()),"operation":hex(&e.header.id),"relay":hex(&e.header.actor),"received_at_unix_ms":e.receipt.received_ms,"local_journal_offset":e.receipt.offset}))
             }).collect();
-            Ok(json!({"kind":"account-decisions","account":hex(&account),"table":hex(&scope.digest()),"state":status,
-                "heads":heads.iter().map(|p|hex(p)).collect::<Vec<_>>(),"decisions":decisions,"transport":transport,"unavailable":history.unavailable,"ignored":history.ignored}))
-        })
+                Ok(
+                    json!({"kind":"account-decisions","account":hex(&account),"table":hex(&scope.digest()),"state":status,
+                "heads":heads.iter().map(|p|hex(p)).collect::<Vec<_>>(),"decisions":decisions,"transport":transport,"unavailable":history.unavailable,"ignored":history.ignored}),
+                )
+            },
+        )
     }
 
     /// Publish one explicit root decision. A retry returns the stored decision

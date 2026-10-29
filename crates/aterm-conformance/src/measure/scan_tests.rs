@@ -1540,6 +1540,29 @@ fn a_take_with_mismatched_rows_or_sizes_is_refused() {
         scan_frames(&names, frames.into_iter().map(Ok), &ctx),
         Err(ScanError::SizeMismatch { .. })
     ));
+    let empty_frames = [
+        Frame::filled(0, 0, [7, 8, 9]),
+        Frame::filled(0, 0, [7, 8, 9]),
+    ];
+    assert_eq!(frame_background(&empty_frames[0]), [0, 0, 0]);
+    let empty_report = scan_frames(&names, empty_frames.into_iter().map(Ok), &ctx)
+        .expect("empty frames scan without panicking");
+    assert_eq!((empty_report.frames, empty_report.total_ink), (2, 0));
+    let malformed_ctx = TakeContext {
+        statuses: Some(vec![
+            StatusRow::new("trail spawns=0 pet_active=false cat_active=false ribbon_hue_bands=0"),
+            StatusRow::new("trail spawns=bad pet_active=false cat_active=false ribbon_hue_bands=0"),
+        ]),
+        ..ctx
+    };
+    let frames = [frame(4, 4, &[]), frame(4, 4, &[])];
+    assert!(matches!(
+        scan_frames(&names, frames.into_iter().map(Ok), &malformed_ctx),
+        Err(ScanError::MalformedStatus {
+            frame: 1,
+            error: StatusError { ref key, .. }
+        }) if key == "spawns"
+    ));
 }
 
 struct Fixture {
@@ -1642,9 +1665,13 @@ fn the_sleeper_is_located_on_the_mid_take_frames_it_is_claimed_on() {
             r.pet_missing,
             r.companion_frames,
             r.pet_final_run,
-            r.companion_stack
+            r.companion_stack,
+            r.companion_height_frames,
+            r.companion_height_px,
+            r.companion_min_h,
+            r.companion_max_h,
         ),
-        (6, 0, 6, 6, 0)
+        (6, 0, 6, 6, 0, 4, Some(15), Some(14), Some(15))
     );
     let mid = &r.per_frame[1];
     assert_eq!(mid.companion, Shape::new(209, 24, 13));
@@ -1967,6 +1994,22 @@ fn the_first_keys_spring_is_located_on_the_mid_take_frames_it_is_claimed_on() {
     }
     assert_eq!(r.per_frame[1].companion, Shape::new(404, 36, 22));
     assert_eq!(r.per_frame[4].companion, Shape::new(305, 33, 19));
+    assert_eq!(
+        (
+            r.companion_height_frames,
+            r.companion_height_px,
+            r.companion_max_h
+        ),
+        (4, Some(19), Some(19))
+    );
+    assert!(
+        r.companion_min_h
+            .is_some_and(|lo| { crate::measure::paint::Companion::Pet.height_holds(lo, r.cell.h) })
+    );
+    assert!(crate::measure::paint::companion_height_holds(
+        crate::measure::paint::Companion::Pet,
+        &r
+    ));
 }
 
 #[test]

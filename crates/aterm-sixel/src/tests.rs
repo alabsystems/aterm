@@ -143,33 +143,53 @@ fn capped_raster_at_the_pixel_limit_still_decodes() {
 }
 
 #[test]
+fn partial_last_band_at_pixel_cap_decodes_without_band_rounding_refusal() {
+    let mut body = vec![b'-'; 681];
+    body.extend_from_slice(b"#1;2;100;0;0#1!1026A");
+    let img = decode(&body).expect(
+        "1026x4088 = 4,194,288 <= SIXEL_MAX_PIXELS must not fail closed to band height 4092",
+    );
+    assert_eq!((img.width(), img.height()), (1026, 4088));
+    let last_row = &img.pixels()[4087 * 1026..4088 * 1026];
+    assert!(last_row.iter().all(|&px| px == 0xFFFF_0000));
+    assert!(img.pixels()[..4087 * 1026].iter().all(|&px| px == 0));
+}
+
+#[test]
 fn partial_column_sets_only_low_bits() {
     let img = decode(b"\"1;1;1;6#1;2;0;100;0#1A").expect("image");
     assert_eq!(img.width(), 1);
     assert_eq!(img.height(), 6);
-    assert_eq!(img.pixels()[0], 0, "row 0 transparent");
-    assert_eq!(
-        img.pixels()[1] & 0xFF00_FF00,
-        0xFF00_FF00,
-        "row 1 opaque green"
-    );
-    assert_eq!(img.pixels()[2], 0, "row 2 transparent");
+    for row in 0..6usize {
+        if row == 1 {
+            assert_eq!(img.pixels()[row], 0xFF00_FF00, "row 1 opaque green");
+        } else {
+            assert_eq!(img.pixels()[row], 0, "row {row} transparent");
+        }
+    }
 }
 
 #[test]
 fn dimensions_are_clamped() {
     let body = b"#1;2;100;0;0#1!4294967295~";
     let img = decode(body).expect("image");
-    assert!(img.width() <= SIXEL_MAX_DIMENSION, "width clamped");
-    assert!(img.height() <= SIXEL_MAX_DIMENSION, "height clamped");
-    assert_eq!(img.pixels().len(), img.width() * img.height());
+    assert_eq!(img.width(), SIXEL_MAX_DIMENSION, "width clamped to 4096");
+    assert_eq!(img.height(), 6, "single band height");
+    assert_eq!(img.pixels().len(), SIXEL_MAX_DIMENSION * 6);
 }
 
 #[test]
 fn register_select_out_of_range_is_clamped_no_panic() {
-    let img = decode(b"\"1;1;1;6#99999~").expect("image");
-    assert_eq!(img.width(), 1);
-    assert_eq!(img.height(), 6);
+    let mut d = SixelDecoder::new();
+    d.hook();
+    for &b in b"\"1;1;1;6#99999~" {
+        d.put(b);
+    }
+    assert_eq!(d.palette.len(), MAX_COLOR_REGISTERS);
+    assert_eq!(d.current_color, MAX_COLOR_REGISTERS - 1);
+    let img = d.unhook().expect("image");
+    assert_eq!((img.width(), img.height()), (1, 6));
+    assert!(img.pixels().iter().all(|&px| px == 0xFF00_0000));
 }
 
 #[test]
@@ -259,9 +279,9 @@ fn decgra_only_oversized_yields_none_without_transient() {
     );
     assert!(
         d.unhook().is_none(),
-        "over-cap declared geometry (4096*4096*4 > SIXEL_MAX_IMAGE_BYTES) must yield None"
+        "over-cap declared geometry (4096*4096 > SIXEL_MAX_PIXELS) must yield None"
     );
-    const _: () = assert!(4096usize * 4096 * 4 > SIXEL_MAX_IMAGE_BYTES);
+    const _: () = assert!(4096usize * 4096 > SIXEL_MAX_PIXELS);
 }
 
 #[test]
@@ -366,59 +386,30 @@ fn decoder_is_bounded_on_arbitrary_streams() {
 }
 
 #[test]
-fn sixel_const_helpers_round_trip() {
-    assert!(!is_sixel_data_byte(0x3E));
-    assert!(is_sixel_data_byte(0x3F));
-    assert!(is_sixel_data_byte(0x7E));
-    assert!(!is_sixel_data_byte(0x7F));
-    assert_eq!(sixel_data_bits(0x3E), None);
-    for bits in 0..=63u8 {
-        let b = encode_sixel_data_byte(bits);
-        assert!(is_sixel_data_byte(b));
-        assert_eq!(sixel_data_bits(b), Some(bits));
-    }
-    for row in 0..6usize {
-        let mask = sixel_row_mask(row);
-        assert_eq!(mask, 1u8 << row);
-        assert!(sixel_bit_is_set(mask, row));
-        assert!(!sixel_bit_is_set(0, row));
-    }
-    assert_eq!(sixel_row_mask(6), 0);
-    assert!(!sixel_bit_is_set(0x3F, 6));
-    assert_eq!(clamp_color_register(0), 0);
-    assert_eq!(clamp_color_register(99_999), MAX_COLOR_REGISTERS - 1);
-    assert_eq!(clamp_sixel_dimension(100), 100);
-    assert_eq!(clamp_sixel_dimension(99_999), SIXEL_MAX_DIMENSION);
-    assert_eq!(checked_sixel_pixel_count(0, 10), None);
-    assert_eq!(
-        checked_sixel_pixel_count(2048, 2048),
-        Some(SIXEL_MAX_PIXELS)
-    );
-    assert_eq!(checked_sixel_pixel_count(4096, 4096), None);
-    assert_eq!(
-        checked_sixel_image_bytes(2048, 2048),
-        Some(SIXEL_MAX_IMAGE_BYTES)
-    );
-    assert_eq!(checked_sixel_image_bytes(4096, 4096), None);
-    let px = pack_argb_pixel(0x12, 0x34, 0x56);
-    assert_eq!(unpack_argb_channels(px), (0xFF, 0x12, 0x34, 0x56));
-    assert_eq!(decode_argb_pixel_le(encode_argb_pixel_le(px)), px);
+fn rgb_percent_scales_and_clamps_each_component() {
     assert_eq!(scale_pct(0), 0);
     assert_eq!(scale_pct(100), 255);
     assert_eq!(scale_pct(200), 255);
     assert_eq!(rgb_percent(100, 0, 100), 0x00FF_00FF);
+}
 
-    let mut d = SixelDecoder::new();
-    assert!(!d.is_active());
-    d.hook();
-    assert!(d.is_active());
-    for &b in b"\"1;1;4;6#2~~" {
-        d.put(b);
-    }
-    assert_eq!(d.current_color(), 2);
-    assert_eq!(d.cursor_pos(), (2, 0));
-    assert_eq!(d.painted_extent(), (2, 6));
-    assert_eq!(d.declared_dimensions(), (4, 6));
-    let hdr = encode_sixel_header_le(640, 480, 15, 3);
-    assert_eq!(decode_sixel_header_le(hdr), (640, 480, 15, 3));
+#[test]
+fn hls_to_rgb_follows_dec_shifted_hsl() {
+    // DEC HLS places blue at 0°, red at 120°, and green at 240° (+240° hue shift onto HSL).
+    assert_eq!(hls_to_rgb(120, 50, 100), 0x00FF_0000);
+    assert_eq!(hls_to_rgb(240, 50, 100), 0x0000_FF00);
+    assert_eq!(hls_to_rgb(0, 50, 100), 0x0000_00FF);
+    assert_eq!(hls_to_rgb(360, 50, 100), 0x0000_00FF);
+    // Secondary hues at 60° steps: yellow (180°), cyan (300°), magenta (60°).
+    assert_eq!(hls_to_rgb(180, 50, 100), 0x00FF_FF00);
+    assert_eq!(hls_to_rgb(300, 50, 100), 0x0000_FFFF);
+    assert_eq!(hls_to_rgb(60, 50, 100), 0x00FF_00FF);
+    // Lightness/saturation extremes and out-of-range clamping.
+    assert_eq!(hls_to_rgb(120, 0, 100), 0x0000_0000);
+    assert_eq!(hls_to_rgb(120, 100, 100), 0x00FF_FFFF);
+    assert_eq!(hls_to_rgb(120, 50, 0), 0x0080_8080);
+    assert_eq!(hls_to_rgb(480, 250, 250), 0x00FF_FFFF);
+
+    let img = decode(b"\"1;1;1;6#1;1;120;50;100#1~").expect("HLS red image");
+    assert!(img.pixels().iter().all(|&px| px == 0xFFFF_0000));
 }

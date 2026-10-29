@@ -344,6 +344,21 @@ impl CursorGlow {
             {
                 *r = to;
             }
+            // What the lay saved of the hand's line moves with it, as the live hand and doubt do
+            // (its recall hands back a doubt only on the lay's own row), and what it saved of the
+            // line the lift replaced goes, as that line's anchors do.
+            match lay.hand_before {
+                Some(hand) if hand.row == from => lay.hand_before = Some(HandRow::at(to)),
+                Some(hand) if hand.row == to => lay.hand_before = None,
+                _ => {}
+            }
+            match lay.unowned_before {
+                Some(caret) if caret.row == from => {
+                    lay.unowned_before = Some(UnownedCaret { row: to, ..caret });
+                }
+                Some(caret) if caret.row == to => lay.unowned_before = None,
+                _ => {}
+            }
         }
         self.carry_held_park(|r| Some(map_hand_row(r, from, to)));
         if let Some((r, _)) = &mut self.last_licensed_row
@@ -418,15 +433,16 @@ impl CursorGlow {
                 if !first_in {
                     return true;
                 }
-                let mut keep = true;
                 let mut pi = 0;
                 while pi < pts.len() {
                     let y = &mut pts[pi].1;
                     *y += px.dy;
-                    keep &= px.inside(*y);
+                    if !px.inside(*y) {
+                        return false;
+                    }
                     pi += 1;
                 }
-                keep
+                true
             });
         }
 

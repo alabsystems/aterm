@@ -6,5 +6,6 @@
 mod derived_supervise_tape;
 mod models_disk_projected;
 mod models_disk_worker;
+mod models_left;
 mod models_occupancy;
 mod models_wakes;

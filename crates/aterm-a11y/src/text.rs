@@ -149,13 +149,14 @@ impl<'a> Position<'a> {
 
     pub(crate) fn is_word_start(&self) -> bool {
         self.is_paragraph_start()
-            || self
-                .inner
-                .node
-                .data()
-                .word_starts()
-                .binary_search(&(self.inner.character_index as u8))
-                .is_ok()
+            || u8::try_from(self.inner.character_index).is_ok_and(|idx| {
+                self.inner
+                    .node
+                    .data()
+                    .word_starts()
+                    .binary_search(&idx)
+                    .is_ok()
+            })
     }
 
     #[inline]
@@ -209,20 +210,21 @@ impl<'a> Position<'a> {
 
     pub(crate) fn forward_to_character_end(&self) -> Self {
         let pos = self.inner.biased_to_start(&self.root_node);
+        let max_len = pos.node.data().character_lengths().len();
         Self {
             root_node: self.root_node,
             inner: InnerPosition {
                 node: pos.node,
-                character_index: pos.character_index + 1,
+                character_index: (pos.character_index + 1).min(max_len),
             },
         }
     }
 
     pub(crate) fn forward_to_word_start(&self) -> Self {
         let pos = self.inner.biased_to_start(&self.root_node);
-        {
+        if let Ok(char_idx) = u8::try_from(pos.character_index) {
             let word_starts = pos.node.data().word_starts();
-            let index = match word_starts.binary_search(&(pos.character_index as u8)) {
+            let index = match word_starts.binary_search(&char_idx) {
                 Ok(index) => index + 1,
                 Err(index) => index,
             };
@@ -267,9 +269,11 @@ impl<'a> Position<'a> {
     pub(crate) fn backward_to_word_start(&self) -> Self {
         {
             let word_starts = self.inner.node.data().word_starts();
-            let index = match word_starts.binary_search(&(self.inner.character_index as u8)) {
-                Ok(index) => index,
-                Err(index) => index,
+            let index = match u8::try_from(self.inner.character_index) {
+                Ok(char_idx) => match word_starts.binary_search(&char_idx) {
+                    Ok(index) | Err(index) => index,
+                },
+                Err(_) => word_starts.len(),
             };
             if let Some(index) = index.checked_sub(1) {
                 return Self {
@@ -448,7 +452,7 @@ impl<'a> Range<'a> {
 
     fn walk<F, T>(&self, mut f: F) -> Option<T>
     where
-        F: FnMut(&Node<'a>) -> Option<T>,
+        F: FnMut(&Node<'a>, InnerPosition<'a>, InnerPosition<'a>) -> Option<T>,
     {
         let (start, end) = if self.is_degenerate() {
             (self.start, self.start)
@@ -457,14 +461,14 @@ impl<'a> Range<'a> {
             let end = self.end.biased_to_end(&self.node);
             (start, end)
         };
-        if let Some(result) = f(&start.node) {
+        if let Some(result) = f(&start.node, start, end) {
             return Some(result);
         }
         if start.node.id() == end.node.id() {
             return None;
         }
         for node in start.node.following_text_runs(&self.node) {
-            if let Some(result) = f(&node) {
+            if let Some(result) = f(&node, start, end) {
                 return Some(result);
             }
             if node.id() == end.node.id() {
@@ -478,22 +482,24 @@ impl<'a> Range<'a> {
     where
         F: FnMut(&Node<'a>, &str) -> Option<T>,
     {
-        self.walk(|node| {
+        self.walk(|node, start, end| {
             let character_lengths = node.data().character_lengths();
-            let start_index = if node.id() == self.start.node.id() {
-                self.start.character_index
+            let len = character_lengths.len();
+            let start_index = if node.id() == start.node.id() {
+                start.character_index.min(len)
             } else {
                 0
             };
-            let end_index = if node.id() == self.end.node.id() {
-                self.end.character_index
+            let end_index = if node.id() == end.node.id() {
+                end.character_index.min(len)
             } else {
-                character_lengths.len()
-            };
+                len
+            }
+            .max(start_index);
             let value = node.data().value().unwrap_or_default();
             let s = if start_index == end_index {
                 ""
-            } else if start_index == 0 && end_index == character_lengths.len() {
+            } else if start_index == 0 && end_index == len {
                 value
             } else {
                 let slice_start = character_lengths[..start_index]
@@ -530,7 +536,7 @@ impl<'a> Range<'a> {
     /// Returns the range's transformed bounding boxes relative to the tree's container.
     pub(crate) fn bounding_boxes(&self) -> Vec<Rect> {
         let mut result = Vec::new();
-        self.walk(|node| {
+        self.walk(|node, start, end| {
             let mut rect = match node.data().bounds() {
                 Some(rect) => rect,
                 None => {
@@ -556,21 +562,28 @@ impl<'a> Range<'a> {
                 }
             };
             let character_lengths = node.data().character_lengths();
-            let start_index = if node.id() == self.start.node.id() {
-                self.start.character_index
+            let len = character_lengths.len();
+            if positions.len() < len || widths.len() < len {
+                return Some(Vec::new());
+            }
+            let start_index = if node.id() == start.node.id() {
+                start.character_index.min(len)
             } else {
                 0
             };
-            let end_index = if node.id() == self.end.node.id() {
-                self.end.character_index
+            let end_index = if node.id() == end.node.id() {
+                end.character_index.min(len)
             } else {
-                character_lengths.len()
-            };
-            if start_index != 0 || end_index != character_lengths.len() {
-                let pixel_start = if start_index < character_lengths.len() {
+                len
+            }
+            .max(start_index);
+            if start_index != 0 || end_index != len {
+                let pixel_start = if start_index < len {
                     positions[start_index]
-                } else {
+                } else if len > 0 {
                     positions[start_index - 1] + widths[start_index - 1]
+                } else {
+                    0.0
                 };
                 let pixel_end = if end_index == start_index {
                     pixel_start
@@ -670,7 +683,13 @@ fn character_index_at_point(node: &Node, point: Point) -> usize {
             return 0;
         }
     };
-    for (i, (position, width)) in positions.iter().zip(widths.iter()).enumerate().rev() {
+    for (i, (position, width)) in positions
+        .iter()
+        .zip(widths.iter())
+        .take(character_lengths.len())
+        .enumerate()
+        .rev()
+    {
         let relative_pos = match direction {
             TextDirection::LeftToRight => point.x - rect.x0,
             TextDirection::RightToLeft => rect.x1 - point.x,
@@ -760,12 +779,20 @@ impl<'a> Node<'a> {
         let selection = self.data().text_selection()?;
         let anchor = InnerPosition::clamped_upgrade(self.tree_state, selection.anchor)?;
         let focus = InnerPosition::clamped_upgrade(self.tree_state, selection.focus)?;
+        if !self.text_runs().any(|run| run.id() == anchor.node.id())
+            || !self.text_runs().any(|run| run.id() == focus.node.id())
+        {
+            return None;
+        }
         Some(Range::new(*self, anchor, focus))
     }
 
     pub(crate) fn text_selection_focus(&self) -> Option<Position<'a>> {
         let selection = self.data().text_selection()?;
         let focus = InnerPosition::clamped_upgrade(self.tree_state, selection.focus)?;
+        if !self.text_runs().any(|run| run.id() == focus.node.id()) {
+            return None;
+        }
         Some(Position {
             root_node: *self,
             inner: focus,
@@ -868,5 +895,182 @@ impl<'a> Node<'a> {
             return Some(self.document_end());
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{
+        Node as Data, NodeId as LocalNodeId, Point, Rect, Role, TextDirection,
+        TextPosition as WeakPosition, TextSelection, Tree, TreeId, TreeUpdate,
+    };
+    use crate::platform::Publication;
+
+    #[test]
+    fn word_navigation_past_255_characters_does_not_wrap_u8() {
+        let mut root = Data::new(Role::Document);
+        root.set_children(vec![LocalNodeId(2), LocalNodeId(3)]);
+
+        let mut long_run = Data::new(Role::TextRun);
+        let text = format!("word {}tail", "a".repeat(260));
+        long_run.set_value(text.as_str());
+        long_run.set_character_lengths(vec![1; text.len()]);
+        long_run.set_word_starts(vec![0, 5]);
+
+        let mut next_run = Data::new(Role::TextRun);
+        next_run.set_value("next");
+        next_run.set_character_lengths(vec![1; 4]);
+        next_run.set_word_starts(vec![0]);
+
+        let mut pub_state = Publication::default();
+        pub_state.update(TreeUpdate {
+            nodes: vec![
+                (LocalNodeId(1), root),
+                (LocalNodeId(2), long_run),
+                (LocalNodeId(3), next_run),
+            ],
+            tree: Some(Tree::new(LocalNodeId(1))),
+            tree_id: TreeId::ROOT,
+            focus: LocalNodeId(1),
+        });
+        let tree = pub_state.tree().unwrap();
+        let doc = tree.root();
+
+        let pos_256 = doc.text_position_from_global_usv_index(256).unwrap();
+        assert_eq!(pos_256.inner.character_index, 256);
+        assert!(
+            !pos_256.is_word_start(),
+            "index 256 must not wrap to u8 index 0"
+        );
+
+        let forward = pos_256.forward_to_word_start();
+        assert_eq!(forward.inner.node.id(), NodeId(LocalNodeId(3)));
+        assert_eq!(forward.inner.character_index, 0);
+
+        let backward = pos_256.backward_to_word_start();
+        assert_eq!(backward.inner.node.id(), NodeId(LocalNodeId(2)));
+        assert_eq!(backward.inner.character_index, 5);
+    }
+
+    #[test]
+    fn forward_to_character_end_clamps_at_document_end_and_degenerate_cross_run_range_is_empty() {
+        let mut root = Data::new(Role::Document);
+        root.set_children(vec![LocalNodeId(2), LocalNodeId(3)]);
+
+        let mut run1 = Data::new(Role::TextRun);
+        run1.set_value("abc");
+        run1.set_character_lengths(vec![1, 1, 1]);
+
+        let mut run2 = Data::new(Role::TextRun);
+        run2.set_value("def");
+        run2.set_character_lengths(vec![1, 1, 1]);
+
+        let mut pub_state = Publication::default();
+        pub_state.update(TreeUpdate {
+            nodes: vec![
+                (LocalNodeId(1), root),
+                (LocalNodeId(2), run1),
+                (LocalNodeId(3), run2),
+            ],
+            tree: Some(Tree::new(LocalNodeId(1))),
+            tree_id: TreeId::ROOT,
+            focus: LocalNodeId(1),
+        });
+        let tree = pub_state.tree().unwrap();
+        let doc = tree.root();
+
+        let end = doc.document_end();
+        let stepped = end.forward_to_character_end();
+        assert_eq!(stepped, end);
+        assert_eq!(stepped.to_global_usv_index(), 6);
+
+        let r1 = tree.node_by_id(NodeId(LocalNodeId(2))).unwrap();
+        let r2 = tree.node_by_id(NodeId(LocalNodeId(3))).unwrap();
+        let cross_degenerate = Range::new(
+            doc,
+            InnerPosition {
+                node: r1,
+                character_index: 3,
+            },
+            InnerPosition {
+                node: r2,
+                character_index: 0,
+            },
+        );
+        assert!(cross_degenerate.is_degenerate());
+        assert_eq!(cross_degenerate.text(), "");
+    }
+
+    #[test]
+    fn mismatched_geometry_lengths_and_foreign_text_selection_stay_in_bounds() {
+        let mut window = Data::new(Role::Window);
+        window.set_children(vec![LocalNodeId(2), LocalNodeId(4)]);
+
+        let mut doc1 = Data::new(Role::Document);
+        doc1.set_children(vec![LocalNodeId(3)]);
+        doc1.set_text_direction(TextDirection::LeftToRight);
+        doc1.set_text_selection(TextSelection {
+            anchor: WeakPosition {
+                node: LocalNodeId(5),
+                character_index: 0,
+            },
+            focus: WeakPosition {
+                node: LocalNodeId(5),
+                character_index: 2,
+            },
+        });
+
+        let mut short_geom_run = Data::new(Role::TextRun);
+        short_geom_run.set_value("abcd");
+        short_geom_run.set_character_lengths(vec![1, 1, 1, 1]);
+        short_geom_run.set_bounds(Rect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 40.0,
+            y1: 10.0,
+        });
+        short_geom_run.set_character_positions(vec![0.0]);
+        short_geom_run.set_character_widths(vec![10.0]);
+
+        let mut doc2 = Data::new(Role::Document);
+        doc2.set_children(vec![LocalNodeId(5)]);
+        doc2.set_text_direction(TextDirection::LeftToRight);
+
+        let mut long_geom_run = Data::new(Role::TextRun);
+        long_geom_run.set_value("xy");
+        long_geom_run.set_character_lengths(vec![1, 1]);
+        long_geom_run.set_bounds(Rect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 40.0,
+            y1: 10.0,
+        });
+        long_geom_run.set_character_positions(vec![0.0, 10.0, 20.0, 30.0]);
+        long_geom_run.set_character_widths(vec![10.0, 10.0, 10.0, 10.0]);
+
+        let mut pub_state = Publication::default();
+        pub_state.update(TreeUpdate {
+            nodes: vec![
+                (LocalNodeId(1), window),
+                (LocalNodeId(2), doc1),
+                (LocalNodeId(3), short_geom_run),
+                (LocalNodeId(4), doc2),
+                (LocalNodeId(5), long_geom_run),
+            ],
+            tree: Some(Tree::new(LocalNodeId(1))),
+            tree_id: TreeId::ROOT,
+            focus: LocalNodeId(2),
+        });
+        let tree = pub_state.tree().unwrap();
+        let d1 = tree.node_by_id(NodeId(LocalNodeId(2))).unwrap();
+        assert!(d1.text_selection().is_none());
+        assert!(d1.text_selection_focus().is_none());
+        assert!(d1.document_range().bounding_boxes().is_empty());
+
+        let d2 = tree.node_by_id(NodeId(LocalNodeId(4))).unwrap();
+        let hit = d2.text_position_at_point(Point { x: 35.0, y: 5.0 });
+        assert!(hit.inner.character_index <= 2);
+        assert_eq!(hit.to_global_usv_index(), 2);
     }
 }

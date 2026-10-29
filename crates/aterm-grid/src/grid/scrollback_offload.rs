@@ -498,6 +498,9 @@ impl Grid {
             .expect("scrollback.is_none() early-returned above");
         self.close_reflow_window_cap_run();
         self.storage.scrollback_detached_for_reflow = true;
+        self.storage
+            .replay_carried_history
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         self.storage.staged_width_stale = false;
         self.storage.pending_scrollback_settings = Some(pending_settings);
         self.storage.detached_reader_aim = None;
@@ -574,6 +577,8 @@ impl Grid {
             self.settle_fill(pulled);
         }
         let sb = self.storage.scrollback_lines();
+        self.storage.deep_history_pullback_ordinal =
+            self.storage.deep_history_pullback_ordinal.wrapping_add(1);
         let reader_descended_to_live =
             self.storage.reader_live_bottom_gen != reflowed.detach_live_bottom_gen;
         if !(reader_descended_to_live && self.storage.display_offset == 0) {
@@ -693,6 +698,9 @@ impl Grid {
         let detach_live_bottom_gen = self.storage.reader_live_bottom_gen;
         self.close_reflow_window_cap_run();
         self.storage.scrollback_detached_for_reflow = true;
+        self.storage
+            .replay_carried_history
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         self.storage.staged_width_stale = false;
         self.storage.pending_scrollback_settings = Some(pending_settings);
         self.storage.detached_reader_aim = None;
@@ -1650,15 +1658,20 @@ mod tests {
     fn stepping_interleaved_with_window_output_keeps_history_and_order() {
         let (rows, cols) = (10u16, 40u16);
         let mut g = tiered_grid(rows, cols, 8);
+        let mut plain = tiered_grid(rows, cols, 8);
         for i in 0..400 {
-            logical_line(&mut g, &format!("H{i}"));
+            let line = format!("H{i}");
+            logical_line(&mut g, &line);
+            logical_line(&mut plain, &line);
         }
-        let before = g.scrollback_lines();
         let mut job = g.resize_offloading_scrollback(rows, 20).expect("job");
+        plain.resize(rows, 20);
         let mut wrote = 0usize;
         let done = loop {
             for _ in 0..3 {
-                logical_line(&mut g, &format!("W{wrote}"));
+                let line = format!("W{wrote}");
+                logical_line(&mut g, &line);
+                logical_line(&mut plain, &line);
                 wrote += 1;
             }
             match job.reflow_step(64) {
@@ -1667,28 +1680,16 @@ mod tests {
             }
         };
         g.reattach_reflowed_scrollback(done);
-        let after = g.scrollback_lines();
-        assert!(
-            after + rows as usize + 8 >= before + wrote,
-            "window output must survive stepping (before={before}, wrote={wrote}, \
-             after={after})"
+        assert_eq!(
+            history_seq(&g),
+            history_seq(&plain),
+            "interleaved offload stepping must equal synchronous plain resize history"
         );
-        let texts: Vec<String> = (0..after)
-            .filter_map(|i| {
-                g.get_history_line(i)
-                    .and_then(|l| l.as_str().map(str::to_string))
-            })
-            .collect();
-        let last_h = texts.iter().rposition(|t| t.starts_with('H'));
-        let first_w = texts.iter().position(|t| t.starts_with('W'));
-        match (last_h, first_w) {
-            (Some(lh), Some(fw)) => assert!(
-                lh < fw,
-                "old history must precede window output after re-attach \
-                 (last H at {lh}, first W at {fw})"
-            ),
-            _ => panic!("both H and W lines must be present in history"),
-        }
+        assert_eq!(
+            screen_rows(&g),
+            screen_rows(&plain),
+            "interleaved offload stepping must equal synchronous plain resize screen"
+        );
         g.assert_invariants();
     }
 

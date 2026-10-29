@@ -968,6 +968,26 @@ impl App {
         );
     }
 
+    /// Whether window `wid`'s front view is Settings on its Packages page.
+    pub(crate) fn packages_page_in_front(&self, wid: crate::WindowId) -> bool {
+        self.active_native_view(wid).is_some_and(|(_, view)| {
+            matches!(
+                self.native_runtime.view_state(view),
+                Some(crate::native_app::AppViewState::Settings(state))
+                    if state.route == crate::native_settings::SettingsRoute::Packages
+            )
+        })
+    }
+
+    /// Window `wid`'s front tab moved, or the window became key: when its front is the Packages
+    /// page, read the package status again, so what a terminal changed meanwhile shows on it (the
+    /// LAN sharing switch after `aterm pkg serve-units --off|--on`, an install).
+    pub(crate) fn packages_page_met_the_front(&mut self, wid: crate::WindowId) {
+        if self.packages_page_in_front(wid) {
+            self.start_native_packages_refresh();
+        }
+    }
+
     /// [`Self::open_settings_tab`] in a named window.
     pub(crate) fn open_settings_tab_in_window(
         &mut self,
@@ -2231,6 +2251,7 @@ mod tests {
                     true,
                     geom,
                     &crate::cursor_rainbow::RainbowConfig {
+                        light: aterm_effects::cursor_glow::Light::OFF,
                         enabled: true,
                         intensity: 1.0,
                         blinking: true,
@@ -2266,6 +2287,7 @@ mod tests {
                     1.0,
                     geom,
                     &crate::cursor_beam::BeamRodConfig {
+                        light: aterm_effects::cursor_glow::Light::OFF,
                         enabled: true,
                         intensity: 1.0,
                         color: 0x00FF_44CC,
@@ -2289,6 +2311,7 @@ mod tests {
                     1.0,
                     geom,
                     &crate::cursor_comet::CometConfig {
+                        light: aterm_effects::cursor_glow::Light::OFF,
                         enabled: true,
                         intensity: 1.0,
                         color: 0x0044_CCFF,

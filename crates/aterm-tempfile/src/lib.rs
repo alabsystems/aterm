@@ -6,6 +6,8 @@
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 
+#[cfg(unix)]
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -13,8 +15,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Generate a temporary name component from the pid, a process-wide counter
-/// and OS randomness.
+/// Generate a temporary name component from the pid, a process-wide counter,
+/// and OS randomness (injective within one process; [`TempDir::made_in`]
+/// retries on cross-process collision).
 #[cfg_attr(trust_verify, trust::skip)]
 fn unique_name(prefix: &str) -> String {
     let pid = std::process::id();
@@ -318,7 +321,7 @@ const fn made_quiet(_dir: &Path, _quiet: &Path) -> bool {
 }
 
 /// This process's effective user id.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 #[cfg_attr(trust_verify, trust::skip)]
 fn euid() -> u32 {
     unsafe extern "C" {
@@ -359,8 +362,12 @@ impl TempDir {
 
     /// Create a new temporary directory with a custom prefix in exactly `dir`.
     fn made_in(prefix: &str, dir: &Path) -> io::Result<Self> {
+        Self::made_in_with(dir, || unique_name(prefix))
+    }
+
+    fn made_in_with(dir: &Path, mut next_name: impl FnMut() -> String) -> io::Result<Self> {
         for _ in 0..5 {
-            let name = unique_name(prefix);
+            let name = next_name();
             let mut components = Path::new(&name).components();
             if !matches!(components.next(), Some(std::path::Component::Normal(part)) if part == name.as_str())
                 || components.next().is_some()
@@ -492,7 +499,148 @@ pub fn tempdir() -> io::Result<TempDir> {
     TempDir::new()
 }
 
+/// The name, before the user id, of the folder in the temporary directory's quiet folder that
+/// holds a user's shared stand-ins ([`shared_stand_in`]). aterm-verify's stand-ins made it
+/// first; the name stays, so every stand-in shares the files they made.
+#[cfg(unix)]
+const STAND_IN_CACHE: &str = "atv-standins-";
+
+/// THE ONE NAME OF A STAND-IN'S FILE: the file holding `text` in this user's cache in the
+/// temporary directory's quiet folder ([`quiet_in`]) that the stand-ins of `text` this process
+/// lays are symlinks to (`stand_in` on macOS, aterm-verify's `standin` on every unix). It is the
+/// first of the cache's slots that holds `text` whole, made when none does yet (`cached_in`), so
+/// a later process finds that same file; first writers that raced may each run a slot of their
+/// own (up to four), and a stand-in written in place runs none. It stays this process's file for
+/// `text` while it still holds `text`: each call checks it again (`holds`), and one that no
+/// longer does (made writable and written through, or removed) is passed over for the slot
+/// `cached_in` gives next. `None` when the cache cannot be used; the stand-in is then written
+/// in place.
+///
+/// macOS assesses the first exec of each file, so a test pays one assessment per text, not one
+/// per stand-in. That file's one name is never removed. macOS reads an exec's file by name to
+/// assess it, and a file with several names (hard links, one per stand-in) need not be named by
+/// the link an exec ran it through: on 27.0.1, once one fixture had opened its link, an exec
+/// through another fixture's left the kernel naming the file, by its id, by the first fixture's
+/// link. A fixture removing its own (its directory going at its end) could so leave the
+/// assessment of another fixture's exec reading a name that was gone; syspolicyd then ended that
+/// stand-in as malware (`killed by signal 9`, an exec security-policy exit). A symlink is no
+/// name of the file: an exec through it runs the file by its one name, and `$0` is still the
+/// stand-in's own path, so a body finds what lies beside it.
+///
+/// Test support that aterm-verify's `standin` reaches in every profile it builds in, so it is
+/// not gated by profile; no shipped code calls it.
+#[cfg(unix)]
+#[cfg_attr(trust_verify, trust::skip)]
+#[doc(hidden)]
+#[must_use]
+pub fn shared_stand_in(text: &str) -> Option<PathBuf> {
+    use std::sync::{Mutex, PoisonError};
+    static SHARED: Mutex<BTreeMap<String, PathBuf>> = Mutex::new(BTreeMap::new());
+    let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+    shared_in(&mut shared, euid(), &call0(std::env::temp_dir), text)
+}
+
+/// [`shared_stand_in`] over the memo `shared`, for user `me` and the temporary directory `tmp`:
+/// the file `shared` names for `text` while it still [`holds`] `text`, else `cached_in`'s, which
+/// `shared` names from then on; `None`, and `text` unnamed, when the cache cannot be used.
+#[cfg(unix)]
+#[cfg_attr(trust_verify, trust::skip)]
+fn shared_in(
+    shared: &mut BTreeMap<String, PathBuf>,
+    me: u32,
+    tmp: &Path,
+    text: &str,
+) -> Option<PathBuf> {
+    if let Some(file) = shared.get(text) {
+        if holds(me, file, text) {
+            return Some(file.clone());
+        }
+        shared.remove(text);
+    }
+    let file = cached_in(me, tmp, text)?;
+    shared.insert(text.to_owned(), file.clone());
+    Some(file)
+}
+
+/// Whether `file` is a slot a stand-in of `text` may run: a regular file of `me`'s (not a link
+/// to one), mode 0555, holding exactly `text`.
+#[cfg(unix)]
+#[cfg_attr(trust_verify, trust::skip)]
+fn holds(me: u32, file: &Path, text: &str) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    fs::symlink_metadata(file)
+        .is_ok_and(|m| m.is_file() && m.uid() == me && m.mode() & 0o7777 == 0o555)
+        && fs::read(file).is_ok_and(|read| read == text.as_bytes())
+}
+
+/// The file holding `text` in user `me`'s stand-in cache in `tmp`'s quiet folder ([`quiet_in`]),
+/// made when none of its slots holds it yet; `None` when the cache cannot be used.
+/// [`shared_stand_in`]'s `me` is this process's effective uid. The cache folder is used only
+/// when it is a directory, not a link to one, of `me`'s with no permission bits for group or
+/// others, so another user's folder of its name (in a shared `/tmp`, made before this user's) is
+/// refused.
+///
+/// The cache holds one file per text (a slot more only where a writer died mid-write or two
+/// first writers raced), so it stays as small as the set of texts, and no file in it is ever
+/// renamed, linked or removed. A file is made under its own name with no exec bit, written,
+/// closed, and only then made mode 0555. A slot is used only when it is a regular file of `me`'s,
+/// mode 0555, holding exactly `text`, so no process runs one still being written (an exec of a
+/// file open for writing is `ETXTBSY` on Linux), and a slot that is not becomes the next slot's
+/// turn.
+#[cfg(unix)]
+#[cfg_attr(trust_verify, trust::skip)]
+fn cached_in(me: u32, tmp: &Path, text: &str) -> Option<PathBuf> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{
+        DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+    };
+    let cache = quiet_in(tmp).join(format!("{STAND_IN_CACHE}{me}"));
+    if let Err(e) = fs::DirBuilder::new().mode(0o700).create(&cache)
+        && e.kind() != io::ErrorKind::AlreadyExists
+    {
+        return None;
+    }
+    let Ok(dir) = fs::symlink_metadata(&cache) else {
+        return None;
+    };
+    if !dir.is_dir() || dir.uid() != me || dir.mode() & 0o077 != 0 {
+        return None;
+    }
+    let hash = fnv1a(text.as_bytes());
+    for slot in 0..4 {
+        let file = cache.join(format!("{hash:016x}-{slot}"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&file)
+        {
+            Ok(mut made) => {
+                let written = made.write_all(text.as_bytes());
+                drop(made);
+                return (written.is_ok()
+                    && fs::set_permissions(&file, fs::Permissions::from_mode(0o555)).is_ok())
+                .then_some(file);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                if holds(me, &file, text) {
+                    return Some(file);
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 /// Lay an executable stand-in at `path` holding `body`, mode 0555, replacing whatever is there by rename.
+///
+/// On macOS `path` is a symlink to the one file of `body` this user's stand-ins share
+/// ([`shared_stand_in`]), made at a name of its own beside `path` and renamed over it. Off
+/// macOS, and where that cache cannot be used, `path` is a file of its own holding `body`.
+/// Either way `path` reads and runs as `body`, and `$0` in it is `path`. A caller that needs a
+/// regular file of its own at `path` (one a program judges by its type or by where it resolves)
+/// writes that file itself.
 /// # Errors
 /// Returns an error if `path` has no file name or the stand-in cannot be written or moved into place.
 #[cfg(all(unix, any(test, debug_assertions, feature = "test-support")))]
@@ -509,77 +657,18 @@ pub fn stand_in(path: &Path, body: &str) -> io::Result<()> {
     };
     let tmp = dir.join(unique_name(".stand-in."));
     #[cfg(target_os = "macos")]
-    let shared = link_shared(&tmp, dir, body.as_bytes()).is_ok();
+    let shared =
+        shared_stand_in(body).is_some_and(|file| std::os::unix::fs::symlink(file, &tmp).is_ok());
     #[cfg(not(target_os = "macos"))]
     let shared = false;
     if !shared && let Err(e) = write_read_only(&tmp, body.as_bytes()) {
         return Err(e);
     }
     let renamed = fs::rename(&tmp, path);
-    let _ = fs::remove_file(&tmp);
+    if renamed.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
     renamed
-}
-
-/// Hard-link the shared copy of `body` at `tmp`, laying it first when it is
-/// absent or not `body`.
-#[cfg(all(
-    target_os = "macos",
-    any(test, debug_assertions, feature = "test-support")
-))]
-#[allow(clippy::question_mark)]
-fn link_shared(tmp: &Path, dir: &Path, body: &[u8]) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt as _;
-    let cache = call0(std::env::temp_dir).join("aterm-stand-ins");
-    if let Err(e) = fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&cache)
-    {
-        return Err(e);
-    }
-    let entry = cache.join(format!("{:016x}", fnv1a(body)));
-    if !is_stand_in(&entry, &cache, body) {
-        let fresh = cache.join(unique_name(".new."));
-        if let Err(e) = write_read_only(&fresh, body) {
-            return Err(e);
-        }
-        if let Err(e) = fs::rename(&fresh, &entry) {
-            let _ = fs::remove_file(&fresh);
-            return Err(e);
-        }
-    }
-    if let Err(e) = fs::hard_link(&entry, tmp) {
-        return Err(e);
-    }
-    if is_stand_in(tmp, dir, body) {
-        Ok(())
-    } else {
-        let _ = fs::remove_file(tmp);
-        Err(io::Error::other(
-            "the shared stand-in changed as it was linked",
-        ))
-    }
-}
-
-/// Whether `file` is a regular file holding exactly `body`, mode 0555, owned by
-/// whoever owns `dir`: what was checked is the inode itself, which only its
-/// owner can change.
-#[cfg(all(
-    target_os = "macos",
-    any(test, debug_assertions, feature = "test-support")
-))]
-fn is_stand_in(file: &Path, dir: &Path, body: &[u8]) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    let (Ok(meta), Ok(owner)) = (fs::symlink_metadata(file), fs::metadata(dir)) else {
-        return false;
-    };
-    if !meta.is_file() || meta.uid() != owner.uid() || meta.mode() & 0o7777 != 0o555 {
-        return false;
-    }
-    match fs::read(file) {
-        Ok(read) => read == body,
-        Err(_) => false,
-    }
 }
 
 /// Create `path` (it must not exist) holding `body`, then make it mode 0555.
@@ -608,12 +697,10 @@ fn write_read_only(path: &Path, body: &[u8]) -> io::Result<()> {
     written
 }
 
-/// 64-bit FNV-1a: names the shared copy. A collision costs a rewrite, never a
-/// wrong stand-in: [`is_stand_in`] compares the bytes.
-#[cfg(all(
-    target_os = "macos",
-    any(test, debug_assertions, feature = "test-support")
-))]
+/// 64-bit FNV-1a, aterm-hash's `fnv1a_64` (this crate depends on nothing): names a text's slots
+/// in the stand-in cache ([`cached_in`]), as aterm-verify's stand-ins named them. A collision
+/// costs a slot, never a wrong stand-in: a slot is used only when it holds the text's bytes.
+#[cfg(unix)]
 const fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     let mut i = 0;
@@ -700,77 +787,334 @@ mod tests {
         }
     }
 
-    /// One body, one read-only inode (on macOS); another body, its own; a shared
-    /// copy whose mode or bytes changed is replaced, not linked; a body laid
-    /// again where it lies leaves nothing beside it.
+    /// The bodies the stand-in tests lay: fixed texts, so the cache every process of this user
+    /// shares gains one file for each once, never one a run.
+    #[cfg(unix)]
+    const RUNS: &str = "#!/bin/sh\necho \"$0 $*\"\n";
+    #[cfg(unix)]
+    const OTHER: &str = "#!/bin/sh\necho other\n";
+
+    /// ONE NAME PER STAND-IN'S FILE. Two stand-ins of one body, in two fixtures, run one file (on
+    /// macOS, where they share it) outside both fixtures, read-only and executable, whose link
+    /// count is 1: no fixture holds a name of it, so the first fixture going, its directory and
+    /// all, leaves the second's stand-in running that body as itself (`$0` is its own path).
+    /// Another body runs a file of its own. NEGATIVE CONTROL: laid by hard link, as the copy this
+    /// replaced laid them, that file has a name in each fixture besides its own, so its link
+    /// count is 3 (more while another test links it); and the gone fixture's stand-in does not
+    /// run.
     #[cfg(unix)]
     #[test]
-    fn stand_ins_share_one_read_only_inode_per_body() {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        #[cfg(target_os = "macos")]
-        struct Evict(PathBuf);
-        #[cfg(target_os = "macos")]
-        impl Drop for Evict {
-            fn drop(&mut self) {
-                let _ = fs::remove_file(&self.0);
-            }
-        }
-        let dir = tempdir().expect("tempdir");
-        let body = format!("#!/bin/sh\necho {}\n", unique_name("t"));
-        #[cfg(target_os = "macos")]
-        let _evict = Evict(
-            call0(std::env::temp_dir)
-                .join("aterm-stand-ins")
-                .join(format!("{:016x}", fnv1a(body.as_bytes()))),
-        );
-        let [a, b, c] = ["a", "b", "c"].map(|name| dir.path().join(name));
-        stand_in(&a, &body).expect("a");
-        stand_in(&b, &body).expect("b");
-        stand_in(&c, "#!/bin/sh\necho other\n").expect("c");
-        let meta = |p: &Path| fs::metadata(p).expect("stand-in");
-        for p in [&a, &b] {
+    fn stand_ins_of_one_body_run_one_file_of_one_name() {
+        use std::os::unix::fs::MetadataExt as _;
+        let (one, two) = (tempdir().expect("a fixture"), tempdir().expect("another"));
+        let a = one.path().join("tool");
+        let b = two.path().join("tool");
+        let c = two.path().join("other");
+        stand_in(&a, RUNS).expect("a");
+        stand_in(&b, RUNS).expect("b");
+        stand_in(&c, OTHER).expect("c");
+        let runs = |p: &Path| fs::canonicalize(p).expect("a stand-in resolves");
+        for (p, body) in [(&a, RUNS), (&b, RUNS), (&c, OTHER)] {
+            let meta = fs::metadata(p).expect("a stand-in's file");
             assert_eq!(fs::read_to_string(p).expect("read"), body);
-            assert_eq!(meta(p).mode() & 0o7777, 0o555);
+            assert_eq!(meta.mode() & 0o7777, 0o555, "{}", p.display());
+            assert_eq!(
+                meta.nlink(),
+                1,
+                "{} has a name a fixture removes",
+                runs(p).display()
+            );
         }
         assert!(
             fs::write(&a, "x").is_err(),
             "a write through a stand-in fails"
         );
-        assert_ne!(meta(&a).ino(), meta(&c).ino());
+        assert_ne!(runs(&a), runs(&c), "another body, another file");
         if cfg!(target_os = "macos") {
-            assert_eq!(meta(&a).ino(), meta(&b).ino(), "one inode per body");
-            fs::set_permissions(&a, fs::Permissions::from_mode(0o755)).expect("chmod");
-            stand_in(&b, &body).expect("b over a shared copy made writable");
-            assert_ne!(meta(&a).ino(), meta(&b).ino());
-            assert_eq!(meta(&b).mode() & 0o7777, 0o555);
-            fs::set_permissions(&b, fs::Permissions::from_mode(0o755)).expect("chmod");
-            fs::write(&b, body.replace("echo", "eCho")).expect("same length, other bytes");
-            fs::set_permissions(&b, fs::Permissions::from_mode(0o555)).expect("chmod back");
-            stand_in(&a, &body).expect("a over a shared copy with other bytes");
-            assert_eq!(fs::read_to_string(&a).expect("read"), body);
+            assert_eq!(runs(&a), runs(&b), "one file per body");
+            for fixture in [one.path(), two.path()] {
+                let fixture = fs::canonicalize(fixture).expect("a fixture resolves");
+                assert!(
+                    !runs(&a).starts_with(&fixture),
+                    "{} runs from inside {}",
+                    a.display(),
+                    fixture.display()
+                );
+            }
         }
-        #[cfg(target_os = "macos")]
-        {
-            let ro = tempdir().expect("tempdir");
-            fs::set_permissions(ro.path(), fs::Permissions::from_mode(0o555)).expect("chmod");
-            let shared = meta(&_evict.0).ino();
-            assert!(stand_in(&ro.path().join("x"), &body).is_err());
-            assert_eq!(
-                meta(&_evict.0).ino(),
-                shared,
-                "a failed link keeps the copy"
-            );
-            fs::set_permissions(ro.path(), fs::Permissions::from_mode(0o700)).expect("chmod");
+        drop(one);
+        let run = |tool: &Path| {
+            aterm_uds::deadline::output_within(
+                aterm_uds::spawnfd::command(tool).arg("kept"),
+                aterm_uds::deadline::FIRST_EXEC_HANG,
+            )
+        };
+        let out = run(&b).expect("the kept fixture's stand-in ran");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("{} kept\n", b.display())
+        );
+        assert!(run(&a).is_err(), "the gone fixture's stand-in ran");
+    }
+
+    /// A stand-in laid again with another body runs that body, by rename; laid again with its
+    /// own body it is unchanged, and nothing is left beside it. The file of the body it ran
+    /// before still holds that body (on macOS, where it is shared): no stand-in's file is
+    /// rewritten. A folder it cannot write gets no stand-in (`PermissionDenied`, the temp's own
+    /// error), nothing is left in it, and the file of that body is unchanged. NEGATIVE CONTROL:
+    /// a path naming no file is refused, and nothing is laid.
+    #[cfg(unix)]
+    #[test]
+    fn a_stand_in_laid_again_with_another_body_runs_that_body() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let dir = tempdir().expect("a fixture");
+        let tool = dir.path().join("tool");
+        stand_in(&tool, RUNS).expect("the first body");
+        let ran = fs::canonicalize(&tool).expect("the stand-in resolves");
+        stand_in(&tool, OTHER).expect("another body");
+        assert_eq!(fs::read_to_string(&tool).expect("read"), OTHER);
+        if cfg!(target_os = "macos") {
+            assert_eq!(fs::read_to_string(&ran).expect("the file it ran"), RUNS);
         }
-        stand_in(&c, &body).expect("c replaced by rename");
-        assert_eq!(fs::read_to_string(&c).expect("read"), body);
-        stand_in(&c, &body).expect("c laid again, unchanged");
-        let mut names: Vec<String> = fs::read_dir(dir.path())
+        stand_in(&tool, OTHER).expect("laid again, unchanged");
+        assert_eq!(fs::read_to_string(&tool).expect("read"), OTHER);
+        let refused = stand_in(&dir.path().join(".."), RUNS).map_err(|e| e.kind());
+        assert_eq!(refused, Err(io::ErrorKind::InvalidInput));
+        let names: Vec<String> = fs::read_dir(dir.path())
             .expect("list")
             .map(|e| e.expect("entry").file_name().into_string().expect("UTF-8"))
             .collect();
-        names.sort();
-        assert_eq!(names, ["a", "b", "c"]);
+        assert_eq!(names, ["tool"]);
+        if euid() != 0 {
+            let file = fs::canonicalize(&tool).expect("the stand-in resolves");
+            let before = fs::metadata(&file).map(|m| (m.ino(), m.mode(), m.mtime_nsec()));
+            let shut = tempdir().expect("a fixture it cannot write");
+            fs::set_permissions(shut.path(), fs::Permissions::from_mode(0o555)).expect("shut");
+            let refused = stand_in(&shut.path().join("tool"), OTHER).map_err(|e| e.kind());
+            let left = fs::read_dir(shut.path()).map(Iterator::count);
+            fs::set_permissions(shut.path(), fs::Permissions::from_mode(0o700)).expect("open");
+            assert_eq!(refused, Err(io::ErrorKind::PermissionDenied));
+            assert_eq!(
+                left.ok(),
+                Some(0),
+                "nothing is left in a folder it cannot write"
+            );
+            assert_eq!(fs::read_to_string(&file).expect("read"), OTHER);
+            let after = fs::metadata(&file).map(|m| (m.ino(), m.mode(), m.mtime_nsec()));
+            assert_eq!(after.ok(), before.ok(), "{} changed", file.display());
+        }
+    }
+
+    /// A FILE THAT NO LONGER HOLDS ITS TEXT IS RUN NO MORE. The memo's file for a text, made
+    /// writable and written through, is passed over: the next ask gets the next slot, holding the
+    /// text, and the written-through file is left as it is; that file removed in turn, the next
+    /// ask gets one holding the text again, which the memo then names. NEGATIVE CONTROL: the
+    /// memo's file, untouched, is the one given again.
+    #[cfg(unix)]
+    #[test]
+    fn a_stand_in_file_that_no_longer_holds_its_text_is_passed_over() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let me = euid();
+        let tmp = tempdir().expect("scratch");
+        let text = "#!/bin/sh\nexit 7\n";
+        let tampered = "#!/bin/sh\necho tampered\n";
+        let mut shared = BTreeMap::new();
+        let first = shared_in(&mut shared, me, tmp.path(), text).expect("a file");
+        assert_eq!(
+            shared_in(&mut shared, me, tmp.path(), text).as_ref(),
+            Some(&first),
+            "the same file while it holds the text"
+        );
+        fs::set_permissions(&first, fs::Permissions::from_mode(0o755)).expect("made writable");
+        fs::write(&first, tampered).expect("written through");
+        let next = shared_in(&mut shared, me, tmp.path(), text).expect("another file");
+        assert_ne!(
+            next,
+            first,
+            "{} is run though it was written",
+            first.display()
+        );
+        assert_eq!(fs::read_to_string(&next).ok().as_deref(), Some(text));
+        assert_eq!(fs::read_to_string(&first).ok().as_deref(), Some(tampered));
+        fs::remove_file(&next).expect("removed");
+        let again = shared_in(&mut shared, me, tmp.path(), text).expect("a file again");
+        assert_eq!(fs::read_to_string(&again).ok().as_deref(), Some(text));
+        assert_eq!(
+            shared.get(text),
+            Some(&again),
+            "the memo names the file it gave"
+        );
+    }
+
+    /// Set, the test binary is [`stand_in_cache_child_if_asked`]: it asks [`cached_in`] for this
+    /// directory's file holding [`CACHED`] and writes the file it got to `got` there.
+    #[cfg(unix)]
+    const CACHE_CHILD: &str = "ATERM_TEMPFILE_STAND_IN_CACHE_CHILD";
+    /// The text [`the_stand_in_cache_holds_one_read_only_file_per_text`] and its child ask for.
+    #[cfg(unix)]
+    const CACHED: &str = "#!/bin/sh\nexit 3\n";
+    /// The wait for that child, which must end: a one-minute hang detector (aterm-spec's
+    /// `wait::MUST_HAPPEN`), never a latency budget.
+    #[cfg(unix)]
+    const MUST_HAPPEN: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Run by [`the_stand_in_cache_holds_one_read_only_file_per_text`] in a process of its own.
+    #[cfg(unix)]
+    fn stand_in_cache_child_if_asked() -> bool {
+        use std::os::unix::ffi::OsStrExt as _;
+        let Some(dir) = std::env::var_os(CACHE_CHILD).map(PathBuf::from) else {
+            return false;
+        };
+        let file = cached_in(euid(), &dir, CACHED).expect("cached");
+        fs::write(dir.join("got"), file.as_os_str().as_bytes()).expect("said which file");
+        true
+    }
+
+    /// The stand-in cache keeps one file per text, however often it is asked, by this process
+    /// or another, read-only, in a quiet folder on macOS, and nothing else. NEGATIVE CONTROL: a
+    /// second text gets a file of its own.
+    #[cfg(unix)]
+    #[test]
+    fn the_stand_in_cache_holds_one_read_only_file_per_text() {
+        if stand_in_cache_child_if_asked() {
+            return;
+        }
+        use std::os::unix::ffi::OsStringExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let me = euid();
+        let tmp = tempdir().expect("scratch");
+        let a = cached_in(me, tmp.path(), CACHED).expect("a cached stand-in");
+        let again = cached_in(me, tmp.path(), CACHED).expect("the same text");
+        let b = cached_in(me, tmp.path(), "#!/bin/sh\nexit 4\n").expect("another text");
+        let child = aterm_uds::deadline::output_within(
+            aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"))
+                .args([
+                    "--exact",
+                    "tests::the_stand_in_cache_holds_one_read_only_file_per_text",
+                    "--test-threads=1",
+                ])
+                .env(CACHE_CHILD, tmp.path()),
+            MUST_HAPPEN,
+        )
+        .expect("the child ran");
+        assert!(child.status.success(), "the child failed: {child:?}");
+        let theirs = fs::read(tmp.path().join("got"))
+            .map(|got| PathBuf::from(std::ffi::OsString::from_vec(got)));
+        assert_eq!(
+            theirs.ok().as_ref(),
+            Some(&a),
+            "another process gets the same file"
+        );
+        assert_eq!(a, again, "one file per text");
+        assert_ne!(a, b, "a text of its own gets a file of its own");
+        let cache = a.parent().expect("the cache").to_path_buf();
+        let held = fs::read_dir(&cache).expect("list the cache").count();
+        assert_eq!(
+            held,
+            2,
+            "{} holds a file per text and nothing else",
+            cache.display()
+        );
+        let mode = fs::metadata(&a).map(|m| m.mode() & 0o7777);
+        assert_eq!(mode.ok(), Some(0o555), "read-only and executable");
+        if cfg!(target_os = "macos") {
+            assert!(is_quiet(&cache), "{} is not quiet", cache.display());
+        }
+    }
+
+    /// A slot not holding the text, or holding it still writable (its writer has not finished
+    /// it), is passed over and left as it is: the text goes in the next slot. NEGATIVE CONTROL:
+    /// the next call finds that slot again, and the passed-over ones still hold what they held.
+    #[cfg(unix)]
+    #[test]
+    fn a_slot_still_being_written_or_holding_another_text_is_passed_over() {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        let me = euid();
+        let tmp = tempdir().expect("scratch");
+        let text = "#!/bin/sh\nexit 5\n";
+        let cache = quiet_in(tmp.path()).join(format!("{STAND_IN_CACHE}{me}"));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&cache)
+            .expect("the cache");
+        let slot = |n: u32| cache.join(format!("{:016x}-{n}", fnv1a(text.as_bytes())));
+        let lay = |n: u32, bytes: &str, mode: u32| {
+            fs::write(slot(n), bytes).expect("lay a slot");
+            fs::set_permissions(slot(n), fs::Permissions::from_mode(mode)).expect("chmod a slot");
+        };
+        lay(0, "#!/bin/sh\nexit", 0o555);
+        lay(1, text, 0o600);
+        let got = cached_in(me, tmp.path(), text);
+        assert_eq!(got, Some(slot(2)), "the first slot holding the text whole");
+        assert_eq!(
+            cached_in(me, tmp.path(), text),
+            Some(slot(2)),
+            "found again"
+        );
+        assert_eq!(
+            fs::read_to_string(slot(0)).ok().as_deref(),
+            Some("#!/bin/sh\nexit")
+        );
+        assert_eq!(fs::read_to_string(slot(1)).ok().as_deref(), Some(text));
+    }
+
+    /// A cache folder that is not the user's alone is refused and nothing is made in it: one
+    /// another user owns (the folder this process made, asked for as a user it is not, as a
+    /// shared `/tmp` can hold another user's folder of this user's name), one others may write,
+    /// and a symlink to a private folder of the user's own. NEGATIVE CONTROL: the folder others
+    /// could write, made private again, is used.
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_folder_not_the_users_alone_is_refused() {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        let me = euid();
+        let text = "#!/bin/sh\nexit 6\n";
+        let cache = |tmp: &Path, uid: u32| quiet_in(tmp).join(format!("{STAND_IN_CACHE}{uid}"));
+        let held = |dir: &Path| fs::read_dir(dir).map(Iterator::count).ok();
+        let private = |dir: &Path| {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(dir)
+                .expect("a private folder");
+        };
+
+        let theirs = tempdir().expect("scratch");
+        let other = me.wrapping_add(1);
+        assert_eq!(
+            cached_in(other, theirs.path(), text),
+            None,
+            "another user's"
+        );
+        assert_eq!(
+            held(&cache(theirs.path(), other)),
+            Some(0),
+            "nothing in theirs"
+        );
+
+        let open = tempdir().expect("scratch");
+        let folder = cache(open.path(), me);
+        private(&folder);
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o777)).expect("open it to others");
+        assert_eq!(
+            cached_in(me, open.path(), text),
+            None,
+            "one others may write"
+        );
+        assert_eq!(held(&folder), Some(0), "nothing in one others may write");
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).expect("make it private");
+        let used = cached_in(me, open.path(), text);
+        assert_eq!(
+            used.as_deref().and_then(Path::parent),
+            Some(folder.as_path())
+        );
+
+        let linked = tempdir().expect("scratch");
+        let elsewhere = linked.path().join("elsewhere");
+        private(&elsewhere);
+        std::os::unix::fs::symlink(&elsewhere, cache(linked.path(), me)).expect("the link");
+        assert_eq!(cached_in(me, linked.path(), text), None, "a symlink");
+        assert_eq!(held(&elsewhere), Some(0), "nothing through the symlink");
     }
 
     /// THE QUIET FOLDER'S SHAPE: a directory asked for in a shared root goes in that root's
@@ -799,12 +1143,13 @@ mod tests {
     }
 
     /// What the tempdirs land in: on macOS the system temp directory's and `/tmp`'s quiet
-    /// folders, `/tmp`'s sticky and open to every user. NEGATIVE CONTROL: a parent the caller
-    /// chose gets its directory directly, and no `.ubd` beside it.
+    /// folders. `/tmp`'s may be one another program made (a `mkdir -p` of scratch under it,
+    /// `0755`), which serves while it is safe, so its mode is not held here: the `1777` one
+    /// made in a sticky root gets is `a_quiet_folder_is_used_only_while_it_is_safe`'s. NEGATIVE
+    /// CONTROL: a parent the caller chose gets its directory directly, and no `.ubd` beside it.
     #[cfg(target_os = "macos")]
     #[test]
     fn tempdirs_in_shared_roots_land_where_fseventsd_drops_their_events() {
-        use std::os::unix::fs::MetadataExt as _;
         let dir = tempdir().expect("tempdir");
         assert!(is_quiet(dir.path()), "{:?}", dir.path());
         assert!(dir.path().starts_with(call0(std::env::temp_dir)));
@@ -813,8 +1158,6 @@ mod tests {
             .tempdir_in("/tmp")
             .expect("in /tmp");
         assert_eq!(short.path().parent(), Some(Path::new("/tmp/.ubd")));
-        let mode = fs::symlink_metadata("/tmp/.ubd").expect("lstat").mode();
-        assert_eq!(mode & 0o1000, 0o1000, "sticky: {mode:o}");
         let chosen = Path::new("/tmp").join(unique_name("atq-chosen-"));
         fs::create_dir(&chosen).expect("a parent of the caller's");
         let inner = TempDir::new_in(&chosen).expect("in the chosen parent");
@@ -866,8 +1209,10 @@ mod tests {
     }
 
     /// A quiet folder is used only while it is safe to: this user's own and closed, or sticky.
-    /// NEGATIVE CONTROL: a link in its place, or one anyone may write and not sticky, is
-    /// refused, so the root itself serves.
+    /// One this user's `mkdir -p` left (`0755`) is closed, so it serves. A sticky root reached
+    /// through a link, as `/tmp` is, gets a folder every user may share. NEGATIVE CONTROL: a
+    /// link in its place, or one anyone may write and not sticky, is refused, so the root
+    /// itself serves.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_quiet_folder_is_used_only_while_it_is_safe() {
@@ -878,6 +1223,8 @@ mod tests {
         assert_eq!(fs::metadata(&quiet).expect("stat").mode() & 0o7777, 0o700);
         assert!(made_quiet(root.path(), &quiet), "found again");
         let chmod = |mode| fs::set_permissions(&quiet, fs::Permissions::from_mode(mode));
+        chmod(0o755).expect("as mkdir -p leaves it");
+        assert!(made_quiet(root.path(), &quiet), "found closed");
         chmod(0o777).expect("open it");
         assert!(!made_quiet(root.path(), &quiet), "open and not sticky");
         chmod(0o1777).expect("sticky");
@@ -892,17 +1239,75 @@ mod tests {
         assert!(made_quiet(&shared, &shared.join(QUIET)));
         let mode = fs::metadata(shared.join(QUIET)).expect("stat").mode();
         assert_eq!(mode & 0o7777, 0o1777, "{mode:o}");
+        let linked_root = root.path().join("linked");
+        fs::create_dir(&linked_root).expect("a second sticky root");
+        fs::set_permissions(&linked_root, fs::Permissions::from_mode(0o1777)).expect("sticky");
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&linked_root, &link).expect("a link to it, as /tmp is");
+        assert!(made_quiet(&link, &link.join(QUIET)));
+        let mode = fs::metadata(link.join(QUIET)).expect("stat").mode();
+        assert_eq!(mode & 0o7777, 0o1777, "through a link: {mode:o}");
     }
 
-    /// On Windows the OS RNG (BCryptGenRandom) must actually work: two
-    /// consecutive 8-byte reads succeed and produce different values.
+    #[test]
+    fn made_in_sets_private_mode_retries_collisions_and_propagates_errors() {
+        let root = tempdir().expect("root");
+        let fresh = TempDir::new_in(root.path()).expect("fresh");
+        assert!(fresh.path().is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let mode = fs::metadata(fresh.path()).expect("stat").mode() & 0o7777;
+            assert_eq!(mode, 0o700, "Unix tempdirs are mode 0700: {mode:o}");
+        }
+
+        let colliding = root.path().join("taken");
+        fs::create_dir(&colliding).expect("taken");
+        let mut tries = 0usize;
+        let won = TempDir::made_in_with(root.path(), || {
+            tries += 1;
+            if tries < 5 {
+                "taken".to_string()
+            } else {
+                "free_on_fifth".to_string()
+            }
+        })
+        .expect("fifth attempt succeeds");
+        assert_eq!(tries, 5);
+        assert_eq!(won.path(), root.path().join("free_on_fifth"));
+
+        let mut exhausted_tries = 0usize;
+        let exhausted = TempDir::made_in_with(root.path(), || {
+            exhausted_tries += 1;
+            "taken".to_string()
+        })
+        .unwrap_err();
+        assert_eq!(exhausted_tries, 5);
+        assert_eq!(exhausted.kind(), io::ErrorKind::AlreadyExists);
+
+        let mut err_tries = 0usize;
+        let missing = TempDir::made_in_with(&root.path().join("missing_parent"), || {
+            err_tries += 1;
+            "candidate".to_string()
+        })
+        .unwrap_err();
+        assert_eq!(err_tries, 1, "non-collision errors return immediately");
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// On Windows the OS RNG (BCryptGenRandom) succeeds on empty and 8-byte buffers.
     #[cfg(windows)]
     #[test]
-    fn windows_os_random_succeeds_and_differs() {
-        let mut a = [0u8; 8];
-        let mut b = [0u8; 8];
-        assert!(read_os_random(&mut a), "first BCryptGenRandom read failed");
-        assert!(read_os_random(&mut b), "second BCryptGenRandom read failed");
-        assert_ne!(a, b, "two 8-byte OS random reads should differ");
+    fn windows_os_random_succeeds() {
+        let mut empty = [];
+        let mut buf = [0u8; 8];
+        assert!(
+            read_os_random(&mut empty),
+            "empty BCryptGenRandom read failed"
+        );
+        assert!(
+            read_os_random(&mut buf),
+            "8-byte BCryptGenRandom read failed"
+        );
     }
 }

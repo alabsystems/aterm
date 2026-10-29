@@ -233,7 +233,8 @@ pub(crate) struct Writer {
     overflow: Arc<Mutex<VecDeque<(String, Shelf)>>>,
     overflowed: Arc<AtomicUsize>,
     files: Arc<Mutex<Files>>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    lazy_rx: Mutex<Option<mpsc::Receiver<Job>>>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// The folder the file lives in: the log dir.
     folder: Option<PathBuf>,
 }
@@ -250,16 +251,32 @@ impl Writer {
         budget: RotationBudget,
         wire_budget: RotationBudget,
     ) -> Option<Writer> {
-        let (mut writer, rx) = match Self::open(path, QUEUE_CAP, budget, wire_budget) {
+        let (writer, rx) = match Self::open(path, QUEUE_CAP, budget, wire_budget) {
             Ok(pair) => pair,
             Err(error) => {
                 aterm_log::warn!("messages log: {} not opened ({error})", path.display());
                 return None;
             }
         };
-        let files = Arc::clone(&writer.files);
-        let overflow = Arc::clone(&writer.overflow);
-        let overflowed = Arc::clone(&writer.overflowed);
+        *writer
+            .lazy_rx
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(rx);
+        Some(writer)
+    }
+
+    fn ensure_thread(&self) {
+        let rx = self
+            .lazy_rx
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let Some(rx) = rx else {
+            return;
+        };
+        let files = Arc::clone(&self.files);
+        let overflow = Arc::clone(&self.overflow);
+        let overflowed = Arc::clone(&self.overflowed);
         let spawned =
             qos::spawn_lane_thread("aterm-messages-log", qos::Role::Responsive, move || {
                 loop {
@@ -299,12 +316,10 @@ impl Writer {
             });
         match spawned {
             Ok(handle) => {
-                writer.thread = Some(handle);
-                Some(writer)
+                *self.thread.lock().unwrap_or_else(PoisonError::into_inner) = Some(handle);
             }
             Err(error) => {
                 aterm_log::warn!("messages log: writer thread not spawned ({error})");
-                None
             }
         }
     }
@@ -325,7 +340,8 @@ impl Writer {
                 overflow: Arc::new(Mutex::new(VecDeque::new())),
                 overflowed: Arc::new(AtomicUsize::new(0)),
                 files: Arc::new(Mutex::new(Files { host, wire })),
-                thread: None,
+                lazy_rx: Mutex::new(None),
+                thread: Mutex::new(None),
                 folder: path.parent().map(Path::to_path_buf),
             },
             rx,
@@ -357,6 +373,7 @@ impl Writer {
         if lines.is_empty() && self.overflowed.load(Ordering::Relaxed) == 0 {
             return;
         }
+        self.ensure_thread();
         let mut queued = self.overflow.lock().unwrap_or_else(PoisonError::into_inner);
         queued.extend(lines.iter().filter_map(|(line, shelf)| {
             let encoded = encoded(line);
@@ -408,8 +425,24 @@ impl Writer {
             self.hand_over(&mut queued);
             return true;
         };
+        if self
+            .lazy_rx
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+            && self.overflowed.load(Ordering::Relaxed) == 0
+        {
+            return true;
+        }
+        self.ensure_thread();
         let (done, landed) = mpsc::sync_channel::<()>(1);
-        let mut job = Job::Flush(done, qos::Boost::start(self.thread.as_ref()));
+        let boost = qos::Boost::start(
+            self.thread
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref(),
+        );
+        let mut job = Job::Flush(done, boost);
         loop {
             {
                 let mut queued = self.overflow.lock().unwrap_or_else(PoisonError::into_inner);
@@ -438,7 +471,16 @@ impl Drop for Writer {
     /// the thread to write what it holds: the lines a process queued in its
     /// last moments are its record.
     fn drop(&mut self) {
-        let attended = self.thread.is_some();
+        let _ = self
+            .lazy_rx
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let attended = self
+            .thread
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some();
         let queued =
             std::mem::take(&mut *self.overflow.lock().unwrap_or_else(PoisonError::into_inner));
         for (line, shelf) in queued {
@@ -455,7 +497,12 @@ impl Drop for Writer {
             }
         }
         self.tx = None;
-        if let Some(thread) = self.thread.take() {
+        if let Some(thread) = self
+            .thread
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
             let _ = thread.join();
         }
     }

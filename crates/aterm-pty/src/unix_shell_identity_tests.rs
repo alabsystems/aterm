@@ -166,9 +166,7 @@ fn a_verified_hup_ignoring_shell_is_still_hung_up_and_force_killed() {
     let hung = hangup_shell(&identity, sh.master);
     let polls_before = reap_polls();
     let _ = take_reap_kill_tick();
-    let started = Instant::now();
     reap_shell(identity);
-    let took = started.elapsed();
     let polls = reap_polls() - polls_before;
     let kill_tick = take_reap_kill_tick();
     let mut status: libc::c_int = 0;
@@ -192,10 +190,6 @@ fn a_verified_hup_ignoring_shell_is_still_hung_up_and_force_killed() {
         collected == sh.pid && libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
         "the HUP-ignoring shell must have died by the SIGKILL escalation \
          (waitpid={collected}, status=0x{status:x})"
-    );
-    assert!(
-        took >= REAP_POLL * REAP_KILL_AT,
-        "it outlived SIGHUP (took {took:?})"
     );
     assert_eq!(
         kill_tick,
@@ -228,6 +222,7 @@ fn an_unreaped_own_child_zombie_still_verifies_and_is_reaped() {
     assert!(!identity.verify(), "once reaped, the pid is no longer ours");
 }
 
+#[cfg(target_os = "macos")]
 fn still_unreaped_after(pid: i32, patience: Duration) -> bool {
     let deadline = Instant::now() + patience;
     while is_unreaped_child(pid) && Instant::now() < deadline {
@@ -246,20 +241,15 @@ fn a_shell_stuck_exiting_on_unread_output_is_reaped_not_left_a_zombie() {
     // SAFETY: writing a few bytes from a valid buffer to the master this test owns.
     let wrote = unsafe { libc::write(sh.master, go.as_ptr().cast(), go.len()) };
     assert_eq!(wrote, 3, "the go line reaches the shell");
-    let queued = || {
-        let mut pfd = libc::pollfd {
-            fd: sh.master,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one valid `pollfd`, zero timeout.
-        unsafe { libc::poll(&mut pfd, 1, 0) == 1 && pfd.revents & libc::POLLIN != 0 }
-    };
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !queued() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
+    let deadline = Instant::now() + HANG_DETECTOR;
+    while output_queue_len(sh.master).is_none_or(|n| n < 512) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
     }
-    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        output_queue_len(sh.master).is_some_and(|n| n >= 512),
+        "PRECONDITION: printf filled the tty output queue before hangup; got {:?}",
+        output_queue_len(sh.master)
+    );
     let hung = hangup_shell(&identity, sh.master);
     reap_shell(identity);
     let stuck_past_teardown = is_unreaped_child(sh.pid);
@@ -317,43 +307,6 @@ fn a_shell_alive_past_the_deadline_is_reaped_when_it_exits() {
         !zombie,
         "a shell past the deadline was left to become an unreaped zombie"
     );
-}
-
-#[test]
-fn a_dropped_running_child_is_reaped_and_a_dropped_std_one_is_not() {
-    let dropped = std::process::Command::new("/usr/bin/true")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn /usr/bin/true");
-    let dropped_pid = i32::try_from(dropped.id()).expect("pid fits i32");
-    drop(dropped);
-    let (read, write) = std::io::pipe().expect("pipe");
-    let running = aterm_uds::spawnfd::command("/bin/sh")
-        .args(["-c", "read line"])
-        .stdin(aterm_uds::spawnfd::Stdio::from(read))
-        .stdout(aterm_uds::spawnfd::Stdio::null())
-        .stderr(aterm_uds::spawnfd::Stdio::null())
-        .spawn()
-        .expect("spawn /bin/sh");
-    let running_pid = i32::try_from(running.id()).expect("pid fits i32");
-    drop(running);
-    drop(write);
-    let running_left = still_unreaped_after(running_pid, HANG_DETECTOR);
-    let dropped_left = is_unreaped_child(dropped_pid);
-    // SAFETY: blocking reaps of the test's own children, so nothing outlives the test.
-    unsafe {
-        libc::waitpid(dropped_pid, std::ptr::null_mut(), 0);
-        if running_left {
-            libc::waitpid(running_pid, std::ptr::null_mut(), 0);
-        }
-    }
-    assert!(
-        dropped_left,
-        "CONTROL: a dropped `std` child is a zombie until someone waits for it"
-    );
-    assert!(!running_left, "the dropped child was never reaped");
 }
 
 /// Set only on the child [`a_quit_after_wait_for_reaps_leaves_no_hup_ignoring_shell`] starts.

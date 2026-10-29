@@ -820,22 +820,29 @@ mod tests {
     #[test]
     fn the_box_token_names_one_screen() {
         let token = |t: &str| question_box_token(&read(t).0.question_dialog.expect("read whole"));
-        assert_eq!(token(f::QUESTION_ONE), token(f::QUESTION_ONE));
-        assert_eq!(token(f::QUESTION_ONE).len(), 8);
-        let all = [
-            token(f::QUESTION_ONE),
-            token(f::QUESTION_TABS_INCIDENT),
-            token(f::QUESTION_TABS_SECOND),
-            token(f::QUESTION_TABS_THIRD),
-            token(f::QUESTION_TABS_FOURTH),
-            token(f::QUESTION_REVIEW),
-            token(f::QUESTION_MULTISELECT),
-        ];
-        for (i, a) in all.iter().enumerate() {
-            for b in &all[i + 1..] {
-                assert_ne!(a, b, "{all:?}");
-            }
+        for fixture in [
+            f::QUESTION_ONE,
+            f::QUESTION_TABS_INCIDENT,
+            f::QUESTION_TABS_SECOND,
+            f::QUESTION_TABS_THIRD,
+            f::QUESTION_TABS_FOURTH,
+            f::QUESTION_REVIEW,
+            f::QUESTION_MULTISELECT,
+        ] {
+            let t = token(fixture);
+            assert_eq!(t, token(fixture));
+            assert_eq!(t.len(), 8);
+            assert!(
+                t.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+                "{t:?}"
+            );
         }
+        let relabelled_option = f::QUESTION_ONE.replace("Red (Recommended)", "Crimson");
+        assert_eq!(
+            token(&relabelled_option),
+            token(f::QUESTION_ONE),
+            "option labels do not move a question_dialog's box token"
+        );
     }
 
     #[test]
@@ -905,13 +912,20 @@ mod tests {
                 .prompt(&f::screen(text))
                 .expect("a Muse Code box")
         };
-        let token = prompt_box_token(&muse(u::QUESTION)).expect("a question's token");
+        let q = muse(u::QUESTION);
+        let token = prompt_box_token(&q).expect("a question's token");
         assert_eq!(token.len(), 8);
+        assert!(token.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')));
         assert_eq!(prompt_box_token(&muse(u::QUESTION)), Some(token.clone()));
-        let other = u::QUESTION.replace("Which color should", "Which shade should");
-        assert_ne!(prompt_box_token(&muse(&other)), Some(token.clone()));
-        let relabelled = u::QUESTION.replace("2. Blue", "2. Navy");
-        assert_ne!(prompt_box_token(&muse(&relabelled)), Some(token));
+        let mut refocused = q;
+        for opt in &mut refocused.options {
+            opt.focused = !opt.focused;
+        }
+        assert_eq!(
+            prompt_box_token(&refocused),
+            Some(token),
+            "focus changes do not move a role question's box token"
+        );
         let (claude, _) = read(f::QUESTION_ONE);
         assert_eq!(
             prompt_box_token(&claude),

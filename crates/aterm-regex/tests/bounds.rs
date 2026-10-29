@@ -8,15 +8,11 @@ use std::time::{Duration, Instant};
 use aterm_regex::{Error, Regex, RegexBuilder};
 
 const SIZE_LIMIT: usize = 128 * 1024;
-const DFA_SIZE_LIMIT: usize = 1 << 20;
 const MAX_PATTERN_LEN: usize = 1024;
 const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
 fn bounded(pattern: &str) -> Result<Regex, Error> {
-    RegexBuilder::new(pattern)
-        .size_limit(SIZE_LIMIT)
-        .dfa_size_limit(DFA_SIZE_LIMIT)
-        .build()
+    RegexBuilder::new(pattern).size_limit(SIZE_LIMIT).build()
 }
 
 #[test]
@@ -125,14 +121,6 @@ fn the_size_limit_is_the_thing_that_decides() {
         ),
         "and do not fit in 1 KiB"
     );
-}
-
-#[test]
-fn dfa_size_limit_is_accepted_and_inert() {
-    let pattern = "(a{50}){50}";
-    let builder = RegexBuilder::new(pattern).size_limit(1 << 20);
-    assert!(builder.clone().dfa_size_limit(1).build().is_ok());
-    assert!(builder.dfa_size_limit(usize::MAX).build().is_ok());
 }
 
 #[test]

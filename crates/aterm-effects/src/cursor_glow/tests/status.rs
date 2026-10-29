@@ -125,7 +125,9 @@ fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
         pet_anchor: None,
         pet_event_seq: 0,
         pet_pose: "pet_sit",
+        pet_deep: false,
         pet_body: Some((12, 68, 30, 64)),
+        head_body: Some((70, 98, 4, 30)),
         cat_active: false,
         block_fill: Some(BlockFill {
             owner: BlockFillOwner::Rainbow,
@@ -181,6 +183,7 @@ fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
         " pet_content=0.420",
         " pet_pending=1",
         " pet_body=12,68,30,64",
+        " head_body=70,98,4,30",
         " cat_active=false",
         " block_fill=rainbow",
         " block_fill_rgb=f02218",
@@ -321,7 +324,9 @@ fn row_for(flow: rk::Flow) -> TrailStatus<'static> {
         pet_anchor: None,
         pet_event_seq: 0,
         pet_pose: "pet_sit",
+        pet_deep: false,
         pet_body: None,
+        head_body: None,
         cat_active: false,
         block_fill: None,
         flow,
@@ -544,7 +549,9 @@ fn the_status_row_names_who_owns_the_block_cursor() {
         pet_anchor: None,
         pet_event_seq: 0,
         pet_pose: "pet_sit",
+        pet_deep: false,
         pet_body: None,
+        head_body: None,
         cat_active: false,
         block_fill: None,
         flow: rk::Flow::default(),
@@ -731,7 +738,7 @@ fn a_split_pane_s_text_is_read_at_its_window_offset() {
         matches!(glow.frame_text.pair(row, col), Some((Some(_), _)))
     };
     let mut glow = CursorGlow::default();
-    glow.observe_frame_text_at(Some((3, 15)), &cells, (2, 10), t0);
+    glow.observe_frame_text_at(Some((3, 15)), &cells, ((2, 10), 0), t0);
     assert!(
         lettered(&glow, 3, 13),
         "the pane's letter at pane cell (1, 3) reads at window cell (3, 13)"

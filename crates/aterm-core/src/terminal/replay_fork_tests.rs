@@ -425,8 +425,7 @@ fn assert_forks_fold_the_straight_end(fx: &Fixture, at: &(Seen, Vec<Option<Seen>
                     fx.name
                 );
             }
-            "kitty" => assert_eq!(refused, [2, 3, 4, 5, 8, 9], "{}", fx.name),
-            "sync_left_open" | "live_images" | "drained_response_bucket" => {
+            "kitty" | "sync_left_open" | "live_images" | "drained_response_bucket" => {
                 assert!(refused.is_empty(), "{}: {refused:?}", fx.name);
             }
             "long" => {
@@ -469,7 +468,7 @@ fn a_fork_without_a_carried_piece_folds_another_end() {
         fixtures.extend(conpty_fixtures());
         fixtures
     };
-    let pieces: [(&str, Strip, Vec<Fixture>); 8] = [
+    let pieces: [(&str, Strip, Vec<Fixture>); 9] = [
         (
             "the orphaned-screen leave's notes",
             |fork| {
@@ -491,6 +490,14 @@ fn a_fork_without_a_carried_piece_folds_another_end() {
         (
             "the Kitty serials",
             |fork| fork.transient.kitty_serial = 0,
+            vec![kitty()],
+        ),
+        (
+            "the Kitty image store",
+            |fork| {
+                fork.transient.kitty_images.clear();
+                fork.transient.kitty_numbers.clear();
+            },
             vec![kitty()],
         ),
         (
@@ -761,30 +768,64 @@ fn a_replay_restore_with_carry_folds_the_rest_as_the_straight_fold_does() {
     let mut all = fixtures();
     all.push(long());
     for fx in &all {
-        let mut at = fx.at_every_boundary_from(|| unbounded(fx), restore_with_carry);
-        if fx.name == "live_images" {
-            // `TerminalCheckpoint` omits pre-keyframe inline cell `ImageRef`s (OPEN-B1), while
-            // `ReplayCarry` carries `live_image_charge` and `kitty_serial` so boundaries 0 and 1
-            // admit row 2's post-keyframe image with the exact serials `straight` assigns.
-            for (k, fork_end) in at.1.iter_mut().enumerate() {
-                if let Some(fork_end) = fork_end {
-                    assert!(
-                        fork_end.images[0].is_empty(),
-                        "checkpoint omits row 0 images"
-                    );
-                    if k < 2 {
-                        assert_eq!(fork_end.images[2], at.0.images[2], "row 2 image matches");
-                    } else {
-                        assert!(
-                            fork_end.images[2].is_empty(),
-                            "checkpoint omits row 2 images"
-                        );
-                    }
-                    fork_end.images.clone_from(&at.0.images);
-                }
-            }
-        }
+        let at = fx.at_every_boundary_from(|| unbounded(fx), restore_with_carry);
         assert_forks_fold_the_straight_end(fx, &at);
+    }
+
+    // Without `replay_fork`'s `kitty_idle` gate, both `ReplayCarry` and `PaneStepCarry`
+    // (through canonical encode/decode) fold `kitty` and `live_images` across every boundary.
+    let origin = fixture_epoch();
+    for fx in [kitty(), live_images()] {
+        let (end_rc, ends_rc) = fx.at_every_boundary_from(
+            || unbounded(&fx),
+            |t| {
+                let c = t.checkpoint_continuing()?;
+                let carry = t.capture_replay_carry();
+                let mut r = Terminal::replay_from_checkpoint(&c);
+                r.apply_replay_carry(&carry);
+                Some(r)
+            },
+        );
+        for (k, fork_end) in ends_rc.iter().enumerate() {
+            let fork_end = fork_end
+                .as_ref()
+                .unwrap_or_else(|| panic!("{}: ReplayCarry refused boundary {}", fx.name, k + 1));
+            assert_eq!(
+                fork_end,
+                &end_rc,
+                "{}: ReplayCarry after {} events",
+                fx.name,
+                k + 1
+            );
+        }
+
+        let (end_pc, ends_pc) = fx.at_every_boundary_from(
+            || unbounded(&fx),
+            |t| {
+                let c = t.checkpoint_continuing()?;
+                let carry = crate::terminal::PaneStepCarry::capture(t, origin, usize::MAX);
+                let wire = carry.canonical();
+                let decoded = crate::terminal::PaneStepCarry::from_canonical(&wire)
+                    .expect("PaneStepCarry canonical roundtrip");
+                assert_eq!(decoded, carry, "PaneStepCarry equality");
+                let mut r = Terminal::replay_from_checkpoint(&c);
+                fx.configure(&mut r);
+                r.apply_pane_step_carry(&decoded, origin);
+                Some(r)
+            },
+        );
+        for (k, fork_end) in ends_pc.iter().enumerate() {
+            let fork_end = fork_end
+                .as_ref()
+                .unwrap_or_else(|| panic!("{}: PaneStepCarry refused boundary {}", fx.name, k + 1));
+            assert_eq!(
+                fork_end,
+                &end_pc,
+                "{}: PaneStepCarry after {} events",
+                fx.name,
+                k + 1
+            );
+        }
     }
 
     // Mid-sequence inside an open mode-2026 frame: `replay_fork` refuses off Ground, while
@@ -903,4 +944,160 @@ fn a_replay_restore_with_carry_folds_the_rest_as_the_straight_fold_does() {
             );
         }
     }
+}
+
+#[test]
+fn unbooked_image_bytes_counts_kitty_store_variants_and_visible_images_without_double_counting_history()
+ {
+    let mut t = Terminal::new(4, 20);
+    t.set_cell_pixel_size(10, 20);
+    assert_eq!(t.unbooked_image_bytes(), 0);
+
+    // 1. Place an inline OSC 1337 image (`ABCDEFG`) on row 0 (visible, not yet in ring/scrollback).
+    t.process(b"\x1b]1337;File=inline=1;width=2;height=1;preserveAspectRatio=0:QUJDREVGRw==\x1b\\");
+    let inline_bytes = t.unbooked_image_bytes();
+    assert!(inline_bytes >= 7, "{inline_bytes}");
+
+    // 2. Load a Kitty 2x1 RGBA image (8 bytes) into `i=3` and place it at two sizes so a cached
+    //    scaled variant is also retained on `transient.kitty_variants`.
+    t.process(
+        b"\x1b_Ga=t,f=32,s=2,v=1,i=3,q=2;////AAAA//8=\x1b\\\
+          \x1b[2;1H\x1b_Ga=p,i=3,p=1,c=1,r=1,q=2\x1b\\\
+          \x1b[2;4H\x1b_Ga=p,i=3,p=2,c=3,r=1,q=2\x1b\\",
+    );
+    let _ = t.images_row(1);
+    let with_store_and_visible = t.unbooked_image_bytes();
+    assert!(
+        with_store_and_visible > inline_bytes + 8,
+        "includes inline + Kitty source + scaled variant without double-counting shared Arcs: {with_store_and_visible}"
+    );
+    let fork = t.replay_fork().expect("fork with Kitty store and variants");
+    assert_eq!(fork.unbooked_image_bytes(), with_store_and_visible);
+
+    // 3. Scroll row 0's inline image off screen into history: `grid().memory_used()` now books its
+    //    payload capacity, while `unbooked_image_bytes()` drops `inline_bytes`.
+    let grid_before = t.grid().memory_used();
+    t.process(b"\x1b[4;1H\r\n\r\n\r\n\r\n");
+    assert!(t.grid().memory_used() > grid_before);
+    assert_eq!(
+        t.unbooked_image_bytes(),
+        with_store_and_visible - inline_bytes
+    );
+}
+
+#[test]
+fn kitty_media_admitted_carries_across_replay_fork_and_replay_carry() {
+    let epoch = aterm_time::Instant::now();
+    let mut live = Terminal::new(4, 20);
+    live.set_kitty_file_resolver(|_, _| None);
+    assert!(live.kitty_file_resolver_installed());
+
+    let cp = live.checkpoint_continuing().expect("ground");
+    let carry = live.capture_replay_carry();
+    assert!(carry.kitty_media_admitted());
+
+    let mut fork = live.replay_fork().expect("fork");
+    assert!(fork.kitty_file_resolver_installed());
+
+    let mut carried = Terminal::replay_from_checkpoint(&cp);
+    carried.apply_replay_carry(&carry);
+    assert!(carried.kitty_file_resolver_installed());
+
+    let mut bare = Terminal::replay_from_checkpoint(&cp);
+    assert!(!bare.kitty_file_resolver_installed());
+
+    // Capability query `a=q,t=f` answers `OK` (no host read) and missing-file `a=T,t=f` answers
+    // `EINVAL:bad image data` when admitted, vs `ENOTSUPPORTED` on an uncarried replay.
+    let probe = b"\x1b_Gi=31,a=q,t=f\x1b\\\x1b_Gi=32,a=T,t=f,f=32,s=1,v=1;L21pc3Npbmc=\x1b\\";
+    for engine in [&mut live, &mut fork, &mut carried, &mut bare] {
+        engine.process_at(probe, clock(epoch, 0));
+    }
+    let expected = b"\x1b_Gi=31;OK\x1b\\\x1b_Gi=32;EINVAL:bad image data\x1b\\".to_vec();
+    let live_reply = live.take_response().expect("live reply");
+    assert_eq!(live_reply, expected);
+    assert_eq!(fork.take_response().as_ref(), Some(&live_reply));
+    assert_eq!(carried.take_response().as_ref(), Some(&live_reply));
+    assert_eq!(
+        fork.capture_replay_carry().earliest_instant(),
+        live.capture_replay_carry().earliest_instant()
+    );
+
+    let bare_reply = bare.take_response().expect("bare reply");
+    assert_ne!(
+        bare_reply, live_reply,
+        "negative control: bare replay answers ENOTSUPPORTED instead of OK / EINVAL"
+    );
+}
+
+#[test]
+fn host_io_ordinal_advances_only_when_live_host_reads_succeed() {
+    use crate::terminal::{ClipboardAccess, ClipboardOperation};
+    use aterm_types::{WindowOperation, WindowResponse};
+
+    let epoch = aterm_time::Instant::now();
+    let mut term = Terminal::new(4, 20);
+    assert_eq!(term.host_io_ordinal(), 0);
+
+    // Direct `t=d`, disabled `t=f`, capability queries `a=q,t=f`, and missing/malformed `t=f`
+    // leave `host_io_ordinal` unmoved because pure replay reproduces them identically.
+    term.process_at(
+        b"\x1b_Gi=1,a=T,f=32,s=1,v=1;////\x1b\\\x1b_Gi=2,a=T,t=f,f=32,s=1,v=1;L21pc3Npbmc=\x1b\\",
+        clock(epoch, 0),
+    );
+    assert_eq!(term.host_io_ordinal(), 0);
+
+    term.set_kitty_file_resolver(|_, name| match name {
+        "/good.raw" => Some(vec![0xff, 0, 0, 0xff]),
+        "/bad.raw" => Some(vec![0xff]), // wrong byte length for 1x1 RGBA -> None
+        _ => None,
+    });
+    term.process_at(
+        b"\x1b_Gi=3,a=q,t=f\x1b\\\
+          \x1b_Gi=4,a=T,t=f,f=32,s=1,v=1;L21pc3Npbmc=\x1b\\\
+          \x1b_Gi=5,a=T,t=f,f=32,s=1,v=1;L2JhZC5yYXc=\x1b\\",
+        clock(epoch, 10),
+    );
+    assert_eq!(term.host_io_ordinal(), 0);
+
+    // Successful `t=f` transmit (`L2dvb2QucmF3` = "/good.raw") and `a=f` frame load each bump it.
+    term.process_at(
+        b"\x1b_Gi=6,a=t,t=f,f=32,s=1,v=1;L2dvb2QucmF3\x1b\\",
+        clock(epoch, 20),
+    );
+    assert_eq!(term.host_io_ordinal(), 1);
+    term.process_at(
+        b"\x1b_Gi=6,a=f,t=f,f=32,s=1,v=1,z=40;L2dvb2QucmF3\x1b\\",
+        clock(epoch, 30),
+    );
+    assert_eq!(term.host_io_ordinal(), 2);
+
+    // Denied or empty-returning `OSC 52 ; ?` leaves it at 2; an answered query advances to 3.
+    term.process_at(b"\x1b]52;c;?\x07", clock(epoch, 40));
+    assert_eq!(term.host_io_ordinal(), 2);
+    term.authorize_clipboard_access(ClipboardAccess::Query);
+    term.set_clipboard_callback(|op| match op {
+        ClipboardOperation::Query { .. } => None,
+        _ => None,
+    });
+    term.process_at(b"\x1b]52;c;?\x07", clock(epoch, 50));
+    assert_eq!(term.host_io_ordinal(), 2);
+
+    term.set_clipboard_callback(|op| match op {
+        ClipboardOperation::Query { .. } => Some("clip".to_string()),
+        _ => None,
+    });
+    let _ = term.take_response();
+    term.process_at(b"\x1b]52;c;?\x07", clock(epoch, 2_000));
+    assert_eq!(term.host_io_ordinal(), 3);
+
+    // RIS (`ESC c`) preserves the monotonic ordinal, and a `Some(WindowResponse)` advances it.
+    term.process_at(b"\x1bc", clock(epoch, 2_100));
+    assert_eq!(term.host_io_ordinal(), 3);
+    term.modes_mut().allow_window_ops = true;
+    term.set_window_callback(|op| match op {
+        WindowOperation::ReportWindowState => Some(WindowResponse::WindowState(false)),
+        _ => None,
+    });
+    term.process_at(b"\x1b[11t", clock(epoch, 4_000));
+    assert_eq!(term.host_io_ordinal(), 4);
 }

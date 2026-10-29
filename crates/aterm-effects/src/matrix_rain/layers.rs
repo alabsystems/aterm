@@ -117,24 +117,13 @@ impl RainLayers {
     /// `tiles` (a cell whose tile is not baked yet draws nothing).
     #[inline]
     pub fn publish(&mut self, cells: &[RainCell], tiles: &RainBaker, layers: &mut Vec<FxLayer>) {
+        if cells.is_empty() {
+            self.withdraw(layers);
+            return;
+        }
         withdraw(layers, &self.ids);
         self.ids.clear();
         self.next.clear();
-        let mut bi = 0;
-        while bi < self.by_row.len() {
-            self.by_row[bi].clear();
-            bi += 1;
-        }
-        let mut ci = 0;
-        while ci < cells.len() {
-            let c = cells[ci];
-            let r = usize::from(c.row);
-            if self.by_row.len() <= r {
-                self.by_row.resize_with(r + 1, Vec::new);
-            }
-            self.by_row[r].push(c);
-            ci += 1;
-        }
         let mut at = layers.len();
         let mut li = 0;
         while li < layers.len() {
@@ -148,58 +137,83 @@ impl RainLayers {
         }
         let version = tiles.version();
         let mut held = std::mem::take(&mut self.held);
-        let mut r = 0;
-        while r < self.by_row.len() {
-            let row_cells = &self.by_row[r];
-            let cur_r = r;
-            r += 1;
-            if row_cells.is_empty() {
-                continue;
-            }
-            let row = cur_r as u16;
-            let mut found = None;
-            let mut hi = 0;
-            while hi < held.len() {
-                if held[hi].row == row {
-                    found = Some(hi);
-                    break;
+        {
+            let mut held_iter = held.drain(..).peekable();
+            let mut emit_row = |row: u16, row_cells: &[RainCell]| {
+                while held_iter.peek().is_some_and(|h| h.row < row) {
+                    let _ = held_iter.next();
                 }
-                hi += 1;
-            }
-            let entry = match found {
-                Some(i) => {
-                    let mut prev = held.swap_remove(i);
-                    if prev.version != version || prev.cells != *row_cells {
+                let entry = if held_iter.peek().is_some_and(|h| h.row == row) {
+                    let mut prev = held_iter.next().expect("peeked matching row");
+                    if prev.version != version || prev.cells.as_slice() != row_cells {
                         prev.version = version;
-                        prev.cells.clone_from(row_cells);
+                        prev.cells.clear();
+                        prev.cells.extend_from_slice(row_cells);
                         prev.content = Arc::new(row_content(row_cells, tiles));
                     }
                     prev
+                } else {
+                    Row {
+                        row,
+                        version,
+                        cells: row_cells.to_vec(),
+                        content: Arc::new(row_content(row_cells, tiles)),
+                    }
+                };
+                if entry.content.items().is_empty() {
+                    return;
                 }
-                None => Row {
-                    row,
-                    version,
-                    cells: row_cells.clone(),
-                    content: Arc::new(row_content(row_cells, tiles)),
-                },
+                let id = crate::genome::mix(RAIN_SALT ^ u64::from(row));
+                let layer = FxLayer::new(
+                    id,
+                    Arc::clone(&entry.content),
+                    FxSlot::Under,
+                    FxSpace::Grid,
+                    FxBlend::Linear,
+                );
+                self.ids.push(id);
+                self.fresh.push(layer);
+                self.next.push(entry);
             };
-            if entry.content.items().is_empty() {
-                continue;
+            if cells_sorted_by_row(cells) {
+                let mut start = 0;
+                while start < cells.len() {
+                    let row = cells[start].row;
+                    let mut end = start + 1;
+                    while end < cells.len() && cells[end].row == row {
+                        end += 1;
+                    }
+                    emit_row(row, &cells[start..end]);
+                    start = end;
+                }
+            } else {
+                let mut bi = 0;
+                while bi < self.by_row.len() {
+                    self.by_row[bi].clear();
+                    bi += 1;
+                }
+                let mut ci = 0;
+                while ci < cells.len() {
+                    let c = cells[ci];
+                    let r = usize::from(c.row);
+                    if self.by_row.len() <= r {
+                        self.by_row.resize_with(r + 1, Vec::new);
+                    }
+                    self.by_row[r].push(c);
+                    ci += 1;
+                }
+                let mut r = 0;
+                while r < self.by_row.len() {
+                    let row_cells = &self.by_row[r];
+                    let cur_r = r;
+                    r += 1;
+                    if !row_cells.is_empty() {
+                        emit_row(cur_r as u16, row_cells);
+                    }
+                }
             }
-            let id = crate::genome::mix(RAIN_SALT ^ u64::from(row));
-            let layer = FxLayer::new(
-                id,
-                Arc::clone(&entry.content),
-                FxSlot::Under,
-                FxSpace::Grid,
-                FxBlend::Linear,
-            );
-            self.ids.push(id);
-            self.fresh.push(layer);
-            self.next.push(entry);
         }
         layers.splice(at..at, self.fresh.drain(..));
-        held.clear();
         self.held = std::mem::replace(&mut self.next, held);
     }
 
@@ -229,6 +243,18 @@ pub const fn is_rain_row(layer: &FxLayer) -> bool {
         && matches!(layer.blend, FxBlend::Linear)
         && matches!(layer.space, FxSpace::Grid)
         && !layer.knock
+}
+
+#[inline]
+pub(super) const fn cells_sorted_by_row(cells: &[RainCell]) -> bool {
+    let mut i = 1;
+    while i < cells.len() {
+        if cells[i - 1].row > cells[i].row {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 /// One row's sprites over a palette of its distinct inks.

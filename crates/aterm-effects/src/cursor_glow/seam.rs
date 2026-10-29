@@ -392,6 +392,9 @@ impl CursorGlow {
             lay.printed_off_row = true;
         }
         if cur != lay.seen {
+            if lay.keyed {
+                return;
+            }
             lay.seen = cur;
             lay.moved_at = now;
         } else if now.saturating_duration_since(lay.moved_at) >= TORN_REST_DUR {
@@ -403,7 +406,10 @@ impl CursorGlow {
         self.torn_lay = Some(lay);
     }
 
-    /// Recall a typed lay the caret rests on or left of, keylessly, after a print ended off its row.
+    /// Recall a typed lay the caret rests on or left of, keylessly, after a print ended off its row,
+    /// handing back what the lay took, each only while it stands as the lay left it: the hand it
+    /// put on its row, and the doubt it settled there (a key that settled the doubt since settled
+    /// the saved one too, [`CursorGlow::note_motion`]).
     #[inline]
     pub(super) fn recall_torn_lay(&mut self, lay: TornLay, (row, col): (u16, u16), now: Instant) {
         if !lay.printed_off_row
@@ -440,8 +446,15 @@ impl CursorGlow {
             },
             now,
         );
-        self.hand_row = lay.hand_before;
-        self.unowned_caret = lay.unowned_before;
+        if matches!(self.hand_row, Some(hand) if hand.row == lay.row) {
+            self.hand_row = lay.hand_before;
+        }
+        if self.unowned_caret.is_none()
+            && let Some(doubt) = lay.unowned_before
+            && doubt.row == lay.row
+        {
+            self.unowned_caret = Some(doubt);
+        }
         self.log_licensed_as(
             now,
             (row, lay.col1),
@@ -516,14 +529,11 @@ impl CursorGlow {
                 let mut best_i = 0;
                 let mut idx = 0;
                 while idx < self.anchor_rows.len() {
-                    let cur_key = self.anchor_rows[idx];
-                    let best_key = self.anchor_rows[best_i];
-                    let less = match (cur_key, best_key) {
-                        (None, Some(_)) => true,
-                        (Some(a), Some(b)) => a.touched < b.touched,
-                        _ => false,
+                    let Some(a) = self.anchor_rows[idx] else {
+                        best_i = idx;
+                        break;
                     };
-                    if less {
+                    if matches!(self.anchor_rows[best_i], Some(b) if a.touched < b.touched) {
                         best_i = idx;
                     }
                     idx += 1;
@@ -1954,6 +1964,20 @@ impl CursorGlow {
         } else {
             None
         });
+        // The park's config is a stale copy: it draws by the light the last tick began under
+        // (`tick_light`). A flush inside a tick is that frame's light; one a key, gesture or
+        // scroll hint runs between ticks is the previous frame's, so a light that flips between
+        // ticks reaches it a tick late. Nothing `spawn_judged` judges reads the light yet; a
+        // reader of it needs such a flush to take the light the latch gives at its instant
+        // (`Light::OFF` once the latch fell) first.
+        let cfg = GlowConfig {
+            light: self.tick_light,
+            ..p.cfg
+        };
+        #[cfg(test)]
+        {
+            self.park_flush_light = Some(cfg.light);
+        }
         let licensed = self.judging_on_rows(p.row, p.landing_row, |glow| {
             glow.with_presses_at_park(p.at, p.press_mask, |glow| {
                 glow.spawn_judged(
@@ -1962,7 +1986,7 @@ impl CursorGlow {
                     p.landing_row,
                     p.landing,
                     p.at,
-                    &p.cfg,
+                    &cfg,
                     p.geom,
                     SpawnLane::Visible,
                     SpawnCall::FlushedPark {
@@ -2403,7 +2427,6 @@ impl CursorGlow {
             if run.row == row
                 && run.end() == col0
                 && usize::from(run.len) + usize::from(col1 - col0) <= RECENT_TYPED_RUN_CAP
-                && now.saturating_duration_since(run.at) <= rk::ribbon::CHAIN_GAP_MAX_DUR
             {
                 let mut ok = true;
                 let mut col = run.col0;
@@ -2425,8 +2448,14 @@ impl CursorGlow {
         } else {
             false
         };
+        let fresh = old.is_some_and(|run| {
+            now.saturating_duration_since(run.at) <= rk::ribbon::CHAIN_GAP_MAX_DUR
+        });
         let mut origin = None;
-        if joined && let Some(run) = old {
+        if joined
+            && fresh
+            && let Some(run) = old
+        {
             let (standing, first) = self.typed_run_standing(row, run.col0, col0, now);
             origin = match first {
                 Some((_, o)) => Some(o),
@@ -2470,8 +2499,34 @@ impl CursorGlow {
                 }
             }
         }
+        if joined
+            && !fresh
+            && let Some(run) = old
+        {
+            let bridge = col0
+                .checked_sub(1)
+                .filter(|&c| self.row_cur.get(usize::from(c)) == Some(&' '));
+            if let (Some(col), Some(origin)) = (bridge, run.origin)
+                && !self.typed_run_standing(row, col, col0, now).0[0]
+            {
+                self.v2.on_event(
+                    rk::Event::Sweep {
+                        row,
+                        col0: col,
+                        col1: col0,
+                    },
+                    now,
+                );
+                self.v2.note_revive(rk::ribbon::Revive {
+                    row,
+                    col0: col,
+                    col1: col0,
+                    origin,
+                });
+            }
+        }
         self.v2.on_event(rk::Event::Sweep { row, col0, col1 }, born);
-        if joined {
+        if joined && fresh {
             if let Some(run) = self.recent_typed_run.as_mut() {
                 let start = usize::from(run.len);
                 let span_len = usize::from(col1 - col0);
@@ -3010,6 +3065,7 @@ impl CursorGlow {
                     unowned_before,
                     anchor_seq: self.print_anchor_seq(),
                     printed_off_row: false,
+                    keyed: false,
                 });
             }
             return true;

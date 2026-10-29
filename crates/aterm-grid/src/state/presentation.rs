@@ -533,12 +533,11 @@ mod tests {
         assert_eq!(band(3, 7).union(band(5, 9)), band(3, 9));
     }
 
-    /// Order independence holds across the arity bound: a sequence that
-    /// momentarily exceeds the bound (a box border drawn as two overlapping
-    /// pieces and then filled) keeps its gaps when the final cover fits, folded
-    /// in either order.
+    /// Order independence holds within the 8-band arity bound: a sequence whose
+    /// overlapping pieces coalesce within the bound keeps its gaps, folded in
+    /// either order.
     #[test]
-    fn union_is_order_independent_past_the_arity_bound() {
+    fn union_is_order_independent_within_the_arity_bound() {
         let seq = [
             (21u64, 24u64),
             (0, 2),

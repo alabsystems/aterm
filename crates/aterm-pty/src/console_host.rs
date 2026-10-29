@@ -126,19 +126,4 @@ mod tests {
         assert!(ConsoleHostKind::OpenConsole.passes_screen_switches_through());
         assert!(!ConsoleHostKind::Inbox.passes_screen_switches_through());
     }
-
-    #[test]
-    fn the_window_calls_have_one_shape_on_every_platform() {
-        let _: fn(ConsoleHostChoice) = crate::set_console_host;
-        let _: fn() -> Option<String> = crate::take_console_host_fallback;
-        let _: fn(i32) -> Option<ConsoleHostKind> = crate::conpty_host;
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn off_windows_there_is_no_console_host() {
-        set_console_host(ConsoleHostChoice::Auto);
-        assert_eq!(take_console_host_fallback(), None);
-        assert_eq!(conpty_host(0), None);
-    }
 }

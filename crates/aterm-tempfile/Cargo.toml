@@ -19,3 +19,10 @@ workspace = true
 # a dependent whose tests lay stand-ins names it: `--features
 # aterm-tempfile/test-support`. `--profile opt-test` needs nothing.
 test-support = []
+
+[dev-dependencies]
+# The stand-in tests run a stand-in and this test binary as children: built with
+# `spawnfd::command`, bounded by `deadline`. A dev-dependency only, so the crate
+# still depends on nothing; aterm-uds reaches aterm-tempfile only as its own
+# dev-dependency, so no cycle forms.
+aterm-uds = { workspace = true }

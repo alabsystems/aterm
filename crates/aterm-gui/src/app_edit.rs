@@ -334,6 +334,31 @@ impl App {
         }
     }
 
+    /// Where an `edit` from `session` opens: the window holding the session and
+    /// the tab hosting it, or the line that refuses it before any file is read
+    /// (`ERR unsupported headless`, `ERR no-window`).
+    fn edit_host(&self, session: u64) -> Result<(WindowId, TabId), &'static str> {
+        if self.headless && !self.native_documents.edits.serves_headless() {
+            return Err("ERR unsupported headless\n");
+        }
+        let window = self.window_of_session(session).ok_or("ERR no-window\n")?;
+        let tab = self
+            .tab_hosting_session(window, session)
+            .ok_or("ERR no-window\n")?;
+        Ok((window, tab))
+    }
+
+    /// `status editor=`: `amacs` while an `edit` from `session` (the `amacs`
+    /// command run in its tab) opens an Editor tab beside it, `-` while
+    /// [`Self::edit_host`] refuses it.
+    pub(crate) fn editor_word(&self, session: u64) -> &'static str {
+        if self.edit_host(session).is_ok() {
+            "amacs"
+        } else {
+            "-"
+        }
+    }
+
     /// [`Self::begin_edit`]'s checks: answer a refusal and return `None`, or
     /// record the ticket as admitting and return its window and the file's
     /// canonical spelling.
@@ -358,14 +383,9 @@ impl App {
             let _ = reply.send(line.to_string());
             None
         };
-        if self.headless && !self.native_documents.edits.serves_headless() {
-            return refuse("ERR unsupported headless\n");
-        }
-        let Some(window) = self.window_of_session(session) else {
-            return refuse("ERR no-window\n");
-        };
-        let Some(caller_tab) = self.tab_hosting_session(window, session) else {
-            return refuse("ERR no-window\n");
+        let (window, caller_tab) = match self.edit_host(session) {
+            Ok(host) => host,
+            Err(line) => return refuse(line),
         };
         if Self::refuse_file_provider_open(&request.uri).is_err() {
             return refuse("ERR refused file-provider\n");
@@ -1836,6 +1856,33 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_that_opens_behind_leaves_the_persons_selection_drag_going() {
+        let f = fixture("behind-drag", b"x\n");
+        let mut app = app();
+        let wid = WindowId(0);
+        let sid = caller(&mut app, wid);
+        let person = fresh_session(&mut app);
+        app.push_stub_tab(wid, crate::stub_session(person));
+        app.next_session_id = person + 1;
+        let person_tab = active_tab(&app, wid);
+        crate::multi_window_tests::start_selection_drag(&mut app, wid);
+
+        let (_, line) = edit(&mut app, sid, request(&f.uri, None));
+        let placed = tab_of(&app, wid, view(&ok(&line)));
+        assert_eq!(active_tab(&app, wid), person_tab, "the person's tab stays");
+        assert!(
+            app.windows[&wid].selecting,
+            "the drag the person is making goes on"
+        );
+
+        select(&mut app, wid, placed);
+        assert!(
+            !app.windows[&wid].selecting,
+            "control: choosing the edit tab ends the drag"
+        );
+    }
+
+    #[test]
     fn dirty_close_answers_closed_only_after_checkpoint_ack() {
         let wid = WindowId(0);
         let mut app = app();
@@ -2824,6 +2871,59 @@ mod tests {
         assert!(app.native_documents.edits.open.is_empty());
     }
 
+    /// T10 (docs/DESIGN-amacs-grid-2026-10-28.md): an `edit` of a table opens as a grid, and
+    /// Done (C-c C-c) with a cell open commits the cell, saves, and answers finished, the file's
+    /// CRLF line ends held and only the cell's bytes changed.
+    #[test]
+    fn t10_done_from_a_grid_commits_the_open_cell_saves_and_answers_finished() {
+        use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+        let wid = WindowId(0);
+        let mut app = app();
+        let sid = caller(&mut app, wid);
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-edit-grid-")
+            .tempdir()
+            .unwrap();
+        let path = dir.path().join("accounts.csv");
+        std::fs::write(&path, b"name,fix\r\nm1,\r\nm2,\r\n").unwrap();
+        let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
+        let (ticket, line) = edit(&mut app, sid, request(&uri, None));
+        let edit_view = view(&ok(&line));
+        let (_, answer) = wait(&mut app, AwaitKey::Ticket(ticket));
+        let grid = |app: &App| match app.native_runtime.view_state(edit_view) {
+            Some(AppViewState::Editor(state)) => state
+                .buffer
+                .as_ref()
+                .and_then(|buffer| buffer.grid())
+                .cloned(),
+            _ => panic!("an Editor view"),
+        };
+        assert!(grid(&app).is_some(), "an edit of a .csv opens as a grid");
+        for named in [NamedKey::ArrowDown, NamedKey::End] {
+            let event = crate::input::InputEvent::Key {
+                key: Key::Named(named),
+                mods: Modifiers::empty(),
+                base_layout: None,
+                layout_text: None,
+                event_type: KeyEventType::Press,
+            };
+            assert!(app.native_input_event(wid, &event));
+        }
+        type_text(&mut app, wid, "x, \"y\"");
+        assert!(grid(&app).is_some_and(|grid| grid.draft.is_some()));
+        press(&mut app, wid, "C-c C-c");
+        let done = outcome(&answer);
+        assert_eq!((done.result, done.saved), (EditResult::Finished, true));
+        assert_eq!(
+            String::from_utf8(std::fs::read(&path).unwrap()).unwrap(),
+            "name,fix\r\nm1,\"x, \"\"y\"\"\"\r\nm2,\r\n"
+        );
+        assert!(
+            app.view_store.get(edit_view).is_none(),
+            "done closes the view"
+        );
+    }
+
     #[test]
     fn crlf_held_buffer_takes_typed_line_ends_as_its_own() {
         let wid = WindowId(0);
@@ -2890,6 +2990,52 @@ mod tests {
         assert_eq!(answer.try_recv(), Err(TryRecvError::Empty));
         assert_eq!(buffer_text(&app, edit_view), "mine base\n");
         assert_eq!(std::fs::read_to_string(&g.path).unwrap(), "base\n");
+    }
+
+    /// Keep Mine over another view's unsaved text leaves that text unsaved
+    /// (it rebinds the file the next Save writes over, and marks nothing
+    /// durable), so an abort of the edit view still keeps it, and the file
+    /// keeps the disk's text.
+    #[test]
+    fn abort_after_keep_mine_keeps_text_the_edit_did_not_type() {
+        let wid = WindowId(0);
+        let mut app = app();
+        let sid = caller(&mut app, wid);
+        let caller_tab = active_tab(&app, wid);
+        let f = fixture("abort-after-keep", b"base\n");
+        app.open_document_tab(AppKind::Editor, &f.uri).unwrap();
+        let (_, mine) = app.active_native_view(wid).unwrap();
+        type_text(&mut app, wid, "mine ");
+        select(&mut app, wid, caller_tab);
+        let (ticket, line) = edit(&mut app, sid, request(&f.uri, None));
+        let edit_view = view(&ok(&line));
+        let (_, answer) = wait(&mut app, AwaitKey::Ticket(ticket));
+        let document = document_of(&app, edit_view);
+        std::fs::write(&f.path, "changed\n").unwrap();
+        app.native_document_file_changed(document.get());
+        // Keep Mine refuses ("Nothing to keep") unless the change was heard.
+        app.dispatch_native_event(
+            wid,
+            AppEvent::Action(crate::native_app::ActionInvocation {
+                id: crate::native_ui::ActionId::new("editor/keep-local"),
+                value: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(app.document_store.dirty(document), Some(true));
+        press(&mut app, wid, "C-c C-k");
+        let aborted = outcome(&answer);
+        assert_eq!(
+            (aborted.result, aborted.saved),
+            (EditResult::Aborted, false)
+        );
+        assert_eq!(
+            buffer_text(&app, mine),
+            "mine base\n",
+            "the other view's text stays"
+        );
+        assert_eq!(std::fs::read_to_string(&f.path).unwrap(), "changed\n");
+        assert_eq!(status(&app, mine).as_deref(), Some(ABORT_KEPT));
     }
 
     #[test]

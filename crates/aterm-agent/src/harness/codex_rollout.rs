@@ -35,7 +35,8 @@ pub fn is_rollout_of(name: &str, thread: &str) -> bool {
     name.starts_with("rollout-")
         && name
             .strip_suffix(".jsonl")
-            .is_some_and(|stem| stem.ends_with(&format!("-{thread}")))
+            .and_then(|stem| stem.strip_suffix(thread))
+            .is_some_and(|prefix| prefix.ends_with('-'))
 }
 
 /// Resolves `$CODEX_HOME` for a Codex process started with `env` in `cwd`.
@@ -76,7 +77,8 @@ pub fn rollouts_by_write(home: &Path) -> Vec<(PathBuf, SystemTime)> {
                     continue;
                 };
                 for e in entries.flatten() {
-                    let name = e.file_name().to_string_lossy().into_owned();
+                    let file_name = e.file_name();
+                    let name = file_name.to_string_lossy();
                     if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
                         continue;
                     }
@@ -87,7 +89,7 @@ pub fn rollouts_by_write(home: &Path) -> Vec<(PathBuf, SystemTime)> {
             }
         }
     }
-    out.sort_by_key(|a| std::cmp::Reverse(a.1));
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
     out
 }
 
@@ -99,19 +101,28 @@ pub fn tail_of(path: &Path, bytes: u64) -> Option<String> {
 
 /// Reads up to the last `bytes` of `path` starting no earlier than line-aligned `floor`.
 pub(crate) fn tail_after(path: &Path, floor: u64, bytes: u64) -> Option<String> {
-    use std::io::{Read as _, Seek as _, SeekFrom};
     let mut f = crate::harness::footer::open_regular(path)?;
+    tail_after_file(&mut f, floor, bytes)
+}
+
+/// Reads up to the last `bytes` of open `f` starting no earlier than line-aligned `floor`.
+pub(crate) fn tail_after_file(f: &mut std::fs::File, floor: u64, bytes: u64) -> Option<String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
     let len = f.metadata().ok()?.len();
     let from = len.saturating_sub(bytes).max(floor);
     f.seek(SeekFrom::Start(from)).ok()?;
-    let mut buf = Vec::new();
+    let want = usize::try_from(len.saturating_sub(from).min(bytes)).unwrap_or(0);
+    let mut buf = Vec::with_capacity(want.min(512 * 1024));
     f.take(bytes).read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf).into_owned();
-    Some(if from > floor {
-        text.split_once('\n')
-            .map_or_else(String::new, |(_, rest)| rest.to_string())
-    } else {
-        text
+    if from > floor {
+        let Some(nl) = buf.iter().position(|&b| b == b'\n') else {
+            return Some(String::new());
+        };
+        buf.drain(..=nl);
+    }
+    Some(match String::from_utf8(buf) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
     })
 }
 
@@ -140,14 +151,14 @@ impl TurnTokens {
     fn of(v: Option<&Value>) -> Option<Self> {
         let o = v?.as_object()?;
         let n = |key: &str| o.get(key).and_then(Value::as_u64);
-        if n("input_tokens").is_none() && n("output_tokens").is_none() {
+        if n(KEY_INPUT_TOKENS).is_none() && n(KEY_OUTPUT_TOKENS).is_none() {
             return None;
         }
         Some(Self {
-            input: n("input_tokens").unwrap_or(0),
+            input: n(KEY_INPUT_TOKENS).unwrap_or(0),
             cached: n("cached_input_tokens").unwrap_or(0),
             cache_write: n("cache_write_input_tokens").unwrap_or(0),
-            output: n("output_tokens").unwrap_or(0),
+            output: n(KEY_OUTPUT_TOKENS).unwrap_or(0),
             reasoning: n("reasoning_output_tokens").unwrap_or(0),
         })
     }
@@ -246,14 +257,24 @@ fn turn_key(total: &TurnTokens, total_tokens: u64, last: &TurnTokens) -> u64 {
     aterm_hash::fnv1a_64(text.as_bytes())
 }
 
+// The keys of a `token_count` payload the counts are read from, as the anchors name them (the
+// Codex step fold's token counts are these: `lab codex-measure` refuses GONE when a build drops
+// one).
+const KEY_INFO: &str = aterm_phase::anchor!("rollout.info");
+const KEY_TOTAL_USAGE: &str = aterm_phase::anchor!("rollout.total_token_usage");
+const KEY_LAST_USAGE: &str = aterm_phase::anchor!("rollout.last_token_usage");
+const KEY_TOTAL_TOKENS: &str = aterm_phase::anchor!("rollout.total_tokens");
+const KEY_INPUT_TOKENS: &str = aterm_phase::anchor!("rollout.input_tokens");
+const KEY_OUTPUT_TOKENS: &str = aterm_phase::anchor!("rollout.output_tokens");
+
 /// Extracts `(last_token_usage, total_tokens)` from a `token_count` payload.
 pub(crate) fn counts_of(payload: Option<&Value>) -> Option<(TurnTokens, u64, TurnTokens)> {
-    let info = payload?.get("info").filter(|i| i.is_object())?;
-    let total_usage = info.get("total_token_usage");
+    let info = payload?.get(KEY_INFO).filter(|i| i.is_object())?;
+    let total_usage = info.get(KEY_TOTAL_USAGE);
     let total = TurnTokens::of(total_usage)?;
-    let last = TurnTokens::of(info.get("last_token_usage"))?;
+    let last = TurnTokens::of(info.get(KEY_LAST_USAGE))?;
     let total_tokens = total_usage
-        .and_then(|t| t.get("total_tokens"))
+        .and_then(|t| t.get(KEY_TOTAL_TOKENS))
         .and_then(Value::as_u64)
         .unwrap_or_else(|| total.input.saturating_add(total.output));
     Some((total, total_tokens, last))
@@ -428,6 +449,17 @@ pub(crate) fn stream_open_ends(
     from: u64,
     skip: Option<u64>,
     cap: u64,
+    each: impl FnMut(u64, u64, Streamed<'_>) -> std::ops::ControlFlow<()>,
+) -> RolloutRead {
+    stream_open_ends_ref(&file, from, skip, cap, each)
+}
+
+/// Streams complete lines from borrowed `file` starting at byte offset `from`.
+pub(crate) fn stream_open_ends_ref(
+    file: &std::fs::File,
+    from: u64,
+    skip: Option<u64>,
+    cap: u64,
     mut each: impl FnMut(u64, u64, Streamed<'_>) -> std::ops::ControlFlow<()>,
 ) -> RolloutRead {
     use std::io::{BufRead as _, Seek as _};
@@ -512,55 +544,315 @@ pub struct Conversation {
     pub unread: usize,
 }
 
-fn session_ids(first_line: &str) -> Option<(Option<String>, Option<String>)> {
-    let v: Value = aterm_json::from_str(first_line.trim()).ok()?;
-    if v.get("type").and_then(Value::as_str) != Some("session_meta") {
-        return None;
+struct MaybeBorrowedStr<'a>(Option<std::borrow::Cow<'a, str>>);
+
+impl<'de> serde::Deserialize<'de> for MaybeBorrowedStr<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Option<std::borrow::Cow<'de, str>>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_borrowed_str<E: serde::de::Error>(
+                self,
+                v: &'de str,
+            ) -> Result<Self::Value, E> {
+                Ok(Some(std::borrow::Cow::Borrowed(v)))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(Some(std::borrow::Cow::Owned(v.to_owned())))
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(Some(std::borrow::Cow::Owned(v)))
+            }
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_some<D2: serde::Deserializer<'de>>(
+                self,
+                d: D2,
+            ) -> Result<Self::Value, D2::Error> {
+                d.deserialize_any(self)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(None)
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while map
+                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .is_some()
+                {}
+                Ok(None)
+            }
+        }
+        de.deserialize_any(V).map(Self)
     }
-    let p = v.get("payload")?;
-    let id = |key: &str| p.get(key).and_then(Value::as_str).map(str::to_owned);
-    Some((id("session_id"), id("id")))
 }
 
-/// Reads the first line of `path` up to [`META_BYTES`].
-pub(crate) fn first_line(path: &Path) -> Option<String> {
-    first_line_of(&crate::harness::footer::open_regular(path)?)
+struct BorrowedKey<'a>(std::borrow::Cow<'a, str>);
+
+impl<'de> serde::Deserialize<'de> for BorrowedKey<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = std::borrow::Cow<'de, str>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a string key")
+            }
+            fn visit_borrowed_str<E: serde::de::Error>(
+                self,
+                v: &'de str,
+            ) -> Result<Self::Value, E> {
+                Ok(std::borrow::Cow::Borrowed(v))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(std::borrow::Cow::Owned(v.to_owned()))
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(std::borrow::Cow::Owned(v))
+            }
+        }
+        de.deserialize_str(V).map(Self)
+    }
+}
+
+#[derive(Default)]
+struct SessionMetaPayload<'a> {
+    present: bool,
+    session_id: Option<std::borrow::Cow<'a, str>>,
+    id: Option<std::borrow::Cow<'a, str>>,
+}
+
+impl<'de> serde::Deserialize<'de> for SessionMetaPayload<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = SessionMetaPayload<'de>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(SessionMetaPayload {
+                    present: true,
+                    ..Default::default()
+                })
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(SessionMetaPayload {
+                    present: true,
+                    ..Default::default()
+                })
+            }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(SessionMetaPayload {
+                    present: true,
+                    ..Default::default()
+                })
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(SessionMetaPayload {
+                    present: true,
+                    ..Default::default()
+                })
+            }
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(SessionMetaPayload {
+                    present: true,
+                    ..Default::default()
+                })
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(SessionMetaPayload {
+                    present: true,
+                    ..Default::default()
+                })
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(SessionMetaPayload {
+                    present: true,
+                    ..Default::default()
+                })
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(SessionMetaPayload {
+                    present: true,
+                    ..Default::default()
+                })
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut out = SessionMetaPayload {
+                    present: true,
+                    ..Default::default()
+                };
+                while let Some(key) = map.next_key::<BorrowedKey<'de>>()? {
+                    match key.0.as_ref() {
+                        "session_id" => {
+                            out.session_id = map.next_value::<MaybeBorrowedStr<'de>>()?.0
+                        }
+                        "id" => out.id = map.next_value::<MaybeBorrowedStr<'de>>()?.0,
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(out)
+            }
+        }
+        de.deserialize_any(V)
+    }
+}
+
+#[derive(Default)]
+struct SessionMetaLine<'a> {
+    kind: Option<std::borrow::Cow<'a, str>>,
+    payload: SessionMetaPayload<'a>,
+}
+
+impl<'de> serde::Deserialize<'de> for SessionMetaLine<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = SessionMetaLine<'de>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut out = SessionMetaLine::default();
+                while let Some(key) = map.next_key::<BorrowedKey<'de>>()? {
+                    match key.0.as_ref() {
+                        "type" => out.kind = map.next_value::<MaybeBorrowedStr<'de>>()?.0,
+                        "payload" => out.payload = map.next_value::<SessionMetaPayload<'de>>()?,
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(out)
+            }
+        }
+        de.deserialize_map(V)
+    }
+}
+
+type SessionMetaIds<'a> = (
+    Option<std::borrow::Cow<'a, str>>,
+    Option<std::borrow::Cow<'a, str>>,
+);
+
+fn parse_session_meta_ids(first_line: &str) -> Option<SessionMetaIds<'_>> {
+    let parsed: SessionMetaLine<'_> = aterm_json::from_str(first_line.trim()).ok()?;
+    if parsed.kind.as_deref() != Some("session_meta") || !parsed.payload.present {
+        return None;
+    }
+    Some((parsed.payload.session_id, parsed.payload.id))
+}
+
+/// Reads the first newline-terminated line of open `file` from offset 0 into `line` up to
+/// [`META_BYTES`], returning `true` when a terminating `\n` was found within the cap.
+pub(crate) fn first_line_into(mut file: &std::fs::File, line: &mut Vec<u8>) -> bool {
+    use std::io::{Read as _, Seek as _};
+    line.clear();
+    if file.seek(std::io::SeekFrom::Start(0)).is_err() {
+        return false;
+    }
+    let cap = usize::try_from(META_BYTES).unwrap_or(usize::MAX);
+    let mut buf = [0u8; 65_536];
+    while line.len() < cap {
+        let room = (cap - line.len()).min(buf.len());
+        let n = match file.read(&mut buf[..room]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        };
+        let chunk = &buf[..n];
+        if let Some(nl) = chunk.iter().position(|&b| b == b'\n') {
+            line.extend_from_slice(&chunk[..=nl]);
+            return true;
+        }
+        line.extend_from_slice(chunk);
+    }
+    false
 }
 
 /// Reads the first line of open `file` from offset 0 up to [`META_BYTES`].
 pub(crate) fn first_line_of(file: &std::fs::File) -> Option<String> {
-    use std::io::{BufRead as _, Seek as _};
-    let mut file = file;
-    file.seek(std::io::SeekFrom::Start(0)).ok()?;
     let mut line = Vec::new();
-    std::io::BufReader::new(std::io::Read::take(file, META_BYTES))
-        .read_until(b'\n', &mut line)
-        .ok()?;
-    line.ends_with(b"\n")
-        .then(|| String::from_utf8_lossy(&line).into_owned())
+    first_line_into(file, &mut line).then(|| match String::from_utf8(line) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    })
 }
 
 /// Finds all rollout files belonging to `thread`'s conversation under `home`.
 #[must_use]
 pub fn conversation_rollouts(home: &Path, thread: &str) -> Conversation {
+    conversation_rollouts_inner(home, thread, true)
+}
+
+/// Like [`conversation_rollouts`], skipping full JSON lexing on rollouts whose first line cannot
+/// encode `root` (when `unread` is unused by the caller).
+#[must_use]
+pub(crate) fn conversation_rollouts_for_sample(home: &Path, thread: &str) -> Conversation {
+    conversation_rollouts_inner(home, thread, false)
+}
+
+fn conversation_rollouts_inner(home: &Path, thread: &str, count_unread: bool) -> Conversation {
     let all = rollouts_by_write(home);
-    let name_of = |p: &Path| {
-        p.file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_owned)
-            .unwrap_or_default()
-    };
+    fn name_of(p: &Path) -> &str {
+        p.file_name().and_then(|n| n.to_str()).unwrap_or_default()
+    }
     let own = all
         .iter()
-        .find(|(p, _)| is_rollout_of(&name_of(p), thread))
+        .find(|(p, _)| is_rollout_of(name_of(p), thread))
         .map(|(p, _)| p.clone());
+    let mut scratch = Vec::with_capacity(64 * 1024);
     let root = own
         .as_deref()
-        .and_then(first_line)
-        .and_then(|l| session_ids(&l))
-        .and_then(|(session, _)| session)
-        .filter(|s| is_thread_id(s))
+        .and_then(crate::harness::footer::open_regular)
+        .filter(|file| first_line_into(file, &mut scratch))
+        .and_then(|_| {
+            let line = String::from_utf8_lossy(&scratch);
+            parse_session_meta_ids(&line)?
+                .0
+                .filter(|s| is_thread_id(s))
+                .map(std::borrow::Cow::into_owned)
+        })
         .unwrap_or_else(|| thread.to_owned());
+    let root_is_uuid = is_thread_id(&root);
     let since = thread_created_ms(&root)
         .map(|ms| SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(ms));
     let mut roots = Vec::new();
@@ -571,7 +863,7 @@ pub fn conversation_rollouts(home: &Path, thread: &str) -> Conversation {
         if since.is_some_and(|s| *at < s) {
             continue;
         }
-        if is_rollout_of(&name_of(path), &root) {
+        if is_rollout_of(name_of(path), &root) {
             roots.push(path.clone());
             continue;
         }
@@ -580,9 +872,21 @@ pub fn conversation_rollouts(home: &Path, thread: &str) -> Conversation {
             unread += 1;
             continue;
         }
-        match first_line(path).and_then(|l| session_ids(&l)) {
+        let Some(file) = crate::harness::footer::open_regular(path) else {
+            unread += 1;
+            continue;
+        };
+        if !first_line_into(&file, &mut scratch) {
+            unread += 1;
+            continue;
+        }
+        let line = String::from_utf8_lossy(&scratch);
+        if !count_unread && root_is_uuid && !line.contains(root.as_str()) && !line.contains("\\u") {
+            continue;
+        }
+        match parse_session_meta_ids(&line) {
             Some((Some(session), id))
-                if session == root && id.as_deref() != Some(root.as_str()) =>
+                if session.as_ref() == root.as_str() && id.as_deref() != Some(root.as_str()) =>
             {
                 subagents.push(path.clone());
             }
@@ -671,12 +975,26 @@ pub(crate) mod fixtures {
 
     /// Builds a `token_count` JSON line with running `total` and `last` turn counts.
     pub(crate) fn count(ms: i64, total: Counts, last: Counts) -> String {
+        count_with(
+            ms,
+            total,
+            last,
+            "{\"limit_id\":\"codex\",\"primary\":{\"used_percent\":12.0,\"window_minutes\":300,\
+             \"resets_at\":1790000000},\"secondary\":null,\"plan_type\":\"pro\"}",
+        )
+    }
+
+    /// Builds a `token_count` JSON line as [`count`] does, with `"rate_limits":null` (a login
+    /// Codex is told no limits for).
+    pub(crate) fn count_unlimited(ms: i64, total: Counts, last: Counts) -> String {
+        count_with(ms, total, last, "null")
+    }
+
+    fn count_with(ms: i64, total: Counts, last: Counts, rate_limits: &str) -> String {
         format!(
             "{{\"timestamp\":\"{}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\
              \"info\":{{\"total_token_usage\":{},\"last_token_usage\":{},\
-             \"model_context_window\":272000}},\"rate_limits\":{{\"limit_id\":\"codex\",\
-             \"primary\":{{\"used_percent\":12.0,\"window_minutes\":300,\"resets_at\":1790000000}},\
-             \"secondary\":null,\"plan_type\":\"pro\"}}}}}}\n",
+             \"model_context_window\":272000}},\"rate_limits\":{rate_limits}}}}}\n",
             stamp(ms),
             usage(total),
             usage(last)

@@ -95,6 +95,14 @@ fn a_needs_token_a_lines_start_names_is_no_need() {
         "Put what only a person can give on a line starting with\nNEEDS YOU: and carry on.",
         "starting NEEDS YOU: and land the rest. Once it is all on remote main, defend that",
         "NEEDS YOU: and carry on with\neverything else.\n\nImplemented the parser.",
+        "NEEDS YOU: and carry on with everything else.\n\nImplemented the parser.",
+        "NEEDS YOU: and carry on.\n\nImplemented the parser.",
+        "NEEDS YOU: and carry on. Handle agent restarts yourself: save a handoff; `aterm ctl help restart`.\n\nImplemented the parser.",
+        "Implemented the parser.\nNEEDS YOU: and carry on.",
+        "by another sentence on the same line (like NEEDS YOU: and carry on.)",
+        "by another sentence on the same line (like NEEDS YOU: and carry on. Handle\nagent restarts yourself: save a handoff; aterm ctl help restart.)",
+        "NEEDS YOU: and land the rest.\n\nImplemented the parser.",
+        "NEEDS YOU: and land the rest. Once it is all on remote main, defend that\n\nImplemented the parser.",
         "Never force-push; a\nNEEDS YOU: line is for credentials only.",
         "Your\nNEEDS YOU line is on the person's screen now. Do not wait for it: carry on.",
     ] {
@@ -116,10 +124,23 @@ fn a_needs_token_a_lines_start_names_is_no_need() {
     ] {
         assert_eq!(needs_you(tail), ["the release credential"], "{tail:?}");
     }
-    assert_eq!(
-        needs_you("Implemented the parser.\nNEEDS YOU: and the release credential"),
-        ["and the release credential"]
-    );
+    for need in [
+        "and the release credential",
+        "and your approval to deploy",
+        "and carry on with the deployment after you grant access",
+    ] {
+        for before in ["", "Implemented the parser.\n"] {
+            let report = format!(
+                "{before}NEEDS YOU: {need}\n\nNothing left: all work is committed and pushed to origin/main."
+            );
+            assert_eq!(needs_you(&report), [need], "{report:?}");
+            assert!(!says_no_needs(&report), "{report:?}");
+            assert!(
+                !crate::supervise::policy::turn_end::clean_defense(Some(&report)),
+                "{report:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -230,8 +251,12 @@ fn a_bare_head_names_the_paragraph_under_it_or_a_need_it_cannot_read() {
         format!("{defense}\nNEEDS YOU:\n\n"),
         format!("NEEDS YOU:\n{defense}"),
         format!("{defense}\nNEEDS YOU:\n```\nlog\n```"),
+        format!("{defense}\nNEEDS YOU: ***"),
+        format!("{defense}\nNEEDS YOU: \u{200B}\u{202E}"),
+        format!("{defense}\nNEEDS YOU:\n- ***"),
     ] {
         assert_eq!(needs_you(&tail), [UNREAD_NEED], "{tail:?}");
+        assert!(!says_no_needs(&tail), "{tail:?}");
         assert_eq!(defense_line(&tail), Some(defense), "{tail:?}");
     }
     assert!(says_no_needs("Landed.\nNEEDS YOU:\nNothing."));
@@ -482,7 +507,11 @@ fn a_need_is_sanitized_and_cut() {
     assert!(need.chars().count() <= NEED_CHARS, "{need}");
     assert!(need.ends_with('…'), "{need}");
     assert_eq!(
-        needs_you("NEEDS YOU: the\u{7}  release\tcredential  **"),
+        needs_you("NEEDS YOU: the\u{7}  release\u{200B}\tcredential\u{202E}  **"),
+        ["the release credential"]
+    );
+    assert_eq!(
+        needs_you("NEEDS YOU: \u{200B}\nNEEDS YOU: the release credential"),
         ["the release credential"]
     );
 }

@@ -391,7 +391,7 @@ fn install_refuses_the_wrong_os_and_a_box_with_no_machine_identity() {
     let e = r.expect_err("no record");
     assert!(
         e.to_string()
-            .contains("no machine record at ~/.aterm/machine.toml — the lane signs"),
+            .contains("no machine record at ~/.aterm/release-ring/machine.toml — the lane signs"),
         "{e}"
     );
     std::fs::remove_file(&b.fx.ctx.identity.key).expect("rm key");
@@ -399,7 +399,7 @@ fn install_refuses_the_wrong_os_and_a_box_with_no_machine_identity() {
     let e = r.expect_err("no key");
     assert!(
         e.to_string()
-            .contains("no machine key at ~/.aterm/machine.key — the lane signs"),
+            .contains("no machine key at ~/.aterm/release-ring/machine.key — the lane signs"),
         "{e}"
     );
     assert!(e.to_string().contains("--keyless"));

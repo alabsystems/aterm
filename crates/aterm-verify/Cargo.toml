@@ -73,6 +73,17 @@ aterm-toolchain = { workspace = true }
 # (docs/DESIGN-adaptive-build-2026-10-24.md, QUIET-ADMIT). Workspace crate;
 # first-party dependencies only, aterm-toolchain and aterm-sysprobe among them.
 aterm-capacity = { workspace = true }
+# A stage child's clock reads what its process group used (CPU and runnable
+# time, I/O) to leave its waits for a core out of its ceiling, and a demoted
+# child's spawn reads the input clock (HIDIdleTime) to keep utility QoS to a
+# Mac someone is at (docs/DESIGN-adaptive-build-2026-10-24.md, CEILING-WAIT).
+# Workspace crate, already in the graph through aterm-uds and aterm-capacity.
+aterm-sysprobe = { workspace = true }
+# Each stage's memory peak is kept in this user's aterm state directory
+# (`dirs::account_state_dir`), one record every checkout's runs share
+# (docs/DESIGN-adaptive-build-2026-10-24.md, VERIFY-MEM). Workspace crate,
+# already in the graph through aterm-capacity.
+aterm-types = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # The arena lanes' interrupt guard: block SIGINT/SIGTERM/SIGHUP, take them on

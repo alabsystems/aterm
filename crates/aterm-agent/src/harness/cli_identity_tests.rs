@@ -10,6 +10,10 @@ struct TerminalCodex {
     probes: RefCell<Vec<PathBuf>>,
     mutation: Option<(PathBuf, String, bool)>,
     credential_fault: Option<bool>,
+    replacement: Option<String>,
+    driver_reports_identity: bool,
+    program: Option<PathBuf>,
+    sign_in_program: Option<PathBuf>,
 }
 impl TerminalCodex {
     fn new(reported: Option<&'static str>) -> Self {
@@ -19,6 +23,10 @@ impl TerminalCodex {
             probes: RefCell::new(Vec::new()),
             mutation: None,
             credential_fault: None,
+            replacement: None,
+            driver_reports_identity: true,
+            program: None,
+            sign_in_program: None,
         }
     }
 }
@@ -38,6 +46,12 @@ impl AccountsHost for TerminalCodex {
     fn now(&self) -> i64 {
         1_758_412_900
     }
+    fn codex_launch_program(&self) -> Option<PathBuf> {
+        self.program.clone()
+    }
+    fn codex_sign_in_program(&self) -> Option<PathBuf> {
+        self.sign_in_program.clone()
+    }
     fn vendor_login(&self, req: &crate::harness::login_drive::Request<'_>) -> Result<i32, String> {
         assert_eq!(req.cli, Cli::Codex);
         self.homes.borrow_mut().push(req.staging.to_path_buf());
@@ -51,6 +65,9 @@ impl AccountsHost for TerminalCodex {
         assert!(home.join("auth.json").is_file());
         assert_eq!(self.homes.borrow().last().map(PathBuf::as_path), Some(home));
         self.probes.borrow_mut().push(home.to_path_buf());
+        if let Some(replacement) = &self.replacement {
+            std::fs::write(home.join("auth.json"), replacement).unwrap();
+        }
         if let Some((path, text, true)) = &self.mutation {
             std::fs::write(path, text).unwrap();
         }
@@ -68,11 +85,16 @@ impl AccountsHost for TerminalCodex {
         req: &crate::harness::login_drive::Request<'_>,
     ) -> crate::harness::login_drive::Drove {
         self.vendor_login(req).unwrap();
+        if self.driver_reports_identity
+            && let Some(replacement) = &self.replacement
+        {
+            std::fs::write(req.staging.join("auth.json"), replacement).unwrap();
+        }
         crate::harness::login_drive::Drove {
             outcome: crate::harness::login_drive::Outcome::SignedIn {
                 // A missing driver identity makes renewal use the same staging
                 // probe as terminal login, where this fixture injects its fault.
-                email: if self.credential_fault.is_some() {
+                email: if self.credential_fault.is_some() || !self.driver_reports_identity {
                     None
                 } else {
                     self.reported.map(str::to_owned)
@@ -80,6 +102,106 @@ impl AccountsHost for TerminalCodex {
                 page: false,
             },
             host: None,
+        }
+    }
+}
+
+fn publication_credential(kind: i64, variant: u8) -> String {
+    if kind == 0 {
+        return "opaque fixture login".into();
+    }
+    let token = |access: bool| {
+        let wrong_email = (kind == 3 && !access) || (kind == 4 && access);
+        let email = if wrong_email {
+            "different@example.test"
+        } else {
+            "owner@example.test"
+        };
+        let mut claims = aterm_json::json!({"https://api.openai.com/auth": {
+            "chatgpt_user_id": if kind == 5 && access { "other-user" } else { "same-user" }
+        }});
+        if kind != 7 {
+            if variant == 1 {
+                claims.as_object_mut().unwrap().insert(
+                    "https://api.openai.com/profile".into(),
+                    aterm_json::json!({"email":format!("  {}  ", email.to_uppercase())}),
+                );
+            } else {
+                claims
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("email".into(), aterm_json::json!(email));
+            }
+        }
+        crate::harness::codex_app_login::tests::make_jwt(&claims)
+    };
+    aterm_json::json!({"auth_mode":"chatgpt", "owner_note":"retain", "tokens": {
+        "id_token":token(false), "access_token":token(true)
+    }})
+    .to_string()
+}
+
+#[test]
+fn codex_publication_refuses_credential_identity_changed_after_the_report() {
+    for path in ["login", "renew-probe", "renew-status"] {
+        for prior in [false, true] {
+            for kind in [0, 3, 4, 5, 6, 7] {
+                let tmp = tmp_dir("codex-publication-identity");
+                let env = env_at(&tmp);
+                assert_eq!(run_line(
+                    "accounts add account --cli codex --email alias@example.test --identity-email owner@example.test",
+                    &env,
+                ).0, exit(0));
+                if prior {
+                    let good = TerminalCodex::new(Some("owner@example.test"));
+                    assert_eq!(
+                        command("accounts login account --cli codex", &env, &good).0,
+                        exit(0)
+                    );
+                }
+                let store = env.accounts_store_for(Cli::Codex).unwrap();
+                let before = store.load_logins(env.now).unwrap().0;
+                let prior_files = before
+                    .get("account")
+                    .and_then(|binding| binding.dir.as_ref())
+                    .map(|dir| {
+                        ["auth.json", accounts::RENEWAL_CHECKPOINT_FILE].map(|name| {
+                            let path = Path::new(dir).join(name);
+                            let bytes = std::fs::read(&path).unwrap();
+                            (path, bytes)
+                        })
+                    });
+                let mut host = TerminalCodex::new(Some("owner@example.test"));
+                let replacement = publication_credential(kind, 1);
+                host.replacement = Some(replacement.clone());
+                host.driver_reports_identity = path != "renew-probe";
+                let verb = if path == "login" { "login" } else { "renew" };
+                let (code, out, err) =
+                    command(&format!("accounts {verb} account --cli codex"), &env, &host);
+                let refused = matches!(kind, 3..=5);
+                assert_eq!(
+                    code,
+                    exit(u8::from(refused)),
+                    "{path}, prior={prior}, kind={kind}: {out}{err}"
+                );
+                if refused {
+                    assert_eq!(store.load_logins(env.now).unwrap().0, before);
+                }
+                if let Some(files) = prior_files {
+                    for (path, bytes) in files {
+                        assert_eq!(std::fs::read(path).unwrap(), bytes);
+                    }
+                }
+                let staging = host.homes.borrow()[0].clone();
+                assert_eq!(
+                    std::fs::read_to_string(staging.join("auth.json")).unwrap(),
+                    replacement
+                );
+                assert_eq!(
+                    staging.join(accounts::RENEWAL_CHECKPOINT_FILE).exists(),
+                    !refused
+                );
+            }
         }
     }
 }
@@ -154,6 +276,123 @@ fn codex_login_alias_is_separate_from_reported_identity_and_round_trips() {
         legacy.identity_proof_for(bound.row("account").unwrap()),
         None
     );
+}
+
+/// WHILE THIS MACHINE'S CODEX KEEPS NO ROW'S LOGIN ITS OWN, NO POOL SIGN-IN MOVES THE ROW ON
+/// ITS OWN LOGIN: `accounts login` and `accounts renew` of `main` (the row with no `dir`) run
+/// nothing and leave it unbound, naming Codex's own sign-in in the default home, since a staged
+/// login of its own is one that build never runs. CONTROL: on a codex-alab that keeps
+/// `CODEX_AUTH_PATH`'s login, the same sign-in binds `main` to its staged login.
+#[test]
+fn no_pool_sign_in_moves_the_default_row_off_a_codex_that_ignores_codex_auth_path() {
+    let tmp = tmp_dir("codex-default-row-staging");
+    let env = env_at(&tmp);
+    std::fs::write(
+        tmp.path().join("accounts-codex.toml"),
+        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\nemail = \"owner@example.test\"\n",
+    )
+    .unwrap();
+    let old = crate::harness::codex_alab::lay_package(&tmp.path().join("store/old"), false);
+    let new = crate::harness::codex_alab::lay_package(&tmp.path().join("store/new"), true);
+    let store = env.accounts_store_for(Cli::Codex).unwrap();
+    let bound_dir = || {
+        store
+            .load_logins(1_758_412_900)
+            .unwrap()
+            .0
+            .get("main")
+            .and_then(|binding| binding.dir.clone())
+    };
+    for verb in ["login", "renew"] {
+        let host = TerminalCodex {
+            program: Some(old.clone()),
+            ..TerminalCodex::new(Some("owner@example.test"))
+        };
+        let (code, out, err) = command(&format!("accounts {verb} main --cli codex"), &env, &host);
+        assert_eq!(code, exit(1), "{verb}: {out}{err}");
+        assert!(
+            err.contains("a sign-in here would bind `main` to a login of its own")
+                && err.contains("`aterm ai login codex`")
+                && err.contains("nothing was run"),
+            "{verb}: {err}"
+        );
+        assert!(host.homes.borrow().is_empty(), "{verb}: no sign-in ran");
+        assert_eq!(
+            bound_dir(),
+            None,
+            "{verb}: `main` stays on the default login"
+        );
+    }
+    let host = TerminalCodex {
+        program: Some(new),
+        ..TerminalCodex::new(Some("owner@example.test"))
+    };
+    let (code, out, err) = command("accounts login main --cli codex", &env, &host);
+    assert_eq!(code, exit(0), "CONTROL: {out}{err}");
+    assert_eq!(host.homes.borrow().len(), 1);
+    assert_eq!(
+        bound_dir().map(PathBuf::from),
+        host.homes.borrow().first().cloned(),
+        "CONTROL: bound to its staged login"
+    );
+}
+
+/// A SIGN-IN'S BY-HAND LINE IS JUDGED BY THE CODEX A SIGN-IN RUNS, ITS WORKER CLAUSE BY THE ONE A
+/// LAUNCH RUNS: `accounts login` of a row of its own signs in on each pair of programs, and the
+/// words are compared with those on a codex-alab that keeps `CODEX_AUTH_PATH`'s login for both
+/// (`new`, the control). Where the launch runs the bare word `codex` (no atpkg twin) but a
+/// sign-in runs `new` (as `~/.local/bin/codex`), the by-hand line is the control's, unconditioned,
+/// and only the worker clause differs; where a sign-in runs a codex-alab from before it (`old`),
+/// the by-hand line differs and the worker clause is the control's.
+#[test]
+fn a_codex_sign_ins_by_hand_line_is_judged_by_the_program_a_sign_in_runs() {
+    fn new(root: &Path) -> PathBuf {
+        crate::harness::codex_alab::lay_package(&root.join("store/new"), true)
+    }
+    fn old(root: &Path) -> PathBuf {
+        crate::harness::codex_alab::lay_package(&root.join("store/old"), false)
+    }
+    fn bare(_: &Path) -> PathBuf {
+        PathBuf::from("codex")
+    }
+    // The `renewed` line and the by-hand line of one sign-in, its folder written `<root>`.
+    let signed_in = |launch: fn(&Path) -> PathBuf, sign_in: fn(&Path) -> PathBuf| {
+        let tmp = tmp_dir("codex-by-hand");
+        let env = env_at(&tmp);
+        let (code, _, err) = run_line(
+            "accounts add account --cli codex --email owner@example.test",
+            &env,
+        );
+        assert_eq!(code, exit(0), "{err}");
+        let host = TerminalCodex {
+            program: Some(launch(tmp.path())),
+            sign_in_program: Some(sign_in(tmp.path())),
+            ..TerminalCodex::new(Some("owner@example.test"))
+        };
+        let (code, out, err) = command("accounts login account --cli codex", &env, &host);
+        assert_eq!(code, exit(0), "{out}{err}");
+        let out = out.replace(&tmp.path().display().to_string(), "<root>");
+        let line = |pick: &dyn Fn(&str) -> bool| {
+            out.lines()
+                .find(|l| pick(l))
+                .unwrap_or_else(|| panic!("{out}"))
+                .to_owned()
+        };
+        (
+            line(&|l| l.starts_with("account: renewed")),
+            line(&|l| l.contains("CODEX_AUTH_PATH=")),
+        )
+    };
+    let control = signed_in(new, new);
+    let (renewed, by_hand) = signed_in(bare, new);
+    assert_eq!(by_hand, control.1, "the by-hand start works as it is");
+    assert_ne!(renewed, control.0, "no worker is started on it");
+    let (renewed, by_hand) = signed_in(new, old);
+    assert_ne!(
+        by_hand, control.1,
+        "the by-hand start waits for atpkg's codex-alab"
+    );
+    assert_eq!(renewed, control.0, "a worker takes it");
 }
 
 #[test]
@@ -644,6 +883,7 @@ struct PublicationHost {
     credential: PathBuf,
     retained: PathBuf,
     fault: i64,
+    replacement: String,
     clocks: std::cell::Cell<usize>,
 }
 
@@ -662,25 +902,41 @@ impl AccountsHost for PublicationHost {
     }
     fn now(&self) -> i64 {
         assert_eq!(self.clocks.replace(self.clocks.get() + 1), 0);
-        if self.fault > 0 {
+        if matches!(self.fault, 1 | 2) {
             std::fs::rename(&self.credential, &self.retained).unwrap();
             if self.fault == 2 {
                 std::fs::create_dir(&self.credential).unwrap();
             }
+        } else {
+            std::fs::write(&self.credential, &self.replacement).unwrap();
         }
         1_758_412_900
     }
 }
 
-fn publication_case(provider: i64, prior: bool, fault: i64) -> [(&'static str, i64); 5] {
+fn publication_case(
+    provider: i64,
+    prior: bool,
+    fault: i64,
+    variant: u8,
+) -> [(&'static str, i64); 5] {
     let cli = [Cli::Codex, Cli::Grok, Cli::Kimi][provider as usize];
+    let aliased = variant == 1 && cli == Cli::Codex;
     let tmp = tmp_dir("signin-publication-presence");
     let env = env_at(&tmp);
     let store = env.accounts_store_for(cli).unwrap();
     let path = env.accounts_roster_for(cli).unwrap();
     let row = accounts::Row {
         label: "account".into(),
-        email: Some("owner@example.test".into()),
+        email: Some(
+            if aliased {
+                "alias@example.test"
+            } else {
+                "owner@example.test"
+            }
+            .into(),
+        ),
+        identity_email: aliased.then(|| "owner@example.test".into()),
         vendor: accounts::Vendor {
             region: (cli == Cli::Kimi).then_some(crate::ai::connector::Region::Global),
             ..Default::default()
@@ -695,6 +951,18 @@ fn publication_case(provider: i64, prior: bool, fault: i64) -> [(&'static str, i
         std::fs::write(credential, "prior login").unwrap();
         store
             .transact_logins(env.now, &mut None, |state, logins| {
+                accounts::write_renewal_checkpoint_for(
+                    cli,
+                    (cli == Cli::Kimi).then_some(crate::ai::connector::Region::Global),
+                    "account",
+                    "owner@example.test",
+                    old.to_str().unwrap(),
+                    None,
+                    Some(accounts::Proof::Status),
+                    env.now,
+                    logins,
+                )
+                .unwrap();
                 Ok(accounts::note_renewed(
                     state,
                     logins,
@@ -708,6 +976,17 @@ fn publication_case(provider: i64, prior: bool, fault: i64) -> [(&'static str, i
             .unwrap();
     }
     let records = store.read_account_records(Some(&path), env.now).unwrap();
+    let prior_files = records
+        .logins
+        .get("account")
+        .and_then(|binding| binding.dir.as_ref())
+        .map(|dir| {
+            [cli.connector().stores[0], accounts::RENEWAL_CHECKPOINT_FILE].map(|name| {
+                let path = Path::new(dir).join(name);
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
+        });
     let row = records.roster.row("account").unwrap();
     let plan = sign_in_plan(
         cli,
@@ -717,6 +996,7 @@ fn publication_case(provider: i64, prior: bool, fault: i64) -> [(&'static str, i
             logins: &records.logins,
             roster_path: &path,
             own_dir: None,
+            codex_program: None,
         },
         env.now,
         "login",
@@ -727,10 +1007,13 @@ fn publication_case(provider: i64, prior: bool, fault: i64) -> [(&'static str, i
     let credential = plan.staging.join(cli.connector().stores[0]);
     std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
     std::fs::write(&credential, "prepared login").unwrap();
+    let replacement =
+        publication_credential(if matches!(fault, 1 | 2) { 0 } else { fault }, variant);
     let host = PublicationHost {
         retained: credential.with_extension("retained"),
         credential,
         fault,
+        replacement: replacement.clone(),
         clocks: std::cell::Cell::new(0),
     };
     let snapshot = || {
@@ -761,22 +1044,48 @@ fn publication_case(provider: i64, prior: bool, fault: i64) -> [(&'static str, i
         &mut err,
     );
     assert_eq!(host.clocks.get(), 1);
-    if fault > 0 {
+    let err = String::from_utf8(err).unwrap();
+    if matches!(fault, 1 | 2) {
         assert!(
-            String::from_utf8(err)
-                .unwrap()
-                .contains("the staging login disappeared before publication"),
+            err.contains("the staging login disappeared before publication"),
             "the refusal must be from the publication check"
         );
     }
-    let evidence = if fault == 0 {
-        &host.credential
-    } else {
+    let refused = matches!(fault, 1 | 2) || (cli == Cli::Codex && matches!(fault, 3..=5));
+    if cli == Cli::Codex && matches!(fault, 3..=5) {
+        assert!(
+            err.contains(if fault == 5 {
+                "tokens name different users"
+            } else {
+                "does not match the expected account"
+            }),
+            "{err}"
+        );
+        assert!(!err.contains("different@example.test"));
+    }
+    let evidence = if matches!(fault, 1 | 2) {
         &host.retained
+    } else {
+        &host.credential
     };
-    let retained = std::fs::read(evidence).unwrap() == b"prepared login";
-    if fault > 0 {
+    let expected = if matches!(fault, 1 | 2) {
+        "prepared login"
+    } else {
+        &replacement
+    };
+    let mut retained = std::fs::read(evidence).unwrap() == expected.as_bytes();
+    if let Some(files) = prior_files {
+        for (path, bytes) in files {
+            retained &= std::fs::read(path).unwrap() == bytes;
+        }
+    }
+    if refused {
         assert_eq!(store.load_logins(env.now).unwrap().0, records.logins);
+    } else {
+        let logins = store.load_logins(env.now).unwrap().0;
+        let binding = logins.get("account").unwrap();
+        assert_eq!(binding.proved_by, Some(accounts::Proof::Status));
+        assert_eq!(binding.proved_email.as_deref(), Some("owner@example.test"));
     }
     [
         ("phase", 1),
@@ -810,9 +1119,13 @@ pub(crate) fn publication_transition(
             next.insert("fault", state["fault"] + 1);
         }
         "Publish" => {
-            for (key, value) in
-                publication_case(state["provider"], state["prior"] == 1, state["fault"])
-            {
+            let observed =
+                publication_case(state["provider"], state["prior"] == 1, state["fault"], 0);
+            assert_eq!(
+                observed,
+                publication_case(state["provider"], state["prior"] == 1, state["fault"], 1)
+            );
+            for (key, value) in observed {
                 next.insert(key, value);
             }
         }
@@ -824,8 +1137,8 @@ pub(crate) fn publication_transition(
 #[test]
 fn signin_publication_conforms_and_missing_credentials_cannot_bind() {
     let model = aterm_models_harness::signin_publication_model();
-    assert_eq!(model.mutant_dials(), (1..=8).collect::<Vec<_>>());
-    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 36);
+    assert_eq!(model.mutant_dials(), (1..=11).collect::<Vec<_>>());
+    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 96);
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
@@ -838,11 +1151,11 @@ fn signin_publication_conforms_and_missing_credentials_cannot_bind() {
             }
         }
     }
-    for fault in [0, 1, 2] {
+    for fault in 0..=7 {
         let mut state = model.init_state();
         state.insert("fault", fault);
         let after = publication_transition(&state, "Publish");
-        let faults = if fault == 0 {
+        let faults = if !matches!(fault, 1..=5) {
             [
                 ("published", 0, "ResultPolicy"),
                 ("changed", 0, "CompleteRecord"),

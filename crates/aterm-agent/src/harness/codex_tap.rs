@@ -2,22 +2,28 @@
 // Copyright 2026 Andrew Yates
 
 //! Codex rollout tap feeding [`super::codex_steps`] ([`RolloutTap::arm`], [`RolloutTap::read`],
-//! [`CODEX_MEASURED_BUILDS`], [`gate`], [`Refusal`], [`CodexStepFold::stop`]).
+//! [`RolloutTap::reads_at`], [`super::codex_steps::CODEX_MEASURED_BUILDS`], [`gate`], [`Refusal`]).
 
 use std::path::{Path, PathBuf};
 
 use aterm_json::Value;
 
 use super::codex_rollout::{
-    RolloutRead, Streamed, first_line_of, is_rollout_of, is_thread_id, rollouts_by_write,
-    stream_open_ends, thread_created_ms,
+    PAGINATED, RolloutRead, Streamed, first_line_of, is_rollout_of, is_thread_id,
+    rollouts_by_write, stream_open_ends, thread_created_ms,
 };
-use super::codex_steps::{CODEX_MEASURED_BUILDS, CodexStepFold};
-use super::steps::{StepBatch, StepMark};
+use super::codex_steps::{CodexStepFold, log_build};
+use super::steps::{StepBatch, StepMark, StepState};
 
 const SESSION_META: &str = aterm_phase::anchor!("rollout.session_meta");
 const KEY_ID: &str = aterm_phase::anchor!("rollout.id");
 const KEY_CLI_VERSION: &str = aterm_phase::anchor!("rollout.cli_version");
+const KEY_HISTORY_MODE: &str = "history_mode";
+
+/// The `history_mode` words of a `session_meta` the fold knows (codex's `ThreadHistoryMode`;
+/// none written is `legacy`, its default): a mode it does not know may lay a fork's copy out in
+/// rows the fold would read as the thread's own.
+const HISTORY_MODES: [&str; 2] = ["legacy", PAGINATED];
 
 /// Declares [`Refusal`], its word table and [`Refusal::ALL`] from one variant list, so a
 /// refusal the tap can produce is always among those a reader of the words enumerates.
@@ -52,34 +58,43 @@ refusals! {
     NoMeta => "no-meta",
     /// The rollout's first row is no `session_meta` of the thread (final).
     OtherThread => "other-thread",
-    /// The build its `session_meta` names is not one [`CODEX_MEASURED_BUILDS`] holds (final).
-    Unmeasured => "unmeasured",
+    /// Its `session_meta` is of a shape the fold does not know: it names no build the log can
+    /// say, or a `history_mode` outside [`HISTORY_MODES`] (final).
+    UnknownMeta => "unknown-meta",
 }
 
 impl Refusal {
     /// Whether the refusal stands for the tap's life.
     #[must_use]
     pub const fn is_final(self) -> bool {
-        matches!(self, Refusal::OtherThread | Refusal::Unmeasured)
+        match self {
+            Refusal::OtherThread | Refusal::UnknownMeta => true,
+            Refusal::NoRollout | Refusal::NoMeta => false,
+        }
     }
 }
 
-/// Validate that the first row is `thread`'s `session_meta` on a `measured` build.
+/// THE GATE: the first row is `thread`'s own `session_meta`, of a shape the fold knows; the
+/// build it names, whatever build that is: one [`super::codex_steps::CODEX_MEASURED_BUILDS`]
+/// does not name is read [`StepState::Partial`], as Claude Code's unmeasured builds are.
 ///
 /// # Errors
-/// [`Refusal::OtherThread`] for a first row that is no `session_meta` of
-/// `thread`, [`Refusal::Unmeasured`] for a build `measured` does not hold
-/// (or none named).
-pub fn gate(first_row: &str, thread: &str, measured: &[&str]) -> Result<String, Refusal> {
+/// [`Refusal::OtherThread`] for a first row that is no `session_meta` of `thread`,
+/// [`Refusal::UnknownMeta`] for one that names no build [`log_build`] can say, or a
+/// `history_mode` outside [`HISTORY_MODES`].
+pub fn gate(first_row: &str, thread: &str) -> Result<String, Refusal> {
     let v = super::transcript::codex_steps(first_row.trim()).map_err(|_| Refusal::OtherThread)?;
     let payload = v.get("payload");
     let word = |key: &str| payload.and_then(|p| p.get(key)).and_then(Value::as_str);
     if v.get("type").and_then(Value::as_str) != Some(SESSION_META) || word(KEY_ID) != Some(thread) {
         return Err(Refusal::OtherThread);
     }
+    let mode_known = payload
+        .and_then(|p| p.get(KEY_HISTORY_MODE))
+        .is_none_or(|m| m.as_str().is_some_and(|m| HISTORY_MODES.contains(&m)));
     match word(KEY_CLI_VERSION) {
-        Some(build) if measured.contains(&build) => Ok(build.to_string()),
-        _ => Err(Refusal::Unmeasured),
+        Some(build) if mode_known && log_build(build).is_some() => Ok(build.to_string()),
+        _ => Err(Refusal::UnknownMeta),
     }
 }
 
@@ -181,28 +196,30 @@ impl RolloutTap {
         self.refused
     }
 
+    /// The state the bound rollout's rows are read at ([`CodexStepFold::reads_at`]: `Partial`
+    /// unless its build and its writer's are both measured), while it binds one.
+    #[must_use]
+    pub const fn reads_at(&self) -> Option<StepState> {
+        if self.bound.is_some() {
+            Some(self.fold.reads_at())
+        } else {
+            None
+        }
+    }
+
     /// Everything the fold queued since the last take.
     pub fn take(&mut self) -> StepBatch {
         self.fold.take()
     }
 
-    /// Bind the rollout if needed and fold up to `cap` new bytes ([`Self::refused`]).
+    /// Bind the rollout if needed and fold up to `cap` new bytes ([`Self::refused`]): read on
+    /// whatever build its writer runs, at the state that build and the rollout's own hold the
+    /// rows to ([`Self::reads_at`]).
     pub fn read(&mut self, cap: u64) -> Option<RolloutRead> {
         if self.refused.is_some_and(Refusal::is_final) {
             return None;
         }
-        let Some(running) = self
-            .running
-            .as_deref()
-            .filter(|b| CODEX_MEASURED_BUILDS.contains(b))
-        else {
-            if let Some(b) = self.bound.take() {
-                self.fold.stop(b.pos);
-            }
-            self.refused = Some(Refusal::Unmeasured);
-            return None;
-        };
-        self.fold.set_writer(running);
+        self.fold.set_writer(self.running.as_deref());
         let held = self.bound.as_ref().and_then(|b| {
             let file = super::footer::open_regular(&b.path)?;
             let meta = file.metadata().ok()?;
@@ -258,7 +275,7 @@ impl RolloutTap {
         let meta = file.metadata().map_err(|_| Refusal::NoRollout)?;
         let id = super::session_usage::open_identity(&file, &meta);
         let first = first_line_of(&file).ok_or(Refusal::NoMeta)?;
-        let build = gate(&first, &self.thread, CODEX_MEASURED_BUILDS)?;
+        let build = gate(&first, &self.thread)?;
         let fp = super::session_usage::path_fp(&path);
         let seed = match self.given.filter(|m| m.fp == fp) {
             Some(m) if m.id == id => m.off,

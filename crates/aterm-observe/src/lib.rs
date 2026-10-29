@@ -30,7 +30,6 @@ impl RowMatch for RegexRowMatch {
 
 const MAX_REGEX_PATTERN_LEN: usize = 1024;
 const REGEX_SIZE_LIMIT: usize = 128 * 1024;
-const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20;
 const REGEX_STEP_LIMIT: u64 = 1 << 22;
 
 /// Compiles a bounded regex row matcher for `watch_rows` and `watch_rows_gone`.
@@ -50,7 +49,6 @@ fn bounded_regex(pattern: &str) -> Result<aterm_regex::Regex, aterm_regex::Error
     }
     aterm_regex::RegexBuilder::new(pattern)
         .size_limit(REGEX_SIZE_LIMIT)
-        .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
         .step_limit(REGEX_STEP_LIMIT)
         .build()
 }
@@ -343,32 +341,34 @@ mod tests {
             "under the length gate"
         );
         assert!(
-            aterm_regex::RegexBuilder::new(amplifier)
-                .size_limit(10 << 20)
-                .build()
-                .is_ok(),
-            "sanity: a 10 MiB limit accepts this pattern",
-        );
-        assert!(
-            row_matcher(amplifier).is_err(),
+            matches!(
+                row_matcher(amplifier),
+                Err(aterm_regex::Error::CompiledTooBig(REGEX_SIZE_LIMIT))
+            ),
             "the bounded builder must reject a pattern that exceeds 128 KiB compiled",
         );
     }
 
     #[test]
     fn ordinary_patterns_never_reach_the_scan_budget() {
-        let row = "PROMPT-READY 66390b5c8f user@example.com 192.168.0.1 ERROR ".repeat(70);
+        let matching = "PROMPT-READY 66390b5c8f user@example.com 192.168.0.1 ERROR ".repeat(70);
+        let clear = ".".repeat(4096);
         for pattern in [
             r"PROMPT-READY",
             r"\b[0-9a-f]{7,40}\b",
             r"\S+@\S+",
             r"(?i)error|warn",
         ] {
-            let m = row_matcher(pattern).expect("compiles");
+            let re = bounded_regex(pattern).expect("compiles");
+            assert_eq!(re.try_is_match(&matching), Ok(true), "{pattern:?}");
+            assert_eq!(re.try_is_match(&clear), Ok(false), "{pattern:?}");
             assert!(
-                m.matches(&row),
-                "{pattern:?} must match a full-width row of its own content"
+                !re.step_limit_exceeded(),
+                "{pattern:?} exceeded the scan budget"
             );
+            let m = row_matcher(pattern).expect("compiles");
+            assert!(m.matches(&matching), "{pattern:?}");
+            assert!(m.clears(&clear), "{pattern:?}");
         }
     }
 

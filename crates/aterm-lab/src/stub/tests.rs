@@ -9,6 +9,63 @@ fn body(v: &str) -> Vec<u8> {
 }
 
 #[test]
+fn a_scripted_call_is_read_against_the_tools_its_request_declares() {
+    let call = |v: &str| J::parse(v).unwrap();
+    // agy 1.4.10's shell tool: closed, with arguments it requires.
+    let gemini = body(
+        r#"{"contents":[],"tools":[{"functionDeclarations":[{"name":"run_command","parametersJsonSchema":{"type":"object","properties":{"CommandLine":{"type":"string"},"toolSummary":{"type":"string"},"WaitMsBeforeAsync":{"type":"integer"}},"required":["CommandLine","toolSummary","WaitMsBeforeAsync"],"additionalProperties":false}}]}]}"#,
+    );
+    let fits = call(r#"{"CommandLine":"ls","toolSummary":"list","WaitMsBeforeAsync":500}"#);
+    assert_eq!(misfit_note(&gemini, &[("run_command", &fits)]), "");
+    let old =
+        call(r#"{"CommandLine":"ls","Cwd":"/tmp","toolAction":"list","WaitMsBeforeAsync":500}"#);
+    assert_eq!(
+        misfit_note(&gemini, &[("run_command", &old)]),
+        " misfit='run_command: lacks toolSummary, undeclared Cwd, undeclared toolAction'"
+    );
+    assert_eq!(
+        misfit_note(&gemini, &[("view_file", &fits)]),
+        " misfit='view_file: no such tool declared'"
+    );
+
+    // An open schema takes arguments it does not name; one a Messages API tool requires is still
+    // missed, and a tool with no schema (a server tool) takes any.
+    let messages = body(
+        r#"{"messages":[],"tools":[{"name":"Bash","input_schema":{"type":"object","properties":{"command":{}},"required":["command"]}},{"type":"web_search_20250305","name":"web_search"}]}"#,
+    );
+    let extra = call(r#"{"command":"ls","timeout":5}"#);
+    let none = call("{}");
+    assert_eq!(misfit_note(&messages, &[("Bash", &extra)]), "");
+    assert_eq!(misfit_note(&messages, &[("web_search", &extra)]), "");
+    assert_eq!(
+        misfit_note(
+            &messages,
+            &[("Bash", &extra), ("Bash", &none), ("Read", &none)]
+        ),
+        " misfit='Bash: lacks command; Read: no such tool declared'"
+    );
+
+    // Muse Code's tools sit in a namespace.
+    let muse = body(
+        r#"{"input":[],"tools":[{"type":"namespace","name":"muse","tools":[{"type":"function","name":"bash","parameters":{"type":"object","properties":{"command":{}},"required":["command"],"additionalProperties":false}}]}]}"#,
+    );
+    assert_eq!(
+        misfit_note(&muse, &[("bash", &call(r#"{"command":"ls"}"#))]),
+        ""
+    );
+    assert_eq!(
+        misfit_note(&muse, &[("bash", &call(r#"{"cmd":"ls"}"#))]),
+        " misfit='bash: lacks command, undeclared cmd'"
+    );
+
+    // A request that declares no named tool has nothing to read a call against.
+    for empty in [r#"{"tools":[{}]}"#, r#"{"messages":[]}"#, "not json"] {
+        assert_eq!(declared_tools(&body(empty)), None, "{empty}");
+        assert_eq!(misfit_note(&body(empty), &[("Bash", &none)]), "", "{empty}");
+    }
+}
+
+#[test]
 fn a_request_is_classed_by_what_it_asks() {
     let main = body(
         r#"{"model":"m","stream":true,"max_tokens":32000,"tools":[{}],"messages":[{"role":"user","content":"hi"}]}"#,
@@ -657,7 +714,7 @@ fn served_on_loopback_it_answers_as_the_modes_say_and_logs_each_request() {
         "stub listening on 127.0.0.1:",
         "MODE -> ok (from file)",
         "POST /v1/messages -> 200 body=",
-        " kind=main model=claude-x stream=true max_tokens=32000 msgs=1 tools=1 sys=0c last_user=\"hi\" sse=",
+        " kind=main model=claude-x stream=true max_tokens=32000 msgs=1 tools=1 sys=0c last_user=\"hi\" auth=none sse=",
         "POST /v1/messages -> 529",
         " RL200[5h-utilization=0.4000]",
         " RL200[5h-utilization=0.4200]",
@@ -827,6 +884,18 @@ fn a_codex_request_is_read_for_its_items_and_its_structured_side_requests() {
         vec![
             ("x-codex-primary-reset-at".to_string(), "160".to_string()),
             ("n".to_string(), "1.5".to_string())
+        ]
+    );
+    let saturated = flat_headers(
+        &J::parse(r#"{"X-Reset":"@NOW+100@","X-Huge":"@NOW+99999999999999999999999999@"}"#)
+            .unwrap(),
+        i64::MAX - 10,
+    );
+    assert_eq!(
+        saturated,
+        vec![
+            ("x-huge".to_string(), i64::MAX.to_string()),
+            ("x-reset".to_string(), i64::MAX.to_string()),
         ]
     );
 }
@@ -1334,7 +1403,7 @@ fn a_gemini_request_is_classed_and_its_tool_script_stepped() {
         None
     );
     let held = J::parse(
-        r#"[{"name":"invoke_subagent","input":{"Subagents":"[{\"Prompt\":\"LABSUB-HOLD reply DONE\"}]"}},{"when":"LABSUB-HOLD","text":"DONE","delay_ms":150000}]"#,
+        r#"[{"name":"invoke_subagent","input":{"Prompt":"LABSUB-HOLD reply DONE","Role":"Lab Waiter","TypeName":"research"}},{"when":"LABSUB-HOLD","text":"DONE","delay_ms":150000}]"#,
     )
     .unwrap();
     let sub = body(
@@ -1345,7 +1414,7 @@ fn a_gemini_request_is_classed_and_its_tool_script_stepped() {
         Some(("DONE".to_string(), 150_000.0))
     );
     let main = body(
-        r#"{"contents":[{"role":"user","parts":[{"text":"toolstart"}]},{"role":"model","parts":[{"functionCall":{"name":"invoke_subagent","args":{"Subagents":"LABSUB-HOLD"}}}]}]}"#,
+        r#"{"contents":[{"role":"user","parts":[{"text":"toolstart"}]},{"role":"model","parts":[{"functionCall":{"name":"invoke_subagent","args":{"Prompt":"LABSUB-HOLD reply DONE"}}}]}]}"#,
     );
     assert_eq!(gemini::held_reply(&main, &held), None);
     assert_eq!(
@@ -1643,7 +1712,7 @@ fn served_on_loopback_it_answers_gemini_as_the_modes_say() {
         " kind=gemini auth=gemini-key model=gemini-3.5-flash stream=true contents=1 tools=1 sys=0c results=0 last_user=\"hi\" sse=",
         "kind=gemini-json auth=gemini-key",
         ":streamGenerateContent -> 429 ",
-        "tool:run_shell_command step 0",
+        "tool:run_shell_command step 0 misfit='run_shell_command: no such tool declared'",
         "tool:done",
     ];
     let logged = logged_with(&log, &want, Duration::from_secs(60));
@@ -1737,4 +1806,249 @@ fn requests_in_flight_together_are_each_dumped() {
     assert_eq!(bodies, want);
     assert_eq!(stub.st().n_requests, 0, "the control");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_labelled_claude_token_reads_as_its_label_and_any_other_as_before() {
+    let a = labelled_oauth_token("lab-a");
+    assert!(
+        a.starts_with(concat!("sk-ant-oat01-LABLABLAB", "-lab-a-LAB")),
+        "{a}"
+    );
+    assert_eq!(auth_label(Some(&format!("Bearer {a}"))), "oat:lab-a");
+    assert_eq!(auth_label(Some(&a)), "oat:lab-a", "no bearer word");
+    assert_eq!(
+        auth_label(Some(&format!("Bearer {}", labelled_oauth_token("b_2")))),
+        "oat:b_2"
+    );
+    assert_eq!(
+        auth_label(Some(&format!("Bearer {}", crate::lab::oauth_token()))),
+        "oat",
+        "the unlabelled lab token"
+    );
+    for bad in ["", "Lab-A", "a.b", &"x".repeat(25)] {
+        assert_eq!(
+            auth_label(Some(&format!("Bearer {}", labelled_oauth_token(bad)))),
+            "oat",
+            "{bad:?}: no label it could carry"
+        );
+    }
+    assert_eq!(
+        auth_label(Some("Bearer sk-ant-oat01-LABLABLAB-lab-a")),
+        "oat",
+        "no end mark"
+    );
+    for label in ["lab-a", "b_2"] {
+        let label_of = auth_label(Some(&labelled_oauth_token(label)));
+        assert!(!label_of.contains("AAAA"), "no token is echoed: {label_of}");
+    }
+    assert_eq!(auth_label(None), "none");
+    assert_eq!(auth_label(Some(LAB_CODEX_KEY)), "key");
+}
+
+#[test]
+fn each_credential_reads_its_own_mode_and_its_own_headers_over_the_shared_ones() {
+    let modes =
+        J::parse(r#"{"oat:lab-a":"limit:five_hour:1800000000","oat:lab-b":"off","key":" ","x":7}"#)
+            .unwrap();
+    assert_eq!(
+        auth_mode(&modes, "oat:lab-a").as_deref(),
+        Some("limit:five_hour:1800000000")
+    );
+    for label in ["oat:lab-b", "key", "x", "oat:lab-c"] {
+        assert_eq!(auth_mode(&modes, label), None, "{label}");
+    }
+    assert_eq!(auth_mode(&J::parse("[1]").unwrap(), "oat:lab-a"), None);
+    assert_eq!(
+        auth_mode(&J::parse(r#"{"k":"ok; rm"}"#).unwrap(), "k").as_deref(),
+        Some("okrm"),
+        "cleaned as /__mode cleans one"
+    );
+
+    let spec = J::parse(
+        r#"{"on200":{"anthropic-ratelimit-unified-5h-utilization":"0.10","anthropic-ratelimit-unified-7d-utilization":"0.20"},
+            "by_auth":{"oat:lab-a":{"on200":{"anthropic-ratelimit-unified-5h-utilization":"0.95"},"on429":{"x-a":"1"}}}}"#,
+    )
+    .unwrap();
+    let a = rate_headers_for(&spec, "oat:lab-a", 0);
+    let b = rate_headers_for(&spec, "oat:lab-b", 0);
+    let five = |r: &RateHeaders| {
+        r.on200
+            .iter()
+            .find(|(k, _)| k == "anthropic-ratelimit-unified-5h-utilization")
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(five(&a).as_deref(), Some("0.95"));
+    assert_eq!(five(&b).as_deref(), Some("0.10"));
+    assert_eq!(a.on200.len(), 2, "the shared 7d figure kept: {a:?}");
+    assert_eq!(a.on429, vec![("x-a".to_string(), "1".to_string())]);
+    assert_eq!(
+        b,
+        rate_headers(&spec, 0),
+        "a credential with no blocks reads the shared ones"
+    );
+
+    let file = headers_file_for(
+        &spec.py(),
+        "oat:lab-b",
+        J::parse(r#"{"on200":{"y":"2"}}"#).unwrap(),
+    );
+    assert!(
+        file.get(BY_AUTH)
+            .and_then(|by| by.get("oat:lab-a"))
+            .is_some()
+    );
+    assert_eq!(
+        rate_headers_for(&file, "oat:lab-b", 0).on200.last(),
+        Some(&("y".to_string(), "2".to_string()))
+    );
+    let headers = headers_file_with(
+        &file.py(),
+        J::parse(r#"{"on200":{"z":"3"}}"#).unwrap(),
+        true,
+    );
+    let flat = headers_file_with(&headers.py(), J::parse(r#"{"x-f":"4"}"#).unwrap(), false);
+    assert_eq!(
+        flat.get(BY_AUTH),
+        file.get(BY_AUTH),
+        "neither headers verb touches a credential's own blocks"
+    );
+    assert_eq!(
+        headers_file_with("{}", J::parse(r#"{"by_auth":{"k":{}}}"#).unwrap(), true).get(BY_AUTH),
+        None,
+        "nor writes them"
+    );
+    let cleared = headers_file_for(&file.py(), "oat:lab-a", J::parse("{}").unwrap());
+    let cleared = headers_file_for(&cleared.py(), "oat:lab-b", J::parse("{}").unwrap());
+    assert_eq!(
+        cleared.get(BY_AUTH),
+        None,
+        "the last credential's blocks gone"
+    );
+    assert!(cleared.get("on200").is_some());
+}
+
+/// One raw POST of `body` to `path` carrying `auth`: its status, its header lines and its body.
+fn post_as(port: &str, path: &str, auth: Option<&str>, body: &str) -> (u16, String, String) {
+    let mut s = TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap())).unwrap();
+    let auth = auth
+        .map(|a| format!("Authorization: {a}\r\n"))
+        .unwrap_or_default();
+    s.write_all(
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let mut answer = String::new();
+    s.read_to_string(&mut answer).unwrap();
+    let status = answer
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let (head, body) = answer.split_once("\r\n\r\n").unwrap_or((&answer, ""));
+    (status, head.to_lowercase(), body.to_string())
+}
+
+#[test]
+fn served_on_loopback_each_credential_meets_its_own_mode_and_its_own_headers() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    let log = dir.join("stub.log");
+    let auth_modes = dir.join("auth-modes.json");
+    let headers = dir.join("headers.json");
+    let args = Args {
+        log: Some(log.clone()),
+        auth_modes_file: Some(auth_modes.clone()),
+        headers_file: Some(headers.clone()),
+        modes_dir: Some(dir.join("modes")),
+        ..Args::default()
+    };
+    let (port, _) = start(args).unwrap();
+    let port = port.to_string();
+    let (a, b) = (labelled_oauth_token("lab-a"), labelled_oauth_token("lab-b"));
+    let (bearer_a, bearer_b) = (format!("Bearer {a}"), format!("Bearer {b}"));
+    let turn = r#"{"model":"claude-x","stream":true,"max_tokens":32000,"tools":[{}],"messages":[{"role":"user","content":"hi"}]}"#;
+
+    let reset = crate::util::now_secs() + 600;
+    std::fs::write(
+        &auth_modes,
+        format!(r#"{{"oat:lab-a":"limit:five_hour:{reset}"}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        &headers,
+        r#"{"on200":{"anthropic-ratelimit-unified-5h-utilization":"0.10"},"by_auth":{"oat:lab-b":{"on200":{"anthropic-ratelimit-unified-5h-utilization":"0.95"}}}}"#,
+    )
+    .unwrap();
+    let (st, head, _) = post_as(&port, "/v1/messages", Some(&bearer_a), turn);
+    assert_eq!(st, 429, "lab-a at its limit");
+    assert!(
+        head.contains("anthropic-ratelimit-unified-status: rejected"),
+        "{head}"
+    );
+    assert!(
+        head.contains(&format!("anthropic-ratelimit-unified-reset: {reset}")),
+        "{head}"
+    );
+    let (st, head, _) = post_as(&port, "/v1/messages", Some(&bearer_b), turn);
+    assert_eq!(
+        st, 200,
+        "lab-b, which no mode names, in the stub's own mode"
+    );
+    assert!(
+        head.contains("anthropic-ratelimit-unified-5h-utilization: 0.95"),
+        "{head}"
+    );
+    let (st, head, _) = post_as(&port, "/v1/messages", None, turn);
+    assert_eq!(st, 200);
+    assert!(
+        head.contains("anthropic-ratelimit-unified-5h-utilization: 0.10"),
+        "{head}"
+    );
+
+    std::fs::write(&auth_modes, r#"{"oat:lab-a":"limit:five_hour:1"}"#).unwrap();
+    assert_eq!(
+        post_as(&port, "/v1/messages", Some(&bearer_a), turn).0,
+        200,
+        "lab-a's limit lifts at its reset"
+    );
+
+    std::fs::create_dir_all(dir.join("modes")).unwrap();
+    std::fs::write(
+        dir.join("modes/gated.json"),
+        r#"{"status":418,"auth":"oat:lab-b","json":{"error":{"type":"x"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(&auth_modes, r#"{"oat:lab-a":"gated","oat:lab-b":"gated"}"#).unwrap();
+    assert_eq!(
+        post_as(&port, "/v1/messages", Some(&bearer_b), turn).0,
+        418,
+        "a custom mode with auth answers the credential it names"
+    );
+    assert_eq!(
+        post_as(&port, "/v1/messages", Some(&bearer_a), turn).0,
+        200,
+        "and no other"
+    );
+
+    let want = [
+        "POST /v1/messages -> 429 body=",
+        " last_user=\"hi\" auth=oat:lab-a",
+        "mode=limit:five_hour:",
+        " last_user=\"hi\" auth=oat:lab-b RL200[5h-utilization=0.95]",
+        " last_user=\"hi\" auth=none RL200[5h-utilization=0.10]",
+        "POST /v1/messages -> 418 body=",
+    ];
+    let logged = logged_with(&log, &want, Duration::from_secs(60));
+    for w in want {
+        assert!(logged.contains(w), "{w:?} is not in the log:\n{logged}");
+    }
+    assert!(
+        !logged.contains(&a) && !logged.contains(&b),
+        "no token is logged"
+    );
 }

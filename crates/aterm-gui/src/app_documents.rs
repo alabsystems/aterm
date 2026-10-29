@@ -25,6 +25,9 @@ use crate::native_editor::{CloseWhy, EditorCommand, EditorEffect, Selection};
 use crate::{App, WindowId};
 use amacs::input::{EditorInput, Follow, Reduction};
 
+#[path = "app_document_watch.rs"]
+mod watch;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigEditorRevealDecision {
     Select {
@@ -250,8 +253,9 @@ fn smallest_edit(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// One queued tab or leaf close. Its window is wherever its tab is now
+/// ([`App::tab_window`]): a tab keeps its process-unique id when it moves.
 struct PendingDocumentClose {
-    window: WindowId,
     tab: crate::tab_model::TabId,
     views: Vec<DocumentViewId>,
     whole_tab: bool,
@@ -279,6 +283,33 @@ struct PlannedDocumentClose {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct DocumentClosePlan {
     documents: Vec<PlannedDocumentClose>,
+}
+
+impl DocumentClosePlan {
+    /// Whether every leaf this plan closes is still one of `live`'s.
+    fn within(&self, live: &Self) -> bool {
+        let live = live
+            .documents
+            .iter()
+            .flat_map(|item| item.views.iter().map(move |view| (item.document, *view)))
+            .collect::<BTreeSet<_>>();
+        self.documents.iter().all(|item| {
+            item.views
+                .iter()
+                .all(|view| live.contains(&(item.document, *view)))
+        })
+    }
+}
+
+/// One OS window's armed close ([`App::prepare_window_document_shutdown`]): the
+/// documents it waits on, and the window it was asked over.
+#[derive(Clone, Debug)]
+struct PendingWindowClose {
+    plan: DocumentClosePlan,
+    asked: crate::app_window::WindowCloseConsent,
+    /// Ready, consented and handed to a pending update handoff, which replays
+    /// the close once it stands down ([`App::replayed_window_close_consented`]).
+    deferred: bool,
 }
 
 enum NativeDocumentJob {
@@ -585,14 +616,21 @@ fn prepare_config_save_observation(
     plan: &crate::native_document_io::SavePlan,
     result: &crate::native_document_io::AtomicSaveResult,
     themes: Option<std::sync::Arc<crate::app_config::ThemeCatalog>>,
-) -> Option<Result<crate::native_config_service::PreparedConfigObservation, String>> {
+) -> Option<
+    Result<
+        crate::native_config_service::PreparedConfigObservation,
+        crate::native_config_service::ConfigFailure,
+    >,
+> {
     let themes = themes?;
     let crate::native_document_io::AtomicSaveResult::Committed(proof) = result else {
         return None;
     };
     let text = std::str::from_utf8(&plan.bytes)
         .map(str::to_owned)
-        .map_err(|_| "saved config bytes were not UTF-8".to_string());
+        .map_err(|_| {
+            crate::native_config_service::ConfigFailure::from("saved config bytes were not UTF-8")
+        });
     Some(text.and_then(|text| {
         crate::native_config_service::VersionedConfigService::prepare_observation(
             crate::native_config_service::ConfigDiskObservation {
@@ -746,7 +784,15 @@ pub(crate) struct DocumentHostRuntime {
     /// OS-window closes are all-or-nothing across every document leaf in that
     /// window: no tab or view is detached while any member still lacks its exact
     /// durable checkpoint.
-    pending_window_closes: BTreeMap<WindowId, DocumentClosePlan>,
+    pending_window_closes: BTreeMap<WindowId, PendingWindowClose>,
+    /// A document an armed window close waits on was discarded since the last
+    /// park, which may have made that close ready with no save to escalate it:
+    /// the park escalates it ([`App::escalate_document_shutdown`]).
+    pub(crate) close_due: bool,
+    /// A window or Quit close went since the last park, so tab and leaf closes
+    /// it held may be free to finish: the park finishes each whose document is
+    /// saved ([`App::resume_released_document_closes`]).
+    closes_resume_due: bool,
     /// Whole-app Quit waits on one process-wide plan before update application or
     /// event-loop exit.
     pending_quit: Option<DocumentClosePlan>,
@@ -765,6 +811,8 @@ pub(crate) struct DocumentHostRuntime {
     pub(crate) release_due: bool,
     /// When the last recently-closed record that alone kept a document expires.
     pub(crate) release_deadline_ms: Option<u64>,
+    /// The file watch over every open document's file (`app_document_watch`).
+    pub(crate) watch: watch::DocumentWatch,
 }
 
 /// Where a document open lands its caret.
@@ -810,6 +858,8 @@ impl DocumentHostRuntime {
             pending_saves: BTreeMap::new(),
             pending_closes: BTreeMap::new(),
             pending_window_closes: BTreeMap::new(),
+            close_due: false,
+            closes_resume_due: false,
             pending_quit: None,
             admissions: BTreeMap::new(),
             next_admission: 1,
@@ -817,6 +867,7 @@ impl DocumentHostRuntime {
             edits: crate::app_edit::EditTickets::default(),
             release_due: false,
             release_deadline_ms: None,
+            watch: watch::DocumentWatch::default(),
         }
     }
 }
@@ -1311,15 +1362,14 @@ impl App {
         if !editor_event {
             return Ok(None);
         }
-        let held_line_ends = self
+        let crlf_on_disk = self
             .native_documents
             .persistence
             .observed(document)
             .is_some_and(|observed| {
                 observed.encoding().eol == crate::native_document_io::LineEnding::CrLf
-            })
-            .then(|| crlf_held_insertion(event))
-            .flatten();
+            });
+        let held_line_ends = crlf_on_disk.then(|| crlf_held_insertion(event)).flatten();
         let event = held_line_ends.as_ref().unwrap_or(event);
 
         let config_diagnostic_navigation = match event {
@@ -1345,6 +1395,8 @@ impl App {
 
         self.editor_workspace.granted =
             crate::command_registry::editor_grant(self.person_gesture_refused());
+        // A yank is a key, not text: the engine writes a kill's CRLF as LF into this document.
+        self.editor_workspace.crlf_on_disk = crlf_on_disk;
         let effects = {
             let (runtime, workspace, store) = (
                 &mut self.native_runtime,
@@ -1398,6 +1450,13 @@ impl App {
                     .handle_input(store, buffer, EditorInput::Text(text.clone()))
                     .map(&mut followed),
                 AppEvent::TextInput(TextInputEvent::Preedit { text, selection }) => {
+                    // A composition in a grid with no cell open opens the current cell, as
+                    // typing does, and composes at the cell editor's caret.
+                    if !text.is_empty() {
+                        workspace.grid_compose(store, buffer).map_err(|error| {
+                            format!("grid cell editor: {}", editor_error_message(&error))
+                        })?;
+                    }
                     state.preedit.clone_from(text);
                     state.preedit_caret = crate::native_text_input::normalize_preedit_selection(
                         text,
@@ -1521,11 +1580,10 @@ impl App {
                     if let Some(effects) = workspace.minibuffer_blocks_document_input(buffer) {
                         Ok(effects)
                     } else {
-                        let snapshot = store
-                            .snapshot(document)
-                            .ok_or_else(|| "editor document disappeared".to_string())?;
-                        buffer.scroll_lines(&snapshot.text, *lines);
-                        Ok(Vec::new())
+                        // Lines of text, or rows of a grid.
+                        workspace
+                            .scroll_view(store, buffer, *lines)
+                            .map(|()| Vec::new())
                     }
                 }
                 _ => unreachable!("editor event filter above is exhaustive"),
@@ -2452,7 +2510,10 @@ impl App {
         }
         self.native_runtime
             .set_document_disk_conflict(document, conflict.is_some());
-        if changed {
+        // The header row's notice stands only for a change on disk.
+        let notice_cleared = conflict != Some(DiskConflictCause::Version)
+            && self.native_runtime.set_document_disk_notice(document, None);
+        if changed || notice_cleared {
             self.repaint_document_views(document);
         }
     }
@@ -2506,6 +2567,9 @@ impl App {
             }
             EditorEffect::RevertDocument { document } => {
                 self.discard_document_changes(document, source_view)?;
+            }
+            EditorEffect::KeepDocument { document } => {
+                self.keep_document_over_disk(document)?;
             }
             EditorEffect::CloseView {
                 why: CloseWhy::Plain,
@@ -2937,6 +3001,7 @@ impl App {
                     observed_text,
                     observed,
                     "Reloaded changes from disk",
+                    crate::native_editor::Origin::Disk,
                 )?;
             }
             crate::native_document_io::FileWatchReduction::ConflictDirty { change } => {
@@ -2948,6 +3013,7 @@ impl App {
                     _ => crate::native_app::DISK_CONFLICT_RECOVERY,
                 };
                 self.set_document_recovery_status(document, Some(line.to_string()));
+                self.note_disk_change(document);
             }
             crate::native_document_io::FileWatchReduction::DeferredSaving { .. } => {}
         }
@@ -2981,9 +3047,26 @@ impl App {
             &observed.text,
             observed.observed,
             "Discarded changes and reloaded from disk",
+            crate::native_editor::Origin::Revert,
         )?;
         self.set_editor_view_status(source_view, "Discarded changes and reloaded from disk");
         self.finish_pending_document_closes(document)?;
+        // Discard is how a window close a failed save left waiting recovers: it
+        // finishes now, not at some unrelated later save.
+        if self
+            .native_documents
+            .pending_window_closes
+            .values()
+            .any(|pending| {
+                pending
+                    .plan
+                    .documents
+                    .iter()
+                    .any(|item| item.document == document)
+            })
+        {
+            self.native_documents.close_due = true;
+        }
         Ok(())
     }
 
@@ -2993,6 +3076,7 @@ impl App {
         observed_text: &str,
         observed: crate::native_document_io::ObservedFileVersion,
         status: &str,
+        origin: crate::native_editor::Origin,
     ) -> Result<(), String> {
         let before = self
             .document_store
@@ -3000,20 +3084,23 @@ impl App {
             .ok_or_else(|| "document disappeared during refresh".to_string())?;
         // Only the spans that changed on disk: a caret, selection, mark or
         // scroll anchor outside them stays on its text.
+        // One labelled frame through the editor's one writer, so C-/ takes
+        // the disk's text back to the buffer's.
         let (seq, deltas) = if before.text.as_ref() == observed_text {
             (before.seq, Vec::new())
         } else {
-            match self
-                .document_store
-                .replace_text(document, before.seq, observed_text)
-            {
-                crate::document_store::DocumentTxnOutcome::Committed { seq, deltas, .. } => {
-                    (seq, deltas)
-                }
-                crate::document_store::DocumentTxnOutcome::Conflict { .. } => {
+            match self.editor_workspace.replace_text(
+                &mut self.document_store,
+                document,
+                before.seq,
+                observed_text,
+                origin,
+            ) {
+                Ok(committed) => committed,
+                Err(crate::native_editor::EditorError::TransactionConflict { .. }) => {
                     return Err("document changed while installing disk refresh".to_string());
                 }
-                crate::document_store::DocumentTxnOutcome::Rejected(error) => {
+                Err(error) => {
                     return Err(format!("disk refresh was rejected: {error:?}"));
                 }
             }
@@ -3026,7 +3113,6 @@ impl App {
             .checkpoint_ack(document, seq)
             .map_err(|error| format!("could not mark refreshed bytes durable: {error:?}"))?;
 
-        self.editor_workspace.observe_external(document, &deltas);
         let views = self.document_native_views(document);
         for (_, _, view) in &views {
             if let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(*view)
@@ -3054,6 +3140,12 @@ impl App {
         let revision = self.document_store.revision(document).unwrap_or(0);
         self.native_runtime
             .publish_document(document, current.text.as_ref(), revision, false);
+        // The reload is an undo frame: Undo lights up for it.
+        self.native_runtime.set_editor_history_availability(
+            document,
+            self.editor_workspace.can_undo(document),
+            self.editor_workspace.can_redo(document),
+        );
         self.request_config_host_diagnostics(document);
         for (window, instance, view) in views {
             let _ = self.native_runtime.dispatch(
@@ -3242,7 +3334,10 @@ impl App {
         saved_bytes: std::sync::Arc<[u8]>,
         result: crate::native_document_io::AtomicSaveResult,
         config_observation: Option<
-            Result<crate::native_config_service::PreparedConfigObservation, String>,
+            Result<
+                crate::native_config_service::PreparedConfigObservation,
+                crate::native_config_service::ConfigFailure,
+            >,
         >,
     ) -> Result<(), String> {
         let reduction = self
@@ -3265,6 +3360,7 @@ impl App {
             config_observation,
         );
         self.edit_document_saved(document, landed.as_ref().err().map(String::as_str));
+        self.look_again_after_save(document);
         landed
     }
 
@@ -3278,7 +3374,10 @@ impl App {
             crate::native_document_host::PersistenceError,
         >,
         config_observation: Option<
-            Result<crate::native_config_service::PreparedConfigObservation, String>,
+            Result<
+                crate::native_config_service::PreparedConfigObservation,
+                crate::native_config_service::ConfigFailure,
+            >,
         >,
     ) -> Result<(), String> {
         self.note_document_settling(document);
@@ -3315,7 +3414,8 @@ impl App {
                             Err(error) => {
                                 self.native_config_service.mark_reconciliation_required();
                                 aterm_log::warn!(
-                                    "manual config save was durable but its prepared config generation failed: {error}"
+                                    "manual config save was durable but its prepared config generation failed: {}",
+                                    error.log
                                 );
                             }
                         }
@@ -3351,6 +3451,7 @@ impl App {
                 }
                 .to_string();
                 self.set_document_recovery_status(document, Some(message.clone()));
+                self.note_disk_change(document);
                 Err(message)
             }
             crate::native_document_io::SaveReduction::Failed {
@@ -3527,13 +3628,11 @@ impl App {
     fn queue_pending_document_close(
         &mut self,
         document: DocumentId,
-        window: WindowId,
         tab: crate::tab_model::TabId,
         views: Vec<DocumentViewId>,
         whole_tab: bool,
     ) {
         let pending = PendingDocumentClose {
-            window,
             tab,
             views,
             whole_tab,
@@ -3580,16 +3679,63 @@ impl App {
                 self.document_store
                     .checkpoint_retry(document)
                     .map_err(|error| format!("could not retry document checkpoint: {error:?}"))?;
-                self.queue_pending_document_close(document, wid, tab_id, closing, false);
+                self.queue_pending_document_close(document, tab_id, closing, false);
                 self.save_document_checkpoint(document, source_view)?;
                 Ok(false)
             }
             crate::document_store::DocumentCloseReadiness::Pending { .. } => {
-                self.queue_pending_document_close(document, wid, tab_id, closing, false);
+                self.queue_pending_document_close(document, tab_id, closing, false);
                 self.save_document_checkpoint(document, source_view)?;
                 Ok(false)
             }
         }
+    }
+
+    /// Commit the open grid cell editor of Editor view `view`, if it has one, before the view
+    /// closes, as Return would. `false` when the commit is refused, its reason on the view's
+    /// status: the close waits and the person's text stays.
+    pub(crate) fn commit_grid_draft_before_close(
+        &mut self,
+        view: crate::tab_model::ViewId,
+    ) -> bool {
+        let Some(crate::tab_model::View::Native(native)) = self.view_store.get(view).copied()
+        else {
+            return true;
+        };
+        let Some(document) = self.native_runtime.document_id(native.instance) else {
+            return true;
+        };
+        let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view) else {
+            return true;
+        };
+        let Some(buffer) = state.buffer.as_mut() else {
+            return true;
+        };
+        if buffer.grid_draft().is_none() {
+            return true;
+        }
+        let committed = self
+            .editor_workspace
+            .commit_before_close(&mut self.document_store, buffer);
+        state.common.presentation_revision = state.common.presentation_revision.saturating_add(1);
+        if let Err(refusal) = &committed {
+            state.status = Some(format!("The cell stays open: {refusal}"));
+        }
+        self.native_runtime.set_editor_history_availability(
+            document,
+            self.editor_workspace.can_undo(document),
+            self.editor_workspace.can_redo(document),
+        );
+        self.publish_editor_commit(document, view);
+        committed.is_ok()
+    }
+
+    /// The window tab `tab` is in now, if it is still open.
+    pub(crate) fn tab_window(&self, tab: crate::tab_model::TabId) -> Option<WindowId> {
+        self.windows
+            .iter()
+            .find(|(_, state)| state.tab_set.get(tab).is_some())
+            .map(|(window, _)| *window)
     }
 
     fn finish_pending_document_closes(&mut self, document: DocumentId) -> Result<(), String> {
@@ -3599,23 +3745,25 @@ impl App {
             .remove(&document)
             .unwrap_or_default();
         let mut deferred = Vec::new();
+        let mut dropped = false;
         for close in pending {
+            let window = self.tab_window(close.tab);
             // A pending window or Quit plan owns teardown atomically; detaching
             // an older tab close here would apply part of it before its other
-            // documents are durable.
+            // documents are durable. The window is wherever the tab is now.
             if self.native_documents.pending_quit.is_some()
-                || self
-                    .native_documents
-                    .pending_window_closes
-                    .contains_key(&close.window)
+                || window.is_some_and(|window| {
+                    self.native_documents
+                        .pending_window_closes
+                        .contains_key(&window)
+                })
             {
                 deferred.push(close);
                 continue;
             }
-            let unchanged = self
-                .windows
-                .get(&close.window)
-                .and_then(|ws| ws.tab_set.tabs().iter().find(|tab| tab.id == close.tab))
+            let unchanged = window
+                .and_then(|window| self.windows.get(&window))
+                .and_then(|ws| ws.tab_set.get(close.tab))
                 .is_some_and(|tab| {
                     let live = tab
                         .root
@@ -3625,35 +3773,36 @@ impl App {
                         .collect::<BTreeSet<_>>();
                     close.views.iter().all(|view| live.contains(view))
                 });
-            if !unchanged {
+            let Some(window) = window.filter(|_| unchanged) else {
+                // The tab or its leaf is gone: nothing is left to close, and the
+                // document must not stay frozen for it.
+                dropped = true;
                 continue;
-            }
-            let mutations = if close.whole_tab {
-                [crate::DeferredHandoffMutation::CloseTab {
-                    window: close.window,
+            };
+            let mutations: Vec<_> = if close.whole_tab {
+                vec![crate::DeferredHandoffMutation::CloseTab {
+                    window,
                     tab: close.tab,
                 }]
-                .into_iter()
-                .collect()
             } else {
                 close
                     .views
                     .iter()
                     .map(|view| crate::DeferredHandoffMutation::CloseView {
-                        window: close.window,
+                        window,
                         tab: close.tab,
                         view: crate::tab_model::ViewId::from_stored(view.0),
                     })
                     .collect()
             };
             if self.defer_pending_update_handoff_teardown(
-                crate::DeferredHandoffTeardown::Mutations(mutations),
+                crate::DeferredHandoffTeardown::mutations(mutations),
             ) {
                 // The handoff now owns the stable close intent and its replay.
                 continue;
             }
             if !close.whole_tab {
-                let sole_leaf = self.windows.get(&close.window).and_then(|window| {
+                let sole_leaf = self.windows.get(&window).and_then(|window| {
                     window
                         .tab_set
                         .tabs()
@@ -3664,18 +3813,18 @@ impl App {
                 if let Some((index, active)) = sole_leaf {
                     // A sibling may have closed while saving. Reuse whole-tab
                     // recovery and last-window shutdown before detaching anything.
-                    self.close_tab_at(close.window, index);
+                    self.close_tab_at(window, index);
                     if self
                         .windows
-                        .get(&close.window)
+                        .get(&window)
                         .is_some_and(|window| window.tab_set.get(close.tab).is_some())
                     {
                         if let Some(active) = active
-                            && let Some(window) = self.windows.get_mut(&close.window)
+                            && let Some(window) = self.windows.get_mut(&window)
                         {
                             window.tab_set.switch_to(active);
                         }
-                        self.resync_active_or_window(close.window);
+                        self.resync_active_or_window(window);
                         deferred.push(close);
                     }
                     continue;
@@ -3687,20 +3836,20 @@ impl App {
             if close.whole_tab {
                 let removed = self
                     .windows
-                    .get_mut(&close.window)
+                    .get_mut(&window)
                     .and_then(|ws| ws.tab_set.remove(close.tab));
                 if let Some(tab) = removed {
                     self.remove_tab_views(&tab);
-                    self.resync_active_or_window(close.window);
-                    self.request_native_redraw(close.window);
+                    self.resync_active_or_window(window);
+                    self.request_native_redraw(window);
                 }
             } else {
                 for document_view in close.views {
                     let view = crate::tab_model::ViewId::from_stored(document_view.0);
-                    let recovery = self.closed_view_record_for(close.window, close.tab, view);
+                    let recovery = self.closed_view_record_for(window, close.tab, view);
                     let removed = self
                         .windows
-                        .get_mut(&close.window)
+                        .get_mut(&window)
                         .and_then(|window| {
                             let index = window
                                 .tab_set
@@ -3717,17 +3866,20 @@ impl App {
                         }
                     }
                 }
-                self.refresh_aggregate_tab_presentation(close.window, close.tab);
-                self.promote_terminal_projection_if_needed(close.window, close.tab);
-                self.resize_panes_after_collapse(close.window);
-                self.resync_active_or_window(close.window);
-                self.request_native_redraw(close.window);
+                self.refresh_aggregate_tab_presentation(window, close.tab);
+                self.promote_terminal_projection_if_needed(window, close.tab);
+                self.resize_panes_after_collapse(window);
+                self.resync_active_or_window(window);
+                self.request_native_redraw(window);
             }
         }
         if !deferred.is_empty() {
             self.native_documents
                 .pending_closes
                 .insert(document, deferred);
+        }
+        if dropped {
+            self.release_unprotected_documents(BTreeSet::from([document]));
         }
         Ok(())
     }
@@ -3749,9 +3901,34 @@ impl App {
             return Ok(true);
         }
         let plan = self.document_close_plan_for_window(window)?;
-        self.native_documents
-            .pending_window_closes
-            .insert(window, plan.clone());
+        let asked = self.window_close_consent(window);
+        if let Some(previous) = self.native_documents.pending_window_closes.remove(&window) {
+            // A repeated close re-plans from the window's tabs. A document the
+            // replaced plan froze that the new one does not close the same way
+            // (it moved to another window, or a leaf of it closed) is reopened
+            // first; the new plan freezes again whatever it still closes.
+            let released = previous
+                .plan
+                .documents
+                .into_iter()
+                .filter(|item| {
+                    !plan
+                        .documents
+                        .iter()
+                        .any(|kept| kept.document == item.document && kept.views == item.views)
+                })
+                .map(|item| item.document)
+                .collect();
+            self.release_unprotected_documents(released);
+        }
+        self.native_documents.pending_window_closes.insert(
+            window,
+            PendingWindowClose {
+                plan: plan.clone(),
+                asked,
+                deferred: false,
+            },
+        );
         let ready = self.drive_document_close_plan(&plan, start_saves)?;
         if ready {
             self.commit_pending_window_document_shutdown(window)?;
@@ -3788,13 +3965,14 @@ impl App {
             .native_documents
             .pending_window_closes
             .values()
-            .flat_map(|plan| plan.documents.iter().map(|item| item.document))
+            .flat_map(|pending| pending.plan.documents.iter().map(|item| item.document))
             .collect::<BTreeSet<_>>();
         for item in plan.documents {
             if !protected.contains(&item.document) {
                 let _ = self.document_store.abort_close(item.document);
             }
         }
+        self.native_documents.closes_resume_due = true;
         true
     }
 
@@ -3813,6 +3991,12 @@ impl App {
         &mut self,
     ) -> Result<(bool, Vec<WindowId>), String> {
         if let Some(plan) = self.native_documents.pending_quit.clone() {
+            let undriven = self.undriven_documents(&plan);
+            if !undriven.documents.is_empty() {
+                // A document the Quit found needing no save may need one now; the
+                // Quit saves it as it saved every other document.
+                self.drive_document_close_plan(&undriven, true)?;
+            }
             if self.document_close_plan_ready(&plan)? {
                 // The native-app preflight ran before the async checkpoint; a
                 // Settings draft (or another native blocker) may have appeared
@@ -3841,37 +4025,222 @@ impl App {
             .collect::<Vec<_>>();
         let mut ready = Vec::new();
         for window in windows {
-            let Some(plan) = self
-                .native_documents
-                .pending_window_closes
-                .get(&window)
-                .cloned()
-            else {
-                continue;
-            };
-            if self.document_close_plan_ready(&plan)? {
-                // Detach nothing until every native leaf is still ready: the UI
-                // stays live while checkpoints run, and a new Settings draft must
-                // keep the whole window and surface its recovery payload.
-                if !self
-                    .prepare_window_native_shutdown(window, crate::native_app::CloseScope::Window)?
-                {
-                    continue;
+            // One window's broken plan costs only that window's close. Each
+            // close is weighed with the ones this pass already committed gone
+            // (they close before anything is asked again) and the ones a
+            // pending update handoff holds (they close when it replays).
+            let gone = ready
+                .iter()
+                .copied()
+                .chain(self.windows_closing_behind_handoff())
+                .collect::<Vec<_>>();
+            match self.take_ready_window_document_shutdown(window, &gone) {
+                Ok(true) => ready.push(window),
+                Ok(false) => {}
+                Err(error) => {
+                    aterm_log::warn!(
+                        "window {} document close dropped: {error}; close it again",
+                        window.0
+                    );
+                    self.disarm_window_document_shutdown(window);
                 }
-                let fresh = self.document_close_plan_for_window(window)?;
-                if fresh != plan {
-                    self.native_documents
-                        .pending_window_closes
-                        .insert(window, fresh.clone());
-                    if !self.drive_document_close_plan(&fresh, true)? {
-                        continue;
-                    }
-                }
-                self.commit_pending_window_document_shutdown(window)?;
-                ready.push(window);
             }
         }
         Ok((false, ready))
+    }
+
+    /// One armed window close at an escalation, with the windows in `gone`
+    /// committed to close before it; `Ok(true)` once it committed and the
+    /// window may go.
+    fn take_ready_window_document_shutdown(
+        &mut self,
+        window: WindowId,
+        gone: &[WindowId],
+    ) -> Result<bool, String> {
+        let Some(armed) = self
+            .native_documents
+            .pending_window_closes
+            .get(&window)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        if !self.windows.contains_key(&window) {
+            self.disarm_window_document_shutdown(window);
+            return Ok(false);
+        }
+        // Readiness is asked of the armed leaves only while they are all still
+        // in this window: `prepare_close` freezes a document, and one that moved
+        // to another window, or a leaf that closed, is no longer this close's.
+        // Such a close no longer describes the window, so it is dropped.
+        if !armed
+            .plan
+            .within(&self.document_close_plan_for_window(window)?)
+        {
+            self.disarm_window_document_shutdown(window);
+            return Ok(false);
+        }
+        if !self.document_close_plan_ready(&armed.plan)? {
+            // A document that needed no save when the close was armed (another
+            // window held a view of it) may need one now. The close saves it, as
+            // it saved the others, unless the window no longer agrees to close.
+            let undriven = self.undriven_documents(&armed.plan);
+            if !undriven.documents.is_empty() {
+                if !self.window_close_consent_holds(window, &armed.asked, gone) {
+                    self.disarm_window_document_shutdown(window);
+                    return Ok(false);
+                }
+                self.drive_document_close_plan(&undriven, true)?;
+            }
+            return Ok(false);
+        }
+        // A close a failed save left armed can come ready long after it was
+        // asked. It ends only what the person agreed to end then: a terminal
+        // the window gained since, a job that was not running then, or the app
+        // (the window became the last one, counting the closes this pass
+        // committed) drops it, and the person closes the window again.
+        if !self.window_close_consent_holds(window, &armed.asked, gone) {
+            aterm_log::info!(
+                "window {} changed since its close was asked (a terminal, a running job, or \
+                 now the last window); the close is dropped",
+                window.0
+            );
+            self.disarm_window_document_shutdown(window);
+            return Ok(false);
+        }
+        // Detach nothing until every native leaf is still ready: the UI stays
+        // live while checkpoints run, and a new Settings draft must keep the
+        // whole window and surface its recovery payload.
+        if !self.prepare_window_native_shutdown(window, crate::native_app::CloseScope::Window)? {
+            return Ok(false);
+        }
+        let fresh = self.document_close_plan_for_window(window)?;
+        if fresh != armed.plan {
+            if let Some(pending) = self.native_documents.pending_window_closes.get_mut(&window) {
+                pending.plan = fresh.clone();
+            }
+            if !self.drive_document_close_plan(&fresh, true)? {
+                return Ok(false);
+            }
+        }
+        // An update handoff in flight takes the window close and replays it
+        // (`close_window`) once it is over. Detach nothing before that: the
+        // replay re-plans from the window's leaves, which must still be the
+        // documents'. The replay weighs the consent again first.
+        if let Some(pending) = self.native_documents.pending_window_closes.get_mut(&window) {
+            pending.deferred = true;
+        }
+        if self.defer_pending_update_handoff_teardown(crate::DeferredHandoffTeardown::mutation(
+            crate::DeferredHandoffMutation::CloseWindow(window),
+        )) {
+            return Ok(false);
+        }
+        if let Some(pending) = self.native_documents.pending_window_closes.get_mut(&window) {
+            pending.deferred = false;
+        }
+        self.commit_pending_window_document_shutdown(window)?;
+        Ok(true)
+    }
+
+    /// Whether a returned update handoff may replay `window`'s close: a close
+    /// it took from an armed plan ends only what the person agreed to end when
+    /// the close was asked, weighed now that the closes replayed before it are
+    /// done. A close that no longer holds is dropped, and the window stays.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn replayed_window_close_consented(&mut self, window: WindowId) -> bool {
+        let Some(asked) = self
+            .native_documents
+            .pending_window_closes
+            .get(&window)
+            .filter(|pending| pending.deferred)
+            .map(|pending| pending.asked.clone())
+        else {
+            return true;
+        };
+        if self.window_close_consent_holds(window, &asked, &[]) {
+            return true;
+        }
+        aterm_log::info!(
+            "window {} changed while an update handoff held its close (a terminal, a running \
+             job, or now the last window); the close is dropped",
+            window.0
+        );
+        self.disarm_window_document_shutdown(window);
+        false
+    }
+
+    /// A returned update handoff hands back `teardown`: each armed close it had
+    /// taken that `teardown` no longer holds (a Quit or an AppKit terminate that
+    /// arrived during the handoff replaced it) is disarmed, so its window stays
+    /// with its documents editable instead of closing at some later, unrelated
+    /// save.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn release_window_closes_the_teardown_dropped(
+        &mut self,
+        teardown: &crate::DeferredHandoffTeardown,
+    ) {
+        let dropped: Vec<WindowId> = self
+            .native_documents
+            .pending_window_closes
+            .iter()
+            .filter(|(_, pending)| pending.deferred)
+            .map(|(window, _)| *window)
+            .filter(|window| {
+                !matches!(
+                    teardown,
+                    crate::DeferredHandoffTeardown::Mutations(mutations)
+                        if mutations.contains_key(&crate::DeferredHandoffMutation::CloseWindow(*window))
+                )
+            })
+            .collect();
+        for window in dropped {
+            aterm_log::info!(
+                "window {}'s close was replaced by a quit while an update handoff held it; \
+                 the close is dropped",
+                window.0
+            );
+            self.disarm_window_document_shutdown(window);
+        }
+    }
+
+    /// Drop `window`'s armed close, if any, with the tab closes in it that the
+    /// close deferred (a commit would have subsumed them; left behind, one
+    /// would close its tab at some later save), and reopen for editing each
+    /// document of either that no other close still waits on.
+    pub(crate) fn disarm_window_document_shutdown(&mut self, window: WindowId) {
+        let Some(pending) = self.native_documents.pending_window_closes.remove(&window) else {
+            return;
+        };
+        let mut released = self.forget_window_tab_closes(window);
+        released.extend(pending.plan.documents.iter().map(|item| item.document));
+        self.release_unprotected_documents(released);
+        self.native_documents.closes_resume_due = true;
+    }
+
+    /// Reopen for editing each of `documents` that no armed close (a window's,
+    /// the Quit's, or a tab's) still waits on.
+    fn release_unprotected_documents(&mut self, documents: BTreeSet<DocumentId>) {
+        let host = &self.native_documents;
+        let protected = host
+            .pending_window_closes
+            .values()
+            .map(|other| &other.plan)
+            .chain(host.pending_quit.as_ref())
+            .flat_map(|plan| plan.documents.iter().map(|item| item.document))
+            .chain(
+                host.pending_closes
+                    .iter()
+                    .filter(|(_, closes)| {
+                        closes
+                            .iter()
+                            .any(|close| self.tab_window(close.tab).is_some())
+                    })
+                    .map(|(document, _)| *document),
+            )
+            .collect::<BTreeSet<_>>();
+        for document in documents.difference(&protected) {
+            let _ = self.document_store.abort_close(*document);
+        }
     }
 
     fn document_close_plan_for_window(
@@ -3977,18 +4346,44 @@ impl App {
         self.document_close_plan_ready(plan)
     }
 
-    fn document_close_plan_ready(&mut self, plan: &DocumentClosePlan) -> Result<bool, String> {
+    /// Whether every document of `plan` can detach now. Asking freezes nothing:
+    /// a document only a close that saves it may freeze.
+    fn document_close_plan_ready(&self, plan: &DocumentClosePlan) -> Result<bool, String> {
         for item in &plan.documents {
-            if !matches!(
-                self.document_store
-                    .prepare_close(item.document, &item.views)
-                    .map_err(|error| format!("could not verify document shutdown: {error:?}"))?,
-                crate::document_store::DocumentCloseReadiness::Ready { .. }
-            ) {
+            if !self
+                .document_store
+                .close_ready(item.document, &item.views)
+                .map_err(|error| format!("could not verify document shutdown: {error:?}"))?
+            {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    /// The documents of `plan` that owe a save no close has started: each
+    /// needed none when the plan was armed (another view kept it open) and is
+    /// still editable.
+    fn undriven_documents(&self, plan: &DocumentClosePlan) -> DocumentClosePlan {
+        DocumentClosePlan {
+            documents: plan
+                .documents
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        self.document_store.phase(item.document),
+                        Some(
+                            crate::document_store::DocumentPhase::Active
+                                | crate::document_store::DocumentPhase::Suspended
+                        )
+                    ) && self
+                        .document_store
+                        .close_ready(item.document, &item.views)
+                        .is_ok_and(|ready| !ready)
+                })
+                .cloned()
+                .collect(),
+        }
     }
 
     fn commit_pending_window_document_shutdown(&mut self, window: WindowId) -> Result<(), String> {
@@ -3996,7 +4391,7 @@ impl App {
             .native_documents
             .pending_window_closes
             .get(&window)
-            .cloned()
+            .map(|pending| pending.plan.clone())
             .ok_or_else(|| "pending window document plan disappeared".to_string())?;
         let batch = plan
             .documents
@@ -4007,13 +4402,40 @@ impl App {
             .commit_detach_batch(&batch)
             .map_err(|error| format!("could not commit atomic window close: {error:?}"))?;
         self.native_documents.pending_window_closes.remove(&window);
-        for closes in self.native_documents.pending_closes.values_mut() {
-            closes.retain(|close| close.window != window);
+        let forgotten = self.forget_window_tab_closes(window);
+        self.release_unprotected_documents(forgotten);
+        self.native_documents.closes_resume_due = true;
+        Ok(())
+    }
+
+    /// Forget the tab and leaf closes in `window` that its window close
+    /// subsumed (and any whose tab is gone), answering the documents they
+    /// were for. A close whose tab moved to another window is that window's.
+    fn forget_window_tab_closes(&mut self, window: WindowId) -> BTreeSet<DocumentId> {
+        let held = self
+            .native_documents
+            .pending_closes
+            .values()
+            .flatten()
+            .map(|close| (close.tab, self.tab_window(close.tab)))
+            .collect::<BTreeMap<_, _>>();
+        let mut forgotten = BTreeSet::new();
+        for (document, closes) in &mut self.native_documents.pending_closes {
+            let before = closes.len();
+            closes.retain(|close| {
+                held.get(&close.tab)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|holder| holder != window)
+            });
+            if closes.len() != before {
+                forgotten.insert(*document);
+            }
         }
         self.native_documents
             .pending_closes
             .retain(|_, closes| !closes.is_empty());
-        Ok(())
+        forgotten
     }
 
     fn mark_document_shutdown_failure(&mut self, document: DocumentId, message: &str) {
@@ -4105,11 +4527,33 @@ impl App {
 
     /// At a park: let go of the documents nothing holds any more when a look is due.
     pub(crate) fn release_documents_at_park(&mut self) {
+        if std::mem::take(&mut self.native_documents.closes_resume_due) {
+            self.resume_released_document_closes();
+        }
         self.sweep_orphaned_edits_at_park();
         let host = &self.native_documents;
         if host.release_due || host.release_deadline_ms.is_some() {
             let now_ms = self.lat_epoch.elapsed().as_millis() as u64;
             self.release_documents_due(now_ms);
+        }
+    }
+
+    /// Finish each queued tab or leaf close that a window or Quit close held
+    /// and no longer holds (it went, or the tab moved out of its window),
+    /// once its document is saved; one still saving finishes when its save
+    /// lands.
+    fn resume_released_document_closes(&mut self) {
+        let saved = self
+            .native_documents
+            .pending_closes
+            .keys()
+            .copied()
+            .filter(|document| self.document_store.dirty(*document) == Some(false))
+            .collect::<Vec<_>>();
+        for document in saved {
+            if let Err(error) = self.finish_pending_document_closes(document) {
+                aterm_log::warn!("a held document close could not finish: {error}");
+            }
         }
     }
 
@@ -4164,6 +4608,7 @@ impl App {
             host.recovery_status.remove(document);
             host.disk_conflicts.remove(document);
             host.journal_retries.remove(*document);
+            host.watch.unwatch(*document);
             self.editor_workspace.forget(*document);
         }
         if let Some(journals) = host.journals.as_mut() {
@@ -4663,13 +5108,17 @@ impl App {
             if let Some(recovered) = recovered
                 && recovered.as_str() != disk_snapshot.text.as_ref()
             {
-                let outcome =
-                    self.document_store
-                        .replace_text(document, disk_snapshot.seq, &recovered);
-                if !matches!(
-                    outcome,
-                    crate::document_store::DocumentTxnOutcome::Committed { .. }
-                ) {
+                // A labelled frame, and the floor of the buffer's undo: C-/
+                // stops at it (`RECOVERED_FLOOR`), so the draft never goes
+                // back to the file's text but by revert-buffer.
+                let outcome = self.editor_workspace.replace_text(
+                    &mut self.document_store,
+                    document,
+                    disk_snapshot.seq,
+                    &recovered,
+                    crate::native_editor::Origin::Recovered,
+                );
+                if outcome.is_err() {
                     let _ = self.document_store.remove_if_unattached(document);
                     return Err("recovered draft could not be installed atomically".to_string());
                 }
@@ -4698,6 +5147,7 @@ impl App {
             .persistence
             .register(document, granted.grant.id, granted.observed, &granted.text)
             .map_err(|error| format!("document persistence failed: {error:?}"))?;
+        self.watch_document_file(document);
         if existing.is_some() {
             let _ = self.refresh_native_document(document)?;
         }
@@ -4872,11 +5322,32 @@ impl App {
                     .editor_workspace
                     .attach(&mut self.document_store, document, document_view)
                     .map_err(|error| format!("could not attach editor view: {error:?}"))?;
+                let mut buffer = buffer;
+                // A table opens as a grid; one too large for it stays text and says why.
+                let delimiter = self
+                    .document_store
+                    .canonical_uri(document)
+                    .zip(self.document_store.snapshot(document))
+                    .and_then(|(uri, snapshot)| {
+                        amacs::language::Language::detect(
+                            uri,
+                            amacs::table::first_line(&snapshot.text),
+                        )
+                        .delimiter()
+                    });
+                let refusal = delimiter.and_then(|delimiter| {
+                    self.editor_workspace
+                        .set_face(&self.document_store, &mut buffer, Some(delimiter))
+                        .err()
+                });
                 let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view)
                 else {
                     return Err("editor runtime view disappeared during attach".to_string());
                 };
                 state.buffer = Some(buffer);
+                if refusal.is_some() {
+                    state.status = refusal;
+                }
                 Ok(())
             }
             AppKind::About | AppKind::Settings | AppKind::SystemState | AppKind::Recovery => {
@@ -5019,9 +5490,8 @@ fn editor_error_message(error: &crate::native_editor::EditorError) -> String {
         EditorError::NothingToUndo => "Nothing to undo".to_string(),
         EditorError::NothingToRedo => "Nothing to redo".to_string(),
         EditorError::NoKill => "Kill ring is empty".to_string(),
-        EditorError::StaleView { .. }
-        | EditorError::TransactionConflict { .. }
-        | EditorError::HistoryDiverged { .. } => {
+        EditorError::UndoRefused { why } => why.clone(),
+        EditorError::StaleView { .. } | EditorError::TransactionConflict { .. } => {
             "The document changed; this view was safely stopped before editing stale text"
                 .to_string()
         }
@@ -8413,8 +8883,10 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "abc");
         assert_eq!(mtime(), before, "nothing was written");
 
-        type_text(&mut app, "x");
-        type_text(&mut app, "y");
+        // Two characters at a time: each is its own undo step (one at a
+        // time, they would join one run of typing).
+        type_text(&mut app, "xx");
+        type_text(&mut app, "yy");
         undo(&mut app);
         assert_ne!(
             app.document_store.snapshot(document).unwrap().text.as_ref(),
@@ -9291,7 +9763,13 @@ mod tests {
                     app.native_documents
                         .pending_window_closes
                         .values()
-                        .any(|plan| plan.documents.iter().any(|item| item.document == document)),
+                        .any(|pending| {
+                            pending
+                                .plan
+                                .documents
+                                .iter()
+                                .any(|item| item.document == document)
+                        }),
                 ),
             );
             state.insert("close_seq", controller.close_seq);
@@ -9840,6 +10318,350 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// A reload from disk is a labelled frame through the editor's one
+    /// writer: C-/ takes a clean reload back to the text before it, and after
+    /// Discard brings the person's edits back (dirty, the disk's text one
+    /// Redo away), each status naming what it undid.
+    #[test]
+    fn undo_reaches_a_reload_and_a_discard_as_labelled_frames() {
+        let wid = WindowId(0);
+        let dir = fresh_dir("aterm-undo-reaches-reloads");
+        let path = dir.join("notes.md");
+        fs::write(&path, "disk one\n").unwrap();
+        let mut app = App::headless_for_test();
+        app.open_document_tab(AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        let views = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(views.0).unwrap();
+        let text = |app: &App| app.document_store.snapshot(document).unwrap().text;
+        let status = |app: &App| {
+            let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(views.1) else {
+                panic!("expected editor view");
+            };
+            state.status.clone().unwrap_or_default()
+        };
+        let can_undo = |app: &App| {
+            let Some(NativeApp::Editor(editor)) = app.native_runtime.app(views.0) else {
+                panic!("the editor stays installed");
+            };
+            editor.can_undo
+        };
+        assert!(!can_undo(&app), "a fresh file has nothing to undo");
+
+        // The watch's clean reload.
+        fs::write(&path, "disk two\n").unwrap();
+        assert!(matches!(
+            app.refresh_native_document(document).unwrap(),
+            crate::native_document_io::FileWatchReduction::ReloadClean { .. }
+        ));
+        assert_clean_at(&app, views, "disk two\n", "a clean reload");
+        assert!(can_undo(&app), "the reload is a frame Undo reaches");
+        undo(&mut app, wid);
+        assert_eq!(text(&app).as_ref(), "disk one\n");
+        assert!(
+            status(&app).starts_with("Undid the reload from disk"),
+            "{}",
+            status(&app)
+        );
+        let _ = fs::remove_dir_all(dir);
+
+        // Discard Changes and Reload from Disk over the person's edits.
+        let dir = fresh_dir("aterm-undo-reaches-discard");
+        let path = dir.join("notes.md");
+        fs::write(&path, "disk one\n").unwrap();
+        let mut app = App::headless_for_test();
+        app.open_document_tab(AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        let views = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(views.0).unwrap();
+        commit(&mut app, wid, "local ");
+        let mine = text(&app);
+        fs::write(&path, "disk two\n").unwrap();
+        assert!(matches!(
+            app.refresh_native_document(document).unwrap(),
+            crate::native_document_io::FileWatchReduction::ConflictDirty { .. }
+        ));
+        app.discard_document_changes(document, views.1).unwrap();
+        assert_clean_at(&app, views, "disk two\n", "Discard");
+        undo(&mut app, wid);
+        assert_eq!(text(&app), mine, "C-/ brings the person's edits back");
+        assert_eq!(app.document_store.dirty(document), Some(true));
+        assert!(
+            !app.native_documents.disk_conflicts.contains_key(&document),
+            "the disk's text is the baseline now: Save overwrites it knowingly"
+        );
+        assert!(
+            status(&app).starts_with("Undid the revert to the file on disk"),
+            "{}",
+            status(&app)
+        );
+        app.dispatch_native_event(
+            wid,
+            AppEvent::Action(crate::native_app::ActionInvocation {
+                id: crate::native_ui::ActionId::new("editor/redo"),
+                value: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            text(&app).as_ref(),
+            "disk two\n",
+            "Redo takes the disk's text"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn editor_action(app: &mut App, wid: WindowId, action: &str) -> Result<(), String> {
+        app.dispatch_native_event(
+            wid,
+            AppEvent::Action(crate::native_app::ActionInvocation {
+                id: crate::native_ui::ActionId::new(action),
+                value: None,
+            }),
+        )
+        .map(|_| ())
+    }
+
+    fn disk_notice(
+        app: &App,
+        instance: crate::tab_model::AppInstanceId,
+    ) -> Option<crate::native_app::DiskNotice> {
+        let Some(NativeApp::Editor(editor)) = app.native_runtime.app(instance) else {
+            panic!("the editor stays installed");
+        };
+        editor.disk_notice
+    }
+
+    fn editor_status(app: &App, view: crate::tab_model::ViewId) -> String {
+        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+            panic!("expected editor view");
+        };
+        state.status.clone().unwrap_or_default()
+    }
+
+    /// The watch's wake over a clean buffer: the file's new text reloads in
+    /// place as one disk frame (C-/ takes it back), the caret staying on its
+    /// text. A wake for a file that did not change, or for a key nobody
+    /// watches, changes nothing; a released document is no longer watched.
+    #[test]
+    fn a_watched_file_rewritten_under_a_clean_buffer_reloads_in_place() {
+        let wid = WindowId(0);
+        let dir = fresh_dir("aterm-watch-clean-reload");
+        let path = dir.join("notes.md");
+        let base: String = (1..=30).map(|line| format!("line {line:02}\n")).collect();
+        fs::write(&path, &base).unwrap();
+        let mut app = App::headless_for_test();
+        app.open_document_tab(AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        let views = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(views.0).unwrap();
+        let watched = app
+            .native_documents
+            .watch
+            .watched_path(document)
+            .map(|watched| fs::canonicalize(watched).unwrap());
+        assert_eq!(
+            watched,
+            Some(fs::canonicalize(&path).unwrap()),
+            "opening the file watches it"
+        );
+
+        // The negative controls: a wake with no change, and one for a key
+        // nobody watches.
+        app.native_document_file_changed(document.get());
+        app.native_document_file_changed(document.get() + 1000);
+        assert_clean_at(&app, views, &base, "an unchanged file");
+        assert!(
+            !app.editor_workspace.can_undo(document),
+            "nothing was reloaded"
+        );
+
+        let caret = base.find("line 12").unwrap() + 3;
+        {
+            let Some(AppViewState::Editor(state)) = app.native_runtime.view_state_mut(views.1)
+            else {
+                panic!("expected editor view");
+            };
+            let buffer = state.buffer.as_mut().expect("attached editor buffer");
+            buffer.selections = vec![Selection::caret(caret)];
+            buffer.primary = 0;
+        }
+        // An AI CLI's edit tool deletes line 2.
+        let external = base.replacen("line 02\n", "", 1);
+        fs::write(&path, &external).unwrap();
+        app.native_document_file_changed(document.get());
+        assert_clean_at(&app, views, &external, "a clean reload");
+        let moved = external.find("line 12").unwrap() + 3;
+        assert_eq!(
+            editor_buffer(&app, views.1).primary_selection().range(),
+            moved..moved,
+            "the caret stays on its text"
+        );
+        assert_eq!(editor_status(&app, views.1), "Reloaded changes from disk");
+        undo(&mut app, wid);
+        assert_eq!(
+            app.document_store.snapshot(document).unwrap().text.as_ref(),
+            base,
+            "C-/ takes the reload back"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Over unsaved edits the watch never reloads: the header row says the
+    /// file changed and offers Reload (the disk's text, the edits one undo
+    /// away) or Keep Mine (the buffer as it is, still unsaved, for Save to
+    /// write over the file; the file keeps the disk's text until then, and
+    /// no undo of the buffer's own typing ever reads as saved). Keep Mine
+    /// with nothing changed on disk keeps nothing (the negative control).
+    #[test]
+    fn a_file_changed_under_unsaved_edits_offers_reload_or_keep_and_loses_neither() {
+        let wid = WindowId(0);
+        let open = |name: &str| {
+            let dir = fresh_dir(name);
+            let path = dir.join("notes.md");
+            fs::write(&path, "disk one\n").unwrap();
+            let mut app = App::headless_for_test();
+            app.open_document_tab(AppKind::Editor, &file_uri(&path))
+                .unwrap();
+            let views = app.active_native_view(wid).unwrap();
+            let document = app.native_runtime.document_id(views.0).unwrap();
+            commit(&mut app, wid, "mine ");
+            (dir, path, app, views, document)
+        };
+        let conflicted = |name: &str| {
+            let (dir, path, mut app, views, document) = open(name);
+            fs::write(&path, "disk two\n").unwrap();
+            app.native_document_file_changed(document.get());
+            (dir, path, app, views, document)
+        };
+        let text = |app: &App, document: DocumentId| {
+            app.document_store
+                .snapshot(document)
+                .unwrap()
+                .text
+                .to_string()
+        };
+
+        // Keep Mine.
+        let (dir, path, mut app, views, document) = conflicted("aterm-watch-keep");
+        assert_eq!(
+            text(&app, document),
+            "mine disk one\n",
+            "the watch never reloads over edits"
+        );
+        assert_eq!(
+            disk_notice(&app, views.0),
+            Some(crate::native_app::DiskNotice::Changed)
+        );
+        assert_eq!(
+            app.native_documents.disk_conflicts.get(&document),
+            Some(&DiskConflictCause::Version)
+        );
+        editor_action(&mut app, wid, "editor/keep-local").unwrap();
+        assert_eq!(text(&app, document), "mine disk one\n");
+        assert_eq!(app.document_store.dirty(document), Some(true));
+        assert!(!app.native_documents.disk_conflicts.contains_key(&document));
+        assert_eq!(disk_notice(&app, views.0), None);
+        assert_eq!(editor_status(&app, views.1), watch::KEPT_STATUS);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "disk two\n",
+            "the file keeps the disk's text until Save"
+        );
+        undo(&mut app, wid);
+        assert_eq!(
+            text(&app, document),
+            "disk one\n",
+            "C-/ undoes the buffer's own typing"
+        );
+        assert_eq!(
+            app.document_store.dirty(document),
+            Some(true),
+            "the text the buffer opened with is not the file on disk now"
+        );
+        editor_action(&mut app, wid, "editor/redo").unwrap();
+        assert_eq!(text(&app, document), "mine disk one\n");
+        editor_action(&mut app, wid, "editor/save").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "mine disk one\n",
+            "Save writes over the file knowingly"
+        );
+        let _ = fs::remove_dir_all(dir);
+
+        // Reload.
+        let (dir, _path, mut app, views, document) = conflicted("aterm-watch-reload");
+        editor_action(&mut app, wid, "editor/revert").unwrap();
+        assert_clean_at(&app, views, "disk two\n", "Reload");
+        assert_eq!(disk_notice(&app, views.0), None);
+        undo(&mut app, wid);
+        assert_eq!(
+            text(&app, document),
+            "mine disk one\n",
+            "C-/ brings the edits back"
+        );
+        let _ = fs::remove_dir_all(dir);
+
+        // The negative control: nothing changed on disk, so nothing is kept.
+        let (dir, _path, mut app, views, document) = open("aterm-watch-keep-nothing");
+        let kept = editor_action(&mut app, wid, "editor/keep-local");
+        assert!(
+            kept.as_ref()
+                .is_err_and(|error| error.starts_with("Nothing to keep")),
+            "{kept:?}"
+        );
+        assert_eq!(text(&app, document), "mine disk one\n");
+        assert_eq!(disk_notice(&app, views.0), None);
+        undo(&mut app, wid);
+        assert_eq!(
+            text(&app, document),
+            "disk one\n",
+            "no frame was pushed: C-/ undoes the typing"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A file deleted under its buffer keeps the buffer's text: the header
+    /// row says so and offers Keep Mine, after which Save writes the file
+    /// again.
+    #[test]
+    fn a_file_deleted_under_its_buffer_keeps_the_text_and_keep_mine_writes_it_again() {
+        let wid = WindowId(0);
+        let dir = fresh_dir("aterm-watch-deleted");
+        let path = dir.join("notes.md");
+        fs::write(&path, "disk one\n").unwrap();
+        let mut app = App::headless_for_test();
+        app.open_document_tab(AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        let views = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(views.0).unwrap();
+        commit(&mut app, wid, "mine ");
+        fs::remove_file(&path).unwrap();
+        app.native_document_file_changed(document.get());
+        assert_eq!(
+            app.document_store.snapshot(document).unwrap().text.as_ref(),
+            "mine disk one\n",
+            "a deleted file never empties its buffer"
+        );
+        assert_eq!(
+            disk_notice(&app, views.0),
+            Some(crate::native_app::DiskNotice::Gone)
+        );
+        assert_eq!(
+            app.native_documents
+                .recovery_status
+                .get(&document)
+                .map(String::as_str),
+            Some(crate::native_app::DISK_EXISTENCE_RECOVERY)
+        );
+        editor_action(&mut app, wid, "editor/keep-local").unwrap();
+        assert!(!app.native_documents.disk_conflicts.contains_key(&document));
+        assert_eq!(app.document_store.dirty(document), Some(true));
+        editor_action(&mut app, wid, "editor/save").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "mine disk one\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn undo_to_base_keeps_local_edits_saves_in_flight_and_binding_conflicts() {
         let wid = WindowId(0);
@@ -9952,7 +10774,7 @@ mod tests {
                 .enabled;
             let revert = artifact
                 .compiled
-                .semantic(&crate::native_ui::UiKey::new("editor/revert-button"))
+                .semantic(&crate::native_ui::UiKey::new("editor/disk-reload"))
                 .map(|node| node.state.unwrap().enabled);
             let conflict_recovery = artifact.compiled.paint.iter().any(|node| {
                 matches!(&node.content, crate::native_ui::UiContent::TextViewport(spec)
@@ -10032,7 +10854,7 @@ mod tests {
             let toolbar_enabled = app
                 .compiled_native_ui(wid)
                 .unwrap()
-                .semantic(&crate::native_ui::UiKey::new("editor/revert-button"))
+                .semantic(&crate::native_ui::UiKey::new("editor/disk-reload"))
                 .unwrap()
                 .state
                 .unwrap()
@@ -10108,7 +10930,7 @@ mod tests {
                 } else {
                     app.act_app(crate::app_control::ActRequest {
                         view,
-                        ui_key: "editor/revert-button".to_string(),
+                        ui_key: "editor/disk-reload".to_string(),
                         action: "editor/revert".to_string(),
                         value: None,
                     })
@@ -10726,6 +11548,55 @@ mod tests {
             panic!("recovered view must be Editor")
         };
         assert!(editor.recovery_status.is_some());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "disk\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A recovered draft is where the reopened buffer's undo starts: C-/
+    /// stops at it and says how to take the file's text instead, so the
+    /// draft stays unsaved and journaled, and closing still asks. Typing
+    /// after it undoes as usual (the negative control: Undo works there).
+    #[test]
+    fn undo_stops_at_a_recovered_draft_and_keeps_it_unsaved() {
+        let dir = fresh_dir("aterm-app-recovered-floor");
+        let path = dir.join("recover.md");
+        let journal_root = dir.join("private-drafts");
+        fs::write(&path, "disk\n").unwrap();
+        let uri = file_uri(&path);
+        {
+            let mut crashed = App::headless_for_test();
+            crashed.native_documents.journals = JournalSlot::for_test(journal_root.clone());
+            crashed.open_document_tab(AppKind::Editor, &uri).unwrap();
+            commit(&mut crashed, WindowId(0), "unsaved ");
+        }
+        let mut reopened = App::headless_for_test();
+        reopened.native_documents.journals = JournalSlot::for_test(journal_root.clone());
+        reopened.open_document_tab(AppKind::Editor, &uri).unwrap();
+        let views = reopened.active_native_view(WindowId(0)).unwrap();
+        let document = reopened.native_runtime.document_id(views.0).unwrap();
+        let text = |app: &App| app.document_store.snapshot(document).unwrap().text;
+        assert_eq!(text(&reopened).as_ref(), "unsaved disk\n");
+        assert!(
+            !reopened.editor_workspace.can_undo(document),
+            "Undo is off at the draft"
+        );
+        undo(&mut reopened, WindowId(0));
+        assert_eq!(
+            text(&reopened).as_ref(),
+            "unsaved disk\n",
+            "C-/ kept the draft"
+        );
+        assert_eq!(reopened.document_store.dirty(document), Some(true));
+        assert_eq!(
+            editor_status(&reopened, views.1),
+            crate::native_editor::RECOVERED_FLOOR
+        );
+
+        commit(&mut reopened, WindowId(0), "more ");
+        assert!(reopened.editor_workspace.can_undo(document));
+        undo(&mut reopened, WindowId(0));
+        assert_eq!(text(&reopened).as_ref(), "unsaved disk\n");
+        assert_eq!(reopened.document_store.dirty(document), Some(true));
         assert_eq!(fs::read_to_string(&path).unwrap(), "disk\n");
         let _ = fs::remove_dir_all(dir);
     }
@@ -11564,12 +12435,1075 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "theirs\n");
+        assert!(
+            app.native_documents.close_due,
+            "the discard escalates the close at the next park, not at some later save"
+        );
         assert_eq!(
             app.take_ready_document_shutdowns().unwrap(),
             (false, vec![wid]),
             "discard/reload is a complete recovery for a conflict-blocked window close"
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Window 0 holds its terminal (session 0) and an Editor whose edits a disk
+    /// change kept from saving, and the close of window 0 that the failed save
+    /// left armed (`close_window` arms it through
+    /// `prepare_window_document_shutdown`). `setup` runs once the Editor holds
+    /// its edits, before the save; it is handed the document's path.
+    fn failed_window_close<R>(
+        setup: impl FnOnce(&mut App, &std::path::Path) -> R,
+    ) -> (
+        aterm_tempfile::TempDir,
+        App,
+        DocumentId,
+        crate::tab_model::ViewId,
+        R,
+    ) {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("conflict.md");
+        fs::write(&path, "before\n").unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab_in_window(wid, AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        commit(&mut app, wid, "ours ");
+        let set = setup(&mut app, &path);
+        fs::write(&path, "theirs\n").unwrap();
+        assert!(
+            !app.prepare_window_document_shutdown(wid).unwrap(),
+            "the save meets the disk change and fails"
+        );
+        assert!(matches!(
+            app.document_store.phase(document),
+            Some(crate::document_store::DocumentPhase::Blocked { .. })
+        ));
+        assert!(
+            app.native_documents
+                .pending_window_closes
+                .contains_key(&wid)
+        );
+        (dir, app, document, view, set)
+    }
+
+    /// The person discards the blocked edits, which readies the armed close of
+    /// window 0; after `changed` it must not finish over that window.
+    fn assert_discard_drops_the_close(
+        app: &mut App,
+        document: DocumentId,
+        view: crate::tab_model::ViewId,
+        changed: &str,
+    ) {
+        let wid = WindowId(0);
+        app.discard_document_changes(document, view).unwrap();
+        assert!(app.native_documents.close_due);
+        assert_eq!(
+            app.take_ready_document_shutdowns().unwrap(),
+            (false, vec![]),
+            "the close resumed over a window that {changed} since it was asked"
+        );
+        assert!(
+            !app.native_documents
+                .pending_window_closes
+                .contains_key(&wid),
+            "the stale close is dropped, so the person closes the window again"
+        );
+        assert!(app.windows.contains_key(&wid));
+        assert_eq!(app.document_store.view_count(document), Some(1));
+        assert_eq!(
+            app.document_store.phase(document),
+            Some(crate::document_store::DocumentPhase::Active)
+        );
+    }
+
+    /// Session 0's shell starts `command` (OSC 133 marks: prompt, command line, run).
+    fn run_in_shell(app: &App, command: &str) {
+        crate::feed_session_for_test(
+            app,
+            0,
+            format!("\x1b]133;A\x07$ \x1b]133;B\x07{command}\n\x1b]133;C\x07").as_bytes(),
+        );
+        assert!(
+            app.session_foreground_busy(0),
+            "{command} runs in its shell"
+        );
+    }
+
+    #[test]
+    fn a_failed_window_close_does_not_resume_over_a_job_started_since() {
+        let (_dir, mut app, document, view, ()) = failed_window_close(|_, _| ());
+        run_in_shell(&app, "make");
+        assert_discard_drops_the_close(&mut app, document, view, "started a job");
+        assert!(app.pool.get(0).is_some(), "the build's terminal lives");
+    }
+
+    #[test]
+    fn a_failed_window_close_does_not_resume_over_a_job_that_replaced_the_one_asked_over() {
+        let (_dir, mut app, document, view, ()) =
+            failed_window_close(|app, _| run_in_shell(app, "tail -f build.log"));
+        crate::feed_session_for_test(&app, 0, b"\x1b]133;D;0\x07");
+        run_in_shell(&app, "vim notes");
+        assert_discard_drops_the_close(
+            &mut app,
+            document,
+            view,
+            "ended the job it was asked over and started another",
+        );
+    }
+
+    /// Control for the two above: the job the close was asked over, still
+    /// running, does not hold the close.
+    #[test]
+    fn a_failed_window_close_resumes_over_the_job_it_was_asked_over() {
+        let wid = WindowId(0);
+        let (_dir, mut app, document, view, ()) =
+            failed_window_close(|app, _| run_in_shell(app, "tail -f build.log"));
+        app.discard_document_changes(document, view).unwrap();
+        assert_eq!(
+            app.take_ready_document_shutdowns().unwrap(),
+            (false, vec![wid])
+        );
+    }
+
+    /// A shell with no command marks counts no finished commands, so the job
+    /// is told apart by its process group: the close asked over a `cat` does
+    /// not finish over the second `cat` the same command line ran once it ended.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_window_close_does_not_resume_over_an_unmarked_job_that_replaced_the_one_asked_over()
+    {
+        use crate::app_restore::crash_journal_program_tests::{
+            kill_all, spawn_leader, type_line, wait_for,
+        };
+        struct Shell(i32, i32);
+        impl Drop for Shell {
+            fn drop(&mut self) {
+                kill_all(&[self.1], &[self.0]);
+            }
+        }
+        let home = aterm_tempfile::tempdir().unwrap();
+        let (master, shell) = spawn_leader(&["/bin/sh", "-i"], home.path());
+        let _shell = Shell(master, shell);
+        let next_job = move |previous: i32| {
+            let mut group = -1;
+            wait_for("the next foreground job", || {
+                group = crate::quit_safety::foreground_pgrp(master);
+                group > 0 && group != shell && group != previous
+            });
+            group
+        };
+        let (_dir, mut app, document, view, asked_over) = failed_window_close(|app, _| {
+            let mut session = crate::stub_session(app.next_session_id);
+            session.master = master;
+            session.pid = shell;
+            app.push_stub_tab(WindowId(0), session);
+            type_line(master, "/bin/cat; /bin/cat\n");
+            next_job(-1)
+        });
+        type_line(master, "\x04");
+        let replacement = next_job(asked_over);
+        assert_discard_drops_the_close(
+            &mut app,
+            document,
+            view,
+            "ended the job it was asked over and started another",
+        );
+        kill_all(&[replacement], &[]);
+    }
+
+    #[test]
+    fn a_failed_window_close_does_not_resume_over_a_tab_opened_since() {
+        let wid = WindowId(0);
+        let (_dir, mut app, document, view, ()) = failed_window_close(|_, _| ());
+        let opened = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(opened));
+        assert_discard_drops_the_close(&mut app, document, view, "gained a terminal tab");
+        assert!(app.window_contains_session(wid, opened));
+    }
+
+    /// A dropped window close takes with it the split-leaf close it deferred;
+    /// left behind, that close would detach the leaf at some later save.
+    #[test]
+    fn a_dropped_window_close_takes_the_leaf_close_it_deferred() {
+        let wid = WindowId(0);
+        let (_dir, mut app, document, view, ()) = failed_window_close(|app, path| {
+            let (instance, view) = app.active_native_view(wid).unwrap();
+            let document = app.native_runtime.document_id(instance).unwrap();
+            let _ = app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Vertical);
+            let tab = tab_holding(app, wid, view);
+            fs::write(path, "theirs\n").unwrap();
+            app.prepare_document_view_close(wid, tab, document, view)
+                .unwrap_err();
+            assert!(
+                app.native_documents.pending_closes.contains_key(&document),
+                "the leaf close waits on the failed save"
+            );
+        });
+        let opened = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(opened));
+        assert_discard_drops_the_close(&mut app, document, view, "gained a terminal tab");
+        assert!(app.native_documents.pending_closes.is_empty());
+        app.save_document_checkpoint(document, view).unwrap();
+        assert!(
+            app.windows[&wid]
+                .tab_set
+                .tabs()
+                .iter()
+                .any(|tab| tab.root.contains(view)),
+            "a later save detached the leaf of a dropped close"
+        );
+    }
+
+    /// A document the armed close never planned (its tab came in after the
+    /// close was asked), whose leaf close the armed close deferred, is editable
+    /// again once that close is dropped.
+    #[test]
+    fn a_dropped_window_close_reopens_a_document_whose_leaf_close_it_deferred() {
+        let wid = WindowId(0);
+        let (dir, mut app, document, view, ()) = failed_window_close(|_, _| ());
+        let later_path = dir.path().join("later.md");
+        fs::write(&later_path, "later\n").unwrap();
+        app.open_document_tab_in_window(wid, AppKind::Editor, &file_uri(&later_path))
+            .unwrap();
+        let (instance, later_view) = app.active_native_view(wid).unwrap();
+        let later = app.native_runtime.document_id(instance).unwrap();
+        commit(&mut app, wid, "edit ");
+        let _ = app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Vertical);
+        let tab = tab_holding(&app, wid, later_view);
+        assert!(
+            !app.prepare_document_view_close(wid, tab, later, later_view)
+                .unwrap(),
+            "the leaf's save lands, and its close waits on the window close"
+        );
+        assert_eq!(app.document_store.dirty(later), Some(false));
+        assert!(app.native_documents.pending_closes.contains_key(&later));
+        assert_discard_drops_the_close(
+            &mut app,
+            document,
+            view,
+            "gained a terminal beside the later document",
+        );
+        assert_eq!(
+            app.document_store.phase(later),
+            Some(crate::document_store::DocumentPhase::Active),
+            "the later document stayed frozen after its deferred leaf close was dropped"
+        );
+        assert!(
+            app.windows[&wid]
+                .tab_set
+                .tabs()
+                .iter()
+                .any(|tab| tab.root.contains(later_view))
+        );
+    }
+
+    fn tab_holding(
+        app: &App,
+        wid: WindowId,
+        view: crate::tab_model::ViewId,
+    ) -> crate::tab_model::TabId {
+        app.windows[&wid]
+            .tab_set
+            .tabs()
+            .iter()
+            .find(|tab| tab.root.contains(view))
+            .unwrap()
+            .id
+    }
+
+    #[test]
+    fn a_failed_window_close_does_not_resume_once_its_window_is_the_last() {
+        let (_dir, mut app, document, view, other) = failed_window_close(|app, _| {
+            let session = app.next_session_id;
+            let other = app.insert_logical_window(crate::stub_session(session), 24, 80);
+            app.frontmost_window = Some(WindowId(0));
+            other
+        });
+        assert_eq!(app.close_window_logical(other), crate::CloseOutcome::Stay);
+        assert_discard_drops_the_close(
+            &mut app,
+            document,
+            view,
+            "became the last window (closing it quits aterm)",
+        );
+    }
+
+    /// Window 0 and a second window each hold an Editor whose edits a disk
+    /// change kept from saving, so each window's close is armed and waiting,
+    /// each asked while the other window was open. Answers the second window
+    /// and each window's document and view, in window order.
+    fn two_failed_window_closes() -> (
+        aterm_tempfile::TempDir,
+        App,
+        WindowId,
+        Vec<(DocumentId, crate::tab_model::ViewId)>,
+    ) {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let wid = WindowId(0);
+        let mut app = App::headless_for_test();
+        let session = app.next_session_id;
+        let other = app.insert_logical_window(crate::stub_session(session), 24, 80);
+        let mut armed = Vec::new();
+        for (window, name) in [(wid, "first.md"), (other, "second.md")] {
+            let path = dir.path().join(name);
+            fs::write(&path, "before\n").unwrap();
+            app.open_document_tab_in_window(window, AppKind::Editor, &file_uri(&path))
+                .unwrap();
+            let (instance, view) = app.active_native_view(window).unwrap();
+            let document = app.native_runtime.document_id(instance).unwrap();
+            commit(&mut app, window, "ours ");
+            fs::write(&path, "theirs\n").unwrap();
+            armed.push((document, view));
+        }
+        for window in [wid, other] {
+            assert!(!app.prepare_window_document_shutdown(window).unwrap());
+        }
+        (dir, app, other, armed)
+    }
+
+    /// Two closes ready in one pass: the second is weighed with the first
+    /// already gone, so together they do not quit aterm unasked.
+    #[test]
+    fn two_window_closes_ready_together_do_not_quit_without_asking() {
+        let wid = WindowId(0);
+        let (_dir, mut app, other, armed) = two_failed_window_closes();
+        for (document, view) in &armed {
+            app.discard_document_changes(*document, *view).unwrap();
+        }
+        assert_eq!(
+            app.take_ready_document_shutdowns().unwrap(),
+            (false, vec![wid]),
+            "both closes went, which quits aterm with no question"
+        );
+        assert!(
+            !app.native_documents
+                .pending_window_closes
+                .contains_key(&other)
+        );
+        assert_eq!(
+            app.document_store.phase(armed[1].0),
+            Some(crate::document_store::DocumentPhase::Active)
+        );
+    }
+
+    /// Window 0 holds its terminal and an Editor, a second window holds a
+    /// terminal, and the Editor's edits a disk change kept from saving armed a
+    /// close of window 0 that is still waiting.
+    fn failed_close_beside_another_window(
+        editor_only: bool,
+    ) -> (
+        aterm_tempfile::TempDir,
+        App,
+        WindowId,
+        DocumentId,
+        crate::tab_model::ViewId,
+    ) {
+        let (dir, app, document, view, other) = failed_window_close(|app, _| {
+            let session = app.next_session_id;
+            let other = app.insert_logical_window(crate::stub_session(session), 24, 80);
+            if editor_only {
+                // Window 0's terminal moves first, so the Editor is all it holds.
+                app.switch_tab_in(WindowId(0), 0);
+                app.migrate_active_tab_from_window(WindowId(0)).unwrap();
+                assert_eq!(app.windows[&WindowId(0)].tab_set.len(), 1);
+            }
+            app.frontmost_window = Some(WindowId(0));
+            other
+        });
+        (dir, app, other, document, view)
+    }
+
+    /// The person keeps editing the moved document in `other` and another save
+    /// escalates: nothing may freeze it, and the escalation must not fail.
+    fn assert_moved_document_stays_editable(
+        app: &mut App,
+        other: WindowId,
+        document: DocumentId,
+        view: crate::tab_model::ViewId,
+    ) {
+        app.discard_document_changes(document, view).unwrap();
+        commit(app, other, "kept ");
+        assert_eq!(app.document_store.dirty(document), Some(true));
+        assert_eq!(
+            app.take_ready_document_shutdowns().unwrap(),
+            (false, vec![]),
+            "a close armed for window 0 failed or finished an unrelated escalation"
+        );
+        assert_eq!(
+            app.document_store.phase(document),
+            Some(crate::document_store::DocumentPhase::Active),
+            "a close armed for window 0 froze a document now open in another window"
+        );
+        commit(app, other, "still ");
+        let text = app.document_store.snapshot(document).unwrap().text;
+        assert!(
+            text.contains("kept ") && text.contains("still "),
+            "every edit applies: {text:?}"
+        );
+        assert!(
+            app.native_documents.pending_window_closes.is_empty(),
+            "no close is left to hold every document release"
+        );
+    }
+
+    #[test]
+    fn a_window_emptied_by_a_tab_move_leaves_no_close_to_freeze_its_document() {
+        let wid = WindowId(0);
+        let (_dir, mut app, other, document, view) = failed_close_beside_another_window(true);
+        app.migrate_active_tab_from_window(wid).unwrap();
+        assert!(!app.windows.contains_key(&wid), "the emptied window closed");
+        assert!(
+            !app.native_documents
+                .pending_window_closes
+                .contains_key(&wid),
+            "the closed window's armed close went with it"
+        );
+        assert_eq!(
+            app.document_store.phase(document),
+            Some(crate::document_store::DocumentPhase::Active),
+            "the document is editable in the window it moved to"
+        );
+        assert_moved_document_stays_editable(&mut app, other, document, view);
+    }
+
+    #[test]
+    fn a_document_moved_out_of_a_window_whose_close_failed_stays_editable() {
+        let wid = WindowId(0);
+        let (_dir, mut app, other, document, view) = failed_close_beside_another_window(false);
+        app.migrate_active_tab_from_window(wid).unwrap();
+        assert!(
+            app.windows.contains_key(&wid),
+            "its terminal keeps window 0"
+        );
+        assert_moved_document_stays_editable(&mut app, other, document, view);
+        assert!(
+            app.windows.contains_key(&wid),
+            "window 0 does not close once the close's document left it"
+        );
+    }
+
+    /// A repeated close of a window whose document left it (after a save that
+    /// failed to write) releases that document; it saves and edits where it went.
+    #[test]
+    fn a_repeated_window_close_reopens_a_document_that_left_the_window() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("write-error.md");
+        fs::write(&path, "before\n").unwrap();
+        let wid = WindowId(0);
+        let mut app = App::headless_for_test();
+        let session = app.next_session_id;
+        let other = app.insert_logical_window(crate::stub_session(session), 24, 80);
+        app.open_document_tab_in_window(wid, AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        commit(&mut app, wid, "ours ");
+        assert!(
+            !app.prepare_window_document_shutdown_inner(wid, false)
+                .unwrap()
+        );
+        let pending = app.hold_document_save_for_test(document);
+        app.finish_native_document_save(
+            document,
+            view,
+            pending.plan.generation,
+            pending.plan.bytes,
+            crate::native_document_io::AtomicSaveResult::Failed {
+                stage: crate::native_document_io::AtomicSaveStage::WriteTemporary,
+                message: "No space left on device".to_string(),
+                cause: None,
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            app.document_store.phase(document),
+            Some(crate::document_store::DocumentPhase::Blocked { .. })
+        ));
+
+        app.migrate_active_tab_from_window(wid).unwrap();
+        assert!(
+            app.prepare_window_document_shutdown(wid).unwrap(),
+            "window 0 holds no document now"
+        );
+        assert_eq!(
+            app.document_store.phase(document),
+            Some(crate::document_store::DocumentPhase::Active),
+            "the replaced close left the moved document frozen"
+        );
+        app.save_document_checkpoint(document, view).unwrap();
+        commit(&mut app, other, "more ");
+        let text = app.document_store.snapshot(document).unwrap().text;
+        assert!(text.contains("more "), "the edit applies: {text:?}");
+    }
+
+    /// In window 0, beside its armed close, `later.md` is edited, split with a
+    /// terminal and its leaf closed: the leaf's save lands and its close waits
+    /// on the window close. Answers the document, its leaf and its tab.
+    fn deferred_leaf_close(
+        app: &mut App,
+        dir: &std::path::Path,
+    ) -> (
+        DocumentId,
+        crate::tab_model::ViewId,
+        crate::tab_model::TabId,
+    ) {
+        let wid = WindowId(0);
+        let later_path = dir.join("later.md");
+        fs::write(&later_path, "later\n").unwrap();
+        app.open_document_tab_in_window(wid, AppKind::Editor, &file_uri(&later_path))
+            .unwrap();
+        let (instance, later_view) = app.active_native_view(wid).unwrap();
+        let later = app.native_runtime.document_id(instance).unwrap();
+        commit(app, wid, "edit ");
+        let _ = app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Vertical);
+        let tab = tab_holding(app, wid, later_view);
+        assert!(
+            !app.prepare_document_view_close(wid, tab, later, later_view)
+                .unwrap()
+        );
+        assert_eq!(app.document_store.dirty(later), Some(false));
+        assert!(matches!(
+            app.document_store.phase(later),
+            Some(crate::document_store::DocumentPhase::Closing { .. })
+        ));
+        (later, later_view, tab)
+    }
+
+    /// `later`'s leaf closed in `window`, where its tab went: the tab keeps
+    /// its terminal, and nothing is left frozen or queued.
+    fn assert_leaf_closed_where_it_went(
+        app: &App,
+        window: WindowId,
+        tab: crate::tab_model::TabId,
+        later: DocumentId,
+        later_view: crate::tab_model::ViewId,
+    ) {
+        let tab = app.windows[&window]
+            .tab_set
+            .get(tab)
+            .expect("the tab stays in the window it moved to");
+        assert!(
+            !tab.root.contains(later_view),
+            "the leaf the person closed is still there"
+        );
+        assert!(
+            !matches!(
+                app.document_store.phase(later),
+                Some(
+                    crate::document_store::DocumentPhase::Closing { .. }
+                        | crate::document_store::DocumentPhase::Blocked { .. }
+                )
+            ),
+            "the closed leaf's document is left frozen"
+        );
+        assert!(app.native_documents.pending_closes.is_empty());
+    }
+
+    /// A leaf close the armed window close deferred, whose tab then moved to
+    /// another window, belongs to that window now: the window close commits
+    /// without it, and the leaf then closes where its tab went.
+    #[test]
+    fn a_committed_window_close_leaves_the_leaf_close_of_a_tab_that_moved_out_to_finish() {
+        let wid = WindowId(0);
+        let (dir, mut app, document, view, other) = failed_window_close(|app, _| {
+            let session = app.next_session_id;
+            let other = app.insert_logical_window(crate::stub_session(session), 24, 80);
+            app.frontmost_window = Some(WindowId(0));
+            other
+        });
+        let (later, later_view, tab) = deferred_leaf_close(&mut app, dir.path());
+        app.migrate_active_tab_from_window(wid).unwrap();
+        assert!(app.windows[&other].tab_set.get(tab).is_some());
+        app.discard_document_changes(document, view).unwrap();
+        assert_eq!(
+            app.take_ready_document_shutdowns().unwrap(),
+            (false, vec![wid])
+        );
+        assert_eq!(app.close_window_logical(wid), crate::CloseOutcome::Stay);
+        app.release_documents_at_park();
+        assert_leaf_closed_where_it_went(&app, other, tab, later, later_view);
+    }
+
+    /// The same, when the person closes window 0 again after moving every
+    /// document out of it: the new close commits at once, holding nothing.
+    #[test]
+    fn a_repeated_window_close_leaves_the_leaf_close_of_a_tab_that_moved_out_to_finish() {
+        let wid = WindowId(0);
+        let (dir, mut app, document, view, other) = failed_window_close(|app, _| {
+            let session = app.next_session_id;
+            let other = app.insert_logical_window(crate::stub_session(session), 24, 80);
+            app.frontmost_window = Some(WindowId(0));
+            other
+        });
+        let (later, later_view, tab) = deferred_leaf_close(&mut app, dir.path());
+        app.migrate_active_tab_from_window(wid).unwrap();
+        let notes = app.windows[&wid]
+            .tab_set
+            .tabs()
+            .iter()
+            .position(|tab| tab.root.contains(view))
+            .unwrap();
+        app.switch_tab_in(wid, notes);
+        app.migrate_active_tab_from_window(wid).unwrap();
+        assert!(
+            app.prepare_window_document_shutdown(wid).unwrap(),
+            "window 0 holds no document now"
+        );
+        assert_eq!(
+            app.document_store.phase(document),
+            Some(crate::document_store::DocumentPhase::Active),
+            "the replaced close reopens the document it froze"
+        );
+        app.release_documents_at_park();
+        assert_leaf_closed_where_it_went(&app, other, tab, later, later_view);
+    }
+
+    /// A leaf close whose save failed, and whose tab then moved to another
+    /// window, finishes there once a later save lands.
+    #[test]
+    fn a_leaf_close_whose_tab_moved_finishes_where_it_went_once_its_save_lands() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("later.md");
+        fs::write(&path, "later\n").unwrap();
+        let wid = WindowId(0);
+        let mut app = App::headless_for_test();
+        let other = app.insert_logical_window(crate::stub_session(app.next_session_id), 24, 80);
+        app.frontmost_window = Some(wid);
+        app.open_document_tab_in_window(wid, AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        let (instance, later_view) = app.active_native_view(wid).unwrap();
+        let later = app.native_runtime.document_id(instance).unwrap();
+        commit(&mut app, wid, "edit ");
+        let _ = app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Vertical);
+        let tab = tab_holding(&app, wid, later_view);
+        let held = app.hold_document_save_for_test(later);
+        assert!(
+            !app.prepare_document_view_close(wid, tab, later, later_view)
+                .unwrap()
+        );
+        app.finish_native_document_save(
+            later,
+            later_view,
+            held.plan.generation,
+            held.plan.bytes,
+            crate::native_document_io::AtomicSaveResult::Failed {
+                stage: crate::native_document_io::AtomicSaveStage::WriteTemporary,
+                message: "No space left on device".to_string(),
+                cause: None,
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            app.document_store.phase(later),
+            Some(crate::document_store::DocumentPhase::Blocked { .. })
+        ));
+        assert!(app.native_documents.pending_closes.contains_key(&later));
+
+        app.migrate_active_tab_from_window(wid).unwrap();
+        app.save_document_checkpoint(later, later_view).unwrap();
+        assert_leaf_closed_where_it_went(&app, other, tab, later, later_view);
+    }
+
+    /// A document open in two windows can leave one of them unsaved, so the
+    /// close of the first window armed without saving it. Once the second
+    /// window closed, the first window's close must save it before it goes:
+    /// its ready edge freezes no document it does not then save.
+    #[test]
+    fn a_window_close_saves_a_document_whose_other_window_closed_since() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let wid = WindowId(0);
+        let shared_path = dir.path().join("shared.md");
+        let conflict_path = dir.path().join("conflict.md");
+        fs::write(&shared_path, "shared\n").unwrap();
+        fs::write(&conflict_path, "before\n").unwrap();
+        let mut app = App::headless_for_test();
+        let twin = app.insert_logical_window(crate::stub_session(app.next_session_id), 24, 80);
+        let _third = app.insert_logical_window(crate::stub_session(app.next_session_id), 24, 80);
+        app.open_document_tab_in_window(wid, AppKind::Editor, &file_uri(&shared_path))
+            .unwrap();
+        let (instance, _) = app.active_native_view(wid).unwrap();
+        let shared = app.native_runtime.document_id(instance).unwrap();
+        commit(&mut app, wid, "unsaved ");
+        app.open_document_tab_in_window(twin, AppKind::Editor, &file_uri(&shared_path))
+            .unwrap();
+        let (twin_instance, _) = app.active_native_view(twin).unwrap();
+        assert_eq!(app.native_runtime.document_id(twin_instance), Some(shared));
+        app.open_document_tab_in_window(wid, AppKind::Editor, &file_uri(&conflict_path))
+            .unwrap();
+        let (conflict_instance, conflict_view) = app.active_native_view(wid).unwrap();
+        let conflict = app.native_runtime.document_id(conflict_instance).unwrap();
+        commit(&mut app, wid, "ours ");
+        fs::write(&conflict_path, "theirs\n").unwrap();
+        assert!(!app.prepare_window_document_shutdown(wid).unwrap());
+        assert_eq!(
+            app.document_store.phase(shared),
+            Some(crate::document_store::DocumentPhase::Active),
+            "its view in the twin window kept the shared document out of the save"
+        );
+        assert!(app.prepare_window_document_shutdown(twin).unwrap());
+        assert_eq!(app.close_window_logical(twin), crate::CloseOutcome::Stay);
+
+        app.discard_document_changes(conflict, conflict_view)
+            .unwrap();
+        assert_eq!(
+            app.take_ready_document_shutdowns().unwrap(),
+            (false, vec![]),
+            "the shared document still owes its save"
+        );
+        assert_eq!(
+            app.document_store.dirty(shared),
+            Some(false),
+            "the ready edge froze the shared document without saving it"
+        );
+        assert_eq!(
+            app.take_ready_document_shutdowns().unwrap(),
+            (false, vec![wid]),
+            "the close finishes once the save it started lands"
+        );
+    }
+
+    /// A close that comes ready while an update handoff is in flight is the
+    /// handoff's to replay, with every document leaf still attached for it.
+    #[cfg(unix)]
+    #[test]
+    fn a_window_close_ready_during_an_update_handoff_detaches_nothing_before_its_replay() {
+        let wid = WindowId(0);
+        let (_dir, mut app, document, view, ()) = failed_window_close(|_, _| ());
+        let cancelled = crate::overlap_handoff_tests::arm_outgoing_handoff(&mut app);
+        app.discard_document_changes(document, view).unwrap();
+        assert_eq!(
+            app.take_ready_document_shutdowns().unwrap(),
+            (false, vec![])
+        );
+        assert_eq!(
+            app.document_store.view_count(document),
+            Some(1),
+            "the documents were detached before the handoff deferred the close"
+        );
+        assert!(
+            cancelled.try_recv().is_ok(),
+            "the handoff was asked to stop"
+        );
+        assert!(matches!(
+            app.pending_update_handoff.as_ref().map(|pending| &pending.teardown),
+            Some(crate::DeferredHandoffTeardown::Mutations(mutations))
+                if mutations.contains_key(&crate::DeferredHandoffMutation::CloseWindow(wid))
+        ));
+        // The handoff rolls back and replays `close_window`.
+        app.pending_update_handoff = None;
+        assert!(
+            app.prepare_window_document_shutdown(wid).unwrap(),
+            "the replayed close's document barrier commits"
+        );
+        assert_eq!(app.document_store.view_count(document), Some(0));
+    }
+
+    /// A close armed for a window that is gone by a path that did not drop it
+    /// neither freezes its document nor costs another window its close.
+    #[test]
+    fn a_close_armed_for_a_vanished_window_costs_no_other_window_its_close() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first.md");
+        let second_path = dir.path().join("second.md");
+        fs::write(&first_path, "first\n").unwrap();
+        fs::write(&second_path, "second\n").unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let session = app.next_session_id;
+        let other = app.insert_logical_window(crate::stub_session(session), 24, 80);
+        app.open_document_tab_in_window(wid, AppKind::Editor, &file_uri(&first_path))
+            .unwrap();
+        let (first_instance, first_view) = app.active_native_view(wid).unwrap();
+        let first = app.native_runtime.document_id(first_instance).unwrap();
+        commit(&mut app, wid, "safe ");
+        app.open_document_tab_in_window(other, AppKind::Editor, &file_uri(&second_path))
+            .unwrap();
+        let (second_instance, _) = app.active_native_view(other).unwrap();
+        let second = app.native_runtime.document_id(second_instance).unwrap();
+        commit(&mut app, other, "open ");
+
+        assert!(
+            !app.prepare_window_document_shutdown_inner(other, false)
+                .unwrap()
+        );
+        let vanished = WindowId(app.next_window_id + 1);
+        let stale = app
+            .native_documents
+            .pending_window_closes
+            .remove(&other)
+            .unwrap();
+        app.native_documents
+            .pending_window_closes
+            .insert(vanished, stale);
+        assert!(
+            !app.prepare_window_document_shutdown_inner(wid, false)
+                .unwrap()
+        );
+        app.save_document_checkpoint(first, first_view).unwrap();
+        assert_eq!(
+            app.take_ready_document_shutdowns().unwrap(),
+            (false, vec![wid])
+        );
+        assert!(
+            !app.native_documents
+                .pending_window_closes
+                .contains_key(&vanished)
+        );
+        assert_eq!(
+            app.document_store.phase(second),
+            Some(crate::document_store::DocumentPhase::Active)
+        );
+    }
+
+    /// The window closes a pending update handoff holds to replay.
+    #[cfg(unix)]
+    fn closes_behind_the_handoff(app: &App) -> Vec<WindowId> {
+        match app
+            .pending_update_handoff
+            .as_ref()
+            .map(|pending| &pending.teardown)
+        {
+            Some(crate::DeferredHandoffTeardown::Mutations(mutations)) => mutations
+                .keys()
+                .filter_map(|mutation| match mutation {
+                    crate::DeferredHandoffMutation::CloseWindow(window) => Some(*window),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The handoff rolls back: its record is taken, as the completion
+    /// reducer takes it, and the closes it deferred replay.
+    #[cfg(unix)]
+    fn replay_returned_handoff(app: &mut App) -> crate::CloseOutcome {
+        let pending = app
+            .pending_update_handoff
+            .take()
+            .expect("a pending handoff");
+        match pending.teardown {
+            crate::DeferredHandoffTeardown::Mutations(mutations) => {
+                app.replay_deferred_handoff_mutations(mutations)
+            }
+            other => panic!("the handoff holds {other:?}, not the closes"),
+        }
+    }
+
+    /// The second window's close was dropped, not handed to the handoff: the
+    /// window stays, and its document is editable.
+    #[cfg(unix)]
+    fn assert_close_dropped_beside_the_handoff(app: &App, window: WindowId, document: DocumentId) {
+        assert!(
+            !closes_behind_the_handoff(app).contains(&window),
+            "the handoff will close window {} too, which quits aterm with no question",
+            window.0
+        );
+        assert!(
+            !app.native_documents
+                .pending_window_closes
+                .contains_key(&window)
+        );
+        assert_eq!(
+            app.document_store.phase(document),
+            Some(crate::document_store::DocumentPhase::Active)
+        );
+    }
+
+    /// Two closes ready in one pass while an update handoff is in flight: the
+    /// first is the handoff's to replay and counts as gone, so the second,
+    /// which would then close the last window, is dropped, and the replay
+    /// closes only the first.
+    #[cfg(unix)]
+    #[test]
+    fn two_window_closes_ready_during_an_update_handoff_do_not_quit_without_asking() {
+        let wid = WindowId(0);
+        let (_dir, mut app, other, armed) = two_failed_window_closes();
+        let _cancelled = crate::overlap_handoff_tests::arm_outgoing_handoff(&mut app);
+        for (document, view) in &armed {
+            app.discard_document_changes(*document, *view).unwrap();
+        }
+        assert_eq!(
+            app.take_ready_document_shutdowns().unwrap(),
+            (false, vec![])
+        );
+        assert_eq!(closes_behind_the_handoff(&app), vec![wid]);
+        assert_close_dropped_beside_the_handoff(&app, other, armed[1].0);
+        assert_eq!(
+            replay_returned_handoff(&mut app),
+            crate::CloseOutcome::Stay,
+            "the replay quit aterm with no question"
+        );
+        assert!(!app.windows.contains_key(&wid));
+        assert!(app.windows.contains_key(&other));
+    }
+
+    /// The same when the two closes come ready in separate passes: the first,
+    /// still armed behind the handoff, counts as gone when the second is weighed.
+    #[cfg(unix)]
+    #[test]
+    fn a_window_close_waiting_behind_an_update_handoff_counts_as_gone_in_a_later_pass() {
+        let wid = WindowId(0);
+        let (_dir, mut app, other, armed) = two_failed_window_closes();
+        let _cancelled = crate::overlap_handoff_tests::arm_outgoing_handoff(&mut app);
+        app.discard_document_changes(armed[0].0, armed[0].1)
+            .unwrap();
+        assert_eq!(
+            app.take_ready_document_shutdowns().unwrap(),
+            (false, vec![])
+        );
+        assert_eq!(closes_behind_the_handoff(&app), vec![wid]);
+        app.discard_document_changes(armed[1].0, armed[1].1)
+            .unwrap();
+        assert_eq!(
+            app.take_ready_document_shutdowns().unwrap(),
+            (false, vec![])
+        );
+        assert_close_dropped_beside_the_handoff(&app, other, armed[1].0);
+    }
+
+    /// While window 0's close waits behind an update handoff, closing the
+    /// other window would close the last one, so its question asks about
+    /// quitting (here the question a busy window's close queues).
+    #[cfg(unix)]
+    #[test]
+    fn a_close_asked_while_another_waits_behind_an_update_handoff_asks_about_quitting() {
+        let (_dir, mut app, document, view, (other, session)) = failed_window_close(|app, _| {
+            let session = app.next_session_id;
+            let other = app.insert_logical_window(crate::stub_session(session), 24, 80);
+            app.frontmost_window = Some(WindowId(0));
+            (other, session)
+        });
+        let _cancelled = crate::overlap_handoff_tests::arm_outgoing_handoff(&mut app);
+        app.discard_document_changes(document, view).unwrap();
+        assert_eq!(
+            app.take_ready_document_shutdowns().unwrap(),
+            (false, vec![])
+        );
+        assert_eq!(closes_behind_the_handoff(&app), vec![WindowId(0)]);
+        crate::feed_session_for_test(
+            &app,
+            session,
+            b"\x1b]133;A\x07$ \x1b]133;B\x07make\n\x1b]133;C\x07",
+        );
+        app.close_banner_queue
+            .push(crate::close_confirm::PendingClose::new(
+                other,
+                crate::quit_safety::busy_view_close_prompt(false),
+                crate::close_confirm::CloseReplay::Window(other),
+                crate::session_store::ExitActor::Human,
+            ));
+        app.ask_next_queued_close();
+        assert_eq!(
+            app.close_banner.as_ref().map(|banner| banner.prompt.title),
+            Some("Are you sure you want to quit aterm?"),
+            "closing the other window quits aterm once the handoff replays both closes"
+        );
+    }
+
+    /// A plain close of a lower window, deferred beside a close that waits
+    /// behind an update handoff, replays first; the armed close then would
+    /// close the last window, so it is dropped rather than quit unasked.
+    #[cfg(unix)]
+    #[test]
+    fn a_replayed_window_close_that_became_the_last_is_dropped() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("conflict.md");
+        fs::write(&path, "before\n").unwrap();
+        let wid = WindowId(0);
+        let mut app = App::headless_for_test();
+        let session = app.next_session_id;
+        let other = app.insert_logical_window(crate::stub_session(session), 24, 80);
+        app.open_document_tab_in_window(other, AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        let (instance, view) = app.active_native_view(other).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        commit(&mut app, other, "ours ");
+        fs::write(&path, "theirs\n").unwrap();
+        assert!(!app.prepare_window_document_shutdown(other).unwrap());
+        let _cancelled = crate::overlap_handoff_tests::arm_outgoing_handoff(&mut app);
+        app.discard_document_changes(document, view).unwrap();
+        assert_eq!(
+            app.take_ready_document_shutdowns().unwrap(),
+            (false, vec![])
+        );
+        assert_eq!(app.close_window_logical(wid), crate::CloseOutcome::Stay);
+        assert_eq!(closes_behind_the_handoff(&app), vec![wid, other]);
+        assert_eq!(
+            replay_returned_handoff(&mut app),
+            crate::CloseOutcome::Stay,
+            "the armed close finished over the last window and quit aterm unasked"
+        );
+        assert!(!app.windows.contains_key(&wid));
+        assert!(app.windows.contains_key(&other));
+        assert!(app.native_documents.pending_window_closes.is_empty());
+        assert_eq!(
+            app.document_store.phase(document),
+            Some(crate::document_store::DocumentPhase::Active)
+        );
+    }
+
+    /// A Quit that arrives while an update handoff holds a window's close
+    /// replaces that close (it dominates the teardown). When the handoff
+    /// returns, the close it no longer holds is disarmed: the window stays,
+    /// its document is editable, and no later save closes the window.
+    #[cfg(unix)]
+    #[test]
+    fn a_window_close_a_quit_replaced_behind_an_update_handoff_is_disarmed() {
+        let (_dir, mut app, document, view, ()) = failed_window_close(|_, _| ());
+        let _cancelled = crate::overlap_handoff_tests::arm_outgoing_handoff(&mut app);
+        app.discard_document_changes(document, view).unwrap();
+        assert_eq!(
+            app.take_ready_document_shutdowns().unwrap(),
+            (false, vec![])
+        );
+        assert_eq!(closes_behind_the_handoff(&app), vec![WindowId(0)]);
+        assert!(
+            app.defer_pending_update_handoff_teardown(
+                crate::DeferredHandoffTeardown::QuitRequested
+            )
+        );
+        assert!(
+            closes_behind_the_handoff(&app).is_empty(),
+            "PRECONDITION: the Quit replaced the close"
+        );
+
+        let attempt_id = app
+            .pending_update_handoff
+            .as_ref()
+            .expect("a pending handoff")
+            .attempt_id;
+        let teardown = app.reduce_returned_handoff_completion(crate::UpdateHandoffCompletion {
+            attempt_id,
+            nonce: None,
+            child_pid: None,
+            outcome: crate::UpdateHandoffOutcome::ActivityRevoked,
+            commit_fd: None,
+            reject: None,
+            reconcile: None,
+            detail: "stood down".to_string(),
+            input_drain_spins: 0,
+            child_death: crate::ChildDeathEvidence::Unobserved,
+        });
+        assert_eq!(
+            teardown,
+            Some(crate::DeferredHandoffTeardown::QuitRequested)
+        );
+        assert!(
+            app.native_documents.pending_window_closes.is_empty(),
+            "the close the Quit replaced is disarmed"
+        );
+        assert!(app.windows.contains_key(&WindowId(0)));
+        assert_eq!(
+            app.document_store.phase(document),
+            Some(crate::document_store::DocumentPhase::Active),
+            "its document is editable"
+        );
     }
 
     #[test]

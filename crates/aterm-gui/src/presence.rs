@@ -1703,7 +1703,8 @@ mod tests {
             let text = format!("{}:{:02}", tod / 3600, (tod % 3600) / 60);
             let ahead = countdown_to_reset(&text).expect("placeable");
             assert!(
-                (Duration::from_secs(2 * 3600 - 61)..=Duration::from_secs(2 * 3600))
+                (Duration::from_secs(2 * 3600 - 60) - aterm_spec::wait::MUST_HAPPEN
+                    ..=Duration::from_secs(2 * 3600))
                     .contains(&ahead),
                 "{text}: {ahead:?}"
             );

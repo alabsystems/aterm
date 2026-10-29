@@ -59,7 +59,7 @@ impl PerlClass {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ClassSet {
     /// Sorted, disjoint, inclusive ranges.
-    ranges: Vec<(char, char)>,
+    pub(crate) ranges: Vec<(char, char)>,
     perls: Vec<PerlClass>,
     negated: bool,
 }

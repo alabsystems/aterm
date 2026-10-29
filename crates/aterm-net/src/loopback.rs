@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The isolated drive's guard: in a debug build, `ATERM_DEBUG_LOOPBACK_ONLY=1` refuses every
-//! fleet listen, dial and name lookup that would leave this machine's loopback, before its
+//! fleet listen, dial, name lookup and Bonjour browse that would leave this machine's loopback, before its
 //! syscall. A release build never reads it.
 
 use std::io;
@@ -20,11 +20,14 @@ pub enum Reach<'a> {
     Dial(SocketAddr),
     /// Ask the system resolver for this word's addresses.
     Lookup(&'a str),
+    /// Ask Bonjour for this service on the network.
+    Browse(&'a str),
 }
 
 /// `Err` (`PermissionDenied`, naming the guard and the address or word) where the guard is on and
 /// `reach` leaves the loopback: a listen on or a dial of any address but 127/8 and `::1`, or a
-/// lookup of a word that is no IP literal or `localhost`. `Ok` wherever the guard is off.
+/// lookup of a word that is no IP literal or `localhost`, or any Bonjour browse
+/// (whose native API cannot confine itself to loopback). `Ok` wherever the guard is off.
 pub fn check(reach: Reach<'_>) -> io::Result<()> {
     if !on() {
         return Ok(());
@@ -39,6 +42,7 @@ pub fn check(reach: Reach<'_>) -> io::Result<()> {
         Reach::Listen(at) => ("a listen on", at.to_string()),
         Reach::Dial(at) => ("a dial of", at.to_string()),
         Reach::Lookup(word) => ("a lookup of", format!("{word:?}")),
+        Reach::Browse(service) => ("a Bonjour browse of", format!("{service:?}")),
     };
     Err(io::Error::new(
         io::ErrorKind::PermissionDenied,
@@ -95,6 +99,7 @@ mod tests {
             Reach::Lookup("mac"),
             Reach::Lookup("localhost.local"),
             Reach::Lookup("localhost."),
+            Reach::Browse("_alab._tcp"),
         ];
         for reach in off_loopback {
             let refused = forced(true, || check(reach)).expect_err("refused");
@@ -106,7 +111,7 @@ mod tests {
             );
             let place = match reach {
                 Reach::Listen(at) | Reach::Dial(at) => at.to_string(),
-                Reach::Lookup(word) => format!("{word:?}"),
+                Reach::Lookup(word) | Reach::Browse(word) => format!("{word:?}"),
             };
             assert!(said.contains(&place), "{said}");
             assert!(

@@ -1124,6 +1124,17 @@ mod imp_windows {
         exception_information: [usize; 15],
     }
 
+    #[cfg(target_pointer_width = "64")]
+    const _: () = {
+        use core::mem::offset_of;
+        assert!(offset_of!(ExceptionRecord, exception_code) == 0);
+        assert!(offset_of!(ExceptionRecord, exception_flags) == 4);
+        assert!(offset_of!(ExceptionRecord, exception_record) == 8);
+        assert!(offset_of!(ExceptionRecord, exception_address) == 16);
+        assert!(offset_of!(ExceptionRecord, number_parameters) == 24);
+        assert!(offset_of!(ExceptionRecord, exception_information) == 32);
+    };
+
     const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC000_0005;
 
     const BANNER_PREFIX: &[u8] = b"aterm: fatal exception 0x";
@@ -1333,26 +1344,6 @@ mod imp_windows {
             }
         }
 
-        #[cfg(target_pointer_width = "64")]
-        #[test]
-        fn exception_record_layout_matches_native_offsets() {
-            assert_eq!(core::mem::offset_of!(ExceptionRecord, exception_code), 0);
-            assert_eq!(core::mem::offset_of!(ExceptionRecord, exception_flags), 4);
-            assert_eq!(core::mem::offset_of!(ExceptionRecord, exception_record), 8);
-            assert_eq!(
-                core::mem::offset_of!(ExceptionRecord, exception_address),
-                16
-            );
-            assert_eq!(
-                core::mem::offset_of!(ExceptionRecord, number_parameters),
-                24
-            );
-            assert_eq!(
-                core::mem::offset_of!(ExceptionRecord, exception_information),
-                32
-            );
-        }
-
         #[test]
         fn install_is_idempotent() {
             let _one_at_a_time = super::super::PROCESS_MARKER_TEST_LOCK
@@ -1401,8 +1392,8 @@ mod imp_windows {
 static PROCESS_MARKER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The Windows clean-exit release, tested at the seam both platforms share:
-/// the rule, the removal (plain `std`, so every host runs it), and the harmless
-/// no-op when nothing was armed.
+/// the rule and the removal (plain `std`, so every host runs it), and on Windows,
+/// where the release does something, the harmless no-op when nothing was armed.
 #[cfg(all(test, any(unix, windows)))]
 mod clean_exit_tests {
     use super::*;
@@ -1425,15 +1416,14 @@ mod clean_exit_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(windows)]
     #[test]
     fn release_without_an_armed_marker_is_a_harmless_no_op() {
-        #[cfg(windows)]
         let _one_at_a_time = PROCESS_MARKER_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         remove_marker_on_clean_exit();
         remove_marker_on_clean_exit();
-        #[cfg(windows)]
         assert_eq!(
             imp_windows::MARKER_HANDLE.load(std::sync::atomic::Ordering::SeqCst),
             -1

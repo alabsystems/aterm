@@ -49,6 +49,7 @@ mod provision;
 mod publish;
 
 mod release;
+mod release_keychain;
 mod release_steps;
 mod sign;
 

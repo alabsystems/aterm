@@ -52,7 +52,10 @@ pub struct Reading {
     pub load1: Option<f64>,
     /// The 5-minute load average.
     pub load5: Option<f64>,
-    /// Memory the kernel can hand out without paging anything out (free, inactive and purgeable pages), bytes.
+    /// Memory a claim can take now, bytes: on macOS what [`claimable`] reads (free pages, the
+    /// inactive ones file-backed pages could fill, purgeable pages, and what compressing the
+    /// anonymous inactive rest frees at the compressor's ratio); elsewhere what the kernel
+    /// reports available (`aterm_sysprobe::machine_memory`, Linux's `MemAvailable`).
     pub available: Option<u64>,
     /// Physical memory, bytes.
     pub physical: Option<u64>,
@@ -67,6 +70,10 @@ pub struct Reading {
     pub swap_total: Option<u64>,
     /// The volume holding the path the reading was taken for.
     pub volume: Option<Volume>,
+    /// The kernel's memory pressure level (macOS `kern.memorystatus_vm_pressure_level`,
+    /// `aterm_sysprobe::memory_pressure`): at [`aterm_sysprobe::MemoryLevel::Critical`], about to
+    /// end processes, no memory claim is admitted ([`crate::Short::Pressure`]). `None` off macOS.
+    pub pressure: Option<aterm_sysprobe::MemoryLevel>,
 }
 
 impl Reading {
@@ -78,11 +85,11 @@ impl Reading {
 
     /// THE MOST MEMORY THAT CAN EVER BE AVAILABLE HERE, bytes: physical memory less what is
     /// wired ([`Self::wired`]), or all of it where nothing wired is read. Available memory
-    /// (free, inactive and purgeable pages) never holds a wired page, nor the active and
-    /// compressed pages of a process that still runs, so it always stays below this, and a need
-    /// of this much or more never fits ([`crate::never`]). This Mac (48 GiB, 2026-10-25): 3.6
-    /// GiB wired, so 44.4 GiB, with 21 to 27 GiB available under its usual load. `None` where
-    /// physical memory is unread.
+    /// ([`Self::available`]) never holds a wired page, an active one, nor what the compressor
+    /// occupies, so it always stays below this, and a need of this much or more never fits
+    /// ([`crate::never`] refuses it, unless it asks to run alone). This Mac (48 GiB,
+    /// 2026-10-25): 3.6 GiB wired, so 44.4 GiB, with 21 to 27 GiB of free, inactive and
+    /// purgeable pages under its usual load. `None` where physical memory is unread.
     #[must_use]
     pub fn reachable(&self) -> Option<u64> {
         self.physical
@@ -143,6 +150,47 @@ fn tenths(bytes: u64) -> f64 {
     (bytes as f64 / GIB as f64 * 10.0).round() / 10.0
 }
 
+/// THE MEMORY A CLAIM CAN TAKE ON A MAC NOW, bytes (CLAIMABLE), from one read of its page
+/// queues `d`; `None` where they are unread (off macOS, whose kernels report what is available
+/// themselves). It counts
+/// - the free pages, the speculative ones included;
+/// - the inactive pages as far as file-backed pages could fill the inactive queue: the kernel
+///   drops a file-backed page and reads it back from its file when it is touched;
+/// - the purgeable pages, which their owners let the kernel drop;
+/// - of the anonymous inactive pages the rest of that queue holds, what compressing them frees at
+///   the ratio the compressor holds now (`1 - occupied / stored`): the kernel compresses an idle
+///   anonymous page before it swaps anything. With nothing in the compressor no ratio is read,
+///   and they count for nothing;
+///
+/// and never more than physical memory. Not the kernel's `kern.memorystatus_level`, which counts
+/// the active queue too: on this 24 GiB Mac on 2026-10-29 it read 78% while the free, active,
+/// inactive and speculative pages were 77% of memory, and it read 85% beside 12.5 GB of swap
+/// the night before. Not every inactive page either (`aterm_sysprobe::available_mib_of`, what
+/// the window and the agents' ceilings read): an anonymous one is given back only by compressing
+/// or swapping it. At one look that night (85% by `memory_pressure`, pressure normal, 0.09 GiB
+/// free, 9.92 GiB inactive, 2.62 GiB file-backed, the compressor holding 1.51 GiB in 0.64),
+/// this reads about 6.9 GiB, every inactive page 10.0, and the file-backed ones alone 2.7.
+#[must_use]
+pub fn claimable(d: &aterm_sysprobe::MemoryDetail) -> Option<u64> {
+    let inactive = d.inactive?;
+    let purgeable = d.purgeable?;
+    let free = d.free.saturating_add(d.speculative.unwrap_or(0));
+    let dropped = inactive.min(d.file_backed);
+    let anonymous = inactive - dropped;
+    let compressed = match (d.compressed, d.stored) {
+        (Some(occupied), Some(stored)) if stored > 0 && occupied < stored => {
+            let freed = u128::from(anonymous) * u128::from(stored - occupied) / u128::from(stored);
+            u64::try_from(freed).unwrap_or(anonymous)
+        }
+        _ => 0,
+    };
+    let room = free
+        .saturating_add(dropped)
+        .saturating_add(purgeable)
+        .saturating_add(compressed);
+    Some(if d.total > 0 { room.min(d.total) } else { room })
+}
+
 /// This machine's logical cores, at least one.
 #[must_use]
 pub fn cores() -> u32 {
@@ -166,7 +214,16 @@ impl Reading {
             swap_used: Some(0),
             swap_total: Some(0),
             volume: None,
+            pressure: None,
         }
+    }
+
+    /// This reading at memory pressure `level` ([`Self::pressure`]): what a test sets.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub const fn at_pressure(mut self, level: aterm_sysprobe::MemoryLevel) -> Reading {
+        self.pressure = Some(level);
+        self
     }
 
     /// This reading with `gib` GiB of its memory wired ([`Self::wired`]): what a test sets.
@@ -185,7 +242,9 @@ pub struct Proc {
     pub pid: u32,
     /// Its parent's pid.
     pub ppid: u32,
-    /// Its memory, bytes (macOS its physical footprint, Linux `RssAnon + VmSwap`): 0 where unread.
+    /// The memory it holds now, bytes ([`Proc::of_reading`]: the lesser of its footprint and its
+    /// resident size, on macOS its physical footprint and resident size, on Linux `RssAnon`): 0
+    /// where unread.
     pub footprint: u64,
     /// Bytes it has written to disk since it started: 0 where unread (Linux).
     pub written: u64,
@@ -315,7 +374,10 @@ impl Machine for Live {
         let physical = aterm_sysprobe::physical_memory_mib()
             .map(|m| m << 20)
             .or_else(|| detail.map(|d| d.total).filter(|t| *t > 0));
-        let available = aterm_sysprobe::machine_memory().map(|m| m.available_mib << 20);
+        let available = detail
+            .as_ref()
+            .and_then(claimable)
+            .or_else(|| aterm_sysprobe::machine_memory().map(|m| m.available_mib << 20));
         let volume = path
             .and_then(|p| volume_of(p, &volumes::table()).ok())
             .map(|v| {
@@ -341,23 +403,39 @@ impl Machine for Live {
             swap_used: detail.map(|d| d.swap_used),
             swap_total: detail.map(|d| d.swap_total),
             volume,
+            pressure: detail.and_then(|d| d.pressure),
         }
     }
 
     fn procs(&self) -> Option<Procs> {
         let sweep = aterm_sysprobe::processes()?;
         Some(Procs::of(
-            sweep
-                .procs
-                .iter()
-                .map(|p| Proc {
-                    pid: p.pid,
-                    ppid: p.ppid,
-                    footprint: p.footprint.unwrap_or(0),
-                    written: p.disk_written.unwrap_or(0),
-                })
-                .collect(),
+            sweep.procs.iter().map(Proc::of_reading).collect(),
         ))
+    }
+}
+
+impl Proc {
+    /// Process `p` as the ledger reads it: the memory it holds is its footprint, or its resident
+    /// size where that is less (macOS `ri_resident_size`, Linux `RssAnon`:
+    /// `ProcessReading::resident`). A footprint counts the pages the kernel compressed or swapped
+    /// out, which a claim's room never held, and a macOS resident size counts the file-backed
+    /// pages a process maps, which a footprint does not; so the lesser leaves the compressed and
+    /// swapped pages out where they outnumber the file-backed resident ones (an aterm-gui compile
+    /// on this Mac, 2026-10-29: 14 GB of footprint, 8.7 GiB resident): a tree whose 10 GiB of
+    /// footprint holds 2 GiB of resident pages, credited 10 GiB, has its 12 GiB claim reserve 2
+    /// GiB of the room it would take back as it touches them; credited 2 GiB, it reserves 10.
+    /// Where the file-backed resident pages outnumber the compressed and swapped ones, the
+    /// footprint is credited whole, compressed pages included.
+    #[must_use]
+    pub fn of_reading(p: &aterm_sysprobe::ProcessReading) -> Proc {
+        let footprint = p.footprint.unwrap_or(0);
+        Proc {
+            pid: p.pid,
+            ppid: p.ppid,
+            footprint: p.resident.map_or(footprint, |r| r.min(footprint)),
+            written: p.disk_written.unwrap_or(0),
+        }
     }
 }
 

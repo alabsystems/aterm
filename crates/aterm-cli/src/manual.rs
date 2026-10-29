@@ -7,6 +7,10 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+/// `aterm help fabric` held to the mirror's vocabulary and encoder.
+#[cfg(test)]
+mod fabric_page_tests;
+
 /// The environment blurb at the top of the front page and the agent brief.
 fn overview() -> String {
     format!(
@@ -260,8 +264,8 @@ REWIND
   on a past screen its recorder kept. Left/Right step one recorded slice and Esc returns
   to live; meanwhile keys and clicks reach no program, and its output keeps arriving
   underneath. The band says whether a live witness checked that state (`faithful`,
-  `may differ from what was on screen`, or `unchecked`). It needs Settings > Terminal >
-  Rewind (`temporal_recording = true`) turned on before the tab opens. Its other keys,
+  `may differ from what was on screen`, or `unchecked`). Settings > Terminal > Rewind
+  (`temporal_recording`, on by default) switches recording for new tabs. Its other keys,
   find, copy, export and forget: `aterm help rewind`.
 
 GOTCHAS
@@ -419,13 +423,21 @@ WHAT IT IS
   global context file (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, agy's
   `~/.gemini/GEMINI.md`, `~/.config/opencode/AGENTS.md`, `~/.config/muse/AGENTS.md`)
   and its skill files (marked `<!-- aterm skill ... -->`):
-  * Claude Code (`~/.claude/skills/<name>/SKILL.md`): `drive-aterm`, `supervise-agent`,
-    `rust-in-aterm`, `aterm-themes`, `aterm-fabric`, `system-state`.
-  * Codex, OpenCode and Muse Code: `aterm-fabric`.
-  It removes aterm hooks from `~/.claude/settings.json` (keeping a `.bak-<unix>`
-  copy) and sets the Claude Code defaults the user has not set: top-effort mode on,
-  `effortLevel` xhigh, rating surveys off, `feedbackDrafts` quiet, `autoCompactWindow`
-  400000.
+  * Claude Code (`~/.claude/skills/<name>/SKILL.md`) and Codex
+    (`~/.codex/skills/<name>/SKILL.md`): `drive-aterm`, `supervise-agent`,
+    `rust-in-aterm`, `aterm-themes`, `aterm-fabric`, `system-state`,
+    `open-in-amacs`.
+  * OpenCode and Muse Code: `aterm-fabric`.
+  `aterm agents` follows a set `$CODEX_HOME` in place of `~/.codex`, as a codex
+  started from the same shell does. A window's automatic pass writes `~/.codex`,
+  because aterm strips `CODEX_*` from the shells it spawns, and `remove` with
+  `$CODEX_HOME` set clears aterm's files from both. `remove <agent>` keeps a skill
+  file another detected agent reads too (one skills folder linked into two homes).
+  The files an earlier aterm wrote that nothing reads now (Gemini CLI's command,
+  Codex's custom prompt) are deleted while they carry the marker. It removes aterm
+  hooks from `~/.claude/settings.json` (keeping a `.bak-<unix>` copy) and sets the
+  Claude Code defaults the user has not set: top-effort mode on, `effortLevel`
+  xhigh, rating surveys off, `feedbackDrafts` quiet, `autoCompactWindow` 400000.
 
 KEY USAGE
   aterm agents               status: each agent, its context file and skills
@@ -474,8 +486,10 @@ WHAT IT DOES
   While full, the mug's launchd process holds an idle-sleep assertion (`pmset -g
   assertions`): neither the system nor the display idle-sleeps (closing the lid or
   choosing Sleep still sleeps). A click toggles it; a right-click or Control-click
-  opens the menu (1h, 8h, 24h, Forever, Enable at Startup, Quit aCaffiene). Timed
-  spans count time asleep, and a change of the date or time neither lengthens nor
+  opens the menu: its one-line about (version, what it does, who made it), then
+  Activate for 1 Hour, 8 Hours, 24 Hours or Forever (the checked span's row says what
+  is left of it), Enable at Startup and Quit aCaffiene. Timed spans count time asleep,
+  and a change of the date or time neither lengthens nor
   shortens one; a reboot or an expired span returns to forever. Enable at Startup works
   only while aterm's switch under Background App Activity (System Settings >
   General > Login Items & Extensions) is on; while it is off, `startup` reads
@@ -485,9 +499,10 @@ WHAT IT DOES
 STARTING WITH ATERM
   Every ordinary aterm window launch starts the mug and keeps this Mac awake
   forever in every build; headless, diagnostic and private-control launches do
-  not. Quit aCaffiene ends it until the next aterm launch, which turns it back on.
-  Enable at Startup also puts it back at every login, and can be turned off
-  independently.
+  not. A window that an update or a launch-record renewal restarts keeps the mode
+  as saved, starting the mug only when that is on. Quit aCaffiene ends it until
+  the next aterm launch, which turns it back on. Enable at Startup also puts it
+  back at every login, and can be turned off independently.
 
 VERBS (`aterm acaffiene --help` has each one)
   aterm acaffiene [start] | on [1h|8h|24h|forever|<n>h|<n>m] | off | status
@@ -518,21 +533,66 @@ FILES
 WHAT IT DOES
   In an aterm window tab, `amacs FILE` opens `FILE` in a fresh Editor tab to the
   right of yours and waits until that tab is closed (`EDITOR=amacs git commit`).
+  A new tab's shell sets `EDITOR=amacs` when you set neither `EDITOR` nor
+  `VISUAL` (`[amacs] default_editor = false` or Settings ▸ Terminal turns it
+  off), so `git commit` and an agent's Ctrl-G open there.
   Outside a window (SSH, tmux/screen, `-nw`), it edits in the terminal with Emacs
   keys (`C-x C-s` save, `C-x C-c` close, `C-c C-c` save+close, `C-c C-k` abort,
   `C-g` cancel, `M-x revert-buffer`).
 
+TABLES
+  In an Editor tab a `.csv` or `.tsv` file opens as a grid: the arrows, Tab,
+  Home and End move between cells; typing, Return or a double-click opens a
+  cell, Return keeps it and Escape drops it. In an open cell `Cmd-Z` undoes your
+  last typing and `Cmd-Shift-Z` redoes it; with no cell open, `Cmd-Z` undoes the
+  last cell you kept. `Cmd-C` or `M-w` copies a cell's value, `Cmd-X`, `C-w` or
+  `C-k` cuts it, and `C-y` puts the last copy or cut in a cell. `C-o` (Add Row)
+  adds an empty row below and moves to it; `C-S-Backspace` (Delete Row) deletes
+  the row. A click in the panel under the grid puts the caret there. The first
+  column stays at the left once the grid scrolls sideways; a sideways swipe or
+  the arrow marks show hidden columns. Commas, quotes and line breaks are quoted
+  for you, and only the bytes of the cells and rows you change change on disk.
+  `Cmd-E` (`C-c C-t`) flips to the text and back. Over 4 MiB, a file opens as
+  text.
+
 USAGE
   amacs [--wait | --no-wait] [-nw | --tty] [+LINE[:COL]] FILE...
   Without a tty, `--wait` or `--no-wait` is required (exits 2 otherwise).
+
+FOR AN AGENT (a tool shell has no tty)
+  When the person must fill in, check or change a file (a CSV, a config, a
+  draft), open it for them rather than printing its path:
+    amacs --no-wait +LINE FILE   an Editor tab beside yours, caret on LINE;
+                                 returns at once
+    amacs --wait FILE            returns once they close the tab, and the file
+                                 on disk is their answer (a background command)
+  Each run opens another tab, even of a file already open; to wait on the one
+  open, `aterm ctl @self await edit uri=file:///abs/path timeout=600000` (run it
+  again on exit 124, `OK timeout`). Exit 2 with `did not open it` on stderr: the
+  window refused the file (one under a cloud-storage folder is refused) or could
+  not be reached, and amacs fell back to the terminal, which a tool shell does
+  not have; inside tmux or screen it always edits in the terminal. Then give the
+  person the path.
+  While the tab is open, `aterm ctl @self doc ls uri=file:///abs/path` says
+  whether it holds unsaved typing (`dirty=1`) and where their caret is
+  (`cursor=`), and `aterm ctl @self doc read file:///abs/path` reads the buffer,
+  unsaved typing included (a bare `doc ls` prints each open file's `uri=`);
+  agent edits to it (`doc apply`, `doc save`) answer `ERR unsupported` for now.
+  `aterm ctl @self status` says `editor=amacs` where an Editor tab opens and
+  `editor=-` where none can (a headless instance). For git, which reads
+  `GIT_EDITOR` before `EDITOR` (a tool shell may set it), use
+  `GIT_EDITOR='amacs --wait' git commit`; for other programs,
+  `EDITOR='amacs --wait'`. Claude Code and Codex get this as the
+  `open-in-amacs` skill (`aterm help agents`).
 
 EXIT STATUS
   0 closed normally; 1 refused/unopenable/aborted (`C-c C-k`); 2 usage or no tty;
   75 window gone with no successor; 130 interrupted (`C-c`, tab stays open).
 
 ON THE WIRE
-  aterm ctl @self edit <file-uri> [line=L[:C]]
-  aterm ctl @self await edit ticket=<t>"#,
+  aterm ctl @self edit <file-uri> [line=L[:C]] [create=1] [wait=0]
+  aterm ctl @self await edit ticket=<t> | uri=<file-uri>
+  aterm ctl @self doc ls [uri=<file-uri>] | doc read <doc-id|file-uri>"#,
         ),
     },
     Topic {
@@ -542,7 +602,7 @@ ON THE WIRE
             r#"rewind — a pane's past screens (View > Rewind Pane, Cmd-Shift-R).
 
 WHAT IT DOES
-  A tab opened with Settings > Terminal > Rewind on (`temporal_recording = true`)
+  A tab opened with Settings > Terminal > Rewind on (`temporal_recording`, on by default)
   keeps, in memory only, the bytes its program wrote and keyframes of its screen:
   at most `rewind_budget_mb` (8) per pane and `rewind_total_mb` (128) for all panes
   together, the panes focused longest ago giving up their oldest history first.
@@ -613,25 +673,53 @@ LIMITS
         name: "ai",
         tagline: "this machine's AI CLIs: one working login each, the doctor, reviews across AIs",
         body: Some(
-            r#"ai — this machine's AI CLIs (`aterm ai`): `claude`, `codex`, `agy`, `muse` and `grok`.
+            r#"ai — this machine's AI CLIs (`aterm ai`): `claude`, `codex`, `agy`, `muse`, `grok` and
+`kimi`.
 
   aterm ai [status] | doctor | login <cli> | review | fleet   (`aterm ai --help`)
 
 THE DOCTOR
-  `aterm ai` prints one row per CLI and a health line (exit 0). `aterm ai doctor`
-  installs or signs in each CLI that needs it when a person is at the terminal, and
-  exits 1 while one is signed out or not installed (`--read-only` only looks;
-  `--on <host>,…` or `--fleet` checks other machines over ssh). `aterm ai login
-  claude` runs `aterm harness accounts renew`; `aterm ai login codex|grok|kimi` runs
-  `aterm harness accounts renew <label> --cli <cli>` where this machine keeps that
-  CLI's roster (`accounts-<cli>.toml`). Where it does not, codex and grok run their
-  own login (grok's `login --device-auth` over SSH), and kimi (no row of `aterm ai`
-  yet) says how to add a row and runs nothing. grok is installed only where a person
-  asks (`aterm pkg install grok`); until then its row is `off` and needs nobody.
-  A renewal whose page waits on a person stops `needs-sign-in` and prints
-  `NEEDS YOU: sign <label> in once…`. `aterm harness accounts browser <label> --cli
-  <cli>` opens that row's own browser profile in a window at the vendor's sign-in page.
-  Once a person signs in there, later renewals approve the CLI's page in it headlessly.
+  `aterm ai` prints one row per CLI and a health line (exit 0): what `aterm ai doctor`
+  fixes itself, then a `NEEDS YOU:` line for each sign-in no route of aterm's makes.
+  `aterm ai doctor` makes aterm's own fixes at a terminal or none, under an agent too:
+  it installs a CLI that is not installed and signs in through accounts v2's or a
+  CLI's pool's renewal where a row has an email and a route that runs with nobody at
+  this Mac (a mailbox, or the row's own browser profile in a headless browser). With
+  nobody at the run that renewal never takes the terminal or opens a browser, and it
+  waits for the window's upkeep after a failed sign-in or a bot check on record. A
+  CLI's own sign-in, approved in a browser, a row no route signs in (its `fix:` names
+  the step, e.g. `aterm harness accounts browser <label>` once), and any sign-in while
+  `[harness] logins = "off"`, it runs only for a person at the terminal. It exits 1
+  while one is signed out or not installed (`--read-only` only looks; `--on <host>,…`
+  or `--fleet` runs it on other machines over ssh for a person at a terminal).
+  Where Claude Code's sign-in cannot start (accounts.toml refused or listing this
+  machine's own login with no email, account records that cannot be read, or
+  `CLAUDE_CONFIG_DIR` set), its `fix:` and the `NEEDS YOU:` line say what a person does
+  instead, never `aterm ai login claude`, which says why at a terminal or none.
+  `aterm ai login claude` runs
+  `aterm harness accounts renew`; `aterm ai login codex|kimi` runs `aterm harness
+  accounts renew <label> --cli <cli>` and `aterm ai login grok` runs `aterm harness
+  accounts login <label> --cli grok`, for a person to approve, where this machine keeps
+  that CLI's roster (`accounts-<cli>.toml`). On a Codex build that keeps no row's login
+  its own (OpenAI's, or a codex-alab from before its cd79a420c), the roster's row on
+  this machine's own login signs in by Codex's own login in its default home instead,
+  which `aterm ai login codex` runs for a person while that row is signed out, unless
+  another Mac's warm set keeps it from this Mac (codex rows carry no claims), when
+  nothing here signs it in; where that build serves that row alone, it signs in no
+  other row, and nothing while that row's login works. Where no roster is kept, each runs its own login (grok's
+  `login --device-auth` over SSH). Every CLI here is in atpkg's default set;
+  `[packages] exclude` or `[ai.<cli>] use = false` keeps one off.
+  A Codex or Kimi renewal whose page waits on a person stops `needs-sign-in` and
+  prints `NEEDS YOU: sign <label> in once…`. `aterm harness accounts browser <label>
+  --cli <cli>` opens that row's own browser profile in a window at the vendor's sign-in
+  page.
+  Once a person signs in there, later Codex and Kimi renewals approve the CLI's page in
+  it headlessly. accounts.x.ai answers aterm's headless browser with Cloudflare's block
+  page, which aterm never works around, so a Grok renewal by hand stops `needs-you`
+  and names `aterm harness accounts login <label> --cli grok`, which a person runs and
+  approves at the desk, and a window starts no Grok renewal in the background (each
+  would be an xAI device code and a blocked page); `accounts browser --cli grok` does
+  not change that.
 
   States: `ok` (used within 6h), `idle` (signed in), `limited` (at a usage limit),
   `due` (renew by a time it names), `unproven`, `signed-out`, `not-installed`, `off`.
@@ -667,25 +755,27 @@ CONFIGURATION — `[ai]` in `aterm.toml`
             r#"secrets — one encrypted, signed credentials file for every machine, written to
 `~/.secrets/<name>` (macOS and Linux; `aterm secrets --help` has every verb and flag).
 
-  aterm secrets join <url>#<key>               a new machine: paste the line `create` printed
-  aterm secrets approve <age1…> --name <host>  an admin lets in one a closed or path vault holds
+  aterm members join                           a new Mac: Allow on any member, type its phrase
+  aterm secrets approve <age1…> --name <host>  an admin lets in one a path vault holds
   aterm secrets                                what this machine holds, and whether it syncs
 
 DETAILS
 
   A vault Mac starts with `aterm secrets create http://127.0.0.1:7484/v1/<name> --serve`:
-  its server set up and answering, then the vault, then the `join` line to paste on the
-  other machines (with this Mac's LAN name). A new vault is open: its admin's subscriber
-  lets in every machine that asks. `aterm secrets password new` gives it a join password
-  instead, and `password off` leaves each machine to an admin's approval by code.
+  its server set up and answering, then the vault. A new Mac joins through a member
+  (`aterm help members`): a person presses Allow on any member and types the phrase it
+  shows, and the admin's subscriber lets in the request that carries that Allow. An open
+  vault lets in no machine by asking alone. `aterm secrets password new` gives it a join
+  password, and `password off` leaves each machine to an Allow or an admin's code.
 
 HOW IT WORKS
   An admin machine encrypts the vault (age X25519, one locker per audience), signs
   the envelope with the vault's Ed25519 key, and publishes it to a server URL (default
   `http://alab-secrets.local:7484/v1/alab` over mDNS) or a file path. Subscribed
   machines check the pinned signer and a rising version, decrypt their lockers, and
-  write `~/.secrets/<name>` (mode 0600). Claude Code and Codex logins are not synced
-  (their refresh tokens are single-use; use `aterm ai login`).
+  write `~/.secrets/<name>` (mode 0600). Claude Code, Codex, Grok Build, Kimi Code and
+  Muse Code login files are refused as entries and never written (their refresh tokens
+  are single-use; use `aterm ai login`).
 
 VAULT FORMAT (`aterm secrets edit`)
   [machines]          `<host> = age1…` (delete to revoke)
@@ -705,12 +795,49 @@ VERBS
                   admins, rotate-key
   a server        serve, server on|off|status (`server on` returns once it answers)
   `watch` is the subscriber `agent on` installs; on an admin it also lets in machines
-  that ask (on an open vault) or type the join password. `agent off` records that
+  a member allowed or that type the join password. `agent off` records that
   choice, which setup keeps, and every install of the subscriber removes it. A path
   vault has no join queue: approve each key.
 
 FILES
   `~/.config/aterm/secrets/{source.toml,identity,state.toml,vault}` and `~/.secrets/<name>`."#,
+        ),
+    },
+    Topic {
+        name: "members",
+        tagline: "Macs joining ALab: ask every member, Allow on any one, type the phrase it shows (requests | allow | invite | ignore | join | status)",
+        body: Some(
+            r#"members — Macs joining ALab, and the members that let them in (macOS and Linux;
+`aterm members --help` has every verb). No member is a leader: any one lets a Mac in.
+
+  aterm members join                 a new Mac: find ALab on this network and ask every member
+  aterm members join <phrase>        type the phrase the member that allowed this Mac shows
+  aterm members requests             on a member: the Macs asking that it hears
+  aterm members allow <name>         on a member: show a phrase for that Mac on this screen
+
+HOW A MAC JOINS
+  1. The new Mac runs `aterm members join` (install.sh runs `members join --no-wait`,
+     which asks, joins the ALab vault and starts this Mac's vault subscriber, which asks
+     again every minute; the join System State and `aterm init` make at the ALab vault
+     asks the same way). It finds the members by Bonjour on macOS (on Linux, name one:
+     `aterm members join --at <host>`), with no account and no password, and asks each
+     one at once on the fleet port's `ask` ALPN, the one op a caller without the fleet
+     secret reaches.
+  2. Every member shows "<name> wants to join ALab (<model>, <ip>)" with Allow and
+     Ignore. Allow is a person's own press on that Mac's screen: `aterm ctl notice act`,
+     a fleet drive and a harness answer are refused.
+  3. Allow shows a three-word phrase in a sheet on that Mac alone, for 5 minutes (an
+     invite's, 10). The person types it into the new Mac. `members allow` and `members invite` in a terminal
+     answer only that the phrase is on this Mac's screen; a Mac with no screen refuses.
+  4. The phrase runs CPace with that member. The member hands over a signed `Allowed`
+     and, until the membership log ships, its own decrypted `[everyone]` files, so the
+     new Mac writes `~/.secrets` at once (GitHub, publishing and AI-account credentials).
+  5. The new Mac asks the vault's server with the `Allowed`; an admin's approver lets
+     it in once one is reachable, and from then it follows every vault change.
+
+  A wrong phrase burns it (one run each); a source gets 3 runs a minute. `Ignore` hides
+  the request on that Mac only. `aterm members status` says whether this Mac is in,
+  waiting, or neither."#,
         ),
     },
     Topic {
@@ -809,7 +936,10 @@ WHAT IT IS
     `stall_term_after_s` (`input=stalled`) is warned about once, or restarted under
     `stall_term = true`.
   Every decision goes to the session's journal (`aterm drive ledger`) and the approval
-  ledger (`aterm harness ledger`).
+  ledger (`aterm harness ledger`). An agent that supervises itself (codex-alab, on its
+  proven claim) books each act it records (`meta set harness_act`) in that ledger as its
+  own (`self-claim <holder> <word> <act>`); Settings ▸ Harness counts those in a row of
+  their own (`codex-alab did`), never in what aterm's harness did.
 
 AUTOPILOT — how far the harness carries a session's work
   Each supervised session has an Autopilot mode (`autopilot=` in `aterm ctl @<sid>
@@ -861,11 +991,36 @@ AUTOPILOT — how far the harness carries a session's work
   Cruise and Land does not restart it. Under Land, when the repository still holds
   work no remote main has and no manager waits on the session, one Messages band
   says `aterm stopped typing` until it types again; every other stop raises none.
+  codex-alab, which supervises itself, stops its own typing the same way and tells
+  it on its proven claim (`meta set harness_held same-reply|no-work`, `meta unset
+  harness_held`): while that claim stands `status held=` names its stop, the
+  Settings ▸ Harness state line and the menu bar's worker row lead with it in its
+  name (`codex-alab stopped typing: <why>`), and the hover and the Overview say it
+  as its own (`driven by aterm (land: codex-alab stopped typing)`), none of them
+  while the tab reads landed or quiet, as for aterm's own; it goes with the claim.
+
+  Land's hold: while Land's instruction stands unlanded, the menu bar counts the tab
+  `landing`, and its worker row, the Overview, the tab's hover and the Settings ▸
+  Harness state line say why (`not landed yet: 2 unpushed commits · 3 nudges`);
+  `status land_held= land_nudges= land_since=` give the legs that held its last
+  judged reply, the nudges since and the second Land's instruction was typed.
+  A codex-alab that tells its own hold on its proven claim (`meta set harness_land
+  since=<ms> nudges=<n> [read=1 legs=<leg>,…]`, `meta unset harness_land`) has it
+  shown: while that claim stands the same surfaces show it in its name
+  (`codex-alab: not landed yet: …`), only while the tab reads Land and neither
+  landed nor quiet, as for aterm's own; it goes with the claim. A tab whose
+  codex-alab does not tell it shows no hold.
 
   NEEDS YOU: a report line starting `NEEDS YOU: <what only a person can give>` puts an
   `owner=needs kind=ask` entry on the menu bar (`❯N`) and window border while the
   agent works on everything else; `NEEDS YOU: nothing`, someone else's turn, or
-  Autopilot `off` clears it.
+  Autopilot `off` clears it. The menu bar's row says the first need whole and gives
+  the next two a row each one level in (8 such rows in the whole menu; the rest are
+  counted as `(+N more)`), and the tab's hover a `Needs you:` line each. A codex-alab
+  that tells its own set on its proven claim (`meta set harness_needs entry=<pct
+  text> need=<pct need> …`, at most 32; `meta unset harness_needs`) has its needs
+  shown the same way while that claim stands, any past the 32 still counted; one
+  that does not is shown by its entry's first need and count.
 
 THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   enabled [true]                  master switch for the window supervisor
@@ -891,13 +1046,19 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   continue_per_hour [0]           max typed continuations per session per hour (0 = no cap)
   rules_file [none]               path whose text is appended to every continuation
   retry_api_errors [true]         retry transient API/overload errors and continue
-  probe_api [true]                probe the API while waiting on a network API error
+  probe_api [true]                probe the API while waiting on a network API error, and
+                                  watch this Mac's network path and routes (no traffic),
+                                  so a lost path holds that wait for up to an hour and its
+                                  return or a route change wakes it; off: neither, and the
+                                  wait keeps its retry ladder
   resume_limits [true]            continue once a usage or rate limit resets
   limit_wait [true]               choose "Wait here" on Claude Code's usage-limit dialog
   accounts ["early"]              account rotation: `"early"`, `"wall"` or `"off"`, for
                                   every CLI whose roster this machine keeps (Claude
                                   Code's `accounts.toml`, and `accounts-codex.toml`,
-                                  `accounts-grok.toml`, `accounts-kimi.toml`)
+                                  `accounts-grok.toml`, `accounts-kimi.toml`, whose
+                                  pools pick a row when aterm starts a session and
+                                  move no running one)
   limit_reset [false]             take an eligible limit reset on the usage-limit dialog
   limit_reset_kinds [[]]          which reset kinds `limit_reset` may spend
   usage_tap [true]                pass aterm's status-line tap on Claude Code relaunches;
@@ -905,8 +1066,14 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
                                   a usage limit's continuation
   usage_notes [false]             record single-account usage when no accounts are listed
   usage_credits [false]           allow carrying a session onto paid usage credits
+  claim_credits [true]            start a worker that claims a free credit Claude Code
+                                  offers this account, in the person's own Chrome
+                                  (never pays, never turns on extra usage); only its
+                                  Chrome actions on the claim pages are approved, its
+                                  questions are yours, and it stops after 30 minutes
   logins ["renew"]                renew expired logins listed with an email
                                   (`"renew"` or `"off"`), in every CLI's roster
+                                  but Grok Build's
   hosts [[]]                      remote hosts `accounts renew --due` also renews
   model_fallback ["opus"]         fallback model on a Claude Code model-bucket limit
   compact_on_context_wall [true]  run `/compact` (or shrink images) on a full context
@@ -943,7 +1110,8 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
 
 THE VERBS (`aterm harness --help`; `aterm harness <verb> --help` for one)
   usage      this session's tokens per model, subagents folded in (Codex at list price,
-             `≈$`, never a bill)
+             `≈$`, never a bill), and its 5-hour and weekly windows (Claude Code's from the
+             usage tap, Codex's from the newest reading in its rollouts)
   limits     the usage wall on a session's screen and when it resets
   disk       report, or with `--apply <class>` reclaim, idle build directories and caches;
              never `~/.claude/projects` (`[disk]` keys: `apply`, `warn_free_gib`,
@@ -951,23 +1119,33 @@ THE VERBS (`aterm harness --help`; `aterm harness <verb> --help` for one)
              `idle_build_dirs`, `idle_build_days`)
   ledger     the approval ledger of a session, or the `disk`, `upgrade` or `accounts` one
   accounts   the Claude Code account pool (`accounts.toml`), sign-ins and renewals, and
-             fleet account sync from a source this machine names (no default source);
-             `--cli codex|grok|kimi` does the same for that CLI's pool
-             (`accounts-<cli>.toml`, its fleet `~/.secrets/ai-accounts-<cli>.toml` or its
-             column of `ai-accounts.csv`, read only where this machine keeps the roster)
+             fleet account sync from a source this machine names or keeps in `~/.secrets`
+             (`aterm harness accounts --help`); `--cli codex|grok|kimi` is that CLI's pool
+             (`accounts-<cli>.toml`), synced by default from its fleet
+             `~/.secrets/ai-accounts-<cli>.toml` or its column of `ai-accounts.csv`, even
+             where this machine keeps no roster yet (the sync writes it;
+             `[harness] accounts = "off"` stops that sync)
   upgrade    move live sessions onto a newer build or model, at an idle point
   tap        the status-line usage tap aterm adds to Claude Code relaunches
 
 THE FOOTER
   A supervised tab's footer bar carries an Autopilot chip (`∞` cruise, `⤓ land`,
   `✓ landed`, `⤓ quiet`, `○ off`, or `✋ you` while you hold it), context and usage
-  meters and status lights. `[claude_footer]` keys, each true by default, switch its
-  extras: `usage` (the `Σ` working time and tokens), `acts` (what the harness just
-  did, beside the chip), `card` (the decorated launch card) and `agents` (the agents
-  panel's colours). Clicking the chip opens the Autopilot menu (Cruise, Cruise
-  until…, Land, Off, Take Over / Hand Back). `aterm ctl chrome` reports the chip as
-  drawn (`face=`, `drawn=`, `spoken=`, `description=`; a debug build adds `title=`,
-  the title its hover reads).
+  meters and status lights. A codex-alab tab lays the chip alone on its composer's top
+  line, right after the `codex-alab` label, only where codex-alab leaves that line blank
+  and carries itself under aterm's Autopilot word (its own proven claim): with its ALab
+  interface on, codex-alab draws the line itself, and with it off (its vanilla mode) it
+  follows no Autopilot word, so the line lays no chip, as while the switch is off; a
+  vendor `codex` carries none. `[claude_footer]` keys, each true by default, switch its
+  extras: `usage` (the `Σ` working time and tokens), `acts` (what the harness just did,
+  beside the chip), `card` (the decorated launch card, its line linking alab.systems,
+  and the banners over Claude Code's update notice and startup announcement) and
+  `agents` (the agents panel's colours). Clicking the chip moves Autopilot to its next
+  mode (Cruise, Land, Off, round again); a right-click (control-click on a Mac) opens
+  the Autopilot menu (Cruise, Land now, Off, a timed Cruise that then lands, Cancel
+  landing while one is armed, and Harness settings…). `aterm ctl chrome` reports the
+  chip as drawn (`face=`, `drawn=`, `spoken=`, `description=`; a debug build adds
+  `title=`, the title its hover reads).
   Settings ▸ Harness shows the supervised sessions, what the harness decided for you,
   a 7-day comparison of the Autopilot modes, and every `[harness]` key. Its WHAT THE
   HARNESS DID counts today and the last 7 days: `past “done”` (turns it kept going
@@ -1004,12 +1182,13 @@ THE FOOTER
 WHAT IT IS
   Installs and keeps current the ALab verification toolchain (`trust`, `clean`, `ty`,
   `ay`, `ny`, `nn`, `trust-ir`, `trust-cg`, `trust-vc`, `trust-mc`) and the managed
-  agent CLIs (`claude`, `codex`, `codex-old`, `agy`, `muse`; `grok` and `kimi` once
-  installed by name). Every ALab package is
-  verified against the paper master public key compiled into aterm, which signs the
-  machine-key roster, which signs the freshness-stamped index and manifests. Agent
-  CLIs come from their vendors' release channels, verified against vendor anchors.
-  The first window launch runs `aterm pkg seed` and `aterm pkg update` by itself.
+  agent CLIs (`claude`, `codex`, `codex-old`, `agy`, `muse`, `grok`, `kimi`). Every
+  ALab package is verified against the paper master public key compiled into aterm,
+  which signs the machine-key roster, which signs the freshness-stamped index and
+  manifests. Agent CLIs come from their vendors' release channels, verified against
+  vendor anchors.
+  The first window launch runs `aterm pkg seed` and `aterm pkg update` by itself, and
+  `aterm init` runs the same two (its `base.pkg.toolset` row) on a Mac with no window.
 
 KEY USAGE (`aterm pkg --help` lists every verb, plumbing included)
   aterm pkg install --default-set
@@ -1085,9 +1264,17 @@ HOW IT WORKS & GOTCHAS
       defaults -currentHost delete com.apple.universalcontrol DisableMagicEdges
     and set `universal_control = "leave"` in `aterm.toml`.
   * `[packages]` keys in `aterm.toml`: `enabled` (default `true`), `auto_install`
-    (default `true`), `exclude = [...]`, and `peers = ["host[:port]", ...]`: LAN Macs a
+    (default `true`), `exclude = [...]`, and `peers = ["host[:port]", ...]`: the LAN Macs a
     toolset download races, each archive taken from one only when it hashes to the signed
-    digest. A Mac serves its archives to them while `aterm pkg serve-units` runs (opt-in)."#,
+    digest. Unset, they are this Mac's fleet members; `peers = []` takes from none.
+  * LAN sharing is on: while aterm runs, a Mac in a fleet serves the toolset archives it
+    keeps beside its builds to its fleet members (port 7487, members' addresses only).
+    `aterm pkg serve-units` serves them in the foreground where aterm does not run;
+    `serve-units --off` stops it and keeps none until `serve-units --on`. Settings ▸
+    Packages ▸ "Share ALab tools with the fleet" runs the same off and on, and
+    `aterm ctl @self status` says where it stands (`units=serving|idle|no-member|off`;
+    `-` when the package manager is inert, no store location resolves, or no read of it
+    has landed in the last 4 s)."#,
         ),
     },
     Topic {
@@ -1597,6 +1784,7 @@ const EXTRA_PAGES: &[&str] = &[
     "windowing",
     "drive",
     "fleet",
+    "node",
     "trust-backends",
     "permissions",
     "agent",
@@ -1742,6 +1930,9 @@ fn overview_page() -> String {
                 "a LAN fleet's membership (init | join | peers | allow | leave); `ctl --host` \
                  drives where allowed"
             }
+            crate::Verb::Node => {
+                "the windowless fleet & Commons node job (status | on | off | serve; Unix)"
+            }
             crate::Verb::Drive => {
                 "the window harness's readers by hand (classify / phase / answer / ledger / \
                  tape / replay)"
@@ -1773,6 +1964,10 @@ fn overview_page() -> String {
             crate::Verb::Secrets => {
                 "one credentials file for every machine: the vault, its server and ~/.secrets \
                  (status | join | sync | edit | password | approve | serve)"
+            }
+            crate::Verb::Members => {
+                "Macs joining ALab: ask every member, Allow on any one, type its phrase \
+                 (requests | allow | invite | ignore | join | status)"
             }
             crate::Verb::Db => {
                 "encrypted embedded application databases: offline edits, direct LAN replication, accounts and budget rights"
@@ -2110,6 +2305,7 @@ WAIT — `aterm ctl @self await sys <condition> [for=<dur>] [timeout=<ms>]`
   aterm ctl @self await sys quiet for=20s timeout=600000
   aterm ctl @self await sys 'cpu<30%' and mem=normal timeout=600000
   aterm ctl @self await sys 'free>50GB' timeout=600000
+  aterm ctl @self await sys 'free<68GiB' vol=/System/Volumes/Data timeout=600000
   aterm ctl @self await sys job=a40977 done,stuck timeout=600000
   aterm ctl @self await sys 'slots>=1' and 'avail>=8GiB' for=20m timeout=600000
   Terms: cpu, cpu.<cluster>, aterm, tab, wait, gpu, mem (normal|warn|critical),
@@ -2123,6 +2319,13 @@ WAIT — `aterm ctl @self await sys <condition> [for=<dur>] [timeout=<ms>]`
   A job that exited meets done even after it leaves `sys jobs`; one that cannot
   meet the wait, or that nobody knows, is `ERR gone job=<id>`. scope=aterm
   (owner) reads every tab.
+
+  Low-free observers (`free<` and `free<=`) take an explicit whole size with
+  units, never `room`, and never request cache cleanup. They may combine with
+  `disk=`, but cannot combine with upward `free>`/`free>=` admission. The volume
+  is read fresh when armed; parked readings aged ten seconds are refreshed
+  before they can satisfy the observer. A changed or unreadable
+  volume refuses. Existing upward free-space admission keeps its cleanup policy.
 
 FRESHNESS
   Sampled on demand: no Deck needs to be on screen. A request whose snapshot is
@@ -2435,11 +2638,12 @@ KEY USAGE (`aterm ctl help <verb>` has every flag)
                              later waits, from each worker's last `rev=`
   aterm ctl @<sid> result [full]
                              the worker's final report (up to 24,000 chars; `full`: the
-                             whole task exchange, from a transcript)
+                             whole task exchange, from a transcript or rollout)
   aterm ctl @<sid> task      the task record (`state=`, `rev=`, `from=`, `result_bytes=`)
   aterm ctl @<sid> turn typed=1 settle=submitted '<one line>'
-                             a follow-up prompt; it returns `task_rev=<n>` once submitted,
-                             then wait on `await task @<sid>:<n>`
+                             a follow-up prompt; it returns `task_rev=<n>` once submitted
+                             (`submit_by=` says what showed it: `claim` is a codex-alab's
+                             own report), then wait on `await task @<sid>:<n>`
   aterm ctl @<sid> signal term
                              stop the worker; `aterm ctl @<sid> close` closes its pane
 
@@ -2453,13 +2657,31 @@ AGENTS
   Build) is refused (`ERR spawn agent=grok: …`) until aterm reads its turn end. Then
   a worker with no usable sign-in file (missing, empty or refused) is `stalled
   why=signin` before anything is installed (only a person signs in: signed out, Grok
-  Build opens xAI's sign-in page by itself), and a missing `grok` is then installed
-  by atpkg's verified install (naming it opts the Mac in; a hold or a failed install
-  is `stalled why=install`).
+  Build opens xAI's sign-in page by itself). Any agent whose program atpkg's store
+  does not hold yet (a fresh Mac before the update pass lands it) is then installed
+  by atpkg's verified install (a failed install is `stalled why=install`); where
+  `[packages] exclude`, a person's removal or a no to unattended installs (Keep ALab
+  tools up to date or Install ALab tools off in Settings ▸ Packages, or the toolset
+  removed by `aterm pkg uninstall --all`) keeps it off, nothing is installed, the
+  launch says so and the line runs any copy of the shell's own.
   `agent=gemini`, the retired Gemini CLI, is refused by name: agy replaces it.
 
-ON ANOTHER MAC (`aterm fleet allow drive --from <this Mac>` on `<h>`)
+ON ANOTHER MAC (`aterm fleet allow drive --from <this Mac>`, or `--all`, on `<h>`)
+  `<h>` is a peer's host, node id or address (`aterm fleet peers`), its host's first label,
+  or its short name: the lead word of its host (`m102` of `m102-macbook-…`), else a word
+  `m<N>` in it (`m27` of `MacbookAir-m27-…`, never a chip's `M5`). A short name two Macs
+  answer to is refused, naming both; a word no peer answers to is refused, except by
+  `survey --host`, which looks it up as a host.
   aterm ctl --host <h> spawn agent=<word> [model=<m>] [cwd=<abs-path>] - < task
+  aterm ctl --host any spawn agent=<claude|codex> [model=<m>] [cwd=<abs-path>] - < task
+                             one survey of every member picks the Mac: of those that let
+                             this Mac drive them and have an enrolled, unwalled account of
+                             that program, the least used week, then five hours, then the
+                             fewest busy sessions, then by host. It says on stderr which
+                             (`--host any: chose <host> (<addr>): …`), prints `OK <sid>` as
+                             `--host <that Mac>` does, and refuses with counts where none can.
+                             The worker's `await task` and `@<sid>` verbs under `--host any`
+                             follow it to that Mac
   aterm ctl --host <h> await task @<w>,… since=0 [all] [timeout=<ms>]
   aterm ctl --host <h> await task @<w>:<rev>,… [all] [timeout=<ms>]
   aterm ctl --host <h> @<w> result | status | text | screen
@@ -2474,7 +2696,12 @@ THE SURVEY & CHANNELS
   aterm ctl survey --brief [--budget <chars>]
                              local instances, node logs and session briefs
   aterm ctl survey --host <h> | --fleet [--sid <s>]
-                             one fleet peer, or the whole fleet (`aterm help fleet`)
+                             one fleet peer, or the whole fleet (`aterm help fleet`); each
+                             instance's line is followed by its pooled CLIs' accounts
+                             (`  accounts: claude main 7d 42% 5h 10%, work-2 walled 3h`),
+                             each by its label, never its email, and a pool it could not
+                             read as `unread`; `--json` carries every row
+                             (`"accounts":null` from an aterm before 0.146)
   Topic channels (with `aterm fabric on`, this machine only): `aterm ctl @self topic add
   <t>`, wait in the background with `aterm ctl @self await inbox since=<id> topic=<t>`,
   and broadcast with `aterm ctl @self post to=say:<t> kind=note -- '<text>'`.
@@ -2786,51 +3013,100 @@ const fn trust_install_act(unserved: bool) -> &'static str {
 /// writes, and the step-in `allow drive` grants (`aterm ctl --host`).
 const FLEET_PAGE: &str = r#"fleet — the aterms of one LAN, reading each other and driving where allowed
 
-  aterm fleet init | join | peers | allow | leave      (`aterm fleet --help` has the flags)
+  aterm fleet init | join | peers | allow | publish | sync | leave
+                                                       (`aterm fleet --help` has the flags)
 
 WHAT IT IS
   A FLEET links the aterms on a LAN that share a fleet secret and prove per-machine
   Ed25519 node keys (`<state>/fleet-node-key`). Members reach each other on loopback,
   private (10/8, 172.16/12, 192.168/16) or link-local (169.254/16) IPv4 addresses only,
-  as a fleet listener answers IPv4 alone, never public or CGNAT (100.64/10) ones. The
-  issuer keeps the book of members and shares it with members on every read.
+  as a fleet listener answers IPv4 alone, never public or CGNAT (100.64/10) ones. Every
+  member keeps a book of members, each entry signed by the machine it names, answers a
+  join and shares its book on every read, so the fleet needs no machine in particular.
 
 MEMBERSHIP
-  `aterm fleet init` on the first machine (the issuer) mints the secret, writes the
-  join code to a 0600 file and prints that file's path (never the code), and sets
+  `aterm fleet init` on the first machine mints the secret, writes the join code (the
+  secret alone) to a 0600 file and prints that file's path (never the code), and sets
   `[fleet]` (port 7100). `aterm fleet join` on each other machine reads the code from
-  stdin, `--code-file F` or a hidden prompt, never an argument. `init --rotate` mints
+  stdin, `--code-file F` or a hidden prompt, never an argument, and joins through the
+  member `--at <host[:port]>` names, the place a vault's code names, a member its book
+  holds, or one advertising `_alab._tcp` on the LAN. `init --rotate` mints
   a new secret, which every member joins again with and which keeps no drive grant on
   either side; `peers` checks every known peer (3 s) and `peers add|rm` edits the
   book of peers (`add` refuses an address past the LAN, an IPv6 one but ::1, and
   this machine's own listener, writing nothing); `leave` removes the fleet secret, the join code, both
   books and `[fleet]`'s listen, allow and drive_from (the node id and node key stay).
+  `aterm fleet sync [--on]` joins the signed default ALab fleet, or its newer code from
+  the default fleet this machine is in, keeping the level set here; its first join lets
+  every member drive this machine (`drive_from = ["*"]`, a vault admin's too), and it
+  leaves a fleet joined by hand to another code, one minted here, and a key it cannot
+  read as they are.
+  `aterm fleet publish`, run by an ALab vault admin where the code was minted,
+  publishes its join code to every current and future ALab member. A `leave` in a fleet
+  writes `<state>/fleet-off`, which keeps sync off until `sync --on` or a join here (an
+  init keeps it).
 
 READING & DRIVING ACROSS THE FLEET
   aterm ctl survey --fleet
                        every session on every reachable fleet machine
-  aterm ctl survey --host <host|node|address> [--sid <s>]
+  aterm ctl survey --host <host|short name|node|address> [--sid <s>]
                        one peer machine (or one session's excerpts)
   Levels (`[fleet] allow`; `--allow` on init and join sets `facts` or `content`):
   * `facts` (default) — programs, agent states, redacted roles, task records, models.
   * `content` — `facts` plus titles, cwds, prompts, recent agent words and shell lines.
   * `drive` — `content`, and the nodes `aterm fleet allow drive --from` names (bound by
-    node key) may run `aterm ctl --host <h> spawn agent=<word>` here, with `await task`,
-    `result`, `status`, `text`, `screen`, `turn`, `key`, `send`, `hold` and `close`
-    (`aterm help workers`). A local Take Over always wins and lifts remote holds.
-    Every member reads a Mac at drive as at content: a grant at `facts` raises them,
-    and `aterm fleet allow facts` lowers them again. Every write that leaves the
-    level below drive removes every grant and says so.
+    node key), or with `--all` (the `"*"` grant) every member this machine's membership
+    log admits (a key the log does not name: every member a book here binds), under the
+    key it binds, may run `aterm ctl --host <h> spawn agent=<word>` here,
+    with `await task`, `result`, `status`, `text`, `screen`, `turn`, `key`, `send`,
+    `hold` and `close` (`aterm help workers`). A local Take Over always wins and lifts
+    remote holds. Every member reads a Mac at drive as at content: a grant at `facts`
+    raises them, and `aterm fleet allow facts` lowers them again. Every write that
+    leaves the level below drive removes every grant and says so.
 
 FILES & CONFIG (`<state>` is `~/Library/Application Support/aterm` on macOS)
   `fleet.key`, `fleet-join-code`, `fleet-node`, `fleet-node-key`, `fleet-peers`,
-  `fleet-issuer-book`; and in `aterm.toml`:
+  `fleet-issuer-book`, `fleet-off`; and in `aterm.toml`:
     [fleet]
     listen = "0.0.0.0:7100"
     allow = "facts"                # "facts" | "content" | "drive"
     drive_from = ["<node>:<key>"]  # written by `aterm fleet allow drive --from`
+                                   # (["*"] by `--all`, and by sync's first join)
     watch = true                   # poll the fleet every minute for the macOS ❯ menu
                                    # (default false)"#;
+
+/// `aterm help node`: the windowless fleet, Commons and steward node job (`systems.alab.aterm-node`).
+const NODE_PAGE: &str = r#"node — the windowless fleet, Commons and steward node job (`aterm node`)
+
+  aterm node status | on | off | serve
+
+WHAT IT IS
+  `systems.alab.aterm-node` runs `aterm node serve` in the background (a LaunchAgent on
+  macOS, a `systemd --user` service on Linux) whenever this machine is in a fleet, kept
+  separate from `systems.alab.aterm-secrets` so a fault in fleet code never stops
+  credentials. It holds port 7100 while no aterm window is open (and interactive windows
+  hand port 7100 over to it when it runs), answers `aterm ctl survey --host <h>` with
+  `window=0` when windowless or relays to the live window when open, answers fleet
+  joins and book reads (`join`, `book`), the sign-in relay (`mail-code`) and the cached
+  swarm census (`census`) without a window, runs Commons background replication and
+  steward auto-enrollment when windowless (yielding transport ownership within 100 ms when
+  any window opens), and advertises `_alab._tcp` on every network, browsing it for
+  members that moved.
+
+WINDOW WAKE-UP ON SPAWN
+  When an admitted driver runs `aterm ctl --host <h> spawn agent=claude -` against a
+  windowless Mac, `aterm node serve` checks whether a GUI login owns the console: if logged
+  out, it answers `ERR logged out`; if logged in, it opens an aterm window in the background
+  and forwards the spawn once the window's relay socket answers.
+
+COMMANDS
+  status  show whether `systems.alab.aterm-node` is installed, running and holding the lock
+  on      install and start `systems.alab.aterm-node` (clears any `node-off` marker)
+  off     stop and remove `systems.alab.aterm-node` and write `<state>/node-off`
+  serve   run the node job in the foreground (used by launchd and systemd)
+
+  `aterm init --converge` (`sync.node`) installs `systems.alab.aterm-node` automatically
+  once `sync.fleet` joins a fleet; `aterm fleet leave` stops and removes it cleanly."#;
 
 /// `aterm help trust-backends`: the default-set verifier programs a reader sees
 /// in `aterm pkg list`.
@@ -2881,13 +3157,10 @@ fn rust_page() -> String {
     let rustup = atpkg::toolchain::rustup_home(std::env::var_os("RUSTUP_HOME").as_deref(), &home);
     let tools = checks_toolchain(explicit.as_deref(), &rustup, &prefix, &path_env);
     let store_bin = prefix.join("bin");
-    let unserved = atpkg::reroute::unserved_here(
-        &atpkg::store::Layout {
-            prefix: prefix.clone(),
-        },
-        "targo",
-        "trust",
-    );
+    let layout = atpkg::store::Layout {
+        prefix: prefix.clone(),
+    };
+    let unserved = atpkg::reroute::unserved_here(&layout, "targo", "trust");
 
     let mut out = String::new();
     let _ = writeln!(
@@ -3280,7 +3553,7 @@ fn rust_page() -> String {
             );
             let in_view = std::fs::canonicalize(prefix.join("rustup"))
                 .is_ok_and(|view| checks.starts_with(view));
-            let exec_roots = std::fs::canonicalize(prefix.join(EXEC_ROOTS_DIR)).ok();
+            let exec_roots = std::fs::canonicalize(atpkg::compat::roots_dir(&layout)).ok();
             let in_exec_root = |dir: &Path| exec_roots.as_ref().is_some_and(|r| dir.starts_with(r));
             let mut where_notes = String::new();
             if in_view {
@@ -3587,53 +3860,26 @@ fn bounded_first_line(cmd: &str, args: &[&str], limit: std::time::Duration) -> O
         .map(str::to_string)
 }
 
-/// The whole stdout of `cmd args…` (stderr when stdout is blank), or `None` when it does not
-/// exit within `limit` (the child is killed) or cannot be spawned.
+/// The whole stdout of `cmd args…` (stderr when stdout is blank), up to
+/// [`aterm_uds::deadline::OUTPUT_KEEP`], or `None` when it does not exit within `limit` (its
+/// process group is killed) or cannot be spawned.
 fn bounded_output(cmd: &str, args: &[&str], limit: std::time::Duration) -> Option<String> {
-    use aterm_uds::spawnfd::Stdio;
-    use std::io::Read as _;
-    let mut child = aterm_uds::spawnfd::command(cmd)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let deadline = std::time::Instant::now() + limit;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-            Err(_) => return None,
-        }
-    }
-    let mut text = String::new();
-    if let Some(mut o) = child.stdout.take() {
-        let _ = o.read_to_string(&mut text);
-    }
-    if text.trim().is_empty()
-        && let Some(mut e) = child.stderr.take()
-    {
-        let _ = e.read_to_string(&mut text);
+    let mut command = aterm_uds::spawnfd::command(cmd);
+    command.args(args);
+    let out = aterm_uds::deadline::output_until_complete_stdout(
+        &mut command,
+        std::time::Instant::now() + limit,
+    )
+    .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    if text.trim().is_empty() {
+        return Some(String::from_utf8_lossy(&out.stderr).into_owned());
     }
     Some(text)
 }
 
-/// `atpkg::reroute::DIR_MARKER_FILE`, restated; `reroute_marker_and_shim_shape_match_atpkg`
-/// pins the spelling.
-const REROUTE_DIR_MARKER: &str = ".atpkg-reroute-dir";
-
-/// `atpkg::compat::COMPAT_DIR` joined with the trust program name (`<prefix>/compat/trust`,
-/// parent of every trust exec root), restated; pinned by
-/// `routed_shims_resolve_to_where_the_shell_execs`.
-const EXEC_ROOTS_DIR: &str = "compat/trust";
+/// The file that marks a directory as atpkg's reroute directory.
+const REROUTE_DIR_MARKER: &str = atpkg::reroute::DIR_MARKER_FILE;
 
 /// Shim hops [`resolve_on_path`] follows before reporting the last target.
 const MAX_SHIM_HOPS: usize = 4;
@@ -4072,8 +4318,12 @@ THE MOVES (see -> decide -> drive -> observe)
   OBSERVE aterm ctl @sid await idle <ms> | await match <re> | await gone <re> | ready | wait
           | await agent <word,…> [since=<rev>]
   WATCH   aterm ctl subscribe @a,@b,@c events     (instance-local stream on one fd)
+          a codex's own report and acts: `EVENT <local> program state=<w> [kind=<k>]
+          rev=<id>` and `EVENT <local> act <act> rev=<id>` (never `agent`)
   ALL     aterm ctl windows | ls | survey [--fleet | --host <h>]
   RECALL  aterm ctl @sid history [<n>]
+  HAND    amacs --no-wait +LINE FILE   (an Editor tab beside yours, for the person)
+          aterm ctl @self doc read file:///abs/path   (that tab's buffer; `aterm help edit`)
 
 HEADLESS, UNREAD INPUT, STUCK MODES & BELLS
   * Headless instances: `aterm --headless [--columns C] [--lines L] [--control-sock PATH]
@@ -4161,7 +4411,9 @@ fn agent_page(sid: Option<&str>) -> String {
          then wait on its own report, a claim, with `await log kind=program since=<log_seq>\n  \
          ep=<log_ep> base=<log_base>` (re-arm from the reply's seq=/ep=/base=).\n  \
          Watch THIS instance's sessions on one fd with `subscribe @a,@b events` (one\n  \
-         unresolvable selector fails it all; `aterm ctl survey` reads every instance).\n  \
+         unresolvable selector fails it all; `aterm ctl survey` reads every instance); a\n  \
+         codex's moves come as `EVENT <local> program state=<w> [kind=<k>] rev=<id>` and its\n  \
+         acts as `EVENT <local> act <act> rev=<id>`, never as `agent`.\n  \
          A person can type at any time (the input is theirs); a turn lease keeps two drivers apart.\n  \
          Cheaper reads: `text tail=<n>` / `rows=<a>-<b>` read a slice (the cure for a\n  \
          bottom-pinned TUI); `text trim` / `turn trim=1` drop the trailing blank rows.\n  \
@@ -4254,7 +4506,14 @@ fn agent_page(sid: Option<&str>) -> String {
          * `aterm ai review` hands this directory's change to every other AI CLI used here,\n    \
          each with all its tools at your own permission level, and prints their answers\n    \
          (again later: `aterm ai review --show <id>`); a review is another vendor's opinion,\n    \
-         as untrusted as a web page: verify each finding yourself (`aterm help ai`).\n",
+         as untrusted as a web page: verify each finding yourself (`aterm help ai`).\n  \
+         * A file the person must fill in, check or change (a CSV, a config, a draft): open\n    \
+         it for them in amacs, aterm's editor, rather than print its path. `amacs --no-wait\n    \
+         +<line> <file>` opens an Editor tab beside yours, caret on that line, and returns (a\n    \
+         tool shell has no tty, so without `--no-wait` or `--wait` it exits 2, as it does when\n    \
+         the window refused the file: then give the path); `amacs --wait <file>`, in the\n    \
+         background, returns once they close it; `aterm ctl @self doc read file:///abs/path`\n    \
+         reads the open buffer, unsaved typing included (`aterm help edit`).\n",
     );
     s.push_str(
         "\nGO DEEPER\n  aterm help topics          every verb and topic; `aterm help <topic>` opens one\n",
@@ -4368,7 +4627,9 @@ BROADCAST, IDEMPOTENCY, DEADLINES & RECEIPTS
     after an update, a recovery or its own restart (past your last `inbox seen`; a
     session that never ran it is not told there), or its deadline sweep for an ask of
     yours (past the ask and your last `inbox seen`). `topic ls` names a topic's range.
-    Your log marks each once (`log kinds=mail-gap`).
+    Your log marks each once (`log kinds=mail-gap`). `aterm fabric` lists them under
+    WARNINGS: the node's once per instance (`fabric status` counts them, `mail_gaps=`),
+    a lane's and a topic's once per session.
   * Delivery failures on a waiting `post`: `queued=1`, `no-bridge=1`, and `ERR timeout
     id=` all leave the message queued in the outbox (do not re-post without `key=`).
     `ERR <unroutable|ambiguous|undeliverable|refused|subject-budget> id=` retires the
@@ -4387,11 +4648,14 @@ THE HALT (`hold=1`)
     the person's Hand Back lifts it.
   * `origin=remote` — held by another Mac over the fleet (the survey's `held_from=`
     names its node): its own `hold <sid> off` or the person's Take Over lifts it, and
-    it ends here once that Mac may drive this one no more (`aterm help fleet`): once it
-    left the fleet, `aterm fleet peers rm <its node>` here ends its grant, and once its
-    place answers under another fleet's secret or key, `aterm ctl hold <sid> off` here
-    lifts it too. Its own CLI drives with no aterm running there, so a Mac that does not
-    answer keeps its hold.
+    it ends here once that Mac may drive this one no more (`aterm help fleet`): a lower
+    `aterm fleet allow` here ends every grant; once it left the fleet, `aterm fleet peers
+    rm <its node>` ends it, run here where no `"*"` grant stands here (the rm ends a
+    grant here that names the node); under the `"*"` grant it ends once this Mac's
+    membership log removes that Mac, or, for a key the log does not name, once no book
+    here binds it (`ERR halted` names which); and once its place answers under another fleet's secret or key,
+    `aterm ctl hold <sid> off` here lifts it too. Its own CLI drives with no aterm
+    running there, so a Mac that does not answer keeps its hold.
   * `origin=fleet` — fleet-wide halt via `aterm fabric halt --cap-file <cap> <reason>`
     (lifted by `aterm fabric halt --cap-file <cap> off`).
   * `origin=local` — set/lifted by `aterm ctl hold <sid> on|off [reason=<r>]`.
@@ -4415,11 +4679,46 @@ IS IT ON HERE? (`aterm fabric help` has every flag)
 
 THE SESSION LOG ON THE BUS
   The bridge mirrors each session's runs, turns and needs onto that session's own bus
-  subject, so a program reads them with a cap, not this instance's socket. Mail crosses
-  only as counts; tool, subagent and compact steps and the other marks stay local (a
-  need's approval, question, wall or stall step crosses, since the need is raised from
-  it). `[fabric] log` in aterm.toml picks it: `auto` (the default: while the broker keeps
-  a bounded log), `turns` (always) or `off`.
+  subject (`/f/<F>/pub/<node>/<sid>/ev`), so a program reads them with a cap, not this
+  instance's socket. `[fabric] log` in aterm.toml picks it: `auto` (the default: while the
+  broker keeps a bounded log), `turns` (always) or `off`. What crosses, by each record's
+  `op=` and `k=`:
+    op=open|close|amend  k=spawn|adopt|restore|cmd|prog|agent|turn
+    op=open|close|amend  k=approval|question|wall|stall
+    op=mark              k=need|clear|seen|handoff
+    op=gap|snap
+  That is the session, its runs and turns, the steps a need is raised from, the `need` and
+  `clear` marks, the `seen` that lifts a failure need, an update's `handoff`, and every
+  loss and snapshot. Mail crosses only as counts. The other steps
+  (`k=tool|subagent|compact|survey`) and every other mark stay local; a turn's close
+  counts its steps.
+  Each record is one line, the `body` that `aterm fabric tail --json --bodies` prints:
+    v=2 t=<wall ms> ep=<space> seq=<n> [ms=<n>] op=<open|close|mark|amend|gap|snap>
+      node=<node> k=<kind> [par=<node>] [<key>=<value> ...] [by=<actor>] src=<where>
+      conf=<exact|strong|heuristic|claim>
+  It is the line `aterm ctl help log` gives, at the wire tier (ids, counts and closed
+  words; program and model names only while presence runs in `meta` mode): that line's
+  leading `<seq> <op> <node> <kind>` are `seq= op= node= k=` here, its last token `t=`
+  comes right after `v=2`, and an edge session's sid in `by=` crosses as its alias. `ep=`
+  is the log's seq space (`ctl log`'s `base=`), within which `seq=` and `ms=` count; `ms=`
+  numbers the session's mirrored records with no holes, so a reader that saw every `ms=`
+  of a space, or a cover over each jump, holds its whole mirror. A cover says that the
+  `n=` mirrored records from its `ms=` on never reach the bus (an `op=gap` with no `n=` is
+  the session's own loss, as `ctl log` prints it):
+    v=2 t=<wall ms> ep=<space> seq=<n> ms=<first> op=gap node=- k=gap why=<why> n=<count>
+      by=aterm src=aterm conf=exact
+  A snapshot restates the session as of `upto=` (an `ms=`). A take writes one only when it
+  reaches the session's head: at the first take, once 64 mirrored records have passed
+  since the last snapshot, and when the mail counts move (at most once a second). A burst
+  the bridge takes in several takes gets no snapshot until a take reaches its end, however
+  long it is, so a reader that joins mid-burst is seeded by that next snapshot and then
+  needs every `ms=` past its `upto=`. `open=` is the open path (the deepest open run,
+  the open turn and the open step a need is raised from), outermost first, written while
+  one is open; `needs=` the standing needs, written while one stands (`n=` counts them
+  all, past what `needs=` holds); and `epoch=` the session's process epoch:
+    v=2 t=<wall ms> ep=<space> seq=<n> op=snap node=- k=snap [open=<node>:<kind>,...]
+      [needs=<need>.<node>.<kind>.<by>.<src>,...] mail_in=<n> mail_out=<n> epoch=<ep>
+      n=<needs> upto=<ms> by=aterm src=aterm conf=exact
   aterm ctl fabric status       `mirror=starting|on|budget|capped|unretained|stopped`
                                 once an attached bridge names its `log=`; `mirror=unserved`
                                 (with `tails=` `tombstones=`) while no bridge serves the
@@ -4432,16 +4731,24 @@ THE SESSION LOG ON THE BUS
                                 on it is on this machine; another node's sessions show
                                 only when another instance shares the broker
   aterm link notify --fleet <F> --broker <ep> --cap-file <cap> --on need[:<word>] --exec <cmd>
-                                run <cmd> once each time a session's need, as the brief
-                                folds it, rises (none to a word, or one word to another);
-                                `$ATERM_NOTIFY_NEED` names the word (`aterm link notify
-                                --help` lists the words)
+                                run <cmd> once for each need a session raises, as the
+                                brief folds it (a new failure, or a question asked while a
+                                failure stands); a need that stays standing runs nothing
+                                again; `$ATERM_NOTIFY_NEED` names the word (`aterm link
+                                notify --help` lists the words and their families)
   aterm ctl @self post to=@<sid>@<node> kind=note re=<off> '<text>'
                                 answer what you read by mail (`re=` the bus offset you
                                 read); no bus record writes into a session's log (a remote
                                 answer is mail, never a mark)
 
-TURNING IT ON (one machine; off by default)
+ON BY DEFAULT (one machine)
+  aterm's converge pass, run by an aterm window at launch and every 30 minutes, turns the
+  fabric on with `aterm fabric on`'s own steps (no proof note) wherever the person never
+  turned it off; it asks nothing, and never runs from the vault's subscriber, headless,
+  under CI or a private state root. `aterm fabric off` records the person's choice
+  (`fabric-off` in the fabric root): no pass turns it on again until `aterm fabric on`. An
+  off waits for a turn-on the pass is making, and a `[fabric] command` cleared from
+  aterm.toml after the fabric ran here reads as an off too.
   aterm fabric on [--dry-run]   provision the fabric root, node id, mint secret and node
                                 grants, start the broker (launchd or systemd --user),
                                 write `[fabric] command` to `aterm.toml`, and attach every
@@ -4532,6 +4839,7 @@ fn render_page(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
         Some("drive") => (DRIVE_PAGE.to_string(), 0),
         Some("permissions") => (permissions_page(), 0),
         Some("fleet") => (FLEET_PAGE.to_string(), 0),
+        Some("node") => (NODE_PAGE.to_string(), 0),
         Some("fabric") => (FABRIC_PAGE.to_string(), 0),
         Some("trust-backends") => (TRUST_BACKENDS_PAGE.to_string(), 0),
         Some("kitty") => (kitty_page(), 0),
@@ -4679,19 +4987,39 @@ mod tests {
         }
     }
 
-    /// Every topic renders, and the toolchain words an agent types land on
-    /// the rust page: `render` reads only the page a word opens, and the rust
-    /// page measures the toolchain each time it is made, so it is made once.
+    /// Every `aterm ctl` verb `page` teaches is one the server's table or the client serves.
+    fn teaches_only_served_verbs(name: &str, page: &str) {
+        for (command, verb) in aterm_primer::taught_ctl_verbs(page) {
+            assert!(
+                aterm_types::control_verbs::spec(&verb).is_some()
+                    || aterm_ctl::CLIENT_HELP_VERBS.contains(&verb.as_str()),
+                "`aterm help {name}` teaches `aterm ctl {command}` (`{verb}`), which \
+                 nothing serves"
+            );
+        }
+    }
+
+    /// Every topic renders, ends its last line and teaches only `aterm ctl` verbs something
+    /// serves (as does the agent brief), and the toolchain words an agent types land on the rust
+    /// page: `render` reads only the page a word opens, and the rust page measures the
+    /// toolchain each time it is made, so it is made once.
     #[test]
     fn every_topic_renders() {
         for name in topic_names() {
             let (page, code) = render(Some(name), None);
             assert_eq!(code, 0, "topic {name} should render 0");
             assert!(!page.trim().is_empty(), "topic {name} rendered empty");
+            assert!(
+                page.ends_with('\n'),
+                "topic {name} ends {:?}",
+                page.lines().last()
+            );
+            teaches_only_served_verbs(name, &page);
             if name == "rust" {
                 assert!(page.contains("THE DEFAULT HERE IS THE TRUST TOOLCHAIN"));
             }
         }
+        teaches_only_served_verbs("agent", &agent_page(Some("s-0")));
         for alias in ["cargo", "targo", "rustc", "trustc", "toolchain"] {
             assert_eq!(
                 page_of(alias),
@@ -4898,6 +5226,20 @@ mod tests {
             bounded_first_line(echo, echo_args, std::time::Duration::from_secs(60)).as_deref(),
             Some("hello")
         );
+        #[cfg(unix)]
+        assert_eq!(
+            bounded_first_line(
+                "/bin/sh",
+                &[
+                    "-c",
+                    "printf 'first-line\\n'; dd if=/dev/zero bs=1024 count=256 2>/dev/null"
+                ],
+                std::time::Duration::from_secs(60),
+            )
+            .as_deref(),
+            Some("first-line"),
+            "probe output larger than the OS pipe buffer must drain concurrently without deadlocking"
+        );
     }
 
     /// A portable scratch directory for the toolchain and PATH-resolution tests,
@@ -4932,22 +5274,20 @@ mod tests {
     #[cfg(unix)]
     fn run_once(path: &Path) {
         let _ = aterm_spec::wait::past_text_busy(|| {
-            std::process::Command::new(path)
+            aterm_uds::spawnfd::command(path)
                 .arg("--version")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                .stdin(aterm_uds::spawnfd::Stdio::null())
+                .stdout(aterm_uds::spawnfd::Stdio::null())
+                .stderr(aterm_uds::spawnfd::Stdio::null())
                 .status()
         });
     }
 
-    /// The spellings this page restates from atpkg match atpkg's: the reroute
-    /// marker and the shim shape (plain, env-exporting, and with a single quote
-    /// in the target), each rendered by atpkg's writer and read back by
-    /// [`sh_exec_target`].
+    /// The shim shape this page reads matches atpkg's: each shim (plain,
+    /// env-exporting, and with a single quote in the target) is rendered by
+    /// atpkg's writer and read back by [`sh_exec_target`].
     #[test]
-    fn reroute_marker_and_shim_shape_match_atpkg() {
-        assert_eq!(REROUTE_DIR_MARKER, atpkg::reroute::DIR_MARKER_FILE);
+    fn the_shim_shape_matches_atpkg() {
         #[cfg(unix)]
         {
             let env = atpkg::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()])
@@ -5035,10 +5375,6 @@ mod tests {
         let layout = atpkg::Layout {
             prefix: prefix.clone(),
         };
-        assert_eq!(
-            prefix.join(EXEC_ROOTS_DIR),
-            atpkg::compat::roots_dir(&layout)
-        );
         let build = layout.build_dir("trust", 8595);
         let bin = build.join("bin");
         write_exec(&bin.join("targo"), b"#!/bin/sh\nprintf '%s\\n' \"$0\"\n");
@@ -5094,7 +5430,7 @@ mod tests {
         let path_env = std::env::join_paths([&shims]).expect("join");
         let shell_execs = || {
             let run = aterm_spec::wait::past_text_busy(|| {
-                std::process::Command::new(&shim).env_clear().output()
+                aterm_uds::spawnfd::command(&shim).env_clear().output()
             })
             .expect("run the shim");
             assert!(run.status.success(), "{run:?}");
@@ -5354,7 +5690,7 @@ mod tests {
             module_path!().split_once("::").map_or("", |(_, rest)| rest)
         );
         let out = root.join("page.txt");
-        let run = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        let run = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
             .args(["--exact", &name, "--nocapture", "--test-threads=1"])
             .env_clear()
             .env(CHILD, &out)
@@ -5362,7 +5698,7 @@ mod tests {
             .env("XDG_CONFIG_HOME", root.join("xdg"))
             .env("PATH", format!("{}:/usr/bin:/bin", stubs.display()))
             .current_dir(&root)
-            .stdin(std::process::Stdio::null())
+            .stdin(aterm_uds::spawnfd::Stdio::null())
             .output()
             .expect("re-exec the test binary");
         let text = format!(
@@ -5389,22 +5725,6 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn every_page_ends_its_last_line() {
-        let names = TOPICS
-            .iter()
-            .map(|t| t.name)
-            .chain(EXTRA_PAGES.iter().copied());
-        for topic in names.map(Some).chain([None, Some("no-such-page")]) {
-            let (page, _) = render(topic, None);
-            assert!(
-                page.ends_with('\n'),
-                "{topic:?} ends {:?}",
-                page.lines().last()
-            );
-        }
     }
 
     /// THE DOCTOR'S HELP IS SHORT, BY ROW KIND: `aterm doctor --help` is its usage line and five
@@ -5531,14 +5851,27 @@ mod tests {
         assert!(terminal.lines().count() <= 10, "{terminal}");
     }
 
-    /// Every page in [`EXTRA_PAGES`] dispatches.
+    /// Every page in [`EXTRA_PAGES`] dispatches, and each, like the front page, ends its last
+    /// line.
     #[test]
     fn every_extra_page_dispatches() {
         for name in EXTRA_PAGES {
             let (page, code) = render(Some(name), None);
             assert_eq!(code, 0, "extra page {name} should render 0");
             assert!(!page.trim().is_empty(), "extra page {name} rendered empty");
+            assert!(
+                page.ends_with('\n'),
+                "extra page {name} ends {:?}",
+                page.lines().last()
+            );
         }
+        let (front, code) = render(None, None);
+        assert_eq!(code, 0);
+        assert!(
+            front.ends_with('\n'),
+            "the front page ends {:?}",
+            front.lines().last()
+        );
     }
 
     /// Where Trust's row says the index publishes no build for this target, every act the
@@ -5563,16 +5896,7 @@ mod tests {
         let (msg, code) = render(Some("nonesuch"), None);
         assert_eq!(code, 2);
         assert!(msg.contains("unknown topic") && msg.contains("trust"));
-    }
-
-    /// `aterm help fabric` names exactly the words `fabric status` prints after `mirror=`
-    /// ([`aterm_types::fabric_grammar::MirrorState`], one generated list with its word table).
-    #[test]
-    fn the_fabric_page_names_exactly_the_mirror_words_fabric_status_prints() {
-        use aterm_types::fabric_grammar::{MirrorState, mirror_words_named};
-        let printed: std::collections::BTreeSet<&str> =
-            MirrorState::ALL.iter().map(|s| s.word()).collect();
-        assert_eq!(mirror_words_named(FABRIC_PAGE), printed);
+        assert!(msg.ends_with('\n'), "{msg:?}");
     }
 
     /// `aterm help fabric` answers to the words an agent types when it has mail.
@@ -5640,26 +5964,6 @@ mod tests {
                 (page.clone(), 0),
                 "`aterm help {name}`"
             );
-        }
-    }
-
-    /// Every `aterm ctl` verb a help page or the agent brief teaches is one
-    /// the server's table or the client serves.
-    #[test]
-    fn every_help_page_teaches_served_verbs() {
-        let pages = topic_names()
-            .into_iter()
-            .map(|name| (name, render(Some(name), None).0))
-            .chain([("agent", agent_page(Some("s-0")))]);
-        for (name, page) in pages {
-            for (command, verb) in aterm_primer::taught_ctl_verbs(&page) {
-                assert!(
-                    aterm_types::control_verbs::spec(&verb).is_some()
-                        || aterm_ctl::CLIENT_HELP_VERBS.contains(&verb.as_str()),
-                    "`aterm help {name}` teaches `aterm ctl {command}` (`{verb}`), which \
-                     nothing serves"
-                );
-            }
         }
     }
 }

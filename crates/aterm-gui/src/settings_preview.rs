@@ -129,7 +129,10 @@ impl PreviewPause {
     fn badge(self) -> String {
         match self {
             Self::SeriousMode => "Serious Mode".to_string(),
-            Self::Unfocused | Self::Load | Self::Resting | Self::Viewer => "Paused".to_string(),
+            Self::Unfocused => "Paused in background".to_string(),
+            Self::Load => "Paused under load".to_string(),
+            Self::Resting => "Resting".to_string(),
+            Self::Viewer => "Paused".to_string(),
             Self::MotionSetting => crate::native_settings::reduce_motion_words(),
             Self::SystemReduceMotion => "System Reduce Motion".to_string(),
             Self::Unspecified => "Reduced motion".to_string(),
@@ -343,9 +346,20 @@ impl CursorPreviewSpec {
         }
     }
 
+    /// The preview's glow config on `theme`, resolved as a window's is. Its light
+    /// (`docs/design/PRISM-GLASS.md` §15.2 1.11) has no latch: the preview's theme is both its
+    /// configured scheme and its page, and no program moves either, so the light is
+    /// [`crate::cursor_glow::Light::admitted`] the two tests a window's latch gates on
+    /// (`scheme_light`, `raw_light`) at `prism_glass::LIVE`, from the first frame.
     fn glow_config(&self, theme: Theme, head_dx: f32) -> crate::cursor_glow::GlowConfig {
+        use aterm_effects::host::light_latch::{raw_light, scheme_light};
         let presentation = self.resolved_trail_presentation();
-        crate::app_config::resolve_cursor_glow(
+        let (fg, bg, dark_theme) = (
+            theme.fg & 0x00FF_FFFF,
+            theme.bg & 0x00FF_FFFF,
+            theme_bg_is_dark(theme.bg),
+        );
+        let mut cfg = crate::app_config::resolve_cursor_glow(
             crate::app_config::CursorGlowInputs {
                 enabled: self.trail_enabled,
                 color: self.color.knob(theme.cursor),
@@ -358,11 +372,16 @@ impl CursorPreviewSpec {
             },
             presentation,
             theme.cursor,
-            theme_bg_is_dark(theme.bg),
-            theme.fg & 0x00FF_FFFF,
-            theme.bg & 0x00FF_FFFF,
+            dark_theme,
+            fg,
+            bg,
             head_dx,
-        )
+        );
+        cfg.light = crate::cursor_glow::Light::admitted(
+            scheme_light(bg) && raw_light(fg, bg, dark_theme),
+            aterm_effects::rainbow_kitty::prism_glass::LIVE,
+        );
+        cfg
     }
 
     const fn has_resolved_trail(&self) -> bool {
@@ -491,18 +510,9 @@ fn spoken_palette(theme: PreviewTerminalTheme, identity: Option<&PreviewThemeIde
     format!(
         "{label}, {}, text contrast {}:1, {illegible} {} below 3:1",
         if light { "light" } else { "dark" },
-        trim_contrast(text),
+        theme_card::contrast_figure(text),
         if illegible == 1 { "colour" } else { "colours" },
     )
-}
-
-fn trim_contrast(ratio: f64) -> String {
-    let tenths = (ratio * 10.0).floor() / 10.0;
-    if tenths.fract() == 0.0 {
-        format!("{tenths:.0}")
-    } else {
-        format!("{tenths:.1}")
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3910,12 +3920,45 @@ fn prompt_row(input: &RenderInput) -> usize {
         .unwrap_or(input.rows.saturating_sub(1))
 }
 
-fn scroll_previous_line(base: &RenderInput, row: usize) -> RenderInput {
+/// What the scene's command prints once the Return hands it to the shell: `git commit`'s
+/// summary, the commit naming what `cat README.md` above read. It is shorter than the Tab's
+/// landing column, so the next prompt's Tab lands with blank cells over it, where a dark landing
+/// ring shows whole by the letter guard's law (`RIM_SHOWN_SHARE`) as the terminal's does: under
+/// the command itself, every landing of the scene lay among the letters of the line above, and
+/// on dark Ring on jumps showed as the landing's veil alone (audit r14 PV7).
+const CURSOR_SCENE_OUTPUT: &str = "[main 4f2c9e1] ship it";
+
+/// The rows a Return scrolls the scene by: the line it hands the shell and the line the shell
+/// prints ([`CURSOR_SCENE_OUTPUT`]).
+const CURSOR_SCENE_RETURN_ROWS: u16 = 2;
+
+/// `base` once the Return has handed the prompt row's line to the shell: the line and what the
+/// shell printed for it ([`CURSOR_SCENE_OUTPUT`]) lie over the fresh prompt, the rows above
+/// scrolled up to make room.
+fn scroll_submitted_line(base: &RenderInput, row: usize) -> RenderInput {
     let mut scrolled = base.clone();
-    if row > 0 && row < scrolled.cells.len() {
-        let previous = scrolled.cells[row].clone();
-        scrolled.cells[..row].rotate_left(1);
-        scrolled.cells[row - 1] = previous;
+    if row == 0 || row >= scrolled.cells.len() {
+        return scrolled;
+    }
+    let submitted = scrolled.cells[row].clone();
+    // A cell in the page's own colours: the command's first, past the
+    // prompt's coloured path.
+    let Some(&blank) = submitted.get(TypedLine::of(&submitted).start) else {
+        return scrolled;
+    };
+    let blank = aterm_core::terminal::RenderCell { ch: ' ', ..blank };
+    let mut printed = vec![blank; submitted.len()];
+    for (cell, ch) in printed.iter_mut().zip(CURSOR_SCENE_OUTPUT.chars()) {
+        cell.ch = ch;
+    }
+    let lines = [submitted, printed];
+    let shift = lines.len().min(row);
+    scrolled.cells[..row].rotate_left(shift);
+    for (slot, line) in scrolled.cells[row - shift..row]
+        .iter_mut()
+        .zip(&lines[lines.len() - shift..])
+    {
+        slot.clone_from(line);
     }
     scrolled
 }
@@ -3973,7 +4016,8 @@ pub(crate) struct SceneJump {
 }
 
 /// The scene's jumps: the Tab's completion along the typed line, over the letters it completes,
-/// and the Return from the line's end down to the next prompt's first column.
+/// and the Return from the line's end down past what the shell prints to the next prompt's first
+/// column.
 pub(crate) const fn scene_jumps() -> [SceneJump; 2] {
     [
         SceneJump {
@@ -3982,7 +4026,7 @@ pub(crate) const fn scene_jumps() -> [SceneJump; 2] {
             over_letters: true,
         },
         SceneJump {
-            rows: 1,
+            rows: CURSOR_SCENE_RETURN_ROWS,
             cols: CURSOR_SCENE_COMMAND.len() as u16,
             over_letters: false,
         },
@@ -4041,10 +4085,6 @@ fn scene_cells_at(offset: u64) -> usize {
     }
 }
 
-fn scene_last_key_ms(offset: u64) -> u64 {
-    (offset / KEY_MS).min(CURSOR_SCENE_KEYS) * KEY_MS
-}
-
 #[derive(Clone, Copy, Debug)]
 struct TypedLine {
     /// First column after the prompt.
@@ -4076,6 +4116,410 @@ impl TypedLine {
     }
 }
 
+/// Tests' negative controls over the cursor scenes a thread builds
+/// ([`CursorScene::new`]), each reverting one law.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SceneControls {
+    /// The pet seats off the letters ([`scene_pet_seat`]); off, it stands at
+    /// the station beside the caret wherever its body lies.
+    pet_seat_law: bool,
+    /// The trail reads the frame's text; off, it reads none, as the scene's
+    /// step fed it none before.
+    frame_text: bool,
+    /// A particle the card's edge would cut is left out whole; off, it is
+    /// drawn cut (`CursorGlow::set_motes_cut`).
+    motes_whole: bool,
+    /// The pet keeps one seat for the line it is written beside
+    /// ([`scene_pet_seat`]'s `kept`); off, each key seats it afresh.
+    one_seat_a_line: bool,
+    /// The trail reads what the card's face lays of each glyph
+    /// ([`SceneStage::ink`]); off, it reads every glyph's ink as its colour.
+    glyph_ink: bool,
+    /// A light rising past the card's top edge is laid shorter inside it;
+    /// off, the box's clip cuts it flat there (`CursorGlow::set_rise_cut`).
+    rises_kept: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCENE_CONTROLS: std::cell::Cell<SceneControls> = const {
+        std::cell::Cell::new(SceneControls {
+            pet_seat_law: true,
+            frame_text: true,
+            motes_whole: true,
+            one_seat_a_line: true,
+            glyph_ink: true,
+            rises_kept: true,
+        })
+    };
+}
+
+/// The scene's lettered cells as shown with the typed line's caret at `caret`:
+/// `cells` hold the whole command on the prompt row, whose cells from the caret
+/// to the command's end are not typed yet.
+#[derive(Clone, Copy)]
+struct SceneLetters<'a> {
+    cells: &'a [Vec<aterm_core::terminal::RenderCell>],
+    /// The prompt's row.
+    row: usize,
+    line: TypedLine,
+    caret: usize,
+}
+
+impl SceneLetters<'_> {
+    /// Whether the cell at `(row, col)` holds a glyph (a blank holds none).
+    fn lettered(&self, row: usize, col: usize) -> bool {
+        if row == self.row && col >= self.caret && col < self.line.end {
+            return false;
+        }
+        self.cells
+            .get(row)
+            .and_then(|cells| cells.get(col))
+            .is_some_and(|cell| !matches!(cell.ch, ' ' | '\0'))
+    }
+}
+
+/// What the resident pet's frame reads ([`CursorScene::place_companion`]).
+struct PetCue<'a> {
+    letters: SceneLetters<'a>,
+    /// The caret's column after the loop's Return and after each of its keys,
+    /// in order (empty for a still scene).
+    carets: Vec<usize>,
+    /// The keys the loop has typed: `carets[keys]` is the caret shown.
+    keys: usize,
+    /// Scene time since the loop's Return, ms.
+    offset: u64,
+    /// The typed cells, which step the walk.
+    typed: usize,
+}
+
+/// How many rows under the caret's the pet's seat may lie on (the terminal
+/// head law's `HEAD_SEAT_ROWS`).
+const PET_SEAT_ROWS: u16 = 3;
+
+/// A resident pet's frame whose body's left edge stands `seat.0` columns
+/// along row `seat.1`, `width` columns wide at its own size, drawn at `fit`.
+fn scene_pet_frame(
+    (left, row): (f32, f32),
+    (width, fit): (f32, f32),
+    (action, pose): (
+        aterm_effects::kitty_pet::PetAction,
+        aterm_effects::pet_glyphs_gen::PetGlyphId,
+    ),
+) -> aterm_effects::kitty_pet::PetFrame {
+    use aterm_effects::kitty_pet::{PET_DEPARTURES_MAX, PET_MOTES_MAX, PetFrame};
+
+    PetFrame {
+        alpha: 255,
+        lane_alpha: 255,
+        action,
+        pose,
+        // `PetFrame::body_px` centres the drawn body on the art's own width.
+        col: left - width * (1.0 - fit) / 2.0,
+        row,
+        lift: 0.0,
+        facing_left: false,
+        scale_x: fit,
+        scale_y: fit,
+        purr: 0.0,
+        contented: false,
+        under_ink: false,
+        motes: [None; PET_MOTES_MAX],
+        departures: [None; PET_DEPARTURES_MAX],
+    }
+}
+
+/// The box a pet seated at `seat` draws, in grid pixels, end exclusive: the
+/// sprite `pet_cursor` lays (`PetFrame::body_px`), held over the card's
+/// `floor` as [`CursorScene::place_companion`] holds it.
+fn scene_pet_box(
+    seat: (f32, f32),
+    size: (f32, f32),
+    geom: aterm_effects::word_decorations::EffectGeom,
+    floor: i32,
+) -> Option<(i32, i32, i32, i32)> {
+    use aterm_effects::kitty_pet::PetAction;
+    use aterm_effects::pet_glyphs_gen::PetGlyphId;
+
+    let (x0, x1, y0, y1) = scene_pet_frame(seat, size, (PetAction::Sit, PetGlyphId::PetSit))
+        .body_px(geom.cell_w, geom.cell_h, geom.cols, geom.rows)?;
+    let y = y0.min(floor - (y1 - y0)).max(0);
+    Some((x0, x1, y, y + (y1 - y0)))
+}
+
+/// Whether a pet's drawn `body` keeps off every lettered cell and the caret's.
+fn scene_pet_clear(
+    (x0, x1, y0, y1): (i32, i32, i32, i32),
+    letters: SceneLetters<'_>,
+    caret: (u16, u16),
+    geom: aterm_effects::word_decorations::EffectGeom,
+) -> bool {
+    let (cw, ch) = (i32::from(geom.cell_w), i32::from(geom.cell_h));
+    if cw <= 0 || ch <= 0 || x1 <= x0 || y1 <= y0 {
+        return true;
+    }
+    let cells = |lo: i32, hi: i32, size: i32| {
+        let first = usize::try_from(lo.max(0) / size).unwrap_or(0);
+        let last = usize::try_from((hi - 1).max(0) / size).unwrap_or(0);
+        first..=last
+    };
+    let caret = (usize::from(caret.0), usize::from(caret.1));
+    cells(y0, y1, ch)
+        .all(|row| cells(x0, x1, cw).all(|col| (row, col) != caret && !letters.lettered(row, col)))
+}
+
+/// Where the resident pet sits for a caret at `caret`, as the terminal's head
+/// law seats it (`kitty_pet`'s `clear_of_letters_above`), its whole drawn body
+/// off the letters and the caret: the station beside the caret where its body
+/// lies on neither; else the nearest seat, a row counting as two columns as the
+/// law counts it, along the caret's row away from the caret (past the letters
+/// over its head) or on a shown row under the caret's ([`PET_SEAT_ROWS`]: the
+/// blank row under the prompt). With no seat the station holds. The left edge
+/// of the drawn body, in columns, and its row; `size` is the art's own width
+/// in columns and the share it is drawn at, `floor` the card's shown height
+/// (px). A pet `kept` on a row under the caret's while the line is written
+/// keeps that row while it holds a seat, the nearest along it to the station
+/// (the head law's ONE SEAT FOR THE WHOLE LINE): taken up beside the caret
+/// once the writing passed the line above's end, it flew up mid-line and down
+/// again at the Return.
+fn scene_pet_seat(
+    letters: SceneLetters<'_>,
+    caret: (u16, u16),
+    geom: aterm_effects::word_decorations::EffectGeom,
+    size: (f32, f32),
+    (floor, kept): (i32, Option<(f32, f32)>),
+) -> (f32, f32) {
+    /// The step (columns) a seat is sought along a row by.
+    const STEP: f32 = 1.0 / 8.0;
+    /// A row's distance in columns (the head law's `ROW_AS_COLS`).
+    const ROW_AS_COLS: f32 = 2.0;
+
+    let width = size.0 * size.1;
+    let limit = (f32::from(geom.cols) - width).max(0.0);
+    let station = aterm_effects::kitty_pet::PetBrain::station(caret.1, geom.cols, width);
+    let clear = |left: f32, row: f32| {
+        scene_pet_box((left, row), size, geom, floor)
+            .is_some_and(|body| scene_pet_clear(body, letters, caret, geom))
+    };
+    let row = f32::from(caret.0);
+    let steps = |from: f32, toward: f32| {
+        (0_u16..)
+            .map(move |step| from + f32::from(step) * toward)
+            .take_while(move |left| (0.0..=limit).contains(left))
+    };
+    let shown = u16::try_from(floor / i32::from(geom.cell_h.max(1))).unwrap_or(0);
+    if let Some((_, kept_row)) = kept {
+        let below = kept_row - row;
+        if (1.0..=f32::from(PET_SEAT_ROWS)).contains(&below)
+            && kept_row < f32::from(shown.min(geom.rows))
+        {
+            let nearest = [STEP, -STEP]
+                .into_iter()
+                .filter_map(|toward| steps(station, toward).find(|&left| clear(left, kept_row)))
+                .min_by(|a, b| (a - station).abs().total_cmp(&(b - station).abs()));
+            if let Some(left) = nearest {
+                return (left, kept_row);
+            }
+        }
+    }
+    if clear(station, row) {
+        return (station, row);
+    }
+    let away = if station >= f32::from(caret.1) {
+        STEP
+    } else {
+        -STEP
+    };
+    let mut best = steps(station, away)
+        .find(|&left| clear(left, row))
+        .map(|left| ((left - station).abs(), left, row));
+    for below in 1..=PET_SEAT_ROWS {
+        let under = caret.0.saturating_add(below);
+        let drop = ROW_AS_COLS * f32::from(below);
+        if under >= shown.min(geom.rows) || best.is_some_and(|(d, ..)| drop >= d) {
+            break;
+        }
+        let under = f32::from(under);
+        for toward in [STEP, -STEP] {
+            let Some(left) = steps(station, toward).find(|&left| clear(left, under)) else {
+                continue;
+            };
+            let d = (left - station).hypot(drop);
+            if best.is_none_or(|(bd, ..)| d < bd) {
+                best = Some((d, left, under));
+            }
+        }
+    }
+    best.map_or((station, row), |(_, left, seat)| (left, seat))
+}
+
+/// What one cursor-scene card showed: its phase, its cells, its decorated input (the text,
+/// the caret and the lights it played) and its companion's drawn body. A window's capture keeps
+/// the card its frame painted ([`stash_captured_scene_card`]), and `settings card` names it as
+/// the terminal's `dims`, `cursor`, `text` and `trail status` replies name a terminal frame
+/// ([`captured_scene_card_reply`]): the trail gallery keeps those beside each settings frame,
+/// so `aterm-lab trail-contrast` and `trail-companion` judge the demo's letters and companion
+/// as they judge the terminal's.
+#[derive(Clone, Debug)]
+pub(crate) struct SceneCardShot {
+    phase_ms: u64,
+    /// Device pixels.
+    cell: (usize, usize),
+    input: RenderInput,
+    /// Card device pixels `(x0, x1, y0, y1)`, end exclusive: the union of the companion's
+    /// sprites as the card drew them (the terminal's `pet_body`, its sprite unshaved).
+    body: Option<(i32, i32, i32, i32)>,
+}
+
+/// A card a raster blitted: the shot, the specimen it played on (for its bare twin) at the
+/// scale it rendered, and its top-left in the raster's device pixels.
+#[derive(Clone)]
+struct PaintedSceneCard {
+    shot: std::rc::Rc<SceneCardShot>,
+    spec: crate::widget::TerminalSpecimenSpec,
+    scale: f32,
+    at: (i32, i32),
+}
+
+/// The card the last capture's frame painted, and its raster's top-left in the window.
+struct CapturedSceneCard {
+    card: PaintedSceneCard,
+    origin: (i32, i32),
+}
+
+thread_local! {
+    static DECORATED_CARD: std::cell::RefCell<Option<std::rc::Rc<SceneCardShot>>> =
+        const { std::cell::RefCell::new(None) };
+    static PAINTED_CARD: std::cell::RefCell<Option<Box<PaintedSceneCard>>> =
+        const { std::cell::RefCell::new(None) };
+    static CAPTURED_CARD: std::cell::RefCell<Option<Box<CapturedSceneCard>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn note_scene_card(shot: SceneCardShot) {
+    DECORATED_CARD.set(Some(std::rc::Rc::new(shot)));
+}
+
+/// A raster blitted `spec`'s card at `at`, its device pixels: the card the scene last decorated
+/// (a still scene's cached frame is the one it decorated) is the one a capture of it shows.
+pub(crate) fn note_scene_card_painted(
+    spec: &crate::widget::TerminalSpecimenSpec,
+    scale: f32,
+    at: (i32, i32),
+) {
+    if spec.motion.is_none() {
+        return;
+    }
+    let Some(shot) = DECORATED_CARD.with_borrow(Clone::clone) else {
+        return;
+    };
+    PAINTED_CARD.set(Some(Box::new(PaintedSceneCard {
+        shot,
+        spec: spec.clone(),
+        scale,
+        at,
+    })));
+}
+
+/// A capture keeps the card its frame painted, the raster that holds it at `origin` in the
+/// window's device pixels; `None` (a frame with no native page) keeps none.
+pub(crate) fn stash_captured_scene_card(origin: Option<(i32, i32)>) {
+    let card = origin.and_then(|origin| {
+        PAINTED_CARD
+            .with_borrow(|card| card.as_deref().cloned())
+            .map(|card| Box::new(CapturedSceneCard { card, origin }))
+    });
+    CAPTURED_CARD.set(card);
+}
+
+/// `settings card`: the card the last capture's frame painted, as reply lines. `dims OK <rows>
+/// <cols> <w> <h> cell_w=<px> cell_h=<px> pad=<x> pad_top=<y> head=0` (the card's grid in the
+/// window, as the terminal's `dims` names a pane's), `cursor OK <row> <col> <visible> <style>`,
+/// `status phase=<ms> pet_body=<x0>,<x1>,<y0>,<y1> word_icons=none` (window device pixels, end
+/// exclusive, as `trail status` names the terminal companion's; `pet_body=none` with none drawn;
+/// the card shows no word icon) and `text
+/// <row>` for each row. With `clean`, one line `clean <x> <y> <w> <h> <bytes> <base64 PNG>`:
+/// the same cells rendered with no light, no companion and no bloom (`image clean`'s twin), at
+/// the card's place in the window.
+pub(crate) fn captured_scene_card_reply(clean: bool) -> Result<Vec<String>, String> {
+    CAPTURED_CARD.with_borrow(|captured| {
+        let Some(CapturedSceneCard {
+            card,
+            origin: (ox, oy),
+        }) = captured.as_deref()
+        else {
+            return Err(
+                "settings card: the last capture painted no cursor scene card; \
+                        capture a Cursor settings page with `image` first"
+                    .to_string(),
+            );
+        };
+        let (x, y) = (ox + card.at.0, oy + card.at.1);
+        let shot = &card.shot;
+        if clean {
+            // The page under the card is no light: the wallpaper the card was laid on stays.
+            let mut bare = shot.input.clone();
+            let wallpaper = bare.wallpaper.take();
+            bare.clear_overlays();
+            bare.wallpaper = wallpaper;
+            let frame = crate::tray_raster::render_bare_scene_card(&card.spec, bare, card.scale)
+                .ok_or_else(|| "settings card clean: the bare card did not render".to_string())?;
+            let rgba: Vec<u8> = frame
+                .pixels
+                .iter()
+                .flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255])
+                .collect();
+            let (w, h) = (frame.width, frame.pixels.len() / frame.width.max(1));
+            let png = crate::app_introspect::encode_rgba8_png(
+                &rgba,
+                u32::try_from(w).map_err(|e| e.to_string())?,
+                u32::try_from(h).map_err(|e| e.to_string())?,
+            )?;
+            let encoded = aterm_codec::base64::encode(&png).map_err(|e| format!("{e:?}"))?;
+            return Ok(vec![format!(
+                "clean {x} {y} {w} {h} {} {encoded}",
+                png.len()
+            )]);
+        }
+        let input = &shot.input;
+        let (cw, ch) = shot.cell;
+        let mut lines = vec![
+            format!(
+                "dims OK {} {} {} {} cell_w={cw} cell_h={ch} pad={x} pad_top={y} head=0",
+                input.rows,
+                input.cols,
+                input.cols * cw,
+                input.rows * ch
+            ),
+            format!(
+                "cursor OK {} {} {} {}",
+                input.cursor_row,
+                input.cursor_col,
+                u8::from(input.cursor_visible),
+                crate::control::cursor_style_name(input.cursor_style)
+            ),
+            format!(
+                "status phase={} pet_body={} word_icons=none",
+                shot.phase_ms,
+                shot.body.map_or_else(
+                    || "none".to_string(),
+                    |(x0, x1, y0, y1)| format!("{},{},{},{}", x + x0, x + x1, y + y0, y + y1)
+                )
+            ),
+        ];
+        for row in input.cells.iter().take(input.rows) {
+            let text: String = row
+                .iter()
+                .filter(|cell| !cell.wide)
+                .map(|cell| if cell.ch == '\0' { ' ' } else { cell.ch })
+                .collect();
+            lines.push(format!("text {}", text.trim_end()));
+        }
+        Ok(lines)
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SceneCompanion {
     None,
@@ -4101,6 +4545,9 @@ pub(crate) struct CursorScene {
     /// (`aterm_effects::kitty_cursor::CursorCat`) earns it as the terminal
     /// does; the sprite control's diagnostic kitty shows at once.
     flying_earned: bool,
+    /// Tests' negative controls ([`SceneControls`]).
+    #[cfg(test)]
+    controls: SceneControls,
     /// The whole rows the card shows (`None`: every row of the grid).
     card_rows: Option<usize>,
     /// Total over every field above but the phase.
@@ -4120,8 +4567,9 @@ struct SceneStep {
     trail: Vec<aterm_core::render::TrailCell>,
     frame: Option<aterm_effects::cursor_fx::CursorFxFrame>,
     cat: Option<aterm_effects::kitty_cursor::CatFrame>,
-    /// The theme's text holds the bloom, as the live terminal's does.
-    bloom_held: bool,
+    /// The theme's text holds the bloom, or its post passes spare the
+    /// letters, as the live terminal's do.
+    bloom_gate: aterm_core::render::BloomGate,
 }
 
 struct ScenePlayer {
@@ -4132,6 +4580,8 @@ struct ScenePlayer {
     /// Scene time of the last step played, ms since `origin`.
     at: Option<u64>,
     step: SceneStep,
+    /// The cells the step presents, handed to the trail as its frame's text.
+    text: Vec<Vec<aterm_core::terminal::RenderCell>>,
 }
 
 impl ScenePlayer {
@@ -4145,6 +4595,7 @@ impl ScenePlayer {
             cat,
             at: None,
             step: SceneStep::default(),
+            text: Vec::new(),
         }
     }
 }
@@ -4158,6 +4609,10 @@ struct SceneStage<'a> {
     line: TypedLine,
     geom: Geom,
     cursor_style: aterm_core::terminal::CursorStyle,
+    /// What the card's face lays down of each glyph ([`aterm_render::Renderer::glyph_ink`]),
+    /// handed to the trail as the terminal's host hands it the live face's: its letter guard
+    /// reads each letter's ink as the raster lays it. `None`: each glyph's ink as its colour.
+    ink: Option<&'a std::sync::Arc<aterm_render::GlyphInk>>,
 }
 
 impl CursorScene {
@@ -4204,6 +4659,13 @@ impl CursorScene {
         spec.paint_fingerprint().hash(&mut hash);
         hash_theme(&mut hash);
         card_rows.hash(&mut hash);
+        #[cfg(test)]
+        let controls = SCENE_CONTROLS.with(std::cell::Cell::get);
+        #[cfg(test)]
+        {
+            controls.hash(&mut script);
+            controls.hash(&mut hash);
+        }
         Self {
             cursor: spec.cursor.clone(),
             post_fx: spec.post_fx.clone(),
@@ -4218,6 +4680,8 @@ impl CursorScene {
             caret_shown: spec.cursor_visible(),
             companion,
             flying_earned: companion == SceneCompanion::FlyingKitty && !sprite_diagnostic,
+            #[cfg(test)]
+            controls,
             card_rows,
             script_key: script.finish(),
             fingerprint: hash.finish() | 1,
@@ -4242,7 +4706,21 @@ impl CursorScene {
     }
 
     /// Play the scene onto `base` for a renderer whose cells are `cell` device pixels.
+    #[cfg(test)]
     pub(crate) fn decorate(&self, base: &RenderInput, cell: (usize, usize)) -> RenderInput {
+        self.decorate_inked(base, cell, None)
+    }
+
+    /// [`Self::decorate`], the card's face laying each glyph as `ink` says
+    /// ([`SceneStage::ink`]).
+    pub(crate) fn decorate_inked(
+        &self,
+        base: &RenderInput,
+        cell: (usize, usize),
+        ink: Option<&std::sync::Arc<aterm_render::GlyphInk>>,
+    ) -> RenderInput {
+        #[cfg(test)]
+        let ink = ink.filter(|_| self.controls.glyph_ink);
         let mut input = base.clone();
         let (cell_w, cell_h) = cell;
         let (rows, cols) = (input.rows, input.cols);
@@ -4251,7 +4729,7 @@ impl CursorScene {
         }
         let row = prompt_row(&input);
         let line = TypedLine::of(&input.cells[row]);
-        let scrolled = self.typing.then(|| scroll_previous_line(base, row));
+        let scrolled = self.typing.then(|| scroll_submitted_line(base, row));
         if let Some(scrolled) = &scrolled {
             input.cells.clone_from(&scrolled.cells);
         }
@@ -4297,15 +4775,39 @@ impl CursorScene {
                 line,
                 geom,
                 cursor_style: input.cursor_style,
+                ink,
             };
             cat = self.play(&mut input, &stage, cell);
         }
-        let settled_ms = if self.typing {
-            offset - scene_last_key_ms(offset)
+        let source = scrolled.as_ref().unwrap_or(base);
+        let caret_at = |at: u64| line.caret(line.shown_at(at)).min(cols - 1);
+        // Where the Return and each key of the loop left the caret, in order.
+        let carets = if self.typing {
+            (0..=CURSOR_SCENE_KEYS)
+                .map(|key| caret_at(key * KEY_MS))
+                .collect()
         } else {
-            u64::MAX
+            Vec::new()
         };
-        self.place_companion(&mut input, cell, caret, shown, settled_ms, cat);
+        let pet = PetCue {
+            letters: SceneLetters {
+                cells: &source.cells,
+                row,
+                line,
+                caret: usize::from(caret.1),
+            },
+            carets,
+            keys: usize::try_from((offset / KEY_MS).min(CURSOR_SCENE_KEYS)).unwrap_or(0),
+            offset,
+            typed: shown,
+        };
+        let body = self.place_companion(&mut input, cell, caret, &pet, cat);
+        note_scene_card(SceneCardShot {
+            phase_ms: self.phase_ms,
+            cell,
+            input: input.clone(),
+            body,
+        });
         input
     }
 
@@ -4320,7 +4822,10 @@ impl CursorScene {
         use aterm_effects::cursor_fx::compose_caret_style_override;
 
         thread_local! {
-            static PLAYER: std::cell::RefCell<Option<ScenePlayer>> =
+            // Boxed: a thread-local's value is part of the image's TLS template, which every
+            // thread allocates whole on its first thread-local (ScenePlayer inline was 27 KB of
+            // each of aterm's threads, docs/measured/idle-memory-2026-10-27.md).
+            static PLAYER: std::cell::RefCell<Option<Box<ScenePlayer>>> =
                 const { std::cell::RefCell::new(None) };
         }
         let mut key = aterm_hash::FxHasher::default();
@@ -4328,6 +4833,7 @@ impl CursorScene {
         cell.hash(&mut key);
         (stage.row, stage.line.start, stage.line.end).hash(&mut key);
         (stage.geom.rows, stage.geom.cols).hash(&mut key);
+        stage.ink.map(|ink| ink.fingerprint()).hash(&mut key);
         let key = key.finish();
         let target = self.warm_cycles() * CURSOR_SCENE_CYCLE_MS + self.shown_offset();
         let step = PLAYER.with_borrow_mut(|slot| {
@@ -4335,7 +4841,12 @@ impl CursorScene {
                 Some(player) if player.key == key && player.at.is_some_and(|at| at <= target) => {
                     player
                 }
-                _ => slot.insert(ScenePlayer::new(key, self.post_fx.companion_look)),
+                _ => {
+                    let player =
+                        slot.insert(Box::new(ScenePlayer::new(key, self.post_fx.companion_look)));
+                    player.fx.glow.observe_glyph_ink(stage.ink.cloned());
+                    player
+                }
             };
             let mut next = player.at.map_or(0, |at| at + MOTION_STEP_MS);
             while next <= target {
@@ -4352,7 +4863,7 @@ impl CursorScene {
         input.char_fg = step.char_fg;
         input.fire_halo = step.fire_halo;
         input.cursor_trail = step.trail;
-        input.bloom_gate = aterm_core::render::BloomGate::of(step.bloom_held);
+        input.bloom_gate = step.bloom_gate;
         if let Some(frame) = step.frame {
             input.cursor_trail_color = frame.trail_color;
             input.cursor_fill_override = frame.block_fill.map(|owned| owned.fill);
@@ -4379,6 +4890,7 @@ impl CursorScene {
             fx,
             cat: cursor_cat,
             step: kept,
+            text,
             ..
         } = player;
         let now = *origin + Duration::from_millis(at);
@@ -4391,7 +4903,7 @@ impl CursorScene {
                 fx.glow.note_return(now);
                 fx.trail.note_return(now);
                 cursor_cat.on_enter(now);
-                fx.scroll_translate(1);
+                fx.scroll_translate(CURSOR_SCENE_RETURN_ROWS);
             }
             Some(SceneEvent::Glyph(cell)) => {
                 let ch = CURSOR_SCENE_COMMAND[cell..].chars().next().unwrap_or(' ');
@@ -4453,6 +4965,34 @@ impl CursorScene {
         fx.glow
             .observe_neighbor_rows(above.as_deref(), below.as_deref());
         fx.glow.observe_caret_drawn(true);
+        // The frame's text, as the terminal's host hands the trail the cells
+        // it presents (`pipeline_native::step_cursor_family`): the letter
+        // guard, the dust's air and the caret's letter read it.
+        text.clone_from(&base.cells);
+        if let Some(cells) = text.get_mut(row) {
+            let blank = aterm_core::terminal::RenderCell {
+                fg: crate::settings::u32_rgb(self.theme.fg),
+                bg: crate::settings::u32_rgb(self.theme.bg),
+                ..aterm_core::terminal::RenderCell::default()
+            };
+            for cell in cells.iter_mut().take(line.end).skip(line.caret(shown)) {
+                *cell = blank;
+            }
+        }
+        #[cfg(test)]
+        if !self.controls.frame_text {
+            text.clear();
+        }
+        #[cfg(test)]
+        fx.glow.set_motes_cut(!self.controls.motes_whole);
+        #[cfg(test)]
+        fx.glow.set_rise_cut(!self.controls.rises_kept);
+        fx.glow.observe_frame_text_at(
+            Some((row as u16, caret)),
+            text,
+            ((0, 0), stage.geom.cols),
+            now,
+        );
         let mut glow = self
             .cursor
             .glow_config(self.theme, head_dx_for(stage.cursor_style));
@@ -4529,29 +5069,47 @@ impl CursorScene {
                 trail: fx.trail_scratch.clone(),
                 frame: Some(frame),
                 cat,
-                bloom_held: fx.bloom_held,
+                bloom_gate: fx.bloom_gate(),
             };
         }
     }
 
-    /// The live terminal's post passes over the rendered scene `frame`.
+    /// The live terminal's post passes over the rendered scene `frame`, whose
+    /// grid lies at `grid` (a frame whose bloom spares its letters crowns and
+    /// blooms from the lights kept off them, as the live terminal's GPU does).
     pub(crate) fn post_process(
         &self,
         frame: &mut aterm_render::Frame,
         input: &RenderInput,
+        grid: aterm_render::bloom::LetterGrid,
     ) -> Result<(), String> {
         if !self.typing {
             return Ok(());
         }
+        let radius =
+            finite_or(self.post_fx.bloom_radius, aterm_render::bloom::BLOOM_RADIUS).max(0.0);
+        let (mut crown, mut blur) = (Vec::new(), Vec::new());
+        let (crown, blur) = if input.bloom_gate.spares_letters() {
+            aterm_render::bloom::spared_sources(
+                &input.cursor_glow_add,
+                input,
+                grid,
+                radius,
+                &mut crown,
+                &mut blur,
+            );
+            (&crown[..], &blur[..])
+        } else {
+            (&input.cursor_glow_add[..], &input.cursor_glow_add[..])
+        };
         if self.post_fx.bloom && !input.bloom_gate.held() {
             aterm_render::bloom::apply(
                 frame,
-                &input.cursor_glow_add,
+                blur,
                 input.rows,
                 aterm_render::bloom::BloomParams {
                     strength: finite_or(self.post_fx.bloom_strength, 0.0).max(0.0),
-                    radius: finite_or(self.post_fx.bloom_radius, aterm_render::bloom::BLOOM_RADIUS)
-                        .max(0.0),
+                    radius,
                 },
             )?;
         }
@@ -4561,7 +5119,7 @@ impl CursorScene {
             let luma = aterm_render::hdr::packed_luma(self.theme.bg);
             aterm_render::hdr::sdr_glow_budget(luma, self.post_fx.sdr_boost)
         };
-        aterm_render::bloom::sdr_crown(frame, &input.cursor_glow_add, input.rows, budget)
+        aterm_render::bloom::sdr_crown(frame, crown, input.rows, budget)
     }
 
     fn place_companion(
@@ -4569,20 +5127,19 @@ impl CursorScene {
         input: &mut RenderInput,
         (cell_w, cell_h): (usize, usize),
         caret: (u16, u16),
-        typed: usize,
-        settled_ms: u64,
+        pet: &PetCue<'_>,
         cat: Option<aterm_effects::kitty_cursor::CatFrame>,
-    ) {
+    ) -> Option<(i32, i32, i32, i32)> {
         use aterm_effects::word_decorations::{EffectGeom, KittySpriteSource, WordDecorations};
         use aterm_render::sprites::{FreeSprite, SpriteLayers, WORD_SPRITE_SALT};
 
         if self.companion == SceneCompanion::None {
-            return;
+            return None;
         }
         let flight = match cat {
             Some(frame) if self.flying_earned => {
                 if frame.alpha == 0 {
-                    return;
+                    return None;
                 }
                 Some(frame)
             }
@@ -4592,7 +5149,7 @@ impl CursorScene {
         if self.companion == SceneCompanion::FlyingKitty
             && matches!(asset, crate::app_config::KittySpriteAsset::Invalid { .. })
         {
-            return;
+            return None;
         }
         let (Ok(cell_w), Ok(cell_h), Ok(rows), Ok(cols)) = (
             u16::try_from(cell_w),
@@ -4600,7 +5157,7 @@ impl CursorScene {
             u16::try_from(input.rows),
             u16::try_from(input.cols),
         ) else {
-            return;
+            return None;
         };
         let geom = EffectGeom {
             cell_w,
@@ -4616,13 +5173,14 @@ impl CursorScene {
         thread_local! {
             // The companion's decorations and its layer publisher, so a still
             // preview frame keeps its sprite layers (identity damage repaints
-            // nothing for them).
-            static COMPANIONS: std::cell::RefCell<Option<(u64, WordDecorations, SpriteLayers)>> =
+            // nothing for them). Boxed, as `PLAYER` is: inline it was 3.6 KB of
+            // every thread's TLS.
+            static COMPANIONS: std::cell::RefCell<Option<Box<(u64, WordDecorations, SpriteLayers)>>> =
                 const { std::cell::RefCell::new(None) };
         }
         COMPANIONS.with_borrow_mut(|slot| {
             let key = asset.fingerprint();
-            if slot.as_ref().is_none_or(|(held, ..)| *held != key) {
+            if slot.as_deref().is_none_or(|(held, ..)| *held != key) {
                 let mut decorations = WordDecorations::default();
                 if let crate::app_config::KittySpriteAsset::Ready { w, h, rgba, fp, .. } = asset {
                     decorations.set_kitty_sprite_source(KittySpriteSource::Custom {
@@ -4632,11 +5190,13 @@ impl CursorScene {
                         rgba: Arc::clone(rgba),
                     });
                 }
-                *slot = Some((key, decorations, SpriteLayers::new(WORD_SPRITE_SALT)));
+                *slot = Some(Box::new((
+                    key,
+                    decorations,
+                    SpriteLayers::new(WORD_SPRITE_SALT),
+                )));
             }
-            let Some((_, decorations, layers)) = slot.as_mut() else {
-                return;
-            };
+            let (_, decorations, layers) = slot.as_deref_mut()?;
             let mut sprites = Vec::new();
             let shown_rows = self.card_rows.map_or(rows, |card| {
                 u16::try_from(card).unwrap_or(u16::MAX).min(rows)
@@ -4650,8 +5210,7 @@ impl CursorScene {
                         decorations,
                         ink,
                         caret,
-                        typed,
-                        settled_ms,
+                        (pet, floor),
                         flight,
                         fit,
                         sprites,
@@ -4674,7 +5233,11 @@ impl CursorScene {
                 sprite.y = sprite.y.min(floor - i32::from(sprite.h)).max(0);
             }
             layers.publish(&sprites, &mut input.fx_layers);
-        });
+            sprites
+                .iter()
+                .map(|s| (s.x, s.x + i32::from(s.w), s.y, s.y + i32::from(s.h)))
+                .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1), a.2.min(b.2), a.3.max(b.3)))
+        })
     }
 
     #[allow(clippy::too_many_arguments)] // One companion frame's placement facts.
@@ -4686,67 +5249,98 @@ impl CursorScene {
             aterm_effects::cat_baker::CatColorKey,
         ),
         caret: (u16, u16),
-        typed: usize,
-        settled_ms: u64,
+        (pet, floor): (&PetCue<'_>, i32),
         flight: Option<aterm_effects::kitty_cursor::CatFrame>,
         fit: f32,
         sprites: &mut Vec<aterm_render::sprites::FreeSprite>,
     ) {
-        use aterm_effects::kitty_pet::{
-            PET_DEPARTURES_MAX, PET_MOTES_MAX, PetAction, PetBrain, PetFrame,
-        };
+        use aterm_effects::kitty_pet::PetAction;
         use aterm_effects::pet_glyphs_gen::PetGlyphId;
         use aterm_effects::word_decorations::{KittyCursorFrame, PetCursorFrame};
 
-        let (cell_w, cell_h, cols) = (geom.cell_w, geom.cell_h, geom.cols);
+        let (cell_w, cell_h) = (geom.cell_w, geom.cell_h);
         match self.companion {
             SceneCompanion::Pet(species) => {
-                let (action, pose) = if settled_ms < KEY_MS * 2 {
-                    let walk = [
-                        PetGlyphId::PetWalk0,
-                        PetGlyphId::PetWalk1,
-                        PetGlyphId::PetWalk2,
-                        PetGlyphId::PetWalk3,
-                    ];
-                    (PetAction::Walk, walk[typed % walk.len()])
-                } else if settled_ms < 500 {
-                    (PetAction::Stand, PetGlyphId::PetStand)
-                } else {
-                    (PetAction::Sit, PetGlyphId::PetSit)
-                };
                 let width = aterm_effects::kitty_pet::art_cols(cell_w, cell_h);
-                let station = PetBrain::station(caret.1, cols, width * fit);
-                let col = station - width * (1.0 - fit) / 2.0;
+                let seat_for = |caret_col: usize, kept: Option<(f32, f32)>| {
+                    let letters = SceneLetters {
+                        caret: caret_col,
+                        ..pet.letters
+                    };
+                    let caret = (caret.0, u16::try_from(caret_col).unwrap_or(u16::MAX));
+                    #[cfg(test)]
+                    if !self.controls.pet_seat_law {
+                        return (
+                            aterm_effects::kitty_pet::PetBrain::station(
+                                caret.1,
+                                geom.cols,
+                                width * fit,
+                            ),
+                            f32::from(caret.0),
+                        );
+                    }
+                    #[cfg(test)]
+                    let kept = kept.filter(|_| self.controls.one_seat_a_line);
+                    scene_pet_seat(letters, caret, geom, (width, fit), (floor, kept))
+                };
+                // The seat after the loop's Return and after each key since,
+                // as the terminal's pet keeps one for the whole line: the
+                // Return's own is the head law's afresh, as a submitted line's
+                // is (`kitty_pet`'s ONE SEAT FOR THE WHOLE LINE holds only
+                // while the hand writes).
+                let mut seats: Vec<(f32, f32)> = Vec::with_capacity(pet.carets.len());
+                for (i, &caret_col) in pet.carets.iter().enumerate() {
+                    let kept = i.checked_sub(1).map(|before| seats[before]);
+                    seats.push(seat_for(caret_col, kept));
+                }
+                let seat = seats
+                    .get(pet.keys)
+                    .copied()
+                    .unwrap_or_else(|| seat_for(pet.letters.caret, None));
+                // The newest key or Return that moved the seat, how long ago
+                // and which way: a pet waiting on its seat while the caret
+                // types towards it stands, then sits, rather than walk on the
+                // spot. Before the Return it sat where the last loop's line
+                // left it.
+                let moved = (0..=pet.keys.min(seats.len().saturating_sub(1)))
+                    .rev()
+                    .find_map(|i| {
+                        let before = match i {
+                            0 => *seats.last()?,
+                            i => seats[i - 1],
+                        };
+                        let ago = pet.offset.saturating_sub(i as u64 * KEY_MS);
+                        (seats[i] != before).then_some((ago, seats[i].0 < before.0))
+                    });
+                let (action, pose) = match moved {
+                    Some((ago, _)) if ago < KEY_MS * 2 => {
+                        let walk = [
+                            PetGlyphId::PetWalk0,
+                            PetGlyphId::PetWalk1,
+                            PetGlyphId::PetWalk2,
+                            PetGlyphId::PetWalk3,
+                        ];
+                        (PetAction::Walk, walk[pet.typed % walk.len()])
+                    }
+                    Some((ago, _)) if ago < 500 => (PetAction::Stand, PetGlyphId::PetStand),
+                    _ => (PetAction::Sit, PetGlyphId::PetSit),
+                };
+                let mut frame = scene_pet_frame(seat, (width, fit), (action, species.skin(pose)));
+                frame.facing_left = moved.is_some_and(|(_, left)| left);
                 let _ = decorations.pet_cursor(
                     PetCursorFrame {
                         geom,
                         colors,
                         coat: self.post_fx.companion_look.coat,
                         iris: self.post_fx.companion_look.iris,
-                        pet: PetFrame {
-                            alpha: 255,
-                            lane_alpha: 255,
-                            action,
-                            pose: species.skin(pose),
-                            col,
-                            row: f32::from(caret.0),
-                            lift: 0.0,
-                            facing_left: false,
-                            scale_x: fit,
-                            scale_y: fit,
-                            purr: 0.0,
-                            contented: false,
-                            under_ink: false,
-                            motes: [None; PET_MOTES_MAX],
-                            departures: [None; PET_DEPARTURES_MAX],
-                        },
+                        pet: frame,
                         page: None,
                     },
                     sprites,
                 );
             }
             SceneCompanion::FlyingKitty => {
-                let (look, alpha, bob, pose, sing) = match flight {
+                let (look, alpha, bob, mut pose, sing) = match flight {
                     Some(frame) => (
                         frame.render_look(),
                         frame.alpha,
@@ -4762,6 +5356,52 @@ impl CursorScene {
                         0.0,
                     ),
                 };
+                // The terminal's seat for the flying head
+                // (`EffectsPipeline::route_flying_head`): its rest ahead of the
+                // caret where the caret's row is blank there, else behind the
+                // caret or a row up, off the letters (`rainbow_kitty::companion::
+                // placement`). The scene's cat faces the way it types.
+                let mut lift = 0.0;
+                if let Some(rest) = decorations.kitty_cursor_footprint(
+                    aterm_effects::word_decorations::KittyCursorLayout {
+                        geom,
+                        cursor: caret,
+                        look,
+                        bob,
+                        lift: 0.0,
+                    },
+                ) {
+                    use aterm_effects::rainbow_kitty::companion::{SeatQuery, placement};
+
+                    let ink = |row: u16, col: u16| {
+                        (row < geom.rows && col < geom.cols)
+                            .then(|| pet.letters.lettered(usize::from(row), usize::from(col)))
+                    };
+                    let seat = placement(
+                        caret,
+                        &SeatQuery {
+                            geom: Geom {
+                                cw: usize::from(cell_w),
+                                ch: usize::from(cell_h),
+                                rows: usize::from(geom.rows),
+                                cols: usize::from(geom.cols),
+                                origin_x: 0,
+                                origin_y: 0,
+                                win_w: 0,
+                                win_h: 0,
+                                head: 0,
+                            },
+                            rest,
+                            lead_px: aterm_effects::word_decorations::WordDecorations::kitty_cursor_lead_px(cell_w),
+                            held_sky: false,
+                        },
+                        ink,
+                    );
+                    lift = seat.lift(cell_h);
+                    if cell_w > 0 {
+                        pose.lead += seat.x.saturating_sub(rest.x) as f32 / f32::from(cell_w);
+                    }
+                }
                 let _ = decorations.kitty_cursor(
                     KittyCursorFrame {
                         geom,
@@ -4769,7 +5409,7 @@ impl CursorScene {
                         look,
                         colors,
                         bob,
-                        lift: 0.0,
+                        lift,
                         alpha,
                         pose: aterm_effects::kitty_cursor::CatPose {
                             scale_x: pose.scale_x * fit,
@@ -6370,7 +7010,7 @@ mod tests {
             spoken_palette(NORD, Some(&identity)),
             format!(
                 "Arctic, dark, text contrast {}:1, {illegible} {words} below 3:1",
-                trim_contrast(f64::from(text))
+                theme_card::contrast_figure(f64::from(text))
             )
         );
         let light = PreviewThemeIdentity {
@@ -6511,14 +7151,6 @@ mod tests {
             badge.ends_with(&format!(" · {}", window.state_badge())),
             "{badge}"
         );
-    }
-
-    #[test]
-    fn trim_contrast_never_rounds_a_ratio_up_to_its_floor() {
-        assert_eq!(trim_contrast(2.96), "2.9");
-        assert_eq!(trim_contrast(3.0), "3");
-        assert_eq!(trim_contrast(21.0), "21");
-        assert_eq!(trim_contrast(11.24), "11.2");
     }
 
     #[test]
@@ -7745,36 +8377,109 @@ mod tests {
         );
     }
 
+    /// The rainbow kitty looks the light fork's companion pins preview.
+    #[cfg(unix)]
+    const RAINBOW_LOOKS: [&str; 4] = [
+        "rainbow kitty",
+        "rainbow kitty tall",
+        "rainbow kitty underline",
+        "rainbow kitty pet",
+    ];
+
+    /// Each assert of main's rule the preview's glow config `cfg` on the ground `(fg, bg)`
+    /// breaks, by name: the host pin's config asserts
+    /// ([`crate::light_fork_pin_tests::config_breaks`]), and its light, which no dark theme
+    /// takes (§15.2 1.11).
+    #[cfg(unix)]
+    fn preview_breaks(
+        cfg: &crate::cursor_glow::GlowConfig,
+        ground: (u32, u32),
+    ) -> Vec<&'static str> {
+        let mut out = crate::light_fork_pin_tests::config_breaks(cfg, ground);
+        if cfg.light != crate::cursor_glow::Light::OFF {
+            out.push("light");
+        }
+        out
+    }
+
     /// The host unreachability pin's companion (`crate::light_fork_pin_tests`,
     /// `docs/design/PRISM-GLASS.md` §15.1 P0.9): the preview's producer draws every dark theme,
-    /// in each rainbow kitty look, by main's rule; the ground that names no theme previews on
-    /// the renderer's default theme.
+    /// in each rainbow kitty look, by main's rule, its light [`crate::cursor_glow::Light::OFF`]
+    /// (§15.2 1.11); the ground that names no theme previews on the renderer's default theme.
     #[cfg(unix)]
     #[test]
     fn the_preview_draws_every_dark_theme_by_mains_rule() {
-        use crate::light_fork_pin_tests::{Ground, config_breaks};
+        use crate::light_fork_pin_tests::Ground;
 
         let grounds = Ground::dark();
-        let looks = [
-            "rainbow kitty",
-            "rainbow kitty tall",
-            "rainbow kitty underline",
-            "rainbow kitty pet",
-        ];
         let mut drawn = 0;
         for ground in &grounds {
             let theme = ground.scheme().map_or_else(Theme::default, |scheme| {
                 PreviewTerminalTheme::from_scheme(&scheme).into_theme()
             });
             assert!(aterm_render::theme_is_dark(theme.bg), "{ground} is dark");
-            for raw in looks {
+            for raw in RAINBOW_LOOKS {
                 let cfg = rainbow_cursor(raw).glow_config(theme, 0.5);
-                let broke = config_breaks(&cfg, (theme.fg, theme.bg));
+                let broke = preview_breaks(&cfg, (theme.fg, theme.bg));
                 assert!(broke.is_empty(), "{ground}, {raw}: {broke:?}");
                 drawn += 1;
             }
         }
-        assert_eq!(drawn, grounds.len() * looks.len());
+        assert_eq!(drawn, grounds.len() * RAINBOW_LOOKS.len());
+    }
+
+    /// The preview's light (§15.2 1.11): every light built-in and pack theme lights the
+    /// preview's first frame at `prism_glass::LIVE`, with no latch to wait on, and that light
+    /// breaks the companion pin's light assert as a dark theme's would (the assert's negative
+    /// control). A light page whose ink is not 3:1 darker than it is no light ground, so its
+    /// light stays [`crate::cursor_glow::Light::OFF`].
+    #[cfg(unix)]
+    #[test]
+    fn the_preview_lights_every_light_theme_from_its_first_frame() {
+        use crate::cursor_glow::Light;
+        use aterm_effects::rainbow_kitty::prism_glass::LIVE;
+
+        let builtins = aterm_types::scheme::builtin_names()
+            .into_iter()
+            .filter_map(|name| Some((name, aterm_types::scheme::builtin(name)?)));
+        let packs = aterm_theme_pack::themes().iter().filter_map(|theme| {
+            Some((
+                theme.id,
+                aterm_types::scheme::parse_scheme_str(theme.text).ok()?,
+            ))
+        });
+        let mut lit = Vec::new();
+        for (name, scheme) in builtins.chain(packs) {
+            let theme = PreviewTerminalTheme::from_scheme(&scheme).into_theme();
+            if aterm_render::theme_is_dark(theme.bg) {
+                continue;
+            }
+            for raw in RAINBOW_LOOKS {
+                let cfg = rainbow_cursor(raw).glow_config(theme, 0.5);
+                assert_eq!(cfg.light, Light::at(LIVE), "{name}, {raw}");
+                assert_eq!(
+                    preview_breaks(&cfg, (theme.fg, theme.bg)),
+                    ["light"],
+                    "{name}, {raw}"
+                );
+            }
+            lit.push(name);
+        }
+        assert!(lit.contains(&"Default Light"), "the sweep met {lit:?}");
+
+        let paper = PreviewTerminalTheme::from_scheme(
+            &aterm_types::scheme::builtin("Default Light").expect("built-in light theme"),
+        )
+        .into_theme();
+        let pale = Theme {
+            fg: 0x00B8_B8B8,
+            ..paper
+        };
+        assert_eq!(
+            rainbow_cursor("rainbow kitty").glow_config(pale, 0.5).light,
+            Light::OFF,
+            "ink under 3:1 on a light page"
+        );
     }
 
     #[test]
@@ -7875,52 +8580,37 @@ mod tests {
     }
 
     #[test]
-    fn the_companion_rides_beside_the_caret_on_its_row() {
+    fn the_flying_kitty_rides_beside_the_caret_on_its_row() {
         let (cell_w, cell_h) = (8_i32, 17_i32);
-        for raw in [
-            "rainbow kitty pet",
-            "rainbow dog pet",
-            "rainbow kitty flying",
-        ] {
-            let phases: &[u64] = if raw.ends_with("flying") {
-                &[1_500, 2_300]
-            } else {
-                &[0, 700, 1_500, 2_300]
-            };
-            for &phase in phases {
-                let input = played(
-                    &SettingsPreviewSpec::cursor(rainbow_cursor(raw)).with_phase(phase),
-                    Theme::default(),
-                );
-                let row = input.cursor_row as i32;
-                assert_eq!(
-                    input.cursor_row,
-                    prompt_row(&input),
-                    "the caret types on the prompt"
-                );
-                let caret_x = input.cursor_col as i32 * cell_w;
-                let sprite = sprites(&input)
-                    .into_iter()
-                    .max_by_key(|sprite| u32::from(sprite.w) * u32::from(sprite.h))
-                    .unwrap_or_else(|| panic!("{raw} at {phase} ms draws its companion"));
-                assert!(
-                    sprite.x >= caret_x && sprite.x <= caret_x + 2 * cell_w,
-                    "{raw} at {phase} ms starts {} px from the caret",
-                    sprite.x - caret_x
-                );
-                let floor = if raw.ends_with("flying") {
-                    row + 2
-                } else {
-                    row + 1
-                };
-                assert!(
-                    sprite.y >= (row - 1) * cell_h
-                        && sprite.y + i32::from(sprite.h) <= floor * cell_h,
-                    "{raw} at {phase} ms stays on the caret's row: y {}..{}",
-                    sprite.y,
-                    sprite.y + i32::from(sprite.h)
-                );
-            }
+        let raw = "rainbow kitty flying";
+        for &phase in &[1_500, 2_300] {
+            let input = played(
+                &SettingsPreviewSpec::cursor(rainbow_cursor(raw)).with_phase(phase),
+                Theme::default(),
+            );
+            let row = input.cursor_row as i32;
+            assert_eq!(
+                input.cursor_row,
+                prompt_row(&input),
+                "the caret types on the prompt"
+            );
+            let caret_x = input.cursor_col as i32 * cell_w;
+            let sprite = sprites(&input)
+                .into_iter()
+                .max_by_key(|sprite| u32::from(sprite.w) * u32::from(sprite.h))
+                .unwrap_or_else(|| panic!("{raw} at {phase} ms draws its companion"));
+            assert!(
+                sprite.x >= caret_x && sprite.x <= caret_x + 2 * cell_w,
+                "{raw} at {phase} ms starts {} px from the caret",
+                sprite.x - caret_x
+            );
+            assert!(
+                sprite.y >= (row - 1) * cell_h
+                    && sprite.y + i32::from(sprite.h) <= (row + 2) * cell_h,
+                "{raw} at {phase} ms stays on the caret's row: y {}..{}",
+                sprite.y,
+                sprite.y + i32::from(sprite.h)
+            );
         }
     }
 
@@ -7954,6 +8644,156 @@ mod tests {
         assert!(
             !sprites(&live_flying).is_empty(),
             "negative control: the selected flying companion is drawable outside Reduced Motion"
+        );
+    }
+
+    /// The cells a sprite's drawn texels cover, `(row, col)`, at `cell` px.
+    fn inked_cells(
+        sprite: &aterm_render::sprites::FreeSprite,
+        (cell_w, cell_h): (usize, usize),
+    ) -> std::collections::BTreeSet<(usize, usize)> {
+        use aterm_core::render::FxTexels;
+
+        let art = &sprite.art;
+        let (aw, ah) = (usize::from(art.w()), usize::from(art.h()));
+        let (dw, dh) = (usize::from(sprite.w), usize::from(sprite.h));
+        let mut cells = std::collections::BTreeSet::new();
+        if aw == 0 || ah == 0 || dw == 0 || dh == 0 {
+            return cells;
+        }
+        for dy in 0..dh {
+            for dx in 0..dw {
+                let (x, y) = (sprite.x + dx as i32, sprite.y + dy as i32);
+                let clip = sprite.clip;
+                if x < clip.x0.max(0) || x >= clip.x1 || y < clip.y0.max(0) || y >= clip.y1 {
+                    continue;
+                }
+                let tx = dx * aw / dw;
+                let tx = if sprite.flip_x { aw - 1 - tx } else { tx };
+                let at = (dy * ah / dh) * aw + tx;
+                let inked = match art.texels() {
+                    FxTexels::Index8 => art.data()[at] != 0,
+                    FxTexels::Rgba8Premul | FxTexels::Rgba8Straight => art.data()[at * 4 + 3] != 0,
+                };
+                if inked {
+                    cells.insert((y as usize / cell_h, x as usize / cell_w));
+                }
+            }
+        }
+        cells
+    }
+
+    /// The resident pet keeps off the scene's letters as the terminal's head law
+    /// keeps it (`kitty_pet`'s `clear_of_letters_above`): no frame of the loop lays
+    /// a drawn texel of it on a lettered cell or the caret's, in every companion
+    /// style on dark and light, in a roomy card and a short one; and it is there
+    /// every frame, whole (no dip and return), its pose held more than a frame. Set
+    /// down at the station beside the caret whatever lies over it (the negative
+    /// control), its head lay on the command the line above holds.
+    #[test]
+    fn the_resident_pet_keeps_off_the_scenes_letters() {
+        let light = PreviewTerminalTheme::from_scheme(
+            &aterm_types::scheme::builtin("GitHub Light").expect("built-in light theme"),
+        );
+        let pets: Vec<&str> = crate::prefs::CURSOR_TRAIL_STYLES
+            .iter()
+            .copied()
+            .filter(|raw| {
+                matches!(
+                    CursorPreviewSpec {
+                        trail_style: PreviewTrailStyle::parse(raw),
+                        trail_style_raw: Arc::from(*raw),
+                        ..CursorPreviewSpec::default()
+                    }
+                    .trail_companion(),
+                    PreviewTrailCompanion::Pet(_)
+                )
+            })
+            .collect();
+        assert!(pets.len() >= 3, "the pet styles: {pets:?}");
+        let cell = (8, 17);
+        let grounds = [("dark", None), ("light", Some(light))];
+        let lays_on_letters =
+            |seat_law: bool, pets: &[&str], grounds: &[(&str, Option<PreviewTerminalTheme>)]| {
+                SCENE_CONTROLS.with(|controls| {
+                    controls.set(SceneControls {
+                        pet_seat_law: seat_law,
+                        ..controls.get()
+                    });
+                });
+                let mut on_letters = Vec::new();
+                for &raw in pets {
+                    for &(side, ground) in grounds {
+                        for rows in [None, Some(4)] {
+                            let mut poses = Vec::new();
+                            for phase in (0..CURSOR_SCENE_CYCLE_MS).step_by(MOTION_STEP_MS as usize)
+                            {
+                                let spec = SettingsPreviewSpec::cursor(CursorPreviewSpec {
+                                    blink: false,
+                                    trail_style: PreviewTrailStyle::parse(raw),
+                                    trail_style_raw: Arc::from(raw),
+                                    ..CursorPreviewSpec::default()
+                                });
+                                let spec = match ground {
+                                    Some(theme) => spec.with_terminal_theme(theme),
+                                    None => spec,
+                                }
+                                .with_phase(phase)
+                                .normalized();
+                                let theme = ground
+                                    .map_or_else(Theme::default, PreviewTerminalTheme::into_theme);
+                                let (base, _) =
+                                    build_terminal_specimen_input_rows(&spec, theme, rows);
+                                let input =
+                                    CursorScene::new(&spec, theme, rows).decorate(&base, cell);
+                                let at = format!("{raw} {side} rows {rows:?} at {phase} ms");
+                                let pet = sprites(&input)
+                                    .into_iter()
+                                    .max_by_key(|sprite| u32::from(sprite.w) * u32::from(sprite.h))
+                                    .unwrap_or_else(|| panic!("{at}: the pet is drawn"));
+                                assert_eq!(pet.alpha, 255, "{at}: the pet is drawn whole");
+                                poses.push((pet.art.id(), pet.flip_x));
+                                let caret = (input.cursor_row, input.cursor_col);
+                                let lettered: Vec<(usize, usize)> = inked_cells(&pet, cell)
+                                    .into_iter()
+                                    .filter(|&(row, col)| {
+                                        (row, col) == caret
+                                            || input
+                                                .cells
+                                                .get(row)
+                                                .and_then(|cells| cells.get(col))
+                                                .is_some_and(|cell| !matches!(cell.ch, ' ' | '\0'))
+                                    })
+                                    .collect();
+                                if !lettered.is_empty() {
+                                    on_letters.push(format!("{at}: on {lettered:?}"));
+                                }
+                            }
+                            if seat_law {
+                                let flash = poses
+                                    .windows(3)
+                                    .position(|three| three[0] == three[2] && three[1] != three[0]);
+                                assert_eq!(
+                                    flash, None,
+                                    "{raw} {side} rows {rows:?}: a pose shown for one frame"
+                                );
+                            }
+                        }
+                    }
+                }
+                on_letters
+            };
+        let control = lays_on_letters(false, &pets[..1], &grounds[..1]);
+        let law = lays_on_letters(true, &pets, &grounds);
+        assert!(
+            law.is_empty(),
+            "{} frames: {:#?}",
+            law.len(),
+            &law[..law.len().min(8)]
+        );
+        assert!(
+            !control.is_empty(),
+            "negative control: the pet at the station beside the caret lies on the letters"
         );
     }
 
@@ -7997,14 +8837,6 @@ mod tests {
                     "{at}: with room, it keeps its own size: {}",
                     roomy.h
                 );
-                if raw.ends_with("pet") {
-                    assert!(
-                        (short.x - roomy.x).abs() <= 2,
-                        "{at}: the pet keeps its station beside the caret: {} against {}",
-                        short.x,
-                        roomy.x
-                    );
-                }
             }
         }
     }
@@ -8068,7 +8900,7 @@ mod tests {
         let (base, _) = build_terminal_specimen_input(&spec, Theme::default());
         let scene = CursorScene::new(&spec, Theme::default(), None);
         let row = prompt_row(&base);
-        let base = scroll_previous_line(&base, row);
+        let base = scroll_submitted_line(&base, row);
         let geom = Geom {
             cw: 8,
             ch: 17,
@@ -8087,6 +8919,7 @@ mod tests {
             line: TypedLine::of(&base.cells[row]),
             geom,
             cursor_style: base.cursor_style,
+            ink: None,
         };
         let mut player = ScenePlayer::new(0, spec.post_fx.companion_look);
         let mut cold = Vec::new();
@@ -8195,8 +9028,11 @@ mod tests {
     fn the_scenes_jumps_show_every_jump_knob() {
         use aterm_effects::cursor_glow::TrailKnob;
 
-        /// The least of the card a landing ring changes by more than 32 levels.
-        const RING_SHOWS: usize = 100;
+        /// The least of the card a landing ring changes by more than 32 levels: twice the
+        /// most a veil alone changed (19 to 30 px). Classic's paper ring, whole and off the
+        /// letters since looks10 L12, hugs the caret inside its own row after the Return
+        /// (83 px in the 190pt card), where laid over the typed line it changed 160 or more.
+        const RING_SHOWS: usize = 64;
 
         let light = PreviewTerminalTheme::from_scheme(
             &aterm_types::scheme::builtin("GitHub Light").expect("built-in light theme"),
@@ -8205,7 +9041,10 @@ mod tests {
         // The frames after the Return and after the Tab, then those while only typing: each
         // knob setting's frames are rendered in this, the scene's own order, so the scene's one
         // player plays on from the frame before rather than from the scene's start, and every
-        // frame is the one the card draws at that phase.
+        // frame is the one the card draws at that phase. Each jump's run past the ring a Fire
+        // meteor strikes on landing, some 160 ms after the hop (`METEOR_STRIKE_FRAC`): in the
+        // one-row card the Return's caret leaves from a line scrolled off the card's top, so
+        // Fire's ring there is the Tab's.
         let after: Vec<u64> = [
             MOTION_STEP_MS,
             2 * MOTION_STEP_MS,
@@ -8213,7 +9052,7 @@ mod tests {
             5 * MOTION_STEP_MS,
         ]
         .into_iter()
-        .chain((0..3).map(|step| tab_ms + step * MOTION_STEP_MS))
+        .chain((0..5).map(|step| tab_ms + step * MOTION_STEP_MS))
         .collect();
         let typing_only: Vec<u64> = vec![6 * KEY_MS, CURSOR_SCENE_TAB.0 as u64 * KEY_MS];
         let mut phases: Vec<u64> = after.iter().chain(&typing_only).copied().collect();
@@ -8223,167 +9062,204 @@ mod tests {
             let spec = SettingsPreviewSpec::cursor(CursorPreviewSpec::default()).normalized();
             spec.header_layout(VIEWPORT.width - 20.0).height + 15.0 + spec.typography_row_height()
         };
-        let mut checked = 0;
-        for &raw in crate::prefs::CURSOR_TRAIL_STYLES {
+        // Each style on each ground is one item: the scene's player, the card's renderers and its
+        // fonts are each thread's own, so a worker plays an item's knob settings in the order the
+        // lone loop did.
+        let items: Vec<(&str, Option<PreviewTerminalTheme>)> = crate::prefs::CURSOR_TRAIL_STYLES
+            .iter()
+            .flat_map(|&raw| [(raw, None), (raw, Some(light))])
+            .collect();
+        let checked: usize = aterm_spec::check::each(&items, |&(raw, ground)| {
             let style = PreviewTrailStyle::parse(raw);
             let Some(glow) = crate::app_config::resolve_trail_style(raw).style else {
-                continue;
+                return 0;
             };
-            for (ground, heights) in [(None, vec![190.0_f32, one_row]), (Some(light), vec![190.0])]
-            {
-                let base = CursorPreviewSpec {
-                    blink: false,
-                    trail_style: style,
-                    trail_style_raw: Arc::from(raw),
-                    ..CursorPreviewSpec::default()
-                };
-                let on_ground = |cursor: CursorPreviewSpec| {
-                    let spec = SettingsPreviewSpec::cursor(cursor);
-                    match ground {
-                        Some(theme) => spec.with_terminal_theme(theme),
-                        None => spec,
-                    }
-                };
-                let scene = on_ground(base.clone());
-                let ctx = scene.scene_knob_context();
-                let reach = scene.scene_length_reach();
-                let long = reach.map_or(512, |reach| reach.ceil() as usize + 8);
-                let knobs = [
-                    (
-                        TrailKnob::Length,
-                        reach.is_some(),
-                        CursorPreviewSpec {
-                            length: 2,
-                            ..base.clone()
-                        },
-                        CursorPreviewSpec {
-                            length: long,
-                            ..base.clone()
-                        },
-                    ),
-                    (
-                        TrailKnob::Ring,
-                        glow.reads_knob(TrailKnob::Ring, ctx),
-                        CursorPreviewSpec {
-                            ring: true,
-                            ..base.clone()
-                        },
-                        CursorPreviewSpec {
-                            ring: false,
-                            ..base.clone()
-                        },
-                    ),
-                    (
-                        TrailKnob::Accent,
-                        glow.reads_knob(TrailKnob::Accent, ctx),
-                        CursorPreviewSpec {
-                            accent: Some(0x00FF_0000),
-                            ..base.clone()
-                        },
-                        CursorPreviewSpec {
-                            accent: Some(0x0000_FFFF),
-                            ..base.clone()
-                        },
-                    ),
-                ];
-                for (knob, law, a, b) in knobs {
-                    if knob == TrailKnob::Accent && glow != GlowStyle::Phaser {
-                        continue;
-                    }
-                    for &height in &heights {
-                        // One knob setting's frames at `phases`, played in order.
-                        let frames = |cursor: &CursorPreviewSpec| {
-                            phases
-                                .iter()
-                                .map(|&phase| {
-                                    let shown = on_ground(cursor.clone()).with_phase(phase);
-                                    (phase, card_pixels(shown, height))
-                                })
-                                .collect::<std::collections::BTreeMap<u64, Vec<u8>>>()
-                        };
-                        let (on_a, on_b) = (frames(&a), frames(&b));
-                        let pairs: Vec<(&Vec<u8>, &Vec<u8>)> = after
+            let heights = match ground {
+                None => vec![190.0_f32, one_row],
+                Some(_) => vec![190.0],
+            };
+            let mut checked = 0_usize;
+            let base = CursorPreviewSpec {
+                blink: false,
+                trail_style: style,
+                trail_style_raw: Arc::from(raw),
+                ..CursorPreviewSpec::default()
+            };
+            let on_ground = |cursor: CursorPreviewSpec| {
+                let spec = SettingsPreviewSpec::cursor(cursor);
+                match ground {
+                    Some(theme) => spec.with_terminal_theme(theme),
+                    None => spec,
+                }
+            };
+            let scene = on_ground(base.clone());
+            let ctx = scene.scene_knob_context();
+            let reach = scene.scene_length_reach();
+            let long = reach.map_or(512, |reach| reach.ceil() as usize + 8);
+            let knobs = [
+                (
+                    TrailKnob::Length,
+                    reach.is_some(),
+                    CursorPreviewSpec {
+                        length: 2,
+                        ..base.clone()
+                    },
+                    CursorPreviewSpec {
+                        length: long,
+                        ..base.clone()
+                    },
+                ),
+                (
+                    TrailKnob::Ring,
+                    glow.reads_knob(TrailKnob::Ring, ctx),
+                    CursorPreviewSpec {
+                        ring: true,
+                        ..base.clone()
+                    },
+                    CursorPreviewSpec {
+                        ring: false,
+                        ..base.clone()
+                    },
+                ),
+                (
+                    TrailKnob::Accent,
+                    glow.reads_knob(TrailKnob::Accent, ctx),
+                    CursorPreviewSpec {
+                        accent: Some(0x00FF_0000),
+                        ..base.clone()
+                    },
+                    CursorPreviewSpec {
+                        accent: Some(0x0000_FFFF),
+                        ..base.clone()
+                    },
+                ),
+            ];
+            for (knob, law, a, b) in knobs {
+                if knob == TrailKnob::Accent && glow != GlowStyle::Phaser {
+                    continue;
+                }
+                for &height in &heights {
+                    // One knob setting's frames at `phases`, played in order.
+                    let frames = |cursor: &CursorPreviewSpec| {
+                        phases
                             .iter()
-                            .map(|phase| (&on_a[phase], &on_b[phase]))
-                            .collect();
-                        let apart = pairs
-                            .iter()
-                            .map(|(x, y)| apart_by(x, y, 32))
-                            .max()
-                            .unwrap_or(0);
-                        let apart16 = pairs
-                            .iter()
-                            .map(|(x, y)| apart_by(x, y, 16))
-                            .max()
-                            .unwrap_or(0);
-                        let side = if ground.is_some() { "light" } else { "dark" };
-                        if law {
-                            assert!(
-                                apart >= 12 && apart16 >= 40,
-                                "{raw} {side}: {knob:?} shows after a jump in a {height}pt card: \
-                                 {apart} px more than 32 levels apart, {apart16} more than 16"
-                            );
-                            // A ring is a mark of its own, not a tint: Classic's square and
-                            // Water's ripples change some 160 to 270 px of the card, Fire's
-                            // flash 117, where the veil alone of Lumen, Comet, Sparkle, Phaser
-                            // and Laser on dark changed 19 to 30 and the knob read as broken.
-                            assert!(
-                                knob != TrailKnob::Ring || apart >= RING_SHOWS,
-                                "{raw} {side}: Ring on jumps draws a ring in a {height}pt card: \
-                                 {apart} px more than 32 levels apart, under {RING_SHOWS}"
-                            );
-                            for phase in &typing_only {
-                                assert_eq!(
-                                    apart_by(&on_a[phase], &on_b[phase], 32),
-                                    0,
-                                    "{raw} {side}: {knob:?} is invisible while only typing \
-                                     ({phase} ms)"
-                                );
-                            }
-                        } else {
-                            assert!(
-                                apart < 12,
-                                "{raw} {side}: {knob:?} the engine says the scene cannot show \
-                                 paints {apart} px apart"
+                            .map(|&phase| {
+                                let shown = on_ground(cursor.clone()).with_phase(phase);
+                                (phase, card_pixels(shown, height))
+                            })
+                            .collect::<std::collections::BTreeMap<u64, Vec<u8>>>()
+                    };
+                    let (on_a, on_b) = (frames(&a), frames(&b));
+                    let pairs: Vec<(&Vec<u8>, &Vec<u8>)> = after
+                        .iter()
+                        .map(|phase| (&on_a[phase], &on_b[phase]))
+                        .collect();
+                    let apart = pairs
+                        .iter()
+                        .map(|(x, y)| apart_by(x, y, 32))
+                        .max()
+                        .unwrap_or(0);
+                    let apart16 = pairs
+                        .iter()
+                        .map(|(x, y)| apart_by(x, y, 16))
+                        .max()
+                        .unwrap_or(0);
+                    let side = if ground.is_some() { "light" } else { "dark" };
+                    if law {
+                        assert!(
+                            apart >= 12 && apart16 >= 40,
+                            "{raw} {side}: {knob:?} shows after a jump in a {height}pt card: \
+                             {apart} px more than 32 levels apart, {apart16} more than 16"
+                        );
+                        // A ring is a mark of its own, not a tint: Classic's square and
+                        // Water's ripples change some 160 to 270 px of the card (Classic's
+                        // paper square, kept off the typed line, 83), Fire's flash 117,
+                        // where the veil alone of Lumen, Comet, Sparkle, Phaser and Laser
+                        // on dark changed 19 to 30 and the knob read as broken.
+                        // Those five's dark rim shows whole or not at all, kept off the
+                        // letters the frame holds (the letter guard's `RIM_SHOWN_SHARE`):
+                        // the Return lands among the letters of what the shell printed, where
+                        // the terminal draws no rim either (the trail gallery's
+                        // `enter-bottom`), and the Tab lands with room, under the printed
+                        // line's end, where it draws. The floor holds in every card, on both
+                        // grounds. The shortest card's three rows lose the Return's line to
+                        // the scroll, and from an origin off the grid the trail draws no
+                        // landing (`note_scroll`, the terminal's own law), so its one landing
+                        // is the Tab's, the least ring a jump draws (impact 1.0): every style
+                        // changes 118 to 272 px there, and Water's ripple, the thinnest ring,
+                        // 96 by more than 32 levels and 147 by more than 16, so Water's least
+                        // ring is held to the floor by 16 levels.
+                        let thin = glow == aterm_effects::cursor_glow::GlowStyle::Water;
+                        assert!(
+                            knob != TrailKnob::Ring
+                                || apart >= RING_SHOWS
+                                || (thin && apart16 >= RING_SHOWS),
+                            "{raw} {side}: Ring on jumps draws a ring in a {height}pt card: \
+                             {apart} px more than 32 levels apart ({apart16} more than 16), \
+                             under {RING_SHOWS}"
+                        );
+                        for phase in &typing_only {
+                            assert_eq!(
+                                apart_by(&on_a[phase], &on_b[phase], 32),
+                                0,
+                                "{raw} {side}: {knob:?} is invisible while only typing \
+                                 ({phase} ms)"
                             );
                         }
-                        checked += 1;
+                    } else {
+                        assert!(
+                            apart < 12,
+                            "{raw} {side}: {knob:?} the engine says the scene cannot show \
+                             paints {apart} px apart"
+                        );
                     }
-                }
-                // What the Tab shows, the frame a pause holds shows.
-                let held = |cursor: CursorPreviewSpec| {
-                    card_pixels(on_ground(cursor).with_phase(300).with_paused(true), 190.0)
-                };
-                let tab = scene_jumps()[0];
-                let (cell_w, cell_h) = scene.demo_cell_size();
-                let tab_reach = glow.jump_reach(
-                    tab.rows,
-                    tab.cols,
-                    cell_h / cell_w.max(1.0),
-                    aterm_effects::cursor_glow::KnobContext {
-                        over_text: tab.over_letters,
-                        ..ctx
-                    },
-                );
-                if tab_reach.is_some_and(|reach| reach > 2.0) {
-                    let apart = apart_by(
-                        &held(CursorPreviewSpec {
-                            length: 2,
-                            ..base.clone()
-                        }),
-                        &held(CursorPreviewSpec {
-                            length: long,
-                            ..base.clone()
-                        }),
-                        32,
-                    );
-                    assert!(
-                        apart >= 12,
-                        "{raw}: Trail length shows on the paused frame: {apart} px"
-                    );
+                    checked += 1;
                 }
             }
-        }
+            // What the Tab shows, the frame a pause holds shows.
+            let held = |cursor: CursorPreviewSpec| {
+                card_pixels(on_ground(cursor).with_phase(300).with_paused(true), 190.0)
+            };
+            let tab = scene_jumps()[0];
+            let (cell_w, cell_h) = scene.demo_cell_size();
+            let tab_reach = glow.jump_reach(
+                tab.rows,
+                tab.cols,
+                cell_h / cell_w.max(1.0),
+                aterm_effects::cursor_glow::KnobContext {
+                    over_text: tab.over_letters,
+                    ..ctx
+                },
+            );
+            if tab_reach.is_some_and(|reach| reach > 2.0) {
+                let (short, long) = (
+                    held(CursorPreviewSpec {
+                        length: 2,
+                        ..base.clone()
+                    }),
+                    held(CursorPreviewSpec {
+                        length: long,
+                        ..base.clone()
+                    }),
+                );
+                let (apart, apart16) = (apart_by(&short, &long, 32), apart_by(&short, &long, 16));
+                // The held frame is the Tab's next step, where the longer trail's smoke lies
+                // over the `m` and the `d` the Tab completed: the letter guard dims it there
+                // to keep each letter's core, as the card's face lays it, at its bar
+                // (`CursorGlow::observe_glyph_ink`). Fire's dark smoke then changes 67 px
+                // by more than 16 levels and 4 by more than 32 (22 with every glyph read
+                // as its colour whole), so the held frame is held to either of the two
+                // floors the Tab's frames meet.
+                assert!(
+                    apart >= 12 || apart16 >= 40,
+                    "{raw}: Trail length shows on the paused frame: {apart} px more than 32 \
+                     levels apart, {apart16} more than 16"
+                );
+            }
+            checked
+        })
+        .into_iter()
+        .sum();
         assert!(checked >= 40, "{checked} knobs checked");
     }
 
@@ -8435,10 +9311,19 @@ mod tests {
                 at(MOTION_STEP_MS),
             );
             let row = after.cursor_row;
-            assert!(row > 0 && before.cursor_row == row, "{raw}: one prompt row");
+            let up = usize::from(CURSOR_SCENE_RETURN_ROWS);
             assert!(
-                text(&after.cells[row - 1]).contains(CURSOR_SCENE_COMMAND),
-                "{raw}: the line just typed is one row up: {:?}",
+                row >= up && before.cursor_row == row,
+                "{raw}: one prompt row"
+            );
+            assert!(
+                text(&after.cells[row - up]).contains(CURSOR_SCENE_COMMAND),
+                "{raw}: the line just typed is over what the shell printed: {:?}",
+                text(&after.cells[row - up])
+            );
+            assert!(
+                text(&after.cells[row - 1]).starts_with(CURSOR_SCENE_OUTPUT),
+                "{raw}: the shell's line is over the fresh prompt: {:?}",
                 text(&after.cells[row - 1])
             );
             let line_end = before.cursor_col as i32 * cw - 2 * cw;
@@ -8449,9 +9334,9 @@ mod tests {
             );
             if raw == "comet" {
                 assert!(
-                    reach(&after, row - 1) >= line_end - 4 * cw,
-                    "comet: the Return's streak leaves the line's end, one row up: {} px",
-                    reach(&after, row - 1)
+                    reach(&after, row - up) >= line_end - 4 * cw,
+                    "comet: the Return's streak leaves the line's end, where it scrolled: {} px",
+                    reach(&after, row - up)
                 );
                 assert!(
                     reach_with(&after, row, false) < line_end,
@@ -8769,7 +9654,13 @@ mod tests {
                 height: 17 * input.rows,
                 pixels: vec![theme.bg; 8 * input.cols * 17 * input.rows],
             };
-            scene.post_process(&mut frame, &input).unwrap();
+            let grid = aterm_render::bloom::LetterGrid {
+                pad: 0,
+                grid_top: 0,
+                cell_w: 8,
+                cell_h: 17,
+            };
+            scene.post_process(&mut frame, &input, grid).unwrap();
             frame.pixels
         };
         assert!(
@@ -9648,6 +10539,53 @@ mod tests {
         );
     }
 
+    /// The card stands still for one cause at a time, and its header names that cause: no two
+    /// causes share the header's words, nor the spoken value's. Round 2's header read "Paused"
+    /// for the background, load, rest and the viewer's own Pause alike, so a sighted reader
+    /// could not tell a held demo from a backgrounded one while the spoken value could.
+    #[test]
+    fn each_cause_of_a_still_card_reads_its_own_header() {
+        let causes = [
+            PreviewPause::Unspecified,
+            PreviewPause::SeriousMode,
+            PreviewPause::Load,
+            PreviewPause::Unfocused,
+            PreviewPause::MotionSetting,
+            PreviewPause::SystemReduceMotion,
+            PreviewPause::Resting,
+            PreviewPause::Viewer,
+        ];
+        let still = |cause: PreviewPause| {
+            let spec = SettingsPreviewSpec::default().with_phase(300);
+            if cause == PreviewPause::Viewer {
+                spec.with_paused(true)
+            } else {
+                spec.with_reduced_motion(true).with_pause(cause)
+            }
+        };
+        let live = SettingsPreviewSpec::default().with_phase(300);
+        let mut headers = std::collections::BTreeMap::new();
+        let mut spoken = std::collections::BTreeMap::new();
+        for cause in causes {
+            let spec = still(cause);
+            assert_eq!(
+                spec.animation(),
+                PreviewAnimation::None,
+                "{cause:?} stands still"
+            );
+            assert_ne!(spec.state_badge(), live.state_badge(), "{cause:?}");
+            if let Some(twin) = headers.insert(spec.state_badge(), cause) {
+                panic!(
+                    "{twin:?} and {cause:?} both read {:?} in the header",
+                    spec.state_badge()
+                );
+            }
+            if let Some(twin) = spoken.insert(spec.semantic_value(), cause) {
+                panic!("{twin:?} and {cause:?} are spoken alike");
+            }
+        }
+    }
+
     #[test]
     fn a_paused_preview_holds_the_trail_mid_line() {
         let spec = |phase| {
@@ -9817,5 +10755,766 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The pixel at `(x, y)` of `frame`.
+    fn frame_rgb(frame: &aterm_render::Frame, x: usize, y: usize) -> [u8; 3] {
+        crate::settings::u32_rgb(frame.pixels[y * frame.width + x])
+    }
+
+    /// WCAG 2 relative luminance of an sRGB colour.
+    fn luma(rgb: [u8; 3]) -> f32 {
+        let lin = |v: u8| {
+            let c = f32::from(v) / 255.0;
+            if c <= 0.039_28 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(rgb[0]) + 0.7152 * lin(rgb[1]) + 0.0722 * lin(rgb[2])
+    }
+
+    /// WCAG 2 contrast of two sRGB colours.
+    fn wcag(a: [u8; 3], b: [u8; 3]) -> f32 {
+        let (la, lb) = (luma(a), luma(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    /// Each channel's median (the upper one of an even count).
+    fn median_rgb(px: &[[u8; 3]]) -> Option<[u8; 3]> {
+        (!px.is_empty()).then(|| {
+            std::array::from_fn(|k| {
+                let mut channel: Vec<u8> = px.iter().map(|rgb| rgb[k]).collect();
+                channel.sort_unstable();
+                channel[channel.len() / 2]
+            })
+        })
+    }
+
+    /// What every lettered cell the scene's lights or companion changed reads, as the trail
+    /// lab's `trail-contrast` judges a glyph against its clean twin (`twin`, the card with no
+    /// light and no companion): the lower of its whole-cell contrast (the median of its core ink
+    /// against the median of its pure ground, as the frame has them) and its local contrast
+    /// (each solid ink pixel against the median of the nearest ring, 1 then 2 px out, of pixels
+    /// that are pure ground in the twin; the worst pixel row's lower median), a speck of a few
+    /// pixels by its local contrast alone. `(reading, bare, row, col)` for each such letter,
+    /// `bare` the same glyph read on the twin.
+    fn judged_letters(
+        lit: &aterm_render::Frame,
+        twin: &aterm_render::Frame,
+        input: &RenderInput,
+        (cell_w, cell_h): (usize, usize),
+    ) -> Vec<(f32, f32, usize, usize)> {
+        /// A glyph's core: this share of the way from the clean ground to its extreme.
+        const CORE_SHARE: f32 = 0.70;
+        /// A glyph's solid ink: this share of its extreme's ratio against the ground.
+        const SOLID_SHARE: f32 = 0.85;
+        /// A speck: a glyph of this many core pixels or fewer (a `.` on the card's 16 px rows
+        /// is four, two of them antialiased edge). The median of so few is an edge pixel, a
+        /// reading of the font's antialiasing rather than of the ink, so a speck reads by its
+        /// local contrast alone (each solid pixel against the ground beside it). The letter
+        /// guard reads a cell's colours, not its glyph's coverage: under Rainbow kitty
+        /// flying's submit on GitHub Light, the Return's frame, the `.` of `README.md` reads
+        /// 4.43:1 whole (5.11 bare) and 8:1 locally.
+        const SPECK_CORE_PX: usize = 6;
+
+        let near =
+            |a: [u8; 3], b: [u8; 3], by: u8| a.iter().zip(&b).all(|(p, q)| p.abs_diff(*q) <= by);
+        let mut out = Vec::new();
+        for (row, cells) in input.cells.iter().enumerate() {
+            for (col, cell) in cells.iter().enumerate() {
+                let (x0, y0) = (col * cell_w, row * cell_h);
+                if matches!(cell.ch, ' ' | '\0')
+                    || (row, col) == (input.cursor_row, input.cursor_col)
+                    || x0 + cell_w > lit.width
+                    || y0 + cell_h > lit.height
+                {
+                    continue;
+                }
+                let pixels =
+                    || (y0..y0 + cell_h).flat_map(move |y| (x0..x0 + cell_w).map(move |x| (x, y)));
+                if pixels().all(|(x, y)| near(frame_rgb(lit, x, y), frame_rgb(twin, x, y), 12)) {
+                    continue;
+                }
+                let mut counts = std::collections::HashMap::<[u8; 3], usize>::new();
+                for (x, y) in pixels() {
+                    *counts.entry(frame_rgb(twin, x, y)).or_default() += 1;
+                }
+                let Some(ground) = counts.iter().max_by_key(|(_, n)| **n).map(|(rgb, _)| *rgb)
+                else {
+                    continue;
+                };
+                let Some(extreme) = pixels()
+                    .map(|(x, y)| frame_rgb(twin, x, y))
+                    .max_by(|a, b| wcag(*a, ground).total_cmp(&wcag(*b, ground)))
+                else {
+                    continue;
+                };
+                if wcag(extreme, ground) < 1.5 {
+                    continue;
+                }
+                let ground_luma = luma(ground);
+                let reach = CORE_SHARE * (luma(extreme) - ground_luma).abs();
+                let speck = pixels()
+                    .filter(|&(x, y)| {
+                        let clean = frame_rgb(twin, x, y);
+                        clean != ground && (luma(clean) - ground_luma).abs() >= reach
+                    })
+                    .count()
+                    <= SPECK_CORE_PX;
+                let read = |lit: &aterm_render::Frame| {
+                    let (mut ink, mut bed) = (Vec::new(), Vec::new());
+                    for (x, y) in pixels() {
+                        let clean = frame_rgb(twin, x, y);
+                        if clean == ground {
+                            bed.push(frame_rgb(lit, x, y));
+                        } else if (luma(clean) - ground_luma).abs() >= reach {
+                            ink.push(frame_rgb(lit, x, y));
+                        }
+                    }
+                    let (ink, bed) = (median_rgb(&ink)?, median_rgb(&bed)?);
+                    let whole = wcag(ink, bed);
+                    let ring_ground = |x: usize, y: usize| {
+                        (1..=2_i32).find_map(|off| {
+                            let mut ring = Vec::new();
+                            for dy in -off..=off {
+                                for dx in -off..=off {
+                                    let (gx, gy) = (x as i32 + dx, y as i32 + dy);
+                                    if dx.abs().max(dy.abs()) != off
+                                        || gx < 0
+                                        || gy < 0
+                                        || gx as usize >= lit.width
+                                        || gy as usize >= lit.height
+                                    {
+                                        continue;
+                                    }
+                                    let (gx, gy) = (gx as usize, gy as usize);
+                                    if frame_rgb(twin, gx, gy) == ground {
+                                        ring.push(frame_rgb(lit, gx, gy));
+                                    }
+                                }
+                            }
+                            median_rgb(&ring)
+                        })
+                    };
+                    let local_of = |solid: &dyn Fn([u8; 3]) -> bool| {
+                        let mut least: Option<f32> = None;
+                        for y in y0..y0 + cell_h {
+                            let mut readings: Vec<f32> = (x0..x0 + cell_w)
+                                .filter(|&x| solid(frame_rgb(twin, x, y)))
+                                .filter_map(|x| {
+                                    ring_ground(x, y).map(|g| wcag(frame_rgb(lit, x, y), g))
+                                })
+                                .collect();
+                            if readings.is_empty() {
+                                continue;
+                            }
+                            readings.sort_by(f32::total_cmp);
+                            let reading = readings[(readings.len() - 1) / 2];
+                            least = Some(least.map_or(reading, |least| least.min(reading)));
+                        }
+                        least
+                    };
+                    let solid_bar = SOLID_SHARE * wcag(extreme, ground);
+                    let local = local_of(&|clean| wcag(clean, ground) >= solid_bar).or_else(|| {
+                        local_of(&|clean| {
+                            clean != ground && (luma(clean) - ground_luma).abs() >= reach
+                        })
+                    });
+                    Some(match local {
+                        Some(local) if speck => local,
+                        Some(local) => whole.min(local),
+                        None => whole,
+                    })
+                };
+                if let (Some(reading), Some(bare)) = (read(lit), read(twin)) {
+                    out.push((reading, bare, row, col));
+                }
+            }
+        }
+        out
+    }
+
+    /// The least a letter reads under a light (WCAG AA).
+    const LEGIBLE: f32 = 4.5;
+
+    /// The share of its own bare reading a letter that reads under [`LEGIBLE`] on the bare
+    /// card keeps under the lights, as the letter guard keeps one
+    /// (`cursor_glow::ink_ledger::letter_guard`'s `OWN_SHARE`): GitHub Light's bold green
+    /// `build.sh` reads 4.25:1 bare, so no light can leave it at 4.5.
+    const OWN_SHARE: f32 = 0.97;
+
+    /// Of [`judged_letters`], the one furthest under its bar (`(reading, bar, row, col)`):
+    /// [`LEGIBLE`], or [`OWN_SHARE`] of its bare reading where that is lower.
+    fn worst_lit_letter(
+        lit: &aterm_render::Frame,
+        twin: &aterm_render::Frame,
+        input: &RenderInput,
+        cell: (usize, usize),
+    ) -> Option<(f32, f32, usize, usize)> {
+        judged_letters(lit, twin, input, cell)
+            .into_iter()
+            .map(|(reading, bare, row, col)| (reading, LEGIBLE.min(OWN_SHARE * bare), row, col))
+            .min_by(|a, b| (a.0 / a.1).total_cmp(&(b.0 / b.1)))
+    }
+
+    /// What [`lit_card`]'s twin of the lit card leaves out.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Twin {
+        /// The lights alone: the caret, the letters and the companion kept.
+        Bare,
+        /// Every overlay (`RenderInput::clear_overlays`, as `image clean` captures a
+        /// terminal's twin): the letters and the caret kept.
+        Clean,
+    }
+
+    /// The card's terminal at `rows` rows playing `raw` on `theme` at `phase`, lit and as
+    /// its `twin`, with the bloom or without and the companion in `look` (`None`: the
+    /// default): the frames, the lit input and the cell size.
+    fn lit_card(
+        raw: &str,
+        (theme, bloom, look): (
+            PreviewTerminalTheme,
+            bool,
+            Option<aterm_effects::kitty_registry::KittyLook>,
+        ),
+        (phase, rows, twin): (u64, usize, Twin),
+        prepared: &crate::tray_raster::PreparedSemanticFont,
+    ) -> (
+        aterm_render::Frame,
+        aterm_render::Frame,
+        RenderInput,
+        (usize, usize),
+    ) {
+        let spec = SettingsPreviewSpec::cursor(CursorPreviewSpec {
+            blink: false,
+            trail_style: PreviewTrailStyle::parse(raw),
+            trail_style_raw: Arc::from(raw),
+            ..CursorPreviewSpec::default()
+        })
+        .with_post_fx(CursorPostFxSpec {
+            bloom,
+            companion_look: look.unwrap_or(CursorPostFxSpec::default().companion_look),
+            ..CursorPostFxSpec::default()
+        })
+        .with_terminal_theme(theme)
+        .with_phase(phase)
+        .with_prepared_font(prepared.clone())
+        .normalized();
+        let specimen = spec.terminal_specimen(theme.into_theme(), Some(rows));
+        let cell = crate::tray_raster::specimen_cell_size_for_test(&specimen, 1.0)
+            .expect("the card's cell");
+        let scene = specimen.motion.clone().expect("the cursor scene");
+        let ink = crate::tray_raster::specimen_glyph_ink_for_test(&specimen, 1.0);
+        let lit_input = scene.decorate_inked(&specimen.input, cell, ink.as_ref());
+        let lit = crate::tray_raster::render_specimen_frame_for_test(&specimen, 1.0)
+            .expect("the lit card");
+        let mut twin_input = lit_input.clone();
+        match twin {
+            Twin::Bare => {
+                twin_input.cursor_glow_add.clear();
+                twin_input.glow_under.clear();
+                twin_input.glow_halo.clear();
+                twin_input.fire_patch.clear();
+                twin_input.char_fg.clear();
+                twin_input.fire_halo.clear();
+                twin_input.cursor_trail.clear();
+            }
+            Twin::Clean => twin_input.clear_overlays(),
+        }
+        let twin = crate::tray_raster::render_specimen_frame_for_test(
+            &crate::widget::TerminalSpecimenSpec {
+                input: Arc::new(twin_input),
+                input_fingerprint: specimen.input_fingerprint ^ 0x0BA2_E000 ^ phase,
+                motion: None,
+                ..specimen.clone()
+            },
+            1.0,
+        )
+        .expect("the card's twin");
+        (lit, twin, lit_input, cell)
+    }
+
+    /// `settings card` names the card a capture painted as the terminal names a frame: its grid
+    /// at the card's place in the window (the native page's origin plus where its raster blitted
+    /// the card), the caret, each row's text, and the companion's body in window pixels; `settings
+    /// card clean` is the same cells with no light, and inside that body it differs from the lit
+    /// card (the companion is gone). A capture of a frame with no native page (the negative
+    /// control) keeps no card, and the verb says so rather than answer a stale one.
+    #[test]
+    fn settings_card_names_the_painted_card_as_a_terminal_frame() {
+        let _ = compiled(SettingsPreviewSpec::default());
+        let prepared = crate::tray_raster::prepared_semantic_font_for_direct_view_test(
+            &SemanticFontCandidate::default(),
+        );
+        let theme = PreviewTerminalTheme::from_scheme(&aterm_types::ColorScheme::default());
+        let raw = "rainbow kitty pet";
+        let spec = SettingsPreviewSpec::cursor(CursorPreviewSpec {
+            blink: false,
+            trail_style: PreviewTrailStyle::parse(raw),
+            trail_style_raw: Arc::from(raw),
+            ..CursorPreviewSpec::default()
+        })
+        .with_terminal_theme(theme)
+        .with_phase(1500)
+        .with_prepared_font(prepared.clone())
+        .normalized();
+        let specimen = spec.terminal_specimen(theme.into_theme(), Some(7));
+        let (cw, ch) = crate::tray_raster::specimen_cell_size_for_test(&specimen, 1.0)
+            .expect("the card's cell");
+        let lit = crate::tray_raster::render_specimen_frame_for_test(&specimen, 1.0)
+            .expect("the lit card");
+        // The raster blits the card 30, 40 into the page, the page at 3, 4 in the window.
+        note_scene_card_painted(&specimen, 1.0, (30, 40));
+        stash_captured_scene_card(Some((3, 4)));
+        let lines = captured_scene_card_reply(false).expect("the card");
+        let (rows, cols) = (specimen.input.rows, specimen.input.cols);
+        assert_eq!(
+            lines[0],
+            format!(
+                "dims OK {rows} {cols} {} {} cell_w={cw} cell_h={ch} pad=33 pad_top=44 head=0",
+                cols * cw,
+                rows * ch
+            )
+        );
+        assert!(lines[1].starts_with("cursor OK 5 "), "{lines:?}");
+        let text: Vec<&str> = lines
+            .iter()
+            .filter_map(|line| line.strip_prefix("text "))
+            .collect();
+        assert_eq!(text.len(), rows, "{lines:?}");
+        assert!(
+            text.iter().any(|row| row.starts_with("~/demo $ git add")),
+            "{text:?}"
+        );
+        let body = lines[2]
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix("pet_body="))
+            .expect("the companion's body");
+        let body: Vec<usize> = body
+            .split(',')
+            .map(|v| v.parse::<usize>().expect("a window pixel"))
+            .collect();
+        let (x0, x1, y0, y1) = (body[0] - 33, body[1] - 33, body[2] - 44, body[3] - 44);
+        let clean = captured_scene_card_reply(true).expect("the bare card");
+        let words: Vec<&str> = clean[0].split_whitespace().collect();
+        assert_eq!(&words[..3], ["clean", "33", "44"], "{:?}", &words[..5]);
+        let png = aterm_codec::base64::decode(words[6]).expect("the card's PNG");
+        let (bare, w, h) = aterm_png::decode_rgba8(&png, 4096).expect("the PNG decodes");
+        assert_eq!((w, h), (lit.width, lit.pixels.len() / lit.width));
+        let changed = |x: usize, y: usize| {
+            let at = (y * w + x) * 4;
+            frame_rgb(&lit, x, y) != [bare[at], bare[at + 1], bare[at + 2]]
+        };
+        let in_body = (y0..y1)
+            .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+            .filter(|&(x, y)| changed(x, y))
+            .count();
+        assert!(in_body > 0, "the bare card still shows the companion");
+        // Both ways a page's raster paints the card note it: the frame of a specimen that
+        // covers most of the page, prepared once for the whole raster (the Cursor page's card
+        // in a captured window; the trail gallery's every settings frame missed it so), and a
+        // card a larger page paints in passing.
+        let card = (cols * cw, rows * ch);
+        for page in [(card.0 + 40, card.1 + 50), (4 * card.0, 4 * card.1)] {
+            PAINTED_CARD.set(None);
+            let prims = [crate::widget::DrawPrim::TerminalSpecimen {
+                x: 30.0,
+                y: 40.0,
+                spec: Box::new(specimen.clone()),
+            }];
+            let w = u32::try_from(page.0).expect("a page's width");
+            let h = u32::try_from(page.1).expect("a page's height");
+            let _ = crate::tray_raster::rasterize_tray(&prims, w, h, 1.0, [0, 0, 0, 255]);
+            stash_captured_scene_card(Some((3, 4)));
+            let painted = captured_scene_card_reply(false).expect("the painted card");
+            assert_eq!(painted[0], lines[0], "a {page:?} page");
+        }
+        stash_captured_scene_card(None);
+        assert!(captured_scene_card_reply(false).is_err());
+    }
+
+    /// The light the card's edges cut in `rows` rows playing `raw` on `theme`, one line a frame,
+    /// at every frame of the loop (the bloom left out, whose soft spill is no mark). Round the
+    /// sides and the bottom every pixel is the bare page's. On the top edge a light may stand
+    /// on the top row from its row's top, kept in its row (Beam's leap bed after the Return
+    /// lights the row's top pixel in every card, the same pixels a row lower in a taller card);
+    /// it is cut where it rises past the row: where the card one line taller, the same scene
+    /// with one more line over it, lights the pixel over that same row in that column.
+    fn edge_cuts(
+        raw: &str,
+        (side, theme): (&str, PreviewTerminalTheme),
+        rows: usize,
+        prepared: &crate::tray_raster::PreparedSemanticFont,
+    ) -> Vec<String> {
+        let lit_at = |lit: &aterm_render::Frame, bare: &aterm_render::Frame, x, y| {
+            let (a, b) = (frame_rgb(lit, x, y), frame_rgb(bare, x, y));
+            a.iter().zip(&b).any(|(p, q)| p.abs_diff(*q) > 12)
+        };
+        let mut cuts = Vec::new();
+        for phase in (0..CURSOR_SCENE_CYCLE_MS).step_by(MOTION_STEP_MS as usize) {
+            let (lit, bare, ..) = lit_card(
+                raw,
+                (theme, false, None),
+                (phase, rows, Twin::Bare),
+                prepared,
+            );
+            let (w, h) = (lit.width, lit.height);
+            let sides = (0..w)
+                .map(|x| (x, h - 1))
+                .chain((0..h).flat_map(|y| [(0, y), (w - 1, y)]))
+                .filter(|&(x, y)| lit_at(&lit, &bare, x, y))
+                .count();
+            let top: Vec<usize> = (0..w).filter(|&x| lit_at(&lit, &bare, x, 0)).collect();
+            let risen = if top.is_empty() {
+                0
+            } else {
+                let (tall, tall_bare, _, (_, cell_h)) = lit_card(
+                    raw,
+                    (theme, false, None),
+                    (phase, rows + 1, Twin::Bare),
+                    prepared,
+                );
+                top.iter()
+                    .filter(|&&x| lit_at(&tall, &tall_bare, x, cell_h - 1))
+                    .count()
+            };
+            if sides + risen > 0 {
+                cuts.push(format!(
+                    "{raw} {side} in {rows} rows at {phase} ms: {sides} px at the sides and \
+                     bottom, {risen} risen past the top"
+                ));
+            }
+        }
+        cuts
+    }
+
+    /// No mark the scene draws stands cut at the card's edge ([`edge_cuts`]), every style on
+    /// dark and light, in cards of three, four and five rows: the picker host's preview
+    /// shrinks to three, a Settings window under 760 px wide shows four. A particle the edge
+    /// would cut is left out whole (`CursorGlow::emit_particles`, the rainbow kitty's paper
+    /// stars), and a light rising past the card's top is laid shorter inside it, its soft top
+    /// whole ([`aterm_effects::cursor_glow`]'s rise ceiling): the card gives its grid no head
+    /// band (`head` 0), where a terminal window's top row rises into its own. The negative
+    /// controls: drawn cut, Water's drops lay flat along the card's bottom edge; cut by the
+    /// box's clip, the rainbow band's exit in a four-row card (the Return sets the submitted
+    /// line on the top row) and Fire's dark cores over the prompt in a three-row card stood
+    /// flat against the card's top edge (settings round 2). Fire's paper tongues there were
+    /// cut too, but the taller card holds them under its submitted line's letters, so this
+    /// card's top edge cannot see them rise; the engine's own test holds them
+    /// (`a_blaze_under_the_grids_top_keeps_inside_the_box`).
+    #[test]
+    fn no_light_stands_cut_at_the_cards_edge() {
+        let light = PreviewTerminalTheme::from_scheme(
+            &aterm_types::scheme::builtin("GitHub Light").expect("built-in light theme"),
+        );
+        let dark = PreviewTerminalTheme::from_scheme(&aterm_types::ColorScheme::default());
+        let items: Vec<(&str, (&str, PreviewTerminalTheme), usize)> =
+            crate::prefs::CURSOR_TRAIL_STYLES
+                .iter()
+                .flat_map(|&raw| {
+                    [3, 4, 5].into_iter().flat_map(move |rows| {
+                        [(raw, ("dark", dark), rows), (raw, ("light", light), rows)]
+                    })
+                })
+                .collect();
+        // Each item plays on its own thread, with that thread's fonts and scene.
+        let found: Vec<String> = aterm_spec::check::each(&items, |&(raw, ground, rows)| {
+            let _ = compiled(SettingsPreviewSpec::default());
+            let prepared = crate::tray_raster::prepared_semantic_font_for_direct_view_test(
+                &SemanticFontCandidate::default(),
+            );
+            edge_cuts(raw, ground, rows, &prepared)
+        })
+        .into_iter()
+        .flatten()
+        .collect();
+        assert!(found.is_empty(), "lit at the card's edge: {found:#?}");
+
+        let _ = compiled(SettingsPreviewSpec::default());
+        let prepared = crate::tray_raster::prepared_semantic_font_for_direct_view_test(
+            &SemanticFontCandidate::default(),
+        );
+        let with_controls = |set: &dyn Fn(&mut SceneControls), run: &dyn Fn() -> Vec<String>| {
+            let kept = SCENE_CONTROLS.with(std::cell::Cell::get);
+            let mut changed = kept;
+            set(&mut changed);
+            SCENE_CONTROLS.with(|controls| controls.set(changed));
+            let cuts = run();
+            SCENE_CONTROLS.with(|controls| controls.set(kept));
+            cuts
+        };
+        let drops = with_controls(&|c| c.motes_whole = false, &|| {
+            edge_cuts("water", ("dark", dark), 5, &prepared)
+        });
+        assert!(
+            !drops.is_empty(),
+            "negative control: Water's drops drawn cut at the edge"
+        );
+        for (raw, ground, rows) in [
+            ("rainbow kitty pet", ("dark", dark), 4),
+            ("rainbow kitty pet", ("light", light), 4),
+            ("fire", ("dark", dark), 3),
+        ] {
+            let cut = with_controls(&|c| c.rises_kept = false, &|| {
+                edge_cuts(raw, ground, rows, &prepared)
+            });
+            assert!(
+                !cut.is_empty(),
+                "negative control: {raw} on {} in {rows} rows cut by the box's clip",
+                ground.0
+            );
+        }
+    }
+
+    /// The styles whose scene draws a companion, resident or flying.
+    fn companion_styles() -> Vec<&'static str> {
+        crate::prefs::CURSOR_TRAIL_STYLES
+            .iter()
+            .copied()
+            .filter(|raw| {
+                !matches!(
+                    CursorPreviewSpec {
+                        trail_style: PreviewTrailStyle::parse(raw),
+                        trail_style_raw: Arc::from(*raw),
+                        ..CursorPreviewSpec::default()
+                    }
+                    .trail_companion(),
+                    PreviewTrailCompanion::None
+                )
+            })
+            .collect()
+    }
+
+    /// The companion looks the card is judged in: the default (an adult) and the smallest
+    /// and largest ages, whose heads differ in height by two fifths.
+    fn judged_looks() -> [aterm_effects::kitty_registry::KittyLook; 3] {
+        use aterm_effects::genome::CatAge;
+        let look = aterm_effects::kitty_registry::KittyLook::DEFAULT;
+        [
+            look,
+            aterm_effects::kitty_registry::KittyLook {
+                age: CatAge::Kitten,
+                ..look
+            },
+            aterm_effects::kitty_registry::KittyLook {
+                age: CatAge::Elder,
+                ..look
+            },
+        ]
+    }
+
+    /// Every letter a trail or companion lies on in the card keeps 4.5:1, judged as the
+    /// trail lab's `trail-contrast` judges one ([`judged_letters`]: the lower of the whole
+    /// cell's contrast and the local one, against the card's clean twin, no light and no
+    /// companion drawn), in every style on dark and light at every frame of the scene's loop,
+    /// and the companions in every look [`judged_looks`] names, in the embedded face and, on
+    /// macOS, in the host's own system face at the card's 14 px (SF Mono, 9 x 16 cells: the
+    /// face the settings window draws its card in, which the trail gallery photographs): the
+    /// scene hands its trail the frame's text and what its face lays of each glyph as the
+    /// terminal's host does (`pipeline_native::step_cursor_family`,
+    /// `CursorGlow::observe_glyph_ink`), so the letter guard, the dust's air and the dark
+    /// rim's law read the letters, and its companions keep off them. Classic's dark face is
+    /// v0.28's, byte for byte (an owner ruling): its spectrum streak runs over the letter it
+    /// leaves. The negative controls: without the frame's text, Laser's bolt on dark lay on
+    /// letters at 1:1; with every glyph's ink read as its colour whole, SF Mono's one-column
+    /// stems showed the light laid under them, and Sparkle's landing on GitHub Light left the
+    /// `m` of `README.md` at 4.30:1 (the gallery's 4.17, looks9's settings round 2).
+    #[test]
+    fn the_cards_letters_read_under_every_light() {
+        let _ = compiled(SettingsPreviewSpec::default());
+        let embedded = crate::tray_raster::prepared_semantic_font_for_direct_view_test(
+            &SemanticFontCandidate::default(),
+        );
+        let faces = vec![("the embedded face", embedded)];
+        #[cfg(target_os = "macos")]
+        let faces = {
+            let mut faces = faces;
+            let mut host = aterm_render::Renderer::from_system_with_family(
+                None,
+                14.0,
+                aterm_render::Theme::default(),
+            )
+            .expect("the host's system face");
+            host.prepare_semantic_typography("Bold Italic != => ");
+            faces.push((
+                "the host's system face",
+                crate::tray_raster::prepared_semantic_font_from_renderer_for_test(host),
+            ));
+            faces
+        };
+        let light = PreviewTerminalTheme::from_scheme(
+            &aterm_types::scheme::builtin("GitHub Light").expect("built-in light theme"),
+        );
+        let dark = PreviewTerminalTheme::from_scheme(&aterm_types::ColorScheme::default());
+        let under =
+            |raw: &str,
+             (side, theme): (&str, PreviewTerminalTheme),
+             look: Option<aterm_effects::kitty_registry::KittyLook>,
+             (face, prepared): (&str, &crate::tray_raster::PreparedSemanticFont)| {
+                let mut under = Vec::new();
+                for phase in (0..CURSOR_SCENE_CYCLE_MS).step_by(MOTION_STEP_MS as usize) {
+                    let (lit, twin, lit_input, cell) =
+                        lit_card(raw, (theme, true, look), (phase, 7, Twin::Clean), prepared);
+                    if let Some((reading, bar, row, col)) =
+                        worst_lit_letter(&lit, &twin, &lit_input, cell)
+                        && reading < bar
+                    {
+                        let age = look.map(|look| look.age);
+                        under.push(format!(
+                            "{raw} {side} {age:?} in {face} at {phase} ms: the letter at row {row} \
+                         col {col} reads {reading:.2}:1, under its {bar:.2}"
+                        ));
+                    }
+                }
+                under
+            };
+        let companions = companion_styles();
+        assert!(
+            companions.len() >= 4,
+            "the companion styles: {companions:?}"
+        );
+        let mut found = Vec::new();
+        for (face, prepared) in &faces {
+            for &raw in crate::prefs::CURSOR_TRAIL_STYLES {
+                for ground in [("dark", dark), ("light", light)] {
+                    if raw == "classic" && ground.0 == "dark" {
+                        continue;
+                    }
+                    if companions.contains(&raw) {
+                        for look in judged_looks() {
+                            found.extend(under(raw, ground, Some(look), (face, prepared)));
+                        }
+                    } else {
+                        found.extend(under(raw, ground, None, (face, prepared)));
+                    }
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "{} frames hold a letter under its bar: {:#?}",
+            found.len(),
+            &found[..found.len().min(24)]
+        );
+        let set = |change: &dyn Fn(&mut SceneControls)| {
+            SCENE_CONTROLS.with(|controls| {
+                let mut next = controls.get();
+                change(&mut next);
+                controls.set(next);
+            });
+        };
+        set(&|c| c.frame_text = false);
+        let (face, prepared) = &faces[0];
+        let unread = under("laser", ("dark", dark), None, (face, prepared));
+        set(&|c| c.frame_text = true);
+        assert!(
+            !unread.is_empty(),
+            "negative control: blind to the frame's letters, Laser's bolt lies on one"
+        );
+        #[cfg(target_os = "macos")]
+        {
+            set(&|c| c.glyph_ink = false);
+            let (face, prepared) = &faces[1];
+            let solid = under("sparkle", ("light", light), None, (face, prepared));
+            set(&|c| c.glyph_ink = true);
+            assert!(
+                !solid.is_empty(),
+                "negative control: each glyph's ink read as its colour whole, Sparkle's landing \
+                 leaves a letter of the host's face under its bar"
+            );
+        }
+    }
+
+    /// The flying kitty keeps off the scene's letters: no frame of the loop lays a drawn texel
+    /// of its head on a lettered cell or the caret's, on dark and light, in every look
+    /// [`judged_looks`] names, in a roomy card and a short one. The head is taller than its
+    /// row and centred on it, so seated by its row's letters alone
+    /// (`rainbow_kitty::companion::placement` before it read the rows beside its own: the
+    /// negative control) its ears lay on the letters of the line above, the card's `git c`
+    /// at 1.25:1 (looks9's settings round 1).
+    #[test]
+    fn the_flying_kitty_keeps_off_the_scenes_letters() {
+        let light = PreviewTerminalTheme::from_scheme(
+            &aterm_types::scheme::builtin("GitHub Light").expect("built-in light theme"),
+        );
+        let raw = "rainbow kitty flying";
+        let cell = (8, 17);
+        let grounds = [("dark", None), ("light", Some(light))];
+        let on_letters = |unread: bool| {
+            aterm_effects::rainbow_kitty::companion::set_rows_beside_unread(unread);
+            let mut on_letters = Vec::new();
+            let mut drawn = 0_usize;
+            for &(side, ground) in &grounds {
+                for look in judged_looks() {
+                    for rows in [None, Some(4)] {
+                        for phase in (0..CURSOR_SCENE_CYCLE_MS).step_by(MOTION_STEP_MS as usize) {
+                            let spec = SettingsPreviewSpec::cursor(CursorPreviewSpec {
+                                blink: false,
+                                trail_style: PreviewTrailStyle::parse(raw),
+                                trail_style_raw: Arc::from(raw),
+                                ..CursorPreviewSpec::default()
+                            })
+                            .with_post_fx(CursorPostFxSpec {
+                                companion_look: look,
+                                ..CursorPostFxSpec::default()
+                            });
+                            let spec = match ground {
+                                Some(theme) => spec.with_terminal_theme(theme),
+                                None => spec,
+                            }
+                            .with_phase(phase)
+                            .normalized();
+                            let theme = ground
+                                .map_or_else(Theme::default, PreviewTerminalTheme::into_theme);
+                            let (base, _) = build_terminal_specimen_input_rows(&spec, theme, rows);
+                            let input = CursorScene::new(&spec, theme, rows).decorate(&base, cell);
+                            let Some(head) = sprites(&input)
+                                .into_iter()
+                                .filter(|sprite| sprite.alpha > 0)
+                                .max_by_key(|sprite| u32::from(sprite.w) * u32::from(sprite.h))
+                            else {
+                                continue;
+                            };
+                            drawn += 1;
+                            let caret = (input.cursor_row, input.cursor_col);
+                            let lettered: Vec<(usize, usize)> = inked_cells(&head, cell)
+                                .into_iter()
+                                .filter(|&(row, col)| {
+                                    (row, col) == caret
+                                        || input
+                                            .cells
+                                            .get(row)
+                                            .and_then(|cells| cells.get(col))
+                                            .is_some_and(|cell| !matches!(cell.ch, ' ' | '\0'))
+                                })
+                                .collect();
+                            if !lettered.is_empty() {
+                                on_letters.push(format!(
+                                    "{side} {:?} rows {rows:?} at {phase} ms: on {lettered:?}",
+                                    look.age
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            aterm_effects::rainbow_kitty::companion::set_rows_beside_unread(false);
+            (on_letters, drawn)
+        };
+        let (control, _) = on_letters(true);
+        let (law, drawn) = on_letters(false);
+        assert!(drawn >= 100, "the flying kitty is drawn: {drawn} frames");
+        assert!(
+            law.is_empty(),
+            "{} frames: {:#?}",
+            law.len(),
+            &law[..law.len().min(8)]
+        );
+        assert!(
+            !control.is_empty(),
+            "negative control: seated by its row's letters alone, its ears lie on the line above"
+        );
     }
 }

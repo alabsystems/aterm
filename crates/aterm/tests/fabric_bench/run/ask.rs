@@ -6,9 +6,11 @@
 //! `kind=note --wait`'s, idle and under load; a receipt (`--wait-ack`); an ask
 //! to a person, which aterm's table escalates to a full flush before its ack,
 //! without and with `aterm link notify` paging it; and what that flush costs
-//! the ordinary messages beside it. A world of its own with the bridge's wait
-//! tally on, so each leg's windows say where the bridge's loop spent a post.
-//! Measures, never asserts a floor.
+//! the ordinary messages beside it; and what an `aterm link notify --on need`
+//! following every row under `pub` costs session-event traffic and itself
+//! (C02). A world of its own with the bridge's wait tally on, so each leg's
+//! windows say where the bridge's loop spent a post. Measures, never asserts a
+//! floor.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -777,6 +779,8 @@ struct Pager {
     child: Option<aterm_uds::spawnfd::Child>,
     journal: PathBuf,
     cursor: PathBuf,
+    /// Its flush tally (`aterm_link::notify::FLUSH_TALLY_SEAM`).
+    tally: PathBuf,
     out: PathBuf,
 }
 
@@ -808,6 +812,7 @@ impl Pager {
             .args(["--on", &sel.label(), "--exec", "true"])
             .args(["--since", &since.to_string()])
             .args(["--rate", "1000000/1s"])
+            .env(aterm_link::notify::FLUSH_TALLY_SEAM, "1")
             .stdin(aterm_uds::spawnfd::Stdio::null())
             .stdout(log)
             .stderr(err);
@@ -815,6 +820,7 @@ impl Pager {
             child: Some(cmd.spawn().expect("spawn aterm link notify")),
             journal: dir.join("notify/journal"),
             cursor: dir.join("notify/cur").join(sel.key()),
+            tally: dir.join("notify").join(aterm_link::notify::FLUSH_TALLY),
             out,
         }
     }
@@ -853,6 +859,34 @@ impl Pager {
                 .is_some_and(|at| at > off)
         })
     }
+
+    /// The flushes it asked for up to its cursor's last write: `(full, ordered)`.
+    fn flushes(&self, clock: Clock) -> (u64, u64) {
+        self.until(clock, "tell the flushes of its cursor's last write", || {
+            tally_settled(&self.tally, &self.cursor)
+        });
+        tally_of(&self.tally)
+    }
+}
+
+/// A pager's flush tally at `tally`: `(full, ordered)`
+/// (`aterm_link::notify::FLUSH_TALLY`).
+fn tally_of(tally: &Path) -> (u64, u64) {
+    let text = std::fs::read_to_string(tally).unwrap_or_default();
+    let count = |key| {
+        harness::kv(&text, key)
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    (count("durable"), count("ordered"))
+}
+
+/// Whether the tally at `tally` was written no earlier than the cursor at
+/// `cursor`: a pager rewrites it after the notice whose flushes wrote the
+/// cursor, so once it has, it counts that write.
+fn tally_settled(tally: &Path, cursor: &Path) -> bool {
+    let written = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    matches!((written(tally), written(cursor)), (Some(t), Some(c)) if t >= c)
 }
 
 impl Drop for Pager {
@@ -879,6 +913,9 @@ struct PersonAsk {
 struct Person {
     asks: [Vec<PersonAsk>; 2],
     spent: [Spent; 2],
+    /// Over the paged blocks' measured asks, the flushes the pager asked for: `(full,
+    /// ordered, pages)`.
+    pager_flushes: (u64, u64, usize),
 }
 
 /// Sleep until `pace` after `from` (bench-clock µs), if that is still ahead.
@@ -896,6 +933,7 @@ fn person(s: &Stage, spec: &Spec, ctl: &mut Ctl, start: Mark) -> (Person, Mark) 
     let mut out = Person {
         asks: [Vec::new(), Vec::new()],
         spent: [Spent::default(); 2],
+        pager_flushes: (0, 0, 0),
     };
     let mut pager: Option<Pager> = None;
     let mut since = 0;
@@ -910,6 +948,7 @@ fn person(s: &Stage, spec: &Spec, ctl: &mut Ctl, start: Mark) -> (Person, Mark) 
             pager = Some(Pager::start(s.w, since));
         }
         let mut from = None;
+        let mut tally_from = None;
         for i in 0..warm + n {
             if let Some(t) = last_call {
                 pace_from(s.clock, t, PERSON_PACE);
@@ -937,6 +976,7 @@ fn person(s: &Stage, spec: &Spec, ctl: &mut Ctl, start: Mark) -> (Person, Mark) 
             }
             if i + 1 == warm {
                 from = Some(m);
+                tally_from = pager.as_ref().map(|p| p.flushes(s.clock));
                 continue;
             }
             out.asks[v].push(PersonAsk {
@@ -947,6 +987,11 @@ fn person(s: &Stage, spec: &Spec, ctl: &mut Ctl, start: Mark) -> (Person, Mark) 
             if i + 1 == warm + n {
                 let from = from.as_ref().expect("a block warms up first");
                 out.spent[v].add(from, &m, "the person leg");
+                if let Some(((full0, ordered0), p)) = tally_from.zip(pager.as_ref()) {
+                    let (full, ordered) = p.flushes(s.clock);
+                    let t = &mut out.pager_flushes;
+                    *t = (t.0 + full - full0, t.1 + ordered - ordered0, t.2 + n);
+                }
                 prev = m;
             }
         }
@@ -1024,6 +1069,227 @@ fn mix(
         prev = end;
     }
     (out, prev)
+}
+
+/// The need leg's two variants, run in blocks A B B A: session-event rows
+/// alone, and the same rows with an `aterm link notify --on need` following
+/// every row the fleet publishes (C02).
+const NEED_ARMS: [&str; 2] = ["no pager", "need pager"];
+
+/// How often the need leg's writer publishes a row: a busy session's mirror.
+const NEED_EVERY: Duration = Duration::from_millis(5);
+
+/// The need leg's rows per variant, per ordinary message the spec samples.
+const NEED_ROWS_PER_SAMPLE: usize = 5;
+
+/// The need leg writer's producer id.
+const NEED_PRODUCER: u64 = 0x0fab_0c02_0000_0000;
+
+/// The need leg's rows: an `ev` face under `pub`, which a `need` selector
+/// reads, that no session owns, so no need folds from it and nothing pages.
+fn need_subject(node: &str) -> String {
+    format!("/f/{FLEET}/pub/{node}/needbench/ev")
+}
+
+/// `aterm link notify --on need --exec true` following every row under
+/// `/f/<F>/pub/`, its stores' flushes told in its flush tally
+/// (`aterm_link::notify::FLUSH_TALLY_SEAM`).
+struct NeedPager {
+    child: Option<aterm_uds::spawnfd::Child>,
+    cursor: PathBuf,
+    tally: PathBuf,
+    out: PathBuf,
+}
+
+impl NeedPager {
+    /// Start one from the head, in a state dir of its own.
+    fn start(w: &World, k: usize) -> NeedPager {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = w.tmp.join(format!("need-pager-{k}"));
+        std::fs::create_dir_all(&dir).expect("the need pager's state dir");
+        let cap = dir.join("person.cap");
+        let caps: String = aterm_link::enable::person_grants(FLEET, PERSON)
+            .iter()
+            .map(|g| harness::cap_line(g))
+            .collect();
+        std::fs::write(&cap, caps).expect("write the person's cap");
+        std::fs::set_permissions(&cap, std::fs::Permissions::from_mode(0o600))
+            .expect("the person's cap is 0600");
+        let out = dir.join("follow.out");
+        let log = std::fs::File::create(&out).expect("the need pager's output");
+        let err = log.try_clone().expect("the need pager's output, twice");
+        let sel = aterm_link::notify::Sel::Need(None);
+        let mut cmd = aterm_uds::spawnfd::command(harness::aterm_to_launch());
+        cmd.arg("link")
+            .args(["notify", "--fleet", FLEET, "--broker", &w.broker_sock])
+            .arg("--cap-file")
+            .arg(&cap)
+            .arg("--state")
+            .arg(&dir)
+            .args(["--on", &sel.label(), "--exec", "true"])
+            .args(["--since", "head"])
+            .env(aterm_link::notify::FLUSH_TALLY_SEAM, "1")
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(log)
+            .stderr(err);
+        NeedPager {
+            child: Some(cmd.spawn().expect("spawn aterm link notify --on need")),
+            cursor: dir.join("notify/cur").join(sel.key()),
+            tally: dir.join("notify").join(aterm_link::notify::FLUSH_TALLY),
+            out,
+        }
+    }
+
+    /// When `ready` first holds, read every [`POLL`].
+    ///
+    /// # Panics
+    ///
+    /// After [`DEADLINE`], naming `what`, with the pager's output.
+    fn until(&self, clock: Clock, what: &str, ready: impl Fn() -> bool) -> u64 {
+        aterm_spec::wait::within(DEADLINE, POLL, || ready().then(|| clock.us())).unwrap_or_else(
+            || {
+                panic!(
+                    "the need pager did not {what} within {DEADLINE:?}; its output:\n{}",
+                    std::fs::read_to_string(&self.out).unwrap_or_default()
+                )
+            },
+        )
+    }
+
+    /// Its cursor, once written.
+    fn cursor(&self) -> Option<u64> {
+        std::fs::read_to_string(&self.cursor)
+            .ok()
+            .and_then(|c| c.trim().parse::<u64>().ok())
+    }
+
+    /// When its cursor first stands past `off`: every row up to it judged,
+    /// and the cursor written as the pager writes it.
+    fn past(&self, clock: Clock, off: u64) -> u64 {
+        self.until(clock, &format!("move its cursor past @{off}"), || {
+            self.cursor().is_some_and(|at| at > off)
+        })
+    }
+
+    /// The flushes its stores asked for up to its cursor's last write:
+    /// `(full, ordered)`.
+    fn flushes(&self, clock: Clock) -> (u64, u64) {
+        self.until(clock, "tell the flushes of its cursor's last write", || {
+            tally_settled(&self.tally, &self.cursor)
+        });
+        tally_of(&self.tally)
+    }
+}
+
+impl Drop for NeedPager {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// One block of the need leg: each row's publish -> ack, and, with the
+/// pager, the rows under `pub` it judged and the flushes it asked for.
+struct NeedBlock {
+    variant: usize,
+    beats: Vec<super::backlog::Beat>,
+    /// `(rows judged, full flushes, ordered flushes)`.
+    pager: Option<(u64, u64, u64)>,
+}
+
+/// The rows under `/f/<F>/pub/` in `[from, to)`: what a `need` selector reads.
+fn pub_rows(w: &World, from: u64, to: u64) -> u64 {
+    let filter = format!("/f/{FLEET}/pub/*/*/*");
+    let mut god = w.god();
+    let (mut at, mut rows) = (from, 0u64);
+    while at < to {
+        let (page, (next, _)) = god
+            .fetch(at, &filter, 256)
+            .unwrap_or_else(|e| panic!("read {filter} from @{at}: {e}"));
+        rows += page.iter().filter(|r| r.0 < to).count() as u64;
+        if next <= at {
+            break;
+        }
+        at = next;
+    }
+    rows
+}
+
+/// THE NEED LEG (C02): a writer publishes `ev` rows every [`NEED_EVERY`],
+/// timing each ack, alone and with a need pager following every row under
+/// `pub`; the pager's flush tally says what each row cost it.
+fn need_leg(s: &Stage, spec: &Spec) -> Vec<NeedBlock> {
+    let subject = need_subject(&s.w.node);
+    let body = [b'n'; super::backlog::FILL_BODY_LEN];
+    let mut god = s.w.god();
+    let mut seq = 0u64;
+    let mut publish = |god: &mut astream_broker::Client| {
+        seq += 1;
+        let sent = s.clock.us();
+        let (off, _) = god
+            .publish(NEED_PRODUCER, seq, &subject, &body)
+            .unwrap_or_else(|e| panic!("need row {seq}: {e}"));
+        (
+            off,
+            super::backlog::Beat {
+                sent,
+                acked: s.clock.us(),
+            },
+        )
+    };
+    let mut pager: Option<NeedPager> = None;
+    let mut started = 0;
+    let mut out = Vec::new();
+    for (v, n) in blocks(spec.samples * NEED_ROWS_PER_SAMPLE, 2) {
+        if v == 0 {
+            pager = None;
+        } else if pager.is_none() {
+            let p = NeedPager::start(s.w, started);
+            started += 1;
+            p.until(s.clock, "claim the head", || p.cursor().is_some());
+            pager = Some(p);
+        }
+        let before = pager.as_ref().map(|p| {
+            let (sync, _) = publish(&mut god);
+            p.past(s.clock, sync);
+            (sync + 1, p.flushes(s.clock))
+        });
+        let mut beats = Vec::with_capacity(n);
+        let mut due = std::time::Instant::now();
+        let mut last = 0;
+        for _ in 0..n {
+            let (off, beat) = publish(&mut god);
+            beats.push(beat);
+            last = off;
+            due += NEED_EVERY;
+            let now = std::time::Instant::now();
+            if due > now {
+                std::thread::sleep(due - now);
+            } else {
+                due = now;
+            }
+        }
+        let pager = pager
+            .as_ref()
+            .zip(before)
+            .map(|(p, (from, (full0, ordered0)))| {
+                p.past(s.clock, last);
+                let (full, ordered) = p.flushes(s.clock);
+                (
+                    pub_rows(s.w, from, last + 1),
+                    full - full0,
+                    ordered - ordered0,
+                )
+            });
+        out.push(NeedBlock {
+            variant: v,
+            beats,
+            pager,
+        });
+    }
+    out
 }
 
 /// The rows of the bridge's asked and deadline tables, read through the
@@ -1143,6 +1409,12 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         );
         let (mix, _) = mix(&s, spec, &mut ctl, &c, &mut b_since, m);
         tables.push(("the end", table_rows(&state)));
+        eprintln!(
+            "fabric bench: asks, a need pager: {} session-event rows without one and {} with",
+            spec.samples * NEED_ROWS_PER_SAMPLE,
+            spec.samples * NEED_ROWS_PER_SAMPLE
+        );
+        let need = need_leg(&s, spec);
         await_durable(broker);
         Legs {
             idle,
@@ -1153,6 +1425,7 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             receipts_spent,
             persons,
             mix,
+            need,
             tables,
         }
     });
@@ -1221,6 +1494,8 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     md.extend(person_md);
     let (mix_json, mix_md) = mix_report(&ctx, spec, &legs.mix);
     md.extend(mix_md);
+    let (need_json, need_md) = need_report(&ctx, spec, &legs.need);
+    md.extend(need_md);
     md.push(String::new());
     md.extend(yardstick_rows(&ruler, &cal_before, &cal_after));
     if let Some(fields) = json.as_object_mut() {
@@ -1229,6 +1504,7 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         fields.insert("receipt".to_string(), receipt_json);
         fields.insert("person_lane".to_string(), person_json);
         fields.insert("escalated_mix".to_string(), mix_json);
+        fields.insert("need_pager".to_string(), need_json);
     }
     drop(ruler);
     (json, md)
@@ -1244,6 +1520,7 @@ struct Legs {
     receipts_spent: Spent,
     persons: Person,
     mix: Mix,
+    need: Vec<NeedBlock>,
     /// The asked and deadline tables' rows as each leg began, and at the end.
     tables: Vec<(&'static str, (usize, usize))>,
 }
@@ -1680,10 +1957,12 @@ fn person_report(ctx: &Reading, p: &Person) -> (Value, Vec<String>) {
              paged, unpaged. aterm's table escalates the person lane (`/f/*/in/p/>`), so the \
              broker flushes each ask in full before its ack: acked is durable. In the paged \
              blocks an `aterm link notify --on ask:{PERSON} --exec true` on this machine follows \
-             the lane: once an ask is durable it writes its rate stamps and its journal's `<off> \
-             firing` line, runs the command, writes the `<off> fired` line and then its cursor, \
-             each a file replaced and flushed in full (`F_FULLFSYNC`) on the volume the bridge's \
-             state dir is on. \"Paged\" is the `fired` line seen by the bench; the bench waits \
+             the lane: once an ask is durable it replaces its rate stamps and its journal (the \
+             `<off> firing` line), each ordered (`F_BARRIERFSYNC`), and flushes the journal's \
+             directory in full (`F_FULLFSYNC`, its one full flush a page), runs the command, \
+             then replaces the journal (the `<off> fired` line) and its cursor, each ordered \
+             with its directory, on the volume the bridge's state dir is on. \"Paged\" is the \
+             `fired` line seen by the bench; the bench waits \
              for the cursor too before the next ask, so no ask is posted while the pager still \
              writes for the one before. The unpaged variant is the escalation's own cost; what \
              the paged one adds is the pager's.\n"
@@ -1776,6 +2055,26 @@ fn person_report(ctx: &Reading, p: &Person) -> (Value, Vec<String>) {
         share_text(lates[0]),
         share_text(lates[1])
     ));
+    let (full, ordered, pages) = p.pager_flushes;
+    if pages > 0 {
+        md.push(format!(
+            "**The pager's own flushes** over its {pages} measured pages, from its flush tally \
+             (`{}`): {full} full ({} a page) and {ordered} ordered ({} a page).\n",
+            aterm_link::notify::FLUSH_TALLY_SEAM,
+            fmt3(per(full as f64, pages)),
+            fmt3(per(ordered as f64, pages)),
+        ));
+        json.insert(
+            "pager_flushes".to_string(),
+            json!({
+                "pages": pages,
+                "full": full,
+                "ordered": ordered,
+                "full_per_page": per(full as f64, pages).map(stats::round3),
+                "ordered_per_page": per(ordered as f64, pages).map(stats::round3),
+            }),
+        );
+    }
     for (v, word) in PERSON_ARMS.iter().enumerate() {
         md.push(flushes_per_post(
             &format!("Broker flushes over the {word} asks"),
@@ -1889,6 +2188,84 @@ fn mix_report(ctx: &Reading, spec: &Spec, m: &Mix) -> (Value, Vec<String>) {
         "mixed_others": part(&others),
     });
     (json, md)
+}
+
+fn need_report(ctx: &Reading, spec: &Spec, blocks: &[NeedBlock]) -> (Value, Vec<String>) {
+    let rows = spec.samples * NEED_ROWS_PER_SAMPLE;
+    let every_ms = u64::try_from(NEED_EVERY.as_millis()).unwrap_or(u64::MAX);
+    let mut md = vec![
+        String::new(),
+        "### A need pager beside session-event traffic\n".to_string(),
+        format!(
+            "A writer on the bench's broker connection publishes a {}-byte row on \
+             `{}` (an `ev` face no session owns, so no need folds from it and nothing pages) \
+             every {every_ms} ms, {rows} rows without and {rows} with a pager, in blocks no \
+             pager, need pager, need pager, no pager, and times each row's publish -> ack. In \
+             the pager's blocks an `aterm link notify --on need --exec true` on this machine, \
+             started from the head, follows `/f/{FLEET}/pub/*/*/*`, every row the fleet \
+             publishes there, and its flush tally (`{}`) counts the file and directory \
+             flushes its stores asked for, by kind, from the first row after it claimed the \
+             head until its cursor stood past the block's last row.\n",
+            super::backlog::FILL_BODY_LEN,
+            need_subject("<node>"),
+            aterm_link::notify::FLUSH_TALLY_SEAM,
+        ),
+        HEAD_U[0].to_string(),
+        HEAD_U[1].to_string(),
+    ];
+    let mut json = aterm_json::Map::new();
+    let mut tallies = Vec::new();
+    for (v, word) in NEED_ARMS.iter().enumerate() {
+        let acks: Vec<f64> = blocks
+            .iter()
+            .filter(|b| b.variant == v)
+            .flat_map(|b| b.beats.iter().map(|beat| beat.ack_ms()))
+            .collect();
+        md.push(row_u(
+            &format!("{word}: a row's publish -> ack"),
+            &acks,
+            ctx.unit,
+        ));
+        let (judged, full, ordered) = blocks
+            .iter()
+            .filter(|b| b.variant == v)
+            .filter_map(|b| b.pager)
+            .fold((0, 0, 0), |(r, f, o), (r1, f1, o1)| {
+                (r + r1, f + f1, o + o1)
+            });
+        let mut fields = json!({
+            "rows": acks.len(),
+            "publish_to_ack_ms": json_u(&acks, ctx.unit),
+        });
+        if judged > 0 {
+            tallies.push(format!(
+                "**The {word} judged {judged} rows under `pub`** and asked for {full} full \
+                 flushes ({} a row) and {ordered} ordered ones ({} a row).",
+                fmt3(per(full as f64, judged as usize)),
+                fmt3(per(ordered as f64, judged as usize)),
+            ));
+            if let Some(f) = fields.as_object_mut() {
+                f.insert(
+                    "pager".to_string(),
+                    json!({
+                        "rows_judged": judged,
+                        "full_flushes": full,
+                        "ordered_flushes": ordered,
+                        "full_per_row": per(full as f64, judged as usize).map(stats::round3),
+                        "ordered_per_row": per(ordered as f64, judged as usize).map(stats::round3),
+                    }),
+                );
+            }
+        }
+        json.insert((*word).to_string(), fields);
+    }
+    md.push(String::new());
+    for line in tallies {
+        md.push(line);
+        md.push(String::new());
+    }
+    json.insert("every_ms".to_string(), json!(every_ms));
+    (Value::Object(json), md)
 }
 
 #[cfg(test)]

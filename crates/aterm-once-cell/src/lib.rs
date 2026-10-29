@@ -157,6 +157,7 @@ pub mod unsync {
     }
 
     /// Single-threaded value initialized on first access.
+    /// If the initializer panics, the `Lazy` is poisoned and subsequent accesses panic.
     pub struct Lazy<T, F = fn() -> T> {
         cell: OnceCell<T>,
         init: Cell<Option<F>>,
@@ -415,6 +416,7 @@ pub mod sync {
     }
 
     /// Thread-safe value initialized on first access.
+    /// If the initializer panics, the `Lazy` is poisoned and subsequent accesses panic.
     pub struct Lazy<T, F = fn() -> T> {
         cell: OnceCell<T>,
         init: Mutex<Option<F>>,

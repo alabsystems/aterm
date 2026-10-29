@@ -776,3 +776,20 @@ fn retain_with_a_panicking_predicate_parity() {
         }
     }
 }
+
+#[test]
+fn insert_out_of_bounds_panics_like_model() {
+    for (initial_len, bad_index) in [(0usize, 1usize), (2, 3), (4, 5)] {
+        let mut mine: MyArrayVec<u32, 4> = (0..initial_len as u32).collect();
+        let mut up: UpArrayVec<u32, 4> = (0..initial_len as u32).collect();
+        assert!(
+            panicked(|| mine.insert(bad_index, 99)),
+            "ArrayVec::insert({bad_index}) on len {initial_len} must panic"
+        );
+        assert!(
+            panicked(|| up.insert(bad_index, 99)),
+            "Model::insert({bad_index}) on len {initial_len} must panic"
+        );
+        same(&mine, &up, "insert past len");
+    }
+}

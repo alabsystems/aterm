@@ -311,6 +311,83 @@ fn a_fleet_code_read_before_the_apply_finished_says_so_rather_than_none() {
 }
 
 #[test]
+fn reserved_fleet_distinguishes_admin_locker_holders_from_members() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let m1 = Paths::for_home(&root.path().join("m1"));
+    let m2 = Paths::for_home(&root.path().join("m2"));
+    let source = root.path().join("test.vault");
+    let created = test_create_unbound(&m1, source.to_str().unwrap(), None, Some("m1")).unwrap();
+    let recipient = machine_identity(&m2).unwrap().recipient().to_bech32();
+    let admin = admin_cached(&m1).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.add_machine("m2", &recipient).unwrap();
+    doc.set_entry(
+        &Audience::Everyone,
+        fleet::FLEET_CODE_ENTRY,
+        b"inert-reserved-code",
+    )
+    .unwrap();
+    admin_publish_approved(&m1, &admin, &doc, &[recipient]).unwrap();
+    join(
+        &m2,
+        &JoinOptions {
+            source: format!("{}#{}", source.display(), created.signer),
+            host: Some("m2".into()),
+            interactive: false,
+            wait: Duration::ZERO,
+            confirm: &|_| false,
+            password: crate::client::JoinPassword::Given(None),
+            fetched: None,
+            requested: &|| {},
+            say: &|_| {},
+        },
+    )
+    .unwrap();
+
+    let m1_cfg = config(&m1).unwrap().unwrap();
+    let m2_cfg = config(&m2).unwrap().unwrap();
+    let m1_fleet = fleet::reserved_fleet(&m1, &m1_cfg).unwrap().unwrap();
+    let m2_fleet = fleet::reserved_fleet(&m2, &m2_cfg).unwrap().unwrap();
+    assert!(
+        m1_fleet.admin,
+        "m1 created the vault and holds its admin locker"
+    );
+    assert!(
+        !m2_fleet.admin,
+        "NEGATIVE CONTROL: non-admin member m2 holds the fleet code without the admin locker"
+    );
+    assert_eq!(m1_fleet.code.as_slice(), b"inert-reserved-code");
+    assert_eq!(m2_fleet.code.as_slice(), b"inert-reserved-code");
+    assert!(
+        !format!("{m1_fleet:?}").contains("inert-reserved-code"),
+        "Debug never exposes the fleet code"
+    );
+
+    // Promoting m2 to admin and syncing makes m2 report `admin = true`; removing m2 returns it to
+    // `admin = false`.
+    let admin = admin_open(&m1).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.add_admin("m2").unwrap();
+    admin_publish(&m1, &admin, &doc).unwrap();
+    sync(&m2, None).unwrap();
+    assert!(
+        fleet::reserved_fleet(&m2, &m2_cfg).unwrap().unwrap().admin,
+        "promoted second admin opens the admin locker"
+    );
+
+    let admin = admin_open(&m1).unwrap();
+    let mut doc = admin.doc.clone();
+    assert!(doc.remove_admin("m2").unwrap());
+    admin_publish(&m1, &admin, &doc).unwrap();
+    sync(&m2, None).unwrap();
+    let m2_cfg = config(&m2).unwrap().unwrap();
+    assert!(
+        !fleet::reserved_fleet(&m2, &m2_cfg).unwrap().unwrap().admin,
+        "removed admin no longer opens the admin locker"
+    );
+}
+
+#[test]
 fn local_if_absent_files_are_not_promoted_to_authenticated_entries() {
     let f = Fixture::new();
     let name = "local-value";

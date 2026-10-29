@@ -156,7 +156,7 @@ impl Reading {
 }
 
 /// The last minute of readings with their wall-clock times, for a trailing mean ([`Recent::mean`])
-/// and a strip drawn reading by reading ([`slots_of`]).
+/// and a strip's finest boxes ([`multi_scale_cells`]).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Recent {
     v: VecDeque<Reading>,
@@ -309,50 +309,6 @@ impl SlotGrid {
             origin_ms: (widest.1 + widest.0 / 2).rem_euclid(len),
         }
     }
-}
-
-/// `n` slots of `grid`, oldest first, the last the one holding `at_ms` (the snapshot's reading):
-/// each the merge of the `readings` taken in it ([`Cell::merge`]). A slot no reading fell in
-/// takes the first reading after it, which speaks for the time back to the reading before (a
-/// rate read at `t` is the mean since that reading), when that span is at most `cover_ms`; else
-/// it is unread, as is the last slot of a series not read at `at_ms`. `readings` are oldest
-/// first, as [`Recent::readings`] keeps them.
-#[must_use]
-pub fn slots_of(
-    readings: &[Reading],
-    at_ms: i64,
-    grid: SlotGrid,
-    n: usize,
-    cover_ms: i64,
-) -> Vec<Cell> {
-    let slot_ms = grid.len();
-    let readings = &readings[..readings.partition_point(|r| r.at_ms <= at_ms)];
-    let last = grid.slot(at_ms);
-    (0..n)
-        .map(|j| {
-            let k = i128::from(last) - (n - 1 - j) as i128;
-            let lo = k * i128::from(slot_ms) + i128::from(grid.origin_ms);
-            let hi = lo + i128::from(slot_ms);
-            let from = readings.partition_point(|r| i128::from(r.at_ms) < lo);
-            let to = readings.partition_point(|r| i128::from(r.at_ms) < hi);
-            let inside = readings.get(from..to).unwrap_or_default();
-            if !inside.is_empty() {
-                return Cell::merge(inside.iter().map(|r| r.cell()));
-            }
-            match (
-                to.checked_sub(1).and_then(|i| readings.get(i)),
-                readings.get(to),
-            ) {
-                (Some(before), Some(after))
-                    if i128::from(after.at_ms) - i128::from(before.at_ms)
-                        <= i128::from(cover_ms) =>
-                {
-                    after.cell()
-                }
-                _ => Cell::default(),
-            }
-        })
-        .collect()
 }
 
 /// Six hours of ten-minute buckets, keyed by the wall clock (`at_unix_ms / LONG_BUCKET_MS`).
@@ -576,7 +532,7 @@ impl BucketRing {
         self.long.open_k()
     }
 
-    /// The last minute of readings, oldest first ([`slots_of`]).
+    /// The last minute of readings, oldest first ([`Tiers::recent`]).
     #[must_use]
     pub fn readings(&self) -> Vec<Reading> {
         self.recent.readings()
@@ -821,30 +777,6 @@ pub struct ProgSlot {
     pub weight: u16,
     /// True when this slot is the far-left real-time `now` box.
     pub is_live_now: bool,
-}
-
-/// Which edge of an [`AxisTick`]'s label stands on the tick.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TickAnchor {
-    /// The label starts at the tick: `"now"`, at the strip's left end.
-    Start,
-    /// The label is centred on the tick: an interior age.
-    Centre,
-    /// The label ends at the tick: the horizon, at the strip's right end.
-    End,
-}
-
-/// One X-axis tick mark and horizon label on a [`MultiScaleSpec`] strip.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct AxisTick {
-    /// Normalized horizontal coordinate in `0.0..=1.0`.
-    pub x_frac: f32,
-    /// Age at this tick in milliseconds before `now` (`0` for `"now"`).
-    pub age_ms: i64,
-    /// Horizon label (`"now"`, `"–10s"`, `"–1m"`, `"–10m"`, `"–1h"`, `"–6h"`).
-    pub label: &'static str,
-    /// Which edge of the label stands on the tick.
-    pub anchor: TickAnchor,
 }
 
 /// One resampled cell in a [`MultiScaleSpec`] strip, carrying its slot geometry and gap marker.
@@ -1108,16 +1040,6 @@ impl MultiScaleSpec {
         out
     }
 
-    /// The finest history box's period, ms: the band right after the live box (1 s on every
-    /// preset), whose boxes the live edge slides; `None` for a spec with no history band.
-    #[must_use]
-    pub fn fine_period_ms(&self) -> Option<i64> {
-        self.bands
-            .iter()
-            .find(|b| !b.live_now && b.slots > 0)
-            .map(|b| b.period_ms)
-    }
-
     /// Map an event age `age_ms` (`now_unix_ms - event_unix_ms`) to its exact continuous
     /// normalized X coordinate in `0.0..=1.0`, growing with age (now is `0`, the horizon `1`), or
     /// `None` when older than [`Self::horizon_ms`].
@@ -1139,36 +1061,6 @@ impl MultiScaleSpec {
             }
         }
         Some(1.0)
-    }
-
-    /// Horizon ticks with exact normalized X positions on this strip: `now` at `0`, its label
-    /// starting there; the horizon at `1`, its label ending there; each age between centred.
-    #[must_use]
-    pub fn axis_ticks(&self) -> Vec<AxisTick> {
-        let horizon = self.horizon_ms();
-        self.ticks
-            .iter()
-            .filter_map(|&(age_ms, label)| {
-                let x_frac = if age_ms == 0 {
-                    0.0
-                } else {
-                    self.x_frac_of_age_ms(age_ms)?
-                };
-                let anchor = if age_ms == 0 {
-                    TickAnchor::Start
-                } else if age_ms >= horizon {
-                    TickAnchor::End
-                } else {
-                    TickAnchor::Centre
-                };
-                Some(AxisTick {
-                    x_frac,
-                    age_ms,
-                    label,
-                    anchor,
-                })
-            })
-            .collect()
     }
 }
 
@@ -1264,10 +1156,11 @@ pub fn multi_scale_cells(
             let lo_ms = now_unix_ms.saturating_sub(slot.age_hi_ms);
             let hi_ms = now_unix_ms.saturating_sub(slot.age_lo_ms);
             let any_gap = gaps.iter().any(|g| g.overlap_ms(lo_ms, hi_ms) > 0);
-            let ring_cell = || {
+            // The 10 s cells the box spans, through bucket `k_max` at the newest.
+            let ring_cell = |k_max: i64| {
                 let k_lo = lo_ms.div_euclid(BUCKET_MS);
                 let k_hi = hi_ms.saturating_sub(1).max(lo_ms).div_euclid(BUCKET_MS);
-                Cell::merge((k_lo..=k_hi).filter_map(ring_at))
+                Cell::merge((k_lo..=k_hi.min(k_max)).filter_map(ring_at))
             };
             let mut raw = if slot.age_lo_ms >= RING_REACH_MS {
                 long_cell(lo_ms, hi_ms)
@@ -1282,7 +1175,14 @@ pub fn multi_scale_cells(
                 if !inside.is_empty() {
                     Cell::merge(inside.iter().map(|r| r.cell()))
                 } else if to == 0 && slot.age_hi_ms - slot.age_lo_ms >= BUCKET_MS {
-                    ring_cell()
+                    // Every reading kept was taken at or after the box's newer edge, so the
+                    // bucket holding the oldest of them is taken as read after the box (with a
+                    // restored bucket's readings the minute did not keep): only the buckets
+                    // before it speak for the box.
+                    let first_read_k = recent_valid
+                        .first()
+                        .map_or(i64::MAX, |r| r.at_ms.div_euclid(BUCKET_MS));
+                    ring_cell(first_read_k.saturating_sub(1))
                 } else if !any_gap {
                     match (
                         to.checked_sub(1).and_then(|i| recent_valid.get(i)),
@@ -1307,7 +1207,7 @@ pub fn multi_scale_cells(
                     Cell::default()
                 }
             } else {
-                ring_cell()
+                ring_cell(i64::MAX)
             };
             let live_resumed = slot.is_live_now
                 && raw.mean.is_some()
@@ -1525,50 +1425,6 @@ mod tests {
         assert_eq!(r.sustained(k0 + 4), Some(6.0));
     }
 
-    fn reading(at_ms: i64, v: f64) -> Reading {
-        Reading {
-            at_ms,
-            v,
-            over: false,
-        }
-    }
-
-    fn means(cells: &[Cell]) -> Vec<Option<f64>> {
-        cells.iter().map(|c| c.mean).collect()
-    }
-
-    #[test]
-    fn slots_hold_each_reading_in_its_second_and_end_at_the_newest() {
-        // A reading a second, 300 ms into each: five 1 s slots end with the one holding the
-        // newest, each the reading taken in it.
-        let rs: Vec<Reading> = (0..8)
-            .map(|i| reading(T0 + 300 + i * 1000, i as f64))
-            .collect();
-        let at = T0 + 7_300;
-        assert_eq!(
-            means(&slots_of(&rs, at, SlotGrid::SECONDS, 5, 15_000)),
-            [3.0, 4.0, 5.0, 6.0, 7.0].map(Some)
-        );
-        // Over rides with its reading.
-        let mut hot = rs.clone();
-        hot[6].over = true;
-        let cells = slots_of(&hot, at, SlotGrid::SECONDS, 5, 15_000);
-        assert_eq!(
-            cells.iter().map(|c| c.over).collect::<Vec<_>>(),
-            [false, false, false, true, false]
-        );
-        // Two readings in one second merge (the lens's half-second cadence).
-        let twice = [reading(T0 + 100, 2.0), reading(T0 + 600, 4.0)];
-        let one = slots_of(&twice, T0 + 600, SlotGrid::SECONDS, 1, 15_000);
-        assert_eq!((one[0].mean, one[0].max), (Some(3.0), Some(4.0)));
-        // A reading later than the snapshot is not drawn; the snapshot's slot then holds the
-        // reading of its own second only.
-        assert_eq!(
-            means(&slots_of(&rs, T0 + 5_300, SlotGrid::SECONDS, 2, 15_000)),
-            [Some(4.0), Some(5.0)]
-        );
-    }
-
     #[test]
     fn a_grid_stands_its_edges_between_the_readings() {
         let clearance = |grid: SlotGrid, t: i64| {
@@ -1612,48 +1468,6 @@ mod tests {
         assert_eq!(one.opened(T0 + 650, T0 + 750), 1);
         assert_eq!(one.opened(T0 + 750, T0 + 1_650), 0);
         assert!(one.clear(T0 + 200, SLOT_GUARD_MS) && !one.clear(T0 + 690, SLOT_GUARD_MS));
-        let rs = [reading(T0 + 650, 1.0), reading(T0 + 750, 2.0)];
-        assert_eq!(
-            means(&slots_of(&rs, T0 + 750, one, 2, 15_000)),
-            [Some(1.0), Some(2.0)]
-        );
-        assert_eq!(
-            means(&slots_of(&rs, T0 + 750, SlotGrid::SECONDS, 2, 15_000)),
-            [None, Some(1.5)],
-            "CONTROL: on the wall clock's seconds the two merge"
-        );
-    }
-
-    #[test]
-    fn an_empty_slot_takes_the_reading_that_speaks_for_it_or_stays_unread() {
-        // Readings 5 s apart (aterm in the background): each speaks for the four seconds before
-        // it that hold no reading of their own.
-        let rs = [
-            reading(T0, 1.0),
-            reading(T0 + 5_000, 2.0),
-            reading(T0 + 10_000, 3.0),
-        ];
-        assert_eq!(
-            means(&slots_of(&rs, T0 + 10_000, SlotGrid::SECONDS, 11, 15_000)),
-            [1.0, 2.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0, 3.0].map(Some)
-        );
-        // A gap over the cover is unread, never filled.
-        let gap = [reading(T0, 1.0), reading(T0 + 20_000, 2.0)];
-        let cells = slots_of(&gap, T0 + 20_000, SlotGrid::SECONDS, 3, 15_000);
-        assert_eq!(means(&cells), [None, None, Some(2.0)]);
-        // Before the first reading nothing speaks; a series not read at the snapshot's moment
-        // leaves its last slot unread.
-        assert_eq!(
-            means(&slots_of(&rs, T0 + 12_000, SlotGrid::SECONDS, 4, 15_000)),
-            [Some(3.0), Some(3.0), None, None],
-            "nothing after the last reading speaks for the slots after it"
-        );
-        assert_eq!(
-            means(&slots_of(&[], T0, SlotGrid::SECONDS, 2, 15_000)),
-            [None, None]
-        );
-        let early = slots_of(&rs, T0 + 10_000, SlotGrid::SECONDS, 13, 15_000);
-        assert_eq!(&means(&early)[..2], [None, None], "{early:?}");
     }
 
     #[test]
@@ -1709,7 +1523,6 @@ mod tests {
                     "historical boxes grow wider toward older right bands: {pair:?}"
                 );
             }
-            assert_eq!(spec.fine_period_ms(), Some(1_000));
             // x grows with age: now at 0, the horizon at 1, every box edge on its own x.
             assert_eq!(spec.x_frac_of_age_ms(0), Some(0.0));
             assert_eq!(spec.x_frac_of_age_ms(spec.horizon_ms()), Some(1.0));
@@ -1724,27 +1537,10 @@ mod tests {
                 .filter_map(|age| spec.x_frac_of_age_ms(age))
                 .collect();
             assert!(xs.windows(2).all(|w| w[0] <= w[1]), "x grows with age");
-            let ticks = spec.axis_ticks();
-            assert_eq!(ticks.len(), spec.ticks.len());
-            for pair in ticks.windows(2) {
-                assert!(
-                    pair[0].x_frac < pair[1].x_frac,
-                    "ticks increase left to right"
-                );
-            }
-            let (first, last) = (ticks[0], ticks[ticks.len() - 1]);
-            assert_eq!(
-                (first.label, first.x_frac, first.anchor),
-                ("now", 0.0, TickAnchor::Start)
-            );
-            assert_eq!(
-                (last.age_ms, last.x_frac, last.anchor),
-                (spec.horizon_ms(), 1.0, TickAnchor::End)
-            );
             assert!(
-                ticks[1..ticks.len() - 1]
-                    .iter()
-                    .all(|t| t.anchor == TickAnchor::Centre)
+                spec.ticks.windows(2).all(|w| w[0].0 < w[1].0),
+                "ticks read outward from now: tick_ages takes them coarsest first by reversing \
+                 this order"
             );
         }
         assert_eq!(MultiScaleSpec::FULL_6H.horizon_ms(), 6 * 3_600_000);
@@ -1961,5 +1757,75 @@ mod tests {
             x_crash > 0.0 && x_crash < x_10s,
             "now at the left, x grows with age"
         );
+    }
+
+    /// A 10 s box older than a run's first reading draws nothing from that reading's bucket,
+    /// whose readings were all taken after the box ended; the buckets before it, an earlier
+    /// run's restored ones, still speak for it.
+    #[test]
+    fn a_10s_box_before_the_first_reading_draws_nothing_read_after_it() {
+        let now = T0 + 15_000;
+        let box_at = |ring: &BucketRing, age_lo_ms: i64, age_hi_ms: i64| -> Option<f64> {
+            let (cells, long, recent) = (ring.cells(), ring.long_cells(), ring.readings());
+            let tiers = Tiers {
+                ring: &cells,
+                ring_k: ring.open_k().unwrap_or(0),
+                long: &long,
+                long_k: ring.long_k().unwrap_or(0),
+                recent: &recent,
+            };
+            let scaled = multi_scale_cells(tiers, now, MultiScaleSpec::FULL_6H, 15_000, &[]);
+            let s = scaled
+                .iter()
+                .find(|s| s.slot.age_lo_ms == age_lo_ms && s.slot.age_hi_ms == age_hi_ms)
+                .expect("the spec has the box");
+            s.cell.mean
+        };
+        // A run whose first reading is mid-bucket, five seconds into T0's 10 s, then one a second.
+        let read_on = |ring: &mut BucketRing| {
+            for t in (5_000..=15_000).step_by(1_000) {
+                let _ = ring.push(T0 + t, Some(1.0), false);
+            }
+        };
+        let mut fresh = BucketRing::default();
+        read_on(&mut fresh);
+        assert_eq!(
+            box_at(&fresh, 9_000, 10_000),
+            Some(1.0),
+            "the first reading"
+        );
+        assert_eq!(
+            box_at(&fresh, 10_000, 20_000),
+            None,
+            "the 10 s before the first reading: nothing was read"
+        );
+
+        // An earlier run read until 20 s before T0 and is restored with its buckets alone (a
+        // strip with no per-second readings, `SavedRing::recent` empty), then the same run reads.
+        let mut earlier = BucketRing::default();
+        for t in (-100_000_i64..=-20_000).step_by(1_000) {
+            let _ = earlier.push(T0 + t, Some(2.0), false);
+        }
+        let mut saved = earlier.saved();
+        saved.recent.clear();
+        let mut restored = BucketRing::restored(&saved, T0 + 4_000);
+        read_on(&mut restored);
+        assert_eq!(
+            box_at(&restored, 10_000, 20_000),
+            None,
+            "between the earlier run's last bucket and the first reading: nothing was read"
+        );
+        for (lo, hi) in [
+            (30_000, 40_000),
+            (40_000, 50_000),
+            (50_000, 60_000),
+            (60_000, 120_000),
+        ] {
+            assert_eq!(
+                box_at(&restored, lo, hi),
+                Some(2.0),
+                "the earlier run's buckets at {lo}..{hi} ms"
+            );
+        }
     }
 }

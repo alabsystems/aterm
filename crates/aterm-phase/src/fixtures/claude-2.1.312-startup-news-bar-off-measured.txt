@@ -1,0 +1,14 @@
+# claude-code 2.1.312 · MEASURED 2026-10-27, `aterm ctl text` of aterm's jailed real-Claude lab (100x50, aterm 0.145.0 dev build e725d40263, Autopilot Cruise) running the real Claude Code 2.1.312 against a stub API: bar-off startup announcement alone, title and footer, no hidden count; cachedGrowthBookFeatures.tengu_startup_announcements = [{id lab-baroff-a, title, text, footer, priority 0, maxImpressions 1000, accentBar false}] in the scratch .claude.json
+ ▐▛███▛█   Claude Code v2.1.312
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.AyU2/proj
+
+  Lab news title
+  A lab startup announcement with its accent bar off, its words long enough to wrap at sixty
+  columns.
+  Lab footer: learn more at example.invalid
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                           ◐ medium · /effort

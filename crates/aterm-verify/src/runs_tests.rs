@@ -1756,6 +1756,7 @@ fn a_stage_survivor_running_from_the_roots_is_ended_at_its_stage_end() {
             remove_env: &[],
             add_env: &[],
             stage_groups: Some(&probe),
+            host: &crate::exec::LIVE_HOST,
         };
         let run = crate::exec::run(&cmd, env);
         assert!(run.ok, "the stage: {}", run.output);

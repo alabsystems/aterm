@@ -119,13 +119,15 @@ pub(crate) fn warn_once(session: &str, what: &str, p: &ReaderPanic, rows: &[Stri
         return false;
     }
     warned.insert(key);
+    // The message names the panic's kind and length, never its text: std's slice panics quote
+    // the row they cut, and a row is the session's screen (DESIGN §3.6).
     aterm_log::warn!(
         "screen reader: aterm_phase panicked reading session {session}'s screen for the {what} \
          at {} ({}); read as no verdict. Screen: {} rows, widest {} chars, shape {} \
          (one per row: _ blank, - rule, | bar, # numbered option, > caret, ? question, \
          x text) — a fixture of that shape reproduces it",
         p.location,
-        p.message,
+        aterm_log::words::Panic::of_text(&p.message),
         rows.len(),
         rows.iter().map(|r| r.chars().count()).max().unwrap_or(0),
         screen_shape(rows)

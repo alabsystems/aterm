@@ -51,6 +51,18 @@ impl Lookups {
     }
 }
 
+/// How git's non-keychain (vault / XDG) credential helper stands for a synced token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VaultStanding {
+    /// git's own non-keychain helper already answers the token for every repository in scope.
+    Ready,
+    /// [`Git::configure`]'s `~/.gitconfig` keychain block shadows an XDG helper that answers the
+    /// token; `revert` puts `~/.gitconfig`'s settings back.
+    Convert { revert: String },
+    /// Neither: use the keychain path.
+    Absent,
+}
+
 /// How a credential reaches git: the program, the one helper every request names, and the
 /// variables a test adds.
 pub(crate) struct Git {
@@ -207,6 +219,25 @@ impl Git {
             .args(["credential", "fill"])
     }
 
+    /// [`Self::fill_as_configured`] reading `global_file` (an XDG git config) in place of
+    /// `~/.gitconfig`, so a check can verify what the XDG helper answers without removing
+    /// `~/.gitconfig` first.
+    pub(crate) fn fill_with_global_file(
+        &self,
+        sys: &dyn System,
+        user: &User,
+        global_file: &Path,
+        host: &str,
+    ) -> Result<Option<Secret>, String> {
+        let global = global_file
+            .to_str()
+            .ok_or_else(|| format!("git config path {} is not UTF-8", global_file.display()))?;
+        let cmd = self
+            .as_configured(Some(user))
+            .env("GIT_CONFIG_GLOBAL", global);
+        self.fill_by(sys, &cmd, host, None)
+    }
+
     /// The token `cmd`, a `git credential fill`, hands back at `host`, for `account` when one
     /// is named.
     fn fill_by(
@@ -260,30 +291,135 @@ impl Git {
         })
     }
 
-    /// [`Self::configured`], and whose settings git's github.com lookups already use instead:
-    /// a helper other than this one's, or a `credential.username` naming another account
-    /// ([`Standing::foreign`]), which [`Self::configure`] must leave as they are. Where it would
-    /// configure, the global file's values of the settings it replaces are read too, for the
-    /// line that puts them back ([`Standing::revert`]).
-    ///
-    /// # Errors
-    /// As [`Self::configured`].
-    pub(crate) fn standing(
+    /// [`Self::configured`], plus whether [`Self::configure`]'s `~/.gitconfig` keychain block is
+    /// shadowing a uniform non-keychain XDG helper (`Some((xdg_file, revert))`), read from the
+    /// same single `git config` pass.
+    pub(crate) fn configured_or_shadowed(
         &self,
         sys: &dyn System,
         user: &User,
         account: &str,
+        owners: &[&str],
+    ) -> Result<(Lookups, Option<(PathBuf, String)>), String> {
+        let mut shadowed = None;
+        let lookups = self.judged(sys, user, |every, conditional| {
+            shadowed = shadowed_xdg(
+                &self.helper,
+                &user.home,
+                account,
+                owners,
+                every,
+                conditional,
+            );
+            judge(&self.helper, account, every, conditional)
+        })?;
+        Ok((lookups, shadowed))
+    }
+
+    /// Whether git's own non-keychain helper already answers `token` for `account` and `owners`,
+    /// or [`Self::configure`]'s `~/.gitconfig` keychain block shadows an XDG helper that does.
+    pub(crate) fn vault_standing(
+        &self,
+        sys: &dyn System,
+        user: &User,
+        account: &str,
+        owners: &[&str],
+        token: &Secret,
+    ) -> VaultStanding {
+        if !self
+            .fill_as_configured(sys, Some(user), GITHUB)
+            .is_ok_and(|answer| answer.is_some_and(|got| got.bytes() == token.bytes()))
+        {
+            return VaultStanding::Absent;
+        }
+        let mut out = VaultStanding::Absent;
+        let Ok(lookups) = self.judged(sys, user, |every, conditional| {
+            if let Some((xdg_file, revert)) = shadowed_xdg(
+                &self.helper,
+                &user.home,
+                account,
+                owners,
+                every,
+                conditional,
+            ) {
+                if self
+                    .fill_with_global_file(sys, user, &xdg_file, GITHUB)
+                    .is_ok_and(|ans| ans.is_some_and(|got| got.bytes() == token.bytes()))
+                {
+                    out = VaultStanding::Convert { revert };
+                }
+                return Lookups::Ready;
+            }
+            if !has_non_keychain_helper(&self.helper, every) {
+                return Lookups::Not("keychain helper only".into());
+            }
+            alike_for(Some(account), owners, every, conditional)
+        }) else {
+            return VaultStanding::Absent;
+        };
+        if matches!(out, VaultStanding::Convert { .. }) {
+            out
+        } else if lookups.ready() {
+            VaultStanding::Ready
+        } else {
+            VaultStanding::Absent
+        }
+    }
+
+    /// [`Self::configured`], and whose settings git's github.com lookups already use instead:
+    /// a helper other than this one's, or a `credential.username` naming another account
+    /// ([`Standing::foreign`]), which [`Self::configure`] must leave as they are. Where it would
+    /// configure, the global file's values of the settings it replaces are read too, for the
+    /// line that puts them back ([`Standing::revert`]). Also detects when [`Self::configure`]'s
+    /// `~/.gitconfig` keychain override shadows an XDG helper that answers `vault_token` (for
+    /// example after a token rotation left the keychain stale).
+    ///
+    /// # Errors
+    /// As [`Self::configured`].
+    pub(crate) fn standing_for(
+        &self,
+        sys: &dyn System,
+        user: &User,
+        account: &str,
+        owners: &[&str],
+        vault_token: Option<&Secret>,
     ) -> Result<Standing, String> {
         let mut foreign = None;
+        let mut shadowed = None;
         let lookups = self.judged(sys, user, |every, conditional| {
+            if vault_token.is_some() {
+                shadowed = shadowed_xdg(
+                    &self.helper,
+                    &user.home,
+                    account,
+                    owners,
+                    every,
+                    conditional,
+                );
+            }
             foreign = someone_elses(&self.helper, account, every, conditional);
             judge(&self.helper, account, every, conditional)
         })?;
+        if let (Some(token), Some((xdg_file, revert))) = (vault_token, shadowed)
+            && self
+                .fill_with_global_file(sys, user, &xdg_file, GITHUB)
+                .is_ok_and(|ans| ans.is_some_and(|got| got.bytes() == token.bytes()))
+        {
+            return Ok(Standing {
+                lookups: Lookups::Not(
+                    "git's global file overrides the XDG GitHub credential helper".into(),
+                ),
+                foreign: None,
+                revert: Some(revert),
+                convert_to_vault: true,
+            });
+        }
         if lookups.ready() || foreign.is_some() {
             return Ok(Standing {
                 lookups,
                 foreign,
                 revert: None,
+                convert_to_vault: false,
             });
         }
         let ran = sys
@@ -324,6 +460,7 @@ impl Git {
                 lookups,
                 foreign: Some(format!("{key} in git's global file")),
                 revert: None,
+                convert_to_vault: false,
             });
         }
         let mut steps = Vec::new();
@@ -343,6 +480,7 @@ impl Git {
             lookups,
             foreign: None,
             revert: Some(steps.join("; ")),
+            convert_to_vault: false,
         })
     }
 
@@ -353,8 +491,24 @@ impl Git {
     /// clone ask for its own repository.
     /// # Errors
     /// As [`Self::configured`].
+    #[cfg(test)]
     pub(crate) fn uniform(&self, sys: &dyn System, user: &User) -> Result<Lookups, String> {
         self.judged(sys, user, alike)
+    }
+
+    /// Whether git asks alike for every github.com repository a clone of `account` and `owners`
+    /// names: a `credential.<url>.*` setting scoped to another login or another owner path cannot
+    /// match those clones.
+    pub(crate) fn uniform_for(
+        &self,
+        sys: &dyn System,
+        user: &User,
+        account: &str,
+        owners: &[&str],
+    ) -> Result<Lookups, String> {
+        self.judged(sys, user, |every, conditional| {
+            alike_for(Some(account), owners, every, conditional)
+        })
     }
 
     /// `judge` of the github.com credential settings of every file git reads as `user`, in its
@@ -445,9 +599,36 @@ impl Git {
         }
         Ok(())
     }
+
+    /// Remove the github.com settings [`Self::configure`] wrote to the account's global
+    /// configuration (`~/.gitconfig`), leaving every other section (`[user]`, `[url …]`
+    /// `insteadOf` / `pushInsteadOf`, other hosts) untouched. `git config --unset-all` exits 5
+    /// with empty output when a key is already absent.
+    ///
+    /// # Errors
+    /// A `git config` run did not complete or failed (output withheld).
+    pub(crate) fn unconfigure(&self, sys: &dyn System, user: &User) -> Result<(), String> {
+        for key in [HELPER, USERNAME, USE_PATH] {
+            let ran = sys
+                .run_complete_stdout(&self.cmd(Some(user)).args([
+                    "config",
+                    "--global",
+                    "--unset-all",
+                    key,
+                ]))
+                .map_err(|_| "git's GitHub credential unconfiguration did not complete")?;
+            let absent = ran.status == Some(5) && ran.stdout.is_empty() && ran.stderr.is_empty();
+            if !ran.success() && !absent {
+                return Err(
+                    "git's GitHub credential unconfiguration failed (output withheld)".into(),
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
-/// What [`Git::standing`] read.
+/// What [`Git::standing_for`] read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Standing {
     /// [`Git::configured`]'s answer.
@@ -456,9 +637,12 @@ pub(crate) struct Standing {
     /// than this one's, another account), named by key and file, never by value; `None` when
     /// there is none.
     pub(crate) foreign: Option<String>,
-    /// The commands that put back the global file's settings [`Git::configure`] replaces,
-    /// read before it runs; `None` when it has nothing to replace (ready, or someone else's).
+    /// The commands that put back the global file's settings [`Git::configure`] or
+    /// [`Git::unconfigure`] changes, read before it runs; `None` when it has nothing to change.
     pub(crate) revert: Option<String>,
+    /// [`Git::configure`]'s `~/.gitconfig` keychain block shadows an XDG helper that already
+    /// answers the vault token, so [`Git::unconfigure`] converts the Mac back to the vault helper.
+    pub(crate) convert_to_vault: bool,
 }
 
 /// The global settings [`Git::configure`] replaces, as `git config --get-regexp` matches keys.
@@ -821,15 +1005,149 @@ fn judge(helper: &str, account: &str, every: &[Setting], conditional: &[Setting]
     Lookups::Ready
 }
 
+/// Whether `every`'s effective host-wide github.com helpers include one other than `helper`
+/// (the vault's helper or a user's own, rather than [`Git::keychain`]'s alone).
+fn has_non_keychain_helper(helper: &str, every: &[Setting]) -> bool {
+    let mut active: Vec<&str> = Vec::new();
+    for setting in every {
+        if let Some((Scope::Every, "helper")) = relevant(setting) {
+            match setting.value.as_deref() {
+                Some("") => active.clear(),
+                Some(value) => active.push(value),
+                None => {}
+            }
+        }
+    }
+    active
+        .into_iter()
+        .any(|value| !value.is_empty() && value != helper)
+}
+
+/// When `home`'s `~/.gitconfig` holds only [`Git::configure`]'s github.com keychain override for
+/// `account`, shadowing an XDG git config file whose own non-`helper` helper leaves github.com
+/// lookups uniform for `account` and `owners`: that XDG file and the shell commands that put
+/// `~/.gitconfig`'s github.com settings back.
+fn shadowed_xdg(
+    helper: &str,
+    home: &str,
+    account: &str,
+    owners: &[&str],
+    every: &[Setting],
+    conditional: &[Setting],
+) -> Option<(PathBuf, String)> {
+    let global_path = Path::new(home).join(".gitconfig");
+    let mut in_global: Vec<&Setting> = Vec::new();
+    let mut without_global: Vec<Setting> = Vec::new();
+    for setting in every {
+        let is_global = setting
+            .origin
+            .strip_prefix("file:")
+            .is_some_and(|file| Path::new(file) == global_path);
+        if is_global {
+            if relevant(setting).is_some_and(|(scope, _)| scope != Scope::Never) {
+                in_global.push(setting);
+            }
+        } else {
+            without_global.push(setting.clone());
+        }
+    }
+    if in_global.is_empty() {
+        return None;
+    }
+    let mut saw_keychain_helper = false;
+    for setting in &in_global {
+        if setting.key.eq_ignore_ascii_case(HELPER) {
+            match setting.value.as_deref() {
+                Some("") => {}
+                Some(value) if value == helper => saw_keychain_helper = true,
+                _ => return None,
+            }
+        } else if setting.key.eq_ignore_ascii_case(USERNAME) {
+            if !setting
+                .value
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case(account))
+            {
+                return None;
+            }
+        } else if setting.key.eq_ignore_ascii_case(USE_PATH) {
+            if setting.value.as_deref().and_then(boolean) != Some(false) {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+    if !saw_keychain_helper {
+        return None;
+    }
+    let mut xdg_helpers: Vec<&Setting> = Vec::new();
+    for setting in &without_global {
+        if let Some((Scope::Every, "helper")) = relevant(setting) {
+            match setting.value.as_deref() {
+                Some("") => xdg_helpers.clear(),
+                Some(_) => xdg_helpers.push(setting),
+                None => return None,
+            }
+        }
+    }
+    let xdg_file = xdg_helpers.into_iter().find_map(|setting| {
+        let value = setting.value.as_deref()?;
+        if value.is_empty() || value == helper {
+            return None;
+        }
+        let path = Path::new(setting.origin.strip_prefix("file:")?);
+        path.ends_with("git/config").then(|| path.to_path_buf())
+    })?;
+    if !alike_for(Some(account), owners, &without_global, conditional).ready() {
+        return None;
+    }
+    let mut steps = Vec::new();
+    for key in [HELPER, USERNAME, USE_PATH] {
+        steps.push(format!("git config --global --unset-all {key}"));
+        for setting in in_global
+            .iter()
+            .filter(|setting| setting.key.eq_ignore_ascii_case(key))
+        {
+            steps.push(format!(
+                "git config --global --add {key} {}",
+                shell_word(setting.value.as_deref().unwrap_or("true"))
+            ));
+        }
+    }
+    Some((xdg_file, steps.join("; ")))
+}
+
 /// Whether git asks alike for every github.com lookup ([`Git::uniform`]), given the settings
 /// of every file git reads, in its order (the last `useHttpPath` wins), and of the files
 /// conditional includes name.
+#[cfg(test)]
 fn alike(every: &[Setting], conditional: &[Setting]) -> Lookups {
+    alike_for(None, &[], every, conditional)
+}
+
+/// Whether git asks alike for every github.com lookup, ignoring normalized `credential.<url>.*`
+/// settings that can never match either the host-wide lookup or a clone under `account` /
+/// `owners` (such as a release-tier owner path or another username).
+fn alike_for(
+    account: Option<&str>,
+    owners: &[&str],
+    every: &[Setting],
+    conditional: &[Setting],
+) -> Lookups {
     let mut use_path = None;
     for setting in every {
         match relevant(setting) {
             None | Some((Scope::Never, _)) => {}
             Some((Scope::Part, _)) => {
+                let url = setting
+                    .key
+                    .strip_prefix("credential.")
+                    .and_then(|rest| rest.rsplit_once('.'))
+                    .map(|(url, _)| url);
+                if url.is_some_and(|url| disjoint_part(account, owners, url)) {
+                    continue;
+                }
                 return Lookups::Not(format!(
                     "{} applies to some github.com lookups",
                     setting.named()
@@ -857,6 +1175,36 @@ fn alike(every: &[Setting], conditional: &[Setting]) -> Lookups {
         }
         _ => Lookups::Ready,
     }
+}
+
+/// Whether a `Scope::Part` github.com URL in `credential.<url>.*` is normalized and strictly
+/// scoped to an owner path or username outside `account` and `owners`, so neither a host-wide
+/// lookup nor a clone of `account` / `owners` can match it.
+fn disjoint_part(account: Option<&str>, owners: &[&str], url: &str) -> bool {
+    let Some(account) = account else {
+        return false;
+    };
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    if scheme.is_empty() || rest.contains(['?', '#', '%']) {
+        return false;
+    }
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let (url_user, address) = match authority.rsplit_once('@') {
+        Some((user, address)) => (Some(user), address),
+        None => (None, authority),
+    };
+    if address.is_empty() || !normalized_github(scheme, address) || path.starts_with("//") {
+        return false;
+    }
+    let trimmed = path.trim_matches('/');
+    if !trimmed.is_empty() {
+        let first = trimmed.split('/').next().unwrap_or("");
+        return !first.is_empty()
+            && first != "*"
+            && !first.eq_ignore_ascii_case(account)
+            && !owners.iter().any(|owner| first.eq_ignore_ascii_case(owner));
+    }
+    url_user.is_some_and(|user| !user.is_empty() && !user.eq_ignore_ascii_case(account))
 }
 
 /// The fields a credential request names, an account among them when one is given. An
@@ -965,7 +1313,7 @@ pub(crate) mod script {
         sys.on(&global(user), Ran::exit(1, ""));
     }
 
-    /// The read [`Git::standing`] makes of the global file's github.com settings.
+    /// The read [`Git::standing_for`] makes of the global file's github.com settings.
     pub(crate) fn global(user: &User) -> String {
         config(
             user,
@@ -1046,6 +1394,62 @@ pub(crate) mod script {
                 "protocol=https\nhost={host}\nusername={account}\npassword={token}\n"
             )),
         );
+    }
+
+    /// A `fill` reading `~/.config/git/config` as `GIT_CONFIG_GLOBAL` ([`Git::fill_with_global_file`]).
+    pub(crate) fn lookups_hold_xdg(
+        sys: &Fake,
+        user: &User,
+        host: &str,
+        account: &str,
+        token: &str,
+    ) {
+        let xdg = format!("{}/.config/git/config", user.home);
+        let cmd = self::host(sys)
+            .as_configured(Some(user))
+            .env("GIT_CONFIG_GLOBAL", xdg);
+        sys.on(
+            &cmd.display(),
+            Ran::ok(&format!(
+                "protocol=https\nhost={host}\nusername={account}\npassword={token}\n"
+            )),
+        );
+    }
+
+    /// git's settings when [`Git::configure`] wrote `~/.gitconfig` for `account` on top of the
+    /// vault's `~/.config/git/config` helper.
+    pub(crate) fn shadowed(sys: &Fake, user: &User, account: &str) {
+        let git = host(sys);
+        let xdg = format!("{}/.config/git/config", user.home);
+        let global = format!("{}/.gitconfig", user.home);
+        let [helper, username, use_path] =
+            [HELPER, USERNAME, USE_PATH].map(str::to_ascii_lowercase);
+        let mut settings = Vec::new();
+        if sys.macos() {
+            settings.push((CLT_CONFIG, "credential.helper", "osxkeychain"));
+        }
+        settings.extend([
+            (xdg.as_str(), helper.as_str(), ""),
+            (&xdg, &helper, "aterm secrets git-credential"),
+            (&global, &helper, ""),
+            (&global, &helper, git.helper()),
+            (&global, &username, account),
+            (&global, &use_path, "false"),
+        ]);
+        sys.on(
+            &git.read(user, None).display(),
+            Ran::ok(&printed(&settings)),
+        );
+    }
+
+    /// The three `--unset-all` runs [`Git::unconfigure`] makes, each answered `ok`.
+    pub(crate) fn unconfigure(sys: &Fake, user: &User) -> Vec<String> {
+        let keys = [HELPER, USERNAME, USE_PATH]
+            .map(|key| config(user, &["config", "--global", "--unset-all", key]));
+        for key in &keys {
+            sys.on(key, Ran::ok(""));
+        }
+        keys.to_vec()
     }
 
     /// A `fill` the helper has nothing for: git's disabled prompt.
@@ -1881,6 +2285,168 @@ mod tests {
             "a clone's request still reaches the account's helper"
         );
         assert!(!git.uniform(&live, &who).unwrap().ready());
+        scratch.close().unwrap();
+    }
+
+    /// Scoped uniformity admits normalized settings for other owners or logins (such as a
+    /// release-tier owner path) while still rejecting settings that match the account, its
+    /// owners, or `//`.
+    #[test]
+    fn uniform_for_ignores_disjoint_owners_and_users_only() {
+        let base = [
+            Setting {
+                origin: "file:/h/.config/git/config".into(),
+                key: "credential.https://github.com.helper".into(),
+                value: Some(String::new()),
+            },
+            Setting {
+                origin: "file:/h/.config/git/config".into(),
+                key: "credential.https://github.com.helper".into(),
+                value: Some("aterm secrets git-credential".into()),
+            },
+        ];
+        for allowed in [
+            "credential.https://github.com/alabsystems.username",
+            "credential.https://alabsystems@github.com.helper",
+        ] {
+            let mut settings = base.to_vec();
+            settings.push(Setting {
+                origin: "file:/h/.config/git/config".into(),
+                key: allowed.into(),
+                value: Some("alabsystems".into()),
+            });
+            assert_eq!(
+                alike_for(Some("alice"), &["alice", "team"], &settings, &[]),
+                Lookups::Ready,
+                "{allowed}"
+            );
+        }
+        for rejected in [
+            "credential.https://github.com/alice.username",
+            "credential.https://github.com/team/repo.username",
+            "credential.https://alice@github.com.helper",
+            "credential.https://github.com//.helper",
+            "credential.github.com/alabsystems.username",
+        ] {
+            let mut settings = base.to_vec();
+            settings.push(Setting {
+                origin: "file:/h/.config/git/config".into(),
+                key: rejected.into(),
+                value: Some("other".into()),
+            });
+            assert!(
+                !alike_for(Some("alice"), &["alice", "team"], &settings, &[]).ready(),
+                "{rejected}"
+            );
+        }
+    }
+
+    /// A real CLT git in a scratch HOME where `Git::configure` wrote `~/.gitconfig` on top of the
+    /// vault's `~/.config/git/config`: `vault_standing` and `standing_for` detect the shadowed XDG
+    /// helper, `unconfigure` removes `[credential "https://github.com"]` from `~/.gitconfig` while
+    /// preserving `[user]` and `[url …]` `pushInsteadOf`, and negative control keeps `~/.gitconfig`
+    /// when `~/.config/git/config` has no answering helper.
+    #[test]
+    fn shadowed_keychain_gitconfig_converts_to_vault_helper_and_preserves_other_sections() {
+        crate::items::github::need_clt_git();
+        let live = Live::new();
+        let mut scratch = Scratch::new(&live, "git-convert-test").unwrap();
+        let home = scratch.path().to_owned();
+        let mut who = user("fixture", live.euid());
+        who.home = home.to_string_lossy().into_owned();
+        let xdg = home.join(".config/git");
+        std::fs::create_dir_all(&xdg).unwrap();
+        let store_path = home.join("keychain-standin");
+        let helper_flag = format!("store --file={}", store_path.display());
+        let git = Git::isolated(&helper_flag);
+
+        let vault_token = Secret::new(b"dummy_vault_value").unwrap();
+        let stale_token = Secret::new(b"dummy_stale_value").unwrap();
+        git.store(&live, Some(&who), GITHUB, "alice", &stale_token)
+            .unwrap();
+        git.configure(&live, &who, "alice").unwrap();
+        for args in [
+            ["config", "--global", "user.name", "Alice"],
+            [
+                "config",
+                "--global",
+                "url.https://alabsystems@github.com/alabsystems/.pushInsteadOf",
+                "https://github.com/alabsystems/",
+            ],
+        ] {
+            assert!(
+                live.run_complete_stdout(&git.cmd(Some(&who)).args(args))
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        // Negative control: with no answering XDG helper in ~/.config/git/config, neither
+        // `vault_standing` nor `standing_for` converts `~/.gitconfig`.
+        live.write_file(
+            &xdg.join("config"),
+            b"[user]\n\temail = a@example.test\n",
+            0o600,
+        )
+        .unwrap();
+        assert_eq!(
+            git.vault_standing(&live, &who, "alice", &["alice"], &stale_token),
+            VaultStanding::Absent
+        );
+        let neg = git
+            .standing_for(&live, &who, "alice", &["alice"], Some(&vault_token))
+            .unwrap();
+        assert!(!neg.convert_to_vault);
+        assert!(neg.lookups.ready());
+
+        // Install the vault helper in ~/.config/git/config: even with the stale token in the
+        // keychain stand-in, `standing_for` detects conversion, and once converted, `unconfigure`
+        // exposes the vault helper while keeping `[user]` and `[url …]` intact.
+        let helper = "!f() { test \"$1\" = get || return 0; echo username=alice; echo password=dummy_vault_value; }; f";
+        let xdg_cfg = format!(
+            "[credential \"https://github.com\"]\n\thelper =\n\thelper = \"{}\"\n",
+            helper.replace('"', "\\\"")
+        );
+        live.write_file(&xdg.join("config"), xdg_cfg.as_bytes(), 0o600)
+            .unwrap();
+
+        let stale_standing = git
+            .standing_for(&live, &who, "alice", &["alice"], Some(&vault_token))
+            .unwrap();
+        assert!(stale_standing.convert_to_vault);
+        assert!(
+            stale_standing
+                .revert
+                .as_deref()
+                .is_some_and(|r| r.contains("--add credential.https://github.com.username alice"))
+        );
+
+        // Also check when keychain holds the current token: `vault_standing` reports `Convert`.
+        git.store(&live, Some(&who), GITHUB, "alice", &vault_token)
+            .unwrap();
+        assert!(matches!(
+            git.vault_standing(&live, &who, "alice", &["alice"], &vault_token),
+            VaultStanding::Convert { .. }
+        ));
+
+        git.unconfigure(&live, &who).unwrap();
+        assert_eq!(
+            git.vault_standing(&live, &who, "alice", &["alice"], &vault_token),
+            VaultStanding::Ready
+        );
+        let global_after = String::from_utf8(
+            live.read_owned_file(&home.join(".gitconfig"), live.euid(), 65536, false)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !global_after.contains("github.com]\n") && !global_after.contains("useHttpPath"),
+            "{global_after}"
+        );
+        assert!(
+            global_after.contains("Alice") && global_after.contains("pushInsteadOf"),
+            "{global_after}"
+        );
         scratch.close().unwrap();
     }
 }

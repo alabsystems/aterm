@@ -308,7 +308,7 @@ fn test_box() {
 }
 
 #[test]
-fn test_boxed_slice() {
+fn test_boxed_array() {
     assert_ser_tokens(
         &Box::new([0, 1, 2]),
         &[

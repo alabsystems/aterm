@@ -32,8 +32,10 @@ pub struct Args {
     /// every cell but this machine's own.
     pub cells: Vec<String>,
     pub no_windows: bool,
-    /// `--admit now|wait`: whether the run waits for room for the disk it will write and its
-    /// timed stages for a quiet machine (the default), or starts at once, saying what it lacks.
+    /// `--admit now|wait`: whether the run waits for room for the disk it will write, each stage
+    /// for room for its memory, and its timed stages for a quiet machine (the default), or starts
+    /// at once, saying what it lacks. Neither lifts the run's own memory budget
+    /// ([`crate::sched::memory_holders`]).
     pub admit: aterm_capacity::Admit,
     pub test_threads: Option<NonZeroU32>,
     pub test_jobs: Option<NonZeroU32>,
@@ -88,7 +90,9 @@ where
     let usage = |s: String| Err(Usage::new(s));
     while let Some(arg) = it.next() {
         let (flag, inline) = match arg.split_once('=') {
-            Some((f, v)) if f.starts_with("--") => (f.to_string(), Some(v.to_string())),
+            Some((f, v)) if f.starts_with("--") || f == "-p" => {
+                (f.to_string(), Some(v.to_string()))
+            }
             _ => (arg.clone(), None),
         };
         let mut value = |name: &str| -> Result<String, Usage> {
@@ -255,7 +259,7 @@ Run aterm's checks in place, alone or in any combination.
 
   verify                          the dev set on what changed since origin/main
   verify lint test -p aterm-grid  two checks on one crate
-  verify test --all               every crate's tests (+ gpu-oracle, wasm-smoke)
+  verify test --all               every crate's tests (+ wasm-smoke)
   verify fmt --fix                rewrite what fmt finds unformatted
   verify release --app <APP>      everything publication requires
   verify list                     every check: sets, needs, what it runs
@@ -293,14 +297,20 @@ Options:
       --fix               with fmt alone: rewrite the files it finds unformatted
       --cell <name>       the forge cell `cells` checks (repeatable; any cell)
       --no-windows        skip each stage that opens a window (a named skip)
-      --admit <wait|now>  wait for room for the disk the run will write, and
-                          for a quiet machine before the first timed stage,
+      --admit <wait|now>  wait for room for the disk the run will write, for
+                          each stage's memory before it starts (held until
+                          it ends, beside other runs' claims), and for a
+                          quiet machine before the first timed stage,
                           held through the last (default wait, saying why
                           once a minute; next in line, it holds back claimed
                           work after {reserve} and starts whatever the load
                           after {start}); now starts at once, saying what
                           it lacks, and a starved take is refused; the
-                          Linux lane's lab is given it too
+                          Linux lane's lab is given it too. Under either,
+                          the run's stages start only while the memory
+                          they claim fits together in what can ever be
+                          available here (one that alone does not runs
+                          with no other that claims memory)
       --test-threads <n>  RUST_TEST_THREADS ceiling for every test binary
       --test-jobs <n>     test binaries at once (default 8); under build-slot,
                           binaries times threads stays within CARGO_BUILD_JOBS
@@ -368,6 +378,8 @@ mod tests {
             &["lnit"],
             &["--full"],
             &["-p"],
+            &["-p="],
+            &["-p=--all"],
             &["-p", "--all"],
             &["--test-jobs", "0"],
             &["--timeout", "45m"],
@@ -393,8 +405,17 @@ mod tests {
 
     #[test]
     fn values_parse_into_their_types() {
-        let a = ok(&["lint", "-p", "a", "--package", "b", "--scope=c", "-pd"]);
-        assert_eq!(a.packages, ["a", "b", "c", "d"]);
+        let a = ok(&[
+            "lint",
+            "-p",
+            "a",
+            "--package",
+            "b",
+            "--scope=c",
+            "-pd",
+            "-p=e",
+        ]);
+        assert_eq!(a.packages, ["a", "b", "c", "d", "e"]);
         let a = ok(&[
             "test",
             "--test-threads=3",

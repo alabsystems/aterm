@@ -24,7 +24,7 @@ mod native {
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use native::{Instant, SystemTime, SystemTimeError, UNIX_EPOCH};
 
-#[cfg(any(all(target_arch = "wasm32", target_os = "unknown"), test))]
+#[cfg(any(all(target_arch = "wasm32", target_os = "unknown"), trust_verify, test))]
 mod shim;
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -69,22 +69,43 @@ macro_rules! wasm_clock_host {
     };
 }
 
+/// Distance past [`UNIX_EPOCH`] for an explicit [`SystemTime`] reading, or
+/// `None` when `now` precedes 1970.
+#[must_use]
+#[inline]
+pub fn since_epoch_at(now: SystemTime) -> Option<Duration> {
+    now.duration_since(UNIX_EPOCH).ok()
+}
+
+/// Whole seconds since [`UNIX_EPOCH`] for `now` ([`since_epoch_at`]), `None`
+/// before it.
+#[must_use]
+#[inline]
+pub fn unix_secs_at(now: SystemTime) -> Option<u64> {
+    since_epoch_at(now).map(|d| d.as_secs())
+}
+
+/// Milliseconds since [`UNIX_EPOCH`] for `now` ([`since_epoch_at`]),
+/// saturating at `u64::MAX`; `None` before it.
+#[must_use]
+#[inline]
+pub fn unix_millis_at(now: SystemTime) -> Option<u64> {
+    since_epoch_at(now).map(duration_to_millis_saturating)
+}
+
 /// The wall clock's distance past the Unix epoch, or `None` when it reads
 /// before 1970.
 #[must_use]
 #[inline]
 pub fn since_epoch() -> Option<Duration> {
-    let Ok(d) = SystemTime::now().duration_since(UNIX_EPOCH) else {
-        return None;
-    };
-    Some(d)
+    since_epoch_at(SystemTime::now())
 }
 
 /// Whole seconds since the Unix epoch ([`since_epoch`]), `None` before it.
 #[must_use]
 #[inline]
 pub fn unix_secs() -> Option<u64> {
-    since_epoch().map(|d| d.as_secs())
+    unix_secs_at(SystemTime::now())
 }
 
 /// Milliseconds since the Unix epoch ([`since_epoch`]), saturating at
@@ -92,19 +113,13 @@ pub fn unix_secs() -> Option<u64> {
 #[must_use]
 #[inline]
 pub fn unix_millis() -> Option<u64> {
-    since_epoch().map(duration_to_millis_saturating)
+    unix_millis_at(SystemTime::now())
 }
 
-/// Nanoseconds per second (`1_000_000_000`).
-pub const NANOS_PER_SEC: u32 = 1_000_000_000;
 /// Nanoseconds per millisecond (`1_000_000`).
 pub const NANOS_PER_MILLI: u32 = 1_000_000;
-/// Nanoseconds per microsecond (`1_000`).
-pub const NANOS_PER_MICRO: u32 = 1_000;
 /// Milliseconds per second (`1_000`).
 pub const MILLIS_PER_SEC: u64 = 1_000;
-/// Microseconds per second (`1_000_000`).
-pub const MICROS_PER_SEC: u64 = 1_000_000;
 
 /// Convert a [`Duration`] to whole milliseconds, saturating at `u64::MAX`.
 #[must_use]
@@ -115,217 +130,50 @@ pub const fn duration_to_millis_saturating(d: Duration) -> u64 {
     secs_ms.saturating_add(sub_ms)
 }
 
-/// Convert a [`Duration`] to whole microseconds, saturating at `u64::MAX`.
-#[must_use]
-#[inline]
-pub const fn duration_to_micros_saturating(d: Duration) -> u64 {
-    let secs_us = d.as_secs().saturating_mul(MICROS_PER_SEC);
-    let sub_us = (d.subsec_nanos() / NANOS_PER_MICRO) as u64;
-    secs_us.saturating_add(sub_us)
-}
-
-/// Split whole milliseconds since epoch into `(secs, subsec_nanos)` where
-/// `subsec_nanos < 1_000_000_000`.
-#[must_use]
-#[inline]
-pub const fn split_millis_to_secs_nanos(millis: u64) -> (u64, u32) {
-    let secs = millis / MILLIS_PER_SEC;
-    let rem_ms = (millis % MILLIS_PER_SEC) as u32;
-    (secs, rem_ms * NANOS_PER_MILLI)
-}
-
-/// Split whole microseconds since epoch into `(secs, subsec_nanos)` where
-/// `subsec_nanos < 1_000_000_000`.
-#[must_use]
-#[inline]
-pub const fn split_micros_to_secs_nanos(micros: u64) -> (u64, u32) {
-    let secs = micros / MICROS_PER_SEC;
-    let rem_us = (micros % MICROS_PER_SEC) as u32;
-    (secs, rem_us * NANOS_PER_MICRO)
-}
-
-/// Construct a [`Duration`] from `(secs, subsec_nanos)`, rejecting
-/// non-canonical `subsec_nanos >= 1_000_000_000`.
-#[must_use]
-#[inline]
-pub const fn duration_from_canonical_parts(secs: u64, subsec_nanos: u32) -> Option<Duration> {
-    if subsec_nanos >= NANOS_PER_SEC {
-        return None;
-    }
-    Some(Duration::new(secs, subsec_nanos))
-}
-
-/// Encode a canonical `(secs: u64, subsec_nanos: u32)` duration/timestamp into
-/// a 12-byte little-endian wire representation.
-#[must_use]
-#[inline]
-pub const fn encode_timestamp_96_le(secs: u64, subsec_nanos: u32) -> Option<[u8; 12]> {
-    if subsec_nanos >= NANOS_PER_SEC {
-        return None;
-    }
-    Some([
-        secs as u8,
-        (secs >> 8) as u8,
-        (secs >> 16) as u8,
-        (secs >> 24) as u8,
-        (secs >> 32) as u8,
-        (secs >> 40) as u8,
-        (secs >> 48) as u8,
-        (secs >> 56) as u8,
-        subsec_nanos as u8,
-        (subsec_nanos >> 8) as u8,
-        (subsec_nanos >> 16) as u8,
-        (subsec_nanos >> 24) as u8,
-    ])
-}
-
-/// Decode a 12-byte little-endian `(secs: u64, subsec_nanos: u32)` wire
-/// timestamp, rejecting non-canonical `subsec_nanos >= 1_000_000_000`.
-#[must_use]
-#[inline]
-pub const fn decode_timestamp_96_le(wire: &[u8; 12]) -> Option<(u64, u32)> {
-    let secs = (wire[0] as u64)
-        | ((wire[1] as u64) << 8)
-        | ((wire[2] as u64) << 16)
-        | ((wire[3] as u64) << 24)
-        | ((wire[4] as u64) << 32)
-        | ((wire[5] as u64) << 40)
-        | ((wire[6] as u64) << 48)
-        | ((wire[7] as u64) << 56);
-    let nanos = (wire[8] as u32)
-        | ((wire[9] as u32) << 8)
-        | ((wire[10] as u32) << 16)
-        | ((wire[11] as u32) << 24);
-    if nanos >= NANOS_PER_SEC {
-        return None;
-    }
-    Some((secs, nanos))
-}
-
-/// Encode a canonical `(secs: u64, subsec_nanos: u32)` duration/timestamp into
-/// a 12-byte big-endian wire representation.
-#[must_use]
-#[inline]
-pub const fn encode_timestamp_96_be(secs: u64, subsec_nanos: u32) -> Option<[u8; 12]> {
-    if subsec_nanos >= NANOS_PER_SEC {
-        return None;
-    }
-    Some([
-        (secs >> 56) as u8,
-        (secs >> 48) as u8,
-        (secs >> 40) as u8,
-        (secs >> 32) as u8,
-        (secs >> 24) as u8,
-        (secs >> 16) as u8,
-        (secs >> 8) as u8,
-        secs as u8,
-        (subsec_nanos >> 24) as u8,
-        (subsec_nanos >> 16) as u8,
-        (subsec_nanos >> 8) as u8,
-        subsec_nanos as u8,
-    ])
-}
-
-/// Decode a 12-byte big-endian `(secs: u64, subsec_nanos: u32)` wire
-/// timestamp, rejecting non-canonical `subsec_nanos >= 1_000_000_000`.
-#[must_use]
-#[inline]
-pub const fn decode_timestamp_96_be(wire: &[u8; 12]) -> Option<(u64, u32)> {
-    let secs = ((wire[0] as u64) << 56)
-        | ((wire[1] as u64) << 48)
-        | ((wire[2] as u64) << 40)
-        | ((wire[3] as u64) << 32)
-        | ((wire[4] as u64) << 24)
-        | ((wire[5] as u64) << 16)
-        | ((wire[6] as u64) << 8)
-        | (wire[7] as u64);
-    let nanos = ((wire[8] as u32) << 24)
-        | ((wire[9] as u32) << 16)
-        | ((wire[10] as u32) << 8)
-        | (wire[11] as u32);
-    if nanos >= NANOS_PER_SEC {
-        return None;
-    }
-    Some((secs, nanos))
-}
-
-/// Advance a monotonic millisecond watermark `last_ms` given an observed
-/// `candidate_ms`, never moving backward.
-#[must_use]
-#[inline]
-pub const fn monotonic_watermark_ms(last_ms: u64, candidate_ms: u64) -> u64 {
-    if candidate_ms > last_ms {
-        candidate_ms
-    } else {
-        last_ms
-    }
-}
-
-/// Remaining milliseconds until `deadline_ms` at `now_ms` (`0` if expired).
-#[must_use]
-#[inline]
-pub const fn deadline_remaining_ms(now_ms: u64, deadline_ms: u64) -> u64 {
-    deadline_ms.saturating_sub(now_ms)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        NANOS_PER_SEC, SystemTime, UNIX_EPOCH, deadline_remaining_ms, decode_timestamp_96_be,
-        decode_timestamp_96_le, duration_from_canonical_parts, duration_to_micros_saturating,
-        duration_to_millis_saturating, encode_timestamp_96_be, encode_timestamp_96_le,
-        monotonic_watermark_ms, split_micros_to_secs_nanos, split_millis_to_secs_nanos,
-    };
+    use super::{Duration, SystemTime, UNIX_EPOCH};
 
-    /// The accessors are the same reading in three units, bracketed by two
-    /// direct reads taken around them.
+    /// Pure epoch conversion agrees across all three units on one reading,
+    /// rejects pre-epoch readings, saturates milliseconds at `u64::MAX`, and
+    /// reads post-epoch values from the live wall clock without assuming
+    /// monotonicity across separate syscalls.
     #[test]
     fn the_epoch_accessors_read_the_wall_clock() {
-        let direct = || {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("wall clock is at or after the Unix epoch")
-        };
-        let before = direct();
-        let (since, secs, millis) = (
-            super::since_epoch().expect("after the epoch"),
-            super::unix_secs().expect("after the epoch"),
-            super::unix_millis().expect("after the epoch"),
-        );
-        let after = direct();
-        assert!(
-            (before..=after).contains(&since),
-            "{before:?} {since:?} {after:?}"
-        );
-        assert!((before.as_secs()..=after.as_secs()).contains(&secs));
-        assert!((before.as_millis()..=after.as_millis()).contains(&u128::from(millis)));
-    }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            let before_epoch = UNIX_EPOCH
+                .checked_sub(Duration::from_secs(1))
+                .expect("native SystemTime represents 1969");
+            assert_eq!(super::since_epoch_at(before_epoch), None);
+            assert_eq!(super::unix_secs_at(before_epoch), None);
+            assert_eq!(super::unix_millis_at(before_epoch), None);
+        }
 
-    #[test]
-    fn timestamp_96_wire_codecs_and_monotonic_helpers_round_trip() {
-        let (secs, nanos) = split_millis_to_secs_nanos(1_729_281_234_567);
-        assert_eq!(secs, 1_729_281_234);
-        assert_eq!(nanos, 567_000_000);
-        let d = duration_from_canonical_parts(secs, nanos).expect("canonical");
-        assert_eq!(duration_to_millis_saturating(d), 1_729_281_234_567);
-        assert_eq!(duration_to_micros_saturating(d), 1_729_281_234_567_000);
+        assert_eq!(super::since_epoch_at(UNIX_EPOCH), Some(Duration::ZERO));
+        assert_eq!(super::unix_secs_at(UNIX_EPOCH), Some(0));
+        assert_eq!(super::unix_millis_at(UNIX_EPOCH), Some(0));
+
+        let sample = Duration::new(1_790_000_000, 123_456_789);
+        let at_sample = UNIX_EPOCH.checked_add(sample).expect("post-epoch sample");
+        assert_eq!(super::since_epoch_at(at_sample), Some(sample));
+        assert_eq!(super::unix_secs_at(at_sample), Some(1_790_000_000));
+        assert_eq!(super::unix_millis_at(at_sample), Some(1_790_000_000_123));
+
         assert_eq!(
-            split_micros_to_secs_nanos(1_729_281_234_567_890),
-            (1_729_281_234, 567_890_000)
+            super::duration_to_millis_saturating(Duration::from_secs(u64::MAX)),
+            u64::MAX
         );
 
-        let le = encode_timestamp_96_le(secs, nanos).expect("canonical le");
-        assert_eq!(decode_timestamp_96_le(&le), Some((secs, nanos)));
-        let be = encode_timestamp_96_be(secs, nanos).expect("canonical be");
-        assert_eq!(decode_timestamp_96_be(&be), Some((secs, nanos)));
-
-        assert!(encode_timestamp_96_le(1, NANOS_PER_SEC).is_none());
-        assert!(encode_timestamp_96_be(1, NANOS_PER_SEC).is_none());
-        assert!(duration_from_canonical_parts(1, NANOS_PER_SEC).is_none());
-
-        assert_eq!(monotonic_watermark_ms(100, 90), 100);
-        assert_eq!(monotonic_watermark_ms(100, 120), 120);
-        assert_eq!(deadline_remaining_ms(80, 100), 20);
-        assert_eq!(deadline_remaining_ms(120, 100), 0);
+        let now = SystemTime::now();
+        let d = super::since_epoch_at(now).expect("wall clock is at or after the Unix epoch");
+        assert_eq!(super::unix_secs_at(now), Some(d.as_secs()));
+        assert_eq!(
+            super::unix_millis_at(now),
+            Some(super::duration_to_millis_saturating(d))
+        );
+        assert!(super::since_epoch().is_some());
+        assert!(super::unix_secs().is_some());
+        assert!(super::unix_millis().is_some());
     }
 }

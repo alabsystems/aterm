@@ -205,6 +205,7 @@ impl Grid {
                 .saturating_add(row_u16(pull));
         }
 
+        self.storage.note_history_popped(avail, pull);
         self.storage.history_renumber_epoch = self.storage.history_renumber_epoch.saturating_add(1);
         self.force_selection_invalidation();
         self.storage.damage = Damage::Full;

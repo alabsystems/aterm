@@ -2102,6 +2102,7 @@ fn group(n: u32) -> String {
 #[derive(Default)]
 pub(crate) struct DiskwalkHost {
     from_walker: Option<Receiver<Arc<Published>>>,
+    proxy_installed: bool,
     started: bool,
     facts_due: Option<Instant>,
     sent_facts: Option<Facts>,
@@ -2123,11 +2124,17 @@ impl crate::App {
 
     /// A level judged every wake.
     pub(crate) fn service_diskwalk(&mut self, now: Instant) {
+        if !self.diskwalk.proxy_installed
+            && let Some(proxy) = self.proxy.clone()
+        {
+            self.diskwalk.proxy_installed = true;
+            *DISKWALK.proxy.lock_or_recover() = Some(proxy);
+        }
         if !self.diskwalk.started
+            && (!self.headless || DISKWALK.demanded(now))
             && let Some(proxy) = self.proxy.clone()
         {
             self.diskwalk.started = true;
-            *DISKWALK.proxy.lock_or_recover() = Some(proxy.clone());
             match spawn_walker(&DISKWALK, Some(proxy), WALKER_CLASS) {
                 Ok(rx) => self.diskwalk.from_walker = Some(rx),
                 Err(error) => aterm_log::warn!("disk walker: the thread did not start: {error}"),

@@ -234,15 +234,19 @@ fn creation_case(case: i64, cli: Cli) -> (i64, i64, i64) {
     };
     let mut out = Vec::new();
     let mut err = Vec::new();
-    let success = if adding {
-        let result = accounts_add(cli, &env, &row);
-        if let Err(why) = &result {
-            err.extend_from_slice(why.as_bytes());
+    // A lock a case holds stays held for the whole verb, so its stores refuse at the first
+    // take: the refusal and the files it leaves are the subject, not the ladder's pauses.
+    let success = accounts::with_store_ladder(&[], || {
+        if adding {
+            let result = accounts_add(cli, &env, &row);
+            if let Err(why) = &result {
+                err.extend_from_slice(why.as_bytes());
+            }
+            result.is_ok()
+        } else {
+            run_accounts_adopt(cli, &env, &host, &row, &mut out, &mut err) == ExitCode::SUCCESS
         }
-        result.is_ok()
-    } else {
-        run_accounts_adopt(cli, &env, &host, &row, &mut out, &mut err) == ExitCode::SUCCESS
-    };
+    });
     let after = data_files(tmp.path());
     let before = before.into_inner();
     if !success {

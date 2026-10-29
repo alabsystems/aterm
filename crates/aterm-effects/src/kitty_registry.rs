@@ -40,10 +40,10 @@ const APP_LOOK_SALT: u64 = 0x6170_704B_6974_7400;
 /// (leading `VAR=value` assignments and `-flags` are skipped too).
 const TRANSPARENT_PREFIXES: &[&str] = &["sudo", "env", "npx"];
 
-/// Extract the first meaningful program token of a shell commandline, basenamed and lowercased.
+/// Extract the first meaningful program token of a shell commandline as a borrowed slice, basenamed and `.exe`-stripped.
 #[inline]
 #[must_use]
-pub fn app_basename(commandline: &str) -> Option<String> {
+pub(crate) fn app_basename_slice(commandline: &str) -> Option<&str> {
     #[inline]
     const fn is_transparent_prefix(base: &str) -> bool {
         let mut i = 0;
@@ -74,13 +74,32 @@ pub fn app_basename(commandline: &str) -> Option<String> {
         if base.is_empty() || is_transparent_prefix(base) {
             continue;
         }
-        return Some(base.to_ascii_lowercase());
+        return Some(base);
     }
     None
 }
 
+/// Extract the first meaningful program token of a shell commandline, basenamed and lowercased.
+#[inline]
+#[must_use]
+pub fn app_basename(commandline: &str) -> Option<String> {
+    app_basename_slice(commandline).map(str::to_ascii_lowercase)
+}
+
 /// The canonical id every shell folds onto.
 pub const SHELL_APP_ID: &str = "shell";
+
+/// True when `basename` (case-insensitively) names a shell that folds onto [`SHELL_APP_ID`].
+#[inline]
+#[must_use]
+pub(crate) const fn is_shell_basename(basename: &str) -> bool {
+    basename.eq_ignore_ascii_case("zsh")
+        || basename.eq_ignore_ascii_case("bash")
+        || basename.eq_ignore_ascii_case("fish")
+        || basename.eq_ignore_ascii_case("sh")
+        || basename.eq_ignore_ascii_case("pwsh")
+        || basename.eq_ignore_ascii_case("nu")
+}
 
 /// The canonical app id for a basename: every shell is [`SHELL_APP_ID`]; anything else is its basename.
 #[inline]
@@ -97,22 +116,36 @@ pub const fn canonical_app_id(basename: &str) -> &str {
 /// terracotta).
 #[inline]
 const fn flagship_look(app_id: &str) -> Option<KittyLook> {
-    let (variant, coat, iris, age) = match app_id.as_bytes() {
-        b"claude" => (CatGlyphId::S108, 12, 0, CatAge::Adult),
-        b"codex" => (CatGlyphId::S117, 15, 7, CatAge::Adult),
-        b"agy" => (CatGlyphId::S122, 3, 6, CatAge::Adolescent),
-        _ => return None,
-    };
-    Some(
-        KittyLook {
-            variant,
-            accessory: None,
-            coat,
-            iris,
-            age,
-        }
-        .normalized(),
-    )
+    const CLAUDE_LOOK: KittyLook = KittyLook {
+        variant: CatGlyphId::S108,
+        accessory: None,
+        coat: 12,
+        iris: 0,
+        age: CatAge::Adult,
+    }
+    .normalized();
+    const CODEX_LOOK: KittyLook = KittyLook {
+        variant: CatGlyphId::S117,
+        accessory: None,
+        coat: 15,
+        iris: 7,
+        age: CatAge::Adult,
+    }
+    .normalized();
+    const AGY_LOOK: KittyLook = KittyLook {
+        variant: CatGlyphId::S122,
+        accessory: None,
+        coat: 3,
+        iris: 6,
+        age: CatAge::Adolescent,
+    }
+    .normalized();
+    match app_id.as_bytes() {
+        b"claude" => Some(CLAUDE_LOOK),
+        b"codex" => Some(CODEX_LOOK),
+        b"agy" => Some(AGY_LOOK),
+        _ => None,
+    }
 }
 
 impl KittyLook {
@@ -329,6 +362,9 @@ const fn str_eq(a: &str, b: &str) -> bool {
 #[inline]
 #[must_use]
 pub const fn glyph_from_key(key: &str) -> Option<CatGlyphId> {
+    if key.is_empty() {
+        return None;
+    }
     let mut i = 0;
     while i < GLYPHS.len() {
         if str_eq(GLYPHS[i].id, key) {
@@ -392,6 +428,7 @@ impl KittyType {
 
     /// The stable `kitty-log.toml` / introspection key for this type.
     #[inline]
+    #[must_use]
     pub const fn config_key(self) -> &'static str {
         match self {
             KittyType::HeadPeek => "head_peek",
@@ -433,6 +470,7 @@ impl KittyMagic {
 
     /// The stable `kitty-log.toml` / introspection key for this bucket.
     #[inline]
+    #[must_use]
     pub const fn config_key(self) -> &'static str {
         match self {
             KittyMagic::None => "none",
@@ -445,6 +483,7 @@ impl KittyMagic {
 
     /// The recorder's mapping from the (config-gated) genome decode.
     #[inline]
+    #[must_use]
     pub const fn from_cat(magic: Option<CatMagic>) -> KittyMagic {
         match magic {
             None => KittyMagic::None,
@@ -655,6 +694,22 @@ mod tests {
             );
             assert!(a.accessory.is_none(), "seed {seed}: no free accessory");
         }
+        let distinct: std::collections::HashSet<_> = (0..64u64)
+            .map(|s| {
+                let l = KittyLook::for_launch(s);
+                (l.variant, l.coat, l.iris, l.age as u8)
+            })
+            .collect();
+        assert!(
+            distinct.len() >= 32,
+            "seeds get visibly different kitties, got {} distinct of 64",
+            distinct.len()
+        );
+        assert_ne!(
+            KittyLook::for_launch(0),
+            KittyLook::default(),
+            "a launch kitty is not the one shared default cat"
+        );
     }
 
     #[test]

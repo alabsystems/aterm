@@ -801,30 +801,58 @@ pub fn handled_words(handled: &Handled) -> String {
 pub struct PageMarkers {
     opened: &'static str,
     declined: &'static str,
+    /// `aterm doctor` writes a plain word to the marker alone, which names every identity:
+    /// `<marker>-by` keeps it whatever window writes after it ([`with_opening`]).
+    doctor_writes: bool,
 }
 
 /// System Settings ▸ Privacy & Security ▸ Developer Tools: `devtools-pane-opened` and
-/// `devtools-declined`, which `aterm doctor` reads and writes too.
+/// `devtools-declined`, which `aterm doctor` reads and writes too. The marker's word is a plain
+/// step, which `aterm doctor` and an older aterm compare whole; the window keeps its TCC
+/// identity's opening beside it in `devtools-pane-opened-by` ([`PageMarkers::note_opened_by`]).
 pub const DEVELOPER_TOOLS: PageMarkers = PageMarkers {
     opened: "devtools-pane-opened",
     declined: "devtools-declined",
+    doctor_writes: true,
 };
 
 /// System Settings ▸ Privacy & Security ▸ Full Disk Access: `fda-pane-opened` and
-/// `fda-declined`, the window's own hand-over of that page.
+/// `fda-declined`, the window's own hand-over of that page. `aterm doctor` writes neither, so a
+/// plain word in them is a window's written before its bundle id was read, or an older aterm's,
+/// and the next note of any identity replaces it.
 pub const FULL_DISK_ACCESS: PageMarkers = PageMarkers {
     opened: "fda-pane-opened",
     declined: "fda-declined",
+    doctor_writes: false,
+};
+
+/// System Settings ▸ Privacy & Security ▸ Accessibility: `accessibility-declined`, the owner's
+/// Not now on the permission walk's Accessibility page. Only the decline is kept: the page is the
+/// walk's alone, which reads the grant itself, so nothing notes an opening in
+/// `accessibility-pane-opened`.
+pub const ACCESSIBILITY: PageMarkers = PageMarkers {
+    opened: "accessibility-pane-opened",
+    declined: "accessibility-declined",
+    doctor_writes: false,
 };
 
 impl PageMarkers {
-    /// Where aterm notes that it opened the page for the owner: one line, `<key> <unix seconds>`.
+    /// Where aterm notes that it opened the page for the owner: one `<key> <unix seconds>` line,
+    /// the newest opening of any TCC identity, which every aterm reads
+    /// ([`Self::note_opened_beside`] keeps each identity's beside it).
     #[must_use]
     pub fn opened_marker(self) -> Option<std::path::PathBuf> {
         aterm_types::dirs::state_dir().map(|dir| dir.join(self.opened))
     }
 
-    /// The last time aterm opened the page: `(key, unix seconds)`, or `None`.
+    /// The file beside the marker that keeps each TCC identity's opening
+    /// ([`Self::note_opened_beside`]): `<marker>-by`.
+    fn opened_by(self) -> String {
+        format!("{}-by", self.opened)
+    }
+
+    /// The last time aterm opened the page, whichever TCC identity wrote it: `(key, unix
+    /// seconds)`, or `None`.
     #[must_use]
     pub fn last_opened(self) -> Option<(String, u64)> {
         self.last_opened_in(&aterm_types::dirs::state_dir()?)
@@ -834,7 +862,44 @@ impl PageMarkers {
     #[must_use]
     pub fn last_opened_in(self, state: &std::path::Path) -> Option<(String, u64)> {
         let text = std::fs::read_to_string(state.join(self.opened)).ok()?;
-        parse_opened(&text)
+        text.lines().filter_map(parse_opened).next_back()
+    }
+
+    /// The last time the TCC identity `key` names opened the page ([`same_identity`]): `(key,
+    /// unix seconds)` from the marker's line, the newest of any identity's, or else the
+    /// identities' file beside it; `None` when neither names it. The marker's line counts only
+    /// when that file does not hold the same opening (its step, [`same_step`], at the same
+    /// second): one written alone (an older aterm's, `aterm doctor`'s) names every identity its
+    /// words do not rule out, and a plain word ([`Self::note_opened_by`]) names one only through
+    /// the line beside it. A line that names each word `key` carries (this identity's own, as far
+    /// as `key` can tell) goes before a newer one that names fewer (a plain word, or one written
+    /// before the bundle id or Mac was read), which might be another identity's.
+    #[must_use]
+    pub fn opened_as(self, key: &str) -> Option<(String, u64)> {
+        self.opened_as_in(&aterm_types::dirs::state_dir()?, key)
+    }
+
+    /// [`Self::opened_as`] with `<state>` given; a file that cannot be read names nothing.
+    #[must_use]
+    pub fn opened_as_in(self, state: &std::path::Path, key: &str) -> Option<(String, u64)> {
+        let read = |name: &str| std::fs::read_to_string(state.join(name)).unwrap_or_default();
+        let by: Vec<(String, u64)> = read(&self.opened_by())
+            .lines()
+            .filter_map(parse_opened)
+            .collect();
+        let alone = written_alone(&read(self.opened), &by);
+        let named: Vec<&(String, u64)> = by
+            .iter()
+            .chain(&alone)
+            .filter(|(word, _)| same_identity(word, key))
+            .collect();
+        let words = |word: &str| word.split('@').count();
+        named
+            .iter()
+            .rfind(|(word, _)| words(word) >= words(key))
+            .or(named.last())
+            .copied()
+            .cloned()
     }
 
     /// How many seconds ago aterm opened the page, when that was under `window_s` ago.
@@ -877,6 +942,78 @@ impl PageMarkers {
     ) -> std::io::Result<()> {
         let _ = aterm_types::fs_restricted::create_dir_all_unshared(state, 0o755);
         write_marker(&state.join(self.opened), &format!("{version} {now}\n"))
+    }
+
+    /// Note that aterm opened the page now under `key`, beside the openings other TCC identities
+    /// wrote. The marker takes this opening alone, the one line every aterm reads (an older one
+    /// reads a longer marker as no opening at all); the file beside it, `<marker>-by`, keeps one
+    /// line per identity ([`same_identity`]: a bundle id and a Mac, where a network home or a dev
+    /// bundle shares `<state>`), newest last, at most [`OPENED_IDENTITIES`], the line the marker
+    /// held before among them when it was written alone, so an older aterm's opening and
+    /// `aterm doctor`'s are kept too ([`with_opening`]). The line `key`'s identity wrote before
+    /// gives way, and so does one written before the Mac was read that names it (every Mac of its
+    /// bundle id). A plain word (a window's before its bundle id was read, `aterm doctor`'s, an
+    /// older aterm's) names every identity: in the Developer Tools marker's file, which `aterm
+    /// doctor` writes beside, it gives way only to a key that is a plain word too, or to a newer
+    /// plain word; in the others the next note of any identity replaces it.
+    pub fn note_opened_beside(self, key: &str) {
+        self.note_opened_by(key, key);
+    }
+
+    /// [`Self::note_opened_beside`] with `<state>` and the clock (`now`, unix seconds) given.
+    ///
+    /// # Errors
+    /// As [`Self::note_opened_by_in`].
+    pub fn note_opened_beside_in(
+        self,
+        state: &std::path::Path,
+        key: &str,
+        now: u64,
+    ) -> std::io::Result<()> {
+        self.note_opened_by_in(state, key, key, now)
+    }
+
+    /// [`Self::note_opened_beside`] with the marker's line under `word` and `key`'s line beside it
+    /// in `<marker>-by`: the Developer Tools marker keeps a plain step, the one word `aterm
+    /// doctor` and an older aterm compare whole, and [`Self::opened_as`] reads the marker's line
+    /// as the opening beside it when that line's step ([`same_step`]) and second agree.
+    pub fn note_opened_by(self, word: &str, key: &str) {
+        let (Some(state), Some(now)) = (aterm_types::dirs::state_dir(), aterm_time::unix_secs())
+        else {
+            return;
+        };
+        let _ = self.note_opened_by_in(&state, word, key, now);
+    }
+
+    /// [`Self::note_opened_by`] with `<state>` and the clock (`now`, unix seconds) given: the
+    /// marker first, so it is never older than the identities' file, both stamped `now`; a file
+    /// that cannot be read counts as empty. The marker's line goes into the identities' file
+    /// only when it was written alone ([`written_alone`]): one written beside its identity's line
+    /// is that line's plain word.
+    ///
+    /// # Errors
+    /// As [`Self::note_opened_in`], for either file; when the marker's write fails the identities'
+    /// file is left as it was.
+    pub fn note_opened_by_in(
+        self,
+        state: &std::path::Path,
+        word: &str,
+        key: &str,
+        now: u64,
+    ) -> std::io::Result<()> {
+        let read = |name: &str| std::fs::read_to_string(state.join(name)).unwrap_or_default();
+        let by = self.opened_by();
+        let by_text = read(&by);
+        let by_lines: Vec<(String, u64)> = by_text.lines().filter_map(parse_opened).collect();
+        let alone: String = written_alone(&read(self.opened), &by_lines)
+            .iter()
+            .map(|(alone, at)| format!("{alone} {at}\n"))
+            .collect();
+        self.note_opened_in(state, word, now)?;
+        write_marker(
+            &state.join(by),
+            &with_opening(&format!("{by_text}\n{alone}"), key, now, self.doctor_writes),
+        )
     }
 
     /// Where aterm notes that the owner said Not now to the page's helper panel, or closed it
@@ -970,11 +1107,70 @@ fn write_marker_with(
     std::fs::rename(&staged, path)
 }
 
+/// How many TCC identities' openings `<marker>-by` keeps (`fda-pane-opened-by`,
+/// `devtools-pane-opened-by`: [`PageMarkers::note_opened_by`]).
+pub const OPENED_IDENTITIES: usize = 8;
+
+/// `text`'s opening lines with `key`'s opening at `now` last: the lines of other TCC identities
+/// kept in their order, a line met again dropped, the oldest given way past
+/// [`OPENED_IDENTITIES`], and unparsable lines dropped. A plain word (no bundle id: `aterm
+/// doctor`'s, an older aterm's, a window's before its bundle id was read) names every identity.
+/// Where `aterm doctor` writes (`doctor_writes`, the Developer Tools marker) no identity's
+/// opening can tell it was its own, so it gives way only to a key that is a plain word too, or to
+/// a later plain word in `text`; elsewhere `key`'s note replaces it, as it replaces any line of
+/// its identity. Pure.
+fn with_opening(text: &str, key: &str, now: u64, doctor_writes: bool) -> String {
+    let plain = |word: &str| !word.contains('@');
+    let mut lines: Vec<(String, u64)> = Vec::new();
+    for line in text.lines().filter_map(parse_opened).filter(|(word, _)| {
+        !same_identity(word, key) || (doctor_writes && plain(word) && !plain(key))
+    }) {
+        if plain(&line.0) {
+            lines.retain(|(word, _)| !plain(word));
+        }
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
+    }
+    lines.push((key.to_owned(), now));
+    let skip = lines.len().saturating_sub(OPENED_IDENTITIES);
+    lines
+        .into_iter()
+        .skip(skip)
+        .map(|(word, at)| format!("{word} {at}\n"))
+        .collect()
+}
+
+/// The lines of `marker`, a page's marker, that `by`, the identities' file beside it, does not
+/// hold the same opening of (its step, [`same_step`], at the same second): those written alone,
+/// by `aterm doctor`, an older aterm, or a window whose write of `by` failed. Pure.
+fn written_alone(marker: &str, by: &[(String, u64)]) -> Vec<(String, u64)> {
+    marker
+        .lines()
+        .filter_map(parse_opened)
+        .filter(|(word, at)| {
+            !by.iter()
+                .any(|(by_word, by_at)| by_at == at && same_step(word, by_word))
+        })
+        .collect()
+}
+
 /// The markers' key for an approved System State setup revision: `r<revision>`. A key that does
 /// not start with `r` and a digit is a version, written by `aterm doctor` or an older aterm.
 #[must_use]
 pub fn revision_key(revision: u64) -> String {
     format!("r{revision}")
+}
+
+/// The revision a [`revision_key`] names: `r` and digits only, so a version, a word with more
+/// after the digits, or a signed number names none. Pure.
+#[must_use]
+pub fn revision_of_key(key: &str) -> Option<u64> {
+    let digits = key.strip_prefix('r')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// Whether two marker keys name the same step: one's `@`-separated words begin the other's. The
@@ -985,6 +1181,18 @@ pub fn revision_key(revision: u64) -> String {
 pub fn same_step(a: &str, b: &str) -> bool {
     a.split('@')
         .zip(b.split('@'))
+        .all(|(left, right)| left == right)
+}
+
+/// Whether two marker keys name the same TCC identity: their words after the step (the bundle
+/// id, then the Mac) agree wherever both carry one, so a key written before the bundle id was
+/// read names every identity, and one written before the Mac was read every Mac of its bundle id.
+/// Pure.
+#[must_use]
+pub fn same_identity(a: &str, b: &str) -> bool {
+    a.split('@')
+        .skip(1)
+        .zip(b.split('@').skip(1))
         .all(|(left, right)| left == right)
 }
 
@@ -1767,6 +1975,8 @@ mod tests {
             DEVELOPER_TOOLS.declined,
             FULL_DISK_ACCESS.opened,
             FULL_DISK_ACCESS.declined,
+            ACCESSIBILITY.opened,
+            ACCESSIBILITY.declined,
         ];
         for (i, a) in names.iter().enumerate() {
             for b in &names[i + 1..] {
@@ -1925,6 +2135,313 @@ mod tests {
         });
         assert_eq!(failed.map_err(|e| e.raw_os_error()), Err(Some(5)));
         assert_eq!(text(FULL_DISK_ACCESS.opened), before.0, "a failed flush");
+    }
+
+    /// A revision's key reads back as its revision; a version, a key with more words, a signed
+    /// or overflowing number, and anything not `r` and digits read as none.
+    #[test]
+    fn a_revision_key_reads_back_and_nothing_else_does() {
+        for revision in [0, 7, u64::MAX] {
+            assert_eq!(revision_of_key(&revision_key(revision)), Some(revision));
+        }
+        for key in [
+            "",
+            "r",
+            "7",
+            "R7",
+            "r+7",
+            "r-7",
+            "r7@id",
+            "r7 ",
+            "0.104.0",
+            "r18446744073709551616",
+        ] {
+            assert_eq!(revision_of_key(key), None, "{key:?}");
+        }
+    }
+
+    /// Each TCC identity keeps its own opening beside the others' (a network home's Macs, a dev
+    /// bundle beside the release): a note replaces only its own identity's line, and one written
+    /// before its words were read; a reader takes the newest line of its identity, or of any;
+    /// the oldest identity gives way past the bound, and a file of one line reads as before. The
+    /// marker stays the one line an older aterm reads, and that aterm's own note is kept beside
+    /// the others once a newer one writes.
+    #[test]
+    fn each_identity_keeps_its_own_opening() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let state = dir.path();
+        let (a, b, dev) = (
+            "r7@com.aterm.aterm@A",
+            "r7@com.aterm.aterm@B",
+            "r7@com.aterm.aterm.dev@A",
+        );
+        FULL_DISK_ACCESS
+            .note_opened_beside_in(state, a, 1_000)
+            .expect("noted");
+        FULL_DISK_ACCESS
+            .note_opened_beside_in(state, b, 2_000)
+            .expect("noted");
+        FULL_DISK_ACCESS
+            .note_opened_beside_in(state, dev, 3_000)
+            .expect("noted");
+        assert_eq!(
+            FULL_DISK_ACCESS.opened_as_in(state, a),
+            Some((a.to_owned(), 1_000)),
+            "B's and the dev bundle's pages leave A's"
+        );
+        assert_eq!(
+            FULL_DISK_ACCESS.last_opened_in(state),
+            Some((dev.to_owned(), 3_000))
+        );
+        assert_eq!(
+            FULL_DISK_ACCESS.opened_as_in(state, "r7@com.aterm.aterm"),
+            Some((b.to_owned(), 2_000)),
+            "a key read before the Mac takes its bundle's newest line"
+        );
+        let read = |name: &str| std::fs::read_to_string(state.join(name)).expect("read");
+        assert_eq!(
+            parse_opened(&read(FULL_DISK_ACCESS.opened)),
+            Some((dev.to_owned(), 3_000)),
+            "the marker reads whole, as an older aterm reads it"
+        );
+        let older = "r7@com.aterm.aterm@D";
+        FULL_DISK_ACCESS
+            .note_opened_in(state, older, 3_500)
+            .expect("an older aterm's note");
+        assert_eq!(
+            FULL_DISK_ACCESS.opened_as_in(state, older),
+            Some((older.to_owned(), 3_500))
+        );
+        assert_eq!(
+            FULL_DISK_ACCESS.opened_as_in(state, a),
+            Some((a.to_owned(), 1_000)),
+            "an older aterm's note leaves the identities' lines"
+        );
+        FULL_DISK_ACCESS
+            .note_opened_beside_in(state, "r8@com.aterm.aterm@A", 4_000)
+            .expect("noted");
+        assert_eq!(
+            read(&FULL_DISK_ACCESS.opened_by()),
+            format!("{b} 2000\n{dev} 3000\n{older} 3500\nr8@com.aterm.aterm@A 4000\n"),
+            "A's own line gives way, and the older aterm's is kept"
+        );
+        assert_eq!(read(FULL_DISK_ACCESS.opened), "r8@com.aterm.aterm@A 4000\n");
+        assert_eq!(
+            FULL_DISK_ACCESS.opened_as_in(state, older),
+            Some((older.to_owned(), 3_500))
+        );
+        assert_eq!(
+            FULL_DISK_ACCESS.opened_as_in(state, "r8@com.aterm.aterm@C"),
+            None
+        );
+        FULL_DISK_ACCESS
+            .note_opened_beside_in(state, "r9", 5_000)
+            .expect("noted cold");
+        assert_eq!(
+            (
+                read(FULL_DISK_ACCESS.opened),
+                read(&FULL_DISK_ACCESS.opened_by())
+            ),
+            ("r9 5000\n".to_owned(), "r9 5000\n".to_owned()),
+            "a key written cold names every identity"
+        );
+        assert_eq!(
+            FULL_DISK_ACCESS.opened_as_in(state, a),
+            Some(("r9".to_owned(), 5_000)),
+            "and reads back for each"
+        );
+        let many = (0..20).fold(String::new(), |text, mac| {
+            with_opening(&text, &format!("r7@com.aterm.aterm@{mac}"), mac, false)
+        });
+        assert_eq!(many.lines().count(), OPENED_IDENTITIES);
+        assert!(many.ends_with("r7@com.aterm.aterm@19 19\n"));
+        assert!(!many.contains("@11 "), "the oldest gave way");
+        assert_eq!(
+            with_opening("junk\nr7@x@A 1\n", "r7@x@A", 2, false),
+            "r7@x@A 2\n"
+        );
+        assert_eq!(
+            with_opening("r7@x@B 1\nr7@x@B 1\n", "r7@x@A", 2, false),
+            "r7@x@B 1\nr7@x@A 2\n",
+            "a line met again is kept once"
+        );
+        for (a, b, want) in [
+            ("r7@x@A", "r8@x@A", true),
+            ("r7", "r8@x@A", true),
+            ("r7@x", "r7@x@A", true),
+            ("r7@x", "r7@y@A", false),
+            ("r7@x@A", "r7@x@B", false),
+            ("r7@x@A", "r7@y@A", false),
+        ] {
+            assert_eq!(same_identity(a, b), want, "{a} vs {b}");
+        }
+    }
+
+    /// The window's Developer Tools opening keeps the marker's one plain word, which `aterm
+    /// doctor` and an older aterm compare whole, and writes its TCC identity beside it: that word
+    /// then names only the identity beside it, so another Mac's page (a network home, a Mac set up
+    /// with Migration Assistant) is not this one's. A plain word written alone (doctor's, an older
+    /// aterm's, with no file beside it) names every identity, as before.
+    #[test]
+    fn a_plain_marker_names_only_the_identity_written_beside_it() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let state = dir.path();
+        let (a, b) = ("r7@com.aterm.aterm@A", "r7@com.aterm.aterm@B");
+        DEVELOPER_TOOLS
+            .note_opened_by_in(state, "r7", a, 1_000)
+            .expect("noted");
+        let read = |name: &str| std::fs::read_to_string(state.join(name)).expect("read");
+        assert_eq!(
+            (
+                read(DEVELOPER_TOOLS.opened),
+                read(&DEVELOPER_TOOLS.opened_by())
+            ),
+            ("r7 1000\n".to_owned(), format!("{a} 1000\n")),
+            "the marker keeps its one plain word"
+        );
+        assert_eq!(
+            DEVELOPER_TOOLS.opened_as_in(state, a),
+            Some((a.to_owned(), 1_000))
+        );
+        assert_eq!(
+            DEVELOPER_TOOLS.opened_as_in(state, b),
+            None,
+            "A's page is not B's"
+        );
+        assert_eq!(
+            DEVELOPER_TOOLS.opened_as_in(state, "r7@com.aterm.aterm"),
+            Some((a.to_owned(), 1_000)),
+            "a key read before the Mac takes its bundle's line"
+        );
+        DEVELOPER_TOOLS
+            .note_opened_in(state, "0.146.0", 1_500)
+            .expect("doctor's note");
+        assert_eq!(
+            DEVELOPER_TOOLS.opened_as_in(state, b),
+            Some(("0.146.0".to_owned(), 1_500)),
+            "a plain word written alone names every identity"
+        );
+        let older = aterm_tempfile::tempdir().expect("tempdir");
+        DEVELOPER_TOOLS
+            .note_opened_in(older.path(), "r7", 1_000)
+            .expect("an older aterm's note");
+        assert_eq!(
+            DEVELOPER_TOOLS.opened_as_in(older.path(), b),
+            Some(("r7".to_owned(), 1_000)),
+            "with no file beside it, as before"
+        );
+    }
+
+    /// A plain word written alone (`aterm doctor`'s, an older aterm's) names every identity
+    /// whatever windows write after it, so what a Mac reads does not hang on the order of the
+    /// writes: a window's opening keeps it in `devtools-pane-opened-by`, and so does the next
+    /// window's, while each window's own line still reads before it for that window; a newer
+    /// plain word takes its place. NEGATIVE CONTROL: the plain word a window writes beside its own
+    /// line is not kept as one, so it names only that line's identity.
+    #[test]
+    fn a_plain_word_written_alone_names_every_identity_whatever_writes_after_it() {
+        let (a, b, c) = (
+            "r7@com.aterm.aterm@A",
+            "r7@com.aterm.aterm@B",
+            "r7@com.aterm.aterm@C",
+        );
+        let doctor_first = aterm_tempfile::tempdir().expect("tempdir");
+        let first = doctor_first.path();
+        DEVELOPER_TOOLS
+            .note_opened_in(first, "0.146.0", 1_000)
+            .expect("doctor's note");
+        DEVELOPER_TOOLS
+            .note_opened_by_in(first, "r7", a, 2_000)
+            .expect("A's");
+        DEVELOPER_TOOLS
+            .note_opened_by_in(first, "r7", c, 3_000)
+            .expect("C's");
+        let doctor_between = aterm_tempfile::tempdir().expect("tempdir");
+        let between = doctor_between.path();
+        DEVELOPER_TOOLS
+            .note_opened_by_in(between, "r7", a, 1_000)
+            .expect("A's");
+        DEVELOPER_TOOLS
+            .note_opened_in(between, "0.146.0", 2_000)
+            .expect("doctor's note");
+        DEVELOPER_TOOLS
+            .note_opened_by_in(between, "r7", c, 3_000)
+            .expect("C's");
+        for (state, doctor_at, a_at) in [(first, 1_000, 2_000), (between, 2_000, 1_000)] {
+            assert_eq!(
+                DEVELOPER_TOOLS.opened_as_in(state, b),
+                Some(("0.146.0".to_owned(), doctor_at)),
+                "doctor's word names B after two windows wrote"
+            );
+            assert_eq!(
+                DEVELOPER_TOOLS.opened_as_in(state, a),
+                Some((a.to_owned(), a_at)),
+                "A's own line reads before the plain word"
+            );
+        }
+        let read = |name: &str| std::fs::read_to_string(first.join(name)).expect("read");
+        assert_eq!(
+            read(&DEVELOPER_TOOLS.opened_by()),
+            format!("0.146.0 1000\n{a} 2000\n{c} 3000\n"),
+            "the plain word A's window wrote beside its line is not kept"
+        );
+        DEVELOPER_TOOLS
+            .note_opened_in(first, "0.147.0", 4_000)
+            .expect("doctor's next note");
+        DEVELOPER_TOOLS
+            .note_opened_by_in(first, "r8", "r8@com.aterm.aterm@A", 5_000)
+            .expect("A's");
+        assert_eq!(
+            read(&DEVELOPER_TOOLS.opened_by()),
+            format!("{c} 3000\n0.147.0 4000\nr8@com.aterm.aterm@A 5000\n"),
+            "the newer plain word takes the older's place"
+        );
+    }
+
+    /// A Full Disk Access opening a window wrote before its bundle id was read (a plain key)
+    /// names every identity only until that identity's next note, which replaces it: another Mac
+    /// sharing `<state>` (a network home, a Mac set up with Migration Assistant) or a dev bundle
+    /// beside the release then reads no opening of its own, so its first walk still comes. The
+    /// cold line names every identity until then. NEGATIVE CONTROL: the Developer Tools marker,
+    /// which `aterm doctor` writes a plain word to, keeps that word whatever window writes after
+    /// it (`a_plain_word_written_alone_names_every_identity_whatever_writes_after_it`).
+    #[test]
+    fn a_full_disk_access_line_written_cold_gives_way_to_its_identitys_next_note() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let state = dir.path();
+        let (a, b, dev) = (
+            "r1@com.aterm.aterm@A",
+            "r1@com.aterm.aterm@B",
+            "r1@com.aterm.aterm.dev@A",
+        );
+        FULL_DISK_ACCESS
+            .note_opened_beside_in(state, "r1", 1_000)
+            .expect("noted cold");
+        assert_eq!(
+            FULL_DISK_ACCESS.opened_as_in(state, b),
+            Some(("r1".to_owned(), 1_000)),
+            "cold, it names every identity"
+        );
+        FULL_DISK_ACCESS
+            .note_opened_beside_in(state, a, 2_000)
+            .expect("noted warm");
+        let read = |name: &str| std::fs::read_to_string(state.join(name)).expect("read");
+        assert_eq!(
+            read(&FULL_DISK_ACCESS.opened_by()),
+            format!("{a} 2000\n"),
+            "the warm note replaces the cold line"
+        );
+        for other in [b, dev] {
+            assert_eq!(
+                FULL_DISK_ACCESS.opened_as_in(state, other),
+                None,
+                "{other} reads no opening of its own"
+            );
+        }
+        assert_eq!(
+            FULL_DISK_ACCESS.opened_as_in(state, a),
+            Some((a.to_owned(), 2_000))
+        );
     }
 
     /// The words every surface shares: the drag is never offered without the + route;

@@ -39,9 +39,15 @@ pub const fn light_spectrum_hue(hue: f32) -> f32 {
 #[must_use]
 #[inline]
 pub const fn rgb2hsv(rgb: u32) -> (f32, f32, f32) {
-    let r = ((rgb >> 16) & 0xff) as f32 / 255.0;
-    let g = ((rgb >> 8) & 0xff) as f32 / 255.0;
-    let b = (rgb & 0xff) as f32 / 255.0;
+    let r_b = (rgb >> 16) & 0xff;
+    let g_b = (rgb >> 8) & 0xff;
+    let b_b = rgb & 0xff;
+    if r_b == g_b && g_b == b_b {
+        return (0.0, 0.0, r_b as f32 / 255.0);
+    }
+    let r = r_b as f32 / 255.0;
+    let g = g_b as f32 / 255.0;
+    let b = b_b as f32 / 255.0;
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     let c = max - min;
@@ -62,9 +68,9 @@ pub const fn rgb2hsv(rgb: u32) -> (f32, f32, f32) {
 /// WCAG channel linearization times channel weight, per byte value.
 pub(crate) struct RelativeLuminanceTable {
     pub(crate) linear: [f32; 256],
-    red: [f32; 256],
-    green: [f32; 256],
-    blue: [f32; 256],
+    pub(crate) red: [f32; 256],
+    pub(crate) green: [f32; 256],
+    pub(crate) blue: [f32; 256],
 }
 
 #[inline]
@@ -421,32 +427,47 @@ pub const fn relative_luminance(rgb: u32) -> f32 {
     relative_luminance_with(relative_luminance_table(), rgb)
 }
 
+#[inline]
+#[must_use]
+pub(crate) const fn contrast_ratio_from_luminance(la: f32, lb: f32) -> f32 {
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
 /// WCAG contrast ratio (`>= 1`) between two `0x00RRGGBB` colours, on [`relative_luminance`].
 #[must_use]
 #[inline]
 pub const fn contrast_ratio(a: u32, b: u32) -> f32 {
     let table = relative_luminance_table();
-    let (la, lb) = (
+    contrast_ratio_from_luminance(
         relative_luminance_with(table, a),
         relative_luminance_with(table, b),
-    );
-    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    )
 }
 
 /// Floor `rgb`'s WCAG contrast against `ground` to at least `min` by moving its lightness alone.
 #[must_use]
 #[inline]
 pub const fn floor_contrast_keeping_hue(rgb: u32, ground: u32, min: f32) -> u32 {
+    let table = relative_luminance_table();
+    let lg = relative_luminance_with(table, ground);
+    floor_contrast_keeping_hue_with_ground_lum(table, rgb, lg, min)
+}
+
+#[must_use]
+#[inline]
+pub(crate) const fn floor_contrast_keeping_hue_with_ground_lum(
+    table: &RelativeLuminanceTable,
+    rgb: u32,
+    lg: f32,
+    min: f32,
+) -> u32 {
     let rgb = rgb & 0x00FF_FFFF;
     if min.is_nan() || min <= 1.0 {
         return rgb;
     }
-    let table = relative_luminance_table();
-    let lg = relative_luminance_with(table, ground);
     #[inline]
     const fn meets(table: &RelativeLuminanceTable, lg: f32, min: f32, c: u32) -> bool {
-        let lc = relative_luminance_with(table, c);
-        (lc.max(lg) + 0.05) / (lc.min(lg) + 0.05) >= min
+        contrast_ratio_from_luminance(relative_luminance_with(table, c), lg) >= min
     }
     if meets(table, lg, min, rgb) {
         return rgb;

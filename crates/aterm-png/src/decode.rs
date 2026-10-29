@@ -198,7 +198,7 @@ impl Reader {
             if &chunk.kind != b"IDAT" {
                 idat_run_ended = seen_idat;
             }
-            if chunk.data.is_empty() && !matches!(&chunk.kind, b"IDAT" | b"IEND") {
+            if chunk.data.is_empty() && (chunk.kind[0] & 0x20) != 0 {
                 continue;
             }
             match &chunk.kind {
@@ -211,7 +211,8 @@ impl Reader {
                         return Err(DecodingError::Malformed("duplicate PLTE"));
                     }
                     seen_plte = true;
-                    if chunk.data.len() % 3 != 0 || chunk.data.len() > 768 {
+                    if chunk.data.is_empty() || chunk.data.len() % 3 != 0 || chunk.data.len() > 768
+                    {
                         return Err(DecodingError::Malformed("PLTE is not 1..=256 RGB triples"));
                     }
                     info.palette = Some(chunk.data.to_vec());
@@ -252,6 +253,9 @@ impl Reader {
                     });
                 }
                 b"sRGB" => {
+                    if chunk.data.len() != 1 {
+                        return Err(DecodingError::Malformed("sRGB length is not 1"));
+                    }
                     let intent = chunk
                         .data
                         .first()
@@ -268,6 +272,9 @@ impl Reader {
                     compressed.extend_from_slice(chunk.data);
                 }
                 b"IEND" => {
+                    if !chunk.data.is_empty() {
+                        return Err(DecodingError::Malformed("non-empty IEND"));
+                    }
                     seen_iend = true;
                     break;
                 }

@@ -449,3 +449,46 @@ fn a_timed_out_wait_parks_on_the_backoff_then_the_wedge() {
         "a wedge that retries is routine, not a badge"
     );
 }
+
+/// The lanes' pass is told its stderr is aterm.log's ([`atpkg::notice::STDERR_IS_HOST_LOG_ENV`]):
+/// [`super::report_pass_verdict`] and the lane's own lines copy that stderr into the log, so the
+/// pass's notices print the log's form, an aterm.toml value by its length and a line that did not
+/// parse by its position (DESIGN §3.6).
+#[cfg(unix)]
+#[test]
+fn a_lanes_pass_is_told_its_stderr_is_the_logs() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-gui-pass-stderr-")
+        .tempdir()
+        .unwrap();
+    let stub = dir.path().join("atpkg-fake");
+    std::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\necho \"atpkg: copied=${{{}:-unset}}\" >&2\n",
+            atpkg::notice::STDERR_IS_HOST_LOG_ENV
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    aterm_uds::deadline::output_until(
+        &mut crate::qos::atpkg_command(&stub),
+        std::time::Instant::now() + aterm_spec::wait::FIRST_EXEC,
+    )
+    .unwrap_or_else(|e| panic!("the stub's first exec within its hang detector: {e}"));
+    let run = super::run_atpkg_pass(
+        Vec::new(),
+        crate::qos::atpkg_command(&stub),
+        None,
+        None,
+        false,
+        &|_: crate::Wake| {},
+    )
+    .expect("the stub runs");
+    assert_eq!(
+        run.why(),
+        "atpkg: copied=1",
+        "the pass whose stderr reaches aterm.log is told so"
+    );
+}

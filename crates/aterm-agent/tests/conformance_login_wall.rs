@@ -816,6 +816,7 @@ fn real_renewal_is_clean() -> bool {
         codex_thread: None,
         agy_conversation: None,
         codex_home: None,
+        codex_login: None,
         now: 1_790_600_000,
         sid: String::new(),
         sock: None,

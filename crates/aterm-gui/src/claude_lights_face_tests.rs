@@ -74,7 +74,7 @@ struct Row {
 
 fn rows() -> Vec<Row> {
     use crate::autopilot::mode_words;
-    use ChipTone::{Accent, Amber, Dim};
+    use ChipTone::{Accent, Amber, Dim, Off};
     use aterm_agent::supervise::Autopilot;
     let timed = crate::autopilot::TIMED_CRUISE_CHIP;
     let landed = aterm_agent::supervise::mode_words::LANDED_WORDS;
@@ -244,7 +244,7 @@ fn rows() -> Vec<Row> {
             ChipFace::Off,
             "\u{25cb} off",
             "\u{25cb}",
-            (Dim, Dim),
+            (Off, Off),
             &format!("autopilot: off \u{2014} {off} \u{b7} click: cruise \u{b7} right-click: more"),
             "autopilot: off",
             "Autopilot: off.",
@@ -255,7 +255,7 @@ fn rows() -> Vec<Row> {
             ChipFace::MasterOff,
             "\u{2298} off",
             "\u{2298}",
-            (Dim, Dim),
+            (Off, Off),
             "harness off in Settings \u{b7} click: turn the harness on \u{b7} right-click: more",
             "harness off in Settings",
             "Autopilot: off. The harness is off in Settings.",
@@ -266,7 +266,7 @@ fn rows() -> Vec<Row> {
             ChipFace::AgentOff(aterm_phase::Program::Claude),
             "\u{2298} off",
             "\u{2298}",
-            (Dim, Dim),
+            (Off, Off),
             "Supervise Claude Code sessions is off \u{b7} click: turn the harness on \u{b7} \
              right-click: more",
             "Supervise Claude Code sessions is off",
@@ -278,7 +278,7 @@ fn rows() -> Vec<Row> {
             ChipFace::Unhosted,
             "\u{2298} off",
             "\u{2298}",
-            (Dim, Dim),
+            (Off, Off),
             "no harness: this aterm has no control socket \u{b7} click: open Settings \u{25b8} \
              Harness \u{b7} right-click: more",
             "no harness: this aterm has no control socket",
@@ -292,6 +292,7 @@ fn ink(tone: ChipTone) -> [u8; 3] {
         ChipTone::Accent => ACCENT,
         ChipTone::Amber => AMBER,
         ChipTone::Dim => dim_of(blank()),
+        ChipTone::Off => off_of(blank()),
     }
 }
 
@@ -798,17 +799,17 @@ fn each_spoken_label_holds_no_glyph() {
     }
     for act in Act::ALL {
         for day in [None, Some(Weekday::Thu)] {
-            let said = spoken_last(act, clock(14, 5), day);
+            let said = spoken_last(None, act, clock(14, 5), day);
             assert!(words(&said), "{said}");
             assert!(said.ends_with(" at 14:05."), "{said}");
         }
     }
     assert_eq!(
-        spoken_last(Act::Approved, clock(14, 5), None),
+        spoken_last(None, Act::Approved, clock(14, 5), None),
         "Last: approved at 14:05."
     );
     assert_eq!(
-        spoken_last(Act::Approved, clock(23, 58), Some(Weekday::Thu)),
+        spoken_last(None, Act::Approved, clock(23, 58), Some(Weekday::Thu)),
         "Last: approved on Thursday at 23:58."
     );
     let unplaced = ChipGlass {
@@ -1075,6 +1076,7 @@ fn the_autopilot_terms_bit_table_round_trips() {
                             other_day,
                         }),
                         last: Some((Act::Approved, stamp(14, 5))),
+                        last_by: None,
                         trail,
                         pause: None,
                     };
@@ -1655,12 +1657,16 @@ fn the_dim_faces_and_the_rows_ink_read_on_every_ground() {
                 let block = Block::of_autopilot(view, blank, accent);
                 for c in block.lights.iter().filter(|c| c.ch != ' ') {
                     let k = reads(c.fg, blank.bg);
+                    // Quiet, never faint: as words read, and quieter than the row's ink, as
+                    // loud only on a tab whose own ink reads under the floor, which leaves no
+                    // room above it.
+                    let room = reads(blank.fg, blank.bg) >= NAME_CONTRAST;
                     assert!(
-                        k >= ICON_CONTRAST && k < ink_k,
+                        k >= NAME_CONTRAST && (k < ink_k || (!room && k <= ink_k)),
                         "{tab}, {view:?}: {:?} at {k:.2}:1, the row's ink at {ink_k:.2}:1",
                         c.ch
                     );
-                    if reads(old, blank.bg) >= ICON_CONTRAST {
+                    if reads(old, blank.bg) >= NAME_CONTRAST {
                         assert_eq!(c.fg, old, "{tab}, {view:?}: halfway that reads is kept");
                         kept += 1;
                     }

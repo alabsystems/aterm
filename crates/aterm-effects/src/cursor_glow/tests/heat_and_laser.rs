@@ -600,6 +600,204 @@ fn a_crackle_keeps_the_letter_it_crosses_readable() {
     );
 }
 
+/// A crackle fades whole (looks10 L8, round 2): late in its life the light
+/// left of a crackle runs from its root to well past its half (its tip
+/// trails off), dimmer, or nothing of it shows; no stub of it stands apart
+/// in the air. Negative controls: burnt back from its tip into its root
+/// (`crackle_burns_back`, as round 1 burnt it), what is left is a dash at
+/// its root, short of its half; burnt from its root out
+/// (`crackle_burns_outward`, as a strike burns), its tip alone, past its
+/// near quarter.
+#[test]
+fn a_crackle_fades_whole() {
+    let g = geom();
+    let c = cfg(GlowStyle::Laser, true);
+    let (root, tip) = ((20.0f32, 40.0f32), (172.0f32, 40.0f32));
+    let mid = (0.5 * (root.0 + tip.0), root.1);
+    // (nearest lit x to the root, farthest lit x from it) at `at` ms of its
+    // 200 ms life, or none when nothing of it shows
+    let left = |back: bool, outward: bool, at: u64| -> Option<(i32, i32)> {
+        let born = Instant::now();
+        let glow = CursorGlow {
+            crackle_burns_back: back,
+            crackle_burns_outward: outward,
+            bolts: vec![Bolt {
+                pts: BoltPts::from_3(root, mid, tip),
+                born,
+                life: 0.2,
+                branch: true,
+                crackle: true,
+            }],
+            ..CursorGlow::default()
+        };
+        let (mut quads, mut verts) = (Vec::new(), Vec::new());
+        glow.emit_bolts(
+            born + Duration::from_millis(at),
+            &c,
+            g,
+            &mut crate::cursor_glow::glow_sink(
+                &mut quads,
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
+            &mut verts,
+            &mut Vec::new(),
+        );
+        let mut glass = Glass::new(g, c.theme_bg);
+        glass.add_quads(&quads);
+        let lit: Vec<i32> = (0..glass.w)
+            .filter(|&x| {
+                (30..51).any(|y| {
+                    let px = glass.px[y * glass.w + x];
+                    let ch = |s: u32| ((px >> s) & 0xff) as i32 - ((c.theme_bg >> s) & 0xff) as i32;
+                    ch(16).abs().max(ch(8).abs()).max(ch(0).abs()) > 24
+                })
+            })
+            .map(|x| x as i32)
+            .collect();
+        Some((*lit.first()?, *lit.last()?))
+    };
+    // Its three knots' light is laid between them, so its tip trails off
+    // over its far half.
+    let (near_q, half, far_q) = (
+        (root.0 + 0.25 * (tip.0 - root.0)) as i32,
+        (root.0 + 0.5 * (tip.0 - root.0)) as i32,
+        (root.0 + 0.6 * (tip.0 - root.0)) as i32,
+    );
+    let mut shown = 0;
+    for at in [150u64, 170, 190] {
+        if let Some((near, far)) = left(false, false, at) {
+            shown += 1;
+            assert!(
+                near <= root.0 as i32 + 4 && far >= far_q,
+                "at {at} ms what is left of it runs {near}..{far}, not from its root {} past {far_q}",
+                root.0
+            );
+        }
+    }
+    assert!(
+        shown > 0,
+        "fixture: the old crackle shows at none of the late frames"
+    );
+    let (_, far) = left(true, false, 150).expect("control: burnt back, its root still shows");
+    assert!(
+        far < half,
+        "control: burnt back, what is left reaches {far}, past its half {half}"
+    );
+    let (near, _) = left(false, true, 150).expect("control: burnt outward, its tip still shows");
+    assert!(
+        near > near_q,
+        "control: burnt outward, what is left starts at {near}, inside its near quarter {near_q}"
+    );
+}
+
+/// A crackle kinks as a strike does (looks9's final look, looks10): every
+/// crackle a key may forge, from its shortest to its longest, from twenty
+/// seeds, runs in straight spans of at most three quarters of a cell, as
+/// lightning does. Negative control: forged in two rounds whatever its
+/// length (`crackle_two_rounds`, as it was), a long crackle is four spans of
+/// more than a cell each, the bent wire Solarized Dark's `burst.t0` showed
+/// in the air above the line.
+#[test]
+fn a_crackle_kinks_as_a_strike_does() {
+    let g = geom();
+    let cell = g.ch as f32;
+    let longest_span = |two_rounds: bool| -> f32 {
+        let mut worst = 0.0f32;
+        for seed in 0..20u32 {
+            for len_ch in [1.6f32, 2.4, 3.2, 4.4] {
+                let mut glow = CursorGlow {
+                    crackle_two_rounds: two_rounds,
+                    ..CursorGlow::default()
+                };
+                for _ in 0..seed {
+                    let _ = glow.frand();
+                }
+                let from = (200.0f32, 120.0f32);
+                let a = 0.3 * seed as f32;
+                let to = (
+                    from.0 + a.cos() * len_ch * cell,
+                    from.1 + a.sin() * len_ch * cell,
+                );
+                glow.spawn_bolt(from, to, cell, false, Instant::now());
+                let bolt = glow.bolts.last().expect("a crackle is forged");
+                assert!(bolt.crackle, "a small bolt is a crackle");
+                let pts = bolt.pts.as_slice();
+                for w in pts.windows(2) {
+                    let span = crate::color_math::hypot_f32(w[1].0 - w[0].0, w[1].1 - w[0].1);
+                    worst = worst.max(span / cell);
+                }
+            }
+        }
+        worst
+    };
+    let kinked = longest_span(false);
+    assert!(
+        kinked <= 0.75,
+        "a crackle runs a straight span of {kinked:.2} cells"
+    );
+    let wire = longest_span(true);
+    assert!(
+        wire > 1.0,
+        "control: in two rounds the longest span is only {wire:.2} cells"
+    );
+}
+
+/// A crackle zigzags (looks10 round 2's L8): every crackle a key may forge,
+/// from its shortest to its longest, from twenty seeds at as many angles,
+/// turns by at least fifteen degrees at every knot, so no stretch of it reads
+/// as a smooth arc. Negative control: its knots kicked by any amount either
+/// way, the kick halving each round (`crackle_smooth_kicks`, as they were),
+/// some knot bends by under five degrees, the bent-wire scratch Default
+/// Light's `burst.t0` showed over `flies`.
+#[test]
+fn a_crackle_zigzags_at_every_knot() {
+    let g = geom();
+    let cell = g.ch as f32;
+    let least_turn = |smooth: bool| -> f32 {
+        let mut least = f32::MAX;
+        for seed in 0..20u32 {
+            for len_ch in [1.6f32, 2.4, 3.2, 4.4] {
+                let mut glow = CursorGlow {
+                    crackle_smooth_kicks: smooth,
+                    ..CursorGlow::default()
+                };
+                for _ in 0..seed {
+                    let _ = glow.frand();
+                }
+                let from = (200.0f32, 120.0f32);
+                let a = 0.3 * seed as f32;
+                let to = (
+                    from.0 + a.cos() * len_ch * cell,
+                    from.1 + a.sin() * len_ch * cell,
+                );
+                glow.spawn_bolt(from, to, cell, false, Instant::now());
+                let bolt = glow.bolts.last().expect("a crackle is forged");
+                assert!(bolt.crackle, "a small bolt is a crackle");
+                for w in bolt.pts.as_slice().windows(3) {
+                    let (u, v) = (
+                        (w[1].0 - w[0].0, w[1].1 - w[0].1),
+                        (w[2].0 - w[1].0, w[2].1 - w[1].1),
+                    );
+                    let turn = (u.0 * v.1 - u.1 * v.0).abs().atan2(u.0 * v.0 + u.1 * v.1);
+                    least = least.min(turn.to_degrees());
+                }
+            }
+        }
+        least
+    };
+    let zigzag = least_turn(false);
+    assert!(
+        zigzag >= 15.0,
+        "a crackle's knot bends by only {zigzag:.1} degrees"
+    );
+    let wire = least_turn(true);
+    assert!(
+        wire < 5.0,
+        "control: kicked any amount, its least bend is {wire:.1} degrees"
+    );
+}
+
 /// The typing streak on a dark ground through the frames a 120 Hz display
 /// shows: forty keys along one row at seventeen a second, then the fade.
 fn typing_streak_flashes(style: GlowStyle, chords: bool, text: bool, knobs: (u64, usize)) -> usize {
@@ -807,5 +1005,400 @@ fn a_jump_strike_holds_its_light_over_the_text_it_crosses() {
     assert!(
         bare_white,
         "control: the unbudgeted strike's white core never crosses the letters"
+    );
+}
+
+/// looks10 round 2's L8: a crackle springs from its typed row's edge into a
+/// blank row beside it, its every kink in that air, so no part of it lies
+/// among the letters where the guard hid its root and left a lone violet
+/// dash apart from the line (Solarized's and the dark page's `burst.t0`).
+/// With the row above lettered it leaves by the row's foot; with both rows
+/// beside it lettered none is forged. Negative control: rooted at its typed
+/// cell's centre at any angle (`crackle_rooted_in_letters`, as it was), its
+/// root and kinks lie on the letters.
+#[test]
+fn a_crackle_springs_from_its_row_s_edge_into_the_air() {
+    use aterm_core::terminal::RenderCell;
+    let g = tall_geom();
+    let ch = g.ch as f32;
+    let c = cfg(GlowStyle::Laser, true);
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    // (crackles forged, their points on rows 1 or 2, the least y of a point)
+    let forge = |rooted: bool, below_lettered: bool| -> (usize, usize, f32) {
+        let mut cells = vec![vec![RenderCell::default(); g.cols]; g.rows];
+        for cell in cells.iter_mut().flatten() {
+            (cell.fg, cell.bg) = (rgb(c.theme_fg), rgb(c.theme_bg));
+        }
+        let lettered: &[usize] = if below_lettered { &[1, 3] } else { &[1] };
+        for &row in lettered {
+            for cell in cells[row].iter_mut().take(40) {
+                cell.ch = 'm';
+            }
+        }
+        let mut glow = CursorGlow {
+            crackle_rooted_in_letters: rooted,
+            ..CursorGlow::default()
+        };
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        let (mut forged, mut on_letters, mut least_y) = (0usize, 0usize, f32::INFINITY);
+        let mut seen = Vec::new();
+        for i in 0..80u16 {
+            let t = t0 + Duration::from_millis(45 * u64::from(i));
+            let col = 2 + i % 36;
+            for cell in cells[2].iter_mut().take(usize::from(col)) {
+                cell.ch = 'm';
+            }
+            let line: Vec<char> = cells[2].iter().map(|c| c.ch).collect();
+            glow.note_synthetic_typed(t, 1);
+            glow.observe_row(2, col, &line, t);
+            glow.observe_frame_text(Some((2, col)), &cells, t);
+            glow.tick(Some((2, col)), t, &c, g, &mut out);
+            for b in glow.bolts.iter().filter(|b| b.crackle) {
+                let key = (b.born, b.pts.as_slice()[0].0.to_bits());
+                if seen.contains(&key) {
+                    continue;
+                }
+                seen.push(key);
+                forged += 1;
+                for &(_, y) in b.pts.as_slice() {
+                    least_y = least_y.min(y);
+                    if y < 3.0 * ch && y >= ch {
+                        on_letters += 1;
+                    }
+                }
+            }
+        }
+        (forged, on_letters, least_y)
+    };
+    let (forged, on_letters, least_y) = forge(false, false);
+    assert!(forged >= 3, "fixture: only {forged} crackles forged");
+    assert_eq!(on_letters, 0, "crackle points lie on rows 1-2");
+    assert!(
+        least_y >= 3.0 * ch - 0.01,
+        "a crackle reaches up to y {least_y} from the row's foot {}",
+        3.0 * ch
+    );
+    let (walled, _, _) = forge(false, true);
+    assert_eq!(
+        walled, 0,
+        "with no blank row beside it no crackle is forged"
+    );
+    let (rooted, rooted_on, _) = forge(true, false);
+    assert!(
+        rooted >= 3,
+        "control fixture: only {rooted} crackles forged"
+    );
+    assert!(
+        rooted_on > 0,
+        "control: rooted at their cells' centres the crackles lie on the letters"
+    );
+}
+
+/// The pieces of a Laser strike forged from the gallery's `enter-bottom`
+/// Return (the echo's end to the new prompt, over the echo and its output)
+/// that read alone, one count per seed. A piece is a run of pixels in the air
+/// (off every line of text) the strike lights at all; it reads alone when it
+/// touches neither caret's cell and a quarter or more of it is brighter than
+/// half again the strike's light held over the letters (faint there, and on a
+/// dim page cut by the guard to the letter's own share).
+fn strike_pieces_apart(pair: (u32, u32), seams: impl Fn(&mut CursorGlow)) -> Vec<usize> {
+    use aterm_core::terminal::RenderCell;
+    let g = tall_geom();
+    let (cw, ch) = (g.cw, g.ch);
+    let mut c = cfg(GlowStyle::Laser, true);
+    c.intensity = 1.0;
+    (c.theme_fg, c.theme_bg) = pair;
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let lines = [
+        "37",
+        "38",
+        "39",
+        "40",
+        "$ echo the quick brown fox",
+        "the quick brown fox",
+        "$",
+    ];
+    let mut cells = vec![vec![RenderCell::default(); g.cols]; g.rows];
+    for cell in cells.iter_mut().flatten() {
+        (cell.fg, cell.bg) = (rgb(pair.0), rgb(pair.1));
+    }
+    for (row, text) in lines.iter().enumerate() {
+        for (col, letter) in text.chars().enumerate() {
+            cells[row][col].ch = letter;
+        }
+    }
+    let lettered = |x: usize, y: usize| {
+        let (row, col) = (y / ch, x / cw);
+        lines.get(row).is_some_and(|l| col < l.len())
+    };
+    let (from, to) = ((4u16, 26u16), (6u16, 2u16));
+    let ends = [from, to];
+    let in_end = |x: usize, y: usize| {
+        ends.iter().any(|&(r, col)| {
+            let (r, col) = (usize::from(r), usize::from(col));
+            x + 2 >= col * cw && x < (col + 1) * cw + 2 && y + 2 >= r * ch && y < (r + 1) * ch + 2
+        })
+    };
+    let diff = |px: u32| {
+        [16u32, 8, 0]
+            .iter()
+            .map(|&s| (((px >> s) & 0xff) as i32 - ((pair.1 >> s) & 0xff) as i32).abs())
+            .max()
+            .unwrap_or(0)
+    };
+    let draw = |glow: &CursorGlow, now: Instant| {
+        let mut quads = Vec::new();
+        glow.emit_bolts(
+            now,
+            &c,
+            g,
+            &mut crate::cursor_glow::glow_sink(
+                &mut quads,
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        let mut glass = Glass::new(g, pair.1);
+        glass.add_quads(&quads);
+        glass
+    };
+    // The strike's light held over the letters: a channel laid along the
+    // echo's middle, all of it over them.
+    let held = {
+        let now = Instant::now();
+        let mut glow = CursorGlow {
+            last: Some(from),
+            ..CursorGlow::default()
+        };
+        glow.observe_frame_text(Some(to), &cells, now);
+        let (a, b) = (g.cell_center(4, 3), g.cell_center(4, 22));
+        glow.bolts.push(Bolt {
+            pts: BoltPts::from_3(a, (0.5 * (a.0 + b.0), a.1), b),
+            born: now,
+            life: 0.1,
+            branch: false,
+            crackle: false,
+        });
+        draw(&glow, now)
+            .px
+            .iter()
+            .map(|&p| diff(p))
+            .max()
+            .unwrap_or(0)
+    };
+    assert!(
+        held > 8,
+        "fixture: the strike lays {held} levels over the letters"
+    );
+    let now = Instant::now();
+    let mut apart = Vec::new();
+    for seed in 0..300u32 {
+        let mut glow = CursorGlow::default();
+        seams(&mut glow);
+        glow.last = Some(from);
+        glow.observe_frame_text(Some(to), &cells, now);
+        glow.rng = seed.wrapping_mul(2_654_435_761) | 1;
+        glow.spawn_bolt(
+            g.cell_center(from.0, from.1),
+            g.cell_center(to.0, to.1),
+            ch as f32,
+            true,
+            now,
+        );
+        glow.keep_strike_in_grid(g, pair.1, (from.0, to.0), now);
+        let glass = draw(&glow, now);
+        let bar = held * 3 / 2;
+        let level: Vec<i32> = (0..glass.h)
+            .flat_map(|y| (0..glass.w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                if lettered(x, y) {
+                    0
+                } else {
+                    diff(glass.px[y * glass.w + x])
+                }
+            })
+            .collect();
+        let mut seen = vec![false; level.len()];
+        let mut lone = 0usize;
+        for start in 0..level.len() {
+            if level[start] <= 24 || seen[start] {
+                continue;
+            }
+            seen[start] = true;
+            let (mut stack, mut anchored, mut bright, mut px) =
+                (vec![start], false, 0usize, 0usize);
+            while let Some(i) = stack.pop() {
+                let (x, y) = (i % glass.w, i / glass.w);
+                px += 1;
+                anchored |= in_end(x, y);
+                bright += usize::from(level[i] > bar);
+                for (dx, dy) in [
+                    (-1i32, -1i32),
+                    (0, -1),
+                    (1, -1),
+                    (-1, 0),
+                    (1, 0),
+                    (-1, 1),
+                    (0, 1),
+                    (1, 1),
+                ] {
+                    let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                    if nx < 0 || ny < 0 || nx as usize >= glass.w || ny as usize >= glass.h {
+                        continue;
+                    }
+                    let j = ny as usize * glass.w + nx as usize;
+                    if level[j] > 24 && !seen[j] {
+                        seen[j] = true;
+                        stack.push(j);
+                    }
+                }
+            }
+            lone += usize::from(!anchored && bright >= 3 && bright * 4 >= px);
+        }
+        apart.push(lone);
+    }
+    apart
+}
+
+/// looks10 round 3: A STRIKE SHOWS NO PIECE APART FROM ITS CARETS. On the
+/// gallery's `enter-bottom` the Return's strike runs from the echo's end down
+/// over its output to the new prompt; a fork forged before the output had
+/// printed sprang from the channel down across `brown`, and the guard, which
+/// on Solarized Dark leaves a letter its own reading, cut its run over the
+/// letters and left its tip a lone violet tick in the prompt's row, 32 px
+/// past the bolt (8 of 8 captures); the channel's jag swung up into the blank
+/// rows over the echo and back, and the stretch between stood apart too.
+/// Forged from 300 seeds over that page, on Solarized Dark and the dark page,
+/// no strike leaves a piece in the air that reads alone
+/// ([`strike_pieces_apart`]; 0 of 300 on each). Negative controls: forks
+/// drawn over the letters too (`strike_forks_on_letters`; 221 and 189 of 300)
+/// and the channel's stretches between two runs over the letters lit whole
+/// (`strike_islands_lit`; 140 and 140) each leave one in a tenth of the
+/// strikes or more.
+#[test]
+fn a_strike_shows_no_piece_apart_from_its_carets() {
+    const SOLARIZED: (u32, u32) = (0x0083_9496, 0x0000_2B36);
+    const DARK: (u32, u32) = (0x00D0_D0D0, 0x0011_1318);
+    let count = |v: &[usize]| v.iter().filter(|&&n| n > 0).count();
+    for (pair, name) in [(SOLARIZED, "Solarized Dark"), (DARK, "dark")] {
+        let kept = count(&strike_pieces_apart(pair, |_| {}));
+        assert_eq!(
+            kept, 0,
+            "{name}: {kept} of 300 strikes leave a piece apart from both carets"
+        );
+        let forks = count(&strike_pieces_apart(pair, |g| {
+            g.strike_forks_on_letters = true
+        }));
+        assert!(
+            forks >= 30,
+            "{name} control: forks over the letters leave pieces apart in only {forks} of 300 strikes"
+        );
+        let islands = count(&strike_pieces_apart(pair, |g| g.strike_islands_lit = true));
+        assert!(
+            islands >= 30,
+            "{name} control: the channel's stretches lit whole leave pieces apart in only {islands} of 300 strikes"
+        );
+    }
+}
+
+/// looks10 round 3, after main's card edge law (the settings card's
+/// `no_light_stands_cut_at_the_cards_edge`): A STRIKE'S CORONA KEEPS INSIDE
+/// ITS GRID. The Return's strike in the settings card's four rows runs from
+/// the end of `git commit` on the top row down to the new prompt on the
+/// third. Its channel was kept inside the grid by a fork's girth, but its
+/// corona is twice a fork's, and where its jag swung into the blank last row
+/// the corona stood cut at the grid's bottom edge (3 px of lavender along
+/// the card's last pixel row, dark and light). Forged from 300 seeds in that
+/// card's grid on the dark page, no strike lights the grid's last pixel row
+/// or a side column. Negative control `strike_channel_fork_girth` (the
+/// channel kept in by a fork's girth): a strike in 10 or more of 300 does.
+#[test]
+fn a_strike_s_corona_keeps_inside_its_grid() {
+    use aterm_core::terminal::RenderCell;
+    let g = Geom {
+        cw: 8,
+        ch: 16,
+        rows: 4,
+        cols: 48,
+        origin_x: 0,
+        origin_y: 0,
+        win_w: 384,
+        win_h: 64,
+        head: 0,
+    };
+    let (fg, page) = (0x00D0_D0D0_u32, 0x0011_1318_u32);
+    let mut c = cfg(GlowStyle::Laser, true);
+    c.intensity = 1.0;
+    (c.theme_fg, c.theme_bg) = (fg, page);
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let lines = [
+        "~/demo $ git add README.md && git commit",
+        "[main 4f2c9e1] ship it",
+        "~/demo $",
+    ];
+    let mut cells = vec![vec![RenderCell::default(); g.cols]; g.rows];
+    for cell in cells.iter_mut().flatten() {
+        (cell.fg, cell.bg) = (rgb(fg), rgb(page));
+    }
+    for (row, text) in lines.iter().enumerate() {
+        for (col, letter) in text.chars().enumerate() {
+            cells[row][col].ch = letter;
+        }
+    }
+    let (from, to) = ((0u16, 40u16), (2u16, 9u16));
+    let lit = |px: u32| {
+        [16u32, 8, 0]
+            .iter()
+            .any(|&s| (((px >> s) & 0xff) as i32 - ((page >> s) & 0xff) as i32).abs() > 12)
+    };
+    let now = Instant::now();
+    let cut = |seams: &dyn Fn(&mut CursorGlow)| {
+        (0..300u32)
+            .filter(|&seed| {
+                let mut glow = CursorGlow::default();
+                seams(&mut glow);
+                glow.last = Some(from);
+                glow.observe_frame_text(Some(to), &cells, now);
+                glow.rng = seed.wrapping_mul(2_654_435_761) | 1;
+                glow.spawn_bolt(
+                    g.cell_center(from.0, from.1),
+                    g.cell_center(to.0, to.1),
+                    g.ch as f32,
+                    true,
+                    now,
+                );
+                glow.keep_strike_in_grid(g, page, (from.0, to.0), now);
+                let mut quads = Vec::new();
+                glow.emit_bolts(
+                    now,
+                    &c,
+                    g,
+                    &mut crate::cursor_glow::glow_sink(
+                        &mut quads,
+                        &mut aterm_render::GlowRamps::default(),
+                        true,
+                    ),
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                );
+                let mut glass = Glass::new(g, page);
+                glass.add_quads(&quads);
+                let (w, h) = (glass.w, glass.h);
+                (0..w)
+                    .map(|x| (x, h - 1))
+                    .chain((0..h).flat_map(|y| [(0, y), (w - 1, y)]))
+                    .any(|(x, y)| lit(glass.px[y * w + x]))
+            })
+            .count()
+    };
+    let kept = cut(&|_| {});
+    assert_eq!(kept, 0, "{kept} of 300 strikes light the grid's edge");
+    let control = cut(&|glow| glow.strike_channel_fork_girth = true);
+    assert!(
+        control >= 10,
+        "control: kept in by a fork's girth, only {control} of 300 strikes light the grid's edge"
     );
 }

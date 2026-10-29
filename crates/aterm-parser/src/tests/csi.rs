@@ -166,6 +166,44 @@ fn assert_whole_read_matches_per_byte(input: &[u8]) {
         sink_per_byte.apc_ends, sink_fast.apc_ends,
         "APC end mismatch"
     );
+    parser_per_byte.assert_invariants();
+    parser_fast.assert_invariants();
+    assert_eq!(
+        (
+            parser_per_byte.state,
+            parser_per_byte.params.as_slice(),
+            parser_per_byte.intermediates.as_slice(),
+            parser_per_byte.subparam_mask,
+            parser_per_byte.current_param,
+            parser_per_byte.param_started,
+            parser_per_byte.last_was_colon,
+        ),
+        (
+            parser_fast.state,
+            parser_fast.params.as_slice(),
+            parser_fast.intermediates.as_slice(),
+            parser_fast.subparam_mask,
+            parser_fast.current_param,
+            parser_fast.param_started,
+            parser_fast.last_was_colon,
+        ),
+        "parser CSI scratch state mismatch between per-byte and whole-slice reads"
+    );
+}
+
+#[test]
+fn csi_fast_path_clears_aborted_param_scratch_matching_per_byte() {
+    for input in [
+        b"\x1b[31\x18\x1b[m".as_slice(),
+        b"\x1b[31\x18\x1b[5m",
+        b"\x1b[31\x18\x1b[42m",
+        b"\x1b[4:3\x18\x1b[5m",
+        b"\x1b[4:3m\x1b[5m",
+        b"\x1b[4:3m\x1b[1;2m",
+        b"\x1b[1;4:3m",
+    ] {
+        assert_whole_read_matches_per_byte(input);
+    }
 }
 
 #[test]

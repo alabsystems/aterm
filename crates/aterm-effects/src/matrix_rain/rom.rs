@@ -231,16 +231,22 @@ pub struct RomMaster {
 }
 
 impl RomMaster {
+    /// All `ROM_GLYPHS * MASTER_H` scanlines (`y` of `glyph` at `glyph * MASTER_H + y`).
+    #[must_use]
+    #[inline]
+    pub const fn rows(&self) -> &[u32] {
+        if self.rows.is_empty() {
+            DECORATIVE_ROWS.as_slice()
+        } else {
+            self.rows.as_slice()
+        }
+    }
+
     /// Scanline `y` of `glyph` (low 24 bits valid).
     #[must_use]
     #[inline]
     pub const fn row(&self, glyph: usize, y: usize) -> u32 {
-        let rows = if self.rows.is_empty() {
-            DECORATIVE_ROWS.as_slice()
-        } else {
-            self.rows.as_slice()
-        };
-        rows[glyph * MASTER_H + y]
+        self.rows()[glyph * MASTER_H + y]
     }
 }
 

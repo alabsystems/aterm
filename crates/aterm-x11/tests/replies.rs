@@ -484,3 +484,14 @@ fn an_error_packet_reads_its_request() {
         (3, 41, 0x0060_0001, 0, 20)
     );
 }
+
+#[test]
+fn get_property_reply_rejects_invalid_format_or_nonzero_absent_len() {
+    for (format, value_len) in [(7u8, 1u32), (24, 0), (0, 1)] {
+        let mut packet = [0u8; 32];
+        packet[0] = 1; // Reply
+        packet[1] = format;
+        packet[16..20].copy_from_slice(&value_len.to_ne_bytes());
+        assert_eq!(GetPropertyReply::parse(&packet), Err(ParseError::Invalid));
+    }
+}

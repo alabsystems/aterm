@@ -28,6 +28,14 @@ macro_rules! flags {
             pub const fn bits(self) -> $int {
                 self.0
             }
+
+            /// The raw flag word `bits`, every bit kept as given (a mode read off a file, with
+            /// its group, other and set-id bits, to write back changed).
+            #[inline]
+            #[must_use]
+            pub const fn from_bits(bits: $int) -> Self {
+                Self(bits)
+            }
         }
 
         impl std::ops::BitOr for $name {

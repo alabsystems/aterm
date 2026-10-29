@@ -264,6 +264,7 @@ pub(super) fn claim_record(
         cwd: run.workspace.clone().unwrap_or_else(|| snap.cwd.clone()),
         twin: mv.twin.to_string_lossy().into_owned(),
         pid: snap.pid,
+        proc_start: snap.start.clone(),
         shell: snap.shell,
         tab: snap.tab.clone(),
         from: mv.running.clone(),
@@ -304,14 +305,16 @@ pub(super) fn upgrade_visit(
         to: "-".to_string(),
         step: String::new(),
     };
-    if let Some(st) =
-        load(opts, &session_key).filter(|st| st.agent == Agent::Muse && st.in_flight())
+    let prior = load(opts, &session_key);
+    if let Some(st) = prior
+        .as_ref()
+        .filter(|st| st.agent == Agent::Muse && st.in_flight())
     {
         let r = report(leader(tabs, &tab, k).unwrap_or(st.pid));
         if opts.background {
             return Some(said(r, AT_BREAK));
         }
-        return Some(carry_in_flight_with(opts, r, st, &session_key, k));
+        return Some(carry_in_flight_with(opts, r, st.clone(), &session_key, k));
     }
     let pid = leader(tabs, &tab, k)?;
     let r = report(pid);
@@ -352,9 +355,20 @@ pub(super) fn upgrade_visit(
     let Some(run) = snap.muse() else {
         return Some(said(r, "wait:not-muse"));
     };
-    let (Some(lock), Some(_)) = (run.lock.clone(), snap.session.as_deref()) else {
+    let (Some(lock), Some(thread)) = (run.lock.clone(), snap.session.as_deref()) else {
         return Some(said(r, "wait:no-session"));
     };
+    if let Some(word) = prior.as_ref().and_then(|st| {
+        st.held_managed_move(
+            Agent::Muse,
+            &tab,
+            thread,
+            (&mv.running, &mv.target),
+            now_s(),
+        )
+    }) {
+        return Some(said(r, format!("wait:{word}")));
+    }
     let started_ms = run.started_ms;
     let Ok(mut c) = connect(opts, &tab) else {
         return Some(said(r, "wait:no-socket"));
@@ -380,7 +394,6 @@ pub(super) fn upgrade_visit(
     let Some(mut hand) = Hand::take(&mut c, &tab) else {
         return Some(said(r, "wait:held"));
     };
-    let prior = load(opts, &session_key);
     if save_checked(opts, &session_key, &st).is_err() {
         hand.give_back(&mut c);
         return Some(said(r, "wait:claim-unwritten"));

@@ -252,6 +252,11 @@ mod tests {
             assert_eq!(fnv1a_64(bytes), hash, "{bytes:02x?}");
             assert_eq!(word_fold(bytes), hash, "the word fold, {bytes:02x?}");
         }
+        // The platform UUID behind aterm-verify's perf-boxes.tsv `m21  fp:4d119fc8de0a3b9e` row.
+        assert_eq!(
+            fnv1a_64(b"4F2C6182-55E3-51B1-B505-42FD89F13166"),
+            0x4d11_9fc8_de0a_3b9e
+        );
         assert_eq!(fnv1a_128(b""), FNV128_OFFSET);
         assert_eq!(fnv1a_128(b"a"), 0xd228_cb69_6f1a_8caf_7891_2b70_4e4a_8964);
         assert_eq!(

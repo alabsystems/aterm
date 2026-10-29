@@ -961,6 +961,52 @@ struct Track {
     fence: Option<u64>,
     /// Let go by the backstop.
     dropped: Option<Box<Dropped>>,
+    /// The lines a write that did not land took for it, held to be written again
+    /// ([`Unlanded`]).
+    unlanded: Option<Box<Unlanded>>,
+}
+
+/// A take's lines that a failed or short write did not land (audit fix G5, LOG2-1). They were
+/// copied out of the ring at the take, so a burst during the write may evict their records (the
+/// take marked them spent first) and nothing is lost: the session's next take writes them again,
+/// before anything newer, then moves its cursor. One session holds at most one take's records
+/// ([`WriterLimits::batch`]) here: the take after them reads only up to that bound.
+///
+/// While they are held their records stay spent first (the take's hold, [`Self::held`]): the
+/// writer has them, so a burst in the backoff spends them before records it has not reached (G5's
+/// review). Lines let go unwritten (a journal that stops, the backstop, a log or timeline put in
+/// place of theirs) give their hold back as they go ([`Drop`]).
+struct Unlanded {
+    /// The lines, whole, as the take encoded them.
+    lines: Vec<u8>,
+    /// They begin with the session's snap, so they read in any segment as they are.
+    snap: bool,
+    /// Where their `#handed` line begins, if they carry one (removed at a stand-down). It ends
+    /// the drain's take, but a take after a lifted fence may have put records after it.
+    handed_at: Option<usize>,
+    /// The records they carry.
+    taken: usize,
+    /// The take's cursor: a snap made for them is at this head.
+    from: u64,
+    /// The take's space's first accounted seq, for a snap made for them.
+    first: u64,
+    next: u64,
+    space: (u32, u32),
+    done: bool,
+    handed: bool,
+    fence: Option<u64>,
+    /// The failed take's hold on its log's journal mark, kept raised over these records until
+    /// the take that writes them again holds them in its stead ([`Writer::batch`]).
+    held: Option<aterm_slog::Journaled>,
+}
+
+impl Drop for Unlanded {
+    /// Let go unwritten: their records rank with the unwritten again.
+    fn drop(&mut self) {
+        if let Some(held) = self.held.take() {
+            held.unwritten();
+        }
+    }
 }
 
 /// A session the backstop let go: a probe of its log when it went (its
@@ -986,18 +1032,30 @@ enum State {
     Stopped,
 }
 
-/// What one track's lines in a batch end at, and what writing them proves.
+/// Where one track's lines in a batch begin and end, and what writing them proves.
 struct LineMark {
+    start: usize,
     end: usize,
     key: String,
+    /// The take's cursor (see [`Unlanded::from`]).
+    from: u64,
+    /// See [`Unlanded::first`].
+    first: u64,
     next: u64,
     space: (u32, u32),
     snapped: u32,
+    /// See [`Unlanded::snap`].
+    snap: bool,
+    /// See [`Unlanded::handed_at`], from `start`.
+    handed_at: Option<usize>,
+    /// See [`Unlanded::taken`].
+    taken: usize,
     done: bool,
     handed: bool,
     fence: Option<u64>,
-    /// The take's hold on its log's journal mark ([`aterm_slog::Log::take_journaled`]): given
-    /// back if these lines do not land. `None` for a dropped session's loss (no log).
+    /// The take's hold on its log's journal mark ([`aterm_slog::Log::take_journaled`]): kept with
+    /// these lines if they do not land ([`Unlanded::held`]), given back if they cannot be held.
+    /// `None` for a dropped session's loss (no log).
     held: Option<aterm_slog::Journaled>,
 }
 
@@ -1019,6 +1077,11 @@ pub(crate) struct Writer<T: Targets> {
     state: State,
     /// The backoff's delay so far, kept across a pass that fails again.
     delay: Option<Duration>,
+    /// The backoff is the free-space floor's ([`Self::room`]): a reading that finds room ends
+    /// it, with or without lines to write (audit fix G5, LOG2-2). Any other pause, a refused
+    /// write's included, ends only at a write that lands, since a volume's free count can show
+    /// room that its quota refuses.
+    floor_held: bool,
     io_errors: u32,
     /// Transient write errors in a row.
     transient: u32,
@@ -1057,6 +1120,7 @@ impl<T: Targets> Writer<T> {
             retired_seq: 0,
             state: State::Running,
             delay: None,
+            floor_held: false,
             io_errors: 0,
             transient: 0,
             owed: false,
@@ -1130,7 +1194,8 @@ impl<T: Targets> Writer<T> {
     /// Pause the writer, doubling the pause it was already in. A full volume's pause also drops
     /// the last free-space reading, so the first pass out reads the volume again before it
     /// writes ([`Self::room`]): only a check that finds room ends it, never a write that the
-    /// minute's cached reading let through under [`FREE_FLOOR`] (C7, ROBUST-1).
+    /// minute's cached reading let through under [`FREE_FLOOR`] (C7, ROBUST-1). The pause is
+    /// no longer the floor's ([`Self::floor_held`]) until [`Self::room`] says it is.
     fn backoff(&mut self, cause: Cause) {
         let delay = self
             .delay
@@ -1138,6 +1203,7 @@ impl<T: Targets> Writer<T> {
         if matches!(cause, Cause::Full) {
             self.last_free_check = None;
         }
+        self.floor_held = false;
         self.delay = Some(delay);
         self.state = State::Backoff {
             until: self.clock.mono() + delay,
@@ -1149,6 +1215,18 @@ impl<T: Targets> Writer<T> {
             cause.word()
         );
         self.report.say(Attention::Paused(cause));
+    }
+
+    /// The pause is over: the next one starts at [`BACKOFF_FIRST`] and the owner's notice
+    /// clears. A landed write ends any pause; a reading that finds room ends the floor's.
+    fn resumed(&mut self) {
+        self.floor_held = false;
+        if self.delay.take().is_some() {
+            aterm_log::info!("session journal resumed");
+        }
+        if !matches!(self.report.attention().1, Attention::None) {
+            self.report.say(Attention::None);
+        }
     }
 
     /// What an errno does.
@@ -1195,6 +1273,24 @@ impl<T: Targets> Writer<T> {
             for t in self.tracks.values_mut() {
                 t.handed = false;
                 t.snapped = None;
+                // Lines a failed write held keep their records, never the `#handed` the drain
+                // gave them: written after the stand-down it would void this session's crash.
+                // Only that line goes: records a take after a lifted fence put after it stay.
+                if let Some(u) = t.unlanded.as_deref_mut() {
+                    if let Some(at) = u.handed_at.take()
+                        && let Some(rest) = u.lines.get(at..)
+                    {
+                        let end = rest
+                            .iter()
+                            .position(|&b| b == b'\n')
+                            .map_or(u.lines.len(), |p| at + p + 1);
+                        u.lines.drain(at..end);
+                    }
+                    u.handed = false;
+                }
+                if t.unlanded.as_ref().is_some_and(|u| u.lines.is_empty()) {
+                    t.unlanded = None;
+                }
             }
         }
         if self.handed_done {
@@ -1244,6 +1340,7 @@ impl<T: Targets> Writer<T> {
                             handed: false,
                             fence: None,
                             dropped: None,
+                            unlanded: None,
                         },
                     );
                 }
@@ -1305,6 +1402,7 @@ impl<T: Targets> Writer<T> {
                 handed: false,
                 fence: None,
                 dropped,
+                unlanded: None,
             },
         );
     }
@@ -1380,7 +1478,8 @@ impl<T: Targets> Writer<T> {
     /// Whether the volume has room: checked at each rotation, once a
     /// minute, and on the first pass out of a full volume's pause ([`Self::backoff`]);
     /// under [`FREE_FLOOR`] the journal pauses before ENOSPC, and the pause doubles while
-    /// the volume stays under it.
+    /// the volume stays under it. A reading that finds room ends the floor's pause at once,
+    /// whether or not the pass has lines to write ([`Self::floor_held`]).
     fn room(&mut self) -> bool {
         let now = self.clock.mono();
         if self
@@ -1394,9 +1493,15 @@ impl<T: Targets> Writer<T> {
             Some(free) if free < self.limits.free_floor => {
                 Report::bump(&self.report.err_full, 1);
                 self.backoff(Cause::Full);
+                self.floor_held = true;
                 false
             }
-            _ => true,
+            _ => {
+                if self.floor_held {
+                    self.resumed();
+                }
+                true
+            }
         }
     }
 
@@ -1430,8 +1535,8 @@ impl<T: Targets> Writer<T> {
         let Some((n, size)) = self.seg.as_ref().map(|s| (s.n, s.size)) else {
             return 0;
         };
-        let (buf, marks) = self.batch(n, size);
-        let written = self.write(&buf, &marks);
+        let (buf, mut marks) = self.batch(n, size);
+        let written = self.write(&buf, &mut marks);
         self.drop_finished();
         if self.handing && !self.handed_done && written == buf.len() {
             self.maybe_hand_off();
@@ -1442,7 +1547,8 @@ impl<T: Targets> Writer<T> {
     /// The pass's lines: retired tracks first (exempt from the pass's byte
     /// bound), then the live ones; no track's lines once the
     /// segment (`size` so far) would pass its rotation size, so a segment is
-    /// never more than one take's lines past it.
+    /// never more than one take's lines past it. A session a failed write held lines for
+    /// writes them first, then takes on from their end ([`Unlanded`]).
     fn batch(&mut self, n: u32, size: u64) -> (Vec<u8>, Vec<LineMark>) {
         let mut buf: Vec<u8> = Vec::new();
         let mut marks: Vec<LineMark> = Vec::new();
@@ -1480,18 +1586,20 @@ impl<T: Targets> Writer<T> {
                         t.done = true;
                         continue;
                     }
-                    for f in &frames {
-                        if let Some(line) = encode_frame(f) {
-                            buf.extend_from_slice(line.as_bytes());
-                            buf.push(b'\n');
-                        }
-                    }
+                    let begin = buf.len();
+                    push_lines(&mut buf, &frames, begin);
                     marks.push(LineMark {
+                        start: begin,
                         end: buf.len(),
                         key,
+                        from: d.take.cursor,
+                        first: d.take.first,
                         next: d.through,
                         space: (d.take.base, d.take.ep),
                         snapped: n,
+                        snap: t.snapped != Some(n),
+                        handed_at: None,
+                        taken: 0,
                         done: true,
                         handed: false,
                         fence: None,
@@ -1521,53 +1629,116 @@ impl<T: Targets> Writer<T> {
             let start = guard.slog().journal_start();
             let log = guard.slog().log();
             let space = (log.base_ep(), log.ep());
+            // What a failed write held for it ([`Unlanded`]), while it writes in the space they
+            // were taken from: a log put in place of that one leaves them unwritten, as before.
+            // Their hold passes to this take's own, from the same cursor, which keeps the
+            // records spent first ([`Self::unlanded`]).
+            let mut unlanded = t.unlanded.take().filter(|u| u.space == space);
+            if let Some(u) = unlanded.as_deref_mut() {
+                u.held = None;
+            }
             if t.space.is_some_and(|(base, _)| base != space.0) {
                 t.cursor = Some(0);
                 t.snapped = None;
             }
-            let cursor = *t.cursor.get_or_insert(start.unwrap_or(0));
-            let snap = t.snapped != Some(n) || t.space.is_some_and(|s| s != space);
-            let take = journal::take(log, cursor, self.limits.batch, snap);
-            // Under the take's own hold: what it took is spent first from now, and a write that
-            // does not land gives it back ([`Self::write`]).
+            let begin = buf.len();
+            let mut handed = t.handed;
+            let mut handed_at = None;
+            let (from, cursor, max, snap, lines_snap) = match unlanded.as_deref() {
+                Some(u) => {
+                    // Written again where this session has no snap yet: one at their head
+                    // first, the open path as of it, as a take at that cursor would make.
+                    let made = !u.snap && t.snapped != Some(n);
+                    if made {
+                        let at = journal::Take {
+                            ep: space.1,
+                            base: space.0,
+                            first: u.first,
+                            cursor: u.from,
+                            next: u.from,
+                            gap: None,
+                            recs: Vec::new(),
+                            holes: Vec::new(),
+                            opens: Some(log.open_path_records()),
+                            fence: None,
+                            done: false,
+                            more: false,
+                        };
+                        push_lines(
+                            &mut buf,
+                            &journal::take_frames(t.sid, &at, true, wall),
+                            begin,
+                        );
+                    }
+                    handed_at = u.handed_at.map(|h| buf.len() - begin + h);
+                    buf.extend_from_slice(&u.lines);
+                    handed = u.handed;
+                    let max = self.limits.batch.saturating_sub(u.taken);
+                    (u.from, u.next, max, false, made || u.snap)
+                }
+                None => {
+                    let cursor = *t.cursor.get_or_insert(start.unwrap_or(0));
+                    let snap = t.snapped != Some(n) || t.space.is_some_and(|s| s != space);
+                    (cursor, cursor, self.limits.batch, snap, snap)
+                }
+            };
+            let first = unlanded.as_ref().map_or(log.first_seq(), |u| u.first);
+            // Past held lines, only what keeps the session's held records within one take's.
+            let take = (max > 0).then(|| journal::take(log, cursor, max, snap));
+            let next = take.as_ref().map_or(cursor, |k| k.next);
+            // Under the take's own hold: what it took, and the held lines in front of it, are
+            // spent first from now, and a write that does not land holds its lines with that
+            // hold ([`Self::unlanded`]).
             let held = guard
                 .slog_mut()
                 .log_mut_for_journal()
-                .take_journaled(cursor, take.next);
+                .take_journaled(from, next);
             drop(guard);
-            t.fence = take.fence;
-            let mut frames = journal::take_frames(t.sid, &take, snap, wall);
-            let mut handed = t.handed;
+            let fence = take
+                .as_ref()
+                .map_or(unlanded.as_ref().and_then(|u| u.fence), |k| k.fence);
+            t.fence = fence;
+            let mut frames = take
+                .as_ref()
+                .map(|k| journal::take_frames(t.sid, k, snap, wall))
+                .unwrap_or_default();
             if self.handing
                 && !handed
-                && let Some(fence) = take.fence
-                && take.next >= fence
+                && let Some(fence) = fence
+                && next >= fence
             {
                 frames.push(Frame::Handed { sid: t.sid, fence });
                 handed = true;
             }
-            if frames.is_empty() {
-                t.done |= take.done;
+            let done =
+                take.as_ref().is_some_and(|k| k.done) || unlanded.as_ref().is_some_and(|u| u.done);
+            if frames.is_empty() && unlanded.is_none() {
+                t.done |= done;
                 continue;
             }
-            for f in &frames {
-                if let Some(line) = encode_frame(f) {
-                    buf.extend_from_slice(line.as_bytes());
-                    buf.push(b'\n');
-                }
+            if let Some(at) = push_lines(&mut buf, &frames, begin) {
+                handed_at = Some(at);
             }
-            if take.more {
+            if take.as_ref().is_none_or(|k| k.more) {
                 self.owed = true;
             }
+            let taken = unlanded.as_ref().map_or(0, |u| u.taken)
+                + take.as_ref().map_or(0, |k| k.recs.len());
             marks.push(LineMark {
+                start: begin,
                 end: buf.len(),
                 key,
-                next: take.next,
+                from,
+                first,
+                next,
                 space,
                 snapped: n,
-                done: take.done,
+                snap: lines_snap,
+                handed_at,
+                taken,
+                done,
                 handed,
-                fence: take.fence,
+                fence,
                 held: Some(held),
             });
         }
@@ -1575,15 +1746,14 @@ impl<T: Targets> Writer<T> {
     }
 
     /// Write `buf` in one `write(2)` (EINTR retried): every mark whose lines
-    /// are wholly on disk moves its track's cursor, and every other gives its take back to its
-    /// log's journal mark ([`aterm_slog::Journaled::unwritten`]: no lock, so a busy timeline
-    /// never keeps unwritten records spent first through a backoff, audit fix C7); after a short
-    /// or failed write the segment is abandoned, never repaired.
-    fn write(&mut self, buf: &[u8], marks: &[LineMark]) -> usize {
+    /// are wholly on disk moves its track's cursor, and every other is held ([`Self::unlanded`]);
+    /// after a short or failed write the segment is abandoned, never repaired.
+    fn write(&mut self, buf: &[u8], marks: &mut [LineMark]) -> usize {
         if buf.is_empty() {
             return 0;
         }
         let Some(seg) = self.seg.as_mut() else {
+            self.unlanded(buf, marks, 0);
             return 0;
         };
         let head = seg.header.as_ref().map_or(0, Vec::len);
@@ -1615,13 +1785,7 @@ impl<T: Targets> Writer<T> {
                 t.fence = m.fence;
             }
         }
-        for held in marks
-            .iter()
-            .filter(|m| m.end > wrote)
-            .filter_map(|m| m.held.as_ref())
-        {
-            held.unwritten();
-        }
+        self.unlanded(buf, marks, wrote);
         let lines = buf[..wrote.min(buf.len())]
             .iter()
             .filter(|&&b| b == b'\n')
@@ -1632,12 +1796,7 @@ impl<T: Targets> Writer<T> {
             Ok(k) if k == head + buf.len() => {
                 self.io_errors = 0;
                 self.transient = 0;
-                if self.delay.take().is_some() {
-                    aterm_log::info!("session journal resumed");
-                }
-                if !matches!(self.report.attention().1, Attention::None) {
-                    self.report.say(Attention::None);
-                }
+                self.resumed();
             }
             Ok(_) => {
                 self.seg = None;
@@ -1653,6 +1812,40 @@ impl<T: Targets> Writer<T> {
             }
         }
         wrote
+    }
+
+    /// The marks a write did not land (its first `wrote` bytes did): each leaves its lines with
+    /// its track ([`Unlanded`]), so a burst during the write that evicted what the take had marked
+    /// spent first costs nothing (audit fix G5, LOG2-1), and keeps its take's hold with them, so
+    /// the records stay spent first while the writer holds them (G5's review). A mark whose lines
+    /// cannot be held gives its take back at once ([`aterm_slog::Journaled::unwritten`]: no lock,
+    /// so a busy timeline never keeps records the writer does not hold spent first through a
+    /// backoff, audit fix C7). A dropped session's loss holds nothing: its probe says it again.
+    fn unlanded(&mut self, buf: &[u8], marks: &mut [LineMark], wrote: usize) {
+        for m in marks.iter_mut().filter(|m| m.end > wrote) {
+            let Some(held) = m.held.take() else {
+                continue;
+            };
+            let (Some(t), Some(lines)) = (self.tracks.get_mut(&m.key), buf.get(m.start..m.end))
+            else {
+                held.unwritten();
+                continue;
+            };
+            t.unlanded = Some(Box::new(Unlanded {
+                lines: lines.to_vec(),
+                snap: m.snap,
+                handed_at: m.handed_at,
+                taken: m.taken,
+                from: m.from,
+                first: m.first,
+                next: m.next,
+                space: m.space,
+                done: m.done,
+                handed: m.handed,
+                fence: m.fence,
+                held: Some(held),
+            }));
+        }
     }
 
     /// Let go of retired tracks whose close is written (or whose loss is).
@@ -1691,6 +1884,9 @@ impl<T: Targets> Writer<T> {
                 drop(guard);
                 t.cursor = Some(after);
                 t.timeline = None;
+                // What a failed write held of it is past `after`: its loss says it, and its
+                // hold goes back with it ([`Unlanded`]).
+                t.unlanded = None;
                 t.dropped = Some(Box::new(dropped));
                 Report::bump(&self.report.dropped, 1);
                 self.owed = true;
@@ -1736,7 +1932,7 @@ impl<T: Targets> Writer<T> {
             t,
         }) {
             line.push('\n');
-            if self.write(line.as_bytes(), &[]) == line.len() {
+            if self.write(line.as_bytes(), &mut []) == line.len() {
                 if let Some(synced) = self.seg.as_mut().map(|seg| seg.file.sync()) {
                     self.segment_flushed(synced);
                 }
@@ -1782,7 +1978,7 @@ impl<T: Targets> Writer<T> {
             buf.extend_from_slice(line.as_bytes());
             buf.push(b'\n');
         }
-        if self.write(&buf, &[]) != buf.len() {
+        if self.write(&buf, &mut []) != buf.len() {
             return;
         }
         if let Some(synced) = self.seg.as_mut().map(|seg| seg.file.sync()) {
@@ -1968,6 +2164,23 @@ impl<T: Targets> Drop for Writer<T> {
             self.targets.end_targets(&owner);
         }
     }
+}
+
+/// Encode `frames` onto `buf`, a line each, and say where a `#handed` line among them begins,
+/// counted from `begin`.
+fn push_lines(buf: &mut Vec<u8>, frames: &[Frame], begin: usize) -> Option<usize> {
+    let mut handed_at = None;
+    for f in frames {
+        let Some(line) = encode_frame(f) else {
+            continue;
+        };
+        if matches!(f, Frame::Handed { .. }) {
+            handed_at = Some(buf.len().saturating_sub(begin));
+        }
+        buf.extend_from_slice(line.as_bytes());
+        buf.push(b'\n');
+    }
+    handed_at
 }
 
 /// Whether `errno` wrote nothing and may pass: EAGAIN, EWOULDBLOCK, EINTR.

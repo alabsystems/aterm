@@ -24,19 +24,6 @@ fn reusable(term: &mut Terminal, scratch: &RenderInput) -> bool {
 }
 
 #[test]
-fn an_untouched_engine_lets_the_effect_tick_present_the_snapshot_it_already_has() {
-    let (mut term, scratch) = settled();
-    assert!(
-        reusable(&mut term, &scratch),
-        "a settled engine + a scratch it just filled is the whole point of the gate"
-    );
-    assert!(
-        reusable(&mut term, &scratch) && reusable(&mut term, &scratch),
-        "reuse must chain across consecutive effect-only frames"
-    );
-}
-
-#[test]
 fn every_way_the_snapshot_goes_stale_refuses() {
     type Perturb = fn(&mut Terminal, &mut RenderInput) -> bool;
     let rows: [(&str, Perturb); 8] = [
@@ -97,7 +84,12 @@ fn every_way_the_snapshot_goes_stale_refuses() {
     ];
     for (label, perturb) in rows {
         let (mut term, mut scratch) = settled();
-        assert!(reusable(&mut term, &scratch), "{label}: precondition");
+        assert!(
+            reusable(&mut term, &scratch)
+                && reusable(&mut term, &scratch)
+                && reusable(&mut term, &scratch),
+            "{label}: precondition: a settled snapshot is reusable, and reuse chains across consecutive effect-only frames"
+        );
         assert!(
             !perturb(&mut term, &mut scratch),
             "{label}: a stale snapshot must never be presented"

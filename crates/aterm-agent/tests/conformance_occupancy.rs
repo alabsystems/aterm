@@ -9,7 +9,9 @@
 //! runs, `age` and `esc` to the K clock (`DueClock`), whose `sample` its `Sample` and `SampleLast`
 //! drive in their own evidence windows; and at each break, the host's own step (`UpgradeTypes`,
 //! the upgrade's notice) to `door::host_step_may_go` of the decider's due line, which
-//! `UpgradeTypes` drives in its own evidence window.
+//! `UpgradeTypes` drives in its own evidence window; and at an idle point in a wake run (`door =
+//! 2`), the wake's fact riding the policy's act to `rules::at_point` on the same guards (the
+//! slice-2 plan's 2.9).
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
@@ -20,8 +22,8 @@ use aterm_agent::supervise::occupancy::due::DueClock;
 use aterm_agent::supervise::occupancy::fault::{self, Fault};
 use aterm_agent::supervise::occupancy::reading::LOOK_EVERY_MS;
 use aterm_agent::supervise::occupancy::rules::{
-    HOLD_ROOM_AFTER_MS, HOLD_ROOM_APART_MS, SESSION_PACE_MS, WAIT_NUDGE_AFTER_MS, episode,
-    wake_opens,
+    HOLD_ROOM_AFTER_MS, HOLD_ROOM_APART_MS, SESSION_PACE_MS, WAIT_NUDGE_AFTER_MS, at_point,
+    episode, wake_opens,
 };
 use aterm_agent::supervise::occupancy::wakes_seen::{AtomKind, Declarer, Prio, WakeState};
 use aterm_agent::supervise::occupancy::{
@@ -90,6 +92,8 @@ struct Run {
     /// The run walks the stuck fact's line (`OpenStuck`, `cond` a facts reading naming the hung
     /// call) instead of the rule's nudge.
     stuck: bool,
+    /// The negative control of the point's judgement: its decider handed no person's guard.
+    blind_point: bool,
 }
 
 /// The hung call's group, which every episode of the stuck runs is of.
@@ -315,6 +319,30 @@ fn at_write(r: &Real) -> AtWrite {
     }
 }
 
+/// Whether `st` is an idle point the run's wake may ride the policy's act at (the slice-2 plan's
+/// 2.9): a wake run's `door = 2`.
+fn rides_at(st: &State, run: Run) -> bool {
+    st["door"] == 2 && run.rule == RuleId::Wake && !run.stuck
+}
+
+/// What the point's rider decides at `st` on the real side: the book's head due at an idle point
+/// (`rules::at_point`) on the break's guards, with no write-time hold of the break's (the host's
+/// line and the upgrade's notice are a break's alone, and a wake goes over the notice).
+fn point_decided(m: &Model, st: &State, r: &Real, run: Run) -> Said {
+    let mut g = guards(st, autopilot(m), run.variant);
+    if run.blind_point {
+        (g.person, g.halted, g.draft) = (false, false, false);
+    }
+    let told = wake_told(r);
+    match at_point(&r.books, &g, r.now, &sight(r, &told)).0 {
+        Verdict::Quiet => Said::Quiet,
+        Verdict::Due(_) => Said::Due,
+        Verdict::Held(g) => Said::Held(term(g)),
+        Verdict::Paced { .. } => Said::Paced,
+        other => Said::Other(format!("{other:?}")),
+    }
+}
+
 fn decided(m: &Model, st: &State, r: &Real, run: Run) -> Said {
     if run.stuck {
         return stuck_said(m, st, r, run);
@@ -448,7 +476,8 @@ fn realizable(st: &State, action: &str, r: &Real, run: Run) -> bool {
         "OpenWake" => !run.stuck && rule == RuleId::Wake,
         "OpenNudge" => !run.stuck && rule != RuleId::Wake,
         "OpenStuck" => run.stuck,
-        "Intend" | "Type" => st["door"] == 1,
+        // At an idle point a wake's fact rides the policy's act; nothing else is typed there.
+        "Intend" | "Type" => st["door"] == 1 || rides_at(st, run),
         "UpgradeTypes" => st["held"] == 1,
         // A wake's line is of no hold's age: the hold a wake run opens never ages for it.
         "HoldAges" => rule != RuleId::Wake && st["told"] == 0 && st["paced"] == 0,
@@ -735,6 +764,8 @@ struct Walked {
     off: Vec<State>,
     fired: BTreeMap<&'static str, usize>,
     said: BTreeSet<String>,
+    /// How many `Type` steps went at an idle point (`door = 2`): a wake's fact riding an act.
+    point_types: usize,
 }
 
 impl Walked {
@@ -747,10 +778,16 @@ impl Walked {
             vars.extend(["age", "esc"]);
         }
         let mut ok = stepped && vars.iter().all(|v| real[v] == st[v]);
-        let said = (st["door"] == 1).then(|| decided(m, st, r, run));
+        let said = if st["door"] == 1 {
+            Some(decided(m, st, r, run))
+        } else {
+            rides_at(st, run).then(|| point_decided(m, st, r, run))
+        };
         if let Some(said) = &said {
             ok &= agrees(m, st, said, run);
             self.said.insert(format!("{said:?}"));
+        }
+        if let Some(said) = said.as_ref().filter(|_| st["door"] == 1) {
             // §2.1's ranks 2 and 3: the host's own step waits for a wake's line the decider says
             // due (the model's `UpgradeTypes` waits for `due = 2`), and goes before any other
             // line. A wake the decider holds lets it go, a step the model's `due = 2` does not
@@ -812,6 +849,7 @@ fn walk(m: &Model, strict: bool, run: Run, ev: &mut Ev) -> Walked {
             off: Vec::new(),
             fired: BTreeMap::new(),
             said: BTreeSet::new(),
+            point_types: 0,
         };
         let mut seen: HashSet<(Vec<i64>, usize)> = HashSet::new();
         w.check(m, &m.init_state(), &init, true, strict, run);
@@ -833,6 +871,9 @@ fn walk(m: &Model, strict: bool, run: Run, ev: &mut Ev) -> Walked {
                 let mut r = real.clone();
                 let stepped = mirror(m, action.name, (&st, &next), &mut r, run, ev);
                 *w.fired.entry(action.name).or_default() += 1;
+                if action.name == "Type" && st["door"] == 2 {
+                    w.point_types += 1;
+                }
                 w.check(m, &next, &r, stepped, strict, run);
                 queue.push_back((next, r));
             }
@@ -870,6 +911,7 @@ fn tier1_the_real_decider_says_due_exactly_where_the_model_types() {
                         fault: None,
                         key: 0,
                         stuck: false,
+                        blind_point: false,
                     },
                 ));
             }
@@ -884,6 +926,7 @@ fn tier1_the_real_decider_says_due_exactly_where_the_model_types() {
                     fault: None,
                     key: 1,
                     stuck: true,
+                    blind_point: false,
                 },
             ));
         }
@@ -980,6 +1023,14 @@ fn tier1_the_real_decider_says_due_exactly_where_the_model_types() {
         if stuck && types {
             assert!(w.said.contains("Paced"), "{what}: {:?}", w.said);
         }
+        // A wake's fact rides the policy's act at an idle point: the real point's decider types
+        // there exactly where the model's `Type` goes at `door = 2`, and nothing else does.
+        assert_eq!(
+            w.point_types > 0,
+            types && wake,
+            "{what}, Mode = {mode}: {} types at a point",
+            w.point_types
+        );
         assert!(w.states.len() > 100, "{}", w.states.len());
     }
 }
@@ -1088,6 +1139,7 @@ fn tier1_each_planted_defect_disagrees_where_the_model_says() {
                         fault: Some(fault),
                         key: 0,
                         stuck: false,
+                        blind_point: false,
                     },
                 ));
                 checks.push((fault, shows, among));
@@ -1114,6 +1166,7 @@ fn tier1_each_planted_defect_disagrees_where_the_model_says() {
                     fault: Some(fault),
                     key,
                     stuck: true,
+                    blind_point: false,
                 },
             ));
             checks.push((fault, shows, None));
@@ -1177,6 +1230,7 @@ fn tier1_sample_and_sample_last_enter_the_k_clock_in_their_own_windows() {
             fault: None,
             key: 0,
             stuck: false,
+            blind_point: false,
         };
         walk(&under(1, 0), true, run, &mut ev);
     }
@@ -1209,6 +1263,7 @@ fn tier1_open_wake_enters_the_books_head_in_its_own_window() {
             fault: None,
             key: 0,
             stuck: false,
+            blind_point: false,
         };
         walk(&under(mode, 0), true, run, &mut ev);
     }
@@ -1237,6 +1292,7 @@ fn tier1_upgrade_types_asks_the_host_steps_rank_in_its_own_window() {
             fault: None,
             key: 0,
             stuck: false,
+            blind_point: false,
         };
         walk(&under(1, 0), true, run, &mut ev);
     }
@@ -1250,4 +1306,43 @@ fn tier1_upgrade_types_asks_the_host_steps_rank_in_its_own_window() {
     assert!(audit.stray.is_empty(), "{audit:?}");
     assert!(audit.unanchored_steps.is_empty(), "{audit:?}");
     assert!(audit.witnessed_steps > 0, "{audit:?}");
+}
+
+/// THE POINT'S JUDGEMENT HAS TEETH (the slice-2 plan's 2.9): a point decider handed no person's
+/// guard (`Run::blind_point`) says the wake's fact due where the model's `Type` waits for the
+/// person at an idle point, and disagrees nowhere else: the walk judges the real point's decider.
+#[test]
+fn tier1_a_point_blind_to_the_person_disagrees_at_the_point_alone() {
+    let runs: Vec<(i64, Run)> = (0..3)
+        .map(|variant| {
+            (
+                1,
+                Run {
+                    rule: RuleId::Wake,
+                    variant,
+                    fault: None,
+                    key: 0,
+                    stuck: false,
+                    blind_point: true,
+                },
+            )
+        })
+        .collect();
+    for ((_, run), w) in runs.iter().zip(walks(&runs, false)) {
+        assert!(
+            !w.off.is_empty(),
+            "variant {}: agreed everywhere",
+            run.variant
+        );
+        let elsewhere: Vec<&State> = w
+            .off
+            .iter()
+            .filter(|st| !(st["door"] == 2 && st["person"] == 1))
+            .collect();
+        assert!(
+            elsewhere.is_empty(),
+            "variant {}: {elsewhere:?}",
+            run.variant
+        );
+    }
 }

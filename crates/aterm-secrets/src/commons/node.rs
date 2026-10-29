@@ -95,6 +95,17 @@ impl Node {
     /// Verify exact bytes against an independently trusted network and authority.
     /// This does not choose a current state or enroll an unknown signer.
     pub fn verify(bytes: &[u8], network: [u8; 16], authority: [u8; 32]) -> Result<Self> {
+        Self::verify_within(bytes, network, authority, MAX_FACTS)
+    }
+
+    /// [`Node::verify`] with another per-node fact bound: 0.145 and earlier verify with
+    /// [`super::constraints::LEGACY_MAX_FACTS`].
+    pub(crate) fn verify_within(
+        bytes: &[u8],
+        network: [u8; 16],
+        authority: [u8; 32],
+        max_facts: usize,
+    ) -> Result<Self> {
         if bytes.get(..4) == Some(b"ACF1") {
             return Self::verify_foundation(bytes, network, authority);
         }
@@ -143,7 +154,7 @@ impl Node {
         let mut facts = Vec::new();
         if !legacy {
             let count = usize::from(u16::from_le_bytes(reader.array()?));
-            if count > MAX_FACTS {
+            if count > max_facts {
                 return Err(Error::new("too many control restrictions"));
             }
             for _ in 0..count {
@@ -268,7 +279,8 @@ impl Node {
             || facts.len() > MAX_FACTS
             || (kind == Kind::Recovery && !facts.is_empty())
             || payload.is_some_and(|p| p.len() > MAX_PAYLOAD)
-            || (payload.is_some() && (recipients.is_empty() || recipients.len() > 64))
+            || (payload.is_some()
+                && (recipients.is_empty() || recipients.len() > super::roster::MAX_MEMBERS))
         {
             return Err(Error::new(
                 "control draft exceeds recipient, parent or payload bounds",

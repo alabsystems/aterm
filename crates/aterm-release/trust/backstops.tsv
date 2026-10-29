@@ -24,6 +24,7 @@ aterm-acaffiene	868a824465b56392	wall-backstop	aterm_acaffiene::icon::coverage a
 aterm-acaffiene	9a18ebc52eb354a1	wall-backstop	aterm_acaffiene::icon::coverage unbounded_allocation @sysroot/alloc/src/macros.rs:47 `-`
 aterm-acaffiene	e4e62c58b219cade	wall-backstop	aterm_acaffiene::icon::coverage arithmetic_overflow_mul crates/aterm-acaffiene/src/icon.rs:34 `hits * 255`
 aterm-agent-names	-	cancelled	0
+aterm-buffer	-	cancelled	0
 aterm-census	-	cancelled	0
 aterm-census	004acc286d663bcf	rss-backstop	aterm_census::scope_census::all_struct_bodies slice_bounds_check crates/aterm-census/src/scope_census.rs:342 `[name_len..]`
 aterm-census	004acc286d663bcf	rss-backstop	aterm_census::scope_census::all_struct_bodies slice_bounds_check crates/aterm-census/src/scope_census.rs:346 `[name_len..]`
@@ -15544,6 +15545,111 @@ aterm-effects	fffe6a574e2bbed1	rss-backstop	aterm_effects::cursor_glow::ink_ledg
 aterm-effects	ffff69977680a170	rss-backstop	aterm_effects::cursor_rainbow::CursorRainbow::equalise_rim_light::rim_pile_light slice_bounds_check crates/aterm-effects/src/cursor_rainbow.rs:1146 `buckets[bi]`
 aterm-effects	ffffe0eb646b4eea	rss-backstop	aterm_effects::genome::collect_ctx_voters index_out_of_bounds crates/aterm-effects/src/genome.rs:404 `v.hash[slot]`
 aterm-effects	ffffe0eb646b4eea	rss-backstop	aterm_effects::genome::collect_ctx_voters index_out_of_bounds crates/aterm-effects/src/genome.rs:417 `v.hash[slot]`
+aterm-gpu	-	cancelled	0
+aterm-gpu	00c329706e7b7a28	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:7991 `(fw / BLOOM_DOWNSCALE)`
+aterm-gpu	01509f3a91ecf331	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b shift_overflow_shr crates/aterm-gpu/src/renderer.rs:8348 `(live_bg >> 8)`
+aterm-gpu	034c40ac5bf25972	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b float_overflow_to_infinity crates/aterm-gpu/src/renderer.rs:8348 `f64::from((live_bg >> 8) & 0xff) / 255.0`
+aterm-gpu	059832e09d77d25a	wall-backstop	aterm_gpu::frame_from_padded_rgba hardened_panic_boundary crates/aterm-gpu/src/lib.rs:220 `base + w * 4`
+aterm-gpu	071121f19636aa29	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b float_overflow_to_infinity crates/aterm-gpu/src/renderer.rs:8032 `1.0 / bh as f32`
+aterm-gpu	0a1cace7d582fccc	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5978 `dw * dh`
+aterm-gpu	0deda39b3b9f6f78	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane arithmetic_overflow_add crates/aterm-gpu/src/renderer.rs:5979 `dst + len`
+aterm-gpu	104d1bb4dc287f6c	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5983 `((y0 + y) * tw)`
+aterm-gpu	10e1adb3f727748a	wall-backstop	aterm_gpu::renderer::GpuRenderer::record_frame_instance_totals hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:10163 `(fx_instances * std::mem::size_of::<fx_gpu::FxInstance>())`
+aterm-gpu	146ea4fba611f13b	wall-backstop	aterm_gpu::renderer::GpuRenderer::ensure_metal_tray_card slice_bounds_check crates/aterm-gpu/src/renderer.rs:6969 `[b0..b1]`
+aterm-gpu	14c9d81444c20598	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5985 `src + (dw * 4) as usize`
+aterm-gpu	1725f3438f25bec2	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane arithmetic_overflow_mul crates/aterm-gpu/src/renderer.rs:5977 `(y0 * tw) as usize * 4`
+aterm-gpu	176aac9fecd7da2f	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b hardened_ffi_boundary crates/aterm-gpu/src/renderer.rs:8167 `tray … .transpose()?`
+aterm-gpu	17bf2608c27b1e36	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane arithmetic_overflow_mul crates/aterm-gpu/src/renderer.rs:5978 `dw * dh`
+aterm-gpu	1b3aff4cce7e8bcf	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b arithmetic_overflow_mul crates/aterm-gpu/src/renderer.rs:8018 `extract_first as usize * std::mem::size_of::<GlowInstance>()`
+aterm-gpu	1c99e24d4001b51a	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5977 `(y0 * tw) as usize * 4`
+aterm-gpu	1dd51adfbb28c10f	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b hardened_ffi_boundary crates/aterm-gpu/src/renderer.rs:8185 `live.present_pso(Pipeline::Blit, dest_mpix)?`
+aterm-gpu	1e48b2cdcd45aef6	wall-backstop	aterm_gpu::renderer::GpuRenderer::lettered_foot hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:9732 `r as i64 * i64::from(ch)`
+aterm-gpu	1fd6b76bb05ab14b	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:8348 `(live_bg >> 8)`
+aterm-gpu	22d9b2f7c623057f	wall-backstop	aterm_gpu::renderer::GpuRenderer::encode_frame::{closure#2} arithmetic_overflow_add crates/aterm-gpu/src/renderer.rs:10257 `grid_top + r * ch`
+aterm-gpu	2324ff53b63f7b1f	wall-backstop	aterm_gpu::renderer::GpuRenderer::ensure_deco_atlas hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5894 `i * cw`
+aterm-gpu	25ca99b0dc208734	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5984 `(dw * 4)`
+aterm-gpu	25ca99b0dc208734	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5985 `(dw * 4)`
+aterm-gpu	2a72cac32475afa8	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b hardened_ffi_boundary crates/aterm-gpu/src/renderer.rs:8214 `live.present_pso(row, dest_mpix)?`
+aterm-gpu	2b5e89c23b41d5ab	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5978 `(dw * dh * 4)`
+aterm-gpu	2f366b66c0ec24f7	wall-backstop	aterm_gpu::renderer::GpuRenderer::ensure_metal_tray_card hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:6957 `y1 as usize * stride`
+aterm-gpu	30f1c953db627a6c	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b hardened_ffi_boundary crates/aterm-gpu/src/renderer.rs:8075 `live.present_pso(extract_row, dest_mpix)?`
+aterm-gpu	3cc76c731fb7591e	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane unreachable crates/aterm-gpu/src/renderer.rs:5973 `fn pack_image_plane(items: &[(u32, u32, u32, &[u8])], tw: u32, th: u32) -> Vec<u8> { … }`
+aterm-gpu	3e949742afcd2c86	wall-backstop	aterm_gpu::renderer::GpuRenderer::encode_frame::{closure#2} arithmetic_overflow_mul crates/aterm-gpu/src/renderer.rs:10260 `r * ch`
+aterm-gpu	42224e3546903536	wall-backstop	aterm_gpu::renderer::SpriteTex::metal_atlas arithmetic_overflow_mul crates/aterm-gpu/src/renderer.rs:3642 `(self.w as usize * self.h as usize * 4)`
+aterm-gpu	4bb4dea18cd374de	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane unbounded_allocation @sysroot/alloc/src/macros.rs:47 `-`
+aterm-gpu	4c16ba5fe6a2c460	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5977 `(y0 * tw)`
+aterm-gpu	4c58cd035d8e1a40	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane slice_bounds_check crates/aterm-gpu/src/renderer.rs:5979 `[..len]`
+aterm-gpu	5048b7874939a3ec	wall-backstop	aterm_gpu::renderer::GpuRenderer::ensure_deco_atlas arithmetic_overflow_add crates/aterm-gpu/src/renderer.rs:5907 `my * atlas_w + x0`
+aterm-gpu	552de43b96e49ecb	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_composite_bloom_in_place hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:7068 `extract_first as usize * std::mem::size_of::<GlowInstance>()`
+aterm-gpu	56c076dc50d283dc	wall-backstop	aterm_gpu::renderer::GpuRenderer::ensure_metal_tray_card hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:6967 `*tray_upload_bytes += bytes.len() as u64`
+aterm-gpu	571b2913dbf8f65a	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b hardened_ffi_boundary crates/aterm-gpu/src/renderer.rs:8076 `live.present_pso(Pipeline::Bloom, dest_mpix)?`
+aterm-gpu	592bbadde255c506	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:7992 `(fh / BLOOM_DOWNSCALE)`
+aterm-gpu	5b706af499f163b4	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane assertion crates/aterm-gpu/src/renderer.rs:5973 `fn pack_image_plane(items: &[(u32, u32, u32, &[u8])], tw: u32, th: u32) -> Vec<u8> { … }`
+aterm-gpu	5bde14c0242a14ca	wall-backstop	aterm_gpu::renderer::GpuRenderer::ensure_deco_atlas hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5898 `my * cw`
+aterm-gpu	5bde14c0242a14ca	wall-backstop	aterm_gpu::renderer::GpuRenderer::ensure_deco_atlas hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5907 `my * cw`
+aterm-gpu	5c1905ffed47e9c3	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b float_overflow_to_infinity crates/aterm-gpu/src/renderer.rs:8347 `f64::from((live_bg >> 16) & 0xff) / 255.0`
+aterm-gpu	5c5ef5d7eb90e6ca	wall-backstop	aterm_gpu::renderer::changed_row_band::{closure#0} arithmetic_overflow_mul crates/aterm-gpu/src/renderer.rs:4381 `(row + 1) * stride`
+aterm-gpu	5ce1040a16d3f260	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane arithmetic_overflow_mul crates/aterm-gpu/src/renderer.rs:5983 `((y0 + y) * tw) as usize * 4`
+aterm-gpu	5e81132502f6b321	wall-backstop	aterm_gpu::renderer::GpuRenderer::ensure_metal_tray_card slice_bounds_check crates/aterm-gpu/src/renderer.rs:6957 `[y0 as usize * stride..y1 as usize * stride]`
+aterm-gpu	625979af795816bf	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:8003 `win … .expect("ensured above when `bloom_state` is Some")`
+aterm-gpu	6487b19acf91be2f	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b hardened_ffi_boundary crates/aterm-gpu/src/renderer.rs:8106 `shimmer_region … .transpose()?`
+aterm-gpu	69466ea4f7bba8bb	wall-backstop	aterm_gpu::renderer::GpuRenderer::lettered_foot arithmetic_overflow_mul crates/aterm-gpu/src/renderer.rs:9732 `r as i64 * i64::from(ch)`
+aterm-gpu	6f6dc8f7a6127d4e	wall-backstop	aterm_gpu::renderer::GpuRenderer::ensure_deco_atlas arithmetic_overflow_add crates/aterm-gpu/src/renderer.rs:5898 `my * atlas_w + x0 + mx`
+aterm-gpu	6f6dc8f7a6127d4e	wall-backstop	aterm_gpu::renderer::GpuRenderer::ensure_deco_atlas arithmetic_overflow_add crates/aterm-gpu/src/renderer.rs:5907 `my * atlas_w + x0 + mx`
+aterm-gpu	718fac7628f0acdb	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b shift_overflow_shr crates/aterm-gpu/src/renderer.rs:8347 `(live_bg >> 16)`
+aterm-gpu	722988f59cf52f9f	wall-backstop	aterm_gpu::renderer::GlyphSlot::ink_reach::{closure#0} hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:3305 `scale.ys.max(1) as i32 * (baseline - rise)`
+aterm-gpu	724e4e8ac956ce5f	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5983 `((y0 + y) * tw) as usize * 4`
+aterm-gpu	74222963f7771da8	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane arithmetic_overflow_mul crates/aterm-gpu/src/renderer.rs:5982 `y * dw`
+aterm-gpu	7e5b369ced6dede6	wall-backstop	aterm_gpu::renderer::GpuRenderer::encode_present_frame hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:9513 `input.rows * ch`
+aterm-gpu	7fef53530d496988	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane slice_bounds_check crates/aterm-gpu/src/renderer.rs:5985 `[src..src + (dw * 4) as usize]`
+aterm-gpu	874cb34b05ac3769	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane arithmetic_overflow_mul crates/aterm-gpu/src/renderer.rs:5977 `(y0 * tw)`
+aterm-gpu	87ec471ed54429cb	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b hardened_ffi_boundary crates/aterm-gpu/src/renderer.rs:8009 `MetalArmLive::upload_scratch_stream( … )?`
+aterm-gpu	87ec471ed54429cb	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b hardened_ffi_boundary crates/aterm-gpu/src/renderer.rs:8019 `MetalArmLive::upload_scratch_stream( … )?`
+aterm-gpu	87ec471ed54429cb	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b hardened_ffi_boundary crates/aterm-gpu/src/renderer.rs:8028 `MetalArmLive::upload_scratch_stream( … )?`
+aterm-gpu	87ec471ed54429cb	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b hardened_ffi_boundary crates/aterm-gpu/src/renderer.rs:8197 `MetalArmLive::upload_scratch_stream( … )?`
+aterm-gpu	87ec471ed54429cb	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b hardened_ffi_boundary crates/aterm-gpu/src/renderer.rs:8204 `MetalArmLive::upload_scratch_stream( … )?`
+aterm-gpu	88da75e5ebc6fc9b	wall-backstop	aterm_gpu::renderer::GpuRenderer::ensure_deco_atlas hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5898 `my * cw + mx`
+aterm-gpu	88da75e5ebc6fc9b	wall-backstop	aterm_gpu::renderer::GpuRenderer::ensure_deco_atlas hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5907 `my * cw + mx`
+aterm-gpu	8a39998ac80bd63f	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane arithmetic_overflow_add crates/aterm-gpu/src/renderer.rs:5984 `dst + (dw * 4) as usize`
+aterm-gpu	8a7487fc3e75b6b2	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane arithmetic_overflow_add crates/aterm-gpu/src/renderer.rs:5985 `src + (dw * 4) as usize`
+aterm-gpu	8e302cd8929fbdc5	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b float_overflow_to_infinity crates/aterm-gpu/src/renderer.rs:8032 `1.0 / bw as f32`
+aterm-gpu	956f129e9e5e571d	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:8347 `(live_bg >> 16)`
+aterm-gpu	96faf1fbedb0e8ad	wall-backstop	aterm_gpu::renderer::GpuRenderer::ensure_metal_tray_card hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:6957 `y0 as usize * stride`
+aterm-gpu	9d612adffd99ef08	wall-backstop	aterm_gpu::renderer::GpuRenderer::encode_frame::{closure#2} hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:10257 `grid_top + r * ch`
+aterm-gpu	a16bc5da782c1e56	wall-backstop	aterm_gpu::renderer::GpuRenderer::ensure_deco_atlas hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5898 `my * atlas_w + x0`
+aterm-gpu	a16bc5da782c1e56	wall-backstop	aterm_gpu::renderer::GpuRenderer::ensure_deco_atlas hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5907 `my * atlas_w + x0`
+aterm-gpu	a267e473d3a40cba	wall-backstop	aterm_gpu::renderer::SpriteTex::metal_atlas hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:3642 `(self.w as usize * self.h as usize * 4)`
+aterm-gpu	a7782892b575aaae	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5984 `dst + (dw * 4) as usize`
+aterm-gpu	a94a9c3ee39a6128	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane arithmetic_overflow_mul crates/aterm-gpu/src/renderer.rs:5978 `(dw * dh * 4)`
+aterm-gpu	a9d7a7046746522c	wall-backstop	aterm_gpu::renderer::GpuRenderer::ensure_metal_tray_card hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:6968 `band.1 as usize * stride`
+aterm-gpu	aeb30a26ef9a998b	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5982 `y * dw`
+aterm-gpu	b487213665b2eae9	wall-backstop	aterm_gpu::renderer::GpuRenderer::ensure_deco_atlas arithmetic_overflow_add crates/aterm-gpu/src/renderer.rs:5898 `my * cw + mx`
+aterm-gpu	b487213665b2eae9	wall-backstop	aterm_gpu::renderer::GpuRenderer::ensure_deco_atlas arithmetic_overflow_add crates/aterm-gpu/src/renderer.rs:5907 `my * cw + mx`
+aterm-gpu	bcd87962401c9b37	wall-backstop	aterm_gpu::renderer::MetalArmLive::ensure_atlas arithmetic_overflow_mul crates/aterm-gpu/src/renderer.rs:2690 `(tw * th * bpp)`
+aterm-gpu	bdb7a9e916f1cd77	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane arithmetic_overflow_mul crates/aterm-gpu/src/renderer.rs:5974 `(tw * th * 4)`
+aterm-gpu	c4c8978630bee673	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane arithmetic_overflow_mul crates/aterm-gpu/src/renderer.rs:5982 `(y * dw * 4)`
+aterm-gpu	c5815221a9ff620f	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane arithmetic_overflow_add crates/aterm-gpu/src/renderer.rs:5983 `(y0 + y)`
+aterm-gpu	ca4d094cc501d389	wall-backstop	aterm_gpu::renderer::GpuRenderer::ensure_deco_atlas hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5898 `my * atlas_w + x0 + mx`
+aterm-gpu	ca4d094cc501d389	wall-backstop	aterm_gpu::renderer::GpuRenderer::ensure_deco_atlas hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5907 `my * atlas_w + x0 + mx`
+aterm-gpu	cad21cd11ba2408e	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b hardened_ffi_boundary crates/aterm-gpu/src/renderer.rs:8203 `bloom_stream.clone_retained()`
+aterm-gpu	cad71b25fd572b8d	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5979 `dst + len`
+aterm-gpu	cfb55976328f3588	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane arithmetic_overflow_mul crates/aterm-gpu/src/renderer.rs:5983 `((y0 + y) * tw)`
+aterm-gpu	dfea36ea453d11ce	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5982 `(y * dw * 4)`
+aterm-gpu	e16374d1c665ad6e	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b float_overflow_to_infinity crates/aterm-gpu/src/renderer.rs:8349 `f64::from(live_bg & 0xff) / 255.0`
+aterm-gpu	e35ba61d7b5223c4	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5974 `tw * th`
+aterm-gpu	e4c24042eda96cc0	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5974 `(tw * th * 4)`
+aterm-gpu	e67069cfe7ea6580	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:8018 `extract_first as usize * std::mem::size_of::<GlowInstance>()`
+aterm-gpu	ed4259446d246d2b	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:5983 `(y0 + y)`
+aterm-gpu	edfa2167d0f1c091	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane arithmetic_overflow_mul crates/aterm-gpu/src/renderer.rs:5984 `(dw * 4)`
+aterm-gpu	edfa2167d0f1c091	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane arithmetic_overflow_mul crates/aterm-gpu/src/renderer.rs:5985 `(dw * 4)`
+aterm-gpu	f34bf117128a4737	wall-backstop	aterm_gpu::renderer::GpuRenderer::pack_image_plane arithmetic_overflow_mul crates/aterm-gpu/src/renderer.rs:5974 `tw * th`
+aterm-gpu	f5dfd9d78eb93a57	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b hardened_ffi_boundary crates/aterm-gpu/src/renderer.rs:8184 `live.ensure_submit_b_blit_u(want)?`
+aterm-gpu	f658d3d619ec6ec3	wall-backstop	aterm_gpu::frame_from_padded_rgba arithmetic_overflow_add crates/aterm-gpu/src/lib.rs:220 `base + w * 4`
+aterm-gpu	f71d4062d08a4942	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b hardened_panic_boundary crates/aterm-gpu/src/renderer.rs:8030 `live.submit_b_slots[sb_idx]`
+aterm-gpu	f88448b6b476c2c9	wall-backstop	aterm_gpu::renderer::GpuRenderer::lettered_foot arithmetic_overflow_sub crates/aterm-gpu/src/renderer.rs:9732 `top + r as i64 * i64::from(ch) - slack`
+aterm-gpu	fa367278dcebed0f	wall-backstop	aterm_gpu::renderer::grow_atlas arithmetic_overflow_mul crates/aterm-gpu/src/renderer.rs:3515 `(atlas.width * need_h * atlas.kind.bpp())`
+aterm-gpu	fac0c71010a85835	wall-backstop	aterm_gpu::renderer::GpuRenderer::ensure_metal_tray_card arithmetic_overflow_add crates/aterm-gpu/src/renderer.rs:6967 `*tray_upload_bytes += bytes.len() as u64`
+aterm-gpu	fc39153fbd11249a	wall-backstop	aterm_gpu::renderer::GpuRenderer::metal_encode_submit_b index_out_of_bounds crates/aterm-gpu/src/renderer.rs:8030 `live.submit_b_slots[sb_idx]`
 aterm-gpu-web	-	cancelled	0
 aterm-grapheme	-	cancelled	0
 aterm-grid	-	cancelled	0
@@ -15585,6 +15691,7 @@ aterm-hash	e1998e0965577fc0	wall-backstop	aterm_hash::hash_bytes slice_bounds_ch
 aterm-http	-	cancelled	0
 aterm-keeper	-	cancelled	0
 aterm-lexicon	-	cancelled	0
+aterm-log	-	cancelled	0
 aterm-machines	-	cancelled	0
 aterm-machines	00135a80b76f8425	rss-backstop	aterm_machines::port::secret::Secret::new assertion crates/aterm-machines/src/port/secret.rs:35 `secret.bytes`
 aterm-machines	092b7062b315ad30	rss-backstop	aterm_machines::items::apps::is_macho::{closure#0} hardened_panic_boundary crates/aterm-machines/src/items/apps.rs:1233 `n[0]`
@@ -15853,15 +15960,23 @@ aterm-png	f0900505610c5b97	wall-backstop	aterm_png::decode::read_sample hardened
 aterm-png	f3ca44474bb11f91	wall-backstop	aterm_png::decode::read_sample hardened_panic_boundary crates/aterm-png/src/decode.rs:538 `b + 1`
 aterm-predict	-	cancelled	0
 aterm-pty	-	cancelled	0
+aterm-scene	-	cancelled	0
+aterm-scene	692650f1d878e8b5	wall-backstop	aterm_scene::atlas::Tile::over_run hardened_panic_boundary crates/aterm-scene/src/atlas.rs:110 `y as u32 * self.w`
+aterm-scene	726007e52d6a61e8	wall-backstop	aterm_scene::atlas::Tile::new arithmetic_overflow_mul crates/aterm-scene/src/atlas.rs:20 `w as usize * h as usize * 4`
+aterm-scene	76bfc0e57e7bdd5c	wall-backstop	aterm_scene::atlas::Tile::reset unbounded_allocation crates/aterm-scene/src/atlas.rs:32 `self.px.resize(len, 0)`
+aterm-scene	c44e54e2fbcd6cde	wall-backstop	aterm_scene::atlas::Tile::new hardened_panic_boundary crates/aterm-scene/src/atlas.rs:20 `w as usize * h as usize * 4`
 aterm-scrollback	-	cancelled	0
 aterm-search	-	cancelled	0
 aterm-selection	-	cancelled	0
 aterm-session	-	cancelled	0
 aterm-shell-integration	-	cancelled	0
+aterm-sixel	-	cancelled	0
 aterm-slog	-	cancelled	0
 aterm-slog	05af28c23c0bdeb0	wall-backstop	aterm_slog::fold::snap::<impl aterm_slog::fold::Fold>::from_snapshot unreachable crates/aterm-slog/src/fold_snap.rs:473 `pub fn from_snapshot(lines: &[&str]) -> Result<Fold, SnapError> { … }`
-aterm-slog	8dcba23829862e32	wall-backstop	aterm_slog::log::carry::<impl aterm_slog::log::Log>::from_carry_built unreachable crates/aterm-slog/src/carry.rs:410 `pub fn from_carry_built( … }`
+aterm-slog	8dcba23829862e32	wall-backstop	aterm_slog::log::carry::<impl aterm_slog::log::Log>::from_carry_built unreachable crates/aterm-slog/src/carry.rs:427 `pub fn from_carry_built( … }`
 aterm-theme-pack	-	cancelled	0
+aterm-toml	-	cancelled	0
+aterm-toolchain	-	cancelled	0
 aterm-update-core	-	cancelled	0
 aterm-verify	-	cancelled	0
 aterm-verify	01ed85c209709361	wall-backstop	aterm_verify::perf::trend::civil_date arithmetic_overflow_div crates/aterm-verify/src/perf/trend.rs:360 `doe / 146_096`
@@ -15981,6 +16096,7 @@ aterm-wasm	1d775bbb12d383bd	wall-backstop	aterm_wasm::dirty_band_present_api::<i
 aterm-wasm	1d775bbb12d383bd	wall-backstop	aterm_wasm::dirty_band_present_api::<impl aterm_wasm::AtermTerminal>::expand_damage_to_rgba hardened_panic_boundary crates/aterm-wasm/src/dirty_band_present_api.rs:154 `y * self.width`
 aterm-wasm	8f587cb5a60b4546	wall-backstop	aterm_wasm::dirty_band_present_api::<impl aterm_wasm::AtermTerminal>::expand_damage_to_rgba hardened_panic_boundary crates/aterm-wasm/src/dirty_band_present_api.rs:134 `self.rows * ch`
 aterm-wasm	cc38c38eca5ed2be	wall-backstop	aterm_wasm::dirty_band_present_api::<impl aterm_wasm::AtermTerminal>::expand_damage_to_rgba hardened_panic_boundary crates/aterm-wasm/src/dirty_band_present_api.rs:154 `(y + h) * self.width`
+aterm-wayland	-	cancelled	0
 aterm-win32	-	cancelled	0
 aterm-window	-	cancelled	0
 aterm-winit-keymap	-	cancelled	0

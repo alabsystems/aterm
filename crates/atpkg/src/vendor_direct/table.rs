@@ -245,8 +245,6 @@ pub struct VendorSpec {
     pub floor: Version,
     /// The newest legacy ALab index build of the program this code vouches for, or [`NEVER_INDEX_PINNED`].
     pub legacy_ceiling: u64,
-    /// Whether the default set installs it on every machine it serves; a row without it is installed only when a person asks (`aterm pkg install <program>`) and kept current once installed.
-    pub default_set: bool,
     /// Its twin's sign-in gate under aterm, for a program that opens a browser on every signed-out launch ([`SigninGate`]).
     pub signin_gate: Option<SigninGate>,
 }
@@ -414,7 +412,6 @@ const OPENAI_CODEX: VendorSpec = VendorSpec {
     revision_versions: false,
     floor: floor(0, 156, 1),
     legacy_ceiling: LEGACY_CEILING,
-    default_set: true,
     signin_gate: None,
 };
 
@@ -503,7 +500,6 @@ pub const VENDORS: &[VendorSpec] = &[
         revision_versions: false,
         floor: floor(2, 1, 281),
         legacy_ceiling: LEGACY_CEILING,
-        default_set: true,
         signin_gate: None,
     },
     OPENAI_CODEX,
@@ -549,7 +545,6 @@ pub const VENDORS: &[VendorSpec] = &[
         revision_versions: false,
         floor: floor(1, 3, 6),
         legacy_ceiling: NEVER_INDEX_PINNED,
-        default_set: true,
         signin_gate: None,
     },
     VendorSpec {
@@ -631,7 +626,6 @@ pub const VENDORS: &[VendorSpec] = &[
         revision_versions: true,
         floor: revision_floor(1, 4, 9, 6297, Some(1)),
         legacy_ceiling: NEVER_INDEX_PINNED,
-        default_set: true,
         signin_gate: None,
     },
     VendorSpec {
@@ -749,7 +743,6 @@ pub const VENDORS: &[VendorSpec] = &[
         revision_versions: false,
         floor: floor(1, 0, 67),
         legacy_ceiling: NEVER_INDEX_PINNED,
-        default_set: false,
         signin_gate: Some(GROK_SIGNIN_GATE),
     },
     VendorSpec {
@@ -822,7 +815,6 @@ pub const VENDORS: &[VendorSpec] = &[
         revision_versions: false,
         floor: floor(2, 3, 1),
         legacy_ceiling: NEVER_INDEX_PINNED,
-        default_set: false,
         signin_gate: None,
     },
 ];
@@ -1128,24 +1120,5 @@ mod tests {
         assert!(Anchor::XaiNpmRegistry.reads_record_of(Anchor::XaiDeveloperId));
         assert!(!Anchor::XaiDeveloperId.reads_record_of(Anchor::XaiNpmRegistry));
         assert!(!Anchor::MetaDeveloperId.reads_record_of(Anchor::XaiDeveloperId));
-    }
-
-    /// THE DEFAULT SET IS THE OWNER'S ROSTER: every machine a row serves gets claude, codex
-    /// (and OpenAI's own codex-old beside it), agy and muse; grok and kimi are installed only
-    /// when a person asks for them, and kept current once they are.
-    #[test]
-    fn only_the_owners_roster_is_in_the_default_set() {
-        let set: Vec<&str> = VENDORS
-            .iter()
-            .filter(|row| row.default_set)
-            .map(|row| row.program)
-            .collect();
-        assert_eq!(set, ["claude", "codex", "agy", "muse", "codex-old"]);
-        let asked: Vec<&str> = VENDORS
-            .iter()
-            .filter(|row| !row.default_set)
-            .map(|row| row.program)
-            .collect();
-        assert_eq!(asked, ["grok", "kimi"]);
     }
 }

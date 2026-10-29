@@ -10,7 +10,7 @@
 
 use crate::harness;
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -251,17 +251,43 @@ fn until_field(w: &World, sid: &str, key: &str, want: &str) -> Duration {
     }
 }
 
+/// The line that runs `script` as the command `name`: a `/bin/sh` that writes
+/// the marks an integrated shell writes for a typed `name` (OSC 133 A and B,
+/// 633;E, then 133;C) and only then execs `image` on `script`, as a shell
+/// execs a command after its C. aterm places an exec by where the output
+/// stream stood when it heard it, so an exec before the C is no command's: the
+/// image that names the command execs after it, inside the command.
+fn marked_line(dir: &Path, name: &str, image: &Path, script: &Path) -> String {
+    let marks = dir.join(format!("{name}-marks.sh"));
+    std::fs::write(
+        &marks,
+        format!(
+            "#!/bin/sh\n\
+             nonce=\"${{ATERM_SHELL_NONCE:+;id=$ATERM_SHELL_NONCE}}\"\n\
+             printf '\\033]133;A%s\\007\\033]133;B%s\\007\\033]633;E;{name}%s\\007\\033]133;C%s\\007' \
+             \"$nonce\" \"$nonce\" \"$nonce\" \"$nonce\"\n\
+             exec \"$@\"\n"
+        ),
+    )
+    .expect("write the marks");
+    format!(
+        "/bin/sh {} {} {}",
+        marks.display(),
+        image.display(),
+        script.display()
+    )
+}
+
 /// The fake Claude: Claude Code's live zone painted by `printf`, with the
 /// terminal's cursor left on the prompt box's caret row as Claude Code keeps it
-/// (the server reads `idle` only at a box holding the cursor), advanced by Enter.
-fn write_fake_claude(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+/// (the server reads `idle` only at a box holding the cursor), advanced by Enter;
+/// the line [`marked_line`] runs it on, through a signed Bash stand-in whose
+/// executable is named `claude` so the kernel identifies that image.
+fn write_fake_claude(dir: &Path) -> String {
     let rule = "─".repeat(120);
     let indicator = format!("{}12% until auto-compact", " ".repeat(96));
     let script = format!(
         "#!/bin/sh\n\
-         nonce=\"${{ATERM_SHELL_NONCE:+;id=$ATERM_SHELL_NONCE}}\"\n\
-         printf '\\033]133;A%s\\007\\033]133;B%s\\007\\033]633;E;claude%s\\007\\033]133;C%s\\007' \
-         \"$nonce\" \"$nonce\" \"$nonce\" \"$nonce\"\n\
          printf '\\033[2J\\033[H'\n\
          printf '%s\\n' '⏺ {SENTINEL} the plan' '' '✶ Deliberating… (3s · esc to interrupt)' '' \
          '{rule}' '❯ ' '{rule}' '  ? for shortcuts'\n\
@@ -281,9 +307,17 @@ fn write_fake_claude(dir: &std::path::Path) -> (PathBuf, PathBuf) {
     let path = dir.join("fake-claude.sh");
     std::fs::write(&path, script).expect("write the fake");
     let claude = dir.join("claude");
-    let _ = std::fs::remove_file(&claude);
-    std::os::unix::fs::symlink("/bin/bash", &claude).expect("link claude -> bash");
-    (claude, path)
+    aterm_uds::deadline::ad_hoc_copy(Path::new("/bin/bash"), &claude);
+    let mut proof = aterm_uds::spawnfd::command(&claude)
+        .env_clear()
+        .current_dir(dir)
+        .args(["-c", "printf 'presence-claude-ready\\n'"])
+        .stdout(aterm_uds::spawnfd::Stdio::piped())
+        .spawn()
+        .expect("run the named stand-in in place");
+    aterm_uds::deadline::prints(&mut proof, "presence-claude-ready", DEADLINE);
+    aterm_uds::deadline::kill_within(&mut proof, DEADLINE);
+    marked_line(dir, "claude", &claude, &path)
 }
 
 /// **THE ROW MEANS SOMETHING, IT FLIPS WITH THE SERVER'S VERDICT, AND IT
@@ -313,12 +347,8 @@ fn a_sessions_presence_row_relays_the_servers_agent_verdict_and_never_text() {
         "no indicator, no token: {body}"
     );
 
-    let (claude, fake) = write_fake_claude(&w.tmp);
-    let sent = w.verb(&format!(
-        "@{sid} send {} {}",
-        claude.display(),
-        fake.display()
-    ));
+    let line = write_fake_claude(&w.tmp);
+    let sent = w.verb(&format!("@{sid} send {line}"));
     assert!(sent.ok(), "send: {}", sent.header());
     let started = Instant::now();
     assert!(w.verb(&format!("@{sid} key enter")).ok());
@@ -401,20 +431,20 @@ fn a_sessions_presence_row_relays_the_servers_agent_verdict_and_never_text() {
     eprintln!("aterm link ls:\n{ls}");
 }
 
-/// A program that marks itself as the session's executing command `name`
-/// (the same OSC 133/633 marks the fake Claude writes, so `status detail=`
-/// becomes `name`) and then waits on stdin.
-fn write_marked_program(dir: &std::path::Path, name: &str) -> PathBuf {
-    let script = format!(
-        "#!/bin/sh\n\
-         nonce=\"${{ATERM_SHELL_NONCE:+;id=$ATERM_SHELL_NONCE}}\"\n\
-         printf '\\033]133;A%s\\007\\033]133;B%s\\007\\033]633;E;{name}%s\\007\\033]133;C%s\\007' \
-         \"$nonce\" \"$nonce\" \"$nonce\" \"$nonce\"\n\
-         read _x\n"
-    );
+/// The line that runs the command `name` ([`marked_line`]), a program that
+/// waits on stdin, with `name`, a copy of `/bin/bash` signed ad hoc
+/// ([`harness::own_image`]), to run it: `status detail=` names only a program
+/// the kernel saw exec, and the copy's image is `name` itself, which never
+/// re-execs.
+fn write_marked_program(dir: &Path, name: &str) -> String {
     let path = dir.join(format!("{name}.sh"));
-    std::fs::write(&path, script).expect("write the marked program");
-    path
+    std::fs::write(&path, "#!/bin/sh\nread _x\n").expect("write the marked program");
+    marked_line(
+        dir,
+        name,
+        &harness::own_image(dir, name, "/bin/bash"),
+        &path,
+    )
 }
 
 /// **A `meta` CHANGE AFTER THE FIRST READ REACHES THE BUS BY THE PUSH, AND
@@ -448,11 +478,8 @@ fn a_meta_change_after_the_first_read_rides_the_push_alone() {
     let marker = w.state.join("drop-meta-event");
     std::fs::write(&marker, b"1\n").expect("arm the dropped push");
     assert!(w.verb(&format!("@{sid} meta set attention dropped-b")).ok());
-    let witness = write_marked_program(&w.tmp, "r13witness");
-    assert!(
-        w.verb(&format!("@{sid} send /bin/sh {}", witness.display()))
-            .ok()
-    );
+    let line = write_marked_program(&w.tmp, "r13witness");
+    assert!(w.verb(&format!("@{sid} send {line}")).ok());
     assert!(w.verb(&format!("@{sid} key enter")).ok());
     until_field(&w, &sid, "detail", "r13witness");
     let body = presence_body(&w, &sid).expect("the row");

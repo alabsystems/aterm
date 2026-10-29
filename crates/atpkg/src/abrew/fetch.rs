@@ -39,11 +39,23 @@ pub fn run_inherit(prog: &str, args: &[&str]) -> i32 {
 
 /// The URL schemes abrew will ever fetch.
 fn check_url(url: &str) -> Result<(), String> {
+    if url.contains(['\r', '\n', '\0']) {
+        return Err("abrew: refusing download URL containing control bytes".to_string());
+    }
     let scheme = url.split("://").next().unwrap_or("");
     if matches!(scheme, "https" | "http" | "file") {
         Ok(())
     } else {
         Err(format!("abrew: refusing non-http(s) download URL: {url}"))
+    }
+}
+
+/// Reject control bytes that could split HTTP headers or inject `curl -K` directives.
+fn check_headers(headers: &[&str]) -> Result<(), String> {
+    if headers.iter().any(|h| h.contains(['\r', '\n', '\0'])) {
+        Err("abrew: refusing HTTP header containing CR, LF or NUL".to_string())
+    } else {
+        Ok(())
     }
 }
 
@@ -128,6 +140,7 @@ pub(super) fn parse_get_response(
 
 pub(super) fn curl_get_with_status(url: &str, headers: &[&str]) -> Result<Vec<u8>, GetError> {
     check_url(url).map_err(GetError::other)?;
+    check_headers(headers).map_err(GetError::other)?;
     let mut args: Vec<&str> = vec![
         "-fsSL",
         "--max-time",
@@ -150,6 +163,7 @@ pub(super) fn curl_get_with_status(url: &str, headers: &[&str]) -> Result<Vec<u8
 /// Download into an exclusively owned scratch beside `dest`, then rename it.
 pub fn curl_to_file(url: &str, dest: &Path, headers: &[&str]) -> Result<(), String> {
     check_url(url)?;
+    check_headers(headers)?;
     let parent = dest
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -226,6 +240,7 @@ pub fn curl_to_file(url: &str, dest: &Path, headers: &[&str]) -> Result<(), Stri
 /// as in [`curl_to_file`].
 pub fn head_size(url: &str, headers: &[&str]) -> Option<u64> {
     check_url(url).ok()?;
+    check_headers(headers).ok()?;
     let work = aterm_tempfile::tempdir().ok()?;
     let mut args: Vec<String> = vec![
         "-fsSIL".into(),
@@ -1186,6 +1201,31 @@ mod tests {
             std::fs::write(&archive, bytes).unwrap();
             assert!(untar(&archive, &stage).is_err());
             assert!(!stage.exists());
+        }
+    }
+
+    #[test]
+    fn headers_and_urls_with_line_breaks_or_nuls_are_refused_before_spawning_curl() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("sub/out.bin");
+        for bad_header in [
+            "Authorization: Bearer a\noutput = /tmp/pwn",
+            "X-Test: a\r\nX-Injected: b",
+            "X-Test: a\0b",
+        ] {
+            assert!(curl_get("https://example.invalid/x", &[bad_header]).is_err());
+            assert!(curl_to_file("https://example.invalid/x", &dest, &[bad_header]).is_err());
+            assert!(head_size("https://example.invalid/x", &[bad_header]).is_none());
+            assert!(!dest.parent().unwrap().exists());
+        }
+        for bad_url in [
+            "https://example.invalid/a\nb",
+            "https://example.invalid/a\rb",
+            "https://example.invalid/a\0b",
+        ] {
+            assert!(curl_get(bad_url, &[]).is_err());
+            assert!(curl_to_file(bad_url, &dest, &[]).is_err());
+            assert!(head_size(bad_url, &[]).is_none());
         }
     }
 }

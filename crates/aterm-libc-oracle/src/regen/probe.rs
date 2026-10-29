@@ -9,7 +9,7 @@ use std::fmt;
 use super::decls::Decls;
 use super::layout::TypeSizes;
 use super::shim::const_expr;
-use crate::cargo::{Diagnostic, Outcome, tail};
+use crate::cargo::{Diagnostic, Outcome, error_list, tail};
 use crate::cells::Cell;
 
 /// The reference crate the probe measures, at the version the shim replaces.
@@ -217,7 +217,6 @@ pub fn reported(errors: &[Diagnostic], file: &str) -> BTreeMap<usize, u64> {
 /// Why a probe measured less than it asked.
 #[must_use]
 pub fn unmeasured_because(outcome: &Outcome) -> String {
-    const SHOWN: usize = 5;
     let other: Vec<&Diagnostic> = outcome
         .errors
         .iter()
@@ -230,15 +229,7 @@ pub fn unmeasured_because(outcome: &Outcome) -> String {
     if other.is_empty() {
         return tail(&outcome.stderr, 20);
     }
-    let mut out: Vec<String> = other
-        .iter()
-        .take(SHOWN)
-        .map(|error| error.rendered.trim_end().to_string())
-        .collect();
-    if other.len() > SHOWN {
-        out.push(format!("… and {} more errors", other.len() - SHOWN));
-    }
-    out.join("\n")
+    error_list(other.into_iter())
 }
 
 /// Everything the three passes measured on one cell.
@@ -254,33 +245,35 @@ pub struct Measured {
 }
 
 impl Measured {
-    /// File one pass's facts.
+    /// File one pass's facts atomically.
     /// # Errors
-    /// When a byte measured out of range.
+    /// When a byte measured out of range or out of order; on error `self` is unchanged.
     pub fn record(&mut self, facts: BTreeMap<Key, u64>) -> Result<(), String> {
+        let mut next = self.clone();
         for (key, value) in facts {
             match key {
                 Key::Size(name) => {
-                    self.size.insert(name, value);
+                    next.size.insert(name, value);
                 }
                 Key::Align(name) => {
-                    self.align.insert(name, value);
+                    next.align.insert(name, value);
                 }
                 Key::Offset(owner, field) => {
-                    self.offset.insert((owner, field), value);
+                    next.offset.insert((owner, field), value);
                 }
                 Key::Byte(name, i) => {
                     let byte = u8::try_from(value).map_err(|_| format!("{name}[{i}] = {value}"))?;
-                    let bytes = self.bytes.entry(name).or_default();
+                    let bytes = next.bytes.entry(name).or_default();
                     if bytes.len() != i {
                         return Err(format!("byte {i} measured out of order"));
                     }
                     bytes.push(byte);
                 }
-                Key::TypeSize(ty) => self.field_types.entry(ty).or_default().0 = value,
-                Key::TypeAlign(ty) => self.field_types.entry(ty).or_default().1 = value,
+                Key::TypeSize(ty) => next.field_types.entry(ty).or_default().0 = value,
+                Key::TypeAlign(ty) => next.field_types.entry(ty).or_default().1 = value,
             }
         }
+        *self = next;
         Ok(())
     }
 }
@@ -384,8 +377,15 @@ mod tests {
         );
         assert!(
             measured
-                .record(BTreeMap::from([(Key::Byte("X".into(), 0), 256)]))
+                .record(BTreeMap::from([
+                    (Key::Size("extra".into()), 16),
+                    (Key::Byte("X".into(), 0), 256),
+                ]))
                 .is_err()
+        );
+        assert!(
+            !measured.size.contains_key("extra"),
+            "failed pass leaves Measured unchanged"
         );
     }
 

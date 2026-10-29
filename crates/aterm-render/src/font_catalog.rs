@@ -523,13 +523,7 @@ fn is_font(path: &Path) -> bool {
         })
 }
 
-fn normalize_family(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| !ch.is_ascii_whitespace() && *ch != '-' && *ch != '_')
-        .map(|ch| ch.to_ascii_lowercase())
-        .collect()
-}
+use crate::normalize_family;
 
 /// Resolve and admit every config-authored family/path in one generation ([`FaceTarget`]).
 #[must_use]
@@ -1612,6 +1606,24 @@ mod tests {
         let absent_root = fixture("memo-later");
         std::fs::remove_dir_all(&absent_root).unwrap();
         let roots = vec![root.clone(), absent_root.clone()];
+        // Pin the directory's mtime so the next entry moves it at any clock granularity.
+        #[cfg(unix)]
+        let vendor_dir = std::fs::File::open(&vendor);
+        #[cfg(windows)]
+        let vendor_dir = {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            std::fs::OpenOptions::new()
+                .access_mode(FILE_WRITE_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(&vendor)
+        };
+        vendor_dir
+            .and_then(|d| {
+                d.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800))
+            })
+            .unwrap();
 
         let (first, walked) = memoized_font_files_walked(&roots);
         assert_eq!(first, vec![vendor.join("a.ttf")]);
@@ -1621,13 +1633,11 @@ mod tests {
         assert_eq!(again, first);
         assert!(!walked, "an unchanged tree is answered from the memo");
 
-        std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(vendor.join("b.ttf"), b"b").unwrap();
         let (grown, walked) = memoized_font_files_walked(&roots);
         assert_eq!(grown, vec![vendor.join("a.ttf"), vendor.join("b.ttf")]);
         assert!(walked, "an entry added deep in the tree is a miss");
 
-        std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::create_dir_all(&absent_root).unwrap();
         std::fs::write(absent_root.join("c.otf"), b"c").unwrap();
         let (with_root, walked) = memoized_font_files_walked(&roots);

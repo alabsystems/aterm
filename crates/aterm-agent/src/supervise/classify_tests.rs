@@ -738,6 +738,82 @@ fn an_awk_program_that_runs_or_writes_in_any_spelling_is_no_read() {
     }
 }
 
+/// macOS awk (BWK 20200816) ignores every long option and `-e` and runs the next word as its
+/// program, so an awk line it reads otherwise than gawk is no read (MEASURED on `/usr/bin/awk`:
+/// `docs/measured/classifier-audit-3-fixes-2026-10-29.md`).
+#[test]
+fn an_awk_line_macos_awk_reads_otherwise_than_gawk_is_no_read() {
+    for cmd in [
+        "awk --field-separator 'BEGIN{system(\"touch m1\")}' in.txt",
+        "awk --assign 'BEGIN{system(\"touch m2\")}' in.txt",
+        "awk --field-separator 'BEGIN{system(\"touch m1\")}'",
+        "awk --field-separator '{print}' ~/.ssh/id_rsa",
+        "awk --field-separator , '{print $1}' in.txt",
+        "awk --source='{print}' 'BEGIN{system(\"touch m3\")}'",
+        "awk -e '{print}' -e key",
+        "awk -e '{print $1}' -F , in.txt",
+        "awk -e '{print}' -- key",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} is no read");
+    }
+    let v = classify_command("awk --assign 'BEGIN{system(\"touch m2\")}' in.txt");
+    assert!(v.reason.contains("macOS awk (BWK)"), "{}", v.reason);
+    // NEGATIVE CONTROLS
+    for cmd in [
+        "awk --field-separator=, '{print $1}' in.txt",
+        "awk --assign=n=3 '{print $n}' in.txt",
+        "awk -F , '{print $2}' in.txt",
+        "awk -F, -e '{print $2}' in.txt",
+        "awk -v OFS=, -e '{print $1, $2}' in.txt",
+        "awk -e '{print}' in.txt",
+        "awk -- '{print}' in.txt",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} refused: {}", v.reason);
+    }
+}
+
+/// A glob is its own command's words and a substitution's output its parent's, so a glob in
+/// `ls`'s words before `| sort` is never sort's; an unquoted parameter holding one (`$?`) counts.
+#[test]
+fn a_glob_belongs_to_the_command_whose_words_hold_it() {
+    let globs = |line: &str| -> Vec<(String, Option<char>)> {
+        command_words_globbed(line)
+            .expect(line)
+            .into_iter()
+            .map(|(seg, g)| (seg[0].clone(), g))
+            .collect()
+    };
+    let s = |p: &str, g: Option<char>| (p.to_string(), g);
+    assert_eq!(
+        globs("ls /etc/*.conf | sort"),
+        [s("ls", Some('*')), s("sort", None)]
+    );
+    assert_eq!(
+        globs("cd /etc && ls *.conf"),
+        [s("cd", None), s("ls", Some('*'))]
+    );
+    assert_eq!(
+        globs("echo \"$(ls *.md)\" | awk 'NR<3'"),
+        [s("ls", Some('*')), s("echo", Some('*')), s("awk", None)]
+    );
+    assert_eq!(
+        globs("awk 'NR<3' `ls src/?.rs`"),
+        [s("ls", Some('?')), s("awk", Some('?'))]
+    );
+    assert_eq!(
+        globs("cat x; echo $?"),
+        [s("cat", None), s("echo", Some('?'))]
+    );
+    // NEGATIVE CONTROLS
+    assert_eq!(globs("ls '*.md' \\*.txt \"a?\" \"$*\""), [s("ls", None)]);
+    assert_eq!(
+        globs("cat README.md | sort"),
+        [s("cat", None), s("sort", None)]
+    );
+}
+
 /// SORT AND GIT TAKE AN ABBREVIATED LONG OPTION FOR THE WHOLE ONE
 /// ([`long_option_spells`]).
 #[test]

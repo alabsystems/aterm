@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// One session's licence boundaries, counted ([`crate::SessionCtx`]).
 #[derive(Debug, Default)]
 pub(crate) struct LicenceFence {
+    pub(crate) vim: crate::vim_custody::Custody,
     fences: AtomicU64,
     hand_offs: AtomicU64,
 }

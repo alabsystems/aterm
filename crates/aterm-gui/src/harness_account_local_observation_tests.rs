@@ -68,7 +68,10 @@ fn untold() -> (Arc<Accts>, WorkerIdle, AccountLook) {
 fn a_notice_cannot_be_read_by_an_older_generation() {
     let (a, idle, look) = untold();
     idle.kept.lock().unwrap().account.landing = Arc::default();
-    assert_eq!(idle.account_untold(&a.seat(), &look, true), None);
+    assert_eq!(
+        idle.account_untold(&a.seat(), &look, usage_wall(), true),
+        None
+    );
     assert!(
         idle.kept
             .lock()
@@ -92,7 +95,10 @@ fn an_old_process_cannot_retire_the_current_notice() {
         .unwrap()
         .argv
         .push("--new-auth-context".into());
-    assert_eq!(idle.account_untold(&a.seat(), &look, false), None);
+    assert_eq!(
+        idle.account_untold(&a.seat(), &look, usage_wall(), false),
+        None
+    );
     assert!(
         idle.kept
             .lock()
@@ -109,7 +115,8 @@ fn an_old_process_cannot_retire_the_current_notice() {
 fn current_notice_readers_can_retell_or_retire_their_notice() {
     let (a, idle, mut look) = untold();
     assert_eq!(
-        idle.account_untold(&a.seat(), &look, true).as_deref(),
+        idle.account_untold(&a.seat(), &look, usage_wall(), true)
+            .as_deref(),
         Some("work-2")
     );
     assert!(
@@ -122,7 +129,10 @@ fn current_notice_readers_can_retell_or_retire_their_notice() {
             .unwrap()
             .untold
     );
-    assert_eq!(idle.account_untold(&a.seat(), &look, false), None);
+    assert_eq!(
+        idle.account_untold(&a.seat(), &look, usage_wall(), false),
+        None
+    );
     assert!(
         !idle
             .kept
@@ -145,7 +155,10 @@ fn current_notice_readers_can_retell_or_retire_their_notice() {
         .untold = true;
     look.snap.pid += 1;
     idle.kept.lock().unwrap().snapshot = Some(look.snap.clone());
-    assert_eq!(idle.account_untold(&a.seat(), &look, true), None);
+    assert_eq!(
+        idle.account_untold(&a.seat(), &look, usage_wall(), true),
+        None
+    );
     assert!(
         !idle
             .kept
@@ -167,6 +180,7 @@ fn loss_time_tracks_authentication_context_and_allows_record_metadata() {
     let old = idle.account_look(&a.roster()).unwrap();
     assert_eq!(idle.lost_seen(&old, login_wall(), 10), Some(10));
     let mut next = AccountLook {
+        profile_env: old.profile_env.clone(),
         snap: old.snap.clone(),
         who: old.who.clone(),
         label: old.label.clone(),
@@ -203,6 +217,7 @@ fn local_case(case: i64) -> [i64; 3] {
             at: 17,
         });
         AccountLook {
+            profile_env: Vec::new(),
             who: accounts::ProcessLogin {
                 login: None,
                 default_home: true,

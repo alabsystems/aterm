@@ -17,7 +17,7 @@ use crate::procs::{self, alive, descendants};
 use crate::protected::{CCSOCKS, inside_any};
 use crate::pyjson::J;
 use crate::run::{Run, all_runs, take_only_tag, take_tag};
-use crate::util::{atomic_write, keep_file, keep_tree, now_secs, shell_quote};
+use crate::util::{atomic_write, keep_file, keep_tree, now_secs, shell_prepend_path, shell_quote};
 use crate::{Fail, Res, stop};
 
 /// The fake API key `apiKeyHelper` prints (the stub accepts anything).
@@ -30,7 +30,8 @@ pub fn oauth_token() -> String {
     format!("sk-ant-oat01-LABLABLAB{}AA", "A".repeat(80))
 }
 
-/// How `up` makes a lab (each field has its `LAB_*` variable).
+/// How `up` makes a lab (each field has its `LAB_*` variable, but `up`'s flags `--window`,
+/// `--fabric` and `--tab-strip`).
 #[derive(Clone, Debug, Default)]
 pub struct UpOpts {
     /// `LAB_SURVEY=1`: the forced survey flag in the settings at launch.
@@ -67,6 +68,11 @@ pub struct UpOpts {
     /// instance rerouting, so `claude --by-name` runs stub → twin → store as the owner's sessions
     /// do.
     pub reroute: bool,
+    /// The instance reads the stub's own base URL as Claude Code's default route
+    /// ([`aterm_agent::harness::netwatch::LAB_ROUTE_SEAM`]), so a lab Claude Code on the stub
+    /// with a stored login is a roster row's process: `claude-rotation-proof`'s alone (no
+    /// `LAB_*` variable).
+    pub route_seam: bool,
     /// `LAB_HOME_IMAGE=<size>` (`16g`): the scratch's `home/` is a sparse APFS image of that size,
     /// a volume of its own, which the `down` that removes the scratch detaches
     /// ([`home_image_refused`], [`detach_home_image`]).
@@ -76,6 +82,13 @@ pub struct UpOpts {
     /// owner's processes cannot be read, and such a scan rules out no path while one stands
     /// unread, so `aterm harness disk free` frees nothing in a lab without it.
     pub jail_scan: bool,
+    /// `up --fabric`: the lab's own bus ([`crate::bus::lay`]): a private broker in the lab's jail
+    /// and socket dir, the node's and an observer's caps, the instance's `[fabric]` table, the
+    /// rendezvous file `aterm link` reads, and the bridge connected before `up` returns.
+    pub fabric: bool,
+    /// `up --tab-strip`: `tab_strip_rows = 1`, the strip whose tab menu holds the session clause
+    /// (`ctl open tab-menu`); it takes a grid row.
+    pub tab_strip: bool,
 }
 
 impl UpOpts {
@@ -105,8 +118,11 @@ impl UpOpts {
             clock: set("LAB_CLOCK"),
             window: false,
             reroute: set("LAB_REROUTE"),
+            route_seam: false,
             home_image: Some(var("LAB_HOME_IMAGE")).filter(|v| !v.is_empty()),
             jail_scan: set("LAB_JAIL_SCAN"),
+            fabric: false,
+            tab_strip: false,
         }
     }
 }
@@ -185,14 +201,19 @@ fn detach_home_image(run_dir: &Path) -> Result<(), String> {
     )
 }
 
-/// The managed Claude Code, launched by path (not through its shim) ([`pkg_which`]), or
-/// `$LAB_CLAUDE`.
+/// The managed Claude Code, launched by path (not through its shim) ([`pkg_which`]; before any
+/// aterm is built, [`store_shim_target`]), or `$LAB_CLAUDE`.
 /// # Errors
 /// Neither names an executable.
 pub fn find_claude() -> Result<String, String> {
+    let p = paths();
     let c = match std::env::var("LAB_CLAUDE") {
         Ok(c) if !c.is_empty() => c,
-        _ => store_claude(paths(), paths().need_aterm()?)?,
+        _ => match built_aterm(p) {
+            Some(aterm) => store_claude(p, aterm)?,
+            None => store_shim_target(p.store_home(), "claude")
+                .ok_or_else(|| p.need_aterm().err().unwrap_or_default())?,
+        },
     };
     if !crate::sys::executable(&c) {
         return Err(format!("cannot execute {c}"));
@@ -231,9 +252,31 @@ pub fn managed_bin(name: &str, line: &str) -> Option<String> {
     (!last.is_empty()).then(|| last.to_string())
 }
 
-/// The store binary of the managed `name` ([`pkg_which`]).
+/// The store binary of the managed `name` ([`pkg_which`]; before any aterm is built,
+/// [`store_shim_target`]).
 pub(crate) fn managed_store_bin(name: &str) -> Option<String> {
-    managed_store_bin_in(paths(), paths().need_aterm().ok()?, name)
+    let p = paths();
+    match built_aterm(p) {
+        Some(aterm) => managed_store_bin_in(p, aterm, name),
+        None => store_shim_target(p.store_home(), name),
+    }
+}
+
+/// The lab's aterm when one is built ([`crate::paths::Paths::need_aterm`] without its refusal).
+fn built_aterm(p: &crate::paths::Paths) -> Option<&Path> {
+    p.aterm
+        .as_deref()
+        .filter(|a| crate::sys::executable(&a.to_string_lossy()))
+}
+
+/// What the `bin/<name>` shim of the package store under `home` (its default prefix) forwards
+/// to, read by atpkg's own shim reader with no aterm run, as `pkg which` reads it: a verb that
+/// builds its aterm (`claude-measure`, `codex-measure`) names its program before that build.
+fn store_shim_target(home: &str, name: &str) -> Option<String> {
+    let layout = atpkg::Layout {
+        prefix: atpkg::store::default_prefix(Path::new(home)),
+    };
+    atpkg::which(&layout, name).map(|t| t.to_string_lossy().into_owned())
 }
 
 /// [`managed_store_bin`] in the package store the lab's facts `p` name
@@ -609,8 +652,9 @@ fn sweep_copies(
 }
 
 /// The end of `down`, once its logs are kept: the copies that may go, the scratch among them
-/// ([`sweep_copies`]), the run directory's own files and its tabs' launch records
-/// ([`crate::verbs::record_launch`], which `down` keeps in its logs), then the directory.
+/// ([`sweep_copies`]), the run directory's own files, its tabs' launch records
+/// ([`crate::verbs::record_launch`], which `down` keeps in its logs) and its bus keys
+/// ([`drop_bus_keys`]), then the directory.
 fn clear_run_dir(
     run_dir: &Path,
     relay_ran: bool,
@@ -641,6 +685,7 @@ fn clear_run_dir(
         }
     }
     let _ = fs::remove_dir_all(run_dir.join(LAUNCHES));
+    drop_bus_keys(run_dir);
     let _ = fs::remove_dir(run_dir);
 }
 
@@ -851,8 +896,24 @@ pub(crate) fn opts_refused(o: &UpOpts) -> Option<&'static str> {
             "a windowed lab takes no LAB_RESTORE=1: the headless-restore seam is a headless instance's",
         );
     }
-    (o.reroute && o.clock).then_some(
-        "LAB_REROUTE=1 takes no LAB_CLOCK=1: the sleep clock runs its own re-signed clone of Claude Code, not the store build the reroute prefix routes to",
+    if o.reroute && o.clock {
+        return Some(
+            "LAB_REROUTE=1 takes no LAB_CLOCK=1: the sleep clock runs its own re-signed clone of Claude Code, not the store build the reroute prefix routes to",
+        );
+    }
+    // The scratch `aterm.toml` composes LAB_ATERM_TOML with what these flags add
+    // ([`scratch_aterm_toml`]): a key or table both name is no TOML document at all.
+    let named = |key: &str| {
+        aterm_toml::from_str::<aterm_toml::Value>(&o.aterm_toml)
+            .is_ok_and(|doc| doc.get(key).is_some())
+    };
+    if o.fabric && named("fabric") {
+        return Some(
+            "up --fabric takes no LAB_ATERM_TOML with a [fabric] table: the lab's own bus names its bridge there",
+        );
+    }
+    (o.tab_strip && named("tab_strip_rows")).then_some(
+        "up --tab-strip takes no LAB_ATERM_TOML that sets tab_strip_rows: --tab-strip sets it to 1",
     )
 }
 
@@ -936,6 +997,12 @@ fn lab_vars(run: &Run, user: &str) -> Vec<(String, String)> {
     if run.seam == "1" {
         vars.push(("ATERM_DEBUG_HEADLESS_RESTORE".into(), "1".into()));
     }
+    if run.route_seam == "1" && !run.port.is_empty() {
+        vars.push((
+            aterm_agent::harness::netwatch::LAB_ROUTE_SEAM.into(),
+            stub_base_url(run),
+        ));
+    }
     if run.jail_scan == "1" {
         vars.push((aterm_uds::holders::JAIL_SEAM.into(), run.mark.clone()));
     }
@@ -944,10 +1011,18 @@ fn lab_vars(run: &Run, user: &str) -> Vec<(String, String)> {
     vars
 }
 
+/// The stub's base URL, as the scratch settings name it to Claude Code.
+#[must_use]
+pub fn stub_base_url(run: &Run) -> String {
+    format!("http://127.0.0.1:{}", run.port)
+}
+
 /// Whether the lab sets `name` for its instance itself ([`lab_vars`]).
 fn lab_sets(name: &str) -> bool {
     let probe = Run {
         seam: "1".into(),
+        route_seam: "1".into(),
+        port: "1".into(),
         clock: "1".into(),
         jail_scan: "1".into(),
         ..Run::default()
@@ -1004,6 +1079,166 @@ pub(crate) fn instance_vars(run: &Run, user: &str) -> Result<Vec<(String, String
     let mut vars = lab_vars(run, user);
     vars.extend(instance_env(&run.instance_env)?);
     Ok(vars)
+}
+
+/// The person id of the lab bus's observer cap (`<run>/fabric/observer.cap`): an `a-` service
+/// ring, which reads `/f/lab/pub/>` and its own lane and cannot publish a halt.
+pub const BUS_OBSERVER: &str = "a-lab-observer";
+
+/// The name of the lab bus's keys dir in the run directory ([`bus_keys`]).
+const BUS_KEYS: &str = "fabric";
+
+/// The lab bus's keys dir (`up --fabric`): `<run>/fabric`, which the jail reads and never
+/// writes (its profile denies every write under the run directory but the scratch).
+#[must_use]
+pub fn bus_keys(run: &Run) -> PathBuf {
+    run.run.join(BUS_KEYS)
+}
+
+/// The bus keys an earlier lab of the tag left in `run_dir` ([`bus_keys`]: its link to the aterm
+/// under test, its mint secret and its caps), removed with no link followed: they are no running
+/// lab's once `down` has ended its jail, or once no `env.sh` names a lab ([`room_for`]), and a
+/// keys dir left in place makes the next `up --fabric` of the tag fail on its link.
+fn drop_bus_keys(run_dir: &Path) {
+    let _ = fs::remove_dir_all(run_dir.join(BUS_KEYS));
+}
+
+/// The lab bus's live dir: `<sockdir>/fabric`, the broker's socket and logs and the bridge's
+/// state, which the jail writes.
+fn bus_live(run: &Run) -> PathBuf {
+    Path::new(&run.sockdir).join("fabric")
+}
+
+/// A file the jail may write, as the lab reads it: its socket dir resolved through `/tmp`'s link
+/// (the jail may not move that dir), and no link followed below it ([`crate::sys::scratch_read`]).
+fn jail_written(path: &Path) -> String {
+    crate::util::scratch_text(&crate::paths::physical(path))
+}
+
+/// What the lab's broker said (`<sockdir>/fabric/broker.out`).
+fn broker_said(run: &Run) -> String {
+    jail_written(&bus_live(run).join("broker.out"))
+        .trim()
+        .to_string()
+}
+
+/// The environment the lab's broker and its mints run with in the jail: the scratch's homes and
+/// the lab's socket dir, from [`lab_vars`] (none of its seams or its clock).
+fn bus_vars(run: &Run, user: &str) -> Vec<(String, String)> {
+    const NAMES: [&str; 8] = [
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "XDG_CONFIG_HOME",
+        "XDG_RUNTIME_DIR",
+        "ATERM_STATE_HOME",
+    ];
+    lab_vars(run, user)
+        .into_iter()
+        .filter(|(k, _)| NAMES.contains(&k.as_str()))
+        .collect()
+}
+
+/// `up --fabric`'s bus, before the stub: laid out ([`crate::bus::lay`], keys in [`bus_keys`],
+/// the live dir in [`bus_live`], each grant minted in the jail), the rendezvous file at
+/// `<sockdir>/aterm/fabric.toml` (where `aterm link` run with the lab's `XDG_RUNTIME_DIR` looks,
+/// never the lab process's own control socket dir), and its broker started in the jail in a
+/// session of its own (its lifeline on stdin when `armed`, so a CLI `up`'s broker outlives `up`
+/// and ends with `down`'s jail sweep). Returns the `[fabric]` table.
+/// # Errors
+/// A file could not be made, a grant could not be minted, or the broker could not start or never
+/// listened ([`crate::bus::await_listening`], naming what it said).
+fn stand_bus(run: &mut Run, armed: bool) -> Result<String, String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let vars = bus_vars(run, &paths().user);
+    let live = bus_live(run);
+    let laid = {
+        let jailed: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (&**k, &**v)).collect();
+        let run: &Run = run;
+        crate::bus::lay(
+            &run.need_aterm()?,
+            &bus_keys(run),
+            &live,
+            Some(BUS_OBSERVER),
+            &mut |argv: &[String]| {
+                let words: Vec<&str> = argv.iter().map(String::as_str).collect();
+                let out =
+                    procs::jailed_output(run, &run.w, &jailed, &words, procs::JailOut::CaptureAll)?;
+                if out.status.success() {
+                    Ok(out.stdout)
+                } else {
+                    Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+                }
+            },
+        )?
+    };
+    run.fabric = live.to_string_lossy().into_owned();
+    run.save();
+    // `aterm_uds::control_socket_dir` under XDG_RUNTIME_DIR=<sockdir>: `<sockdir>/aterm`.
+    let dir = Path::new(&run.sockdir).join("aterm");
+    let file = dir.join(aterm_link::enable::RENDEZVOUS_FILE);
+    fs::create_dir_all(&dir)
+        .and_then(|()| fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)))
+        .and_then(|()| {
+            use std::io::Write as _;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&file)?
+                .write_all(laid.rendezvous().render().as_bytes())
+        })
+        .map_err(|e| format!("the rendezvous file {}: {e}", file.display()))?;
+    let stdin = lifeline_end(run, armed).map_err(|e| format!("the broker's lifeline: {e}"))?;
+    let mut prog = laid.broker_argv();
+    if stdin.is_some() {
+        prog.extend(lifeline_flag());
+    }
+    let mut cmd = jailed_command(run, &vars, &prog, &live.join("broker.out"), stdin)?;
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("cannot start the lab's broker: {e}"))?;
+    run.broker_pid = procs::keep_jailed(&run.run, child);
+    run.save();
+    let pid = run.broker_pid;
+    crate::bus::await_listening(
+        &laid.sock,
+        crate::bus::LISTEN_HANG,
+        || !alive(pid),
+        || broker_said(run),
+    )?;
+    Ok(laid.table)
+}
+
+/// The lab's bridge connected (`ctl fabric status` gives `state=connected`), waited for as a
+/// one-minute hang detector ([`READY_HANG`]), never a latency budget.
+/// # Errors
+/// It never connected (naming the last status), or the wait was interrupted.
+fn await_bridge(run: &Run) -> Result<(), String> {
+    let door = Door::new(run)?;
+    let end = Instant::now() + READY_HANG;
+    loop {
+        let r = door.ctl(&["fabric", "status"])?;
+        let status = r
+            .stdout
+            .lines()
+            .chain(r.stderr.lines())
+            .find(|l| l.starts_with("OK ") || l.starts_with("ERR"))
+            .unwrap_or("")
+            .to_string();
+        if crate::screen::field(&status, "state").as_deref() == Some("connected") {
+            return Ok(());
+        }
+        if Instant::now() >= end {
+            return Err(format!(
+                "no connected bridge in {} s: fabric status {status}",
+                READY_HANG.as_secs()
+            ));
+        }
+        stop::sleep(Duration::from_millis(250)).map_err(|_| "interrupted".to_string())?;
+    }
 }
 
 /// Whether the lab's instance opens a window (`WINDOW=1`, `forever --window`).
@@ -1122,7 +1357,8 @@ fn still_started(pid: i32, start: &str) -> i32 {
 }
 
 /// Whether `up` may make the lab `run` names at `now`: what an earlier lab of the tag left is
-/// stamped ([`stamp_holds`]) and swept ([`sweep_copies`]).
+/// stamped ([`stamp_holds`]) and swept ([`sweep_copies`]), and its bus keys removed
+/// ([`drop_bus_keys`]).
 /// # Errors
 /// Why the tag cannot come up now.
 fn room_for(run: &Run, now: std::time::SystemTime) -> Result<(), Fail> {
@@ -1139,7 +1375,10 @@ fn room_for(run: &Run, now: std::time::SystemTime) -> Result<(), Fail> {
             "lab '{tag}' cannot come up yet: {}",
             kept_copies(dir, "up", tag)
         ))),
-        None => Ok(()),
+        None => {
+            drop_bus_keys(&run.run);
+            Ok(())
+        }
     }
 }
 
@@ -1208,6 +1447,7 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     run.cols.clone_from(&o.cols);
     run.rows.clone_from(&o.lines);
     run.seam = if o.restore { "1" } else { "0" }.into();
+    run.route_seam = if o.route_seam { "1" } else { "0" }.into();
     run.window = if o.window { "1" } else { "0" }.into();
     let w = run.w.clone();
     if let Some(size) = &o.home_image {
@@ -1271,7 +1511,8 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
         .and_then(|()| fs::create_dir_all(run.run.join("shim")))
         .and_then(|()| std::os::unix::fs::symlink(&bin, run.run.join("shim/security")))
         .and_then(|()| std::os::unix::fs::symlink(&bin, run.run.join("shim/open")))
-        .and_then(|()| std::os::unix::fs::symlink(&aterm, run.run.join("shim/aterm")));
+        .and_then(|()| std::os::unix::fs::symlink(&aterm, run.run.join("shim/aterm")))
+        .and_then(|()| std::os::unix::fs::symlink(&aterm, run.run.join("shim/amacs")));
     if let Err(e) = made {
         return Err(abort(
             &run,
@@ -1322,6 +1563,25 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     run.sampler_pid = procs::spawn_kept(&mut sampler)
         .map_err(|e| abort(&run, &[], &format!("cannot start the egress witness: {e}")))?;
     run.save();
+    // The bus before the stub: nothing else of the lab runs in the jail yet, so what `up` makes
+    // in the socket dir for it is the lab's own.
+    let fabric_table = if o.fabric {
+        match stand_bus(&mut run, o.lifeline) {
+            Ok(table) => Some(table),
+            Err(e) => {
+                return Err(abort(
+                    &run,
+                    &[run.sampler_pid, run.broker_pid],
+                    &format!("the lab's bus: {e}"),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    if o.tab_strip {
+        run.tab_strip = "1".into();
+    }
     let _ = fs::write(w.join("mode"), "ok\n");
     let _ = fs::write(w.join("reply.txt"), "");
     let _ = fs::write(w.join("security.log"), "");
@@ -1354,6 +1614,8 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
         &ws("headers.json"),
         "--account-file",
         &ws("account.json"),
+        "--auth-modes-file",
+        &ws(crate::verbs::AUTH_MODES),
     ]
     .map(str::to_string)
     .to_vec();
@@ -1442,7 +1704,12 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     }
     put(
         "cfg/aterm/aterm.toml",
-        &scratch_aterm_toml(&o.aterm_toml, &o.harness_keys),
+        &scratch_aterm_toml(
+            &o.aterm_toml,
+            &o.harness_keys,
+            fabric_table.as_deref(),
+            o.tab_strip,
+        ),
     );
     put_tab_shell(&w, &run.port);
 
@@ -1477,6 +1744,15 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
             aterm.display()
         )));
     }
+    if o.fabric
+        && let Err(e) = await_bridge(&run)
+    {
+        let said = broker_said(&run);
+        let _ = down(&run.tag, false);
+        return Err(Fail::die(format!(
+            "the lab's bridge did not connect ({e}); its broker said: {said}"
+        )));
+    }
     let clone = Path::new(&run.claude_bin) == run.run.join(CLOCK_CLONE);
     // the clock's clone counts as started from here on
     if clone
@@ -1507,12 +1783,25 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
 }
 
 /// A lab's scratch `aterm.toml`: `LAB_ATERM_TOML`, the update and package lanes off,
-/// `LAB_HARNESS_KEYS` under `[harness]`, and the audible bell off unless `LAB_ATERM_TOML` sets
-/// `bell_sound` ([`crate::instance::bell_off`]).
-pub(crate) fn scratch_aterm_toml(aterm_toml: &str, harness_keys: &str) -> String {
-    crate::instance::bell_off(&format!(
+/// `LAB_HARNESS_KEYS` under `[harness]`, the lab bus's `[fabric]` table when `up --fabric` stood
+/// one ([`crate::bus::Laid::table`]), `tab_strip_rows = 1` at its head with `up --tab-strip`, and
+/// the audible bell off unless `LAB_ATERM_TOML` sets `bell_sound` ([`crate::instance::bell_off`]).
+pub(crate) fn scratch_aterm_toml(
+    aterm_toml: &str,
+    harness_keys: &str,
+    fabric: Option<&str>,
+    tab_strip: bool,
+) -> String {
+    let mut text = format!(
         "{aterm_toml}\n[update]\nenabled = false\n[packages]\nenabled = false\n[harness]\nprobe_api = false\n{harness_keys}\n"
-    ))
+    );
+    if let Some(table) = fabric {
+        text.push_str(table);
+    }
+    if tab_strip {
+        text = format!("tab_strip_rows = 1\n{text}");
+    }
+    crate::instance::bell_off(&text)
 }
 
 /// The scratch `settings.json` and `.claude.json` texts.
@@ -1570,19 +1859,25 @@ fn scratch_claude_config(run: &Run, helper: &str, proj: &str, o: &UpOpts) -> (St
     (settings.dump(pretty), cj.dump(pretty))
 }
 
-/// `up [tag] [--window]`: the existing jailed instance, headless by default.
+/// `up [tag] [--window] [--fabric] [--tab-strip]`: the existing jailed instance, headless by
+/// default.
 pub fn cmd_up(args: &[String]) -> Res {
     let mut tag = None;
     let mut o = UpOpts::from_env();
     for arg in args {
-        if arg == "--window" {
-            o.window = true;
-        } else if arg.starts_with('-') {
-            return Err(Fail::usage(format!("up: unknown option '{arg}'")));
-        } else if tag.is_none() {
-            tag = Some(arg.clone());
-        } else {
-            return Err(Fail::usage("up: takes one optional tag and --window"));
+        match arg.as_str() {
+            "--window" => o.window = true,
+            "--fabric" => o.fabric = true,
+            "--tab-strip" => o.tab_strip = true,
+            _ if arg.starts_with('-') => {
+                return Err(Fail::usage(format!("up: unknown option '{arg}'")));
+            }
+            _ if tag.is_none() => tag = Some(arg.clone()),
+            _ => {
+                return Err(Fail::usage(
+                    "up: takes one optional tag beside --window, --fabric and --tab-strip",
+                ));
+            }
         }
     }
     let tag = tag.unwrap_or_else(crate::run::default_tag);
@@ -1598,6 +1893,23 @@ pub fn cmd_up(args: &[String]) -> Res {
         run.instance_pid, run.sock, run.cols, run.rows
     );
     println!("  claude      {} ({})", run.claude_bin, run.claude_ver);
+    if !run.fabric.is_empty() {
+        let live = bus_live(&run);
+        println!(
+            "  fabric      broker {} (pid {}, fleet {}, node {})   observer cap {}   bridge connected",
+            live.join("b.sock").display(),
+            run.broker_pid,
+            crate::bus::FLEET,
+            jail_written(&live.join("state/node")).trim(),
+            bus_keys(&run).join("observer.cap").display()
+        );
+    }
+    if run.tab_strip == "1" {
+        println!(
+            "  tab strip   1 row (the tab menu holds the session clause: aterm ctl --sock {} open tab-menu)",
+            run.sock
+        );
+    }
     if run.reroute == "1" {
         println!(
             "  reroute     the instance reroutes; `{LAB} claude {} --by-name` runs the stub, the twin, then that build",
@@ -1823,6 +2135,18 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
     keep_tree(&r.run.join(LAUNCHES), &keep.join(LAUNCHES));
     crate::clock::keep(&r, &keep.join("clock"));
     keep_tree(&r.state().join("logs"), &keep.join("state-logs"));
+    if !r.fabric.is_empty() {
+        // The jail writes the bus's live dir: read through no link, before the socket dir goes.
+        let live = crate::paths::physical(&bus_live(&r));
+        for (f, to) in [
+            ("broker.out", "fabric-broker.out"),
+            ("b.log", "fabric-b.log"),
+        ] {
+            if let Ok(Some(b)) = crate::sys::scratch_read(&live.join(f)) {
+                let _ = fs::write(keep.join(to), b);
+            }
+        }
+    }
     if keep_dumps {
         keep_tree(&r.w.join("dump"), &keep.join("dump"));
     }
@@ -1890,6 +2214,34 @@ pub fn cmd_down(args: &[String]) -> Res {
     Ok(0)
 }
 
+/// `ps`'s line for an `up --fabric` lab's broker, `live` or gone. A gone one names the way back:
+/// `down`, then `up` of the tag with the flags it came up with (`--window`, `--fabric`,
+/// `--tab-strip`, as its `env.sh` records them).
+fn broker_line(r: &Run, live: bool) -> String {
+    if live {
+        return format!(
+            "fabric broker {} live (in the jail; its socket {}/b.sock)",
+            r.broker_pid, r.fabric
+        );
+    }
+    let mut again = format!("{LAB} up {}", r.tag);
+    for (on, flag) in [
+        (windowed(r), "--window"),
+        (true, "--fabric"),
+        (r.tab_strip == "1", "--tab-strip"),
+    ] {
+        if on {
+            again.push(' ');
+            again.push_str(flag);
+        }
+    }
+    format!(
+        "fabric broker {} gone: `link broker` exits when the aterm it runs is rebuilt, and the lab \
+         has no supervisor to start it again ({LAB} down {}, then {again})",
+        r.broker_pid, r.tag
+    )
+}
+
 /// One lab's pids, and which of them live.
 fn ps_one(tag: &str) -> Result<(), Fail> {
     let r = Run::read(tag)?;
@@ -1918,6 +2270,12 @@ fn ps_one(tag: &str) -> Result<(), Fail> {
         },
         r.run.display()
     );
+    if !r.fabric.is_empty() {
+        println!(
+            "  {}",
+            broker_line(&r, alive(r.broker_pid) && names_this_lab(&r, r.broker_pid))
+        );
+    }
     if live.is_empty() {
         println!("  nothing of it is alive: {LAB} down {tag} removes its run directory");
     } else if let Ok(out) = aterm_uds::spawnfd::command("/bin/ps")
@@ -1956,6 +2314,8 @@ pub fn cmd_ps(args: &[String]) -> Res {
 /// How `claude` launches.
 #[derive(Debug, Default)]
 pub struct Launch {
+    /// Replace the private interactive shell, so job control cannot reclaim a held TUI.
+    pub replace_shell: bool,
     /// `-e K=V`: extra environment.
     pub envs: Vec<String>,
     /// `--no-wait`.
@@ -2009,68 +2369,222 @@ pub fn parse_launch(args: &[String]) -> Result<Launch, String> {
     Ok(l)
 }
 
-/// The launcher the tab runs.
+/// One launch of Claude Code as its parts, in order: what [`launcher`] writes as `claude.sh` and
+/// [`typed_line`] types as a person would.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LaunchWords {
+    /// The relay's words before the program (`<relay> --log <L> --`), as shell words, when the
+    /// launch is behind it.
+    pub relay: Vec<String>,
+    /// The environment the lab sets, as the launcher's lines: each pair a name and the shell word
+    /// of its value (`PATH` keeps its `"<shim>:$PATH"` form).
+    pub env: Vec<Vec<(String, String)>>,
+    /// The `K=V` words after them, one per launcher line: the sleep clock's, each `-e`, the
+    /// relay's renderer and the subscriber's token, as given.
+    pub extra: Vec<String>,
+    /// The program word: `claude` by name, else the binary by path (a shell word).
+    pub program: String,
+    /// Its arguments, as shell words.
+    pub args: Vec<String>,
+}
+
+impl LaunchWords {
+    /// Every name the launch sets, in order.
+    #[cfg(test)]
+    #[must_use]
+    pub fn names(&self) -> Vec<String> {
+        self.env
+            .iter()
+            .flatten()
+            .map(|(k, _)| k.clone())
+            .chain(self.extra.iter().map(|kv| {
+                kv.split_once('=')
+                    .map_or(kv.as_str(), |(k, _)| k)
+                    .to_string()
+            }))
+            .collect()
+    }
+}
+
+/// The parts of `l`'s launch in `run`.
 #[must_use]
-pub fn launcher(run: &Run, l: &Launch) -> String {
+pub(crate) fn launch_words(run: &Run, l: &Launch) -> LaunchWords {
     let q = shell_quote;
     let w = run.w.to_string_lossy();
-    let mut envs: Vec<String> = crate::clock::vars(run)
+    let mut extra: Vec<String> = crate::clock::vars(run)
         .into_iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
-    envs.extend(l.envs.iter().cloned());
-    let mut pre = String::new();
+    extra.extend(l.envs.iter().cloned());
+    let mut relay = Vec::new();
     if l.relay {
-        pre = format!(
-            "{} --log {} -- ",
+        relay = vec![
             q(&run.run.join("relay/node").to_string_lossy()),
-            q(&format!("{w}/relay.log"))
-        );
-        envs.push("CLAUDE_CODE_NO_FLICKER=1".into());
+            "--log".to_string(),
+            q(&format!("{w}/relay.log")),
+            "--".to_string(),
+        ];
+        extra.push("CLAUDE_CODE_NO_FLICKER=1".into());
     }
     if l.subscriber {
-        envs.push(format!("CLAUDE_CODE_OAUTH_TOKEN={}", oauth_token()));
+        extra.push(format!("CLAUDE_CODE_OAUTH_TOKEN={}", oauth_token()));
     }
-    let px = &run.proxy;
-    let mut s = String::from("#!/bin/sh\nclear\n");
-    s.push_str(&format!(
-        "exec {pre}env PATH=\"{}:$PATH\" CLAUDE_CONFIG_DIR={} ANTHROPIC_BASE_URL=http://127.0.0.1:{} \\\n",
-        run.run.join("shim").display(),
-        q(&format!("{w}/home/.claude")),
-        run.port
-    ));
-    s.push_str(&format!(
-        "  HTTP_PROXY={px} HTTPS_PROXY={px} http_proxy={px} https_proxy={px} ALL_PROXY={px} \\\n"
-    ));
-    s.push_str(
-        "  NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost DISABLE_AUTOUPDATER=1 \\\n",
-    );
-    s.push_str(&format!(
-        "  LAB_SECURITY_LOG={} LAB_OPEN_LOG={} BROWSER={} \\\n",
-        q(&format!("{w}/security.log")),
-        q(&format!("{w}/open.log")),
-        q(&run.run.join("shim/open").to_string_lossy())
-    ));
-    for kv in &envs {
-        s.push_str(&format!("  {} \\\n", q(kv)));
-    }
-    if l.by_name {
-        s.push_str("  claude");
-    } else {
-        s.push_str(&format!("  {}", q(&run.claude_bin)));
-    }
+    let px = q(&run.proxy);
+    let pair = |k: &str, v: String| (k.to_string(), v);
+    let env = vec![
+        vec![
+            pair(
+                "PATH",
+                shell_prepend_path(&run.run.join("shim").to_string_lossy()),
+            ),
+            pair("CLAUDE_CONFIG_DIR", q(&format!("{w}/home/.claude"))),
+            pair(
+                "ANTHROPIC_BASE_URL",
+                q(&format!("http://127.0.0.1:{}", run.port)),
+            ),
+        ],
+        [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "ALL_PROXY",
+        ]
+        .map(|k| pair(k, px.clone()))
+        .to_vec(),
+        vec![
+            pair("NO_PROXY", "127.0.0.1,localhost".into()),
+            pair("no_proxy", "127.0.0.1,localhost".into()),
+            pair("DISABLE_AUTOUPDATER", "1".into()),
+        ],
+        vec![
+            pair("LAB_SECURITY_LOG", q(&format!("{w}/security.log"))),
+            pair("LAB_OPEN_LOG", q(&format!("{w}/open.log"))),
+            pair("BROWSER", q(&run.run.join("shim/open").to_string_lossy())),
+        ],
+    ];
+    let mut args = Vec::new();
     if l.debug_log {
-        s.push_str(&format!(
-            " --debug-file {}",
-            q(&crate::stats::debug_log(run).to_string_lossy())
-        ));
+        args.push("--debug-file".to_string());
+        args.push(q(&crate::stats::debug_log(run).to_string_lossy()));
     }
-    for a in &l.args {
+    args.extend(l.args.iter().map(|a| q(a)));
+    LaunchWords {
+        relay,
+        env,
+        extra,
+        program: if l.by_name {
+            "claude".to_string()
+        } else {
+            q(&run.claude_bin)
+        },
+        args,
+    }
+}
+
+/// The launcher the tab runs.
+#[must_use]
+pub fn launcher(run: &Run, l: &Launch) -> String {
+    let words = launch_words(run, l);
+    let mut s = String::from("#!/bin/sh\nclear\nexec ");
+    for r in &words.relay {
+        s.push_str(r);
         s.push(' ');
-        s.push_str(&q(a));
+    }
+    s.push_str("env");
+    for (i, line) in words.env.iter().enumerate() {
+        s.push_str(if i == 0 { " " } else { "  " });
+        let pairs: Vec<String> = line.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        s.push_str(&pairs.join(" "));
+        s.push_str(" \\\n");
+    }
+    for kv in &words.extra {
+        s.push_str(&format!("  {} \\\n", shell_quote(kv)));
+    }
+    s.push_str("  ");
+    s.push_str(&words.program);
+    for a in &words.args {
+        s.push(' ');
+        s.push_str(a);
     }
     s.push('\n');
     s
+}
+
+/// The line `claude --by-name` types at the tab's prompt, as a person types it: the launch's
+/// environment as assignment words (`K='v 1'`, the name never quoted: aterm's command reader and
+/// the shell skip `NAME=value` words before the program word), then `exec` when the launch
+/// replaces the tab's shell ([`Launch::replace_shell`]: after the assignments, where zsh and bash
+/// still assign them, and a wrapper aterm's reader looks through), then the relay's words, then
+/// `claude` bare, which the shell looks up in the assigned `PATH`, then its arguments.
+#[must_use]
+pub(crate) fn typed_line(run: &Run, l: &Launch) -> String {
+    let words = launch_words(run, l);
+    let mut line: Vec<String> = words
+        .env
+        .iter()
+        .flatten()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    line.extend(words.extra.iter().map(|kv| match kv.split_once('=') {
+        Some((k, v)) => format!("{k}={}", shell_quote(v)),
+        None => shell_quote(kv),
+    }));
+    if l.replace_shell {
+        line.push("exec".to_string());
+    }
+    line.extend(words.relay);
+    line.push(words.program);
+    line.extend(words.args);
+    line.join(" ")
+}
+
+/// Whether `name` is a shell variable name, `[A-Za-z_][A-Za-z0-9_]*`.
+fn shell_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Why `l` cannot launch by name in `run`, before anything is typed: `claude` is on a tab's PATH
+/// only in a `LAB_REROUTE=1` lab, and each `-e` must be an assignment word.
+#[must_use]
+pub(crate) fn by_name_refused(run: &Run, l: &Launch) -> Option<String> {
+    if !l.by_name {
+        return None;
+    }
+    if run.reroute != "1" {
+        return Some(format!(
+            "claude --by-name types `claude` at the prompt as a person does, which finds it only in a lab brought up with LAB_REROUTE=1 (lab '{0}' was not): {LAB} down {0}, then LAB_REROUTE=1 {LAB} up {0}",
+            run.tag
+        ));
+    }
+    l.envs
+        .iter()
+        .find(|kv| !kv.split_once('=').is_some_and(|(k, _)| shell_name(k)))
+        .map(|kv| {
+            format!(
+                "claude --by-name: -e {kv} is no NAME=value assignment word (NAME is [A-Za-z_][A-Za-z0-9_]*)"
+            )
+        })
+}
+
+/// What [`launch_claude`] types: `sh <launcher>` (`exec sh <launcher>` when it replaces the
+/// tab's shell, [`Launch::replace_shell`]), or with `--by-name` the line a person types
+/// ([`typed_line`]).
+#[must_use]
+pub(crate) fn launch_line(run: &Run, l: &Launch, script: &Path) -> String {
+    if l.by_name {
+        typed_line(run, l)
+    } else {
+        format!(
+            "{}sh {}",
+            if l.replace_shell { "exec " } else { "" },
+            shell_quote(&script.to_string_lossy())
+        )
+    }
 }
 
 /// Whether the relay copied into the lab's run directory ran ([`RELAY_RAN`]).
@@ -2108,6 +2622,9 @@ fn lay_relay(run: &Run) -> Result<(), Fail> {
 /// # Errors
 /// The launch line could not be typed, or the relay could not be laid.
 pub fn launch_claude(run: &Run, l: &Launch) -> Result<String, Fail> {
+    if let Some(why) = by_name_refused(run, l) {
+        return Err(Fail::usage(why));
+    }
     procs::need_witness(run)?;
     let mut run = run.clone();
     run.agent = "claude".into();
@@ -2129,7 +2646,7 @@ pub fn launch_claude(run: &Run, l: &Launch) -> Result<String, Fail> {
     if !sid.is_empty() {
         crate::verbs::record_launch(run, &sid, &text)?;
     }
-    let line = format!("sh {}", shell_quote(&script.to_string_lossy()));
+    let line = launch_line(run, l, &script);
     let sent = door.ctl(&["send", &line])?;
     if sent.code != 0 {
         return Err(Fail::die("could not type the launch line"));
@@ -2139,7 +2656,7 @@ pub fn launch_claude(run: &Run, l: &Launch) -> Result<String, Fail> {
         "launched: {} ({}) in lab '{}'{}  (launcher: {})",
         if l.by_name {
             format!(
-                "claude by name (PATH's first: in a LAB_REROUTE=1 lab the reroute stub, its twin, {})",
+                "`claude` typed at the prompt as a person does (PATH's first: the reroute stub, its twin, {})",
                 run.claude_bin
             )
         } else {
@@ -2177,6 +2694,30 @@ pub fn cmd_claude(args: &[String]) -> Res {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_store_names_its_managed_program_with_no_aterm_run() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let prefix = atpkg::store::default_prefix(&home);
+        let build = prefix.join("store/claude/1000002000001000399/bin/claude");
+        std::fs::create_dir_all(build.parent().unwrap()).unwrap();
+        std::fs::write(&build, "#!/bin/sh\necho '2.1.399 (Claude Code)'\n").unwrap();
+        std::fs::set_permissions(&build, fs::Permissions::from_mode(0o755)).unwrap();
+        let home = home.to_string_lossy().into_owned();
+        assert_eq!(store_shim_target(&home, "claude"), None, "no shim yet");
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        std::os::unix::fs::symlink(&build, prefix.join("bin/claude")).unwrap();
+        assert_eq!(
+            store_shim_target(&home, "claude"),
+            Some(build.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            store_shim_target(&home, "codex"),
+            None,
+            "only what it holds"
+        );
+    }
 
     #[test]
     fn a_line_typed_in_a_tab_shell_reaches_the_stub_with_the_labs_key() {
@@ -2269,7 +2810,12 @@ mod tests {
         let bell =
             |doc: &aterm_toml::Value| doc.get("bell_sound").and_then(aterm_toml::Value::as_bool);
 
-        let plain = read(&scratch_aterm_toml("font_px = 13", "usage_tap = true"));
+        let plain = read(&scratch_aterm_toml(
+            "font_px = 13",
+            "usage_tap = true",
+            None,
+            false,
+        ));
         assert_eq!(bell(&plain), Some(false));
         assert_eq!(
             plain.get("font_px").and_then(aterm_toml::Value::as_integer),
@@ -2283,7 +2829,7 @@ mod tests {
             Some(true),
         );
 
-        let asked = read(&scratch_aterm_toml("bell_sound = true", ""));
+        let asked = read(&scratch_aterm_toml("bell_sound = true", "", None, false));
         assert_eq!(
             bell(&asked),
             Some(true),
@@ -2291,28 +2837,174 @@ mod tests {
         );
     }
 
+    /// The `[fabric]` table a lab bus names its bridge in: [`crate::bus::Laid::table`]'s shape.
+    const BUS_TABLE: &str = "[fabric]\ncommand = \"/r/fabric/aterm link serve --fleet lab --broker /s/fabric/b.sock --cap-file /r/fabric/node.cap --state /s/fabric/state --accept-from n-0123456789abcdef\"\n";
+
+    /// A FABRIC LAB NAMES ITS BRIDGE AND A TAB-STRIP LAB ITS ROW: the scratch `aterm.toml` with the
+    /// bus's table and the strip is one TOML document holding the bridge's command and
+    /// `tab_strip_rows = 1`, LAB_ATERM_TOML's own keys, the harness keys and the bell-off rule kept;
+    /// without either option neither key is there.
+    #[test]
+    fn a_fabric_lab_names_its_bridge_and_a_tab_strip_lab_its_row() {
+        let read =
+            |text: &str| aterm_toml::from_str::<aterm_toml::Value>(text).expect("one document");
+        let command = |doc: &aterm_toml::Value| {
+            doc.get("fabric")
+                .and_then(|t| t.get("command"))
+                .and_then(aterm_toml::Value::as_str)
+                .map(str::to_string)
+        };
+        let both = read(&scratch_aterm_toml(
+            "font_px = 13\n[ui]\nx = 1",
+            "usage_tap = true",
+            Some(BUS_TABLE),
+            true,
+        ));
+        assert_eq!(
+            command(&both).as_deref(),
+            Some(
+                "/r/fabric/aterm link serve --fleet lab --broker /s/fabric/b.sock --cap-file /r/fabric/node.cap --state /s/fabric/state --accept-from n-0123456789abcdef"
+            )
+        );
+        assert_eq!(
+            both.get("tab_strip_rows")
+                .and_then(aterm_toml::Value::as_integer),
+            Some(1)
+        );
+        assert_eq!(
+            both.get("font_px").and_then(aterm_toml::Value::as_integer),
+            Some(13)
+        );
+        assert_eq!(
+            both.get("ui")
+                .and_then(|t| t.get("x"))
+                .and_then(aterm_toml::Value::as_integer),
+            Some(1)
+        );
+        assert_eq!(
+            both.get("harness")
+                .and_then(|t| t.get("usage_tap"))
+                .and_then(aterm_toml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            both.get("bell_sound").and_then(aterm_toml::Value::as_bool),
+            Some(false)
+        );
+        let neither = read(&scratch_aterm_toml(
+            "font_px = 13\n[ui]\nx = 1",
+            "usage_tap = true",
+            None,
+            false,
+        ));
+        assert_eq!(command(&neither), None);
+        assert_eq!(neither.get("tab_strip_rows"), None);
+        assert_eq!(neither.get("fabric"), None);
+    }
+
+    /// A BUS OR TAB-STRIP LAB REFUSES A LAB_ATERM_TOML NAMING THE SAME KEY, before anything is
+    /// made (exit 2): composed, the pair is no TOML document, so the instance would not start. Each
+    /// flag alone, or beside an unrelated LAB_ATERM_TOML, is no refusal.
+    #[test]
+    fn a_bus_or_tab_strip_lab_refuses_an_aterm_toml_naming_the_same_key() {
+        let o = |fabric, tab_strip, toml: &str| UpOpts {
+            fabric,
+            tab_strip,
+            aterm_toml: toml.to_string(),
+            ..UpOpts::default()
+        };
+        let named_bus = "[fabric]\ncommand = \"x\"";
+        let named_row = "tab_strip_rows = 2";
+        let why = opts_refused(&o(true, false, named_bus)).expect("refused");
+        assert!(
+            why.contains("--fabric") && why.contains("[fabric]"),
+            "{why}"
+        );
+        let f = up("not a tag!", &o(true, false, named_bus)).expect_err("refused");
+        assert_eq!((f.code, f.msg.as_deref()), (2, Some(why)));
+        let why = opts_refused(&o(false, true, named_row)).expect("refused");
+        assert!(
+            why.contains("--tab-strip") && why.contains("tab_strip_rows"),
+            "{why}"
+        );
+        for (fabric, tab_strip, toml) in [
+            (true, false, ""),
+            (false, true, ""),
+            (true, true, "font_px = 13\n[ui]\nx = 1"),
+            (true, false, named_row),
+            (false, true, named_bus),
+            (false, false, named_bus),
+        ] {
+            assert_eq!(
+                opts_refused(&o(fabric, tab_strip, toml)),
+                None,
+                "fabric {fabric} tab strip {tab_strip}: {toml}"
+            );
+        }
+        let parses = |toml: &str, fabric: bool, tab_strip: bool| {
+            aterm_toml::from_str::<aterm_toml::Value>(&scratch_aterm_toml(
+                toml,
+                "",
+                fabric.then_some(BUS_TABLE),
+                tab_strip,
+            ))
+            .is_ok()
+        };
+        assert!(!parses(named_bus, true, false), "a [fabric] table twice");
+        assert!(!parses(named_row, false, true), "tab_strip_rows twice");
+        assert!(parses(named_bus, false, true) && parses(named_row, true, false));
+    }
+
+    /// The two verbs run in a child of this test binary whose `LAB_STATE` is a fresh scratch
+    /// directory and whose `LAB_TAG` is unset, so the default lab `lab` is down by construction:
+    /// [`crate::paths::paths`] is per process, and a regressed `down` that fell back to the default
+    /// tag could reach no lab this checkout has up.
     #[test]
     fn ps_and_down_of_a_lab_that_is_down_name_its_tag() {
+        const PROBE: &str = "ATERM_LAB_PS_DOWN_PROBE";
         let gone = "ki1016-ps-gone";
-        let default = crate::run::default_tag();
-        assert!(
-            !crate::run::is_run(gone) && !crate::run::is_run(&default),
-            "PRECONDITION: no lab '{gone}' or '{default}' is up"
-        );
-        let refusal = |got: Res| got.err().and_then(|f| f.msg).unwrap_or_default();
-        for (verb, got) in [
-            ("ps", refusal(cmd_ps(&[gone.to_string()]))),
-            (
-                "down",
-                refusal(cmd_down(&[gone.to_string(), "--keep-dumps".to_string()])),
-            ),
-        ] {
+        if std::env::var_os(PROBE).is_some() {
+            let refusal = |got: Res| got.err().and_then(|f| f.msg).unwrap_or_default();
+            for (verb, got) in [
+                ("ps", refusal(cmd_ps(&[gone.to_string()]))),
+                (
+                    "down",
+                    refusal(cmd_down(&[gone.to_string(), "--keep-dumps".to_string()])),
+                ),
+            ] {
+                println!("PROBE {verb}: {}", got.replace('\n', " "));
+            }
+            std::process::exit(0);
+        }
+        let state = aterm_tempfile::tempdir().expect("a scratch LAB_STATE");
+        let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"));
+        cmd.args([
+            "--exact",
+            "lab::tests::ps_and_down_of_a_lab_that_is_down_name_its_tag",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(PROBE, "1")
+        .env("LAB_STATE", state.path())
+        .env_remove("LAB_TAG");
+        let out = aterm_uds::deadline::output_until(
+            &mut cmd,
+            std::time::Instant::now() + std::time::Duration::from_mins(1),
+        )
+        .expect("the probe ends within the hang detector");
+        let out = String::from_utf8_lossy(&out.stdout);
+        for verb in ["ps", "down"] {
+            let mark = format!("PROBE {verb}: ");
+            let got = out
+                .lines()
+                .find_map(|l| l.split_once(&mark).map(|(_, got)| got))
+                .unwrap_or_else(|| panic!("{verb} printed no refusal: {out}"));
             assert!(
                 got.contains(&format!("no lab '{gone}' is up")),
                 "{verb}: {got:?}"
             );
             assert!(
-                !got.contains(&format!("'{default}'")),
+                !got.contains("'lab'"),
                 "{verb} names the default lab: {got:?}"
             );
         }
@@ -2385,6 +3077,22 @@ mod tests {
             "{arg_only}"
         );
         assert!(!opens_recorded(&arg_words, &run), "{arg_only}");
+        let meta_run = Run {
+            run: r#"/s/"a"$b`c`/t"#.into(),
+            w: "/s/w $x".into(),
+            port: "5;evil".into(),
+            proxy: "http://127.0.0.1:6 x".into(),
+            claude_bin: "/a b/claude".into(),
+            ..Run::default()
+        };
+        let meta_words = exec_words(&launcher(&meta_run, &l));
+        assert!(
+            meta_words.contains(&r#"PATH=/s/"a"$b`c`/t/shim:$PATH"#.to_string())
+                && meta_words.contains(&"ANTHROPIC_BASE_URL=http://127.0.0.1:5;evil".to_string())
+                && meta_words.contains(&"HTTP_PROXY=http://127.0.0.1:6 x".to_string())
+                && opens_recorded(&meta_words, &meta_run),
+            "{meta_words:?}"
+        );
     }
 
     fn exec_words(script: &str) -> Vec<String> {
@@ -2392,7 +3100,11 @@ mod tests {
             .split_once("exec ")
             .map_or("", |(_, rest)| rest)
             .replace("\\\n", "");
-        let line = line.lines().next().unwrap_or("");
+        shell_words(line.lines().next().unwrap_or(""))
+    }
+
+    /// `line`'s shell words, quotes removed (no expansion).
+    fn shell_words(line: &str) -> Vec<String> {
         let (mut words, mut cur, mut open) = (Vec::new(), String::new(), false);
         let mut it = line.chars();
         while let Some(c) = it.next() {
@@ -2587,6 +3299,19 @@ mod tests {
         }
     }
 
+    /// Whether aterm's own judge admits the stub's URL under the seam value `vars` hold.
+    fn lab_default_route_admits(vars: &[(String, String)], run: &Run) -> bool {
+        let seam = vars
+            .iter()
+            .find(|(k, _)| k == aterm_agent::harness::netwatch::LAB_ROUTE_SEAM)
+            .map(|(_, v)| v.as_str());
+        aterm_agent::harness::netwatch::lab_default_route(
+            seam,
+            "ANTHROPIC_BASE_URL",
+            &stub_base_url(run),
+        )
+    }
+
     fn recorded(instance_env: &str, seam: &str) -> Run {
         Run {
             run: "/s/runs/k1".into(),
@@ -2628,6 +3353,33 @@ mod tests {
         let seam = instance_vars(&recorded("", "1"), "owner").unwrap();
         assert!(seam.contains(&("ATERM_DEBUG_HEADLESS_RESTORE".to_string(), "1".to_string())));
         assert!(!seam.iter().any(|(k, _)| k == "TMPDIR"));
+        let route = aterm_agent::harness::netwatch::LAB_ROUTE_SEAM;
+        assert!(
+            get(route).is_empty(),
+            "no route seam unless up asked for one"
+        );
+        let routed = Run {
+            route_seam: "1".into(),
+            port: "57232".into(),
+            ..recorded("", "0")
+        };
+        let vars = instance_vars(&routed, "owner").unwrap();
+        assert!(
+            vars.contains(&(route.to_string(), "http://127.0.0.1:57232".to_string())),
+            "the route seam names the stub's own URL: {vars:?}"
+        );
+        assert!(
+            lab_default_route_admits(&vars, &routed),
+            "the URL the seam names is the one the instance's own judge admits"
+        );
+        assert!(
+            instance_vars(
+                &recorded(&format!("{route}=http://127.0.0.1:1"), "0"),
+                "owner"
+            )
+            .is_err(),
+            "LAB_INSTANCE_ENV cannot hand the instance the route seam"
+        );
         assert!(
             get(aterm_uds::holders::JAIL_SEAM).is_empty(),
             "no jail scan unless asked"
@@ -2903,25 +3655,165 @@ mod tests {
         );
     }
 
-    /// `--by-name` launches `claude` found on `PATH`; without it the launcher names the binary by
-    /// path.
+    /// A lab whose `claude` is on its tabs' PATH (`LAB_REROUTE=1`).
+    fn rerouting(root: &Path) -> Run {
+        Run {
+            tag: "t".into(),
+            run: root.join("runs/t"),
+            w: root.join("runs/t/scratch"),
+            port: "5".into(),
+            proxy: "http://127.0.0.1:6".into(),
+            claude_bin: "/a b/claude".into(),
+            reroute: "1".into(),
+            ..Run::default()
+        }
+    }
+
+    /// The program word of a typed line: its first word that is no `NAME=value` assignment.
+    fn program_word(line: &str) -> String {
+        shell_words(line)
+            .into_iter()
+            .find(|w| !w.split_once('=').is_some_and(|(k, _)| shell_name(k)))
+            .unwrap_or_default()
+    }
+
+    /// A BY-NAME LAUNCH TYPES `claude` AS A PERSON DOES: the line typed at the prompt and the
+    /// launcher script hand `claude`, found on PATH, the same environment (every name the
+    /// launch sets, enumerated from its own parts) and the same arguments; the typed line's
+    /// program word is `claude` itself, past its assignment words. Whole-quoting an `-e` pair
+    /// (`'K=v 1'`) would make it the command (zsh: command not found), and the typed line never
+    /// does; a by-path launch still types `sh <launcher>`.
     #[test]
-    fn by_name_launches_claude_through_path() {
-        let run = recorded("", "0");
-        let named = launcher(
-            &run,
-            &Launch {
-                by_name: true,
-                ..Launch::default()
-            },
+    fn a_by_name_launch_types_claude_as_a_person_does() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let run = rerouting(&root);
+        let l =
+            parse_launch(&["--by-name", "-e", "K=v 1", "--", "--model", "x y"].map(String::from))
+                .unwrap();
+        let names = launch_words(&run, &l).names();
+        for want in ["PATH", "CLAUDE_CONFIG_DIR", "BROWSER", "LAB_OPEN_LOG", "K"] {
+            assert!(names.iter().any(|n| n == want), "{want}: {names:?}");
+        }
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let mut probe = String::from("#!/bin/sh\n");
+        for n in &names {
+            probe.push_str(&format!("printf '%s=%s\\n' {n} \"${{{n}-unset}}\"\n"));
+        }
+        probe.push_str("for a in \"$@\"; do printf 'arg=%s\\n' \"$a\"; done\n");
+        std::fs::write(bin.join("claude"), probe).unwrap();
+        std::fs::set_permissions(bin.join("claude"), fs::Permissions::from_mode(0o755)).unwrap();
+        let script = root.join("claude.sh");
+        std::fs::write(&script, launcher(&run, &l)).unwrap();
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        let ran = |cmd: &mut aterm_uds::spawnfd::Command| {
+            let out = cmd
+                .env_clear()
+                .env("PATH", &path)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            (
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        };
+        let typed = typed_line(&run, &l);
+        assert_eq!(launch_line(&run, &l, &script), typed);
+        let (by_line, _) =
+            ran(aterm_uds::spawnfd::command("/bin/zsh").args(["-f", "-c", typed.as_str()]));
+        let (by_script, _) = ran(aterm_uds::spawnfd::command("/bin/sh").arg(&script));
+        assert_eq!(by_line, by_script, "{typed}");
+        for want in [
+            "K=v 1\n".to_string(),
+            "arg=x y\n".to_string(),
+            format!("PATH={}:{path}\n", run.run.join("shim").display()),
+            format!("CLAUDE_CONFIG_DIR={}/home/.claude\n", run.w.display()),
+        ] {
+            assert!(by_line.contains(&want), "{want}: {by_line}");
+        }
+        assert_eq!(by_line.lines().count(), names.len() + 2, "{by_line}");
+        assert_eq!(program_word(&typed), "claude", "{typed}");
+        assert!(
+            typed.contains(" K='v 1' ") && !typed.contains("'K=v 1'"),
+            "{typed}"
         );
-        let last = |s: &str| s.lines().last().unwrap_or("").trim().to_string();
-        assert_eq!(last(&named), "claude");
-        let pathed = launcher(&run, &Launch::default());
-        assert_eq!(last(&pathed), shell_quote(&run.claude_bin));
+
+        let whole = typed.replace("K='v 1'", "'K=v 1'");
+        let (_, said) =
+            ran(aterm_uds::spawnfd::command("/bin/zsh").args(["-f", "-c", whole.as_str()]));
+        assert!(said.contains("command not found: K=v 1"), "{said}");
+        let by_path = Launch {
+            by_name: false,
+            ..parse_launch(&["-e", "K=v 1"].map(String::from)).unwrap()
+        };
         assert_eq!(
-            parse_launch(&["--by-name".to_string()]).map(|l| l.by_name),
-            Ok(true)
+            launch_line(&run, &by_path, &script),
+            format!("sh {}", shell_quote(&script.to_string_lossy()))
+        );
+
+        // One that replaces the tab's shell: `exec` past the assignment words, where the shell
+        // still assigns them and finds `claude` on the assigned PATH; by path, `exec sh`.
+        let held = Launch {
+            replace_shell: true,
+            ..parse_launch(&["--by-name", "-e", "K=v 1", "--", "--model", "x y"].map(String::from))
+                .unwrap()
+        };
+        let exec_line = launch_line(&run, &held, &script);
+        assert_eq!(program_word(&exec_line), "exec", "{exec_line}");
+        assert_eq!(
+            exec_line,
+            typed.replacen(" K='v 1' claude ", " K='v 1' exec claude ", 1),
+            "{typed}"
+        );
+        let (by_exec, _) =
+            ran(aterm_uds::spawnfd::command("/bin/zsh").args(["-f", "-c", exec_line.as_str()]));
+        assert_eq!(by_exec, by_script, "{exec_line}");
+        let held_path = Launch {
+            by_name: false,
+            ..held
+        };
+        assert_eq!(
+            launch_line(&run, &held_path, &script),
+            format!("exec sh {}", shell_quote(&script.to_string_lossy()))
+        );
+    }
+
+    /// `--by-name` is refused (exit 2) before anything is typed in a lab without
+    /// `LAB_REROUTE=1`, naming it, and for an `-e` no shell assigns; a reroute lab's by-name
+    /// launch and every by-path launch pass.
+    #[test]
+    fn by_name_is_refused_outside_a_reroute_lab_and_for_a_name_no_shell_assigns() {
+        let root = Path::new("/s");
+        let named = |envs: &[&str]| Launch {
+            by_name: true,
+            envs: envs.iter().map(|e| (*e).to_string()).collect(),
+            ..Launch::default()
+        };
+        let plain = Run {
+            reroute: String::new(),
+            ..rerouting(root)
+        };
+        let why = by_name_refused(&plain, &named(&[])).expect("refused");
+        assert!(why.contains("LAB_REROUTE=1"), "{why}");
+        let f = launch_claude(&plain, &named(&[])).expect_err("refused");
+        assert_eq!((f.code, f.msg.as_deref()), (2, Some(why.as_str())));
+        assert_eq!(by_name_refused(&rerouting(root), &named(&["K=v 1"])), None);
+        for bad in ["1X=v", "K", "K-1=v", "=v"] {
+            let why = by_name_refused(&rerouting(root), &named(&[bad])).expect(bad);
+            assert!(why.contains(&format!("-e {bad} ")), "{why}");
+        }
+        assert_eq!(by_name_refused(&plain, &Launch::default()), None);
+        assert_eq!(
+            by_name_refused(
+                &rerouting(root),
+                &Launch {
+                    envs: vec!["1X=v".into()],
+                    ..Launch::default()
+                }
+            ),
+            None
         );
     }
 
@@ -3353,6 +4245,79 @@ mod tests {
         .unwrap();
         clear_run_dir(&run.run, false, false, &run.tag, made);
         assert!(!run.run.exists(), "the run directory went whole");
+    }
+
+    /// An `up --fabric` lab's bus keys ([`bus_keys`]: the link to the aterm under test, the mint
+    /// secret and the caps) go with its run directory, the link removed and never followed. Keys
+    /// an earlier lab of the tag left with no `env.sh` naming it go at the next `up`
+    /// ([`room_for`]), so that `up --fabric` can lay its bus again; a lab that is up keeps its own.
+    #[test]
+    fn a_down_takes_the_bus_keys_and_an_up_the_keys_a_lab_left() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let target = root.path().join("aterm-under-test");
+        fs::write(&target, "a program").unwrap();
+        let lay_keys = |run: &Run| {
+            let keys = bus_keys(run);
+            fs::create_dir_all(&keys).unwrap();
+            std::os::unix::fs::symlink(&target, keys.join("aterm")).unwrap();
+            for f in ["mint.secret", "node.cap", "observer.cap"] {
+                fs::write(keys.join(f), "QZP6WORD1").unwrap();
+            }
+            keys
+        };
+        let (run, made) = torn_down(root.path(), true, false);
+        lay_keys(&run);
+        clear_run_dir(&run.run, false, false, &run.tag, made);
+        assert!(!run.run.exists(), "the run directory went whole");
+        assert!(target.is_file(), "the link was not followed");
+        let (left, made) = torn_down(root.path(), true, false);
+        fs::remove_file(left.run.join("env.sh")).unwrap();
+        let keys = lay_keys(&left);
+        assert!(room_for(&left, made).is_ok(), "no lab of the tag is up");
+        assert!(
+            fs::symlink_metadata(&keys).is_err(),
+            "the keys a lab left go at the next up"
+        );
+        assert!(target.is_file(), "the link was not followed");
+        fs::remove_dir_all(root.path().join("runs")).unwrap();
+        let (up, made) = torn_down(root.path(), true, false);
+        let keys = lay_keys(&up);
+        assert!(room_for(&up, made).is_err(), "up already");
+        assert!(
+            keys.join("mint.secret").is_file(),
+            "a lab that is up keeps its keys"
+        );
+    }
+
+    /// `ps`'s broker line: a live one names its socket; a gone one names the way back, `down` and
+    /// then the `up` of the tag with every flag its lab came up with.
+    #[test]
+    fn a_gone_broker_names_the_up_its_lab_came_up_with() {
+        let mut r = Run {
+            tag: "e7x".into(),
+            fabric: "/tmp/at.x/fabric".into(),
+            broker_pid: 42,
+            ..Run::default()
+        };
+        assert_eq!(
+            broker_line(&r, true),
+            "fabric broker 42 live (in the jail; its socket /tmp/at.x/fabric/b.sock)"
+        );
+        let gone = broker_line(&r, false);
+        assert!(gone.starts_with("fabric broker 42 gone: "), "{gone}");
+        assert!(
+            gone.ends_with(&format!("({LAB} down e7x, then {LAB} up e7x --fabric)")),
+            "{gone}"
+        );
+        r.window = "1".into();
+        r.tab_strip = "1".into();
+        let gone = broker_line(&r, false);
+        assert!(
+            gone.ends_with(&format!(
+                "({LAB} down e7x, then {LAB} up e7x --window --fabric --tab-strip)"
+            )),
+            "{gone}"
+        );
     }
 
     /// A clone held in the scratch that never showed it ran keeps the scratch and `env.sh` past any

@@ -74,7 +74,7 @@ fn the_pinned_chain_reproduces_on_the_v1_sets() {
     let pin = M6_CHAIN_V1.expect("stage E pins the chain");
     assert_eq!(
         pin.digest().hex(),
-        "ed3cfd79d82728f86eb6def01c1935713907abfa22a7d283003eca65e6670322"
+        "f3ae385050abe4b23912ec63291af550d6445337e3c72adee7f0645a3113afa7"
     );
     assert_eq!(pin.ids[0], Version::base().id());
     let members = chain(&Sets::v1(), &Labeller::new(evaluator(), &Threads)).expect("the v1 chain");

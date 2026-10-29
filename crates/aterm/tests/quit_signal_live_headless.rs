@@ -152,6 +152,8 @@ fn sigterm_quits_a_headless_instance_as_the_quit_verb_does() {
     assert!(!markers(&inst).is_empty(), "the crash marker is armed");
     let watcher = headless_boot::subscribed(&inst, &["@*", "events,sessions"]);
     until_watched(&inst, &manager, 1);
+    let token = PathBuf::from(format!("{}.token", inst.sock));
+    assert!(exists(&token), "the token sits beside the socket");
 
     let status = signal_and_reap(&mut inst, libc::SIGTERM);
     assert_eq!(
@@ -169,6 +171,7 @@ fn sigterm_quits_a_headless_instance_as_the_quit_verb_does() {
         "and the crash marker"
     );
     assert!(!exists(Path::new(&inst.sock)), "and its socket");
+    assert!(!exists(&token), "and its token");
 
     let out = child_output::wait_and_read(watcher, Instant::now() + HANG)
         .expect("the watcher ends once the instance has quit");

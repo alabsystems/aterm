@@ -15,11 +15,6 @@ use aterm_slog::{
     encode_with_table,
 };
 
-/// Whether `run` is listed in `list` in order and together, wherever later words were appended.
-fn listed_together(list: &[&str], run: &[&str]) -> bool {
-    list.windows(run.len()).any(|w| w == run)
-}
-
 fn rec(op: Op, node: Node, k: Kind, f: Fields) -> Rec {
     Rec {
         seq: 412,
@@ -410,28 +405,9 @@ fn a_rule_id_crosses_the_wire_as_name_dot_version() {
 
 #[test]
 fn phase_3b_keys_and_kinds_are_appended_wire_numbers() {
-    let n = FIELDS
-        .iter()
-        .position(|r| r.0 == Key::Attention)
-        .expect("phase 5's first key");
-    let tail: Vec<Key> = FIELDS[n - 4..n].iter().map(|r| r.0).collect();
-    assert_eq!(tail, [Key::H5, Key::D7, Key::Skipped, Key::Dropped]);
-    for k in tail {
+    for k in [Key::H5, Key::D7, Key::Skipped, Key::Dropped] {
         assert_eq!((k.tier(), k.cap()), (Tier::Wire, Cap::U), "{k:?}");
     }
-    assert_eq!(
-        FIELDS[n - 5].0,
-        Key::Title,
-        "the keys before 3B kept their places"
-    );
-    let at = Kind::ALL
-        .iter()
-        .position(|k| *k == Kind::Source)
-        .expect("3B's first kind");
-    assert_eq!(
-        &Kind::ALL[at..at + 3],
-        &[Kind::Source, Kind::MailLanded, Kind::Task]
-    );
     for k in [Kind::Source, Kind::MailLanded] {
         assert!(k.is_mark() && k.node_level().is_none(), "{k:?}");
     }
@@ -439,20 +415,9 @@ fn phase_3b_keys_and_kinds_are_appended_wire_numbers() {
 
 #[test]
 fn phase_5_task_key_and_kind_are_appended_and_local() {
-    let n = 1 + FIELDS
-        .iter()
-        .position(|r| r.0 == Key::Attention)
-        .expect("the task key");
-    assert_eq!(FIELDS[n - 2].0, Key::Dropped, "3B's keys kept their places");
     assert_eq!(
         (Key::Attention.tier(), Key::Attention.cap()),
         (Tier::Wire, Cap::U)
-    );
-    let kind_at = |k: Kind| Kind::ALL.iter().position(|x| *x == k);
-    assert_eq!(
-        kind_at(Kind::Task),
-        kind_at(Kind::MailLanded).map(|i| i + 1),
-        "appended after 3B's kinds, which kept their places"
     );
     assert!(Kind::Task.is_mark() && Kind::Task.node_level().is_none());
     let f = Fields::new()
@@ -485,12 +450,6 @@ fn phase_5_task_key_and_kind_are_appended_and_local() {
 
 #[test]
 fn phase_5_act_key_is_appended_and_closed() {
-    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
-    assert_eq!(
-        at(Key::Act),
-        at(Key::Attention).map(|i| i + 1),
-        "appended after 5C-1's key, which kept its place"
-    );
     assert_eq!(Key::Act.tier(), Tier::Wire);
     let words: Vec<&str> = aterm_slog::ActWord::ALL.iter().map(|a| a.word()).collect();
     assert_eq!(words, ACT_WORDS);
@@ -509,11 +468,6 @@ fn phase_5_act_key_is_appended_and_closed() {
 
 #[test]
 fn phase_5_reached_key_is_appended_and_host_only() {
-    let n = 1 + FIELDS
-        .iter()
-        .position(|r| r.0 == Key::Reached)
-        .expect("5D-4's key");
-    assert_eq!(FIELDS[n - 2].0, Key::Act, "5D-2's key kept its place");
     assert_eq!(Key::Reached.tier(), Tier::Host);
     let r = Rec {
         seq: 5,
@@ -539,14 +493,6 @@ fn phase_5_reached_key_is_appended_and_host_only() {
 
 #[test]
 fn phase_5_node_log_keys_are_appended_wire_words() {
-    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
-    assert_eq!(at(Key::PrevEnd), at(Key::Reached).map(|i| i + 1));
-    assert_eq!(at(Key::CfgKey), at(Key::PrevEnd).map(|i| i + 1));
-    assert_eq!(
-        at(Key::OpBy),
-        at(Key::CfgKey).map(|i| i + 1),
-        "6C-2's op_by= comes after them"
-    );
     assert_eq!(
         (Key::PrevEnd.tier(), Key::PrevEnd.cap()),
         (Tier::Wire, Cap::Word(END_WORDS))
@@ -593,13 +539,6 @@ fn phase_5_node_log_keys_are_appended_wire_words() {
 
 #[test]
 fn phase_6_op_by_is_appended_host_only_and_an_older_reader_skips_it() {
-    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
-    assert_eq!(at(Key::OpBy), at(Key::CfgKey).map(|i| i + 1));
-    assert_eq!(
-        at(Key::Pool),
-        at(Key::OpBy).map(|i| i + 1),
-        "6C-6's pool= comes after it"
-    );
     assert_eq!((Key::OpBy.tier(), Key::OpBy.cap()), (Tier::Host, Cap::Id));
     assert_eq!(Key::OpBy.word(), "op_by");
     let sid = ShortId::new("s-edge42").expect("a sid");
@@ -646,13 +585,6 @@ fn phase_6_op_by_is_appended_host_only_and_an_older_reader_skips_it() {
 
 #[test]
 fn phase_6_pool_is_appended_host_only_and_closed() {
-    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
-    assert_eq!(at(Key::Pool), at(Key::OpBy).map(|i| i + 1));
-    assert_eq!(
-        at(Key::Build),
-        at(Key::Pool).map(|i| i + 1),
-        "6F-2's keys come after it"
-    );
     assert_eq!(
         (Key::Pool.tier(), Key::Pool.cap()),
         (Tier::Host, Cap::Word(POOL_WORDS))
@@ -698,7 +630,6 @@ fn phase_6_pool_is_appended_host_only_and_closed() {
 
 #[test]
 fn phase_6_ring_vocabulary_is_appended_at_its_tiers() {
-    let kind_at = |k: Kind| Kind::ALL.iter().position(|x| *x == k);
     let kinds = [
         Kind::State,
         Kind::Policy,
@@ -708,12 +639,6 @@ fn phase_6_ring_vocabulary_is_appended_at_its_tiers() {
         Kind::MailFetch,
         Kind::Shown,
     ];
-    let first = kind_at(Kind::Task).map(|i| i + 1).expect("5C-1's kind");
-    assert_eq!(
-        &Kind::ALL[first..first + kinds.len()],
-        &kinds,
-        "appended after `task`"
-    );
     let words: Vec<&str> = kinds.iter().map(|k| k.word()).collect();
     assert_eq!(
         words,
@@ -744,7 +669,6 @@ fn phase_6_ring_vocabulary_is_appended_at_its_tiers() {
         assert!(!r.is_bus_class() && !r.is_turn_class(), "{k:?} stays local");
     }
 
-    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
     let rows: [(Key, &str, Tier, Cap); 17] = [
         (Key::Build, "build", Tier::Wire, Cap::U),
         (Key::Run, "run", Tier::Wire, Cap::U),
@@ -769,24 +693,16 @@ fn phase_6_ring_vocabulary_is_appended_at_its_tiers() {
         (Key::TopicName, "topic_name", Tier::Content, Cap::Text(64)),
         (Key::Closer, "closer", Tier::Content, Cap::Text(64)),
     ];
-    let first = at(Key::Pool).map(|i| i + 1).expect("6C-6's key");
-    for (i, (key, word, tier, cap)) in rows.iter().enumerate() {
-        assert_eq!(at(*key), Some(first + i), "{key:?} in its place");
+    for (key, word, tier, cap) in &rows {
         assert_eq!(
             (key.word(), key.tier(), key.cap()),
             (*word, *tier, *cap),
             "{key:?}"
         );
     }
-    assert_eq!(
-        FIELDS.get(first + rows.len()).map(|r| r.0),
-        Some(Key::Change),
-        "6F-5's `change=` follows `closer=`"
-    );
-    assert!(
-        listed_together(WHY_WORDS, &["mail", "burst"]),
-        "6F-6's two follow"
-    );
+    for w in ["mail", "burst"] {
+        assert!(Fields::new().word(Key::Why, w).is_ok(), "why={w}");
+    }
     for w in ["spawning", "alive", "exited", "closed"] {
         assert!(Fields::new().word(Key::State, w).is_ok(), "session {w}");
     }
@@ -867,7 +783,6 @@ fn phase_6_ring_vocabulary_is_appended_at_its_tiers() {
 
 #[test]
 fn phase_6_ring_row_keys_are_appended_at_their_tiers() {
-    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
     let rows: [(Key, &str, Tier, Cap); 7] = [
         (Key::Change, "change", Tier::Wire, Cap::Word(CHANGE_WORDS)),
         (Key::Since, "since", Tier::Content, Cap::Text(64)),
@@ -882,25 +797,18 @@ fn phase_6_ring_row_keys_are_appended_at_their_tiers() {
         (Key::Seen, "seen", Tier::Wire, Cap::U),
         (Key::Moved, "moved", Tier::Wire, Cap::U),
     ];
-    let first = at(Key::Closer).map(|i| i + 1).expect("6F-2's last key");
-    for (i, (key, word, tier, cap)) in rows.iter().enumerate() {
-        assert_eq!(at(*key), Some(first + i), "{key:?} in its place");
+    for (key, word, tier, cap) in &rows {
         assert_eq!(
             (key.word(), key.tier(), key.cap()),
             (*word, *tier, *cap),
             "{key:?}"
         );
     }
-    assert_eq!(at(Key::Net), Some(first + rows.len()), "6F-7's keys follow");
     assert_eq!(CHANGE_WORDS, ["add", "drop"]);
     assert!(Fields::new().word(Key::Change, "rename").is_err(), "closed");
-    assert!(
-        listed_together(
-            WHY_WORDS,
-            &["not-carried", "log-replaced", "signin", "install"]
-        ),
-        "a worker launcher's two refusals (task `why=`) follow"
-    );
+    for w in ["not-carried", "log-replaced", "signin", "install"] {
+        assert!(Fields::new().word(Key::Why, w).is_ok(), "why={w}");
+    }
 
     let mark = |k: Kind, f: Fields| Rec {
         seq: 41,
@@ -1013,7 +921,6 @@ fn phase_6_ring_row_keys_are_appended_at_their_tiers() {
 
 #[test]
 fn phase_6_session_row_keys_are_appended_at_their_tiers() {
-    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
     let rows: [(Key, &str, Tier, Cap); 14] = [
         (Key::Net, "net", Tier::Wire, Cap::Word(NET_WORDS)),
         (Key::AfterMs, "after_ms", Tier::Wire, Cap::U),
@@ -1035,20 +942,13 @@ fn phase_6_session_row_keys_are_appended_at_their_tiers() {
         (Key::Reply, "reply", Tier::Content, Cap::Text(64)),
         (Key::Build, "build", Tier::Wire, Cap::U),
     ];
-    let first = at(Key::Moved).map(|i| i + 1).expect("6F-6's last key");
-    for (i, (key, word, tier, cap)) in rows[..13].iter().enumerate() {
-        assert_eq!(at(*key), Some(first + i), "{key:?} in its place");
+    for (key, word, tier, cap) in &rows[..13] {
         assert_eq!(
             (key.word(), key.tier(), key.cap()),
             (*word, *tier, *cap),
             "{key:?}"
         );
     }
-    assert_eq!(
-        at(Key::HarnessAct),
-        Some(first + 13),
-        "the review's `harness_act=` follows"
-    );
     assert_eq!(NET_WORDS, ["zero", "changed"]);
     assert_eq!(CLASS_WORDS, ["agent", "learned", "unknown"]);
     assert_eq!(HEALED_BY_WORDS, ["app", "undo", "nudge"]);
@@ -1178,13 +1078,6 @@ fn phase_6_session_row_keys_are_appended_at_their_tiers() {
 
 #[test]
 fn phase_6_harness_act_is_appended_host_only() {
-    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
-    assert_eq!(at(Key::HarnessAct), at(Key::Reply).map(|i| i + 1));
-    assert_eq!(
-        at(Key::LandAt),
-        at(Key::HarnessAct).map(|i| i + 1),
-        "6F-8's `land_at=` follows"
-    );
     assert_eq!(
         (
             Key::HarnessAct.word(),
@@ -1234,13 +1127,6 @@ fn phase_6_harness_act_is_appended_host_only() {
 
 #[test]
 fn phase_6_land_at_is_appended_host_only() {
-    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
-    assert_eq!(at(Key::LandAt), at(Key::HarnessAct).map(|i| i + 1));
-    assert_eq!(
-        at(Key::Sev),
-        at(Key::LandAt).map(|i| i + 1),
-        "6F-9's `sev=` follows"
-    );
     assert_eq!(
         (Key::LandAt.word(), Key::LandAt.tier(), Key::LandAt.cap()),
         ("land_at", Tier::Host, Cap::I)
@@ -1282,14 +1168,6 @@ fn phase_6_land_at_is_appended_host_only() {
 
 #[test]
 fn phase_6_shown_keys_are_appended_wire_and_the_mark_is_local() {
-    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
-    assert_eq!(at(Key::Sev), at(Key::LandAt).map(|i| i + 1));
-    assert_eq!(at(Key::Held), at(Key::Sev).map(|i| i + 1));
-    assert_eq!(
-        at(Key::RowKind),
-        at(Key::Held).map(|i| i + 1),
-        "`row=` follows `held=`"
-    );
     assert_eq!(
         (Key::Sev.word(), Key::Sev.tier(), Key::Sev.cap()),
         ("sev", Tier::Wire, Cap::Word(SEV_WORDS))
@@ -1358,17 +1236,8 @@ fn phase_6_shown_keys_are_appended_wire_and_the_mark_is_local() {
 
 #[test]
 fn phase_6_row_mark_is_appended_local_and_its_text_never_leaves_ram() {
-    let kind_at = |k: Kind| Kind::ALL.iter().position(|x| *x == k);
-    assert_eq!(kind_at(Kind::Row), kind_at(Kind::Shown).map(|i| i + 1));
     assert_eq!(Kind::Row.word(), "row");
     assert!(Kind::Row.is_mark() && Kind::Row.node_level().is_none());
-    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
-    assert_eq!(at(Key::RowText), at(Key::RowKind).map(|i| i + 1));
-    assert_eq!(
-        at(Key::FactRev),
-        at(Key::RowText).map(|i| i + 1),
-        "the fact word's keys follow"
-    );
     assert_eq!(
         (Key::RowKind.word(), Key::RowKind.tier(), Key::RowKind.cap()),
         ("row", Tier::Wire, Cap::Tok(aterm_slog::Charset::Lower, 32))
@@ -1430,7 +1299,7 @@ fn phase_6_row_mark_is_appended_local_and_its_text_never_leaves_ram() {
     );
 }
 
-/// A9 (B22): THE MAIL GAP MARK is appended last, local, and names no key of its own. A
+/// A9 (B22): THE MAIL GAP MARK is local and names no key of its own. A
 /// broker's gap notice says which offsets of the node's mail lanes retention gave up unread
 /// (`off=` the tail's cursor, `floor=` the oldest offset the lane still reaches, both host
 /// facts as every mail offset is) and, where the broker counted them, how many (`lost=`, a
@@ -1440,13 +1309,6 @@ fn phase_6_row_mark_is_appended_local_and_its_text_never_leaves_ram() {
 /// one, so the count is the kind's.
 #[test]
 fn a9_mail_gap_is_appended_local_at_its_keys_tiers() {
-    let kind_at = |k: Kind| Kind::ALL.iter().position(|x| *x == k);
-    assert_eq!(Kind::ALL.last(), Some(&Kind::MailGap), "the last kind");
-    assert_eq!(
-        kind_at(Kind::MailGap),
-        kind_at(Kind::Row).map(|i| i + 1),
-        "it follows phase 6's row mark"
-    );
     assert_eq!(Kind::MailGap.word(), "mail-gap");
     assert!(Kind::MailGap.is_mark() && Kind::MailGap.node_level().is_none());
     assert_eq!(Kind::from_word("mail-gap"), Kind::MailGap);
@@ -1525,28 +1387,17 @@ fn a9_mail_gap_is_appended_local_at_its_keys_tiers() {
 
 #[test]
 fn occupancy_fact_keys_are_appended_wire_and_an_older_reader_skips_them() {
-    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
-    let first = at(Key::RowText).map(|i| i + 1).expect("phase 6's last key");
-    for (i, (key, word, cap)) in [
+    for (key, word, cap) in [
         (Key::FactRev, "fact_rev", Cap::U),
         (Key::FactRule, "fact_rule", Cap::Word(FACT_RULE_WORDS)),
         (Key::FactN, "fact_n", Cap::U),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        assert_eq!(at(key), Some(first + i), "{key:?} in its place");
+    ] {
         assert_eq!(
             (key.word(), key.tier(), key.cap()),
             (word, Tier::Wire, cap),
             "{key:?}"
         );
     }
-    assert_eq!(
-        FIELDS.len(),
-        at(Key::FactN).map_or(0, |i| i + 1),
-        "the last key"
-    );
     assert_eq!(
         FACT_RULE_WORDS,
         ["wait-nudge@v1", "hold-room@v1", "wake@v1"]

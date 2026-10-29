@@ -13,7 +13,7 @@ fn scrollback_line_limit_default_is_safe_cap() {
 }
 
 #[test]
-fn scrollback_line_limit_zero_disables() {
+fn scrollback_line_limit_zero_retains_zero_lines() {
     let mut sb = Scrollback::new(100, 1000, 10_000_000);
     sb.set_line_limit(Some(5));
 
@@ -24,6 +24,12 @@ fn scrollback_line_limit_zero_disables() {
 
     sb.set_line_limit(Some(0));
     assert_eq!(sb.line_count(), 0);
+    sb.push_str("after zero cap");
+    assert_eq!(sb.line_count(), 0);
+
+    sb.set_line_limit(None);
+    sb.push_str("after uncap");
+    assert_eq!(sb.line_count(), 1);
 }
 
 #[test]

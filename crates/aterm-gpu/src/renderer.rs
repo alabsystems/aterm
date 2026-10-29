@@ -434,6 +434,18 @@ impl BlitUniform {
         }
     }
 
+    /// The compose copy's uniform: the blit row as a 1:1 texel copy, alpha and all, of a frame
+    /// at the origin with no bands (an extent no texture reaches), no chrome rows, no invert,
+    /// wash or encode. One value serves every frame size.
+    #[cfg(target_os = "macos")]
+    #[inline]
+    const fn compose_copy() -> Self {
+        let mut u = Self::bell(false).with_translucency(1.0);
+        u.dims = [f32::MAX, f32::MAX];
+        u.visible_h = f32::MAX;
+        u
+    }
+
     #[inline]
     const fn with_translucency(mut self, band_a: f32) -> Self {
         self.translucent = 1.0;
@@ -584,7 +596,8 @@ pub(crate) fn scaled_border_px(base: u32, scale_q4: u8) -> u32 {
     if scale_q4 == 0 {
         return base;
     }
-    ((base * u32::from(scale_q4)) / 16).max(1)
+    let scaled = (u64::from(base) * u64::from(scale_q4)) / 16;
+    u32::try_from(scaled).unwrap_or(u32::MAX).max(1)
 }
 
 #[cfg(test)]
@@ -602,6 +615,9 @@ mod scaled_border_px_tests {
             (1, 1, 1),
             (0, 16, 1),
             (0, 0, 0),
+            (u32::MAX, 16, u32::MAX),
+            (u32::MAX, 255, u32::MAX),
+            (1 << 25, 32, 1 << 26),
         ] {
             assert_eq!(scaled_border_px(base, q4), want, "base {base} × {q4}/16");
         }
@@ -1905,6 +1921,9 @@ struct MetalArmLive {
     fetch_psos: [Option<crate::metal::ffi::Obj>; pipeline_table::FETCH_TWIN_COUNT],
     nearest: crate::metal::ffi::Obj,
     linear: crate::metal::ffi::Obj,
+    /// The compose copy's uniform ([`BlitUniform::compose_copy`]), minted at the first present
+    /// that composes and never rewritten, so one buffer serves every Submit B slot.
+    compose_u: Option<crate::device_layer::LayerBuffer>,
     frame_slots: [ArmFrameSlot; ARM_FRAME_SLOTS],
     cur_slot: usize,
     submit_b_slots: [ArmSubmitBSlot; ARM_SUBMIT_B_SLOTS],
@@ -2057,6 +2076,7 @@ impl MetalArmLive {
             nearest,
             linear,
             frame_slots,
+            compose_u: None,
             cur_slot: 0,
             submit_b_slots: std::array::from_fn(|_| ArmSubmitBSlot::default()),
             submit_b_idx: 0,
@@ -2262,6 +2282,24 @@ impl MetalArmLive {
         unsafe { layer.write_buffer_from_zero(&buf, aterm_bits::bytes_of(&want)) };
         let handle = buf.metal().clone_retained();
         *slot = Some((want, buf));
+        Ok(handle)
+    }
+
+    /// The compose copy's uniform buffer ([`Self::compose_u`]), minted on first use.
+    fn ensure_compose_copy_u(&mut self) -> Result<crate::metal::ffi::Obj, String> {
+        if let Some(buf) = self.compose_u.as_ref() {
+            return Ok(buf.metal().clone_retained());
+        }
+        let layer = crate::device_layer::DeviceHandle::Metal(&self.mint);
+        let want = BlitUniform::compose_copy();
+        let buf = layer.try_create_uniform_buffer(
+            "aterm-gpu metal compose uniform",
+            std::mem::size_of::<BlitUniform>() as u64,
+        )?;
+        // SAFETY: freshly minted shared buffer of `size_of::<BlitUniform>()`.
+        unsafe { layer.write_buffer_from_zero(&buf, aterm_bits::bytes_of(&want)) };
+        let handle = buf.metal().clone_retained();
+        self.compose_u = Some(buf);
         Ok(handle)
     }
 
@@ -3752,6 +3790,9 @@ pub struct WindowGpu {
     pub(crate) metal_present_off: Option<crate::metal::resources::SealedTexture>,
     #[cfg(all(target_os = "macos", test))]
     pub(crate) metal_last_compose_rect: Option<[u32; 4]>,
+    /// The blit encoders the last Submit B's present sequence opened (the effect copies alone).
+    #[cfg(all(target_os = "macos", test))]
+    pub(crate) metal_last_present_blits: u64,
     #[cfg(target_os = "macos")]
     pub(crate) metal_present_off_pending: Vec<crate::metal::encoder::CbProbe>,
     #[cfg(target_os = "macos")]
@@ -4251,6 +4292,9 @@ pub struct GpuRenderer {
     ligature_break_scratch: Vec<usize>,
     bloom_glow_scratch: Vec<GlowInstance>,
     bloom_quad_scratch: Vec<aterm_render::GlowQuad>,
+    /// A frame whose bloom spares its letters: its post passes' lights, and
+    /// the crown's and the bloom's of them ([`Self::build_spared_bloom_glow`]).
+    bloom_spare_scratch: [Vec<aterm_render::GlowQuad>; 3],
     /// The bloom's item list, the frame's bloom stream where
     /// [`Self::bloom_items_live`].
     bloom_items: aterm_render::bloom::BloomItems,
@@ -4781,6 +4825,7 @@ impl GpuRenderer {
             ligature_break_scratch: Vec::new(),
             bloom_glow_scratch: Vec::new(),
             bloom_quad_scratch: Vec::new(),
+            bloom_spare_scratch: [Vec::new(), Vec::new(), Vec::new()],
             bloom_items: aterm_render::bloom::BloomItems::default(),
             bloom_items_live: false,
             glow_fx_scratch: Vec::new(),
@@ -5201,6 +5246,13 @@ impl GpuRenderer {
     #[inline]
     pub fn prewarm_ascii(&mut self) {
         self.cpu.prewarm_ascii();
+    }
+
+    /// What the face lays down of each printable ASCII glyph
+    /// ([`aterm_render::Renderer::glyph_ink`]), from the CPU face whose rasters the atlas holds.
+    #[inline]
+    pub fn glyph_ink(&mut self) -> std::sync::Arc<aterm_render::GlyphInk> {
+        self.cpu.glyph_ink()
     }
 
     /// Diagnostic.
@@ -8181,6 +8233,14 @@ impl GpuRenderer {
             })
             .transpose()?;
 
+        let compose_parts = if use_present_off {
+            Some((
+                live.present_pso(Pipeline::Blit, MPix::Rgba8Unorm)?,
+                live.ensure_compose_copy_u()?,
+            ))
+        } else {
+            None
+        };
         let bu = live.ensure_submit_b_blit_u(want)?;
         let blit_pso = live.present_pso(Pipeline::Blit, dest_mpix)?;
         let crown_parts = if let Some(hu) = crown
@@ -8256,6 +8316,15 @@ impl GpuRenderer {
             offscreen: &off_tex,
             present_off: present_off.as_ref(),
             copy_rect,
+            compose: compose_parts.as_ref().map(|(pso, ubuf)| PostPass {
+                pso,
+                tex: off_tex.obj(),
+                tex_slot: Pipeline::Blit.spec().binds.fragment_textures[0] as usize,
+                sampler: &live.nearest,
+                sampler_slot: Pipeline::Blit.spec().binds.fragment_samplers[0] as usize,
+                uniform: ubuf,
+                uniform_slot: Pipeline::Blit.spec().binds.fragment_buffers[0] as usize,
+            }),
             bloom: bloom_parts.as_ref().map(
                 |(
                     half,
@@ -8365,7 +8434,14 @@ impl GpuRenderer {
                 }),
         };
         let mut cb = live.session.begin()?;
+        #[cfg(test)]
+        let blits_before = crate::metal::encoder::blit_census::opened();
         encode_present_sequence(&mut cb, target, (dw, dh), &seq)?;
+        #[cfg(test)]
+        {
+            win.metal_last_present_blits =
+                crate::metal::encoder::blit_census::opened() - blits_before;
+        }
         if use_present_off {
             let mut fx: Option<[u32; 4]> = Some([0, 0, 0, 0]);
             if let Some((.., sc)) = bloom_parts.as_ref() {
@@ -8443,48 +8519,52 @@ impl GpuRenderer {
         translucent: bool,
         full_repaint: bool,
     ) -> Result<Vec<u8>, String> {
-        use crate::metal::ffi as mtl;
         self.metal_present_standalone_for_test(
             win,
             input,
             (dw, dh),
             (translucent, full_repaint),
             crate::device_layer::TexelFormat::Bgra8Unorm,
-            |gpu, target| {
-                let live = gpu
-                    .metal_arm
-                    .as_mut()
-                    .ok_or("the arm is not live")?
-                    .live_mut();
-                let row = (dw * 4) as usize;
-                let rb = live
-                    .layer()
-                    .try_create_readback_buffer(
-                        "aterm-gpu metal readback",
-                        (row * dh as usize) as u64,
-                    )?
-                    .into_metal()
-                    .into_obj();
-                let mut cb = live.session.begin()?;
-                cb.copy_texture_to_buffer(target, dw as usize, dh as usize, &rb, row)?;
-                if cb.commit().wait_outcome() != crate::metal::loss::CbOutcome::Completed {
-                    return Err("the readback copy did not complete".to_owned());
-                }
-                // SAFETY: shared storage sized `row * dh` whose writing command buffer has
-                // completed.
-                let bgra = unsafe { mtl::buffer_bytes(&rb, row * dh as usize) };
-                let mut rgba = vec![0u8; bgra.len()];
-                for (dst, src) in rgba
-                    .as_chunks_mut::<4>()
-                    .0
-                    .iter_mut()
-                    .zip(bgra.as_chunks::<4>().0)
-                {
-                    *dst = [src[2], src[1], src[0], src[3]];
-                }
-                Ok(rgba)
-            },
+            |gpu, target| gpu.metal_read_bgra_target_for_test(target, (dw, dh)),
         )
+    }
+
+    /// The RGBA bytes of a `dw`×`dh` `Bgra8Unorm` present target, read back once the GPU wrote it.
+    #[cfg(all(target_os = "macos", test))]
+    pub(crate) fn metal_read_bgra_target_for_test(
+        &mut self,
+        target: &crate::metal::resources::SealedTexture,
+        (dw, dh): (u32, u32),
+    ) -> Result<Vec<u8>, String> {
+        use crate::metal::ffi as mtl;
+        let live = self
+            .metal_arm
+            .as_mut()
+            .ok_or("the arm is not live")?
+            .live_mut();
+        let row = (dw * 4) as usize;
+        let rb = live
+            .layer()
+            .try_create_readback_buffer("aterm-gpu metal readback", (row * dh as usize) as u64)?
+            .into_metal()
+            .into_obj();
+        let mut cb = live.session.begin()?;
+        cb.copy_texture_to_buffer(target, dw as usize, dh as usize, &rb, row)?;
+        if cb.commit().wait_outcome() != crate::metal::loss::CbOutcome::Completed {
+            return Err("the readback copy did not complete".to_owned());
+        }
+        // SAFETY: shared storage sized `row * dh` whose writing command buffer has completed.
+        let bgra = unsafe { mtl::buffer_bytes(&rb, row * dh as usize) };
+        let mut rgba = vec![0u8; bgra.len()];
+        for (dst, src) in rgba
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(bgra.as_chunks::<4>().0)
+        {
+            *dst = [src[2], src[1], src[0], src[3]];
+        }
+        Ok(rgba)
     }
 
     /// [`Self::metal_present_bytes_with_scope_for_test`]'s present onto a standalone drawable of
@@ -8497,6 +8577,27 @@ impl GpuRenderer {
         (dw, dh): (u32, u32),
         (translucent, full_repaint): (bool, bool),
         format: crate::device_layer::TexelFormat,
+        read: impl FnOnce(&mut Self, &crate::metal::resources::SealedTexture) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.metal_present_standalone_with_tray_for_test(
+            win,
+            input,
+            (dw, dh),
+            (translucent, full_repaint),
+            (format, None),
+            read,
+        )
+    }
+
+    /// [`Self::metal_present_standalone_for_test`] with a tray card over the frame.
+    #[cfg(all(target_os = "macos", test))]
+    pub(crate) fn metal_present_standalone_with_tray_for_test<T>(
+        &mut self,
+        win: &mut WindowGpu,
+        input: &RenderInput,
+        (dw, dh): (u32, u32),
+        (translucent, full_repaint): (bool, bool),
+        (format, tray): (crate::device_layer::TexelFormat, Option<TrayQuad<'_>>),
         read: impl FnOnce(&mut Self, &crate::metal::resources::SealedTexture) -> Result<T, String>,
     ) -> Result<T, String> {
         use crate::metal::ffi as mtl;
@@ -8539,7 +8640,7 @@ impl GpuRenderer {
             input,
             false,
             None,
-            None,
+            tray,
             None,
             None,
             (fw, fh),
@@ -9666,6 +9767,10 @@ impl GpuRenderer {
         items: bool,
     ) -> (u32, Option<[u32; 4]>, u32) {
         let f = self.fx_frame_for(input);
+        if input.bloom_gate.spares_letters() {
+            self.bloom_items_live = false;
+            return self.build_spared_bloom_glow(input, &f);
+        }
         self.bloom_items_live = items && !input.cursor_glow_add_ramps.is_empty();
         if self.bloom_items_live {
             let extra = self.fx.bloom_layers(&f, input).unwrap_or(&[]);
@@ -9703,6 +9808,71 @@ impl GpuRenderer {
         self.bloom_glow_scratch = v;
         self.bloom_quad_scratch = quads;
         (n, bbox, extract_first as u32)
+    }
+
+    /// [`Self::build_bloom_glow`] for a frame whose bloom spares its letters
+    /// ([`aterm_core::render::BloomGate::SparesLetters`]): the crown draws its
+    /// lights kept off the lettered cells, the extract its lights kept a
+    /// whole blur's reach off them ([`aterm_render::bloom::spared_sources`]),
+    /// as the CPU law does. Each set is padded with empty instances to the
+    /// longer's count, the extract's after the crown's.
+    fn build_spared_bloom_glow(
+        &mut self,
+        input: &RenderInput,
+        f: &aterm_render::FxFrame,
+    ) -> (u32, Option<[u32; 4]>, u32) {
+        let [mut src, mut crown, mut blur] = std::mem::take(&mut self.bloom_spare_scratch);
+        src.clear();
+        input
+            .cursor_glow_add_ramps
+            .expand_into(&input.cursor_glow_add, &mut src);
+        if let Some(layers) = self.fx.bloom_layers(f, input) {
+            src.extend_from_slice(layers);
+        }
+        let (cw, ch) = self.cpu.cell_size();
+        let grid = aterm_render::bloom::LetterGrid {
+            pad: f.pad,
+            grid_top: f.grid_top,
+            cell_w: cw,
+            cell_h: ch,
+        };
+        aterm_render::bloom::spared_sources(
+            &src,
+            input,
+            grid,
+            self.bloom_radius,
+            &mut crown,
+            &mut blur,
+        );
+        let mut quads = std::mem::take(&mut self.bloom_quad_scratch);
+        let (crown_box, crown_wide) =
+            aterm_render::bloom::source_quads_into(&crown, input.rows, &mut quads);
+        let crown_n = if crown_wide > 0 {
+            crown_wide
+        } else {
+            quads.len()
+        };
+        crown.clear();
+        crown.extend_from_slice(&quads[..crown_n]);
+        let (blur_box, blur_first) =
+            aterm_render::bloom::source_quads_into(&blur, input.rows, &mut quads);
+        let count = crown.len().max(quads.len() - blur_first);
+        let mut v = std::mem::take(&mut self.bloom_glow_scratch);
+        v.clear();
+        let empty = GlowInstance::of([0; 4], &aterm_render::GlowQuad::default());
+        let instances = |set: &[aterm_render::GlowQuad], v: &mut Vec<GlowInstance>| {
+            v.extend(
+                set.iter()
+                    .map(|q| GlowInstance::of([q.x, q.y, q.w, q.h], q)),
+            );
+            v.resize(v.len() + count - set.len(), empty);
+        };
+        instances(&crown, &mut v);
+        instances(&quads[blur_first..], &mut v);
+        self.bloom_glow_scratch = v;
+        self.bloom_quad_scratch = quads;
+        self.bloom_spare_scratch = [src, crown, blur];
+        (count as u32, blur_box.or(crown_box), count as u32)
     }
 
     fn shimmer_phase(&self) -> f32 {
@@ -12670,10 +12840,20 @@ mod tests {
         let mut a = WindowGpu::new();
         let mut b = WindowGpu::new();
 
+        let expected_first = 0.30 * (1.0 - (-0.016f32 / 0.045).exp());
         let a_first = a.advance_sdr_glow_budget(true, 0.30, now);
-        let a_second =
-            a.advance_sdr_glow_budget(true, 0.30, now + std::time::Duration::from_millis(16));
-        assert!(a_first > 0.0 && a_second > a_first);
+        assert!(
+            (a_first - expected_first).abs() <= f32::EPSILON,
+            "fresh attack takes the 16 ms step: got {a_first}, want {expected_first}"
+        );
+        assert_eq!(
+            a.advance_sdr_glow_budget(true, 0.30, now),
+            a_first,
+            "zero elapsed dt holds the current attack level"
+        );
+        let t1 = now + std::time::Duration::from_millis(16);
+        let a_second = a.advance_sdr_glow_budget(true, 0.30, t1);
+        assert!(a_second > a_first && a_second <= 0.30);
 
         assert_eq!(b.advance_sdr_glow_budget(false, 0.30, now), 0.0);
         assert_eq!(
@@ -12684,13 +12864,29 @@ mod tests {
 
         let b_first = b.advance_sdr_glow_budget(true, 0.30, now);
         assert!(
-            (b_first - a_first).abs() < f32::EPSILON,
+            (b_first - a_first).abs() <= f32::EPSILON,
             "window B begins its own attack instead of inheriting A's level"
         );
-        assert_eq!(a.advance_sdr_glow_budget(false, 0.30, now), 0.0);
+
+        let snapped =
+            a.advance_sdr_glow_budget(true, 0.05, t1 + std::time::Duration::from_millis(16));
+        assert_eq!(
+            snapped, 0.05,
+            "lowering the target below the current level snaps down immediately"
+        );
+
+        assert_eq!(a.advance_sdr_glow_budget(false, 0.30, t1), 0.0);
+        assert_eq!(a.sdr_glow_level, 0.0);
+        assert!(a.sdr_glow_level_at.is_none());
+        let a_restarted =
+            a.advance_sdr_glow_budget(true, 0.30, t1 + std::time::Duration::from_secs(5));
+        assert!(
+            (a_restarted - expected_first).abs() <= f32::EPSILON,
+            "after reset, the next lit frame takes a fresh 16 ms attack step"
+        );
         assert_eq!(
             b.sdr_glow_level, b_first,
-            "resetting window A cannot disturb window B"
+            "resetting and restarting window A cannot disturb window B"
         );
     }
 
@@ -14604,6 +14800,243 @@ mod tests {
         assert_eq!(
             win.offscreen_dirty_since_sync, None,
             "the armed E7 shift must invalidate the incremental sync"
+        );
+    }
+
+    /// A present whose one effect is the tray card composes the offscreen into the present copy
+    /// by a draw in the tray's pass, so it opens no blit encoder (a blit wakes a second class of
+    /// the GPU driver's working memory, kept resident while the GPU stays busy), and the copy is
+    /// texel-exact: outside the card the glass is the bare frame's, on the first full sync and
+    /// on an incremental one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_tray_present_composes_by_draw_with_no_blit_and_every_texel_kept() {
+        tray_present_composes_by_draw_at(1.0);
+    }
+
+    /// On a translucent window the compose keeps the offscreen's alpha: outside the card the
+    /// glass is the bare translucent frame's, alpha and all, so a deck never makes the window
+    /// opaque.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_translucent_tray_present_keeps_the_offscreen_alpha() {
+        tray_present_composes_by_draw_at(0.5);
+    }
+
+    /// The compose draw `read`s the offscreen at every texel of its rect, so a rect that leaves
+    /// the offscreen is refused before anything encodes, as the blit it replaced refused it; one
+    /// inside both textures encodes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_compose_rect_past_the_offscreen_is_refused() {
+        use crate::device_layer::{TexUsage, TexelFormat};
+        use crate::metal::present::{PostPass, PresentSequence, encode_present_sequence};
+        if crate::metal::ffi::Device::preferred().is_none() {
+            aterm_spec::host::could_not_run("no Metal device");
+        }
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
+        gpu.arm_metal_for_test();
+        let input = Terminal::new(2, 4).cell_frame(2, 4);
+        let _ = gpu.render_input(&mut WindowGpu::new(), &input, None);
+        assert!(
+            gpu.metal_render_armed(),
+            "fixture: the frame minted the arm"
+        );
+        let live = gpu.metal_arm.as_mut().expect("armed").live_mut();
+        let mint = |live: &MetalArmLive, label, format, side: u32| {
+            live.layer()
+                .try_create_texture_2d(label, format, side, side, TexUsage::OFFSCREEN, None)
+                .map(crate::device_layer::LayerTexture::into_metal)
+                .expect("a scratch texture")
+        };
+        let offscreen = mint(live, "test offscreen", TexelFormat::Rgba8Unorm, 8);
+        let copy = mint(live, "test present copy", TexelFormat::Rgba8Unorm, 16);
+        let dest = mint(live, "test drawable", TexelFormat::Bgra8Unorm, 16);
+        let compose_pso = live
+            .present_pso(Pipeline::Blit, crate::metal::ffi::PixelFormat::Rgba8Unorm)
+            .expect("the compose row");
+        let blit_pso = live
+            .present_pso(Pipeline::Blit, crate::metal::ffi::PixelFormat::Bgra8Unorm)
+            .expect("the present row");
+        let uniform = live.ensure_compose_copy_u().expect("the compose uniform");
+        let binds = Pipeline::Blit.spec().binds;
+        let post = |pso, tex| PostPass {
+            pso,
+            tex,
+            tex_slot: binds.fragment_textures[0] as usize,
+            sampler: &live.nearest,
+            sampler_slot: binds.fragment_samplers[0] as usize,
+            uniform: &uniform,
+            uniform_slot: binds.fragment_buffers[0] as usize,
+        };
+        let encode = |copy_rect| {
+            let seq = PresentSequence {
+                offscreen: &offscreen,
+                present_off: Some(&copy),
+                copy_rect,
+                compose: Some(post(&compose_pso, offscreen.obj())),
+                bloom: None,
+                shimmer: None,
+                band_shift: None,
+                apron: None,
+                tray: None,
+                blit: post(&blit_pso, copy.obj()),
+                clear: crate::metal::ffi::ClearColor {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 1.0,
+                },
+                crown: None,
+            };
+            let mut cb = live.session.begin().expect("a command buffer");
+            let blits_before = crate::metal::encoder::blit_census::opened();
+            let out = encode_present_sequence(&mut cb, &dest, (16, 16), &seq);
+            assert_eq!(
+                crate::metal::encoder::blit_census::opened(),
+                blits_before,
+                "the compose blitted"
+            );
+            out
+        };
+        let refused = encode([0, 0, 16, 16]).expect_err("a rect past the 8x8 offscreen");
+        assert!(
+            refused.contains("leaves the 8x8 offscreen"),
+            "the refusal names the offscreen: {refused}"
+        );
+        encode([0, 0, 8, 8]).expect("negative control: a rect inside both textures encodes");
+    }
+
+    /// [`a_tray_present_composes_by_draw_with_no_blit_and_every_texel_kept`] at `opacity`,
+    /// presented translucent below 1.
+    #[cfg(target_os = "macos")]
+    fn tray_present_composes_by_draw_at(opacity: f32) {
+        use crate::device_layer::TexelFormat;
+        if crate::metal::ffi::Device::preferred().is_none() {
+            aterm_spec::host::could_not_run("no Metal device");
+        }
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
+        gpu.arm_metal_for_test();
+        gpu.set_background_opacity(opacity);
+        let translucent = opacity < 1.0;
+        let (rows, cols) = (6usize, 12usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(b"\x1b[?25lrow zero\r\nrow one\r\nrow two\r\nrow three");
+        let input = term.cell_frame(rows, cols);
+        let probe = gpu.render_input(&mut WindowGpu::new(), &input, None);
+        assert!(gpu.metal_render_armed(), "the frame took the Metal arm");
+        let dest = (probe.width as u32, probe.height as u32);
+        let (pw, ph, dx, dy) = (24u32, 10u32, 3u32, 2u32);
+        let card: Vec<u8> = [30, 200, 120, 255].repeat((pw * ph) as usize);
+        let tray = || {
+            Some(TrayQuad {
+                rgba: &card,
+                pw,
+                ph,
+                dx,
+                dy,
+                scrim: None,
+            })
+        };
+        let present = |gpu: &mut GpuRenderer,
+                       win: &mut WindowGpu,
+                       input: &RenderInput,
+                       with_tray: bool,
+                       full: bool| {
+            gpu.metal_present_standalone_with_tray_for_test(
+                win,
+                input,
+                dest,
+                (translucent, full),
+                (
+                    TexelFormat::Bgra8Unorm,
+                    if with_tray { tray() } else { None },
+                ),
+                |gpu, target| gpu.metal_read_bgra_target_for_test(target, dest),
+            )
+            .expect("armed present")
+        };
+        let in_card = |i: usize| {
+            let (x, y) = ((i % dest.0 as usize) as u32, (i / dest.0 as usize) as u32);
+            (dx..dx + pw).contains(&x) && (dy..dy + ph).contains(&y)
+        };
+        let outside_card_matches = |got: &[u8], want: &[u8]| {
+            got.as_chunks::<4>()
+                .0
+                .iter()
+                .zip(want.as_chunks::<4>().0)
+                .enumerate()
+                .filter(|(i, (g, w))| !in_card(*i) && g != w)
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>()
+        };
+
+        let mut bare_win = WindowGpu::new();
+        let bare = present(&mut gpu, &mut bare_win, &input, false, true);
+        assert_eq!(
+            bare_win.metal_last_compose_rect, None,
+            "fixture: a frame with no effect draws the offscreen with no copy"
+        );
+        assert_eq!(
+            bare.as_chunks::<4>().0.iter().any(|px| px[3] < 255),
+            translucent,
+            "fixture: the bare frame's alpha is below opaque exactly when translucent"
+        );
+
+        let mut win = WindowGpu::new();
+        let carded = present(&mut gpu, &mut win, &input, true, true);
+        assert_eq!(
+            win.metal_last_compose_rect,
+            Some([0, 0, dest.0, dest.1]),
+            "fixture: the first sync into a fresh copy is the whole frame"
+        );
+        assert_eq!(
+            win.metal_last_present_blits, 0,
+            "the tray present composed through a blit encoder"
+        );
+        assert_eq!(
+            outside_card_matches(&carded, &bare),
+            Vec::<usize>::new(),
+            "texels outside the card left the composed copy changed"
+        );
+        assert!(
+            carded
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(bare.as_chunks::<4>().0)
+                .enumerate()
+                .any(|(i, (c, b))| in_card(i) && c != b),
+            "negative control: the card must reach the glass"
+        );
+
+        term.process(b"\x1b[3;1HX");
+        let changed = term.cell_frame(rows, cols);
+        let incremental = present(&mut gpu, &mut win, &changed, true, false);
+        let rect = win.metal_last_compose_rect.expect("the copy composed");
+        assert!(
+            rect != [0, 0, dest.0, dest.1] && rect[2] > rect[0] && rect[3] > rect[1],
+            "fixture: the second sync copies a part of the frame, not {rect:?}"
+        );
+        assert_eq!(
+            win.metal_last_present_blits, 0,
+            "the incremental compose blitted"
+        );
+        let mut fresh = WindowGpu::new();
+        let oracle = present(&mut gpu, &mut fresh, &changed, true, true);
+        assert_eq!(
+            incremental, oracle,
+            "the incremental compose must present the full sync's bytes"
+        );
+        assert_ne!(
+            incremental, carded,
+            "negative control: the changed cell must reach the glass"
+        );
+        let bare_changed = present(&mut gpu, &mut WindowGpu::new(), &changed, false, true);
+        assert_eq!(
+            outside_card_matches(&incremental, &bare_changed),
+            Vec::<usize>::new(),
+            "texels outside the card left the incremental copy changed"
         );
     }
 

@@ -74,11 +74,20 @@ pub struct CursorFx {
     /// ([`aterm_core::render::RenderInput::bloom_gate`], from the glow
     /// config's theme ink and ground).
     pub bloom_held: bool,
+    /// Whether the post passes keep their source off the frame's letters
+    /// ([`aterm_core::render::BloomGate::SparesLetters`],
+    /// [`CursorGlow::bloom_spares_letters`]).
+    pub bloom_spares_letters: bool,
     /// Memoised [`bed_legible_share`] for the last `(color, ground, ink)` triple.
     pub(crate) legible_memo: Option<((u32, u32, u32), f32)>,
     /// Memoised [`floor_block_fill`] for the last
     /// `(candidate, ground, live_cursor, pinned_cursor, lettered)`.
     pub(crate) floor_fill_memo: Option<FloorFillMemo>,
+    /// The light each body engine's config last carried: the rainbow block's, the momentum
+    /// glow's, the comet's and the beam rod's, for the host's dark pin (§15.0.3). Debug and test
+    /// builds only.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) engine_lights: [crate::cursor_glow::Light; 4],
 }
 
 /// Everything one [`CursorFx::tick`] reads besides the two folded configs.
@@ -250,6 +259,7 @@ pub const fn resolve_block_fill(
     trail_color: u32,
     cursor_base_pinned: bool,
 ) -> Option<BlockFill> {
+    #[inline]
     const fn owned(
         owner: BlockFillOwner,
         fill: Option<u32>,
@@ -445,24 +455,29 @@ pub const fn floor_block_fill(
         return candidate;
     }
     let ground = ground & 0x00FF_FFFF;
+    let table = crate::color_math::relative_luminance_table();
+    let lg = crate::color_math::relative_luminance_with(table, ground);
     let letter = if lettered {
         crate::cursor_glow::caret_letter_min_contrast()
     } else {
         0.0
     };
     let min = match candidate.owner {
-        BlockFillOwner::Momentum => {
-            CARET_PAGE_MIN_CONTRAST
-                .max(letter)
-                .min(crate::color_math::contrast_ratio(
-                    live_cursor & 0x00FF_FFFF,
-                    ground,
-                ))
-        }
+        BlockFillOwner::Momentum => CARET_PAGE_MIN_CONTRAST.max(letter).min(
+            crate::color_math::contrast_ratio_from_luminance(
+                crate::color_math::relative_luminance_with(table, live_cursor & 0x00FF_FFFF),
+                lg,
+            ),
+        ),
         owner => caret_page_floor(owner).max(letter),
     };
     BlockFill {
-        fill: crate::color_math::floor_contrast_keeping_hue(candidate.fill, ground, min),
+        fill: crate::color_math::floor_contrast_keeping_hue_with_ground_lum(
+            table,
+            candidate.fill,
+            lg,
+            min,
+        ),
         ..candidate
     }
 }
@@ -610,6 +625,7 @@ const fn finite_clamp_or_off(value: f32, min: f32, max: f32) -> f32 {
 #[inline]
 #[must_use]
 pub const fn brighten(color: u32, factor: f32) -> u32 {
+    #[inline]
     const fn channel(color: u32, shift: u32, factor: f32) -> u32 {
         ((((color >> shift) & 0xff) as f32) * factor).min(255.0) as u32
     }
@@ -731,6 +747,7 @@ pub const fn resolve_glow_config(
         ribbon_flat: spelling.ribbon_flat,
         classic_mono: spelling.classic_mono
             || (matches!(glow_style, GlowStyle::Classic) && knobs.color.is_some()),
+        light: crate::cursor_glow::Light::OFF,
     }
 }
 
@@ -951,8 +968,19 @@ const fn is_block(style: CursorStyle) -> bool {
 }
 
 impl CursorFx {
+    /// The light each body engine's config last carried (the rainbow block's, the momentum
+    /// glow's, the comet's and the beam rod's): for the host's dark pin (§15.0.3). Debug and test
+    /// builds only.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    #[must_use]
+    pub const fn engine_lights(&self) -> [crate::cursor_glow::Light; 4] {
+        self.engine_lights
+    }
+
     /// A test's read of this tick's whole additive stream: [`Self::glow_scratch`] with its ramps ([`CursorGlow::out_laid`]).
     #[cfg(any(test, debug_assertions))]
+    #[inline]
     #[must_use]
     pub fn glow_laid(&self) -> Vec<GlowQuad> {
         self.glow.out_laid(&self.glow_scratch)
@@ -1084,9 +1112,17 @@ impl CursorFx {
         }
     }
 
+    /// The frame's [`aterm_core::render::RenderInput::bloom_gate`]: held where the
+    /// page's text holds the bloom, else sparing the letters where the style's
+    /// light is guarded.
+    #[inline]
+    #[must_use]
+    pub const fn bloom_gate(&self) -> aterm_core::render::BloomGate {
+        aterm_core::render::BloomGate::sparing(self.bloom_held, self.bloom_spares_letters)
+    }
+
     /// The frame step: the aurora, then every block body off the aurora's post-tick state, then
     /// the comet, then the caret's one owner.
-    #[inline]
     pub fn tick(
         &mut self,
         f: &CursorFxInput,
@@ -1108,6 +1144,9 @@ impl CursorFx {
         let glow_fp = self
             .glow
             .tick(cur, now, glow_cfg, geom, &mut self.glow_scratch);
+        // A glow that is off draws no guarded light, so the frame keeps main's gate.
+        self.bloom_spares_letters =
+            glow_cfg.enabled && self.glow.bloom_spares_letters(glow_cfg.style);
         let body_allowed = f.body_allowed && f.live_viewport && cur.is_some();
         let forge_fill = forge_cursor_fill(body_allowed, glow_cfg, || self.glow.forge_fill());
         let rainbow_block = body_allowed
@@ -1142,7 +1181,12 @@ impl CursorFx {
             } else {
                 None
             },
+            light: glow_cfg.light,
         };
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.engine_lights[0] = rainbow_cfg.light;
+        }
         let cadence_heard = trail_cfg.enabled
             || (rainbow_block
                 && rainbow_cfg.intensity > 0.0
@@ -1152,8 +1196,11 @@ impl CursorFx {
         } else {
             (0.0, 0.0)
         };
-        let family_phase = self.glow.rainbow_phase();
-        let family_field = self.glow.rainbow_field();
+        let (family_phase, family_field) = if rainbow_enabled {
+            (self.glow.rainbow_phase(), self.glow.rainbow_field())
+        } else {
+            (0.0, 0.0)
+        };
         let rainbow_from = self.glow_scratch.len();
         let rainbow_frame = self.rainbow.tick_with_family_phase(
             cur,
@@ -1176,7 +1223,7 @@ impl CursorFx {
         let rim_held = !self.rainbow_rim_unheld;
         #[cfg(not(test))]
         let rim_held = true;
-        let rim_print = if dark && rim_held {
+        let rim_print = if dark && rim_held && self.glow_scratch.len() > rainbow_from {
             self.glow.hold_off_neighbour_ink(
                 &mut self.glow_scratch[rainbow_from..],
                 cur,
@@ -1204,11 +1251,13 @@ impl CursorFx {
         );
         let mut shares = OverInkShares::EMPTY;
         let body_to = self.glow_scratch.len();
-        shares.fold(self.glow.admit_over_ink(
-            &mut self.glow_scratch,
-            body_from..body_to,
-            OverInkTier::Body,
-        ));
+        if body_to > body_from {
+            shares.fold(self.glow.admit_over_ink(
+                &mut self.glow_scratch,
+                body_from..body_to,
+                OverInkTier::Body,
+            ));
+        }
         let glow_fp = glow_fp ^ droplet_frame.fp.rotate_left(47);
         let bar_shape = body_allowed
             && f.focused
@@ -1277,61 +1326,64 @@ impl CursorFx {
         } else {
             None
         };
-        self.momentum.set_light_vivid(sparkle_paper_gold.is_some());
+        let momentum_cfg = MomentumGlowConfig {
+            enabled: momentum_enabled,
+            intensity: body_amp,
+            tau_s: MOMENTUM_GLOW_TAU_S,
+            radius_cells: MOMENTUM_GLOW_RADIUS_CELLS,
+            base: sparkle_paper_gold.unwrap_or(f.live_cursor),
+            dark_theme: dark,
+            light: glow_cfg.light,
+            hue: if !glow_cfg.enabled {
+                f.live_cursor & 0x00FF_FFFF
+            } else if warm && matches!(glow_cfg.style, GlowStyle::Sparkle) && !dark {
+                match sparkle_paper_rod {
+                    Some(rod) => rod,
+                    None => crate::cursor_glow::CursorGlow::sparkle_paper_gold_at(glow_cfg, 1.0),
+                }
+            } else {
+                rod_color
+            },
+            theme_fg: glow_cfg.theme_fg,
+            theme_bg: glow_cfg.theme_bg,
+            block: is_block(f.cursor_style),
+            glyph_span: if momentum_enabled && !dark {
+                match cur {
+                    Some(cell) => self.glow.caret_row_glyphs(cell),
+                    None => None,
+                }
+            } else {
+                None
+            },
+            light_vivid: sparkle_paper_gold.is_some(),
+        };
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.engine_lights[1] = momentum_cfg.light;
+        }
         let momentum_frame = self.momentum.tick(
             cur,
             now,
             geom,
-            &MomentumGlowConfig {
-                enabled: momentum_enabled,
-                intensity: body_amp,
-                tau_s: MOMENTUM_GLOW_TAU_S,
-                radius_cells: MOMENTUM_GLOW_RADIUS_CELLS,
-                base: sparkle_paper_gold.unwrap_or(f.live_cursor),
-                dark_theme: dark,
-                hue: if !glow_cfg.enabled {
-                    f.live_cursor & 0x00FF_FFFF
-                } else if warm && matches!(glow_cfg.style, GlowStyle::Sparkle) && !dark {
-                    match sparkle_paper_rod {
-                        Some(rod) => rod,
-                        None => {
-                            crate::cursor_glow::CursorGlow::sparkle_paper_gold_at(glow_cfg, 1.0)
-                        }
-                    }
-                } else {
-                    rod_color
-                },
-                theme_fg: glow_cfg.theme_fg,
-                theme_bg: glow_cfg.theme_bg,
-                block: is_block(f.cursor_style),
-                glyph_span: if momentum_enabled && !dark {
-                    match cur {
-                        Some(cell) => self.glow.caret_row_glyphs(cell),
-                        None => None,
-                    }
-                } else {
-                    None
-                },
-            },
+            &momentum_cfg,
             &mut self.glow_scratch,
             self.glow.under_sink(),
         );
         let momentum_to = self.glow_scratch.len();
-        if warm && dark && glow_cfg.enabled && !tinted && matches!(glow_cfg.style, GlowStyle::Fire)
-        {
-            #[cfg(test)]
-            let ember = self
-                .momentum_fire_ember
-                .unwrap_or(crate::cursor_momentum::MOMENTUM_FIRE_EMBER);
-            #[cfg(not(test))]
-            let ember = crate::cursor_momentum::MOMENTUM_FIRE_EMBER;
-            crate::cursor_momentum::warm_halo(
-                &mut self.glow_scratch[momentum_from..momentum_to],
-                ember,
-                crate::cursor_momentum::MOMENTUM_FIRE_WARMTH,
-            );
-        }
-        let held_print = if dark {
+        let held_print = if dark && momentum_to > momentum_from {
+            if warm && glow_cfg.enabled && !tinted && matches!(glow_cfg.style, GlowStyle::Fire) {
+                #[cfg(test)]
+                let ember = self
+                    .momentum_fire_ember
+                    .unwrap_or(crate::cursor_momentum::MOMENTUM_FIRE_EMBER);
+                #[cfg(not(test))]
+                let ember = crate::cursor_momentum::MOMENTUM_FIRE_EMBER;
+                crate::cursor_momentum::warm_halo(
+                    &mut self.glow_scratch[momentum_from..momentum_to],
+                    ember,
+                    crate::cursor_momentum::MOMENTUM_FIRE_WARMTH,
+                );
+            }
             self.glow.hold_off_neighbour_ink(
                 &mut self.glow_scratch[momentum_from..momentum_to],
                 cur,
@@ -1353,30 +1405,38 @@ impl CursorFx {
         };
         let glow_fp = glow_fp ^ momentum_frame.fp.rotate_left(53) ^ held_print.rotate_left(31);
         let body_from = self.glow_scratch.len();
+        let comet_cfg = CometConfig {
+            enabled: matches!(glow_cfg.style, GlowStyle::Comet) && rainbow_block,
+            intensity: body_amp,
+            color: glow_cfg.color,
+            accent: glow_cfg.accent,
+            dark_theme: dark,
+            light: glow_cfg.light,
+            theme_fg: glow_cfg.theme_fg,
+            theme_bg: glow_cfg.theme_bg,
+            pinned: matches!(pinned_base, Some(c) if (c & 0x00FF_FFFF) == (glow_cfg.color & 0x00FF_FFFF)),
+        };
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.engine_lights[2] = comet_cfg.light;
+        }
         let comet_frame = self.comet.tick(
             cur,
             now,
             blaze,
             geom,
-            &CometConfig {
-                enabled: matches!(glow_cfg.style, GlowStyle::Comet) && rainbow_block,
-                intensity: body_amp,
-                color: glow_cfg.color,
-                accent: glow_cfg.accent,
-                dark_theme: dark,
-                theme_fg: glow_cfg.theme_fg,
-                theme_bg: glow_cfg.theme_bg,
-                pinned: matches!(pinned_base, Some(c) if (c & 0x00FF_FFFF) == (glow_cfg.color & 0x00FF_FFFF)),
-            },
+            &comet_cfg,
             &mut self.glow_scratch,
             self.glow.under_sink(),
         );
         let body_to = self.glow_scratch.len();
-        shares.fold(self.glow.admit_over_ink(
-            &mut self.glow_scratch,
-            body_from..body_to,
-            OverInkTier::Body,
-        ));
+        if body_to > body_from {
+            shares.fold(self.glow.admit_over_ink(
+                &mut self.glow_scratch,
+                body_from..body_to,
+                OverInkTier::Body,
+            ));
+        }
         let glow_fp = glow_fp ^ comet_frame.fp.rotate_left(29);
         let body_from = self.glow_scratch.len();
         let phaser_frame = self.phaser.tick(
@@ -1394,50 +1454,62 @@ impl CursorFx {
             &mut self.glow_scratch,
         );
         let body_to = self.glow_scratch.len();
-        shares.fold(self.glow.admit_over_ink(
-            &mut self.glow_scratch,
-            body_from..body_to,
-            OverInkTier::Body,
-        ));
+        if body_to > body_from {
+            shares.fold(self.glow.admit_over_ink(
+                &mut self.glow_scratch,
+                body_from..body_to,
+                OverInkTier::Body,
+            ));
+        }
         let glow_fp = glow_fp ^ phaser_frame.fp.rotate_left(53);
         let emitter_block = matches!(
             glow_cfg.style,
             GlowStyle::Beam | GlowStyle::Lumen | GlowStyle::Sparkle
         );
         let body_from = self.glow_scratch.len();
+        let beamrod_cfg = BeamRodConfig {
+            enabled: glow_cfg.enabled
+                && glow_cfg.intensity > 0.0
+                && (bar_shape || (rainbow_block && emitter_block)),
+            intensity: body_amp,
+            color: rod_color,
+            haze: rod_haze,
+            bar: bar_shape,
+            shimmer: matches!(glow_cfg.style, GlowStyle::Sparkle),
+            dark_theme: dark,
+            light: glow_cfg.light,
+            theme_fg: glow_cfg.theme_fg,
+            theme_bg: glow_cfg.theme_bg,
+            pinned: matches!(pinned_base, Some(c) if (c & 0x00FF_FFFF) == (rod_color & 0x00FF_FFFF)),
+        };
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.engine_lights[3] = beamrod_cfg.light;
+        }
         let beamrod_frame = self.beamrod.tick(
             cur,
             now,
             blaze,
             geom,
-            &BeamRodConfig {
-                enabled: glow_cfg.enabled
-                    && glow_cfg.intensity > 0.0
-                    && (bar_shape || (rainbow_block && emitter_block)),
-                intensity: body_amp,
-                color: rod_color,
-                haze: rod_haze,
-                bar: bar_shape,
-                shimmer: matches!(glow_cfg.style, GlowStyle::Sparkle),
-                dark_theme: dark,
-                theme_fg: glow_cfg.theme_fg,
-                theme_bg: glow_cfg.theme_bg,
-                pinned: matches!(pinned_base, Some(c) if (c & 0x00FF_FFFF) == (rod_color & 0x00FF_FFFF)),
-            },
+            &beamrod_cfg,
             &mut self.glow_scratch,
             self.glow.under_sink(),
         );
         let body_to = self.glow_scratch.len();
-        shares.fold(self.glow.admit_over_ink(
-            &mut self.glow_scratch,
-            body_from..body_to,
-            OverInkTier::Body,
-        ));
-        shares.fold(self.glow.admit_over_ink(
-            &mut self.glow_scratch,
-            momentum_from..momentum_to,
-            OverInkTier::Momentum,
-        ));
+        if body_to > body_from {
+            shares.fold(self.glow.admit_over_ink(
+                &mut self.glow_scratch,
+                body_from..body_to,
+                OverInkTier::Body,
+            ));
+        }
+        if momentum_to > momentum_from {
+            shares.fold(self.glow.admit_over_ink(
+                &mut self.glow_scratch,
+                momentum_from..momentum_to,
+                OverInkTier::Momentum,
+            ));
+        }
         let glow_fp =
             glow_fp ^ shares.0.rotate_left(41) ^ self.glow.over_ink_print().rotate_left(13);
         let glow_fp = glow_fp ^ beamrod_frame.fp.rotate_left(17);
@@ -1471,7 +1543,6 @@ impl CursorFx {
         // renderer cuts the letter out of: a bolt is no block, and drawn over the letter it hid
         // it (looks8 WIDEN move-up: the `!` read 1.00:1).
         let bolt_down = bolt_cursor && self.glow.caret_bolt_stands_down(cur);
-        let lettered = self.glow.caret_fill_keeps_letter(cur);
         let glow_fp = glow_fp ^ u64::from(bolt_fill.unwrap_or(0)).rotate_left(59);
         if trail_cfg.enabled {
             crate::cursor_trail::ignite(&mut trail_cfg, energy, warmth);
@@ -1521,6 +1592,7 @@ impl CursorFx {
             glow_cfg.color,
             f.cursor_color_pinned,
         ) {
+            let lettered = self.glow.caret_fill_keeps_letter(cur);
             let ground = f.cursor_cell_bg.unwrap_or(f.default_bg);
             let floored = match self.floor_fill_memo {
                 Some(memo)
@@ -1863,26 +1935,18 @@ mod tests {
         assert_eq!(off_cells, 0, "a zero dial lays no bed");
     }
 
-    const fn classic_cfg(enabled: bool) -> (GlowConfig, TrailConfig) {
+    fn classic_cfg(enabled: bool) -> (GlowConfig, TrailConfig) {
         let glow = GlowConfig {
             ribbon_tall: false,
-            ribbon_flat: false,
-            classic_mono: false,
-            theme_fg: 0x00C8_D3F5,
-            theme_bg: 0x001A_1B26,
-            dark_theme: true,
             enabled,
             style: GlowStyle::Classic,
-            color: 0x0050_FA7B,
-            accent: 0x0078_FFB8,
-            duration: std::time::Duration::from_millis(260),
-            length: 24,
             intensity: 0.7,
             audible: true,
             radius: 0.6,
             ring: true,
             beam: true,
             head_dx: 0.08,
+            ..Default::default()
         };
         let trail = TrailConfig {
             enabled: false,

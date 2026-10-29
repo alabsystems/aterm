@@ -937,6 +937,9 @@ pub enum Reconciled {
     Told,
     /// An intent with no outcome, a skip, or no row: released, so it may be told.
     Released,
+    /// The last row says its line stands left in the composer (`left`): the claim stays the
+    /// door's, settled at the successor's first look (`FactsState::look`).
+    Left,
 }
 
 /// THE RECONCILE OF A CLAIM ON `episode` from the ledger's fact rows (oldest first).
@@ -950,6 +953,7 @@ pub fn reconcile_claim(episode: u64, rows: &[(u64, SeedOutcome)]) -> Reconciled 
         .map(|(_, outcome)| *outcome);
     match last {
         Some(SeedOutcome::Typed) if !armed(Fault::ReleaseAfterTyped) => Reconciled::Told,
+        Some(SeedOutcome::Left) if !armed(Fault::ReleaseOnLeft) => Reconciled::Left,
         _ => Reconciled::Released,
     }
 }
@@ -1389,7 +1393,8 @@ impl WakeBook {
         ended
     }
 
-    /// A SUCCESSOR'S RECONCILE of the claims a loop's door held, from the ledger's fact rows.
+    /// A SUCCESSOR'S RECONCILE of the claims a loop's door held, from the ledger's fact rows: a
+    /// claim whose last row says left stays the door's ([`Reconciled::Left`]).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1403,6 +1408,14 @@ impl WakeBook {
         aterm_spec_anchor::refines(
             machine = "WakeBook",
             action = "CrashMidWrite",
+            project = "conformance_wakes::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeBook",
+            action = "KeepLeft",
             project = "conformance_wakes::project"
         )
     )]
@@ -1425,6 +1438,7 @@ impl WakeBook {
                     };
                 }
                 Reconciled::Released => wake.unclaimed(),
+                Reconciled::Left => {}
             }
             outcomes.push((wake.ord, outcome));
         }

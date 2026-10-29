@@ -5,7 +5,8 @@
 
 use crate::supervise::approvals::Outcome;
 use crate::supervise::policy::approval::{
-    QuestionPriority, RULE_PLAN, RULE_PROSE_LONG_TERM, RULE_PROSE_SHORT_TERM,
+    QuestionPriority, RULE_ANSWER_LONG_TERM, RULE_ANSWER_SHORT_TERM, RULE_PLAN,
+    RULE_PROSE_LONG_TERM, RULE_PROSE_SHORT_TERM,
 };
 use crate::supervise::policy::question::{RULE_ANSWER_RECOMMENDED, is_question_rule};
 use crate::supervise::policy::turn_end::{
@@ -210,14 +211,16 @@ fn log_rule(rule_id: &str) -> String {
 #[must_use]
 pub fn self_claim_act(act: &str) -> Option<(&'static str, String)> {
     let word = match act {
-        RULE_APPROVE_ALL => "approve",
+        RULE_APPROVE_ALL | RULE_PLAN => "approve",
         RULE_ANSWER_RECOMMENDED
+        | RULE_ANSWER_LONG_TERM
+        | RULE_ANSWER_SHORT_TERM
         | RULE_LAND_ANSWER
         | RULE_ANSWER
         | RULE_PROSE_LONG_TERM
         | RULE_PROSE_SHORT_TERM => "answer",
         RULE_CONTINUE | RULE_POLICY_CONTINUE | RULE_LIMIT_RESUME | RULE_DONE_CHECK
-        | RULE_API_RETRY | RULE_API_CUTOFF | RULE_COMPACT => "continue",
+        | RULE_API_RETRY | RULE_API_BACK | RULE_API_CUTOFF | RULE_COMPACT => "continue",
         RULE_UPGRADE => "relaunch",
         RULE_HOST_TURN | RULE_LAND | RULE_LAND_NUDGE => "dispatch",
         RULE_LANDED => LANDED_WORD,
@@ -230,6 +233,45 @@ pub fn self_claim_act(act: &str) -> Option<(&'static str, String)> {
 #[must_use]
 pub fn self_claim_types_turn(act: &str) -> bool {
     act == RULE_HOST_TURN || act == RULE_PLAN || typed_act(act, "").is_some()
+}
+
+/// A PROVEN SELF-CLAIM'S ACT ON THE CHIP AND IN ITS OWN COUNTS: what the holder's `meta set
+/// harness_act <act>` lights and adds to, as aterm's own typed act under that rule does
+/// ([`typed_act`]), and its box acts as aterm's own approval of the box lights them ([`sort`]):
+/// `approve-all@v1` and the plan box's yes ([`RULE_PLAN`]) approved, a question box's answer
+/// under any priority ([`is_question_rule`]) answered. Each of those counts once, where aterm
+/// counts its own dialog's answer from its journal's choice. None for its landing
+/// ([`RULE_LANDED`]: the face says it, and the counts book it apart), its re-exec
+/// ([`RULE_UPGRADE`]), a point left to a person, a mail turn's receipt, or any other act, which
+/// type nothing in the person's name.
+#[must_use]
+pub fn self_claim_sort(act: &str) -> Sorted {
+    let sorted = |act, counter| Sorted {
+        act: Some(act),
+        counter: Some(counter),
+    };
+    if act == RULE_APPROVE_ALL || act == RULE_PLAN {
+        sorted(Act::Approved, Counter::Approved)
+    } else if is_question_rule(act) {
+        sorted(Act::Answered, Counter::Answered)
+    } else {
+        typed_act(act, "").map_or_else(Sorted::default, |(act, counter)| sorted(act, counter))
+    }
+}
+
+/// THE NAME A SELF-CLAIM'S HOLDER ACTS UNDER: `holder` without the `@<pid>` its proof names
+/// (`codex-alab` for `codex-alab@4242`), so every process of one agent is one name in the
+/// words and the counts; a holder with no such suffix is its own name.
+#[must_use]
+pub fn claimant_name(holder: &str) -> &str {
+    match holder.rsplit_once('@') {
+        Some((name, pid))
+            if !name.is_empty() && !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            name
+        }
+        _ => holder,
+    }
 }
 
 /// The session log's act word for a self-claim's landing ([`RULE_LANDED`], [`self_claim_act`]).
@@ -442,6 +484,12 @@ impl HoldLeg {
         }
     }
 
+    /// The leg of `word` ([`Self::word`]'s inverse); `None` for any other word.
+    #[must_use]
+    pub fn of_word(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|leg| leg.word() == word)
+    }
+
     /// Its words where they name nothing the reply held, the same in every written form (the
     /// title, the state line, the hover and a row's tip); `None` for the legs whose words name
     /// what the reply or the repository held (a need, the repository's counts, the open words).
@@ -647,6 +695,18 @@ mod tests {
             stop_words(HeldBy::NoWork, StopForm::Line),
             "the arms say different whys"
         );
+    }
+
+    /// `status land_held=` and `meta set harness_land legs=` read back to the leg each word
+    /// names, and no other word, nor a word in another case, names one.
+    #[test]
+    fn a_holds_leg_round_trips_its_word() {
+        for leg in HoldLeg::ALL {
+            assert_eq!(HoldLeg::of_word(leg.word()), Some(leg));
+        }
+        for word in ["", "-", "unread", "REPO", "repo,open", "needs "] {
+            assert_eq!(HoldLeg::of_word(word), None, "{word:?}");
+        }
     }
 
     #[test]
@@ -1028,7 +1088,10 @@ mod tests {
     fn a_self_claims_acts_are_the_logs_act_words() {
         let cases = [
             ("approve-all@v1", Some("approve")),
+            ("plan-approve@v2", Some("approve")),
             ("answer-recommended@v1", Some("answer")),
+            ("answer-long-term@v1", Some("answer")),
+            ("answer-short-term@v1", Some("answer")),
             ("continue@v1", Some("continue")),
             ("policy-continue@v1", Some("continue")),
             ("usage-resume@v1", Some("continue")),
@@ -1043,6 +1106,7 @@ mod tests {
             ("prose-long-term@v1", Some("answer")),
             ("prose-short-term@v1", Some("answer")),
             ("api-retry@v1", Some("continue")),
+            ("api-back@v1", Some("continue")),
             ("api-cutoff@v1", Some("continue")),
             ("context-compact@v1", Some("continue")),
             ("finished@v1", None),
@@ -1089,10 +1153,25 @@ mod tests {
             RULE_PROSE_LONG_TERM,
             RULE_PROSE_SHORT_TERM,
             RULE_API_RETRY,
+            RULE_API_BACK,
             RULE_API_CUTOFF,
             RULE_COMPACT,
         ] {
             let loops = log_mark(rule, Outcome::Typed, "words").expect("a typed act");
+            let (word, _) = self_claim_act(rule).expect("a self-claim act");
+            assert!(
+                loops.starts_with(&format!("act word={word} ")),
+                "{rule}: {loops}"
+            );
+        }
+        for rule in [
+            RULE_APPROVE_ALL,
+            RULE_PLAN,
+            RULE_ANSWER_RECOMMENDED,
+            RULE_ANSWER_LONG_TERM,
+            RULE_ANSWER_SHORT_TERM,
+        ] {
+            let loops = log_mark(rule, Outcome::Approved, "").expect("a box's act");
             let (word, _) = self_claim_act(rule).expect("a self-claim act");
             assert!(
                 loops.starts_with(&format!("act word={word} ")),
@@ -1140,7 +1219,110 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:?}");
         let worded = |act| self_claim_act(act).is_some();
         assert!(worded("approve-all@v1") && worded("harness-turn@v1"));
-        assert!(!worded("plan-approve@v2") && !worded("mail-report@v1"));
+        assert!(!worded("outage-resume@v1") && !worded("mail-report@v1"));
+    }
+
+    /// A SELF-CLAIM'S ACT LIGHTS AND COUNTS AS ATERM'S OWN ACT OF ITS RULE: a continuation keeps
+    /// going, a wall's carry resumes, a land act is a land prompt, an answer answers, and its
+    /// box rules (approve-all, the plan box, a question box under every priority) light what
+    /// aterm's own approval of the box lights, each counted once. NEGATIVE CONTROL: its landing,
+    /// its re-exec, a point left to a person, a mail turn and a word no rule is light nothing and
+    /// count nothing.
+    #[test]
+    fn a_self_claims_act_sorts_as_the_typed_act_of_its_rule() {
+        let lit = |act, counter| Sorted {
+            act: Some(act),
+            counter: Some(counter),
+        };
+        let cases = [
+            ("approve-all@v1", lit(Act::Approved, Counter::Approved)),
+            ("plan-approve@v2", lit(Act::Approved, Counter::Approved)),
+            (
+                "answer-recommended@v1",
+                lit(Act::Answered, Counter::Answered),
+            ),
+            ("answer-long-term@v1", lit(Act::Answered, Counter::Answered)),
+            (
+                "answer-short-term@v1",
+                lit(Act::Answered, Counter::Answered),
+            ),
+            ("answer@v1", lit(Act::Answered, Counter::Answered)),
+            ("land-answer@v1", lit(Act::Answered, Counter::Answered)),
+            ("prose-long-term@v1", lit(Act::Answered, Counter::Answered)),
+            ("continue@v1", lit(Act::Continued, Counter::Continued)),
+            (
+                "policy-continue@v1",
+                lit(Act::Continued, Counter::Continued),
+            ),
+            (
+                "continue-done-check@v1",
+                lit(Act::Continued, Counter::Continued),
+            ),
+            ("usage-resume@v1", lit(Act::Resumed, Counter::Resumed)),
+            ("api-retry@v1", lit(Act::Resumed, Counter::Resumed)),
+            ("api-back@v1", lit(Act::Resumed, Counter::Resumed)),
+            ("context-compact@v1", lit(Act::Resumed, Counter::Resumed)),
+            ("land@v1", lit(Act::Landing, Counter::LandPrompts)),
+            ("land-nudge@v1", lit(Act::Nudged, Counter::LandPrompts)),
+            ("landed@v1", Sorted::default()),
+            ("upgrade@v1", Sorted::default()),
+            ("left-to-person@v1", Sorted::default()),
+            ("harness-turn@v1", Sorted::default()),
+            ("mail-report@v1", Sorted::default()),
+            ("approve-all@v2", Sorted::default()),
+            ("continue", Sorted::default()),
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .filter(|(act, want)| self_claim_sort(act) != *want)
+            .map(|(act, want)| (act, want, self_claim_sort(act)))
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
+        for (act, want) in cases {
+            if let Some((typed, counter)) = typed_act(act, "") {
+                assert_eq!(
+                    want,
+                    lit(typed, counter),
+                    "{act}: aterm's own act of the rule"
+                );
+            }
+        }
+        for act in [
+            RULE_APPROVE_ALL,
+            RULE_PLAN,
+            RULE_ANSWER_RECOMMENDED,
+            RULE_ANSWER_LONG_TERM,
+            RULE_ANSWER_SHORT_TERM,
+        ] {
+            let own = sort(act, Outcome::Approved, "");
+            assert!(own.act.is_some(), "{act}: aterm's own approval lights it");
+            assert_eq!(
+                self_claim_sort(act).act,
+                own.act,
+                "{act}: as aterm's own box"
+            );
+            assert!(
+                self_claim_sort(act).counter.is_some(),
+                "{act}: counted once"
+            );
+        }
+    }
+
+    /// A HOLDER'S NAME DROPS ONLY THE PID ITS PROOF NAMES. NEGATIVE CONTROL: a suffix that is
+    /// no pid, or a holder with no name before it, is the holder whole.
+    #[test]
+    fn a_claimants_name_is_its_holder_without_the_pid() {
+        assert_eq!(claimant_name("codex-alab@4242"), "codex-alab");
+        assert_eq!(claimant_name("x@y@17"), "x@y");
+        for whole in [
+            "codex-alab",
+            "codex-alab@",
+            "codex-alab@v1",
+            "@4242",
+            "a@12b",
+        ] {
+            assert_eq!(claimant_name(whole), whole, "{whole}");
+        }
     }
 
     #[test]

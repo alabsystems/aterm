@@ -8,8 +8,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use super::super::live::{self, Move, claim_record, upgrade_visit};
 use super::*;
 use crate::harness::relaunch::ended_by_restart;
+use crate::harness::upgrade::Request;
 use crate::harness::upgrade_agy_live::{self as pure, Look, Message, STATUS_IDLE};
 use crate::harness::upgrade_drive::build_start::{NamedProbe, PROBE, Probe};
+use crate::harness::upgrade_drive::{Ask, ask_for};
 use crate::harness::upgrade_drive::{Due, LiveTab, descendants_in};
 
 const NEW_BUILD: &str = "1000001000004000001";
@@ -125,6 +127,8 @@ struct Knobs {
     cmdline: Option<&'static str>,
     /// agy's quota rotates the launch onto this model (default: it keeps its own).
     quota_to: Option<&'static str>,
+    /// Actual vendor-record versions, with build ids derived by the same typed parser.
+    versions: Option<(&'static str, &'static str)>,
 }
 
 struct LiveKernel {
@@ -524,8 +528,23 @@ impl LiveRig {
             std::fs::write(dir.join("read.json"), read_json).expect("read.json");
         }
         let store = base.join("prefix/store/agy");
-        let exe = lay(&store, BUILD, VERSION);
-        let new_exe = lay(&store, NEW_BUILD, NEW_VERSION);
+        let (build, version, new_build, new_version) = match knobs.versions {
+            Some((from, to)) => (
+                pure::build_version(from, None)
+                    .expect("running version")
+                    .build_id()
+                    .to_string(),
+                from,
+                pure::build_version(to, None)
+                    .expect("target version")
+                    .build_id()
+                    .to_string(),
+                to,
+            ),
+            None => (BUILD.to_owned(), VERSION, NEW_BUILD.to_owned(), NEW_VERSION),
+        };
+        let exe = lay(&store, &build, version);
+        let new_exe = lay(&store, &new_build, new_version);
         let old_exe = lay(&store, OLD_BUILD, OLD_VERSION);
         let twin = base.join("prefix/agents/agy");
         std::fs::create_dir_all(twin.parent().expect("agents")).expect("agents");
@@ -675,6 +694,7 @@ impl LiveRig {
             instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
             agents_off: Vec::new(),
             land: false,
+            press: None,
             timings: crate::harness::Timings::FAST,
         };
         LiveRig {
@@ -750,12 +770,170 @@ impl LiveRig {
     fn record(&self) -> Option<St> {
         load(&self.opts, &key(TAB))
     }
+
+    fn snapshot(&self) -> crate::harness::relaunch::Snapshot {
+        let args = self.kernel.args(TUI).expect("argv");
+        let snap = snapshot(
+            &self.opts,
+            TAB,
+            TUI,
+            "tui-birth".into(),
+            SHELL,
+            &args,
+            &self.kernel,
+        )
+        .expect("actual snapshot path");
+        assert_eq!(snap.session.as_deref(), Some(C1));
+        snap
+    }
+
+    /// The production claim/failure record of an earlier refused signal, built from actual
+    /// validated fixture store records. Preparing it signals no real process.
+    fn failed_claim(&self) -> St {
+        let mv = live::behind(&self.kernel.exe, Some(self.twin.clone()))
+            .expect("validated records")
+            .expect("newer build");
+        let mut st =
+            claim_record(&self.snapshot(), &mv, self.opts.human_grace_s, now_s()).expect("claim");
+        st.fail("signal-refused", now_s());
+        st
+    }
+
+    fn store(&self, st: &St) {
+        crate::harness::upgrade_drive::save_checked(&self.opts, &key(TAB), st)
+            .expect("persisted record");
+    }
 }
 
 impl Drop for LiveRig {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(self.dir.path());
     }
+}
+
+#[test]
+fn a_persisted_agy_numeric_or_revision_word_holds_the_real_worker() {
+    for versions in [None, Some(("1.4.0-R6427.1", "1.4.0-R6500.1"))] {
+        for (ask, step) in [
+            (Ask::Skip, "wait:skipped"),
+            (Ask::Defer(3600), "wait:deferred"),
+        ] {
+            let rig = LiveRig::new(Knobs {
+                versions,
+                ..Knobs::default()
+            });
+            let claim = rig.failed_claim();
+            let target = claim.to.clone();
+            rig.store(&claim);
+            let row = ask_for(&rig.opts, TAB, ask, &target, &key(TAB)).expect("public request");
+            assert!(row.word_in_force(now_s()));
+            let stored = rig.record().expect("request reloaded");
+            assert_eq!(stored.request, row.request);
+            let report = rig.visit();
+            assert_eq!(report.step, step, "{versions:?}: {report:?}");
+            assert!(rig.asked("signal").is_empty() && rig.asked("turn").is_empty());
+            assert_eq!(rig.record(), Some(stored), "the request is not overwritten");
+        }
+    }
+    let rig = LiveRig::new(Knobs::default());
+    let mut st = rig.failed_claim();
+    st.request = Request::Skip(format!("v{NEW_VERSION}.0"));
+    assert!(st.request_tab.is_empty(), "legacy tab scope");
+    rig.store(&st);
+    assert_eq!(
+        rig.visit().step,
+        "wait:skipped",
+        "numeric aliases still hold"
+    );
+    assert!(rig.asked("signal").is_empty());
+}
+
+#[test]
+fn stale_foreign_or_invalid_agy_words_cannot_hold_another_move() {
+    type Change = fn(&mut St);
+    let cases: [(&str, Change); 11] = [
+        ("other-agent", |s| s.agent = Agent::Muse),
+        ("other-tab", |s| s.tab = "s-foreign".into()),
+        ("other-request-tab", |s| s.request_tab = "s-foreign".into()),
+        ("other-thread", |s| s.thread = SUB.into()),
+        ("other-source", |s| s.source = "native".into()),
+        ("other-running", |s| s.from = OLD_VERSION.into()),
+        ("other-target", |s| {
+            s.to = OLD_VERSION.into();
+            s.request = Request::Skip(OLD_VERSION.into());
+        }),
+        ("other-skip", |s| {
+            s.request = Request::Skip(OLD_VERSION.into())
+        }),
+        ("invalid-equal", |s| {
+            s.to = "latest".into();
+            s.request = Request::Skip("latest".into());
+        }),
+        ("expired-defer", |s| s.request = Request::DeferUntil(1)),
+        ("stale-defer", |s| {
+            s.to = OLD_VERSION.into();
+            s.request = Request::DeferUntil(u64::MAX);
+        }),
+    ];
+    for (name, change) in cases {
+        let rig = LiveRig::new(Knobs::default());
+        rig.store(&rig.failed_claim());
+        ask_for(&rig.opts, TAB, Ask::Skip, NEW_VERSION, &key(TAB)).expect("request producer");
+        let mut st = rig.record().expect("request");
+        change(&mut st);
+        rig.store(&st);
+        let report = rig.visit();
+        assert_eq!(report.step, "done:resumed", "{name}: {report:?}");
+        assert_eq!(rig.asked("signal").len(), 1, "{name}");
+        assert_eq!(rig.asked("turn").len(), 1, "{name}");
+    }
+}
+
+#[test]
+fn a_build_word_does_not_block_an_agy_quota_model_rotation() {
+    for request in [Request::Skip(VERSION.into()), Request::DeferUntil(u64::MAX)] {
+        let rig = LiveRig::new(Knobs {
+            twin: Some(Twin::Same),
+            quota_to: Some("claude-opus-5-5-medium"),
+            ..Knobs::default()
+        });
+        let mv = Move {
+            running: VERSION.into(),
+            target: VERSION.into(),
+            twin: rig.twin.clone(),
+        };
+        let mut st = claim_record(&rig.snapshot(), &mv, rig.opts.human_grace_s, now_s())
+            .expect("claim shape");
+        st.fail("signal-refused", now_s());
+        st.request = request;
+        st.request_tab = TAB.into();
+        rig.store(&st);
+        let report = rig.visit();
+        assert_eq!(report.step, "done:resumed", "{report:?}");
+        assert_eq!(rig.asked("signal").len(), 1);
+        assert_eq!(
+            rig.record().expect("rotation").cause,
+            "model:claude-opus-5-5-medium"
+        );
+    }
+}
+
+#[test]
+fn a_saved_word_does_not_strand_an_agy_restart_already_in_flight() {
+    let ready = Arc::new(AtomicBool::new(false));
+    let rig = LiveRig::new(Knobs {
+        shell_slow: Some(Arc::clone(&ready)),
+        ..Knobs::default()
+    });
+    assert_eq!(rig.visit().step, "wait:shell-prompt");
+    let mut st = rig.record().expect("actual in-flight claim");
+    st.request = Request::Skip(NEW_VERSION.into());
+    st.request_tab = TAB.into();
+    rig.store(&st);
+    ready.store(true, Ordering::SeqCst);
+    assert_eq!(rig.visit().step, "done:resumed");
+    assert_eq!(rig.asked("signal").len(), 1);
+    assert_eq!(rig.asked("turn").len(), 1);
 }
 
 #[test]
@@ -1681,6 +1859,10 @@ fn real_claim_relaunches() -> bool {
     };
     let now = now_s();
     let st = claim_record(&snap, &mv, rig.opts.human_grace_s, now).expect("a claim");
+    assert_eq!(
+        st.proc_start, snap.start,
+        "the claim preserves its snapshot's run identity"
+    );
     ended_by_restart(&st, Agent::Agy, TAB, TUI, now)
 }
 

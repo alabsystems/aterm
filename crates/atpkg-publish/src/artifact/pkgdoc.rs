@@ -88,6 +88,26 @@ pub struct Row {
     pub provenance: Provenance,
 }
 
+/// One target's `[[artifact]]` row for an upstream bottle or archive (`Shape::Bottle`),
+/// which carries no Rust compiler `[artifact.provenance]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BottleRow {
+    /// The target.
+    pub triple: Triple,
+    /// The payload shape.
+    pub kind: Kind,
+    /// The release asset's file name.
+    pub asset: String,
+    /// The asset's sha256.
+    pub sha256: String,
+    /// The extracted tree's `tree_root`.
+    pub tree_root: String,
+    /// The asset's size.
+    pub size: u64,
+    /// `[artifact.cost] disk_installed`.
+    pub disk_installed: u64,
+}
+
 /// Rendered manifest bytes and the prefix length of any base manifest it extends.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Doc {
@@ -253,6 +273,38 @@ fn render_row(row: &Row) -> Result<String> {
     Ok(s)
 }
 
+fn render_bottle_row(row: &BottleRow) -> Result<String> {
+    plain("the asset name", &row.asset)?;
+    for (what, hex) in [("sha256", &row.sha256), ("tree_root", &row.tree_root)] {
+        if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err(Error::refused(format!(
+                "the row's {what} `{hex}` is not 64 hex"
+            )));
+        }
+    }
+    if row.size == 0 {
+        return Err(Error::refused(format!("{} is empty", row.asset)));
+    }
+    let mut s = format!(
+        "[[artifact]]\ntarget = \"{}\"\nkind = \"{}\"\nprotocol = \"github-release\"\n\
+         asset = \"{}\"\nsha256 = \"{}\"\ntree_root = \"{}\"\nsize = {}\n",
+        row.triple,
+        row.kind.as_str(),
+        row.asset,
+        row.sha256,
+        row.tree_root,
+        row.size
+    );
+    if row.kind == Kind::SysrootBundle {
+        s.push_str("reloc = \"self-contained\"\n");
+    }
+    s.push_str(&format!(
+        "[artifact.cost]\ndownload_bytes = {}\ndisk_installed = {}\nbuild_seconds = 0\n",
+        row.size, row.disk_installed
+    ));
+    Ok(s)
+}
+
 /// Validates that `exposes` is non-empty and every tool name is permitted by `shim_allowed`
 /// and is no other program's vendor tool.
 ///
@@ -297,11 +349,37 @@ fn vendor_tools_left_alone(program: &str, exposes: &[String]) -> Result<()> {
         })
         .collect();
     if taken.is_empty() {
-        return Ok(());
+        return bottle_tools_left_alone(program, exposes);
     }
     Err(Error::refused(format!(
         "{program} exposes {}: a vendor row shims that name, and one `bin/` holds one shim per \
          name, so a client would shadow the vendor's tool — expose the program's own name",
+        taken.join(", ")
+    )))
+}
+
+fn bottle_tools_left_alone(program: &str, exposes: &[String]) -> Result<()> {
+    let taken: Vec<String> = exposes
+        .iter()
+        .filter_map(|e| {
+            crate::programs::PROGRAMS
+                .iter()
+                .find(|d| match d.shape {
+                    crate::programs::Shape::Bottle(b) => {
+                        b.exposes.iter().any(|t| t.eq_ignore_ascii_case(e))
+                    }
+                    _ => false,
+                })
+                .filter(|d| d.name != program)
+                .map(|d| format!("`{e}` ({})", d.name))
+        })
+        .collect();
+    if taken.is_empty() {
+        return Ok(());
+    }
+    Err(Error::refused(format!(
+        "{program} exposes {}: a bottle row shims that name, and one `bin/` holds one shim per \
+         name, so a client would shadow that tool — expose the program's own name",
         taken.join(", ")
     )))
 }
@@ -346,6 +424,23 @@ pub fn fresh(header: &Header, row: &Row) -> Result<Doc> {
 /// what a client lays.
 fn tool_set<'a>(tools: impl IntoIterator<Item = &'a str>) -> std::collections::BTreeSet<&'a str> {
     tools.into_iter().collect()
+}
+
+fn base_exposes<'a>(doc: &'a aterm_toml::Value, program: &str) -> Result<Vec<&'a str>> {
+    let exposes: Vec<&str> = doc
+        .get("exposes")
+        .and_then(aterm_toml::Value::as_array)
+        .and_then(|a| a.iter().map(aterm_toml::Value::as_str).collect())
+        .ok_or_else(|| Error::refused("the merge base's exposes is not an array of strings"))?;
+    if exposes.is_empty() {
+        return Err(Error::refused(format!(
+            "{program} exposes nothing: a pack that shims no tool is never signed"
+        )));
+    }
+    for &e in &exposes {
+        plain("an exposed tool", e)?;
+    }
+    Ok(exposes)
 }
 
 /// Appends `row` to an existing published manifest `base` as a byte-prefix extension.
@@ -397,11 +492,7 @@ pub fn merge(base: Vec<u8>, header: &Header, row: &Row) -> Result<Doc> {
             header.version
         )));
     }
-    let base_exposes: Vec<&str> = doc
-        .get("exposes")
-        .and_then(aterm_toml::Value::as_array)
-        .map(|a| a.iter().filter_map(aterm_toml::Value::as_str).collect())
-        .unwrap_or_default();
+    let base_exposes = base_exposes(&doc, program)?;
     if tool_set(base_exposes.iter().copied()) != tool_set(header.exposes.iter().map(String::as_str))
     {
         return Err(Error::refused(format!(
@@ -485,6 +576,183 @@ pub fn check_parsed(parsed: &atpkg::PkgManifest, header: &Header, row: &Row) -> 
         && got.kind == row.kind.as_str()
         && got.cost.disk_installed == row.disk_installed
         && got.provenance.as_ref() == Some(&row.provenance);
+    if same {
+        Ok(())
+    } else {
+        Err(Error::refused(format!(
+            "the client parses {}'s {} row differently from what was packed",
+            header.program, row.triple
+        )))
+    }
+}
+
+/// Renders a fresh bottle manifest containing `header` and `row` without `[artifact.provenance]`.
+///
+/// # Errors
+/// Returns an error if any field or `exposes` list is invalid.
+pub fn fresh_bottle(header: &Header, row: &BottleRow) -> Result<Doc> {
+    plain("the program", &header.program)?;
+    plain("the version", &header.version)?;
+    if header.exposes.is_empty() {
+        return Err(Error::refused(format!(
+            "{} exposes nothing: a pack that shims no tool is never signed",
+            header.program
+        )));
+    }
+    for e in &header.exposes {
+        plain("an exposed tool", e)?;
+    }
+    check_exposes(&header.program, &header.exposes)?;
+    let exposes = header
+        .exposes
+        .iter()
+        .map(|e| format!("\"{e}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut s = format!(
+        "# Generated by atpkg-publish — DO NOT edit (the signature covers the exact bytes).\n\
+         schema = {SCHEMA}\nprogram = \"{}\"\nversion = \"{}\"\nbuild_number = {}\n\
+         exposes = [{exposes}]\n\n",
+        header.program, header.version, header.build
+    );
+    s.push_str(&render_bottle_row(row)?);
+    Ok(Doc {
+        bytes: s.into_bytes(),
+        base_len: 0,
+    })
+}
+
+/// Appends `row` to an existing published bottle manifest `base` as a byte-prefix extension.
+///
+/// # Errors
+/// Returns an error when `base` is malformed, belongs to another build or exposed set, already
+/// carries this target or asset, or `row` is invalid.
+pub fn merge_bottle(base: Vec<u8>, header: &Header, row: &BottleRow) -> Result<Doc> {
+    let (program, build) = (header.program.as_str(), header.build);
+    check_exposes(program, &header.exposes)?;
+    let text = std::str::from_utf8(&base)
+        .map_err(|_| Error::refused("the merge base is not UTF-8 — not a manifest"))?;
+    let doc: aterm_toml::Value = text
+        .parse()
+        .map_err(|e| Error::refused(format!("the merge base does not parse as TOML: {e}")))?;
+    let schema = doc.get("schema").and_then(aterm_toml::Value::as_integer);
+    if schema != Some(SCHEMA) {
+        return Err(Error::refused(format!(
+            "the merge base's schema is {schema:?}, not {SCHEMA} — not a document this \
+             writer produces; refusing to append to it"
+        )));
+    }
+    let base_program = doc.get("program").and_then(aterm_toml::Value::as_str);
+    if base_program != Some(program) {
+        return Err(Error::refused(format!(
+            "the merge base is for program {base_program:?} but this pack is `{program}`"
+        )));
+    }
+    let base_build = doc
+        .get("build_number")
+        .and_then(aterm_toml::Value::as_integer);
+    if base_build.and_then(|b| u64::try_from(b).ok()) != Some(build) {
+        return Err(Error::refused(format!(
+            "the merge base is build {base_build:?} but this pack is build {build} — a merged \
+             manifest describes ONE build"
+        )));
+    }
+    let base_version = doc.get("version").and_then(aterm_toml::Value::as_str);
+    if base_version != Some(header.version.as_str()) {
+        return Err(Error::refused(format!(
+            "the merge base is version {base_version:?} but this pack is `{}` — a merged \
+             manifest describes ONE build",
+            header.version
+        )));
+    }
+    let base_exposes = base_exposes(&doc, program)?;
+    if tool_set(base_exposes.iter().copied()) != tool_set(header.exposes.iter().map(String::as_str))
+    {
+        return Err(Error::refused(format!(
+            "the merge base shims [{}] but this {} pack shims [{}] — one build has one \
+             exposed set, and a shim a target cannot serve breaks there",
+            base_exposes.join(", "),
+            row.triple,
+            header.exposes.join(", ")
+        )));
+    }
+    let rows = doc
+        .get("artifact")
+        .and_then(aterm_toml::Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let field = |r: &aterm_toml::Value, k: &str| {
+        r.get(k)
+            .and_then(aterm_toml::Value::as_str)
+            .map(str::to_string)
+    };
+    if rows
+        .iter()
+        .any(|r| field(r, "target").as_deref() == Some(row.triple.as_str()))
+    {
+        return Err(Error::refused(format!(
+            "the merge base already carries an [[artifact]] row for {} — a duplicate leaves \
+             which row a client honours undefined",
+            row.triple
+        )));
+    }
+    if rows
+        .iter()
+        .any(|r| field(r, "asset").as_deref() == Some(row.asset.as_str()))
+    {
+        return Err(Error::refused(format!(
+            "the merge base already names asset `{}` — two rows, one file name: their \
+             uploads would replace each other",
+            row.asset
+        )));
+    }
+    let rendered = render_bottle_row(row)?;
+    let base_len = base.len();
+    let mut bytes = base;
+    bytes.push(b'\n');
+    bytes.extend_from_slice(rendered.as_bytes());
+    Ok(Doc { bytes, base_len })
+}
+
+/// Verifies that `parsed` matches `header` and bottle `row`.
+///
+/// # Errors
+/// A refusal naming what differs.
+pub fn check_parsed_bottle(
+    parsed: &atpkg::PkgManifest,
+    header: &Header,
+    row: &BottleRow,
+) -> Result<()> {
+    if parsed.program != header.program || parsed.build_number != header.build {
+        return Err(Error::refused(format!(
+            "the parsed manifest is {}@{}, not {}@{}",
+            parsed.program, parsed.build_number, header.program, header.build
+        )));
+    }
+    if parsed.version != header.version
+        || tool_set(parsed.exposes.iter().map(String::as_str))
+            != tool_set(header.exposes.iter().map(String::as_str))
+    {
+        return Err(Error::refused(format!(
+            "the client parses {} as version {} shimming [{}], not the packed {} shimming [{}]",
+            header.program,
+            parsed.version,
+            parsed.exposes.join(", "),
+            header.version,
+            header.exposes.join(", ")
+        )));
+    }
+    let got = parsed
+        .artifacts
+        .iter()
+        .find(|a| a.target == row.triple.as_str())
+        .ok_or_else(|| Error::refused(format!("the parsed manifest has no {} row", row.triple)))?;
+    let same = got.asset == row.asset
+        && got.sha256 == row.sha256
+        && got.tree_root == row.tree_root
+        && got.size == row.size
+        && got.kind == row.kind.as_str()
+        && got.cost.disk_installed == row.disk_installed
+        && got.provenance.is_none();
     if same {
         Ok(())
     } else {

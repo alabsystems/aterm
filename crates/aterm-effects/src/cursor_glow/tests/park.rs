@@ -226,6 +226,45 @@ fn a_park_with_no_return_flushes_as_todays_verdict() {
     assert_eq!(stalled.in_flight_tally().park_flushed, 1);
 }
 
+/// A held park's config is a stale copy: its flush is judged under the light of the tick that
+/// flushes it, whatever the light it was held under (§15.2 1.3).
+#[test]
+fn a_flushed_park_draws_by_the_light_of_the_tick_that_flushes_it() {
+    let g = wide_geom();
+    let dark = cfg(GlowStyle::RainbowKitty, true);
+    let lit = GlowConfig {
+        light: Light::at(Live::Glass),
+        ..dark
+    };
+    let t0 = Instant::now();
+    for (held, flushed) in [(&dark, &lit), (&lit, &dark), (&dark, &dark)] {
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        let pre = pre_roll(&mut glow, 11, t0, held, g);
+        let k = pre + Duration::from_millis(85);
+        glow.note_typed(k);
+        let park_at = k + Duration::from_millis(10);
+        glow.tick(Some((11, 3)), park_at, held, g, &mut out);
+        assert_eq!(glow.in_flight_tally().park_flushed, 0, "held");
+        assert_eq!(glow.park_flush_light, None);
+        glow.tick(
+            Some((11, 3)),
+            park_at + Duration::from_millis(300),
+            flushed,
+            g,
+            &mut out,
+        );
+        assert_eq!(glow.in_flight_tally().park_flushed, 1, "flushed");
+        assert_eq!(
+            glow.park_flush_light,
+            Some(flushed.light),
+            "held under {:?}, flushed under {:?}",
+            held.light,
+            flushed.light
+        );
+    }
+}
+
 /// A one-cell park's flush drains nothing. A key typed, the caret seen one
 /// column left (a repaint parking on the trailing space it just drew), held as a
 /// park and flushed after the window: the flush judges it `typing` and hands v2

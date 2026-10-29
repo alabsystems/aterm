@@ -41,8 +41,13 @@ pub const START_SLACK_S: u64 = 2;
 /// The text a task's `RUNNING` row names its id after.
 const TASK_STARTED: &str = "background task with task id: ";
 
-/// The words of a subagent spawn's row.
-const SUBAGENTS_CREATED: &str = "Created the following subagents:";
+/// The words of a subagent spawn's row: agy 1.4.0's `invoke_subagent` took a
+/// list and wrote `subagents` even for one; agy 1.4.10's makes one and writes
+/// `subagent` (its binary holds both templates).
+const SUBAGENTS_CREATED: [&str; 2] = [
+    "Created the following subagents:",
+    "Created the following subagent:",
+];
 
 /// The words a `manage_subagents` kill's result row says.
 const SUBAGENTS_KILLED: &str = "Successfully killed";
@@ -203,11 +208,12 @@ pub fn open_work(text: &str, from_s: u64) -> Result<(), Open> {
                 if let Some(id) = cancelled_task(content) {
                     tasks.remove(id);
                 }
-                if content
+                if let Some(head) = content
                     .lines()
                     .take(4)
-                    .any(|l| l.trim() == SUBAGENTS_CREATED)
-                    && let Some((_, spawned)) = content.split_once(SUBAGENTS_CREATED)
+                    .map(str::trim)
+                    .find(|l| SUBAGENTS_CREATED.contains(l))
+                    && let Some((_, spawned)) = content.split_once(head)
                 {
                     subagents.extend(
                         spawned

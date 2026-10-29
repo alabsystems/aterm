@@ -2073,23 +2073,22 @@ mod tests {
         path
     }
 
-    /// The env that turns [`probe_stages_its_directories_0755_under_an_open_umask`] on:
+    /// The env that turns [`probe_stages_its_directories_0755_under_an_open_umask_if_asked`] on:
     /// the scratch directory it stages under.
     #[cfg(unix)]
     const OPEN_UMASK_ENV: &str = "ATPKG_EXTRACT_OPEN_UMASK_DIR";
     /// That probe's name, as `--exact` wants it.
     #[cfg(unix)]
     const OPEN_UMASK_PROBE: &str =
-        "extract::tests::probe_stages_its_directories_0755_under_an_open_umask";
+        "extract::tests::a_folding_lane_makes_every_directory_0755_whatever_the_umask";
 
     /// The child half of [`a_folding_lane_makes_every_directory_0755_whatever_the_umask`]:
     /// under umask `000`, implicit (`share/`, `share/doc/`) and explicit (`bin/`)
     /// directories stage at `0755`.
     #[cfg(unix)]
-    #[test]
-    fn probe_stages_its_directories_0755_under_an_open_umask() {
+    fn probe_stages_its_directories_0755_under_an_open_umask_if_asked() -> bool {
         let Some(dir) = std::env::var_os(OPEN_UMASK_ENV) else {
-            return;
+            return false;
         };
         // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail; this
         // process runs this one test (`--exact`), so no other create sees the mask.
@@ -2125,6 +2124,7 @@ mod tests {
                 & 0o7777;
             assert_eq!(mode, 0o755, "{dir}: staged under umask 000");
         }
+        true
     }
 
     /// The directories a folding lane makes because a member's path passes through them
@@ -2132,6 +2132,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_folding_lane_makes_every_directory_0755_whatever_the_umask() {
+        if probe_stages_its_directories_0755_under_an_open_umask_if_asked() {
+            return;
+        }
         let d = dest("open-umask");
         let out = aterm_uds::spawnfd::command(std::env::current_exe().unwrap())
             .args(["--exact", "--nocapture", OPEN_UMASK_PROBE])

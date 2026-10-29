@@ -100,10 +100,10 @@ fn answer(mut s: UnixStream, pages: &[Page]) {
 
 fn ls(tag: &str, pages: Vec<Page>, extra: &[&str]) -> (String, String, bool) {
     let (_dir, path) = sock_path(tag);
-    let listener = UnixListener::bind(&path).expect("bind the stub broker");
+    let listener = harness::kept(UnixListener::bind(&path).expect("bind the stub broker"));
     let server = std::thread::spawn(move || {
         if let Ok((s, _)) = listener.accept() {
-            answer(s, &pages);
+            answer(harness::kept(s), &pages);
         }
     });
     let (mut cmd, _runtime) = aterm_link();

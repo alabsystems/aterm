@@ -72,6 +72,11 @@ struct DoorHost {
     /// The window's own book, where a test runs the door against it: its reads, claims, releases
     /// and tells are the book's, at the run's wall ([`DoorHost::facts_at`]).
     real: Mutex<Option<WakeBook>>,
+    /// The agent's launch the host saw ([`IdleHost::launch`], unix ms); `None`, none.
+    launch: Option<i64>,
+    /// What the host measured of the API's reach ([`IdleHost::reach_peek`] and
+    /// [`IdleHost::reach`] alike).
+    reach: Mutex<crate::supervise::policy::turn_end::Reach>,
 }
 
 impl DoorHost {
@@ -87,6 +92,12 @@ impl DoorHost {
 impl IdleHost for DoorHost {
     fn wants(&self) -> bool {
         self.wants.load(Ordering::SeqCst)
+    }
+    fn reach_peek(&self) -> crate::supervise::policy::turn_end::Reach {
+        *self.reach.lock().expect("reach")
+    }
+    fn reach(&self) -> crate::supervise::policy::turn_end::Reach {
+        *self.reach.lock().expect("reach")
     }
     fn at_idle(&self) -> Option<HostStep> {
         None
@@ -204,6 +215,9 @@ impl IdleHost for DoorHost {
             .expect("wakes")
             .wakes
             .retain(|w| w.ord != ord);
+    }
+    fn launch(&self) -> Option<i64> {
+        self.launch
     }
     fn task_fact(&self, word: Option<FactWord>) -> NoteOutcome {
         self.called(format!(
@@ -432,7 +446,27 @@ struct Script<'a> {
     seed: Option<(String, i64)>,
     /// Cross-loop fixtures need ledger stamps and hold arithmetic on the same clock.
     virtual_time: bool,
+    /// The session goes after the last step: the loop's end is booked as a gone session's
+    /// (`Session::loop_ended` on [`GONE`]), in place of the hold's end row.
+    gone: bool,
+    /// How the loop steps each read ([`Step`]).
+    steps: &'a dyn Fn(usize) -> Step,
 }
+
+/// How the loop steps a read of [`Script::run`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// The break's steps run on it.
+    Stepped,
+    /// The loop came back to it afresh, as after a lost call rode out: the break's start is read
+    /// again from it.
+    Again,
+    /// Read under Off: a live turn is still taken, the break's steps skipped.
+    Off,
+}
+
+/// The loop's end where its session went (`session_gone`).
+const GONE: &str = "aterm-ctl: ERR exited";
 
 /// The door's policy under `occupancy`: the door alone, without Cruise's carry at a break
 /// (`continue_policy` off), which `cruise_carry_loop_tests` runs beside it.
@@ -455,6 +489,8 @@ impl<'a> Script<'a> {
             host: Arc::new(DoorHost::default()),
             seed: None,
             virtual_time: false,
+            gone: false,
+            steps: &|_| Step::Stepped,
         }
     }
 
@@ -530,10 +566,26 @@ impl<'a> Script<'a> {
                 before(&mut s, i);
                 let screen = s.screen().expect("the break's read");
                 s.clock_marks = Some((s.fx.mono(), at_ms));
+                match (self.steps)(i) {
+                    Step::Off => continue,
+                    Step::Again => since = None,
+                    Step::Stepped => {}
+                }
                 s.host_steps_in_background(&screen, &mut since, Some(&self.policy), &mut heard)
                     .expect("the break's step");
             }
-            s.hold_left(Some(&self.policy), &heard);
+            if self.gone {
+                let opts = SuperviseOpts {
+                    policy: self.policy.clone(),
+                    idle_host: Some(Arc::clone(&self.host) as Arc<dyn IdleHost>),
+                    ..hosted(30)
+                };
+                let end = Err(GONE.to_string());
+                assert!(session_gone(&end));
+                s.loop_ended(&end, &opts, &mut heard);
+            } else {
+                s.hold_left(Some(&self.policy), &heard);
+            }
             (
                 heard.noted.clone(),
                 s.turn_end.land_act_seeded(),
@@ -1137,10 +1189,7 @@ fn a_line_left_in_the_composer_is_not_said_unwritten() {
         m.key_replies
             .push_back(ok("OK skipped reason=person seq=101\n"));
     });
-    assert_eq!(
-        wrote(&left.noted),
-        [said(NUDGE, "skipped why=not-submitted")]
-    );
+    assert_eq!(wrote(&left.noted), [said(NUDGE, "left")]);
     let writes = left.writes();
     assert!(
         writes.first().is_some_and(|w| w.starts_with("send "))
@@ -1151,14 +1200,11 @@ fn a_line_left_in_the_composer_is_not_said_unwritten() {
         left.kinds(),
         [
             (INTENT.to_string(), "waiting".to_string()),
-            (HOLD.to_string(), "skipped".to_string()),
-        ]
+            (HOLD.to_string(), "waiting".to_string()),
+        ],
+        "left, neither told nor untold (2.9b)"
     );
-    assert!(
-        left.rows[1].3.ends_with(" why=not-submitted"),
-        "{:?}",
-        left.rows
-    );
+    assert!(left.rows[1].3.ends_with(" left"), "{:?}", left.rows);
     let unwritten = run(&|m| {
         m.send_replies
             .push_back(ok("OK skipped reason=changed seq=101\n"));

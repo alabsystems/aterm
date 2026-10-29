@@ -166,10 +166,7 @@ pub enum InitModeFromFlagError {
 impl std::fmt::Display for InitModeFromFlagError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Parse(e) => {
-                f.write_str("invalid containment mode: ")?;
-                std::fmt::Display::fmt(e, f)
-            }
+            Self::Parse(e) => std::fmt::Display::fmt(e, f),
             Self::Init(e) => std::fmt::Display::fmt(e, f),
         }
     }

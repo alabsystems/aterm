@@ -48,12 +48,21 @@ fn adaptive_fast_expiry_is_invisible_and_slow_echo_may_display() {
         "shipping Predictor tracks fast-link `b`"
     );
     assert_eq!(fast_model["confirmed"], 1);
-    let confirmation_only_visible =
-        usize::from(tracked_fast_prediction && fast_model["confirmed"] == 1);
+    let mut always = Predictor::new(PredictMode::Always);
+    assert!(always.predict_char('a', (0, 0), G, 80, now));
+    always.reconcile(Some((0, 1)), G, false, fast_echo, echoed_a);
+    assert!(always.predict_char('b', (0, 1), G, 80, fast_echo));
     assert_ne!(
-        confirmation_only_visible,
+        always.overlay(fast_echo).len(),
         fast.overlay(fast_echo).len(),
-        "the deleted confirmation-only gate must disagree with shipping pixels"
+        "without the Adaptive regime gate, shipping Predictor paints fast-link `b`"
+    );
+    let mut unbenefited = fast_model.clone();
+    unbenefited.insert("visible", 1);
+    assert!(
+        !model.check_invariant("FastAdaptiveNeverPaints", &unbenefited)
+            && !model.check_invariant("VisibleNeedsProofAndBenefit", &unbenefited),
+        "model invariants reject visible=1 while slow=0"
     );
 
     let expired = fast_echo + Duration::from_millis(251);

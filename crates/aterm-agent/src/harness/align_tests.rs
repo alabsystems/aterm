@@ -136,8 +136,14 @@ fn group_emptied(pgid: libc::pid_t) -> bool {
             return true;
         }
         if started.elapsed() >= Duration::from_secs(60) {
+            // Again until none is left: a member's fork can dodge one signal (XNU).
+            let until = std::time::Instant::now() + Duration::from_secs(60);
             // SAFETY: as above; SIGKILL to a group this test's fixture made.
-            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            while unsafe { libc::kill(-pgid, libc::SIGKILL) } == 0
+                && std::time::Instant::now() < until
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             return false;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -172,6 +178,23 @@ fn a_descendant_holding_stdout_is_killed_with_its_process_group() {
         "a descendant-held stdout did not time out: the capture took {took:?}"
     );
     assert!(group_emptied(pgid), "the descendant was left running");
+}
+
+/// The child forks a `sleep` and kills it, over and over, so the deadline's
+/// group SIGKILL lands while it is forking: XNU leaves the child of that fork
+/// unsignalled, a `sleep` nothing kills ([`aterm_uds::process::kill_group_until_empty`]).
+#[cfg(unix)]
+#[test]
+fn a_group_still_forking_at_the_deadline_is_killed_whole() {
+    let (pgid, _) = capture_a_hanging_group(
+        "forking-group",
+        "echo \"$$ $(ps -o pgid= -p $$)\" > \"$PGIDF\"; while :; do sleep \"$HANG_S\" & kill $!; done",
+        "ran past its",
+    );
+    assert!(
+        group_emptied(pgid),
+        "a child forked as the group was killed ran on"
+    );
 }
 
 #[cfg(unix)]

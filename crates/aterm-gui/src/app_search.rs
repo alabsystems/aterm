@@ -744,7 +744,10 @@ impl App {
         self.front_terminal(wid).is_some()
             && self.windows.get(&wid).is_some_and(|ws| {
                 ws.search.as_ref().map_or_else(
-                    || !self.search_last_query.is_empty(),
+                    || {
+                        !self.search_last_query.is_empty()
+                            || !self.guest_search_last_query.is_empty()
+                    },
                     |search| !search.query.is_empty(),
                 )
             })
@@ -1398,11 +1401,12 @@ impl App {
             self.search_step_in(wid, forward);
             return Ok(());
         }
-        if self.search_last_query.is_empty() {
+        let (query, last_anchor) = self.remembered_find();
+        if query.is_empty() {
             return Err("there is no search to step \u{2014} find something first");
         }
 
-        let query = self.search_last_query.clone();
+        let query = query.to_owned();
         let session_identity = self.front_shown(wid).map(|(term, session)| {
             let term = term_lock(&term);
             (
@@ -1411,8 +1415,7 @@ impl App {
                 term.grid().history_renumber_epoch(),
             )
         });
-        let anchor = self
-            .search_last_anchor
+        let anchor = last_anchor
             .filter(|(anchor_session, anchor_revision, anchor_epoch, ..)| {
                 Some((*anchor_session, *anchor_revision, *anchor_epoch)) == session_identity
             })
@@ -1427,6 +1430,31 @@ impl App {
         }
         self.search_recompute_from_anchor_in(wid, anchor.is_some());
         Ok(())
+    }
+
+    /// The last terminal find query the gesture being dispatched accepted, and where its match
+    /// was: the person's ([`App::search_last_query`]), or for a control client's gesture its own,
+    /// so a client's Find Next or `^S` on an empty query never recalls what the person searched
+    /// for (a token checked for and not found, say) into a find bar it reads, as an Editor
+    /// view's remembered search is split.
+    fn remembered_find(&self) -> (&str, Option<crate::FindAnchor>) {
+        if self.person_gesture_refused() {
+            (&self.guest_search_last_query, self.guest_search_last_anchor)
+        } else {
+            (&self.search_last_query, self.search_last_anchor)
+        }
+    }
+
+    /// Keep `query` and its match as the gesture being dispatched's last accepted terminal find
+    /// ([`Self::remembered_find`]).
+    fn remember_find(&mut self, query: String, anchor: Option<crate::FindAnchor>) {
+        if self.person_gesture_refused() {
+            self.guest_search_last_query = query;
+            self.guest_search_last_anchor = anchor;
+        } else {
+            self.search_last_query = query;
+            self.search_last_anchor = anchor;
+        }
     }
 
     /// `^S`/`^R` in find mode (isearch-repeat): step to the next/previous match, or on an empty query recall the last accepted one (`search_last_query`, emacs `C-s C-s`); forward lands on the first match, backward on the last.
@@ -1447,8 +1475,8 @@ impl App {
             .get(&wid)
             .and_then(|ws| ws.search.as_ref())
             .is_some_and(|s| s.query.is_empty());
-        if query_empty && !self.search_last_query.is_empty() {
-            let recalled = self.search_last_query.clone();
+        let recalled = self.remembered_find().0.to_owned();
+        if query_empty && !recalled.is_empty() {
             if let Some(s) = self.windows.get_mut(&wid).and_then(|ws| ws.search.as_mut()) {
                 s.set_query(recalled);
                 if forward {
@@ -1482,9 +1510,11 @@ impl App {
         }
     }
 
-    /// ⌘V in the find field: insert the clipboard at the caret ([`SearchState::edit`] strips control bytes and line breaks).
+    /// ⌘V in the find field: insert the clipboard at the caret ([`SearchState::edit`] strips control bytes and line breaks). A control client's gesture reads no clipboard ([`Self::refuse_clipboard_gesture`]).
     pub(crate) fn search_paste_in(&mut self, wid: crate::WindowId) {
-        if self.windows.get(&wid).is_none_or(|ws| ws.search.is_none()) {
+        if self.windows.get(&wid).is_none_or(|ws| ws.search.is_none())
+            || self.refuse_clipboard_gesture("find-field paste")
+        {
             return;
         }
         #[cfg(not(target_os = "linux"))]
@@ -1616,10 +1646,10 @@ impl App {
         if let Some((q, revision, epoch, anchor)) = accepted.as_ref()
             && !q.is_empty()
         {
-            self.search_last_query = q.clone();
-            self.search_last_anchor = session
+            let anchor = session
                 .zip(*anchor)
                 .map(|(session, (row, start, end))| (session, *revision, *epoch, row, start, end));
+            self.remember_find(q.clone(), anchor);
         }
         if let Some(session) = session {
             self.find_origins.remove(&(session, wid));

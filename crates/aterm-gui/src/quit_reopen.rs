@@ -10,8 +10,9 @@
 use std::ffi::OsString;
 #[cfg(any(target_os = "macos", test))]
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 #[cfg(target_os = "macos")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// `keySenderPIDAttr`, `'spid'`: the pid of the program that sent an Apple event.
 #[cfg(any(target_os = "macos", test))]
@@ -30,19 +31,22 @@ const REOPEN_SENDERS: [&str; 2] = [
 pub const REOPEN_VERB: &str = "__reopen-after";
 
 /// How long the helper waits for the quitting aterm to be gone before it gives up.
-#[cfg(target_os = "macos")]
 const GONE_CEILING: Duration = Duration::from_secs(120);
 
 /// How long the helper waits for LaunchServices to drop the gone aterm before it opens anyway:
 /// LaunchServices answers an `open` for an app it still lists by bringing that app forward.
-#[cfg(target_os = "macos")]
 const FORGOTTEN_CEILING: Duration = Duration::from_secs(5);
 
 #[cfg(target_os = "macos")]
 const FORGOTTEN_TICK: Duration = Duration::from_millis(20);
 
-#[cfg(target_os = "macos")]
 const OPEN_CEILING: Duration = Duration::from_secs(60);
+
+/// The longest the helper takes, from its start at this process's quit, to open aterm again: its
+/// waits for the quitting aterm to be gone, for LaunchServices to drop it, and for `open`.
+pub(crate) const REOPEN_CEILING: Duration = Duration::from_secs(
+    GONE_CEILING.as_secs() + FORGOTTEN_CEILING.as_secs() + OPEN_CEILING.as_secs(),
+);
 
 /// Whether a quit sent by the program at `path` is System Settings' Quit & Reopen.
 #[cfg(any(target_os = "macos", test))]

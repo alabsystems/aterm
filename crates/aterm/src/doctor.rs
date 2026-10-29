@@ -832,7 +832,8 @@ fn unmeasured(id: &str, family: &str, layer: Option<Layer>, why: String) -> Item
 
 /// The base items `aterm init` runs before its workstation items (design §4.2, S5): the
 /// same repair items, the doctor's pass (an opted-out rc stays as the person left it),
-/// `base.ai.accounts`, and on a Mac `base.clt` over atpkg's C toolchain probe (S6).
+/// `base.ai.accounts`, on a Mac `base.clt` over atpkg's C toolchain probe (S6), and
+/// `base.pkg.toolset` ([`toolset`]), which installs the toolset once the lock is let go.
 #[cfg(unix)]
 pub(crate) fn init_base(lock: aterm_machines::init::BaseLock) -> aterm_machines::init::Base {
     let wait = wait_for_pass("init");
@@ -852,8 +853,141 @@ pub(crate) fn init_base(lock: aterm_machines::init::BaseLock) -> aterm_machines:
     let clt = None;
     aterm_machines::init::Base {
         clt,
+        toolset: Some(toolset(lock)),
         targo: Some(Arc::new(targo)),
         ..base
+    }
+}
+
+/// `base.pkg.toolset` ([`aterm_machines::init_toolset`]): its check side is `aterm pkg
+/// doctor`'s toolset row beside atpkg's install consent ([`toolset_found`]), and its passes are
+/// this executable's `aterm pkg seed` then `aterm pkg update` ([`run_pkg`]), the passes a first
+/// window launch runs (update with the unattended lanes' `--defer-busy-flip`), each waiting for
+/// the store lock unless `--no-wait` made `lock` [`aterm_machines::init::BaseLock::Try`].
+#[cfg(unix)]
+fn toolset(lock: aterm_machines::init::BaseLock) -> aterm_machines::init_toolset::Toolset {
+    use aterm_machines::init_toolset::{Atpkg, Toolset, WAIT_LOCK};
+    Toolset::new(
+        Box::new(toolset_found),
+        Box::new(run_pkg),
+        (lock != aterm_machines::init::BaseLock::Try).then_some(WAIT_LOCK),
+        Atpkg {
+            update_flags: &[atpkg::cli::DEFER_BUSY_FLIP_FLAG],
+            left_for_next_pass: atpkg::cli::left_for_next_pass,
+        },
+    )
+}
+
+/// What `base.pkg.toolset` reads: the toolset row of this account's store
+/// ([`atpkg::doctor::toolset_row`]), whether atpkg may install unattended here
+/// ([`atpkg::adoption::adoption`]) and whether Automatic updates are on
+/// ([`atpkg::config::PackagesConfig::enabled`], what a window's launch lane stands by on).
+#[cfg(unix)]
+fn toolset_found() -> aterm_machines::init_toolset::Found {
+    let Some(layout) = atpkg::store::resolve_configured() else {
+        return aterm_machines::init_toolset::Found::Unread(
+            "no home folder, so no atpkg store to read".to_owned(),
+        );
+    };
+    let cfg = atpkg::config::cached();
+    toolset_reads(
+        atpkg::doctor::toolset_row(&layout).as_ref(),
+        atpkg::adoption::adoption(&layout, cfg),
+        cfg.enabled(),
+        cfg.ignored_prefix.as_deref(),
+    )
+}
+
+/// [`toolset_found`]'s verdict over the toolset `row`, atpkg's `adoption` answer, whether
+/// Automatic updates are `enabled` and the `[packages] prefix` this build ignores: a row that
+/// reads `Ok` is complete whatever the consent; a row that wants programs is missing them where
+/// atpkg may install them and Automatic updates are on, and otherwise off, saying why first
+/// (init never undoes a decline, Automatic updates off or `auto_install = false`).
+#[cfg(unix)]
+fn toolset_reads(
+    row: Option<&ItemReport>,
+    adoption: atpkg::Adoption,
+    enabled: bool,
+    ignored_prefix: Option<&Path>,
+) -> aterm_machines::init_toolset::Found {
+    use aterm_machines::init_toolset::Found;
+    use atpkg::Adoption;
+    let Some(row) = row else {
+        return Found::Unread("`aterm pkg doctor` reads no toolset row".to_owned());
+    };
+    let said = row
+        .explain
+        .as_ref()
+        .map(|explain| explain.why.clone())
+        .or_else(|| row.why.clone())
+        .or_else(|| row.from.clone())
+        .unwrap_or_else(|| row.title.clone());
+    match row.outcome {
+        Outcome::Ok => return Found::Complete(row.to.clone().unwrap_or(said)),
+        Outcome::Unknown => return Found::Unread(said),
+        _ => {}
+    }
+    let off = match adoption {
+        Adoption::Consented if row.outcome == Outcome::NotApplicable => return Found::Off(said),
+        // A window's launch lane stands by while the switch is off, and so does init.
+        Adoption::Consented if !enabled => "Automatic updates are off ([packages].enabled = \
+                                            false in aterm.toml, or the retired auto_update = \
+                                            false), so init installs no toolset; Settings \u{25b8} \
+                                            Packages turns them on, or `aterm pkg install \
+                                            --default-set` installs it"
+            .to_owned(),
+        Adoption::Consented => return Found::Missing(said),
+        // The row says the decline, and how to lift it.
+        Adoption::Declined => return Found::Off(said),
+        Adoption::AutoInstallOff => "[packages].auto_install = false in aterm.toml (or a \
+                                     [packages] table too broken to read), so init installs no \
+                                     toolset; `aterm pkg install --default-set` installs it"
+            .to_owned(),
+        Adoption::IgnoredPrefix => ignored_prefix.map_or_else(
+            || "aterm.toml names a [packages] prefix this build ignores".to_owned(),
+            atpkg::config::ignored_prefix_note,
+        ),
+        Adoption::ManagerDisabled => {
+            "this aterm pins no root key, so atpkg installs nothing".to_owned()
+        }
+    };
+    Found::Off(format!("{off}: {said}"))
+}
+
+/// Run this executable's `aterm pkg <args>` as `base.pkg.toolset`'s pass: a child that
+/// inherits this process's environment (the store, the config and the network it reads are
+/// init's), standard input closed and its output kept, ended at `budget`. Under a private
+/// state root it carries the window's lead ([`atpkg::cli::PRIVATE_STATE_ROOT_FLAG`]), as the
+/// window's passes there do.
+#[cfg(unix)]
+fn run_pkg(
+    args: &[String],
+    budget: std::time::Duration,
+) -> Result<aterm_machines::port::Ran, aterm_machines::port::RunFailed> {
+    use aterm_machines::port::{Ran, RunFailed};
+    let exe = std::env::current_exe()
+        .and_then(|exe| exe.canonicalize())
+        .map_err(|e| RunFailed::Spawn(format!("this aterm cannot name itself: {e}")))?;
+    let mut child = aterm_uds::spawnfd::command(&exe);
+    child.arg("pkg");
+    if aterm_types::dirs::runs_under_private_state_root() {
+        child.arg(atpkg::cli::PRIVATE_STATE_ROOT_FLAG);
+    }
+    child.args(args);
+    match aterm_uds::deadline::output_until_from(
+        &mut child,
+        aterm_uds::spawnfd::Stdio::null(),
+        std::time::Instant::now() + budget,
+    ) {
+        Ok(out) => Ok(Ran {
+            status: out.status.code(),
+            stdout: out.stdout,
+            stderr: out.stderr,
+        }),
+        Err(aterm_uds::deadline::RunError::TimedOut) => Err(RunFailed::TimedOut(budget)),
+        Err(aterm_uds::deadline::RunError::Spawn(e) | aterm_uds::deadline::RunError::Wait(e)) => {
+            Err(RunFailed::Spawn(e.to_string()))
+        }
     }
 }
 
@@ -959,9 +1093,10 @@ impl Item for AiAccountsItem {
     }
 }
 
-/// Whether `env`'s machine keeps another CLI's pool and no source of Claude Code's: then
-/// `base.ai.accounts` is the other pools' alone, and Claude Code's sync having nothing to read
-/// is no failure of it.
+/// Whether `env`'s machine keeps another CLI's pool, or a pool syncing by default is due here
+/// ([`ai_accounts_due`]), and no source of Claude Code's: then `base.ai.accounts` is the other
+/// pools' alone, Claude Code's sync having nothing to read is no failure of it, and a failed
+/// sync of theirs is what the item reports.
 #[cfg(unix)]
 fn ai_accounts_others_only(env: &aterm_agent::harness::cli::Env) -> bool {
     let (Some(home), Some(roster_path)) = (env.home.as_deref(), env.accounts_roster()) else {
@@ -972,7 +1107,7 @@ fn ai_accounts_others_only(env: &aterm_agent::harness::cli::Env) -> bool {
         &env.state,
         &roster_path,
         env.now,
-    ) && ai_accounts_pools(env).is_some()
+    ) && (ai_accounts_pools(env).is_some() || ai_accounts_due(env).is_some())
 }
 
 /// The other CLIs' pools beside Claude Code's roster in one phrase (`codex 1, kimi 1`,
@@ -988,13 +1123,68 @@ fn ai_accounts_pools(env: &aterm_agent::harness::cli::Env) -> Option<Result<Stri
     cli_pools_words(&pools).map(Ok)
 }
 
-/// `base.ai.accounts`' probe over `env`: Claude Code's pool, as it always read
-/// ([`ai_accounts_claude_probe`]), and each other CLI's whose roster this machine keeps after it
-/// (`other CLIs: codex 1, kimi 1`). A machine with Claude Code's alone reads as it always did.
+/// The pools syncing by default whose rows of this machine's the vault's fleet lists while no
+/// roster of theirs stands here (`accounts_sync::cli_pools_due`), in one phrase (`codex`);
+/// `None` where none is due.
+#[cfg(unix)]
+fn ai_accounts_due(env: &aterm_agent::harness::cli::Env) -> Option<String> {
+    let (config, home) = (env.config.as_deref()?, env.home.as_deref()?);
+    let due = aterm_agent::harness::accounts_sync::cli_pools_due(config, &env.state, home, env.now);
+    (!due.is_empty()).then(|| {
+        due.iter()
+            .map(|cli| cli.id())
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
+}
+
+/// `base.ai.accounts`' probe over `env`: not applicable where `[harness] accounts = "off"`
+/// turns the accounts' sync off (`accounts_sync::accounts_sync_off`, which the item's apply
+/// would refuse), else Claude Code's pool, as it always read
+/// ([`ai_accounts_claude_probe`]), a change where a pool syncing by default has rows of this
+/// machine's in the vault's fleet and no roster here yet ([`ai_accounts_due`]), and each other
+/// CLI's whose roster this machine keeps after it (`other CLIs: codex 1, kimi 1`). A machine
+/// with Claude Code's alone reads as it always did.
 #[cfg(unix)]
 fn ai_accounts_probe(env: &aterm_agent::harness::cli::Env) -> aterm_converge::Probe {
+    use aterm_agent::harness::accounts_sync::{ACCOUNTS_SYNC_OFF, accounts_sync_off};
     use aterm_converge::Probe;
-    let claude = ai_accounts_claude_probe(env);
+    if let Some(config) = env.config.as_deref() {
+        match aterm_secrets::swarm::enabled_at(config) {
+            Ok(false) => {
+                return Probe::NotApplicable {
+                    why: aterm_secrets::swarm::SWARM_OFF.to_owned(),
+                };
+            }
+            Ok(true) => {}
+            Err(why) => {
+                return Probe::Unusable {
+                    why: format!("{}: {why}", config.display()),
+                };
+            }
+        }
+    }
+    if accounts_sync_off(env.config.as_deref()) {
+        return Probe::NotApplicable {
+            why: ACCOUNTS_SYNC_OFF.to_owned(),
+        };
+    }
+    let claude = match (ai_accounts_claude_probe(env), ai_accounts_due(env)) {
+        (claude, None) => claude,
+        (Probe::Ok { now }, Some(due)) => Probe::Change {
+            from: now,
+            to: format!("{due} rows synced from the vault"),
+        },
+        (Probe::NotApplicable { .. }, Some(due)) => Probe::Change {
+            from: format!("no {due} roster"),
+            to: format!("{due} rows synced from the vault"),
+        },
+        (Probe::Change { from, to }, Some(due)) => Probe::Change {
+            from,
+            to: format!("{to}; {due} rows synced from the vault"),
+        },
+        (other, Some(_)) => other,
+    };
     let pools = match ai_accounts_pools(env) {
         Some(Ok(pools)) => pools,
         Some(Err(why)) => return Probe::Unusable { why },
@@ -1062,7 +1252,7 @@ fn ai_accounts_claude_probe(env: &aterm_agent::harness::cli::Env) -> aterm_conve
             .rows
             .iter()
             .filter(|r| {
-                (r.dir.is_none() || enrolled.contains(&r.label))
+                enrolled.contains(&r.label)
                     && state
                         .accounts
                         .get(&r.label)
@@ -1161,6 +1351,7 @@ fn init_base_over(
         items,
         held,
         clt: None,
+        toolset: None,
         targo: None,
     };
     if lock == BaseLock::Read {

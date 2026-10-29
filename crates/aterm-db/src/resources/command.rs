@@ -69,7 +69,11 @@ pub(super) fn run_at(
     if !options.is_empty() {
         return Err(Error::new("unknown resource option"));
     }
-    let bootstrap = Bootstrap::required(&paths).map_err(crate::table::failure)?;
+    let bootstrap = Bootstrap::required_until(
+        &paths,
+        std::time::Instant::now() + std::time::Duration::from_secs(2),
+    )
+    .map_err(crate::table::failure)?;
     if let Some(terms) = proposed {
         let proposal = Proposal::prepare(bootstrap.trust(), terms)?;
         return Ok(json!({"kind":"resource-proposal","authority":"none",

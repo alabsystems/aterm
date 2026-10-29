@@ -358,3 +358,19 @@ fn test_snapshot_roundtrip_restores_full_state() {
     state.pop_flags_for_buffer(1, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 0b0_0011);
 }
+
+#[cfg(feature = "serde")]
+#[test]
+fn test_serde_deserialize_masks_kitty_flags() {
+    let flags: KittyKeyboardFlags = aterm_json::from_str("255").expect("deserializes");
+    assert_eq!(flags.bits(), 0b1_1111);
+
+    let snap: KittyKeyboardStateSnapshot = aterm_json::from_str(
+        r#"{"flags":255,"main_saved_flags":224,"alt_saved_flags":null,"main_stack":[255,0,0,0,0,0,0,0],"alt_stack":[128,0,0,0,0,0,0,0],"main_sp":1,"alt_sp":1}"#,
+    )
+    .expect("deserializes snapshot");
+    assert_eq!(snap.flags.bits(), 0b1_1111);
+    assert_eq!(snap.main_saved_flags.map(|f| f.bits()), Some(0));
+    assert_eq!(snap.main_stack[0].bits(), 0b1_1111);
+    assert_eq!(snap.alt_stack[0].bits(), 0);
+}

@@ -236,16 +236,23 @@ pub fn check_signable(parsed: &atpkg::PkgManifest) -> Result<()> {
             parsed.program, parsed.build_number, parsed.version
         )));
     }
+    let is_bottle = crate::programs::get(&parsed.program)
+        .is_some_and(|d| matches!(d.shape, crate::programs::Shape::Bottle(_)));
     for a in &parsed.artifacts {
-        let p = a.provenance.as_ref().ok_or_else(|| {
-            Error::refused(format!(
-                "the {} row carries no [artifact.provenance] — nothing says which compiler \
-                 built it",
-                a.target
-            ))
-        })?;
-        pkgdoc::check_provenance(p)
-            .map_err(|e| Error::refused(format!("the {} row: {e}", a.target)))?;
+        match &a.provenance {
+            Some(p) => {
+                pkgdoc::check_provenance(p)
+                    .map_err(|e| Error::refused(format!("the {} row: {e}", a.target)))?;
+            }
+            None if is_bottle => {}
+            None => {
+                return Err(Error::refused(format!(
+                    "the {} row carries no [artifact.provenance] — nothing says which compiler \
+                     built it",
+                    a.target
+                )));
+            }
+        }
     }
     Ok(())
 }

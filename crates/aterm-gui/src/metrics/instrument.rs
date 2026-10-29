@@ -812,19 +812,6 @@ mod tests {
         assert!(one.percentile(0.0001).unwrap() >= 7_777);
     }
 
-    /// reset() empties the distribution; recording after reset works.
-    #[test]
-    fn histogram_reset_clears_and_reuses() {
-        let h = Histogram::new();
-        h.record(1_000_000);
-        assert_eq!(h.copy_out().n(), 1);
-        h.reset();
-        assert_eq!(h.copy_out().n(), 0);
-        assert_eq!(h.copy_out().percentile(0.99), None);
-        h.record(2_000_000);
-        assert!(h.copy_out().percentile(0.5).unwrap() >= 2_000_000);
-    }
-
     /// Whatever bucket vector a copy holds (a racing reset can leave any
     /// subset of buckets zeroed), every quantile lands in a populated bucket,
     /// because `n` is the sum of exactly those buckets.
@@ -866,13 +853,15 @@ mod tests {
         assert_eq!(low.percentile(0.99), Some(Histogram::upper_edge(0)));
     }
 
-    /// A reset between two samples leaves exactly the survivor: one sample,
-    /// whose p99 is its own bucket's edge.
+    /// A reset empties the distribution, and a reset between two samples leaves
+    /// exactly the survivor: one sample, whose p99 is its own bucket's edge.
     #[test]
     fn record_reset_record_publishes_the_survivor() {
         let h = Histogram::new();
         h.record(5_000_000);
         h.reset();
+        assert_eq!(h.copy_out().n(), 0);
+        assert_eq!(h.copy_out().percentile(0.99), None);
         h.record(3_000_000);
         let copy = h.copy_out();
         assert_eq!(copy.n(), 1);

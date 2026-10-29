@@ -91,9 +91,9 @@ pub(crate) fn session_window_rows(
 
 fn session_detail(h: &SessionHandle) -> Option<String> {
     match h.term.try_lock() {
-        Ok(t) => crate::session_status::executing_detail(&t),
+        Ok(t) => crate::session_status::executing_detail(&t, &h.ctx.ran),
         Err(std::sync::TryLockError::Poisoned(p)) => {
-            crate::session_status::executing_detail(&p.into_inner())
+            crate::session_status::executing_detail(&p.into_inner(), &h.ctx.ran)
         }
         Err(std::sync::TryLockError::WouldBlock) => None,
     }
@@ -167,7 +167,7 @@ pub(crate) fn sessions_lines(
                 u8::from(meta.any_set()),
                 opt(live),
                 opt(meta.role.as_deref()),
-                opt(meta.attention.as_deref()),
+                opt(meta.row_attention()),
                 opt(meta.user_title.as_deref()),
                 meta.autopilot_word(),
                 meta.land_at,
@@ -1053,7 +1053,7 @@ pub(crate) struct TaskTarget<'a> {
     pub(crate) fact_since: Option<u64>,
 }
 
-/// `await task`: park until the task records of `targets` have news — a target whose record's rev is past its `since` with a state to read (`done`, `exited`, `stalled`) or the supervisor's attention raised ([`crate::task_record::TaskRecord::has_news`]), a `facts=1` target whose fact word was noted past its fact edge (a clear is none), or whose session closed — at the first such target (`any`) or once every target is one (`all`). A fact edit never moves `rev`, so a wait without `facts=1` never wakes on one.
+/// `await task`: park until the task records of `targets` have news — a target whose record's rev is past its `since` with a state to read (`done`, `exited`, `stalled`) or an ask raised under a task owner, never a `kind=wait` entry ([`crate::task_record::TaskRecord::has_news`]), a `facts=1` target whose fact word was noted past its fact edge (a clear is none), or whose session closed — at the first such target (`any`) or once every target is one (`all`). A fact edit never moves `rev`, so a wait without `facts=1` never wakes on one.
 pub(crate) fn await_task(
     store: &Store,
     targets: &[TaskTarget<'_>],
@@ -1275,14 +1275,27 @@ pub(crate) fn await_log_seamed(
     }
 }
 
+#[cfg(not(test))]
 static NEXT_TURN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn turn_id_count() -> &'static std::sync::atomic::AtomicU64 {
     #[cfg(test)]
-    if let Some(own) = OWN_TURN_IDS.get() {
-        return own;
+    {
+        OWN_TURN_IDS.with(|cell| {
+            if let Some(own) = cell.get() {
+                own
+            } else {
+                let fresh: &'static std::sync::atomic::AtomicU64 =
+                    Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0)));
+                cell.set(Some(fresh));
+                fresh
+            }
+        })
     }
-    &NEXT_TURN_ID
+    #[cfg(not(test))]
+    {
+        &NEXT_TURN_ID
+    }
 }
 
 #[cfg(test)]
@@ -1348,9 +1361,17 @@ pub(crate) const TURN_ID_RESERVE: u64 = 1 << 12;
 /// The turn-id count a handoff manifest carries: ids minted so far plus [`TURN_ID_RESERVE`], within what a manifest holds.
 #[cfg(any(unix, test))]
 pub(crate) fn turn_ids_for_handoff() -> u64 {
-    turn_ids_minted()
-        .saturating_add(TURN_ID_RESERVE)
-        .min(crate::handoff_carry::MAX_TURN_ID)
+    handoff_ceiling_for(turn_ids_minted())
+}
+
+#[cfg(any(unix, test))]
+const fn handoff_ceiling_for(minted: u64) -> u64 {
+    let sum = minted.saturating_add(TURN_ID_RESERVE);
+    if sum < crate::handoff_carry::MAX_TURN_ID {
+        sum
+    } else {
+        crate::handoff_carry::MAX_TURN_ID
+    }
 }
 
 /// Whether this process has minted a turn id past `ceiling`, the count the attempt's handoff manifest carried: the successor would mint it again, so the Commit stands down (and the next attempt carries a fresh count).
@@ -1915,6 +1936,90 @@ fn press_look(
     }
 }
 
+/// WHAT SHOWED A `turn`'S SUBMIT, its verdict's `submit_by=`: the evidence `submitted=1` rests on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubmitBy {
+    /// A proven codex-alab's own report began a turn after a press made between turns
+    /// ([`codex_began_a_turn`]).
+    Claim,
+    /// The typed text left Claude Code's composer, or the composer gave way to a box.
+    Composer,
+    /// A shell's command block started (an OSC 133/633 `C`).
+    Block,
+    /// The screen moved: content past the press, or the cursor off the row the text was typed on.
+    Screen,
+}
+
+impl SubmitBy {
+    /// Its wire word: `claim`, `composer`, `block`, `screen`.
+    const fn as_str(self) -> &'static str {
+        match self {
+            SubmitBy::Claim => "claim",
+            SubmitBy::Composer => "composer",
+            SubmitBy::Block => "block",
+            SubmitBy::Screen => "screen",
+        }
+    }
+}
+
+/// THE TURN COUNT A PROVEN CODEX-ALAB'S CLAIM MUST PASS, read from the engine's report as the
+/// press is armed ([`ProgramStateReport::turns`]), or `None` while the report standing is in a
+/// turn (`working`, `blocked`). Codex takes an Enter then into its running turn or its queue, and
+/// a turn it begins within the window can be another line's (one it queued earlier, its own
+/// Autopilot's), so no turn begun is this Enter's claim and the screen judges the press.
+///
+/// [`ProgramStateReport::turns`]: aterm_core::terminal::program_state::ProgramStateReport::turns
+fn claim_base(report: aterm_core::terminal::program_state::ProgramStateReport) -> Option<u64> {
+    use aterm_core::terminal::program_state::ProgramStateWord as W;
+    let in_a_turn = report
+        .state
+        .is_some_and(|s| matches!(s.state, W::Working | W::Blocked));
+    (!in_a_turn).then_some(report.turns)
+}
+
+/// WHETHER CODEX BEGAN A TURN SINCE THE PRESS: the engine's report counts a turn begun past
+/// `turns`, its count read at the press while codex stood between turns ([`claim_base`]), and the
+/// report standing names codex. A `working` after a turn's end (or none) begins one; the same
+/// `working` re-sent mid-turn does not, nor does one after a box it answered.
+///
+/// A REPORT SAYS NO MORE THAN THAT A TURN BEGAN, not which line began it: a turn codex's own
+/// Autopilot types at that same moment is taken for the Enter's too.
+fn codex_began_a_turn(
+    report: aterm_core::terminal::program_state::ProgramStateReport,
+    turns: u64,
+) -> bool {
+    report.turns != turns
+        && report
+            .state
+            .is_some_and(|s| s.app == aterm_core::terminal::program_state::ProgramApp::Codex)
+}
+
+/// [`press_look`] for a proven codex-alab between turns: it answers only at codex's own claim
+/// ([`codex_began_a_turn`] past `turns`), read from the engine on every wake rather than from the
+/// status sweep's copy a sweep behind, and notes in `screen` whether the screen showed the press
+/// meanwhile (the watch latched, or the cursor left `typed_row`), which is no submit there: a
+/// popup that took the Enter redraws too. It only stops the presses at the window's close.
+fn claim_look<'a>(
+    term: &'a Arc<Mutex<Terminal>>,
+    id: aterm_core::terminal::WatchId,
+    typed_row: Option<u16>,
+    turns: u64,
+    screen: &'a std::cell::Cell<bool>,
+) -> impl FnMut(std::time::Instant, bool, bool) -> (Option<()>, Option<std::time::Instant>) + 'a {
+    move |now, parked, closing| {
+        let mut t = term_lock(term);
+        fire_idle_unless_parked(&mut t, now, parked);
+        if t.watch_poll(id).is_some() || typed_row.is_some_and(|row| t.cursor().row != row) {
+            screen.set(true);
+        }
+        let claimed = codex_began_a_turn(t.program_state(), turns);
+        if claimed || closing {
+            t.watch_disarm(id);
+        }
+        (claimed.then_some(()), t.watch_next_deadline())
+    }
+}
+
 fn disarm_watch(
     term: &Arc<Mutex<Terminal>>,
     id: aterm_core::terminal::WatchId,
@@ -2301,7 +2406,7 @@ pub(crate) fn turn_preflight(rest: &str) -> Result<Option<crate::session_log::Ca
     Ok(o.cause)
 }
 
-/// `turn [<options>] <text>` (the options: [`TURN_USAGE`]) — one complete human turn against the target session: type `<text>`, submit it with a real keypress, block until the app's response settles, and return the settled screen — `OK <rows> turn submitted=<0|1> status=<settled|timeout|hangup|submitted> seq=<n> id=<n> dur_ms=<n> hash=<hex16>[ typed=<n> pasted=<n>][ yielded_ms=<ms>][ pressed=<n>][ task_rev=<n>][ agent_rev=<n>][ frame=open][ trimmed=<k>]` then `<rows>` text rows (the same rows `text` prints).
+/// `turn [<options>] <text>` (the options: [`TURN_USAGE`]) — one complete human turn against the target session: type `<text>`, submit it with a real keypress, block until the app's response settles, and return the settled screen — `OK <rows> turn submitted=<0|1> status=<settled|timeout|hangup|submitted> seq=<n> id=<n> dur_ms=<n> hash=<hex16>[ submit_by=<claim|composer|block|screen>][ typed=<n> pasted=<n>][ yielded_ms=<ms>][ pressed=<n>][ task_rev=<n>][ agent_rev=<n>][ frame=open][ trimmed=<k>]` then `<rows>` text rows (the same rows `text` prints); `submit_by=` names what showed a verified submit.
 pub(crate) fn cmd_turn(
     term: &Arc<Mutex<Terminal>>,
     store: &Store,
@@ -2686,7 +2791,7 @@ fn turn_attempt(
         }
     }
 
-    let mut submitted = false;
+    let mut submit_by: Option<SubmitBy> = None;
     let mut pressed = 0u32;
     let mut unjudged = false;
     let task_found = task_record_of(ctx).map(|task| (task.rev, task.entered));
@@ -2730,6 +2835,9 @@ fn turn_attempt(
         };
         // No composer and no command block to read: the screen alone shows the program took the line.
         let by_screen = composer_key.is_none() && !submit_verify_block;
+        // A proven codex-alab between turns says itself when it took the line: its report
+        // beginning a turn within the press's window, and nothing else (`claim_base`).
+        let by_claim = auto_mode && by_screen && proven_codex_alab(ctx);
         for press_no in 0..presses {
             // A re-press is for an Enter the program read and swallowed; one still unread would
             // only queue another behind it (`input_stall::repress_would_queue`).
@@ -2750,13 +2858,14 @@ fn turn_attempt(
                 return cut;
             }
             let window = deadline.min(Instant::now() + Duration::from_millis(submit_window_ms));
-            let (base_started, typed_row, mut id) = {
+            let (base_started, typed_row, base_turns, mut id) = {
                 let mut t = term_lock(term);
                 let base = t.started_command_seq();
                 let row = by_screen.then(|| t.cursor().row);
+                let turns = by_claim.then(|| claim_base(t.program_state())).flatten();
                 let after = t.content_seq();
                 match t.watch(WatcherSpec::SeqAdvanced { after }, Instant::now()) {
-                    Some(id) => (base, row, id),
+                    Some(id) => (base, row, turns, id),
                     None => return format!("ERR {WAITS_FULL}\n"),
                 }
             };
@@ -2800,77 +2909,110 @@ fn turn_attempt(
             pressed += 1;
             let mut advanced = false;
             let mut composer_gone = false;
-            loop {
+            // A press the screen showed but codex began no turn for: no submit, and no press more,
+            // which would act on what the Enter opened (a popup's pick).
+            let mut unclaimed = false;
+            if let Some(turns) = base_turns {
+                // The claim alone ends the wait and alone is the submit: a redraw (a popup) is no
+                // turn codex began.
+                let screen = std::cell::Cell::new(false);
                 match Park::new(&sub, &exited_now, OnHangup::Finish, stretch).run(
                     window,
-                    press_look(
-                        term,
-                        id,
-                        (submit_verify_block.then_some(base_started), typed_row),
-                    ),
+                    claim_look(term, id, typed_row, turns, &screen),
                     disarm_watch(term, id),
                 ) {
                     Parked::Exited => return "ERR exited\n".to_string(),
-                    Parked::Done(PressLook::Started | PressLook::Moved) => {
-                        submitted = true;
-                        break;
-                    }
-                    Parked::Done(PressLook::Latched) => {
-                        advanced = true;
-                        let mut t = term_lock(term);
-                        if let Some(key) = composer_key.as_deref() {
-                            match composer_after_press(&t, key) {
-                                ComposerAfterPress::Left => {
-                                    submitted = true;
-                                    break;
+                    Parked::Done(()) => submit_by = Some(SubmitBy::Claim),
+                    Parked::Deadline | Parked::HungUp => unclaimed = screen.get(),
+                }
+            } else {
+                loop {
+                    match Park::new(&sub, &exited_now, OnHangup::Finish, stretch).run(
+                        window,
+                        press_look(
+                            term,
+                            id,
+                            (submit_verify_block.then_some(base_started), typed_row),
+                        ),
+                        disarm_watch(term, id),
+                    ) {
+                        Parked::Exited => return "ERR exited\n".to_string(),
+                        Parked::Done(PressLook::Started) => {
+                            submit_by = Some(SubmitBy::Block);
+                            break;
+                        }
+                        Parked::Done(PressLook::Moved) => {
+                            submit_by = Some(SubmitBy::Screen);
+                            break;
+                        }
+                        Parked::Done(PressLook::Latched) => {
+                            advanced = true;
+                            let mut t = term_lock(term);
+                            if let Some(key) = composer_key.as_deref() {
+                                match composer_after_press(&t, key) {
+                                    ComposerAfterPress::Left => {
+                                        submit_by = Some(SubmitBy::Composer);
+                                        break;
+                                    }
+                                    ComposerAfterPress::Gone => composer_gone = true,
+                                    ComposerAfterPress::Holds => composer_gone = false,
+                                    ComposerAfterPress::Unfinished => {}
                                 }
-                                ComposerAfterPress::Gone => composer_gone = true,
-                                ComposerAfterPress::Holds => composer_gone = false,
-                                ComposerAfterPress::Unfinished => {}
+                            } else if !submit_verify_block {
+                                submit_by = Some(SubmitBy::Screen);
+                                break;
+                            } else if t.started_command_seq() > base_started {
+                                submit_by = Some(SubmitBy::Block);
+                                break;
                             }
-                        } else if !submit_verify_block || t.started_command_seq() > base_started {
-                            submitted = true;
+                            if Instant::now() >= window {
+                                break;
+                            }
+                            let after = t.content_seq();
+                            match t.watch(WatcherSpec::SeqAdvanced { after }, Instant::now()) {
+                                Some(nid) => id = nid,
+                                None => return format!("ERR {WAITS_FULL}\n"),
+                            }
+                        }
+                        closed @ (Parked::Deadline | Parked::HungUp) => {
+                            if let Some(key) = composer_key.as_deref() {
+                                match composer_after_press(&term_lock(term), key) {
+                                    ComposerAfterPress::Left => {
+                                        submit_by = Some(SubmitBy::Composer);
+                                    }
+                                    ComposerAfterPress::Gone => composer_gone = true,
+                                    ComposerAfterPress::Holds => composer_gone = false,
+                                    ComposerAfterPress::Unfinished => {}
+                                }
+                            } else if matches!(closed, Parked::HungUp)
+                                && submit_verify_block
+                                && term_lock(term).started_command_seq() > base_started
+                            {
+                                submit_by = Some(SubmitBy::Block);
+                            }
                             break;
                         }
-                        if Instant::now() >= window {
-                            break;
-                        }
-                        let after = t.content_seq();
-                        match t.watch(WatcherSpec::SeqAdvanced { after }, Instant::now()) {
-                            Some(nid) => id = nid,
-                            None => return format!("ERR {WAITS_FULL}\n"),
-                        }
-                    }
-                    closed @ (Parked::Deadline | Parked::HungUp) => {
-                        if let Some(key) = composer_key.as_deref() {
-                            match composer_after_press(&term_lock(term), key) {
-                                ComposerAfterPress::Left => submitted = true,
-                                ComposerAfterPress::Gone => composer_gone = true,
-                                ComposerAfterPress::Holds => composer_gone = false,
-                                ComposerAfterPress::Unfinished => {}
-                            }
-                        } else if matches!(closed, Parked::HungUp)
-                            && submit_verify_block
-                            && term_lock(term).started_command_seq() > base_started
-                        {
-                            submitted = true;
-                        }
-                        break;
                     }
                 }
             }
-            if !submitted && advanced && auto_mode && base_started == 0 && composer_key.is_none() {
-                submitted = true;
+            if submit_by.is_none()
+                && advanced
+                && auto_mode
+                && base_started == 0
+                && composer_key.is_none()
+            {
+                submit_by = Some(SubmitBy::Screen);
             }
-            if !submitted && composer_gone {
-                submitted = true;
+            if submit_by.is_none() && composer_gone {
+                submit_by = Some(SubmitBy::Composer);
             }
-            if submitted || Instant::now() >= deadline {
+            if submit_by.is_some() || unclaimed || Instant::now() >= deadline {
                 break;
             }
         }
-        unjudged = by_screen && !submitted && pressed > 0;
+        unjudged = by_screen && submit_by.is_none() && pressed > 0;
     }
+    let submitted = submit_by.is_some();
 
     drop(committed);
 
@@ -2979,6 +3121,10 @@ fn turn_attempt(
         "turn submitted={} status={status} seq={seq} id={turn_id} dur_ms={dur_ms} hash={screen_hash:016x}",
         u8::from(submitted)
     );
+    if let Some(by) = submit_by {
+        use std::fmt::Write as _;
+        let _ = write!(verdict, " submit_by={}", by.as_str());
+    }
     if typed {
         use std::fmt::Write as _;
         let _ = write!(verdict, " typed={typed_keys} pasted={pasted_graphemes}");
@@ -2987,7 +3133,8 @@ fn turn_attempt(
         use std::fmt::Write as _;
         let _ = write!(verdict, " yielded_ms={ms}");
     }
-    // A screen that showed no press is no proof the program left the line: the Enters are named.
+    // A screen that showed no press is no proof the program left the line, nor one a codex-alab
+    // between turns began no turn for: the Enters are named.
     if submit_matcher.is_some() || unjudged {
         use std::fmt::Write as _;
         let _ = write!(verdict, " pressed={pressed}");
@@ -3036,6 +3183,24 @@ fn read_as_claude(ctx: &SessionCtx) -> bool {
         Some(aterm_phase::Program::Claude) => true,
         Some(
             aterm_phase::Program::Codex
+            | aterm_phase::Program::Grok
+            | aterm_phase::Program::Kimi
+            | aterm_phase::Program::Agy
+            | aterm_phase::Program::Muse
+            | aterm_phase::Program::Generic,
+        )
+        | None => false,
+    }
+}
+
+/// Whether the tab's agent is a codex-alab aterm has proven ([`crate::harness_host::admitted`]:
+/// a proven self-claim, aterm's copy of one, or an ALab image leading the group), whose own
+/// OSC 7501 report a `turn` reads as its submit ([`codex_began_a_turn`]).
+fn proven_codex_alab(ctx: &SessionCtx) -> bool {
+    match crate::harness_host::admitted(ctx) {
+        Some(aterm_phase::Program::Codex) => true,
+        Some(
+            aterm_phase::Program::Claude
             | aterm_phase::Program::Grok
             | aterm_phase::Program::Kimi
             | aterm_phase::Program::Agy
@@ -3651,7 +3816,7 @@ fn harness_act_request(rest: &str) -> Option<Result<HarnessActRequest<'_>, &'sta
     Some(parsed.ok_or(HARNESS_ACT_USAGE))
 }
 
-/// `meta set harness_act <act> [until_us=<n>]` — an agent that supervises itself records an act it took on the session, so who is driving a session is seen per session.
+/// `meta set harness_act <act> [until_us=<n>]` — an agent that supervises itself records an act it took on the session, so who is driving a session is seen per session. AN ADMITTED ACT IS THE HOLDER'S, SHOWN AND BOOKED AS ITS OWN: queued for the window's glass (`SessionTimeline::queue_self_act`: the chip's act and the trail, worded as the holder's) and booked in the session's ledger once the session's locks are let go (`crate::self_claim::book_act`), which Settings ▸ Harness counts under the holder and `aterm harness ledger` lists; a standing face's act told again (`SessionTimeline::self_act_resent`) is answered as before and neither shown nor booked twice. A refusal (`ERR denied`, an expired or busy act) and a lease (`meta prepare harness_act`) do neither.
 pub(crate) fn cmd_meta_harness_act(
     ctx: &SessionCtx,
     snapshot: Option<HarnessActSnapshot>,
@@ -3720,6 +3885,7 @@ pub(super) fn cmd_meta_harness_act_with_clock(
             false,
         ));
     };
+    let resent;
     {
         let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         let now = now_us();
@@ -3740,8 +3906,20 @@ pub(super) fn cmd_meta_harness_act_with_clock(
                 return Some(("ERR busy harness_act\n".to_string(), false));
             }
         }
-        timeline.note_harness_act(act, &holder, by);
         let face = crate::harness_task::self_claim_act_face(act);
+        resent = timeline.self_act_resent(
+            act,
+            &holder,
+            face,
+            snapshot.map(|point| point.mark.program_turns),
+        );
+        timeline.note_harness_act(act, &holder, by);
+        if !resent {
+            timeline.queue_self_act(crate::session_timeline::SelfAct {
+                act: aterm_agent::harness::acts::self_claim_sort(act).act,
+                holder: holder.clone(),
+            });
+        }
         if face.is_some_and(crate::harness_task::holds_until_another_turn) {
             let typed_at = timeline.take_typed_turn();
             if let Some(point) = snapshot {
@@ -3778,6 +3956,10 @@ pub(super) fn cmd_meta_harness_act_with_clock(
         }
         let _ = timeline.slog_take_wake();
     }
+    drop(meta);
+    if !resent {
+        crate::self_claim::book_act(ctx.self_id.as_str(), &holder, act);
+    }
     Some(("OK\n".to_string(), true))
 }
 
@@ -3787,6 +3969,15 @@ pub(crate) fn harness_act_face(rest: &str) -> Option<aterm_agent::harness::acts:
         return None;
     };
     crate::harness_task::self_claim_act_face(act)
+}
+
+/// Whether `meta <rest>` is a well-formed `set harness_act <act>`: an admitted one queued its act
+/// for the window's glass (`HarnessFact::SelfAct`).
+pub(crate) fn is_harness_act_set(rest: &str) -> bool {
+    matches!(
+        harness_act_request(rest),
+        Some(Ok(HarnessActRequest::Set { .. }))
+    )
 }
 
 /// Whether `meta <rest>` is a `set harness_act` that reads the session's counts ([`HarnessActSnapshot`], under `crate::act_barrier`): a face that stands until another turn (its mark, and a point left to a person's rest check) or an opening act that types a turn ([`aterm_agent::harness::acts::self_claim_types_turn`]). Any other act reads none and waits for no barrier.
@@ -3801,6 +3992,292 @@ pub(crate) fn harness_act_reads_counts(rest: &str) -> bool {
         }
         _ => false,
     }
+}
+
+const HARNESS_HELD_USAGE: &str =
+    "ERR usage: meta set harness_held same-reply|no-work | meta unset harness_held\n";
+
+/// The stop a `meta set harness_held <arm>` tells (`Some`), or a `meta unset harness_held`'s lift
+/// (`None`); `None` outright for every other `meta` line.
+fn harness_held_request(
+    rest: &str,
+) -> Option<Result<Option<aterm_agent::harness::acts::HeldBy>, &'static str>> {
+    let mut toks = rest.split_whitespace();
+    let sub = toks.next()?;
+    if !matches!(sub, "set" | "unset") || toks.next() != Some("harness_held") {
+        return None;
+    }
+    let held = match sub {
+        "set" => toks
+            .next()
+            .and_then(aterm_agent::harness::acts::HeldBy::of_word)
+            .map(Some),
+        _ => Some(None),
+    };
+    Some(
+        held.filter(|_| toks.next().is_none())
+            .ok_or(HARNESS_HELD_USAGE),
+    )
+}
+
+/// `meta set harness_held <same-reply|no-work>` / `meta unset harness_held` — an agent that supervises itself tells that ITS OWN TYPING STOPPED, by which arm of ruling F's hold ([`aterm_agent::harness::acts::HeldBy::word`]), or goes on again, so `status held=` says its stop as it says aterm's own. THE STOP IS ITS CLAIM'S: admitted only from the session's standing proven self-claim ([`self_claim_write`]: by the proof `meta set harness_act` takes, that claim's connection or a connection its very process proves), else `ERR denied`; kept with that claim's proof ([`crate::session_timeline::SessionMeta::self_held`]) and gone wherever a wait written under it lapses (the claim released, replaced or gone with its process, its connection closed), so a new claim starts with none; said while the claim stands ([`crate::App::shown_stop`]). `OK` whether or not it moved; only a move is a change, which wakes the window.
+pub(crate) fn cmd_meta_harness_held(
+    ctx: &SessionCtx,
+    conn: Option<u64>,
+    prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
+    rest: &str,
+) -> Option<(String, bool)> {
+    let held = match harness_held_request(rest)? {
+        Ok(held) => held,
+        Err(usage) => return Some((usage.to_string(), false)),
+    };
+    let Some((holder, moved)) = self_claim_write(ctx, conn, prove, |meta, proven| {
+        meta.tell_self_held(proven, held)
+    }) else {
+        return Some(("ERR denied\n".to_string(), false));
+    };
+    if moved {
+        aterm_log::info!(
+            "self-claim @{}: {holder} told its stop: {}",
+            ctx.self_id.as_str(),
+            held.map_or("-", aterm_agent::harness::acts::HeldBy::word)
+        );
+    }
+    Some(("OK\n".to_string(), moved))
+}
+
+/// A WRITE ONLY THE SESSION'S STANDING PROVEN SELF-CLAIM MAKES (`meta set harness_held`, `meta set harness_land`, `meta set harness_needs`): admitted by the proof `meta set harness_act` takes — the line came on that claim's connection, or `prove` names the very proof of the claim's process — and `write` runs under the meta lock with the claim's proof only where neither [`crate::session_timeline::SessionMeta::supervisor_revision`] nor the live claim's proof moved since the look (a claim that moved between the look and the write admits nothing). The holder and whether `write` moved what it keeps; `None` for anything else, which the verb answers `ERR denied`.
+fn self_claim_write(
+    ctx: &SessionCtx,
+    conn: Option<u64>,
+    prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
+    write: impl FnOnce(&mut crate::session_timeline::SessionMeta, &crate::self_claim::Proven) -> bool,
+) -> Option<(String, bool)> {
+    let standing = {
+        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+        meta.live_claim(crate::metrics::now_us()).and_then(|claim| {
+            let proven = claim.proven.as_ref()?;
+            let bound = conn.is_some() && claim.conn == conn;
+            Some((
+                claim.holder.clone(),
+                proven.clone(),
+                bound,
+                meta.supervisor_revision,
+            ))
+        })
+    };
+    let (holder, proven, _, revision) = standing
+        .filter(|(holder, proven, bound, _)| *bound || prove(holder).as_ref() == Some(proven))?;
+    let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    if meta.supervisor_revision != revision
+        || meta
+            .live_claim(crate::metrics::now_us())
+            .and_then(|claim| claim.proven.as_ref())
+            != Some(&proven)
+    {
+        return None;
+    }
+    let moved = write(&mut meta, &proven);
+    Some((holder, moved))
+}
+
+const HARNESS_LAND_USAGE: &str = "ERR usage: meta set harness_land since=<ms> nudges=<n> \
+     [read=1 legs=\u{2026} open=\u{2026} changed=\u{2026} untracked=\u{2026} stashes=\u{2026} \
+     unpushed=\u{2026} unlanded=\u{2026}] | meta unset harness_land\n";
+
+/// The keys of a `meta set harness_land` line, each at most once: the two every line carries, then `read`'s group.
+const HARNESS_LAND_KEYS: [&str; 10] = [
+    "since",
+    "nudges",
+    "read",
+    "legs",
+    "open",
+    "changed",
+    "untracked",
+    "stashes",
+    "unpushed",
+    "unlanded",
+];
+
+/// The Land hold a `meta set harness_land …` tells (`Some`), or a `meta unset harness_land`'s lift (`None`); `None` outright for every other `meta` line, and the usage for a malformed one ([`land_held_of`]; an unset with any token after it).
+fn harness_land_request(
+    rest: &str,
+) -> Option<Result<Option<aterm_agent::harness::acts::LandHeld>, &'static str>> {
+    let mut toks = rest.split_whitespace();
+    let sub = toks.next()?;
+    if !matches!(sub, "set" | "unset") || toks.next() != Some("harness_land") {
+        return None;
+    }
+    let held = match sub {
+        "set" => land_held_of(toks).map(Some),
+        _ => toks.next().is_none().then_some(None),
+    };
+    Some(held.ok_or(HARNESS_LAND_USAGE))
+}
+
+/// THE HOLD A `meta set harness_land` LINE'S TOKENS TELL, read strictly: each `key=value` of [`HARNESS_LAND_KEYS`] at most once, in any order; `since=` (unix ms, ASCII digits) and `nudges=` on every line; `read=1` with `legs=` (each [`aterm_agent::harness::acts::HoldLeg::word`], comma-separated) and neither without the other; `open=` and the five repository counts only beside `read=1`. A count is ASCII digits, held at its field's largest value past it. `open=`'s words are percent-encoded and comma-separated, and only the first four [`aterm_agent::harness::acts::OpenWord::of`] knows are kept, the rest dropped, as the strict reading keeps them. `None` for an unknown token, a token twice, a leg word no leg has, a count or a `since` that is no number, a `read=` other than `1`, a missing `since=` or `nudges=`, `read=1` without `legs=` or `legs=` without it, and `open=` or a count with no `read=1`.
+fn land_held_of<'a>(
+    toks: impl Iterator<Item = &'a str>,
+) -> Option<aterm_agent::harness::acts::LandHeld> {
+    use aterm_agent::harness::acts::{HoldLeg, LandHeld, OpenWord};
+    let digits = |value: &str| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
+    let count = |value: &str| digits(value).then(|| value.parse::<u64>().unwrap_or(u64::MAX));
+    let short = |value: &str| count(value).map(|n| u16::try_from(n).unwrap_or(u16::MAX));
+    let mut held = LandHeld::default();
+    let mut seen = [false; HARNESS_LAND_KEYS.len()];
+    for tok in toks {
+        let (key, value) = tok.split_once('=')?;
+        let at = HARNESS_LAND_KEYS.iter().position(|known| *known == key)?;
+        if std::mem::replace(&mut seen[at], true) {
+            return None;
+        }
+        match key {
+            "since" => held.since_ms = Some(value.parse::<i64>().ok().filter(|_| digits(value))?),
+            "nudges" => held.nudges = count(value).map(|n| u32::try_from(n).unwrap_or(u32::MAX))?,
+            "read" if value == "1" => held.read = true,
+            "read" => return None,
+            "legs" => {
+                for word in value.split(',') {
+                    held.legs |= HoldLeg::of_word(word)?.bit();
+                }
+            }
+            "open" => {
+                let known = value
+                    .split(',')
+                    .filter_map(|word| OpenWord::of(&aterm_control::wire::pct_decode(word)));
+                for (slot, word) in held.open.iter_mut().zip(known) {
+                    *slot = Some(word);
+                }
+            }
+            "changed" => held.changed = short(value)?,
+            "untracked" => held.untracked = short(value)?,
+            "stashes" => held.stashes = short(value)?,
+            "unpushed" => held.unpushed = short(value)?,
+            _ => held.unlanded = short(value)?,
+        }
+    }
+    let [since, nudges, read, legs, rest @ ..] = seen;
+    (since && nudges && read == legs && (read || !rest.contains(&true))).then_some(held)
+}
+
+/// `meta set harness_land since=<ms> nudges=<n> [read=1 legs=… [open=…] [changed=… untracked=… stashes=… unpushed=… unlanded=…]]` / `meta unset harness_land` — an agent that supervises itself tells WHY ITS OWN LAND STILL HOLDS, as aterm's loop tells its own ([`aterm_agent::harness::acts::LandHeld`], read by [`land_held_of`]), or that no landing holds, so `status land_held= land_nudges= land_since=`, the menu bar's `landing` and every hold line say its hold as they say aterm's own. THE HOLD IS ITS CLAIM'S, as `meta set harness_held`'s stop is ([`self_claim_write`], else `ERR denied`): kept with that claim's proof ([`crate::session_timeline::SessionMeta::self_land`]), NEVER on aterm's own glass (which stays cleared beside a proven self-claim), and gone wherever that stop goes; shown while the claim stands ([`crate::App::shown_hold`]). `OK` whether or not it moved; only a move is a change, which wakes the window.
+pub(crate) fn cmd_meta_harness_land(
+    ctx: &SessionCtx,
+    conn: Option<u64>,
+    prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
+    rest: &str,
+) -> Option<(String, bool)> {
+    let held = match harness_land_request(rest)? {
+        Ok(held) => held,
+        Err(usage) => return Some((usage.to_string(), false)),
+    };
+    let Some((holder, moved)) = self_claim_write(ctx, conn, prove, |meta, proven| {
+        meta.tell_self_land(proven, held)
+    }) else {
+        return Some(("ERR denied\n".to_string(), false));
+    };
+    if moved {
+        aterm_log::info!(
+            "self-claim @{}: {holder} told its Land hold:{}",
+            ctx.self_id.as_str(),
+            crate::session_status::land_fields(held)
+        );
+    }
+    Some(("OK\n".to_string(), moved))
+}
+
+const HARNESS_NEEDS_USAGE: &str = "ERR usage: meta set harness_needs entry=<pct text> \
+     need=<pct need> [need=<pct need> \u{2026}] | meta unset harness_needs\n";
+
+/// The most needs one `meta set harness_needs` line tells: the first 32 of the worker's set, in its order.
+pub(crate) const HARNESS_NEEDS_MAX: usize = 32;
+
+/// The NEEDS YOU set a `meta set harness_needs …` tells (`Some`), or a `meta unset harness_needs`'s take-down (`None`); `None` outright for every other `meta` line, and the usage for a malformed one ([`harness_needs_of`]; an unset with any token after it).
+fn harness_needs_request(
+    rest: &str,
+) -> Option<Result<Option<Arc<crate::needs::HarnessNeeds>>, &'static str>> {
+    let mut toks = rest.split_whitespace();
+    let sub = toks.next()?;
+    if !matches!(sub, "set" | "unset") || toks.next() != Some("harness_needs") {
+        return None;
+    }
+    let told = match sub {
+        "set" => harness_needs_of(toks).map(|told| Some(Arc::new(told))),
+        _ => toks.next().is_none().then_some(None),
+    };
+    Some(told.ok_or(HARNESS_NEEDS_USAGE))
+}
+
+/// Whether `meta <rest>` is a `set` or `unset harness_needs` line: an admitted one that moved what a reader reads is a needs fact for the window (`HarnessFact::Needs`), as aterm's own loop's tell is.
+pub(crate) fn is_harness_needs(rest: &str) -> bool {
+    harness_needs_request(rest).is_some()
+}
+
+/// THE SET A `meta set harness_needs` LINE'S TOKENS TELL, read strictly: `entry=` exactly once (the text of the `owner=needs` entry the set describes) and `need=` one to [`HARNESS_NEEDS_MAX`] times, in the worker's order, each value percent-decoded strictly ([`pct_strict`]), a need at most [`crate::needs::NEED_TOLD_MAX`] bytes and non-empty once folded as every reader folds it ([`crate::needs::fold_clip`], which drops whitespace, control and forbidden format characters); the entry's text kept through the presentation sanitizer ([`crate::needs::HarnessNeeds::told`]). `None` for an unknown token, no `entry=`, `entry=` twice or empty (nothing left once sanitized included), no `need=`, a 33rd, an empty need (nothing left once folded included) or one past `NEED_TOLD_MAX`, a bad percent escape and an escape that decodes to no UTF-8.
+fn harness_needs_of<'a>(toks: impl Iterator<Item = &'a str>) -> Option<crate::needs::HarnessNeeds> {
+    let mut entry = None;
+    let mut needs = Vec::new();
+    for tok in toks {
+        match tok.split_once('=')? {
+            ("entry", value) if entry.is_none() => {
+                entry = Some(pct_strict(value).filter(|text| !text.is_empty())?);
+            }
+            ("need", value) if needs.len() < HARNESS_NEEDS_MAX => {
+                needs.push(pct_strict(value).filter(|need| {
+                    need.len() <= crate::needs::NEED_TOLD_MAX
+                        && !crate::needs::fold_clip(need, crate::needs::NEED_TOLD_MAX).is_empty()
+                })?)
+            }
+            _ => return None,
+        }
+    }
+    crate::needs::HarnessNeeds::told(&needs, &entry?)
+}
+
+/// `value` PERCENT-DECODED STRICTLY: every `%` begins two hex digits (either case), any other byte stands for itself, and the bytes decoded are UTF-8; `None` for anything else, where [`aterm_control::wire::pct_decode`] passes a stray `%` through and decodes bad UTF-8 lossily.
+fn pct_strict(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while let Some(&byte) = bytes.get(at) {
+        if byte == b'%' {
+            let hex = |at: usize| bytes.get(at).and_then(|b| char::from(*b).to_digit(16));
+            let (hi, lo) = (hex(at + 1)?, hex(at + 2)?);
+            out.push(u8::try_from((hi << 4) | lo).ok()?);
+            at += 3;
+        } else {
+            out.push(byte);
+            at += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// `meta set harness_needs entry=<pct text> need=<pct need> [need=<pct need> …]` / `meta unset harness_needs` — an agent that supervises itself tells EVERY NEED ITS `owner=needs` ENTRY STANDS FOR, whole and in its order ([`harness_needs_of`]), or that the entry went, so the menu bar's rows one level in, the hover's lines and `status needs_told=` say its set as they say aterm's own loop's, where its entry alone gives the first need and a count. THE SET IS ITS CLAIM'S, as `meta set harness_held`'s stop is ([`self_claim_write`], else `ERR denied`): told as aterm's own loop's is (`HarnessNeeds::told` then `ToldNeeds::tell` beside the session's `owner=needs` entry as stored now, [`crate::session_timeline::SessionMeta::tell_self_needs`]), so a set told before its entry stands waits for it and one told for another entry's text is never read; kept with that claim's proof, NEVER in the timeline's set (aterm's own loop's), and gone wherever that stop goes; read while the claim stands ([`crate::needs::told_of`]). `OK` whether or not it moved; only a move of what a reader reads beside the standing entry is a change, which wakes the window.
+pub(crate) fn cmd_meta_harness_needs(
+    ctx: &SessionCtx,
+    conn: Option<u64>,
+    prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
+    rest: &str,
+) -> Option<(String, bool)> {
+    let told = match harness_needs_request(rest)? {
+        Ok(told) => told,
+        Err(usage) => return Some((usage.to_string(), false)),
+    };
+    let count = told.as_ref().map(|told| told.needs().len());
+    let Some((holder, moved)) = self_claim_write(ctx, conn, prove, |meta, proven| {
+        meta.tell_self_needs(proven, told)
+    }) else {
+        return Some(("ERR denied\n".to_string(), false));
+    };
+    if moved {
+        aterm_log::info!(
+            "self-claim @{}: {holder} told its NEEDS YOU set: needs={}",
+            ctx.self_id.as_str(),
+            count.map_or_else(|| "-".to_string(), |n| n.to_string())
+        );
+    }
+    Some(("OK\n".to_string(), moved))
 }
 
 /// `meta set questions|autopilot …` / `meta unset questions|autopilot` from a connection that is not Owner-class: `ERR denied`.
@@ -4906,14 +5383,16 @@ mod tests {
     fn a_count_at_the_manifest_limit_never_wedges_the_commit() {
         let max = crate::handoff_carry::MAX_TURN_ID;
         let minted = max + 1;
-        let ceiling = minted.saturating_add(TURN_ID_RESERVE).min(max);
+        let ceiling = super::handoff_ceiling_for(minted);
         assert_eq!(ceiling, max, "the ceiling is held to the top");
         assert!(!super::past_ceiling(minted, ceiling));
         assert!(!super::past_ceiling(minted + TURN_ID_RESERVE, ceiling));
         let below = max - TURN_ID_RESERVE - 1;
-        assert!(!super::past_ceiling(below, below + TURN_ID_RESERVE));
+        let below_ceiling = super::handoff_ceiling_for(below);
+        assert_eq!(below_ceiling, below + TURN_ID_RESERVE);
+        assert!(!super::past_ceiling(below, below_ceiling));
         assert!(
-            super::past_ceiling(below + TURN_ID_RESERVE + 1, below + TURN_ID_RESERVE),
+            super::past_ceiling(below_ceiling + 1, below_ceiling),
             "negative control: past a ceiling below the top still stands down"
         );
     }
@@ -5298,6 +5777,7 @@ mod tests {
             bells: Default::default(),
             screen_moves: Default::default(),
             job_feed: Default::default(),
+            ran: Default::default(),
             box_banner: Default::default(),
             update_parked: Default::default(),
             watchers: observed.watchers,
@@ -5896,6 +6376,84 @@ mod tests {
             .unwrap()
             .set_state(workers[2].local_id, SessionState::Exited);
         assert_eq!(task_reply(&one(&workers[2], 1)), ("OK 1", vec!["closed"]));
+    }
+
+    /// A WAIT WAKES NO `await task`: codex-alab's automatic wait (`meta set attention
+    /// owner=codex-alab-wait kind=wait`) and aterm's harness waiting out a limit under its own
+    /// owner (`owner=supervisor kind=wait`) leave the worker's record where it stood, so a wait
+    /// past its rev times out with no news, its row naming the newest wait. NEGATIVE CONTROL:
+    /// codex-alab's ask (`owner=codex-alab`, no kind) wakes it with `task_news=1`; its row, and the
+    /// `sessions` row, then name the ask, not the wait written after it.
+    #[test]
+    fn a_wait_entry_never_wakes_await_task_and_an_ask_does() {
+        use crate::task_record::Combine;
+        let store = crate::session_store::new_store();
+        let workers = three_workers(&store);
+        let w = &workers[0];
+        let meta = |rest: &str| cmd_meta(&w.term, &store, w.local_id, &w.ctx, rest).0;
+        let rev = task_record_of(&w.ctx).expect("a record").rev;
+        let wait = |timeout_ms| {
+            await_task(
+                &store,
+                &[TaskTarget {
+                    local_id: w.local_id,
+                    ctx: &w.ctx,
+                    since: Some(rev),
+                    facts: false,
+                    fact_since: None,
+                }],
+                Combine::Any,
+                timeout_ms,
+            )
+        };
+        assert_eq!(
+            meta("set attention owner=codex-alab-wait kind=wait waiting out the usage limit"),
+            "OK\n"
+        );
+        assert_eq!(
+            meta("set attention owner=supervisor kind=wait limited: resets 15:00"),
+            "OK\n"
+        );
+        let quiet = wait(20);
+        assert_eq!(task_reply(&quiet).0, "OK 1 status=timeout", "{quiet}");
+        assert!(
+            quiet.ends_with(" attention=limited:%20resets%2015:00 result_bytes=0 task_news=0\n"),
+            "with no ask, the row names the newest wait: {quiet}"
+        );
+        assert_eq!(task_record_of(&w.ctx).expect("a record").rev, rev);
+
+        assert_eq!(meta("unset attention owner=supervisor"), "OK\n");
+        assert_eq!(
+            meta("set attention owner=codex-alab box: Allow this command?"),
+            "OK\n"
+        );
+        assert_eq!(
+            meta("set attention owner=codex-alab-wait kind=wait waiting out the outage"),
+            "OK\n"
+        );
+        let woke = wait(60_000);
+        assert_eq!(task_reply(&woke), ("OK 1", vec!["working"]), "{woke}");
+        assert!(
+            woke.ends_with(
+                " attention=box:%20Allow%20this%20command? result_bytes=0 task_news=1\n"
+            ),
+            "{woke}"
+        );
+        let roster = sessions_lines(
+            std::slice::from_ref(w),
+            Ok(&[]),
+            crate::autopilot::HarnessPosture::default(),
+            |_| false,
+        );
+        assert!(
+            roster.contains(" attention=box:%20Allow%20this%20command? "),
+            "{roster}"
+        );
+        assert_eq!(
+            w.ctx.meta.lock().unwrap().attention.as_deref(),
+            Some("waiting out the outage"),
+            "the newest entry is still the wait"
+        );
     }
 
     /// THE FACT WORD IS NO NEWS TO A DEFAULT WAIT (the occupancy design's manager door): a
@@ -6527,6 +7085,7 @@ mod tests {
             .unwrap()
             .process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 30\n\x1b]133;C\x07");
         let snapshot = vec![handle(0, &t0), handle(1, &t1)];
+        snapshot[1].ctx.ran.hear_running("sleep");
         let out = sessions_lines(
             &snapshot,
             Err("main-thread reply did not arrive within 30s"),
@@ -6619,6 +7178,17 @@ mod tests {
         );
         let snapshot = vec![handle(0, &term)];
         let rows = vec![row(0, 0, true, true)];
+        let out = sessions_lines(
+            &snapshot,
+            Ok(&rows),
+            crate::autopilot::HarnessPosture::default(),
+            |_| false,
+        );
+        assert!(
+            out.contains(" detail=- path=live "),
+            "nothing named targo heard running yet: {out}"
+        );
+        snapshot[0].ctx.ran.hear_running("targo");
         let out = sessions_lines(
             &snapshot,
             Ok(&rows),
@@ -6747,6 +7317,7 @@ mod tests {
             bells: Default::default(),
             screen_moves: Default::default(),
             job_feed: Default::default(),
+            ran: Default::default(),
             box_banner: Default::default(),
             update_parked: Default::default(),
             watchers: observed.watchers,

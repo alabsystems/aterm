@@ -67,15 +67,6 @@ impl Json {
     }
 
     #[inline]
-    #[must_use]
-    pub fn as_array(&self) -> Option<&[Self]> {
-        match self {
-            Self::Array(items) => Some(items),
-            _ => None,
-        }
-    }
-
-    #[inline]
     pub const fn as_array_mut(&mut self) -> Option<&mut Vec<Self>> {
         match self {
             Self::Array(items) => Some(items),

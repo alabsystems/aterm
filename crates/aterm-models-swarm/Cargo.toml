@@ -1,0 +1,26 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-models-swarm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "aterm's formal models of ALab swarm ledger publishing, lease, pool assignment, join phrases and the membership log (ty_model!)"
+# No tests of its own: `aterm-models` sweeps these models, and `aterm-secrets` holds ledger
+# publishing, lease coordination, its join phrase book and the membership log to them in
+# conformance tests.
+autotests = false
+
+[lib]
+# No unit tests and no doctests live in src/.
+test = false
+doctest = false
+
+[dependencies]
+aterm-spec.workspace = true
+
+[lints]
+workspace = true

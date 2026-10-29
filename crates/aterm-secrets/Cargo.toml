@@ -43,6 +43,9 @@ aterm-toolchain = { workspace = true }
 astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
 aterm-db-core.workspace = true
 aterm-spec-anchor.workspace = true
+# The exceptions digest entry and the step and reason words a credential need's ask is held
+# to (`need::exception`).
+aterm-messages = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 aterm-journal.workspace = true
@@ -59,6 +62,7 @@ ring = { workspace = true, features = ["default"] }
 # The C2SP CCTV vectors that ship zlib-compressed.
 aterm-codec = { workspace = true }
 aterm-models-db.workspace = true
+aterm-models-swarm.workspace = true
 aterm-spec.workspace = true
 
 [lints]

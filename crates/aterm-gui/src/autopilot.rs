@@ -102,7 +102,8 @@ pub(crate) enum AutopilotView {
     AgentOff(aterm_phase::Program),
 }
 
-/// How a chip is tinted (§2.3): Cruise the accent, Land amber, the rest dim.
+/// How a chip is tinted (§2.3): Cruise the accent, Land amber, the off chips their floored dim,
+/// another supervisor's dim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ChipTone {
     /// The theme's accent.
@@ -111,6 +112,8 @@ pub(crate) enum ChipTone {
     Amber,
     /// Dim: the harness's hands are off.
     Dim,
+    /// The off chips' words (`○ off`, `⊘ off`): the dim ink floored to read as words do.
+    Off,
 }
 
 /// The chip while a click's word is being written and read back (§2.3, "changing").
@@ -262,7 +265,7 @@ impl AutopilotView {
         match self {
             Self::Cruise => ChipTone::Accent,
             Self::Land => ChipTone::Amber,
-            Self::Off | Self::MasterOff | Self::Unhosted | Self::AgentOff(_) => ChipTone::Dim,
+            Self::Off | Self::MasterOff | Self::Unhosted | Self::AgentOff(_) => ChipTone::Off,
         }
     }
 
@@ -323,6 +326,24 @@ impl AutopilotView {
 
 /// THE ONE THEME PREDICATE of the harness's persistent glass.
 #[must_use]
+/// Whether aterm's Autopilot carries a session whose program in front is `program`, from its
+/// [`App::session_autopilot_for`] reading: aterm's own live claim (`supervised`), or a codex's
+/// proven self-claim (`self_proven`: codex-alab carries itself under the same Autopilot words).
+/// Admission alone carries nothing.
+pub(crate) const fn carried(
+    program: aterm_phase::Program,
+    supervised: bool,
+    self_proven: bool,
+) -> bool {
+    use aterm_phase::Program as P;
+    // Which programs carry themselves under a proven self-claim: codex-alab alone.
+    let self_carries = match program {
+        P::Codex => true,
+        P::Claude | P::Agy | P::Muse | P::Grok | P::Kimi | P::Generic => false,
+    };
+    supervised || (self_carries && self_proven)
+}
+
 pub(crate) fn harness_theme(
     view: AutopilotView,
     supervised: bool,
@@ -1235,20 +1256,20 @@ mod tests {
             (
                 AutopilotView::Off,
                 "\u{25cb} off",
-                ChipTone::Dim,
+                ChipTone::Off,
                 Some(Autopilot::Cruise),
             ),
             (
                 AutopilotView::MasterOff,
                 "\u{2298} off",
-                ChipTone::Dim,
+                ChipTone::Off,
                 None,
             ),
-            (AutopilotView::Unhosted, "\u{2298} off", ChipTone::Dim, None),
+            (AutopilotView::Unhosted, "\u{2298} off", ChipTone::Off, None),
             (
                 AutopilotView::AgentOff(aterm_phase::Program::Claude),
                 "\u{2298} off",
-                ChipTone::Dim,
+                ChipTone::Off,
                 None,
             ),
         ];
@@ -1334,7 +1355,7 @@ mod tests {
                 assert!(!view.carries());
                 assert_eq!(view.wire(), "off");
                 assert_eq!(view.label(), "\u{2298} off");
-                assert_eq!(view.tone(), ChipTone::Dim);
+                assert_eq!(view.tone(), ChipTone::Off);
                 assert_eq!(
                     wire_field(posture, word, Some(agent)),
                     "off",

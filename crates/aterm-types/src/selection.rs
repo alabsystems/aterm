@@ -50,7 +50,9 @@ impl Ord for SelectionSide {
     }
 }
 
-/// Check if a cell at `(row, col)` is within a linear (non-block) selection.
+/// Check if a cell at `(row, col)` is within a normalized linear (non-block) selection.
+///
+/// Callers must pass normalized reading-order bounds `(start_row, start_col) <= (end_row, end_col)`.
 #[inline]
 #[must_use]
 pub const fn selection_contains_linear(

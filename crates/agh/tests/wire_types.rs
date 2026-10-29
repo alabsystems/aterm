@@ -3,7 +3,7 @@
 // Author: Andrew Yates
 
 //! The wire's types (the plan's §4.6.5–§4.6.7): origins, endpoints, deadlines, requests,
-//! answers, the scripted transport and the credential door's public twin.
+//! answers and the credential door's public twin.
 
 use std::io::Cursor;
 use std::time::Duration;
@@ -11,10 +11,9 @@ use std::time::Duration;
 use agh::identity::Credential;
 use agh::policy::Tier;
 use agh::wire::door::{AuthHeader, is_authorization};
-use agh::wire::scripted::{Scripted, ScriptedTransport};
 use agh::wire::{
-    Deadlines, Endpoints, Method, Origin, OriginRole, Phase, Transport, WireBody, WireError,
-    WireKind, WireRequest, WireResponse, wire_kind_of,
+    Deadlines, Endpoints, Method, Origin, OriginRole, Phase, WireBody, WireKind, WireRequest,
+    WireResponse, wire_kind_of,
 };
 
 use crate::common;
@@ -43,7 +42,11 @@ fn origin_parse_reads_scheme_host_port_and_path() {
     for bad in [
         "https://:@api.github.com/",
         "http://[::1]/",
+        "http://127.0.0.1:0/",
         "http://127.0.0.1:99999/",
+        "https://api.github.com%2e.evil.example/",
+        "https://api.github.com/with space",
+        "https://api.github.com/with\r\ninjection",
         "ftp://example.com/",
     ] {
         assert!(Origin::parse(bad).is_none(), "{bad}");
@@ -262,71 +265,6 @@ fn header_and_header_all() {
     assert_eq!(r.header_all("link").collect::<Vec<_>>(), ["<a>", "<b>"]);
     assert_eq!(r.header("etag"), Some("W/\"x\""));
     assert_eq!(r.header("location"), None);
-}
-
-fn get<'a>(url: &str) -> WireRequest<'a> {
-    WireRequest::new(Method::Get, url, Vec::new(), 1 << 20, Deadlines::JSON)
-}
-
-#[test]
-fn scripted_transport_answers_in_order_and_records() {
-    let transport = ScriptedTransport::new();
-    transport.answer(200, &[("X-One", "1")], b"first");
-    transport.push(Scripted::Fail(WireError {
-        phase: Phase::Sent,
-        kind: WireKind::Reset,
-        detail: "reset".into(),
-    }));
-    let mut first = transport
-        .round_trip(get("http://127.0.0.1/a"))
-        .expect("the first answer");
-    assert_eq!(first.status, 200);
-    assert_eq!(first.read_body(100).expect("body"), b"first");
-    let second = transport
-        .round_trip(get("http://127.0.0.1/b"))
-        .expect_err("the scripted failure");
-    assert_eq!(second.kind, WireKind::Reset);
-    let empty = transport
-        .round_trip(get("http://127.0.0.1/c"))
-        .expect_err("the empty queue");
-    assert_eq!((empty.phase, empty.kind), (Phase::NotSent, WireKind::Local));
-    assert_eq!(transport.remaining(), 0);
-    let urls: Vec<String> = transport.requests().into_iter().map(|r| r.url).collect();
-    assert_eq!(
-        urls,
-        [
-            "http://127.0.0.1/a",
-            "http://127.0.0.1/b",
-            "http://127.0.0.1/c"
-        ]
-    );
-}
-
-#[test]
-fn scripted_transport_reduces_the_credential_and_reads_a_body() {
-    let endpoints = common::scripted_endpoints(PORT);
-    let token = agh_fake::token("scripted");
-    let cred = Credential::for_tests("dev", Tier::Dev, token.as_bytes());
-    let header =
-        AuthHeader::for_origin_for_tests(&cred, &endpoints, endpoints.api()).expect("a header");
-    let transport = ScriptedTransport::new();
-    transport.answer(204, &[], b"");
-    let mut bytes = Cursor::new(b"streamed body".to_vec());
-    let mut req = get(&endpoints.url(OriginRole::Api, "/x"));
-    req.auth = Some(&header);
-    req.body = WireBody::Reader {
-        len: 13,
-        reader: &mut bytes,
-    };
-    transport.round_trip(req).expect("answered");
-    let seen = transport.requests();
-    assert_eq!(seen[0].auth_profile.as_deref(), Some("dev"));
-    assert_eq!(
-        seen[0].auth_fingerprint.as_deref(),
-        Some(cred.fingerprint())
-    );
-    assert_eq!(seen[0].body, b"streamed body");
-    assert!(!format!("{seen:?}").contains(&token));
 }
 
 #[test]

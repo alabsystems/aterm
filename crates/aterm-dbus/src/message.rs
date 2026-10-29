@@ -211,13 +211,13 @@ impl Message {
         let mut w = Writer::new(self.endian, 0);
         w.buf
             .extend_from_slice(&[self.endian.tag(), self.kind as u8, self.flags, 1]);
-        w.u32(body_len);
-        w.u32(self.serial);
-        w.u32(0);
-        w.align(8);
+        w.u32(body_len)?;
+        w.u32(self.serial)?;
+        w.u32(0)?;
+        w.align(8)?;
         let start = w.buf.len();
         let field = |w: &mut Writer, code: u8, value: Value| -> Result<()> {
-            w.align(8);
+            w.align(8)?;
             w.buf.push(code);
             w.value(&Value::variant(value))
         };
@@ -247,7 +247,7 @@ impl Message {
         }
         let fields_len = w.buf.len().saturating_sub(start);
         w.patch_u32(12, fields_len as u32);
-        w.align(8);
+        w.align(8)?;
         w.buf.extend_from_slice(&body);
         if w.buf.len() > MAX_MESSAGE {
             return Err(Error::Invalid("message longer than 128 MiB"));
@@ -493,18 +493,18 @@ mod tests {
         let build = |fields: &[(u8, Value)], kind: Kind| {
             let mut w = Writer::new(Endian::Little, 0);
             w.buf.extend_from_slice(&[b'l', kind as u8, 0, 1]);
-            w.u32(0);
-            w.u32(5);
-            w.u32(0);
-            w.align(8);
+            w.u32(0).unwrap();
+            w.u32(5).unwrap();
+            w.u32(0).unwrap();
+            w.align(8).unwrap();
             for (code, value) in fields {
-                w.align(8);
+                w.align(8).unwrap();
                 w.buf.push(*code);
                 w.value(&Value::variant(value.clone())).unwrap();
             }
             let len = w.buf.len() - 16;
             w.patch_u32(12, len as u32);
-            w.align(8);
+            w.align(8).unwrap();
             w.buf
         };
         let path = || Value::path("/a").unwrap();

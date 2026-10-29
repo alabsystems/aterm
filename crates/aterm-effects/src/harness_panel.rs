@@ -505,9 +505,23 @@ pub const fn panel_ink(
             }
         }
         PanelMark::BarEmpty | PanelMark::Name | PanelMark::Pointer => {
-            let letter = palette.letter(x, dark);
-            let fresh = mix_rgb(letter, cell_fg, 1.0 - sat.clamp(0.0, 1.0));
-            match_luminance(fresh, cell_fg)
+            let s = sat.clamp(0.0, 1.0);
+            let fg = cell_fg & 0x00FF_FFFF;
+            if s <= 0.0 {
+                fg
+            } else {
+                let letter = palette.letter(x, dark);
+                if letter == fg {
+                    fg
+                } else {
+                    let fresh = if s >= 1.0 {
+                        letter
+                    } else {
+                        mix_rgb(letter, fg, 1.0 - s)
+                    };
+                    match_luminance(fresh, fg)
+                }
+            }
         }
     }
 }

@@ -106,6 +106,13 @@ pub(crate) const fn light_ink_vivid_over_floor(
 ) -> u32 {
     use crate::color_math::rgb2hsv;
     let bold = light_ink_bold(rgb & 0x00FF_FFFF);
+    if a_max == 0 {
+        return bold;
+    }
+    let table = crate::color_math::relative_luminance_table();
+    if crate::color_math::relative_luminance_with(table, over_at(theme_bg, bold, a_max)) >= floor {
+        return bold;
+    }
     let r = (bold >> 16) & 0xff;
     let g = (bold >> 8) & 0xff;
     let b = bold & 0xff;
@@ -119,17 +126,13 @@ pub(crate) const fn light_ink_vivid_over_floor(
         }
         ch(bold, k, 16) | ch(bold, k, 8) | ch(bold, k, 0)
     }
-    let table = crate::color_math::relative_luminance_table();
     let top = if peak == 0 { 1.0 } else { 255.0 / peak as f32 };
     let top_rgb = scaled(bold, top);
-    if a_max == 0
-        || rgb2hsv(bold).1 < VIVID_LIFT_CHROMA_MIN
-        || crate::color_math::relative_luminance_with(table, over_at(theme_bg, bold, a_max))
-            >= floor
+    if rgb2hsv(bold).1 < VIVID_LIFT_CHROMA_MIN
         || crate::color_math::relative_luminance_with(table, over_at(theme_bg, top_rgb, a_max))
             < floor
     {
-        return light_ink_over_floor(rgb, theme_bg, a_max, floor);
+        return ink_over_floor_from(bold, theme_bg, a_max, floor);
     }
     let (mut lo, mut hi) = (1.0f32, top);
     let (mut lo_rgb, mut hi_rgb) = (bold, top_rgb);
@@ -205,9 +208,19 @@ pub(crate) const fn ink_over_floor_from(ink: u32, theme_bg: u32, a_max: u8, floo
         } else {
             (1.0, 0x00FF_FFFF)
         };
-    if !crate::rainbow_kitty::ribbon::seen(over_at(theme_bg, ink, a_max), theme_bg) {
+    let linear = &table.linear;
+    let bg_lin = crate::rainbow_kitty::ribbon::bg_linear_rgb(linear, theme_bg);
+    if !crate::rainbow_kitty::ribbon::seen_with_bg_lin(
+        linear,
+        over_at(theme_bg, ink, a_max),
+        bg_lin,
+    ) {
         ink
-    } else if crate::rainbow_kitty::ribbon::seen(over_at(theme_bg, bar_rgb, a_max), theme_bg) {
+    } else if crate::rainbow_kitty::ribbon::seen_with_bg_lin(
+        linear,
+        over_at(theme_bg, bar_rgb, a_max),
+        bg_lin,
+    ) {
         bar_rgb
     } else {
         let (mut lo, mut hi) = (0.0f32, 1.0f32);
@@ -222,7 +235,11 @@ pub(crate) const fn ink_over_floor_from(ink: u32, theme_bg: u32, a_max: u8, floo
             } else if hi_known && mid_rgb == hi_rgb {
                 true
             } else {
-                !crate::rainbow_kitty::ribbon::seen(over_at(theme_bg, mid_rgb, a_max), theme_bg)
+                !crate::rainbow_kitty::ribbon::seen_with_bg_lin(
+                    linear,
+                    over_at(theme_bg, mid_rgb, a_max),
+                    bg_lin,
+                )
             };
             if matches {
                 hi = mid;
@@ -315,7 +332,13 @@ impl NightGround {
     #[inline]
     #[must_use]
     pub(crate) const fn alpha(self, s: f32) -> f32 {
-        NIGHT_GROUND_PEAK * (1.0 - crate::color_math::exp_f32(-s.max(0.0) / self.tau.max(0.1)))
+        Self::alpha_with_inv_tau(s, 1.0 / self.tau.max(0.1))
+    }
+
+    #[inline]
+    #[must_use]
+    const fn alpha_with_inv_tau(s: f32, inv_tau: f32) -> f32 {
+        NIGHT_GROUND_PEAK * (1.0 - crate::color_math::exp_f32(-s.max(0.0) * inv_tau))
     }
 }
 
@@ -359,13 +382,14 @@ pub(crate) const fn night_ground(page: u32, family: &[u32]) -> Option<NightGroun
     #[inline]
     const fn passes(p: [f32; 3], r: [f32; 3], lights: &[[f32; 3]], ng: NightGround) -> bool {
         let q = rgb(ng.ink);
+        let inv_tau = 1.0 / ng.tau.max(0.1);
         // From six closes up the ground is whole to a quarter of a percent.
         let s_max = (6.0 * ng.tau).ceil().min(255.0) as u32;
         let mut s_int = 1u32;
         while s_int <= s_max {
             let s = s_int as f32;
             s_int += 1;
-            let g = ng.alpha(s) / 255.0;
+            let g = NightGround::alpha_with_inv_tau(s, inv_tau) * (1.0 / 255.0);
             let one_minus_g = 1.0 - g;
             let base0 = p[0] * one_minus_g + q[0] * g;
             let base1 = p[1] * one_minus_g + q[1] * g;
@@ -482,15 +506,15 @@ pub(super) const fn max_channel(c: u32) -> u32 {
 
 #[inline]
 const fn night_ground_px(
-    ng: NightGround,
+    inv_tau: f32,
     centre: f32,
-    (cx, rx, ny): (f32, f32, f32),
+    (cx, inv_rx, ny): (f32, f32, f32),
     x: i32,
 ) -> f32 {
     let dx = (x as f32 - cx).abs();
-    let u = dx / rx;
+    let u = dx * inv_rx;
     let w = (1.0 - (ny + u * u)).max(0.0);
-    ng.alpha(centre * w * w)
+    NightGround::alpha_with_inv_tau(centre * w * w, inv_tau)
 }
 
 #[inline]
@@ -507,6 +531,8 @@ pub(crate) fn push_night_ground(
     }
     let (cx, cy) = (f32::from(h.cx), f32::from(h.cy));
     let (rx, ry) = (f32::from(h.rx), f32::from(h.ry));
+    let (inv_rx, inv_ry) = (1.0 / rx, 1.0 / ry);
+    let inv_tau = 1.0 / ng.tau.max(0.1);
     let (left, right) = (
         i32::from(h.x).max(geom.fx_left()),
         (i32::from(h.x) + i32::from(h.w)).min(geom.fx_right()),
@@ -528,7 +554,8 @@ pub(crate) fn push_night_ground(
         } else {
             (y as f32 - cy).abs().min(((y1 - 1) as f32 - cy).abs())
         };
-        let ny = (dy / ry) * (dy / ry);
+        let dy_ry = dy * inv_ry;
+        let ny = dy_ry * dy_ry;
         if ny < 1.0 {
             let rim = rx * crate::color_math::sqrt_f32(1.0 - ny);
             let core = if n_core > ny {
@@ -540,9 +567,10 @@ pub(crate) fn push_night_ground(
             // edge, a gradient's at its centre.
             let mid = cx + 0.5;
             let mut edges = [0i32; 2 * NIGHT_GROUND_RAMPS + 2];
+            const INV_RAMPS: f32 = 1.0 / NIGHT_GROUND_RAMPS as f32;
             let mut k = 0;
             while k <= NIGHT_GROUND_RAMPS {
-                let dx = rim - (rim - core) * k as f32 / NIGHT_GROUND_RAMPS as f32;
+                let dx = rim - (rim - core) * (k as f32 * INV_RAMPS);
                 let (l, r) = if k == 0 {
                     ((mid - dx).floor() as i32, (mid + dx).ceil() as i32)
                 } else {
@@ -558,7 +586,7 @@ pub(crate) fn push_night_ground(
             // The ground a pixel's light asks for (`x - cx` is where the
             // halo samples it), and a segment's edges set so its first and
             // last pixels' centres take theirs.
-            let slice_geom = (cx, rx, ny);
+            let slice_geom = (cx, inv_rx, ny);
             let mut ei = 0;
             while ei + 1 < edges.len() {
                 let (p0, p1) = (edges[ei], edges[ei + 1]);
@@ -568,8 +596,8 @@ pub(crate) fn push_night_ground(
                     continue;
                 }
                 let (first, last) = (
-                    night_ground_px(ng, centre, slice_geom, q0),
-                    night_ground_px(ng, centre, slice_geom, q1 - 1),
+                    night_ground_px(inv_tau, centre, slice_geom, q0),
+                    night_ground_px(inv_tau, centre, slice_geom, q1 - 1),
                 );
                 if first.max(last) < 1.0 {
                     continue;
@@ -642,6 +670,11 @@ pub(crate) fn push_ink_ring(
         }
     }
     #[inline]
+    const fn full_end(ink: u32, alpha: f32) -> (u32, u8) {
+        let al = alpha.round().clamp(0.0, 255.0) as u8;
+        (if al > 0 { premul_rgb(ink, al) } else { 0 }, al)
+    }
+    #[inline]
     fn put_ring_span(
         under: &mut Vec<GlowQuad>,
         geom: Geom,
@@ -649,6 +682,7 @@ pub(crate) fn push_ink_ring(
         (a, b): (f32, f32),
         ink: u32,
         alpha: f32,
+        full: (u32, u8),
         budget: usize,
     ) {
         if b <= a || alpha < 1.0 {
@@ -678,13 +712,15 @@ pub(crate) fn push_ink_ring(
                 budget,
             );
         }
-        if ib > ia {
-            put_ring_px(under, geom, (ia, y, ib - ia), ink, alpha, 1.0, budget);
+        if ib > ia && full.1 > 0 && under.len() < budget {
+            crate::effect_util::push_fx_ramp(under, geom, ia, y, ib - ia, 1, full, full);
         }
         if b > ib as f32 {
             put_ring_px(under, geom, (ib, y, 1), ink, alpha, b - ib as f32, budget);
         }
     }
+    let rim_full = full_end(ink, rim);
+    let fill_full = full_end(ink, fill);
     let ri = (r - rim_w).max(0.0);
     let (r2, ri2) = (r * r, ri * ri);
     let mut y = y0;
@@ -698,9 +734,36 @@ pub(crate) fn push_ink_ring(
             } else {
                 0.0
             };
-            put_ring_span(under, geom, y, (cx - outer, cx - inner), ink, rim, budget);
-            put_ring_span(under, geom, y, (cx - inner, cx + inner), ink, fill, budget);
-            put_ring_span(under, geom, y, (cx + inner, cx + outer), ink, rim, budget);
+            put_ring_span(
+                under,
+                geom,
+                y,
+                (cx - outer, cx - inner),
+                ink,
+                rim,
+                rim_full,
+                budget,
+            );
+            put_ring_span(
+                under,
+                geom,
+                y,
+                (cx - inner, cx + inner),
+                ink,
+                fill,
+                fill_full,
+                budget,
+            );
+            put_ring_span(
+                under,
+                geom,
+                y,
+                (cx + inner, cx + outer),
+                ink,
+                rim,
+                rim_full,
+                budget,
+            );
         }
         y += 1;
     }
@@ -807,8 +870,12 @@ fn soft_ellipse(
         v.dn = r;
         v.core_up = r * 0.3;
         v.core_dn = r * 0.3;
-        let kept = share(xs[i.saturating_sub(1)], xs[(i + 1).min(STEPS)]).clamp(0.0, 1.0);
-        v.cov = peak * round * round * kept;
+        let env = peak * round * round;
+        v.cov = if env > 0.0 {
+            env * share(xs[i.saturating_sub(1)], xs[(i + 1).min(STEPS)]).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         i += 1;
     }
     let stride = (geom.cw / 8).max(1);

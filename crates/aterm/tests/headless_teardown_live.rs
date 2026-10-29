@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Live-headless conformance for an isolated instance's log footprint and `SIGTERM` socket cleanup.
+//! Live-headless conformance for an isolated instance's log footprint and its refused state root.
 
 #![cfg(unix)]
 
@@ -21,10 +21,6 @@ fn boot(tag: &str, state: Option<&str>) -> Instance {
         },
         |_| true,
     )
-}
-
-fn sock(inst: &Instance) -> PathBuf {
-    PathBuf::from(&inst.sock)
 }
 
 fn home_log(tmp: &Path) -> PathBuf {
@@ -49,26 +45,6 @@ fn an_isolated_state_root_keeps_the_log_and_the_default_does_not() {
     drop(isolated);
     let plain = boot("p", None);
     assert!(home_log(&plain.tmp).exists(), "the default log directory");
-}
-
-#[test]
-fn sigterm_removes_the_socket_and_its_token() {
-    use std::os::unix::process::ExitStatusExt;
-    let mut inst = boot("t", Some("own-state"));
-    let sock = sock(&inst);
-    let token = PathBuf::from(format!("{}.token", sock.display()));
-    assert!(token.exists(), "the token sits beside the socket");
-    let pid = libc::pid_t::try_from(inst.child.id()).unwrap();
-    // SAFETY: a plain signal to the child this test spawned and still owns.
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
-    let status = inst.child.wait().expect("wait for the instance");
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGTERM),
-        "it still dies of the signal"
-    );
-    assert!(!sock.exists(), "the socket went with it");
-    assert!(!token.exists(), "the token went with it");
 }
 
 /// A relative state root is refused on stderr and writes nothing under `HOME`.

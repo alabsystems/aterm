@@ -55,7 +55,8 @@ impl Default for Probe {
 }
 
 impl Probe {
-    /// Create a sampler initialized with platform core counts and scratch state.
+    /// Create a sampler (initializes Linux core-count/scratch state and Windows processor-group
+    /// widths; empty on macOS).
     #[must_use]
     pub fn new() -> Self {
         Self {

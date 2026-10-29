@@ -4,14 +4,27 @@
 //! Harness launch-card overlay on the terminal glass.
 //!
 //! Decorates supervised launch cards with `aterm_effects::harness_card` fx layers,
-//! an undoable status line ([`CardLine`], [`LineEnd`]), and the update-notice
-//! banner ([`NOTICE`]). [`read_card`] caches card geometry across pane text
-//! rebuilds ([`CardReading::holds`]), [`admit`] enforces holder-token, fence, and
-//! build provenance ([`GateCheck`]), [`RESHOW_MS`] bounds flash rates, and
-//! [`layout`] places the border, kitty, trail, and status line within the pane.
+//! an undoable status line ([`CardLine`]: the harness's version and the site's name,
+//! the same under every Autopilot mode, whose palette alone the mode sets), and two
+//! harness banners ([`BannerGlass`], one type placed by [`BannerPlace`] and worded by a
+//! [`HarnessNotice`]): [`NOTICE`] over Claude Code's update notice and [`ANNOUNCEMENT`]
+//! over its startup announcement (the one notice its startup slot shows, and the
+//! hidden-count row under it). Both are read once per pane text rebuild with the card
+//! (`PaneTextCache::harness_notices`) and kept while the rows they read hold; once
+//! the card has scrolled off, the announcement's banner stays over the slot's rows
+//! still on screen (`PaneTextCache::scrolled_announcement`). A
+//! banner's cells, ink and star are rebuilt only when its key moves, and at rest a
+//! settled frame replays them. The site's name on the line and the banners' URLs are
+//! links ([`GlassHit`]: the hand, a plain press or a link-modifier press opens it once
+//! per double click, a reader's node). Glass only: the grid, copy, `text` reads and
+//! recordings keep the vendor's words. [`read_card`] caches card
+//! geometry across pane text rebuilds ([`CardReading::holds`]), [`admit`] enforces
+//! holder-token, fence, and build provenance ([`GateCheck`]), [`RESHOW_MS`] bounds
+//! flash rates, and [`layout`] places the border, kitty, trail, and status line
+//! within the pane.
 
 use std::ops::Range;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use aterm_core::render::{
@@ -23,12 +36,9 @@ use aterm_effects::harness_card::{
     CardArts, CardFrames, CardPalette, CardScene, FRAME_MS, HarnessCard, LineAt, kitty_cols,
     line_star,
 };
-use aterm_phase::{CardPlace, CliHarness, NoticePlace};
-
-use aterm_agent::harness::acts::TaskFace;
+use aterm_phase::{AnnouncementPlace, CardPlace, CliHarness, NoticePlace};
 
 use crate::autopilot::AutopilotView;
-use crate::claude_lights::LandAtGlass;
 use crate::{App, WindowId};
 
 const TRAIL_MIN: usize = 8;
@@ -36,7 +46,7 @@ const TRAIL_MAX: usize = 20;
 const KITTY_MARGIN: usize = 4;
 const LINE_LEAD: usize = 2;
 /// Emphasized hero word in the card status line: the brand, as the top rule's label reads it
-/// (`alab claude harness v0.4`).
+/// (`alab claude harness v0.5`).
 pub(crate) const HERO_WORD: &str = "alab";
 const FLOW_TAG: u64 = 0xF10F_0000_0000_0000;
 const MOTION_TAG: u64 = 0xA417_0000_0000_0000;
@@ -52,29 +62,77 @@ const NO_STAR: WordDecoration = WordDecoration {
     alpha: 0,
 };
 
-/// Text and target URL for the harness banner over Claude Code's update notice.
+/// One rung of a harness banner's words: the words before its link, then the link's own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BannerWords {
+    /// The words before the link (none: the banner's words are the link).
+    pub(crate) lead: &'static str,
+    /// The link's words, as a link reads.
+    pub(crate) link: &'static str,
+}
+
+impl BannerWords {
+    /// The cells the rung's words take.
+    pub(crate) fn cells(self) -> usize {
+        text_cells(self.lead) + text_cells(self.link)
+    }
+}
+
+/// A harness banner's words and the URL its link opens ([`NOTICE`], [`ANNOUNCEMENT`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HarnessNotice {
-    /// The banner's words: the link as a link reads, its scheme included.
-    pub(crate) text: &'static str,
-    /// The words where [`text`](Self::text) does not fit: the site's name alone.
-    pub(crate) short: &'static str,
+    /// The rungs the banner may show, widest first.
+    pub(crate) rungs: &'static [BannerWords],
     pub(crate) url: &'static str,
 }
 
 impl HarnessNotice {
-    /// The widest of the banner's words that fits `room` cells, if any does.
-    pub(crate) fn words_within(self, room: usize) -> Option<&'static str> {
-        [self.text, self.short]
-            .into_iter()
-            .find(|words| text_cells(words) <= room)
+    /// The widest of the banner's rungs that fits `room` cells, if any does.
+    pub(crate) fn words_within(self, room: usize) -> Option<BannerWords> {
+        self.rungs
+            .iter()
+            .copied()
+            .find(|words| words.cells() <= room)
     }
 }
 
-/// Harness banner configuration replacing Claude Code's update notice.
+/// The harness banner over Claude Code's update notice: the link as a link reads, its scheme
+/// included, or the site's name alone where the URL does not fit.
 pub(crate) const NOTICE: HarnessNotice = HarnessNotice {
-    text: aterm_types::identity::SITE_URL,
-    short: aterm_types::identity::SITE,
+    rungs: &[
+        BannerWords {
+            lead: "",
+            link: aterm_types::identity::SITE_URL,
+        },
+        BannerWords {
+            lead: "",
+            link: aterm_types::identity::SITE,
+        },
+    ],
+    url: aterm_types::identity::SITE_URL,
+};
+
+/// The harness banner over Claude Code's startup announcement (its one notice slot): ALab's
+/// own announcement, its URL the link, narrowing to the URL and then the site's name.
+pub(crate) const ANNOUNCEMENT: HarnessNotice = HarnessNotice {
+    rungs: &[
+        BannerWords {
+            lead: "ALab \u{b7} aterm, the terminal that runs your agents \u{b7} ",
+            link: aterm_types::identity::SITE_URL,
+        },
+        BannerWords {
+            lead: "ALab \u{b7} ",
+            link: aterm_types::identity::SITE_URL,
+        },
+        BannerWords {
+            lead: "",
+            link: aterm_types::identity::SITE_URL,
+        },
+        BannerWords {
+            lead: "",
+            link: aterm_types::identity::SITE,
+        },
+    ],
     url: aterm_types::identity::SITE_URL,
 };
 
@@ -302,9 +360,9 @@ pub(crate) struct CardLeaf {
     pane: PaneGeom,
     blank: RenderCell,
     view: AutopilotView,
-    end: LineEnd,
     card: Option<(Arc<CardRead>, u64, u64)>,
     notice: Option<NoticePlace>,
+    announcement: Option<AnnouncementPlace>,
     bare: Option<Bare>,
     token: u64,
     row_base: i64,
@@ -321,8 +379,12 @@ pub(crate) struct CardLine {
     settled: bool,
     step: Option<u64>,
     frame_row: usize,
+    term_row: usize,
     col: usize,
     hero: Range<u16>,
+    /// The frame columns of the site's name the line shows as a link ([`line_link`]); empty
+    /// on a rung without it.
+    link: Range<usize>,
     cells: Vec<RenderCell>,
     ground: RenderCell,
     ink: Vec<InkCell>,
@@ -337,8 +399,10 @@ impl Default for CardLine {
             settled: false,
             step: None,
             frame_row: 0,
+            term_row: 0,
             col: 0,
             hero: 0..0,
+            link: 0..0,
             cells: Vec::new(),
             ground: RenderCell::default(),
             ink: Vec::new(),
@@ -360,16 +424,144 @@ impl CardLine {
 }
 
 #[derive(Clone, Debug, Default)]
-struct NoticeRow {
+struct BannerRow {
     frame_row: usize,
     term_row: usize,
     col: usize,
     cells: Vec<RenderCell>,
 }
 
+/// Where a harness banner lies over the vendor's rows, in pane rows and columns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct BannerPlace {
+    /// The first row: the banner's words.
+    top: usize,
+    /// The vendor's rows the banner covers from [`top`](Self::top); all but the first blanked.
+    rows: usize,
+    /// The column the banner's `✦` stands at; its words start two cells after.
+    col: usize,
+    /// Column just past the vendor's widest row: each covered row is blank to it (the pane's
+    /// last column bounds it).
+    end: usize,
+    /// The column the banner's words may run to (the pane's last column bounds it too).
+    reach: usize,
+}
+
+impl BannerPlace {
+    /// Over Claude Code's update notice: the star at the notice's text column, the words
+    /// inside the notice's end.
+    const fn notice(place: &NoticePlace) -> Self {
+        Self {
+            top: place.top,
+            rows: place.rows,
+            col: place.text_col,
+            end: place.end,
+            reach: place.end,
+        }
+    }
+
+    /// Over Claude Code's startup announcement and its hidden-count row: the star at column 0,
+    /// over the quote bar or the indent of a notice with its bar off, the words where the
+    /// vendor's start. The slot's rows are the vendor's whole rows, so the words run as wide as
+    /// the pane lets them and each row is blanked to the pane's edge (a wide glyph in the
+    /// vendor's words never outruns the blank).
+    const fn announcement(place: &AnnouncementPlace) -> Self {
+        Self {
+            top: place.top,
+            rows: place.span(),
+            col: 0,
+            end: usize::MAX,
+            reach: usize::MAX,
+        }
+    }
+}
+
+/// The part of the slot at `place` that wears an announcement's inks in `scratch`, the vendor's
+/// cells of `pane` on `ground`: a barred slot whole, where its bar is not the pane's ink drawn
+/// faint (`faint_opacity`), which is how Claude Code bars every notice but an announcement (debug
+/// mode, remote control, channels, the tmux and model-source notices); a slot with its bar off
+/// from its first block (rows between blank ones) that holds a letter in the pane's own ink, as
+/// launch news and the saved-model nudge do and the emergency tip over them, drawn wholly in
+/// warning or error colour or faint (its default), never does. Where faint lands in the pane's
+/// own ink (`faint_opacity` 1, or near enough that the blend rounds to it), a block wholly in the
+/// pane's ink over a block that opens on a row in a colour of its own (news's title, in the
+/// Claude colour) is the faint tip, and is passed over too. Otherwise a block in the pane's ink is
+/// news, the tip never: news may have no title, and with no colour at all the two cannot be told
+/// apart. The reader reads text only
+/// ([`aterm_phase::announcement_scan`]), so this is what tells the vendor's news from the rest.
+pub(crate) fn announcement_inks(
+    place: &AnnouncementPlace,
+    pane: PaneGeom,
+    ground: RenderCell,
+    faint_opacity: f32,
+    scratch: &RenderInput,
+) -> Option<AnnouncementPlace> {
+    let row = |r: usize| {
+        scratch
+            .cells
+            .get(pane.frame_row(r))
+            .and_then(|row| row.get(pane.frame_col(0)..))
+            .map(|row| &row[..row.len().min(pane.cols)])
+            .unwrap_or_default()
+    };
+    let blank = |r: usize| row(r).iter().all(|cell| cell.ch.is_whitespace());
+    let inked = |r: usize| {
+        row(r)
+            .iter()
+            .any(|cell| !cell.ch.is_whitespace() && cell.fg == ground.fg)
+    };
+    let plain = |r: usize| {
+        row(r)
+            .iter()
+            .all(|cell| cell.ch.is_whitespace() || cell.fg == ground.fg)
+    };
+    let faint = faint_ink(ground, faint_opacity);
+    let faint_in_ink = faint == ground.fg;
+    let titled = |r: usize| {
+        !blank(r)
+            && row(r)
+                .iter()
+                .all(|cell| cell.ch.is_whitespace() || (cell.fg != ground.fg && cell.fg != faint))
+    };
+    let end = place.top + place.rows;
+    match row(place.top).first() {
+        Some(bar) if bar.ch == aterm_phase::ANNOUNCEMENT_BAR => (bar.fg != faint).then_some(*place),
+        Some(_) => {
+            let mut top = place.top;
+            while top < end {
+                let gap = (top..end).find(|&r| blank(r)).unwrap_or(end);
+                let tip = faint_in_ink
+                    && (top..gap).all(plain)
+                    && (gap..end).find(|&r| !blank(r)).is_some_and(titled);
+                if !tip && (top..gap).any(inked) {
+                    return Some(AnnouncementPlace {
+                        top,
+                        rows: end - top,
+                        ..*place
+                    });
+                }
+                top = gap + 1;
+            }
+            None
+        }
+        None => None,
+    }
+}
+
+/// The pane's ink drawn faint on its ground, as the terminal draws a faint cell.
+fn faint_ink(ground: RenderCell, faint_opacity: f32) -> [u8; 3] {
+    let rgb = |[r, g, b]: [u8; 3]| aterm_types::Rgb::new(r, g, b);
+    let faint = aterm_core::terminal::color_resolve::dim_toward_bg(
+        rgb(ground.fg),
+        rgb(ground.bg),
+        faint_opacity,
+    );
+    [faint.r, faint.g, faint.b]
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct NoticeKey {
-    place: NoticePlace,
+struct BannerKey {
+    place: BannerPlace,
     pane: PaneGeom,
     base: RenderCell,
     ground: RenderCell,
@@ -377,22 +569,24 @@ struct NoticeKey {
     palette: CardPalette,
 }
 
-/// Replacement banner state over Claude Code's update notice ([`NOTICE`]).
+/// A harness banner's state over the vendor's rows ([`NOTICE`] over the update notice,
+/// [`ANNOUNCEMENT`] over the startup announcement): its undoable row writes, ink, star and link.
 #[derive(Clone, Debug)]
-struct NoticeGlass {
+struct BannerGlass {
     on: bool,
-    key: Option<NoticeKey>,
+    key: Option<BannerKey>,
     settled: bool,
     step: Option<u64>,
-    rows: Vec<NoticeRow>,
+    rows: Vec<BannerRow>,
     live: usize,
     ground: RenderCell,
+    /// The frame columns a press opens the link on.
     link: Range<usize>,
     ink: Vec<InkCell>,
     star: WordDecoration,
 }
 
-impl Default for NoticeGlass {
+impl Default for BannerGlass {
     fn default() -> Self {
         Self {
             on: false,
@@ -409,20 +603,32 @@ impl Default for NoticeGlass {
     }
 }
 
-impl NoticeGlass {
-    fn rows(&self) -> &[NoticeRow] {
+impl BannerGlass {
+    fn rows(&self) -> &[BannerRow] {
         &self.rows[..self.live]
     }
 }
 
-/// Hit-test region and target URL for a rendered update-notice banner.
+/// Which harness words on the glass a [`GlassHit`] is on: the banner over Claude Code's update
+/// notice ([`NOTICE`]), the banner over its startup announcement ([`ANNOUNCEMENT`]), or the
+/// card's line ([`CardLine`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum GlassLink {
+    Notice,
+    Announcement,
+    Line,
+}
+
+/// Hit-test region of harness words on the glass (a banner's row, or the card line's link) and
+/// the URL a press on it opens, where it is a link.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct NoticeHit {
+pub(crate) struct GlassHit {
     session: u64,
     frame_row: usize,
     term_row: usize,
     cols: Range<usize>,
     url: Option<&'static str>,
+    link: GlassLink,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -441,7 +647,6 @@ struct LaidKey {
     blank: RenderCell,
     place: CardPlace,
     view: AutopilotView,
-    end: LineEnd,
     px: Pixels,
     serious: bool,
     kitty: (u8, u8),
@@ -473,7 +678,22 @@ struct CardEntry {
     laid_gen: u64,
     seen: Seen,
     line: CardLine,
-    notice: NoticeGlass,
+    notice: BannerGlass,
+    announcement: BannerGlass,
+    /// The rows from the slot's news to its last, as the inks last read them under the card, whole
+    /// or cut (the tip over the news left out): a slot keeps them once its card has scrolled off,
+    /// since a scroll cuts the slot from its top.
+    news_rows: Option<usize>,
+}
+
+impl CardEntry {
+    /// The entry's banners, each with its words and its link.
+    const fn banners(&self) -> [(&BannerGlass, HarnessNotice, GlassLink); 2] {
+        [
+            (&self.notice, NOTICE, GlassLink::Notice),
+            (&self.announcement, ANNOUNCEMENT, GlassLink::Announcement),
+        ]
+    }
 }
 
 impl CardEntry {
@@ -586,8 +806,8 @@ pub(crate) struct WindowCards {
     /// rail ([`Self::paint_icon`]).
     no_px: Arc<[u32]>,
     panels: crate::claude_panel::WindowPanels,
-    notice_hits: Vec<NoticeHit>,
-    /// The session whose banner link a press last opened, or would have, and when.
+    glass_hits: Vec<GlassHit>,
+    /// The session whose glass link a press last opened, or would have, and when.
     link_pressed: Option<(u64, Instant)>,
     away: Option<Instant>,
     composed: u64,
@@ -664,7 +884,7 @@ impl WindowCards {
         self.painted.icons.push((row, icon));
     }
 
-    /// Record a press that opens `session`'s banner link at `now`, and say whether it repeats
+    /// Record a press that opens `session`'s glass link at `now`, and say whether it repeats
     /// the last such press within a double click's interval (`multi_click_ms`), so a double or
     /// triple click opens the link once.
     pub(crate) fn link_press_repeats(&mut self, session: u64, now: Instant) -> bool {
@@ -683,9 +903,10 @@ impl WindowCards {
             entry.shown = false;
             entry.line.on = false;
             entry.notice.on = false;
+            entry.announcement.on = false;
         }
         self.panels.hide_all();
-        self.notice_hits.clear();
+        self.glass_hits.clear();
     }
 
     /// Borrow the agents panel state and painted record together.
@@ -741,13 +962,13 @@ impl WindowCards {
         self.entries.iter().map(|e| &e.line).filter(|l| l.on)
     }
 
-    /// Active update-notice banner row edits to write this frame.
-    pub(crate) fn notice_edits(
+    /// Active harness banners' row edits to write this frame.
+    pub(crate) fn banner_edits(
         &self,
     ) -> impl Iterator<Item = (usize, usize, &[RenderCell], RenderCell)> {
         self.entries
             .iter()
-            .map(|e| &e.notice)
+            .flat_map(|e| [&e.notice, &e.announcement])
             .filter(|n| n.on)
             .flat_map(|n| {
                 n.rows()
@@ -1070,7 +1291,8 @@ fn withdraw_card_layers(stream: &mut Vec<FxLayer>, ours: &[FxLayer]) {
     }
 }
 
-/// Apply ink and leading stars for card lines and notice banners whose cell edits took.
+/// Apply ink and leading stars for card lines and notice banners whose cell edits took, and
+/// record their hit regions ([`GlassHit`]).
 pub(crate) fn ink_lines(
     cards: &mut WindowCards,
     scratch: &mut RenderInput,
@@ -1079,20 +1301,26 @@ pub(crate) fn ink_lines(
     let WindowCards {
         entries,
         painted,
-        notice_hits,
+        glass_hits,
         ..
     } = cards;
-    notice_hits.clear();
+    glass_hits.clear();
     let before = scratch.ink.len();
     let words = entries
         .iter()
         .map(|e| &e.line)
         .filter(|l| l.on && took(l.at()))
         .map(|l| (l.ink.as_slice(), l.star))
-        .chain(entries.iter().map(|e| &e.notice).filter_map(|n| {
-            let banner = n.rows().first()?;
-            (n.on && took((banner.frame_row, banner.col))).then_some((n.ink.as_slice(), n.star))
-        }));
+        .chain(
+            entries
+                .iter()
+                .flat_map(|e| [&e.notice, &e.announcement])
+                .filter_map(|n| {
+                    let banner = n.rows().first()?;
+                    (n.on && took((banner.frame_row, banner.col)))
+                        .then_some((n.ink.as_slice(), n.star))
+                }),
+        );
     for (ink, star) in words {
         for cell in ink {
             let key = (cell.row, cell.col);
@@ -1107,23 +1335,42 @@ pub(crate) fn ink_lines(
         scratch.word_decorations.push(star);
         painted.decos.push(star);
     }
-    for entry in entries.iter().filter(|e| e.notice.on) {
-        let notice = &entry.notice;
-        for (k, row) in notice.rows().iter().enumerate() {
-            if !took((row.frame_row, row.col)) {
+    for entry in entries
+        .iter()
+        .filter(|e| e.line.on && !e.line.link.is_empty() && took(e.line.at()))
+    {
+        let line = &entry.line;
+        glass_hits.push(GlassHit {
+            session: entry.session,
+            frame_row: line.frame_row,
+            term_row: line.term_row,
+            cols: line.link.clone(),
+            url: Some(aterm_types::identity::SITE_URL),
+            link: GlassLink::Line,
+        });
+    }
+    for entry in entries.iter() {
+        for (banner, words, link) in entry.banners() {
+            if !banner.on {
                 continue;
             }
-            let hit = |cols: Range<usize>, url| NoticeHit {
-                session: entry.session,
-                frame_row: row.frame_row,
-                term_row: row.term_row,
-                cols,
-                url,
-            };
-            if k == 0 {
-                notice_hits.push(hit(notice.link.clone(), Some(NOTICE.url)));
+            for (k, row) in banner.rows().iter().enumerate() {
+                if !took((row.frame_row, row.col)) {
+                    continue;
+                }
+                let hit = |cols: Range<usize>, url| GlassHit {
+                    session: entry.session,
+                    frame_row: row.frame_row,
+                    term_row: row.term_row,
+                    cols,
+                    url,
+                    link,
+                };
+                if k == 0 {
+                    glass_hits.push(hit(banner.link.clone(), Some(words.url)));
+                }
+                glass_hits.push(hit(row.col..row.col + row.cells.len(), None));
             }
-            notice_hits.push(hit(row.col..row.col + row.cells.len(), None));
         }
     }
     if scratch.ink.len() > before {
@@ -1203,148 +1450,47 @@ fn pack_fill((r, g, b): (f32, f32, f32)) -> u32 {
     (channel(r) << 16) | (channel(g) << 8) | channel(b)
 }
 
-/// Suffix state for a card's status line.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub(crate) enum LineEnd {
-    #[default]
-    Mode,
-    Landed,
-    CruiseUntil(LandAtGlass),
-}
-
-impl LineEnd {
-    /// Line suffix for `view` and optional `task` face.
-    #[must_use]
-    pub(crate) const fn of(view: AutopilotView, task: Option<TaskFace>) -> Self {
-        match (view, task) {
-            (AutopilotView::Land, Some(TaskFace::Landed)) => LineEnd::Landed,
-            _ => LineEnd::Mode,
-        }
-    }
-
-    /// Attach an armed `land_at` timer to a Cruise suffix.
-    #[must_use]
-    pub(crate) const fn timed(self, view: AutopilotView, land_at: Option<LandAtGlass>) -> Self {
-        match (self, view, land_at) {
-            (LineEnd::Mode, AutopilotView::Cruise, Some(at)) => LineEnd::CruiseUntil(at),
-            _ => self,
-        }
-    }
-
-    const fn words(self, view: AutopilotView) -> (&'static str, &'static str) {
-        let face = match self {
-            LineEnd::Mode | LineEnd::CruiseUntil(_) => return (view.glyph(), view.wire()),
-            LineEnd::Landed => crate::claude_lights::ChipFace::Landed,
-        };
-        match face.word() {
-            Some(word) => (face.glyph(), word),
-            None => (view.glyph(), view.wire()),
-        }
-    }
-}
-
-const fn untimed_end(view: AutopilotView, end: LineEnd) -> LineEnd {
-    match (view, end) {
-        (AutopilotView::Land, LineEnd::Landed) => LineEnd::Landed,
-        _ => LineEnd::Mode,
-    }
-}
-
-fn line_texts(view: AutopilotView, end: LineEnd) -> &'static [String] {
-    static TEXTS: [OnceLock<Vec<String>>; 6] = [const { OnceLock::new() }; 6];
-    let end = match (view, end) {
-        (AutopilotView::Cruise, LineEnd::CruiseUntil(at)) => {
-            return timed_line_texts(CliHarness::ClaudeCode, at);
-        }
-        _ => untimed_end(view, end),
+/// The card line's rungs for the harness of reader kind `rows_kind` (`3` Claude Code, `4` agy,
+/// `1` Muse Code), widest first, made once per harness ([`make_line_texts_for`]).
+fn line_texts_for(rows_kind: usize) -> &'static [String] {
+    static TEXTS: [OnceLock<Vec<String>>; 3] = [const { OnceLock::new() }; 3];
+    let (harness, slot) = match rows_kind {
+        4 => (CliHarness::Agy, &TEXTS[1]),
+        1 => (CliHarness::Muse, &TEXTS[2]),
+        _ => (CliHarness::ClaudeCode, &TEXTS[0]),
     };
-    let slot = match (view, end) {
-        (AutopilotView::Land, LineEnd::Landed) => &TEXTS[5],
-        (AutopilotView::Cruise, _) => &TEXTS[0],
-        (AutopilotView::Land, _) => &TEXTS[1],
-        (AutopilotView::Off, _) => &TEXTS[2],
-        (AutopilotView::MasterOff | AutopilotView::AgentOff(_), _) => &TEXTS[3],
-        (AutopilotView::Unhosted, _) => &TEXTS[4],
-    };
-    slot.get_or_init(|| make_line_texts(view, end))
-}
-
-fn timed_line_texts(harness: CliHarness, at: LandAtGlass) -> &'static [String] {
-    type TimedFace = (CliHarness, LandAtGlass, &'static [String]);
-    static MADE: Mutex<Vec<TimedFace>> = Mutex::new(Vec::new());
-    let mut made = MADE.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(&(_, _, texts)) = made
-        .iter()
-        .find(|(who, face, _)| *who == harness && *face == at)
-    {
-        return texts;
-    }
-    let texts: &'static [String] =
-        make_line_texts_for(harness, AutopilotView::Cruise, LineEnd::CruiseUntil(at)).leak();
-    made.push((harness, at, texts));
-    texts
-}
-
-fn make_line_texts(view: AutopilotView, end: LineEnd) -> Vec<String> {
-    make_line_texts_for(CliHarness::ClaudeCode, view, end)
-}
-
-fn line_texts_for(rows_kind: usize, view: AutopilotView, end: LineEnd) -> &'static [String] {
-    static AGY_TEXTS: [OnceLock<Vec<String>>; 6] = [const { OnceLock::new() }; 6];
-    static MUSE_TEXTS: [OnceLock<Vec<String>>; 6] = [const { OnceLock::new() }; 6];
-    let (harness, table) = match rows_kind {
-        4 => (CliHarness::Agy, &AGY_TEXTS),
-        1 => (CliHarness::Muse, &MUSE_TEXTS),
-        _ => return line_texts(view, end),
-    };
-    let end = match (view, end) {
-        (AutopilotView::Cruise, LineEnd::CruiseUntil(at)) => {
-            return timed_line_texts(harness, at);
-        }
-        _ => untimed_end(view, end),
-    };
-    let slot = match (view, end) {
-        (AutopilotView::Land, LineEnd::Landed) => &table[5],
-        (AutopilotView::Cruise, _) => &table[0],
-        (AutopilotView::Land, _) => &table[1],
-        (AutopilotView::Off, _) => &table[2],
-        (AutopilotView::MasterOff | AutopilotView::AgentOff(_), _) => &table[3],
-        (AutopilotView::Unhosted, _) => &table[4],
-    };
-    slot.get_or_init(|| make_line_texts_for(harness, view, end))
+    slot.get_or_init(|| make_line_texts_for(harness))
 }
 
 /// The card line's rungs, widest first, naming `harness` the way its top rule does (`alab
-/// <cli> harness`) and its own version (never aterm's build).
-fn make_line_texts_for(harness: CliHarness, view: AutopilotView, end: LineEnd) -> Vec<String> {
-    use crate::claude_lights::ChipFace;
-    let mut texts = Vec::with_capacity(6);
+/// <cli> harness`) and its own version (never aterm's build): `enhanced by {named} ·
+/// alab.systems`, `{named} · alab.systems`, `alab <cli> harness · alab.systems`,
+/// `alab.systems`, `alab`, where `{named}` is `alab <cli> harness v<version>` and the site's
+/// name is a link ([`line_link`]). Every rung the site's name fits in keeps it: the link is the
+/// line's point, so the words before it give way first.
+fn make_line_texts_for(harness: CliHarness) -> Vec<String> {
+    let site = aterm_types::identity::SITE;
     let brand = format!("{HERO_WORD} {} harness", harness.cli());
-    let head = format!("enhanced by {brand} v{}", harness.version_str());
-    let (glyph, word) = end.words(view);
-    let mode = if harness == CliHarness::Agy {
-        head.clone()
-    } else {
-        format!("{head} \u{b7} autopilot {glyph} {word}")
-    };
-    if let LineEnd::CruiseUntil(at) = end {
-        let mark = ChipFace::CruiseUntil
-            .word()
-            .unwrap_or(AutopilotView::Land.glyph());
-        texts.push(format!("{mode} {mark}{}", crate::autopilot_menu::when(at)));
+    let named = format!("{brand} v{}", harness.version_str());
+    vec![
+        format!("enhanced by {named} \u{b7} {site}"),
+        format!("{named} \u{b7} {site}"),
+        format!("{brand} \u{b7} {site}"),
+        site.to_owned(),
+        HERO_WORD.to_owned(),
+    ]
+}
+
+/// The cells of `text`, a rung of the card line, that are the link to the site: its closing
+/// `alab.systems`, after a ` · ` or alone, where it has one.
+fn line_link(text: &str) -> Option<Range<usize>> {
+    let site = aterm_types::identity::SITE;
+    let lead = text.strip_suffix(site)?;
+    if !lead.is_empty() && !lead.ends_with(" \u{b7} ") {
+        return None;
     }
-    if mode != head {
-        texts.push(mode);
-    }
-    texts.push(head);
-    if harness == CliHarness::Agy {
-        texts.push(brand);
-    } else {
-        texts.push(format!("{brand} \u{b7} {glyph} {word}"));
-    }
-    texts.push(format!("{HERO_WORD} \u{b7} {glyph} {word}"));
-    texts.push(format!("{HERO_WORD} {glyph}"));
-    texts
+    let start = text_cells(lead);
+    Some(start..start + text_cells(site))
 }
 
 fn text_cells(text: &str) -> usize {
@@ -1738,7 +1884,7 @@ fn lay_out(
         &cells,
         &read.place,
         kitty_width(key),
-        line_texts_for(read.kind, key.view, key.end),
+        line_texts_for(read.kind),
         seen,
     )?;
     let dark = dark_ground(key.blank);
@@ -1818,6 +1964,13 @@ fn words_base(
     }
 }
 
+/// Mark `cell` as a link's letter: a single underline with no colour of its own, so it takes the
+/// letter's ink.
+const fn underline_link(cell: &mut RenderCell) {
+    cell.underline = UnderlineStyle::Single;
+    cell.underline_color = None;
+}
+
 fn push_words(text: &str, base: RenderCell, out: &mut Vec<RenderCell>) {
     for ch in text.chars() {
         let cell = RenderCell { ch, ..base };
@@ -1836,14 +1989,15 @@ fn push_words(text: &str, base: RenderCell, out: &mut Vec<RenderCell>) {
     }
 }
 
-/// Compute line ink and the leading `✦` decoration for `len` cells starting after `star_col`.
+/// Compute line ink and the leading `✦` decoration for `len` cells starting after `star_col`,
+/// lit from the card's `wand` tip where it stands.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the words' place, their card, the pane, the frame's clock and motion"
+    reason = "the words' place, their card's wand, the pane, the frame's clock and motion"
 )]
 fn ink_words(
     card: &HarnessCard,
-    read: &CardRead,
+    wand: Option<(usize, usize)>,
     pane: PaneGeom,
     (frame_row, star_col, len): (usize, usize, usize),
     hero: Range<u16>,
@@ -1855,10 +2009,7 @@ fn ink_words(
     ink.clear();
     #[cfg(test)]
     crate::work_counts::card_line_inked();
-    let wand = read
-        .place
-        .wand()
-        .map(|(col, row)| (u16_of(pane.frame_col(col)), u16_of(pane.frame_row(row))));
+    let wand = wand.map(|(col, row)| (u16_of(pane.frame_col(col)), u16_of(pane.frame_row(row))));
     let at = LineAt {
         row: u16_of(frame_row),
         col: u16_of(star_col + LINE_LEAD),
@@ -1911,6 +2062,9 @@ fn make_line(
         palette,
     };
     line.on = true;
+    // The key holds the frame row, which a strip that grows as the grid scrolls keeps: the term
+    // row the link's hit is checked against is refreshed on every frame.
+    line.term_row = pane.row_off + place.row;
     let inked = InkFrame::of(card, frame, animate);
     if line.key == Some(key) && inked.keeps(line.settled, line.step) {
         return;
@@ -1928,11 +2082,18 @@ fn make_line(
                 cell.bold = true;
             }
         }
+        let link = line_link(place.text).unwrap_or(0..0);
+        if let Some(cells) = line.cells.get_mut(link.clone()) {
+            for cell in cells {
+                underline_link(cell);
+            }
+        }
+        line.link = line.col + link.start..line.col + link.end;
         line.key = Some(key);
     }
     line.star = ink_words(
         card,
-        read,
+        read.place.wand(),
         pane,
         (frame_row, star_col, line.cells.len()),
         line.hero.clone(),
@@ -1945,16 +2106,21 @@ fn make_line(
     line.step = inked.step;
 }
 
-/// Build or reuse the [`NoticeGlass`] banner over Claude Code's update notice.
+/// Build or reuse a [`BannerGlass`] showing `words` over the vendor's rows at `place`: the
+/// first row a drawn `✦` and the widest rung that fits, its link's letters underlined in their
+/// own ink; every other covered row blank. The words take the ink of the card `read`'s last row
+/// or, once the card has scrolled off (none), the ink they last took. Refused where no rung fits,
+/// the rows leave the pane, or no card is read and the banner was never drawn.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the notice's place, its card, the frame's cells and the card's clock and motion"
+    reason = "the banner's words and place, its card, the frame's cells and the card's clock and motion"
 )]
-fn make_notice(
-    notice: &mut NoticeGlass,
+fn make_banner(
+    banner: &mut BannerGlass,
+    words: HarnessNotice,
+    place: BannerPlace,
     card: &HarnessCard,
-    place: &NoticePlace,
-    read: &CardRead,
+    read: Option<&CardRead>,
     pane: PaneGeom,
     ground: RenderCell,
     scratch: &RenderInput,
@@ -1962,70 +2128,89 @@ fn make_notice(
     frame: Option<(Instant, bool, Option<u64>)>,
     animate: bool,
 ) {
+    let Some(base) = read
+        .map(|read| words_base(read, pane, ground, scratch))
+        .or(banner.key.map(|key| key.base))
+    else {
+        return;
+    };
     let room = place
-        .end
+        .reach
         .min(pane.cols.saturating_sub(1))
-        .saturating_sub(place.text_col + LINE_LEAD);
-    let Some(text) = NOTICE.words_within(room) else {
+        .saturating_sub(place.col + LINE_LEAD);
+    let Some(rung) = words.words_within(room) else {
         return;
     };
     if place.rows == 0 || place.top + place.rows > pane.rows {
         return;
     }
-    let words = text_cells(text);
-    let key = NoticeKey {
-        place: *place,
+    let cells = rung.cells();
+    let star_col = pane.frame_col(place.col);
+    let width = place.end.min(pane.cols).max(place.col + LINE_LEAD + cells) - place.col;
+    // The frame writes no cell over a cluster, a combining mark or an image
+    // (`claude_footer::touches`), so a covered row holding one would keep the vendor's words
+    // under the banner: the banner is refused whole.
+    let span = star_col..star_col + width;
+    if (place.top..place.top + place.rows).any(|r| {
+        let row = pane.frame_row(r);
+        crate::claude_footer::touches(&scratch.clusters, row, &span)
+            || crate::claude_footer::touches(&scratch.combining, row, &span)
+            || crate::claude_footer::touches(&scratch.images, row, &span)
+    }) {
+        return;
+    }
+    let key = BannerKey {
+        place,
         pane,
-        base: words_base(read, pane, ground, scratch),
+        base,
         ground,
         dark: dark_ground(ground),
         palette,
     };
-    notice.on = true;
+    banner.on = true;
     let inked = InkFrame::of(card, frame, animate);
-    if notice.key == Some(key) && inked.keeps(notice.settled, notice.step) {
+    if banner.key == Some(key) && inked.keeps(banner.settled, banner.step) {
         return;
     }
-    let star_col = pane.frame_col(place.text_col);
-    if notice.key != Some(key) {
-        let width = place.end - place.text_col;
-        if notice.rows.len() < place.rows {
-            notice.rows.resize_with(place.rows, NoticeRow::default);
+    if banner.key != Some(key) {
+        if banner.rows.len() < place.rows {
+            banner.rows.resize_with(place.rows, BannerRow::default);
         }
-        notice.live = place.rows;
-        for (k, row) in notice.rows[..place.rows].iter_mut().enumerate() {
+        banner.live = place.rows;
+        for (k, row) in banner.rows[..place.rows].iter_mut().enumerate() {
             row.frame_row = pane.frame_row(place.top + k);
             row.term_row = pane.row_off + place.top + k;
             row.col = star_col;
             row.cells.clear();
             if k == 0 {
                 row.cells.resize(LINE_LEAD, ground);
-                let link = RenderCell {
-                    underline: UnderlineStyle::Single,
-                    underline_color: None,
-                    ..key.base
-                };
-                push_words(text, link, &mut row.cells);
+                push_words(rung.lead, key.base, &mut row.cells);
+                let mut link = key.base;
+                underline_link(&mut link);
+                push_words(rung.link, link, &mut row.cells);
             }
             row.cells.resize(width, ground);
         }
-        notice.ground = ground;
-        notice.link = star_col..star_col + LINE_LEAD + words;
-        notice.key = Some(key);
+        banner.ground = ground;
+        let at = star_col + LINE_LEAD + text_cells(rung.lead);
+        // A banner whose words are its link takes a press on its star too.
+        let from = if rung.lead.is_empty() { star_col } else { at };
+        banner.link = from..at + text_cells(rung.link);
+        banner.key = Some(key);
     }
-    notice.star = ink_words(
+    banner.star = ink_words(
         card,
-        read,
+        read.and_then(|read| read.place.wand()),
         pane,
-        (pane.frame_row(place.top), star_col, words),
+        (pane.frame_row(place.top), star_col, cells),
         0..0,
         ground,
         inked,
         animate,
-        &mut notice.ink,
+        &mut banner.ink,
     );
-    notice.settled = inked.still;
-    notice.step = inked.step;
+    banner.settled = inked.still;
+    banner.step = inked.step;
 }
 
 /// Reason a pane's launch card was left undecorated this frame.
@@ -2095,6 +2280,30 @@ impl FenceFrame {
             base_y: scratch.base_y,
             alt: scratch.engine_alt,
             mutations: scratch.screen_mutations,
+        }
+    }
+
+    /// Whether the fence says another holder drew the pane's main-screen rows `top..end`: a
+    /// current drawer whose clean fence admits none of them (a composer an exited process left on
+    /// the screen, before the drawer in front draws its own). A row of them in any of its spans
+    /// keeps them its own, whole or not: a drawer resumed with the caret past its composer's ink
+    /// reselects a span that ends at the prompt row (exclusive) and opens the next under the mode
+    /// row, so only the top rule is in its spans, the prompt row and the bottom rule are in none,
+    /// and no one span holds the composer whole. An alternate screen, no drawer, and
+    /// a tainted fence (nothing on the main screen admitted: its lay found ink, an anchor was
+    /// lost, or it was adopted without a seed) say nothing either way.
+    pub(crate) fn disowns(&self, top: usize, end: usize) -> bool {
+        if self.alt || self.holder.token == 0 || self.holder.tainted {
+            return false;
+        }
+        let row = |r: usize| {
+            u64::try_from(self.base_y)
+                .ok()
+                .and_then(|base| base.checked_add(u64::try_from(r).ok()?))
+        };
+        match (row(top), row(end)) {
+            (Some(lo), Some(hi)) => !(lo..hi).any(|r| self.holder.admits_rows(r, r + 1)),
+            _ => false,
         }
     }
 }
@@ -2187,6 +2396,21 @@ impl GateCheck {
         self.gate.map_or(0, |g| g.token)
     }
 
+    /// Whether the fence says another holder drew rows `top..end` ([`FenceFrame::disowns`]).
+    pub(crate) fn disowns(&self, top: usize, end: usize) -> bool {
+        self.fence.disowns(top, end)
+    }
+
+    /// Whether row `row` is one the current drawer drew, the gate's reader being `kind`
+    /// ([`crate::holder_image::CardProgram::rows_kind`]).
+    pub(crate) fn admits_row(&self, kind: usize, row: usize) -> bool {
+        self.gate.is_some_and(|gate| {
+            gate.kind == kind
+                && token_holds(&gate, &self.fence).is_ok()
+                && fence_holds(&self.fence, row, 1).is_ok()
+        })
+    }
+
     /// Compute or return the cached [`Verdict`] for `session` at `leaf_index`.
     pub(crate) fn verdict(
         &mut self,
@@ -2225,16 +2449,8 @@ impl GateCheck {
         if banner.is_none() && status.is_none() {
             return false;
         }
-        if let Some(row) = status {
-            let Some(gate) = self.gate else {
-                return false;
-            };
-            if gate.kind != kind
-                || token_holds(&gate, &self.fence).is_err()
-                || fence_holds(&self.fence, row, 1).is_err()
-            {
-                return false;
-            }
+        if status.is_some_and(|row| !self.admits_row(kind, row)) {
+            return false;
         }
         banner.is_none_or(|top| {
             matches!(
@@ -2271,19 +2487,29 @@ pub(crate) fn card_leaf(
     } else {
         (None, Some(Bare::Unsupervised))
     };
-    let notice = card
-        .as_ref()
-        .filter(|(read, _, _)| read.kind == 3)
-        .and_then(|(read, _, _)| texts.update_notice(leaf_index, session, &read.place, pane.cols));
+    let (notice, announcement) = match (&card, bare) {
+        (Some((read, _, _)), _) if read.kind == 3 => {
+            texts.harness_notices(leaf_index, session, &read.place, pane.cols)
+        }
+        // The card has scrolled off over its startup announcement: the slot's rows still on
+        // screen, where the drawer wrote them.
+        (None, Some(Bare::NoCard)) => (
+            None,
+            texts
+                .scrolled_announcement(leaf_index, session)
+                .filter(|place| fence_holds(&check.fence, place.top, place.span()).is_ok()),
+        ),
+        _ => (None, None),
+    };
     CardLeaf {
         leaf_index,
         session,
         pane,
         blank,
         view,
-        end: LineEnd::Mode,
         card,
         notice,
+        announcement,
         bare,
         token,
         row_base: check.fence.base_y,
@@ -2301,9 +2527,9 @@ pub(crate) fn drawerless_leaf(leaf_index: usize, session: u64, pane: PaneGeom) -
         pane,
         blank: RenderCell::default(),
         view: AutopilotView::Off,
-        end: LineEnd::Mode,
         card: None,
         notice: None,
+        announcement: None,
         bare: Some(Bare::NoDrawer),
         token: 0,
         row_base: 0,
@@ -2329,8 +2555,10 @@ struct Look {
 }
 
 impl App {
-    /// Hit-test the update-notice banner at window pixel `(x, y)` in `wid`.
-    pub(crate) fn claude_notice_at(
+    /// Hit-test the harness words on `wid`'s glass (a banner's rows, the card line's link) at
+    /// window pixel `(x, y)`: the session they belong to and the URL a press there opens, if it
+    /// is a link.
+    pub(crate) fn claude_glass_hit_at(
         &self,
         wid: WindowId,
         x: f64,
@@ -2339,7 +2567,7 @@ impl App {
         if self
             .windows
             .get(&wid)
-            .is_none_or(|ws| ws.claude_card.notice_hits.is_empty())
+            .is_none_or(|ws| ws.claude_card.glass_hits.is_empty())
         {
             return None;
         }
@@ -2347,30 +2575,37 @@ impl App {
         let ws = self.windows.get(&wid)?;
         let hit = ws
             .claude_card
-            .notice_hits
+            .glass_hits
             .iter()
             .find(|hit| hit.frame_row == row && hit.cols.contains(&col))?;
         (!self.chrome_owns_terminal_row(wid, hit.term_row)).then_some((hit.session, hit.url))
     }
 
-    /// Whether the pointer rests on a banner's link in `wid` ([`Self::claude_notice_at`]).
-    pub(crate) fn pointer_on_notice_link(&self, wid: WindowId) -> bool {
+    /// Whether the pointer rests on a link of the glass's harness words in `wid`
+    /// ([`Self::claude_glass_hit_at`]).
+    pub(crate) fn pointer_on_glass_link(&self, wid: WindowId) -> bool {
         let Some((x, y)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px) else {
             return false;
         };
-        self.claude_notice_at(wid, x, y)
+        self.claude_glass_hit_at(wid, x, y)
             .is_some_and(|(_, url)| url.is_some())
     }
 
-    /// Open `session`'s banner link for a screen reader's press on its node, where the glass
-    /// shows it: a tab name being edited settles first, as on a pointer's press.
-    pub(crate) fn open_claude_notice_for_reader(&mut self, wid: WindowId, session: u64) {
+    /// Open `session`'s `link` for a screen reader's press on its node, where the glass shows
+    /// it: a tab name being edited settles first, as on a pointer's press.
+    pub(crate) fn open_claude_link_for_reader(
+        &mut self,
+        wid: WindowId,
+        session: u64,
+        link: GlassLink,
+    ) {
         let url = self.windows.get(&wid).and_then(|ws| {
             ws.claude_card
-                .notice_hits
+                .glass_hits
                 .iter()
                 .find(|hit| {
                     hit.session == session
+                        && hit.link == link
                         && hit.url.is_some()
                         && !self.chrome_owns_terminal_row(wid, hit.term_row)
                 })
@@ -2386,10 +2621,11 @@ impl App {
         crate::app_mouse::open_url_external(url);
     }
 
-    /// The banners' links on `wid`'s glass as the accessibility tree publishes them, on grid
-    /// rows below the window's `strip` chrome rows: each a link named by the words it shows.
+    /// The links of the glass's harness words in `wid` as the accessibility tree publishes
+    /// them, on grid rows below the window's `strip` chrome rows: each a link named by the words
+    /// it shows.
     #[cfg(a11y_tree)]
-    pub(crate) fn claude_notice_links_a11y(
+    pub(crate) fn claude_links_a11y(
         &self,
         wid: WindowId,
         strip: usize,
@@ -2398,7 +2634,7 @@ impl App {
             return Vec::new();
         };
         let mut links = Vec::new();
-        for hit in &ws.claude_card.notice_hits {
+        for hit in &ws.claude_card.glass_hits {
             let Some(url) = hit.url else {
                 continue;
             };
@@ -2421,7 +2657,7 @@ impl App {
             }
             links.push(crate::a11y_tree::GridChip {
                 session: hit.session,
-                chip: crate::a11y_tree::HarnessChip::Link,
+                chip: crate::a11y_tree::HarnessChip::Link(hit.link),
                 label,
                 description: Some(format!("Opens {url} in the browser")),
                 toggled: None,
@@ -2469,18 +2705,13 @@ impl App {
             return;
         };
         let probe = crate::holder_image::DEV_ROWS && self.session_factory.card_probe;
+        let faint_opacity = self.config.faint_opacity_or_default();
         let mut lapsed = false;
         let look = leaves.iter().any(|leaf| leaf.card.is_some()).then(|| {
             let focus = moves_focused(focused, away);
             lapsed = !focus && away.is_some();
             self.card_look(wid, focus)
         });
-        for leaf in leaves.iter_mut().filter(|leaf| {
-            leaf.card.is_some() && matches!(leaf.view, AutopilotView::Land | AutopilotView::Cruise)
-        }) {
-            let glass = self.chip_glass(leaf.session);
-            leaf.end = LineEnd::of(leaf.view, glass.task).timed(leaf.view, glass.land_at);
-        }
         let pool = &self.pool;
         let Some(ws) = self.windows.get_mut(&wid).map(Box::as_mut) else {
             return;
@@ -2505,7 +2736,21 @@ impl App {
             seen,
             ..
         } = cards;
-        for leaf in leaves.drain(..) {
+        for mut leaf in leaves.drain(..) {
+            // The reader placed the slot by its text; while the card is read, whole or cut, the
+            // slot's inks say whether it is the vendor's news and from which row down. Once the
+            // card has scrolled off, the slot keeps what its card's last frames gave: a refused
+            // slot clears the entry's banner below, and `make_banner` draws no banner it never
+            // drew.
+            let mut inked = None;
+            if leaf.card.is_some() {
+                let (pane, ground) = (leaf.pane, leaf.blank);
+                let read = leaf.announcement;
+                leaf.announcement = read.and_then(|place| {
+                    announcement_inks(&place, pane, ground, faint_opacity, &*scratch)
+                });
+                inked = read.map(|_| leaf.announcement.map(|news| news.rows));
+            }
             let at = entries
                 .iter()
                 .position(|e| (e.leaf_index, e.session) == (leaf.leaf_index, leaf.session))
@@ -2516,6 +2761,16 @@ impl App {
                 });
             if let Some(at) = at {
                 entries[at].leaf_index = leaf.leaf_index;
+                if let Some(news_rows) = inked
+                    && entries[at].identity == leaf.token
+                {
+                    // The banner the entry wore over an earlier slot (one the vendor since
+                    // released) is no banner for the refused one's rows to keep.
+                    if news_rows.is_none() {
+                        entries[at].announcement = BannerGlass::default();
+                    }
+                    entries[at].news_rows = news_rows;
+                }
             }
             let Some(((read, token, text_gen), look)) = leaf.card.as_ref().zip(look) else {
                 let why = leaf.bare.unwrap_or(Bare::NoCard);
@@ -2525,6 +2780,37 @@ impl App {
                     entry.gate_hid |= why.bounds_reshow();
                     if !leaf.drawerless && !leaf.view.carries() {
                         entry.view = leaf.view;
+                    }
+                    // The card scrolled off over its startup announcement: the banner stays over
+                    // the slot's rows still on screen, as it did over the cut card's, and off the
+                    // tip over its news (`news_rows`, read under the card) while the tip stands.
+                    if let Some(place) = &leaf.announcement
+                        && entry.identity == leaf.token
+                        && entry.whole
+                        && !find_up
+                    {
+                        let end = place.top + place.rows;
+                        let top = entry
+                            .news_rows
+                            .map_or(place.top, |rows| end.saturating_sub(rows).max(place.top));
+                        let news = AnnouncementPlace {
+                            top,
+                            rows: end - top,
+                            ..*place
+                        };
+                        make_banner(
+                            &mut entry.announcement,
+                            ANNOUNCEMENT,
+                            BannerPlace::announcement(&news),
+                            &entry.card,
+                            None,
+                            leaf.pane,
+                            leaf.blank,
+                            scratch,
+                            leaf.view.card_palette().unwrap_or_default(),
+                            None,
+                            false,
+                        );
                     }
                 }
                 if probe {
@@ -2569,7 +2855,6 @@ impl App {
                 blank: leaf.blank,
                 place: read.place,
                 view: leaf.view,
-                end: leaf.end,
                 px: look.px,
                 serious: look.serious,
                 kitty: look.kitty,
@@ -2578,21 +2863,38 @@ impl App {
                 if let Some(entry) = at.map(|at| &mut entries[at])
                     && same(entry)
                     && entry.whole
-                    && let Some(place) = leaf.notice.as_ref().filter(|_| !find_up)
+                    && !find_up
                 {
                     let palette = leaf.view.card_palette().unwrap_or_default();
-                    make_notice(
-                        &mut entry.notice,
-                        &entry.card,
-                        place,
-                        read,
-                        leaf.pane,
-                        leaf.blank,
-                        scratch,
-                        palette,
-                        None,
-                        false,
-                    );
+                    let banners = [
+                        (
+                            &mut entry.notice,
+                            NOTICE,
+                            leaf.notice.as_ref().map(BannerPlace::notice),
+                        ),
+                        (
+                            &mut entry.announcement,
+                            ANNOUNCEMENT,
+                            leaf.announcement.as_ref().map(BannerPlace::announcement),
+                        ),
+                    ];
+                    for (banner, words, place) in banners {
+                        if let Some(place) = place {
+                            make_banner(
+                                banner,
+                                words,
+                                place,
+                                &entry.card,
+                                Some(read),
+                                leaf.pane,
+                                leaf.blank,
+                                scratch,
+                                palette,
+                                None,
+                                false,
+                            );
+                        }
+                    }
                 }
                 continue;
             }
@@ -2688,7 +2990,9 @@ impl App {
                         laid_gen: 0,
                         seen: Seen::default(),
                         line: CardLine::default(),
-                        notice: NoticeGlass::default(),
+                        notice: BannerGlass::default(),
+                        announcement: BannerGlass::default(),
+                        news_rows: None,
                     };
                     if let Some(origin) = origin {
                         entry.card.adopt_ripple(origin);
@@ -2710,6 +3014,9 @@ impl App {
             let entry = &mut entries[at];
             entry.view = leaf.view;
             entry.whole = true;
+            if let Some(news_rows) = inked {
+                entry.news_rows = news_rows;
+            }
             let (glass, frame) = match entry.card.replay(&scene, look.animate, &entry.frames) {
                 Some(kept) => {
                     entry.shimmer = None;
@@ -2794,20 +3101,35 @@ impl App {
                     look.animate,
                 );
             }
-            if let Some(place) = leaf.notice.as_ref().filter(|_| !find_up) {
-                make_notice(
+            let banners = [
+                (
                     &mut entry.notice,
-                    &entry.card,
-                    place,
-                    read,
-                    leaf.pane,
-                    leaf.blank,
-                    scratch,
-                    scene.palette,
-                    frame
-                        .map(|(now, drew)| (now, drew, entry.frames.kept().and_then(|k| k.step()))),
-                    look.animate,
-                );
+                    NOTICE,
+                    leaf.notice.as_ref().map(BannerPlace::notice),
+                ),
+                (
+                    &mut entry.announcement,
+                    ANNOUNCEMENT,
+                    leaf.announcement.as_ref().map(BannerPlace::announcement),
+                ),
+            ];
+            let step = entry.frames.kept().and_then(|k| k.step());
+            for (banner, words, place) in banners {
+                if let Some(place) = place.filter(|_| !find_up) {
+                    make_banner(
+                        banner,
+                        words,
+                        place,
+                        &entry.card,
+                        Some(read),
+                        leaf.pane,
+                        leaf.blank,
+                        scratch,
+                        scene.palette,
+                        frame.map(|(now, drew)| (now, drew, step)),
+                        look.animate,
+                    );
+                }
             }
             keep(entry, Some((lay, scene)), seen);
             if probe {

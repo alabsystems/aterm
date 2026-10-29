@@ -28,6 +28,12 @@ fn the_model_adds_one_per_present_and_drains_one_per_period() {
     let err = drained.max(want) - drained.min(want);
     assert!(err < Duration::from_micros(1), "drains to 1 at t0 + P");
     assert_eq!(b.drained_to(2.0), None);
+    assert_eq!(b.drained_to(f64::NAN), None);
+    assert!(b.drained_to(f64::NEG_INFINITY).is_some());
+    let mut huge = FifoBacklog::default();
+    huge.note_present(t0, Duration::MAX);
+    huge.note_present(t0, Duration::MAX);
+    assert!(huge.drained_to(0.0).is_some());
 }
 
 #[test]

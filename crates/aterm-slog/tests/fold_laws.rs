@@ -4,8 +4,8 @@
 //! The fold's laws and the clause.
 
 use aterm_slog::{
-    Actor, Amend, BoxWord, Close, Conf, Fields, Fold, Key, Kind, Limits, Log, Mark, Open, Out, Rec,
-    RunOut, ShortId, Src, Tone, TurnTracker, Verdict, WallKind,
+    Actor, Amend, BoxWord, Close, Conf, Fields, Fold, Key, Kind, Limits, Log, Mark, Node, Open,
+    Out, Rec, RunOut, ShortId, Src, StepOut, Tone, TurnOut, TurnTracker, Verdict, WallKind,
 };
 
 use crate::support::{WALL0, agent_session, at};
@@ -946,4 +946,407 @@ fn a_repeated_inbox_seen_moves_no_mail_count() {
     }
     mark(&mut log, Kind::MailSeen, seen(None), 7);
     assert_eq!(counts(&log), (0, 2), "an older writer's seen is a move");
+}
+
+/// A turn with one open tool step. With `step_out`, the step closes itself first;
+/// without, the turn's close (`turn_out` at `conf`) cascades it `gone` at that conf.
+fn turn_with_a_step(
+    step_out: Option<StepOut>,
+    turn_out: TurnOut,
+    conf: Conf,
+) -> (Log, aterm_slog::Node, aterm_slog::Node) {
+    let mut log = Log::new(0);
+    let run = agent_session(&mut log, 0);
+    let turn = log
+        .open(
+            Open::new(Kind::Turn, Src::Screen, Conf::Strong).under(run),
+            at(1),
+        )
+        .expect("turn");
+    let cls = Fields::new().word(Key::Cls, "shell").expect("cls");
+    let step = log
+        .open(
+            Open::new(Kind::Tool, Src::Transcript, Conf::Strong)
+                .under(turn)
+                .fields(cls),
+            at(2),
+        )
+        .expect("step");
+    if let Some(o) = step_out {
+        log.close(
+            step,
+            Close::new(Out::Step(o), Src::Transcript, Conf::Strong),
+            at(3),
+        )
+        .expect("the step closes");
+    }
+    log.close(
+        turn,
+        Close::new(Out::Turn(turn_out), Src::Screen, conf),
+        at(4),
+    )
+    .expect("the turn closes");
+    (log, turn, step)
+}
+
+/// Fix E1 (E2E-7): a step's `gone` is its turn's cascade, never an observation, so any
+/// amend the confidence law admits gives it its outcome, in the fold and in `brief`. Every
+/// other outcome, and every turn's, still takes an exact amend only.
+#[test]
+fn a_cascade_gone_step_takes_an_admitted_amend_and_nothing_else_does() {
+    let read = |log: &Log, lvl: usize, line: &str| {
+        let held = log.state().last[lvl].clone().expect("held");
+        assert_eq!(held.f.word(Key::Out), Some(held.out), "field and outcome");
+        let b = log.brief("s-1", aterm_slog::DEFAULT_BUDGET, WALL0 + 10);
+        let shown = b.text.lines().any(|l| l.trim_start().starts_with(line));
+        (held.out, shown, b.text)
+    };
+
+    let (mut log, _, step) = turn_with_a_step(None, TurnOut::Done, Conf::Strong);
+    assert_eq!(read(&log, 2, "p1 tool shell gone").0, "gone");
+    amend_out(&mut log, step, Kind::Tool, "ok", Conf::Strong, 6);
+    let (out, shown, text) = read(&log, 2, "p1 tool shell ok");
+    assert_eq!(out, "ok", "the cascade's gone takes the result: {text}");
+    assert!(shown, "{text}");
+
+    let (mut log, _, step) = turn_with_a_step(Some(StepOut::Ok), TurnOut::Done, Conf::Strong);
+    amend_out(&mut log, step, Kind::Tool, "error", Conf::Strong, 6);
+    let (out, shown, text) = read(&log, 2, "p1 tool shell ok");
+    assert_eq!(
+        out, "ok",
+        "an observed outcome takes an exact amend only: {text}"
+    );
+    assert!(shown, "{text}");
+
+    let (mut log, turn, _) = turn_with_a_step(None, TurnOut::Gone, Conf::Strong);
+    amend_out(&mut log, turn, Kind::Turn, "done", Conf::Strong, 6);
+    let (out, shown, text) = read(&log, 1, "t1 gone");
+    assert_eq!(
+        out, "gone",
+        "a turn's gone takes an exact amend only: {text}"
+    );
+    assert!(shown, "{text}");
+    assert_eq!(log.state().totals.done, 0, "{:?}", log.state().totals);
+
+    let (mut log, _, step) = turn_with_a_step(None, TurnOut::Done, Conf::Exact);
+    amend_out(&mut log, step, Kind::Tool, "ok", Conf::Strong, 6);
+    let (out, shown, text) = read(&log, 2, "p1 tool shell gone");
+    assert_eq!(
+        out, "gone",
+        "the law still ranks: an exact gone outranks a strong ok: {text}"
+    );
+    assert!(shown, "{text}");
+}
+
+/// Every step outcome, walked from the producer's own enum: the match is exhaustive, so a
+/// new `StepOut` variant fails to compile here until it joins the walk.
+fn every_step_out() -> Vec<StepOut> {
+    std::iter::successors(Some(StepOut::Ok), |o| match o {
+        StepOut::Ok => Some(StepOut::Error),
+        StepOut::Error => Some(StepOut::Approved),
+        StepOut::Approved => Some(StepOut::Declined),
+        StepOut::Declined => Some(StepOut::Answered),
+        StepOut::Answered => Some(StepOut::Dismissed),
+        StepOut::Dismissed => Some(StepOut::Passed),
+        StepOut::Passed => Some(StepOut::Interrupted),
+        StepOut::Interrupted => Some(StepOut::Gone),
+        StepOut::Gone => Some(StepOut::Retracted),
+        StepOut::Retracted => Some(StepOut::Unknown),
+        StepOut::Unknown => None,
+    })
+    .collect()
+}
+
+/// Fix E1 (E2E-7), the other half of the exception: only a step's `gone` is a cascade.
+/// A step that closed with any other outcome was observed, so a strong amend leaves it
+/// as it closed, in the fold and in `brief`, whichever outcome it is.
+#[test]
+fn an_observed_step_outcome_takes_no_strong_amend_whichever_it_is() {
+    let observed: Vec<StepOut> = every_step_out()
+        .into_iter()
+        .filter(|o| *o != StepOut::Gone)
+        .collect();
+    assert_eq!(observed.len() + 1, every_step_out().len(), "gone is walked");
+    for held in observed {
+        let word = Out::Step(held).word();
+        let offered = if held == StepOut::Ok { "error" } else { "ok" };
+        let (mut log, _, step) = turn_with_a_step(Some(held), TurnOut::Done, Conf::Strong);
+        amend_out(&mut log, step, Kind::Tool, offered, Conf::Strong, 6);
+        let kept = log.state().last[2].clone().expect("held");
+        assert_eq!(kept.out, word, "a strong {offered} overruled a held {word}");
+        let b = log.brief("s-1", aterm_slog::DEFAULT_BUDGET, WALL0 + 10);
+        let line = format!("p1 tool shell {word}");
+        assert!(
+            b.text.lines().any(|l| l.trim_start().starts_with(&line)),
+            "the brief lost a held {word} to a strong {offered}: {}",
+            b.text
+        );
+    }
+}
+
+/// A session whose agent run's turn holds decision step p of `kind` (an approval box `bash`, or
+/// a question) and a tool step the transcript opened beside it after p, in the same ms, as
+/// Claude Code's transcript does (finding E2E-3): `(p, the tool step)`.
+fn decision_beside_a_tool(log: &mut Log, kind: Kind) -> (Node, Node) {
+    let run = agent_session(log, 0);
+    let turn = log
+        .open(
+            Open::new(Kind::Turn, Src::Screen, Conf::Strong).under(run),
+            at(1),
+        )
+        .expect("turn");
+    let f = if kind == Kind::Approval {
+        Fields::new().word(Key::Box, "bash").expect("box")
+    } else {
+        Fields::new()
+    };
+    let p = log
+        .open(
+            Open::new(kind, Src::Screen, Conf::Strong)
+                .under(turn)
+                .fields(f),
+            at(2),
+        )
+        .expect("the decision step");
+    let tool = log
+        .open(
+            Open::new(Kind::Tool, Src::Transcript, Conf::Strong)
+                .under(turn)
+                .by(Actor::Vendor)
+                .fields(Fields::new().word(Key::Cls, "shell").expect("cls")),
+            at(2),
+        )
+        .expect("the tool step");
+    (p, tool)
+}
+
+/// `mark <at|-> <kind> word=<word> src=<src> by=<by>`, as a producer writes it.
+fn need_mark(
+    log: &mut Log,
+    kind: Kind,
+    (src, by): (Src, Actor),
+    word: &str,
+    at_node: Option<Node>,
+    ms: u64,
+) {
+    let conf = if src == Src::Mark {
+        Conf::Claim
+    } else {
+        Conf::Strong
+    };
+    let mut m = Mark::new(kind, src, conf)
+        .by(by)
+        .fields(Fields::new().word(Key::Word, word).expect("word"));
+    if let Some(node) = at_node {
+        m = m.at(node);
+    }
+    log.mark(m, at(ms)).expect("mark");
+}
+
+/// The supervisor's escalation as `observe_meta` writes it: `src=meta conf=strong by=aterm`.
+const META: (Src, Actor) = (Src::Meta, Actor::Aterm);
+
+fn needs_of(log: &Log) -> Vec<(&'static str, Node)> {
+    log.state()
+        .needs
+        .iter()
+        .flatten()
+        .map(|n| (n.word, n.node))
+        .collect()
+}
+
+/// Fix E3 (E2E-3): the escalation the harness raised on a box or question is that step's need,
+/// and ends in the same apply that closes the step. Before the fix it was the session's: the
+/// close uncovered it, and every fold reader said `escalated` until the harness's clear, 250 to
+/// 330 ms after the person had answered.
+#[test]
+fn an_escalation_on_a_decision_step_ends_with_it() {
+    for (kind, own) in [
+        (Kind::Approval, "approval:bash"),
+        (Kind::Question, "question"),
+    ] {
+        let mut log = Log::new(0);
+        let (p, tool) = decision_beside_a_tool(&mut log, kind);
+        need_mark(&mut log, Kind::Need, META, "escalated", Some(p), 3);
+        assert_eq!(
+            needs_of(&log),
+            [(own, p), ("escalated", p)],
+            "{kind:?}: the escalation is p's"
+        );
+        let before = log.state().as_of;
+        log.close(
+            p,
+            Close::new(Out::Step(StepOut::Passed), Src::Screen, Conf::Strong).by(Actor::Human),
+            at(4),
+        )
+        .expect("the person answered");
+        assert_eq!(log.state().as_of, before + 1, "{kind:?}: one record");
+        assert!(log.is_open(tool), "{kind:?}: the tool step stands");
+        assert_eq!(
+            log.state().top_observed_need().map(|n| n.word),
+            None,
+            "{kind:?}: the close uncovered the escalation"
+        );
+        assert!(needs_of(&log).is_empty(), "{kind:?}: {:?}", needs_of(&log));
+        need_mark(&mut log, Kind::Clear, META, "escalated", None, 5);
+        assert!(
+            needs_of(&log).is_empty(),
+            "{kind:?}: the clear changed nothing"
+        );
+    }
+}
+
+/// Fix E3 (E2E-3): the harness's clear lifts a step's escalation while the step stands, which
+/// leaves the step's own need; a consumer's `clear` never lifts it; an escalation on `-` (a
+/// record written before the fix) is the session's, which a step's close leaves to the clear; a
+/// consumer's claim on the step is the session's whatever node it was written on.
+#[test]
+fn the_harness_clear_lifts_a_step_escalation_while_the_step_stands() {
+    let mut log = Log::new(0);
+    let (p, _) = decision_beside_a_tool(&mut log, Kind::Approval);
+    need_mark(&mut log, Kind::Need, META, "escalated", Some(p), 3);
+    need_mark(
+        &mut log,
+        Kind::Clear,
+        (Src::Mark, Actor::Ctl),
+        "escalated",
+        None,
+        4,
+    );
+    log.mark(
+        Mark::new(Kind::Clear, Src::Mark, Conf::Claim).by(Actor::Ctl),
+        at(5),
+    )
+    .expect("a ctl clear of every need");
+    assert_eq!(
+        needs_of(&log),
+        [("approval:bash", p), ("escalated", p)],
+        "a consumer's clear lifted the harness's escalation"
+    );
+    need_mark(&mut log, Kind::Clear, META, "escalated", None, 6);
+    assert_eq!(
+        needs_of(&log),
+        [("approval:bash", p)],
+        "the harness's clear leaves the step's own need"
+    );
+
+    let mut log = Log::new(0);
+    let (p, _) = decision_beside_a_tool(&mut log, Kind::Question);
+    need_mark(
+        &mut log,
+        Kind::Need,
+        META,
+        "escalated",
+        Some(Node::SESSION),
+        3,
+    );
+    for (word, by) in [
+        ("review", Actor::Harness),
+        ("decision", Actor::Ctl),
+        ("help", Actor::Harness),
+    ] {
+        need_mark(&mut log, Kind::Need, (Src::Mark, by), word, Some(p), 4);
+    }
+    let session = |log: &Log| {
+        needs_of(log)
+            .into_iter()
+            .filter(|(w, _)| *w != "question")
+            .collect::<Vec<_>>()
+    };
+    let standing = vec![
+        ("escalated", Node::SESSION),
+        ("review", Node::SESSION),
+        ("help", Node::SESSION),
+        ("decision", Node::SESSION),
+    ];
+    assert_eq!(
+        session(&log),
+        standing,
+        "every other need mark is the session's"
+    );
+    log.close(
+        p,
+        Close::new(Out::Step(StepOut::Answered), Src::Screen, Conf::Strong).by(Actor::Harness),
+        at(5),
+    )
+    .expect("answered");
+    assert_eq!(
+        needs_of(&log),
+        standing,
+        "a session's need outlives the step"
+    );
+    need_mark(&mut log, Kind::Clear, META, "escalated", None, 6);
+    assert_eq!(
+        needs_of(&log),
+        standing[1..],
+        "the clear lifts the session's escalation"
+    );
+}
+
+/// `mark - act word=<w>` as the harness writes it (`src=aterm by=harness`).
+fn act_on_dash(log: &mut Log, word: &str, at_node: Option<Node>, ms: u64) -> Node {
+    let mut m = Mark::new(Kind::Act, Src::Aterm, Conf::Strong)
+        .by(Actor::Harness)
+        .fields(Fields::new().word(Key::Word, word).expect("word"));
+    if let Some(node) = at_node {
+        m = m.at(node);
+    }
+    let seq = log.mark(m, at(ms)).expect("an act");
+    node_of(log, seq)
+}
+
+fn node_of(log: &Log, seq: u64) -> Node {
+    log.window()
+        .rev()
+        .find(|r| r.seq == seq)
+        .map(|r| r.node)
+        .expect("the record")
+}
+
+/// Fix E3 (E2E-3): the harness's act on `-` is the act of deciding the open approval or
+/// question step, even with a tool step opened beside it after it. Before the fix it landed on
+/// the deepest open node: the tool's step, or the turn once the box had closed. Any other
+/// node-less mark still lands on the deepest open node, and an act that names an open node is
+/// kept there.
+#[test]
+fn a_node_less_act_lands_on_the_open_decision_step() {
+    for kind in [Kind::Approval, Kind::Question] {
+        let mut log = Log::new(0);
+        let (p, tool) = decision_beside_a_tool(&mut log, kind);
+        assert_eq!(
+            act_on_dash(&mut log, "escalate", None, 3),
+            p,
+            "{kind:?}: the act is the decision step's"
+        );
+        let note = log
+            .mark(
+                Mark::new(Kind::Note, Src::Mark, Conf::Claim)
+                    .by(Actor::Ctl)
+                    .fields(Fields::new().text(Key::Text, "a note").expect("text")),
+                at(3),
+            )
+            .expect("a note");
+        assert_eq!(
+            node_of(&log, note),
+            tool,
+            "{kind:?}: a note is the deepest node's"
+        );
+        let turn = log.state().turn().expect("the turn").node;
+        assert_eq!(
+            act_on_dash(&mut log, "approve", Some(turn), 4),
+            turn,
+            "{kind:?}: an act that names an open node stays there"
+        );
+        log.close(
+            p,
+            Close::new(Out::Step(StepOut::Passed), Src::Screen, Conf::Strong).by(Actor::Human),
+            at(5),
+        )
+        .expect("answered");
+        assert_eq!(
+            act_on_dash(&mut log, "escalate", Some(p), 6),
+            tool,
+            "{kind:?}: with no decision step open, an act is the deepest node's"
+        );
+    }
 }

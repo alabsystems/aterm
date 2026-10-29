@@ -726,12 +726,25 @@ mod osc_color_response_cap_tests {
         let response = term
             .take_response()
             .expect("OSC 21 query must emit a response");
-        let pair_count = response.iter().filter(|b| **b == b'=').count();
+        let reply_str = std::str::from_utf8(&response).expect("OSC 21 reply is ASCII");
+        let body = reply_str
+            .strip_prefix("\x1b]21;")
+            .and_then(|s| s.strip_suffix("\x1b\\").or_else(|| s.strip_suffix('\x07')))
+            .expect("OSC 21 reply must carry header and terminator");
+        let pairs: Vec<&str> = body.split(';').collect();
         assert_eq!(
-            pair_count, LEGACY_PALETTE_PER_SEQUENCE_MAX,
+            pairs.len(),
+            LEGACY_PALETTE_PER_SEQUENCE_MAX,
             "OSC 21 response must contain exactly {} pairs (cap), got {}",
-            LEGACY_PALETTE_PER_SEQUENCE_MAX, pair_count,
+            LEGACY_PALETTE_PER_SEQUENCE_MAX,
+            pairs.len(),
         );
+        for (idx, pair) in pairs.iter().enumerate() {
+            assert!(
+                pair.starts_with(&format!("{idx}=rgb:")),
+                "unexpected OSC 21 pair[{idx}]: {pair:?}"
+            );
+        }
     }
 
     #[test]

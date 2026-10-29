@@ -79,6 +79,20 @@ impl StepEvidence {
         out
     }
 
+    /// Append `other`'s windows after this ledger's, in their order: a conformance that drives
+    /// its steps on several threads (a window opens on the thread that drives it) keeps a
+    /// ledger per step it hands out and absorbs them in the order it reads the steps back.
+    /// # Panics
+    /// If `other` is another machine's ledger.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn absorb(&mut self, other: Self) {
+        assert_eq!(
+            self.machine, other.machine,
+            "a ledger absorbs only its own machine's windows"
+        );
+        self.steps.extend(other.steps);
+    }
+
     /// The machine this ledger is about.
     #[must_use]
     pub const fn machine(&self) -> &'static str {

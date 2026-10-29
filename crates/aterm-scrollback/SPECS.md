@@ -91,7 +91,7 @@ id	kind	functions	statement	subsumes	difficulty	blocking_gaps
 line-wire-roundtrip	round-trip	Line::{serialize,append_serialized,deserialize}	∀ l ∈ Caps: Line::deserialize(&l.serialize()) = Some(d) with d = Strip(l) (content bytes, attrs runs, WRAPPED, hyperlink spans with ids, underline-colour spans; images() = None). Hence Wire(d) = Wire(l).	8	Vec<u8>/slices, Option<Box<Rle>>, SmallVec sidecars, Arc<str>, loops over runs and spans, u32/u16 LE encoding; serialize/deserialize are trust::skip today	0,1,3,7
 line-wire-version	contract	Line::{serialize,append_serialized}	∀ l: l.serialize()[0] = 4 if l.underline_colors().is_some() else 3; Wire(l) = Wire(Strip(l)) (images contribute no bytes); a line with no underline colours has no bytes after its hyperlink section.	2	Vec<u8> writer, Option sidecars	0,1,3
 block-roundtrip	round-trip	serialize_lines, deserialize_lines, deserialize_lines_capped, walk_records	∀ ls ∈ Caps* with |ls| ≤ u32::MAX: serialize_lines(ls) = u32le(|ls|) ++ concat(map Line::serialize ls), and deserialize_lines(serialize_lines(ls)) = map Strip ls (equal length, Wire-equal elementwise).	6	Vec<Line>, nested loops, framing arithmetic over slices, closure passed to walk_records; trust::skip to lift	0,1,3,5,7,13
-serialized-size-exact	contract	Line::serialized_size_estimate, HyperlinkSpan::serialized_size, serialize_lines, Line::serialize	∀ l: |l.serialize()| = l.serialized_size_estimate() = 6 + len + (1 or 5+14·runs) + (2 + Σ span.serialized_size) + (0 or 2+8·ul_spans); span.serialized_size = 12 + |url| + |id|; |serialize_lines(ls)| = 4 + Σ estimate, and below MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES the Vec's capacity = len. A plain line is len+9 bytes.	3	saturating folds over slices; Vec capacity as an observable (needs a capacity model)	0,1,3,7
+serialized-size-exact	contract	Line::serialized_size_estimate, HyperlinkSpan::serialized_size, serialize_lines, serialize_lines_bounded, Line::serialize	∀ l: |l.serialize()| = l.serialized_size_estimate() = 6 + len + (1 or 5+14·runs) + (2 + Σ span.serialized_size) + (0 or 2+8·ul_spans); span.serialized_size = 12 + |url| + |id|; |serialize_lines(ls)| = 4 + Σ estimate, and below MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES the Vec's capacity = len. serialize_lines_bounded(ls, max_bytes) = Some(serialize_lines(ls)) ⇔ |ls| ≤ u32::MAX ∧ |serialize_lines(ls)| ≤ max_bytes, else None. A plain line is len+9 bytes.	4	saturating/checked folds over slices; Vec capacity as an observable (needs a capacity model)	0,1,3,7
 block-decode-total-bounded	no-panic	deserialize_lines, deserialize_lines_capped, walk_records, declared_count, line_size_v0, line_size_v1v2	∀ d: deserialize_lines(d) returns without panic; |d| < 4 ⇒ []; otherwise, with count = u32le(d[0..4]), the result is the Line::deserialize-accepted records among the framed records walked from offset 4 (stopping at the first unframeable or overrunning record, or after count records). So |result| ≤ min(count, (|d|-4)/5) and capacity = len.	10	slice walk with checked arithmetic, loop invariant offset ≤ |d|, shrink_to_fit, closure	0,1,3,5,7,13
 line-decode-total-capped	no-panic	Line::{deserialize,deserialize_attrs,deserialize_hyperlinks_v3,deserialize_underline_colors,deserialize_legacy}	∀ d: Line::deserialize(d) returns without panic; it is None if d = [], if d[0] ≠ 0 ∧ |d| < 7, or if the declared content length exceeds MAX_LINE_CONTENT_BYTES or overruns d. If Some(l) then l ∈ Caps and images() = None: an over-cap URL drops its span, an over-cap id becomes None with the URL kept, span counts are capped, and RLE run lengths saturate when summed.	5	slice indexing, u32 LE reads, Arc<str> from bytes, SmallVec, loops, saturating RLE extend	0,1,3,5,7,12
 record-is-valid-mirrors-deserialize	equivalence	Line::record_is_valid, Line::deserialize, count_page_lines, deserialize_lines_capped	∀ d: Line::record_is_valid(d) ⇔ Line::deserialize(d).is_some(); hence ∀ d, m: count_page_lines(d, m) = |deserialize_lines_capped(d, m)|.	1	two slice readers related by an equivalence; the corollary composes callee ensures through walk_records	0,1,3,4,5,7
@@ -109,7 +109,7 @@ lz4-decode-classification	contract	lz4::decompress_size_prepended, map_decompres
 lz4-roundtrip	round-trip	lz4::{compress_prepend_size,decompress_size_prepended}, encode_cold_block, decode_cold_bounded, decompress_lz4_bounded	∀ x with |x| ≤ MAX_DECOMPRESSED_SIZE: compress_prepend_size(x) = Ok(c) and decompress_size_prepended(&c) = Ok(x); compress_prepend_size errs ⇔ |x| > u32::MAX; likewise for encode_cold_block/decode_cold_bounded, decompress_lz4_bounded, and data compressed by aterm_lz4 directly. Needs the aterm_lz4 lemma that its body length ≥ ⌈|x|/255⌉, so the 512:1 gate never fires on honest output.	5	Vec<u8>, cross-crate LZ4 correctness lemma	0,1,4,7,12
 dec-string-decimal	contract	error::dec_string	∀ v: usize: dec_string(v) = format!("{v}") (shortest base-10 rendering, no sign, no leading zero except "0").	1	String building in a digit loop	0,1,7
 error-source-io-only	contract	ScrollbackError::source	∀ e: e.source().is_some() ⇔ e is ScrollbackError::Io(_), and then it is that io::Error.	1	enum match, Option<&dyn Error>	0,1,3,11
-watermark-transition-table	table-property	watermark::recompute_watermark, Scrollback::update_watermark_level	∀ level c, ∀ b, r, y, x: recompute_watermark(c, b, r, y, x) = Red if b ≥ r; else Yellow if b ≥ y; else Yellow if c = Red; else Green if c = Yellow ∧ b < x; else c. update_watermark_level sets level := recompute_watermark(level, budgeted_bytes, red, yellow, yellow_exit).	8	3-variant non_exhaustive enum match, usize compares; &mut self for the method	0,1,2,3
+watermark-transition-table	table-property	watermark::recompute_watermark, Scrollback::update_watermark_level	∀ level c, ∀ b, r, y, x: recompute_watermark(c, b, r, y, x) = Red if b ≥ r; else Yellow if b ≥ y; else Yellow if c = Red; else Green if c = Yellow ∧ b < x; else c. update_watermark_level sets level := recompute_watermark(level, budgeted_bytes, red, yellow, yellow_exit).	8	3-variant non_exhaustive enum match, usize compares; &mut self for the method	0,1,2,3; fragment: `watermark::recompute_watermark` F1+D2b (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs").
 threshold-bytes-bounds	contract	watermark::threshold_bytes	∀ p ≤ 100, ∀ b: threshold_bytes(p, b) = ⌊b·p/100⌋ (in u128); hence ≤ b, monotone in p (exit(50) ≤ yellow(80) ≤ red(95)), and = 0 ⇔ b·p < 100.	1	u128 widening, saturating_mul, division, narrowing cast with min	0,3
 store-watermark-invariant	invariant	Scrollback::{new,with_block_size,clear,set_memory_budget,set_watermark_thresholds,sync_accounting}, ScrollbackStorage::watermark_level	∀ s ∈ Reach: (yellow, yellow_exit, red) = (threshold_bytes(Y, budget), threshold_bytes(50, budget), threshold_bytes(R, budget)) for the configured Y, R (default 80, 95); a fresh or cleared store is Green; after every mutator, level = recompute_watermark(previous level, budgeted_memory_used(), red, yellow, yellow_exit). ScrollbackStorage::watermark_level() is the inner store's.	8	type invariant over a large struct with &mut self methods; composes watermark-transition-table	0,1,2,4,6
 eager-promotion-at-yellow	contract	Scrollback::push_line, promote_hot_to_warm	∀ s ∈ Reach, l: push_line promotes one block hot→warm before appending ⇔ hot.len() ≥ hot_limit, or level ≥ Yellow ∧ hot.len() ≥ block_size. So below Yellow, fewer than hot_limit pushes leave warm and cold unchanged.	2	&mut self over VecDeque/Vec tiers, composition into LZ4 compression	0,1,2,4,7
@@ -123,7 +123,7 @@ iter-and-dense-walk-match-get-line	equivalence	Scrollback::iter, ScrollbackStora
 hot-reads-borrow	contract	Scrollback::{get_line,get_line_rev}, ScrollbackStorage::dense_from	∀ s ∈ Reach, i < line_count: get_line(i) is Cow::Borrowed ⇔ i ≥ line_count - hot.len(), else Cow::Owned; the dense walk yields Some(Cow::Borrowed) exactly for hot rows.	2	Cow variant as an observable, lifetimes	0,1,2,3
 memory-accounting-exact	invariant	Scrollback::{sync_accounting,total_memory_used,memory_used,cold_memory_used,budgeted_memory_used}, WarmTier::memory_used, HotTier::memory_used, Line::memory_used	∀ s ∈ Reach after every public call: total_memory_used() = recompute_total_memory_used() = memory_used() + cold_memory_used(); budgeted_memory_used() = recompute_budgeted_bytes(); over_budget() ⇔ budgeted > memory_budget; read-only calls (get_line, iter) leave budgeted_memory_used() unchanged but may raise memory_used()/cold_memory_used() by the caches they fill; a push_line with no promotion raises memory_used() by Line::memory_used(l).	12	running counters vs recomputation (folds over all tiers), Cell caches mutated through &self	0,1,2,5,7
 budget-enforcement-fifo	contract	Scrollback::{set_memory_budget,handle_memory_pressure,push_line}, ColdTier::pop_front_batch	∀ s ∈ Reach with no corrupt block: after push_line or a successful set_memory_budget(b), ¬over_budget() or cold is empty; eviction removes whole oldest cold pages only (M loses a prefix, the newest line survives); pressure_evicted_lines grows by exactly the lines budget eviction removed, and set_line_limit/truncate never change it; memory_budget() = b afterwards.	6	loop until a predicate, monotone counter, composes cold-tier-refines-seq	0,1,2,4,7
-image-retention-horizon	contract	Scrollback::{push_line,promote_hot_to_warm,image_rows_dropped_by_compression,clear}, count_image_rows	∀ s ∈ Reach, i: if row i is hot, get_line(i).images() is the pushed span list with the same Arc payload (ptr_eq); otherwise images() = None and Strip content is unchanged; each promotion adds count_image_rows(batch) = #{l ∈ batch | l.has_images()} to image_rows_dropped_by_compression, which is monotone and survives clear(); when image rows leave hot their per_row_bytes shares leave total_memory_used.	7	Arc pointer identity, monotone u64 counter, composition across promotion	0,1,2,4,7,12
+image-retention-horizon	contract	Scrollback::{push_line,promote_hot_to_warm,image_rows_dropped_by_compression,clear,retain_images}, ScrollbackStorage::retain_images, HotTier::retain_images, Line::retain_images, count_image_rows	∀ s ∈ Reach, i: if row i is hot, get_line(i).images() is the pushed span list with the same Arc payload (ptr_eq); otherwise images() = None and Strip content is unchanged; each promotion adds count_image_rows(batch) = #{l ∈ batch | l.has_images()} to image_rows_dropped_by_compression, which is monotone and survives clear(); when image rows leave hot their per_row_bytes shares leave total_memory_used. retain_images(keep) filters hot-tier image spans in order, drops empty image sidecars to None, reconciles total_memory_used/budgeted_memory_used and watermark level when any span is removed, preserves existing allocations when keep accepts every span, and returns whether any span was dropped.	8	Arc pointer identity, monotone u64 counter, FnMut retention filter across hot rows, composition across promotion	0,1,2,4,7,12,13
 storage-delegates	refinement	ScrollbackStorage::*, From<Scrollback>, ScrollbackStorage::default	∀ st and delegated method m: st.m(args) = inner.m(args) for its one variant, Memory (Ok for an infallible inner call); From<Scrollback> gives Memory; default() = Memory(Scrollback::with_defaults()); hot_limit/warm_limit/memory_budget/line_limit read back what was configured or last set.	14	enum dispatch macro, Result wrapping	0,1,2,3,4
 hot-tier-deque	refinement	HotTier::{push,get,len,take_front,truncate_front,truncate_back}	HotTier refines Seq<Line> H: push(l): H := H ++ [l]; get(i) = H.get(i); len = |H|; take_front(k) returns take(k, H) and H := drop(k, H); truncate_front(keep): H := last(keep, H); truncate_back(n): H := take(|H| - min(n,|H|), H); bytes_used = size_of::<HotTier>() + Σ Line::memory_used(H).	3	VecDeque<Line>, Vec return, &mut self	0,1,2,7
 warm-tier-refines-seq	refinement	WarmBlock::{from_lines,decompress,get_line}, WarmTier::{push_block,pop_front,push_front,truncate_front_lines,get_line,locate,segment_len_at,rebuild_cumulative}	WarmBlock::from_lines(ls).decompress() = Ok(map Strip ls) and get_line(i) = Ok(ls.get(i)); WarmTier refines V(warm): push_block appends a block's lines; pop_front removes and returns the front block (its live lines leave line_count); push_front(pop_front()) is the identity; truncate_front_lines(n) drops n lines without decoding; get_line(i) = V[i]; the amortized cumulative index (cum_start, cumulative_base) answers locate/segment_len_at/line_count as rebuild_cumulative() would; memory_used() = recompute_memory_used().	6	VecDeque<WarmBlock>, amortized index with dead-prefix compaction, Cell caches, LZ4 calls	0,1,2,4,5,7
@@ -155,6 +155,7 @@ src/line_tests.rs	a_line_reports_the_footprint_tile_each_of_its_columns_paints	s
 src/line_tests.rs	a_link_dense_line_over_the_cap_keeps_its_text_and_loses_only_its_links	stripping-decode-refines-strict	
 src/line_tests.rs	a_span_starting_mid_footprint_keeps_its_tile_offsets	span-column-lookup	
 src/line_tests.rs	attr_cursor_matches_get_attr_everywhere	attr-lookup-and-cursor	
+src/line_tests.rs	bounded_line_blocks_preserve_wire_bytes_at_their_budget	serialized-size-exact	block-roundtrip
 src/line_tests.rs	cell_attrs_from_raw_preserves_main_cell_wide_geometry	cell-attrs-codec-mask	
 src/line_tests.rs	clearing_hyperlinks_drops_the_links_and_keeps_everything_else	clear-hyperlinks-frame	
 src/line_tests.rs	deserialize_caps_hyperlink_span_count	line-decode-total-capped	
@@ -197,8 +198,8 @@ src/lz4.rs	test_max_decompressed_size_at_limit	lz4-roundtrip
 src/lz4.rs	test_max_decompressed_size_rejection	lz4-decode-classification	
 src/lz4.rs	test_ratio_boundary_exactly_at_limit_accepted	lz4-decode-classification	
 src/memory_tracking_tests.rs	scrollback_budget_ignores_warm_cache_population	memory-accounting-exact	
+src/memory_tracking_tests.rs	scrollback_incremental_counters_match_recomputed	memory-accounting-exact	
 src/performance_tests.rs	push_with_line_limit_constant_time_truncate	decode-work-bound	
-src/performance_tests.rs	remove_newest_memory_bounded_cross_tier	-	move-to-bench
 src/performance_tests.rs	remove_newest_work_sublinear_in_total_size	decode-work-bound	scrollback-refines-seq
 src/storage_tests.rs	dense_walk_borrows_hot_lines	hot-reads-borrow	
 src/storage_tests.rs	dense_walk_matches_per_line_oracle_across_tiers_and_front_truncation	iter-and-dense-walk-match-get-line	
@@ -209,7 +210,6 @@ src/storage_tests.rs	streaming_iter_skips_corrupt_block_with_same_totals	iter-an
 src/tests/basic.rs	scrollback_clear	scrollback-refines-seq	
 src/tests/basic.rs	scrollback_promotion	scrollback-refines-seq	tier-shape-invariant
 src/tests/basic.rs	tier_transition_content_fidelity_multi_cycle	scrollback-refines-seq	
-src/tests/decompression.rs	corrupt_warm_block_quarantined_after_threshold	store-corruption-semantics	
 src/tests/decompression.rs	corrupt_warm_block_quarantines_only_on_final_eviction_attempt	store-corruption-semantics	
 src/tests/decompression.rs	decompress_lz4_bounded_rejects_oversized_prefix	lz4-decode-classification	
 src/tests/decompression.rs	decompress_lz4_bounded_rejects_too_short	lz4-decode-classification	
@@ -228,6 +228,7 @@ src/tests/image_horizon.rs	a_footprint_straddling_the_horizon_ages_out_from_its_
 src/tests/image_horizon.rs	a_footprints_payload_leaves_the_byte_budget_when_its_rows_cross	image-retention-horizon	memory-accounting-exact, image-memory-share
 src/tests/image_horizon.rs	a_picture_is_retained_for_exactly_as_long_as_its_line_is_uncompressed	image-retention-horizon	
 src/tests/image_horizon.rs	crossing_the_horizon_costs_the_line_its_picture_and_nothing_else	image-retention-horizon	
+src/tests/image_horizon.rs	retaining_hot_images_preserves_order_and_reconciles_payload_accounting	image-retention-horizon	memory-accounting-exact
 src/tests/image_horizon.rs	the_horizon_count_never_decreases_and_survives_a_clear	image-retention-horizon	
 src/tests/image_horizon.rs	the_horizon_is_reported_only_for_lines_that_actually_carried_a_picture	image-retention-horizon	
 src/tests/line_limit.rs	binary_search_counted_matches_stdlib	binary-search-counted	
@@ -235,19 +236,20 @@ src/tests/line_limit.rs	scrollback_default_caps_runaway_push_from_oldest	scrollb
 src/tests/line_limit.rs	scrollback_line_limit_bounds_massive_push	scrollback-refines-seq	
 src/tests/line_limit.rs	scrollback_line_limit_default_is_safe_cap	tier-shape-invariant	
 src/tests/line_limit.rs	scrollback_line_limit_evicts_from_oldest_tier_first	truncate-oldest-tier-first	
-src/tests/line_limit.rs	scrollback_line_limit_zero_disables	scrollback-refines-seq	
+src/tests/line_limit.rs	scrollback_line_limit_zero_retains_zero_lines	scrollback-refines-seq	
 src/tests/memory_budget.rs	over_budget_false_after_cold_eviction	budget-enforcement-fifo	
 src/tests/memory_budget.rs	pressure_evictions_are_counted_and_limit_truncation_is_not	budget-enforcement-fifo	
 src/tests/memory_budget.rs	push_line_triggers_cold_eviction_when_over_budget	budget-enforcement-fifo	
 src/tests/memory_budget.rs	set_memory_budget_evicts_cold_pages	budget-enforcement-fifo	
 src/tests/repaired_trimmed.rs	repaired_trimmed_warm_block_keeps_logical_suffix	store-corruption-semantics	
+src/tests/truncation.rs	remove_newest_keeps_the_oldest_lines_on_every_path	scrollback-refines-seq	
+src/tests/truncation.rs	truncate_keeps_the_newest_lines_on_every_path	scrollback-refines-seq	truncate-oldest-tier-first
 src/tier_decode_tests.rs	read_failures_reach_quarantine_without_manual_record_failure	warm-block-quarantine-fsm	
 src/tier_decode_tests.rs	warm_block_decompress_rejects_truncated_serialized_payload	warm-block-count-validation	
 src/tier_decode_tests.rs	warm_block_successful_decompress_clears_failure_streak	warm-block-quarantine-fsm	
 src/tier_tests.rs	block_size_clamped_to_decode_page_cap	tier-shape-invariant	
 src/tier_tests.rs	rows_of_links_past_the_page_cap_age_out_whole	scrollback-refines-seq	line-wire-roundtrip
 src/tier_tests.rs	warm_block_decompress_rejects_oversized_lz4_prefix	lz4-decode-classification	
-src/tier_tests.rs	warm_block_to_cold_rejects_oversized_lz4_prefix	lz4-decode-classification	
 src/tier_tests.rs	warm_tier_cumulative_index_matches_rebuild_across_front_and_back_ops	warm-tier-refines-seq	
 src/tier_tests.rs	warm_tier_find_block_logarithmic_scaling	binary-search-counted	
 src/tier_tests.rs	warm_tier_memory_used_includes_cache	memory-accounting-exact	
@@ -256,6 +258,7 @@ src/watermark_tests.rs	thresholds_are_bounded_for_every_budget	threshold-bytes-b
 src/watermark_tests.rs	watermark_clear_resets_to_green	store-watermark-invariant	
 src/watermark_tests.rs	watermark_custom_thresholds_lower_yellow	store-watermark-invariant	
 src/watermark_tests.rs	watermark_eager_promotion_fires_under_pressure	eager-promotion-at-yellow	
+src/watermark_tests.rs	watermark_hysteresis_transitions	watermark-transition-table	store-watermark-invariant
 src/watermark_tests.rs	watermark_not_over_budget_after_sustained_push	budget-enforcement-fifo	store-watermark-invariant
 src/watermark_tests.rs	watermark_returns_to_green_after_budget_increase	store-watermark-invariant	
 src/watermark_tests.rs	watermark_visits_all_three_levels	store-watermark-invariant	
@@ -263,7 +266,7 @@ src/watermark_tests.rs	watermark_visits_all_three_levels	store-watermark-invaria
 
 ## 3. Coverage
 
-- 341 tests read. 329 map to one of the 53 specs. 12 are not spec samples (§4).
+- 121 live tests mapped in §2 across the 43 active specs (0 non-spec tests remain in §4; 341 original tests and 53 specs in the initial 2026-10-16 pre-prune snapshot).
 - The biggest collapses: `scrollback-refines-seq` (28 primary), `cold-tier-refines-seq` (15),
   `storage-delegates` (14), `lz4-decode-classification` (13), `memory-accounting-exact` (12),
   `iter-and-dense-walk-match-get-line` (11).
@@ -278,37 +281,23 @@ Status (2026-10-16): deleted `line_memory_used`, `capabilities_track_the_built_f
 Status 2026-10-17: the tests-and-gates audit also deleted `watermark_level_ord_is_green_yellow_red`,
 `scrollback_is_send_but_not_sync` (no static assertion took its place) and the timing test
 `pop_front_cost_scales_with_page_count`, and `disk_backed_remove_newest_memory_bounded_cross_tier` went
-with the disk tier. Their rows are gone. One **move-to-bench** row is left.
+with the disk tier. Their rows are gone.
 
-| test | why | action |
-|---|---|---|
-| `src/performance_tests.rs::remove_newest_memory_bounded_cross_tier` | A memory-ratio heuristic (after/before < 1.5×) over a diagnostic counter that includes caches. Its correctness half is `scrollback-refines-seq`; the bound it means is `decode-work-bound`. | **move-to-bench** |
-
-Counts at the reading: 9 **delete**, 3 **move-to-bench**. Every **delete** row's test is gone (status
-above), and its row with it. aterm-bench already owns throughput, so a move-to-bench row becomes a
-bench there, or is deleted if that bench already covers it.
+Status 2026-10-28: deleted `src/performance_tests.rs::remove_newest_memory_bounded_cross_tier`
+(`1.5x` memory-ratio heuristic; `remove_newest_work_sublinear_in_total_size` already checks the exact
+deterministic `records_walked <= 50` `decode-work-bound`). Zero non-spec tests remain.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **A mislabelled limit test.** `src/tests/line_limit.rs::scrollback_line_limit_zero_disables`:
-   `Some(0)` does not disable the limit, it keeps zero lines (`truncate(0)` clears). `None` disables it.
-   The spec (`scrollback-refines-seq`) states the real behaviour.
-2. **An unmeasured claim and a missed invariant.**
-   `src/tests/decompression.rs::iterator_skips_quarantined_block_without_redundant_decompression`
-   never measures "without redundant decompression" (no `take_records_walked` or failure-count check).
-   It also leaves `line_count() = 15` while `iter()` yields 10. That is consistent with the
-   skipping-iterator contract, but the test never asserts `skipped_lines`, so
-   `yielded + skipped = line_count` (`iter-and-dense-walk-match-get-line`) goes unchecked.
-3. **A false doc contract.** `Scrollback::new` in `src/lib.rs:255` documents
-   `ENSURES: self.memory_used() == 0`. That is false: `HotTier::new` and `WarmTier::new` start
-   `bytes_used` at `size_of::<Self>()`. Correct the doc before it becomes a Trust clause.
-4. **Budget claimed, diagnostic measured.**
-   `src/tests/image_horizon.rs::a_footprints_payload_leaves_the_byte_budget_when_its_rows_cross` talks
-   about the byte *budget* but measures `total_memory_used()` (diagnostic, includes caches), not
-   `budgeted_memory_used()`. The budget claim is untested; `image-retention-horizon` should state it over
-   `budgeted_memory_used()` as well.
-5. **Test-only code with no caller.** `HyperlinkSpan::width()` is `#[cfg(test)]`, and nothing calls
-   it; delete it.
+1. **Resolved:** `src/tests/line_limit.rs::scrollback_line_limit_zero_retains_zero_lines` now tests both `Some(0)` (retaining zero lines on existing and newly pushed lines) and `None` (uncapping line retention).
+2. **Resolved: `iterator_skips_quarantined_block_without_redundant_decompression` now measures both
+   decompression avoidance and `skipped_lines`.** It resets `take_records_walked`, verifies that only
+   the healthy 5-line warm block walks records and the quarantined block's `failure_count()` remains at
+   `QUARANTINE_THRESHOLD`, and asserts `iter.skipped_lines() == 5` with `yielded + skipped == line_count`.
+3. **Resolved: `Scrollback::new` no longer carries the stale `memory_used() == 0` doc claim.**
+4. **Resolved: `a_footprints_payload_leaves_the_byte_budget_when_its_rows_cross` now asserts both
+   `budgeted_memory_used()` and `total_memory_used()` before and after crossing the compression horizon.**
+5. **Resolved: deleted uncalled `#[cfg(test)]` `HyperlinkSpan::width()`.**
 
 ## 6. Proof order (easiest high-value first)
 

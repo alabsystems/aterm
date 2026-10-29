@@ -60,8 +60,8 @@ pub(crate) const WHY_LANDED: &str = "landed";
 /// can fix (`task_launch::refused_why`).
 pub(crate) const WHY_SIGNIN: &str = "signin";
 
-/// `why=` of a worker its launcher refused because its program is held back or failed to
-/// install (`task_launch::refused_why`).
+/// `why=` of a worker its launcher refused because atpkg's install of its absent program failed
+/// (`task_launch::refused_why`).
 pub(crate) const WHY_INSTALL: &str = "install";
 
 /// Closed `why=` vocabulary for task state transitions.
@@ -129,7 +129,7 @@ fn unix_ms_now() -> u64 {
 /// Per-session task record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TaskRecord {
-    /// Monotonic revision incremented on record or supervisor attention changes.
+    /// Monotonic revision incremented on record changes and when [`Self::attention`] moves.
     pub(crate) rev: u64,
     /// Current task state.
     pub(crate) state: TaskState,
@@ -143,8 +143,8 @@ pub(crate) struct TaskRecord {
     pub(crate) result_bytes: u64,
     /// Path to the result file under [`tasks_dir`], if any.
     pub(crate) result_path: Option<PathBuf>,
-    /// Whether supervisor, `NEEDS YOU:` or codex-alab's own attention stands on the session
-    /// ([`supervisor_attention`]).
+    /// Whether a supervisor's, a `NEEDS YOU:` or codex-alab's own ask stands on the session
+    /// ([`supervisor_attention`]); a `kind=wait` entry is none.
     pub(crate) attention: bool,
     /// Wall-clock timestamp (unix ms) when the current state was entered.
     pub(crate) since_unix_ms: u64,
@@ -172,7 +172,7 @@ impl TaskRecord {
         u64::try_from(self.since.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// Whether a waiter has news (a terminal state or standing attention).
+    /// Whether a waiter has news (a terminal state or a standing ask, [`Self::attention`]).
     #[must_use]
     pub(crate) const fn has_news(&self) -> bool {
         self.state.is_terminal() || self.attention
@@ -526,7 +526,7 @@ fn spelled_as_its_parts(path: &Path) -> bool {
 /// unanswered, a wall, a login): a worker that carries itself, waiting on someone.
 pub(crate) const SELF_CLAIM_ATTENTION_OWNER: &str = "codex-alab";
 
-/// The attention owners whose entries move the task record's attention flag.
+/// The attention owners whose asks move the task record's attention flag.
 const TASK_ATTENTION_OWNERS: [&str; 3] = [
     crate::harness_host::ATTENTION_OWNER,
     crate::harness_host::NEEDS_ATTENTION_OWNER,
@@ -538,11 +538,13 @@ pub(crate) fn owner_moves_task(owner: &str) -> bool {
     TASK_ATTENTION_OWNERS.contains(&owner)
 }
 
-/// Whether supervisor, worker `NEEDS YOU:` or codex-alab's own attention stands in `meta`.
+/// Whether a supervisor's, a worker's `NEEDS YOU:` or codex-alab's own ask stands in `meta`. A
+/// `kind=wait` entry under those owners (a limit the harness waits out) is no news: `await task`
+/// wakes on a worker done, exited, stalled or needing a person, and a wait it sits out is none.
 pub(crate) fn supervisor_attention(meta: &crate::session_timeline::SessionMeta) -> bool {
     TASK_ATTENTION_OWNERS
         .iter()
-        .any(|owner| meta.attention_owners.get(owner).is_some())
+        .any(|owner| meta.attention_owners.ask(owner).is_some())
 }
 
 /// Error returned when a mark times out waiting on a committing update's session fence.
@@ -822,7 +824,9 @@ pub(crate) fn reopen_at_turn(ctx: &SessionCtx, local_id: u64, by: &TurnBy, found
 /// Usage error line for `result`.
 pub(crate) const RESULT_USAGE: &str = "ERR usage: result [full]\n";
 
-/// Handles `result [full]` on `ctx` (session `local_id`).
+/// Handles `result [full]` on `ctx` (session `local_id`): a result the done edge missed is read
+/// again (`result::reread_with`), a codex landing's that knew no conversation by the one the
+/// worker's claim names now (`self_claim::rollout_target`, the landing's own resolver).
 pub(crate) fn cmd_result(ctx: &SessionCtx, local_id: u64, rest: &str) -> String {
     let full = match rest.trim() {
         "" => false,
@@ -840,7 +844,8 @@ pub(crate) fn cmd_result(ctx: &SessionCtx, local_id: u64, rest: &str) -> String 
     };
     match (&record.result_path, record.state) {
         (Some(path), TaskState::Done | TaskState::Exited) => {
-            match aterm_agent::harness::result::reread(path) {
+            let claim = || crate::self_claim::rollout_target(ctx).map(|t| (t.home, t.thread));
+            match aterm_agent::harness::result::reread_with(path, claim) {
                 Some(found) => {
                     repair_result(ctx, local_id, &record, path, &found);
                     found.answer(path, full)
@@ -913,14 +918,14 @@ pub(crate) fn seed_carried(ctx: &SessionCtx, row: Option<&str>) {
 
 /// Returns the session's published agent word, the program's own report as the timeline
 /// shows it (`program_state=`, [`crate::program_state::column`]: a claim beside `agent=`, read
-/// under the same lock) and the percent-encoded attention text.
+/// under the same lock) and the percent-encoded attention text, an ask before any wait
+/// ([`crate::session_timeline::SessionMeta::row_attention`]).
 pub(crate) fn agent_program_and_attention(ctx: &SessionCtx) -> (&'static str, String, String) {
     let attention = ctx
         .meta
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .attention
-        .as_deref()
+        .row_attention()
         .map_or_else(|| "-".to_string(), crate::control::pct_encode);
     let (agent, program) = {
         let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());

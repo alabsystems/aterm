@@ -274,6 +274,95 @@ fn compact(log: &mut BrokerLog, carry: bool, min: u64) -> io::Result<u64> {
     }
 }
 
+#[test]
+fn replacement_inode_remains_exclusively_owned_after_rename() {
+    let fx = Fixture::new("compact-lock-continuity", false);
+    let mut log = fx.create();
+    seed(&mut log, false);
+    let (gate, held) = gate();
+    log.arm_compact_seam(Seam {
+        step_gate: Some((Step::Rename, gate)),
+        ..Seam::default()
+    });
+    let worker = std::thread::spawn(move || {
+        let result = compact(&mut log, false, MIN);
+        (log, result)
+    });
+    assert!(held.wait(), "compaction did not reach the renamed inode");
+    let competing = fx.open();
+    held.resume();
+    let (mut log, result) = worker.join().unwrap();
+    assert!(
+        matches!(&competing, Err(error) if error.kind() == io::ErrorKind::AlreadyExists),
+        "a second broker acquired the live replacement inode"
+    );
+    assert_eq!(result.unwrap(), MIN);
+    assert!(log.poisoned().is_none());
+    log.publish(9, 1, "after/switch".into(), b"still owned".to_vec())
+        .unwrap();
+    drop(log);
+    let reopened = fx.open().unwrap();
+    assert_eq!(reopened.read_floor(), Offset(MIN));
+}
+
+#[test]
+fn an_opener_cannot_acquire_the_detached_inode_after_compaction() {
+    let fx = Fixture::new("compact-stale-open", false);
+    let mut log = fx.create();
+    seed(&mut log, false);
+    let files = || -> std::collections::BTreeMap<_, _> {
+        std::fs::read_dir(fx.path.parent().unwrap())
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect()
+    };
+    let mut before = None;
+    let competing = crate::store::open_log_file(&fx.path, crate::store::sync_parent_dir, || {
+        assert_eq!(compact(&mut log, false, MIN).unwrap(), MIN);
+        before = Some(files());
+    });
+    assert!(
+        matches!(&competing, Err(error) if error.kind() == io::ErrorKind::AlreadyExists),
+        "an opener acquired the inode detached by the compaction"
+    );
+    assert_eq!(
+        files(),
+        before.unwrap(),
+        "a refused stale opener changed the log or its sidecars"
+    );
+    assert!(log.poisoned().is_none());
+    log.publish(9, 1, "after/switch".into(), b"still owned".to_vec())
+        .unwrap();
+}
+
+#[test]
+fn a_failed_post_rename_step_keeps_exclusive_ownership_until_drop() {
+    for step in [
+        Step::Rename,
+        Step::StateInstalled,
+        Step::Base,
+        Step::IntentRemoved,
+    ] {
+        let fx = Fixture::new("compact-poisoned-lock", false);
+        let mut log = fx.create();
+        seed(&mut log, true);
+        log.arm_compact_seam(Seam {
+            crash_after: Some(step),
+            ..Seam::default()
+        });
+        assert!(compact(&mut log, true, MIN).is_err());
+        assert!(log.poisoned().is_some());
+        assert!(matches!(fx.open(), Err(error) if error.kind() == io::ErrorKind::AlreadyExists));
+        drop(log);
+        let recovered = fx.open().unwrap();
+        assert_eq!(recovered.read_floor(), Offset(MIN));
+    }
+}
+
 /// The reference: the seeded log as a reopen reads it before the compaction, and after
 /// an uninterrupted one.
 fn reference(sealed: bool, carry: bool) -> (Snap, Snap) {

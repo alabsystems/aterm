@@ -23,6 +23,8 @@ fn cli(id: &'static str, state: State, mark: Mark, fact: &str) -> AiCli {
         fact: fact.to_string(),
         path: None,
         version: Some("1.2.3".to_string()),
+        offers_fix: state.needs_act(true),
+        mend: None,
     }
 }
 

@@ -434,7 +434,10 @@ pub const fn removed_by_x9(class: BidiClass) -> bool {
     matches!(class, RLE | LRE | RLO | LRO | PDF | BN)
 }
 
-/// Quick test for whether a line needs the Bidirectional Algorithm at all.
+/// Quick test for whether `text` carries any RTL/Arabic-number/isolate trigger class
+/// (`R`, `AL`, `AN`, `RLE`, `RLO`, `RLI`, `FSI`). When `false`, every level resolves even
+/// under [`BaseDirection::Auto`] and [`BaseDirection::Ltr`], making visual order the identity
+/// ([`BaseDirection::Rtl`] sets paragraph level 1 and can still reorder neutrals around `L`/`EN`).
 #[must_use]
 #[inline]
 pub fn has_bidi(text: &[char]) -> bool {
@@ -442,7 +445,8 @@ pub fn has_bidi(text: &[char]) -> bool {
         .any(|&c| u32::from(c) >= 0x0590 && is_bidi_class(bidi_class_table(u32::from(c))))
 }
 
-/// Class-slice companion to [`has_bidi`].
+/// Class-slice companion to [`has_bidi`] (identity guarantee holds for [`BaseDirection::Auto`]
+/// and [`BaseDirection::Ltr`], not [`BaseDirection::Rtl`]).
 #[must_use]
 #[inline]
 pub fn has_bidi_classes(classes: &[BidiClass]) -> bool {
@@ -474,28 +478,9 @@ pub fn reorder_visual_to_logical(text: &[char], base: BaseDirection) -> Vec<usiz
     order
 }
 
-/// Convenience wrapper over [`reorder_visual_to_logical`] taking a `&str`.
-#[must_use]
-#[cfg(test)]
-pub fn reorder_str(s: &str, base: BaseDirection) -> Vec<usize> {
-    let chars: Vec<char> = s.chars().collect();
-    reorder_visual_to_logical(&chars, base)
-}
-
-/// Compute the visual→logical **cell** permutation for a terminal row.
-#[must_use]
-#[cfg(test)]
-pub fn reorder_cells(
-    cell_chars: &[char],
-    is_wide_continuation: &[bool],
-    base: BaseDirection,
-) -> Vec<usize> {
-    let (classes, brackets) = classes_and_brackets(cell_chars);
-    reorder_cells_with_classes(&classes, &brackets, is_wide_continuation, base)
-}
-
-/// Class-taking companion to `reorder_cells`: per-CELL classes and brackets (parallel to
-/// `is_wide_continuation`), so a caller that already computed them does not recompute.
+/// Compute the visual→logical **cell** permutation for a terminal row from per-CELL classes and
+/// brackets (parallel to `is_wide_continuation`), so a caller that already computed them does not
+/// recompute.
 #[must_use]
 pub fn reorder_cells_with_classes(
     cell_classes: &[BidiClass],
@@ -617,12 +602,11 @@ fn fold_cells_and_resolve(
     s.logical_brackets.clear();
     s.lead_cell.clear();
     s.has_cont.clear();
+    let n = cell_classes.len();
     let mut i = 0;
-    while i < cell_classes.len() {
-        let cont = is_wide_continuation
-            .get(i.wrapping_add(1))
-            .copied()
-            .unwrap_or(false);
+    while i < n {
+        let next = i.saturating_add(1);
+        let cont = next < n && is_wide_continuation.get(next).copied().unwrap_or(false);
         if let Some(&class) = cell_classes.get(i) {
             s.logical.push(class);
             s.logical_brackets
@@ -661,20 +645,6 @@ pub fn resolve_levels_from_classes(
     let mut levels = Vec::new();
     resolve_into(classes, brackets, base, &mut resolve, &mut levels);
     levels
-}
-
-/// The base level of the first paragraph of `text` (0 = LTR, 1 = RTL).
-#[must_use]
-#[cfg(test)]
-pub fn paragraph_level(text: &[char], base: BaseDirection) -> u8 {
-    let (classes, _) = classes_and_brackets(text);
-    let end = classes
-        .iter()
-        .position(|&c| c == B)
-        .map_or(classes.len(), |i| i + 1);
-    let mut matching = Vec::new();
-    match_isolates(classes.get(..end).unwrap_or(&[]), &mut matching);
-    paragraph_level_of(classes.get(..end).unwrap_or(&[]), &matching, base)
 }
 
 /// Apply UAX #9 rule L2 to a resolved level array, returning the visual→logical permutation.
@@ -1064,7 +1034,7 @@ fn resolve_paragraph(
             let pdi = matching.get(last).copied().unwrap_or(n);
             run = run_of_char.get(pdi).copied().unwrap_or(usize::MAX);
         }
-        resolve_sequence(&seq, classes, brackets, &matching, levels, para, r);
+        resolve_sequence(&seq, classes, brackets, levels, para, r);
     }
     r.runs = runs;
     r.run_of_char = run_of_char;
@@ -1131,7 +1101,6 @@ fn resolve_sequence(
     seq: &[usize],
     classes: &[BidiClass],
     brackets: &[Bracket],
-    matching: &[usize],
     levels: &[u8],
     para: u8,
     r: &mut Resolve,
@@ -1156,7 +1125,6 @@ fn resolve_sequence(
             .unwrap_or(para)
     };
     let eos = direction_of(level.max(after));
-    let _ = matching;
 
     let t = |r: &Resolve, k: usize| -> BidiClass {
         seq.get(k)
@@ -1353,11 +1321,51 @@ mod tests {
     fn pure_rtl_reverses() {
         let t = chars("\u{05D0}\u{05D1}\u{05D2}");
         assert!(has_bidi(&t));
-        assert_eq!(paragraph_level(&t, BaseDirection::Auto), 1);
+        let (classes, _) = classes_and_brackets(&t);
+        let mut matching = Vec::new();
+        match_isolates(&classes, &mut matching);
+        assert_eq!(
+            first_strong_level(&classes, &matching, 0, classes.len()),
+            Some(1)
+        );
+        assert_eq!(
+            paragraph_level_of(&classes, &matching, BaseDirection::Auto),
+            1
+        );
         assert_eq!(
             reorder_visual_to_logical(&t, BaseDirection::Auto),
             vec![2, 1, 0]
         );
+    }
+
+    #[test]
+    fn has_bidi_false_is_identity_for_auto_and_ltr_only() {
+        let t = chars("a!");
+        assert!(!has_bidi(&t));
+        assert_eq!(
+            reorder_visual_to_logical(&t, BaseDirection::Auto),
+            vec![0, 1]
+        );
+        assert_eq!(
+            reorder_visual_to_logical(&t, BaseDirection::Ltr),
+            vec![0, 1]
+        );
+        assert_eq!(
+            reorder_visual_to_logical(&t, BaseDirection::Rtl),
+            vec![1, 0]
+        );
+    }
+
+    #[test]
+    fn multi_paragraph_reorder_keeps_paragraphs_disjoint() {
+        let t = chars("\u{05D0}\u{05D1}\n\u{05D2}\u{05D3}");
+        let levels = resolve_levels(&t, BaseDirection::Auto);
+        assert_eq!(levels, vec![1, 1, 1, 1, 1]);
+        assert_eq!(
+            reorder_visual_to_logical(&t, BaseDirection::Auto),
+            vec![2, 1, 0, 4, 3]
+        );
+        assert_eq!(reorder_from_levels(&levels), vec![4, 3, 2, 1, 0]);
     }
 
     const CJK: char = '\u{4E2D}';
@@ -1366,15 +1374,20 @@ mod tests {
     fn reorder_cells_wide_glyph_stays_paired_ltr() {
         let cc = vec![CJK, ' '];
         let wide = vec![false, true];
-        assert_eq!(reorder_cells(&cc, &wide, BaseDirection::Auto), vec![0, 1]);
+        let (classes, brackets) = classes_and_brackets(&cc);
+        assert_eq!(
+            reorder_cells_with_classes(&classes, &brackets, &wide, BaseDirection::Auto),
+            vec![0, 1]
+        );
     }
 
     #[test]
     fn reorder_cells_rtl_with_wide_glyph_keeps_pair_unmirrored() {
         let cc = vec![ALEF, CJK, ' '];
         let wide = vec![false, false, true];
+        let (classes, brackets) = classes_and_brackets(&cc);
         assert_eq!(
-            reorder_cells(&cc, &wide, BaseDirection::Auto),
+            reorder_cells_with_classes(&classes, &brackets, &wide, BaseDirection::Auto),
             vec![1, 2, 0]
         );
     }
@@ -1415,7 +1428,8 @@ mod tests {
             ),
         ];
         for (cc, wide) in cases {
-            let order = reorder_cells(cc, wide, BaseDirection::Auto);
+            let (classes, brackets) = classes_and_brackets(cc);
+            let order = reorder_cells_with_classes(&classes, &brackets, wide, BaseDirection::Auto);
             let mut seen = order.clone();
             seen.sort_unstable();
             assert_eq!(
@@ -1424,13 +1438,30 @@ mod tests {
                 "not a permutation: {cc:?}"
             );
         }
+        let overlong_wide = [false, false, true, true];
+        let short_cc = [ALEF, 'a'];
+        let (short_classes, short_brackets) = classes_and_brackets(&short_cc);
+        let order = reorder_cells_with_classes(
+            &short_classes,
+            &short_brackets,
+            &overlong_wide,
+            BaseDirection::Auto,
+        );
+        let mut seen = order;
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            vec![0, 1],
+            "trailing wide flags past cell_classes.len() must not emit out-of-range indices"
+        );
     }
 
     #[test]
     fn reorder_cells_malformed_leading_continuation_is_safe() {
         let cc = vec![' ', 'a'];
         let wide = vec![true, false];
-        let order = reorder_cells(&cc, &wide, BaseDirection::Auto);
+        let (classes, brackets) = classes_and_brackets(&cc);
+        let order = reorder_cells_with_classes(&classes, &brackets, &wide, BaseDirection::Auto);
         let mut seen = order.clone();
         seen.sort_unstable();
         assert_eq!(seen, vec![0, 1]);
@@ -1592,17 +1623,21 @@ mod generated {
     /// base).
     #[test]
     fn levels_well_formed() {
+        let mut matching = Vec::new();
         for line in lines() {
+            let (line_classes, _) = classes_and_brackets(&line);
             for base in BASES {
                 let levels = resolve_levels(&line, base);
                 assert_eq!(levels.len(), line.len());
                 let mut start = 0;
                 while start < line.len() {
-                    let end = line[start..]
+                    let end = line_classes[start..]
                         .iter()
-                        .position(|&c| bidi_class(c) == B)
+                        .position(|&c| c == B)
                         .map_or(line.len(), |off| start + off + 1);
-                    let para = paragraph_level(&line[start..end], base);
+                    let para_classes = &line_classes[start..end];
+                    match_isolates(para_classes, &mut matching);
+                    let para = paragraph_level_of(para_classes, &matching, base);
                     for &l in &levels[start..end] {
                         assert!(l >= para, "{line:?}");
                     }
@@ -1634,6 +1669,10 @@ mod generated {
         for line in lines() {
             let classes: Vec<BidiClass> = line.iter().map(|&c| bidi_class(c)).collect();
             let brackets: Vec<Bracket> = line.iter().map(|&c| bracket_of(c)).collect();
+            assert_eq!(
+                classes_and_brackets(&line),
+                (classes.clone(), brackets.clone())
+            );
             let wide = vec![false; line.len()];
             assert_eq!(has_bidi(&line), has_bidi_classes(&classes));
             for base in BASES {
@@ -1643,11 +1682,8 @@ mod generated {
                     levels,
                     resolve_levels_from_classes(&classes, &brackets, base)
                 );
-                let cells = reorder_cells(&line, &wide, base);
-                assert_eq!(
-                    cells,
-                    reorder_cells_with_classes(&classes, &brackets, &wide, base)
-                );
+                let cells = reorder_cells_with_classes(&classes, &brackets, &wide, base);
+                assert_eq!(cells, reorder_visual_to_logical(&line, base));
                 reorder_cells_with_classes_into(
                     &classes,
                     &brackets,

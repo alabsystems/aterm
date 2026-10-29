@@ -219,6 +219,11 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     fn relaunch_owed(&self) -> bool {
         false
     }
+    /// Whether the foreground agent in the tab was relaunched by aterm to resume the session's
+    /// conversation ([`AgentResumed`]), `None` when no foreground agent snapshot is read.
+    fn agent_resumed(&self) -> Option<AgentResumed> {
+        None
+    }
     fn agent_conversation(&self) -> Option<String> {
         None
     }
@@ -355,6 +360,27 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
 
     fn reach(&self) -> Reach {
         Reach::Unknown
+    }
+
+    /// What the host's measures and network path say of the API's reach now, as [`Self::reach`]
+    /// would answer, but taking no lease: nothing is probed for this read, so a loop may ask it
+    /// at every point. A point no network wall stands at asks [`Self::reach`] (whose lease keeps
+    /// the probe measuring until the return) only when this says Down, so a measured outage
+    /// holds the act typed there and its edge resumes it.
+    fn reach_peek(&self) -> Reach {
+        Reach::Unknown
+    }
+
+    /// When the host's next measure of the API's reach can land, always later than now, and no
+    /// later than the lost path's poll while this Mac's network path is lost, since its return
+    /// owes a probe (`netwatch::NetState::landing`); for a session whose reach is the network
+    /// path alone, when that verdict can next change (`netwatch::NetState::path_landing`);
+    /// `None` when the host has nothing to look at again for this session (no measure due, no
+    /// path lost or settling). It takes no lease ([`Self::reach`] does). A wait that stands on
+    /// the reach wakes by then, so a measured Up, or a path's settled return, is acted on within
+    /// one step of landing.
+    fn reach_at(&self) -> Option<Instant> {
+        None
     }
 
     fn memory(&self) -> Option<super::super::memory::AgentMemory> {

@@ -631,6 +631,8 @@ pub struct StateDir {
     adopt_after_attach: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     adopt_without_the_attach: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    proof_rule: std::sync::Mutex<ProofRule>,
 }
 
 /// The filesystem operations one [`StateDir`] made, by kind (counted only in a test build,
@@ -1086,6 +1088,9 @@ pub(crate) struct Flushed {
     pub ordered: u64,
     /// Full flushes: a file's or a directory's on another device than the root, the record's.
     pub full: u64,
+    /// A start that wrote nothing: the record was the OPEN it would write, and its proof showed
+    /// it on the media ([`RUN_PROOF`]).
+    pub proven: bool,
 }
 
 impl Flushed {
@@ -1125,7 +1130,7 @@ pub(crate) struct StartRules {
     pub flush_record: bool,
     /// The root, whose entry the rename moved, is flushed after it by the start's tier, and must succeed before the admission is cached.
     pub flush_root: bool,
-    /// A record of this boot is replaced in full, an open one too: its visible OPEN may be a failed replacement of this boot's durable CLEAN.
+    /// A record of this boot is replaced in full, an open one too: its visible OPEN may be a failed replacement of this boot's durable CLEAN. An OPEN whose inode its proof links is not replaced at all ([`RUN_PROOF`]).
     pub this_boot_in_full: bool,
 }
 
@@ -1138,7 +1143,7 @@ impl StartRules {
     };
 }
 
-/// How the last bridge of this dir stopped, and in which boot (`run`). CLEAN is written durably. OPEN is written by the barrier only over an earlier boot's record, with this boot named too and every existing torn kind's directory on the root's device, and in full everywhere else, this boot's record among them ([`StateDir::begin_run`]).
+/// How the last bridge of this dir stopped, and in which boot (`run`). CLEAN is written durably. OPEN is written by the barrier only over an earlier boot's record, with this boot named too and every existing torn kind's directory on the root's device, and in full everywhere else, this boot's record among them, but not at all where the record already reads as that OPEN and its proof links its inode ([`StateDir::begin_run`], [`RUN_PROOF`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LastRun {
     /// The boot it ran in, as the kernel names it.
@@ -1193,6 +1198,50 @@ pub(crate) const LOGPIN: &str = "logpin";
 pub(crate) const LOGKEY: &str = "logkey";
 /// The floor of the bus mirror's lifetime total ([`StateDir::logfloor`]).
 pub(crate) const LOGFLOOR: &str = "logfloor";
+/// The run record's proof: a hard link to the inode `run` names, made only once that inode is
+/// on the media ([`StateDir::begin_run`], [`StateDir::take_incarnation`]).
+pub(crate) const RUN_PROOF: &str = "run.durable";
+/// The floor's proof: a hard link to the inode `logfloor` names, made only once a durable
+/// publication of that inode returned ([`StateDir::raise_logfloor`]).
+pub(crate) const LOGFLOOR_PROOF: &str = "logfloor.durable";
+
+/// The proof kept beside `name` that its inode is on the media, for the two files a later process
+/// of the same boot admits by one: `run` and `logfloor`.
+fn proof_of(name: &str) -> Option<&'static str> {
+    match name {
+        "run" => Some(RUN_PROOF),
+        LOGFLOOR => Some(LOGFLOOR_PROOF),
+        _ => None,
+    }
+}
+
+/// The device and inode of the regular file at `path`, never followed through a link.
+fn identity_at(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    meta.is_file().then(|| (meta.dev(), meta.ino()))
+}
+
+/// The device and inode of an open regular file.
+fn identity_of(file: &std::fs::File) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = file.metadata().ok()?;
+    meta.is_file().then(|| (meta.dev(), meta.ino()))
+}
+
+/// How a proof is made and read ([`StateDir::prove`], [`StateDir::proven`]): a test's controls.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ProofRule {
+    /// What ships: a link to the published inode, made once a full flush that covers it
+    /// returned, and read by its inode.
+    #[default]
+    Ships,
+    /// CONTROL: the link made as soon as the rename is visible, whatever its flush then does.
+    AtTheRename,
+    /// CONTROL: the proof's presence vouches for whatever the name holds now.
+    ByPresence,
+}
 
 /// The mode every file of the state directory is made with: the owner's alone, as its records
 /// (`inflight/`, mode 0600) and its key (`logkey`) always were. A post's `key=` (`keys/<sid>`)
@@ -1327,6 +1376,8 @@ impl StateDir {
             adopt_after_attach: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             adopt_without_the_attach: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            proof_rule: std::sync::Mutex::default(),
         }
     }
 
@@ -1366,6 +1417,55 @@ impl StateDir {
     pub(crate) fn adopt_without_the_attach(&self, on: bool) {
         self.adopt_without_the_attach
             .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How this open makes and reads the proofs of `run` and `logfloor` ([`ProofRule`]).
+    #[cfg(test)]
+    pub(crate) fn set_proof_rule(&self, rule: ProofRule) {
+        *self.proof_rule.lock().unwrap_or_else(|e| e.into_inner()) = rule;
+    }
+
+    #[cfg(test)]
+    fn proof_rule(&self) -> ProofRule {
+        *self.proof_rule.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Link `name`'s proof ([`proof_of`]) to the inode `made` names, where `name` still names it:
+    /// the old proof unlinked, `name` hard-linked in its place, and the link kept only where it
+    /// is `made`'s. The caller knows `made` is on the media at `name`: a durable publication of it
+    /// returned, or a full flush issued after its ordered one did. Nothing is flushed, and
+    /// nothing fails: the proof speaks to a later process of this boot, and a proof lost or not
+    /// made costs that process the full publication it would pay without one.
+    fn prove(&self, name: &str, made: (u64, u64)) {
+        let Some(proof) = proof_of(name) else {
+            return;
+        };
+        let proof = self.path(proof);
+        match std::fs::remove_file(&proof) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return,
+        }
+        if std::fs::hard_link(self.path(name), &proof).is_ok() && identity_at(&proof) != Some(made)
+        {
+            let _ = std::fs::remove_file(&proof);
+        }
+    }
+
+    /// Whether `made`, the inode `name` names now, is the one its proof links: then it is on the
+    /// media at `name`. The proof is made only once it is ([`StateDir::prove`]); a rename over
+    /// `name`, which every later write of it is, gives `name` another inode, and the inode the
+    /// proof holds is never freed, so never reused, while the proof stands. A power cut changes
+    /// nothing of this: what reads after it is what the media held.
+    fn proven(&self, name: &str, made: (u64, u64)) -> bool {
+        let Some(proof) = proof_of(name) else {
+            return false;
+        };
+        #[cfg(test)]
+        if self.proof_rule() == ProofRule::ByPresence {
+            return identity_at(&self.path(proof)).is_some();
+        }
+        identity_at(&self.path(proof)) == Some(made)
     }
 
     #[cfg(test)]
@@ -1638,15 +1738,17 @@ impl StateDir {
             })
     }
 
-    /// Raise `logfloor` to `top`, durably.
+    /// Raise `logfloor` to `top`, durably, and prove it on the media ([`LOGFLOOR_PROOF`]). A floor
+    /// at or above `top` that this open admitted, or whose proof admits it now
+    /// ([`StateDir::admit_logfloor_by_its_proof`]), is left as it reads.
     pub(crate) fn raise_logfloor(&self, top: u64) -> io::Result<u64> {
-        let admitted = self.logfloor_admitted();
+        let admitted = self.logfloor_admitted() || self.admit_logfloor_by_its_proof();
         match self.logfloor()? {
             Some(floor) if floor >= top && admitted => Ok(floor),
             floor => {
                 let top = floor.map_or(top, |floor| floor.max(top));
                 let bytes = format!("{top}\n");
-                self.replace_bytes_as_with(
+                let made = self.publish(
                     LOGFLOOR,
                     bytes.as_bytes(),
                     Some(aterm_durable::Flush::Durable),
@@ -1655,9 +1757,30 @@ impl StateDir {
                 )?;
                 self.floor_admitted
                     .store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(made) = made {
+                    self.prove(LOGFLOOR, made);
+                }
                 Ok(top)
             }
         }
+    }
+
+    /// Admit the floor that reads, for this open, where its proof links the inode `logfloor` names
+    /// ([`StateDir::proven`]): a process published it durably and its flush returned, so it is on
+    /// the media, whichever process reads it now. True where it admitted the floor
+    /// now: not where this open had already, nor where a write of the floor this open made did not
+    /// finish (the proof then links the inode before it, if any).
+    pub(crate) fn admit_logfloor_by_its_proof(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.floor_admitted.load(Ordering::SeqCst) || !self.on_the_media(LOGFLOOR) {
+            return false;
+        }
+        let proven =
+            identity_at(&self.path(LOGFLOOR)).is_some_and(|made| self.proven(LOGFLOOR, made));
+        if proven {
+            self.floor_admitted.store(true, Ordering::SeqCst);
+        }
+        proven
     }
 
     #[cfg(test)]
@@ -1671,7 +1794,7 @@ impl StateDir {
         }
     }
 
-    /// Whether the floor that reads is on the media as far as this open can say.
+    /// Whether the floor that reads is on the media as far as this open can say: this open wrote it durably, or admitted it by its proof ([`StateDir::admit_logfloor_by_its_proof`]), with no failed write of it since.
     pub(crate) fn logfloor_admitted(&self) -> bool {
         self.floor_admitted
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -2572,6 +2695,19 @@ impl StateDir {
         mode: u32,
         finish_dir: fn(io::Result<()>) -> io::Result<()>,
     ) -> io::Result<()> {
+        self.publish(name, bytes, flush, mode, finish_dir).map(drop)
+    }
+
+    /// [`StateDir::replace_bytes_as_with`], answering the device and inode of the file it
+    /// published where they read ([`StateDir::prove`]).
+    fn publish(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        flush: Option<aterm_durable::Flush>,
+        mode: u32,
+        finish_dir: fn(io::Result<()>) -> io::Result<()>,
+    ) -> io::Result<Option<(u64, u64)>> {
         #[cfg(test)]
         self.refused_by_a_test(name)?;
         let target = self.path(name);
@@ -2598,12 +2734,20 @@ impl StateDir {
             if let Some(flush) = flush.filter(|_| flushes_media()) {
                 flush.file(&f)?;
             }
+            let made = identity_of(&f);
             drop(f);
-            std::fs::rename(&tmp, &target)
+            std::fs::rename(&tmp, &target).map(|()| made)
         })();
-        if staged.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-            return staged;
+        let made = match staged {
+            Ok(made) => made,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        };
+        #[cfg(test)]
+        if let Some(made) = made.filter(|_| self.proof_rule() == ProofRule::AtTheRename) {
+            self.prove(name, made);
         }
         let finished = (|| {
             if durable {
@@ -2628,7 +2772,7 @@ impl StateDir {
                 unflushed.insert(name.to_string());
             }
         }
-        finished
+        finished.map(|()| made)
     }
 
     /// The bridge lock's file, opened (created) for one take: a regular file, never followed
@@ -2811,7 +2955,9 @@ impl StateDir {
     }
 
     /// Take the incarnation an attach runs under, before its will is registered: named in the post
-    /// journal before the lease says it ([`StateDir::name_attach_in_posts`]).
+    /// journal before the lease says it ([`StateDir::name_attach_in_posts`]). Where it writes `inc`
+    /// in full (the boot's first incarnation, or a lease spent), that flush covers the OPEN this
+    /// open admitted, and its proof links it ([`StateDir::begin_run`], [`RUN_PROOF`]).
     pub fn take_incarnation(&self, bus: u64) -> io::Result<u64> {
         let (top, file) = (self.incarnation_top(), self.inc_file());
         let boot = self.trusted_boot();
@@ -2847,6 +2993,7 @@ impl StateDir {
         let file = if plan.flush {
             self.write_durable("inc", &plan.top.to_string())?;
             self.kill_point(IncStep::Flushed)?;
+            self.prove_the_admitted_run();
             self.inc_file()
         } else {
             file
@@ -3793,7 +3940,7 @@ impl StateDir {
         Ok(())
     }
 
-    /// A bridge's run begins, after its sweep ([`StateDir::set_aside_torn`]) and before it writes any file of a [`TornKind`]: `run` says OPEN of this boot, its temp flushed before its rename and the root flushed after it. Both flushes are barriers only where the record it replaces names an earlier boot, this boot is named too, and every torn kind's directory that exists is on the root's device; anywhere else, both are full flushes: over a record of this boot (open or clean), over no record, where either boot is unnamed, and where a torn kind's directory is on another device or does not read.
+    /// A bridge's run begins, after its sweep ([`StateDir::set_aside_torn`]) and before it writes any file of a [`TornKind`]: `run` says OPEN of this boot, its temp flushed before its rename and the root flushed after it. Both flushes are barriers only where the record it replaces names an earlier boot, this boot is named too, and every torn kind's directory that exists is on the root's device; anywhere else, both are full flushes: over a record of this boot (open or clean), over no record, where either boot is unnamed, and where a torn kind's directory is on another device or does not read. Nothing is written where the record already reads as the OPEN this start would write and its proof links its inode (R6, [`RUN_PROOF`]): a process published that inode and a full flush that covers it returned (its publication's own, or a full write of `inc` after one the barrier ordered), and no rename has replaced it since. A start in full proves its record at once, one the barrier ordered once the incarnation's flush returns ([`StateDir::take_incarnation`]).
     pub(crate) fn begin_run(&self) -> io::Result<Flushed> {
         self.begin_run_by(StartRules::ALL)
     }
@@ -3851,6 +3998,21 @@ impl StateDir {
                 .unwrap_or_else(|e| e.into_inner())
                 .extend(here.into_iter().map(|(_, _, rel)| rel).chain(pin));
         }
+        // THE OPEN ON THE MEDIA ALREADY (R6): a record that reads as the OPEN this start would
+        // write, whose inode its proof links, was published by a process of this boot, a full
+        // flush that covers it returned, and no rename has replaced it since; the media holds
+        // it, so writing the same bytes again would add nothing. A handoff's successor and a
+        // restart after a crash find their predecessor's.
+        if let Some((file, _)) = current.filter(|(file, run)| {
+            *run == open && identity_of(file).is_some_and(|made| self.proven("run", made))
+        }) {
+            *known = Some(file);
+            drop(previous);
+            return Ok(Flushed {
+                proven: true,
+                ..Flushed::default()
+            });
+        }
         let tier = self.open_tier(last, now, rules.this_boot_in_full);
         let mut flushed = Flushed::default();
         let mut bytes = open.render().into_bytes();
@@ -3860,7 +4022,7 @@ impl StateDir {
             (true, false) => Some(Flush::Ordered),
             (true, true) => Some(tier),
         };
-        self.replace_bytes_as_with(
+        let made = self.publish(
             "run",
             &bytes,
             flush,
@@ -3892,7 +4054,24 @@ impl StateDir {
         }
         *known = Some(file);
         drop(previous);
+        if let Some(made) = made.filter(|_| flush == Some(Flush::Durable)) {
+            self.prove("run", made);
+        }
         Ok(flushed)
+    }
+
+    /// After a full flush this open made, the OPEN this open admitted ([`StateDir::begin_run`]'s
+    /// fence) is on the media whatever tier published it, where `run` still names it: its proof
+    /// links it ([`StateDir::prove`]). The boot's first incarnation is that flush for a start the
+    /// barrier ordered ([`StateDir::take_incarnation`]).
+    fn prove_the_admitted_run(&self) {
+        let known = self.run_fence.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(made) = known.as_ref().and_then(identity_of) else {
+            return;
+        };
+        if identity_at(&self.path("run")) == Some(made) && !self.proven("run", made) {
+            self.prove("run", made);
+        }
     }
 
     /// The start's tier: the barrier only over an earlier named boot's record, this boot named too, with every torn kind's directory on the root's device. There a cut that loses OPEN loses every later write on the device with it, and this boot's first incarnation flushes `inc` in full before the attach presents anything to a broker, which puts OPEN on the media. Over a record of this boot, in full: a visible OPEN may be a failed replacement of this boot's CLEAN, and a same-boot lease flushes nothing later, so a lost OPEN would leave CLEAN vouching for its in-flight entries, which the next boot would republish behind later posts a broker on another volume kept.
@@ -8382,8 +8561,24 @@ mod tests {
         };
         let (_, cost) = start(in_boot(1));
         assert_eq!(cost, (0, 2), "over no record");
+        let (_, cost) = start(in_boot(1));
+        assert_eq!(
+            cost,
+            (0, 0),
+            "over an open of this boot its proof links: nothing written (R6)"
+        );
+        std::fs::remove_file(root.join(RUN_PROOF)).expect("the proof the first start made");
+        let (_, cost) = start(in_boot(1));
+        assert_eq!(cost, (0, 2), "over an open of this boot with no proof");
+        let copy = root.join("run-copy");
+        std::fs::copy(root.join("run"), &copy).expect("the record's bytes");
+        std::fs::rename(&copy, root.join("run")).expect("the same bytes, another inode");
         let (st, cost) = start(in_boot(1));
-        assert_eq!(cost, (0, 2), "over an open of this boot");
+        assert_eq!(
+            cost,
+            (0, 2),
+            "over an open of this boot whose inode its proof does not link"
+        );
         st.end_run_clean().expect("a clean stop in boot 1");
         let (_, cost) = start(in_boot(1));
         assert_eq!(cost, (0, 2), "over a clean stop of this boot");
@@ -8408,6 +8603,69 @@ mod tests {
             .expect("a link where a directory goes");
         let (_, cost) = start(in_boot(5));
         assert_eq!(cost, (0, 2), "a torn kind's directory that does not read");
+    }
+
+    /// R6: AN OPEN THE BARRIER ORDERED IS PROVED ONLY ONCE A FULL FLUSH COVERS IT. The first start
+    /// of boot 2, over boot 1's clean stop, writes OPEN by the barrier and makes no proof; the
+    /// boot's first incarnation writes `inc` in full and links `run.durable` to the OPEN, and the
+    /// next start of the boot then writes nothing. CONTROL: where that write of `inc` fails, no
+    /// proof is made and the next start writes OPEN in full.
+    #[test]
+    fn an_open_the_barrier_ordered_is_proved_by_the_incarnations_full_flush() {
+        for inc_fails in [false, true] {
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("proof-inc")
+                .tempdir_in("/tmp")
+                .expect("scratch");
+            let root = dir.path();
+            let first = StateDir::open(root).expect("open");
+            first.set_inc_seam(in_boot(1));
+            first.begin_run().expect("boot 1's run");
+            first.take_incarnation(0).expect("boot 1's incarnation");
+            first.end_run_clean().expect("its clean stop");
+            drop(first);
+            let proved = || {
+                identity_at(&root.join("run")).is_some()
+                    && identity_at(&root.join("run")) == identity_at(&root.join(RUN_PROOF))
+            };
+            let st = StateDir::open(root).expect("boot 2's open");
+            st.set_inc_seam(in_boot(2));
+            let began = st.begin_run().expect("boot 2's first start");
+            assert_eq!((began.ordered, began.full), (2, 0), "by the barrier");
+            assert!(
+                !proved(),
+                "an OPEN the barrier ordered is not proved by its start"
+            );
+            if inc_fails {
+                st.refuse_writes_of(Some("inc"));
+                assert!(st.take_incarnation(0).is_err(), "the write of inc refused");
+                st.refuse_writes_of(None);
+            } else {
+                st.take_incarnation(0).expect("boot 2's first incarnation");
+            }
+            assert_eq!(
+                proved(),
+                !inc_fails,
+                "proved once the incarnation's full flush of inc returned, and only then"
+            );
+            drop(st);
+            let next = StateDir::open(root).expect("its successor's open");
+            next.set_inc_seam(in_boot(2));
+            let began = next.begin_run().expect("the successor's start");
+            if inc_fails {
+                assert_eq!(
+                    (began.ordered, began.full, began.proven),
+                    (0, 2, false),
+                    "CONTROL: no proof, OPEN written in full over this boot's open"
+                );
+            } else {
+                assert_eq!(
+                    (began.ordered, began.full, began.proven),
+                    (0, 0, true),
+                    "the proved OPEN: nothing written"
+                );
+            }
+        }
     }
 
     #[test]
@@ -8575,6 +8833,7 @@ mod tests {
                         dirs: 2,
                         ordered: 5,
                         full: 1,
+                        proven: false,
                     }
                 );
                 assert_eq!(

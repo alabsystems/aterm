@@ -7,14 +7,31 @@
 
 use std::ffi::{CStr, c_char, c_void};
 
-use aterm_objc::{ClassPtr, strip_method_offsets};
+use aterm_objc::{
+    Bool, ClassPtr, ProtocolPtr, Sel, protocol_method_extended_types, strip_method_offsets,
+};
 
 // SAFETY: the block declares no symbol; its only job is the link line.
 #[link(name = "AppKit", kind = "framework")]
 unsafe extern "C" {}
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MethodDesc {
+    name: Sel,
+    types: *const c_char,
+}
+
 unsafe extern "C" {
     fn objc_copyClassList(out_count: *mut u32) -> *mut ClassPtr;
+    fn objc_copyProtocolList(out_count: *mut u32) -> *mut ProtocolPtr;
+    fn protocol_getName(proto: ProtocolPtr) -> *const c_char;
+    fn protocol_copyMethodDescriptionList(
+        proto: ProtocolPtr,
+        is_required_method: Bool,
+        is_instance_method: Bool,
+        out_count: *mut u32,
+    ) -> *mut MethodDesc;
     fn class_copyMethodList(cls: ClassPtr, out_count: *mut u32) -> *mut *const c_void;
     fn method_getTypeEncoding(method: *const c_void) -> *const c_char;
     fn free(ptr: *mut c_void);
@@ -133,7 +150,58 @@ fn every_registered_encoding() -> Vec<(String, String)> {
     }
     // SAFETY: `classes` came from `objc_copyClassList`.
     unsafe { free(classes.cast()) };
+    append_protocol_encodings(&mut out);
     out
+}
+
+fn append_protocol_encodings(out: &mut Vec<(String, String)>) {
+    let mut n_protos: u32 = 0;
+    // SAFETY: `objc_copyProtocolList` fills the count and returns a malloc'd array the caller frees.
+    let protos = unsafe { objc_copyProtocolList(&raw mut n_protos) };
+    if protos.is_null() {
+        return;
+    }
+    for pi in 0..n_protos as usize {
+        // SAFETY: `pi < n_protos` live protocol pointers.
+        let proto = unsafe { *protos.add(pi) };
+        if proto.is_null() {
+            continue;
+        }
+        // SAFETY: `proto` is a live protocol object; `protocol_getName` borrows immortal storage.
+        let pname = unsafe { CStr::from_ptr(protocol_getName(proto)) }
+            .to_string_lossy()
+            .into_owned();
+        for required in [true, false] {
+            for instance in [true, false] {
+                let mut n: u32 = 0;
+                // SAFETY: `proto` is live; the returned array is malloc'd and freed below.
+                let descs = unsafe {
+                    protocol_copyMethodDescriptionList(
+                        proto,
+                        Bool::new(required),
+                        Bool::new(instance),
+                        &raw mut n,
+                    )
+                };
+                if descs.is_null() {
+                    continue;
+                }
+                for di in 0..n as usize {
+                    // SAFETY: `di < n` method descriptions; `proto` and `desc.name` are live.
+                    let sel = unsafe { (*descs.add(di)).name };
+                    if let Some(ext) =
+                        unsafe { protocol_method_extended_types(proto, sel, instance) }
+                    {
+                        out.push((format!("<{pname}>"), ext));
+                    }
+                }
+                // SAFETY: `descs` came from `protocol_copyMethodDescriptionList`.
+                unsafe { free(descs.cast()) };
+            }
+        }
+    }
+    // SAFETY: `protos` came from `objc_copyProtocolList`.
+    unsafe { free(protos.cast()) };
 }
 
 #[test]
@@ -193,9 +261,18 @@ fn stripping_deletes_offsets_and_nothing_else_over_every_row_in_the_process() {
          no longer exercises the second kind (`{{CATransform3D=…}}` had one)"
     );
     assert!(
-        with_count >= 1 && with_quoted == with_quoted,
+        with_count >= 1,
         "no row carries an ARRAY COUNT, the one kind the original rule DID \
-         keep — {with_count} found, {with_quoted} quoted class name(s)"
+         keep — {with_count} found"
+    );
+    assert!(
+        with_quoted >= 1,
+        "no extended protocol row carries a QUOTED CLASS NAME — {with_quoted} found"
+    );
+    assert_eq!(
+        strip_method_offsets("@\"NSISO8601DateFormatter\"24@0:8@\"CATransform3D\"16"),
+        "@\"NSISO8601DateFormatter\"@:@\"CATransform3D\"",
+        "digits inside quoted class names must survive offset stripping"
     );
     assert!(
         bad.is_empty(),

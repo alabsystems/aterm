@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The turn tracker (design §2.4): at most one open turn per agent run, driven by the screen verdict word.
+//! The turn tracker (design §2.4): at most one open turn per agent run, driven by the screen verdict word, or, for a run whose screen reader reads nothing, by the program's own claim ([`TurnTracker::claim`]).
 
 use crate::field::{BoundedText, BoundedToken, Fields, Key, Val};
 use crate::fold::NodeFields;
@@ -182,6 +182,18 @@ impl Verdict {
     }
 }
 
+/// What the program in front says of its own turn (OSC 7501's `state=`, the log's `mark program
+/// state=`), as [`TurnTracker::claim`] reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Claimed {
+    /// `working`, or `blocked` on a person in the middle of one: a turn runs.
+    Working,
+    /// `idle` or `done`: the turn came to rest.
+    Rested,
+    /// `error`: the turn ended on an error.
+    Failed,
+}
+
 /// A step the screen holds open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ScreenStep {
@@ -330,8 +342,11 @@ struct Held {
     opened: Option<Stamp>,
 }
 
+/// Whether an input binds to the screen's step `what`: a decision step
+/// ([`crate::log::is_decision_step`]), the rule a node-less act and the harness's escalation
+/// read too.
 const fn binds(what: ScreenStep) -> bool {
-    matches!(what, ScreenStep::Approval(_) | ScreenStep::Question)
+    crate::log::is_decision_step(what.kind())
 }
 
 /// The latest input bound to the open approval or question step (T1).
@@ -432,7 +447,21 @@ pub struct TurnTracker {
     /// between).
     opens: u64,
     closes: u64,
+    /// The screen verdict opened a turn on this run in this process (a carry starts it unset): its
+    /// turns are the screen's, and the program's claim stands aside ([`TurnTracker::claim`]).
+    screen_turns: bool,
+    /// The turns a partial transcript opened where none ran (fix E1) that no claim's beginning
+    /// has taken and no claim's rest closed yet, oldest first, each with its open's wall time: at
+    /// most [`UNTAKEN_MAX`], and never carried: a successor feeds no beginning from before its
+    /// first reading, so a carried one would take the first beginning it sees, a later turn's
+    /// unless that reading shows its own span still `working`, and the later turn would open no
+    /// turn of its own (ATERM-KI-1029-1 R5).
+    untaken: Vec<(Node, u64)>,
 }
+
+/// The most untaken partial-transcript turns a tracker keeps ([`TurnTracker::claim`]); a ninth
+/// drops the oldest.
+const UNTAKEN_MAX: usize = 8;
 
 impl TurnTracker {
     /// A tracker for the agent run `run` (already open in the log).
@@ -453,6 +482,8 @@ impl TurnTracker {
             lead: None,
             opens: 0,
             closes: 0,
+            screen_turns: false,
+            untaken: Vec::new(),
         }
     }
 
@@ -552,6 +583,161 @@ impl TurnTracker {
         self.resync(log);
         self.settle_if_due(log, at);
         self.wake_at()
+    }
+
+    /// THE PROGRAM'S OWN CLAIM of its turn (OSC 7501's working and resting edges), for a run whose
+    /// screen opens no turn (a codex-alab's, whose screen word is `unknown`): `working` opens a
+    /// turn at `conf=claim` (`src=engine`) and the next rest closes it there, and the host feeds
+    /// the edges no status sample showed through [`Self::claim_edge`], at the engine's own times,
+    /// so a turn that began and ended between two samples is in the log too, with its duration,
+    /// whatever its transcript gives, as far as the host feeds its edges and the run's bucket pays
+    /// for it (ATERM-KI-1029-1 names what it misses). A beginning opens its turn no earlier than
+    /// the run's open or the close of the log's newest closed turn, so sibling turns never run
+    /// backwards. Once the screen verdict has opened a turn on the run, its turns are the screen's
+    /// and the claim stands aside. A transcript read `state=on` opens and closes its own turns, so
+    /// the claim stands aside while one is read (until its reader stops, [`Self::tx_stopped`], or
+    /// an interrupt ended the vendor turn, which emits no `TurnEnd`; an engine edge dated no later
+    /// than the newest row a stopped reader applied stays aside, as that turn is the transcript's);
+    /// its prompt names the claim's turn it finds inside [`ATTRIBUTION_MS`], open or closed and
+    /// named by none, so a transcript read late never logs a second turn for a span a claim's turn
+    /// holds. One read `state=partial` adds to the claim's turns, as an unmeasured Claude Code's
+    /// adds to its screen's, and opens a turn only where none runs (fix E1: its prompt read before
+    /// the claim's `working`). A beginning takes the oldest turn a partial transcript opened that
+    /// no beginning took (fix E1), opened within [`ATTRIBUTION_MS`] before it or after it, as its
+    /// span's: the turn running, or, closed already, the one that holds the span, so a span is one
+    /// turn. A rest leaves such an untaken turn open while it is that fresh, as it may be a later
+    /// vendor turn's, read ahead of the parse, unless the turn's interrupt was read and the rest
+    /// is dated no earlier than its opening: then its vendor turn is over and the rest closes it.
+    /// Its interrupt, read while the claim's turn runs, is that turn's only witness of an Esc
+    /// (`out=interrupted` at the rest).
+    pub fn claim(&mut self, log: &mut Log, claimed: Claimed, at: Stamp) -> Option<u64> {
+        self.claim_as(log, claimed, at, false, &mut || true)
+    }
+
+    /// AN ENGINE EDGE NO STATUS SAMPLE SHOWED: the host feeds each beginning and end the program's
+    /// report kept between two of its samples, oldest first, at the time of the parse batch that
+    /// carried it, under [`Self::claim`]'s rules; here [`Claimed::Working`] is always a turn's
+    /// beginning. A beginning that finds the claim's own turn (`src=engine conf=claim`) still open
+    /// closes it `out=unknown` there first: the engine drew a new turn, so that one ended unseen
+    /// (its end fell out of the report's record before a sample read it). A beginning that would
+    /// open a turn asks `may_open` (the run's program bucket) first and opens nothing on a
+    /// refusal; one that takes a partial transcript's turn, or finds another turn running, asks
+    /// nothing.
+    pub fn claim_edge(
+        &mut self,
+        log: &mut Log,
+        claimed: Claimed,
+        at: Stamp,
+        may_open: &mut dyn FnMut() -> bool,
+    ) -> Option<u64> {
+        self.claim_as(log, claimed, at, true, may_open)
+    }
+
+    fn claim_as(
+        &mut self,
+        log: &mut Log,
+        claimed: Claimed,
+        at: Stamp,
+        engine_edge: bool,
+        may_open: &mut dyn FnMut() -> bool,
+    ) -> Option<u64> {
+        self.resync(log);
+        if !log.is_open(self.run) {
+            return self.wake_at();
+        }
+        self.settle_if_due(log, at);
+        if self.screen_turns
+            || (self.tx.state == Some(TxState::On)
+                && (!self.tx.stopped || engine_edge && at.wall_ms <= self.tx.read_ms)
+                && !(claimed == Claimed::Rested && self.interrupted))
+        {
+            return self.wake_at();
+        }
+        let out = match claimed {
+            Claimed::Working => {
+                self.begin(log, at, engine_edge, may_open);
+                return self.wake_at();
+            }
+            Claimed::Rested if self.interrupted => TurnOut::Interrupted,
+            Claimed::Rested => TurnOut::Done,
+            Claimed::Failed => TurnOut::Error,
+        };
+        if let Some(turn) = self
+            .turn
+            .filter(|t| !self.untaken_at(*t, at) || self.interrupted && !self.untaken_after(*t, at))
+        {
+            self.untaken.retain(|&(n, _)| n != turn);
+            let at = tx_close_at(log, turn, at);
+            let close = Close::new(Out::Turn(out), Src::Engine, Conf::Claim);
+            self.close_turn_with(log, close, out, (None, false, false), at);
+        }
+        self.wake_at()
+    }
+
+    /// A CLAIM'S BEGINNING at `at` ([`Self::claim`], [`Self::claim_edge`]).
+    fn begin(
+        &mut self,
+        log: &mut Log,
+        at: Stamp,
+        engine_edge: bool,
+        may_open: &mut dyn FnMut() -> bool,
+    ) {
+        // The engine drew a new turn while the claim's own runs: that one's end was lost.
+        if engine_edge
+            && let Some(t) = self.turn
+            && log
+                .state()
+                .turn()
+                .is_some_and(|o| o.node == t && (o.src, o.conf) == (Src::Engine, Conf::Claim))
+        {
+            let close = Close::new(Out::Turn(TurnOut::Unknown), Src::Engine, Conf::Claim);
+            let at = tx_close_at(log, t, at);
+            self.close_turn_with(log, close, TurnOut::Unknown, (None, false, false), at);
+        }
+        // A partial transcript's turn no beginning took holds this span, running or closed.
+        if self.turn.is_none_or(|t| self.untaken_at(t, at)) && self.take_untaken(at).is_some() {
+            return;
+        }
+        // A turn the claim did not open runs (a carried one, an exact transcript's after its
+        // reader stopped), or the run's bucket refuses.
+        if self.turn.is_some() || !may_open() {
+            return;
+        }
+        let run_t = log.open_entry(self.run).map_or(0, |e| e.t);
+        let floor = run_t.max(log.state().last[1].as_ref().map_or(0, |c| c.t));
+        self.ensure_turn_as(log, Src::Engine, Conf::Claim, no_earlier(at, floor));
+    }
+
+    /// Whether `t` is a partial transcript's turn no beginning has taken, opened within
+    /// [`ATTRIBUTION_MS`] before `at` (or after it).
+    fn untaken_at(&self, t: Node, at: Stamp) -> bool {
+        self.untaken
+            .iter()
+            .any(|&(n, opened)| n == t && untaken_fresh(opened, at))
+    }
+
+    /// Whether `t` is an untaken turn opened after `at`: a rest dated before it is an earlier
+    /// vendor turn's, even once its interrupt was read.
+    fn untaken_after(&self, t: Node, at: Stamp) -> bool {
+        self.untaken
+            .iter()
+            .any(|&(n, opened)| n == t && opened > at.wall_ms)
+    }
+
+    /// The oldest untaken turn opened within [`ATTRIBUTION_MS`] before `at` (or after it), taken;
+    /// the older ones are dropped.
+    fn take_untaken(&mut self, at: Stamp) -> Option<Node> {
+        self.untaken
+            .retain(|&(_, opened)| untaken_fresh(opened, at));
+        (!self.untaken.is_empty()).then(|| self.untaken.remove(0).0)
+    }
+
+    /// THE TRANSCRIPT'S READER STOPPED (its tap dropped, or reading no file now): the join keeps
+    /// its watermark and state, and the program's claim no longer stands aside for a source read
+    /// `state=on` ([`Self::claim`]) until the next transcript fact says it reads again, but for an
+    /// engine edge dated no later than the newest row it applied, whose turn the source logged.
+    pub const fn tx_stopped(&mut self) {
+        self.tx.stopped = true;
     }
 
     /// The screen reported the turn interrupted (`aterm_phase::turn::interrupted`): its idle close is `out=interrupted`.
@@ -703,6 +889,13 @@ impl TurnTracker {
             settle: self.settle.map(|s| (s.cause, s.held(now_mono))),
             last_close: self.last_close,
         }
+    }
+
+    /// The partial transcript's turns no claim's beginning has taken yet, oldest first, for a
+    /// conformance projection (`ClaimedTurnEdges`' `u1`, `u2`).
+    #[cfg(any(test, debug_assertions))]
+    pub fn untaken(&self) -> impl Iterator<Item = Node> + '_ {
+        self.untaken.iter().map(|&(node, _)| node)
     }
 
     /// The tracker as one carry line (design §5.2, phase 2A).
@@ -890,6 +1083,8 @@ impl TurnTracker {
             lead: None,
             opens: 0,
             closes: 0,
+            screen_turns: false,
+            untaken: Vec::new(),
         })
     }
 
@@ -976,12 +1171,26 @@ impl TurnTracker {
     }
 
     fn ensure_turn(&mut self, log: &mut Log, conf: Conf, at: Stamp) {
+        self.screen_turns = true;
+        self.ensure_turn_as(log, Src::Screen, conf, at);
+    }
+
+    /// Open a turn from `src` at `conf` unless one is open, naming the transcript's vendor turn
+    /// read just before it. A screen's turn also continues (`cont=`) the vendor turn whose end
+    /// row is not read yet, since the screen can close a turn in the middle of one; a claim's
+    /// never does: the program's own rest ended its turn, and the vendor turn's end row read late
+    /// still finds that turn through the join.
+    fn ensure_turn_as(&mut self, log: &mut Log, src: Src, conf: Conf, at: Stamp) {
         if self.turn.is_some() {
             return;
         }
-        let Some(node) = self.open_turn(log, Src::Screen, conf, Fields::new(), at) else {
+        let Some(node) = self.open_turn(log, src, conf, Fields::new(), at) else {
             return;
         };
+        // An unmapped vendor turn within the window names the screen's turn. Since fix E1 no
+        // prompt leaves one with no turn open (a partial source opens its own turn), but a
+        // successor adopting an older build's carry line (`tx_v`/`tx_vp`, no `tx_vt`) still holds
+        // one across a seamless update (`TranscriptJoin`'s `CarriedUnmapped`).
         if let Some(v) = self
             .tx
             .cur
@@ -997,7 +1206,8 @@ impl TurnTracker {
             });
             return;
         }
-        if let Some(v) = self.tx.cur.filter(|v| v.end_ms.is_none())
+        if src == Src::Screen
+            && let Some(v) = self.tx.cur.filter(|v| v.end_ms.is_none())
             && let Some(prev) = v.node.filter(|n| !log.is_open(*n))
             && let Some(conf) = self.tx.state.and_then(TxState::conf)
             && let Some(id) = ShortId::new(&prev.to_string())
@@ -1181,7 +1391,8 @@ pub const TX_TOOLS_MAX: usize = 8;
 pub enum TxState {
     /// A measured build: exact.
     On,
-    /// An unmeasured build: strong, additive only.
+    /// An unmeasured build: strong. It adds, opens the turn the screen missed, and ends or
+    /// supersedes only a turn it opened (fix E1); it never overrules the screen.
     Partial,
     /// Not read.
     Off,
@@ -1408,6 +1619,13 @@ struct TxJoin {
     unsaid: bool,
     /// Rebuild `tools` from the log at the next read (an adoption).
     rebuild: bool,
+    /// Its reader stopped since the last transcript fact ([`TurnTracker::tx_stopped`]; never
+    /// carried: a carried join's reader is made afresh, and its first fact is a bind).
+    stopped: bool,
+    /// The wall time of the newest row it applied, one it lost (a desync's) not counted, and
+    /// never carried: a stopped reader read the turns up to it, so an engine edge dated no later
+    /// stays the transcript's ([`TurnTracker::claim_edge`]).
+    read_ms: u64,
 }
 
 impl TxJoin {
@@ -1423,6 +1641,8 @@ impl TxJoin {
             dropped: 0,
             unsaid: false,
             rebuild: false,
+            stopped: false,
+            read_ms: 0,
         }
     }
 
@@ -1502,6 +1722,8 @@ impl TxJoin {
             dropped: get("tx_dr").and_then(|v| v.parse().ok()).unwrap_or(0),
             unsaid: get("tx_du") == Some("1"),
             rebuild: true,
+            stopped: false,
+            read_ms: 0,
         }
     }
 }
@@ -1515,12 +1737,29 @@ const fn rest_cause(v: Verdict) -> Option<SettleCause> {
     }
 }
 
+/// Whether a partial transcript's untaken turn, opened at `opened` (wall ms), may still be the span
+/// of a claim's beginning at `at`: opened no more than [`ATTRIBUTION_MS`] before it.
+const fn untaken_fresh(opened: u64, at: Stamp) -> bool {
+    opened.saturating_add(ATTRIBUTION_MS) >= at.wall_ms
+}
+
 const fn no_earlier(at: Stamp, wall_ms: u64) -> Stamp {
     if wall_ms <= at.wall_ms {
         at
     } else {
         Stamp::new(wall_ms, at.mono_ms.saturating_add(wall_ms - at.wall_ms))
     }
+}
+
+/// WHETHER THE TRANSCRIPT OWNS TURN `t` (fix E1): `t` is the open turn and the transcript opened it (`src=transcript`).
+/// A source read at `partial` may end or supersede only such a turn, never the screen's. It is read from the fold's
+/// open turn, which keeps its open's `src`: the fold sees every record ever appended, so no ring eviction can make an
+/// own turn look like the screen's, and no carry token is needed.
+fn tx_owns(log: &Log, t: Node) -> bool {
+    log.state()
+        .turn()
+        .filter(|o| o.node == t)
+        .is_some_and(|o| o.src == Src::Transcript)
 }
 
 /// THE DATE OF A TRANSCRIPT CLOSE of `node`: `chosen`, or later.
@@ -1575,6 +1814,7 @@ impl TurnTracker {
         if !log.is_open(self.run) {
             return self.wake_at();
         }
+        self.tx.stopped = false;
         self.settle_if_due(log, now);
         if self.tx.rebuild {
             self.rebuild_tools(log);
@@ -1623,6 +1863,7 @@ impl TurnTracker {
         let Some(conf) = state.conf() else {
             return self.wake_at();
         };
+        let read = row.then_some(self.tx.dropped);
         let row = rebase(pos.wall_ms, now);
         match ev {
             TxEvent::Bind { .. }
@@ -1633,8 +1874,12 @@ impl TurnTracker {
             TxEvent::Interrupt => {
                 // An unmeasured source may end its own vendor turn below,
                 // but must not change the screen turn's eventual outcome.
+                // A claim's turn has no screen to say it, so there the
+                // source is the only witness.
                 if state == TxState::On {
                     self.note_interrupted();
+                } else {
+                    self.tx_interrupt_claimed(log);
                 }
                 if let Some(v) = self.tx.cur.filter(|v| v.end_ms.is_none()) {
                     self.tx.cur = Some(VTurn {
@@ -1661,6 +1906,9 @@ impl TurnTracker {
             }
             TxEvent::Wall { kind, judge } => self.tx_wall(log, kind, judge, state, now),
             TxEvent::EndWall { kind } => self.tx_end_wall(log, kind, state, now),
+        }
+        if read == Some(self.tx.dropped) {
+            self.tx.read_ms = self.tx.read_ms.max(pos.wall_ms);
         }
         self.wake_at()
     }
@@ -1791,6 +2039,35 @@ impl TurnTracker {
         let _ = log.amend(node, amend, at);
     }
 
+    /// THE CLAIM'S CLOSED TURN A LATE PROMPT NAMES: of the run's closed turns the program's claim
+    /// opened (`src=engine conf=claim`) and no vendor turn names yet, the one opened nearest the
+    /// prompt's row at `tp`, within [`ATTRIBUTION_MS`] and not before the run's open (`run_t`).
+    /// A transcript first read after its claims' turns closed (a self-claim proven late, a tap
+    /// that stopped and reads again) names each of them as the newest closed turn is named,
+    /// rather than opening a second turn for a span a claim's turn holds.
+    fn claimed_unnamed(&self, log: &Log, tp: u64, run_t: u64) -> Option<(Node, u64)> {
+        let named = |node: Node| {
+            log.window().any(|r| {
+                r.node == node
+                    && matches!(r.op, Op::Open | Op::Amend)
+                    && r.f.get(Key::Vref).is_some()
+            })
+        };
+        log.window()
+            .filter(|r| {
+                r.op == Op::Open
+                    && r.k == Kind::Turn
+                    && r.par == Some(self.run)
+                    && (r.src, r.conf) == (Src::Engine, Conf::Claim)
+                    && r.t >= run_t
+                    && r.t.abs_diff(tp) <= ATTRIBUTION_MS
+                    && !log.is_open(r.node)
+                    && !named(r.node)
+            })
+            .map(|r| (r.node, r.t))
+            .min_by_key(|(_, t)| t.abs_diff(tp))
+    }
+
     fn tx_prompt(
         &mut self,
         log: &mut Log,
@@ -1816,7 +2093,7 @@ impl TurnTracker {
             end_ms: None,
             at_ms: tp,
         };
-        let late = log.state().last[1]
+        let last = log.state().last[1]
             .as_ref()
             .map(|c| (c.node, c.opened_t, c.f.get(Key::Vref).is_some()))
             .and_then(|(node, opened, held)| {
@@ -1824,6 +2101,10 @@ impl TurnTracker {
                     .filter(|o| !held && *o >= run_t && o.abs_diff(tp) <= ATTRIBUTION_MS)
                     .map(|o| (node, o))
             });
+        let late = match (last, self.claimed_unnamed(log, tp, run_t)) {
+            (Some(l), Some(c)) if c.1.abs_diff(tp) < l.1.abs_diff(tp) => Some(c),
+            (l, c) => l.or(c),
+        };
         if let Some(t) = self.turn {
             let opened = log.open_entry(t).map_or(0, |e| e.t);
             let held =
@@ -1851,7 +2132,9 @@ impl TurnTracker {
                 return;
             }
             let screen_held = self.step.as_ref().is_some_and(|h| h.under_turn);
-            if held == Some(vref) || screen_held || state != TxState::On {
+            // A partial source supersedes only a turn it opened itself (fix E1): the screen's
+            // turn shares the new vendor turn.
+            if held == Some(vref) || screen_held || (state != TxState::On && !tx_owns(log, t)) {
                 self.tx.cur = Some(mapped(t));
                 return;
             }
@@ -1864,10 +2147,11 @@ impl TurnTracker {
             self.tx.cur = Some(mapped(node));
             return;
         }
-        if state != TxState::On {
-            self.tx.cur = Some(unmapped);
-            return;
-        }
+        // THE TURN THE SCREEN MISSED (fix E1): the prompt is the agent's own witness, so it opens
+        // the turn at the source's conf on every build the transcript reads (strong at partial,
+        // exact once measured). The screen samples its word at most every 250 ms and takes no
+        // look while output keeps arriving, so a fast reply is never seen busy. The input that
+        // submitted it only dates and attributes it (`open_turn`); no input opens a turn alone.
         let mut f = Fields::new();
         let _ = f.set(Key::Vref, Val::Id(vref));
         let at = no_earlier(row, run_t);
@@ -1875,6 +2159,14 @@ impl TurnTracker {
             Some(node) => {
                 if let Some(cause) = rest_cause(self.word) {
                     self.arm(cause, now);
+                }
+                // The span of a claim's beginning not fed yet ([`Self::claim`]); an exact source
+                // keeps its own turns, and the claims stand aside for it.
+                if state != TxState::On {
+                    if self.untaken.len() == UNTAKEN_MAX {
+                        self.untaken.remove(0);
+                    }
+                    self.untaken.push((node, at.wall_ms));
                 }
                 self.tx.cur = Some(mapped(node));
             }
@@ -1945,11 +2237,40 @@ impl TurnTracker {
                 .by(Actor::Vendor)
                 .dur_wall(at.wall_ms.saturating_sub(opened));
             let _ = log.close(p, close, at);
-        } else if state == TxState::On {
+        } else {
+            // A step in `tx.tools` that is closed already was closed by its turn's close
+            // (`gone`, the cascade), never by an observation: its result gives it its real
+            // outcome on every build, at the source's conf (fix E1, E2E-7). Below exact, the
+            // fold takes it over the cascade's `gone` and no other outcome (`amend_refines_out`).
             let mut f = Fields::new();
             let _ = f.set(Key::Out, Val::Word(out.word()));
-            let amend = Amend::new(kind, Src::Transcript, Conf::Exact, f).by(Actor::Vendor);
+            let amend = Amend::new(kind, Src::Transcript, conf, f).by(Actor::Vendor);
             let _ = log.amend(p, amend, row);
+        }
+    }
+
+    /// AN ESC ON A CLAIM'S TURN: the program's claim has no interrupted state and a codex screen
+    /// reads nothing, so a source read `state=partial` is that turn's one witness: read while the
+    /// claim's turn its vendor turn names runs (or the turn its prompt opened before the claim's
+    /// `working`, fix E1), the turn closes `out=interrupted` at its rest. A
+    /// screen's turn keeps the screen's outcome, and a turn a rest already closed keeps `done`
+    /// (only an exact source refines a closed turn's outcome, `amend_refines_out`).
+    fn tx_interrupt_claimed(&mut self, log: &Log) {
+        let Some(node) = self
+            .tx
+            .cur
+            .filter(|v| v.end_ms.is_none())
+            .and_then(|v| v.node)
+        else {
+            return;
+        };
+        if Some(node) == self.turn
+            && (tx_owns(log, node)
+                || log.state().turn().is_some_and(|o| {
+                    o.node == node && (o.src, o.conf) == (Src::Engine, Conf::Claim)
+                }))
+        {
+            self.note_interrupted();
         }
     }
 
@@ -1982,7 +2303,8 @@ impl TurnTracker {
         let mut at = row;
         let open = Some(node) == self.turn && log.is_open(node);
         let screen_held = self.step.as_ref().is_some_and(|h| h.under_turn);
-        if open && !screen_held && state == TxState::On {
+        // A partial source ends only the turn it opened (fix E1); the screen's settles it.
+        if open && !screen_held && (state == TxState::On || tx_owns(log, node)) {
             let (out, oconf) = match self.settle.map(|s| s.cause) {
                 Some(c) => match settle_out(c, self.interrupted) {
                     (o, Conf::Heuristic) => (o, Conf::Heuristic),

@@ -125,7 +125,7 @@ impl<'a> Reading<'a> {
             (None, _) => (Err("not_sampled"), f.split.parts_of(&[])),
         };
         let (services, unaccounted) = if f.split.via == Via::Subtraction && p.unaccounted >= 0 {
-            (p.services + p.unaccounted, None)
+            (p.services.saturating_add(p.unaccounted), None)
         } else {
             (p.services, Some(p.unaccounted))
         };
@@ -182,7 +182,7 @@ impl<'a> Reading<'a> {
 
     fn mostly(&self) -> Option<String> {
         let p = self.printed()?;
-        let aterm = p.tab.unwrap_or(0) + p.aterm_rest;
+        let aterm = p.tab.unwrap_or(0).saturating_add(p.aterm_rest);
         let parts = [
             (Part::Services, p.services),
             (Part::Others, p.others),
@@ -739,7 +739,14 @@ impl<'r> Rows<'r> {
 }
 
 /// Append `sys why`'s text body for `q` over `s` into `lines`.
-pub fn why_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>, events: &[Line]) {
+pub fn why_text(
+    q: &SysQuery,
+    ctx: &Ctx<'_>,
+    s: &Snapshot,
+    lines: &mut Vec<Line>,
+    hw_notes: &[Line],
+    events: &[Line],
+) {
     let subject = match resolve(q, Some(s)) {
         Bare::Calm => {
             let w = Reading::new(ctx, s, WhySubject::Cpu);
@@ -773,7 +780,7 @@ pub fn why_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>
     let mut rows = Rows::of(&w, &ranked, q.top);
     loop {
         let body = rows.lines(&w, subject);
-        let n = lines.len() + head.len() + body.len() + tail.len() + events.len();
+        let n = lines.len() + head.len() + body.len() + tail.len() + hw_notes.len() + events.len();
         let header = header_line(
             View::Why,
             None,
@@ -789,6 +796,7 @@ pub fn why_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>
                 .chain(&head)
                 .chain(&body)
                 .chain(&tail)
+                .chain(hw_notes)
                 .chain(events)
                 .map(|l| l.text.len() + 1)
                 .sum::<usize>();

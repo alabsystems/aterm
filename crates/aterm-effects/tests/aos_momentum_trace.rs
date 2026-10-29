@@ -38,6 +38,7 @@ fn geom() -> Geom {
 
 fn cfg(dark: bool) -> MomentumGlowConfig {
     MomentumGlowConfig {
+        light: aterm_effects::cursor_glow::Light::OFF,
         enabled: true,
         intensity: 1.0,
         tau_s: MOMENTUM_GLOW_TAU_S,
@@ -49,6 +50,7 @@ fn cfg(dark: bool) -> MomentumGlowConfig {
         theme_bg: if dark { 0x0010_1016 } else { 0x00FF_FFFF },
         block: true,
         glyph_span: None,
+        light_vivid: false,
     }
 }
 

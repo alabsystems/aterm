@@ -7,7 +7,7 @@
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::{ContentScrollDelta, ContentScrollState, Terminal};
 use aterm_effects::cursor_glow::{
-    AdmissionRecord, CursorGlow, Geom, GlowConfig, GlowStyle, InsertWidth, ProbeTrust,
+    AdmissionRecord, CursorGlow, Geom, GlowConfig, InsertWidth, ProbeTrust,
 };
 use aterm_effects::rainbow_kitty::TypedClass;
 use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
@@ -346,24 +346,12 @@ fn pieces(b: &[u8]) -> Vec<&[u8]> {
 /// The shipped default: Rainbow Kitty, tall body, intensity 1.0, dark.
 fn cfg() -> GlowConfig {
     GlowConfig {
-        classic_mono: false,
-        ribbon_tall: true,
-        ribbon_flat: false,
-        enabled: true,
-        dark_theme: true,
-        theme_fg: 0x00C8_D3F5,
-        theme_bg: 0x001A_1B26,
-        style: GlowStyle::RainbowKitty,
-        color: 0x0050_FA7B,
         accent: 0x007A_A2F7,
-        duration: Duration::from_millis(260),
         length: 18,
-        intensity: 1.0,
         audible: true,
         radius: 0.6,
         ring: true,
-        beam: false,
-        head_dx: 0.5,
+        ..Default::default()
     }
 }
 
@@ -1559,30 +1547,6 @@ fn a_wide_glyph_echo_below_a_parked_caret_still_lights() {
     );
 }
 
-/// Maximum duration (ms) that light laid on a torn redisplay may remain on the match row.
-const RECALL_BOUND_MS: u64 = 330;
-
-/// Match-row ink that outlived [`RECALL_BOUND_MS`] or remained live after the replay rested.
-fn match_row_kept(h: &Host) -> Vec<String> {
-    let r = h.match_row();
-    let every = h.present.tear == Tear::Every;
-    let last_key = h.last_key_us();
-    let mut kept: Vec<String> = h
-        .lives
-        .iter()
-        .filter(|((row, _), l)| {
-            let from = if every { last_key } else { l.first_us };
-            *row == r && l.last_us.saturating_sub(from) > RECALL_BOUND_MS * 1000
-        })
-        .map(|((_, c), l)| {
-            let from = if every { last_key } else { l.first_us };
-            format!("ink ({r},{c}) {} ms", l.last_us.saturating_sub(from) / 1000)
-        })
-        .collect();
-    kept.extend(live_cols(h, r).iter().map(|c| format!("live ({r},{c})")));
-    kept
-}
-
 /// Replay [`OWNER_TAKES`] with `Tear::Every` and collect findings from `law`.
 fn every_tear(law: fn(&Host) -> Vec<String>) -> String {
     let mut bad = String::new();
@@ -1653,25 +1617,6 @@ fn one_tear(law: fn(&Host) -> Vec<String>) -> (String, usize, usize) {
     (bad, tried, refused)
 }
 
-/// Torn reads leave no band on the match row past [`RECALL_BOUND_MS`].
-#[test]
-fn torn_reads_leave_no_band_on_the_match_row() {
-    let bad = every_tear(match_row_kept);
-    assert!(bad.is_empty(), "band kept on the match row R:{bad}");
-}
-
-/// Every single-piece tear preserves the retention ceiling and exercises program-row refusal.
-#[test]
-fn one_torn_read_at_any_boundary_leaves_no_band_on_the_match_row() {
-    let (bad, tried, refused) = one_tear(match_row_kept);
-    assert!(tried > 100, "the sweep tried {tried} tears");
-    assert!(refused > 0, "non-vacuity: some program rows were refused");
-    assert!(
-        bad.is_empty(),
-        "a single torn read left band on the match row:{bad}"
-    );
-}
-
 /// Any band ink on the match row, with how long each cell carried it.
 fn match_row_inked(h: &Host) -> Vec<String> {
     let r = h.match_row();
@@ -1682,9 +1627,17 @@ fn match_row_inked(h: &Host) -> Vec<String> {
         .collect()
 }
 
+/// [`match_row_inked`], and any cell still live on the match row once the replay rested.
+fn match_row_inked_or_live(h: &Host) -> Vec<String> {
+    let r = h.match_row();
+    let mut found = match_row_inked(h);
+    found.extend(live_cols(h, r).iter().map(|c| format!("live ({r},{c})")));
+    found
+}
+
 #[test]
 fn torn_reads_lay_no_band_on_the_match_row() {
-    let bad = every_tear(match_row_inked);
+    let bad = every_tear(match_row_inked_or_live);
     assert!(bad.is_empty(), "band laid on the match row R:{bad}");
     for delay_ms in [64, 1_500, 12_000] {
         let mut h = Host::new(24, 100, APP);
@@ -1707,8 +1660,9 @@ fn torn_reads_lay_no_band_on_the_match_row() {
 
 #[test]
 fn one_torn_read_at_any_boundary_lays_no_band_on_the_match_row() {
-    let (bad, tried, _) = one_tear(match_row_inked);
+    let (bad, tried, refused) = one_tear(match_row_inked_or_live);
     assert!(tried > 100, "the sweep tried {tried} tears");
+    assert!(refused > 0, "non-vacuity: some program rows were refused");
     assert!(
         bad.is_empty(),
         "a single torn read painted the match row:{bad}"
@@ -1792,6 +1746,184 @@ fn a_composer_inserting_again_settles_its_parked_row() {
     }
 }
 
+#[test]
+fn confirmed_composer_mode_needs_a_real_inserted_key_span() {
+    for confirming in [false, true] {
+        let mut h = Host::new(24, 100, APP);
+        let row = plain_prompt(&mut h);
+        h.glow.clear_typed(h.now);
+        h.feed(b"\x1b[1B\rstatus\x1b[A\x1b[4G");
+        h.idle_ms(20);
+        h.hint(b"i");
+        let entry = h.now;
+        h.idle_ms(1);
+        h.hint(b"p");
+        // A draw without a row change must not move the key's echo cutoff.
+        h.idle_ms(20);
+        h.glow.note_composer_entry(Some(entry));
+        h.glow.note_composer_insert_frame(confirming);
+        h.feed(b"p");
+        assert_eq!(
+            live_cols(&h, row).contains(&3),
+            confirming,
+            "{}",
+            h.report("queued insertion")
+        );
+        if confirming {
+            h.idle_ms(20);
+            h.feed(b"z");
+            assert!(
+                !live_cols(&h, row).contains(&4),
+                "mode-entry key cannot fund a later output move"
+            );
+        }
+    }
+}
+
+#[test]
+fn composer_echo_separates_append_motion_and_wide_glyphs_from_command_keys() {
+    for append in [false, true] {
+        for wide in [false, true] {
+            let mut h = Host::new(24, 100, APP);
+            let row = plain_prompt(&mut h);
+            h.feed(b"ab\x1b[4G");
+            h.glow.clear_typed(h.now);
+            h.feed(b"\x1b[1B\rstatus\x1b[A\x1b[4G");
+            h.idle_ms(20);
+            h.hint(if append { b"a" } else { b"i" });
+            let entry = h.now;
+            h.idle_ms(1);
+            if wide {
+                h.glow
+                    .note_typed_expected(h.now, 2, false, TypedClass::Glyph, '界');
+            } else {
+                h.hint(b"p");
+            }
+            h.glow.note_composer_entry(Some(entry));
+            h.glow.note_composer_insert_frame(true);
+            let mut output = if append {
+                b"\x1b[C\x1b[4h".to_vec()
+            } else {
+                b"\x1b[4h".to_vec()
+            };
+            output.extend_from_slice(if wide { "界".as_bytes() } else { b"p" });
+            output.extend_from_slice(b"\x1b[4l");
+            h.feed(&output);
+            let first = if append { 4 } else { 3 };
+            assert!(
+                live_cols(&h, row).contains(&first),
+                "append={append} wide={wide}: {}",
+                h.report("proved echo")
+            );
+            if append {
+                assert!(
+                    !live_cols(&h, row).contains(&3),
+                    "the append command's motion stays dark"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn composer_echo_can_precede_a_later_queued_text_keys_echo() {
+    let mut h = Host::new(24, 100, APP);
+    let row = plain_prompt(&mut h);
+    h.glow.clear_typed(h.now);
+    h.feed(b"\x1b[1B\rstatus\x1b[A\x1b[4G");
+    h.idle_ms(20);
+    h.hint(b"i");
+    let entry = h.now;
+    h.idle_ms(1);
+    h.hint(b"p");
+    h.hint(b"q");
+    h.idle_ms(20);
+    h.glow.note_composer_entry(Some(entry));
+    h.glow.note_composer_insert_frame(true);
+    h.feed(b"p");
+    assert!(
+        live_cols(&h, row).contains(&3),
+        "{}",
+        h.report("first echo")
+    );
+    h.idle_ms(20);
+    h.feed(b"q");
+    assert!(
+        live_cols(&h, row).contains(&4),
+        "{}",
+        h.report("queued echo")
+    );
+}
+
+#[test]
+fn composer_entry_never_spends_later_repeated_text_keys() {
+    let mut h = Host::new(24, 100, APP);
+    let row = plain_prompt(&mut h);
+    h.glow.clear_typed(h.now);
+    h.feed(b"\x1b[1B\rstatus\x1b[A\x1b[4G");
+    h.idle_ms(20);
+    h.hint(b"i");
+    let entry = h.now;
+    for &key in b"iiq" {
+        h.idle_ms(1);
+        h.hint(&[key]);
+    }
+    h.glow.note_composer_entry(Some(entry));
+    h.glow.note_composer_insert_frame(true);
+    for (index, &key) in b"iiq".iter().enumerate() {
+        h.feed(&[key]);
+        assert!(
+            live_cols(&h, row).contains(&(3 + index as u16)),
+            "{}",
+            h.report("repeated echo")
+        );
+        h.idle_ms(20);
+    }
+    h.feed(b"i");
+    assert!(
+        !live_cols(&h, row).contains(&6),
+        "entry key cannot pay for later output"
+    );
+}
+
+#[test]
+fn an_insert_entry_command_is_not_a_glyph_even_when_output_matches_it() {
+    let mut h = Host::new(24, 100, APP);
+    let row = plain_prompt(&mut h);
+    h.glow.clear_typed(h.now);
+    h.feed(b"\x1b[1B\rstatus\x1b[A\x1b[4G");
+    h.idle_ms(20);
+    h.hint(b"h");
+    h.idle_ms(1);
+    h.hint(b"i");
+    h.glow.note_composer_entry(Some(h.now));
+    h.glow.note_composer_insert_frame(true);
+    h.feed(b"i");
+    assert!(
+        !live_cols(&h, row).contains(&3),
+        "entry intent has no glyph credit"
+    );
+}
+
+#[test]
+fn composer_mode_without_changed_text_cannot_spend_normal_command_keys() {
+    let mut h = Host::new(24, 100, APP);
+    let row = plain_prompt(&mut h);
+    h.feed(b"aiaia\x1b[4G");
+    h.glow.clear_typed(h.now);
+    h.feed(b"\x1b[1B\rstatus\x1b[A\x1b[4G");
+    h.idle_ms(20);
+    h.hint(b"h");
+    h.hint(b"i");
+    h.glow.note_composer_insert_frame(true);
+    h.feed(b"\x1b[C");
+    assert!(
+        live_cols(&h, row).is_empty(),
+        "{}",
+        h.report("normal commands")
+    );
+}
+
 /// A licensed insert's echo establishes the hand's row.
 #[test]
 fn a_licensed_insert_takes_the_hand_s_row() {
@@ -1841,6 +1973,70 @@ fn a_recalled_lay_hands_back_the_row_s_doubt() {
     h.feed(b"c");
     assert_eq!(live_cols(&h, row), [3], "the torn read lays `c`");
     h.feed(b"\r\r\nbck-i-search: c_\x1b[K\x1b[A\x1b[4G");
+    h.idle_ms(100);
+    assert!(
+        h.ring.iter().any(|v| v.licence == "recall"),
+        "the lay is recalled: {}",
+        h.report("recall")
+    );
+    h.hint(b"l");
+    h.feed(b"l");
+    h.idle_ms(20);
+    assert!(
+        h.cells_on(row).iter().all(|&(_, glyph)| glyph != 'l'),
+        "the next torn read lays nothing on the match row: {}",
+        h.report("next key")
+    );
+    assert_eq!(
+        h.ring
+            .iter()
+            .filter(|v| v.reason == CursorGlow::DECLINE_PROGRAM_ROW)
+            .count(),
+        1,
+        "the parked row refuses `l`: {}",
+        h.report("next key")
+    );
+}
+
+/// A key pressed once the torn redisplay has walked the caret back, inside the caret's rest (an
+/// arrow taking the match on a remote link, its answer not back yet), keeps the recall: the caret
+/// rests where the key found it.
+#[test]
+fn a_key_after_the_walk_back_keeps_the_recall() {
+    let mut h = Host::new(24, 100, APP);
+    let row = plain_prompt(&mut h);
+    h.hint(&[0x12]);
+    h.idle_ms(40);
+    h.hint(b"c");
+    h.feed(b"c");
+    assert_eq!(live_cols(&h, row), [3], "the torn read lays `c`");
+    h.feed(b"\r\r\nbck-i-search: c_\x1b[K\x1b[A\x1b[4G");
+    h.idle_ms(8);
+    h.hint(b"\x1b[D");
+    h.idle_ms(100);
+    assert!(
+        h.ring.iter().any(|v| v.licence == "recall"),
+        "the lay is recalled: {}",
+        h.report("recall")
+    );
+}
+
+/// A click once the torn redisplay has walked the caret back, inside the caret's rest, keeps the
+/// hand where the lay put it, as any pointer gesture does, and settles no doubt: the recall still
+/// hands back the hand and the row's doubt, so the next torn read lays nothing on the match row.
+#[test]
+fn a_click_after_the_walk_back_still_hands_back_the_row_s_doubt() {
+    let mut h = Host::new(24, 100, APP);
+    let row = plain_prompt(&mut h);
+    h.hint(&[0x12]);
+    h.idle_ms(40);
+    h.hint(b"c");
+    h.feed(b"c");
+    assert_eq!(live_cols(&h, row), [3], "the torn read lays `c`");
+    h.feed(b"\r\r\nbck-i-search: c_\x1b[K\x1b[A\x1b[4G");
+    h.idle_ms(8);
+    // The app's pointer fence (`fence_pointer_license`).
+    h.glow.clear_typed_keeping_hand(h.now);
     h.idle_ms(100);
     assert!(
         h.ring.iter().any(|v| v.licence == "recall"),

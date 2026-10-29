@@ -101,6 +101,7 @@ fn point(reset_at: Option<Instant>, person: bool) -> TurnEndReading {
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::of_found(None),
         fact: None,
+        wake: None,
     }
 }
 

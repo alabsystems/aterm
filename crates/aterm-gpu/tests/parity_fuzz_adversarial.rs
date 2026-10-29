@@ -106,20 +106,62 @@ fn gpu_render_adversarial_states_never_panics_and_matches_cpu() {
         );
         assert!(!gpu_frame.pixels.is_empty(), "iter {it}: empty GPU frame");
 
-        let is_decdhl = dec == 1 || dec == 2;
-        if !is_decdhl {
-            let d = max_channel_delta(&cpu_frame, &gpu_frame);
-            worst = worst.max(d);
-            let exc = count_exceeding(&cpu_frame, &gpu_frame, 8);
-            worst_exc = worst_exc.max(exc);
-            assert!(
-                d <= EDGE_CEIL && exc <= MAX_FRINGE_PX,
-                "iter {it}: diverge by {d} (ceil {EDGE_CEIL}) over {exc} px (max {MAX_FRINGE_PX}) \
-                 ({rows}x{cols}, dec={dec}) — linear-light AA-fringe bound exceeded (interiors <=8)"
-            );
-        }
+        let d = max_channel_delta(&cpu_frame, &gpu_frame);
+        worst = worst.max(d);
+        let exc = count_exceeding(&cpu_frame, &gpu_frame, 8);
+        worst_exc = worst_exc.max(exc);
+        assert!(
+            d <= EDGE_CEIL && exc <= MAX_FRINGE_PX,
+            "iter {it}: diverge by {d} (ceil {EDGE_CEIL}) over {exc} px (max {MAX_FRINGE_PX}) \
+             ({rows}x{cols}, dec={dec}) — linear-light AA-fringe bound exceeded (interiors <=8)"
+        );
     }
     eprintln!(
         "gpu adversarial parity fuzz: {iters} frames; worst delta {worst}, worst fringe-px {worst_exc}"
     );
+}
+
+#[test]
+fn top_anchored_decdhl_rows_match_cpu() {
+    let theme = Theme::default();
+    for px in [13.0, 14.0, 15.0, 16.0, 17.0] {
+        let (mut cpu, mut gpu) = backends(px, theme);
+        gpu.set_bloom(false);
+        gpu.set_shimmer(false);
+        cpu.debug_block_on_lazy_fallbacks();
+        gpu.debug_block_on_lazy_fallbacks();
+        let mut win = aterm_gpu::WindowGpu::new();
+
+        for (rows, cols, seq) in [
+            (
+                2usize,
+                24usize,
+                b"WgQj09|_ \xe6\x97\xa5 \xf0\x9f\x9a\x80\x1b#4".as_slice(),
+            ),
+            (
+                1usize,
+                24usize,
+                b"WgQj09|_ \xe6\x97\xa5 \xf0\x9f\x9a\x80\x1b#4".as_slice(),
+            ),
+            (
+                1usize,
+                24usize,
+                b"WgQj09|_ \xe6\x97\xa5 \xf0\x9f\x9a\x80\x1b#3".as_slice(),
+            ),
+        ] {
+            let mut term = Terminal::new(rows as u16, cols as u16);
+            term.process(seq);
+            term.process(b"\x1b[?25l");
+            let input = term.cell_frame(rows, cols);
+            let cpu_frame = cpu.render_input(&input);
+            let gpu_frame = gpu.render_input(&mut win, &input, None);
+            let d = max_channel_delta(&cpu_frame, &gpu_frame);
+            let exc = count_exceeding(&cpu_frame, &gpu_frame, 8);
+            assert!(
+                d <= EDGE_CEIL && exc <= MAX_FRINGE_PX,
+                "px={px} ({rows}x{cols}, cell_h={}): DECDHL diverge by {d} over {exc} px",
+                cpu.cell_size().1
+            );
+        }
+    }
 }

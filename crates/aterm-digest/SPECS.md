@@ -1,17 +1,16 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-digest: the SHA-256 and wire-header specs
+# aterm-digest: the SHA-256 specs
 
 aterm-digest re-exports astream-digest's `Sha256`, `HmacSha256`, `hmac_sha256_parts`,
-`hkdf_extract`, `hkdf_expand_32`, `ct_eq`, `InvalidLength` and `MacError`, and owns two 16-byte
-wire headers. This file holds the specs of astream-digest's SHA-256 (the `sha256-*` rows and
-`opaque-debug`), which the HMAC and HKDF rows of `vendor/astream/crates/astream-digest/SPECS.md`
-build on, and the spec of this crate's headers (`digest-envelope-wire-roundtrip`).
+`hkdf_extract`, `hkdf_expand_32`, `ct_eq`, `InvalidLength` and `MacError`. This file holds the
+specs of astream-digest's SHA-256 (the `sha256-*` rows and `opaque-debug`), which the HMAC and HKDF
+rows of `vendor/astream/crates/astream-digest/SPECS.md` build on.
 
 Each row is a property its cited tests sample, stated so that a Trust/Clean proof against the
 compiled Rust function can retire those tests. Test paths under `../../vendor/astream/` are
-astream-digest's; `src/lib.rs` is this crate's.
+astream-digest's.
 
 Gap numbers refer to the gap table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
 Gap 0 (a seal that publishes Clean-discharged rows) blocks every spec, so every row lists it.
@@ -54,7 +53,6 @@ sha256-state-invariant	invariant	Sha256::new, Sha256::default, Sha256::update_sl
 sha256-digest-refines-fips	refinement	Sha256::digest_slice, Sha256::digest (via new, update_slice, finalize)	∀ m : &[u8] with |m| < 2^61: Sha256::digest_slice(m) = Sha256::digest(m) = FIPS.SHA256(m). A corollary of sha256-state-invariant and sha256-finalize-pads. The FIPS 180-4/NIST vectors and the recorded length sweeps (every length 0..=1024, and selected lengths to 100,000 bytes) are instances. The vectors move to evaluated facts about FIPS.SHA256 (model validation).	../../vendor/astream/crates/astream-digest/src/lib.rs::{fips_empty_message,fips_abc,fips_448_bit_message,fips_896_bit_message,fips_one_million_a}; ../../vendor/astream/crates/astream-digest/tests/lengths_and_streaming.rs::sha256_over_every_length_and_large_inputs_is_pinned; ../../vendor/astream/crates/astream-digest/tests/lengths_and_splits.rs::every_length_to_1024_is_the_recorded_answer	EASY given the two lemmas: composition of new/update_slice/finalize (callee ensures), the generic impl AsRef<[u8]> wrapper digest. The Clean model needs List UInt8 and UInt32 bit-vector arithmetic.	0,1,4,5,11,14
 sha256-streaming-equals-one-shot	equivalence	Sha256::update_slice, Sha256::update, Sha256::finalize, Sha256::digest	∀ partitions [x1..xn] (n ≥ 0, any lengths, empty pieces included) with total length < 2^61: feed(Sha256::new(),[x1..xn]).finalize() = Sha256::digest(x1 ++ … ++ xn). More generally, ∀ h, M with ShaInv(h,M): feed(h,xs).finalize() = FIPS.SHA256(M ++ concat xs). FREE given sha256-state-invariant (update is a monoid action on the abstraction) and sha256-finalize-pads.	../../vendor/astream/crates/astream-digest/tests/lengths_and_streaming.rs::sha256_fed_in_arbitrary_chunks_matches_one_shot; ../../vendor/astream/crates/astream-digest/src/lib.rs::{padding_boundary_lengths_stream_identically,whole_blocks_from_the_input_digest_as_every_byte_through_the_buffer_does}	EASY given the invariant: induction over a sequence of &mut self calls, a ghost message, list append	0,1,2,4,5
 opaque-debug	contract	<Sha256 as Debug>::fmt	∀ h : Sha256: format!("{h:?}") = "Sha256 { .. }", a constant independent of every field, so no absorbed message byte reaches the output. This is the general form of "does not contain \"secret\"". astream-digest's `opaque-debug-hmac` is the same spec for `HmacSha256`.	../../vendor/astream/crates/astream-digest/src/lib.rs::debug_does_not_leak_state	EASY-MEDIUM: a trait impl on &self, std::fmt::Formatter and debug_struct/finish_non_exhaustive (std calls that need models), String output from format!	0,1,2,3,4,11
-digest-envelope-wire-roundtrip	round-trip	encode_digest_envelope_wire, decode_digest_envelope_wire, encode_hmac_prefix_wire, decode_hmac_prefix_wire	∀ alg, tag_len ∈ 1..=32, flags, payload_len: decode_digest_envelope_wire(encode_digest_envelope_wire(alg, tag_len, flags, payload_len)) = Some((alg, tag_len, flags, payload_len)); a tag_len of 0 or above 32, a buffer under 16 bytes or another magic decodes to None. ∀ key_len, tag_prefix: decode_hmac_prefix_wire(encode_hmac_prefix_wire(key_len, tag_prefix)) = Some((key_len, tag_prefix)); a short buffer or another magic decodes to None.	src/lib.rs::digest_envelope_and_hmac_prefix_wire_roundtrip	EASY: const fns over fixed arrays, little-endian byte assembly, a bounds check	0,1,3
 ```
 
 ## 2. Test → spec map (TSV)
@@ -63,7 +61,6 @@ digest-envelope-wire-roundtrip	round-trip	encode_digest_envelope_wire, decode_di
 
 ```tsv
 file	test	primary	also
-src/lib.rs	digest_envelope_and_hmac_prefix_wire_roundtrip	digest-envelope-wire-roundtrip	
 ../../vendor/astream/crates/astream-digest/src/lib.rs	fips_empty_message	sha256-digest-refines-fips	
 ../../vendor/astream/crates/astream-digest/src/lib.rs	fips_abc	sha256-digest-refines-fips	
 ../../vendor/astream/crates/astream-digest/src/lib.rs	fips_448_bit_message	sha256-digest-refines-fips	sha256-finalize-pads (56 bytes spill the length, §4.1)
@@ -81,7 +78,7 @@ src/lib.rs	digest_envelope_and_hmac_prefix_wire_roundtrip	digest-envelope-wire-r
 ../../vendor/astream/crates/astream-digest/tests/lengths_and_splits.rs	every_length_to_1024_is_the_recorded_answer	sha256-digest-refines-fips	sha256-streaming-equals-one-shot
 ```
 
-16 tests map to the 7 rows; `sha256-digest-refines-fips` retires the most (7). astream-digest's
+15 tests map to the 6 rows; `sha256-digest-refines-fips` retires the most (7). astream-digest's
 HMAC, HKDF and `ct_eq` tests are mapped in its own file.
 
 ## 3. Tests that are not spec samples
@@ -122,19 +119,17 @@ HMAC, HKDF and `ct_eq` tests are mapped in its own file.
 
 No spec is blocked by gap 0 alone, so the order goes by fewest and smallest gaps, then by tests
 retired and by what each spec unlocks. `sha256-compress-refines-fips` is the one leaf the other
-`sha256-*` rows build on; `opaque-debug` and `digest-envelope-wire-roundtrip` are independent.
+`sha256-*` rows build on; `opaque-debug` is independent.
 
-1. **`digest-envelope-wire-roundtrip`** (gaps 0,1,3). Const fns over fixed arrays, a bounds check and
-   early returns, no loops. It retires 1 test.
-2. **`sha256-compress-refines-fips`** (0,1,2,3,7,14). Fixed-size arrays, fixed-bound loops, no
+1. **`sha256-compress-refines-fips`** (0,1,2,3,7,14). Fixed-size arrays, fixed-bound loops, no
    heap and no data-dependent control flow: the best first target for gap 7 on bit-vector code.
    It retires 1 test, and every other `sha256-*` row, and astream-digest's HMAC rows, build on it.
-3. **`sha256-finalize-pads`** (0,1,2,3,4,7). One branch and two `compress` calls (the first use
+2. **`sha256-finalize-pads`** (0,1,2,3,4,7). One branch and two `compress` calls (the first use
    of gap 4). It retires `the_length_field_is_64_bits_wide`.
-4. **`sha256-state-invariant`** (0,1,2,3,4,5,7,11), then **`sha256-digest-refines-fips`** and
+3. **`sha256-state-invariant`** (0,1,2,3,4,5,7,11), then **`sha256-digest-refines-fips`** and
    **`sha256-streaming-equals-one-shot`** as near-free corollaries. Together they retire 12
    tests, including the 10^6-byte vector and the 100,000-byte sweep. `update_slice` and
    `digest_slice` take a plain `&[u8]`, so gap 11 reaches only the `AsRef` wrappers `update` and
    `digest`.
-5. **`opaque-debug`** (0,1,2,3,4,11). It is small once `Formatter` is modelled. Writing the impl
+4. **`opaque-debug`** (0,1,2,3,4,11). It is small once `Formatter` is modelled. Writing the impl
    as `f.write_str("Sha256 { .. }")` drops the `debug_struct` model from the gap.

@@ -16,8 +16,8 @@ pub const fn grid_band_px(
     if grid_bot_row <= grid_top_row {
         return (0, 0);
     }
-    let raw_y0 = pad + grid_top_row.saturating_mul(cell_h);
-    let raw_y1 = pad + grid_bot_row.saturating_mul(cell_h);
+    let raw_y0 = pad.saturating_add(grid_top_row.saturating_mul(cell_h));
+    let raw_y1 = pad.saturating_add(grid_bot_row.saturating_mul(cell_h));
     let y0 = if raw_y0 < h { raw_y0 } else { h };
     let y1 = if raw_y1 < h { raw_y1 } else { h };
     (y0, y1)
@@ -314,5 +314,10 @@ mod tests {
         );
         let (a, b) = grid_band_px(4, 16, 0, 0, 500);
         assert!(a >= b, "grid_bot_row==0 is the no-translate default");
+        assert_eq!(
+            grid_band_px(16, usize::MAX, 1, 2, 500),
+            (500, 500),
+            "saturating product plus non-zero pad clamps to h without wrapping"
+        );
     }
 }

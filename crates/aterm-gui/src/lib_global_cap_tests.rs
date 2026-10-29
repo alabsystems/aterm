@@ -27,6 +27,9 @@ fn global_shed_order_picks_largest_until_under_cap() {
     assert!(global_shed_order(&usages, 400 * mib).is_empty());
     assert!(global_shed_order(&[], 10).is_empty());
     assert_eq!(global_shed_order(&usages, 120 * mib), vec![1, 2]);
+    let huge = [(1u64, usize::MAX), (2, usize::MAX - 1)];
+    assert_eq!(global_shed_order(&huge, usize::MAX), vec![1]);
+    assert_eq!(global_shed_order(&huge, 0), vec![1, 2]);
 }
 
 #[test]

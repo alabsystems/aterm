@@ -38,6 +38,7 @@ fn env() -> PaneEnv {
         cell_px: None,
         security_policy: None,
         hyperlink_schemes: Vec::new(),
+        kitty_media_admitted: false,
     }
 }
 
@@ -651,6 +652,7 @@ fn host_ops_roundtrip_and_enforce_clock_and_canonical_state_laws() {
         (HostOp::AuthorizeShellRekey([0xCC; 32]), None),
         (HostOp::WithdrawShellRekey([0xCC; 32]), None),
         (HostOp::SettleShellRekey([0xCC; 32]), None),
+        (HostOp::AdvanceKittyAnimations, Some(sample_clock)),
     ];
     for (op, clock) in all_ops {
         let input = PaneInput::Host { op, clock };
@@ -692,16 +694,19 @@ fn host_ops_roundtrip_and_enforce_clock_and_canonical_state_laws() {
         );
     }
 
-    // LeaveAlternateScreen without a recorded clock fails CLOCK_RECORDED.
+    // LeaveAlternateScreen and AdvanceKittyAnimations without a recorded clock fail CLOCK_RECORDED.
     let at = origin();
     let start = PaneState::new(project(&Terminal::new(6, 30)).expect("blank"), env());
-    let mut unclocked = PaneRecording::new(at, start.clone());
-    unclocked.bytes(Arc::from(&b"\x1b[?1049hhi"[..]), Some(sample_clock), b"");
-    unclocked.host(HostOp::LeaveAlternateScreen, None);
-    assert_eq!(
-        law(&unclocked.check(PaneCode::ThisBuild, BUILD).verdict),
-        Some((CLOCK_RECORDED, 1))
-    );
+    for op in [HostOp::LeaveAlternateScreen, HostOp::AdvanceKittyAnimations] {
+        let mut unclocked = PaneRecording::new(at, start.clone());
+        unclocked.bytes(Arc::from(&b"\x1b[?1049hhi"[..]), Some(sample_clock), b"");
+        unclocked.host(op, None);
+        assert_eq!(
+            law(&unclocked.check(PaneCode::ThisBuild, BUILD).verdict),
+            Some((CLOCK_RECORDED, 1)),
+            "{op:?} must require a clock"
+        );
+    }
 
     // State invariant: awaiting_shell_nonce and checkpoint.shell_integration_nonce cannot both be Some.
     let mut cp = start.checkpoint().clone();
@@ -795,4 +800,428 @@ fn split_decrqss_and_xtgettcap_queries_carry_and_answer_across_slices() {
             field: "state.carry.dcs_query"
         })
     ));
+}
+
+#[test]
+fn stored_kitty_images_numbers_virtuals_and_chunked_transfers_replay_across_slices() {
+    let at = origin();
+    let schema = PaneSchema::new(at);
+    let mut pane_env = env();
+    pane_env.cell_px = Some((10, 20));
+    let mut seed = Terminal::new(6, 30);
+    seed.set_host_alternate_scroll(pane_env.host_alternate_scroll);
+    seed.set_cell_pixel_size(10, 20);
+    let start = PaneState::new(project(&seed).expect("blank screen"), pane_env.clone());
+    let mut rec = PaneRecording::new(at, start.clone());
+    let mut live = start.engine_on(rec.schema());
+
+    let push_slice = |rec: &mut PaneRecording, live: &mut Terminal, bytes: &[u8], ms: u64| {
+        let clock = PaneClock {
+            offset_ns: ms * 1_000_000,
+            wall_ms: Some(1_800_000_000_000 + ms),
+        };
+        live.process_at(bytes, rec.schema().reading(clock));
+        let reply = live.take_response().unwrap_or_default();
+        rec.bytes(Arc::from(bytes), Some(clock), &reply);
+        reply
+    };
+
+    // Slice 1: store RGBA image 1 via number 42 + second animation frame.
+    push_slice(
+        &mut rec,
+        &mut live,
+        b"\x1b_Ga=t,f=32,s=3,v=1,I=42;////AAAA////AAAA\x1b\\\
+          \x1b_Ga=f,f=32,s=3,v=1,i=1,z=50;AAAA////AAAA////\x1b\\",
+        10,
+    );
+    // Slice 2: create U=1 virtual placement + Unicode placeholder, and open an m=1 chunked transfer.
+    let mut slice2 = b"\x1b_Ga=p,U=1,i=1,p=3,c=2,r=1\x1b\\".to_vec();
+    slice2.extend_from_slice("\x1b[2;1H\x1b[38;5;1m\u{10EEEE}\u{0305}\u{0305}\x1b[39m".as_bytes());
+    slice2.extend_from_slice(b"\x1b_Ga=t,f=24,s=1,v=1,i=8,m=1;/w\x1b\\");
+    push_slice(&mut rec, &mut live, &slice2, 20);
+
+    // Capture a mid-recording state for the negative control before Slice 3 completes and places.
+    let mid_cp = project(&live).expect("ground between chunks");
+    let mid_carry = PaneStepCarry::capture(&live, at.monotonic, PANE_HISTORY_LINES);
+    assert_eq!(mid_carry.kitty_store.len(), 1);
+    assert_eq!(mid_carry.kitty_numbers, vec![(42, 1)]);
+    assert!(mid_carry.kitty_pending.is_some());
+
+    // Slice 3: finish m=0 chunked transfer, place by I=42 and i=8, switch animation frame, witness.
+    let slice3 = b"\x1b_Gm=0;AA\x1b\\\
+                   \x1b[3;1H\x1b_Ga=p,I=42,c=2,r=1\x1b\\\
+                   \x1b[4;1H\x1b_Ga=p,i=8,c=1,r=1\x1b\\\
+                   \x1b_Ga=a,i=1,c=2\x1b\\";
+    let slice3_reply = push_slice(&mut rec, &mut live, slice3, 30);
+    let seen3 = live.checkpoint_visible().expect("at ground");
+    rec.witness(screen_digest(&seen3));
+
+    // Slice 4: delete all Kitty images (`d=A`) and witness again.
+    push_slice(&mut rec, &mut live, b"\x1b_Ga=d,d=A\x1b\\", 40);
+    let seen4 = live.checkpoint_visible().expect("at ground");
+    rec.witness(screen_digest(&seen4));
+
+    let here = rec.check(PaneCode::ThisBuild, BUILD);
+    assert_eq!(here.verdict, Verdict::Pass, "{here:?}");
+    assert_eq!(here.counts.matched, 2);
+    assert!(here.replies_matched >= 3);
+
+    let continuous = PaneState::from_live(&live, &schema, pane_env.clone()).expect("at ground");
+    assert_eq!(here.state_digest, state_digest(&schema, &continuous));
+
+    let encoded_trace = rec
+        .trace(PaneCode::ThisBuild, BUILD)
+        .expect("trace builds")
+        .encode();
+    let decoded = PaneTrace::decode(&encoded_trace).expect("trace decodes");
+    let there = decoded.check(at, BUILD).expect("trace replays");
+    assert_eq!(there.verdict, Verdict::Pass);
+    assert_eq!(there.state_digest, here.state_digest);
+
+    // Negative control: without the carried Kitty store/numbers/pending state, Slice 3 answers
+    // ENOENT instead of OK and fails REPLIES_MATCH.
+    let mut stripped_carry = mid_carry;
+    stripped_carry.kitty_store.clear();
+    stripped_carry.kitty_numbers.clear();
+    stripped_carry.kitty_pending = None;
+    let mut broken =
+        PaneRecording::new(at, PaneState::with_carry(mid_cp, stripped_carry, pane_env));
+    broken.bytes(
+        Arc::from(&slice3[..]),
+        Some(PaneClock {
+            offset_ns: 30_000_000,
+            wall_ms: Some(1_800_000_000_030),
+        }),
+        &slice3_reply,
+    );
+    broken.witness(screen_digest(&seen3));
+    let failed = broken.check(PaneCode::ThisBuild, BUILD);
+    assert!(
+        law(&failed.verdict).is_some(),
+        "dropping Kitty carry must fail replay check: {failed:?}"
+    );
+}
+
+#[test]
+fn placed_inline_images_relative_floating_and_history_replay_across_slices() {
+    let at = origin();
+    let schema = PaneSchema::new(at);
+    let mut pane_env = env();
+    pane_env.cell_px = Some((10, 20));
+    let mut live = Terminal::new(6, 30);
+    live.set_host_alternate_scroll(pane_env.host_alternate_scroll);
+    live.set_cell_pixel_size(10, 20);
+
+    // Pre-keyframe output: loose OSC 1337 spanning scrolled history + visible row, unnamed `a=T`
+    // (`i=0`), stored 2-frame Kitty `i=1` with cell parent `p=10` + relative child `p=11`, and
+    // virtual `p=2` + placeholder + floating child `p=21`.
+    live.process(
+        b"\x1b]1337;File=inline=1;width=3;height=2;preserveAspectRatio=0:QUJDREVGRw==\x1b\\\
+          \x1b[6;1H\r\n\
+          \x1b[1;12H\x1b_Ga=T,f=24,s=1,v=1,c=2,r=1;/wAA\x1b\\\
+          \x1b_Ga=t,f=32,s=2,v=1,i=1;////AAAA//8=\x1b\\\
+          \x1b_Ga=f,f=32,s=2,v=1,i=1,z=40;AAAA//////8=\x1b\\\
+          \x1b[3;2H\x1b_Ga=p,i=1,p=10,c=2,r=1\x1b\\\
+          \x1b_Ga=p,i=1,p=11,P=1,Q=10,H=3,V=0,c=1,r=1\x1b\\\
+          \x1b_Ga=p,U=1,i=1,p=2,c=2,r=1\x1b\\",
+    );
+    live.process("\x1b[4;2H\x1b[38;5;1;58;5;2m\u{10EEEE}\u{0305}\u{0305}\x1b[39;59m".as_bytes());
+    live.process(b"\x1b_Ga=p,i=1,p=21,P=1,Q=2,H=1,V=0,c=1,r=1\x1b\\");
+    let _ = live.take_response();
+
+    // Seed a mid-session recording from `PaneState::from_live`.
+    let start = PaneState::from_live(&live, &schema, pane_env.clone()).expect("at ground");
+    assert_eq!(start.carry().loose_images.len(), 2);
+    assert_eq!(start.carry().kitty_relations.len(), 1);
+    assert_eq!(start.carry().kitty_floating.len(), 1);
+    assert!(!start.carry().active_images.visible.is_empty());
+    assert!(!start.carry().active_images.history_rev.is_empty());
+
+    let mut rec = PaneRecording::new(at, start.clone());
+    let push_slice = |rec: &mut PaneRecording, live: &mut Terminal, bytes: &[u8], ms: u64| {
+        let clock = PaneClock {
+            offset_ns: ms * 1_000_000,
+            wall_ms: Some(1_800_000_000_000 + ms),
+        };
+        live.process_at(bytes, rec.schema().reading(clock));
+        let reply = live.take_response().unwrap_or_default();
+        rec.bytes(Arc::from(bytes), Some(clock), &reply);
+        reply
+    };
+
+    // Slice 1: attach a grandchild cell placement (`P=1,Q=11`) to pre-keyframe `p=11`, attach a
+    // grandchild floating placement (`P=1,Q=21`) to pre-keyframe `p=21`, move root `p=10` (which
+    // cascades to `p=11` and `p=12`), and switch animation frame 2.
+    let slice1 = b"\x1b_Ga=p,i=1,p=12,P=1,Q=11,H=1,V=0,c=1,r=1\x1b\\\
+                   \x1b_Ga=p,i=1,p=22,P=1,Q=21,H=1,V=0,c=1,r=1\x1b\\\
+                   \x1b[3;6H\x1b_Ga=p,i=1,p=10,c=2,r=1\x1b\\\
+                   \x1b_Ga=a,i=1,c=2\x1b\\";
+    let slice1_reply = push_slice(&mut rec, &mut live, slice1, 10);
+    let seen1 = live.checkpoint_visible().expect("at ground");
+    rec.witness(screen_digest(&seen1));
+
+    // Slice 2: cascading delete of `p=10` (`d=P`) removes `p=10`, `p=11`, and `p=12`.
+    push_slice(&mut rec, &mut live, b"\x1b_Ga=d,d=P,i=1,p=10\x1b\\", 20);
+    let seen2 = live.checkpoint_visible().expect("at ground");
+    rec.witness(screen_digest(&seen2));
+
+    let here = rec.check(PaneCode::ThisBuild, BUILD);
+    assert_eq!(here.verdict, Verdict::Pass, "{here:?}");
+    assert_eq!(here.counts.matched, 2);
+
+    let continuous = PaneState::from_live(&live, &schema, pane_env.clone()).expect("at ground");
+    assert_eq!(here.state_digest, state_digest(&schema, &continuous));
+
+    let encoded_trace = rec
+        .trace(PaneCode::ThisBuild, BUILD)
+        .expect("trace builds")
+        .encode();
+    let decoded = PaneTrace::decode(&encoded_trace).expect("trace decodes");
+    let there = decoded.check(at, BUILD).expect("trace replays");
+    assert_eq!(there.verdict, Verdict::Pass);
+    assert_eq!(there.state_digest, here.state_digest);
+
+    // Negative control: without placed-grid / floating / relation carry on the keyframe, `Q=11`
+    // and `Q=21` fail with ENOPARENT and trip REPLIES_MATCH.
+    let mut stripped_carry = start.carry().clone();
+    stripped_carry.loose_images.clear();
+    stripped_carry.kitty_floating.clear();
+    stripped_carry.kitty_relations.clear();
+    stripped_carry.active_images = Default::default();
+    let mut broken = PaneRecording::new(
+        at,
+        PaneState::with_carry(start.checkpoint().clone(), stripped_carry, pane_env),
+    );
+    broken.bytes(
+        Arc::from(&slice1[..]),
+        Some(PaneClock {
+            offset_ns: 10_000_000,
+            wall_ms: Some(1_800_000_000_010),
+        }),
+        &slice1_reply,
+    );
+    broken.witness(screen_digest(&seen1));
+    let failed = broken.check(PaneCode::ThisBuild, BUILD);
+    assert!(
+        law(&failed.verdict).is_some(),
+        "dropping placed image carry must fail replay check: {failed:?}"
+    );
+}
+
+#[test]
+fn kitty_animation_frame_steps_and_finite_loops_replay_across_slices_and_roundtrip_trace() {
+    let at = origin();
+    let schema = PaneSchema::new(at);
+    let mut pane_env = env();
+    pane_env.cell_px = Some((10, 20));
+    let mut live = Terminal::new(6, 30);
+    live.set_cell_pixel_size(10, 20);
+    let start = PaneState::from_live(&live, &schema, pane_env.clone()).expect("at ground");
+    let mut rec = PaneRecording::new(at, start.clone());
+
+    // Load a 2-frame 2x1 RGBA animation with `v=2` (frame 1 -> frame 2 -> rests on frame 2).
+    let setup = b"\x1b_Ga=t,f=32,s=2,v=1,i=7,q=2;////AAAA//8=\x1b\\\
+                  \x1b_Ga=f,f=32,s=2,v=1,i=7,z=30,q=2;AAAA//////8=\x1b\\\
+                  \x1b_Ga=a,i=7,r=1,z=30\x1b\\\
+                  \x1b_Ga=p,i=7,c=1,r=1,C=1,q=2\x1b\\\
+                  \x1b_Ga=a,i=7,s=3,v=2\x1b\\";
+    let t0 = PaneClock {
+        offset_ns: 10_000_000,
+        wall_ms: None,
+    };
+    live.process_at(setup, schema.reading(t0));
+    rec.bytes(Arc::from(&setup[..]), Some(t0), b"");
+
+    // Autonomous tick 1 at +30ms: advances to frame 2.
+    let tick1 = PaneClock {
+        offset_ns: 40_000_000,
+        wall_ms: None,
+    };
+    let step1 = live.advance_kitty_animations(schema.reading(tick1).monotonic);
+    assert!(step1.advanced);
+    rec.host(HostOp::AdvanceKittyAnimations, Some(tick1));
+    rec.witness(screen_digest(&live.checkpoint_visible().expect("ground")));
+
+    // Autonomous tick 2 at +60ms: finite `v=2` reaches `loops == 1` and rests without changing
+    // the shown frame (`!step2.advanced`), yet mutates `animation.loops` in canonical state!
+    let tick2 = PaneClock {
+        offset_ns: 70_000_000,
+        wall_ms: None,
+    };
+    let step2 = live.advance_kitty_animations(schema.reading(tick2).monotonic);
+    assert!(!step2.advanced && step2.next_frame_at.is_none());
+    rec.host(HostOp::AdvanceKittyAnimations, Some(tick2));
+
+    let here = rec.check(PaneCode::ThisBuild, BUILD);
+    assert_eq!(here.verdict, Verdict::Pass, "{here:?}");
+    let end_state = PaneState::from_live(&live, &schema, pane_env).expect("ground");
+    assert_eq!(here.state_digest, state_digest(&schema, &end_state));
+
+    let encoded_trace = rec
+        .trace(PaneCode::ThisBuild, BUILD)
+        .expect("trace builds")
+        .encode();
+    let decoded = PaneTrace::decode(&encoded_trace).expect("trace decodes");
+    let there = decoded.check(at, BUILD).expect("trace replays");
+    assert_eq!(there.verdict, Verdict::Pass);
+    assert_eq!(there.state_digest, here.state_digest);
+
+    // Negative control: omitting the resting finite-loop tick leaves `animation.loops == 0`
+    // instead of `1`, changing `state_digest`.
+    let mut missing_rest_tick = PaneRecording::new(at, start);
+    missing_rest_tick.bytes(Arc::from(&setup[..]), Some(t0), b"");
+    missing_rest_tick.host(HostOp::AdvanceKittyAnimations, Some(tick1));
+    let missing_check = missing_rest_tick.check(PaneCode::ThisBuild, BUILD);
+    assert_ne!(missing_check.state_digest, here.state_digest);
+}
+
+#[test]
+fn kitty_media_admitted_replays_file_queries_and_refused_transmits_across_slices() {
+    let at = origin();
+    let schema = PaneSchema::new(at);
+    let mut pane_env = env();
+    pane_env.kitty_media_admitted = true;
+
+    let (rec, live) = record_with_env(
+        at,
+        pane_env.clone(),
+        &[
+            Live::Out(
+                b"\x1b_Gi=31,a=q,t=f\x1b\\\
+                  \x1b_Gi=32,a=q,t=t\x1b\\\
+                  \x1b_Gi=33,a=q,t=s\x1b\\",
+                10,
+            ),
+            Live::Out(b"\x1b_Gi=34,a=T,t=f,f=32,s=1,v=1;L21pc3Npbmc=\x1b\\", 20),
+            Live::Witness,
+        ],
+    );
+    let here = rec.check(PaneCode::ThisBuild, BUILD);
+    assert_eq!(here.verdict, Verdict::Pass, "{here:?}");
+    let end_state = PaneState::from_live(&live, &schema, pane_env).expect("ground");
+    assert_eq!(here.state_digest, state_digest(&schema, &end_state));
+
+    let encoded_trace = rec
+        .trace(PaneCode::ThisBuild, BUILD)
+        .expect("trace builds")
+        .encode();
+    let decoded = PaneTrace::decode(&encoded_trace).expect("trace decodes");
+    let there = decoded.check(at, BUILD).expect("trace replays");
+    assert_eq!(there.verdict, Verdict::Pass);
+    assert_eq!(there.state_digest, here.state_digest);
+
+    // Negative control: without `kitty_media_admitted`, slice 0 answers ENOTSUPPORTED instead of OK.
+    let start_disabled = PaneState::new(project(&Terminal::new(6, 30)).expect("blank"), env());
+    let mut broken = PaneRecording::new(at, start_disabled);
+    broken.bytes(
+        Arc::from(&b"\x1b_Gi=31,a=q,t=f\x1b\\"[..]),
+        Some(PaneClock {
+            offset_ns: 10_000_000,
+            wall_ms: Some(1_800_000_000_010),
+        }),
+        b"\x1b_Gi=31;OK\x1b\\",
+    );
+    assert_eq!(
+        law(&broken.check(PaneCode::ThisBuild, BUILD).verdict),
+        Some((REPLIES_MATCH, 0))
+    );
+}
+
+#[test]
+fn extreme_clock_offsets_saturate_monotonic_instant_without_panicking() {
+    let at = origin();
+    let schema = PaneSchema::new(at);
+    let near_max = schema.reading(PaneClock {
+        offset_ns: u64::MAX - 1,
+        wall_ms: Some(u64::MAX - 1),
+    });
+    let at_max = schema.reading(PaneClock {
+        offset_ns: u64::MAX,
+        wall_ms: Some(u64::MAX),
+    });
+    assert!(near_max.monotonic >= at.monotonic);
+    assert!(at_max.monotonic >= near_max.monotonic);
+    assert_eq!(at_max.wall_ms, Some(u64::MAX));
+
+    let start = PaneState::new(project(&Terminal::new(4, 20)).expect("blank"), env());
+    let mut rec = PaneRecording::new(at, start);
+    rec.bytes(
+        Arc::from(&b"ok"[..]),
+        Some(PaneClock {
+            offset_ns: u64::MAX,
+            wall_ms: Some(u64::MAX),
+        }),
+        b"",
+    );
+    assert_eq!(rec.check(PaneCode::ThisBuild, BUILD).verdict, Verdict::Pass);
+    let _ = rec.check(PaneCode::DemoClockSkew, BUILD);
+
+    let encoded = rec
+        .trace(PaneCode::ThisBuild, BUILD)
+        .expect("trace")
+        .encode();
+    let decoded = PaneTrace::decode(&encoded).expect("decodes");
+    assert_eq!(
+        decoded.check(at, BUILD).expect("replays").verdict,
+        Verdict::Pass
+    );
+}
+
+#[test]
+fn judge_refuses_surplus_observations_and_refused_cell_px_keeps_state_env() {
+    let at = origin();
+    let schema = PaneSchema::new(at);
+    let contract = FaithfulReplay::new();
+    let state = PaneState::new(project(&Terminal::new(4, 20)).expect("blank"), env());
+    let run = aterm_aos::replay::Run {
+        state,
+        state_digest: Digest([0; 32]),
+        observations: vec![(0, PaneObservation::Resized { rows: 4, cols: 20 })],
+        observation_chain: Digest([0; 32]),
+        refused: None,
+    };
+    assert!(matches!(
+        contract.judge(&schema, &[], &run),
+        Verdict::Fail {
+            cursor: 0,
+            law: WITNESS_MATCHES,
+            ..
+        }
+    ));
+
+    let mut state = PaneState::new(project(&Terminal::new(4, 20)).expect("blank"), env());
+    let code = PrebuiltPane::new(PaneCode::ThisBuild, BUILD);
+    let err = code
+        .step(
+            &schema,
+            &mut state,
+            &PaneInput::CellPx {
+                width: 0,
+                height: 18,
+            },
+            &mut aterm_aos::effects::NoEffects,
+        )
+        .expect_err("zero-width CellPx must refuse with RESIZE_GEOMETRY");
+    assert_eq!(err.law, RESIZE_GEOMETRY);
+    assert_eq!(
+        state.env().cell_px,
+        None,
+        "refused CellPx step must not mutate state.env"
+    );
+
+    let err_partial = code
+        .step(
+            &schema,
+            &mut state,
+            &PaneInput::Bytes {
+                bytes: Arc::from(&b"\x1bP1$t"[..]),
+                clock: Some(PaneClock {
+                    offset_ns: 0,
+                    wall_ms: None,
+                }),
+            },
+            &mut aterm_aos::effects::NoEffects,
+        )
+        .expect_err("uncarried DECRSPS partial sequence must refuse step");
+    assert_eq!(err_partial.law, UNCARRIED_PARTIAL);
 }

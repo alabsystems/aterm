@@ -151,12 +151,8 @@ fn theme_own_colors(state: &SettingsViewState) -> crate::resolved_colors::Resolv
             .then(|| field_text(state, prefs::EDIT_THEME, ""))
         })
         .filter(|value| !value.trim().is_empty());
-    let config = Config {
-        theme,
-        ..Config::default()
-    };
     let side = theme_visible_side(state, state.presented_motion.get().system_dark);
-    config.resolved_colors(side, &state.assets.themes, None)
+    resolved_colors_from(state, side, ColorsFrom::theme(theme))
 }
 
 /// The colour an unset colour key draws, the one its placeholder names.
@@ -580,6 +576,14 @@ const ROW_WHEEL_FLOOR: f32 = 64.0;
 
 const TIGHT_WHEEL_FLOOR: f32 = 40.0;
 
+/// The least a picker sized by its room lays its wheel out, and the least room it lays one in.
+pub(super) const fn wheel_least() -> (f32, f32) {
+    (TIGHT_WHEEL_FLOOR, TIGHT_WHEEL_FLOOR + 2.0 * CARD_PAD)
+}
+
+/// A picker card's inset around its wheel and controls.
+const CARD_PAD: f32 = 4.0;
+
 /// `row` (a colour row, `key`'s) with its open picker under it, as one stop of the list.
 pub(super) fn with_open_color_picker(
     state: &SettingsViewState,
@@ -654,7 +658,7 @@ fn color_picker_card(
             column_width,
         )]
     };
-    const PAD: f32 = 4.0;
+    const PAD: f32 = CARD_PAD;
     let inner = (room - 2.0 * PAD).max(scaled_control_height());
     let text_width = text_width - 2.0 * PAD;
     let beside = |floor: f32, column: SettingsWidth| {

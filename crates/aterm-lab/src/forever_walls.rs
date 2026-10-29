@@ -92,15 +92,17 @@ fn forever_faults(seen: &Seen, t1: i64, until: i64, t0: i64) -> Vec<String> {
 fn landed(seen: &Seen, done: &(i64, String), mut bad: Vec<String>, said: &str, t0: i64) -> Verdict {
     let (more, quiet, window) = landing_quiet(seen, done, false, t0);
     bad.extend(more);
-    if let Some(r) = cover::invented_record(seen) {
-        bad.push(format!("a task record where none was given: {r}"));
-    }
+    let unread = cover::invented_record(seen, &mut bad);
     if seen.cover.window_stub.is_none() {
         return Verdict::Unobserved(format!(
             "{said}; {quiet}: the stub's dumps of the wall were not read"
         ));
     }
-    landed_verdict(bad, format!("{said}; {quiet}"), seen, done.0, window)
+    let said = format!("{said}; {quiet}");
+    match unread {
+        Some(why) if bad.is_empty() => Verdict::Unobserved(format!("{said}: {why}")),
+        _ => landed_verdict(bad, said, seen, done.0, window),
+    }
 }
 
 /// Judges `--mode wall-redraw`: a usage wall redrawn under a new reset after a typed resume.

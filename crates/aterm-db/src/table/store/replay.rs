@@ -33,64 +33,109 @@ pub(super) struct Entry {
     )
 )]
 pub(super) fn read(log: &mut Log, acknowledged: Witness, pending: bool) -> Result<Replay> {
-    let mut witness = Witness::default();
-    let mut prefix_checked = acknowledged == witness;
-    let mut entries = Vec::new();
+    let mut replay = Builder::new(acknowledged, pending);
     let mut offset = Offset::ZERO;
     loop {
         let batch = log.read_range(offset, 256)?;
         if batch.is_empty() {
             break;
         }
-        if pending {
+        for entry in batch {
+            offset = replay.push(&entry)?;
+        }
+    }
+    replay.finish()
+}
+
+/// An observer exposes only independently witnessed receipts. A sealed append
+/// awaiting its custody witness is left to the exclusive writer's recovery path.
+pub(super) fn read_observed(
+    records: Vec<astream_broker::BrokerRecord>,
+    acknowledged: Witness,
+) -> Result<Replay> {
+    let mut builder = Builder::new(acknowledged, false);
+    for record in records {
+        builder.push(&record)?;
+    }
+    let mut replay = builder.finish()?;
+    let count = usize::try_from(acknowledged.count)
+        .map_err(|_| Error::new("table witness count exceeds this reader"))?;
+    replay.entries.truncate(count);
+    replay.witness = acknowledged;
+    Ok(replay)
+}
+
+struct Builder {
+    acknowledged: Witness,
+    pending: bool,
+    witness: Witness,
+    prefix_checked: bool,
+    entries: Vec<Entry>,
+}
+impl Builder {
+    fn new(acknowledged: Witness, pending: bool) -> Self {
+        Self {
+            acknowledged,
+            pending,
+            witness: Witness::default(),
+            prefix_checked: acknowledged == Witness::default(),
+            entries: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, entry: &astream_broker::BrokerRecord) -> Result<Offset> {
+        if self.pending {
             return Err(Error::new("unfinished table enrollment contains records"));
         }
-        for entry in batch {
-            if !matches!(entry.subject.as_str(), SUBJECT | CONFLICT_SUBJECT) || entry.body.len() < 8
-            {
-                return Err(Error::new("foreign table journal record"));
-            }
-            let received_ms = u64::from_le_bytes(entry.body[..8].try_into().unwrap());
-            let wire = entry.body[8..].to_vec();
-            let id = Sha256::digest(&wire);
-            witness = witness.advance(entry.seq.0, id, received_ms)?;
-            if witness.count > acknowledged.count + 1 {
+        if !matches!(entry.subject.as_str(), SUBJECT | CONFLICT_SUBJECT) || entry.body.len() < 8 {
+            return Err(Error::new("foreign table journal record"));
+        }
+        let received_ms = u64::from_le_bytes(entry.body[..8].try_into().unwrap());
+        let wire = entry.body[8..].to_vec();
+        let id = Sha256::digest(&wire);
+        self.witness = self.witness.advance(entry.seq.0, id, received_ms)?;
+        if self.witness.count > self.acknowledged.count + 1 {
+            return Err(Error::new(
+                "table log exceeds its single unwitnessed append allowance",
+            ));
+        }
+        if self.witness.count == self.acknowledged.count {
+            if self.witness != self.acknowledged {
                 return Err(Error::new(
-                    "table log exceeds its single unwitnessed append allowance",
+                    "acknowledged table history differs from custody witness",
                 ));
             }
-            if witness.count == acknowledged.count {
-                if witness != acknowledged {
-                    return Err(Error::new(
-                        "acknowledged table history differs from custody witness",
-                    ));
-                }
-                prefix_checked = true;
-            }
-            entries.push(Entry {
-                receipt: Receipt {
-                    id,
-                    received_ms,
-                    offset: entry.seq.0,
-                },
-                wire,
-                conflict: entry.subject == CONFLICT_SUBJECT,
-            });
-            offset = Offset(
-                entry
-                    .seq
-                    .0
-                    .checked_add(1)
-                    .ok_or_else(|| Error::new("table offset exhausted"))?,
-            );
+            self.prefix_checked = true;
         }
+        self.entries.push(Entry {
+            receipt: Receipt {
+                id,
+                received_ms,
+                offset: entry.seq.0,
+            },
+            wire,
+            conflict: entry.subject == CONFLICT_SUBJECT,
+        });
+        Ok(Offset(
+            entry
+                .seq
+                .0
+                .checked_add(1)
+                .ok_or_else(|| Error::new("table offset exhausted"))?,
+        ))
     }
-    if !prefix_checked {
-        return Err(Error::new(
-            "table history lost acknowledged custody records",
-        ));
+
+    fn finish(self) -> Result<Replay> {
+        if !self.prefix_checked {
+            return Err(Error::new(
+                "table history lost acknowledged custody records",
+            ));
+        }
+        Ok(Replay {
+            entries: self.entries,
+            witness: self.witness,
+        })
     }
-    Ok(Replay { entries, witness })
 }
 
 #[cfg_attr(

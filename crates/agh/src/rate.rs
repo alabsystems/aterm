@@ -35,7 +35,10 @@ impl RateSnapshot {
         let remaining = number("x-ratelimit-remaining")?;
         let reset = number("x-ratelimit-reset")?;
         Some(RateSnapshot {
-            resource: get("x-ratelimit-resource").unwrap_or("core").to_string(),
+            resource: get("x-ratelimit-resource")
+                .filter(|s| !s.is_empty())
+                .unwrap_or("core")
+                .to_string(),
             limit,
             remaining,
             reset,

@@ -9,15 +9,19 @@ use std::time::Duration;
 
 /// Connect to `addr` within `timeout`, as `TcpStream::connect_timeout` does.
 /// # Errors
-/// The connect failed, was refused, or did not complete within `timeout`.
+/// The connect failed, was refused, or did not complete within `timeout`; or a debug build's
+/// partition cut lists `addr` (`HostUnreachable`, [`aterm_uds::partition::check`]).
 pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+    aterm_uds::partition::check(*addr)?;
     #[cfg(windows)]
     {
         winsock::connect_timeout(addr, timeout)
     }
     #[cfg(not(windows))]
     {
-        TcpStream::connect_timeout(addr, timeout)
+        let stream = TcpStream::connect_timeout(addr, timeout)?;
+        let _ = aterm_uds::keep_out_of_children(&stream);
+        Ok(stream)
     }
 }
 
@@ -303,6 +307,24 @@ mod tests {
         drop(listener);
         let err = connect_timeout(&addr, MUST_HAPPEN).expect_err("nothing listens");
         assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused, "{err}");
+    }
+
+    #[test]
+    fn a_connect_the_partition_cuts_reaches_no_listener_until_the_cut_heals() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let addr = listener.local_addr().expect("addr");
+        let cut = format!("{addr}\n");
+        let err = aterm_uds::partition::cut_here(&cut, || connect_timeout(&addr, MUST_HAPPEN))
+            .expect_err("cut");
+        assert_eq!(err.kind(), io::ErrorKind::HostUnreachable, "{err}");
+        assert_eq!(
+            listener.accept().expect_err("nothing came").kind(),
+            io::ErrorKind::WouldBlock,
+            "the cut connect made no connection"
+        );
+        let healed = aterm_uds::partition::cut_here("", || connect_timeout(&addr, MUST_HAPPEN));
+        assert!(healed.is_ok(), "{healed:?}");
     }
 
     #[test]

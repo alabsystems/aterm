@@ -1,6 +1,7 @@
 seq v=1 rig=transcript program=claude build=2.1.0
-# Twin of a_tool_use_for_a_closed_or_unmapped_turn_never_opens_a_step, its
-# first rig (S13).
+# Twin of a_tool_use_for_a_closed_turn_never_opens_a_step (S13). The unmapped
+# case is tx-twin-a-prompt-older-than-the-open-turn-partial.seq: since fix E1 a
+# partial prompt with no turn open opens its own.
 bind 0
 see busy
 tx prompt v1

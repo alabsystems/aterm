@@ -28,8 +28,8 @@ fn descriptor(bootstrap: &Bootstrap) -> Result<Descriptor> {
 }
 
 /// An installation's account proposal database. Construction performs no I/O.
-/// Each operation obtains a fresh locked membership observation and opens one
-/// short-lived local store; no handle or secret is held across network I/O.
+/// Mutations obtain a fresh locked membership observation; metadata snapshots
+/// read a verified committed prefix beside writers. No handle or secret is held across network I/O.
 pub struct Proposals {
     paths: Paths,
 }
@@ -44,9 +44,11 @@ impl Proposals {
     /// Read current eligible metadata and signed/local provenance. A missing or
     /// damaged established store is never silently replaced.
     pub fn snapshot(&self) -> Result<Snapshot> {
-        self.with_store(false, |session, store, _| {
-            Self::snapshot_from_store(session, store)
-        })
+        crate::documents::application::observe_store(
+            &self.paths,
+            descriptor,
+            |session, store, _| Self::snapshot_from_store(session, store),
+        )
     }
     /// Project an already opened proposal store without reopening or enrolling
     /// its catalog. The caller keeps the authenticated session alive.

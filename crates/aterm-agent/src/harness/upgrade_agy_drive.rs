@@ -495,6 +495,13 @@ pub(super) fn after_exit_onto(
             }
         });
         let overtook = overtaken.is_some();
+        if !overtook && hand_waits_out(opts, &mut st, &session_key, |pid| k.alive(pid)) {
+            if st.exited_at == 0 {
+                st.exited_at = now_s();
+                save(opts, &session_key, &st);
+            }
+            return said(r, WAIT_HAND_LIFTS);
+        }
         let Some((why, detail)) = overtaken.or_else(|| expired(&st, now_s(), k)) else {
             return carry_in_flight_with(opts, r, st, &session_key, k);
         };
@@ -503,6 +510,9 @@ pub(super) fn after_exit_onto(
             if overtook {
                 st.close_overtaken(why, now_s());
             } else {
+                if st.exited_at == 0 {
+                    st.exited_at = now_s();
+                }
                 st.fail(why, now_s());
             }
             ledger(opts, &said(r.clone(), format!("failed:{why}")), &detail);
@@ -614,6 +624,7 @@ pub(super) fn after_exit_onto(
         twin: program.to_string_lossy().into_owned(),
         pid: snap.pid,
         shell: snap.shell,
+        proc_start: snap.start.clone(),
         tab: tab.clone(),
         from,
         to,
@@ -654,7 +665,7 @@ pub(super) fn after_exit_onto(
 fn expired(st: &St, now: u64, k: &dyn AgyKernel) -> Option<(&'static str, String)> {
     match st.phase {
         Phase::Exiting { at_s }
-            if now.saturating_sub(exit_clock(at_s, 0, st.hand_seen_s)) > STALE_S =>
+            if now.saturating_sub(exit_clock(at_s, st.exited_at, st.hand_seen_s)) > STALE_S =>
         {
             Some((
                 "stale-exit",
@@ -1113,10 +1124,24 @@ fn carry_in_flight_with(
     if opts.dry_run {
         return said(r, format!("would-resume:{}", st.phase.word()));
     }
+    let see_gone = |st: &mut St| -> bool {
+        if st.exited_at != 0 || st.pid == 0 || k.alive(st.pid) {
+            return false;
+        }
+        st.exited_at = now_s();
+        true
+    };
     if hand_waits_out(opts, &mut st, session, |pid| k.alive(pid)) {
+        if see_gone(&mut st) {
+            save(opts, session, &st);
+        }
         return said(r, WAIT_HAND_LIFTS);
     }
-    if let Some((why, detail)) = expired(&st, now_s(), k) {
+    let stale = expired(&st, now_s(), k);
+    if see_gone(&mut st) {
+        save(opts, session, &st);
+    }
+    if let Some((why, detail)) = stale {
         let r = fail(opts, r, &mut st, why, &detail);
         save(opts, session, &st);
         return r;

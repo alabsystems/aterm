@@ -625,8 +625,7 @@ pub fn chrome_line<D: Desk>(d: &D, front: Option<D::Win>) -> String {
         .map_or_else(|| "-".to_string(), |sid| format!("@{sid}"));
     let pill = view
         .and_then(|v| v.pill.as_ref())
-        .map(|p| pill_words(p, now).text())
-        .unwrap_or_default();
+        .map_or_else(String::new, |p| pill_words(p, now).text());
     format!(
         "presence rim={rim} pressing={pressing} pill={}",
         quoted(&pill)

@@ -5,10 +5,11 @@
 //! stands on, the flight, the run and lead it keeps beside the caret (the held stands among
 //! them), its moods and pending reactions (the offered and caught star, the trick and room cues),
 //! the pointer's play, the gait and the still pose it holds, the wear, the palette and arrival,
-//! the departures, the letter veil, the motes and the last frame it drew by. The console's
-//! resident and the stroke detector are not named yet, and so are not hashed. Nor are the tests'
-//! switches (`hug_armed`, `letters_unseen`, `letter_arrival_dwells`, `letter_step_rearms` and
-//! `old_paths`), which a test sets and the brain only reads. A surface's session id is the
+//! the departures, the letter veil, the motes and the last frame it drew by, then the console's
+//! resident (its words are `console_life/state_words.rs`'s) and the pointer's stroke detector
+//! (`crate::pet_stroke`'s). Not hashed: the tests' switches (`hug_armed`, `letters_unseen`,
+//! `letter_arrival_dwells`, `letter_step_rearms` and `old_paths`), which a test sets and the
+//! brain only reads. A surface's session id is the
 //! process's count of terminals, not the pet's state: a surface is hashed by its screen and by
 //! whether it is the one the body stands on.
 
@@ -448,6 +449,8 @@ impl PetBrain {
             f.f32("home", self.home);
             f.flag("evicting", self.evicting);
         });
+        self.console.state_words(w);
+        w.group("pet.stroke", |f| self.stroke.state_words(f));
     }
 
     /// A surface the brain keeps beside its own: whether it is the body's, then its screen.
@@ -655,7 +658,7 @@ mod tests {
         use super::super::PetMoteKind;
         let t0 = Instant::now();
         let base = words(&PetBrain::new(), t0);
-        let cases: [Case; 25] = [
+        let cases: [Case; 27] = [
             ("the surface", |p, _| p.surface = Some((7, true))),
             ("a held stand", |p, _| {
                 p.held_stash[1] = Some(HeldStand {
@@ -684,6 +687,12 @@ mod tests {
                 p.set_off_asked = Some([1, 2, 3, 4])
             }),
             ("the console's pose", |p, _| p.console_posed = true),
+            ("the console resident", |p, t0| {
+                p.note_console_completion(t0, true)
+            }),
+            ("the stroke detector", |p, t0| {
+                p.stroke.sample(t0, Some((3.0, 1.0)), 2.0);
+            }),
             ("a deferred arc", |p, _| {
                 p.deferred_arc = Some((6.0, 2.0, 0.3, 1.0, FlightKind::PLAIN));
             }),

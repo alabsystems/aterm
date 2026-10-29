@@ -132,3 +132,46 @@ fn vault_sync_effect_keeps_default_restore_and_completed_stop_semantics() {
         "a completed durable Stop remains spent; the caller also checks local Stop"
     );
 }
+
+/// An admitted run owes its Secrets stage until that stage is done: not once it is, nor once the
+/// run completed or was stopped, nor where the plan leaves the Secrets vault out, nor with no
+/// run at all.
+/// NEGATIVE CONTROL: a reader that ignores the Secrets stage's done bit reads a run past that
+/// stage as owing it.
+#[test]
+fn an_admitted_run_owes_its_secrets_stage_until_it_is_done() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    assert!(!owes_secrets_stage_at(root.path()).unwrap(), "no run");
+
+    let revision = restart_at(root.path(), &Plan::default()).unwrap();
+    assert!(
+        owes_secrets_stage_at(root.path()).unwrap(),
+        "admitted, nothing done"
+    );
+    let mut past = progress(root.path()).unwrap().unwrap();
+    past.done |= Stage::Secrets.bit();
+    save_progress(root.path(), past).unwrap();
+    assert!(
+        !owes_secrets_stage_at(root.path()).unwrap(),
+        "its Secrets stage is done"
+    );
+
+    restart_at(root.path(), &Plan::default()).unwrap();
+    let mut done = progress(root.path()).unwrap().unwrap();
+    done.completed = true;
+    save_progress(root.path(), done).unwrap();
+    assert!(!owes_secrets_stage_at(root.path()).unwrap(), "completed");
+
+    let revision_again = restart_at(root.path(), &Plan::default()).unwrap();
+    assert!(revision_again > revision);
+    request_stop_at(root.path(), revision_again).unwrap();
+    assert!(!owes_secrets_stage_at(root.path()).unwrap(), "stopped");
+
+    let mut without = Plan::default();
+    without.selection.set(Setting::Secrets, false);
+    restart_at(root.path(), &without).unwrap();
+    assert!(
+        !owes_secrets_stage_at(root.path()).unwrap(),
+        "the vault left out"
+    );
+}

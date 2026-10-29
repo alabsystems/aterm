@@ -79,8 +79,8 @@ pub struct Hello {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HostVitals {
     /// Logical CPU core count (`hw.ncpu` / `nproc`).
-    #[serde(default)]
-    pub cpu_cores: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_cores: Option<u32>,
     /// Whole-machine CPU busy percentage (`0..=100`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_busy_pct: Option<u8>,
@@ -90,6 +90,9 @@ pub struct HostVitals {
     /// Accelerator / GPU model name (`"Apple M5 GPU"`, `"NVIDIA GB10"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_name: Option<String>,
+    /// GPU core count, where the host reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_cores: Option<u32>,
     /// Accelerator / GPU device busy percentage (`0..=100`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_busy_pct: Option<u8>,
@@ -100,11 +103,11 @@ pub struct HostVitals {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_power_deciwatts: Option<u32>,
     /// Total physical RAM in bytes.
-    #[serde(default)]
-    pub mem_total_bytes: u64,
-    /// Used RAM in bytes (`total - available`).
-    #[serde(default)]
-    pub mem_used_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_total_bytes: Option<u64>,
+    /// Used RAM in bytes, where the reader measured its classes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_used_bytes: Option<u64>,
     /// Wired kernel RAM in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mem_wired_bytes: Option<u64>,
@@ -117,15 +120,15 @@ pub struct HostVitals {
     /// Memory pressure word (`"normal"`, `"warn"`, `"critical"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mem_pressure: Option<String>,
-    /// Root volume total capacity in bytes.
-    #[serde(default)]
-    pub disk_total_bytes: u64,
-    /// Root volume used capacity in bytes.
-    #[serde(default)]
-    pub disk_used_bytes: u64,
-    /// Root volume available capacity in bytes.
-    #[serde(default)]
-    pub disk_avail_bytes: u64,
+    /// Capacity of the volume holding this account's home, in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_total_bytes: Option<u64>,
+    /// Occupied bytes on the account home volume, independent of writable available space.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_used_bytes: Option<u64>,
+    /// Writable available bytes on the account home volume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_avail_bytes: Option<u64>,
     /// Host uptime in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uptime_secs: Option<u64>,
@@ -151,6 +154,9 @@ impl HostVitals {
     /// Format bytes in human-readable GiB/TiB/MiB.
     #[must_use]
     pub fn human_bytes(bytes: u64) -> String {
+        if bytes == 0 {
+            return "0 MiB".to_owned();
+        }
         const MIB: f64 = 1024.0 * 1024.0;
         const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
         const TIB: f64 = 1024.0 * 1024.0 * 1024.0 * 1024.0;
@@ -186,16 +192,11 @@ impl HostVitals {
     /// Format CPU busy % + core count + load average.
     #[must_use]
     pub fn format_cpu(&self) -> String {
-        let pct = self.cpu_busy_pct.or_else(|| {
-            let load1 = self.load_avg_100?[0];
-            let cores = self.cpu_cores.max(1);
-            Some((load1.saturating_mul(100) / (cores * 100)).min(100) as u8)
-        });
-        let cores = if self.cpu_cores > 0 {
-            format!("{}c", self.cpu_cores)
-        } else {
-            "-".to_owned()
-        };
+        let pct = self.cpu_busy_pct.map(|p| p.min(100));
+        let cores = self
+            .cpu_cores
+            .filter(|n| *n > 0)
+            .map_or_else(|| "cores unknown".to_owned(), |n| format!("{n}c"));
         let load = self.load_avg_100.map_or_else(
             || "-".to_owned(),
             |[l1, l5, l15]| {
@@ -209,7 +210,9 @@ impl HostVitals {
         );
         match pct {
             Some(p) => format!("{p:>2}% {} ({cores} \u{b7} load {load})", Self::bar_8(p)),
-            None if self.cpu_cores > 0 => format!("{cores} \u{b7} load {load}"),
+            None if self.cpu_cores.is_some() || self.load_avg_100.is_some() => {
+                format!("utilization unavailable ({cores} \u{b7} load {load})")
+            }
             None => "unprobed".to_owned(),
         }
     }
@@ -218,11 +221,14 @@ impl HostVitals {
     #[must_use]
     pub fn format_gpu(&self) -> String {
         let mut parts = Vec::new();
-        if let Some(pct) = self.gpu_busy_pct {
+        if let Some(pct) = self.gpu_busy_pct.map(|p| p.min(100)) {
             parts.push(format!("{pct}% {}", Self::bar_8(pct)));
         }
         if let Some(name) = self.gpu_name.as_deref().filter(|s| !s.is_empty()) {
             parts.push(name.to_owned());
+        }
+        if let Some(cores) = self.gpu_cores.filter(|n| *n > 0) {
+            parts.push(format!("{cores} cores"));
         }
         if let Some(temp) = self.gpu_temp_c {
             parts.push(format!("{temp}\u{b0}C"));
@@ -240,19 +246,9 @@ impl HostVitals {
     /// Format RAM usage, percentage bar, pressure, wired/compressed, and swap.
     #[must_use]
     pub fn format_memory(&self) -> String {
-        if self.mem_total_bytes == 0 {
+        if !self.has_memory() {
             return "unprobed".to_owned();
         }
-        if self.mem_used_bytes == 0
-            && self.mem_wired_bytes.is_none()
-            && self.mem_pressure.is_none()
-            && self.cpu_busy_pct.is_none()
-            && self.load_avg_100.is_none()
-        {
-            return format!("{} total", Self::human_bytes(self.mem_total_bytes));
-        }
-        let pct = ((self.mem_used_bytes.saturating_mul(100)) / self.mem_total_bytes.max(1)).min(100)
-            as u8;
         let mut extra = Vec::new();
         if let Some(p) = self.mem_pressure.as_deref().filter(|s| !s.is_empty()) {
             extra.push(p.to_owned());
@@ -266,53 +262,77 @@ impl HostVitals {
         if let Some(sw) = self.swap_used_bytes.filter(|sw| *sw > 0) {
             extra.push(format!("swap {}", Self::human_bytes(sw)));
         }
+        if let Some(pct) = Self::used_percent(self.mem_used_bytes, self.mem_total_bytes) {
+            extra.insert(0, format!("{pct}% {}", Self::bar_8(pct)));
+        }
         let suffix = if extra.is_empty() {
             String::new()
         } else {
-            format!(" \u{b7} {}", extra.join(" \u{b7} "))
+            format!(" ({})", extra.join(" \u{b7} "))
         };
         format!(
-            "{}/{} ({pct}% {}{suffix})",
-            Self::human_bytes(self.mem_used_bytes),
-            Self::human_bytes(self.mem_total_bytes),
-            Self::bar_8(pct),
+            "{} used/{} total{suffix}",
+            Self::observed_bytes(self.mem_used_bytes),
+            Self::observed_bytes(self.mem_total_bytes),
         )
     }
 
-    /// Format root disk capacity, used %, and available space.
+    /// Format account home volume capacity, used %, and available space.
     #[must_use]
     pub fn format_disk(&self) -> String {
-        if self.disk_total_bytes == 0 {
+        if self.disk_total_bytes.is_none()
+            && self.disk_used_bytes.is_none()
+            && self.disk_avail_bytes.is_none()
+        {
             return "unprobed".to_owned();
         }
-        if self.disk_used_bytes == 0 && self.disk_avail_bytes == 0 {
-            return format!("{} total", Self::human_bytes(self.disk_total_bytes));
-        }
-        let pct = ((self.disk_used_bytes.saturating_mul(100)) / self.disk_total_bytes.max(1))
-            .min(100) as u8;
+        let share = Self::used_percent(self.disk_used_bytes, self.disk_total_bytes)
+            .map(|pct| format!("{pct}% \u{b7} "))
+            .unwrap_or_default();
         format!(
-            "{}/{} ({pct}% \u{b7} {} free)",
-            Self::human_bytes(self.disk_used_bytes),
-            Self::human_bytes(self.disk_total_bytes),
-            Self::human_bytes(self.disk_avail_bytes)
+            "{} used/{} total ({share}{} available)",
+            Self::observed_bytes(self.disk_used_bytes),
+            Self::observed_bytes(self.disk_total_bytes),
+            Self::observed_bytes(self.disk_avail_bytes)
         )
+    }
+
+    fn observed_bytes(bytes: Option<u64>) -> String {
+        bytes.map_or_else(|| "unknown".to_owned(), Self::human_bytes)
+    }
+
+    fn used_percent(used: Option<u64>, total: Option<u64>) -> Option<u8> {
+        let total = total.filter(|n| *n > 0)?;
+        Some((u128::from(used?) * 100 / u128::from(total)).min(100) as u8)
+    }
+
+    fn has_memory(&self) -> bool {
+        self.mem_total_bytes.is_some()
+            || self.mem_used_bytes.is_some()
+            || self.mem_wired_bytes.is_some()
+            || self.mem_compressed_bytes.is_some()
+            || self.swap_used_bytes.is_some()
+            || self.mem_pressure.is_some()
     }
 
     /// Format a single-line comprehensive system monitor summary for a computer row.
     #[must_use]
     pub fn format_summary_line(&self) -> String {
         let mut parts = Vec::new();
-        if self.cpu_cores > 0 || self.cpu_busy_pct.is_some() || self.load_avg_100.is_some() {
+        if self.cpu_cores.is_some() || self.cpu_busy_pct.is_some() || self.load_avg_100.is_some() {
             parts.push(format!("CPU {}", self.format_cpu()));
         }
         let gpu = self.format_gpu();
         if gpu != "-" {
             parts.push(format!("GPU {gpu}"));
         }
-        if self.mem_total_bytes > 0 {
+        if self.has_memory() {
             parts.push(format!("RAM {}", self.format_memory()));
         }
-        if self.disk_total_bytes > 0 {
+        if self.disk_total_bytes.is_some()
+            || self.disk_used_bytes.is_some()
+            || self.disk_avail_bytes.is_some()
+        {
             parts.push(format!("Disk {}", self.format_disk()));
         }
         if let Some(up) = self.uptime_secs.filter(|u| *u > 0) {
@@ -363,6 +383,9 @@ pub struct HostedSession {
     /// Milliseconds the AI CLI has been in its current state (`agent_since_ms`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_since_ms: Option<u64>,
+    /// What the program says about itself (OSC 7501, `program_state=<state>[:<kind>]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_state: Option<String>,
     /// Milliseconds since a person last typed in this tab (`human_ms`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub human_ms: Option<u64>,
@@ -419,4 +442,102 @@ pub enum Line {
         /// Why, one line.
         why: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vitals_accept_legacy_numbers_and_omit_unread_values_on_the_wire() {
+        let old = r#"{"cpu_cores":18,"mem_total_bytes":17179869184,"mem_used_bytes":0,"disk_total_bytes":1024000,"disk_used_bytes":614400,"disk_avail_bytes":204800}"#;
+        let v: HostVitals = aterm_json::from_str(old).unwrap();
+        assert_eq!(v.cpu_cores, Some(18));
+        assert_eq!(v.mem_total_bytes, Some(16 << 30));
+        assert_eq!(v.mem_used_bytes, Some(0));
+        assert_eq!(v.disk_total_bytes, Some(1_024_000));
+        assert_eq!(v.disk_used_bytes, Some(614_400));
+        assert_eq!(v.disk_avail_bytes, Some(204_800));
+        assert_eq!(v.gpu_cores, None);
+        let json = aterm_json::to_value(&v).unwrap();
+        assert_eq!(json.get("mem_used_bytes").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(
+            json.get("disk_used_bytes").and_then(|v| v.as_u64()),
+            Some(614_400)
+        );
+        assert!(json.get("gpu_cores").is_none());
+        assert_eq!(
+            aterm_json::from_str::<HostVitals>("{}").unwrap(),
+            HostVitals::default()
+        );
+        assert_eq!(
+            aterm_json::from_str::<HostVitals>(r#"{"mem_used_bytes":null}"#)
+                .unwrap()
+                .mem_used_bytes,
+            None
+        );
+        let absent = aterm_json::to_value(HostVitals::default()).unwrap();
+        for field in [
+            "cpu_cores",
+            "mem_total_bytes",
+            "mem_used_bytes",
+            "disk_total_bytes",
+            "disk_used_bytes",
+            "disk_avail_bytes",
+        ] {
+            assert!(absent.get(field).is_none(), "{field}: {absent}");
+        }
+    }
+
+    #[test]
+    fn vitals_format_partial_and_zero_readings_without_inventing_capacity() {
+        let sparse = HostVitals {
+            cpu_cores: Some(18),
+            load_avg_100: Some([250, 300, 400]),
+            mem_total_bytes: Some(16 << 30),
+            disk_total_bytes: Some(1 << 40),
+            gpu_cores: Some(40),
+            ..Default::default()
+        };
+        assert!(!sparse.format_cpu().contains('%'));
+        assert!(sparse.format_cpu().contains("18c"));
+        assert!(sparse.format_cpu().contains("load 2.50/3.00/4.00"));
+        assert!(
+            sparse
+                .format_memory()
+                .contains("unknown used/16.0 GiB total")
+        );
+        assert!(!sparse.format_memory().contains('%'));
+        assert!(sparse.format_disk().contains("unknown used/1.00 TiB total"));
+        assert!(sparse.format_disk().contains("unknown available"));
+        assert!(!sparse.format_disk().contains('%'));
+        assert_eq!(sparse.format_gpu(), "40 cores");
+        let zero = HostVitals {
+            cpu_busy_pct: Some(0),
+            gpu_busy_pct: Some(0),
+            mem_used_bytes: Some(0),
+            disk_used_bytes: Some(0),
+            disk_avail_bytes: Some(0),
+            ..sparse
+        };
+        assert!(zero.format_cpu().contains("0%"));
+        assert!(zero.format_gpu().contains("0%"));
+        assert!(
+            zero.format_memory()
+                .contains("0 MiB used/16.0 GiB total (0%")
+        );
+        assert!(zero.format_disk().contains("0 MiB used/1.00 TiB total (0%"));
+        assert!(zero.format_disk().contains("0 MiB available"));
+        let usage_only = HostVitals {
+            mem_used_bytes: Some(1 << 30),
+            disk_used_bytes: Some(2 << 30),
+            disk_avail_bytes: Some(3 << 30),
+            ..Default::default()
+        };
+        let line = usage_only.format_summary_line();
+        assert!(line.contains("1.0 GiB used/unknown total"), "{line}");
+        assert!(line.contains("2.0 GiB used/unknown total"), "{line}");
+        assert!(line.contains("3.0 GiB available"), "{line}");
+        assert!(!line.contains('%'), "{line}");
+    }
 }

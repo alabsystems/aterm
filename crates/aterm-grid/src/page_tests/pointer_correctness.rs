@@ -25,7 +25,7 @@ fn alloc_slice_alignment_u128() {
 }
 
 #[test]
-fn alloc_zero_length_slice_is_stable_and_non_consuming() {
+fn alloc_zero_length_slice_aligns_offset_and_consumes_zero_bytes() {
     let mut store = PageStore::new();
 
     let mut empty = store.alloc_slice::<u32>(0);
@@ -35,6 +35,7 @@ fn alloc_zero_length_slice_is_stable_and_non_consuming() {
     let empty_ptr = empty.as_slice().as_ptr();
     let empty_mut_ptr = empty.as_mut_slice().as_mut_ptr();
     assert_eq!(empty_ptr, empty_mut_ptr);
+    assert_eq!(empty_ptr.align_offset(std::mem::align_of::<u32>()), 0);
     let empty_offset = empty.offset().byte_offset();
     let empty_page_id = empty.page_id();
 
@@ -43,12 +44,31 @@ fn alloc_zero_length_slice_is_stable_and_non_consuming() {
     assert_eq!(
         filled.offset().byte_offset(),
         empty_offset,
-        "len=0 allocation must not advance page offset"
+        "len=0 allocation at an already-aligned offset consumes zero bytes"
     );
     for (i, value) in filled.iter_mut().enumerate() {
         *value = i as u32 + 1;
     }
     assert_eq!(filled.as_slice(), &[1, 2, 3, 4]);
+
+    let _misalign = store.alloc_slice::<u8>(1);
+    let empty_u64 = store.alloc_slice::<u64>(0);
+    assert_eq!(empty_u64.len(), 0);
+    assert_eq!(
+        empty_u64
+            .as_slice()
+            .as_ptr()
+            .align_offset(std::mem::align_of::<u64>()),
+        0,
+        "len=0 allocation aligns the cursor to align_of::<u64>()"
+    );
+    assert_eq!(empty_u64.offset().byte_offset(), 24);
+    let next_u64 = store.alloc_slice::<u64>(2);
+    assert_eq!(
+        next_u64.offset().byte_offset(),
+        empty_u64.offset().byte_offset(),
+        "after aligning to u64, len=0 consumes zero payload bytes"
+    );
 }
 
 #[test]

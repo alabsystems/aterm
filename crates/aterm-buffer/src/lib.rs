@@ -170,15 +170,12 @@ impl EventLog {
     pub fn append_at(&mut self, op: Op, ts: Ticks) -> (Seq, Option<Event>) {
         self.total = self.total.saturating_add(1);
         let seq = Seq(self.total);
-        if self.ring.len() == MAX_LOG_EVENTS && self.ring.capacity() == MAX_LOG_EVENTS {
-            self.ring.reserve_exact(1);
-        }
-        self.ring.push_back(Event { seq, op, ts });
-        let evicted = if self.ring.len() > MAX_LOG_EVENTS {
+        let evicted = if self.ring.len() >= MAX_LOG_EVENTS {
             self.ring.pop_front()
         } else {
             None
         };
+        self.ring.push_back(Event { seq, op, ts });
         (seq, evicted)
     }
 
@@ -437,153 +434,6 @@ impl Snapshot {
     }
 }
 
-/// Wire size in bytes of an encoded spine event (`"SPNE"`).
-pub const SPINE_EVENT_WIRE_BYTES: usize = 24;
-
-/// Wire size in bytes of an encoded spine cursor state (`"SPNC"`).
-pub const SPINE_CURSOR_WIRE_BYTES: usize = 20;
-
-/// Encode a 24-byte spine [`Event`] wire frame (`"SPNE"`).
-#[inline]
-#[must_use]
-pub const fn encode_spine_event_wire(event: &Event) -> [u8; SPINE_EVENT_WIRE_BYTES] {
-    let (op_tag, payload) = match event.op {
-        Op::Append(id) => (1u8, id.0),
-        Op::Write(id) => (2u8, id.0),
-        Op::Clear(id) => (3u8, id.0),
-        Op::RawIn(id) => (4u8, id.0),
-        Op::Reply(id) => (5u8, id.0),
-        Op::Resize { rows, cols } => (6u8, ((rows as u64) << 16) | (cols as u64)),
-        Op::Keyframe(id) => (7u8, id.0),
-        Op::Witness(id) => (8u8, id.0),
-        Op::CellPx { width, height } => (9u8, ((width as u64) << 16) | (height as u64)),
-        Op::Host(id) => (10u8, id.0),
-    };
-    let [s0, s1, s2, s3, s4, s5, s6, s7] = event.seq.0.to_le_bytes();
-    let pb = payload.to_le_bytes();
-    let tb = (event.ts.0 as u32).to_le_bytes();
-    [
-        b'S', b'P', b'N', op_tag, s0, s1, s2, s3, s4, s5, s6, s7, pb[0], pb[1], pb[2], pb[3],
-        pb[4], pb[5], pb[6], pb[7], tb[0], tb[1], tb[2], tb[3],
-    ]
-}
-
-/// Decode a 24-byte spine [`Event`] wire frame produced by [`encode_spine_event_wire`].
-#[inline]
-#[must_use]
-pub const fn decode_spine_event_wire(bytes: &[u8]) -> Option<Event> {
-    if bytes.len() < SPINE_EVENT_WIRE_BYTES {
-        return None;
-    }
-    if bytes[0] != b'S' || bytes[1] != b'P' || bytes[2] != b'N' {
-        return None;
-    }
-    let seq = Seq(u64::from_le_bytes([
-        bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
-    ]));
-    let payload = u64::from_le_bytes([
-        bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19],
-    ]);
-    let ts = Ticks(u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]) as u64);
-    let op = match bytes[3] {
-        1 => Op::Append(LineId(payload)),
-        2 => Op::Write(LineId(payload)),
-        3 => Op::Clear(LineId(payload)),
-        4 => Op::RawIn(BlobId(payload)),
-        5 => Op::Reply(BlobId(payload)),
-        6 => {
-            if payload > 0xFFFF_FFFF {
-                return None;
-            }
-            Op::Resize {
-                rows: (payload >> 16) as u16,
-                cols: (payload & 0xFFFF) as u16,
-            }
-        }
-        7 => Op::Keyframe(KeyframeId(payload)),
-        8 => Op::Witness(WitnessId(payload)),
-        9 => {
-            if payload > 0xFFFF_FFFF {
-                return None;
-            }
-            Op::CellPx {
-                width: (payload >> 16) as u16,
-                height: (payload & 0xFFFF) as u16,
-            }
-        }
-        10 => Op::Host(HostOpId(payload)),
-        _ => return None,
-    };
-    Some(Event { seq, op, ts })
-}
-
-/// Encode a 20-byte spine cursor & origin wire frame (`"SPNC"`).
-#[inline]
-#[must_use]
-pub const fn encode_spine_cursor_wire(
-    origin: OriginTag,
-    cursor: Cursor,
-    head: Seq,
-) -> [u8; SPINE_CURSOR_WIRE_BYTES] {
-    let origin_byte = match origin {
-        OriginTag::Source => 1u8,
-        OriginTag::Overlay => 2u8,
-        OriginTag::System => 3u8,
-    };
-    let cb = cursor.at.0.to_le_bytes();
-    let hb = head.0.to_le_bytes();
-    [
-        b'S',
-        b'P',
-        b'C',
-        origin_byte,
-        cb[0],
-        cb[1],
-        cb[2],
-        cb[3],
-        cb[4],
-        cb[5],
-        cb[6],
-        cb[7],
-        hb[0],
-        hb[1],
-        hb[2],
-        hb[3],
-        hb[4],
-        hb[5],
-        hb[6],
-        hb[7],
-    ]
-}
-
-/// Decode a 20-byte spine cursor & origin wire frame produced by [`encode_spine_cursor_wire`].
-#[inline]
-#[must_use]
-pub const fn decode_spine_cursor_wire(bytes: &[u8]) -> Option<(OriginTag, Cursor, Seq)> {
-    if bytes.len() < SPINE_CURSOR_WIRE_BYTES {
-        return None;
-    }
-    if bytes[0] != b'S' || bytes[1] != b'P' || bytes[2] != b'C' {
-        return None;
-    }
-    let origin = match bytes[3] {
-        1 => OriginTag::Source,
-        2 => OriginTag::Overlay,
-        3 => OriginTag::System,
-        _ => return None,
-    };
-    let at = Seq(u64::from_le_bytes([
-        bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
-    ]));
-    let head = Seq(u64::from_le_bytes([
-        bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19],
-    ]));
-    if at.0 > head.0 {
-        return None;
-    }
-    Some((origin, Cursor { at }, head))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -692,56 +542,60 @@ mod tests {
     }
 
     /// Line lookup is an ordered lower bound, not a prefix scan: reading or
-    /// rewriting the tail of a long surface costs O(log lines) id comparisons.
+    /// rewriting the tail of a long surface costs at most `ceil(log2(lines + 1))`
+    /// id comparisons per lookup.
     #[test]
     fn narrow_tail_line_operations_do_logarithmic_work() {
-        const LINES: usize = 4096;
-        let mut s = Surface::new();
-        for i in 0..LINES {
-            let text = if i + 1 == LINES {
-                "tail needle"
-            } else {
-                "prefix"
+        for lines in [1usize, 2, 3, 7, 8, 15, 16, 1023, 1024, 4096] {
+            let max_per_lookup = (lines + 1).next_power_of_two().ilog2() as usize;
+            let mut s = Surface::new();
+            for i in 0..lines {
+                let text = if i + 1 == lines {
+                    "tail needle"
+                } else {
+                    "prefix"
+                };
+                s.apply(&write_cap(), Edit::AppendLine(text.into()));
+            }
+            let tail = Range {
+                start: LineId((lines - 1) as u64),
+                end: LineId(lines as u64),
             };
-            s.apply(&write_cap(), Edit::AppendLine(text.into()));
+
+            let _ = take_line_id_comparisons();
+            assert_eq!(s.read_text(&read_cap(), tail).text, "tail needle\n");
+            let read_comparisons = take_line_id_comparisons();
+            assert!(read_comparisons > 0, "read must reach the lower bound");
+            assert!(
+                read_comparisons <= 2 * max_per_lookup,
+                "tail read made {read_comparisons} id comparisons for {lines} lines (bound {})",
+                2 * max_per_lookup
+            );
+
+            s.apply(
+                &write_cap(),
+                Edit::SetLine(LineId((lines - 1) as u64), "updated".into()),
+            );
+            let lookup_comparisons = take_line_id_comparisons();
+            assert!(lookup_comparisons > 0, "SetLine must reach ordered lookup");
+            assert!(
+                lookup_comparisons <= max_per_lookup,
+                "tail SetLine made {lookup_comparisons} id comparisons for {lines} lines (bound {max_per_lookup})"
+            );
+
+            assert!(
+                s.read_text(
+                    &read_cap(),
+                    Range {
+                        start: LineId(12),
+                        end: LineId(3),
+                    },
+                )
+                .text
+                .is_empty(),
+                "an inverted range stays empty"
+            );
         }
-        let tail = Range {
-            start: LineId((LINES - 1) as u64),
-            end: LineId(LINES as u64),
-        };
-
-        let _ = take_line_id_comparisons();
-        assert_eq!(s.read_text(&read_cap(), tail).text, "tail needle\n");
-        let read_comparisons = take_line_id_comparisons();
-        assert!(read_comparisons > 0, "read must reach the lower bound");
-        assert!(
-            read_comparisons <= 2 * usize::BITS as usize,
-            "tail read made {read_comparisons} id comparisons for {LINES} lines"
-        );
-
-        s.apply(
-            &write_cap(),
-            Edit::SetLine(LineId((LINES - 1) as u64), "updated".into()),
-        );
-        let lookup_comparisons = take_line_id_comparisons();
-        assert!(lookup_comparisons > 0, "SetLine must reach ordered lookup");
-        assert!(
-            lookup_comparisons <= usize::BITS as usize,
-            "tail SetLine made {lookup_comparisons} id comparisons for {LINES} lines"
-        );
-
-        assert!(
-            s.read_text(
-                &read_cap(),
-                Range {
-                    start: LineId(12),
-                    end: LineId(3),
-                },
-            )
-            .text
-            .is_empty(),
-            "an inverted range stays empty"
-        );
     }
 
     #[test]
@@ -773,16 +627,16 @@ mod tests {
         }
         assert_eq!(log.ring.len(), MAX_LOG_EVENTS, "ring stays bounded");
         assert!(
-            log.ring.capacity() <= MAX_LOG_EVENTS + 1,
-            "no doubling: settled cap {} must be <= {}",
+            log.ring.capacity() <= MAX_LOG_EVENTS,
+            "no doubling past MAX_LOG_EVENTS: settled cap {} must be <= {}",
             log.ring.capacity(),
-            MAX_LOG_EVENTS + 1
+            MAX_LOG_EVENTS
         );
         assert!(
-            max_cap_seen <= MAX_LOG_EVENTS + 1,
+            max_cap_seen <= MAX_LOG_EVENTS,
             "never doubled at any point: peak cap {} must be <= {}",
             max_cap_seen,
-            MAX_LOG_EVENTS + 1
+            MAX_LOG_EVENTS
         );
     }
 
@@ -889,40 +743,8 @@ mod tests {
     }
 
     #[test]
-    fn spine_event_and_cursor_wire_roundtrip() {
+    fn op_and_event_keep_their_slot_sizes() {
         assert_eq!(std::mem::size_of::<Op>(), 16);
         assert_eq!(std::mem::size_of::<Event>(), 32);
-        for op in [
-            Op::Append(LineId(1)),
-            Op::Write(LineId(2)),
-            Op::Clear(LineId(3)),
-            Op::RawIn(BlobId(4)),
-            Op::Reply(BlobId(5)),
-            Op::Resize { rows: 24, cols: 80 },
-            Op::CellPx {
-                width: 10,
-                height: 20,
-            },
-            Op::Keyframe(KeyframeId(7)),
-            Op::Witness(WitnessId(8)),
-            Op::Host(HostOpId(9)),
-        ] {
-            let ev = Event {
-                seq: Seq(42),
-                op,
-                ts: Ticks(99),
-            };
-            let w = encode_spine_event_wire(&ev);
-            assert_eq!(decode_spine_event_wire(&w), Some(ev));
-        }
-
-        let cw = encode_spine_cursor_wire(OriginTag::Source, Cursor { at: Seq(5) }, Seq(10));
-        let (origin, cur, head) = decode_spine_cursor_wire(&cw).expect("decode cursor");
-        assert_eq!(origin, OriginTag::Source);
-        assert_eq!(cur.at, Seq(5));
-        assert_eq!(head, Seq(10));
-        let invalid_cw =
-            encode_spine_cursor_wire(OriginTag::Overlay, Cursor { at: Seq(20) }, Seq(10));
-        assert!(decode_spine_cursor_wire(&invalid_cw).is_none());
     }
 }

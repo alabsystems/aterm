@@ -103,10 +103,7 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
     let document = store.open(uri.to_string(), "base".to_string());
     let disk = store.snapshot(document).unwrap();
     let decision = journals.inspect_open(uri, disk.text.as_bytes()).unwrap();
-    crate::native_document_journal::settle_busy(|| {
-        journals.initialize(decision.clone(), &disk, &disk)
-    })
-    .unwrap();
+    journals.initialize(decision, &disk, &disk).unwrap();
     let mut protocol = Protocol {
         origin: disk.seq,
         inflight: 0,

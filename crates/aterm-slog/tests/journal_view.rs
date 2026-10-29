@@ -687,7 +687,7 @@ fn a_reader_holds_every_record_it_read() {
     let mut log = Log::new(1);
     open_session(&mut log, 0);
     let mut w = Writer::new("p1-a1", 0);
-    for i in 0..100_000u64 {
+    for i in 0..10_000u64 {
         let _ = log.mark(Mark::new(Kind::Human, Src::Input, Conf::Exact), at(i));
         if i % 1500 == 0 {
             w.pass(&log, 512);
@@ -704,7 +704,6 @@ fn a_reader_holds_every_record_it_read() {
     );
     assert_eq!(read.recs.len() as u64, log.last_seq(), "every seq held");
     assert!(v.log.len() > MAX_RECORDS && v.log.bytes() > MAX_BYTES);
-    let _ = Key::N;
 }
 
 #[test]

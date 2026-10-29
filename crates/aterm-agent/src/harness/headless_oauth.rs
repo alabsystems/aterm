@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use aterm_json::{Value, json};
 
 use super::open_url::{
-    DEFAULT_MAILBOX_DIR, EMAIL_FILE_MAX, MAILBOX_ENV, MailboxFlow, decode_html_amp,
+    DEFAULT_MAILBOX_DIR, EMAIL_FILE_MAX, MAILBOX_ENV, MailboxFlow, MetWord, decode_html_amp,
     decode_mime_base64_parts, decode_quoted_printable, email_matches_target, extract_login_hint,
     percent_decode, percent_encode,
 };
@@ -148,9 +148,233 @@ pub struct MailboxConfig {
     /// to different emails: their `<label>` secrets are Claude Code's own rows' alone, and
     /// [`MailboxConfig::alias_label_to_email`] maps them onto no other pool's email.
     pub contested_labels: BTreeSet<String>,
+    /// True when `ai-signin.toml` advertises that stewards answer `FleetOp::MailCode` for
+    /// catch-all sign-ins (`DESIGN-alab-swarm` §6.2, C17c).
+    pub relay_enabled: bool,
+    /// Home directory used to read this Mac's local age identity and swarm roster when relaying.
+    pub relay_home: Option<PathBuf>,
+    /// State directory holding this Mac's fleet credentials and peer book when relaying.
+    pub relay_state_dir: Option<PathBuf>,
+    /// The `[[mailboxes]]` entries ([`super::mailbox_routes`]): the mailbox each AI email's
+    /// codes arrive in, ahead of the top-level fields above.
+    pub mailboxes: Vec<super::mailbox_routes::MailboxRoute>,
+    /// Where refused mailbox sign-ins are recorded
+    /// ([`super::mailbox_routes::LOGIN_RECORD_FILE`] in the accounts store), so no row or
+    /// process tries a refused login again before its wait ends; `None` keeps that wait to one
+    /// authorization.
+    pub login_record: Option<PathBuf>,
+    /// True on the view [`MailboxConfig::routed_for`] makes of a `[[mailboxes]]` entry: its
+    /// URLs are final, so none is discovered from the target's domain.
+    pub routed: bool,
+    /// On such a view of an entry that is not ready, why it is never tried.
+    pub unready: Option<&'static str>,
 }
 
 impl MailboxConfig {
+    /// The `[[mailboxes]]` entry `target_email`'s codes arrive in
+    /// ([`super::mailbox_routes::resolve`]), completed with what this configuration already
+    /// keeps for its login ([`MailboxConfig::completed_route`]); `None` where the top-level
+    /// mailbox applies.
+    #[must_use]
+    pub fn route_for(
+        &self,
+        target_email: Option<&str>,
+    ) -> Option<super::mailbox_routes::MailboxRoute> {
+        super::mailbox_routes::resolve(&self.mailboxes, target_email)
+            .map(|route| self.completed_route(route, target_email))
+    }
+
+    /// Whether `login` is this configuration's top-level `user` (trimmed, any case).
+    #[must_use]
+    pub fn is_top_level_login(&self, login: &str) -> bool {
+        let login = login.trim();
+        !login.is_empty()
+            && self
+                .user
+                .as_deref()
+                .is_some_and(|user| user.trim().eq_ignore_ascii_case(login))
+    }
+
+    /// Whether `route` reads the top-level mailbox's URLs (and its bearer token): its login is
+    /// the top-level `user` and it names no URL itself.
+    fn takes_top_level_urls(&self, route: &super::mailbox_routes::MailboxRoute) -> bool {
+        self.is_top_level_login(&route.login) && !route.names_a_url()
+    }
+
+    /// `route` with what it leaves out (a missing or empty password, second password or TOTP
+    /// secret) taken from what this configuration already keeps for its login, so an entry
+    /// never cuts an address off from a password that works: where its login is the top-level
+    /// `user`, the top level's, and, where it names no URL, the top level's URLs too (it is
+    /// that mailbox); else the per-email ones kept for its login (for an entry that is one
+    /// address's own mailbox, [`super::mailbox_routes::MailboxRoute::own`], under any key the
+    /// address is looked up by, the row's label aliased to it included,
+    /// [`MailboxConfig::alias_label_to_email`]). Never the `"*"` default, nor another login's.
+    #[must_use]
+    pub fn completed_route(
+        &self,
+        route: &super::mailbox_routes::MailboxRoute,
+        target_email: Option<&str>,
+    ) -> super::mailbox_routes::MailboxRoute {
+        let mut out = route.clone();
+        let blank = |v: &Option<String>| v.as_deref().is_none_or(str::is_empty);
+        if self.is_top_level_login(&route.login) {
+            if blank(&out.password) {
+                out.password.clone_from(&self.password);
+            }
+            if blank(&out.mailbox_password) {
+                out.mailbox_password.clone_from(&self.mailbox_password);
+            }
+            if blank(&out.totp_secret) {
+                out.totp_secret.clone_from(&self.totp_secret);
+            }
+            if self.takes_top_level_urls(route) {
+                out.webmail_url.clone_from(&self.webmail_url);
+                out.imap_url.clone_from(&self.imap_url);
+                out.http_url.clone_from(&self.http_url);
+            }
+            return out;
+        }
+        let login = route.login.trim().to_ascii_lowercase();
+        if login.is_empty() {
+            return out;
+        }
+        let keys: Vec<String> = if route.own() {
+            let address = target_email
+                .map(|t| t.trim().to_ascii_lowercase())
+                .filter(|t| !t.is_empty())
+                .or_else(|| route.receives.first().cloned())
+                .unwrap_or_else(|| login.clone());
+            let mut keys = candidate_lookup_keys(Some(&address));
+            for key in candidate_lookup_keys(Some(&login)) {
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+            keys
+        } else {
+            let base = login.split_once('@').map(|(local, domain)| {
+                format!("{}@{domain}", local.split('+').next().unwrap_or(local))
+            });
+            std::iter::once(login.clone()).chain(base).collect()
+        };
+        let lookup = |values: &BTreeMap<String, String>| {
+            keys.iter()
+                .filter(|key| {
+                    key.contains('@') || !self.contested_labels.contains(&contest_key(key))
+                })
+                .find_map(|key| values.get(key))
+                .filter(|v| !v.is_empty())
+                .cloned()
+        };
+        if blank(&out.password) {
+            out.password = lookup(&self.passwords).or(out.password);
+        }
+        if blank(&out.mailbox_password) {
+            out.mailbox_password = lookup(&self.mailbox_passwords).or(out.mailbox_password);
+        }
+        if blank(&out.totp_secret) {
+            out.totp_secret = lookup(&self.totp_secrets).or(out.totp_secret);
+        }
+        out
+    }
+
+    /// Every `[[mailboxes]]` entry, completed ([`MailboxConfig::completed_route`]) with no target
+    /// address.
+    #[must_use]
+    pub fn completed_mailboxes(&self) -> Vec<super::mailbox_routes::MailboxRoute> {
+        self.mailboxes
+            .iter()
+            .map(|route| self.completed_route(route, None))
+            .collect()
+    }
+
+    /// This configuration as `target_email`'s sign-in reads it: unchanged where no
+    /// `[[mailboxes]]` entry receives the address, else that entry's login, URLs (or those its
+    /// login's domain implies), password, second password and TOTP secret, completed
+    /// ([`MailboxConfig::completed_route`]), as the top-level fields, with every per-email
+    /// credential dropped, and the bearer token too unless the entry is the top-level mailbox
+    /// and reads its URLs. An entry with no password keeps every network source off
+    /// ([`MailboxConfig::unready_words`]). The local folder, the relay, the seen file and the
+    /// filters are kept.
+    #[must_use]
+    pub fn routed_for(&self, target_email: Option<&str>) -> std::borrow::Cow<'_, MailboxConfig> {
+        let Some(raw) = super::mailbox_routes::resolve(&self.mailboxes, target_email) else {
+            return std::borrow::Cow::Borrowed(self);
+        };
+        let route = self.completed_route(raw, target_email);
+        let ready = route.ready();
+        std::borrow::Cow::Owned(MailboxConfig {
+            dir: self.dir.clone(),
+            http_url: self.http_url_for(target_email),
+            bearer_token: self
+                .bearer_token
+                .clone()
+                .filter(|_| ready && self.takes_top_level_urls(raw)),
+            imap_url: self.effective_imap_url(target_email),
+            webmail_url: self.effective_webmail_url(target_email),
+            user: self.webmail_user_for(target_email),
+            password: self.password_for(target_email),
+            mailbox_password: self.mailbox_password_for(target_email),
+            totp_secret: self.totp_secret_for(target_email),
+            passwords: BTreeMap::new(),
+            mailbox_passwords: BTreeMap::new(),
+            totp_secrets: BTreeMap::new(),
+            seen_file: self.seen_file.clone(),
+            senders: self.senders.clone(),
+            since: self.since,
+            contested_labels: self.contested_labels.clone(),
+            relay_enabled: self.relay_enabled,
+            relay_home: self.relay_home.clone(),
+            relay_state_dir: self.relay_state_dir.clone(),
+            mailboxes: Vec::new(),
+            login_record: self.login_record.clone(),
+            routed: true,
+            unready: (!ready)
+                .then(|| route.unready_words())
+                .flatten()
+                .map(super::mailbox_routes::static_words),
+        })
+    }
+
+    /// Why `target_email`'s mailbox is never tried: its `[[mailboxes]]` entry has no password
+    /// (or no login) yet, as `mailbox ab…@… has no password yet`.
+    #[must_use]
+    pub fn unready_words(&self, target_email: Option<&str>) -> Option<&'static str> {
+        if self.routed {
+            return self.unready;
+        }
+        self.route_for(target_email)
+            .and_then(|route| route.unready_words())
+            .map(super::mailbox_routes::static_words)
+    }
+
+    /// The HTTP mailbox API URL `target_email`'s sign-in reads, if any.
+    #[must_use]
+    pub fn http_url_for(&self, target_email: Option<&str>) -> Option<String> {
+        match self.route_for(target_email) {
+            Some(route) => {
+                let ready = route.ready();
+                route.http_url.filter(|_| ready)
+            }
+            None => self.http_url.clone(),
+        }
+    }
+
+    /// The login of the mailbox `target_email`'s codes are read from over IMAP, HTTP or
+    /// webmail, masked (`ab…@…`): `None` where no such source serves it (a local folder or the
+    /// relay alone, or none).
+    #[must_use]
+    pub fn masked_login_for(&self, target_email: Option<&str>) -> Option<String> {
+        let view = self.routed_for(target_email);
+        let networked = view.http_url.is_some()
+            || view.effective_imap_url(target_email).is_some()
+            || view.effective_webmail_url(target_email).is_some();
+        networked
+            .then(|| view.webmail_user_for(target_email))
+            .flatten()
+            .map(|login| super::mailbox_routes::mask_login(&login))
+    }
+
     /// Create a [`MailboxConfig`] backed by a local Maildir, spool directory, or `.mbox` file.
     #[must_use]
     pub fn from_dir(dir: impl Into<PathBuf>) -> Self {
@@ -173,11 +397,23 @@ impl MailboxConfig {
             || self.webmail_url.is_some()
             || self.password.is_some()
             || !self.passwords.is_empty()
+            || self.relay_enabled
+            || !self.mailboxes.is_empty()
     }
 
-    /// True when a mailbox source is configured that can serve `target_email`.
+    /// True when a mailbox source is configured that can serve `target_email`: for an address a
+    /// `[[mailboxes]]` entry receives, that entry with its password (or the local folder or the
+    /// relay), never the top-level mailbox.
     #[must_use]
     pub fn is_configured_for(&self, target_email: Option<&str>) -> bool {
+        if let Some(route) = self.route_for(target_email) {
+            return self.dir.is_some()
+                || (self.relay_enabled && target_email.is_some())
+                || (route.ready()
+                    && (route.http_url.is_some()
+                        || self.effective_imap_url(target_email).is_some()
+                        || self.effective_webmail_url(target_email).is_some()));
+        }
         let has_pw_or_unscoped = target_email.is_none()
             || self.passwords.is_empty()
             || self.password_for(target_email).is_some();
@@ -192,18 +428,27 @@ impl MailboxConfig {
             || (self.webmail_url.is_some() && has_pw_or_unscoped)
             || self.password_for(target_email).is_some()
             || (target_email.is_none() && !self.passwords.is_empty())
+            || (self.relay_enabled && target_email.is_some())
     }
 
     /// Look up the password for `target_email` (checking email, local-part, and derived account
     /// label before falling back to `password` or `"*"`).
     #[must_use]
     pub fn password_for(&self, target_email: Option<&str>) -> Option<String> {
+        if let Some(route) = self.route_for(target_email) {
+            let ready = route.ready();
+            return route.password.filter(|_| ready);
+        }
         self.credential_for(&self.passwords, self.password.as_ref(), target_email)
     }
 
     /// Look up the second-stage mailbox password for `target_email`.
     #[must_use]
     pub fn mailbox_password_for(&self, target_email: Option<&str>) -> Option<String> {
+        if let Some(route) = self.route_for(target_email) {
+            let ready = route.ready();
+            return route.mailbox_password.filter(|_| ready);
+        }
         self.credential_for(
             &self.mailbox_passwords,
             self.mailbox_password.as_ref(),
@@ -214,6 +459,10 @@ impl MailboxConfig {
     /// Look up the Base32 TOTP secret for `target_email`.
     #[must_use]
     pub fn totp_secret_for(&self, target_email: Option<&str>) -> Option<String> {
+        if let Some(route) = self.route_for(target_email) {
+            let ready = route.ready();
+            return route.totp_secret.filter(|_| ready);
+        }
         self.credential_for(&self.totp_secrets, self.totp_secret.as_ref(), target_email)
     }
 
@@ -246,6 +495,10 @@ impl MailboxConfig {
     /// otherwise stripping any RFC 5233 `+tag` subaddress from `target_email`).
     #[must_use]
     pub fn webmail_user_for(&self, target_email: Option<&str>) -> Option<String> {
+        if let Some(route) = self.route_for(target_email) {
+            let login = route.login.trim();
+            return (!login.is_empty()).then(|| login.to_owned());
+        }
         if let Some(u) = self
             .user
             .as_deref()
@@ -305,8 +558,22 @@ impl MailboxConfig {
 
     /// Effective IMAP/IMAPS URL for `target_email`, auto-discovering standard IMAPS endpoints
     /// or a running local ProtonMail Bridge (`127.0.0.1:1143`) when a password is configured.
+    /// For an address a `[[mailboxes]]` entry receives: that entry's own URL, else the one its
+    /// login's domain implies where it names no URL, and none while it has no password.
     #[must_use]
     pub fn effective_imap_url(&self, target_email: Option<&str>) -> Option<String> {
+        if let Some(route) = self.route_for(target_email) {
+            if !route.ready() || (route.names_a_url() && route.imap_url.is_none()) {
+                return None;
+            }
+            let domain = route.login_domain();
+            return route
+                .imap_url
+                .or_else(|| domain.and_then(|d| discovered_imap_url(&d)));
+        }
+        if self.routed {
+            return self.imap_url.clone();
+        }
         let has_pw = self.password_for(target_email).is_some();
         if let Some(url) = &self.imap_url {
             let has_embedded_pw = parse_imap_url(url).is_some_and(|p| p.password.is_some());
@@ -319,63 +586,28 @@ impl MailboxConfig {
             && let Some(email) = target_email
             && let Some((_, domain)) = email.trim().rsplit_once('@')
         {
-            let dom = domain.to_ascii_lowercase();
-            match dom.as_str() {
-                "gmail.com" | "googlemail.com" => {
-                    return Some("imaps://imap.gmail.com:993/INBOX".to_owned());
-                }
-                "fastmail.com" | "fastmail.fm" | "messagingengine.com" => {
-                    return Some("imaps://imap.fastmail.com:993/INBOX".to_owned());
-                }
-                "icloud.com" | "me.com" | "mac.com" => {
-                    return Some("imaps://imap.mail.me.com:993/INBOX".to_owned());
-                }
-                "yahoo.com" | "ymail.com" => {
-                    return Some("imaps://imap.mail.yahoo.com:993/INBOX".to_owned());
-                }
-                "zoho.com" | "zohomail.com" => {
-                    return Some("imaps://imap.zoho.com:993/INBOX".to_owned());
-                }
-                "gmx.com" | "gmx.net" => {
-                    return Some("imaps://imap.gmx.com:993/INBOX".to_owned());
-                }
-                "mail.com" => {
-                    return Some("imaps://imap.mail.com:993/INBOX".to_owned());
-                }
-                "outlook.com" | "hotmail.com" | "live.com" | "msn.com" => {
-                    return Some("imaps://outlook.office365.com:993/INBOX".to_owned());
-                }
-                "purelymail.com" => {
-                    return Some("imaps://imap.purelymail.com:993/INBOX".to_owned());
-                }
-                "migadu.com" => {
-                    return Some("imaps://imap.migadu.com:993/INBOX".to_owned());
-                }
-                "mailbox.org" => {
-                    return Some("imaps://imap.mailbox.org:993/INBOX".to_owned());
-                }
-                "runbox.com" => {
-                    return Some("imaps://mail.runbox.com:993/INBOX".to_owned());
-                }
-                "posteo.de" | "posteo.net" | "posteo.org" => {
-                    return Some("imaps://posteo.de:993/INBOX".to_owned());
-                }
-                "proton.me" | "proton.ch" | "protonmail.com" | "protonmail.ch" | "pm.me" => {
-                    let bridge_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 1143));
-                    if TcpStream::connect_timeout(&bridge_addr, Duration::from_millis(50)).is_ok() {
-                        return Some("imap://127.0.0.1:1143/INBOX".to_owned());
-                    }
-                }
-                _ => {}
-            }
+            return discovered_imap_url(&domain.to_ascii_lowercase());
         }
         None
     }
 
     /// Effective webmail inbox URL for `target_email` when headless CDP webmail polling is
-    /// applicable.
+    /// applicable. For an address a `[[mailboxes]]` entry receives: as
+    /// [`MailboxConfig::effective_imap_url`].
     #[must_use]
     pub fn effective_webmail_url(&self, target_email: Option<&str>) -> Option<String> {
+        if let Some(route) = self.route_for(target_email) {
+            if !route.ready() || (route.names_a_url() && route.webmail_url.is_none()) {
+                return None;
+            }
+            let domain = route.login_domain();
+            return route
+                .webmail_url
+                .or_else(|| domain.and_then(|d| discovered_webmail_url(&d)));
+        }
+        if self.routed {
+            return self.webmail_url.clone();
+        }
         let has_pw = self.password_for(target_email).is_some();
         if let Some(url) = &self.webmail_url {
             if target_email.is_none() || self.passwords.is_empty() || has_pw {
@@ -387,42 +619,9 @@ impl MailboxConfig {
             && let Some(email) = target_email
             && let Some((_, domain)) = email.trim().rsplit_once('@')
         {
-            let dom = domain.to_ascii_lowercase();
-            match dom.as_str() {
-                "proton.me" | "proton.ch" | "protonmail.com" | "protonmail.ch" | "pm.me" => {
-                    return Some("https://mail.proton.me/u/0/inbox".to_owned());
-                }
-                "fastmail.com" | "fastmail.fm" | "messagingengine.com" => {
-                    return Some("https://app.fastmail.com/mail/Inbox".to_owned());
-                }
-                "zoho.com" | "zohomail.com" => {
-                    return Some("https://mail.zoho.com/zm/".to_owned());
-                }
-                "outlook.com" | "hotmail.com" | "live.com" | "msn.com" => {
-                    return Some("https://outlook.live.com/mail/0/inbox".to_owned());
-                }
-                "purelymail.com" => {
-                    return Some("https://purelymail.com/webmail/".to_owned());
-                }
-                "migadu.com" => {
-                    return Some("https://webmail.migadu.com/".to_owned());
-                }
-                "tuta.com" | "tuta.io" | "tutanota.com" | "tutanota.de" | "tutamail.com" => {
-                    return Some("https://app.tuta.com/mail".to_owned());
-                }
-                _ => {}
-            }
+            return discovered_webmail_url(&domain.to_ascii_lowercase());
         }
         None
-    }
-
-    /// True when this configuration uses headless webmail only.
-    #[must_use]
-    pub fn is_webmail_only(&self, target_email: Option<&str>) -> bool {
-        self.dir.is_none()
-            && self.http_url.is_none()
-            && self.effective_imap_url(target_email).is_none()
-            && self.effective_webmail_url(target_email).is_some()
     }
 
     /// Merge missing fields from `other` into `self`.
@@ -466,6 +665,40 @@ impl MailboxConfig {
         }
         if self.since.is_none() {
             self.since = other.since;
+        }
+        if other.relay_enabled {
+            self.relay_enabled = true;
+        }
+        if self.relay_home.is_none() {
+            self.relay_home = other.relay_home;
+        }
+        if self.relay_state_dir.is_none() {
+            self.relay_state_dir = other.relay_state_dir;
+        }
+        // A lower file's entry for a login this one already has keeps this one's credentials and
+        // URLs, but its addresses are not lost: each pattern no entry here names joins the kept
+        // entry (one an entry here names stays where it is).
+        for route in other.mailboxes {
+            let login = route.login.trim();
+            let held = (!login.is_empty())
+                .then(|| {
+                    self.mailboxes
+                        .iter()
+                        .position(|held| held.login.trim().eq_ignore_ascii_case(login))
+                })
+                .flatten();
+            let Some(at) = held else {
+                self.mailboxes.push(route);
+                continue;
+            };
+            for pattern in route.receives {
+                if !self.mailboxes.iter().any(|m| m.receives.contains(&pattern)) {
+                    self.mailboxes[at].receives.push(pattern);
+                }
+            }
+        }
+        if self.login_record.is_none() {
+            self.login_record = other.login_record;
         }
     }
 
@@ -892,6 +1125,7 @@ impl MailboxConfig {
                     | "ai"
                     | "harness"
                     | "mailbox"
+                    | "mailboxes"
                     | "fleet"
             );
             if !is_reserved_table
@@ -904,6 +1138,13 @@ impl MailboxConfig {
                 parse_account_entry(&mut cfg, Some(k), v);
             }
         }
+        cfg.mailboxes = super::mailbox_routes::parse_mailboxes(
+            &doc,
+            table,
+            &get_str_in,
+            &read_secret_file,
+            &is_webmail_ui_url,
+        );
         (cfg != Self::default()).then_some(cfg)
     }
 
@@ -1129,7 +1370,63 @@ fn candidate_lookup_keys(target_email: Option<&str>) -> Vec<String> {
     keys
 }
 
-fn is_webmail_ui_url(url: &str) -> bool {
+/// The IMAPS endpoint a mailbox `domain` (lowercased) is known to serve, or a running local
+/// ProtonMail Bridge for a Proton domain.
+fn discovered_imap_url(domain: &str) -> Option<String> {
+    let url = match domain {
+        "gmail.com" | "googlemail.com" => "imaps://imap.gmail.com:993/INBOX",
+        "fastmail.com" | "fastmail.fm" | "messagingengine.com" => {
+            "imaps://imap.fastmail.com:993/INBOX"
+        }
+        "icloud.com" | "me.com" | "mac.com" => "imaps://imap.mail.me.com:993/INBOX",
+        "yahoo.com" | "ymail.com" => "imaps://imap.mail.yahoo.com:993/INBOX",
+        "zoho.com" | "zohomail.com" => "imaps://imap.zoho.com:993/INBOX",
+        "gmx.com" | "gmx.net" => "imaps://imap.gmx.com:993/INBOX",
+        "mail.com" => "imaps://imap.mail.com:993/INBOX",
+        "outlook.com" | "hotmail.com" | "live.com" | "msn.com" => {
+            "imaps://outlook.office365.com:993/INBOX"
+        }
+        "purelymail.com" => "imaps://imap.purelymail.com:993/INBOX",
+        "migadu.com" => "imaps://imap.migadu.com:993/INBOX",
+        "mailbox.org" => "imaps://imap.mailbox.org:993/INBOX",
+        "runbox.com" => "imaps://mail.runbox.com:993/INBOX",
+        "posteo.de" | "posteo.net" | "posteo.org" => "imaps://posteo.de:993/INBOX",
+        "proton.me" | "proton.ch" | "protonmail.com" | "protonmail.ch" | "pm.me" => {
+            let bridge_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 1143));
+            if TcpStream::connect_timeout(&bridge_addr, Duration::from_millis(50)).is_err() {
+                return None;
+            }
+            "imap://127.0.0.1:1143/INBOX"
+        }
+        _ => return None,
+    };
+    Some(url.to_owned())
+}
+
+/// The webmail inbox a mailbox `domain` (lowercased) is known to serve.
+fn discovered_webmail_url(domain: &str) -> Option<String> {
+    let url = match domain {
+        "proton.me" | "proton.ch" | "protonmail.com" | "protonmail.ch" | "pm.me" => {
+            "https://mail.proton.me/u/0/inbox"
+        }
+        "fastmail.com" | "fastmail.fm" | "messagingengine.com" => {
+            "https://app.fastmail.com/mail/Inbox"
+        }
+        "zoho.com" | "zohomail.com" => "https://mail.zoho.com/zm/",
+        "outlook.com" | "hotmail.com" | "live.com" | "msn.com" => {
+            "https://outlook.live.com/mail/0/inbox"
+        }
+        "purelymail.com" => "https://purelymail.com/webmail/",
+        "migadu.com" => "https://webmail.migadu.com/",
+        "tuta.com" | "tuta.io" | "tutanota.com" | "tutanota.de" | "tutamail.com" => {
+            "https://app.tuta.com/mail"
+        }
+        _ => return None,
+    };
+    Some(url.to_owned())
+}
+
+pub(super) fn is_webmail_ui_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     lower.contains("mail.proton.me")
         || lower.contains("app.fastmail.com")
@@ -1368,6 +1665,10 @@ fn discover_mailbox_config_sources(
             cfg.merge_from(parsed);
         }
     }
+    #[cfg(unix)]
+    super::ai_signin::load_local_ai_signin_into(home, store_dir, config_path, &mut cfg);
+    #[cfg(not(unix))]
+    let _ = (store_dir, config_path);
     if let Some(h) = home {
         let secrets_dir = h.join(".secrets");
         if secrets_dir.is_dir() {
@@ -1598,6 +1899,9 @@ fn discover_mailbox_config_sources(
             .map(|s| s.join("mailbox.seen"))
             .or_else(|| cfg.dir.as_deref().map(default_seen_file_for_path));
     }
+    if cfg.login_record.is_none() {
+        cfg.login_record = store_dir.map(|s| s.join(super::mailbox_routes::LOGIN_RECORD_FILE));
+    }
     (cfg, aliases)
 }
 
@@ -1703,7 +2007,8 @@ pub fn discover_mailbox_config(
     discover_mailbox_config_with_env(home, store_dir, |name| std::env::var_os(name))
 }
 
-fn discover_mailbox_config_with_env(
+/// [`discover_mailbox_config`] reading `env` in place of the process's environment.
+pub(super) fn discover_mailbox_config_with_env(
     home: Option<&Path>,
     store_dir: Option<&Path>,
     env: impl Fn(&str) -> Option<std::ffi::OsString>,
@@ -1768,6 +2073,26 @@ fn discover_mailbox_config_with_env(
         cfg.bearer_token = Some(tok);
     }
 
+    // A mailbox the environment names (a URL, a login or any secret of one) overrides the
+    // files' `[[mailboxes]]` entries too, as it overrides their top-level mailbox: otherwise an
+    // entry would still win for its addresses.
+    let env_names_mailbox = env(MAILBOX_ENV).is_some_and(|v| !v.is_empty())
+        || [
+            MAILBOX_URL_ENV,
+            IMAP_URL_ENV,
+            WEBMAIL_URL_ENV,
+            IMAP_USER_ENV,
+            IMAP_PASS_ENV,
+            WEBMAIL_PASS_ENV,
+            TOTP_SECRET_ENV,
+            MAILBOX_TOKEN_ENV,
+        ]
+        .iter()
+        .any(|name| non_empty_env(name).is_some());
+    let mut files = files;
+    if env_names_mailbox {
+        files.mailboxes.clear();
+    }
     cfg.merge_from(files);
     apply_mailbox_aliases(&mut cfg, &aliases);
 
@@ -3419,7 +3744,7 @@ fn oversized_imap_literals_cannot_turn_body_lines_into_command_responses() {
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "TCP IMAP fetch binds host, port, mailbox, credentials, target filter, and seen state"
+    reason = "TCP IMAP fetch binds host, port, mailbox, credentials, target filter, seen state and how its login went"
 )]
 fn fetch_imap_tcp_credential(
     host: &str,
@@ -3432,6 +3757,7 @@ fn fetch_imap_tcp_credential(
     seen: &mut BTreeSet<String>,
     seen_otps: &mut BTreeSet<String>,
     filter: &MailFilter<'_>,
+    login: &mut ImapLogin,
 ) -> Option<MailboxCredential> {
     let addr = (host, port).to_socket_addrs().ok()?.next()?;
     let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).ok()?;
@@ -3453,8 +3779,10 @@ fn fetch_imap_tcp_credential(
     writer.write_all(login_cmd.as_bytes()).ok()?;
     writer.flush().ok()?;
     if !imap_read_until_tag(&mut reader, "a1")?.0 {
+        *login = ImapLogin::Refused;
         return None;
     }
+    *login = ImapLogin::Accepted;
 
     let select_cmd = format!("a2 SELECT \"{}\"\r\n", escape_imap_quoted(mailbox));
     writer.write_all(select_cmd.as_bytes()).ok()?;
@@ -3589,7 +3917,7 @@ fn fetch_imap_tcp_credential(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "IMAPS fetch binds the URL, credentials, target filter, seen state and the vendor mail filter"
+    reason = "IMAPS fetch binds the URL, credentials, target filter, seen state, the vendor mail filter and how its login went"
 )]
 fn fetch_imaps_curl_credential(
     parsed: &ParsedImapUrl,
@@ -3600,6 +3928,7 @@ fn fetch_imaps_curl_credential(
     seen: &mut BTreeSet<String>,
     seen_otps: &mut BTreeSet<String>,
     filter: &MailFilter<'_>,
+    login: &mut ImapLogin,
 ) -> Option<MailboxCredential> {
     let userpwd = format!("{user}:{password}");
     let url_host = if parsed.host.contains(':') {
@@ -3626,8 +3955,12 @@ fn fetch_imaps_curl_credential(
     )
     .ok()?;
     if !out.status.success() {
+        if out.status.code() == Some(CURLE_LOGIN_DENIED) {
+            *login = ImapLogin::Refused;
+        }
         return None;
     }
+    *login = ImapLogin::Accepted;
     let search_stdout = String::from_utf8_lossy(&out.stdout);
     let seqs = imap_search_sequences(search_stdout.lines());
     for seq in seqs.into_iter().rev().take(8) {
@@ -3676,12 +4009,32 @@ fn fetch_imaps_curl_credential(
     None
 }
 
+/// curl's exit status for a login the server refused (`CURLE_LOGIN_DENIED`).
+const CURLE_LOGIN_DENIED: i32 = 67;
+
+/// How one IMAP read's login went: the backoff of a refused mailbox login keys on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImapLogin {
+    /// No login was sent (no connection, or the read ended first).
+    NotReached,
+    /// The server refused the login.
+    Refused,
+    /// The server accepted it.
+    Accepted,
+}
+
+/// Read `target_email`'s mailbox over IMAP once, through its `[[mailboxes]]` entry where one
+/// receives it. A login with no password is never sent. One refused login is recorded
+/// ([`super::mailbox_routes::note_login_refused`]) and marked in `seen` (this
+/// authorization's in-memory set, never its seen file), so neither this authorization's next
+/// poll nor, through the record, any row's sign-in tries it again before its wait ends.
 fn fetch_imap_credential(
     cfg: &MailboxConfig,
     target_email: Option<&str>,
     seen: &mut BTreeSet<String>,
     seen_otps: &mut BTreeSet<String>,
 ) -> Option<MailboxCredential> {
+    let cfg = &*cfg.routed_for(target_email);
     let imap_url = cfg.effective_imap_url(target_email)?;
     if cleartext_refusal(&imap_url).is_some() {
         return None;
@@ -3699,7 +4052,12 @@ fn fetch_imap_credential(
         .as_deref()
         .or(cfg_pw.as_deref())
         .unwrap_or("");
-    if parsed.tls {
+    let source = super::mailbox_routes::login_source(&imap_url);
+    if password.is_empty() || !login_may_be_tried(cfg, &source, user, seen) {
+        return None;
+    }
+    let mut login = ImapLogin::NotReached;
+    let found = if parsed.tls {
         fetch_imaps_curl_credential(
             &parsed,
             user,
@@ -3709,6 +4067,7 @@ fn fetch_imap_credential(
             seen,
             seen_otps,
             &MailFilter::of(cfg),
+            &mut login,
         )
     } else {
         fetch_imap_tcp_credential(
@@ -3722,8 +4081,94 @@ fn fetch_imap_credential(
             seen,
             seen_otps,
             &MailFilter::of(cfg),
+            &mut login,
         )
+    };
+    let outcome = match login {
+        ImapLogin::Accepted => LoginOutcome::Accepted,
+        ImapLogin::Refused => LoginOutcome::Refused,
+        ImapLogin::NotReached => LoginOutcome::Unknown,
+    };
+    note_login(cfg, &source, user, outcome, seen);
+    found
+}
+
+/// How one source's sign-in with a mailbox login went, as its refusal record counts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginOutcome {
+    /// Signed in, by a positive sign (the server's OK, the inbox's message list, a code read).
+    Accepted,
+    /// Refused: the server said so, or a submitted password never reached the inbox.
+    Refused,
+    /// Nothing either way (no password was sent).
+    Unknown,
+}
+
+/// Whether `login` may be tried on `source` ([`super::mailbox_routes::login_source`]) now: not
+/// refused there earlier in this authorization (its marker in `seen`) nor waiting on a refusal
+/// the record holds; one that waits is marked so this authorization does not read the record
+/// again.
+fn login_may_be_tried(
+    cfg: &MailboxConfig,
+    source: &str,
+    login: &str,
+    seen: &mut BTreeSet<String>,
+) -> bool {
+    let marker = super::mailbox_routes::refused_marker(source, login);
+    if seen.contains(&marker) {
+        return false;
     }
+    let now = super::mailbox_routes::unix_now();
+    if super::mailbox_routes::login_held(cfg.login_record.as_deref(), source, login, now).is_some()
+    {
+        seen.insert(marker);
+        return false;
+    }
+    true
+}
+
+/// Record how a login went on `source`: accepted forgets its refusals there, refused records
+/// one and marks it in `seen` for the rest of this authorization.
+fn note_login(
+    cfg: &MailboxConfig,
+    source: &str,
+    login: &str,
+    outcome: LoginOutcome,
+    seen: &mut BTreeSet<String>,
+) {
+    match outcome {
+        LoginOutcome::Refused => {
+            super::mailbox_routes::note_login_refused(
+                cfg.login_record.as_deref(),
+                source,
+                login,
+                super::mailbox_routes::unix_now(),
+            );
+            seen.insert(super::mailbox_routes::refused_marker(source, login));
+        }
+        LoginOutcome::Accepted => {
+            super::mailbox_routes::note_login_accepted(cfg.login_record.as_deref(), source, login);
+        }
+        LoginOutcome::Unknown => {}
+    }
+}
+
+/// Why `target_email`'s mailbox login is not tried over IMAP in this authorization, where it
+/// was refused there or waits on an earlier refusal (its marker in `seen`).
+fn imap_login_refused_words(
+    cfg: &MailboxConfig,
+    target_email: Option<&str>,
+    seen: &BTreeSet<String>,
+) -> Option<&'static str> {
+    let imap_url = cfg.effective_imap_url(target_email)?;
+    let parsed = parse_imap_url(&imap_url)?;
+    let login = parsed
+        .user
+        .or_else(|| cfg.webmail_user_for(target_email))
+        .unwrap_or_else(|| "user".to_owned());
+    let source = super::mailbox_routes::login_source(&imap_url);
+    seen.contains(&super::mailbox_routes::refused_marker(&source, &login))
+        .then(|| super::mailbox_routes::refused_words(&login))
 }
 
 fn authority_and_tail(rest: &str) -> (&str, &str) {
@@ -3791,6 +4236,7 @@ pub fn plaintext_credential_refusal(
     cfg: &MailboxConfig,
     target_email: Option<&str>,
 ) -> Option<&'static str> {
+    let cfg = &*cfg.routed_for(target_email);
     if let Some(why) = cfg
         .effective_imap_url(target_email)
         .as_deref()
@@ -4086,6 +4532,7 @@ fn fetch_http_mailbox_credential(
     seen: &mut BTreeSet<String>,
     seen_otps: &mut BTreeSet<String>,
 ) -> Option<MailboxCredential> {
+    let cfg = &*cfg.routed_for(target_email);
     let filter = MailFilter::of(cfg);
     let raw_url = cfg.http_url.as_deref()?;
     let url = if raw_url.contains("{email}") {
@@ -4233,6 +4680,7 @@ fn scan_maildir_once(
     seen_file: Option<&Path>,
     (seen_digests, seen_otps): (&mut BTreeSet<String>, &mut BTreeSet<String>),
     filter: &MailFilter<'_>,
+    mark_clicked: bool,
 ) -> Option<MailboxCredential> {
     let mut candidates: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
     if mailbox_dir.is_file()
@@ -4358,7 +4806,7 @@ fn scan_maildir_once(
             );
             if exhausted {
                 tried.insert((path.clone(), len, mtime));
-                if let Some(name) = path.file_name() {
+                if mark_clicked && let Some(name) = path.file_name() {
                     let name_str = name.to_string_lossy();
                     let parent = path.parent().unwrap_or(mailbox_dir);
                     let marker = parent.join(format!("{name_str}.clicked"));
@@ -4377,6 +4825,77 @@ fn scan_maildir_once(
     None
 }
 
+/// Read-only steward peek for C17c `mail-code <email>`: returns the newest verification code or
+/// magic link addressed to `target_email` without writing `.clicked` or `seen_file` markers.
+#[cfg(unix)]
+pub(super) fn peek_newest_credential_for_relay(
+    cfg: &MailboxConfig,
+    target_email: &str,
+) -> Option<MailboxCredential> {
+    let mut peek_cfg = cfg.routed_for(Some(target_email)).into_owned();
+    peek_cfg.seen_file = None;
+    peek_cfg.relay_enabled = false;
+    let mut tried_files = BTreeSet::new();
+    let mut seen_digests = BTreeSet::new();
+    let mut seen_otps = BTreeSet::new();
+    if let Some(dir) = peek_cfg.dir.as_deref()
+        && let Some(cred) = scan_maildir_once(
+            dir,
+            Some(target_email),
+            &mut tried_files,
+            None,
+            (&mut seen_digests, &mut seen_otps),
+            &MailFilter::of(&peek_cfg),
+            false,
+        )
+    {
+        return Some(cred);
+    }
+    if let Some(cred) = fetch_imap_credential(
+        &peek_cfg,
+        Some(target_email),
+        &mut seen_digests,
+        &mut seen_otps,
+    ) {
+        return Some(cred);
+    }
+    fetch_http_mailbox_credential(
+        &peek_cfg,
+        Some(target_email),
+        &mut seen_digests,
+        &mut seen_otps,
+    )
+}
+
+#[cfg(unix)]
+fn accept_relay_credential(
+    cred: MailboxCredential,
+    target_email: Option<&str>,
+    seen_file: Option<&Path>,
+    seen_digests: &mut BTreeSet<String>,
+    seen_otps: &mut BTreeSet<String>,
+) -> Option<MailboxCredential> {
+    match &cred {
+        MailboxCredential::MagicLink(url) => {
+            let digest = fnv1a_hex(url);
+            if seen_digests.contains(&digest) || seen_otps.contains(&digest) {
+                return None;
+            }
+            record_seen_digest(seen_file, seen_digests, &digest);
+            seen_otps.insert(digest);
+            Some(cred)
+        }
+        MailboxCredential::Otp(code) => {
+            let key = otp_flow_key(code, target_email);
+            if seen_otps.contains(&key) {
+                return None;
+            }
+            seen_otps.insert(key);
+            Some(cred)
+        }
+    }
+}
+
 fn poll_non_webmail_once(
     cfg: &MailboxConfig,
     target_email: Option<&str>,
@@ -4384,6 +4903,7 @@ fn poll_non_webmail_once(
     seen_digests: &mut BTreeSet<String>,
     seen_otps: &mut BTreeSet<String>,
 ) -> Option<MailboxCredential> {
+    let cfg = &*cfg.routed_for(target_email);
     if let Some(dir) = cfg.dir.as_deref()
         && let Some(cred) = scan_maildir_once(
             dir,
@@ -4392,6 +4912,7 @@ fn poll_non_webmail_once(
             cfg.seen_file.as_deref(),
             (seen_digests, seen_otps),
             &MailFilter::of(cfg),
+            true,
         )
     {
         return Some(cred);
@@ -4401,6 +4922,24 @@ fn poll_non_webmail_once(
     }
     if let Some(cred) = fetch_http_mailbox_credential(cfg, target_email, seen_digests, seen_otps) {
         return Some(cred);
+    }
+    #[cfg(unix)]
+    if cfg.relay_enabled
+        && let Some(email) = target_email
+        && let Some(cred) = super::ai_signin::fetch_relay_mail_credential(
+            cfg,
+            email,
+            super::ai_signin::MAIL_CODE_DIAL_WITHIN,
+        )
+        && let Some(accepted) = accept_relay_credential(
+            cred,
+            target_email,
+            cfg.seen_file.as_deref(),
+            seen_digests,
+            seen_otps,
+        )
+    {
+        return Some(accepted);
     }
     None
 }
@@ -4421,18 +4960,26 @@ pub(super) fn poll_mailbox_config_for_credential_with_seen_otps(
     timeout: Duration,
     seen_otps: &mut BTreeSet<String>,
 ) -> Result<MailboxCredential, &'static str> {
+    let cfg = &*cfg.routed_for(target_email);
     if let Some(why) = plaintext_credential_refusal(cfg, target_email) {
         return Err(why);
     }
+    let has_relay = cfg.relay_enabled && target_email.is_some();
     let has_non_webmail = cfg.dir.is_some()
         || cfg.effective_imap_url(target_email).is_some()
-        || cfg.http_url.is_some();
+        || cfg.http_url.is_some()
+        || has_relay;
     if !has_non_webmail {
         if cfg.effective_webmail_url(target_email).is_some() {
             return Err("webmail inbox requires headless browser");
         }
-        return Err("headless browser requires sign-in, but no mailbox is configured");
+        return Err(cfg
+            .unready_words(target_email)
+            .unwrap_or("headless browser requires sign-in, but no mailbox is configured"));
     }
+    // A mailbox reached over IMAP alone, whose login was refused (here or within its wait),
+    // ends the poll at once with that reason instead of waiting out the timeout.
+    let imap_alone = cfg.dir.is_none() && cfg.http_url.is_none() && !has_relay;
     let deadline = Instant::now() + timeout;
     let mut tried_files = BTreeSet::new();
     let mut seen_digests = load_seen_digests(cfg.seen_file.as_deref());
@@ -4448,6 +4995,7 @@ pub(super) fn poll_mailbox_config_for_credential_with_seen_otps(
                 cfg.seen_file.as_deref(),
                 (&mut seen_digests, seen_otps),
                 &MailFilter::of(cfg),
+                true,
             )
         {
             return Ok(cred);
@@ -4455,7 +5003,8 @@ pub(super) fn poll_mailbox_config_for_credential_with_seen_otps(
         let should_poll_net =
             last_network_poll.is_none_or(|last| last.elapsed() >= network_interval);
         if should_poll_net {
-            if cfg.effective_imap_url(target_email).is_some() || cfg.http_url.is_some() {
+            if cfg.effective_imap_url(target_email).is_some() || cfg.http_url.is_some() || has_relay
+            {
                 last_network_poll = Some(Instant::now());
             }
             if let Some(cred) =
@@ -4463,10 +5012,33 @@ pub(super) fn poll_mailbox_config_for_credential_with_seen_otps(
             {
                 return Ok(cred);
             }
+            if imap_alone
+                && let Some(why) = imap_login_refused_words(cfg, target_email, &seen_digests)
+            {
+                return Err(why);
+            }
             if let Some(cred) =
                 fetch_http_mailbox_credential(cfg, target_email, &mut seen_digests, seen_otps)
             {
                 return Ok(cred);
+            }
+            #[cfg(unix)]
+            if has_relay
+                && let Some(email) = target_email
+                && let Some(cred) = super::ai_signin::fetch_relay_mail_credential(
+                    cfg,
+                    email,
+                    super::ai_signin::MAIL_CODE_DIAL_WITHIN,
+                )
+                && let Some(accepted) = accept_relay_credential(
+                    cred,
+                    target_email,
+                    cfg.seen_file.as_deref(),
+                    &mut seen_digests,
+                    seen_otps,
+                )
+            {
+                return Ok(accepted);
             }
         }
         if Instant::now() >= deadline {
@@ -4700,7 +5272,9 @@ const SUBMIT_INPUT_HELPERS_JS: &str = r#"
 "#;
 
 /// Build the JavaScript expression evaluated inside the OAuth page to inspect and advance the
-/// flow.
+/// flow. Cloudflare's block page answers `block_page` and its bot check `bot_check`
+/// ([`block_page`], [`bot_check`]), read before anything on the page is pressed or filled, and
+/// then nothing is.
 #[must_use]
 pub fn oauth_step_js(
     email: Option<&str>,
@@ -4726,6 +5300,10 @@ pub fn oauth_step_js(
   if (href.startsWith("http://127.0.0.1:") || href.startsWith("http://localhost:")) {{
     return {{ state: failedHref ? "callback_recovered" : "callback", url: href }};
   }}
+{BOT_CHECK_JS}
+  const pageText = String(document.body && document.body.innerText || "");
+  if (blockPageOf(pageText)) return {{ state: "block_page", url: href }};
+  if (botCheckOf(document.title, pageText, botCheckMarkers())) return {{ state: "bot_check", url: href }};
   const setNativeValue = (el, val) => {{
     if (typeof el.focus === "function") el.focus();
     const proto = Object.getPrototypeOf(el);
@@ -5271,6 +5849,7 @@ pub(super) fn webmail_step_js(
   return {{
     state: "inbox",
     url: href,
+    rows: rows.length,
     clicked_row: clickedRow,
     html: htmlParts.join("\n"),
     text: textParts.join("\n")
@@ -5292,12 +5871,15 @@ pub fn poll_webmail_via_cdp(
     seen_digests: &mut BTreeSet<String>,
     seen_otps: &mut BTreeSet<String>,
 ) -> Result<MailboxCredential, &'static str> {
+    let cfg = &*cfg.routed_for(target_email);
     if let Some(why) = plaintext_credential_refusal(cfg, target_email) {
         return Err(why);
     }
-    let raw_webmail_url = cfg
-        .effective_webmail_url(target_email)
-        .ok_or("headless browser requires sign-in, but no webmail URL is configured")?;
+    let raw_webmail_url =
+        cfg.effective_webmail_url(target_email)
+            .ok_or(cfg.unready_words(target_email).unwrap_or(
+                "headless browser requires sign-in, but no webmail URL is configured",
+            ))?;
     let webmail_url = raw_webmail_url.trim();
     if let Some(why) = cleartext_refusal(webmail_url) {
         return Err(why);
@@ -5312,6 +5894,14 @@ pub fn poll_webmail_via_cdp(
     let password = cfg.password_for(target_email);
     let mailbox_password = cfg.mailbox_password_for(target_email);
     let totp_secret = cfg.totp_secret_for(target_email);
+    // A webmail login refused on this host within its wait is not tried again
+    // ([`login_may_be_tried`]); a refusal over IMAP (a local Bridge) holds only IMAP.
+    let source = super::mailbox_routes::login_source(webmail_url);
+    if let Some(login) = login_user.as_deref()
+        && !login_may_be_tried(cfg, &source, login, seen_digests)
+    {
+        return Err(super::mailbox_routes::refused_words(login));
+    }
 
     let deadline = Instant::now() + timeout;
     let step_timeout = || deadline.saturating_duration_since(Instant::now());
@@ -5339,6 +5929,11 @@ pub fn poll_webmail_via_cdp(
         .ok_or("browser attached no webmail sessionId")?
         .to_owned();
 
+    let mut login_submitted = false;
+    // Set only on a positive sign that the submitted password signed in: the inbox's message
+    // list on the configured webmail host, or a code read from it. A tick that merely finds no
+    // sign-in form (a page still loading, a redirect) is no such sign.
+    let mut signed_in = false;
     let result = (|| {
         for method in ["Page.enable", "Runtime.enable"] {
             let _ = cdp.call(Some(&session), method, json!({}), step_timeout())?;
@@ -5351,7 +5946,6 @@ pub fn poll_webmail_via_cdp(
         )?;
 
         let mut user_submitted = false;
-        let mut login_submitted = false;
         let mut last_submitted_totp: Option<String> = None;
         let mut mailbox_pw_submitted = false;
         let mut inbox_tick = 0usize;
@@ -5432,6 +6026,14 @@ pub fn poll_webmail_via_cdp(
                     mailbox_pw_submitted = true;
                 }
                 "inbox" => {
+                    let on_inbox_host = val
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .is_some_and(|href| super::mailbox_routes::login_source(href) == source);
+                    let listed = val.get("rows").and_then(Value::as_u64).unwrap_or(0) > 0;
+                    if login_submitted && on_inbox_host && listed {
+                        signed_in = true;
+                    }
                     inbox_tick = inbox_tick.saturating_add(1);
                     let html = val.get("html").and_then(Value::as_str).unwrap_or("");
                     let text = val.get("text").and_then(Value::as_str).unwrap_or("");
@@ -5461,6 +6063,7 @@ pub fn poll_webmail_via_cdp(
                                 &cred,
                                 exhausted,
                             );
+                            signed_in |= login_submitted;
                             return Ok(cred);
                         }
                     }
@@ -5473,6 +6076,19 @@ pub fn poll_webmail_via_cdp(
         }
         Err("timed out waiting for verification email in webmail inbox")
     })();
+    // A password submitted with no positive sign that it signed in counts as refused: recorded,
+    // so neither this authorization nor any row's sign-in submits it again on this host before
+    // its wait ends. Only that positive sign clears a refusal recorded earlier.
+    if let Some(login) = login_user.as_deref() {
+        let outcome = if signed_in {
+            LoginOutcome::Accepted
+        } else if login_submitted {
+            LoginOutcome::Refused
+        } else {
+            LoginOutcome::Unknown
+        };
+        note_login(cfg, &source, login, outcome, seen_digests);
+    }
 
     let _ = cdp.call(
         None,
@@ -5495,6 +6111,7 @@ pub fn poll_mailbox_or_webmail_for_credential(
     poll_interval: Duration,
     seen_otps: &mut BTreeSet<String>,
 ) -> Result<MailboxCredential, &'static str> {
+    let cfg = &*cfg.routed_for(target_email);
     if let Some(why) = plaintext_credential_refusal(cfg, target_email) {
         return Err(why);
     }
@@ -5547,7 +6164,9 @@ pub fn poll_mailbox_or_webmail_for_credential(
     } else if has_non_webmail {
         poll_mailbox_config_for_credential_with_seen_otps(cfg, target_email, timeout, seen_otps)
     } else {
-        Err("headless browser requires sign-in, but no mailbox is configured")
+        Err(cfg
+            .unready_words(target_email)
+            .unwrap_or("headless browser requires sign-in, but no mailbox is configured"))
     };
     if let Ok(credential) = &result {
         remember_flow_otp(credential, target_email, seen_otps);
@@ -5609,15 +6228,90 @@ pub fn drive_cdp_oauth(
     )
 }
 
+/// The most reads of the OAuth page one drive makes, Cloudflare's bot check and the gaps
+/// between its reads apart ([`drive_cdp_oauth_with_webmail`], [`BotCheckClock`]).
+const MAX_OAUTH_STEPS: usize = 120;
+
+/// A Claude sign-in's end on Cloudflare's bot check ([`bot_check`]) that did not clear within
+/// [`VENDOR_STALL`] or the drive's deadline.
+pub const BOT_CHECK_UNCLEARED: &str =
+    "Cloudflare's bot check on the sign-in page did not clear; aterm never tries to pass it";
+
+/// A Claude sign-in's end on Cloudflare's block page ([`block_page`]).
+pub const BLOCK_PAGE_MET: &str =
+    "Cloudflare's block page answered the sign-in; aterm never tries to pass it";
+
+thread_local! {
+    /// What this thread's last headless Claude sign-in met where it ended without the callback
+    /// ([`note_met`], [`take_met`]).
+    static MET: std::cell::RefCell<Option<super::open_url::Met>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Notes that this thread's headless sign-in ended on `word`, last on `host`.
+fn note_met(word: MetWord, host: Option<&str>) {
+    let met = super::open_url::Met::new(word, host);
+    MET.with(|slot| *slot.borrow_mut() = Some(met));
+}
+
+/// What this thread's last headless Claude sign-in met where it ended without the callback (a
+/// bot check, a block page, no callback in time), taken once; the opener writes it to the
+/// renewal's outcome file ([`super::open_url::OUTCOME_ENV`]).
+#[must_use]
+pub fn take_met() -> Option<super::open_url::Met> {
+    MET.with(|slot| slot.borrow_mut().take())
+}
+
 /// Drive an active CDP session (`cdp`) through the OAuth flow for `authorize_url`, passing
 /// `&mut CdpClient` to `mailbox_credential` so webmail inboxes can be polled in a secondary CDP
-/// tab.
+/// tab. Cloudflare's bot check is waited on, its reads (and a gap of idle reads between two,
+/// [`BotCheckClock`]) not counted against the drive's steps, and ends the drive
+/// [`BOT_CHECK_UNCLEARED`] once it has stood for [`VENDOR_STALL`] or the deadline comes during
+/// it; its block page ends it [`BLOCK_PAGE_MET`] at once. Either end, and a drive that reached
+/// no callback in time, is noted for [`take_met`].
 pub fn drive_cdp_oauth_with_webmail(
     cdp: &mut CdpClient,
     authorize_url: &str,
     target_email: Option<&str>,
     timeout: Duration,
     poll_interval: Duration,
+    mailbox_credential: impl FnMut(
+        &mut CdpClient,
+        Option<&str>,
+    ) -> Result<MailboxCredential, &'static str>,
+    deliver_callback: impl FnMut(&str) -> Result<u16, &'static str>,
+) -> Result<(), &'static str> {
+    drive_cdp_oauth_within(
+        cdp,
+        authorize_url,
+        target_email,
+        (timeout, poll_interval),
+        VENDOR_STALL,
+        mailbox_credential,
+        deliver_callback,
+    )
+}
+
+/// How a Claude drive whose deadline came at `now` ends, last on `last_host`, noted for
+/// [`take_met`]: [`BOT_CHECK_UNCLEARED`] where a bot check it waited on still stood
+/// ([`BotCheckClock::held`]), else timed out.
+fn oauth_out_of_time(bot: &BotCheckClock, last_host: Option<&str>, now: Instant) -> &'static str {
+    if bot.held(now).is_some() {
+        note_met(MetWord::BotCheck, last_host);
+        return BOT_CHECK_UNCLEARED;
+    }
+    note_met(MetWord::Stall, last_host);
+    "timed out waiting for headless browser OAuth completion"
+}
+
+/// [`drive_cdp_oauth_with_webmail`] within `timeout`, reading every `poll_interval`, with
+/// `bot_stall` how long a bot check may stand (a test's short one; else [`VENDOR_STALL`]).
+pub(super) fn drive_cdp_oauth_within(
+    cdp: &mut CdpClient,
+    authorize_url: &str,
+    target_email: Option<&str>,
+    (timeout, poll_interval): (Duration, Duration),
+    bot_stall: Duration,
     mut mailbox_credential: impl FnMut(
         &mut CdpClient,
         Option<&str>,
@@ -5672,11 +6366,27 @@ pub fn drive_cdp_oauth_with_webmail(
     let mut mailbox_polls = 0usize;
     let mut needs_mailbox_ticks = 0usize;
     const MAX_MAILBOX_POLLS: usize = 3;
+    let _ = take_met();
 
     let result = (|| {
-        for _ in 0..120 {
-            if Instant::now() >= deadline {
-                return Err("timed out waiting for headless browser OAuth completion");
+        let mut steps = 0usize;
+        let mut bot = BotCheckClock::default();
+        let mut last_host: Option<String> = None;
+        let pause = || {
+            if !poll_interval.is_zero() {
+                std::thread::sleep(poll_interval);
+            }
+        };
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(oauth_out_of_time(&bot, last_host.as_deref(), now));
+            }
+            if steps >= MAX_OAUTH_STEPS {
+                note_met(MetWord::Stall, last_host.as_deref());
+                return Err(
+                    "headless browser OAuth exceeded maximum steps without reaching callback",
+                );
             }
             let expr = oauth_step_js(
                 email.as_deref(),
@@ -5684,7 +6394,7 @@ pub fn drive_cdp_oauth_with_webmail(
                 email_submitted,
                 otp_submitted,
             );
-            let eval = cdp.call(
+            let eval = match cdp.call(
                 Some(&session),
                 "Runtime.evaluate",
                 json!({
@@ -5693,7 +6403,26 @@ pub fn drive_cdp_oauth_with_webmail(
                     "returnByValue": true
                 }),
                 step_timeout(),
-            )?;
+            ) {
+                Ok(eval) => eval,
+                // A read cut short while a bot check stood (the deadline came, or the check
+                // replaced its page under the read) is part of that wait.
+                Err(why) => {
+                    let now = Instant::now();
+                    if bot.held(now).is_none() {
+                        return Err(why);
+                    }
+                    if now >= deadline {
+                        return Err(oauth_out_of_time(&bot, last_host.as_deref(), now));
+                    }
+                    bot.unread(now);
+                    if bot.held(now).is_none() {
+                        return Err(why);
+                    }
+                    pause();
+                    continue;
+                }
+            };
             let val = eval
                 .pointer("/result/value")
                 .cloned()
@@ -5727,6 +6456,35 @@ pub fn drive_cdp_oauth_with_webmail(
             if flow.is_callback(target_attr) {
                 return callback_delivery_result(deliver_callback(target_attr));
             }
+            if let Some(host) = super::login_drive::https_host(url) {
+                last_host = Some(host);
+            }
+            match state {
+                "block_page" => {
+                    note_met(MetWord::BlockPage, last_host.as_deref());
+                    return Err(BLOCK_PAGE_MET);
+                }
+                "bot_check" => {
+                    if bot.check(url, Instant::now()) >= bot_stall {
+                        note_met(MetWord::BotCheck, last_host.as_deref());
+                        return Err(BOT_CHECK_UNCLEARED);
+                    }
+                    pause();
+                    continue;
+                }
+                // A page that did nothing (`loading`) between two reads of a bot check, on its
+                // host and within its gap, is part of that wait and none of the drive's steps:
+                // the check reloading itself, read half-parsed.
+                _ => {
+                    let now = Instant::now();
+                    bot.other(url, state == "loading", now);
+                    if bot.held(now).is_some() {
+                        pause();
+                        continue;
+                    }
+                }
+            }
+            steps += 1;
 
             match state {
                 "clicked_consent" | "switched_account" => {
@@ -5809,7 +6567,6 @@ pub fn drive_cdp_oauth_with_webmail(
                 }
             }
         }
-        Err("headless browser OAuth exceeded maximum steps without reaching callback")
     })();
 
     let _ = cdp.call(
@@ -5903,9 +6660,11 @@ pub(super) fn authorize_with_headless_browser_config_and_credential(
                 timeout,
                 Duration::from_millis(200),
                 |cdp_inner, em| {
-                    let mb = mailbox_cfg
-                        .filter(|c| c.is_configured_for(em))
-                        .ok_or("headless browser requires sign-in, but no mailbox is configured")?;
+                    let mb = mailbox_cfg.filter(|c| c.is_configured_for(em)).ok_or(
+                        mailbox_cfg.and_then(|c| c.unready_words(em)).unwrap_or(
+                            "headless browser requires sign-in, but no mailbox is configured",
+                        ),
+                    )?;
                     poll_mailbox_or_pending_credential(
                         &mut pending_credential,
                         cdp_inner,
@@ -5971,6 +6730,59 @@ pub struct Page {
     pub buttons: Vec<String>,
     /// Its enabled, visible inputs.
     pub inputs: Vec<Field>,
+    /// Its title (`document.title`), lowercase.
+    pub title: String,
+    /// The marks of Cloudflare's challenge machinery on it ([`bot_check`]).
+    pub markers: Vec<Marker>,
+}
+
+/// A mark of Cloudflare's challenge machinery on a [`Page`], read by [`VENDOR_PAGE_JS`] and
+/// [`oauth_step_js`]: the closed list [`bot_check`] judges a page by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Marker {
+    /// An element of class `cf-turnstile` (the Turnstile widget).
+    Turnstile,
+    /// An element `#challenge-form`.
+    ChallengeForm,
+    /// An iframe or script whose `src` contains `challenges.cloudflare.com`.
+    ChallengeHost,
+    /// An iframe or script whose `src` contains `/cdn-cgi/challenge-platform/`.
+    ChallengePlatform,
+    /// `__cf_chl_` in the page's URL or in a form's action.
+    ChallengeToken,
+    /// `window._cf_chl_opt` is defined.
+    ChallengeOptions,
+}
+
+impl Marker {
+    /// Every marker, in the order the page's reader names them.
+    pub const ALL: [Marker; 6] = [
+        Marker::Turnstile,
+        Marker::ChallengeForm,
+        Marker::ChallengeHost,
+        Marker::ChallengePlatform,
+        Marker::ChallengeToken,
+        Marker::ChallengeOptions,
+    ];
+
+    /// Its word in the page reader's answer.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Marker::Turnstile => "cf-turnstile",
+            Marker::ChallengeForm => "challenge-form",
+            Marker::ChallengeHost => "challenges.cloudflare.com",
+            Marker::ChallengePlatform => "challenge-platform",
+            Marker::ChallengeToken => "cf-chl",
+            Marker::ChallengeOptions => "cf-chl-opt",
+        }
+    }
+
+    /// The marker `word` names; `None` for a word not on the list.
+    #[must_use]
+    pub fn of(word: &str) -> Option<Marker> {
+        Marker::ALL.into_iter().find(|m| m.word() == word)
+    }
 }
 
 /// One input of a [`Page`].
@@ -6491,6 +7303,94 @@ fn block_page(page: &Page) -> bool {
     lower.contains("sorry, you have been blocked") && lower.contains("cloudflare")
 }
 
+/// The titles of Cloudflare's managed challenge (its interstitial), lowercase.
+pub const CHALLENGE_TITLES: &[&str] = &["just a moment...", "just a moment…"];
+
+/// The words of Cloudflare's managed challenge in a page's text, lowercase.
+pub const CHALLENGE_WORDS: &[&str] = &[
+    "enable javascript and cookies to continue",
+    "verify you are human",
+    "verifying you are human",
+];
+
+/// Whether the page is Cloudflare's managed challenge (the "Just a moment..." interstitial
+/// that answered the headless shell at claude.ai/login on 2026-10-27): its title or its text
+/// says so ([`CHALLENGE_TITLES`], [`CHALLENGE_WORDS`]) AND at least one of its [`Marker`]s is
+/// on it. The words without a marker (a help page quoting them) and a marker without the words
+/// (a sign-in form carrying a Turnstile widget) are never one. aterm never tries to pass one: no
+/// user-agent change, no flag that hides automation, no press on its widget, no solver and no
+/// imported clearance cookie. A page that is one is waited on, with nothing pressed, filled or
+/// followed, until it clears by itself or its stall ends the sign-in naming it ([`PageStall`]).
+#[must_use]
+pub fn bot_check(page: &Page) -> bool {
+    if page.markers.is_empty() {
+        return false;
+    }
+    let text = page.text.to_lowercase();
+    CHALLENGE_TITLES.contains(&page.title.trim().to_lowercase().as_str())
+        || CHALLENGE_WORDS.iter().any(|w| text.contains(w))
+}
+
+/// The page reader's helpers for Cloudflare's pages, shared by [`VENDOR_PAGE_JS`] and
+/// [`oauth_step_js`]: `botCheckMarkers()` names the [`Marker`]s on the page, `blockPageOf(text)`
+/// is [`block_page`], and `botCheckOf(title, text, markers)` is [`bot_check`] (their word lists
+/// are [`CHALLENGE_TITLES`] and [`CHALLENGE_WORDS`]). They read the page and touch nothing.
+macro_rules! bot_check_helpers_js {
+    () => {
+        r##"
+  const botCheckTitles = ["just a moment...", "just a moment…"];
+  const botCheckWords = ["enable javascript and cookies to continue", "verify you are human", "verifying you are human"];
+  const botCheckMarkers = () => {
+    const found = [];
+    const srcs = Array.from(document.querySelectorAll("iframe[src], script[src]")).map(el => String(el.getAttribute("src") || ""));
+    const actions = Array.from(document.querySelectorAll("form[action]")).map(f => String(f.getAttribute("action") || ""));
+    if (document.querySelector(".cf-turnstile")) found.push("cf-turnstile");
+    if (document.querySelector("#challenge-form")) found.push("challenge-form");
+    if (srcs.some(s => s.includes("challenges.cloudflare.com"))) found.push("challenges.cloudflare.com");
+    if (srcs.some(s => s.includes("/cdn-cgi/challenge-platform/"))) found.push("challenge-platform");
+    if (String(window.location && window.location.href || "").includes("__cf_chl_") || actions.some(a => a.includes("__cf_chl_"))) found.push("cf-chl");
+    if (typeof window._cf_chl_opt !== "undefined") found.push("cf-chl-opt");
+    return found;
+  };
+  const blockPageOf = (text) => {
+    const lower = String(text || "").toLowerCase();
+    return lower.includes("sorry, you have been blocked") && lower.includes("cloudflare");
+  };
+  const botCheckOf = (title, text, markers) => {
+    if (!markers.length) return false;
+    const lower = String(text || "").toLowerCase();
+    return botCheckTitles.includes(String(title || "").trim().toLowerCase()) || botCheckWords.some(w => lower.includes(w));
+  };
+"##
+    };
+}
+
+/// [`bot_check_helpers_js`] as a string.
+const BOT_CHECK_JS: &str = bot_check_helpers_js!();
+
+/// Where `page` is: its host and path, without its query (which may carry a code or a
+/// challenge's token) or fragment.
+fn url_place(url: &str) -> String {
+    let url = url.split(['?', '#']).next().unwrap_or("");
+    let place = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    format!("`{}`", super::one_line(place, 80))
+}
+
+/// The reason a sign-in ends on Cloudflare's bot check ([`bot_check`]) at `url`, `held` after
+/// it was first read: the place, never the page's text (which carries this machine's public
+/// address and the challenge's ray id).
+#[must_use]
+pub fn bot_check_reason(url: &str, held: Duration) -> String {
+    format!(
+        "Cloudflare's bot check on {} did not clear in {} s; aterm never tries to pass it",
+        url_place(url),
+        held.as_secs()
+    )
+}
+
 const CONSENT_LABELS: &[&str] = &[
     "authorize",
     "allow",
@@ -6538,7 +7438,8 @@ const SUCCESS_WORDS: &[&str] = &[
 
 /// The step one vendor sign-in page calls for (design §6): a pure judgment of the page's host,
 /// text, buttons and inputs. Nothing is pressed off the pinned hosts, on another identity
-/// provider, on a sign-up page or on a bot-protection block page; a device page is confirmed once,
+/// provider, on a sign-up page, on a bot-protection block page or on Cloudflare's bot check
+/// ([`bot_check`], which is waited on); a device page is confirmed once,
 /// and only when it shows the code the CLI printed (in its text, or in its URL on a card naming
 /// the account signed in); a page showing another code, or another account signed in, is
 /// refused; another provider's page or a password asks for the person's sign-in
@@ -6616,6 +7517,9 @@ fn page_step(page: &Page, gate: &Gate<'_>) -> Step {
                 .to_owned(),
         );
     }
+    if bot_check(page) {
+        return Step::Wait;
+    }
     if sign_up_page(page) {
         return Step::Stop("the page asks to create an account, which aterm never does".to_owned());
     }
@@ -6690,9 +7594,12 @@ fn page_step(page: &Page, gate: &Gate<'_>) -> Step {
 }
 
 /// Reads the page into a [`Page`]: its URL, first heading, visible text (8000 characters at
-/// most), enabled visible buttons' labels and inputs' kinds.
-pub const VENDOR_PAGE_JS: &str = r#"(() => {
-  const visible = el => !el.disabled && !el.hidden && el.type !== "hidden" &&
+/// most), enabled visible buttons' labels and inputs' kinds, title, and the [`Marker`]s of
+/// Cloudflare's challenge on it.
+pub const VENDOR_PAGE_JS: &str = concat!(
+    "(() => {",
+    bot_check_helpers_js!(),
+    r#"  const visible = el => !el.disabled && !el.hidden && el.type !== "hidden" &&
     el.getAttribute("aria-disabled") !== "true" && el.getClientRects().length > 0;
   const label = b => String(b.innerText || b.value || b.getAttribute("aria-label") || "").trim().toLowerCase().slice(0, 80);
   const buttons = Array.from(document.querySelectorAll("button, input[type='submit'], [role='button']")).filter(visible);
@@ -6714,9 +7621,12 @@ pub const VENDOR_PAGE_JS: &str = r#"(() => {
     heading: String(h && h.innerText || "").trim().toLowerCase().slice(0, 200),
     text: String(document.body && document.body.innerText || "").slice(0, 8000),
     buttons: buttons.map(label),
-    inputs
+    inputs,
+    title: String(document.title || "").trim().toLowerCase().slice(0, 200),
+    markers: botCheckMarkers()
   };
-})()"#;
+})()"#
+);
 
 /// The JavaScript that carries out `step` on the page read by [`VENDOR_PAGE_JS`]: a press of the
 /// same enumeration's button, or `value` typed into the first input of the step's kind and
@@ -6811,6 +7721,16 @@ pub fn page_of(value: &Value) -> Page {
                     .collect()
             })
             .unwrap_or_default(),
+        title: text("title"),
+        markers: value
+            .get("markers")
+            .and_then(Value::as_array)
+            .map(|m| {
+                m.iter()
+                    .filter_map(|w| Marker::of(w.as_str().unwrap_or("")))
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -6818,17 +7738,109 @@ pub fn page_of(value: &Value) -> Page {
 const VENDOR_TICK: Duration = Duration::from_millis(400);
 
 /// How long a vendor drive waits on one unchanged page that shows nothing aterm presses or
-/// fills before it stops for a person ([`PageStall`]).
+/// fills before it stops for a person, and on Cloudflare's bot check before it ends naming it
+/// ([`PageStall`]).
 pub const VENDOR_STALL: Duration = Duration::from_secs(90);
+
+/// How long reads that are not Cloudflare's bot check may come between two that are, inside
+/// one wait on it ([`BotCheckClock`]): a check that reloads itself is read between its documents
+/// half-parsed (its title, no marker yet) or not at all. Such a gap, each read on the check's
+/// host with nothing on it to press, fill or follow, does not restart the wait; a longer one, a
+/// page on another host, or one with something to act on, ends it.
+pub const BOT_CHECK_GAP: Duration = Duration::from_secs(10);
+
+/// One wait on Cloudflare's bot check ([`bot_check`]), shared by the vendor drive
+/// ([`PageStall`]) and the Claude drive ([`drive_cdp_oauth_with_webmail`]): where it was last
+/// read, since when one has stood, and since when the reads have been a gap between two
+/// ([`BOT_CHECK_GAP`]).
+#[derive(Debug, Default, Clone)]
+pub struct BotCheckClock {
+    held: Option<BotWait>,
+}
+
+#[derive(Debug, Clone)]
+struct BotWait {
+    url: String,
+    since: Instant,
+    gap: Option<Instant>,
+}
+
+impl BotCheckClock {
+    /// Notes a read at `now` of `url` that is a bot check: how long one has stood, from the
+    /// first read of the wait it is part of. An expired gap or another HTTPS host starts a
+    /// fresh wait.
+    pub fn check(&mut self, url: &str, now: Instant) -> Duration {
+        let same_wait = self.held(now).is_some_and(|(before, _)| {
+            super::login_drive::https_host(before)
+                .is_some_and(|host| super::login_drive::https_host(url) == Some(host))
+        });
+        if !same_wait {
+            self.held = None;
+        }
+        let since = self.held.as_ref().map_or(now, |wait| wait.since);
+        self.held = Some(BotWait {
+            url: url.to_owned(),
+            since,
+            gap: None,
+        });
+        now.saturating_duration_since(since)
+    }
+
+    /// Notes a read at `now` of `url` that is not a bot check; `idle` says nothing on it is
+    /// aterm's to press, fill or follow. It ends the wait unless it is idle, on the host the
+    /// check was last read on, and within [`BOT_CHECK_GAP`] of the gap's first read.
+    pub fn other(&mut self, url: &str, idle: bool, now: Instant) {
+        let same_host = self.held.as_ref().is_some_and(|wait| {
+            super::login_drive::https_host(&wait.url)
+                .is_some_and(|host| super::login_drive::https_host(url) == Some(host))
+        });
+        if idle && same_host {
+            self.unread(now);
+        } else {
+            self.held = None;
+        }
+    }
+
+    /// Notes a read at `now` that answered nothing (the page was replaced under it): part of
+    /// the gap ([`Self::other`]), which ends the wait once it outlasts [`BOT_CHECK_GAP`].
+    pub fn unread(&mut self, now: Instant) {
+        if let Some(wait) = &mut self.held {
+            let gap = *wait.gap.get_or_insert(now);
+            if now.saturating_duration_since(gap) >= BOT_CHECK_GAP {
+                self.held = None;
+            }
+        }
+    }
+
+    /// The URL the bot check standing at `now` was last read at, and how long one has stood;
+    /// `None` where none was read, or reads that are not one have since ended the wait or
+    /// outlasted [`BOT_CHECK_GAP`].
+    #[must_use]
+    pub fn held(&self, now: Instant) -> Option<(&str, Duration)> {
+        self.held
+            .as_ref()
+            .filter(|wait| {
+                wait.gap
+                    .is_none_or(|gap| now.saturating_duration_since(gap) < BOT_CHECK_GAP)
+            })
+            .map(|wait| (wait.url.as_str(), now.saturating_duration_since(wait.since)))
+    }
+}
 
 /// The page a vendor drive is waiting on, and since when it is unchanged. A page that shows
 /// nothing aterm presses or fills for [`VENDOR_STALL`] waits for a person (a sign-in through
-/// another provider, a phone number, a CAPTCHA), so the drive stops there, naming the page,
-/// instead of waiting out its whole budget; a device page already confirmed waits on the CLI,
-/// never on a person, and never stalls.
+/// another provider, a phone number), so the drive stops there, naming the page, instead of
+/// waiting out its whole budget; a device page already confirmed waits on the CLI, never on a
+/// person, and never stalls. Cloudflare's bot check ([`bot_check`]) is apart: it waits on no
+/// person, so it is timed from its first read however often it reloads itself (a gap of idle
+/// reads on its host shorter than [`BOT_CHECK_GAP`] included, [`BotCheckClock`]), and one that
+/// has not cleared within the stall ends the drive naming Cloudflare and the place
+/// ([`PageStall::note_bot_check`]).
 #[derive(Debug)]
 pub struct PageStall {
     seen: Option<(String, Instant)>,
+    /// The bot check being waited on.
+    bot: BotCheckClock,
     within: Duration,
 }
 
@@ -6843,11 +7855,42 @@ impl PageStall {
     /// [`VENDOR_STALL`]).
     #[must_use]
     pub fn within(within: Duration) -> PageStall {
-        PageStall { seen: None, within }
+        PageStall {
+            seen: None,
+            bot: BotCheckClock::default(),
+            within,
+        }
+    }
+
+    /// Notes that the drive decided `step` on `page` at `now`; `Some(why)` once pages that are
+    /// Cloudflare's bot check ([`bot_check`]), waited on, have stood for the stall
+    /// ([`bot_check_reason`]). A page between them that is not one ends that wait, unless it is
+    /// part of a gap of [`Step::Wait`] pages on the check's host with no button or input,
+    /// shorter than [`BOT_CHECK_GAP`] ([`BotCheckClock::other`]).
+    pub fn note_bot_check(&mut self, page: &Page, step: &Step, now: Instant) -> Option<String> {
+        let wait = matches!(step, Step::Wait);
+        if wait && bot_check(page) {
+            let held = self.bot.check(&page.url, now);
+            return (held >= self.within).then(|| bot_check_reason(&page.url, held));
+        }
+        let idle = wait && page.buttons.is_empty() && page.inputs.is_empty();
+        self.bot.other(&page.url, idle, now);
+        None
+    }
+
+    /// The reason a drive whose deadline came at `now` ends with, where a bot check it was
+    /// waiting on still stood ([`Self::note_bot_check`], [`BotCheckClock::held`]); `None`
+    /// otherwise.
+    #[must_use]
+    pub fn bot_check_held(&self, now: Instant) -> Option<String> {
+        self.bot
+            .held(now)
+            .map(|(url, held)| bot_check_reason(url, held))
     }
 
     /// Notes that the drive decided `step` on `page` at `now`; `Some(why)` once the same page
-    /// has asked nothing of aterm for its stall ([`VENDOR_STALL`]).
+    /// has asked nothing of aterm for its stall ([`VENDOR_STALL`]). Cloudflare's bot check is
+    /// never such a page ([`Self::note_bot_check`] times it).
     pub fn note(
         &mut self,
         page: &Page,
@@ -6855,7 +7898,7 @@ impl PageStall {
         gate: &Gate<'_>,
         now: Instant,
     ) -> Option<String> {
-        if !matches!(step, Step::Wait) || gate.confirmed {
+        if !matches!(step, Step::Wait) || gate.confirmed || bot_check(page) {
             self.seen = None;
             return None;
         }
@@ -6886,11 +7929,7 @@ impl PageStall {
 /// its heading, with the row's email, any other email and the CLI's code left out.
 #[must_use]
 pub fn page_place(page: &Page, gate: &Gate<'_>) -> String {
-    let url = page.url.split(['?', '#']).next().unwrap_or("");
-    let place = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
+    let place = url_place(&page.url);
     let mut heading = page.heading.clone();
     for email in emails_in(&page.heading) {
         heading = heading.replace(&email, "…");
@@ -6902,16 +7941,36 @@ pub fn page_place(page: &Page, gate: &Gate<'_>) -> String {
     }
     let heading = super::one_line(heading.trim(), 60);
     if heading.is_empty() {
-        format!("`{}`", super::one_line(place, 80))
+        place
     } else {
-        format!("`{}` (\"{heading}\")", super::one_line(place, 80))
+        format!("{place} (\"{heading}\")")
     }
+}
+
+/// How a vendor drive whose deadline came at `now` ends: [`super::login_drive::Approval::BotCheck`]
+/// where a bot check it waited on still stood ([`PageStall::bot_check_held`]), else not approved
+/// in time, last on `last_place`.
+fn vendor_out_of_time(
+    stall: &PageStall,
+    last_place: Option<&str>,
+    now: Instant,
+) -> super::login_drive::Approval {
+    use super::login_drive::Approval;
+    if let Some(why) = stall.bot_check_held(now) {
+        return Approval::BotCheck(why);
+    }
+    Approval::NeedsYou(match last_place {
+        Some(place) => format!("the sign-in page was not approved in time (last on {place})"),
+        None => "the sign-in page was not approved in time".to_owned(),
+    })
 }
 
 /// Drives one vendor sign-in page in `cdp` from `start` ([`vendor_step`] each tick) until the
 /// page approves it, `finished` says the CLI is done, or `deadline`; `mailbox` answers a
 /// [`Step::Mailbox`]. A page unchanged for [`VENDOR_STALL`] with nothing of aterm's on it ends
-/// it [`super::login_drive::Approval::NeedsSignIn`] ([`PageStall`]).
+/// it [`super::login_drive::Approval::NeedsSignIn`] ([`PageStall`]); Cloudflare's bot check
+/// that has not cleared within it, or when `deadline` comes, ends it
+/// [`super::login_drive::Approval::BotCheck`].
 pub fn drive_cdp_vendor(
     cdp: &mut CdpClient,
     start: &str,
@@ -7015,13 +8074,9 @@ pub(super) fn drive_cdp_vendor_within(
         if finished() {
             break Approval::Approved { page: page_proved };
         }
-        if Instant::now() >= deadline {
-            break Approval::NeedsYou(match &last_place {
-                Some(place) => {
-                    format!("the sign-in page was not approved in time (last on {place})")
-                }
-                None => "the sign-in page was not approved in time".to_owned(),
-            });
+        let now = Instant::now();
+        if now >= deadline {
+            break vendor_out_of_time(&stall, last_place.as_deref(), now);
         }
         let eval = cdp.call(
             Some(&session),
@@ -7032,6 +8087,7 @@ pub(super) fn drive_cdp_vendor_within(
         let page = match eval {
             Ok(eval) => page_of(eval.pointer("/result/value").unwrap_or(&Value::Null)),
             Err(_) => {
+                stall.bot.unread(now);
                 std::thread::sleep(VENDOR_TICK);
                 continue;
             }
@@ -7048,7 +8104,11 @@ pub(super) fn drive_cdp_vendor_within(
         }
         let step = vendor_step(&page, &view);
         last_place = Some(page_place(&page, &view));
-        if let Some(why) = stall.note(&page, &step, &view, Instant::now()) {
+        let now = Instant::now();
+        if let Some(why) = stall.note_bot_check(&page, &step, now) {
+            break Approval::BotCheck(why);
+        }
+        if let Some(why) = stall.note(&page, &step, &view, now) {
             break Approval::NeedsSignIn(why);
         }
         let value = match step {
@@ -7168,10 +8228,18 @@ pub struct VendorApprover {
     /// The profile's key where the row names no email.
     pub label_key: String,
     /// `aterm harness accounts browser <label> --cli <id>`, which a stop on the vendor's sign-in
-    /// page names.
-    pub sign_in_once: String,
+    /// page names; none where a renewal cannot approve the CLI's page headlessly
+    /// ([`crate::ai::connector::Cli::renews_headlessly`]: Grok Build's), since signing the
+    /// profile in does not get it past the vendor's block page.
+    pub sign_in_once: Option<String>,
     /// The mailbox, where one is configured for the row.
     pub mailbox: Option<MailboxConfig>,
+    /// Where none is because the row's `[[mailboxes]]` entry has no password yet, its words
+    /// ([`MailboxConfig::unready_words`]), said instead of "no mailbox is configured".
+    pub mailbox_unready: Option<&'static str>,
+    /// That entry's masked login ([`super::mailbox_routes::mask_login`]), for the ladder's
+    /// words (`mailbox(ab…@… has no password yet)`).
+    pub mailbox_unready_login: Option<String>,
     /// The vendor's sender words.
     pub senders: &'static [&'static str],
     /// `$HOME`, for the browser's location.
@@ -7193,18 +8261,27 @@ impl VendorApprover {
     ) -> VendorApprover {
         let label_key = vendor_label_key(cli, label);
         let senders = cli.accounts().mail_senders;
-        let mailbox = discover_mailbox_config(home, Some(shared_dir))
-            .map(|mut cfg| {
-                cfg.alias_label_to_email(Some(label), email);
-                cfg.senders = senders.iter().map(|s| (*s).to_owned()).collect();
-                cfg
-            })
-            .filter(|cfg| cfg.is_configured_for(email));
+        let found = discover_mailbox_config(home, Some(shared_dir)).map(|mut cfg| {
+            cfg.alias_label_to_email(Some(label), email);
+            cfg.senders = senders.iter().map(|s| (*s).to_owned()).collect();
+            cfg
+        });
+        let mailbox_unready = found.as_ref().and_then(|cfg| cfg.unready_words(email));
+        let mailbox_unready_login = found
+            .as_ref()
+            .and_then(|cfg| cfg.route_for(email))
+            .filter(|route| !route.ready())
+            .map(|route| route.masked());
+        let mailbox = found.filter(|cfg| cfg.is_configured_for(email));
         VendorApprover {
             shared_dir: shared_dir.to_path_buf(),
             label_key,
-            sign_in_once: format!("aterm harness accounts browser {label} --cli {}", cli.id()),
+            sign_in_once: cli
+                .renews_headlessly()
+                .then(|| format!("aterm harness accounts browser {label} --cli {}", cli.id())),
             mailbox,
+            mailbox_unready,
+            mailbox_unready_login,
             senders,
             home: home.map(Path::to_path_buf),
             types_email: cli
@@ -7259,7 +8336,10 @@ impl super::login_drive::Approver for VendorApprover {
             cfg
         });
         let senders = self.senders;
-        let sign_in_once = self.sign_in_once.as_str();
+        let no_mailbox = self
+            .mailbox_unready
+            .unwrap_or("the page asks for the sign-in mail, and no mailbox is configured");
+        let sign_in_once = self.sign_in_once.as_deref();
         let types_email = self.types_email;
         let ran = in_profile(&profile_dir, |profile_dir| {
             let (cmd_read, cmd_write) =
@@ -7296,7 +8376,7 @@ impl super::login_drive::Approver for VendorApprover {
                 filled_email: false,
                 filled_otp: false,
                 bound: Some(&bound),
-                sign_in_once: Some(sign_in_once),
+                sign_in_once,
                 types_email,
             };
             outcome = drive_cdp_vendor(
@@ -7306,9 +8386,7 @@ impl super::login_drive::Approver for VendorApprover {
                 handoff.finished,
                 handoff.deadline,
                 |cdp_inner, em| {
-                    let mb = mailbox.as_ref().ok_or(
-                        "the page asks for the sign-in mail, and no mailbox is configured",
-                    )?;
+                    let mb = mailbox.as_ref().ok_or(no_mailbox)?;
                     poll_mailbox_or_webmail_for_credential(
                         cdp_inner,
                         mb,

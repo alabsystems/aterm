@@ -359,6 +359,29 @@ pub(crate) enum QuitBarrier {
     Refused,
 }
 
+/// What a window close ends, as its close gate weighs it: the terminals the
+/// window holds, those of them running a job only this window shows (with which
+/// job, [`SessionJob`]), and whether it is the last window. An armed document
+/// close remembers it from when the close was asked
+/// ([`App::window_close_consent_holds`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WindowCloseConsent {
+    sessions: std::collections::BTreeSet<u64>,
+    busy: std::collections::BTreeMap<u64, SessionJob>,
+    exits_app: bool,
+}
+
+/// Which job a busy terminal runs, as far as aterm can tell one job from the
+/// next: the PTY's foreground process group (unix) and how many commands the
+/// shell's integration has reported finished. A job that ends and another that
+/// starts moves one of them; where neither moves (no process group and no shell
+/// integration), the two are not told apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SessionJob {
+    foreground_group: i32,
+    finished_commands: u64,
+}
+
 impl App {
     /// Coalesce a destructive request behind the live overlap handoff and ask its worker to abort.
     #[cfg(unix)]
@@ -397,6 +420,32 @@ impl App {
         _intent: crate::DeferredHandoffTeardown,
     ) -> bool {
         false
+    }
+
+    /// The windows whose close a pending update handoff holds and replays
+    /// once it stands down: each counts as gone when another close is weighed.
+    #[cfg(unix)]
+    pub(crate) fn windows_closing_behind_handoff(&self) -> Vec<WindowId> {
+        match self
+            .pending_update_handoff
+            .as_ref()
+            .map(|pending| &pending.teardown)
+        {
+            Some(crate::DeferredHandoffTeardown::Mutations(mutations)) => mutations
+                .keys()
+                .filter_map(|mutation| match mutation {
+                    crate::DeferredHandoffMutation::CloseWindow(window) => Some(*window),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// No overlap handoff exists off unix, so no close waits behind one.
+    #[cfg(not(unix))]
+    pub(crate) fn windows_closing_behind_handoff(&self) -> Vec<WindowId> {
+        Vec::new()
     }
 
     /// The frontmost logical window's state.
@@ -1712,6 +1761,10 @@ impl App {
             }
         }
         self.windows.remove(&wid);
+        // A document close still armed for `wid` (a failed save left it, then a
+        // tab move emptied the window) must not outlive it: its documents may be
+        // open in another window now.
+        self.disarm_window_document_shutdown(wid);
         self.find_origins.retain(|(_, entry), _| *entry != wid);
         self._toolbars.remove(&wid);
         #[cfg(target_os = "macos")]
@@ -1774,30 +1827,37 @@ impl App {
 
     /// Close window `wid` and exit the app iff it was the last window.
     pub(crate) fn close_window(&mut self, el: &ActiveEventLoop, wid: WindowId) {
+        if matches!(self.close_window_through_barriers(wid), CloseOutcome::Exit) {
+            el.exit();
+        }
+    }
+
+    /// [`Self::close_window`] up to the exit: the handoff deferral, then the
+    /// native and document barriers, then the logical close, answering
+    /// whether it closed the last window.
+    pub(crate) fn close_window_through_barriers(&mut self, wid: WindowId) -> CloseOutcome {
         if self.defer_pending_update_handoff_teardown(crate::DeferredHandoffTeardown::mutation(
             crate::DeferredHandoffMutation::CloseWindow(wid),
         )) {
-            return;
+            return CloseOutcome::Stay;
         }
         match self.prepare_window_native_shutdown(wid, crate::native_app::CloseScope::Window) {
             Ok(true) => {}
-            Ok(false) => return,
+            Ok(false) => return CloseOutcome::Stay,
             Err(error) => {
                 aterm_log::warn!("window native close barrier: {error}");
-                return;
+                return CloseOutcome::Stay;
             }
         }
         match self.prepare_window_document_shutdown(wid) {
             Ok(true) => {}
-            Ok(false) => return,
+            Ok(false) => return CloseOutcome::Stay,
             Err(error) => {
                 aterm_log::warn!("window document close barrier: {error}");
-                return;
+                return CloseOutcome::Stay;
             }
         }
-        if matches!(self.close_window_logical(wid), CloseOutcome::Exit) {
-            el.exit();
-        }
+        self.close_window_logical(wid)
     }
 
     /// Re-read the frame window `wid` must draw itself ([`crate::client_frame`]) from its OS window.
@@ -1926,6 +1986,81 @@ impl App {
         ids.dedup();
         ids.into_iter().any(|id| {
             self.window_drops_last_session_view(wid, id) && self.session_foreground_busy(id)
+        })
+    }
+
+    /// What closing `wid` would end now.
+    pub(crate) fn window_close_consent(&self, wid: WindowId) -> WindowCloseConsent {
+        self.window_close_consent_after(wid, &[])
+    }
+
+    /// What closing `wid` would end once the windows in `gone` have closed too.
+    fn window_close_consent_after(&self, wid: WindowId, gone: &[WindowId]) -> WindowCloseConsent {
+        let local = self.window_terminal_sessions(wid);
+        let sessions = local
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let views_in = |window: WindowId, session: u64| {
+            self.window_terminal_sessions(window)
+                .into_iter()
+                .filter(|candidate| *candidate == session)
+                .count() as u32
+        };
+        let busy = sessions
+            .iter()
+            .copied()
+            .filter(|id| {
+                let local_views = local.iter().filter(|candidate| *candidate == id).count() as u32;
+                let gone_views = gone
+                    .iter()
+                    .filter(|window| **window != wid)
+                    .map(|window| views_in(*window, *id))
+                    .sum::<u32>();
+                let drops_last = self
+                    .pool
+                    .views(*id)
+                    .is_some_and(|all_views| all_views.saturating_sub(gone_views) <= local_views);
+                drops_last && self.session_foreground_busy(*id)
+            })
+            .filter_map(|id| Some((id, self.session_job(id)?)))
+            .collect();
+        WindowCloseConsent {
+            sessions,
+            busy,
+            exits_app: !self
+                .windows
+                .keys()
+                .any(|window| *window != wid && !gone.contains(window)),
+        }
+    }
+
+    /// Whether closing `wid` now, once the windows in `gone` have closed,
+    /// ends nothing beyond `asked`: no terminal the window gained, no job that
+    /// was not running when the close was asked, and not the app unless the
+    /// window was already the last one.
+    pub(crate) fn window_close_consent_holds(
+        &self,
+        wid: WindowId,
+        asked: &WindowCloseConsent,
+        gone: &[WindowId],
+    ) -> bool {
+        let now = self.window_close_consent_after(wid, gone);
+        now.sessions.is_subset(&asked.sessions)
+            && now
+                .busy
+                .iter()
+                .all(|(session, job)| asked.busy.get(session) == Some(job))
+            && (!now.exits_app || asked.exits_app)
+    }
+
+    /// The job session `id` runs ([`SessionJob`]).
+    fn session_job(&self, id: u64) -> Option<SessionJob> {
+        let session = self.pool.get(id)?;
+        let finished_commands = crate::term_lock(&session.term).completed_command_seq();
+        Some(SessionJob {
+            foreground_group: crate::quit_safety::foreground_pgrp(session.master),
+            finished_commands,
         })
     }
 
@@ -2280,8 +2415,14 @@ impl App {
         self.confirm_destructive_gesture(wid, false, true, replay)
     }
 
+    /// Whether closing `wid` leaves no window: the windows a pending update
+    /// handoff will close when it replays count as gone already.
     fn exits_app_when_closing(&self, wid: WindowId) -> bool {
-        !self.windows.keys().any(|w| *w != wid)
+        let closing = self.windows_closing_behind_handoff();
+        !self
+            .windows
+            .keys()
+            .any(|w| *w != wid && !closing.contains(w))
     }
 
     /// Quit-safety for CloseRequested (close button / Window ▸ Close).

@@ -20,9 +20,11 @@ pub(crate) enum Drawn {
     NoRoom,
     /// The last frame fitted the pane's rule, and no harness host drew a chip there.
     NoHost,
-    /// The program has no composer footer to draw a chip in.
+    /// The program has no composer line to draw a chip in ([`crate::claude_footer::chip_line`]).
     NoFooter,
-    /// The last frame drew only the pane's harness switch over a footer [`crate::claude_footer::bare_while_off`] leaves bare.
+    /// The last frame drew only the pane's harness switch: over a footer
+    /// [`crate::claude_footer::bare_while_off`] leaves bare, or on a top line whose chip stands
+    /// down ([`crate::claude_footer::chip_stands_down`]).
     SwitchOnly,
 }
 
@@ -133,7 +135,8 @@ impl WindowLights {
             } else if self.border_toggles.iter().any(|b| {
                 b.session == session
                     && !covered(b.term_row)
-                    && crate::claude_footer::bare_while_off(Some(b.program), Some(b.face))
+                    && (crate::claude_footer::bare_while_off(Some(b.program), Some(b.face))
+                        || b.chip_down)
             }) {
                 Drawn::SwitchOnly
             } else {
@@ -232,7 +235,12 @@ impl App {
                         .agent()
                         .program
                         .clone();
-                    if !crate::claude_footer::drawn_for(published.as_deref()) {
+                    if published
+                        .as_deref()
+                        .and_then(aterm_phase::program_of)
+                        .and_then(crate::claude_footer::chip_line)
+                        .is_none()
+                    {
                         lines.push(drawn_chip_line(
                             sid,
                             wid.0,

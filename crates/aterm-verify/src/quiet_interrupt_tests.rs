@@ -130,6 +130,7 @@ fn standin_run_waits_for_the_quiet_machine() {
         Seams {
             stage,
             admit_quiet: admit_in_scratch,
+            admit_memory: admit_in_scratch,
         },
     )
     .expect("the result written");

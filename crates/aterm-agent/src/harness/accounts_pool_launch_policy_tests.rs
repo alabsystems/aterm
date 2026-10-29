@@ -31,23 +31,24 @@ fn prepared_launch_refuses_a_login_renewed_in_the_same_directory() {
                 std::fs::write(world.cfg.join("aterm.toml"), "[harness]\naccounts='off'\n")
                     .unwrap();
             }
-            let result = super::super::launch_env_using(&world.seat(), cli, &no_usage, |row| {
-                let env = login_env(cli, row, &world.home)?;
-                store
-                    .transact_logins(NOW - MIN, &mut None, |state, logins| {
-                        Ok(accounts::note_renewed(
-                            state,
-                            logins,
-                            "work",
-                            work.to_str(),
-                            work.to_str().unwrap(),
-                            None,
-                            NOW - MIN,
-                        ))
-                    })
-                    .unwrap();
-                Ok(env)
-            });
+            let result =
+                super::super::launch_env_using(&world.seat(), cli, &no_usage, None, |row| {
+                    let env = login_env(cli, row, &world.home)?;
+                    store
+                        .transact_logins(NOW - MIN, &mut None, |state, logins| {
+                            Ok(accounts::note_renewed(
+                                state,
+                                logins,
+                                "work",
+                                work.to_str(),
+                                work.to_str().unwrap(),
+                                None,
+                                NOW - MIN,
+                            ))
+                        })
+                        .unwrap();
+                    Ok(env)
+                });
             assert!(result.is_err(), "{cli:?}, off={off}: {result:?}");
         }
     }
@@ -118,7 +119,7 @@ fn run_case(cli: Cli, off: bool, case: i64) -> (bool, bool) {
         now: NOW + 2,
         ..world.seat()
     };
-    let result = super::super::launch_env_using(&seat, cli, &no_usage, |row| {
+    let result = super::super::launch_env_using(&seat, cli, &no_usage, None, |row| {
         assert_eq!(row.label, "work");
         let env = login_env(cli, row, &world.home)?;
         prepared = Some(env.clone());
@@ -360,19 +361,33 @@ fn launch_policy_conforms_for_automatic_and_pinned_launches() {
     let model = aterm_models_harness::account_pool_launch_policy_model();
     assert_eq!(model.mutant_dials(), (1..=29).collect::<Vec<_>>());
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
-    let mut checked = 0;
-    for state in aterm_spec::interp::reachable_states(&model) {
+    let states = aterm_spec::interp::reachable_states(&model);
+    let mut steps = Vec::new();
+    for state in &states {
         for action in &model.actions {
-            if model.action_enabled(action.name, &state) {
-                let next = launch_transition(&state, action.name);
-                assert!(
-                    model.successors(action.name, &state).contains(&next),
-                    "{}: {state:?} -> {next:?}",
-                    action.name
-                );
-                checked += usize::from(action.name == "Finish");
+            if model.action_enabled(action.name, state) {
+                steps.push((state, action.name));
             }
         }
+    }
+    // Each Finish builds a World of its own (temp dir, store, lock file), so the steps run side by
+    // side on as many workers as the kernel serves file system calls fastest for
+    // (`aterm_spec::fs_lane::PLACES`; the lane counts libtest's test threads, not these): case 18's
+    // six held-lock launches wait out LOCK_LADDER that many at a time, not in turn. The
+    // thread-local seams on the launch path (an `aterm_spec::xref::StepEvidence` window,
+    // `aterm_durable::seam::Recording`, `FailingDirs`) are unset here, as on each worker thread;
+    // one opened here would not reach the steps.
+    let nexts =
+        aterm_spec::check::each_on(aterm_spec::fs_lane::PLACES, &steps, |&(state, action)| {
+            launch_transition(state, action)
+        });
+    let mut checked = 0;
+    for (&(state, action), next) in steps.iter().zip(&nexts) {
+        assert!(
+            model.successors(action, state).contains(next),
+            "{action}: {state:?} -> {next:?}"
+        );
+        checked += usize::from(action == "Finish");
     }
     assert_eq!(checked, 3 * 2 * 27);
     let mut stale = model.init_state();
@@ -401,7 +416,7 @@ fn final_launch_check_preserves_failed_overlay_exclusions() {
             });
         });
         let mut prepared = Vec::new();
-        let result = super::super::launch_env_using(&world.seat(), cli, &no_usage, |row| {
+        let result = super::super::launch_env_using(&world.seat(), cli, &no_usage, None, |row| {
             prepared.push(row.label.clone());
             if row.label == "work" {
                 return Err(io::Error::other("overlay unavailable"));

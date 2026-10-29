@@ -29,9 +29,10 @@ use super::policy::reset::{
 };
 use super::policy::sleeps::{FirstLook, SleepBook, SleepStamp};
 use super::policy::turn_end::{
-    AccountAdvice, AccountBad, AccountPoint, FirstRead, ModelSwitch, ProbeGate, RULE_API_BACK,
-    RULE_API_CUTOFF, RULE_API_RETRY, RULE_LIMIT_RESUME, RULE_OUTAGE_RESUME, Reach, TurnEndAction,
-    TurnEndReading, TurnEndState, TurnEndTiming, WaitKind, is_continue_rule, said_mark,
+    AccountAdvice, AccountBad, AccountPoint, AgentResumed, FirstRead, ModelSwitch, ProbeGate,
+    RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY, RULE_LIMIT_RESUME, RULE_OUTAGE_RESUME, Reach,
+    TurnEndAction, TurnEndReading, TurnEndState, TurnEndTiming, WaitKind, is_continue_rule,
+    said_mark,
 };
 use super::prompt::{
     CancelEffect, Prompt, PromptKind, PromptV2, parse_prompt, prompt_box_first_row, prompt_box_span,
@@ -3182,6 +3183,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             rows,
             generation: screen.generation.clone(),
             launch: screen.launch.clone(),
+            title: screen.title.clone(),
             ..screen
         });
         Ok(screen)
@@ -4328,6 +4330,25 @@ impl<'a, C: Ctl> Session<'a, C> {
         };
         let body = books.as_deref().unwrap_or(body);
         self.seed_sleep(body, now_ms);
+        // Cruise's ladder at background breaks, replayed where it is still a ladder: carries
+        // before the agent's launch are another program's, and a lift off Off starts it again.
+        let mut carries = approvals::background_carries_in(body, self.setup.sid.as_deref());
+        if !carries.is_empty()
+            && let Some(launch) = self.stall_host.as_ref().and_then(|host| host.launch())
+        {
+            carries.retain(|&ts| ts >= launch);
+        }
+        if !lifted_off
+            && let Some((last_ms, streak)) =
+                super::policy::cruise_carry::BackgroundCarries::replayed(
+                    &self.turn_end.timing,
+                    &carries,
+                    now_ms,
+                )
+        {
+            let ago = Duration::from_millis(u64::try_from(now_ms - last_ms).unwrap_or(0));
+            self.cruise_carry.seed(ago, streak, self.fx.mono());
+        }
         let typed = approvals::typed_at_in(body, self.setup.sid.as_deref());
         let ages: Vec<Duration> = typed
             .iter()
@@ -4343,6 +4364,13 @@ impl<'a, C: Ctl> Session<'a, C> {
             self.turn_end.seed_carry_over();
         }
         let streak = approvals::short_streak_in(body, self.setup.sid.as_deref());
+        if streak.as_ref().is_some_and(|s| s.recorded) || !typed.is_empty() {
+            // The session worked under a loop before this one, a point it recorded or an act it
+            // typed (a turn-ran row alone is a turn no point judged yet, such as the opening one
+            // a restart cut): a person's message is not the one that opens it
+            // ([`TurnEndState::seed_worked`]).
+            self.turn_end.seed_worked();
+        }
         let since = streak
             .as_ref()
             .filter(|s| s.recorded && s.point)
@@ -4447,7 +4475,19 @@ impl<'a, C: Ctl> Session<'a, C> {
         if let Some(key) = older.and_then(|j| journaled_left(j, self.setup.sid.as_deref()))
             && !left_keys.contains(&key)
         {
+            // An older journal's: work before it is an act typed before it, or a point judged
+            // before the one it left (two points by its time).
+            let at = approvals::parse_left_before(&key).and_then(|t| i64::try_from(t).ok());
+            if at.is_some_and(|at| {
+                typed.iter().any(|&ts| ts < at)
+                    || older_reads.points.iter().filter(|(t, _)| *t <= at).count() >= 2
+            }) {
+                self.turn_end.seed_left_after_work();
+            }
             left_keys.push(key);
+        }
+        if approvals::left_after_work_in(body, self.setup.sid.as_deref()) {
+            self.turn_end.seed_left_after_work();
         }
         self.left_keys = left_keys;
         seed_usage_act_in(
@@ -4568,14 +4608,39 @@ impl<'a, C: Ctl> Session<'a, C> {
             _ => opts,
         };
         let end = self.drive_loop(opts, review);
+        self.loop_ended(&end, opts, review);
+        end
+    }
+
+    /// What the loop's end `end` leaves booked: the stuck episode and the exception closed, a
+    /// line left in the composer released where the session went (its composer went with it, a
+    /// wake's claim given back), the hold's end row where it lives on, the untold lines and the
+    /// act marks.
+    ///
+    /// Where the session lives on, a line left stays left, a wake's claim kept: the loop makes
+    /// no read at its end, and the line may still stand or may have gone, so releasing it unseen
+    /// could have a successor, or the agent's own `await wake`, tell it a second time. The
+    /// successor that seeds it (`FactsState::seed_left`) settles it at its first look that finds
+    /// the composer clear (told, since it cannot weigh this loop's count) or the session gone
+    /// (released). Until a loop looks the claim stands, and an `await wake` hears nothing of that
+    /// wake (the slice-2 plan's 2.9b, decided under its safety lens: one tell lost at most, never
+    /// a second).
+    fn loop_ended(
+        &mut self,
+        end: &Result<End, String>,
+        opts: &SuperviseOpts,
+        review: &mut dyn Review,
+    ) {
         self.stuck_over(0, "the loop ended", review);
         self.exception_ended(0, Some("the loop ended"), review);
-        if !session_gone(&end) {
+        if session_gone(end) {
+            let gone = super::facts::LeftLook::Gone;
+            self.left_look(gone, None, 0, Some(&opts.policy), Some(&mut *review));
+        } else {
             self.hold_left(Some(&opts.policy), review);
         }
         self.occupancy_untold();
         self.send_act_marks();
-        end
     }
 
     pub(super) fn send_act_marks(&mut self) {
@@ -4906,7 +4971,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             self.woken = None;
             self.retry_seen = None;
             let turn_end = if review.unattended() {
-                let action = self.turn_end_at_point(&point, busy_for, opts)?;
+                let action = self.turn_end_looked(&point, busy_for, opts, review)?;
                 let folded = self.task_edge_at_fold(&point.screen, opts, review);
                 self.said_before_fail(&point, folded, review)?;
                 action
@@ -5401,6 +5466,9 @@ impl<'a, C: Ctl> Session<'a, C> {
             self.probing = false;
             match probe {
                 Ok(_) => {
+                    // The host back may be another process, counting its submits from 0: no
+                    // line left before keeps a count a look may weigh.
+                    self.facts.state.recount();
                     let fresh = self
                         .outage
                         .as_mut()
@@ -5704,6 +5772,10 @@ impl<C: Ctl> Session<'_, C> {
         deadline: &mut Instant,
         review: &mut dyn Review,
     ) -> Result<Option<End>, Fail> {
+        // The acts this look queued are the log's before it waits (fix E3, E2E-3): a box
+        // handed to the person blocks the wait until it leaves, so `drive_loop`'s flush after
+        // the look would write the escalate act at the answer, not when the harness acted.
+        self.send_act_marks();
         let anchor = (seen.phase == Phase::Prompt)
             .then(|| box_anchor(self.reader(&seen.screen.rows), &seen.screen.rows))
             .flatten();
@@ -5797,6 +5869,10 @@ impl<C: Ctl> Session<'_, C> {
                 .idle_host
                 .as_ref()
                 .and_then(|h| h.wants_at())
+                .filter(|at| *at > now)
+                .map_or(step_cap, |at| step_cap.min(at - now));
+            let step_cap = self
+                .reach_wake(opts)
                 .filter(|at| *at > now)
                 .map_or(step_cap, |at| step_cap.min(at - now));
             let step_cap = self.settling().map_or(step_cap, |at| {
@@ -6110,6 +6186,14 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
+    /// Whether the host's peek at the API's reach ([`IdleHost::reach_peek`], which takes no
+    /// lease) says Down now; never in a replay whose recording build had no `host.reach_peek`
+    /// door, which peeks nothing.
+    pub(super) fn peeks_down(&self, host: &dyn IdleHost) -> bool {
+        !self.fx.replay_lacks_host_door("host.reach_peek")
+            && matches!(host.reach_peek(), Reach::Down { .. })
+    }
+
     fn reach_edge(&mut self, opts: &SuperviseOpts) -> bool {
         let Some(seen) = self.reach_seen else {
             return false;
@@ -6126,6 +6210,21 @@ impl<C: Ctl> Session<'_, C> {
         }
         self.reach_seen = Some(now);
         true
+    }
+
+    /// When the host's next measure of the reach can land ([`IdleHost::reach_at`]), while
+    /// [`Self::reach_edge`] would act on it: the reach was asked at this point and a turn end is
+    /// due. The wait's step ends by then, so a measured Up is met within one step of landing,
+    /// not at the next [`WAIT_STEP`]. A replay whose recording build had no `host.reach_at`
+    /// door asks nothing here, so its steps stay as recorded.
+    fn reach_wake(&self, opts: &SuperviseOpts) -> Option<Instant> {
+        if self.reach_seen.is_none()
+            || self.turn_end_due.is_none()
+            || self.fx.replay_lacks_host_door("host.reach_at")
+        {
+            return None;
+        }
+        opts.idle_host.as_ref()?.reach_at()
     }
 
     pub(super) fn account_edge(&mut self, opts: &SuperviseOpts) -> bool {
@@ -6388,6 +6487,7 @@ impl<C: Ctl> Session<'_, C> {
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
         let reader = self.reader(&screen.rows);
+        self.cruise_carry.read(reader, screen, || self.fx.mono());
         let carried = self.transcript_wait_seq == Some(screen.seq);
         let unfit = if carried {
             None
@@ -6443,12 +6543,20 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(());
         }
         self.turn_end.fact_answered();
-        self.cruise_carry.at_break();
+        // The break's read is a look at any line left in the composer, before any door's line.
+        self.left_look_at(
+            screen,
+            occupancy_loop::LookAt::Break,
+            cfg,
+            Some(&mut *review),
+        );
         let at = *since.get_or_insert_with(|| self.fx.mono());
         let Some(host) = host.filter(|h| h.wants()) else {
             self.withheld = None;
             let waited = self.fx.since(at);
             let settled = waited >= self.setup.background_settle;
+            self.cruise_carry
+                .at_break(&self.turn_end.timing, screen, at, settled);
             if settled {
                 self.say_hold(screen.seq, Some(HoldSaid::NoHostStep), review);
             }
@@ -6478,6 +6586,8 @@ impl<C: Ctl> Session<'_, C> {
         };
         let waited = self.fx.since(at);
         let settled = waited >= self.setup.background_settle;
+        self.cruise_carry
+            .at_break(&self.turn_end.timing, screen, at, settled);
         self.hold_background(screen, at, waited, settled, cfg, review);
         let held = if !settled {
             Some(Guard::Settle)

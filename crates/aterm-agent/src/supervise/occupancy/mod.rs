@@ -10,6 +10,8 @@ mod door_environment;
 pub mod due;
 pub mod fact_word;
 pub mod hold;
+#[cfg(any(test, debug_assertions))]
+mod left_environment;
 pub mod reading;
 pub mod replay;
 pub mod ring;
@@ -36,6 +38,8 @@ pub use wakes_seen::{WakeClaim, WakeDoor, WakeFacts, WakeSeen, WakesSeen};
 
 #[cfg(any(test, debug_assertions))]
 pub use door_environment::occupancy_door_environment;
+#[cfg(any(test, debug_assertions))]
+pub use left_environment::left_write_environment;
 #[cfg(any(test, debug_assertions))]
 pub use wakes_environment::wake_book_environment;
 
@@ -156,6 +160,48 @@ pub mod fault {
         /// The wake's line carries words the agent wrote beside its template's closed words: its
         /// last words on the screen, where the label it declared shows.
         TemplateEchoesLabel,
+        /// An idle point's act carries the wake's fact whatever the host's claim answered (the
+        /// slice-2 plan's 2.9): a wake the agent's own `await wake` told rides again.
+        RideWithoutClaim,
+        /// A line left in the composer (`Written::Left`) is booked untold and its claim given back
+        /// at its write, as every door did before the slice-2 plan's 2.9b: the draft it leaves
+        /// goes out with no told row. Planted in the account
+        /// ([`FactsState::leave`](crate::supervise::facts::FactsState::leave) keeps nothing) and
+        /// in a successor's reconcile (`wakes::reconcile_claim` releases a claim whose last row
+        /// says left).
+        ReleaseOnLeft,
+        /// [`FactsState::look`](crate::supervise::facts::FactsState::look) keeps a left line whose
+        /// composer it sees clear and unsent: its claim never comes back.
+        LeftNeverSettles,
+        /// [`FactsState::look`](crate::supervise::facts::FactsState::look) books a left line told
+        /// though its composer was cleared unsent.
+        ToldOnClear,
+        /// [`FactsState::draft_may_go`](crate::supervise::facts::FactsState::draft_may_go) lets the
+        /// policy's draft step send a line `prompt` left once `prompt` is no longer in force.
+        SubmitWithoutPrompt,
+        /// [`FactsState::look`](crate::supervise::facts::FactsState::look) weighs a count it may
+        /// not (a loop's before this one, one from before an outage, or one that went back): a
+        /// line the person sent under another host process is released, and typed again.
+        ReleaseUncounted,
+        /// The left line's settle tells the host the line (`IdleHost::inform`) whatever grant
+        /// is in force at the look: a line `prompt` left is raised under `observe`.
+        InformUngranted,
+        /// A wake's left line told at a look books no wake in the door's books
+        /// (`Books::woke`): the next wake goes within the session's pace.
+        ToldWakeUnpaced,
+        /// A break's left line told at a break's look is not kept as the harness's turn
+        /// (`TurnEndState::fact_typed`): the agent's answer to it reads as its own turn.
+        ToldLineUntaken,
+        /// A rule's or the stuck line left and told at a break's look is not the hold's
+        /// harness line (`HoldEvent::HarnessLine`): the point that ends its answer closes the
+        /// hold.
+        ToldLineUnanswered,
+        /// The stuck line left in the composer is not the break's one line: the nudges' door
+        /// writes at that break too.
+        StuckLeftNotTheLine,
+        /// A look reads the composer under a box drawn over it (`Session::left_seen`): the
+        /// box's read settles the line it hides.
+        BoxedComposerRead,
     }
 
     thread_local! {
@@ -229,6 +275,18 @@ pub(crate) mod fault {
         WakeToldKept,
         HostBeforeWake,
         TemplateEchoesLabel,
+        RideWithoutClaim,
+        ReleaseOnLeft,
+        LeftNeverSettles,
+        ToldOnClear,
+        SubmitWithoutPrompt,
+        ReleaseUncounted,
+        InformUngranted,
+        ToldWakeUnpaced,
+        ToldLineUntaken,
+        ToldLineUnanswered,
+        StuckLeftNotTheLine,
+        BoxedComposerRead,
     }
 
     /// The shipped build: never armed.

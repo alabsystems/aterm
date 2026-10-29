@@ -2337,16 +2337,16 @@ fn github_refusal_summary(response: &[u8]) -> Option<String> {
     }
 }
 
-fn release_post_failure_detail(out: &RunOut, posted_body_len: usize) -> String {
+fn release_post_failure_detail(out: &RunOut, posted_body_chars: usize) -> String {
     let mut detail = out.stderr_utf8().trim().to_string();
     if http_status_from_curl_failure(&out.stderr_utf8()) == Some(HTTP_UNPROCESSABLE_CONTENT) {
         let limit = changelog::GITHUB_RELEASE_BODY_LIMIT;
         detail.push_str(&format!(
             " — {HTTP_UNPROCESSABLE_CONTENT} is GitHub understanding the request and refusing \
-             its CONTENT. The release body this POST carried was {posted_body_len} bytes against \
-             the {limit}-character release-body limit, which is "
+             its CONTENT. The release body this POST carried was {posted_body_chars} characters \
+             against the {limit}-character release-body limit, which is "
         ));
-        if posted_body_len > limit {
+        if posted_body_chars > limit {
             detail.push_str(
                 "OVER IT — that is this refusal, and nothing else needs investigating until \
                  the body fits",
@@ -2362,6 +2362,10 @@ fn release_post_failure_detail(out: &RunOut, posted_body_len: usize) -> String {
         detail.push_str(&format!(" — GitHub said: {said}"));
     }
     detail
+}
+
+fn release_body_post_failure_detail(out: &RunOut, body: &ReleaseBody) -> String {
+    release_post_failure_detail(out, changelog::github_length(body))
 }
 
 fn release_body_for_post(label: &str, path: &Path) -> Result<ReleaseBody> {
@@ -2700,7 +2704,7 @@ pub fn channel_signature_policy(
     let Some(material) = material_pubkey else {
         return Err(Error::new(
             "no signing material, and the release channel takes only a rostered machine's \
-             key: cut with --release-credentials ~/.aterm/release-credentials.toml (`targo \
+             key: cut with --release-credentials ~/.aterm/release-ring/release-credentials.toml (`targo \
              --unverified ship provision --id <id>` writes it)",
         ));
     };
@@ -8649,7 +8653,6 @@ fn prove_channel_assets_download_anonymously(ctx: &CutCtx, slug: &str) -> Result
 
 fn create_channel_draft(ctx: &mut CutCtx, slug: &str) -> Result<ReleaseObjectIdentity> {
     let notes = release_body_for_post("publish", &ctx.notes_path())?;
-    let posted_body_len = notes.len();
     let title = format!("aterm {}", ctx.version);
     let payload = release_create_payload(ctx.tag.as_str(), &title, &notes)?;
     let post = OneShotPost::prepare_json(&format!("repos/{slug}/releases"), &payload)?;
@@ -8671,7 +8674,7 @@ fn create_channel_draft(ctx: &mut CutCtx, slug: &str) -> Result<ReleaseObjectIde
             "release create for {} was REFUSED by {slug} ({}); nothing was created, so the \
              release intent has been released and `--resume` may post once more.",
             ctx.tag,
-            release_post_failure_detail(&out, posted_body_len)
+            release_body_post_failure_detail(&out, &notes)
         )));
     }
     Err(Error::new(format!(
@@ -8679,7 +8682,7 @@ fn create_channel_draft(ctx: &mut CutCtx, slug: &str) -> Result<ReleaseObjectIde
          {slug}; refusing an ambiguous retry in this invocation (resume after GitHub \
          converges): {}",
         ctx.tag,
-        release_post_failure_detail(&out, posted_body_len)
+        release_body_post_failure_detail(&out, &notes)
     )))
 }
 
@@ -8937,17 +8940,19 @@ mod release_body_post_tests {
 
     #[test]
     fn an_oversized_notes_file_on_disk_is_bounded_at_the_post() {
-        let oversized = "### Section\n\n- an entry long enough to matter\n\n".repeat(6000);
+        let oversized =
+            "### Section\n\n- an entry — with em dashes — long enough to matter\n\n".repeat(4000);
         assert!(
-            oversized.len() > changelog::GITHUB_RELEASE_BODY_LIMIT,
-            "fixture must actually overflow: {} bytes",
-            oversized.len()
+            changelog::github_length(&oversized) > changelog::GITHUB_RELEASE_BODY_LIMIT,
+            "fixture must actually overflow: {} UTF-16 units",
+            changelog::github_length(&oversized)
         );
         let (_dir, path) = notes_file("oversized", &oversized);
         let posted = release_body_for_post("draft", &path).expect("read notes");
         assert!(
-            posted.len() <= changelog::GITHUB_RELEASE_BODY_LIMIT,
-            "the POST would carry {} bytes, over the {} GitHub takes",
+            changelog::github_length(&posted) <= changelog::GITHUB_RELEASE_BODY_LIMIT,
+            "the POST would carry {} UTF-16 units ({} bytes), over the {} GitHub takes",
+            changelog::github_length(&posted),
             posted.len(),
             changelog::GITHUB_RELEASE_BODY_LIMIT
         );
@@ -8966,6 +8971,29 @@ mod release_body_post_tests {
             fs::read_to_string(&path).expect("re-read fixture").len(),
             oversized.len()
         );
+    }
+
+    #[test]
+    fn a_422_post_failure_judges_body_length_in_utf16_characters_not_utf8_bytes() {
+        let out = RunOut {
+            status: CURL_EXIT_HTTP_ERROR,
+            stdout: br#"{"message":"Validation Failed"}"#.to_vec(),
+            stderr: b"curl: (22) The requested URL returned error: 422\n".to_vec(),
+        };
+        let within = ReleaseBody("—".repeat(changelog::GITHUB_RELEASE_BODY_LIMIT));
+        assert!(
+            within.len() > changelog::GITHUB_RELEASE_BODY_LIMIT,
+            "UTF-8 bytes ({}) exceed the UTF-16 limit ({})",
+            within.len(),
+            changelog::GITHUB_RELEASE_BODY_LIMIT
+        );
+        let detail = release_body_post_failure_detail(&out, &within);
+        assert!(detail.contains("WITHIN it"), "{detail}");
+        assert!(!detail.contains("OVER IT"), "{detail}");
+
+        let over = ReleaseBody("—".repeat(changelog::GITHUB_RELEASE_BODY_LIMIT + 1));
+        let detail = release_body_post_failure_detail(&out, &over);
+        assert!(detail.contains("OVER IT"), "{detail}");
     }
 }
 

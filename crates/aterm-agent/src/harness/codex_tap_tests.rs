@@ -9,8 +9,10 @@ use std::path::{Path, PathBuf};
 use super::*;
 use crate::harness::codex_rollout::PAGINATED;
 use crate::harness::codex_rollout::fixtures::{count, meta_as, stamp};
+use crate::harness::codex_steps::CODEX_MEASURED_BUILDS;
 use crate::harness::footer::FOLD_BUDGET;
 use crate::harness::steps::{StepEvent, StepId, StepState};
+use aterm_phase::anchors::rollout_reduction_stem;
 
 const THREAD: &str = "019a0000-0000-7000-8000-00000000000a";
 
@@ -178,45 +180,207 @@ fn a_measured_codex_alab_thread_binds_at_its_build_and_is_read_on() {
     assert_eq!(words(&said(&mut tap)), ["end 900 0 0"]);
 }
 
+/// A BUILD NOBODY MEASURED IS READ PARTIAL, AN UNKNOWN META BINDS NOTHING: a thread whose
+/// `session_meta` names a build `CODEX_MEASURED_BUILDS` does not hold (a vendor Codex's release,
+/// a count nobody measured, a measured build's release matched short of whole) is bound and read,
+/// every step [`StepState::Partial`]; one whose `session_meta` names no build the log can say, or
+/// a `history_mode` the fold does not know, is refused `unknown-meta`, for the tap's life.
+/// NEGATIVE CONTROL: the same rows with a measured build, or a `history_mode` the fold knows (or
+/// none), bind; the measured one reads `On`.
 #[test]
-fn a_vendor_codex_and_an_unmeasured_build_bind_nothing() {
-    let tap_on = |build: &str| {
+fn a_build_nobody_measured_is_read_partial_and_an_unknown_meta_binds_nothing() {
+    let tap_on = |meta: String| {
         let home = scratch_home("gate");
         let path = rollout_in(home.path(), DAY, THREAD);
-        append(
-            &path,
-            &[opening(THREAD, build), ctx(T0 + 1000, "turn-1")].concat(),
-        );
+        append(&path, &[meta, ctx(T0 + 1000, "turn-1")].concat());
         let mut tap = RolloutTap::new(THREAD, home.path()).expect("a thread id");
         tap.arm(0, None, Some(ALAB));
         let read = tap.read(FOLD_BUDGET);
-        let got = said(&mut tap);
+        let mut got = said(&mut tap);
+        let at = tap.reads_at();
         append(&path, &done(T0 + 3000, "turn-1", 5));
         let again = tap.read(FOLD_BUDGET);
-        (
-            read.is_some(),
-            tap.is_bound(),
-            tap.refused(),
-            got,
-            again.is_some(),
-        )
+        got.extend(said(&mut tap));
+        (read.is_some() && again.is_some(), tap.refused(), at, got)
     };
-    let (read, bound, refused, got, _) = tap_on(ALAB);
-    assert!(
-        read && bound && refused.is_none() && got.len() == 3,
-        "{got:?}"
+    let (read, refused, at, got) = tap_on(opening(THREAD, ALAB));
+    assert!(read && refused.is_none(), "{refused:?}");
+    assert_eq!(at, Some(StepState::On));
+    assert_eq!(
+        words(&got),
+        [
+            "bind 0",
+            "prompt turn-1",
+            "model gpt-5.5 0.164.0-dev.12521",
+            "end 5 0 0"
+        ]
     );
+    assert!(got.iter().all(|(_, s)| *s == StepState::On), "{got:?}");
     for build in [
         "0.163.0",
         "0.164.0-dev.99999+g0123abcd",
         "0.164.0-dev.12521",
     ] {
-        let (read, bound, refused, got, again) = tap_on(build);
-        assert!(!read && !bound && !again, "{build}");
-        assert_eq!(refused, Some(Refusal::Unmeasured), "{build}");
-        assert!(got.is_empty(), "{build}: {got:?}");
+        let (read, refused, at, got) = tap_on(opening(THREAD, build));
+        assert!(read && refused.is_none(), "{build}: {refused:?}");
+        assert_eq!(at, Some(StepState::Partial), "{build}");
+        assert_eq!(
+            words(&got),
+            [
+                "bind 0",
+                "prompt turn-1",
+                "model gpt-5.5 0.164.0-dev.12521",
+                "end 5 0 0"
+            ],
+            "{build}: the model is said at the writer's build"
+        );
+        assert!(
+            got.iter().all(|(_, s)| *s == StepState::Partial),
+            "{build}: {got:?}"
+        );
     }
-    assert_eq!(Refusal::Unmeasured.word(), "unmeasured");
+    let measured = opening(THREAD, ALAB);
+    let cli = format!("\"cli_version\":\"{ALAB}\",");
+    assert!(measured.contains(&cli), "the plant's anchor");
+    for (what, meta) in [
+        ("no build", measured.replacen(&cli, "", 1)),
+        (
+            "a build that is no string",
+            measured.replacen(&cli, "\"cli_version\":164,", 1),
+        ),
+        (
+            "a build the log cannot say",
+            measured.replacen(&cli, "\"cli_version\":\"0 164+x\",", 1),
+        ),
+        (
+            "a history mode the fold does not know",
+            measured.replacen(PAGINATED, "segmented", 1),
+        ),
+    ] {
+        assert_ne!(meta, measured, "{what}: the plant took");
+        let (read, refused, at, got) = tap_on(meta);
+        assert!(!read, "{what}");
+        assert_eq!(refused, Some(Refusal::UnknownMeta), "{what}");
+        assert!(Refusal::UnknownMeta.is_final(), "{what}");
+        assert_eq!(at, None, "{what}");
+        assert!(got.is_empty(), "{what}: {got:?}");
+    }
+    for (what, meta) in [
+        ("legacy", measured.replacen(PAGINATED, "legacy", 1)),
+        (
+            "none",
+            measured.replacen(&format!(",\"history_mode\":\"{PAGINATED}\""), "", 1),
+        ),
+    ] {
+        assert_ne!(meta, measured, "{what}: the plant took");
+        let (read, refused, at, got) = tap_on(meta);
+        assert!(
+            read && refused.is_none(),
+            "NEGATIVE CONTROL {what}: {refused:?}"
+        );
+        assert_eq!(at, Some(StepState::On), "NEGATIVE CONTROL {what}");
+        assert_eq!(got.len(), 4, "NEGATIVE CONTROL {what}: {got:?}");
+    }
+    assert_eq!(Refusal::UnknownMeta.word(), "unknown-meta");
+    assert_eq!(
+        Refusal::ALL.iter().map(|r| r.word()).collect::<Vec<_>>(),
+        ["no-rollout", "no-meta", "other-thread", "unknown-meta"]
+    );
+}
+
+/// AN UNMEASURED BUILD'S ROLLOUT IS READ PARTIAL, step for step: the newest measured build's
+/// committed `approval` leg, relabelled to a count nobody measured (its `cli_version` alone moved)
+/// and written as the thread's rollout, folds through a tap whose claimant runs that build to the
+/// very steps the leg folds to on its own build (turns, durations, tokens, the call and its
+/// result), each [`StepState::Partial`] and the model said at the relabelled build.
+/// NEGATIVE CONTROL: the leg as committed, its claimant on its own build, reads them `On`.
+#[test]
+fn an_unmeasured_builds_rollout_is_read_partial() {
+    let newest = *CODEX_MEASURED_BUILDS.last().expect("a measured build");
+    let leg = format!(
+        "{}/src/harness/testdata/steps/{}-approval.jsonl",
+        env!("CARGO_MANIFEST_DIR"),
+        rollout_reduction_stem(newest)
+    );
+    let committed = std::fs::read_to_string(&leg).unwrap_or_else(|e| panic!("{leg}: {e}"));
+    let own: String = committed
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| format!("{l}\n"))
+        .collect::<String>()
+        .replace("00000000-0000-4000-8000-000000000001", THREAD);
+    let (release, _) = newest.split_once('+').expect("a dev build");
+    let (stem, _) = release.rsplit_once('.').expect("its count");
+    let unmeasured = format!("{stem}.99999+g0123abcd");
+    assert!(!CODEX_MEASURED_BUILDS.contains(&unmeasured.as_str()));
+    let relabelled = own.replace(
+        &format!("\"cli_version\":\"{newest}\""),
+        &format!("\"cli_version\":\"{unmeasured}\""),
+    );
+    assert_ne!(relabelled, own, "the relabel took");
+    let read_as = |text: &str, running: &str| {
+        let home = scratch_home("relabelled");
+        append(&rollout_in(home.path(), DAY, THREAD), text);
+        let mut tap = RolloutTap::new(THREAD, home.path()).expect("a thread id");
+        tap.arm(0, None, Some(running));
+        assert!(
+            tap.read(FOLD_BUDGET).is_some_and(|r| r.complete),
+            "{running}"
+        );
+        assert!(tap.is_bound() && tap.refused().is_none(), "{running}");
+        let at = tap.reads_at();
+        let batch = tap.take();
+        assert_eq!((batch.lost, batch.overflow), (0, 0), "{running}");
+        (at, batch.steps)
+    };
+    let (on_at, on) = read_as(&own, newest);
+    let (partial_at, partial) = read_as(&relabelled, &unmeasured);
+    assert_eq!(
+        (on_at, partial_at),
+        (Some(StepState::On), Some(StepState::Partial))
+    );
+    let kinds = |steps: &[crate::harness::steps::Step]| {
+        steps
+            .iter()
+            .map(|s| match s.ev {
+                StepEvent::Model { model, effort, ver } => StepEvent::Model {
+                    model,
+                    effort,
+                    ver: ver.map(|_| StepId::new("ver").expect("an id")),
+                },
+                ev => ev,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(kinds(&partial), kinds(&on), "the very steps");
+    let read: [fn(&StepEvent) -> bool; 4] = [
+        |e| matches!(e, StepEvent::Prompt { .. }),
+        |e| matches!(e, StepEvent::TurnEnd { tok_in, .. } if *tok_in > 0),
+        |e| matches!(e, StepEvent::ToolUse { .. }),
+        |e| matches!(e, StepEvent::ToolResult { .. }),
+    ];
+    for ev in read {
+        assert!(partial.iter().any(|s| ev(&s.ev)), "{partial:?}");
+    }
+    assert!(
+        on.iter().all(|s| s.state == StepState::On),
+        "NEGATIVE CONTROL: {on:?}"
+    );
+    assert!(
+        partial.iter().all(|s| s.state == StepState::Partial),
+        "{partial:?}"
+    );
+    let ver = |steps: &[crate::harness::steps::Step]| {
+        steps
+            .iter()
+            .find_map(|s| match s.ev {
+                StepEvent::Model { ver, .. } => ver.map(|v| v.as_str().to_string()),
+                _ => None,
+            })
+            .expect("the model said")
+    };
+    assert_eq!(ver(&on), release);
+    assert_eq!(ver(&partial), format!("{stem}.99999"));
 }
 
 #[test]
@@ -350,7 +514,8 @@ fn a_codex_alab_own_line_package_is_tapped_at_its_client_version() {
 /// the client version. The
 /// tap is armed with the client version and binds; a record whose client version names a
 /// measured build the package does not run (another count and commit), or a compound package
-/// that names no client version, arms it with no build, so it binds nothing (unmeasured).
+/// that names no client version, arms it with no build, so its rows are read partial and the
+/// model is said at no build.
 #[test]
 fn a_compound_package_is_tapped_at_its_client_version_and_never_at_a_build_it_does_not_run() {
     use crate::harness::codex_alab::{ALAB_BUILD_JSON, PACKAGE_JSON, alab_build};
@@ -411,30 +576,59 @@ fn a_compound_package_is_tapped_at_its_client_version_and_never_at_a_build_it_do
         assert_eq!(running, None, "{client:?}");
         let mut tap = RolloutTap::new(THREAD, other.path()).expect("a thread id");
         tap.arm(0, None, running.as_deref());
-        assert!(tap.read(FOLD_BUDGET).is_none(), "{client:?}");
-        assert!(!tap.is_bound(), "{client:?}");
-        assert_eq!(tap.refused(), Some(Refusal::Unmeasured), "{client:?}");
-        assert!(said(&mut tap).is_empty(), "{client:?}");
+        assert!(tap.read(FOLD_BUDGET).is_some(), "{client:?}");
+        assert!(tap.is_bound() && tap.refused().is_none(), "{client:?}");
+        assert_eq!(tap.reads_at(), Some(StepState::Partial), "{client:?}");
+        let got = said(&mut tap);
+        assert_eq!(
+            words(&got),
+            ["bind 0", "prompt turn-1", "model gpt-5.5 -"],
+            "{client:?}: a build the package does not run is never said"
+        );
+        assert!(
+            got.iter().all(|(_, s)| *s == StepState::Partial),
+            "{client:?}: {got:?}"
+        );
     }
 }
 
+/// A CLAIMANT RUNNING A BUILD NOBODY MEASURED IS READ PARTIAL: a measured thread whose claimant's
+/// image runs an unmeasured build (or one its reader names no build of) is bound and read, every
+/// step `Partial` and the model said at the running build; a bound tap whose writer moves onto
+/// such a build reads on at `Partial`, and back on a measured build at `On`, never refused.
+/// NEGATIVE CONTROL: a claimant on a measured build reads the same rows `On`.
 #[test]
-fn a_claimant_running_an_unmeasured_build_binds_nothing() {
+fn a_claimant_running_an_unmeasured_build_is_read_partial() {
     let home = scratch_home("running");
     let path = rollout_in(home.path(), DAY, THREAD);
     append(
         &path,
         &[opening(THREAD, ALAB), ctx(T0 + 1000, "turn-1")].concat(),
     );
-    for running in [Some(UNMEASURED), Some("0.163.0"), None] {
+    for (running, ver) in [
+        (Some(UNMEASURED), "0.164.0-dev.99999"),
+        (Some("0.163.0"), "0.163.0"),
+        (None, "-"),
+    ] {
         let mut tap = RolloutTap::new(THREAD, home.path()).expect("a thread id");
         tap.arm(0, None, running);
-        assert!(tap.read(FOLD_BUDGET).is_none(), "{running:?}");
-        assert!(!tap.is_bound(), "{running:?}");
-        assert_eq!(tap.refused(), Some(Refusal::Unmeasured), "{running:?}");
-        assert!(said(&mut tap).is_empty(), "{running:?}");
-        tap.arm(0, None, Some(ALAB));
-        assert!(tap.read(FOLD_BUDGET).is_none(), "{running:?}");
+        assert!(tap.read(FOLD_BUDGET).is_some(), "{running:?}");
+        assert!(tap.is_bound() && tap.refused().is_none(), "{running:?}");
+        assert_eq!(tap.reads_at(), Some(StepState::Partial), "{running:?}");
+        let got = said(&mut tap);
+        assert_eq!(
+            words(&got),
+            [
+                "bind 0".to_string(),
+                "prompt turn-1".into(),
+                format!("model gpt-5.5 {ver}")
+            ],
+            "{running:?}"
+        );
+        assert!(
+            got.iter().all(|(_, s)| *s == StepState::Partial),
+            "{running:?}: {got:?}"
+        );
     }
     let mut tap = RolloutTap::new(THREAD, home.path()).expect("a thread id");
     tap.arm(0, None, Some(ALAB_MANAGED));
@@ -444,21 +638,31 @@ fn a_claimant_running_an_unmeasured_build_binds_nothing() {
         words(&got),
         ["bind 0", "prompt turn-1", "model gpt-5.5 0.164.0-dev.12479"]
     );
-    assert!(got.iter().all(|(_, s)| *s == StepState::On), "{got:?}");
+    assert!(
+        got.iter().all(|(_, s)| *s == StepState::On),
+        "NEGATIVE CONTROL: {got:?}"
+    );
     append(&path, &call(T0 + 1500, "call_r0010"));
     tap.arm(0, None, Some(UNMEASURED));
-    assert!(tap.read(FOLD_BUDGET).is_none());
+    assert!(tap.read(FOLD_BUDGET).is_some());
+    assert_eq!(tap.reads_at(), Some(StepState::Partial));
+    let got = said(&mut tap);
     assert_eq!(
-        words(&said(&mut tap)),
-        ["Off { why: \"unmeasured\" }"],
-        "the source says off once"
+        words(&got),
+        ["call call_r0010 exec_command", "result call_r0010"],
+        "the writer moved: read on"
     );
-    assert!(!tap.is_bound());
-    assert_eq!(tap.refused(), Some(Refusal::Unmeasured));
+    assert!(got.iter().all(|(_, s)| *s == StepState::Partial), "{got:?}");
+    assert!(tap.is_bound() && tap.refused().is_none());
     append(&path, &done(T0 + 3000, "turn-1", 2000));
     tap.arm(0, None, Some(ALAB));
-    assert!(tap.read(FOLD_BUDGET).is_none());
-    assert!(said(&mut tap).is_empty(), "read no more");
+    assert!(tap.read(FOLD_BUDGET).is_some());
+    assert_eq!(tap.reads_at(), Some(StepState::On));
+    assert_eq!(
+        said(&mut tap),
+        [("end 2000 0 0".to_string(), StepState::On)],
+        "back on a measured build: On"
+    );
 }
 
 #[test]

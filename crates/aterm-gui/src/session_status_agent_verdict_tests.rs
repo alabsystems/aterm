@@ -1203,7 +1203,7 @@ fn the_status_record_counts_the_history_an_update_could_not_carry() {
             " history_lost=0 journal=off journal_off=keeper-off integration_rev=- born=cold render=ok \
              resizes=0 flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- \
              held=- waiting=- end=- end_seen=- end_cheered=- goal=- task_state=- task_rev=0 \
-             log_seq=1 log_ep=1 log_base=1 run=- turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 editing=0 bells=0 bells_sounded=0 last_bell=- gen="
+             log_seq=1 log_ep=1 log_base=1 run=- turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 editing=0 editor=- bells=0 bells_sounded=0 last_bell=- gen="
         ),
         "{record}"
     );
@@ -1246,7 +1246,7 @@ fn the_status_record_counts_the_history_an_update_could_not_carry() {
             " history_lost=1234 journal=off journal_off=keeper-off integration_rev=- born=cold render=ok \
              resizes=0 flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- \
              held=- waiting=- end=- end_seen=- end_cheered=- goal=- task_state=- task_rev=0 \
-             log_seq=1 log_ep=1 log_base=1 run=- turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 editing=0 bells=0 bells_sounded=0 last_bell=- gen="
+             log_seq=1 log_ep=1 log_base=1 run=- turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 editing=0 editor=- bells=0 bells_sounded=0 last_bell=- gen="
         ),
         "{record}"
     );
@@ -1793,7 +1793,11 @@ fn an_adopted_session_with_its_carried_nonce_reads_its_command() {
         ShellIntegrationPosture::On
     );
     adopted.process(feed.as_bytes());
-    assert_eq!(super::executing_detail(&adopted).as_deref(), Some("claude"));
+    assert_eq!(
+        super::executing_detail(&adopted, &crate::command_ran::Ran::running(&["claude"]))
+            .as_deref(),
+        Some("claude")
+    );
 
     let mut uncarried = carried.clone();
     uncarried.shell_integration_nonce = None;
@@ -1806,7 +1810,10 @@ fn an_adopted_session_with_its_carried_nonce_reads_its_command() {
     );
     assert!(blind.is_require_shell_integration_nonce(), "never cleared");
     blind.process(feed.as_bytes());
-    assert_eq!(super::executing_detail(&blind), None);
+    assert_eq!(
+        super::executing_detail(&blind, &crate::command_ran::Ran::running(&["claude"])),
+        None
+    );
 }
 
 /// The herald's posts on this thread since the last call, drained.

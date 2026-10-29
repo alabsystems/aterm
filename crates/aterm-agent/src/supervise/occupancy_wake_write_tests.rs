@@ -1038,3 +1038,6 @@ fn a_reconciled_release_is_retold_at_the_successors_first_break() {
     let told = one_break("wake-write-reconcile-view-3", &first.ledger);
     assert_eq!(sends(&told), 0, "CONTROL: {:#?}", told.noted);
 }
+
+#[path = "occupancy_left_write_tests.rs"]
+mod left;

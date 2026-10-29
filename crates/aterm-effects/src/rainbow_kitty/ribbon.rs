@@ -18,6 +18,7 @@ use crate::spectrum::{spectrum, spectrum_with_min_saturation};
 
 use super::companion::KeepOut;
 use super::meteor::tri;
+use super::prism_glass::PaletteCache;
 use super::spine::{DISP_RELEASE_TAU, PHASE_RATE};
 use super::stardust::GlyphProbe;
 use super::timing::{
@@ -89,8 +90,18 @@ pub const DN_FLOOR_CH: f32 = 0.25;
 /// The downward reach at full momentum, in `ch`.
 pub const DN_TOP_CH: f32 = DN_FLOOR_CH + WAVE_AMP_CELLS;
 
-/// The underline spelling's reach above the spine, in `ch`.
-pub const UNDERLINE_UP_CH: f32 = 1.0 - DN_TOP_CH;
+/// The underline spelling's reach above the spine, in `ch`: the row's foot
+/// band, under the letters' baseline (a 26 px row's letters end on its 21st
+/// pixel row). Reaching `1.0 - DN_TOP_CH` (0.64 ch) it washed the letters'
+/// lower half and read as the pet's ribbon cut short, not a thin rainbow
+/// under the words (looks10 L3).
+pub const UNDERLINE_UP_CH: f32 = 0.20;
+
+/// The underline spelling's reach below the spine at the hand, in `ch`: the
+/// melt's floor ([`DN_FLOOR_CH`]) at every momentum, where the pet's comet
+/// body opens to [`COMET_DN_HAND_CH`], so the underline stays a thin band
+/// over its rail (looks10 L3).
+pub const UNDERLINE_DN_CH: f32 = DN_FLOOR_CH;
 
 /// The leading's half-thickness in `ch`.
 pub const LEAD_CH: f32 = 0.11;
@@ -127,11 +138,72 @@ pub const COMET_UP_TAIL_CH: f32 = 0.80;
 /// Cells behind the head over which the comet's `up` tapers from [`TALL_UP_CH`] to [`COMET_UP_TAIL_CH`] (smoothstep).
 pub const COMET_TAPER_CELLS: f32 = 12.0;
 
+/// The light glass's reach above its row's bottom at the hand, in `ch` ([`GLASS_BODY`],
+/// `docs/design/PRISM-GLASS.md` §2.2).
+pub const GLASS_UP_CH: f32 = 0.96;
+
+/// The glass's reach [`COMET_TAPER_CELLS`] behind the hand on the comet, in `ch` (smoothstep
+/// from [`GLASS_UP_CH`]).
+pub const GLASS_TAIL_UP_CH: f32 = 0.86;
+
+/// The glass's core, as a share of its reach.
+pub const GLASS_CORE_SHARE: f32 = 0.5;
+
+/// How far the glass's top swings with the spine's wave at full momentum, in `ch` (main's spine
+/// swings [`WAVE_AMP_CELLS`]): the glass stands on its row's bottom, so its wave is its height's.
+pub const LIGHT_GLASS_WAVE_CH: f32 = 0.035;
+
+/// The glass's top edge, px: its light melts to nothing over the top px of its reach
+/// (`aterm_render::glass_profile`).
+pub const GLASS_EDGE_PX: f32 = 2.5;
+
+/// The least glass a run draws, px: a run none of whose boundaries stands this tall (the frame's
+/// intensity scales the glass's height, never its opacity) draws no body, so the glass is
+/// whole or absent and no pastel of it is ever laid.
+pub const GLASS_MIN_PX: f32 = 2.0;
+
+/// The glass's ceiling (§15.2 1.7): it lays whole opacity hot and [`BODY_COLD_SHARE`] of it cold,
+/// where main's paper bed lays its role's cap ([`light_role`]).
+pub const GLASS_ALPHA: f32 = 255.0;
+
+/// The largest walk step a glass boundary lerps across (§2.2 Seams): one cell's at the walk's
+/// fastest lay ([`WALK_FAST_CELLS`]), the step the glass's legibility proof covers. Between two
+/// cells of a run whose walk differs by more (an in-run walk jump), and at a cohort seam, the
+/// glass steps hard, each side in its own ink.
+pub const GLASS_HARD_STEP_T: f32 = 1.0 / 16.0;
+
+/// The rounding a walk step is read through before it is a hard step ([`GLASS_HARD_STEP_T`]):
+/// two cells laid one fast step apart differ by it to within a float's error.
+const GLASS_HARD_STEP_SLACK: f32 = 1e-3;
+
+/// The most rows the hand's structural set holds ([`Ribbon::structural_rows`],
+/// `docs/design/PRISM-GLASS.md` §15.2 1.10): the hand's row and the rows nearest it.
+pub const STRUCTURAL_ROWS_MAX: u16 = 8;
+
+/// The low glass a wrapped row the hand has left sinks to, in `ch` ([`GlassWrap`], §2.4 The sink,
+/// WRAP_SINK_CH).
+pub const WRAP_SINK_CH: f32 = 0.34;
+
+/// How long a wrapped row the hand has left takes to sink to [`WRAP_SINK_CH`], seconds
+/// (smoothstep, §2.4 WRAP_SINK_S).
+pub const WRAP_SINK_S: f32 = 0.40;
+
+/// The page the hand's row of a multi-row structural set keeps above its glass, px (§2.4 The
+/// hand-row inset, WRAP_HAND_TOP_PX): the glass reaches at most a cell less this up its row.
+pub const WRAP_HAND_TOP_PX: f32 = 3.0;
+
 /// The flat ribbon's reach above its spine on paper, as a share of the pet's body's.
 pub const FLAT_PAPER_UP_SHARE: f32 = 0.72;
 
-/// The flat ribbon's full-strength plateau on paper, as a share of its reach.
+/// The flat ribbon's full-strength plateau on paper, as a share of its
+/// reach, as it was laid (the glow [`FLAT_PAPER_GAIN`] replaced).
 pub const FLAT_PAPER_CORE_SHARE: f32 = 0.85;
+
+/// The flat ribbon's body on paper: a soft even band, as its rail is on a
+/// dim page (looks8 K3), at this share of the pet's light, with no lit
+/// plateau or lift. Laid as the pet's glow, its plateau near its top, it
+/// read as the pet's ribbon without the rail, a near twin at 1x (looks9 Q6).
+pub const FLAT_PAPER_GAIN: f32 = 0.62;
 
 /// The rail's ink luminance floor.
 pub const RAIL_LUMA_FLOOR: f32 = 0.20;
@@ -193,6 +265,23 @@ pub const RAIL_GAP_CH: f32 = 0.06;
 /// ([`crate::cursor_glow::InkLedger::note_foot_rail`]).
 pub const ROW_RAIL_CH: f32 = 0.12;
 
+/// How far below its row's bottom the in-row rail ([`ROW_RAIL_CH`]) dips
+/// under a foot, px: its top the judge's ring under the row, clear of a
+/// descender that reaches the row's last pixel. It dips only where no
+/// letter of the row below meets it, into that row's blank top; parted
+/// round each foot, Solarized Dark's context rail broke under the `q` of
+/// `quick` (looks9 Q9).
+pub const ROW_RAIL_DIP_GAP_PX: f32 = crate::cursor_glow::LETTER_GUARD_RING as f32;
+
+/// How much thinner the in-row rail ([`ROW_RAIL_CH`]) lies where it dips
+/// under a foot ([`ROW_RAIL_DIP_GAP_PX`]), px: its foot and the judge's ring
+/// round it then keep within the row below's blank top over a short glyph
+/// (`crate::cursor_glow`'s short glyphs, their ink a third of the cell
+/// down). Whole there, a letter beside the foot's cell below broke the dip:
+/// Solarized Dark's context rail left a 10 px gap past the `q` of `quick`
+/// with the `a` of `a selected` under the next cell (looks9 round 2's Q9).
+pub const ROW_RAIL_DIP_THIN_PX: f32 = 1.0;
+
 /// How far the in-row rail ([`ROW_RAIL_CH`]) keeps off a foot's cell, px:
 /// the judge's ring and a pixel, and a slab more (a slab spans to the next
 /// vertex at its own light), then easing in over [`FOOT_EASE_PX`].
@@ -200,11 +289,21 @@ pub const FOOT_CLEAR_PX: f32 = crate::cursor_glow::LETTER_GUARD_RING as f32 + 1.
 /// The run over which the in-row rail eases in beside a foot, px.
 pub const FOOT_EASE_PX: f32 = 3.0;
 
-/// [`RAIL_GAP_CH`] in whole device pixels at cell height `ch`, at least one.
+/// [`RAIL_GAP_CH`] in whole device pixels at cell height `ch`, and never
+/// inside the judge's ring round a descender's foot
+/// ([`crate::cursor_glow::LETTER_GUARD_RING`]), as a bed's rail on a lit page
+/// keeps (`cursor_glow::bed::lit_rail_drop`). Rounded alone, a row under 25 px
+/// (a 13 px font's 16 px row at 1x, the Settings card's) left a pixel: the
+/// rail was not clear of its row's ring, so the letter guard weighed its
+/// vivid ink as the brightest ground of every lettered cell above it and cut
+/// the whole row's ribbon to about half its light, where the letters read
+/// 5.4:1 uncut (the Settings cursor demo's dark ribbon, settings round 2).
 #[inline]
 #[must_use]
 pub const fn rail_gap_px(ch: f32) -> f32 {
-    (RAIL_GAP_CH * ch).round().max(1.0)
+    (RAIL_GAP_CH * ch)
+        .round()
+        .max(crate::cursor_glow::LETTER_GUARD_RING as f32)
 }
 
 const _: () = assert!(RAIL_REACH_MAX_CH < aterm_render::SUB_CEILING);
@@ -280,20 +379,57 @@ pub const PAPER_MARK_CONTRAST: f32 = 4.5;
 
 const PAPER_HUE_BEND: [(f32, f32); 4] = [(30.0, 30.0), (72.0, 40.0), (90.0, 85.0), (110.0, 110.0)];
 
-/// A paper train's hue bend ([`paper_train_ink`]): as [`PAPER_HUE_BEND`],
-/// yellow walks to gold, and gold steps to green: the darkened yellows
-/// between them (an olive and a khaki at the paper's contrast) are never
-/// laid. Bent through them over its whole interval, the `enter-bottom`
-/// Return's stick read olive and khaki (`b1b774`) for a cell and more
-/// (looks7 M2); walked through them in six degrees, its turn from amber
-/// to green still read olive (`#8b8013` at its gold's end, looks8 K10).
-const PAPER_TRAIN_HUE_BEND: [(f32, f32); 5] = [
+/// The paper caret's hue bend ([`paper_caret_ink`]): yellow walks to an
+/// amber and the yellow-greens step from it to a clean green, as a Return's
+/// stick steps ([`PAPER_TRAIN_HUE_BEND`]). Bent as a mark is
+/// ([`PAPER_HUE_BEND`]), the yellow-greens kept their hue, and deepened to
+/// the caret law's 4.5:1 the gallery's `burst` caret read olive (`#557e01`)
+/// and then khaki (`#2e3c14`) on GitHub Light (looks10 L7). Stepped at 89
+/// degrees, the burst's lime head (88 degrees) still carried a bronze caret
+/// (`#946a01`, `#8f6601` on Default Light) against the ribbon's lime: from
+/// 76 degrees it steps to the clean green the head reads as (looks10 round
+/// 2's L7), and a greenish yellow (68 degrees) keeps its amber.
+const PAPER_CARET_HUE_BEND: [(f32, f32); 5] = [
     (30.0, 30.0),
     (72.0, 40.0),
-    (89.0, 44.0),
-    (89.0, 88.0),
-    (110.0, 110.0),
+    (76.0, 43.0),
+    (76.0, 118.0),
+    (122.0, 122.0),
 ];
+
+/// A paper train's hue bend ([`paper_train_ink`]): as [`PAPER_HUE_BEND`],
+/// yellow walks to gold, and gold steps to a clean green: the darkened
+/// yellows and yellow-greens between them (an olive, a khaki, a lime gone
+/// dark at the paper's contrast) are never laid. Bent through them over its
+/// whole interval, the `enter-bottom` Return's stick read olive and khaki
+/// (`b1b774`) for a cell and more (looks7 M2); walked through them in six
+/// degrees, its turn from amber to green still read olive (`#8b8013` at its
+/// gold's end, looks8 K10); stepped from 44 to 88 degrees, its green began
+/// at a darkened lime (`#329213`, looks9 Q5).
+const PAPER_TRAIN_HUE_BEND: [(f32, f32); 5] = [
+    (30.0, 30.0),
+    (72.0, 44.0),
+    (89.0, 47.0),
+    (89.0, 118.0),
+    (122.0, 122.0),
+];
+
+/// The least contrast a paper train's warm span (its orange and gold,
+/// [`PAPER_TRAIN_GOLD_HUES`]) keeps against a light page: a graphic's 3:1.
+/// Held to the caret's 4.5:1, a gold is darkened to an ochre on white
+/// (`#a27b13`, `#b37113` along the gallery's `enter-bottom` Return, looks9
+/// Q5): no gold reaches 4.5:1 on white but as a brown. The stick is a mark
+/// on the page, never under a letter (`meteor`'s `paper_launch_drop`), and
+/// its other hues keep the caret's bar.
+pub const PAPER_TRAIN_GOLD_CONTRAST: f32 = 3.0;
+
+/// The bent hues (degrees) a paper train lays at [`PAPER_TRAIN_GOLD_CONTRAST`],
+/// easing to the caret's bar over [`PAPER_TRAIN_GOLD_EASE`] degrees past
+/// either end.
+pub const PAPER_TRAIN_GOLD_HUES: (f32, f32) = (25.0, 55.0);
+
+/// Degrees over which a paper train's bar eases from the gold's to the caret's.
+const PAPER_TRAIN_GOLD_EASE: f32 = 10.0;
 
 /// The hues a paper train never lays, degrees: its bend's step from gold to
 /// green ([`PAPER_TRAIN_HUE_BEND`]), which its stick crosses at a hard edge
@@ -882,6 +1018,17 @@ pub struct Segment {
     pub dn: f32,
     pub t: f32,
     pub cov: u8,
+    /// The glass's reach above its row's bottom here, px, on a frame the bed draws by its
+    /// glass ([`BedInkLut::glass_lit`], §15.2 1.7): [`GLASS_BODY`]'s, its wave, the frame's
+    /// intensity, its exits and its oldest end's ease (§15.2 1.8) and its row's sink and inset
+    /// (§15.2 1.10, [`GlassWrap`], [`WRAP_HAND_TOP_PX`]) folded in. `0` on every other
+    /// frame, where the body is main's (`spine`, `up`, `dn`), which the plan keeps on a glass
+    /// frame too ([`Ribbon::band`]).
+    pub glass_up: f32,
+    /// On a glass frame, the walk the boundary opens its right cell at less the walk it closes
+    /// its left cell at (`t`): a hard step (§2.2 Seams, [`GLASS_HARD_STEP_T`]) the glass lays as
+    /// two vertices at one x. `0` at every other boundary and on every other frame.
+    pub glass_jump: f32,
 }
 
 /// The vertical extent of the ribbon's body at one cell, `[spine - up, spine + dn]`.
@@ -894,6 +1041,7 @@ pub struct Band {
 
 impl Band {
     /// True when `y` lies inside the body.
+    #[inline]
     #[must_use]
     #[cfg(test)]
     pub const fn contains(&self, y: f32) -> bool {
@@ -908,7 +1056,23 @@ pub struct BodyProfile {
     pub dn_ch: f32,
     pub core_up_ch: f32,
     pub shoulder: f32,
+    /// The tall ribbon's profile; the underline's when false.
+    pub tall: bool,
 }
+
+/// The light glass's body (`docs/design/PRISM-GLASS.md` §2.2, §15.2 1.7), what a frame the
+/// bed draws by its glass lays in place of [`Ribbon::body_profile`]'s: standing on its row's
+/// bottom with no reach below it, [`GLASS_UP_CH`] tall at the hand (easing to
+/// [`GLASS_TAIL_UP_CH`] over [`COMET_TAPER_CELLS`] on the comet), its core half its reach, and
+/// its top a [`GLASS_EDGE_PX`] melt (`aterm_render::glass_profile`) with no shoulder.
+pub const GLASS_BODY: BodyProfile = BodyProfile {
+    up_ch: GLASS_UP_CH,
+    dn_ch: 0.0,
+    core_up_ch: GLASS_CORE_SHARE * GLASS_UP_CH,
+    shoulder: 1.0,
+    // The glass lights only the tall spelling (`glass_table`).
+    tall: true,
+};
 
 #[derive(Clone, Debug)]
 struct FieldLane {
@@ -1002,6 +1166,7 @@ impl FieldIndex {
     }
 
     /// Rows carrying field light this frame.
+    #[inline]
     #[must_use]
     #[cfg(test)]
     pub const fn live_rows(&self) -> usize {
@@ -1239,6 +1404,7 @@ pub const fn dim_theme(fg: u32, page: u32) -> bool {
 /// letter's edge (the judge's solid share of the text's reading) at four
 /// fifths of the theme's own.
 #[cfg(test)]
+#[inline]
 pub(crate) const fn dim_edge_held(bed: u32, fg: u32, page: u32) -> u32 {
     const DIM_EDGE_GUARD: f32 = 0.03;
     const DIM_EDGE_SOLID: f32 = 0.85;
@@ -1305,6 +1471,7 @@ pub const fn bed_ink(rgb: u32, budget: f32) -> u32 {
 
 /// [`bed_ink`] without the dark hue bend (a test's control).
 #[cfg(test)]
+#[inline]
 pub(crate) const fn bed_ink_unbent(rgb: u32, budget: f32) -> u32 {
     onto_luma(spectrum_with_min_saturation(rgb, BED_SAT_FLOOR), budget)
 }
@@ -1330,8 +1497,78 @@ const fn dark_hue_bent(rgb: u32) -> u32 {
 }
 
 /// The bed's light twin, its ink on paper.
+#[cfg(test)]
+#[inline]
 #[must_use]
 pub(crate) const fn paper_ink(rgb: u32, fg: u32, bg: u32, role: InkRole) -> u32 {
+    let table = crate::color_math::relative_luminance_table();
+    let theme = PaperTheme::new(table, fg, bg, role);
+    paper_ink_with_theme(table, rgb, &theme)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PaperTheme {
+    bg: u32,
+    bg_lab: [f32; 3],
+    y_fg: f32,
+    cap: f32,
+    weight_sq: f32,
+    bar: Option<f32>,
+}
+
+impl PaperTheme {
+    const ZERO: Self = Self {
+        bg: 0,
+        bg_lab: [0.0; 3],
+        y_fg: 0.0,
+        cap: 0.0,
+        weight_sq: 0.0,
+        bar: None,
+    };
+
+    #[inline]
+    #[must_use]
+    pub(crate) const fn new(
+        table: &crate::color_math::RelativeLuminanceTable,
+        fg: u32,
+        bg: u32,
+        role: InkRole,
+    ) -> Self {
+        let bg = bg & 0x00FF_FFFF;
+        let cap = (role.alpha_cap() / 255.0).clamp(0.0, 1.0);
+        let y_fg = crate::color_math::relative_luminance_with(table, fg);
+        let (weight, bar) = match role {
+            InkRole::OverText => {
+                let y_bg = crate::color_math::relative_luminance_with(table, bg);
+                let ratio_bg_fg = (y_bg.max(y_fg) + 0.05) / (y_bg.min(y_fg) + 0.05);
+                (
+                    PAPER_WEIGHT,
+                    Some(
+                        (BODY_CONTRAST_BAR + BODY_CONTRAST_GUARD)
+                            .min(PAPER_BAR_THEME_SHARE * ratio_bg_fg),
+                    ),
+                )
+            }
+            InkRole::Leading => (PAPER_WEIGHT_LEADING, None),
+        };
+        Self {
+            bg,
+            bg_lab: oklab(bg),
+            y_fg,
+            cap,
+            weight_sq: weight * weight,
+            bar,
+        }
+    }
+}
+
+#[inline]
+#[must_use]
+pub(crate) const fn paper_ink_with_theme(
+    table: &crate::color_math::RelativeLuminanceTable,
+    rgb: u32,
+    theme: &PaperTheme,
+) -> u32 {
     #[inline]
     const fn ratio(y: f32, y_fg: f32) -> f32 {
         (y.max(y_fg) + 0.05) / (y.min(y_fg) + 0.05)
@@ -1355,6 +1592,12 @@ pub(crate) const fn paper_ink(rgb: u32, fg: u32, bg: u32, role: InkRole) -> u32 
             ch(ink, bg, cap, 0),
         )
     }
+    let bg = theme.bg;
+    let bg_lab = theme.bg_lab;
+    let y_fg = theme.y_fg;
+    let cap = theme.cap;
+    let weight_sq = theme.weight_sq;
+    let bar = theme.bar;
     let rgb = spectrum_with_min_saturation(rgb, BED_SAT_FLOOR);
     let r = (rgb >> 16) & 0xff;
     let g = (rgb >> 8) & 0xff;
@@ -1365,34 +1608,19 @@ pub(crate) const fn paper_ink(rgb: u32, fg: u32, bg: u32, role: InkRole) -> u32 
         return bg;
     }
     let full = scale_rgb(rgb, 255.0 / mx as f32);
-    let bg = bg & 0x00FF_FFFF;
-    let cap = (role.alpha_cap() / 255.0).clamp(0.0, 1.0);
-    let table = crate::color_math::relative_luminance_table();
-    let y_fg = crate::color_math::relative_luminance_with(table, fg);
-    let (weight, bar) = match role {
-        InkRole::OverText => (
-            PAPER_WEIGHT,
-            Some((BODY_CONTRAST_BAR + BODY_CONTRAST_GUARD).min(
-                PAPER_BAR_THEME_SHARE
-                    * ratio(crate::color_math::relative_luminance_with(table, bg), y_fg),
-            )),
-        ),
-        InkRole::Leading => (PAPER_WEIGHT_LEADING, None),
+    let hi0 = (lerp_rgb(bg, full, cap), full);
+    let hi0_ok = match bar {
+        Some(bar) => ratio(worst_lum(table, hi0.1, bg, cap), y_fg) >= bar,
+        None => true,
+    } && {
+        let lab0 = oklab(hi0.0);
+        let (dl0, da0, db0) = (
+            lab0[0] - bg_lab[0],
+            lab0[1] - bg_lab[1],
+            lab0[2] - bg_lab[2],
+        );
+        dl0 * dl0 + da0 * da0 + db0 * db0 <= weight_sq
     };
-    let bg_lab = oklab(bg);
-    let weight_sq = weight * weight;
-    let hi0 = (lerp_rgb(bg, full, cap), lerp_rgb(bg, full, 1.0));
-    let lab0 = oklab(hi0.0);
-    let (dl0, da0, db0) = (
-        lab0[0] - bg_lab[0],
-        lab0[1] - bg_lab[1],
-        lab0[2] - bg_lab[2],
-    );
-    let hi0_ok = dl0 * dl0 + da0 * da0 + db0 * db0 <= weight_sq
-        && match bar {
-            Some(bar) => ratio(worst_lum(table, hi0.1, bg, cap), y_fg) >= bar,
-            None => true,
-        };
     if hi0_ok {
         return hi0.1;
     }
@@ -1416,13 +1644,14 @@ pub(crate) const fn paper_ink(rgb: u32, fg: u32, bg: u32, role: InkRole) -> u32 
         } else if same_hi {
             hi = mid;
         } else {
-            let lab = oklab(pair.0);
-            let (dl, da, db) = (lab[0] - bg_lab[0], lab[1] - bg_lab[1], lab[2] - bg_lab[2]);
-            let ok = dl * dl + da * da + db * db <= weight_sq
-                && match bar {
-                    Some(bar) => ratio(worst_lum(table, pair.1, bg, cap), y_fg) >= bar,
-                    None => true,
-                };
+            let ok = match bar {
+                Some(bar) => ratio(worst_lum(table, pair.1, bg, cap), y_fg) >= bar,
+                None => true,
+            } && {
+                let lab = oklab(pair.0);
+                let (dl, da, db) = (lab[0] - bg_lab[0], lab[1] - bg_lab[1], lab[2] - bg_lab[2]);
+                dl * dl + da * da + db * db <= weight_sq
+            };
             if ok {
                 lo = mid;
                 lo_pair = Some(pair);
@@ -1443,7 +1672,27 @@ pub(crate) const fn paper_ink(rgb: u32, fg: u32, bg: u32, role: InkRole) -> u32 
 #[inline]
 #[must_use]
 pub const fn paper_caret_ink(rgb: u32, bg: u32) -> u32 {
-    paper_vivid_ink(rgb, bg, PAPER_CARET_CONTRAST)
+    paper_vivid_ink_bent(rgb, bg, PAPER_CARET_CONTRAST, &PAPER_CARET_HUE_BEND)
+}
+
+#[inline]
+#[must_use]
+pub(crate) const fn paper_caret_ink_with_bg_lum(
+    table: &crate::color_math::RelativeLuminanceTable,
+    rgb: u32,
+    y_bg: f32,
+) -> u32 {
+    let (h, s, v) = rgb2hsv(spectrum_with_min_saturation(rgb, BED_SAT_FLOOR));
+    if v <= 0.0 {
+        return 0;
+    }
+    paper_vivid_ink_hsv_with_bg_lum(
+        table,
+        bent_hue(h, &PAPER_HUE_BEND),
+        s,
+        y_bg,
+        PAPER_CARET_CONTRAST,
+    )
 }
 
 /// The caret's colour for the walk's stop `arc`.
@@ -1464,13 +1713,65 @@ pub const fn paper_mark_ink(rgb: u32, bg: u32) -> u32 {
     paper_vivid_ink(rgb, bg, PAPER_MARK_CONTRAST)
 }
 
+#[inline]
+#[must_use]
+pub(crate) const fn paper_mark_ink_with_bg_lum(
+    table: &crate::color_math::RelativeLuminanceTable,
+    rgb: u32,
+    y_bg: f32,
+) -> u32 {
+    let (h, s, v) = rgb2hsv(spectrum_with_min_saturation(rgb, BED_SAT_FLOOR));
+    if v <= 0.0 {
+        return 0;
+    }
+    paper_vivid_ink_hsv_with_bg_lum(
+        table,
+        bent_hue(h, &PAPER_HUE_BEND),
+        s,
+        y_bg,
+        PAPER_MARK_CONTRAST,
+    )
+}
+
 /// A paper train's ink (a Return's stick): the caret's ink, its walk from
-/// gold to green crossing the darkened yellows quickly
-/// ([`PAPER_TRAIN_HUE_BEND`]).
+/// gold to green stepping over the darkened yellows
+/// ([`PAPER_TRAIN_HUE_BEND`]), its orange and gold held to a graphic's bar
+/// ([`PAPER_TRAIN_GOLD_CONTRAST`]) so they read gold rather than ochre.
 #[inline]
 #[must_use]
 pub const fn paper_train_ink(rgb: u32, bg: u32) -> u32 {
-    paper_vivid_ink_bent(rgb, bg, PAPER_CARET_CONTRAST, &PAPER_TRAIN_HUE_BEND)
+    let (h, s, v) = rgb2hsv(spectrum_with_min_saturation(rgb, BED_SAT_FLOOR));
+    if v <= 0.0 {
+        return 0;
+    }
+    let h = bent_hue(h, &PAPER_TRAIN_HUE_BEND);
+    paper_vivid_ink_hsv(h, s, bg, paper_train_bar(h))
+}
+
+#[inline]
+#[must_use]
+pub(crate) const fn paper_train_ink_with_bg_lum(
+    table: &crate::color_math::RelativeLuminanceTable,
+    rgb: u32,
+    y_bg: f32,
+) -> u32 {
+    let (h, s, v) = rgb2hsv(spectrum_with_min_saturation(rgb, BED_SAT_FLOOR));
+    if v <= 0.0 {
+        return 0;
+    }
+    let h = bent_hue(h, &PAPER_TRAIN_HUE_BEND);
+    paper_vivid_ink_hsv_with_bg_lum(table, h, s, y_bg, paper_train_bar(h))
+}
+
+/// The contrast bar a paper train's ink of bent hue `h` keeps: the gold's
+/// over [`PAPER_TRAIN_GOLD_HUES`], the caret's away from it.
+#[inline]
+const fn paper_train_bar(h: f32) -> f32 {
+    let (lo, hi) = PAPER_TRAIN_GOLD_HUES;
+    let out = (lo - h).max(h - hi).max(0.0) * (1.0 / PAPER_TRAIN_GOLD_EASE);
+    let u = if out < 1.0 { out } else { 1.0 };
+    let gold = 1.0 - u * u * (3.0 - 2.0 * u);
+    PAPER_CARET_CONTRAST + (PAPER_TRAIN_GOLD_CONTRAST - PAPER_CARET_CONTRAST) * gold
 }
 
 #[inline]
@@ -1500,10 +1801,25 @@ const fn paper_vivid_ink_bent(rgb: u32, bg: u32, bar: f32, bend: &[(f32, f32)]) 
     if v <= 0.0 {
         return 0;
     }
-    let h = bent_hue(h, bend);
-    let full = hsv2rgb(h, s, 1.0);
+    paper_vivid_ink_hsv(bent_hue(h, bend), s, bg, bar)
+}
+
+#[inline]
+const fn paper_vivid_ink_hsv(h: f32, s: f32, bg: u32, bar: f32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
     let y_bg = crate::color_math::relative_luminance_with(table, bg);
+    paper_vivid_ink_hsv_with_bg_lum(table, h, s, y_bg, bar)
+}
+
+#[inline]
+const fn paper_vivid_ink_hsv_with_bg_lum(
+    table: &crate::color_math::RelativeLuminanceTable,
+    h: f32,
+    s: f32,
+    y_bg: f32,
+    bar: f32,
+) -> u32 {
+    let full = hsv2rgb(h, s, 1.0);
     #[inline]
     const fn holds(
         table: &crate::color_math::RelativeLuminanceTable,
@@ -1545,26 +1861,41 @@ const fn paper_vivid_ink_bent(rgb: u32, bg: u32, bar: f32, bend: &[(f32, f32)]) 
 }
 
 #[inline]
-const fn channel_contrast(linear: &[f32; 256], a: u8, b: u8) -> f32 {
-    let (a, b) = (linear[a as usize], linear[b as usize]);
-    let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
+const fn channel_contrast_lin(a_lin: f32, b_lin: f32) -> f32 {
+    let (hi, lo) = if a_lin >= b_lin {
+        (a_lin, b_lin)
+    } else {
+        (b_lin, a_lin)
+    };
     (hi + 0.05) / (lo + 0.05)
 }
 
+#[inline]
+#[must_use]
+pub(crate) const fn bg_linear_rgb(linear: &[f32; 256], bg: u32) -> (f32, f32, f32) {
+    (
+        linear[((bg >> 16) & 0xff) as usize],
+        linear[((bg >> 8) & 0xff) as usize],
+        linear[(bg & 0xff) as usize],
+    )
+}
+
 /// Whether a composited pixel is still a stop.
+#[cfg(test)]
 #[inline]
 #[must_use]
 pub(crate) const fn seen(rgb: u32, bg: u32) -> bool {
-    seen_with(
-        &crate::color_math::relative_luminance_table().linear,
-        rgb,
-        bg,
-    )
+    let linear = &crate::color_math::relative_luminance_table().linear;
+    seen_with_bg_lin(linear, rgb, bg_linear_rgb(linear, bg))
 }
 
 #[inline]
 #[must_use]
-pub(crate) const fn seen_with(linear: &[f32; 256], rgb: u32, bg: u32) -> bool {
+pub(crate) const fn seen_with_bg_lin(
+    linear: &[f32; 256],
+    rgb: u32,
+    bg_lin: (f32, f32, f32),
+) -> bool {
     let (r, g, b) = (
         ((rgb >> 16) & 0xff) as u8,
         ((rgb >> 8) & 0xff) as u8,
@@ -1578,19 +1909,28 @@ pub(crate) const fn seen_with(linear: &[f32; 256], rgb: u32, bg: u32) -> bool {
     if spread < SEEN_SPREAD {
         return false;
     }
-    let stand = channel_contrast(linear, r, ((bg >> 16) & 0xff) as u8)
-        .max(channel_contrast(linear, g, ((bg >> 8) & 0xff) as u8))
-        .max(channel_contrast(linear, b, (bg & 0xff) as u8));
+    let stand = channel_contrast_lin(linear[r as usize], bg_lin.0)
+        .max(channel_contrast_lin(linear[g as usize], bg_lin.1))
+        .max(channel_contrast_lin(linear[b as usize], bg_lin.2));
     stand >= SEEN_CONTRAST
 }
 
 #[inline]
 #[must_use]
-const fn seen_floor_with(linear: &[f32; 256], ink: u32, bg: u32) -> f32 {
+const fn seen_floor_with_bg_lin(
+    linear: &[f32; 256],
+    ink: u32,
+    bg: u32,
+    bg_lin: (f32, f32, f32),
+) -> f32 {
     let mut a = 255u16;
     while a >= 1 {
         let alpha = a as u8;
-        if !seen_with(linear, over_premul(bg, premul_rgb(ink, alpha), alpha), bg) {
+        if !seen_with_bg_lin(
+            linear,
+            over_premul(bg, premul_rgb(ink, alpha), alpha),
+            bg_lin,
+        ) {
             return (alpha as f32) + 1.0;
         }
         a -= 1;
@@ -1655,6 +1995,14 @@ pub(crate) const fn light_role(cfg: &Config) -> InkRole {
     }
 }
 
+/// The ceiling a body's coverage is planned under: [`GLASS_ALPHA`] on a frame the bed draws by
+/// its `glass` (§15.2 1.7), main's [`cov_cap`] on every other.
+#[inline]
+#[must_use]
+const fn body_cov_cap(cfg: &Config, glass: bool) -> f32 {
+    if glass { GLASS_ALPHA } else { cov_cap(cfg) }
+}
+
 #[inline]
 #[must_use]
 const fn cov_cap(cfg: &Config) -> f32 {
@@ -1662,6 +2010,20 @@ const fn cov_cap(cfg: &Config) -> f32 {
         UNDER_COV_CAP
     } else {
         light_role(cfg).alpha_cap()
+    }
+}
+
+/// Clamp a requested occupied-cell bed coverage into `[0.0, body_cov_cap(cfg, glass)]`.
+#[inline]
+#[must_use]
+pub(crate) const fn clamp_bed_cov(cfg: &Config, glass: bool, requested: f32) -> f32 {
+    let cap = body_cov_cap(cfg, glass);
+    if requested.is_nan() || requested <= 0.0 {
+        0.0
+    } else if requested >= cap {
+        cap
+    } else {
+        requested
     }
 }
 
@@ -1730,10 +2092,11 @@ static DARK_SEEN_COMMON_LUT: [(u32, [f32; BED_INK_LUT_LEN]); 5] = {
     let mut g_idx = 0;
     while g_idx < 5 {
         let g = grounds[g_idx];
+        let g_lin = bg_linear_rgb(linear, g);
         let mut seen = [0.0f32; BED_INK_LUT_LEN];
         let mut i = 0;
         while i < BED_INK_LUT_LEN {
-            seen[i] = seen_floor_with(linear, DARK_BED_MAX_LUT[i], g);
+            seen[i] = seen_floor_with_bg_lin(linear, DARK_BED_MAX_LUT[i], g, g_lin);
             i += 1;
         }
         out[g_idx] = (g, seen);
@@ -1756,11 +2119,49 @@ const fn dark_seen_common_lut(bg: u32) -> Option<&'static [f32; BED_INK_LUT_LEN]
 }
 
 /// The bed's ink table for one theme, rebuilt only when the theme or spelling changes.
+///
+/// Under Prism Glass's glass (`docs/design/PRISM-GLASS.md` §15.2 1.5: `glass_lit`, a light frame's
+/// tall spelling on a page whose solved palette has headroom) the bed draws by that palette's
+/// glass129 instead ([`Self::glass`]), filled when the glass lights or the page changes. Main's
+/// own table is still built for the theme beside it, byte for byte, and is what [`Self::key`],
+/// [`Self::lut`] and [`Self::seen`] read on every frame.
 #[derive(Clone, Copy, Debug)]
 pub struct BedInkLut {
     key: Option<(u32, u32, bool, bool)>,
     lut: [u32; BED_INK_LUT_LEN],
     seen: [f32; BED_INK_LUT_LEN],
+    /// The glass table the bed draws by under `glass_lit`; `None` on every other frame.
+    glass: Option<GlassBed>,
+}
+
+/// A light page's glass129 as the bed draws it (§15.2 1.5), light only.
+#[derive(Clone, Copy, Debug)]
+struct GlassBed {
+    /// The theme fg and page it was filled for.
+    pair: (u32, u32),
+    /// The palette's glass129.
+    lut: [u32; BED_INK_LUT_LEN],
+    /// What of each glass the page shows.
+    seen: [f32; BED_INK_LUT_LEN],
+}
+
+/// The glass129 the bed draws a frame by (`glass_lit`, §15.0.4, §15.2 1.5): on a light frame
+/// whose light draws glass, the tall spelling, a page whose palette `palettes` holds solved (the
+/// frame advances a pending solve by its counted units) and which has headroom. A dark frame, the
+/// flat spelling and a light below the glass level never ask the cache, so no solve unit runs
+/// there.
+#[inline]
+fn glass_table<'p>(
+    cfg: &Config,
+    palettes: &'p mut PaletteCache,
+) -> Option<&'p [u32; BED_INK_LUT_LEN]> {
+    if !cfg.light.glass() || !cfg.ribbon_tall || cfg.dark_theme {
+        return None;
+    }
+    palettes
+        .frame(cfg.theme_fg, cfg.theme_bg)
+        .filter(|p| p.headroom())
+        .map(|p| &p.glass)
 }
 
 impl Default for BedInkLut {
@@ -1776,6 +2177,7 @@ impl BedInkLut {
         key: None,
         lut: [0; BED_INK_LUT_LEN],
         seen: [0.0; BED_INK_LUT_LEN],
+        glass: None,
     };
 
     #[inline]
@@ -1804,8 +2206,17 @@ impl BedInkLut {
             self.key = Some(key);
             return;
         }
-        let linear = &crate::color_math::relative_luminance_table().linear;
+        let table = crate::color_math::relative_luminance_table();
+        let linear = &table.linear;
+        let bg_lin = bg_linear_rgb(linear, cfg.theme_bg);
         let light_a = (cov_cap(cfg) + 16.0).min(255.0) as u8;
+        let is_dim_theme = cfg.dark_theme && dim_theme(cfg.theme_fg, cfg.theme_bg);
+        let bg_masked = cfg.theme_bg & 0x00FF_FFFF;
+        let paper_theme = if cfg.dark_theme {
+            PaperTheme::ZERO
+        } else {
+            PaperTheme::new(table, cfg.theme_fg, bg_masked, role)
+        };
         let mut i = 0;
         while i < BED_INK_LUT_LEN {
             let bed = if let Some(max_lut) = dark_max {
@@ -1813,14 +2224,19 @@ impl BedInkLut {
             } else {
                 let arc = walk_arc_at(i);
                 if cfg.dark_theme {
-                    dim_page_bed(bed_ink(arc, budget), cfg.theme_fg, cfg.theme_bg)
+                    let raw = bed_ink(arc, budget);
+                    if is_dim_theme {
+                        crate::cursor_glow::page_lit_ink(raw & 0x00FF_FFFF, bg_masked)
+                    } else {
+                        raw
+                    }
                 } else {
-                    let paper = paper_ink(arc, cfg.theme_fg, cfg.theme_bg, role);
-                    let shows = seen_with(
+                    let paper = paper_ink_with_theme(table, arc, &paper_theme);
+                    let shows = seen_with_bg_lin(
                         linear,
                         over_premul(cfg.theme_bg, premul_rgb(paper, light_a), light_a)
                             & 0x00FF_FFFF,
-                        cfg.theme_bg,
+                        bg_lin,
                     );
                     if cfg.ribbon_tall && !shows {
                         crate::cursor_glow::light_body_ink(arc, cfg.theme_fg, cfg.theme_bg, light_a)
@@ -1830,21 +2246,87 @@ impl BedInkLut {
                 }
             };
             self.lut[i] = bed;
-            self.seen[i] = seen_floor_with(linear, bed, cfg.theme_bg);
+            self.seen[i] = seen_floor_with_bg_lin(linear, bed, cfg.theme_bg, bg_lin);
             i += 1;
         }
         self.key = Some(key);
     }
 
-    /// The table a ribbon's frame syncs for `cfg`, built from empty: what the host
-    /// unreachability pin holds each frame's table to (`docs/design/PRISM-GLASS.md` §15.1 P0.9).
-    /// Debug and test builds only.
+    /// Sync the glass to the frame: under `glass_lit`, the glass129 it draws by ([`glass_table`]),
+    /// filled when the glass lights or the page changes; `None` on every other frame. Main's
+    /// table ([`Self::sync`]) is synced beside it.
+    #[inline]
+    fn sync_glass(&mut self, cfg: &Config, glass: Option<&[u32; BED_INK_LUT_LEN]>) {
+        let Some(table) = glass else {
+            self.glass = None;
+            return;
+        };
+        let pair = (cfg.theme_fg, cfg.theme_bg);
+        if self.glass.as_ref().is_some_and(|g| g.pair == pair) {
+            return;
+        }
+        let linear = &crate::color_math::relative_luminance_table().linear;
+        let bg_lin = bg_linear_rgb(linear, cfg.theme_bg);
+        let mut seen = [0.0; BED_INK_LUT_LEN];
+        let mut i = 0;
+        while i < BED_INK_LUT_LEN {
+            seen[i] = seen_floor_with_bg_lin(linear, table[i], cfg.theme_bg, bg_lin);
+            i += 1;
+        }
+        self.glass = Some(GlassBed {
+            pair,
+            lut: *table,
+            seen,
+        });
+    }
+
+    /// The table a ribbon's frame syncs for `cfg`, built from empty with an empty palette
+    /// cache: what the host unreachability pin holds each frame's table to
+    /// (`docs/design/PRISM-GLASS.md` §15.1 P0.9). Debug and test builds only.
     #[cfg(any(test, debug_assertions))]
+    #[inline]
     #[must_use]
     pub fn synced(cfg: &Config) -> Self {
         let mut lut = Self::EMPTY;
+        let mut palettes = PaletteCache::new();
         lut.sync(cfg);
+        lut.sync_glass(cfg, glass_table(cfg, &mut palettes));
         lut
+    }
+
+    /// Whether the bed draws by the glass (`glass_lit`, §15.2 1.5).
+    #[inline]
+    #[must_use]
+    pub const fn glass_lit(&self) -> bool {
+        self.glass.is_some()
+    }
+
+    /// The glass129 the bed draws by under `glass_lit`; `None` on every other frame.
+    #[inline]
+    #[must_use]
+    pub const fn glass(&self) -> Option<&[u32; BED_INK_LUT_LEN]> {
+        match &self.glass {
+            Some(g) => Some(&g.lut),
+            None => None,
+        }
+    }
+
+    /// The light words (§15.0.2(a)): under the glass, the page it was filled for, its inks and
+    /// what of each the page shows; none on any other frame. Never compared. Debug and test
+    /// builds only.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub fn light_words(&self, w: &mut impl crate::state_words::Words) {
+        use crate::state_words::Words as _;
+        let Some(g) = &self.glass else {
+            return;
+        };
+        w.put("bed.glass.fg", u64::from(g.pair.0));
+        w.put("bed.glass.bg", u64::from(g.pair.1));
+        w.list("bed.glass.lut", g.lut, |f, ink| {
+            f.put("ink", u64::from(ink))
+        });
+        w.list("bed.glass.seen", g.seen, |f, seen| f.f32("seen", seen));
     }
 
     /// The ink at walk position `t`, folded through `meteor::tri`, so the station under the caret is the caret's stop by construction.
@@ -1854,7 +2336,10 @@ impl BedInkLut {
         if self.key.is_none() {
             return 0;
         }
-        Self::sample(&self.lut, t)
+        match &self.glass {
+            Some(g) => Self::sample(&g.lut, t),
+            None => Self::sample(&self.lut, t),
+        }
     }
 
     /// The hot edge's ink at walk position `t`.
@@ -1884,6 +2369,27 @@ impl BedInkLut {
         if self.key.is_none() {
             return 0.0;
         }
+        match &self.glass {
+            Some(g) => Self::floor_in(&g.seen, t),
+            None => Self::floor_in(&self.seen, t),
+        }
+    }
+
+    /// Main's colour floor at walk position `t`: [`Self::seen_floor_at`] of main's table, which
+    /// the glass leaves as it was (§15.2 1.8: main's envelope, and every decision it makes, reads
+    /// main's floor on a frame the glass draws).
+    #[inline]
+    #[must_use]
+    pub const fn main_seen_floor_at(&self, t: f32) -> f32 {
+        if self.key.is_none() {
+            return 0.0;
+        }
+        Self::floor_in(&self.seen, t)
+    }
+
+    /// The floor `seen` holds at walk position `t`.
+    #[inline]
+    const fn floor_in(seen: &[f32; BED_INK_LUT_LEN], t: f32) -> f32 {
         let x = clamp01(tri(t)) * (BED_INK_LUT_LEN - 1) as f32;
         let idx = x as usize;
         let i = if idx < BED_INK_LUT_LEN - 1 {
@@ -1896,12 +2402,14 @@ impl BedInkLut {
         } else {
             BED_INK_LUT_LEN - 1
         };
-        self.seen[i].max(self.seen[j])
+        seen[i].max(seen[j])
     }
 
+    /// The colour `table` lays at walk position `t`: the bed's sampler, which Prism Glass's scan
+    /// scores (`prism_glass::scan`).
     #[inline]
     #[must_use]
-    const fn sample(table: &[u32; BED_INK_LUT_LEN], t: f32) -> u32 {
+    pub(crate) const fn sample(table: &[u32; BED_INK_LUT_LEN], t: f32) -> u32 {
         let x = clamp01(tri(t)) * (BED_INK_LUT_LEN - 1) as f32;
         let idx = x as usize;
         let i = if idx < BED_INK_LUT_LEN - 1 {
@@ -2035,7 +2543,328 @@ pub(crate) const fn level_step_melt(peak: f32, u: f32, life_s: f32) -> Option<f3
     Some(((u_next - u) * life_s).max(0.0))
 }
 
-type Sample = (f32, f32, f32, f32, f32);
+/// How far the glass's oldest end eases in, in cells (`docs/design/PRISM-GLASS.md` §2.2 The oldest
+/// end, TAIL_CELLS).
+pub const GLASS_TAIL_CELLS: f32 = 2.5;
+
+/// How short a trail keeps some of its glass's height at its oldest end, in cells (§2.2): the
+/// hand's own height eases out over this many cells behind it.
+pub const GLASS_SHORT_TRAIL_CELLS: f32 = 3.0;
+
+/// A glass run's oldest end (§2.2 The oldest end, §15.2 1.8): the run's height at window x is
+/// its reach times smooth01(d / [`GLASS_TAIL_CELLS`]), `d` the cells from its oldest end, plus
+/// smooth01(1 − behind / [`GLASS_SHORT_TRAIL_CELLS`]), `behind` the cells from its hand, so a
+/// short trail's hand keeps its height. Laid per vertex, so the wedge emission draws the ease
+/// with no stair. A run continued at its oldest end (a seam, a neighbour) has no end there.
+#[derive(Clone, Copy, Debug)]
+struct GlassTail {
+    /// The run's left edge, window x.
+    x0: f32,
+    inv_cw: f32,
+    /// The run's cells.
+    len: f32,
+    /// The hand's boundary, cells from the run's left edge.
+    head: f32,
+    /// Whether the oldest end is the run's right (a stream laid leftward).
+    oldest_right: bool,
+    /// Whether the oldest end is open.
+    open: bool,
+}
+
+impl GlassTail {
+    /// The height share at window x `x`.
+    #[inline]
+    const fn at(self, x: f32) -> f32 {
+        let pos = (x - self.x0) * self.inv_cw;
+        let (d, behind) = if self.oldest_right {
+            (self.len - pos, pos - self.head)
+        } else {
+            (pos, self.head - pos)
+        };
+        let ease = if self.open {
+            smoothstep01(d * (1.0 / GLASS_TAIL_CELLS))
+        } else {
+            1.0
+        };
+        clamp01(ease + smoothstep01(1.0 - behind.max(0.0) * (1.0 / GLASS_SHORT_TRAIL_CELLS)))
+    }
+}
+
+/// A row of the hand's structural set the hand has left ([`Ribbon::structural_rows`],
+/// `docs/design/PRISM-GLASS.md` §2.4 The sink, §15.2 1.10): light only, kept beside main's cells
+/// in a side table keyed by the cohort and its row, which moves with them wherever main moves
+/// rows. The row's glass sinks by height from `left_at` to [`WRAP_SINK_CH`] over
+/// [`WRAP_SINK_S`] ([`wrapped_up`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GlassWrap {
+    /// The cohort on the row.
+    pub cohort: u32,
+    /// The row.
+    pub row: u16,
+    /// When the hand left the row, or when the glass lit over a row it had already left.
+    pub left_at: Instant,
+}
+
+impl GlassWrap {
+    /// How far the row has sunk at `now`: `0` at `left_at`, `1` [`WRAP_SINK_S`] after it
+    /// (smoothstep); `1` at once under reduced motion, which steps main's row holds the same way.
+    #[inline]
+    fn sunk(self, now: Instant, reduced: bool) -> f32 {
+        if reduced {
+            return 1.0;
+        }
+        smoothstep01(
+            now.saturating_duration_since(self.left_at).as_secs_f32() * (1.0 / WRAP_SINK_S),
+        )
+    }
+}
+
+/// The glass's reach `up` px on a row of the hand's structural set (§2.4): a row the hand has left,
+/// `sunk` of the way down, up × lerp(1, min(1, [`WRAP_SINK_CH`] / up), sunk) on a `chf` px cell,
+/// and at most `cap` px (the hand's row of a multi-row set, [`WRAP_HAND_TOP_PX`] under its
+/// cell's top).
+#[inline]
+const fn wrapped_up(up: f32, chf: f32, sunk: f32, cap: f32) -> f32 {
+    let up = if sunk > 0.0 && up > 0.0 {
+        let low = (WRAP_SINK_CH * chf / up).min(1.0);
+        up * (1.0 + (low - 1.0) * sunk)
+    } else {
+        up
+    };
+    up.min(cap)
+}
+
+/// Seconds until a sink falling `fall` px over [`WRAP_SINK_S`] (smoothstep), `x` of the way
+/// through, next moves its height a pixel; `None` once it has no pixel left to fall.
+#[inline]
+#[must_use]
+pub(crate) const fn level_step_sink(fall: f32, x: f32) -> Option<f32> {
+    if !(fall.is_finite() && x.is_finite()) || fall <= 0.0 || x >= 1.0 {
+        return None;
+    }
+    let x = clamp01(x);
+    let next = ((fall * smoothstep01(x)).round() + 0.5) / fall;
+    if next >= 1.0 {
+        return None;
+    }
+    let x_next = 0.5
+        - crate::supernova::sin_cos_f32(
+            crate::color_math::asin_f32((1.0 - 2.0 * next).clamp(-1.0, 1.0)) * (1.0 / 3.0),
+        )
+        .0;
+    Some(((x_next - x) * WRAP_SINK_S).max(0.0))
+}
+
+/// The lip's rows the glass's price reserves under each slab, in `ch`: the lip's deep height
+/// (`docs/design/PRISM-GLASS.md` §2.3 DEEP), so the lip a later phase lays under the glass fits
+/// the density the glass chose.
+pub const GLASS_LIP_RESERVE_CH: f32 = 0.25;
+
+/// The lights a wedge row of the glass lays at most (`aterm_render::ribbon_glass_into`): its
+/// flat run, the melt's run and the dark side's, and the chord a long melt is split at, where a
+/// slab's row lays one.
+pub const GLASS_WEDGE_ROW_LIGHTS: f32 = 4.0;
+
+/// The rows a glass slab lays at a cell `ch` px tall, the lip's reserved rows beside them: its
+/// reach at the hand with the wave's swing, one more where its top straddles a row, and
+/// [`GLASS_LIP_RESERVE_CH`]. Some 36 at a Retina's 28 px.
+#[inline]
+#[must_use]
+pub const fn glass_slab_rows(ch: f32) -> f32 {
+    ((GLASS_UP_CH + LIGHT_GLASS_WAVE_CH) * ch).ceil() + 1.0 + (GLASS_LIP_RESERVE_CH * ch).ceil()
+}
+
+/// The lights a glass run's open oldest end lays past its slabs' own rows at `slabs` a cell
+/// `ch` px tall (§2.2 The oldest end): every slab of the ease ([`GLASS_TAIL_CELLS`], one more
+/// for its straddle) is a wedge, each wedge row laying [`GLASS_WEDGE_ROW_LIGHTS`] where a slab's
+/// row lays one, over the rows its top climbs (at most smoothstep's steepest, 1.5 times the
+/// mean climb) and its melt's ([`GLASS_EDGE_PX`]), with a row's straddle at each side. A wedge
+/// row's runs each stand in their own column, so none rides a ramp
+/// ([`aterm_render::glow_ramps::RAMP_COST`] folds a column's rows only): each is charged whole
+/// against [`RIBBON_QUAD_BUDGET`], as the ramp sink's `laid` counts it.
+#[inline]
+#[must_use]
+pub const fn glass_tail_wedge_lights(ch: f32, slabs: usize) -> f32 {
+    let reach = (GLASS_UP_CH + LIGHT_GLASS_WAVE_CH) * ch;
+    let per_cell = slabs as f32;
+    let wedges = (GLASS_TAIL_CELLS * per_cell).ceil() + 1.0;
+    let climb = reach * 1.5 / (GLASS_TAIL_CELLS * per_cell);
+    let edge_rows = (climb + GLASS_EDGE_PX).ceil() + 2.0;
+    wedges * edge_rows * (GLASS_WEDGE_ROW_LIGHTS - 1.0)
+}
+
+/// What a glass frame of `cells` cells over `rows` rows of `ch` px costs at `slabs` a cell, in
+/// lights: each slab's [`glass_slab_rows`], one cell's slabs more for the run's last boundary as
+/// main prices it, and each row's open oldest end ([`glass_tail_wedge_lights`]).
+#[inline]
+#[must_use]
+pub const fn glass_frame_price(ch: f32, cells: usize, rows: usize, slabs: usize) -> f32 {
+    (cells + 1) as f32 * slabs as f32 * glass_slab_rows(ch)
+        + rows as f32 * glass_tail_wedge_lights(ch, slabs)
+}
+
+/// The rows the plan's cells stand on, sorted by row ([`Ribbon::plan`]).
+#[inline]
+const fn rows_of(sorted: &[(u16, u16, u32)]) -> usize {
+    let mut rows = 0;
+    let mut i = 0;
+    while i < sorted.len() {
+        if i == 0 || sorted[i].0 != sorted[i - 1].0 {
+            rows += 1;
+        }
+        i += 1;
+    }
+    rows
+}
+
+/// How [`Ribbon::envelope`] folds a cell's factors: main's one product ([`MainEnv`]), or the
+/// glass's opacity and height ([`GlassEnv`]).
+trait Envelope: Copy {
+    /// The envelope of a cell not yet born.
+    const DARK: Self;
+    /// The birth's edge-in (its wipe's ramp).
+    fn edge_in(&mut self, f: f32);
+    /// A factor that moves the light over time: the melt, an exit or a cell's own relight
+    /// (under reduced motion, its fade).
+    fn fade(&mut self, f: f32);
+    /// The focus ember's factor and its relight's, from the ember's floor: main's [`Self::fade`].
+    #[inline]
+    fn ember(&mut self, f: f32) {
+        self.fade(f);
+    }
+    /// A dim no clock of the motion makes: a printed line's.
+    fn scale(&mut self, f: f32);
+    /// The ember's floor for `cell`, from what the envelope carries so far.
+    fn ember_floor(&self, rib: &Ribbon, ctx: &Ctx<'_>, cell: &Cell) -> f32;
+}
+
+/// Main's envelope: the product of every factor, in [`Ribbon::envelope`]'s order.
+#[derive(Clone, Copy, Debug)]
+struct MainEnv(f32);
+
+impl Envelope for MainEnv {
+    const DARK: Self = Self(0.0);
+
+    #[inline]
+    fn edge_in(&mut self, f: f32) {
+        self.0 *= f;
+    }
+
+    #[inline]
+    fn fade(&mut self, f: f32) {
+        self.0 *= f;
+    }
+
+    #[inline]
+    fn scale(&mut self, f: f32) {
+        self.0 *= f;
+    }
+
+    #[inline]
+    fn ember_floor(&self, rib: &Ribbon, ctx: &Ctx<'_>, cell: &Cell) -> f32 {
+        rib.ember_floor(ctx, cell, self.0)
+    }
+}
+
+/// The glass's envelope (`docs/design/PRISM-GLASS.md` §2.2 Exits by height, §15.2 1.8): its
+/// opacity moves only at the edge-in and, under reduced motion, the fade; every other factor (the
+/// melt, the swoosh, the retract, the curtain, the ember, a relight, the printed dim) scales its
+/// height. Its ember holds the height [`GLASS_MIN_PX`] (with main's margin) of a `reach` px glass,
+/// so every run stays drawn through it, and under reduced motion too: the ember and its relight
+/// move the height ([`Envelope::ember`]), so an unfocused window's glass stands at its least
+/// height at whole opacity, never a translucent pastel held for as long as the window is
+/// unfocused.
+#[derive(Clone, Copy, Debug)]
+struct GlassEnv {
+    opacity: f32,
+    height: f32,
+    reduced: bool,
+    reach: f32,
+}
+
+impl GlassEnv {
+    #[inline]
+    const fn new(reduced: bool, reach: f32) -> Self {
+        Self {
+            opacity: 1.0,
+            height: 1.0,
+            reduced,
+            reach,
+        }
+    }
+}
+
+impl Envelope for GlassEnv {
+    const DARK: Self = Self {
+        opacity: 0.0,
+        height: 0.0,
+        reduced: false,
+        reach: 0.0,
+    };
+
+    #[inline]
+    fn edge_in(&mut self, f: f32) {
+        self.opacity *= f;
+    }
+
+    #[inline]
+    fn fade(&mut self, f: f32) {
+        if self.reduced {
+            self.opacity *= f;
+        } else {
+            self.height *= f;
+        }
+    }
+
+    #[inline]
+    fn ember(&mut self, f: f32) {
+        self.height *= f;
+    }
+
+    #[inline]
+    fn scale(&mut self, f: f32) {
+        self.height *= f;
+    }
+
+    #[inline]
+    fn ember_floor(&self, _: &Ribbon, _: &Ctx<'_>, _: &Cell) -> f32 {
+        glass_height_floor(self.reach * self.height)
+    }
+}
+
+/// The share of its height a glass `reach` px tall keeps through an ember: [`GLASS_MIN_PX`]
+/// with main's margin ([`EMBER_FLOOR_MARGIN`]).
+#[inline]
+const fn glass_height_floor(reach: f32) -> f32 {
+    if !reach.is_finite() || reach <= 0.0 {
+        return 0.0;
+    }
+    GLASS_MIN_PX * EMBER_FLOOR_MARGIN / reach
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static GLASS_EXITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one glass exit read ([`take_glass_exits`]).
+#[cfg(any(test, debug_assertions))]
+#[inline]
+fn count_glass_exit() {
+    GLASS_EXITS.with(|n| n.set(n.get() + 1));
+}
+
+/// The glass's exits this thread ran since the last take, zeroed: the glass envelopes folded
+/// (opacity and height), the glass slab prices ([`glass_frame_price`]) and the glass cadences
+/// ([`Ribbon::next_change_deadline`]'s one-pixel steps). The host's light-fork pin holds it at
+/// zero on every dark ground. Debug and test builds only.
+#[cfg(any(test, debug_assertions))]
+pub fn take_glass_exits() -> usize {
+    GLASS_EXITS.with(|n| n.replace(0))
+}
+
+/// A boundary's planned shape: `(spine, up, dn, t, cov, glass_up)` ([`Segment`]).
+type Sample = (f32, f32, f32, f32, f32, f32);
 
 #[derive(Clone, Copy, Debug)]
 struct Run {
@@ -2072,6 +2901,7 @@ struct HeadFeather {
     head_x: f32,
     /// The feather's reach back from it, px; `0` for none.
     width: f32,
+    inv_width: f32,
 }
 
 impl HeadFeather {
@@ -2081,7 +2911,44 @@ impl HeadFeather {
         if self.width <= 0.0 {
             return 1.0;
         }
-        smoothstep01((x - self.head_x).abs() / self.width)
+        smoothstep01((x - self.head_x).abs() * self.inv_width)
+    }
+}
+
+/// How [`Ribbon::emit`] lays a run's vertices: main's beam at a shoulder (`aterm_render::ribbon_beam_into`,
+/// source-over), or the light glass (§15.2 1.7: `aterm_render::ribbon_glass_into`, its slabs
+/// wedges at [`aterm_render::WEDGE_EDGE_PX`] and its top a [`GLASS_EDGE_PX`] melt).
+#[derive(Clone, Copy, Debug)]
+enum BodyLay {
+    Beam(f32),
+    Glass,
+}
+
+impl BodyLay {
+    /// Lay `verts` into `out`; `false` where the `budget` ran out.
+    #[inline]
+    fn lay(
+        self,
+        out: &mut RampSink<'_>,
+        clip: BeamClip,
+        verts: &[RibbonVertex],
+        stride: usize,
+        budget: usize,
+    ) -> bool {
+        match self {
+            Self::Beam(shoulder) => {
+                ribbon_beam_into(out, clip, verts, shoulder, stride, budget, GlowBlend::Over)
+            }
+            Self::Glass => aterm_render::ribbon_glass_into(
+                out,
+                clip,
+                verts,
+                stride,
+                budget,
+                aterm_render::WEDGE_EDGE_PX,
+                GLASS_EDGE_PX,
+            ),
+        }
     }
 }
 
@@ -2094,6 +2961,8 @@ struct LaidSegment {
     dn: f32,
     t: f32,
     cov: f32,
+    glass_up: f32,
+    glass_jump: f32,
 }
 
 const FEATHER_FINE_PX: f32 = 1.0;
@@ -2131,6 +3000,8 @@ const fn laid_segment(s: &Segment) -> LaidSegment {
         dn: s.dn,
         t: s.t,
         cov: s.cov as f32,
+        glass_up: s.glass_up,
+        glass_jump: s.glass_jump,
     }
 }
 
@@ -2178,13 +3049,21 @@ fn for_each_feathered(
                 let n = ((here.x - p.x).abs() / px).floor() as usize;
                 if n > 1 {
                     let inv_nf = 1.0 / (n as f32);
-                    let (dx, d_spine, d_up, d_dn, dt, d_cov) = (
+                    // A hard step's right side opens at its own walk: the boundaries laid
+                    // between `p` and `here` lerp from `p` to `here`'s right side.
+                    let here_t = if here.glass_jump == 0.0 {
+                        here.t
+                    } else {
+                        here.t + here.glass_jump
+                    };
+                    let (dx, d_spine, d_up, d_dn, dt, d_cov, d_glass) = (
                         here.x - p.x,
                         here.spine - p.spine,
                         here.up - p.up,
                         here.dn - p.dn,
-                        here.t - p.t,
+                        here_t - p.t,
                         here.cov - p.cov,
+                        here.glass_up - p.glass_up,
                     );
                     let mut k = 1;
                     while k < n {
@@ -2198,6 +3077,8 @@ fn for_each_feathered(
                                 dn: p.dn + d_dn * u,
                                 t: p.t + dt * u,
                                 cov: p.cov + d_cov * u,
+                                glass_up: p.glass_up + d_glass * u,
+                                glass_jump: 0.0,
                             },
                         );
                         k += 1;
@@ -2249,6 +3130,16 @@ pub struct Ribbon {
     /// Test-only: leave a run the hand has left square-cut at its head end (no [`Ribbon::head_feather`]), the negative control of the feather's test.
     #[cfg(test)]
     head_square: bool,
+    /// Test-only: lift the underline off a last or held row's floor by its
+    /// reach below, as the tall ribbon is lifted, as it was (looks10 L3's
+    /// negative control).
+    #[cfg(test)]
+    underline_lifted: bool,
+    /// Test-only: ease the underline off the letters that land on the row
+    /// below with the row's hold, as the tall ribbon eases, as it did
+    /// (looks10 round 3's negative control).
+    #[cfg(test)]
+    underline_eases_off_letters: bool,
     /// Test-only: keep the hot edge on a run the hand has left, the negative
     /// control of the hot edge's hand test.
     #[cfg(test)]
@@ -2262,6 +3153,10 @@ pub struct Ribbon {
     /// tail's fine lay ([`RUN_END_FINE_CELLS`]).
     #[cfg(test)]
     tail_stair: bool,
+    /// Test-only: step the glass's cadence by main's coverage levels, the negative control of
+    /// its one-pixel steps ([`Ribbon::next_change_deadline`]).
+    #[cfg(test)]
+    glass_level_steps: bool,
     /// Test-only: centre the hot edge on the row's top under a kept box, the
     /// negative control of its inset.
     #[cfg(test)]
@@ -2274,14 +3169,27 @@ pub struct Ribbon {
     /// negative control of the descenders' hairline.
     #[cfg(test)]
     rail_flush: bool,
+    /// Test-only: the hairline rounded alone, a pixel on a short row, inside
+    /// the judge's ring ([`rail_gap_px`]'s negative control).
+    #[cfg(test)]
+    pub(crate) rail_gap_rounded: bool,
     /// Test-only: the rail keeps below its row over a filled cell, as it did
     /// (looks8 K9's negative control).
     #[cfg(test)]
     pub(crate) row_rail_off: bool,
+    /// Test-only: the in-row rail parts round every foot, as it did
+    /// (looks9 Q9's negative control, [`ROW_RAIL_DIP_GAP_PX`]).
+    #[cfg(test)]
+    pub(crate) row_rail_parted: bool,
     /// Test-only: draw the pet's and the flat ribbon alike on paper (no
     /// rail, one body), the negative control of their reading apart there.
     #[cfg(test)]
     paper_alike: bool,
+    /// Test-only: lay the flat ribbon's body on paper as the pet's glow, its
+    /// lit plateau and its light following each cell's (looks9 Q6's
+    /// negative control, [`FLAT_PAPER_GAIN`]).
+    #[cfg(test)]
+    flat_paper_glow: bool,
     /// Test-only: leave each row's hold behind when a scroll or a band move
     /// carries its line away, the negative control of the carried hold.
     #[cfg(test)]
@@ -2311,6 +3219,23 @@ pub struct Ribbon {
     /// resident stamped cells; an exact return must still match its saved count.
     release_parts: Vec<ReleasePart>,
     ink: BedInkLut,
+    /// The light pages' palettes the bed's glass draws by ([`glass_table`]), light only.
+    palettes: PaletteCache,
+    /// The instant of the last frame whose plan the bed's glass drew, laid or not
+    /// ([`Self::glass_drew_at`]), light only.
+    glass_drew: Option<Instant>,
+    /// The under stream's span that frame's glass was laid in ([`Self::glass_span`]), light
+    /// only: `None` on a frame it laid nothing.
+    glass_span: Option<(StreamMark, StreamMark)>,
+    /// The rows of the hand's structural set the hand has left ([`GlassWrap`]), light only:
+    /// empty on every frame the bed draws by main's table.
+    glass_wrap: Vec<GlassWrap>,
+    /// The hand's row when the last plan's structural set held more than one row
+    /// ([`WRAP_HAND_TOP_PX`]), light only.
+    wrap_hand: Option<u16>,
+    /// Test-only: lay no sink, the negative control of the wrap's sink and of its wakes.
+    #[cfg(test)]
+    wrap_unsunk: bool,
     ground: u32,
     ink_quads: usize,
     /// The frame's rails laid clear of their row's ring, as `[from, to)`
@@ -2326,6 +3251,16 @@ pub struct Ribbon {
     attach: Option<(u16, u16)>,
     attach_floor: Option<AttachFloor>,
     cell_h: f32,
+    /// The glass's slabs a cell at the last plan ([`Self::glass_slabs_per_cell`]).
+    glass_slabs: usize,
+    /// The glass's px a `ch` at the last plan: the cell's height times the frame's intensity
+    /// under `glass_lit`, `0` on every other frame ([`Self::next_change_deadline`]'s pixel steps).
+    glass_px: f32,
+    /// Test-only: main's ember floor reads the glass's colour floor
+    /// ([`BedInkLut::seen_floor_at`]), the 1.5 leak `main_seen_floor_at` closed (§15.2 1.8),
+    /// for the paper twin's negative control.
+    #[cfg(test)]
+    pub(crate) ember_reads_glass: bool,
     wedge_px: f32,
     scroll_followed: bool,
     followed_now: Vec<(u16, u16, Instant)>,
@@ -2356,6 +3291,11 @@ pub struct Ribbon {
     /// What the body's top never feathers up into ([`KeepOut`]): a word
     /// icon or a lettered or filled cell standing on the run's row.
     pub keep_out: KeepOut,
+    /// A test's negative control: a body reaching past the effects box's top
+    /// is cut flat there by the box's clip, not laid shorter inside it
+    /// ([`crate::cursor_glow::RISE_CLEAR_PX`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) rise_cut: bool,
 }
 
 /// How far beside a [`KeepOut`] box the body's top eases back to its own
@@ -2521,11 +3461,17 @@ impl Ribbon {
             #[cfg(test)]
             head_square: false,
             #[cfg(test)]
+            underline_lifted: false,
+            #[cfg(test)]
+            underline_eases_off_letters: false,
+            #[cfg(test)]
             hot_edge_left_lit: false,
             #[cfg(test)]
             feather_coarse: false,
             #[cfg(test)]
             tail_stair: false,
+            #[cfg(test)]
+            glass_level_steps: false,
             #[cfg(test)]
             hot_edge_on_bar: false,
             #[cfg(test)]
@@ -2533,9 +3479,15 @@ impl Ribbon {
             #[cfg(test)]
             rail_flush: false,
             #[cfg(test)]
+            rail_gap_rounded: false,
+            #[cfg(test)]
             row_rail_off: false,
             #[cfg(test)]
+            row_rail_parted: false,
+            #[cfg(test)]
             paper_alike: false,
+            #[cfg(test)]
+            flat_paper_glow: false,
             #[cfg(test)]
             holds_left_behind: false,
             holds: Vec::new(),
@@ -2554,6 +3506,13 @@ impl Ribbon {
             released_cohorts: Vec::new(),
             release_parts: Vec::new(),
             ink: BedInkLut::EMPTY,
+            palettes: PaletteCache::new(),
+            glass_drew: None,
+            glass_span: None,
+            glass_wrap: Vec::new(),
+            wrap_hand: None,
+            #[cfg(test)]
+            wrap_unsunk: false,
             ground: 0,
             ink_quads: 0,
             rail_spans: Vec::new(),
@@ -2566,6 +3525,10 @@ impl Ribbon {
             attach: None,
             attach_floor: None,
             cell_h: 0.0,
+            glass_px: 0.0,
+            #[cfg(test)]
+            ember_reads_glass: false,
+            glass_slabs: 0,
             wedge_px: 0.0,
             scroll_followed: false,
             followed_now: Vec::new(),
@@ -2594,6 +3557,8 @@ impl Ribbon {
             curtain: None,
             hand_floor: None,
             keep_out: KeepOut::EMPTY,
+            #[cfg(any(test, debug_assertions))]
+            rise_cut: false,
         }
     }
 
@@ -2657,6 +3622,7 @@ impl Ribbon {
     }
 
     /// The instant `cell`'s expiry is measured from — see [`live_since`].
+    #[inline]
     #[must_use]
     #[cfg(test)]
     pub fn live_since(&self, cell: &Cell) -> Instant {
@@ -2664,6 +3630,7 @@ impl Ribbon {
     }
 
     /// The callback-relative swoosh as a fault.
+    #[inline]
     #[cfg(test)]
     pub fn restart_unobserved_swooshes(&mut self, now: Instant) {
         let mut ci = 0;
@@ -2698,6 +3665,15 @@ impl Ribbon {
         self.plan.as_slice()
     }
 
+    /// The glass's slabs a cell on the last plan (§15.2 1.8: [`glass_frame_price`]'s density, laid
+    /// a whole number to each of the plan's vertices); `0` on a frame the bed does not draw by its
+    /// glass.
+    #[inline]
+    #[must_use]
+    pub const fn glass_slabs_per_cell(&self) -> usize {
+        self.glass_slabs
+    }
+
     /// The frame's vertex density.
     #[inline]
     #[must_use]
@@ -2712,6 +3688,7 @@ impl Ribbon {
     }
 
     /// The caret cell as last observed, or `None` before any.
+    #[inline]
     #[must_use]
     #[cfg(test)]
     pub const fn caret(&self) -> Option<(u16, u16)> {
@@ -2722,7 +3699,9 @@ impl Ribbon {
     #[inline]
     #[must_use]
     pub const fn body_profile(cfg: &Config) -> BodyProfile {
-        let dn_ch = if Self::comet(cfg) {
+        let dn_ch = if !cfg.ribbon_tall {
+            UNDERLINE_DN_CH
+        } else if Self::comet(cfg) {
             COMET_DN_HAND_CH
         } else {
             DN_TOP_CH
@@ -2733,6 +3712,7 @@ impl Ribbon {
                 dn_ch,
                 core_up_ch: TALL_CORE_CH,
                 shoulder: SHOULDER_TALL,
+                tall: true,
             }
         } else {
             BodyProfile {
@@ -2740,6 +3720,7 @@ impl Ribbon {
                 dn_ch,
                 core_up_ch: LEAD_CH,
                 shoulder: SHOULDER_UNDERLINE,
+                tall: false,
             }
         }
     }
@@ -2795,6 +3776,22 @@ impl Ribbon {
     #[inline]
     pub fn forget_rails(&mut self) {
         self.rail_spans.clear();
+    }
+
+    /// Forget that this frame's body drew by the glass: what it drew was cut away.
+    #[inline]
+    pub const fn unlay_glass(&mut self) {
+        self.glass_drew = None;
+        self.glass_span = None;
+    }
+
+    /// The span of the under stream the last frame's glass was laid in, `[from, to)` of its
+    /// quads and ramps (§15.2 1.9: the glass is light-owned, the yield's to cut and never the
+    /// letter guard's); `None` on a frame the glass did not draw or laid nothing.
+    #[inline]
+    #[must_use]
+    pub const fn glass_span(&self) -> Option<(StreamMark, StreamMark)> {
+        self.glass_span
     }
 
     /// Ingest one engine event at its own edge, before this frame's plan.
@@ -3132,10 +4129,182 @@ impl Ribbon {
     }
 
     /// The open phrase's id — read-only, for the twins.
+    #[inline]
     #[must_use]
     #[cfg(test)]
     pub const fn phrase_open(&self) -> Option<u32> {
         self.phrase_open
+    }
+
+    /// The hand's structural set (`docs/design/PRISM-GLASS.md` §14 amendment 4, §15.2 1.10), as
+    /// `(top, bottom)` rows, inclusive: the hand's row `hand` and the contiguous rows beside it
+    /// that each hold a live cohort of the hand's open phrase that is neither abandoned nor a
+    /// wake, the [`STRUCTURAL_ROWS_MAX`] rows nearest the hand at most. Just the hand's row when no
+    /// phrase is open or no row beside it holds one.
+    #[inline]
+    #[must_use]
+    pub const fn structural_rows(&self, hand: u16) -> (u16, u16) {
+        let Some(open) = self.phrase_open else {
+            return (hand, hand);
+        };
+        let (mut top, mut bottom) = (hand, hand);
+        let (mut up, mut down) = (true, true);
+        while (up || down) && bottom - top + 1 < STRUCTURAL_ROWS_MAX {
+            if up {
+                match top.checked_sub(1) {
+                    Some(row) if self.holds_phrase_on(open, row) => top = row,
+                    _ => up = false,
+                }
+            }
+            if down && bottom - top + 1 < STRUCTURAL_ROWS_MAX {
+                match bottom.checked_add(1) {
+                    Some(row) if self.holds_phrase_on(open, row) => bottom = row,
+                    _ => down = false,
+                }
+            }
+        }
+        (top, bottom)
+    }
+
+    /// Whether `row` holds a cohort of phrase `open` that counts toward the structural set.
+    #[inline]
+    const fn holds_phrase_on(&self, open: u32, row: u16) -> bool {
+        let cohorts = self.cohorts.as_slice();
+        let mut i = 0;
+        while i < cohorts.len() {
+            if cohorts[i].row == row && Self::of_phrase(&cohorts[i], open) {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Whether `coh` is a live cohort of phrase `open`, neither abandoned nor a wake
+    /// ([`Self::structural_rows`]).
+    #[inline]
+    const fn of_phrase(coh: &Cohort, open: u32) -> bool {
+        coh.phrase == open && !coh.abandoned && !coh.wake && !matches!(coh.phase, Phase::Fading)
+    }
+
+    /// The wrap's side table ([`GlassWrap`]) for the frame at `ctx` (§2.4, §15.2 1.10). Under
+    /// the glass: each cohort of the hand's open phrase on a row of its structural set the hand is
+    /// not on is recorded left now (on a row another record already holds, at that record's
+    /// instant, so a cohort merged or relaid there keeps its row's sink); the row the hand is on
+    /// keeps none (Backspace clears it); a record whose cohort no longer stands on its row is
+    /// dropped. On any other frame the table is empty, so the glass's falling edge clears it.
+    #[inline]
+    fn sync_glass_wrap(&mut self, ctx: &Ctx<'_>) {
+        if !self.ink.glass_lit() {
+            self.glass_wrap.clear();
+            self.wrap_hand = None;
+            return;
+        }
+        #[cfg(any(test, debug_assertions))]
+        count_glass_exit();
+        let hand = ctx.caret.0;
+        let (top, bottom) = self.structural_rows(hand);
+        self.wrap_hand = if bottom > top { Some(hand) } else { None };
+        self.glass_wrap.retain(|w| w.row != hand);
+        if let Some(open) = self.phrase_open
+            && bottom > top
+        {
+            for coh in &self.cohorts {
+                if coh.row == hand
+                    || coh.row < top
+                    || coh.row > bottom
+                    || !Self::of_phrase(coh, open)
+                    || self
+                        .glass_wrap
+                        .iter()
+                        .any(|w| w.cohort == coh.id && w.row == coh.row)
+                {
+                    continue;
+                }
+                let left_at = self
+                    .glass_wrap
+                    .iter()
+                    .filter(|w| w.row == coh.row)
+                    .map(|w| w.left_at)
+                    .min()
+                    .unwrap_or(ctx.now);
+                self.glass_wrap.push(GlassWrap {
+                    cohort: coh.id,
+                    row: coh.row,
+                    left_at,
+                });
+            }
+        }
+        let cohorts = &self.cohorts;
+        self.glass_wrap
+            .retain(|w| cohorts.iter().any(|c| c.id == w.cohort && c.row == w.row));
+    }
+
+    /// How far run `cohort`'s glass on `row` has sunk at `now` ([`GlassWrap::sunk`]); `0` on a
+    /// row the hand has not left.
+    #[inline]
+    fn sunk_on(&self, cohort: u32, row: u16, now: Instant) -> f32 {
+        #[cfg(test)]
+        if self.wrap_unsunk {
+            return 0.0;
+        }
+        match self
+            .glass_wrap
+            .iter()
+            .find(|w| w.cohort == cohort && w.row == row)
+        {
+            Some(w) => w.sunk(now, self.reduced),
+            None => 0.0,
+        }
+    }
+
+    /// A carry's half of the wrap's table ([`Self::translate_run`]): the record of `cohort` on
+    /// `row` goes to `new_row` with its cells, under the carried part's own cohort `id` when the
+    /// carry split it (the part left behind keeping its own), and is dropped when `new_row` is off
+    /// the pane.
+    #[inline]
+    fn carry_glass_wrap(&mut self, cohort: u32, row: u16, id: u32, new_row: u16) {
+        let Some(i) = self
+            .glass_wrap
+            .iter()
+            .position(|w| w.cohort == cohort && w.row == row)
+        else {
+            return;
+        };
+        let on_pane = match self.pane_rows {
+            Some((row0, rows)) => new_row >= row0 && new_row < row0.saturating_add(rows),
+            None => true,
+        };
+        if id != cohort {
+            if on_pane {
+                let carried = GlassWrap {
+                    cohort: id,
+                    row: new_row,
+                    ..self.glass_wrap[i]
+                };
+                self.glass_wrap.push(carried);
+            }
+        } else if on_pane {
+            self.glass_wrap[i].row = new_row;
+        } else {
+            self.glass_wrap.remove(i);
+        }
+    }
+
+    /// The rows of the hand's structural set the hand has left, light only ([`GlassWrap`]):
+    /// empty on every frame the bed draws by main's table.
+    #[inline]
+    #[must_use]
+    pub const fn glass_wraps(&self) -> &[GlassWrap] {
+        self.glass_wrap.as_slice()
+    }
+
+    /// The hand's row when its structural set spans more than one row on a glass frame, which
+    /// keeps [`WRAP_HAND_TOP_PX`] of page above its glass; `None` on every other frame.
+    #[inline]
+    #[must_use]
+    pub const fn wrap_hand(&self) -> Option<u16> {
+        self.wrap_hand
     }
 
     #[inline]
@@ -3316,41 +4485,66 @@ impl Ribbon {
         let below = matches!(self.caret, Some((row, _)) if coh.row > row);
         let mut lo = u16::MAX;
         let mut hi = 0u16;
+        let mut lo_born: Option<Instant> = None;
+        let mut lo_disp = 0.0_f32;
+        let mut hi_born: Option<Instant> = None;
+        let mut hi_disp = 0.0_f32;
+        let mut has_leaving = false;
         let cells = self.cells.as_slice();
         let mut ci = 0;
         while ci < cells.len() {
             let c = &cells[ci];
-            if c.row == coh.row && c.cohort == coh.id && !c.leaving() {
-                if c.col < lo {
-                    lo = c.col;
-                }
-                if c.col > hi {
-                    hi = c.col;
+            if c.row == coh.row && c.cohort == coh.id {
+                if !c.leaving() {
+                    if c.col < lo {
+                        lo = c.col;
+                        lo_born = Some(c.born);
+                        lo_disp = c.birth_disp;
+                    } else if c.col == lo && !matches!(lo_born, Some(b) if c.born < b) {
+                        lo_born = Some(c.born);
+                        lo_disp = c.birth_disp;
+                    }
+                    if c.col > hi {
+                        hi = c.col;
+                        hi_born = Some(c.born);
+                        hi_disp = c.birth_disp;
+                    } else if c.col == hi && !matches!(hi_born, Some(b) if c.born < b) {
+                        hi_born = Some(c.born);
+                        hi_disp = c.birth_disp;
+                    }
+                } else {
+                    has_leaving = true;
                 }
             }
             ci += 1;
         }
-        let (lo, hi) = if lo > hi {
+        let no_staying = lo > hi;
+        let (lo, hi) = if no_staying {
             (coh.col0, coh.col1.saturating_sub(1).max(coh.col0))
         } else {
             (lo, hi)
         };
         let edge = if below { lo } else { hi };
-        let mut best_born: Option<Instant> = None;
-        let mut disp = 0.0_f32;
-        let mut ci = 0;
-        while ci < cells.len() {
-            let c = &cells[ci];
-            if c.row == coh.row
-                && c.cohort == coh.id
-                && c.col == edge
-                && !matches!(best_born, Some(b) if c.born < b)
-            {
-                best_born = Some(c.born);
-                disp = c.birth_disp;
+        let disp = if !no_staying && !has_leaving {
+            if below { lo_disp } else { hi_disp }
+        } else {
+            let mut best_born: Option<Instant> = None;
+            let mut disp = 0.0_f32;
+            let mut ci = 0;
+            while ci < cells.len() {
+                let c = &cells[ci];
+                if c.row == coh.row
+                    && c.cohort == coh.id
+                    && c.col == edge
+                    && !matches!(best_born, Some(b) if c.born < b)
+                {
+                    best_born = Some(c.born);
+                    disp = c.birth_disp;
+                }
+                ci += 1;
             }
-            ci += 1;
-        }
+            disp
+        };
         let heat = smoothstep01((disp - HOT_EDGE_DISP_MIN) * (1.0 / HOT_EDGE_DISP_SPAN));
         let kept = f32::from(hi - lo) + 1.0;
         let drift = (FLOW_DRIFT_MIN_CELLS + (FLOW_DRIFT_MAX_CELLS - FLOW_DRIFT_MIN_CELLS) * heat)
@@ -4416,11 +5610,12 @@ impl Ribbon {
             coh.t0 = seat.t;
             coh.d0 = seat.d;
             let origin = *coh;
+            let walk_zero = origin.walk_zero();
             let mut ci = 0;
             while ci < self.cells.len() {
                 let c = &mut self.cells[ci];
                 if c.cohort == origin.id {
-                    c.t = origin.t_at(c.col);
+                    c.t = walk_zero + walk_t(origin.walk_d(c.col));
                 }
                 ci += 1;
             }
@@ -5015,12 +6210,13 @@ impl Ribbon {
             }
             self.carry_release(wake.id, band.id);
             self.merge_hold(wake.id, band.id, row);
+            let band_walk_zero = band.walk_zero();
             let mut mi = 0;
             while mi < self.cells.len() {
                 let cell = &mut self.cells[mi];
                 if cell.cohort == wake.id {
                     cell.cohort = band.id;
-                    cell.t = band.t_at(cell.col);
+                    cell.t = band_walk_zero + walk_t(band.walk_d(cell.col));
                     if let Some(like) = like {
                         cell.life_s = cell.life_s.max(like.life_s);
                         cell.cov0 = cell.cov0.max(like.cov0);
@@ -5173,6 +6369,7 @@ impl Ribbon {
     pub fn retire_cells(&mut self, cells: &[(u16, u16, Instant)], at: Instant) -> usize {
         let mut n = 0;
         let mut ci = 0;
+        let mut last_revoked: Option<u32> = None;
         while ci < self.cells.len() {
             let cell = &mut self.cells[ci];
             ci += 1;
@@ -5181,12 +6378,13 @@ impl Ribbon {
             }
             if cell.leaving() {
                 // Replaced content cannot restore a prior partial release, even when its visual retract has already finished.
-                if cell.released_at.take().is_some() {
+                if cell.released_at.take().is_some() && last_revoked != Some(cell.cohort) {
                     let mut ki = 0;
                     while ki < self.cohorts.len() {
                         let coh = &mut self.cohorts[ki];
                         if coh.id == cell.cohort {
                             coh.revoke_releases(at);
+                            last_revoked = Some(cell.cohort);
                             break;
                         }
                         ki += 1;
@@ -5195,14 +6393,17 @@ impl Ribbon {
                 continue;
             }
             cell.retire_at = Some(at);
-            let mut ki = 0;
-            while ki < self.cohorts.len() {
-                let coh = &mut self.cohorts[ki];
-                if coh.id == cell.cohort {
-                    coh.revoke_releases(at);
-                    break;
+            if last_revoked != Some(cell.cohort) {
+                let mut ki = 0;
+                while ki < self.cohorts.len() {
+                    let coh = &mut self.cohorts[ki];
+                    if coh.id == cell.cohort {
+                        coh.revoke_releases(at);
+                        last_revoked = Some(cell.cohort);
+                        break;
+                    }
+                    ki += 1;
                 }
-                ki += 1;
             }
             n += 1;
         }
@@ -5476,9 +6677,9 @@ impl Ribbon {
         if from == into {
             return;
         }
-        if self.cohort_by_id(into).is_none() {
+        let Some(into_idx) = self.cohort_index(into) else {
             return;
-        }
+        };
         let Some(from_coh) = self.cohort_by_id(from) else {
             return;
         };
@@ -5502,9 +6703,7 @@ impl Ribbon {
                 ..part
             });
         }
-        let Some(target) = self.cohort_by_id_mut(into) else {
-            return;
-        };
+        let target = &mut self.cohorts[into_idx];
         if let Some(t) = revoked {
             target.parts_revoked_at = Some(match target.parts_revoked_at {
                 Some(u) => u.max(t),
@@ -5647,11 +6846,12 @@ impl Ribbon {
                 coh.d0 = merged.d0;
             }
             let origin = *coh;
+            let walk_zero = origin.walk_zero();
             let mut ci = 0;
             while ci < self.cells.len() {
                 let c = &mut self.cells[ci];
                 if c.cohort == into_id {
-                    c.t = origin.t_at(c.col);
+                    c.t = walk_zero + walk_t(origin.walk_d(c.col));
                 }
                 ci += 1;
             }
@@ -5684,10 +6884,17 @@ impl Ribbon {
     #[inline]
     pub fn plan_over(&mut self, ctx: &Ctx<'_>, below: Option<&GlyphProbe>) {
         self.ink.sync(ctx.cfg);
+        self.ink
+            .sync_glass(ctx.cfg, glass_table(ctx.cfg, &mut self.palettes));
         self.ground = ctx.cfg.theme_bg;
         self.caret = Some(ctx.caret);
         self.reduced = ctx.cfg.reduced_motion;
         self.cell_h = ctx.geom.ch as f32;
+        self.glass_px = if self.ink.glass_lit() {
+            self.cell_h * clamp01(ctx.cfg.intensity)
+        } else {
+            0.0
+        };
         self.wedge_px = (Self::body_profile(ctx.cfg).dn_ch - DN_FLOOR_CH).max(0.0) * self.cell_h;
         self.advance_swoosh(ctx);
         self.retire(ctx);
@@ -5697,6 +6904,7 @@ impl Ribbon {
             self.seam = None;
         }
         self.heal_seams();
+        self.sync_glass_wrap(ctx);
         self.build(ctx, below);
         self.carried_holds.clear();
         self.scroll_followed = false;
@@ -5793,9 +7001,10 @@ impl Ribbon {
 
     #[inline]
     fn lay_reach_cell(&mut self, row: u16, col: u16, cohort: u32) {
-        let Some(&coh) = self.cohort_by_id(cohort) else {
+        let Some(coh_idx) = self.cohort_index(cohort) else {
             return;
         };
+        let coh = self.cohorts[coh_idx];
         let mut tail: Option<Cell> = None;
         let mut i = 0;
         while i < self.cells.len() {
@@ -5829,9 +7038,7 @@ impl Ribbon {
             rearm: tail.rearm,
             released_at: None,
         });
-        if let Some(coh) = self.cohort_by_id_mut(cohort) {
-            coh.col0 = coh.col0.min(col);
-        }
+        self.cohorts[coh_idx].col0 = self.cohorts[coh_idx].col0.min(col);
     }
 
     #[inline]
@@ -5866,6 +7073,11 @@ impl Ribbon {
         let release_parts = &self.release_parts;
         let mut cached_coh: Option<(&Cohort, bool)> = None;
         self.cells.retain(|cell| {
+            if let Some(at) = cell.retire_at
+                && now.saturating_duration_since(at).as_secs_f32() >= RETIRE_MELT_S
+            {
+                return false;
+            }
             let (coh, phase_live) = match cached_coh {
                 Some((c, live)) if c.id == cell.cohort => (c, live),
                 _ => {
@@ -5877,6 +7089,9 @@ impl Ribbon {
                     (c, live)
                 }
             };
+            if !phase_live {
+                return false;
+            }
             if coh.flow.is_none()
                 && now
                     .saturating_duration_since(cell.born.max(coh.alive_at))
@@ -5893,12 +7108,7 @@ impl Ribbon {
                     return false;
                 }
             }
-            if let Some(at) = cell.retire_at
-                && now.saturating_duration_since(at).as_secs_f32() >= RETIRE_MELT_S
-            {
-                return false;
-            }
-            phase_live
+            true
         });
         let cells = &self.cells;
         let mut gone_freshest: Option<Cohort> = None;
@@ -6008,6 +7218,8 @@ impl Ribbon {
         let mut sorted = mem::take(&mut self.sorted);
         sorted.clear();
         sorted.reserve(self.cells.len());
+        let mut strict_order = true;
+        let mut prev_rc: Option<(u16, u16)> = None;
         let mut i = 0;
         while i < self.cells.len() {
             let c = &self.cells[i];
@@ -6018,6 +7230,13 @@ impl Ribbon {
                 i += 1;
                 continue;
             }
+            let rc = (c.row, c.col);
+            if let Some(prev) = prev_rc
+                && prev >= rc
+            {
+                strict_order = false;
+            }
+            prev_rc = Some(rc);
             sorted.push((c.row, c.col, i.min(u32::MAX as usize) as u32));
             i += 1;
         }
@@ -6028,15 +7247,17 @@ impl Ribbon {
                 _ => 1,
             }
         }
-        let now = ctx.now;
-        let cells = self.cells.as_slice();
-        sorted.sort_unstable_by(|a, b| {
-            (a.0, a.1)
-                .cmp(&(b.0, b.1))
-                .then(cell_sort_rank(cells, now, a.2).cmp(&cell_sort_rank(cells, now, b.2)))
-                .then(b.2.cmp(&a.2))
-        });
-        sorted.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+        if !strict_order {
+            let now = ctx.now;
+            let cells = self.cells.as_slice();
+            sorted.sort_unstable_by(|a, b| {
+                (a.0, a.1)
+                    .cmp(&(b.0, b.1))
+                    .then(cell_sort_rank(cells, now, a.2).cmp(&cell_sort_rank(cells, now, b.2)))
+                    .then(b.2.cmp(&a.2))
+            });
+            sorted.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+        }
         let mut si = 0;
         while si < sorted.len() {
             let (row, col, idx) = sorted[si];
@@ -6047,6 +7268,16 @@ impl Ribbon {
             self.index.set(row, col, cell.t);
         }
         self.slabs = Self::slabs_for(ctx, sorted.len());
+        self.glass_slabs = if self.ink.glass_lit() {
+            #[cfg(any(test, debug_assertions))]
+            count_glass_exit();
+            // The plan keeps main's vertices (band() is main's); the glass lays its slabs between
+            // them, a whole number to each, never fewer than one.
+            let plan = self.slabs_per_cell();
+            plan * (Self::glass_slabs_for(ctx, sorted.len(), rows_of(&sorted)) / plan).max(1)
+        } else {
+            0
+        };
         self.build_runs(ctx, &sorted, below);
         self.sorted = sorted;
         self.runs
@@ -6075,6 +7306,19 @@ impl Ribbon {
         }
     }
 
+    /// The glass's slab density for `cells` cells over `rows` rows (`docs/design/PRISM-GLASS.md`
+    /// §2.2 Quad budget, §15.2 1.8): the densest of one to [`SLABS_PER_CELL`] slabs a cell whose
+    /// price stays within [`RIBBON_QUAD_BUDGET`] ([`glass_frame_price`]), one where none does.
+    #[inline]
+    const fn glass_slabs_for(ctx: &Ctx<'_>, cells: usize, rows: usize) -> usize {
+        let ch = ctx.geom.ch as f32;
+        let mut n = SLABS_PER_CELL;
+        while n > 1 && glass_frame_price(ch, cells, rows, n) > RIBBON_QUAD_BUDGET as f32 {
+            n -= 1;
+        }
+        n
+    }
+
     #[inline]
     fn build_runs(
         &mut self,
@@ -6092,14 +7336,14 @@ impl Ribbon {
             }
         }
         // One answer per row (its runs share seams, so they share a floor).
-        let mut held_row: Option<(u16, f32)> = None;
+        let mut held_row: Option<(u16, usize, (f32, bool))> = None;
         let chf = ctx.geom.ch as f32;
         let pane_bot = self.pane_bot(ctx, chf);
         let mut s = 0usize;
         while s < sorted.len() {
             let row = sorted[s].0;
-            let hold = match held_row {
-                Some((r, hold)) if r == row => hold,
+            let (row_end, (hold, letters_below)) = match held_row {
+                Some((r, end, hold)) if r == row => (end, hold),
                 _ => {
                     let mut end = s + 1;
                     while end < sorted.len() && sorted[end].0 == row {
@@ -6131,7 +7375,7 @@ impl Ribbon {
                                 };
                                 if seen_coh == Some(id) {
                                     continue;
-                                }
+                                };
                                 seen_coh = Some(id);
                                 if let Some(c) = self.cohort_by_id(id)
                                     && c.flow.is_some()
@@ -6148,15 +7392,16 @@ impl Ribbon {
                     };
                     let previous = self.previous_hold(row, row_cells);
                     let hold = self.ease_hold(ctx, row, held, previous);
-                    held_row = Some((row, hold));
-                    hold
+                    let hold = (hold, held == Some(true) && floor < pane_bot);
+                    held_row = Some((row, end, hold));
+                    (end, hold)
                 }
             };
+            let run_coh = cohort_of(&self.cells, sorted[s]);
             let mut e = s;
-            while e + 1 < sorted.len()
-                && sorted[e + 1].0 == sorted[s].0
+            while e + 1 < row_end
                 && sorted[e + 1].1 == sorted[e].1 + 1
-                && cohort_of(&self.cells, sorted[e + 1]) == cohort_of(&self.cells, sorted[e])
+                && cohort_of(&self.cells, sorted[e + 1]) == run_coh
             {
                 e += 1;
             }
@@ -6208,7 +7453,7 @@ impl Ribbon {
                 Some(e + 1),
                 sorted[e].1.checked_add(1),
             );
-            self.plan_run(ctx, &sorted[s..=e], seam, right, hold);
+            self.plan_run(ctx, &sorted[s..=e], seam, right, (hold, letters_below));
             s = e + 1;
         }
         mem::swap(&mut self.holds, &mut self.holds_next);
@@ -6387,6 +7632,9 @@ impl Ribbon {
         col1: u16,
     ) -> Option<bool> {
         let below = row as i32 + 1;
+        if below < 0 || (below as usize) >= ctx.geom.rows {
+            return None;
+        }
         let mut known = true;
         let mut col = col0.saturating_sub(1);
         let end = col1.saturating_add(1);
@@ -6421,7 +7669,17 @@ struct RunSample {
     comet: bool,
     fx_top: f32,
     pane_bot: f32,
+    free_last_row: bool,
+    held_last_row: bool,
     hold: f32,
+    /// The row below holds letters this frame ([`Ribbon::inked_below`]).
+    letters_below: bool,
+    phase_rad: f32,
+    /// How far the run's row has sunk ([`GlassWrap`]), on glass only; `0` elsewhere.
+    sunk: f32,
+    /// The most the run's glass reaches, px ([`WRAP_HAND_TOP_PX`]), on glass only; unbounded
+    /// elsewhere.
+    glass_cap: f32,
 }
 
 impl Ribbon {
@@ -6431,11 +7689,17 @@ impl Ribbon {
         ctx: &Ctx<'_>,
         row: u16,
         coh: Option<&Cohort>,
-        hold: f32,
+        (hold, letters_below): (f32, bool),
         (settle, breath): (f32, f32),
     ) -> RunSample {
         let chf = ctx.geom.ch as f32;
         let prof = Self::body_profile(ctx.cfg);
+        #[cfg(test)]
+        let prof = if self.underline_lifted {
+            BodyProfile { tall: true, ..prof }
+        } else {
+            prof
+        };
         let reduced = ctx.cfg.reduced_motion;
         let disp = clamp01(ctx.disp);
         let room = (DN_TOP_CH - DN_FLOOR_CH) * chf;
@@ -6450,6 +7714,10 @@ impl Ribbon {
         let comet = Self::comet(ctx.cfg);
         let fx_top = ctx.geom.fx_top() as f32;
         let pane_bot = self.pane_bot(ctx, chf);
+        let dn_thresh = prof.dn_ch * chf;
+        let free_last_row = (pane_bot - row_bot) < dn_thresh;
+        let held_last_row = 0.0 < dn_thresh;
+        let phase_rad = ctx.phase * std::f32::consts::TAU;
         RunSample {
             chf,
             prof,
@@ -6465,7 +7733,13 @@ impl Ribbon {
             comet,
             fx_top,
             pane_bot,
+            free_last_row,
+            held_last_row,
             hold,
+            letters_below,
+            phase_rad,
+            sunk: 0.0,
+            glass_cap: f32::INFINITY,
         }
     }
 
@@ -6477,7 +7751,7 @@ impl Ribbon {
         coh: Option<&Cohort>,
         sp: f32,
         rs: &RunSample,
-    ) -> (f32, f32, f32, f32) {
+    ) -> (f32, f32, f32, f32, f32) {
         let chf = rs.chf;
         let prof = rs.prof;
         let disp = rs.disp;
@@ -6491,10 +7765,9 @@ impl Ribbon {
         let wave = if amp == 0.0 {
             0.0
         } else {
-            crate::supernova::sin_cos_f32(
-                (sp * std::f32::consts::TAU * WAVE_CYCLES) - ctx.phase * std::f32::consts::TAU,
-            )
-            .0 * amp
+            crate::supernova::sin_cos_f32((sp * std::f32::consts::TAU * WAVE_CYCLES) - rs.phase_rad)
+                .0
+                * amp
         };
         let behind = sp * rs.span;
         let bloom = if disp <= 0.0 || behind >= BLOOM_REACH_CELLS {
@@ -6518,7 +7791,7 @@ impl Ribbon {
         // bottom, where it is laid as a last row is.
         #[inline]
         const fn shape_at(
-            pane_bot: f32,
+            (pane_bot, last_row): (f32, bool),
             rs: &RunSample,
             bloom: f32,
             wave_pos: f32,
@@ -6526,14 +7799,30 @@ impl Ribbon {
             comet_up_ch: f32,
             spine_raw: f32,
         ) -> (f32, f32, f32) {
-            let room_below = pane_bot - rs.row_bot;
-            let last_row = room_below < rs.prof.dn_ch * rs.chf;
             let dn_ch = if last_row { DN_TOP_CH } else { rs.prof.dn_ch };
             let dn_open = rs.chf * (DN_FLOOR_CH + (dn_ch - DN_FLOOR_CH) * bloom);
             let dn = (dn_open - wave_pos).max(rs.dn_floor);
             let dn = (rs.dn_floor + (dn - rs.dn_floor) * rs.settle_scale) * rs.breath_scale;
             let up_ch = if last_row { rs.prof.up_ch } else { comet_up_ch };
             let up = (up_ch * rs.chf + wave_neg).max(0.0) * rs.settle_scale * rs.breath_scale;
+            if !rs.prof.tall {
+                // The underline keeps to its row's foot band over a floor:
+                // lifted by its reach below, as the tall ribbon is, it lay
+                // across the lower half of a last or held row's letters
+                // (looks10 L3: the dim Solarized `c` of an Enter at the
+                // bottom row at 96.9% of its own reading). Its reach below
+                // ends at the floor instead.
+                let spine = spine_raw.min(pane_bot).max(rs.fx_top);
+                let room = pane_bot - spine;
+                let dn = if dn < room {
+                    dn
+                } else if room > 0.0 {
+                    room
+                } else {
+                    0.0
+                };
+                return (spine, up, dn);
+            }
             let spine = spine_raw.min(pane_bot - dn).max(rs.fx_top);
             (spine, up, dn)
         }
@@ -6543,9 +7832,22 @@ impl Ribbon {
         }
         let pane_bot = rs.pane_bot;
         let hold = rs.hold;
+        // The underline settles at once off the letters that land on the
+        // row below: eased in with the row's hold ([`HOLD_EASE_S`]), its
+        // reach below lay over the new letters' tops for the ease (the
+        // settings card's Return on GitHub Light: the `p` of `[main 4f2c9e1]`
+        // read 4.45:1 on its tinted ground, looks10 round 3). Kept to its
+        // floor (looks10 L3) the underline's spine does not move, as the tall
+        // body's does, so only its reach below changes; it lets go of the row
+        // as it did ([`HOLD_RELEASE_S`]), over a row whose letters are gone.
+        #[cfg(test)]
+        let settles = rs.letters_below && !self.underline_eases_off_letters;
+        #[cfg(not(test))]
+        let settles = rs.letters_below;
+        let hold = if settles && !rs.prof.tall { 1.0 } else { hold };
         let (spine, up, dn) = if hold <= 0.0 || pane_bot <= row_bot {
             shape_at(
-                pane_bot,
+                (pane_bot, rs.free_last_row),
                 rs,
                 bloom,
                 wave_pos,
@@ -6555,7 +7857,7 @@ impl Ribbon {
             )
         } else if hold >= 1.0 {
             shape_at(
-                row_bot,
+                (row_bot, rs.held_last_row),
                 rs,
                 bloom,
                 wave_pos,
@@ -6565,7 +7867,7 @@ impl Ribbon {
             )
         } else {
             let free = shape_at(
-                pane_bot,
+                (pane_bot, rs.free_last_row),
                 rs,
                 bloom,
                 wave_pos,
@@ -6574,7 +7876,7 @@ impl Ribbon {
                 spine_raw,
             );
             let held = shape_at(
-                row_bot,
+                (row_bot, rs.held_last_row),
                 rs,
                 bloom,
                 wave_pos,
@@ -6588,7 +7890,52 @@ impl Ribbon {
                 mix(free.2, held.2, hold),
             )
         };
-        (spine, up, dn, self.cov_of(ctx, cell, coh))
+        if self.ink.glass_lit() {
+            // The glass's exits scale its height, its opacity moving only at the edge-in and
+            // the reduced fade (§2.2 Exits by height).
+            let env = self.glass_env(ctx, cell, coh);
+            let glass = Self::glass_up_at(ctx, rs, sp) * env.height;
+            let cov = Self::glass_cov(ctx.cfg, cell, env);
+            return (spine, up, dn, cov, glass);
+        }
+        (spine, up, dn, self.cov_of(ctx, cell, coh), 0.0)
+    }
+
+    /// The glass's reach above its row's bottom at a boundary `sp` of the run's span from its
+    /// head ([`GLASS_BODY`], `docs/design/PRISM-GLASS.md` §2.2, §15.2 1.7): [`GLASS_UP_CH`] at
+    /// the hand, easing to [`GLASS_TAIL_UP_CH`] over [`COMET_TAPER_CELLS`] on the comet, its top
+    /// swinging [`LIGHT_GLASS_WAVE_CH`] with main's wave (where main's spine swings, at its
+    /// phase), under the flow's settle and breath as main's height is, and scaled by the frame's
+    /// intensity: the glass's intensity is its height, never its opacity. On a row of the hand's
+    /// structural set it is then sunk and capped there ([`wrapped_up`], §15.2 1.10).
+    #[inline]
+    fn glass_up_at(ctx: &Ctx<'_>, rs: &RunSample, sp: f32) -> f32 {
+        let chf = rs.chf;
+        let disp = rs.disp;
+        let behind = sp * rs.span;
+        let reach_ch = if rs.comet {
+            GLASS_UP_CH
+                - (GLASS_UP_CH - GLASS_TAIL_UP_CH)
+                    * smoothstep01(behind * (1.0 / COMET_TAPER_CELLS))
+        } else {
+            GLASS_UP_CH
+        };
+        let wave = if rs.reduced || disp <= 0.0 || rs.settle >= 1.0 || sp <= 0.0 {
+            0.0
+        } else {
+            crate::supernova::sin_cos_f32((sp * std::f32::consts::TAU * WAVE_CYCLES) - rs.phase_rad)
+                .0
+                * LIGHT_GLASS_WAVE_CH
+                * chf
+                * disp
+                * smoothstep01(sp * (1.0 / WAVE_HEAD_PIN))
+                * (1.0 - rs.settle)
+        };
+        let up = (reach_ch * chf - wave).max(0.0)
+            * rs.settle_scale
+            * rs.breath_scale
+            * clamp01(ctx.cfg.intensity);
+        wrapped_up(up, chf, rs.sunk, rs.glass_cap)
     }
 
     #[inline]
@@ -6596,11 +7943,46 @@ impl Ribbon {
         self.env_with(ctx, cell, self.cohort_by_id(cell.cohort))
     }
 
+    /// Read a live cell's visibility envelope at `ctx.now` for conformance tests.
+    #[cfg(test)]
+    #[inline]
+    #[must_use]
+    pub(crate) fn debug_cell_envelope(&self, ctx: &Ctx<'_>, cell: &Cell) -> f32 {
+        self.env_of(ctx, cell)
+    }
+
+    /// The cell's envelope as main folds it: one product of every factor, its ember floor main's
+    /// ([`BedInkLut::main_seen_floor_at`]). Every decision the ribbon makes on a cell's light
+    /// reads it, on a frame the glass draws too.
     #[inline]
     fn env_with(&self, ctx: &Ctx<'_>, cell: &Cell, coh: Option<&Cohort>) -> f32 {
+        self.envelope(ctx, cell, coh, MainEnv(1.0)).0
+    }
+
+    /// The cell's glass envelope (`docs/design/PRISM-GLASS.md` §2.2 Exits by height, §15.2 1.8):
+    /// `(opacity, height)`, the factors [`Self::envelope`] folds split between the glass's
+    /// opacity and its height ([`GlassEnv`]).
+    #[inline]
+    fn glass_env(&self, ctx: &Ctx<'_>, cell: &Cell, coh: Option<&Cohort>) -> GlassEnv {
+        #[cfg(any(test, debug_assertions))]
+        count_glass_exit();
+        let reach = GLASS_TAIL_UP_CH * (ctx.geom.ch as f32 * clamp01(ctx.cfg.intensity));
+        self.envelope(ctx, cell, coh, GlassEnv::new(ctx.cfg.reduced_motion, reach))
+    }
+
+    /// Fold the cell's envelope into `e`: its attack, its melt, each exit, the printed dim, the
+    /// focus ember and the relight, in that order ([`Envelope`]).
+    #[inline]
+    fn envelope<E: Envelope>(
+        &self,
+        ctx: &Ctx<'_>,
+        cell: &Cell,
+        coh: Option<&Cohort>,
+        mut e: E,
+    ) -> E {
         let now = ctx.now;
         if now < cell.born {
-            return 0.0;
+            return E::DARK;
         }
         let reduced = ctx.cfg.reduced_motion;
         let attack_now = match cell.retire_at {
@@ -6621,38 +8003,37 @@ impl Ribbon {
             })
             .as_secs_f32();
         let u = (spent / cell.life_s.max(1e-3)).clamp(0.0, 1.0);
-        let attack = match cell.rearm {
+        match cell.rearm {
             Some((re_at, level)) => {
                 let r = attack_now.saturating_duration_since(re_at).as_secs_f32();
-                level + (1.0 - level) * edge_in(r)
+                e.fade(level + (1.0 - level) * edge_in(r));
             }
-            None => BIRTH_EDGE_FLOOR + (1.0 - BIRTH_EDGE_FLOOR) * edge_in(age),
-        };
-        let mut env = attack
-            * if reduced {
-                reduced_fade(cell.life_s - spent)
-            } else {
-                expiry_melt(u)
-            };
+            None => e.edge_in(BIRTH_EDGE_FLOOR + (1.0 - BIRTH_EDGE_FLOOR) * edge_in(age)),
+        }
+        e.fade(if reduced {
+            reduced_fade(cell.life_s - spent)
+        } else {
+            expiry_melt(u)
+        });
         if let Some(at) = cell.retract_at {
             let r = now.saturating_duration_since(at).as_secs_f32();
-            env *= if reduced {
+            e.fade(if reduced {
                 reduced_fade(RETRACT_FADE_S - r)
             } else {
                 spend(clamp01(r * (1.0 / RETRACT_FADE_S)))
-            };
+            });
         }
         if let Some(at) = cell.retire_at {
             let r = now.saturating_duration_since(at).as_secs_f32();
-            env *= if reduced {
+            e.fade(if reduced {
                 reduced_fade(RETIRE_MELT_S - r)
             } else {
                 spend(clamp01(r * (1.0 / RETIRE_MELT_S)))
-            };
+            });
         }
         if let Some(at) = self.curtain {
             let r = now.saturating_duration_since(at).as_secs_f32();
-            env *= if reduced {
+            e.fade(if reduced {
                 reduced_fade(CURTAIN_S - r)
             } else {
                 let rank = match coh {
@@ -6661,32 +8042,32 @@ impl Ribbon {
                 };
                 let t0 = CURTAIN_STAGGER_S * (1.0 - rank);
                 spend(clamp01((r - t0) * (1.0 / CURTAIN_SPEND_S)))
-            };
+            });
         }
         if let Some(Cohort {
             printed: Some(at), ..
         }) = coh
         {
             let r = now.saturating_duration_since(*at).as_secs_f32();
-            env *= 1.0 - (1.0 - RETURN_PRINTED_SHARE) * smoothstep01(r * (1.0 / RETURN_DIM_S));
+            e.scale(1.0 - (1.0 - RETURN_PRINTED_SHARE) * smoothstep01(r * (1.0 / RETURN_DIM_S)));
         }
         if let Some(coh) = coh
             && coh.phase.is_retracting()
         {
             let idle = coh.idle_s(now);
             if reduced {
-                env *= reduced_fade(coh.swoosh_total() - idle);
+                e.fade(reduced_fade(coh.swoosh_total() - idle));
             } else {
                 // Farthest from the hand first ([`Cohort::drain_rank`]), each cell taking `RETRACT_FADE_S`, so the mark is drawn back into the hand.
                 if coh.flow.is_some() {
-                    env *= ember_level(
-                        self.ember_floor(ctx, cell, env),
+                    e.fade(ember_level(
+                        e.ember_floor(self, ctx, cell),
                         coh.flow_drain(cell.col, idle),
-                    );
+                    ));
                 } else {
                     let t0 =
                         coh.retract_start() + coh.retract_span() * (1.0 - coh.drain_rank(cell.col));
-                    env *= spend(clamp01((idle - t0) * (1.0 / RETRACT_FADE_S)));
+                    e.fade(spend(clamp01((idle - t0) * (1.0 / RETRACT_FADE_S))));
                 }
             }
         }
@@ -6697,23 +8078,41 @@ impl Ribbon {
             } else {
                 spend(clamp01(r * (1.0 / FOCUS_EMBER_S)))
             };
-            env *= ember_level(self.ember_floor(ctx, cell, env), f);
+            e.ember(ember_level(e.ember_floor(self, ctx, cell), f));
         }
         if let Some((at, fade)) = self.rearm {
-            let level = ember_level(self.ember_floor(ctx, cell, env), fade);
+            let level = ember_level(e.ember_floor(self, ctx, cell), fade);
             let r = attack_now.saturating_duration_since(at).as_secs_f32();
-            env *= level + (1.0 - level) * edge_in(r);
+            e.ember(level + (1.0 - level) * edge_in(r));
         }
-        env
+        e
     }
 
+    /// The cell's coverage: main's cap times its envelope and the frame's intensity; under glass
+    /// the glass's whole opacity ([`GLASS_ALPHA`]) times its envelope's opacity alone, its height
+    /// carrying the rest ([`Self::glass_env`], [`Self::glass_up_at`]).
     #[inline]
     fn cov_of(&self, ctx: &Ctx<'_>, cell: &Cell, coh: Option<&Cohort>) -> f32 {
-        let cap = cov_cap(ctx.cfg);
-        (cap * cell.cov0 * self.env_with(ctx, cell, coh) * clamp01(ctx.cfg.intensity))
-            .clamp(0.0, cap)
+        let glass = self.ink.glass_lit();
+        let cap = body_cov_cap(ctx.cfg, glass);
+        if glass {
+            return Self::glass_cov(ctx.cfg, cell, self.glass_env(ctx, cell, coh));
+        }
+        clamp_bed_cov(
+            ctx.cfg,
+            glass,
+            cap * cell.cov0 * self.env_with(ctx, cell, coh) * clamp01(ctx.cfg.intensity),
+        )
     }
 
+    /// The glass's coverage of `cell` under its envelope `env`: the glass's whole ceiling
+    /// ([`body_cov_cap`]), hot or cold, moved only by the opacity's places.
+    #[inline]
+    const fn glass_cov(cfg: &Config, cell: &Cell, env: GlassEnv) -> f32 {
+        clamp_bed_cov(cfg, true, body_cov_cap(cfg, true) * cell.cov0 * env.opacity)
+    }
+
+    /// Main's ember floor for `cell` carrying `carried` of its light, against main's floor.
     #[inline]
     const fn ember_floor(&self, ctx: &Ctx<'_>, cell: &Cell, carried: f32) -> f32 {
         self.ember_floor_of(
@@ -6727,35 +8126,52 @@ impl Ribbon {
         if !full_cov.is_finite() || full_cov <= 0.0 {
             return 0.0;
         }
-        (self.ink.seen_floor_at(t) * EMBER_FLOOR_MARGIN / full_cov).max(0.0)
+        #[cfg(test)]
+        if self.ember_reads_glass {
+            return (self.ink.seen_floor_at(t) * EMBER_FLOOR_MARGIN / full_cov).max(0.0);
+        }
+        (self.ink.main_seen_floor_at(t) * EMBER_FLOOR_MARGIN / full_cov).max(0.0)
     }
 
     #[inline]
-    fn wipe_of(&self, ctx: &Ctx<'_>, cell: &Cell, dist: f32) -> f32 {
+    fn wipe_state(&self, ctx: &Ctx<'_>, cell: &Cell) -> Option<(f32, f32, f32)> {
         // Typed cells only: a wake's cells share one birth instant, so wiping each from its own edge would print a comb; its lay sweep is its attack.
         if !cell.typing
             || !Self::comet(ctx.cfg)
             || ctx.cfg.reduced_motion
             || ctx.now < cell.attack_at
         {
-            return 1.0;
+            return None;
         }
         let age = ctx
             .now
             .saturating_duration_since(cell.attack_at)
             .as_secs_f32();
         if age >= ATTACK_WIPE_S {
-            return 1.0;
+            return None;
         }
         let ramp = edge_in(age);
         if ramp <= 0.0 {
-            return 1.0;
+            return None;
         }
         let front = clamp01(age * (1.0 / ATTACK_WIPE_S)) * (1.0 + ATTACK_WIPE_FRONT);
-        let gate = smoothstep01((front - clamp01(dist)) * (1.0 / ATTACK_WIPE_FRONT));
         let uniform = BIRTH_EDGE_FLOOR + (1.0 - BIRTH_EDGE_FLOOR) * ramp;
+        Some((front, ramp, uniform))
+    }
+
+    #[inline]
+    const fn wipe_eval(state: Option<(f32, f32, f32)>, dist: f32) -> f32 {
+        let Some((front, ramp, uniform)) = state else {
+            return 1.0;
+        };
+        let gate = smoothstep01((front - clamp01(dist)) * (1.0 / ATTACK_WIPE_FRONT));
         let wiped = BIRTH_EDGE_FLOOR + (1.0 - BIRTH_EDGE_FLOOR) * ramp * gate;
         wiped / uniform
+    }
+
+    #[inline]
+    fn wipe_of(&self, ctx: &Ctx<'_>, cell: &Cell, dist: f32) -> f32 {
+        Self::wipe_eval(self.wipe_state(ctx, cell), dist)
     }
 
     #[inline]
@@ -6889,7 +8305,7 @@ impl Ribbon {
         run: &[(u16, u16, u32)],
         seam: Option<Segment>,
         right_nb: Option<Cell>,
-        hold: f32,
+        (hold, letters_below): (f32, bool),
     ) {
         #[inline]
         const fn cell_at<'a>(
@@ -6985,6 +8401,7 @@ impl Ribbon {
         let lo = self.plan.len();
         let mut prev: Option<(f32, Sample)> = None;
         let mut left_sample = None;
+        let mut left_wipe = None;
         let mut doubled: Option<usize> = None;
         let caret_side_right = stream_dir < 0;
         let ox = f32::from(ctx.geom.origin_x);
@@ -7003,7 +8420,39 @@ impl Ribbon {
         } else {
             (0.0, 0.0)
         };
-        let rs = self.run_sample(ctx, row, coh, hold, flow_settle);
+        let rs = self.run_sample(ctx, row, coh, (hold, letters_below), flow_settle);
+        let glass = self.ink.glass_lit();
+        // On glass (§2.4) a row the hand has left sinks, and the hand's row of a multi-row set
+        // keeps its inset; main's row hold moves main's body only, so each row's glass has one
+        // height owner.
+        let rs = if glass {
+            RunSample {
+                sunk: self.sunk_on(cohort, row, ctx.now),
+                glass_cap: if self.wrap_hand == Some(row) {
+                    (rs.chf - WRAP_HAND_TOP_PX).max(0.0)
+                } else {
+                    f32::INFINITY
+                },
+                ..rs
+            }
+        } else {
+            rs
+        };
+        // On glass (§2.2 The oldest end) the run's height eases in from its oldest end, the end
+        // away from its hand, unless a seam or a neighbour continues it there.
+        let tail = GlassTail {
+            x0: ox + f32::from(col0) * cw,
+            inv_cw: 1.0 / cw,
+            len: f32::from(col1 - col0) + 1.0,
+            head: f32::from(head_col - col0) + if stream_dir > 0 { 0.0 } else { 1.0 },
+            oldest_right: stream_dir > 0,
+            open: if stream_dir > 0 {
+                right_nb.is_none()
+            } else {
+                seam.is_none()
+            },
+        };
+        let tail_at = |x: f32| if glass { tail.at(x) } else { 1.0 };
         let mut boundary = u32::from(col0);
         let boundary_end = u32::from(col1) + 1;
         while boundary <= boundary_end {
@@ -7025,6 +8474,7 @@ impl Ribbon {
                 (None, Some(b)) => (b, b),
                 (None, None) => {
                     left_sample = None;
+                    left_wipe = None;
                     boundary += 1;
                     continue;
                 }
@@ -7052,13 +8502,23 @@ impl Ribbon {
                 )
             };
             left_sample = if right.is_some() { Some(sb) } else { None };
+            let wa = match left_wipe {
+                Some(wa) => wa,
+                None => self.wipe_state(ctx, a),
+            };
+            let wb = if a.col == b.col {
+                wa
+            } else {
+                self.wipe_state(ctx, b)
+            };
+            left_wipe = if right.is_some() { Some(wb) } else { None };
             let mut la = if left.is_some() {
-                sa.3 * self.wipe_of(ctx, a, if caret_side_right { 0.0 } else { 1.0 })
+                sa.3 * Self::wipe_eval(wa, if caret_side_right { 0.0 } else { 1.0 })
             } else {
                 0.0
             };
             let mut lb = if right.is_some() {
-                sb.3 * self.wipe_of(ctx, b, if caret_side_right { 1.0 } else { 0.0 })
+                sb.3 * Self::wipe_eval(wb, if caret_side_right { 1.0 } else { 0.0 })
             } else {
                 0.0
             };
@@ -7067,12 +8527,27 @@ impl Ribbon {
                 mid_f32(sa.1, sb.1),
                 mid_f32(sa.2, sb.2),
                 mid_f32(a.t, b.t),
+                mid_f32(sa.4, sb.4),
             );
+            // On glass (§2.2 Seams) an in-run walk jump is a hard step: the boundary closes
+            // its left cell at that cell's walk and opens its right one at its own.
+            let mut jump = 0.0;
+            if glass
+                && left.is_some()
+                && right.is_some()
+                && (b.t - a.t).abs() > GLASS_HARD_STEP_T + GLASS_HARD_STEP_SLACK
+            {
+                shape.3 = a.t;
+                jump = b.t - a.t;
+            }
             if left.is_none()
                 && let Some(seam) = seam
             {
                 la = f32::from(seam.cov);
-                shape = (seam.spine, seam.up, seam.dn, seam.t);
+                // A cohort seam keeps its neighbour's shape, and on glass opens at its own
+                // walk: a hard step.
+                let t = if glass { shape.3 } else { seam.t };
+                shape = (seam.spine, seam.up, seam.dn, t, seam.glass_up);
             }
             if right.is_none()
                 && let Some(nb) = right_nb.as_ref()
@@ -7080,7 +8555,12 @@ impl Ribbon {
                 let nb_coh = self.cohort_by_id(nb.cohort);
                 lb = self.cov_of(ctx, nb, nb_coh) * self.wipe_of(ctx, nb, 1.0);
             }
-            let natural = la.max(lb * RUN_TAIL_EASE);
+            // The glass's run eases in by height ([`GlassTail`]), never by its opacity.
+            let natural = if glass {
+                la.max(lb)
+            } else {
+                la.max(lb * RUN_TAIL_EASE)
+            };
             let floored = if let Some(l) = left
                 && let Some(floor) = self.attach_floor_at(ctx, row, l, 1.0)
             {
@@ -7089,7 +8569,7 @@ impl Ribbon {
                 None
             };
             let cov = floored.unwrap_or(natural);
-            let here = (shape.0, shape.1, shape.2, shape.3, cov);
+            let here = (shape.0, shape.1, shape.2, shape.3, cov, shape.4);
             if let Some((uniform, probe)) = attack
                 && boundary == u32::from(caret_cell)
             {
@@ -7103,27 +8583,35 @@ impl Ribbon {
             }
             let x = ox + boundary as f32 * cw;
             if let Some((px, p)) = prev {
+                let has_attach_floor = matches!(
+                    self.attach_floor,
+                    Some(af) if af.row == row && af.col == a.col && a.leaving()
+                );
                 let mut j = 1;
                 while j < slabs {
                     let f = j as f32 * inv_slabs;
                     let own =
-                        sa.3 * self.wipe_of(ctx, a, if caret_side_right { 1.0 - f } else { f });
+                        sa.3 * Self::wipe_eval(wa, if caret_side_right { 1.0 - f } else { f });
                     let mut cov = lerp_f32(p.4, here.4, f).min(own);
-                    if let Some(floor) = self.attach_floor_at(ctx, row, a, f) {
+                    if has_attach_floor && let Some(floor) = self.attach_floor_at(ctx, row, a, f) {
                         cov = cov.max(floor);
                     }
+                    let xf = lerp_f32(px, x, f);
                     self.plan.push(Segment {
-                        x: retract.at(lerp_f32(px, x, f)).round(),
+                        x: retract.at(xf).round(),
                         spine: lerp_f32(p.0, here.0, f),
                         up: lerp_f32(p.1, here.1, f),
                         dn: lerp_f32(p.2, here.2, f),
                         t: lerp_f32(p.3, here.3, f),
                         cov: cov.clamp(0.0, 255.0) as u8,
+                        glass_up: lerp_f32(p.5, here.5, f) * tail_at(xf),
+                        glass_jump: 0.0,
                     });
                     j += 1;
                 }
             }
             let rx = retract.at(x).round();
+            let tail_here = tail_at(x);
             self.plan.push(Segment {
                 x: rx,
                 spine: here.0,
@@ -7131,12 +8619,20 @@ impl Ribbon {
                 dn: here.2,
                 t: here.3,
                 cov: here.4.clamp(0.0, 255.0) as u8,
+                glass_up: here.5 * tail_here,
+                glass_jump: jump,
             });
+            // The boundary's right side: its walk past a hard step.
+            let open = if jump == 0.0 {
+                here
+            } else {
+                (here.0, here.1, here.2, here.3 + jump, here.4, here.5)
+            };
             let continues =
                 right.is_some() || (boundary == u32::from(col1) + 1 && right_nb.is_some());
             let onward = if floored.is_some() && continues {
                 doubled = Some((boundary - u32::from(col0)) as usize);
-                let seam = (shape.0, shape.1, shape.2, shape.3, natural);
+                let seam = (open.0, open.1, open.2, open.3, natural, open.5);
                 self.plan.push(Segment {
                     x: rx,
                     spine: seam.0,
@@ -7144,10 +8640,12 @@ impl Ribbon {
                     dn: seam.2,
                     t: seam.3,
                     cov: seam.4.clamp(0.0, 255.0) as u8,
+                    glass_up: seam.5 * tail_here,
+                    glass_jump: 0.0,
                 });
                 seam
             } else {
-                here
+                open
             };
             prev = Some((x, onward));
             boundary += 1;
@@ -7162,13 +8660,16 @@ impl Ribbon {
             while j <= slabs {
                 let f = j as f32 * inv_slabs;
                 let cov = af.level(self, ctx, f);
+                let xf = px + (x - px) * f;
                 self.plan.push(Segment {
-                    x: retract.at(px + (x - px) * f).round(),
+                    x: retract.at(xf).round(),
                     spine: p.0,
                     up: p.1,
                     dn: p.2,
                     t: p.3,
                     cov: cov.clamp(0.0, 255.0) as u8,
+                    glass_up: p.5 * tail_at(xf),
+                    glass_jump: 0.0,
                 });
                 j += 1;
             }
@@ -7214,10 +8715,21 @@ impl Ribbon {
     pub fn emit(&mut self, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
         self.ink_quads = 0;
         self.rail_spans.clear();
+        self.glass_drew = None;
+        self.glass_span = None;
         if self.plan.is_empty() || self.runs.is_empty() {
             return;
         }
         let ink_from = (frame.under.len(), frame.under_ramps.mark());
+        // Under glass (§15.2 1.7) the body is the glass's: [`GLASS_BODY`] laid on its row's
+        // bottom through the glass's wedge walk, under a whole ceiling, with no rail (the
+        // declared interim until the lip) and none of the paper spellings' treatments.
+        let glass = self.ink.glass_lit();
+        // The frame's plan draws by the glass, so it is the glass arm's even where no run
+        // reaches [`GLASS_MIN_PX`] and nothing is laid: main's paper would lay its body there.
+        if glass {
+            self.glass_drew = Some(ctx.now);
+        }
         let prof = Self::body_profile(ctx.cfg);
         let shoulder = prof.shoulder;
         #[cfg(test)]
@@ -7225,52 +8737,51 @@ impl Ribbon {
         #[cfg(not(test))]
         let alike = false;
         let flat_dim = Self::flat_dim(ctx.cfg);
-        let rail = (Self::rail_lit(ctx.cfg) || flat_dim) && !alike;
+        let rail = (Self::rail_lit(ctx.cfg) || flat_dim) && !alike && !glass;
         let chf = ctx.geom.ch as f32;
-        let ceiling = if ctx.cfg.dark_theme {
+        let ceiling = if glass {
+            GLASS_ALPHA
+        } else if ctx.cfg.dark_theme {
             BODY_FRAME_TOP
         } else {
             light_role(ctx.cfg).alpha_cap()
         };
+        let fx_top = ctx.geom.fx_top() as f32;
         let clip = ctx.geom.beam_clip();
         let budget = frame.under_ramps.laid(frame.under.len()) + RIBBON_QUAD_BUDGET;
         let core_up = prof.core_up_ch * chf;
         let lift_span = LEAD_CH * chf;
+        let box_top = self.rise_ceiling(ctx);
         let mut verts = mem::take(&mut self.verts);
         let runs = mem::take(&mut self.runs);
         let stride = ctx.geom.cw.max(1).div_ceil(self.slabs_per_cell());
-        let mut caret_row = None;
+        let glass_stride = ctx.geom.cw.max(1).div_ceil(self.glass_slabs.max(1));
+        let mut focused_multi_run_row = None;
         let mut ri = 0;
         while ri < runs.len() {
             let run = &runs[ri];
             if run.at_caret {
-                caret_row = Some(run.row);
+                let row = run.row;
+                let mut rj = 0;
+                while rj < runs.len() {
+                    if rj != ri && runs[rj].row == row {
+                        focused_multi_run_row = Some(row);
+                        break;
+                    }
+                    rj += 1;
+                }
                 break;
             }
             ri += 1;
         }
-        let focused_multi_run_row = if let Some(row) = caret_row {
-            let mut count = 0usize;
-            let mut rj = 0;
-            while rj < runs.len() {
-                if runs[rj].row == row {
-                    count += 1;
-                    if count > 1 {
-                        break;
-                    }
-                }
-                rj += 1;
-            }
-            if count > 1 { Some(row) } else { None }
-        } else {
-            None
-        };
         let pane_bot = self.pane_bot(ctx, chf);
         let dn_floor = DN_FLOOR_CH * chf;
         let rail_reach_max = RAIL_REACH_MAX_CH * chf;
         #[cfg(test)]
         let rail_gap = if self.rail_flush {
             0.0
+        } else if self.rail_gap_rounded {
+            (RAIL_GAP_CH * chf).round().max(1.0)
         } else {
             rail_gap_px(chf)
         };
@@ -7281,6 +8792,10 @@ impl Ribbon {
         let row_rail_off = self.row_rail_off;
         #[cfg(not(test))]
         let row_rail_off = false;
+        #[cfg(test)]
+        let row_rail_parted = self.row_rail_parted;
+        #[cfg(not(test))]
+        let row_rail_parted = false;
         let row_rail = (ROW_RAIL_CH * chf).floor().max(1.0);
         // A slab spans to the next vertex at its own light: the in-row
         // rail keeps a slab more off a foot.
@@ -7291,8 +8806,12 @@ impl Ribbon {
         let ink = &self.ink;
         let keep_out_ease = KEEP_OUT_EASE_CELLS * ctx.geom.cw as f32;
         // The flat ribbon on paper lies flatter than the pet's comet body:
-        // lower, its plateau carried near its top.
-        let flat_paper = !ctx.cfg.dark_theme && !Self::comet(ctx.cfg) && !alike;
+        // lower, and a soft even band ([`FLAT_PAPER_GAIN`]).
+        let flat_paper = !ctx.cfg.dark_theme && !Self::comet(ctx.cfg) && !alike && !glass;
+        #[cfg(test)]
+        let flat_even = flat_paper && !self.flat_paper_glow;
+        #[cfg(not(test))]
+        let flat_even = flat_paper;
         #[cfg(test)]
         let coarse = self.feather_coarse;
         let roomy = (self.plan.len() as f32) * FEATHER_ROOM_ROWS * chf
@@ -7355,8 +8874,27 @@ impl Ribbon {
                 if rail_layer && (!rail || (run.hold >= 1.0 && !in_row) || row_bottom >= pane_bot) {
                     return true;
                 }
+                // A glass run nowhere [`GLASS_MIN_PX`] tall draws nothing: the glass is whole
+                // or absent.
+                if glass
+                    && !rail_layer
+                    && !plan[run.lo..run.hi]
+                        .iter()
+                        .any(|s| s.glass_up >= GLASS_MIN_PX)
+                {
+                    return true;
+                }
                 let hold = if in_row { 0.0 } else { run.hold };
-                let head_feather_of = self.head_feather(ctx, run);
+                // The glass's run ends where its height does (§15.2 1.8): no head feather.
+                let head_feather_of = if glass && !rail_layer {
+                    HeadFeather {
+                        width: 0.0,
+                        inv_width: 0.0,
+                        ..self.head_feather(ctx, run)
+                    }
+                } else {
+                    self.head_feather(ctx, run)
+                };
                 #[cfg(test)]
                 let roomy = roomy && !coarse;
                 let fine_feather = if roomy {
@@ -7364,6 +8902,7 @@ impl Ribbon {
                 } else {
                     HeadFeather {
                         width: 0.0,
+                        inv_width: 0.0,
                         ..head_feather_of
                     }
                 };
@@ -7375,7 +8914,9 @@ impl Ribbon {
                 let stair = self.tail_stair;
                 #[cfg(not(test))]
                 let stair = false;
-                let end_fine = if roomy_ends && !stair {
+                // The glass's oldest end is its height's ease ([`GlassTail`]), laid at the
+                // plan's vertices: no fine run end.
+                let end_fine = if roomy_ends && !stair && !(glass && !rail_layer) {
                     (
                         RUN_END_FINE_CELLS * ctx.geom.cw as f32,
                         stride.div_ceil(RUN_END_FINE_SPLIT) as f32,
@@ -7385,6 +8926,36 @@ impl Ribbon {
                 };
                 if rail_layer {
                     let rail_scale = RAIL_GAIN * (1.0 - hold);
+                    let flat_dim_scale = FLAT_DIM_RAIL_GAIN * (1.0 - hold);
+                    let rail_core = if flat_dim {
+                        FLAT_DIM_RAIL_CORE
+                    } else {
+                        RAIL_CORE_SHARE
+                    };
+                    // Beside a foot the in-row rail dips under the row, into
+                    // the row below's blank top, as far as it would have
+                    // parted ([`ROW_RAIL_DIP_GAP_PX`]), a pixel thinner there
+                    // ([`ROW_RAIL_DIP_THIN_PX`]): it passes over a short
+                    // glyph's cell (its ink a third of the cell down), so a
+                    // letter beside the foot's cell below no longer breaks it.
+                    let dip = row_rail + ROW_RAIL_DIP_GAP_PX;
+                    let dip_rail = (row_rail - ROW_RAIL_DIP_THIN_PX).max(1.0);
+                    let row_bottom_i = row_bottom as i32;
+                    let dip_bottom = (row_bottom
+                        + ROW_RAIL_DIP_GAP_PX
+                        + dip_rail
+                        + crate::cursor_glow::LETTER_GUARD_RING as f32)
+                        .ceil() as i32;
+                    let dips = |x: f32| {
+                        !row_rail_parted
+                            && self.keep_out.letters_meet(
+                                (
+                                    (x - foot_clear).floor() as i32,
+                                    (x + foot_clear).ceil() as i32 + 1,
+                                ),
+                                (row_bottom_i, dip_bottom),
+                            ) == Some(false)
+                    };
                     for_each_feathered(&plan[run.lo..run.hi], fine_feather, end_fine, |i, seg| {
                         if i == head_rel {
                             head_rev = verts.len();
@@ -7395,50 +8966,85 @@ impl Ribbon {
                         } else {
                             (row_bottom + rail_gap).max(seg.spine)
                         };
-                        let (dn, core) = if in_row {
-                            let core = if flat_dim {
-                                FLAT_DIM_RAIL_CORE
+                        let (top, foot, dipped) = if in_row {
+                            let share = self.keep_out.foot_share(
+                                (seg.x, row_bottom - 1.0),
+                                foot_clear,
+                                FOOT_EASE_PX,
+                            );
+                            if share < 1.0 && dips(seg.x) {
+                                (top + (1.0 - share) * dip, 1.0, 1.0 - share)
                             } else {
-                                RAIL_CORE_SHARE
-                            };
-                            (row_rail, core)
-                        } else if flat_dim {
-                            (rail_reach_max, FLAT_DIM_RAIL_CORE)
+                                (top, share, 0.0)
+                            }
                         } else {
-                            (
-                                (seg.spine + seg.dn - top).max(dn_floor).min(rail_reach_max),
-                                RAIL_CORE_SHARE,
-                            )
+                            (top, 1.0, 0.0)
                         };
+                        let dn = if in_row {
+                            row_rail + (dip_rail - row_rail) * dipped
+                        } else if flat_dim {
+                            rail_reach_max
+                        } else {
+                            (seg.spine + seg.dn - top).max(dn_floor).min(rail_reach_max)
+                        };
+                        let feather_cov = seg.cov * head_feather_of.at(seg.x);
                         verts.push(RibbonVertex {
                             x: seg.x,
                             spine: top,
                             up: 0.0,
                             dn,
                             core_up: 0.0,
-                            core_dn: dn * core,
+                            core_dn: dn * rail_core,
                             color: ink.rail_at(seg.t),
                             // The flat rail on a dim page holds about half the
                             // pet's peak: its coverage is capped at that share
                             // of whole, since the body's own runs past it.
                             cov: if flat_dim {
-                                (seg.cov * head_feather_of.at(seg.x)).min(255.0)
-                                    * FLAT_DIM_RAIL_GAIN
-                                    * (1.0 - hold)
+                                feather_cov.min(255.0) * flat_dim_scale
                             } else {
-                                seg.cov * rail_scale * head_feather_of.at(seg.x)
-                            } * if in_row {
-                                self.keep_out.foot_share(
-                                    (seg.x, row_bottom - 1.0),
-                                    foot_clear,
-                                    FOOT_EASE_PX,
-                                )
-                            } else {
-                                1.0
-                            },
+                                feather_cov * rail_scale
+                            } * foot,
                             lift: 0.0,
                             lift_span: 0.0,
                         });
+                    });
+                } else if glass {
+                    // The glass stands on its row's bottom with no reach below it, as tall as
+                    // the plan's glass reach where the row's keep-outs and the box's rise
+                    // ceiling let it be.
+                    let row_top = f32::from(ctx.geom.origin_y) + f32::from(run.row) * chf;
+                    let has_ceiling = self.keep_out.has_ceiling_at(row_top);
+                    let spine = row_bottom.min(pane_bot).max(fx_top);
+                    for_each_feathered(&plan[run.lo..run.hi], fine_feather, end_fine, |i, seg| {
+                        if i == head_rel {
+                            head_rev = verts.len();
+                        }
+                        // Whole opacity, its edge the melt's: no strip lift (§15.2 1.8).
+                        let cov = seg.cov * head_feather_of.at(seg.x);
+                        let up = self.kept_up(
+                            (seg.x, spine, seg.glass_up),
+                            row_top,
+                            keep_out_ease,
+                            (has_ceiling, box_top),
+                        );
+                        let vertex = |t: f32| RibbonVertex {
+                            x: seg.x,
+                            spine,
+                            up,
+                            dn: 0.0,
+                            core_up: GLASS_CORE_SHARE * up,
+                            core_dn: 0.0,
+                            color: ink.at(t),
+                            cov,
+                            lift: 0.0,
+                            lift_span: 0.0,
+                        };
+                        // A hard step is two vertices at one x, laid right side first as the
+                        // run is: nothing lerps between them.
+                        if seg.glass_jump != 0.0 {
+                            verts.push(vertex(seg.t + seg.glass_jump));
+                        }
+                        verts.push(vertex(seg.t));
                     });
                 } else {
                     let row_top = f32::from(ctx.geom.origin_y) + f32::from(run.row) * chf;
@@ -7447,15 +9053,21 @@ impl Ribbon {
                         if i == head_rel {
                             head_rev = verts.len();
                         }
-                        let cov = seg.cov * head_feather_of.at(seg.x);
-                        let strip = (cov * STRIP_LIFT_GAIN).min(ceiling - cov).max(0.0);
+                        let (cov, strip) = if flat_even {
+                            (seg.cov * FLAT_PAPER_GAIN * head_feather_of.at(seg.x), 0.0)
+                        } else {
+                            let cov = seg.cov * head_feather_of.at(seg.x);
+                            (cov, (cov * STRIP_LIFT_GAIN).min(ceiling - cov).max(0.0))
+                        };
                         let up = self.kept_up(
                             (seg.x, seg.spine, seg.up),
                             row_top,
                             keep_out_ease,
-                            has_ceiling,
+                            (has_ceiling, box_top),
                         );
-                        let (up, core) = if flat_paper {
+                        let (up, core) = if flat_even {
+                            (up * FLAT_PAPER_UP_SHARE, 0.0)
+                        } else if flat_paper {
                             let up = up * FLAT_PAPER_UP_SHARE;
                             (up, up * FLAT_PAPER_CORE_SHARE)
                         } else {
@@ -7471,20 +9083,32 @@ impl Ribbon {
                             color: ink.at(seg.t),
                             cov,
                             lift: strip,
-                            lift_span,
+                            // The lift's bump ends where the body does under
+                            // the box's top, its top soft there too.
+                            lift_span: lift_span.min((seg.spine - box_top).max(0.0)),
                         });
                     });
                 }
                 let start = out.mark();
-                let shoulder = if rail_layer { 1.0 } else { shoulder };
-                let mut complete =
-                    ribbon_beam_into(out, clip, &verts, shoulder, stride, budget, GlowBlend::Over);
+                let lay = if rail_layer {
+                    BodyLay::Beam(1.0)
+                } else if glass {
+                    BodyLay::Glass
+                } else {
+                    BodyLay::Beam(shoulder)
+                };
+                let stride = if matches!(lay, BodyLay::Glass) {
+                    glass_stride
+                } else {
+                    stride
+                };
+                let mut complete = lay.lay(out, clip, &verts, stride, budget);
                 let head = verts.len().saturating_sub(1 + head_rev);
                 if !complete && head + 1 < verts.len() {
                     out.truncate(start);
                     verts.reverse();
                     complete = Self::repaint_capped_run_from_head(
-                        out, clip, &mut verts, head, shoulder, stride, budget,
+                        out, clip, &mut verts, head, lay, stride, budget,
                     );
                 }
                 let end = out.mark();
@@ -7568,25 +9192,29 @@ impl Ribbon {
             }
         }
         let at = (frame.under.len(), frame.under_ramps.mark());
+        if glass && at != ink_from {
+            self.glass_span = Some((ink_from, at));
+        }
         rail_spans.retain(|&(_, to, _)| rail_within(to, at));
         self.rail_spans = rail_spans;
         self.runs = runs;
         self.verts = verts;
         self.emit_hot_edge(ctx, frame);
         #[inline]
-        const fn quad_reads_as_ink(
+        const fn end_reads_as_ink(
             bg: u32,
             last_ink: &mut Option<(u32, u8, bool)>,
-            q: &aterm_render::GlowQuad,
+            color: u32,
+            alpha: u8,
         ) -> bool {
             if let Some((prev_c, prev_a, res)) = *last_ink
-                && prev_c == q.color
-                && prev_a == q.alpha
+                && prev_c == color
+                && prev_a == alpha
             {
                 return res;
             }
-            let res = reads_as_ink(over_premul(bg, q.color, q.alpha));
-            *last_ink = Some((q.color, q.alpha, res));
+            let res = reads_as_ink(over_premul(bg, color, alpha));
+            *last_ink = Some((color, alpha, res));
             res
         }
         let bg = ctx.cfg.theme_bg;
@@ -7596,7 +9224,8 @@ impl Ribbon {
         let under_slice = &frame.under[ink_from.0..];
         let mut qi = 0;
         while qi < under_slice.len() {
-            if quad_reads_as_ink(bg, &mut last_ink, &under_slice[qi]) {
+            let q = &under_slice[qi];
+            if end_reads_as_ink(bg, &mut last_ink, q.color, q.alpha) {
                 quads += 1;
             }
             qi += 1;
@@ -7605,10 +9234,21 @@ impl Ribbon {
         let since_rows = ramps.since(ink_from.1);
         let mut ri = 0;
         while ri < since_rows.len() {
-            for q in since_rows[ri].quads(&ramps.ends) {
-                if quad_reads_as_ink(bg, &mut last_ink, &q) {
+            let ends = since_rows[ri].kept_ends(&ramps.ends);
+            let mut ei = 0;
+            while ei + 1 < ends.len() {
+                let (e0, e1) = (ends[ei], ends[ei + 1]);
+                if e0 | e1 != 0
+                    && end_reads_as_ink(
+                        bg,
+                        &mut last_ink,
+                        aterm_core::render::end_color(e0),
+                        aterm_core::render::end_alpha(e0),
+                    )
+                {
                     rows += 1;
                 }
+                ei += 2;
             }
             ri += 1;
         }
@@ -7617,7 +9257,10 @@ impl Ribbon {
 
     /// The reach `up` of a body boundary at window x `x` standing on
     /// `spine` in `row`, cut so its top (and the feather it wears there)
-    /// stays in its own row under a [`KeepOut`] box standing on the row.
+    /// stays in its own row under a [`KeepOut`] box standing on the row,
+    /// and under `box_top`, the effects box's rise ceiling
+    /// ([`Self::rise_ceiling`]): the whole profile laid in the room under
+    /// it, where the box's clip would cut its soft top flat.
     ///
     /// [`Self::kept_up`] with the top held `inset` px inside the row under
     /// a box: a line drawn centred on the top (the hot edge) keeps its
@@ -7628,17 +9271,30 @@ impl Ribbon {
         (x, spine, up): (f32, f32, f32),
         row_top: f32,
         ease: f32,
-        has_ceiling: bool,
+        (has_ceiling, box_top): (bool, f32),
     ) -> f32 {
+        let room = (spine - box_top).max(0.0);
         if !has_ceiling {
-            return up;
+            return up.min(room);
         }
         let top = spine - up;
         if top >= row_top {
-            return up;
+            return up.min(room);
         }
         let ceiling = self.keep_out.ceiling(x, row_top, top, ease);
-        (spine - ceiling.max(top)).max(0.0)
+        (spine - ceiling.max(top)).max(0.0).min(room)
+    }
+
+    /// The effects box's rise ceiling for this frame
+    /// ([`crate::cursor_glow::Geom::rise_ceiling`]; none under the negative
+    /// control, where the box's clip cuts the body).
+    #[inline]
+    const fn rise_ceiling(&self, ctx: &Ctx<'_>) -> f32 {
+        #[cfg(any(test, debug_assertions))]
+        if self.rise_cut {
+            return f32::NEG_INFINITY;
+        }
+        ctx.geom.rise_ceiling()
     }
 
     #[inline]
@@ -7662,14 +9318,23 @@ impl Ribbon {
         let at_end = at_end && self.curtain.is_none();
         #[cfg(test)]
         if self.head_square {
-            return HeadFeather { head_x, width: 0.0 };
+            return HeadFeather {
+                head_x,
+                width: 0.0,
+                inv_width: 0.0,
+            };
         }
-        let width = if !run.at_caret && at_end {
-            HEAD_FEATHER_CELLS * ctx.geom.cw as f32
+        let (width, inv_width) = if !run.at_caret && at_end {
+            let w = HEAD_FEATHER_CELLS * ctx.geom.cw as f32;
+            (w, if w > 0.0 { 1.0 / w } else { 0.0 })
         } else {
-            0.0
+            (0.0, 0.0)
         };
-        HeadFeather { head_x, width }
+        HeadFeather {
+            head_x,
+            width,
+            inv_width,
+        }
     }
 
     #[inline]
@@ -7678,32 +9343,15 @@ impl Ribbon {
         clip: BeamClip,
         verts: &mut [RibbonVertex],
         head: usize,
-        shoulder: f32,
+        lay: BodyLay,
         stride: usize,
         budget: usize,
     ) -> bool {
         debug_assert!(head < verts.len());
         verts[..=head].reverse();
-        let left_complete = ribbon_beam_into(
-            out,
-            clip,
-            &verts[..=head],
-            shoulder,
-            stride,
-            budget,
-            GlowBlend::Over,
-        );
+        let left_complete = lay.lay(out, clip, &verts[..=head], stride, budget);
         verts[..=head].reverse();
-        left_complete
-            && ribbon_beam_into(
-                out,
-                clip,
-                &verts[head..],
-                shoulder,
-                stride,
-                budget,
-                GlowBlend::Over,
-            )
+        left_complete && lay.lay(out, clip, &verts[head..], stride, budget)
     }
 
     /// How many of the last frame's ribbon quads read as band ink on the glass.
@@ -7711,6 +9359,58 @@ impl Ribbon {
     #[must_use]
     pub const fn ink_quad_count(&self) -> usize {
         self.ink_quads
+    }
+
+    /// Whether the frame at `now` drew its plan by the bed's glass (§15.2 1.5, 1.7): Prism
+    /// Glass's `glass` arm, which draws into the under stream's quads and ramps. A lit plan is
+    /// the arm's even when none of its runs reaches [`GLASS_MIN_PX`] and the frame lays nothing,
+    /// since main's paper lays its body there; a frame with no plan, or the bed on main's table,
+    /// is not.
+    #[inline]
+    #[must_use]
+    pub fn glass_drew_at(&self, now: Instant) -> bool {
+        self.glass_drew == Some(now)
+    }
+
+    /// The glass's height in pixels a `ch` the last plan gave the ribbon (§15.2 1.7): zero on
+    /// every frame whose bed draws by main's table, for the host's dark pin. Debug and test
+    /// builds only.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    #[must_use]
+    pub const fn glass_px(&self) -> f32 {
+        self.glass_px
+    }
+
+    /// Whether the last frame's plan holds the glass's geometry (§15.2 1.7): a boundary with a
+    /// glass reach ([`Segment::glass_up`]) or a hard step ([`Segment::glass_jump`]). Never on a
+    /// frame the bed draws by main's table. Debug and test builds only.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    #[must_use]
+    pub fn glass_planned(&self) -> bool {
+        self.plan
+            .iter()
+            .any(|s| s.glass_up != 0.0 || s.glass_jump != 0.0)
+    }
+
+    /// The light words (§15.0.2(a)): the bed's glass table and the palettes it draws by, and the
+    /// wrap's side table and the hand's row of a multi-row set (§15.2 1.10). Never compared.
+    /// Debug and test builds only.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub fn light_words(&self, w: &mut impl crate::state_words::Words) {
+        use crate::state_words::Words as _;
+        self.ink.light_words(w);
+        self.palettes.light_words(w);
+        if !self.glass_wrap.is_empty() || self.wrap_hand.is_some() {
+            w.list("glass.wrap", &self.glass_wrap, |f, r: &GlassWrap| {
+                f.put("cohort", u64::from(r.cohort));
+                f.put("row", u64::from(r.row));
+                f.at("left_at", r.left_at);
+            });
+            w.u16_opt("glass.wrap_hand", self.wrap_hand);
+        }
     }
 
     /// The hot edge's gain.
@@ -7815,6 +9515,7 @@ impl Ribbon {
             f32::from(ctx.geom.origin_y) + f32::from(run.row) * (ctx.geom.ch as f32) + inset;
         let keep_out_ease = KEEP_OUT_EASE_CELLS * cw;
         let has_ceiling = self.keep_out.has_ceiling_at(row_top);
+        let box_top = self.rise_ceiling(ctx) + inset;
         frame.beams.clear();
         let step = self.slabs_per_cell();
         let mut idx = run.lo;
@@ -7839,7 +9540,7 @@ impl Ribbon {
                         (seg.x, seg.spine, seg.up),
                         row_top,
                         keep_out_ease,
-                        has_ceiling,
+                        (has_ceiling, box_top),
                     ),
                 color: self.ink.hot_at(seg.t),
                 cov: cov as u8,
@@ -8125,6 +9826,20 @@ impl Ribbon {
             }
             None => (None, None, None),
         };
+        // On glass (§15.2 1.8) the exits move the glass's height, not its opacity: each cell's
+        // steps are one pixel of its reach at the hand, its ember the glass's height floor.
+        #[cfg(test)]
+        let glass_px = if self.glass_level_steps {
+            0.0
+        } else {
+            self.glass_px
+        };
+        #[cfg(not(test))]
+        let glass_px = self.glass_px;
+        #[cfg(any(test, debug_assertions))]
+        if glass_px > 0.0 {
+            count_glass_exit();
+        }
         let mut cached_coh: Option<(u32, Option<&Cohort>)> = None;
         let mut ci = 0;
         while ci < self.cells.len() {
@@ -8176,7 +9891,11 @@ impl Ribbon {
                 }
                 continue;
             }
-            let base = UNDER_COV_CAP * cell.cov0;
+            let base = if glass_px > 0.0 {
+                GLASS_UP_CH * glass_px
+            } else {
+                UNDER_COV_CAP * cell.cov0
+            };
             let u = clamp01(age / life);
             let melt = expiry_melt(u);
             let (retract_u, f_r) = match cell.retract_at {
@@ -8208,7 +9927,11 @@ impl Ribbon {
             let carried = base * melt * f_r * f_s * f_m;
             let (ember_floor, f_e) = match ember_spend {
                 Some(s) => {
-                    let floor = self.ember_floor_of(carried, cell.t);
+                    let floor = if glass_px > 0.0 {
+                        glass_height_floor(carried * (GLASS_TAIL_UP_CH / GLASS_UP_CH))
+                    } else {
+                        self.ember_floor_of(carried, cell.t)
+                    };
                     (floor, ember_level(floor, s))
                 }
                 None => (0.0, 1.0),
@@ -8246,6 +9969,24 @@ impl Ribbon {
             }
             if let Some(at) = cell.retire_at {
                 cad.tail_at(at + RETIRE_MELT_DUR);
+            }
+        }
+        // A wrapped row the hand has left (§2.4) steps by one pixel of its sink, which falls from
+        // the glass's reach at the hand to [`WRAP_SINK_CH`]; under reduced motion it has sunk.
+        #[cfg(test)]
+        let sinks = !self.wrap_unsunk;
+        #[cfg(not(test))]
+        let sinks = true;
+        if glass_px > 0.0 && !self.reduced && sinks {
+            let up = GLASS_UP_CH * glass_px;
+            let fall = up - up.min(WRAP_SINK_CH * self.cell_h);
+            let mut wi = 0;
+            while wi < self.glass_wrap.len() {
+                let x = secs_since(now, self.glass_wrap[wi].left_at) * (1.0 / WRAP_SINK_S);
+                if let Some(step) = level_step_sink(fall, x) {
+                    cad.tail(step);
+                }
+                wi += 1;
             }
         }
         let mut ki = 0;
@@ -8340,6 +10081,7 @@ impl Ribbon {
             }
         }
         let walk = self.cohorts[ci];
+        let walk_zero = walk.walk_zero();
         let release_parts = &self.release_parts;
         let mut n = 0usize;
         let (mut c0, mut c1) = (u16::MAX, 0u16);
@@ -8356,7 +10098,7 @@ impl Ribbon {
             {
                 moved.push((c.row, c.col, c.born));
                 c.col = col;
-                c.t = walk.t_at(col);
+                c.t = walk_zero + walk_t(walk.walk_d(col));
                 self.followed_now.push((row, col, c.born));
                 n += 1;
             }
@@ -8529,6 +10271,10 @@ impl Ribbon {
         if id != cohort {
             self.split_release(cohort, id);
         }
+        // The wrap's sink rides with its row ([`GlassWrap`], light only).
+        if !self.glass_wrap.is_empty() {
+            self.carry_glass_wrap(cohort, row, id, new_row);
+        }
         if let Some(coh) = self.cohort_by_id_mut(id) {
             if away {
                 Self::flow_cohort(coh, at);
@@ -8662,6 +10408,17 @@ impl Ribbon {
         if self.holds_left_behind {
             self.holds.clear();
         }
+        // The wrap's sinks ride with their rows ([`GlassWrap`], light only).
+        if !self.glass_wrap.is_empty() {
+            self.glass_wrap
+                .retain_mut(|w| match w.row.checked_sub(rows) {
+                    Some(row) => {
+                        w.row = row;
+                        true
+                    }
+                    None => false,
+                });
+        }
         self.index.translate(rows);
         self.plan.clear();
         self.runs.clear();
@@ -8786,6 +10543,17 @@ impl Ribbon {
         if self.holds_left_behind {
             self.holds.clear();
         }
+        // The wrap's sinks ride with their rows ([`GlassWrap`], light only).
+        if !self.glass_wrap.is_empty() {
+            self.glass_wrap
+                .retain_mut(|w| match band_row(w.row, top, bottom, delta) {
+                    Some(row) => {
+                        w.row = row;
+                        true
+                    }
+                    None => false,
+                });
+        }
         self.index.translate_band(top, bottom, delta);
         self.plan.clear();
         self.runs.clear();
@@ -8839,6 +10607,15 @@ impl Ribbon {
                 None => None,
             };
         }
+        // The wrap's sinks ride with their rows ([`GlassWrap`], light only).
+        if !self.glass_wrap.is_empty() {
+            let wraps = self.glass_wrap.as_mut_slice();
+            let mut i = 0;
+            while i < wraps.len() {
+                wraps[i].row = map(wraps[i].row, row, to);
+                i += 1;
+            }
+        }
     }
 
     /// The seam on the hand's lifted line ([`super::Engine::lift_hand`]) rides from `row` to `to` with it.
@@ -8869,6 +10646,8 @@ impl Ribbon {
         self.holds.clear();
         self.holds_next.clear();
         self.carried_holds.clear();
+        self.glass_wrap.clear();
+        self.wrap_hand = None;
         self.plan.clear();
         self.runs.clear();
         self.sorted.clear();
@@ -8915,42 +10694,59 @@ pub(crate) use state_words::{lift_words, revive_words, run_origin_words, soft_wr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cursor_glow::{Geom, SoundCue};
+    use crate::cursor_glow::{Geom, Light, Live, SoundCue};
 
-    /// THE PAPER TRAIN LAYS NO OLIVE (looks8 round 2's K10b): round 1's
-    /// `enter-bottom` Return on paper turned from amber to green through
-    /// `#8b8013`. Over every hue of the spectrum, on white and on a grey
-    /// paper, the paper train's ink ([`paper_train_ink`]) wears no hue
-    /// between 50 and 80 degrees: gold steps to green. Negative control:
-    /// round 1's bend, which walked from gold to green in six degrees, lays
-    /// such hues.
+    /// THE PAPER TRAIN'S GOLD READS GOLD (looks9 Q5): the gallery's
+    /// `enter-bottom` Return on paper laid its gold as an ochre (`#a27b13`
+    /// to `#b37113`, the caret's 4.5:1 darkening it to a brown) and began
+    /// its green at a darkened lime (`#329213`). Over every hue of the
+    /// spectrum, on white and on a grey paper, each warm ink the paper train
+    /// lays (bent hue 25 to 55 degrees) keeps three fifths of its value or
+    /// more and a graphic's 3:1 against the page, and it lays no hue between
+    /// 50 and 112 degrees (no olive: looks8 K10b's `#8b8013`): gold, then a
+    /// clean green. Negative control: the same bend held to the caret's bar
+    /// darkens its golds to ochre.
     #[test]
-    fn the_paper_train_steps_from_gold_to_green() {
-        const ROUND_1: [(f32, f32); 5] = [
-            (30.0, 30.0),
-            (72.0, 40.0),
-            (86.0, 44.0),
-            (92.0, 88.0),
-            (110.0, 110.0),
-        ];
-        let olive = |bend: Option<&[(f32, f32)]>| -> usize {
-            let mut n = 0;
+    fn the_paper_train_lays_gold_then_a_clean_green() {
+        let lay = |caret_bar: bool| -> (usize, usize, f32) {
+            let (mut ochre, mut lime, mut least) = (0usize, 0usize, f32::MAX);
             for page in [0x00FF_FFFFu32, 0x00F2_F2F2] {
                 for k in 0..1440u32 {
                     let rgb = hsv2rgb(k as f32 * 0.25, 1.0, 1.0);
-                    let ink = match bend {
-                        None => paper_train_ink(rgb, page),
-                        Some(b) => paper_vivid_ink_bent(rgb, page, PAPER_CARET_CONTRAST, b),
+                    let ink = if caret_bar {
+                        paper_vivid_ink_bent(rgb, page, PAPER_CARET_CONTRAST, &PAPER_TRAIN_HUE_BEND)
+                    } else {
+                        paper_train_ink(rgb, page)
                     };
-                    let (h, s, _) = rgb2hsv(ink);
-                    n += usize::from(s > 0.3 && (50.0..80.0).contains(&h));
+                    let (h, s, v) = rgb2hsv(ink);
+                    if s <= 0.3 {
+                        continue;
+                    }
+                    if (PAPER_TRAIN_GOLD_HUES.0..=PAPER_TRAIN_GOLD_HUES.1).contains(&h) {
+                        ochre += usize::from(v < 0.66);
+                        let (yi, yp) = (relative_luminance(ink), relative_luminance(page));
+                        least = least.min((yi.max(yp) + 0.05) / (yi.min(yp) + 0.05));
+                    }
+                    lime += usize::from((50.0..112.0).contains(&h));
                 }
             }
-            n
+            (ochre, lime, least)
         };
-        let (now, then) = (olive(None), olive(Some(&ROUND_1)));
-        assert!(then >= 8, "control: round 1's bend lays {then} olive inks");
-        assert_eq!(now, 0, "the paper train lays {now} olive inks");
+        let (ochre, lime, least) = lay(false);
+        assert_eq!(
+            ochre, 0,
+            "{ochre} of the paper train's warm inks read ochre"
+        );
+        assert_eq!(lime, 0, "the paper train lays {lime} olive or lime inks");
+        assert!(
+            least >= PAPER_TRAIN_GOLD_CONTRAST - 0.05,
+            "a warm ink of the paper train holds only {least:.2}:1"
+        );
+        let (dark, ..) = lay(true);
+        assert!(
+            dark >= 8,
+            "control: at the caret's bar only {dark} golds read ochre"
+        );
     }
 
     #[test]
@@ -9057,6 +10853,7 @@ mod tests {
             theme_fg: if dark { DEFAULT_FG } else { 0x0016_161C },
             theme_bg: if dark { DEFAULT_BG } else { 0x00FF_FFFF },
             reduced_motion: false,
+            light: crate::cursor_glow::Light::OFF,
         }
     }
 
@@ -9485,6 +11282,852 @@ mod tests {
         );
     }
 
+    /// Whether two bed tables are main's same table: the same key, inks and floors.
+    fn same_mains(a: &BedInkLut, b: &BedInkLut) -> bool {
+        a.key() == b.key()
+            && a.lut() == b.lut()
+            && a.seen()
+                .iter()
+                .zip(b.seen())
+                .all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    /// Every light a frame can carry: none, then a latched scheme at each live level.
+    const LIGHTS: [Light; 6] = [
+        Light::OFF,
+        Light::at(Live::Off),
+        Light::at(Live::Glass),
+        Light::at(Live::Lip),
+        Light::at(Live::Marks),
+        Light::at(Live::Vanish),
+    ];
+
+    /// The glass twin of [`the_paper_bed_keeps_every_stop_its_hue_and_every_letter_its_bar`]
+    /// (Prism Glass §15.2 1.5): on every paper page whose shipped palette has headroom, the bed a
+    /// glass frame syncs draws its palette's glass129 at every entry and main's sampler between
+    /// them, and every entry composited over the page at every alpha keeps the theme fg at the
+    /// glass bar; what of each the page shows is the glass's own, and main's table beside it is
+    /// main's. A lip-forward page (Solarized Light, Catppuccin Latte) draws main's paper bed.
+    #[test]
+    fn the_glass_bed_keeps_every_entry_its_glass_and_every_letter_its_bar() {
+        use crate::rainbow_kitty::prism_glass::{Palette, colour, glass_bar};
+        let linear = &crate::color_math::relative_luminance_table().linear;
+        let (mut glass_pages, mut forward) = (0, 0);
+        for (fg, bg) in PAPERS {
+            let paper = Config {
+                theme_fg: fg,
+                theme_bg: bg,
+                ..cfg(false, true)
+            };
+            let main = BedInkLut::synced(&paper);
+            let bed = BedInkLut::synced(&Config {
+                light: Light::at(Live::Glass),
+                ..paper
+            });
+            assert!(
+                same_mains(&bed, &main),
+                "#{bg:06X}: main's table beside the glass"
+            );
+            let palette = Palette::shipped(fg, bg).expect("every paper page ships");
+            if !palette.headroom() {
+                forward += 1;
+                assert!(!bed.glass_lit(), "#{bg:06X} is lip-forward");
+                for k in 0..=1024u32 {
+                    let t = k as f32 / 1024.0;
+                    assert_eq!(bed.at(t), main.at(t), "#{bg:06X} at {t}");
+                }
+                continue;
+            }
+            glass_pages += 1;
+            assert_eq!(bed.glass(), Some(&palette.glass), "#{bg:06X}: glass129");
+            let bar = glass_bar(fg, bg);
+            let bg_lin = bg_linear_rgb(linear, bg);
+            for (i, &glass) in palette.glass.iter().enumerate() {
+                let t = i as f32 / (BED_INK_LUT_LEN - 1) as f32;
+                assert_eq!(bed.at(t), glass, "#{bg:06X}: entry {i}");
+                let seen = seen_floor_with_bg_lin(linear, glass, bg, bg_lin);
+                assert_eq!(
+                    bed.seen_floor_at(t).to_bits(),
+                    seen.max(seen_floor_with_bg_lin(
+                        linear,
+                        palette.glass[(i + 1).min(BED_INK_LUT_LEN - 1)],
+                        bg,
+                        bg_lin
+                    ))
+                    .to_bits(),
+                    "#{bg:06X}: entry {i}'s floor is its glass's"
+                );
+                for cov in 1..=255u8 {
+                    let lit = over_premul(bg, premul_rgb(glass, cov), cov);
+                    let c = colour::contrast(fg, lit);
+                    assert!(
+                        c >= bar,
+                        "#{fg:06X} on #{bg:06X}: glass #{glass:06X} at cov {cov} composites #{lit:06X}, {c:.3}:1 under {bar:.3}:1"
+                    );
+                }
+                assert_ne!(
+                    over_premul(bg, premul_rgb(glass, 255), 255),
+                    bg,
+                    "#{bg:06X}: entry {i} went out"
+                );
+            }
+            for k in 0..=1024u32 {
+                let t = k as f32 / 1024.0;
+                assert_eq!(
+                    bed.at(t),
+                    BedInkLut::sample(&palette.glass, t),
+                    "#{bg:06X} at {t}: main's sampler over the glass"
+                );
+            }
+            assert_ne!(
+                (0..BED_INK_LUT_LEN)
+                    .filter(|&i| bed.at(i as f32 / 128.0) != main.at(i as f32 / 128.0))
+                    .count(),
+                0,
+                "control: #{bg:06X}'s glass is not its paper bed"
+            );
+        }
+        assert_eq!((glass_pages, forward), (4, 2), "the pages swept");
+    }
+
+    /// Prism Glass's bed pin (§15.2 1.5, §15.0.3): on every dark ground (each built-in and pack
+    /// scheme `aterm_render::theme_is_dark` reads dark, and the tests' own), on both spellings,
+    /// whatever light the frame carries, the bed syncs main's table byte for byte and draws by
+    /// it, a ribbon's frame lays main's body and plans and lays no glass (§15.2 1.7), and no
+    /// palette solve unit runs. Negative control: the same lights on Default Light's page light
+    /// the glass from the glass level up.
+    #[test]
+    fn the_bed_ink_lut_is_mains_on_every_dark_ground() {
+        use crate::rainbow_kitty::prism_glass::take_solves;
+        let pack = |c: aterm_types::Rgb| aterm_render::rgb_to_u32([c.r, c.g, c.b]);
+        let builtins = aterm_types::scheme::builtin_names()
+            .into_iter()
+            .filter_map(aterm_types::scheme::builtin);
+        let packs = aterm_theme_pack::themes()
+            .iter()
+            .filter_map(|theme| aterm_types::scheme::parse_scheme_str(theme.text).ok());
+        let mut grounds: Vec<(u32, u32)> = builtins
+            .chain(packs)
+            .map(|scheme| (pack(scheme.foreground), pack(scheme.background)))
+            .filter(|&(_, bg)| aterm_render::theme_is_dark(bg))
+            .collect();
+        let schemes = grounds.len();
+        assert!(schemes >= 37, "{schemes} dark schemes swept");
+        grounds.extend([(DEFAULT_FG, DEFAULT_BG), (SHIPPED_FG, SHIPPED_BG)]);
+        let t0 = Instant::now();
+        let _ = take_solves();
+        let body = |c: &Config| {
+            let mut rib = Ribbon::new();
+            type_run(&mut rib, t0, 10, 12, c, 0.9);
+            let now = at(t0, 11 * 60 + 16);
+            let cx = ctx(now, c, (2, 22), 0.9);
+            rib.plan(&cx);
+            let mut sink = Sink::default();
+            rib.emit(&cx, &mut sink.frame());
+            (rib, sink.under, now)
+        };
+        for &(fg, bg) in &grounds {
+            for tall in [true, false] {
+                let mains = Config {
+                    theme_fg: fg,
+                    theme_bg: bg,
+                    ..cfg(true, tall)
+                };
+                let main = BedInkLut::synced(&mains);
+                for light in LIGHTS {
+                    let lit = Config { light, ..mains };
+                    let bed = BedInkLut::synced(&lit);
+                    assert!(
+                        same_mains(&bed, &main) && !bed.glass_lit() && bed.glass().is_none(),
+                        "#{fg:06X} on #{bg:06X}, tall {tall}, {light:?}: the bed is main's"
+                    );
+                    for k in 0..=256u32 {
+                        let t = k as f32 / 256.0;
+                        assert_eq!(bed.at(t), main.at(t));
+                        assert_eq!(
+                            bed.seen_floor_at(t).to_bits(),
+                            main.seen_floor_at(t).to_bits()
+                        );
+                    }
+                }
+            }
+            let mains = Config {
+                theme_fg: fg,
+                theme_bg: bg,
+                ..cfg(true, true)
+            };
+            let (main_rib, main_under, now) = body(&mains);
+            let (rib, under, _) = body(&Config {
+                light: Light::at(Live::Vanish),
+                ..mains
+            });
+            assert!(!main_under.is_empty(), "fixture: the run laid a body");
+            assert_eq!(
+                under, main_under,
+                "#{fg:06X} on #{bg:06X}: a lit frame lays main's body"
+            );
+            assert!(same_mains(&rib.ink, &main_rib.ink) && !rib.ink.glass_lit());
+            assert!(!rib.glass_drew_at(now) && rib.palettes.is_empty());
+            assert!(
+                !rib.glass_planned() && aterm_render::test_counters::take_glass_slabs() == 0,
+                "#{fg:06X} on #{bg:06X}: a lit frame plans and lays no glass"
+            );
+        }
+        assert_eq!(
+            take_solves(),
+            0,
+            "no palette solve unit ran on a dark ground"
+        );
+
+        let (fg, bg) = (0x002B_2D33, 0x00F6_F7F9);
+        let paper = Config {
+            theme_fg: fg,
+            theme_bg: bg,
+            ..cfg(false, true)
+        };
+        let lit: Vec<bool> = LIGHTS
+            .iter()
+            .map(|&light| BedInkLut::synced(&Config { light, ..paper }).glass_lit())
+            .collect();
+        assert_eq!(
+            lit,
+            [false, false, true, true, true, true],
+            "control: Default Light's page lights the glass from the glass level up"
+        );
+        let forced = Config {
+            light: Light::at(Live::Vanish),
+            dark_theme: true,
+            ..paper
+        };
+        assert!(
+            !BedInkLut::synced(&forced).glass_lit(),
+            "a dark frame never lights the glass, whatever its pair"
+        );
+        assert_eq!(take_solves(), 0, "a shipped page runs no unit");
+    }
+
+    /// The glass needs the tall spelling and a page with headroom (§15.0.4): the underline
+    /// spelling of a glass page, and a lip-forward page, draw main's paper bed under any light;
+    /// the tall spellings of a glass page, the flat one among them, light the glass.
+    #[test]
+    fn the_glass_lights_only_the_tall_spelling_of_a_page_with_headroom() {
+        let (fg, bg) = (0x002B_2D33, 0x00F6_F7F9);
+        for (what, c) in [
+            ("the underline spelling", cfg(false, false)),
+            ("Solarized Light", cfg(false, true)),
+            ("Catppuccin Latte", cfg(false, true)),
+        ] {
+            let (fg, bg) = match what {
+                "Solarized Light" => (0x0058_6E75, 0x00FD_F6E3),
+                "Catppuccin Latte" => (0x004C_4F69, 0x00EF_F1F5),
+                _ => (fg, bg),
+            };
+            let paper = Config {
+                theme_fg: fg,
+                theme_bg: bg,
+                ..c
+            };
+            let main = BedInkLut::synced(&paper);
+            let bed = BedInkLut::synced(&Config {
+                light: Light::at(Live::Vanish),
+                ..paper
+            });
+            assert!(!bed.glass_lit(), "{what} lights no glass");
+            for k in 0..=256u32 {
+                let t = k as f32 / 256.0;
+                assert_eq!(bed.at(t), main.at(t), "{what} at {t}");
+            }
+        }
+        for (what, c) in [
+            ("the tall", cfg(false, true)),
+            ("the flat", flat(false, true)),
+        ] {
+            let lit = Config {
+                theme_fg: fg,
+                theme_bg: bg,
+                light: Light::at(Live::Vanish),
+                ..c
+            };
+            assert!(
+                BedInkLut::synced(&lit).glass_lit(),
+                "{what} spelling lights the glass"
+            );
+        }
+    }
+
+    /// A light page whose palette does not ship draws main's paper bed while its solve runs, at
+    /// most [`prism_glass::SOLVE_UNITS_PER_FRAME`] units a frame, then the solved glass129: the
+    /// glass needs a ready palette (§15.2 1.4, 1.5).
+    #[test]
+    fn a_pending_palette_draws_mains_paper_bed_until_its_glass_is_solved() {
+        use crate::rainbow_kitty::prism_glass::{
+            MAX_SOLVE_UNITS, Palette, SOLVE_UNITS_PER_FRAME, solve, take_solves,
+        };
+        let (fg, bg) = (0x0033_3333, 0x00FA_FAF7);
+        assert!(Palette::shipped(fg, bg).is_none(), "fixture: not shipped");
+        let paper = Config {
+            theme_fg: fg,
+            theme_bg: bg,
+            ..cfg(false, true)
+        };
+        let main = BedInkLut::synced(&paper);
+        let c = Config {
+            light: Light::at(Live::Glass),
+            ..paper
+        };
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_run(&mut rib, t0, 10, 12, &c, 0.9);
+        let now = at(t0, 11 * 60 + 16);
+        let cx = ctx(now, &c, (2, 22), 0.9);
+        let _ = take_solves();
+        let mut frames = 0;
+        while !rib.ink.glass_lit() {
+            assert!(
+                same_mains(&rib.ink, &main),
+                "frame {frames}: main's paper bed while the palette solves"
+            );
+            for k in 0..=128u32 {
+                let t = k as f32 / 128.0;
+                assert_eq!(rib.ink.at(t), main.at(t), "frame {frames} at {t}");
+            }
+            rib.plan(&cx);
+            let ran = take_solves();
+            assert!(
+                ran <= SOLVE_UNITS_PER_FRAME,
+                "{ran} units in frame {frames}"
+            );
+            frames += 1;
+            assert!(
+                frames <= MAX_SOLVE_UNITS.div_ceil(SOLVE_UNITS_PER_FRAME),
+                "the solve outran its unit count"
+            );
+        }
+        assert!(frames > 1, "the solve took {frames} frames");
+        let solved = solve(fg, bg);
+        assert!(solved.headroom(), "fixture: the pair takes glass");
+        assert_eq!(rib.ink.glass(), Some(&solved.glass));
+        assert!(same_mains(&rib.ink, &main), "main's table beside the glass");
+        let _ = take_solves();
+        rib.plan(&cx);
+        assert_eq!(take_solves(), 0, "a solved pair runs no unit");
+        rib.plan(&ctx(now, &paper, (2, 22), 0.9));
+        assert!(!rib.ink.glass_lit(), "main's light puts the glass out");
+    }
+
+    /// Default Light's page at the glass level, the glass's fixture (§15.2 1.7): a frame the bed
+    /// draws by its glass.
+    const fn glass_cfg(c: Config) -> Config {
+        Config {
+            theme_fg: 0x002B_2D33,
+            theme_bg: 0x00F6_F7F9,
+            light: Light::at(Live::Glass),
+            ..c
+        }
+    }
+
+    /// Default Light's page on main's light: the glass fixture's paper twin.
+    const fn paper_cfg(c: Config) -> Config {
+        Config {
+            light: Light::OFF,
+            ..glass_cfg(c)
+        }
+    }
+
+    /// The bottom of row 2 on [`geom`], where the glass stands.
+    const ROW2_BOTTOM: i32 = 3 * 18;
+
+    /// [`type_run`]'s 12 keys from column 10 of row 2 on `c`, and its frame 16 ms after the
+    /// last: the ribbon and what it laid under the text.
+    fn typed_frame(c: &Config, t0: Instant) -> (Ribbon, Vec<GlowQuad>, Instant) {
+        let mut rib = Ribbon::new();
+        type_run(&mut rib, t0, 10, 12, c, 0.9);
+        let now = at(t0, 11 * 60 + 16);
+        let cx = ctx(now, c, (2, 22), 0.9);
+        rib.plan(&cx);
+        let mut sink = Sink::default();
+        rib.emit(&cx, &mut sink.frame());
+        (rib, sink.under, now)
+    }
+
+    /// A glass frame (§15.2 1.5, 1.7) lays the glass in the glass's ink, standing on its row's
+    /// bottom with nothing below it where main's paper body reaches below the row, and says so
+    /// ([`Ribbon::glass_drew_at`], Prism Glass's `glass` arm). Its plan keeps main's geometry, so
+    /// every cell's band is main's. The same frame on main's light lays main's paper body, plans
+    /// no glass and draws no arm, and a lit frame with nothing to plan draws none either.
+    #[test]
+    fn a_glass_frame_lays_the_glass_in_the_glass_ink() {
+        use crate::rainbow_kitty::prism_glass::{colour, glass_bar};
+        let paper = paper_cfg(cfg(false, true));
+        let lit = glass_cfg(cfg(false, true));
+        let t0 = Instant::now();
+        let (main_rib, main_under, now) = typed_frame(&paper, t0);
+        let (rib, under, _) = typed_frame(&lit, t0);
+        assert!(
+            !main_under.is_empty() && !under.is_empty(),
+            "fixture: the run laid a body"
+        );
+        assert!(rib.ink.glass_lit() && !main_rib.ink.glass_lit());
+        assert!(
+            main_under.iter().any(|q| i32::from(q.y) >= ROW2_BOTTOM),
+            "control: main's paper body reaches below its row"
+        );
+        assert!(
+            under.iter().all(|q| i32::from(q.y) < ROW2_BOTTOM),
+            "the glass stands on its row's bottom"
+        );
+        let bar = glass_bar(lit.theme_fg, lit.theme_bg);
+        let opaque = rib
+            .cells()
+            .iter()
+            .map(|c| (GLASS_ALPHA * c.cov0) as u8)
+            .min()
+            .expect("fixture: cells");
+        let whole: Vec<u32> = under
+            .iter()
+            .filter(|q| q.alpha >= opaque && q.alpha2 >= opaque)
+            .flat_map(|q| [q.color, q.color2])
+            .collect();
+        assert!(
+            !whole.is_empty(),
+            "the glass lays its whole opacity, {opaque} or more"
+        );
+        for ink in whole {
+            let c = colour::contrast(lit.theme_fg, ink);
+            assert!(
+                c >= bar,
+                "the glass's #{ink:06X} keeps the letters {c:.3}:1, under {bar:.3}:1"
+            );
+        }
+        assert!(rib.glass_planned() && !main_rib.glass_planned());
+        for col in 0..40 {
+            assert_eq!(rib.band(2, col), main_rib.band(2, col), "column {col}");
+        }
+        assert!(rib.glass_drew_at(now) && !main_rib.glass_drew_at(now));
+        assert!(
+            !rib.glass_drew_at(at(t0, 11 * 60 + 32)),
+            "the arm is the frame's"
+        );
+
+        let mut idle = Ribbon::new();
+        let cx = ctx(now, &lit, (2, 22), 0.9);
+        idle.plan(&cx);
+        let mut sink = Sink::default();
+        idle.emit(&cx, &mut sink.frame());
+        assert!(idle.ink.glass_lit() && sink.under.is_empty() && idle.plan.is_empty());
+        assert!(
+            !idle.glass_drew_at(now) && idle.glass_span().is_none(),
+            "a frame with no plan draws no arm"
+        );
+    }
+
+    /// v4's glass on a single-row composer (§2.2, §15.2 1.7): typed along one row, the glass
+    /// stands on the row's bottom and lays nothing on or below it; it is 0.96 ch tall at the hand
+    /// and 0.86 ch a taper's length behind it, its top a 2.5 px melt over whole opacity
+    /// (source-over, 255 hot and [`BODY_COLD_SHARE`] of it cold), laid by the glass's wedge walk; it draws no rail and no hot edge.
+    /// The negative control is main's paper arm on the same keys: it reaches below the row and
+    /// lays no glass slab, under its role's cap.
+    #[test]
+    fn a_single_row_composer_draws_v4s_glass() {
+        use aterm_render::test_counters::take_glass_slabs;
+        let g = geom();
+        let (cw, ch) = (g.cw as i32, g.ch as f32);
+        let keys = Keys {
+            g,
+            row: 2,
+            col0: 2,
+            n: 30,
+            period_ms: 60,
+            disp: 0.9,
+        };
+        let lay = |c: &Config| {
+            let t0 = Instant::now();
+            let mut rib = Ribbon::new();
+            type_keys(&mut rib, t0, keys, c);
+            let cx = ctx(at(t0, 29 * 60 + 16), c, (2, 32), 0.9);
+            let _ = take_glass_slabs();
+            rib.plan(&cx);
+            let mut sink = Sink::default();
+            rib.emit(&cx, &mut sink.frame());
+            (rib, sink.under, sink.out, take_glass_slabs())
+        };
+        let (rib, under, out, slabs) = lay(&glass_cfg(cfg(false, true)));
+        assert!(rib.ink.glass_lit(), "fixture: the bed draws by its glass");
+        assert!(slabs > 0, "the glass's wedge walk laid it");
+        assert!(out.is_empty(), "no hot edge on light");
+        assert!(rib.rail_spans().is_empty(), "no rail under glass");
+        assert!(
+            under.iter().all(|q| q.alpha > 0 || q.alpha2 > 0),
+            "the glass is source-over"
+        );
+        assert!(
+            under.iter().all(|q| i32::from(q.y) < ROW2_BOTTOM),
+            "nothing on or below the row's bottom"
+        );
+        let census = |col: i32, floor: u8| {
+            column_census(&under, col * cw..(col + 1) * cw, 0..ROW2_BOTTOM + 18, floor)
+                .into_iter()
+                .flatten()
+                .fold((i32::MAX, 0u8), |(top, peak), (t, _, p)| {
+                    (top.min(t), peak.max(p))
+                })
+        };
+        let (hand_top, hand_peak) = census(31, 128);
+        let (tail_top, _) = census(31 - 16, 128);
+        let (hand_lit, _) = census(31, 1);
+        let reach = |up_ch: f32| ROW2_BOTTOM as f32 - up_ch * ch;
+        assert!(
+            (reach(GLASS_UP_CH).floor() as i32
+                ..=(reach(GLASS_UP_CH) + GLASS_EDGE_PX).ceil() as i32)
+                .contains(&hand_top),
+            "the hand's glass is half opaque from y {hand_top}, not {:.2} ch tall",
+            GLASS_UP_CH
+        );
+        assert!(
+            (reach(GLASS_TAIL_UP_CH).floor() as i32 - 1
+                ..=(reach(GLASS_TAIL_UP_CH) + GLASS_EDGE_PX).ceil() as i32 + 1)
+                .contains(&tail_top),
+            "the tail's glass is half opaque from y {tail_top}, not {:.2} ch tall",
+            GLASS_TAIL_UP_CH
+        );
+        assert!(tail_top > hand_top, "the glass tapers from the hand");
+        let whole = rib
+            .cells()
+            .iter()
+            .find(|c| c.col == 30)
+            .map_or(0, |c| (GLASS_ALPHA * c.cov0) as u8);
+        assert!(
+            whole >= 250 && hand_peak == whole,
+            "the hand's glass is whole: {hand_peak} of {whole}"
+        );
+        let whole_from = column_census(&under, 31 * cw..32 * cw, 0..ROW2_BOTTOM, 250)
+            .into_iter()
+            .flatten()
+            .map(|(t, _, _)| t)
+            .min()
+            .expect("whole rows at the hand");
+        assert!(
+            whole_from - hand_lit <= GLASS_EDGE_PX.ceil() as i32 + 1,
+            "the top melts over {} rows, not {GLASS_EDGE_PX} px",
+            whole_from - hand_lit
+        );
+
+        let (main, main_under, _, main_slabs) = lay(&paper_cfg(cfg(false, true)));
+        assert!(!main.ink.glass_lit() && main_slabs == 0);
+        assert!(
+            main_under.iter().any(|q| i32::from(q.y) >= ROW2_BOTTOM),
+            "control: main's paper arm reaches below the row"
+        );
+        let cap = light_role(&paper_cfg(cfg(false, true))).alpha_cap();
+        assert!(
+            main_under
+                .iter()
+                .filter(|q| i32::from(q.y) < ROW2_BOTTOM)
+                .all(|q| f32::from(q.alpha.max(q.alpha2)) <= cap),
+            "control: main's paper body keeps its role's cap"
+        );
+    }
+
+    /// §2.2's seams (§15.2 1.7): on a glass frame a cohort seam and an in-run walk jump (cells
+    /// whose walk differs by more than [`GLASS_HARD_STEP_T`]) are hard steps: the seam's run
+    /// opens at its own walk, and the jump's boundary is two vertices at one x, each in its own
+    /// side's ink. A cell boundary lerps: one vertex at the mean of its cells' walk. Main's frame
+    /// lerps across both (the negative control): its seam opens at its neighbour's walk and its
+    /// jump is one vertex at the mean.
+    #[test]
+    fn a_seam_or_walk_jump_is_a_hard_step_on_light_and_a_cell_boundary_is_not() {
+        let cw = geom().cw as f32;
+        // The jump sits in the run left of the seam, the run the ribbon paints last, whose
+        // vertices it keeps.
+        let (jump_col, seam_col) = (13u16, 16u16);
+        let lay = |c: &Config| {
+            let t0 = Instant::now();
+            let mut rib = Ribbon::new();
+            type_run(&mut rib, t0, 10, 12, c, 0.9);
+            let coh = rib.cells[0].cohort;
+            let ci = rib
+                .cohorts
+                .iter()
+                .position(|k| k.id == coh)
+                .expect("the run's cohort");
+            let mut copy = rib.cohorts[ci];
+            copy.id = rib.next_cohort;
+            rib.next_cohort += 1;
+            copy.col0 = seam_col;
+            // A wake cohort: a seam heals only between two hot ones.
+            copy.wake = true;
+            rib.cohorts[ci].col1 = seam_col;
+            rib.cohorts.push(copy);
+            for cell in &mut rib.cells {
+                if cell.col >= jump_col {
+                    cell.t += 0.25;
+                }
+                if cell.col >= seam_col {
+                    cell.cohort = copy.id;
+                    cell.t += 0.25;
+                }
+            }
+            let cx = ctx(at(t0, 11 * 60 + 16), c, (2, 22), 0.9);
+            rib.plan(&cx);
+            let mut sink = Sink::default();
+            rib.emit(&cx, &mut sink.frame());
+            assert!(!sink.under.is_empty(), "fixture: the runs laid a body");
+            rib
+        };
+        let t_of = |rib: &Ribbon, col: u16| {
+            rib.cells
+                .iter()
+                .find(|k| k.col == col)
+                .map(|k| k.t)
+                .expect("a cell")
+        };
+        for (glass, c) in [
+            (true, glass_cfg(cfg(false, true))),
+            (false, paper_cfg(cfg(false, true))),
+        ] {
+            let rib = lay(&c);
+            assert_eq!(rib.ink.glass_lit(), glass);
+            let right = rib
+                .runs
+                .iter()
+                .find(|r| r.col0 == seam_col)
+                .copied()
+                .expect("the seam's right run");
+            assert!(
+                rib.runs.iter().any(|r| r.col1 + 1 == seam_col),
+                "fixture: a run abuts the seam"
+            );
+            let first = rib.plan[right.lo];
+            let (left_t, own_t) = (t_of(&rib, seam_col - 1), t_of(&rib, seam_col));
+            assert!(
+                own_t - left_t > GLASS_HARD_STEP_T,
+                "fixture: the seam jumps"
+            );
+            if glass {
+                assert_eq!(first.t, own_t, "glass: the seam opens at its own walk");
+            } else {
+                assert_eq!(
+                    first.t, left_t,
+                    "control: main's seam opens at its neighbour's"
+                );
+            }
+            let at_x = |x: f32| {
+                rib.verts
+                    .iter()
+                    .filter(|v| (v.x - x).abs() < 1e-3)
+                    .map(|v| v.color)
+                    .collect::<Vec<_>>()
+            };
+            let plan_at = |x: f32| {
+                rib.plan
+                    .iter()
+                    .find(|s| (s.x - x).abs() < 1e-3)
+                    .copied()
+                    .expect("a boundary")
+            };
+            let (x_cell, x_jump) = (f32::from(jump_col - 1) * cw, f32::from(jump_col) * cw);
+            let (t11, t12, t13) = (
+                t_of(&rib, jump_col - 2),
+                t_of(&rib, jump_col - 1),
+                t_of(&rib, jump_col),
+            );
+            assert!(t13 - t12 > GLASS_HARD_STEP_T, "fixture: the run jumps");
+            let cell = plan_at(x_cell);
+            assert_eq!(
+                cell.glass_jump, 0.0,
+                "glass {glass}: a cell boundary is no step"
+            );
+            assert_eq!(
+                cell.t,
+                (t11 + t12) * 0.5,
+                "glass {glass}: a cell boundary is the mean of its cells' walk"
+            );
+            // Main's last laid vertices are its rail's, in the rail's ink.
+            let ink = |t: f32| {
+                if glass {
+                    rib.ink.at(t)
+                } else {
+                    rib.ink.rail_at(t)
+                }
+            };
+            assert_eq!(
+                at_x(x_cell),
+                [ink(cell.t)],
+                "glass {glass}: a cell boundary is one vertex"
+            );
+            let jump = plan_at(x_jump);
+            if glass {
+                assert_eq!((jump.t, jump.glass_jump), (t12, t13 - t12));
+                assert_eq!(
+                    at_x(x_jump),
+                    [rib.ink.at(t12 + (t13 - t12)), rib.ink.at(t12)],
+                    "glass: the jump is a hard step, its right side first as the run is laid"
+                );
+            } else {
+                assert_eq!((jump.t, jump.glass_jump), ((t12 + t13) * 0.5, 0.0));
+                assert_eq!(
+                    at_x(x_jump),
+                    [ink(jump.t)],
+                    "control: main's jump is one vertex at the mean"
+                );
+            }
+        }
+    }
+
+    /// The glass's intensity is its height (§15.2 1.7): at half intensity the glass is half as
+    /// tall and as whole at the hand; at a tenth, under [`GLASS_MIN_PX`], it lays nothing but is
+    /// still the glass arm's frame, and leaves no span for the guard or the yield. The negative
+    /// control is main's paper arm, whose intensity is its opacity.
+    #[test]
+    fn glass_at_half_intensity_is_half_height_at_full_alpha() {
+        let cw = geom().cw as i32;
+        let hand = |c: Config| {
+            let t0 = Instant::now();
+            let (rib, under, now) = typed_frame(&c, t0);
+            let (mut top, mut lit, mut peak) = (i32::MAX, i32::MAX, 0u8);
+            for (floor, at) in [(128u8, &mut top), (1, &mut lit)] {
+                for (t, _, p) in column_census(&under, 20 * cw..21 * cw, 0..ROW2_BOTTOM + 18, floor)
+                    .into_iter()
+                    .flatten()
+                {
+                    *at = (*at).min(t);
+                    peak = peak.max(p);
+                }
+            }
+            let whole = rib
+                .cells()
+                .iter()
+                .find(|c| c.col == 20)
+                .map_or(0, |c| (GLASS_ALPHA * c.cov0) as u8);
+            (
+                ROW2_BOTTOM - top,
+                ROW2_BOTTOM - lit,
+                (peak, whole),
+                (rib.glass_drew_at(now), rib.glass_span().is_some()),
+                under.len(),
+            )
+        };
+        let at_intensity = |c: Config, intensity: f32| Config { intensity, ..c };
+        let glass = glass_cfg(cfg(false, true));
+        let (h1, _, peak1, drew1, _) = hand(glass);
+        let (h2, _, peak2, drew2, _) = hand(at_intensity(glass, 0.5));
+        assert!(drew1 == (true, true) && drew2 == (true, true));
+        assert!(
+            (h2 as f32 - h1 as f32 * 0.5).abs() <= 1.5,
+            "half intensity stands {h2} px against {h1} px"
+        );
+        assert!(
+            peak1.1 >= 250 && peak1 == (peak1.1, peak1.1) && peak2 == (peak2.1, peak2.1),
+            "whole at the hand at both intensities: {peak1:?}, {peak2:?}"
+        );
+        let (_, _, _, drew, quads) = hand(at_intensity(glass, 0.1));
+        assert!(
+            0.1 * GLASS_UP_CH * (geom().ch as f32) < GLASS_MIN_PX,
+            "fixture: a tenth of the glass is under its least"
+        );
+        assert_eq!(quads, 0, "a glass under {GLASS_MIN_PX} px draws nothing");
+        assert_eq!(
+            drew,
+            (true, false),
+            "its frame is the glass arm's, with no span laid"
+        );
+
+        let paper = paper_cfg(cfg(false, true));
+        let (_, lit1, main1, _, _) = hand(paper);
+        let (_, lit2, main2, _, _) = hand(at_intensity(paper, 0.5));
+        assert!(
+            f32::from(main2.0) <= 0.75 * f32::from(main1.0),
+            "control: main's half intensity lays {} against {}",
+            main2.0,
+            main1.0
+        );
+        assert!(
+            (lit1 - lit2).abs() <= 2,
+            "control: main's height holds ({lit1} and {lit2} px)"
+        );
+    }
+
+    /// A see-through page (`host::PageFacts`: a translucent window, a wallpaper or an image) draws
+    /// main's paper arm (§15.2 1.7): its sheer light at the glass level syncs main's paper bed,
+    /// plans no glass, lays main's paper frame byte for byte and draws no arm. The negative
+    /// control is the same light on a clear page, which draws the glass.
+    #[test]
+    fn a_translucent_page_draws_mains_paper_arm() {
+        use aterm_render::test_counters::take_glass_slabs;
+        let paper = paper_cfg(cfg(false, true));
+        let t0 = Instant::now();
+        let _ = take_glass_slabs();
+        let (main, main_under, now) = typed_frame(&paper, t0);
+        for light in [Light::at(Live::Glass), Light::at(Live::Vanish)] {
+            let sheer = Config {
+                light: light.on_page(false),
+                ..paper
+            };
+            assert!(sheer.light.on() && !sheer.light.glass());
+            let (rib, under, _) = typed_frame(&sheer, t0);
+            assert!(!rib.ink.glass_lit() && same_mains(&rib.ink, &main.ink));
+            assert!(!rib.glass_planned() && !rib.glass_drew_at(now));
+            assert_eq!(under, main_under, "{light:?}: main's paper frame");
+            assert_eq!(
+                rib.rail_spans(),
+                main.rail_spans(),
+                "{light:?}: main's rail"
+            );
+        }
+        assert_eq!(take_glass_slabs(), 0, "a sheer light lays no glass");
+        let clear = Config {
+            light: Light::at(Live::Glass).on_page(true),
+            ..paper
+        };
+        let (rib, under, _) = typed_frame(&clear, t0);
+        assert!(rib.ink.glass_lit() && rib.glass_drew_at(now));
+        assert_ne!(under, main_under, "control: a clear page draws the glass");
+    }
+
+    /// No rail under glass (§15.2 1.7, the declared interim until the lip): a glass frame lays
+    /// no rail span and nothing on or below its row's bottom, on the comet and the flat
+    /// spellings, with the row below free and with the row held. The negative control is main's
+    /// paper comet, whose rail lies below the row.
+    #[test]
+    fn no_rail_quad_under_glass() {
+        let t0 = Instant::now();
+        for (what, c) in [
+            ("the comet", cfg(false, true)),
+            ("the flat spelling", flat(false, true)),
+        ] {
+            for held in [false, true] {
+                let lit = glass_cfg(c);
+                let mut rib = Ribbon::new();
+                type_run(&mut rib, t0, 10, 12, &lit, 0.9);
+                let now = at(t0, 11 * 60 + 16);
+                let cx = ctx(now, &lit, (2, 22), 0.9);
+                rib.plan(&cx);
+                if held {
+                    for run in &mut rib.runs {
+                        run.hold = 1.0;
+                    }
+                }
+                let mut sink = Sink::default();
+                rib.emit(&cx, &mut sink.frame());
+                assert!(!sink.under.is_empty(), "{what}, held {held}: fixture");
+                assert!(
+                    rib.rail_spans().is_empty(),
+                    "{what}, held {held}: a rail span"
+                );
+                assert!(
+                    sink.under.iter().all(|q| i32::from(q.y) < ROW2_BOTTOM),
+                    "{what}, held {held}: light on or below the row's bottom"
+                );
+            }
+        }
+        let (main, under, _) = typed_frame(&paper_cfg(cfg(false, true)), t0);
+        assert!(Ribbon::rail_lit(&paper_cfg(cfg(false, true))) && !main.ink.glass_lit());
+        assert!(
+            under.iter().any(|q| i32::from(q.y) > ROW2_BOTTOM),
+            "control: main's paper comet lays its rail below the row"
+        );
+    }
+
     #[test]
     fn the_paper_caret_is_its_stop_deepened_and_never_olive() {
         for (_, bg) in PAPERS {
@@ -9525,6 +12168,61 @@ mod tests {
             (35.0..=50.0).contains(&h),
             "yellow's caret sits at hue {h:.1}, not amber"
         );
+        // looks10 L7: no stop's caret is an olive or a khaki, a hue between
+        // the amber and the green deepened to the caret law. Control: bent
+        // as a mark is, the yellow-greens keep their hue and read olive.
+        let olive = |c: u32| {
+            let (h, s, v) = rgb2hsv(c);
+            (46.0..100.0).contains(&h) && s > 0.3 && v < 0.85
+        };
+        for (_, bg) in PAPERS {
+            for i in 0..=128u32 {
+                let stop = spectrum(i as f32 / 128.0);
+                let caret = paper_caret_ink(stop, bg);
+                assert!(
+                    !olive(caret),
+                    "on #{bg:06X} stop #{stop:06X} carets #{caret:06X}, an olive"
+                );
+            }
+        }
+        let olives = (0..=128u32)
+            .filter(|&i| {
+                olive(paper_vivid_ink(
+                    spectrum(i as f32 / 128.0),
+                    0x00FF_FFFF,
+                    4.5,
+                ))
+            })
+            .count();
+        assert!(
+            olives > 0,
+            "control: bent as a mark is, no caret reads olive"
+        );
+        // looks10 round 2's L7: the burst's lime head (88 degrees) carets a
+        // clean green, as the head reads, not round 1's bronze. Control:
+        // stepped to green at 89 degrees, as round 1 bent it, it is bronze.
+        const ROUND_1_BEND: [(f32, f32); 5] = [
+            (30.0, 30.0),
+            (72.0, 40.0),
+            (89.0, 43.0),
+            (89.0, 118.0),
+            (122.0, 122.0),
+        ];
+        let lime = crate::color_math::hsv2rgb(88.0, 1.0, 1.0);
+        for (_, bg) in PAPERS {
+            let caret = paper_caret_ink(lime, bg);
+            let (h, ..) = rgb2hsv(caret);
+            assert!(
+                (110.0..=130.0).contains(&h),
+                "on #{bg:06X} the lime head carets #{caret:06X} at hue {h:.1}, not a green"
+            );
+            let bronze = paper_vivid_ink_bent(lime, bg, PAPER_CARET_CONTRAST, &ROUND_1_BEND);
+            let (h1, ..) = rgb2hsv(bronze);
+            assert!(
+                h1 < 50.0,
+                "control: on #{bg:06X} round 1's bend carets the lime #{bronze:06X} at {h1:.1}"
+            );
+        }
     }
 
     #[test]
@@ -9971,6 +12669,64 @@ mod tests {
         );
     }
 
+    /// THE BODY KEEPS UNDER THE BOX'S TOP: typed on the grid's top row with no head band
+    /// over it (the Settings card's grid, a pane under a chrome strip), the body and its hot
+    /// edge, laying and through the exit swoosh, are laid inside the effects box with their
+    /// soft tops whole, under [`crate::cursor_glow::RISE_CLEAR_PX`], on dark and on paper.
+    /// The negative control (`rise_cut`): cut by the box's clip, the body stood flat on the
+    /// box's top row (settings round 2's four-row card, 40 to 211 px a frame).
+    #[test]
+    fn a_body_on_the_grids_top_row_keeps_under_the_boxs_top() {
+        for dark in [true, false] {
+            let c = cfg(dark, true);
+            let on_top = |cut: bool| {
+                let t0 = Instant::now();
+                let mut rib = Ribbon::new();
+                rib.rise_cut = cut;
+                let keys = Keys {
+                    g: geom(),
+                    row: 0,
+                    col0: 10,
+                    n: 16,
+                    period_ms: 60,
+                    disp: 1.0,
+                };
+                type_keys(&mut rib, t0, keys, &c);
+                let mut sink = Sink::default();
+                let (mut drawn, mut top) = (0, 0);
+                let ceiling = geom().rise_ceiling();
+                for ms in (15 * 60..15 * 60 + 2_400).step_by(40) {
+                    let cx = ctx_in(at(t0, ms), &c, (0, 26), 1.0, geom());
+                    rib.plan(&cx);
+                    rib.emit(&cx, &mut sink.frame());
+                    for q in sink.under.iter().chain(&sink.out) {
+                        // Additive quads (opacity 0) light by their colour alone.
+                        if q.color | q.color2 == 0 && q.alpha == 0 && q.alpha2 == 0 {
+                            continue;
+                        }
+                        drawn += 1;
+                        if f32::from(q.y) < ceiling {
+                            top += 1;
+                        }
+                    }
+                }
+                (drawn, top)
+            };
+            let side = if dark { "dark" } else { "paper" };
+            let (drawn, top) = on_top(false);
+            assert!(drawn > 0, "{side}: the body draws");
+            assert_eq!(
+                top, 0,
+                "{side}: {top} quads of the body on the box's top row"
+            );
+            let (_, cut) = on_top(true);
+            assert!(
+                cut > 0,
+                "negative control ({side}): the box's clip cuts the body's top"
+            );
+        }
+    }
+
     #[test]
     fn the_exit_swoosh_retracts_toward_the_caret_and_reaches_exactly_zero() {
         let c = cfg(true, true);
@@ -10055,10 +12811,11 @@ mod tests {
 
     /// THE DARK BAND, BYTE FOR BYTE, ACROSS ITS EXIT: every boundary bit and
     /// every emitted quad of a busy dark band through typing, rest, Backspace
-    /// and the curtain hash to the values recorded at Prism Glass P0.11. A
-    /// dark golden held through the light-only Prism Glass phases
-    /// (docs/design/PRISM-GLASS.md §10.3 #4): only a §10.2 change may record
-    /// new values (replaces the pruned
+    /// and the curtain hash to the values recorded at Prism Glass P0.11, as
+    /// re-recorded for §10.2 #3 (the rail's hairline keeps the judge's ring on
+    /// this 18 px row). A dark golden held through the light-only Prism Glass
+    /// phases (docs/design/PRISM-GLASS.md §10.3 #4): only a §10.2 change may
+    /// record new values (replaces the pruned
     /// `a_busy_band_keeps_its_boundary_and_pixel_signature_across_its_exit`).
     #[test]
     fn a_dark_busy_band_keeps_its_signature_across_its_exit() {
@@ -10131,10 +12888,10 @@ mod tests {
         assert_eq!(
             signatures,
             [
-                (94, 2530, 11_489_668_820_431_870_377),
-                (94, 2531, 10_537_523_130_422_772_974),
-                (91, 2468, 3_027_888_762_767_605_351),
-                (91, 2482, 9_297_242_145_352_902_710),
+                (94, 2520, 2_871_221_491_103_572_636),
+                (94, 2521, 1_139_705_768_875_531_907),
+                (91, 2457, 6_051_614_497_633_733_274),
+                (91, 2469, 2_216_295_461_641_169_251),
             ]
         );
     }
@@ -10471,66 +13228,70 @@ mod tests {
         );
     }
 
+    /// A run's tail on the gallery's 14 px cells under `c`, laid finely or, under `stair`, at the
+    /// stride: the largest step its light takes from one lit column to the next across its tail
+    /// cell, and the body's light four cells in.
+    fn tail_profile(c: &Config, stair: bool) -> (f32, f32) {
+        let g = gallery_geom();
+        let col0 = 3u16;
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        rib.tail_stair = stair;
+        let keys = Keys {
+            g,
+            row: 4,
+            col0,
+            n: 16,
+            period_ms: 60,
+            disp: 0.6,
+        };
+        type_keys(&mut rib, t0, keys, c);
+        let now = at(t0, 15 * 60 + 16);
+        let cx = ctx_in(now, c, (4, col0 + 16), 0.6, g);
+        rib.plan(&cx);
+        let mut sink = Sink::default();
+        {
+            let mut f = sink.frame();
+            rib.emit(&cx, &mut f);
+        }
+        let mut col = vec![0.0f32; usize::from(g.win_w)];
+        for q in sink.under.iter().filter(|q| q.alpha > 0 || q.alpha2 > 0) {
+            let w = f32::from(q.w.max(1));
+            for i in 0..q.w {
+                let t = if q.w > 1 {
+                    f32::from(i) / (w - 1.0)
+                } else {
+                    0.0
+                };
+                let a = f32::from(q.alpha) + (f32::from(q.alpha2) - f32::from(q.alpha)) * t;
+                let x = usize::from(q.x + i);
+                col[x] = col[x].max(a);
+            }
+        }
+        let ox = usize::from(g.origin_x);
+        let tail = ox + usize::from(col0) * g.cw;
+        let body = col[tail + 4 * g.cw];
+        // From the run's first lit column (its outer boundary keeps a
+        // tenth of the light, a soft start) across the tail cell.
+        let first = (tail.saturating_sub(2)..tail + g.cw)
+            .find(|&x| col[x] > 0.0)
+            .unwrap_or(tail);
+        let step = col[first..first + g.cw + 2]
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f32::max);
+        (step, body)
+    }
+
     /// On the gallery's 14 px cells a run's tail light steps by no more than
     /// an eighth of the body's from one lit column to the next, on dark and
     /// on paper; laid at the stride (the negative control) it steps by a fifth
     /// or more.
     #[test]
     fn the_run_s_tail_eases_in_without_a_stair() {
-        let g = gallery_geom();
-        let col0 = 3u16;
-        let profile = |dark: bool, stair: bool| -> (f32, f32) {
-            let c = cfg(dark, true);
-            let t0 = Instant::now();
-            let mut rib = Ribbon::new();
-            rib.tail_stair = stair;
-            let keys = Keys {
-                g,
-                row: 4,
-                col0,
-                n: 16,
-                period_ms: 60,
-                disp: 0.6,
-            };
-            type_keys(&mut rib, t0, keys, &c);
-            let now = at(t0, 15 * 60 + 16);
-            let cx = ctx_in(now, &c, (4, col0 + 16), 0.6, g);
-            rib.plan(&cx);
-            let mut sink = Sink::default();
-            {
-                let mut f = sink.frame();
-                rib.emit(&cx, &mut f);
-            }
-            let mut col = vec![0.0f32; usize::from(g.win_w)];
-            for q in sink.under.iter().filter(|q| q.alpha > 0 || q.alpha2 > 0) {
-                let w = f32::from(q.w.max(1));
-                for i in 0..q.w {
-                    let t = if q.w > 1 {
-                        f32::from(i) / (w - 1.0)
-                    } else {
-                        0.0
-                    };
-                    let a = f32::from(q.alpha) + (f32::from(q.alpha2) - f32::from(q.alpha)) * t;
-                    let x = usize::from(q.x + i);
-                    col[x] = col[x].max(a);
-                }
-            }
-            let ox = usize::from(g.origin_x);
-            let tail = ox + usize::from(col0) * g.cw;
-            let body = col[tail + 4 * g.cw];
-            // From the run's first lit column (its outer boundary keeps a
-            // tenth of the light, a soft start) across the tail cell.
-            let first = (tail.saturating_sub(2)..tail + g.cw)
-                .find(|&x| col[x] > 0.0)
-                .unwrap_or(tail);
-            let step = col[first..first + g.cw + 2]
-                .windows(2)
-                .map(|w| (w[1] - w[0]).abs())
-                .fold(0.0, f32::max);
-            (step, body)
-        };
         for dark in [true, false] {
-            let (step, body) = profile(dark, false);
+            let c = cfg(dark, true);
+            let (step, body) = tail_profile(&c, false);
             assert!(
                 body > 40.0,
                 "fixture (dark {dark}): the body is lit ({body})"
@@ -10539,12 +13300,1168 @@ mod tests {
                 step <= body / 8.0,
                 "dark {dark}: the tail steps by {step} in a column against the body's {body}"
             );
-            let (stair, body) = profile(dark, true);
+            let (stair, body) = tail_profile(&c, true);
             assert!(
                 stair >= body / 5.0,
                 "control (dark {dark}): at the stride the tail steps only {stair} against {body}"
             );
         }
+    }
+
+    /// The glass's oldest end (`docs/design/PRISM-GLASS.md` §2.2 The oldest end, §15.2 1.8): on a
+    /// glass frame the run's height eases in from its oldest end by smooth01(d /
+    /// [`GLASS_TAIL_CELLS`]), from a pixel or two at its first lit column to the body's over the
+    /// ease, half way at half of it, with no stair (no column a step of more than two pixels
+    /// above its neighbour, none lower than its neighbour by more than one, the wave's swing),
+    /// and at whole opacity wherever it stands taller than its melt: the tail is the glass's
+    /// height. The negative control is main's paper on the same keys, whose tail is its
+    /// opacity's ([`RUN_TAIL_EASE`]): its first lit column holds under half its body's light.
+    #[test]
+    fn the_glass_run_s_tail_eases_in_by_height_without_a_stair() {
+        let g = gallery_geom();
+        let (cw, ch) = (g.cw as i32, g.ch as i32);
+        let col0 = 3u16;
+        let lay = |c: &Config| {
+            let t0 = Instant::now();
+            let mut rib = Ribbon::new();
+            let keys = Keys {
+                g,
+                row: 4,
+                col0,
+                n: 16,
+                period_ms: 60,
+                disp: 0.6,
+            };
+            type_keys(&mut rib, t0, keys, c);
+            let now = at(t0, 15 * 60 + 16);
+            let cx = ctx_in(now, c, (4, col0 + 16), 0.6, g);
+            rib.plan(&cx);
+            let mut sink = Sink::default();
+            rib.emit(&cx, &mut sink.frame());
+            sink.under
+        };
+        let row_bottom = i32::from(g.origin_y) + 5 * ch;
+        let x0 = i32::from(g.origin_x) + i32::from(col0) * cw;
+        let span = x0 - 2..x0 + 4 * cw;
+        let census = |under: &[GlowQuad], floor: u8| {
+            column_census(
+                under,
+                span.clone(),
+                row_bottom - 2 * ch..row_bottom + ch,
+                floor,
+            )
+        };
+        let lit = glass_cfg(cfg(false, true));
+        let under = lay(&lit);
+        let heights: Vec<i32> = census(&under, 128)
+            .iter()
+            .map(|c| c.map_or(0, |(top, _, _)| row_bottom - top))
+            .collect();
+        let peaks: Vec<u8> = census(&under, 1)
+            .iter()
+            .map(|c| c.map_or(0, |(_, _, peak)| peak))
+            .collect();
+        let at_cells = |d: f32| (2.0 + d * cw as f32).round() as usize;
+        let body = heights[at_cells(3.5)];
+        let body_peak = peaks[at_cells(3.5)];
+        assert!(
+            (body as f32 - GLASS_TAIL_UP_CH * ch as f32).abs() <= 2.0 && body_peak >= 224,
+            "fixture: the glass's body stands {body} px at {body_peak}"
+        );
+        let first = heights
+            .iter()
+            .position(|&h| h > 0)
+            .expect("the tail is laid");
+        assert!(
+            heights[first] <= 3,
+            "the tail starts {} px tall",
+            heights[first]
+        );
+        let half = heights[at_cells(GLASS_TAIL_CELLS * 0.5)];
+        assert!(
+            (half - body / 2).abs() <= 3,
+            "half way along the ease the glass stands {half} px of the body's {body}"
+        );
+        let eased = heights[at_cells(GLASS_TAIL_CELLS) + 2];
+        assert!(
+            eased >= body - 1,
+            "past the ease the glass stands {eased} px of the body's {body}"
+        );
+        for (i, w) in heights[first..at_cells(3.5)].windows(2).enumerate() {
+            assert!(
+                w[1] - w[0] <= 2 && w[0] - w[1] <= 1,
+                "column {}: the tail steps from {} to {} px",
+                first + i,
+                w[0],
+                w[1]
+            );
+        }
+        for (i, (&h, &peak)) in heights.iter().zip(&peaks).enumerate() {
+            if h > GLASS_EDGE_PX.ceil() as i32 + 1 {
+                assert!(
+                    peak.abs_diff(body_peak) <= 1,
+                    "column {i}: the tail's glass stands {h} px at {peak}, not whole ({body_peak})"
+                );
+            }
+        }
+
+        let paper = lay(&paper_cfg(cfg(false, true)));
+        let paper_peaks: Vec<u8> = census(&paper, 1)
+            .iter()
+            .map(|c| c.map_or(0, |(_, _, peak)| peak))
+            .collect();
+        let paper_first = paper_peaks
+            .iter()
+            .position(|&p| p > 0)
+            .expect("control: main's tail is laid");
+        let paper_body = paper_peaks[at_cells(3.5)];
+        assert!(
+            u32::from(paper_peaks[paper_first]) * 2 < u32::from(paper_body),
+            "control: main's tail starts at {} of its body's {paper_body}",
+            paper_peaks[paper_first]
+        );
+    }
+
+    /// One frame's plan read for an exit: its highest coverage and its tallest glass, px.
+    fn plan_peaks(rib: &Ribbon) -> (u8, f32) {
+        let segs = rib.plan_segments();
+        (
+            segs.iter().map(|s| s.cov).max().unwrap_or(0),
+            segs.iter().map(|s| s.glass_up).fold(0.0, f32::max),
+        )
+    }
+
+    /// The exits [`the_glass_leaves_by_height`] drives, each from the settled band of
+    /// [`type_run`]'s 12 keys on row 2: its name, the event that starts it (none for the swoosh
+    /// and melt the band leaves by when the hand rests), the caret it plans under, and how long
+    /// its frames run, ms.
+    const EXITS: [(&str, u64); 4] = [
+        ("swoosh and melt", 30_000),
+        ("retract", 1_000),
+        ("ember", 400),
+        ("curtain", (CURTAIN_S * 1000.0) as u64 + 48),
+    ];
+
+    /// Exit `which` of [`EXITS`] on `c`: the settled plan's peaks and every 16 ms frame's from
+    /// the exit's start ([`plan_peaks`]), until the ribbon rests or the exit's time is out.
+    fn exit_run(c: &Config, which: usize) -> ((u8, f32), Vec<(u8, f32)>) {
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_run(&mut rib, t0, 10, 12, c, 0.9);
+        let start = at(t0, 11 * 60 + 100);
+        let cx = ctx(start, c, (2, 22), 0.9);
+        rib.plan(&cx);
+        let settled = plan_peaks(&rib);
+        let caret = match which {
+            1 => {
+                rib.on_event(&pty((2, 22), (2, 80)), start, &cx);
+                (2, 80)
+            }
+            2 => {
+                rib.on_event(&Event::Focus(false), start, &cx);
+                (2, 22)
+            }
+            3 => {
+                rib.curtain(start);
+                (3, 0)
+            }
+            _ => (2, 22),
+        };
+        let mut frames = Vec::new();
+        for k in 1..=EXITS[which].1 / 16 {
+            let cx = ctx(at(start, k * 16), c, caret, 0.9);
+            rib.plan(&cx);
+            frames.push(plan_peaks(&rib));
+            if rib.at_rest() {
+                break;
+            }
+        }
+        (settled, frames)
+    }
+
+    /// EXITS BY HEIGHT (`docs/design/PRISM-GLASS.md` §2.2 Exits by height, §15.2 1.8): on a glass
+    /// frame the swoosh and the drawn melt the band leaves by when the hand rests, a jump's
+    /// retract, the focus ember and the curtain each take the glass down by its height: through
+    /// every frame of each the glass's opacity is the settled band's whole while any of it
+    /// stands, and its height never rises, falls under half of the band's, and ends at nothing
+    /// (the ember burning at its floor, a glass still drawn, [`GLASS_MIN_PX`] or more, until the
+    /// band goes out whole). Under reduced motion it is the other way round: the exits are the
+    /// opacity's fade (§2.2's fourth place) and the height stands, but for the focus ember, which
+    /// takes the height to its floor at whole opacity there too, so an unfocused window never
+    /// holds a translucent pastel glass. The negative control is main's paper on the same exits,
+    /// whose coverage falls.
+    #[test]
+    fn the_glass_leaves_by_height() {
+        let lit = glass_cfg(cfg(false, true));
+        let paper = paper_cfg(cfg(false, true));
+        for (which, &(name, _)) in EXITS.iter().enumerate() {
+            let ((cov, up), frames) = exit_run(&lit, which);
+            assert!(
+                cov >= 224 && up > 0.8 * 18.0,
+                "{name}: fixture: the glass stands {up} px at {cov}"
+            );
+            let mut prev = up;
+            let mut least = up;
+            for (k, &(c, u)) in frames.iter().enumerate() {
+                if u > GLASS_EDGE_PX {
+                    assert_eq!(
+                        c, cov,
+                        "{name}: frame {k}: the glass stands {u} px at {c}, not its whole {cov}"
+                    );
+                }
+                assert!(
+                    u <= prev + 0.01,
+                    "{name}: frame {k}: the glass rises from {prev} to {u} px"
+                );
+                prev = u;
+                least = least.min(u);
+            }
+            assert!(
+                least < 0.5 * up,
+                "{name}: the glass falls only to {least} of its {up} px"
+            );
+            if name == "ember" {
+                let burning: Vec<f32> = frames.iter().filter(|f| f.0 > 0).map(|f| f.1).collect();
+                assert!(
+                    !burning.is_empty() && burning.iter().all(|&u| u >= GLASS_MIN_PX),
+                    "the ember takes the glass under its least: {burning:?}"
+                );
+            }
+            assert!(prev < GLASS_MIN_PX, "{name}: the glass ends {prev} px tall");
+
+            let ((paper_cov, _), paper_frames) = exit_run(&paper, which);
+            let paper_least = paper_frames.iter().map(|f| f.0).min().unwrap_or(0);
+            assert!(
+                u32::from(paper_least) * 5 < u32::from(paper_cov) * 3,
+                "control: {name}: main's paper keeps {paper_least} of its {paper_cov}"
+            );
+        }
+
+        let reduced = Config {
+            reduced_motion: true,
+            ..lit
+        };
+        for which in [1usize, 3] {
+            let name = EXITS[which].0;
+            let ((cov, up), frames) = exit_run(&reduced, which);
+            let laid: Vec<_> = frames.iter().filter(|f| f.0 > 0).collect();
+            assert!(
+                !laid.is_empty() && laid.iter().all(|f| (f.1 - up).abs() < 0.01),
+                "reduced {name}: the glass's height moves ({up} px)"
+            );
+            let least = frames.iter().map(|f| f.0).min().unwrap_or(0);
+            assert!(
+                u32::from(least) * 2 < u32::from(cov),
+                "reduced {name}: the glass's opacity keeps {least} of {cov}"
+            );
+        }
+        let ((cov, up), frames) = exit_run(&reduced, 2);
+        let laid: Vec<_> = frames.iter().filter(|f| f.0 > 0).collect();
+        assert!(
+            !laid.is_empty() && laid.iter().all(|f| f.0 == cov),
+            "reduced ember: the glass's opacity moves from {cov}: {frames:?}"
+        );
+        let floor = laid.iter().map(|f| f.1).fold(up, f32::min);
+        assert!(
+            floor < 0.5 * up && laid.iter().all(|f| f.1 >= GLASS_MIN_PX),
+            "reduced ember: the glass stands {floor} of its {up} px: {frames:?}"
+        );
+    }
+
+    /// One frame of a twin run: the ribbon's state words and its bed's, and every live cell's
+    /// envelope as main folds it (`env_of`), by its bits.
+    type TwinFrame = (Vec<crate::state_words::Word>, Vec<u32>);
+
+    /// Exit `which` of [`EXITS`] on `c` as [`exit_run`] runs it, its typing included, each frame
+    /// planned and emitted: every frame's [`TwinFrame`]. With `leak`, main's ember floor reads
+    /// the glass's colour floor (`Ribbon::ember_reads_glass`).
+    fn twin_run(c: &Config, which: usize, leak: bool) -> Vec<TwinFrame> {
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        rib.ember_reads_glass = leak;
+        let mut frames = Vec::new();
+        let mut lay = |rib: &mut Ribbon, cx: &Ctx<'_>| {
+            rib.plan(cx);
+            let mut sink = Sink::default();
+            rib.emit(cx, &mut sink.frame());
+            let mut words = crate::state_words::StateWords::new(t0);
+            rib.state_words(&mut words);
+            rib.bed_ink_lut().state_words(&mut words);
+            let envs = rib
+                .cells
+                .iter()
+                .map(|cell| rib.debug_cell_envelope(cx, cell).to_bits())
+                .collect();
+            frames.push((words.into_words(), envs));
+        };
+        for i in 0..12u16 {
+            let now = at(t0, u64::from(i) * 60);
+            let cx = ctx(now, c, (2, 10 + i + 1), 0.9);
+            rib.on_event(&typed(), now, &cx);
+            lay(&mut rib, &cx);
+        }
+        let start = at(t0, 11 * 60 + 100);
+        let cx = ctx(start, c, (2, 22), 0.9);
+        lay(&mut rib, &cx);
+        let caret = match which {
+            1 => {
+                rib.on_event(&pty((2, 22), (2, 80)), start, &cx);
+                (2, 80)
+            }
+            2 => {
+                rib.on_event(&Event::Focus(false), start, &cx);
+                (2, 22)
+            }
+            3 => {
+                rib.curtain(start);
+                (3, 0)
+            }
+            _ => (2, 22),
+        };
+        for k in 1..=EXITS[which].1 / 16 {
+            let cx = ctx(at(start, k * 16), c, caret, 0.9);
+            lay(&mut rib, &cx);
+            if rib.at_rest() {
+                break;
+            }
+        }
+        frames
+    }
+
+    /// The first frame two twin runs part at, and what parts them: `None` when every frame is
+    /// the same.
+    fn twin_parts(a: &[TwinFrame], b: &[TwinFrame]) -> Option<String> {
+        if a.len() != b.len() {
+            return Some(format!("{} frames beside {}", a.len(), b.len()));
+        }
+        a.iter().zip(b).enumerate().find_map(|(k, (x, y))| {
+            if let Some(n) = (0..x.0.len().max(y.0.len())).find(|&n| x.0.get(n) != y.0.get(n)) {
+                return Some(format!(
+                    "frame {k}: word {n}: {:?} beside {:?}",
+                    x.0.get(n),
+                    y.0.get(n)
+                ));
+            }
+            (x.1 != y.1).then(|| format!("frame {k}: envelopes {:?} beside {:?}", x.1, y.1))
+        })
+    }
+
+    /// The glass draws main's ribbon (`docs/design/PRISM-GLASS.md` §15.2 1.8, §15.0.4): typing,
+    /// then each exit of [`EXITS`] (the swoosh and melt, a jump's retract, the focus ember, the
+    /// curtain), under full and reduced motion, a glass frame leaves every state word, the bed's
+    /// main table and every cell's envelope as main folds it (`env_of`) exactly as its paper twin
+    /// does (main's light on the same page). The negative control: main's ember floor read off
+    /// the glass's colour floor, the 1.5 leak `main_seen_floor_at` closed, parts the ember's
+    /// frames from its twin's, and leaves main's paper, which has no glass, as it was.
+    #[test]
+    fn a_glass_ribbon_folds_its_paper_twins_state_through_every_exit() {
+        let lit = glass_cfg(cfg(false, true));
+        let paper = paper_cfg(cfg(false, true));
+        let reduced = |c: Config| Config {
+            reduced_motion: true,
+            ..c
+        };
+        for (motion, lit, paper) in [
+            ("full", lit, paper),
+            ("reduced", reduced(lit), reduced(paper)),
+        ] {
+            for (which, &(name, _)) in EXITS.iter().enumerate() {
+                let glass = twin_run(&lit, which, false);
+                assert!(glass.len() > 13, "{motion} {name}: fixture: the exit ran");
+                assert_eq!(
+                    twin_parts(&glass, &twin_run(&paper, which, false)),
+                    None,
+                    "{motion} {name}: the glass frame is its paper twin's"
+                );
+            }
+        }
+        let ember = 2;
+        assert!(
+            twin_parts(
+                &twin_run(&lit, ember, true),
+                &twin_run(&paper, ember, false)
+            )
+            .is_some(),
+            "control: an ember floor read off the glass parts the twins"
+        );
+        assert_eq!(
+            twin_parts(
+                &twin_run(&paper, ember, true),
+                &twin_run(&paper, ember, false)
+            ),
+            None,
+            "control: on main's paper the glass's floor is main's"
+        );
+    }
+
+    /// A Retina geometry at §2's 2x (`docs/design/PRISM-GLASS.md` §2: 28 px cells 15 wide), 240
+    /// columns: room for a line past the glass's one-slab density.
+    const fn geom_retina() -> Geom {
+        Geom {
+            cw: 15,
+            ch: 28,
+            rows: 40,
+            cols: 240,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 3600,
+            win_h: 1120,
+            head: 0,
+        }
+    }
+
+    /// Whether `under` lays light anywhere over cell `(row, col)` of `g`: a glass's oldest end
+    /// stands lower than [`cell_lit`]'s top half.
+    fn row_lit(under: &[GlowQuad], g: Geom, row: u16, col: u16) -> bool {
+        let x0 = i32::from(g.origin_x) + i32::from(col) * g.cw as i32;
+        let y0 = i32::from(g.origin_y) + i32::from(row) * g.ch as i32;
+        column_census(under, x0..x0 + g.cw as i32, y0..y0 + g.ch as i32, 1)
+            .iter()
+            .any(Option::is_some)
+    }
+
+    /// The lights a frame laid under the text: its quads and its ramps' lit rows.
+    fn lights(sink: &Sink) -> usize {
+        sink.under_ramps.laid(sink.under.len())
+    }
+
+    /// THE GLASS'S PRICE (`docs/design/PRISM-GLASS.md` §2.2 Quad budget, §15.2 1.8): at §2's 28 px
+    /// a glass slab prices some 36 rows ([`glass_slab_rows`]: its reach and the lip's reserve),
+    /// and a glass line takes the densest slabs its price allows to some 91 cells for three and
+    /// some 137 for two ([`Ribbon::glass_slabs_for`]), a whole number to each of the plan's
+    /// vertices, which stay main's ([`Ribbon::glass_slabs_per_cell`]): three while main's plan
+    /// lays three, two to 136 cells, one past 141. Every line's frame lays no more lights than
+    /// its price less the lip's reserve, so its wedges ([`glass_tail_wedge_lights`]) are paid
+    /// for and the lip a later phase lays fits; the price stays within [`RIBBON_QUAD_BUDGET`]
+    /// wherever the density is more than one, and no frame lays past the budget. A paragraph's
+    /// frames keep within it too, the hand's row whole. The negative control is main's paper on
+    /// the same lines, which prices its paper rows (its body, its reach below the row and the
+    /// rail) and so gives up its density first.
+    #[test]
+    fn a_glass_frame_stays_within_the_ribbon_quad_budget() {
+        let g = geom_retina();
+        let ch = g.ch as f32;
+        assert_eq!(
+            glass_slab_rows(ch),
+            36.0,
+            "§2.2: 36 rows a glass slab at 28 px"
+        );
+        let lit = glass_cfg(cfg(false, true));
+        let paper = paper_cfg(cfg(false, true));
+        let line = |c: &Config, n: u16| {
+            let t0 = Instant::now();
+            let mut rib = Ribbon::new();
+            let keys = Keys {
+                g,
+                row: 2,
+                col0: 2,
+                n,
+                period_ms: 5,
+                disp: 1.0,
+            };
+            type_keys(&mut rib, t0, keys, c);
+            let cx = ctx_in(at(t0, u64::from(n) * 5 + 16), c, (2, 2 + n), 1.0, g);
+            rib.plan(&cx);
+            let mut sink = Sink::default();
+            rib.emit(&cx, &mut sink.frame());
+            (rib, sink)
+        };
+        let lip = (GLASS_LIP_RESERVE_CH * ch).ceil();
+        for n in [
+            1u16, 2, 4, 8, 16, 30, 50, 70, 85, 90, 95, 110, 130, 136, 142, 160, 200, 230,
+        ] {
+            let (rib, sink) = line(&lit, n);
+            assert!(rib.ink.glass_lit(), "fixture: a glass frame");
+            let slabs = rib.glass_slabs_per_cell();
+            let plan = rib.slabs_per_cell();
+            let priced = Ribbon::glass_slabs_for(
+                &ctx_in(Instant::now(), &lit, (2, 2), 1.0, g),
+                usize::from(n),
+                1,
+            );
+            assert_eq!(
+                slabs,
+                plan * (priced / plan).max(1),
+                "{n} cells: the glass lays {slabs} a cell over main's {plan} vertices, priced {priced}"
+            );
+            let laid = lights(&sink);
+            let price = glass_frame_price(ch, usize::from(n), 1, slabs);
+            let reserve = f32::from(n + 1) * slabs as f32 * lip;
+            assert!(
+                laid as f32 + reserve <= price,
+                "{n} cells at {slabs} a cell: {laid} lights and the lip's {reserve} pass the price {price}"
+            );
+            assert!(laid <= RIBBON_QUAD_BUDGET, "{n} cells lay {laid} lights");
+            assert!(
+                slabs == 1 || price <= RIBBON_QUAD_BUDGET as f32,
+                "{n} cells at {slabs} a cell price {price}"
+            );
+            let want = match n {
+                0..=50 => 3,
+                51..=136 => 2,
+                _ => 1,
+            };
+            assert_eq!(slabs, want, "{n} cells take {slabs} slabs a cell");
+            for col in 2..2 + n {
+                assert!(
+                    row_lit(&sink.under, g, 2, col),
+                    "{n} cells: col {col} is dark"
+                );
+            }
+            if n == 110 {
+                let (main, _) = line(&paper, n);
+                assert!(
+                    main.slabs_per_cell() < slabs && main.glass_slabs_per_cell() == 0,
+                    "control: main's paper takes {} slabs a cell over {n} cells",
+                    main.slabs_per_cell()
+                );
+            }
+        }
+
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        let mut sink = Sink::default();
+        let mut ms = 0u64;
+        for row in 2..6u16 {
+            let keys = Keys {
+                g,
+                row,
+                col0: 2,
+                n: 76,
+                period_ms: 5,
+                disp: 1.0,
+            };
+            type_keys(&mut rib, at(t0, ms), keys, &lit);
+            ms += 76 * 5;
+            let cx = ctx_in(at(t0, ms), &lit, (row, 78), 1.0, g);
+            rib.plan(&cx);
+            rib.emit(&cx, &mut sink.frame());
+            let laid = lights(&sink);
+            assert!(
+                laid <= RIBBON_QUAD_BUDGET,
+                "{} rows lay {laid} lights",
+                row - 1
+            );
+            for col in 2..78u16 {
+                assert!(
+                    row_lit(&sink.under, g, row, col),
+                    "the hand's row {row} is dark at col {col}"
+                );
+            }
+        }
+    }
+
+    /// A SETTLED GLASS IDLES TO EXACTLY ZERO (`docs/design/PRISM-GLASS.md` §15.2 1.8): woken only
+    /// at its own deadlines ([`Ribbon::next_change_deadline`]), the settled band of
+    /// [`type_run`]'s 12 keys, its phrase held past its life so its drawn melt alone takes it,
+    /// wakes not once until the melt moves it a pixel; it then steps down by its height (at
+    /// most two wakes a pixel of its reach, its cells stepping at their own instants), its
+    /// opacity whole and its height never rising, until it lays nothing at all, books no
+    /// deadline and rests: no faint glass and no wake is left. The negative control is the same
+    /// glass stepped by main's coverage levels, which wakes before it moves a pixel and half
+    /// again as often.
+    #[test]
+    fn a_settled_glass_idles_to_exactly_zero() {
+        let lit = glass_cfg(cfg(false, true));
+        let idle = |level_steps: bool| {
+            let t0 = Instant::now();
+            let mut rib = Ribbon::new();
+            rib.glass_level_steps = level_steps;
+            type_run(&mut rib, t0, 10, 12, &lit, 0.9);
+            for coh in &mut rib.cohorts {
+                coh.grace_s = 1000.0;
+            }
+            for cell in &mut rib.cells {
+                cell.life_s = 8.0;
+            }
+            let settled = at(t0, 11 * 60 + 100);
+            let mut now = settled;
+            let mut sink = Sink::default();
+            let mut wakes = Vec::new();
+            let mut first = None;
+            loop {
+                let cx = ctx(now, &lit, (2, 22), 0.9);
+                rib.plan(&cx);
+                rib.emit(&cx, &mut sink.frame());
+                let (cov, up) = plan_peaks(&rib);
+                if let Some(&(_, before)) = wakes.last() {
+                    assert!(
+                        up <= before + 0.01,
+                        "wake {}: the glass rises from {before} to {up} px",
+                        wakes.len()
+                    );
+                }
+                assert!(
+                    cov == 0 || cov >= 250,
+                    "wake {}: the glass at {cov}",
+                    wakes.len()
+                );
+                if now > settled && first.is_none() {
+                    first = Some(up);
+                }
+                wakes.push((now, up));
+                let Some(next) = rib.next_change_deadline(now) else {
+                    break;
+                };
+                assert!(wakes.len() < 100_000, "the glass never settles");
+                now = next.max(now + Duration::from_millis(1));
+            }
+            (rib, sink, wakes, first.unwrap_or(0.0))
+        };
+        let (rib, sink, wakes, first) = idle(false);
+        let reach = wakes[0].1;
+        let now = wakes[wakes.len() - 1].0;
+        assert!(reach > 0.8 * 18.0, "fixture: the glass stands {reach} px");
+        assert!(
+            reach - first >= 0.5,
+            "the glass's first wake moves it {} px",
+            reach - first
+        );
+        assert!(
+            sink.under.is_empty() && !rib.glass_drew_at(now),
+            "the settled glass still lays {} quads",
+            sink.under.len()
+        );
+        assert!(rib.at_rest(), "the settled glass holds cells");
+        let steps = wakes.len() - 1;
+        assert!(
+            steps > 0 && steps as f32 <= 2.0 * reach.ceil(),
+            "the glass wakes {steps} times to leave {reach} px"
+        );
+        let (_, _, level_wakes, level_first) = idle(true);
+        assert!(
+            reach - level_first < 0.5 && 2 * (level_wakes.len() - 1) >= 3 * steps,
+            "control: main's level steps wake the glass {} times, first by {} px, against {steps}",
+            level_wakes.len() - 1,
+            reach - level_first
+        );
+    }
+
+    /// [`type_run`]'s 12 keys along row 2 from column 10, then the hand wrapped to row 3 and 4
+    /// more keys there from column 0, 60 ms apart, on `c`: §2.4's wrapped composer. The ribbon,
+    /// and the instant the hand left row 2 (its first key on row 3).
+    fn wrapped(c: &Config, t0: Instant) -> (Ribbon, Instant) {
+        let mut rib = Ribbon::new();
+        type_run(&mut rib, t0, 10, 12, c, 0.9);
+        let wrap = at(t0, 12 * 60);
+        let keys = Keys {
+            g: geom(),
+            row: 3,
+            col0: 0,
+            n: 4,
+            period_ms: 60,
+            disp: 0.9,
+        };
+        type_keys(&mut rib, wrap, keys, c);
+        (rib, wrap)
+    }
+
+    /// The caret after [`wrapped`]'s last key.
+    const WRAPPED_CARET: (u16, u16) = (3, 4);
+
+    /// A frame of `rib` at `now` with the hand at `caret` on `c`: what it laid under the text.
+    fn glass_frame(rib: &mut Ribbon, c: &Config, now: Instant, caret: (u16, u16)) -> Vec<GlowQuad> {
+        let cx = ctx(now, c, caret, 0.9);
+        rib.plan(&cx);
+        let mut sink = Sink::default();
+        rib.emit(&cx, &mut sink.frame());
+        sink.under
+    }
+
+    /// The last plan's boundaries on `row`: each one's x, glass reach and coverage.
+    fn row_glass(rib: &Ribbon, row: u16) -> Vec<(f32, f32, u8)> {
+        rib.runs
+            .iter()
+            .filter(|r| r.row == row)
+            .flat_map(|r| {
+                rib.plan[r.lo..r.hi]
+                    .iter()
+                    .map(|s| (s.x, s.glass_up, s.cov))
+            })
+            .collect()
+    }
+
+    /// THE WRAP'S SINK (§2.4, §15.2 1.10): on a glass frame of a wrapped composer, the row the hand
+    /// has left is recorded left ([`GlassWrap`]) on the frame its first key lands below, and its
+    /// glass sinks by height, up × lerp(1, min(1, [`WRAP_SINK_CH`] / up), smooth01((now −
+    /// left_at) / [`WRAP_SINK_S`])), half way at 0.2 s and to 0.34 ch from 0.4 s on, its
+    /// opacity untouched and its top a pixel row of the low glass; the hand's row is not sunk.
+    /// Negative control: the same frames with no sink keep the left row's glass whole.
+    #[test]
+    fn a_wrapped_row_the_hand_left_sinks_to_its_low_glass_by_height() {
+        let c = glass_cfg(cfg(false, true));
+        let t0 = Instant::now();
+        let (mut rib, wrap) = wrapped(&c, t0);
+        let (mut whole, _) = wrapped(&c, t0);
+        whole.wrap_unsunk = true;
+        assert!(rib.ink.glass_lit(), "fixture: the bed draws by its glass");
+        assert_eq!(
+            rib.structural_rows(3),
+            (2, 3),
+            "fixture: one phrase over two rows"
+        );
+        let left = rib
+            .cohorts()
+            .iter()
+            .find(|k| k.row == 2)
+            .expect("row 2's cohort");
+        assert_eq!(
+            rib.glass_wraps(),
+            [GlassWrap {
+                cohort: left.id,
+                row: 2,
+                left_at: wrap,
+            }],
+            "the row is left when the hand's first key lands below it"
+        );
+        let chf = geom().ch as f32;
+        let low = WRAP_SINK_CH * chf;
+        // Three cells in from the run's oldest end, past its tail's ease.
+        let body = (10.0 + 3.0) * geom().cw as f32;
+        for ms in [200u64, 300, 400, 600] {
+            let now = at(wrap, ms);
+            let under = glass_frame(&mut rib, &c, now, WRAPPED_CARET);
+            let _ = glass_frame(&mut whole, &c, now, WRAPPED_CARET);
+            let sunk = smoothstep01(ms as f32 / 1000.0 / WRAP_SINK_S);
+            let (laid, full) = (row_glass(&rib, 2), row_glass(&whole, 2));
+            assert!(
+                !laid.is_empty() && laid.len() == full.len(),
+                "+{ms} ms: fixture: row 2 planned alike"
+            );
+            for (&(x, up, cov), &(_, reach, reach_cov)) in laid.iter().zip(&full) {
+                assert_eq!(
+                    cov, reach_cov,
+                    "+{ms} ms, x {x}: the sink leaves the opacity"
+                );
+                if x < body {
+                    continue;
+                }
+                let want = reach * (1.0 + ((low / reach).min(1.0) - 1.0) * sunk);
+                assert!(
+                    (up - want).abs() < 1e-3,
+                    "+{ms} ms, x {x}: the left row's glass {up} px, not {want} of {reach}"
+                );
+            }
+            assert!(
+                full.iter()
+                    .any(|&(x, reach, _)| x >= body && reach > 0.8 * chf),
+                "control: unsunk, the left row keeps its glass"
+            );
+            assert_eq!(
+                row_glass(&rib, 3),
+                row_glass(&whole, 3),
+                "+{ms} ms: the hand's row is not sunk"
+            );
+            if ms >= 400 {
+                let top = |floor: u8| {
+                    column_census(
+                        &under,
+                        body as i32..(21 * geom().cw) as i32,
+                        0..ROW2_BOTTOM,
+                        floor,
+                    )
+                    .into_iter()
+                    .flatten()
+                    .map(|(top, _, _)| top)
+                    .min()
+                    .expect("the low glass lays")
+                };
+                let reach = ROW2_BOTTOM as f32 - low;
+                let (half, lit) = (top(128), top(1));
+                assert!(
+                    (reach.floor() as i32..=(reach + GLASS_EDGE_PX).ceil() as i32).contains(&half),
+                    "+{ms} ms: the low glass is half opaque from y {half}, not {WRAP_SINK_CH} ch tall"
+                );
+                assert!(
+                    lit >= reach.floor() as i32,
+                    "+{ms} ms: the low glass lays from y {lit}, above its {WRAP_SINK_CH} ch"
+                );
+            }
+        }
+    }
+
+    /// THE HAND-ROW INSET (§2.4, §15.2 1.10): on a multi-row structural set the hand's row keeps
+    /// [`WRAP_HAND_TOP_PX`] of page above its glass: its reach is at most a cell less that, and
+    /// nothing is laid in its top 3 px. Negative control: a single-row composer's hand reaches
+    /// into its row's top 3 px.
+    #[test]
+    fn the_hand_row_of_a_multi_row_band_keeps_3_px_of_page_above_its_glass() {
+        let c = glass_cfg(cfg(false, true));
+        let t0 = Instant::now();
+        let chf = geom().ch as f32;
+        let (mut rib, wrap) = wrapped(&c, t0);
+        let under = glass_frame(&mut rib, &c, at(wrap, 3 * 60 + 16), WRAPPED_CARET);
+        assert_eq!(rib.structural_rows(3), (2, 3), "fixture: a multi-row set");
+        let reach = row_glass(&rib, 3)
+            .iter()
+            .map(|&(_, up, _)| up)
+            .fold(0.0, f32::max);
+        assert!(
+            (reach - (chf - WRAP_HAND_TOP_PX)).abs() < 1e-3,
+            "the hand's glass reaches {reach} px of a {chf} px cell"
+        );
+        let row3_top = 3 * geom().ch as u16;
+        let hand: Vec<&GlowQuad> = under.iter().filter(|q| q.row == 3).collect();
+        assert!(!hand.is_empty(), "fixture: the hand's row lays glass");
+        assert!(
+            hand.iter()
+                .all(|q| q.y >= row3_top + WRAP_HAND_TOP_PX as u16),
+            "glass in the hand's row's top {WRAP_HAND_TOP_PX} px"
+        );
+
+        let mut single = Ribbon::new();
+        type_run(&mut single, t0, 10, 12, &c, 0.9);
+        let under = glass_frame(&mut single, &c, at(t0, 11 * 60 + 16), (2, 22));
+        assert_eq!(single.structural_rows(2), (2, 2), "control: one row");
+        let row2_top = 2 * geom().ch as u16;
+        assert!(
+            under
+                .iter()
+                .any(|q| q.row == 2 && q.y < row2_top + WRAP_HAND_TOP_PX as u16),
+            "control: a single row's hand reaches into its top {WRAP_HAND_TOP_PX} px"
+        );
+    }
+
+    /// A scroll or a band move carries each sink with its row ([`GlassWrap`], §15.2 1.10,
+    /// ribbon-translate): the record rides to the row the text went to, keeping its instant, so
+    /// the next frame lays that row's glass as sunk as it was; a row moved off the screen or out of
+    /// its band drops its record.
+    #[test]
+    fn a_scroll_keeps_each_sink_on_its_row() {
+        let c = glass_cfg(cfg(false, true));
+        let t0 = Instant::now();
+        let (mut rib, wrap) = wrapped(&c, t0);
+        let now = at(wrap, 250);
+        let _ = glass_frame(&mut rib, &c, now, WRAPPED_CARET);
+        let [record] = *rib.glass_wraps() else {
+            panic!("fixture: one record, {:?}", rib.glass_wraps());
+        };
+        let sunk = row_glass(&rib, 2);
+        assert!(!sunk.is_empty(), "fixture: the left row lays glass");
+
+        let mut scrolled = rib.clone();
+        scrolled.translate_scroll(1);
+        assert_eq!(
+            scrolled.glass_wraps(),
+            [GlassWrap { row: 1, ..record }],
+            "the scroll carried the sink a row up"
+        );
+        let _ = glass_frame(&mut scrolled, &c, now, (2, 4));
+        assert_eq!(
+            row_glass(&scrolled, 1),
+            sunk,
+            "the row's glass is as sunk as it was"
+        );
+        scrolled.translate_scroll(2);
+        assert!(
+            scrolled.glass_wraps().is_empty(),
+            "a row scrolled off the screen drops its sink"
+        );
+
+        let mut banded = rib.clone();
+        banded.translate_band(1, 12, 3);
+        assert_eq!(
+            banded.glass_wraps(),
+            [GlassWrap { row: 5, ..record }],
+            "the band move carried the sink with its row"
+        );
+        let _ = glass_frame(&mut banded, &c, now, (6, 4));
+        assert_eq!(
+            row_glass(&banded, 5),
+            sunk,
+            "the row's glass is as sunk as it was"
+        );
+        banded.translate_band(3, 12, -3);
+        assert!(
+            banded.glass_wraps().is_empty(),
+            "a row moved out of its band drops its sink"
+        );
+    }
+
+    /// A carry moves each sink with its row ([`Ribbon::translate_run`], [`GlassWrap`], §15.2 1.10,
+    /// ribbon-translate): a run carried whole takes its record to its new row; a run carried in
+    /// part leaves its record on the part left behind and gives the carried part its own, with
+    /// the same instant; a carry off the pane drops it; the hand's lift maps a record on the
+    /// hand's row with the hand.
+    #[test]
+    fn a_carry_moves_each_sink_with_its_row() {
+        use super::super::witness::FollowRun;
+        let c = glass_cfg(cfg(false, true));
+        let t0 = Instant::now();
+        let (mut rib, wrap) = wrapped(&c, t0);
+        let now = at(wrap, 250);
+        let _ = glass_frame(&mut rib, &c, now, WRAPPED_CARET);
+        let [record] = *rib.glass_wraps() else {
+            panic!("fixture: one record, {:?}", rib.glass_wraps());
+        };
+        let sunk = row_glass(&rib, 2);
+        let run = |lo: u16, hi: u16, dr: i16| FollowRun {
+            row: 2,
+            cohort: record.cohort,
+            lo,
+            hi,
+            dr,
+        };
+        let mut moved = Vec::new();
+
+        let mut whole = rib.clone();
+        assert_eq!(
+            whole.translate_run(run(10, 21, -1), now, false, &mut moved),
+            12
+        );
+        assert_eq!(
+            whole.glass_wraps(),
+            [GlassWrap { row: 1, ..record }],
+            "a run carried whole takes its sink"
+        );
+        let _ = glass_frame(&mut whole, &c, now, WRAPPED_CARET);
+        let carried = row_glass(&whole, 1);
+        assert_eq!(carried.len(), sunk.len(), "fixture: the run laid alike");
+        for (&(x, up, _), &(_, was, _)) in carried.iter().zip(&sunk) {
+            assert!(
+                up <= was + 1e-3,
+                "x {x}: the carried row's glass rose from {was} to {up} px"
+            );
+        }
+
+        let mut split = rib.clone();
+        assert_eq!(
+            split.translate_run(run(16, 21, 4), now, false, &mut moved),
+            6
+        );
+        let copy = split
+            .cohorts()
+            .iter()
+            .find(|k| k.row == 6)
+            .expect("the carried part's cohort")
+            .id;
+        assert_ne!(copy, record.cohort, "fixture: the carry split the run");
+        assert_eq!(
+            split.glass_wraps(),
+            [
+                record,
+                GlassWrap {
+                    cohort: copy,
+                    row: 6,
+                    ..record
+                }
+            ],
+            "the part left behind keeps its sink and the carried part takes one"
+        );
+
+        let mut off = rib.clone();
+        off.set_pane_rows(Some((0, 4)));
+        let _ = off.translate_run(run(10, 21, 4), now, false, &mut moved);
+        assert!(
+            off.glass_wraps().is_empty(),
+            "a run carried off the pane drops its sink"
+        );
+
+        let mut lifted = rib.clone();
+        lifted.lift_hand(2, 1);
+        assert_eq!(
+            lifted.glass_wraps(),
+            [GlassWrap { row: 1, ..record }],
+            "the hand's lift maps a record on its row"
+        );
+    }
+
+    /// The glass's falling edge (§2.4 Light-only state, §15.2 1.10): while the glass lights, a
+    /// sinking row books its own one-pixel wakes (the negative control: with no sink the deadline
+    /// differs); the first frame on main's light, on the paper page or on a dark ground, clears
+    /// every record, leaves no light words, and books exactly the deadline the same keys book on
+    /// main's light throughout, so a dark frame never schedules a sink wake; when the glass
+    /// lights again, the row the hand left is left at that moment.
+    #[test]
+    fn a_light_to_dark_flip_clears_every_left_at_and_schedules_no_sink_wake() {
+        let lit = glass_cfg(cfg(false, true));
+        let paper = paper_cfg(cfg(false, true));
+        let t0 = Instant::now();
+        let (mut rib, wrap) = wrapped(&lit, t0);
+        let (mut main, _) = wrapped(&paper, t0);
+        let mid = at(wrap, 250);
+        let _ = glass_frame(&mut rib, &lit, mid, WRAPPED_CARET);
+        let _ = glass_frame(&mut main, &paper, mid, WRAPPED_CARET);
+        assert!(!rib.glass_wraps().is_empty(), "fixture: the left row sinks");
+        let mut unsunk = rib.clone();
+        unsunk.wrap_unsunk = true;
+        let booked = rib.next_change_deadline(mid);
+        assert!(
+            booked.is_some() && booked != unsunk.next_change_deadline(mid),
+            "control: the sink books its own wakes"
+        );
+
+        // The same moment flipped to a dark ground instead, beside main's ribbon flipped there.
+        let dark = Config {
+            dark_theme: true,
+            theme_fg: DEFAULT_FG,
+            theme_bg: DEFAULT_BG,
+            light: Light::OFF,
+            ..lit
+        };
+        let (mut to_dark, mut main_dark) = (rib.clone(), main.clone());
+
+        let flip = at(wrap, 266);
+        let _ = glass_frame(&mut rib, &paper, flip, WRAPPED_CARET);
+        let _ = glass_frame(&mut main, &paper, flip, WRAPPED_CARET);
+        let _ = glass_frame(&mut to_dark, &dark, flip, WRAPPED_CARET);
+        let _ = glass_frame(&mut main_dark, &dark, flip, WRAPPED_CARET);
+        for (ground, rib, main) in [("paper", &rib, &main), ("dark", &to_dark, &main_dark)] {
+            assert!(
+                rib.glass_wraps().is_empty(),
+                "{ground}: the falling edge clears every record"
+            );
+            let mut words = crate::state_words::StateWords::new(t0);
+            rib.light_words(&mut words);
+            assert!(
+                words.words().is_empty(),
+                "{ground}: no light words on main's light"
+            );
+            for ms in [0u64, 16, 100, 400] {
+                let now = at(flip, ms);
+                assert_eq!(
+                    rib.next_change_deadline(now),
+                    main.next_change_deadline(now),
+                    "{ground} +{ms} ms: the flipped ribbon books main's deadline"
+                );
+            }
+        }
+
+        let back = at(flip, 16);
+        let _ = glass_frame(&mut rib, &lit, back, WRAPPED_CARET);
+        assert!(
+            matches!(rib.glass_wraps(), [w] if w.row == 2 && w.left_at == back),
+            "lit again, the row the hand left is left at that moment: {:?}",
+            rib.glass_wraps()
+        );
+    }
+
+    /// The hand's structural set (§14 amendment 4, §15.2 1.10): the contiguous rows beside the
+    /// hand's that each hold a live cohort of its open phrase, neither abandoned nor a wake, the
+    /// [`STRUCTURAL_ROWS_MAX`] nearest the hand at most; a row of another phrase, an abandoned or
+    /// wake cohort or a blank row ends it, and with no phrase open it is the hand's row alone.
+    #[test]
+    fn the_structural_set_is_the_hand_s_open_phrase_rows_capped_at_eight() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        for row in 2..=13u16 {
+            let keys = Keys {
+                g: geom(),
+                row,
+                col0: 0,
+                n: 3,
+                period_ms: 60,
+                disp: 0.9,
+            };
+            type_keys(&mut rib, at(t0, u64::from(row - 2) * 180), keys, &c);
+            // Every row stays live while the next is typed.
+            for coh in &mut rib.cohorts {
+                coh.grace_s = 1000.0;
+            }
+            for cell in &mut rib.cells {
+                cell.life_s = 8.0;
+            }
+        }
+        let open = rib.phrase_open().expect("an open phrase");
+        assert!(
+            (2..=13).all(|row| rib.holds_phrase_on(open, row)),
+            "fixture: one phrase over twelve rows: {:?}",
+            rib.cohorts()
+                .iter()
+                .map(|k| (k.row, k.phrase, k.abandoned))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            rib.structural_rows(13),
+            (6, 13),
+            "the eight rows up from the hand"
+        );
+        assert_eq!(
+            rib.structural_rows(7),
+            (3, 10),
+            "the eight rows nearest the hand"
+        );
+        assert_eq!(
+            rib.structural_rows(15),
+            (15, 15),
+            "a blank row beside the hand ends it"
+        );
+        let cut = |rib: &mut Ribbon, row: u16, how: fn(&mut Cohort)| {
+            let k = rib
+                .cohorts
+                .iter_mut()
+                .find(|k| k.row == row)
+                .expect("the row's cohort");
+            how(k);
+        };
+        for (how, name) in [
+            (
+                (|k: &mut Cohort| k.abandoned = true) as fn(&mut Cohort),
+                "an abandoned cohort",
+            ),
+            (|k: &mut Cohort| k.wake = true, "a wake"),
+            (
+                |k: &mut Cohort| k.phrase = k.phrase.wrapping_add(1),
+                "another phrase",
+            ),
+            (|k: &mut Cohort| k.phase = Phase::Fading, "a dead cohort"),
+        ] {
+            let mut cut_rib = rib.clone();
+            cut(&mut cut_rib, 10, how);
+            assert_eq!(cut_rib.structural_rows(13), (11, 13), "{name} ends the set");
+        }
+        rib.phrase_open = None;
+        assert_eq!(rib.structural_rows(13), (13, 13), "no phrase open, no set");
+    }
+
+    /// One height owner (§15.2 1.10 Hold): main's row hold runs unchanged on glass (a row over
+    /// ink below is held as main holds it), but the glass's height is the same held or free, so
+    /// the hold moves only main's body. Negative control: on main's light the held row's body
+    /// differs from the free one's.
+    #[test]
+    fn main_s_row_hold_runs_and_leaves_the_glass_s_height_alone() {
+        let mut inked = GlyphProbe::new();
+        inked.probe_row(3, &[true; 40]);
+        let mut blank = GlyphProbe::new();
+        blank.probe_row(3, &[false; 40]);
+        let lay = |c: &Config, probe: &GlyphProbe| {
+            let t0 = Instant::now();
+            let mut rib = Ribbon::new();
+            type_run(&mut rib, t0, 10, 12, c, 0.9);
+            rib.plan_over(&ctx(at(t0, 11 * 60 + 16), c, (2, 22), 0.9), Some(probe));
+            let judged = at(t0, 11 * 60 + (HOLD_EASE_S * 1000.0) as u64 + 32);
+            let cx = ctx(judged, c, (2, 22), 0.9);
+            rib.plan_over(&cx, Some(probe));
+            let mut sink = Sink::default();
+            rib.emit(&cx, &mut sink.frame());
+            (rib.holds.clone(), row_glass(&rib, 2), sink.under)
+        };
+        let lit = glass_cfg(cfg(false, true));
+        let (held, held_glass, held_under) = lay(&lit, &inked);
+        let (free, free_glass, free_under) = lay(&lit, &blank);
+        let level = |holds: &[(u16, f32, Instant)]| {
+            holds
+                .iter()
+                .find(|h| h.0 == 2)
+                .map(|h| h.1)
+                .expect("row 2's hold")
+        };
+        assert_eq!(
+            (level(&held), level(&free)),
+            (1.0, 0.0),
+            "main's hold runs on glass"
+        );
+        assert_eq!(
+            held_glass, free_glass,
+            "the glass's plan is the same held or free"
+        );
+        assert_eq!(held_under, free_under, "and so is the glass it lays");
+
+        let paper = paper_cfg(cfg(false, true));
+        let (_, _, main_held) = lay(&paper, &inked);
+        let (_, _, main_free) = lay(&paper, &blank);
+        assert_ne!(main_held, main_free, "control: the hold moves main's body");
     }
 
     #[test]
@@ -13288,6 +17205,150 @@ mod tests {
         );
     }
 
+    /// THE UNDERLINE KEEPS TO A LAST ROW'S FOOT (looks10 L3): typed along the
+    /// pane's last row, where the tall ribbon is lifted off the floor by its
+    /// reach below, the underline keeps to the row's foot band, no higher
+    /// than its reach above the row's bottom, and lays nothing past the
+    /// floor; on a row with room below it keeps its reach below. Negative
+    /// control: lifted as the tall ribbon is, as it was, the underline's top
+    /// edge rises into the lower half of the row's letters.
+    #[test]
+    fn the_underline_keeps_to_a_last_rows_foot() {
+        let g = geom();
+        let chf = g.ch as f32;
+        let t0 = Instant::now();
+        let band = |row: u16, lifted: bool| {
+            let c = cfg(true, false);
+            let mut rib = Ribbon::new();
+            rib.underline_lifted = lifted;
+            let keys = Keys {
+                g,
+                row,
+                col0: 10,
+                n: 6,
+                period_ms: 60,
+                disp: 0.9,
+            };
+            type_keys(&mut rib, t0, keys, &c);
+            let cx = ctx_in(at(t0, 5 * 60 + 30), &c, (row, 16), 0.9, g);
+            rib.plan(&cx);
+            let mut sink = Sink::default();
+            {
+                let mut f = sink.frame();
+                rib.emit(&cx, &mut f);
+            }
+            let lit: Vec<_> = sink
+                .under
+                .iter()
+                .filter(|q| q.color & 0x00FF_FFFF != 0)
+                .collect();
+            assert!(!lit.is_empty(), "row {row}: the underline laid nothing");
+            let top = lit
+                .iter()
+                .map(|q| f32::from(q.y))
+                .fold(f32::INFINITY, f32::min);
+            let bottom = lit
+                .iter()
+                .map(|q| f32::from(q.y) + f32::from(q.h))
+                .fold(0.0, f32::max);
+            (top, bottom, (f32::from(row) + 1.0) * chf)
+        };
+        let last = u16::try_from(g.rows - 1).expect("a row");
+        let (top, bottom, row_bot) = band(last, false);
+        assert!(
+            top >= row_bot - UNDERLINE_UP_CH * chf - 1.0,
+            "on the last row the underline rose to y {top:.1}, over its foot band from {:.1}",
+            row_bot - UNDERLINE_UP_CH * chf
+        );
+        assert!(
+            bottom <= row_bot + 0.5,
+            "on the last row the underline laid to y {bottom:.1}, past the floor at {row_bot:.1}"
+        );
+        let (_, mid_bottom, mid_bot) = band(2, false);
+        assert!(
+            mid_bottom > mid_bot + 0.5 * DN_FLOOR_CH * chf,
+            "with room below the underline keeps its reach below: to y {mid_bottom:.1} \
+             from the row's bottom at {mid_bot:.1}"
+        );
+        let (old_top, _, _) = band(last, true);
+        assert!(
+            old_top < row_bot - 0.4 * chf,
+            "control: lifted as the tall ribbon is, the underline still keeps to the foot \
+             (top y {old_top:.1}, row bottom {row_bot:.1})"
+        );
+    }
+
+    /// THE UNDERLINE SETTLES AT ONCE OFF THE LETTERS BELOW (looks10 round 3):
+    /// a lit underline whose next row inks under it lays nothing of its band
+    /// past its row's bottom from the first frame the letters land, where the
+    /// tall ribbon eases into its row over [`HOLD_EASE_S`]
+    /// (`a_line_whose_next_row_inks_settles_into_its_row_over_the_ease`). The
+    /// rail, laid clear of the row's ring and fading with the hold, is the
+    /// letter guard's to judge and is not read here. Negative control: eased
+    /// with the hold, as it was, the first frame's band still reaches most of
+    /// its free reach below the row.
+    #[test]
+    fn the_underline_settles_at_once_off_the_letters_below() {
+        let g = geom();
+        let row_bottom = f32::from(g.origin_y) + 3.0 * g.ch as f32;
+        let mut inked = GlyphProbe::new();
+        inked.probe_row(3, &[[true; 30], [false; 30]].concat());
+        let mut blank = GlyphProbe::new();
+        blank.probe_row(3, &[false; 120]);
+        let c = cfg(true, false);
+        let deepest = |rib: &mut Ribbon, now: Instant, probe: &GlyphProbe| {
+            let cx = ctx(now, &c, (2, 18), 0.9);
+            rib.plan_over(&cx, Some(probe));
+            let mut sink = Sink::default();
+            {
+                let mut f = sink.frame();
+                rib.emit(&cx, &mut f);
+            }
+            let rails = rib.rail_spans();
+            let in_rail = |i: usize| {
+                rails
+                    .iter()
+                    .any(|(from, to, _)| (from.0..to.0).contains(&i))
+            };
+            sink.under
+                .iter()
+                .enumerate()
+                .filter(|&(i, q)| q.color != 0 && !in_rail(i))
+                .map(|(_, q)| f32::from(q.y) + f32::from(q.h))
+                .fold(f32::NEG_INFINITY, f32::max)
+                - row_bottom
+        };
+        for eases in [false, true] {
+            let t0 = Instant::now();
+            let mut rib = Ribbon::new();
+            rib.underline_eases_off_letters = eases;
+            type_run(&mut rib, t0, 10, 8, &c, 0.9);
+            let free = deepest(&mut rib, at(t0, 8 * 60), &blank);
+            assert!(
+                free > 2.0,
+                "premise: a free underline reaches {free:.1} px below its row"
+            );
+            let first = deepest(&mut rib, at(t0, 8 * 60 + 16), &inked);
+            assert!(
+                first.is_finite(),
+                "eases {eases}: the underline is lit the frame the letters land"
+            );
+            if eases {
+                assert!(
+                    first > 0.5 * free,
+                    "negative control: eased with the hold, the first frame's band reaches \
+                     {first:.1} of its {free:.1} px below the row"
+                );
+            } else {
+                assert!(
+                    first <= 0.5,
+                    "the frame the letters land below, the underline's band still reaches \
+                     {first:.1} px past its row's bottom (free {free:.1})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_light_bed_keeps_theme_ink_over_it_at_the_bar() {
         fn contrast(a: u32, b: u32) -> f32 {
@@ -13332,29 +17393,58 @@ mod tests {
         assert!(contrast(0x001F_2328, old) < 3.0, "the old table's blue");
     }
 
+    /// On a light page every quad composites source-over and nothing is additive (L6; the hot
+    /// edge is dark-only). Main's paper ribbon keeps the leading role's cap; the glass (§2.2,
+    /// §15.2 1.7) is whole, over that cap, and still source-over: its wedges' runs (§15.2 1.8: its
+    /// oldest end eases in by height) may start or end at no opacity, but none is both, which the
+    /// raster draws additively.
     #[test]
     fn a_light_theme_ribbon_is_source_over_ink_and_never_additive() {
-        let c = cfg(false, false);
-        let t0 = Instant::now();
-        let mut rib = Ribbon::new();
-        type_run(&mut rib, t0, 10, 6, &c, 0.9);
-        let now = at(t0, 5 * 60);
-        let cx = ctx(now, &c, (2, 16), 0.9);
-        rib.plan(&cx);
-        let mut sink = Sink::default();
-        {
-            let mut f = sink.frame();
-            rib.emit(&cx, &mut f);
-        }
-        assert!(!sink.under.is_empty(), "the light rail still draws");
-        assert!(
-            sink.out.is_empty(),
-            "no additive light on white — L6, and the hot edge is dark-only"
-        );
         let cap = InkRole::Leading.alpha_cap() as u8;
-        for q in &sink.under {
-            assert!(q.alpha > 0, "every light-theme quad composites SOURCE-OVER");
-            assert!(q.alpha <= cap, "light alpha {} over the {cap} cap", q.alpha);
+        let t0 = Instant::now();
+        for (glass, c) in [
+            (false, cfg(false, false)),
+            (true, glass_cfg(cfg(false, true))),
+        ] {
+            let mut rib = Ribbon::new();
+            type_run(&mut rib, t0, 10, 6, &c, 0.9);
+            let now = at(t0, 5 * 60);
+            let cx = ctx(now, &c, (2, 16), 0.9);
+            rib.plan(&cx);
+            let mut sink = Sink::default();
+            {
+                let mut f = sink.frame();
+                rib.emit(&cx, &mut f);
+            }
+            assert_eq!(rib.ink.glass_lit(), glass, "fixture");
+            assert!(
+                !sink.under.is_empty(),
+                "glass {glass}: the light ribbon still draws"
+            );
+            assert!(
+                sink.out.is_empty(),
+                "glass {glass}: no additive light on white — L6, and the hot edge is dark-only"
+            );
+            for q in &sink.under {
+                assert!(
+                    q.alpha > 0 || q.alpha2 > 0,
+                    "glass {glass}: every light-theme quad composites SOURCE-OVER"
+                );
+                assert!(
+                    glass || q.alpha > 0,
+                    "each of main's paper quads starts lit"
+                );
+                if !glass {
+                    assert!(q.alpha <= cap, "light alpha {} over the {cap} cap", q.alpha);
+                }
+            }
+            let peak = sink.under.iter().map(|q| q.alpha.max(q.alpha2)).max();
+            if glass {
+                assert!(
+                    peak.is_some_and(|p| p > cap),
+                    "the glass is whole, over the {cap} cap: {peak:?}"
+                );
+            }
         }
     }
 
@@ -13728,6 +17818,107 @@ mod tests {
             5 * alike_pet < 8 * alike_flat.max(1) && (alike_flat_top - alike_pet_top).abs() < 3.0,
             "control: drawn alike, the two still read apart ({alike_pet} vs {alike_flat}, \
              tops {alike_pet_top} vs {alike_flat_top})"
+        );
+    }
+
+    /// looks9 Q6, THE FLAT RIBBON ON PAPER IS A SOFT EVEN BAND: on paper
+    /// the flat ribbon and the pet's were near twins at 1x, the flat lacking
+    /// only the pet's rail (`flat-rainbow-light.t0` against
+    /// `rainbow-kitty-pet-light.t0`). As its rail is on a dim page (looks8
+    /// K3), its body is now a soft even band: at most two thirds of the
+    /// pet's light, with no lit plateau, and as light under the run's middle
+    /// as at its brightest. Negative control: laid as the pet's glow, it
+    /// holds a plateau at the pet's light.
+    #[test]
+    fn on_paper_the_flat_ribbon_is_a_soft_even_band() {
+        let g = geom();
+        let ch = g.ch as f32;
+        let row_bottom = f32::from(g.origin_y) + 3.0 * ch;
+        // Each body pixel column's alpha profile above the row's bottom.
+        let profile = |c: &Config, glow: bool| -> std::collections::BTreeMap<u16, Vec<u8>> {
+            let t0 = Instant::now();
+            let mut rib = Ribbon::new();
+            rib.flat_paper_glow = glow;
+            type_run(&mut rib, t0, 10, 8, c, 0.9);
+            let cx = ctx(at(t0, 8 * 60), c, (2, 18), 0.9);
+            rib.plan(&cx);
+            let mut sink = Sink::default();
+            {
+                let mut f = sink.frame();
+                rib.emit(&cx, &mut f);
+            }
+            let mut cols: std::collections::BTreeMap<u16, Vec<u8>> = Default::default();
+            for q in sink
+                .under
+                .iter()
+                .filter(|q| f32::from(q.y) + f32::from(q.h) <= row_bottom && q.alpha > 0)
+            {
+                for x in q.x..q.x + q.w {
+                    for _ in q.y..q.y + q.h {
+                        cols.entry(x).or_default().push(q.alpha);
+                    }
+                }
+            }
+            cols
+        };
+        let peak = |p: &std::collections::BTreeMap<u16, Vec<u8>>| {
+            p.values().flatten().copied().max().unwrap_or(0)
+        };
+        let plateau = |p: &std::collections::BTreeMap<u16, Vec<u8>>| {
+            p.values()
+                .map(|col| {
+                    let top = col.iter().copied().max().unwrap_or(0);
+                    col.iter()
+                        .filter(|&&a| u32::from(a) * 20 >= u32::from(top) * 19)
+                        .count()
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        // The least column top under the run's middle (cells 12 to 16) as a
+        // share of the brightest.
+        let evenness = |p: &std::collections::BTreeMap<u16, Vec<u8>>| {
+            let x0 = g.origin_x + 12 * g.cw as u16;
+            let x1 = g.origin_x + 17 * g.cw as u16;
+            let tops: Vec<u8> = p
+                .range(x0..x1)
+                .map(|(_, col)| col.iter().copied().max().unwrap_or(0))
+                .collect();
+            let (lo, hi) = (
+                tops.iter().copied().min().unwrap_or(0),
+                tops.iter().copied().max().unwrap_or(0),
+            );
+            f32::from(lo) / f32::from(hi.max(1))
+        };
+        let pet = profile(&cfg(false, true), false);
+        let band = profile(&flat(false, true), false);
+        let glow = profile(&flat(false, true), true);
+        let (pp, bp, gp) = (peak(&pet), peak(&band), peak(&glow));
+        assert!(
+            bp > 0 && pp > 0,
+            "fixture: both bodies are laid ({bp}, {pp})"
+        );
+        assert!(
+            u32::from(bp) * 3 <= u32::from(pp) * 2,
+            "the flat band peaks at {bp}, more than two thirds of the pet's {pp}"
+        );
+        let (band_plateau, glow_plateau) = (plateau(&band), plateau(&glow));
+        assert!(
+            band_plateau <= 3,
+            "the flat band holds a plateau of {band_plateau} px"
+        );
+        assert!(
+            glow_plateau >= band_plateau + 3,
+            "control: laid as the glow the flat body holds only {glow_plateau} px at its peak"
+        );
+        let even = evenness(&band);
+        assert!(
+            even >= 0.9,
+            "the flat band falls to {even:.2} of its light under the run"
+        );
+        assert!(
+            u32::from(gp) * 3 > u32::from(pp) * 2,
+            "control: laid as the glow the flat body peaks at {gp}, two thirds of the pet's {pp}"
         );
     }
 
@@ -15079,6 +19270,131 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A geometry of `ch` px cells half as wide, 240 columns: room for [`slab_walk`]'s line.
+    const fn geom_ch(ch: usize) -> Geom {
+        Geom {
+            cw: ch / 2,
+            ch,
+            rows: 40,
+            cols: 240,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: (240 * (ch / 2)) as u16,
+            win_h: (40 * ch) as u16,
+            head: 0,
+        }
+    }
+
+    /// The frame's vertex density ([`Ribbon::slabs_per_cell`]) and the glass's
+    /// ([`Ribbon::glass_slabs_per_cell`]) after each of 160 keys typed 2 ms apart along row 2 of
+    /// `g` under `c`: the plan's choice for every count of cells from one to the line's.
+    fn slab_walk(c: &Config, g: Geom) -> Vec<(usize, usize)> {
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        (0..160u16)
+            .map(|i| {
+                let now = at(t0, u64::from(i) * 2);
+                let cx = ctx_in(now, c, (2, 3 + i), 0.9, g);
+                rib.on_event(&typed(), now, &cx);
+                rib.plan(&cx);
+                (rib.slabs_per_cell(), rib.glass_slabs_per_cell())
+            })
+            .collect()
+    }
+
+    /// FNV-1a over `words`.
+    fn fold_words(words: impl IntoIterator<Item = u64>) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for w in words {
+            for b in w.to_le_bytes() {
+                h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        h
+    }
+
+    /// The spellings a density is chosen for: the tall comet, the tall flat ribbon, the
+    /// underline comet and the underline flat ribbon, on a page `dark` or not.
+    const fn spellings(dark: bool) -> [Config; 4] {
+        [
+            cfg(dark, true),
+            flat(dark, true),
+            cfg(dark, false),
+            flat(dark, false),
+        ]
+    }
+
+    /// The lights a dark ground is drawn under in [`dark_slabs_for_is_mains`]: none, each live
+    /// level, and the glass level on a see-through page.
+    const DARK_LIGHTS: [Light; 6] = [
+        Light::OFF,
+        Light::at(Live::Glass),
+        Light::at(Live::Lip),
+        Light::at(Live::Marks),
+        Light::at(Live::Vanish),
+        Light::at(Live::Glass).on_page(false),
+    ];
+
+    /// The cell heights [`dark_slabs_for_is_mains`] walks: the dump's 1×, the tests' 18, a
+    /// Retina's 28 and 36.
+    const SLAB_CHS: [usize; 4] = [16, 18, 28, 36];
+
+    /// [`slab_walk`] on two dark grounds (Default's, and Solarized Dark's, a dim page whose flat
+    /// ribbon lays its rail) under [`DARK_LIGHTS`], every spelling and [`SLAB_CHS`], folded, and
+    /// the densities the walks chose (bit `n` for `n` slabs per cell) and the most glass slabs
+    /// any frame chose.
+    fn dark_slab_fold() -> (u64, u32, usize) {
+        let mut words: Vec<u64> = Vec::new();
+        let mut glass = 0;
+        for (fg, bg) in [(DEFAULT_FG, DEFAULT_BG), (0x0083_9496, 0x0000_2B36)] {
+            for light in DARK_LIGHTS {
+                for c in spellings(true) {
+                    for ch in SLAB_CHS {
+                        let c = Config {
+                            theme_fg: fg,
+                            theme_bg: bg,
+                            light,
+                            ..c
+                        };
+                        for (n, g) in slab_walk(&c, geom_ch(ch)) {
+                            words.push(n as u64);
+                            glass = glass.max(g);
+                        }
+                    }
+                }
+            }
+        }
+        let chose = words.iter().fold(0u32, |m, &n| m | 1 << n);
+        (fold_words(words), chose, glass)
+    }
+
+    /// [`dark_slab_fold`] of main's densities on every dark ground, with the underline
+    /// spelling at looks10 L3's reach ([`UNDERLINE_UP_CH`], [`UNDERLINE_DN_CH`]). Captured at
+    /// this pin's parent (origin/main `b11eed7965`, before Prism Glass 1.8), with the underline
+    /// at its old reach, the walks folded to `0x0ee8_6c14_beca_e565`. trail/looks10's merge of
+    /// 1.8 folds to that value again with L3's reach put back (`1.0 - DN_TOP_CH` up,
+    /// [`COMET_DN_HAND_CH`] or [`DN_TOP_CH`] down, the tall walk). The thin underline alone moves
+    /// the fold; the glass moves none of it.
+    const MAIN_DARK_SLABS: u64 = 0xfe94_9fbb_f997_eca5;
+
+    /// DARK SLABS ARE MAIN'S (`docs/design/PRISM-GLASS.md` §2.2 Quad budget, §15.2 1.8): the glass
+    /// prices its own rows only on a page it lights, so on every dark ground, under every light
+    /// level (and on a see-through page), every spelling chooses main's vertex density for every
+    /// count of cells at every cell height: the walks fold to the hash main's walks folded to at
+    /// this pin's parent, and they choose one, two and three slabs a cell; no frame prices a
+    /// glass slab. The glass's own density on a light page, denser than main's paper, is
+    /// [`a_glass_frame_stays_within_the_ribbon_quad_budget`]'s control.
+    #[test]
+    fn dark_slabs_for_is_mains() {
+        let (fold, chose, glass) = dark_slab_fold();
+        assert_eq!(
+            chose, 0b1110,
+            "fixture: the walks choose 1, 2 and 3 slabs a cell"
+        );
+        assert_eq!(fold, MAIN_DARK_SLABS, "{fold:#x}");
+        assert_eq!(glass, 0, "a dark frame chose {glass} glass slabs a cell");
     }
 
     const fn geom_codex() -> Geom {
@@ -18126,6 +22442,8 @@ mod tests {
                 dn: 0.30 * g.ch as f32,
                 t: 0.4,
                 cov: 220,
+                glass_up: 0.0,
+                glass_jump: 0.0,
             })
             .collect();
         rib.runs.push(Run {
@@ -18170,6 +22488,8 @@ mod tests {
                 dn: 0.30 * g.ch as f32,
                 t: 0.4,
                 cov: 220,
+                glass_up: 0.0,
+                glass_jump: 0.0,
             })
             .collect();
         rib.runs.extend([

@@ -86,11 +86,151 @@ fn write_landing(
     Ok(aterm_durable::DirFlushed::classify(flush_dir(dir)).map(|_flushed_or_unavailable| ()))
 }
 
+/// The bytes of a temporary name's salt ([`create_temp_beside`]), written as twice as many hex
+/// digits.
+const SALT_BYTES: usize = 4;
+
 /// A NEW file beside `path` to write it through.
 /// # Errors
 /// No entropy for the name, a clash on every try, or the create's own error.
 pub fn create_temp_beside(path: &Path, mode: u32) -> io::Result<(PathBuf, std::fs::File)> {
-    create_temp_salted(path, mode, crate::rand::hex_token::<4>)
+    create_temp_salted(path, mode, crate::rand::hex_token::<SALT_BYTES>)
+}
+
+/// An age to pass [`abandoned_temps_beside`] and [`sweep_temps_beside`] as `older_than`: far past
+/// any write through a file [`create_temp_beside`] made, which lasts a flush and a rename, with
+/// a second or so at most of waiting for a lock or checking between.
+pub const ABANDONED_AFTER: Duration = Duration::from_secs(60 * 60);
+
+/// The files [`create_temp_beside`] made beside `path` that no write will rename, sorted, as
+/// [`temp_writer`] reads their names (so none for a `path` that has no name, or one that is not
+/// UTF-8, whose temporaries are named lossily): each a regular
+/// file whose pid names no live process ([`crate::process::pid_alive`]) and that was last
+/// written more than `older_than` ago. A writer that ends between the create and the rename
+/// (killed, or its process exiting under a thread that is still writing) leaves its file for
+/// good. One whose pid names a live process is not named (its writer's, or that of a later
+/// process given the pid, until it ends), nor one written within `older_than` or dated ahead of
+/// this clock, a link, a folder or any other name. A writer on another host that shares the
+/// folder is kept by the age alone: while the time since it last wrote, with however far the
+/// clock that dated the write (its own or the file server's) runs behind this one, stays within
+/// `older_than`.
+/// # Errors
+/// The folder, or an entry of its listing, cannot be read (a missing folder names none).
+pub fn abandoned_temps_beside(path: &Path, older_than: Duration) -> io::Result<Vec<PathBuf>> {
+    abandoned_with(
+        path,
+        older_than,
+        std::time::SystemTime::now(),
+        crate::process::pid_alive,
+    )
+}
+
+/// [`abandoned_temps_beside`] at `now`, with `alive` answering for a writer's pid.
+fn abandoned_with(
+    path: &Path,
+    older_than: Duration,
+    now: std::time::SystemTime,
+    alive: impl Fn(u32) -> bool,
+) -> io::Result<Vec<PathBuf>> {
+    if path.file_name().and_then(|n| n.to_str()).is_none() {
+        return Ok(Vec::new());
+    }
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut due = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(pid) = temp_writer(path, &entry.file_name()) else {
+            continue;
+        };
+        let old = entry.metadata().is_ok_and(|meta| {
+            meta.is_file()
+                && meta
+                    .modified()
+                    .is_ok_and(|at| now.duration_since(at).is_ok_and(|age| age > older_than))
+        });
+        if old && !alive(pid) {
+            due.push(entry.path());
+        }
+    }
+    due.sort();
+    Ok(due)
+}
+
+/// Remove each file [`abandoned_temps_beside`] names for `path` and `older_than`. Returns how
+/// many went; one that went meanwhile is no error and not counted.
+/// # Errors
+/// As [`abandoned_temps_beside`], or one could not be removed: the first such error, once every
+/// other one was tried.
+pub fn sweep_temps_beside(path: &Path, older_than: Duration) -> io::Result<usize> {
+    sweep_temps_with(
+        path,
+        older_than,
+        std::time::SystemTime::now(),
+        crate::process::pid_alive,
+        |temp| std::fs::remove_file(temp),
+    )
+}
+
+/// [`sweep_temps_beside`] at `now`, with `alive` answering for a writer's pid and `remove`
+/// removing a due file.
+fn sweep_temps_with(
+    path: &Path,
+    older_than: Duration,
+    now: std::time::SystemTime,
+    alive: impl Fn(u32) -> bool,
+    remove: impl Fn(&Path) -> io::Result<()>,
+) -> io::Result<usize> {
+    let (mut removed, mut first) = (0, None);
+    for temp in abandoned_with(path, older_than, now, alive)? {
+        match remove(&temp) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                first.get_or_insert(e);
+            }
+        }
+    }
+    first.map_or(Ok(removed), Err)
+}
+
+/// The pid of the writer whose temporary for `path` ([`create_temp_beside`]) is named `name`:
+/// `.<path's name>.tmp.<pid>.<salt>`, the pid in decimal digits and the salt as 8 lowercase hex
+/// digits (`SALT_BYTES`). `None` for any other name, when either name is not UTF-8, and for a
+/// `path` that has no name.
+#[must_use]
+pub fn temp_writer(path: &Path, name: &std::ffi::OsStr) -> Option<u32> {
+    let target = path.file_name()?.to_str()?;
+    let tail = name
+        .to_str()?
+        .strip_prefix('.')?
+        .strip_prefix(target)?
+        .strip_prefix(".tmp.")?;
+    let (pid, salt) = tail.split_once('.')?;
+    let salted = salt.len() == 2 * SALT_BYTES
+        && salt.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if !salted || pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse().ok()
+}
+
+/// The name of the file a temporary named `name` stands in for ([`create_temp_beside`]):
+/// `name` less its leading `.` and its `.tmp.<pid>.<salt>`, in [`temp_writer`]'s grammar, so a
+/// folder's listing can say whose temporaries it holds. `None` for any other name.
+#[must_use]
+pub fn temp_target(name: &std::ffi::OsStr) -> Option<&str> {
+    let (head, _salt) = name.to_str()?.strip_prefix('.')?.rsplit_once('.')?;
+    let (head, _pid) = head.rsplit_once('.')?;
+    let target = head.strip_suffix(".tmp")?;
+    temp_writer(Path::new(target), name).map(|_| target)
 }
 
 fn create_temp_salted(

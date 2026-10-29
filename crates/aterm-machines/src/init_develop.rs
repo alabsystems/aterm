@@ -936,8 +936,10 @@ struct WorkspaceTools {
     reader: Reader,
 }
 
-/// The base items the tools wait for: the C toolchain, and the toolset.
-const TOOLS_AFTER: [&str; 2] = [crate::init_clt::ID, "base.pkg.toolset"];
+/// The base items the tools wait for: the C toolchain. `base.pkg.toolset` runs before them in
+/// init's lane but does not hold them: a toolset that installs nothing (`auto_install = false`)
+/// or fails one vendor CLI may still have left `targo`, which the tools' own probe reads.
+pub(crate) const TOOLS_AFTER: [&str; 1] = [crate::init_clt::ID];
 
 impl WorkspaceTools {
     /// The checkout's own verb: under `--locked`, and for doctor `--offline` too, so cargo

@@ -174,14 +174,12 @@ impl TextSelection {
     }
 
     /// Re-floor the selection after scrollback eviction without a scroll delta (e.g. a retention-limit shrink or memory-budget trim).
+    ///
+    /// When `oldest_abs >= live_top_abs` (no scrollback rows remain above the live grid), the floor clamps to row `0`.
     pub fn truncate_to_floor(&mut self, oldest_abs: u64, live_top_abs: u64) -> bool {
         let oldest = i64::try_from(oldest_abs).unwrap_or(i64::MAX);
         let live_top = i64::try_from(live_top_abs).unwrap_or(i64::MAX);
         let min_row = i32::try_from(oldest.saturating_sub(live_top)).unwrap_or(i32::MIN);
-        debug_assert!(
-            min_row <= 0,
-            "history floor cannot sit below the live top: min_row={min_row}"
-        );
         self.clamp_head_to_min_row(min_row.min(0))
     }
 

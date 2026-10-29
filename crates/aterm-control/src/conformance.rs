@@ -558,6 +558,8 @@ pub struct MemoryHost {
     clipboard: Mutex<Option<String>>,
     capabilities: HostCapabilities,
     changed: ChangeSignal,
+    /// How many times a [`MemoryWait`] has parked on `changed`.
+    parks: Arc<AtomicU64>,
     redraws: AtomicU64,
 }
 
@@ -578,6 +580,7 @@ impl MemoryHost {
                 roster: true,
             },
             changed: Arc::new((Mutex::new(0), Condvar::new())),
+            parks: Arc::new(AtomicU64::new(0)),
             redraws: AtomicU64::new(0),
         }
     }
@@ -608,10 +611,15 @@ impl MemoryHost {
         cv.notify_all();
     }
 
-    /// A second handle on the same session, for a producer thread.
+    /// A second handle on the same session, for a producer thread, with the
+    /// count of parks on its change signal.
     #[must_use]
-    pub fn producer(&self) -> (Arc<Mutex<Terminal>>, ChangeSignal) {
-        (Arc::clone(&self.term), Arc::clone(&self.changed))
+    pub fn producer(&self) -> (Arc<Mutex<Terminal>>, ChangeSignal, Arc<AtomicU64>) {
+        (
+            Arc::clone(&self.term),
+            Arc::clone(&self.changed),
+            Arc::clone(&self.parks),
+        )
     }
 
     /// The clipboard's current contents.
@@ -631,11 +639,14 @@ impl MemoryHost {
 }
 
 /// A registration on [`MemoryHost`]'s change counter, holding the value it saw
-/// at registration so a bump in the register→recheck gap is not lost.
+/// at registration so a bump in the register→recheck gap is not lost. It counts
+/// each park in `parks` while it still holds the change lock, which it gives up
+/// only inside the condvar wait, so a bump made after the count is seen wakes it.
 #[cfg(test)]
 struct MemoryWait {
     changed: ChangeSignal,
     registered_at: u64,
+    parks: Arc<AtomicU64>,
 }
 
 #[cfg(test)]
@@ -646,6 +657,7 @@ impl ChangeWait for MemoryWait {
         if *g != self.registered_at {
             return true;
         }
+        self.parks.fetch_add(1, Ordering::SeqCst);
         let (g, res) = cv
             .wait_timeout(g, timeout)
             .unwrap_or_else(|p| p.into_inner());
@@ -714,6 +726,7 @@ impl SessionHost for MemoryHost {
         Box::new(MemoryWait {
             changed,
             registered_at,
+            parks: Arc::clone(&self.parks),
         })
     }
 
@@ -831,6 +844,29 @@ mod tests {
         assert_eq!(selection::cmd_copy(&host, 0), "OK 5\n");
         assert_eq!(host.clipboard().as_deref(), Some("hello"));
         assert!(host.redraws() >= 1, "select must ask for a repaint");
+        for bad in [
+            "line +0",
+            "line -0",
+            "line 0 junk",
+            "word 0 1 junk",
+            "block 0 0 0 1 junk",
+            "extend 0 1 junk",
+            "clear extra",
+            "0 0 0 4 9",
+        ] {
+            assert!(
+                selection::cmd_select(&host, 0, bad).starts_with("ERR usage: "),
+                "`select {bad}`"
+            );
+        }
+        for bad in ["+0 0 0 4", "-0 0 0 4", "0 +0 0 4"] {
+            assert_eq!(
+                selection::cmd_select(&host, 0, bad),
+                "ERR bad args\n",
+                "`select {bad}`"
+            );
+        }
+        assert_eq!(selection::cmd_select(&host, 0, "line -1"), "OK\n");
     }
 
     /// `wait` parks on the host's change signal and reports the completion that
@@ -839,9 +875,13 @@ mod tests {
     fn wait_reports_a_completion_that_lands_while_parked() {
         let host = MemoryHost::new(0);
         host.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep\n\x1b]133;C\x07");
-        let (term, changed) = host.producer();
+        let (term, changed, parks) = host.producer();
         let h = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(40));
+            aterm_spec::wait::until_within(
+                aterm_spec::wait::MUST_HAPPEN,
+                "the wait to park",
+                || (parks.load(Ordering::SeqCst) > 0).then_some(()),
+            );
             term.lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .process(b"\x1b]133;D;0\x07");
@@ -865,16 +905,12 @@ mod tests {
     fn a_wait_ms_that_is_not_a_number_is_the_usage_line() {
         let host = MemoryHost::new(0);
         host.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07true\n\x1b]133;C\x07\x1b]133;D;0\x07");
-        for tail in ["2s", "1.5", "-1", "0x10", "5 6", "timeout=5"] {
+        for tail in ["2s", "1.5", "-1", "+5", "0x10", "5 6", "timeout=5"] {
             assert_eq!(
                 selection::cmd_wait(&host, 0, tail),
                 "ERR usage: wait [<ms>]\n",
                 "`wait {tail}`"
             );
-        }
-        for tail in ["", "0", "99999999999"] {
-            let reply = selection::cmd_wait(&host, 0, tail);
-            assert!(reply.starts_with("OK complete "), "`wait {tail}`: {reply}");
         }
         assert_eq!(
             crate::wire::wait_ms("99999999999"),
@@ -885,6 +921,18 @@ mod tests {
             None,
             "the caller trims, not the reader"
         );
+    }
+
+    /// When a block is already complete and none is executing, `wait` answers
+    /// immediately without parking.
+    #[test]
+    fn wait_returns_an_existing_completion_without_parking() {
+        let host = MemoryHost::new(0);
+        host.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07true\n\x1b]133;C\x07\x1b]133;D;0\x07");
+        for tail in ["", "0", "99999999999"] {
+            let reply = selection::cmd_wait(&host, 0, tail);
+            assert!(reply.starts_with("OK complete "), "`wait {tail}`: {reply}");
+        }
     }
 
     /// `blocks`/`blocktext` over real OSC-133 content, so `check_blocks` sees a
@@ -900,6 +948,10 @@ mod tests {
         assert!(listed.contains("cmdline=echo%20hi"), "{listed}");
         let txt = selection::cmd_blocktext(&host, 0, "0");
         assert!(txt.starts_with("OK ") && txt.contains("hi"), "{txt}");
+        assert_eq!(
+            selection::cmd_blocktext(&host, 0, "+0"),
+            "ERR usage: blocktext <id>\n"
+        );
         for o in [check_blocks(&host, 0), check_blocks_json(&host, 0)] {
             assert!(o.passed(), "{}: {:?}", o.check, o.failure);
         }

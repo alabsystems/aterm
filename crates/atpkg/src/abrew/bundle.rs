@@ -119,16 +119,79 @@ pub fn brewfile_dump(prefix: &Prefix) -> String {
         if super::prefix::receipt_word(&keg, "installed_on_request").as_deref() == Some("false") {
             continue;
         }
-        let shown = match super::prefix::receipt_word(&keg, "full_name") {
-            Some(full) if full.contains('/') => full,
-            _ => i.name.clone(),
-        };
-        out.push_str(&format!("brew \"{shown}\"\n"));
+        out.push_str(&format!("brew \"{}\"\n", prefix.specified_name(&i)));
     }
     for i in prefix.installed(Kind::Cask) {
-        out.push_str(&format!("cask \"{}\"\n", i.name));
+        out.push_str(&format!("cask \"{}\"\n", prefix.specified_name(&i)));
     }
     out
+}
+
+/// Normalize an official core formula or cask operand in a Brewfile (`name`,
+/// `homebrew/[homebrew-]core/name` for `brew`, or `homebrew/[homebrew-]cask/name`
+/// for `cask`). Third-party tap packages require tap recipes and are not native.
+fn parse_official_package_entry(key: &str, name: &str) -> Option<String> {
+    if super::valid_component(name) {
+        return Some(name.to_owned());
+    }
+    let (tap_part, pkg) = name.rsplit_once('/')?;
+    if !super::valid_component(pkg) {
+        return None;
+    }
+    let (user, repo) = super::tap::parse_tap_name(tap_part)?;
+    match (key, user.as_str(), repo.as_str()) {
+        ("brew", "homebrew", "core") | ("cask", "homebrew", "cask") => Some(pkg.to_owned()),
+        _ => None,
+    }
+}
+
+fn normalize_qualified_name(full: &str) -> Option<String> {
+    let (tap_part, pkg) = full.rsplit_once('/')?;
+    if !super::valid_component(pkg) {
+        return None;
+    }
+    let (user, repo) = super::tap::parse_tap_name(tap_part)?;
+    Some(format!("{user}/{repo}/{pkg}"))
+}
+
+/// Whether `entry` is already satisfied by `prefix`.
+#[must_use]
+pub fn entry_installed(prefix: &Prefix, entry: &BrewfileEntry) -> bool {
+    match entry {
+        BrewfileEntry::Tap(n) => super::tap::parse_tap_name(n)
+            .map(|(u, r)| format!("{u}/{r}"))
+            .is_some_and(|want| super::tap::list(prefix).iter().any(|t| t.name() == want)),
+        BrewfileEntry::Brew(n) => package_installed(prefix, Kind::Formula, n, false),
+        BrewfileEntry::Cask(n) => package_installed(prefix, Kind::Cask, n, true),
+    }
+}
+
+fn package_installed(prefix: &Prefix, kind: Kind, requested: &str, canonical_cask: bool) -> bool {
+    let (key, official_tap) = match kind {
+        Kind::Formula => ("brew", "homebrew/core"),
+        Kind::Cask => ("cask", "homebrew/cask"),
+    };
+    let Some(raw_short) = parse_official_package_entry(key, requested) else {
+        return false;
+    };
+    let short = if canonical_cask {
+        super::api::canonical_cask_token(&raw_short)
+    } else {
+        raw_short.as_str()
+    };
+    let Some(inst) = prefix.installed_one(kind, short) else {
+        return false;
+    };
+    let want = format!("{official_tap}/{short}");
+    inst.versions.iter().any(|version| {
+        let one = super::prefix::Installed {
+            name: short.to_owned(),
+            version: version.clone(),
+            kind,
+            versions: Vec::new(),
+        };
+        normalize_qualified_name(&prefix.full_name(&one)).as_deref() == Some(want.as_str())
+    })
 }
 
 /// One Brewfile line's instruction.
@@ -163,15 +226,15 @@ pub fn parse_brewfile(text: &str) -> (Vec<BrewfileEntry>, Vec<String>) {
             if !tail.is_empty() && !tail.starts_with('#') {
                 return None;
             }
-            let valid = if key == "tap" {
-                super::tap::parse_tap_name(name).is_some()
+            if key == "tap" {
+                let (user, repo) = super::tap::parse_tap_name(name)?;
+                Some(format!("{user}/{repo}"))
             } else {
-                super::valid_component(name)
-            };
-            valid.then(|| name.to_owned())
+                parse_official_package_entry(key, name)
+            }
         };
-        if let Some((user, repo)) = quoted("tap").and_then(|n| super::tap::parse_tap_name(&n)) {
-            entries.push(BrewfileEntry::Tap(format!("{user}/{repo}")));
+        if let Some(tap) = quoted("tap") {
+            entries.push(BrewfileEntry::Tap(tap));
         } else if let Some(n) = quoted("brew") {
             entries.push(BrewfileEntry::Brew(n));
         } else if let Some(n) = quoted("cask") {
@@ -226,23 +289,62 @@ mod tests {
                 ("full_name", "someone/tap/taptool"),
             ],
         );
+        mk(
+            "badreceipt",
+            "1.0",
+            &[
+                ("installed_on_request", "true"),
+                ("full_name", "evil\" \ntap \"bad/repo"),
+            ],
+        );
         mk("legacy", "0.9", &[]);
         let text = brewfile_dump(&p);
         assert!(text.contains("brew \"wget\"\n"), "{text}");
         assert!(text.contains("brew \"someone/tap/taptool\"\n"), "{text}");
+        assert!(text.contains("brew \"badreceipt\"\n"), "{text}");
+        assert!(!text.contains("evil"), "{text}");
         assert!(text.contains("brew \"legacy\"\n"), "{text}");
         assert!(!text.contains("dep"), "dependency leaked into dump: {text}");
+
+        let (entries, skipped) = parse_brewfile(&text);
+        assert_eq!(
+            skipped,
+            ["brew \"someone/tap/taptool\""],
+            "third-party tap formulae remain unsupported rows: {skipped:?}"
+        );
+        for entry in &entries {
+            assert!(
+                entry_installed(&p, entry),
+                "dumped core entry {entry:?} must be recognized as installed"
+            );
+        }
+        assert!(
+            !entry_installed(&p, &BrewfileEntry::Brew("taptool".into())),
+            "third-party tap keg must not satisfy a core formula entry"
+        );
+        assert!(entry_installed(
+            &p,
+            &BrewfileEntry::Brew("homebrew/core/wget".into())
+        ));
     }
 
     #[test]
     fn brewfile_parse() {
         let (entries, skipped) = parse_brewfile(
-            "tap \"me/tools\"\nbrew \"wget\"\ncask \"firefox\"\nmas \"Xcode\", id: 1\n",
+            "tap \"me/tools\"\nbrew \"wget\"\nbrew \"homebrew/homebrew-core/curl\"\ncask \"homebrew/cask/firefox\"\nbrew \"someone/homebrew-tap/taptool\"\nmas \"Xcode\", id: 1\n",
         );
-        assert_eq!(entries.len(), 3);
-        assert_eq!(skipped.len(), 1);
+        assert_eq!(
+            entries,
+            [
+                BrewfileEntry::Tap("me/tools".into()),
+                BrewfileEntry::Brew("wget".into()),
+                BrewfileEntry::Brew("curl".into()),
+                BrewfileEntry::Cask("firefox".into()),
+            ]
+        );
+        assert_eq!(skipped.len(), 2);
         let (entries, skipped) = parse_brewfile(
-            "brew 'openssl@3' # note\ntap \"me/homebrew-tools\"\nbrew \"wget\", args: [\"HEAD\"]\nbrew \"wget\" if true\nbrew\"wget\"\ncask \"../outside\"\ntap \"../foo\"\nbrew 'wget\"\n",
+            "brew 'openssl@3' # note\ntap \"me/homebrew-tools\"\nbrew \"wget\", args: [\"HEAD\"]\nbrew \"wget\" if true\nbrew\"wget\"\ncask \"../outside\"\nbrew \"two/parts\"\ncask \"homebrew/core/firefox\"\ntap \"../foo\"\nbrew 'wget\"\n",
         );
         assert_eq!(
             entries,
@@ -253,7 +355,7 @@ mod tests {
         );
         assert_eq!(
             skipped.len(),
-            6,
+            8,
             "unsupported syntax is never partially executed"
         );
     }

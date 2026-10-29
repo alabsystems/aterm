@@ -38,16 +38,15 @@ fn empty_query_terminal_search() {
 #[test]
 fn bloom_filter_rejection() {
     let mut index = SearchIndex::new();
+    assert!(
+        !index.might_contain("zzqxj"),
+        "an empty bloom filter rejects every query with at least one trigram"
+    );
+
     index.index_line(0, "hello world");
 
     assert!(index.might_contain("hello"));
     assert!(index.might_contain("world"));
-
-    assert!(
-        !index.might_contain("zzqxj"),
-        "bloom filter should reject query with no matching trigrams"
-    );
-
     assert!(index.might_contain("zz"));
 }
 
@@ -1511,21 +1510,30 @@ fn changed_row_reindex_matches_from_scratch_rebuild() {
         }
     }
 
-    for stale in ["world 200", "worl\u{0064} ", "\u{df}e"] {
+    for stale in ["world", "worlq", "200", "\u{df}e"] {
         assert!(
             incremental
                 .search_results_opts(stale, true, false)
                 .expect("ok")
                 .matches
-                .len()
-                == fresh
-                    .search_results_opts(stale, true, false)
-                    .expect("ok")
-                    .matches
-                    .len(),
-            "stale probe {stale:?}"
+                .is_empty(),
+            "overwritten text {stale:?} left no match"
         );
     }
+
+    // Negative control: an index missing the row-0 overwrite diverges from `fresh` under the same oracle.
+    let mut stale_row0 = SearchIndex::new();
+    for &(row, text) in &script[..9] {
+        stale_row0.index_line(row, text);
+    }
+    stale_row0.index_line(4, "\u{03c3} sigma forms");
+    assert_ne!(
+        stale_row0
+            .search_results_opts("worlq", true, false)
+            .expect("ok"),
+        fresh.search_results_opts("worlq", true, false).expect("ok"),
+        "negative control: oracle distinguishes stale row-0 postings from fresh rebuild"
+    );
 }
 
 #[test]

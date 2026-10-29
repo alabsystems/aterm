@@ -29,9 +29,19 @@ pub fn scratch_root() -> Option<&'static Path> {
     }
 }
 
-/// Whether `exe` is a Cargo test binary.
+/// Whether `exe` is a Cargo test binary. Linux names a running image that a later build unlinked
+/// `<path> (deleted)` (its `/proc/self/exe`, which `current_exe` reads), and that image is still the
+/// test binary it was.
 #[must_use]
 pub fn is_test_binary(exe: &Path) -> bool {
+    #[cfg(unix)]
+    let exe = {
+        use std::os::unix::ffi::OsStrExt as _;
+        exe.as_os_str()
+            .as_bytes()
+            .strip_suffix(b" (deleted)")
+            .map_or(exe, |path| Path::new(OsStr::from_bytes(path)))
+    };
     let in_deps = exe
         .parent()
         .and_then(Path::file_name)
@@ -41,14 +51,29 @@ pub fn is_test_binary(exe: &Path) -> bool {
         .file_stem()
         .and_then(OsStr::to_str)
         .and_then(|stem| stem.rsplit_once('-'))
-        .is_some_and(|(name, hash)| {
+        .filter(|(name, hash)| {
             !name.is_empty()
                 && hash.len() == 16
                 && hash
                     .bytes()
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         });
-    in_deps && executable && named
+    let Some((_, hash)) = named else {
+        return false;
+    };
+    // Native Targo's separated build directory retains test executables at
+    // build/<package>/<unit-hash>/out/<target>-<same-unit-hash>. This is the
+    // same debug-only isolation heuristic as deps/, not executable authority.
+    let native_out = exe
+        .parent()
+        .filter(|out| out.file_name().is_some_and(|n| n == "out"))
+        .and_then(Path::parent)
+        .filter(|unit| unit.file_name().is_some_and(|name| name == hash))
+        .and_then(Path::parent)
+        .filter(|package| package.file_name().is_some_and(|name| !name.is_empty()))
+        .and_then(Path::parent)
+        .is_some_and(|build| build.file_name().is_some_and(|name| name == "build"));
+    executable && (in_deps || native_out)
 }
 
 /// Whether `dir` is the login session's runtime directory (`/run/user/<uid>`).
@@ -198,12 +223,16 @@ mod tests {
             "/t/debug/deps/aterm_gui-ed1c215a8f696a87",
             "/t/debug/deps/aterm-4e7f22a66ff5f4f6",
             r"C:\t\debug\deps\aterm_uds-0123456789abcdef.exe",
+            "/t/debug/build/aterm-types/0123456789abcdef/out/aterm_types-0123456789abcdef",
+            "/t/opt-test/build/package/0123456789abcdef/out/contract-0123456789abcdef",
+            r"C:\t\debug\build\aterm-uds\0123456789abcdef\out\aterm_uds-0123456789abcdef.exe",
         ] {
             let exe = exe.replace('\\', std::path::MAIN_SEPARATOR_STR);
             assert!(is_test_binary(Path::new(&exe)), "{exe}");
         }
         for exe in [
             "/t/debug/aterm",
+            "/t/debug/aterm (deleted)",
             "/t/debug/examples/demo-ed1c215a8f696a87",
             "/t/debug/build/aterm-gui-ed1c215a8f696a87/build-script-build",
             "/t/debug/deps/aterm_gui-ED1C215A8F696A87",
@@ -211,8 +240,24 @@ mod tests {
             "/t/debug/deps/-ed1c215a8f696a87",
             "/t/debug/deps/libaterm_uds-ed1c215a8f696a87.rlib",
             "/Applications/aterm.app/Contents/MacOS/aterm",
+            "/t/debug/build/pkg/fedcba9876543210/out/unit-0123456789abcdef",
+            "/t/debug/build/pkg/0123456789abcdef/out/unit-0123456789abcdef.rlib",
+            "/t/debug/build/pkg/0123456789abcdef/out/build-script-build",
+            "/t/debug/build/0123456789abcdef/out/unit-0123456789abcdef",
+            "/t/debug/other/pkg/0123456789abcdef/out/unit-0123456789abcdef",
         ] {
             assert!(!is_test_binary(Path::new(exe)), "{exe}");
+        }
+        // Linux's name for a running image a later build unlinked, in a folder whose name is
+        // no UTF-8 too.
+        #[cfg(unix)]
+        for exe in [
+            &b"/t/debug/deps/aterm_agent-0123456789abcdef (deleted)"[..],
+            b"/t/\xff/debug/deps/aterm_agent-0123456789abcdef (deleted)",
+        ] {
+            use std::os::unix::ffi::OsStrExt as _;
+            let exe = Path::new(std::ffi::OsStr::from_bytes(exe));
+            assert!(is_test_binary(exe), "{}", exe.display());
         }
     }
 

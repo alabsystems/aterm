@@ -32,7 +32,109 @@ pub const MINT_SECRET: &str = "mint.secret";
 /// A mint secret is 32 bytes.
 pub use astream_cap::capfile::SECRET_MIN as SECRET_LEN;
 
-const PROOF_DEADLINE: Duration = Duration::from_secs(5);
+/// The record `aterm fabric off` leaves in the fabric root, empty, and beside aterm.toml
+/// ([`kept_off_record`]): the person turned the fabric off, and the converge pass never turns it
+/// on beside either ([`unset_state`]); `aterm fabric on` removes both.
+pub const OFF_RECORD: &str = "fabric-off";
+
+/// [`OFF_RECORD`] beside aterm.toml, outside the fabric root: an off keeps the root (the node id,
+/// the secret, the grants, the bus log), so a person who tidies it away after has not turned the
+/// fabric back on. `None` where no config path resolves.
+fn kept_off_record(p: &Paths) -> Option<PathBuf> {
+    p.config
+        .as_deref()
+        .and_then(Path::parent)
+        .map(|dir| dir.join(OFF_RECORD))
+}
+
+/// The off record that stands, in `root` or at `kept` ([`kept_off_record`]).
+fn off_recorded(root: &Path, kept: Option<&Path>) -> Option<PathBuf> {
+    std::iter::once(root.join(OFF_RECORD))
+        .chain(kept.map(Path::to_path_buf))
+        .find(|record| std::fs::symlink_metadata(record).is_ok())
+}
+
+/// The record the converge pass leaves in the fabric root before it turns the fabric on by
+/// default ([`turn_on_by_default`]), empty: a root it provisioned and did not finish (a broker
+/// that did not start, say) reads as never turned off, so a later pass finishes it, where a root
+/// an older `off` left reads as the person's off. The turn-on that finishes takes it out, the
+/// pass's or a person's `aterm fabric on`, so a command the person clears after reads as their
+/// off.
+pub const DEFAULT_RECORD: &str = "fabric-by-default";
+
+/// The record `aterm fabric on --service none` leaves in the fabric root: the person runs the
+/// broker, so the converge pass renews no job an earlier `on` installed there. An `on` that hands
+/// the broker to launchd or systemd takes it out.
+pub const HAND_RECORD: &str = "fabric-service-none";
+
+/// The lock in the fabric root that `aterm fabric on`, `aterm fabric off`, the converge pass's
+/// turn-on and its broker renewal hold, one at a time: an off never lands midway through a turn-on
+/// (whose steps remove its record and write `[fabric] command` back over it) or a renewal (whose
+/// step would start the broker the off stopped), and two turn-ons never write the root at once.
+const SWITCH_LOCK: &str = "fabric-switch.lock";
+
+/// How long a person's `aterm fabric on` or `off` waits for the switch: a hang bound, well past
+/// the broker step's own waits.
+const SWITCH_WAIT: Duration = Duration::from_secs(300);
+
+/// Take [`SWITCH_LOCK`] in `root` (made 0700 where it is missing), waiting at most `within`; a
+/// lock still held then is `WouldBlock`.
+fn switch_lock(root: &Path, within: Duration) -> io::Result<aterm_uds::private_file::PrivateLock> {
+    aterm_uds::private_file::ensure_private_dir(root)?;
+    aterm_uds::private_file::PrivateLock::take(root, SWITCH_LOCK, within, "held")
+}
+
+/// [`SWITCH_LOCK`] in `root` for a person's `aterm fabric {verb}`, waiting at most `within` for a
+/// turn-on, renewal, `on` or `off` that holds it; `None` for a dry run, or where the lock cannot
+/// be taken (said on `out`, and the command goes on without it). A switch still held then fails
+/// the command, its line naming what to do.
+fn persons_switch(
+    root: &Path,
+    verb: &str,
+    within: Duration,
+    out: &mut Out,
+) -> Result<Option<aterm_uds::private_file::PrivateLock>, ExitCode> {
+    if out.dry_run {
+        return Ok(None);
+    }
+    match switch_lock(root, within) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            out.fail(
+                "record",
+                &format!(
+                    "{} was held for {}s (the converge pass turning the fabric on or renewing its \
+                     broker, or another `aterm fabric on` or `off`): run `aterm fabric {verb}` \
+                     again once it ends",
+                    root.join(SWITCH_LOCK).display(),
+                    within.as_secs()
+                ),
+            );
+            Err(ExitCode::FAILURE)
+        }
+        Err(e) => {
+            out.warn(
+                "record",
+                &format!(
+                    "{}: {e}; {verb} goes on without it",
+                    root.join(SWITCH_LOCK).display()
+                ),
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Take [`DEFAULT_RECORD`] out of `root`: a turn-on finished there.
+fn clear_default_record(root: &Path) -> Result<(), String> {
+    aterm_uds::private_file::remove_private(root, DEFAULT_RECORD)
+        .map(|_| ())
+        .map_err(|e| format!("{}: {e}", root.join(DEFAULT_RECORD).display()))
+}
+
+/// The proof waits for what must happen once the broker answers and the bridge connected (the
+/// steps before it): a hang bound, not a latency budget a busy machine's working fabric misses.
+const PROOF_DEADLINE: Duration = Duration::from_secs(60);
 
 const BIND_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -374,6 +476,11 @@ impl Paths {
     #[must_use]
     pub fn plist_text(&self) -> String {
         let root = aterm_codec::xml::escape(&self.root.to_string_lossy());
+        let pkg_bin = self.home.join("Library/Application Support/aterm/pkg/bin");
+        let path = aterm_codec::xml::escape(&format!(
+            "{}:/usr/bin:/bin:/usr/sbin:/sbin",
+            pkg_bin.to_string_lossy()
+        ));
         let args: String = self
             .broker_argv()
             .iter()
@@ -393,6 +500,10 @@ impl Paths {
              \x20 <key>KeepAlive</key><true/>\n\
              \x20 <key>ProcessType</key><string>Background</string>\n\
              \x20 <key>WorkingDirectory</key><string>{root}</string>\n\
+             \x20 <key>EnvironmentVariables</key>\n\
+             \x20 <dict>\n\
+             \x20   <key>PATH</key><string>{path}</string>\n\
+             \x20 </dict>\n\
              \x20 <key>StandardOutPath</key><string>{root}/broker.out</string>\n\
              \x20 <key>StandardErrorPath</key><string>{root}/broker.err</string>\n\
              </dict>\n\
@@ -847,6 +958,23 @@ fn login_home() -> Option<PathBuf> {
 #[must_use]
 pub fn rendezvous_path() -> Option<PathBuf> {
     aterm_uds::control_socket_dir().map(|d| d.join(RENDEZVOUS_FILE))
+}
+
+/// Whether [`Paths::resolve`] names an `aterm` on `$PATH` (or the test seam's) as the broker's
+/// program, rather than this process's own executable.
+#[must_use]
+pub fn names_aterm_on_path() -> bool {
+    names_aterm_on(
+        aterm_types::dev_seam!("ATERM_BIN").as_deref(),
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+/// [`names_aterm_on_path`] over the seam's value `seam` and `$PATH`'s `path`: a seam that is not
+/// blank, or an executable `aterm` in one of `path`'s directories.
+fn names_aterm_on(seam: Option<&std::ffi::OsStr>, path: Option<&std::ffi::OsStr>) -> bool {
+    seam.is_some_and(|b| !b.to_string_lossy().trim().is_empty())
+        || path.is_some_and(|p| which_in(std::ffi::OsStr::new("aterm"), p).is_some())
 }
 
 fn which(name: &str) -> Option<PathBuf> {
@@ -1798,6 +1926,301 @@ fn root_step(p: &Paths, state: &Path, out: &mut Out) -> bool {
     true
 }
 
+/// Remove `aterm fabric off`'s records ([`OFF_RECORD`]) from `p`'s root and beside aterm.toml:
+/// `on` turns the fabric on again, and the converge pass may keep it on after. Said only where
+/// there was one.
+fn record_step(p: &Paths, service: Service, out: &mut Out) -> bool {
+    let kept = kept_off_record(p);
+    let root = remove_off_record(&p.root.join(OFF_RECORD), out);
+    let kept = kept.is_none_or(|record| remove_off_record(&record, out));
+    hand_record_step(p, service, out) && kept && root
+}
+
+/// Leave [`HAND_RECORD`] in `p`'s root where `on` runs with `--service none` (`service`), and
+/// take it out where it hands the broker to launchd or systemd.
+fn hand_record_step(p: &Paths, service: Service, out: &mut Out) -> bool {
+    let record = p.root.join(HAND_RECORD);
+    let there = match std::fs::symlink_metadata(&record) {
+        Ok(_) => true,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => {
+            out.fail("record", &format!("{}: {e}", record.display()));
+            return false;
+        }
+    };
+    let written = match (service, there) {
+        (Service::None, true) => {
+            out.already(
+                "record",
+                &format!(
+                    "{} (you run the broker: the converge pass renews no job of this root)",
+                    record.display()
+                ),
+            );
+            return true;
+        }
+        (Service::None, false) => {
+            out.done(
+                "record",
+                &format!(
+                    "write {} (you run the broker: the converge pass renews no job of this root)",
+                    record.display()
+                ),
+                &format!("wrote {} (you run the broker)", record.display()),
+            );
+            true
+        }
+        (_, true) => {
+            out.done(
+                "record",
+                &format!("remove {} (`on --service none`'s record)", record.display()),
+                &format!(
+                    "removed {} (`on --service none`'s record)",
+                    record.display()
+                ),
+            );
+            false
+        }
+        (_, false) => return true,
+    };
+    if out.dry_run {
+        return true;
+    }
+    let done = if written {
+        aterm_uds::private_file::write_private(&p.root, HAND_RECORD, b"").map(|()| true)
+    } else {
+        aterm_uds::private_file::remove_private(&p.root, HAND_RECORD)
+    };
+    match done {
+        Ok(_) => true,
+        Err(e) => {
+            out.fail("record", &format!("{}: {e}", record.display()));
+            false
+        }
+    }
+}
+
+/// [`record_step`] for one record.
+fn remove_off_record(record: &Path, out: &mut Out) -> bool {
+    match std::fs::symlink_metadata(record) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return true,
+        Err(e) => {
+            out.fail("record", &format!("{}: {e}", record.display()));
+            return false;
+        }
+    }
+    out.done(
+        "record",
+        &format!(
+            "remove {} (`aterm fabric off`'s record, which keeps the converge pass from turning \
+             the fabric on)",
+            record.display()
+        ),
+        &format!("removed {} (`aterm fabric off`'s record)", record.display()),
+    );
+    if out.dry_run {
+        return true;
+    }
+    match std::fs::remove_file(record) {
+        Ok(()) => true,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+        Err(e) => {
+            out.fail("record", &format!("{}: {e}", record.display()));
+            false
+        }
+    }
+}
+
+/// Write `aterm fabric off`'s records ([`OFF_RECORD`]) in `p`'s root, made 0700 where it is
+/// missing, and beside aterm.toml where its folder is there ([`kept_off_record`]): the off's first
+/// writes, so one stopped short keeps the converge pass from turning the fabric on again too.
+fn off_record_step(p: &Paths, out: &mut Out) {
+    write_off_record(&p.root.join(OFF_RECORD), Some(&p.root), out);
+    let kept = kept_off_record(p).filter(|record| record.parent().is_some_and(Path::is_dir));
+    if let Some(record) = kept {
+        write_off_record(&record, None, out);
+    }
+}
+
+/// [`off_record_step`] for `record`; `root` is the fabric root it is written in, made private
+/// first, where it is that record. aterm.toml's folder is left as it is (the record is empty).
+fn write_off_record(record: &Path, root: Option<&Path>, out: &mut Out) {
+    if std::fs::symlink_metadata(record).is_ok() {
+        out.already(
+            "record",
+            &format!(
+                "{} (the converge pass leaves the fabric off)",
+                record.display()
+            ),
+        );
+        return;
+    }
+    out.done(
+        "record",
+        &format!(
+            "write {} (the converge pass leaves the fabric off until `aterm fabric on`)",
+            record.display()
+        ),
+        "",
+    );
+    if out.dry_run {
+        return;
+    }
+    let written = match root {
+        Some(root) => aterm_uds::private_file::ensure_private_dir(root)
+            .and_then(|_| aterm_uds::private_file::write_private(root, OFF_RECORD, b"")),
+        None => aterm_uds::atomic_file::write(record, b"", 0o600),
+    };
+    if let Err(e) = written {
+        out.fail("record", &format!("{}: {e}", record.display()));
+    }
+}
+
+/// What the fabric reads as where no `[fabric] command` turns it on ([`unset_state`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unset {
+    /// The person turned it off: why, as one line naming what says so.
+    PersonOff(String),
+    /// Off, and nothing says the person ever turned it off: what was found.
+    Never(String),
+}
+
+/// Whether the fabric is unset here, and why: `None` where `[fabric] command` (or
+/// `$ATERM_FABRIC_COMMAND`) names a bridge, so the fabric is on. Otherwise the person turned it
+/// off where `aterm fabric off`'s record stands in the fabric root, or where the root holds what
+/// an earlier `on` left (a node id, the mint secret or the node grants) beside no command and no
+/// [`DEFAULT_RECORD`]: an `off` from before the record, which keeps them; a command the person
+/// cleared from aterm.toml after a turn-on finished; or a person's `on` that stopped short, which
+/// `aterm fabric on` finishes. The converge pass leaves each as it is. Anything else (a root the
+/// pass began turning on included) is a fabric nobody turned off, which the pass turns on.
+///
+/// # Errors
+/// aterm.toml or the command cannot be read, or `$HOME` is not set.
+pub fn unset_state() -> Result<Option<Unset>, String> {
+    let command = configured_command()?;
+    let p = Paths::resolve(None)?;
+    Ok(unset_in(
+        &p.root,
+        kept_off_record(&p).as_deref(),
+        command.is_some(),
+    ))
+}
+
+/// [`unset_state`] for the fabric root `root` and the off record kept beside aterm.toml at `kept`
+/// ([`kept_off_record`]), `command` saying whether a bridge command is configured.
+fn unset_in(root: &Path, kept: Option<&Path>, command: bool) -> Option<Unset> {
+    if command {
+        return None;
+    }
+    if let Some(record) = off_recorded(root, kept) {
+        return Some(Unset::PersonOff(format!(
+            "off by your choice: `aterm fabric off` recorded it ({}); `aterm fabric on` turns it \
+             on",
+            record.display()
+        )));
+    }
+    let by_default = std::fs::symlink_metadata(root.join(DEFAULT_RECORD)).is_ok();
+    let left = read_node(&root.join("link-state"))
+        .map(|node| format!("node {node}"))
+        .or_else(|| {
+            [MINT_SECRET, "node.cap"]
+                .into_iter()
+                .find(|name| std::fs::symlink_metadata(root.join(name)).is_ok())
+                .map(str::to_owned)
+        });
+    match left {
+        Some(what) if !by_default => Some(Unset::PersonOff(format!(
+            "off: {} keeps {what} beside no [fabric] command, as an earlier `aterm fabric off` \
+             leaves it (or a command cleared from aterm.toml, or an `aterm fabric on` that \
+             stopped short); `aterm fabric on` turns it on",
+            root.display()
+        ))),
+        Some(_) => Some(Unset::Never(
+            "off: an earlier pass began turning it on and did not finish".to_string(),
+        )),
+        None => Some(Unset::Never(
+            "off: no [fabric] command, and it was never turned off here".to_string(),
+        )),
+    }
+}
+
+/// What [`turn_on_by_default`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ByDefault {
+    /// `[fabric] command` was set already: nothing was done.
+    On,
+    /// The person turned it off ([`Unset::PersonOff`]): left as it is, and why.
+    Left(String),
+    /// `aterm fabric on`'s steps turned it on: what they said.
+    TurnedOn(String),
+}
+
+/// Turn the fabric on as `aterm fabric on` does with no flags (the platform's broker job, the
+/// fleet and durability the root keeps), its step lines kept rather than printed, and no proof
+/// (which would leave a note in a session's inbox nobody asked for): the converge pass's
+/// `sync.fabric` where the fabric was never turned off ([`unset_state`] reads [`Unset::Never`]),
+/// read again under the off's lock ([`by_default_in`]) so a person's `aterm fabric off` since the
+/// pass read it, or running now, stands. Nothing asks: `on` reads nothing from a terminal.
+///
+/// # Errors
+/// The state cannot be read, `on` cannot resolve its paths, or a step failed (what the steps
+/// said).
+pub fn turn_on_by_default() -> Result<ByDefault, String> {
+    match unset_state()? {
+        None => return Ok(ByDefault::On),
+        Some(Unset::PersonOff(why)) => return Ok(ByDefault::Left(why)),
+        Some(Unset::Never(_)) => {}
+    }
+    let opts = OnOpts::default();
+    let prepared = prepare_on(&opts)?;
+    by_default_in(
+        &prepared.p.root,
+        kept_off_record(&prepared.p).as_deref(),
+        &|| configured_command().map(|command| command.is_some()),
+        |out| on_steps(&prepared, &opts, Service::default_here(), out, Proof::Skip).map(|_| ()),
+    )
+}
+
+/// [`turn_on_by_default`] in the fabric root `root`, `steps` its run of `on`'s steps: under
+/// [`SWITCH_LOCK`], tried once (an `off` or `on` that holds it leaves the fabric as it is), the
+/// state read again (`command` says whether a bridge command is configured now),
+/// [`DEFAULT_RECORD`] left before the steps and taken out once they wrote `[fabric] command`
+/// (they returned `Ok`).
+fn by_default_in(
+    root: &Path,
+    kept: Option<&Path>,
+    command: &dyn Fn() -> Result<bool, String>,
+    steps: impl FnOnce(&mut Out) -> Result<(), ExitCode>,
+) -> Result<ByDefault, String> {
+    let _switch = match switch_lock(root, Duration::ZERO) {
+        Ok(lock) => lock,
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            return Ok(ByDefault::Left(
+                "an `aterm fabric off` or `on` runs now: the next pass reads what it left"
+                    .to_owned(),
+            ));
+        }
+        Err(e) => return Err(format!("{}: {e}", root.join(SWITCH_LOCK).display())),
+    };
+    match unset_in(root, kept, command()?) {
+        None => return Ok(ByDefault::On),
+        Some(Unset::PersonOff(why)) => return Ok(ByDefault::Left(why)),
+        Some(Unset::Never(_)) => {}
+    }
+    aterm_uds::private_file::write_private(root, DEFAULT_RECORD, b"")
+        .map_err(|e| format!("{}: {e}", root.join(DEFAULT_RECORD).display()))?;
+    let mut out = Out::kept();
+    let done = steps(&mut out);
+    if done.is_ok() {
+        clear_default_record(root).map_err(|why| format!("{}{why}", out.said()))?;
+    }
+    match done {
+        Ok(()) if !out.failed => Ok(ByDefault::TurnedOn(out.said())),
+        Ok(()) | Err(_) => Err(out.said()),
+    }
+}
+
 fn program_step(p: &Paths, out: &mut Out) -> bool {
     if p.program() == p.aterm {
         return true;
@@ -2036,39 +2459,413 @@ pub(crate) fn launchctl_list() -> String {
 /// What launchd's `gui/<uid>` domain says of a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LaunchdJob {
-    /// The domain holds no such job.
+    /// The domain holds no such job (`print` exits 113).
     Absent,
-    /// There is no `gui/<uid>` domain.
+    /// There is no `gui/<uid>` domain (`print` exits 112).
     NoGuiLogin,
     /// Loaded; `Some(pid)` while it runs.
     Loaded(Option<u32>),
+    /// `print` could not run, or exited otherwise: launchd said nothing of the job.
+    Unread,
 }
 
 const LAUNCHCTL_NO_DOMAIN: i32 = 112;
+const LAUNCHCTL_NO_SERVICE: i32 = 113;
 
 /// Query `launchctl print gui/<uid>/<label>`.
 pub(crate) fn launchd_job(label: &str) -> LaunchdJob {
-    let Ok(out) = aterm_uds::spawnfd::command(launchctl_program())
+    let (code, stdout) = launchd_print(label);
+    job_of(code, &stdout)
+}
+
+/// `launchctl print gui/<uid>/<label>`'s exit code and stdout; `(None, "")` where it could not
+/// run, which [`job_of`] reads as unread.
+fn launchd_print(label: &str) -> (Option<i32>, String) {
+    match aterm_uds::spawnfd::command(launchctl_program())
         .args(["print", &format!("gui/{}/{label}", uid())])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
-    else {
-        return LaunchdJob::Absent;
-    };
-    match out.status.code() {
-        Some(0) => LaunchdJob::Loaded(String::from_utf8_lossy(&out.stdout).lines().find_map(|l| {
+    {
+        Ok(out) => (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        ),
+        Err(_) => (None, String::new()),
+    }
+}
+
+/// The arguments launchd loaded a job with, as `print`'s `stdout` lists them (one to a line
+/// between `arguments = {` and its `}`, each trimmed); `None` where it lists none.
+fn printed_arguments(stdout: &str) -> Option<Vec<String>> {
+    let mut lines = stdout
+        .lines()
+        .map(str::trim)
+        .skip_while(|line| *line != "arguments = {");
+    lines.next()?;
+    let mut args = Vec::new();
+    for line in lines {
+        if line == "}" {
+            return Some(args);
+        }
+        args.push(line.to_string());
+    }
+    None
+}
+
+/// What the broker step rewrites of `p`'s plist, `old` the one on disk (`None`: no file) and
+/// `printed` what `print` said of the job (`loaded`: launchd holds it): the plist `on` writes
+/// where `old` is not it, and also where launchd holds the job loaded from other arguments than
+/// it (a plist written while the job stayed loaded), since a kickstart restarts what launchd
+/// loaded, not the file. A `print` that lists no arguments is read as the file's.
+fn launchd_rewrite(p: &Paths, old: Option<String>, loaded: bool, printed: &str) -> Option<Rewrite> {
+    let same = old.as_deref().is_some_and(|old| p.plist_is_current(old));
+    let argv = p.broker_argv();
+    let older = loaded
+        && printed_arguments(printed).is_some_and(|args| {
+            !args
+                .iter()
+                .map(String::as_str)
+                .eq(argv.iter().map(|a| a.trim()))
+        });
+    (!same || older).then(|| Rewrite {
+        text: p.plist_text(),
+        old,
+    })
+}
+
+/// What `print`'s exit `code` (`None`: killed by a signal) and `stdout` say of the job: only 113
+/// is "no such job".
+fn job_of(code: Option<i32>, stdout: &str) -> LaunchdJob {
+    match code {
+        Some(0) => LaunchdJob::Loaded(stdout.lines().find_map(|l| {
             l.trim()
                 .strip_prefix("pid = ")
                 .and_then(|p| p.trim().parse().ok())
         })),
         Some(LAUNCHCTL_NO_DOMAIN) => LaunchdJob::NoGuiLogin,
-        _ => LaunchdJob::Absent,
+        Some(LAUNCHCTL_NO_SERVICE) => LaunchdJob::Absent,
+        _ => LaunchdJob::Unread,
     }
 }
 
-pub(crate) fn launchd_loaded(label: &str) -> bool {
-    matches!(launchd_job(label), LaunchdJob::Loaded(_))
+/// Whether `launchctl print-disabled gui/<uid>` names `label` disabled (a person's `launchctl
+/// disable`, or its switch in Login Items turned off): its rows read `"<label>" => disabled`
+/// (`=> true` before macOS 13).
+///
+/// # Errors
+/// `print-disabled` could not run or failed: whether the job is disabled is not known.
+pub(crate) fn launchd_disabled(label: &str) -> Result<bool, String> {
+    let out = aterm_uds::spawnfd::command(launchctl_program())
+        .args(["print-disabled", &format!("gui/{}", uid())])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("`launchctl print-disabled` could not run: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "`launchctl print-disabled gui/{}` exited {}",
+            uid(),
+            out.status.code().unwrap_or(-1)
+        ));
+    }
+    Ok(disabled_in(&String::from_utf8_lossy(&out.stdout), label))
+}
+
+/// Whether `print-disabled`'s `text` names `label` disabled.
+fn disabled_in(text: &str, label: &str) -> bool {
+    let quoted = format!("\"{label}\"");
+    text.lines().any(|line| {
+        line.trim()
+            .strip_prefix(&quoted)
+            .and_then(|rest| rest.trim().strip_prefix("=>"))
+            .is_some_and(|state| matches!(state.trim(), "disabled" | "true"))
+    })
+}
+
+/// launchd as the broker step drives its job: the live `launchctl` ([`LiveLaunchd`]), or a test's
+/// fake, so the order of the step's verbs is proved with no launchd.
+pub(crate) trait Launchd {
+    /// What `launchctl print gui/<uid>/<label>` exits with and prints.
+    fn print(&self, label: &str) -> (Option<i32>, String);
+    /// What that `print` says of the job ([`job_of`]).
+    fn job(&self, label: &str) -> LaunchdJob {
+        let (code, printed) = self.print(label);
+        job_of(code, &printed)
+    }
+    /// `launchctl <args>`.
+    ///
+    /// # Errors
+    /// launchctl could not run or exited non-zero: the verb, its exit status and its stderr.
+    fn run(&self, args: &[&str]) -> Result<(), String>;
+    /// Write `text` to the plist at `plist` (0644, atomically: a failed write leaves the file as
+    /// it was).
+    ///
+    /// # Errors
+    /// The write failed: the path and the error.
+    fn write(&self, plist: &Path, text: &str) -> Result<(), String>;
+    /// Whether process `pid` still runs.
+    fn running(&self, pid: u32) -> bool;
+    /// Wait `pause` before the next look at a job launchd is still letting go.
+    fn pause(&self, pause: Duration);
+}
+
+/// The live `launchctl` (`$ATERM_TEST_LAUNCHCTL`'s stand-in in a test build).
+pub(crate) struct LiveLaunchd;
+
+impl Launchd for LiveLaunchd {
+    fn print(&self, label: &str) -> (Option<i32>, String) {
+        launchd_print(label)
+    }
+    fn run(&self, args: &[&str]) -> Result<(), String> {
+        launchctl(args)
+    }
+    fn write(&self, plist: &Path, text: &str) -> Result<(), String> {
+        write_atomic(plist, text.as_bytes(), 0o644).map_err(|e| format!("{}: {e}", plist.display()))
+    }
+    fn running(&self, pid: u32) -> bool {
+        aterm_uds::process::pid_alive(pid)
+    }
+    fn pause(&self, pause: Duration) {
+        std::thread::sleep(pause);
+    }
+}
+
+/// The most looks, [`GONE_POLL`] apart, the broker step takes at a job it booted out while it
+/// waits for launchd to let the job go, or at the process a `kickstart -k` killed: thirty
+/// seconds, past launchd's default `ExitTimeOut` (20 s from its SIGTERM to its SIGKILL; `on`'s
+/// plist sets none). launchd's `bootout` returns
+/// before the job is gone, and a `bootstrap` of the same label until then fails (`5:
+/// Input/output error`, `37: Operation already in progress`), which left the job unloaded.
+const GONE_POLLS: u32 = 300;
+
+const GONE_POLL: Duration = Duration::from_millis(100);
+
+/// The pause before the one bootstrap the step tries again: the label can stay busy a moment
+/// after `print` stops naming the job.
+const RETRY_PAUSE: Duration = Duration::from_secs(1);
+
+/// How [`launchd_up`] brought the job up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Up {
+    /// `kickstart -k`: the loaded job restarted in place.
+    InPlace,
+    /// `bootstrap` loaded the plist; `Some(errors)` where it did only after what failed first
+    /// (a kickstart, or the first bootstrap), as those verbs said it.
+    Loaded(Option<String>),
+    /// A `bootstrap` failed, and launchd holds the job after it all the same: what failed. The job
+    /// it let go was gone before that bootstrap, so this one is the plist's.
+    Held(String),
+}
+
+/// Wait until `gone` holds, [`GONE_POLLS`] looks [`GONE_POLL`] apart at most: whether it did.
+fn until_gone(lc: &dyn Launchd, gone: impl Fn() -> bool) -> bool {
+    for _ in 0..GONE_POLLS {
+        if gone() {
+            return true;
+        }
+        lc.pause(GONE_POLL);
+    }
+    gone()
+}
+
+/// Wait while launchd still holds `label`: whether it let it go. Only `print`'s "no such job"
+/// is gone: one it could not read ([`LaunchdJob::Unread`]) is waited out like a held one.
+fn let_go(lc: &dyn Launchd, label: &str) -> bool {
+    until_gone(lc, || {
+        matches!(lc.job(label), LaunchdJob::Absent | LaunchdJob::NoGuiLogin)
+    })
+}
+
+/// What launchd holds of the broker's job `label`, read once through `lc`: whether it is loaded,
+/// the pid it runs, and the rewrite the step makes ([`launchd_rewrite`] over the plist on disk,
+/// `old`, and the arguments that `print` lists). `Err` is a job the step leaves as it is: no GUI
+/// login, or a `print` that did not say.
+fn launchd_read(
+    lc: &dyn Launchd,
+    p: &Paths,
+    label: &str,
+    old: Option<String>,
+) -> Result<(bool, Option<u32>, Option<Rewrite>), LaunchdJob> {
+    let (code, printed) = lc.print(label);
+    let (loaded, running) = match job_of(code, &printed) {
+        LaunchdJob::Loaded(pid) => (true, pid),
+        LaunchdJob::Absent => (false, None),
+        other => return Err(other),
+    };
+    Ok((loaded, running, launchd_rewrite(p, old, loaded, &printed)))
+}
+
+/// The plist `on` writes, where the one on disk is not it: its text, and the text it replaces
+/// (`None` where there was no file), put back and loaded again where the new one does not load.
+pub(crate) struct Rewrite {
+    text: String,
+    old: Option<String>,
+}
+
+/// Bring launchd's job `label` up from `plist`, `loaded` saying whether launchd holds the job now
+/// and `running` the pid it runs, with `rewrite` where the plist on disk is not the one `on`
+/// writes. A loaded job whose plist is unchanged restarts in place (`kickstart -k`, which starts
+/// the file now at the plist's program path), with no moment it is unloaded, and the step waits
+/// for the process it killed to exit: `kickstart` returns before it has, and until then that
+/// process (the old build) can still answer on the socket. A kickstart that fails while launchd
+/// still holds the job leaves it loaded as it was. Otherwise a loaded job is booted out and waited
+/// for until launchd lets it go ([`let_go`]); only then is the plist written (so the plist on disk
+/// is never newer than a job launchd still holds) and bootstrapped, and a bootstrap that fails is
+/// tried once more, [`RETRY_PAUSE`] later. No job is stranded by the step: one launchd never lets
+/// go is never bootstrapped over or rewritten; one launchd holds after a failed bootstrap is that
+/// bootstrap's ([`Up::Held`]), never booted out again, which the wait for the broker judges; and
+/// where the rewritten plist does not load and `print` says launchd holds no job of the label,
+/// the one it replaced is put back and loaded, [`RETRY_PAUSE`] later.
+///
+/// # Errors
+/// What launchd holds now (the old job it did not let go or a kickstart did not restart, a killed
+/// process that did not exit, the replaced plist loaded again, or an installed plist it did not
+/// load), then each step that failed, in order, with what it said: the last one ends the error.
+fn launchd_up(
+    lc: &dyn Launchd,
+    label: &str,
+    plist: &Path,
+    (loaded, running): (bool, Option<u32>),
+    rewrite: Option<&Rewrite>,
+) -> Result<Up, String> {
+    let uid = uid();
+    let job = format!("gui/{uid}/{label}");
+    let domain = format!("gui/{uid}");
+    let plist_s = plist.to_string_lossy();
+    let shown = plist.display();
+    let mut failed = Vec::new();
+    let mut loaded = loaded;
+    if loaded && rewrite.is_none() {
+        match lc.run(&["kickstart", "-k", &job]) {
+            Ok(()) => {
+                return match running {
+                    Some(old) if !until_gone(lc, || !lc.running(old)) => Err(format!(
+                        "pid {old} of {job} still ran {} s after `launchctl kickstart -k` \
+                         killed it, so no broker of this build was started",
+                        (GONE_POLL * GONE_POLLS).as_secs()
+                    )),
+                    _ => Ok(Up::InPlace),
+                };
+            }
+            // A kickstart fails where launchd let the job go meanwhile: load it.
+            Err(e) if lc.job(label) == LaunchdJob::Absent => {
+                failed.push(e);
+                loaded = false;
+            }
+            Err(e) => {
+                return Err(format!(
+                    "launchd holds {job} (or did not say), and its `kickstart -k` failed, so it is \
+                     left loaded as it was: {e}"
+                ));
+            }
+        }
+    }
+    if loaded {
+        // A bootout of a job launchd let go meanwhile fails: the wait says whether it holds it.
+        let bootout = lc.run(&["bootout", &job]).err();
+        if !let_go(lc, label) {
+            failed.extend(bootout);
+            failed.push(format!(
+                "launchd still held {job} {} s after its bootout",
+                (GONE_POLL * GONE_POLLS).as_secs()
+            ));
+            return Err(format!(
+                "launchd still holds {job} as it was loaded before, so {shown} was neither \
+                 rewritten nor loaded: {}",
+                failed.join("; then ")
+            ));
+        }
+    }
+    let wrote = match rewrite {
+        Some(rewrite) => match lc.write(plist, &rewrite.text) {
+            Ok(()) => true,
+            // The write left the plist as it was: load that one again.
+            Err(e) => {
+                failed.push(e);
+                false
+            }
+        },
+        None => false,
+    };
+    // What `print` said after the last bootstrap that failed.
+    let mut after = LaunchdJob::Absent;
+    for attempt in 0..2 {
+        if attempt == 1 {
+            lc.pause(RETRY_PAUSE);
+        }
+        let up = match lc.run(&["bootstrap", &domain, &plist_s]) {
+            Ok(()) => Up::Loaded((!failed.is_empty()).then(|| failed.join("; then "))),
+            Err(e) => {
+                failed.push(e);
+                after = lc.job(label);
+                if !matches!(after, LaunchdJob::Loaded(_)) {
+                    continue;
+                }
+                Up::Held(failed.join("; then "))
+            }
+        };
+        // Loaded or held, the job is the plist on disk's: as it was, where the write failed.
+        if rewrite.is_some() && !wrote {
+            return Err(format!(
+                "{shown} could not be written, so launchd loaded it as it was: {}",
+                failed.join("; then ")
+            ));
+        }
+        return Ok(up);
+    }
+    // The plist it replaced goes back only where launchd says it holds no job of the label: one
+    // it did not say of may hold the new plist's.
+    let mut put_back = false;
+    if let (true, Some(Rewrite { old: Some(old), .. }), LaunchdJob::Absent) =
+        (wrote, rewrite, &after)
+    {
+        lc.pause(RETRY_PAUSE);
+        match lc.write(plist, old) {
+            Ok(()) => {
+                put_back = true;
+                let replaced = format!(
+                    "{shown} as `aterm fabric on` writes it did not load, so the plist it replaced \
+                     was put back"
+                );
+                match lc.run(&["bootstrap", &domain, &plist_s]) {
+                    Ok(()) => {
+                        return Err(format!(
+                            "{replaced} and launchd loaded that: {}",
+                            failed.join("; then ")
+                        ));
+                    }
+                    Err(e) => {
+                        failed.push(e);
+                        after = lc.job(label);
+                        if matches!(after, LaunchdJob::Loaded(_)) {
+                            return Err(format!(
+                                "{replaced}, and launchd holds the job after a bootstrap of it \
+                                 that failed: {}",
+                                failed.join("; then ")
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(e) => failed.push(e),
+        }
+    }
+    Err(format!(
+        "{shown}{} is installed but launchd has not loaded it{}, so nothing keeps the broker \
+         until `aterm fabric on` (or the next converge pass) loads it: {}",
+        if put_back {
+            " (the plist it replaced, put back)"
+        } else {
+            ""
+        },
+        if after == LaunchdJob::Unread {
+            " (or `launchctl print` did not say)"
+        } else {
+            ""
+        },
+        failed.join("; then ")
+    ))
 }
 
 fn refuse_no_gui_login(out: &mut Out) -> bool {
@@ -2112,6 +2909,88 @@ pub(crate) fn systemctl(args: &[&str]) -> Result<(), String> {
             safe(String::from_utf8_lossy(&out.stderr).trim(), 256)
         ))
     }
+}
+
+/// What `systemctl --user show -p MainPID -p UnitFileState <label>` says of the unit: the pid it
+/// runs, and whether a person turned it off (`disable` or `mask`).
+///
+/// # Errors
+/// No systemd user manager answered (a login with no user bus): nothing is known of the unit.
+fn systemd_unit(label: &str) -> Result<(Option<u32>, bool), String> {
+    let out = aterm_uds::spawnfd::command("systemctl")
+        .args([
+            "--user",
+            "show",
+            "-p",
+            "MainPID",
+            "-p",
+            "UnitFileState",
+            label,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("systemctl: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "no systemd user manager answers this login (`systemctl --user show` exited {}: {})",
+            out.status.code().unwrap_or(-1),
+            safe(String::from_utf8_lossy(&out.stderr).trim(), 256)
+        ));
+    }
+    Ok(systemd_shown(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// `systemctl show`'s `MainPID=` (0: none) and whether its `UnitFileState=` is one a person set
+/// to keep the unit from starting.
+fn systemd_shown(text: &str) -> (Option<u32>, bool) {
+    let value = |key: &str| {
+        text.lines()
+            .find_map(|line| line.trim().strip_prefix(key)?.strip_prefix('='))
+            .map(str::trim)
+    };
+    (
+        value("MainPID")
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .filter(|&pid| pid != 0),
+        value("UnitFileState")
+            .is_some_and(|state| matches!(state, "disabled" | "masked" | "masked-runtime")),
+    )
+}
+
+/// Bring systemd's user unit `label` up: write `text` (by `write`) where the unit on disk (`old`,
+/// `None`: no file) is not it, then `daemon-reload`, `enable` and `restart` it (by `systemctl`).
+/// A step that fails after the write puts `old` back, so the next pass reads the unit as changed
+/// and runs the step again, rather than reading the new file beside the process the old one
+/// started as current. A unit that had no file before is kept: it is `on`'s job either way.
+///
+/// # Errors
+/// The step that failed, with what it said, and whether the unit it replaced went back.
+fn systemd_up(
+    systemctl: &dyn Fn(&[&str]) -> Result<(), String>,
+    write: &dyn Fn(&[u8]) -> Result<(), String>,
+    label: &str,
+    old: Option<&[u8]>,
+    text: &[u8],
+) -> Result<(), String> {
+    let rewrite = old != Some(text);
+    if rewrite {
+        write(text)?;
+    }
+    let steps: [&[&str]; 3] = [&["daemon-reload"], &["enable", label], &["restart", label]];
+    for args in steps {
+        if let Err(e) = systemctl(args) {
+            return Err(match old.filter(|_| rewrite) {
+                Some(old) => match write(old) {
+                    Ok(()) => format!(
+                        "{e}; the unit it replaced was put back, so the next pass writes it again"
+                    ),
+                    Err(back) => format!("{e}; then putting back the unit it replaced: {back}"),
+                },
+                None => e,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn systemd_main_pid(label: &str) -> Option<u32> {
@@ -2245,16 +3124,27 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
         }
         Service::Launchd => {
             let plist = p.plist();
-            let text = p.plist_text();
-            let same = std::fs::read_to_string(&plist).is_ok_and(|old| p.plist_is_current(&old));
-            let running = match launchd_job(&label) {
-                LaunchdJob::NoGuiLogin => return refuse_no_gui_login(out),
-                LaunchdJob::Loaded(pid) => pid,
-                LaunchdJob::Absent => None,
+            let old = std::fs::read_to_string(&plist).ok();
+            let same = old.as_deref().is_some_and(|old| p.plist_is_current(old));
+            // The plist is written inside the step, once launchd let go of the job it replaces.
+            let (loaded, running, rewrite) = match launchd_read(&LiveLaunchd, p, &label, old) {
+                Ok(read) => read,
+                Err(LaunchdJob::NoGuiLogin) => return refuse_no_gui_login(out),
+                Err(_) => {
+                    out.fail(
+                        "broker",
+                        &format!(
+                            "`launchctl print gui/{}/{label}` did not say whether launchd holds \
+                             the job, so it is left as it is",
+                            uid()
+                        ),
+                    );
+                    return false;
+                }
             };
             let view = probe(p, node);
             let stale = not_current(p, &view);
-            if same && running.is_some() && view.read_ok() && stale.is_none() {
+            if rewrite.is_none() && running.is_some() && view.read_ok() && stale.is_none() {
                 out.already("plist", &plist.display().to_string());
                 out.already(
                     "broker",
@@ -2270,23 +3160,20 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
             }
             if same {
                 out.already("plist", &plist.display().to_string());
-            } else {
-                out.done(
-                    "plist",
-                    &format!("write {}", plist.display()),
-                    &format!("wrote {}", plist.display()),
-                );
-                if !out.dry_run {
-                    if let Err(e) = write_atomic(&plist, text.as_bytes(), 0o644) {
-                        out.fail("plist", &format!("{}: {e}", plist.display()));
-                        return false;
-                    }
-                }
+            } else if out.dry_run {
+                out.done("plist", &format!("write {}", plist.display()), "");
             }
-            let why = if running.is_none() {
+            let why = if !loaded {
                 "not loaded".to_string()
             } else if !same {
                 "the job changed".to_string()
+            } else if rewrite.is_some() {
+                format!(
+                    "launchd runs it from other arguments than {}",
+                    plist.display()
+                )
+            } else if running.is_none() {
+                "loaded but not running".to_string()
             } else if let (true, Some(stale)) = (view.read_ok(), stale) {
                 stale.to_string()
             } else {
@@ -2295,20 +3182,64 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
                     safe(view.error.as_deref().unwrap_or("-"), 128)
                 )
             };
-            out.done(
-                "broker",
-                &format!("(re)start launchd {label} ({why}) and wait for {sock}"),
-                &format!("(re)started launchd {label} ({why})"),
-            );
             if out.dry_run {
+                let how = if loaded && rewrite.is_none() {
+                    "restart launchd {label} in place (`launchctl kickstart -k`)"
+                } else if loaded {
+                    "reload launchd {label} (`bootout`, then `bootstrap` once launchd lets the job \
+                     go)"
+                } else {
+                    "load launchd {label} (`launchctl bootstrap`)"
+                }
+                .replace("{label}", &label);
+                out.done("broker", &format!("{how} ({why}) and wait for {sock}"), "");
                 return true;
             }
-            let domain = format!("gui/{}/{label}", uid());
-            let _ = launchctl(&["bootout", &domain]);
-            let plist_s = plist.to_string_lossy().into_owned();
-            if let Err(e) = launchctl(&["bootstrap", &format!("gui/{}", uid()), &plist_s]) {
-                out.fail("broker", &e);
-                return false;
+            let up = launchd_up(
+                &LiveLaunchd,
+                &label,
+                &plist,
+                (loaded, running),
+                rewrite.as_ref(),
+            );
+            if !same && up.is_ok() {
+                out.done("plist", "", &format!("wrote {}", plist.display()));
+            }
+            match up {
+                Ok(Up::InPlace) => out.done(
+                    "broker",
+                    "",
+                    &format!("restarted launchd {label} in place ({why})"),
+                ),
+                Ok(Up::Loaded(first)) => out.done(
+                    "broker",
+                    "",
+                    &format!(
+                        "{} launchd {label} ({why}){}",
+                        // A kickstart of a job launchd let go meanwhile booted nothing out.
+                        if loaded && rewrite.is_some() {
+                            "reloaded"
+                        } else {
+                            "loaded"
+                        },
+                        first.map_or_else(String::new, |first| format!(
+                            ", once these failed: {}",
+                            safe(&first, 512)
+                        ))
+                    ),
+                ),
+                Ok(Up::Held(failed)) => out.done(
+                    "broker",
+                    "",
+                    &format!(
+                        "launchd holds {label} ({why}) after a bootstrap that failed: {}",
+                        safe(&failed, 512)
+                    ),
+                ),
+                Err(e) => {
+                    out.fail("broker", &e);
+                    return false;
+                }
             }
             match wait_for_broker(p, node) {
                 Ok(view) => {
@@ -2343,7 +3274,8 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
         Service::Systemd => {
             let unit = p.unit();
             let text = p.unit_text();
-            let same = std::fs::read(&unit).is_ok_and(|old| old == text.as_bytes());
+            let old = std::fs::read(&unit).ok();
+            let same = old.as_deref() == Some(text.as_bytes());
             let running = systemd_main_pid(&label);
             let view = probe(p, node);
             if same && running.is_some() && view.read_ok() && not_current(p, &view).is_none() {
@@ -2371,12 +3303,6 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
                     &format!("write {}", unit.display()),
                     &format!("wrote {}", unit.display()),
                 );
-                if !out.dry_run {
-                    if let Err(e) = write_atomic(&unit, text.as_bytes(), 0o644) {
-                        out.fail("unit", &format!("{}: {e}", unit.display()));
-                        return false;
-                    }
-                }
             }
             let why = if running.is_none() {
                 "not running"
@@ -2396,16 +3322,13 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
             if out.dry_run {
                 return true;
             }
-            let steps: [&[&str]; 3] = [
-                &["daemon-reload"],
-                &["enable", &label],
-                &["restart", &label],
-            ];
-            for args in steps {
-                if let Err(e) = systemctl(args) {
-                    out.fail("broker", &e);
-                    return false;
-                }
+            let write = |bytes: &[u8]| {
+                write_atomic(&unit, bytes, 0o644).map_err(|e| format!("{}: {e}", unit.display()))
+            };
+            if let Err(e) = systemd_up(&systemctl, &write, &label, old.as_deref(), text.as_bytes())
+            {
+                out.fail("broker", &e);
+                return false;
             }
             match wait_for_broker(p, node) {
                 Ok(view) => {
@@ -2439,21 +3362,22 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
 pub enum BrokerRenewal {
     /// No `[fabric] command`: the fabric is off, and nothing of it was read or changed.
     Off,
-    /// The broker runs the build on disk, or none holds its socket now (`aterm fabric` says
-    /// why): what was found.
+    /// The broker runs the build on disk: what was found.
     Current(String),
-    /// The broker runs a build an update replaced, and `aterm fabric on`'s job does not keep it
-    /// (the person runs it: `--service none`, or a broker that is not the job `on` installed;
-    /// or the command names another socket than its root's): it is left as it is, and why.
+    /// The broker runs a build an update replaced, or none holds its socket, and `aterm fabric
+    /// on`'s job does not keep it (the person runs it: `--service none`, or a broker that is not
+    /// the job `on` installed; the command names another socket than its root's; no gui domain
+    /// here to load the job in; or `aterm fabric off`'s record stands): it is left as it is, and
+    /// why.
     Kept(String),
-    /// The broker runs a build an update replaced, and a look ([`Renew::Look`]) leaves it: which.
+    /// The broker runs a build an update replaced, or none holds its socket while the job `on`
+    /// installed is not loaded or runs no broker, and a look ([`Renew::Look`]) leaves it: which.
     Due(String),
-    /// It ran a replaced build, and `aterm fabric on`'s broker step renewed it: what that step
-    /// said.
+    /// It was due, and `aterm fabric on`'s broker step renewed it: what that step said.
     Renewed(String),
 }
 
-/// Whether [`renew_replaced_broker`] renews a broker that runs a replaced build, or only looks.
+/// Whether [`renew_replaced_broker`] renews a replaced or absent broker, or only looks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Renew {
     /// Read, and change nothing.
@@ -2472,15 +3396,26 @@ struct Found {
     service: Service,
     /// The pid that job runs now; `None` where it is not loaded or not running.
     job: Option<u32>,
+    /// Whether launchd holds that job (systemd: whether its unit runs a process), or why launchd
+    /// cannot be asked here (no gui domain in an SSH login, or a `print` that said nothing), so
+    /// nothing here loads it.
+    loaded: Result<bool, String>,
+    /// Whether launchd has that job disabled ([`launchd_disabled`]).
+    disabled: bool,
+    /// Whether a broker answers on the socket ([`fabric::answers`]), or why none does.
+    answers: Result<(), String>,
     view: fabric::BrokerView,
 }
 
-/// Renew this Mac's fabric broker where it runs a build an update replaced, with `aterm fabric
-/// on`'s broker step alone (its job (re)started as `on` restarts it, then waited for), nothing
-/// else of `on`: the converge pass's `sync.fabric`. Where `[fabric] command` is unset nothing is
-/// read and nothing changes, so it never turns the fabric on; a broker the person keeps
-/// (`--service none`, or one that is not the job `on` installed), or one at another socket than
-/// the command's root's, is left as it is. [`Renew::Look`] reads alone.
+/// Renew this Mac's fabric broker where it runs a build an update replaced, or where no broker
+/// answers on its socket while the job `on` installed is not loaded, runs none, or runs one that
+/// does not answer (an update's restart that left it unloaded, say), with `aterm fabric on`'s broker step alone (its job restarted or
+/// loaded as `on` does it, then waited for), nothing else of `on`: the converge pass's
+/// `sync.fabric`. Where `[fabric] command` is unset nothing is read and nothing changes, so it
+/// never turns the fabric on; a broker the person keeps (`--service none`, or one that is not the
+/// job `on` installed), one at another socket than the command's root's, one whose job launchd
+/// has disabled or cannot be asked about here, and any broker of a root where `aterm fabric
+/// off`'s record stands are left as they are. [`Renew::Look`] reads alone.
 ///
 /// # Errors
 /// aterm.toml, the root's role or installed job, or the command cannot be read, or the step
@@ -2501,7 +3436,12 @@ fn configured_command() -> Result<Option<Vec<String>>, String> {
 
 /// [`renew_replaced_broker`] over the configured `command`, with `look` resolving its root and
 /// naming its broker, and `step` running the broker step: nothing is looked at without a
-/// command, and the step runs only to [`Renew::Apply`] a replaced broker `on`'s job keeps.
+/// command, and the step runs only to [`Renew::Apply`] a replaced or missing broker `on`'s job
+/// keeps. An apply holds [`SWITCH_LOCK`], tried once, from before it reads the off's record to
+/// the step's end: an `aterm fabric off` or `on` running now leaves the broker for the next pass,
+/// and one that starts meanwhile waits for the step. A lock that cannot be taken (not held: the
+/// root cannot be made, say) is said beside the step's lines, and the apply goes on without it,
+/// as `off` does.
 fn renew_with(
     command: Option<Vec<String>>,
     renew: Renew,
@@ -2512,43 +3452,117 @@ fn renew_with(
         return Ok(BrokerRenewal::Off);
     };
     let found = look(&command)?;
+    // The root is never made here: a renewal whose root is gone steps without the lock, saying
+    // so, and leaves no empty root behind.
+    let (_switch, unlocked) = if renew == Renew::Apply {
+        match aterm_uds::private_file::PrivateLock::take(
+            &found.p.root,
+            SWITCH_LOCK,
+            Duration::ZERO,
+            "held",
+        ) {
+            Ok(lock) => (Some(lock), String::new()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                return Ok(BrokerRenewal::Kept(
+                    "an `aterm fabric off` or `on` runs now: the next pass reads what it left"
+                        .to_owned(),
+                ));
+            }
+            Err(e) => (
+                None,
+                format!(
+                    " (without {}: {e})",
+                    found.p.root.join(SWITCH_LOCK).display()
+                ),
+            ),
+        }
+    } else {
+        (None, String::new())
+    };
+    if let Some(record) = off_recorded(&found.p.root, kept_off_record(&found.p).as_deref()) {
+        return Ok(BrokerRenewal::Kept(format!(
+            "off by your choice: `aterm fabric off` recorded it ({}); `aterm fabric on` turns it \
+             on",
+            record.display()
+        )));
+    }
+    let hand = found.p.root.join(HAND_RECORD);
+    if std::fs::symlink_metadata(&hand).is_ok() {
+        return Ok(BrokerRenewal::Kept(format!(
+            "you run the broker: `aterm fabric on --service none` recorded it ({}); `aterm \
+             fabric on` hands it to launchd or systemd",
+            hand.display()
+        )));
+    }
     let pid = found
         .view
         .pid
         .map_or_else(|| "-".to_string(), |pid| pid.to_string());
-    let Some(exe) = found.view.replaced.as_deref() else {
-        return Ok(BrokerRenewal::Current(match found.view.pid {
-            Some(_) => format!("the broker (pid {pid}) runs the build on disk"),
-            None => format!(
-                "no broker holds {} now (`aterm fabric` says why)",
+    let which = match (found.view.replaced.as_deref(), &found.answers) {
+        (Some(exe), _) => format!(
+            "the broker (pid {pid}) runs a replaced build ({} is another file now)",
+            safe(exe, 256)
+        ),
+        (None, Ok(())) => {
+            return Ok(BrokerRenewal::Current(format!(
+                "the broker (pid {pid}) answers on {}, on the build on disk",
                 safe(&found.view.endpoint, 256)
-            ),
-        }));
+            )));
+        }
+        (None, Err(why)) => unserved(&found, why),
     };
-    let which = format!(
-        "the broker (pid {pid}) runs a replaced build ({} is another file now)",
-        safe(exe, 256)
-    );
     if let Some(why) = kept(&found) {
         return Ok(BrokerRenewal::Kept(format!("{which}; {why}")));
     }
     match renew {
         Renew::Look => Ok(BrokerRenewal::Due(which)),
-        Renew::Apply => step(&found).map(BrokerRenewal::Renewed),
+        Renew::Apply => {
+            step(&found).map(|said| BrokerRenewal::Renewed(format!("{said}{unlocked}")))
+        }
     }
 }
 
+/// `found`'s socket, on which no broker answers (`why`), and what the job `on` installed is doing
+/// meanwhile.
+fn unserved(found: &Found, why: &str) -> String {
+    let sock = safe(&found.view.endpoint, 256);
+    let label = found.p.label();
+    let job = match (found.service, &found.loaded, found.job) {
+        (Service::None, ..) | (_, Err(_), _) => String::new(),
+        (Service::Launchd, Ok(false), _) => {
+            format!(", and launchd has not loaded {label}, the job `aterm fabric on` installed")
+        }
+        (Service::Launchd, Ok(true), None) => {
+            format!(", and launchd holds {label} but runs no process of it")
+        }
+        (Service::Systemd, _, None) => format!(", and systemd --user {label} runs none"),
+        (service, Ok(_), Some(pid)) => format!(
+            ", though {} {label} runs pid {pid}",
+            if service == Service::Systemd {
+                "systemd --user"
+            } else {
+                "launchd"
+            }
+        ),
+    };
+    format!("no broker answers on {sock} ({}){job}", safe(why, 256))
+}
+
 /// Why `on`'s broker step leaves `found`'s broker as it is, where it does: no job of `on`'s, a
-/// socket other than its root's, or a broker that is not the process `on`'s job runs (one the
-/// person started by hand, with that job not loaded or running another process), which the step
-/// would refuse as unmanaged, or start the job over.
+/// socket other than its root's, a job launchd has disabled (the person's choice) or cannot be
+/// asked about here, or a broker that is not the process `on`'s job runs (one the person started
+/// by hand, with that job not loaded or running another process), which the step would refuse
+/// as unmanaged, or start the job over.
 fn kept(found: &Found) -> Option<String> {
     if found.service == Service::None {
-        return Some(
-            "no job of `aterm fabric on`'s keeps it (it runs as `--service none`): restart it \
-             yourself"
-                .to_string(),
-        );
+        return Some(format!(
+            "no job of `aterm fabric on`'s keeps it (it runs as `--service none`): {} it yourself",
+            if found.view.pid.is_some() {
+                "restart"
+            } else {
+                "start"
+            }
+        ));
     }
     let sock = found.p.sock();
     if found.view.endpoint != sock {
@@ -2557,25 +3571,50 @@ fn kept(found: &Found) -> Option<String> {
             safe(&found.view.endpoint, 256)
         ));
     }
-    (found.view.pid != found.job).then(|| {
-        let job = found.job.map_or_else(
-            || "is not running".to_string(),
-            |pid| format!("runs pid {pid}"),
-        );
-        format!(
-            "it is not the job `aterm fabric on` installed ({} {job}): you run it, so restart it \
-             yourself, or stop it and run `aterm fabric on`",
-            found.p.label()
-        )
-    })
+    let label = found.p.label();
+    if found.disabled {
+        return Some(if found.service == Service::Systemd {
+            format!(
+                "systemd --user has {label} disabled or masked, your choice: `systemctl --user \
+                 enable {label}` (after `unmask`, where masked) turns it back on"
+            )
+        } else {
+            format!(
+                "launchd has {label} disabled (`launchctl disable`, or its switch in Login Items \
+                 turned off), your choice: `launchctl enable gui/{}/{label}` (or that switch) \
+                 turns it back on",
+                uid()
+            )
+        });
+    }
+    if let Err(why) = &found.loaded {
+        return Some(format!(
+            "{why}, so nothing here loads {label}: `aterm fabric on` from a desktop login here does"
+        ));
+    }
+    match found.view.pid {
+        Some(pid) if Some(pid) != found.job => {
+            let job = found.job.map_or_else(
+                || "is not running".to_string(),
+                |pid| format!("runs pid {pid}"),
+            );
+            Some(format!(
+                "it is not the job `aterm fabric on` installed ({label} {job}): you run it, so \
+                 restart it yourself, or stop it and run `aterm fabric on`"
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// The root `command` points into, resolved as `on` resolves it (fleet, durability and node
 /// kept), its broker named as `aterm fabric` names it (the process holding the socket and
-/// whether an update replaced its build), and the pid the job `on` installed runs now. Nothing
-/// connects to it. The program is the one the installed job runs, not `on`'s (the `aterm` on
-/// `$PATH`): the renewal restarts the job onto the file an update put at its path and never
-/// points it at another aterm, so the plist `on` wrote stays as it is.
+/// whether an update replaced its build), the pid the job `on` installed runs now and whether a
+/// person turned that job off in launchd or systemd, and whether a broker answers on the socket
+/// ([`asked_twice`]; nothing is attached or read). A supervisor that does not say is an error in
+/// `loaded`. The program is the one the installed job runs, not `on`'s (the `aterm` on `$PATH`):
+/// the renewal restarts the job onto the file an update put at its path and never points it at
+/// another aterm, so the plist `on` wrote stays as it is.
 fn look_at(command: &[String]) -> Result<Found, String> {
     let cfg = fabric::bridge_config(command)?;
     let mut p = Paths::resolve(None)?;
@@ -2596,26 +3635,93 @@ fn look_at(command: &[String]) -> Result<Found, String> {
         }
         None => Service::None,
     };
-    let job = match service {
-        Service::Launchd => match launchd_job(&p.label()) {
-            LaunchdJob::Loaded(pid) => pid,
-            LaunchdJob::Absent | LaunchdJob::NoGuiLogin => None,
-        },
-        Service::Systemd => systemd_main_pid(&p.label()),
-        Service::None => None,
+    let label = p.label();
+    let (job, loaded, disabled) = match service {
+        Service::Launchd => with_disabled(
+            launchd_state(launchd_job(&label), &label),
+            launchd_disabled(&label),
+        ),
+        Service::Systemd => systemd_state(systemd_unit(&label)),
+        Service::None => (None, Ok(false), false),
     };
     let mut view = fabric::BrokerView {
         endpoint: cfg.broker,
         ..fabric::BrokerView::default()
     };
     view.locate();
+    let answers = asked_twice(
+        view.pid.is_some(),
+        || fabric::answers(&view.endpoint),
+        || std::thread::sleep(RETRY_PAUSE),
+    );
     Ok(Found {
         p,
         node,
         service,
         job,
+        loaded,
+        disabled,
+        answers,
         view,
     })
+}
+
+/// The pid launchd's `job` runs and whether it is loaded, or why that is not known.
+fn launchd_state(job: LaunchdJob, label: &str) -> (Option<u32>, Result<bool, String>) {
+    match job {
+        LaunchdJob::Loaded(pid) => (pid, Ok(true)),
+        LaunchdJob::Absent => (None, Ok(false)),
+        LaunchdJob::NoGuiLogin => (
+            None,
+            Err(format!("launchd has no gui/{} domain in this login", uid())),
+        ),
+        LaunchdJob::Unread => (
+            None,
+            Err(format!(
+                "`launchctl print` did not say whether launchd holds {label}"
+            )),
+        ),
+    }
+}
+
+/// launchd's `state` of the job with whether a person disabled it: where `print-disabled` did not
+/// say, the job reads as not known (`loaded` an error), never as enabled.
+fn with_disabled(
+    (job, loaded): (Option<u32>, Result<bool, String>),
+    disabled: Result<bool, String>,
+) -> (Option<u32>, Result<bool, String>, bool) {
+    match disabled {
+        Ok(disabled) => (job, loaded, disabled),
+        Err(why) => (job, Err(why), false),
+    }
+}
+
+/// The pid systemd's unit runs, whether it runs, and whether a person turned it off, from what
+/// `systemctl --user show` said ([`systemd_unit`]).
+fn systemd_state(
+    read: Result<(Option<u32>, bool), String>,
+) -> (Option<u32>, Result<bool, String>, bool) {
+    match read {
+        Ok((pid, disabled)) => (pid, Ok(pid.is_some()), disabled),
+        Err(why) => (None, Err(why), false),
+    }
+}
+
+/// Whether a broker answers, by `ask`: a socket a process holds (`held`) is asked once more,
+/// after `pause`, before it reads as unanswered, so a broker busy past one `Hello`'s timeout is
+/// not restarted for it.
+fn asked_twice(
+    held: bool,
+    ask: impl Fn() -> Result<(), String>,
+    pause: impl FnOnce(),
+) -> Result<(), String> {
+    match ask() {
+        Err(first) if held => {
+            pause();
+            ask().map_err(|then| format!("{first}; asked again: {then}"))
+        }
+        answered => answered,
+    }
 }
 
 /// `aterm fabric on`'s broker step over `found`, its lines kept: what it said, an error where it
@@ -2969,7 +4075,10 @@ fn prove(armed: &[Instance], out: &mut Out) -> Result<u64, String> {
         return Ok(0);
     }
     let mut ctl = Ctl::open(&inst.sock).map_err(|e| format!("{}: {e}", inst.sock))?;
-    let _ = ctl.get_ref().set_read_timeout(Some(IO_TIMEOUT));
+    // The post and the await each block up to the proof's deadline before they answer.
+    let _ = ctl
+        .get_ref()
+        .set_read_timeout(Some(PROOF_DEADLINE + IO_TIMEOUT));
     let _ = ctl.get_ref().set_write_timeout(Some(IO_TIMEOUT));
     let ask = |ctl: &mut Ctl, line: &str| -> Result<crate::ctl::Reply, String> {
         let r = ctl.request(line).map_err(|e| format!("`{line}`: {e}"))?;
@@ -3008,30 +4117,48 @@ fn prove(armed: &[Instance], out: &mut Out) -> Result<u64, String> {
                 safe(posted.header(), 128)
             )
         })?;
-    let left = PROOF_DEADLINE
-        .saturating_sub(started.elapsed())
-        .as_millis()
-        .max(1);
-    ask(
-        &mut ctl,
-        &format!("@{sid} await inbox since={since} kinds=note timeout={left}"),
-    )
-    .map_err(|e| {
+    let not_back = |why: &str| {
         format!(
-            "landed at @{off} but was not delivered back within {PROOF_DEADLINE:?}: {e}; check \
+            "landed at @{off} but was not delivered back within {PROOF_DEADLINE:?}: {why}; check \
              the cap file's `ro:/f/<F>/in/<node>/>` grant and `--accept-from`"
         )
-    })?;
-    let rows = ask(&mut ctl, &format!("@{sid} inbox --peek --meta"))?;
-    let delivered = rows.rows().iter().any(|r| {
-        r.starts_with("msg ")
-            && kv(r, "off") == Some(&off.to_string())
-            && kv(r, "kind") == Some("note")
-    });
-    if !delivered {
-        return Err(format!(
-            "landed at @{off}, but another sender's note was delivered first; run `on` again"
-        ));
+    };
+    let mut since = since;
+    loop {
+        let left = PROOF_DEADLINE
+            .saturating_sub(started.elapsed())
+            .as_millis()
+            .max(1);
+        let woke = ask(
+            &mut ctl,
+            &format!("@{sid} await inbox since={since} kinds=note timeout={left}"),
+        )
+        .map_err(|e| not_back(&e))?;
+        // `OK timeout` is the await's deadline passing: an OK that delivered nothing.
+        let Some(newest) = woke
+            .header()
+            .strip_prefix("OK inbox ")
+            .and_then(|id| id.trim().parse::<u64>().ok())
+        else {
+            return Err(not_back(&format!(
+                "the wait answered {}",
+                safe(woke.header(), 128)
+            )));
+        };
+        let rows = ask(
+            &mut ctl,
+            &format!("@{sid} inbox --peek --meta since={since}"),
+        )?;
+        let delivered = rows.rows().iter().any(|r| {
+            r.starts_with("msg ")
+                && kv(r, "off") == Some(&off.to_string())
+                && kv(r, "kind") == Some("note")
+        });
+        if delivered {
+            break;
+        }
+        // Another sender's note came first: wait past it for this one.
+        since = since.max(newest);
     }
     let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     out.ok(
@@ -3044,47 +4171,54 @@ fn prove(armed: &[Instance], out: &mut Out) -> Result<u64, String> {
     Ok(ms)
 }
 
+/// What `on` resolves before its first step: the paths (fleet and durability kept from the root
+/// and its installed job), and the tier that job names.
+struct Prepared {
+    p: Paths,
+    job_durability: Option<crate::durability::Durability>,
+    durability_job: Option<String>,
+}
+
+/// Resolve `on`'s paths for `opts`: the fleet the root already belongs to (a different
+/// `--fleet` refused) and the durability its installed job names.
+fn prepare_on(opts: &OnOpts) -> Result<Prepared, String> {
+    let mut p = Paths::resolve(opts.fleet.as_deref())?;
+    let role = Role::of(&p).map_err(|e| format!("cannot determine the existing role: {e}"))?;
+    if let Some(fleet) = role.fleet() {
+        if opts.fleet.as_deref().is_some_and(|asked| asked != fleet) {
+            return Err(format!(
+                "this root belongs to fleet {fleet}; run `aterm fabric off` before choosing \
+                 another fleet"
+            ));
+        }
+        p.fleet = fleet.to_string();
+    }
+    let (job_durability, durability_job) =
+        kept_durability(&p).map_err(|e| format!("cannot read the installed broker job: {e}"))?;
+    p.durability = opts.durability.or(job_durability);
+    Ok(Prepared {
+        p,
+        job_durability,
+        durability_job,
+    })
+}
+
 /// `aterm fabric on`.
 #[must_use]
 pub fn on(opts: &OnOpts) -> ExitCode {
-    let mut p = match Paths::resolve(opts.fleet.as_deref()) {
-        Ok(p) => p,
+    let prepared = match prepare_on(opts) {
+        Ok(prepared) => prepared,
         Err(e) => {
             eprintln!("aterm fabric on: {e}");
             return ExitCode::from(2);
         }
     };
-    let role = match Role::of(&p) {
-        Ok(role) => role,
-        Err(e) => {
-            eprintln!("aterm fabric on: cannot determine the existing role: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    if let Some(fleet) = role.fleet() {
-        if opts.fleet.as_deref().is_some_and(|asked| asked != fleet) {
-            eprintln!(
-                "aterm fabric on: this root belongs to fleet {fleet}; run `aterm fabric off` \
-                 before choosing another fleet"
-            );
-            return ExitCode::from(2);
-        }
-        p.fleet = fleet.to_string();
-    }
-    let (job_durability, durability_job) = match kept_durability(&p) {
-        Ok(kept) => kept,
-        Err(e) => {
-            eprintln!("aterm fabric on: cannot read the installed broker job: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    p.durability = opts.durability.or(job_durability);
     let service = opts.service.unwrap_or_else(Service::default_here);
     let mut out = Out::new(opts.dry_run);
     println!(
         "aterm fabric on — fleet {} · root {} · service {}{}",
-        safe(&p.fleet, 64),
-        p.root.display(),
+        safe(&prepared.p.fleet, 64),
+        prepared.p.root.display(),
         service.name(),
         if opts.dry_run {
             " · DRY RUN: every step printed, nothing touched"
@@ -3092,7 +4226,71 @@ pub fn on(opts: &OnOpts) -> ExitCode {
             ""
         }
     );
-    let kept_from = match (opts.durability, &durability_job) {
+    on_prepared(&prepared, &mut out, SWITCH_WAIT, |out| {
+        on_steps(&prepared, opts, service, out, Proof::Run)
+    })
+}
+
+/// `aterm fabric on` once its paths are `prepared`: `steps` (its run of `on`'s steps) under
+/// [`SWITCH_LOCK`], waited for at most `within`, so a turn-on or renewal the converge pass is
+/// making, or another `on` or `off`, finishes first and this one lands after it whole.
+fn on_prepared(
+    prepared: &Prepared,
+    out: &mut Out,
+    within: Duration,
+    steps: impl FnOnce(&mut Out) -> Result<Proved, ExitCode>,
+) -> ExitCode {
+    let _switch = match persons_switch(&prepared.p.root, "on", within, out) {
+        Ok(lock) => lock,
+        Err(code) => return code,
+    };
+    match steps(out) {
+        Ok(proof) => {
+            // The command is written: a turn-on the converge pass began and did not finish is
+            // finished.
+            if !out.dry_run {
+                if let Err(why) = clear_default_record(&prepared.p.root) {
+                    out.fail("record", &why);
+                }
+            }
+            finish_report(&prepared.p, out, out.dry_run, proof)
+        }
+        Err(code) => code,
+    }
+}
+
+/// Whether `on`'s steps end with the delivery proof (a note a session posts to itself, left in
+/// its inbox), or skip it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Proof {
+    Run,
+    Skip,
+}
+
+/// How `on`'s proof went: whether it failed, and whether it ran.
+#[derive(Debug, Clone, Copy)]
+struct Proved {
+    failed: bool,
+    ran: bool,
+}
+
+/// Every step of `on` for `prepared` on `out`, from the socket check to the armed instances and,
+/// where `proof` says, the proof: how the proof went, or the exit a step that stopped the run
+/// ends it with (its line already said why).
+fn on_steps(
+    prepared: &Prepared,
+    opts: &OnOpts,
+    service: Service,
+    out: &mut Out,
+    proof: Proof,
+) -> Result<Proved, ExitCode> {
+    let Prepared {
+        p,
+        job_durability,
+        durability_job,
+    } = prepared;
+    let job_durability = *job_durability;
+    let kept_from = match (opts.durability, durability_job) {
         (None, Some(job)) => format!(", kept from {job}"),
         _ => String::new(),
     };
@@ -3137,7 +4335,7 @@ pub fn on(opts: &OnOpts) -> ExitCode {
                 sock.len()
             ),
         );
-        return ExitCode::from(2);
+        return Err(ExitCode::from(2));
     }
     let state = p.state();
     let checked = [
@@ -3150,9 +4348,9 @@ pub fn on(opts: &OnOpts) -> ExitCode {
     .try_for_each(argv_safe);
     if let Err(e) = checked {
         out.fail("argv", &e);
-        return ExitCode::from(2);
+        return Err(ExitCode::from(2));
     }
-    match binary_has_link(&p) {
+    match binary_has_link(p) {
         Ok(()) => out.ok(
             "binary",
             &format!(
@@ -3164,12 +4362,12 @@ pub fn on(opts: &OnOpts) -> ExitCode {
         ),
         Err(e) => {
             out.fail("binary", &e);
-            return ExitCode::from(2);
+            return Err(ExitCode::from(2));
         }
     }
 
-    if !root_step(&p, &state, &mut out) || !program_step(&p, &mut out) {
-        return ExitCode::from(2);
+    if !root_step(p, &state, out) || !record_step(p, service, out) || !program_step(p, out) {
+        return Err(ExitCode::from(2));
     }
 
     let node = match read_node(&state) {
@@ -3182,7 +4380,7 @@ pub fn on(opts: &OnOpts) -> ExitCode {
                 Ok(hex) => format!("n-{hex}"),
                 Err(e) => {
                     out.fail("node", &format!("no entropy for a node id: {e}"));
-                    return ExitCode::from(2);
+                    return Err(ExitCode::from(2));
                 }
             };
             let file = state.join("node");
@@ -3222,7 +4420,7 @@ pub fn on(opts: &OnOpts) -> ExitCode {
                     }
                     Err(e) => {
                         out.fail("node", &e);
-                        return ExitCode::from(2);
+                        return Err(ExitCode::from(2));
                     }
                 }
             }
@@ -3249,7 +4447,7 @@ pub fn on(opts: &OnOpts) -> ExitCode {
                     crate::transport::describe(&secret_shown, &e)
                 ),
             );
-            return ExitCode::from(2);
+            return Err(ExitCode::from(2));
         }
         Err(_) => {
             out.done(
@@ -3265,7 +4463,7 @@ pub fn on(opts: &OnOpts) -> ExitCode {
                     .and_then(|b| aterm_uds::private_file::write_private(&p.root, MINT_SECRET, &b))
                 {
                     out.fail("secret", &format!("{}: {e}", secret.display()));
-                    return ExitCode::from(2);
+                    return Err(ExitCode::from(2));
                 }
             }
         }
@@ -3300,13 +4498,13 @@ pub fn on(opts: &OnOpts) -> ExitCode {
                         Ok(to) => Some(to),
                         Err(e) => {
                             out.fail("cap", &e.to_string());
-                            return ExitCode::FAILURE;
+                            return Err(ExitCode::FAILURE);
                         }
                     }
                 } else {
                     None
                 };
-                match mint_caps(&p, &node) {
+                match mint_caps(p, &node) {
                     Ok(n) => {
                         out.ok(
                             "cap",
@@ -3321,28 +4519,37 @@ pub fn on(opts: &OnOpts) -> ExitCode {
                             crate::state::take_back_aside(&cap, to);
                         }
                         out.fail("cap", &e);
-                        return ExitCode::FAILURE;
+                        return Err(ExitCode::FAILURE);
                     }
                 }
             }
         }
     }
 
-    let broker_ok = broker_step(&p, &node, service, opts.durability.is_some(), &mut out);
+    let broker_ok = broker_step(p, &node, service, opts.durability.is_some(), out);
     if !broker_ok && !opts.dry_run {
-        return ExitCode::FAILURE;
+        return Err(ExitCode::FAILURE);
     }
     let argv = p.bridge_command(&node);
-    finish(&p, &node, &argv, &mut out, opts.dry_run)
+    finish(p, &node, &argv, out, opts.dry_run, proof)
 }
 
-fn finish(p: &Paths, node: &str, argv: &[String], out: &mut Out, dry_run: bool) -> ExitCode {
+/// `on`'s steps after the broker: `[fabric] command`, the rendezvous file, the armed instances
+/// and, where `proof` says, the proof.
+fn finish(
+    p: &Paths,
+    node: &str,
+    argv: &[String],
+    out: &mut Out,
+    dry_run: bool,
+    proof: Proof,
+) -> Result<Proved, ExitCode> {
     let node = node.to_string();
     let state = p.state();
     let sock = p.sock();
     let cap = p.cap();
     if !config_step(p.config.as_deref(), argv, out) {
-        return ExitCode::FAILURE;
+        return Err(ExitCode::FAILURE);
     }
 
     let rendezvous = Rendezvous {
@@ -3391,19 +4598,46 @@ fn finish(p: &Paths, node: &str, argv: &[String], out: &mut Out, dry_run: bool) 
 
     let (running, armed) = arm_instances(argv, out);
 
-    let (proof_failed, proof_ran) = if armed.is_empty() {
+    Ok(if proof == Proof::Skip {
+        out.note(
+            "proof",
+            "skipped: it would post a note into a session's inbox that nobody asked for \
+             (`aterm fabric on` proves delivery; `aterm fabric` reports the broker)",
+        );
+        Proved {
+            failed: false,
+            ran: false,
+        }
+    } else if armed.is_empty() {
         out.note("proof", proof_skipped(running));
-        (false, false)
+        Proved {
+            failed: false,
+            ran: false,
+        }
     } else {
         match prove(&armed, out) {
-            Ok(_) => (false, true),
+            Ok(_) => Proved {
+                failed: false,
+                ran: true,
+            },
             Err(e) => {
                 out.fail("proof", &e);
-                (true, true)
+                Proved {
+                    failed: true,
+                    ran: true,
+                }
             }
         }
-    };
+    })
+}
 
+/// What `on` prints after its steps: the undo command, the summary, and the status report; the
+/// exit, a failed step or proof failing it.
+fn finish_report(p: &Paths, out: &mut Out, dry_run: bool, proof: Proved) -> ExitCode {
+    let Proved {
+        failed: proof_failed,
+        ran: proof_ran,
+    } = proof;
     if !dry_run {
         let program = if p.is_link_shim() {
             "aterm-link"
@@ -3549,6 +4783,41 @@ fn off_config_step(config: Option<&Path>, out: &mut Out) {
     );
 }
 
+/// `aterm fabric off`'s launchd step: boot `label` out of the GUI domain and remove its `plist`.
+/// A `print` that said nothing ([`LaunchdJob::Unread`]) is read as a job launchd may hold: the
+/// bootout runs, and its failure stands unless `print` then says launchd holds no such job.
+fn off_launchd(lc: &dyn Launchd, label: &str, plist: &Path, out: &mut Out) {
+    let job = lc.job(label);
+    let held = matches!(job, LaunchdJob::Loaded(_) | LaunchdJob::Unread);
+    if !held && !plist.exists() {
+        out.already("broker", &format!("launchd {label} is not installed"));
+        return;
+    }
+    out.done(
+        "broker",
+        &format!("bootout launchd {label} and remove {}", plist.display()),
+        &format!("launchd {label} stopped and {} removed", plist.display()),
+    );
+    if out.dry_run {
+        return;
+    }
+    // By domain, with no legacy `unload` fallback: that acts on the caller's domain and exits 0
+    // whatever it did.
+    if held {
+        let domain = format!("gui/{}/{label}", uid());
+        if let Err(e) = lc.run(&["bootout", &domain]) {
+            if !(job == LaunchdJob::Unread && lc.job(label) == LaunchdJob::Absent) {
+                out.fail("broker", &e);
+            }
+        }
+    }
+    if let Err(e) = std::fs::remove_file(plist) {
+        if e.kind() != io::ErrorKind::NotFound {
+            out.fail("broker", &format!("{}: {e}", plist.display()));
+        }
+    }
+}
+
 /// `aterm fabric off`.
 #[must_use]
 pub fn off(opts: &OffOpts) -> ExitCode {
@@ -3605,36 +4874,16 @@ pub fn off(opts: &OffOpts) -> ExitCode {
         );
         out.warn("held", &detail);
     }
+    // A turn-on or renewal the converge pass is making, or another `on` or `off`, finishes
+    // first, so this off lands after it whole.
+    let _switch = match persons_switch(&p.root, "off", SWITCH_WAIT, &mut out) {
+        Ok(lock) => lock,
+        Err(code) => return code,
+    };
+    off_record_step(&p, &mut out);
     let label = p.label();
     match service {
-        Service::Launchd => {
-            let plist = p.plist();
-            let loaded = launchd_loaded(&label);
-            if !loaded && !plist.exists() {
-                out.already("broker", &format!("launchd {label} is not installed"));
-            } else {
-                out.done(
-                    "broker",
-                    &format!("bootout launchd {label} and remove {}", plist.display()),
-                    &format!("launchd {label} stopped and {} removed", plist.display()),
-                );
-                if !opts.dry_run {
-                    // By domain, with no legacy `unload` fallback: that acts
-                    // on the caller's domain and exits 0 whatever it did.
-                    if loaded {
-                        let domain = format!("gui/{}/{label}", uid());
-                        if let Err(e) = launchctl(&["bootout", &domain]) {
-                            out.fail("broker", &e);
-                        }
-                    }
-                    if let Err(e) = std::fs::remove_file(&plist) {
-                        if e.kind() != io::ErrorKind::NotFound {
-                            out.fail("broker", &format!("{}: {e}", plist.display()));
-                        }
-                    }
-                }
-            }
-        }
+        Service::Launchd => off_launchd(&LiveLaunchd, &label, &p.plist(), &mut out),
         Service::Systemd => {
             let unit = p.unit();
             if !unit.exists() {
@@ -3889,10 +5138,12 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
                 "the broker's socket refuses this user: check its owner and mode".to_string()
             }
             cut if cut.starts_with("cut-") => {
-                "the broker is up and ended one subscription (the face after `cut-`), as astream \
-                 does to a reader that leaves its socket unread for the 30 s stream write bound: \
-                 a bridge stopped or starved that long, or a link that lost one connection — \
-                 nothing on the broker needs a restart"
+                "the broker is up and one subscription (the face after `cut-`) ended: the broker \
+                 ended it, as astream does to a reader that leaves its socket unread past its 30 s \
+                 stream write bound (a bridge stopped or starved that long); or it read nothing \
+                 for its 30 s live read deadline (a broker stalled that long, behind a slow disk \
+                 say); or the link lost that one connection. The bridge's line in the log names \
+                 which end it saw — nothing on the broker needs a restart"
                     .to_string()
             }
             "protocol" => protocol_remedy(&again),
@@ -3988,10 +5239,37 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
                  --cap-file <their cap> off`"
             )
         }
+    } else if s(fabric::RETENTION_GAVE_UP) {
+        format!(
+            "nothing brings those records back: aterm's broker rules keep unread mail {days} \
+             days within {} MiB of mail lanes and every other record (a broadcast too) {days} \
+             days within {} MiB, and let read mail go with the bulk stream's cut, so a bridge \
+             kept away that long, mail a session left unhandled across its restart, or a topic \
+             followed from far back lost what went. Each session told names the range (`aterm \
+             ctl @<sid> inbox --peek --meta`, `topic ls`) and marks it in its log (`aterm ctl \
+             @<sid> log kinds=mail-gap`): ask the senders again where it matters, and `inbox \
+             seen` what is handled. The node's line lasts while the instance runs, a session's \
+             while it names the range",
+            crate::broker_rules::MAIL_BYTES >> 20,
+            crate::broker_rules::DEFAULT_BYTES >> 20,
+            days = crate::broker_rules::MAX_AGE.as_secs() / 86_400,
+        )
     } else if s("lost") && s("evicted") {
         "read mail sooner (`aterm ctl @<sid> await inbox since=<id>`) and `inbox seen` what is \
          handled; the evicted records are still on the bus"
             .to_string()
+    } else if s(fabric::OVERDUE_UNJUDGED) {
+        format!(
+            "nothing on the bus is broken: the broker let a reply on the asker's lane go, so \
+             status cannot tell whether it answered these asks. The asker's inbox shows the \
+             answers it had, `re=` naming the ask's offset (`aterm ctl @<sid> inbox --peek` for \
+             a session, `aterm fabric inbox --cap-file <their cap> --peek` for a person); an ask \
+             still owed one is answered by whoever it was sent to, as an overdue one is. Nothing \
+             else clears the count: it falls as the broker lets those asks go (unread mail \
+             within {days} days) or the bus moves {span} records past them",
+            days = crate::broker_rules::MAX_AGE.as_secs() / 86_400,
+            span = fabric::OVERDUE_SCAN_SPAN,
+        )
     } else if s("passed its deadline") && s("@p passed") {
         "a person was asked: `aterm fabric inbox --cap-file <their cap>` shows it, and `aterm \
          fabric post --cap-file <their cap> to=@<sid>@<node> kind=answer re=<off> <text>` \
@@ -4065,8 +5343,11 @@ pub const PERSON_HOLD_LIFT: &str = "the person at the window took it over (Take 
 /// What lifts another Mac's hold (`origin=remote`, the step-in).
 pub const REMOTE_HOLD_LIFT: &str = "another Mac holds it over the fleet: that Mac's `aterm ctl \
      --host <this Mac> hold <sid> off` lifts it, or the person here takes it with Take Over and \
-     hands it back; once that Mac left the fleet, `aterm fleet peers rm <its node>` here (the \
-     survey's `held_from=`) ends its grant and lifts it";
+     hands it back, or lowers `aterm fleet allow` here; once that Mac left the fleet, `aterm \
+     fleet peers rm <its node>` (the survey's `held_from=`) lifts it too, run here where no \
+     \"*\" grant stands here (the rm ends a grant here that names the node), and under the \
+     \"*\" grant run on the fleet's issuer, once this Mac reads that book again (`aterm fleet \
+     peers` reads it now)";
 
 /// Which hold slots an `origin=` / `hold_origin=` list names (`person`,
 /// `remote`, `fleet`, `local`, comma-joined), each read as a whole word.
@@ -4479,30 +5760,314 @@ mod tests {
             p,
             node: Some("n-0123456789abcdef".to_string()),
             job: (service != Service::None).then_some(4242),
+            loaded: Ok(service != Service::None),
+            disabled: false,
+            answers: Ok(()),
             service,
         }
     }
 
+    /// A root `p` under `dir`, nothing configured.
+    fn scratch_paths(dir: &Path) -> Paths {
+        Paths {
+            home: dir.to_path_buf(),
+            login_home: None,
+            root: dir.join("root"),
+            aterm: "/nonexistent/bin/aterm".to_string(),
+            fleet: DEFAULT_FLEET.to_string(),
+            config: None,
+            rendezvous: None,
+            durability: None,
+        }
+    }
+
+    /// `aterm fabric off`'s record is written once (a second off says it stands already), a
+    /// configured command reads on over it, and `aterm fabric on` removes it and says nothing
+    /// where there is none.
+    /// NEGATIVE CONTROL: an `unset_in` that reads the record before the command reads a
+    /// configured command as the person's off.
+    #[test]
+    fn an_off_record_is_written_once_and_an_on_removes_it() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let p = scratch_paths(dir.path());
+        let mut out = Out::kept();
+        off_record_step(&p, &mut out);
+        assert!(!out.failed, "{}", out.said());
+        assert!(p.root.join(OFF_RECORD).exists(), "off records it");
+        assert_eq!(
+            unset_in(&p.root, None, true),
+            None,
+            "a command still reads on"
+        );
+        let mut out = Out::kept();
+        off_record_step(&p, &mut out);
+        assert!(out.said().contains("already"), "{}", out.said());
+        let mut out = Out::kept();
+        assert!(
+            record_step(&p, Service::Launchd, &mut out),
+            "{}",
+            out.said()
+        );
+        assert!(!p.root.join(OFF_RECORD).exists(), "on removes it");
+        let mut out = Out::kept();
+        assert!(record_step(&p, Service::Launchd, &mut out));
+        assert!(out.said().is_empty(), "nothing said with no record");
+    }
+
+    /// AN OFF OUTLIVES ITS FABRIC ROOT: `aterm fabric off` keeps its record beside aterm.toml too,
+    /// so a person who deletes the fabric root after an off (it keeps the node id, the secret, the
+    /// grants and the bus log) still reads off, and the converge pass leaves it; `aterm fabric on`
+    /// removes both records. aterm.toml's folder keeps its mode (the record is empty).
+    /// NEGATIVE CONTROL: with `off_recorded` reading the root's record alone, the deleted root
+    /// reads as never turned off and the pass turns the fabric on over the person's off.
+    #[test]
+    fn an_off_outlives_the_fabric_root_it_was_recorded_in() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let config_dir = dir.path().join("cfg/aterm");
+        std::fs::create_dir_all(&config_dir).expect("aterm.toml's folder");
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = || {
+                std::fs::metadata(&config_dir)
+                    .expect("mode")
+                    .permissions()
+                    .mode()
+            };
+            std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o755))
+                .expect("0755");
+            move || mode() & 0o777
+        };
+        let p = Paths {
+            config: Some(config_dir.join("aterm.toml")),
+            ..scratch_paths(dir.path())
+        };
+        let kept = kept_off_record(&p).expect("beside aterm.toml");
+        let mut out = Out::kept();
+        off_record_step(&p, &mut out);
+        assert!(!out.failed, "{}", out.said());
+        assert!(p.root.join(OFF_RECORD).exists(), "in the root");
+        assert!(kept.exists(), "beside aterm.toml");
+        #[cfg(unix)]
+        assert_eq!(mode(), 0o755, "aterm.toml's folder keeps its mode");
+        std::fs::remove_dir_all(&p.root).expect("the person tidies the root away");
+        let off = unset_in(&p.root, Some(&kept), false);
+        assert!(
+            matches!(&off, Some(Unset::PersonOff(why)) if why.contains(&*kept.to_string_lossy())),
+            "{off:?}"
+        );
+        let left = by_default_in(&p.root, Some(&kept), &|| Ok(false), |_| {
+            panic!("no steps over their off")
+        });
+        assert!(matches!(left, Ok(ByDefault::Left(_))), "{left:?}");
+        let mut out = Out::kept();
+        off_record_step(&p, &mut out);
+        assert!(!out.failed, "{}", out.said());
+        let mut out = Out::kept();
+        assert!(
+            record_step(&p, Service::Launchd, &mut out),
+            "{}",
+            out.said()
+        );
+        assert!(!p.root.join(OFF_RECORD).exists(), "on removes the root's");
+        assert!(!kept.exists(), "on removes the one beside aterm.toml");
+        assert!(
+            matches!(unset_in(&p.root, Some(&kept), false), Some(Unset::Never(_))),
+            "on again: the pass may turn it on"
+        );
+    }
+
+    /// A root an earlier `on` left without a node id (one that predates it, or set up by hand)
+    /// still reads as the person's off where it keeps the mint secret or the node grants.
+    /// NEGATIVE CONTROL: a read that looks for the node id alone turns such a root on over an off.
+    #[test]
+    fn a_root_with_no_node_id_that_an_earlier_on_left_reads_as_the_persons_off() {
+        for kept in [MINT_SECRET, "node.cap"] {
+            let dir = aterm_tempfile::tempdir().expect("scratch");
+            let root = dir.path().join("root");
+            std::fs::create_dir_all(root.join("link-state")).expect("state");
+            std::fs::write(root.join("link-state/lock"), b"").expect("lock");
+            assert!(
+                matches!(unset_in(&root, None, false), Some(Unset::Never(_))),
+                "{kept}: state alone is no off"
+            );
+            std::fs::write(root.join(kept), b"inert").expect("kept");
+            let read = unset_in(&root, None, false);
+            assert!(
+                matches!(&read, Some(Unset::PersonOff(why)) if why.contains(kept)),
+                "{kept}: {read:?}"
+            );
+            std::fs::write(root.join(DEFAULT_RECORD), b"").expect("by default");
+            assert!(
+                matches!(unset_in(&root, None, false), Some(Unset::Never(_))),
+                "{kept}: a root the pass began turning on"
+            );
+        }
+    }
+
+    /// The node id an `on`'s steps write, in `root`.
+    fn node_written(root: &Path) {
+        std::fs::create_dir_all(root.join("link-state")).expect("state");
+        std::fs::write(root.join("link-state/node"), "n-0123456789abcdef\n").expect("node");
+    }
+
+    /// The converge pass's turn-on, its steps a stand-in for `on`'s: the record stands while they
+    /// run and goes once they finished, so a command the person clears after reads as their off;
+    /// steps that fail leave it, so the root reads as never turned off and the next pass finishes
+    /// it.
+    /// NEGATIVE CONTROL: a turn-on that leaves no record before its steps reads its own failed
+    /// steps as the person's off for good, and one that never takes it out turns the fabric on
+    /// again over a command the person cleared.
+    #[test]
+    fn a_turn_on_by_default_records_itself_until_its_steps_finish() {
+        let no_command = || Ok(false);
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let root = dir.path().join("root");
+        let done = by_default_in(&root, None, &no_command, |out| {
+            assert!(root.join(DEFAULT_RECORD).exists(), "left before the steps");
+            node_written(&root);
+            out.ok("node", "n-0123456789abcdef");
+            Ok(())
+        })
+        .expect("turned on");
+        assert!(
+            matches!(&done, ByDefault::TurnedOn(said) if said.contains("node")),
+            "{done:?}"
+        );
+        assert!(
+            !root.join(DEFAULT_RECORD).exists(),
+            "taken out once it finished"
+        );
+        let read = unset_in(&root, None, false);
+        assert!(
+            matches!(&read, Some(Unset::PersonOff(_))),
+            "a command the person cleared after: {read:?}"
+        );
+        let left = by_default_in(&root, None, &no_command, |_| {
+            panic!("no steps over their off")
+        });
+        assert!(matches!(left, Ok(ByDefault::Left(_))), "{left:?}");
+
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let root = dir.path().join("root");
+        let failed = by_default_in(&root, None, &no_command, |out| {
+            node_written(&root);
+            out.fail("broker", "did not start");
+            Err(ExitCode::FAILURE)
+        });
+        assert!(
+            matches!(&failed, Err(said) if said.contains("did not start")),
+            "{failed:?}"
+        );
+        assert!(root.join(DEFAULT_RECORD).exists(), "kept for the next pass");
+        assert!(
+            matches!(unset_in(&root, None, false), Some(Unset::Never(_))),
+            "the next pass finishes it"
+        );
+    }
+
+    /// The turn-on reads the state again under the off's lock: an off recorded since the pass read
+    /// it, an off running now (holding the lock) and a command set since each leave the steps
+    /// unrun.
+    /// NEGATIVE CONTROL: a turn-on that trusts the pass's first read runs its steps (and removes
+    /// the off's record) over an off made since; one that skips the lock runs them midway through
+    /// an off.
+    #[test]
+    fn a_turn_on_by_default_stands_aside_for_an_off_made_since_or_running() {
+        let no_command = || Ok(false);
+        let unrun = |_: &mut Out| -> Result<(), ExitCode> { panic!("no steps") };
+
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let root = dir.path().join("root");
+        let p = scratch_paths(dir.path());
+        let mut out = Out::kept();
+        off_record_step(&p, &mut out);
+        let left = by_default_in(&root, None, &no_command, unrun);
+        assert!(
+            matches!(&left, Ok(ByDefault::Left(why)) if why.contains("aterm fabric off")),
+            "{left:?}"
+        );
+        assert!(root.join(OFF_RECORD).exists(), "the off's record stands");
+
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let root = dir.path().join("root");
+        let off = switch_lock(&root, Duration::ZERO).expect("the off's lock");
+        let left = by_default_in(&root, None, &no_command, unrun);
+        assert!(
+            matches!(&left, Ok(ByDefault::Left(why)) if why.contains("runs now")),
+            "{left:?}"
+        );
+        assert!(!root.join(DEFAULT_RECORD).exists(), "nothing written");
+        drop(off);
+
+        let on = by_default_in(&root, None, &|| Ok(true), unrun);
+        assert!(matches!(on, Ok(ByDefault::On)), "{on:?}");
+        assert!(!root.join(DEFAULT_RECORD).exists(), "nothing written");
+    }
+
+    /// A dry run says the record's step and writes nothing.
+    #[test]
+    fn a_dry_run_off_or_on_writes_and_removes_no_record() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let p = scratch_paths(dir.path());
+        let mut out = Out::new(true);
+        out.kept = Some(std::cell::RefCell::new(Vec::new()));
+        off_record_step(&p, &mut out);
+        assert!(out.said().contains("would"), "{}", out.said());
+        assert!(!p.root.exists(), "a dry off makes nothing");
+        std::fs::create_dir_all(&p.root).expect("root");
+        std::fs::write(p.root.join(OFF_RECORD), b"").expect("record");
+        let mut out = Out::new(true);
+        out.kept = Some(std::cell::RefCell::new(Vec::new()));
+        assert!(record_step(&p, Service::Launchd, &mut out));
+        assert!(p.root.join(OFF_RECORD).exists(), "a dry on keeps it");
+    }
+
+    /// An absent broker on `service`'s root (nothing answers on its socket and its job unloaded).
+    fn absent(service: Service) -> Found {
+        let mut at = found(service, None);
+        at.view.pid = None;
+        at.job = None;
+        at.loaded = Ok(false);
+        at.answers = Err("connect: Connection refused (os error 61)".to_string());
+        at
+    }
+
+    /// `at` with its fabric root at `root`, and its broker's endpoint with it where it named the
+    /// root's socket: an apply takes the switch lock in the root.
+    fn rooted(mut at: Found, root: &Path) -> Found {
+        let ours = at.view.endpoint == at.p.sock();
+        at.p.root = root.to_path_buf();
+        if ours {
+            at.view.endpoint = at.p.sock();
+        }
+        at
+    }
+
     /// The converge pass's broker renewal: with no `[fabric] command` nothing is looked at and
-    /// nothing runs; a broker on the build on disk reads current; one on a replaced build that
-    /// `on`'s job keeps is renewed once by the broker step (a look leaves it due); one the person
-    /// keeps (`--service none`, or one started by hand that is not the process `on`'s job runs,
-    /// with that job not loaded or running another), or at another socket, is left as it is.
+    /// nothing runs; a broker on the build on disk reads current; one on a replaced build is
+    /// renewed once by the broker step (a look leaves it due); one the person keeps
+    /// (`--service none`, or one started by hand that is not the process `on`'s job runs, with
+    /// that job not loaded or running another), or one at another socket, is left as it is.
     /// NEGATIVE CONTROLS: a renewal that reads no command as due runs the step with the fabric
-    /// off; one that takes any broker of a root with `on`'s job for that job's steps a broker
-    /// the person started by hand.
+    /// off; one that takes any broker of a root with `on`'s job for that job's steps a broker the
+    /// person started by hand. Absent sockets, `--service none` with no broker and an unavailable
+    /// supervisor are checked by
+    /// `a_broker_that_does_not_answer_is_due_where_the_job_on_installed_serves_none`.
     #[test]
     fn a_broker_is_renewed_only_where_the_fabric_is_on_and_it_runs_a_replaced_build() {
         use std::cell::Cell;
         let command = || Some(words("aterm link serve --broker /nonexistent/bus.sock"));
         let (looks, steps) = (Cell::new(0), Cell::new(0));
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        aterm_uds::private_file::ensure_private_dir(&dir.path().join("root")).expect("the root");
         let renew = |command: Option<Vec<String>>, renew: Renew, at: Found| {
             renew_with(
                 command,
                 renew,
                 |_: &[String]| {
                     looks.set(looks.get() + 1);
-                    Ok(at)
+                    Ok(rooted(at, &dir.path().join("root")))
                 },
                 |_: &Found| {
                     steps.set(steps.get() + 1);
@@ -4519,7 +6084,7 @@ mod tests {
         assert_eq!(
             (looks.get(), steps.get()),
             (0, 0),
-            "absent: nothing read or run"
+            "command unset: nothing read or run"
         );
 
         let current = renew(command(), Renew::Apply, found(Service::Launchd, None));
@@ -4575,6 +6140,696 @@ mod tests {
         assert_eq!(steps.get(), 1, "a broker the person keeps is left as it is");
     }
 
+    /// The update measured on m22 left `on`'s launchd job unloaded, and the next pass read the
+    /// missing broker as current. Where no broker answers on the root's socket, the job `on`
+    /// installed is due (a look) and stepped once (an apply) where launchd has not loaded it,
+    /// holds it running nothing, or runs a broker that does not answer, and where systemd runs
+    /// none. A broker that answers reads current whether or not the listener scan named it. It is
+    /// left as it is under `--service none`, at another socket, for a process the person started
+    /// that holds the socket, where launchd or systemd has the job disabled (or masked) or cannot
+    /// be asked about it, and where `aterm fabric off`'s record stands in the root, which keeps a
+    /// replaced broker too.
+    /// NEGATIVE CONTROLS: a renewal that reads a broker nobody answers for as current (as
+    /// measured), one blind to the off record, to a disabled job, to a login launchd cannot be
+    /// asked in, or to an answering broker the scan missed each fail it.
+    #[test]
+    fn a_broker_that_does_not_answer_is_due_where_the_job_on_installed_serves_none() {
+        use std::cell::Cell;
+        let steps = Cell::new(0);
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let root = dir.path().join("root");
+        aterm_uds::private_file::ensure_private_dir(&root).expect("the root");
+        let renew = |renew: Renew, at: Found| {
+            renew_with(
+                Some(words("aterm link serve --broker /nonexistent/bus.sock")),
+                renew,
+                |_: &[String]| Ok(rooted(at, &root)),
+                |_: &Found| {
+                    steps.set(steps.get() + 1);
+                    Ok("broker done loaded launchd".to_string())
+                },
+            )
+        };
+        let silent = |service: Service, loaded: bool, job: Option<u32>, pid: Option<u32>| {
+            let mut at = found(service, None);
+            at.view.pid = pid;
+            at.answers = Err("connect: Connection refused (os error 61)".to_string());
+            at.loaded = Ok(loaded);
+            at.job = job;
+            at
+        };
+        let sock = rooted(found(Service::Launchd, None), &root).p.sock();
+        for (service, loaded, job, pid, says) in [
+            (
+                Service::Launchd,
+                false,
+                None,
+                None,
+                "launchd has not loaded",
+            ),
+            (Service::Launchd, true, None, None, "runs no process of it"),
+            (Service::Launchd, true, Some(4343), None, "though launchd"),
+            (
+                Service::Launchd,
+                true,
+                Some(4242),
+                Some(4242),
+                "though launchd",
+            ),
+            (Service::Systemd, false, None, None, "systemd --user"),
+        ] {
+            let case = format!("{service:?} loaded={loaded} job={job:?} pid={pid:?}");
+            let look = renew(Renew::Look, silent(service, loaded, job, pid));
+            assert!(
+                matches!(&look, Ok(BrokerRenewal::Due(why))
+                    if why.starts_with(&format!("no broker answers on {sock} (connect: "))
+                        && why.contains(says)),
+                "{case}: {look:?}"
+            );
+            let before = steps.get();
+            let applied = renew(Renew::Apply, silent(service, loaded, job, pid));
+            assert!(
+                matches!(&applied, Ok(BrokerRenewal::Renewed(_))),
+                "{case}: {applied:?}"
+            );
+            assert_eq!(steps.get(), before + 1, "{case}: one step");
+        }
+        let stepped = steps.get();
+
+        let mut unnamed = found(Service::Launchd, None);
+        unnamed.view.pid = None;
+        let unnamed = renew(Renew::Apply, unnamed);
+        assert!(
+            matches!(&unnamed, Ok(BrokerRenewal::Current(_))),
+            "a broker that answers, though the scan named no process: {unnamed:?}"
+        );
+        let theirs = renew(Renew::Apply, silent(Service::None, false, None, None));
+        assert!(
+            matches!(&theirs, Ok(BrokerRenewal::Kept(why)) if why.contains("start it yourself")),
+            "{theirs:?}"
+        );
+        let by_hand = renew(
+            Renew::Apply,
+            silent(Service::Launchd, false, None, Some(999)),
+        );
+        assert!(
+            matches!(&by_hand, Ok(BrokerRenewal::Kept(why)) if why.contains("not the job")),
+            "{by_hand:?}"
+        );
+        let mut disabled = silent(Service::Launchd, false, None, None);
+        disabled.disabled = true;
+        let disabled = renew(Renew::Apply, disabled);
+        assert!(
+            matches!(&disabled, Ok(BrokerRenewal::Kept(why)) if why.contains("disabled")),
+            "{disabled:?}"
+        );
+        let mut masked = silent(Service::Systemd, false, None, None);
+        (masked.job, masked.loaded, masked.disabled) =
+            systemd_state(Ok(systemd_shown("MainPID=0\nUnitFileState=masked\n")));
+        let masked = renew(Renew::Apply, masked);
+        assert!(
+            matches!(&masked, Ok(BrokerRenewal::Kept(why)) if why.contains("systemctl --user enable")),
+            "{masked:?}"
+        );
+        let mut no_bus = silent(Service::Systemd, false, None, None);
+        (no_bus.job, no_bus.loaded, no_bus.disabled) =
+            systemd_state(Err("no systemd user manager answers this login".to_string()));
+        let no_bus = renew(Renew::Apply, no_bus);
+        assert!(
+            matches!(&no_bus, Ok(BrokerRenewal::Kept(why)) if why.contains("no systemd user manager")),
+            "{no_bus:?}"
+        );
+        let mut unasked = silent(Service::Launchd, false, None, None);
+        unasked.loaded = Err("launchd has no gui/501 domain in this login".to_string());
+        let unasked = renew(Renew::Apply, unasked);
+        assert!(
+            matches!(&unasked, Ok(BrokerRenewal::Kept(why)) if why.contains("no gui/501 domain")),
+            "{unasked:?}"
+        );
+        let mut elsewhere = silent(Service::Launchd, false, None, None);
+        elsewhere.view.endpoint = "/elsewhere/bus.sock".to_string();
+        let elsewhere = renew(Renew::Apply, elsewhere);
+        assert!(
+            matches!(&elsewhere, Ok(BrokerRenewal::Kept(why)) if why.contains("not its root's")),
+            "{elsewhere:?}"
+        );
+        std::fs::write(root.join(OFF_RECORD), b"").expect("the person's off");
+        for off in [
+            silent(Service::Launchd, false, None, None),
+            found(Service::Launchd, Some("/old/aterm")),
+        ] {
+            let off = renew(Renew::Apply, off);
+            assert!(
+                matches!(&off, Ok(BrokerRenewal::Kept(why)) if why.starts_with("off by your choice")),
+                "{off:?}"
+            );
+        }
+        assert_eq!(
+            steps.get(),
+            stepped,
+            "what the person keeps is never stepped"
+        );
+    }
+
+    /// A renewal's apply steps only under the switch `aterm fabric off` and `on` hold: one that
+    /// holds it now leaves the broker as it is (a look still reads it due), and one that starts
+    /// while the step runs finds it held. A lock that cannot be made (the root is a file, or gone,
+    /// which the renewal does not make) is said beside the step's lines.
+    /// NEGATIVE CONTROLS: a renewal that takes no lock steps midway through an off (which stops
+    /// the broker the step starts); one that lets it go before the step lets an off land midway
+    /// through it; one that reads any lock failure as held never renews a broker whose root
+    /// cannot hold the lock.
+    #[test]
+    fn a_broker_renewal_steps_only_under_the_switch_off_and_on_hold() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let root = dir.path().join("root");
+        let command = || Some(words("aterm link serve"));
+        let replaced = |root: &Path| rooted(found(Service::Launchd, Some("/old/aterm")), root);
+
+        let off = switch_lock(&root, Duration::ZERO).expect("an off's lock");
+        let kept = renew_with(
+            command(),
+            Renew::Apply,
+            |_: &[String]| Ok(replaced(&root)),
+            |_: &Found| panic!("no step while an off holds the switch"),
+        );
+        assert!(
+            matches!(&kept, Ok(BrokerRenewal::Kept(why)) if why.contains("runs now")),
+            "{kept:?}"
+        );
+        let due = renew_with(
+            command(),
+            Renew::Look,
+            |_: &[String]| Ok(replaced(&root)),
+            |_: &Found| panic!("a look runs no step"),
+        );
+        assert!(matches!(due, Ok(BrokerRenewal::Due(_))), "{due:?}");
+        drop(off);
+
+        let renewed = renew_with(
+            command(),
+            Renew::Apply,
+            |_: &[String]| Ok(replaced(&root)),
+            |at: &Found| {
+                let off = switch_lock(&at.p.root, Duration::ZERO);
+                assert!(
+                    matches!(&off, Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+                    "an off that starts during the step waits for it: {:?}",
+                    off.as_ref().err()
+                );
+                Ok("broker done (re)started launchd".to_string())
+            },
+        );
+        assert_eq!(
+            renewed,
+            Ok(BrokerRenewal::Renewed(
+                "broker done (re)started launchd".to_string()
+            ))
+        );
+        assert!(
+            switch_lock(&root, Duration::ZERO).is_ok(),
+            "let go once the step ends"
+        );
+
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, b"").expect("a file where the root goes");
+        let unlocked = renew_with(
+            command(),
+            Renew::Apply,
+            |_: &[String]| Ok(replaced(&file)),
+            |_: &Found| Ok("broker done (re)started launchd".to_string()),
+        );
+        assert!(
+            matches!(&unlocked, Ok(BrokerRenewal::Renewed(said))
+                if said.starts_with("broker done (re)started launchd (without ")),
+            "{unlocked:?}"
+        );
+        let gone = dir.path().join("gone");
+        let unlocked = renew_with(
+            command(),
+            Renew::Apply,
+            |_: &[String]| Ok(replaced(&gone)),
+            |_: &Found| Ok("broker done (re)started launchd".to_string()),
+        );
+        assert!(
+            matches!(&unlocked, Ok(BrokerRenewal::Renewed(said)) if said.contains("(without ")),
+            "{unlocked:?}"
+        );
+        assert!(!gone.exists(), "a root that is gone is not made");
+    }
+
+    /// A person's `aterm fabric on` runs its steps under the switch: one the converge pass's
+    /// turn-on or renewal, or another `on` or `off`, holds past the wait fails the command with
+    /// what to do and runs no step; one free is held while the steps run. A dry run takes none.
+    /// NEGATIVE CONTROLS: an `on` that takes no lock writes the root midway through an off or a
+    /// turn-on (its steps run while the switch is held), and one that lets it go before its steps
+    /// lets an off land midway through them.
+    #[test]
+    fn a_persons_fabric_on_runs_its_steps_under_the_switch() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let prepared = Prepared {
+            p: scratch_paths(dir.path()),
+            job_durability: None,
+            durability_job: None,
+        };
+        let root = prepared.p.root.clone();
+
+        let held = switch_lock(&root, Duration::ZERO).expect("a turn-on's lock");
+        let mut out = Out::kept();
+        let code = on_prepared(&prepared, &mut out, Duration::ZERO, |_| {
+            panic!("no step while the switch is held")
+        });
+        assert_eq!(code, ExitCode::FAILURE);
+        assert!(
+            out.said().contains("run `aterm fabric on` again"),
+            "{}",
+            out.said()
+        );
+        drop(held);
+
+        let mut out = Out::kept();
+        let code = on_prepared(&prepared, &mut out, Duration::ZERO, |_| {
+            let off = switch_lock(&root, Duration::ZERO);
+            assert!(
+                matches!(&off, Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+                "an off that starts during the steps waits for them: {:?}",
+                off.as_ref().err()
+            );
+            Err(ExitCode::from(7))
+        });
+        assert_eq!(code, ExitCode::from(7), "the steps' own exit");
+        assert!(
+            switch_lock(&root, Duration::ZERO).is_ok(),
+            "let go once the steps end"
+        );
+
+        let dry = aterm_tempfile::tempdir().expect("scratch");
+        let mut out = Out::new(true);
+        let lock = persons_switch(&dry.path().join("root"), "on", Duration::ZERO, &mut out);
+        assert!(matches!(lock, Ok(None)), "a dry run takes no lock");
+        assert!(!dry.path().join("root").exists(), "a dry run makes no root");
+    }
+
+    /// `aterm fabric on --service none` records that the person runs the broker, and the renewal
+    /// keeps a root with that record as it is, even where a plist an earlier `on` installed is
+    /// still there; an `on` that hands the broker to launchd takes the record out, and a dry run
+    /// writes none.
+    /// NEGATIVE CONTROLS: an `on --service none` that records nothing, or a renewal blind to the
+    /// record, loads the leftover plist over the broker the person keeps; an `on` that leaves the
+    /// record keeps a job it installed from ever being renewed.
+    #[test]
+    fn a_broker_the_person_keeps_with_service_none_is_never_renewed() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let p = scratch_paths(dir.path());
+        aterm_uds::private_file::ensure_private_dir(&p.root).expect("root, 0700 as `on` makes it");
+        let record = p.root.join(HAND_RECORD);
+
+        let mut out = Out::new(true);
+        out.kept = Some(std::cell::RefCell::new(Vec::new()));
+        assert!(hand_record_step(&p, Service::None, &mut out));
+        assert!(out.said().contains("would"), "{}", out.said());
+        assert!(!record.exists(), "a dry run writes no record");
+
+        let mut out = Out::kept();
+        assert!(
+            hand_record_step(&p, Service::None, &mut out),
+            "{}",
+            out.said()
+        );
+        assert!(record.exists(), "`on --service none` records it");
+
+        let renew = |renew: Renew| {
+            renew_with(
+                Some(words("aterm link serve")),
+                renew,
+                |_: &[String]| Ok(rooted(absent(Service::Launchd), &p.root)),
+                |_: &Found| panic!("no step for a broker the person keeps"),
+            )
+        };
+        for how in [Renew::Look, Renew::Apply] {
+            let kept = renew(how);
+            assert!(
+                matches!(&kept, Ok(BrokerRenewal::Kept(why)) if why.contains("--service none")),
+                "{how:?}: {kept:?}"
+            );
+        }
+
+        let mut out = Out::kept();
+        assert!(
+            record_step(&p, Service::Launchd, &mut out),
+            "{}",
+            out.said()
+        );
+        assert!(!record.exists(), "an `on` under launchd takes it out");
+        let due = renew_with(
+            Some(words("aterm link serve")),
+            Renew::Look,
+            |_: &[String]| Ok(rooted(absent(Service::Launchd), &p.root)),
+            |_: &Found| panic!("a look runs no step"),
+        );
+        assert!(matches!(due, Ok(BrokerRenewal::Due(_))), "{due:?}");
+    }
+
+    /// `aterm fabric off` boots out a job `print` did not say of: a print that said nothing is
+    /// not read as an unloaded job (whose plist the off would remove while launchd kept its
+    /// broker running), and the bootout's failure is excused only where `print` then says
+    /// launchd holds no such job. A job print says is absent, with no plist, is not installed.
+    /// NEGATIVE CONTROLS: an off that reads an unread print as unloaded runs no bootout of the
+    /// loaded job; one that excuses every failed bootout hides a job it did not stop; one that
+    /// excuses none fails an off of a job that was not loaded.
+    #[test]
+    fn an_off_boots_out_a_job_print_did_not_say_of() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let plist = dir.path().join("job.plist");
+
+        std::fs::write(&plist, "old").expect("plist");
+        let loaded = FakeLaunchd::new(true, 0);
+        loaded.unread.set(1);
+        let mut out = Out::kept();
+        off_launchd(&loaded, FAKE_LABEL, &plist, &mut out);
+        assert_eq!(loaded.calls(), ["print", "bootout"]);
+        assert!(!loaded.held(), "booted out");
+        assert!(!out.failed, "{}", out.said());
+        assert!(!plist.exists(), "removed");
+
+        std::fs::write(&plist, "old").expect("plist");
+        let unloaded = FakeLaunchd::new(false, 0);
+        unloaded.unread.set(1);
+        let mut out = Out::kept();
+        off_launchd(&unloaded, FAKE_LABEL, &plist, &mut out);
+        assert_eq!(unloaded.calls(), ["print", "bootout", "print"]);
+        assert!(!out.failed, "no such job: {}", out.said());
+        assert!(!plist.exists(), "removed");
+
+        let silent = FakeLaunchd::new(false, 0);
+        silent.unread.set(2);
+        let mut out = Out::kept();
+        off_launchd(&silent, FAKE_LABEL, &plist, &mut out);
+        assert!(
+            out.failed && out.said().contains("No such process"),
+            "print never said: {}",
+            out.said()
+        );
+
+        let absent = FakeLaunchd::new(false, 0);
+        let mut out = Out::kept();
+        off_launchd(&absent, FAKE_LABEL, &plist, &mut out);
+        assert_eq!(absent.calls(), ["print"]);
+        assert!(out.said().contains("not installed"), "{}", out.said());
+    }
+
+    /// The broker step reloads a job launchd loaded from other arguments than the plist on disk
+    /// (one written while the job stayed loaded), since a kickstart restarts what launchd loaded:
+    /// the reload boots it out, writes the plist again and bootstraps it. A job loaded from the
+    /// plist's arguments, one not loaded, or a `print` that lists none is read as the file's; a
+    /// plist that is not `on`'s is rewritten as before. The step reads launchd through the seam
+    /// (`launchd_read`), so the arguments it judges are the ones `print` listed.
+    /// NEGATIVE CONTROLS: a step that reads only the file kickstarts the older definition; one
+    /// whose read hands the rewrite no printed arguments does too.
+    #[test]
+    fn a_job_loaded_from_older_arguments_is_reloaded_not_kickstarted() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let p = scratch_paths(dir.path());
+        let current = p.plist_text();
+        let argv = p.broker_argv();
+        let printed = |args: &[String]| {
+            format!(
+                "gui/501/{} = {{\n\tstate = running\n\tprogram = {}\n\targuments = {{\n{}\t}}\n\n\t\
+                 inherited environment = {{\n\t\tA => b\n\t}}\n}}\n",
+                p.label(),
+                args[0],
+                args.iter().map(|a| format!("\t\t{a}\n")).collect::<String>()
+            )
+        };
+        assert_eq!(printed_arguments(&printed(&argv)), Some(argv.clone()));
+        assert_eq!(
+            printed_arguments("gui/501/x = {\n\tstate = running\n}\n"),
+            None
+        );
+
+        let older = argv[..argv.len() - 2].to_vec();
+        let reload = launchd_rewrite(&p, Some(current.clone()), true, &printed(&older))
+            .expect("loaded from older arguments: reloaded");
+        assert_eq!(reload.text, current);
+        assert_eq!(reload.old.as_deref(), Some(current.as_str()));
+        for (old, loaded, said, case) in [
+            (
+                Some(current.clone()),
+                true,
+                printed(&argv),
+                "the plist's arguments",
+            ),
+            (Some(current.clone()), false, printed(&older), "not loaded"),
+            (
+                Some(current.clone()),
+                true,
+                "state = running\n".to_string(),
+                "none listed",
+            ),
+        ] {
+            assert!(launchd_rewrite(&p, old, loaded, &said).is_none(), "{case}");
+        }
+        assert!(
+            launchd_rewrite(&p, Some("old".to_string()), true, &printed(&argv)).is_some(),
+            "a plist that is not on's"
+        );
+        assert!(launchd_rewrite(&p, None, false, "").is_some(), "no plist");
+
+        let lc = FakeLaunchd::new(true, 1);
+        *lc.plist.borrow_mut() = current.clone();
+        let up = launchd_up(
+            &lc,
+            FAKE_LABEL,
+            Path::new(FAKE_PLIST),
+            (true, None),
+            Some(&reload),
+        );
+        assert_eq!(up, Ok(Up::Loaded(None)), "{:?}", lc.calls());
+        assert_eq!(lc.count("kickstart"), 0, "{:?}", lc.calls());
+        assert_eq!(lc.running_from().as_deref(), Some(current.as_str()));
+
+        // The step's own read of launchd (`launchd_read`, the live one's `print` behind the seam):
+        // the arguments the job was loaded from are the ones the rewrite is judged on.
+        assert_eq!(plist_arguments(&current), argv);
+        let older_plist = argv[argv.len() - 2..]
+            .iter()
+            .fold(current.clone(), |text, a| {
+                text.replace(&format!("    <string>{a}</string>\n"), "")
+            });
+        assert_eq!(plist_arguments(&older_plist), older);
+        let lc = FakeLaunchd::new(true, 0);
+        *lc.loaded_from.borrow_mut() = older_plist;
+        let read = launchd_read(&lc, &p, FAKE_LABEL, Some(current.clone()));
+        assert!(
+            matches!(&read, Ok((true, None, Some(r))) if r.text == current),
+            "a job loaded from older arguments is reloaded"
+        );
+        *lc.loaded_from.borrow_mut() = current.clone();
+        let read = launchd_read(&lc, &p, FAKE_LABEL, Some(current.clone()));
+        assert!(
+            matches!(read, Ok((true, None, None))),
+            "one loaded from the plist's"
+        );
+        lc.loaded.set(false);
+        let read = launchd_read(&lc, &p, FAKE_LABEL, Some(current.clone()));
+        assert!(matches!(read, Ok((false, None, None))), "one not loaded");
+        lc.unread.set(1);
+        let read = launchd_read(&lc, &p, FAKE_LABEL, Some(current.clone()));
+        assert!(
+            matches!(read, Err(LaunchdJob::Unread)),
+            "a print that did not say"
+        );
+        assert_eq!(lc.count("print"), 4, "{:?}", lc.calls());
+    }
+
+    /// systemd's unit is written before `daemon-reload`, `enable` and `restart`; a step that fails
+    /// after the write puts the unit it replaced back, so the next pass reads the unit as changed
+    /// and runs the step again; a unit with no file before is kept, and one already on disk is
+    /// not written.
+    /// NEGATIVE CONTROL: a step with no put-back leaves the new unit beside the process the old
+    /// one started, which the next pass reads as current.
+    #[test]
+    fn a_systemd_restart_that_fails_puts_the_unit_it_replaced_back() {
+        use std::cell::RefCell;
+        let (calls, disk) = (
+            RefCell::new(Vec::<String>::new()),
+            RefCell::new(b"old".to_vec()),
+        );
+        let (calls, disk) = (&calls, &disk);
+        let failing = |verb: &'static str| {
+            move |args: &[&str]| {
+                calls.borrow_mut().push(args[0].to_string());
+                if args[0] == verb {
+                    Err(format!(
+                        "systemctl --user {} exited 1: failed",
+                        args.join(" ")
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        let write = |bytes: &[u8]| {
+            calls.borrow_mut().push("write".to_string());
+            *disk.borrow_mut() = bytes.to_vec();
+            Ok::<(), String>(())
+        };
+
+        let why = systemd_up(&failing("restart"), &write, "u", Some(b"old"), b"new")
+            .expect_err("the restart failed");
+        assert!(
+            why.contains("restart u exited 1") && why.contains("put back"),
+            "{why}"
+        );
+        assert_eq!(
+            *calls.borrow(),
+            ["write", "daemon-reload", "enable", "restart", "write"]
+        );
+        assert_eq!(*disk.borrow(), b"old", "the next pass reads it as changed");
+
+        calls.borrow_mut().clear();
+        *disk.borrow_mut() = Vec::new();
+        let why = systemd_up(&failing("enable"), &write, "u", None, b"new").expect_err("failed");
+        assert!(!why.contains("put back"), "{why}");
+        assert_eq!(*calls.borrow(), ["write", "daemon-reload", "enable"]);
+        assert_eq!(*disk.borrow(), b"new", "no unit before: kept");
+
+        calls.borrow_mut().clear();
+        assert_eq!(
+            systemd_up(&failing("none"), &write, "u", Some(b"new"), b"new"),
+            Ok(())
+        );
+        assert_eq!(*calls.borrow(), ["daemon-reload", "enable", "restart"]);
+    }
+
+    /// `print-disabled`'s rows name a label disabled as macOS 13 and later print it (`=>
+    /// disabled`) and as earlier ones did (`=> true`); an enabled row, another label, or one that
+    /// only starts with it, is not.
+    #[test]
+    fn a_disabled_job_is_read_off_print_disabled() {
+        let text = "\tdisabled services = {\n\
+                    \t\t\"com.example.other\" => disabled\n\
+                    \t\t\"systems.alab.astream-broker.n-1\" => enabled\n\
+                    \t\t\"systems.alab.astream-broker.n-2\" => disabled\n\
+                    \t\t\"systems.alab.astream-broker.n-3\" => true\n\
+                    \t\t\"systems.alab.astream-broker.n-4x\" => disabled\n\
+                    \t}\n";
+        assert!(!disabled_in(text, "systems.alab.astream-broker.n-1"));
+        assert!(disabled_in(text, "systems.alab.astream-broker.n-2"));
+        assert!(disabled_in(text, "systems.alab.astream-broker.n-3"));
+        assert!(!disabled_in(text, "systems.alab.astream-broker.n-4"));
+        assert!(!disabled_in(text, "systems.alab.astream-broker.n-5"));
+    }
+
+    /// What launchd and systemd say of the job, read fail-closed: only `print`'s 113 is "no such
+    /// job", any other failure says nothing; a unit a person disabled or masked is theirs; a
+    /// systemd that does not answer, like a launchd `print` or `print-disabled` that says
+    /// nothing, is not "stopped" or "enabled".
+    /// NEGATIVE CONTROLS: `print`'s other failures read as absent (the first review's finding),
+    /// `mask` not read as a person's choice, and a `MainPID=0` read as a pid each fail it.
+    #[test]
+    fn a_supervisor_that_does_not_say_is_not_read_as_a_stopped_job() {
+        let running = "\tstate = running\n\tpid = 4242\n";
+        assert_eq!(job_of(Some(0), running), LaunchdJob::Loaded(Some(4242)));
+        assert_eq!(
+            job_of(Some(0), "\tstate = not running\n"),
+            LaunchdJob::Loaded(None)
+        );
+        assert_eq!(job_of(Some(113), ""), LaunchdJob::Absent);
+        assert_eq!(job_of(Some(112), ""), LaunchdJob::NoGuiLogin);
+        for code in [Some(1), Some(5), Some(37), Some(125), None] {
+            assert_eq!(job_of(code, ""), LaunchdJob::Unread, "{code:?}");
+        }
+        let label = "systems.alab.astream-broker.x";
+        assert_eq!(launchd_state(LaunchdJob::Absent, label), (None, Ok(false)));
+        assert_eq!(
+            launchd_state(LaunchdJob::Loaded(Some(7)), label),
+            (Some(7), Ok(true))
+        );
+        for job in [LaunchdJob::Unread, LaunchdJob::NoGuiLogin] {
+            let (pid, loaded) = launchd_state(job, label);
+            assert!(pid.is_none() && loaded.is_err(), "{job:?}: {loaded:?}");
+        }
+
+        assert_eq!(
+            systemd_shown("MainPID=4242\nUnitFileState=enabled\n"),
+            (Some(4242), false)
+        );
+        assert_eq!(
+            systemd_shown("UnitFileState=disabled\nMainPID=0\n"),
+            (None, true)
+        );
+        for state in ["masked", "masked-runtime"] {
+            assert_eq!(
+                systemd_shown(&format!("MainPID=0\nUnitFileState={state}\n")),
+                (None, true),
+                "{state}"
+            );
+        }
+        for state in ["static", "linked", ""] {
+            assert_eq!(
+                systemd_shown(&format!("MainPID=0\nUnitFileState={state}\n")),
+                (None, false),
+                "{state}"
+            );
+        }
+        assert_eq!(
+            with_disabled((Some(7), Ok(true)), Ok(true)),
+            (Some(7), Ok(true), true)
+        );
+        let (_, loaded, disabled) = with_disabled(
+            (Some(7), Ok(true)),
+            Err("`launchctl print-disabled gui/501` exited 1".to_string()),
+        );
+        assert!(loaded.is_err() && !disabled, "{loaded:?}");
+        assert_eq!(
+            systemd_state(Ok((Some(9), false))),
+            (Some(9), Ok(true), false)
+        );
+        let (pid, loaded, disabled) = systemd_state(Err("no user bus".to_string()));
+        assert!(pid.is_none() && loaded.is_err() && !disabled);
+    }
+
+    /// A socket a process holds is asked twice before it reads as unanswered; one nobody holds
+    /// once. NEGATIVE CONTROL: asking once fails it.
+    #[test]
+    fn a_held_socket_is_asked_again_before_it_reads_unanswered() {
+        use std::cell::Cell;
+        let asks = Cell::new(0);
+        let pauses = Cell::new(0);
+        let busy_once = || {
+            asks.set(asks.get() + 1);
+            if asks.get() == 1 {
+                Err("hello: Resource temporarily unavailable".to_string())
+            } else {
+                Ok(())
+            }
+        };
+        assert_eq!(
+            asked_twice(true, busy_once, || pauses.set(pauses.get() + 1)),
+            Ok(())
+        );
+        assert_eq!((asks.get(), pauses.get()), (2, 1));
+
+        asks.set(0);
+        let never = || {
+            asks.set(asks.get() + 1);
+            Err(format!("connect: refused {}", asks.get()))
+        };
+        assert_eq!(
+            asked_twice(true, never, || ()),
+            Err("connect: refused 1; asked again: connect: refused 2".to_string())
+        );
+        asks.set(0);
+        assert_eq!(
+            asked_twice(false, never, || panic!(
+                "nothing holds the socket: no pause"
+            )),
+            Err("connect: refused 1".to_string())
+        );
+        assert_eq!(asks.get(), 1);
+    }
+
     /// A kept `Out` prints nothing and hands back what it said; a step it ran without a node id
     /// fails, naming the remedy.
     #[test]
@@ -4596,6 +6851,567 @@ mod tests {
 
     fn words(line: &str) -> Vec<String> {
         aterm_types::fabric_command::split_line(line)
+    }
+
+    /// launchd as the measured Mac's behaved, in memory: `bootout` returns at once while the job
+    /// stays held for `lingers` more `print`s, a `bootstrap` of a label launchd still holds fails
+    /// as launchd fails it (`5: Input/output error`), and `kickstart -k` restarts only a loaded
+    /// job, the process it killed running `lingers` more looks. The plist on disk starts as
+    /// `old`. Each verb is recorded by its first word, a plist write as `write`.
+    struct FakeLaunchd {
+        loaded: std::cell::Cell<bool>,
+        /// The plist text the loaded job was loaded from.
+        loaded_from: std::cell::RefCell<String>,
+        /// The plist on disk.
+        plist: std::cell::RefCell<String>,
+        /// The `print`s a booted-out job is still held for.
+        letting_go: std::cell::Cell<u32>,
+        /// How many `print`s each bootout leaves it held for.
+        lingers: u32,
+        /// The `print`s that say nothing ([`LaunchdJob::Unread`]).
+        unread: std::cell::Cell<u32>,
+        /// Bootstraps that fail even with the label free, before one loads.
+        refusals: std::cell::Cell<u32>,
+        /// The refused bootstrap (counted from 1) that loads the job all the same; 0 for none.
+        loads_anyway: std::cell::Cell<u32>,
+        /// The bootstraps refused so far.
+        refused: std::cell::Cell<u32>,
+        /// Whether a kickstart fails even for a loaded job (a disabled one: `119`).
+        kick_refused: std::cell::Cell<bool>,
+        /// Whether a plist write fails.
+        write_fails: std::cell::Cell<bool>,
+        /// The looks the process a `kickstart -k` killed still runs for.
+        exiting: std::cell::Cell<u32>,
+        calls: std::cell::RefCell<Vec<String>>,
+        pauses: std::cell::Cell<u32>,
+    }
+
+    impl FakeLaunchd {
+        fn new(loaded: bool, lingers: u32) -> Self {
+            Self {
+                loaded: std::cell::Cell::new(loaded),
+                loaded_from: std::cell::RefCell::new("old".to_string()),
+                plist: std::cell::RefCell::new("old".to_string()),
+                letting_go: std::cell::Cell::new(0),
+                lingers,
+                unread: std::cell::Cell::new(0),
+                refusals: std::cell::Cell::new(0),
+                loads_anyway: std::cell::Cell::new(0),
+                refused: std::cell::Cell::new(0),
+                kick_refused: std::cell::Cell::new(false),
+                write_fails: std::cell::Cell::new(false),
+                exiting: std::cell::Cell::new(0),
+                calls: std::cell::RefCell::new(Vec::new()),
+                pauses: std::cell::Cell::new(0),
+            }
+        }
+
+        fn held(&self) -> bool {
+            self.loaded.get() || self.letting_go.get() > 0
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+
+        fn count(&self, verb: &str) -> usize {
+            self.calls.borrow().iter().filter(|c| *c == verb).count()
+        }
+
+        fn on_disk(&self) -> String {
+            self.plist.borrow().clone()
+        }
+
+        fn running_from(&self) -> Option<String> {
+            self.loaded.get().then(|| self.loaded_from.borrow().clone())
+        }
+    }
+
+    /// The `ProgramArguments` of plist `text`, as `on` writes them (one `<string>` a line); none
+    /// for a text that is no such plist.
+    fn plist_arguments(text: &str) -> Vec<String> {
+        let Some((_, rest)) = text.split_once("<key>ProgramArguments</key>") else {
+            return Vec::new();
+        };
+        let array = rest.split_once("</array>").map_or(rest, |(array, _)| array);
+        array
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("<string>")?.strip_suffix("</string>"))
+            .map(|a| {
+                a.replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&quot;", "\"")
+                    .replace("&apos;", "'")
+                    .replace("&amp;", "&")
+            })
+            .collect()
+    }
+
+    impl Launchd for FakeLaunchd {
+        fn print(&self, label: &str) -> (Option<i32>, String) {
+            self.calls.borrow_mut().push("print".to_string());
+            if self.unread.get() > 0 {
+                self.unread.set(self.unread.get() - 1);
+                return (None, String::new());
+            }
+            let held = self.held();
+            self.letting_go.set(self.letting_go.get().saturating_sub(1));
+            if !held {
+                return (Some(LAUNCHCTL_NO_SERVICE), String::new());
+            }
+            // launchd lists the arguments of the plist it loaded the job from, where it has some.
+            let args = plist_arguments(&self.loaded_from.borrow());
+            let listed = if args.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\targuments = {{\n{}\t}}\n",
+                    args.iter()
+                        .map(|a| format!("\t\t{a}\n"))
+                        .collect::<String>()
+                )
+            };
+            (
+                Some(0),
+                format!("gui/501/{label} = {{\n\tstate = running\n{listed}}}\n"),
+            )
+        }
+
+        fn run(&self, args: &[&str]) -> Result<(), String> {
+            self.calls.borrow_mut().push(args[0].to_string());
+            let failed = |code: i32, why: &str| {
+                Err(format!("launchctl {} exited {code}: {why}", args.join(" ")))
+            };
+            let load = || {
+                self.loaded.set(true);
+                *self.loaded_from.borrow_mut() = self.on_disk();
+            };
+            match args[0] {
+                "bootout" if self.loaded.get() => {
+                    self.loaded.set(false);
+                    self.letting_go.set(self.lingers);
+                    Ok(())
+                }
+                "bootout" => failed(3, "Boot-out failed: 3: No such process"),
+                "bootstrap" if self.held() => failed(5, "Bootstrap failed: 5: Input/output error"),
+                "bootstrap" if self.refusals.get() > 0 => {
+                    self.refusals.set(self.refusals.get() - 1);
+                    self.refused.set(self.refused.get() + 1);
+                    if self.loads_anyway.get() == self.refused.get() {
+                        load();
+                    }
+                    failed(5, "Bootstrap failed: 5: Input/output error")
+                }
+                "bootstrap" => {
+                    load();
+                    Ok(())
+                }
+                "kickstart" if self.kick_refused.get() => failed(119, "Service is disabled"),
+                "kickstart" if self.loaded.get() => {
+                    self.exiting.set(self.lingers);
+                    Ok(())
+                }
+                "kickstart" => failed(113, "Could not find service"),
+                other => panic!("launchctl {other} is not the broker step's"),
+            }
+        }
+
+        fn write(&self, plist: &Path, text: &str) -> Result<(), String> {
+            self.calls.borrow_mut().push("write".to_string());
+            if self.write_fails.get() {
+                return Err(format!(
+                    "{}: Permission denied (os error 13)",
+                    plist.display()
+                ));
+            }
+            *self.plist.borrow_mut() = text.to_string();
+            Ok(())
+        }
+
+        fn running(&self, pid: u32) -> bool {
+            assert_eq!(pid, 4242, "only the pid the job ran is waited for");
+            let running = self.exiting.get() > 0;
+            self.exiting.set(self.exiting.get().saturating_sub(1));
+            running
+        }
+
+        fn pause(&self, _pause: Duration) {
+            self.pauses.set(self.pauses.get() + 1);
+        }
+    }
+
+    const FAKE_PLIST: &str = "/nonexistent/LaunchAgents/systems.alab.astream-broker.x.plist";
+    const FAKE_LABEL: &str = "systems.alab.astream-broker.x";
+
+    fn rewrite(old: Option<&str>) -> Rewrite {
+        Rewrite {
+            text: "new".to_string(),
+            old: old.map(str::to_string),
+        }
+    }
+
+    /// The renewal measured on m22 after an update: a loaded job booted out and bootstrapped at
+    /// once failed (launchd's bootout returns before the job is gone) and left the job unloaded.
+    /// The step now boots a job whose plist changed out, waits for launchd to let it go, and only
+    /// then writes the plist and bootstraps it, once more after a failed bootstrap; an unchanged
+    /// plist restarts in place with `kickstart -k`, never unloaded, once the process it killed
+    /// exits, and a kickstart of a job launchd let go meanwhile loads the plist; a job is never
+    /// booted out twice, so one a failed bootstrap loaded all the same stays loaded.
+    /// NEGATIVE CONTROLS: a step that bootstraps with no wait (`let_go` answering `true` at once)
+    /// bootstraps against a job launchd still holds; one that boots the job out again before its
+    /// retry (as the handoff's did) unloads the job a failed bootstrap loaded; one that takes a
+    /// kickstart's return for the old process's exit does not wait for it; one that retries with
+    /// no pause, or writes the plist before the bootout, is caught by the calls.
+    #[test]
+    fn a_reload_waits_for_launchd_to_let_the_job_go_and_an_unchanged_job_restarts_in_place() {
+        let (plist, label) = (Path::new(FAKE_PLIST), FAKE_LABEL);
+
+        let changed = FakeLaunchd::new(true, 3);
+        assert_eq!(
+            launchd_up(
+                &changed,
+                label,
+                plist,
+                (true, Some(4242)),
+                Some(&rewrite(Some("old")))
+            ),
+            Ok(Up::Loaded(None))
+        );
+        assert_eq!(
+            changed.calls(),
+            [
+                "bootout",
+                "print",
+                "print",
+                "print",
+                "print",
+                "write",
+                "bootstrap"
+            ],
+            "written and bootstrapped once launchd let the job go"
+        );
+        assert_eq!(changed.pauses.get(), 3, "the wait polled");
+        assert_eq!(changed.running_from().as_deref(), Some("new"));
+
+        // `print` stops naming the job before launchd takes the label again: the first bootstrap
+        // fails, and the step tries once more, a pause later, never booting the job out again.
+        let busy = FakeLaunchd::new(true, 1);
+        busy.refusals.set(1);
+        let up = launchd_up(
+            &busy,
+            label,
+            plist,
+            (true, Some(4242)),
+            Some(&rewrite(Some("old"))),
+        );
+        assert!(
+            matches!(&up, Ok(Up::Loaded(Some(first))) if first.contains("launchctl bootstrap")
+                && first.contains("5: Input/output error")),
+            "{up:?}"
+        );
+        assert_eq!(
+            (busy.count("bootout"), busy.count("bootstrap")),
+            (1, 2),
+            "{:?}",
+            busy.calls()
+        );
+        assert_eq!(
+            busy.pauses.get(),
+            2,
+            "the wait's look, then the retry's pause"
+        );
+        assert_eq!(busy.running_from().as_deref(), Some("new"));
+
+        // A bootstrap that fails and loads the job all the same: launchd holds the plist's job,
+        // which stays loaded for the wait for the broker to judge.
+        let loaded_anyway = FakeLaunchd::new(true, 1);
+        loaded_anyway.refusals.set(1);
+        loaded_anyway.loads_anyway.set(1);
+        let up = launchd_up(
+            &loaded_anyway,
+            label,
+            plist,
+            (true, Some(4242)),
+            Some(&rewrite(Some("old"))),
+        );
+        assert!(
+            matches!(&up, Ok(Up::Held(failed)) if failed.contains("5: Input/output error")),
+            "{up:?}"
+        );
+        assert_eq!(
+            (
+                loaded_anyway.count("bootout"),
+                loaded_anyway.count("bootstrap")
+            ),
+            (1, 1),
+            "never booted out twice: {:?}",
+            loaded_anyway.calls()
+        );
+        assert_eq!(loaded_anyway.running_from().as_deref(), Some("new"));
+
+        // `kickstart -k` returns while the process it killed still runs: the step waits for it.
+        let unchanged = FakeLaunchd::new(true, 3);
+        assert_eq!(
+            launchd_up(&unchanged, label, plist, (true, Some(4242)), None),
+            Ok(Up::InPlace)
+        );
+        assert_eq!(unchanged.calls(), ["kickstart"], "never unloaded");
+        assert_eq!(
+            unchanged.pauses.get(),
+            3,
+            "the killed process was waited for"
+        );
+        let lingering = FakeLaunchd::new(true, 3 * GONE_POLLS);
+        let why = launchd_up(&lingering, label, plist, (true, Some(4242)), None)
+            .expect_err("the killed process never exits");
+        assert!(
+            why.contains("still ran") && why.contains("kickstart -k"),
+            "{why}"
+        );
+        assert_eq!(lingering.calls(), ["kickstart"], "never unloaded: {why}");
+
+        // The job went between the look and the kickstart: the plist is loaded, nothing booted out.
+        let went = FakeLaunchd::new(false, 3);
+        let up = launchd_up(&went, label, plist, (true, Some(4242)), None);
+        assert!(
+            matches!(&up, Ok(Up::Loaded(Some(first))) if first.contains("launchctl kickstart -k")),
+            "{up:?}"
+        );
+        assert_eq!(went.calls(), ["kickstart", "print", "bootstrap"]);
+
+        let unloaded = FakeLaunchd::new(false, 3);
+        assert_eq!(
+            launchd_up(&unloaded, label, plist, (false, None), None),
+            Ok(Up::Loaded(None))
+        );
+        assert_eq!(unloaded.calls(), ["bootstrap"], "nothing to boot out");
+        let unloaded = FakeLaunchd::new(false, 3);
+        assert_eq!(
+            launchd_up(
+                &unloaded,
+                label,
+                plist,
+                (false, None),
+                Some(&rewrite(Some("old")))
+            ),
+            Ok(Up::Loaded(None))
+        );
+        assert_eq!(unloaded.calls(), ["write", "bootstrap"]);
+        assert_eq!(unloaded.running_from().as_deref(), Some("new"));
+    }
+
+    /// The step leaves no job it found loaded unloaded, nor a plist newer than the job launchd
+    /// holds: a job launchd never lets go is neither rewritten nor bootstrapped over; a plist
+    /// that does not load is replaced by the one it replaced, loaded again; a write that fails
+    /// loads the plist as it was; a kickstart refused for a loaded job (a disabled one) leaves it
+    /// loaded; a `print` that says nothing is waited out, never read as the job gone; and a
+    /// bootstrap that keeps failing names each verb's error and says the plist is not loaded.
+    /// NEGATIVE CONTROLS: a step with no rollback, one that writes the plist before the job is
+    /// gone, one that boots out a job whose kickstart was refused, and one that reads a silent
+    /// `print` as the job gone each fail it.
+    #[test]
+    fn a_load_that_fails_never_strands_the_job() {
+        let (plist, label) = (Path::new(FAKE_PLIST), FAKE_LABEL);
+        let eio = "Bootstrap failed: 5: Input/output error";
+
+        let refused = FakeLaunchd::new(true, 2);
+        refused.refusals.set(2);
+        let why = launchd_up(
+            &refused,
+            label,
+            plist,
+            (true, Some(4242)),
+            Some(&rewrite(Some("old"))),
+        )
+        .expect_err("the new plist does not load");
+        assert!(why.contains("put back") && why.contains(eio), "{why}");
+        assert!(
+            why.contains(&format!(
+                "launchctl bootstrap gui/{} {} exited 5: {eio}",
+                uid(),
+                plist.display()
+            )),
+            "the failing verb and its stderr: {why}"
+        );
+        assert_eq!(refused.on_disk(), "old", "{why}");
+        assert_eq!(refused.running_from().as_deref(), Some("old"), "{why}");
+        assert_eq!(
+            (refused.count("bootout"), refused.count("bootstrap")),
+            (1, 3),
+            "{:?}",
+            refused.calls()
+        );
+        assert_eq!(
+            refused.pauses.get(),
+            4,
+            "two looks, the retry's pause and the put-back's"
+        );
+
+        // The plist put back does not load either: said so, and never called the new one.
+        let refused_again = FakeLaunchd::new(true, 2);
+        refused_again.refusals.set(3);
+        let why = launchd_up(
+            &refused_again,
+            label,
+            plist,
+            (true, Some(4242)),
+            Some(&rewrite(Some("old"))),
+        )
+        .expect_err("neither plist loads");
+        assert!(
+            why.contains("(the plist it replaced, put back) is installed but launchd has not")
+                && why.ends_with(eio),
+            "{why}"
+        );
+        assert_eq!(refused_again.on_disk(), "old", "{why}");
+        assert_eq!(refused_again.running_from(), None, "{why}");
+
+        // The plist put back fails to bootstrap and loads all the same: launchd holds that one.
+        let held_old = FakeLaunchd::new(true, 2);
+        held_old.refusals.set(3);
+        held_old.loads_anyway.set(3);
+        let why = launchd_up(
+            &held_old,
+            label,
+            plist,
+            (true, Some(4242)),
+            Some(&rewrite(Some("old"))),
+        )
+        .expect_err("the new plist does not load");
+        assert!(
+            why.contains("put back, and launchd holds the job after a bootstrap of it"),
+            "{why}"
+        );
+        assert_eq!(held_old.running_from().as_deref(), Some("old"), "{why}");
+
+        // `print` does not say after the bootstraps fail: launchd may hold the new plist's job,
+        // so the old one is not written over it.
+        let unsaid = FakeLaunchd::new(false, 0);
+        unsaid.refusals.set(2);
+        unsaid.unread.set(2);
+        let why = launchd_up(
+            &unsaid,
+            label,
+            plist,
+            (false, None),
+            Some(&rewrite(Some("old"))),
+        )
+        .expect_err("the new plist does not load");
+        assert!(why.contains("(or `launchctl print` did not say)"), "{why}");
+        assert_eq!(
+            unsaid.calls(),
+            ["write", "bootstrap", "print", "bootstrap", "print"],
+            "{why}"
+        );
+        assert_eq!(unsaid.on_disk(), "new", "{why}");
+
+        let fresh = FakeLaunchd::new(false, 0);
+        fresh.refusals.set(2);
+        let why = launchd_up(&fresh, label, plist, (false, None), Some(&rewrite(None)))
+            .expect_err("nothing to put back");
+        assert!(
+            why.contains("is installed but launchd has not loaded it") && why.ends_with(eio),
+            "the last verb's error ends it: {why}"
+        );
+        assert_eq!(
+            fresh.calls(),
+            ["write", "bootstrap", "print", "bootstrap", "print"]
+        );
+
+        let unwritable = FakeLaunchd::new(true, 1);
+        unwritable.write_fails.set(true);
+        let why = launchd_up(
+            &unwritable,
+            label,
+            plist,
+            (true, Some(4242)),
+            Some(&rewrite(Some("old"))),
+        )
+        .expect_err("the plist could not be written");
+        assert!(
+            why.contains("could not be written") && why.contains("Permission denied"),
+            "{why}"
+        );
+        assert_eq!(unwritable.running_from().as_deref(), Some("old"), "{why}");
+        // The plist as it was fails to bootstrap and loads all the same: still not written.
+        let unwritable = FakeLaunchd::new(true, 1);
+        unwritable.write_fails.set(true);
+        unwritable.refusals.set(1);
+        unwritable.loads_anyway.set(1);
+        let why = launchd_up(
+            &unwritable,
+            label,
+            plist,
+            (true, Some(4242)),
+            Some(&rewrite(Some("old"))),
+        )
+        .expect_err("the plist could not be written");
+        assert!(
+            why.contains("could not be written") && why.contains("5: Input/output error"),
+            "{why}"
+        );
+        assert_eq!(unwritable.running_from().as_deref(), Some("old"), "{why}");
+
+        let disabled = FakeLaunchd::new(true, 3);
+        disabled.kick_refused.set(true);
+        let why = launchd_up(&disabled, label, plist, (true, Some(4242)), None)
+            .expect_err("kickstart refused");
+        assert!(
+            why.contains("left loaded as it was") && why.contains("119: Service is disabled"),
+            "{why}"
+        );
+        assert_eq!(
+            disabled.calls(),
+            ["kickstart", "print"],
+            "no bootout: {why}"
+        );
+        assert!(disabled.loaded.get());
+        // A kickstart refused while `print` says nothing: the job may be held, so it is left.
+        let unsaid = FakeLaunchd::new(true, 3);
+        unsaid.kick_refused.set(true);
+        unsaid.unread.set(1);
+        let why = launchd_up(&unsaid, label, plist, (true, Some(4242)), None)
+            .expect_err("kickstart refused");
+        assert!(why.contains("left loaded as it was"), "{why}");
+        assert_eq!(unsaid.calls(), ["kickstart", "print"], "no bootout: {why}");
+
+        // `print` says nothing twice while launchd still lets the job go: waited out.
+        let silent = FakeLaunchd::new(true, 1);
+        silent.unread.set(2);
+        assert_eq!(
+            launchd_up(
+                &silent,
+                label,
+                plist,
+                (true, Some(4242)),
+                Some(&rewrite(Some("old")))
+            ),
+            Ok(Up::Loaded(None)),
+            "{:?}",
+            silent.calls()
+        );
+        assert_eq!(silent.count("bootstrap"), 1);
+
+        let stuck = FakeLaunchd::new(true, 3 * GONE_POLLS);
+        let why = launchd_up(
+            &stuck,
+            label,
+            plist,
+            (true, Some(4242)),
+            Some(&rewrite(Some("old"))),
+        )
+        .expect_err("launchd never let it go");
+        assert!(
+            why.contains("launchd still held") && why.contains("neither rewritten nor loaded"),
+            "{why}"
+        );
+        assert_eq!(
+            (stuck.count("write"), stuck.count("bootstrap")),
+            (0, 0),
+            "no write, no bootstrap over a job launchd holds: {why}"
+        );
+        assert_eq!(stuck.on_disk(), "old");
+        assert_eq!(stuck.pauses.get(), GONE_POLLS, "a bounded wait");
     }
 
     /// The wait for a starting broker connects until one answers and names its process once,
@@ -4981,6 +7797,53 @@ mod tests {
     }
 
     #[test]
+    fn the_generated_broker_command_selects_the_open_policy() {
+        use crate::durability::Durability;
+
+        let paths = Paths {
+            home: PathBuf::from("/fixture-home"),
+            login_home: None,
+            root: PathBuf::from("/fixture-root"),
+            aterm: "/fixture-bin/aterm".to_string(),
+            fleet: "local".to_string(),
+            config: None,
+            rendezvous: None,
+            durability: None,
+        };
+        let expected = Durability::Ordered.options();
+        let tier = expected.durability;
+        for named in [None, Some(Durability::Ordered)] {
+            let paths = Paths {
+                durability: named,
+                ..paths.clone()
+            };
+            let argv = paths.broker_argv();
+            let serving = Durability::try_of_argv(&argv).expect("a serving broker command");
+            let options = serving.options();
+            assert_eq!(options.durability, tier);
+            assert_eq!(options.escalation, expected.escalation);
+        }
+
+        let strict = Paths {
+            durability: Some(Durability::Strict),
+            ..paths.clone()
+        };
+        assert_ne!(
+            Durability::try_of_argv(&strict.broker_argv())
+                .unwrap()
+                .tier(),
+            tier
+        );
+        let mut unguarded = paths.broker_argv();
+        let guard_at = unguarded
+            .iter()
+            .position(|word| word == "--secret-file")
+            .unwrap();
+        unguarded.drain(guard_at..guard_at + 2);
+        assert_ne!(Durability::try_of_argv(&unguarded).unwrap().tier(), tier);
+    }
+
+    #[test]
     fn the_tier_is_in_the_job_and_a_bare_on_keeps_it() {
         use crate::durability::Durability;
         let dir = aterm_tempfile::tempdir().expect("scratch");
@@ -5141,6 +8004,15 @@ mod tests {
         );
         assert!(text.contains("  <key>Label</key><string>systems.alab.astream-broker</string>\n"));
         assert!(text.contains("  <key>KeepAlive</key><true/>\n"));
+        assert!(
+            text.contains(
+                "  <key>EnvironmentVariables</key>\n\
+             \x20 <dict>\n\
+             \x20   <key>PATH</key><string>/Users//example/Library/Application Support/aterm/pkg/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>\n\
+             \x20 </dict>\n"
+            ),
+            "{text}"
+        );
         assert!(text.ends_with("</dict>\n</plist>\n"));
         assert!(p.plist_is_current(&text));
         assert_eq!(
@@ -5605,6 +8477,10 @@ mod tests {
             "a plain argv is written as the line it always was:\n{text}"
         );
         assert_eq!(Rendezvous::parse(&text), Ok(r.clone()));
+        assert!(
+            Rendezvous::parse(&text.replace("node = \"n-0123456789abcdef\"", "node = 1")).is_err(),
+            "a field of the wrong type"
+        );
         let odd = Rendezvous {
             command: words("a \"quoted\" \\ back"),
             ..r.clone()
@@ -5649,10 +8525,6 @@ mod tests {
                 .map(|x| x.replace("/local/", "/lab/").replace("n-a", "n-b"))
                 .collect::<Vec<_>>()
         );
-        assert_eq!(g.len(), 8);
-        assert_eq!(g.iter().filter(|x| x.contains("p=n-a:")).count(), 4);
-        assert_eq!(g.iter().filter(|x| x.starts_with("ro:")).count(), 4);
-        assert_eq!(g.iter().filter(|x| x.contains("n-a")).count(), 6);
     }
 
     #[test]
@@ -5733,6 +8605,50 @@ mod tests {
         let plain = p("/Users//u/.local/bin/aterm");
         assert_eq!(plain.program(), "/Users//u/.local/bin/aterm");
         assert_eq!(plain.broker_argv()[0], "/Users//u/.local/bin/aterm");
+    }
+
+    /// `Paths::resolve` names an `aterm` other than this process for the broker where the seam is
+    /// not blank or `$PATH` holds an executable `aterm`: a blank seam, a file that is not
+    /// executable, a folder named `aterm`, a `$PATH` that does not hold it, and no `$PATH` name
+    /// none (`converge` then turns the fabric on only from the installed app).
+    /// NEGATIVE CONTROLS: a read that takes a blank seam for one names a program for any build; one
+    /// that takes any `aterm` entry for a program names one a `$PATH` cannot run.
+    #[test]
+    fn an_aterm_is_named_on_path_only_where_one_runs_there() {
+        use std::ffi::OsStr;
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = aterm_tempfile::tempdir().expect("exclusive scratch");
+        let dir = scratch.path();
+        let (runs, plain, folder, none) = (
+            dir.join("runs"),
+            dir.join("plain"),
+            dir.join("folder"),
+            dir.join("none"),
+        );
+        for d in [&runs, &plain, &folder, &none] {
+            std::fs::create_dir(d).expect("scratch");
+        }
+        for (d, mode) in [(&runs, 0o755), (&plain, 0o644)] {
+            std::fs::write(d.join("aterm"), "#!/bin/sh\n").expect("an aterm");
+            std::fs::set_permissions(d.join("aterm"), std::fs::Permissions::from_mode(mode))
+                .expect("chmod");
+        }
+        std::fs::create_dir(folder.join("aterm")).expect("a folder named aterm");
+        let path = |dirs: &[&PathBuf]| std::env::join_paths(dirs).expect("a $PATH");
+
+        assert!(names_aterm_on(None, Some(&path(&[&none, &runs]))));
+        assert!(names_aterm_on(Some(OsStr::new("/x/aterm")), None));
+        assert!(!names_aterm_on(
+            None,
+            Some(&path(&[&none, &plain, &folder]))
+        ));
+        assert!(!names_aterm_on(None, None));
+        for blank in ["", "  "] {
+            assert!(
+                !names_aterm_on(Some(OsStr::new(blank)), Some(&path(&[&none]))),
+                "{blank:?}"
+            );
+        }
     }
 
     #[test]
@@ -5940,7 +8856,14 @@ mod tests {
              was read on a bus log since replaced",
             "@s-a (instance 1) is HELD (reason=x origin=local)",
             "@s-a (instance 1) lost 2 message(s): its inbox ring evicted rows",
+            "instance 1: the broker's retention gave up this node's unread mail before its bridge \
+             read it (1 range(s) since the instance started): @10..@42 (3 records)",
+            "@s-a (instance 1): the broker's retention gave up records of its own before it \
+             handled them: its mail lane @50..@60 (`inbox` lane_given_up=)",
             "@s-a (instance 1) has 1 unhandled task/ask older than 10 min",
+            "2 held ask(s) past their deadline cannot be judged: the bus no longer keeps (or this \
+             cap does not read) every answer, report and ack above them on their asker's lane, so \
+             status cannot say whether they had one",
             "@s-a (instance 1) has 3 queued post(s) and no working bridge",
             "instance 1 did not answer (x)",
             "cannot list this machine's aterm instances: x",
@@ -6227,46 +9150,6 @@ mod tests {
     }
 
     #[test]
-    fn the_installed_job_reads_back_as_the_broker_argv() {
-        let p = Paths {
-            home: PathBuf::from("/Users//u"),
-            login_home: Some(PathBuf::from("/Users//u")),
-            root: PathBuf::from("/tmp/r"),
-            aterm: "/usr/local/bin/aterm".to_string(),
-            fleet: "local".to_string(),
-            config: None,
-            rendezvous: None,
-            durability: None,
-        };
-        let plist = p.plist_text();
-        assert!(p.plist_is_current(&plist), "{plist}");
-        assert_eq!(
-            plist_program_arguments(&collapse_between_tags(&plist)),
-            Some(p.broker_argv())
-        );
-        let unit = p.unit_text();
-        assert!(!unit.contains("rm -f"), "{unit}");
-        assert_eq!(unit_argv(&unit), Some(p.broker_argv()));
-    }
-
-    #[test]
-    fn the_rendezvous_file_round_trips_and_a_command_names_its_root() {
-        let r = Rendezvous {
-            fleet: "f".to_string(),
-            broker: "/r/bus.sock".to_string(),
-            node: "n-a".to_string(),
-            cap_file: "/r/node.cap".to_string(),
-            state: "/r/link-state".to_string(),
-            command: words("x"),
-        };
-        let text = r.render();
-        assert_eq!(Rendezvous::parse(&text), Ok(r.clone()));
-        assert!(Rendezvous::parse(&text.replace("node = \"n-a\"", "node = 1")).is_err());
-        assert_eq!(root_of("/r/bus.sock"), Some(PathBuf::from("/r")));
-        assert_eq!(root_of("bus.sock"), None, "a relative socket");
-    }
-
-    #[test]
     fn rendezvous_defaults_fill_only_absent_flags() {
         let r = Rendezvous {
             fleet: "f".to_string(),
@@ -6288,6 +9171,8 @@ mod tests {
             fill(&["--fleet", "g", "--state", "/t"]).join(" "),
             "--broker /b --cap-file /c --fleet g --state /t"
         );
+        assert_eq!(root_of("/r/bus.sock"), Some(PathBuf::from("/r")));
+        assert_eq!(root_of("bus.sock"), None, "a relative socket");
     }
 
     #[test]
@@ -6337,6 +9222,91 @@ mod tests {
             ["AUTH cafef00d\n", "sessions\n"]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The proof against a scripted instance: its `sessions` listing names `s-1`, then the proof's
+    /// own connection gets `replies` in order. Answers the proof's result and that connection's
+    /// requests.
+    fn prove_against(name: &str, replies: &[&str]) -> (Result<u64, String>, Vec<String>) {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = std::env::temp_dir().join(format!("atlk-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let sock = dir.join("a.sock");
+        std::fs::write(dir.join("a.sock.token"), "deadbeef\n").expect("token");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        let replies: Vec<String> = replies.iter().map(|r| (*r).to_string()).collect();
+        let server = std::thread::spawn(move || {
+            let (listing, _) = listener.accept().expect("accept the listing");
+            let mut lines = BufReader::new(listing.try_clone().expect("clone"));
+            for _ in 0..2 {
+                lines
+                    .read_line(&mut String::new())
+                    .expect("AUTH, then sessions");
+            }
+            (&listing)
+                .write_all(b"OK 1\n0 s-1 - alive zsh\n")
+                .expect("list");
+            let (conn, _) = listener.accept().expect("accept the proof");
+            let mut lines = BufReader::new(conn.try_clone().expect("clone"));
+            lines.read_line(&mut String::new()).expect("AUTH");
+            let mut seen = Vec::new();
+            for reply in replies {
+                let mut line = String::new();
+                if lines.read_line(&mut line).expect("a request") == 0 {
+                    break;
+                }
+                seen.push(line.trim_end().to_string());
+                (&conn).write_all(reply.as_bytes()).expect("reply");
+            }
+            seen
+        });
+        let inst = Instance {
+            pid: std::process::id(),
+            sock: sock.to_str().expect("utf8").to_string(),
+            supervised: true,
+            state: "connected".to_string(),
+            reason: String::new(),
+            command: None,
+        };
+        let proved = prove(&[inst], &mut Out::kept());
+        let seen = server.join().expect("server");
+        let _ = std::fs::remove_dir_all(&dir);
+        (proved, seen)
+    }
+
+    #[test]
+    fn the_proof_waits_past_another_senders_note_for_its_own() {
+        let (proved, seen) = prove_against(
+            "proof-past",
+            &[
+                "OK 0 hold=0\n",
+                "OK 1 off=6\n",
+                "OK inbox 1\n",
+                "OK 1 hold=0\nmsg 1 off=5 t=1 from=s-9@n-b kind=note trust=agent\n",
+                "OK inbox 2\n",
+                "OK 1 hold=0\nmsg 2 off=6 t=2 from=s-1@n-a kind=note trust=agent\n",
+            ],
+        );
+        assert!(proved.is_ok(), "{proved:?}: {seen:#?}");
+        assert!(
+            seen[4].starts_with("@s-1 await inbox since=1 kinds=note "),
+            "the second wait starts past the other sender's note: {seen:#?}"
+        );
+    }
+
+    #[test]
+    fn a_proof_wait_that_times_out_says_the_note_did_not_come_back() {
+        let (proved, seen) = prove_against(
+            "proof-timeout",
+            &["OK 0 hold=0\n", "OK 1 off=6\n", "OK timeout\n"],
+        );
+        let why = proved.expect_err("nothing came back");
+        assert!(
+            why.starts_with("landed at @6 but was not delivered back within 60s: ")
+                && why.contains("OK timeout"),
+            "{why}: {seen:#?}"
+        );
     }
 
     #[test]

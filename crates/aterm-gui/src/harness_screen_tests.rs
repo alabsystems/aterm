@@ -1381,6 +1381,148 @@ fn what_the_harness_did_counts_the_occupancy_facts() {
 }
 
 #[test]
+fn what_a_self_claims_holder_did_has_its_own_row_and_never_aterms() {
+    use aterm_agent::harness::stats::SelfClaimed;
+    let codex = |approved: u64, continued: u64, landed: u64| SelfClaimed {
+        approved,
+        continued,
+        landed,
+        acts: approved + continued + landed,
+        ..SelfClaimed::default()
+    };
+    let mut today = HarnessStats::new(0);
+    today.approved = 2;
+    today.rows = 2;
+    let mut week = HarnessStats::new(0);
+    week.approved = 5;
+    week.rows = 5;
+    let mut state = HarnessState::unobserved();
+    state.observed = true;
+    let report = |today: &HarnessStats, week: &HarnessStats| {
+        Some(std::sync::Arc::new(HarnessStatsReport::new(
+            today.clone(),
+            week.clone(),
+            1_000_000_000,
+            Some(0),
+            &|_| Some(0),
+        )))
+    };
+    // NEGATIVE CONTROL: aterm's own rows, read before any self-claim is in the reading.
+    state.stats.report = report(&today, &week);
+    let aterms = state.projection().did_rows;
+    assert!(
+        aterms.iter().all(|(label, _)| !label.ends_with(" did")),
+        "{aterms:?}"
+    );
+
+    today
+        .self_claimed
+        .insert("codex-alab".to_string(), codex(1, 3, 0));
+    week.self_claimed
+        .insert("codex-alab".to_string(), codex(4, 12, 1));
+    state.stats.report = report(&today, &week);
+    let rows = state.projection().did_rows;
+    let words = |label: &str| {
+        rows.iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, w)| w.clone())
+            .unwrap_or_else(|| panic!("no {label} row: {rows:?}"))
+    };
+    assert_eq!(
+        words("codex-alab did"),
+        "1 approved, 3 kept going today \u{b7} 1 landed, 4 approved, 12 kept going in 7 days"
+    );
+    assert_eq!(
+        words(APPROVED.label),
+        "2 today \u{b7} 5 in 7 days",
+        "aterm's count stands"
+    );
+    let without: Vec<_> = rows
+        .iter()
+        .filter(|(label, _)| label != "codex-alab did")
+        .cloned()
+        .collect();
+    assert_eq!(without, aterms, "the holder's row is the only change");
+
+    today.self_claimed.clear();
+    state.stats.report = report(&today, &week);
+    assert_eq!(
+        self_claimed_rows(&today, &week),
+        [(
+            "codex-alab did".to_string(),
+            "none today \u{b7} 1 landed, 4 approved, 12 kept going in 7 days".to_string()
+        )]
+    );
+
+    let mut quiet = HarnessStats::new(0);
+    quiet
+        .self_claimed
+        .insert("codex-alab".to_string(), codex(0, 2, 0));
+    state.stats.report = report(&HarnessStats::new(0), &quiet);
+    let rows = state.projection().did_rows;
+    assert_eq!(
+        rows.iter()
+            .find(|(l, _)| l == "7 days")
+            .map(|(_, w)| w.as_str()),
+        Some("nothing yet: aterm's harness has not acted"),
+        "{rows:?}"
+    );
+    assert!(rows.iter().any(|(l, _)| l == "codex-alab did"), "{rows:?}");
+    state.stats.report = report(&HarnessStats::new(0), &HarnessStats::new(0));
+    assert_eq!(
+        state
+            .projection()
+            .did_rows
+            .iter()
+            .find(|(l, _)| l == "7 days")
+            .map(|(_, w)| w.clone())
+            .as_deref(),
+        Some("nothing yet: no supervised session has acted")
+    );
+}
+
+#[test]
+fn a_rows_day_line_names_a_self_claims_holder_after_aterms_counts() {
+    use aterm_agent::harness::stats::{SelfClaimed, Tally};
+    let aterms = Tally {
+        approved: 31,
+        ..Tally::default()
+    };
+    let mut both = aterms.clone();
+    both.self_claimed.insert(
+        "codex-alab".to_string(),
+        SelfClaimed {
+            approved: 1,
+            continued: 3,
+            acts: 4,
+            ..SelfClaimed::default()
+        },
+    );
+    assert_eq!(
+        day_line(&both, Some(0)).as_deref(),
+        Some("today: 31 approved \u{b7} codex-alab did 1 approved, 3 kept going")
+    );
+    // NEGATIVE CONTROL: without the self-claim the line is aterm's alone.
+    assert_eq!(
+        day_line(&aterms, Some(0)).as_deref(),
+        Some("today: 31 approved")
+    );
+    let alone = Tally {
+        self_claimed: both.self_claimed.clone(),
+        ..Tally::default()
+    };
+    assert_eq!(
+        day_line(&alone, Some(0)).as_deref(),
+        Some("today: codex-alab did 1 approved, 3 kept going")
+    );
+    let nothing = Tally {
+        self_claimed: [("codex-alab".to_string(), SelfClaimed::default())].into(),
+        ..Tally::default()
+    };
+    assert_eq!(day_line(&nothing, Some(0)), None, "no count, no part");
+}
+
+#[test]
 fn one_name_for_each_count_from_the_chip_to_the_page() {
     use aterm_agent::harness::acts::Act;
     use aterm_agent::harness::stats::{DecisionKind, Tally};
@@ -1853,6 +1995,20 @@ fn the_state_line_says_the_pause_where_no_face_or_timer_has_the_line() {
         .state_line()
         .as_deref(),
         Some("last: \u{2713} approved 18:35")
+    );
+    assert_eq!(
+        row(
+            AutopilotView::Cruise,
+            ChipGlass {
+                pause: None,
+                last_by: Some(crate::harness_glass::claimant("codex-alab@4242")),
+                ..pausing
+            }
+        )
+        .state_line()
+        .as_deref(),
+        Some("last: codex-alab: \u{2713} approved 18:35"),
+        "a self-claim's act is named for its holder"
     );
 }
 
@@ -3998,7 +4154,8 @@ fn an_aterm_that_is_not_its_accounts_own_reads_no_fleet() {
         state.tabs
     );
     assert_eq!(
-        state.computers[0].instances, 2,
+        state.computers[0].instances,
+        Some(2),
         "itself and the one it read"
     );
     assert_eq!(state.fleet, FleetScope::Isolated(TEST_BUILD_ISOLATION));
@@ -4032,6 +4189,57 @@ fn an_aterm_that_is_not_its_accounts_own_reads_no_fleet() {
     );
 }
 
+/// Tab Control's Bonjour sweep (its `dns-sd` browses, `.local` lookups and SSH probes) puts
+/// macOS's Local Network question on screen where macOS never asked aterm, so it waits while
+/// System State's Local Network step, which asks that question first, is still to come, and the
+/// page says why it shows no computer on the network; once the step asked, or never will, it
+/// sweeps and the page says nothing of it.
+#[cfg(target_os = "macos")]
+#[test]
+fn tab_control_sweeps_the_local_network_only_after_the_local_network_step() {
+    let mut swept = 0;
+    assert_eq!(
+        sweep_lan_after_the_step(false, || swept += 1),
+        Some(LAN_WAITS)
+    );
+    assert_eq!(swept, 0, "no sweep while the step is still to come");
+    assert_eq!(sweep_lan_after_the_step(true, || swept += 1), None);
+    assert_eq!(swept, 1, "the step asked, or never will: it sweeps");
+
+    let mut app = App::headless_for_test();
+    let mut report = HarnessStatsReport::new(
+        HarnessStats::per_session(0),
+        HarnessStats::new(0),
+        0,
+        Some(0),
+        &|_| Some(0),
+    );
+    report.lan_waits = Some(LAN_WAITS);
+    app.harness_screen.stats.report = Some(std::sync::Arc::new(report));
+    let state = app.tab_control_state(crate::autopilot::HarnessPosture::default());
+    let said = |state: &TabControlState| {
+        state
+            .projection(true, false)
+            .summary_rows
+            .into_iter()
+            .find(|(name, _)| name == "Local network")
+            .map(|(_, value)| value)
+    };
+    assert_eq!(
+        said(&state).as_deref(),
+        Some(LAN_WAITS),
+        "the page says why it looked for no computer on the network"
+    );
+    assert_eq!(
+        said(&TabControlState {
+            lan_waits: None,
+            ..state
+        }),
+        None,
+        "CONTROL: a reading that swept says nothing of it"
+    );
+}
+
 /// One probe that misses a host (a slow 120 ms connect on a loaded machine) keeps its last
 /// address, SSH banner and round trip, where the row once read "SSH banner unknown" for a sweep
 /// and reflowed the list; a host silent past the hold loses them.
@@ -4062,5 +4270,695 @@ fn a_missed_probe_keeps_a_hosts_last_facts() {
         held.after_probe((None, None, None), t0 + std::time::Duration::from_secs(33)),
         ((Some("192.168.1.138".to_string()), None, None), false),
         "past the hold what was not seen since is gone, the address seen at 6 s kept"
+    );
+}
+
+/// ANOTHER ATERM'S CODEX ROW reads as this aterm's does (`roster_word`, the render-time rule): its
+/// `sessions` line says `agent=unknown` beside the program's own `program_state=`, so the row says
+/// `working`, or `waiting on permission` for a box, with no age (the line's age is the reader's).
+/// NEGATIVE CONTROLS: the same line with no report reads `unknown`; a reader that names a state
+/// keeps its own word and age whatever the column says.
+#[cfg(unix)]
+#[test]
+fn another_aterms_codex_row_reads_the_programs_own_report() {
+    let row = |agent: &str, program_state: &str| {
+        let line = format!(
+            "3 s-sib 1 alive codex program=codex agent={agent} agent_since_ms=4000 \
+             program_state={program_state}"
+        );
+        parse_sibling_roster_line("mac", 99, &line)
+            .expect("a row")
+            .1
+    };
+    assert_eq!(row("unknown", "working").ai_status, "working");
+    assert_eq!(
+        row("unknown", "blocked:permission").ai_status,
+        "waiting on permission"
+    );
+    assert_eq!(
+        row("unknown", "blocked:question").ai_status,
+        "waiting on question"
+    );
+    assert!(
+        row("unknown", "-").ai_status.starts_with("unknown"),
+        "{}",
+        row("unknown", "-").ai_status
+    );
+    assert_eq!(row("busy", "idle").ai_status, "working (4s)");
+    for (agent, program_state, expected) in [
+        ("unknown", "working", Some(true)),
+        ("unknown", "blocked:permission", Some(true)),
+        ("unknown", "blocked:question", Some(true)),
+        ("unknown", "blocked:auth", Some(false)),
+        ("unknown", "idle", Some(false)),
+        ("unknown", "-", None),
+        ("busy", "idle", Some(true)),
+    ] {
+        assert_eq!(row(agent, program_state).active_ai, expected);
+    }
+    assert_eq!(
+        crate::program_state::survey_word_of_wire("blocked:nope"),
+        None
+    );
+    assert_eq!(crate::program_state::survey_word_of_wire("-"), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn tab_activity_counts_agree_across_local_sibling_and_cached_readings() {
+    for (word, expected) in [
+        ("busy", Some(true)),
+        ("working", Some(true)),
+        ("prompt", Some(true)),
+        ("permission", Some(true)),
+        ("box:permission", Some(true)),
+        ("waiting", Some(true)),
+        ("question", Some(true)),
+        ("box:question", Some(true)),
+        ("idle", Some(false)),
+        ("limited", Some(false)),
+        ("wall:rate-limit", Some(false)),
+        ("wall:auth", Some(false)),
+        ("unknown", None),
+        ("-", None),
+    ] {
+        let mut app = App::headless_for_test();
+        let ctx = app.pool.get(0).unwrap().ctx.clone();
+        {
+            let mut timeline = ctx.timeline.lock().unwrap();
+            timeline.note_foreground_group(7);
+            timeline.set_program(7, Some("claude".into()));
+        }
+        publish(&ctx, word);
+        let sibling = parse_sibling_roster_line(
+            "local",
+            71,
+            &format!("1 sibling-sid - Running title program=claude agent={word}"),
+        )
+        .unwrap()
+        .1;
+        let hello = format!(
+            "{{\"sessions\":[{{\"instance_pid\":72,\"local_id\":2,\"program\":\"claude\",\"agent\":\"{word}\"}}]}}"
+        );
+        let state = aterm_json::from_str::<aterm_json::Value>(&format!(
+            "{{\"hello\":{}}}",
+            aterm_json::to_string(&hello).unwrap()
+        ))
+        .unwrap();
+        let (computer, cached) = cached_configured_computer(
+            "remote".into(),
+            "remote".into(),
+            "remote.local".into(),
+            Some(&state),
+        );
+        assert_eq!(computer.active_ai, expected.map(usize::from), "{word}");
+        let mut report = HarnessStatsReport::new(
+            HarnessStats::per_session(0),
+            HarnessStats::new(0),
+            0,
+            Some(0),
+            &|_| Some(0),
+        );
+        report.sibling_tabs = vec![sibling];
+        report.remote_computers = vec![computer];
+        report.remote_tabs = cached;
+        app.harness_screen.stats.report = Some(std::sync::Arc::new(report));
+        let state = app.tab_control_state(crate::autopilot::HarnessPosture::default());
+        assert_eq!(state.tabs.len(), 3);
+        assert!(state.tabs.iter().all(|row| row.is_ai_cli));
+        assert!(
+            state.tabs.iter().all(|row| row.active_ai == expected),
+            "{word}"
+        );
+        let active = usize::from(expected == Some(true));
+        assert_eq!(
+            state.computers[0].active_ai,
+            expected.map(|v| 2 * usize::from(v)),
+            "{word}"
+        );
+        let summary = |state: &TabControlState| {
+            state
+                .projection(true, false)
+                .summary_rows
+                .into_iter()
+                .find(|(name, _)| name == "AI CLIs")
+                .unwrap()
+                .1
+        };
+        match expected {
+            Some(_) => assert!(
+                summary(&state).ends_with(&format!("{} active", 3 * active)),
+                "{word}"
+            ),
+            None => assert!(summary(&state).ends_with("activity unobserved"), "{word}"),
+        }
+        let mut renamed = state.clone();
+        for row in &mut renamed.tabs {
+            row.ai_status = if active == 1 { "idle" } else { "working" }.into();
+        }
+        assert_eq!(
+            summary(&renamed),
+            summary(&state),
+            "display words are not activity facts"
+        );
+    }
+}
+
+#[test]
+fn tab_activity_keeps_unknown_classification_separate_from_non_ai() {
+    let unknown = r#"{"instance_pid":71,"local_id":1}"#;
+    let busy = r#"{"instance_pid":71,"local_id":2,"program":"codex","agent":"busy"}"#;
+    let shell = r#"{"instance_pid":71,"local_id":1,"program":"sh"}"#;
+    for (sessions, expected) in [
+        (unknown.to_owned(), None),
+        (format!("{unknown},{busy}"), None),
+        (format!("{shell},{busy}"), Some(1)),
+        (shell.to_owned(), Some(0)),
+    ] {
+        let hello = format!("{{\"sessions\":[{sessions}]}}");
+        let state = aterm_json::from_str::<aterm_json::Value>(&format!(
+            "{{\"hello\":{}}}",
+            aterm_json::to_string(&hello).unwrap()
+        ))
+        .unwrap();
+        let (computer, tabs) = cached_configured_computer(
+            "remote".into(),
+            "remote".into(),
+            "remote.local".into(),
+            Some(&state),
+        );
+        assert_eq!(computer.ai_clis, expected, "{sessions}");
+        assert_eq!(computer.active_ai, expected, "{sessions}");
+        assert_eq!(ai_cli_count(tabs.iter()), expected, "{sessions}");
+        assert_eq!(active_ai_count(tabs.iter()), expected, "{sessions}");
+        let projection = TabControlState {
+            computers: vec![computer],
+            tabs,
+            fleet: FleetScope::Account,
+            lan_waits: None,
+        }
+        .projection(true, false);
+        let summary = &projection
+            .summary_rows
+            .iter()
+            .find(|(key, _)| key == "AI CLIs")
+            .unwrap()
+            .1;
+        match expected {
+            None => assert!(summary.starts_with("count unobserved")),
+            Some(0) => assert!(summary.starts_with("none observed")),
+            Some(n) => assert!(summary.ends_with(&format!("{n} active"))),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn monitor_swarm_census_maps_members_aliases_and_stragglers_without_per_mac_dials() {
+    use aterm_agent::fleet_census::{
+        CensusMember, CensusStraggler, CensusSummary, MemberAccountSummary,
+        STRAGGLER_MONITOR_STATUS, StragglerReason, SwarmCensus,
+    };
+
+    let now_s = 1_793_320_000_u64;
+    let census = SwarmCensus {
+        generated_at: now_s - 20,
+        steward: Some("m1".to_owned()),
+        members: vec![
+            CensusMember {
+                label: "m15".to_owned(),
+                aliases: Vec::new(),
+                node: Some("15151515151515151515151515151515".to_owned()),
+                host: Some("m15.local".to_owned()),
+                version: Some("0.146.0".to_owned()),
+                window: true,
+                window_last: Some(now_s - 5),
+                sessions: 3,
+                accounts: MemberAccountSummary {
+                    warm: 2,
+                    leased: 1,
+                    walled: 0,
+                },
+                last_seen: Some(now_s - 5),
+                converge_failures: 0,
+                eligible: true,
+                in_fleet: true,
+                in_commons: true,
+            },
+            CensusMember {
+                label: "m100".to_owned(),
+                aliases: vec!["m32".to_owned()],
+                node: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+                host: Some("m100.local".to_owned()),
+                version: Some("0.146.0".to_owned()),
+                window: false,
+                window_last: Some(now_s - 7_200),
+                sessions: 0,
+                accounts: MemberAccountSummary {
+                    warm: 1,
+                    leased: 0,
+                    walled: 1,
+                },
+                last_seen: Some(now_s - 3_600),
+                converge_failures: 0,
+                eligible: true,
+                in_fleet: true,
+                in_commons: true,
+            },
+        ],
+        stragglers: vec![CensusStraggler {
+            name: "guest-mac".to_owned(),
+            host: "guest-mac.local".to_owned(),
+            reason: StragglerReason::NoAterm,
+        }],
+        summary: CensusSummary::default(),
+    };
+
+    // The local name may include the hardware suffix; labels and addresses still share one row.
+    for local_arg in ["m15", "m15-MacBook-Pro-M5-Max-128GB-8TB"] {
+        let (rows, known) = swarm_census_to_tab_computers(&census, Some(local_arg), now_s);
+        assert!(known.contains_key("m15"));
+        assert!(known.contains_key("m100"));
+        assert!(known.contains_key("m32"));
+        assert!(is_known_swarm_host(&known, "m100-Mac-Studio-M4-Max"));
+        assert!(is_known_swarm_host(&known, "M32-MacBook-Air-M3"));
+        assert!(is_known_swarm_host(&known, " m32-MacBook-Air-M3.local. "));
+        assert!(!is_known_swarm_host(&known, "guest-mac"));
+        assert!(!is_known_swarm_host(&known, "m99-MacBook-Air"));
+        assert_eq!(rows.len(), 2, "local_arg={local_arg}");
+        assert_eq!(rows[0].name, "m100");
+        assert_eq!(rows[0].status, format!("away since {}", now_s - 3_600));
+        assert!(rows[0].vitals.contains("accounts warm 1"));
+        assert_eq!(rows[1].name, "guest-mac");
+        assert_eq!(rows[1].status, STRAGGLER_MONITOR_STATUS);
+    }
+
+    // Exclude local Mac `m15`; fold `m100` + alias `m32` into `known_swarm_names`; mark straggler!
+    let (rows, known) = swarm_census_to_tab_computers(&census, Some("m15"), now_s);
+    assert!(known.contains_key("m15"));
+    assert!(known.contains_key("m100"));
+    assert!(
+        known.contains_key("m32"),
+        "legacy alias m32 must be suppressed from Bonjour straggler list"
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].name, "m100");
+    assert_eq!(rows[0].status, format!("away since {}", now_s - 3_600));
+    assert!(rows[0].vitals.contains("accounts warm 1"));
+    assert_eq!(rows[0].os_version, None);
+    assert_eq!(rows[0].instances, None);
+    assert_eq!(
+        rows[0].tabs,
+        Some(0),
+        "a heartbeat explicitly reported zero sessions"
+    );
+    assert_eq!((rows[0].ai_clis, rows[0].active_ai), (None, None));
+    assert_eq!(rows[0].session_scope, TabSessionScope::OneInstanceHeartbeat);
+    let detail = crate::native_settings::tabs_page::computer_detail(&rows[0]);
+    assert!(detail.contains("unobserved") && !detail.contains("no AI CLI"));
+    assert_eq!(rows[1].name, "guest-mac");
+    assert_eq!(rows[1].status, STRAGGLER_MONITOR_STATUS);
+
+    let mut unheard = census.clone();
+    unheard.members[1].version = None;
+    let (unheard, _) = swarm_census_to_tab_computers(&unheard, Some("m15"), now_s);
+    assert_eq!(unheard[0].tabs, None, "no heartbeat is not a zero report");
+    assert!(!unheard[0].vitals.contains("window closed"));
+
+    let state = |hello: &str| {
+        aterm_json::from_str::<aterm_json::Value>(&format!(
+            "{{\"last_seen\":{now_s},\"hello\":{}}}",
+            aterm_json::to_string(hello).unwrap()
+        ))
+        .unwrap()
+    };
+    let parsed_for = |name: &str, hello: &str| {
+        cached_configured_computer(
+            format!("configured-{name}"),
+            name.into(),
+            format!("{name}.local"),
+            Some(&state(hello)),
+        )
+    };
+    let parsed = |hello: &str| parsed_for("m32", hello);
+    let (legacy, _) = parsed(r#"{"os_version":""}"#);
+    assert_eq!(legacy.os_version, None);
+    assert_eq!(
+        (
+            legacy.instances,
+            legacy.tabs,
+            legacy.ai_clis,
+            legacy.active_ai
+        ),
+        (None, None, None, None)
+    );
+    let (legacy, _) = parsed(r#"{"sessions":[{"local_id":1}]}"#);
+    assert_eq!(
+        (legacy.instances, legacy.ai_clis, legacy.active_ai),
+        (None, None, None)
+    );
+    assert_eq!(legacy.tabs, Some(1));
+    assert_eq!(legacy.session_scope, TabSessionScope::CachedObservations);
+    assert!(
+        crate::native_settings::tabs_page::computer_detail(&legacy)
+            .contains("instances unobserved")
+    );
+    let (empty, _) = parsed(r#"{"sessions":[]}"#);
+    assert_eq!(
+        (empty.instances, empty.tabs, empty.ai_clis, empty.active_ai),
+        (Some(0), Some(0), Some(0), Some(0))
+    );
+    assert!(crate::native_settings::tabs_page::computer_detail(&empty).contains("no AI CLI"));
+    let (unknown_activity, _) = parsed(r#"{"sessions":[{"instance_pid":71,"program":"codex"}]}"#);
+    assert_eq!(
+        (unknown_activity.ai_clis, unknown_activity.active_ai),
+        (Some(1), None)
+    );
+
+    let hello = r#"{"os_version":"27.0","vitals":{"cpu_busy_pct":12,"cpu_cores":18},"sessions":[{"instance_pid":71,"local_id":2,"sid":"owned-sid","program":"codex","agent":"busy","task":"owned task"},{"instance_pid":72,"local_id":3,"program":"bash"}]}"#;
+    let (cached, host_tabs) = parsed(hello);
+    let mut merged = rows.clone();
+    let mut tabs = Vec::new();
+    merge_cached_computer(&mut merged, &known, "m32", cached, host_tabs, &mut tabs);
+    let vitals = merged[0].vitals.clone();
+    let (same, same_tabs) = parsed_for("m100", hello);
+    merge_cached_computer(&mut merged, &known, "m100", same, same_tabs, &mut tabs);
+    assert_eq!(
+        merged[0].vitals, vitals,
+        "the canonical name does not duplicate an alias's facts"
+    );
+    assert_eq!(
+        merged.len(),
+        rows.len(),
+        "an alias enriches one canonical row"
+    );
+    let member = &merged[0];
+    assert_eq!(
+        (&member.id, &member.name, &member.status),
+        (&rows[0].id, &rows[0].name, &rows[0].status)
+    );
+    assert_eq!(member.os_version.as_deref(), Some("macOS 27.0"));
+    assert_eq!(
+        (
+            member.instances,
+            member.tabs,
+            member.ai_clis,
+            member.active_ai
+        ),
+        (Some(2), Some(2), Some(1), Some(1))
+    );
+    assert!(member.vitals.contains("CPU 12%") && member.vitals.contains(&rows[0].vitals));
+    assert_eq!(tabs.len(), 2);
+    assert!(
+        tabs.iter()
+            .all(|tab| tab.key.starts_with("remote/swarm/m100/"))
+    );
+    assert!(tabs.iter().all(|tab| tab.computer_id == "swarm/m100"));
+    assert!(tabs.iter().all(|tab| tab.computer == "m100"));
+    assert_eq!(tabs[0].sid, "owned-sid");
+    assert!(tabs[0].ai_status.contains("owned task"));
+    let (mut by_address, address_tabs) = parsed_for("studio", hello);
+    by_address.address = "M32-MacBook-Air-M3.local.".into();
+    merge_cached_computer(
+        &mut merged,
+        &known,
+        "studio",
+        by_address,
+        address_tabs,
+        &mut tabs,
+    );
+    assert_eq!(
+        merged.len(),
+        rows.len(),
+        "an address match enriches the census row"
+    );
+    assert_eq!(
+        tabs.len(),
+        2,
+        "address matches share canonical session identities"
+    );
+    let (local, local_tabs) = parsed_for("m15", hello);
+    merge_cached_computer(&mut merged, &known, "m15", local, local_tabs, &mut tabs);
+    assert_eq!(
+        tabs.len(),
+        2,
+        "the excluded local member adds no remote duplicates"
+    );
+    assert_eq!(merged.len(), rows.len());
+    let (mut local_address, local_tabs) = parsed_for("my-laptop", hello);
+    local_address.address = "m15-MacBook-Pro-M5-Max-128GB-8TB.local.".into();
+    merge_cached_computer(
+        &mut merged,
+        &known,
+        "my-laptop",
+        local_address,
+        local_tabs,
+        &mut tabs,
+    );
+    assert_eq!(
+        tabs.len(),
+        2,
+        "the local address cannot become a remote row"
+    );
+    assert_eq!(merged.len(), rows.len());
+    let (distinct, distinct_tabs) = parsed(&hello.replace("owned-sid", "other-sid"));
+    merge_cached_computer(
+        &mut merged,
+        &known,
+        "m32",
+        distinct,
+        distinct_tabs,
+        &mut tabs,
+    );
+    assert_eq!(tabs.len(), 3, "a different session id remains distinct");
+    assert_eq!(
+        (
+            merged[0].instances,
+            merged[0].tabs,
+            merged[0].ai_clis,
+            merged[0].active_ai
+        ),
+        (Some(2), Some(3), Some(2), Some(2)),
+        "computer counts describe the same deduplicated session rows"
+    );
+    let (other, other_tabs) = parsed_for("other-host", hello);
+    merge_cached_computer(
+        &mut merged,
+        &known,
+        "other-host",
+        other,
+        other_tabs,
+        &mut tabs,
+    );
+    assert_eq!(
+        tabs.len(),
+        5,
+        "the same instance/session ids on another host remain distinct"
+    );
+
+    let counts = |computer: &TabComputer| {
+        (
+            computer.instances,
+            computer.tabs,
+            computer.ai_clis,
+            computer.active_ai,
+        )
+    };
+    assert_eq!(counts(&merged[0]), (Some(2), Some(3), Some(2), Some(2)));
+    assert_eq!(
+        counts(
+            merged
+                .iter()
+                .find(|computer| computer.name == "other-host")
+                .unwrap()
+        ),
+        (Some(2), Some(2), Some(1), Some(1)),
+        "another host's observations do not enter the census member's counts"
+    );
+    let first = r#"{"sessions":[{"instance_pid":71,"local_id":1,"sid":"first","program":"codex","agent":"busy"}]}"#;
+    let second = r#"{"sessions":[{"instance_pid":72,"local_id":2,"sid":"second","program":"claude","agent":"idle"}]}"#;
+    let mut aliases = rows.clone();
+    let mut alias_tabs = Vec::new();
+    for (name, hello) in [("m32", first), ("m100", first), ("m100", second)] {
+        let (cached, cached_tabs) = parsed_for(name, hello);
+        merge_cached_computer(
+            &mut aliases,
+            &known,
+            name,
+            cached,
+            cached_tabs,
+            &mut alias_tabs,
+        );
+    }
+    assert_eq!(alias_tabs.len(), 2, "the repeated SID is one observation");
+    assert_eq!(counts(&aliases[0]), (Some(2), Some(2), Some(2), Some(1)));
+    assert_eq!(
+        aliases[0].session_scope,
+        TabSessionScope::CachedObservations
+    );
+    assert_eq!(aliases[0].status, rows[0].status);
+    let mut reversed = rows.clone();
+    let mut reversed_tabs = Vec::new();
+    for (name, hello) in [("m100", second), ("m32", first)] {
+        let (cached, cached_tabs) = parsed_for(name, hello);
+        merge_cached_computer(
+            &mut reversed,
+            &known,
+            name,
+            cached,
+            cached_tabs,
+            &mut reversed_tabs,
+        );
+    }
+    assert_eq!(counts(&reversed[0]), counts(&aliases[0]));
+
+    let unknown = r#"{"sessions":[{"local_id":3,"sid":"unknown-pid","program":"codex"}]}"#;
+    let (cached, cached_tabs) = parsed(unknown);
+    merge_cached_computer(
+        &mut aliases,
+        &known,
+        "m32",
+        cached,
+        cached_tabs,
+        &mut alias_tabs,
+    );
+    assert_eq!(counts(&aliases[0]), (None, Some(3), Some(3), None));
+    assert_eq!(
+        aliases[0].session_scope,
+        TabSessionScope::CachedObservations
+    );
+    let (cached, cached_tabs) =
+        parsed(r#"{"sessions":[{"instance_pid":74,"local_id":4,"sid":"unknown-program"}]}"#);
+    merge_cached_computer(
+        &mut aliases,
+        &known,
+        "m32",
+        cached,
+        cached_tabs,
+        &mut alias_tabs,
+    );
+    assert_eq!(counts(&aliases[0]), (None, Some(4), None, None));
+    let (empty, empty_tabs) = parsed(r#"{"sessions":[]}"#);
+    merge_cached_computer(
+        &mut aliases,
+        &known,
+        "m32",
+        empty,
+        empty_tabs,
+        &mut alias_tabs,
+    );
+    assert_eq!(counts(&aliases[0]), (None, Some(4), None, None));
+    let mut zero = rows.clone();
+    let (empty, empty_tabs) = parsed(r#"{"sessions":[]}"#);
+    merge_cached_computer(&mut zero, &known, "m32", empty, empty_tabs, &mut Vec::new());
+    assert_eq!(counts(&zero[0]), (Some(0), Some(0), Some(0), Some(0)));
+    assert_eq!(zero[0].session_scope, TabSessionScope::CachedObservations);
+
+    // Inventory names and UUIDs are unique; presentation names need not be. In both
+    // valid shapes, identical process/session ids still belong to different computers.
+    let host_a = "0A1B2C3D-0000-4000-8000-000000000007";
+    let host_b = "0A1B2C3D-0000-4000-8000-000000000008";
+    let shell = r#"{"sessions":[{"instance_pid":71,"local_id":1,"sid":"first","program":"bash"}]}"#;
+    for (second_name, names) in [
+        ("alpha.local", std::collections::BTreeMap::new()),
+        (
+            "beta",
+            std::collections::BTreeMap::from([
+                ("alpha".to_owned(), "bench".to_owned()),
+                ("beta".to_owned(), "bench".to_owned()),
+            ]),
+        ),
+    ] {
+        let mut computers = Vec::new();
+        let mut sessions = Vec::new();
+        for (uuid, raw_name, address, hello) in [
+            (host_a, "alpha", "10.0.0.7", first),
+            (host_b, second_name, "10.0.0.8", shell),
+        ] {
+            let (cached, cached_tabs) = cached_configured_computer(
+                uuid.to_owned(),
+                canonical_host_name_gui(raw_name, &names),
+                address.to_owned(),
+                Some(&state(hello)),
+            );
+            merge_cached_computer(
+                &mut computers,
+                &known,
+                raw_name,
+                cached,
+                cached_tabs,
+                &mut sessions,
+            );
+        }
+        assert_eq!(computers.len(), 2);
+        assert_eq!(computers[0].name, computers[1].name);
+        assert_eq!(sessions.len(), 2);
+        assert_ne!(sessions[0].key, sessions[1].key);
+        assert_eq!(sessions[0].computer_id, host_a);
+        assert_eq!(sessions[1].computer_id, host_b);
+        assert_eq!(counts(&computers[0]), (Some(1), Some(1), Some(1), Some(1)));
+        assert_eq!(counts(&computers[1]), (Some(1), Some(1), Some(0), Some(0)));
+    }
+
+    // A custom display label cannot claim a census identity; a proved address takes
+    // precedence over a raw name that belongs to another member, including this Mac.
+    let mut identities = rows.clone();
+    let mut identity_tabs = Vec::new();
+    let (cached, cached_tabs) = cached_configured_computer(
+        host_a.to_owned(),
+        "m100".into(),
+        "10.0.0.7".into(),
+        Some(&state(first)),
+    );
+    merge_cached_computer(
+        &mut identities,
+        &known,
+        "alpha",
+        cached,
+        cached_tabs,
+        &mut identity_tabs,
+    );
+    assert_eq!(identities.len(), rows.len() + 1);
+    assert_eq!(
+        identities[0].session_scope,
+        TabSessionScope::OneInstanceHeartbeat
+    );
+    assert_eq!(identity_tabs[0].computer_id, host_a);
+    let (cached, cached_tabs) = cached_configured_computer(
+        host_b.to_owned(),
+        "m15".into(),
+        "m100.local".into(),
+        Some(&state(first)),
+    );
+    merge_cached_computer(
+        &mut identities,
+        &known,
+        "m15",
+        cached,
+        cached_tabs,
+        &mut identity_tabs,
+    );
+    assert_eq!(identities.len(), rows.len() + 1);
+    assert_eq!(counts(&identities[0]), (Some(1), Some(1), Some(1), Some(1)));
+    assert_eq!(identity_tabs.len(), 2);
+    assert_eq!(identity_tabs[1].computer_id, "swarm/m100");
+    let (cached, cached_tabs) = cached_configured_computer(
+        host_b.to_owned(),
+        "m15".into(),
+        "10.0.0.8".into(),
+        Some(&state(first)),
+    );
+    merge_cached_computer(
+        &mut identities,
+        &known,
+        "m32",
+        cached,
+        cached_tabs,
+        &mut identity_tabs,
+    );
+    assert_eq!(
+        identity_tabs.len(),
+        2,
+        "raw aliases share the census session identity"
     );
 }

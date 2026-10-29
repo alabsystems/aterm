@@ -1271,12 +1271,9 @@ impl Cask {
                     fields.get("only_path").and_then(Value::as_str),
                 ) {
                     (Some(branch), Some(path))
-                        if !branch.is_empty()
-                            && !branch.contains('/')
+                        if super::single_normal_segment(branch)
                             && !path.is_empty()
-                            && std::path::Path::new(path)
-                                .components()
-                                .all(|c| matches!(c, std::path::Component::Normal(_))) =>
+                            && path.split('/').all(super::single_normal_segment) =>
                     {
                         Some((branch.to_string(), path.to_string()))
                     }
@@ -1419,14 +1416,12 @@ pub fn version_cmp(a: &str, b: &str) -> Ordering {
 }
 
 fn split_revision(v: &str) -> (String, u64) {
-    for sep in ['_', '-'] {
-        if let Some((head, tail)) = v.rsplit_once(sep)
-            && let Ok(n) = tail.parse::<u64>()
-            && tail.chars().all(|c| c.is_ascii_digit())
-            && !head.is_empty()
-        {
-            return (head.to_string(), n);
-        }
+    if let Some((head, tail)) = v.rsplit_once('_')
+        && let Ok(n) = tail.parse::<u64>()
+        && tail.chars().all(|c| c.is_ascii_digit())
+        && !head.is_empty()
+    {
+        return (head.to_string(), n);
     }
     (v.to_string(), 0)
 }
@@ -1573,6 +1568,12 @@ mod tests {
         assert_eq!(version_cmp("2.0beta2", "2.0rc1"), Ordering::Less);
         assert_eq!(version_cmp("1.2.3_1", "1.2.3"), Ordering::Greater);
         assert_eq!(version_cmp("2024.01", "2023.12"), Ordering::Greater);
+        assert_eq!(version_cmp("2024-01-15", "2024-02"), Ordering::Less);
+        assert_eq!(
+            version_cmp("1.0.0-alpha.1", "1.0.0-alpha-2"),
+            Ordering::Less
+        );
+        assert_eq!(version_cmp("1-2", "1.1"), Ordering::Greater);
     }
 
     #[test]

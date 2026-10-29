@@ -86,12 +86,16 @@ pub fn endpoints(lsof_f: &str) -> BTreeSet<String> {
     let (mut pid, mut cmd, mut proto) = (String::new(), String::new(), String::new());
     let mut out = BTreeSet::new();
     for l in lsof_f.lines() {
-        let (tag, rest) = l.split_at(l.len().min(1));
+        let mut chars = l.chars();
+        let Some(tag) = chars.next() else {
+            continue;
+        };
+        let rest = chars.as_str();
         match tag {
-            "p" => rest.clone_into(&mut pid),
-            "c" => rest.clone_into(&mut cmd),
-            "P" => rest.clone_into(&mut proto),
-            "n" => {
+            'p' => rest.clone_into(&mut pid),
+            'c' => rest.clone_into(&mut cmd),
+            'P' => rest.clone_into(&mut proto),
+            'n' => {
                 let (kind, remote) = match rest.split_once("->") {
                     Some((_, r)) => ("conn", r),
                     None if rest.split(" (").next() == Some("*:*") => ("unbound", rest),
@@ -269,6 +273,10 @@ mod tests {
                 "aterm[3] UDP unbound *:*",
             ]
         );
+        // Untrusted lsof lines starting with multi-byte UTF-8 or empty lines never panic.
+        let multibyte = "—banner\n\np4\ncλ-daemon\nPTCP\nn127.0.0.1:9000\n✓trailing\n";
+        let e: Vec<String> = endpoints(multibyte).into_iter().collect();
+        assert_eq!(e, ["λ-daemon[4] TCP listen 127.0.0.1:9000"]);
     }
 
     /// The empty directories under `top` that `tmp_cleaner`'s own test

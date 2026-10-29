@@ -77,7 +77,7 @@ id	kind	functions	statement	subsumes	difficulty	gaps
 assertion-semantics	contract	pikevm::satisfied, unicode::is_word	∀ t, at ∈ Bnd(t), with wb = (the char before at exists ∧ is_word) and wa = (the char at at exists ∧ is_word): StartText ⇔ at=0; EndText ⇔ at=|t|; StartLine ⇔ at=0 ∨ t[..at] ends with '\n'; EndLine ⇔ at=|t| ∨ t[at..] starts with '\n'; WordBoundary ⇔ wb≠wa; NotWordBoundary ⇔ wb=wa; WordStart ⇔ ¬wb ∧ wa; WordEnd ⇔ wb ∧ ¬wa. The haystack is never sliced at the search start, so ^ and \b at a resume point see the whole text. A combining mark is a word char, so a+U+0301 has no inner boundary.	src/pikevm.rs::assertions_read_the_surrounding_code_points	EASY: &str get(..at)/get(at..), chars().next_back()/next(), char comparison, a call to is_word (tables, via perl-class-tables)	0, 1, 3, 5
 classset-byte-size	contract	parse::ClassSet::byte_size	byte_size(s) = size_of::<ClassSet>() + |s.ranges|·size_of::<(char,char)>() + |s.perls|·size_of::<PerlClass>(). So it is ≥ size_of::<ClassSet>() and strictly increasing in |ranges|. This is the class term of cost(prog) in compile-size-ceiling.	src/parse.rs::classes_report_their_size	TRIVIAL: size_of constants, Vec len, usize arithmetic	0, 1, 3
 range-tables-well-formed	table-property	unicode::{ND, MARK, PC, FOLD}	For each T ∈ {ND, MARK, PC} and all i: T[i].0 ≤ T[i].1 ≤ 0x10FFFF (the last entry included) and T[i].1 + 1 < T[i+1].0, so the ranges are sorted, disjoint and non-adjacent. The FOLD keys are strictly increasing. This is the precondition of in_ranges and fold_next, and it is decidable by evaluating the static tables.	src/unicode.rs::range_tables_are_well_formed	EASY: evaluation of a static slice (decide); no fn body	0, 1, 5, 7
-builder-knobs	contract	RegexBuilder::{new, size_limit, dfa_size_limit, step_limit, build}, Regex::{new, step_limit}	RegexBuilder::new(p) has size_limit = 10 MiB, step_limit = 2^26 and Flags::default(). size_limit(n) and step_limit(n) set exactly that field. dfa_size_limit(n) is the identity on the builder, so build() is independent of it. build() copies step_limit into Regex::step_limit(). Regex::new(p) = RegexBuilder::new(p).build(). The read-back get_step_limit() is #[cfg(test)]-only, so the spec states a field equality instead.	tests/bounds.rs::dfa_size_limit_is_accepted_and_inert, src/lib.rs::the_step_limit_is_the_thing_that_decides (builder half)	EASY: by-value builder methods (move self), a String field, struct update	0, 1, 2, 3
+builder-knobs	contract	RegexBuilder::{new, size_limit, step_limit, build}, Regex::{new, step_limit}	RegexBuilder::new(p) has size_limit = 10 MiB, step_limit = 2^26 and Flags::default(). size_limit(n) and step_limit(n) set exactly that field. build() copies step_limit into Regex::step_limit(). Regex::new(p) = RegexBuilder::new(p).build().	src/lib.rs::the_step_limit_is_the_thing_that_decides (builder half)	EASY: by-value builder methods (move self), a String field, struct update	0, 1, 2, 3
 regex-metadata	contract	Regex::{as_str, clone}, <Regex as Display>::fmt, <Regex as Debug>::fmt, <Regex as FromStr>::from_str	∀ p with Regex::new(p) = Ok(re): re.as_str() = p; format!("{re}") = format!("{re:?}") = p; p.parse::<Regex>() = Regex::new(p); re.clone() shares prog and cut_short and agrees with re on every entry point and haystack. Regex: Send + Sync is checked by the type system and needs no proof.	-	EASY: Arc<str>, trait impls (Display/Debug/FromStr), Formatter write_str	0, 1, 3, 11
 parse-refusals	contract	parse::Parser::{parse_escape_char, parse_class, parse_flags, open_group}	∀ p whose first failing construct is one of these, P(p,f) = Err(Syntax(msg)), never Ok: \p or \P (msg contains 'Unicode property classes'); &&, -- or ~~ inside a class ('set operations'); a nested '[' that does not start a known POSIX name ('nested character classes'); (?-u) ('byte-oriented'); (?R) ('CRLF mode'); look-around ('look-around'); \digit ('backreferences'). An escaped \-, \& or \~ is always a literal.	tests/differential.rs::refusals_are_refusals	EASY-MEDIUM: peek/peek_at lookahead over Vec<char>, String formatting into Error::Syntax	0, 1, 3, 5
 parse-error-render	contract	parse::Parser::{error, err}, <Error as Display>::fmt, <StepLimitExceeded as Display>::fmt	P(p,f) = Err(e) ⇒ e = Syntax("regex parse error:\n    " ++ p ++ "\n    " ++ " "·min(pos,|chars(p)|) ++ "^\nerror: " ++ msg), where pos is the char index the failing branch sets (the opening position for unclosed groups, classes and repetitions) and msg is from a fixed finite nonempty set; so the rendering has length > 20 and contains 'error: '. Display(Syntax(s)) = s; Display(CompiledTooBig(l)) = "Compiled regex exceeds size limit of {l} bytes."; Display(StepLimitExceeded{limit}) = "regex search exceeded its step budget of {limit} units". Samples: ab[cd has its caret at 2, a(b at 1.	src/parse.rs::errors_quote_the_pattern_and_point_at_the_position	EASY-MEDIUM: format!, str repeat, usize min, Formatter write_str/write!; the 'pos' half needs the parser's cursor	0, 1, 3, 5
@@ -160,6 +160,7 @@ src/lib.rs	the_cut_short_flag_is_shared_with_clones	cut-short-sticky-shared
 src/lib.rs	the_default_budget_stops_the_runaway_scan	step-cost-lower-bound	
 src/lib.rs	the_step_limit_is_the_thing_that_decides	step-budget-contract	builder-knobs
 src/lib.rs	the_worst_admitted_program_still_fits_the_default_budget	pikevm-linear-cost	compile-size-ceiling
+src/lib.rs	step_budget_and_span_const_helpers_invariants	step-budget-contract	builder-knobs, match-offsets-and-accessors, escape-literal
 src/parse.rs	a_negated_posix_item_is_the_complement_of_its_folded_table	complement-exact	class-denotation
 src/parse.rs	classes_report_their_size	classset-byte-size	
 src/parse.rs	counted_repetition_tolerates_spaces	parse-quantifier	
@@ -182,7 +183,6 @@ tests/bounds.rs	adversarial_matching_input_is_also_linear	pikevm-linear-cost
 tests/bounds.rs	an_empty_body_repeat_collapses_instead_of_spinning	compile-terminates-linearly	
 tests/bounds.rs	an_unbounded_repetition_count_fails_fast_instead_of_allocating	compile-terminates-linearly	
 tests/bounds.rs	deeply_nested_patterns_are_rejected_rather_than_overflowing	parse-nesting-cap	no-panic-total
-tests/bounds.rs	dfa_size_limit_is_accepted_and_inert	builder-knobs	
 tests/bounds.rs	nesting_is_bounded_on_a_small_stack	no-panic-total	parse-nesting-cap
 tests/bounds.rs	offsets_are_byte_offsets_on_code_point_boundaries	match-offsets-and-accessors	perl-class-tables
 tests/bounds.rs	pathological_patterns_finish_promptly	pikevm-linear-cost	
@@ -237,49 +237,40 @@ Status (2026-10-15): `instruction_cost_covers_the_whole_program` (the **delete**
 | src/lib.rs::every_builtin_selection_rule_stays_far_inside_the_default | Calibration of a tuning constant. It bisects measured unit counts for 11 rule/haystack pairs, prints them, and pins the documented numbers (`per_row ≤ 2^22/8`). That is a margin about chosen inputs, not a property. Its "still matches under the default" half is sampled by `regex-reference-semantics` and `step-budget-contract`. | **move to bench** (`aterm-bench`), then delete |
 | tests/bounds.rs::scanning_a_long_haystack_is_linear | A wall-clock hang detector for one pattern. No general spec says `find_iter` is linear: it is quadratic for `\w+=|\w` (see `find-iter-shared-budget`). Only the per-search cost (`pikevm-linear-cost`) is linear. Its count assertion is a point sample of `regex-reference-semantics`. | **move to bench** (`aterm-bench`), then delete |
 
-Totals: move to bench 2. One more test is half calibration
-(`lib::a_find_iter_is_held_to_one_budget_not_one_per_match`, §5.7). Its spec half maps to
-`find-iter-shared-budget` and its bisection half goes to the bench.
+Totals: move to bench 2. `lib::a_find_iter_is_held_to_one_budget_not_one_per_match` (§5.7) now
+checks `find-iter-shared-budget` directly against `4 * one_search` without asserting the
+`one_search * 16 < 2^22` calibration margin.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
 1. **The wave count is off by one.** `wave1-chunks.json` lists 87 tests for aterm-regex, but
    there are 86 `#[test]` fns. `tests/regex_suite.rs` has none; only its doc comment mentions
    `#[test]`s.
-2. **The table well-formedness test skips entries.** `src/unicode.rs::range_tables_are_well_formed`
-   checks `w[0].0 <= w[0].1` over `table.windows(2)`, which is only the first range of each
-   window. The last range's `lo ≤ hi` is never checked, a one-entry table is never checked, and
-   nothing checks `hi ≤ 0x10FFFF`. `range-tables-well-formed` states all three.
-3. **A pinned builtin rule is stale.** The doc of `BUILTIN` in `tests/differential.rs` says
-   these are the eleven patterns `aterm-selection`'s builtin_patterns ships. But
-   `crates/aterm-selection/src/builtin_patterns.rs:26` ships
-   `(?:~|\.{1,2}|[a-zA-Z0-9._-]+)?(?:/[a-zA-Z0-9._-]+)+/?|[A-Za-z]:...` (which the
-   `step_budget_tests` in `src/lib.rs` carry), while differential.rs pins an older
-   `(?:/(?:[a-zA-Z0-9._-]+/)*...` form. `BUILTIN_DIGEST` therefore pins a rule the product no
-   longer ships. Re-derive it from the shipped list when the digest becomes a conformance test.
-4. **A doc names a missing feature that exists.** The doc of
-   `tests/bounds.rs::the_worst_program_under_the_ceiling_still_scans_a_row_promptly` says bounding
-   the scan "needs a step budget in the VM that the call sites opt into". That is stale:
-   `RegexBuilder::step_limit` exists and the `step_budget_tests` in `src/lib.rs` cover it.
-5. **Half of a prefilter test is vacuous for most of its inputs.** In
-   `src/compile.rs::the_prefilter_byte_map_marks_lead_bytes_only`, the half that checks "every
-   code point a pattern can start with has its lead byte marked" runs only when
-   `re.is_match(one code point)` is true. That is false for 8 of its 10 patterns (`abc`,
-   `\bcommit`, `[a-z]+x`, `foo|bar`, `\d+z`, `[^\s]x`, `你好`, `(?i)Hello`), so for them only the
-   continuation-byte half is tested. `prefilter-sets` states the lead-byte half over every
-   consuming pc in `K`.
+2. *(Resolved)* **`src/unicode.rs::range_tables_are_well_formed` now checks every entry.** Each table
+   asserts `!table.is_empty()`, `lo <= hi <= 0x10FFFF` across every `(lo, hi)` (the final entry
+   included), and `w[0].1 + 1 < w[1].0` across adjacent pairs, plus `<= 0x10FFFF` on `FOLD`.
+3. *(Resolved)* **Pinned builtin `file_path` rule aligned with `aterm-selection`.** `BUILTIN` in
+   `tests/differential.rs` now carries the shipped
+   `(?:~|\.{1,2}|[a-zA-Z0-9._-]+)?(?:/[a-zA-Z0-9._-]+)+/?|[A-Za-z]:...` pattern from
+   `crates/aterm-selection/src/builtin_patterns.rs`, `BUILTIN_DIGEST` is re-derived over the
+   shipped eleven rules, and `builtin_patterns_select_what_they_are_for` samples bare-relative
+   paths (`crates/aterm-regex/src/pikevm.rs`).
+4. *(Resolved)* **`tests/bounds.rs::the_worst_program_under_the_ceiling_still_scans_a_row_promptly` no
+   longer carries the stale missing-budget doc.**
+5. *(Resolved)* **`src/compile.rs::the_prefilter_byte_map_marks_lead_bytes_only` now inspects every
+   consuming pc in `prefilter.pcs` directly** (and checks `0x80..=0xC1` and `0xF5..=0xFF`), so all 10
+   patterns verify lead-byte marking instead of skipping multi-code-point patterns.
 6. **Golden digests cannot be retired by a proof alone.** The digests in
    `tests/differential.rs` and `PINNED` in `tests/fuzz.rs` are FNV hashes recorded when the
    outputs agreed with the regex crate. `Ref`'s agreement with the regex crate is empirical, so
    these should become the `Ref` `ty_model!`'s conformance test (with a negative control), per
    AGENTS.md. They should not be deleted.
-7. **One test mixes a spec with calibration.**
-   `src/lib.rs::a_find_iter_is_held_to_one_budget_not_one_per_match` checks a spec (one shared
-   budget truncates the iteration) and a calibration (`one_search * 16 < 2^22`, found by
-   bisection). Only the first half is a spec; the second goes with the bench (§4).
-8. **The step-limit read-back is test-only.** `get_step_limit()` is `#[cfg(test)]`, so
-   `builder-knobs` states the field equality instead. A proof about the shipped build can only
-   observe it through `Regex::step_limit()`.
+7. *(Resolved)* **`src/lib.rs::a_find_iter_is_held_to_one_budget_not_one_per_match` drops the
+   `one_search * 16 < 2^22` calibration assertion** and checks `find-iter-shared-budget` directly
+   with `step_limit(one_search * 4)`, verifying that a budget sufficient for multiple single searches
+   truncates across `find_iter` while linear `\w` completes.
+8. *(Resolved)* **Test-only `RegexBuilder::get_step_limit` removed.** `the_step_limit_is_the_thing_that_decides`
+   now observes builder step limits through `build()?.step_limit()`, matching the shipped API.
 
 ## 6. Proof order (easiest high-value first)
 

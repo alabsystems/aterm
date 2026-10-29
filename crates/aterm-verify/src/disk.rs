@@ -8,12 +8,17 @@
 //! since then a short volume showed only at `ENOSPC`, hours in, as a COULD NOT RUN row
 //! ([`crate::exec::Run::environment_failure`]). Now a run whose checks build claims, in the
 //! capacity ledger, what its directories (the main lane's build directory and `<target>/verify`)
-//! grew by in the last runs of this target ([`FOOTPRINT`]), or where none was measured
-//! [`COLD_BYTES`] less what they hold already. A volume short of it is relieved first (the build
-//! cache's pass under pressure, and inside aterm the window's disk watch), then waited for with a
-//! line a minute naming the need, the free space and the largest holders (`atpkg::admit_disk`).
+//! grew by in the last runs of this target, or held at their peak beyond what they hold now
+//! (a build directory reclaimed since is written again) but no more than [`COLD_BYTES`]
+//! ([`FOOTPRINT`]), or where none was measured [`COLD_BYTES`] less what they hold already. A peak
+//! further above what they hold measured more than one run writes (stale builds, or the build
+//! root before the cache moved), so it claims the budget. A volume short of it is relieved first
+//! (the build cache's pass under pressure, and inside aterm the window's disk watch), then waited
+//! for with a line a minute naming the need, the free space and the largest holders, after one
+//! saying why it needs that (`atpkg::admit_disk`).
 //! `--admit now` starts at once and says what it lacks. Only a need above what the volume holds
-//! over its floor is refused.
+//! over its floor is refused. A need above what it has free over its floor now waits for space
+//! freed, which no other run's end gives, and reserves nothing against the runs behind it.
 
 use std::path::{Path, PathBuf};
 
@@ -26,7 +31,8 @@ const GIB: u64 = 1 << 30;
 /// workspace at `932f1ef624` grew empty tracked directories by 61.1 GiB; AppKit then brought
 /// their peak to 63.2 GiB (`docs/measured/verify-disk-2026-10-27.md`). Round up with room for
 /// growth. A first run claims this less what its directories hold already; a run measured
-/// here claims what it wrote instead.
+/// here claims what it wrote instead, and at most this to write again what they held at its
+/// peak.
 pub const COLD_BYTES: u64 = 72 * GIB;
 
 /// The file in `<target>/verify` keeping what the last runs wrote (`aterm_capacity::Footprints`).

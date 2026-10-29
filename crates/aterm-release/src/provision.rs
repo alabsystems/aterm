@@ -223,14 +223,23 @@ pub fn run_provision(
     for (label, check) in layer::audit(&host) {
         record(label, check, &mut checks);
     }
+    if !check_only && let Some(line) = layer::settle_site_key(&host) {
+        step("release.site-key", &line);
+    }
 
     phase(
         3,
         "Apple certificate",
         "this machine's own Developer ID identity",
     );
-    let (apple_check, apple_sha1) = apple_identity_check(id, !check_only, cert_dir);
+    let (apple_check, apple_sha1) =
+        apple_identity_check(id, !check_only, leave(check_only), cert_dir);
     record(crate::apple::APPLE_LABEL, apple_check, &mut checks);
+    record(
+        KEYCHAIN_LABEL,
+        keychain_check(id, leave(check_only)),
+        &mut checks,
+    );
 
     phase(
         4,
@@ -286,9 +295,16 @@ pub fn run_provision(
         let check = match write_failed {
             Some(e) => Check::Fail {
                 what: e,
-                fix: "check ownership of ~/.aterm, then re-run".into(),
+                fix: "check ownership of ~/.aterm/release-ring, then re-run".into(),
             },
-            None => profile_check(&home, id, apple_sha1.as_deref(), derived_pubkey.as_deref()),
+            None => profile_check(
+                &home,
+                id,
+                apple_sha1.as_deref(),
+                derived_pubkey.as_deref(),
+                &crate::dev_identity::Bounded,
+                leave(check_only),
+            ),
         };
         checks.push(("profile", check));
     }
@@ -521,7 +537,7 @@ fn close(c: Closing<'_>) -> Result<()> {
     if let Some(r) = c.report {
         next.extend(report_next_before_cut(r));
     }
-    let profile_path = Path::new(c.home).join(".aterm/release-credentials.toml");
+    let profile_path = Path::new(c.home).join(atpkg_keys::provision::RELEASE_CREDENTIALS_REL);
     if c.key_exists && !c.host_cannot_cut && c.fails + c.waiting == 0 {
         next.push(cut_dry_run_next(&profile_path));
     }
@@ -681,9 +697,18 @@ fn admit_candidate(
     })
 }
 
-/// The pair already in `dist/`.
+/// A local pair admitted under the release's paper-master anchors.
 #[cfg(unix)]
 fn read_local_candidate(roster_path: &Path) -> Result<Option<Candidate>> {
+    read_local_candidate_with(roster_path, pins::PAPER_MASTER_PUBKEYS)
+}
+
+/// Read a local pair under the supplied anchors, without changing either half.
+#[cfg(unix)]
+fn read_local_candidate_with(
+    roster_path: &Path,
+    master_pubkeys: &[&str],
+) -> Result<Option<Candidate>> {
     let sig_path = machines::RosterDocument::signature_path(roster_path);
     let body = roster_path.exists();
     let sig = sig_path.exists();
@@ -703,15 +728,49 @@ fn read_local_candidate(roster_path: &Path) -> Result<Option<Candidate>> {
         )));
     }
     let doc = machines::RosterDocument::read(roster_path)?;
-    let c = admit_candidate(pins::PAPER_MASTER_PUBKEYS, doc.bytes, doc.signature).map_err(|e| {
+    let c = admit_candidate(master_pubkeys, doc.bytes, doc.signature).map_err(|e| {
         Error::new(format!(
-            "the dist/ roster pair is unusable: {e}. Refusing to overwrite local \
+            "the roster pair at {} is unusable: {e}. Refusing to overwrite local \
                  roster state this tool cannot prove — if it was a hand-copy, re-copy \
                  BOTH files from the source machine; remove both files to accept the \
                  channel release's pair instead",
+            roster_path.display(),
         ))
     })?;
     Ok(Some(c))
+}
+
+/// Audit every supplied local pair, keeping the newest admitted generation. A damaged
+/// pair or two different documents at one generation refuses instead of falling back.
+#[cfg(unix)]
+fn newest_local_candidate(paths: &[&Path], master_pubkeys: &[&str]) -> Result<Option<Candidate>> {
+    let mut selected: Option<(&Path, Candidate)> = None;
+    for &path in paths {
+        atpkg_keys::provision::refuse_pending_roster_transaction(&utf8_path(path)?)
+            .map_err(Error::new)?;
+        let Some(candidate) = read_local_candidate_with(path, master_pubkeys)? else {
+            continue;
+        };
+        if let Some((previous_path, previous)) = &selected {
+            if previous.roster.roster_seq == candidate.roster.roster_seq
+                && previous.bytes != candidate.bytes
+            {
+                return Err(Error::new(format!(
+                    "LINEAGE FORK: local roster pairs {} and {} both carry roster_seq {} \
+                     but their bytes differ — resolve the conflicting master-signed \
+                     documents before releasing",
+                    previous_path.display(),
+                    path.display(),
+                    candidate.roster.roster_seq,
+                )));
+            }
+            if previous.roster.roster_seq >= candidate.roster.roster_seq {
+                continue;
+            }
+        }
+        selected = Some((path, candidate));
+    }
+    Ok(selected.map(|(_, candidate)| candidate))
 }
 
 /// The latest channel release's pair, fetched anonymously and admitted.
@@ -917,16 +976,13 @@ pub(crate) fn publish_proven_pair(
         .map_err(|e| crate::ledger::Error::new(format!("write {}: {e}", roster_path.display())))
 }
 
-/// Durable copy of the roster generation under `~/.aterm` beside the key.
+/// Durable copy of the roster generation under `~/.aterm/release-ring` beside the key.
 #[cfg(unix)]
 fn kept_roster_path(home: &str) -> PathBuf {
-    Path::new(home)
-        .join(".aterm")
-        .join("roster")
-        .join(roster::ROSTER_ASSET)
+    Path::new(home).join(atpkg_keys::provision::RELEASE_ROSTER_REL)
 }
 
-/// Copy the pair `authorize_cut` just accepted into `~/.aterm/roster`.
+/// Copy the pair `authorize_cut` just accepted into `~/.aterm/release-ring/roster`.
 #[cfg(unix)]
 fn keep_roster_pair(roster_path: &Path, kept_path: &Path) -> Result<bool> {
     let doc = machines::RosterDocument::read(roster_path)?;
@@ -1383,9 +1439,10 @@ fn apple_clt_check() -> Check {
 fn apple_identity_check(
     id: &str,
     may_change: bool,
+    leave: crate::release_keychain::Leave,
     cert_dir: Option<&Path>,
 ) -> (Check, Option<String>) {
-    match crate::apple::acquire(id, may_change, cert_dir) {
+    match crate::apple::acquire(id, may_change, leave, cert_dir) {
         crate::apple::Outcome::Ready { ids, note } => {
             let mut msg = match ids.len() {
                 0 => {
@@ -1413,6 +1470,54 @@ fn apple_identity_check(
         | crate::apple::Outcome::Todo { what, next } => (Check::Todo { what, next }, None),
         crate::apple::Outcome::Blocked { what, fix } => (Check::Fail { what, fix }, None),
         crate::apple::Outcome::Skipped(why) => (Check::Skip(why), None),
+    }
+}
+
+/// The label of the release keychain's line.
+#[cfg(unix)]
+const KEYCHAIN_LABEL: &str = "keychain";
+
+/// What a run may do to the release keychain: `ship provision --check` and a dry
+/// `ship release` write nothing; provision and a real release's audit may re-assert its
+/// partition list, so their test signature runs.
+#[cfg(unix)]
+fn leave(look_only: bool) -> crate::release_keychain::Leave {
+    if look_only {
+        crate::release_keychain::Leave::Look
+    } else {
+        crate::release_keychain::Leave::Write
+    }
+}
+
+/// aterm's own release keychain ([`crate::release_keychain`]): missing, locked, holding the
+/// identity, its partition list set (a test signature passes; a look only opens it), and on
+/// the search list. Each gap's fix runs provision, which needs no login password.
+#[cfg(unix)]
+fn keychain_check(id: &str, leave: crate::release_keychain::Leave) -> Check {
+    if !cfg!(target_os = "macos") {
+        return Check::Skip("cuts run on macOS (Tier APPLE); no keychain on this host".into());
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return Check::CouldNotRun("HOME is not set".into());
+    };
+    keychain_check_in(Path::new(&home), id, &crate::dev_identity::Bounded, leave)
+}
+
+/// [`keychain_check`] for the user whose home is `home`, every tool call through `run`.
+#[cfg(unix)]
+fn keychain_check_in(
+    home: &Path,
+    id: &str,
+    run: &dyn crate::dev_identity::Run,
+    leave: crate::release_keychain::Leave,
+) -> Check {
+    let kc = crate::release_keychain::Keychains::new(home, run);
+    match kc.row(id, aterm_update_core::pins::APPLE_TEAM_ID, &|sha1| {
+        crate::apple::prove_can_sign(&kc, sha1, leave)
+    }) {
+        crate::release_keychain::Row::Ready(line) => Check::Pass(line),
+        crate::release_keychain::Row::Todo { what, next } => Check::Todo { what, next },
+        crate::release_keychain::Row::Blocked { what, fix } => Check::Fail { what, fix },
     }
 }
 
@@ -1477,10 +1582,10 @@ pub struct Finding {
     pub state: Audited,
 }
 
-/// The machine audit `ship release` runs.
+/// The machine audit `ship release` runs, using its explicitly selected profile when given.
 #[cfg(unix)]
 #[must_use]
-pub fn audit(repo: &Path, id: &str) -> Vec<Finding> {
+pub fn audit(repo: &Path, id: &str, profile: Option<&Path>, dry: bool) -> Vec<Finding> {
     let mut found: Vec<(&'static str, Check)> = Vec::new();
     let Ok(home) = std::env::var("HOME") else {
         return vec![Finding {
@@ -1492,8 +1597,9 @@ pub fn audit(repo: &Path, id: &str) -> Vec<Finding> {
         found.push((
             "roster",
             Check::Owner {
-                what: "this machine names no roster id (no ~/.aterm/machine.toml, no machine_id \
-                       in its credentials profile) — the cut signs only as a rostered machine"
+                what: "this machine names no roster id (no ~/.aterm/release-ring/machine.toml, \
+                       no machine_id in its credentials profile) — the cut signs only as a \
+                       rostered machine"
                     .into(),
                 fix: format!("{SHIP} provision --id <its roster id> (docs/RELEASE-KEYS.md)"),
             },
@@ -1509,8 +1615,9 @@ pub fn audit(repo: &Path, id: &str) -> Vec<Finding> {
     found.push(("rust shims", rust_shim_check()));
     found.push(("x86 slice", x86_slice_check()));
     found.push(("apple sdk", apple_clt_check()));
-    let (apple, apple_sha1) = apple_identity_check(id, false, None);
+    let (apple, apple_sha1) = apple_identity_check(id, false, leave(dry), None);
     found.push((crate::apple::APPLE_LABEL, apple));
+    found.push((KEYCHAIN_LABEL, keychain_check(id, leave(dry))));
     found.push(("notary", notary_check()));
     let slug = std::fs::read_to_string(repo.join("Cargo.toml"))
         .map_err(|e| Error::new(format!("read {}/Cargo.toml: {e}", repo.display())))
@@ -1520,26 +1627,41 @@ pub fn audit(repo: &Path, id: &str) -> Vec<Finding> {
         Ok(slug) => found.push(("channel", channel_token_check(slug, false))),
         Err(e) => found.push(("channel", Check::CouldNotRun(e.to_string()))),
     }
-    let derived = sign::ReleaseCredentials::resolve(None, repo)
+    let resolved = sign::ReleaseCredentials::resolve(profile, repo)
         .ok()
-        .flatten()
-        .map(|c| c.pubkey().to_string());
+        .flatten();
+    let derived = resolved.as_ref().map(|c| c.pubkey().to_string());
+    let profile_path = profile.map_or_else(
+        || Path::new(&home).join(atpkg_keys::provision::RELEASE_CREDENTIALS_REL),
+        Path::to_path_buf,
+    );
     found.push((
         "profile",
-        profile_check(&home, id, apple_sha1.as_deref(), derived.as_deref()),
+        profile_check_at(
+            &profile_path,
+            &home,
+            id,
+            apple_sha1.as_deref(),
+            derived.as_deref(),
+            &crate::dev_identity::Bounded,
+            leave(dry),
+        ),
     ));
     let roster = slug.and_then(|slug| {
         let roster_path = repo.join("dist").join(roster::ROSTER_ASSET);
-        atpkg_keys::provision::refuse_pending_roster_transaction(&utf8_path(&roster_path)?)
-            .map_err(Error::new)?;
-        let local = match read_local_candidate(&roster_path)? {
-            Some(local) => Some(local),
-            None => read_local_candidate(&kept_roster_path(&home))?,
-        };
+        let kept_path = kept_roster_path(&home);
+        let mut paths = vec![roster_path.as_path(), kept_path.as_path()];
+        if let Some(named) = resolved
+            .as_ref()
+            .and_then(sign::ReleaseCredentials::machine_roster)
+        {
+            paths.push(named);
+        }
+        let local = newest_local_candidate(&paths, pins::PAPER_MASTER_PUBKEYS)?;
         let fetched = fetch_channel_candidate(&slug);
         let (chosen, _, _) = choose_candidate(&roster_path, &slug, local, fetched)?;
         let pubkey = derived.clone().ok_or_else(|| {
-            Error::new("this machine holds no release key (~/.aterm/machine.key)")
+            Error::new("this machine holds no release key (~/.aterm/release-ring/machine.key)")
         })?;
         authorize(chosen.bytes, &chosen.sig, &pubkey)
     });
@@ -1568,7 +1690,12 @@ pub fn audit(repo: &Path, id: &str) -> Vec<Finding> {
 /// [`audit`] off unix.
 #[cfg(not(unix))]
 #[must_use]
-pub fn audit(_repo: &std::path::Path, _id: &str) -> Vec<Finding> {
+pub fn audit(
+    _repo: &std::path::Path,
+    _id: &str,
+    _profile: Option<&std::path::Path>,
+    _dry: bool,
+) -> Vec<Finding> {
     vec![Finding {
         label: "toolchain",
         state: Audited::Gap {
@@ -1806,11 +1933,27 @@ fn profile_check(
     id: &str,
     apple_sha1: Option<&str>,
     machine_pubkey: Option<&str>,
+    run: &dyn crate::dev_identity::Run,
+    leave: crate::release_keychain::Leave,
+) -> Check {
+    let path = Path::new(home).join(atpkg_keys::provision::RELEASE_CREDENTIALS_REL);
+    profile_check_at(&path, home, id, apple_sha1, machine_pubkey, run, leave)
+}
+
+/// Audit exactly the profile the cut will load, including its permissions and identity.
+#[cfg(unix)]
+fn profile_check_at(
+    path: &Path,
+    home: &str,
+    id: &str,
+    apple_sha1: Option<&str>,
+    machine_pubkey: Option<&str>,
+    run: &dyn crate::dev_identity::Run,
+    leave: crate::release_keychain::Leave,
 ) -> Check {
     if !cfg!(target_os = "macos") {
         return Check::Skip("cuts run on macOS (Tier APPLE)".into());
     }
-    let path = Path::new(home).join(".aterm/release-credentials.toml");
     let rewrite = format!(
         "move {} aside and re-run `{SHIP} provision --id {id}` — provision writes it",
         path.display()
@@ -1831,7 +1974,7 @@ fn profile_check(
             fix: format!("re-run `{SHIP} provision --id {id}` — provision writes it"),
         };
     }
-    let creds = match sign::ReleaseCredentials::load(&path, Some(Path::new(home))) {
+    let creds = match sign::ReleaseCredentials::load(path, Some(Path::new(home))) {
         Ok(c) => c,
         Err(e) => {
             return Check::Fail {
@@ -1877,12 +2020,20 @@ fn profile_check(
     }
     match (creds.signing_identity_sha1(), apple_sha1) {
         (Some(pinned), Some(proved)) if !pinned.eq_ignore_ascii_case(proved) => {
-            match crate::apple::pinned_identity_proves(pinned) {
-                Ok(()) => Check::Pass(format!(
+            let kc = crate::release_keychain::Keychains::new(Path::new(home), run);
+            match crate::apple::pinned_identity_proves(&kc, pinned, leave) {
+                Ok(crate::release_keychain::Proof::Signed) => Check::Pass(format!(
                     "{} pins signing_identity_sha1 {pinned} — installed, valid and proved \
                      to sign (this run's first-listed identity was {proved}; both are \
                      usable)",
                     path.display()
+                )),
+                Ok(crate::release_keychain::Proof::Opened) => Check::Pass(format!(
+                    "{} pins signing_identity_sha1 {pinned} — installed and valid in the \
+                     release keychain, which opens; {} (this run's first-listed identity was \
+                     {proved}; both are usable)",
+                    path.display(),
+                    crate::release_keychain::OPENED_NOTE
                 )),
                 Err(why) => Check::Fail {
                     what: format!(
@@ -1997,6 +2148,66 @@ fn now_unix() -> Result<u64> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// `--check` and a dry release promise no writes, so they only look at the release
+    /// keychain; a provision run and a real release's audit may re-assert its partition list.
+    #[cfg(unix)]
+    #[test]
+    fn a_check_only_looks_at_the_release_keychain() {
+        use crate::release_keychain::Leave;
+        assert_eq!(leave(true), Leave::Look);
+        assert_eq!(leave(false), Leave::Write);
+    }
+
+    /// The keychain line follows its `leave`: a look (the line's, and the pinned identity's
+    /// proof) opens a held identity's keychain and writes nothing else, and runs no codesign
+    /// even with its key's partition list gone; a write re-asserts the partition list and
+    /// test-signs.
+    #[cfg(unix)]
+    #[test]
+    fn the_keychain_line_looks_or_test_signs_as_told() {
+        use crate::release_keychain::fake::{Fake, World};
+        use crate::release_keychain::{Keychains, Leave, OPENED_NOTE, login_keychain_path};
+        let sha1 = "D".repeat(40);
+        let scratch = aterm_tempfile::tempdir().expect("scratch HOME");
+        let home = std::fs::canonicalize(scratch.path()).expect("canonical scratch");
+        let mut world = World::new(&sha1);
+        world.search_list = vec![login_keychain_path(&home)];
+        let fake = Fake::new(world);
+        let kc = Keychains::new(&home, &fake);
+        kc.install_pair(&home.join("c.cer"), &home.join("k.key"))
+            .expect("install");
+        let release = kc.release();
+        fake.0
+            .borrow_mut()
+            .keychains
+            .get_mut(&release)
+            .unwrap()
+            .partition = false;
+        fake.0.borrow_mut().log.clear();
+
+        let Check::Pass(line) = keychain_check_in(&home, "m9", &fake, Leave::Look) else {
+            panic!("a held identity is ready to a look");
+        };
+        assert!(line.contains(OPENED_NOTE), "{line}");
+        assert_eq!(
+            crate::apple::pinned_identity_proves(&kc, &sha1, Leave::Look),
+            Ok(crate::release_keychain::Proof::Opened)
+        );
+        let changed: Vec<_> = fake
+            .writes()
+            .into_iter()
+            .filter(|c| c[1] != "unlock-keychain")
+            .collect();
+        assert!(changed.is_empty(), "a look only unlocks: {changed:?}");
+        assert!(fake.calls("codesign", "--force").is_empty());
+
+        let Check::Pass(line) = keychain_check_in(&home, "m9", &fake, Leave::Write) else {
+            panic!("a write re-asserts and signs");
+        };
+        assert!(line.contains("a test signature passed"), "{line}");
+        assert!(fake.0.borrow().keychains[&release].partition);
+    }
 
     /// The audit's shim line is the build's own refusal, over the `rustup` row's answer: a
     /// symlinked cargo beside it (how one machine's rustup linked it) fails with the build's
@@ -2232,6 +2443,66 @@ mod tests {
         (s.pubkey_b64().expect("pubkey"), bytes, sig)
     }
 
+    /// The selected profile's valid pair is considered alongside the other local copies.
+    /// Newer removal, a fork, a damaged signature and a half-pair all refuse admission.
+    #[test]
+    fn profile_roster_participates_without_hiding_newer_or_invalid_local_state() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let dist = scratch.path().join("dist/aterm-machines.toml");
+        let kept = scratch.path().join("kept/aterm-machines.toml");
+        let named = scratch.path().join("profile/aterm-machines.toml");
+        let master = seed().pubkey_b64().unwrap();
+        let write = |path: &Path, seq, members, revoked| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let bytes = roster_with(seq, members, revoked)
+                .to_toml()
+                .unwrap()
+                .into_bytes();
+            let sig = seed().sign(&bytes).unwrap();
+            std::fs::write(path, bytes).unwrap();
+            std::fs::write(machines::RosterDocument::signature_path(path), sig).unwrap();
+        };
+        let choose = || newest_local_candidate(&[&dist, &kept, &named], &[&master]);
+        let authorize = |candidate: Candidate| {
+            machines::authorize_cut(
+                &[&master],
+                candidate.bytes,
+                &candidate.sig,
+                &pubkey_of(0x23),
+                1_793_000_000,
+            )
+        };
+
+        write(&dist, 3, vec![machine("m3", 0x42)], vec![]);
+        write(&named, 5, vec![machine("m23", 0x23)], vec![]);
+        let chosen = choose().unwrap().unwrap();
+        assert_eq!(chosen.roster.roster_seq, 5);
+        assert_eq!(authorize(chosen).unwrap().machine_id, "m23");
+
+        write(&kept, 7, vec![machine("m3", 0x42)], vec!["m23".into()]);
+        let chosen = choose().unwrap().unwrap();
+        assert_eq!(chosen.roster.roster_seq, 7);
+        assert!(
+            authorize(chosen).is_err(),
+            "the older profile cannot restore membership"
+        );
+
+        write(&named, 7, vec![machine("m23", 0x23)], vec![]);
+        assert!(
+            choose().is_err(),
+            "different signed documents at one generation refuse"
+        );
+
+        write(&named, 5, vec![machine("m23", 0x23)], vec![]);
+        let signature = machines::RosterDocument::signature_path(&named);
+        let mut damaged = std::fs::read(&signature).unwrap();
+        damaged[0] ^= 1;
+        std::fs::write(&signature, damaged).unwrap();
+        assert!(choose().is_err(), "a bad named signature is never ignored");
+        std::fs::remove_file(&signature).unwrap();
+        assert!(choose().is_err(), "a half named pair is never ignored");
+    }
+
     #[test]
     fn admission_requires_the_master_signature() {
         let (master, bytes, sig) = signed_candidate(7);
@@ -2357,16 +2628,71 @@ mod tests {
         )
     }
 
+    /// An alternate profile is audited in place; neither an absent nor an invalid default
+    /// changes which credentials the cut selected. Its own permissions still apply.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_explicit_profile_is_audited_without_replacing_the_default() {
+        use crate::release_keychain::Leave;
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let home = scratch.path();
+        let home_s = home.to_str().unwrap();
+        let explicit = home.join("selected.toml");
+        let default = home.join(atpkg_keys::provision::RELEASE_CREDENTIALS_REL);
+        let (key, pubkey) = signing_key_b64();
+        let sha1 = "0".repeat(40);
+        let good = format!(
+            "signing_key = \"{key}\"\nmachine_id = \"m9\"\nnotary_profile = \"notary\"\n\
+             signing_identity_sha1 = \"{sha1}\"\n"
+        );
+        std::fs::write(&explicit, &good).unwrap();
+        std::fs::set_permissions(&explicit, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let fake = crate::release_keychain::fake::Fake::new(
+            crate::release_keychain::fake::World::new(&"F".repeat(40)),
+        );
+        let check = || {
+            profile_check_at(
+                &explicit,
+                home_s,
+                "m9",
+                Some(&sha1),
+                Some(&pubkey),
+                &fake,
+                Leave::Look,
+            )
+        };
+        assert!(!default.exists());
+        assert!(matches!(check(), Check::Pass(_)));
+        assert!(
+            !default.exists(),
+            "the audit does not materialize a default"
+        );
+
+        std::fs::create_dir_all(default.parent().unwrap()).unwrap();
+        std::fs::write(&default, "invalid default").unwrap();
+        assert!(matches!(check(), Check::Pass(_)));
+        assert_eq!(std::fs::read(&explicit).unwrap(), good.as_bytes());
+        assert_eq!(std::fs::read(&default).unwrap(), b"invalid default");
+
+        std::fs::write(&default, &good).unwrap();
+        std::fs::set_permissions(&default, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&explicit, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(check(), Check::Fail { .. }));
+        assert_eq!(std::fs::read(&explicit).unwrap(), good.as_bytes());
+    }
+
     /// The audit refuses exactly what the cut refuses: each profile below is one the cut
     /// rejects on its first line.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_profile_audit_refuses_what_the_cut_refuses() {
+        use crate::release_keychain::Leave;
         use std::os::unix::fs::PermissionsExt as _;
         let home = std::env::temp_dir().join(format!("provision-profile-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(home.join(".aterm")).unwrap();
-        let path = home.join(".aterm/release-credentials.toml");
+        std::fs::create_dir_all(home.join(atpkg_keys::provision::RELEASE_RING_REL)).unwrap();
+        let path = home.join(atpkg_keys::provision::RELEASE_CREDENTIALS_REL);
         let home_s = home.to_str().unwrap().to_string();
         let sha1 = "0".repeat(40);
 
@@ -2382,29 +2708,79 @@ mod tests {
 
         let (key, pubkey) = signing_key_b64();
         let mine = Some(pubkey.as_str());
+        // Keychains modelled in the scratch HOME, holding no identity: no real one is read.
+        let fake = crate::release_keychain::fake::Fake::new(
+            crate::release_keychain::fake::World::new(&"F".repeat(40)),
+        );
 
-        refusal(profile_check(&home_s, "m9", Some(&sha1), mine));
+        refusal(profile_check(
+            &home_s,
+            "m9",
+            Some(&sha1),
+            mine,
+            &fake,
+            Leave::Look,
+        ));
 
         write(
             &format!("notary_profile = \"notary\"\nsigning_identity_sha1 = \"{sha1}\"\n"),
             0o600,
         );
-        refusal(profile_check(&home_s, "m9", Some(&sha1), mine));
+        refusal(profile_check(
+            &home_s,
+            "m9",
+            Some(&sha1),
+            mine,
+            &fake,
+            Leave::Look,
+        ));
 
         let good = format!(
             "signing_key = \"{key}\"\nmachine_id = \"m9\"\nnotary_profile = \"notary\"\n\
              signing_identity_sha1 = \"{sha1}\"\n"
         );
         write(&good, 0o644);
-        refusal(profile_check(&home_s, "m9", Some(&sha1), mine));
+        refusal(profile_check(
+            &home_s,
+            "m9",
+            Some(&sha1),
+            mine,
+            &fake,
+            Leave::Look,
+        ));
 
         write(&good, 0o600);
-        refusal(profile_check(&home_s, "m9", Some(&"1".repeat(40)), mine));
+        refusal(profile_check(
+            &home_s,
+            "m9",
+            Some(&"1".repeat(40)),
+            mine,
+            &fake,
+            Leave::Look,
+        ));
+        assert!(
+            !fake.calls("security", "find-identity").is_empty(),
+            "the pinned identity is looked up in the modelled keychains"
+        );
 
-        refusal(profile_check(&home_s, "m8", Some(&sha1), mine));
+        refusal(profile_check(
+            &home_s,
+            "m8",
+            Some(&sha1),
+            mine,
+            &fake,
+            Leave::Look,
+        ));
 
         let (_, other) = signing_key_b64();
-        refusal(profile_check(&home_s, "m9", Some(&sha1), Some(&other)));
+        refusal(profile_check(
+            &home_s,
+            "m9",
+            Some(&sha1),
+            Some(&other),
+            &fake,
+            Leave::Look,
+        ));
 
         write(
             &format!(
@@ -2413,23 +2789,37 @@ mod tests {
             ),
             0o600,
         );
-        refusal(profile_check(&home_s, "m9", Some(&sha1), mine));
+        refusal(profile_check(
+            &home_s,
+            "m9",
+            Some(&sha1),
+            mine,
+            &fake,
+            Leave::Look,
+        ));
 
         write(
             &format!("{good}machine_roster = \"~/fleet/roster.toml\"\n"),
             0o600,
         );
-        refusal(profile_check(&home_s, "m9", Some(&sha1), mine));
+        refusal(profile_check(
+            &home_s,
+            "m9",
+            Some(&sha1),
+            mine,
+            &fake,
+            Leave::Look,
+        ));
         std::fs::create_dir_all(home.join("fleet")).unwrap();
         std::fs::write(home.join("fleet/roster.toml"), "").unwrap();
         assert!(matches!(
-            profile_check(&home_s, "m9", Some(&sha1), mine),
+            profile_check(&home_s, "m9", Some(&sha1), mine, &fake, Leave::Look),
             Check::Pass(_)
         ));
 
         write(&good, 0o600);
         assert!(matches!(
-            profile_check(&home_s, "m9", Some(&sha1), mine),
+            profile_check(&home_s, "m9", Some(&sha1), mine, &fake, Leave::Look),
             Check::Pass(_)
         ));
         write(
@@ -2437,7 +2827,7 @@ mod tests {
             0o600,
         );
         assert!(matches!(
-            profile_check(&home_s, "m9", Some(&sha1), mine),
+            profile_check(&home_s, "m9", Some(&sha1), mine, &fake, Leave::Look),
             Check::Pass(_)
         ));
         let _ = std::fs::remove_dir_all(&home);

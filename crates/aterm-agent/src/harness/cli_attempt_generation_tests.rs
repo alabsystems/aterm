@@ -179,14 +179,14 @@ fn completed_cli_signins_recover_all_records_without_another_provider_login() {
         };
         let mut out = Vec::new();
         let mut err = Vec::new();
-        if cli == Cli::Claude {
+        let _exit = if cli == Cli::Claude {
             run_accounts_renew(
                 &env,
                 &host,
                 (&["main".into()], false, None),
                 &mut out,
                 &mut err,
-            );
+            )
         } else {
             run_accounts_renew_for(
                 cli,
@@ -195,8 +195,8 @@ fn completed_cli_signins_recover_all_records_without_another_provider_login() {
                 (&["main".into()], false, None),
                 &mut out,
                 &mut err,
-            );
-        }
+            )
+        };
         let staging = host.staging.borrow().clone().expect("provider flow ran");
         assert!(
             store.load(NOW).is_err(),
@@ -208,7 +208,7 @@ fn completed_cli_signins_recover_all_records_without_another_provider_login() {
         std::fs::rename(&witness, witness.with_extension("blocked")).unwrap();
         std::fs::rename(witness.with_extension("retained"), &witness).unwrap();
         assert_eq!(
-            run_accounts_report(cli, &env, true, &mut out, &mut err),
+            run_accounts_report((cli, Launch::default()), &env, true, &mut out, &mut err),
             ExitCode::SUCCESS
         );
         let after = store.load_logins(NOW).unwrap().0;
@@ -368,11 +368,11 @@ pub(crate) fn attempt_transition(
             };
             let mut out = Vec::new();
             let mut err = Vec::new();
-            if state["mode"] == 2 {
+            let _exit = if state["mode"] == 2 {
                 if cli == Cli::Claude {
-                    run_accounts_login(&env, &host, "main", &mut out, &mut err);
+                    run_accounts_login(&env, &host, "main", &mut out, &mut err)
                 } else {
-                    run_accounts_login_for(cli, &env, &host, "main", &mut out, &mut err);
+                    run_accounts_login_for(cli, &env, &host, "main", &mut out, &mut err)
                 }
             } else if cli == Cli::Claude {
                 run_accounts_renew(
@@ -381,7 +381,7 @@ pub(crate) fn attempt_transition(
                     (&["main".into()], false, None),
                     &mut out,
                     &mut err,
-                );
+                )
             } else {
                 run_accounts_renew_for(
                     cli,
@@ -390,8 +390,8 @@ pub(crate) fn attempt_transition(
                     (&["main".into()], false, None),
                     &mut out,
                     &mut err,
-                );
-            }
+                )
+            };
             let staging = host
                 .staging
                 .borrow()

@@ -76,6 +76,10 @@ pub struct HarnessStats {
     pub bad: u64,
     /// The window may be partial.
     pub cut: bool,
+    /// WHAT AGENTS THAT SUPERVISE THEMSELVES DID (a proven self-claim's acts, codex-alab's), by
+    /// the name each holder acts under ([`acts::claimant_name`]): never in the counts above, which
+    /// are aterm's own harness's, nor in [`Self::rows`] and [`Self::sessions`].
+    pub self_claimed: BTreeMap<String, SelfClaimed>,
     /// Each session's share of the counts above, by `sid`.
     pub by_session: Option<BTreeMap<String, Tally>>,
     /// The choices the harness made in the person's name inside the window.
@@ -117,8 +121,53 @@ pub struct Tally {
     pub upgraded: u64,
     /// When the newest escalation counted in the window was handed to a person (unix ms).
     pub last_escalated_ms: Option<i64>,
+    /// [`HarnessStats::self_claimed`]'s share: what each self-claim's holder did in the session.
+    pub self_claimed: BTreeMap<String, SelfClaimed>,
     /// The session's own ledger or journal may have lost the window's start.
     pub cut: bool,
+}
+
+/// What one agent that supervises itself did over a window, from the acts its proven claim
+/// recorded ([`approvals::SelfClaimRow`]), each counted under the act aterm's own act of its
+/// rule is, one count per act ([`acts::self_claim_sort`]): the words of aterm's own counts,
+/// booked apart from them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SelfClaimed {
+    /// Boxes it approved (`approve-all@v1`, the plan box's yes).
+    pub approved: u64,
+    /// Questions it answered.
+    pub answered: u64,
+    /// Turns it kept going.
+    pub continued: u64,
+    /// Work it carried past a wall.
+    pub resumed: u64,
+    /// Land's instruction and nudges it typed.
+    pub land_prompts: u64,
+    /// Its landings (`landed@v1`).
+    pub landed: u64,
+    /// Its re-execs onto a re-linked build (`upgrade@v1`).
+    pub upgraded: u64,
+    /// Every act it recorded in the window, those that count nothing included (a point left to a
+    /// person, a mail turn's receipt).
+    pub acts: u64,
+}
+
+impl SelfClaimed {
+    fn take(&mut self, act: &str) {
+        bump(&mut self.acts);
+        let slot = match acts::self_claim_sort(act).counter {
+            Some(Counter::Approved) => &mut self.approved,
+            Some(Counter::Answered) => &mut self.answered,
+            Some(Counter::Continued) => &mut self.continued,
+            Some(Counter::Resumed) => &mut self.resumed,
+            Some(Counter::LandPrompts) => &mut self.land_prompts,
+            Some(Counter::Declined) => return,
+            None if act == acts::RULE_LANDED => &mut self.landed,
+            None if act == acts::RULE_UPGRADE => &mut self.upgraded,
+            None => return,
+        };
+        bump(slot);
+    }
 }
 
 /// A count a row adds to: the window's total and, per session, its share.
@@ -254,7 +303,9 @@ impl HarnessStats {
         }
     }
 
-    /// No row of any file fell in the window: the page says the harness has done nothing there yet.
+    /// No row of aterm's own harness fell in the window (a self-claim's rows are in
+    /// [`Self::self_claimed`], never in [`Self::rows`]): the page says aterm's harness has done
+    /// nothing there yet.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.rows == 0
@@ -1052,6 +1103,10 @@ pub fn fold_ledger_line(acc: &mut HarnessStats, line: &str) {
 pub fn fold_ledger_row(acc: &mut HarnessStats, v: &Value, ts: i64) {
     let text = |k: &str| v.get(k).and_then(Value::as_str);
     let sid = text("sid").unwrap_or_default();
+    if let Some(row) = approvals::SelfClaimRow::of(v) {
+        fold_self_claim(acc, sid, &row, ts);
+        return;
+    }
     let rule = text("rule_id").unwrap_or("-");
     let outcome = text("decision").and_then(Outcome::from_word);
     let fact = approvals::is_fact_rule(rule);
@@ -1095,6 +1150,32 @@ pub fn fold_ledger_row(acc: &mut HarnessStats, v: &Value, ts: i64) {
     acc.count(sid, Count::Act(kind));
     if kind == Counter::Approved && text("reason").is_some_and(|r| r.starts_with("unproven:")) {
         acc.count(sid, Count::Unproven);
+    }
+}
+
+/// A PROVEN SELF-CLAIM'S ACT IS ITS HOLDER'S, NEVER ATERM'S: a [`approvals::SelfClaimRow`] in the
+/// window adds to its holder's [`HarnessStats::self_claimed`] and the session's share of it, and
+/// to no count, row or session of aterm's own harness; one that names no holder is a line no row
+/// is ([`HarnessStats::bad`]).
+fn fold_self_claim(acc: &mut HarnessStats, sid: &str, row: &approvals::SelfClaimRow<'_>, ts: i64) {
+    if row.holder.is_empty() {
+        bump(&mut acc.bad);
+        return;
+    }
+    if ts < acc.since_ms {
+        return;
+    }
+    let name = acts::claimant_name(row.holder);
+    acc.self_claimed
+        .entry(name.to_string())
+        .or_default()
+        .take(row.act);
+    if let Some(tally) = acc.tally(sid) {
+        tally
+            .self_claimed
+            .entry(name.to_string())
+            .or_default()
+            .take(row.act);
     }
 }
 

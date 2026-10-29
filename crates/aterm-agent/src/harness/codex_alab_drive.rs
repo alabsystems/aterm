@@ -360,6 +360,7 @@ pub(super) fn self_claimed_after_exit(
         resume_start: snap.start.clone(),
         pid: snap.pid,
         shell: snap.shell,
+        proc_start: snap.start.clone(),
         tab: tab.clone(),
         from: from.clone(),
         to: from,
@@ -463,6 +464,30 @@ fn relaunch_held(
             return said(r, "wait:managed-resume-writer");
         }
         return fail(opts, r, st, "managed-resume", &error.to_string());
+    }
+    // A row's own login reaches Codex only as `CODEX_AUTH_PATH`, and the program the line names
+    // runs whatever build atpkg serves now, which a rollback or a vendor pin can make one that
+    // ignores it and runs on `$CODEX_HOME/auth.json` while the pool still counts the session as
+    // the row's: refused, after the managed entry is in place, before anything is typed. Such a
+    // build serves only this machine's own login (`accounts_pool::launch_env_for`'s rule), and a
+    // relaunch resumes the conversation on the login it ran on, never another (moving a
+    // self-claimed session is codex-alab's own), so a session on the default login still
+    // relaunches and one on a row of its own waits for a build that keeps it; no pin is offered.
+    if st
+        .codex_auth_path
+        .as_deref()
+        .is_some_and(|auth| !auth.is_empty())
+        && let Some(exe) = st.resume_argv.first()
+        && let Some(why) = ca::auth_path_unread(Path::new(exe))
+    {
+        let detail = format!(
+            "the session ran on its own Codex account ({}), but {why}: this build runs only this \
+             machine's own login, and a relaunch never moves the conversation onto another, so \
+             relaunching it needs a codex-alab from its cd79a420c on (`aterm pkg update codex` \
+             once atpkg serves one); nothing was typed",
+            ca::AUTH_PATH_ENV
+        );
+        return fail(opts, r, st, "auth-path-unread", &detail);
     }
     st.line.clone_from(&line);
     save(opts, &key(&tab), st);
@@ -701,10 +726,24 @@ pub(super) fn carry_in_flight_with(
     if opts.dry_run {
         return said(r, format!("would-resume:{}", st.phase.word()));
     }
+    let see_gone = |st: &mut St| -> bool {
+        if st.exited_at != 0 || st.pid == 0 || k.alive(st.pid) {
+            return false;
+        }
+        st.exited_at = now_s();
+        true
+    };
     if hand_waits_out(opts, &mut st, session, |pid| k.alive(pid)) {
+        if see_gone(&mut st) {
+            save(opts, session, &st);
+        }
         return said(r, WAIT_HAND_LIFTS);
     }
-    if let Some((why, detail)) = expired(&st, now_s(), k) {
+    let stale = expired(&st, now_s(), k);
+    if see_gone(&mut st) {
+        save(opts, session, &st);
+    }
+    if let Some((why, detail)) = stale {
         let r = fail(opts, r, &mut st, why, &detail);
         save(opts, session, &st);
         return r;
@@ -844,7 +883,7 @@ pub(super) const LANE_RETIRED: &str = "codex-lane-retired";
 pub(super) fn expired(st: &St, now: u64, k: &dyn AlabKernel) -> Option<(&'static str, String)> {
     match st.phase {
         Phase::Exiting { at_s }
-            if now.saturating_sub(exit_clock(at_s, 0, st.hand_seen_s)) > STALE_S =>
+            if now.saturating_sub(exit_clock(at_s, st.exited_at, st.hand_seen_s)) > STALE_S =>
         {
             Some((
                 "stale-exit",

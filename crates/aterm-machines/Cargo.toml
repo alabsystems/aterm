@@ -70,8 +70,8 @@ aterm-log = { workspace = true }
 aterm-agent-names = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# The Command Line Tools' Low Data Mode look (port/low_data.rs): Network.framework's path
-# monitor takes its update handler as a block, on a dispatch queue.
+# The Command Line Tools' Low Data Mode look (port/low_data.rs): the first update of
+# Network.framework's path monitor (`aterm_objc::PathMonitor`).
 aterm-objc = { workspace = true }
 # The app macOS holds responsible for this process (`System::responsible_app`), which the
 # sign-out's Accessibility grant goes to.

@@ -17,6 +17,18 @@ fn reads(a: [u8; 3], b: [u8; 3]) -> f32 {
     contrast_ratio(pack(a), pack(b))
 }
 
+/// A value's ink at rest under a rule drawn in `gray` on `blank`'s pane, where it reads already:
+/// kept, unless the floor of its stub reads as loud, where it is lifted halfway to the lit ink
+/// (`true`).
+fn value_that_reads(gray: [u8; 3], blank: RenderCell) -> ([u8; 3], bool) {
+    let value = value_fg(gray, blank.fg);
+    if reads(greyed_on(gray, value, blank.bg), blank.bg) < reads(value, blank.bg) {
+        (value, false)
+    } else {
+        (mix(value, legible_on(blank.fg, blank.bg), 0.5), true)
+    }
+}
+
 struct Side {
     name: &'static str,
     accent: [u8; 3],
@@ -222,15 +234,36 @@ fn every_fact_mark_reads_on_every_ground() {
     );
 }
 
+/// EVERY FACT WORD READS ON EVERY GROUND: a value at 4.5:1 and a hidden fact's stub at 4.5:1 and
+/// quieter than the quietest value, by its ink. Every value is bold. On a light ground the stub
+/// keeps the values' weight, since a thin dark stroke at the subscript size covers no whole pixel
+/// and reads lighter than its ink; on a dark ground it stays thin (owner ruling 2026-10-28: the
+/// black theme keeps main's stub). NEGATIVE CONTROLS: a bold stub everywhere fails the dark pin, a
+/// thin one everywhere the light pin. On glass (the lab's `pls` frames of Claude Code 2.1.305 at
+/// 80 x 40, scale 2, 2026-10-28, not kept), the bold stub's darkest pixel on Default Light
+/// reaches its ink, #717171 at 4.55:1, in 9 of its 10 inked cells (the eleventh is the gap
+/// between words); its last inked cell reads #737373 at 4.42:1, just under the 4.5:1 this test
+/// asks of the ink. The dark stub stays main's (#858585 at 5.04:1 at best, its weakest cell
+/// 3.85:1), by the owner ruling.
 #[test]
 fn every_fact_word_reads_on_every_ground() {
     let sides = sides();
     let tabs = tabs(&sides);
     let fit = every_fact();
     let room = 200;
+    // The cells of a hidden fact's stub in the set run, one past the facts' lead blank.
+    let stub_cells: Vec<usize> = footer::set_facts(&fit.segments)
+        .glyphs
+        .iter()
+        .filter(|g| g.quiet && !g.mark)
+        .flat_map(|g| 1 + g.cell..1 + g.cell + g.cols)
+        .collect();
+    assert!(!stub_cells.is_empty(), "the line hides a fact");
     let (mut values, mut stubs, mut kept_values, mut kept_stubs) = (0usize, 0usize, 0, 0);
+    let (mut lifted, mut thin_stubs, mut bold_stubs) = (0usize, 0usize, 0usize);
     for instance in &sides {
         for &(tab, blank) in &tabs {
+            let dark = crate::claude_card::dark_ground(blank);
             for rule in rule_greys(blank) {
                 let old_value = mix(rule.fg, blank.fg, VALUE_LIFT);
                 for lit in std::iter::once(None).chain(
@@ -253,36 +286,73 @@ fn every_fact_word_reads_on_every_ground() {
                             instance.name, rule.fg, c.ch
                         )
                     };
-                    let words: Vec<&RenderCell> = paint
+                    // Each word's role is its glyph's: a hidden fact's stub, or a value.
+                    let words: Vec<(bool, &RenderCell)> = paint
                         .cells
                         .iter()
-                        .filter(|c| c.ch != ' ' && !MARKS.contains(&c.ch))
+                        .enumerate()
+                        .filter(|(_, c)| c.ch != ' ' && !MARKS.contains(&c.ch))
+                        .map(|(at, c)| {
+                            let set = at.checked_sub(paint.facts_at);
+                            (set.is_some_and(|k| stub_cells.contains(&k)), c)
+                        })
                         .collect();
                     let quietest_value = words
                         .iter()
-                        .filter(|c| c.bold)
-                        .map(|c| reads(c.fg, blank.bg))
+                        .filter(|(stub, _)| !stub)
+                        .map(|(_, c)| reads(c.fg, blank.bg))
                         .fold(f32::INFINITY, f32::min);
                     assert!(quietest_value.is_finite(), "values are on the line");
-                    for c in words {
+                    for (stub, c) in words {
                         let k = reads(c.fg, blank.bg);
-                        if c.bold {
+                        // Every value is bold; a stub is bold on a light ground, where a thin
+                        // dark stroke reads lighter than its ink, and thin on a dark one, as main
+                        // draws the black theme.
+                        assert!(
+                            matches!(c.script, aterm_core::terminal::Script::Sub { .. })
+                                && c.bold == (!stub || !dark),
+                            "{}: a {} on a {} ground at {:?}, bold {}",
+                            what(c),
+                            if stub { "stub" } else { "value" },
+                            if dark { "dark" } else { "light" },
+                            c.script,
+                            c.bold
+                        );
+                        if stub && c.bold {
+                            bold_stubs += 1;
+                        } else if stub {
+                            thin_stubs += 1;
+                        }
+                        if !stub {
                             assert!(k >= NAME_CONTRAST, "{}: a value at {k:.2}:1", what(c));
                             if lit.is_none() && reads(old_value, blank.bg) >= NAME_CONTRAST {
-                                assert_eq!(c.fg, old_value, "{}: a value that reads", what(c));
-                                kept_values += 1;
+                                let (ink, crowded) = value_that_reads(rule.fg, blank);
+                                assert_eq!(
+                                    c.fg,
+                                    ink,
+                                    "{}: a value that reads ({crowded})",
+                                    what(c)
+                                );
+                                if crowded {
+                                    lifted += 1;
+                                } else {
+                                    kept_values += 1;
+                                }
                             }
                             values += 1;
                         } else {
-                            assert!(k >= ICON_CONTRAST, "{}: a stub at {k:.2}:1", what(c));
+                            assert!(k >= NAME_CONTRAST, "{}: a stub at {k:.2}:1", what(c));
                             if lit.is_none() {
+                                // A tab whose own ink reads under the floor leaves no room above
+                                // it: there the stub reads as loud as a value, never louder.
+                                let room = reads(blank.fg, blank.bg) >= NAME_CONTRAST;
                                 assert!(
-                                    k < quietest_value,
+                                    k < quietest_value || (!room && k <= quietest_value),
                                     "{}: a stub at {k:.2}:1, a value at {quietest_value:.2}:1",
                                     what(c)
                                 );
                                 let grey = reads(rule.fg, blank.bg);
-                                if grey >= ICON_CONTRAST && grey < quietest_value {
+                                if grey >= NAME_CONTRAST && grey < quietest_value {
                                     assert_eq!(c.fg, rule.fg, "{}: a grey that reads", what(c));
                                     kept_stubs += 1;
                                 }
@@ -295,7 +365,24 @@ fn every_fact_word_reads_on_every_ground() {
         }
     }
     assert!(values >= sides.len() * tabs.len() * 3 * 7 * 20, "{values}");
+    assert!(
+        lifted > 0,
+        "a value its stub's floor would match is lifted on some ground"
+    );
+    assert!(
+        reads(soft_tab().fg, soft_tab().bg) < NAME_CONTRAST,
+        "CONTROL: only a tab whose own ink reads under the floor leaves no room"
+    );
     assert!(stubs >= sides.len() * tabs.len() * 3 * 7 * 10, "{stubs}");
+    assert!(
+        thin_stubs > 0 && bold_stubs > 0,
+        "stubs on dark and light grounds: {thin_stubs} thin, {bold_stubs} bold"
+    );
+    assert!(
+        crate::claude_card::dark_ground(side(&sides, "Default").blank)
+            && !crate::claude_card::dark_ground(side(&sides, "Default Light").blank),
+        "CONTROL: Default's ground is dark and Default Light's light"
+    );
     assert!(
         kept_values > 0 && kept_stubs > 0,
         "a theme's own inks that read are kept: {kept_values} values, {kept_stubs} stubs"
@@ -356,6 +443,7 @@ fn ghost_glyphs(
             clip: aterm_core::render::PxRect::EVERYWHERE,
             mark_hover: false,
             title_gen: 0,
+            chip: TopChip::NONE,
         },
         &mut top,
         None,
@@ -390,18 +478,24 @@ fn the_keys_ghost_reads_on_every_ground() {
                     assert!(lit_k >= NAME_CONTRAST, "{what}: lit at {lit_k:.2}:1");
                     assert_eq!(c.fg, lit[0].fg, "{what}: one ink");
                     if reads(old_lit, blank.bg) >= NAME_CONTRAST {
-                        assert_eq!(c.fg, old_lit, "{what}: a lit ink that reads is kept");
+                        let (ink, crowded) = value_that_reads(rule.fg, blank);
+                        assert_eq!(
+                            c.fg, ink,
+                            "{what}: a lit ink that reads is kept ({crowded}: lifted)"
+                        );
                     }
                 }
+                // As a stub's beside a value ([`every_fact_word_reads_on_every_ground`]).
+                let room = reads(blank.fg, blank.bg) >= NAME_CONTRAST;
                 for c in &rest {
                     let k = reads(c.fg, blank.bg);
                     assert!(
-                        k >= ICON_CONTRAST && k < lit_k && !c.bold,
+                        k >= NAME_CONTRAST && (k < lit_k || (!room && k <= lit_k)) && !c.bold,
                         "{what}: {:?} at rest at {k:.2}:1, lit at {lit_k:.2}:1",
                         c.ch
                     );
                     let grey = reads(rule.fg, blank.bg);
-                    if grey >= ICON_CONTRAST && grey < lit_k {
+                    if grey >= NAME_CONTRAST && grey < lit_k {
                         assert_eq!(c.fg, rule.fg, "{what}: a grey that reads is kept");
                         kept += 1;
                     }

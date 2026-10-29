@@ -46,7 +46,7 @@ pub enum StageId {
     /// Publication engine export guards (`ship check --export`).
     Export,
     LibcOracle,
-    /// Source guards and L0 censuses ([`crate::stages::CENSUS_WALKS`]).
+    /// Source guards and L0 censuses ([`aterm_census::CENSUSES`]).
     Census,
     /// Trust checkers over registered formal models (`spec-check`).
     SpecCheck,
@@ -138,6 +138,11 @@ pub struct StageSpec {
     pub exclusive: bool,
     /// Earlier stages that must finish before this stage starts ([`crate::sched::check_waits`]).
     pub after_stages: Vec<StageId>,
+    /// The memory it claims, bytes ([`crate::memory::need`]): no stage that claims any starts
+    /// beside others it would take the run past its budget with ([`crate::sched::ready`]). `0`
+    /// claims none, and a run that measures nothing ([`Ctx::memory`] `None`) plans `0` for every
+    /// stage.
+    pub mem: u64,
 }
 
 /// The side lanes' build directories ([`SIDE_LANES`]), each `*.noindex`, live in
@@ -174,35 +179,60 @@ pub fn cells_dir(ctx: &Ctx) -> PathBuf {
 }
 
 /// THE SIDE LANES' OLD PLACE, emptied: each `<target>/verify/<lane>.noindex` the lanes built in
-/// before they moved into [`lanes_dir`] goes whole once no build holds its cargo locks
-/// (`atpkg::build_cache::remove_unbuilt`), one line each for the log; one a build holds stays for
-/// a later run. Nothing of this version builds there.
+/// before they moved into [`lanes_dir`] goes whole once no build holds its cargo locks, and what
+/// an earlier run set aside of it and could not finish (`<lane>.noindex.removing`,
+/// `<lane>.noindex.removing-<n>`) is tried again, whether or not the lane is still there
+/// (`atpkg::build_cache::remove_unbuilt`): one line each for the log, and none for a lane with
+/// nothing of it left; one a build holds stays for a later run. Nothing of this version builds
+/// there.
 #[cfg(unix)]
 #[must_use]
 pub fn retire_old_lanes(ctx: &Ctx) -> Vec<String> {
+    retire_old_lanes_with(ctx, &atpkg::build_cache::remove_unbuilt)
+}
+
+#[cfg(unix)]
+fn retire_old_lanes_with(
+    ctx: &Ctx,
+    remove: &dyn Fn(&std::path::Path) -> std::io::Result<bool>,
+) -> Vec<String> {
     let mut said = Vec::new();
     for name in SIDE_LANES {
         let old = ctx.state_dir().join(noindex(name));
-        if !std::fs::symlink_metadata(&old).is_ok_and(|m| m.is_dir()) {
-            continue;
-        }
-        said.push(match atpkg::build_cache::remove_unbuilt(&old) {
+        let there = std::fs::symlink_metadata(&old).is_ok_and(|m| m.is_dir());
+        said.push(match remove(&old) {
             Ok(true) => format!(
                 "removed {}: the {name} lane builds in {} now, out of fseventsd's stream",
                 old.display(),
                 lanes_dir(ctx).display()
             ),
-            Ok(false) => format!(
-                "kept {}: a build holds its locks; a later run removes it",
+            Ok(false) if there => format!(
+                "kept {}: a build or process still uses it, or ownership is unreadable; a later run checks it again",
                 old.display()
             ),
-            Err(e) => format!("kept {}: it could not be removed ({e})", old.display()),
+            Ok(false) => continue,
+            Err(e) => format!(
+                "{}: not all of it could be removed ({e}); a later run tries again",
+                old.display()
+            ),
         });
     }
     said
 }
 
-/// Planned stages for `ctx.checks` ([`crate::checks::stages_of`]) in declared order.
+/// Whether stage `id` is a named skip in `ctx` before it starts anything: a windowed stage
+/// ([`WINDOWED`]) under `--no-windows`, or one that measures the handed bundle (the measuring
+/// tests, the gui smoke) with no `--app`. It claims no memory and takes no quiet machine.
+#[must_use]
+pub fn named_skip(ctx: &Ctx, id: StageId) -> bool {
+    let needs_app = matches!(id, StageId::MeasuringTests | StageId::GuiSmoke);
+    (ctx.no_windows && id.no_windows_skip().is_some())
+        || (needs_app && ctx.measure_artifact.is_none())
+}
+
+/// Planned stages for `ctx.checks` ([`crate::checks::stages_of`]) in declared order, each with
+/// the memory it claims by the run's book ([`StageSpec::mem`]): none for a named skip
+/// ([`named_skip`]), which starts nothing.
 #[must_use]
 pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     let mut wanted = crate::checks::stages_of(&ctx.checks);
@@ -214,8 +244,15 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         .filter(|s| wanted.contains(&s.id))
         .collect();
     let present: Vec<StageId> = v.iter().map(|s| s.id).collect();
+    let records = ctx.memory.as_ref().map(crate::memory::Book::records);
     for s in &mut v {
         s.after_stages.retain(|id| present.contains(id));
+        if let (Some(book), Some(records)) = (&ctx.memory, &records)
+            && !named_skip(ctx, s.id)
+        {
+            let key = crate::memory::Key::of_run(s.id, ctx);
+            s.mem = crate::memory::need(records, s, &key, book.physical).bytes;
+        }
         // Independent build/test lanes would each spend the same CPU grant.
         // Keep every stage and its bounds, but let a managed run spend it once.
         if ctx.env.build_slot_held.is_some() {
@@ -367,6 +404,7 @@ fn spec(id: StageId, title: impl Into<String>, lane: Lane) -> StageSpec {
         lane,
         exclusive: false,
         after_stages: Vec::new(),
+        mem: 0,
     }
 }
 
@@ -444,6 +482,132 @@ mod tests {
         }
     }
 
+    /// WHAT AN EARLIER RUN SET ASIDE OF AN OLD LANE IS TRIED AGAIN, THE LANE GONE OR NOT: an aside
+    /// of the old tippy lane keeping one entry its owner flagged `uchg` (the remover never clears
+    /// a flag) loses the rest and is said, naming it, though no `tippy.noindex` is left; once the
+    /// flag is off, the next run removes it and says nothing. NEGATIVE CONTROL: the flag refuses
+    /// `std::fs::remove_file`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_old_lanes_stuck_aside_is_tried_again_once_the_lane_is_gone() {
+        /// Clears the flag when dropped, so a failed test leaves its scratch removable.
+        struct Unflag(PathBuf);
+        impl Drop for Unflag {
+            fn drop(&mut self) {
+                let _ = atpkg::platform::set_file_flags(&self.0, 0);
+            }
+        }
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let target = std::fs::canonicalize(dir.path())
+            .expect("resolved")
+            .join("target");
+        let c = Ctx::new(
+            PathBuf::from("/repo"),
+            Scope::workspace(),
+            EnvSnapshot {
+                cargo_target_dir: Some(target),
+                ..EnvSnapshot::default()
+            },
+            PathBuf::from("/tmp"),
+        );
+        let aside = c.state_dir().join("tippy.noindex.removing");
+        let stuck = aside.join("debug/stuck");
+        std::fs::create_dir_all(stuck.parent().expect("its folder")).expect("a folder");
+        std::fs::write(&stuck, "x").expect("written");
+        std::fs::write(aside.join("debug/free"), "x").expect("written");
+        let _unflag = Unflag(stuck.clone());
+        atpkg::platform::set_file_flags(&stuck, libc::UF_IMMUTABLE).expect("uchg");
+        assert!(std::fs::remove_file(&stuck).is_err(), "the flag refuses it");
+        assert!(
+            c.state_dir()
+                .join("tippy.noindex")
+                .symlink_metadata()
+                .is_err()
+        );
+
+        let retire = || {
+            retire_old_lanes_with(&c, &|path| {
+                atpkg::build_cache::remove_unbuilt_with_processes(path, &|_, _| {
+                    Ok(aterm_uds::holders::PathScan::default())
+                })
+            })
+        };
+        let said = retire();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains(&*aside.to_string_lossy()), "{said:?}");
+        assert!(stuck.is_file() && !aside.join("debug/free").exists());
+        atpkg::platform::set_file_flags(&stuck, 0).expect("the flag off");
+        assert_eq!(retire(), Vec::<String>::new());
+        assert!(aside.symlink_metadata().is_err(), "the aside went");
+    }
+
+    /// A run that measures memory plans each stage's claim from its book: the test compile its
+    /// kept peak and margin, the lint (never measured) the cold figure, the test run (which
+    /// compiles nothing) and the formatter (which touches no target directory) nothing.
+    /// NEGATIVE CONTROL: a run that measures nothing plans no claim for any stage.
+    #[test]
+    fn a_run_that_measures_memory_plans_each_stages_claim_from_its_book() {
+        const GIB: u64 = 1 << 30;
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let book = crate::memory::Book::at(
+            Some(dir.path().join("stage-memory.json")),
+            Some(24 * GIB),
+            Some(43 * GIB / 2),
+        );
+        let scope = Scope::crate_only("aterm-gui");
+        let compile = declared(&scope)
+            .into_iter()
+            .find(|s| s.id == StageId::TestCompile)
+            .expect("declared");
+        let checks = [Check::Test, Check::Lint, Check::Fmt];
+        let key = crate::memory::Key::of_run(compile.id, &ctx(&checks, scope.clone()));
+        book.keep(&compile, &key, 10 * GIB).expect("kept");
+        let claims = |c: &Ctx| -> Vec<(StageId, u64)> {
+            plan(c).into_iter().map(|s| (s.id, s.mem)).collect()
+        };
+        assert_eq!(
+            claims(&ctx(&checks, scope.clone()).with_memory(book)),
+            [
+                (StageId::TestCompile, 12 * GIB),
+                (StageId::Test, 0),
+                (StageId::Tippy, 12 * GIB),
+                (StageId::Formatting, 0),
+            ]
+        );
+        assert!(
+            claims(&ctx(&checks, scope))
+                .iter()
+                .all(|(_, mem)| *mem == 0)
+        );
+    }
+
+    /// A named skip plans no memory: under `--no-windows` the redraw conformance and the objc
+    /// drives, which would compile and so claim the cold figure, are skipped before they start
+    /// anything and claim nothing. NEGATIVE CONTROL: the same run with windows plans the cold 12
+    /// GiB of a 24 GiB Mac for each.
+    #[test]
+    fn a_named_skip_plans_no_memory() {
+        const GIB: u64 = 1 << 30;
+        let book = || crate::memory::Book::at(None, Some(24 * GIB), Some(43 * GIB / 2));
+        let claims = |no_windows: bool| -> Vec<(StageId, u64)> {
+            let c = ctx(&[Check::Appkit], Scope::workspace())
+                .with_no_windows(no_windows)
+                .with_memory(book());
+            plan(&c).into_iter().map(|s| (s.id, s.mem)).collect()
+        };
+        assert_eq!(
+            claims(true),
+            [(StageId::RedrawConformance, 0), (StageId::ObjcDrives, 0)]
+        );
+        assert_eq!(
+            claims(false),
+            [
+                (StageId::RedrawConformance, 12 * GIB),
+                (StageId::ObjcDrives, 12 * GIB)
+            ]
+        );
+    }
+
     #[test]
     fn a_selection_plans_exactly_its_checks_stages_and_never_deadlocks() {
         assert_eq!(
@@ -494,23 +658,23 @@ mod tests {
         );
         assert_eq!(awaited(&p, doc).collect::<Vec<_>>(), [compile]);
         let none = vec![false; p.len()];
-        assert!(!ready(&p, &none, &none, 0, doc));
+        assert!(!ready(&p, &none, &none, 0, doc, u64::MAX));
         assert!(
-            ready(&p, &none, &none, 0, compile),
+            ready(&p, &none, &none, 0, compile, u64::MAX),
             "the compile starts at t0"
         );
         assert!(p[compile].after_stages.is_empty() && p[test].after_stages.is_empty());
         assert!(
-            !ready(&p, &none, &none, 0, test),
+            !ready(&p, &none, &none, 0, test, u64::MAX),
             "the test run follows its compile"
         );
         let mut done = none.clone();
         done[compile] = true;
         let mut started = done.clone();
-        assert!(ready(&p, &started, &done, 0, test));
-        assert!(ready(&p, &started, &done, 0, doc));
+        assert!(ready(&p, &started, &done, 0, test, u64::MAX));
+        assert!(ready(&p, &started, &done, 0, doc, u64::MAX));
         started[test] = true;
-        assert!(ready(&p, &started, &done, 1, doc));
+        assert!(ready(&p, &started, &done, 1, doc, u64::MAX));
     }
 
     #[test]
@@ -544,7 +708,7 @@ mod tests {
         let at = |id| p.iter().position(|s| s.id == id).expect("planned");
         let none = vec![false; p.len()];
         assert!(
-            ready(&p, &none, &none, 0, at(StageId::CheckersCompile)),
+            ready(&p, &none, &none, 0, at(StageId::CheckersCompile), u64::MAX),
             "the checkers compile at t0"
         );
         assert_eq!(
@@ -564,17 +728,17 @@ mod tests {
             done[at(id)] = true;
         }
         assert!(
-            !ready(&p, &done, &done, 0, oracle),
+            !ready(&p, &done, &done, 0, oracle, u64::MAX),
             "the oracle waits for the test run"
         );
         done[test] = true;
-        assert!(ready(&p, &done, &done, 0, oracle));
+        assert!(ready(&p, &done, &done, 0, oracle, u64::MAX));
         assert!(
-            !ready(&p, &done, &done, 0, checkers),
+            !ready(&p, &done, &done, 0, checkers, u64::MAX),
             "the checkers wait for the oracle"
         );
         done[oracle] = true;
-        assert!(ready(&p, &done, &done, 0, checkers));
+        assert!(ready(&p, &done, &done, 0, checkers, u64::MAX));
         for alone in [Check::Checkers, Check::GpuOracle] {
             let p = plan(&ctx(&[alone], Scope::workspace()));
             assert!(p.iter().all(|s| s.after_stages.is_empty()), "{alone:?}");

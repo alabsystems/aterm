@@ -8,9 +8,9 @@
 > deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
 > were taken before.
 
-> Status 2026-10-16: this is the crate's migration worklist. Each of the 17 specs below is to be
+> Status 2026-10-16: this is the crate's migration worklist. Each of the 16 specs below is to be
 > proved (through Trust/Clean, or by rustc for the auto-trait spec), and then the tests it
-> subsumes are deleted. Section4 records retired non-spec checks and one remaining migration control.
+> subsumes are deleted. Section 4 records the retired non-spec checks.
 >
 > 2026-10-16 (LAG-2): the macOS proxy queue (`src/platform_impl/macos/wake_queue.rs`) added one
 > spec, `macos-proxy-queue`, and its 3 tests (last rows of §1 and §2). The counts below are the
@@ -22,17 +22,18 @@
 The package and lib were named `winit` when this was written; since winit-core step 7
 (2026-10-19) they are `aterm-window` and `aterm_window`. The inventory below is historical: the original 36
 entries plus 3 audit regressions. Of those 39, the 9 compile-only auto-trait (`Send`/`Sync`) checks
-and 3 of the 4 non-spec tests in §4 are since deleted, which leaves 27
-(src/event.rs 2, src/keyboard/smol_str.rs 1,
+and all 4 non-spec tests in §4 are since retired, and so is `test_force_normalize` (with
+`Force::normalized`, 2026-10-27), which leaves 25
+(src/event.rs 1, src/keyboard/smol_str.rs 1,
 src/platform_impl/linux/common/percent.rs 1, src/platform_impl/linux/headless.rs 5,
-src/platform_impl/linux/wayland/clipboard.rs 10, src/platform_impl/linux/wayland/seat/data_device.rs 3,
+src/platform_impl/linux/wayland/clipboard.rs 9, src/platform_impl/linux/wayland/seat/data_device.rs 3,
 src/platform_impl/linux/x11/dnd.rs 1, src/platform_impl/linux/x11/xsettings.rs 2,
-src/platform_impl/windows/drop_handler.rs 2 = 27). It is not a current crate-wide test census.
+src/platform_impl/windows/drop_handler.rs 2 = 25). It is not a current crate-wide test census.
 It lists those entries and the code each one reaches. The initial inventory was read-only. The
 URI/Xsettings corrections were subsequently exercised as pure host-Trust parser tests; Windows drop tests were type-checked
 for both Windows architectures, not executed on Windows. These checks are not proof claims.
 
-The historical map has **16 specs** covering **26 entries** and **1 non-spec entry** (§4).
+The historical map has **15 specs** covering **25 entries** and **0 non-spec entries** (§4).
 `public-handles-send-sync` has no test left to retire.
 
 ## 0. Notation used in the statements
@@ -75,7 +76,6 @@ copy-outcome-placed	table-property	wayland::clipboard::CopyOutcome::placed	∀ o
 headless-wait-deadline	contract (arithmetic)	headless::EventLoop::poll_events_with_timeout, common::poll::{wait, timeout_millis}, to be factored into pure deadline/poll_millis/cause fns (poll_millis is common::poll::timeout_millis since LW.7)	Factor out three pure fns. (a) deadline(pending, cf, timeout, start) = Some(0) if pending, else min_opt(by_cf, timeout), where by_cf is None for Wait, Some(0) for Poll and Some(r.saturating_duration_since(start)) for WaitUntil(r). (b) poll_millis(None) = -1, poll_millis(Some(0)) = 0, otherwise min(c_int::MAX, max(1, ceil(d.as_nanos()/1e6))); so poll_millis(Some(d))·1ms ≥ d unless it saturates. (c) cause(cf, now) = ResumeTimeReached ⇔ cf = WaitUntil(r) ∧ now ≥ r; Poll gives Poll; otherwise WaitCancelled. With poll(2) honouring its timeout (a platform assumption): a WaitUntil(r) turn with no proxy wake reports ResumeTimeReached and does not start before r.	headless.rs::a_due_wait_until_reports_resume_time_reached	EASY once factored: Duration/Instant arithmetic, u128 div_ceil, c_int::try_from, Option combinators. Only the poll(2) step needs gap 8.	0, 1, 3, 8
 percent-decode-utf8	contract	linux::common::percent::{percent_decode_utf8,hex_val}	∀ data: &[u8]: percent_decode_utf8(data) = String::from_utf8(dec(data)) with the Utf8Error mapped. So the result is Ok(s) ⇔ dec(data) is valid UTF-8, and then s.as_bytes() = dec(data). hex_val(b) = Some(v) ⇔ b ∈ [0-9a-fA-F] with v its digit value (< 16); a table property decidable over 256 values. A '%' with fewer than two following bytes, or a non-hex digit, is copied verbatim. Corollary: ∀ s: &str, percent_decode_utf8(pct_encode(s)) = Ok(s) for an encoder that escapes any chosen subset of bytes.	common/percent.rs::percent_decode_basic_and_incomplete	EASY (hex_val: range match, evaluate 256 cases) / MEDIUM (decoder: while loop over a slice index with 3-byte lookahead, Vec<u8> push, u8 shifts and OR, String::from_utf8 needs a UTF-8 model)	0, 1, 3, 5, 7
 event-map-nonuser	contract	event::Event::map_nonuser_event	∀ T, U, e: Event<T>: map_nonuser_event::<U>(e) = Err(e) ⇔ e is UserEvent(_). Otherwise it is Ok(e'), where e' has the same variant and the same payload (window_id/event, device_id/event, cause) as e, re-typed at U.	event.rs::test_map_nonuser_event	EASY in shape, heavy in data: 10-arm enum match, generic T and U, large nested enum payloads	0, 1, 3, 11
-force-normalized	contract	event::Force::normalized	∀ f, m, a: f64: normalized(Normalized(f)) = f; normalized(Calibrated{force:f, max_possible_force:m, altitude_angle:None}) = f/m; normalized(Calibrated{f, m, Some(a)}) = (f / sin a) / m, in IEEE-754 f64 semantics. Corollary used by the test: when f/m is exact, the None and Some(PI/2) results agree, because sin(PI/2) rounds to 1.0. The statement is close to the body; its value is pinning the documented normalisation.	event.rs::test_force_normalize	EASY except f64::sin: f64 division, enum match with an Option field; sin is libm (needs an FFI or float model)	0, 1, 3, 8
 pick-text-mime	contract	wayland::clipboard::pick_text_mime	∀ advertised: &[String]: pick_text_mime(advertised) = Some(TEXT_MIMES[k]) for the least k with TEXT_MIMES[k] ∈ advertised, or None if there is no such k. The result never depends on the order or multiplicity of advertised and is always an element of TEXT_MIMES. Priority: text/plain;charset=utf-8 > UTF8_STRING > text/plain > TEXT > STRING.	wayland/clipboard.rs::a_paste_prefers_utf8_then_the_legacy_text_types	EASY-MEDIUM: nested iterator find/any with closures, String equality against &str, const [&str;5]	0, 1, 5, 7, 13
 smolstr-text-round-trip	round-trip	keyboard::smol_str::SmolStr::{new,as_str,clone}, <SmolStr as PartialEq/Ord/Hash/Debug/Display>	∀ t: &str: SmolStr::new(t).as_str() = t. The representation is Inline ⇔ t.len() ≤ INLINE_CAP (22), else Shared. as_str never panics: the expect in the Inline arm is unreachable, because new copies exactly len bytes of valid UTF-8. ∀ s: s.clone().as_str() = s.as_str(). eq, cmp, hash, Debug and Display of a SmolStr equal those of its as_str(). Layout: size_of::<SmolStr>() = 24 on 64-bit targets, as a static assertion.	keyboard/smol_str.rs::text_round_trips_on_both_sides_of_the_inline_limit	MEDIUM: &str and [u8;22] contents, enum Repr, u8::try_from, copy_from_slice, str::from_utf8 (UTF-8 model), Arc<str>, generic T: AsRef<str>, trait impls	0, 1, 3, 11, 14
 selection-port-copy	contract	wayland::clipboard::SelectionPort::copy (default method), CLAIM_ORDER	∀ port P, sel, serial: (1) ¬P.focused() ⇒ PortTrace has no release or claim, and copy returns Kept if P.offers(sel), else Refused(Unfocused). (2) P.focused() ⇒ PortTrace restricted to mutators is exactly [release(sel), claim(sel, serial)], in that order, and copy returns Claimed iff that claim returned true, else Refused(NoDevice). copy never returns Refused(NoSerial).	wayland/clipboard.rs::{the_copy_a_focused_client_makes_releases_before_it_claims, an_unfocused_copy_keeps_the_selection_it_holds_instead_of_walking_the_clipboard_backwards, an_unfocused_copy_that_holds_no_selection_reports_the_refusal_rather_than_success}	MEDIUM: trait default method generic over Self with &mut self, a for loop over a const array, enum match, a ghost trace of calls to abstract trait methods	0, 2, 3, 4, 7, 11
@@ -96,11 +96,11 @@ macos-proxy-queue	contract (liveness)	macos::wake_queue::{channel, Sender::send,
 Test paths in `subsumes` are shortened: `wayland/…`, `common/…`, `x11/…` and `headless.rs` sit under
 `src/platform_impl/linux/`; `event.rs` and `keyboard/…` under `src/`.
 
-### Distribution by kind (17)
+### Distribution by kind (20)
 
 | kind | count | ids |
 |---|---|---|
-| contract | 11 | headless-wait-deadline, percent-decode-utf8, event-map-nonuser, force-normalized, pick-text-mime, selection-port-copy, parse-uri-list, copy-verdict, wayland-clipboard-handle, headless-proxy-delivery, windows-drop-ownership |
+| contract | 14 | headless-wait-deadline, percent-decode-utf8, event-map-nonuser, pick-text-mime, selection-port-copy, parse-uri-list, copy-verdict, wayland-clipboard-handle, headless-proxy-delivery, windows-drop-ownership, windows-ime-events, windows-key-replay, windows-attention-flash, macos-proxy-queue |
 | round-trip | 2 | smolstr-text-round-trip, xsettings-decode |
 | table-property | 1 | copy-outcome-placed |
 | refinement | 1 | clip-release-before-claim-lands |
@@ -112,13 +112,13 @@ Test paths in `subsumes` are shortened: `wayland/…`, `common/…`, `x11/…` a
 | gap | specs | notes |
 |---|---|---|
 | none | 1 | public-handles-send-sync (rustc, no Clean) |
-| 0 | 16 | every Clean-proved spec |
-| 1 | 11 | non-scalar carriers: &str, String, Vec, Option, enums |
-| 3 | 9 | E6 body widening: enum matches, calls, casts, shifts |
+| 0 | 19 | every Clean-proved spec |
+| 1 | 10 | non-scalar carriers: &str, String, Vec, Option, enums |
+| 2 | 9 | &self/&mut self views |
+| 8 | 9 | effects: fs::canonicalize, mpsc, poll(2), pipes, Win32/CFRunLoop FFI |
+| 3 | 8 | E6 body widening: enum matches, calls, casts, shifts |
+| 13 | 8 | closures, threads, channels |
 | 7 | 7 | loops and iterators |
-| 13 | 7 | closures, threads, channels |
-| 2 | 7 | &self/&mut self views |
-| 8 | 7 | effects: libm sin, fs::canonicalize, mpsc, poll(2), pipes |
 | 11 | 5 | generics |
 | 5 | 4 | quantified clauses |
 | 4 | 2 | callee-ensures composition |
@@ -131,7 +131,7 @@ Test paths in `subsumes` are shortened: `wayland/…`, `common/…`, `x11/…` a
 negative control) → `copy-verdict` and `wayland-clipboard-handle`. `percent-decode-utf8` →
 `parse-uri-list`. The proposed pure `headless-wait-deadline` factor → `headless-trace-grammar` →
 `headless-proxy-delivery`. `public-handles-send-sync`, `smolstr-text-round-trip`, `event-map-nonuser`,
-`force-normalized`, `pick-text-mime` and `xsettings-decode` stand alone.
+`pick-text-mime` and `xsettings-decode` stand alone.
 
 ## 2. Historical test → spec map (TSV)
 
@@ -140,7 +140,6 @@ negative control) → `copy-verdict` and `wayland-clipboard-handle`. `percent-de
 ```tsv
 file	test	primary	also
 src/event.rs	test_map_nonuser_event	event-map-nonuser	
-src/event.rs	test_force_normalize	force-normalized	
 src/keyboard/smol_str.rs	text_round_trips_on_both_sides_of_the_inline_limit	smolstr-text-round-trip	
 src/platform_impl/linux/common/percent.rs	percent_decode_basic_and_incomplete	percent-decode-utf8	parse-uri-list
 src/platform_impl/linux/headless.rs	the_first_turn_is_init_then_resumed_and_the_last_is_loop_exiting	headless-trace-grammar	
@@ -153,7 +152,6 @@ src/platform_impl/linux/wayland/clipboard.rs	an_unfocused_copy_keeps_the_selecti
 src/platform_impl/linux/wayland/clipboard.rs	an_unfocused_copy_that_holds_no_selection_reports_the_refusal_rather_than_success	selection-port-copy	copy-outcome-placed
 src/platform_impl/linux/wayland/clipboard.rs	a_selection_the_compositor_binds_no_device_for_is_refused_and_placed_says_so	copy-outcome-placed	selection-port-copy
 src/platform_impl/linux/wayland/clipboard.rs	a_copy_with_no_fresh_input_behind_it_still_reaches_the_system_clipboard	clip-release-before-claim-lands	selection-port-copy
-src/platform_impl/linux/wayland/clipboard.rs	claiming_before_releasing_loses_every_other_copy_and_leaves_the_text_before_it	NON-SPEC (tests test-only code)	becomes the negative control of clip-release-before-claim-lands
 src/platform_impl/linux/wayland/clipboard.rs	a_copy_off_the_loop_thread_answers_the_loop_s_verdict_and_never_guesses	copy-verdict	copy-outcome-placed
 src/platform_impl/linux/wayland/clipboard.rs	a_copy_with_no_loop_left_to_answer_it_is_false_and_leaves_no_own_slot_behind	wayland-clipboard-handle	
 src/platform_impl/linux/wayland/clipboard.rs	the_own_slot_answers_synchronously_and_a_foreign_slot_answers_none	wayland-clipboard-handle	
@@ -175,24 +173,20 @@ src/platform_impl/macos/wake_queue.rs	a_drain_that_finds_the_lock_held_still_cle
 
 ## 3. Coverage
 
-- 36 original tests read. 32 mapped to one of the 16 specs. 4 were not spec samples (§4). 12 of the
-  36 are since deleted: the 9 auto-trait checks and 3 of the 4 non-spec tests.
+- 36 original tests read. 32 mapped to one of the 16 specs. 4 were not spec samples (§4). 13 of the
+  36 are since deleted: the 9 auto-trait checks, 3 of the 4 non-spec tests and `test_force_normalize`.
 - The biggest collapse was `public-handles-send-sync` (9 tests across two integration files, now
-  deleted; one library `const _` item, not yet added, would prove the property). Next: `selection-port-copy`, `parse-uri-list` (3 each).
+  deleted; discharged at compile time by the `const _` auto-trait assertion item in `src/lib.rs`). Next: `selection-port-copy`, `parse-uri-list` (3 each).
 - 18 of the 36 tests sit in effectful files (headless event loop, Wayland clipboard, data device). Their
   pure cores (`copy-outcome-placed`, `selection-port-copy`, `pick-text-mime`, `headless-wait-deadline`,
   `percent-decode-utf8`) can be proved before Trust's platform lane (gap 8) lands.
 
 ## 4. Tests that are not spec samples
 
-> Status 2026-10-16: the 3 derive/prose checks in `src/error.rs` and `src/event.rs` that this
-> table marked for deletion are deleted, and their rows are gone from it and from §2.
-
-| test | why | action |
-|---|---|---|
-| wayland/clipboard.rs::claiming_before_releasing_loses_every_other_copy_and_leaves_the_text_before_it | Drives only the `#[cfg(test)]` `FakeSeat::claim` with the old `[Claim]`-only order, not production code. | **delete as a test; keep its content as the negative control** of `clip-release-before-claim-lands` (PLAN done-criterion 3) |
-
-Status: the compositor negative control remains a migration candidate for folding into its conformance test.
+> Status 2026-10-28: all 4 non-spec tests are retired — the 3 derive/prose checks in `src/error.rs`
+> and `src/event.rs` were deleted, and `wayland/clipboard.rs::claiming_before_releasing_loses_every_other_copy_and_leaves_the_text_before_it`
+> was folded into `a_copy_with_no_fresh_input_behind_it_still_reaches_the_system_clipboard` as the
+> `FakeSeat` negative control of `clip-release-before-claim-lands`. No standalone non-spec test remains.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -217,13 +211,11 @@ Status: the compositor negative control remains a migration candidate for foldin
    live variant to cover.
 6. **Redundant clipboard order assertion removed.** The production wire-trace assertions remain;
    the duplicate CLAIM_ORDER constant assertion no longer substitutes for behavior coverage.
-7. **`force-normalized` restates the body.** The spec is close to the code; it is worth proving only
-   because it pins the documented normalisation, and it needs a model of `f64::sin`.
 
 ## 6. Proof order (easiest high-value first)
 
-1. **`public-handles-send-sync`**. No Trust gap at all: add the `const _` auto-trait assertion item to
-   the library. The 9 compile-only `Send`/`Sync` tests it was to retire are already deleted.
+1. **`public-handles-send-sync`** *(discharged)*. No Trust gap at all: the `const _` auto-trait assertion
+   item lives in `src/lib.rs`, and the 9 compile-only `Send`/`Sync` tests it retired are deleted.
 2. **`copy-outcome-placed`**. Blocked only by gap 0 plus enum carriers (gaps 1, 3); decidable by
    evaluation over 5 values. It is the lemma `copy-verdict` and `selection-port-copy` cite.
 3. **`headless-wait-deadline`** (pure factor). Linear `Duration`/`Option` arithmetic plus a
@@ -235,4 +227,4 @@ Status: the compositor negative control remains a migration candidate for foldin
    `FakeSeat`. They need `&mut self` views (gap 2) and a `ty_model!` refinement (gap 10).
 6. Then `event-map-nonuser`, `pick-text-mime`, `smolstr-text-round-trip` and `xsettings-decode` (carrier
    and loop work), and last the effectful shells: `copy-verdict`, `wayland-clipboard-handle`,
-   `headless-trace-grammar` and `headless-proxy-delivery` (gaps 8 and 13), and `force-normalized` (libm).
+   `headless-trace-grammar` and `headless-proxy-delivery` (gaps 8 and 13).

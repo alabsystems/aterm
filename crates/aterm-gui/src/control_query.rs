@@ -512,6 +512,9 @@ pub(crate) fn serialize_dims(snapshot: &DimsSnapshot) -> String {
             || ("none".to_string(), "none".to_string(), "none".to_string()),
             |(g, s, f)| (g.clone(), format!("{s:.2}"), f.to_string()),
         );
+    let presented_seq = snapshot
+        .presented_seq
+        .map_or_else(|| "none".to_string(), |seq| seq.to_string());
     format!(
         "OK {} {} {} {} session={} cell_w={} cell_h={} font_px={:.2} scale={:.2} window={} \
          window_rows={} window_cols={} composed_rows={} grid_w={} grid_h={} \
@@ -521,7 +524,7 @@ pub(crate) fn serialize_dims(snapshot: &DimsSnapshot) -> String {
          tab_rows={} deck_y={} deck_h={} viewers={} visible_viewers={} geometry={} \
          present_retry_state={} present_retry_count={} present_retry_remaining={} \
          present_retry_in_ms={} \
-         layer_gravity={} layer_scale={} layer_flipped={}\n",
+         layer_gravity={} layer_scale={} layer_flipped={} presented_seq={}\n",
         snapshot.rows,
         snapshot.cols,
         snapshot.pixel_w,
@@ -568,6 +571,7 @@ pub(crate) fn serialize_dims(snapshot: &DimsSnapshot) -> String {
         layer_gravity,
         layer_scale,
         layer_flipped,
+        presented_seq,
     )
 }
 
@@ -1404,6 +1408,21 @@ pub(crate) fn cmd_notice(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
 }
 
+/// `members requests | allow <name> | invite | ignore <name>` -> the window's reply. `allow` and
+/// `invite` never carry the phrase: it shows on this Mac's screen alone
+/// (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.3.5).
+#[cfg(unix)]
+pub(crate) fn cmd_members(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    let asked = match crate::members_desk::Asked::parse(rest) {
+        Ok(asked) => asked,
+        Err(usage) => return usage.to_owned(),
+    };
+    match control_media::call_main(proxy, |reply| Wake::Members { asked, reply }) {
+        Ok(reply) => reply,
+        Err(error) => format!("ERR {error}\n"),
+    }
+}
+
 /// The usage line every malformed `devtools` form answers.
 pub(crate) const DEVTOOLS_USAGE: &str = "ERR usage: devtools hand-over [now]\n";
 
@@ -1479,11 +1498,68 @@ pub(crate) fn cmd_permissions(proxy: &EventLoopProxy<Wake>, rest: &str) -> Strin
     ask_walk(proxy, subjects)
 }
 
+/// How long the `permissions walk now` lane waits for the main thread to take the ask before it
+/// gives the ask up ([`serve_ask_walk`]): half the 10 s a front-door client (`aterm doctor`,
+/// `aterm init`, a sign-out) waits for its answer, so the client hears whether a walk starts,
+/// and none starts once it stopped listening.
+const WALK_ASK_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn ask_walk(
     proxy: &EventLoopProxy<Wake>,
     subjects: Vec<crate::permission_walk::Subject>,
 ) -> String {
-    match control_media::call_main(proxy, |reply| Wake::PermissionWalkAsked { subjects, reply }) {
+    if let Some(refusal) = control_media::main_thread_refusal() {
+        return format!("ERR {refusal}\n");
+    }
+    serve_ask_walk(
+        subjects,
+        &mut control_media::MainPost::new(proxy),
+        WALK_ASK_WITHIN,
+        &mut crate::control::caller_hung_up,
+        crate::control::hangup_park,
+    )
+}
+
+/// [`ask_walk`]'s lane past the main-thread refusal: posts the ask with a
+/// [`control_media::Claim`] and waits up to `within` for the main thread's answer, re-checking
+/// `hung_up` between `park` slices. An ask the main thread has not taken by then, or by the
+/// client's hang-up, the lane gives up: it answers `ERR late: …` (or
+/// [`crate::control::HUNG_UP_REPLY`] to a client gone), and the main thread starts no walk for
+/// it when it comes to it ([`crate::App::take_permission_walk_ask`]). One the main thread took
+/// first is answered with the walk's answer.
+pub(crate) fn serve_ask_walk(
+    subjects: Vec<crate::permission_walk::Subject>,
+    post: &mut control_media::MainPost<'_>,
+    within: std::time::Duration,
+    hung_up: &mut dyn FnMut() -> bool,
+    park: fn(std::time::Duration) -> std::time::Duration,
+) -> String {
+    use control_media::Waited;
+    let claim = control_media::Claim::default();
+    let asked = claim.clone();
+    let (answer, _hop) = match post.ask(|reply| Wake::PermissionWalkAsked {
+        subjects,
+        reply,
+        claim: asked,
+    }) {
+        Ok(posted) => posted,
+        Err(error) => return format!("ERR {error}\n"),
+    };
+    let deadline = std::time::Instant::now() + within;
+    let gave_up = match control_media::park_for_answer(&answer, deadline, hung_up, park) {
+        Waited::Answer(started) => return started.reply(),
+        Waited::Dropped => return "ERR main-thread reply dropped\n".to_owned(),
+        Waited::HungUp => crate::control::HUNG_UP_REPLY.to_owned(),
+        Waited::Deadline => format!(
+            "ERR late: the window did not take the ask within {}s; no walk starts\n",
+            within.as_secs()
+        ),
+    };
+    if claim.give_up() {
+        return gave_up;
+    }
+    // The main thread took the ask first: its answer follows in the same turn.
+    match control_media::recv_main(&answer) {
         Ok(started) => started.reply(),
         Err(error) => format!("ERR {error}\n"),
     }
@@ -1555,7 +1631,7 @@ pub(crate) fn cmd_cwd(term: &Arc<Mutex<Terminal>>) -> String {
     format!("OK {}\n", pct_encode(cwd.as_deref().unwrap_or("")))
 }
 
-/// `text --json` with no person, launch or input stamps -> `OK 1\n{"rows":[...],"cursor":{...},"dims":{...},"seq":N,"gen":"E.S","human_ms":null,"human_seq":0,"launch":null[,...]}`.
+/// `text --json` with no person, launch or input stamps -> `OK 1\n{"rows":[...],"cursor":{...},"dims":{...},"seq":N,"gen":"E.S","title":"<OSC 0/2 title, \"\" if unset>","human_ms":null,"human_seq":0,"launch":null[,...]}`.
 #[cfg(test)]
 pub(crate) fn cmd_text_json_opt(term: &Arc<Mutex<Terminal>>, args: TextArgs) -> String {
     cmd_text_json_read(
@@ -1604,6 +1680,8 @@ thread_local! {
 
 /// `person` and the first `inputs` count are taken under the rows' hold once its wait is over, so neither is older
 /// than the frame read; before the rows, so a gesture they miss moves `human_seq` past an `if-human=` fence.
+/// `"title"` is read in that same hold, so the title and the rows are one snapshot (a separate `title` read takes
+/// its own lock and can fall on either side of a frame).
 pub(crate) fn cmd_text_json_read(
     term: &Arc<Mutex<Terminal>>,
     frame: &FrameSlot,
@@ -1625,6 +1703,7 @@ pub(crate) fn cmd_text_json_read(
         cols,
         seq,
         generation,
+        title,
         first,
         end,
         launch,
@@ -1662,6 +1741,7 @@ pub(crate) fn cmd_text_json_read(
             t.cols(),
             t.content_seq(),
             screen_gen(&t),
+            t.title().to_owned(),
             first,
             end,
             launch.map_or_else(|| "null".to_string(), |w| w.json(human_seq)),
@@ -1696,11 +1776,12 @@ pub(crate) fn cmd_text_json_read(
         let _ = write!(
             out,
             "],\"cursor\":{{\"row\":{},\"col\":{},\"visible\":{vis},{}}},\
-             \"dims\":{{\"rows\":{rows},\"cols\":{cols}}},\"seq\":{seq},\"gen\":\"{generation}\",\
+             \"dims\":{{\"rows\":{rows},\"cols\":{cols}}},\"seq\":{seq},\"gen\":\"{generation}\",{},\
              \"human_ms\":{human},\"human_seq\":{human_seq},\"launch\":{launch}",
             c.row,
             c.col,
             json_str_field("style", style),
+            json_str_field("title", &title),
             human = human_ms.map_or_else(|| "null".to_string(), |ms| ms.to_string()),
         );
         if args.trim {
@@ -2336,12 +2417,14 @@ const fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::
         cursor_color: _,   // frame "cursor.color" (fixed RGB or "default")
         snapshot_seq: _,   // frame "seq" (the engine content version stamp)
         content_seq: _, // OMITTED: host effect-attribution clock paired with the exact snapshot, not wire content
+        drawn_at: _, // OMITTED: when that content was drawn, the host's effect-attribution age, not wire content
         process_sequence: _, // OMITTED: parser-batch provenance used only by host cursor-effect admission
         input_hot: _, // OMITTED: present-time bloom-defer latency hint, display-only (not cell content)
         terminal_id: _,
         extract_gen: _,
         engine_fill_seq: _,
         engine_alt: _,
+        grid_instance: _,
         engine_row_order: _,
         row_rev: _,
         row_rev_lane: _,
@@ -2517,6 +2600,9 @@ pub(crate) fn serialize_dims_json(snapshot: &DimsSnapshot) -> String {
     let present_retry_in_ms = snapshot
         .present_retry_in_ms
         .map_or_else(|| "null".to_string(), |delay| delay.to_string());
+    let presented_seq = snapshot
+        .presented_seq
+        .map_or_else(|| "null".to_string(), |seq| seq.to_string());
     json_ok(&format!(
         "{{\"rows\":{},\"cols\":{},\"pixel_w\":{},\"pixel_h\":{},\
          \"session\":{},\"cell_w\":{},\"cell_h\":{},\"font_px\":{:.2},\"scale\":{:.2},\
@@ -2528,7 +2614,7 @@ pub(crate) fn serialize_dims_json(snapshot: &DimsSnapshot) -> String {
          \"pad\":{},\"pad_top\":{},\"pad_bottom\":{},\"head\":{},\"tab_rows\":{},\
          \"deck_y\":{},\"deck_h\":{},\"viewers\":{},\"visible_viewers\":{},\"geometry\":\"{}\",\
          \"present_retry_state\":\"{}\",\"present_retry_count\":{},\
-         \"present_retry_remaining\":{},\"present_retry_in_ms\":{}}}",
+         \"present_retry_remaining\":{},\"present_retry_in_ms\":{},\"presented_seq\":{}}}",
         snapshot.rows,
         snapshot.cols,
         snapshot.pixel_w,
@@ -2572,6 +2658,7 @@ pub(crate) fn serialize_dims_json(snapshot: &DimsSnapshot) -> String {
         snapshot.present_retry_count,
         snapshot.present_retry_remaining,
         present_retry_in_ms,
+        presented_seq,
     ))
 }
 
@@ -4733,6 +4820,62 @@ mod trim_tests {
         Arc::new(Mutex::new(t))
     }
 
+    /// `"title"` is the program's OSC 0/2 title, read in the rows' own hold, escaped, and `""` when none was set.
+    #[test]
+    fn text_json_carries_the_title_read_with_its_rows() {
+        let decoded = |term: &Arc<Mutex<Terminal>>| {
+            let reply = cmd_text_json_opt(term, TextArgs::default());
+            let body = reply.strip_prefix("OK 1\n").expect("an OK 1 reply");
+            let v: aterm_json::Value = aterm_json::from_str(body.trim()).expect("valid JSON");
+            (reply, v)
+        };
+        let (bare, v) = decoded(&term_with(4, b"\xe2\x9c\xb3 idle\r\n"));
+        assert_eq!(
+            v.get("title").and_then(aterm_json::Value::as_str),
+            Some(""),
+            "NEGATIVE CONTROL: no OSC 2, an empty title: {bare}"
+        );
+        let running = term_with(
+            4,
+            "\x1b]2;\u{25d0} Claude Code\x07\u{23fa} streaming\r\n".as_bytes(),
+        );
+        let (reply, v) = decoded(&running);
+        assert_eq!(
+            v.get("title").and_then(aterm_json::Value::as_str),
+            Some("\u{25d0} Claude Code"),
+            "{reply}"
+        );
+        assert!(
+            reply.contains(",\"gen\":") && reply.find("\"gen\":") < reply.find("\"title\":"),
+            "after the generation it shares a hold with: {reply}"
+        );
+        assert!(
+            reply.contains("\"title\":\"\u{25d0} Claude Code\",\"human_ms\":null"),
+            "{reply}"
+        );
+        running
+            .lock()
+            .unwrap()
+            .process(b"\x1b]0;say \"hi\" \\ there\x07");
+        let (quoted, v) = decoded(&running);
+        assert!(
+            quoted.contains(r#""title":"say \"hi\" \\ there""#),
+            "a quote and a backslash are escaped: {quoted}"
+        );
+        assert_eq!(
+            v.get("title").and_then(aterm_json::Value::as_str),
+            Some(r#"say "hi" \ there"#),
+            "and decode back"
+        );
+        assert_eq!(
+            v.get("rows"),
+            decoded(&term_with(4, "\u{23fa} streaming\r\n".as_bytes()))
+                .1
+                .get("rows"),
+            "the title is no row"
+        );
+    }
+
     #[test]
     fn text_json_carries_the_generation_of_the_rows_it_sends() {
         const ALT_A: &[u8] = b"\x1b[?1049h\x1b[H Bash command\r\n   ls -la /tmp/work\r\n";
@@ -5655,7 +5798,11 @@ mod story_tests {
             Ok((StoryVerb::Chose, "some text here".to_string())),
             "the text is trimmed and kept whole"
         );
-        assert_eq!(StoryVerb::TOLD_WORDS.len(), 1, "the closed set is `chose`");
+        assert_eq!(
+            StoryVerb::TOLD_WORDS,
+            ["chose"],
+            "the closed set is `chose`"
+        );
         for word in StoryVerb::TOLD_WORDS {
             assert!(StoryVerb::parse_told(word).is_some(), "{word}");
         }
@@ -5715,8 +5862,21 @@ mod permissions_verb_tests {
     #[test]
     fn the_reply_names_the_walks_subjects() {
         assert_eq!(
-            Started::Walking(vec![Subject::DeveloperTools, Subject::FullDiskAccess]).reply(),
+            Started::Walking {
+                pages: vec![Subject::DeveloperTools, Subject::FullDiskAccess],
+                not_now: Vec::new(),
+            }
+            .reply(),
             "OK walking devtools fda\n"
+        );
+        assert_eq!(
+            Started::Walking {
+                pages: vec![Subject::DeveloperTools],
+                not_now: vec![Subject::FullDiskAccess],
+            }
+            .reply(),
+            "OK walking devtools not-now:fda\n",
+            "a page held back by a Not now"
         );
         assert_eq!(Started::Granted.reply(), "OK granted\n");
         assert_eq!(Started::Recent.reply(), "OK recent\n");

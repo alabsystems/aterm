@@ -298,6 +298,7 @@ pub(crate) fn answer_transition(
             id: MoveId::default(),
             origin: a.seat().context(),
             to: "main".into(),
+            at: AccountAt::Wall,
             login: Some(old.clone()),
             process: snap.clone(),
             answered: false,
@@ -606,5 +607,89 @@ fn auth_changes_before_the_observation_lock_use_independent_identity_evidence() 
         assert!(changed.load(Ordering::SeqCst) >= 2);
         assert!(a.state().proven, "named={named}");
         assert_eq!(a.state().account("main").auth, accounts::Auth::Ok);
+    }
+}
+#[test]
+fn a_known_identity_contradiction_never_proves_the_active_account() {
+    for auth in [
+        accounts::Auth::Unseen,
+        accounts::Auth::Ok,
+        accounts::Auth::SignedOut,
+    ] {
+        let a = Accts::new();
+        let sid = "s-wrong-served-identity";
+        std::fs::write(a.roster_path(), OWN_ROW).unwrap();
+        a.spawn(sid, ACCT_TALK_A, "main");
+        let idle = a.worker(sid, &on());
+        unproven(&a);
+        edited(&a, |state| {
+            state.accounts.entry("main".into()).or_default().auth = auth;
+            state.canary = Some(accounts::Canary {
+                sid: sid.into(),
+                at: a.clock(),
+                took: false,
+            });
+        });
+        std::fs::write(
+            a.tmp.path().join("home/.claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"wrong@example.test"}}"#,
+        )
+        .unwrap();
+        let before = a.state();
+        let ledger = a.ledger();
+        idle.account_served();
+        assert_eq!(
+            a.state(),
+            before,
+            "auth={auth:?}: contradictory identity proved the account"
+        );
+        assert_eq!(a.ledger(), ledger, "auth={auth:?}");
+    }
+}
+
+#[test]
+fn signed_out_recovery_checks_the_profile_inside_the_writer() {
+    for served in [false, true] {
+        for evidence in [
+            r#"{"oauthAccount":{"emailAddress":"wrong@example.test"}}"#,
+            r#"{"oauthAccount":{"accountUuid":"unknown"}}"#,
+        ] {
+            let a = Accts::new();
+            let sid = "s-late-recovery-identity";
+            std::fs::write(a.roster_path(), OWN_ROW).unwrap();
+            a.spawn(sid, ACCT_TALK_A, "main");
+            let idle = a.worker(sid, &on());
+            unproven(&a);
+            edited(&a, |state| {
+                accounts::note_auth(state, "main", accounts::Auth::SignedOut, a.clock());
+            });
+            let profile = a.tmp.path().join("home/.claude.json");
+            std::fs::write(
+                &profile,
+                r#"{"oauthAccount":{"emailAddress":"owner@example.com"}}"#,
+            )
+            .unwrap();
+            let reached = Arc::new(AtomicBool::new(false));
+            let observed = Arc::clone(&reached);
+            a.at_seat_read(2, move |_| {
+                std::fs::write(&profile, evidence).unwrap();
+                observed.store(true, Ordering::SeqCst);
+            });
+            let before = a.state();
+            let ledger = a.ledger();
+            if served {
+                idle.account_served();
+            } else {
+                let (seat, roster, look) = idle.account_ctx().unwrap();
+                idle.signed_back(&seat, &roster, &look, "main");
+            }
+            assert!(reached.load(Ordering::SeqCst));
+            assert_eq!(
+                a.state(),
+                before,
+                "served={served}: stale identity admitted recovery"
+            );
+            assert_eq!(a.ledger(), ledger, "served={served}");
+        }
     }
 }

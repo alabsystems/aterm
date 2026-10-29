@@ -107,6 +107,9 @@ pub(crate) struct TaskOrder {
     pub(crate) fact_line: bool,
     /// Autopilot word (`spawn … autopilot=<land|cruise>`) written before the worker starts.
     pub(crate) autopilot: Autopilot,
+    /// Whether the worker drives the person's own browser (Claude Code's `--chrome`): a credit
+    /// claim worker's alone ([`crate::harness_host::credit_claim`]); no `spawn` word sets it.
+    pub(crate) chrome: bool,
 }
 
 /// A WORKER'S AUTOPILOT where its spawn names none: Land (Autopilot Land).
@@ -154,6 +157,7 @@ impl TaskOrder {
             trusted_cwd,
             fact_line: true,
             autopilot: WORKER_AUTOPILOT,
+            chrome: false,
         })
     }
 }
@@ -453,6 +457,8 @@ pub(crate) struct Launch {
     pub(crate) trusted_cwd: Option<String>,
     /// The starter's session, whose agent of the worker's kind the line follows.
     pub(crate) caller: Option<Arc<SessionCtx>>,
+    /// [`TaskOrder::chrome`].
+    pub(crate) chrome: bool,
 }
 
 /// Start the worker's launcher.
@@ -463,6 +469,195 @@ pub(crate) fn launch_worker(work: Launch) {
         .spawn(move || run_worker_launch(&work));
     if started.is_err() {
         stall_task(&ctx, local, "its launcher thread could not start");
+    }
+}
+
+/// How many more times a pooled launch the pool refused is tried before its worker stalls
+/// ([`pool_attempts`]).
+const POOL_RETRIES: u32 = 3;
+
+/// The pause before a refused pooled launch is tried again; each later one doubles.
+const POOL_RETRY_PAUSE: Duration = Duration::from_secs(1);
+
+/// The longest a held launch waits before it looks at its pool again ([`pool_attempts`]): a row
+/// the owner signs in, adds, pins or switches rotation off for is seen within this.
+const POOL_HOLD_LOOK: Duration = Duration::from_secs(60);
+
+/// What [`pool_attempts`] waits for before it looks again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PoolWait {
+    /// A pause after a refusal that may pass: another process's turn at `accounts.lock`, or a
+    /// roster, login or selection that changed while the launch was read or prepared.
+    Retry(Duration),
+    /// Every row of the pool the launch may take is at its limit, the first of them opening at
+    /// `until` (Unix seconds): one look's wait, `look` long at most, uncounted.
+    Hold {
+        until: i64,
+        why: String,
+        look: Duration,
+    },
+}
+
+/// A pooled launch `attempt`, tried again where the pool refused it: held while every row it may
+/// take is at its limit (`opening` names when the first opens), else up to [`POOL_RETRIES`] more
+/// times after a pause from [`POOL_RETRY_PAUSE`] that doubles. A hold looks at the pool again
+/// after each wait of [`POOL_HOLD_LOOK`] at most (and at `until`, by `now`, Unix seconds): the
+/// launch is tried again once `opening` no longer names that instant, as where a row serves now,
+/// the pool or its mode changed, or another row opens first. `wait` waits, and answers false
+/// where the launch is no longer wanted (its session ended).
+///
+/// # Errors
+///
+/// The last refusal, where the retries are spent, or `wait` gave up.
+pub(crate) fn pool_attempts<T>(
+    mut attempt: impl FnMut() -> Result<T, String>,
+    mut opening: impl FnMut() -> Option<i64>,
+    now: impl Fn() -> Option<i64>,
+    mut wait: impl FnMut(&PoolWait) -> bool,
+) -> Result<T, String> {
+    let mut retries = 0;
+    loop {
+        let why = match attempt() {
+            Ok(done) => return Ok(done),
+            Err(why) => why,
+        };
+        let Some(until) = opening() else {
+            if retries == POOL_RETRIES {
+                return Err(why);
+            }
+            let pause = POOL_RETRY_PAUSE.saturating_mul(1 << retries);
+            retries += 1;
+            if !wait(&PoolWait::Retry(pause)) {
+                return Err(why);
+            }
+            continue;
+        };
+        loop {
+            let left = now().map_or(0, |now| until.saturating_sub(now)).max(0);
+            // At least a second, so a clock that reads `until` early never spins the hold.
+            let look = Duration::from_secs(left.unsigned_abs().max(1)).min(POOL_HOLD_LOOK);
+            let held = PoolWait::Hold {
+                until,
+                why: why.clone(),
+                look,
+            };
+            if !wait(&held) {
+                return Err(why);
+            }
+            if opening() != Some(until) {
+                break;
+            }
+        }
+    }
+}
+
+/// When `cli`'s pool at `seat` can next take a launch of the program `starter` runs
+/// ([`aterm_agent::harness::accounts_pool::launch_opening`], judged for `starter.exe`, so on a
+/// Codex build that keeps no row's login its own only the default row's wall end counts), the
+/// instant [`pool_attempts`] holds a refused launch until; `None` for an agent with no pool.
+fn pool_opening(
+    seat: &aterm_agent::harness::accounts_pool::Seat<'_>,
+    starter: &aterm_agent::harness::worker::Starter,
+    cli: &aterm_agent::harness::worker::WorkerCli,
+) -> Option<i64> {
+    use aterm_agent::harness::{accounts, accounts_pool};
+    let pool = accounts::Cli::of(cli.agent)?;
+    accounts_pool::launch_opening(seat, pool, Some(&starter.exe))
+}
+
+/// [`pooled_starter`] through [`pool_attempts`] for `work`: a hold is noted on its launch record
+/// and marks its session as its launcher's still ([`InstallingMark`]) until the launch starts or
+/// stalls, so the startup deadline does not judge a worker whose line is not typed yet; each wait
+/// ends early where the session ends.
+fn pooled_starter_held(
+    work: &Launch,
+    starter: aterm_agent::harness::worker::Starter,
+    cli: &aterm_agent::harness::worker::WorkerCli,
+) -> Result<aterm_agent::harness::worker::Starter, String> {
+    let alive = || {
+        work.store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .by_local(work.local)
+            .is_some_and(|h| !matches!(h.state, SessionState::Exited))
+    };
+    let mut mark = None;
+    let mut noted = None;
+    let mut sub = None;
+    pool_attempts(
+        || pooled_starter(starter.clone(), cli, work.local),
+        || pool_opening(&PoolSeat::here()?.seat(), &starter, cli),
+        PoolSeat::unix_now,
+        |next| match next {
+            PoolWait::Retry(pause) => {
+                std::thread::sleep(*pause);
+                alive()
+            }
+            PoolWait::Hold { until, why, look } => {
+                if noted != Some(*until) {
+                    noted = Some(*until);
+                    note_launch(
+                        &work.ctx,
+                        format!(
+                            "held until {} ({why}): no account of its pool can take it now",
+                            aterm_types::rfc3339::format_rfc3339(
+                                u64::try_from(*until).unwrap_or(0)
+                            )
+                        ),
+                    );
+                }
+                mark.get_or_insert_with(|| InstallingMark::of(&work.ctx));
+                let sub = sub.get_or_insert_with(|| {
+                    crate::session_watch::Subscription::single(&work.ctx.watchers)
+                });
+                let end = Instant::now() + *look;
+                loop {
+                    if !alive() {
+                        return false;
+                    }
+                    let left = end.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return true;
+                    }
+                    let _ = sub.wait(left);
+                }
+            }
+        },
+    )
+}
+
+/// Where a pooled launch reads its pool ([`aterm_agent::harness::accounts_pool::Seat`]): this
+/// user's config directory, harness state, home and the time now.
+pub(crate) struct PoolSeat {
+    config_dir: PathBuf,
+    state: PathBuf,
+    home: PathBuf,
+    now: i64,
+}
+
+impl PoolSeat {
+    pub(crate) fn here() -> Option<PoolSeat> {
+        Some(PoolSeat {
+            config_dir: aterm_types::dirs::aterm_config_path()?
+                .parent()?
+                .to_path_buf(),
+            state: crate::harness_host::harness_state()?,
+            home: aterm_types::dirs::home_dir()?,
+            now: PoolSeat::unix_now()?,
+        })
+    }
+
+    fn unix_now() -> Option<i64> {
+        aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok())
+    }
+
+    pub(crate) fn seat(&self) -> aterm_agent::harness::accounts_pool::Seat<'_> {
+        aterm_agent::harness::accounts_pool::Seat {
+            config_dir: &self.config_dir,
+            state: &self.state,
+            home: &self.home,
+            now: self.now,
+        }
     }
 }
 
@@ -479,7 +674,7 @@ fn run_worker_launch(work: &Launch) {
         return;
     };
     let (caller, found) = worker_starter_of(work, cli);
-    let caller = match pooled_starter(caller, cli, work.local) {
+    let caller = match pooled_starter_held(work, caller, cli) {
         Ok(caller) => caller,
         Err(why) => {
             stall(work, &why);
@@ -526,16 +721,13 @@ fn run_worker_launch(work: &Launch) {
         _ => work.model.as_deref(),
     };
     // A disk-free worker starts where every box is raised, whatever the owner's settings say,
-    // so its approval rule fences what it removes (the disk-free design's §8.4).
+    // so its approval rule fences what it removes (the disk-free design's §8.4); so does a
+    // credit claim worker (`work.chrome`), whose rule fences what it does in the browser.
     let disk_worker = work
         .trusted_cwd
         .as_deref()
         .is_some_and(|cwd| aterm_agent::harness::disk::fence::is_worker_folder(Path::new(cwd)));
-    let fresh = aterm_agent::harness::worker::Fresh {
-        model,
-        trusted_here: here,
-        permission_mode: disk_worker.then_some("default"),
-    };
+    let fresh = worker_fresh(model, here, disk_worker, work.chrome);
     let line = aterm_agent::harness::worker::line(cli, work.dialect, &admitted, &fresh);
     match line {
         Ok(line) => {
@@ -566,7 +758,7 @@ fn run_worker_launch(work: &Launch) {
                 }
             };
             let note = format!(
-                "typed ({} B, {written}): {} ({}{}{})",
+                "typed ({} B, {written}): {} ({}{}{}){}",
                 line.len() + 1,
                 caller.exe.display(),
                 found.words(cli.agent),
@@ -579,6 +771,10 @@ fn run_worker_launch(work: &Launch) {
                     .filter(|_| here)
                     .map(|flag| format!(", trusting its folder for this run ({flag})"))
                     .unwrap_or_default(),
+                admitted
+                    .kept_off()
+                    .map(|said| format!("; {said}"))
+                    .unwrap_or_default(),
             );
             aterm_log::info!("worker session {}: launch line {note}", work.local);
             note_launch(&work.ctx, note);
@@ -587,11 +783,32 @@ fn run_worker_launch(work: &Launch) {
     }
 }
 
-/// The store a worker's on-demand program is read from and installed into ([`admit_worker`]).
+/// What a worker's line names beside its program: `model`, its folder trusted where `here`,
+/// and the person's browser where `chrome` ([`TaskOrder::chrome`]). A disk-free worker (the
+/// disk-free design's §8.4) and a credit claim worker, the one `chrome` worker
+/// ([`crate::harness_host::credit_claim`]), start with every box raised (`default`), whatever
+/// the person's settings say, so their approval rules fence what they do.
+pub(crate) fn worker_fresh(
+    model: Option<&str>,
+    here: bool,
+    disk_worker: bool,
+    chrome: bool,
+) -> aterm_agent::harness::worker::Fresh<'_> {
+    aterm_agent::harness::worker::Fresh {
+        model,
+        trusted_here: here,
+        permission_mode: (disk_worker || chrome).then_some("default"),
+        chrome,
+    }
+}
+
+/// The store a worker's program is read from and installed into ([`admit_worker`]).
 pub(crate) trait ProgramStore {
     /// Whether `program` has an installed build.
     fn present(&self, program: &str) -> bool;
-    /// Why a person keeps `program` off this machine, where they do.
+    /// Why atpkg installs no `program` on this machine, where it does not: a person keeps it off
+    /// (`[packages] exclude`, a removal, or a no to unattended installs, [`held_in`]), or no
+    /// atpkg here can install it.
     fn held(&self, program: &str) -> Option<String>;
     /// Install `program` by atpkg's verified install.
     ///
@@ -604,22 +821,10 @@ pub(crate) trait ProgramStore {
 /// atpkg's own store, and its verified install run as `aterm pkg install <program>` runs it.
 pub(crate) struct AtpkgStore;
 
-impl ProgramStore for AtpkgStore {
-    fn present(&self, program: &str) -> bool {
-        atpkg::store::resolve_configured()
-            .is_some_and(|layout| atpkg::ops::active_builds(&layout).contains_key(program))
-    }
-
-    fn held(&self, program: &str) -> Option<String> {
-        if atpkg::config::load().exclude().iter().any(|e| e == program) {
-            return Some("`[packages] exclude` in aterm.toml names it".to_string());
-        }
-        atpkg::store::resolve_configured()
-            .is_some_and(|layout| layout.removed_programs().contains(program))
-            .then(|| format!("a person removed it (`aterm pkg install {program}` brings it back)"))
-    }
-
-    fn install(&self, program: &str) -> Result<(), String> {
+impl AtpkgStore {
+    /// The atpkg that installs here, or why none can: none beside aterm, an inert package
+    /// manager (no package root key pinned in this build), or no store configured.
+    fn installer() -> Result<(std::path::PathBuf, atpkg::store::Layout), String> {
         let Some(atpkg) = crate::co_located_atpkg() else {
             return Err("the package tool is not installed beside aterm".to_string());
         };
@@ -629,16 +834,36 @@ impl ProgramStore for AtpkgStore {
                     .to_string(),
             );
         }
-        let layout = atpkg::store::resolve_configured();
+        let Some(layout) = atpkg::store::resolve_configured() else {
+            return Err("no package store is configured".to_string());
+        };
+        Ok((atpkg, layout))
+    }
+}
+
+impl ProgramStore for AtpkgStore {
+    fn present(&self, program: &str) -> bool {
+        atpkg::store::resolve_configured()
+            .is_some_and(|layout| atpkg::ops::active_builds(&layout).contains_key(program))
+    }
+
+    fn held(&self, program: &str) -> Option<String> {
+        let cfg = atpkg::config::load();
+        held_in(program, &cfg, atpkg::store::resolve_from(&cfg).as_ref())
+            .or_else(|| Self::installer().err())
+    }
+
+    fn install(&self, program: &str) -> Result<(), String> {
+        let (atpkg, layout) = Self::installer()?;
         let mut cmd = crate::qos::atpkg_command(&atpkg);
         cmd.args(crate::pass_lead(
             aterm_types::dirs::runs_under_private_state_root(),
         ));
         let run = crate::run_atpkg_pass(
-            install_argv(program, layout.as_ref()),
+            install_argv(program, Some(&layout)),
             cmd,
             Some(&crate::spawn::atpkg_child_path()),
-            layout.as_ref(),
+            Some(&layout),
             false,
             &|_: crate::Wake| {},
         )
@@ -655,6 +880,38 @@ impl ProgramStore for AtpkgStore {
     }
 }
 
+/// Why atpkg installs no `program` here by what `cfg` (aterm.toml's `[packages]`) and `layout`
+/// (atpkg's store, where one is configured) say, or `None`: the pure policy core of
+/// [`AtpkgStore::held`]. `[packages] exclude` names it, a person removed it, atpkg may install
+/// nothing unattended here (a person's no to installs, or an inert manager, by atpkg's own
+/// reading, the one its update pass completes the default set by:
+/// [`atpkg::adoption::unattended_install_off`]), or atpkg serves no build of it for this
+/// machine. A spawn is a lead's request, not the person's, so it installs nothing a person kept
+/// off.
+pub(crate) fn held_in(
+    program: &str,
+    cfg: &atpkg::config::PackagesConfig,
+    layout: Option<&atpkg::store::Layout>,
+) -> Option<String> {
+    if cfg.exclude().iter().any(|e| e == program) {
+        return Some("`[packages] exclude` in aterm.toml names it".to_string());
+    }
+    if layout.is_some_and(|layout| layout.removed_programs().contains(program)) {
+        return Some(format!(
+            "a person removed it (`aterm pkg install {program}` brings it back)"
+        ));
+    }
+    if let Some(off) =
+        layout.and_then(|layout| atpkg::adoption::unattended_install_off(layout, cfg))
+    {
+        return Some(off.to_string());
+    }
+    if !atpkg::vendor_direct::served_here(program) {
+        return Some(format!("atpkg serves no {program} build for this machine"));
+    }
+    None
+}
+
 /// The argv of atpkg's verified install of `program` (after any pass lead): the verb
 /// `aterm pkg install <program>` runs, waiting its turn behind a running pass and writing its
 /// progress where every pass does.
@@ -669,11 +926,15 @@ pub(crate) fn install_argv(
 
 /// ADMIT A WORKER BEFORE ITS FIRST PROMPT IS AWAITED: its sign-in first, then its program
 /// ([`aterm_agent::harness::worker::admit`]). A signed-out CLI that would open a sign-in page by
-/// itself (Grok Build) is refused before anything is installed. A CLI the default set does not
-/// keep is installed by atpkg's verified install where it is absent, with each step told to the
-/// launch record by `note`. While the install runs, the session carries the mark `installing`
-/// makes ([`InstallingMark`]), so the startup deadline does not count the install as a start
-/// that never came.
+/// itself (Grok Build) is refused before `store` is read or anything is installed. A program
+/// atpkg ships that `store` holds no build of (a fresh Mac before atpkg's update pass lands it,
+/// or one whose install failed) is installed by atpkg's verified install, with each step told to
+/// the launch record by `note`; where a person keeps it off ([`held_in`]: an exclude, a removal,
+/// or a no to unattended installs), or no atpkg here can install it, nothing is installed and
+/// the launch line says so
+/// ([`aterm_agent::harness::worker::Admitted::kept_off`]). While the install runs, the session
+/// carries the mark `installing` makes ([`InstallingMark`]), so the startup deadline does not
+/// count the install as a start that never came.
 ///
 /// # Errors
 ///
@@ -695,15 +956,14 @@ pub(crate) fn admit_worker<M>(
         |program| store.held(program),
         |program| {
             note(format!(
-                "installing {program} by atpkg's verified install: `spawn agent={}` named it, \
-                 which opts this machine in",
-                cli.word
+                "installing {program} by atpkg's verified install: atpkg's store holds no build \
+                 of it yet"
             ));
             let _mark = installing();
             store.install(program)
         },
     )?;
-    if admitted.readiness() == Readiness::Installed {
+    if *admitted.readiness() == Readiness::Installed {
         note(format!(
             "installed {}; atpkg keeps it current from here",
             cli.word
@@ -714,7 +974,7 @@ pub(crate) fn admit_worker<M>(
 
 /// The task record's `why=` for a worker its launcher refused before its line
 /// ([`aterm_agent::harness::worker::Refused`]): `signin` for a signed-out CLI, which only a
-/// person can fix, and `install` for a program that is held back or failed to install.
+/// person can fix, and `install` for a program whose install failed.
 pub(crate) const fn refused_why(refused: &aterm_agent::harness::worker::Refused) -> &'static str {
     match refused {
         aterm_agent::harness::worker::Refused::SignedOut(_) => crate::task_record::WHY_SIGNIN,
@@ -722,8 +982,9 @@ pub(crate) const fn refused_why(refused: &aterm_agent::harness::worker::Refused)
     }
 }
 
-/// A session's launcher is installing its worker's program: set on the session's timeline while
-/// it lives, and cleared when it drops, on an error or a panic too
+/// A session's launcher is installing its worker's program, or holding its launch until a pool
+/// row opens ([`pooled_starter_held`]): set on the session's timeline while it lives, and cleared
+/// when it drops, on an error or a panic too
 /// ([`crate::session_timeline::SessionTimeline::worker_installing`]). The startup deadline does
 /// not judge a worker while this stands. It lives only in this process, so a seamless update's
 /// successor, which has no launcher, judges the worker as usual.
@@ -1052,8 +1313,13 @@ fn worker_starter_of(
 /// runs on a home or credential of its own, which the pool leaves alone; a starter already on a
 /// bound pool row still rotates): every pick removes [`pool_onto`]'s variables, replaces any
 /// carried seam variable for a row of its own directory, and drops a carried pool seam variable
-/// when moving back to the machine's default row. Claude Code's workers keep the starter's login,
-/// which the host's own flow moves.
+/// when moving back to the machine's default row. On a Codex program that keeps no row's
+/// `CODEX_AUTH_PATH` login its own ([`aterm_agent::harness::codex_alab::auth_path_unread`]),
+/// which would run a row of its own on the default home's login, the pool picks only the row on
+/// that login ([`aterm_agent::harness::accounts_pool::launch_env_for`]) and says from that row's
+/// own condition why it cannot serve where it cannot, and a bound row of its own the starter
+/// carried is refused. Claude Code's workers keep the starter's login, which the host's own flow
+/// moves.
 fn pooled_starter(
     starter: aterm_agent::harness::worker::Starter,
     cli: &aterm_agent::harness::worker::WorkerCli,
@@ -1063,24 +1329,16 @@ fn pooled_starter(
     let Some(pool) = accounts::Cli::of(cli.agent).filter(|c| *c != accounts::Cli::Claude) else {
         return Ok(starter);
     };
-    let (Some(config), Some(state), Some(home), Some(now)) = (
-        aterm_types::dirs::aterm_config_path(),
-        crate::harness_host::harness_state(),
-        aterm_types::dirs::home_dir(),
-        aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok()),
-    ) else {
+    let Some(parts) = PoolSeat::here() else {
         return Ok(starter);
     };
-    let Some(config_dir) = config.parent() else {
-        return Ok(starter);
-    };
-    let seat = accounts_pool::Seat {
-        config_dir,
-        state: &state,
-        home: &home,
-        now,
-    };
-    pooled_starter_in(starter, pool, &seat, &accounts_pool::live_usage, local)
+    pooled_starter_in(
+        starter,
+        pool,
+        &parts.seat(),
+        &accounts_pool::LiveUsage,
+        local,
+    )
 }
 
 pub(crate) fn pooled_starter_in(
@@ -1101,9 +1359,10 @@ pub(crate) fn pooled_starter_in(
         return Ok(starter);
     }
     let var = pool.accounts().seam.var();
+    let mut carried_row = None;
     if starter.env.iter().any(|(name, _)| name == var) {
         let roster = seat.bound_roster(pool)?;
-        if accounts::judged_label(&roster, &who).is_none() {
+        let Some(label) = accounts::judged_label(&roster, &who) else {
             if let Some(login) = who.login.as_deref() {
                 let root = seat.store(pool).logins_dir();
                 let path = Path::new(login);
@@ -1122,9 +1381,10 @@ pub(crate) fn pooled_starter_in(
                 }
             }
             return Ok(starter);
-        }
+        };
+        carried_row = Some(label.to_string());
     }
-    if let Some(pick) = accounts_pool::launch_env(seat, pool, read)? {
+    if let Some(pick) = accounts_pool::launch_env_for(seat, pool, read, Some(&starter.exe))? {
         let onto = pool_onto(starter, pool, &pick, seat.home)?;
         aterm_log::info!(
             "worker session {local}: starts under {} account {}",
@@ -1133,7 +1393,50 @@ pub(crate) fn pooled_starter_in(
         );
         return Ok(onto);
     }
+    if let Some(label) = carried_row {
+        codex_row_runs(&starter, pool, seat, &label)?;
+    }
     Ok(starter)
+}
+
+/// Why a Codex worker `starter` would run on this machine's default login while the pool counts
+/// it as `label`'s: it carries a bound row's own `CODEX_AUTH_PATH`, which the pool picked nothing
+/// to replace (rotation off with no pin, or Codex's login kept in the OS keyring, for which the
+/// pool picks no row), on a program that would not keep that login its own
+/// ([`aterm_agent::harness::codex_alab::auth_path_unread`]); the refusal's advice comes from the
+/// default row's own condition ([`aterm_agent::harness::accounts_pool::default_row_now`]), told
+/// as under a pool that picked no row, rotation off only where that is why: with Codex's login
+/// in the keyring the pool reads no pin, so a pin may stand under rotation off too
+/// ([`aterm_agent::harness::codex_alab::only_default_carried`]). The default row's starter,
+/// which carries no such variable, and every other CLI pass.
+fn codex_row_runs(
+    starter: &aterm_agent::harness::worker::Starter,
+    pool: aterm_agent::harness::accounts::Cli,
+    seat: &aterm_agent::harness::accounts_pool::Seat<'_>,
+    label: &str,
+) -> Result<(), String> {
+    use aterm_agent::harness::{accounts, codex_alab};
+    if pool != accounts::Cli::Codex
+        || !starter
+            .env
+            .iter()
+            .any(|(name, value)| name == codex_alab::AUTH_PATH_ENV && !value.is_empty())
+    {
+        return Ok(());
+    }
+    let Some(why) = codex_alab::auth_path_unread(&starter.exe) else {
+        return Ok(());
+    };
+    let default = aterm_agent::harness::accounts_pool::default_row_now(seat, pool)?;
+    Err(format!(
+        "{}; no worker was started",
+        codex_alab::only_default_carried(
+            &why,
+            label,
+            &default,
+            seat.mode() == accounts::Mode::Off && !seat.keyring_held(pool)
+        )
+    ))
 }
 
 /// `starter` onto `pool`'s login `pick` ([`pooled_starter`]): the variables

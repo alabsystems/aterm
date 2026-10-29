@@ -3147,7 +3147,7 @@ unsafe fn restore_screen(
             "crash restore: the restore of a recovered session panicked at {} ({}); it takes \
              the META rung, its screen blank",
             panic.location,
-            panic.message
+            aterm_log::words::Panic::of_text(&panic.message)
         );
         RestoreReport::meta("panic", attempts)
     })?;

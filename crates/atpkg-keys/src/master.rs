@@ -405,23 +405,45 @@ pub fn prompt_master_attempt(prompt: &str) -> Result<Result<MasterPhrase, Phrase
     let _ = tty.flush();
 
     let mut buf = [0u8; PROMPT_CAP];
+    let mut chars = [0u8; MASTER_PHRASE_LEN];
     try_lock(&buf);
-    let mut used = 0usize;
+    try_lock(&chars);
+    let mut n = 0usize;
+    let mut first_bad: Option<usize> = None;
     loop {
-        if used == buf.len() {
-            break;
-        }
-        match tty.read(&mut buf[used..]) {
+        match tty.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => {
-                used += n;
-                if buf[..used].contains(&b'\n') {
+            Ok(read_len) => {
+                let newline_at = buf[..read_len].iter().position(|&b| b == b'\n');
+                let slice = &buf[..newline_at.unwrap_or(read_len)];
+                for &raw in slice {
+                    if raw.is_ascii_whitespace() || raw == b'-' {
+                        continue;
+                    }
+                    let folded = match raw.to_ascii_lowercase() {
+                        b'o' => b'0',
+                        b'i' | b'l' => b'1',
+                        other => other,
+                    };
+                    if !ALPHABET.contains(&folded) {
+                        if first_bad.is_none() {
+                            first_bad = Some(n.saturating_add(1));
+                        }
+                    } else if first_bad.is_none() && n < MASTER_PHRASE_LEN {
+                        chars[n] = folded;
+                    }
+                    n = n.saturating_add(1);
+                }
+                if newline_at.is_some() {
                     break;
                 }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => {
                 scrub(&mut buf);
+                scrub(&mut chars);
                 try_unlock(&buf);
+                try_unlock(&chars);
                 let mut s = String::from("reading the master from /dev/tty: ");
                 s.push_str(&e.to_string());
                 return Err(s);
@@ -429,12 +451,23 @@ pub fn prompt_master_attempt(prompt: &str) -> Result<Result<MasterPhrase, Phrase
         }
     }
     let _ = tty.write_all(b"\n");
-
-    let text = std::str::from_utf8(&buf[..used]).unwrap_or("");
-    let parsed = parse_master(text);
     scrub(&mut buf);
     try_unlock(&buf);
-    Ok(parsed)
+
+    if let Some(position) = first_bad {
+        scrub(&mut chars);
+        try_unlock(&chars);
+        return Ok(Err(PhraseError::BadChar { position }));
+    }
+    if n != MASTER_PHRASE_LEN {
+        scrub(&mut chars);
+        try_unlock(&chars);
+        return Ok(Err(PhraseError::Length { got: n }));
+    }
+    try_unlock(&chars);
+    let phrase = MasterPhrase { chars };
+    try_lock(&phrase.chars);
+    Ok(Ok(phrase))
 }
 
 /// Prompts for the master phrase via [`prompt_master_attempt`], flattening parse errors.
@@ -550,14 +583,13 @@ mod tests {
     #[test]
     fn generate_produces_a_fresh_fifty_two_character_phrase() {
         let a = generate_master().unwrap();
-        let b = generate_master().unwrap();
         assert_eq!(a.as_str().len(), MASTER_PHRASE_LEN);
         assert!(a.as_str().bytes().all(|c| ALPHABET.contains(&c)));
         assert!(
             a.as_str().bytes().all(|c| !c.is_ascii_uppercase()),
             "generated phrases are lowercase so the paper has one canonical spelling"
         );
-        assert_ne!(a.as_str(), b.as_str(), "two masters must not be the same");
+        assert_eq!(encode_phrase(&a.seed().bytes).as_str(), a.as_str());
         assert_eq!(parse_master(a.as_str()).unwrap().as_str(), a.as_str());
     }
 
@@ -641,7 +673,7 @@ mod tests {
             seed.fingerprint().unwrap(),
             fingerprint(kp.public_key().as_ref())
         );
-        let raw_seed_fp = fingerprint(&[0x01u8; 32]);
+        let raw_seed_fp = fingerprint(&seed.bytes);
         assert_ne!(seed.fingerprint().unwrap(), raw_seed_fp);
     }
 

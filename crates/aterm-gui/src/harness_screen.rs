@@ -29,6 +29,9 @@ pub(crate) struct HarnessStatsReport {
     pub(crate) sibling_tabs: Vec<TabSpreadsheetRow>,
     pub(crate) remote_computers: Vec<TabComputer>,
     pub(crate) remote_tabs: Vec<TabSpreadsheetRow>,
+    /// Why this reading looked for no computer on the local network ([`LAN_WAITS`]), where it
+    /// did not.
+    pub(crate) lan_waits: Option<&'static str>,
     /// The build-slot minutes idle while a session's hold was ready, over the day the facts
     /// ring (`<state>/occupancy/facts.ring`) holds; `None` with no ring.
     pub(crate) idle_ready_min: Option<u64>,
@@ -75,6 +78,7 @@ impl HarnessStatsReport {
             sibling_tabs: Vec::new(),
             remote_computers: Vec::new(),
             remote_tabs: Vec::new(),
+            lan_waits: None,
             idle_ready_min: None,
             day_lines,
             decision_clocks,
@@ -156,11 +160,13 @@ pub(crate) fn read_harness_stats(
     let read = collect_harness_stats(state_dir, harness_state, now_ms, offset_at);
     let ask = fleet.take();
     read.map(|mut report| {
-        let (sibling_tabs, remote_computers, remote_tabs) = collect_fleet_and_sibling_tabs(ask);
+        let (sibling_tabs, remote_computers, remote_tabs, lan_waits) =
+            collect_fleet_and_sibling_tabs(ask);
         report.ab_others = others;
         report.sibling_tabs = sibling_tabs;
         report.remote_computers = remote_computers;
         report.remote_tabs = remote_tabs;
+        report.lan_waits = lan_waits;
         report
     })
 }
@@ -409,8 +415,8 @@ pub(crate) struct HarnessSession {
     pub(crate) armed_at_ms: Option<i64>,
     pub(crate) set_by: Option<crate::autopilot::SetByWords>,
     pub(crate) need: Option<crate::needs::HarnessAsk>,
-    pub(crate) hold: Option<crate::harness_glass::HeldGlass>,
-    pub(crate) stopped: Option<aterm_agent::harness::acts::HeldBy>,
+    pub(crate) hold: Option<crate::harness_glass::ShownHold>,
+    pub(crate) stopped: Option<crate::harness_glass::ShownStop>,
     pub(crate) waiting: Option<crate::harness_glass::WaitGlass>,
 }
 
@@ -476,25 +482,49 @@ pub(crate) struct HarnessState {
     pub(crate) today: i64,
 }
 
+/// Whether session counts describe listed observations or one instance's heartbeat.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TabSessionScope {
+    /// Counts describe the retained session observations, with unknown fields kept unknown.
+    #[default]
+    Observed,
+    /// A union of cached observations, without claiming one simultaneous host snapshot.
+    CachedObservations,
+    /// A heartbeat reports one instance's session count, without listing the host's sessions.
+    #[cfg(unix)]
+    OneInstanceHeartbeat,
+}
+
 /// One accessible computer in Settings ▸ Harness ▸ Tab Control (`/tabs`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TabComputer {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) address: String,
-    pub(crate) os_version: String,
+    pub(crate) os_version: Option<String>,
     pub(crate) status: String,
     pub(crate) vitals: String,
-    pub(crate) instances: usize,
-    pub(crate) tabs: usize,
-    pub(crate) ai_clis: usize,
-    pub(crate) active_ai: usize,
+    pub(crate) instances: Option<usize>,
+    /// The count's scope is explicit: a missing PID in cached Hello rows is not a heartbeat.
+    pub(crate) session_scope: TabSessionScope,
+    pub(crate) tabs: Option<usize>,
+    pub(crate) ai_clis: Option<usize>,
+    pub(crate) active_ai: Option<usize>,
+}
+
+/// Typed facts from a cached Hello session, independent of the words its row displays.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CachedSessionObservation {
+    instance_pid: Option<u64>,
+    ai_cli: Option<bool>,
 }
 
 /// One row in the Tab Control Panel's sessions & tabs spreadsheet.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TabSpreadsheetRow {
     pub(crate) key: String,
+    /// Stable computer identity; `computer` is only its display name.
+    pub(crate) computer_id: String,
     pub(crate) computer: String,
     pub(crate) instance: String,
     pub(crate) place: String,
@@ -503,11 +533,45 @@ pub(crate) struct TabSpreadsheetRow {
     pub(crate) state: String,
     pub(crate) program: String,
     pub(crate) is_ai_cli: bool,
+    /// Activity read from the agent's phase, independent of the row's display words.
+    pub(crate) active_ai: Option<bool>,
     pub(crate) ai_status: String,
     pub(crate) autopilot: String,
     pub(crate) human: String,
     pub(crate) vitals: String,
     pub(crate) show_local_id: Option<u64>,
+    pub(crate) cached_observation: Option<CachedSessionObservation>,
+}
+
+impl TabSpreadsheetRow {
+    fn ai_classification(&self) -> Option<bool> {
+        self.cached_observation
+            .map_or(Some(self.is_ai_cli), |fact| fact.ai_cli)
+    }
+}
+
+/// Count AI CLIs only when every row's classification was observed.
+pub(crate) fn ai_cli_count<'a>(rows: impl Iterator<Item = &'a TabSpreadsheetRow>) -> Option<usize> {
+    rows.map(|row| row.ai_classification().map(usize::from))
+        .sum()
+}
+
+/// Count active AI CLIs only when every row is classified and every AI phase was observed.
+pub(crate) fn active_ai_count<'a>(
+    rows: impl Iterator<Item = &'a TabSpreadsheetRow>,
+) -> Option<usize> {
+    rows.map(|row| match row.ai_classification()? {
+        false => Some(0),
+        true => row.active_ai.map(usize::from),
+    })
+    .sum()
+}
+
+pub(crate) fn active_ai_words(active: Option<usize>) -> String {
+    active.map_or_else(
+        || "activity unobserved".to_owned(),
+        |n| format!("{n} active"),
+    )
 }
 
 /// Snapshot of all accessible computers, `aterm` instances, and tabs for Settings ▸ Harness ▸ Tab Control (`/tabs`).
@@ -517,6 +581,9 @@ pub(crate) struct TabControlState {
     pub(crate) tabs: Vec<TabSpreadsheetRow>,
     /// What of the fleet this reading could look at.
     pub(crate) fleet: FleetScope,
+    /// Why the reading looked for no computer on the local network, where it did not
+    /// ([`LAN_WAITS`]).
+    pub(crate) lan_waits: Option<&'static str>,
 }
 
 /// Pure projection rendered by Settings ▸ Harness ▸ Tab Control (`/tabs`).
@@ -536,24 +603,24 @@ impl TabControlState {
         let summary_rows = if !observed {
             vec![("Fleet".to_string(), "reading\u{2026}".to_string())]
         } else {
-            let partial = self.computers.iter().any(|c| c.id.starts_with("lan/"));
+            let partial = self.computers.iter().any(|c| {
+                c.id.starts_with("lan/")
+                    || c.session_scope != TabSessionScope::Observed
+                    || c.instances.is_none()
+                    || c.tabs.is_none()
+                    || c.ai_clis.is_none()
+                    || c.active_ai.is_none()
+            });
             let total_computers = self.computers.len();
             let online_computers = self
                 .computers
                 .iter()
                 .filter(|c| c.status.starts_with("online"))
                 .count();
-            let total_instances: usize = self.computers.iter().map(|c| c.instances).sum::<usize>();
+            let total_instances: usize = self.computers.iter().filter_map(|c| c.instances).sum();
             let total_tabs = self.tabs.len();
-            let ai_tabs = self.tabs.iter().filter(|t| t.is_ai_cli).count();
-            let active_ai = self
-                .tabs
-                .iter()
-                .filter(|t| {
-                    t.is_ai_cli
-                        && (t.ai_status.starts_with("working") || t.ai_status.starts_with("busy"))
-                })
-                .count();
+            let ai_tabs = ai_cli_count(self.tabs.iter());
+            let active_ai = active_ai_words(active_ai_count(self.tabs.iter()));
             let mut rows = vec![(
                 "Computers".to_string(),
                 format!("{total_computers} known \u{b7} {online_computers} online"),
@@ -564,11 +631,15 @@ impl TabControlState {
                     format!("other computers and aterm instances are not read here: {why}"),
                 ));
             }
+            if let Some(why) = self.lan_waits {
+                rows.push(("Local network".to_string(), why.to_string()));
+            }
             rows.extend([
                 (
                     "Sessions".to_string(),
                     format!(
-                        "{total_instances} aterm {} \u{b7} {total_tabs} open {}{}",
+                        "{total_instances} {}aterm {} \u{b7} {total_tabs} open {}{}",
+                        if partial { "observed " } else { "" },
                         if total_instances == 1 {
                             "instance"
                         } else {
@@ -580,18 +651,18 @@ impl TabControlState {
                 ),
                 (
                     "AI CLIs".to_string(),
-                    if ai_tabs == 0 {
-                        if partial {
+                    match ai_tabs {
+                        None => format!("count unobserved \u{b7} {active_ai}"),
+                        Some(0) => if partial {
                             "none observed"
                         } else {
                             "none running"
                         }
-                        .to_string()
-                    } else {
-                        format!(
-                            "{ai_tabs} {} \u{b7} {active_ai} active",
+                        .to_string(),
+                        Some(ai_tabs) => format!(
+                            "{ai_tabs} {} \u{b7} {active_ai}",
                             if partial { "observed" } else { "running" }
-                        )
+                        ),
                     },
                 ),
             ]);
@@ -977,7 +1048,7 @@ impl HarnessState {
         })
     }
 
-    /// WHAT THE HARNESS DID's rows (§10.3, §12.4.6, §14.6): each count with a week, today's and the week's (`Approved  31 today · 212 in 7 days`), with its part under it where the part's week has one (`no safe rule`, `past “done”`); [`NEEDED_YOU`]'s count and wait in one row ([`waited_for_you`]); every count whose week is 0 named in one last count row ([`NONE_IN_7_DAYS`]); then the waits at limits, the occupancy door's rows and the reading's own.
+    /// WHAT THE HARNESS DID's rows (§10.3, §12.4.6, §14.6): each count with a week, today's and the week's (`Approved  31 today · 212 in 7 days`), with its part under it where the part's week has one (`no safe rule`, `past “done”`); [`NEEDED_YOU`]'s count and wait in one row ([`waited_for_you`]); every count whose week is 0 named in one last count row ([`NONE_IN_7_DAYS`]); then the waits at limits, the occupancy door's rows, a row of its own for each agent that supervises itself ([`self_claimed_rows`]), and the reading's own.
     fn did_rows(&self) -> Vec<(String, String)> {
         let row = |label: &str, value: String| (label.to_string(), value);
         let Some(report) = self.stats.report.as_deref() else {
@@ -997,11 +1068,14 @@ impl HarnessState {
             .map(|why| row("Last check", format!("failed: {why}")));
         let (today, week) = (&report.today, &report.week);
         let mut rows = Vec::new();
+        let others = self_claimed_rows(today, week);
         if week.is_empty() {
-            rows.push(row(
-                "7 days",
-                "nothing yet: no supervised session has acted".to_string(),
-            ));
+            let words = if others.is_empty() {
+                "nothing yet: no supervised session has acted"
+            } else {
+                "nothing yet: aterm's harness has not acted"
+            };
+            rows.push(row("7 days", words.to_string()));
         } else {
             let both = |t: u64, w: u64| in_windows(|d| format!("{t} {d}"), |d| format!("{w} {d}"));
             let waited = |t: u64, w: u64| {
@@ -1095,6 +1169,7 @@ impl HarnessState {
                 ));
             }
         }
+        rows.extend(others);
         if let Some(min) = report.idle_ready_min {
             rows.push(row(
                 "Idle while ready",
@@ -1178,6 +1253,23 @@ impl Families {
             s.land_prompts,
             s.declined,
             s.relaunched,
+            s.upgraded,
+        ])
+    }
+
+    /// What a self-claim's holder did ([`aterm_agent::harness::stats::SelfClaimed`]): the families
+    /// it can do, none it never does (declined, relaunched).
+    #[must_use]
+    pub(crate) const fn of_self_claimed(s: &aterm_agent::harness::stats::SelfClaimed) -> Self {
+        Self([
+            s.landed,
+            s.approved,
+            s.continued,
+            s.answered,
+            s.resumed,
+            s.land_prompts,
+            0,
+            0,
             s.upgraded,
         ])
     }
@@ -1363,6 +1455,44 @@ pub(crate) fn families(counts: Families) -> Vec<String> {
         .collect()
 }
 
+/// What a self-claim's holder did, each nonzero count in [`Families`]' order and words, `, `
+/// between them (`3 kept going, 1 approved`); empty where it did nothing that counts.
+#[must_use]
+fn self_claimed_words(s: &aterm_agent::harness::stats::SelfClaimed, at_most: usize) -> String {
+    families(Families::of_self_claimed(s))
+        .into_iter()
+        .take(at_most)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A ROW OF ITS OWN FOR WHAT EACH AGENT THAT SUPERVISES ITSELF DID (WHAT THE HARNESS DID): `codex-alab did  3 kept going, 1 approved today · 12 kept going, 4 approved, 1 landed in 7 days`, one per holder name the week holds ([`HarnessStats::self_claimed`]), its counts in aterm's own words ([`self_claimed_words`]), `none today` where today holds none — never in the rows of aterm's own counts, which say what aterm's harness did.
+#[must_use]
+pub(crate) fn self_claimed_rows(
+    today: &HarnessStats,
+    week: &HarnessStats,
+) -> Vec<(String, String)> {
+    week.self_claimed
+        .iter()
+        .filter_map(|(name, did)| {
+            let in_week = self_claimed_words(did, usize::MAX);
+            if in_week.is_empty() {
+                return None;
+            }
+            let in_today = today
+                .self_claimed
+                .get(name)
+                .map(|did| self_claimed_words(did, usize::MAX))
+                .filter(|words| !words.is_empty());
+            let value = in_windows(
+                |d| in_today.map_or_else(|| format!("none {d}"), |words| format!("{words} {d}")),
+                |d| format!("{in_week} {d}"),
+            );
+            Some((format!("{name} did"), value))
+        })
+        .collect()
+}
+
 fn day_line_at(
     tally: &aterm_agent::harness::stats::Tally,
     offset_at: &dyn Fn(i64) -> Option<i64>,
@@ -1373,7 +1503,7 @@ fn day_line_at(
     day_line(tally, offset)
 }
 
-/// A SESSIONS ROW'S DAY (§10.3.1) from its share of today's reading: `today:`, then `waited for you N times, <wait> at <the last escalation's clock>` where it stopped and asked the person ([`NEEDED_YOU`]), or `waited for you <wait>` where the day's wait stands on an ask raised before the day, then `N needs, carried on` where its worker's NEEDS YOU went on screen ([`NEEDS_TOLD`]), then at most three nonzero counts, its landings first ([`Families`]' order, §12.4.1), then `partial` where its own ledgers' cut may have shortened the day — `today: waited for you once, 1m at 18:29 · 2 needs, carried on · 1 landed · 31 approved` (§14.6), `today: 1 landed · 31 approved · 3 land prompts`.
+/// A SESSIONS ROW'S DAY (§10.3.1) from its share of today's reading: `today:`, then `waited for you N times, <wait> at <the last escalation's clock>` where it stopped and asked the person ([`NEEDED_YOU`]), or `waited for you <wait>` where the day's wait stands on an ask raised before the day, then `N needs, carried on` where its worker's NEEDS YOU went on screen ([`NEEDS_TOLD`]), then at most three nonzero counts, its landings first ([`Families`]' order, §12.4.1), then what each agent that supervises itself did there, in its own part (`codex-alab did 3 kept going, 1 approved`: never in aterm's counts before it), then `partial` where its own ledgers' cut may have shortened the day — `today: waited for you once, 1m at 18:29 · 2 needs, carried on · 1 landed · 31 approved` (§14.6), `today: 1 landed · 31 approved · 3 land prompts`.
 #[must_use]
 pub(crate) fn day_line(
     tally: &aterm_agent::harness::stats::Tally,
@@ -1398,6 +1528,10 @@ pub(crate) fn day_line(
         parts.push(NEEDS_TOLD.count(tally.needs_told));
     }
     parts.extend(families(Families::of_tally(tally)).into_iter().take(3));
+    parts.extend(tally.self_claimed.iter().filter_map(|(name, did)| {
+        let words = self_claimed_words(did, 3);
+        (!words.is_empty()).then(|| format!("{name} did {words}"))
+    }));
     if tally.cut {
         parts.push("partial".to_string());
     }
@@ -1573,8 +1707,8 @@ pub(crate) struct HarnessSessionRow {
     pub(crate) today: i64,
     pub(crate) setting: String,
     pub(crate) need: Option<crate::needs::HarnessAsk>,
-    pub(crate) hold: Option<crate::harness_glass::HeldGlass>,
-    pub(crate) stopped: Option<aterm_agent::harness::acts::HeldBy>,
+    pub(crate) hold: Option<crate::harness_glass::ShownHold>,
+    pub(crate) stopped: Option<crate::harness_glass::ShownStop>,
     pub(crate) waiting: Option<crate::harness_glass::WaitGlass>,
 }
 
@@ -1587,7 +1721,7 @@ impl HarnessSessionRow {
             .map_or(self.detail.as_str(), |(lead, _)| lead)
     }
 
-    /// The row's STATE LINE (§9.3.4, §10.2.3 item 2), led by the loop's outage wait where one stands (`waiting: API overload · next try 18:41 · `, §14.17.5.2), then by aterm's stop while the chip carries a mode (`stopped typing: the same reply twice, no work · types again at your turn or once the agent works · `, §14.3), then by a harness's need where one stands (`needs you: … (+1 more); carrying on · `, §12.2.1), then formatted from its glass under its view as the chip's face reads it ([`ChipFace::of`]): `lands at 18:00` (`lands Sat 16:00` on another day), under Land `landed 17:42` and `quiet: a person's own exchange`; else the loop's pause after short turns (`pausing until 18:41 (3 short turns in a row)`, §10.5.1), which a stop drops; else the trail's newest act (`last: ✓ approved 14:05`).
+    /// The row's STATE LINE (§9.3.4, §10.2.3 item 2), led by the loop's outage wait where one stands (`waiting: API overload · next try 18:41 · `, §14.17.5.2), then by the stop of whoever drives it (aterm's, or a codex-alab's under its own proven claim: [`crate::App::shown_stop`], §14.3.2) while the chip carries a mode (`stopped typing: the same reply twice, no work · types again at your turn or once the agent works · `, §14.3; a self-claim's in its holder's name, `codex-alab stopped typing: …`, [`crate::harness_glass::ShownStop::words`]), then by a harness's need where one stands (`needs you: … (+1 more); carrying on · `, §12.2.1), then formatted from its glass under its view as the chip's face reads it ([`ChipFace::of`]): `lands at 18:00` (`lands Sat 16:00` on another day), under `⤓ land` Land's hold of whoever drives it ([`crate::App::shown_hold`], §14.3.3: `not landed yet: … · landing since 14:02 · 3 nudges`; a self-claim's in its holder's name, `codex-alab: not landed yet: …`, unless its stop named it first, [`crate::harness_glass::ShownHold::words`]), under Land `landed 17:42` and `quiet: a person's own exchange`; else the loop's pause after short turns (`pausing until 18:41 (3 short turns in a row)`, §10.5.1), which a stop drops; else the trail's newest act (`last: ✓ approved 14:05`; a self-claim's named for its holder, `last: codex-alab: ✓ approved 14:05`).
     #[must_use]
     pub(crate) fn state_line(&self) -> Option<String> {
         let glass = &self.glass;
@@ -1602,10 +1736,8 @@ impl HarnessSessionRow {
         };
         let face = ChipFace::of(self.view, glass);
         let hold = self.hold.filter(|_| face == ChipFace::Land);
-        let stop = self
-            .stopped
-            .filter(|_| face.carries())
-            .map(|arm| crate::harness_glass::stop_words(arm, crate::harness_glass::HoldForm::Line));
+        let stopped = self.stopped.filter(|_| face.carries());
+        let stop = stopped.map(|stop| stop.words(crate::harness_glass::HoldForm::Line));
         // A stopped tab is not pausing: the pause it waited out before the hold has lapsed.
         let pause = glass.pause.filter(|_| stop.is_none());
         let line = match face {
@@ -1614,11 +1746,11 @@ impl HarnessSessionRow {
             ChipFace::Theirs => Some("quiet: a person's own exchange".to_owned()),
             ChipFace::Land => hold
                 .and_then(|hold| {
-                    crate::harness_glass::hold_words(
-                        &hold,
+                    hold.words(
                         self.need.as_ref(),
                         crate::harness_glass::HoldForm::Line,
                         today,
+                        stopped,
                     )
                 })
                 .map(|held| match pause {
@@ -1636,8 +1768,12 @@ impl HarnessSessionRow {
             | ChipFace::Unhosted => None,
         };
         let need = self.need.as_ref().filter(|_| {
-            !hold.is_some_and(|hold| {
-                hold.read() && hold.held.holds(aterm_agent::harness::acts::HoldLeg::Needs)
+            !hold.is_some_and(|shown| {
+                shown.hold.read()
+                    && shown
+                        .hold
+                        .held
+                        .holds(aterm_agent::harness::acts::HoldLeg::Needs)
             })
         });
         let rest = line
@@ -1645,9 +1781,8 @@ impl HarnessSessionRow {
             .or_else(|| {
                 glass.last.map(|(act, stamp)| {
                     format!(
-                        "last: {} {} {}",
-                        act.glyph(),
-                        act.word(),
+                        "last: {} {}",
+                        crate::harness_glass::act_words(act, glass.last_by),
                         stamp.words(today)
                     )
                 })
@@ -2272,13 +2407,14 @@ impl App {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
                 let ag = tl.agent();
+                let (word, since_ms) = tl.shown_agent_word();
                 (
                     ag.program.clone(),
                     crate::harness_host::agent_of(ag),
-                    ag.word,
+                    word,
                     ag.detail.clone(),
                     ag.subject.clone(),
-                    ag.since_ms(),
+                    since_ms,
                     tl.task_face().map(|(f, _)| f.status()),
                 )
             };
@@ -2389,6 +2525,7 @@ impl App {
                 });
             local_tabs.push(TabSpreadsheetRow {
                 key: format!("local/{}", handle.local_id),
+                computer_id: "local".into(),
                 computer: local_comp_name.clone(),
                 instance: own_instance.clone(),
                 place,
@@ -2397,23 +2534,26 @@ impl App {
                 state: handle.state.as_str().to_string(),
                 program: program_label,
                 is_ai_cli,
+                active_ai: active_ai_observation(is_ai_cli, Some(word)),
                 ai_status,
                 autopilot,
                 human,
                 vitals,
                 show_local_id: Some(handle.local_id),
+                cached_observation: None,
             });
         }
         local_tabs.sort_by_key(|row| row.show_local_id.unwrap_or(u64::MAX));
 
-        let (sibling_tabs, mut remote_computers, remote_tabs) =
+        let (sibling_tabs, mut remote_computers, remote_tabs, lan_waits) =
             self.harness_screen.stats.report.as_deref().map_or_else(
-                || (Vec::new(), Vec::new(), Vec::new()),
+                || (Vec::new(), Vec::new(), Vec::new(), None),
                 |r| {
                     (
                         r.sibling_tabs.clone(),
                         r.remote_computers.clone(),
                         r.remote_tabs.clone(),
+                        r.lan_waits,
                     )
                 },
             );
@@ -2424,19 +2564,8 @@ impl App {
         let sibling_instances: std::collections::BTreeSet<&str> =
             sibling_tabs.iter().map(|t| t.instance.as_str()).collect();
         let local_instances = 1 + sibling_instances.len();
-        let local_ai_clis = local_tabs
-            .iter()
-            .chain(sibling_tabs.iter())
-            .filter(|t| t.is_ai_cli)
-            .count();
-        let local_active_ai = local_tabs
-            .iter()
-            .chain(sibling_tabs.iter())
-            .filter(|t| {
-                t.is_ai_cli
-                    && (t.ai_status.starts_with("working") || t.ai_status.starts_with("waiting"))
-            })
-            .count();
+        let local_ai_clis = ai_cli_count(local_tabs.iter().chain(sibling_tabs.iter()));
+        let local_active_ai = active_ai_count(local_tabs.iter().chain(sibling_tabs.iter()));
         let live_local_vitals = self
             .vitals
             .snapshot
@@ -2456,7 +2585,7 @@ impl App {
                 None => (
                     format!("{local_comp_name} (this Mac)"),
                     "local".to_string(),
-                    std::env::consts::OS.to_string(),
+                    Some(std::env::consts::OS.to_string()),
                     "online".to_string(),
                     live_local_vitals.unwrap_or_default(),
                 ),
@@ -2468,10 +2597,11 @@ impl App {
             os_version: self_os_version,
             status: self_status,
             vitals: self_vitals,
-            instances: local_instances,
-            tabs: local_tabs.len() + sibling_tabs.len(),
+            instances: Some(local_instances),
+            tabs: Some(local_tabs.len() + sibling_tabs.len()),
             ai_clis: local_ai_clis,
             active_ai: local_active_ai,
+            session_scope: TabSessionScope::Observed,
         }];
         computers.extend(remote_computers);
 
@@ -2482,6 +2612,7 @@ impl App {
             computers,
             tabs,
             fleet: FleetScope::of_this_process(),
+            lan_waits,
         }
     }
 
@@ -2526,8 +2657,8 @@ impl App {
                 .need()
                 .harness_ask()
                 .cloned();
-            let hold = self.shown_hold(handle.local_id).filter(|_| supervised);
-            let stopped = self.shown_stop(handle.local_id).filter(|_| supervised);
+            let hold = self.shown_hold(handle.local_id);
+            let stopped = self.shown_stop(handle.local_id);
             let waiting = self.shown_wait(handle.local_id).filter(|_| supervised);
             sessions.push(HarnessSession {
                 local_id: handle.local_id,
@@ -2872,6 +3003,7 @@ impl App {
                     report.sibling_tabs.clone_from(&last.sibling_tabs);
                     report.remote_computers.clone_from(&last.remote_computers);
                     report.remote_tabs.clone_from(&last.remote_tabs);
+                    report.lan_waits = last.lan_waits;
                 }
                 screen.stats.report = Some(std::sync::Arc::from(report));
                 screen.stats.unavailable = None;
@@ -2916,6 +3048,46 @@ impl App {
     }
 }
 
+/// The render-time rule ([`crate::session_timeline::SessionTimeline::shown_agent_word`]) for a
+/// row another aterm sent: where its reader says `unknown` and its `program_state=` carries the
+/// program's own report, the program's word, with no age (the row carries the reader's age, not
+/// the report's).
+fn roster_word<'a>(
+    agent: Option<&'a str>,
+    since_ms: Option<u64>,
+    program_state: Option<&str>,
+) -> (Option<&'a str>, Option<u64>) {
+    match program_state
+        .filter(|_| agent == Some("unknown"))
+        .and_then(crate::program_state::survey_word_of_wire)
+    {
+        Some(word) => (Some(word), None),
+        None => (agent, since_ms),
+    }
+}
+
+/// A turn working or waiting on a box is active; an unread phase stays unknown.
+fn active_ai_observation(is_ai_cli: bool, word: Option<&str>) -> Option<bool> {
+    if !is_ai_cli {
+        return Some(false);
+    }
+    word.map(str::trim)
+        .filter(|word| !matches!(*word, "unknown" | "-" | ""))
+        .map(|word| {
+            matches!(
+                word,
+                "busy"
+                    | "working"
+                    | "prompt"
+                    | "permission"
+                    | "box:permission"
+                    | "waiting"
+                    | "question"
+                    | "box:question"
+            )
+        })
+}
+
 /// Format live AI CLI status for a tab row (`"working: thinking (14s)"`, `"waiting on permission: Bash (5s)"`, `"idle at prompt · landed"`).
 #[must_use]
 pub(crate) fn format_ai_cli_live_status(
@@ -2939,7 +3111,7 @@ pub(crate) fn format_ai_cli_live_status(
             (None, Some(t)) => format!("working \u{b7} task {t}"),
             (None, None) => "working".to_string(),
         },
-        Some("prompt" | "idle") => {
+        Some("idle") => {
             let prompt = match detail {
                 Some(d) => format!("at prompt: {d}"),
                 None => "idle at prompt".to_string(),
@@ -2949,7 +3121,10 @@ pub(crate) fn format_ai_cli_live_status(
                 None => prompt,
             }
         }
-        Some(w) if w == "permission" || w == "box:permission" || w == "waiting" => {
+        // `prompt` is the survey's word for a standing box (`program_state::survey_word`).
+        Some(w)
+            if w == "prompt" || w == "permission" || w == "box:permission" || w == "waiting" =>
+        {
             match subject.or(detail) {
                 Some(what) => format!("waiting on permission: {what}"),
                 None => "waiting on permission".to_string(),
@@ -3240,19 +3415,28 @@ fn collect_fleet_and_sibling_tabs(
     Vec<TabSpreadsheetRow>,
     Vec<TabComputer>,
     Vec<TabSpreadsheetRow>,
+    Option<&'static str>,
 ) {
     if !ask.fleet {
-        return (Vec::new(), Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new(), None);
     }
     #[cfg(test)]
     FLEET_SWEEPS.with(|sweeps| sweeps.set(sweeps.get() + 1));
     if FleetScope::of_this_process() != FleetScope::Account {
-        return (Vec::new(), Vec::new(), Vec::new());
+        #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
+        if let Some((computers, tabs)) = monitor_fixture::read() {
+            return (Vec::new(), computers, tabs, None);
+        }
+        return (Vec::new(), Vec::new(), Vec::new(), None);
     }
     let sibling_tabs = collect_sibling_aterm_tabs();
-    let (remote_computers, remote_tabs) = collect_remote_machines_tabs(ask.local_vitals);
-    (sibling_tabs, remote_computers, remote_tabs)
+    let (remote_computers, remote_tabs, lan_waits) = collect_remote_machines_tabs(ask.local_vitals);
+    (sibling_tabs, remote_computers, remote_tabs, lan_waits)
 }
+
+#[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
+#[path = "harness_monitor_fixture.rs"]
+mod monitor_fixture;
 
 #[cfg(test)]
 thread_local! {
@@ -3474,6 +3658,7 @@ fn parse_sibling_roster_line(
     let mut agent: Option<String> = None;
     let mut agent_detail: Option<String> = None;
     let mut agent_since_ms: Option<u64> = None;
+    let mut program_state: Option<String> = None;
     let mut human_ms: Option<u64> = None;
     let mut autopilot: Option<String> = None;
     let mut role: Option<String> = None;
@@ -3492,6 +3677,7 @@ fn parse_sibling_roster_line(
             "agent" if v != "-" => agent = Some(pct_decode(v)),
             "agent_detail" if v != "-" => agent_detail = Some(pct_decode(v)),
             "agent_since_ms" if v != "-" => agent_since_ms = v.parse().ok(),
+            "program_state" if v != "-" => program_state = Some(v.to_string()),
             "human_ms" if v != "-" => human_ms = v.parse().ok(),
             "autopilot" if v != "-" => autopilot = Some(pct_decode(v)),
             "role" if v != "-" => role = Some(pct_decode(v)),
@@ -3516,12 +3702,13 @@ fn parse_sibling_roster_line(
     } else {
         (raw_prog, false)
     };
+    let (word, since_ms) = roster_word(agent.as_deref(), agent_since_ms, program_state.as_deref());
     let ai_status = if is_ai_cli {
         format_ai_cli_live_status(
-            agent.as_deref(),
+            word,
             agent_detail.as_deref(),
             None,
-            agent_since_ms,
+            since_ms,
             task.as_deref(),
         )
     } else {
@@ -3548,6 +3735,7 @@ fn parse_sibling_roster_line(
         local_id,
         TabSpreadsheetRow {
             key: format!("sibling/{pid}/{local_id}"),
+            computer_id: "local".into(),
             computer: comp_name.to_string(),
             instance: format!("aterm-{pid}"),
             place,
@@ -3556,18 +3744,193 @@ fn parse_sibling_roster_line(
             state,
             program: prog_label,
             is_ai_cli,
+            active_ai: active_ai_observation(is_ai_cli, word),
             ai_status,
             autopilot: auto_full,
             human: human_activity_words(human_ms),
             vitals: String::new(),
             show_local_id: None,
+            cached_observation: None,
         },
     ))
 }
 
-fn collect_remote_machines_tabs(local_vitals: bool) -> (Vec<TabComputer>, Vec<TabSpreadsheetRow>) {
+/// Whether `name` matches any swarm member label, alias, or host in `known_swarm_names` (either
+/// verbatim case-insensitively or by its [`aterm_agent::fleet_census::canonical_host_stem`]).
+#[cfg(any(target_os = "macos", all(test, unix)))]
+pub(crate) fn is_known_swarm_host(
+    known_swarm_names: &std::collections::BTreeMap<String, String>,
+    name: &str,
+) -> bool {
+    known_swarm_computer(known_swarm_names, name).is_some()
+}
+
+fn known_swarm_computer<'a>(
+    known_swarm_names: &'a std::collections::BTreeMap<String, String>,
+    name: &str,
+) -> Option<&'a String> {
+    let low = name.trim_ascii().to_ascii_lowercase();
+    if let Some(id) = known_swarm_names.get(&low) {
+        return Some(id);
+    }
+    #[cfg(unix)]
+    {
+        let stem = aterm_agent::fleet_census::canonical_host_stem(name);
+        if let Some(id) = known_swarm_names.get(&stem) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// Convert a cached [`aterm_agent::fleet_census::SwarmCensus`] snapshot into `/monitor`'s
+/// [`TabComputer`] rows (excluding `local_label`), plus labels and aliases bound to their row ids so
+/// Bonjour is used strictly for `"on the LAN, not in the swarm"` stragglers (`DESIGN-alab-swarm` §7.2).
+#[cfg(unix)]
+pub(crate) fn swarm_census_to_tab_computers(
+    census: &aterm_agent::fleet_census::SwarmCensus,
+    local_label: Option<&str>,
+    now_s: u64,
+) -> (Vec<TabComputer>, std::collections::BTreeMap<String, String>) {
+    let mut computers = Vec::new();
+    let mut known_swarm_names = std::collections::BTreeMap::new();
+    let local_norm = local_label.map(|l| l.trim_ascii().to_ascii_lowercase());
+    let local_stem = local_label.map(aterm_agent::fleet_census::canonical_host_stem);
+    let matches_local = |candidate: &str| {
+        let cand_low = candidate.trim_ascii().to_ascii_lowercase();
+        let cand_stem = aterm_agent::fleet_census::canonical_host_stem(candidate);
+        local_norm
+            .as_deref()
+            .is_some_and(|loc| loc == cand_low || loc == cand_stem)
+            || local_stem
+                .as_deref()
+                .is_some_and(|stem| stem == cand_low || stem == cand_stem)
+    };
+
+    for member in &census.members {
+        let id = format!("swarm/{}", member.label);
+        known_swarm_names.insert(member.label.trim_ascii().to_ascii_lowercase(), id.clone());
+        known_swarm_names.insert(
+            aterm_agent::fleet_census::canonical_host_stem(&member.label),
+            id.clone(),
+        );
+        for alias in &member.aliases {
+            known_swarm_names.insert(alias.trim_ascii().to_ascii_lowercase(), id.clone());
+            known_swarm_names.insert(
+                aterm_agent::fleet_census::canonical_host_stem(alias),
+                id.clone(),
+            );
+        }
+        if let Some(host) = member.host.as_deref() {
+            known_swarm_names.insert(host.trim_ascii().to_ascii_lowercase(), id.clone());
+            known_swarm_names.insert(
+                aterm_agent::fleet_census::canonical_host_stem(host),
+                id.clone(),
+            );
+        }
+        if matches_local(&member.label)
+            || member.aliases.iter().any(|a| matches_local(a))
+            || member.host.as_deref().is_some_and(matches_local)
+        {
+            continue;
+        }
+        let address = member
+            .host
+            .clone()
+            .unwrap_or_else(|| format!("{}.local", member.label));
+        let report = member.version.as_deref().map_or_else(
+            || "aterm/window unreported".to_owned(),
+            |ver| {
+                let win = if member.window { "open" } else { "closed" };
+                format!("aterm {ver} \u{b7} one instance last reported window {win}")
+            },
+        );
+        let elig = if member.eligible { "yes" } else { "no" };
+        let vitals = format!(
+            "accounts warm {} \u{b7} leased {} \u{b7} walled {} \u{b7} eligible {elig} \u{b7} {report}",
+            member.accounts.warm, member.accounts.leased, member.accounts.walled,
+        );
+        computers.push(TabComputer {
+            id,
+            name: member.label.clone(),
+            address,
+            os_version: None,
+            status: member.monitor_status(now_s),
+            vitals,
+            instances: None,
+            tabs: member.version.as_ref().map(|_| member.sessions),
+            session_scope: TabSessionScope::OneInstanceHeartbeat,
+            ai_clis: None,
+            active_ai: None,
+        });
+    }
+
+    for straggler in &census.stragglers {
+        if matches_local(&straggler.name) || matches_local(&straggler.host) {
+            continue;
+        }
+        computers.push(TabComputer {
+            id: format!("lan/{}", straggler.name),
+            name: straggler.name.clone(),
+            address: straggler.host.clone(),
+            os_version: Some(format!("LAN host ({})", straggler.reason.as_str())),
+            status: aterm_agent::fleet_census::STRAGGLER_MONITOR_STATUS.to_owned(),
+            vitals: String::new(),
+            instances: None,
+            tabs: None,
+            ai_clis: None,
+            active_ai: None,
+            session_scope: TabSessionScope::Observed,
+        });
+    }
+
+    (computers, known_swarm_names)
+}
+
+#[cfg(unix)]
+fn try_load_monitor_swarm_census()
+-> Option<(Vec<TabComputer>, std::collections::BTreeMap<String, String>)> {
+    let state = aterm_types::dirs::state_dir()?;
+    if !state.join(aterm_net::fleet::KEY_FILE).is_file() {
+        return None;
+    }
+    let home = aterm_types::dirs::home_dir();
+    let now_s = aterm_time::unix_secs().unwrap_or(0);
+    let census =
+        aterm_agent::fleet_census::read_or_compute_census(&state, home.as_deref(), false, now_s)
+            .ok()?;
+    #[cfg(target_os = "macos")]
+    let local_raw = raw_local_host_name_gui();
+    #[cfg(not(target_os = "macos"))]
+    let local_raw = String::new();
+    // Membership uses the host's identity, never a custom display override. The census
+    // mapper already matches the raw hostname's canonical hardware stem.
+    Some(swarm_census_to_tab_computers(
+        &census,
+        (!local_raw.is_empty()).then_some(local_raw.as_str()),
+        now_s,
+    ))
+}
+
+#[cfg(not(unix))]
+fn try_load_monitor_swarm_census()
+-> Option<(Vec<TabComputer>, std::collections::BTreeMap<String, String>)> {
+    None
+}
+
+fn collect_remote_machines_tabs(
+    local_vitals: bool,
+) -> (
+    Vec<TabComputer>,
+    Vec<TabSpreadsheetRow>,
+    Option<&'static str>,
+) {
     let custom_names = load_custom_host_names();
-    let mut configured: Vec<(String, String, String)> = Vec::new();
+    let census_loaded = try_load_monitor_swarm_census();
+    let in_swarm_census = census_loaded.is_some();
+    let (mut computers, known_swarm_names) =
+        census_loaded.unwrap_or_else(|| (Vec::new(), std::collections::BTreeMap::new()));
+    let mut configured: Vec<(String, String, String, String)> = Vec::new();
     let mut state_dir_opt = None;
     if let Some(config_dir) = aterm_types::dirs::aterm_config_dir() {
         let machines_dir = config_dir.join("machines");
@@ -3595,163 +3958,300 @@ fn collect_remote_machines_tabs(local_vitals: bool) -> (Vec<TabComputer>, Vec<Ta
                     .unwrap_or("")
                     .to_string();
                 if !uuid.is_empty() && !name.is_empty() {
-                    configured.push((uuid, name, address));
+                    configured.push((uuid, raw_name, name, address));
                 }
             }
         }
     }
-    let mut computers = Vec::new();
     let mut tabs = Vec::new();
-    for (uuid, name, address) in configured {
+    for (uuid, identity_name, name, address) in configured {
         let state_json = state_dir_opt
             .as_ref()
             .and_then(|sd| std::fs::read_to_string(sd.join(format!("{uuid}.json"))).ok())
             .and_then(|s| aterm_json::from_str::<aterm_json::Value>(&s).ok());
-        let last_seen = state_json
-            .as_ref()
-            .and_then(|v| v.get("last_seen"))
-            .and_then(|v| v.as_u64());
-        let last_error = state_json
-            .as_ref()
-            .and_then(|v| v.get("last_error"))
-            .and_then(|v| v.as_str());
-        let hello_json = state_json
-            .as_ref()
-            .and_then(|v| v.get("hello"))
-            .and_then(|v| v.as_str())
-            .and_then(|s| aterm_json::from_str::<aterm_json::Value>(s).ok());
-        let os_version = hello_json
-            .as_ref()
-            .and_then(|h| h.get("os_version"))
-            .and_then(|v| v.as_str())
-            .map(|s| format!("macOS {s}"))
-            .unwrap_or_else(|| "macOS".to_string());
-        let status = match (last_seen, last_error) {
-            (Some(_), None) => "online (ssh)".to_string(),
-            (Some(_), Some(_)) => "standby".to_string(),
-            (None, Some(_)) => "offline".to_string(),
-            (None, None) => "configured".to_string(),
-        };
-        let mut instance_pids = std::collections::BTreeSet::new();
-        let mut host_tabs = 0usize;
-        let mut host_ai = 0usize;
-        let mut host_active_ai = 0usize;
-        if let Some(sessions) = hello_json
-            .as_ref()
-            .and_then(|h| h.get("sessions"))
-            .and_then(|v| v.as_array())
-        {
-            for s in sessions {
-                let inst_pid = s.get("instance_pid").and_then(|v| v.as_u64()).unwrap_or(0);
-                if inst_pid > 0 {
-                    instance_pids.insert(inst_pid);
-                }
-                let local_id = s.get("local_id").and_then(|v| v.as_u64()).unwrap_or(0);
-                let sid = s
-                    .get("sid")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("-")
-                    .to_string();
-                let state = s
-                    .get("state")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Running")
-                    .to_string();
-                let title = s
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("-")
-                    .to_string();
-                let window = s.get("window").and_then(|v| v.as_str()).unwrap_or("-");
-                let active = s.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
-                let raw_prog = s.get("program").and_then(|v| v.as_str()).unwrap_or("shell");
-                let agent = s.get("agent").and_then(|v| v.as_str());
-                let agent_detail = s.get("agent_detail").and_then(|v| v.as_str());
-                let agent_since_ms = s.get("agent_since_ms").and_then(|v| v.as_u64());
-                let human_ms = s.get("human_ms").and_then(|v| v.as_u64());
-                let autopilot = s
-                    .get("autopilot")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("-")
-                    .to_string();
-                let task = s.get("task").and_then(|v| v.as_str());
-                let cols = s.get("cols").and_then(|v| v.as_u64());
-                let rows_n = s.get("rows").and_then(|v| v.as_u64());
-                let cwd = s.get("cwd").and_then(|v| v.as_str());
-                let (prog_label, is_ai_cli) = if let Some(prod) = ai_product_for_name(raw_prog) {
-                    (format!("{prod} ({raw_prog})"), true)
-                } else if agent.is_some() {
-                    (raw_prog.to_string(), true)
-                } else {
-                    (raw_prog.to_string(), false)
-                };
-                let ai_status = if is_ai_cli {
-                    format_ai_cli_live_status(agent, agent_detail, None, agent_since_ms, task)
-                } else {
-                    "-".to_string()
-                };
-                if is_ai_cli {
-                    host_ai += 1;
-                    if ai_status.starts_with("working") || ai_status.starts_with("waiting") {
-                        host_active_ai += 1;
-                    }
-                }
-                host_tabs += 1;
-                let mut place = if window != "-" {
-                    format!(
-                        "Tab #{local_id}{} (Win {window})",
-                        if active { "*" } else { "" }
-                    )
-                } else {
-                    format!("Tab #{local_id}{}", if active { "*" } else { "" })
-                };
-                if let (Some(c), Some(r)) = (cols, rows_n) {
-                    place.push_str(&format!(" \u{b7} {c}\u{d7}{r}"));
-                }
-                if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
-                    place.push_str(&format!(" \u{b7} {dir}"));
-                }
-                tabs.push(TabSpreadsheetRow {
-                    key: format!("remote/{name}/{inst_pid}/{local_id}"),
-                    computer: name.clone(),
-                    instance: format!("aterm-{inst_pid}"),
-                    place,
-                    sid,
-                    title,
-                    state,
-                    program: prog_label,
-                    is_ai_cli,
-                    ai_status,
-                    autopilot,
-                    human: human_activity_words(human_ms),
-                    vitals: String::new(),
-                    show_local_id: None,
-                });
-            }
-        }
-        let vitals = hello_json
-            .as_ref()
-            .and_then(|h| h.get("vitals"))
-            .map(|v| format_hello_vitals_json(&uuid, v))
-            .unwrap_or_default();
-        computers.push(TabComputer {
-            id: uuid,
-            name,
-            address,
-            os_version,
-            status,
-            vitals,
-            instances: instance_pids.len(),
-            tabs: host_tabs,
-            ai_clis: host_ai,
-            active_ai: host_active_ai,
-        });
+        let (cached, host_tabs) =
+            cached_configured_computer(uuid, name, address, state_json.as_ref());
+        merge_cached_computer(
+            &mut computers,
+            &known_swarm_names,
+            &identity_name,
+            cached,
+            host_tabs,
+            &mut tabs,
+        );
     }
     #[cfg(target_os = "macos")]
-    discover_bonjour_lan_computers(&mut computers, &custom_names, local_vitals);
+    let lan_waits =
+        sweep_lan_after_the_step(aterm_types::macos_setup::lan_first_use::may_use(), || {
+            discover_bonjour_lan_computers(
+                &mut computers,
+                &custom_names,
+                &known_swarm_names,
+                in_swarm_census,
+                local_vitals,
+            );
+        });
     #[cfg(not(target_os = "macos"))]
-    let _ = local_vitals;
-    (computers, tabs)
+    let lan_waits = {
+        let _ = (local_vitals, in_swarm_census);
+        None
+    };
+    (computers, tabs, lan_waits)
+}
+
+/// What Tab Control says while it looks for no computer on the local network because System
+/// State's Local Network step is still to come ([`sweep_lan_after_the_step`]).
+#[cfg(target_os = "macos")]
+pub(crate) const LAN_WAITS: &str = "computers on this network are looked for once System State \
+    has asked macOS's Local Network question, which comes first";
+
+/// Run the Bonjour `sweep` of the local network (its `dns-sd` browses, `.local` lookups and SSH
+/// probes put macOS's Local Network question on screen where macOS never asked aterm) only where
+/// this process `may_use` the LAN ([`aterm_types::macos_setup::lan_first_use::may_use`]): not
+/// while System State's Local Network step is still to come, which asks that question first. The
+/// words the page says instead ([`LAN_WAITS`]), where it did not run.
+#[cfg(target_os = "macos")]
+fn sweep_lan_after_the_step(may_use: bool, sweep: impl FnOnce()) -> Option<&'static str> {
+    if !may_use {
+        return Some(LAN_WAITS);
+    }
+    sweep();
+    None
+}
+
+fn cached_configured_computer(
+    uuid: String,
+    name: String,
+    address: String,
+    state_json: Option<&aterm_json::Value>,
+) -> (TabComputer, Vec<TabSpreadsheetRow>) {
+    let mut tabs = Vec::new();
+    let last_seen = state_json
+        .as_ref()
+        .and_then(|v| v.get("last_seen"))
+        .and_then(|v| v.as_u64());
+    let last_error = state_json
+        .as_ref()
+        .and_then(|v| v.get("last_error"))
+        .and_then(|v| v.as_str());
+    let hello_json = state_json
+        .as_ref()
+        .and_then(|v| v.get("hello"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| aterm_json::from_str::<aterm_json::Value>(s).ok());
+    let os_version = hello_json
+        .as_ref()
+        .and_then(|h| h.get("os_version"))
+        .and_then(|v| v.as_str())
+        .filter(|version| !version.trim().is_empty())
+        .map(|s| format!("macOS {s}"));
+    let status = match (last_seen, last_error) {
+        (Some(_), None) => "online (ssh)".to_string(),
+        (Some(_), Some(_)) => "standby".to_string(),
+        (None, Some(_)) => "offline".to_string(),
+        (None, None) => "configured".to_string(),
+    };
+    let sessions = hello_json
+        .as_ref()
+        .and_then(|h| h.get("sessions"))
+        .and_then(|v| v.as_array());
+    if let Some(sessions) = sessions {
+        for s in sessions {
+            let inst_pid = s.get("instance_pid").and_then(|v| v.as_u64()).unwrap_or(0);
+            let local_id = s.get("local_id").and_then(|v| v.as_u64()).unwrap_or(0);
+            let sid = s
+                .get("sid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+                .to_string();
+            let state = s
+                .get("state")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Running")
+                .to_string();
+            let title = s
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+                .to_string();
+            let window = s.get("window").and_then(|v| v.as_str()).unwrap_or("-");
+            let active = s.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+            let raw_prog = s.get("program").and_then(|v| v.as_str()).unwrap_or("shell");
+            let agent = s.get("agent").and_then(|v| v.as_str());
+            let ai_known = s
+                .get("program")
+                .and_then(|v| v.as_str())
+                .is_some_and(|p| !p.is_empty())
+                || agent.is_some();
+            let agent_detail = s.get("agent_detail").and_then(|v| v.as_str());
+            let agent_since_ms = s.get("agent_since_ms").and_then(|v| v.as_u64());
+            let human_ms = s.get("human_ms").and_then(|v| v.as_u64());
+            let autopilot = s
+                .get("autopilot")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+                .to_string();
+            let task = s.get("task").and_then(|v| v.as_str());
+            let cols = s.get("cols").and_then(|v| v.as_u64());
+            let rows_n = s.get("rows").and_then(|v| v.as_u64());
+            let cwd = s.get("cwd").and_then(|v| v.as_str());
+            let (prog_label, is_ai_cli) = if let Some(prod) = ai_product_for_name(raw_prog) {
+                (format!("{prod} ({raw_prog})"), true)
+            } else if agent.is_some() {
+                (raw_prog.to_string(), true)
+            } else {
+                (raw_prog.to_string(), false)
+            };
+            let (ai_status, active_ai) = if is_ai_cli {
+                let (word, since_ms) = roster_word(
+                    agent,
+                    agent_since_ms,
+                    s.get("program_state").and_then(|v| v.as_str()),
+                );
+                let active = active_ai_observation(is_ai_cli, word);
+                (
+                    format_ai_cli_live_status(word, agent_detail, None, since_ms, task),
+                    active,
+                )
+            } else {
+                ("-".to_string(), Some(false))
+            };
+            let mut place = if window != "-" {
+                format!(
+                    "Tab #{local_id}{} (Win {window})",
+                    if active { "*" } else { "" }
+                )
+            } else {
+                format!("Tab #{local_id}{}", if active { "*" } else { "" })
+            };
+            if let (Some(c), Some(r)) = (cols, rows_n) {
+                place.push_str(&format!(" \u{b7} {c}\u{d7}{r}"));
+            }
+            if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
+                place.push_str(&format!(" \u{b7} {dir}"));
+            }
+            tabs.push(TabSpreadsheetRow {
+                key: if sid.is_empty() || sid == "-" {
+                    format!("remote/{uuid}/{inst_pid}/local/{local_id}")
+                } else {
+                    format!("remote/{uuid}/{inst_pid}/sid/{sid}")
+                },
+                computer_id: uuid.clone(),
+                computer: name.clone(),
+                instance: format!("aterm-{inst_pid}"),
+                place,
+                sid,
+                title,
+                state,
+                program: prog_label,
+                is_ai_cli,
+                active_ai,
+                ai_status,
+                autopilot,
+                human: human_activity_words(human_ms),
+                vitals: String::new(),
+                show_local_id: None,
+                cached_observation: Some(CachedSessionObservation {
+                    instance_pid: (inst_pid > 0).then_some(inst_pid),
+                    ai_cli: ai_known.then_some(is_ai_cli),
+                }),
+            });
+        }
+    }
+    let vitals = hello_json
+        .as_ref()
+        .and_then(|h| h.get("vitals"))
+        .map(|v| format_hello_vitals_json(&uuid, v))
+        .unwrap_or_default();
+    let mut computer = TabComputer {
+        id: uuid,
+        name,
+        address,
+        os_version,
+        status,
+        vitals,
+        instances: None,
+        tabs: None,
+        ai_clis: None,
+        active_ai: None,
+        session_scope: TabSessionScope::Observed,
+    };
+    if sessions.is_some() {
+        count_cached_observations(&mut computer, tabs.iter());
+    }
+    (computer, tabs)
+}
+
+/// Count the same retained observations the spreadsheet shows. Empty observed sessions are
+/// zero; one missing PID, classification, or activity leaves only that field unobserved.
+fn count_cached_observations<'a>(
+    computer: &mut TabComputer,
+    rows: impl Iterator<Item = &'a TabSpreadsheetRow>,
+) {
+    let rows: Vec<_> = rows.collect();
+    computer.instances = rows
+        .iter()
+        .map(|row| row.cached_observation?.instance_pid)
+        .collect::<Option<std::collections::BTreeSet<_>>>()
+        .map(|instances| instances.len());
+    computer.tabs = Some(rows.len());
+    computer.ai_clis = ai_cli_count(rows.iter().copied());
+    computer.active_ai = active_ai_count(rows.into_iter());
+    computer.session_scope = TabSessionScope::CachedObservations;
+}
+
+/// Fold existing cached facts into the census identity without replacing its liveness or
+/// account report. A known local member excluded from the remote list stays excluded.
+/// Only the dial address or raw inventory name may resolve that identity; display names
+/// can repeat or be custom labels. Retained rows and their counts use the stable identity.
+fn merge_cached_computer(
+    computers: &mut Vec<TabComputer>,
+    known_swarm_names: &std::collections::BTreeMap<String, String>,
+    identity_name: &str,
+    cached: TabComputer,
+    mut cached_tabs: Vec<TabSpreadsheetRow>,
+    tabs: &mut Vec<TabSpreadsheetRow>,
+) {
+    let sessions_observed = cached.tabs.is_some();
+    let member_index = if let Some(id) = known_swarm_computer(known_swarm_names, &cached.address)
+        .or_else(|| known_swarm_computer(known_swarm_names, identity_name))
+    {
+        let Some(index) = computers.iter().position(|row| row.id == *id) else {
+            return;
+        };
+        let member = &mut computers[index];
+        let prefix = format!("remote/{}/", cached.id);
+        for row in &mut cached_tabs {
+            if let Some(identity) = row.key.strip_prefix(&prefix) {
+                row.key = format!("remote/{}/{identity}", member.id);
+            }
+            row.computer_id.clone_from(&member.id);
+            row.computer.clone_from(&member.name);
+        }
+        if cached.os_version.is_some() {
+            member.os_version = cached.os_version;
+        }
+        if !cached.vitals.is_empty() && !member.vitals.starts_with(&cached.vitals) {
+            member.vitals = format!("{} \u{b7} {}", cached.vitals, member.vitals);
+        }
+        if !cached.address.is_empty() {
+            member.address = cached.address;
+        }
+        index
+    } else {
+        computers.push(cached);
+        computers.len() - 1
+    };
+    for row in cached_tabs {
+        if !tabs.iter().any(|known| known.key == row.key) {
+            tabs.push(row);
+        }
+    }
+    if sessions_observed {
+        let member = &mut computers[member_index];
+        let id = member.id.clone();
+        count_cached_observations(member, tabs.iter().filter(|row| row.computer_id == id));
+    }
 }
 
 fn bar_8_gui(pct: u8) -> String {
@@ -3770,7 +4270,9 @@ fn human_bytes_gui(bytes: u64) -> String {
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     const TIB: f64 = 1024.0 * 1024.0 * 1024.0 * 1024.0;
     let b = bytes as f64;
-    if b >= TIB {
+    if bytes == 0 {
+        "0 MiB".to_string()
+    } else if b >= TIB {
         format!("{:.2} TiB", b / TIB)
     } else if b >= 100.0 * GIB {
         format!("{:.0} GiB", b / GIB)
@@ -3835,44 +4337,41 @@ fn sparkline(host_key: &str, sample_pct: Option<u8>) -> String {
 fn format_local_snapshot_vitals(snap: &aterm_vitals::model::Snapshot) -> String {
     let mut parts = Vec::new();
     if let Some(cpu) = &snap.cpu {
-        let total = cpu.total().max(1);
-        let pct = ((cpu.busy.level / total as f32) * 100.0)
-            .round()
-            .clamp(0.0, 100.0) as u8;
-        let spark = push_sparkline_sample("local/cpu", pct);
+        let total = cpu.total();
+        let pct = cpu
+            .current_busy()
+            .map(|busy| ((busy / total as f32) * 100.0).round().clamp(0.0, 100.0) as u8);
         let clusters: Vec<String> = cpu
             .clusters
             .iter()
             .map(|c| {
-                let c_pct = if c.cores.is_empty() {
-                    0.0
-                } else {
-                    let sum: f32 = c
-                        .cores
-                        .iter()
-                        .filter_map(|&i| cpu.cores.get(i))
-                        .map(|cv| cv.load.level)
-                        .sum();
-                    (sum / c.cores.len() as f32) * 100.0
-                };
-                format!("{}:{:.0}%", c.name, c_pct)
+                cpu.current_cluster_busy(c).map_or_else(
+                    || format!("{}:unavailable", c.name),
+                    |busy| format!("{}:{:.0}%", c.name, busy / c.cores.len() as f32 * 100.0),
+                )
             })
             .collect();
-        let cl_str = if clusters.is_empty() {
+        let cl_str = if total == 0 {
+            "cores unknown".to_string()
+        } else if clusters.is_empty() {
             format!("{}c", cpu.total())
         } else {
             format!("{}c \u{b7} {}", cpu.total(), clusters.join(" "))
         };
-        parts.push(format!("CPU {pct}% {} {spark} ({cl_str})", bar_8_gui(pct)));
+        parts.push(format_cpu_vitals_gui("local/cpu", pct, &cl_str));
     }
-    if let Some(gpu) = &snap.gpu {
-        let pct = (gpu.load.level * 100.0).round().clamp(0.0, 100.0) as u8;
-        let name = match (gpu.name.as_deref(), gpu.cores) {
-            (Some(n), Some(c)) if !n.is_empty() && c > 0 => format!("{n} {c}c"),
-            (Some(n), _) if !n.is_empty() => n.to_string(),
-            _ => "GPU".to_string(),
-        };
-        parts.push(format!("GPU {pct}% {} ({name})", bar_8_gui(pct)));
+    if let Some(gpu) = snap
+        .facts
+        .gpu
+        .as_ref()
+        .or_else(|| snap.gpu.as_ref().map(|view| &view.sample))
+        && let Some(text) = format_gpu_vitals_gui(
+            gpu.name.as_deref(),
+            gpu.cores.map(u64::from),
+            gpu.device_pct.map(u64::from),
+        )
+    {
+        parts.push(text);
     }
     if let Some(mem) = &snap.mem {
         let used = mem.sample.used();
@@ -3903,7 +4402,7 @@ fn format_local_snapshot_vitals(snap: &aterm_vitals::model::Snapshot) -> String 
         ));
     }
     if let Some(vol) = &snap.volume {
-        let used = vol.used();
+        let used = vol.occupied();
         let pct = ((used.saturating_mul(100)) / vol.total.max(1)).min(100) as u8;
         parts.push(format!(
             "Disk {}/{} ({pct}% \u{b7} {} free)",
@@ -3915,8 +4414,92 @@ fn format_local_snapshot_vitals(snap: &aterm_vitals::model::Snapshot) -> String 
     parts.join(" \u{b7} ")
 }
 
+/// A measured CPU percentage adds one sparkline sample; an unread one adds none.
+fn format_cpu_vitals_gui(host_key: &str, pct: Option<u8>, meta: &str) -> String {
+    match pct {
+        Some(pct) => {
+            let pct = pct.min(100);
+            let spark = push_sparkline_sample(host_key, pct);
+            format!("CPU {pct}% {} {spark} ({meta})", bar_8_gui(pct))
+        }
+        None => format!("CPU unavailable ({meta})"),
+    }
+}
+
+/// The share only where both figures were read and the capacity is positive.
+fn used_percent_gui(used: Option<u64>, total: Option<u64>) -> Option<u8> {
+    let total = total.filter(|total| *total > 0)?;
+    Some((u128::from(used?) * 100 / u128::from(total)).min(100) as u8)
+}
+
+fn observed_bytes_gui(bytes: Option<u64>) -> String {
+    bytes.map_or_else(|| "unknown".to_string(), human_bytes_gui)
+}
+
+/// Keep each memory figure's absence distinct from a measured zero.
+fn format_memory_usage_gui(used: Option<u64>, total: Option<u64>) -> Option<String> {
+    if used.is_none() && total.is_none() {
+        return None;
+    }
+    let share = used_percent_gui(used, total)
+        .map(|pct| format!(" ({pct}% {})", bar_8_gui(pct)))
+        .unwrap_or_default();
+    Some(format!(
+        "RAM {}/{}{share}",
+        observed_bytes_gui(used),
+        observed_bytes_gui(total)
+    ))
+}
+
+/// Keep used, total and available independent: one unread figure says nothing about the others.
+fn format_disk_usage_gui(
+    used: Option<u64>,
+    total: Option<u64>,
+    available: Option<u64>,
+) -> Option<String> {
+    if used.is_none() && total.is_none() && available.is_none() {
+        return None;
+    }
+    let share = used_percent_gui(used, total)
+        .map(|pct| format!("{pct}% \u{b7} "))
+        .unwrap_or_default();
+    Some(format!(
+        "Disk {}/{} ({share}{} free)",
+        observed_bytes_gui(used),
+        observed_bytes_gui(total),
+        observed_bytes_gui(available)
+    ))
+}
+
+/// Hardware identity, capacity and utilization are independently measured.
+fn format_gpu_vitals_gui(
+    name: Option<&str>,
+    cores: Option<u64>,
+    pct: Option<u64>,
+) -> Option<String> {
+    let name = name.filter(|name| !name.is_empty());
+    if name.is_none() && cores.is_none() && pct.is_none() {
+        return None;
+    }
+    let usage = pct
+        .map(|pct| format!("{}% {} ", pct.min(100), bar_8_gui(pct.min(100) as u8)))
+        .unwrap_or_default();
+    let mut meta = Vec::new();
+    if let Some(name) = name {
+        meta.push(name.to_string());
+    }
+    if let Some(cores) = cores {
+        meta.push(format!("{cores}c"));
+    }
+    Some(if meta.is_empty() {
+        format!("GPU {}", usage.trim_end())
+    } else {
+        format!("GPU {usage}({})", meta.join(" "))
+    })
+}
+
 fn format_hello_vitals_json(host_id: &str, v: &aterm_json::Value) -> String {
-    let cores = v.get("cpu_cores").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    let cores = v.get("cpu_cores").and_then(|x| x.as_u64());
     let cpu_pct = v
         .get("cpu_busy_pct")
         .and_then(|x| x.as_u64())
@@ -3932,8 +4515,7 @@ fn format_hello_vitals_json(host_id: &str, v: &aterm_json::Value) -> String {
             ])
         });
     let mut parts = Vec::new();
-    if let Some(pct) = cpu_pct {
-        let spark = push_sparkline_sample(&format!("{host_id}/cpu"), pct);
+    if cpu_pct.is_some() || cores.is_some() || load.is_some() {
         let load_str = load.map_or_else(String::new, |[l1, l5, l15]| {
             format!(
                 " \u{b7} load {:.2}/{:.2}/{:.2}",
@@ -3942,60 +4524,32 @@ fn format_hello_vitals_json(host_id: &str, v: &aterm_json::Value) -> String {
                 f64::from(l15) / 100.0
             )
         });
-        parts.push(format!(
-            "CPU {pct}% {} {spark} ({cores}c{load_str})",
-            bar_8_gui(pct)
+        let capacity = cores.map_or_else(|| "cores unknown".to_string(), |n| format!("{n}c"));
+        parts.push(format_cpu_vitals_gui(
+            &format!("{host_id}/cpu"),
+            cpu_pct,
+            &format!("{capacity}{load_str}"),
         ));
     }
-    if let Some(gpu_name) = v
+    let gpu_name = v
         .get("gpu_name")
         .and_then(|x| x.as_str())
-        .filter(|s| !s.is_empty())
-    {
-        let gpct = v
-            .get("gpu_busy_pct")
-            .and_then(|x| x.as_u64())
-            .map(|x| format!("{}% {} ", x.min(100), bar_8_gui(x.min(100) as u8)))
-            .unwrap_or_default();
-        parts.push(format!("GPU {gpct}({gpu_name})"));
+        .filter(|s| !s.is_empty());
+    let gpu_cores = v.get("gpu_cores").and_then(|x| x.as_u64());
+    let gpu_pct = v.get("gpu_busy_pct").and_then(|x| x.as_u64());
+    if let Some(gpu) = format_gpu_vitals_gui(gpu_name, gpu_cores, gpu_pct) {
+        parts.push(gpu);
     }
-    let mem_tot = v
-        .get("mem_total_bytes")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0);
-    let mem_used = v
-        .get("mem_used_bytes")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0);
-    if mem_tot > 0 {
-        let pct = ((mem_used.saturating_mul(100)) / mem_tot.max(1)).min(100) as u8;
-        parts.push(format!(
-            "RAM {}/{} ({pct}% {})",
-            human_bytes_gui(mem_used),
-            human_bytes_gui(mem_tot),
-            bar_8_gui(pct)
-        ));
+    let mem_tot = v.get("mem_total_bytes").and_then(|x| x.as_u64());
+    let mem_used = v.get("mem_used_bytes").and_then(|x| x.as_u64());
+    if let Some(memory) = format_memory_usage_gui(mem_used, mem_tot) {
+        parts.push(memory);
     }
-    let disk_tot = v
-        .get("disk_total_bytes")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0);
-    let disk_used = v
-        .get("disk_used_bytes")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0);
-    let disk_avail = v
-        .get("disk_avail_bytes")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0);
-    if disk_tot > 0 {
-        let pct = ((disk_used.saturating_mul(100)) / disk_tot.max(1)).min(100) as u8;
-        parts.push(format!(
-            "Disk {}/{} ({pct}% \u{b7} {} free)",
-            human_bytes_gui(disk_used),
-            human_bytes_gui(disk_tot),
-            human_bytes_gui(disk_avail)
-        ));
+    let disk_tot = v.get("disk_total_bytes").and_then(|x| x.as_u64());
+    let disk_used = v.get("disk_used_bytes").and_then(|x| x.as_u64());
+    let disk_avail = v.get("disk_avail_bytes").and_then(|x| x.as_u64());
+    if let Some(disk) = format_disk_usage_gui(disk_used, disk_tot, disk_avail) {
+        parts.push(disk);
     }
     if let Some(up) = v
         .get("uptime_secs")
@@ -4040,8 +4594,6 @@ fn sample_local_vitals_fallback() -> String {
                 f64::from(l15) / 100.0
             )
         });
-    let pct = cpu_pct.unwrap_or(8);
-    let spark = push_sparkline_sample("local/cpu", pct);
     let mut parts = Vec::new();
     let cl_names: Vec<String> = layout
         .clusters
@@ -4050,20 +4602,15 @@ fn sample_local_vitals_fallback() -> String {
         .collect();
     let cpu_meta = match (cl_names.is_empty(), load_str) {
         (false, Some(ld)) => {
-            format!(
-                "{}c [{}] \u{b7} {ld}",
-                total_cores.max(1),
-                cl_names.join(" ")
-            )
+            format!("{}c [{}] \u{b7} {ld}", total_cores, cl_names.join(" "))
         }
-        (false, None) => format!("{}c [{}]", total_cores.max(1), cl_names.join(" ")),
-        (true, Some(ld)) => format!("{}c \u{b7} {ld}", total_cores.max(1)),
-        (true, None) => format!("{}c", total_cores.max(1)),
+        (false, None) => format!("{}c [{}]", total_cores, cl_names.join(" ")),
+        (true, Some(ld)) if total_cores > 0 => format!("{total_cores}c \u{b7} {ld}"),
+        (true, Some(ld)) => format!("cores unknown \u{b7} {ld}"),
+        (true, None) if total_cores > 0 => format!("{total_cores}c"),
+        (true, None) => "cores unknown".to_string(),
     };
-    parts.push(format!(
-        "CPU {pct}% {} {spark} ({cpu_meta})",
-        bar_8_gui(pct)
-    ));
+    parts.push(format_cpu_vitals_gui("local/cpu", cpu_pct, &cpu_meta));
 
     if let Some(g) = aterm_sysprobe::gpu() {
         let gname = match (g.name.as_deref(), g.cores) {
@@ -4117,8 +4664,8 @@ fn sample_local_vitals_fallback() -> String {
             extra.join(" \u{b7} ")
         ));
     }
-    if let Some(v) = aterm_sysprobe::volume(std::path::Path::new("/")) {
-        let used = v.total.saturating_sub(v.available);
+    if let Some(v) = aterm_types::dirs::home_dir().and_then(|home| aterm_sysprobe::volume(&home)) {
+        let used = v.total.saturating_sub(v.free);
         let dpct = ((used.saturating_mul(100)) / v.total.max(1)).min(100) as u8;
         parts.push(format!(
             "Disk {}/{} ({dpct}% \u{b7} {} free)",
@@ -4560,6 +5107,8 @@ fn cached_bonjour_browse() -> (Vec<String>, Vec<String>, Vec<String>, BonjourRes
 fn discover_bonjour_lan_computers(
     computers: &mut Vec<TabComputer>,
     custom_names: &std::collections::BTreeMap<String, String>,
+    known_swarm_names: &std::collections::BTreeMap<String, String>,
+    in_swarm_census: bool,
     local_vitals: bool,
 ) {
     let (lan_names, sftp_names, rfb_names, resolved_map) = cached_bonjour_browse();
@@ -4614,19 +5163,20 @@ fn discover_bonjour_lan_computers(
         id: "__local_meta__".to_string(),
         name: format!("{local_canonical} (this Mac)"),
         address: local_addr,
-        os_version: format!(
+        os_version: Some(format!(
             "{local_hw} \u{b7} {local_os_str} \u{b7} {local_ssh_str} \u{b7} advertised services: {local_services}"
-        ),
+        )),
         status: "online (local)".to_string(),
         vitals: if local_vitals {
             sample_local_vitals_fallback()
         } else {
             String::new()
         },
-        instances: 0,
-        tabs: 0,
-        ai_clis: 0,
-        active_ai: 0,
+        instances: None,
+        tabs: None,
+        ai_clis: None,
+        active_ai: None,
+        session_scope: TabSessionScope::Observed,
     });
 
     let candidates: Vec<String> = lan_names
@@ -4636,13 +5186,52 @@ fn discover_bonjour_lan_computers(
             if canonical.eq_ignore_ascii_case(&local_canonical) {
                 return false;
             }
+            if is_known_swarm_host(known_swarm_names, &canonical)
+                || is_known_swarm_host(known_swarm_names, inst_name)
+            {
+                return false;
+            }
+            let canonical_stem = aterm_agent::fleet_census::canonical_host_stem(&canonical);
             !computers.iter().any(|c| {
                 c.id != "__local_meta__"
                     && (c.name.eq_ignore_ascii_case(&canonical)
-                        || c.name.eq_ignore_ascii_case(inst_name))
+                        || c.name.eq_ignore_ascii_case(inst_name)
+                        || aterm_agent::fleet_census::canonical_host_stem(&c.name)
+                            == canonical_stem)
             })
         })
         .collect();
+
+    if in_swarm_census {
+        // DESIGN-alab-swarm §7.2: when in a fleet, `/monitor` never TCP-dials every Mac for
+        // Bonjour RTTs; Bonjour remains strictly for non-swarm LAN stragglers.
+        for inst_name in candidates {
+            let canonical = canonical_host_name_gui(&inst_name, custom_names);
+            let Some((dot_local, _port, model_id, osxvers)) = resolved_map.get(&inst_name).cloned()
+            else {
+                continue;
+            };
+            let hw_display = describe_gui_hardware(model_id.as_deref());
+            let os_str = osxvers.map_or_else(
+                || "OS version unknown".to_string(),
+                |d| format!("Darwin {d}"),
+            );
+            computers.push(TabComputer {
+                id: format!("lan/{canonical}"),
+                name: canonical,
+                address: dot_local,
+                os_version: Some(format!("{hw_display} \u{b7} {os_str}")),
+                status: aterm_agent::fleet_census::STRAGGLER_MONITOR_STATUS.to_owned(),
+                vitals: String::new(),
+                instances: None,
+                tabs: None,
+                ai_clis: None,
+                active_ai: None,
+                session_scope: TabSessionScope::Observed,
+            });
+        }
+        return;
+    }
 
     let results: Vec<TabComputer> = std::thread::scope(|s| {
         let handles: Vec<_> = candidates
@@ -4704,17 +5293,18 @@ fn discover_bonjour_lan_computers(
                         id: format!("lan/{canonical}"),
                         name: canonical,
                         address: addr_display,
-                        os_version: os_full,
+                        os_version: Some(os_full),
                         status: if ssh_banner.is_some() {
                             "reachable (ssh)".into()
                         } else {
                             "advertised (lan)".into()
                         },
                         vitals,
-                        instances: 0,
-                        tabs: 0,
-                        ai_clis: 0,
-                        active_ai: 0,
+                        instances: None,
+                        tabs: None,
+                        ai_clis: None,
+                        active_ai: None,
+                        session_scope: TabSessionScope::Observed,
                     })
                 })
             })
@@ -4757,3 +5347,7 @@ pub(crate) fn unix_ms_now() -> i64 {
 #[cfg(test)]
 #[path = "harness_screen_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "harness_vitals_tests.rs"]
+mod vitals_tests;

@@ -54,5 +54,7 @@ pub mod language;
 pub mod protocol;
 /// The store of open documents and their views.
 pub mod store;
+/// CSV and TSV as records and cells: the scan, values and re-encoding behind the grid face.
+pub mod table;
 /// The rope every document's text lives in.
 pub mod text;

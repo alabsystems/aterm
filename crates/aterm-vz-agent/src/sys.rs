@@ -28,8 +28,11 @@ fn check(r: c_int) -> io::Result<c_int> {
 /// Send `signal` to the process group `pgid` (a command's, which leads it).
 ///
 /// # Errors
-/// `pgid` cannot be a command's group (0, 1, or past `pid_t`), or `kill` failed.
+/// `pgid` cannot be a command's group (0, 1, or past `pid_t`), `signal <= 0`, or `kill` failed.
 pub fn kill_group(pgid: u32, signal: i32) -> io::Result<()> {
+    if signal <= 0 {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
     let pgid = c_int::try_from(pgid)
         .ok()
         .filter(|p| *p > 1)
@@ -67,6 +70,29 @@ pub fn kill_self() -> ! {
 
 #[cfg(target_os = "linux")]
 pub use linux::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kill_group_refuses_non_positive_signals_and_invalid_groups() {
+        for sig in [0, -1, -9] {
+            assert_eq!(
+                kill_group(4242, sig).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "signal {sig}"
+            );
+        }
+        for pgid in [0, 1] {
+            assert_eq!(
+                kill_group(pgid, SIGKILL).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "pgid {pgid}"
+            );
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 mod linux {

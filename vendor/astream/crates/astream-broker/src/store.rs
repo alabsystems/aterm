@@ -1914,7 +1914,23 @@ pub(crate) fn create_fresh(path: &Path, opts: &mut FsOpenOptions) -> io::Result<
 /// log, even briefly. A file whose permissions cannot be set is removed.
 #[cfg(any(feature = "retention", feature = "at-rest"))]
 pub(crate) fn create_like(path: &Path, perms: &std::fs::Permissions) -> io::Result<File> {
+    create_like_access(path, perms, false)
+}
+
+/// A kept copy becomes the live log without reopening: give its owned descriptor
+/// read access too, retaining exactly the same creation and permission rules.
+#[cfg(feature = "retention")]
+pub(crate) fn create_like_read_write(
+    path: &Path,
+    perms: &std::fs::Permissions,
+) -> io::Result<File> {
+    create_like_access(path, perms, true)
+}
+
+#[cfg(any(feature = "retention", feature = "at-rest"))]
+fn create_like_access(path: &Path, perms: &std::fs::Permissions, read: bool) -> io::Result<File> {
     let mut opts = FsOpenOptions::new();
+    opts.read(read);
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -3015,6 +3031,187 @@ pub enum Prepared {
     Unclean(String),
 }
 
+/// Hard upper bound (`10^12`) on per-bucket rate and burst parameters in [`RateLimit`],
+/// guaranteeing `val * 1_000` millitokens never overflows `u64`.
+pub const MAX_RATE_BUDGET: u64 = 1_000_000_000_000;
+
+/// Per-principal / per-producer monotone token-bucket rate limit (`DESIGN-aterm-fabric`
+/// T9 & T17).
+///
+/// Keyed by `producer_id` (which on a capability-guarded broker is pinned to the bound
+/// capability principal `producer_id_of(principal)`), throttling `Publish` and
+/// `ProcessAndProduce` on the connection thread (`ERR_RATE_LIMITED`) before queueing to
+/// the writer while leaving `Replicate`, `Commit`, `Retire`, `Fetch`, `Last`, and
+/// `Subscribe` unimpeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimit {
+    /// Sustained publish rate per bucket in records/sec (`1..=MAX_RATE_BUDGET`).
+    pub records_per_sec: u64,
+    /// Maximum burst capacity per bucket in records (`1..=MAX_RATE_BUDGET`).
+    pub burst_records: u64,
+    /// Optional sustained wire-payload byte rate (`subject + body`) per bucket in
+    /// bytes/sec (`0` = unlimited; otherwise `1..=MAX_RATE_BUDGET`).
+    pub bytes_per_sec: u64,
+    /// Maximum byte burst capacity per bucket when `bytes_per_sec > 0` (`0` when
+    /// `bytes_per_sec == 0`; otherwise `1..=MAX_RATE_BUDGET`).
+    pub burst_bytes: u64,
+}
+
+impl RateLimit {
+    /// Construct a record-rate token bucket (`records_per_sec` and `burst_records` in
+    /// `1..=MAX_RATE_BUDGET`) with no byte ceiling (`bytes_per_sec = 0`).
+    #[must_use]
+    pub const fn records(records_per_sec: u64, burst_records: u64) -> Option<Self> {
+        if records_per_sec == 0
+            || records_per_sec > MAX_RATE_BUDGET
+            || burst_records == 0
+            || burst_records > MAX_RATE_BUDGET
+        {
+            return None;
+        }
+        Some(Self {
+            records_per_sec,
+            burst_records,
+            bytes_per_sec: 0,
+            burst_bytes: 0,
+        })
+    }
+
+    /// Attach a byte-rate token bucket (`bytes_per_sec` and `burst_bytes` in
+    /// `1..=MAX_RATE_BUDGET`) to an existing [`RateLimit`].
+    #[must_use]
+    pub const fn with_bytes(self, bytes_per_sec: u64, burst_bytes: u64) -> Option<Self> {
+        if bytes_per_sec == 0
+            || bytes_per_sec > MAX_RATE_BUDGET
+            || burst_bytes == 0
+            || burst_bytes > MAX_RATE_BUDGET
+        {
+            return None;
+        }
+        if self.records_per_sec == 0
+            || self.records_per_sec > MAX_RATE_BUDGET
+            || self.burst_records == 0
+            || self.burst_records > MAX_RATE_BUDGET
+        {
+            return None;
+        }
+        Some(Self {
+            records_per_sec: self.records_per_sec,
+            burst_records: self.burst_records,
+            bytes_per_sec,
+            burst_bytes,
+        })
+    }
+
+    /// Validate that all rate and burst fields lie within `1..=MAX_RATE_BUDGET` (or both
+    /// byte fields are `0`).
+    pub fn validate(&self) -> Result<Self, String> {
+        if self.records_per_sec == 0 || self.records_per_sec > MAX_RATE_BUDGET {
+            return Err(format!(
+                "records_per_sec ({}) must be in 1..={MAX_RATE_BUDGET}",
+                self.records_per_sec
+            ));
+        }
+        if self.burst_records == 0 || self.burst_records > MAX_RATE_BUDGET {
+            return Err(format!(
+                "burst_records ({}) must be in 1..={MAX_RATE_BUDGET}",
+                self.burst_records
+            ));
+        }
+        if self.bytes_per_sec == 0 && self.burst_bytes == 0 {
+            return Ok(*self);
+        }
+        if self.bytes_per_sec == 0 || self.bytes_per_sec > MAX_RATE_BUDGET {
+            return Err(format!(
+                "bytes_per_sec ({}) must be in 1..={MAX_RATE_BUDGET} when byte limiting is active",
+                self.bytes_per_sec
+            ));
+        }
+        if self.burst_bytes == 0 || self.burst_bytes > MAX_RATE_BUDGET {
+            return Err(format!(
+                "burst_bytes ({}) must be in 1..={MAX_RATE_BUDGET} when byte limiting is active",
+                self.burst_bytes
+            ));
+        }
+        Ok(*self)
+    }
+
+    /// Parse `<records_per_sec>[:<burst_records>][,<bytes_per_sec>[:<burst_bytes>]]`
+    /// (for `asb serve --rate-limit` and configuration files). When `:<burst>` is omitted,
+    /// `burst` defaults to the sustained per-second rate.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let trimmed = spec.trim();
+        if trimmed.is_empty() {
+            return Err("empty rate-limit spec".to_string());
+        }
+        let (rec_part, byte_part) = match trimmed.split_once(',') {
+            Some((r, b)) => (r.trim(), Some(b.trim())),
+            None => (trimmed, None),
+        };
+        let (records_per_sec, burst_records) = parse_rate_pair(rec_part, "records")?;
+        let base = match Self::records(records_per_sec, burst_records) {
+            Some(lim) => lim,
+            None => {
+                return Err(format!(
+                    "records rate/burst ({records_per_sec}:{burst_records}) out of range 1..={MAX_RATE_BUDGET}"
+                ));
+            }
+        };
+        match byte_part {
+            None => Ok(base),
+            Some(b_str) => {
+                let (bytes_per_sec, burst_bytes) = parse_rate_pair(b_str, "bytes")?;
+                match base.with_bytes(bytes_per_sec, burst_bytes) {
+                    Some(lim) => Ok(lim),
+                    None => Err(format!(
+                        "bytes rate/burst ({bytes_per_sec}:{burst_bytes}) out of range 1..={MAX_RATE_BUDGET}"
+                    )),
+                }
+            }
+        }
+    }
+}
+
+fn parse_rate_pair(part: &str, label: &str) -> Result<(u64, u64), String> {
+    if part.is_empty() {
+        return Err(format!("missing {label} rate"));
+    }
+    match part.split_once(':') {
+        Some((r_str, b_str)) => {
+            let rate = match r_str.trim().parse::<u64>() {
+                Ok(v) => v,
+                Err(_) => return Err(format!("invalid {label} rate {r_str:?}")),
+            };
+            let burst = match b_str.trim().parse::<u64>() {
+                Ok(v) => v,
+                Err(_) => return Err(format!("invalid {label} burst {b_str:?}")),
+            };
+            Ok((rate, burst))
+        }
+        None => {
+            let rate = match part.parse::<u64>() {
+                Ok(v) => v,
+                Err(_) => return Err(format!("invalid {label} rate {part:?}")),
+            };
+            Ok((rate, rate))
+        }
+    }
+}
+
+impl std::fmt::Display for RateLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.bytes_per_sec > 0 {
+            write!(
+                f,
+                "{}:{},{}:{}",
+                self.records_per_sec, self.burst_records, self.bytes_per_sec, self.burst_bytes
+            )
+        } else {
+            write!(f, "{}:{}", self.records_per_sec, self.burst_records)
+        }
+    }
+}
+
 /// How [`BrokerLog::open_opts`] (and [`Broker::open_opts`](crate::Broker::open_opts))
 /// open a log. Every other constructor is a shorthand for it. Build one with
 /// [`new`](Self::new) and set the fields that differ from the defaults.
@@ -3067,6 +3264,12 @@ pub struct OpenOptions {
     /// least one newly visible deliverable record, eliminating `O(S)` broadcast wakeups
     /// on brokers with many disjoint-filter subscribers. Ignored by [`BrokerLog::open_opts`].
     pub selective_tail_wake: bool,
+    /// `Some(limit)`: per-principal / per-producer monotone token-bucket rate limit
+    /// (`DESIGN-aterm-fabric` T9 & T17; [`Broker::set_rate_limit`](crate::Broker::set_rate_limit)),
+    /// throttling `Publish` and `ProcessAndProduce` with [`crate::ERR_RATE_LIMITED`] when
+    /// a bucket's record or byte budget is exhausted. `None` by default. Ignored by
+    /// [`BrokerLog::open_opts`].
+    pub rate_limit: Option<RateLimit>,
     /// The crash simulation's recovery mutation (a negative control).
     #[cfg(test)]
     pub(crate) mutation: Mutation,
@@ -3080,6 +3283,13 @@ impl OpenOptions {
         let mut opts = OpenOptions::default();
         opts.durability = durability;
         opts
+    }
+
+    /// Builder helper setting [`Self::rate_limit`].
+    #[must_use]
+    pub const fn with_rate_limit(mut self, limit: RateLimit) -> Self {
+        self.rate_limit = Some(limit);
+        self
     }
 
     pub(crate) const fn at_rest_key_opt(&self) -> Option<[u8; 32]> {
@@ -3721,8 +3931,13 @@ fn lineage_note(settled: &logid::Settled) -> String {
 
 /// Open (creating if absent) and exclusively lock the log file, then fsync its
 /// directory, returning whether this call created the file. `sync_dir` is
-/// [`sync_parent_dir`], injectable so a test can see it.
-fn open_log_file(path: &Path, sync_dir: fn(&Path) -> io::Result<()>) -> io::Result<(File, bool)> {
+/// [`sync_parent_dir`], injectable so a test can see it. `before_lock` is the
+/// open/lock race seam; production passes an empty closure.
+pub(crate) fn open_log_file(
+    path: &Path,
+    sync_dir: fn(&Path) -> io::Result<()>,
+    before_lock: impl FnOnce(),
+) -> io::Result<(File, bool)> {
     let (file, created) = match open_with_options(
         FsOpenOptions::new().read(true).write(true).create_new(true),
         path,
@@ -3734,7 +3949,20 @@ fn open_log_file(path: &Path, sync_dir: fn(&Path) -> io::Result<()>) -> io::Resu
         ),
         Err(e) => return Err(e),
     };
+    before_lock();
     lock_exclusive(&file, path)?;
+    match astream_sys::file_matches_path(&file, path) {
+        Ok(true) => {}
+        result => {
+            let _ = file.unlock();
+            return Err(result.err().unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "log ownership changed during open",
+                )
+            }));
+        }
+    }
     // On EVERY open, not only the one that creates the file: that open may have died
     // (or failed) before its directory fsync, and a record acked into a file whose
     // entry is not durable can vanish with it on a power loss.
@@ -4255,7 +4483,7 @@ impl BrokerLog {
         let rules = opts.escalation.compile()?;
         let (mut file, dir, created) = match storage {
             Storage::Os(path) => {
-                let (file, created) = open_log_file(path, sync_parent_dir)?;
+                let (file, created) = open_log_file(path, sync_parent_dir, || {})?;
                 (
                     Backing::from_file(file),
                     Dir::Os(path.to_path_buf()),
@@ -9100,16 +9328,23 @@ impl BrokerLog {
             return Err(e);
         }
         self.compact_crash(Step::Intent)?;
+        // Own the replacement before publishing its name. The lock then follows
+        // this exact descriptor through the rename, including every error below.
+        if let Err(e) = lock_exclusive(c.copy.destination(), c.copy.kept()) {
+            self.compact_abandon(c);
+            return Err(e);
+        }
         // 4) The switch. A failed rename leaves the log as it was.
         if let Err(e) = rename_path(c.copy.kept(), &self.path) {
             self.compact_abandon(c);
             return Err(e);
         }
+        self.file = Backing::from_file(c.copy.into_destination());
         // From here the on-disk log is ALREADY compacted: the rest of the durable I/O
         // runs FIRST, and any failure POISONS the log — it refuses every further op until
         // it is reopened, and the reopen finishes the compaction from the intent.
         // `next`/head is unchanged (a front prune).
-        if let Err(e) = self.compact_switch(&c, &intent) {
+        if let Err(e) = self.compact_switch(c.min, c.carry, &intent) {
             self.publish_poison(
                 format!("retention compaction failed after rewrite: {e}"),
                 None,
@@ -9247,30 +9482,28 @@ impl BrokerLog {
     }
 
     /// Steps 4 (its directory flush) to 8 of the switch: the log is already the kept
-    /// suffix on disk. Reopen and re-lock the new inode (the old one is unlinked), install
-    /// the carried state, record the base, re-identify the watermark, remove the intent.
+    /// suffix on disk and its locked descriptor is already installed. Install the
+    /// carried state, record the base, re-identify the watermark, remove the intent.
     #[cfg(feature = "retention")]
     fn compact_switch(
         &mut self,
-        c: &Compaction,
+        min: u64,
+        carry: bool,
         intent: &crate::compact::Intent,
     ) -> io::Result<()> {
         use crate::compact::{remove_intent, staged_state_path, Step};
         sync_parent_dir(&self.path)?;
         self.compact_crash(Step::Rename)?;
-        let newf = open_with_options(FsOpenOptions::new().read(true).write(true), &self.path)?;
-        lock_exclusive(&newf, &self.path)?;
-        self.file = Backing::from_file(newf);
         self.file.seek_end()?;
-        if c.carry {
+        if carry {
             let state = state_path(&self.path);
             rename_path(&staged_state_path(&self.path), &state)?;
             sync_parent_dir(&state)?;
             self.compact_crash(Step::StateInstalled)?;
         }
-        write_base(&self.path, c.min)?;
+        write_base(&self.path, min)?;
         self.compact_crash(Step::Base)?;
-        if self.compact_watermark(c.min, intent)? {
+        if self.compact_watermark(min, intent)? {
             self.compact_crash(Step::Watermark)?;
         }
         remove_intent(&self.path)?;
@@ -10113,10 +10346,10 @@ mod tests {
         let (_tmp, path) = tmp("dirsync");
         let _ = std::fs::remove_file(&path);
         // The first open creates the file, but its directory fsync fails.
-        assert!(open_log_file(&path, failing).is_err());
+        assert!(open_log_file(&path, failing, || {}).is_err());
         assert!(path.exists(), "the file was created");
         // The next open finds the file there and must still fsync the directory.
-        let (_file, created) = open_log_file(&path, counting).unwrap();
+        let (_file, created) = open_log_file(&path, counting, || {}).unwrap();
         assert!(!created);
         assert_eq!(SYNCS.load(Ordering::SeqCst), 1);
     }

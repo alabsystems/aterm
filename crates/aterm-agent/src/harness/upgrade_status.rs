@@ -9,10 +9,11 @@ use std::path::Path;
 use aterm_json::{Map, Value};
 
 use super::{
-    LiveTab, Opts, Phase, Report, Request, STALE_S, St, Version, connect, conversation_live,
+    LiveTab, Opts, Phase, Report, Request, STALE_S, St, Version, alive, connect, conversation_live,
     ledger, load, now_s, process_group, roster_aside, save, session_files, started_s, state_dir,
     sweep_lock, tab_is_live, unique_tab_for_group, upgrade,
 };
+use crate::harness::relaunch::{TAB_TAKEN, overtakable, overtaken, overtaken_line};
 
 /// How long a session may be behind before its upgrade reads stalled on its own.
 pub const STALLED_AFTER_S: u64 = upgrade::RUNG_LAND_S + LAND_GRACE_S;
@@ -231,6 +232,10 @@ pub struct Row {
     pub request: Request,
     /// When the owner's word was written (unix seconds; `0`: none recorded).
     pub request_at: u64,
+    /// When the owner pressed the top rule's ⬆️ (`0`: no press), and the build it was for
+    /// ([`Self::press_stands`]).
+    pub pressed_at: u64,
+    pub pressed_to: String,
     /// A finished restart's outcome line ([`upgrade::restart_outcome`]).
     pub outcome: String,
     /// When the restart finished (`0`: not done).
@@ -254,6 +259,8 @@ pub struct Row {
     pub exited_at: u64,
     /// The agent the record names (`St::pid`; `0`: none recorded).
     pub pid: u32,
+    /// The original run's recorded birth (`St::proc_start`), including pending records with no PID.
+    pub proc_start: String,
     /// The last look that found a hand the relaunch line waits on standing on the tab.
     pub hand_seen: u64,
     /// What ran under the agent at the last look whose step waited ([`HeldBy`], [`St::held_by`]).
@@ -314,7 +321,8 @@ pub struct Row {
     pub aside: String,
     /// The flow the row is read under.
     pub quiet: bool,
-    /// A restart in flight whose agent was read gone, held again ([`Self::held_again`]).
+    /// A record whose agent was read gone, intentionally answered by a live holder or a retained
+    /// answer ([`Self::held_again`], [`Self::answer_down`]). Its original birth is no new-run gate.
     pub held_back: bool,
     /// The restart's agent no look stamped gone ([`Self::exited_at`] still `0` on its record).
     pub ended_unstamped: bool,
@@ -381,6 +389,8 @@ impl Row {
             wait_seen: st.wait_seen,
             request: st.request_for(&st.tab),
             request_at: st.request_at,
+            pressed_at: st.pressed_at,
+            pressed_to: st.pressed_to.clone(),
             outcome: st.outcome.clone(),
             done_at: st.done_at,
             moved_at: st.relaunched_at,
@@ -398,6 +408,7 @@ impl Row {
             exited_at: exited_seen(st, now, ended_unstamped),
             ended_unstamped,
             pid: st.pid,
+            proc_start: st.proc_start.clone(),
             hand_seen: st.hand_seen_s,
             held_by: st.held_by.clone(),
             work_seen: st.work_seen
@@ -564,11 +575,7 @@ impl Row {
     }
 
     fn owner_holds(&self, now: u64) -> bool {
-        match &self.request {
-            Request::Skip(v) => upgrade::Version::parse(v) == upgrade::Version::parse(&self.to),
-            Request::DeferUntil(t) => now < *t,
-            Request::None | Request::Now => false,
-        }
+        self.request.holds_build_for(self.agent, &self.to, now)
     }
 
     /// Whether the upgrade will move this session to the target at a turn end with nobody's help.
@@ -954,7 +961,15 @@ impl Row {
             "held" => "it moves once the tab is let go",
             NOT_FOREGROUND => "it moves once it is back in front in its tab (`fg` there)",
             CLAIMED => "it moves once that supervisor lets the tab go",
+            AUTOPILOT_OFF if self.agent.presses() => {
+                "it moves once its autopilot is cruise or land again, or once on a press of its \
+                 update arrow"
+            }
             AUTOPILOT_OFF => "it moves once its autopilot is cruise or land again",
+            AGENT_OFF if self.agent.presses() => {
+                "it moves once its agent is switched on again (Settings ▸ Harness), or once on a \
+                 press of its update arrow"
+            }
             AGENT_OFF => "it moves once its agent is switched on again (Settings ▸ Harness)",
             "limited" if self.spend_held() => "it moves once you add credits or raise the cap",
             "limited" => "it moves once the limit resets",
@@ -1067,9 +1082,8 @@ impl Row {
     }
 
     const fn answer_down(&mut self) {
-        if matches!(self.phase, Phase::Exiting { .. }) {
-            self.held_back = true;
-        } else {
+        self.held_back = true;
+        if !matches!(self.phase, Phase::Exiting { .. }) {
             self.exited_at = 0;
         }
     }
@@ -1159,26 +1173,60 @@ impl Row {
     }
 
     /// Sets the row aside where its tab holds it: not in front, claimed by another supervisor,
-    /// its agent switched off or its Autopilot off. The person's own Now for the row's build
-    /// (the top rule's ⬆️, the tab menu's Upgrade Now) is a one-shot exception to the last two:
-    /// they asked for this move with the harness off. Not in front and claimed still hold.
+    /// its agent switched off or its Autopilot off. The person's own Now (the tab menu's Upgrade
+    /// Now) is no exception: no worker steps a tab its agent's switch or its Autopilot holds
+    /// off, so the row keeps the reason it waits, and their Now moves it once that reason goes.
+    /// Their standing press of the ⬆️ ([`Self::press_stands`]) is: its own lane moves the tab
+    /// once, so a switched-off agent or Autopilot sets it aside no longer, while a tab another
+    /// supervisor holds or whose agent is not in front stays aside.
     fn set_aside(&mut self, held: &[Holder], unproven_tab: bool, aside: &Aside, now: u64) {
-        let asked_now = self.request == Request::Now;
+        let pressed = self.press_stands(now);
         if self.held_aside(held, unproven_tab) {
             self.go_aside(NOT_FOREGROUND, now);
         } else if !self.outside && aside.claimed.contains(&self.tab) {
             self.go_aside(CLAIMED, now);
-        } else if !self.outside && !asked_now && aside.agent_off.contains(&self.tab) {
+        } else if !self.outside && !pressed && aside.agent_off.contains(&self.tab) {
             self.go_aside(AGENT_OFF, now);
-        } else if !self.outside && !asked_now && aside.off.contains(&self.tab) {
+        } else if !self.outside && !pressed && aside.off.contains(&self.tab) {
             self.go_aside(AUTOPILOT_OFF, now);
         }
     }
 
-    /// Keeps the aside of the row `shown` on this one, read at `now`.
+    /// Whether the owner's press of the ⬆️ stands at `now` ([`press_stands`]).
+    #[must_use]
+    pub fn press_stands(&self, now: u64) -> bool {
+        press_stands(
+            self.agent,
+            self.pressed_at,
+            &self.pressed_to,
+            &self.to,
+            &self.request,
+            &self.phase,
+            now,
+        )
+    }
+
+    /// Keeps the aside of the row `shown` on this one, read at `now`: but an Autopilot or an
+    /// agent switched off, which a standing press passes ([`Self::press_stands`]), on a row whose
+    /// press stands.
     pub fn keep_aside(&mut self, shown: &Row, now: u64) {
-        if !shown.aside.is_empty() && shown.session == self.session {
+        let passed =
+            self.press_stands(now) && matches!(shown.aside.as_str(), AGENT_OFF | AUTOPILOT_OFF);
+        if !shown.aside.is_empty() && shown.session == self.session && !passed {
             self.go_aside(&shown.aside, now);
+        }
+    }
+
+    /// Clears an Autopilot or agent switched-off aside that a standing press passes, restoring
+    /// `word`'s wait when a host row read before the press arrives after it.
+    pub fn lift_passed_aside(&mut self, word: &Row, now: u64) {
+        if self.press_stands(now) && matches!(self.aside.as_str(), AGENT_OFF | AUTOPILOT_OFF) {
+            if self.wait == self.aside {
+                self.wait.clone_from(&word.wait);
+                self.wait_since = word.wait_since;
+            }
+            self.aside.clear();
+            self.person_named = self.person_seen(now);
         }
     }
 
@@ -1218,6 +1266,14 @@ impl Row {
         let same_build = to.is_some() && Version::parse(&self.from) == to;
         holders.iter().filter(move |h| {
             h.session == self.session
+                && (self.held_back
+                    || !self.held_by_a_process()
+                    || self.proc_start.is_empty()
+                    || h.proc_start.is_empty()
+                    || self
+                        .proc_start
+                        .split_whitespace()
+                        .eq(h.proc_start.split_whitespace()))
                 && to.as_ref().is_some_and(|to| {
                     Version::parse(&h.version).is_some_and(|v| v < *to || (same_build && v == *to))
                 })
@@ -1754,7 +1810,7 @@ fn wait_class(wait: &str) -> WaitClass {
             | "home-unreadable",
             _,
         ) => WaitClass::TabUnread,
-        ("in-flight", _) => WaitClass::UnderWay,
+        ("in-flight" | upgrade::PRESSED, _) => WaitClass::UnderWay,
         (_, "left-typed:screen-unreadable") => WaitClass::TabUnread,
         ("left-typed", _) => WaitClass::Person,
         ("announce-refused", _) => WaitClass::Notice,
@@ -3172,6 +3228,7 @@ fn claude_wait_words(wait: &str) -> Option<&'static str> {
         "queued" => "it has not read the upgrade's question yet",
         "login" => "it is not logged in",
         "in-flight" => "a step is under way",
+        upgrade::PRESSED => "the owner pressed its update arrow: that press moves it",
         crate::harness::upgrade_drive::BUILD_FAILS => "its new build fails to start",
         "announce-refused:changed" => {
             "aterm could not type its notice: the screen moved as it typed"
@@ -3626,6 +3683,8 @@ fn sessions_to_vet(rows: &[Row]) -> BTreeSet<String> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Holder {
     pub(super) pid: u32,
+    /// The already-read registry's process birth, empty when the lane does not record one.
+    pub(super) proc_start: String,
     pub(super) session: String,
     pub(super) version: String,
     pub(super) tab: Option<String>,
@@ -3798,6 +3857,7 @@ fn holder_of(sf: &upgrade::SessionFile, tabs: Option<&[LiveTab]>) -> Holder {
     };
     Holder {
         pid: sf.pid,
+        proc_start: sf.proc_start.clone(),
         session: sf.session_id.clone(),
         version: sf.version.clone(),
         led: led && tab.is_some(),
@@ -3813,12 +3873,15 @@ fn agent_down_tabs(opts: &Opts, sessions: &BTreeSet<String>, now: u64) -> BTreeS
     sessions
         .iter()
         .filter(|s| upgrade::Agent::keyed(s).is_none())
-        .filter_map(|s| Some(Row::of(s, &load(opts, s)?, now)))
-        .filter(|r| {
-            r.answered_by_its_tabs_agent()
-                && now.saturating_sub(r.exited_at) <= EXITED_FAILURE_SHOWN_S
+        .filter_map(|s| {
+            let st = load(opts, s)?;
+            let taken = !st.tab.is_empty() && overtakable(&st, super::alive);
+            let r = Row::of(s, &st, now);
+            (taken
+                || (r.answered_by_its_tabs_agent()
+                    && now.saturating_sub(r.exited_at) <= EXITED_FAILURE_SHOWN_S))
+                .then_some(r.tab)
         })
-        .map(|r| r.tab)
         .collect()
 }
 
@@ -3827,6 +3890,10 @@ fn agent_down_tabs(opts: &Opts, sessions: &BTreeSet<String>, now: u64) -> BTreeS
 pub enum Ask {
     /// Restart at the next turn end ([`Request::Now`]).
     Now,
+    /// The owner's press of the top rule's ⬆️: a [`Self::Now`] that stands as a press for
+    /// [`upgrade::PRESS_S`] ([`press_stands`]), which its own lane moves past what only defers a
+    /// move ([`upgrade::press_gate`]). Refused for a tab another supervisor holds.
+    Press,
     /// Not for this many seconds ([`Request::DeferUntil`]).
     Defer(u64),
     /// Stay on the running build until a newer one than the target comes ([`Request::Skip`]).
@@ -3872,7 +3939,43 @@ fn ask_aside(opts: &Opts, sid: &str, what: Ask, aside: &dyn Fn() -> Aside) -> Re
     Ok(row)
 }
 
-/// [`ask`] for the row the owner was shown.
+/// The source identity of the upgrade row when the owner pressed a word.
+///
+/// This bounds admission of a queued word, without changing an already accepted request's
+/// persistence across a restart or retarget.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AskScope {
+    /// The agent whose upgrade was shown.
+    pub agent: upgrade::Agent,
+    /// The displayed running build, including an unchanged opaque or unavailable spelling.
+    pub from: String,
+    /// The displayed target's install or relaunch source label.
+    pub source: String,
+    /// The displayed run's recorded birth, empty when unknown; a known birth must stay known.
+    pub proc_start: String,
+}
+
+impl From<&Row> for AskScope {
+    fn from(row: &Row) -> Self {
+        Self {
+            agent: row.agent,
+            from: row.from.clone(),
+            source: row.source.clone(),
+            proc_start: row.proc_start.clone(),
+        }
+    }
+}
+
+impl AskScope {
+    fn matches(&self, st: &St) -> bool {
+        self.agent == st.agent
+            && (self.from == st.from || upgrade::same_build(st.agent, &self.from, &st.from))
+            && self.source == st.source
+            && (self.proc_start.is_empty() || self.proc_start == st.proc_start)
+    }
+}
+
+/// [`ask`] for the target and conversation the owner was shown.
 pub fn ask_for(
     opts: &Opts,
     sid: &str,
@@ -3880,14 +3983,85 @@ pub fn ask_for(
     target: &str,
     session: &str,
 ) -> Result<Row, String> {
+    ask_for_aside(opts, sid, what, target, session, &|| aside_tabs(opts, true))
+}
+
+/// What a press of the ⬆️ on a tab another supervisor holds is refused with.
+pub const PRESS_CLAIMED: &str = "another supervisor holds its tab";
+
+/// [`ask_for`] with the tabs set aside read by `aside`: only a press reads them, refused for a
+/// tab another supervisor holds ([`PRESS_CLAIMED`]), where no lane of aterm's moves it.
+fn ask_for_aside(
+    opts: &Opts,
+    sid: &str,
+    what: Ask,
+    target: &str,
+    session: &str,
+    aside: &dyn Fn() -> Aside,
+) -> Result<Row, String> {
+    if what == Ask::Press && aside().claimed.contains(sid) {
+        return Err(PRESS_CLAIMED.to_string());
+    }
     let shown = Shown {
         to: target,
         session,
+        scope: None,
     };
     ask_within(opts, sid, what, Some(shown), ASK_LOCK_WAIT, &|s| {
         holders(opts, s, None)
     })
     .map(|(row, _)| row)
+}
+
+/// [`ask_for`] conditioned on the source identity displayed when a queued word was pressed.
+/// The selected record is checked under the sweep lock, before changing or recording the word.
+///
+/// # Errors
+/// Returns a refusal if the displayed target or source scope changed, or the upgrade cannot
+/// currently accept this word.
+pub fn ask_for_scope(
+    opts: &Opts,
+    sid: &str,
+    what: Ask,
+    target: &str,
+    session: &str,
+    scope: &AskScope,
+) -> Result<Row, String> {
+    let shown = Shown {
+        to: target,
+        session,
+        scope: Some(scope),
+    };
+    ask_within(opts, sid, what, Some(shown), ASK_LOCK_WAIT, &|s| {
+        holders(opts, s, None)
+    })
+    .map(|(row, _)| row)
+}
+
+/// Whether a press of the ⬆️ stamped at `pressed_at` for build `pressed_to` stands at `now` on
+/// `agent`'s record moving to `to` under `request` in `phase`: pressed within
+/// [`upgrade::PRESS_S`], for that same build ([`upgrade::same_build`]), its Now still standing,
+/// and the move not begun (pending, announced, or a round that gave up unanswered).
+#[must_use]
+pub fn press_stands(
+    agent: upgrade::Agent,
+    pressed_at: u64,
+    pressed_to: &str,
+    to: &str,
+    request: &Request,
+    phase: &Phase,
+    now: u64,
+) -> bool {
+    let unbegun = match phase {
+        Phase::Pending | Phase::Announced { .. } => true,
+        Phase::Failed(why) => why == upgrade::GAVE_UP,
+        Phase::Exiting { .. } | Phase::Relaunched { .. } | Phase::Done => false,
+    };
+    pressed_at != 0
+        && now < pressed_at.saturating_add(upgrade::PRESS_S)
+        && upgrade::same_build(agent, pressed_to, to)
+        && *request == Request::Now
+        && unbegun
 }
 
 /// The row a window showed the owner, which a pressed word is for ([`ask_for`]).
@@ -3897,6 +4071,8 @@ struct Shown<'a> {
     to: &'a str,
     /// Its conversation.
     session: &'a str,
+    /// Its source identity when a queued window word was pressed.
+    scope: Option<&'a AskScope>,
 }
 
 fn ask_within(
@@ -3921,7 +4097,7 @@ fn ask_within(
         }
     };
     let now = now_s();
-    let mut candidates: Vec<(String, St)> = std::fs::read_dir(state_dir(opts))
+    let candidates: Vec<(String, St)> = std::fs::read_dir(state_dir(opts))
         .map(|dir| {
             dir.flatten()
                 .filter_map(|e| {
@@ -3930,32 +4106,69 @@ fn ask_within(
                         return None;
                     }
                     let session = path.file_stem()?.to_string_lossy().into_owned();
-                    let st = load(opts, &session).filter(St::is_upgrade)?;
-                    (st.tab == sid || st.tab.is_empty()).then_some((session, st))
+                    let st = load(opts, &session)?;
+                    ((st.tab == sid && st.in_flight())
+                        || (st.is_upgrade() && (st.tab == sid || st.tab.is_empty())))
+                    .then_some((session, st))
                 })
                 .collect()
         })
         .unwrap_or_default();
-    if let Some((_, st)) = candidates
-        .iter()
-        .find(|(_, st)| st.tab == sid && st.in_flight())
-    {
-        let begun = match st.agent {
-            upgrade::Agent::Claude => "once the agent is signalled",
-            upgrade::Agent::Codex => "once its `/exit` is typed",
-            upgrade::Agent::Muse | upgrade::Agent::Agy => "by any lane: no lane moves this agent",
-        };
-        return Err(format!(
-            "the restart in tab {sid} is already under way: it is not held or hurried {begun}"
-        ));
-    }
+    let (flying, mut candidates): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|(_, st)| st.tab == sid && st.in_flight());
     candidates.retain(|(_, st)| {
-        matches!(
-            st.phase,
-            Phase::Pending | Phase::Announced { .. } | Phase::Failed(_)
-        )
+        st.is_upgrade()
+            && matches!(
+                st.phase,
+                Phase::Pending | Phase::Announced { .. } | Phase::Failed(_)
+            )
     });
-    let held = held_of(&candidates.iter().map(|(s, _)| s.clone()).collect()).unwrap_or_default();
+    let held = if flying.is_empty() || flying.iter().all(|(_, st)| overtakable(st, alive)) {
+        let vet: BTreeSet<String> = candidates
+            .iter()
+            .chain(&flying)
+            .map(|(s, _)| s.clone())
+            .collect();
+        held_of(&vet).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    for (session, mut st) in flying {
+        let taken = held.iter().find(|h| {
+            h.tab.as_deref() == Some(sid)
+                && !h.aside
+                && overtaken(&st, &session, h.pid, &h.proc_start, &h.session, alive)
+        });
+        let Some(h) = taken else {
+            let begun = match st.agent {
+                upgrade::Agent::Claude => "once the agent is signalled",
+                upgrade::Agent::Codex => "once its `/exit` is typed",
+                upgrade::Agent::Muse | upgrade::Agent::Agy => {
+                    "by any lane: no lane moves this agent"
+                }
+            };
+            return Err(format!(
+                "the restart in tab {sid} is already under way: it is not held or hurried {begun}"
+            ));
+        };
+        let line = overtaken_line(h.pid, &h.session);
+        st.close_overtaken(TAB_TAKEN, now);
+        let closed = Opts {
+            dry_run: false,
+            ..opts.clone()
+        };
+        let r = Report {
+            pid: st.pid,
+            tab: sid.to_string(),
+            session: session.clone(),
+            from: st.from.clone(),
+            to: format!("{}({})", st.to, st.source),
+            step: format!("failed:{TAB_TAKEN}"),
+        };
+        ledger(&closed, &r, &line);
+        save(&closed, &session, &st);
+    }
     candidates.retain(|(session, st)| {
         !st.tab.is_empty() || Row::of(session, st, now).proven_tab(&held).as_deref() == Some(sid)
     });
@@ -3985,12 +4198,21 @@ fn ask_within(
         ));
     };
     if let Some(shown) = shown
-        && !same_target(shown.to, &st.to)
+        && !upgrade::same_build(st.agent, shown.to, &st.to)
     {
         return Err(format!("stale:{}", word(&st.to)));
     }
+    if shown
+        .and_then(|shown| shown.scope)
+        .is_some_and(|scope| !scope.matches(&st))
+    {
+        return Err(format!(
+            "the upgrade in tab {sid} changed since this word was pressed; \
+             choose again on its current row"
+        ));
+    }
     match what {
-        Ask::Now => {
+        Ask::Now | Ask::Press => {
             match &st.phase {
                 Phase::Failed(why) if why == upgrade::GAVE_UP => {
                     st.phase = Phase::Pending;
@@ -4069,7 +4291,13 @@ fn ask_within(
     }
     st.request_at = now;
     st.new_round(now);
-    if matches!(st.phase, Phase::Announced { .. }) && st.request.holds(&st.phase, &st.to, now) {
+    if what == Ask::Press {
+        st.pressed_at = now;
+        st.pressed_to.clone_from(&st.to);
+    }
+    if matches!(st.phase, Phase::Announced { .. })
+        && st.request.holds_build_for(st.agent, &st.to, now)
+    {
         st.owe_release(if matches!(st.request, Request::Skip(_)) {
             "skipped"
         } else {
@@ -4079,7 +4307,9 @@ fn ask_within(
         st.forget_markers();
         st.noted.clear();
     }
-    if matches!(&st.phase, Phase::Failed(why) if why == upgrade::GAVE_UP) && what != Ask::Now {
+    if matches!(&st.phase, Phase::Failed(why) if why == upgrade::GAVE_UP)
+        && !matches!(what, Ask::Now | Ask::Press)
+    {
         st.forget_markers();
     }
     if st.tab.is_empty() {
@@ -4108,23 +4338,23 @@ fn ask_within(
             ..opts.clone()
         },
         &report,
-        "the owner's word (aterm harness upgrade --now|--defer|--skip)",
+        if what == Ask::Press {
+            "the owner's press of the update arrow: a Now its own lane moves once, past an \
+             Autopilot or an agent switched off and the agent's background work"
+        } else {
+            "the owner's word (aterm harness upgrade --now|--defer|--skip)"
+        },
     );
     announce_word(opts, now);
     Ok((Row::of(&session, &st, now).in_flow(opts, now), held))
-}
-
-fn same_target(shown: &str, to: &str) -> bool {
-    match (upgrade::Version::parse(shown), upgrade::Version::parse(to)) {
-        (Some(a), Some(b)) => a == b,
-        _ => !shown.is_empty() && shown == to,
-    }
 }
 
 /// The window's view of its tabs' upgrades, kept by its host thread (`aterm-gui`'s `harness_host`).
 #[derive(Debug, Default)]
 pub struct View {
     sent: Option<Vec<Row>>,
+    /// A caller's external publication custody changed: offer the next completed read again.
+    reoffer: bool,
     /// The tabs the rows last handed over left as they stood ([`Self::refresh_keeping`]).
     sent_kept: Vec<String>,
     badged: BTreeMap<String, String>,
@@ -4203,6 +4433,12 @@ const UNREAD_RETRY: [std::time::Duration; 4] = [
 ];
 
 impl View {
+    /// Hand the next completed read or explicit stand-down clear over even if its rows did not
+    /// change. A failed read keeps this request pending; it never re-stamps cached rows as fresh.
+    pub fn reoffer_after_read(&mut self) {
+        self.reoffer = true;
+    }
+
     /// Looks at the upgrades of the instance at `opts.sock`.
     pub fn refresh(&mut self, opts: &Opts, summary: &mut dyn FnMut(&[Row])) -> Option<u64> {
         self.refresh_keeping(opts, &mut |rows, _| summary(rows))
@@ -4415,8 +4651,9 @@ impl View {
         for r in &mut mine {
             r.level = r.attention(now).level();
         }
-        if self.sent.as_ref() != Some(&mine) || self.sent_kept != kept {
+        if self.reoffer || self.sent.as_ref() != Some(&mine) || self.sent_kept != kept {
             summary(&mine, &kept);
+            self.reoffer = false;
             self.sent = Some(mine.clone());
             self.sent_kept.clone_from(&kept);
         }
@@ -4525,10 +4762,11 @@ impl View {
 
     /// The host stood down (the switch is off, or it is shutting down).
     pub fn stand_down(&mut self, summary: &mut dyn FnMut(&[Row])) {
-        if self.sent.as_ref().is_some_and(|rows| !rows.is_empty()) {
+        if self.reoffer || self.sent.as_ref().is_some_and(|rows| !rows.is_empty()) {
             summary(&[]);
         }
         self.sent = None;
+        self.reoffer = false;
         self.sent_kept.clear();
         self.follows.clear();
         self.watch.clear();
@@ -4560,6 +4798,7 @@ impl View {
                 instances: crate::harness::upgrade_drive::Instances::Machine,
                 agents_off: Vec::new(),
                 land: false,
+                press: None,
                 timings: crate::harness::Timings::for_build(),
             };
             self.mark(&opts, &BTreeMap::new());
@@ -4712,6 +4951,8 @@ pub fn progress_projection(row: &Row, now: u64) -> BTreeMap<&'static str, i64> {
         ("cause", cause),
         ("clock", flag(clock)),
         ("reset", flag(row.limit_passed(now))),
+        ("pressed", flag(row.press_stands(now))),
+        ("now", flag(row.request == Request::Now)),
     ])
 }
 

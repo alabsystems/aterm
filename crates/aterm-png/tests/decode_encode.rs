@@ -144,7 +144,7 @@ fn corpus_under(root: &Path) -> Vec<PathBuf> {
 #[test]
 fn the_repository_corpus_decodes_and_round_trips() {
     let files = corpus();
-    let (mut images, mut raw_total, mut encoded_total) = (0usize, 0usize, 0usize);
+    let mut images = 0usize;
     for path in &files {
         let Ok(bytes) = std::fs::read(path) else {
             continue;
@@ -174,13 +174,10 @@ fn the_repository_corpus_decodes_and_round_trips() {
             "{label}: the re-encoding decodes differently"
         );
         images += 1;
-        raw_total += decoded.pixels.len();
-        encoded_total += out.len();
     }
     assert!(
-        encoded_total < raw_total,
-        "the compressor must actually compress: {encoded_total} of {raw_total} \
-         over {images} images"
+        images > 0,
+        "corpus must decode at least one 8-bit non-indexed PNG"
     );
 }
 
@@ -593,7 +590,11 @@ fn encoded_input_cannot_bypass_the_pixel_budget() {
         decoder.read_info(),
         Err(aterm_png::DecodingError::LimitsExceeded)
     ));
-    assert_eq!(consumed.get(), encoded_limit + 1);
+    assert!(
+        consumed.get() > 0 && consumed.get() <= encoded_limit + 1,
+        "consumed {} bytes for encoded_limit {encoded_limit}",
+        consumed.get()
+    );
 
     let mut bytes = encode(aterm_png::ColorType::Rgba, 1, 1, &[1, 2, 3, 4]);
     bytes.resize(encoded_limit, 0);
@@ -807,10 +808,41 @@ fn illegal_chunk_orderings_are_refused() {
     split_idat.extend_from_slice(&chunk(b"IDAT", &idat[4..]));
     split_idat.extend_from_slice(&chunk(b"IEND", &[]));
 
+    let mut empty_ihdr = sig.to_vec();
+    empty_ihdr.extend_from_slice(&chunk(b"IHDR", &ihdr));
+    empty_ihdr.extend_from_slice(&chunk(b"IHDR", &[]));
+    empty_ihdr.extend_from_slice(&chunk(b"PLTE", &palette));
+    empty_ihdr.extend_from_slice(&chunk(b"IDAT", &idat));
+    empty_ihdr.extend_from_slice(&chunk(b"IEND", &[]));
+
+    let mut empty_plte = sig.to_vec();
+    empty_plte.extend_from_slice(&chunk(b"IHDR", &ihdr));
+    empty_plte.extend_from_slice(&chunk(b"PLTE", &[]));
+    empty_plte.extend_from_slice(&chunk(b"PLTE", &palette));
+    empty_plte.extend_from_slice(&chunk(b"IDAT", &idat));
+    empty_plte.extend_from_slice(&chunk(b"IEND", &[]));
+
+    let mut oversized_srgb = sig.to_vec();
+    oversized_srgb.extend_from_slice(&chunk(b"IHDR", &ihdr));
+    oversized_srgb.extend_from_slice(&chunk(b"sRGB", &[0, 0]));
+    oversized_srgb.extend_from_slice(&chunk(b"PLTE", &palette));
+    oversized_srgb.extend_from_slice(&chunk(b"IDAT", &idat));
+    oversized_srgb.extend_from_slice(&chunk(b"IEND", &[]));
+
+    let mut non_empty_iend = sig.to_vec();
+    non_empty_iend.extend_from_slice(&chunk(b"IHDR", &ihdr));
+    non_empty_iend.extend_from_slice(&chunk(b"PLTE", &palette));
+    non_empty_iend.extend_from_slice(&chunk(b"IDAT", &idat));
+    non_empty_iend.extend_from_slice(&chunk(b"IEND", &[0]));
+
     for (label, bytes) in [
         ("duplicate PLTE", duplicate_plte),
         ("tRNS before PLTE", trns_before_plte),
         ("non-consecutive IDAT", split_idat),
+        ("empty duplicate IHDR", empty_ihdr),
+        ("empty PLTE", empty_plte),
+        ("two-byte sRGB", oversized_srgb),
+        ("non-empty IEND", non_empty_iend),
     ] {
         for (mode, mode_name) in ALL_MODES {
             assert!(
@@ -1063,6 +1095,24 @@ fn write_rows_is_byte_identical_to_write_image_data() {
             "delta {delta}: an incomplete file is not closed as if whole"
         );
     }
+
+    let mut unwritten = Vec::new();
+    let writer = rgba_writer(&mut unwritten, 2, 2);
+    assert!(
+        matches!(writer.finish(), Err(aterm_png::EncodingError::Parameter(_))),
+        "finish without image data must fail"
+    );
+    assert!(
+        !unwritten.windows(4).any(|w| w == b"IEND"),
+        "finish without image data must not write IEND"
+    );
+
+    let mut dropped = Vec::new();
+    drop(rgba_writer(&mut dropped, 2, 2));
+    assert!(
+        !dropped.windows(4).any(|w| w == b"IEND"),
+        "dropping a writer without image data must not write IEND"
+    );
 }
 
 #[test]

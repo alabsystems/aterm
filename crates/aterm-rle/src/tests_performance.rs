@@ -18,16 +18,13 @@ fn rle_set_well_compressed_is_constant() {
     let small = measure_sets_on_uniform(100);
     let large = measure_sets_on_uniform(10_000);
 
-    assert_eq!(
-        small, large,
-        "single set() on uniform RLE should be O(1) regardless of length: \
-         small={small}, large={large}"
-    );
+    assert_eq!(small, 1);
+    assert_eq!(large, 1);
 }
 
 #[test]
 fn rle_set_range_linear_in_runs() {
-    fn measure_set_range(run_count: u32) -> usize {
+    fn measure_set_range(run_count: u32) -> (usize, usize) {
         let mut rle: Rle<u8> = Rle::new();
         for i in 0..run_count {
             rle.push((i & 1) as u8);
@@ -39,15 +36,16 @@ fn rle_set_range_linear_in_runs() {
 
         reset_run_iterations();
         rle.set_range(start, end, 5);
-        take_run_iterations()
+        let actual = take_run_iterations();
+        // `find_run(start)` visits `start + 1` runs, `find_run(end - 1)` visits `end` runs,
+        // and `split_range_multi_run` visits `end - start` runs (`compact_around` has no loop).
+        let expected = (start + 1 + end + (end - start)) as usize;
+        (actual, expected)
     }
 
-    let small_iters = measure_set_range(1_000);
-    let large_iters = measure_set_range(4_000);
+    let (small_iters, small_expected) = measure_set_range(1_000);
+    let (large_iters, large_expected) = measure_set_range(4_000);
 
-    assert!(
-        large_iters <= small_iters * 8,
-        "4x runs should at most ~4x set_range iterations (linear): \
-         small={small_iters}, large={large_iters}"
-    );
+    assert_eq!(small_iters, small_expected);
+    assert_eq!(large_iters, large_expected);
 }

@@ -429,6 +429,9 @@ fn one_turn_restart_retains_reset_and_search_id_without_a_cursor() {
     assert!(fresh_complete.reset);
     assert_eq!(fresh_complete.cursor, None);
     assert_ne!(fresh_complete.search_id, restarted.search_id);
+
+    assert_slipped_rotated_resume_rejected(&model);
+    assert_slipped_gate_free_completion_rejected(&model);
 }
 
 #[test]
@@ -580,12 +583,8 @@ fn dense_result_backlog_drains_without_rescanning_or_replaying_deltas() {
     assert_eq!(got, oracle, "ordered deltas concatenate exactly once");
 }
 
-/// Verify that slipped `search_budgeted` steps match the `Buggy=1` transitions and are rejected.
-#[test]
-fn slipped_real_steps_are_the_buggy_transitions_and_are_rejected() {
-    let model = budgeted_search_resume_model();
-    let buggy = aterm_spec::interp::with_buggy(&model, 1);
-
+fn assert_slipped_rotated_resume_rejected(model: &Model) {
+    let buggy = aterm_spec::interp::with_buggy(model, 1);
     let mut state = model.init_state();
     let mut host = HostTrace::default();
     let mut terminal = Terminal::new(ROWS, 20);
@@ -593,7 +592,7 @@ fn slipped_real_steps_are_the_buggy_transitions_and_are_rejected() {
         .search_budgeted("x", true, false, None, 0)
         .expect("fresh search");
     bind_step(
-        &model,
+        model,
         &mut state,
         &mut host,
         "Start",
@@ -621,7 +620,7 @@ fn slipped_real_steps_are_the_buggy_transitions_and_are_rejected() {
     assert_eq!(buggy.successors("Resume", &state), vec![projected.clone()]);
     assert!(!model.check_invariant("IdentityStableWithoutReset", &projected));
     let (conforms, diagnostics) = verify::validate_transition_tiered(
-        &model,
+        model,
         &[],
         &state,
         &projected,
@@ -632,7 +631,10 @@ fn slipped_real_steps_are_the_buggy_transitions_and_are_rejected() {
         !conforms,
         "a resume that rotates its token passed unexpectedly: {diagnostics}"
     );
+}
 
+fn assert_slipped_gate_free_completion_rejected(model: &Model) {
+    let buggy = aterm_spec::interp::with_buggy(model, 1);
     let mut state = model.init_state();
     let mut host = HostTrace::default();
     let mut terminal = Terminal::new(ROWS, 20);
@@ -640,7 +642,7 @@ fn slipped_real_steps_are_the_buggy_transitions_and_are_rejected() {
         .search_budgeted("y", true, false, None, 0)
         .expect("fresh search");
     bind_step(
-        &model,
+        model,
         &mut state,
         &mut host,
         "Start",
@@ -652,7 +654,7 @@ fn slipped_real_steps_are_the_buggy_transitions_and_are_rejected() {
         .search_budgeted("y", true, false, start.cursor, 1)
         .expect("penultimate scan resume");
     bind_step(
-        &model,
+        model,
         &mut state,
         &mut host,
         "Resume",
@@ -678,7 +680,7 @@ fn slipped_real_steps_are_the_buggy_transitions_and_are_rejected() {
     );
     assert!(!model.check_invariant("LifecycleShape", &projected));
     let (conforms, diagnostics) = verify::validate_transition_tiered(
-        &model,
+        model,
         &[],
         &state,
         &projected,

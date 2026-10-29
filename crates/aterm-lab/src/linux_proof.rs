@@ -1086,6 +1086,9 @@ impl Gui<'_> {
                 "DBUS_SESSION_BUS_ADDRESS".into(),
                 format!("unix:path={}/bus", self.up.runtime),
             ),
+            // The clipboard rows' `invoke Paste` stands in for the person's Edit ▸ Paste: a
+            // control client's own paste reads no clipboard.
+            ("ATERM_DEBUG_PERSON_INVOKE".into(), "1".into()),
         ];
         let mut argv = vec![
             format!("{}/aterm-gui", self.bin),

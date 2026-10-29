@@ -308,12 +308,14 @@ mod eviction_tests {
 
         run_block(&mut term, "first", &["EVICT-ME-0", "EVICT-ME-1"]);
         run_block(&mut term, "second", &["KEEP-ME-0", "KEEP-ME-1"]);
+        // Next prompt seals `second`'s `end_row` before subsequent output scrolls.
+        term.process(b"\x1b]133;A\x07");
 
         let ids: Vec<u64> = term.all_blocks().map(|b| b.id).collect();
         assert!(ids.len() >= 2, "expected at least two blocks, got {ids:?}");
         let (evict_id, keep_id) = (ids[0], ids[1]);
 
-        for i in 0..40 {
+        for i in 0..6 {
             term.process(format!("filler-{i}\r\n").as_bytes());
         }
 
@@ -356,7 +358,7 @@ mod eviction_tests {
                     "retained block output must not be shifted into unrelated filler rows: {text:?}",
                 );
             }
-            BlockText::Evicted => {}
+            BlockText::Evicted => panic!("retained block unexpectedly Evicted"),
             BlockText::NotAvailable => panic!("retained block unexpectedly NotAvailable"),
         }
     }

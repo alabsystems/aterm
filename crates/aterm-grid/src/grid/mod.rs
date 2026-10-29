@@ -73,6 +73,7 @@ pub(in crate::grid) use crate::test_counters::{
 };
 
 pub use anchor_lend::{AnchorLend, LendReach};
+pub use checkpoint_lines::GridImageCarry;
 pub use history_carry::{
     HistoryFence, HistoryFenceBroken, OlderHistory, OlderHistoryClaim, OlderHistoryRefusal,
 };

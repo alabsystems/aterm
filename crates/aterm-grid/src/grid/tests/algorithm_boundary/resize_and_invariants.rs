@@ -276,10 +276,10 @@ fn reflow_grow_cursor_in_trailing_blank_of_continuation_row() {
         "cursor should be on merged row 0, not row {} (was on continuation of 'ABCDE'→'FG')",
         grid.cursor_row()
     );
-    assert!(
-        grid.cursor_col() <= 9,
-        "cursor col {} should be within new_cols 10",
-        grid.cursor_col()
+    assert_eq!(
+        grid.cursor_col(),
+        9,
+        "cursor at col 4 after 5-col row 0 ('ABCDE') maps to col 5 + 4 == 9 on merged 10-col row 0"
     );
     assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
     assert_eq!(grid.cell(0, 6).unwrap().char(), 'G');

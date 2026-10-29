@@ -160,16 +160,6 @@ impl LoadNames {
     }
 }
 
-/// Every dylib the Mach-O `bytes` loads, in load-command order, slice after slice for a
-/// universal file (a name both slices load appears once per slice): [`load_names`]'
-/// `loads`.
-///
-/// # Errors
-/// [`LoadError::Malformed`] as [`load_names`] refuses.
-pub fn load_dylibs(bytes: &[u8]) -> Result<Vec<String>, LoadError> {
-    load_names(bytes).map(|names| names.loads)
-}
-
 /// The install name, the loaded dylibs and the run paths of the Mach-O `bytes`
 /// ([`LoadNames`]).
 ///
@@ -368,12 +358,12 @@ impl Command<'_> {
     }
 }
 
-/// Every dylib the Mach-O at `path` loads ([`load_dylibs`]), read whole through a
+/// Every dylib the Mach-O at `path` loads ([`load_names`]' `loads`), read whole through a
 /// no-follow open of a regular file.
 ///
 /// # Errors
 /// [`LoadError::Io`] when it is not a regular file, is over 1 GiB or cannot be read;
-/// [`LoadError::Malformed`] as [`load_dylibs`] refuses.
+/// [`LoadError::Malformed`] as [`load_names`] refuses.
 pub fn load_dylibs_at(path: &Path) -> Result<Vec<String>, LoadError> {
     load_names_at(path).map(|names| names.loads)
 }
@@ -927,7 +917,7 @@ mod tests {
             .map(|cmd| dylib_command(*cmd, &format!("/opt/x/{cmd:x}.dylib"), true))
             .collect();
         commands.push(dylib_command(0xD, "/opt/x/self.dylib", true));
-        let names = load_dylibs(&thin(&commands, true)).unwrap();
+        let names = load_names(&thin(&commands, true)).unwrap().loads;
         assert_eq!(names.len(), DYLIB_LOADS.len(), "{names:?}");
         assert!(
             !names.iter().any(|n| n.ends_with("self.dylib")),
@@ -1290,12 +1280,12 @@ mod tests {
             vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 0x34, 0, 0],
         ));
         for (what, bytes) in cases {
-            match load_dylibs(&bytes) {
+            match load_names(&bytes) {
                 Err(LoadError::Malformed(_)) => {}
                 other => panic!("{what}: {other:?}"),
             }
         }
-        assert!(load_dylibs(&good).is_ok(), "the unmutated fixture reads");
+        assert!(load_names(&good).is_ok(), "the unmutated fixture reads");
     }
 
     /// A real binary reads: the test binary itself and Apple's universal `/bin/ls` each

@@ -10,24 +10,15 @@ use aterm_effects::cursor_glow::{GlowConfig, GlowStyle};
 /// The shipping default config in `style`.
 pub(crate) fn config(style: GlowStyle) -> GlowConfig {
     GlowConfig {
-        classic_mono: false,
-        ribbon_tall: true,
-        ribbon_flat: false,
-        enabled: true,
-        dark_theme: true,
-        theme_fg: 0x00C8_D3F5,
-        theme_bg: 0x001A_1B26,
         style,
         color: 0x00d0_d0d0,
         accent: 0x0048_c9ff,
         duration: Duration::from_millis(650),
         length: usize::MAX,
-        intensity: 1.0,
         audible: true,
         radius: 0.4,
         ring: true,
-        beam: false,
-        head_dx: 0.5,
+        ..Default::default()
     }
 }
 
@@ -36,7 +27,7 @@ pub(crate) fn config(style: GlowStyle) -> GlowConfig {
 /// integrator, `rainbow.disp` stays 0, and only the cheaper resting path is measured.
 #[test]
 fn cursor_rainbow_hot_ribbon_work_stays_below_its_normalized_share() {
-    use aterm_effects::cursor_glow::Geom;
+    use aterm_effects::cursor_glow::{CursorGlow, Geom};
     use std::time::Instant;
     let config = config(GlowStyle::RainbowKitty);
     let geometry = Geom {
@@ -76,12 +67,15 @@ fn cursor_rainbow_hot_ribbon_work_stays_below_its_normalized_share() {
         under > 2_000,
         "fixture must reach the active tall ribbon ({under} quads)"
     );
+    const _: () = assert!(
+        aterm_effects::rainbow_kitty::ribbon::RIBBON_QUAD_BUDGET * 8 == CursorGlow::MAX_QUADS * 5
+    );
     assert!(
-        under * 8 <= 16_384 * 5,
+        under <= aterm_effects::rainbow_kitty::ribbon::RIBBON_QUAD_BUDGET,
         "default tall ribbon spent more than its five-eighths normalized share: {under}"
     );
     assert!(
-        total < 16_384,
+        total < CursorGlow::MAX_QUADS,
         "active rim/ribbon frame must retain global quad headroom: {under} + {}",
         quads.len()
     );

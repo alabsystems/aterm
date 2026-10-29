@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Hand-written verdict sequences through the real tracker.
+//! Hand-written verdict sequences through the real tracker. Each one
+//! [`crate::seq_twins::TURN_TWINS`] names runs there, against its `.seq` file; the rest are tests.
 
 use aterm_slog::{
     Actor, BoxWord, Close, Conf, Key, Kind, Lvl, Op, Out, Rec, RunOut, ShortId, Src, TurnOut,
@@ -48,7 +49,6 @@ fn shown(detail: &str) -> Step {
 
 /// A Claude Code turn with an approval box: the box is a step of the turn,
 /// its need lives while it is up, and the turn's close counts it.
-#[test]
 pub(crate) fn claude_turn_with_an_approval_box() {
     let mut rig = drive(&[See(Verdict::Busy), Half, shown("bash:not-read-only")]);
     let need = rig.log.state().top_need().expect("the box needs someone");
@@ -78,7 +78,6 @@ pub(crate) fn claude_turn_with_an_approval_box() {
 
 /// The AskUserQuestion dialog mid-turn is a `question` step: it never ends
 /// the turn, and its need is `question`.
-#[test]
 pub(crate) fn question_dialog_mid_turn_stays_in_the_turn() {
     let mut rig = drive(&[See(Verdict::Busy), shown("question"), Half, Half, Half]);
     assert!(rig.tracker.turn().is_some(), "the dialog stays in the turn");
@@ -95,7 +94,6 @@ pub(crate) fn question_dialog_mid_turn_stays_in_the_turn() {
 
 /// A usage wall at rest closes its turn `out=wall:usage-session`; the wall
 /// stays open on the run, so its need holds until the wall lifts.
-#[test]
 pub(crate) fn usage_wall_at_rest_closes_the_turn_and_holds_its_need() {
     let reset = ShortId::new("3:15pm").expect("a detail");
     let mut rig = drive(&[
@@ -153,7 +151,6 @@ pub(crate) fn usage_wall_at_rest_closes_the_turn_and_holds_its_need() {
 
 /// The agent leaving (`-`) over an open box closes the box `out=gone`, not
 /// `passed`: nothing on screen moved past it.
-#[test]
 pub(crate) fn agent_leaving_closes_its_box_gone() {
     let rig = drive(&[
         See(Verdict::Busy),
@@ -169,7 +166,6 @@ pub(crate) fn agent_leaving_closes_its_box_gone() {
 
 /// A settled turn is dated when it came to rest: busy for 1 s, then idle,
 /// closes `t=` the idle and `dur_ms=1000`, however late the wake.
-#[test]
 pub(crate) fn a_settled_turn_is_dated_at_its_rest() {
     let mut rig = drive(&[See(Verdict::Busy), Half, Half, See(Verdict::Idle)]);
     let idle_at = WALL0 + rig.now;
@@ -182,7 +178,6 @@ pub(crate) fn a_settled_turn_is_dated_at_its_rest() {
 }
 
 /// A late wake: the idle held past its settle and the next verdict is busy.
-#[test]
 pub(crate) fn a_late_wake_never_merges_two_turns() {
     let rig = drive(&[
         See(Verdict::Busy),
@@ -200,7 +195,6 @@ pub(crate) fn a_late_wake_never_merges_two_turns() {
 
 /// An input stall is a `stall` step with need `unresponsive`; it never
 /// closes the turn, however long it holds.
-#[test]
 pub(crate) fn input_stall_never_closes_the_turn() {
     let mut rig = drive(&[See(Verdict::Busy), See(Verdict::Unresponsive)]);
     for _ in 0..20 {
@@ -222,7 +216,6 @@ pub(crate) fn input_stall_never_closes_the_turn() {
 
 /// Codex's 220 ms mid-answer idle must not close the turn: one turn, closed
 /// once, by the idle that held.
-#[test]
 pub(crate) fn codex_mid_answer_idle_does_not_close_the_turn() {
     let mut rig = drive(&[See(Verdict::Busy), See(Verdict::Idle), Step::Wait(220)]);
     apply_on(&mut rig, See(Verdict::Busy));
@@ -240,7 +233,6 @@ pub(crate) fn codex_mid_answer_idle_does_not_close_the_turn() {
 
 /// An interrupted turn closes `out=interrupted` at its idle, and the clause
 /// says so.
-#[test]
 pub(crate) fn interrupted_turn_closes_interrupted() {
     let mut rig = drive(&[See(Verdict::Busy), Step::Interrupted]);
     for s in [See(Verdict::Idle), Half, Half] {
@@ -255,7 +247,6 @@ pub(crate) fn interrupted_turn_closes_interrupted() {
 }
 
 /// `unknown` is never idle: the turn stays open through it.
-#[test]
 pub(crate) fn unknown_never_closes_a_turn() {
     let mut rig = drive(&[See(Verdict::Busy), See(Verdict::Idle), Half]);
     apply_on(&mut rig, See(Verdict::Unknown));
@@ -269,7 +260,6 @@ pub(crate) fn unknown_never_closes_a_turn() {
 }
 
 /// A prose question closes the turn `asked` at `conf=heuristic`.
-#[test]
 pub(crate) fn prose_question_closes_asked_heuristic() {
     let rig = drive(&[See(Verdict::Busy), See(Verdict::Question), Half, Half]);
     let turn = closes(&rig, Lvl::Turn).pop().expect("closed");
@@ -279,7 +269,6 @@ pub(crate) fn prose_question_closes_asked_heuristic() {
 
 /// `ctl turn` attributes the turn it starts (`by=`, `ledger=`); input older
 /// than 5 s attributes nothing.
-#[test]
 pub(crate) fn ctl_turn_and_input_attribute_the_opening_turn() {
     let mut rig = drive(&[Step::Ctl, Step::Wait(300), See(Verdict::Busy)]);
     let ledger = rig.ledger;
@@ -304,7 +293,6 @@ pub(crate) fn ctl_turn_and_input_attribute_the_opening_turn() {
 /// A harness answering a prose question within the settle: the asked turn
 /// closes at once, dated when the agent asked, and the harness's exchange
 /// is a turn of its own carrying its `by=` and `ledger=`.
-#[test]
 pub(crate) fn ctl_turn_while_resting_starts_its_own_turn() {
     let mut rig = drive(&[See(Verdict::Busy), See(Verdict::Question)]);
     let asked_at = WALL0 + rig.now;
@@ -338,7 +326,6 @@ pub(crate) fn ctl_turn_while_resting_starts_its_own_turn() {
 /// A `ctl turn` queued while the agent is busy labels only a turn that
 /// opens within the attribution window, from its sender: an hour later, a
 /// human's turn never carries it.
-#[test]
 pub(crate) fn a_stale_ledger_labels_no_later_turn() {
     let mut rig = drive(&[See(Verdict::Busy)]);
     checked(&mut rig, Step::Ctl);

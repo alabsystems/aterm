@@ -4,7 +4,7 @@
 
 //! A theme's typography (DTP §3.1).
 
-use crate::scheme::{THEME_KEYS, ThemeKey, ThemeKeyGroup, theme_key_spec};
+use crate::scheme::{THEME_KEYS, ThemeKey, ThemeKeyGroup};
 
 /// Longest font family name a theme may carry, in chars.
 pub const MAX_THEME_FONT_NAME_CHARS: usize = 128;
@@ -497,13 +497,6 @@ pub fn parse_schema(value: &str) -> Result<u16, String> {
     parse_integer(value, 1, u16::MAX)
 }
 
-/// Whether `key` is in the typography group (by its [`THEME_KEYS`] row).
-#[inline]
-#[must_use]
-pub const fn is_typography_key(key: ThemeKey) -> bool {
-    matches!(theme_key_spec(key).group, ThemeKeyGroup::Typography)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,7 +533,6 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{}: {e}", spec.name));
             assert_eq!(parsed.typography.keys(), vec![spec.name], "{}", spec.name);
             assert!(parsed.typography.is_set(spec.key));
-            assert!(is_typography_key(spec.key));
             for written in [
                 to_native_conf_package(&parsed, &["a test"]),
                 to_native_conf_package_commented(&parsed, &[]),

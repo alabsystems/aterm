@@ -351,32 +351,6 @@ fn stdout_write_all(handle: isize, mut data: &[u8]) {
     }
 }
 
-fn push_utf16_unit(unit: u16, pending: &mut Option<u16>, out: &mut Vec<u8>) {
-    fn push_char(c: char, out: &mut Vec<u8>) {
-        let mut buf = [0u8; 4];
-        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-    }
-    if let Some(high) = pending.take() {
-        if (0xDC00..=0xDFFF).contains(&unit) {
-            let c = 0x10000 + ((u32::from(high) - 0xD800) << 10) + (u32::from(unit) - 0xDC00);
-            push_char(
-                char::from_u32(c).unwrap_or(char::REPLACEMENT_CHARACTER),
-                out,
-            );
-            return;
-        }
-        push_char(char::REPLACEMENT_CHARACTER, out);
-    }
-    match unit {
-        0xD800..=0xDBFF => *pending = Some(unit),
-        0xDC00..=0xDFFF => push_char(char::REPLACEMENT_CHARACTER, out),
-        u => push_char(
-            char::from_u32(u32::from(u)).unwrap_or(char::REPLACEMENT_CHARACTER),
-            out,
-        ),
-    }
-}
-
 fn pump_console_input(stdin: isize, master: i32) {
     // SAFETY: zeroed PODs — every field of every record arm is plain data.
     let mut records: [InputRecord; 64] = unsafe { std::mem::zeroed() };
@@ -388,6 +362,13 @@ fn pump_console_input(stdin: isize, master: i32) {
         let ok =
             unsafe { ReadConsoleInputW(stdin, records.as_mut_ptr(), records.len() as u32, &mut n) };
         if ok == 0 || n == 0 {
+            if pending.take().is_some() {
+                let mut buf = [0u8; 4];
+                aterm_pty::write_all(
+                    master,
+                    char::REPLACEMENT_CHARACTER.encode_utf8(&mut buf).as_bytes(),
+                );
+            }
             return;
         }
         let mut bytes: Vec<u8> = Vec::new();
@@ -398,7 +379,11 @@ fn pump_console_input(stdin: isize, master: i32) {
                     let key = unsafe { rec.event.key };
                     if key.key_down != 0 && key.unicode_char != 0 {
                         for _ in 0..key.repeat_count.max(1) {
-                            push_utf16_unit(key.unicode_char, &mut pending, &mut bytes);
+                            crate::windowing::push_utf16_unit(
+                                key.unicode_char,
+                                &mut pending,
+                                &mut bytes,
+                            );
                         }
                     }
                 }

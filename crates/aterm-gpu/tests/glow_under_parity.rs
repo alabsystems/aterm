@@ -620,13 +620,12 @@ fn ribbon_beam_v_train_is_byte_exact_cpu_vs_gpu() {
 /// law and `fs_glow` computes the same law from the instance bytes.
 #[test]
 fn gradient_glow_under_is_byte_exact_cpu_vs_gpu() {
-    gradient_glow_under_parity(false, &ByteExact::default());
+    gradient_glow_under_parity(&ByteExact::default());
 }
 
-fn gradient_glow_under_parity(oracle: bool, exact: &ByteExact) {
+fn gradient_glow_under_parity(exact: &ByteExact) {
     let theme = Theme::default();
     let (mut cpu, mut gpu) = backends(18.0, theme);
-    let _ = oracle;
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (12usize, 40usize);
     let mut term = block_text_term(rows, cols, 1..11);
@@ -724,7 +723,7 @@ fn gradient_glow_under_parity(oracle: bool, exact: &ByteExact) {
     let delta = max_channel_delta(&cpu_grad.pixels, &gpu_grad.pixels);
     let delta_flat = max_channel_delta(&cpu_flat.pixels, &gpu_flat.pixels);
     eprintln!(
-        "gradient glow_under GPU (oracle={oracle}) vs CPU max per-channel delta = {delta} ({} \
+        "gradient glow_under GPU vs CPU max per-channel delta = {delta} ({} \
          quads); flat twin = {delta_flat}",
         input.glow_under.len()
     );
@@ -743,5 +742,95 @@ fn gradient_glow_under_parity(oracle: bool, exact: &ByteExact) {
             delta_flat,
             format_args!("the flat twin must be BYTE-EXACT CPU==GPU (got {delta_flat})"),
         );
+    }
+}
+
+/// §15.2 1.9, §4 rule 1: a selected word under the light glass shows its selection on both
+/// backends. The glass laid across a Default Light row whose word `two` is selected yields
+/// there (`aterm_effects::cursor_glow::glass_yield`): each selected cell draws as it draws with
+/// no glass at all, on the CPU and on the GPU, while the theme's words beside it keep their
+/// glass. Negative control: the glass laid whole tints the selection.
+#[test]
+fn a_selected_word_under_the_light_glass_shows_its_selection() {
+    use aterm_core::render::GlowRamps;
+    use aterm_core::selection::{SelectionSide, SelectionType};
+    use aterm_effects::cursor_glow::glass_yield::{GlassLaid, GlassYield};
+    let (fg, bg) = (0x002B_2D33, 0x00F6_F7F9);
+    let theme = Theme::default();
+    let (mut cpu, mut gpu) = backends(18.0, theme);
+    gpu.set_bloom(false);
+    let mut win = aterm_gpu::WindowGpu::new();
+    let (cw, ch) = cpu.cell_size();
+    let (rows, cols) = (3usize, 16usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.process(b"\x1b]10;rgb:2b/2d/33\x07\x1b]11;rgb:f6/f7/f9\x07one two three");
+    let selection = term.text_selection_mut();
+    selection.start_selection(0, 4, SelectionSide::Left, SelectionType::Simple);
+    selection.update_selection(0, 6, SelectionSide::Right);
+    selection.complete_selection();
+    let mut base = term.cell_frame(rows, cols);
+    base.cursor_visible = false;
+    base.selection_bg = 0x00B4_D5FE;
+    let glass = GlowQuad {
+        row: 0,
+        x: 0,
+        y: 0,
+        w: (cols * cw) as u16,
+        h: ch as u16,
+        color: 0x005A_4B00,
+        alpha: 90,
+        color2: 0x005A_4B00,
+        alpha2: 90,
+    };
+    let mut whole = base.clone();
+    whole.glow_under = vec![glass];
+    let mut yielded = whole.clone();
+    let laid = GlassLaid::new(
+        std::time::Instant::now(),
+        (vec![glass], GlowRamps::default()),
+        (fg, bg),
+        (0, 0, cw as i32, ch as i32),
+        None,
+    );
+    let report = GlassYield::default().apply(&mut yielded, &laid, &[]);
+    assert!(report.cut(), "premise: the selection yields the glass");
+    let cell = |f: &aterm_render::Frame, col: usize| -> Vec<u32> {
+        (0..ch)
+            .flat_map(|y| (col * cw..(col + 1) * cw).map(move |x| f.pixels[y * f.width + x]))
+            .collect()
+    };
+    for (name, plain, yielded_frame, whole_frame) in [
+        (
+            "CPU",
+            cpu.render_input(&base),
+            cpu.render_input(&yielded),
+            cpu.render_input(&whole),
+        ),
+        (
+            "GPU",
+            gpu.render_input(&mut win, &base, None),
+            gpu.render_input(&mut win, &yielded, None),
+            gpu.render_input(&mut win, &whole, None),
+        ),
+    ] {
+        for col in 4..7 {
+            assert_eq!(
+                cell(&yielded_frame, col),
+                cell(&plain, col),
+                "{name}: the selected cell {col} draws as it does with no glass"
+            );
+            assert_ne!(
+                cell(&whole_frame, col),
+                cell(&plain, col),
+                "{name}, control: the whole glass tints the selected cell {col}"
+            );
+        }
+        for col in [0, 1, 2, 9, 10] {
+            assert_eq!(
+                cell(&yielded_frame, col),
+                cell(&whole_frame, col),
+                "{name}: the theme's cell {col} keeps its glass"
+            );
+        }
     }
 }

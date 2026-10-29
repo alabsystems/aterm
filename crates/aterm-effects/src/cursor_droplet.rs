@@ -400,7 +400,8 @@ impl CursorDroplet {
         // are cut at the row's foot, the water's surface: the near side of a
         // ring is under it, and a drop falls through it.
         let surface_from = out.len();
-        if e > 0.0 {
+        let cov_ring_scale = cov_core * 0.55 * e;
+        if cov_ring_scale >= 1.0 {
             let ring_rgb = water_ramp(0.74 + 0.10 * e);
             let y0 = cy + radius * 0.88;
             let halves = [0.0f32, 0.5];
@@ -410,8 +411,8 @@ impl CursorDroplet {
                 hi += 1;
                 let u = (self.ripple + half).fract();
                 let one_minus_u = 1.0 - u;
-                let env = one_minus_u * crate::color_math::sqrt_f32(one_minus_u) * e;
-                let cov = (cov_core * 0.55 * env).min(COV_CAP) as u8;
+                let env = one_minus_u * crate::color_math::sqrt_f32(one_minus_u);
+                let cov = (cov_ring_scale * env).min(COV_CAP) as u8;
                 if cov == 0 {
                     continue;
                 }
@@ -428,8 +429,9 @@ impl CursorDroplet {
         let cut_surface = !self.uncut;
         #[cfg(not(test))]
         let cut_surface = true;
+        const DRIP_BODY_RGB: u32 = water_ramp(0.68);
         let belly = cy + radius * 0.80;
-        let body = water_ramp(0.68);
+        let body = DRIP_BODY_RGB;
         let cov_drip = cov_core * 0.70;
         let r_grow = radius * 0.08;
         let r_fall = 1.2 + radius * 0.05;
@@ -454,6 +456,9 @@ impl CursorDroplet {
                     cov_drip * (1.0 - v),
                 )
             };
+            if cov < 1.0 {
+                continue;
+            }
             let ry = r * stretch;
             if cut_surface && (y - ry).floor() as i32 >= foot {
                 continue;
@@ -462,7 +467,7 @@ impl CursorDroplet {
             let x = cx + dx * cw + (phase_sin * cos_do + phase_cos * sin_do) * 1.5;
             push_soft_disc(out, geom, (x, y), (r, ry), body, cov.min(COV_CAP));
         }
-        if !cut_surface {
+        if !cut_surface || out.len() <= surface_from {
             return;
         }
         cut_at_surface(out, surface_from, foot);

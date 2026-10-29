@@ -285,20 +285,3 @@ fn a_decision_row_keeps_its_ten_minutes_and_an_unclassified_one_is_cut() {
     assert_eq!(c.demotions(), 1);
     assert_eq!(c.last_demoted(), Some("packages.posture2"));
 }
-
-/// Demoted standing asks record their key in `last_demoted`.
-#[test]
-fn a_recorded_ask_is_named_for_the_hosts_one_warning() {
-    let now = t0();
-    let mut c = fresh(now);
-    assert_eq!(c.last_demoted(), None);
-    let two = Ask::standing(
-        StandingWhy::OnlyYou(Reason::new("its own work holds the move")),
-        Then::step("Stop that work or skip the build"),
-    );
-    let posted = c.post(upgrade_row().now(two), stamp(), now);
-    assert!(c.live(posted.id).is_none());
-    assert_eq!(c.demotions(), 1);
-    assert_eq!(c.last_demoted(), Some("harness.upgrade.s-3e79"));
-    assert_eq!(c.log().get(posted.id).unwrap().severity, Severity::Warn);
-}

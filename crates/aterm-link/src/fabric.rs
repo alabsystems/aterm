@@ -61,15 +61,18 @@ file `fabric.toml` that `on` writes, else in a running instance's bridge command
   --json           status: one JSON object of the same data; brief: one object whose
                    `sessions` each carry these keys:
 @SESSION_KEYS@
-                   tail: one object per record, one per line, with these keys (`node`
-                   and `sid` null where the subject names none; `body` only with
-                   --bodies):
+                   tail: one object per record, one per line, offsets strictly
+                   increasing (so `--from` the last `off` plus one misses none), with
+                   these keys (`node` and `sid` null where the subject names none;
+                   `body` only with --bodies):
 @TAIL_KEYS@
                    and, where retention gave records up before it read them, one
                    {\"gap\":{...}} line
   tail             stream bus records as they land, until Ctrl-C
   --from <offset>  tail: replay from bus offset <offset> first
-  --bodies         tail: print each record's text after its trust label (--json: `body`)
+  --bodies         tail: print each record's text after its trust label (--json:
+                   `body`); an `ev` record's text is the session log's bus line, whose
+                   grammar `aterm help fabric` gives under THE SESSION LOG ON THE BUS
   --filter <f>     tail: one full subject pattern, `/f/<F>/…` (`*` one segment, `>`
                    the rest), instead of the whole fleet
   brief            fold each session's mirrored log into a few lines (need, open work,
@@ -81,7 +84,8 @@ file `fabric.toml` that `on` writes, else in a running instance's bridge command
                    the broker under launchd (macOS) or systemd --user (Linux); write
                    `[fabric] command` to aterm.toml (keeping `.bak`) and `fabric.toml`
                    (0600); attach running instances; prove delivery with a note a session
-                   posts to itself; print `status`
+                   posts to itself; print `status`. An aterm window's converge pass runs
+                   these steps (the proof aside) wherever the fabric was never turned off
   --dry-run        on/off: print every step, change nothing
   --fleet <F>      on, mint-for: the fleet (`/f/<F>/`; default the configured one, else
                    `local`)
@@ -100,8 +104,11 @@ file `fabric.toml` that `on` writes, else in a running instance's bridge command
                    always flush in full before their ack. A clean stop flushes and closes
                    the log; after an unclean reboot the log's generation advances, and
                    bridges and notifiers resume without skipping mail
-  off              stop and remove the broker job, `[fabric]` in aterm.toml (keeping
-                   `.bak`) and `fabric.toml`; the node id, secret, cap and bus log stay
+  off              record the off (`fabric-off` in the root: the converge pass, which
+                   turns the fabric on by default, leaves it off until `on`; an off waits
+                   for a turn-on the pass is making), stop and remove the broker job,
+                   `[fabric]` in aterm.toml (keeping `.bak`) and `fabric.toml`; the node
+                   id, secret, cap and bus log stay
   doctor           print the broker's durability, health and holds, then each warning
                    with its fix; `--retire-ghosts` lists the live presence rows of this
                    machine's nodes that no instance hosts and, after y/N or `--yes`,
@@ -168,8 +175,26 @@ const TRAFFIC_SCAN_MAX: u64 = 1 << 20;
 pub const STALE_WORK_MS: u64 = 10 * 60 * 1000;
 
 /// The bound on every socket this report and the operator's one-shot broker commands open: the
-/// dial, and each read and write ([`transport::connect`]).
+/// dial, and each read and write ([`transport::connect`]). This module, the roster (`cli`) and
+/// the brief read it through [`io_timeout`]; a person's commands (`person`) keep it fixed,
+/// beneath their subscription's silence bound.
 pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The development seam that replaces [`IO_TIMEOUT`] (milliseconds; debug builds and
+/// `dev-seams` only): a test on a loaded machine bounds these sockets, the doctor's read of an
+/// instance among them, within its one-minute hang detector, so an instance or broker the load
+/// keeps from answering for 3 s is waited for rather than reported as unanswerable.
+const IO_TIMEOUT_SEAM: &str = "ATERM_FABRIC_IO_TIMEOUT_MS";
+
+/// [`IO_TIMEOUT`], or the [`IO_TIMEOUT_SEAM`] a development build was given.
+pub(crate) fn io_timeout() -> Duration {
+    static AT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        aterm_types::dev_seam!(IO_TIMEOUT_SEAM)
+            .and_then(|ms| ms.to_str()?.parse::<u64>().ok())
+            .map_or(IO_TIMEOUT, Duration::from_millis)
+    })
+}
 
 const WORK_KINDS: [&str; 2] = ["task", "ask"];
 
@@ -482,7 +507,36 @@ pub fn config_path() -> Option<PathBuf> {
 /// with, as the argv it names. Either spelling ([`aterm_types::fabric_command`]): a string
 /// split on whitespace, or an array of strings taken word for word.
 pub fn command_in_toml(text: &str) -> Result<Option<Vec<String>>, String> {
-    fabric_key(text, "command", command_of)
+    let table: aterm_toml::Table =
+        aterm_toml::from_str(text).map_err(|e| format!("not valid TOML: {e}"))?;
+    if !swarm_enabled_in_table(&table)? {
+        return Ok(None);
+    }
+    let Some(fabric) = table.get("fabric") else {
+        return Ok(None);
+    };
+    let Some(fabric) = fabric.as_table() else {
+        return Err("`fabric` is not a table".to_string());
+    };
+    fabric.get("command").map_or(Ok(None), command_of)
+}
+
+fn swarm_enabled_in_table(table: &aterm_toml::Table) -> Result<bool, String> {
+    let Some(swarm) = table.get("swarm") else {
+        return Ok(true);
+    };
+    let Some(swarm) = swarm.as_table() else {
+        return Err("`swarm` is not a table".to_string());
+    };
+    if swarm.keys().any(|key| key != "enabled") {
+        return Err("unknown `[swarm]` setting".to_string());
+    }
+    match swarm.get("enabled") {
+        None => Ok(true),
+        Some(v) => v
+            .as_bool()
+            .ok_or_else(|| "`[swarm] enabled` is not a boolean".to_string()),
+    }
 }
 
 /// [`command_in_toml`]'s reading of one `command` value — aterm.toml's or the rendezvous file's.
@@ -1137,9 +1191,24 @@ pub(crate) fn reach_broker(cfg: &Config) -> (BrokerView, Option<Conn>) {
     )
 }
 
+/// Whether a broker answers on `endpoint`: one connect and a `Hello` round trip, in this build's
+/// astream protocol or another (a broker answers either way). Nothing is attached or read.
+///
+/// # Errors
+/// Why none answered: the connect, or a socket that accepted and answered no `Hello`.
+pub(crate) fn answers(endpoint: &str) -> Result<(), String> {
+    let (mut conn, _closer) =
+        transport::connect(endpoint, io_timeout()).map_err(|e| format!("connect: {e}"))?;
+    match conn.hello() {
+        Ok(_) => Ok(()),
+        Err(e) if astream_broker::protocol_mismatch(&e).is_some() => Ok(()),
+        Err(e) => Err(format!("the socket accepted but no broker answered: {e}")),
+    }
+}
+
 fn reach(cfg: &Config, mut view: BrokerView) -> (BrokerView, Option<Conn>) {
     let started = Instant::now();
-    let mut conn = match transport::connect(&cfg.broker, IO_TIMEOUT) {
+    let mut conn = match transport::connect(&cfg.broker, io_timeout()) {
         Ok((c, _)) => c,
         Err(e) => {
             view.error = Some(format!("connect: {e}"));
@@ -1719,7 +1788,8 @@ pub struct Overdue {
     pub expired: Option<bool>,
 }
 
-const OVERDUE_SCAN_SPAN: u64 = 1 << 16;
+/// How far below the head the deadline scan ([`overdue_work`]) reads for asks.
+pub(crate) const OVERDUE_SCAN_SPAN: u64 = 1 << 16;
 
 /// The overdue asks on the fleet's `in` lanes (or the `in` faces of `faces`) within the last
 /// [`OVERDUE_SCAN_SPAN`] offsets, read TOLD ([`transport::fetch_told_kept`]). Those lanes span
@@ -1734,14 +1804,17 @@ const OVERDUE_SCAN_SPAN: u64 = 1 << 16;
 /// listed only while every `answer`, `report` and `ack` that could reach its asker's lane
 /// above it is kept (retention gives up the asker node's read mail with the cut while it
 /// holds the ask, so a reply given up beside a held ask would read as none), and its
-/// `expired` is `None` where the asker's `expired` verdicts above it are not all kept.
+/// `expired` is `None` where the asker's `expired` verdicts above it are not all kept. An
+/// ask past its deadline that is so left out is counted ([`Deadlines::unjudged`]), never
+/// listed: a reply given up above it may have been its answer or another ask's (audit
+/// finding BUS2-3).
 fn overdue_work(
     conn: &mut Conn,
     fleet: &str,
     faces: Option<&[String]>,
     head: u64,
     now_ms: u64,
-) -> io::Result<Vec<Overdue>> {
+) -> io::Result<Deadlines> {
     let filters = in_filters(fleet, faces);
     let mut scan = OverdueScan::default();
     let mut fed: BTreeSet<u64> = BTreeSet::new();
@@ -1762,10 +1835,11 @@ fn overdue_work(
         }
     }
     let mut oldest = BTreeMap::new();
-    let mut overdue = Vec::new();
+    let mut found = Deadlines::default();
     for (mut o, lane) in scan.finish_on_lanes(now_ms) {
         let above = o.off.saturating_add(1);
         if !verdicts_kept(conn, &mut oldest, &filters, &lane, &ANSWER_KINDS, above)? {
+            found.unjudged = found.unjudged.saturating_add(1);
             continue;
         }
         if o.expired == Some(false)
@@ -1773,9 +1847,20 @@ fn overdue_work(
         {
             o.expired = None;
         }
-        overdue.push(o);
+        found.overdue.push(o);
     }
-    Ok(overdue)
+    Ok(found)
+}
+
+/// What the deadline scan ([`overdue_work`]) found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Deadlines {
+    /// The asks past their deadline with no verdict, judged on verdicts the bus keeps.
+    overdue: Vec<Overdue>,
+    /// The asks past their deadline it cannot judge: the bus no longer keeps every `answer`,
+    /// `report` and `ack` above them on their asker's lane (or no face read reaches it), so it
+    /// cannot say whether they had one.
+    unjudged: usize,
 }
 
 /// Whether the bus keeps, from `from` on, every record of `kinds` on the asker's `lane`
@@ -2005,8 +2090,58 @@ pub struct LocalSession {
     pub hold_why: Option<(String, String)>,
     /// The broadcast topics this session has opted into (`topic ls`), in topic order.
     pub topics: Vec<String>,
+    /// The inbox header's `given_up=` (with `given_up_count=`): the newest range of this node's
+    /// unread mail the broker's retention gave up before the bridge read it, as told to this
+    /// session.
+    pub given_up: Option<GivenUpRange>,
+    /// The inbox header's `lane_given_up=`: the newest range of this session's own lane given up
+    /// before it handled the mail there.
+    pub lane_given_up: Option<GivenUpRange>,
+    /// The `topic ls` rows' `given_up=`: per topic, the newest range of its broadcasts given up
+    /// before they were replayed to this session, in topic order.
+    pub topic_given_up: Vec<(String, GivenUpRange)>,
     /// A ctl read that failed for this session.
     pub error: Option<String>,
+}
+
+/// A range of bus offsets the broker's retention gave up, as an instance names one:
+/// `@<from>..@<to>` (`inbox`'s `given_up=` and `lane_given_up=`, a `topic ls` row's `given_up=`,
+/// `fabric status`'s `mail_gap=`), and its records where the broker counted them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GivenUpRange {
+    pub from: u64,
+    pub to: u64,
+    pub records: Option<u64>,
+}
+
+impl GivenUpRange {
+    /// `@<from>..@<to>` (`from <= to`), and `count` as its records where it is a number.
+    #[must_use]
+    pub fn parse(range: &str, count: Option<&str>) -> Option<Self> {
+        let (from, to) = range.strip_prefix('@')?.split_once("..@")?;
+        let (from, to) = (from.parse::<u64>().ok()?, to.parse::<u64>().ok()?);
+        (from <= to).then(|| Self {
+            from,
+            to,
+            records: count.and_then(|n| n.parse().ok()),
+        })
+    }
+
+    /// `@<from>..@<to>`, as the instance named it.
+    #[must_use]
+    pub fn range(&self) -> String {
+        format!("@{}..@{}", self.from, self.to)
+    }
+
+    /// The range, and its records where they were counted: `@10..@42 (3 records)`.
+    #[must_use]
+    pub fn said(&self) -> String {
+        match self.records {
+            Some(1) => format!("{} (1 record)", self.range()),
+            Some(n) => format!("{} ({n} records)", self.range()),
+            None => self.range(),
+        }
+    }
 }
 
 /// What one local instance says about itself.
@@ -2035,6 +2170,13 @@ pub struct InstanceView {
     pub bridge_build: Option<String>,
     /// `fabric status`'s `lane_faults=`: bridge lines the instance could not parse.
     pub lane_faults: Option<u64>,
+    /// `fabric status`'s `mail_gaps=`: the ranges of this node's unread mail its bridges told it
+    /// the broker's retention gave up before they read them, since the instance started; absent
+    /// before the first, and from an instance that predates the field.
+    pub mail_gaps: Option<u64>,
+    /// `fabric status`'s `mail_gap=` (with `mail_gap_count=`): the newest of those ranges, while
+    /// its offsets name the bridge's log.
+    pub mail_gap: Option<GivenUpRange>,
     /// The command it runs (or was launched with), decoded into its argv ([`status_argv`]).
     pub command: Option<Vec<String>>,
     /// The program that command runs ([`bridge_program`]), resolved when the report was read so
@@ -2086,6 +2228,9 @@ pub fn fill_inbox(s: &mut LocalSession, header0: &str, posts: &[String], full: &
     s.seen = num("seen");
     s.dropped = num("dropped");
     s.pending = num("pending");
+    s.given_up =
+        kv(header0, "given_up").and_then(|r| GivenUpRange::parse(r, kv(header0, "given_up_count")));
+    s.lane_given_up = kv(header0, "lane_given_up").and_then(|r| GivenUpRange::parse(r, None));
     s.posts = Some(posts.iter().filter(|r| r.starts_with("post ")).count() as u64);
     let seen = s.seen.unwrap_or(0);
     s.unhandled = full
@@ -2106,6 +2251,22 @@ pub fn fill_inbox(s: &mut LocalSession, header0: &str, posts: &[String], full: &
         .filter(|m| m.id > seen)
         .collect();
     s.unread = Some((s.unhandled.len() as u64).saturating_sub(s.pending.unwrap_or(0)));
+}
+
+/// Fill a session's topics, and the range of each that retention gave up, from its `topic ls`
+/// rows (`topic <t> since=<s>[ given_up=@<a>..@<b>]`).
+pub fn fill_topics(s: &mut LocalSession, rows: &[String]) {
+    s.topics.clear();
+    s.topic_given_up.clear();
+    for rest in rows.iter().filter_map(|row| row.strip_prefix("topic ")) {
+        let Some(topic) = rest.split_whitespace().next() else {
+            continue;
+        };
+        s.topics.push(topic.to_string());
+        if let Some(gap) = kv(rest, "given_up").and_then(|r| GivenUpRange::parse(r, None)) {
+            s.topic_given_up.push((topic.to_string(), gap));
+        }
+    }
 }
 
 /// The `(reason, origins)` of the last `kind=hold` transition in a `timeline` reply, when it
@@ -2160,13 +2321,7 @@ fn read_session(ctl: &mut Ctl, sid: &str) -> LocalSession {
             }
         }
         if let Ok(t) = ask(ctl, &format!("@{sid} topic ls")) {
-            s.topics = t
-                .rows()
-                .iter()
-                .filter_map(|row| row.strip_prefix("topic "))
-                .filter_map(|rest| rest.split_whitespace().next())
-                .map(str::to_string)
-                .collect();
+            fill_topics(&mut s, t.rows());
         }
         Ok(())
     })();
@@ -2192,7 +2347,7 @@ fn read_instance(pid: u32, sock: &str, procs: &[Proc], sessions: bool) -> Option
         })
         .map(|p| p.pid)
         .collect();
-    let mut ctl = match open_instance(pid, sock, IO_TIMEOUT) {
+    let mut ctl = match open_instance(pid, sock, io_timeout()) {
         Ok(Some(c)) => c,
         Ok(None) => return None,
         Err(e) => {
@@ -2213,6 +2368,9 @@ fn read_instance(pid: u32, sock: &str, procs: &[Proc], sessions: bool) -> Option
                 .filter(|b| *b != "-")
                 .map(str::to_string);
             v.lane_faults = kv(h, "lane_faults").and_then(|n| n.parse().ok());
+            v.mail_gaps = kv(h, "mail_gaps").and_then(|n| n.parse().ok());
+            v.mail_gap =
+                kv(h, "mail_gap").and_then(|r| GivenUpRange::parse(r, kv(h, "mail_gap_count")));
             v.command = status_argv(h);
             v.program = v.command.as_deref().and_then(bridge_program);
         }
@@ -2402,6 +2560,10 @@ pub struct Report {
     /// listed, as status cannot say it had none, and `expired` is `None` where the asker's
     /// `expired` verdicts above it are not all kept.
     pub overdue: Vec<Overdue>,
+    /// How many asks past their `dl=` the deadline scan left out of `overdue` because the bus no
+    /// longer keeps every verdict above them on their asker's lane: one warning names the count
+    /// (audit finding BUS2-3).
+    pub overdue_unjudged: usize,
     /// WARNINGS.
     pub warnings: Vec<String>,
     /// When the report was taken, ms since the epoch.
@@ -2533,6 +2695,7 @@ pub fn gather() -> Result<Report, Off> {
         exited: 0,
         traffic: Vec::new(),
         overdue: Vec::new(),
+        overdue_unjudged: 0,
         warnings: Vec::new(),
         now_ms,
     };
@@ -2567,7 +2730,10 @@ pub fn gather() -> Result<Report, Off> {
         }
         halts = fleet_halts(&mut conn, &report.cfg.fleet);
         match overdue_work(&mut conn, &report.cfg.fleet, faces.as_deref(), head, now_ms) {
-            Ok(o) => report.overdue = o,
+            Ok(d) => {
+                report.overdue = d.overdue;
+                report.overdue_unjudged = d.unjudged;
+            }
             Err(e) => bus_errors.push(format!("the deadlines could not be read: {e}")),
         }
         let in_filters = in_filters(&report.cfg.fleet, faces.as_deref());
@@ -2751,6 +2917,114 @@ pub fn age(ms: u64) -> String {
         3600..=86_399 => format!("{}h", s / 3600),
         _ => format!("{}d", s / 86_400),
     }
+}
+
+/// The words each warning of records the broker's retention gave up says what happened with,
+/// which `doctor` matches for its fix ([`crate::enable::fix_for`]).
+pub const RETENTION_GAVE_UP: &str = "the broker's retention gave up";
+
+/// The words of the warning that counts the asks past their deadline the deadline scan cannot
+/// judge ([`Report::overdue_unjudged`]), which `doctor` matches for its fix
+/// ([`crate::enable::fix_for`]).
+pub const OVERDUE_UNJUDGED: &str = "past their deadline cannot be judged";
+
+/// How many ranges one warning names before it counts the rest.
+const GAP_RANGES_SHOWN: usize = 4;
+
+/// `told` as the ranges of records they name, lowest first: ranges that overlap are one (a
+/// later gap notice on one subscription can overlap an earlier one, astream's `Gap::and`; a new
+/// subscription's notice can cover the last), carrying the first count of a range told that is
+/// the whole merged range and none where every count is of a part of it; ranges that only touch
+/// stay apart, and an empty range is no loss.
+fn merged_ranges(told: &[GivenUpRange]) -> Vec<GivenUpRange> {
+    let mut spans: Vec<GivenUpRange> = Vec::new();
+    let mut sorted: Vec<&GivenUpRange> = told.iter().filter(|g| g.from < g.to).collect();
+    sorted.sort_by_key(|g| (g.from, g.to));
+    for g in sorted {
+        match spans.last_mut() {
+            Some(span) if g.from < span.to => span.to = span.to.max(g.to),
+            _ => spans.push(GivenUpRange {
+                from: g.from,
+                to: g.to,
+                records: None,
+            }),
+        }
+    }
+    for span in &mut spans {
+        span.records = told
+            .iter()
+            .filter(|g| (g.from, g.to) == (span.from, span.to))
+            .find_map(|g| g.records);
+    }
+    spans
+}
+
+/// The warning for this node's unread mail that one instance's bridges were told the broker's
+/// retention gave up before they read it (`link gap` with no `sid=`, the inbox group's gap
+/// notice), or `None`. It names the ranges the instance's counter names (`fabric status`'s
+/// `mail_gaps=` and newest `mail_gap=`) and those its sessions still name (`inbox`'s
+/// `given_up=`, which a seamless update carries and the counter does not), ranges that overlap
+/// as one ([`merged_ranges`]), newest first, so a range told to every session is one warning,
+/// not one per session.
+fn node_mail_given_up(inst: &InstanceView) -> Option<String> {
+    let told = inst.mail_gaps.filter(|k| *k > 0);
+    let named: Vec<GivenUpRange> = inst
+        .mail_gap
+        .iter()
+        .chain(inst.sessions.iter().filter_map(|s| s.given_up.as_ref()))
+        .copied()
+        .collect();
+    let ranges = merged_ranges(&named);
+    if told.is_none() && ranges.is_empty() {
+        return None;
+    }
+    let since = told.map_or_else(String::new, |k| {
+        format!(" ({k} range(s) since the instance started)")
+    });
+    let named = if ranges.is_empty() {
+        ", its offsets on a bus log since replaced".to_string()
+    } else {
+        let shown: Vec<String> = ranges
+            .iter()
+            .rev()
+            .take(GAP_RANGES_SHOWN)
+            .map(GivenUpRange::said)
+            .collect();
+        let more = ranges.len().saturating_sub(GAP_RANGES_SHOWN);
+        let more = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        format!(": {}{more}", shown.join(", "))
+    };
+    Some(format!(
+        "instance {}: {RETENTION_GAVE_UP} this node's unread mail before its bridge read \
+         it{since}{named}; the sessions it served then were told (`inbox` given_up=, a `mail-gap` \
+         mark in each log)",
+        inst.pid
+    ))
+}
+
+/// What the broker's retention gave up of one session's own before it handled it, or `None`:
+/// its mail lane's newest range (`inbox`'s `lane_given_up=`, the bridge's own read of the lane
+/// met the floor) and each topic's (`topic ls`'s `given_up=`, the bridge's replay of the topic
+/// met it), each with the field that names it.
+fn session_given_up(s: &LocalSession) -> Option<String> {
+    let mut parts: Vec<String> = s
+        .lane_given_up
+        .iter()
+        .map(|g| format!("its mail lane {} (`inbox` lane_given_up=)", g.said()))
+        .collect();
+    let topics: Vec<String> = s
+        .topic_given_up
+        .iter()
+        .map(|(topic, g)| format!("topic {} {}", safe(topic, 64), g.said()))
+        .collect();
+    if !topics.is_empty() {
+        parts.push(format!("{} (`topic ls` given_up=)", topics.join(", ")));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 fn warnings(
@@ -2961,6 +3235,9 @@ fn warnings(
                  the mail they carried is held back on the bus, not lost"
             ));
         }
+        if let Some(line) = node_mail_given_up(inst) {
+            w.push(line);
+        }
         let program_differs = inst.program.is_some() && inst.program != r.program;
         if inst.supervised == Some(true)
             && (inst.command.as_deref().and_then(serve_flags) != config_flags || program_differs)
@@ -3035,6 +3312,11 @@ fn warnings(
                      (dropped={n})"
                 ));
             }
+            if let Some(lost) = session_given_up(s) {
+                w.push(format!(
+                    "{at}: {RETENTION_GAVE_UP} records of its own before it handled them: {lost}"
+                ));
+            }
             if s.hold == Some(1) {
                 let why = s.hold_why.as_ref().map_or_else(
                     || "reason and origin no longer in its timeline".to_string(),
@@ -3099,6 +3381,14 @@ fn warnings(
                 Some(false) => "not yet recorded expired by the asker's bridge",
                 None => "whether the asker's bridge recorded it expired is not kept on the bus",
             }
+        ));
+    }
+    if r.overdue_unjudged > 0 {
+        w.push(format!(
+            "{} held ask(s) {OVERDUE_UNJUDGED}: the bus no longer keeps (or this cap does not \
+             read) every answer, report and ack above them on their asker's lane, so status \
+             cannot say whether they had one",
+            r.overdue_unjudged
         ));
     }
     let answered = every_instance_answered(r);
@@ -3287,7 +3577,7 @@ fn report_node(report: &Report) -> io::Result<&str> {
 }
 
 fn connect_attached(cfg: &Config) -> io::Result<Conn> {
-    let (mut conn, _closer) = transport::connect(&cfg.broker, IO_TIMEOUT)?;
+    let (mut conn, _closer) = transport::connect(&cfg.broker, io_timeout())?;
     transport::attach_cap_files(&mut conn, &cfg.cap_files)?;
     Ok(conn)
 }
@@ -3498,7 +3788,7 @@ pub(crate) fn node_hosted() -> Result<BTreeMap<String, u32>, String> {
     let mut hosted = BTreeMap::new();
     for (pid, sock) in listed {
         let Some(mut ctl) =
-            open_instance(pid, &sock, IO_TIMEOUT).map_err(|e| format!("instance {pid}: {e}"))?
+            open_instance(pid, &sock, io_timeout()).map_err(|e| format!("instance {pid}: {e}"))?
         else {
             continue;
         };
@@ -4133,6 +4423,15 @@ pub fn render_json(r: &Report) -> String {
                 ),
                 ("program", J::opt_s(i.program.as_deref())),
                 ("node", J::opt_s(i.node.as_deref())),
+                ("mail_gaps", J::opt_n(i.mail_gaps)),
+                (
+                    "mail_gap",
+                    J::opt_s(i.mail_gap.map(|g| g.range()).as_deref()),
+                ),
+                (
+                    "mail_gap_count",
+                    J::opt_n(i.mail_gap.and_then(|g| g.records)),
+                ),
                 ("error", J::opt_s(i.error.as_deref())),
             ])
         })
@@ -4192,6 +4491,35 @@ pub fn render_json(r: &Report) -> String {
                     "topics",
                     l.map_or(J::Null, |l| {
                         J::Arr(l.topics.iter().map(|t| J::s(t)).collect())
+                    }),
+                ),
+                (
+                    "given_up",
+                    J::opt_s(l.and_then(|l| l.given_up).map(|g| g.range()).as_deref()),
+                ),
+                (
+                    "given_up_count",
+                    J::opt_n(l.and_then(|l| l.given_up).and_then(|g| g.records)),
+                ),
+                (
+                    "lane_given_up",
+                    J::opt_s(
+                        l.and_then(|l| l.lane_given_up)
+                            .map(|g| g.range())
+                            .as_deref(),
+                    ),
+                ),
+                (
+                    "topics_given_up",
+                    l.map_or(J::Null, |l| {
+                        J::Arr(
+                            l.topic_given_up
+                                .iter()
+                                .map(|(t, g)| {
+                                    J::Obj(vec![("topic", J::s(t)), ("given_up", J::s(&g.range()))])
+                                })
+                                .collect(),
+                        )
                     }),
                 ),
                 ("error", J::opt_s(l.and_then(|l| l.error.as_deref()))),
@@ -4319,6 +4647,7 @@ pub fn render_json(r: &Report) -> String {
                     .collect(),
             ),
         ),
+        ("overdue_unjudged", J::Num(r.overdue_unjudged as u64)),
         (
             "warnings",
             J::Arr(r.warnings.iter().map(|w| J::s(w)).collect()),
@@ -4583,7 +4912,7 @@ fn tail(
     out: &mut impl Write,
 ) -> io::Result<()> {
     let broker = safe(&cfg.broker, 256);
-    let (mut conn, closer) = transport::connect(&cfg.broker, IO_TIMEOUT)
+    let (mut conn, closer) = transport::connect(&cfg.broker, io_timeout())
         .map_err(|e| io::Error::new(e.kind(), format!("the broker at {broker}: {e}")))?;
     transport::attach_cap_files(&mut conn, &cfg.cap_files)?;
     let whole = match want {
@@ -4654,8 +4983,8 @@ fn tail(
         return Ok(());
     }
     if let Some(faces) = faces {
-        drop(conn);
-        return tail_faces(cfg, &faces, start, fmt, out);
+        closer.set_read_timeout(Some(astream_broker::IDLE_MARK_DEADLINE))?;
+        return tail_faces(cfg, &mut conn, &faces, start, fmt, out);
     }
     let mut sub = conn.subscribe(start, &filter)?;
     closer.set_read_timeout(None)?;
@@ -4702,14 +5031,223 @@ fn silent_link(e: io::Error, broker: &str) -> io::Error {
     }
 }
 
-/// What one face's reader hands [`tail_faces`]: a record, or a gap retention made in it.
+/// What one face's reader hands [`tail_faces`]: a record, where its stream stands, or a gap
+/// retention made in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum FaceRead {
     Record(u64, String, Vec<u8>),
-    Gap(String, astream_broker::Gap),
+    /// The stream's `Mark`: it delivered every record of its face below this offset, and it is
+    /// caught up (the first one), or idle since (each later one).
+    Caught(u64),
+    Gap(astream_broker::Gap),
 }
 
+/// How many records [`tail_faces`] holds for a face still delivering its backlog before it
+/// reads that face on by a fetch instead of waiting for its stream.
+const FACE_HOLD_MAX: usize = 4096;
+
+/// THE FACES MERGED BY OFFSET (audit finding BUS2-5): [`tail_faces`] reads each face on its own
+/// subscription, which delivers that face's records in offset order, and prints a record only
+/// once every face is past it, so `tail --json` prints offsets strictly increasing and a
+/// program that stops after any line misses nothing by resuming with `--from <off>+1`. A face
+/// is past `off` once every record of it below `off + 1` is taken: delivered, or read by a
+/// fetch, or below the `next` of its stream's `Mark`. A record two faces deliver is printed
+/// once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FaceMerge {
+    /// Per face: every record of it below this offset is taken (held or printed).
+    below: Vec<u64>,
+    /// Per face: whether its stream said it is caught up (or its broker marks no tail). Only a
+    /// face that has not may hold the merge back by waiting; one that has is read on by a
+    /// fetch, never waited for, as an idle stream says nothing until its next idle mark.
+    caught: Vec<bool>,
+    /// Taken and not yet printed, by offset.
+    held: BTreeMap<u64, (String, Vec<u8>)>,
+    /// Every record below this offset is printed (or was below the tail's start).
+    floor: u64,
+    /// How many may be held while a face still delivering its backlog holds them back
+    /// ([`FACE_HOLD_MAX`]); past it that face is read on by a fetch.
+    hold: usize,
+}
+
+/// What [`FaceMerge::next`] says to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MergeStep {
+    /// Print this record: every face is past it.
+    Print(u64, String, Vec<u8>),
+    /// Face `face` may still hold a record below the oldest held: read it on by a fetch from
+    /// its `below` (`fetch`), or wait for its stream.
+    Behind { face: usize, fetch: bool },
+    /// Nothing is held.
+    Empty,
+}
+
+impl FaceMerge {
+    /// `faces` faces, every one read from `start`, none caught up yet (a face of a broker that
+    /// marks no tail is [`FaceMerge::caught`] at `start`).
+    fn new(faces: usize, start: u64) -> Self {
+        Self {
+            below: vec![start; faces],
+            caught: vec![false; faces],
+            held: BTreeMap::new(),
+            floor: start,
+            hold: FACE_HOLD_MAX,
+        }
+    }
+
+    /// Take `face`'s record at `off`: one below its `below` was read already (by a fetch).
+    fn record(&mut self, face: usize, off: u64, subject: String, raw: Vec<u8>) {
+        let Some(below) = self.below.get_mut(face) else {
+            return;
+        };
+        if off < *below {
+            return;
+        }
+        *below = off.saturating_add(1);
+        if off >= self.floor {
+            self.held.entry(off).or_insert((subject, raw));
+        }
+    }
+
+    /// `face`'s stream marked `next`: it is caught up, and holds nothing more below `next`.
+    fn caught(&mut self, face: usize, next: u64) {
+        if let (Some(below), Some(caught)) = (self.below.get_mut(face), self.caught.get_mut(face)) {
+            *below = (*below).max(next);
+            *caught = true;
+        }
+    }
+
+    /// A fetch of `face` from its `below`: `page`, in offset order, then `next`, the offset
+    /// after the last record the broker scanned. Whether it moved `below` on.
+    fn fetched(&mut self, face: usize, page: Vec<astream_broker::Record>, next: u64) -> bool {
+        let Some(before) = self.below.get(face).copied() else {
+            return false;
+        };
+        for (off, subject, raw) in page {
+            self.record(face, off, subject, raw);
+        }
+        if let Some(below) = self.below.get_mut(face) {
+            *below = (*below).max(next);
+            *below > before
+        } else {
+            false
+        }
+    }
+
+    /// The oldest held record once every face is past it, else the face that may not be.
+    fn next(&mut self) -> MergeStep {
+        let Some(off) = self.held.first_key_value().map(|(off, _)| *off) else {
+            return MergeStep::Empty;
+        };
+        if let Some(face) = self.below.iter().position(|below| *below <= off) {
+            let caught = self.caught.get(face).copied().unwrap_or(true);
+            return MergeStep::Behind {
+                face,
+                fetch: caught || self.held.len() >= self.hold,
+            };
+        }
+        let Some((subject, raw)) = self.held.remove(&off) else {
+            return MergeStep::Empty;
+        };
+        self.floor = off.saturating_add(1);
+        MergeStep::Print(off, subject, raw)
+    }
+}
+
+/// [`tail_faces`]'s merge, run until it must wait for a stream: print what `merge` says to
+/// (`print` false: the reader is gone), and read a face on where it says to by `fetch(face,
+/// filter, from)`, a page in offset order and the offset after the last record the broker
+/// scanned. Whether the reader is still there. A fetch that fails, or moves nothing, ends the
+/// tail with an error that names the face and the `--from` a resume starts at, as every record
+/// below the merge's floor is printed. LAWS: it returns only where nothing is held or a face
+/// that has not said it is caught up holds the merge with fewer than its hold held.
+fn drain_merge(
+    merge: &mut FaceMerge,
+    faces: &[String],
+    broker: &str,
+    mut fetch: impl FnMut(usize, &str, u64) -> io::Result<(Vec<astream_broker::Record>, u64)>,
+    mut print: impl FnMut(u64, &str, &[u8]) -> bool,
+) -> io::Result<bool> {
+    loop {
+        match merge.next() {
+            MergeStep::Print(off, subject, raw) => {
+                if !print(off, &subject, &raw) {
+                    return Ok(false);
+                }
+            }
+            MergeStep::Behind { face, fetch: true } => {
+                let (Some(&from), Some(filter)) = (merge.below.get(face), faces.get(face)) else {
+                    return Ok(true);
+                };
+                let failed = |e: io::Error, floor: u64| {
+                    let why = match e.kind() {
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => format!(
+                            "no answer in {} s",
+                            astream_broker::IDLE_MARK_DEADLINE.as_secs()
+                        ),
+                        _ => e.to_string(),
+                    };
+                    io::Error::new(
+                        e.kind(),
+                        format!(
+                            "the broker at {broker} did not read {} on from @{from}: {why} \
+                             (resume with --from {floor})",
+                            safe(filter, 128)
+                        ),
+                    )
+                };
+                let (page, next) = fetch(face, filter, from).map_err(|e| failed(e, merge.floor))?;
+                if !merge.fetched(face, page, next) {
+                    return Err(failed(io::Error::other("it moved nothing"), merge.floor));
+                }
+            }
+            MergeStep::Behind { fetch: false, .. } | MergeStep::Empty => return Ok(true),
+        }
+    }
+}
+
+/// One face's reader: its stream's events, each sent to [`tail_faces`] with the face's index,
+/// until the stream fails or ends or nobody takes them.
+fn read_face(
+    face: usize,
+    mut sub: astream_broker::AnySubscription,
+    closer: &astream_broker::Closer,
+    broker: &str,
+    tx: &std::sync::mpsc::SyncSender<(usize, io::Result<FaceRead>)>,
+) {
+    use astream_broker::Event;
+    loop {
+        let read = match sub.recv_live_event(closer, astream_broker::IDLE_MARK_DEADLINE) {
+            Ok(Some(Event::Delivery {
+                offset,
+                subject,
+                body,
+            })) => Ok(FaceRead::Record(offset, subject, body)),
+            Ok(Some(Event::Mark { next, .. })) => Ok(FaceRead::Caught(next)),
+            Ok(Some(Event::Gap(gap))) => {
+                let _ = sub.take_gap();
+                Ok(FaceRead::Gap(gap))
+            }
+            Ok(None) => Err(io::Error::other(format!(
+                "the broker at {broker} closed a face's stream"
+            ))),
+            Err(e) => Err(silent_link(e, broker)),
+        };
+        let last = read.is_err();
+        if tx.send((face, read)).is_err() || last {
+            return;
+        }
+    }
+}
+
+/// `tail` where the caps do not grant the fleet's root: one subscription per readable face
+/// ([`readable_faces`]), merged by offset ([`FaceMerge`], [`drain_merge`]). `conn` reads a face
+/// on by a fetch where the merge says to; `tail` bounds its reads as astream bounds a stream's
+/// ([`astream_broker::IDLE_MARK_DEADLINE`]), not by the 3 s of a one-shot request, as a live
+/// tail fetches for as long as it runs.
 fn tail_faces(
     cfg: &Config,
+    conn: &mut Conn,
     faces: &[String],
     start: u64,
     fmt: TailFmt,
@@ -4717,61 +5255,52 @@ fn tail_faces(
 ) -> io::Result<()> {
     use std::sync::mpsc;
     let broker = safe(&cfg.broker, 256);
-    let (tx, rx) = mpsc::sync_channel::<io::Result<FaceRead>>(0);
-    for face in faces {
-        let (mut conn, closer) = transport::connect(&cfg.broker, IO_TIMEOUT)?;
-        transport::attach_cap_files(&mut conn, &cfg.cap_files)?;
-        let mut sub = conn.subscribe(start, face)?;
+    let (tx, rx) = mpsc::sync_channel::<(usize, io::Result<FaceRead>)>(0);
+    let mut merge = FaceMerge::new(faces.len(), start);
+    for (i, face) in faces.iter().enumerate() {
+        let (mut sub_conn, closer) = transport::connect(&cfg.broker, io_timeout())?;
+        transport::attach_cap_files(&mut sub_conn, &cfg.cap_files)?;
+        if !sub_conn.idle_marks()? {
+            merge.caught(i, start);
+        }
+        let sub = sub_conn.subscribe(start, face)?;
         closer.set_read_timeout(None)?;
         let tx = tx.clone();
         let broker = broker.clone();
-        let face = face.clone();
-        std::thread::spawn(move || loop {
-            let read = sub.recv_live(&closer, astream_broker::IDLE_MARK_DEADLINE);
-            if let Some(gap) = sub.take_gap() {
-                if tx.send(Ok(FaceRead::Gap(face.clone(), gap))).is_err() {
-                    return;
-                }
-            }
-            match read.map_err(|e| silent_link(e, &broker)) {
-                Ok(Some((off, subject, raw))) => {
-                    if tx.send(Ok(FaceRead::Record(off, subject, raw))).is_err() {
-                        return;
-                    }
-                }
-                Ok(None) => {
-                    let _ = tx.send(Err(io::Error::other(format!(
-                        "the broker at {broker} closed a face's stream"
-                    ))));
-                    return;
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e));
-                    return;
-                }
-            }
-        });
+        std::thread::spawn(move || read_face(i, sub, &closer, &broker, &tx));
     }
     drop(tx);
-    let mut printed: BTreeSet<u64> = BTreeSet::new();
-    while let Ok(next) = rx.recv() {
-        let line = match next? {
-            FaceRead::Gap(face, gap) => match fmt.gap(&face, &gap) {
-                Some(line) => line,
-                None => continue,
+    loop {
+        let there = drain_merge(
+            &mut merge,
+            faces,
+            &broker,
+            |_, filter, from| {
+                transport::fetch_told_kept(conn, from, filter, transport::POST_PAGE)
+                    .map(|((page, (next, _)), _)| (page, next))
             },
-            FaceRead::Record(off, subject, raw) => {
-                if !printed.insert(off) {
-                    continue;
-                }
-                while printed.len() > 4096 {
-                    printed.pop_first();
-                }
-                fmt.record(&cfg.fleet, off, &subject, &raw)
-            }
-        };
-        if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
+            |off, subject, raw| {
+                let line = fmt.record(&cfg.fleet, off, subject, raw);
+                writeln!(out, "{line}").and_then(|()| out.flush()).is_ok()
+            },
+        )?;
+        if !there {
             return Ok(());
+        }
+        let Ok((face, read)) = rx.recv() else {
+            break;
+        };
+        match read? {
+            FaceRead::Record(off, subject, raw) => merge.record(face, off, subject, raw),
+            FaceRead::Caught(next) => merge.caught(face, next),
+            FaceRead::Gap(gap) => {
+                let filter = faces.get(face).map_or("", String::as_str);
+                if let Some(line) = fmt.gap(filter, &gap) {
+                    if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
+                        return Ok(());
+                    }
+                }
+            }
         }
     }
     Err(io::Error::other(format!(
@@ -5013,10 +5542,12 @@ mod tests {
         }
         for from in ["+5", "@", "", "@-1"] {
             let args = ["tail", "--from", from].map(str::to_string);
-            assert_eq!(
-                parse_args(&args),
-                Err(format!("--from {from} is not a bus offset")),
-                "{from}"
+            let refused = parse_args(&args);
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|e| e.contains("--from") && e.contains(from)),
+                "{from:?}: refused, naming the flag and the value: {refused:?}"
             );
         }
     }
@@ -5134,6 +5665,385 @@ mod tests {
         }
         server.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fetch of face `face` of `log` from `from` on a broker whose head is `head`: the face's
+    /// records in `from..head`, then `head` as the offset after the last one scanned.
+    fn face_page(
+        log: &[Vec<u64>],
+        head: u64,
+        face: usize,
+        from: u64,
+    ) -> (Vec<astream_broker::Record>, u64) {
+        let page = log[face]
+            .iter()
+            .filter(|off| (from..head).contains(*off))
+            .map(|off| (*off, format!("/f/f1/s{off}"), Vec::new()))
+            .collect();
+        (page, head)
+    }
+
+    /// [`tail_faces`]'s loop over `merge`, as it runs: [`drain_merge`] (a face read on by
+    /// `fetch(face, below)`), then the next of `events`. What it printed. LAWS: the merge waits
+    /// only for a face that has not said it is caught up, and holds fewer than its hold while it
+    /// does.
+    fn drive_merge(
+        merge: &mut FaceMerge,
+        events: Vec<(usize, FaceRead)>,
+        fetch: impl Fn(usize, u64) -> (Vec<astream_broker::Record>, u64),
+    ) -> Vec<u64> {
+        let faces: Vec<String> = (0..merge.below.len()).map(|f| format!("face{f}")).collect();
+        let mut printed = Vec::new();
+        let mut events = events.into_iter();
+        loop {
+            let there = drain_merge(
+                merge,
+                &faces,
+                "/b",
+                |face, _, from| Ok(fetch(face, from)),
+                |off, _, _| {
+                    printed.push(off);
+                    true
+                },
+            )
+            .expect("every fetch moves its face on");
+            assert!(there, "the reader is there");
+            if let MergeStep::Behind { face, fetch } = merge.next() {
+                assert!(!fetch, "drain_merge returned with face {face} to read on");
+                assert!(
+                    !merge.caught[face],
+                    "the merge waits for face {face}, which said it is caught up"
+                );
+                assert!(
+                    merge.held.len() < merge.hold,
+                    "the merge waits for face {face} holding {} records, its hold {}",
+                    merge.held.len(),
+                    merge.hold
+                );
+            }
+            let Some((face, read)) = events.next() else {
+                return printed;
+            };
+            match read {
+                FaceRead::Record(off, subject, raw) => merge.record(face, off, subject, raw),
+                FaceRead::Caught(next) => merge.caught(face, next),
+                FaceRead::Gap(_) => {}
+            }
+        }
+    }
+
+    /// THE FACES ARE MERGED BY OFFSET (audit findings BUS2-5 and LOOP2-3; [`FaceMerge`]): four
+    /// faces of one log, the fourth the same as the first (as `pub/>` and `pub/<node>/>` are),
+    /// each delivering its own records in offset order while the faces interleave as their
+    /// threads race, a sparse one caught up early, and offsets 5 and 8 on none. The merge
+    /// prints every record once, offsets strictly increasing, waiting only for a face still
+    /// delivering its backlog. A caught-up face is read on by a fetch: a live record on one face
+    /// prints while the others are idle, and one a face's stream has not delivered yet is
+    /// fetched and printed first, its delivery then taken as read. Past its hold, a face still
+    /// delivering its backlog is read on by a fetch too, though its stream says nothing. Every
+    /// face of a broker that marks no tail is caught from its start ([`tail_faces`]), so every
+    /// record prints though no stream ever marks. A fetch that fails ends the merge naming the
+    /// `--from` a resume starts at.
+    /// NEGATIVE CONTROLS (run): printing the oldest held at once (arrival order) prints 1 first,
+    /// and 0 never; waiting for a caught-up face's stream breaks the law above; waiting past the
+    /// hold for a face not caught up prints nothing past the hold; a fetch's error passed on
+    /// as it came names no `--from`.
+    #[test]
+    fn faces_merge_by_offset_and_a_caught_up_face_is_read_on_never_waited_for() {
+        let rec = |off: u64| FaceRead::Record(off, format!("/f/f1/s{off}"), Vec::new());
+        let mut log = vec![
+            vec![0, 3, 6, 9],
+            vec![1, 4, 7, 10],
+            vec![2, 11],
+            vec![0, 3, 6, 9],
+        ];
+        let mut merge = FaceMerge::new(4, 0);
+        let backlog = vec![
+            (1, rec(1)),
+            (0, rec(0)),
+            (2, rec(2)),
+            (3, rec(0)),
+            (0, rec(3)),
+            (1, rec(4)),
+            (3, rec(3)),
+            (0, rec(6)),
+            (2, rec(11)),
+            (2, FaceRead::Caught(12)),
+            (1, rec(7)),
+            (3, rec(6)),
+            (0, rec(9)),
+            (1, rec(10)),
+            (3, rec(9)),
+            (0, FaceRead::Caught(12)),
+            (1, FaceRead::Caught(12)),
+            (3, FaceRead::Caught(12)),
+        ];
+        let printed = drive_merge(&mut merge, backlog, |f, from| face_page(&log, 12, f, from));
+        assert_eq!(printed, vec![0, 1, 2, 3, 4, 6, 7, 9, 10, 11], "the backlog");
+
+        log[1].push(12);
+        let printed = drive_merge(&mut merge, vec![(1, rec(12))], |f, from| {
+            face_page(&log, 13, f, from)
+        });
+        assert_eq!(printed, vec![12], "a live record, the other faces idle");
+
+        log[2].push(13);
+        log[0].push(14);
+        log[3].push(14);
+        let live = vec![(0, rec(14)), (2, rec(13)), (3, rec(14))];
+        let printed = drive_merge(&mut merge, live, |f, from| face_page(&log, 15, f, from));
+        assert_eq!(
+            printed,
+            vec![13, 14],
+            "a record a face's stream has not delivered yet comes first, and once"
+        );
+        assert!(merge.held.is_empty(), "{merge:?}");
+
+        let log = vec![vec![0, 1, 2, 3], vec![5]];
+        let mut merge = FaceMerge::new(2, 0);
+        merge.hold = 2;
+        let events = vec![
+            (0, rec(0)),
+            (0, rec(1)),
+            (0, rec(2)),
+            (0, rec(3)),
+            (0, FaceRead::Caught(6)),
+        ];
+        let printed = drive_merge(&mut merge, events, |f, from| face_page(&log, 6, f, from));
+        assert_eq!(
+            printed,
+            vec![0, 1, 2, 3, 5],
+            "past the hold, the silent face is fetched"
+        );
+
+        let log = vec![vec![10, 12], vec![11, 13]];
+        let mut merge = FaceMerge::new(2, 10);
+        for face in 0..2 {
+            merge.caught(face, 10);
+        }
+        let events = vec![(1, rec(11)), (0, rec(10)), (1, rec(13)), (0, rec(12))];
+        let printed = drive_merge(&mut merge, events, |f, from| face_page(&log, 14, f, from));
+        assert_eq!(printed, vec![10, 11, 12, 13], "a broker that marks no tail");
+
+        let faces = ["/f/f1/pub/>".to_string(), "/f/f1/in/n-a/>".to_string()];
+        let mut merge = FaceMerge::new(2, 0);
+        merge.caught(0, 0);
+        merge.record(1, 0, "/f/f1/s0".to_string(), Vec::new());
+        merge.record(1, 3, "/f/f1/s3".to_string(), Vec::new());
+        let mut printed = Vec::new();
+        let ended = drain_merge(
+            &mut merge,
+            &faces,
+            "/b",
+            |face, _, from| match from {
+                0 => Ok(face_page(&[vec![1, 2], vec![]], 3, face, from)),
+                _ => Err(io::Error::from(io::ErrorKind::TimedOut)),
+            },
+            |off, _, _| {
+                printed.push(off);
+                true
+            },
+        );
+        assert_eq!(printed, vec![0, 1, 2], "printed before the fetch failed");
+        assert!(
+            ended
+                .as_ref()
+                .is_err_and(|e| e.kind() == io::ErrorKind::TimedOut
+                    && e.to_string().contains("--from 3")
+                    && e.to_string().contains(&faces[0])),
+            "{ended:?}"
+        );
+    }
+
+    /// A writer that hands each line it is given to `tx` and refuses a write once it has sent
+    /// `lines` lines, as a closed pipe does (the tail then ends).
+    struct Sent {
+        tx: std::sync::mpsc::Sender<String>,
+        buf: Vec<u8>,
+        lines: usize,
+    }
+
+    impl Write for Sent {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            if self.lines == 0 {
+                return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+            }
+            self.buf.extend_from_slice(b);
+            while let Some(at) = self.buf.iter().position(|c| *c == b'\n') {
+                let line: Vec<u8> = self.buf.drain(..=at).collect();
+                let _ = self
+                    .tx
+                    .send(String::from_utf8_lossy(&line).trim_end().to_string());
+                self.lines = self.lines.saturating_sub(1);
+            }
+            Ok(b.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The `off` of a `tail --json` record line.
+    fn tail_off(line: &str) -> Option<u64> {
+        aterm_json::from_str::<aterm_json::Value>(line)
+            .ok()?
+            .get("off")?
+            .as_u64()
+    }
+
+    /// `tail --json` UNDER A NODE CAP PRINTS OFFSETS STRICTLY INCREASING, SO A RESUME FROM THE
+    /// LAST ONE PLUS ONE MISSES NOTHING (audit findings BUS2-5 and LOOP2-3): on a guarded broker
+    /// a node's cap (`enable::node_grants`) does not grant the fleet's root, so the tail reads
+    /// each of its seven faces apart. 250 records cycle over subjects on four faces (one on two,
+    /// `pub/>` and `pub/n-a/>`) and one the node cannot read. A tail from 0 stopped after 100
+    /// lines and one resumed from its last offset plus one print, between them, every record the
+    /// node reads, once, in offset order, and the resumed tail then prints each record published
+    /// live on one face while the others are idle. The broker keeps its default idle mark, so
+    /// no phase races astream's link deadline; that a caught-up face is read on, never waited
+    /// for, is [`faces_merge_by_offset_and_a_caught_up_face_is_read_on_never_waited_for`]'s law.
+    /// NEGATIVE CONTROLS (run): printing each record as it arrives, deduplicated (the code before
+    /// this fix), prints `[1, 0, 2, 3, 6, 11, 7, …]`; printing in arrival order fails it too.
+    #[cfg(unix)]
+    #[test]
+    fn tail_json_under_a_node_cap_prints_offsets_in_order_so_a_resume_misses_none() {
+        use aterm_spec::wait::MUST_HAPPEN;
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-tail-faces")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let secret = vec![0x5a_u8; 32];
+        let broker = astream_broker::Broker::open_guarded_with(
+            dir.path().join("b.log"),
+            secret.clone(),
+            astream_broker::Durability::Relaxed,
+        )
+        .expect("a guarded broker");
+        let socket = dir.path().join("b.sock");
+        let _server = broker.serve(&socket).expect("serve the broker");
+        let sock = socket.to_string_lossy().into_owned();
+        let (mut god, _) = transport::connect(&sock, MUST_HAPPEN).expect("dial");
+        let all = astream_cap::mint(&secret, "/f/f1/>").expect("mint the fleet's cap");
+        god.attach(&all.filter, &all.tag).expect("attach it");
+        let cap = dir.path().join("node.cap");
+        let lines: String = crate::enable::node_grants("f1", "n-a")
+            .iter()
+            .map(|g| {
+                let c = astream_cap::mint(&secret, g).expect("mint");
+                format!("{}\n", astream_cap::capfile::format_line(&c.filter, &c.tag))
+            })
+            .collect();
+        std::fs::write(&cap, lines).expect("the node's cap");
+        let subjects = [
+            ("/f/f1/pub/n-b/s-x/presence", true),
+            ("/f/f1/in/n-a/s-y/n-b/note", true),
+            ("/f/f1/pub/n-a/s-y/presence", true),
+            ("/f/f1/term/n-a/s-y/screen", true),
+            ("/f/f1/in/n-b/s-z/n-c/note", false),
+        ];
+        let mut seq = 0u64;
+        let mut publish = |i: usize| {
+            seq += 1;
+            let (subject, read) = subjects[i % subjects.len()];
+            let body = format!("v=1 t={} state=live", 1_700_000_000_000 + seq);
+            let off = god
+                .publish(7, seq, subject, body.as_bytes())
+                .expect("lands")
+                .0;
+            (off, read)
+        };
+        let readable: Vec<u64> = (0..250)
+            .map(&mut publish)
+            .filter_map(|(off, read)| read.then_some(off))
+            .collect();
+        let cfg = crate::cli::parse(&[
+            "--fleet".to_string(),
+            "f1".to_string(),
+            "--broker".to_string(),
+            sock,
+            "--cap-file".to_string(),
+            cap.to_string_lossy().into_owned(),
+        ])
+        .expect("a config")
+        .cfg;
+        let json = TailFmt::new(false, true);
+
+        let stop = 100;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut out = Sent {
+            tx,
+            buf: Vec::new(),
+            lines: stop,
+        };
+        let from_zero = cfg.clone();
+        std::thread::spawn(move || {
+            let ended = tail(&from_zero, json, Some(0), None, &mut out);
+            let _ = done_tx.send(ended.map_err(|e| e.to_string()));
+        });
+        let mut first = Vec::new();
+        for _ in 0..stop {
+            let line = rx
+                .recv_timeout(MUST_HAPPEN)
+                .unwrap_or_else(|e| panic!("the first tail's lines ({first:?}): {e}"));
+            first.extend(tail_off(&line));
+        }
+        assert_eq!(
+            done_rx
+                .recv_timeout(MUST_HAPPEN)
+                .expect("the first tail ends"),
+            Ok(()),
+            "it ends when its reader does"
+        );
+        assert!(
+            first.windows(2).all(|w| w[0] < w[1]),
+            "offsets strictly increasing: {first:?}"
+        );
+        assert_eq!(first.as_slice(), &readable[..stop], "the first {stop}");
+
+        let live = 4;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let resume = first.last().map_or(0, |off| off + 1);
+        let mut out = Sent {
+            tx,
+            buf: Vec::new(),
+            lines: readable.len() - stop + live,
+        };
+        let resumed = cfg.clone();
+        std::thread::spawn(move || {
+            let ended = tail(&resumed, json, Some(resume), None, &mut out);
+            let _ = done_tx.send(ended.map_err(|e| e.to_string()));
+        });
+        let mut rest = Vec::new();
+        while rest.len() < readable.len() - stop {
+            let line = rx
+                .recv_timeout(MUST_HAPPEN)
+                .unwrap_or_else(|e| panic!("the resumed tail's backlog ({rest:?}): {e}"));
+            rest.extend(tail_off(&line));
+        }
+        assert!(
+            rest.windows(2).all(|w| w[0] < w[1]),
+            "offsets strictly increasing: {rest:?}"
+        );
+        assert_eq!(
+            [first.as_slice(), rest.as_slice()].concat(),
+            readable,
+            "the two runs read every record the node reads, once: no hole"
+        );
+        for i in 0..live {
+            let (off, _) = publish(i);
+            let line = rx
+                .recv_timeout(MUST_HAPPEN)
+                .unwrap_or_else(|e| panic!("the live record @{off} on face {i}: {e}"));
+            assert_eq!(tail_off(&line), Some(off), "{line}");
+        }
+        publish(0);
+        assert_eq!(
+            done_rx.recv_timeout(MUST_HAPPEN).expect("the tail ends"),
+            Ok(()),
+            "it ends when its reader does"
+        );
     }
 
     #[test]
@@ -5779,6 +6689,7 @@ mod tests {
             exited: 0,
             traffic: Vec::new(),
             overdue: Vec::new(),
+            overdue_unjudged: 0,
             warnings: Vec::new(),
             now_ms: 100 * 60 * 1000,
         }
@@ -5826,6 +6737,56 @@ mod tests {
             None,
             "a cap directory alone does not prove where the broker runs"
         );
+    }
+
+    /// The renewal's health read: a broker answers when its `Hello` comes back, in this protocol
+    /// or another; a socket nobody holds, or one that accepts and says nothing, does not.
+    /// NEGATIVE CONTROLS: an `answers` that only connects passes the silent socket; one with no
+    /// protocol arm fails the broker of another protocol.
+    #[cfg(unix)]
+    #[test]
+    fn a_broker_answers_when_its_hello_comes_back() {
+        use astream_broker::proto::PROTO_VERSION;
+        use astream_broker::proto::{encode_response, read_frame, write_frame, Response};
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-answers")
+            .tempdir()
+            .expect("scratch");
+        let endpoint = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+
+        let why = answers(&endpoint("none.sock")).expect_err("nobody holds it");
+        assert!(why.starts_with("connect: "), "{why}");
+
+        let silent =
+            std::os::unix::net::UnixListener::bind(dir.path().join("silent.sock")).expect("bind");
+        let closer = std::thread::spawn(move || drop(silent.accept()));
+        let why = answers(&endpoint("silent.sock")).expect_err("accepted, said nothing");
+        assert!(
+            why.starts_with("the socket accepted but no broker answered"),
+            "{why}"
+        );
+        closer.join().expect("the listener");
+
+        let other =
+            std::os::unix::net::UnixListener::bind(dir.path().join("other.sock")).expect("bind");
+        let replier = std::thread::spawn(move || {
+            let (mut c, _) = other.accept().expect("accept");
+            if let Ok(Some(_hello)) = read_frame(&mut c) {
+                let mut reply = encode_response(&Response::Error {
+                    code: astream_broker::proto::ERR_REFUSED,
+                    msg: "malformed request".to_string(),
+                });
+                reply[0] = PROTO_VERSION + 1;
+                let _ = write_frame(&mut c, &reply);
+            }
+        });
+        assert_eq!(answers(&endpoint("other.sock")), Ok(()));
+        replier.join().expect("the replier");
+
+        let broker = crate::test_broker(dir.path().join("b.log")).expect("broker");
+        let mut server = broker.serve(dir.path().join("b.sock")).expect("serve");
+        assert_eq!(answers(&endpoint("b.sock")), Ok(()));
+        server.shutdown();
     }
 
     #[cfg(unix)]
@@ -6771,6 +7732,222 @@ mod tests {
         assert!(warnings(&r, &ages, &[]).is_empty(), "a note is not work");
     }
 
+    /// R5: WHAT THE BROKER'S RETENTION GAVE UP IS A WARNING, ONCE WHERE IT WAS TOLD. The fields
+    /// parse as aterm writes them (`inbox`'s `given_up=`, `given_up_count=`, `lane_given_up=`; a
+    /// `topic ls` row's `given_up=`; `fabric status`'s `mail_gaps=`, `mail_gap=`,
+    /// `mail_gap_count=`). The node's unread mail is one line per instance, from its counter
+    /// alone (a range no session was there to be told of, or one on a log since replaced), from
+    /// its sessions alone (after a seamless update, which carries theirs and not the counter), or
+    /// both, each range once and newest first, the fourth past counted; a session's own lane
+    /// and topics are one line for that session, never its copy of the node's range. Each gets
+    /// `doctor`'s retention fix. NC (run): a `node_mail_given_up` that returns `None` fails the
+    /// counter's line; one that takes no session's range fails the update's; a
+    /// `session_given_up` that returns `None` fails the session's line; one that keeps each
+    /// session's copy of a range apart fails "once for both".
+    #[test]
+    fn records_the_brokers_retention_gave_up_are_listed_once_where_they_were_told() {
+        let mut s = LocalSession::default();
+        fill_inbox(
+            &mut s,
+            "OK 0 hold=0 holder=- seen=3 bus_head=90 oldest_on_bus=@44 dropped=0 pending=0 \
+             given_up=@10..@42 given_up_count=3 lane_given_up=@50..@60",
+            &[],
+            &[],
+        );
+        let range = |from, to, records| GivenUpRange { from, to, records };
+        assert_eq!(s.given_up, Some(range(10, 42, Some(3))));
+        assert_eq!(s.lane_given_up, Some(range(50, 60, None)));
+        fill_topics(
+            &mut s,
+            &[
+                "topic deploy since=@0 given_up=@70..@80".to_string(),
+                "topic news since=head".to_string(),
+            ],
+        );
+        assert_eq!(s.topics, ["deploy", "news"]);
+        assert_eq!(
+            s.topic_given_up,
+            [("deploy".to_string(), range(70, 80, None))]
+        );
+        for bad in ["@5..@3", "10..42", "@a..@b", "@1..", ""] {
+            assert_eq!(GivenUpRange::parse(bad, Some("2")), None, "{bad}");
+        }
+        assert_eq!(
+            GivenUpRange::parse("@1..@2", Some("x")),
+            Some(range(1, 2, None))
+        );
+
+        let node_lines = |r: &Report| -> Vec<String> {
+            warned(r)
+                .into_iter()
+                .filter(|l| l.contains("this node's unread mail"))
+                .collect()
+        };
+        let fix = |l: &str| crate::enable::fix_for(l, &crate::enable::Role::default());
+
+        let mut r = healthy();
+        r.instances[0].mail_gaps = Some(2);
+        r.instances[0].mail_gap = Some(range(70, 75, Some(1)));
+        assert_eq!(
+            warned(&r),
+            [
+                "instance 100: the broker's retention gave up this node's unread mail before its \
+              bridge read it (2 range(s) since the instance started): @70..@75 (1 record); the \
+              sessions it served then were told (`inbox` given_up=, a `mail-gap` mark in each \
+              log)"
+            ],
+            "the counter alone, no session told"
+        );
+        assert!(fix(&warned(&r)[0]).starts_with("nothing brings those records back"));
+        r.instances[0].mail_gap = None;
+        assert_eq!(
+            node_lines(&r),
+            [
+                "instance 100: the broker's retention gave up this node's unread mail before its \
+              bridge read it (2 range(s) since the instance started), its offsets on a bus log \
+              since replaced; the sessions it served then were told (`inbox` given_up=, a \
+              `mail-gap` mark in each log)"
+            ]
+        );
+        r.instances[0].mail_gaps = Some(0);
+        assert_eq!(warned(&r), Vec::<String>::new(), "none told");
+
+        let mut r = healthy();
+        let mut two = r.instances[0].sessions[0].clone();
+        two.sid = "s-two".to_string();
+        r.instances[0].sessions.push(two);
+        for s in &mut r.instances[0].sessions {
+            s.given_up = Some(range(10, 42, Some(3)));
+        }
+        assert_eq!(
+            warned(&r),
+            [
+                "instance 100: the broker's retention gave up this node's unread mail before its \
+              bridge read it: @10..@42 (3 records); the sessions it served then were told \
+              (`inbox` given_up=, a `mail-gap` mark in each log)"
+            ],
+            "the sessions' range after an update, once for both"
+        );
+        r.instances[0].mail_gaps = Some(2);
+        r.instances[0].mail_gap = Some(range(100, 120, None));
+        r.instances[0].sessions[1].given_up = Some(range(100, 120, Some(2)));
+        assert_eq!(
+            node_lines(&r),
+            [
+                "instance 100: the broker's retention gave up this node's unread mail before its \
+              bridge read it (2 range(s) since the instance started): @100..@120 (2 records), \
+              @10..@42 (3 records); the sessions it served then were told (`inbox` given_up=, a \
+              `mail-gap` mark in each log)"
+            ],
+            "the counter's and the sessions', each range once, newest first"
+        );
+        for (i, from) in [130, 140, 150, 160].into_iter().enumerate() {
+            let mut s = r.instances[0].sessions[0].clone();
+            s.sid = format!("s-more{i}");
+            s.given_up = Some(range(from, from + 5, None));
+            r.instances[0].sessions.push(s);
+        }
+        let lines = node_lines(&r);
+        assert!(
+            lines.len() == 1
+                && lines[0]
+                    .contains(": @160..@165, @150..@155, @140..@145, @130..@135 and 2 more;"),
+            "{lines:#?}"
+        );
+
+        let mut r = healthy();
+        let s = &mut r.instances[0].sessions[0];
+        s.given_up = Some(range(10, 42, Some(3)));
+        s.lane_given_up = Some(range(50, 60, None));
+        s.topic_given_up = vec![
+            ("deploy".to_string(), range(70, 80, None)),
+            ("news".to_string(), range(81, 90, Some(4))),
+        ];
+        let w = warned(&r);
+        let own: Vec<&String> = w.iter().filter(|l| l.starts_with("@s-one ")).collect();
+        assert_eq!(
+            own,
+            ["@s-one (instance 100): the broker's retention gave up records of its own before it \
+              handled them: its mail lane @50..@60 (`inbox` lane_given_up=); topic deploy \
+              @70..@80, topic news @81..@90 (4 records) (`topic ls` given_up=)"],
+            "{w:#?}"
+        );
+        assert!(fix(own[0]).starts_with("nothing brings those records back"));
+        assert_eq!(w.len(), 2, "the node's range is its own line: {w:#?}");
+        r.instances[0].sessions[0].lane_given_up = None;
+        one(&r, "@s-one (instance 100): the broker's retention gave up records of its own before it handled them: topic deploy");
+        r.instances[0].sessions[0].topic_given_up.clear();
+        assert_eq!(warned(&r).len(), 1, "only the node's: {:#?}", warned(&r));
+    }
+
+    /// R5 review: OVERLAPPING RANGES OF THE NODE'S GIVEN-UP MAIL ARE ONE LOSS. A later notice on
+    /// one subscription can overlap an earlier one (astream's `Gap::and`, whose counts sum): the
+    /// instance's counter widens its newest over both (`fabric status` `mail_gap=@4..@12`, no
+    /// count) while each session keeps the later (`given_up=@6..@12 given_up_count=1`). The
+    /// warning merges the counter's and the sessions' ranges that overlap, keeps a count only
+    /// where the range it counted is the whole merged one, keeps ranges that only touch apart,
+    /// and lists no empty range. NC (run): a `node_mail_given_up` keyed by the exact range says
+    /// `@6..@12 (1 record), @4..@12` for one range.
+    #[test]
+    fn overlapping_ranges_of_the_nodes_given_up_mail_are_listed_as_one() {
+        let range = |from, to, records| GivenUpRange { from, to, records };
+        let node_lines = |r: &Report| -> Vec<String> {
+            warned(r)
+                .into_iter()
+                .filter(|l| l.contains("this node's unread mail"))
+                .collect()
+        };
+        let said = |since: &str, ranges: &str| {
+            vec![format!(
+                "instance 100: the broker's retention gave up this node's unread mail before its \
+                 bridge read it{since}: {ranges}; the sessions it served then were told (`inbox` \
+                 given_up=, a `mail-gap` mark in each log)"
+            )]
+        };
+        let one_told = " (1 range(s) since the instance started)";
+
+        let mut r = healthy();
+        r.instances[0].mail_gaps = Some(1);
+        r.instances[0].mail_gap = Some(range(4, 12, None));
+        r.instances[0].sessions[0].given_up = Some(range(6, 12, Some(1)));
+        assert_eq!(
+            node_lines(&r),
+            said(one_told, "@4..@12"),
+            "one range; the later notice's count is of part of it"
+        );
+        r.instances[0].mail_gap = Some(range(4, 12, Some(3)));
+        assert_eq!(
+            node_lines(&r),
+            said(one_told, "@4..@12 (3 records)"),
+            "a count of the whole merged range stays"
+        );
+
+        let mut r = healthy();
+        let mut two = r.instances[0].sessions[0].clone();
+        two.sid = "s-two".to_string();
+        r.instances[0].sessions.push(two);
+        r.instances[0].sessions[0].given_up = Some(range(10, 42, Some(3)));
+        r.instances[0].sessions[1].given_up = Some(range(30, 50, Some(2)));
+        assert_eq!(
+            node_lines(&r),
+            said("", "@10..@50"),
+            "the sessions' alone, after an update"
+        );
+        let mut three = r.instances[0].sessions[0].clone();
+        three.sid = "s-three".to_string();
+        three.given_up = Some(range(50, 60, Some(1)));
+        r.instances[0].sessions.push(three);
+        let mut four = r.instances[0].sessions[0].clone();
+        four.sid = "s-four".to_string();
+        four.given_up = Some(range(60, 60, None));
+        r.instances[0].sessions.push(four);
+        assert_eq!(
+            node_lines(&r),
+            said("", "@50..@60 (1 record), @10..@50"),
+            "ranges that only touch stay apart, and an empty one is no loss"
+        );
+    }
+
     /// A bus where retention holds overdue asks below the `in` lanes' oldest and gave up the
     /// verdicts of some ([`held_ask_bus`]).
     #[cfg(unix)]
@@ -6919,7 +8096,8 @@ mod tests {
     /// read told, the deadline scan over the whole fleet's `in` lanes and over the node cap's
     /// `in` faces both list the ask nothing answered or expired (`expired` `Some(false)`), and
     /// the one whose `expired` retention gave up with `expired` `None` (`null` in `--json`),
-    /// and leave out the one whose answer retention gave up: status cannot say it had none.
+    /// and leave out the one whose answer retention gave up: status cannot say it had none, and
+    /// counts it unjudged (audit finding BUS2-3).
     /// NEGATIVE CONTROLS (run): `overdue_work` reading through `transport::fetch_kept` lists
     /// nothing; skipping its check of the asker's answers lists the answered ask; skipping its
     /// check of the asker's `expired` verdicts says `Some(false)` for the lapsed one.
@@ -6929,24 +8107,144 @@ mod tests {
         let bus = held_ask_bus("al-held-ask");
         assert!(bus.answered < bus.lapsed && bus.lapsed < bus.ask);
         for faces in [None, Some(bus.node_faces.as_slice())] {
-            let overdue = overdue_work(&mut bus.dial(), "lab", faces, bus.head, bus.now)
+            let found = overdue_work(&mut bus.dial(), "lab", faces, bus.head, bus.now)
                 .expect("the deadlines");
             assert_eq!(
-                overdue
+                found
+                    .overdue
                     .iter()
                     .map(|o| (o.off, o.expired))
                     .collect::<Vec<_>>(),
                 vec![(bus.lapsed, None), (bus.ask, Some(false))],
-                "{faces:?}: {overdue:#?}"
+                "{faces:?}: {found:#?}"
             );
+            assert_eq!(found.unjudged, 1, "{faces:?}: the answered ask");
             let mut r = healthy();
-            r.overdue = overdue;
+            r.overdue = found.overdue;
             let json = render_json(&r);
             assert!(
                 json.contains(&format!("{{\"off\":{},", bus.lapsed))
                     && json.contains("\"expired\":null"),
                 "{json}"
             );
+        }
+    }
+
+    /// AN ASK STATUS CANNOT JUDGE IS COUNTED, NEVER LISTED (audit finding BUS2-3): `s-one@n-a`
+    /// asks the person `h-jsmith` with a deadline that has passed (`ask`), then again with one
+    /// that has not (`later`), and the person answers `later` on `s-one`'s lane. The node's
+    /// inbox group reads the answer and a mail, and the bulk stream's cut (aterm's rules, its
+    /// bytes scaled) gives them up, which raises the floor of `s-one`'s answers above `ask`: the
+    /// bus no longer says whether `ask` had one. Over the whole fleet's `in` lanes and over the
+    /// node cap's faces, the deadline scan lists nothing and counts `ask` unjudged, and status
+    /// says so in one warning (exit 1), which `doctor` gives its own fix, and as
+    /// `overdue_unjudged` in `--json`.
+    /// NEGATIVE CONTROLS (run): `overdue_work`'s `continue` without the count gives 0 and no
+    /// warning; `fix_for` without the warning's branch gives it the catch-all.
+    #[cfg(unix)]
+    #[test]
+    fn an_ask_whose_askers_later_answer_was_given_up_is_counted_unjudged() {
+        const BODY: u64 = 4096;
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-unjudged")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let socket = dir.path().join("b.sock");
+        let broker = crate::test_broker(dir.path().join("b.log")).expect("a broker");
+        broker.set_retention_interval(Duration::from_secs(3600));
+        broker
+            .set_retention(crate::broker_rules::rules_scaled(
+                3 * BODY / 2,
+                1 << 30,
+                1 << 30,
+            ))
+            .expect("aterm's rules, scaled");
+        let _server = broker.serve(&socket).expect("serve the broker");
+        let path = socket.to_string_lossy().into_owned();
+        let dial = || {
+            transport::connect(&path, aterm_spec::wait::MUST_HAPPEN)
+                .expect("connect")
+                .0
+        };
+        let mut writer = dial();
+        let t = 1_000_000_u64;
+        let now = t + 20 * 60 * 1000;
+        let mut seq = 0u64;
+        let mut publish = |subject: &str, body: &str| {
+            seq += 1;
+            writer
+                .publish(91, seq, subject, body.as_bytes())
+                .unwrap_or_else(|e| panic!("publish on {subject}: {e}"))
+                .0
+        };
+        let to_person = format!(
+            "{}/ask",
+            crate::subject::person_lane("lab", "h-jsmith", "n-a")
+        );
+        let ask = publish(
+            &to_person,
+            &format!("v=1 t={t} from=s-one dl=600000 text=which"),
+        );
+        let later = publish(
+            &to_person,
+            &format!("v=1 t={now} from=s-one dl=600000 text=which"),
+        );
+        publish(
+            &crate::subject::post_lane("lab", "n-a", "s-one", "h-jsmith", "answer"),
+            &format!("v=1 t=1 re={later} text=yes"),
+        );
+        let read = publish(
+            &crate::subject::post_lane("lab", "n-a", "s-two", "n-a", "note"),
+            "v=1 t=1 from=s-one text=fyi",
+        );
+        let filler = "e".repeat(BODY as usize);
+        for _ in 0..3 {
+            publish("/f/lab/pub/n-a/s-one/ev", &filler);
+        }
+        writer
+            .commit(&crate::subject::inbox_group("lab", "n-a"), read)
+            .expect("the node's inbox group reads the answer and the mail");
+        broker
+            .retention_tick_at(broker.now_ms())
+            .expect("the retention tick");
+        let (_, (_, head)) = writer.fetch(0, "/f/lab/>", 0).expect("the head");
+        let lane = verdict_lane("lab", &to_person, Some("s-one"));
+        let (floor, _) = writer
+            .oldest(&format!("{lane}/answer"))
+            .expect("the answers' oldest");
+        assert!(
+            floor.is_some_and(|floor| floor > ask + 1),
+            "PRECONDITION: the cut gave up the answer above the ask: {floor:?}"
+        );
+        let node_faces: Vec<String> = crate::enable::node_grants("lab", "n-a")
+            .iter()
+            .filter_map(|g| astream_cap::Grant::parse(g).ok())
+            .map(|g| g.filter)
+            .filter(|f| !f.starts_with("/f/lab/cur/"))
+            .collect();
+        for faces in [None, Some(node_faces.as_slice())] {
+            let found = overdue_work(&mut dial(), "lab", faces, head, now).expect("the deadlines");
+            assert_eq!(
+                (found.overdue.len(), found.unjudged),
+                (0, 1),
+                "{faces:?}: {found:#?}"
+            );
+            let mut r = healthy();
+            r.overdue = found.overdue;
+            r.overdue_unjudged = found.unjudged;
+            r.warnings = warned(&r);
+            assert_eq!(r.warnings.len(), 1, "{faces:?}: {:?}", r.warnings);
+            let role = crate::enable::Role::default();
+            assert_ne!(
+                crate::enable::fix_for(&r.warnings[0], &role),
+                crate::enable::fix_for("a warning no remedy names", &role),
+                "doctor gives the warning its own fix: {}",
+                r.warnings[0]
+            );
+            assert_eq!(exit_of(&r), 1, "{faces:?}");
+            let json: aterm_json::Value = aterm_json::from_str(&render_json(&r)).expect("JSON");
+            assert_eq!(json["overdue_unjudged"].as_u64(), Some(1), "{faces:?}");
+            assert_eq!(json["overdue"].as_array().map(Vec::len), Some(0));
         }
     }
 
@@ -7756,5 +9054,23 @@ mod running_argv_tests {
             );
             assert_eq!(view.replaced.as_deref(), want);
         }
+    }
+
+    #[test]
+    fn swarm_enabled_false_disables_fabric_command_in_toml() {
+        let off =
+            "[swarm]\nenabled = false\n[fabric]\ncommand = [\"aterm\", \"link\", \"serve\"]\n";
+        assert_eq!(command_in_toml(off), Ok(None));
+        // Negative control: `[swarm] enabled = true` resolves the configured command.
+        let on = "[swarm]\nenabled = true\n[fabric]\ncommand = [\"aterm\", \"link\", \"serve\"]\n";
+        assert_eq!(
+            command_in_toml(on),
+            Ok(Some(vec![
+                "aterm".to_string(),
+                "link".to_string(),
+                "serve".to_string(),
+            ]))
+        );
+        assert!(command_in_toml("[swarm]\nenabled = 1\n").is_err());
     }
 }

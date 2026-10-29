@@ -33,14 +33,14 @@ pub struct Table {
 /// Path to the system TCC SQLite database.
 pub const TCC_DB: &str = "/Library/Application Support/com.apple.TCC/TCC.db";
 
-/// Path to `/usr/bin/sqlite3`.
-pub const SQLITE3: &str = aterm_uds::os_path!("sqlite3");
+/// Maximum size of a TCC SQLite snapshot read into memory (`TCC.db` or its `-wal`).
+const TCC_DB_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Formats [`TCC_DB`] as an immutable `file:` URI for lock-free SQLite reads.
-#[must_use]
-pub fn tcc_target() -> String {
-    aterm_uds::foreign_db::immutable_uri(std::path::Path::new(TCC_DB))
-}
+/// Maximum lock-free snapshot retries when `tccd` is writing concurrently.
+const TCC_DB_READS: usize = 3;
+
+/// Pause between snapshot retries when `tccd` updates `TCC.db` mid-read.
+const TCC_DB_PAUSE: Duration = Duration::from_millis(10);
 
 /// Path to `/bin/launchctl`.
 pub const LAUNCHCTL: &str = aterm_uds::os_path!("launchctl");
@@ -306,48 +306,173 @@ pub struct TccRow {
     pub auth_value: i64,
 }
 
-/// Builds the SQL query reading `access` rows for `clients`.
-#[must_use]
-pub fn tcc_query(clients: &[&str]) -> String {
-    let list: Vec<String> = clients.iter().map(|c| format!("'{c}'")).collect();
-    format!(
-        "select client,service,auth_value from access where client in ({})",
-        list.join(",")
-    )
-}
-
-/// Read-only `sqlite3` CLI flags used for every TCC probe.
-pub const SQLITE3_OPTIONS: [&str; 11] = [
-    "-init",
-    "/dev/null",
-    "-readonly",
-    "-safe",
-    "-nofollow",
-    "-batch",
-    "-bail",
-    "-noheader",
-    "-list",
-    "-separator",
-    "|",
-];
-
-/// Builds the `sqlite3` [`Cmd`] querying `clients` from [`TCC_DB`].
+/// Builds the host agent [`Cmd`] reading `clients` from [`TCC_DB`] in-process.
 #[must_use]
 pub fn tcc_cmd(clients: &[&str]) -> Cmd {
-    Cmd::new(SQLITE3)
-        .args(SQLITE3_OPTIONS)
-        .arg(tcc_target())
-        .arg(tcc_query(clients))
+    Cmd::new(crate::protocol::AGENT_EXE)
+        .args(["machines", "agent", "tcc"])
+        .args(clients)
         .budget(READ_BUDGET)
 }
 
-/// Builds a `sqlite3` [`Cmd`] that probes read access to [`TCC_DB`].
+/// Builds a host agent [`Cmd`] that probes read access to [`TCC_DB`] in-process.
 #[must_use]
 pub fn tcc_open_cmd() -> Cmd {
-    Cmd::new(SQLITE3)
-        .args(SQLITE3_OPTIONS)
-        .args([tcc_target().as_str(), "select count(*) from access"])
-        .budget(READ_BUDGET)
+    tcc_cmd(&[])
+}
+
+struct TccColumns {
+    client: usize,
+    service: usize,
+    auth_value: usize,
+}
+
+fn tcc_columns(schema: &aterm_uds::sqlite_read::TableSchema) -> Option<TccColumns> {
+    Some(TccColumns {
+        client: schema.column_index("client")?,
+        service: schema.column_index("service")?,
+        auth_value: schema.column_index("auth_value")?,
+    })
+}
+
+/// Scans an in-memory SQLite `TCC.db` snapshot (`main` and optional `wal`) for `clients`'
+/// rows in `access` (`clients = &[]` validates that `access` opens and scans).
+///
+/// # Errors
+/// Returns an error if `main` and `wal` are not a readable SQLite 3 database with an
+/// `access(client, service, auth_value)` table or a matched row holds malformed cells.
+pub fn scan_tcc_bytes(
+    main: &[u8],
+    wal: Option<&[u8]>,
+    clients: &[&str],
+) -> Result<Vec<TccRow>, String> {
+    use aterm_uds::sqlite_read::{SqlValue, scan_table_with};
+    let scanned = scan_table_with(main, wal, "access", tcc_columns, |cols, row| {
+        if clients.is_empty() {
+            return None;
+        }
+        let client_cell = row.get(cols.client)?;
+        let client_str = match client_cell {
+            SqlValue::Text(s) => s.as_ref(),
+            SqlValue::Blob(b) => match std::str::from_utf8(b) {
+                Ok(s) => s,
+                Err(_) => return Some(Err("the TCC database holds non-UTF-8 client bytes".into())),
+            },
+            SqlValue::Null | SqlValue::Int(_) | SqlValue::Float(_) => {
+                return Some(Err("the TCC database holds a non-text client cell".into()));
+            }
+        };
+        if !clients.contains(&client_str) {
+            return None;
+        }
+        let service = match row.get(cols.service)? {
+            SqlValue::Text(s) => s.as_ref().to_owned(),
+            SqlValue::Blob(b) => match std::str::from_utf8(b) {
+                Ok(s) => s.to_owned(),
+                Err(_) => {
+                    return Some(Err("the TCC database holds non-UTF-8 service bytes".into()));
+                }
+            },
+            SqlValue::Null | SqlValue::Int(_) | SqlValue::Float(_) => {
+                return Some(Err("the TCC database holds a non-text service cell".into()));
+            }
+        };
+        let Some(auth_value) = row.get(cols.auth_value)?.as_int() else {
+            return Some(Err("the TCC database holds a non-integer auth_value".into()));
+        };
+        Some(Ok(TccRow {
+            client: client_str.to_owned(),
+            service,
+            auth_value,
+        }))
+    })
+    .ok_or_else(|| "the TCC database did not answer: unreadable SQLite access table".to_owned())?;
+    scanned.into_iter().collect()
+}
+
+fn open_tcc_no_link(db: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    options.open(db)
+}
+
+/// Reads `clients`' rows from `db` (`clients = &[]` checks read access and schema) in-process
+/// with no lock, temporary copy, or subprocess.
+///
+/// # Errors
+/// Returns [`NEEDS_REMOTE_FDA`] when TCC denies opening `db` (`EPERM`), or a diagnostic line
+/// when `db` cannot be opened or decoded.
+pub fn read_tcc_file(db: &std::path::Path, clients: &[&str]) -> Result<Vec<TccRow>, String> {
+    use aterm_uds::foreign_db::{Unread, read_bytes};
+    if let Err(e) = open_tcc_no_link(db) {
+        #[cfg(unix)]
+        if e.raw_os_error() == Some(libc::EPERM) {
+            return Err(NEEDS_REMOTE_FDA.to_owned());
+        }
+        return Err(format!(
+            "the TCC database did not answer: {}: {e}",
+            db.display()
+        ));
+    }
+    for attempt in 0..TCC_DB_READS {
+        if attempt > 0 {
+            std::thread::sleep(TCC_DB_PAUSE);
+        }
+        match read_bytes(db, TCC_DB_MAX_BYTES, |main, wal| {
+            Some(scan_tcc_bytes(main, wal, clients))
+        }) {
+            Ok(result) => return result,
+            Err(Unread::Changed | Unread::Writing) => {}
+            Err(Unread::Missing) => {
+                return Err(format!(
+                    "the TCC database did not answer: {}: not a regular file",
+                    db.display()
+                ));
+            }
+            Err(Unread::Failed) => {
+                return Err(format!(
+                    "the TCC database did not answer: {}: unreadable database snapshot",
+                    db.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "the TCC database did not answer: {}: changed during read",
+        db.display()
+    ))
+}
+
+/// `aterm machines agent tcc [client...]`: reads `clients` from [`TCC_DB`] through `sys`.
+pub fn agent_tcc(
+    sys: &dyn System,
+    clients: &[&str],
+    out: &mut dyn std::io::Write,
+) -> std::process::ExitCode {
+    for client in clients {
+        if let Err(why) = bundle_id(client) {
+            return crate::agent::refuse(out, &why);
+        }
+    }
+    match sys.tcc_access(clients) {
+        Ok(rows) => {
+            for row in rows {
+                let _ = writeln!(out, "{}|{}|{}", row.client, row.service, row.auth_value);
+            }
+            let _ = out.flush();
+            std::process::ExitCode::SUCCESS
+        }
+        Err(why) => {
+            let _ = writeln!(out, "not read: {why}");
+            let _ = out.flush();
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 /// Builds the `launchctl print-disabled system` [`Cmd`].
@@ -358,10 +483,18 @@ pub fn print_disabled_cmd() -> Cmd {
         .budget(READ_BUDGET)
 }
 
-/// Why the database did not answer: [`NEEDS_REMOTE_FDA`] when TCC refused this session
-/// (`Error: unable to open database "file:…?immutable=1": authorization denied`, exit 1), else
-/// what the tool said.
+/// Why the remote TCC read did not answer: the agent's own `not read: <why>` (including
+/// [`NEEDS_REMOTE_FDA`]), else how the command ended.
 fn tcc_refusal(ran: &Ran) -> String {
+    if let Some(why) = ran
+        .out()
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .and_then(|l| l.strip_prefix("not read: "))
+    {
+        return why.to_owned();
+    }
     let err = ran.err();
     if err.contains("authorization denied") {
         NEEDS_REMOTE_FDA.to_owned()
@@ -370,7 +503,7 @@ fn tcc_refusal(ran: &Ran) -> String {
     }
 }
 
-/// Parses `client|service|auth_value` lines from `sqlite3` output.
+/// Parses `client|service|auth_value` lines from agent TCC output.
 ///
 /// # Errors
 /// Returns an error if any non-empty line is malformed.
@@ -396,7 +529,7 @@ pub fn parse_tcc(text: &str) -> Result<Vec<TccRow>, String> {
     Ok(rows)
 }
 
-/// The rows for `clients`, or why they could not be read.
+/// The rows for `clients` read through `run`, or why they could not be read.
 fn tcc_rows(
     clients: &[&str],
     run: &mut dyn FnMut(&Cmd) -> Result<Ran, RunFailed>,
@@ -460,18 +593,51 @@ pub struct Known<'a> {
     pub console: Option<&'a User>,
 }
 
-/// Probes `step` using `run` to execute system commands.
+trait StepPort {
+    fn run_cmd(&mut self, cmd: &Cmd) -> Result<Ran, RunFailed>;
+    fn tcc_access(&mut self, clients: &[&str]) -> Result<Vec<TccRow>, String>;
+}
+
+struct CmdPort<'a>(&'a mut dyn FnMut(&Cmd) -> Result<Ran, RunFailed>);
+
+impl StepPort for CmdPort<'_> {
+    fn run_cmd(&mut self, cmd: &Cmd) -> Result<Ran, RunFailed> {
+        (self.0)(cmd)
+    }
+
+    fn tcc_access(&mut self, clients: &[&str]) -> Result<Vec<TccRow>, String> {
+        tcc_rows(clients, self.0)
+    }
+}
+
+struct SysPort<'a>(&'a dyn System);
+
+impl StepPort for SysPort<'_> {
+    fn run_cmd(&mut self, cmd: &Cmd) -> Result<Ran, RunFailed> {
+        self.0.run(cmd)
+    }
+
+    fn tcc_access(&mut self, clients: &[&str]) -> Result<Vec<TccRow>, String> {
+        self.0.tcc_access(clients)
+    }
+}
+
+/// Probes `step` using `run` to execute system and agent commands.
 pub fn probe_step(
     step: &PersonStep,
     known: Known<'_>,
     run: &mut dyn FnMut(&Cmd) -> Result<Ran, RunFailed>,
 ) -> Probe {
+    probe_step_port(step, known, &mut CmdPort(run))
+}
+
+fn probe_step_port(step: &PersonStep, known: Known<'_>, port: &mut dyn StepPort) -> Probe {
     let person = || Probe::Person {
         step: step.id(),
         how: step.how(),
     };
     match step.kind {
-        Kind::RemoteLogin => match service_enabled(SSHD_LABEL, run) {
+        Kind::RemoteLogin => match service_enabled(SSHD_LABEL, &mut |cmd| port.run_cmd(cmd)) {
             Read::Value(true) => Probe::Ok { now: "on".into() },
             Read::Value(false) | Read::Absent => person(),
             Read::Unusable(why) => Probe::Unusable { why },
@@ -479,24 +645,19 @@ pub fn probe_step(
         Kind::RemoteFullDiskAccess => match known.remote_full_disk_access {
             Some(true) => Probe::Ok { now: "on".into() },
             Some(false) => person(),
-            None => match run(&tcc_open_cmd()) {
-                Ok(ran) if ran.success() => Probe::Ok { now: "on".into() },
-                Ok(ran) => match tcc_refusal(&ran) {
-                    why if why == NEEDS_REMOTE_FDA => person(),
-                    why => Probe::Unusable { why },
-                },
-                Err(e) => Probe::Unusable {
-                    why: format!("the TCC database did not answer: {e}"),
-                },
+            None => match port.tcc_access(&[]) {
+                Ok(_) => Probe::Ok { now: "on".into() },
+                Err(why) if why == NEEDS_REMOTE_FDA => person(),
+                Err(why) => Probe::Unusable { why },
             },
         },
         Kind::ScreenSharing => {
-            match service_enabled(SCREEN_SHARING_LABEL, run) {
+            match service_enabled(SCREEN_SHARING_LABEL, &mut |cmd| port.run_cmd(cmd)) {
                 Read::Value(true) => {}
                 Read::Value(false) | Read::Absent => return person(),
                 Read::Unusable(why) => return Probe::Unusable { why },
             }
-            let rows = match tcc_rows(&[SCREEN_SHARING_AGENT], run) {
+            let rows = match port.tcc_access(&[SCREEN_SHARING_AGENT]) {
                 Ok(rows) => rows,
                 Err(why) => return Probe::Unusable { why },
             };
@@ -517,7 +678,7 @@ pub fn probe_step(
                 "kTCCServiceDeveloperTool"
             };
             let bundle = step.bundle.as_deref().unwrap_or("");
-            match tcc_rows(&[bundle], run) {
+            match port.tcc_access(&[bundle]) {
                 Ok(rows) => match grant(&rows, bundle, service) {
                     Read::Value(2) => Probe::Ok {
                         now: "granted".into(),
@@ -526,7 +687,8 @@ pub fn probe_step(
                     Read::Unusable(why) => Probe::Unusable { why },
                 },
                 Err(why) if why == NEEDS_REMOTE_FDA && step.kind == Kind::FullDiskAccess => {
-                    aterm_record(step, known.console, run).unwrap_or(Probe::Unusable { why })
+                    aterm_record(step, known.console, &mut |cmd| port.run_cmd(cmd))
+                        .unwrap_or(Probe::Unusable { why })
                 }
                 Err(why) => Probe::Unusable { why },
             }
@@ -589,7 +751,7 @@ impl Item for PersonItem {
             remote_full_disk_access: ctx.facts.remote_full_disk_access,
             console: ctx.console.as_ref(),
         };
-        probe_step(&self.step, known, &mut |cmd| sys.run(cmd))
+        probe_step_port(&self.step, known, &mut SysPort(sys))
     }
 
     fn apply(&self, _sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
@@ -650,10 +812,6 @@ mod tests {
     /// FDA on: Screen Sharing granted, aterm listed under Full Disk Access but switched off.
     const TCC_VM: &str = "com.apple.screensharing.agent|kTCCServicePostEvent|2\ncom.apple.screensharing.agent|kTCCServiceScreenCapture|2\ncom.aterm.aterm|kTCCServiceSystemPolicyAllFiles|0\n";
 
-    /// sqlite3's refusal from a session without Full Disk Access (measured on a Mac whose
-    /// terminal lacks it), exit 1.
-    const TCC_DENIED: &str = "Error: unable to open database \"file:/Library/Application%20Support/com.apple.TCC/TCC.db?immutable=1\": authorization denied\n";
-
     fn ctx() -> Ctx {
         Ctx {
             facts: HostFacts::default(),
@@ -676,38 +834,82 @@ mod tests {
         }
     }
 
-    fn key(clients: &[&str]) -> String {
-        tcc_cmd(clients).display()
-    }
-
     fn item(id: &str) -> PersonItem {
         PersonItem {
             step: PersonStep::parse(id).unwrap(),
         }
     }
 
+    fn rows_of(text: &str) -> Result<Vec<TccRow>, String> {
+        parse_tcc(text)
+    }
+
+    fn denied() -> Result<Vec<TccRow>, String> {
+        Err(NEEDS_REMOTE_FDA.to_owned())
+    }
+
     #[test]
-    fn the_tcc_query_is_one_readonly_sqlite3_run_naming_only_the_wanted_clients() {
+    fn the_remote_tcc_cmd_routes_through_the_agents_native_tcc_verb() {
         assert_eq!(
-            key(&["com.aterm.aterm"]),
-            "/usr/bin/sqlite3 -init /dev/null -readonly -safe -nofollow -batch -bail -noheader \
-             -list -separator '|' \
-             'file:/Library/Application%20Support/com.apple.TCC/TCC.db?immutable=1' \
-             'select client,service,auth_value from access where client in ('\\''com.aterm.aterm'\\'')'"
+            tcc_cmd(&["com.aterm.aterm"]).display(),
+            "/Library/Management/aterm/bin/aterm machines agent tcc com.aterm.aterm"
         );
         assert_eq!(
             tcc_open_cmd().display(),
-            "/usr/bin/sqlite3 -init /dev/null -readonly -safe -nofollow -batch -bail -noheader \
-             -list -separator '|' \
-             'file:/Library/Application%20Support/com.apple.TCC/TCC.db?immutable=1' \
-             'select count(*) from access'"
+            "/Library/Management/aterm/bin/aterm machines agent tcc"
         );
+
+        let sys = Fake::root();
+        sys.on_tcc(
+            &["com.aterm.aterm"],
+            rows_of("com.aterm.aterm|kTCCServiceDeveloperTool|2\n"),
+        );
+        let mut out = Vec::new();
+        assert_eq!(
+            agent_tcc(&sys, &["com.aterm.aterm"], &mut out),
+            std::process::ExitCode::SUCCESS
+        );
+        let step = PersonStep::parse("developer_tools:aterm").unwrap();
+        let probe = probe_step(&step, Known::default(), &mut |cmd| {
+            assert_eq!(cmd, &tcc_cmd(&["com.aterm.aterm"]));
+            Ok(Ran::ok(&String::from_utf8(out.clone()).unwrap()))
+        });
+        assert_eq!(
+            probe,
+            Probe::Ok {
+                now: "granted".into()
+            }
+        );
+
+        let refused_sys = Fake::root();
+        refused_sys.on_tcc(&[], denied());
+        let mut refused_out = Vec::new();
+        assert_eq!(
+            agent_tcc(&refused_sys, &[], &mut refused_out),
+            std::process::ExitCode::FAILURE
+        );
+        let remote_fda = PersonStep::parse("remote_full_disk_access").unwrap();
+        let fda_probe = probe_step(&remote_fda, Known::default(), &mut |cmd| {
+            assert_eq!(cmd, &tcc_open_cmd());
+            Ok(Ran {
+                status: Some(1),
+                stdout: refused_out.clone(),
+                stderr: Vec::new(),
+            })
+        });
+        assert!(matches!(fda_probe, Probe::Person { .. }), "{fda_probe:?}");
+
+        let mut bad_out = Vec::new();
+        assert_eq!(
+            agent_tcc(&Fake::root(), &["com.x');drop"], &mut bad_out),
+            std::process::ExitCode::from(crate::agent::REFUSED)
+        );
+        assert!(String::from_utf8_lossy(&bad_out).starts_with("refused: "));
     }
 
-    /// THE READ TAKES NO LOCK ON tccd's FILE (macOS: Apple's `/usr/bin/sqlite3`): the
-    /// options every TCC read passes, over a scratch database's immutable URI, answer its rows
-    /// while the lock a committing writer holds is taken (`EXCLUSIVE`: `PENDING_BYTE` and
-    /// the 511 bytes after it).
+    /// THE READ TAKES NO LOCK ON tccd's FILE AND SPAWNS NO SUBPROCESS: [`read_tcc_file`]
+    /// answers rows from a WAL-backed database while the `EXCLUSIVE` byte-range lock a
+    /// committing writer holds (`PENDING_BYTE` and the 511 bytes after it) is taken.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_tcc_read_takes_no_lock_a_writer_would_meet() {
@@ -716,19 +918,13 @@ mod tests {
         let db = std::fs::canonicalize(dir.path())
             .expect("canonical")
             .join("TCC.db");
-        let sqlite = |target: &str, sql: &str| {
-            aterm_uds::spawnfd::command(SQLITE3)
-                .args(SQLITE3_OPTIONS)
-                .arg(target)
-                .arg(sql)
-                .output()
-                .expect("sqlite3")
-        };
-        let made = aterm_uds::spawnfd::command(SQLITE3)
+        let made = aterm_uds::spawnfd::command("/usr/bin/sqlite3")
             .arg(&db)
             .arg(
-                "CREATE TABLE access (service TEXT, client TEXT, auth_value INTEGER); \
-                 INSERT INTO access VALUES ('kTCCServiceDeveloperTool', 'com.aterm.aterm', 2);",
+                "PRAGMA journal_mode=WAL; \
+                 CREATE TABLE access (service TEXT, client TEXT, client_type INTEGER, auth_value INTEGER); \
+                 INSERT INTO access VALUES ('kTCCServiceDeveloperTool', 'com.aterm.aterm', 0, 2); \
+                 INSERT INTO access VALUES ('kTCCServicePostEvent', 'com.apple.screensharing.agent', 0, 2);",
             )
             .output()
             .expect("made");
@@ -747,16 +943,19 @@ mod tests {
         // SAFETY: `fl` is valid for the call and the descriptor is open.
         let rc = unsafe { libc::fcntl(held.as_raw_fd(), libc::F_SETLK, &raw const fl) };
         assert_eq!(rc, 0, "the writer's lock is taken");
-        let query = tcc_query(&["com.aterm.aterm"]);
-        let control = sqlite(&db.to_string_lossy(), &query);
+        let control = aterm_uds::spawnfd::command("/usr/bin/sqlite3")
+            .args(["-readonly", "-bail"])
+            .arg(&db)
+            .arg("SELECT client, service, auth_value FROM access WHERE client = 'com.aterm.aterm'")
+            .output()
+            .expect("sqlite3 control");
         assert!(
             String::from_utf8_lossy(&control.stderr).contains("database is locked"),
             "{control:?}"
         );
-        let read = sqlite(&aterm_uds::foreign_db::immutable_uri(&db), &query);
-        assert!(read.status.success(), "{read:?}");
+        assert_eq!(read_tcc_file(&db, &[]), Ok(Vec::new()));
         assert_eq!(
-            parse_tcc(&String::from_utf8_lossy(&read.stdout)),
+            read_tcc_file(&db, &["com.aterm.aterm"]),
             Ok(vec![TccRow {
                 client: "com.aterm.aterm".into(),
                 service: "kTCCServiceDeveloperTool".into(),
@@ -764,22 +963,24 @@ mod tests {
             }])
         );
         drop(held);
+
+        let corrupt = dir.path().join("corrupt.db");
+        std::fs::write(&corrupt, b"not a sqlite file").expect("corrupt");
+        let bad = read_tcc_file(&corrupt, &["com.aterm.aterm"]).unwrap_err();
+        assert_ne!(bad, NEEDS_REMOTE_FDA);
     }
 
     #[test]
     fn a_database_that_fails_to_open_for_another_reason_is_unusable_not_the_fda_switch() {
-        let gone = Ran::exit(
-            1,
-            "Error: unable to open database \"file:/Library/Application%20Support/com.apple.TCC/TCC.db?immutable=1\": unable to open database file\n",
-        );
+        let gone = Err("the TCC database did not answer: unable to open database file".to_owned());
         let sys = Fake::root();
-        sys.on(&tcc_open_cmd().display(), gone.clone());
+        sys.on_tcc(&[], gone.clone());
         assert!(matches!(
             item("remote_full_disk_access").probe(&sys, &ctx()),
             Probe::Unusable { .. }
         ));
         let sys = Fake::root();
-        sys.on(&key(&["com.aterm.aterm"]), gone);
+        sys.on_tcc(&["com.aterm.aterm"], gone);
         let probe = item("developer_tools:aterm").probe(&sys, &ctx());
         assert!(
             matches!(&probe, Probe::Unusable { why } if why != NEEDS_REMOTE_FDA),
@@ -847,7 +1048,7 @@ mod tests {
     fn screen_sharing_needs_the_service_on_and_both_agent_grants() {
         let sys = Fake::root();
         sys.on(&print_disabled_cmd().display(), Ran::ok(PRINT_DISABLED_VM));
-        sys.on(&key(&[SCREEN_SHARING_AGENT]), Ran::ok(TCC_VM));
+        sys.on_tcc(&[SCREEN_SHARING_AGENT], rows_of(TCC_VM));
         assert_eq!(
             item("screen_sharing").probe(&sys, &ctx()),
             Probe::Ok {
@@ -856,9 +1057,9 @@ mod tests {
         );
         let sys = Fake::root();
         sys.on(&print_disabled_cmd().display(), Ran::ok(PRINT_DISABLED_VM));
-        sys.on(
-            &key(&[SCREEN_SHARING_AGENT]),
-            Ran::ok("com.apple.screensharing.agent|kTCCServiceScreenCapture|2\n"),
+        sys.on_tcc(
+            &[SCREEN_SHARING_AGENT],
+            rows_of("com.apple.screensharing.agent|kTCCServiceScreenCapture|2\n"),
         );
         assert!(matches!(
             item("screen_sharing").probe(&sys, &ctx()),
@@ -879,7 +1080,7 @@ mod tests {
     #[test]
     fn full_disk_access_is_granted_only_at_auth_value_two() {
         let sys = Fake::root();
-        sys.on(&key(&["com.aterm.aterm"]), Ran::ok(TCC_VM));
+        sys.on_tcc(&["com.aterm.aterm"], rows_of(TCC_VM));
         let Probe::Person { step, how } = item("full_disk_access:aterm").probe(&sys, &ctx()) else {
             panic!("aterm is listed but off in the VM");
         };
@@ -891,9 +1092,9 @@ mod tests {
         assert!(how.ends_with(PANE_FULL_DISK_ACCESS), "{how}");
 
         let sys = Fake::root();
-        sys.on(
-            &key(&["com.aterm.aterm"]),
-            Ran::ok("com.aterm.aterm|kTCCServiceSystemPolicyAllFiles|2\n"),
+        sys.on_tcc(
+            &["com.aterm.aterm"],
+            rows_of("com.aterm.aterm|kTCCServiceSystemPolicyAllFiles|2\n"),
         );
         assert_eq!(
             item("full_disk_access:aterm").probe(&sys, &ctx()),
@@ -906,9 +1107,9 @@ mod tests {
     #[test]
     fn developer_tools_reads_its_own_service_and_an_unlisted_app_is_a_person_step() {
         let sys = Fake::root();
-        sys.on(
-            &key(&["com.aterm.aterm"]),
-            Ran::ok("com.aterm.aterm|kTCCServiceSystemPolicyAllFiles|2\n"),
+        sys.on_tcc(
+            &["com.aterm.aterm"],
+            rows_of("com.aterm.aterm|kTCCServiceSystemPolicyAllFiles|2\n"),
         );
         let Probe::Person { step, how } = item("developer_tools:aterm").probe(&sys, &ctx()) else {
             panic!("aterm is not in Developer Tools");
@@ -916,9 +1117,9 @@ mod tests {
         assert_eq!(step, "developer_tools:aterm");
         assert!(how.ends_with(PANE_DEVELOPER_TOOLS), "{how}");
         let sys = Fake::root();
-        sys.on(
-            &key(&["com.aterm.aterm"]),
-            Ran::ok("com.aterm.aterm|kTCCServiceDeveloperTool|2\n"),
+        sys.on_tcc(
+            &["com.aterm.aterm"],
+            rows_of("com.aterm.aterm|kTCCServiceDeveloperTool|2\n"),
         );
         assert!(matches!(
             item("developer_tools:aterm").probe(&sys, &ctx()),
@@ -935,8 +1136,8 @@ mod tests {
         ] {
             let sys = Fake::root();
             sys.on(&print_disabled_cmd().display(), Ran::ok(PRINT_DISABLED_VM));
-            sys.on(&key(&[SCREEN_SHARING_AGENT]), Ran::exit(1, TCC_DENIED));
-            sys.on(&key(&["com.aterm.aterm"]), Ran::exit(1, TCC_DENIED));
+            sys.on_tcc(&[SCREEN_SHARING_AGENT], denied());
+            sys.on_tcc(&["com.aterm.aterm"], denied());
             assert_eq!(
                 item(id).probe(&sys, &ctx()),
                 Probe::Unusable {
@@ -958,7 +1159,7 @@ mod tests {
         ));
         assert!(sys.calls().is_empty(), "the fact answers without a read");
         let sys = Fake::root();
-        sys.on(&tcc_open_cmd().display(), Ran::exit(1, TCC_DENIED));
+        sys.on_tcc(&[], denied());
         let Probe::Person { step, how } = item("remote_full_disk_access").probe(&sys, &ctx())
         else {
             panic!("a refused open is the person step");
@@ -969,7 +1170,7 @@ mod tests {
             "{how}"
         );
         let sys = Fake::root();
-        sys.on(&tcc_open_cmd().display(), Ran::ok("5\n"));
+        sys.on_tcc(&[], Ok(Vec::new()));
         assert!(matches!(
             item("remote_full_disk_access").probe(&sys, &ctx()),
             Probe::Ok { .. }
@@ -986,14 +1187,14 @@ mod tests {
         c.console = Some(admin());
         let record = "admin$ /Applications/aterm.app/Contents/MacOS/aterm ctl privacy --json";
         let sys = Fake::root();
-        sys.on(&key(&["com.aterm.aterm"]), Ran::exit(1, TCC_DENIED));
+        sys.on_tcc(&["com.aterm.aterm"], denied());
         sys.on(record, Ran::ok(PRIVACY_VM));
         assert!(matches!(
             item("full_disk_access:aterm").probe(&sys, &c),
             Probe::Person { .. }
         ));
         let sys = Fake::root();
-        sys.on(&key(&["com.aterm.aterm"]), Ran::exit(1, TCC_DENIED));
+        sys.on_tcc(&["com.aterm.aterm"], denied());
         sys.on(
             record,
             Ran::ok(&PRIVACY_VM.replace("no_full_disk_access", "read")),
@@ -1003,7 +1204,7 @@ mod tests {
             Probe::Ok { .. }
         ));
         let sys = Fake::root();
-        sys.on(&key(&["com.aterm.aterm"]), Ran::exit(1, TCC_DENIED));
+        sys.on_tcc(&["com.aterm.aterm"], denied());
         sys.on(
             record,
             Ran::ok(
@@ -1022,7 +1223,7 @@ mod tests {
             }
         );
         let sys = Fake::root();
-        sys.on(&key(&["com.aterm.aterm"]), Ran::exit(1, TCC_DENIED));
+        sys.on_tcc(&["com.aterm.aterm"], denied());
         assert_eq!(
             item("full_disk_access:aterm").probe(&sys, &c),
             Probe::Unusable {

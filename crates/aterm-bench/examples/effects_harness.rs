@@ -5,12 +5,16 @@ use std::fmt::Write as _;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
+use aterm_core::config::TerminalConfig;
 use aterm_core::render::{
     DecoGlyph, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRect, FxSlot, FxSpace, InkCell,
     PxRect, WordDecoration,
 };
-use aterm_core::terminal::Terminal;
-use aterm_effects::cursor_fx::CursorFxInput;
+use aterm_core::terminal::{Rgb, Terminal};
+use aterm_effects::cursor_fx::{
+    CursorFxInput, GlowKnobs, GlowSpelling, TrailColor, follow_live_cursor, head_dx_for,
+    resolve_glow_config,
+};
 use aterm_effects::cursor_glow::{
     CURSOR_WITNESS_ROWS, CursorGlow, Geom, GlowConfig, GlowStyle, ProbeTrust,
 };
@@ -21,11 +25,13 @@ use aterm_effects::harness_card::{
 };
 use aterm_effects::host::motion_print_anchor;
 use aterm_effects::pipeline::{CursorStep, EffectsPipeline, RowProbe};
+use aterm_effects::sound_policy::fold_window_audibility;
 use aterm_gpu::gpu_time::{self, Settled};
 use aterm_gpu::{
     FetchProbe, FrameShape, GpuContext, GpuRenderer, UnormAblation, UnormRoute, WindowGpu,
 };
 use aterm_render::{RenderInput, Renderer, Theme, WindowCpu};
+use aterm_types::scheme::ColorScheme;
 
 const FONT_PX: f32 = 30.0;
 const ROWS: usize = 26;
@@ -373,6 +379,8 @@ struct Run {
     refs: Vec<RefSample>,
 }
 
+/// The full repaints every scene's GPU time is read against (`ref_*`). Their terminals stay
+/// bare, unthemed ([`Rig::term`]): the yardstick is the same work on every tree.
 struct Reference {
     inputs: [RenderInput; 2],
     blanks: [RenderInput; 2],
@@ -441,6 +449,10 @@ struct Rig {
     clock: &'static str,
     counter: &'static str,
     theme: Theme,
+    /// The name of the built-in theme [`Self::theme`] comes from ([`rig_scheme`]).
+    theme_name: String,
+    /// What a window gives each terminal it draws on [`Self::theme`] ([`engine_colors`]).
+    colors: TerminalConfig,
     cw: u16,
     ch: u16,
     pad: u16,
@@ -506,13 +518,60 @@ impl Knobs {
     }
 }
 
-/// `--light`: every scene on Default Light, the shipped light theme, the card in its light
-/// palette.
-fn default_light() -> Theme {
-    aterm_types::scheme::builtin("Default Light").map_or_else(
-        || fail("Default Light is not a built-in theme"),
-        |s| Theme::from(&s),
-    )
+/// The theme `--theme NAME` or `--theme=NAME` names, if the command line has either; a
+/// `--theme` with no name after it fails rather than leaving the rig on Default.
+fn theme_arg() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let name = if arg == "--theme" {
+            args.next()
+        } else if let Some(name) = arg.strip_prefix("--theme=") {
+            Some(name.to_string())
+        } else {
+            continue;
+        };
+        return match name {
+            Some(name) if !name.is_empty() && !name.starts_with("--") => Some(name),
+            _ => fail("--theme names no theme: pass --theme NAME or --theme=NAME"),
+        };
+    }
+    None
+}
+
+/// The rig's theme: Default, under `--light` Default Light (the shipped light theme, the card
+/// in its light palette), or under `--theme NAME` that built-in theme, its ground deciding the
+/// arm the trail draws as it does in a window.
+fn rig_scheme() -> ColorScheme {
+    let named = theme_arg();
+    let light = std::env::args().skip(1).any(|a| a == "--light");
+    let name = match (named.as_deref(), light) {
+        (Some(_), true) => fail("--theme and --light both name the rig's theme"),
+        (Some(name), false) => name,
+        (None, true) => "Default Light",
+        (None, false) => "Default",
+    };
+    aterm_types::scheme::builtin(name)
+        .unwrap_or_else(|| fail(format!("{name} is not a built-in theme")))
+}
+
+/// The engine colours a window gives every terminal it draws on `scheme`, a theme its config
+/// names (aterm-gui's `Config::applied_terminal_config_from`): the theme's ink and ground, its
+/// cursor and selection, and its ANSI slots as the indexed palette. A bare `Terminal::new`
+/// draws its own E5E5E5 on 000000 and xterm's slots, letters no window shows on the theme's
+/// page, which the letter guard then judges under lights solved for the theme's.
+fn engine_colors(scheme: &ColorScheme) -> TerminalConfig {
+    let parts = scheme.to_theme_parts();
+    let unpack = |c: u32| Rgb::new((c >> 16) as u8, (c >> 8) as u8, c as u8);
+    TerminalConfig {
+        default_foreground: scheme.foreground,
+        default_background: scheme.background,
+        cursor_color: Some(unpack(parts.cursor)),
+        selection_background: Some(unpack(parts.selection)),
+        selection_foreground: scheme.selection_fg,
+        custom_palette: Some(scheme.to_color_palette()),
+        color_scheme: Some(scheme.appearance),
+        ..TerminalConfig::default()
+    }
 }
 
 fn skip(why: impl std::fmt::Display) -> ! {
@@ -528,11 +587,8 @@ impl Rig {
             env!("CARGO_MANIFEST_DIR"),
             "/../aterm-render/tests/fixtures/jetbrains-mono.ttf"
         );
-        let theme = if std::env::args().skip(1).any(|a| a == "--light") {
-            default_light()
-        } else {
-            Theme::default()
-        };
+        let scheme = rig_scheme();
+        let theme = Theme::from(&scheme);
         let ctx = GpuContext::new().unwrap_or_else(|e| skip(format!("no GPU: {e}")));
         let raster = |what: &str| {
             let mut r = Renderer::from_system_with_family(Some(font), FONT_PX, theme)
@@ -578,6 +634,8 @@ impl Rig {
             clock,
             counter,
             theme,
+            colors: engine_colors(&scheme),
+            theme_name: scheme.name,
             frames: 0,
             reference: Reference::new(),
             refs: Vec::new(),
@@ -617,6 +675,14 @@ impl Rig {
             eye: 0x0040_C080,
             wand: None,
         }
+    }
+
+    /// A scene's terminal, in the rig's theme as a window draws it: the colours the app gives
+    /// every session ([`Terminal::apply_config_colors`]).
+    fn term(&self) -> Terminal {
+        let mut term = Terminal::new(ROWS as u16, COLS as u16);
+        term.apply_config_colors(&self.colors);
+        term
     }
 
     fn grid(&self) -> (i32, i32) {
@@ -986,29 +1052,45 @@ struct GlowHost {
 }
 
 impl GlowHost {
+    /// The config a focused window resolves for `style` on the rig's theme (aterm-gui's
+    /// `App::glow_config_for`, then `fold_window_audibility`), from knobs a default window
+    /// does not pass. Like a default window's, they set no `cursor_trail_color` or accent, so
+    /// the colour is the style's automatic one against the theme's cursor and the accent its
+    /// brightening, and the radius and ring reach only the styles that read them. Unlike a
+    /// default window's, the duration is 650 ms, the length 512 and the radius 0.4, where a
+    /// default config gives 260 ms, 24 and 0.6; each is a value a config can set. The
+    /// brightness, 1.0, is every style's default but Classic's (0.7). Of those three knobs,
+    /// Rainbow Kitty, the style of the typing, meteor, flood and composer scenes, reads only
+    /// the duration.
     fn new(rig: &Rig, style: GlowStyle) -> Self {
-        let mut host = Self {
-            fx: EffectsPipeline::for_window(),
-            cfg: GlowConfig {
-                classic_mono: false,
-                ribbon_tall: true,
-                ribbon_flat: false,
+        let mut cfg = resolve_glow_config(
+            GlowKnobs {
                 enabled: true,
-                dark_theme: aterm_render::theme_is_dark(rig.theme.bg),
-                theme_fg: rig.theme.fg,
-                theme_bg: rig.theme.bg,
-                style,
-                color: 0x00d0_d0d0,
-                accent: 0x0048_c9ff,
-                duration: Duration::from_millis(650),
-                length: usize::MAX,
+                color: None,
+                accent: None,
+                duration_ms: 650,
+                length: 512,
                 intensity: 1.0,
-                audible: true,
                 radius: 0.4,
                 ring: true,
-                beam: aterm_effects::cursor_glow::style_has_beam_of(style, ""),
-                head_dx: 0.5,
             },
+            GlowSpelling {
+                style: Some(style),
+                beam: aterm_effects::cursor_glow::style_has_beam_of(style, ""),
+                ribbon_tall: true,
+                ribbon_flat: false,
+                classic_mono: false,
+            },
+            rig.theme.cursor,
+            aterm_render::theme_is_dark(rig.theme.bg),
+            rig.theme.fg,
+            rig.theme.bg,
+            0.5,
+        );
+        fold_window_audibility(&mut cfg, 1.0, 1.0, true);
+        let mut host = Self {
+            fx: EffectsPipeline::for_window(),
+            cfg,
             geom: rig.glow_geom(),
             row: Vec::new(),
             witness: Vec::new(),
@@ -1033,8 +1115,39 @@ impl GlowHost {
         caret: (u16, u16),
         now: Instant,
     ) -> (u64, Spent) {
-        let watch = Stopwatch::start();
+        // What a window reads off its terminal each frame before the step (aterm-gui's
+        // `App::cursor_frame`): the cursor colour it presents, which the automatic glow
+        // colour and accent follow, the cursor's shape and the ground under it.
+        let ink = term
+            .cursor_color()
+            .unwrap_or_else(|| term.default_foreground());
+        let live_cursor = aterm_render::rgb_to_u32([ink.r, ink.g, ink.b]);
+        let pinned = term.cursor_color_recoloured();
+        let mut trail = TrailConfig {
+            enabled: false,
+            duration: self.cfg.duration,
+            max_len: self.cfg.length,
+            color: self.cfg.color,
+            intensity: self.cfg.intensity,
+            warmth: 0.0,
+        };
+        follow_live_cursor(
+            &mut self.cfg,
+            &mut trail,
+            live_cursor,
+            pinned,
+            TrailColor::Automatic,
+            false,
+            None,
+        );
+        self.cfg.head_dx = head_dx_for(term.cursor_style());
         let (row, col) = caret;
+        let cursor_cell_bg = input
+            .cells
+            .get(usize::from(row))
+            .and_then(|cells| cells.get(usize::from(col)))
+            .map(|cell| aterm_render::rgb_to_u32(cell.bg));
+        let watch = Stopwatch::start();
         let below_row = usize::from(row) + 1 < ROWS;
         term.row_cols_into(usize::from(row), &mut self.row);
         if row > 0 {
@@ -1055,17 +1168,17 @@ impl GlowHost {
         }
         let (print_anchor, print_anchor_glyph) = motion_print_anchor(term);
         let step = self.fx.cursor_step(
-            &CursorStep {
-                input: CursorFxInput {
+            &CursorStep::new(
+                CursorFxInput {
                     now,
                     cur: Some(caret),
                     live_viewport: true,
                     cursor_style: term.cursor_style(),
                     blink_phase: true,
-                    live_cursor: self.cfg.color,
-                    cursor_color_pinned: false,
+                    live_cursor,
+                    cursor_color_pinned: pinned,
                     default_bg: self.cfg.theme_bg,
-                    cursor_cell_bg: None,
+                    cursor_cell_bg,
                     geom: self.geom,
                     focused: true,
                     shed_envelope: 1.0,
@@ -1075,33 +1188,23 @@ impl GlowHost {
                     user_tinted: false,
                     accent_pinned: false,
                 },
-                glow: &self.cfg,
-                trail: TrailConfig {
-                    enabled: false,
-                    duration: self.cfg.duration,
-                    max_len: self.cfg.length,
-                    color: self.cfg.color,
-                    intensity: self.cfg.intensity,
-                    warmth: 0.0,
-                },
-                animate: true,
-                row_probe: Some(RowProbe {
-                    row,
-                    caret: col,
-                    trust: ProbeTrust::Full,
-                    cols: &self.row,
-                    flanks: Some((
-                        (row > 0).then_some(self.above.as_slice()),
-                        below_row.then_some(self.below.as_slice()),
-                    )),
-                }),
-                frame_cells: Some(input.cells.as_slice()),
-                frame_cells_at: (0, 0),
-                pending_keys: 0,
-                print_anchor,
-                print_anchor_glyph,
-                caret_drawn: true,
-            },
+                &self.cfg,
+                trail,
+            )
+            .with_row_probe(Some(RowProbe {
+                row,
+                caret: col,
+                trust: ProbeTrust::Full,
+                cols: &self.row,
+                flanks: Some((
+                    (row > 0).then_some(self.above.as_slice()),
+                    below_row.then_some(self.below.as_slice()),
+                )),
+            }))
+            .with_frame_cells(Some(input.cells.as_slice()))
+            .with_frame_cells_cols(input.cols)
+            .with_print_anchor(print_anchor)
+            .with_print_anchor_glyph(print_anchor_glyph),
             std::iter::empty(),
         );
         (step.frame.glow_fp, watch.stop())
@@ -1134,7 +1237,7 @@ fn banner_at(term: &Terminal, row: u16, scratch: &mut Vec<char>) -> bool {
 }
 
 fn card_scenes(rig: &mut Rig, seed: u64) -> (Run, Run, Run) {
-    let mut term = Terminal::new(ROWS as u16, COLS as u16);
+    let mut term = rig.term();
     term.process(b"$ claude");
     print_card(&mut term, CARD_TOP);
     let composer = CARD_TOP + BOX_ROWS + 2;
@@ -1234,7 +1337,7 @@ fn card_scenes(rig: &mut Rig, seed: u64) -> (Run, Run, Run) {
 /// Two small items spanning eight row bands, recoloured each frame without moving their hull.
 /// Every measured frame follows an already drawn frame; verification runs outside the timers.
 fn sparse_fx_scene(rig: &mut Rig) -> Run {
-    let mut term = Terminal::new(ROWS as u16, COLS as u16);
+    let mut term = rig.term();
     let mut input = term.cell_frame(ROWS, COLS);
     input.cursor_visible = false;
     let layers: [FxLayer; 2] = std::array::from_fn(|phase| {
@@ -1379,7 +1482,7 @@ impl Page {
 }
 
 fn typing_scene(rig: &mut Rig, style: GlowStyle, page: Page, script: Script) -> Run {
-    let mut term = Terminal::new(ROWS as u16, COLS as u16);
+    let mut term = rig.term();
     page.paint(&mut term);
     let mut input = RenderInput::empty();
     let mut win = Win::new();
@@ -1432,7 +1535,7 @@ fn scroll_scene(rig: &mut Rig) -> Run {
     let mut row = Vec::new();
     rig.refs.clear();
     for _ in 0..SCROLL_CYCLES {
-        let mut term = Terminal::new(ROWS as u16, COLS as u16);
+        let mut term = rig.term();
         for i in 0..SCROLL_TOP - 2 {
             term.process(format!("{} {i}\r\n", &STREAMED[..60]).as_bytes());
         }
@@ -1506,7 +1609,7 @@ fn pipeline_scene(
     setup: impl FnOnce(&mut EffectsPipeline),
     mut feed: impl FnMut(usize, &mut EffectsPipeline, &mut Terminal, &RenderInput) -> bool,
 ) -> Run {
-    let mut term = Terminal::new(ROWS as u16, COLS as u16);
+    let mut term = rig.term();
     for i in 0..4 {
         term.process(format!("{} {i}\r\n", &STREAMED[..72]).as_bytes());
     }
@@ -2190,7 +2293,7 @@ fn report_reference(r: &mut Report, scenes: &[Scene], clocked: bool, counted: bo
 fn main() {
     if std::env::args().skip(1).any(|a| a == "--help") {
         println!(
-            "effects_harness [--light] [--damage] [--only a,b,...] [--ramp-cost LIGHT,RAMP|never] [--ramps-fx fx|instances] [--frames PATH]\n  --damage: animated card scenes and recoloured sparse FX layers, with dirty rows and full-render pixel verification\n  --only: run only the named scenes (episode, flowing, settled, typing, scroll, bolt, comet, classic, meteor, flood, rain, cats, pet, icons; fx_sparse under --damage; composer only when named)\n  --light: every scene on Default Light"
+            "effects_harness [--light | --theme NAME | --theme=NAME] [--damage] [--only a,b,...] [--ramp-cost LIGHT,RAMP|never] [--ramps-fx fx|instances] [--frames PATH]\n  --damage: animated card scenes and recoloured sparse FX layers, with dirty rows and full-render pixel verification\n  --only: run only the named scenes (episode, flowing, settled, typing, scroll, bolt, comet, classic, meteor, flood, rain, cats, pet, icons; fx_sparse under --damage; composer only when named)\n  --light: every scene on Default Light\n  --theme NAME, --theme=NAME: every scene on the named built-in theme (\"Solarized Light\", \"Catppuccin Latte\", ...)"
         );
         return;
     }
@@ -2362,6 +2465,7 @@ fn main() {
     report.text("gpu_clock", rig.clock);
     report.text("cpu_clock", if cfg!(unix) { "thread" } else { "wall" });
     report.text("cpu_counter", rig.counter);
+    report.text("theme", &rig.theme_name);
     report.text(
         "ground",
         if dark_ground(rig.theme.bg) {

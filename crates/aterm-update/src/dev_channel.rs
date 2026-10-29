@@ -60,12 +60,15 @@ impl DevLag {
         let release = format!("aterm {}", self.latest());
         match self {
             Self::Behind {
+                releases: None | Some(0),
+                ..
+            } => format!("older than {release}"),
+            Self::Behind {
                 releases: Some(1), ..
             } => format!("1 release behind {release}"),
             Self::Behind {
                 releases: Some(n), ..
             } => format!("{n} releases behind {release}"),
-            Self::Behind { releases: None, .. } => format!("older than {release}"),
             Self::Current { .. } => format!("at {release}, the newest release"),
             Self::Ahead { .. } => format!("newer than {release}, the newest release"),
         }
@@ -94,7 +97,8 @@ pub fn classify(running_version: &str, latest_tag: &str) -> Option<DevLag> {
     let tag = latest_tag.to_string();
     Some(match running.cmp(&latest) {
         std::cmp::Ordering::Less => DevLag::Behind {
-            releases: (running[0] == latest[0]).then(|| latest[1] - running[1]),
+            releases: (running[0] == latest[0] && running[1] < latest[1])
+                .then(|| latest[1] - running[1]),
             latest: tag,
         },
         std::cmp::Ordering::Equal => DevLag::Current { latest: tag },
@@ -416,6 +420,23 @@ mod tests {
                 latest: "v0.93.0".into(),
                 releases: Some(1),
             })
+        );
+        let patch_lag = classify("0.93.0", "v0.93.1").expect("patch lag");
+        assert_eq!(
+            patch_lag,
+            DevLag::Behind {
+                latest: "v0.93.1".into(),
+                releases: None,
+            }
+        );
+        assert_eq!(patch_lag.words(), "older than aterm v0.93.1");
+        assert_eq!(
+            DevLag::Behind {
+                latest: "v0.93.1".into(),
+                releases: Some(0),
+            }
+            .words(),
+            "older than aterm v0.93.1"
         );
         assert_eq!(
             classify("0.93.0", "v1.0.0"),

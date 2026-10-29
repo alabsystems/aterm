@@ -245,6 +245,11 @@ fn one_master_and_one_roster_authorize_both_a_release_and_a_toolchain_index() {
         anchor.is_armed(),
         "precondition: the atpkg anchor is armed with the master, not a package root"
     );
+    assert_eq!(
+        atpkg::PKG_TRUST_ANCHORS,
+        aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
+        "atpkg and release verification share the one master anchor slice"
+    );
 }
 
 #[test]
@@ -288,8 +293,8 @@ fn an_unpinned_client_installs_nothing_although_every_byte_is_genuine() {
         "the same bytes install under the pinned master"
     );
 
-    assert!(!atpkg::PKG_TRUST_ANCHORS.is_empty());
-    assert!(atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS));
+    assert!(!atpkg::manager_enabled_with(&[]));
+    assert!(atpkg::manager_enabled_with(&[p.master_pub.as_str()]));
 }
 
 #[test]

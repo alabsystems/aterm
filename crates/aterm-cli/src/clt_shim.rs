@@ -38,7 +38,7 @@ trait ShimHost {
 }
 
 /// Serve a shim invoked as `tool` (its `argv[0]`) with `rest` (its `argv[1..]`).
-#[must_use]
+#[must_use = "return the shim's exit status from the front door"]
 pub fn run(tool: &str, rest: Vec<OsString>) -> ExitCode {
     ExitCode::from(run_with(&Live, tool, &rest))
 }

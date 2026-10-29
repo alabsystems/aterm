@@ -649,9 +649,11 @@ impl<R: Read> Read for Decoder<R> {
                 }
                 _ => {}
             }
+            let total_before = self.total;
             if let Err(e) = self.step() {
                 // What the failed step wrote is never handed out: nothing past a refusal is.
                 self.out.truncate(self.read);
+                self.total = total_before;
                 self.state = State::Failed;
                 return Err(e.into());
             }

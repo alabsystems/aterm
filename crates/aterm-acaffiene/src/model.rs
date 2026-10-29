@@ -31,7 +31,8 @@ impl Choice {
     /// Every choice, in menu order.
     pub const ALL: [Self; 4] = [Self::Hours1, Self::Hours8, Self::Hours24, Self::Forever];
 
-    /// The span this choice keeps the Mac awake for, `None` for [`Choice::Forever`].
+    /// The span this choice counts down, `None` for [`Choice::Forever`]; at its end the mode
+    /// returns to forever ([`crate::state::restore`]).
     #[inline]
     #[must_use]
     pub const fn span(self) -> Option<u64> {
@@ -122,9 +123,10 @@ pub enum Mode {
     Off,
     /// Keeping it awake until turned off.
     Forever,
-    /// Keeping it awake until `deadline`.
+    /// Keeping it awake for a span that ends at `deadline`: [`Mode::settled`] reads it off from
+    /// then, and [`crate::state::restore`] returns it to forever.
     Until {
-        /// When it turns off, on the boot clock ([`Clocks::since_boot`]).
+        /// When the span ends, on the boot clock ([`Clocks::since_boot`]).
         deadline: u64,
         /// The span it was set for.
         span: u64,
@@ -153,25 +155,38 @@ impl Mode {
         Self::activate(choice.span(), now)
     }
 
-    /// What a click at `now` turns the mug to: off when it is on, forever when it is off.
+    /// What a click at `now` turns the mug to: off when it is on as the mug keeps it
+    /// ([`Mode::kept`], so a span past its deadline is on), forever when it is off.
     #[inline]
     #[must_use]
     pub const fn toggled(self, now: Clocks) -> Self {
-        if self.is_on(now) {
+        if self.kept(now).is_on(now) {
             Self::Off
         } else {
             Self::Forever
         }
     }
 
-    /// This mode at `now`: off past its deadline, and with no more than its span left (a deadline
-    /// further off, such as a hand-edited file's, comes in to its span).
+    /// This mode at `now` as the mug keeps it: [`Mode::settled`], except that a span past its
+    /// deadline is forever, the mode every span ends in.
+    #[inline]
+    #[must_use]
+    pub const fn kept(self, now: Clocks) -> Self {
+        match (self, self.settled(now)) {
+            (Self::Until { .. }, Self::Off) => Self::Forever,
+            (_, settled) => settled,
+        }
+    }
+
+    /// This mode at `now`: off past its deadline or with a span of nothing (a hand-edited `span=0`,
+    /// which ends as it starts), and with no more than its span left (a deadline further off, such
+    /// as a hand-edited file's, comes in to its span).
     #[inline]
     #[must_use]
     pub const fn settled(self, now: Clocks) -> Self {
         let now = now.since_boot;
         match self {
-            Self::Until { deadline, .. } if deadline <= now => Self::Off,
+            Self::Until { deadline, span } if deadline <= now || span == 0 => Self::Off,
             Self::Until { deadline, span } if deadline - now > span => Self::Until {
                 deadline: now + span,
                 span,
@@ -269,7 +284,34 @@ mod tests {
         assert_eq!(on.toggled(NOW + 5), Mode::Off);
         let timed = Mode::chosen(Choice::Hours8, NOW);
         assert_eq!(timed.toggled(NOW + 1), Mode::Off);
-        assert_eq!(timed.toggled(NOW + 8 * HOUR), Mode::Forever);
+        // A span past its deadline is forever until the mug's tick takes it again, so a click
+        // then turns it off, as it does any lit mug.
+        assert_eq!(timed.toggled(NOW + 8 * HOUR), Mode::Off);
+        assert_eq!(timed.toggled(NOW + 9 * HOUR), Mode::Off);
+    }
+
+    #[test]
+    fn a_span_past_its_deadline_is_kept_as_forever() {
+        for choice in TIMED {
+            let timed = Mode::chosen(choice, NOW);
+            let span = choice.span().unwrap_or_default();
+            let before = NOW + (span - 1);
+            assert_eq!(timed.kept(before), timed.settled(before));
+            assert!(matches!(timed.kept(before), Mode::Until { .. }));
+            assert_eq!(timed.kept(NOW + span), Mode::Forever);
+            assert_eq!(timed.kept(NOW + span + DAY), Mode::Forever);
+        }
+        assert_eq!(Mode::Off.kept(NOW), Mode::Off);
+        assert_eq!(Mode::Forever.kept(NOW), Mode::Forever);
+        // A hand-edited span of nothing has ended as it starts: kept, it is the forever every span
+        // ends in, never a span already over that the mug would show dark.
+        let nothing = Mode::Until {
+            deadline: NOW.since_boot + HOUR,
+            span: 0,
+        };
+        assert_eq!(nothing.settled(NOW), Mode::Off);
+        assert_eq!(nothing.kept(NOW), Mode::Forever);
+        assert_eq!(nothing.toggled(NOW), Mode::Off);
     }
 
     #[test]

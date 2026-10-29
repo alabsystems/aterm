@@ -363,6 +363,10 @@ mod tests {
         )
         .expect("apply_to_job should succeed");
         assert_eq!(
+            HARDENED_UI_RESTRICTIONS, 0x0000_00FE,
+            "hardened UI bitset must pin the 7 Win32 UILIMIT flags (0xFE)"
+        );
+        assert_eq!(
             job.query_ui(),
             HARDENED_UI_RESTRICTIONS,
             "the hardened UI-restriction bitset must be installed"
@@ -387,9 +391,23 @@ mod tests {
             .expect("apply_to_job with shell_default should succeed");
         let info = job.query();
         assert_ne!(
+            info.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+            0,
+            "shell_default must bound per-process memory on Windows"
+        );
+        assert_eq!(
+            info.ProcessMemoryLimit,
+            16 * 1024 * 1024 * 1024,
+            "shell_default must set a 16 GiB ProcessMemoryLimit"
+        );
+        assert_ne!(
             info.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
             0,
             "shell_default must bound the active-process count"
+        );
+        assert_eq!(
+            info.BasicLimitInformation.ActiveProcessLimit, 512,
+            "shell_default must cap ActiveProcessLimit at 512"
         );
         assert_eq!(
             job.query_ui(),
@@ -419,10 +437,10 @@ mod tests {
     #[test]
     fn apply_to_job_fails_closed_on_invalid_handle() {
         let err = apply_to_job(&Limits::shell_default(), std::ptr::null_mut()).unwrap_err();
-        assert_ne!(
-            err.kind(),
-            io::ErrorKind::Other,
-            "should be a concrete OS error, got {err:?}"
+        assert_eq!(
+            err.raw_os_error(),
+            Some(6),
+            "null job handle must fail with ERROR_INVALID_HANDLE (6), got {err:?}"
         );
     }
 }

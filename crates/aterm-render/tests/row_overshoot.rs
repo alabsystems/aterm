@@ -340,11 +340,6 @@ fn an_overshooting_px(glyphs: &str) -> f32 {
         .unwrap_or_else(|| panic!("{glyphs:?} ink above their cell at no px in 11..=20"))
 }
 
-#[test]
-fn accented_capitals_ink_above_their_cell_at_some_px() {
-    an_overshooting_px(ACCENTS);
-}
-
 const PROMPTS: [&str; 4] = ["$ ", "\u{276f} ", "\u{3bb} ", "\u{2192} "];
 
 fn rows_typing_marks(r: &mut Renderer, prompt: &str, keys: &[&str]) -> Vec<Vec<usize>> {
@@ -371,6 +366,9 @@ fn rows_typing_marks(r: &mut Renderer, prompt: &str, keys: &[&str]) -> Vec<Vec<u
         .collect()
 }
 
+/// Its `an_overshooting_px("\u{c9}")` also holds the premise of
+/// `row_damage_beside_overshooting_glyphs_is_byte_exact`'s accent class: an accented capital inks
+/// above its cell at some px.
 #[test]
 fn typing_at_a_symbol_prompt_repaints_only_its_row() {
     let keys = ["l", "s", " ", "-"];

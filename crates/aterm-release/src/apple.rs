@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Apple Developer ID and notarization provisioning for `ship provision`.
+//! Apple Developer ID and notarization provisioning for `ship provision`. The Developer ID
+//! pair goes into aterm's own release keychain ([`crate::release_keychain`]), never the login
+//! keychain, so no step asks for the login keychain's password.
 
 #![cfg(unix)]
 
@@ -12,14 +14,16 @@ use std::time::Duration;
 
 use aterm_update_core::pins;
 
+use crate::dev_identity::Bounded;
 use crate::publish::step;
+use crate::release_keychain::{Keychains, Leave, OPENED_NOTE, Proof};
 
 /// The label this check prints under, in the audit too: one subject, one label.
 pub(crate) const APPLE_LABEL: &str = "apple id";
 
-/// Where this machine's own Apple key material lives.
-fn apple_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".aterm").join("apple"))
+/// Where the Apple key material of the user whose home is `home` lives.
+fn apple_dir_in(home: &Path) -> PathBuf {
+    home.join(".aterm").join("apple")
 }
 
 fn key_path(dir: &Path, id: &str) -> PathBuf {
@@ -51,18 +55,15 @@ pub(crate) struct Observed {
 }
 
 impl Observed {
-    pub fn look(id: &str) -> Observed {
-        let dir = apple_dir();
-        let (key, csr) = match &dir {
-            Some(d) => {
-                let k = key_path(d, id);
-                let c = csr_path(d, id);
-                (k.is_file().then_some(k), c.is_file().then_some(c))
-            }
-            None => (None, None),
+    pub fn look(kc: &Keychains<'_>, id: &str) -> Observed {
+        let dir = apple_dir_in(kc.home());
+        let (key, csr) = {
+            let k = key_path(&dir, id);
+            let c = csr_path(&dir, id);
+            (k.is_file().then_some(k), c.is_file().then_some(c))
         };
-        let (identities, lookup_failed) = valid_identities();
-        let invalid = invalid_identities();
+        let (identities, lookup_failed) = valid_identities(kc);
+        let invalid = invalid_identities(kc, &identities);
         Observed {
             identities,
             lookup_failed,
@@ -74,38 +75,24 @@ impl Observed {
     }
 }
 
-/// `security find-identity -v` filtered to our team, plus the reason we could not look.
-fn valid_identities() -> (Vec<String>, Option<String>) {
-    match Command::new("/usr/bin/security")
-        .args(["find-identity", "-v", "-p", "codesigning"])
-        .output()
-    {
-        Ok(out) => (
-            crate::provision::devid_identities(
-                &String::from_utf8_lossy(&out.stdout),
-                pins::APPLE_TEAM_ID,
-            ),
-            None,
-        ),
+/// `security find-identity -v` filtered to our team, in the release keychain by name and
+/// then on the search list (where a Mac provisioned before it holds its identity, in the login
+/// keychain), plus the reason we could not look.
+fn valid_identities(kc: &Keychains<'_>) -> (Vec<String>, Option<String>) {
+    match kc.identities(pins::APPLE_TEAM_ID, true) {
+        Ok(ids) => (ids, None),
         Err(e) => (Vec::new(), Some(format!("could not run `security`: {e}"))),
     }
 }
 
-/// The SHA-1s of our team's Developer ID identities the keychain holds but will not vouch
-/// for: all identities (no `-v`) but the valid ones.
-fn invalid_identities() -> Vec<String> {
-    let all = Command::new("/usr/bin/security")
-        .args(["find-identity", "-p", "codesigning"])
-        .output()
-        .map(|o| {
-            crate::provision::devid_identities(
-                &String::from_utf8_lossy(&o.stdout),
-                pins::APPLE_TEAM_ID,
-            )
-        })
-        .unwrap_or_default();
-    let valid = valid_identities().0;
-    all.into_iter().filter(|id| !valid.contains(id)).collect()
+/// The SHA-1s of our team's Developer ID identities the keychains hold but will not vouch
+/// for: all identities (no `-v`) but the `valid` ones.
+fn invalid_identities(kc: &Keychains<'_>, valid: &[String]) -> Vec<String> {
+    kc.identities(pins::APPLE_TEAM_ID, false)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| !valid.iter().any(|v| v.eq_ignore_ascii_case(id)))
+        .collect()
 }
 
 /// What the Apple step decided.
@@ -149,9 +136,12 @@ enum OnDisk {
 /// for that key. A certificate for the key that provision can make an identity, by importing
 /// it or its issuer, is a step for whoever runs provision; one the keychain holds with its
 /// issuer and still refuses is the owner's errand at Apple. A folder or key it could not read
-/// stops it as it stops a real run.
+/// stops it as it stops a real run. `leave` says whether the test signature of a held
+/// identity may re-assert the release keychain's partition list first.
 fn read_only(
+    kc: &Keychains<'_>,
     id: &str,
+    leave: Leave,
     identities: Vec<String>,
     key: Option<&Path>,
     cert_dir: Option<&Path>,
@@ -168,7 +158,7 @@ fn read_only(
         )
     };
     match (identities.is_empty(), key) {
-        (false, _) => verdict(identities),
+        (false, _) => verdict(kc, id, identities, leave),
         (true, Some(key)) => match on_disk(key) {
             OnDisk::Unimported => Outcome::Blocked {
                 what: format!(
@@ -219,17 +209,56 @@ fn read_only(
 
 /// The driver: it re-reads the world each run, and only a confirmed [`generate`] makes a new
 /// key.
-pub(crate) fn acquire(id: &str, may_change: bool, cert_dir: Option<&Path>) -> Outcome {
+pub(crate) fn acquire(
+    id: &str,
+    may_change: bool,
+    leave: Leave,
+    cert_dir: Option<&Path>,
+) -> Outcome {
     if !cfg!(target_os = "macos") {
         return Outcome::Skipped("cuts run on macOS (Tier APPLE); no keychain on this host".into());
     }
-    let Some(dir) = apple_dir() else {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return Outcome::Blocked {
             what: "HOME is not set, so ~/.aterm/apple has no location".into(),
             fix: "run provision as the user that will cut releases".into(),
         };
     };
-    let mut seen = Observed::look(id);
+    acquire_in(
+        &Keychains::new(&home, &Bounded),
+        id,
+        may_change,
+        leave,
+        cert_dir,
+    )
+}
+
+/// [`acquire`] for the user whose home `kc` names, every `security` and `codesign` call
+/// through it. With leave to change it first re-asserts an existing release keychain
+/// ([`Keychains::converge`]) and test-signs; without, it only opens it, and its test
+/// signature follows `leave` (a real release's audit may re-assert the partition list; a
+/// check or a dry run writes nothing).
+fn acquire_in(
+    kc: &Keychains<'_>,
+    id: &str,
+    may_change: bool,
+    leave: Leave,
+    cert_dir: Option<&Path>,
+) -> Outcome {
+    let dir = apple_dir_in(kc.home());
+    if may_change {
+        if let Err(refused) = kc.converge(pins::APPLE_TEAM_ID) {
+            return Outcome::Blocked {
+                what: refused.what,
+                fix: refused.fix,
+            };
+        }
+    } else {
+        // One that will not open is the keychain line's to report; nothing signs from it.
+        let _ = kc.unlock();
+    }
+    let watch = Watch::new(Some(kc.home()), cert_dir);
+    let mut seen = Observed::look(kc, id);
 
     if let Some(why) = seen.lookup_failed.as_deref() {
         return Outcome::Blocked {
@@ -241,39 +270,44 @@ pub(crate) fn acquire(id: &str, may_change: bool, cert_dir: Option<&Path>) -> Ou
     }
 
     if !may_change {
-        let watch = Watch::new(cert_dir);
         let Observed {
             identities,
             invalid,
             key,
             ..
         } = seen;
-        return read_only(id, identities, key.as_deref(), cert_dir, &|key| {
-            on_disk(key, &watch, &invalid)
-        });
+        return read_only(
+            kc,
+            id,
+            leave,
+            identities,
+            key.as_deref(),
+            cert_dir,
+            &|key| on_disk(kc, key, &watch, &invalid),
+        );
     }
 
     if seen.identities.is_empty()
         && seen.invalid_present > 0
-        && let Some(note) = repair_installed_chain()
+        && let Some(note) = repair_installed_chain(kc)
     {
         step(APPLE_LABEL, &note);
-        seen = Observed::look(id);
+        seen = Observed::look(kc, id);
     }
 
     if !seen.identities.is_empty() {
         // The spent request is public and finished, so it is removed silently. The
         // private key is never touched automatically: its slot cannot be reclaimed.
         if let Some(csr) = &seen.csr
-            && paired_with_installed(&seen.key, &seen.identities[0])
+            && paired_with_installed(kc, &seen.key, &seen.identities[0])
         {
             let _ = std::fs::remove_file(csr);
         }
-        return verdict(seen.identities);
+        return verdict(kc, id, seen.identities, Leave::Write);
     }
 
     if let (Some(key), Some(csr)) = (&seen.key, &seen.csr) {
-        return await_then_install(key, csr, id, &seen.invalid, cert_dir);
+        return await_then_install(kc, key, csr, id, &seen.invalid, &watch);
     }
 
     if seen.key.is_none() && seen.csr.is_some() {
@@ -313,7 +347,7 @@ pub(crate) fn acquire(id: &str, may_change: bool, cert_dir: Option<&Path>) -> Ou
                      — no new key, no new slot"
                     ),
                 );
-                await_then_install(key, &csr, id, &seen.invalid, cert_dir)
+                await_then_install(kc, key, &csr, id, &seen.invalid, &watch)
             }
             Err(e) => Outcome::Blocked {
                 what: format!("could not rebuild the certificate request: {e}"),
@@ -324,7 +358,7 @@ pub(crate) fn acquire(id: &str, may_change: bool, cert_dir: Option<&Path>) -> Ou
 
     match confirm_slot(id, seen.invalid_present) {
         Ok(true) => match generate(&dir, id) {
-            Ok(csr) => await_then_install(&key_path(&dir, id), &csr, id, &seen.invalid, cert_dir),
+            Ok(csr) => await_then_install(kc, &key_path(&dir, id), &csr, id, &seen.invalid, &watch),
             Err(outcome) => outcome,
         },
         Ok(false) => Outcome::Waiting {
@@ -371,27 +405,29 @@ fn unlooked(why: String, key: &Path) -> Outcome {
 /// How long the command waits for the browser errand.
 const WAIT_FOR_CERT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-/// Prints the browser errand, waits for a public-key-matched certificate, and installs it.
+/// Prints the browser errand, waits for a public-key-matched certificate in `watch`, and
+/// installs it.
 fn await_then_install(
+    kc: &Keychains<'_>,
     key: &Path,
     csr: &Path,
     id: &str,
     invalid: &[String],
-    cert_dir: Option<&Path>,
+    watch: &Watch,
 ) -> Outcome {
-    let watch = Watch::new(cert_dir);
-    let lookup = || look(key, &watch, invalid, 0, &issuer_in_keychain);
+    let issuer = |leaf: &str| issuer_in_keychain(kc, leaf);
+    let lookup = || look(key, watch, invalid, 0, &issuer);
     let rejected = match lookup() {
         Ok(Look {
             cert: Some(cer), ..
-        }) => return install(&cer, key, id),
+        }) => return install(kc, &cer, key, id),
         Err(why) => return unlooked(why, key),
         Ok(Look { rejected, .. }) => rejected,
     };
     if !has_terminal() {
         return Outcome::Waiting {
-            what: waiting_text(id, invalid.len(), &rejected, None, &watch),
-            next: errand_lines(csr, false, &watch).join("\n"),
+            what: waiting_text(id, invalid.len(), &rejected, None, watch),
+            next: errand_lines(csr, false, watch).join("\n"),
         };
     }
     let visible = watch
@@ -400,7 +436,7 @@ fn await_then_install(
         .and_then(|named| surface_csr(csr, id, named));
     let upload = visible.as_deref().unwrap_or(csr);
     let waiting = |rejected: &[PathBuf]| Outcome::Waiting {
-        what: waiting_text(id, invalid.len(), rejected, Some(upload), &watch),
+        what: waiting_text(id, invalid.len(), rejected, Some(upload), watch),
         next: format!(
             "upload {} at https://developer.apple.com/account/resources/certificates and \
              download the certificate THAT produces.\n\
@@ -417,11 +453,11 @@ fn await_then_install(
         step(label, &note);
         label = "";
     }
-    if let Some(note) = rejected_note(&rejected, Some(upload), &watch) {
+    if let Some(note) = rejected_note(&rejected, Some(upload), watch) {
         step(label, &note);
         label = "";
     }
-    for line in errand_lines(upload, true, &watch) {
+    for line in errand_lines(upload, true, watch) {
         step(label, &line);
         label = "";
     }
@@ -438,7 +474,7 @@ fn await_then_install(
                     APPLE_LABEL,
                     &format!("certificate found: {}", cer.path.display()),
                 );
-                return install(&cer, key, id);
+                return install(kc, &cer, key, id);
             }
             Err(why) => return unlooked(why, key),
             Ok(Look { rejected: seen, .. }) => {
@@ -447,7 +483,7 @@ fn await_then_install(
                     .filter(|p| !rejected.contains(p))
                     .cloned()
                     .collect();
-                if let Some(note) = rejected_note(&fresh, Some(upload), &watch) {
+                if let Some(note) = rejected_note(&fresh, Some(upload), watch) {
                     step(
                         APPLE_LABEL,
                         "⚠ THE .cer THAT JUST ARRIVED IS NOT THIS REQUEST'S",
@@ -479,6 +515,11 @@ fn await_then_install(
 
 /// Whether there is a human to ask.
 fn has_terminal() -> bool {
+    // A test never waits on a person: with no terminal the errand is returned at once, so a
+    // certificate the test expected to match fails fast instead of polling for 30 minutes.
+    if cfg!(test) {
+        return false;
+    }
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -486,9 +527,14 @@ fn has_terminal() -> bool {
         .is_ok_and(|f| std::io::IsTerminal::is_terminal(&f))
 }
 
-/// Verifies that the pinned `signing_identity_sha1` is valid and can sign unattended.
-pub(crate) fn pinned_identity_proves(sha1: &str) -> Result<(), String> {
-    let (ids, lookup_failed) = valid_identities();
+/// Verifies that the pinned `signing_identity_sha1` is valid in `kc`'s keychains and can sign
+/// unattended ([`prove_can_sign`]).
+pub(crate) fn pinned_identity_proves(
+    kc: &Keychains<'_>,
+    sha1: &str,
+    leave: Leave,
+) -> Result<Proof, String> {
+    let (ids, lookup_failed) = valid_identities(kc);
     if let Some(why) = lookup_failed {
         return Err(format!("cannot read the keychain: {why}"));
     }
@@ -498,14 +544,25 @@ pub(crate) fn pinned_identity_proves(sha1: &str) -> Result<(), String> {
             pins::APPLE_TEAM_ID
         ));
     }
-    prove_can_sign(sha1)
+    prove_can_sign(kc, sha1, leave)
 }
 
-/// The single place a green Apple verdict is produced, so no path skips the proof.
-fn verdict(ids: Vec<String>) -> Outcome {
-    match prove_can_sign(&ids[0]) {
-        Ok(()) => {
-            let note = expiry_note(&ids[0]);
+/// The single place a green Apple verdict is produced, so no path skips the proof. The fix
+/// for a key codesign cannot use names the login keychain's password only for an identity
+/// that keychain is known to hold (a Mac provisioned before the release keychain): one in the
+/// release keychain is fixed by provision with that keychain's own password, and one whose
+/// keychain cannot be read is re-run.
+fn verdict(kc: &Keychains<'_>, id: &str, ids: Vec<String>, leave: Leave) -> Outcome {
+    match prove_can_sign(kc, &ids[0], leave) {
+        Ok(proof) => {
+            let expiry = expiry_note(kc, &ids[0]);
+            let note = match proof {
+                Proof::Signed => expiry,
+                Proof::Opened => Some(match expiry {
+                    Some(expiry) => format!("{OPENED_NOTE}; {expiry}"),
+                    None => OPENED_NOTE.to_string(),
+                }),
+            };
             Outcome::Ready { ids, note }
         }
         Err(why) => Outcome::Blocked {
@@ -514,29 +571,43 @@ fn verdict(ids: Vec<String>) -> Outcome {
                  codesign cannot use this key unattended, so a cut would stop here",
                 ids[0]
             ),
-            fix: format!(
-                "run `security set-key-partition-list -S apple-tool:,apple:,codesign: -t \
-                 private -s -l '{}' {}` (it asks for your login keychain password), then \
-                 re-run this command — it re-tests the signature every time",
-                identity_label(&ids[0]).unwrap_or_else(|| "<the certificate's name>".into()),
-                login_keychain()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "~/Library/Keychains/login.keychain-db".into()),
-            ),
+            fix: match kc.holds(pins::APPLE_TEAM_ID, &ids[0]) {
+                Ok(true) => format!(
+                    "run `{} provision --id {id}`: it sets the partition list on {} with that \
+                     keychain's own stored password (never your login password), then \
+                     re-tests the signature",
+                    crate::publish::SHIP_COMMAND,
+                    kc.release().display()
+                ),
+                Err(why) => format!(
+                    "{} could not be read ({why}); re-run once `security` answers",
+                    kc.release().display()
+                ),
+                Ok(false) => format!(
+                    "this identity is in your login keychain (provisioned before aterm's \
+                     release keychain): run `security set-key-partition-list -S \
+                     apple-tool:,apple:,codesign: -t private -s -l '{}' {}` (it asks for your \
+                     login keychain password), then re-run this command — it re-tests the \
+                     signature every time",
+                    identity_label(kc, &ids[0])
+                        .unwrap_or_else(|| "<the certificate's name>".into()),
+                    crate::release_keychain::login_keychain_path(kc.home()).display(),
+                ),
+            },
         },
     }
 }
 
 /// Whether the on-disk request key is the private half of the certificate this identity names.
-fn paired_with_installed(key: &Option<PathBuf>, sha1: &str) -> bool {
+fn paired_with_installed(kc: &Keychains<'_>, key: &Option<PathBuf>, sha1: &str) -> bool {
     let Some(key) = key else { return false };
-    installed_cert_spki(sha1)
+    installed_cert_spki(kc, sha1)
         .is_some_and(|installed| key_spki_sha256(key).is_some_and(|k| k == installed))
 }
 
 /// The SPKI digest of the certificate the identity `sha1` names.
-fn installed_cert_spki(sha1: &str) -> Option<String> {
-    let pem = installed_leaf_pem(sha1)?;
+fn installed_cert_spki(kc: &Keychains<'_>, sha1: &str) -> Option<String> {
+    let pem = installed_leaf_pem(kc, sha1)?;
     let der = capture(
         "/usr/bin/openssl",
         &["x509", "-pubkey", "-noout"],
@@ -551,20 +622,16 @@ fn installed_cert_spki(sha1: &str) -> Option<String> {
 }
 
 /// PEM of the installed `Developer ID Application` certificate with digest `sha1`.
-fn installed_leaf_pem(sha1: &str) -> Option<String> {
-    let out = capture(
-        "/usr/bin/security",
-        &[
-            "find-certificate",
-            "-a",
-            "-c",
-            "Developer ID Application",
-            "-p",
-            "-Z",
-        ],
-        None,
-    )?;
-    leaf_pem_by_sha1(&String::from_utf8_lossy(&out), sha1)
+fn installed_leaf_pem(kc: &Keychains<'_>, sha1: &str) -> Option<String> {
+    let out = kc.find_certificates(&[
+        "find-certificate",
+        "-a",
+        "-c",
+        "Developer ID Application",
+        "-p",
+        "-Z",
+    ])?;
+    leaf_pem_by_sha1(&out, sha1)
 }
 
 /// The selection, pure over the captured stream so it is testable without a keychain.
@@ -600,10 +667,10 @@ fn leaf_pem_by_sha1(text: &str, sha1: &str) -> Option<String> {
 const RENEWAL_WINDOW_SECS: u64 = 90 * 24 * 60 * 60;
 
 /// The expiry clause on a green Apple line.
-fn expiry_note(sha1: &str) -> Option<String> {
-    let leaf = installed_leaf_pem(sha1)?;
+fn expiry_note(kc: &Keychains<'_>, sha1: &str) -> Option<String> {
+    let leaf = installed_leaf_pem(kc, sha1)?;
     let mut soonest = (cert_enddate_iso(&leaf)?, leaf.clone());
-    if let Some(ca) = issuer_in_keychain(&leaf) {
+    if let Some(ca) = issuer_in_keychain(kc, &leaf) {
         match cert_enddate_iso(&ca) {
             Some(iso) if iso < soonest.0 => soonest = (iso, ca),
             _ => {}
@@ -629,8 +696,8 @@ fn cert_enddate_iso(pem: &str) -> Option<String> {
     enddate_iso(&String::from_utf8_lossy(&out))
 }
 
-/// The certificate in this keychain that issued `leaf`, matched by subject DN.
-fn issuer_in_keychain(leaf: &str) -> Option<String> {
+/// The certificate in `kc`'s keychains that issued `leaf`, matched by subject DN.
+fn issuer_in_keychain(kc: &Keychains<'_>, leaf: &str) -> Option<String> {
     let out = capture(
         "/usr/bin/openssl",
         &["x509", "-noout", "-issuer"],
@@ -641,7 +708,7 @@ fn issuer_in_keychain(leaf: &str) -> Option<String> {
         .trim_start_matches("issuer=")
         .trim()
         .to_string();
-    keychain_cert_with_subject(&issuer)
+    keychain_cert_with_subject(kc, &issuer)
 }
 
 /// `notAfter=Aug 18 16:36:18 2031 GMT` → `2031-08-18`.
@@ -672,14 +739,10 @@ fn outlives(pem: &str, secs: u64) -> Option<bool> {
     Some(child.wait().ok()?.success())
 }
 
-/// The label macOS gives the paired private key (the certificate's common name).
-fn identity_label(sha1: &str) -> Option<String> {
-    let out = capture(
-        "/usr/bin/security",
-        &["find-identity", "-v", "-p", "codesigning"],
-        None,
-    )?;
-    let text = String::from_utf8_lossy(&out).to_string();
+/// The label macOS gives the paired private key (the certificate's common name), as the
+/// search list holds it.
+fn identity_label(kc: &Keychains<'_>, sha1: &str) -> Option<String> {
+    let text = kc.security_stdout(&[&"find-identity", &"-v", &"-p", &"codesigning"])?;
     let line = text.lines().find(|l| l.contains(sha1))?;
     let start = line.find('"')? + 1;
     let end = line.rfind('"')?;
@@ -1024,9 +1087,10 @@ pub(crate) struct Watch {
 }
 
 impl Watch {
-    pub(crate) fn new(named: Option<&Path>) -> Self {
+    /// A watch over `named`, then `~/.aterm/apple` of the user whose home is `home`.
+    pub(crate) fn new(home: Option<&Path>, named: Option<&Path>) -> Self {
         Self {
-            own: apple_dir(),
+            own: home.map(apple_dir_in),
             named: named.map(Path::to_path_buf),
         }
     }
@@ -1097,8 +1161,8 @@ fn surface_csr(csr: &Path, id: &str, named: &Path) -> Option<PathBuf> {
 /// What the watched folders hold for `key` ([`OnDisk`]), given the SHA-1s of the team's
 /// identities the keychain holds but does not trust (`invalid`): unlooked when a folder or the
 /// key could not be read and no certificate there can be installed.
-fn on_disk(key: &Path, watch: &Watch, invalid: &[String]) -> OnDisk {
-    look(key, watch, invalid, 0, &issuer_in_keychain)
+fn on_disk(kc: &Keychains<'_>, key: &Path, watch: &Watch, invalid: &[String]) -> OnDisk {
+    look(key, watch, invalid, 0, &|leaf| issuer_in_keychain(kc, leaf))
         .map_or_else(OnDisk::Unlooked, |look| look.judged)
 }
 
@@ -1367,8 +1431,10 @@ fn digest(der: &[u8]) -> Option<String> {
     aterm_codec::hex::is_hex(&hex, 64).then_some(hex)
 }
 
-/// Imports the certificate and key, widens the key ACL, and verifies signing.
-fn install(cer: &MatchedCert, key: &Path, id: &str) -> Outcome {
+/// Imports the certificate and key into the release keychain, lets codesign use the key
+/// unattended with that keychain's own password, and verifies signing. No other keychain is
+/// written ([`Keychains::install_pair`]).
+fn install(kc: &Keychains<'_>, cer: &MatchedCert, key: &Path, id: &str) -> Outcome {
     let subject = match cert_subject(&cer.path, cer.form) {
         Some(s) => s,
         None => {
@@ -1390,64 +1456,25 @@ fn install(cer: &MatchedCert, key: &Path, id: &str) -> Outcome {
             fix: "download the certificate issued for THIS machine's request".into(),
         };
     }
-    let Some(keychain) = login_keychain() else {
+    let release = kc.release();
+    if let Err(refused) = kc.install_pair(&cer.path, key) {
         return Outcome::Blocked {
-            what: "no login keychain found".into(),
-            fix: "run provision as the user that will cut releases".into(),
-        };
-    };
-    let kc = keychain.to_string_lossy().to_string();
-
-    if let Err(e) = import_idempotent(&[
-        "import",
-        &cer.path.to_string_lossy(),
-        "-k",
-        &kc,
-        "-T",
-        "/usr/bin/codesign",
-    ]) {
-        return Outcome::Blocked {
-            what: format!("could not import {}: {e}", cer.path.display()),
-            fix: format!(
-                "run it yourself and read the error: security import {} -k {kc} -T \
-                 /usr/bin/codesign\n\
-                 or import it by double-clicking in Finder, then re-run",
-                cer.path.display()
+            what: format!(
+                "could not put {} and its key into {}: {}",
+                cer.path.display(),
+                release.display(),
+                refused.what
             ),
-        };
-    }
-    if let Err(e) = import_idempotent(&[
-        "import",
-        &key.to_string_lossy(),
-        "-k",
-        &kc,
-        "-t",
-        "priv",
-        "-f",
-        "openssl",
-        "-T",
-        "/usr/bin/codesign",
-        "-T",
-        "/usr/bin/security",
-    ]) {
-        return Outcome::Blocked {
-            what: format!("could not import the private key: {e}"),
-            fix: format!(
-                "run it yourself and read the error: security import {} -k {kc} -t priv -f \
-                 openssl -T /usr/bin/codesign -T /usr/bin/security\n\
-                 the two -T flags are load-bearing — a key imported without them yields an \
-                 identity that looks installed and then cannot sign unattended.",
-                key.display()
-            ),
+            fix: refused.fix,
         };
     }
 
-    let mut found = valid_identities().0;
+    let mut found = valid_identities(kc).0;
     if found.is_empty() {
-        match install_issuer_intermediate(cer) {
+        match install_issuer_intermediate(kc, cer) {
             Ok(Some(note)) => {
                 step(APPLE_LABEL, &note);
-                found = valid_identities().0;
+                found = valid_identities(kc).0;
             }
             Ok(None) => {}
             Err(e) => {
@@ -1479,54 +1506,25 @@ fn install(cer: &MatchedCert, key: &Path, id: &str) -> Outcome {
             fix: format!(
                 "check the dates:  openssl x509 -inform {} -in {} -noout -dates\n\
                  list what this keychain can actually sign with:  security find-identity \
-                 -v -p codesigning {kc}\n\
+                 -v -p codesigning {}\n\
                  an identity needs BOTH halves in ONE keychain — the certificate above is \
-                 imported, so an empty list here means its private key is not in {kc}",
+                 imported, so an empty list here means its private key is not in {}",
                 cer.form,
-                cer.path.display()
+                cer.path.display(),
+                release.display(),
+                release.display()
             ),
         };
     }
-
-    let label =
-        cert_common_name(&subject).unwrap_or_else(|| format!("Developer ID Application: {id}"));
-    let _ = Command::new("/usr/bin/security")
-        .args([
-            "set-key-partition-list",
-            "-S",
-            "apple-tool:,apple:,codesign:",
-            "-t",
-            "private",
-            "-s",
-            "-l",
-            &label,
-            &kc,
-        ])
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .status();
-
-    verdict(found)
+    verdict(kc, id, found, Leave::Write)
 }
 
-/// `security import` fails on an item already present; a duplicate is success.
-fn import_idempotent(args: &[&str]) -> Result<(), String> {
-    match run("/usr/bin/security", args) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let lower = e.to_ascii_lowercase();
-            if lower.contains("already exists") || lower.contains("duplicate") {
-                Ok(())
-            } else {
-                Err(e)
-            }
-        }
-    }
-}
-
-/// Install the intermediate that issued this certificate, if the keychain lacks it.
-fn install_issuer_intermediate(cer: &MatchedCert) -> Result<Option<String>, String> {
+/// Install the intermediate that issued this certificate into the release keychain, if no
+/// keychain holds it.
+fn install_issuer_intermediate(
+    kc: &Keychains<'_>,
+    cer: &MatchedCert,
+) -> Result<Option<String>, String> {
     /// Apple publishes both generations at fixed paths, and the leaf says which is which.
     const CA_URLS: [&str; 2] = [
         "https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer",
@@ -1538,14 +1536,13 @@ fn install_issuer_intermediate(cer: &MatchedCert) -> Result<Option<String>, Stri
     if !issuer.contains("Developer ID Certification Authority") {
         return Ok(None);
     }
-    if keychain_has_subject(&issuer) {
+    if keychain_has_subject(kc, &issuer) {
         return Ok(None);
     }
     let want_key = cert_key_id(&cer.path, cer.form, AUTHORITY_KEY_ID).ok_or(
         "this certificate names no issuing key (no Authority Key Identifier), so which CA \
          issued it cannot be proved",
     )?;
-    let keychain = login_keychain().ok_or("no login keychain")?;
     let dir = temp_run_dir("issuer")?;
     let outcome = (|| -> Result<Option<String>, String> {
         let mut urls = CA_URLS;
@@ -1593,12 +1590,7 @@ fn install_issuer_intermediate(cer: &MatchedCert) -> Result<Option<String>, Stri
                 refused.push(format!("{name}: a different issuing key"));
                 continue;
             }
-            import_idempotent(&[
-                "import",
-                &tmp.to_string_lossy(),
-                "-k",
-                &keychain.to_string_lossy(),
-            ])?;
+            kc.install_certificate(&tmp)?;
             return Ok(Some(format!(
                 "installed the missing issuing intermediate ({issuer}) — without it macOS \
                  cannot chain your certificate to Apple Root CA and reports the identity \
@@ -1657,19 +1649,15 @@ fn key_id_from_text(text: &str, header: &str) -> Option<String> {
 }
 
 /// Repairs missing issuer intermediates for already-installed team Developer ID leaves.
-fn repair_installed_chain() -> Option<String> {
-    let pems = capture(
-        "/usr/bin/security",
-        &[
-            "find-certificate",
-            "-a",
-            "-c",
-            "Developer ID Application",
-            "-p",
-        ],
-        None,
-    )?;
-    for block in String::from_utf8_lossy(&pems).split_inclusive("-----END CERTIFICATE-----") {
+fn repair_installed_chain(kc: &Keychains<'_>) -> Option<String> {
+    let pems = kc.find_certificates(&[
+        "find-certificate",
+        "-a",
+        "-c",
+        "Developer ID Application",
+        "-p",
+    ])?;
+    for block in pems.split_inclusive("-----END CERTIFICATE-----") {
         if !block.contains("BEGIN CERTIFICATE") {
             continue;
         }
@@ -1683,7 +1671,7 @@ fn repair_installed_chain() -> Option<String> {
         let ours =
             cert_subject(&cer.path, cer.form).is_some_and(|s| s.contains(pins::APPLE_TEAM_ID));
         let note = if ours {
-            install_issuer_intermediate(&cer).ok().flatten()
+            install_issuer_intermediate(kc, &cer).ok().flatten()
         } else {
             None
         };
@@ -1722,26 +1710,21 @@ fn temp_cert(bytes: &[u8]) -> Result<PathBuf, String> {
     Err("no free temp name".into())
 }
 
-/// Whether any certificate in the keychain has exactly this subject.
-fn keychain_has_subject(subject: &str) -> bool {
-    keychain_cert_with_subject(subject).is_some()
+/// Whether any certificate in `kc`'s keychains has exactly this subject.
+fn keychain_has_subject(kc: &Keychains<'_>, subject: &str) -> bool {
+    keychain_cert_with_subject(kc, subject).is_some()
 }
 
-/// The Developer ID CA certificate in this keychain whose subject is exactly `subject`.
-fn keychain_cert_with_subject(subject: &str) -> Option<String> {
-    let pems = capture(
-        "/usr/bin/security",
-        &[
-            "find-certificate",
-            "-a",
-            "-c",
-            "Developer ID Certification Authority",
-            "-p",
-        ],
-        None,
-    )?;
-    String::from_utf8_lossy(&pems)
-        .split_inclusive("-----END CERTIFICATE-----")
+/// The Developer ID CA certificate in `kc`'s keychains whose subject is exactly `subject`.
+fn keychain_cert_with_subject(kc: &Keychains<'_>, subject: &str) -> Option<String> {
+    let pems = kc.find_certificates(&[
+        "find-certificate",
+        "-a",
+        "-c",
+        "Developer ID Certification Authority",
+        "-p",
+    ])?;
+    pems.split_inclusive("-----END CERTIFICATE-----")
         .find(|block| {
             capture(
                 "/usr/bin/openssl",
@@ -1795,24 +1778,21 @@ fn cert_subject(cer: &Path, form: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out).to_string())
 }
 
-/// The common name out of an `openssl x509 -subject` line, in both dialects.
-fn cert_common_name(subject: &str) -> Option<String> {
-    let after = subject
-        .split_once("CN=")
-        .or_else(|| subject.split_once("CN = "))
-        .map(|(_, rest)| rest)?;
-    let name = after
-        .split(['/', ','])
-        .next()
-        .unwrap_or(after)
-        .trim()
-        .to_string();
-    (!name.is_empty()).then_some(name)
-}
-
-/// Signs a throwaway copy of a system binary with `sha1` to verify pairing and ACL.
-fn prove_can_sign(sha1: &str) -> Result<(), String> {
+/// Signs a throwaway copy of a system binary with `sha1` to verify pairing and ACL, naming
+/// the release keychain (`--keychain`) when it holds the identity
+/// ([`Keychains::signing_keychain`]). Under [`Leave::Look`] an identity the release keychain
+/// holds is only opened ([`Proof::Opened`]): a test signature from it is safe only once its
+/// partition list is re-asserted, which is a write.
+pub(crate) fn prove_can_sign(
+    kc: &Keychains<'_>,
+    sha1: &str,
+    leave: Leave,
+) -> Result<Proof, String> {
     use std::os::unix::fs::OpenOptionsExt as _;
+    let keychain = kc.signing_keychain(pins::APPLE_TEAM_ID, sha1, leave)?;
+    if leave == Leave::Look && keychain.is_some() {
+        return Ok(Proof::Opened);
+    }
     let dir = temp_run_dir("probe")?;
     let probe = dir.join("probe");
     let signed = std::fs::read("/bin/echo")
@@ -1827,19 +1807,15 @@ fn prove_can_sign(sha1: &str) -> Result<(), String> {
                 .map_err(|e| format!("could not stage a probe: {e}"))
         })
         .and_then(|()| {
-            run(
-                "/usr/bin/codesign",
-                &[
-                    "--force",
-                    "--timestamp=none",
-                    "--sign",
-                    sha1,
-                    &probe.to_string_lossy(),
-                ],
-            )
+            let mut args: Vec<&dyn AsRef<std::ffi::OsStr>> = vec![&"--force", &"--timestamp=none"];
+            if let Some(keychain) = &keychain {
+                args.extend([&"--keychain" as &dyn AsRef<std::ffi::OsStr>, keychain]);
+            }
+            args.extend([&"--sign" as &dyn AsRef<std::ffi::OsStr>, &sha1, &probe]);
+            kc.codesign(&args)
         });
     let _ = std::fs::remove_dir_all(&dir);
-    signed
+    signed.map(|()| Proof::Signed)
 }
 
 /// A directory this run alone can hold.
@@ -1868,12 +1844,12 @@ pub(crate) fn write_credentials_profile(
     let Some(home) = std::env::var_os("HOME") else {
         return Err("HOME is not set".into());
     };
-    let aterm = PathBuf::from(home).join(".aterm");
-    let path = aterm.join("release-credentials.toml");
+    let ring = PathBuf::from(home).join(atpkg_keys::provision::RELEASE_RING_REL);
+    let path = ring.join("release-credentials.toml");
     if path.exists() {
         return Ok(None);
     }
-    let key_bytes = std::fs::read(aterm.join("machine.key"))
+    let key_bytes = std::fs::read(ring.join("machine.key"))
         .map_err(|e| format!("cannot read this machine's key: {e}"))?;
     let signing_key = aterm_codec::base64::encode(&key_bytes)
         .map_err(|_| "this machine's key is too large to encode".to_string())?;
@@ -1902,15 +1878,6 @@ pub(crate) fn write_credentials_profile(
     f.write_all(body.as_bytes())
         .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     Ok(Some(path))
-}
-
-fn login_keychain() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let p = PathBuf::from(home)
-        .join("Library")
-        .join("Keychains")
-        .join("login.keychain-db");
-    p.is_file().then_some(p)
 }
 
 fn chmod(path: &Path, mode: u32) -> std::io::Result<()> {
@@ -1972,9 +1939,17 @@ fn capture(program: &str, args: &[&str], input: Option<&[u8]>) -> Option<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::release_keychain::fake::{Fake, Kc, World};
+
+    /// A watch over `named` and this test process's own `~/.aterm/apple`.
+    fn env_watch(named: Option<&Path>) -> Watch {
+        Watch::new(
+            std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+            named,
+        )
+    }
 
     const COMMAND_CHILD: &str = "ATERM_APPLE_COMMAND_TEST_CHILD";
-    const COMMAND_READY: &str = "ATERM_APPLE_COMMAND_TEST_READY";
 
     fn command_child(mode: &str) -> aterm_uds::spawnfd::Command {
         let mut command =
@@ -2011,13 +1986,9 @@ mod tests {
                 eprintln!("fixture signing failure\nmore detail");
                 std::process::exit(7);
             }
-            "block" => {
-                let ready = std::env::var_os(COMMAND_READY).expect("readiness path");
-                std::fs::write(ready, std::process::id().to_string()).expect("ready");
-                loop {
-                    std::thread::park();
-                }
-            }
+            "block" => loop {
+                std::thread::park();
+            },
             _ => panic!("unknown fixture mode"),
         }
     }
@@ -2039,25 +2010,15 @@ mod tests {
         assert!(!error.contains("requested termination"), "{error}");
     }
 
+    /// A signing command that never answers is stopped at the deadline it was given, and the
+    /// error names that deadline. Stopping and reaping it is `output_within`'s, which aterm-uds
+    /// proves (`a_child_past_its_deadline_is_killed_and_reaped`); a child that never finishes
+    /// meets a short deadline however slowly it starts, so this waits out no minute.
     #[test]
-    fn a_signing_command_that_never_answers_is_stopped_and_reaped() {
-        let dir = aterm_tempfile::tempdir().expect("tempdir");
-        let ready = dir.path().join("ready");
-        let error = run_command(
-            command_child("block").env(COMMAND_READY, &ready),
-            COMMAND_WAIT,
-        )
-        .expect_err("the blocked signing command must not pass");
-        assert!(error.contains("did not finish within 60 s"), "{error}");
-        let pid = std::fs::read_to_string(&ready)
-            .expect("the child reached its blocking body")
-            .parse::<i32>()
-            .expect("the child's pid");
-        assert_eq!(
-            aterm_uds::process::process_presence(pid),
-            aterm_uds::process::ProcessPresence::Absent,
-            "the deadline must reap the child, not leave it as a zombie"
-        );
+    fn a_signing_command_that_never_answers_is_stopped_at_its_deadline() {
+        let error = run_command(&mut command_child("block"), Duration::from_secs(1))
+            .expect_err("the blocked signing command must not pass");
+        assert!(error.contains("did not finish within 1 s"), "{error}");
     }
 
     /// A read-only look names provision, with the operator's folder, as the step when it can
@@ -2066,8 +2027,12 @@ mod tests {
     #[test]
     fn a_key_whose_certificate_is_on_disk_is_provisions_step_not_an_errand() {
         let key = Path::new("/nonexistent/devid-m9.key");
+        let fake = Fake::new(World::new(&"0".repeat(40)));
+        let kc = Keychains::new(Path::new("/nonexistent"), &fake);
         let blocked = |found: OnDisk, cert_dir: Option<&Path>| match read_only(
+            &kc,
             "m9",
+            Leave::Look,
             Vec::new(),
             Some(key),
             cert_dir,
@@ -2099,7 +2064,8 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    read_only("m9", Vec::new(), key, None, &|_| found.clone()),
+                    read_only(&kc, "m9", Leave::Look, Vec::new(), key, None, &|_| found
+                        .clone()),
                     Outcome::Todo { .. }
                 ),
                 "{key:?} {found:?}"
@@ -2109,7 +2075,7 @@ mod tests {
             ("/x/locked: Permission denied (os error 13)", "readable"),
             ("could not read the public half of /k", "openssl rsa -in"),
         ] {
-            match read_only("m9", Vec::new(), Some(key), None, &|_| {
+            match read_only(&kc, "m9", Leave::Look, Vec::new(), Some(key), None, &|_| {
                 OnDisk::Unlooked(why.into())
             }) {
                 Outcome::Blocked { what, fix: said } => {
@@ -2120,7 +2086,9 @@ mod tests {
         }
         let refused = OnDisk::Refused(PathBuf::from("/x/Downloads/old.cer"));
         match read_only(
+            &kc,
             "m9",
+            Leave::Look,
             Vec::new(),
             Some(key),
             Some(Path::new("/x/Downloads")),
@@ -2144,6 +2112,11 @@ mod tests {
     fn a_certificate_on_disk_is_judged_by_its_key_its_end_and_the_keychain() {
         let scratch = aterm_tempfile::tempdir().expect("tempdir");
         let dir = scratch.path();
+        let fake = Fake::new(World::new(&"0".repeat(40)));
+        let kc = Keychains::new(dir, &fake);
+        let on_disk =
+            |key: &Path, watch: &Watch, invalid: &[String]| on_disk(&kc, key, watch, invalid);
+        let issuer_in_keychain = |leaf: &str| issuer_in_keychain(&kc, leaf);
         let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
         let openssl = |args: &[&str]| {
             assert!(
@@ -2177,7 +2150,7 @@ mod tests {
             "-out",
             &path("c.cer"),
         ]);
-        let watch = Watch::new(Some(dir));
+        let watch = Watch::new(None, Some(dir));
         let key = dir.join("k.pem");
         let cert = MatchedCert {
             path: dir.join("c.cer"),
@@ -2297,19 +2270,254 @@ mod tests {
         );
     }
 
+    /// A scratch HOME holding a Developer ID pair in `~/.aterm/apple` as the vault fills it
+    /// (`devid-<id>.key` and `.cer`, no request), and its certificate's SHA-1.
+    fn vault_filled_home(id: &str) -> (aterm_tempfile::TempDir, PathBuf, String) {
+        let scratch = aterm_tempfile::tempdir().expect("scratch HOME");
+        let home = std::fs::canonicalize(scratch.path()).expect("canonical scratch");
+        let apple = apple_dir_in(&home);
+        std::fs::create_dir_all(&apple).expect(".aterm/apple");
+        std::fs::create_dir_all(home.join("Library/Keychains")).expect("Keychains");
+        let key = key_path(&apple, id).to_string_lossy().into_owned();
+        let pem = home.join("cert.pem").to_string_lossy().into_owned();
+        let cer = apple.join(format!("devid-{id}.cer"));
+        let team = pins::APPLE_TEAM_ID;
+        let subject =
+            format!("/CN=Developer ID Application: Placeholder Org ({team})/OU={team}/C=US");
+        for args in [
+            &["genrsa", "-out", &key, "2048"][..],
+            &[
+                "req", "-new", "-x509", "-key", &key, "-subj", &subject, "-days", "30", "-out",
+                &pem,
+            ],
+            &[
+                "x509",
+                "-in",
+                &pem,
+                "-outform",
+                "DER",
+                "-out",
+                &cer.to_string_lossy(),
+            ],
+        ] {
+            assert!(
+                capture("/usr/bin/openssl", args, None).is_some(),
+                "openssl {args:?}"
+            );
+        }
+        let sha1 = cert_sha1(&MatchedCert {
+            path: cer,
+            form: "DER",
+        })
+        .expect("a fingerprint");
+        (scratch, home, sha1)
+    }
+
+    /// Whether a logged call names the login keychain other than to keep it on the search
+    /// list where it was.
+    fn names_login(call: &[String], login: &Path) -> bool {
+        let keeps_it = call[1] == "list-keychains"
+            && call
+                .iter()
+                .position(|a| a == "-s")
+                .is_some_and(|at| call.get(at + 1).map(String::as_str) == login.to_str());
+        !keeps_it && call.iter().any(|a| a.contains("login.keychain"))
+    }
+
+    /// `ship provision` on a fresh Mac the vault filled: the pair goes into the release
+    /// keychain, made, opened and given its partition list with its own password; the search
+    /// list keeps login first; the test signature names the release keychain; and no call
+    /// names the login keychain. A second run makes, imports and rewrites nothing.
     #[test]
-    fn the_common_name_parses_in_both_openssl_dialects() {
-        let libressl = "subject= /CN=Developer ID Application: A Person (A66A9P66Z7)/OU=A66A9P66Z7/O=A Person/C=US";
-        let openssl3 = "subject=CN = Developer ID Application: A Person (A66A9P66Z7), OU = A66A9P66Z7, O = A Person, C = US";
-        let want = "Developer ID Application: A Person (A66A9P66Z7)";
-        assert_eq!(cert_common_name(libressl).as_deref(), Some(want));
-        assert_eq!(cert_common_name(openssl3).as_deref(), Some(want));
-        assert!(cert_common_name("subject= /O=A Person/C=US").is_none());
+    fn provision_on_a_fresh_home_fills_the_release_keychain_and_never_the_login_one() {
+        let (_scratch, home, sha1) = vault_filled_home("m9");
+        let login = crate::release_keychain::login_keychain_path(&home);
+        let mut world = World::new(&sha1);
+        world.keychains.insert(login.clone(), Kc::default());
+        world.search_list = vec![login.clone()];
+        let fake = Fake::new(world);
+        let kc = Keychains::new(&home, &fake);
+        let release = kc.release();
+
+        match acquire_in(&kc, "m9", true, Leave::Write, None) {
+            Outcome::Ready { ids, .. } => assert_eq!(ids, std::slice::from_ref(&sha1)),
+            Outcome::Blocked { what, fix } => panic!("blocked: {what} / {fix}"),
+            _ => panic!("a vault-filled pair provisions in one run"),
+        }
+        {
+            let world = fake.0.borrow();
+            for call in &world.log {
+                assert!(!names_login(call, &login), "names login: {call:?}");
+            }
+            let filled = &world.keychains[&release];
+            assert!(filled.partition && !filled.locked, "{filled:?}");
+            assert_eq!((filled.certs.clone(), filled.keys), (vec![sha1.clone()], 1));
+            assert_eq!(world.keychains[&login], Kc::default(), "login untouched");
+            assert_eq!(world.search_list, [login.clone(), release.clone()]);
+        }
+        let probes = fake.calls("codesign", "--force");
+        assert_eq!(probes.len(), 1, "{probes:?}");
+        assert!(
+            probes[0]
+                .windows(2)
+                .any(|w| w[0] == "--keychain" && Path::new(&w[1]) == release),
+            "{probes:?}"
+        );
+
+        let before = fake.0.borrow().keychains.clone();
+        fake.0.borrow_mut().log.clear();
+        assert!(matches!(
+            acquire_in(&kc, "m9", true, Leave::Write, None),
+            Outcome::Ready { .. }
+        ));
+        assert_eq!(fake.0.borrow().keychains, before);
+        for sub in ["create-keychain", "import"] {
+            assert!(
+                fake.calls("security", sub).is_empty(),
+                "a second run ran {sub}"
+            );
+        }
+        assert!(
+            fake.writes().iter().all(|c| c[1] != "list-keychains"),
+            "a second run rewrote the search list"
+        );
+
+        // A key codesign cannot use there, its partition list not settable now, is provision's
+        // to fix, with no login password.
+        {
+            let mut world = fake.0.borrow_mut();
+            world.keychains.get_mut(&release).unwrap().partition = false;
+            world.fail = Some("set-key-partition-list");
+        }
+        let Outcome::Blocked { fix, .. } = verdict(&kc, "m9", vec![sha1.clone()], Leave::Write)
+        else {
+            panic!("a key codesign cannot use is blocked");
+        };
+        assert!(fix.contains("provision --id m9"), "{fix}");
+        assert!(!fix.contains("asks for your login"), "{fix}");
+
+        // A release keychain that cannot be listed is re-run, never sent to the login keychain.
+        fake.0.borrow_mut().fail = Some("find-identity");
+        let Outcome::Blocked { fix, .. } = verdict(&kc, "m9", vec![sha1], Leave::Write) else {
+            panic!("an unreadable keychain is blocked");
+        };
+        assert!(fix.contains("could not be read"), "{fix}");
+        assert!(!fix.contains("login"), "{fix}");
+    }
+
+    /// A run without leave to change follows `leave` on a release keychain that holds the
+    /// identity, its key's partition list gone: `ship provision --check` and a dry release
+    /// only open it (no write but the unlock, no codesign) and say so; a real release's audit
+    /// re-asserts the list and test-signs before the publish.
+    #[test]
+    fn a_check_only_looks_and_a_real_release_audit_test_signs() {
+        let sha1 = "C".repeat(40);
+        let scratch = aterm_tempfile::tempdir().expect("scratch HOME");
+        let home = std::fs::canonicalize(scratch.path()).expect("canonical scratch");
+        let mut world = World::new(&sha1);
+        world.search_list = vec![crate::release_keychain::login_keychain_path(&home)];
+        let fake = Fake::new(world);
+        let kc = Keychains::new(&home, &fake);
+        kc.install_pair(&home.join("c.cer"), &home.join("k.key"))
+            .expect("install");
+        let release = kc.release();
+        let stop = || {
+            let mut world = fake.0.borrow_mut();
+            let kept = world.keychains.get_mut(&release).unwrap();
+            kept.partition = false;
+            kept.locked = true;
+            world.log.clear();
+        };
+
+        stop();
+        match acquire_in(&kc, "m9", false, Leave::Look, None) {
+            Outcome::Ready { ids, note } => {
+                assert_eq!(ids, std::slice::from_ref(&sha1));
+                assert!(note.is_some_and(|n| n.contains(OPENED_NOTE)));
+            }
+            Outcome::Blocked { what, fix } => panic!("a look is ready: {what} / {fix}"),
+            _ => panic!("a look at a held identity is ready"),
+        }
+        let changed: Vec<_> = fake
+            .writes()
+            .into_iter()
+            .filter(|c| c[1] != "unlock-keychain")
+            .collect();
+        assert!(changed.is_empty(), "a look only unlocks: {changed:?}");
+        assert!(fake.calls("codesign", "--force").is_empty());
+
+        stop();
+        match acquire_in(&kc, "m9", false, Leave::Write, None) {
+            Outcome::Ready { note, .. } => {
+                assert!(!note.is_some_and(|n| n.contains(OPENED_NOTE)));
+            }
+            Outcome::Blocked { what, fix } => panic!("the audit signs: {what} / {fix}"),
+            _ => panic!("a real release's audit test-signs"),
+        }
+        assert!(fake.0.borrow().keychains[&release].partition);
+        assert!(!fake.calls("codesign", "--force").is_empty());
+        let added: Vec<_> = fake
+            .writes()
+            .into_iter()
+            .filter(|c| !matches!(c[1].as_str(), "unlock-keychain" | "set-key-partition-list"))
+            .collect();
+        assert!(added.is_empty(), "nothing is imported or listed: {added:?}");
+    }
+
+    /// A Mac provisioned before the release keychain keeps signing from its login keychain:
+    /// provision and its check accept the identity there, write nothing, and only the fix for
+    /// a key codesign cannot use there names the login password.
+    #[test]
+    fn a_login_keychain_provisioned_mac_is_accepted_with_nothing_written() {
+        let sha1 = "B".repeat(40);
+        let scratch = aterm_tempfile::tempdir().expect("scratch HOME");
+        let home = std::fs::canonicalize(scratch.path()).expect("canonical scratch");
+        let login = crate::release_keychain::login_keychain_path(&home);
+        let mut world = World::new(&sha1);
+        world.keychains.insert(login.clone(), Kc::holding(&sha1));
+        world.search_list = vec![login.clone()];
+        let fake = Fake::new(world);
+        let kc = Keychains::new(&home, &fake);
+        for may_change in [true, false] {
+            match acquire_in(&kc, "m9", may_change, Leave::Look, None) {
+                Outcome::Ready { ids, .. } => assert_eq!(ids, std::slice::from_ref(&sha1)),
+                Outcome::Blocked { what, fix } => panic!("blocked: {what} / {fix}"),
+                _ => panic!("the login keychain's identity is accepted"),
+            }
+        }
+        assert!(fake.writes().is_empty(), "{:?}", fake.writes());
+        let probes = fake.calls("codesign", "--force");
+        assert!(
+            !probes.is_empty()
+                && probes
+                    .iter()
+                    .all(|p| !p.contains(&"--keychain".to_string())),
+            "codesign finds it on the search list as it always has: {probes:?}"
+        );
+        for leave in [Leave::Write, Leave::Look] {
+            assert_eq!(pinned_identity_proves(&kc, &sha1, leave), Ok(Proof::Signed));
+        }
+
+        fake.0
+            .borrow_mut()
+            .keychains
+            .get_mut(&login)
+            .unwrap()
+            .partition = false;
+        let Outcome::Blocked { fix, .. } = verdict(&kc, "m9", vec![sha1.clone()], Leave::Look)
+        else {
+            panic!("a key codesign cannot use is blocked");
+        };
+        assert!(
+            fix.contains("asks for your login keychain password"),
+            "{fix}"
+        );
+        assert!(fake.writes().is_empty(), "{:?}", fake.writes());
     }
 
     #[test]
     fn nothing_outside_aterms_own_folder_is_read_unless_the_operator_named_it() {
-        let own = Watch::new(None);
+        let own = env_watch(None);
         let dirs = own.dirs();
         assert_eq!(dirs.len(), 1, "{dirs:?}");
         assert!(dirs[0].ends_with(".aterm/apple"), "{dirs:?}");
@@ -2319,7 +2527,7 @@ mod tests {
                 .any(|d| d.to_string_lossy().contains("Downloads")),
             "{dirs:?}"
         );
-        let named = Watch::new(Some(Path::new("/Users//x/Downloads")));
+        let named = env_watch(Some(Path::new("/Users//x/Downloads")));
         let dirs = named.dirs();
         assert_eq!(dirs.len(), 2, "{dirs:?}");
         assert_eq!(
@@ -2333,8 +2541,8 @@ mod tests {
     #[test]
     fn the_consent_note_names_only_a_guarded_folder_the_operator_named() {
         let home = PathBuf::from(std::env::var_os("HOME").expect("HOME in tests"));
-        assert!(Watch::new(None).consent_note().is_none());
-        let guarded = Watch::new(Some(&home.join("Downloads")));
+        assert!(env_watch(None).consent_note().is_none());
+        let guarded = env_watch(Some(&home.join("Downloads")));
         let downloads_note = guarded
             .consent_note()
             .expect("Downloads is a guarded folder");
@@ -2342,7 +2550,7 @@ mod tests {
             downloads_note.contains("would like to access files"),
             "{downloads_note}"
         );
-        let app_data = Watch::new(Some(
+        let app_data = env_watch(Some(
             &home.join("Library/Containers/com.aterm.nonexistent-test"),
         ));
         let app_data_note = app_data
@@ -2353,24 +2561,24 @@ mod tests {
                 && !app_data_note.contains("one-time"),
             "{app_data_note}"
         );
-        let plain = Watch::new(Some(&home.join(".aterm").join("apple-scratch")));
+        let plain = env_watch(Some(&home.join(".aterm").join("apple-scratch")));
         assert!(plain.consent_note().is_none());
-        let lookalike = Watch::new(Some(&home.join("Downloadsx")));
+        let lookalike = env_watch(Some(&home.join("Downloadsx")));
         assert!(lookalike.consent_note().is_none());
     }
 
     #[test]
     fn the_certificate_is_selected_by_digest_not_by_position() {
-        let stream = "SHA-256 hash: AAAA\nSHA-1 hash: 1111111111111111111111111111111111111111\n\
+        let stream = "SHA-256 hash: AAAA\nSHA-1 hash: 1111111111111111111111111111111111abcdef\n\
                       -----BEGIN CERTIFICATE-----\nolder\n-----END CERTIFICATE-----\n\
-                      SHA-256 hash: BBBB\nSHA-1 hash: 2222222222222222222222222222222222222222\n\
+                      SHA-256 hash: BBBB\nSHA-1 hash: 2222222222222222222222222222222222FEDCBA\n\
                       -----BEGIN CERTIFICATE-----\nnewer\n-----END CERTIFICATE-----\n";
-        let second = leaf_pem_by_sha1(stream, "2222222222222222222222222222222222222222")
+        let second = leaf_pem_by_sha1(stream, "2222222222222222222222222222222222fedcba")
             .expect("the second certificate");
         assert!(second.contains("newer"), "{second}");
         assert!(!second.contains("older"), "{second}");
         assert!(
-            leaf_pem_by_sha1(stream, "1111111111111111111111111111111111111111")
+            leaf_pem_by_sha1(stream, "1111111111111111111111111111111111ABCDEF")
                 .is_some_and(|p| p.contains("older"))
         );
         assert!(leaf_pem_by_sha1(stream, &"3".repeat(40)).is_none());

@@ -49,7 +49,8 @@ impl Grid {
         self.set_cursor(new_row, new_col);
     }
 
-    /// Move cursor up by n rows, respecting scroll region margins.
+    /// Move cursor up by `n` rows under xterm vertical margin rules: clamp at `scroll_region.top`
+    /// when `cursor.row >= scroll_region.top`, and at row `0` when above `scroll_region.top`.
     #[doc(hidden)]
     #[inline]
     pub fn cursor_up(&mut self, n: u16) {
@@ -69,7 +70,9 @@ impl Grid {
         );
     }
 
-    /// Move cursor down by n rows, respecting scroll region margins.
+    /// Move cursor down by `n` rows under xterm vertical margin rules: clamp at
+    /// `scroll_region.bottom` when `cursor.row <= scroll_region.bottom`, and at `visible_rows - 1`
+    /// when below `scroll_region.bottom`.
     #[doc(hidden)]
     #[inline]
     pub fn cursor_down(&mut self, n: u16) {

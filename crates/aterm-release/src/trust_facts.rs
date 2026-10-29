@@ -1564,32 +1564,20 @@ pub(crate) fn memory_refusal(
 /// ([`peak_seen`]): its `peak` is that peak in bytes, its `when` the cost history's stamp.
 pub const PEAK: &str = "peak";
 
-/// A check claims its library's last recorded peak plus a fifth of it, and at least
-/// [`MARGIN_MIN`] more ([`peak_claim`]): one library's recorded peaks moved by 14% between
-/// two runs on one prover (aterm-render, 13.2 GB on 2026-10-22 and 15.0 GB on 2026-10-21).
-const MARGIN_DIV: u64 = 5;
-
-/// The least margin a claim adds to a recorded peak ([`MARGIN_DIV`]).
-const MARGIN_MIN: u64 = 1 << 30;
-
-/// The memory a check of a library whose last recorded check peaked at `maxrss` bytes claims
-/// at the launch gate: that peak and its margin ([`MARGIN_DIV`], [`MARGIN_MIN`]).
-#[must_use]
-pub fn peak_claim(maxrss: u64) -> u64 {
-    maxrss.saturating_add((maxrss / MARGIN_DIV).max(MARGIN_MIN))
-}
-
 /// A library whose last recorded check peaked at `maxrss` bytes (the cost history's largest
-/// process, stamped `when`) so near this host's memory that its claim ([`peak_claim`]) is not
-/// below what can ever be available ([`Host::reach`], the RAM less what is wired, else the
-/// RAM): what is available never reaches that, so the launch gate could never admit it
+/// process, stamped `when`) so near this host's memory that its claim
+/// ([`aterm_capacity::peak_claim`]: that peak, a fifth of it and at least 1 GiB more; one
+/// library's recorded peaks moved by 14% between two runs on one prover, aterm-render's 13.2 GB
+/// on 2026-10-22 and 15.0 GB on 2026-10-21) is not below what can ever be available
+/// ([`Host::reach`], the RAM less what is wired, else the RAM): what is available never
+/// reaches that, so the launch gate could never admit it
 /// ([`aterm_capacity::never`]), and a peak above the RAM cannot fit at all. It is refused up
 /// front whatever the prover's ceiling, its row's ceiling the reach it was held to (`-` where
 /// that was the RAM). `None` when its claim is below that, or the RAM is unread.
 #[must_use]
 pub fn peak_seen(host: &Host, maxrss: u64, when: &str) -> Option<Seen> {
     let below = host.admits_below();
-    (host.mem > 0 && peak_claim(maxrss) >= below).then(|| Seen {
+    (host.mem > 0 && aterm_capacity::peak_claim(maxrss) >= below).then(|| Seen {
         outcome: PEAK.into(),
         ceil: if below < host.mem {
             below.to_string()
@@ -1612,7 +1600,7 @@ pub fn peak_seen(host: &Host, maxrss: u64, when: &str) -> Option<Seen> {
 #[allow(clippy::cast_precision_loss)]
 pub(crate) fn peak_refusal(host: &Host, name: &str, seen: &Seen) -> Option<Refusal> {
     let peak: u64 = seen.peak.parse().ok().filter(|_| seen.outcome == PEAK)?;
-    let claim = peak_claim(peak);
+    let claim = aterm_capacity::peak_claim(peak);
     let gb = |b: u64| b as f64 / 1e9;
     let on = match seen.when.get(..10) {
         Some(day) if seen.when != "-" => format!(" on {day}"),

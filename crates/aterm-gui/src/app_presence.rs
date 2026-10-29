@@ -252,17 +252,19 @@ impl App {
         let wall_answer =
             self.wall_answer_of(session, ctx, agent.as_ref().map(|a| &a.phase), now_us);
         let input_stall = self.session_status.input_stall(session).cloned();
-        let (need, held_by_person) = {
+        let (need, held_by_person, codex_ctx_left) = {
             let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             let verdict = tl.need();
             (
                 verdict.need.as_ref().map(presence::need_fact),
                 verdict.held == Some(aterm_types::needs::HoldWord::Person),
+                tl.codex_survey().and_then(|codex| codex.facts.ctx_left_pct),
             )
         };
         Some(Facts {
             attention,
             shell,
+            program_ctx_left: program.and(codex_ctx_left),
             program,
             agent_seq: agent_seq + self.harness_wait_epoch,
             agent,
@@ -395,7 +397,7 @@ impl App {
         };
         let restarts = relaunching.contains(h.ctx.self_id.as_str())
             && crate::input_stall::host_hand_refusal(ctx, now_us).is_none();
-        let (agent, program_blocked, admit, stall, task, resume, age_ms, told) = {
+        let (agent, program_blocked, admit, stall, task, resume, age_ms, grok_walled) = {
             let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             let a = tl.agent();
             let agent = (a.word != "-").then(|| crate::needs::AgentFact {
@@ -431,7 +433,6 @@ impl App {
             });
             let resume = tl.claude_footer().and_then(|facts| facts.resume.clone());
             let admit = (crate::harness_host::agent_of(a), a.program_pgid);
-            let told = tl.harness_needs();
             // The walled program's group leader, whose start says whether a login predates it.
             let grok_walled = (a.word == "wall:auth"
                 && crate::harness_host::identified_agent(a).is_some_and(signs_in_once_per_machine))
@@ -444,10 +445,10 @@ impl App {
                 task,
                 resume,
                 a.age_ms(),
-                (told, grok_walled),
+                grok_walled,
             )
         };
-        let (told, grok_walled) = told;
+        let told = crate::needs::told_of(ctx, now_us);
         // Read only for a Grok session on a sign-in wall: a record read and a file stat.
         let grok_signin = grok_walled.map(grok_signin_now);
         let host_supervises =
@@ -760,6 +761,27 @@ impl App {
                 }
                 self.clear_land_held(session);
             }
+            // A self-claim's acts happened under the proof that admitted them: each goes on the
+            // glass as its holder's, whatever the claim stands at now.
+            crate::HarnessFact::SelfAct => {
+                let acts = {
+                    let Some(entry) = self.pool.get(session) else {
+                        return;
+                    };
+                    entry
+                        .ctx
+                        .timeline
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take_self_acts()
+                };
+                for crate::session_timeline::SelfAct { act, holder } in acts {
+                    match act {
+                        Some(act) => crate::harness_glass::on_self_act(self, session, act, &holder),
+                        None => self.note_harness_act_for_page(std::time::Instant::now(), false),
+                    }
+                }
+            }
             crate::HarnessFact::Pause(plan) => {
                 let Some(entry) = self.pool.get(session) else {
                     return;
@@ -912,8 +934,22 @@ impl App {
         drive::human_acted(self, wid);
     }
 
-    /// One key from the winit `KeyboardInput` arm.
-    pub(crate) fn dispatch_hw_key(&mut self, wid: WindowId, event: aterm_window::event::KeyEvent) {
+    /// One key from the winit `KeyboardInput` arm. A key an `hwkey` burst posted (`posted`, as
+    /// it arrived: `App::key_event_posted`) takes this, the person's own key path, with no mark
+    /// of its own, but it is a control client's gesture: its dispatch carries the controller
+    /// mark, so the person-only leaves it reaches (⌘V, ⌘C, a Copy or Paste binding, the stats
+    /// lens's copies, an Editor's kill ring and macro) refuse it as they refuse `key`.
+    pub(crate) fn dispatch_hw_key(
+        &mut self,
+        wid: WindowId,
+        event: aterm_window::event::KeyEvent,
+        posted: bool,
+    ) {
+        self.with_controller_mark(posted, |app| app.dispatch_key_event(wid, event));
+    }
+
+    /// [`Self::dispatch_hw_key`] under whatever mark it set.
+    fn dispatch_key_event(&mut self, wid: WindowId, event: aterm_window::event::KeyEvent) {
         let pressed = event.state == aterm_window::event::ElementState::Pressed;
         let front = self.focused_session_id(wid);
         let seen = front.filter(|_| pressed);
@@ -927,8 +963,14 @@ impl App {
         }
     }
 
-    /// The story read for a press (`drive::human_acted_on`).
+    /// The story read for a press (`drive::human_acted_on`). The watermark records what the
+    /// person saw, so a control client's press reads none: a key an `hwkey` burst posted
+    /// ([`Self::dispatch_hw_key`] carries the controller mark) or a `pointer` click (run under
+    /// [`Self::with_gesture_source`]).
     pub(crate) fn note_human_acted_on(&mut self, wid: WindowId, session: u64) {
+        if self.person_gesture_refused() {
+            return;
+        }
         drive::human_acted_on(self, wid, session);
     }
 
@@ -1266,19 +1308,21 @@ impl App {
 
     /// What the tab's hover says after `driven by aterm` for session `session` ([`driven_words`]).
     pub(crate) fn driven_by_aterm(&self, session: u64) -> Option<String> {
-        let (_, view, supervised) = self.session_autopilot(session);
-        if !supervised {
+        let agent = self.session_agent(session);
+        let (_, view, supervised, self_proven) =
+            self.session_autopilot_for(session, agent, &crate::autopilot::ClaimClock::default());
+        if !(supervised
+            || agent.is_some_and(|agent| crate::autopilot::carried(agent, supervised, self_proven)))
+        {
             return None;
         }
         let glass = self.chip_glass(session);
-        let own = self.harness_glass.get(&session);
-        let hold = own.and_then(crate::harness_glass::SessionGlass::hold);
         driven_words(
             crate::claude_lights::ChipFace::of(view, &glass),
             &glass,
-            hold.as_ref(),
+            self.shown_hold(session),
             false,
-            own.and_then(crate::harness_glass::SessionGlass::stopped),
+            self.shown_stop(session),
         )
     }
 
@@ -1965,20 +2009,26 @@ pub(crate) fn harness_need_hover(ask: &crate::needs::HarnessAsk) -> Vec<String> 
 /// WHO DRIVES, IN THE CHIP'S OWN WORDS (§12.4.1; §12.4.3, item 1). `landed_said`: the row these
 /// words end already says `landed` (the Overview's `task landed 17m`), so a landed chip says only
 /// `land` there; the tab's hover, which has no task words, passes `false` and keeps `land, landed`
-/// (§14.6). `stopped`: aterm stopped typing into it, said first under a face that carries a mode
-/// (§14.3: `land: stopped typing; not landed yet, 1 untracked file`, `cruise: stopped typing`).
+/// (§14.6). `stopped`: the stop of whoever drives it ([`App::shown_stop`]), said first under a face
+/// that carries a mode (§14.3: `land: stopped typing; not landed yet, 1 untracked file`, `cruise:
+/// stopped typing`), led by its holder's name where a self-claim stopped its own typing
+/// ([`crate::harness_glass::ShownStop::words`]), since these words name aterm as the driver
+/// (§14.3.2: `land: codex-alab stopped typing`). `hold`: Land's hold of whoever drives it
+/// ([`App::shown_hold`]), said under `⤓ land` once its yield was read, led by its holder's name
+/// where a self-claim told it and no stop of that holder's named it first
+/// ([`crate::harness_glass::ShownHold::words`], §14.3.3: `land: codex-alab: not landed yet, 1
+/// untracked file`).
 #[must_use]
 pub(crate) fn driven_words(
     face: crate::claude_lights::ChipFace,
     glass: &crate::claude_lights::ChipGlass,
-    hold: Option<&crate::harness_glass::HeldGlass>,
+    hold: Option<crate::harness_glass::ShownHold>,
     landed_said: bool,
-    stopped: Option<aterm_agent::harness::acts::HeldBy>,
+    stopped: Option<crate::harness_glass::ShownStop>,
 ) -> Option<String> {
     use crate::claude_lights::ChipFace;
-    let stop = stopped
-        .filter(|_| face.carries())
-        .map(|arm| crate::harness_glass::stop_words(arm, crate::harness_glass::HoldForm::Hover));
+    let stopped = stopped.filter(|_| face.carries());
+    let stop = stopped.map(|stop| stop.words(crate::harness_glass::HoldForm::Hover));
     let mode = |mode: &str, why: Option<String>| match (&stop, why) {
         (Some(stop), Some(why)) => format!("{mode}: {stop}; {why}"),
         (Some(stop), None) => format!("{mode}: {stop}"),
@@ -2004,12 +2054,7 @@ pub(crate) fn driven_words(
         ChipFace::Land => mode(
             "land",
             hold.and_then(|hold| {
-                crate::harness_glass::hold_words(
-                    hold,
-                    None,
-                    crate::harness_glass::HoldForm::Hover,
-                    None,
-                )
+                hold.words(None, crate::harness_glass::HoldForm::Hover, None, stopped)
             }),
         ),
         ChipFace::Landed if landed_said => "land".to_owned(),
@@ -2157,39 +2202,52 @@ mod tests {
         );
     }
 
+    /// A WAIT LIGHTS NOTHING: a `kind=wait` entry, aterm's harness waiting out a limit
+    /// (`supervisor`) or codex-alab waiting out a reset or an outage by itself
+    /// (`codex-alab-wait`), stands with no border, no pill and the chip off. NEGATIVE CONTROL: the
+    /// same entry as an ask lights the border at Decide, the pill and the chip.
     #[test]
     fn a_kind_wait_entry_lights_no_border_and_a_kind_ask_does() {
         use aterm_types::needs::AttentionKind;
-        let (mut app, wid, sid, ctx) = app_with_stub();
-        let entry = |app: &mut App, kind: AttentionKind| {
-            ctx.meta
-                .lock()
-                .unwrap()
-                .set_attention_kind(
-                    aterm_agent::supervise::ATTENTION_OWNER,
-                    Some("limited: resets 7pm".to_string()),
-                    Some(kind),
+        for owner in [aterm_agent::supervise::ATTENTION_OWNER, "codex-alab-wait"] {
+            let (mut app, wid, sid, ctx) = app_with_stub();
+            let entry = |app: &mut App, kind: AttentionKind| {
+                ctx.meta
+                    .lock()
+                    .unwrap()
+                    .set_attention_kind(owner, Some("limited: resets 7pm".to_string()), Some(kind))
+                    .expect("room for the entry");
+                app.on_meta_changed(sid);
+                (
+                    view(app, wid).rim,
+                    app.presence_pill(wid).is_some(),
+                    app.presence.slot(sid).map(|s| s.chip()),
+                    app.presence_chrome_line(),
                 )
-                .expect("room for the entry");
-            app.on_meta_changed(sid);
-            (
-                view(app, wid).rim,
-                app.presence_pill(wid).is_some(),
-                app.presence.slot(sid).map(|s| s.chip()),
-                app.presence_chrome_line(),
-            )
-        };
-        let (rim, pill, chip, line) = entry(&mut app, AttentionKind::Wait);
-        assert!(ctx.meta.lock().unwrap().attention.is_some(), "it stands");
-        assert!(ctx.timeline.lock().unwrap().need().need.is_none());
-        assert_eq!((rim, pill, chip), (Rim::None, false, Some(ChipLevel::Off)));
-        assert!(line.contains("rim=none"), "{line}");
-        let (rim, pill, chip, line) = entry(&mut app, AttentionKind::Ask);
-        assert_eq!(
-            (rim, pill, chip),
-            (Rim::Decide, true, Some(ChipLevel::Wait))
-        );
-        assert!(line.contains("rim=decide"), "{line}");
+            };
+            let (rim, pill, chip, line) = entry(&mut app, AttentionKind::Wait);
+            assert!(
+                ctx.meta.lock().unwrap().attention.is_some(),
+                "{owner}: it stands"
+            );
+            assert!(
+                ctx.timeline.lock().unwrap().need().need.is_none(),
+                "{owner}"
+            );
+            assert_eq!(
+                (rim, pill, chip),
+                (Rim::None, false, Some(ChipLevel::Off)),
+                "{owner}"
+            );
+            assert!(line.contains("rim=none"), "{owner}: {line}");
+            let (rim, pill, chip, line) = entry(&mut app, AttentionKind::Ask);
+            assert_eq!(
+                (rim, pill, chip),
+                (Rim::Decide, true, Some(ChipLevel::Wait)),
+                "{owner}"
+            );
+            assert!(line.contains("rim=decide"), "{owner}: {line}");
+        }
     }
 
     #[test]
@@ -2243,11 +2301,24 @@ mod tests {
     #[test]
     fn a_headless_pill_arms_no_timer() {
         let (mut app, wid, sid, ctx) = app_with_stub();
+        let _ = second_tab(&mut app, wid);
         ask(&ctx, Some("approve?"));
         app.refresh_presence_session(sid);
-        assert!(app.presence_pill(wid).is_some());
+        assert!(
+            view(&app, wid).pill.as_ref().and_then(|p| p.tab).is_some(),
+            "PRECONDITION: a background tab's pill, which carries an age"
+        );
         let now = Instant::now();
-        assert_eq!(app.presence_deadline(now), None);
+        assert_eq!(
+            app.presence_deadline(now),
+            None,
+            "headless: nobody reads the pill's age"
+        );
+        app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+        assert!(
+            app.presence_deadline(now).is_some(),
+            "CONTROL: an on-screen background pill arms its age timer"
+        );
     }
 
     #[test]
@@ -3334,6 +3405,53 @@ mod tests {
         assert_eq!(app.presence_session_level(sid), presence::Level::Story);
         app.note_human_acted(wid);
         assert_eq!(app.presence_session_level(sid), presence::Level::Quiet);
+    }
+
+    /// A CONTROL CLIENT'S PRESS READS NO STORY: the story watermark records what the person
+    /// saw, so a key an `hwkey` burst posted (the winit key arm, under the controller mark) and a
+    /// `pointer` click (under the controller's gesture) leave the session's story standing; the
+    /// person's key by the same arm reads it.
+    /// NEGATIVE CONTROL: without the guard in `note_human_acted_on`, the posted key read the
+    /// story (Quiet).
+    #[test]
+    fn a_control_clients_press_reads_no_story() {
+        use aterm_window::event::{ElementState, KeyEvent, MouseButton};
+        use aterm_window::keyboard::{Key, KeyCode, KeyLocation, PhysicalKey, SmolStr};
+        let (mut app, wid, sid, _ctx) = app_with_stub();
+        app.refresh_presence_session(sid);
+        app.tell_story(sid, presence::StoryVerb::Chose)
+            .expect("the stub is held");
+        let key = || {
+            KeyEvent::synthetic_for_test(
+                PhysicalKey::Code(KeyCode::KeyX),
+                Key::Character(SmolStr::new("x")),
+                Some(SmolStr::new("x")),
+                KeyLocation::Standard,
+                ElementState::Pressed,
+                false,
+            )
+        };
+        app.dispatch_hw_key(wid, key(), true);
+        assert_eq!(
+            app.presence_session_level(sid),
+            presence::Level::Story,
+            "a posted key"
+        );
+        app.with_gesture_source(true, |app| {
+            app.mouse_input_then_fold(wid, ElementState::Pressed, MouseButton::Left);
+            app.mouse_input_then_fold(wid, ElementState::Released, MouseButton::Left);
+        });
+        assert_eq!(
+            app.presence_session_level(sid),
+            presence::Level::Story,
+            "a pointer click"
+        );
+        app.dispatch_hw_key(wid, key(), false);
+        assert_eq!(
+            app.presence_session_level(sid),
+            presence::Level::Quiet,
+            "the person's key reads it"
+        );
     }
 
     #[test]

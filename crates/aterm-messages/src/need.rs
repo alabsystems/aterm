@@ -434,7 +434,7 @@ impl Fingerprint {
     #[must_use]
     pub fn new(family: &str, subject: &str, cause: &str) -> Self {
         let family = clip(family, 24);
-        let cause = clip(cause, 20);
+        let mut cause = clip(cause, 20);
         let subject = clip(subject, usize::MAX);
         if subject.is_empty() {
             return Self(format!("{family}.{cause}"));
@@ -447,9 +447,14 @@ impl Fingerprint {
             let hash = subject.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
                 (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
             });
-            let keep = room.saturating_sub(5);
-            let head: String = subject.chars().take(keep.min(12)).collect();
-            format!("{head}~{:04x}", hash & 0xffff)
+            if room >= 5 {
+                let keep = (room - 5).min(12);
+                let head: String = subject.chars().take(keep).collect();
+                format!("{head}~{:04x}", hash & 0xffff)
+            } else {
+                cause = clip(&cause, KEY_CAP.saturating_sub(family.chars().count() + 6));
+                format!("{:04x}", hash & 0xffff)
+            }
         };
         Self(format!("{family}.{subject}.{cause}"))
     }

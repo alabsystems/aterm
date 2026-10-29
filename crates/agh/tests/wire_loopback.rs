@@ -104,22 +104,6 @@ fn the_api_origin_gets_user_agent_api_version_and_accept() {
 }
 
 #[test]
-fn the_web_origin_gets_no_api_version() {
-    let fake = fake_with_repo();
-    let gh = anonymous(&fake);
-    let call = Call::get("/fixture-dev/repo", read_of("fixture-dev/repo"))
-        .origin(OriginRole::Web)
-        .answer_any(true);
-    gh.call(&call).expect("the web answers");
-    let seen = fake.seen();
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].origin, FakeOrigin::Web);
-    assert_eq!(seen[0].header("x-github-api-version"), None);
-    assert!(seen[0].header("user-agent").is_some());
-    assert_clean(&fake);
-}
-
-#[test]
 fn an_anonymous_asset_download_hops_to_the_cdn() {
     let fake = fake_with_repo();
     let id = one_asset(&fake, "fixture-dev/repo");

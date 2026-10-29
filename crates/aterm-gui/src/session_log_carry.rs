@@ -10,7 +10,7 @@ use aterm_slog::{
 #[cfg(any(unix, test))]
 use aterm_slog::{CarryBudget, CarryOut, CarrySnapshot, PreparedCarry};
 
-use super::{AgentRun, CSnap, CmdRun, FgRun, LogCarry, PendingName, SessionLog, Typed};
+use super::{AgentRun, CSnap, CmdRun, Detailed, FgRun, LogCarry, PendingName, SessionLog, Typed};
 
 /// What the handoff worker takes of a session's log under its timeline lock.
 #[cfg(any(unix, test))]
@@ -185,11 +185,12 @@ impl SessionLog {
         ));
         if let Some(c) = self.cmd {
             out.push(format!(
-                "cmd blk={} node={} wall_from={} child_end={}",
+                "cmd blk={} node={} wall_from={} child_end={} detailed={}",
                 c.blk,
                 c.node,
                 opt_wall(c.wall_from),
-                opt_wall(c.child_end.map(|s| s.wall_ms))
+                opt_wall(c.child_end.map(|s| s.wall_ms)),
+                c.detailed.word()
             ));
         }
         if let Some(f) = &self.fg {
@@ -451,6 +452,7 @@ fn read_cmd(line: &str, log: &Log, at: Stamp) -> Option<CmdRun> {
         node: Node::parse(kv(line, "node")?)?,
         wall_from: opt_num(line, "wall_from")?,
         child_end: opt_num(line, "child_end")?.map(|w| rebase(w, at)),
+        detailed: Detailed::from_word(kv(line, "detailed")),
     };
     (log.is_open(c.node) && log.open_entry(c.node).is_some_and(|e| e.kind == Kind::Cmd))
         .then_some(c)

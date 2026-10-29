@@ -231,9 +231,8 @@ impl TerminalSearch {
         after_line: usize,
         after_col: usize,
     ) -> Option<SearchMatch> {
-        self.index
-            .search_from_line(query, after_line)
-            .find(|m| m.line > after_line || (m.line == after_line && m.start_col > after_col))
+        self.find_next_opts(query, after_line, after_col, true, false)
+            .expect("literal search cannot fail")
     }
 
     /// Find the next match with case-sensitivity and regex options.
@@ -267,10 +266,8 @@ impl TerminalSearch {
         before_line: usize,
         before_col: usize,
     ) -> Option<SearchMatch> {
-        let exclusive_upper = before_line.saturating_add(1);
-        self.index
-            .search_before_line(query, exclusive_upper)
-            .find(|m| m.line < before_line || (m.line == before_line && m.start_col < before_col))
+        self.find_prev_opts(query, before_line, before_col, true, false)
+            .expect("literal search cannot fail")
     }
 
     /// Find the previous match with case-sensitivity and regex options.

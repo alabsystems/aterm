@@ -102,11 +102,9 @@ struct LiveStaged {
 
 /// Called only after try_wait proved this retained child remains unreaped.
 fn signal_owned(child: &mut Child) {
-    if let Ok(pid) = i32::try_from(child.id())
-        && pid > 0
-    {
-        // SAFETY: the exact unreaped child owns this group ID; it was spawned with setsid.
-        let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    if let Ok(pid) = i32::try_from(child.id()) {
+        // The exact unreaped child owns this group ID; it was spawned with setsid.
+        let _ = aterm_uds::process::kill_group_until_empty(pid);
     }
     let _ = child.kill();
 }

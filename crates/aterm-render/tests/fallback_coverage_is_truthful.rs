@@ -34,12 +34,16 @@ fn korean_resolves_consistently_to_a_face_that_has_hangul() {
              resolved to any face — the unresolved ones render as tofu",
             syllables.len()
         );
+    } else if resolved == 0 {
+        aterm_spec::host::could_not_run("no Hangul fallback face installed on this host");
     }
 }
 
 fn hangul_face_installed() -> bool {
     const KNOWN_HANGUL_FACES: &[&str] = &[
         "C:\\Windows\\Fonts\\malgun.ttf",
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+        "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
         "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
         "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",

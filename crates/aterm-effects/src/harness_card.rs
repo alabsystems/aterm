@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use crate::cli_marks::ICON_CONTRAST;
 use crate::color_math::{
-    floor_contrast_keeping_hue, hue_path_at, hue_path_endpoints, relative_luminance,
+    floor_contrast_keeping_hue_with_ground_lum, hue_path_at, hue_path_endpoints, relative_luminance,
 };
 use crate::cursor_glow::InkRole;
 use crate::effect_util::{
@@ -713,9 +713,12 @@ impl LineInks {
         if matches!(self.key, Some((p, g)) if p as u8 == palette as u8 && g == ground) {
             return;
         }
+        let table = crate::color_math::relative_luminance_table();
+        let y_bg = crate::color_math::relative_luminance_with(table, ground & 0x00FF_FFFF);
         let mut i = 0;
         while i < self.ink.len() {
-            self.ink[i] = palette.text_at(i as f32 * Self::INV_LINE_INK_STEPS, ground);
+            self.ink[i] =
+                palette.text_at_with_bg_lum(table, i as f32 * Self::INV_LINE_INK_STEPS, y_bg);
             i += 1;
         }
         self.key = Some((palette, ground));
@@ -823,6 +826,15 @@ impl CardPalette {
         }
     }
 
+    #[inline]
+    const fn letter_dark_with(
+        self,
+        table: &crate::color_math::RelativeLuminanceTable,
+        t: f32,
+    ) -> u32 {
+        lift_to_luminance_with(table, self.at(t), LINE_DARK_LUMA_FLOOR)
+    }
+
     /// Returns the resting line letter color at `t` (`0.0..=1.0`) against `ground` (`0x00RRGGBB`),
     /// reading at least 4.5:1 on it: on a dark ground the lifted letter floored along its hue, on
     /// paper the print law's ink.
@@ -830,10 +842,12 @@ impl CardPalette {
     #[inline]
     pub const fn letter_on(self, t: f32, ground: u32) -> u32 {
         let ground = ground & 0x00FF_FFFF;
-        if dark_ground(ground) {
-            line_floor(self.letter(t, true), ground)
+        let table = crate::color_math::relative_luminance_table();
+        let lg = crate::color_math::relative_luminance_with(table, ground);
+        if lg < 0.5 {
+            line_floor(table, self.letter_dark_with(table, t), lg)
         } else {
-            self.text_at(t, ground)
+            self.text_at_with_bg_lum(table, t, lg)
         }
     }
 
@@ -891,12 +905,38 @@ impl CardPalette {
             Self::Cruise | Self::Land => paper_mark_ink(self.art_at(t, false), ground),
         }
     }
+
+    #[inline]
+    const fn text_at_with_bg_lum(
+        self,
+        table: &crate::color_math::RelativeLuminanceTable,
+        t: f32,
+        y_bg: f32,
+    ) -> u32 {
+        match self {
+            Self::Off => paper_silver_ink_with_bg_lum(table, self.art_at(t, false), y_bg),
+            Self::Cruise | Self::Land => crate::rainbow_kitty::ribbon::paper_mark_ink_with_bg_lum(
+                table,
+                self.art_at(t, false),
+                y_bg,
+            ),
+        }
+    }
 }
 
 #[inline]
 const fn paper_silver_ink(rgb: u32, ground: u32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
     let y_bg = crate::color_math::relative_luminance_with(table, ground & 0x00FF_FFFF);
+    paper_silver_ink_with_bg_lum(table, rgb, y_bg)
+}
+
+#[inline]
+const fn paper_silver_ink_with_bg_lum(
+    table: &crate::color_math::RelativeLuminanceTable,
+    rgb: u32,
+    y_bg: f32,
+) -> u32 {
     let y_bg_plus = y_bg + 0.05;
     #[inline]
     const fn holds(
@@ -1332,6 +1372,7 @@ struct Geo {
 }
 
 impl Geo {
+    #[inline]
     const fn new(s: &CardScene) -> Option<Self> {
         const fn air(pad: u16, ch: i64) -> i64 {
             let p = pad as i64;
@@ -1520,6 +1561,7 @@ impl KittyInk {
         }
     }
 
+    #[cfg(test)]
     #[inline]
     const fn of(self, c: u8) -> Option<u32> {
         match c {
@@ -1570,6 +1612,7 @@ const fn unit(seed: u64, salt: u64) -> f32 {
 struct StarSpot {
     x: i64,
     y: i64,
+    arm: i64,
     ratio: f32,
     phase: f32,
     gold: bool,
@@ -1771,6 +1814,7 @@ fn trail_band(g: &Geo, s: &CardScene) -> (i64, i64) {
     (y0.clamp(lo, hi), y1.clamp(lo, hi))
 }
 
+#[inline]
 fn trail_rect(g: &Geo, s: &CardScene, seat: Option<KittyAt>) -> Option<(Rect, i64)> {
     let (c0, c1) = s.trail?;
     if g.rows < 2 {
@@ -1883,6 +1927,7 @@ fn glint_spots(g: &Geo, s: &CardScene, seed: u64) -> Glints {
     glint_spots_at(g, s, seed, star_region(g, s), kitty_rect(g, s))
 }
 
+#[inline]
 fn glint_spots_at(
     g: &Geo,
     s: &CardScene,
@@ -1972,6 +2017,7 @@ fn field_spots(
             [StarSpot {
                 x: 0,
                 y: 0,
+                arm: 0,
                 ratio: 0.0,
                 phase: 0.0,
                 gold: false,
@@ -1984,6 +2030,7 @@ fn field_spots(
     field_spots_at(g, s, seed, light_theme, region, seat, &glints)
 }
 
+#[inline]
 fn field_spots_at(
     g: &Geo,
     s: &CardScene,
@@ -1996,6 +2043,7 @@ fn field_spots_at(
     let mut spots = [StarSpot {
         x: 0,
         y: 0,
+        arm: 0,
         ratio: 0.0,
         phase: 0.0,
         gold: false,
@@ -2011,13 +2059,27 @@ fn field_spots_at(
     let gap = g.cw.max(g.ch / 2);
     let tax = if light_theme { STAR_ARM_INK } else { 1.0 };
     let chf = g.ch as f32;
+    let ratios = [
+        STAR_RATIOS[0] * tax,
+        STAR_RATIOS[1] * tax,
+        STAR_RATIOS[2] * tax,
+        STAR_RATIOS[3] * tax,
+    ];
+    let arm_fine = i64::from(star_arm_px(star_arm(chf, ratios[1])));
+    let arms = [
+        i64::from(star_arm_px(star_arm(chf, ratios[0]))),
+        arm_fine,
+        i64::from(star_arm_px(star_arm(chf, ratios[2]))),
+        arm_fine,
+    ];
     let mut n = 0;
     let mut i = 0;
     while i < want {
         let cur_i = i;
         i += 1;
-        let ratio = STAR_RATIOS[cur_i & (STAR_RATIOS.len() - 1)] * tax;
-        let arm = i64::from(star_arm_px(star_arm(chf, ratio)));
+        let idx = cur_i & (STAR_RATIOS.len() - 1);
+        let ratio = ratios[idx];
+        let arm = arms[idx];
         let m = arm + 1;
         let room = Rect {
             x0: region.x0 + m,
@@ -2098,6 +2160,7 @@ fn field_spots_at(
                 spots[n] = StarSpot {
                     x,
                     y,
+                    arm,
                     ratio,
                     phase: unit(seed, 0x5048_0000 | i as u64) * std::f32::consts::PI,
                     gold: i % 3 == 0,
@@ -2312,6 +2375,7 @@ impl HarnessCard {
 
     /// Replays the cached settled [`CardFrame`] from `frames` if the card holds still and matches
     /// `scene`'s shape.
+    #[inline]
     pub fn replay(
         &mut self,
         scene: &CardScene,
@@ -2337,6 +2401,7 @@ impl HarnessCard {
     }
 
     /// Replays the cached flow [`CardFrame`] from `frames` when `now` falls in the same step.
+    #[inline]
     pub fn replay_step(
         &mut self,
         scene: &CardScene,
@@ -2403,6 +2468,7 @@ impl HarnessCard {
     }
 
     /// Draws the current frame (`under` and `over` layers) into `frames` for `scene` and `animate`.
+    #[inline]
     pub fn draw(
         &mut self,
         now: Instant,
@@ -2447,6 +2513,7 @@ impl HarnessCard {
         }
     }
 
+    #[inline]
     fn step(
         &mut self,
         now: Instant,
@@ -2476,6 +2543,7 @@ impl HarnessCard {
         Some(clock)
     }
 
+    #[inline]
     fn advance(&mut self, now: Instant, animate: bool, serious: bool) -> Clock {
         if serious {
             self.episode = Episode::Idle;
@@ -2597,6 +2665,7 @@ impl HarnessCard {
     }
 
     /// Appends per-cell [`InkCell`] colors for the status line at `at` into `out`.
+    #[inline]
     pub fn line_ink_into(
         &self,
         now: Option<Instant>,
@@ -2605,12 +2674,17 @@ impl HarnessCard {
         animate: bool,
         out: &mut Vec<InkCell>,
     ) {
-        let ground = ground & 0x00FF_FFFF;
-        let dark = dark_ground(ground);
         debug_assert!(
             now.is_some() || self.is_still() || !animate,
             "a card that moves needs the clock for its line"
         );
+        if at.len == 0 {
+            return;
+        }
+        let ground = ground & 0x00FF_FFFF;
+        let table = crate::color_math::relative_luminance_table();
+        let lg = crate::color_math::relative_luminance_with(table, ground);
+        let dark = lg < 0.5;
         let clock = match now {
             Some(now) if animate => match self.running(now) {
                 Some(ms) => self.on_ripple(Clock::intro(ms, None), now),
@@ -2670,12 +2744,17 @@ impl HarnessCard {
                 let place = tri(k * LINE_HERO_SPREAD + phi);
                 if dark {
                     line_floor(
+                        table,
                         mix_rgb(
-                            lift_to_luminance(palette.at(place), LINE_HERO_DARK_LUMA_FLOOR),
+                            lift_to_luminance_with(
+                                table,
+                                palette.at(place),
+                                LINE_HERO_DARK_LUMA_FLOOR,
+                            ),
                             WHITE,
                             crest * LINE_HERO_SWEEP_GAIN,
                         ),
-                        ground,
+                        lg,
                     )
                 } else {
                     mix_rgb(
@@ -2688,8 +2767,13 @@ impl HarnessCard {
                 let place = tri(x + phi);
                 if dark {
                     line_floor(
-                        mix_rgb(palette.letter(place, true), WHITE, crest * LINE_SWEEP_GAIN),
-                        ground,
+                        table,
+                        mix_rgb(
+                            palette.letter_dark_with(table, place),
+                            WHITE,
+                            crest * LINE_SWEEP_GAIN,
+                        ),
+                        lg,
                     )
                 } else {
                     mix_rgb(
@@ -2712,14 +2796,22 @@ impl HarnessCard {
 /// where it already reads, lifted toward white on a dim ground, and darkened on a mid ground on
 /// which black reads better than white, so a sweep's white never washes it out.
 #[inline]
-const fn line_floor(rgb: u32, ground: u32) -> u32 {
-    floor_contrast_keeping_hue(rgb, ground, LINE_CONTRAST)
+const fn line_floor(table: &crate::color_math::RelativeLuminanceTable, rgb: u32, lg: f32) -> u32 {
+    floor_contrast_keeping_hue_with_ground_lum(table, rgb, lg, LINE_CONTRAST)
 }
 
 /// Mixes `rgb` toward white to reach WCAG relative luminance `floor` on a `2^-14` step grid.
 #[inline]
 pub(crate) const fn lift_to_luminance(rgb: u32, floor: f32) -> u32 {
-    let table = crate::color_math::relative_luminance_table();
+    lift_to_luminance_with(crate::color_math::relative_luminance_table(), rgb, floor)
+}
+
+#[inline]
+const fn lift_to_luminance_with(
+    table: &crate::color_math::RelativeLuminanceTable,
+    rgb: u32,
+    floor: f32,
+) -> u32 {
     if crate::color_math::relative_luminance_with(table, rgb) >= floor {
         return rgb;
     }
@@ -2774,8 +2866,22 @@ pub enum DarkMark {
 /// its hue to the least lightness that reads, added; and otherwise (black reads better, or even
 /// added white misses the floor) the light floored along its hue to [`MARK_CONTRAST`] and
 /// printed.
+#[inline]
 #[must_use]
 pub const fn dark_mark(rgb: u32, ground: u32) -> DarkMark {
+    let ground = ground & 0x00FF_FFFF;
+    let table = crate::color_math::relative_luminance_table();
+    let lg = crate::color_math::relative_luminance_with(table, ground);
+    dark_mark_with(table, rgb, ground, lg)
+}
+
+#[inline]
+const fn dark_mark_with(
+    table: &crate::color_math::RelativeLuminanceTable,
+    rgb: u32,
+    ground: u32,
+    lg: f32,
+) -> DarkMark {
     #[inline]
     const fn reads(
         table: &crate::color_math::RelativeLuminanceTable,
@@ -2787,9 +2893,7 @@ pub const fn dark_mark(rgb: u32, ground: u32) -> DarkMark {
         let ll = crate::color_math::relative_luminance_with(table, lit);
         (ll.max(lg) + 0.05) / (ll.min(lg) + 0.05) >= MARK_CONTRAST
     }
-    let (rgb, ground) = (rgb & 0x00FF_FFFF, ground & 0x00FF_FFFF);
-    let table = crate::color_math::relative_luminance_table();
-    let lg = crate::color_math::relative_luminance_with(table, ground);
+    let rgb = rgb & 0x00FF_FFFF;
     if reads(table, ground, lg, rgb) {
         return DarkMark::Light(rgb);
     }
@@ -2822,19 +2926,28 @@ pub const fn dark_mark(rgb: u32, ground: u32) -> DarkMark {
             return DarkMark::Light(hi_rgb);
         }
     }
-    DarkMark::Print(floor_contrast_keeping_hue(rgb, ground, MARK_CONTRAST))
+    DarkMark::Print(floor_contrast_keeping_hue_with_ground_lum(
+        table,
+        rgb,
+        lg,
+        MARK_CONTRAST,
+    ))
 }
 
 /// The tint and blend of the `✦` leading a card line whose first letter wears `rgb` on `ground`
 /// (both `0x00RRGGBB`): on a dark ground the card's mark ([`dark_mark`]), the letter's light
 /// added where it reads or once lifted along its hue, else its floored ink laid over the ground;
 /// on paper the letter's ink laid over.
+#[inline]
 #[must_use]
 pub const fn line_star(rgb: u32, ground: u32) -> (u32, DecoBlend) {
-    if !dark_ground(ground & 0x00FF_FFFF) {
+    let ground = ground & 0x00FF_FFFF;
+    let table = crate::color_math::relative_luminance_table();
+    let lg = crate::color_math::relative_luminance_with(table, ground);
+    if lg >= 0.5 {
         return (rgb, DecoBlend::Over);
     }
-    match dark_mark(rgb, ground) {
+    match dark_mark_with(table, rgb, ground, lg) {
         DarkMark::Light(rgb) => (rgb, DecoBlend::Add),
         DarkMark::Print(rgb) => (rgb, DecoBlend::Over),
     }
@@ -2903,6 +3016,7 @@ fn compute_trail_lay(
     })
 }
 
+#[inline]
 fn lay_cut(
     q: Rect,
     k: i64,
@@ -2963,6 +3077,7 @@ struct Emit<'a> {
 }
 
 impl<'a> Emit<'a> {
+    #[inline]
     fn new(scene: &'a CardScene, geo: Geo, clock: Clock, seed: u64) -> Self {
         const INV_SHIMMER_MS: f32 = 1.0 / SHIMMER_MS;
         let seat = kitty_rect(&geo, scene);
@@ -3052,6 +3167,7 @@ impl<'a> Emit<'a> {
         }
     }
 
+    #[inline]
     fn border(&self, out: &mut impl Ramps) {
         let g = self.geo;
         let o = g.outer;
@@ -3171,8 +3287,7 @@ impl<'a> Emit<'a> {
     }
 
     #[inline]
-    const fn stripe_paint(&self, k: usize, (w, ring): (f32, f32)) -> Paint {
-        let base = self.scene.palette.stripe(k, self.scene.dark);
+    const fn stripe_paint_with_base(&self, k: usize, base: u32, (w, ring): (f32, f32)) -> Paint {
         if self.scene.dark {
             let w = w.max(GLINT_CREST_DARK * ring);
             light(mix_rgb(base, WHITE, w), TRAIL_COV as f32)
@@ -3187,6 +3302,7 @@ impl<'a> Emit<'a> {
         }
     }
 
+    #[inline]
     fn trail(&self, out: &mut impl Ramps) {
         let Some(lay) = self.trail_lay else {
             return;
@@ -3200,6 +3316,9 @@ impl<'a> Emit<'a> {
             yb,
             ..
         } = lay;
+        if drawn <= tx0 {
+            return;
+        }
         let inner = self.geo.inner();
         let stripes = TRAIL_STOPS.len() as i64;
         let h = yb - ya;
@@ -3208,13 +3327,22 @@ impl<'a> Emit<'a> {
         let mid = (ya + yb) as f32 * 0.5;
         let inv_len = 1.0 / len as f32;
         let mut wa = self.shimmer(0.0, (tx0 as f32, mid));
+        let (palette, dark) = (self.scene.palette, self.scene.dark);
+        let bases: [u32; TRAIL_STOPS.len()] = [
+            palette.stripe(0, dark),
+            palette.stripe(1, dark),
+            palette.stripe(2, dark),
+            palette.stripe(3, dark),
+            palette.stripe(4, dark),
+            palette.stripe(5, dark),
+        ];
         let mut ends: [Paint; TRAIL_STOPS.len()] = [
-            self.stripe_paint(0, wa),
-            self.stripe_paint(1, wa),
-            self.stripe_paint(2, wa),
-            self.stripe_paint(3, wa),
-            self.stripe_paint(4, wa),
-            self.stripe_paint(5, wa),
+            self.stripe_paint_with_base(0, bases[0], wa),
+            self.stripe_paint_with_base(1, bases[1], wa),
+            self.stripe_paint_with_base(2, bases[2], wa),
+            self.stripe_paint_with_base(3, bases[3], wa),
+            self.stripe_paint_with_base(4, bases[4], wa),
+            self.stripe_paint_with_base(5, bases[5], wa),
         ];
         while xa < drawn {
             let xb = (xa + seg).min(drawn);
@@ -3242,7 +3370,7 @@ impl<'a> Emit<'a> {
                 let pb = if same_w {
                     end
                 } else {
-                    self.stripe_paint(s, wb)
+                    self.stripe_paint_with_base(s, bases[s], wb)
                 };
                 out.ramp(inner, r, end, pb);
                 ends[s] = pb;
@@ -3308,6 +3436,7 @@ impl<'a> Emit<'a> {
         })
     }
 
+    #[inline]
     const fn trail_ink(&self) -> TrailInk {
         let mut ink = TrailInk::new();
         if self.scene.dark {
@@ -3332,6 +3461,7 @@ impl<'a> Emit<'a> {
         }
     }
 
+    #[inline]
     fn glints(&self, lay: &mut impl FnMut(StarCall)) {
         const INV_STAR_SETTLE_SPAN: f32 = 1.0 / STAR_SETTLE_SPAN;
         const INV_STAR_REVEAL_MS: f32 = 1.0 / STAR_REVEAL_MS;
@@ -3399,6 +3529,7 @@ impl<'a> Emit<'a> {
         }
     }
 
+    #[inline]
     fn field(&self, lay: &mut impl FnMut(StarCall)) {
         const INV_STAR_SETTLE_SPAN: f32 = 1.0 / STAR_SETTLE_SPAN;
         const INV_STAR_REVEAL_MS: f32 = 1.0 / STAR_REVEAL_MS;
@@ -3415,6 +3546,9 @@ impl<'a> Emit<'a> {
             self.seat,
             self.glint_spots(),
         );
+        if n == 0 {
+            return;
+        }
         let u = self.clock.u();
         let settle = smooth((u - (1.0 - STAR_SETTLE_SPAN)) * INV_STAR_SETTLE_SPAN);
         let riding = match self.seat {
@@ -3423,7 +3557,6 @@ impl<'a> Emit<'a> {
             None => None,
         };
         let t_sec = self.clock.t_ms.map(|t| t as f32 * 0.001);
-        let chf = self.geo.ch as f32;
         let (even_rgb, odd_rgb) = match self.scene.palette {
             CardPalette::Cruise => (twinkle_rgb(true), twinkle_rgb(false)),
             CardPalette::Land => (twinkle_rgb(true), mix_rgb(SUNSET[3], WHITE, 0.5)),
@@ -3434,7 +3567,7 @@ impl<'a> Emit<'a> {
             let s = &spots[i];
             let cur_i = i;
             i += 1;
-            let arm = i64::from(star_arm_px(star_arm(chf, s.ratio)));
+            let arm = s.arm;
             let up = match (self.clock.ride_ms, riding) {
                 (Some(t), Some((seat, from, inv_dist))) if s.x < seat.rect.x0 => {
                     let passed = ride_at((s.x + arm + 1 - from) as f32 * inv_dist);
@@ -3474,6 +3607,7 @@ impl<'a> Emit<'a> {
         }
     }
 
+    #[inline]
     fn shed(&self, lay: &mut impl FnMut(StarCall)) {
         const INV_SHED_MS: f32 = 1.0 / SHED_MS as f32;
         const INV_SHED_STEP: f32 = 1.0 / (SHED_SPARKLES + 1) as f32;
@@ -3552,6 +3686,7 @@ impl<'a> Emit<'a> {
         }
     }
 
+    #[inline]
     fn burst_stars(&self, lay: &mut impl FnMut(StarCall)) {
         let Some(ring) = self.burst_ring() else {
             return;
@@ -3574,23 +3709,71 @@ impl<'a> Emit<'a> {
 
     /// Every star of the frame, a dark scene's each laid on its ground ([`StarCall::laid_on`]),
     /// the glints by their rest light ([`Self::laid_glints`]).
+    #[inline]
     fn each_star(&self, lay: &mut impl FnMut(StarCall)) {
-        let ground = self.scene.ground;
-        self.burst_stars(&mut |s: StarCall| lay(s.laid_on(ground)));
-        self.laid_glints(lay);
-        let lay = &mut |s: StarCall| lay(s.laid_on(ground));
-        self.field(lay);
-        self.shed(lay);
+        if !self.scene.dark {
+            self.burst_stars(lay);
+            self.glints(lay);
+            self.field(lay);
+            self.shed(lay);
+            return;
+        }
+        let ground = self.scene.ground & 0x00FF_FFFF;
+        let table = crate::color_math::relative_luminance_table();
+        let lg = crate::color_math::relative_luminance_with(table, ground);
+        let mut cache: [(u32, Option<DarkMark>); 2] = [(0, None), (0, None)];
+        let mut cache_slot = 0usize;
+        let mut resolve = |s: StarCall| -> StarCall {
+            if !s.light {
+                return s;
+            }
+            let dm = if let Some(dm) = cache[0].1
+                && cache[0].0 == s.color
+            {
+                dm
+            } else if let Some(dm) = cache[1].1
+                && cache[1].0 == s.color
+            {
+                dm
+            } else {
+                let dm = dark_mark_with(table, s.color, ground, lg);
+                cache[cache_slot] = (s.color, Some(dm));
+                cache_slot ^= 1;
+                dm
+            };
+            s.with_dark_mark(dm)
+        };
+        self.burst_stars(&mut |s: StarCall| lay(resolve(s)));
+        self.laid_glints_with(table, ground, lg, lay);
+        let lay_star = &mut |s: StarCall| lay(resolve(s));
+        self.field(lay_star);
+        self.shed(lay_star);
     }
 
     /// The glints, each laid with the polarity its rest light takes on the ground
     /// ([`StarCall::laid_as`]), so a flare toward white never flips one between ink and light.
+    #[cfg(test)]
+    #[inline]
     fn laid_glints(&self, lay: &mut impl FnMut(StarCall)) {
-        let ground = self.scene.ground;
-        let rest = dark_mark(self.scene.palette.glint_rest(), ground);
-        self.glints(&mut |s: StarCall| lay(s.laid_as(rest, ground)));
+        let ground = self.scene.ground & 0x00FF_FFFF;
+        let table = crate::color_math::relative_luminance_table();
+        let lg = crate::color_math::relative_luminance_with(table, ground);
+        self.laid_glints_with(table, ground, lg, lay);
     }
 
+    #[inline]
+    fn laid_glints_with(
+        &self,
+        table: &crate::color_math::RelativeLuminanceTable,
+        ground: u32,
+        lg: f32,
+        lay: &mut impl FnMut(StarCall),
+    ) {
+        let rest = dark_mark_with(table, self.scene.palette.glint_rest(), ground, lg);
+        self.glints(&mut |s: StarCall| lay(s.laid_as(table, rest, ground, lg)));
+    }
+
+    #[inline]
     const fn burst_ring(&self) -> Option<BurstRing> {
         const INV_BURST_MS: f32 = 1.0 / BURST_MS as f32;
         const STEP_THETA: f32 = std::f32::consts::TAU / BURST_STARS as f32;
@@ -3666,14 +3849,9 @@ struct StarCall {
 }
 
 impl StarCall {
-    /// The star laid on `ground`: a dark scene's light as [`dark_mark`] lays it, a printed star
-    /// as it is.
     #[inline]
-    const fn laid_on(self, ground: u32) -> Self {
-        if !self.light {
-            return self;
-        }
-        match dark_mark(self.color, ground) {
+    const fn with_dark_mark(self, dm: DarkMark) -> Self {
+        match dm {
             DarkMark::Light(color) => Self { color, ..self },
             DarkMark::Print(color) => Self {
                 color,
@@ -3683,23 +3861,54 @@ impl StarCall {
         }
     }
 
+    /// The star laid on `ground`: a dark scene's light as [`dark_mark`] lays it, a printed star
+    /// as it is.
+    #[cfg(test)]
+    #[inline]
+    const fn laid_on(self, ground: u32) -> Self {
+        if !self.light {
+            return self;
+        }
+        self.with_dark_mark(dark_mark(self.color, ground))
+    }
+
+    #[inline]
+    const fn laid_on_with(
+        self,
+        table: &crate::color_math::RelativeLuminanceTable,
+        ground: u32,
+        lg: f32,
+    ) -> Self {
+        if !self.light {
+            return self;
+        }
+        self.with_dark_mark(dark_mark_with(table, self.color, ground, lg))
+    }
+
     /// A glint laid on `ground` by its rest light's [`dark_mark`] `rest`: where that prints, the
     /// rest's floored ink through the whole flare, so the flare shows in shape alone, as a light
     /// scene's does; else its flared light as [`Self::laid_on`] lays it, which stays light (white
     /// reads wherever the rest light, or its lift, does).
     #[inline]
-    const fn laid_as(self, rest: DarkMark, ground: u32) -> Self {
+    const fn laid_as(
+        self,
+        table: &crate::color_math::RelativeLuminanceTable,
+        rest: DarkMark,
+        ground: u32,
+        lg: f32,
+    ) -> Self {
         match rest {
             DarkMark::Print(color) if self.light => Self {
                 color,
                 light: false,
                 ..self
             },
-            DarkMark::Light(_) | DarkMark::Print(_) => self.laid_on(ground),
+            DarkMark::Light(_) | DarkMark::Print(_) => self.laid_on_with(table, ground, lg),
         }
     }
 }
 
+#[inline]
 fn rim_strips(frame: &[&str], p: i64, rim: i64, mut strip: impl FnMut(Rect)) {
     #[inline]
     const fn rim_h_edge(frame: &[&str], art_row: i64, open_row: i64, c: i64) -> bool {

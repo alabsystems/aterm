@@ -578,6 +578,8 @@ fn conflict_transition(state: &State, action: &str) -> State {
         body.extend_from_slice(&f.wire);
         store
             .log
+            .as_mut()
+            .unwrap()
             .append(super::super::super::CONFLICT_SUBJECT, body)
             .unwrap();
     } else {
@@ -911,6 +913,8 @@ fn invalid_crash_tail_never_advances_the_independent_witness() {
     body.extend_from_slice(&malformed);
     store
         .log
+        .as_mut()
+        .unwrap()
         .append(super::super::super::CONFLICT_SUBJECT, body)
         .unwrap();
     drop(store);

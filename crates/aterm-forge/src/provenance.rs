@@ -115,9 +115,21 @@ pub fn path_dependants(root: &Path, rel_root: &str) -> Vec<String> {
     out
 }
 
+const fn is_toml_key_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
 fn path_deps(manifest: &str) -> Vec<String> {
+    let bytes = manifest.as_bytes();
     let mut out = Vec::new();
     for (i, _) in manifest.match_indices("path") {
+        if i > 0 && is_toml_key_byte(bytes[i - 1]) {
+            continue;
+        }
+        let line_prefix = manifest[..i].rsplit('\n').next().unwrap_or("");
+        if line_prefix.contains('#') {
+            continue;
+        }
         let rest = &manifest[i + "path".len()..];
         let rest = rest.trim_start();
         let Some(rest) = rest.strip_prefix('=') else {
@@ -165,7 +177,9 @@ mod tests {
             PathBuf::from("/w/vendor/astream/crates/x")
         );
         assert_eq!(
-            path_deps("[dependencies]\nx = \"1\"\n"),
+            path_deps(
+                "[dependencies]\nx = \"1\"\nxpath = \"vendor/fake\"\n# path = \"vendor/commented\"\n"
+            ),
             Vec::<String>::new()
         );
     }

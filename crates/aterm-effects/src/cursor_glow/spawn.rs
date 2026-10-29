@@ -479,6 +479,7 @@ impl CursorGlow {
     }
 
     /// Laser: a jump forges a strike along the jump vector.
+    #[inline]
     pub(super) fn spawn_lightning(&mut self, mv: &MoveCtx) {
         let &MoveCtx {
             pr,
@@ -503,6 +504,7 @@ impl CursorGlow {
                         true,
                         now,
                     );
+                    self.keep_strike_in_grid(geom, cfg.theme_bg, (pr, cr), now);
                 }
             } else if self.heat > 0.30
                 && self.frand() < 0.18 + 0.55 * self.heat
@@ -535,18 +537,77 @@ impl CursorGlow {
                 };
                 let (x0, y0) = geom.cell_center(rr, rc);
                 let (sin_a, cos_a) = crate::supernova::sin_cos_f32(a);
-                self.spawn_bolt(
-                    (x0, y0),
-                    (x0 + cos_a * len, y0 + sin_a * len),
-                    chf,
-                    false,
-                    now,
-                );
+                #[cfg(test)]
+                let rooted = self.crackle_rooted_in_letters;
+                #[cfg(not(test))]
+                let rooted = false;
+                // A CRACKLE SPRINGS FROM ITS ROW'S EDGE INTO THE AIR. Rooted
+                // at a typed cell's centre at any angle, the guard hid its
+                // root among the letters and what showed was a lone violet
+                // dash under or over the line, apart from the bolt and the
+                // letters (Solarized's and the dark page's `burst.t0`, a
+                // smooth arc across the `f` of `flies` on Default Light;
+                // looks10 round 2's L8). It leaves its typed cell by the
+                // edge of the row it is aimed at, into a blank row, steeply
+                // enough to clear the row's letters; with no blank row on
+                // either side it is not forged.
+                let aim = if rooted {
+                    Some(((x0, y0), (x0 + cos_a * len, y0 + sin_a * len)))
+                } else {
+                    let text = self.text_view();
+                    let blank = |r: i32| {
+                        r >= 0 && r < geom.rows as i32 && text.knows_row(r) && text.row_is_blank(r)
+                    };
+                    let row = i32::from(rr);
+                    let first_up = sin_a < 0.0;
+                    let up = if blank(row + if first_up { -1 } else { 1 }) {
+                        Some(first_up)
+                    } else if blank(row + if first_up { 1 } else { -1 }) {
+                        Some(!first_up)
+                    } else {
+                        None
+                    };
+                    up.map(|up| {
+                        let way = if up { -1.0 } else { 1.0 };
+                        let edge = y0 + way * 0.5 * chf;
+                        let rise = sin_a.abs().max(Self::CRACKLE_LEAVE_SIN);
+                        let run = (1.0 - rise * rise).max(0.0).sqrt()
+                            * if cos_a < 0.0 { -1.0 } else { 1.0 };
+                        ((x0, edge), (x0 + run * len, edge + way * rise * len))
+                    })
+                };
+                let Some((from, to)) = aim else {
+                    return;
+                };
+                self.spawn_bolt(from, to, chf, false, now);
+                // Its kinks swing about its chord; one swung back over the
+                // row's edge is folded back into the air, so no part of it
+                // lies on the letters it sprang from.
+                if !rooted
+                    && from.1 != y0
+                    && let Some(b) = self.bolts.last_mut()
+                    && b.crackle
+                {
+                    let (edge, down) = (from.1, from.1 > y0);
+                    for p in b.pts.as_mut_slice() {
+                        if (down && p.1 < edge) || (!down && p.1 > edge) {
+                            p.1 = 2.0 * edge - p.1;
+                        }
+                    }
+                }
+                #[cfg(test)]
+                let kept = !self.particles_on_bars;
+                #[cfg(not(test))]
+                let kept = true;
+                if kept {
+                    self.keep_crackle_off_bars(geom, cfg.theme_bg, cr, y0);
+                }
             }
         }
     }
 
     /// Landing ring on a real jump (fire meteors ring at arrival instead).
+    #[inline]
     pub(super) fn spawn_landing_ring(&mut self, mv: &MoveCtx, fire_meteor: bool) {
         let &MoveCtx {
             cr,
@@ -579,6 +640,7 @@ impl CursorGlow {
     /// The per-style particle burst for this move: jump-scaled showers,
     /// heat-scaled typing sheds; fire meteor moves defer to the strike, and
     /// navigation moves get none.
+    #[inline]
     pub(super) fn spawn_burst_particles(&mut self, mv: &MoveCtx, fire_meteor: bool) {
         let &MoveCtx {
             pr,
@@ -659,7 +721,7 @@ impl CursorGlow {
             let cell = geom.ch as f32;
             let cwf = geom.cw as f32;
             let hue0 = self.hue;
-            let laser_cov_scale = if burst > 0 {
+            let laser_cov_scale = if laser && burst > 0 {
                 1.0 / crate::color_math::sqrt_f32(burst as f32)
             } else {
                 1.0
@@ -670,7 +732,11 @@ impl CursorGlow {
             let heat = self.heat;
             let bubble_p = if heat > 0.45 { 0.30 } else { 0.0 };
             let drip_p = 0.75 - 0.55 * heat;
-            let comet_drift = {
+            #[cfg(test)]
+            let comet_regimented = self.comet_dust_regimented;
+            #[cfg(not(test))]
+            let comet_regimented = false;
+            let comet_drift = if comet {
                 let (mvx, mvy) = (ox - leap_from.0, oy - leap_from.1);
                 let ml = crate::color_math::hypot_f32(mvx, mvy);
                 if ml > 0.5 {
@@ -679,6 +745,8 @@ impl CursorGlow {
                 } else {
                     None
                 }
+            } else {
+                None
             };
             let mut bi = 0;
             while bi < burst {
@@ -708,6 +776,7 @@ impl CursorGlow {
                                 hue: 0.8 + r4 * 0.2,
                                 cov_scale: 1.0,
                                 born: now,
+                                edge_cut: false,
                             }
                         } else if r5 < pop_p + smolder_p {
                             Particle {
@@ -720,6 +789,7 @@ impl CursorGlow {
                                 hue: r4 * 0.35,
                                 cov_scale: 1.0,
                                 born: now,
+                                edge_cut: false,
                             }
                         } else {
                             Particle {
@@ -732,6 +802,7 @@ impl CursorGlow {
                                 hue: 0.35 + r4 * 0.45,
                                 cov_scale: 1.0,
                                 born: now,
+                                edge_cut: false,
                             }
                         }
                     }
@@ -755,6 +826,7 @@ impl CursorGlow {
                                     hue: r4,
                                     cov_scale: 1.0,
                                     born: now,
+                                    edge_cut: false,
                                 }
                             } else {
                                 Particle {
@@ -767,6 +839,7 @@ impl CursorGlow {
                                     hue: r4,
                                     cov_scale: 1.0,
                                     born: now,
+                                    edge_cut: false,
                                 }
                             }
                         } else {
@@ -781,6 +854,7 @@ impl CursorGlow {
                                     hue: r4,
                                     cov_scale: 1.0,
                                     born: now,
+                                    edge_cut: false,
                                 }
                             } else if r5 < bubble_p + drip_p {
                                 Particle {
@@ -793,6 +867,7 @@ impl CursorGlow {
                                     hue: r4,
                                     cov_scale: 1.0,
                                     born: now,
+                                    edge_cut: false,
                                 }
                             } else {
                                 Particle {
@@ -805,6 +880,7 @@ impl CursorGlow {
                                     hue: r4,
                                     cov_scale: 1.0,
                                     born: now,
+                                    edge_cut: false,
                                 }
                             }
                         }
@@ -823,6 +899,7 @@ impl CursorGlow {
                             hue: r4,
                             cov_scale: laser_cov_scale,
                             born: now,
+                            edge_cut: false,
                         }
                     }
                     GlowStyle::Beam => {
@@ -845,14 +922,25 @@ impl CursorGlow {
                             hue: r4,
                             cov_scale: 1.0,
                             born: now,
+                            edge_cut: false,
                         }
                     }
                     GlowStyle::Comet => {
                         let (fx, fy) = leap_from;
+                        // A typed key's dust is shed behind the nucleus, from
+                        // the caret's trailing edge back a cell: born about the
+                        // caret's centre, half of it stood ahead of the head
+                        // (looks9 Q2).
                         let (bx, by) = if dist >= 2.0 {
                             (fx + (ox - fx) * r0, fy + (oy - fy) * r0)
                         } else {
-                            (ox + (r0 - 0.5) * cwf, oy)
+                            match comet_drift.filter(|_| !comet_regimented) {
+                                Some((tx, ty)) => {
+                                    let back = (0.3 + 0.8 * r0) * cwf;
+                                    (ox + tx * back, oy + ty * back)
+                                }
+                                None => (ox + (r0 - 0.5) * cwf, oy),
+                            }
                         };
                         let (tx, ty) = match comet_drift {
                             Some(d) => d,
@@ -873,6 +961,7 @@ impl CursorGlow {
                             hue: r4,
                             cov_scale: 1.0,
                             born: now,
+                            edge_cut: false,
                         }
                     }
                     GlowStyle::Sparkle => {
@@ -898,6 +987,7 @@ impl CursorGlow {
                             hue: (hue0 + r5 * 0.3).fract(),
                             cov_scale: 1.0,
                             born: now,
+                            edge_cut: false,
                         }
                     }
                     _ => {
@@ -923,6 +1013,7 @@ impl CursorGlow {
                             hue: (hue0 + r5 * 0.3).fract(),
                             cov_scale: 1.0,
                             born: now,
+                            edge_cut: false,
                         }
                     }
                 };
@@ -931,6 +1022,23 @@ impl CursorGlow {
         }
     }
 
+    /// The least sine of the angle a crackle leaves its row's edge at
+    /// ([`Self::spawn_lightning`]): steep enough that its kinks keep off the
+    /// letters it springs from.
+    pub(super) const CRACKLE_LEAVE_SIN: f32 = 0.6;
+
+    /// The longest straight span of a crackle's channel, in cells
+    /// ([`Self::spawn_bolt`]).
+    pub(super) const CRACKLE_SPAN_CELLS: f32 = 0.5;
+    /// The most a crackle's knot is kicked off its span, as a share of the
+    /// span ([`Self::spawn_bolt`]): enough to kink it as lightning does, and
+    /// little enough that its longest span stays within three quarters of a
+    /// cell ([`Self::CRACKLE_SPAN_CELLS`] grows by at most `sqrt(1 + 4k²)` a
+    /// round).
+    pub(super) const CRACKLE_KINK: f32 = 0.27;
+    /// The least share of [`Self::CRACKLE_KINK`] a crackle's knot is kicked
+    /// by, so every knot is a kink, not a bend.
+    pub(super) const CRACKLE_KINK_FLOOR: f32 = 0.65;
     /// A jump strike's main channel's shortest life, seconds.
     pub(super) const STRIKE_LIFE_S: f32 = 0.07;
     /// A strike's forks' shortest life, seconds.
@@ -939,6 +1047,7 @@ impl CursorGlow {
     pub(super) const STRIKE_LIFE_SPREAD_S: f32 = 0.03;
 
     /// Forge one lightning bolt from `from` to `to`: midpoint-displacement jagging.
+    #[inline]
     pub(super) fn spawn_bolt(
         &mut self,
         from: (f32, f32),
@@ -952,7 +1061,48 @@ impl CursorGlow {
         if len < 1.0 {
             return;
         }
-        let rounds = if big { 4 } else { 2 };
+        // A crackle kinks as finely as a strike does, a span to every
+        // [`Self::CRACKLE_SPAN_CELLS`] of a cell or less: forged in two rounds
+        // whatever its length, a long one was four straight spans, a smooth
+        // bent wire in the air above the line (Solarized Dark's `burst.t0`,
+        // looks9's final look).
+        #[cfg(test)]
+        let two_rounds = self.crackle_two_rounds;
+        #[cfg(not(test))]
+        let two_rounds = false;
+        let rounds = if big {
+            4
+        } else if two_rounds {
+            2
+        } else {
+            let spans = len / (cell * Self::CRACKLE_SPAN_CELLS);
+            if spans <= 4.0 {
+                2
+            } else if spans <= 8.0 {
+                3
+            } else {
+                4
+            }
+        };
+        // A CRACKLE ZIGZAGS. Its knots kicked by any amount either way, the
+        // kick halving each round as a strike's does, a short crackle came
+        // out a smooth arc, every knot bent by a few degrees: a bent-wire
+        // scratch in the air over the line, not lightning (Default Light's
+        // `burst.t0`, looks10 round 2's L8). Each of its knots is kicked off
+        // its own span by a share of it, the other way from the knot before,
+        // never less than [`Self::CRACKLE_KINK_FLOOR`] of the most, so every
+        // knot is a kink. A strike keeps its halving kicks: its forks and its
+        // length kink it.
+        #[cfg(test)]
+        let smooth = self.crackle_smooth_kicks;
+        #[cfg(not(test))]
+        let smooth = false;
+        let zigzag = !big && !smooth;
+        let mut side = if zigzag && self.frand() < 0.5 {
+            -1.0
+        } else {
+            1.0
+        };
         let (mut pts, mut next) = (BoltPts::default(), BoltPts::default());
         pts.push(from);
         pts.push(to);
@@ -966,8 +1116,15 @@ impl CursorGlow {
             while wi + 1 < pts_slice.len() {
                 let (a, b) = (pts_slice[wi], pts_slice[wi + 1]);
                 let (sx, sy) = (b.0 - a.0, b.1 - a.1);
-                let inv_sl = 1.0 / crate::color_math::hypot_f32(sx, sy).max(1e-3);
-                let kick_sl = (self.frand() - 0.5) * 2.0 * amp * inv_sl;
+                let kick_sl = if zigzag {
+                    let floor = Self::CRACKLE_KINK_FLOOR;
+                    let k = side * Self::CRACKLE_KINK * (floor + (1.0 - floor) * self.frand());
+                    side = -side;
+                    k
+                } else {
+                    let inv_sl = 1.0 / crate::color_math::hypot_f32(sx, sy).max(1e-3);
+                    (self.frand() - 0.5) * 2.0 * amp * inv_sl
+                };
                 next.push(a);
                 next.push((
                     (a.0 + b.0) * 0.5 - sy * kick_sl,
@@ -1024,6 +1181,284 @@ impl CursorGlow {
         });
     }
 
+    /// Whether the bolt along `pts` meets, its corona's girth and all, a
+    /// filled cell of a row outside `rows` (a prompt's powerline bar) or
+    /// leaves its pane's grid ([`Self::keep_crackle_off_bars`],
+    /// [`Self::keep_strike_in_grid`]). A split's focused pane has its edge
+    /// inside the window's grid ([`FrameText::past_pane`]), where the GUI
+    /// clips the glow to the pane: read by the window's edge alone, a fork
+    /// that crossed the divider was cut there (looks9 round 3's review).
+    #[inline]
+    fn bolt_meets_a_bar(
+        &self,
+        geom: Geom,
+        page: u32,
+        rows: (u16, u16),
+        (pts, half): (&[(f32, f32)], f32),
+    ) -> bool {
+        let page = page & 0x00FF_FFFF;
+        let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
+        let (oxf, oyf) = (f32::from(geom.origin_x), f32::from(geom.origin_y));
+        let frame_text = &self.frame_text;
+        let (grid_rows, cols) = (geom.rows as i32, geom.cols as i32);
+        #[cfg(test)]
+        let pane_read = !self.bolt_window_edge;
+        #[cfg(not(test))]
+        let pane_read = true;
+        let (own_lo, own_hi) = (i32::from(rows.0.min(rows.1)), i32::from(rows.0.max(rows.1)));
+        let (inv_cwf, inv_chf) = (1.0 / cwf, 1.0 / chf);
+        let step_px = (0.5 * cwf).max(1.0);
+        let inv_step_px = 1.0 / step_px;
+        let on_bar = |x: f32, y: f32| {
+            let row = ((y - oyf) * inv_chf).floor() as i32;
+            let col = ((x - oxf) * inv_cwf).floor() as i32;
+            row < 0
+                || row >= grid_rows
+                || col < 0
+                || col >= cols
+                || (pane_read && frame_text.past_pane(row, col))
+                || ((row < own_lo || row > own_hi)
+                    && matches!(
+                        frame_text.pair(row, col),
+                        Some((_, ground)) if !super::emit::reads_as_page(ground, page)
+                    ))
+        };
+        let mut wi = 0;
+        while wi + 1 < pts.len() {
+            let ((xa, ya), (xb, yb)) = (pts[wi], pts[wi + 1]);
+            wi += 1;
+            let n = ((xb - xa).abs().max((yb - ya).abs()) * inv_step_px)
+                .ceil()
+                .max(1.0) as usize;
+            let inv_nf = 1.0 / (n as f32);
+            let mut k = 0;
+            while k <= n {
+                let f = k as f32 * inv_nf;
+                let (x, y) = (xa + (xb - xa) * f, ya + (yb - ya) * f);
+                if on_bar(x, y) || on_bar(x, y - half) || on_bar(x, y + half) {
+                    return true;
+                }
+                k += 1;
+            }
+        }
+        false
+    }
+
+    /// A fork's or a crackle's corona's half girth ([`Self::emit_bolts`]
+    /// strokes it 0.30 of a row across) and a pixel.
+    #[inline]
+    const fn bolt_half_girth(ch: f32) -> f32 {
+        ch * 0.15 + 1.0
+    }
+
+    /// A strike's main channel's corona's half girth ([`Self::emit_bolts`]
+    /// strokes it 0.55 of a row across) and a pixel. Kept inside its grid by
+    /// a fork's girth, the channel's corona stood cut at the grid's bottom
+    /// edge, 3 px of lavender along the settings card's last pixel row under
+    /// the Return's strike (looks10 round 3, after main's card edge law).
+    #[inline]
+    const fn strike_half_girth(ch: f32) -> f32 {
+        ch * 0.275 + 1.0
+    }
+
+    /// Keep the crackle just spawned (the last bolt) off every filled cell
+    /// of another row than the caret's `caret_row` (a prompt's powerline
+    /// bar) and inside its pane's grid, its corona's girth and all: laid at
+    /// a random angle from a typed cell, it rose onto Solarized Dark's bar
+    /// above the typed line as a violet arc apart from the bolt (the
+    /// gallery's `context`, looks9 Q8), and one crossing a pane's edge is cut
+    /// there to a fragment. Such a crackle is dropped. Turned about its
+    /// root's row centre `y0` to aim away (looks9 round 2), the crackle a
+    /// pane's bottom edge would have cut rose two rows into the air over the
+    /// typed line instead, its root hidden among the letters: a lone violet
+    /// zigzag beside the cat's word icon, apart from the caret's bolt (the
+    /// gallery's `split` at `b0`, looks9 round 3's Q8).
+    #[inline]
+    pub(super) fn keep_crackle_off_bars(&mut self, geom: Geom, page: u32, caret_row: u16, y0: f32) {
+        let Some(bolt) = self.bolts.last() else {
+            return;
+        };
+        if !bolt.crackle {
+            return;
+        }
+        let chf = geom.ch as f32;
+        let half = Self::bolt_half_girth(chf);
+        let rows = (caret_row, caret_row);
+        let laid = bolt.pts;
+        if !self.bolt_meets_a_bar(geom, page, rows, (laid.as_slice(), half)) {
+            return;
+        }
+        #[cfg(test)]
+        let turned = self.crackle_turned;
+        #[cfg(not(test))]
+        let turned = false;
+        if !turned {
+            self.bolts.pop();
+            return;
+        }
+        let mut mirrored = laid;
+        let mirrored_slice = mirrored.as_mut_slice();
+        let mut mi = 0;
+        while mi < mirrored_slice.len() {
+            mirrored_slice[mi].1 = 2.0 * y0 - mirrored_slice[mi].1;
+            mi += 1;
+        }
+        let mut flat = laid;
+        let laid_slice = laid.as_slice();
+        let mut reach = 0.0f32;
+        let mut ri = 0;
+        while ri < laid_slice.len() {
+            reach = reach.max((laid_slice[ri].1 - y0).abs());
+            ri += 1;
+        }
+        let room = (0.5 * chf - half - 0.5).max(0.0);
+        let k = if reach > room { room / reach } else { 1.0 };
+        let flat_slice = flat.as_mut_slice();
+        let mut fi = 0;
+        while fi < flat_slice.len() {
+            flat_slice[fi].1 = y0 + (flat_slice[fi].1 - y0) * k;
+            fi += 1;
+        }
+        let keep = if !self.bolt_meets_a_bar(geom, page, rows, (mirrored.as_slice(), half)) {
+            Some(mirrored)
+        } else if !self.bolt_meets_a_bar(geom, page, rows, (flat.as_slice(), half)) {
+            Some(flat)
+        } else {
+            None
+        };
+        match keep {
+            Some(pts) => {
+                if let Some(b) = self.bolts.last_mut() {
+                    b.pts = pts;
+                }
+            }
+            None => {
+                self.bolts.pop();
+            }
+        }
+    }
+
+    /// Keep the strike just forged at `now` (its channel and forks) inside
+    /// its pane's grid and off every filled cell of a row the jump did not
+    /// cross (`rows`, its start's and its end's), its corona's girth and
+    /// all: a fork aimed at a pane's edge was cut there to a lone violet
+    /// fragment (the paper gallery's `split`, looks9 round 2's Q8). The
+    /// channel's jag is eased toward its chord until it meets none (the
+    /// chord, between the two cells' centres, meets none), its forks moved
+    /// with their roots; a fork that meets one is mirrored about its root's
+    /// row to aim away, and dropped if that meets one too.
+    #[inline]
+    pub(super) fn keep_strike_in_grid(
+        &mut self,
+        geom: Geom,
+        page: u32,
+        rows: (u16, u16),
+        now: Instant,
+    ) {
+        #[cfg(test)]
+        if self.strike_forks_cut {
+            return;
+        }
+        let mut first = self.bolts.len();
+        while first > 0 {
+            let b = &self.bolts[first - 1];
+            if b.born == now && !b.crackle {
+                first -= 1;
+            } else {
+                break;
+            }
+        }
+        let mut channel = None;
+        let mut ci = self.bolts.len();
+        while ci > first {
+            ci -= 1;
+            if !self.bolts[ci].branch {
+                channel = Some(ci);
+                break;
+            }
+        }
+        let Some(channel) = channel else {
+            return;
+        };
+        let laid = self.bolts[channel].pts;
+        let mut eased = laid;
+        let pts = laid.as_slice();
+        let chf = geom.ch as f32;
+        #[cfg(test)]
+        let girth = if self.strike_channel_fork_girth {
+            Self::bolt_half_girth(chf)
+        } else {
+            Self::strike_half_girth(chf)
+        };
+        #[cfg(not(test))]
+        let girth = Self::strike_half_girth(chf);
+        let fork_girth = Self::bolt_half_girth(chf);
+        if let (Some(&a), Some(&b)) = (pts.first(), pts.last()) {
+            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let inv = 1.0 / (dx * dx + dy * dy).max(1e-3);
+            let mut k = 1.0f32;
+            while k > 0.0 && self.bolt_meets_a_bar(geom, page, rows, (eased.as_slice(), girth)) {
+                k = (k - 0.25).max(0.0);
+                let eased_slice = eased.as_mut_slice();
+                let mut pi = 0;
+                while pi < eased_slice.len() {
+                    let p = pts[pi];
+                    let t = (((p.0 - a.0) * dx + (p.1 - a.1) * dy) * inv).clamp(0.0, 1.0);
+                    let chord = (a.0 + dx * t, a.1 + dy * t);
+                    eased_slice[pi] =
+                        (chord.0 + (p.0 - chord.0) * k, chord.1 + (p.1 - chord.1) * k);
+                    pi += 1;
+                }
+            }
+            self.bolts[channel].pts = eased;
+        }
+        let mut i = self.bolts.len();
+        while i > first {
+            i -= 1;
+            if i == channel {
+                continue;
+            }
+            let mut fork = self.bolts[i].pts;
+            let root = fork.as_slice().first().copied();
+            if let Some(r) = root {
+                let mut at = None;
+                let mut pi = 0;
+                while pi < pts.len() {
+                    if pts[pi] == r {
+                        at = Some(pi);
+                        break;
+                    }
+                    pi += 1;
+                }
+                if let Some(at) = at {
+                    let (to, from) = (eased.as_slice()[at], pts[at]);
+                    let (tx, ty) = (to.0 - from.0, to.1 - from.1);
+                    let fork_slice = fork.as_mut_slice();
+                    let mut fi = 0;
+                    while fi < fork_slice.len() {
+                        let p = fork_slice[fi];
+                        fork_slice[fi] = (p.0 + tx, p.1 + ty);
+                        fi += 1;
+                    }
+                }
+            }
+            if self.bolt_meets_a_bar(geom, page, rows, (fork.as_slice(), fork_girth)) {
+                let y0 = fork.as_slice().first().map_or(0.0, |p| p.1);
+                let fork_slice = fork.as_mut_slice();
+                let mut fi = 0;
+                while fi < fork_slice.len() {
+                    fork_slice[fi].1 = 2.0 * y0 - fork_slice[fi].1;
+                    fi += 1;
+                }
+                if self.bolt_meets_a_bar(geom, page, rows, (fork.as_slice(), fork_girth)) {
+                    self.bolts.remove(i);
+                    continue;
+                }
+            }
+            self.bolts[i].pts = fork;
+        }
+    }
+
     /// Append a bolt, evicting the oldest once [`Self::MAX_BOLTS`] are live.
     #[inline]
     pub(super) fn push_bolt(&mut self, b: Bolt) {
@@ -1034,6 +1469,7 @@ impl CursorGlow {
     }
 
     /// The meteor's debris.
+    #[inline]
     pub(super) fn meteor_strike_fountain(&mut self, m: &Meteor, now: Instant, geom: Geom) {
         let cell = geom.ch as f32;
         let (dx, dy) = (m.x1 - m.x0, m.y1 - m.y0);
@@ -1065,10 +1501,12 @@ impl CursorGlow {
                 hue: 0.35 + r4 * 0.5,
                 cov_scale: 1.0,
                 born: now,
+                edge_cut: false,
             });
         }
     }
 
+    #[inline]
     pub(super) fn poof_scan(&mut self, now: Instant, cfg: &GlowConfig, geom: Geom) {
         if self.kill_hint.is_none() && self.bs_poof_hint.is_none() {
             self.rotate_row_probe();
@@ -1210,6 +1648,7 @@ impl CursorGlow {
         clippy::too_many_arguments,
         reason = "span + clock + config + geometry + cue ownership; kept explicit at the three poof_scan branches"
     )]
+    #[inline]
     pub(super) fn spawn_poof(
         &mut self,
         row: u16,
@@ -1297,6 +1736,7 @@ impl CursorGlow {
                         hue: r4,
                         cov_scale: 1.0,
                         born: now,
+                        edge_cut: false,
                     });
                     k += 1;
                 }
@@ -1318,6 +1758,7 @@ impl CursorGlow {
         clippy::too_many_arguments,
         reason = "span + geometry scalars + clock; the two internal call sites are the two erase detectors"
     )]
+    #[inline]
     pub(super) fn spawn_erase_sparkles(
         &mut self,
         span_x0: f32,
@@ -1365,6 +1806,7 @@ impl CursorGlow {
                 hue: r0,
                 cov_scale: ERASE_ROUND_SCALE,
                 born: now,
+                edge_cut: false,
             });
             k += 1;
         }
@@ -1381,6 +1823,7 @@ impl CursorGlow {
                 hue: 0.02,
                 cov_scale: ERASE_HERO_SCALE_MIN + ERASE_HERO_SCALE_SPAN * heft,
                 born: now,
+                edge_cut: false,
             });
         }
     }
@@ -1390,6 +1833,7 @@ impl CursorGlow {
         clippy::too_many_arguments,
         reason = "span + geometry scalars; two internal call sites (spawn_poof)"
     )]
+    #[inline]
     pub(super) fn spawn_poof_smoke(
         &mut self,
         span_x0: f32,
@@ -1426,6 +1870,7 @@ impl CursorGlow {
     }
 
     /// Quench steam ([`Self::update_typing_thermals`], [`Self::spawn_poof`]).
+    #[inline]
     pub(super) fn spawn_quench_steam(
         &mut self,
         puffs: usize,

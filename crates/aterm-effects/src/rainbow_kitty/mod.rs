@@ -4,6 +4,7 @@
 //! Rainbow kitty cursor companion state machine, sprite baking, and ribbon orchestration.
 pub mod companion;
 pub mod meteor;
+pub mod prism_glass;
 pub mod ribbon;
 pub mod spine;
 pub mod stardust;
@@ -17,7 +18,7 @@ use std::time::Duration;
 
 use aterm_render::{BeamVertex, GlowQuad, GlowRamps, RainHalo, RampSink};
 
-use crate::cursor_glow::{Geom, GlowConfig, SoundCue, band_pos, band_row};
+use crate::cursor_glow::{Geom, GlowConfig, Light, SoundCue, band_pos, band_row};
 use crate::spectrum::spectrum_snap;
 use crate::trail_sound::SoundKind;
 use meteor::{Meteors, Spawn};
@@ -168,6 +169,8 @@ pub struct Config {
     pub theme_fg: u32,
     pub theme_bg: u32,
     pub reduced_motion: bool,
+    /// The frame's light ([`GlowConfig::light`]).
+    pub light: Light,
 }
 
 impl Config {
@@ -184,6 +187,7 @@ impl Config {
             theme_fg: cfg.theme_fg,
             theme_bg: cfg.theme_bg,
             reduced_motion,
+            light: cfg.light,
         }
     }
 }
@@ -316,6 +320,15 @@ pub struct Ctx<'a> {
 /// part of it.
 pub const DARK_CARET_GAP_PX: i32 = 3;
 
+/// How many cells either side of the caret's block its row is kept clear of
+/// stars on a dark page ([`Ctx::beside_dark_caret`]): the cells the next keys
+/// land in. After Solarized Dark's Return at the bottom a faint navy star
+/// stood two cells past the new caret on its row
+/// (`rainbow-kitty-pet-dark-enter-bottom.e120`, looks9 Q10). A landing's
+/// sparks on a dark page still fly from the block itself: they are the
+/// landing, thrown from the caret.
+pub const DARK_CARET_ROW_CELLS: i32 = 3;
+
 impl Ctx<'_> {
     /// Whether a light at `(x, y)` reaching `reach` px stands on the caret:
     /// on paper within a cell of its block, every side; on a dark page on
@@ -325,6 +338,28 @@ impl Ctx<'_> {
     #[inline]
     #[must_use]
     pub const fn near_paper_caret(&self, (x, y): (i32, i32), reach: i32) -> bool {
+        self.caret_box_meets((x, y), reach, 0)
+    }
+
+    /// Whether a light at `(x, y)` reaching `reach` px stands on a dark
+    /// page's caret row within [`DARK_CARET_ROW_CELLS`] of its block, either
+    /// side, where the next keys land (looks9 Q10); `false` on paper. A star
+    /// reads this once, at its first paint ([`super::stardust::Star`]'s
+    /// `beside_caret`): read every frame, a lit star the caret typed past
+    /// went dark and came back, and one born beside a resting caret popped
+    /// in mid-life once typing moved the caret on (looks9 round 3's review).
+    #[inline]
+    #[must_use]
+    pub const fn beside_dark_caret(&self, (x, y): (i32, i32), reach: i32) -> bool {
+        self.cfg.dark_theme
+            && self.caret_box_meets((x, y), reach, DARK_CARET_ROW_CELLS * self.geom.cw as i32)
+    }
+
+    /// Whether `(x, y)` reaching `reach` px meets the caret's block grown by
+    /// its margin (a cell on paper, [`DARK_CARET_GAP_PX`] on a dark page),
+    /// along its row by `wide` px either side where that is wider.
+    #[inline]
+    const fn caret_box_meets(&self, (x, y): (i32, i32), reach: i32, wide: i32) -> bool {
         let (row, col) = self.caret;
         if row as usize >= self.geom.rows || col as usize >= self.geom.cols {
             return false;
@@ -337,6 +372,7 @@ impl Ctx<'_> {
         } else {
             (cw, ch)
         };
+        let mx = if wide > mx { wide } else { mx };
         x + reach >= x0 - mx
             && x - reach < x0 + cw + mx
             && y + reach >= y0 - my
@@ -572,33 +608,21 @@ impl EchoLedger {
 
     #[inline]
     fn expire(&mut self, now: Instant) {
-        let mut any = false;
-        let mut i = 0;
-        while i < ECHO_LEDGER_DEPTH {
-            let Some((at, _c)) = self.slots[i] else { break };
-            if now.saturating_duration_since(at) > crate::cursor_glow::IN_FLIGHT_PATIENCE_DUR {
-                #[cfg(test)]
-                {
-                    self.tally.expired += u32::from(_c);
-                }
-                self.slots[i] = None;
-                any = true;
-            }
-            i += 1;
-        }
-        if any {
-            self.repack();
-        }
-    }
-
-    #[inline]
-    const fn repack(&mut self) {
         let mut write = 0;
         let mut read = 0;
         while read < ECHO_LEDGER_DEPTH {
-            if let Some(entry) = self.slots[read] {
+            let Some((at, c)) = self.slots[read] else {
+                break;
+            };
+            if now.saturating_duration_since(at) > crate::cursor_glow::IN_FLIGHT_PATIENCE_DUR {
+                #[cfg(test)]
+                {
+                    self.tally.expired += u32::from(c);
+                }
+                self.slots[read] = None;
+            } else {
                 if write != read {
-                    self.slots[write] = Some(entry);
+                    self.slots[write] = Some((at, c));
                     self.slots[read] = None;
                 }
                 write += 1;
@@ -646,33 +670,49 @@ impl EchoLedger {
 
     #[inline]
     const fn spend(&mut self, mut cells: usize) {
-        let mut any = false;
-        let mut i = 0;
-        while i < ECHO_LEDGER_DEPTH {
-            if cells == 0 {
-                break;
-            }
-            let Some((at, have)) = self.slots[i] else {
-                break;
-            };
-            let have_usize = have as usize;
-            let take = if have_usize < cells {
-                have_usize
-            } else {
-                cells
-            };
-            cells -= take;
-            #[cfg(test)]
-            {
-                self.tally.spent += take as u32;
-            }
-            let left = have - take as u16;
-            self.slots[i] = if left > 0 { Some((at, left)) } else { None };
-            any |= left == 0;
-            i += 1;
+        if cells == 0 {
+            return;
         }
-        if any {
-            self.repack();
+        let mut write = 0;
+        let mut read = 0;
+        while read < ECHO_LEDGER_DEPTH {
+            let Some((at, have)) = self.slots[read] else {
+                break;
+            };
+            if cells > 0 {
+                let have_usize = have as usize;
+                let take = if have_usize < cells {
+                    have_usize
+                } else {
+                    cells
+                };
+                cells -= take;
+                #[cfg(test)]
+                {
+                    self.tally.spent += take as u32;
+                }
+                let left = have - take as u16;
+                if left > 0 {
+                    if write != read {
+                        self.slots[write] = Some((at, left));
+                        self.slots[read] = None;
+                    } else {
+                        self.slots[write] = Some((at, left));
+                    }
+                    write += 1;
+                } else {
+                    self.slots[read] = None;
+                }
+            } else {
+                if write != read {
+                    self.slots[write] = Some((at, have));
+                    self.slots[read] = None;
+                } else {
+                    break;
+                }
+                write += 1;
+            }
+            read += 1;
         }
     }
 
@@ -682,11 +722,16 @@ impl EchoLedger {
         {
             self.tally.forfeited += self.total() as u32;
         }
-        self.slots = [None; ECHO_LEDGER_DEPTH];
+        let mut i = 0;
+        while i < ECHO_LEDGER_DEPTH && self.slots[i].is_some() {
+            self.slots[i] = None;
+            i += 1;
+        }
     }
 
     #[inline]
-    fn forget(&mut self, now: Instant) {
+    fn forget(&mut self, #[cfg_attr(not(test), allow(unused_variables))] now: Instant) {
+        #[cfg(test)]
         self.expire(now);
         self.clear();
     }
@@ -789,6 +834,7 @@ type PxBox = (i32, i32, i32, i32);
 impl Engine {
     /// A disengaged engine with nothing live and a full glint bucket, so the first capital of a
     /// session chimes.
+    #[inline]
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -1469,7 +1515,7 @@ impl Engine {
     }
 
     /// The laid ribbon, for a test's negative control.
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub(crate) const fn ribbon_mut(&mut self) -> &mut Ribbon {
         &mut self.ribbon
     }
@@ -1554,17 +1600,19 @@ impl Engine {
             return 0;
         }
         let grid_rows = self.grid_rows;
+        let caret_row = if self.caret_known {
+            Some(self.caret.0)
+        } else {
+            None
+        };
         let mut n = 0usize;
-        let mut focus: Option<&ribbon::Cohort> = None;
+        let mut focus: Option<(u16, (bool, Instant))> = None;
         let mut ci = 0;
         while ci < cohorts.len() {
             let coh = &cohorts[ci];
-            let key = (self.caret_known && coh.row == self.caret.0, coh.alive_at);
-            if !matches!(
-                focus,
-                Some(prev) if (self.caret_known && prev.row == self.caret.0, prev.alive_at) > key
-            ) {
-                focus = Some(coh);
+            let key = (caret_row == Some(coh.row), coh.alive_at);
+            if !matches!(focus, Some((_, prev_key)) if prev_key > key) {
+                focus = Some((coh.row, key));
             }
             ci += 1;
         }
@@ -1580,8 +1628,7 @@ impl Engine {
             }
             None => None,
         };
-        if let Some(focus) = focus {
-            let focus = focus.row;
+        if let Some((focus, _)) = focus {
             Self::push_unique_row(out, &mut n, grid_rows, focus);
             if let Some(row) = focus.checked_sub(1) {
                 Self::push_unique_row(out, &mut n, grid_rows, row);
@@ -2397,6 +2444,7 @@ impl Engine {
             out.halos.truncate(h0);
             self.stardust.clear_marks();
             self.ribbon.forget_rails();
+            self.ribbon.unlay_glass();
         }
         self.caret_seam.field_t = ctx.caret_t;
         self.caret_seam.paint = self.caret_paint(now);
@@ -2603,6 +2651,10 @@ impl Engine {
     #[inline]
     #[must_use]
     pub fn caret_paint(&self, now: Instant) -> f32 {
+        let disp = self.spine.disp();
+        if disp >= 1.0 {
+            return disp;
+        }
         let relight = match self.paint_at {
             Some(at) => {
                 let elapsed = now.saturating_duration_since(at);
@@ -2618,7 +2670,7 @@ impl Engine {
             }
             None => 0.0,
         };
-        self.spine.disp().max(relight)
+        disp.max(relight)
     }
 
     /// Seam point 8.
@@ -2629,6 +2681,7 @@ impl Engine {
     }
 
     /// Seam point 9.
+    #[inline]
     #[must_use]
     pub fn next_change_deadline(&self, now: Instant) -> Option<Instant> {
         if !self.engaged {
@@ -2678,6 +2731,7 @@ impl Engine {
     /// if let Some(star) = pet.note_v2_offer(&offer) { v2.catch_star(star, now); }
     /// # }
     /// ```
+    #[inline]
     #[must_use]
     pub fn pet_offer(&self, geom: Geom, pet: Option<companion::PetOnGlass>) -> companion::PetOffer {
         let perk_at = if let Some(imp) = self.companion
@@ -2715,14 +2769,13 @@ impl Engine {
                     && s.class == stardust::StarClass::M1
                     && s.lane.is_sky()
                     && s.finish.is_none()
+                    && !matches!(catch, Some(prev) if prev.born > s.born)
                     && s.in_sky_of(pet.row, geom))
                 {
                     continue;
                 }
                 let col = s.grid_col(geom);
-                if pet.columns_to(col) <= companion::CATCH_REACH_CELLS
-                    && !matches!(catch, Some(prev) if prev.born > s.born)
-                {
+                if pet.columns_to(col) <= companion::CATCH_REACH_CELLS {
                     catch = Some(companion::StarCatch {
                         x: s.x,
                         y: s.y,
@@ -2790,7 +2843,7 @@ impl Engine {
         icon_offset: (i32, i32),
         cells: &[PxBox],
         (rows, past): (&[PxBox], i32),
-        filled: &[PxBox],
+        (filled, letters): (&[PxBox], &[PxBox]),
         (feet, soles): (&[PxBox], &[PxBox]),
     ) {
         self.stardust
@@ -2798,6 +2851,7 @@ impl Engine {
             .set_split_slices(icons, icon_offset, cells);
         self.stardust.keep_out.set_rows_past_slice(rows, past);
         self.stardust.keep_out.set_filled_slice(filled);
+        self.stardust.keep_out.set_letters_slice(letters);
         self.stardust.keep_out.set_feet_slices(feet, soles);
         self.ribbon.keep_out.clone_from(&self.stardust.keep_out);
         self.meteor.keep_out.clone_from(&self.stardust.keep_out);
@@ -2819,6 +2873,7 @@ impl Engine {
 
     /// The body box the sky last drew no star on ([`companion::PetShade::body`]).
     #[cfg(any(test, debug_assertions))]
+    #[inline]
     #[must_use]
     pub const fn pet_shade(&self) -> Option<(i32, i32, i32, i32)> {
         self.stardust.shade.body()
@@ -2826,6 +2881,7 @@ impl Engine {
 
     /// The boxes the sky and the ribbon last kept off ([`companion::KeepOut::boxes`]).
     #[cfg(any(test, debug_assertions))]
+    #[inline]
     #[must_use]
     pub const fn keep_out(&self) -> &[(i32, i32, i32, i32)] {
         self.stardust.keep_out.boxes()
@@ -2838,6 +2894,7 @@ impl Engine {
     }
 
     /// The curtain.
+    #[inline]
     pub fn curtain(&mut self, now: Instant) {
         if !self.engaged {
             return;
@@ -2872,6 +2929,7 @@ impl Engine {
     }
 
     /// Seam point 12 (`reset`).
+    #[inline]
     pub fn reset(&mut self) {
         self.ribbon.reset();
         self.clear_non_ribbon_state();
@@ -2885,6 +2943,7 @@ impl Engine {
         self.brisk = false;
     }
 
+    #[inline]
     fn clear_non_ribbon_state(&mut self) {
         self.hidden = false;
         self.spine.reset();
@@ -2924,6 +2983,7 @@ impl Engine {
     }
 
     /// Seam point 12 (`translate_scroll_state`).
+    #[inline]
     pub fn translate_scroll(&mut self, rows: u16, cell_h: u16) {
         if !self.engaged || rows == 0 {
             return;
@@ -3004,6 +3064,7 @@ impl Engine {
     }
 
     /// Seam point 12 (`translate_band_state`), the band twin of [`Engine::translate_scroll`].
+    #[inline]
     pub fn translate_band(
         &mut self,
         top: u16,
@@ -3238,6 +3299,7 @@ mod tests {
             theme_fg: 0x00E8_E8F0,
             theme_bg: 0x0016_161C,
             reduced_motion: false,
+            light: Light::OFF,
         }
     }
 

@@ -180,6 +180,70 @@ fn claude_codes_context_and_goal_are_marked_when_they_move() {
     assert!(run.starts_with('r'), "on the agent run: {ctx:?}");
 }
 
+/// CODEX'S OWN CONTEXT AND GOAL ARE MARKED WHEN THEY MOVE, as Claude Code's screen facts are: the
+/// context its rollout says is left at each tenth it crosses (`src=transcript conf=exact`) and the
+/// goal codex-alab's record names as it goes on and off (`src=meta conf=claim`), on the codex run.
+/// NEGATIVE CONTROLS: the same tenth again, a first reading of no goal, and facts read for a group
+/// not in front mark nothing.
+#[test]
+fn codexs_context_and_goal_are_marked_when_they_move() {
+    let mut app = App::headless_for_test();
+    let sid = app.next_session_id;
+    app.push_stub_tab(WindowId(0), crate::stub_session(sid));
+    let timeline = std::sync::Arc::clone(&app.pool.get(sid).expect("pooled").ctx.timeline);
+    super::super::tests::with_agent(&timeline, "codex");
+    let survey = |ctx: Option<u8>, goal: Option<&str>| crate::survey::CodexSurvey {
+        facts: aterm_agent::harness::codex_facts::CodexFacts {
+            ctx_left_pct: ctx,
+            ..Default::default()
+        },
+        goal: goal.map(str::to_string),
+        ..Default::default()
+    };
+    for (ctx, goal) in [
+        (Some(47), None),
+        (Some(45), None),
+        (Some(38), Some("ship the parser")),
+        (Some(38), None),
+    ] {
+        assert!(
+            timeline
+                .lock()
+                .unwrap()
+                .set_codex_survey(300, survey(ctx, goal)),
+            "read for the group in front"
+        );
+    }
+    assert!(
+        !timeline
+            .lock()
+            .unwrap()
+            .set_codex_survey(301, survey(Some(5), Some("elsewhere"))),
+        "CONTROL: a group not in front"
+    );
+    let got = lines_of(&timeline);
+    let ctx = having(&got, " ctx pct=");
+    assert_eq!(ctx.len(), 2, "47, then 38 (45 is the same tenth): {got:?}");
+    assert!(
+        ctx[0].contains(" ctx pct=47 ") && ctx[1].contains(" ctx pct=38 "),
+        "{ctx:?}"
+    );
+    assert!(ctx[0].contains(" src=transcript conf=exact "), "{ctx:?}");
+    let goal = having(&got, " goal state=");
+    assert_eq!(
+        goal.len(),
+        2,
+        "on, then off; the first reading of none says nothing: {got:?}"
+    );
+    assert!(
+        goal[0].contains(" goal state=on ") && goal[1].contains(" goal state=off "),
+        "{goal:?}"
+    );
+    assert!(goal[0].contains(" src=meta conf=claim "), "{goal:?}");
+    let run = ctx[0].split(' ').nth(2).expect("a node");
+    assert!(run.starts_with('r'), "on the codex run: {ctx:?}");
+}
+
 #[test]
 fn a_stopped_turn_closes_interrupted() {
     for stopped in [true, false] {
@@ -1303,7 +1367,7 @@ fn a_successor_restoring_the_same_meta_marks_it_carried() {
         let mut g = tl.lock().unwrap();
         let at = g.slog().now();
         let change = MetaChange::written_by(field, value, aterm_slog::Actor::Aterm);
-        g.slog_mut().observe_meta(change, false, at);
+        g.slog_mut().observe_meta(change, Escalated::Off, at);
     };
     let (prev, _hand) = opened();
     say(&prev, "role", Some("SENTINEL-ROLE"));
@@ -1360,7 +1424,7 @@ fn the_autopilot_timer_is_in_the_meta_fingerprint() {
         let at = g.slog().now();
         let change = MetaChange::written_by("autopilot", Some("cruise"), aterm_slog::Actor::Ctl)
             .with_land_at(land_at);
-        g.slog_mut().observe_meta(change, false, at);
+        g.slog_mut().observe_meta(change, Escalated::Off, at);
     };
     let metas = |tl: &std::sync::Mutex<crate::session_timeline::SessionTimeline>| {
         lines_of(tl)
@@ -1463,7 +1527,7 @@ fn a_proven_claim_the_sweep_clears_leaves_the_need_consistent() {
         Some("stuck"),
         aterm_slog::Actor::Aterm,
     );
-    n.slog_mut().observe_meta(change, true, at);
+    n.slog_mut().observe_meta(change, Escalated::Ask, at);
     let got = lines(n.slog().log());
     assert!(
         having(&got, " word=escalated ").is_empty(),
@@ -1715,4 +1779,407 @@ fn a_restart_lifts_no_failure_of_a_command_that_ran_no_agent() {
         "the act is still written: {:?}",
         lines_of(&tl)
     );
+}
+
+/// Decision step `kind` (an approval box `bash`, or a question) under a turn of an agent run in
+/// `ctx`'s log, then a tool step the transcript opens beside it in the same ms, as Claude Code's
+/// does (finding E2E-3): the decision step.
+fn decision_beside_a_tool(ctx: &crate::SessionCtx, kind: Kind) -> Node {
+    use aterm_slog::{Lvl, Open};
+    let mut g = ctx.timeline.lock().unwrap();
+    let at = g.slog().now();
+    let log = g.slog_mut().log_mut_for_tests();
+    let run = match log.deepest_open(Lvl::Run) {
+        Some(run) => run,
+        None => log
+            .open(Open::new(Kind::Agent, Src::Status, Conf::Strong), at)
+            .expect("the agent run"),
+    };
+    let turn = match log.deepest_open(Lvl::Turn) {
+        Some(turn) => turn,
+        None => log
+            .open(
+                Open::new(Kind::Turn, Src::Screen, Conf::Strong).under(run),
+                at,
+            )
+            .expect("the turn"),
+    };
+    let f = if kind == Kind::Approval {
+        Fields::new().word(Key::Box, "bash").expect("box")
+    } else {
+        Fields::new()
+    };
+    let p = log
+        .open(
+            Open::new(kind, Src::Screen, Conf::Strong)
+                .under(turn)
+                .fields(f),
+            at,
+        )
+        .expect("the decision step");
+    log.open(
+        Open::new(Kind::Tool, Src::Transcript, Conf::Strong)
+            .under(turn)
+            .by(aterm_slog::Actor::Vendor)
+            .fields(Fields::new().word(Key::Cls, "shell").expect("cls")),
+        at,
+    )
+    .expect("the tool step");
+    p
+}
+
+/// The person answers `p`: its close, `by=human`.
+fn answered(ctx: &crate::SessionCtx, p: Node) {
+    use aterm_slog::{Close, Out, StepOut};
+    let mut g = ctx.timeline.lock().unwrap();
+    let at = g.slog().now();
+    g.slog_mut()
+        .log_mut_for_tests()
+        .close(
+            p,
+            Close::new(Out::Step(StepOut::Passed), Src::Screen, Conf::Strong)
+                .by(aterm_slog::Actor::Human),
+            at,
+        )
+        .expect("the answer closes the step");
+}
+
+/// The harness's `meta set|unset attention owner=supervisor [kind=…] <text>`, through the one
+/// writer that marks the log ([`crate::session_timeline::SessionTimeline::record_meta_change`]).
+fn supervisor_asks(
+    ctx: &crate::SessionCtx,
+    text: Option<&str>,
+    kind: Option<aterm_types::needs::AttentionKind>,
+) {
+    use crate::session_timeline::{MetaEdit, write_attention_kind};
+    let edit = text.map_or(MetaEdit::Clear, MetaEdit::Set);
+    let wrote = write_attention_kind(
+        ctx,
+        aterm_agent::supervise::run::ATTENTION_OWNER,
+        edit,
+        kind,
+        aterm_slog::Actor::Harness,
+    );
+    assert!(wrote.is_ok(), "{wrote:?}");
+}
+
+/// Each escalation mark's head: `mark <node> need|clear`.
+fn escalation_marks(ctx: &crate::SessionCtx) -> Vec<String> {
+    lines_of(&ctx.timeline)
+        .into_iter()
+        .filter(|l| l.contains(" word=escalated "))
+        .filter_map(|l| {
+            let w: Vec<&str> = l.split(' ').collect();
+            (w.get(1) == Some(&"mark")).then(|| w[1..4].join(" "))
+        })
+        .collect()
+}
+
+/// Whether an `await log need` armed now would latch at once.
+fn need_latches(ctx: &crate::SessionCtx) -> Option<String> {
+    let what = crate::session_log::LogAwait::parse(&["need"])
+        .expect("await log need")
+        .what;
+    match ctx.timeline.lock().unwrap().slog().await_start(what) {
+        crate::session_log::LogAwaitStep::Answer(line) => Some(line),
+        crate::session_log::LogAwaitStep::Wait(_) => None,
+    }
+}
+
+/// Fix E3 (E2E-3): the supervisor's ask raised while a box stands is the box's escalation (`mark
+/// p<box> need word=escalated`), whatever tool step the transcript opened beside it, and the
+/// person's answer ends it in the same apply: no reader of the fold, nor an `await log need`
+/// armed after the answer, sees `escalated` before the harness takes its ask down, which still
+/// writes `mark - clear word=escalated`. An ask with no box or question open, or a wait, is the
+/// session's.
+#[test]
+fn the_supervisors_ask_on_a_box_is_the_boxs_escalation_and_ends_with_it() {
+    use aterm_types::needs::AttentionKind;
+    for (rig, kind, named) in [
+        (41, Kind::Approval, Some(AttentionKind::Ask)),
+        (43, Kind::Question, None),
+    ] {
+        let (h, _store) = fabric_rig(rig);
+        let p = decision_beside_a_tool(&h.ctx, kind);
+        supervisor_asks(&h.ctx, Some("claude approval rm target"), named);
+        assert_eq!(
+            escalation_marks(&h.ctx),
+            [format!("mark {p} need")],
+            "{kind:?}: the ask is the box's"
+        );
+        answered(&h.ctx, p);
+        let top = h
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .slog()
+            .log()
+            .state()
+            .top_observed_need()
+            .map(|n| n.word);
+        assert_eq!(top, None, "{kind:?}: the answer uncovered the escalation");
+        assert_eq!(
+            need_latches(&h.ctx),
+            None,
+            "{kind:?}: an armed wait latched"
+        );
+        supervisor_asks(&h.ctx, None, None);
+        assert_eq!(
+            escalation_marks(&h.ctx),
+            [format!("mark {p} need"), "mark - clear".to_string()],
+            "{kind:?}: the harness's unset"
+        );
+
+        supervisor_asks(&h.ctx, Some("claude asks again"), named);
+        assert_eq!(
+            escalation_marks(&h.ctx).last().map(String::as_str),
+            Some("mark - need"),
+            "{kind:?}: no box or question stands"
+        );
+        supervisor_asks(&h.ctx, None, None);
+        let q = decision_beside_a_tool(&h.ctx, kind);
+        supervisor_asks(
+            &h.ctx,
+            Some("limited: resets 3pm"),
+            Some(AttentionKind::Wait),
+        );
+        assert_eq!(
+            escalation_marks(&h.ctx).last().map(String::as_str),
+            Some("mark - need"),
+            "{kind:?}: a wait is the session's while {q} stands"
+        );
+    }
+}
+
+/// Fix E3 (E2E-3): the harness moves its ask to the next box with no unset between. Once the
+/// first box's close ended its escalation, the move raises it again on the second box.
+#[test]
+fn the_supervisors_ask_moved_to_the_next_box_is_raised_on_it() {
+    let (h, _store) = fabric_rig(42);
+    let first = decision_beside_a_tool(&h.ctx, Kind::Approval);
+    supervisor_asks(&h.ctx, Some("claude approval rm target"), None);
+    answered(&h.ctx, first);
+    let second = decision_beside_a_tool(&h.ctx, Kind::Question);
+    supervisor_asks(&h.ctx, Some("claude question which branch"), None);
+    assert_eq!(
+        escalation_marks(&h.ctx),
+        [format!("mark {first} need"), format!("mark {second} need")],
+        "the second box's ask"
+    );
+    let needs: Vec<(&str, Node)> = {
+        let g = h.ctx.timeline.lock().unwrap();
+        g.slog()
+            .log()
+            .state()
+            .needs
+            .iter()
+            .flatten()
+            .map(|n| (n.word, n.node))
+            .collect()
+    };
+    assert_eq!(needs, [("question", second), ("escalated", second)]);
+    supervisor_asks(&h.ctx, Some("claude question which branch now"), None);
+    assert_eq!(
+        escalation_marks(&h.ctx).len(),
+        2,
+        "a move while the escalation stands raises nothing"
+    );
+}
+
+/// The agent verdict `word` (`detail` its box) published on `h`'s timeline, through its one
+/// verdict writer (`settle_agent_word`), as the screen reader publishes it.
+fn verdict(h: &crate::session_store::SessionHandle, word: &'static str, detail: Option<&str>) {
+    let seq = {
+        let g = h.ctx.timeline.lock().unwrap();
+        g.agent().rev + 10
+    };
+    h.ctx.timeline.lock().unwrap().publish_agent(
+        word,
+        detail.map(str::to_string),
+        None,
+        Some(aterm_phase::Program::Claude),
+        stamp(seq),
+    );
+}
+
+/// An input stall published over the screen's word (`Some`), or lifted (`None`).
+fn stalled(h: &crate::session_store::SessionHandle, on: bool) {
+    let fact = on.then(|| crate::input_stall::InputStallFact {
+        word: aterm_session::input_backlog::InputWord::Stalled,
+        since: Instant::now(),
+        since_unix: None,
+        bytes: 1,
+        stopped: false,
+        rss_mb: None,
+        restart: crate::input_stall::Restart::default(),
+        act: None,
+    });
+    let _ = h.ctx.timeline.lock().unwrap().set_input(fact);
+}
+
+/// The open approval or question step, and each need the fold names as `(word, node)`.
+fn decision_and_needs(
+    h: &crate::session_store::SessionHandle,
+) -> (Option<Node>, Vec<(&'static str, Node)>) {
+    let g = h.ctx.timeline.lock().unwrap();
+    let log = g.slog().log();
+    let needs = log
+        .state()
+        .needs
+        .iter()
+        .flatten()
+        .map(|n| (n.word, n.node))
+        .collect();
+    (log.open_decision_step(), needs)
+}
+
+/// A Claude Code run under a registered session on a hand clock, its turn busy, then the box
+/// `detail` (an approval box, or `question`) open with the supervisor's ask raised on it: the
+/// handle, the hand and the box's step.
+fn escalated_box(
+    rig: u64,
+    detail: &'static str,
+) -> (
+    crate::session_store::SessionHandle,
+    crate::session_store::Store,
+    super::super::tests::Hand,
+    Node,
+) {
+    let h = crate::session_store::test_handle(rig);
+    let hand = super::super::tests::hand_clock(&h.ctx.timeline);
+    let store = crate::session_store::new_store();
+    store.write().unwrap().register(h.clone());
+    with_claude(&h.ctx.timeline);
+    verdict(&h, "busy", None);
+    verdict(&h, "prompt", Some(detail));
+    let (Some(first), _) = decision_and_needs(&h) else {
+        panic!("{detail}: the box opened no step");
+    };
+    supervisor_asks(
+        &h.ctx,
+        Some("claude approval rm target"),
+        Some(aterm_types::needs::AttentionKind::Ask),
+    );
+    assert_eq!(escalation_marks(&h.ctx), [format!("mark {first} need")]);
+    (h, store, hand, first)
+}
+
+/// The two kinds of decision step, and a box of another kind to follow each.
+const DECISIONS: [(u64, &str, &str); 2] = [
+    (45, "bash:not-read-only", "edit"),
+    (48, "question", "bash:not-read-only"),
+];
+
+/// Fix E3 review: the supervisor's ask raised on a box ends with the box's close, but a close no
+/// input dismissed (an input stall stood over the box, or the verdict flickered off it) answered
+/// nothing. When the box opens again in the same turn with the ask standing, the ask is raised
+/// again on it, through the real verdict writer, and that box's close ends it. The stall itself
+/// shows its own need, and the harness's unset still writes the clear.
+#[test]
+fn a_box_the_verdict_closed_unanswered_keeps_the_supervisors_ask() {
+    for (rig, detail, _) in DECISIONS {
+        let (h, _store, _hand, first) = escalated_box(rig, detail);
+        stalled(&h, true);
+        let (open, needs) = decision_and_needs(&h);
+        assert_eq!(open, None, "{detail}: the stall closed the box");
+        assert_eq!(
+            needs.iter().map(|n| n.0).collect::<Vec<_>>(),
+            ["unresponsive"],
+            "{detail}: the stall's own need stands"
+        );
+        stalled(&h, false);
+        let (Some(again), needs) = decision_and_needs(&h) else {
+            panic!("{detail}: the box came back");
+        };
+        assert_ne!(again, first);
+        assert_eq!(
+            escalation_marks(&h.ctx),
+            [format!("mark {first} need"), format!("mark {again} need")],
+            "{detail}: the box the stall closed unanswered keeps the ask"
+        );
+        assert!(needs.contains(&("escalated", again)), "{detail}: {needs:?}");
+
+        verdict(&h, "busy", None);
+        let (_, needs) = decision_and_needs(&h);
+        assert!(
+            needs.is_empty(),
+            "{detail}: the flicker's close ends the reopened box's escalation: {needs:?}"
+        );
+        verdict(&h, "prompt", Some(detail));
+        let (Some(third), needs) = decision_and_needs(&h) else {
+            panic!("{detail}: the box came back after the flicker");
+        };
+        assert!(
+            needs.contains(&("escalated", third)),
+            "{detail}: a flicker: {needs:?}"
+        );
+        supervisor_asks(&h.ctx, None, None);
+        assert_eq!(
+            escalation_marks(&h.ctx).last().map(String::as_str),
+            Some("mark - clear"),
+            "{detail}: the harness's unset"
+        );
+        assert_eq!(
+            decision_and_needs(&h).1.len(),
+            1,
+            "{detail}: the clear left the box's own need"
+        );
+    }
+}
+
+/// Fix E3 review: a close an input dismissed (here a person's, `by=human`) was the answer. The
+/// next box that opens before the harness's next look carries no escalation: the supervisor
+/// raises it there itself if it hands that box over too.
+#[test]
+fn the_box_after_an_answer_carries_no_escalation() {
+    for (rig, detail, next) in DECISIONS {
+        let (h, _store, _hand, first) = escalated_box(rig + 1, detail);
+        answered(&h.ctx, first);
+        verdict(&h, "prompt", Some(next));
+        let (Some(second), needs) = decision_and_needs(&h) else {
+            panic!("{detail}: the next box opened no step");
+        };
+        assert_ne!(second, first);
+        assert!(
+            !needs.iter().any(|n| n.0 == "escalated"),
+            "{detail}: the answer's next box carried the ask: {needs:?}"
+        );
+        assert_eq!(escalation_marks(&h.ctx).len(), 1, "{detail}: no carry");
+    }
+}
+
+/// Fix E3 review: a box closed unanswered whose turn then ended (the stall, a rest the turn's
+/// settle closes) carries nothing into a later turn's box.
+#[test]
+fn a_box_in_a_later_turn_carries_no_escalation() {
+    for (rig, detail, _) in DECISIONS {
+        let (h, _store, hand, first) = escalated_box(rig + 2, detail);
+        stalled(&h, true);
+        verdict(&h, "idle", None);
+        stalled(&h, false);
+        hand.advance(aterm_slog::SETTLE_MS);
+        let _ = h.ctx.timeline.lock().unwrap().slog_tick();
+        verdict(&h, "busy", None);
+        verdict(&h, "prompt", Some(detail));
+        let (Some(later), needs) = decision_and_needs(&h) else {
+            panic!("{detail}: the later turn's box opened no step");
+        };
+        let parents = {
+            let g = h.ctx.timeline.lock().unwrap();
+            (
+                g.slog().log().parent_of(first),
+                g.slog().log().parent_of(later),
+            )
+        };
+        assert!(
+            parents.0.is_some() && parents.0 != parents.1,
+            "{detail}: the settle ended the turn: {parents:?}"
+        );
+        assert!(
+            !needs.iter().any(|n| n.0 == "escalated"),
+            "{detail}: a later turn's box carried the ask: {needs:?}"
+        );
+        assert_eq!(escalation_marks(&h.ctx).len(), 1, "{detail}: no carry");
+    }
 }

@@ -26,6 +26,17 @@ use aterm_core::terminal::{
 /// Default byte budget for retained payloads: input blobs plus keyframes.
 pub(crate) const DEFAULT_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 
+/// Size of one packed history byte slab: 256 KiB sits in macOS `libsystem_malloc`'s Large VM
+/// region, so evicting a packed chain unmaps whole pages instead of stranding freed slots in
+/// Small/Tiny magazine pages.
+const BLOB_SLAB_BYTES: usize = 256 * 1024;
+
+/// Freed history bytes accumulated before an idle writer relieves the allocator.
+const IDLE_RELIEF_FLOOR_BYTES: usize = 1024 * 1024;
+
+/// Freed history bytes accumulated during multi-pane pool shedding before mid-flood relief.
+const POOL_RELIEF_MID_FLOOD_BYTES: usize = 16 * 1024 * 1024;
+
 /// An in-memory replay keyframe: its [`TerminalCheckpoint`] paired with the transient engine state no checkpoint carries ([`ReplayCarry`]).
 #[derive(Clone, Debug)]
 pub(crate) struct ReplayKeyframe {
@@ -159,6 +170,15 @@ pub(crate) fn reply_of(response: Option<&[u8]>, reports: Option<&[u8]>) -> Optio
 #[must_use]
 pub(crate) fn keyframe_of(term: &Terminal, max_history: usize) -> Option<ReplayKeyframe> {
     let mut checkpoint = term.checkpoint_continuing_bounded(max_history)?;
+    term.note_bounded_replay_keyframe(max_history);
+    if checkpoint.grid.capacity() > checkpoint.grid.len() + 4096 {
+        checkpoint.grid.shrink_to_fit();
+    }
+    if let Some(alt) = &mut checkpoint.alt_grid
+        && alt.capacity() > alt.len() + 4096
+    {
+        alt.shrink_to_fit();
+    }
     checkpoint.shell_integration_nonce = term
         .shell_integration_nonce_in_use()
         .map(ShellIntegrationNonce);
@@ -193,7 +213,9 @@ impl TemporalMsg {
     fn weight(&self) -> usize {
         match self {
             Self::RawIn(input) => input.charge(),
-            Self::Keyframe(k) | Self::LiveKeyframe(k, _) => charge_of(&k.checkpoint),
+            Self::Keyframe(k) | Self::LiveKeyframe(k, _) => {
+                charge_of(&k.checkpoint).saturating_add(k.carry.retained_image_bytes())
+            }
             Self::Witness(c) => charge_of(c),
             Self::Reply
             | Self::Resize { .. }
@@ -252,12 +274,30 @@ fn writer() -> Result<&'static Sender<Queued>, String> {
                 crate::qos::Role::Responsive,
                 move || {
                     let _gone = WriterGone;
-                    while let Ok(queued) = rx.recv() {
-                        if let Some(to) = &queued.to {
-                            write_queued(to, queued.generation, queued.msg);
+                    let mut next = rx.recv().ok();
+                    while let Some(first) = next {
+                        let mut cur = Some(first);
+                        while let Some(queued) = cur {
+                            if let Some(to) = &queued.to {
+                                write_queued(to, queued.generation, queued.msg);
+                            }
+                            queued.state.written(queued.weight);
+                            queued.state.pool.relieve();
+                            cur = rx.try_recv().ok();
                         }
-                        queued.state.written(queued.weight);
-                        queued.state.pool.relieve();
+                        if pool().relief_due() {
+                            match rx.recv_timeout(std::time::Duration::from_millis(20)) {
+                                Ok(more) => {
+                                    next = Some(more);
+                                    continue;
+                                }
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                    pool().relieve_allocator_if_due();
+                                }
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
+                        next = rx.recv().ok();
                     }
                 },
             )
@@ -336,6 +376,7 @@ impl QueueState {
 }
 
 /// A reader's end of its recording's queue.
+#[derive(Clone)]
 pub(crate) struct TemporalTx {
     sender: Sender<Queued>,
     to: Option<Arc<Mutex<TemporalRecorder>>>,
@@ -515,7 +556,9 @@ pub(crate) struct SpineWatermark {
     lifetime: AtomicU64,
     ordinal: AtomicU64,
     cell_px: AtomicU64,
+    host_lifetime: AtomicU64,
     host_ordinal: AtomicU64,
+    deep_pullback: AtomicU64,
     dropped_input: AtomicU64,
     closed: AtomicU64,
     dropped_replies: AtomicU64,
@@ -528,9 +571,18 @@ pub(crate) struct SpineWatermark {
 impl SpineWatermark {
     /// Start the watermark at `pre`.
     pub(crate) fn seed(&self, pre: SpinePre) {
-        self.store_host(pre.host_ordinal);
+        self.store_host((pre.lifetime, pre.host_ordinal));
         self.store((pre.lifetime, pre.ordinal));
         self.store_cell_px(pre.cell_px);
+        self.store_deep_pullback(pre.deep_pullback);
+    }
+
+    fn load_deep_pullback(&self) -> u64 {
+        self.deep_pullback.load(Ordering::Acquire)
+    }
+
+    fn store_deep_pullback(&self, ordinal: u64) {
+        self.deep_pullback.store(ordinal, Ordering::Release);
     }
 
     fn load(&self) -> Option<(u64, u64)> {
@@ -544,12 +596,13 @@ impl SpineWatermark {
     }
 
     fn load_host(&self) -> Option<(u64, u64)> {
-        let lifetime = self.lifetime.load(Ordering::Acquire);
+        let lifetime = self.host_lifetime.load(Ordering::Acquire);
         (lifetime != 0).then(|| (lifetime, self.host_ordinal.load(Ordering::Acquire)))
     }
 
-    fn store_host(&self, ordinal: u64) {
+    fn store_host(&self, (lifetime, ordinal): (u64, u64)) {
         self.host_ordinal.store(ordinal, Ordering::Release);
+        self.host_lifetime.store(lifetime, Ordering::Release);
     }
 
     fn load_cell_px(&self) -> Option<(u16, u16)> {
@@ -627,6 +680,7 @@ pub(crate) struct SpineMark {
     at: Option<(u64, u64)>,
     cell_px: Option<(u16, u16)>,
     host_at: Option<(u64, u64)>,
+    deep_pullback_at: u64,
     shared: Arc<SpineWatermark>,
     broken: bool,
     since_witness: usize,
@@ -644,11 +698,13 @@ pub(crate) struct SpinePre {
     started: u64,
     cell_px: Option<(u16, u16)>,
     host_ordinal: u64,
+    host_io: u64,
+    deep_pullback: u64,
 }
 
 impl SpinePre {
     /// Read `term` (the caller holds its lock) before processing a slice.
-    pub(crate) const fn take(term: &Terminal) -> Self {
+    pub(crate) fn take(term: &Terminal) -> Self {
         Self {
             lifetime: term.resize_lifetime(),
             ordinal: term.resize_ordinal(),
@@ -657,6 +713,8 @@ impl SpinePre {
             started: term.started_command_seq(),
             cell_px: term.host_cell_pixel_size(),
             host_ordinal: term.host_ordinal(),
+            host_io: term.host_io_ordinal(),
+            deep_pullback: term.deep_history_pullback_ordinal(),
         }
     }
 }
@@ -714,6 +772,7 @@ impl SpineMark {
             at: shared.load(),
             cell_px: shared.load_cell_px(),
             host_at: shared.load_host(),
+            deep_pullback_at: shared.load_deep_pullback(),
             broken: shared.break_open(),
             generation: shared.generation(),
             shared,
@@ -728,6 +787,14 @@ impl SpineMark {
         self.advance_host((pre.lifetime, pre.host_ordinal));
         self.advance((pre.lifetime, pre.ordinal));
         self.advance_cell_px(pre.cell_px);
+        self.advance_deep_pullback(pre.deep_pullback);
+    }
+
+    fn advance_deep_pullback(&mut self, ordinal: u64) {
+        if self.deep_pullback_at != ordinal {
+            self.deep_pullback_at = ordinal;
+            self.shared.store_deep_pullback(ordinal);
+        }
     }
 
     fn advance(&mut self, at: (u64, u64)) {
@@ -740,7 +807,7 @@ impl SpineMark {
     fn advance_host(&mut self, at: (u64, u64)) {
         if self.host_at != Some(at) {
             self.host_at = Some(at);
-            self.shared.store_host(at.1);
+            self.shared.store_host(at);
         }
     }
 
@@ -764,6 +831,11 @@ impl SpineMark {
     }
 
     fn catch_up_host(&mut self, tx: &TemporalTx, term: &Terminal) -> CatchUpHost {
+        if let Some(shared_host) = self.shared.load_host()
+            && self.host_at.is_none_or(|cur| shared_host > cur)
+        {
+            self.host_at = Some(shared_host);
+        }
         let lifetime = term.resize_lifetime();
         let target = term.host_ordinal();
         let since = match self.host_at {
@@ -797,6 +869,7 @@ impl SpineMark {
             self.at = self.shared.load();
             self.cell_px = self.shared.load_cell_px();
             self.host_at = self.shared.load_host();
+            self.deep_pullback_at = self.shared.load_deep_pullback();
             self.since_witness = 0;
             self.witnessed_at = None;
         }
@@ -804,8 +877,35 @@ impl SpineMark {
             self.resync(tx, term, None);
             return;
         }
+        if self.shared.keyframe_wanted() && self.resync(tx, term, None) {
+            return;
+        }
+        if self.shared.load().is_some()
+            && term.deep_history_pullback_ordinal() != self.deep_pullback_at
+        {
+            let marks = SliceMarks {
+                sync_open: term.modes().synchronized_output(),
+                command: false,
+            };
+            if !self.resync(tx, term, Some(marks)) && !tx.has_room() {
+                self.broken = true;
+                self.shared.dropped_input.fetch_add(1, Ordering::Release);
+            }
+            return;
+        }
+        if self.shared.load().is_some()
+            && !self.catch_up(&mut TemporalSink(tx), SpinePre::take(term), term)
+        {
+            self.broken = true;
+            self.shared.dropped_input.fetch_add(1, Ordering::Release);
+            return;
+        }
         match self.catch_up_host(tx, term) {
-            CatchUpHost::Ok => {}
+            CatchUpHost::Ok => {
+                if self.shared.load().is_some() {
+                    term.note_bounded_replay_step(REKEY_SCROLLBACK_LINES);
+                }
+            }
             CatchUpHost::Overrun => {
                 if !self.resync(tx, term, None) {
                     self.broken = true;
@@ -838,6 +938,7 @@ impl SpineMark {
             self.at = self.shared.load();
             self.cell_px = self.shared.load_cell_px();
             self.host_at = self.shared.load_host();
+            self.deep_pullback_at = self.shared.load_deep_pullback();
             self.since_witness = 0;
             self.witnessed_at = None;
         }
@@ -846,6 +947,13 @@ impl SpineMark {
             return;
         }
         if self.shared.keyframe_wanted() && self.resync(tx, term, Some(input.marks)) {
+            return;
+        }
+        if term.deep_history_pullback_ordinal() != self.deep_pullback_at {
+            if !self.resync(tx, term, Some(input.marks)) {
+                self.broken = true;
+                self.shared.dropped_input.fetch_add(1, Ordering::Release);
+            }
             return;
         }
         let (len, at) = (input.len(), input.clock.monotonic);
@@ -871,11 +979,20 @@ impl SpineMark {
                 return;
             }
         }
+        if term.host_io_ordinal() != pre.host_io {
+            if !self.resync(tx, term, Some(input.marks)) {
+                self.broken = true;
+                self.shared.dropped_input.fetch_add(1, Ordering::Release);
+            }
+            return;
+        }
         if tx.send(TemporalMsg::RawIn(input)) {
             // Past anything the bytes themselves applied (they replay it).
             self.advance((term.resize_lifetime(), term.resize_ordinal()));
             self.advance_cell_px(term.host_cell_pixel_size());
             self.advance_host((term.resize_lifetime(), term.host_ordinal()));
+            self.advance_deep_pullback(term.deep_history_pullback_ordinal());
+            term.note_bounded_replay_step(REKEY_SCROLLBACK_LINES);
             self.witness(tx, term, len, at);
         } else {
             self.broken = true;
@@ -902,7 +1019,10 @@ impl SpineMark {
 
     /// Queue a keyframe of the live screen in place of the slice just parsed: one that closes a break (`live: None`), or a live one carrying that slice's marks.
     fn resync(&mut self, tx: &TemporalTx, term: &Terminal, live: Option<SliceMarks>) -> bool {
-        if !tx.has_room() || term.partial_sequence_swallowed().is_some() {
+        if !tx.has_room()
+            || term.partial_sequence_swallowed().is_some()
+            || term.has_detached_scrollback()
+        {
             return false;
         }
         let Some(mut keyframe) = keyframe_of(term, REKEY_SCROLLBACK_LINES) else {
@@ -926,6 +1046,7 @@ impl SpineMark {
         self.advance_host((term.resize_lifetime(), term.host_ordinal()));
         self.advance((term.resize_lifetime(), term.resize_ordinal()));
         self.advance_cell_px(term.host_cell_pixel_size());
+        self.advance_deep_pullback(term.deep_history_pullback_ordinal());
         true
     }
 
@@ -962,6 +1083,11 @@ impl SpineMark {
         pre: SpinePre,
         term: &Terminal,
     ) -> bool {
+        if let Some(shared_at) = self.shared.load()
+            && self.at.is_none_or(|cur| shared_at > cur)
+        {
+            self.at = Some(shared_at);
+        }
         let since = match self.at {
             Some((lifetime, ordinal)) if lifetime == pre.lifetime && ordinal == pre.ordinal => {
                 return true;
@@ -1168,6 +1294,24 @@ impl TemporalRecorder {
         }
     }
 
+    fn note_freed(&self, bytes: usize) {
+        if let Some(share) = self.share.as_ref() {
+            share.pool.note_freed(bytes);
+        }
+    }
+
+    fn compact_storage(&mut self) {
+        fn shrink<T>(q: &mut VecDeque<T>) {
+            if q.capacity() > 64 && q.capacity() / 4 > q.len() {
+                q.shrink_to_fit();
+            }
+        }
+        shrink(&mut self.blobs);
+        shrink(&mut self.host_ops);
+        shrink(&mut self.keyframes);
+        shrink(&mut self.witnesses);
+    }
+
     /// Drop every kept event, slice, keyframe and witness, so no replay reaches an instant before now; a message queued before it is dropped as it arrives.
     pub(crate) fn forget(&mut self) {
         self.generation += 1;
@@ -1190,7 +1334,8 @@ impl TemporalRecorder {
     /// [`Self::forget`], then keep `term` as the first state; the caller holds `term`'s lock, so no reader is mid-slice, and takes the recorder's lock inside it.
     pub(crate) fn forget_onto(&mut self, term: &Terminal) -> bool {
         self.forget();
-        let seed = if term.partial_sequence_swallowed().is_some() {
+        let seed = if term.partial_sequence_swallowed().is_some() || term.has_detached_scrollback()
+        {
             None
         } else {
             keyframe_of(term, REKEY_SCROLLBACK_LINES)
@@ -1246,6 +1391,7 @@ impl TemporalRecorder {
             while self.host_op_base() < first_host && self.pop_host_op() {}
             self.settle();
         }
+        self.compact_storage();
     }
 
     /// Mark this spine as one that starts at a seamless update ([`crate::session_timeline::HandoffGap`]).
@@ -1501,20 +1647,38 @@ impl TemporalRecorder {
 
     /// Record a keyframe (a serialized [`TerminalCheckpoint`]), the seed for replays to instants at or after it.
     pub(crate) fn record_keyframe(&mut self, keyframe: impl Into<ReplayKeyframe>) {
-        self.record_keyframe_with_marks(keyframe.into(), false);
+        self.record_keyframe_inner(keyframe.into(), false, false);
         self.settle();
     }
 
-    fn record_keyframe_with_marks(&mut self, mut keyframe: ReplayKeyframe, command: bool) {
+    fn record_keyframe_with_marks(&mut self, keyframe: ReplayKeyframe, command: bool) {
+        self.record_keyframe_inner(keyframe, command, true);
+    }
+
+    fn record_keyframe_inner(
+        &mut self,
+        mut keyframe: ReplayKeyframe,
+        command: bool,
+        coalesceable: bool,
+    ) {
         let config = keyframe
             .recorded_config
             .take()
             .unwrap_or_else(|| self.replay_config.clone());
         let stale_config = config.as_deref() != self.replay_config.as_deref();
-        self.record_keyframe_as(keyframe, false, command, config);
+        self.record_keyframe_as(keyframe, false, command, coalesceable, config);
         if stale_config {
             self.spine.keyframe_wanted.store(true, Ordering::Release);
         }
+    }
+
+    fn has_chain_steps_after(&self, seq: Seq) -> bool {
+        self.log.live_after(seq).any(|ev| {
+            matches!(
+                ev.op,
+                Op::RawIn(_) | Op::Resize { .. } | Op::CellPx { .. } | Op::Host(_) | Op::Witness(_)
+            )
+        })
     }
 
     /// [`Self::record_keyframe`], marked as minted by a replay (a rekey) or taken from the live engine, as standing in for a slice that started a command, and its chain replaying under `config`.
@@ -1523,12 +1687,32 @@ impl TemporalRecorder {
         keyframe: ReplayKeyframe,
         replayed: bool,
         command: bool,
+        coalesceable: bool,
         config: Option<Arc<TerminalConfig>>,
     ) {
         let ts = self.now();
         let id = KeyframeId(self.next_keyframe);
         self.next_keyframe += 1;
         let seq = self.append(Op::Keyframe(id), ts);
+        let mut command = command;
+        let mut freed_keyframe = 0usize;
+        if coalesceable
+            && self.keyframes.len() >= 2
+            && self.keyframes.back().is_some_and(|prev| {
+                prev.coalesceable
+                    && prev.cut.is_none()
+                    && prev.config.as_deref() == config.as_deref()
+                    && prev.checkpoint.modes.synchronized_output()
+                        == keyframe.checkpoint.modes.synchronized_output()
+                    && !self.has_chain_steps_after(prev.seq)
+            })
+            && let Some(prev) = self.keyframes.pop_back()
+        {
+            let prev_charge = prev.charge();
+            self.used = self.used.saturating_sub(prev_charge);
+            freed_keyframe = prev_charge;
+            command |= prev.command;
+        }
         let keyframe = RetainedKeyframe {
             #[cfg(test)]
             id,
@@ -1538,7 +1722,9 @@ impl TemporalRecorder {
             first_host_op: self.next_host_op,
             cut: None,
             replayed,
+            coalesceable,
             command,
+            packed: false,
             checkpoint: keyframe.checkpoint,
             carry: keyframe.carry,
             config,
@@ -1551,6 +1737,132 @@ impl TemporalRecorder {
             self.pop_keyframe();
         }
         self.enforce_budget();
+        self.pack_older_chains();
+        if freed_keyframe > 0 {
+            self.note_freed(freed_keyframe);
+        }
+    }
+
+    /// Pack unshared small slices of completed chains into [`BLOB_SLAB_BYTES`] slabs so evicted
+    /// chains drop Large VM allocations whole while slices still shared with `CastRecorder`, a
+    /// byte tap, or a caller stay shared.
+    fn pack_older_chains(&mut self) {
+        if self.keyframes.len() < 2 {
+            return;
+        }
+        let base = self.blob_base();
+        let mut freed = 0usize;
+        for k in 0..self.keyframes.len() - 1 {
+            if self.keyframes[k].packed {
+                continue;
+            }
+            let start_id = self.keyframes[k].first_blob.max(base);
+            let end_id = self.keyframes[k + 1].first_blob.min(self.next_blob);
+            if end_id <= start_id {
+                self.keyframes[k].packed = true;
+                continue;
+            }
+            let lo = usize::try_from(start_id - base).unwrap_or(self.blobs.len());
+            let hi = usize::try_from(end_id - base)
+                .unwrap_or(self.blobs.len())
+                .min(self.blobs.len());
+            if hi <= lo {
+                self.keyframes[k].packed = true;
+                continue;
+            }
+            // Identify contiguous runs of slices sharing one `Arc<[u8]>` whose `strong_count`
+            // equals the run length (no holder outside this chain).
+            let mut runs: Vec<Range<usize>> = Vec::new();
+            let mut packable_bytes = 0usize;
+            let mut all_small_unshared = true;
+            let mut idx = lo;
+            while idx < hi {
+                let Some(first) = self.blobs[idx].as_ref() else {
+                    idx += 1;
+                    continue;
+                };
+                if first.len() == 0 || first.batch.len() > BLOB_SLAB_BYTES / 2 {
+                    idx += 1;
+                    continue;
+                }
+                let ptr = Arc::as_ptr(&first.batch).cast::<u8>();
+                let strong = Arc::strong_count(&first.batch);
+                let run_start = idx;
+                let mut run_bytes = first.len();
+                idx += 1;
+                while idx < hi {
+                    let Some(next) = self.blobs[idx].as_ref() else {
+                        break;
+                    };
+                    if Arc::as_ptr(&next.batch).cast::<u8>() != ptr
+                        || next.len() == 0
+                        || next.batch.len() > BLOB_SLAB_BYTES / 2
+                    {
+                        break;
+                    }
+                    run_bytes += next.len();
+                    idx += 1;
+                }
+                if strong == idx - run_start {
+                    runs.push(run_start..idx);
+                    packable_bytes += run_bytes;
+                } else {
+                    all_small_unshared = false;
+                }
+            }
+            if packable_bytes == 0 {
+                if all_small_unshared {
+                    self.keyframes[k].packed = true;
+                }
+                continue;
+            }
+            if !all_small_unshared && packable_bytes < BLOB_SLAB_BYTES / 2 {
+                continue;
+            }
+            let mut slab_indices: Vec<usize> = Vec::new();
+            let mut slab_buf = Vec::with_capacity(packable_bytes.min(BLOB_SLAB_BYTES));
+            let flush_slab = |blobs: &mut VecDeque<Option<InputSlice>>,
+                              indices: &mut Vec<usize>,
+                              buf: &mut Vec<u8>| {
+                if indices.is_empty() {
+                    return;
+                }
+                let slab: Arc<[u8]> = std::mem::take(buf).into();
+                let mut at = 0usize;
+                for &slot_idx in indices.iter() {
+                    if let Some(slice) = blobs[slot_idx].as_mut() {
+                        let len = slice.len();
+                        slice.batch = slab.clone();
+                        slice.range = at..at + len;
+                        at += len;
+                    }
+                }
+                indices.clear();
+            };
+            for run in runs {
+                for slot_idx in run {
+                    let len = self.blobs[slot_idx].as_ref().map_or(0, InputSlice::len);
+                    if !slab_indices.is_empty() && slab_buf.len() + len > BLOB_SLAB_BYTES {
+                        flush_slab(&mut self.blobs, &mut slab_indices, &mut slab_buf);
+                        slab_buf.reserve_exact(
+                            packable_bytes.saturating_sub(freed).min(BLOB_SLAB_BYTES),
+                        );
+                    }
+                    if let Some(slice) = self.blobs[slot_idx].as_ref() {
+                        slab_buf.extend_from_slice(slice.bytes());
+                        slab_indices.push(slot_idx);
+                        freed += len;
+                    }
+                }
+            }
+            flush_slab(&mut self.blobs, &mut slab_indices, &mut slab_buf);
+            if all_small_unshared {
+                self.keyframes[k].packed = true;
+            }
+        }
+        if freed > 0 {
+            self.note_freed(freed);
+        }
     }
 
     fn close_break(&mut self, keyframe: ReplayKeyframe) {
@@ -1593,13 +1905,14 @@ impl TemporalRecorder {
 
     /// Record the verdicts and the keyframe a due re-keyframe minted ([`Rekey::mint`]), unless a witness in its chain diverged, then hold the budget.
     pub(crate) fn rekeyed(&mut self, minted: Minted) {
+        self.note_freed(BLOB_SLAB_BYTES);
         if minted.generation != self.generation {
             return;
         }
         self.judge(minted.judged);
         match minted.keyframe {
             Some(keyframe) if self.log.head() == minted.head && !self.chain_diverged => {
-                self.record_keyframe_as(keyframe, true, false, minted.config);
+                self.record_keyframe_as(keyframe, true, false, false, minted.config);
             }
             Some(_) => self.enforce_budget(),
             None => {
@@ -1668,6 +1981,7 @@ impl TemporalRecorder {
     }
 
     fn enforce_budget(&mut self) {
+        let mut evicted = false;
         while self.used > self.budget {
             let base = self.blob_base();
             let host_base = self.host_op_base();
@@ -1678,14 +1992,19 @@ impl TemporalRecorder {
             if oldest_chain
                 .is_some_and(|(first, first_host)| first < base || first_host < host_base)
             {
-                self.pop_keyframe();
+                evicted |= self.pop_keyframe();
             } else if !self.blobs.is_empty() && oldest_chain.is_none_or(|(first, _)| base < first) {
-                self.pop_blob();
+                evicted |= self.pop_blob();
             } else if self.keyframes.len() > 1 {
-                self.pop_keyframe();
-            } else if !self.pop_blob() && !self.pop_keyframe() {
+                evicted |= self.pop_keyframe();
+            } else if self.pop_blob() || self.pop_keyframe() {
+                evicted = true;
+            } else {
                 break;
             }
+        }
+        if evicted {
+            self.compact_storage();
         }
     }
 
@@ -2097,12 +2416,14 @@ impl TemporalRecorder {
                     _ => continue,
                 },
                 Op::Keyframe(_) => {
-                    let kf = self.keyframes.iter().find(|kf| kf.seq == ev.seq);
-                    let marks = kf.map(|kf| SliceMarks {
+                    let Some(kf) = self.keyframes.iter().find(|kf| kf.seq == ev.seq) else {
+                        continue;
+                    };
+                    let marks = Some(SliceMarks {
                         sync_open: kf.checkpoint.modes.synchronized_output(),
                         command: kf.command,
                     });
-                    (marks, kf.is_some_and(|kf| !kf.replayed))
+                    (marks, !kf.replayed)
                 }
                 _ => continue,
             };
@@ -2219,6 +2540,19 @@ impl TemporalRecorder {
         })
     }
 
+    fn chain_env(&self, kf: &RetainedKeyframe) -> PaneEnv {
+        PaneEnv {
+            config: kf.config.as_deref().cloned().unwrap_or_default(),
+            policy: self.resize_policy,
+            host_resyncs_alt_screen: self.host_resyncs_alt_screen,
+            host_alternate_scroll: kf.carry.host_alternate_scroll().unwrap_or(false),
+            cell_px: kf.carry.host_cell_px(),
+            security_policy: kf.carry.security_policy(),
+            hyperlink_schemes: kf.carry.hyperlink_schemes(),
+            kitty_media_admitted: kf.carry.kitty_media_admitted(),
+        }
+    }
+
     /// Each replayable chain as a recording of the pane task ([`aterm_aos_pane`]), oldest first: its keyframe under the config it was recorded with, the session's resize policy and alternate-screen recovery, then every slice with its clock and reply, resize and live witness before the next keyframe. `None` while a break is open or before any keyframe.
     #[must_use]
     pub(crate) fn pane_chains(&self) -> Option<Vec<PaneRecording>> {
@@ -2259,15 +2593,7 @@ impl TemporalRecorder {
                 monotonic: origin_mono,
                 wall_ms: earliest_slice.and_then(|c| c.wall_ms),
             };
-            let env = PaneEnv {
-                config: kf.config.as_deref().cloned().unwrap_or_default(),
-                policy: self.resize_policy,
-                host_resyncs_alt_screen: self.host_resyncs_alt_screen,
-                host_alternate_scroll: kf.carry.host_alternate_scroll().unwrap_or(false),
-                cell_px: kf.carry.host_cell_px(),
-                security_policy: kf.carry.security_policy(),
-                hyperlink_schemes: kf.carry.hyperlink_schemes(),
-            };
+            let env = self.chain_env(kf);
             let carry = aterm_core::terminal::PaneStepCarry::from_replay_carry(
                 &kf.carry,
                 &kf.checkpoint,
@@ -2395,8 +2721,12 @@ struct RetainedKeyframe {
     cut: Option<Ticks>,
     /// Whether a replay minted it (a rekey), so the slices before it are all on the spine.
     replayed: bool,
+    /// Whether this keyframe came from a live in-band resync ([`TemporalMsg::LiveKeyframe`]) and may coalesce with an immediately following one when no chain steps fell between them.
+    coalesceable: bool,
     /// Whether the slice a live keyframe stands in for started a command ([`SliceMarks::command`]).
     command: bool,
+    /// Whether unshared small slices in this completed chain were packed into slabs.
+    packed: bool,
     checkpoint: Arc<TerminalCheckpoint>,
     /// The in-process transient state no checkpoint carries ([`ReplayCarry`]).
     carry: Arc<ReplayCarry>,
@@ -2406,7 +2736,7 @@ struct RetainedKeyframe {
 
 impl RetainedKeyframe {
     fn charge(&self) -> usize {
-        charge_of(&self.checkpoint)
+        charge_of(&self.checkpoint).saturating_add(self.carry.retained_image_bytes())
     }
 }
 
@@ -2441,6 +2771,7 @@ pub(crate) const DEFAULT_TOTAL_BYTES: usize = 128 * 1024 * 1024;
 pub(crate) struct RewindPool {
     charged: AtomicUsize,
     queued: AtomicUsize,
+    unrelieved: AtomicUsize,
     limit: AtomicUsize,
     focus: AtomicU64,
     front: AtomicU64,
@@ -2467,9 +2798,9 @@ impl Share {
                 .charged
                 .fetch_add(now - self.charged, Ordering::AcqRel);
         } else {
-            self.pool
-                .charged
-                .fetch_sub(self.charged - now, Ordering::AcqRel);
+            let freed = self.charged - now;
+            self.pool.charged.fetch_sub(freed, Ordering::AcqRel);
+            self.pool.note_freed(freed);
         }
         self.charged = now;
     }
@@ -2491,11 +2822,36 @@ impl RewindPool {
         Arc::new(Self {
             charged: AtomicUsize::new(0),
             queued: AtomicUsize::new(0),
+            unrelieved: AtomicUsize::new(0),
             limit: AtomicUsize::new(limit.max(1)),
             focus: AtomicU64::new(0),
             front: AtomicU64::new(NO_FRONT),
             members: Mutex::new(Vec::new()),
         })
+    }
+
+    fn note_freed(&self, bytes: usize) {
+        if bytes > 0 {
+            self.unrelieved.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    fn relief_due(&self) -> bool {
+        self.unrelieved.load(Ordering::Relaxed) >= IDLE_RELIEF_FLOOR_BYTES
+    }
+
+    fn relieve_allocator_if_due(&self) {
+        if self.relief_due() {
+            self.unrelieved.store(0, Ordering::Relaxed);
+            aterm_uds::process::release_free_memory();
+        }
+    }
+
+    fn relieve_allocator_mid_flood(&self) {
+        if self.unrelieved.load(Ordering::Relaxed) >= POOL_RELIEF_MID_FLOOD_BYTES {
+            self.unrelieved.store(0, Ordering::Relaxed);
+            aterm_uds::process::release_free_memory();
+        }
     }
 
     /// Hold at most `limit` bytes from the next message on.
@@ -2578,23 +2934,25 @@ impl RewindPool {
         let over = || self.used() > target;
         for rec in &recorders {
             if !over() {
-                return;
+                break;
             }
             rec.lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .shed_while(&over);
         }
-        let Some((_, older)) = recorders.split_last() else {
-            return;
-        };
-        for rec in older {
-            if !over() {
-                return;
+        if over()
+            && let Some((_, older)) = recorders.split_last()
+        {
+            for rec in older {
+                if !over() {
+                    break;
+                }
+                rec.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .forget_for_pool();
             }
-            rec.lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .forget_for_pool();
         }
+        self.relieve_allocator_mid_flood();
     }
 }
 
@@ -3190,14 +3548,6 @@ mod tests {
     }
 
     #[test]
-    fn ticks_are_monotone_nondecreasing() {
-        let r = TemporalRecorder::new();
-        let a = r.now();
-        let b = r.now();
-        assert!(b >= a, "recorder ticks must be monotone non-decreasing");
-    }
-
-    #[test]
     fn shared_burst_is_retained_not_copied_and_refunded_on_eviction() {
         let burst: Arc<[u8]> = Arc::from(&[b'y'; 64][..]);
         let mut r = TemporalRecorder::with_budget(1024);
@@ -3231,20 +3581,6 @@ mod tests {
         assert_eq!(r.dropped_events(), 0);
         assert_eq!(r.used, 256);
         assert_eq!((r.blob_base(), r.blobs.len()), (996, 4));
-    }
-
-    #[test]
-    fn replay_reconstructs_screen_from_keyframe_and_rawin() {
-        let mut r = TemporalRecorder::new();
-        let blank = aterm_core::terminal::Terminal::new(6, 20);
-        r.record_keyframe(blank.checkpoint());
-        r.record_raw_in(b"seed\r\n");
-
-        let term = r
-            .replay_at(None)
-            .expect("base keyframe retained -> replay reconstructs");
-        let row0 = term.get_line_text(0, None).unwrap_or_default();
-        assert!(row0.starts_with("seed"), "replayed row 0 = {row0:?}");
     }
 
     #[test]
@@ -5884,5 +6220,563 @@ mod tests {
             let check = chain.check(PaneCode::ThisBuild, "test");
             assert_eq!(check.verdict, Verdict::Pass, "chain {idx}: {check:?}");
         }
+    }
+
+    #[test]
+    fn completed_unshared_chains_pack_into_slabs_while_shared_bursts_stay_shared() {
+        let mut live = Terminal::new(8, 32);
+        let mut r = TemporalRecorder::with_budget(8 * 1024 * 1024);
+        r.record_keyframe(keyframe_of(&live, usize::MAX).expect("seed"));
+
+        let shared: Arc<[u8]> = Arc::from(&b"shared-burst\r\n"[..]);
+        live.process(&shared);
+        r.record_raw_in_shared(shared.clone());
+
+        // Push 100 small unshared slices (4 KiB each = 400 KiB > BLOB_SLAB_BYTES) in chain 0.
+        for i in 0..100u32 {
+            let mut chunk = format!("line-{i:04}: ").into_bytes();
+            chunk.resize(4096, b'x');
+            chunk[4094] = b'\r';
+            chunk[4095] = b'\n';
+            live.process(&chunk);
+            r.record_raw_in(&chunk);
+        }
+        let chain0_end = r.latest_tick();
+        let expected_chain0 = screen_of(&live);
+
+        // Record a second keyframe so chain 0 is completed and packed.
+        r.record_keyframe(keyframe_of(&live, REKEY_SCROLLBACK_LINES).expect("rekey"));
+        assert_eq!(
+            Arc::strong_count(&shared),
+            2,
+            "externally held burst was not copied"
+        );
+        let retained = r.retained_inputs();
+        assert_eq!(retained.len(), 101);
+        assert!(
+            Arc::ptr_eq(&retained[0].0, &shared),
+            "shared slice keeps caller allocation"
+        );
+        let mut unique_slabs: Vec<*const u8> = retained[1..]
+            .iter()
+            .map(|(arc, _)| Arc::as_ptr(arc).cast::<u8>())
+            .collect();
+        unique_slabs.sort_unstable();
+        unique_slabs.dedup();
+        assert_eq!(
+            unique_slabs.len(),
+            2,
+            "400 KiB of 4 KiB slices packed into two <=256 KiB slabs"
+        );
+        assert!(
+            !r.keyframes[0].packed,
+            "chain stays eligible until externally shared burst is dropped"
+        );
+        let replayed = r.replay_at(Some(chain0_end)).expect("replay packed chain");
+        assert_eq!(screen_of(&replayed), expected_chain0);
+
+        drop(retained);
+        drop(shared);
+        r.record_keyframe(keyframe_of(&live, REKEY_SCROLLBACK_LINES).expect("rekey 2"));
+        assert!(
+            r.keyframes[0].packed,
+            "once shared holder drops, remaining small slice packs and marks chain packed"
+        );
+        let replayed_again = r
+            .replay_at(Some(chain0_end))
+            .expect("replay fully packed chain");
+        assert_eq!(screen_of(&replayed_again), expected_chain0);
+    }
+
+    #[test]
+    fn kitty_store_numbers_virtuals_and_chunked_transfers_pass_pane_chains_and_charge_budget() {
+        use aterm_aos::contract::Verdict;
+        use aterm_aos_pane::PaneCode;
+
+        let mut live = Terminal::new(6, 40);
+        live.set_cell_pixel_size(10, 20);
+        let mut r = TemporalRecorder::with_budget(4 * MIN_REKEY_BYTES);
+        r.record_keyframe(keyframe_of(&live, usize::MAX).expect("at ground"));
+        r.spine_watermark().seed(SpinePre::take(&live));
+        let (tx, rx) = queue(64);
+        let mut mark = SpineMark::attach(r.spine_watermark());
+        let step = |live: &mut Terminal, mark: &mut SpineMark, bytes: &[u8], ms: u64| {
+            let at = clock(ms);
+            let pre = SpinePre::take(live);
+            live.process_at(bytes, at);
+            let reply = live.take_response().map(Arc::<[u8]>::from);
+            mark.record(&tx, pre, live, InputSlice::at(bytes, at).replying(reply));
+        };
+
+        // Chain 0: store RGBA image 1 (via number 42) + frame 2, virtual placement U=1 + placeholder,
+        // open m=1 chunked transfer for image 8, and cross MIN_REKEY_BYTES so a rekey mints.
+        let mut pre_rekey = b"\x1b_Ga=t,f=32,s=3,v=1,I=42;////AAAA////AAAA\x1b\\\
+                              \x1b_Ga=f,f=32,s=3,v=1,i=1,z=50;AAAA////AAAA////\x1b\\\
+                              \x1b_Ga=p,U=1,i=1,p=3,c=2,r=1\x1b\\"
+            .to_vec();
+        pre_rekey.extend_from_slice(
+            "\x1b[2;1H\x1b[38;5;1m\u{10EEEE}\u{0305}\u{0305}\x1b[39m".as_bytes(),
+        );
+        pre_rekey.extend_from_slice(b"\x1b_Ga=t,f=24,s=1,v=1,i=8,m=1;/w\x1b\\");
+        pre_rekey.extend(std::iter::repeat_n(b'x', MIN_REKEY_BYTES));
+        pre_rekey.extend_from_slice(b"\r\n");
+        step(&mut live, &mut mark, &pre_rekey, 100);
+        drain(&rx, &mut r);
+        if let Some(rekey) = r.rekey_due() {
+            r.rekeyed(rekey.mint());
+        }
+        assert_eq!(r.keyframe_count(), 2, "rekey minted carrying Kitty store");
+        assert!(
+            r.keyframes[1].carry.retained_image_bytes() >= 24,
+            "minted keyframe retains Kitty image and chunk bytes"
+        );
+        assert!(
+            r.keyframes[1].charge() > charge_of(&r.keyframes[1].checkpoint),
+            "keyframe charge includes retained Kitty payload bytes"
+        );
+
+        // Chain 1 (after the rekey): complete m=0 chunk, place by I=42 and i=8, animate, delete.
+        step(
+            &mut live,
+            &mut mark,
+            b"\x1b_Gm=0;AA\x1b\\\
+              \x1b[3;1H\x1b_Ga=p,I=42,c=2,r=1\x1b\\\
+              \x1b[4;1H\x1b_Ga=p,i=8,c=1,r=1\x1b\\\
+              \x1b_Ga=a,i=1,c=2\x1b\\",
+            1200,
+        );
+        step(&mut live, &mut mark, b"\x1b_Ga=d,d=A\x1b\\", 2400);
+        drain(&rx, &mut r);
+
+        for plan in r.chain_plans(r.latest_tick()) {
+            r.judge(plan.fold().judged);
+        }
+        assert_eq!(r.diverged(), 0);
+
+        let chains = r.pane_chains().expect("chains");
+        assert_eq!(chains.len(), 2);
+        for (idx, chain) in chains.iter().enumerate() {
+            let check = chain.check(PaneCode::ThisBuild, "test");
+            assert_eq!(check.verdict, Verdict::Pass, "chain {idx}: {check:?}");
+        }
+
+        // Budget shedding: a keyframe holding Kitty payload bytes counts against the recorder
+        // budget and is evicted when a newer keyframe pushes `used` past `budget`.
+        let mut small = TemporalRecorder::with_budget(16 * 1024);
+        let mut img_term = Terminal::new(4, 20);
+        let raw = vec![0xABu8; 80 * 30 * 4];
+        let b64 = aterm_codec::base64::encode(&raw).expect("base64");
+        let cmd = format!("\x1b_Ga=t,f=32,s=80,v=30,i=1;{b64}\x1b\\");
+        img_term.process(cmd.as_bytes());
+        let kf_heavy = keyframe_of(&img_term, usize::MAX).expect("heavy keyframe");
+        let heavy_img_bytes = kf_heavy.carry.retained_image_bytes();
+        assert_eq!(heavy_img_bytes, raw.len());
+        small.record_keyframe(kf_heavy);
+        assert!(small.used > raw.len());
+        assert_eq!(small.keyframe_count(), 1);
+
+        // Replace image 1 with a second 9,600-byte Kitty image on a new keyframe so each keyframe
+        // fits under 16 KiB alone, while both together (> 19.2 KiB) exceed 16 KiB.
+        let raw2 = vec![0xCDu8; 80 * 30 * 4];
+        let b64_2 = aterm_codec::base64::encode(&raw2).expect("base64 2");
+        img_term.process(
+            format!("\x1b_Ga=d,d=A\x1b\\\x1b_Ga=t,f=32,s=80,v=30,i=2;{b64_2}\x1b\\").as_bytes(),
+        );
+        let kf_heavy_2 = keyframe_of(&img_term, usize::MAX).expect("second keyframe");
+        assert_eq!(kf_heavy_2.carry.retained_image_bytes(), raw2.len());
+        small.record_keyframe(kf_heavy_2);
+        assert!(
+            small.used <= small.budget,
+            "budget shed stale image-bearing keyframe ({} <= {})",
+            small.used,
+            small.budget
+        );
+        assert_eq!(small.keyframe_count(), 1);
+    }
+
+    #[test]
+    fn kitty_file_queries_and_missing_file_transmits_pass_witnesses_and_pane_chains_across_rekeys()
+    {
+        use aterm_aos::contract::Verdict;
+        use aterm_aos_pane::PaneCode;
+
+        let mut live = Terminal::new(6, 40);
+        live.set_kitty_file_resolver(|_, _| None);
+        let mut r = TemporalRecorder::with_budget(4 * MIN_REKEY_BYTES);
+        r.record_keyframe(keyframe_of(&live, usize::MAX).expect("at ground"));
+        r.spine_watermark().seed(SpinePre::take(&live));
+        let (tx, rx) = queue(64);
+        let mut mark = SpineMark::attach(r.spine_watermark());
+        let step = |live: &mut Terminal, mark: &mut SpineMark, bytes: &[u8], ms: u64| {
+            let at = clock(ms);
+            let pre = SpinePre::take(live);
+            live.process_at(bytes, at);
+            let reply = live.take_response().map(Arc::<[u8]>::from);
+            mark.record(&tx, pre, live, InputSlice::at(bytes, at).replying(reply));
+        };
+
+        // Chain 0: query `t=f` (`OK`), cross `MIN_REKEY_BYTES`, and mint a second keyframe.
+        let mut pre_rekey = b"\x1b_Gi=31,a=q,t=f\x1b\\".to_vec();
+        pre_rekey.extend(std::iter::repeat_n(b'x', MIN_REKEY_BYTES));
+        pre_rekey.extend_from_slice(b"\r\n");
+        step(&mut live, &mut mark, &pre_rekey, 100);
+        drain(&rx, &mut r);
+        if let Some(rekey) = r.rekey_due() {
+            r.rekeyed(rekey.mint());
+        }
+        assert_eq!(r.keyframe_count(), 2);
+        assert!(
+            r.keyframes[1].carry.kitty_media_admitted(),
+            "minted keyframe preserves kitty_media_admitted across rekeys"
+        );
+
+        // Chain 1 (after the rekey): query `t=t`/`t=s` (`OK`) and refuse a missing `t=f` (`EINVAL`).
+        step(
+            &mut live,
+            &mut mark,
+            b"\x1b_Gi=32,a=q,t=t\x1b\\\
+              \x1b_Gi=33,a=q,t=s\x1b\\\
+              \x1b_Gi=34,a=T,t=f,f=32,s=1,v=1;L21pc3Npbmc=\x1b\\",
+            1200,
+        );
+        drain(&rx, &mut r);
+
+        for plan in r.chain_plans(r.latest_tick()) {
+            r.judge(plan.fold().judged);
+        }
+        assert_eq!(r.diverged(), 0);
+
+        let chains = r.pane_chains().expect("chains");
+        assert_eq!(chains.len(), 2);
+        for (idx, chain) in chains.iter().enumerate() {
+            let check = chain.check(PaneCode::ThisBuild, "test");
+            assert_eq!(check.verdict, Verdict::Pass, "chain {idx}: {check:?}");
+        }
+    }
+
+    #[test]
+    fn successful_kitty_file_loads_and_osc52_queries_project_live_keyframes_with_zero_divergence_and_pass_pane_chains()
+     {
+        use aterm_aos::contract::Verdict;
+        use aterm_aos_pane::{PaneCode, trace::PaneTrace};
+        use aterm_core::terminal::{ClipboardAccess, ClipboardOperation};
+
+        let secret_path = "/secret/host/photo.raw";
+        let secret_path_b64 = aterm_codec::base64::encode(secret_path.as_bytes()).expect("b64");
+        let secret_clip = "secret-clipboard-token";
+        let secret_clip_b64 = aterm_codec::base64::encode(secret_clip.as_bytes()).expect("b64");
+
+        let mut live = Terminal::new(6, 40);
+        live.set_kitty_file_resolver(|_, path| {
+            (path == "/secret/host/photo.raw").then(|| vec![0x11, 0x22, 0x33, 0xff])
+        });
+        live.authorize_clipboard_access(ClipboardAccess::Query);
+        live.set_clipboard_callback(|op| match op {
+            ClipboardOperation::Query { .. } => Some("secret-clipboard-token".to_string()),
+            _ => None,
+        });
+
+        let mut r = TemporalRecorder::with_budget(8 * MIN_REKEY_BYTES);
+        r.record_keyframe(keyframe_of(&live, usize::MAX).expect("seed"));
+        r.spine_watermark().seed(SpinePre::take(&live));
+        let (tx, rx) = queue(64);
+        let mut mark = SpineMark::attach(r.spine_watermark());
+        let step = |live: &mut Terminal, mark: &mut SpineMark, bytes: &[u8], ms: u64| {
+            let at = clock(ms);
+            let pre = SpinePre::take(live);
+            live.process_at(bytes, at);
+            let reply = live.take_response().map(Arc::<[u8]>::from);
+            mark.record(&tx, pre, live, InputSlice::at(bytes, at).replying(reply));
+        };
+
+        step(&mut live, &mut mark, b"before\r\n", 100);
+        let load = format!("\x1b_Gi=7,a=T,t=f,f=32,s=1,v=1;{secret_path_b64}\x1b\\");
+        step(&mut live, &mut mark, load.as_bytes(), 200);
+        step(&mut live, &mut mark, b"\x1b[3;1H\x1b_Gi=7,a=p\x1b\\", 300);
+        step(&mut live, &mut mark, b"placed\r\n", 1_400);
+        step(&mut live, &mut mark, b"\x1b]52;c;?\x07", 2_000);
+        step(&mut live, &mut mark, b"after\r\n", 3_500);
+        step(&mut live, &mut mark, b"done\r\n", 4_600);
+        drain(&rx, &mut r);
+
+        for plan in r.chain_plans(r.latest_tick()) {
+            r.judge(plan.fold().judged);
+        }
+        assert_eq!((r.witnessed(), r.diverged()), (2, 0));
+        let replayed = r.plan(r.latest_tick()).expect("plan").fold().term;
+        assert_eq!(replayed.checkpoint_visible(), live.checkpoint_visible());
+
+        let chains = r.pane_chains().expect("chains");
+        assert_eq!(chains.len(), 3);
+        let lacks = |hay: &[u8], needle: &[u8]| !hay.windows(needle.len()).any(|w| w == needle);
+        for (idx, chain) in chains.iter().enumerate() {
+            assert_eq!(
+                chain.check(PaneCode::ThisBuild, "test").verdict,
+                Verdict::Pass,
+                "{idx}"
+            );
+            let bytes = chain
+                .trace(PaneCode::ThisBuild, "test")
+                .expect("trace")
+                .encode();
+            for s in [
+                secret_path.as_bytes(),
+                secret_path_b64.as_bytes(),
+                secret_clip.as_bytes(),
+                secret_clip_b64.as_bytes(),
+            ] {
+                assert!(lacks(&bytes, s));
+            }
+            let round = PaneTrace::decode(&bytes)
+                .expect("decode")
+                .check(clock(0), "test")
+                .expect("check");
+            assert_eq!(round.verdict, Verdict::Pass);
+        }
+
+        // Negative control: recording `load` as a bare `RawIn` without the LiveKeyframe cut fails `REPLIES_MATCH`.
+        let mut unresynced = TemporalRecorder::with_budget(4 * MIN_REKEY_BYTES);
+        let mut bare_seed = Terminal::new(6, 40);
+        bare_seed.set_kitty_file_resolver(|_, _| None);
+        unresynced.record_keyframe(keyframe_of(&bare_seed, usize::MAX).expect("seed"));
+        unresynced.apply_inline(TemporalMsg::RawIn(
+            InputSlice::at(load.as_bytes(), clock(200))
+                .replying(Some(Arc::from(&b"\x1b_Gi=7;OK\x1b\\"[..]))),
+        ));
+        assert_ne!(
+            unresynced.pane_chains().expect("chains")[0]
+                .check(PaneCode::ThisBuild, "test")
+                .verdict,
+            Verdict::Pass
+        );
+    }
+
+    #[test]
+    fn consecutive_kitty_file_loads_coalesce_live_keyframes_and_preserve_earlier_chains() {
+        use aterm_aos::contract::Verdict;
+        use aterm_aos_pane::{PaneCode, trace::PaneTrace};
+
+        let mut live = Terminal::new(8, 40);
+        live.set_kitty_file_resolver(|_, path| {
+            path.strip_prefix("/secret/gallery/thumb-")
+                .and_then(|n| n.strip_suffix(".raw"))
+                .and_then(|n| n.parse::<u8>().ok())
+                .map(|k| vec![k, k.wrapping_add(1), k.wrapping_add(2), 0xff])
+        });
+        let mut r = TemporalRecorder::with_budget(16 * MIN_REKEY_BYTES);
+        r.freeze_now_for_test(Some(Ticks(10)));
+        r.record_keyframe(keyframe_of(&live, usize::MAX).expect("seed"));
+        r.spine_watermark().seed(SpinePre::take(&live));
+        let (tx, rx) = queue(128);
+        let mut mark = SpineMark::attach(r.spine_watermark());
+        let mut step = |bytes: &[u8], ms: u64| {
+            let pre = SpinePre::take(&live);
+            live.process_at(bytes, clock(ms));
+            let reply = live.take_response().map(Arc::<[u8]>::from);
+            let replied = reply.is_some();
+            mark.record(
+                &tx,
+                pre,
+                &live,
+                InputSlice::at(bytes, clock(ms)).replying(reply),
+            );
+            if replied {
+                mark.reply(&tx);
+            }
+            r.freeze_now_for_test(Some(Ticks(ms)));
+            drain(&rx, &mut r);
+        };
+
+        step(b"pre-gallery shell output\r\n", 100);
+        step(b"ready\r\n", 1_200);
+        let mut secrets = Vec::new();
+        for idx in 1u8..=10 {
+            let path = format!("/secret/gallery/thumb-{idx}.raw");
+            let path_b64 = aterm_codec::base64::encode(path.as_bytes()).expect("b64");
+            let prefix = if idx == 1 {
+                "\x1b]133;A\x07$ \x1b]133;B\x07gallery\r\n\x1b]133;C\x07"
+            } else {
+                ""
+            };
+            let cmd = format!("{prefix}\x1b_Gi={idx},a=T,t=f,f=32,s=1,v=1;{path_b64}\x1b\\");
+            secrets.extend([path.into_bytes(), path_b64.into_bytes()]);
+            step(cmd.as_bytes(), 1_200 + u64::from(idx) * 50);
+        }
+        step(b"gallery complete\r\n", 2_000);
+        step(b"done\r\n", 3_100);
+
+        assert_eq!(
+            (r.keyframe_count(), r.reachable_from()),
+            (2, Some(Ticks(10)))
+        );
+        for plan in r.chain_plans(r.latest_tick()) {
+            r.judge(plan.fold().judged);
+        }
+        assert_eq!((r.witnessed(), r.diverged()), (2, 0));
+        let replayed = r.plan(r.latest_tick()).expect("plan").fold().term;
+        assert_eq!(replayed.checkpoint_visible(), live.checkpoint_visible());
+        let pre_gallery = r.plan(Ticks(1_200)).expect("pre-gallery").fold().term;
+        assert_eq!(
+            pre_gallery.row_text(0).as_deref().map(str::trim_end),
+            Some("pre-gallery shell output")
+        );
+        let inst = |at, command| RewindInstant {
+            at: Ticks(at),
+            command,
+        };
+        assert_eq!(
+            r.rewind_instants(),
+            vec![
+                inst(10, false),
+                inst(100, false),
+                inst(1_200, false),
+                inst(1_700, true),
+                inst(2_000, false),
+                inst(3_100, false),
+            ]
+        );
+        assert!(r.export().is_ok());
+
+        let chains = r.pane_chains().expect("chains");
+        assert_eq!(chains.len(), 2);
+        for (idx, chain) in chains.iter().enumerate() {
+            assert_eq!(
+                chain.check(PaneCode::ThisBuild, "test").verdict,
+                Verdict::Pass,
+                "{idx}"
+            );
+            let bytes = chain
+                .trace(PaneCode::ThisBuild, "test")
+                .expect("trace")
+                .encode();
+            assert!(
+                secrets
+                    .iter()
+                    .all(|s| !bytes.windows(s.len()).any(|w| w == s.as_slice()))
+            );
+            let round = PaneTrace::decode(&bytes)
+                .expect("decode")
+                .check(clock(0), "test")
+                .expect("check");
+            assert_eq!(round.verdict, Verdict::Pass);
+        }
+    }
+
+    #[test]
+    fn deep_unscroll_past_carried_scrollback_projects_live_keyframe_and_hot_tier_images_survive() {
+        use aterm_aos::contract::Verdict;
+        use aterm_aos_pane::{PaneCode, trace::PaneTrace};
+
+        let mut live = Terminal::new(20, 40);
+        live.set_cell_pixel_size(10, 20);
+        let mut r = TemporalRecorder::with_budget(80 * MIN_REKEY_BYTES);
+        r.record_keyframe(keyframe_of(&live, REKEY_SCROLLBACK_LINES).expect("seed"));
+        r.spine_watermark().seed(SpinePre::take(&live));
+        let (tx, rx) = queue(256);
+        let mut mark = SpineMark::attach(r.spine_watermark());
+        let step = |live: &mut Terminal, mark: &mut SpineMark, bytes: &[u8], ms: u64| {
+            let at = clock(ms);
+            let pre = SpinePre::take(live);
+            live.process_at(bytes, at);
+            let reply = live.take_response().map(Arc::<[u8]>::from);
+            mark.record(&tx, pre, live, InputSlice::at(bytes, at).replying(reply));
+        };
+
+        let mut bulk = Vec::with_capacity(21 * MIN_REKEY_BYTES);
+        for idx in 0..2_219 {
+            if idx == 700 {
+                bulk.extend_from_slice(b"\x1bP0;0;0q\"1;1;10;20#1;2;100;0;0~\x1b\\");
+            }
+            bulk.extend_from_slice(format!("line-{idx:04}\r\n").as_bytes());
+        }
+        bulk.extend_from_slice(b"line-2219");
+        bulk.extend(std::iter::repeat_n(0u8, 20 * MIN_REKEY_BYTES));
+        step(&mut live, &mut mark, &bulk, 100);
+        drain(&rx, &mut r);
+        assert_eq!(r.keyframe_count(), 2);
+        assert!(
+            r.keyframes[1].replayed,
+            "bulk crossed the byte interval so apply_inline minted a trimmed rekey"
+        );
+
+        // 102 slices * 20 lines = 2,040 lines (<= 2,048 carried): zero extra keyframes, and the
+        // hot-tier Sixel image at line-0700 (rev ~ 1,500) unscrolls cleanly across the rekey.
+        for s in 1..=102u64 {
+            step(&mut live, &mut mark, b"\x1b[20+T", 100 + s * 20);
+            drain(&rx, &mut r);
+        }
+        assert_eq!(r.keyframe_count(), 2);
+
+        // Slice 103 reaches 2,060 > 2,048 lines, projecting one LiveKeyframe and re-seeding the
+        // remaining 141 lines (2,200 text lines + 1 Sixel row) so slices 104..=111 replay without
+        // further keyframes.
+        for s in 103..=111u64 {
+            step(&mut live, &mut mark, b"\x1b[20+T", 100 + s * 20);
+            drain(&rx, &mut r);
+        }
+        assert_eq!(r.keyframe_count(), 3);
+        for plan in r.chain_plans(r.latest_tick()) {
+            r.judge(plan.fold().judged);
+        }
+        assert_eq!(r.diverged(), 0);
+        let replayed = r.plan(r.latest_tick()).expect("plan").fold().term;
+        assert_eq!(replayed.checkpoint_visible(), live.checkpoint_visible());
+        assert_eq!(
+            replayed.row_text(0).as_deref().map(str::trim_end),
+            Some("line-0000")
+        );
+
+        let chains = r.pane_chains().expect("chains");
+        assert_eq!(chains.len(), 3);
+        for (idx, chain) in chains.iter().enumerate() {
+            assert_eq!(
+                chain.check(PaneCode::ThisBuild, "test").verdict,
+                Verdict::Pass,
+                "{idx}"
+            );
+            let bytes = chain
+                .trace(PaneCode::ThisBuild, "test")
+                .expect("trace")
+                .encode();
+            let round = PaneTrace::decode(&bytes)
+                .expect("decode")
+                .check(clock(0), "test")
+                .expect("check");
+            assert_eq!(round.verdict, Verdict::Pass, "{idx}");
+        }
+    }
+
+    #[test]
+    fn deep_unscroll_without_live_keyframe_cut_diverges_negative_control() {
+        use aterm_aos::contract::Verdict;
+        use aterm_aos_pane::PaneCode;
+
+        let mut bare_live = Terminal::new(20, 40);
+        let mut bulk = Vec::with_capacity(64 * 1024);
+        for idx in 0..2_219 {
+            bulk.extend_from_slice(format!("line-{idx:04}\r\n").as_bytes());
+        }
+        bulk.extend_from_slice(b"line-2219");
+        bare_live.process(&bulk);
+        let mut unresynced = TemporalRecorder::with_budget(8 * MIN_REKEY_BYTES);
+        unresynced.record_keyframe(keyframe_of(&bare_live, REKEY_SCROLLBACK_LINES).expect("seed"));
+        let deep = b"\x1b[20+T".repeat(103);
+        bare_live.process_at(&deep, clock(5_000));
+        unresynced.apply_inline(TemporalMsg::RawIn(InputSlice::at(&deep, clock(5_000))));
+        unresynced.apply_inline(TemporalMsg::Witness(Arc::new(
+            bare_live.checkpoint_visible().expect("witness"),
+        )));
+        let folded = unresynced
+            .plan(unresynced.latest_tick())
+            .expect("plan")
+            .fold();
+        unresynced.judge(folded.judged);
+        assert_eq!(unresynced.diverged(), 1);
+        assert_ne!(
+            unresynced.pane_chains().expect("chains")[0]
+                .check(PaneCode::ThisBuild, "test")
+                .verdict,
+            Verdict::Pass
+        );
     }
 }

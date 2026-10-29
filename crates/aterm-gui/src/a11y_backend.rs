@@ -35,14 +35,22 @@ pub(crate) fn notice_lines(msg: &aterm_messages::Message) -> Vec<String> {
     std::iter::once(head).chain(detail.cloned()).collect()
 }
 
-/// Reports a dead accessibility publisher to stderr, the message inbox, and the log.
-pub(crate) fn report_failure(reason: &str, location: &str) {
-    let msg = crate::message_reporters::a11y_publisher_dead(reason, at_client_seen());
+/// Reports a dead accessibility publisher (its panic's `payload` text) to stderr and the message
+/// inbox, which name its reason, and to the log, which names the panic's kind and length: the
+/// reason can quote the accessibility text, a session's screen (DESIGN §3.6).
+pub(crate) fn report_failure(payload: &str, location: &str) {
+    let msg = crate::message_reporters::a11y_publisher_dead(
+        reason_from_payload(payload),
+        at_client_seen(),
+    );
     for line in notice_lines(&msg) {
         crate::logging::stderr_line!("aterm-gui: {line}");
     }
     crate::message_inbox::queue_message(msg);
-    aterm_log::error!("accessibility publisher failed at {location}: {reason}");
+    aterm_log::error!(
+        "accessibility publisher failed at {location}: {}",
+        aterm_log::words::Panic::of_text(payload)
+    );
 }
 
 static AT_CLIENT_SEEN: AtomicBool = AtomicBool::new(false);

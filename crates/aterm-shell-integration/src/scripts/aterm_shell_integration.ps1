@@ -78,21 +78,42 @@ if ($HOME) {
     }
 }
 
+# Set `$env:EDITOR` to `$env:ATERM_DEFAULT_EDITOR` (aterm's own editor, amacs)
+# only when neither EDITOR nor VISUAL is set once the profiles have run (aterm
+# dot-sources this file after them) and the word names a program on PATH; drop
+# the hint either way, so no child inherits it.
+$__aterm_word = $env:ATERM_DEFAULT_EDITOR
+Remove-Item -LiteralPath Env:ATERM_DEFAULT_EDITOR -ErrorAction SilentlyContinue
+if ($__aterm_word -and -not $env:EDITOR -and -not $env:VISUAL -and
+    (Get-Command -Name $__aterm_word -CommandType Application -ErrorAction SilentlyContinue)) {
+    $env:EDITOR = $__aterm_word
+}
+Remove-Variable -Name __aterm_word -ErrorAction SilentlyContinue
+
 # Move `$env:ATPKG_AGENTS` and `$env:ATERM_REROUTE_DIR` to the front of PATH
 # (reroute first, then agents) so user profile additions cannot shadow them, and
 # record the expected prefix in `$Global:__aterm_managed_want`.
 $Global:__aterm_managed_want = @()
+$Global:__aterm_managed_bin_on = $false
 $Global:__aterm_managed_agents_on = $false
 $Global:__aterm_managed_reroute_on = $false
 function Global:__aterm_reroute_path_front {
     $Global:__aterm_managed_want = @()
+    $Global:__aterm_managed_bin_on = $false
     $Global:__aterm_managed_agents_on = $false
     $Global:__aterm_managed_reroute_on = $false
+    if ($env:ATPKG_AGENTS -and $env:ATPKG_BIN -and ([System.IO.Path]::GetDirectoryName($env:ATPKG_BIN.TrimEnd('/\')) -eq [System.IO.Path]::GetDirectoryName($env:ATPKG_AGENTS.TrimEnd('/\'))) -and (Test-Path -LiteralPath $env:ATPKG_BIN -PathType Container)) {
+        $__aterm_sep = [string][System.IO.Path]::PathSeparator
+        $__aterm_rest = @(($env:PATH -split [regex]::Escape($__aterm_sep)) | Where-Object { $_ -ne $env:ATPKG_BIN })
+        $env:PATH = (@($env:ATPKG_BIN) + $__aterm_rest) -join $__aterm_sep
+        $Global:__aterm_managed_want = @($env:ATPKG_BIN)
+        $Global:__aterm_managed_bin_on = $true
+    }
     if ($env:ATPKG_AGENTS -and (Test-Path -LiteralPath $env:ATPKG_AGENTS -PathType Container)) {
         $__aterm_sep = [string][System.IO.Path]::PathSeparator
         $__aterm_rest = @(($env:PATH -split [regex]::Escape($__aterm_sep)) | Where-Object { $_ -ne $env:ATPKG_AGENTS })
         $env:PATH = (@($env:ATPKG_AGENTS) + $__aterm_rest) -join $__aterm_sep
-        $Global:__aterm_managed_want = @($env:ATPKG_AGENTS)
+        $Global:__aterm_managed_want = @($env:ATPKG_AGENTS) + $Global:__aterm_managed_want
         $Global:__aterm_managed_agents_on = $true
     }
     if ($env:ATERM_REROUTE_DIR -and (Test-Path -LiteralPath $env:ATERM_REROUTE_DIR -PathType Container)) {
@@ -144,6 +165,7 @@ function Global:__aterm_managed_path_live {
     }
     # 2. Re-probe any managed dir that was previously absent.
     $__aterm_refront = $false
+    if ((-not $Global:__aterm_managed_bin_on) -and $env:ATPKG_AGENTS -and $env:ATPKG_BIN -and ([System.IO.Path]::GetDirectoryName($env:ATPKG_BIN.TrimEnd('/\')) -eq [System.IO.Path]::GetDirectoryName($env:ATPKG_AGENTS.TrimEnd('/\'))) -and (Test-Path -LiteralPath $env:ATPKG_BIN -PathType Container)) { $__aterm_refront = $true }
     if ((-not $Global:__aterm_managed_agents_on) -and $env:ATPKG_AGENTS -and (Test-Path -LiteralPath $env:ATPKG_AGENTS -PathType Container)) { $__aterm_refront = $true }
     if (-not $Global:__aterm_managed_reroute_on) {
         if ($env:ATERM_REROUTE_DIR) {
@@ -267,14 +289,16 @@ function Global:Prompt {
     $__aterm_suffix = __aterm_id_suffix
     $__aterm_out = ''
 
-    # Emit OSC 133;D;exitcode only when a new history entry appeared since the last prompt.
+    # Emit OSC 133;D;exitcode only when a new history entry appeared since the last prompt,
+    # written at once: the user's prompt below may run a program (starship, oh-my-posh), and
+    # a program heard after D is never the command's.
     $__aterm_history = Get-History -Count 1
     $__aterm_hid = 0
     if ($null -ne $__aterm_history) { $__aterm_hid = $__aterm_history.Id }
     if (($null -ne $Global:__aterm_last_history_id) -and ($__aterm_hid -ne $Global:__aterm_last_history_id)) {
         $__aterm_code = 0
         if ((-not $__aterm_ok) -or (__aterm_history_failed $__aterm_history)) { $__aterm_code = __aterm_failed_code $__aterm_exit $__aterm_history }
-        $__aterm_out += "$__aterm_esc]133;D;$__aterm_code$__aterm_suffix$__aterm_bel"
+        [Console]::Write("$__aterm_esc]133;D;$__aterm_code$__aterm_suffix$__aterm_bel")
     }
     $Global:__aterm_last_history_id = $__aterm_hid
 

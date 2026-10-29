@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use super::{
     EXIT_TIMEOUT, TargetOrigin, answer_replacement, await_task, connect_served, drain_refusal_tail,
-    read_status_line, redial, replaced_before_reply, reply_is_timeout, request_line, send_served,
-    stderr_line, validate_request_line_len,
+    instant_after, read_status_line, redial, replaced_before_reply, reply_is_timeout, request_line,
+    send_served, stderr_line, validate_request_line_len,
 };
 
 /// A re-armed `[@<sel>] await inbox|agent|edit …`.
@@ -88,7 +88,11 @@ enum Leg {
 type LegFn<'a> = dyn FnMut(&str, TargetOrigin, &str, Duration) -> Leg + 'a;
 
 fn socket_leg(sock: &str, origin: TargetOrigin, request: &str, wait: Duration) -> Leg {
-    let stream = match connect_served(sock, origin, Some(wait + await_task::LEG_SLACK)) {
+    let stream = match connect_served(
+        sock,
+        origin,
+        Some(wait.saturating_add(await_task::LEG_SLACK)),
+    ) {
         Ok(Ok(stream)) => stream,
         Ok(Err(code)) => return Leg::Code(code),
         Err(e) => return Leg::Failed(e),
@@ -263,7 +267,7 @@ pub(crate) fn run_rearmed_await(
         (None, Some(flag)) => flag,
         (None, None) => Some(await_task::DEFAULT_TOTAL),
     };
-    let until = total.map(|t| Instant::now() + t);
+    let until = total.map(|t| instant_after(Instant::now(), t));
     wait_legs(
         &wait,
         sock,
@@ -452,5 +456,15 @@ mod tests {
             &mut |_: &str| Ok(()),
         );
         assert_eq!(cut.map_err(|e| e.kind()), Err(io::ErrorKind::UnexpectedEof));
+        assert!(
+            run_rearmed_await(
+                &parts("await inbox timeout=18446744073709551615"),
+                "/no/such/aterm-ctl-test.sock",
+                TargetOrigin::Pinned,
+                &redial::Redial::none(),
+                Some(Some(Duration::from_secs(u64::MAX))),
+            )
+            .is_err()
+        );
     }
 }

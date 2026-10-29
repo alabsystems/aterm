@@ -30,5 +30,12 @@ astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
 aterm-tempfile.workspace = true
 aterm-spec.workspace = true
 aterm-models-db.workspace = true
+
+[[example]]
+name = "commons_probe"
+path = "examples/commons_probe.rs"
+# Its unit tests (receiver reads, the live-config pause guard, the audit's classification) run with the crate's tests: verify's `--tests` selects only targets with test = true.
+test = true
+
 [lints]
 workspace = true

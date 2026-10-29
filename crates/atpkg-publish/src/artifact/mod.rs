@@ -4,6 +4,7 @@
 //! Artifact building, staging, relocation, and signing for `atpkg-publish`.
 
 pub mod arch;
+pub mod bottle;
 pub mod build_local;
 pub mod bundle;
 pub mod closure;

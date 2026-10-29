@@ -293,8 +293,9 @@ fn a_const_fn_anchor_reports_itself_unprobed_rather_than_lying() {
          demands execution evidence fails on an empty entry_id"
     );
     let _ = const_double(1);
-    assert!(
-        entered_anchor_ids().is_empty(),
+    assert_eq!(
+        entered_anchor_count(),
+        Some(0),
         "the const fn records nothing at all"
     );
 }

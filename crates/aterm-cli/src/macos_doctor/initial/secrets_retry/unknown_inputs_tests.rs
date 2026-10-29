@@ -17,6 +17,7 @@ fn reading(marks: Option<&str>, now: u64) -> Pace {
             subscriber: Some(false),
         })),
         materialization: None,
+        network: None,
         now,
     }
 }
@@ -71,6 +72,7 @@ fn an_unknown_record_preserves_the_same_runs_known_hold() {
     let root = root.path();
     let mut known = reading(Some("known-network-and-vault"), 1_000);
     known.materialization = Some(materialization());
+    known.network = Some("gw-a".into());
     failed(root, REVISION, &known);
     known.now += FIRST_PAUSE.as_secs();
     failed(root, REVISION, &known);
@@ -81,6 +83,7 @@ fn an_unknown_record_preserves_the_same_runs_known_hold() {
     let cached = Attempt::load(root).unwrap();
     assert_eq!(cached.marks, known.marks);
     assert_eq!(cached.materialization, known.materialization);
+    assert_eq!(cached.network, known.network);
     assert_eq!(cached.failures, TRIES + 1);
     known.now = 20_000;
     assert!(paused(root, REVISION, &known).is_some());
@@ -89,6 +92,7 @@ fn an_unknown_record_preserves_the_same_runs_known_hold() {
     let next = Attempt::load(root).unwrap();
     assert_eq!(next.marks, None);
     assert_eq!(next.materialization, None);
+    assert_eq!(next.network, None);
     assert_eq!(next.failures, 1);
 }
 
@@ -116,6 +120,7 @@ fn a_partial_network_change_reopens_without_unknown_materialization_rearming_it(
     let root = root.path();
     let mut known = reading(Some("network-a"), 1_000);
     known.materialization = Some(materialization());
+    known.network = Some("gw-a".into());
     failed(root, REVISION, &known);
     known.now += FIRST_PAUSE.as_secs();
     failed(root, REVISION, &known);
@@ -128,6 +133,7 @@ fn a_partial_network_change_reopens_without_unknown_materialization_rearming_it(
     assert_eq!(cached.failures, 1);
     assert_eq!(cached.marks, None);
     assert_eq!(cached.materialization, known.materialization);
+    assert_eq!(cached.network, None);
     let cached_inputs = cached.inputs.unwrap();
     assert_eq!(cached_inputs.routes.as_deref(), Some("network-b"));
     assert_eq!(cached_inputs.vault, known.inputs.as_ref().unwrap().vault);
@@ -148,11 +154,17 @@ fn a_known_post_change_retires_the_opaque_mark_but_keeps_independent_materializa
     for earlier in [None, Some("older-network-and-vault")] {
         let mut before = reading(earlier, 1_000);
         before.materialization = Some(materialization());
+        before.network = Some("gw-a".into());
+        let mut unknown_after = reading(None, 1_001);
+        unknown_after.retain_known_from(&before);
+        assert_eq!(unknown_after.network, before.network);
+
         let mut after = reading(None, 1_001);
         after.inputs.as_mut().unwrap().routes = Some("network-b".into());
         after.retain_known_from(&before);
         assert_eq!(after.marks, None);
         assert_eq!(after.materialization, before.materialization);
+        assert_eq!(after.network, None);
         assert_eq!(
             after.inputs.as_ref().unwrap().routes.as_deref(),
             Some("network-b")

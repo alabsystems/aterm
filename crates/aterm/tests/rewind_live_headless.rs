@@ -54,7 +54,7 @@ fn a_view_on_the_instant_before_a_clear_shows_that_screen_and_the_live_grid_stay
         .unwrap_or_else(|_| panic!("a latest_tick: {status}"));
 
     ctl.type_line("clear");
-    ctl.ok("await idle 500 timeout=60000");
+    ctl.ok("await gone ^row- timeout=60000");
     let cleared = trimmed(ctl.text());
     assert!(
         !cleared.iter().any(|row| row.starts_with("row-")),

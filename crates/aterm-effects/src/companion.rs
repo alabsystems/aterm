@@ -70,8 +70,9 @@ pub const fn cursor_cat_color_key(
     fallback_accent: u32,
 ) -> CatColorKey {
     const MAX_SAMPLES: u32 = 64;
+    let table = crate::color_math::relative_luminance_table();
     if geom.cell_w == 0 || geom.cell_h == 0 || cells.is_empty() {
-        return CatColorKey::from_rgb(fallback_bg, fallback_fg, fallback_accent);
+        return CatColorKey::from_rgb_with(table, fallback_bg, fallback_fg, fallback_accent);
     };
 
     let cw = geom.cell_w as i64;
@@ -87,7 +88,7 @@ pub const fn cursor_cat_color_key(
     let y1_cand = fy + (footprint.h as i64);
     let y1 = if y1_cand < y1_max { y1_cand } else { y1_max };
     if x1 <= x0 || y1 <= y0 {
-        return CatColorKey::from_rgb(fallback_bg, fallback_fg, fallback_accent);
+        return CatColorKey::from_rgb_with(table, fallback_bg, fallback_fg, fallback_accent);
     }
     let c0 = (x0 / cw) as usize;
     let c1 = ((x1 - 1) / cw) as usize;
@@ -107,32 +108,48 @@ pub const fn cursor_cat_color_key(
         fallback_bg as u8,
     ];
     let mut last_bg_rgb = [0u8; 3];
+    let mut fallback_band_opt: Option<u8> = None;
+    let cols_per_row = (c1 - c0 + 1) as u64;
     let mut row = r0;
     'rows: while row <= r1 {
-        let line = if row < cells.len() {
-            cells[row].as_slice()
-        } else {
-            &[]
-        };
+        if row >= cells.len() {
+            let rem_rows = (r1 - row + 1) as u64;
+            let rem_raw = rem_rows * cols_per_row;
+            let rem_cap = (MAX_SAMPLES - sampled) as u64;
+            let rem_cells = (if rem_raw < rem_cap { rem_raw } else { rem_cap }) as u32;
+            if rem_cells > 0 {
+                let fallback_band = match fallback_band_opt {
+                    Some(b) => b,
+                    None => CatColorKey::background_band_with(table, fallback_bg),
+                };
+                if fallback_band < min_background_band {
+                    min_background_band = fallback_band;
+                }
+                if fallback_band > max_background_band {
+                    max_background_band = fallback_band;
+                }
+                bg_sum[0] += fallback_bg_rgb[0] as u32 * rem_cells;
+                bg_sum[1] += fallback_bg_rgb[1] as u32 * rem_cells;
+                bg_sum[2] += fallback_bg_rgb[2] as u32 * rem_cells;
+                sampled += rem_cells;
+            }
+            break 'rows;
+        }
+        let line = cells[row].as_slice();
+        let in_end = if c1 < line.len() { c1 + 1 } else { line.len() };
         let mut col = c0;
-        while col <= c1 {
-            let cell = if col < line.len() {
-                Some(&line[col])
-            } else {
-                None
-            };
-            let background_rgb = match cell {
-                Some(cell) => cell.bg,
-                None => fallback_bg_rgb,
-            };
+        while col < in_end {
+            let cell = &line[col];
+            let background_rgb = cell.bg;
             if sampled == 0
                 || background_rgb[0] != last_bg_rgb[0]
                 || background_rgb[1] != last_bg_rgb[1]
                 || background_rgb[2] != last_bg_rgb[2]
             {
-                let band = CatColorKey::background_band(crate::word_decorations::rgb3_to_u32(
-                    background_rgb,
-                ));
+                let band = CatColorKey::background_band_with(
+                    table,
+                    crate::word_decorations::rgb3_to_u32(background_rgb),
+                );
                 last_bg_rgb = background_rgb;
                 if band < min_background_band {
                     min_background_band = band;
@@ -145,10 +162,7 @@ pub const fn cursor_cat_color_key(
             bg_sum[1] += background_rgb[1] as u32;
             bg_sum[2] += background_rgb[2] as u32;
             sampled += 1;
-            if let Some(cell) = cell
-                && !cell.wide
-                && crate::word_decorations::is_ink_char(cell.ch)
-            {
+            if !cell.wide && crate::word_decorations::is_ink_char(cell.ch) {
                 if principal_fg.is_none() {
                     principal_fg = Some(cell.fg);
                 }
@@ -160,10 +174,36 @@ pub const fn cursor_cat_color_key(
             if sampled == MAX_SAMPLES {
                 break 'rows;
             }
-            if col == usize::MAX {
-                break;
-            }
             col += 1;
+        }
+        if col <= c1 {
+            let oob_raw = (c1 - col + 1) as u32;
+            let oob_cap = MAX_SAMPLES - sampled;
+            let oob = if oob_raw < oob_cap { oob_raw } else { oob_cap };
+            if oob > 0 {
+                let fallback_band = match fallback_band_opt {
+                    Some(b) => b,
+                    None => {
+                        let b = CatColorKey::background_band_with(table, fallback_bg);
+                        fallback_band_opt = Some(b);
+                        b
+                    }
+                };
+                if fallback_band < min_background_band {
+                    min_background_band = fallback_band;
+                }
+                if fallback_band > max_background_band {
+                    max_background_band = fallback_band;
+                }
+                last_bg_rgb = fallback_bg_rgb;
+                bg_sum[0] += fallback_bg_rgb[0] as u32 * oob;
+                bg_sum[1] += fallback_bg_rgb[1] as u32 * oob;
+                bg_sum[2] += fallback_bg_rgb[2] as u32 * oob;
+                sampled += oob;
+                if sampled == MAX_SAMPLES {
+                    break 'rows;
+                }
+            }
         }
         if row == usize::MAX {
             break;
@@ -171,7 +211,7 @@ pub const fn cursor_cat_color_key(
         row += 1;
     }
     if sampled == 0 {
-        return CatColorKey::from_rgb(fallback_bg, fallback_fg, fallback_accent);
+        return CatColorKey::from_rgb_with(table, fallback_bg, fallback_fg, fallback_accent);
     }
     let background =
         crate::word_decorations::rgb3_to_u32(crate::word_decorations::avg_rgb(bg_sum, sampled));
@@ -184,7 +224,8 @@ pub const fn cursor_cat_color_key(
     } else {
         crate::word_decorations::rgb3_to_u32(crate::word_decorations::avg_rgb(fg_sum, visible))
     };
-    CatColorKey::from_rgb_span(
+    CatColorKey::from_rgb_span_with(
+        table,
         background,
         foreground,
         surrounding,
@@ -318,9 +359,14 @@ pub const fn pet_pointer_cell(
     if cw == 0 || ch == 0 {
         return None;
     }
-    let col = (pointer_px.0 - origin.0 as f64) / cw as f64;
-    let row = (pointer_px.1 - origin.1 as f64) / ch as f64;
-    if col >= 0.0 && row >= 0.0 && col < grid.0 as f64 && row < grid.1 as f64 {
+    let dx = pointer_px.0 - origin.0 as f64;
+    let dy = pointer_px.1 - origin.1 as f64;
+    if !(dx >= 0.0 && dy >= 0.0) {
+        return None;
+    }
+    let col = dx / cw as f64;
+    let row = dy / ch as f64;
+    if col < grid.0 as f64 && row < grid.1 as f64 {
         Some((col as f32, row as f32))
     } else {
         None
@@ -524,6 +570,65 @@ pub struct PetFacts<'a> {
     pub pane: Option<(u64, (i32, i32))>,
     /// The room the pet lives in, `None` for a host that has none.
     pub room: Option<RoomFacts>,
+}
+
+impl<'a> PetFacts<'a> {
+    /// A focused, unobscured single-pane frame of `facts` and `host` under the trail verdict
+    /// `glow`, with no sing-along and no room; each `with_*` sets one field, and a field added
+    /// later takes its default here, so no host or harness literal changes (§15.1 P0.1).
+    #[inline]
+    #[must_use]
+    pub const fn new(
+        facts: &'a TerminalFacts,
+        host: &'a HostFrameInput,
+        glow: GlowOwnership,
+    ) -> Self {
+        Self {
+            facts,
+            host,
+            glow,
+            sing: SingFacts::EMPTY,
+            focused: true,
+            obscured: false,
+            pane: None,
+            room: None,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn with_sing(mut self, sing: SingFacts) -> Self {
+        self.sing = sing;
+        self
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn with_focused(mut self, focused: bool) -> Self {
+        self.focused = focused;
+        self
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn with_obscured(mut self, obscured: bool) -> Self {
+        self.obscured = obscured;
+        self
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn with_pane(mut self, pane: Option<(u64, (i32, i32))>) -> Self {
+        self.pane = pane;
+        self
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn with_room(mut self, room: Option<RoomFacts>) -> Self {
+        self.room = room;
+        self
+    }
 }
 
 /// The half-sensed frame [`CompanionOwner::prepare`] hands back.
@@ -1068,10 +1173,14 @@ impl CompanionOwner {
                     facts.session,
                     facts.wrap_serial,
                 );
-            if let Some((x, y)) = match host.pointer_px {
-                Some(p) => Some(p),
-                None => self.pointer_px,
-            } {
+            if focused
+                && visible
+                && self.hit_rect.is_some()
+                && let Some((x, y)) = match host.pointer_px {
+                    Some(p) => Some(p),
+                    None => self.pointer_px,
+                }
+            {
                 pointer = pet_pointer_cell(
                     (f64::from(x), f64::from(y)),
                     host.geometry.origin_px,
@@ -1176,18 +1285,23 @@ impl CompanionOwner {
     #[inline]
     pub fn offer_glass(&mut self, glass: impl IntoIterator<Item = PetGlass>) {
         let any_own = self.clear_own_glass_offers();
-        if self.resight_frame.is_none() && !any_own {
+        let want_resight = self.resight_frame.map(|f| f.glass);
+        if want_resight.is_none() && !any_own {
             return;
         }
         self.resight_offered = false;
         for g in glass {
-            self.resight_offered |= matches!(self.resight_frame, Some(f) if f.glass == g);
-            let mut i = 0;
-            while i < self.own_glass.len() {
-                if let Some(own) = &mut self.own_glass[i] {
-                    own.offered |= own.frame.glass == g;
+            if let Some(rg) = want_resight {
+                self.resight_offered |= rg == g;
+            }
+            if any_own {
+                let mut i = 0;
+                while i < self.own_glass.len() {
+                    if let Some(own) = &mut self.own_glass[i] {
+                        own.offered |= own.frame.glass == g;
+                    }
+                    i += 1;
                 }
-                i += 1;
             }
         }
     }
@@ -1208,6 +1322,7 @@ impl CompanionOwner {
             glass: t.glass,
         };
         let offered = std::mem::take(&mut self.resight_offered);
+        let mut any_own = false;
         let mut si = 0;
         while si < self.own_glass.len() {
             let slot = &mut self.own_glass[si];
@@ -1225,6 +1340,8 @@ impl CompanionOwner {
             {
                 self.pet.forget_own_glass(own.key);
                 *slot = None;
+            } else {
+                any_own = true;
             }
         }
         if let Some(drawn) = self.resight_frame.take() {
@@ -1250,6 +1367,7 @@ impl CompanionOwner {
                         frame: drawn,
                         offered: false,
                     });
+                    any_own = true;
                 } else {
                     self.pet.forget_resight();
                 }
@@ -1284,34 +1402,36 @@ impl CompanionOwner {
         self.last_alpha = if on_glass { pet_frame.alpha } else { 0 };
         self.drawn_frame = if on_glass { Some(frame_px) } else { None };
         self.last_visible = t.visible;
-        let mut si = 0;
-        while si < self.own_glass.len() {
-            if let Some(own) = self.own_glass[si]
-                && !self.pet.has_ghost_on_glass(own.key)
-            {
-                self.own_glass[si] = None;
-            }
-            si += 1;
-        }
         let mut glass = [None; crate::kitty_pet::PET_DEPARTURES_MAX];
-        let mut di = 0;
-        while di < crate::kitty_pet::PET_DEPARTURES_MAX {
-            if let Some(d) = &pet_frame.departures[di]
-                && d.own_glass
-            {
-                let key = d.glass;
-                let mut si = 0;
-                while si < self.own_glass.len() {
-                    if let Some(own) = &self.own_glass[si]
-                        && own.key == key
-                    {
-                        glass[di] = Some(own.frame.glass);
-                        break;
-                    }
-                    si += 1;
+        if any_own {
+            let mut si = 0;
+            while si < self.own_glass.len() {
+                if let Some(own) = self.own_glass[si]
+                    && !self.pet.has_ghost_on_glass(own.key)
+                {
+                    self.own_glass[si] = None;
                 }
+                si += 1;
             }
-            di += 1;
+            let mut di = 0;
+            while di < crate::kitty_pet::PET_DEPARTURES_MAX {
+                if let Some(d) = &pet_frame.departures[di]
+                    && d.own_glass
+                {
+                    let key = d.glass;
+                    let mut si = 0;
+                    while si < self.own_glass.len() {
+                        if let Some(own) = &self.own_glass[si]
+                            && own.key == key
+                        {
+                            glass[di] = Some(own.frame.glass);
+                            break;
+                        }
+                        si += 1;
+                    }
+                }
+                di += 1;
+            }
         }
         let companion = cursor_companion_on_glass(duty, t.painted_caret, None, body_px);
         CompanionFrame {
@@ -1423,7 +1543,11 @@ impl CompanionOwner {
             coat,
             iris,
             pet: t.pet,
-            page: if aterm_render::theme_is_dark(fallback.bg) {
+            page: if crate::color_math::relative_luminance_with(
+                crate::color_math::relative_luminance_table(),
+                fallback.bg,
+            ) < 0.22
+            {
                 None
             } else {
                 Some(fallback.bg)
@@ -2120,17 +2244,7 @@ mod owner_tests {
     };
 
     const fn host_at(now: Instant) -> HostFrameInput {
-        HostFrameInput {
-            now,
-            visibility: Visibility::Focused,
-            reduced_motion: false,
-            serious: false,
-            shed_envelope: 1.0,
-            shed_active: false,
-            pointer_px: None,
-            capture: CaptureMode::Present,
-            geometry: GRID,
-        }
+        HostFrameInput::new(now, GRID)
     }
 
     const fn facts_with(caret: Option<(u16, u16)>) -> TerminalFacts {
@@ -2161,16 +2275,54 @@ mod owner_tests {
     }
 
     const fn pet_facts<'a>(facts: &'a TerminalFacts, host: &'a HostFrameInput) -> PetFacts<'a> {
-        PetFacts {
-            facts,
-            host,
+        PetFacts::new(facts, host, pet_glow())
+    }
+
+    /// `new` is the literal a test host wrote, and each setter moves only its own field: the
+    /// constructor every host and harness builds a pet frame's facts through (§15.1 P0.1).
+    #[test]
+    fn pet_facts_built_by_new_are_the_literal() {
+        let facts = facts_with(Some((3, 4)));
+        let host = host_at(Instant::now());
+        let plain = PetFacts {
+            facts: &facts,
+            host: &host,
             glow: pet_glow(),
             sing: SingFacts::EMPTY,
             focused: true,
             obscured: false,
             pane: None,
             room: None,
-        }
+        };
+        let built = PetFacts::new(&facts, &host, pet_glow());
+        assert!(std::ptr::eq(built.facts, plain.facts) && std::ptr::eq(built.host, plain.host));
+        assert_eq!(format!("{built:?}"), format!("{plain:?}"));
+        let sing = SingFacts {
+            drive: 0.5,
+            flying_alpha: 9,
+        };
+        let every = PetFacts {
+            facts: &facts,
+            host: &host,
+            glow: GlowOwnership::NONE,
+            sing,
+            focused: false,
+            obscured: true,
+            pane: Some((7, (8, 9))),
+            room: Some(RoomFacts::EMPTY),
+        };
+        let built = PetFacts::new(&facts, &host, GlowOwnership::NONE)
+            .with_sing(sing)
+            .with_focused(false)
+            .with_obscured(true)
+            .with_pane(Some((7, (8, 9))))
+            .with_room(Some(RoomFacts::EMPTY));
+        assert_eq!(format!("{built:?}"), format!("{every:?}"));
+        assert_ne!(
+            format!("{plain:?}"),
+            format!("{every:?}"),
+            "control: the setters moved the facts off their defaults"
+        );
     }
 
     const fn an_enabled_owner() -> CompanionOwner {

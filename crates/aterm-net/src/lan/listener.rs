@@ -4,8 +4,8 @@
 //! A nonblocking listener configured before the kernel may answer a SYN.
 
 use super::{
-    Attachment, Connection, Scope, local_attachments, native, ready, refuse, same_subnet,
-    unambiguous, unicast,
+    Attachment, BindFailure, Connection, Scope, local_attachments, native, ready, refuse,
+    same_subnet, unambiguous, unicast,
 };
 use std::{
     io,
@@ -139,46 +139,60 @@ impl Listener {
     /// attachments are refused. LAN interface binding and one-hop limits are
     /// established before listen, including the kernel's initial SYN-ACK.
     pub fn bind(local: SocketAddr, scope: Scope) -> io::Result<Self> {
-        crate::loopback::check(crate::loopback::Reach::Listen(local))?;
+        Self::try_bind(local, scope).map_err(|failure| failure.error)
+    }
+
+    /// [`Self::bind`], saying of a failure whether it reached its socket ([`BindFailure`]): a
+    /// listener whose attachment changed before its re-check fails after its bind and listen.
+    pub fn try_bind(local: SocketAddr, scope: Scope) -> Result<Self, BindFailure> {
+        crate::loopback::check(crate::loopback::Reach::Listen(local))
+            .map_err(BindFailure::before)?;
         if scope == Scope::Lan && !remote_supported(local) {
-            return Err(io::Error::new(
+            return Err(BindFailure::before(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "IPv6 LAN listeners require inheritable hop limits on this platform",
-            ));
+            )));
         }
         let until = native::deadline();
         let attachment = match scope {
-            Scope::Lan => Some(select(local, &local_attachments(Some(local), None)?)?),
+            Scope::Lan => Some(
+                local_attachments(Some(local), None)
+                    .and_then(|attachments| select(local, &attachments))
+                    .map_err(BindFailure::before)?,
+            ),
             Scope::Loopback if unambiguous(local) && local.ip().is_loopback() => None,
             Scope::Loopback => {
-                return Err(refuse(
+                return Err(BindFailure::before(refuse(
                     "local listener requires an unambiguous loopback address",
-                ));
+                )));
             }
         };
-        let prepared = native::Prepared::new(
-            local,
-            attachment.as_ref().map(|a| (a.index, a.name.as_str())),
-            until,
-        )?;
-        let tcp = prepared.listen(|| {
-            if let Some(attachment) = &attachment
-                && select(local, &local_attachments(Some(local), None)?)? != *attachment
-            {
-                return Err(refuse("listener attachment changed before listen"));
-            }
-            Ok(())
-        })?;
-        let local = tcp.local_addr()?;
-        let listener = Self {
-            tcp,
-            local,
-            scope,
-            attachment,
-            withdrawn: Arc::new(AtomicBool::new(false)),
-        };
-        listener.recheck()?;
-        Ok(listener)
+        (|| {
+            let prepared = native::Prepared::new(
+                local,
+                attachment.as_ref().map(|a| (a.index, a.name.as_str())),
+                until,
+            )?;
+            let tcp = prepared.listen(|| {
+                if let Some(attachment) = &attachment
+                    && select(local, &local_attachments(Some(local), None)?)? != *attachment
+                {
+                    return Err(refuse("listener attachment changed before listen"));
+                }
+                Ok(())
+            })?;
+            let local = tcp.local_addr()?;
+            let listener = Self {
+                tcp,
+                local,
+                scope,
+                attachment,
+                withdrawn: Arc::new(AtomicBool::new(false)),
+            };
+            listener.recheck()?;
+            Ok(listener)
+        })()
+        .map_err(BindFailure::after)
     }
 
     /// The exact bound address, including the assigned ephemeral port.

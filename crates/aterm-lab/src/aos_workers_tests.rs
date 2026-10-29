@@ -124,7 +124,7 @@ fn fault_specs_parse_by_lease_and_refuse_by_reason() {
         ("late-lie@1.1.2", at(FaultKind::LateLie, 1, 1, 2)),
         ("dup@1.0.1", at(FaultKind::Dup, 1, 0, 1)),
         ("dup-lie@1.0.1", at(FaultKind::DupLie, 1, 0, 1)),
-        ("post-lie@1.5.1", at(FaultKind::PostLie, 1, 5, 1)),
+        ("close-lie@1.5.1", at(FaultKind::CloseLie, 1, 5, 1)),
         ("lie-refusal@1.0.1", at(FaultKind::LieRefusal, 1, 0, 1)),
         ("lie-best@1.1.1", at(FaultKind::LieBest, 1, 1, 1)),
         ("inflate@1.0.1", at(FaultKind::Inflate, 1, 0, 1)),
@@ -215,32 +215,38 @@ fn the_stderr_tail_is_bounded_and_counts_fired_faults() {
     assert_eq!(tail.bytes.len(), STDERR_TAIL);
 }
 
-/// `--lease-ms` overrides the window alone; the pool's size bounds the ledger's workers.
+/// `--lease-ms`, `--hello-ms` and `--grace-ms` override the window, the hello and the grace alone;
+/// the pool's size bounds the ledger's workers.
 #[test]
-fn pool_limits_are_v1_but_the_window_and_the_size() {
+fn pool_limits_are_v1_but_the_hello_the_window_the_grace_and_the_size() {
     let args = PoolArgs {
         workers: 3,
         lease_ms: Some(10_000),
+        hello_ms: Some(86_400_000),
+        grace_ms: Some(60_000),
         faults: Vec::new(),
         frames: false,
     };
     let l = args.limits();
     assert_eq!(l.window_ns, 10_000_000_000);
+    assert_eq!(l.grace_ns, 60_000_000_000);
+    assert_eq!(l.hello_ns, 86_400_000_000_000);
     assert_eq!(l.max_workers, 3);
     assert_eq!(
-        (l.hello_ns, l.grace_ns, l.max_attempts, l.items),
-        (
-            LIMITS_V1.hello_ns,
-            LIMITS_V1.grace_ns,
-            LIMITS_V1.max_attempts,
-            LIMITS_V1.items
-        )
+        (l.max_attempts, l.items),
+        (LIMITS_V1.max_attempts, LIMITS_V1.items)
     );
     let none = PoolArgs {
         lease_ms: None,
+        hello_ms: None,
+        grace_ms: None,
         ..args
-    };
-    assert_eq!(none.limits().window_ns, LIMITS_V1.window_ns);
+    }
+    .limits();
+    assert_eq!(
+        (none.hello_ns, none.window_ns, none.grace_ns),
+        (LIMITS_V1.hello_ns, LIMITS_V1.window_ns, LIMITS_V1.grace_ns)
+    );
 }
 
 /// Dropping the receiver releases blocked sends, which closes each reader's pipe and releases any

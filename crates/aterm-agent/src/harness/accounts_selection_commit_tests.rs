@@ -253,3 +253,59 @@ fn explicit_selection_conforms_through_policy_failure_and_recovery() {
     bad.insert("case", 3);
     assert!(!model.check_invariant("NoFalseAcknowledgment", &bad));
 }
+
+/// A Codex row with no directory is the CLI's default login, here only while the default home
+/// holds its login file (`~/.codex/auth.json`), as a launch reads it: a pin requested while the
+/// file is missing is not completed onto a row no launch would use, and the same request made
+/// once the row is signed in completes.
+#[test]
+fn a_requested_pin_on_a_default_codex_row_completes_only_with_its_login_file() {
+    let root = aterm_tempfile::TempDir::new().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let store = Store::at_for(root.path(), Cli::Codex, &home);
+    let roster = Roster {
+        rows: vec![Row {
+            label: "main".into(),
+            email: Some("owner@example.test".into()),
+            ..Row::default()
+        }],
+    };
+    let path = root.path().join("accounts.toml");
+    std::fs::write(
+        &path,
+        append_rows_for(Cli::Codex, "", &roster.rows).unwrap(),
+    )
+    .unwrap();
+    let request = || {
+        let PinSelection::Renew(request) = store
+            .select_account_for(Cli::Codex, &roster, &path, "main", NOW)
+            .unwrap()
+        else {
+            panic!("a default row with no login file is signed in before it is pinned")
+        };
+        request
+    };
+    let missing = request();
+    assert!(
+        !store
+            .complete_requested_pin_at(&path, &roster, &missing, NOW)
+            .unwrap(),
+        "no pin on a default row whose login file is missing"
+    );
+    let (state, _) = store.load(NOW).unwrap();
+    assert!(state.active.is_none() && !state.pinned, "{state:?}");
+    assert!(state.pending_pin.is_none(), "the request is spent");
+    // CONTROL: signed in meanwhile, the request completes onto the row.
+    let signed_in = request();
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    std::fs::write(home.join(".codex").join("auth.json"), "{}").unwrap();
+    assert!(
+        store
+            .complete_requested_pin_at(&path, &roster, &signed_in, NOW)
+            .unwrap()
+    );
+    let (state, _) = store.load(NOW).unwrap();
+    assert_eq!(state.active.as_deref(), Some("main"));
+    assert!(state.pinned);
+}

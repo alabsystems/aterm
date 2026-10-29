@@ -1004,12 +1004,13 @@ fn the_landed_row_counts_every_landing() {
 /// L7 widened (§14.6): This Mac's `landing` is every Land tab that holds at rest, less those
 /// whose need it counts first. CONTROL: `b42ae72fc3`'s menu, which calls the held tabs `resting`.
 /// It never passes on `-` (§14.0 limit 7): no held tab, a hold no `status` names, or a wait This
-/// Mac counts first is UNOBSERVED, main's row included.
+/// Mac counts first is UNOBSERVED, main's row included; a tab whose `status` END could not read
+/// FAILS it.
 #[test]
 fn this_mac_counts_every_held_landing() {
     let rest = |here: &str, held: usize, needs: usize, unread: usize| {
         format!(
-            "here=\"{here}\" landed_tabs=5 landing_tabs=7 held_landing={held} held_needs={needs} held_unread={unread} landings=5 today=\"5 landed today\" every=\"x\" did=\"-\""
+            "here=\"{here}\" landed_tabs=5 landing_tabs=7 held_landing={held} held_needs={needs} held_unread={unread} landings=5 today=\"5 landed today\" every=\"x\" did=\"-\" status_failed=\"-\""
         )
     };
     let judge = |r: Option<String>| {
@@ -1032,6 +1033,21 @@ fn this_mac_counts_every_held_landing() {
     assert!(
         matches!(&control, Verdict::Fail(why) if why.contains("0 landing, not 6")),
         "{control:?}"
+    );
+    // A held tab whose END status read failed is in no total: the row short by it (6 held, 5
+    // landing) would match, so the failed read fails, never a pass.
+    let short = "This Mac \u{2014} 1 need you \u{b7} 5 landing \u{b7} 2 resting \u{b7} 5 landed";
+    assert!(matches!(
+        judge(Some(rest(short, 6, 1, 0))),
+        Verdict::Pass(_)
+    ));
+    let failed = judge(Some(rest(short, 6, 1, 0).replace(
+        "status_failed=\"-\"",
+        "status_failed=\"land-b: `@s-2 status` answered 1: ERR busy\"",
+    )));
+    assert!(
+        matches!(&failed, Verdict::Fail(why) if why.contains("land-b: `@s-2 status`")),
+        "{failed:?}"
     );
     for (here, held, needs) in [
         (NOW, 7, 2),
@@ -1073,6 +1089,10 @@ fn this_mac_counts_every_held_landing() {
         (
             "no held_unread",
             Some(rest(NOW, 7, 1, 0).replace(" held_unread=0", "")),
+        ),
+        (
+            "no status_failed",
+            Some(rest(NOW, 7, 1, 0).replace(" status_failed=\"-\"", "")),
         ),
         ("no This Mac row", Some(rest("", 7, 1, 0))),
     ] {
@@ -1323,6 +1343,22 @@ fn a_drawn_chip_that_loses_its_title_mid_run_fails() {
     assert!(
         matches!(hidden, Verdict::Pass(_)),
         "not drawn, no title: {hidden:?}"
+    );
+    // CONTROL: the titled run whose opening `chrome` read failed judges nothing before the
+    // first prompt, so it fails naming the reply rather than passing on the later reads.
+    let mut s = title_seen(None, None);
+    s.window.chip = vec![(2_000, drawn.into())];
+    s.window.title = vec![(2_000, cruise.clone())];
+    let later = title_words(&s, &title_cx(Chain::CruiseN, "claude"));
+    assert!(
+        matches!(later, Verdict::Pass(_)),
+        "no opening, titled after: {later:?}"
+    );
+    s.window.opening_failed = Some("`chrome` answered 1: ERR timeout".into());
+    let unread = title_words(&s, &title_cx(Chain::CruiseN, "claude"));
+    assert!(
+        matches!(&unread, Verdict::Fail(why) if why.contains("ERR timeout")),
+        "opening unread: {unread:?}"
     );
 }
 

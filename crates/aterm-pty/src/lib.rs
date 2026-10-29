@@ -94,11 +94,25 @@ fn is_inherited_descriptor_key(key: &std::ffi::OsStr) -> bool {
     key == "WAYLAND_SOCKET"
 }
 
+/// Whether environment key `key` is `name`: case-insensitive on Windows only, as the deny list.
+#[must_use]
+fn env_key_is(key: &std::ffi::OsStr, name: &str) -> bool {
+    #[cfg(windows)]
+    {
+        key.to_string_lossy().eq_ignore_ascii_case(name)
+    }
+    #[cfg(not(windows))]
+    {
+        key == name
+    }
+}
+
 /// The child shell's environment: `inherited` minus every deny-listed key
 /// ([`aterm_types::domain::is_ai_env_key`]: AI-tool vars and the recursion-provisioning
-/// identity vars; case-insensitive on Windows only) and every descriptor handed down by
-/// number ([`is_inherited_descriptor_key`]), then `env_add` on top, overriding or
-/// appending.
+/// identity vars; case-insensitive on Windows only), every descriptor handed down by
+/// number ([`is_inherited_descriptor_key`]) and an `EDITOR` an outer aterm's tab exported
+/// ([`aterm_types::domain::is_handed_down_editor`], which this hop's own default replaces),
+/// then `env_add` on top, overriding or appending.
 #[cfg_attr(trust_verify, trust::skip)]
 fn build_child_env(
     inherited: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
@@ -120,6 +134,14 @@ fn build_child_env(
             env_pairs.push((k, v));
         }
     }
+    let aterm_child = env_pairs
+        .iter()
+        .find(|(k, _)| env_key_is(k, aterm_types::domain::ENV_ATERM_CHILD))
+        .map(|(_, v)| v.clone());
+    env_pairs.retain(|(k, v)| {
+        !(env_key_is(k, "EDITOR")
+            && aterm_types::domain::is_handed_down_editor(v, aterm_child.as_deref()))
+    });
     for (k, v) in env_add {
         let key = std::ffi::OsString::from(k);
         let mut replaced = false;
@@ -534,6 +556,68 @@ mod tests {
             &os("xterm-256color"),
             "env_add must override inherited TERM"
         );
+    }
+
+    /// The default-editor hint is per hop (docs/DESIGN-amacs-2026-10-19.md §8.3, W1): an
+    /// aterm started from a tab drops the hint it inherited and hands its own, while the
+    /// person's `EDITOR` and `VISUAL` pass through.
+    /// NEGATIVE CONTROL: with no hint of its own in `env_add`, the child gets none, though one
+    /// was inherited.
+    #[test]
+    fn build_child_env_rederives_the_default_editor_hint_per_hop() {
+        use std::ffi::OsString;
+        let os = |s: &str| OsString::from(s);
+        let hint = aterm_types::domain::ENV_DEFAULT_EDITOR;
+        let inherited = || {
+            vec![
+                (os(hint), os("amacs")),
+                (os("EDITOR"), os("vi")),
+                (os("VISUAL"), os("nano")),
+            ]
+            .into_iter()
+        };
+        let value = |out: &[(OsString, OsString)], key: &str| {
+            out.iter()
+                .filter(|(k, _)| k == &os(key))
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let own = vec![(hint.to_string(), "amacs".to_string())];
+        let out = build_child_env(inherited(), &own);
+        assert_eq!(value(&out, hint), ["amacs"], "this hop's own hint, once");
+        assert_eq!(value(&out, "EDITOR"), ["vi"]);
+        assert_eq!(value(&out, "VISUAL"), ["nano"]);
+        let out = build_child_env(inherited(), &[]);
+        assert!(value(&out, hint).is_empty(), "an inherited hint is dropped");
+        assert_eq!(value(&out, "EDITOR"), ["vi"]);
+    }
+
+    /// An `EDITOR=amacs` an outer aterm's tab exported is that aterm's default, not the
+    /// person's: an aterm started from such a tab drops it, so its own setting (the opt-out
+    /// included) decides again, while a person's `EDITOR` passes through.
+    /// NEGATIVE CONTROL: the same `EDITOR=amacs` with no `ATERM_CHILD` (an aterm started from
+    /// the Dock or another terminal) reaches the child, as do `EDITOR=vi` under `ATERM_CHILD`
+    /// and an `EDITOR` this hop sets itself.
+    #[test]
+    fn build_child_env_drops_an_editor_an_outer_aterm_tab_exported() {
+        use std::ffi::OsString;
+        let os = |s: &str| OsString::from(s);
+        let editor = |out: &[(OsString, OsString)]| {
+            out.iter()
+                .filter(|(k, _)| k == "EDITOR")
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let from_tab =
+            |value: &str| vec![(os("ATERM_CHILD"), os("1")), (os("EDITOR"), os(value))].into_iter();
+        let out = build_child_env(from_tab("amacs"), &[]);
+        assert!(editor(&out).is_empty(), "{out:?}");
+        assert!(out.iter().any(|(k, _)| k == "ATERM_CHILD"), "{out:?}");
+        assert_eq!(editor(&build_child_env(from_tab("vi"), &[])), ["vi"]);
+        let own = vec![("EDITOR".to_string(), "amacs".to_string())];
+        assert_eq!(editor(&build_child_env(from_tab("amacs"), &own)), ["amacs"]);
+        let outside = vec![(os("EDITOR"), os("amacs"))].into_iter();
+        assert_eq!(editor(&build_child_env(outside, &[])), ["amacs"]);
     }
 
     /// aterm launched from another terminal's tab: that terminal's window, pane and

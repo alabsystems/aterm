@@ -268,11 +268,25 @@ fn subscription_policy_parses_fail_closed_and_preserves_default_on() {
     let home = aterm_tempfile::tempdir().unwrap();
     let config = home.path().join("config");
     assert_eq!(Policy::read(&config).unwrap(), Policy::default());
+    fsx::write_atomic(&config, b"[swarm]\nenabled = false\n", 0o600).unwrap();
+    assert!(!Policy::read(&config).unwrap().enabled);
+    fsx::write_atomic(
+        &config,
+        b"[swarm]\nenabled = false\n[commons]\nenabled = true\n",
+        0o600,
+    )
+    .unwrap();
+    assert!(
+        !Policy::read(&config).unwrap().enabled,
+        "[swarm] enabled = false overrides [commons] enabled = true"
+    );
     for text in [
         "[commons]\nexclude_tables=1",
         "[commons]\nexclude_tables=['bad']",
         "[commons]\nenabled=1",
         "[commons]\nexclude_table=[]",
+        "[swarm]\nenabled=1",
+        "[swarm]\nother=true",
     ] {
         fsx::write_atomic(&config, text.as_bytes(), 0o600).unwrap();
         assert!(Policy::read(&config).is_err());
@@ -593,7 +607,7 @@ fn withdrawn_catalog_declarations_keep_only_retained_slots_and_preserve_exclusio
             .unwrap()
             .contains_key(&kept.digest())
     );
-    assert!(!db.permits(&sb, &excluded, kept.digest()).unwrap());
+    assert!(!db.permits(&sb, &excluded, kept.digest(), 0).unwrap());
     let mut target = db.catalog(&sb).unwrap();
     target.ingest(&sb, &conflict_wire).unwrap();
     drop(target);
@@ -601,22 +615,29 @@ fn withdrawn_catalog_declarations_keep_only_retained_slots_and_preserve_exclusio
         db.snapshot(&sb).unwrap().entries[&kept.digest()].state,
         State::Conflict
     );
-    assert!(!db.permits(&sb, &Policy::default(), kept.digest()).unwrap());
+    assert!(
+        !db.permits(&sb, &Policy::default(), kept.digest(), 0)
+            .unwrap()
+    );
 }
 
-fn subscription_transition(
+/// The flags `action` leaves from `state`, without `subscribed`: everything the world
+/// [`subscription_transition`] builds depends on.
+fn subscription_flags(
     state: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
-    let p = Pair::new();
-    let a = p.lab.bootstrap(0);
-    let b = p.lab.bootstrap(1);
-    let sa = Session::open(&a).unwrap();
-    let sb = Session::open(&b).unwrap();
-    let dir = p.directory(0);
-    let descriptor = Descriptor::application(a.trust(), "accounts", "proposals", 1).unwrap();
-    let scope = descriptor.scope;
-    let mut catalog = dir.catalog(&sa).unwrap();
+    let mut next = subscription_transition_flags(state, action);
+    next.remove("subscribed");
+    next
+}
+
+/// `state` after `action`'s flag update, before the world it describes is observed: its
+/// `subscribed` is still `state`'s.
+fn subscription_transition_flags(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
     let mut next = state.clone();
     match action {
         "Discover" => {
@@ -642,6 +663,23 @@ fn subscription_transition(
         }
         _ => panic!("unknown model action"),
     }
+    next
+}
+
+fn subscription_transition(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    let p = Pair::new();
+    let a = p.lab.bootstrap(0);
+    let b = p.lab.bootstrap(1);
+    let sa = Session::open(&a).unwrap();
+    let sb = Session::open(&b).unwrap();
+    let dir = p.directory(0);
+    let descriptor = Descriptor::application(a.trust(), "accounts", "proposals", 1).unwrap();
+    let scope = descriptor.scope;
+    let mut catalog = dir.catalog(&sa).unwrap();
+    let mut next = subscription_transition_flags(state, action);
     if next["known"] == 1 {
         catalog
             .commit_catalog(&sa, &descriptor.encode().unwrap())
@@ -700,19 +738,43 @@ fn all_subscription_policy_interleavings_conform_and_mutants_fail() {
         aterm_spec::interp::fired_actions(&model).len(),
         model.actions.len()
     );
-    for state in aterm_spec::interp::reachable_states(&model) {
-        for action in &model.actions {
-            if model.action_enabled(action.name, &state) {
-                let next = subscription_transition(&state, action.name);
-                assert!(
-                    model.successors(action.name, &state).contains(&next),
-                    "{}: {state:?} -> {next:?}",
-                    action.name
-                );
-            }
-        }
+    let steps: Vec<_> = aterm_spec::interp::reachable_states(&model)
+        .into_iter()
+        .flat_map(|state| {
+            model
+                .actions
+                .iter()
+                .filter(|action| model.action_enabled(action.name, &state))
+                .map(|action| (state.clone(), action.name))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    // Steps that leave the same flags build the same world and observe the same state:
+    // project one step per world, every world on its own core.
+    let mut first = BTreeMap::new();
+    for (state, action) in &steps {
+        first
+            .entry(subscription_flags(state, action))
+            .or_insert((state, *action));
     }
-    let mut bad = subscription_transition(&model.init_state(), "Exclude");
+    let first: Vec<_> = first.into_iter().collect();
+    let projected: BTreeMap<_, _> = first
+        .iter()
+        .map(|(flags, _)| flags.clone())
+        .zip(aterm_spec::check::each_on(
+            aterm_spec::fs_lane::PLACES,
+            &first,
+            |(_, (state, action))| subscription_transition(state, action),
+        ))
+        .collect();
+    for (state, action) in &steps {
+        let next = &projected[&subscription_flags(state, action)];
+        assert!(
+            model.successors(action, state).contains(next),
+            "{action}: {state:?} -> {next:?}"
+        );
+    }
+    let mut bad = projected[&subscription_flags(&model.init_state(), "Exclude")].clone();
     bad.insert("subscribed", 1);
     assert!(
         !model

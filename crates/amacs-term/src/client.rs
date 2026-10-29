@@ -41,6 +41,21 @@ OPTIONS:
     -h, --help    print this help
     --            every later argument is a FILE
 
+TABLES: in an Editor tab, a .csv or .tsv FILE opens as a grid. The arrows,
+Tab, Home and End move between cells; typing, Return or a double-click opens a
+cell; Return keeps the cell and Escape drops it. In an open cell Cmd-Z undoes
+your last typing and Cmd-Shift-Z redoes it; with no cell open, Cmd-Z undoes the
+last cell you kept. Cmd-C or M-w copies a cell's value, Cmd-X, C-w or C-k cuts
+it, C-y puts the last copy or cut in a cell, and Cmd-V pastes the clipboard.
+C-o (Add Row) adds an empty row below and moves to it; C-S-Backspace (Delete
+Row) deletes the row; Cmd-Z takes either back. A click in the panel under the
+grid puts the caret there. The first column stays at the left once the grid
+scrolls sideways, and a sideways swipe or the arrow marks show hidden columns.
+A value with a comma, a quote or a line break is quoted for you, and every
+byte outside the cells and rows you change stays as it was. Cmd-E (C-c C-t)
+shows the text and back. A file over 4 MiB opens as text. The terminal editor
+shows tables as text.
+
 IN THE TERMINAL (outside an aterm tab, over ssh, in tmux or screen, with -nw,
 or once the window refuses a FILE or cannot be reached), amacs edits in this
 terminal with Emacs keys: C-x C-s saves, C-x C-c closes the file (asking first

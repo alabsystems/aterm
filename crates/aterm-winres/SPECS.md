@@ -112,24 +112,20 @@ test-only code, checks a tautology or measures timing.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **`outcome_display_names_the_state` mixes two specs and pins prose.** It checks `is_linked`
-   (WR5) and `Display` (WR6) together. Its `Display` half is substring checks on `"not Windows"`
-   and `"no resource compiler"`, so it pins wording. It never checks payload preservation, which
-   is the actual contract. It also skips `Display` for `Linked` and `Failed`, and `is_linked` for
-   `NotWindows` and `NoCompiler`. When WR5 and WR6 land, drop the substring asserts and do not
-   replace them with a wording pin.
-2. **`sdk_versions_newest_first`'s doc says "four numeric components" but the parse is
-   looser.** `key()` uses `u64::from_str`, which accepts a leading `+` (so `10.+0.1.2` is kept),
-   and it treats `10.00.0.0` as equal to `10.0.0.0`. Equal keys keep input order because `sort_by`
-   is stable. WR1 states this behaviour exactly. Either tighten the parse to ASCII digits or
-   document it. No test covers `+`, ties between equal keys, or u64 overflow.
-3. **`dialect_of` uses plain substring matching.** Any name containing `windres` maps to
-   `Windres` (for example `llvm-windres`, which really is windres-compatible). Every unrecognised
-   name, including an arbitrary `ATERM_RC` binary, silently defaults to `Rc`. The test samples only
-   the three happy names. WR2 states the precedence and the default, and the gnu-target refusal in
-   `locate_compiler` relies on both.
-4. **A doc comment cites the test.** `arguments()` says "Pure, so the shape is unit-tested". This
-   goes stale when the test is deleted for WR3, so update it in the same commit.
+1. **Resolved — `outcome_display_names_the_state` checks payload preservation and `is_linked` across all variants.**
+   It now checks `is_linked` and `Display` across `Linked`, `NotWindows`, `NoCompiler` and `Failed`,
+   asserting payload suffix preservation and pairwise distinctness without pinning prose substrings.
+2. **Resolved — `sdk_versions_newest_first` documents `u64::from_str` parsing and preserves tie order.**
+   `sdk_versions_newest_first` now sorts solely on the numeric key via stable `sort_by` (rather than
+   `sort_unstable` over `(key, name)`), documents `u64::from_str` component parsing and input-order tie
+   stability, and `sdk_versions_sort_numerically_newest_first` covers leading `+`, equal-key tie order in
+   both directions (`10.00.0.0` vs `10.0.0.0`), and `u64` overflow rejection.
+3. **Resolved — `dialect_follows_the_program_name` covers WR2 precedence, final-component scoping, and `Rc` defaults.**
+   Covers `llvm-windres` and `windres-llvm-rc` (`windres` precedence over `llvm-rc`), parent-directory
+   exclusion (`/opt/windres/llvm-rc`, `/opt/llvm-rc/custom-rc`), empty/unrecognised names, and non-UTF-8
+   file names defaulting to `Rc`.
+4. **Resolved — `arguments()` doc comment no longer cites the unit test.** `arguments()` is documented
+   as `"The argument vector for one dialect."`.
 
 ## 6. Proof order (easiest, high value first)
 

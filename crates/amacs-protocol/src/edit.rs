@@ -172,6 +172,9 @@ impl EditOk {
     /// The reply line, without its newline.
     pub fn format(&self) -> Result<String, EditError> {
         token("uri", &self.uri)?;
+        if !self.uri.starts_with("file://") {
+            return Err(EditError::BadField("uri", self.uri.clone()));
+        }
         Ok(format!(
             "OK edit ticket={} view={} doc={} uri={}",
             self.ticket, self.view, self.doc, self.uri
@@ -186,6 +189,9 @@ impl EditOk {
             ["ticket", "view", "doc", "uri"],
             "OK edit ticket= view= doc= uri=",
         )?;
+        if !uri.starts_with("file://") {
+            return Err(EditError::BadField("uri", uri.to_string()));
+        }
         Ok(Self {
             ticket: ticket.parse()?,
             view: number(view, "view")?,
@@ -635,6 +641,15 @@ mod tests {
         assert_eq!(EditOk::parse(&format!("{line}\n")).unwrap(), ok);
         assert!(EditOk::parse("OK edit ticket=1 view=2 doc=3").is_err());
         assert!(EditOk::parse("OK edit view=2 ticket=1 doc=3 uri=file:///x").is_err());
+        assert!(EditOk::parse("OK edit ticket=1 view=2 doc=3 uri=/tmp/x").is_err());
+        assert!(
+            EditOk {
+                uri: "/tmp/x".to_string(),
+                ..ok.clone()
+            }
+            .format()
+            .is_err()
+        );
         assert!(EditOk::parse("ERR refused missing").is_err());
 
         for (result, saved, seq) in [

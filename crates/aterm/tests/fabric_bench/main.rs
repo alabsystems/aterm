@@ -13,6 +13,7 @@ mod census;
 mod census_tests;
 mod clock;
 mod profile;
+mod profile_tests;
 #[expect(
     dead_code,
     reason = "the live measurement entry runs only in the explicit bench"
@@ -23,4 +24,6 @@ mod run;
     reason = "the explicit bench reads its required run from the environment"
 )]
 mod spec;
+mod spec_tests;
 mod stats;
+mod stats_tests;

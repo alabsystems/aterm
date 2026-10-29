@@ -1307,7 +1307,7 @@ impl Jobs {
                     }
                     let j = &mut self.jobs[i];
                     if j.backgrounded {
-                        j.fg_ms = Some(tick.read_ms.max(at) + FG_NOTICE_MS);
+                        j.fg_ms = Some(tick.read_ms.max(at).saturating_add(FG_NOTICE_MS));
                     }
                     j.front_pgid = Some(u.pgid);
                     j.kind = JobKind::Shell;
@@ -1350,7 +1350,7 @@ impl Jobs {
                     // pass's notice window.
                     j.backgrounded |= j.block.is_some();
                     if j.backgrounded && j.deferred.take() != u.block {
-                        j.fg_ms = Some(tick.read_ms.max(at) + FG_NOTICE_MS);
+                        j.fg_ms = Some(tick.read_ms.max(at).saturating_add(FG_NOTICE_MS));
                     }
                     j.front_pgid = Some(u.pgid);
                     j.kind = JobKind::Shell;
@@ -1933,12 +1933,17 @@ impl Jobs {
                 }
                 match was {
                     Some(p) => {
-                        cpu += c.cpu_ns.saturating_sub(p.cpu_ns);
-                        child_work += delta(c.child_cpu_ns, p.child_cpu_ns);
-                        calls += delta(c.syscalls, p.syscalls)
-                            + delta(c.wakeups.or(c.ctx_switches), p.wakeups.or(p.ctx_switches));
-                        side += delta(c.logical_writes, p.logical_writes);
-                        pageins += delta(c.pageins, p.pageins);
+                        cpu = cpu.saturating_add(c.cpu_ns.saturating_sub(p.cpu_ns));
+                        child_work =
+                            child_work.saturating_add(delta(c.child_cpu_ns, p.child_cpu_ns));
+                        calls = calls
+                            .saturating_add(delta(c.syscalls, p.syscalls))
+                            .saturating_add(delta(
+                                c.wakeups.or(c.ctx_switches),
+                                p.wakeups.or(p.ctx_switches),
+                            ));
+                        side = side.saturating_add(delta(c.logical_writes, p.logical_writes));
+                        pageins = pageins.saturating_add(delta(c.pageins, p.pageins));
                     }
                     None if prev.contains_key(pid) => rebased = true,
                     // The job's shell lived long before it joined (`fg`, a block learned late,
@@ -1946,11 +1951,11 @@ impl Jobs {
                     // birth with its lifetime's CPU and writes.
                     None if Some(*pid) == job.shell => {}
                     None if !first_tick => {
-                        births += 1;
-                        cpu += c.cpu_ns;
-                        child_work += c.cpu_ns;
-                        births_wrote += c.logical_writes.unwrap_or(0);
-                        side += c.logical_writes.unwrap_or(0);
+                        births = births.saturating_add(1);
+                        cpu = cpu.saturating_add(c.cpu_ns);
+                        child_work = child_work.saturating_add(c.cpu_ns);
+                        births_wrote = births_wrote.saturating_add(c.logical_writes.unwrap_or(0));
+                        side = side.saturating_add(c.logical_writes.unwrap_or(0));
                     }
                     None => {}
                 }
@@ -1969,7 +1974,7 @@ impl Jobs {
                     m.pending = pending;
                 }
             }
-            let churn = births + reaps > 0;
+            let churn = births > 0 || reaps > 0;
             let stir = if !moved.is_empty() {
                 Stir::Stirred
             } else if churn {
@@ -2122,7 +2127,7 @@ impl Jobs {
                 let Some(last) = last.filter(|l| size > l) else {
                     continue;
                 };
-                out_growth += size - last;
+                out_growth = out_growth.saturating_add(size - last);
                 let p = if *lf {
                     Some(Progress::FileLine)
                 } else if *cr && fault != Some(Fault::RawBytesProgress) {
@@ -2139,9 +2144,10 @@ impl Jobs {
                 progress = file_progress.map(|p| (p, at));
             }
             if !refused && dt > 0 && progress.is_none() {
-                let allowance = (out_growth * 2).div_ceil(4096) * 4096 + SIDE_ALLOWANCE * dt / 2000;
+                let allowance = (u128::from(out_growth) * 2).div_ceil(4096) * 4096
+                    + u128::from(SIDE_ALLOWANCE) * u128::from(dt) / 2000;
                 let any = fault == Some(Fault::AnyLogicalWrites);
-                if (any && side > 0) || side > allowance {
+                if (any && side > 0) || u128::from(side) > allowance {
                     progress = Some((Progress::SideWrites, at));
                 } else if churn && (churn_work || fault == Some(Fault::ChurnWithoutWork)) {
                     progress = Some((Progress::ChurnWithWork, at));
@@ -2478,7 +2484,7 @@ impl Jobs {
                 .wait
                 .as_ref()
                 .map_or(leader_name, |w| w.leaf_name.clone());
-            let cpu_mc = (dt > 0 && !refused).then(|| cpu / (dt * 1000));
+            let cpu_mc = (dt > 0 && !refused).then(|| cpu / dt / 1000);
             let class = out.class;
             job.row = Some(JobRow {
                 id: job.id.clone(),

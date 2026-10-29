@@ -69,6 +69,11 @@ aterm-tempfile = { workspace = true }
 # dev-only cycle: cargo builds it, and nothing but these tests and examples
 # sees the second copy.
 aterm-uds = { workspace = true }
+# The tests' hang detector, `wait::MUST_HAPPEN`: the stopped spinner
+# (`src/procs.rs`) fails by name when its child is not ready or not stopped
+# within it. Workspace crate; it depends on aterm-uds, so this is the same
+# dev-only cycle.
+aterm-spec = { workspace = true }
 # The stuck engine's live check (`examples/stuck_live.rs`) hands what the job
 # probe reads to the pure engine, as the host will. Workspace crate, no
 # dependencies.

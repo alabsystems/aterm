@@ -1,12 +1,16 @@
 seq v=1 rig=transcript program=claude build=2.1.0
-# Twin of a_prompt_read_before_the_screens_turn_names_it, 6 s apart (the
-# negative control): the turn is its own, the call counted.
+# Twin of a_prompt_read_before_the_screens_turn_names_it, its second rig (fix
+# E1): at partial a prompt read 6 s before the screen saw the agent busy opens
+# the turn itself; the screen's busy opens nothing, and the call opens under
+# the transcript's turn.
 state partial
 bind 0
 pass 10000
 tx prompt vlead
+expect open t1 turn par=r1 vref=vlead src=transcript conf=strong
 pass 6000
 see busy
-expect open t1 turn src=screen
+expect turn=t1
 tx tool c1
-expect tx dropped=1
+expect open p1 tool par=t1 vref=c1 src=transcript conf=strong
+expect tx dropped=0

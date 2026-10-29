@@ -37,11 +37,11 @@ fn dom_against(s: &CellSurvey, base: &BTreeSet<PkgId>, target: &PkgId) -> DomCos
     let without = s.graph.reach(Some(target));
     let mut cost = DomCost::default();
     for id in base.difference(&without) {
-        if s.facts.get(id).is_some_and(|f| !f.is_third_party) {
+        let Some(facts) = s.facts.get(id).filter(|f| f.is_third_party) else {
             continue;
-        }
+        };
         cost.pkgs += 1;
-        cost.loc += s.facts.get(id).map_or(0, |f| f.loc);
+        cost.loc += facts.loc;
         if id != target {
             cost.also.push(id.clone());
         }

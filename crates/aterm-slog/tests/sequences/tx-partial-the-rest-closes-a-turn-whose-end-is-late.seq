@@ -1,0 +1,17 @@
+seq v=1 rig=transcript program=claude build=2.1.311
+# Fix E1: a turn a partial prompt opened while the screen rests is settled by
+# the screen's resting word when its end row comes late; the late end only
+# amends the closed turn.
+state partial
+bind 0
+see idle
+pass 500
+tx prompt v1
+expect open t1 turn par=r1 vref=v1 src=transcript conf=strong
+expect wake=1500
+wait 1000
+expect close t1 turn out=done src=screen conf=strong @500
+expect turn=none
+tx end
+expect amend t1 turn vdur_ms=4200 by=vendor src=transcript conf=strong
+expect turn=none

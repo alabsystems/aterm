@@ -48,7 +48,11 @@ pub struct Args {
     pub headers_file: Option<PathBuf>,
     /// The bodies of the claude.ai account routes ([`account`]), re-read per request.
     pub account_file: Option<PathBuf>,
-    /// Ticks of a `slow` reply.
+    /// The mode each credential's `/v1/messages` turns are answered in, by its label
+    /// ([`auth_label`]): a JSON object `{label: mode}`, re-read per request ([`auth_mode`]); a
+    /// credential it does not name is answered in the stub's own mode.
+    pub auth_modes_file: Option<PathBuf>,
+    /// Ticks of a `slow` reply ([`SLOW_SECONDS`] unless `--slow-seconds` says).
     pub slow_seconds: i64,
     /// The `retry-after` of `rate-limit`.
     pub retry_after: String,
@@ -57,6 +61,9 @@ pub struct Args {
     /// A pipe's write end the stub writes one byte to.
     pub ready_fd: Option<i32>,
 }
+
+/// The ticks of a `slow` reply when `--slow-seconds` names none: one a second.
+pub const SLOW_SECONDS: i64 = 30;
 
 impl Default for Args {
     fn default() -> Self {
@@ -75,7 +82,8 @@ impl Default for Args {
             tool_file: None,
             headers_file: None,
             account_file: None,
-            slow_seconds: 30,
+            auth_modes_file: None,
+            slow_seconds: SLOW_SECONDS,
             retry_after: "5".into(),
             lifeline_fd: None,
             ready_fd: None,
@@ -123,6 +131,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args, String> {
             "--tool-file" => a.tool_file = Some(val()?.into()),
             "--headers-file" => a.headers_file = Some(val()?.into()),
             "--account-file" => a.account_file = Some(val()?.into()),
+            "--auth-modes-file" => a.auth_modes_file = Some(val()?.into()),
             "--slow-seconds" => a.slow_seconds = num(val()?)?,
             "--retry-after" => a.retry_after = val()?,
             "--ready-fd" => {
@@ -268,6 +277,36 @@ pub fn rate_headers(spec: &J, served: u32) -> RateHeaders {
         on200: side("on200"),
         on429: side("on429"),
     }
+}
+
+/// The key of a `--headers-file` that holds each credential's own blocks, by its label
+/// ([`rate_headers_for`]).
+pub const BY_AUTH: &str = "by_auth";
+
+/// The headers `spec` puts on the answer to the credential `label` after `served` 200s that
+/// carried on200 headers: [`rate_headers`]' blocks with `spec.by_auth[label]`'s own blocks
+/// merged over them, header by header ([`BY_AUTH`]), so each credential can read its own window.
+#[must_use]
+pub fn rate_headers_for(spec: &J, label: &str, served: u32) -> RateHeaders {
+    let mut out = rate_headers(spec, served);
+    if let Some(own) = spec.get(BY_AUTH).and_then(|by| by.get(label)) {
+        let own = rate_headers(own, served);
+        out.on200 = merged(&out.on200, &own.on200);
+        out.on429 = merged(&out.on429, &own.on429);
+    }
+    out
+}
+
+/// The mode an `--auth-modes-file`'s JSON `modes` names for the credential `label`, cleaned as
+/// `/__mode?m=` cleans one ([`clean_mode`]): `None` where it names none, names `off` or `""`, or
+/// is no object, so the stub's own mode answers.
+#[must_use]
+pub fn auth_mode(modes: &J, label: &str) -> Option<String> {
+    let J::Obj(_) = modes else {
+        return None;
+    };
+    let m = modes.get(label)?.as_str()?.trim();
+    (!m.is_empty() && m != "off").then(|| clean_mode(m))
 }
 
 fn value_text(v: &J) -> String {
@@ -454,6 +493,97 @@ pub fn scripted_call(spec: &J, answered: bool) -> Option<(String, J)> {
     let call = spec.get("tool").filter(|c| matches!(c, J::Obj(_)))?;
     let name = call_name(call);
     (!answered && !name.is_empty()).then(|| (name, call_input(call)))
+}
+
+/// The tools a request `body` declares, by name, each with its arguments' schema (`None` for
+/// one that declares none, such as a freeform or server tool): Gemini's
+/// `tools[].functionDeclarations[]` (`parametersJsonSchema` or `parameters`), the Messages API's
+/// `tools[]` (`input_schema`), the Responses API's `tools[]` (`parameters`), a Muse Code
+/// `namespace` tool's own `tools[]` among them. `None` when the request declares no named tool,
+/// so a call has nothing to be read against.
+#[must_use]
+pub fn declared_tools(body: &[u8]) -> Option<Vec<(String, Option<J>)>> {
+    fn named(t: &J, keys: &[&str]) -> Option<(String, Option<J>)> {
+        let name = t.get("name").and_then(J::as_str)?.to_string();
+        Some((name, keys.iter().find_map(|k| t.get(k)).cloned()))
+    }
+    fn of(tools: &[J]) -> Vec<(String, Option<J>)> {
+        tools
+            .iter()
+            .flat_map(|t| {
+                if let Some(decls) = t.get("functionDeclarations").and_then(J::as_arr) {
+                    decls
+                        .iter()
+                        .filter_map(|d| named(d, &["parametersJsonSchema", "parameters"]))
+                        .collect()
+                } else if t.get("type").and_then(J::as_str) == Some("namespace") {
+                    of(t.get("tools").and_then(J::as_arr).unwrap_or_default())
+                } else {
+                    named(t, &["input_schema", "parameters"])
+                        .into_iter()
+                        .collect()
+                }
+            })
+            .collect()
+    }
+    let j = J::parse_bytes(body).ok()?;
+    let out = of(j.get("tools").and_then(J::as_arr)?);
+    (!out.is_empty()).then_some(out)
+}
+
+/// What a scripted call of `name` with `input` gets wrong against the tools `declared`: a tool
+/// none declares, an argument its schema requires and the call lacks, or one a closed schema
+/// (`additionalProperties: false`) does not name. `None` when it fits. Only the schema's top
+/// level is read: a nested shape, and each argument's type, are the agent's to refuse.
+#[must_use]
+pub fn misfit(declared: &[(String, Option<J>)], name: &str, input: &J) -> Option<String> {
+    let Some((_, schema)) = declared.iter().find(|(n, _)| n == name) else {
+        return Some(format!("{name}: no such tool declared"));
+    };
+    let schema = schema.as_ref()?;
+    let given: Vec<&str> = match input {
+        J::Obj(m) => m.iter().map(|(k, _)| k.as_str()).collect(),
+        _ => Vec::new(),
+    };
+    let mut wrong: Vec<String> = schema
+        .get("required")
+        .and_then(J::as_arr)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(J::as_str)
+        .filter(|r| !given.contains(r))
+        .map(|r| format!("lacks {r}"))
+        .collect();
+    if schema.get("additionalProperties") == Some(&J::Bool(false)) {
+        let props = schema.get("properties");
+        wrong.extend(
+            given
+                .iter()
+                .filter(|k| props.and_then(|p| p.get(k)).is_none())
+                .map(|k| format!("undeclared {k}")),
+        );
+    }
+    (!wrong.is_empty()).then(|| format!("{name}: {}", wrong.join(", ")))
+}
+
+/// What a stub log line adds for scripted `calls` that do not fit the tools `body` declares
+/// ([`misfit`]): ` misfit='…'`, or nothing when each fits or the request declares no tool. An
+/// agent refuses such a call itself, often with nothing on its screen to say why (agy 1.4.10
+/// answered every undeclared argument with a tool result), so the stub's log says it.
+#[must_use]
+pub fn misfit_note(body: &[u8], calls: &[(&str, &J)]) -> String {
+    let Some(declared) = declared_tools(body) else {
+        return String::new();
+    };
+    let wrong: Vec<String> = calls
+        .iter()
+        .filter_map(|(name, input)| misfit(&declared, name, input))
+        .collect();
+    if wrong.is_empty() {
+        String::new()
+    } else {
+        format!(" misfit={}", py_repr(&wrong.join("; ")))
+    }
 }
 
 /// Whether a Messages API request's conversation carries a tool's result back.
@@ -855,6 +985,35 @@ pub fn lab_claims(authorization: &str) -> Option<J> {
     Some(j)
 }
 
+/// The head of a lab Claude OAuth token that names its label ([`labelled_oauth_token`]).
+pub const LABELLED_OAUTH: &str = "sk-ant-oat01-LABLABLAB-";
+
+/// Where a labelled token's label ends ([`labelled_oauth_token`]): no label holds it, a label
+/// being lowercase.
+const LABEL_END: &str = "-LAB";
+
+/// A fake Claude OAuth token the stub reads as `oat:<label>` ([`auth_label`]): the realistic
+/// `sk-ant-oat01-` head, the lab's `LABLABLAB` mark, the label, then `-LAB` and padding. No
+/// credential anywhere. `label` is 1–24 characters of `[a-z0-9_-]`, else the token reads as the
+/// plain `oat`.
+#[must_use]
+pub fn labelled_oauth_token(label: &str) -> String {
+    format!("{LABELLED_OAUTH}{label}{LABEL_END}{}AA", "A".repeat(72))
+}
+
+/// The label of a lab token [`labelled_oauth_token`] made, where `tok` is one and its label is
+/// 1–24 characters of `[a-z0-9_-]`.
+fn oauth_label(tok: &str) -> Option<&str> {
+    let rest = tok.strip_prefix(LABELLED_OAUTH)?;
+    let label = &rest[..rest.find(LABEL_END)?];
+    (!label.is_empty()
+        && label.len() <= 24
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'))
+    .then_some(label)
+}
+
 /// Which lab credential a request carried, NEVER its value.
 #[must_use]
 pub fn auth_label(authorization: Option<&str>) -> String {
@@ -875,6 +1034,9 @@ pub fn auth_label(authorization: Option<&str>) -> String {
     }
     if tok == gemini::LAB_GEMINI_KEY {
         return "gemini-key".into();
+    }
+    if let Some(label) = oauth_label(tok) {
+        return format!("oat:{label}");
     }
     if tok.starts_with("sk-ant-oat01-LABLABLAB") {
         return "oat".into();
@@ -1128,10 +1290,12 @@ pub fn usage_limit_headers(claim: &str, reset: i64) -> Vec<(String, String)> {
 /// The keys of a `--headers-file` that are [`rate_headers`]'s blocks (`headers` writes them).
 pub const RATE_BLOCKS: [&str; 2] = ["on200", "on429"];
 
-/// The `--headers-file` a verb leaves.
+/// The `--headers-file` a verb leaves: `headers` (`blocks`) rewrites the [`RATE_BLOCKS`],
+/// `ratelimits` the flat entries, and each keeps the other's and every credential's own blocks
+/// ([`BY_AUTH`], which [`headers_file_for`] writes).
 #[must_use]
 pub fn headers_file_with(old: &str, new: J, blocks: bool) -> J {
-    let own = |k: &str| RATE_BLOCKS.contains(&k) == blocks;
+    let own = |k: &str| k != BY_AUTH && RATE_BLOCKS.contains(&k) == blocks;
     let mut out: Vec<(String, J)> = match J::parse(old) {
         Ok(J::Obj(m)) => m.into_iter().filter(|(k, _)| !own(k)).collect(),
         _ => Vec::new(),
@@ -1140,6 +1304,30 @@ pub fn headers_file_with(old: &str, new: J, blocks: bool) -> J {
         out.extend(m.into_iter().filter(|(k, _)| own(k)));
     }
     J::Obj(out)
+}
+
+/// The `--headers-file` `headers-for` leaves: `old` with the credential `label`'s own blocks
+/// ([`BY_AUTH`]) set to `blocks` (`{"on200": {…}, "on429": {…}}`), or removed where `blocks` holds
+/// none; every other entry and credential kept.
+#[must_use]
+pub fn headers_file_for(old: &str, label: &str, blocks: J) -> J {
+    let mut out = match J::parse(old) {
+        Ok(j @ J::Obj(_)) => j,
+        _ => J::Obj(Vec::new()),
+    };
+    let mut by: Vec<(String, J)> = match out.get(BY_AUTH) {
+        Some(J::Obj(m)) => m.iter().filter(|(k, _)| k != label).cloned().collect(),
+        _ => Vec::new(),
+    };
+    if matches!(&blocks, J::Obj(m) if !m.is_empty()) {
+        by.push((label.to_string(), blocks));
+    }
+    if by.is_empty() {
+        out.remove(BY_AUTH);
+    } else {
+        out.set(BY_AUTH, J::Obj(by));
+    }
+    out
 }
 
 /// The flat entries of a `--headers-file` (`ratelimits` writes them).
@@ -1163,8 +1351,13 @@ pub fn flat_headers(spec: &J, now: i64) -> Vec<(String, String)> {
             if digits.is_empty() || !rest[digits.len()..].starts_with('@') {
                 break;
             }
-            let n: i64 = digits.parse().unwrap_or(0);
-            text = format!("{}{}{}", &text[..i], now + n, &rest[digits.len() + 1..]);
+            let n: i64 = digits.parse().unwrap_or(i64::MAX);
+            text = format!(
+                "{}{}{}",
+                &text[..i],
+                now.saturating_add(n),
+                &rest[digits.len() + 1..]
+            );
         }
         let text: String = text
             .chars()
@@ -1635,11 +1828,18 @@ impl Stub {
             .and_then(|t| J::parse(&t).ok())
     }
 
-    fn answer_headers(&self) -> RateHeaders {
+    fn answer_headers(&self, label: &str) -> RateHeaders {
         self.headers_spec()
             .map_or_else(RateHeaders::default, |spec| {
-                rate_headers(&spec, self.served_200.load(Ordering::Relaxed))
+                rate_headers_for(&spec, label, self.served_200.load(Ordering::Relaxed))
             })
+    }
+
+    /// The mode the `--auth-modes-file` names for the credential `label` ([`auth_mode`]).
+    fn credential_mode(&self, label: &str) -> Option<String> {
+        let path = self.args.auth_modes_file.as_ref()?;
+        let modes = J::parse(&std::fs::read_to_string(path).ok()?).ok()?;
+        auth_mode(&modes, label)
     }
 
     fn take_custom(&self, mode: &str, label: Option<&str>) -> Option<J> {
@@ -1753,7 +1953,9 @@ impl Stub {
             gemini::credential_label(key, auth)
         };
         let result = if req.method == "POST" && path == "/v1/messages" {
-            self.messages(&req.method, path, &req.body, mode, &mut out)
+            let label = auth_label(auth);
+            let mode = self.credential_mode(&label).unwrap_or(mode);
+            self.messages(&req.method, path, &req.body, (mode, &label), &mut out)
         } else if req.method == "GET" && path == "/v1/responses" && req.websocket_upgrade() {
             // Codex falls back to HTTP on 426; a handshake must not take a scripted POST reply.
             out.json(
@@ -1901,7 +2103,7 @@ impl Stub {
         method: &str,
         path: &str,
         body: &[u8],
-        mode: String,
+        (mode, label): (String, &str),
         out: &mut Out<'_>,
     ) -> io::Result<()> {
         let info = analyse(body);
@@ -1916,7 +2118,7 @@ impl Stub {
             .as_ref()
             .map_or_else(|| "None".to_string(), |v| v.py());
         let mut summary = format!(
-            "kind={kind} model={model} stream={} max_tokens={max_tokens} msgs={} tools={} sys={}c last_user=\"{}\"",
+            "kind={kind} model={model} stream={} max_tokens={max_tokens} msgs={} tools={} sys={}c last_user=\"{}\" auth={label}",
             info.stream,
             info.msgs,
             info.tools,
@@ -1924,7 +2126,7 @@ impl Stub {
             one_line(&info.last_user, 70)
         );
         self.dump(body, kind);
-        let rate = self.answer_headers();
+        let rate = self.answer_headers(label);
         summary.push_str(&rate.summary());
         out.rate = Some(rate);
         let blen = body.len();
@@ -1948,12 +2150,12 @@ impl Stub {
                 .and_then(|p| std::fs::read_to_string(p).ok())
                 .and_then(|t| J::parse(&t).ok());
             if let Some(turn) = script.and_then(|s| tool_turn(body, &s)) {
-                return self.tool_turn_answer(&base.in_mode(&mode), &summary, turn, out);
+                return self.tool_turn_answer(&base.in_mode(&mode), body, &summary, turn, out);
             }
         }
         let mut mode = mode;
         if let Some(sp) = self
-            .take_custom(&mode, None)
+            .take_custom(&mode, Some(label))
             .filter(|sp| kind == "main" || !is_scripted(sp))
         {
             // A custom mode's `script` answers the conversations keyed to it, step by step, as the
@@ -1963,11 +2165,12 @@ impl Stub {
                 .filter(|_| kind == "main")
                 .and_then(|s| keyed_tool_turn(body, s));
             if let Some(turn) = keyed {
-                return self.tool_turn_answer(&base.in_mode(&mode), &summary, turn, out);
+                return self.tool_turn_answer(&base.in_mode(&mode), body, &summary, turn, out);
             }
             let sp = with_reply(sp, &message_users(body));
             if let Some((name, input)) = scripted_call(&sp, messages_answered(body)) {
-                let s = format!("{summary} custom tool:{name}");
+                let note = misfit_note(body, &[(&name, &input)]);
+                let s = format!("{summary} custom tool:{name}{note}");
                 return self.stream_tool(&base.in_mode(&mode), &s, &name, &input, out);
             }
             return self.custom(&base.in_mode(&mode), &sp, &summary, out);
@@ -2134,7 +2337,8 @@ impl Stub {
             let facts = (method, path, blen, mode.as_str());
             match script.and_then(|s| muse::tool_turn(body, &s)) {
                 Some(ToolTurn::Call(name, input, step)) => {
-                    let s = format!("{summary} tool:{name} step {step}");
+                    let note = misfit_note(body, &[(&name, &input)]);
+                    let s = format!("{summary} tool:{name} step {step}{note}");
                     return self.muse_call(facts, &info, &s, &name, &input, out);
                 }
                 Some(ToolTurn::Done) => {
@@ -2157,7 +2361,8 @@ impl Stub {
             if dialect == Dialect::Muse
                 && let Some((name, input)) = scripted_call(&spec, muse::results_answered(body))
             {
-                let s = format!("{summary} custom tool:{name}");
+                let note = misfit_note(body, &[(&name, &input)]);
+                let s = format!("{summary} custom tool:{name}{note}");
                 return self.muse_call(
                     (method, path, blen, mode.as_str()),
                     &info,
@@ -2880,23 +3085,27 @@ impl Stub {
         Ok(())
     }
 
-    /// Answer a request at `turn` of its script ([`tool_turn`], [`keyed_tool_turn`]): the call or
-    /// calls it makes, the words it says, or, every step answered, `Tool call done.`.
+    /// Answer a request (`body`) at `turn` of its script ([`tool_turn`], [`keyed_tool_turn`]): the
+    /// call or calls it makes, the words it says, or, every step answered, `Tool call done.`.
     fn tool_turn_answer(
         &self,
         t: &Turn<'_>,
+        body: &[u8],
         summary: &str,
         turn: ToolTurn,
         out: &mut Out<'_>,
     ) -> io::Result<()> {
         match turn {
             ToolTurn::Call(name, input, step) => {
-                let s = format!("{summary} tool:{name} step {step}");
+                let note = misfit_note(body, &[(&name, &input)]);
+                let s = format!("{summary} tool:{name} step {step}{note}");
                 self.stream_tool(t, &s, &name, &input, out)
             }
             ToolTurn::Calls(calls, step) => {
                 let names: Vec<&str> = calls.iter().map(|(n, _)| n.as_str()).collect();
-                let s = format!("{summary} tool:{} step {step}", names.join("+"));
+                let each: Vec<(&str, &J)> = calls.iter().map(|(n, i)| (n.as_str(), i)).collect();
+                let note = misfit_note(body, &each);
+                let s = format!("{summary} tool:{} step {step}{note}", names.join("+"));
                 self.stream_tools(t, &s, &calls, out)
             }
             ToolTurn::Say(text, step) => {

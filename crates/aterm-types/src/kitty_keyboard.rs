@@ -8,7 +8,14 @@
 /// and push with `CSI > flags u`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct KittyKeyboardFlags(u8);
+pub struct KittyKeyboardFlags(
+    #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_kitty_flags"))] u8,
+);
+
+#[cfg(feature = "serde")]
+fn deserialize_kitty_flags<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
+    Ok(<u8 as serde::Deserialize>::deserialize(d)? & 0b1_1111)
+}
 
 impl KittyKeyboardFlags {
     /// Disambiguate escape codes (send Esc, Alt+key, Ctrl+key using CSI u).
@@ -96,27 +103,6 @@ impl KittyKeyboardFlags {
     }
 }
 
-/// Kitty keyboard protocol stack entry: flags with a valid bit (0x80) set. The stack pointer,
-/// not this bit, tracks validity.
-#[derive(Debug, Clone, Copy, Default)]
-struct KittyKeyboardStackEntry(u8);
-
-impl KittyKeyboardStackEntry {
-    const VALID_BIT: u8 = 0x80;
-
-    /// Create a valid entry with the given flags.
-    #[inline]
-    const fn new(flags: KittyKeyboardFlags) -> Self {
-        Self(flags.bits() | Self::VALID_BIT)
-    }
-
-    /// Get the flags from this entry.
-    #[inline]
-    const fn flags(self) -> KittyKeyboardFlags {
-        KittyKeyboardFlags::from_bits(self.0 & !Self::VALID_BIT)
-    }
-}
-
 /// Kitty keyboard protocol state.
 #[derive(Debug, Clone)]
 pub struct KittyKeyboardState {
@@ -127,9 +113,9 @@ pub struct KittyKeyboardState {
     /// Saved flags for the alternate screen while the main screen is active.
     alt_saved_flags: Option<KittyKeyboardFlags>,
     /// Stack for the main screen: 8 slots, at most 7 saved entries (+ the live mode).
-    main_stack: [KittyKeyboardStackEntry; 8],
+    main_stack: [KittyKeyboardFlags; 8],
     /// Stack for the alternate screen.
-    alt_stack: [KittyKeyboardStackEntry; 8],
+    alt_stack: [KittyKeyboardFlags; 8],
     /// Current stack pointer for main screen (points to next free slot).
     main_sp: usize,
     /// Current stack pointer for alternate screen.
@@ -193,8 +179,8 @@ impl KittyKeyboardState {
             flags: KittyKeyboardFlags::none(),
             main_saved_flags: None,
             alt_saved_flags: None,
-            main_stack: [KittyKeyboardStackEntry(0); 8],
-            alt_stack: [KittyKeyboardStackEntry(0); 8],
+            main_stack: [KittyKeyboardFlags::none(); 8],
+            alt_stack: [KittyKeyboardFlags::none(); 8],
             main_sp: 0,
             alt_sp: 0,
         }
@@ -254,7 +240,7 @@ impl KittyKeyboardState {
             *sp = 6;
         }
 
-        stack[*sp & 7] = KittyKeyboardStackEntry::new(self.flags);
+        stack[*sp & 7] = self.flags;
         *sp = (*sp & 7).saturating_add(1);
 
         self.flags = KittyKeyboardFlags::from_bits(new_flags);
@@ -281,7 +267,7 @@ impl KittyKeyboardState {
         }
 
         let new_sp = (*sp).wrapping_sub(count);
-        self.flags = stack[new_sp & 7].flags();
+        self.flags = stack[new_sp & 7];
         *sp = new_sp;
     }
 
@@ -289,11 +275,11 @@ impl KittyKeyboardState {
     pub fn reset_current_screen(&mut self, buffer: ScreenBuffer) {
         self.flags = KittyKeyboardFlags::none();
         if matches!(buffer, ScreenBuffer::Alternate) {
-            self.alt_stack = [KittyKeyboardStackEntry::default(); 8];
+            self.alt_stack = [KittyKeyboardFlags::none(); 8];
             self.alt_sp = 0;
             self.alt_saved_flags = None;
         } else {
-            self.main_stack = [KittyKeyboardStackEntry::default(); 8];
+            self.main_stack = [KittyKeyboardFlags::none(); 8];
             self.main_sp = 0;
             self.main_saved_flags = None;
         }
@@ -304,8 +290,8 @@ impl KittyKeyboardState {
         self.flags = KittyKeyboardFlags::none();
         self.main_saved_flags = None;
         self.alt_saved_flags = None;
-        self.main_stack = [KittyKeyboardStackEntry::default(); 8];
-        self.alt_stack = [KittyKeyboardStackEntry::default(); 8];
+        self.main_stack = [KittyKeyboardFlags::none(); 8];
+        self.alt_stack = [KittyKeyboardFlags::none(); 8];
         self.main_sp = 0;
         self.alt_sp = 0;
     }
@@ -313,15 +299,12 @@ impl KittyKeyboardState {
     /// Capture a stable snapshot of the current kitty keyboard state.
     #[must_use]
     pub fn snapshot(&self) -> KittyKeyboardStateSnapshot {
+        let main_sp = self.main_sp.min(7);
+        let alt_sp = self.alt_sp.min(7);
         let mut main_stack = [KittyKeyboardFlags::none(); 8];
-        for (dst, src) in main_stack.iter_mut().zip(self.main_stack.iter()) {
-            *dst = src.flags();
-        }
-
+        main_stack[..main_sp].copy_from_slice(&self.main_stack[..main_sp]);
         let mut alt_stack = [KittyKeyboardFlags::none(); 8];
-        for (dst, src) in alt_stack.iter_mut().zip(self.alt_stack.iter()) {
-            *dst = src.flags();
-        }
+        alt_stack[..alt_sp].copy_from_slice(&self.alt_stack[..alt_sp]);
 
         KittyKeyboardStateSnapshot {
             flags: self.flags,
@@ -329,37 +312,41 @@ impl KittyKeyboardState {
             alt_saved_flags: self.alt_saved_flags,
             main_stack,
             alt_stack,
-            main_sp: self.main_sp.min(7) as u8,
-            alt_sp: self.alt_sp.min(7) as u8,
+            main_sp: main_sp as u8,
+            alt_sp: alt_sp as u8,
         }
     }
 
     /// Restore kitty keyboard state from a semantic snapshot.
     pub fn restore_snapshot(&mut self, snapshot: KittyKeyboardStateSnapshot) {
-        self.flags = snapshot.flags;
-        self.main_saved_flags = snapshot.main_saved_flags;
-        self.alt_saved_flags = snapshot.alt_saved_flags;
+        self.flags = KittyKeyboardFlags::from_bits(snapshot.flags.bits());
+        self.main_saved_flags = snapshot
+            .main_saved_flags
+            .map(|f| KittyKeyboardFlags::from_bits(f.bits()));
+        self.alt_saved_flags = snapshot
+            .alt_saved_flags
+            .map(|f| KittyKeyboardFlags::from_bits(f.bits()));
         self.main_sp = usize::from(snapshot.main_sp.min(7));
         self.alt_sp = usize::from(snapshot.alt_sp.min(7));
 
-        self.main_stack = [KittyKeyboardStackEntry::default(); 8];
+        self.main_stack = [KittyKeyboardFlags::none(); 8];
         for (dst, src) in self
             .main_stack
             .iter_mut()
             .take(self.main_sp)
             .zip(snapshot.main_stack.iter())
         {
-            *dst = KittyKeyboardStackEntry::new(*src);
+            *dst = KittyKeyboardFlags::from_bits(src.bits());
         }
 
-        self.alt_stack = [KittyKeyboardStackEntry::default(); 8];
+        self.alt_stack = [KittyKeyboardFlags::none(); 8];
         for (dst, src) in self
             .alt_stack
             .iter_mut()
             .take(self.alt_sp)
             .zip(snapshot.alt_stack.iter())
         {
-            *dst = KittyKeyboardStackEntry::new(*src);
+            *dst = KittyKeyboardFlags::from_bits(src.bits());
         }
     }
 }

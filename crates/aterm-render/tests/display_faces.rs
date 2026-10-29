@@ -6,7 +6,7 @@
 use aterm_render::{
     DISPLAY_FACE_MIX_MAX, DISPLAY_FACE_SCHEME, DISPLAY_FACES, FaceId, Renderer, Theme,
     display_face_bytes, display_face_canonical_id, display_face_fit, display_face_ids_for_family,
-    display_face_mix_for_family, display_face_scale, display_layer_ids, display_mix_face_index,
+    display_face_scale, display_layer_ids, display_mix_face_index,
 };
 
 fn every_layer() -> Vec<Vec<&'static str>> {
@@ -454,14 +454,20 @@ fn from_system_with_family_draws_a_display_family_over_the_default_font() {
 
 #[test]
 fn display_mix_family_parsing_is_exact() {
-    let solo = display_face_mix_for_family("display:pixel").expect("single id");
-    assert_eq!(solo.len(), 1);
-    let duo = display_face_mix_for_family("display:pixel+engraved").expect("two ids");
-    assert_eq!(duo.len(), 2);
-    assert_eq!(duo[0], display_face_bytes("pixel").unwrap());
-    assert_eq!(duo[1], display_face_bytes("engraved").unwrap());
-    let trio = display_face_mix_for_family("display:chunky+bubble+engraved").unwrap();
-    assert_eq!(trio.len(), DISPLAY_FACE_MIX_MAX);
+    assert_eq!(
+        display_face_ids_for_family("display:pixel"),
+        Some(vec!["pixel"])
+    );
+    assert_eq!(
+        display_face_ids_for_family("display:pixel+engraved"),
+        Some(vec!["pixel", "engraved"])
+    );
+    assert_eq!(
+        display_face_ids_for_family("display:chunky+bubble+engraved")
+            .unwrap()
+            .len(),
+        DISPLAY_FACE_MIX_MAX
+    );
     for bad in [
         "display:pixel+doom",
         "display:pixel+pixel",
@@ -471,7 +477,7 @@ fn display_mix_family_parsing_is_exact() {
         "display:+",
     ] {
         assert!(
-            display_face_mix_for_family(bad).is_none(),
+            display_face_ids_for_family(bad).is_none(),
             "{bad} must reject"
         );
     }

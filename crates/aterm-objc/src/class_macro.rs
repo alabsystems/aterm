@@ -411,14 +411,17 @@ macro_rules! declare_class {
             #[allow(dead_code, reason = "generated for every declared class; each class calls a subset")]
             $vis fn ivars(&self) -> &$ivars {
                 let __meta = Self::meta();
+                // SAFETY: `self` borrows a live Objective-C object; checking its runtime class
+                // chain before forming `__slot` guarantees `_atermIvars` sits at `ivar_offset`.
+                unsafe { __meta.assert_instance(self.as_id()) };
                 let __slot = ::core::ptr::with_exposed_provenance::<$crate::IvarSlot<$ivars>>(
                     ::core::ptr::from_ref(self)
                         .expose_provenance()
                         .wrapping_add_signed(__meta.ivar_offset()),
                 );
-                // SAFETY: `self` borrows a live instance, so the slot at the
-                // registered offset is aligned, readable and live for the
-                // borrow. `IvarSlot::get` checks it was written, in release too.
+                // SAFETY: `assert_instance` verified `self` is an instance of `Self::meta().class()`
+                // (or a subclass), so the slot at the registered offset is aligned, readable and
+                // live for the borrow. `IvarSlot::get` checks it was written, in release too.
                 unsafe { $crate::IvarSlot::get(__slot) }
             }
 
@@ -476,7 +479,7 @@ macro_rules! declare_class {
                         $crate::Id,
                         $crate::Sel,
                     ) -> $crate::Id = $crate::checked_msg();
-                    let __obj = __init(__raw, $crate::sel!(init));
+                    let __obj = Self::meta().guard_init(__init(__raw, $crate::sel!(init)));
                     $crate::Retained::from_owned(__obj)
                 }
             }

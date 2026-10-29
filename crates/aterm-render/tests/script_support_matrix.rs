@@ -36,13 +36,19 @@ fn every_script_resolves_to_a_face_that_really_contains_it() {
     r.debug_block_on_lazy_fallbacks();
     let mut missing: Vec<String> = Vec::new();
     let mut checked = 0usize;
+    let mut file_picks = 0usize;
+    let mut rasterized = 0usize;
     for (script, sample) in SAMPLES {
         for ch in sample.chars() {
             checked += 1;
             if let Some(path) = r.debug_fallback_pick_path(ch) {
-                let Ok(bytes) = std::fs::read(&path) else {
-                    continue;
-                };
+                file_picks += 1;
+                let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+                    panic!(
+                        "{script}: {ch:?} (U+{:04X}) picked unreadable {path}: {e}",
+                        ch as u32
+                    )
+                });
                 let faces = aterm_font::fonts_in_collection(&bytes).unwrap_or(1);
                 let real = (0..faces).any(|i| {
                     aterm_font::Face::parse(&bytes, i)
@@ -57,9 +63,26 @@ fn every_script_resolves_to_a_face_that_really_contains_it() {
                     ));
                 }
             }
+            let key = r.glyph_key(ch);
+            let is_notdef = key.source == aterm_render::FaceId::Primary
+                && key.glyph_class == aterm_render::GlyphClass::Mono;
+            if !is_notdef {
+                rasterized += 1;
+                let img = r.glyph_image(key);
+                if !img.bytes().iter().any(|&b| b > 0) {
+                    missing.push(format!(
+                        "{script}: {ch:?} (U+{:04X}) resolved to {:?} ({:?}) with zero ink",
+                        ch as u32, key.source, key.glyph_class
+                    ));
+                }
+            }
         }
     }
     assert!(checked > 50, "matrix ran vacuously ({checked} code points)");
+    assert!(
+        rasterized > 0,
+        "no sample code point resolved to a non-.notdef glyph ({file_picks} file picks)"
+    );
     assert!(
         missing.is_empty(),
         "coverage lies:\n  {}",

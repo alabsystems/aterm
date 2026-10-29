@@ -55,19 +55,29 @@ pub struct TokenUsage {
     pub cache_read: u64,
 }
 
+// The usage keys of a transcript row the counts are read from, as the anchors name them (the
+// step fold's token counts are these: `lab claude-measure` refuses GONE when a build drops one).
+const INPUT_TOKENS: &str = aterm_phase::anchor!("transcript.input_tokens");
+const OUTPUT_TOKENS: &str = aterm_phase::anchor!("transcript.output_tokens");
+const CACHE_CREATION: &str = aterm_phase::anchor!("transcript.cache_creation");
+const EPHEMERAL_5M: &str = aterm_phase::anchor!("transcript.ephemeral_5m_input_tokens");
+const EPHEMERAL_1H: &str = aterm_phase::anchor!("transcript.ephemeral_1h_input_tokens");
+const CACHE_CREATION_INPUT: &str = aterm_phase::anchor!("transcript.cache_creation_input_tokens");
+const CACHE_READ_INPUT: &str = aterm_phase::anchor!("transcript.cache_read_input_tokens");
+
 impl TokenUsage {
     /// Read the counts; a missing one reads 0.
     pub(crate) fn from_object(obj: &Map) -> Option<Self> {
-        let input = num_u64(obj.get("input_tokens"));
-        let output = num_u64(obj.get("output_tokens"));
-        let split = obj.get("cache_creation").and_then(Value::as_object);
-        let five_min = split.and_then(|s| num_u64(s.get("ephemeral_5m_input_tokens")));
-        let one_hour = split.and_then(|s| num_u64(s.get("ephemeral_1h_input_tokens")));
-        let cache_write = num_u64(obj.get("cache_creation_input_tokens")).or_else(|| {
+        let input = num_u64(obj.get(INPUT_TOKENS));
+        let output = num_u64(obj.get(OUTPUT_TOKENS));
+        let split = obj.get(CACHE_CREATION).and_then(Value::as_object);
+        let five_min = split.and_then(|s| num_u64(s.get(EPHEMERAL_5M)));
+        let one_hour = split.and_then(|s| num_u64(s.get(EPHEMERAL_1H)));
+        let cache_write = num_u64(obj.get(CACHE_CREATION_INPUT)).or_else(|| {
             (five_min.is_some() || one_hour.is_some())
                 .then(|| five_min.unwrap_or(0).saturating_add(one_hour.unwrap_or(0)))
         });
-        let cache_read = num_u64(obj.get("cache_read_input_tokens"));
+        let cache_read = num_u64(obj.get(CACHE_READ_INPUT));
         if input.is_none() && output.is_none() && cache_write.is_none() && cache_read.is_none() {
             return None;
         }
@@ -949,18 +959,20 @@ pub struct SpendView {
     pub usd: Option<f64>,
 }
 
-/// One rate-limit window of an account as the usage tap read it ([`super::tap::Window`]).
+/// One rate-limit window of an account as the usage tap read it ([`super::tap::Window`]), or as a Codex rollout wrote it ([`super::accounts::Sample`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowView {
-    /// `used_percentage`.
+    /// `used_percentage`; a Codex share taken up to the next whole percent.
     pub used_pct: u32,
     /// `resets_at`, Unix seconds.
     pub resets_at: i64,
-    /// Seconds since its figures were first reported since its process was last served ([`super::tap::Reading::at`]), at the view's `as_of`.
+    /// Seconds since its figures were first reported since its process was last served ([`super::tap::Reading::at`]), or since a Codex rollout's reading wrote its share, at the view's `as_of`.
     pub age_s: u64,
+    /// Where it was read: [`super::accounts::SOURCE_TAP`], or a Codex rollout ([`super::source::Source::Rollout`]).
+    pub source: &'static str,
 }
 
-/// One account: its spend (per model), the model its live session runs, and the windows its usage tap read.
+/// One account: its spend (per model), the model its live session runs, and the windows its usage tap or its Codex rollouts read.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountView {
     /// The owner's label for the account (`accounts.toml`).
@@ -971,7 +983,7 @@ pub struct AccountView {
     pub spend: BTreeMap<String, SpendView>,
     /// The session's model id ([`TranscriptUsage::last_model`], taken by [`Self::add_transcript`]).
     pub model: Option<String>,
-    /// The rate-limit windows by the vendor's name (`five_hour`, `seven_day`), from the usage tap's reading for the session's own process ([`Self::add_reading`]).
+    /// The rate-limit windows by the vendor's name (`five_hour`, `seven_day`), from the usage tap's reading for the session's own process ([`Self::add_reading`]), or a Codex conversation's newest reading ([`Self::add_sample`]).
     pub windows: BTreeMap<String, WindowView>,
 }
 
@@ -1001,9 +1013,51 @@ impl AccountView {
                         used_pct: w.pct,
                         resets_at: w.resets_at,
                         age_s,
+                        source: super::accounts::SOURCE_TAP,
                     },
                 );
             }
+        }
+    }
+
+    /// Take the five-hour and week windows of a usage `sample` ([`super::accounts::Sample`]),
+    /// spelled `source`, each as old as `as_of` makes the moment its share was read.
+    ///
+    /// A WINDOW THE SAMPLE GIVES NO SHARE OR NO RESET IS LEFT OUT, so the HUD shows `?` for it
+    /// rather than a figure the sample does not hold.
+    pub fn add_sample(
+        &mut self,
+        sample: &super::accounts::Sample,
+        source: &'static str,
+        as_of: i64,
+    ) {
+        for (name, pct, reset, read_at) in [
+            (
+                "five_hour",
+                sample.session_pct,
+                sample.session_reset,
+                sample.session_read_at,
+            ),
+            (
+                "seven_day",
+                sample.week_pct,
+                sample.week_reset,
+                sample.week_read_at,
+            ),
+        ] {
+            let (Some(used_pct), Some(resets_at)) = (pct, reset) else {
+                continue;
+            };
+            let read = read_at.unwrap_or(sample.at);
+            self.windows.insert(
+                name.to_owned(),
+                WindowView {
+                    used_pct,
+                    resets_at,
+                    age_s: u64::try_from(as_of.saturating_sub(read)).unwrap_or(0),
+                    source,
+                },
+            );
         }
     }
 
@@ -1045,7 +1099,7 @@ impl UsageView {
     }
 }
 
-/// One rate-limit window Claude Code painted on its `/usage` panel, before its reset text is placed on a clock.
+/// One rate-limit window in a CLI's `/usage` panel, before its reset text is placed on a clock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanelWindow {
     /// The window key this row names (the vendor's own: `five_hour`, …).
@@ -1188,6 +1242,51 @@ pub fn usage_panel_windows(rows: &[String]) -> Vec<PanelWindow> {
         return Vec::new();
     }
     out
+}
+
+/// The windows in Kimi Code's complete inline `/usage` panel, including its optional legacy
+/// weekly window and its monthly total separately.
+#[must_use]
+pub fn kimi_usage_windows(rows: &[String]) -> Vec<PanelWindow> {
+    let Some((start, _)) = rows
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, row)| row.trim_start().starts_with("╭ Usage "))
+    else {
+        return Vec::new();
+    };
+    let Some(end) = rows
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find_map(|(i, row)| row.trim_start().starts_with('╰').then_some(i))
+    else {
+        return Vec::new();
+    };
+    let mut windows = Vec::new();
+    for row in &rows[start + 1..end] {
+        let text = row.trim().trim_matches(['│', ' ']).trim();
+        let name = if text.starts_with("5h limit") {
+            SESSION_WINDOW
+        } else if text.starts_with("Weekly limit") || text.starts_with("Week limit") {
+            WEEK_WINDOW
+        } else if text.starts_with("Monthly limit") {
+            "monthly"
+        } else {
+            continue;
+        };
+        let Some(used_pct) = pct_used(text).filter(|pct| *pct <= 100) else {
+            continue;
+        };
+        windows.push(PanelWindow {
+            name: name.to_owned(),
+            used_pct,
+            reset_text: reset_after(text)
+                .map(|reset| reset.trim_end_matches(['│', ' ']).trim_end().to_owned()),
+        });
+    }
+    windows
 }
 
 /// The command the accounts probe types to open the panel.
@@ -1349,7 +1448,7 @@ pub fn hud_line(view: &UsageView) -> String {
         },
     );
     let source = match five.or(seven) {
-        Some(w) => format!("tap {}", super::upgrade::span(w.age_s)),
+        Some(w) => format!("{} {}", w.source, super::upgrade::span(w.age_s)),
         None => "none".to_owned(),
     };
     truncate_to(
@@ -1404,7 +1503,7 @@ fn account_json(a: &AccountView) -> Value {
                     let mut m = Map::new();
                     m.insert("used_pct".to_owned(), Value::from(u64::from(w.used_pct)));
                     m.insert("resets_at".to_owned(), Value::from(w.resets_at));
-                    m.insert("source".to_owned(), Value::from("tap"));
+                    m.insert("source".to_owned(), Value::from(w.source));
                     m.insert("age_s".to_owned(), Value::from(w.age_s));
                     (name.clone(), Value::Object(m))
                 })
@@ -2492,6 +2591,45 @@ mod tests {
     }
 
     #[test]
+    fn kimi_usage_keeps_its_optional_week_and_month_apart() {
+        let screen = rows(
+            "   ╭ Usage ─────────────────────────────────────────╮\n\
+             \x20  │ Plan usage                                      │\n\
+             \x20  │   5h limit    ███████░░░  36% used  resets in 25m │\n\
+             \x20  │   Monthly limit  ███░░░░  13% used  resets in 26d 20h 27m │\n\
+             \x20  ╰─────────────────────────────────────────────────╯",
+        );
+        assert_eq!(
+            kimi_usage_windows(&screen),
+            vec![
+                PanelWindow {
+                    name: "five_hour".to_owned(),
+                    used_pct: 36,
+                    reset_text: Some("in 25m".to_owned()),
+                },
+                PanelWindow {
+                    name: "monthly".to_owned(),
+                    used_pct: 13,
+                    reset_text: Some("in 26d 20h 27m".to_owned()),
+                },
+            ]
+        );
+        let legacy = screen
+            .iter()
+            .map(|row| row.replace("Monthly limit", "Weekly limit "))
+            .collect::<Vec<_>>();
+        assert_eq!(kimi_usage_windows(&legacy)[1].name, "seven_day");
+        let newer = screen
+            .iter()
+            .map(|row| row.replace("36% used", "41% used"))
+            .collect::<Vec<_>>();
+        let repeated = [screen.clone(), newer].concat();
+        assert_eq!(kimi_usage_windows(&repeated)[0].used_pct, 41);
+        assert!(kimi_usage_windows(&screen[..screen.len() - 1]).is_empty());
+        assert!(kimi_usage_windows(&rows("5h limit 36% used resets in 25m")).is_empty());
+    }
+
+    #[test]
     fn panel_reader_takes_both_measured_layouts_and_the_fable_window() {
         for (what, text) in [("wide", PANEL_WIDE), ("narrow", PANEL_NARROW)] {
             let got = usage_panel_windows(&rows(text));
@@ -3043,7 +3181,6 @@ mod tests {
         assert_eq!(of(&[fable.clone(), window("spend_limit", 12, None)]), None);
         let both = of(&[fable, week, session]).expect("both");
         assert_eq!((both.session_pct, both.week_pct), (Some(1), Some(10)));
-        assert_eq!(USAGE_COMMAND, "/usage");
     }
 
     #[test]

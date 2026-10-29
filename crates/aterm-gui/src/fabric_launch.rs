@@ -24,6 +24,9 @@ const QUIT_BYE_SEAM: &str = "ATERM_DEBUG_QUIT_BYE";
 /// The configured bridge command, or `None` when the fabric is off.
 #[must_use]
 pub(crate) fn configured_command(config: &crate::app_config::Config) -> Option<Vec<String>> {
+    if !config.swarm_enabled() {
+        return None;
+    }
     let argv = aterm_types::dev_seam!(FABRIC_COMMAND_ENV)
         .map(|s| aterm_types::fabric_command::split_line(&s.to_string_lossy()))
         .filter(|argv| !argv.is_empty())
@@ -126,8 +129,9 @@ pub(crate) fn spawn_supervisor(config: &crate::app_config::Config) -> bool {
         Err(ArmError::AlreadySupervised(_)) => true,
         Err(ArmError::NotExecutable { program, reason }) => {
             aterm_log::warn!(
-                "fabric bridge supervisor not started: `{program}` is {reason}; fix [fabric] \
-                 command in aterm.toml, then `aterm ctl fabric attach` arms it"
+                "fabric bridge supervisor not started: `{}` is {reason}; fix [fabric] \
+                 command in aterm.toml, then `aterm ctl fabric attach` arms it",
+                program_word(&program)
             );
             false
         }
@@ -315,15 +319,38 @@ pub(crate) fn carry_attached(argv: Vec<String>) {
 }
 
 fn supervise(argv: &[String]) {
+    supervise_with(argv, launch_once, || RETIRED.load(Ordering::SeqCst));
+}
+
+/// The word aterm.log keeps of the bridge's program: its file name where that is a word
+/// ([`aterm_log::words::word`]), never the path or the arguments, which are aterm.toml's
+/// `[fabric] command` (cap paths, broker addresses: a config value, DESIGN §3.6).
+fn program_word(program: &str) -> &str {
+    std::path::Path::new(program)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .map_or("?", aterm_log::words::word)
+}
+
+/// [`supervise`] over its `launch` and its `retired` word.
+fn supervise_with(
+    argv: &[String],
+    launch: impl Fn(&[String]) -> std::io::Result<Launched>,
+    retired: impl Fn() -> bool,
+) {
     let mut backoff = RELAUNCH_MIN;
     loop {
-        if RETIRED.load(Ordering::SeqCst) {
+        if retired() {
             aterm_log::info!("fabric bridge supervisor retired: aterm is quitting");
             return;
         }
-        match launch_once(argv) {
+        match launch(argv) {
             Ok(launched) => {
-                aterm_log::info!("fabric bridge started: {}", argv.join(" "));
+                aterm_log::info!(
+                    "fabric bridge started: {} ({} args)",
+                    argv.first().map_or("?", |program| program_word(program)),
+                    argv.len().saturating_sub(1)
+                );
                 let started = Instant::now();
                 let status = launched.wait_and_retire();
                 let ran = started.elapsed();
@@ -454,6 +481,42 @@ mod tests {
             .find(|p| std::path::Path::new(p).exists())
             .expect("a `true` binary")
             .to_string()
+    }
+
+    /// The bridge's argv is aterm.toml's `[fabric] command` (cap paths, broker addresses): the
+    /// started line names its program's file name and counts its arguments (DESIGN §3.6).
+    #[test]
+    fn the_started_line_names_the_program_and_counts_its_arguments() {
+        let argv = vec![true_program(), "QZP7E7E1".to_string()];
+        let launches = std::cell::Cell::new(0_u32);
+        let logged = crate::test_log::logged_while(|| {
+            supervise_with(
+                &argv,
+                |argv| {
+                    launches.set(launches.get() + 1);
+                    launch_serving(argv, |_, _| true)
+                },
+                || launches.get() > 0,
+            );
+        });
+        assert_eq!(launches.get(), 1, "one launch, then retired");
+        assert!(
+            logged
+                .iter()
+                .any(|line| line == "fabric bridge started: true (1 args)"),
+            "the started line names its program: {} lines",
+            logged.len()
+        );
+        assert!(
+            !logged.iter().any(|line| line.contains("QZP7E7E")),
+            "the log keeps the bridge's arguments"
+        );
+        assert_eq!(program_word("/opt/QZP7E7E2 x/bridge"), "bridge");
+        assert_eq!(
+            program_word("/opt/x/QZP7E7E3 bridge"),
+            "?",
+            "a name that is no word"
+        );
     }
 
     #[test]

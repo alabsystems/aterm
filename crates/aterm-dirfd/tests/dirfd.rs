@@ -164,14 +164,20 @@ fn run_mine(root: &OwnedFd, op: &Op, ids: &mut Identities) -> Outcome {
         Op::Chmod(name, bits) => match mine::openat(root, name, mine_flags_file(), Mode::empty()) {
             Ok(fd) => {
                 let mut m = mine::Mode::empty();
-                if bits & 0o400 != 0 {
-                    m |= mine::Mode::RUSR;
-                }
-                if bits & 0o200 != 0 {
-                    m |= mine::Mode::WUSR;
-                }
-                if bits & 0o100 != 0 {
-                    m |= mine::Mode::XUSR;
+                for (mask, flag) in [
+                    (0o400, mine::Mode::RUSR),
+                    (0o200, mine::Mode::WUSR),
+                    (0o100, mine::Mode::XUSR),
+                    (0o040, mine::Mode::RGRP),
+                    (0o020, mine::Mode::WGRP),
+                    (0o010, mine::Mode::XGRP),
+                    (0o004, mine::Mode::ROTH),
+                    (0o002, mine::Mode::WOTH),
+                    (0o001, mine::Mode::XOTH),
+                ] {
+                    if bits & mask != 0 {
+                        m |= flag;
+                    }
                 }
                 unit(mine::fchmod(&fd, m))
             }
@@ -516,6 +522,8 @@ fn renames_links_and_modes_agree() {
             Op::Link("twolinks", "third"),
             Op::Link("missing", "nope"),
             Op::Chmod("third", 0o400),
+            Op::Chmod("third", 0o644),
+            Op::Chmod("third", 0o755),
             Op::Chmod("third", 0o600),
             Op::Chmod("missing", 0o600),
             Op::FsyncDir,
@@ -525,6 +533,7 @@ fn renames_links_and_modes_agree() {
 
 /// The non-clobbering publish — the platform-specific rename semantics, which
 /// are implemented per-platform rather than emulated.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 #[test]
 fn flagged_renames_agree() {
     compare_script(
@@ -536,6 +545,17 @@ fn flagged_renames_agree() {
             Op::RenameNoReplace("dir", "empty"),
         ],
     );
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+#[test]
+fn flagged_renames_report_enosys_on_unsupported_unix() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+    let fd = open_root_mine(dir.path());
+    let err = mine::renameat_with(&fd, "file", &fd, "published", mine::RenameFlags::NOREPLACE)
+        .unwrap_err();
+    assert_eq!(err, mine::Errno::NOSYS);
 }
 
 /// Directory listings, before and after mutation.
@@ -613,12 +633,21 @@ fn a_removed_directory_reads_as_empty() {
     std::fs::create_dir(&doomed).unwrap();
     std::fs::write(doomed.join("child"), b"x").unwrap();
     let fd = open_root_mine(&doomed);
+    let fd_direct = open_root_mine(&doomed);
     std::fs::remove_file(doomed.join("child")).unwrap();
     std::fs::remove_dir(&doomed).unwrap();
     assert_eq!(
         run_mine(&fd, &Op::ReadDir, &mut Identities::default()),
         Outcome::Names(Vec::new()),
         "a removed directory should read as empty",
+    );
+    let direct: Vec<_> = mine::Dir::new(fd_direct)
+        .expect("fdopendir on an unlinked directory descriptor")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("reading an unlinked directory stream directly must not error");
+    assert!(
+        direct.is_empty(),
+        "a direct stream over a removed directory must read as empty: {direct:?}"
     );
 }
 
@@ -684,11 +713,12 @@ fn a_retained_descriptor_never_follows_a_swapped_pathname() {
 /// matches on it to decide "already gone" versus "the filesystem refused me".
 #[test]
 fn the_not_found_errno_is_the_same_constant() {
-    assert_eq!(mine::Errno::NOENT.raw_os_error(), libc::ENOENT);
     let dir = aterm_tempfile::tempdir().unwrap();
     let fa = open_root_mine(dir.path());
     let err = mine::unlinkat(&fa, "nothing-here", mine::AtFlags::empty()).unwrap_err();
     assert_eq!(err, mine::Errno::NOENT);
+    assert!(err.is_noent());
+    assert_eq!(std::io::Error::from(err).raw_os_error(), Some(libc::ENOENT));
 }
 
 /// A name with an interior NUL must be REFUSED, not silently truncated at the
@@ -708,9 +738,31 @@ fn an_interior_nul_is_refused_rather_than_truncated() {
 /// between that fast path and the heap fallback must not change behaviour.
 #[test]
 fn names_across_the_stack_buffer_boundary_agree() {
+    use mine::Arg as _;
+    for len in [0usize, 1, 2, 255, 511, 512, 513, 900] {
+        let sample: String = (0..len)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        sample
+            .as_str()
+            .with_c_str(|c| {
+                assert_eq!(c.to_bytes(), sample.as_bytes(), "c_str length {len}");
+                Ok(())
+            })
+            .unwrap();
+    }
+
     let a = aterm_tempfile::tempdir().unwrap();
     let b = aterm_tempfile::tempdir().unwrap();
+    std::fs::write(a.path().join("target"), b"payload").unwrap();
     let fa = open_root_mine(a.path());
+    for dots in [252usize, 253, 254, 300] {
+        let rel = format!("{}target", "./".repeat(dots));
+        let opened = mine::openat(&fa, rel.as_str(), mine_flags_file(), mine::Mode::empty())
+            .unwrap_or_else(|e| panic!("multi-component path of len {} failed: {e}", rel.len()));
+        assert_eq!(mine::fstat(&opened).unwrap().st_nlink, 1);
+    }
+
     for len in [1usize, 2, 200, 254, 255, 511, 512, 513, 900] {
         let name = "n".repeat(len);
         let ra = mine::openat(
@@ -733,4 +785,47 @@ fn names_across_the_stack_buffer_boundary_agree() {
             .map_err(|e| e.raw_os_error().expect("an OS error"));
         assert_eq!(ra, rb, "name of length {len}");
     }
+}
+
+/// A STREAM OVER ITS OWN DESCRIPTOR (`Dir::new`) lists what `std` lists, its descriptor is the
+/// directory it was opened on (`fstat` agrees, and an `*at` call through it lands there), and a
+/// rewind lists the directory again whole, an entry made since included. NEGATIVE CONTROL: before
+/// the rewind, the spent stream lists nothing more.
+#[test]
+fn a_stream_over_its_own_descriptor_lists_rewinds_and_lends_its_descriptor() {
+    use std::os::fd::AsFd as _;
+    let dir = aterm_tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+    let names = |listing: &mut mine::Dir| {
+        let mut names: Vec<String> = listing
+            .by_ref()
+            .map(|e| String::from_utf8_lossy(e.unwrap().file_name().to_bytes()).into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let mut listing = mine::Dir::new(open_root_mine(dir.path())).unwrap();
+    let first = names(&mut listing);
+    assert_eq!(
+        Outcome::Names(first.clone()),
+        run_reference(dir.path(), &Op::ReadDir, &mut Identities::default())
+    );
+    assert_eq!(
+        listing.next().map(|e| e.is_ok()),
+        None,
+        "the stream is spent"
+    );
+
+    let held = mine::fstat(listing.as_fd()).unwrap();
+    let meta = std::fs::symlink_metadata(dir.path()).unwrap();
+    assert_eq!((held.st_dev, held.st_ino), (meta.dev(), meta.ino()));
+    mine::mkdirat(listing.as_fd(), "made-since", mine::Mode::RWXU).unwrap();
+    assert!(dir.path().join("made-since").is_dir());
+
+    listing.rewind();
+    let again = names(&mut listing);
+    let mut want = first;
+    want.push("made-since".to_owned());
+    want.sort();
+    assert_eq!(again, want);
 }

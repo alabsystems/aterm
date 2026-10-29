@@ -1022,9 +1022,9 @@ fn drive_chromium(
         .unwrap_or("?")
         .to_string();
     let server = serve::Server::start(site).map_err(Stop::CouldNotRun)?;
-    let cpu = page(&mut cdp, &server.origin(), "cpu")?;
-    let gpu = page(&mut cdp, &server.origin(), "gpu")?;
-    let worker = page(&mut cdp, &server.origin(), "worker");
+    let cpu = page(&mut cdp, &server, "cpu")?;
+    let gpu = page(&mut cdp, &server, "gpu")?;
+    let worker = page(&mut cdp, &server, "worker");
     let served = server.served();
     drop(server);
     let _ = cdp.call(None, "Browser.close", json!({}));
@@ -1193,8 +1193,10 @@ fn posted(kind: &str, body: &[u8]) -> Result<judge::Answer, Stop> {
     judge::parse(answer).map_err(fail)
 }
 
-/// Open `<origin>/<kind>.html` in a fresh DevTools target, run its lane, and close the tab.
-fn page(cdp: &mut cdp::Cdp, origin: &str, kind: &str) -> Result<Page, Stop> {
+/// Open `<origin>/<kind>.html` in a fresh DevTools target, run its lane (waited for while it
+/// beats, [`serve::hang_at`]), and close the tab.
+fn page(cdp: &mut cdp::Cdp, server: &serve::Server, kind: &str) -> Result<Page, Stop> {
+    let origin = server.origin();
     let fail = |what: String| Stop::Fail(format!("the {kind} page: {what}"));
     let target = cdp
         .call(None, "Target.createTarget", json!({"url": "about:blank"}))
@@ -1240,10 +1242,11 @@ fn page(cdp: &mut cdp::Cdp, origin: &str, kind: &str) -> Result<Page, Stop> {
         aterm_json::to_string(&spec()).unwrap_or_default()
     );
     let t0 = Instant::now();
-    let result = cdp.call(
+    let result = cdp.call_beating(
         Some(&session),
         "Runtime.evaluate",
         json!({"expression": expression, "awaitPromise": true, "returnByValue": true}),
+        server.beats(),
     );
     let evaluate_ms = ms(t0);
     let console = cdp.take_console(&session);

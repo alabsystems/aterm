@@ -722,6 +722,38 @@ fn materialize_visible_text(
         }
     }
 
+    // A grid draws no text lines; its current cell is what a screen reader hears, announced as
+    // it changes. (The viewport's own value stays its document key: the virtual-text contract
+    // resolves the surface by it.)
+    if let Some(grid) = spec.grid.as_ref() {
+        let cell_key = UiKey::new(format!("{}/grid-cell", key.as_str()));
+        let cell_id = id_for(&cell_key);
+        if let Some(first) = by_id.insert(cell_id, cell_key.clone()) {
+            return Err(AccessibilityProjectionError::IdCollision {
+                first,
+                second: cell_key,
+            });
+        }
+        let mut cell_node = Node::new(Role::Label);
+        cell_node.set_description("Current cell");
+        announce_live(
+            &mut cell_node,
+            Live::Polite,
+            &crate::native_ui::editor_grid_cell_words(grid),
+        );
+        cell_node.set_bounds(Rect {
+            x0: f64::from(geometry.text_x),
+            y0: f64::from(geometry.body_y),
+            x1: f64::from(rect.right()),
+            y1: f64::from(geometry.body_y + geometry.body_h),
+        });
+        pending.push(PendingNode {
+            id: cell_id,
+            node: cell_node,
+            children: Vec::new(),
+        });
+    }
+
     if let Some(status) = spec
         .semantic_status
         .as_deref()
@@ -2223,6 +2255,7 @@ mod tests {
                     document_key: "document:18446744073709551615".to_string(),
                     selectable: true,
                     projection: Some(visible),
+                    grid: None,
                     preedit: String::new(),
                     preedit_caret: None,
                     status: Some("1 config error · Save blocked".to_string()),
@@ -2422,6 +2455,7 @@ mod tests {
                         total_lines: 10_000_000,
                         lines,
                     }),
+                    grid: None,
                     preedit: String::new(),
                     preedit_caret: None,
                     status: None,

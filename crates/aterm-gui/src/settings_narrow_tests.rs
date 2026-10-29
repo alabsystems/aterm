@@ -79,9 +79,16 @@ fn routed(
 
 /// The painted words under any of `prefixes` that are not whole.
 pub(super) fn cut_words(compiled: &crate::native_ui::CompiledUi, prefixes: &[&str]) -> Vec<String> {
-    compiled
-        .paint_audit_lines()
-        .into_iter()
+    cut_words_in(&compiled.paint_audit_lines(), prefixes)
+}
+
+/// The words of `lines` (a screen's [`paint_audit_lines`]) under any of `prefixes` that are not
+/// whole: [`cut_words`] for a screen whose audit serves more than one check.
+///
+/// [`paint_audit_lines`]: crate::native_ui::CompiledUi::paint_audit_lines
+fn cut_words_in(lines: &[String], prefixes: &[&str]) -> Vec<String> {
+    lines
+        .iter()
         .filter(|line| {
             line.strip_prefix("paint-text key=\"").is_some_and(|rest| {
                 prefixes.iter().any(|prefix| rest.starts_with(prefix))
@@ -91,6 +98,7 @@ pub(super) fn cut_words(compiled: &crate::native_ui::CompiledUi, prefixes: &[&st
                             .is_some_and(|(_, painted)| painted.contains('\u{2026}')))
             })
         })
+        .cloned()
         .collect()
 }
 
@@ -114,24 +122,244 @@ pub(super) fn spilled_nodes(
         .collect()
 }
 
+/// Plain pages keep their words, names and controls in narrow windows, one walk of each page
+/// serving every check: About's wordmark is whole and its type fits its box on the top screen at
+/// every width from 164pt to 1200pt, every height from 348pt to 900pt and every text size; at 1x
+/// and 2x in every narrow window, About's card of facts paints every name and value whole and
+/// inside its box; a setting name wrapped on Harness, AI and Software Update fills the box it is
+/// drawn in (no line breaks before a word that would fit, except where that lets the last line
+/// hold Changed); Harness's and About's buttons keep their words and stay in their column, and are
+/// drawn; a stacked choice (active tab colour, preferred AI) keeps its words with no ellipsis, a
+/// chip standing in for an empty label, and is listed; and a stacked switch on Keyboard & Input,
+/// Security, Windows & Tabs, Software Update and Packages is never wider than its line, its
+/// control's words whole, the page drawing switches.
 #[test]
-fn a_card_of_facts_paints_every_name_and_value_whole_at_phone_width() {
-    at_each_text_scale(&[1.0, 2.0], "facts at phone width", |scale| {
-        for width in NARROW_WIDTHS {
-            for height in NARROW_HEIGHTS {
-                let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
-                for (index, screen) in screens_of(|_, _| {}, SettingsRoute::About, width, height)
-                    .iter()
-                    .enumerate()
-                {
-                    let prefixes = ["about/provenance/", "about/font-credits/"];
-                    let cut = cut_words(screen, &prefixes);
-                    assert!(cut.is_empty(), "{context} screen {index}: {cut:#?}");
-                    let spilled = spilled_nodes(screen, &prefixes);
-                    assert!(spilled.is_empty(), "{context} screen {index}: {spilled:#?}");
+fn a_plain_narrow_page_keeps_its_words_names_and_controls() {
+    const WORDMARK: &str = "about_s_wordmark_is_whole_at_every_size";
+    const FACTS: &str = "a_card_of_facts_paints_every_name_and_value_whole_at_phone_width";
+    const NAMES: &str = "a_wrapped_name_fills_the_box_it_is_drawn_in";
+    const BUTTONS: &str = "a_button_keeps_its_words_in_a_narrow_column";
+    const CHOICE: &str = "a_stacked_choice_keeps_its_words";
+    const SWITCH: &str = "a_stacked_switch_is_never_wider_than_its_line";
+    const WORDMARK_WIDTHS: [f32; 9] = [
+        164.0, 178.0, 192.0, 234.0, 276.0, 318.0, 584.0, 744.0, 1_200.0,
+    ];
+    const WORDMARK_HEIGHTS: [f32; 4] = [348.0, 420.0, 516.0, 900.0];
+    const STACKED_WIDTHS: [f32; 4] = [178.0, 192.0, 234.0, 276.0];
+    const CHOICE_WIDTHS: [f32; 3] = [178.0, 192.0, 234.0];
+    const STACKED_HEIGHT: f32 = 516.0;
+    at_each_text_scale(&[1.0, 1.5, 2.0], "plain narrow pages", |scale| {
+        // Every check but the wordmark's runs at 1x and 2x only.
+        let checked = [1.0, 2.0].contains(&scale);
+        let mut cases = Vec::new();
+        if checked {
+            for route in [
+                SettingsRoute::Harness,
+                SettingsRoute::Ai,
+                SettingsRoute::SoftwareUpdate,
+            ] {
+                for width in NARROW_WIDTHS {
+                    for height in NARROW_HEIGHTS {
+                        cases.push((route, width, height));
+                    }
+                }
+            }
+            for route in [
+                SettingsRoute::KeyboardInput,
+                SettingsRoute::Security,
+                SettingsRoute::WindowTabs,
+                SettingsRoute::Packages,
+            ] {
+                for width in STACKED_WIDTHS {
+                    cases.push((route, width, STACKED_HEIGHT));
                 }
             }
         }
+        for width in WORDMARK_WIDTHS {
+            for height in WORDMARK_HEIGHTS {
+                cases.push((SettingsRoute::About, width, height));
+            }
+        }
+        on_workers(&cases, "plain narrow pages", |&(route, width, height)| {
+            let narrow =
+                checked && NARROW_WIDTHS.contains(&width) && NARROW_HEIGHTS.contains(&height);
+            let stacked = checked && height == STACKED_HEIGHT;
+            let wordmark = route == SettingsRoute::About;
+            let facts = wordmark && narrow;
+            let names = matches!(
+                route,
+                SettingsRoute::Harness | SettingsRoute::Ai | SettingsRoute::SoftwareUpdate
+            );
+            let buttons_under: Option<&[&str]> = match route {
+                SettingsRoute::Harness if narrow && stacked => Some(&[
+                    harness_page::HARNESS_REFRESH,
+                    harness_page::HARNESS_OPEN_CONFIG,
+                    harness_page::HARNESS_AI_CLIS,
+                    harness_page::HARNESS_TAB_CONTROL,
+                ]),
+                SettingsRoute::About if narrow && stacked => {
+                    Some(&["about/copy-build-info", "about/open-site"])
+                }
+                _ => None,
+            };
+            let choice = match route {
+                SettingsRoute::WindowTabs => Some(prefs::EDIT_ACTIVE_TAB_COLOR),
+                SettingsRoute::Ai => Some(prefs::EDIT_AI_PREFERRED),
+                _ => None,
+            }
+            .filter(|_| stacked && CHOICE_WIDTHS.contains(&width));
+            let switch = stacked
+                && STACKED_WIDTHS.contains(&width)
+                && matches!(
+                    route,
+                    SettingsRoute::KeyboardInput
+                        | SettingsRoute::Security
+                        | SettingsRoute::WindowTabs
+                        | SettingsRoute::SoftwareUpdate
+                        | SettingsRoute::Packages
+                );
+            let sized = format!("{scale}\u{d7} {width}\u{d7}{height}");
+            let named = format!("{scale}\u{d7} {width} {}", route.label());
+            let chosen = choice.map(|key| (format!("{scale}\u{d7} {width} {key}"), key));
+            // The wordmark's check reads the top screen alone: an About window no other check
+            // walks renders just that one ([`top_screen_of`] is [`screens_of`]' first).
+            let screens = if wordmark && !facts {
+                vec![top_screen_of(route, width, height)]
+            } else {
+                screens_of(|_, _| {}, route, width, height)
+            };
+            let mut faults = Vec::new();
+            let (mut buttons, mut seen, mut switches) = (0, false, 0);
+            for (index, screen) in screens.iter().enumerate() {
+                let audit_lines = std::cell::OnceCell::new();
+                let cut_under = |prefixes: &[&str]| {
+                    cut_words_in(
+                        audit_lines.get_or_init(|| screen.paint_audit_lines()),
+                        prefixes,
+                    )
+                };
+                if wordmark && index == 0 {
+                    match screen.text_fit_audit_line(&UiKey::new("about/wordmark")) {
+                        None => faults.push(format!("{WORDMARK}: {sized}: the wordmark is drawn")),
+                        Some(audit) if !audit.contains(" overflow=false ") => {
+                            faults.push(format!("{WORDMARK}: {sized}: {audit}"));
+                        }
+                        Some(_) => {}
+                    }
+                    match screen
+                        .paint
+                        .iter()
+                        .find(|node| node.key.as_str() == "about/wordmark")
+                    {
+                        None => {
+                            faults.push(format!("{WORDMARK}: {sized}: the wordmark is painted"));
+                        }
+                        Some(node) => {
+                            let (px, face) =
+                                crate::native_ui::wordmark_typography("aterm", node.rect.width);
+                            let fits =
+                                crate::tray_raster::ui_text_width_for(face, "aterm", px.get())
+                                    <= node.rect.width + 0.01;
+                            if !fits {
+                                faults.push(format!(
+                                    "{WORDMARK}: {sized}: the wordmark's type fits its {}pt box",
+                                    node.rect.width
+                                ));
+                            }
+                        }
+                    }
+                }
+                if facts {
+                    let prefixes = ["about/provenance/", "about/font-credits/"];
+                    let cut = cut_under(&prefixes);
+                    if !cut.is_empty() {
+                        faults.push(format!("{FACTS}: {sized} screen {index}: {cut:#?}"));
+                    }
+                    let spilled = spilled_nodes(screen, &prefixes);
+                    if !spilled.is_empty() {
+                        faults.push(format!("{FACTS}: {sized} screen {index}: {spilled:#?}"));
+                    }
+                }
+                if names {
+                    let early = early_breaks(screen);
+                    if !early.is_empty() {
+                        faults.push(format!(
+                            "{NAMES}: {sized} {} screen {index}: {early:#?}",
+                            route.label()
+                        ));
+                    }
+                }
+                if let Some(prefixes) = buttons_under {
+                    buttons += screen
+                        .paint
+                        .iter()
+                        .filter(|node| {
+                            !node.peek && prefixes.iter().any(|key| node.key.as_str() == *key)
+                        })
+                        .count();
+                    let cut = cut_under(prefixes);
+                    if !cut.is_empty() {
+                        faults.push(format!("{BUTTONS}: {named} screen {index}: {cut:#?}"));
+                    }
+                    let spilled = spilled_nodes(screen, prefixes);
+                    if !spilled.is_empty() {
+                        faults.push(format!("{BUTTONS}: {named} screen {index}: {spilled:#?}"));
+                    }
+                }
+                if let Some((context, key)) = &chosen {
+                    let control = format!("settings/control/{key}");
+                    if let Some(node) = screen
+                        .paint
+                        .iter()
+                        .find(|node| !node.peek && node.key.as_str() == control)
+                    {
+                        seen = true;
+                        if let UiContent::Button(button) = &node.content {
+                            let painted = button.spec.visual_label.clone().unwrap_or_default();
+                            let whole = !painted.contains('\u{2026}')
+                                && (!painted.is_empty() || button.spec.chip.is_some());
+                            if !whole {
+                                faults.push(format!("{CHOICE}: {context}: {painted:?}"));
+                            }
+                            let cut = cut_under(&[control.as_str()]);
+                            if !cut.is_empty() {
+                                faults.push(format!("{CHOICE}: {context}: {cut:#?}"));
+                            }
+                        } else {
+                            faults.push(format!("{CHOICE}: {context}: a button"));
+                        }
+                    }
+                }
+                if switch {
+                    switches += screen
+                        .paint
+                        .iter()
+                        .filter(|node| matches!(node.content, UiContent::Switch(_)))
+                        .count();
+                    let spilled = spilled_nodes(
+                        screen,
+                        &["settings/control/", "settings/reset", "settings/controls/"],
+                    );
+                    if !spilled.is_empty() {
+                        faults.push(format!("{SWITCH}: {named} screen {index}: {spilled:#?}"));
+                    }
+                    let cut = cut_under(&["settings/control/"]);
+                    if !cut.is_empty() {
+                        faults.push(format!("{SWITCH}: {named} screen {index}: {cut:#?}"));
+                    }
+                }
+            }
+            if buttons_under.is_some() && buttons == 0 {
+                faults.push(format!("{BUTTONS}: {named}: the buttons are drawn"));
+            }
+            if let Some((context, _)) = chosen.as_ref().filter(|_| !seen) {
+                faults.push(format!("{CHOICE}: {context}: the row is listed"));
+            }
+            if switch && switches == 0 {
+                faults.push(format!("{SWITCH}: {named}: the page draws switches"));
+            }
+            assert!(faults.is_empty(), "{}", faults.join("\n"));
+        });
     });
 }
 
@@ -223,40 +451,6 @@ fn a_fact_that_wraps_taller_beside_its_name_stacks() {
     });
 }
 
-#[test]
-fn a_stacked_switch_is_never_wider_than_its_line() {
-    at_each_text_scale(&[1.0, 2.0], "switches at phone width", |scale| {
-        for width in [178.0, 192.0, 234.0, 276.0] {
-            for route in [
-                SettingsRoute::KeyboardInput,
-                SettingsRoute::Security,
-                SettingsRoute::WindowTabs,
-                SettingsRoute::SoftwareUpdate,
-                SettingsRoute::Packages,
-            ] {
-                let context = format!("{scale}\u{d7} {width} {}", route.label());
-                let mut switches = 0;
-                for (index, screen) in screens_of(|_, _| {}, route, width, 516.0)
-                    .iter()
-                    .enumerate()
-                {
-                    let prefixes = ["settings/control/", "settings/reset", "settings/controls/"];
-                    switches += screen
-                        .paint
-                        .iter()
-                        .filter(|node| matches!(node.content, UiContent::Switch(_)))
-                        .count();
-                    let spilled = spilled_nodes(screen, &prefixes);
-                    assert!(spilled.is_empty(), "{context} screen {index}: {spilled:#?}");
-                    let cut = cut_words(screen, &["settings/control/"]);
-                    assert!(cut.is_empty(), "{context} screen {index}: {cut:#?}");
-                }
-                assert!(switches > 0, "{context}: the page draws switches");
-            }
-        }
-    });
-}
-
 /// The setting names on `compiled` broken onto a next line whose first word would have fit.
 pub(super) fn early_breaks(compiled: &crate::native_ui::CompiledUi) -> Vec<String> {
     let mut lines: BTreeMap<String, Vec<(usize, String, f32)>> = BTreeMap::new();
@@ -299,30 +493,6 @@ pub(super) fn early_breaks(compiled: &crate::native_ui::CompiledUi) -> Vec<Strin
         }
     }
     early
-}
-
-#[test]
-fn a_wrapped_name_fills_the_box_it_is_drawn_in() {
-    at_each_text_scale(&[1.0, 2.0], "names fill their boxes", |scale| {
-        for width in NARROW_WIDTHS {
-            for height in NARROW_HEIGHTS {
-                for route in [
-                    SettingsRoute::Harness,
-                    SettingsRoute::Ai,
-                    SettingsRoute::SoftwareUpdate,
-                ] {
-                    let context = format!("{scale}\u{d7} {width}\u{d7}{height} {}", route.label());
-                    for (index, screen) in screens_of(|_, _| {}, route, width, height)
-                        .iter()
-                        .enumerate()
-                    {
-                        let early = early_breaks(screen);
-                        assert!(early.is_empty(), "{context} screen {index}: {early:#?}");
-                    }
-                }
-            }
-        }
-    });
 }
 
 #[test]
@@ -513,87 +683,6 @@ fn a_reset_place_never_costs_a_name_more_than_a_line_of_its_own() {
 }
 
 #[test]
-fn a_stacked_choice_keeps_its_words() {
-    at_each_text_scale(&[1.0, 2.0], "stacked choices", |scale| {
-        for width in [178.0, 192.0, 234.0] {
-            for (route, key) in [
-                (SettingsRoute::WindowTabs, prefs::EDIT_ACTIVE_TAB_COLOR),
-                (SettingsRoute::Ai, prefs::EDIT_AI_PREFERRED),
-            ] {
-                let context = format!("{scale}\u{d7} {width} {key}");
-                let control = format!("settings/control/{key}");
-                let mut seen = false;
-                for screen in screens_of(|_, _| {}, route, width, 516.0) {
-                    let Some(node) = screen
-                        .paint
-                        .iter()
-                        .find(|node| !node.peek && node.key.as_str() == control)
-                    else {
-                        continue;
-                    };
-                    seen = true;
-                    let UiContent::Button(button) = &node.content else {
-                        panic!("{context}: a button");
-                    };
-                    let painted = button.spec.visual_label.clone().unwrap_or_default();
-                    assert!(
-                        !painted.contains('\u{2026}')
-                            && (!painted.is_empty() || button.spec.chip.is_some()),
-                        "{context}: {painted:?}"
-                    );
-                    let cut = cut_words(&screen, &[control.as_str()]);
-                    assert!(cut.is_empty(), "{context}: {cut:#?}");
-                }
-                assert!(seen, "{context}: the row is listed");
-            }
-        }
-    });
-}
-
-#[test]
-fn a_button_keeps_its_words_in_a_narrow_column() {
-    at_each_text_scale(&[1.0, 2.0], "buttons at phone width", |scale| {
-        for width in NARROW_WIDTHS {
-            for (route, prefixes) in [
-                (
-                    SettingsRoute::Harness,
-                    &[
-                        harness_page::HARNESS_REFRESH,
-                        harness_page::HARNESS_OPEN_CONFIG,
-                        harness_page::HARNESS_AI_CLIS,
-                        harness_page::HARNESS_TAB_CONTROL,
-                    ][..],
-                ),
-                (
-                    SettingsRoute::About,
-                    &["about/copy-build-info", "about/open-site"][..],
-                ),
-            ] {
-                let context = format!("{scale}\u{d7} {width} {}", route.label());
-                let mut buttons = 0;
-                for (index, screen) in screens_of(|_, _| {}, route, width, 516.0)
-                    .iter()
-                    .enumerate()
-                {
-                    buttons += screen
-                        .paint
-                        .iter()
-                        .filter(|node| {
-                            !node.peek && prefixes.iter().any(|key| node.key.as_str() == *key)
-                        })
-                        .count();
-                    let cut = cut_words(screen, prefixes);
-                    assert!(cut.is_empty(), "{context} screen {index}: {cut:#?}");
-                    let spilled = spilled_nodes(screen, prefixes);
-                    assert!(spilled.is_empty(), "{context} screen {index}: {spilled:#?}");
-                }
-                assert!(buttons > 0, "{context}: the buttons are drawn");
-            }
-        }
-    });
-}
-
-#[test]
 fn a_text_button_paints_its_labels_lines() {
     at_each_text_scale(&[2.0], "button lines", |_| {
         let _ = view_cx();
@@ -627,37 +716,6 @@ fn a_text_button_paints_its_labels_lines() {
             .text_fit_audit_line(&UiKey::new("site"))
             .expect("the label is audited");
         assert!(audit.contains(" overflow=false "), "{audit}");
-    });
-}
-
-#[test]
-fn about_s_wordmark_is_whole_at_every_size() {
-    at_each_text_scale(&[1.0, 1.5, 2.0], "the wordmark", |scale| {
-        for width in [
-            164.0, 178.0, 192.0, 234.0, 276.0, 318.0, 584.0, 744.0, 1_200.0,
-        ] {
-            for height in [348.0, 420.0, 516.0, 900.0] {
-                let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
-                let screens = screens_of(|_, _| {}, SettingsRoute::About, width, height);
-                let screen = &screens[0];
-                let audit = screen
-                    .text_fit_audit_line(&UiKey::new("about/wordmark"))
-                    .unwrap_or_else(|| panic!("{context}: the wordmark is drawn"));
-                assert!(audit.contains(" overflow=false "), "{context}: {audit}");
-                let node = screen
-                    .paint
-                    .iter()
-                    .find(|node| node.key.as_str() == "about/wordmark")
-                    .expect("painted");
-                let (px, face) = crate::native_ui::wordmark_typography("aterm", node.rect.width);
-                assert!(
-                    crate::tray_raster::ui_text_width_for(face, "aterm", px.get())
-                        <= node.rect.width + 0.01,
-                    "{context}: the wordmark's type fits its {}pt box",
-                    node.rect.width
-                );
-            }
-        }
     });
 }
 
@@ -957,39 +1015,52 @@ fn messages_small_buttons_stay_on_the_page() {
 
 #[test]
 fn harness_keeps_its_words_with_sessions_open() {
+    let workers = std::thread::available_parallelism()
+        .map_or(SWEEP_WORKERS, |n| n.get().div_ceil(2).max(SWEEP_WORKERS));
     at_each_text_scale(&[1.0, 2.0], "Harness sessions", |scale| {
-        let mut parts = 0;
+        let mut windows = Vec::new();
         for width in NARROW_WIDTHS {
             for height in NARROW_HEIGHTS {
                 for (fixture, state) in [
-                    ("", super::harness::fixture()),
-                    (" landings", super::harness::fixture_landings()),
+                    ("", super::harness::fixture as fn() -> _),
+                    (" landings", super::harness::fixture_landings as fn() -> _),
                 ] {
-                    let context = format!("{scale}\u{d7} {width}\u{d7}{height}{fixture}");
-                    let prepare = |runtime: &mut NativeRuntime, _: crate::native_app::ViewId| {
-                        assert!(runtime.replace_settings_harness(state.clone(), 1));
-                    };
-                    for (index, screen) in
-                        screens_of(prepare, SettingsRoute::Harness, width, height)
-                            .iter()
-                            .enumerate()
-                    {
-                        parts += screen
-                            .paint
-                            .iter()
-                            .filter(|node| node.key.as_str().contains("/block/part-"))
-                            .count();
-                        let cut = cut_words(screen, &["harness/"])
-                            .into_iter()
-                            .filter(|line| !says_it_is_under_way(line))
-                            .collect::<Vec<_>>();
-                        assert!(cut.is_empty(), "{context} screen {index}: {cut:#?}");
-                        let spilled = spilled_nodes(screen, &["harness/", "settings/control/"]);
-                        assert!(spilled.is_empty(), "{context} screen {index}: {spilled:#?}");
-                    }
+                    windows.push((width, height, fixture, state));
                 }
             }
         }
+        // Each window's walk on a worker of its rung, from a runtime of its own.
+        let parts = std::sync::atomic::AtomicUsize::new(0);
+        on_n_workers(
+            workers,
+            &windows,
+            "Harness sessions",
+            |&(width, height, fixture, state)| {
+                let context = format!("{scale}\u{d7} {width}\u{d7}{height}{fixture}");
+                let prepare = |runtime: &mut NativeRuntime, _: crate::native_app::ViewId| {
+                    assert!(runtime.replace_settings_harness(state(), 1));
+                };
+                for (index, screen) in screens_of(prepare, SettingsRoute::Harness, width, height)
+                    .iter()
+                    .enumerate()
+                {
+                    let shown = screen
+                        .paint
+                        .iter()
+                        .filter(|node| node.key.as_str().contains("/block/part-"))
+                        .count();
+                    parts.fetch_add(shown, std::sync::atomic::Ordering::Relaxed);
+                    let cut = cut_words(screen, &["harness/"])
+                        .into_iter()
+                        .filter(|line| !says_it_is_under_way(line))
+                        .collect::<Vec<_>>();
+                    assert!(cut.is_empty(), "{context} screen {index}: {cut:#?}");
+                    let spilled = spilled_nodes(screen, &["harness/", "settings/control/"]);
+                    assert!(spilled.is_empty(), "{context} screen {index}: {spilled:#?}");
+                }
+            },
+        );
+        let parts = parts.into_inner();
         if scale > 1.5 {
             assert!(
                 parts > 0,
@@ -1129,15 +1200,15 @@ fn search_results_and_modified_keep_their_words() {
                     }
                     let cx = view_cx_at(width, height);
                     each_screen(&mut runtime, instance, view, &cx, |screen, top| {
-                        let cut = cut_words(screen, &prefixes)
+                        let lines = screen.paint_audit_lines();
+                        let cut = cut_words_in(&lines, &prefixes)
                             .into_iter()
                             .filter(|line| !line.ends_with("painted=\"Reset All\u{2026}\""))
                             .collect::<Vec<_>>();
                         assert!(cut.is_empty(), "{context} screen {top}: {cut:#?}");
                         let spilled = spilled_nodes(screen, &prefixes);
                         assert!(spilled.is_empty(), "{context} screen {top}: {spilled:#?}");
-                        wrapped += screen
-                            .paint_audit_lines()
+                        wrapped += lines
                             .iter()
                             .filter(|line| {
                                 line.starts_with("paint-text key=\"settings/search/page/")
@@ -2333,20 +2404,24 @@ pub(super) fn every_page_runtime_over(
         } else {
             "local".to_string()
         },
-        os_version: "Mac16,5 \u{b7} Darwin 26 \u{b7} macOS 26.1 \u{b7} OpenSSH_9.9p2".to_string(),
+        os_version: Some(
+            "Mac16,5 \u{b7} Darwin 26 \u{b7} macOS 26.1 \u{b7} OpenSSH_9.9p2".to_string(),
+        ),
         status: if lan { "advertised" } else { "online" }.to_string(),
         vitals: if lan {
             String::new()
         } else {
             "CPU 14% \u{b7} GPU 6% \u{b7} RAM 38.2/128.0 GiB (30%) \u{b7} up 5d 11h".to_string()
         },
-        instances: 1,
-        tabs: 2,
-        ai_clis: 1,
-        active_ai: 1,
+        instances: Some(1),
+        tabs: Some(2),
+        ai_clis: Some(1),
+        active_ai: Some(1),
+        session_scope: Default::default(),
     };
     let tab = |key: &str, title: &str, ai: bool, local_id: u64| TabSpreadsheetRow {
         key: key.to_string(),
+        computer_id: "local".into(),
         computer: "m111-MacBook-Pro-M4-Max-128GB-8TB (this Mac)".to_string(),
         instance: "this aterm (pid 1000)".to_string(),
         place: "Tab #0*! (Window 1) \u{b7} 102\u{d7}29".to_string(),
@@ -2355,11 +2430,13 @@ pub(super) fn every_page_runtime_over(
         state: "alive".to_string(),
         program: "Claude Code".to_string(),
         is_ai_cli: ai,
+        active_ai: Some(ai),
         ai_status: "working: Bash \u{b7} targo test (14s)".to_string(),
         autopilot: "land (supervised)".to_string(),
         human: "12s ago".to_string(),
         vitals: "CPU 8.4% \u{b7} RSS 142 MiB".to_string(),
         show_local_id: Some(local_id),
+        cached_observation: None,
     };
     harness.tabs = TabControlState {
         computers: vec![
@@ -2379,6 +2456,7 @@ pub(super) fn every_page_runtime_over(
             tab("local/8", "zsh", false, 8),
         ],
         fleet: crate::harness_screen::FleetScope::Account,
+        lan_waits: None,
     };
     assert!(runtime.replace_settings_harness(harness, 1));
     (runtime, instance, view)

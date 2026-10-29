@@ -296,6 +296,7 @@ fn derived_session_log_ring_proves_and_catches_each_law() {
             "CarryShedUncounted",
             "CrashSameEpoch",
             "RefoldFromRing",
+            "EvictRiderAsDetail",
         ],
     );
     let settle = |m: &aterm_spec::derive::Model, s: &mut aterm_spec::interp::State| {
@@ -307,6 +308,7 @@ fn derived_session_log_ring_proves_and_catches_each_law() {
                 "EvictOldDetail",
                 "EvictTurnDetail",
                 "EvictClosedOpen",
+                "EvictClosedOpenRider",
                 "EvictClose",
                 "EvictTurnClose",
                 "EvictCurrent",
@@ -333,6 +335,28 @@ fn derived_session_log_ring_proves_and_catches_each_law() {
         ),
         (0, 0, 1, 1, 1, 2),
         "the close outlives its detail and its open"
+    );
+
+    let mut r = model.init_state();
+    for action in ["OpenRun", "AmendRun", "CloseRun"] {
+        assert!(model.fire(action, &mut r), "{action}: {r:?}");
+        settle(&model, &mut r);
+    }
+    assert_eq!(
+        (r["ocl"], r["orid"], r["onamed"], r["cls"]),
+        (1, 1, 1, 1),
+        "a named run's open and the amend that named it, closed"
+    );
+    assert!(model.fire("MarkOutside", &mut r));
+    assert!(
+        !model.action_enabled("EvictClosedOpen", &r),
+        "a named open never goes without its rider"
+    );
+    settle(&model, &mut r);
+    assert_eq!(
+        (r["ocl"], r["orid"], r["onamed"], r["lost"]),
+        (0, 0, 0, 2),
+        "the open and its rider go together, both counted"
     );
 
     let mut p = model.init_state();
@@ -417,6 +441,7 @@ fn derived_session_log_ring_proves_and_catches_each_law() {
             "EvictOldDetail",
             "EvictTurnDetail",
             "EvictClosedOpen",
+            "EvictClosedOpenRider",
             "EvictClose",
             "EvictTurnClose",
             "EvictCurrent",
@@ -929,6 +954,56 @@ fn derived_session_log_claims_proves_and_catches_each_law() {
 }
 
 #[test]
+fn derived_session_log_escalation_breaks_each_law_first_and_walks_its_paths() {
+    let model = aterm_models_session::session_log_escalation_model();
+    assert_every_invariant_breaks_first(&model);
+    assert_committed_dead_actions(
+        &model,
+        &[
+            "CloseStepKeepsBinding",
+            "ClearUncovers",
+            "EscalateOnTheSession",
+        ],
+    );
+    let fire = |s: &mut aterm_spec::interp::State, path: &[&str]| {
+        for action in path {
+            assert!(model.fire(action, s), "{action}: {s:?}");
+        }
+    };
+    let mut s = model.init_state();
+    fire(&mut s, &["OpenStep", "Escalate"]);
+    assert_eq!(
+        (s["e"], s["top"]),
+        (1, 1),
+        "an ask on the open box is the box's, under its own need"
+    );
+    fire(&mut s, &["CloseStep"]);
+    assert_eq!(
+        (s["e"], s["a"], s["top"]),
+        (0, 1, 0),
+        "the close ends it before the harness's clear"
+    );
+    fire(&mut s, &["OpenStep", "Reraise"]);
+    assert_eq!(
+        (s["e"], s["top"]),
+        (1, 1),
+        "the next box's ask is that box's"
+    );
+    fire(&mut s, &["HarnessClear"]);
+    assert_eq!(
+        (s["e"], s["top"]),
+        (0, 1),
+        "the clear leaves the box's own need"
+    );
+    fire(&mut s, &["EscalateWait", "CloseStep"]);
+    assert_eq!(
+        (s["e"], s["top"]),
+        (2, 2),
+        "a wait is the session's and outlives the box"
+    );
+}
+
+#[test]
 fn derived_transcript_join_proves_and_catches_each_law() {
     let model = aterm_models_session::transcript_join_model();
     assert_proves_and_catches(&model);
@@ -1002,6 +1077,7 @@ fn derived_transcript_join_proves_and_catches_each_law() {
     for a in ["Bind", "SetPartial", "ScreenBusy", "Age", "PromptShare"] {
         assert!(model.fire(a, &mut partial));
     }
+    assert_eq!(partial["own"], 0, "the screen's turn");
     assert!(!model.action_enabled("TxEndCloses", &partial));
     assert!(model.fire("TxEndHeld", &mut partial));
     assert_eq!(partial["lt"], 1);
@@ -1035,10 +1111,19 @@ fn derived_transcript_join_proves_and_catches_each_law() {
     let running = fired(&[&ran[..], &["ScreenRest", "ScreenBusy"]].concat());
     assert_eq!((running["lt"], running["vm"]), (1, 1), "continued");
 
-    let first = fired(&["Bind", "SetPartial", "PromptUnmapped", "ScreenBusy"]);
-    assert_eq!((first["lt"], first["vm"]), (2, 1));
-    let stale = fired(&["Bind", "SetPartial", "PromptUnmapped", "Age", "ScreenBusy"]);
+    let first = fired(&["Bind", "SetPartial", "CarriedUnmapped", "ScreenBusy"]);
+    assert_eq!((first["lt"], first["vm"], first["own"]), (2, 1, 0));
+    let stale = fired(&["Bind", "SetPartial", "CarriedUnmapped", "Age", "ScreenBusy"]);
     assert_eq!((stale["lt"], stale["vm"], stale["vo"]), (1, 3, 1));
+
+    // Fix E1: a partial prompt with no turn open opens its own, and ends and supersedes
+    // only that one; the screen's turn still only shares the vendor turn.
+    let own = fired(&["Bind", "SetPartial", "PromptOpens"]);
+    assert_eq!((own["lt"], own["vm"], own["own"]), (2, 1, 1));
+    assert!(model.action_enabled("TxEndCloses", &own), "its own turn");
+    assert!(!model.action_enabled("TxEndHeld", &own));
+    assert!(model.action_enabled("PromptSupersede", &own));
+    assert!(!model.action_enabled("PromptShare", &own));
 
     let old = fired(&["Bind", "ScreenBusy", "PromptOld"]);
     assert_eq!((old["lt"], old["vm"], old["vo"]), (1, 3, 1));
@@ -1069,6 +1154,82 @@ fn derived_transcript_join_proves_and_catches_each_law() {
         "ScreenBusy",
     ]);
     assert!(!model.action_enabled("PromptLateNear", &held));
+}
+
+#[test]
+fn derived_claimed_turn_edges_proves_and_catches_each_law() {
+    let model = aterm_models_session::claimed_turn_edges_model();
+    assert_proves_and_catches(&model);
+    assert_every_invariant_breaks_first(&model);
+    assert_committed_dead_actions(
+        &model,
+        &["BeginSkipsFifo", "BeginUnfed", "EndClosesUntaken"],
+    );
+    let fired = |path: &[&str]| {
+        let mut s = model.init_state();
+        for action in path {
+            assert!(model.fire(action, &mut s), "{action}: {s:?}");
+        }
+        s
+    };
+
+    let held = fired(&[
+        "Prompt1",
+        "RowEnd1",
+        "Parse",
+        "FeedBegin1",
+        "Parse",
+        "FeedEnd1",
+    ]);
+    assert_eq!(
+        (held["x1"], held["u1"], held["c1"]),
+        (2, 0, 0),
+        "the rollout's closed turn holds the span"
+    );
+    let open = fired(&["Prompt1", "Parse", "FeedBegin1", "Parse", "FeedEnd1"]);
+    assert_eq!(
+        (open["x1"], open["u1"], open["c1"]),
+        (2, 0, 0),
+        "the rollout's open turn closes at the engine's end"
+    );
+
+    let mut lag = fired(&["Prompt1", "RowEnd1", "Parse", "Parse"]);
+    assert!(
+        !model.action_enabled("Prompt2", &lag),
+        "the second prompt waits for the first beginning's feed"
+    );
+    for action in ["FeedBegin1", "Prompt2", "FeedEnd1"] {
+        assert!(model.fire(action, &mut lag), "{action}: {lag:?}");
+    }
+    assert_eq!(
+        (lag["x2"], lag["u2"], lag["xc2"]),
+        (1, 1, 0),
+        "the first end leaves the second turn's untaken turn running"
+    );
+    for action in ["Parse", "FeedBegin2", "Parse", "FeedEnd2"] {
+        assert!(model.fire(action, &mut lag), "{action}: {lag:?}");
+    }
+    assert_eq!((lag["x2"], lag["u2"], lag["xc2"], lag["c2"]), (2, 0, 1, 0));
+
+    let claimed = fired(&[
+        "Parse",
+        "Parse",
+        "Parse",
+        "Parse",
+        "FeedBegin1",
+        "FeedEnd1",
+        "FeedBegin2",
+        "FeedEnd2",
+        "Prompt1",
+        "RowEnd1",
+        "Prompt2",
+    ]);
+    assert_eq!(
+        (claimed["c1"], claimed["c2"], claimed["n1"], claimed["n2"]),
+        (2, 2, 1, 1),
+        "a late rollout names each claim turn"
+    );
+    assert_eq!((claimed["x1"], claimed["x2"]), (0, 0));
 }
 
 #[test]

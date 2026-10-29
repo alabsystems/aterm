@@ -145,6 +145,7 @@ fn shell_command(shell: &str) -> ShellCommand {
         "ATERM_INTEGRATION_POINTER",
         "VISUAL",
         "EDITOR",
+        "ATERM_DEFAULT_EDITOR",
         "TERM_PROGRAM",
         "TERM_PROGRAM_VERSION",
         "AGY_CLI_FAST_PROMPT_EDITOR",
@@ -1266,6 +1267,16 @@ fn test_prepare_unknown_returns_none() {
         !base.exists(),
         "prepare_into(Unknown) must not create the cache directory"
     );
+    let cached_root = dir.path().join("cached-si");
+    assert!(
+        prepare_cached(ShellType::Unknown, cached_root.clone(), &Mutex::new(None))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !cached_root.exists(),
+        "prepare_cached(Unknown) must not create the cache directory"
+    );
 }
 
 /// Source the fish integration in an interactive fish, run `body`, and return its stdout.
@@ -1941,9 +1952,24 @@ fn test_wsl_cwd_env_only_crosses_a_posix_path() {
 #[test]
 fn test_prepare_cmd_wraps_the_prompt_with_marks_and_cwd() {
     let dir = aterm_tempfile::tempdir().unwrap();
-    let mut injection = prepare_into(ShellType::Cmd, &dir.path().join("si"))
-        .unwrap()
-        .unwrap();
+    let si = dir.path().join("si");
+    assert!(prepare_into(ShellType::Cmd, &si).unwrap().is_some());
+    assert!(
+        !si.exists(),
+        "prepare_into(Cmd) must not write script files cmd.exe never reads"
+    );
+    let cached_root = dir.path().join("cached-si");
+    assert!(
+        prepare_cached(ShellType::Cmd, cached_root.clone(), &Mutex::new(None))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        !cached_root.exists(),
+        "prepare_cached(Cmd) must not write script files cmd.exe never reads"
+    );
+
+    let mut injection = prepare_cmd_with_prompt(None);
     assert!(
         injection.argv_override.is_none(),
         "the injection is %PROMPT%"
@@ -1994,6 +2020,7 @@ fn test_cmd_prompt_wraps_an_inherited_prompt_once() {
 #[test]
 fn test_posix_scripts_are_written_lf_only() {
     assert_eq!(lf_only("a\r\nb\r\n"), "a\nb\n");
+    assert_eq!(lf_only("a\r\nb\rc\r\n"), "a\nb\nc\n");
     let dir = aterm_tempfile::tempdir().unwrap();
     let base = dir.path().join("si");
     prepare_into(ShellType::Bash, &base).unwrap().unwrap();
@@ -3041,12 +3068,8 @@ impl LiveFixture {
             self.bin.to_str().expect("UTF-8"),
         );
         assert!(
-            path.starts_with(&format!("{reroute}:{agents}:")),
-            "{label}: PATH must lead with reroute then agents: {path:?}"
-        );
-        assert!(
-            path.ends_with(&format!(":{bin}")),
-            "{label}: the managed bin/ must stay LAST: {path:?}"
+            path.starts_with(&format!("{reroute}:{agents}:{bin}:")),
+            "{label}: PATH must lead with reroute, agents, and bin: {path:?}"
         );
         for (name, dir) in [("reroute", reroute), ("agents", agents), ("bin", bin)] {
             assert_eq!(

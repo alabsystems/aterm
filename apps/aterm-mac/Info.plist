@@ -124,8 +124,10 @@
 	     reads of its peers); every other is a program run inside it (`aterm machines`'
 	     ssh and dns-sd, ssh to a LAN host, an agent's dev server). NSBonjourServices
 	     names the three service types `aterm machines scan` browses with /usr/bin/dns-sd,
-	     and `_alab-vault._tcp`, the service `aterm secrets serve` registers when advertising
-	     beside its `<name>.local` host (docs/DESIGN-secrets-2026-10-20.md §9). -->
+	     `_alab-vault._tcp`, the service `aterm secrets serve` registers when advertising
+	     beside its `<name>.local` host (docs/DESIGN-secrets-2026-10-20.md §9), and
+	     `_alab._tcp`, the service `aterm node serve` registers on the ALab network
+	     (docs/DESIGN-alab-swarm-2026-10-27.md §12.3 C23). -->
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>aterm syncs approved ALab Commons devices and connects its fleet on your local network. aterm machines and programs you run inside aterm — your shell, builds and agents — share this access.</string>
 	<key>NSBonjourServices</key>
@@ -134,6 +136,7 @@
 		<string>_sftp-ssh._tcp</string>
 		<string>_rfb._tcp</string>
 		<string>_alab-vault._tcp</string>
+		<string>_alab._tcp</string>
 	</array>
 </dict>
 </plist>

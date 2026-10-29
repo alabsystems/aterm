@@ -229,9 +229,20 @@ mod shift_enter_e2e_tests {
             b"\x1b[?0u",
             "undefined high bits must be masked out of the pushed flags"
         );
-        term.process(b"\x1b[=257;1u");
+        term.process(b"\x1b[>289u");
         term.process(b"\x1b[?u");
-        assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?1u");
+        assert_eq!(
+            term.take_response().unwrap_or_default(),
+            b"\x1b[?1u",
+            "push masks to the five defined flags (0b1_1111), clearing bit 5 (32) as well as bit 8"
+        );
+        term.process(b"\x1b[=290;1u");
+        term.process(b"\x1b[?u");
+        assert_eq!(
+            term.take_response().unwrap_or_default(),
+            b"\x1b[?2u",
+            "set masks to the five defined flags (0b1_1111)"
+        );
     }
 
     #[test]

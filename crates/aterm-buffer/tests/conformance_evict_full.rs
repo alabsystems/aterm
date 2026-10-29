@@ -8,7 +8,7 @@ use aterm_buffer::{Edit, Surface};
 use aterm_models_session::evict_full_model;
 use std::collections::BTreeSet;
 
-const CAP: u64 = 1 << 16;
+const CAP: u64 = aterm_buffer::MAX_LOG_EVENTS as u64;
 
 #[test]
 fn real_eventlog_live_set_is_contiguous_window() {

@@ -1,79 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Wayland cursors via cursor-shape-v1 and `libwayland-cursor.so.0`.
+//! Wayland cursor themes via `libwayland-cursor.so.0`.
 
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 
-use crate::protocols::cursor_shape_v1::wp_cursor_shape_device_v1::shape;
 use crate::proxy::{Error, Proxy};
-
-/// A pointer shape aterm shows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Icon {
-    Default,
-    Pointer,
-    ColResize,
-    RowResize,
-    Text,
-    Grabbing,
-}
-
-impl Icon {
-    /// Every icon.
-    pub const ALL: [Icon; 6] = [
-        Icon::Default,
-        Icon::Pointer,
-        Icon::ColResize,
-        Icon::RowResize,
-        Icon::Text,
-        Icon::Grabbing,
-    ];
-
-    /// Its cursor-shape-v1 shape.
-    #[inline]
-    pub const fn shape(self) -> u32 {
-        match self {
-            Icon::Default => shape::DEFAULT,
-            Icon::Pointer => shape::POINTER,
-            Icon::ColResize => shape::COL_RESIZE,
-            Icon::RowResize => shape::ROW_RESIZE,
-            Icon::Text => shape::TEXT,
-            Icon::Grabbing => shape::GRABBING,
-        }
-    }
-
-    /// Its theme names, the CSS name first.
-    #[inline]
-    pub const fn names(self) -> &'static [&'static CStr] {
-        match self {
-            Icon::Default => &[
-                c"default",
-                c"left_ptr",
-                c"arrow",
-                c"top_left_arrow",
-                c"left_arrow",
-            ],
-            Icon::Pointer => &[c"pointer", c"hand2", c"hand1", c"hand", c"pointing_hand"],
-            Icon::ColResize => &[
-                c"col-resize",
-                c"split_h",
-                c"h_double_arrow",
-                c"sb_h_double_arrow",
-            ],
-            Icon::RowResize => &[
-                c"row-resize",
-                c"split_v",
-                c"v_double_arrow",
-                c"sb_v_double_arrow",
-            ],
-            Icon::Text => &[c"text", c"xterm", c"ibeam"],
-            Icon::Grabbing => &[c"grabbing", c"closedhand"],
-        }
-    }
-}
 
 /// `struct wl_cursor_image`.
 #[repr(C)]
@@ -161,12 +95,6 @@ impl Theme {
         NonNull::new(raw)
             .map(|raw| Theme { lib, raw })
             .ok_or(Error::NoObject)
-    }
-
-    /// The first frame of `icon`, under the first of its names the theme has.
-    #[inline]
-    pub fn frame(&self, icon: Icon) -> Option<Frame> {
-        self.frame_named(icon.names())
     }
 
     /// The first frame of the cursor under the first of `names` the theme has.

@@ -298,6 +298,7 @@ fn read_on_thread(mut pipe: PipeReader, reply: mpsc::Sender<Option<String>>) {
     let _ = std::thread::Builder::new().name("wayland-clipboard-recv".into()).spawn(move || {
         let deadline = Instant::now() + PASTE_TIMEOUT;
         let mut bytes = Vec::new();
+        let mut truncated = false;
         let mut buf = [0u8; 8192];
         loop {
             if Instant::now() >= deadline {
@@ -309,6 +310,7 @@ fn read_on_thread(mut pipe: PipeReader, reply: mpsc::Sender<Option<String>>) {
                     bytes.extend_from_slice(&buf[..n]);
                     if bytes.len() >= MAX_PASTE_BYTES {
                         bytes.truncate(MAX_PASTE_BYTES);
+                        truncated = true;
                         break;
                     }
                 },
@@ -319,8 +321,22 @@ fn read_on_thread(mut pipe: PipeReader, reply: mpsc::Sender<Option<String>>) {
                 Err(_) => break,
             }
         }
-        let _ = reply.send(String::from_utf8(bytes).ok().filter(|s| !s.is_empty()));
+        let _ = reply.send(decode_paste_bytes(bytes, truncated));
     });
+}
+
+fn decode_paste_bytes(bytes: Vec<u8>, truncated: bool) -> Option<String> {
+    let text = match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) if truncated && e.utf8_error().error_len().is_none() => {
+            let valid_len = e.utf8_error().valid_up_to();
+            let mut bytes = e.into_bytes();
+            bytes.truncate(valid_len);
+            String::from_utf8(bytes).ok()?
+        },
+        Err(_) => return None,
+    };
+    (!text.is_empty()).then_some(text)
 }
 
 /// The MIME type a paste asks a foreign offer for.
@@ -655,6 +671,21 @@ mod tests {
 
     #[test]
     fn a_copy_with_no_fresh_input_behind_it_still_reaches_the_system_clipboard() {
+        let mut unreleasing = FakeSeat::new();
+        let lost: Vec<String> = FOUR
+            .iter()
+            .map(|text| {
+                unreleasing.slot = (*text).to_owned();
+                unreleasing.claim(WaylandSelection::Clipboard, 4426);
+                unreleasing.read()
+            })
+            .collect();
+        assert_eq!(
+            lost,
+            ["ZULU-00-aaaa", "ZULU-00-aaaa", "ZULU-02-cccc", "ZULU-02-cccc"],
+            "negative control: claiming without releasing loses every other copy",
+        );
+
         let mut seat = FakeSeat::new();
         for text in FOUR {
             assert!(seat.copy_text(text, 4426).placed(), "{text} was refused");
@@ -672,20 +703,6 @@ mod tests {
             Step::Destroy(1),
             Step::SetSelection { source: 2, serial: 4426 },
         ]);
-    }
-
-    #[test]
-    fn claiming_before_releasing_loses_every_other_copy_and_leaves_the_text_before_it() {
-        let mut seat = FakeSeat::new();
-        let read_back: Vec<String> = FOUR
-            .iter()
-            .map(|text| {
-                seat.slot = (*text).to_owned();
-                seat.claim(WaylandSelection::Clipboard, 4426);
-                seat.read()
-            })
-            .collect();
-        assert_eq!(read_back, ["ZULU-00-aaaa", "ZULU-00-aaaa", "ZULU-02-cccc", "ZULU-02-cccc"]);
     }
 
     #[test]
@@ -775,5 +792,17 @@ mod tests {
         assert_eq!(handle.paste(WaylandSelection::Primary), None);
         shared.lock().unwrap().clipboard = None;
         assert_eq!(handle.paste_owned(WaylandSelection::Clipboard), None);
+    }
+
+    #[test]
+    fn paste_truncation_mid_codepoint_keeps_complete_prefix_only_when_capped() {
+        // 3-byte UTF-8 '中' = E4 B8 AD cut after 2 bytes at the paste cap keeps "hello".
+        assert_eq!(decode_paste_bytes(b"hello\xE4\xB8".to_vec(), true).as_deref(), Some("hello"));
+        // Without cap truncation, an incomplete trailing UTF-8 sequence is rejected.
+        assert_eq!(decode_paste_bytes(b"hello\xE4\xB8".to_vec(), false), None);
+        // An invalid interior byte is still rejected even when truncated at the cap.
+        assert_eq!(decode_paste_bytes(b"he\xFFllo\xE4".to_vec(), true), None);
+        // Only incomplete bytes with no complete codepoint yields None.
+        assert_eq!(decode_paste_bytes(b"\xE4\xB8".to_vec(), true), None);
     }
 }

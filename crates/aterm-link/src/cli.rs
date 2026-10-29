@@ -214,7 +214,7 @@ fn column(raw: &str) -> String {
 const ELLIPSIS: &str = "%E2%80%A6";
 
 fn roster(cfg: &Config, attention_only: bool) -> std::io::Result<()> {
-    let (mut client, _closer) = transport::connect(&cfg.broker, crate::fabric::IO_TIMEOUT)
+    let (mut client, _closer) = transport::connect(&cfg.broker, crate::fabric::io_timeout())
         .map_err(|e| {
             std::io::Error::new(
                 e.kind(),

@@ -401,6 +401,19 @@ pub enum Intent {
         /// The asking machine's key (`age1…`).
         recipient: String,
     },
+    /// Allow the Mac whose request this member's desk heard as `request`: the member shows a
+    /// phrase in a native sheet for a person to type on that Mac
+    /// (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.3.1). A person's own press on this Mac's
+    /// screen only ([`Intent::person_only`]), never a row's primary ([`Intent::never_default`]).
+    AllowJoin {
+        /// The request's handle on this member's desk.
+        request: u64,
+    },
+    /// Hide the request this member's desk heard as `request` on this Mac.
+    IgnoreJoin {
+        /// The request's handle on this member's desk.
+        request: u64,
+    },
     /// Restart one of macOS's own services that holds far too much memory, in a tab that asks
     /// for the administrator's password once (`aterm_vitals::services::RESTARTS`).
     RestartService {
@@ -471,6 +484,8 @@ impl Intent {
             Self::EndRecovered => "End sessions",
             Self::ReviewVaultSync => "System State",
             Self::ApproveJoin { .. } => "Approve",
+            Self::AllowJoin { .. } => "Allow",
+            Self::IgnoreJoin { .. } => "Ignore",
             Self::RestartService { .. } => "Restart",
         }
     }
@@ -508,6 +523,8 @@ impl Intent {
             Self::EndRecovered => "End",
             Self::ReviewVaultSync => "System",
             Self::ApproveJoin { .. } => "Approve",
+            Self::AllowJoin { .. } => "Allow",
+            Self::IgnoreJoin { .. } => "Ignore",
             Self::RestartService { .. } => "Restart",
         }
     }
@@ -517,7 +534,16 @@ impl Intent {
     #[inline]
     #[must_use]
     pub const fn never_default(&self) -> bool {
-        matches!(self, Self::ApproveJoin { .. })
+        matches!(self, Self::ApproveJoin { .. } | Self::AllowJoin { .. })
+    }
+
+    /// An intent only a person's own input on this Mac may press: `notice act`, a fleet drive
+    /// and a control client's gesture are refused it (`docs/DESIGN-fluid-swarm-2026-10-28.md`
+    /// §3.3.5).
+    #[inline]
+    #[must_use]
+    pub const fn person_only(&self) -> bool {
+        matches!(self, Self::AllowJoin { .. })
     }
 
     /// Only `NotNow` closes its row.
@@ -626,6 +652,8 @@ impl Intent {
             Self::ApproveJoin { recipient } => {
                 format!("approve-join:{}", escape_payload(recipient))
             }
+            Self::AllowJoin { request } => format!("allow-join:{request}"),
+            Self::IgnoreJoin { request } => format!("ignore-join:{request}"),
             Self::RestartService { service } => {
                 format!("restart-service:{}", escape_payload(service))
             }
@@ -701,6 +729,12 @@ impl Intent {
                     && recipient.bytes().all(|b| b.is_ascii_alphanumeric()))
                 .then_some(Self::ApproveJoin { recipient })
             }
+            "allow-join" => Some(Self::AllowJoin {
+                request: payload.parse().ok()?,
+            }),
+            "ignore-join" => Some(Self::IgnoreJoin {
+                request: payload.parse().ok()?,
+            }),
             "restart-service" => {
                 let service = unescape_payload(payload);
                 service_name(&service).then_some(Self::RestartService { service })
@@ -807,6 +841,8 @@ pub(crate) fn every_intent() -> Vec<Intent> {
         Intent::ApproveJoin {
             recipient: "age1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqs3290gq".into(),
         },
+        Intent::AllowJoin { request: 7 },
+        Intent::IgnoreJoin { request: 7 },
         Intent::RestartService {
             service: "fseventsd".into(),
         },

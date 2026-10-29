@@ -47,7 +47,10 @@ unstable = []
 
 [dev-dependencies]
 # No differential oracle: a registry `once_cell` would make `-p once_cell`
-# ambiguous. tests/behaviour.rs asserts the contracts directly.
+# ambiguous. tests/behaviour.rs asserts the contracts directly and binds
+# `sync::OnceCell`'s gate protocol to `OnceCellGateProtocol`.
+aterm-models-core.workspace = true
+aterm-spec.workspace = true
 
 [lints]
 workspace = true

@@ -3,9 +3,9 @@
 
 //! The negative controls' fault points (`tests/conformance_lifecycle.rs`): each a planted
 //! defect of the lifetime `VzLifecycle` models (`docs/DESIGN-vz-guest-2026-10-23.md` §5.1,
-//! §12), armed on one thread for one walk, so the walk shows the conformance seeing it and
-//! the model's mutant naming the law it breaks. Test and debug builds only; nothing arms one
-//! outside a test.
+//! §12), armed on each thread that runs one of a walk's replays, so the walk shows the
+//! conformance seeing it and the model's mutant naming the law it breaks. Test and debug
+//! builds only; nothing arms one outside a test.
 
 use std::cell::Cell;
 

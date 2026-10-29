@@ -46,6 +46,14 @@ pub enum BloomGate {
     Open,
     /// The page's text holds the bloom: it draws none.
     Held,
+    /// The bloom draws, but the post passes (the bloom and the SDR crown) take
+    /// no light from within their reach of a lettered cell: the letter guard
+    /// keeps every letter at its bar on the light the frame composites, and the
+    /// passes' spill would lift a letter's ground past what it weighed (looks10
+    /// L1: Lumen's newest letter read 6.25:1 on the dark page and 4.37 bloomed).
+    /// The trail's own lights are drawn whole; only their blur and crown are
+    /// withheld near the text.
+    SparesLetters,
 }
 
 impl BloomGate {
@@ -56,11 +64,30 @@ impl BloomGate {
         if held { Self::Held } else { Self::Open }
     }
 
+    /// [`Self::Held`] when `held`, else [`Self::SparesLetters`] when `spares`,
+    /// else [`Self::Open`].
+    #[must_use]
+    #[inline]
+    pub const fn sparing(held: bool, spares: bool) -> Self {
+        match (held, spares) {
+            (true, _) => Self::Held,
+            (false, true) => Self::SparesLetters,
+            (false, false) => Self::Open,
+        }
+    }
+
     /// Whether the bloom is held.
     #[must_use]
     #[inline]
     pub const fn held(self) -> bool {
         matches!(self, Self::Held)
+    }
+
+    /// Whether the post passes keep their source off the lettered cells.
+    #[must_use]
+    #[inline]
+    pub const fn spares_letters(self) -> bool {
+        matches!(self, Self::SparesLetters)
     }
 }
 
@@ -1247,6 +1274,8 @@ pub struct RenderInput {
     pub snapshot_seq: u64,
     /// Content-only arrival clock at the fill; damage-only frames do not advance it.
     pub content_seq: u64,
+    /// When the screen last changed at the fill ([`Terminal::drawn_at`](crate::terminal::Terminal::drawn_at), the parse's clock), read under the same lock as [`content_seq`](Self::content_seq): a frame that first sees output long after it was drawn is showing history, not arrival.
+    pub drawn_at: Option<aterm_time::Instant>,
     /// Parser batch sequence at the fill.
     pub process_sequence: u32,
     /// Present-time latency hint.
@@ -1259,6 +1288,10 @@ pub struct RenderInput {
     pub engine_fill_seq: u64,
     /// Whether the stamping terminal's alternate screen was active at fill time.
     pub engine_alt: bool,
+    /// The stamping terminal's active grid at fill time
+    /// ([`Grid::instance`](crate::grid::Grid::instance)): [`content_seq`](Self::content_seq) is
+    /// that grid's clock and starts over on a new one, so this names whose clock it is.
+    pub grid_instance: u64,
     /// Which column order the last engine fill left this snapshot's rows in.
     pub engine_row_order: RowOrder,
     /// Per-row content revision ([`Grid::row_revisions`](crate::grid::Grid::row_revisions)), captured under the cells' lock, so a consumer diffing two snapshots (`aterm_render::compute_dirty_rows`) answers "did row `r` change?" with a `u64` compare.
@@ -1696,12 +1729,14 @@ impl RenderInput {
         self.chrome_rasters.clone_from(&source.chrome_rasters);
         self.snapshot_seq = source.snapshot_seq;
         self.content_seq = source.content_seq;
+        self.drawn_at = source.drawn_at;
         self.process_sequence = source.process_sequence;
         self.input_hot = source.input_hot;
         self.terminal_id = source.terminal_id;
         self.extract_gen = source.extract_gen;
         self.engine_fill_seq = source.engine_fill_seq;
         self.engine_alt = source.engine_alt;
+        self.grid_instance = source.grid_instance;
         self.engine_row_order = source.engine_row_order;
         self.row_rev.clone_from(&source.row_rev);
         self.row_rev_lane = source.row_rev_lane;
@@ -1793,12 +1828,14 @@ impl RenderInput {
             chrome_rasters: Vec::new(),
             snapshot_seq: 0,
             content_seq: 0,
+            drawn_at: None,
             process_sequence: 0,
             input_hot: false,
             terminal_id: 0,
             extract_gen: 0,
             engine_fill_seq: 0,
             engine_alt: false,
+            grid_instance: 0,
             engine_row_order: RowOrder::Logical,
             row_rev: Vec::new(),
             row_rev_lane: 0,

@@ -18,21 +18,15 @@ impl EditorWorkspace {
         self.global_mark_ring.truncate(MARK_RING_LIMIT);
     }
 
-    /// Carry `document`'s marks through a commit this workspace made, so a
-    /// mark stays on the text it was set at.
+    /// Carry `document`'s marks through a commit the workspace's one writer
+    /// made (a command's, an agent's, a reload's), so a mark stays on the
+    /// text it was set at.
     pub(super) fn rebase_marks(&mut self, document: DocumentId, deltas: &[EditDelta]) {
         for mark in &mut self.global_mark_ring {
             if mark.document == document {
                 mark.offset = rebase_position(mark.offset, deltas);
             }
         }
-    }
-
-    /// Carry `document`'s marks through a commit made outside this workspace
-    /// (a reload from disk), as [`EditorBufferView::observe_external`] carries
-    /// a view's carets.
-    pub fn observe_external(&mut self, document: DocumentId, deltas: &[EditDelta]) {
-        self.rebase_marks(document, deltas);
     }
 
     fn last_mark(&self, document: DocumentId, text: &str) -> Option<usize> {

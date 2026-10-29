@@ -11,13 +11,11 @@ use std::sync::Arc;
 
 use amacs::editor::{
     CloseWhy, EditorBufferView, EditorEffect, EditorError, EditorLines, EditorWorkspace, Keymap,
-    Profile, Selection, line_starts_capped,
+    Origin, Profile, Selection, line_starts_capped,
 };
 use amacs::input::{EditorInput, Follow};
 use amacs::language::{Language, LexCache};
-use amacs::store::{
-    DocumentError, DocumentId, DocumentStore, DocumentTxnOutcome, DocumentViewId, TextEdit,
-};
+use amacs::store::{DocumentError, DocumentId, DocumentStore, DocumentViewId};
 use amacs_files::host::{
     self as files, AdmitOptions, DEFAULT_DOCUMENT_LIMIT, DocumentGrantStore, DocumentHostError,
     DocumentPersistenceStore, GrantAccess, PersistenceError,
@@ -345,7 +343,7 @@ const fn error_text(error: &EditorError) -> &'static str {
         EditorError::NothingToRedo => "No further redo information",
         EditorError::NoKill => "Kill ring is empty",
         EditorError::MacroRecursion => "A keyboard macro cannot run itself",
-        EditorError::HistoryDiverged { .. } => "The undo history no longer matches the buffer",
+        EditorError::UndoRefused { .. } => "That undo was refused",
         EditorError::StaleView { .. } | EditorError::TransactionConflict { .. } => {
             "The buffer changed under that command; try it again"
         }
@@ -451,6 +449,11 @@ impl Tui {
             .map_err(refused)?;
         let mut store = DocumentStore::new(self.write);
         let document = store.open(uri, granted.text.clone());
+        // A file whose every line ends CRLF is held with LF: a yank writes a kill's CRLF as LF.
+        self.workspace.crlf_on_disk = matches!(
+            granted.observed.encoding().eol,
+            amacs_files::io::LineEnding::CrLf
+        );
         let mut persistence = DocumentPersistenceStore::default();
         persistence
             .register(document, granted.grant.id, granted.observed, &granted.text)
@@ -773,7 +776,10 @@ impl Tui {
         let reduction = match reduction {
             Ok(reduction) => reduction,
             Err(error) => {
-                self.status = Some(error_text(&error).to_string());
+                self.status = Some(match error {
+                    EditorError::UndoRefused { why } => why,
+                    error => error_text(&error).to_string(),
+                });
                 return Ok(None);
             }
         };
@@ -806,6 +812,13 @@ impl Tui {
                 self.save(buffer);
             }
             EditorEffect::RevertDocument { .. } => self.revert(buffer),
+            EditorEffect::KeepDocument { .. } => {
+                self.status = Some(
+                    "This terminal does not watch the file: C-x C-s overwrites it, M-x \
+                     revert-buffer reloads it"
+                        .to_string(),
+                );
+            }
             EditorEffect::CloseView { why } => return Ok(self.close(buffer, why)),
             EditorEffect::KillBuffer { query } => {
                 let query = query.trim();
@@ -993,7 +1006,7 @@ impl Tui {
     }
 
     fn revert(&mut self, buffer: &mut Buffer) {
-        match reload(buffer) {
+        match reload(&mut self.workspace, buffer) {
             Ok(()) => {
                 buffer.overwrite = false;
                 self.status = Some(format!("Reverted {}", buffer.path.display()));
@@ -1070,29 +1083,28 @@ fn take_disk_version(buffer: &mut Buffer) -> Result<(), String> {
         .map_err(|error| save_words::words(Speaker::Amacs, &buffer.path, &Failure::Begin(&error)))
 }
 
-fn reload(buffer: &mut Buffer) -> Result<(), String> {
+/// Take the file's text into the buffer as one labelled frame through the
+/// workspace's one writer: the smallest edits, so the caret stays on its
+/// text, and C-/ brings the buffer's text back.
+fn reload(workspace: &mut EditorWorkspace, buffer: &mut Buffer) -> Result<(), String> {
     let fresh = read_disk(buffer, false)?;
     let before = buffer
         .store
         .snapshot(buffer.document)
         .ok_or_else(|| "the buffer is gone".to_string())?;
-    let (seq, deltas) = if *before.text == *fresh.text {
-        (before.seq, Vec::new())
-    } else {
-        match buffer.store.transact(
-            buffer.document,
-            before.seq,
-            vec![TextEdit {
-                range: 0..before.text.len(),
-                insert: fresh.text.clone(),
-            }],
-        ) {
-            DocumentTxnOutcome::Committed { seq, deltas, .. } => (seq, deltas),
-            DocumentTxnOutcome::Conflict { .. } => {
-                return Err("the buffer changed while it was reloaded".to_string());
-            }
-            DocumentTxnOutcome::Rejected(error) => return Err(store_words(&error).to_string()),
+    let (seq, deltas) = match workspace.replace_text(
+        &mut buffer.store,
+        buffer.document,
+        before.seq,
+        &fresh.text,
+        Origin::Revert,
+    ) {
+        Ok(committed) => committed,
+        Err(EditorError::TransactionConflict { .. }) => {
+            return Err("the buffer changed while it was reloaded".to_string());
         }
+        Err(EditorError::UnknownDocument) => return Err("the buffer is gone".to_string()),
+        Err(_) => return Err("the buffer refused the edit".to_string()),
     };
     buffer
         .persistence
@@ -1157,6 +1169,36 @@ pub fn run_tui(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G2 review: a kill holding CRLF (from a file held byte for byte) yanked into a file whose
+    /// every line ends CRLF goes in as LF, the text it is held as, so the file does not save CR
+    /// CR LF. *Control:* before `crlf_on_disk` the yank wrote `x\r\ny` into the LF-held text.
+    #[test]
+    fn a_crlf_kill_yanks_into_a_crlf_file_as_its_held_lf() {
+        use aterm_tty::tty::MemTty;
+
+        // SAFETY: the test is a launcher with no untrusted input; its capability
+        // is used only for this scratch document.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let mut tui = Tui::new(
+            authority.grant(aterm_cap::Tier::Trusted),
+            Options::default(),
+        );
+        let scratch = aterm_tempfile::TempDir::new().unwrap();
+        let path = scratch.path().join("held.txt");
+        std::fs::write(&path, "a\r\nb\r\n").unwrap();
+        let mut buffer = tui.open(&Target { path, line: None }).unwrap();
+        assert_eq!(buffer.text().as_ref(), "a\nb\n", "held with LF");
+        tui.workspace.kill_ring.push_front("x\r\ny".to_string());
+        let (mut tty, _peer) = MemTty::pair(Size { cols: 80, rows: 24 });
+        let yank = EditorInput::Key {
+            key: Key::Character('y'),
+            mods: Modifiers::CTRL,
+            text: None,
+        };
+        assert!(tui.input(&mut tty, &mut buffer, yank).unwrap().is_none());
+        assert_eq!(buffer.text().as_ref(), "x\nya\nb\n");
+    }
 
     #[test]
     fn input_releases_commit_projections_even_after_a_partial_macro_error() {

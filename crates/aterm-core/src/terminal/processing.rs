@@ -65,9 +65,18 @@ impl Terminal {
             return KittyAnimationStep::default();
         }
         let (_, mut handler) = self.split_for_process();
-        let (advanced, next_frame_at) = handler.advance_kitty_animations(now);
+        let (advanced, mutated, next_frame_at) = handler.advance_kitty_animations(now);
         if advanced {
             self.transient.screen_mutations = self.transient.screen_mutations.wrapping_add(1);
+        }
+        if mutated {
+            self.host_journal.push_at(
+                super::HostOp::AdvanceKittyAnimations,
+                ClockReading {
+                    monotonic: now,
+                    wall_ms: None,
+                },
+            );
         }
         KittyAnimationStep {
             advanced,
@@ -1434,6 +1443,7 @@ mod tests {
     #[test]
     fn process_at_is_deterministic_under_injected_clock() {
         use super::ClockReading;
+        use crate::terminal::program_state::{ProgramApp, ProgramStateWord, ProgramTurn, TurnEdge};
         use aterm_time::Instant;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1448,11 +1458,14 @@ mod tests {
             (b"\x1b]133;B\x07", 260, 1_260),
             (b"\x1b]133;C\x07", 260, 1_260),
             (b"\x1b]133;D;0\x07", 260, 1_260), // finished -> mark recorded
+            (b"\x1b]7501;state=working:app=codex\x1b\\", 270, 1_270), // a turn begins
+            (b"\x1b]7501;state=done:app=codex\x1b\\", 280, 1_280), // and ends
             (b"z", 2_300, 3_300),              // +2050ms after enable -> sync times out
         ];
 
         type Marks = Vec<(Option<u64>, Option<u64>, Option<u64>)>;
-        let run = |base: Instant| -> (String, bool, usize, Marks) {
+        type Turns = Vec<ProgramTurn>;
+        let run = |base: Instant| -> (String, bool, usize, Marks, Turns) {
             let mut term = Terminal::new(8, 40);
             let bells = Arc::new(AtomicUsize::new(0));
             let bells_cb = Arc::clone(&bells);
@@ -1484,6 +1497,7 @@ mod tests {
                 term.modes().synchronized_output(),
                 bells.load(Ordering::Relaxed),
                 marks,
+                term.program_state().turn_edges().collect(),
             )
         };
 
@@ -1495,7 +1509,7 @@ mod tests {
             "process_at must be deterministic for a fixed (bytes, clock) schedule"
         );
 
-        let (content, sync_on, bell_count, marks) = a;
+        let (content, sync_on, bell_count, marks, turns) = a;
         assert!(content.contains("helloz"), "grid content: {content:?}");
         assert_eq!(
             bell_count, 2,
@@ -1510,6 +1524,19 @@ mod tests {
             marks[0],
             (Some(1_260), Some(1_260), Some(1_260)),
             "command-mark timestamps must equal the injected wall_ms, not host time"
+        );
+        let edge = |seq, wall_ms| TurnEdge {
+            seq,
+            wall_ms: Some(wall_ms),
+        };
+        assert_eq!(
+            turns,
+            [ProgramTurn {
+                app: ProgramApp::Codex,
+                began: Some(edge(1, 1_270)),
+                ended: Some((ProgramStateWord::Done, edge(2, 1_280))),
+            }],
+            "OSC 7501 turn edges must carry the injected wall_ms, not host time"
         );
     }
 }

@@ -432,13 +432,17 @@ mod tests {
             "zip",
             "zip_sha256",
             "linux_x86_64",
+            "linux_x86_64_size",
             "linux_aarch64",
+            "linux_aarch64_size",
             "linux_verifier",
             "dmg_x86_64",
             "dmg_x86_64_sha256",
             "min_os",
             "team_id",
             "pub_date",
+            "machine_id",
+            "roster_seq",
             "changelog",
         ] {
             assert!(

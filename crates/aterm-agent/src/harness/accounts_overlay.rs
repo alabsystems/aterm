@@ -102,6 +102,54 @@ pub fn ensure(seam: Seam, overlay: &Path, default_home: &Path) -> io::Result<Ens
     Ok(out)
 }
 
+/// Turn off Kimi Code's occasional session-rating prompt in `home`'s `tui.toml`, preserving
+/// unrelated settings and comments. An invalid file is left untouched.
+pub fn disable_feedback_survey(home: &Path) -> io::Result<()> {
+    use aterm_toml::edit::{DocumentMut, Item, Value};
+
+    let path = home.join("tui.toml");
+    let target = match std::fs::read_link(&path) {
+        Ok(target) if target.is_absolute() => target,
+        Ok(target) => home.join(target),
+        Err(_) => path,
+    };
+    let text = match std::fs::read_to_string(&target) {
+        Ok(text) => text,
+        Err(why) if why.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(why) => return Err(why),
+    };
+    let mut doc: DocumentMut = text.parse().map_err(|why| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Kimi Code's tui.toml is invalid and was left unchanged: {why}"),
+        )
+    })?;
+    if doc["disable_feedback_survey"].as_bool() == Some(true) {
+        return Ok(());
+    }
+    doc["disable_feedback_survey"] = Item::Value(Value::from(true));
+    let edited = doc.to_string();
+    let after: aterm_toml::Table = aterm_toml::from_str(&edited).map_err(|why| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("edited Kimi Code config would be invalid: {why}"),
+        )
+    })?;
+    if after
+        .get("disable_feedback_survey")
+        .and_then(aterm_toml::Value::as_bool)
+        != Some(true)
+    {
+        return Err(io::Error::other(
+            "edited Kimi Code config did not retain the feedback-survey opt-out",
+        ));
+    }
+    if text != edited {
+        super::upgrade_models::write_atomic_mode(&target, &edited, None)?;
+    }
+    Ok(())
+}
+
 /// Removes `overlay`'s `name` where it is a link to `default_home`'s `name`; leaves any other
 /// entry, and a link to anywhere else.
 fn unlink_own(

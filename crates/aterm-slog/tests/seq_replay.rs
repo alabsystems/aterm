@@ -15,7 +15,7 @@ use aterm_slog::{
 use aterm_spec::derive::{InvariantKind, Model};
 use aterm_spec::interp::{State, admits, with_buggy};
 
-use crate::conformance_transcript::project_parts;
+use crate::conformance_transcript::{self, project_parts};
 use crate::conformance_turn::{self, Rig, Step, handoff};
 use crate::seq_twins::{self, Took};
 use crate::support::{self, WALL0, agent_session, at, time_order_holds};
@@ -106,10 +106,13 @@ pub enum Ev {
     File(u64),
     Bind(u64),
     Tx(Tx),
-    /// Seamless-update tracker carry adoption after `after` ms.
+    /// Seamless-update tracker carry adoption after `after` ms; `unmapped=<vref>` adopts the
+    /// line a pre-E1 predecessor wrote while its partial source held that unmapped vendor
+    /// turn with no turn open ([`crate::conformance_transcript::carried_unmapped`]).
     Adopt {
         keep_tx: bool,
         after: u64,
+        unmapped: Option<ShortId>,
     },
     Expect(Expect),
 }
@@ -540,14 +543,26 @@ fn step(rig: RigKind, toks: &[&str]) -> Result<Ev, String> {
                 w => return Err(format!("`adopt {w}`: keep-tx or drop-tx")),
             };
             let (opts, bare) = split_opts(rest);
-            if let Some(k) = opts.keys().find(|k| **k != "after") {
+            if let Some(k) = opts.keys().find(|k| !["after", "unmapped"].contains(*k)) {
                 return Err(format!("`{k}=` is no option of `adopt`"));
             }
             if !bare.is_empty() {
                 return Err(format!("`{bare:?}` after `adopt {which}`"));
             }
             let after = opts.get("after").map_or(Ok(0), |v| num(v))?;
-            only(!screen, Ev::Adopt { keep_tx, after })
+            let unmapped = match opts.get("unmapped") {
+                None => None,
+                Some(_) if !keep_tx => return Err("`unmapped=` keeps the tx_ tokens".into()),
+                Some(v) => Some(ShortId::new(v).ok_or_else(|| format!("`unmapped={v}` is no id"))?),
+            };
+            only(
+                !screen,
+                Ev::Adopt {
+                    keep_tx,
+                    after,
+                    unmapped,
+                },
+            )
         }
         ["tx", rest @ ..] => only(!screen, Ev::Tx(tx_row(rest)?)),
         _ => Err(format!("`{}` is no step", toks.join(" "))),
@@ -874,9 +889,15 @@ impl TxRig {
                 let pos = self.pos(off, wall);
                 self.call(tx.row.event(), pos);
             }
-            Ev::Adopt { keep_tx, after } => {
+            Ev::Adopt {
+                keep_tx,
+                after,
+                unmapped,
+            } => {
                 let line = self.tracker.carry_line(stamp);
-                let line = if *keep_tx {
+                let line = if let Some(vref) = unmapped {
+                    conformance_transcript::carried_unmapped(&line, *vref, WALL0 + self.now)
+                } else if *keep_tx {
                     line
                 } else {
                     line.split(' ')
@@ -1684,6 +1705,7 @@ pub const JOIN_MUTANTS: &[Mutant] = &[
                     ("wr", 0),
                     ("wd", 1),
                     ("rf", 0),
+                    ("own", 0),
                 ],
             )
         },
@@ -1784,6 +1806,7 @@ pub const JOIN_MUTANTS: &[Mutant] = &[
                     ("vm", 2),
                     ("ve", 1),
                     ("vo", 0),
+                    ("own", 0),
                     ("g", 7),
                 ],
             )
@@ -1813,6 +1836,7 @@ pub const JOIN_MUTANTS: &[Mutant] = &[
                     ("vm", 2),
                     ("ve", 1),
                     ("vo", 0),
+                    ("own", 0),
                     ("g", 8),
                 ],
             )
@@ -1836,6 +1860,7 @@ pub const JOIN_MUTANTS: &[Mutant] = &[
                     ("vc", 0),
                     ("ve", 1),
                     ("vo", 0),
+                    ("own", 0),
                     ("g", 10),
                 ],
             )
@@ -1977,6 +2002,28 @@ fn the_corpus_catches_every_mutant() {
         let model = if *join { "join" } else { "turn" };
         println!("{model} {name}: {}", by.as_deref().unwrap_or("-"));
     }
+}
+
+/// Fix E1: the partial prompt that opens the turn the screen missed is the join model's
+/// `PromptOpens` at `pt = 1`, and the turn it opens is its own: the `PartialCloses` ghost
+/// is not enabled on it, the model's own end is.
+#[test]
+fn a_partial_prompt_with_no_turn_open_is_the_models_prompt_opens() {
+    let m = transcript_join_model();
+    let buggy = with_buggy(&m, 1);
+    let r = replay(
+        &file("tx-partial-a-reply-the-screen-never-saw-busy.seq"),
+        Broken::No,
+    )
+    .expect("the shipping tracker");
+    let states: Vec<&State> = r.trace.iter().filter_map(|t| t.state.as_ref()).collect();
+    let opened = states
+        .windows(2)
+        .find(|w| w[0]["pt"] == 1 && m.successors("PromptOpens", w[0]).contains(w[1]))
+        .expect("the partial prompt is the model's PromptOpens");
+    assert_eq!((opened[1]["lt"], opened[1]["own"]), (2, 1));
+    assert!(!buggy.action_enabled("PartialCloses", opened[1]));
+    assert!(m.action_enabled("TxEndCloses", opened[1]));
 }
 
 #[test]
@@ -2270,6 +2317,8 @@ fn the_parser_refuses_what_the_format_does_not_say() {
         "adopt keep-tx soon=1",
         "adopt drop-tx after=x",
         "adopt keep-tx later",
+        "adopt drop-tx unmapped=v1",
+        "adopt keep-tx unmapped=",
     ] {
         assert!(
             parse("bad.seq", &format!("{tx}{bad}\n")).is_err(),

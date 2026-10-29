@@ -8,7 +8,7 @@
 //! blocks ([`RcBlock`], [`BlockPtr`]), pinned weak references ([`WeakSlot`]),
 //! cached selectors ([`SelCache`]), method swizzling ([`Swizzle`]),
 //! main-thread affinity ([`MainThread`], [`MainThreadBound`], [`run_on_main`]), private serial
-//! dispatch queues ([`SerialQueue`]),
+//! dispatch queues ([`SerialQueue`]), Network.framework's path monitor ([`PathMonitor`]),
 //! run-loop wake timers ([`WakeTimer`]), and [`HasNsView`].
 //!
 //! # Safety conventions
@@ -40,6 +40,7 @@ pub(crate) mod dispatch;
 pub(crate) mod encode;
 pub mod exception;
 pub(crate) mod main_thread_bound;
+pub mod path_monitor;
 pub mod queue;
 pub(crate) mod retained;
 pub(crate) mod runtime;
@@ -59,6 +60,7 @@ pub use dispatch::{ContainedInRunOnMain, run_on_main};
 pub use encode::{Bool, CGPoint, CGRect, CGSize, Encode, NSRange, strip_method_offsets};
 pub use exception::{Contained, ContainedException, InertZero, contain, contained_count, objc_try};
 pub use main_thread_bound::MainThreadBound;
+pub use path_monitor::{PathMonitor, PathReading, PathStatus};
 pub use queue::{ContainedOnQueue, SerialQueue};
 pub use retained::{ClassType, Retained};
 pub use runtime::{

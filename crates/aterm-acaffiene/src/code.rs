@@ -86,8 +86,9 @@ fn is_under(exe: &Path, dir: &Path) -> bool {
 pub fn prepare_copy(origin: &Path, code_dir: &Path, label: &str) -> io::Result<Option<PathBuf>> {
     let Some(bundle) = own_bundle(origin) else {
         #[cfg(unix)]
-        if let Err(e) = discard_copies(code_dir) {
-            eprintln!("aterm acaffiene: {}: {e}", code_dir.display());
+        match discard_copies(code_dir) {
+            Ok(kept) => kept.say(),
+            Err(e) => eprintln!("aterm acaffiene: {}: {e}", code_dir.display()),
         }
         return Ok(None);
     };
@@ -131,7 +132,7 @@ fn copy_bundle(origin: &Path, bundle: &Path, code_dir: &Path, label: &str) -> io
         .file_name()
         .ok_or_else(|| io::Error::other("the bundle has no name"))?;
     private_dir(code_dir)?;
-    sweep(code_dir, std::time::SystemTime::now())?;
+    sweep(code_dir, std::time::SystemTime::now())?.say();
     let slot = code_dir.join(label);
     match std::fs::create_dir(&slot) {
         Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
@@ -251,16 +252,16 @@ fn exclude_from_backup(dir: &Path) {
     }
 }
 
-/// Remove `code_dir` and every copy in it that may go ([`sweep`]).
+/// Remove `code_dir` and every copy in it that may go ([`sweep`]), and return the copies kept.
 ///
 /// # Errors
 /// `code_dir` is not this user's directory, or an entry in it cannot be removed.
 #[cfg(unix)]
-pub fn discard_copies(code_dir: &Path) -> io::Result<()> {
+pub fn discard_copies(code_dir: &Path) -> io::Result<Kept> {
     use std::os::unix::fs::MetadataExt as _;
     let meta = match std::fs::symlink_metadata(code_dir) {
         Ok(meta) => meta,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Kept::default()),
         Err(e) => return Err(e),
     };
     if !meta.file_type().is_dir() || meta.uid() != aterm_uds::peer::our_uid() {
@@ -269,11 +270,41 @@ pub fn discard_copies(code_dir: &Path) -> io::Result<()> {
             format!("{} is not this user's directory", code_dir.display()),
         ));
     }
-    sweep(code_dir, std::time::SystemTime::now())?;
-    if std::fs::read_dir(code_dir)?.next().is_some() {
-        return Ok(());
+    let kept = sweep(code_dir, std::time::SystemTime::now())?;
+    if std::fs::read_dir(code_dir)?.next().is_none() {
+        std::fs::remove_dir(code_dir)?;
     }
-    std::fs::remove_dir(code_dir)
+    Ok(kept)
+}
+
+/// The copies a sweep kept because macOS may still be assessing their first exec, which the
+/// caller says: [`Kept::say`] in the mug's own `code_dir`.
+#[cfg(unix)]
+#[must_use = "each copy kept is said"]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Kept(pub Vec<PathBuf>);
+
+#[cfg(unix)]
+impl Kept {
+    /// Say each copy on stderr ([`kept_line`]): a verb's, or the mug job's log.
+    pub fn say(&self) {
+        for copy in &self.0 {
+            eprintln!("{}", kept_line(copy));
+        }
+    }
+}
+
+/// What a mug or a verb says of a copy in its own `code_dir` that a sweep kept.
+#[cfg(unix)]
+#[must_use]
+pub fn kept_line(copy: &Path) -> String {
+    format!(
+        "aterm acaffiene: kept {}: no mug said it ran from it, so macOS may still be assessing \
+         its first exec; `aterm acaffiene quit` or the next start removes it once the Mac has \
+         been awake {} minutes since",
+        copy.display(),
+        aterm_uds::deadline::FIRST_EXEC_HANG.as_secs() / 60
+    )
 }
 
 #[cfg(unix)]
@@ -298,8 +329,10 @@ fn serves_acaffiene_within(origin: &Path, wait: std::time::Duration) -> Option<b
     out.status.code().map(|code| code == 0)
 }
 
+/// Remove each copy in `dir` that may go at `now` ([`may_go`]), and return the ones kept.
 #[cfg(unix)]
-fn sweep(dir: &Path, now: std::time::SystemTime) -> io::Result<()> {
+fn sweep(dir: &Path, now: std::time::SystemTime) -> io::Result<Kept> {
+    let mut kept_copies = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -317,13 +350,7 @@ fn sweep(dir: &Path, now: std::time::SystemTime) -> io::Result<()> {
             let at = copy.path();
             let dir = copy.file_type()?.is_dir();
             if dir && !may_go(&at, now) {
-                eprintln!(
-                    "aterm acaffiene: kept {}: no mug said it ran from it, so macOS may still be \
-                     assessing its first exec; `aterm acaffiene quit` or the next start removes \
-                     it once the Mac has been awake {} minutes since",
-                    at.display(),
-                    aterm_uds::deadline::FIRST_EXEC_HANG.as_secs() / 60
-                );
+                kept_copies.push(at);
                 kept = true;
                 continue;
             }
@@ -333,7 +360,7 @@ fn sweep(dir: &Path, now: std::time::SystemTime) -> io::Result<()> {
             remove_entry(&path, true)?;
         }
     }
-    Ok(())
+    Ok(Kept(kept_copies))
 }
 
 #[cfg(unix)]
@@ -441,7 +468,10 @@ fn read_capped(path: &Path) -> Option<Vec<u8>> {
     (bytes.len() as u64 <= PLIST_CAP).then_some(bytes)
 }
 
-/// What the update watch compares to tell that the code the mug was started from changed.
+/// What the update watch compares to tell that the code the mug was started from changed. For a
+/// bundle it is the `Info.plist` bytes, which a copy shares with its origin (an executable's
+/// times need not survive the copy): a release changes its version there, and a dev bundle the
+/// hash of its executable (aterm-release's `DEV_BINARY_KEY`).
 #[must_use]
 pub fn code_fingerprint(origin_exe: &Path) -> Option<Vec<u8>> {
     if let Some(bundle) = own_bundle(origin_exe) {
@@ -714,11 +744,15 @@ mod tests {
             .expect("a bundle");
         assert!(!home.exists(), "it ran: replaced");
         assert!(next.is_dir(), "the second copy, unproven, stays");
-        sweep(
-            &code,
-            std::time::SystemTime::now() + aterm_uds::deadline::FIRST_EXEC_HANG,
-        )
-        .expect("sweep");
+        assert_eq!(
+            sweep(
+                &code,
+                std::time::SystemTime::now() + aterm_uds::deadline::FIRST_EXEC_HANG,
+            )
+            .expect("sweep"),
+            Kept::default(),
+            "none kept"
+        );
         assert!(!next.exists(), "past the first-exec hang: removed");
         assert!(
             !home_of(&code, &third).exists(),
@@ -803,12 +837,19 @@ mod tests {
             .expect("copy")
             .expect("a bundle");
         let home = home_of(&code, &copy);
-        discard_copies(&code).expect("an unproven copy is kept, not an error");
+        assert_eq!(
+            discard_copies(&code).expect("an unproven copy is kept, not an error"),
+            Kept(vec![home.clone()]),
+            "the kept copy is returned to say"
+        );
         assert!(home.join("Fake (dev).app").is_dir(), "kept while unproven");
         std::fs::write(home.join(RAN), "").expect("ran");
-        discard_copies(&code).expect("discard");
+        assert_eq!(discard_copies(&code).expect("discard"), Kept::default());
         assert!(!code.exists(), "the copy and its directory are gone");
-        discard_copies(&code).expect("nothing to discard");
+        assert_eq!(
+            discard_copies(&code).expect("nothing to discard"),
+            Kept::default()
+        );
         let elsewhere = root.path().join("elsewhere");
         std::fs::create_dir_all(elsewhere.join("keep")).expect("elsewhere");
         std::os::unix::fs::symlink(&elsewhere, &code).expect("link");

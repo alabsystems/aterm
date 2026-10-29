@@ -248,6 +248,7 @@ pub fn run(
         ["install", rest @ ..] => install::main(sys, layout, exe, rest, out),
         ["lock-screen"] => lock::lock_screen(sys, out, lock::LOCK_HANG),
         ["screen-watch", rest @ ..] => watch::main(sys, layout, exe, rest, out),
+        ["tcc", clients @ ..] => crate::items::person::agent_tcc(sys, clients, out),
         ["version"] => {
             let _ = writeln!(out, "{}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -256,7 +257,7 @@ pub fn run(
             out,
             &format!(
                 "`aterm machines agent {}` is not an agent verb (ssh, hello, put, apply, \
-                 run-job, attach, put-file, install, lock-screen, screen-watch, version)",
+                 run-job, attach, put-file, install, lock-screen, screen-watch, tcc, version)",
                 args.join(" ")
             ),
         ),

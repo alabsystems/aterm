@@ -458,6 +458,12 @@ impl Grid {
         let new_rows = new_rows.clamp(1, MAX_GRID_ROWS);
         let new_cols = new_cols.clamp(1, MAX_GRID_COLS);
         let old_cols = self.storage.cols;
+        let sb_before = self.storage.scrollback_lines();
+        let carried_before = self
+            .storage
+            .replay_carried_history
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(sb_before);
         self.admit_resize_undo(new_rows, new_cols, policy);
         let next = NextWrite::of(self);
         let old_rows = self.settled_rows();
@@ -603,6 +609,8 @@ impl Grid {
         }
         if let Some(lines) = reflowed_scrollback {
             self.restore_reflowed_scrollback(lines, new_cols, staged_before_reflow);
+            self.storage
+                .reconcile_replay_carried_after_width_restore(sb_before, carried_before);
         }
         if let (Some(laid), Some(plan)) = (laid, rewrap_plan) {
             // From a plan the fill leaves the window's blank rows that fit and pulls history for the rest; what is owed after is where that leaves the window.
@@ -650,6 +658,9 @@ impl Grid {
             self.storage.history_renumber_epoch =
                 self.storage.history_renumber_epoch.saturating_add(1);
             self.lose_anchors_renumbered();
+        } else {
+            self.storage
+                .reconcile_replay_carried_after_resize(sb_before, carried_before);
         }
         self.cover_retained_rows();
         self.seal_resize_undo();
@@ -1353,7 +1364,7 @@ impl Grid {
             }
 
             if let Ok(n) = u16::try_from(push_count) {
-                result.extras.shift_rows_up_by(0, n);
+                result.extras.shift_rows_up_by(n);
             }
             result.cursor_row -= push_count;
             result.saved = result

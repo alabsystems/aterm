@@ -24,18 +24,25 @@
 //!   deadline glow=<ms>|- pet=<ms>|- words=<ms>|-
 //!   sounds <n>:<hash>|-
 //!   state n=<words> <engine>=<hash> … bed=<hash>
-//!   light n=<words>
+//!   ledger n=<words> <engine>=<hash> …
+//!   light n=<words> latch=<hash> <engine>=<hash> …
 //! ```
 //!
 //! The `streams` line names every `RenderInput` stream an effect writes, each a light arm may
 //! declare (`aterm_effects::state_words::Streams::NAMED`, in its order; `cursor_ink` joins at
 //! Phase 3). Every hash is FNV-1a/64 over named words, never `Debug`: a stream element's
 //! (`stream_words`), a sound cue's (`aterm_effects::state_words::sound_event_words`) and the
-//! bed's ink table's (`BedInkLut::state_words`).
+//! bed's ink table's (`BedInkLut::state_words`). The `light` line folds the window's light latch
+//! (`latch`, [`latch_words`]) and the pipeline's light-only words (`EffectsPipeline::light_words`,
+//! none on a frame without light state) as the `state` line folds the engines', and
+//! `lab trail-diff` never compares it. The `ledger` line folds the ink ledger's per-frame
+//! products the same way (`EffectsPipeline::ledger_words`: its rails, dims and cut notes, read off
+//! the under stream), which `lab trail-diff` compares as a stream (`docs/design/PRISM-GLASS.md`
+//! §15.9's preamble).
 //!
 //! A frame a synchronized update holds prints `F <n> t=<ms> held`, then its `state` and `light`
-//! words: it draws nothing, so it has no streams, pixels or deadline, and its cues stay for the
-//! frame that draws. `--full --frame <n>` also prints every element and word of frame `n`
+//! words: it draws nothing, so it has no streams, pixels, deadline or ledger, and its cues stay
+//! for the frame that draws. `--full --frame <n>` also prints every element and word of frame `n`
 //! (`W …` lines). Exit codes: 0 dumped, 1 a run failed, 2 a usage or script error.
 
 use super::rig::{TrailFrame, TrailRig};
@@ -96,7 +103,8 @@ pub(crate) enum Setup {
     Page(Page),
     /// `intensity <x>`: `cursor_trail_intensity`.
     Intensity(f32),
-    /// `live off|glass|lip|marks|vanish`: recorded, not honoured until `force_live` lands at 1.3.
+    /// `live off|glass|lip|marks|vanish`: the level a frame the window's light latch admits
+    /// lights at (`TrailRig::live`), in place of `prism_glass::LIVE`.
     Live(Live),
 }
 
@@ -128,6 +136,20 @@ pub(crate) enum Live {
     Lip,
     Marks,
     Vanish,
+}
+
+impl Live {
+    /// The effects crate's level.
+    const fn level(self) -> aterm_effects::cursor_glow::Live {
+        use aterm_effects::cursor_glow::Live as L;
+        match self {
+            Self::Off => L::Off,
+            Self::Glass => L::Glass,
+            Self::Lip => L::Lip,
+            Self::Marks => L::Marks,
+            Self::Vanish => L::Vanish,
+        }
+    }
 }
 
 /// `motion`'s policy.
@@ -798,6 +820,8 @@ struct Runner {
     focus_pane: Option<usize>,
     hz: Option<u32>,
     ramp: Option<Ramp>,
+    /// The `live` level not yet handed to the rig.
+    live: Option<Live>,
     /// Events not yet due, in time order (ties in script order).
     events: Vec<(u64, Event)>,
     /// Where the last run ended, in ms after `t0`.
@@ -820,6 +844,7 @@ impl Runner {
             focus_pane: None,
             hz: None,
             ramp: None,
+            live: None,
             events: Vec::new(),
             ran_to: 0,
             next_frame: Duration::ZERO,
@@ -869,8 +894,9 @@ impl Runner {
             Setup::Ramp(ramp) => self.ramp = Some(*ramp),
             Setup::Page(page) => self.config.page = Some(*page),
             Setup::Intensity(x) => self.config.intensity = Some(*x),
+            Setup::Live(live) => self.live = Some(*live),
             // Recorded, not honoured: each variant's doc names the phase that wires it.
-            Setup::Font(_) | Setup::PaneTheme { .. } | Setup::Live(_) => {}
+            Setup::Font(_) | Setup::PaneTheme { .. } => {}
         }
     }
 
@@ -905,6 +931,9 @@ impl Runner {
         }
         if let Some(hz) = self.hz.take() {
             self.rig.panel_hz(hz);
+        }
+        if let Some(live) = self.live.take() {
+            self.rig.live(Some(live.level()));
         }
         if config_changed || self.ramp.is_some() {
             let ramp = self.ramp.map(|ramp| ramp == Ramp::Always);
@@ -968,7 +997,11 @@ impl Runner {
             let _ = writeln!(out, "F {n} t={t} held");
             let reads = self.rig.reads(now);
             state(&reads.words, &reads.bed_ink, full, out);
-            let _ = writeln!(out, "  light n=0");
+            light(
+                &light_words(&reads.light_words, reads.latch, reads.live, reads.raw),
+                full,
+                out,
+            );
             return Ok(());
         };
         let reads = self.rig.reads(now);
@@ -986,8 +1019,8 @@ impl Runner {
         if arms.is_empty() {
             arms.push('-');
         }
-        // GlowConfig carries no light bits until Phase 1 (§15.0.4), so every frame's are 0.
-        let _ = writeln!(out, "F {n} t={t} light=0 arms={arms}");
+        // The frame light's bits (§15.0.4): 0 on every dark ground.
+        let _ = writeln!(out, "F {n} t={t} light={} arms={arms}", reads.light.bits());
         self.streams(full, out);
         pixels(&frame, out);
         let t0 = self.rig.t0();
@@ -1006,8 +1039,12 @@ impl Runner {
         );
         sounds(&frame, t0, full, out);
         state(&reads.words, &reads.bed_ink, full, out);
-        // No engine writes light words until the phase that adds a light table (§15.1 P0.3).
-        let _ = writeln!(out, "  light n=0");
+        ledger(&reads.ledger, full, out);
+        light(
+            &light_words(&reads.light_words, reads.latch, reads.live, reads.raw),
+            full,
+            out,
+        );
         Ok(())
     }
 
@@ -1172,10 +1209,10 @@ fn sounds(frame: &TrailFrame, t0: Instant, full: bool, out: &mut String) {
     }
 }
 
-/// The state words, folded per engine (the name before a word's first `.`) in the order the
-/// engines wrote them, then the bed's ink table's words as `bed`.
-fn state(words: &StateWords, bed: &BedInkLut, full: bool, out: &mut String) {
-    let mut groups: Vec<(&str, u64)> = Vec::new();
+/// The words folded per engine (the name before a word's first `.`), in the order the engines
+/// wrote them.
+fn engine_folds(words: &StateWords) -> Vec<(&'static str, u64)> {
+    let mut groups: Vec<(&'static str, u64)> = Vec::new();
     for &(name, v) in words.words() {
         let engine = name.split_once('.').map_or(name, |(engine, _)| engine);
         let h = match groups.iter_mut().find(|(e, _)| *e == engine) {
@@ -1188,16 +1225,96 @@ fn state(words: &StateWords, bed: &BedInkLut, full: bool, out: &mut String) {
         *h = aterm_hash::fnv1a_64_extend(*h, name.as_bytes());
         *h = aterm_hash::fnv1a_64_extend(*h, &v.to_le_bytes());
     }
+    groups
+}
+
+/// The state words, folded per engine ([`engine_folds`]), then the bed's ink table's words as
+/// `bed`.
+fn state(words: &StateWords, bed: &BedInkLut, full: bool, out: &mut String) {
     let mut bed_fold = Fold::new(words.t0());
     bed.state_words(&mut bed_fold);
     let _ = write!(out, "  state n={}", words.words().len());
-    for (engine, h) in &groups {
+    for (engine, h) in engine_folds(words) {
         let _ = write!(out, " {engine}={h:016x}");
     }
     let _ = writeln!(out, " bed={:016x}", bed_fold.finish());
     if full {
         for &(name, v) in words.words() {
             let _ = writeln!(out, "  W state {name} {v:016x}");
+        }
+    }
+}
+
+/// The ink ledger's per-frame products, folded per engine as the state words are: compared as a
+/// stream.
+fn ledger(words: &StateWords, full: bool, out: &mut String) {
+    let _ = write!(out, "  ledger n={}", words.words().len());
+    for (engine, h) in engine_folds(words) {
+        let _ = write!(out, " {engine}={h:016x}");
+    }
+    out.push('\n');
+    if full {
+        for &(name, v) in words.words() {
+            let _ = writeln!(out, "  W ledger {name} {v:016x}");
+        }
+    }
+}
+
+/// The window's light latch as light words (§15.0.4), which `lab trail-diff` never compares:
+/// its verdict as the frame left it (`latch.on`, `latch.scheme_changed`, `latch.fell`), the level
+/// a frame it admits lights at (`latch.live`, 0 for `off` to 4 for `vanish`), and whether a
+/// grounded frame has run (`latch.seen`) and the last one's raw light (`latch.raw`, 0 before it).
+fn latch_words(
+    w: &mut impl Words,
+    latch: aterm_effects::host::light_latch::LatchOut,
+    live: aterm_effects::cursor_glow::Live,
+    raw: Option<bool>,
+) {
+    use aterm_effects::cursor_glow::Live as Level;
+    w.flag("latch.on", latch.on);
+    w.flag("latch.scheme_changed", latch.scheme_changed);
+    w.flag("latch.fell", latch.fell);
+    w.put(
+        "latch.live",
+        match live {
+            Level::Off => 0,
+            Level::Glass => 1,
+            Level::Lip => 2,
+            Level::Marks => 3,
+            Level::Vanish => 4,
+        },
+    );
+    w.flag("latch.seen", raw.is_some());
+    w.flag("latch.raw", raw == Some(true));
+}
+
+/// The frame's light words: the window's latch ([`latch_words`]), then its pipeline's light-only
+/// state (`pipeline`, `EffectsPipeline::light_words`).
+fn light_words(
+    pipeline: &StateWords,
+    latch: aterm_effects::host::light_latch::LatchOut,
+    live: aterm_effects::cursor_glow::Live,
+    raw: Option<bool>,
+) -> StateWords {
+    let mut w = StateWords::new(pipeline.t0());
+    latch_words(&mut w, latch, live, raw);
+    for &(name, v) in pipeline.words() {
+        w.put(name, v);
+    }
+    w
+}
+
+/// The light words ([`light_words`]), folded per engine as the state words are, and never
+/// compared.
+fn light(words: &StateWords, full: bool, out: &mut String) {
+    let _ = write!(out, "  light n={}", words.words().len());
+    for (engine, h) in engine_folds(words) {
+        let _ = write!(out, " {engine}={h:016x}");
+    }
+    out.push('\n');
+    if full {
+        for &(name, v) in words.words() {
+            let _ = writeln!(out, "  W light {name} {v:016x}");
         }
     }
 }

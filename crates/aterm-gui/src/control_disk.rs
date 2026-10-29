@@ -39,6 +39,8 @@ pub(crate) use aterm_vitals::sys::predicate::Need;
 pub(crate) enum Term {
     /// Free space at least (`free>=`) or above (`free>`) the need.
     Free { strict: bool, need: Need },
+    /// Observe low free space without admitting cleanup work.
+    FreeBelow { inclusive: bool, bytes: u64 },
     /// The volume at one of these levels.
     Disk(Vec<Level>),
 }
@@ -52,6 +54,14 @@ pub(crate) struct SysWait {
     pub(crate) vol: Option<PathBuf>,
     /// The caller's patience.
     pub(crate) timeout_ms: u64,
+}
+
+impl SysWait {
+    fn observes_low_free(&self) -> bool {
+        self.terms
+            .iter()
+            .any(|term| matches!(term, Term::FreeBelow { .. }))
+    }
 }
 
 /// The disk watch's level a `disk=` word names.
@@ -87,6 +97,7 @@ pub(crate) fn wait_of(parsed: VolumeWait) -> Result<SysWait, &'static str> {
         .into_iter()
         .map(|t| match t {
             VolumeTerm::Free { strict, need } => Term::Free { strict, need },
+            VolumeTerm::FreeBelow { inclusive, bytes } => Term::FreeBelow { inclusive, bytes },
             VolumeTerm::Disk(words) => Term::Disk(words.into_iter().map(level).collect()),
         })
         .collect();
@@ -149,6 +160,9 @@ fn holds(wait: &SysWait, row: &VolumeRow) -> bool {
                 row.reading.free >= need
             }
         }
+        Term::FreeBelow { inclusive, bytes } => {
+            row.reading.free < *bytes || (*inclusive && row.reading.free == *bytes)
+        }
         Term::Disk(levels) => levels.contains(&row.level),
     })
 }
@@ -184,13 +198,18 @@ const NO_WATCH: &str = "ERR unavailable free why=no-watch\n";
 
 /// The largest free need of `wait` on `row`, if it has a `free` term.
 fn largest_need(wait: &SysWait, row: &VolumeRow) -> Option<u64> {
+    // Defense at the host boundary too: even a directly constructed mixed
+    // wait cannot turn a low-water observation into a cleanup demand.
+    if wait.observes_low_free() {
+        return None;
+    }
     wait.terms
         .iter()
         .filter_map(|t| match t {
             Term::Free { strict, need } => {
                 Some(need_bytes(*need, row).saturating_add(u64::from(*strict)))
             }
-            Term::Disk(_) => None,
+            Term::FreeBelow { .. } | Term::Disk(_) => None,
         })
         .max()
 }
@@ -314,7 +333,10 @@ pub(crate) fn run(shelf: &Shelf, wait: &SysWait, who: &Who, env: &Env<'_>) -> St
     };
     let fresh = |key: Option<&VolumeKey>| -> Result<VolumeRow, String> {
         let old = key.and_then(|k| shelf.board_lock().row_keyed(k).cloned());
-        if let Some(o) = old.as_ref().filter(|o| o.as_of.elapsed() <= ARM_FRESH) {
+        if let Some(o) = old
+            .as_ref()
+            .filter(|o| !wait.observes_low_free() && o.as_of.elapsed() <= ARM_FRESH)
+        {
             return Ok(o.clone());
         }
         let reading =
@@ -423,7 +445,8 @@ fn park(
     let mut poked_at = Instant::now();
     loop {
         let g = shelf.board_lock();
-        if let Some(p) = g.last_pass.as_ref()
+        if !wait.observes_low_free()
+            && let Some(p) = g.last_pass.as_ref()
             && &p.key == key
             && Some(p.ended_at) != seen
             && p.ended_at >= armed
@@ -447,6 +470,20 @@ fn park(
                 Err(u) => return format!("ERR unavailable free why={}\n", u.word()),
             }
         };
+        // A stale low reading cannot trip a resource observer before its
+        // refresh. Bind every refresh to the volume selected at arm time.
+        if wait.observes_low_free() && row.as_of.elapsed() >= FRESH {
+            drop(g);
+            match (env.read)(path) {
+                Ok(reading) if &reading.key == key => {
+                    let fresh = row_of(reading, Some(&row), unix_now(), env.lines);
+                    shelf.publish(|b| b.refresh(fresh));
+                    continue;
+                }
+                Ok(_) => return "ERR unavailable free why=unreadable\n".to_owned(),
+                Err(u) => return format!("ERR unavailable free why={}\n", u.word()),
+            }
+        }
         if room_unknown(wait, &row) {
             drop(g);
             return ROOM_UNKNOWN.to_owned();
@@ -541,10 +578,12 @@ pub(crate) fn cmd_await_sys(
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
     };
-    if let Some(c) = cwd.as_deref().filter(|c| {
-        crate::harness_host::disk_short_spelled(c)
-            && spell_owed(&crate::disk_board::SHELF.board_lock(), session, c)
-    }) {
+    if !wait.observes_low_free()
+        && let Some(c) = cwd.as_deref().filter(|c| {
+            crate::harness_host::disk_short_spelled(c)
+                && spell_owed(&crate::disk_board::SHELF.board_lock(), session, c)
+        })
+    {
         let _quiet = aterm_sysprobe::quiet_errors();
         let table = aterm_sysprobe::volumes::table();
         crate::harness_host::disk_spell_now(&crate::disk_board::SHELF, &table, session, c);

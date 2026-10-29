@@ -298,7 +298,8 @@ fn the_switchs_accent_reads_on_a_slab_the_theme_did_not_choose() {
     );
     let label = switch.label.clone().expect("the label");
     assert!(
-        letters(label, "the label") >= "alabv0.4".len(),
+        letters(label, "the label")
+            >= format!("alabv{}", aterm_phase::CliHarness::ClaudeCode.version_str()).len(),
         "the label read"
     );
     app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
@@ -395,6 +396,10 @@ fn codex_gets_a_switch_only_as_codex_alab() {
             switch_of(&app, wid, session).is_none(),
             "{cols}: vendor codex has no switch"
         );
+        assert!(
+            chip_on_pad(&app, wid, session).0.is_empty(),
+            "{cols}: vendor codex has no chip"
+        );
         let line = glass_chars(&app, wid, PAD);
         if cols >= 14 {
             assert!(
@@ -432,9 +437,10 @@ fn codex_gets_a_switch_only_as_codex_alab() {
             .find(|m| m.session == session)
             .map(|m| m.cols.clone())
             .unwrap_or_default();
-        // The harness's cells: its switch, its label and the close's blank.
-        let harness =
-            switch.cols.start..switch.label.as_ref().map_or(switch.cols.end, |l| l.end) + 1;
+        // The harness's cells: its Autopilot chip, its switch, its label and the close's blank.
+        let chip = chip_on_pad(&app, wid, session).0;
+        let harness = chip.first().copied().unwrap_or(switch.cols.start)
+            ..switch.label.as_ref().map_or(switch.cols.end, |l| l.end) + 1;
         for (c, cell) in after[PAD].iter().enumerate() {
             if !lockup.contains(&c) && !harness.contains(&c) {
                 assert_eq!(*cell, before[PAD][c], "{cols}: column {c} untinted");
@@ -534,10 +540,10 @@ fn codex_gets_a_switch_only_as_codex_alab() {
 }
 
 #[test]
-fn the_pet_holds_codexs_lockup_and_switch_never_the_pad_between() {
+fn the_pet_holds_codexs_lockup_chip_and_switch_never_the_pad_between() {
     let (mut app, wid, session) = pane_of(24, 100, "codex");
     let _host = hosted(&mut app);
-    let mut gaps = 0;
+    let (mut gaps, mut chips) = (0, 0);
     for cols in [40usize, 100, 160] {
         assert!(app.apply_term_resize(wid, 24, cols as u16));
         for proven in [false, true] {
@@ -553,10 +559,17 @@ fn the_pet_holds_codexs_lockup_and_switch_never_the_pad_between() {
                 .find(|m| m.session == session)
                 .map(|m| m.cols.clone())
                 .expect("the lockup on the slab");
-            // The harness's cells: its switch, its label and the close's blank.
+            // The harness's cells: its switch, its label and the close's blank, and its
+            // Autopilot chip.
             let switch = switch_of(&app, wid, session)
                 .map(|s| s.cols.start..s.label.as_ref().map_or(s.cols.end, |l| l.end) + 1);
             assert_eq!(switch.is_some(), proven, "{cols}: a switch for codex-alab");
+            let chip = chip_on_pad(&app, wid, session).0;
+            assert!(
+                proven || chip.is_empty(),
+                "{cols}: a chip for codex-alab alone"
+            );
+            chips += usize::from(!chip.is_empty());
             let held = app.windows[&wid].pet_chrome.held().to_vec();
             let covered = |col: usize| {
                 let (r, c) = (PAD as f32 + 0.5, col as f32 + 0.5);
@@ -568,7 +581,9 @@ fn the_pet_holds_codexs_lockup_and_switch_never_the_pad_between() {
                 })
             };
             let ours = |col: usize| {
-                lockup.contains(&col) || switch.as_ref().is_some_and(|s| s.contains(&col))
+                lockup.contains(&col)
+                    || switch.as_ref().is_some_and(|s| s.contains(&col))
+                    || chip.contains(&col)
             };
             let wrong: Vec<usize> = (0..cols).filter(|&c| covered(c) != ours(c)).collect();
             assert!(
@@ -577,11 +592,259 @@ fn the_pet_holds_codexs_lockup_and_switch_never_the_pad_between() {
                  held other than the host's marks, or marks not held: {wrong:?}"
             );
             if let Some(s) = &switch {
-                gaps += s.start - lockup.end;
+                gaps += s.start - lockup.end - chip.len();
             }
         }
     }
     assert!(gaps > 100, "the slab's pad lies between the marks: {gaps}");
+    assert!(chips >= 2, "the chip held at 100 and 160 columns: {chips}");
+}
+
+/// `session`'s Autopilot chip on the pad: its frame columns, and its glyphs as the glass reads them.
+fn chip_on_pad(app: &App, wid: WindowId, session: u64) -> (Vec<usize>, String) {
+    let ws = &app.windows[&wid];
+    let strip = ws.input_scratch.cells.len() - usize::from(ws.rows);
+    let painted = ws
+        .claude_lights
+        .painted_cells(session, crate::claude_lights::Chip::Autopilot);
+    assert!(
+        painted.iter().all(|&(row, _)| row == strip + PAD),
+        "the chip on the pad: {painted:?}"
+    );
+    let cols: Vec<usize> = painted.into_iter().map(|(_, col)| col).collect();
+    let text = cols
+        .iter()
+        .map(|&c| ws.input_scratch.cells[strip + PAD][c])
+        .filter(|c| !c.wide)
+        .map(|c| c.ch)
+        .collect();
+    (cols, text)
+}
+
+/// `session`'s lockup on the glass.
+fn lockup_of(app: &App, wid: WindowId, session: u64) -> std::ops::Range<usize> {
+    app.windows[&wid]
+        .claude_lights
+        .mark_hits
+        .iter()
+        .find(|m| m.session == session)
+        .map(|m| m.cols.clone())
+        .unwrap_or_default()
+}
+
+/// The engine's rows and columns.
+fn engine_size(app: &App, session: u64) -> (u16, u16) {
+    let term = app.pool.get(session).expect("session").term.clone();
+    let t = crate::term_lock(&term);
+    (t.rows(), t.cols())
+}
+
+/// One frame of codex-alab's composer at `cols`, its claim proven: refilled, then passed.
+fn codex_alab_frame(app: &mut App, wid: WindowId, session: u64, cols: usize) {
+    let _ = app.apply_term_resize(wid, 24, cols as u16);
+    bytes(app, session, codex_screen(cols, Some(SLAB)).as_bytes());
+    set_proven(app, session, true);
+    refill(app, wid);
+    let _ = pass(app, wid);
+}
+
+/// `session`'s Autopilot word, written as a chip's click writes it.
+fn word(app: &mut App, session: u64, word: aterm_agent::supervise::Autopilot) {
+    assert!(app.set_session_autopilot(session, Some(word), crate::autopilot::Surface::Chip));
+}
+
+/// codex-alab's own task face, as its proven claim tells it (`meta harness_act`).
+fn self_task(app: &mut App, session: u64, face: aterm_agent::harness::acts::TaskFace) {
+    let sid = {
+        let ctx = &app.pool.get(session).expect("session").ctx;
+        ctx.timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .queue_self_task(face);
+        ctx.self_id.as_str().to_owned()
+    };
+    app.apply_harness_fact(&sid, crate::HarnessFact::SelfTask(face));
+}
+
+/// THE CHIP TAKES THE PAD'S GAP: on a proven codex-alab's slab, at every width from 20 to 160
+/// columns, the Autopilot chip lays two cells after the lockup and ends two before the switch,
+/// on the slab, wherever the gap has room for it and nowhere else; only the pad row changes, and
+/// neither the window's chrome rows nor the engine's size move. Its faces are Claude Code's:
+/// Cruise, Land, Off, a timed Cruise, codex-alab's own landing and a person's exchange. Controls:
+/// a vendor codex, an off master switch and a pad codex drew on lay no chip.
+#[test]
+fn codex_alab_lays_its_autopilot_chip_in_the_pads_gap() {
+    use aterm_agent::harness::acts::TaskFace;
+    use aterm_agent::supervise::Autopilot;
+    let (mut app, wid, session) = pane_of(24, 100, "codex");
+    let _host = hosted(&mut app);
+    let (mut laid, mut narrow) = (0, 0);
+    for cols in 20..=160usize {
+        assert!(app.apply_term_resize(wid, 24, cols as u16));
+        bytes(&app, session, codex_screen(cols, Some(SLAB)).as_bytes());
+        set_proven(&app, session, true);
+        refill(&mut app, wid);
+        let before = pane_cells(&app, wid);
+        let (chrome, size) = (app.chrome_rows(wid), engine_size(&app, session));
+        let _ = pass(&mut app, wid);
+        let after = pane_cells(&app, wid);
+        let changed = changed_rows(&before, &after);
+        assert!(
+            changed.iter().all(|&r| r == PAD),
+            "{cols}: the pad alone: {changed:?}"
+        );
+        assert_eq!(app.chrome_rows(wid), chrome, "{cols}: no chrome row");
+        assert_eq!(engine_size(&app, session), size, "{cols}: no re-grid");
+        let switch = switch_of(&app, wid, session).expect("codex-alab's switch");
+        let lockup = lockup_of(&app, wid, session);
+        let (chip, text) = chip_on_pad(&app, wid, session);
+        let room = if lockup.is_empty() {
+            0
+        } else {
+            switch.cols.start.saturating_sub(lockup.end)
+        };
+        // Cruise's face, `∞`, is one cell.
+        let fits = room >= CHIP_LEAD + 1 + CHIP_TAIL;
+        assert_eq!(
+            !chip.is_empty(),
+            fits,
+            "{cols}: a chip wherever the gap holds one: lockup {lockup:?}, switch {:?}: {:?}",
+            switch.cols,
+            glass_chars(&app, wid, PAD)
+        );
+        if chip.is_empty() {
+            narrow += 1;
+            continue;
+        }
+        assert_eq!(
+            chip[0],
+            lockup.end + CHIP_LEAD,
+            "{cols}: two after the lockup"
+        );
+        assert!(
+            chip[chip.len() - 1] + 1 + CHIP_TAIL <= switch.cols.start,
+            "{cols}: two before the switch: {chip:?} {:?}",
+            switch.cols
+        );
+        assert_eq!(text, "\u{221e}", "{cols}: Cruise's face");
+        for &c in &chip {
+            assert_eq!(after[PAD][c].bg, SLAB, "{cols}: column {c} on the slab");
+        }
+        for c in lockup.end..switch.cols.start {
+            if !chip.contains(&c) {
+                assert_eq!(
+                    after[PAD][c], before[PAD][c],
+                    "{cols}: column {c} the vendor's pad"
+                );
+            }
+        }
+        laid += 1;
+    }
+    assert!(laid > 100 && narrow > 0, "{laid} laid, {narrow} too narrow");
+
+    let face = |app: &mut App| {
+        codex_alab_frame(app, wid, session, 100);
+        chip_on_pad(app, wid, session).1
+    };
+    assert_eq!(face(&mut app), "\u{221e}", "Cruise");
+    word(&mut app, session, Autopilot::Land);
+    assert_eq!(face(&mut app), "\u{2913} land", "Land");
+    self_task(&mut app, session, TaskFace::Landed);
+    assert_eq!(
+        face(&mut app),
+        "\u{2713} landed",
+        "codex-alab's own landing"
+    );
+    self_task(&mut app, session, TaskFace::Theirs);
+    assert_eq!(face(&mut app), "\u{2913} quiet", "a person's own exchange");
+    word(&mut app, session, Autopilot::Off);
+    assert_eq!(face(&mut app), "\u{25cb} off", "Off");
+    let lands = crate::autopilot_timers::wall_ms() + 2 * 3_600_000;
+    assert!(app.set_session_autopilot_timed(
+        session,
+        Some(Autopilot::Cruise),
+        Some(lands),
+        crate::autopilot::Surface::Chip
+    ));
+    let timed = face(&mut app);
+    assert!(
+        timed.starts_with("\u{221e} \u{2913}") && timed.len() > "\u{221e} \u{2913}".len(),
+        "a timed Cruise: {timed:?}"
+    );
+
+    set_proven(&app, session, false);
+    refill(&mut app, wid);
+    let _ = pass(&mut app, wid);
+    assert!(
+        switch_of(&app, wid, session).is_none() && chip_on_pad(&app, wid, session).0.is_empty(),
+        "CONTROL: a vendor codex lays no chip"
+    );
+    app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+        crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
+    );
+    codex_alab_frame(&mut app, wid, session, 100);
+    assert_eq!(
+        switch_of(&app, wid, session).map(|s| s.face),
+        Some(HarnessSwitch::Off(SwitchOff::Master)),
+        "CONTROL: the master switch off"
+    );
+    assert!(
+        chip_on_pad(&app, wid, session).0.is_empty(),
+        "CONTROL: under an off switch, the switch alone"
+    );
+    app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+        crate::app_config::HarnessPolicy::read("[harness]\n"),
+    );
+    codex_alab_frame(&mut app, wid, session, 100);
+    assert!(
+        !chip_on_pad(&app, wid, session).0.is_empty(),
+        "CONTROL: the switch on, the chip back"
+    );
+    let on = format!("\x1b[48;2;{};{};{}m", SLAB[0], SLAB[1], SLAB[2]);
+    bytes(&app, session, format!("\x1b[6;40H{on}x\x1b[0m").as_bytes());
+    refill(&mut app, wid);
+    let _ = pass(&mut app, wid);
+    assert!(
+        switch_of(&app, wid, session).is_none() && chip_on_pad(&app, wid, session).0.is_empty(),
+        "CONTROL: a pad codex drew on lays neither the switch nor the chip"
+    );
+}
+
+/// THE CHIP NEVER MOVES THE SWITCH: at every width from 12 to 200 columns, a codex-alab top line
+/// with its chip laid and the same line with none laid (`without_top_chips`) have the same switch,
+/// label, ⬆️ and face, and the same cells everywhere but the chip's own.
+#[test]
+fn the_chip_never_moves_codexs_switch_or_label() {
+    let (mut app, wid, session) = pane_of(24, 100, "codex");
+    let _host = hosted(&mut app);
+    let mut chipped = 0;
+    for cols in 12..=200usize {
+        codex_alab_frame(&mut app, wid, session, cols);
+        let with = (switch_of(&app, wid, session), pane_cells(&app, wid));
+        let (chip, _) = chip_on_pad(&app, wid, session);
+        let _ = without_top_chips(|| pass(&mut app, wid));
+        assert!(
+            chip_on_pad(&app, wid, session).0.is_empty(),
+            "{cols}: CONTROL: the seam lays none"
+        );
+        let bare = (switch_of(&app, wid, session), pane_cells(&app, wid));
+        assert_eq!(
+            with.0, bare.0,
+            "{cols}: the switch, its label and its arrow stand"
+        );
+        for (c, (a, b)) in with.1[PAD].iter().zip(&bare.1[PAD]).enumerate() {
+            if !chip.contains(&c) {
+                assert_eq!(a, b, "{cols}: column {c} is the line's own");
+            }
+        }
+        assert_eq!(
+            changed_rows(&with.1, &bare.1),
+            if chip.is_empty() { vec![] } else { vec![PAD] },
+            "{cols}"
+        );
+        chipped += usize::from(!chip.is_empty());
+    }
+    assert!(chipped > 150, "{chipped}");
 }
 
 #[test]
@@ -716,6 +979,7 @@ fn lockup_key(
         clip: aterm_core::render::PxRect::EVERYWHERE,
         mark_hover: hover,
         title_gen: u64::from(hover),
+        chip: TopChip::NONE,
     }
 }
 
@@ -971,6 +1235,11 @@ fn hover_title_on_the_glass() {
     feed(&app, session, &screen(&grown));
     refill(&mut app, wid);
     let _ = pass(&mut app, wid);
+    let first = glass_chars(&app, wid, top - 1);
+    assert!(
+        first.contains("    claude \u{2500}") && !first.contains("Claude Code"),
+        "the frame that moves the line draws no title for the pointer it left: {first:?}"
+    );
     assert!(
         !app.windows[&wid].claude_lights.mark_hovered(session),
         "the lockup moved from under the pointer: the hover is let go"
@@ -1045,6 +1314,568 @@ fn point_at(app: &mut App, wid: WindowId, cell: (usize, usize)) -> crate::claude
 
 fn switch_hovered(app: &App, wid: WindowId) -> Option<u64> {
     app.windows[&wid].claude_lights.switch_hover
+}
+
+/// A codex pane `cols` wide whose session writes its PTY input to a private observer.
+#[cfg(unix)]
+fn observed_codex(cols: u16) -> (App, WindowId, u64, std::os::unix::net::UnixStream) {
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("a private PTY observer");
+    reader
+        .set_nonblocking(true)
+        .expect("a nonblocking observer");
+    let mut app = App::headless_for_test_with_sink(std::sync::Arc::new(
+        aterm_session::sink::SinkWriter::new_owned(writer.into()),
+    ));
+    let wid = WindowId(0);
+    let session = app.focused_session_id(wid).expect("the front session");
+    assert!(app.apply_term_resize(wid, 24, cols));
+    set_program(&app, session, "codex");
+    (app, wid, session, reader)
+}
+
+/// What the session typed into its PTY since the last read.
+#[cfg(unix)]
+fn typed(reader: &mut std::os::unix::net::UnixStream) -> Vec<u8> {
+    use std::io::Read;
+    let mut got = Vec::new();
+    let mut buf = [0u8; 256];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("reading the PTY observer: {e}"),
+        }
+    }
+    got
+}
+
+/// The `meta-change field=autopilot` events on `session`'s timeline.
+#[cfg(unix)]
+fn autopilot_moves(app: &App, session: u64) -> Vec<String> {
+    app.pool
+        .get(session)
+        .expect("session")
+        .ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .since(None)
+        .filter(|e| e.kind == "meta-change" && e.payload.contains("field=autopilot "))
+        .map(|e| e.payload.to_string())
+        .collect()
+}
+
+/// The frame cell of `session`'s chip's first painted cell.
+#[cfg(unix)]
+fn chip_cell(app: &App, wid: WindowId, session: u64) -> (usize, usize) {
+    let ws = &app.windows[&wid];
+    *ws.claude_lights
+        .painted_cells(session, crate::claude_lights::Chip::Autopilot)
+        .first()
+        .expect("the chip is painted")
+}
+
+/// A CLICK ON CODEX-ALAB'S CHIP CYCLES ITS WORD AND TYPES NOTHING: the left press writes the
+/// session's next word (Cruise to Land) as the chip's (`Surface::Chip`), one `meta-change
+/// field=autopilot` on its timeline, nothing on the PTY, and the next frame repaints to the new
+/// face once; the pointer's hover moves the repaint key, and so does codex-alab's own landing
+/// (`bare_top_term`'s fold of `autopilot_term`). A right-click, and a control-click on macOS,
+/// open the Autopilot menu anchored on the chip's first cell; a right-click on the switch opens
+/// nothing.
+#[cfg(unix)]
+#[test]
+fn a_codex_chip_click_cycles_the_word_and_types_nothing() {
+    use aterm_agent::harness::acts::TaskFace;
+    use aterm_agent::supervise::Autopilot;
+    use aterm_window::event::{ElementState, MouseButton};
+    let (mut app, wid, session, mut reader) = observed_codex(100);
+    let _host = hosted(&mut app);
+    codex_alab_frame(&mut app, wid, session, 100);
+    assert!(typed(&mut reader).is_empty(), "a frame types nothing");
+    assert_eq!(chip_on_pad(&app, wid, session).1, "\u{221e}");
+    let at = chip_cell(&app, wid, session);
+    let rest = pass(&mut app, wid);
+    assert_eq!(
+        pass(&mut app, wid),
+        rest,
+        "CONTROL: an idle pane's key stands"
+    );
+    assert_eq!(
+        point_at(&mut app, wid, at),
+        crate::claude_lights::OverChips::Chip,
+        "the pointer on the chip"
+    );
+    let hovered = pass(&mut app, wid);
+    assert_ne!(hovered, rest, "the chip's hover is in the repaint key");
+    let moves = autopilot_moves(&app, session);
+    app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+    app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+    assert!(typed(&mut reader).is_empty(), "a click types nothing");
+    assert_eq!(app.session_autopilot(session).0, Some(Autopilot::Land));
+    let set_by = app
+        .pool
+        .get(session)
+        .expect("session")
+        .ctx
+        .meta
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .autopilot_set_by
+        .and_then(|by| by.surface);
+    assert_eq!(
+        set_by,
+        Some(crate::autopilot::Surface::Chip),
+        "the chip's write"
+    );
+    let now = autopilot_moves(&app, session);
+    assert_eq!(
+        now[moves.len()..],
+        ["field=autopilot value=land".to_string()],
+        "one meta-change, which codex-alab follows"
+    );
+    let clicked = pass(&mut app, wid);
+    assert_ne!(clicked, hovered, "the click repaints");
+    assert_eq!(
+        chip_on_pad(&app, wid, session).1,
+        "\u{2913} land",
+        "to the new face"
+    );
+    assert_eq!(pass(&mut app, wid), clicked, "once");
+    let _ = point_at(&mut app, wid, (at.0, 1));
+    let away = pass(&mut app, wid);
+    self_task(&mut app, session, TaskFace::Landed);
+    let landed = pass(&mut app, wid);
+    assert_ne!(
+        landed, away,
+        "codex-alab's own landing repaints an idle pane"
+    );
+    assert_eq!(chip_on_pad(&app, wid, session).1, "\u{2713} landed");
+
+    let at = chip_cell(&app, wid, session);
+    let _ = point_at(&mut app, wid, at);
+    app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Right);
+    app.on_mouse_input(wid, ElementState::Released, MouseButton::Right);
+    assert_eq!(
+        app.autopilot_menu.as_ref().map(|m| (m.session, m.anchor)),
+        Some((session, at)),
+        "a right-click opens the Autopilot menu on the chip"
+    );
+    assert!(app.close_autopilot_menu());
+    if cfg!(target_os = "macos") {
+        app.windows.get_mut(&wid).expect("window").mods =
+            aterm_window::keyboard::ModifiersState::CONTROL;
+        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        app.windows.get_mut(&wid).expect("window").mods =
+            aterm_window::keyboard::ModifiersState::empty();
+        assert_eq!(
+            app.autopilot_menu.as_ref().map(|m| (m.session, m.anchor)),
+            Some((session, at)),
+            "a control-click opens it too"
+        );
+        assert_eq!(
+            app.session_autopilot(session).0,
+            Some(Autopilot::Land),
+            "and turns nothing"
+        );
+        assert!(app.close_autopilot_menu());
+    }
+    let _ = pass(&mut app, wid);
+    let switch = switch_of(&app, wid, session).expect("the switch");
+    let _ = point_at(&mut app, wid, (switch.frame_row, switch.cols.start + 1));
+    app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Right);
+    app.on_mouse_input(wid, ElementState::Released, MouseButton::Right);
+    assert!(
+        app.autopilot_menu.is_none(),
+        "a right-click on the switch opens nothing"
+    );
+    assert_eq!(app.session_autopilot(session).0, Some(Autopilot::Land));
+    assert!(typed(&mut reader).is_empty(), "nothing typed");
+}
+
+/// `session`'s `autopilot` line in `aterm ctl chrome`.
+fn chrome_line(app: &App, session: u64) -> String {
+    let sid = format!(
+        "autopilot sid={} ",
+        app.pool.get(session).expect("session").ctx.self_id.as_str()
+    );
+    app.drawn_chip_lines()
+        .into_iter()
+        .find(|l| l.starts_with(&sid))
+        .expect("the session's chrome line")
+}
+
+/// AN UNCARRIED CODEX-ALAB LAYS ITS SWITCH ALONE: a tab admitted as codex-alab by what its claim
+/// left (the claim's copy here; on glass, its ALab image) with no proven claim standing is one
+/// nothing carries (`autopilot::carried`): codex-alab's vanilla mode never claims and reads no
+/// Autopilot word, and it gives its claim back for Autopilot Off. Under every word its line keeps
+/// the lit switch and lays no chip, `aterm ctl chrome` says `why=switch-only`, and the tab's
+/// hover names no driver, so nothing on the glass names a mode nothing acts on. CONTROL: the
+/// proven claim lays the chip, `○ off` under Off while the claim stands.
+#[test]
+fn an_uncarried_codex_alab_lays_its_switch_alone() {
+    use aterm_agent::supervise::Autopilot;
+    let (mut app, wid, session) = pane_of(24, 100, "codex");
+    let _host = hosted(&mut app);
+    let _copy = copy_for(&app, session);
+    for (said, face, drawn) in [
+        (None, "cruise", "\u{221e}"),
+        (Some(Autopilot::Land), "land", "\u{2913} land"),
+        (Some(Autopilot::Off), "off", "\u{25cb} off"),
+    ] {
+        if let Some(said) = said {
+            word(&mut app, session, said);
+        }
+        set_proven(&app, session, false);
+        bytes(&app, session, codex_screen(100, Some(SLAB)).as_bytes());
+        refill(&mut app, wid);
+        let _ = pass(&mut app, wid);
+        let switch = switch_of(&app, wid, session).expect("admitted: the switch");
+        assert_eq!(switch.face, HarnessSwitch::On, "{face}: the switch lit");
+        assert!(
+            chip_on_pad(&app, wid, session).0.is_empty(),
+            "{face}: no chip: {:?}",
+            glass_chars(&app, wid, PAD)
+        );
+        let line = chrome_line(&app, session);
+        assert!(
+            line.contains(&format!(" face={face} drawn=- why=switch-only ")),
+            "{face}: {line}"
+        );
+        assert_eq!(app.driven_by_aterm(session), None, "{face}: no driver");
+        codex_alab_frame(&mut app, wid, session, 100);
+        assert_eq!(
+            chip_on_pad(&app, wid, session).1,
+            drawn,
+            "CONTROL: {face}: the proven claim carries it, and lays the chip"
+        );
+    }
+}
+
+/// THE GOAL LEAVES THE CHIP ITS CELLS: with an active goal on codex-alab's pad (`CodexSurvey::goal`,
+/// read off codex-alab's session record), at every width from 40 to 200 columns the Autopilot
+/// chip, Cruise's one-cell `∞` and Land's worded `⤓ land` alike, lays whole at the columns it lays
+/// at with no goal, whether the goal is cut or whole; the goal lays after the chip and its tail
+/// wherever both fit, and the switch never moves. CONTROL: with no goal the chip lays at every
+/// width the gap holds it.
+#[test]
+fn a_goal_on_codexs_pad_leaves_the_chip_its_cells() {
+    use aterm_agent::supervise::Autopilot;
+    let (mut app, wid, session) = pane_of(24, 100, "codex");
+    let _host = hosted(&mut app);
+    let set_goal = |app: &App, goal: Option<&str>| {
+        let ctx = app.pool.get(session).expect("session").ctx.clone();
+        let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(timeline.set_codex_survey(
+            PGID,
+            crate::survey::CodexSurvey {
+                goal: goal.map(str::to_owned),
+                ..crate::survey::CodexSurvey::default()
+            }
+        ));
+    };
+    for (said, face) in [
+        (Autopilot::Cruise, "\u{221e}"),
+        (Autopilot::Land, "\u{2913} land"),
+    ] {
+        word(&mut app, session, said);
+        let (mut chipped, mut both) = (0, 0);
+        for cols in 40..=200usize {
+            set_goal(&app, None);
+            codex_alab_frame(&mut app, wid, session, cols);
+            let bare = chip_on_pad(&app, wid, session);
+            let switch = switch_of(&app, wid, session).map(|s| s.cols);
+            assert!(
+                !glass_chars(&app, wid, PAD).contains(GOAL_MARK),
+                "{cols}: CONTROL: no goal"
+            );
+            if bare.0.is_empty() {
+                continue;
+            }
+            assert_eq!(bare.1, face, "{cols}: CONTROL: the face whole");
+            chipped += 1;
+            for goal in [
+                "implement the aos aterm vision across every surface",
+                "fix it",
+            ] {
+                set_goal(&app, Some(goal));
+                codex_alab_frame(&mut app, wid, session, cols);
+                let chip = chip_on_pad(&app, wid, session);
+                let line = glass_chars(&app, wid, PAD);
+                assert_eq!(chip, bare, "{cols}: {goal:?}: the chip stands: {line:?}");
+                assert_eq!(
+                    switch_of(&app, wid, session).map(|s| s.cols),
+                    switch,
+                    "{cols}: {goal:?}: the switch stands"
+                );
+                if let (Some(&last), Some(mark)) =
+                    (chip.0.last(), line.chars().position(|c| c == GOAL_MARK))
+                {
+                    assert!(
+                        mark > last + CHIP_TAIL,
+                        "{cols}: {goal:?}: the goal after the chip and its tail: {line:?}"
+                    );
+                    both += 1;
+                }
+            }
+        }
+        assert!(
+            chipped > 120 && both > 200,
+            "{face}: {chipped} chipped, {both} beside a goal"
+        );
+    }
+}
+
+/// A CODEX LINE THAT LAYS NO SWITCH NOTES NO CHIP: at the widths too narrow for a carried
+/// codex-alab's switch, its line notes no chip row, so `aterm ctl chrome` says its chip was not
+/// drawn (`why=not-drawn`, never a `no-room` it was never laid for), and on macOS ctrl+shift+tab,
+/// which walks a window only where it drew a chip row or a switch, is codex's to read.
+#[test]
+fn a_codex_line_that_lays_no_switch_notes_no_chip_row() {
+    let (mut app, wid, session) = pane_of(24, 100, "codex");
+    let _host = hosted(&mut app);
+    let (mut bare, mut switched) = (0, 0);
+    for cols in 4..=40usize {
+        codex_alab_frame(&mut app, wid, session, cols);
+        if switch_of(&app, wid, session).is_some() {
+            switched += 1;
+            continue;
+        }
+        let line = chrome_line(&app, session);
+        assert!(line.contains(" drawn=- why=not-drawn "), "{cols}: {line}");
+        #[cfg(target_os = "macos")]
+        {
+            use aterm_window::keyboard::{
+                Key, KeyCode, KeyLocation, NamedKey, PhysicalKey, SmolStr,
+            };
+            let tab = aterm_window::event::KeyEvent::synthetic_for_test(
+                PhysicalKey::Code(KeyCode::Tab),
+                Key::Named(NamedKey::Tab),
+                Some(SmolStr::new("\t")),
+                KeyLocation::Standard,
+                aterm_window::event::ElementState::Pressed,
+                false,
+            );
+            let chord = aterm_window::keyboard::ModifiersState::CONTROL
+                | aterm_window::keyboard::ModifiersState::SHIFT;
+            assert!(
+                !app.on_key_claude_lights(wid, chord, &tab),
+                "{cols}: ctrl+shift+tab is codex's"
+            );
+        }
+        bare += 1;
+    }
+    assert!(
+        bare > 0 && switched > 0,
+        "{bare} with no switch, {switched} with one"
+    );
+}
+
+/// A TAB THAT RAN CLAUDE CODE LAYS THE AUTOPILOT CHIP ALONE ON CODEX: a session's lights are kept
+/// per session, so what Claude Code left of them (its plan mode's light, a worker's Team chip)
+/// is let go on codex-alab's top line, where Autopilot is the one chip.
+#[test]
+fn a_tab_that_ran_claude_lays_the_autopilot_chip_alone_on_codex() {
+    use crate::claude_lights::Chip;
+    use aterm_agent::harness::lights::Light;
+    let plan = Live {
+        under: &["  \u{23F8} plan mode on (shift+tab to cycle)"],
+        ..AT_REST
+    };
+    let (mut app, wid, session) = glass_with(&plan, facts());
+    let _host = hosted(&mut app);
+    app.teams.insert(
+        session,
+        crate::team::Team {
+            manager: Some(crate::team::Manager {
+                local: None,
+                label: std::sync::Arc::from("lab-sweep"),
+            }),
+            ..crate::team::Team::default()
+        },
+    );
+    for _ in 0..2 {
+        refill(&mut app, wid);
+        let _ = pass(&mut app, wid);
+    }
+    let painted = |app: &App, chip: Chip| {
+        !app.windows[&wid]
+            .claude_lights
+            .painted_cells(session, chip)
+            .is_empty()
+    };
+    assert!(
+        painted(&app, Chip::Light(Light::Mode)) && painted(&app, Chip::Team),
+        "CONTROL: Claude Code's plan mode lights its chip, and the worker's Team chip"
+    );
+    set_program(&app, session, "codex");
+    codex_alab_frame(&mut app, wid, session, 120);
+    assert!(
+        !painted(&app, Chip::Light(Light::Mode)) && !painted(&app, Chip::Team),
+        "neither on codex-alab's pad"
+    );
+    assert_eq!(
+        chip_on_pad(&app, wid, session).1,
+        "\u{221e}",
+        "Autopilot alone"
+    );
+}
+
+/// THE CHIP'S TITLE LAYS BESIDE IT AND NEVER MOVES THE SWITCH: with the pointer on codex-alab's
+/// chip, its title lays two cells right of it, ending two before the switch, whose cells stand,
+/// at every width the chip lays at; with the pointer on the lockup, whose title may grow its name
+/// into the pad (`compose_top`'s room for it leaves the chip's cells), the chip lays two cells
+/// after the lockup and its title, at every width it lays at with the pointer away, and the
+/// switch stands.
+#[test]
+fn a_codex_chips_title_lays_beside_it_and_never_moves_the_switch() {
+    let (mut app, wid, session) = pane_of(24, 100, "codex");
+    let _host = hosted(&mut app);
+    let mut titled = 0;
+    for cols in 30..=160usize {
+        codex_alab_frame(&mut app, wid, session, cols);
+        let Some(&at) = app.windows[&wid]
+            .claude_lights
+            .painted_cells(session, crate::claude_lights::Chip::Autopilot)
+            .first()
+        else {
+            continue;
+        };
+        let rest = switch_of(&app, wid, session).expect("the switch");
+        let _ = point_at(&mut app, wid, at);
+        let _ = pass(&mut app, wid);
+        let (chip, _) = chip_on_pad(&app, wid, session);
+        assert_eq!(chip.first(), Some(&at.1), "{cols}: the chip stands");
+        assert_eq!(
+            switch_of(&app, wid, session).map(|s| (s.cols, s.label)),
+            Some((rest.cols.clone(), rest.label.clone())),
+            "{cols}: the switch stands"
+        );
+        if let Some(title) = app.windows[&wid]
+            .claude_lights
+            .title_hits
+            .iter()
+            .find(|t| t.session == session)
+        {
+            assert_eq!(
+                title.cols.start,
+                chip[chip.len() - 1] + 1 + 2,
+                "{cols}: two cells right of the chip"
+            );
+            assert!(
+                title.cols.end + CHIP_TAIL <= rest.cols.start,
+                "{cols}: never into the switch's lead: {:?} {:?}",
+                title.cols,
+                rest.cols
+            );
+            let words: String = glass_chars(&app, wid, PAD)
+                .chars()
+                .skip(title.cols.start)
+                .take(title.cols.len())
+                .collect();
+            assert!(words.starts_with("autopilot"), "{cols}: {words:?}");
+            titled += 1;
+        }
+        let _ = point_at(&mut app, wid, (at.0, 0));
+    }
+    assert!(titled > 50, "{titled}");
+
+    let strip = {
+        let ws = &app.windows[&wid];
+        ws.input_scratch.cells.len() - usize::from(ws.rows)
+    };
+    let mut hovered = 0;
+    for cols in 30..=160usize {
+        codex_alab_frame(&mut app, wid, session, cols);
+        let (away, _) = chip_on_pad(&app, wid, session);
+        let rest = switch_of(&app, wid, session).map(|s| s.cols);
+        let lockup = lockup_of(&app, wid, session);
+        if lockup.is_empty() {
+            continue;
+        }
+        let _ = point_at(&mut app, wid, (strip + PAD, lockup.start + 1));
+        assert!(
+            app.windows[&wid].claude_lights.mark_hovered(session),
+            "{cols}: on the lockup"
+        );
+        let _ = pass(&mut app, wid);
+        let titled = lockup_of(&app, wid, session);
+        let (chip, _) = chip_on_pad(&app, wid, session);
+        assert_eq!(
+            chip.is_empty(),
+            away.is_empty(),
+            "{cols}: the chip lays wherever it lays with the pointer away: {:?}",
+            glass_chars(&app, wid, PAD)
+        );
+        if let Some(&first) = chip.first() {
+            assert_eq!(
+                first,
+                titled.end + CHIP_LEAD,
+                "{cols}: two cells after the lockup and its title: {:?}",
+                glass_chars(&app, wid, PAD)
+            );
+            hovered += 1;
+        }
+        assert_eq!(
+            switch_of(&app, wid, session).map(|s| s.cols),
+            rest,
+            "{cols}: the switch stands"
+        );
+        let _ = point_at(&mut app, wid, (strip + PAD + 3, 2));
+        let _ = pass(&mut app, wid);
+        assert_eq!(
+            chip_on_pad(&app, wid, session).0,
+            away,
+            "{cols}: CONTROL: the pointer gone, the chip back in its place"
+        );
+    }
+    assert!(hovered > 100, "{hovered}");
+}
+
+/// A SCREEN READER MEETS ONE AUTOPILOT NODE ON CODEX-ALAB'S PAD: the chip's node, its label the
+/// face's spoken words, beside the switch's node.
+#[cfg(a11y_tree)]
+#[test]
+fn a_codex_alab_pad_speaks_one_autopilot_node_beside_its_switch() {
+    use crate::a11y_tree::HarnessChip;
+    use aterm_agent::supervise::Autopilot;
+    let (mut app, wid, session) = pane_of(24, 100, "codex");
+    let _host = hosted(&mut app);
+    word(&mut app, session, Autopilot::Land);
+    codex_alab_frame(&mut app, wid, session, 100);
+    let nodes = app.claude_chips_a11y(wid);
+    let autopilot: Vec<_> = nodes
+        .iter()
+        .filter(|n| n.session == session && n.chip == HarnessChip::Autopilot)
+        .collect();
+    assert_eq!(autopilot.len(), 1, "one Autopilot node: {nodes:#?}");
+    let face = crate::claude_lights::ChipFace::of(
+        crate::autopilot::AutopilotView::Land,
+        &app.chip_glass(session),
+    );
+    assert_eq!(
+        autopilot[0].label,
+        face.spoken(&app.chip_glass(session), None),
+        "the face's spoken words"
+    );
+    assert_eq!(autopilot[0].label, "Autopilot: land.");
+    assert!(
+        nodes
+            .iter()
+            .any(|n| n.session == session && n.chip == HarnessChip::Switch),
+        "and the switch's node: {nodes:#?}"
+    );
+    app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+        crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
+    );
+    codex_alab_frame(&mut app, wid, session, 100);
+    let nodes = app.claude_chips_a11y(wid);
+    assert!(
+        !nodes.iter().any(|n| n.chip == HarnessChip::Autopilot)
+            && nodes.iter().any(|n| n.chip == HarnessChip::Switch),
+        "CONTROL: an off switch speaks alone: {nodes:#?}"
+    );
 }
 
 #[test]
@@ -1413,7 +2244,7 @@ fn another_clis_account_chip_never_names_the_row_claude_codes_roster_judges() {
 
 /// EVERY CLI HARNESS SHARES THE SWITCH AND ITS LABEL: Claude Code, Antigravity, Muse Code and
 /// `codex-alab` all paint ` ● on ` when lit and ` ○ off ` when off, ending in the same cell, each
-/// followed by its own label (`alab <cli> harness v0.4`), every cell on the line's ground, the
+/// followed by its own label (`alab <cli> harness v0.5`), every cell on the line's ground, the
 /// switch never bold; when off no cell wears the theme's active green accent.
 #[test]
 fn every_cli_harness_shares_the_switch_and_never_glows_green_when_off() {
@@ -1462,9 +2293,24 @@ fn every_cli_harness_shares_the_switch_and_never_glows_green_when_off() {
             "codex" => {
                 set_proven(&app, session, true);
                 bytes(&app, session, codex_screen(120, Some(SLAB)).as_bytes());
+                // The ALab build its image runs, as the rollout tap publishes it.
+                let ctx = app.pool.get(session).expect("session").ctx.clone();
+                let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                assert!(timeline.set_codex_build(
+                    PGID,
+                    Some("0.1.0-dev.13764+codex.0.164.0.g4b3a367a0".into())
+                ));
             }
             _ => unreachable!(),
         }
+        // The running build each lane gives the label: the session registry's (Claude Code's),
+        // the store image's (Muse Code's), the ALab build's (codex-alab's).
+        let build = match prog {
+            "claude" => Some("2.1.283"),
+            "muse" => Some("0.9.3"),
+            "codex" => Some("0.1.0"),
+            _ => None,
+        };
         let settle = |app: &mut App| {
             for _ in 0..2 {
                 refill(app, wid);
@@ -1491,6 +2337,12 @@ fn every_cli_harness_shares_the_switch_and_never_glows_green_when_off() {
                 words.starts_with(&harness_label(harness)),
                 "{prog}: the label {words:?}"
             );
+            if let Some(core) = build {
+                assert!(
+                    words.ends_with(&format!(" (v{core})")),
+                    "{prog}: the running build {core} named: {words:?}"
+                );
+            }
             for c in &row[b.cols.start..label.end] {
                 assert_eq!(c.bg, ground, "{prog}: {:?} on the line's ground", c.ch);
             }
@@ -1599,5 +2451,435 @@ fn a_settled_switch_builds_nothing() {
         (rings_on(&app, wid, session), kept(&app)),
         (vec![], 0),
         "no sprite turned off"
+    );
+}
+
+/// A retained move is still the move from the running image, not an order over every later
+/// revision of its numeric core. Replacing Muse outside the host cannot re-offer its old target.
+#[test]
+fn a_retained_upgrade_is_bound_to_its_running_source_revision() {
+    use aterm_agent::harness::upgrade::{Agent, Phase};
+    use aterm_agent::harness::upgrade_drive::Row;
+
+    let (app, _wid, session) = pane_of(24, 120, "muse");
+    drawer(&app, session, PGID, "muse", "1.4.10-R6427.1");
+    let ctx = app.pool.get(session).unwrap().ctx.clone();
+    {
+        let mut timeline = ctx.timeline.lock().unwrap();
+        assert!(timeline.set_upgrade(Some(Row {
+            agent: Agent::Muse,
+            from: "1.4.10-R6427.1".into(),
+            to: "1.4.10-R6500.1".into(),
+            phase: Phase::Pending,
+            ..Row::default()
+        })));
+        assert!(timeline.set_upgrade(None));
+        assert_eq!(TopCli::from_timeline(&timeline).kept.state, UpState::Held);
+    }
+    drawer(&app, session, PGID, "muse", "1.4.10-R6501.1");
+    let timeline = ctx.timeline.lock().unwrap();
+    let cli = TopCli::from_timeline(&timeline);
+    assert_eq!(cli.ver.as_str(), "1.4.10-R6501.1");
+    assert_eq!(cli.kept.state, UpState::None);
+}
+
+/// Clearing a published row after another same-version job took the foreground must keep the
+/// row's original owner. CONTROL: clearing before the change already hides it from the other
+/// job and admits the unchanged original when it returns.
+#[test]
+fn a_retained_upgrade_keeps_its_owner_when_the_foreground_changes_before_the_clear() {
+    use aterm_agent::harness::upgrade::{Agent, Phase};
+    use aterm_agent::harness::upgrade_drive::Row;
+
+    for moved_before_clear in [false, true] {
+        let (mut app, _wid, session) = pane_of(24, 120, "claude");
+        let ctx = app.pool.get(session).unwrap().ctx.clone();
+        let front = |app: &App, pgid| {
+            drawer(app, session, pgid, "claude", "2.1.305");
+            ctx.timeline
+                .lock()
+                .unwrap()
+                .set_program(pgid, Some("claude".into()));
+        };
+        let arrow = || {
+            let timeline = ctx.timeline.lock().unwrap();
+            SwitchPaint::of(
+                HarnessSwitch::Off(SwitchOff::Master),
+                HoverAt::None,
+                Some(aterm_phase::Program::Claude),
+                TopCli::from_timeline(&timeline),
+            )
+            .up
+        };
+        front(&app, PGID);
+        app.apply_agent_upgrades(vec![Row {
+            tab: app.session_sid(session).unwrap(),
+            session: "00000000-0000-4000-8000-000000000031".into(),
+            agent: Agent::Claude,
+            from: "2.1.305".into(),
+            to: "2.1.310".into(),
+            phase: Phase::Pending,
+            ..Row::default()
+        }]);
+        if moved_before_clear {
+            front(&app, PGID + 1);
+        }
+        app.apply_agent_upgrades(Vec::new());
+        assert_eq!(
+            arrow().state,
+            if moved_before_clear {
+                UpState::None
+            } else {
+                UpState::Ready
+            },
+            "foreground moved before clearing: {moved_before_clear}"
+        );
+        front(&app, PGID + 1);
+        assert_eq!(arrow().state, UpState::None, "another same-version job");
+        front(&app, PGID);
+        assert_eq!(
+            arrow().state,
+            UpState::Ready,
+            "the unchanged original returns: {moved_before_clear}"
+        );
+    }
+}
+
+fn upgrade_owner_front(app: &App, session: u64, pgid: i32, started: u64) -> u64 {
+    let token = drawer_started(app, session, pgid, "claude", "2.1.305", started);
+    app.pool
+        .get(session)
+        .unwrap()
+        .ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .set_program(pgid, Some("claude".into()));
+    token
+}
+
+fn upgrade_owner_row(app: &App, session: u64) -> aterm_agent::harness::upgrade_drive::Row {
+    use aterm_agent::harness::upgrade::{Agent, Phase};
+    aterm_agent::harness::upgrade_drive::Row {
+        tab: app.session_sid(session).unwrap(),
+        session: "00000000-0000-4000-8000-000000000031".into(),
+        agent: Agent::Claude,
+        from: "2.1.305".into(),
+        to: "2.1.310".into(),
+        phase: Phase::Pending,
+        ..Default::default()
+    }
+}
+
+/// The arrow of `session`'s rule with the harness off. A Claude Code row kept there stands as it
+/// is, `Ready`: a press moves its tab once ([`TopUp::harness_off`]).
+fn upgrade_owner_arrow(app: &App, session: u64) -> TopUp {
+    let ctx = app.pool.get(session).unwrap().ctx.clone();
+    let timeline = ctx.timeline.lock().unwrap();
+    SwitchPaint::of(
+        HarnessSwitch::Off(SwitchOff::Master),
+        HoverAt::None,
+        Some(aterm_phase::Program::Claude),
+        TopCli::from_timeline(&timeline),
+    )
+    .up
+}
+
+/// A read captured before a foreground change cannot publish its old row onto the new job,
+/// including a PID reused by the same CLI and version. A completed read for the original can.
+#[test]
+fn a_queued_upgrade_uses_the_foreground_captured_before_its_read() {
+    use crate::upgrade_host::UpgradeSources;
+
+    for (pgid, started) in [(PGID + 1, 1), (PGID, 2)] {
+        let (mut app, _wid, session) = pane_of(24, 120, "claude");
+        let original = upgrade_owner_front(&app, session, PGID, 1);
+        let row = upgrade_owner_row(&app, session);
+        assert_eq!(row.pid, 0, "pending Claude records have no recorded PID");
+        let before_read = UpgradeSources::capture(&app.store);
+        let replacement = upgrade_owner_front(&app, session, pgid, started);
+        assert_ne!(original, replacement, "real holder image identity");
+        app.apply_host_upgrades_from(vec![row.clone()], vec![], before_read.clone());
+        assert_eq!(upgrade_owner_arrow(&app, session).state, UpState::None);
+        assert!(
+            app.upgrade_view.row_for(&row.tab).is_none(),
+            "the stale batch was not admitted"
+        );
+
+        upgrade_owner_front(&app, session, PGID, 1);
+        app.apply_host_upgrades_from(vec![row.clone()], vec![], before_read);
+        assert_eq!(
+            upgrade_owner_arrow(&app, session).state,
+            UpState::None,
+            "departing and returning does not make an old in-flight read current"
+        );
+        let after_read = UpgradeSources::capture(&app.store);
+        app.apply_host_upgrades_from(vec![row], vec![], after_read);
+        assert_eq!(
+            upgrade_owner_arrow(&app, session).state,
+            UpState::Ready,
+            "a new completed read admits the unchanged original even with pid=0"
+        );
+    }
+}
+
+/// Once admitted, a record's owner survives unchanged refreshes, deliberately unreadable
+/// records and delayed owner-word results; none may bind it to a new same-version job.
+#[test]
+fn rereads_kept_records_and_word_results_preserve_the_accepted_upgrade_owner() {
+    use crate::upgrade_host::{UpgradeSources, WordAsk};
+    use aterm_agent::harness::upgrade::Request;
+    use aterm_messages::UpgradeWord;
+
+    for path in ["reread", "kept", "word"] {
+        let (mut app, _wid, session) = pane_of(24, 120, "claude");
+        upgrade_owner_front(&app, session, PGID, 1);
+        let row = upgrade_owner_row(&app, session);
+        let tab = row.tab.clone();
+        app.apply_host_upgrades(vec![row.clone()], vec![]);
+        assert_eq!(
+            upgrade_owner_arrow(&app, session).state,
+            UpState::Ready,
+            "{path}: admitted"
+        );
+        upgrade_owner_front(&app, session, PGID + 1, 1);
+        match path {
+            "reread" => {
+                let sources = UpgradeSources::capture(&app.store);
+                app.apply_host_upgrades_from(vec![row.clone()], vec![], sources);
+            }
+            "kept" => app.apply_host_upgrades(vec![], vec![tab.clone()]),
+            "word" => app.apply_upgrade_word(
+                &WordAsk {
+                    tab: tab.clone(),
+                    to: row.to.clone(),
+                    session: row.session.clone(),
+                    word: UpgradeWord::NotToday,
+                    press: None,
+                    scope: None,
+                },
+                Ok(aterm_agent::harness::upgrade_drive::Row {
+                    request: Request::DeferUntil(crate::upgrade_host::now_s() + 86_400),
+                    request_at: crate::upgrade_host::now_s(),
+                    ..row.clone()
+                }),
+            ),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            upgrade_owner_arrow(&app, session).state,
+            UpState::None,
+            "{path}: another job"
+        );
+        upgrade_owner_front(&app, session, PGID, 1);
+        assert_eq!(
+            upgrade_owner_arrow(&app, session).state,
+            UpState::Ready,
+            "{path}: original returns"
+        );
+        if path == "word" {
+            let timeline = app.pool.get(session).unwrap().ctx.timeline.lock().unwrap();
+            assert!(
+                matches!(timeline.upgrade().unwrap().request, Request::DeferUntil(_)),
+                "the original accepted row received its word"
+            );
+        }
+    }
+}
+
+/// A replacement with the same numeric PID has a different image token. Returning to the
+/// original image admits its own retained row; the replacement never inherits it.
+#[test]
+fn a_retained_upgrade_rejects_a_reused_process_group() {
+    let (mut app, _wid, session) = pane_of(24, 120, "claude");
+    let original = upgrade_owner_front(&app, session, PGID, 1);
+    let row = upgrade_owner_row(&app, session);
+    app.apply_host_upgrades(vec![row], vec![]);
+    let replacement = upgrade_owner_front(&app, session, PGID, 2);
+    assert_ne!(original, replacement);
+    app.apply_host_upgrades(vec![], vec![]);
+    assert_eq!(upgrade_owner_arrow(&app, session).state, UpState::None);
+    upgrade_owner_front(&app, session, PGID, 1);
+    assert_eq!(upgrade_owner_arrow(&app, session).state, UpState::Ready);
+}
+
+/// A queued clear for the old job cannot consume a newer job's accepted publication, even
+/// when both run the same CLI version and offer the same target.
+#[test]
+fn a_queued_clear_cannot_consume_another_runs_upgrade_publication() {
+    use crate::upgrade_host::UpgradeSources;
+
+    let (mut app, _wid, session) = pane_of(24, 120, "claude");
+    upgrade_owner_front(&app, session, PGID, 1);
+    let original = upgrade_owner_row(&app, session);
+    app.apply_host_upgrades(vec![original.clone()], vec![]);
+    let clearing_original = UpgradeSources::capture(&app.store);
+    upgrade_owner_front(&app, session, PGID + 1, 2);
+    let mut replacement = original;
+    replacement.session = "00000000-0000-4000-8000-000000000032".into();
+    replacement.proc_start = "Mon Oct 26 12:01:00 2026".into();
+    app.apply_host_upgrades(vec![replacement.clone()], vec![]);
+    app.apply_host_upgrades_from(vec![], vec![], clearing_original);
+    assert_eq!(
+        app.upgrade_view.row_for(&replacement.tab).unwrap().session,
+        replacement.session
+    );
+    let ctx = app.pool.get(session).unwrap().ctx.clone();
+    let timeline = ctx.timeline.lock().unwrap();
+    assert_eq!(
+        timeline.upgrade().unwrap().session,
+        replacement.session,
+        "the stale clear must leave the accepted live row live"
+    );
+    assert!(timeline.upgrade_kept().is_none());
+}
+
+/// A new process can resume the same conversation at the same build: the pending record's
+/// existing process-birth stamp admits that new run. Target or phase changes alone cannot.
+#[test]
+fn a_new_pending_run_can_admit_a_new_owner_without_inheriting_the_old_runs_word() {
+    use crate::upgrade_host::WordAsk;
+    use aterm_agent::harness::upgrade::{Phase, Request};
+    use aterm_messages::UpgradeWord;
+
+    let (mut app, _wid, session) = pane_of(24, 120, "claude");
+    upgrade_owner_front(&app, session, PGID, 1);
+    let mut original = upgrade_owner_row(&app, session);
+    original.proc_start = "Mon Oct 26 12:00:00 2026".into();
+    app.apply_host_upgrades(vec![original.clone()], vec![]);
+    upgrade_owner_front(&app, session, PGID + 1, 2);
+    let mut retargeted = original.clone();
+    retargeted.to = "2.1.311".into();
+    retargeted.source = "native".into();
+    retargeted.phase = Phase::Announced {
+        asks: 1,
+        at_s: crate::upgrade_host::now_s(),
+    };
+    retargeted.wait = "background".into();
+    app.apply_host_upgrades(vec![retargeted.clone()], vec![]);
+    assert_eq!(
+        upgrade_owner_arrow(&app, session).state,
+        UpState::None,
+        "retargeting and phase changes grant no custody to the other job"
+    );
+
+    let mut resumed = retargeted.clone();
+    resumed.proc_start = "Mon Oct 26 12:01:00 2026".into();
+    resumed.phase = Phase::Pending;
+    app.apply_host_upgrades(vec![resumed.clone()], vec![]);
+    assert_eq!(resumed.pid, 0);
+    assert_eq!(
+        upgrade_owner_arrow(&app, session).state,
+        UpState::Ready,
+        "the real pending-run stamp admits the new same-build owner"
+    );
+
+    app.apply_upgrade_word(
+        &WordAsk {
+            tab: retargeted.tab.clone(),
+            to: retargeted.to.clone(),
+            session: retargeted.session.clone(),
+            word: UpgradeWord::NotToday,
+            press: None,
+            scope: None,
+        },
+        Ok(aterm_agent::harness::upgrade_drive::Row {
+            request: Request::DeferUntil(crate::upgrade_host::now_s() + 86_400),
+            request_at: crate::upgrade_host::now_s(),
+            ..retargeted
+        }),
+    );
+    assert_eq!(
+        app.upgrade_view.row_for(&resumed.tab).unwrap().proc_start,
+        resumed.proc_start
+    );
+    assert_eq!(
+        app.upgrade_view.row_for(&resumed.tab).unwrap().request,
+        Request::None,
+        "a reply from the previous run cannot replace this run's row"
+    );
+    app.apply_host_upgrades(vec![resumed.clone()], vec![]);
+    assert_eq!(
+        app.upgrade_view.row_for(&resumed.tab).unwrap().request,
+        Request::None,
+        "the stale word cannot be overlaid on a later fresh read either"
+    );
+    let timeline = app.pool.get(session).unwrap().ctx.timeline.lock().unwrap();
+    assert_eq!(timeline.upgrade().unwrap().proc_start, resumed.proc_start);
+    assert_eq!(timeline.upgrade().unwrap().request, Request::None);
+    drop(timeline);
+
+    let mut newer_target = resumed.clone();
+    newer_target.to = "2.1.312".into();
+    app.apply_host_upgrades(vec![newer_target.clone()], vec![]);
+    app.apply_upgrade_word(
+        &WordAsk {
+            tab: resumed.tab.clone(),
+            to: resumed.to.clone(),
+            session: resumed.session.clone(),
+            word: UpgradeWord::NotToday,
+            press: None,
+            scope: None,
+        },
+        Ok(aterm_agent::harness::upgrade_drive::Row {
+            request: Request::DeferUntil(crate::upgrade_host::now_s() + 86_400),
+            request_at: crate::upgrade_host::now_s(),
+            ..resumed
+        }),
+    );
+    assert_eq!(
+        app.upgrade_view.row_for(&newer_target.tab).unwrap().to,
+        newer_target.to,
+        "an older target's reply cannot replace the current move either"
+    );
+    assert_eq!(
+        app.upgrade_view.row_for(&newer_target.tab).unwrap().request,
+        Request::None
+    );
+}
+
+/// Known footer ownership distinguishes conversations inside one unchanged process image,
+/// both while a publication waits and after its row has been retained.
+#[test]
+fn a_known_foreground_conversation_owns_its_upgrade_publication() {
+    use crate::upgrade_host::UpgradeSources;
+    use aterm_agent::harness::footer::{FactsOwner, FooterFacts};
+
+    let (mut app, _wid, session) = pane_of(24, 120, "claude");
+    upgrade_owner_front(&app, session, PGID, 1);
+    let ctx = app.pool.get(session).unwrap().ctx.clone();
+    let row = upgrade_owner_row(&app, session);
+    let facts = |conversation: &str| {
+        let mut timeline = ctx.timeline.lock().unwrap();
+        timeline.set_agent_reader_for_test(true);
+        timeline.set_claude_footer(
+            PGID,
+            Some(1),
+            Some(FooterFacts {
+                version: Some("2.1.305".into()),
+                owner: Some(FactsOwner {
+                    floor: Some(0),
+                    session_id: conversation.into(),
+                }),
+                ..FooterFacts::default()
+            }),
+        );
+    };
+    facts(&row.session);
+    let before_read = UpgradeSources::capture(&app.store);
+    facts("00000000-0000-4000-8000-000000000032");
+    app.apply_host_upgrades_from(vec![row.clone()], vec![], before_read);
+    assert_eq!(upgrade_owner_arrow(&app, session).state, UpState::None);
+    facts(&row.session);
+    app.apply_host_upgrades(vec![row.clone()], vec![]);
+    app.apply_host_upgrades(vec![], vec![]);
+    assert_eq!(upgrade_owner_arrow(&app, session).state, UpState::Ready);
+    facts("00000000-0000-4000-8000-000000000032");
+    assert_eq!(upgrade_owner_arrow(&app, session).state, UpState::None);
+    facts(&row.session);
+    assert_eq!(
+        upgrade_owner_arrow(&app, session).state,
+        UpState::Ready,
+        "the same conversation can return without reminting custody"
     );
 }

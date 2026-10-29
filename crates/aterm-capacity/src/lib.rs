@@ -12,9 +12,18 @@
 //! waits, with no deadline, until the need fits beside the claims already held and those that
 //! waited longer (first in, first out; a later claim goes first only when it fits beside every
 //! earlier one's reservation), printing one line a minute that names the shortfall and each
-//! holder. That is admission, not a retry. It refuses at once only a need that can never fit
-//! here: all the memory that can ever be available or more (physical memory less what is
-//! wired, [`Reading::reachable`]), or more disk than the volume holds above its floor.
+//! holder. That is admission, not a retry. An earlier waiter whose disk need is more than the
+//! volume has free above its floor now reserves none of it ([`Short::unservable`]): what a
+//! claim wrote stays on the volume once it ends, so no claim's end can make room for it, only
+//! space freed, and the waiters behind it go first while it waits for that, so it is not kept
+//! from being overtaken (the trade, in [`mod@admit`]). A memory need with no margin that does
+//! not fit, where no other claim holds memory or waits ahead for it, is admitted ALONE: what it
+//! is short of is work no claim holds, whose end no claim's end brings, so a wait for it would
+//! have no bound; it runs with no other memory claim beside it, each waiting while it is held
+//! ([`Short::Alone`]). It refuses at once only a need that can never fit here: all the memory
+//! that can ever be available or more (physical memory less what is wired,
+//! [`Reading::reachable`]) unless it asks to be admitted alone ([`Need::alone`]), or more disk
+//! than the volume holds above its floor.
 //! Timing-sensitive work waits for the load within its [`Patience`]: past its reservation age
 //! it holds back claimed work that asks after it, and at its bound it starts whatever the load.
 //!
@@ -41,14 +50,16 @@ pub mod reading;
 pub mod room;
 
 pub use admit::{
-    CREDIT_MAX, Claim, Error, Holder, Pace, Polled, QuietStart, Relief, Short, Shortfall, Waiter,
-    admit, admit_relieved, admit_until, admit_with, gib, never, span,
+    Alone, CREDIT_MAX, Claim, Error, Holder, Pace, Polled, QuietStart, Relief, Reserve, Short,
+    Shortfall, Waiter, admit, admit_relieved, admit_until, admit_with, gib, never, reserved, span,
 };
 pub use footprint::{Estimate, Footprint, Footprints, Meter, allocated, allocated_until, size};
 pub use ledger::{Held, Ledger, Record};
 #[cfg(any(test, debug_assertions))]
 pub use reading::Fixed;
-pub use reading::{Live, Machine, Proc, Procs, Reading, TreeUse, Volume, between, cores};
+pub use reading::{
+    Live, Machine, Proc, Procs, Reading, TreeUse, Volume, between, claimable, cores,
+};
 
 /// This account's home as the account database has it, whatever `$HOME` says.
 #[cfg(unix)]
@@ -105,6 +116,8 @@ pub struct Need {
     pub path: Option<PathBuf>,
     /// The checkout it runs for, where that is not its working directory's (a tool that confines its working directory to `/`); unset, the working directory's enclosing checkout. A [`Record`] keeps it as its `checkout`, never here.
     pub checkout: Option<String>,
+    /// Admit its memory only ALONE ([`Self::alone`]): once no other claim holds memory or waits ahead for it, whatever is available, and while it is held no other memory claim is admitted.
+    pub alone: bool,
 }
 
 impl Need {
@@ -182,6 +195,57 @@ impl Need {
     pub fn checkout(mut self, dir: impl Into<String>) -> Need {
         self.checkout = Some(dir.into());
         self
+    }
+
+    /// Admit its memory only ALONE: once no other claim on the machine holds memory or waits
+    /// ahead for it, however much is available, and while it is held every other memory claim
+    /// waits ([`Short::Alone`]). What work that needs more memory than can ever be available here
+    /// asks: [`never`] refuses such a need otherwise, and admitted beside other claims it would
+    /// overrun the machine with them. A memory need with no margin that is short only of memory
+    /// no claim holds is admitted alone without asking (the ledger's ALONE rule, [`mod@admit`]).
+    #[must_use]
+    pub const fn alone(mut self) -> Need {
+        self.alone = true;
+        self
+    }
+}
+
+/// A memory claim made from a measured peak adds a fifth of it ([`peak_claim`]): one library's
+/// recorded Trust check peaks moved by 14% between two runs on one prover (aterm-render, 13.2 GB
+/// on 2026-10-22 and 15.0 GB on 2026-10-21).
+pub const PEAK_MARGIN_DIV: u64 = 5;
+
+/// The least margin a memory claim adds to a measured peak ([`peak_claim`]): 1 GiB.
+pub const PEAK_MARGIN_MIN: u64 = floor::GIB;
+
+/// THE MEMORY WORK WHOSE MEASURED PEAK IS `peak` BYTES CLAIMS: that peak, and a margin of a fifth
+/// of it ([`PEAK_MARGIN_DIV`]) and at least [`PEAK_MARGIN_MIN`], saturating. The one rule the
+/// Trust lane's checks (their cost history's largest process) and verify's stages (their last
+/// runs' largest peak) claim by. A claim is never cut to fit the machine: one that can never fit
+/// is its caller's to refuse or bound ([`never`]).
+#[must_use]
+pub const fn peak_claim(peak: u64) -> u64 {
+    let margin = peak / PEAK_MARGIN_DIV;
+    peak.saturating_add(if margin > PEAK_MARGIN_MIN {
+        margin
+    } else {
+        PEAK_MARGIN_MIN
+    })
+}
+
+/// What heavy work never measured here claims at most ([`cold_claim`]): 16 GiB.
+pub const COLD_CLAIM: u64 = 16 << 30;
+
+/// THE MEMORY HEAVY WORK NEVER MEASURED HERE CLAIMS, on a machine of `physical` bytes of memory
+/// (`None`: unread): [`COLD_CLAIM`], and never more than half of physical memory, so a host of
+/// any size can admit work it has not measured. The Trust lane's check of a library with no
+/// recorded peak claims it, and so does each verify stage that compiles, until a run of it is
+/// measured.
+#[must_use]
+pub const fn cold_claim(physical: Option<u64>) -> u64 {
+    match physical {
+        Some(p) if p > 0 && p / 2 < COLD_CLAIM => p / 2,
+        _ => COLD_CLAIM,
     }
 }
 

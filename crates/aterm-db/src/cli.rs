@@ -18,9 +18,10 @@ use std::{
 pub const USAGE: &str = "aterm db — encrypted embedded application databases (Unix)\n\
   Commons tables use enrolled secrets and default LAN repair (no --dir):\n\
   commons-status                       local membership, control history and sharing setting\n\
-  network-state                        retained local machine observations; never grants access\n\
+  network-state                        live local observer or retained history; never grants access\n\
   commons-authority                    inspect cached admin control metadata; changes nothing\n\
   commons-tables                       list declarations, provenance and subscriptions\n\
+  commons-inventory --table <digest>    local retained operation counts and fingerprints\n\
   commons-open --application <id> --role <id> [--version <n>]\n\
                                        open a deterministic offline application table\n\
   commons-create --application <id> --role <id> [--version <n>] [--name <name>]\n\
@@ -141,23 +142,38 @@ pub fn run(words: &[String]) -> Result<Value> {
         }
         return Ok(json!({"request":hex::encode_lower(&crypto::random::<16>()?)}));
     }
+    // A development probe, deliberately before paths, custody and network work.
+    // A release or an older executable must refuse the lab before it can start
+    // a host whose runtime would ignore the loopback-only attachment.
+    if command == "runtime-isolation" {
+        empty(&options)?;
+        #[cfg(any(test, debug_assertions))]
+        return Ok(json!({
+            "loopback_only": true,
+            "port": crate::runtime::private_attachment_port()?,
+        }));
+        #[cfg(not(any(test, debug_assertions)))]
+        return Err(Error::new(
+            "private Commons runtime isolation requires a debug build",
+        ));
+    }
     if command == "network-state" {
         empty(&options)?;
         let config = aterm_types::dirs::aterm_config_path()
             .ok_or_else(|| Error::new("network observation path unavailable"))?;
-        let network = crate::network_state::read_history(&config)?;
+        let network = crate::network_state::read_live_publication(&config);
         let paths = aterm_secrets::client::Paths::live()
             .map_err(|_| Error::new("service observation path unavailable"))?;
-        let services =
-            crate::service_state::observe(&paths, &config, aterm_time::unix_millis().unwrap_or(0));
-        let service = |state: aterm_types::network_state::ServiceState| {
-            json!({
-            "availability":format!("{:?}",state.availability),"observed_at_ms":state.observed_at_ms,
-            "last_success_ms":state.last_success_ms,"revision":state.revision,"detail":state.detail,"refresh_failed":state.refresh_failed})
-        };
-        return Ok(
-            json!({"live_network":false,"network":crate::network_state::value(&network),
-            "services":{"accounts":service(services.accounts),"secrets":service(services.secrets)}}),
+        return read_network_state_with(
+            network,
+            || {
+                Ok(crate::network_state::Publication::new(
+                    crate::network_state::read_history(&config)?,
+                    std::time::Instant::now(),
+                ))
+            },
+            || crate::service_state::observe_publication(&paths, &config),
+            || (std::time::Instant::now(), aterm_time::unix_millis()),
         );
     }
     if matches!(
@@ -165,6 +181,7 @@ pub fn run(words: &[String]) -> Result<Value> {
         "commons-status"
             | "commons-authority"
             | "commons-tables"
+            | "commons-inventory"
             | "commons-open"
             | "commons-create"
     ) {
@@ -495,6 +512,48 @@ pub fn run(words: &[String]) -> Result<Value> {
     };
     Ok(value)
 }
+
+fn read_network_state_with(
+    network: std::io::Result<crate::network_state::Publication>,
+    read_history: impl FnOnce() -> Result<crate::network_state::Publication>,
+    read_services: impl FnOnce() -> crate::service_state::Publication,
+    clock: impl FnOnce() -> (std::time::Instant, Option<u64>),
+) -> Result<Value> {
+    let (network, error) = match network {
+        Ok(network) => (network, None),
+        Err(error) => (read_history()?, Some(format!("{:?}", error.kind()))),
+    };
+    Ok(network_state_value_with(
+        network,
+        error,
+        read_services,
+        clock,
+    ))
+}
+
+fn network_state_value_with(
+    network: crate::network_state::Publication,
+    live_error: Option<String>,
+    read_services: impl FnOnce() -> crate::service_state::Publication,
+    clock: impl FnOnce() -> (std::time::Instant, Option<u64>),
+) -> Value {
+    let services = read_services();
+    // Both leases include service I/O and are judged at the same final clock sample.
+    let (now, wall) = clock();
+    let network = network.current_at(now, wall);
+    let services = services.current_at(now, wall);
+    let service = |state: aterm_types::network_state::ServiceState| {
+        json!({
+        "availability":format!("{:?}",state.availability),"observed_at_ms":state.observed_at_ms,
+        "last_success_ms":state.last_success_ms,"revision":state.revision,"detail":state.detail,"refresh_failed":state.refresh_failed})
+    };
+    json!({"live_observation":network.via_local_process.is_some(),
+        "live_observation_error":live_error,
+        "live_network":network.via_local_process.is_some() && network.visibility == aterm_types::network_state::Visibility::Active,
+        "network":crate::network_state::value(&network),
+        "services":{"accounts":service(services.accounts),"secrets":service(services.secrets)}})
+}
+
 fn take<'a>(options: &mut BTreeMap<&'a str, &'a str>, name: &str) -> Result<&'a str> {
     options
         .remove(name)
@@ -525,4 +584,185 @@ fn status(db: &Database) -> Value {
         json!({"name":name,"conflicted":grants.len()!=1,"allocations":allocations})
     }).collect();
     json!({"dataset":hex::encode_lower(&db.credentials.manifest.id),"root":hex::encode_lower(&db.credentials.manifest.root),"actor":hex::encode_lower(&db.credentials.capability.actor),"namespace":db.credentials.manifest.namespace,"retained":db.history.index.inventory().count(),"visible":view.causal.ordered.len(),"pending":view.causal.pending.len(),"quarantined":view.causal.quarantined.iter().map(|a|hex::encode_lower(a)).collect::<Vec<_>>(),"invalid":view.invalid.len(),"refused":db.history.refusals().map(|(id,reason)|json!({"operation":hex::encode_lower(id),"reason":reason})).collect::<Vec<_>>(),"authority_fault":view.authority_fault,"retired_writers":view.revocations.keys().map(|actor|hex::encode_lower(actor)).collect::<Vec<_>>(),"budgets":budgets})
+}
+
+#[cfg(test)]
+mod network_state_tests {
+    use super::*;
+    use aterm_types::network_state::{
+        HistoryState, NetworkObservation, ServiceAvailability, ServiceState, ServiceStates,
+        Visibility,
+    };
+    use std::{
+        cell::Cell,
+        time::{Duration, Instant},
+    };
+
+    fn network(at: Instant, wall: u64) -> crate::network_state::Publication {
+        crate::network_state::Publication::new(
+            NetworkObservation {
+                observed_at_ms: wall,
+                visibility: Visibility::Active,
+                history: HistoryState::Ready,
+                via_local_process: Some(7),
+                revision: 23,
+                ..NetworkObservation::default()
+            },
+            at,
+        )
+    }
+
+    fn services(at: Instant, wall: u64) -> crate::service_state::Publication {
+        let state = ServiceState {
+            availability: ServiceAvailability::Cached,
+            observed_at_ms: wall,
+            revision: Some("retained revision".into()),
+            ..ServiceState::default()
+        };
+        crate::service_state::Publication::new(
+            ServiceStates {
+                accounts: state.clone(),
+                secrets: state,
+            },
+            at,
+        )
+    }
+
+    #[test]
+    fn delayed_service_metadata_cannot_keep_an_expired_network_current() {
+        let at = Instant::now();
+        let sampled = at + Duration::from_secs(14);
+        let now = Cell::new((sampled, Some(114_000)));
+        let value = network_state_value_with(
+            network(at, 100_000),
+            None,
+            || {
+                let publication = services(sampled, 114_000);
+                now.set((at + Duration::from_secs(16), Some(116_000)));
+                publication
+            },
+            || now.get(),
+        );
+        assert_eq!(value["live_network"], json!(false));
+        assert_eq!(value["network"]["visibility"], json!("Unavailable"));
+        assert_eq!(value["network"]["observed_at_ms"], json!(100_000));
+        assert_eq!(value["network"]["revision"], json!(23));
+        assert_eq!(
+            value["services"]["secrets"]["availability"],
+            json!("Cached")
+        );
+    }
+
+    #[test]
+    fn current_network_and_retained_history_keep_their_distinct_evidence() {
+        let at = Instant::now();
+        let now = at + Duration::from_secs(14);
+        let current = network_state_value_with(
+            network(at, 100_000),
+            None,
+            || {
+                crate::service_state::Publication::new(
+                    ServiceStates {
+                        accounts: ServiceState {
+                            availability: ServiceAvailability::Cached,
+                            observed_at_ms: 50_000,
+                            ..ServiceState::default()
+                        },
+                        secrets: ServiceState {
+                            availability: ServiceAvailability::Cached,
+                            observed_at_ms: 114_000,
+                            ..ServiceState::default()
+                        },
+                    },
+                    now,
+                )
+            },
+            || (now, Some(114_000)),
+        );
+        assert_eq!(current["live_network"], json!(true));
+        assert_eq!(
+            current["services"]["accounts"]["availability"],
+            json!("Unknown")
+        );
+        assert_eq!(
+            current["services"]["secrets"]["availability"],
+            json!("Cached")
+        );
+        let retained = crate::network_state::Publication::new(
+            NetworkObservation {
+                visibility: Visibility::Unavailable,
+                history: HistoryState::Ready,
+                observed_at_ms: 100_000,
+                revision: 23,
+                ..NetworkObservation::default()
+            },
+            now,
+        );
+        let history = network_state_value_with(
+            retained,
+            None,
+            || services(now, 114_000),
+            || (now, Some(114_000)),
+        );
+        assert_eq!(history["live_observation"], json!(false));
+        assert_eq!(history["live_network"], json!(false));
+        assert_eq!(history["network"]["revision"], json!(23));
+        assert_eq!(history["network"]["observed_at_ms"], json!(100_000));
+    }
+
+    #[test]
+    fn failed_live_read_reports_its_kind_without_exposing_private_errors() {
+        let at = Instant::now();
+        let private = "private diagnostic payload";
+        for (kind, code) in [
+            (std::io::ErrorKind::InvalidData, "InvalidData"),
+            (std::io::ErrorKind::NotFound, "NotFound"),
+        ] {
+            let value = read_network_state_with(
+                Err(std::io::Error::new(kind, private)),
+                || {
+                    Ok(crate::network_state::Publication::new(
+                        NetworkObservation {
+                            visibility: Visibility::Unavailable,
+                            history: HistoryState::Ready,
+                            observed_at_ms: 100_000,
+                            revision: 23,
+                            ..NetworkObservation::default()
+                        },
+                        at,
+                    ))
+                },
+                || services(at, 100_000),
+                || (at, Some(100_000)),
+            )
+            .unwrap();
+            assert_eq!(value["live_observation_error"], json!(code));
+            assert_eq!(value["live_observation"], json!(false));
+            assert_eq!(value["live_network"], json!(false));
+            assert_eq!(value["network"]["history"], json!("Ready"));
+            assert_eq!(value["network"]["revision"], json!(23));
+            assert_eq!(value["network"]["observed_at_ms"], json!(100_000));
+            assert!(!aterm_json::to_string(&value).unwrap().contains(private));
+        }
+        let live = read_network_state_with(
+            Ok(network(at, 100_000)),
+            || panic!("a live read must not open retained history"),
+            || services(at, 100_000),
+            || (at, Some(100_000)),
+        )
+        .unwrap();
+        assert_eq!(live.get("live_observation_error"), Some(&Value::Null));
+        assert_eq!(live["live_network"], json!(true));
+    }
+
+    #[test]
+    fn a_failed_live_read_cannot_hide_a_failed_history_read() {
+        let result = read_network_state_with(
+            Err(std::io::ErrorKind::NotFound.into()),
+            || Err(Error::new("history unavailable")),
+            || panic!("failed history must be returned before service reads"),
+            || panic!("failed history supplies no publication"),
+        );
+        assert!(result.is_err());
+    }
 }

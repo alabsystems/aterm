@@ -107,6 +107,7 @@ fn base_reading() -> TurnEndReading {
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::Clean,
         fact: None,
+        wake: None,
     }
 }
 

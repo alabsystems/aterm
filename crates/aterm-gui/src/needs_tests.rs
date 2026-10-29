@@ -912,6 +912,7 @@ fn every_reader_says_the_published_verdict() {
             host: None,
             instances: 1,
             drive: false,
+            facts: None,
         };
         let survey = crate::survey::survey_rows(
             &app.store,
@@ -1881,6 +1882,98 @@ fn a_told_need_in_any_script_reads_whole() {
     );
 }
 
+/// A TOLD SET CUT SHORT COUNTS EVERY NEED ITS ENTRY COUNTS (`harness_ask`): a self-claim tells
+/// only its first 32 needs (`meta set harness_needs`), so beside an entry counting 40 more the
+/// first need and its 31 others are read whole and the 9 past them counted on, `(+40 more)` in
+/// all and `count()` 41, the hover's last line saying ` (+9 more)`. NEGATIVE CONTROLS: an entry
+/// counting fewer than the set carries reads the set's own count, and a need the fold empties is
+/// not counted back by the entry that counted it.
+#[test]
+fn a_told_set_cut_short_counts_every_need_its_entry_counts() {
+    let needs: Vec<String> = (1..=32).map(|i| format!("need {i}")).collect();
+    let refs: Vec<&str> = needs.iter().map(String::as_str).collect();
+    let entry = harness_entry("codex", "need 1", 40);
+    let v = of(&told_with(&entry, &refs, &entry));
+    let ask = v.harness_ask().expect("the told set");
+    assert_eq!(
+        (ask.first.as_str(), ask.others.len(), ask.more, ask.count()),
+        ("need 1", 31, 40, 41),
+        "the 32 told, whole, and the 9 past them counted"
+    );
+    assert_eq!(ask.more_past(ask.others.len()), " (+9 more)");
+    let hover = crate::app_presence::harness_need_hover(ask);
+    assert_eq!(
+        hover.get(31).map(String::as_str),
+        Some("Needs you: need 32 (+9 more)"),
+        "{hover:#?}"
+    );
+
+    let short = harness_entry("codex", "need 1", 1);
+    let v = of(&told_with(&short, &refs[..3], &short));
+    assert_eq!(
+        v.harness_ask().map(|a| (a.others.len(), a.more)),
+        Some((2, 2)),
+        "CONTROL: the set carries more than the entry counts"
+    );
+    let entry = harness_entry("claude", "sign it", 1);
+    let v = of(&told_with(&entry, &["\u{200b} ", "sign it"], &entry));
+    assert_eq!(
+        v.harness_ask().map(|a| (a.first.as_str(), a.more)),
+        Some(("sign it", 0)),
+        "CONTROL: the need the fold emptied is the one the entry counted"
+    );
+}
+
+/// AN OUTGOING SET GOES ONCE ITS ENTRY DOES (`ToldNeeds::settle`): the set a take-down replaced
+/// keeps describing its entry while it stands, as §12.2.11 holds; once the entry it was told with
+/// moves or goes, a settle, or a tell beside the entry now standing that moves nothing else (the
+/// take-down told again), keeps nothing, so the same text standing again later never reads it.
+/// NEGATIVE CONTROLS: a settle beside the entry it describes keeps it; the set told last still
+/// waits for its entry through a settle.
+#[test]
+fn an_outgoing_set_goes_once_its_entry_does() {
+    let entry = harness_entry("claude", "sign it", 1);
+    let set = |needs: &[&str]| {
+        let needs: Vec<String> = needs.iter().map(|need| (*need).to_string()).collect();
+        HarnessNeeds::told(&needs, &entry).map(std::sync::Arc::new)
+    };
+    let both = ["sign it".to_string(), "rotate the key".to_string()];
+    let mut told = ToldNeeds::default();
+    assert!(told.tell(set(&["sign it", "rotate the key"]), Some(&entry)));
+    assert!(
+        !told.tell(None, Some(&entry)),
+        "the take-down beside its entry"
+    );
+    told.settle(Some(&entry));
+    assert_eq!(
+        told.words_for(Some(&entry)),
+        Some(both.as_slice()),
+        "CONTROL: it describes its entry while it stands"
+    );
+    assert!(
+        !told.tell(None, None),
+        "the take-down again, its entry gone"
+    );
+    assert_eq!(told, ToldNeeds::default(), "nothing kept");
+    assert_eq!(told.words_for(Some(&entry)), None);
+
+    assert!(told.tell(set(&["sign it", "rotate the key"]), Some(&entry)));
+    assert!(!told.tell(None, Some(&entry)));
+    told.settle(Some(
+        "claude needs you: something else \u{2014} carrying on",
+    ));
+    assert_eq!(told, ToldNeeds::default(), "its entry gave way to another");
+    assert_eq!(told.words_for(Some(&entry)), None);
+
+    assert!(!told.tell(set(&["sign it", "rotate the key"]), None));
+    told.settle(None);
+    assert_eq!(
+        told.words_for(Some(&entry)),
+        Some(both.as_slice()),
+        "CONTROL: the set told last still waits for its entry"
+    );
+}
+
 fn codex_blocked(
     kind: Option<aterm_core::terminal::program_state::ProgramBlockedKind>,
 ) -> NeedFacts {
@@ -2003,6 +2096,47 @@ fn a_programs_blocked_report_is_a_need_only_where_no_claim_speaks_for_it() {
     );
 }
 
+/// CODEX-ALAB'S WAIT IS A WAITING ROW: the wait codex-alab sits out by itself (a usage reset, an
+/// outage, a back-off) while its proven self-claim carries a tab whose reader names no state, as
+/// `owner=codex-alab-wait kind=wait`, is no need and shows under Waiting in its own words beside
+/// its owner, as any writer's `kind=wait` entry does. NEGATIVE CONTROL: the same entry as an ask
+/// is the tab's need, and nothing waits.
+#[test]
+fn codex_alabs_wait_is_a_waiting_row_and_never_a_need() {
+    let carried = |kind| NeedFacts {
+        agent: agent("unknown"),
+        self_claimed: true,
+        supervised: true,
+        other_supervisor: true,
+        claim_live: true,
+        attention: vec![entry(
+            "codex-alab-wait",
+            "waiting out the usage limit \u{b7} resets 15:00",
+            Some(kind),
+        )],
+        ..facts()
+    };
+    let waits = of(&carried(AttentionKind::Wait));
+    assert_eq!(waits.need, None, "a wait is never a need");
+    let wait = waits.waiting.expect("a waiting row");
+    assert_eq!(wait.word, WaitWord::Entry);
+    assert_eq!(
+        wait_words(&wait, false),
+        "waiting out the usage limit \u{b7} resets 15:00 (codex-alab-wait)"
+    );
+
+    let asks = of(&carried(AttentionKind::Ask));
+    assert_eq!(asks.waiting, None, "an ask waits for nothing");
+    let need = asks.need.expect("the ask");
+    assert_eq!(
+        (need.word, need.what.as_str()),
+        (
+            NeedWord::Ask,
+            "waiting out the usage limit \u{b7} resets 15:00"
+        )
+    );
+}
+
 /// NEGATIVE CONTROL: a claim never stands over a word the tab's reader names, and none stands
 /// without a claim: a Claude Code box is `box_need`'s, keyed by its verdict and carrying no
 /// report; `busy`, `idle` and no reader at all with codex's `blocked` beside them, and an
@@ -2079,36 +2213,38 @@ fn two_grok_auth_walls_give_one_need() {
         assert_eq!(wait.word, WaitWord::Login);
         assert_eq!(wait_words(&wait, true), GROK_SIGNIN_WAIT);
     }
-    // ... while the leader's own session carries the one need: the once-ever setup first, and
-    // still the code within the row, for every setup of the label `adopt-default` gives.
+    // ... while the leader's own session carries the one need: the once-ever setup first where
+    // there is one, and still the code within the row, for every setup of the label
+    // `adopt-default` gives and for none (Grok's page blocks the headless browser).
     {
         use aterm_agent::harness::grok_signin::{ADOPT_LABEL, Setup, need_words};
         let label = || ADOPT_LABEL.to_owned();
         for setup in [
-            Setup::Window(label()),
-            Setup::Mailbox(label()),
-            Setup::Email {
+            Some(Setup::Window(label())),
+            Some(Setup::Mailbox(label())),
+            Some(Setup::Email {
                 label: label(),
                 window: true,
-            },
-            Setup::Email {
+            }),
+            Some(Setup::Email {
                 label: label(),
                 window: false,
-            },
-            Setup::Adopt {
+            }),
+            Some(Setup::Adopt {
                 label: label(),
                 window: true,
-            },
-            Setup::Adopt {
+            }),
+            Some(Setup::Adopt {
                 label: label(),
                 window: false,
-            },
+            }),
+            None,
         ] {
             let leader = NeedFacts {
                 attention: vec![entry(
                     aterm_agent::harness::grok_signin::NEED_OWNER,
                     &need_words(
-                        &setup,
+                        setup.as_ref(),
                         "https://accounts.x.ai/oauth2/device?user_code=WMRT-8KQZ",
                         Some("WMRT-8KQZ"),
                     ),
@@ -2118,8 +2254,13 @@ fn two_grok_auth_walls_give_one_need() {
             };
             let need = of(&leader).need.expect("the leader's need");
             assert_eq!(need.word, NeedWord::Ask);
+            let lead = if setup.is_some() {
+                "once: "
+            } else {
+                "approve code "
+            };
             assert!(
-                need.what.starts_with("once: ") && need.what.contains("code WMRT-8KQZ"),
+                need.what.starts_with(lead) && need.what.contains("code WMRT-8KQZ"),
                 "{setup:?}: {}",
                 need.what
             );

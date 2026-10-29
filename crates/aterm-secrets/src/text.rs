@@ -58,8 +58,8 @@ pub struct Entry {
     pub anchor: Option<String>,
 }
 
-/// An open vault's `[join]` line: an admin's subscriber lets in every machine that asks, with
-/// no password and no person at an admin Mac, except a key on a `code-only` line.
+/// An open vault's `[join]` line: an admin's subscriber lets in a machine a person allowed on any
+/// member, with no password and no person at an admin Mac, except a key on a `code-only` line.
 const OPEN_LINE: &str = "open = yes";
 
 /// A parse failure: the 1-based line and what is wrong, never the line's contents.
@@ -194,6 +194,12 @@ struct Model {
     open: Option<usize>,
     /// The keys `[join]`'s `code-only` lines name, and where.
     code_only: Vec<(String, usize)>,
+    /// The keys `[join]`'s notes ([`Document::set_code_only_notes`]) name, the version each says
+    /// named it, and where: for a key noted twice, the last line holds.
+    named_in: Vec<(String, u64, usize)>,
+    /// The versions `[join]`'s run notes say were noted, from and through, and where: the last
+    /// line holds.
+    noted: Vec<(u64, u64, usize)>,
     sections: Vec<Section>,
     entries: Vec<Located>,
 }
@@ -299,7 +305,7 @@ impl Document {
         }
     }
 
-    /// Whether the vault is open (`[join]`'s `open = yes`): an admin's subscriber lets in every machine that asks, with no password, except a key [`Document::code_only`] names.
+    /// Whether the vault is open (`[join]`'s `open = yes`): an admin's subscriber lets in a machine a person allowed on any member, with no password, except a key [`Document::code_only`] names.
     pub const fn open(&self) -> bool {
         self.model.open.is_some()
     }
@@ -348,6 +354,83 @@ impl Document {
         )
     }
 
+    /// The version that named each key on a `code-only` line anew, as `[join]`'s notes say
+    /// ([`Document::set_code_only_notes`]): a key no note names is absent, and a note of a key on
+    /// no `code-only` line now is left out.
+    pub fn code_only_named_in(&self) -> BTreeMap<String, u64> {
+        self.model
+            .named_in
+            .iter()
+            .filter(|(key, _, _)| self.model.code_only.iter().any(|(held, _)| held == key))
+            .map(|(key, version, _)| (key.clone(), *version))
+            .collect()
+    }
+
+    /// The versions `[join]`'s run note says were noted, from and through: each written by an
+    /// aterm that keeps the notes ([`Document::set_code_only_notes`]).
+    pub fn code_only_noted(&self) -> Option<(u64, u64)> {
+        self.model
+            .noted
+            .last()
+            .map(|(from, through, _)| (*from, *through))
+    }
+
+    /// Whether `[join]` holds a note ([`Document::set_code_only_notes`]), of a key on a
+    /// `code-only` line or not.
+    pub fn code_only_notes(&self) -> bool {
+        !self.model.named_in.is_empty() || !self.model.noted.is_empty()
+    }
+
+    /// Rewrite `[join]`'s notes: remove every one, then, when `noted` is `Some((from, through))`
+    /// and a key is on a `code-only` line, append after the last item of the last `[join]` one
+    /// `# code-only <key> named in version <n>` line for each such key `named_in` names, in
+    /// file order, and the run note `# code-only lines noted from version <from> through version
+    /// <through>`. They are comments, which every aterm reads past and an edit keeps as they are;
+    /// `[join]` is never made for them.
+    pub fn set_code_only_notes(
+        &mut self,
+        named_in: &BTreeMap<String, u64>,
+        noted: Option<(u64, u64)>,
+    ) -> Result<(), TextError> {
+        let mut next = self.clone();
+        let mut gone: Vec<usize> = next
+            .model
+            .named_in
+            .iter()
+            .map(|(_, _, line)| *line)
+            .chain(next.model.noted.iter().map(|(_, _, line)| *line))
+            .collect();
+        if !gone.is_empty() {
+            gone.sort_unstable();
+            gone.dedup();
+            let mut lines = next.lines.clone();
+            for line in gone.into_iter().rev() {
+                lines.remove(line).zeroize();
+            }
+            next.commit(lines)?;
+        }
+        if let Some((from, through)) = noted
+            && !next.model.code_only.is_empty()
+        {
+            let block: Vec<String> = next
+                .model
+                .code_only
+                .iter()
+                .filter_map(|(key, _)| {
+                    named_in
+                        .get(key)
+                        .map(|version| format!("# code-only {key} named in version {version}"))
+                })
+                .chain(std::iter::once(format!(
+                    "# code-only lines noted from version {from} through version {through}"
+                )))
+                .collect();
+            next.append_to(&SectionKind::Join, "[join]", block)?;
+        }
+        *self = next;
+        Ok(())
+    }
+
     /// Every entry, in file order.
     pub fn entries(&self) -> Vec<Entry> {
         self.model
@@ -355,6 +438,18 @@ impl Document {
             .iter()
             .map(|located| located.entry.clone())
             .collect()
+    }
+
+    /// Why this text cannot be published over `base`: an entry it adds names an AI CLI's login
+    /// file ([`cli_login_refusal`]). One `base` already holds is kept, so the vault still opens;
+    /// no machine writes its file.
+    pub fn added_cli_login(&self, base: &Document) -> Option<String> {
+        self.model
+            .entries
+            .iter()
+            .map(|located| &located.entry)
+            .filter(|entry| base.entry(&entry.audience, &entry.name).is_none())
+            .find_map(|entry| cli_login_refusal(&entry.name))
     }
 
     /// The entry `name` of the sections for `audience`, if there is one.
@@ -608,6 +703,9 @@ impl Document {
                 "an invalid entry name: a file name [A-Za-z0-9][A-Za-z0-9._-]{0,127} or a ~/ home path",
             ));
         }
+        if let Some(why) = cli_login_refusal(name) {
+            return Err(whole(why));
+        }
         if value.len() > MAX_VALUE {
             return Err(whole(format!("the value is larger than {MAX_VALUE} bytes")));
         }
@@ -769,8 +867,8 @@ const TEMPLATE: &[&str] = &[
     "#             [everyone] entry of the same name.",
     "# [join]      `password = ...`: a machine whose person types it at `aterm secrets",
     "#             join` is let in by an admin's subscriber within seconds.",
-    "#             Or `open = yes` instead: every machine that reaches the server and",
-    "#             asks is let in, with no password, and reads [everyone].",
+    "#             Or `open = yes` instead: a machine a person allows on any member",
+    "#             is let in, with no password, and reads [everyone].",
     "#             `code-only = age1...`: a key an open vault lets in only by its code",
     "#             (a machine it let go, or one that asked before it opened); approving",
     "#             it by code drops the line.",
@@ -850,7 +948,14 @@ fn parse_lines(lines: &[String], mode: Mode) -> Result<Model, TextError> {
         let line = lines[i].as_str();
         let n = i + 1;
         let trimmed = line.trim_matches(BLANK);
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        if trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+        if let Some(comment) = trimmed.strip_prefix('#') {
+            if current.is_some_and(|s| model.sections[s].kind == SectionKind::Join) {
+                note_line(comment, i, &mut model);
+            }
             i += 1;
             continue;
         }
@@ -1096,6 +1201,48 @@ fn parse_join(trimmed: &str, n: usize) -> Result<JoinLine, TextError> {
         }
         _ => Err(at(n, shape)),
     }
+}
+
+/// Note a comment line of `[join]` at line index `i` (`comment`, its text after the `#`) when
+/// it is one of the two notes [`Document::set_code_only_notes`] writes, word for word:
+/// `code-only age1… named in version <n>` and `code-only lines noted from version <a> through
+/// version <b>`, `a` no more than `b`. Any other comment is only a comment, as it is to an aterm
+/// before the notes.
+fn note_line(comment: &str, i: usize, model: &mut Model) {
+    let words: Vec<&str> = comment.split_ascii_whitespace().collect();
+    match words.as_slice() {
+        ["code-only", key, "named", "in", "version", n] if valid_recipient(key) => {
+            if let Some(n) = note_version(n) {
+                model.named_in.push(((*key).to_string(), n, i));
+            }
+        }
+        [
+            "code-only",
+            "lines",
+            "noted",
+            "from",
+            "version",
+            from,
+            "through",
+            "version",
+            through,
+        ] => {
+            if let (Some(from), Some(through)) = (note_version(from), note_version(through))
+                && from <= through
+            {
+                model.noted.push((from, through, i));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A version a note names: 1 to 20 ASCII digits that make a `u64`.
+fn note_version(word: &str) -> Option<u64> {
+    if !(1..=20).contains(&word.len()) || !word.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    word.parse().ok()
 }
 
 /// The entry starting at line index `i`, in a section for `audience`, and its last line
@@ -1409,6 +1556,26 @@ fn spell(name: &str, value: &[u8], if_absent: bool, anchor: Option<&str>) -> Vec
     }
 }
 
+/// The `[everyone]` locker text that holds `entries`, each spelled as a vault spells it, so
+/// [`parse_locker`] reads the same entries back (a member's interim join bundle,
+/// `docs/DESIGN-fluid-swarm-2026-10-28.md` F10). Each entry's own audience is not written: every
+/// one is read back as [`Audience::Everyone`].
+#[must_use]
+pub fn render_everyone_locker(entries: &[Entry]) -> SecretBytes {
+    let mut lines = vec![Audience::Everyone.header()];
+    for entry in entries {
+        lines.extend(spell(
+            &entry.name,
+            entry.value.as_slice(),
+            entry.if_absent,
+            entry.anchor.as_deref(),
+        ));
+    }
+    let text = render_lines(lines.iter().map(String::as_str));
+    wipe_lines(lines);
+    text
+}
+
 /// `END`, or the first of `END1`, `END2`, … that no body line equals.
 fn pick_tag(body: &[&str]) -> String {
     let mut tag = "END".to_string();
@@ -1560,6 +1727,72 @@ pub fn valid_entry_name(name: &str) -> bool {
     let components: Vec<&str> = folded.split('/').collect();
     !(components.starts_with(&[".secrets"])
         || components.starts_with(&[".config", "aterm", "secrets"]))
+}
+
+/// What says whose AI CLI login file a home path is ([`on_cli_login`]).
+static CLI_LOGIN: std::sync::OnceLock<fn(&str) -> Option<&'static str>> =
+    std::sync::OnceLock::new();
+
+/// Registers what says whose OAuth login file the home path `name` (`~/…`) is, by the product's
+/// name ([`cli_login`]). Where each AI CLI keeps its login is in its connector row, and the rows
+/// live in `aterm-agent`, which depends on this crate: the shipped executable registers
+/// `aterm_agent::ai::connector::login_file` as it starts, so every vault path in it (`secrets
+/// set` and `edit`, a document's entries, the materializer) asks the rows themselves. The first
+/// registration wins; with none, or where it names no login, the built-in floor
+/// ([`default_home_login`]) still answers, so a process that registered nothing fails closed.
+pub fn on_cli_login(whose: fn(&str) -> Option<&'static str>) {
+    let _ = CLI_LOGIN.set(whose);
+}
+
+/// Whose login the home path `name` is, where it is an AI CLI's OAuth login file: by what
+/// [`on_cli_login`] registered, else by the built-in floor ([`default_home_login`]).
+#[must_use]
+pub fn cli_login(name: &str) -> Option<&'static str> {
+    login_by(CLI_LOGIN.get().copied(), name)
+}
+
+/// [`cli_login`] with `registered` as what [`on_cli_login`] registered.
+fn login_by(
+    registered: Option<fn(&str) -> Option<&'static str>>,
+    name: &str,
+) -> Option<&'static str> {
+    registered
+        .and_then(|whose| whose(name))
+        .or_else(|| default_home_login(name))
+}
+
+/// The AI CLI logins refused whatever [`on_cli_login`] registered, matched without case as
+/// macOS's file system matches names: Claude Code's `.credentials.json`, in its home or any
+/// directory a row gives it; Codex CLI's `~/.codex/auth.json` and the refresh aterm journals
+/// beside it (`auth.json.refreshed`); Grok Build's `~/.grok/auth.json`; Kimi Code CLI's files
+/// under `~/.kimi-code/credentials/`; Muse Code's `~/.config/muse/.auth.json`; and any file
+/// under `~/.aterm/logins/`, where aterm keeps an account pool's rows' logins.
+fn default_home_login(name: &str) -> Option<&'static str> {
+    let rel = name.strip_prefix("~/")?.to_ascii_lowercase();
+    let components: Vec<&str> = rel.split('/').collect();
+    match components[..] {
+        [.., ".credentials.json"] => Some("Claude Code"),
+        [".codex", "auth.json" | "auth.json.refreshed"] => Some("Codex CLI"),
+        [".grok", "auth.json"] => Some("Grok Build"),
+        [".kimi-code", "credentials", _, ..] => Some("Kimi Code CLI"),
+        [".config", "muse", ".auth.json"] => Some("Muse Code"),
+        [".aterm", "logins", _, ..] => Some("an AI CLI"),
+        _ => None,
+    }
+}
+
+/// Why `name` cannot be a vault entry, where it is an AI CLI's login file ([`cli_login`]): its
+/// OAuth refresh token is single-use and rotates, so a copy on another machine is spent by
+/// whichever refreshes first and the other is signed out (`docs/DESIGN-secrets-2026-10-20.md`
+/// §11, AI CLIs).
+#[must_use]
+pub fn cli_login_refusal(name: &str) -> Option<String> {
+    let whose = cli_login(name)?;
+    Some(format!(
+        "{name} is {whose}'s login, which no vault carries: its refresh token is single-use and \
+         rotates, so a copy on another machine signs one of them out; sign each machine in once \
+         (aterm ai login) and keep only the account names in the vault (ai-accounts.csv)"
+    ))
 }
 
 /// True when `name` is a valid machine name.
@@ -2114,6 +2347,84 @@ mod tests {
         assert_eq!(text(&d), before, "changes nothing");
         let e = error(&format!("{source}[m62]\nown=1\n"));
         assert_eq!(e.line, before.lines().count() + 1);
+    }
+
+    /// FAIL CLOSED: a process that registered no connector rows ([`on_cli_login`]), or whose
+    /// rows name no login at a path, still refuses each AI CLI's login in its default home, a
+    /// Claude Code `.credentials.json` a row keeps elsewhere, a Kimi Code credential file and a
+    /// pool row's login; a name the rows know keeps the rows' answer. A CLI's settings, a lock
+    /// beside a login and Claude Code's profile (`~/.claude.json`, no token) are entries.
+    #[test]
+    fn a_process_that_registered_no_rows_still_refuses_the_default_homes_logins() {
+        let none_here: fn(&str) -> Option<&'static str> = |_| None;
+        for registered in [None, Some(none_here)] {
+            for login in [
+                "~/.codex/auth.json",
+                "~/.Codex/Auth.json",
+                "~/.codex/auth.json.refreshed",
+                "~/.claude/.credentials.json",
+                "~/work/claude-2/.credentials.json",
+                "~/.grok/auth.json",
+                "~/.kimi-code/credentials/kimi-code.json",
+                "~/.kimi-code/credentials/other.json",
+                "~/.config/muse/.auth.json",
+                "~/.aterm/logins/codex/work/auth.json",
+            ] {
+                assert!(login_by(registered, login).is_some(), "{login}");
+            }
+            for entry in [
+                "auth.json",
+                "credentials.json",
+                "~/.codex/config.toml",
+                "~/.codex/auth.json.lock",
+                "~/.claude/settings.json",
+                "~/.claude.json",
+                "~/.grok/settings.json",
+                "~/.kimi-code/config.toml",
+                "~/.kimi-code/credentials",
+                "~/.aterm/release-credentials.toml",
+                "~/.aterm/logins",
+                "~/.config/codex/auth.json",
+            ] {
+                assert_eq!(login_by(registered, entry), None, "{entry}");
+            }
+        }
+        let rows: fn(&str) -> Option<&'static str> =
+            |name| (name == "~/.codex/auth.json").then_some("the rows' Codex");
+        assert_eq!(
+            login_by(Some(rows), "~/.codex/auth.json"),
+            Some("the rows' Codex")
+        );
+    }
+
+    #[test]
+    fn an_ai_clis_login_file_is_refused_as_an_entry_and_still_parses_where_one_stands() {
+        let mut document = Document::parse(&base("")).expect("valid");
+        for name in ["~/.codex/auth.json", "~/.Codex/Auth.json"] {
+            assert!(
+                document
+                    .set_entry(&Audience::Everyone, name, b"{}")
+                    .is_err(),
+                "{name} is a CLI's login, no entry"
+            );
+        }
+        document
+            .set_entry(
+                &Audience::Everyone,
+                "~/.codex/config.toml",
+                b"model = \"x\"",
+            )
+            .expect("a CLI's settings are an entry");
+        let held = Document::parse(&base("[everyone]\n~/.codex/auth.json={}\n"))
+            .expect("a vault an older admin wrote one into still parses");
+        assert!(
+            held.added_cli_login(&held).is_none(),
+            "one it holds is kept"
+        );
+        assert!(
+            held.added_cli_login(&document).is_some(),
+            "one an edit adds is refused"
+        );
     }
 
     #[test]
@@ -2767,6 +3078,114 @@ mod tests {
                 "{body}"
             );
         }
+    }
+
+    #[test]
+    fn a_code_only_note_is_a_comment_a_vault_reads_as_before() {
+        let pw = strong("pw");
+        let (gone, held) = (recipient(9), recipient(8));
+        let source = base(&format!(
+            "[join]\npassword = {pw}\ncode-only = {gone}\ncode-only = {held}\n\n[everyone]\na=1\n"
+        ));
+        let mut d = Document::parse(&source).expect("valid");
+        d.set_code_only_notes(
+            &BTreeMap::from([(gone.clone(), 7), (held.clone(), 3)]),
+            Some((2, 9)),
+        )
+        .expect("noted");
+        let block = format!(
+            "# code-only {gone} named in version 7\n\
+             # code-only {held} named in version 3\n\
+             # code-only lines noted from version 2 through version 9\n"
+        );
+        assert_eq!(
+            text(&d),
+            source.replace("\n\n[everyone]", &format!("\n{block}\n[everyone]"))
+        );
+
+        // Every parse reads past them: the vault reads as it does with no comment at all.
+        let noted = Document::parse(&text(&d)).expect("parses");
+        let bare: String = text(&d)
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let bare = Document::parse(&bare).expect("parses");
+        assert_eq!(noted.machines(), bare.machines());
+        assert_eq!(noted.admins(), bare.admins());
+        assert_eq!(
+            noted.join_password().map(|p| p.as_slice().to_vec()),
+            bare.join_password().map(|p| p.as_slice().to_vec())
+        );
+        assert_eq!(noted.open(), bare.open());
+        assert_eq!(noted.code_only(), bare.code_only());
+        assert_eq!(noted.entries(), bare.entries());
+        assert_eq!(
+            noted.code_only_named_in(),
+            BTreeMap::from([(gone.clone(), 7), (held.clone(), 3)])
+        );
+        assert_eq!(noted.code_only_noted(), Some((2, 9)));
+        assert_eq!(bare.code_only_named_in(), BTreeMap::new());
+        assert_eq!(bare.code_only_noted(), None);
+
+        // A second set rewrites them in place, a key it does not name with no note, and none
+        // takes them away.
+        d.set_code_only_notes(&BTreeMap::from([(held.clone(), 4)]), Some((4, 10)))
+            .expect("noted again");
+        let block = format!(
+            "# code-only {held} named in version 4\n\
+             # code-only lines noted from version 4 through version 10\n"
+        );
+        assert_eq!(
+            text(&d),
+            source.replace("\n\n[everyone]", &format!("\n{block}\n[everyone]"))
+        );
+        d.set_code_only_notes(&BTreeMap::new(), None).expect("none");
+        assert_eq!(text(&d), source);
+        assert!(!d.code_only_notes());
+
+        // With no `code-only` line there is nothing to note.
+        let mut plain =
+            Document::parse(&base(&format!("[join]\npassword = {pw}\n"))).expect("valid");
+        let before = text(&plain);
+        plain
+            .set_code_only_notes(&BTreeMap::from([(gone.clone(), 1)]), Some((1, 1)))
+            .expect("nothing");
+        assert_eq!(text(&plain), before);
+
+        // These are comments, not notes.
+        let note = |n: &str| format!("# code-only {gone} named in version {n}");
+        let run = |a: &str, b: &str| {
+            format!("# code-only lines noted from version {a} through version {b}")
+        };
+        for comment in [
+            format!("# code-only = {gone}"),
+            "# code-only age1nope named in version 7".to_string(),
+            format!("{} now", note("7")),
+            note("seven"),
+            note("+7"),
+            note("123456789012345678901"),
+            note("99999999999999999999"),
+            run("9", "2"),
+            run("2", "x"),
+            format!("# code-only {held} named in version 7"),
+        ] {
+            let source = base(&format!(
+                "[join]\npassword = {pw}\ncode-only = {gone}\n{comment}\n"
+            ));
+            let d = Document::parse(&source).expect("valid");
+            assert_eq!(d.code_only_named_in(), BTreeMap::new(), "{comment}");
+            assert_eq!(d.code_only_noted(), None, "{comment}");
+        }
+        let elsewhere = base(&format!(
+            "[join]\ncode-only = {gone}\n[everyone]\n{}\n{}\n",
+            note("7"),
+            run("1", "7")
+        ));
+        let d = Document::parse(&elsewhere).expect("valid");
+        assert_eq!(d.code_only_named_in(), BTreeMap::new(), "under [everyone]");
+        assert_eq!(d.code_only_noted(), None, "under [everyone]");
+        assert!(!d.code_only_notes(), "under [everyone]");
     }
 
     #[test]

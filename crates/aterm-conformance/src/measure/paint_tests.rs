@@ -53,6 +53,10 @@ fn lit_burst() -> ScanReport {
         companion_frames: 0,
         companion_stack: 0,
         companion_fused: 0,
+        companion_height_frames: 0,
+        companion_height_px: None,
+        companion_min_h: None,
+        companion_max_h: None,
         base_comp: Shape::NONE,
         typed_row: None,
         reach_frames: 0,
@@ -342,6 +346,10 @@ fn companion_obligations_ride_on_top_of_ink() {
         status_frames: 36,
         pet_claimed: 36,
         pet_final_run: 3,
+        companion_height_frames: 4,
+        companion_height_px: Some(15),
+        companion_min_h: Some(14),
+        companion_max_h: Some(15),
         base_comp: Shape::new(215, 24, 14),
         ..lit_burst()
     };
@@ -382,6 +390,10 @@ fn companion_obligations_ride_on_top_of_ink() {
         companion_frames: 3,
         cat_final_run: 3,
         cat_last_present: true,
+        companion_height_frames: 3,
+        companion_height_px: Some(16),
+        companion_min_h: Some(16),
+        companion_max_h: Some(16),
         ..lit_burst()
     };
     let flying = Ledger {
@@ -592,6 +604,116 @@ fn a_reach_row_that_cannot_measure_its_body_is_refused() {
         assert!(
             reach_row(Reach::Tall, style).validate().is_ok(),
             "{style:?}"
+        );
+    }
+}
+
+#[test]
+fn a_companion_row_is_red_for_a_companion_too_short_or_too_tall() {
+    let cell_h = lit_burst().cell.h;
+    for (companion, style) in [
+        (Companion::Pet, Style::Default),
+        (Companion::Cat, Style::Flying),
+    ] {
+        let companion_row = PaintRow {
+            scene: Scene::Prompt,
+            companion: Some(companion),
+            ..row(Expect::Ink, Capture::UnpinnedFocused, style)
+        };
+        assert!(companion_row.validate().is_ok());
+        let style_name = match style {
+            Style::Default => "rainbow kitty pet",
+            Style::Flying => "rainbow kitty flying",
+            _ => unreachable!(),
+        };
+        let ledger = Ledger {
+            rows: Some(vec![status(style_name, ""); 36]),
+            final_row: None,
+            fx_under_frames: 40,
+        };
+        let (lo, hi) = companion.height_bounds();
+        let lo_px = (lo * cell_h).div_ceil(100);
+        let hi_px = hi * cell_h / 100;
+        assert!(
+            lo_px <= hi_px,
+            "{companion:?} bounds leave a pixel at cell height {cell_h}"
+        );
+        let with_height =
+            |min_h: Option<usize>, px: Option<usize>, max_h: Option<usize>| match companion {
+                Companion::Pet => ScanReport {
+                    frames: 36,
+                    status_frames: 36,
+                    pet_claimed: 36,
+                    pet_final_run: 3,
+                    companion_height_frames: 4,
+                    companion_height_px: px,
+                    companion_min_h: min_h,
+                    companion_max_h: max_h,
+                    base_comp: Shape::new(215, 24, px.unwrap_or(14)),
+                    ..lit_burst()
+                },
+                Companion::Cat => ScanReport {
+                    frames: 36,
+                    status_frames: 36,
+                    cat_claimed: 4,
+                    companion_frames: 3,
+                    cat_final_run: 3,
+                    cat_last_present: true,
+                    companion_height_frames: 3,
+                    companion_height_px: px,
+                    companion_min_h: min_h,
+                    companion_max_h: max_h,
+                    ..lit_burst()
+                },
+            };
+        for px in [lo_px, hi_px] {
+            assert_eq!(
+                verdict(
+                    &companion_row,
+                    &ledger,
+                    &with_height(Some(px), Some(px), Some(px))
+                ),
+                ShapeVerdict::Pass,
+                "{companion:?} {px} px"
+            );
+        }
+        for px in [lo_px - 1, hi_px + 1, 0, 3 * cell_h] {
+            assert_eq!(
+                verdict(
+                    &companion_row,
+                    &ledger,
+                    &with_height(Some(px), Some(px), Some(px))
+                ),
+                ShapeVerdict::Fail,
+                "{companion:?} {px} px"
+            );
+        }
+        assert_eq!(
+            verdict(
+                &companion_row,
+                &ledger,
+                &with_height(Some(lo_px - 1), Some(lo_px), Some(hi_px))
+            ),
+            ShapeVerdict::Fail,
+            "{companion:?} outlier low still"
+        );
+        assert_eq!(
+            verdict(
+                &companion_row,
+                &ledger,
+                &with_height(Some(lo_px), Some(hi_px), Some(hi_px + 1))
+            ),
+            ShapeVerdict::Fail,
+            "{companion:?} outlier high still"
+        );
+        let few = ScanReport {
+            companion_height_frames: COMPANION_HEIGHT_MIN_FRAMES - 1,
+            ..with_height(Some(lo_px), Some(lo_px), Some(lo_px))
+        };
+        assert_eq!(verdict(&companion_row, &ledger, &few), ShapeVerdict::Fail);
+        assert_eq!(
+            verdict(&companion_row, &ledger, &with_height(None, None, None)),
+            ShapeVerdict::Fail
         );
     }
 }

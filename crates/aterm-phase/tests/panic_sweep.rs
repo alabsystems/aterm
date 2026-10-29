@@ -117,6 +117,7 @@ fn read_all(w: &[String]) {
     let _ = aterm_phase::phase::composer_rules(w);
     let _ = aterm_phase::phase::composer_index(w);
     let _ = aterm_phase::phase::composer_bottom(w);
+    let _ = aterm_phase::phase::prompt_box_bottom(w);
     let _ = aterm_phase::phase::last_said_row(w);
     let _ = aterm_phase::limit_notice(w);
     let _ = aterm_phase::interrupted(w);

@@ -77,7 +77,7 @@ fn rss_text(mb: u64) -> String {
     if mb < 1024 {
         return format!("rss {mb} MB");
     }
-    let tenths = (mb * 10 + 512) / 1024;
+    let tenths = (u128::from(mb) * 10 + 512) / 1024;
     format!("rss {}.{} GB", tenths / 10, tenths % 10)
 }
 
@@ -584,5 +584,6 @@ mod tests {
             ..s
         };
         assert_eq!(stall_facts(&bare), " for 41s");
+        assert_eq!(rss_text(u64::MAX), "rss 18014398509481984.0 GB");
     }
 }

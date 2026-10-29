@@ -692,6 +692,17 @@ impl Run<'_> {
             .map_err(|e| Halt::Broken(format!("{line}: {e}")))
     }
 
+    /// [`Run::req`] for a step the phase counts on: any reply but an `OK` (an `ERR`) is BROKEN,
+    /// never the step taken as done.
+    fn req_ok(&mut self, line: &str) -> Result<String, Halt> {
+        let reply = self.req(line)?;
+        if reply.starts_with("OK") {
+            Ok(reply)
+        } else {
+            Err(Halt::Broken(format!("{line}: {reply}")))
+        }
+    }
+
     /// Press `key`; a press the window did not take is NOT MEASURED.
     fn press(&mut self, key: Key) -> Result<(), Halt> {
         let line = if self.headless {
@@ -699,10 +710,7 @@ impl Run<'_> {
         } else {
             key.hwkey()
         };
-        let reply = self.req(&line)?;
-        if !reply.starts_with("OK") {
-            return Err(Halt::Broken(format!("{line}: {reply}")));
-        }
+        let reply = self.req_ok(&line)?;
         if !self.headless && !reply.contains("key=1") {
             return Err(Halt::NotMeasured(format!(
                 "{line}: {reply}: the window was not the key window of the active app"
@@ -713,12 +721,8 @@ impl Run<'_> {
 
     /// Wait until the tab has written nothing for `ms`.
     fn settle(&mut self, ms: u64) -> Result<(), Halt> {
-        let reply = self.req(&format!("await idle {ms} timeout=60000"))?;
-        if reply.starts_with("OK") {
-            Ok(())
-        } else {
-            Err(Halt::Broken(format!("await idle: {reply}")))
-        }
+        self.req_ok(&format!("await idle {ms} timeout=60000"))?;
+        Ok(())
     }
 
     /// Type the corpus: each line's keys at a typist's cadence, then wait for
@@ -776,14 +780,16 @@ impl Run<'_> {
     }
 
     /// One phase: settle, read the oracle's start, reset the metrics, type,
-    /// settle, read the metrics, the trace and the take, and judge.
+    /// settle, read the metrics, the trace and the take, and judge. A reset
+    /// the instance refused is BROKEN: the counters would still hold the
+    /// phase before, whose `input_predicted` would stand in for this one's.
     fn phase(&mut self, name: &'static str, sid: Option<&str>, image: bool) -> Result<Phase, Halt> {
         self.settle(800)?;
         let mut notes = Vec::new();
         let takes_at_start = read_takes(&self.takes);
         let text_at_start = text_rows(&self.inst, sid);
         let log_offset = self.log_len();
-        let _ = self.req("metrics reset")?;
+        self.req_ok("metrics reset")?;
         self.type_corpus(image)?;
         self.settle(800)?;
         let percentiles = self.req("metrics percentiles")?;

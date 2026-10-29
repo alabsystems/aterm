@@ -32,6 +32,17 @@ fn the_measured_credits_notices_read_as_credits_in_use() {
         in_use(&screen(CREDITS_STARTED_2_1_300)),
         Some(started("9:43am (America/Los_Angeles)"))
     );
+    // 2.1.312's words for the same notice (`Your ${Wce[type]} resets`, `5-hour limit` for
+    // `session limit`), one column further in so the notice still ends at the frame's edge.
+    let five_hour = CREDITS_STARTED_2_1_300.replace(
+        "You're now using usage credits · Your session limit resets",
+        " You're now using usage credits · Your 5-hour limit resets",
+    );
+    assert_ne!(five_hour, CREDITS_STARTED_2_1_300, "the notice row");
+    assert_eq!(
+        in_use(&screen(&five_hour)),
+        Some(started("9:43am (America/Los_Angeles)"))
+    );
     assert_eq!(
         in_use(&screen(CREDITS_STARTED_FULLSCREEN_2_1_300)),
         Some(started("9:44am (America/Los_Angeles)"))
@@ -242,19 +253,24 @@ fn the_vendors_usage_warning_is_read_with_its_window_and_figure() {
         })
     );
     let at = row_of(&rows, "You've used");
-    let session = format!(
-        "  TAP#3 5h=100 7d=51{:>w$}",
-        "You've used 92% of your session limit · resets 4:12am (America/Los_Angeles)",
-        w = 110 - 2 - 19
-    );
-    assert_eq!(
-        usage_warning(&with_row(rows.clone(), at, &session)),
-        Some(Warning {
-            window: Window::Session,
-            pct: 92,
-            reset: Some("4:12am (America/Los_Angeles)".to_string()),
-        })
-    );
+    // 2.1.312 names the five-hour window `5-hour limit` (`Wce.five_hour` @225060028 in the
+    // store's 2.1.312 binary), the builds before it `session limit`: either is the session's.
+    for name in ["session limit", "5-hour limit"] {
+        let session = format!(
+            "  TAP#3 5h=100 7d=51{:>w$}",
+            format!("You've used 92% of your {name} · resets 4:12am (America/Los_Angeles)"),
+            w = 110 - 2 - 19
+        );
+        assert_eq!(
+            usage_warning(&with_row(rows.clone(), at, &session)),
+            Some(Warning {
+                window: Window::Session,
+                pct: 92,
+                reset: Some("4:12am (America/Los_Angeles)".to_string()),
+            }),
+            "{name}"
+        );
+    }
     for other in [
         "You've used 92% of your Opus limit · resets 4:12am",
         "You've used 40% of your usage credits",

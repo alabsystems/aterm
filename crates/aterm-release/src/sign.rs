@@ -83,7 +83,7 @@ impl ReleaseCredentials {
         let Some(home) = home else {
             return Ok(None);
         };
-        let key_path = Path::new(&home).join(".aterm/machine.key");
+        let key_path = Path::new(&home).join(atpkg_keys::provision::MACHINE_KEY_REL);
         if !key_path.exists() {
             return Ok(None);
         }
@@ -221,7 +221,7 @@ impl ReleaseCredentials {
 
 /// A profile's `machine_roster`, a leading `~/` read under `home`: the secrets vault hands
 /// every Mac one profile, which names the roster where the vault puts it
-/// (`~/.aterm/roster/aterm-machines.toml`) whoever's home that is. A home that is missing or
+/// (`~/.aterm/release-ring/roster/aterm-machines.toml`) whoever's home that is. A home that is missing or
 /// not absolute refuses, so the roster is never looked for under the working directory. Any
 /// other value is the path as written.
 fn roster_path(named: &str, home: Option<&Path>) -> Result<PathBuf, String> {
@@ -345,6 +345,11 @@ pub struct DevIdIdentity {
     pub sha1: String,
     /// `Developer ID Application: <name> (<TEAMID>)`.
     pub common_name: String,
+    /// The keychain codesign is told to find it in (`--keychain`): aterm's release keychain
+    /// when it holds the identity, so the signature does not depend on search order. `None`
+    /// for one only the keychain search list holds (the login keychain of a Mac provisioned
+    /// before the release keychain), which codesign finds there as it always has.
+    pub keychain: Option<PathBuf>,
 }
 
 impl DevIdIdentity {
@@ -353,6 +358,20 @@ impl DevIdIdentity {
     pub fn provenance(&self) -> String {
         format!("{} [{}]", self.common_name, self.sha1)
     }
+}
+
+/// The `codesign` arguments that name `id`: `--keychain <file> --sign <sha1>` when a keychain
+/// holds it ([`DevIdIdentity::keychain`]), else `--sign <sha1>`.
+#[must_use]
+pub fn devid_sign_args(id: &DevIdIdentity) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    if let Some(keychain) = &id.keychain {
+        args.push("--keychain".into());
+        args.push(keychain.into());
+    }
+    args.push("--sign".into());
+    args.push((&id.sha1).into());
+    args
 }
 
 /// The prefix of every Developer-ID code-signing certificate's common name. Matching on it,
@@ -379,10 +398,12 @@ pub fn select_devid_identity(
         .collect();
     if candidates.is_empty() {
         return Err(format!(
-            "no valid \"Developer ID Application: … ({team_id})\" certificate in the login \
-             keychain. `security find-identity -v -p codesigning` must list one; install the \
-             Developer-ID Application certificate and its private key for team {team_id}, or \
-             leave pins::APPLE_TEAM_ID empty to keep Tier APPLE off"
+            "no valid \"Developer ID Application: … ({team_id})\" certificate in aterm's \
+             release keychain or on the keychain search list. `security find-identity -v -p \
+             codesigning` must list one; `{} provision --id <machine-id>` imports the \
+             Developer-ID Application certificate and its private key for team {team_id} into \
+             the release keychain, or leave pins::APPLE_TEAM_ID empty to keep Tier APPLE off",
+            crate::publish::SHIP_COMMAND
         ));
     }
     let chosen: Vec<&DevIdIdentity> = match preferred_sha1 {
@@ -402,7 +423,7 @@ pub fn select_devid_identity(
         )),
         _ => Err(format!(
             "{} valid Developer-ID Application certificates match team {team_id}, so the \
-             pipeline cannot pick one: {}. Remove the superseded certificate from the login \
+             pipeline cannot pick one: {}. Remove the superseded certificate from its \
              keychain, or add `signing_identity_sha1 = \"<sha1>\"` to the release-credentials \
              profile to name the one to use",
             chosen.len(),
@@ -432,6 +453,7 @@ fn parse_find_identity_line(line: &str) -> Option<DevIdIdentity> {
     Some(DevIdIdentity {
         sha1: sha1.to_ascii_uppercase(),
         common_name: common_name.to_string(),
+        keychain: None,
     })
 }
 
@@ -489,7 +511,7 @@ pub fn resolve_apple_tier(
     else {
         return Err(format!(
             "no --release-credentials profile was given, and pins::APPLE_TEAM_ID ({team_id}) \
-             notarizes every artifact, which needs the profile's notary credential. Cut with `--release-credentials ~/.aterm/release-credentials.toml` (`{} provision \
+             notarizes every artifact, which needs the profile's notary credential. Cut with `--release-credentials ~/.aterm/release-ring/release-credentials.toml` (`{} provision \
              --id <machine-id>` writes it)",
             crate::publish::SHIP_COMMAND
         ));
@@ -503,19 +525,61 @@ pub fn resolve_apple_tier(
             profile.display()
         )
     })?;
-    let listing = Command::new(SECURITY)
-        .args(["find-identity", "-v", "-p", "codesigning"])
-        .output()
-        .map_err(|e| format!("spawn {SECURITY} find-identity: {e}"))?;
-    let identity = select_devid_identity(
-        &String::from_utf8_lossy(&listing.stdout),
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let identity = locate_identity(
         team_id,
         credentials.signing_identity_sha1(),
+        home.as_deref(),
+        &crate::dev_identity::Bounded,
     )?;
     Ok(AppleTier::Active {
         identity,
         auth: auth.clone().with_team_id(team_id),
     })
+}
+
+/// The identity a cut signs with: first in aterm's release keychain under `home`, opened with
+/// its stored password and named by path
+/// ([`crate::release_keychain::Keychains::signing_keychain`]); else on the keychain search
+/// list, read-only, as every cut read it before the release keychain existed. A release
+/// keychain that holds the identity and will not open is refused, so codesign never asks for
+/// its password in a dialog; one that holds none is no reason to refuse an identity the search
+/// list holds.
+pub(crate) fn locate_identity(
+    team_id: &str,
+    preferred: Option<&str>,
+    home: Option<&Path>,
+    run: &dyn crate::dev_identity::Run,
+) -> Result<DevIdIdentity, String> {
+    #[cfg(unix)]
+    {
+        if let Some(home) = home {
+            let kc = crate::release_keychain::Keychains::new(home, run);
+            if let Ok(mut identity) =
+                select_devid_identity(&kc.release_listing(true)?, team_id, preferred)
+            {
+                // A cut signs next, so the partition list is re-asserted first.
+                identity.keychain = kc.signing_keychain(
+                    team_id,
+                    &identity.sha1,
+                    crate::release_keychain::Leave::Write,
+                )?;
+                return Ok(identity);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = home;
+    let mut listing = aterm_uds::spawnfd::command(SECURITY);
+    listing.args(["find-identity", "-v", "-p", "codesigning"]);
+    let listing = run
+        .run(&mut listing, crate::dev_identity::WAIT)
+        .map_err(|e| format!("{SECURITY} find-identity: {e}"))?;
+    select_devid_identity(
+        &String::from_utf8_lossy(&listing.stdout),
+        team_id,
+        preferred,
+    )
 }
 
 /// Sign the assembled bundle and return the `signed_by` provenance string.
@@ -531,17 +595,7 @@ pub fn sign_app(
                 id.common_name
             );
             run_checked(
-                Command::new(CODESIGN)
-                    .args([
-                        "--force",
-                        "--options",
-                        "runtime",
-                        "--timestamp",
-                        "--entitlements",
-                    ])
-                    .arg(entitlements)
-                    .args(["--sign", &id.sha1])
-                    .arg(app),
+                Command::new(CODESIGN).args(app_sign_args(app, entitlements, id)),
                 "codesign app",
             )?;
             id.provenance()
@@ -573,11 +627,34 @@ pub fn sign_app(
 pub fn sign_dmg(dmg: &Path, sign_id: &DevIdIdentity) -> Result<(), String> {
     println!("==> codesign dmg (Developer-ID): {}", sign_id.common_name);
     run_checked(
-        Command::new(CODESIGN)
-            .args(["--force", "--timestamp", "--sign", &sign_id.sha1])
-            .arg(dmg),
+        Command::new(CODESIGN).args(dmg_sign_args(dmg, sign_id)),
         "codesign dmg",
     )
+}
+
+/// `codesign`'s arguments for the bundle: hardened runtime, entitlements, a timestamp, `id`.
+fn app_sign_args(app: &Path, entitlements: &Path, id: &DevIdIdentity) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = [
+        "--force",
+        "--options",
+        "runtime",
+        "--timestamp",
+        "--entitlements",
+    ]
+    .map(Into::into)
+    .into();
+    args.push(entitlements.into());
+    args.extend(devid_sign_args(id));
+    args.push(app.into());
+    args
+}
+
+/// `codesign`'s arguments for the DMG: a timestamp and `id`.
+fn dmg_sign_args(dmg: &Path, id: &DevIdIdentity) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = ["--force", "--timestamp"].map(Into::into).into();
+    args.extend(devid_sign_args(id));
+    args.push(dmg.into());
+    args
 }
 
 /// Notarytool credentials.
@@ -1092,6 +1169,192 @@ fn run_streamed(cmd: &mut Command, what: &str, timeout: Duration) -> Result<(), 
             ));
         }
         std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod keychain_tests {
+    use super::{DevIdIdentity, app_sign_args, devid_sign_args, dmg_sign_args, locate_identity};
+    use crate::release_keychain::fake::{Fake, Kc, World};
+    use crate::release_keychain::{Keychains, login_keychain_path};
+    use aterm_update_core::pins::APPLE_TEAM_ID as TEAM;
+    use std::path::{Path, PathBuf};
+
+    const SHA1: &str = "C0FFEE0000000000000000000000000000C0FFEE";
+
+    fn scratch() -> (aterm_tempfile::TempDir, PathBuf) {
+        let dir = aterm_tempfile::tempdir().expect("scratch HOME");
+        let home = std::fs::canonicalize(dir.path()).expect("canonical scratch");
+        std::fs::create_dir_all(home.join("Library/Keychains")).expect("Keychains");
+        (dir, home)
+    }
+
+    fn argv(id: &DevIdIdentity) -> Vec<String> {
+        devid_sign_args(id)
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// A Mac `ship provision` filled signs from the release keychain by path: the cut opens it
+    /// with its stored password, re-asserts the key's partition list (lost here), names it, and
+    /// codesign gets `--keychain` before `--sign`.
+    #[test]
+    fn signing_names_the_release_keychain() {
+        let (_dir, home) = scratch();
+        let login = login_keychain_path(&home);
+        let mut world = World::new(SHA1);
+        world.keychains.insert(login.clone(), Kc::default());
+        world.search_list = vec![login];
+        let fake = Fake::new(world);
+        let kc = Keychains::new(&home, &fake);
+        kc.install_pair(Path::new("/vault/devid.cer"), Path::new("/vault/devid.key"))
+            .expect("provision");
+        let release = kc.release();
+        {
+            let mut world = fake.0.borrow_mut();
+            let kept = world.keychains.get_mut(&release).unwrap();
+            kept.locked = true;
+            kept.partition = false;
+        }
+        fake.0.borrow_mut().log.clear();
+
+        let id = locate_identity(TEAM, None, Some(&home), &fake).expect("the identity");
+        assert_eq!(id.sha1, SHA1);
+        assert_eq!(id.keychain.as_deref(), Some(release.as_path()));
+        let kept = fake.0.borrow().keychains[&release].clone();
+        assert!(!kept.locked, "opened for codesign");
+        assert!(
+            kept.partition,
+            "codesign meets a key it may use with no dialog"
+        );
+        let shown = release.display().to_string();
+        assert_eq!(argv(&id), ["--keychain", shown.as_str(), "--sign", SHA1]);
+        assert!(
+            fake.0
+                .borrow()
+                .log
+                .iter()
+                .all(|c| !c.iter().any(|a| a.contains("login.keychain"))),
+            "{:?}",
+            fake.0.borrow().log
+        );
+        assert_eq!(
+            locate_identity(TEAM, Some(&SHA1.to_lowercase()), Some(&home), &fake)
+                .expect("pinned")
+                .keychain,
+            Some(release.clone())
+        );
+
+        // One that will not open is refused before codesign could ask for its password.
+        std::fs::remove_file(crate::release_keychain::password_path(&home)).unwrap();
+        fake.0
+            .borrow_mut()
+            .keychains
+            .get_mut(&release)
+            .unwrap()
+            .locked = true;
+        let refused = locate_identity(TEAM, None, Some(&home), &fake).expect_err("locked");
+        assert!(refused.contains("move it aside"), "{refused}");
+    }
+
+    /// A release keychain that will not open and holds no identity (one provision made only
+    /// for an issuing intermediate, its password file since lost) does not stop a Mac whose
+    /// identity is in its login keychain: the cut signs from there, with no `--keychain`.
+    #[test]
+    fn an_unopenable_release_keychain_holding_nothing_leaves_the_login_identity_usable() {
+        let (_dir, home) = scratch();
+        let login = login_keychain_path(&home);
+        let mut world = World::new(SHA1);
+        world.keychains.insert(login.clone(), Kc::holding(SHA1));
+        world.search_list = vec![login];
+        let fake = Fake::new(world);
+        let kc = Keychains::new(&home, &fake);
+        let issuer = home.join("issuer.cer");
+        kc.install_certificate(&issuer).expect("the intermediate");
+        let release = kc.release();
+        {
+            let mut world = fake.0.borrow_mut();
+            let made = world.keychains.get_mut(&release).expect("made");
+            made.certs.clear();
+            made.locked = true;
+        }
+        std::fs::remove_file(crate::release_keychain::password_path(&home)).unwrap();
+        fake.0.borrow_mut().log.clear();
+
+        let id = locate_identity(TEAM, None, Some(&home), &fake).expect("the login identity");
+        assert_eq!((id.sha1.as_str(), id.keychain.as_deref()), (SHA1, None));
+        assert!(fake.writes().iter().all(|c| c[1] == "unlock-keychain"));
+        assert!(fake.0.borrow().keychains[&release].locked, "never opened");
+    }
+
+    /// The argv a cut hands codesign. With the identity only on the search list (m3, provisioned
+    /// in its login keychain) it is the argv every cut ran before the release keychain existed,
+    /// word for word; with the identity in the release keychain, `--keychain <it>` comes just
+    /// before `--sign` and nothing else changes.
+    #[test]
+    fn the_codesign_argv_is_unchanged_for_a_login_keychain_identity() {
+        let words = |args: Vec<std::ffi::OsString>| -> Vec<String> {
+            args.iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let (app, ent, dmg) = (
+            Path::new("/d/aterm.app"),
+            Path::new("/d/ent.plist"),
+            Path::new("/d/aterm.dmg"),
+        );
+        let mut id = DevIdIdentity {
+            sha1: SHA1.into(),
+            common_name: format!("Developer ID Application: Placeholder Org ({TEAM})"),
+            keychain: None,
+        };
+        let before_app = [
+            "--force",
+            "--options",
+            "runtime",
+            "--timestamp",
+            "--entitlements",
+            "/d/ent.plist",
+            "--sign",
+            SHA1,
+            "/d/aterm.app",
+        ];
+        let before_dmg = ["--force", "--timestamp", "--sign", SHA1, "/d/aterm.dmg"];
+        assert_eq!(words(app_sign_args(app, ent, &id)), before_app);
+        assert_eq!(words(dmg_sign_args(dmg, &id)), before_dmg);
+
+        let release = "/h/Library/Keychains/aterm-release.keychain-db";
+        id.keychain = Some(PathBuf::from(release));
+        let named = |before: &[&str]| -> Vec<String> {
+            let at = before.iter().position(|w| *w == "--sign").expect("--sign");
+            let mut want: Vec<String> = before.iter().map(|w| (*w).to_string()).collect();
+            want.splice(at..at, ["--keychain".to_string(), release.to_string()]);
+            want
+        };
+        assert_eq!(words(app_sign_args(app, ent, &id)), named(&before_app));
+        assert_eq!(words(dmg_sign_args(dmg, &id)), named(&before_dmg));
+    }
+
+    /// A Mac provisioned before the release keychain signs from its login keychain, found on
+    /// the search list as before: no `--keychain`, nothing opened or written.
+    #[test]
+    fn a_login_keychain_identity_signs_as_it_always_has() {
+        let (_dir, home) = scratch();
+        let login = login_keychain_path(&home);
+        let mut world = World::new(SHA1);
+        world.keychains.insert(login.clone(), Kc::holding(SHA1));
+        world.search_list = vec![login.clone()];
+        let fake = Fake::new(world);
+        let id = locate_identity(TEAM, None, Some(&home), &fake).expect("the identity");
+        assert_eq!((id.sha1.as_str(), id.keychain.as_deref()), (SHA1, None));
+        assert_eq!(argv(&id), ["--sign", SHA1]);
+        assert!(fake.writes().is_empty(), "{:?}", fake.writes());
+        assert_eq!(fake.0.borrow().keychains[&login], Kc::holding(SHA1));
+        assert!(
+            locate_identity(TEAM, Some(&"D".repeat(40)), Some(&home), &fake).is_err(),
+            "a pin the keychains do not hold is refused"
+        );
     }
 }
 

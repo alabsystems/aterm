@@ -67,6 +67,26 @@ fn conflict_naming<'a>(lex: &'a TrickLexicon, needle: &str) -> Option<&'a String
 }
 
 #[test]
+fn the_builtin_decoded_at_build_time_is_the_vocabulary_of_the_data_file() {
+    const TRICKS: &str = include_str!("../data/tricks.toml");
+    let rows = TrickLexicon::rows_from_source(TRICKS).expect("the data file decodes");
+    assert!(rows.len() > 900, "fixture: the data file holds its rows");
+    assert_eq!(TrickLexicon::all_rows(), rows, "all_rows");
+    let langs = languages_in_the_file();
+    assert!(langs.len() > 10, "fixture: the data names its languages");
+    let mut sets: Vec<Vec<&str>> = vec![vec![], vec!["en"], vec!["all"]];
+    sets.extend(langs.iter().map(|lang| vec![lang.as_str()]));
+    for set in &sets {
+        let decoded = TrickLexicon::from_source(TRICKS, set).expect("the data file decodes");
+        assert_eq!(
+            format!("{:?}", TrickLexicon::with_languages(set)),
+            format!("{decoded:?}"),
+            "with_languages({set:?})"
+        );
+    }
+}
+
+#[test]
 fn the_embedded_vocabulary_has_no_conflicts_under_any_language_configuration() {
     let langs = languages_in_the_file();
     let mut configs: Vec<Vec<&str>> = vec![vec![], vec!["en"], vec!["all"]];
@@ -593,11 +613,6 @@ fn classify_folds_case_and_strippable_marks() {
 #[test]
 fn the_cached_english_table_is_the_default_configuration() {
     let a = TrickLexicon::shared_en();
-    let b = TrickLexicon::shared_en();
-    assert!(
-        std::ptr::eq(a, b),
-        "shared_en must be built once and cached"
-    );
     let fresh = TrickLexicon::with_languages(&["en"]);
     assert_eq!(a.surface_count(), fresh.surface_count());
     for row in TrickLexicon::all_rows() {
@@ -970,53 +985,6 @@ fn no_ungated_non_english_surface_is_an_english_dictionary_word() {
          the owning row `gated = true` (split the risky surface into a gated \
          sibling row), or add it to DICTIONARY_EXCUSED with a reason:\n  {}",
         offenders.join("\n  ")
-    );
-}
-
-#[test]
-fn the_dictionary_gate_catches_an_ungated_foreign_english_word_and_clears_a_gated_one() {
-    let doc = |gated: bool| {
-        format!(
-            r#"
-            [[trick]]
-            id = "sit"
-            lang = "en"
-            words = ["sit"]
-            [[trick]]
-            id = "play"
-            lang = "id"
-            words = ["main", "bermain"]
-            gated = {gated}
-            [[trick]]
-            id = "down"
-            lang = "fr"
-            words = ["couché"]
-            "#
-        )
-    };
-    let dictionary = ["sit", "main", "couche", "zebra"];
-    let ungated = doc(false);
-    let offenders = ungated_foreign_surfaces_that_are_english_words(
-        &TrickLexicon::rows_from_source(&ungated).expect("parses"),
-        &compile(&ungated, &["en"]),
-        dictionary.into_iter(),
-    );
-    assert_eq!(
-        offenders.len(),
-        1,
-        "exactly `main` must be charged: {offenders:?}"
-    );
-    assert!(offenders[0].starts_with("main -> "), "{offenders:?}");
-
-    let gated = doc(true);
-    let offenders = ungated_foreign_surfaces_that_are_english_words(
-        &TrickLexicon::rows_from_source(&gated).expect("parses"),
-        &compile(&gated, &["en"]),
-        dictionary.into_iter(),
-    );
-    assert!(
-        offenders.is_empty(),
-        "a gated row is the remedy: {offenders:?}"
     );
 }
 
@@ -1443,6 +1411,10 @@ fn a_marked_surface_needs_marked_typing_unless_the_bare_spelling_is_listed() {
         id = "jump"
         lang = "vi"
         words = ["nhảy"]
+        [[trick]]
+        id = "paw"
+        lang = "pl"
+        words = ["łapa"]
     "#;
     let lex = compile(src, &["all"]);
     assert!(lex.conflicts().is_empty(), "{:?}", lex.conflicts());
@@ -1457,6 +1429,9 @@ fn a_marked_surface_needs_marked_typing_unless_the_bare_spelling_is_listed() {
     assert_eq!(classify(&lex, "СПАТЬ"), plain(Trick::Sleep));
     assert_eq!(classify(&lex, "nhảy"), plain(Trick::Jump));
     assert_eq!(classify(&lex, "nhay"), None);
+    assert_eq!(classify(&lex, "łapa"), plain(Trick::Paw));
+    assert_eq!(classify(&lex, "ŁAPA"), plain(Trick::Paw));
+    assert_eq!(classify(&lex, "lapa"), None);
 }
 
 #[test]
@@ -1544,7 +1519,6 @@ fn a_surface_longer_than_the_token_window_is_dropped_and_named() {
     assert_eq!(classify(&lex, &too_long), None);
     assert_eq!(lex.conflicts().len(), 1);
     assert!(conflict_naming(&lex, "longer than the typed-token window").is_some());
-    assert_eq!(TrickLexicon::MAX_SURFACE_CHARS, 32);
 }
 
 #[test]

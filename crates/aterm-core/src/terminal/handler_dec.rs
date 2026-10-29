@@ -875,57 +875,21 @@ impl TerminalHandler<'_> {
             if active { 1 } else { 2 }
         }
 
-        let mode_state: u8 = match mode {
-            1 => state(self.modes.application_cursor_keys),
-            2 => state(!self.modes.vt52_mode),
-            3 => state(self.modes.column_mode_132),
-            5 => state(self.modes.reverse_video),
-            6 => state(self.modes.origin_mode),
-            7 => state(self.modes.auto_wrap),
-            12 => state(self.modes.cursor_style.blinks()),
-            25 => state(self.modes.cursor_visible),
-            40 => state(self.modes.deccolm_enable),
-            45 => state(self.modes.reverse_wraparound),
-            66 => state(self.modes.application_keypad),
-            67 => state(self.modes.backarrow_sends_bs),
-            69 => state(self.modes.left_right_margin_mode),
-            1035 => state(self.modes.special_modifiers),
-            1036 => state(self.modes.meta_send_escape),
-            1039 => state(self.modes.alt_send_escape),
-            1045 => state(self.modes.mode_1045),
-            80 => state(self.modes.sixel_display_mode),
-            95 => state(self.modes.decncsm),
-            9 => state(self.modes.mouse_mode == MouseMode::X10),
-            1000 => state(self.modes.mouse_mode == MouseMode::Normal),
-            1002 => state(self.modes.mouse_mode == MouseMode::ButtonEvent),
-            1003 => state(self.modes.mouse_mode == MouseMode::AnyEvent),
-            1004 => state(self.modes.focus_reporting),
-            1007 => state(self.modes.alternate_scroll),
-            1005 => state(self.modes.mouse_encoding == MouseEncoding::Utf8),
-            1006 => state(self.modes.mouse_encoding == MouseEncoding::Sgr),
-            1015 => state(self.modes.mouse_encoding == MouseEncoding::Urxvt),
-            1016 => state(self.modes.mouse_encoding == MouseEncoding::SgrPixel),
-            47 | 1047 | 1049 => state(self.modes.alternate_screen),
-            1048 => {
-                let saved = if self.modes.alternate_screen {
-                    self.cursor_save.alt.is_some()
-                } else {
-                    self.cursor_save.main.is_some()
-                };
-                state(saved)
+        let mode_state: u8 = if let Some(active) = self.query_dec_mode(mode) {
+            state(active)
+        } else {
+            match mode {
+                1048 => {
+                    let saved = if self.modes.alternate_screen {
+                        self.cursor_save.alt.is_some()
+                    } else {
+                        self.cursor_save.main.is_some()
+                    };
+                    state(saved)
+                }
+                4 | 8 | 18 | 19 | 2027 => 4,
+                _ => 0,
             }
-            1243 => state(self.modes.bidi_arrow_swap),
-            2004 => state(self.modes.bracketed_paste),
-            2026 => state(self.modes.synchronized_output),
-            2031 => state(self.modes.report_color_scheme),
-            2048 => state(self.modes.in_band_size_reports),
-            2500 => state(self.modes.bidi_box_mirroring),
-            2501 => state(self.modes.bidi_autodetection),
-            9001 if self.modes.win32_input_enabled => state(self.modes.win32_input_mode),
-            4 | 8 => 4,
-            18 | 19 => 4,
-            2027 => 4,
-            _ => 0,
         };
 
         let mut response = StackResponse::<16>::new();
@@ -2586,13 +2550,22 @@ mod mode_and_query_agreement_tests {
 
     #[test]
     fn xtsave_covers_every_mode_decrqm_reports() {
-        const REPORTED: &[u16] = &[
-            1, 3, 5, 6, 7, 9, 12, 25, 40, 45, 66, 67, 69, 80, 95, 1000, 1002, 1003, 1004, 1005,
-            1006, 1007, 1015, 1016, 1035, 1036, 1039, 1045, 1243, 2004, 2026, 2031, 2048, 2500,
-            2501, 9001,
-        ];
+        let mut probe = Terminal::new(24, 80);
+        probe.set_win32_input_enabled(true);
+        let mut discovered = Vec::new();
+        for mode in 0u16..=10_000 {
+            let reply = decrqm(&mut probe, mode);
+            if (reply.ends_with(b";1$y") || reply.ends_with(b";2$y")) && !matches!(mode, 2 | 1048) {
+                discovered.push(mode);
+            }
+        }
+        assert!(
+            discovered.len() >= 38,
+            "DECRQM discovery found unexpectedly few modes: {discovered:?}"
+        );
+
         let mut lost = Vec::new();
-        for &mode in REPORTED {
+        for mode in discovered {
             let mut term = Terminal::new(24, 80);
             if mode == 3 {
                 term.process(b"\x1b[?40h");
@@ -2611,6 +2584,11 @@ mod mode_and_query_agreement_tests {
             term.process(format!("\x1b[?{mode}s").as_bytes());
             term.process(format!("\x1b[?{mode}l").as_bytes());
             let _ = term.take_response();
+            assert_eq!(
+                decrqm(&mut term, mode),
+                format!("\x1b[?{mode};2$y").into_bytes(),
+                "mode {mode} did not disarm"
+            );
             term.process(format!("\x1b[?{mode}r").as_bytes());
             let _ = term.take_response();
             if decrqm(&mut term, mode) != format!("\x1b[?{mode};1$y").into_bytes() {

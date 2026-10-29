@@ -322,10 +322,7 @@ impl Seen {
         if self.unit.is_blank() {
             return;
         }
-        let age = now
-            .saturating_duration_since(self.born)
-            .as_millis()
-            .min(u32::MAX as u128) as u32;
+        let mut age_opt: Option<u32> = None;
         let mut k = 0;
         while k < nb.len() {
             let Some(cols) = nb[k] else {
@@ -338,11 +335,24 @@ impl Seen {
                 self.pending &= !bit;
             } else if at_arm {
                 self.twin |= bit;
-            } else if self.pending & bit == 0 {
-                self.pending |= bit;
-                self.pend_ms[k] = age;
-            } else if age.saturating_sub(self.pend_ms[k]) >= TWIN_MIN_MS {
-                self.twin |= bit;
+            } else {
+                let age = match age_opt {
+                    Some(a) => a,
+                    None => {
+                        let a = now
+                            .saturating_duration_since(self.born)
+                            .as_millis()
+                            .min(u32::MAX as u128) as u32;
+                        age_opt = Some(a);
+                        a
+                    }
+                };
+                if self.pending & bit == 0 {
+                    self.pending |= bit;
+                    self.pend_ms[k] = age;
+                } else if age.saturating_sub(self.pend_ms[k]) >= TWIN_MIN_MS {
+                    self.twin |= bit;
+                }
             }
             k += 1;
         }
@@ -1412,6 +1422,7 @@ impl Witness {
         } else {
             None
         };
+        let mut any = false;
         self.seen
             .retain_mut(|s| match band_row(s.row, top, bottom, delta) {
                 Some(row) => {
@@ -1419,21 +1430,28 @@ impl Witness {
                     s.clear &= keep;
                     s.twin &= keep;
                     s.pending &= keep;
+                    any |= row != s.row;
                     s.row = row;
                     true
                 }
                 None => false,
             });
-        self.seen.sort_unstable_by_key(|s| (s.row, s.col, s.born));
+        if any {
+            self.seen.sort_unstable_by_key(|s| (s.row, s.col, s.born));
+        }
+        let mut blanks = false;
         self.blank_seen
             .retain_mut(|b| match band_row(b.0, top, bottom, delta) {
                 Some(row) => {
+                    blanks |= row != b.0;
                     b.0 = row;
                     true
                 }
                 None => false,
             });
-        self.blank_seen.sort_unstable();
+        if blanks {
+            self.blank_seen.sort_unstable();
+        }
     }
 
     /// The insert's rewrite re-laid `row` left of `col` ([`super::Event::Rewrite`]).
@@ -2128,10 +2146,11 @@ impl Witness {
                 }
                 continue;
             }
-            retire.retain(|id| id.0 != row || !self.run_ids.contains(id));
-            release.retain(|id| id.0 != row || !self.run_ids.contains(id));
+            self.run_ids.sort_unstable();
+            retire.retain(|id| id.0 != row || self.run_ids.binary_search(id).is_err());
+            release.retain(|id| id.0 != row || self.run_ids.binary_search(id).is_err());
             self.fresh_released
-                .retain(|id| id.0 != row || !self.run_ids.contains(id));
+                .retain(|id| id.0 != row || self.run_ids.binary_search(id).is_err());
             self.retired_runs.retain(|r| *r != run);
             self.released_runs.retain(|r| *r != run);
             let sample = row_sample_at(rows, row);

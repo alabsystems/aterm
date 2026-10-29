@@ -72,12 +72,20 @@ pub(crate) fn stamp(len: u64, sha: &[u8; 32], take: u64) -> String {
     format!("{len} {} {take}", aterm_codec::hex::encode_lower(sha))
 }
 
+fn parse_canonical_u64(s: &str) -> Option<u64> {
+    (!s.is_empty()
+        && s.bytes().all(|b| b.is_ascii_digit())
+        && (s.len() == 1 || !s.starts_with('0')))
+    .then(|| s.parse().ok())
+    .flatten()
+}
+
 #[must_use]
 pub(crate) fn parse_stamp(stamp: &str) -> Option<(u64, [u8; 32], u64)> {
     let mut fields = stamp.split(' ');
-    let len = fields.next()?.parse().ok()?;
+    let len = parse_canonical_u64(fields.next()?)?;
     let digest = fields.next()?;
-    let take = fields.next()?.parse().ok()?;
+    let take = parse_canonical_u64(fields.next()?)?;
     if fields.next().is_some() || digest.len() != 64 {
         return None;
     }

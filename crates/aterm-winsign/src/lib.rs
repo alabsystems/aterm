@@ -139,7 +139,9 @@ pub trait Host {
     fn list_dir(&self, path: &Path) -> Vec<String>;
     fn read_to_string(&self, path: &Path) -> Result<String, String>;
     fn write(&self, path: &Path, text: &str) -> Result<(), String>;
+    fn remove_file(&self, path: &Path);
     fn temp_dir(&self) -> PathBuf;
+    fn pid(&self) -> u32;
     fn home(&self) -> Option<PathBuf>;
     /// The SDK's `bin\<version>\<arch>` subdirectory for this machine.
     fn sdk_arch(&self) -> &'static str;
@@ -175,8 +177,14 @@ impl Host for RealHost {
     fn write(&self, path: &Path, text: &str) -> Result<(), String> {
         std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
     }
+    fn remove_file(&self, path: &Path) {
+        let _ = std::fs::remove_file(path);
+    }
     fn temp_dir(&self) -> PathBuf {
         std::env::temp_dir()
+    }
+    fn pid(&self) -> u32 {
+        std::process::id()
     }
     fn home(&self) -> Option<PathBuf> {
         std::env::var_os("USERPROFILE")
@@ -389,22 +397,26 @@ pub fn versions_newest_first<'a>(names: impl IntoIterator<Item = &'a str>) -> Ve
                 .map(str::parse)
                 .collect::<Result<_, _>>()
                 .ok()?;
-            (!parts.is_empty()).then_some((parts, n))
+            Some((parts, n))
         })
         .collect();
     v.sort_by(|a, b| b.0.cmp(&a.0));
     v.into_iter().map(|(_, n)| n).collect()
 }
 
-/// Resolve a bare program name against `PATH` (Windows executable extensions
-/// tried when the name has none).
+/// Resolve a bare program name against a `;`-separated Windows `PATH`
+/// (executable extensions tried when the name has none).
 fn find_on_path(host: &dyn Host, program: &str) -> Option<PathBuf> {
     let paths = host.env("PATH")?;
-    for dir in std::env::split_paths(&paths) {
+    for raw in paths.split(';') {
+        let dir = raw.trim().trim_matches('"');
+        if dir.is_empty() {
+            continue;
+        }
         for candidate in [
-            dir.join(program),
-            dir.join(format!("{program}.exe")),
-            dir.join(format!("{program}.cmd")),
+            win_join(dir, [program]),
+            win_join(dir, [format!("{program}.exe").as_str()]),
+            win_join(dir, [format!("{program}.cmd").as_str()]),
         ] {
             if host.is_file(&candidate) {
                 return Some(candidate);
@@ -649,7 +661,7 @@ pub fn verify_args(file: &Path) -> Vec<String> {
 pub struct VerifyReport {
     /// Exit 0 and "Successfully verified".
     pub verified: bool,
-    /// A signature is present at all.
+    /// `true` unless signtool printed `"No signature found"` (positive trust still requires [`Self::verified`]).
     pub signed: bool,
     /// The chain terminates in a root the trust provider does not trust.
     pub untrusted_root: bool,
@@ -661,7 +673,9 @@ pub struct VerifyReport {
     pub timestamped: bool,
 }
 
-/// Parse signtool's verbose verify output.
+/// Parse signtool's verbose verify output: positive markers set [`VerifyReport::verified`],
+/// [`VerifyReport::untrusted_root`], and [`VerifyReport::timestamped`], while `"No signature found"`
+/// clears [`VerifyReport::signed`].
 #[must_use]
 pub fn parse_verify_output(ran: &Ran) -> VerifyReport {
     /// One certificate of the printed chain: its depth (leading whitespace) and
@@ -725,38 +739,83 @@ pub fn parse_verify_output(ran: &Ran) -> VerifyReport {
     report
 }
 
-/// The tier's judgement of one verified file.
-pub fn judge(tier: &Tier, report: &VerifyReport) -> Result<(), String> {
+/// Structured reason why Tier WINDOWS refused a [`VerifyReport`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefusalReason {
+    /// The executable carries no Authenticode signature (`!report.signed`).
+    Unsigned,
+    /// Verification failed and signtool reported an untrusted root (`!report.verified && report.untrusted_root`).
+    UntrustedRoot,
+    /// Verification failed under the default Authenticode policy (`!report.verified && !report.untrusted_root`).
+    UnverifiedPolicy,
+    /// The leaf certificate's `Issued to:` does not match the pinned publisher.
+    PublisherMismatch { got: String, publisher: String },
+    /// Signtool printed no signing certificate chain with a unique deepest leaf (`report.issued_to.is_none()`).
+    MissingChain,
+    /// The signature carries no RFC 3161 timestamp (`!report.timestamped`).
+    NotTimestamped,
+}
+
+impl fmt::Display for RefusalReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsigned => {
+                f.write_str("the exe carries no signature, and Tier WINDOWS is active")
+            }
+            Self::UntrustedRoot => f.write_str(
+                "the signature chains to a root the Authenticode policy does not trust (a self-signed or private-CA certificate); Code Integrity will refuse it",
+            ),
+            Self::UnverifiedPolicy => {
+                f.write_str("the signature does not verify under the default Authenticode policy")
+            }
+            Self::PublisherMismatch { got, publisher } => write!(
+                f,
+                "signed by `{got}`, but pins::WINDOWS_SIGNING_PUBLISHER is `{publisher}`"
+            ),
+            Self::MissingChain => f.write_str("signtool printed no signing certificate chain"),
+            Self::NotTimestamped => {
+                f.write_str("the signature is not timestamped; it would expire with the certificate")
+            }
+        }
+    }
+}
+
+/// Structured tier judgement of one verified file, naming the first failing check.
+pub fn judge_reason(tier: &Tier, report: &VerifyReport) -> Result<(), RefusalReason> {
     match tier {
         Tier::Inactive => Ok(()),
         Tier::Active { publisher } => {
             if !report.signed {
-                return Err("the exe carries no signature, and Tier WINDOWS is active".into());
+                return Err(RefusalReason::Unsigned);
             }
             if !report.verified {
                 return Err(if report.untrusted_root {
-                    "the signature chains to a root the Authenticode policy does not trust (a self-signed or private-CA certificate); Code Integrity will refuse it".into()
+                    RefusalReason::UntrustedRoot
                 } else {
-                    "the signature does not verify under the default Authenticode policy".into()
+                    RefusalReason::UnverifiedPolicy
                 });
             }
             match report.issued_to.as_deref() {
                 Some(got) if got == publisher => {}
                 Some(got) => {
-                    return Err(format!(
-                        "signed by `{got}`, but pins::WINDOWS_SIGNING_PUBLISHER is `{publisher}`"
-                    ));
+                    return Err(RefusalReason::PublisherMismatch {
+                        got: got.to_string(),
+                        publisher: publisher.clone(),
+                    });
                 }
-                None => return Err("signtool printed no signing certificate chain".into()),
+                None => return Err(RefusalReason::MissingChain),
             }
             if !report.timestamped {
-                return Err(
-                    "the signature is not timestamped; it would expire with the certificate".into(),
-                );
+                return Err(RefusalReason::NotTimestamped);
             }
             Ok(())
         }
     }
+}
+
+/// The tier's judgement of one verified file.
+pub fn judge(tier: &Tier, report: &VerifyReport) -> Result<(), String> {
+    judge_reason(tier, report).map_err(|r| r.to_string())
 }
 
 pub const USAGE: &str =
@@ -824,9 +883,14 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
     Ok(f)
 }
 
-/// Run the tool.
+/// Run the tool against the committed [`tier()`].
 pub fn run(args: Vec<String>, host: &dyn Host) -> i32 {
-    match run_inner(&args, host) {
+    run_with_tier(args, host, &tier())
+}
+
+/// Run the tool against an explicit [`Tier`].
+pub fn run_with_tier(args: Vec<String>, host: &dyn Host, tier: &Tier) -> i32 {
+    match run_inner(&args, host, tier) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("aterm-winsign: {e}");
@@ -835,14 +899,13 @@ pub fn run(args: Vec<String>, host: &dyn Host) -> i32 {
     }
 }
 
-fn run_inner(args: &[String], host: &dyn Host) -> Result<i32, String> {
+fn run_inner(args: &[String], host: &dyn Host, tier: &Tier) -> Result<i32, String> {
     let flags = parse_flags(args)?;
     let verb = flags.verb.clone().unwrap_or_else(|| "help".into());
     if verb == "help" {
         println!("{USAGE}");
         return Ok(0);
     }
-    let tier = tier();
     let env = values_from_env(host);
     let profile = match &flags.credentials {
         Some(p) => values_from_profile(&host.read_to_string(p)?)
@@ -852,7 +915,7 @@ fn run_inner(args: &[String], host: &dyn Host) -> Result<i32, String> {
     let config = resolve_config(&[&flags.values, &env, &profile])?;
 
     match verb.as_str() {
-        "doctor" => Ok(doctor(host, &tier, &config)),
+        "doctor" => Ok(doctor(host, tier, &config)),
         "verify" => {
             if flags.files.is_empty() {
                 return Err("verify needs at least one exe".into());
@@ -860,101 +923,109 @@ fn run_inner(args: &[String], host: &dyn Host) -> Result<i32, String> {
             let signtool = find_signtool(host, config.signtool.as_deref())?;
             let mut code = 0;
             for f in &flags.files {
-                if !report_file(host, &signtool, &tier, f)? {
+                if !report_file(host, &signtool, tier, f)? {
                     code = 1;
                 }
             }
             Ok(code)
         }
-        "sign" => {
-            if flags.files.is_empty() {
-                return Err("sign needs at least one exe".into());
-            }
-            for f in &flags.files {
-                if !host.is_file(f) {
-                    return Err(format!("not a file: {}", f.display()));
-                }
-            }
-            let Some(lane) = &config.lane else {
-                let why = "no signing lane is configured: name a Trusted Signing account (endpoint/account/profile) or a certificate thumbprint — apps/aterm-win/SIGNING.md";
-                return match tier {
-                    Tier::Active { .. } => Err(format!("{tier}; {why}")),
-                    Tier::Inactive => Err(why.into()),
-                };
-            };
-            let signtool = find_signtool(host, config.signtool.as_deref())?;
-            eprintln!("{tier}");
-            eprintln!("signtool: {}", signtool.display());
-            let timestamp = config
-                .timestamp
-                .clone()
-                .unwrap_or_else(|| default_timestamp(lane).to_string());
-            let mut child_env: Vec<(String, String)> = Vec::new();
-            let (dlib, metadata) = match lane {
-                Lane::TrustedSigning {
-                    endpoint,
-                    account,
-                    profile,
-                    dlib,
-                } => {
-                    let dlib = find_dlib(host, dlib.as_deref())?;
-                    let runtime = find_dotnet_runtime(host)?;
-                    if runtime.needs_root_env {
-                        child_env.push((
-                            "DOTNET_ROOT".to_string(),
-                            runtime.root.display().to_string(),
-                        ));
-                    }
-                    let meta = host
-                        .temp_dir()
-                        .join(format!("aterm-winsign-{}.json", std::process::id()));
-                    host.write(&meta, &trusted_signing_metadata(endpoint, account, profile))?;
-                    eprintln!("lane: Azure Artifact Signing — {account} / {profile} at {endpoint}");
-                    eprintln!("dlib: {}", dlib.display());
-                    eprintln!(
-                        "dotnet: {} at {}{}",
-                        runtime.version,
-                        runtime.root.display(),
-                        if runtime.needs_root_env {
-                            " (passed as DOTNET_ROOT)"
-                        } else {
-                            ""
-                        }
-                    );
-                    (Some(dlib), Some(meta))
-                }
-                Lane::Thumbprint(t) => {
-                    eprintln!("lane: certificate {t} from the user's store");
-                    (None, None)
-                }
-            };
-            let args = sign_args(
-                lane,
-                &timestamp,
-                dlib.as_deref(),
-                metadata.as_deref(),
-                &flags.files,
-            );
-            let ran = host.run(&signtool, &args, &child_env);
-            if let Some(m) = &metadata {
-                let _ = std::fs::remove_file(m);
-            }
-            let ran = ran?;
-            if ran.code != Some(0) {
-                eprint!("{}{}", ran.stdout, ran.stderr);
-                eprintln!("aterm-winsign: signtool sign failed (exit {:?})", ran.code);
-                return Ok(1);
-            }
-            let mut code = 0;
-            for f in &flags.files {
-                if !report_file(host, &signtool, &tier, f)? {
-                    code = 1;
-                }
-            }
-            Ok(code)
-        }
+        "sign" => run_sign(host, tier, &config, &flags.files),
         other => Err(format!("unknown verb `{other}`\n{USAGE}")),
     }
+}
+
+fn run_sign(
+    host: &dyn Host,
+    tier: &Tier,
+    config: &Config,
+    files: &[PathBuf],
+) -> Result<i32, String> {
+    if files.is_empty() {
+        return Err("sign needs at least one exe".into());
+    }
+    for f in files {
+        if !host.is_file(f) {
+            return Err(format!("not a file: {}", f.display()));
+        }
+    }
+    let Some(lane) = &config.lane else {
+        let why = "no signing lane is configured: name a Trusted Signing account (endpoint/account/profile) or a certificate thumbprint — apps/aterm-win/SIGNING.md";
+        return match tier {
+            Tier::Active { .. } => Err(format!("{tier}; {why}")),
+            Tier::Inactive => Err(why.into()),
+        };
+    };
+    let signtool = find_signtool(host, config.signtool.as_deref())?;
+    eprintln!("{tier}");
+    eprintln!("signtool: {}", signtool.display());
+    let timestamp = config
+        .timestamp
+        .clone()
+        .unwrap_or_else(|| default_timestamp(lane).to_string());
+    let mut child_env: Vec<(String, String)> = Vec::new();
+    let (dlib, metadata) = match lane {
+        Lane::TrustedSigning {
+            endpoint,
+            account,
+            profile,
+            dlib,
+        } => {
+            let dlib = find_dlib(host, dlib.as_deref())?;
+            let runtime = find_dotnet_runtime(host)?;
+            if runtime.needs_root_env {
+                child_env.push((
+                    "DOTNET_ROOT".to_string(),
+                    runtime.root.display().to_string(),
+                ));
+            }
+            let meta = win_join(
+                host.temp_dir(),
+                [format!("aterm-winsign-{}.json", host.pid()).as_str()],
+            );
+            host.write(&meta, &trusted_signing_metadata(endpoint, account, profile))?;
+            eprintln!("lane: Azure Artifact Signing — {account} / {profile} at {endpoint}");
+            eprintln!("dlib: {}", dlib.display());
+            eprintln!(
+                "dotnet: {} at {}{}",
+                runtime.version,
+                runtime.root.display(),
+                if runtime.needs_root_env {
+                    " (passed as DOTNET_ROOT)"
+                } else {
+                    ""
+                }
+            );
+            (Some(dlib), Some(meta))
+        }
+        Lane::Thumbprint(t) => {
+            eprintln!("lane: certificate {t} from the user's store");
+            (None, None)
+        }
+    };
+    let args = sign_args(
+        lane,
+        &timestamp,
+        dlib.as_deref(),
+        metadata.as_deref(),
+        files,
+    );
+    let ran = host.run(&signtool, &args, &child_env);
+    if let Some(m) = &metadata {
+        host.remove_file(m);
+    }
+    let ran = ran?;
+    if ran.code != Some(0) {
+        eprint!("{}{}", ran.stdout, ran.stderr);
+        eprintln!("aterm-winsign: signtool sign failed (exit {:?})", ran.code);
+        return Ok(1);
+    }
+    let mut code = 0;
+    for f in files {
+        if !report_file(host, &signtool, tier, f)? {
+            code = 1;
+        }
+    }
+    Ok(code)
 }
 
 /// Verify one file, print the verdict, and say whether the tier accepts it.
@@ -1122,6 +1193,8 @@ mod tests {
         env: BTreeMap<String, String>,
         files: Vec<PathBuf>,
         dirs: BTreeMap<PathBuf, Vec<String>>,
+        written: RefCell<Vec<(PathBuf, String)>>,
+        removed: RefCell<Vec<PathBuf>>,
         runs: RefCell<Vec<Run>>,
         reply: Ran,
     }
@@ -1132,6 +1205,8 @@ mod tests {
                 env: BTreeMap::new(),
                 files: Vec::new(),
                 dirs: BTreeMap::new(),
+                written: RefCell::new(Vec::new()),
+                removed: RefCell::new(Vec::new()),
                 runs: RefCell::new(Vec::new()),
                 reply: Ran::default(),
             }
@@ -1157,11 +1232,20 @@ mod tests {
         fn read_to_string(&self, path: &Path) -> Result<String, String> {
             Err(format!("no such file {}", path.display()))
         }
-        fn write(&self, _: &Path, _: &str) -> Result<(), String> {
+        fn write(&self, path: &Path, text: &str) -> Result<(), String> {
+            self.written
+                .borrow_mut()
+                .push((path.to_path_buf(), text.to_string()));
             Ok(())
+        }
+        fn remove_file(&self, path: &Path) {
+            self.removed.borrow_mut().push(path.to_path_buf());
         }
         fn temp_dir(&self) -> PathBuf {
             PathBuf::from(r"C:\tmp")
+        }
+        fn pid(&self) -> u32 {
+            4242
         }
         fn home(&self) -> Option<PathBuf> {
             Some(PathBuf::from(r"C:\Users\u"))
@@ -1297,21 +1381,28 @@ Number of errors: 1
             "Issued to: Andrew Yates",
             "Issued to: Mallory Unrelated Customer LLC",
         );
-        let e = judge(
-            &tier_from("Andrew Yates"),
-            &parse_verify_output(&ran(0, &other)),
-        )
-        .unwrap_err();
-        assert!(
-            e.contains("signed by `Mallory Unrelated Customer LLC`"),
-            "{e}"
+        let other_report = parse_verify_output(&ran(0, &other));
+        assert_eq!(
+            judge_reason(&tier_from("Andrew Yates"), &other_report),
+            Err(RefusalReason::PublisherMismatch {
+                got: "Mallory Unrelated Customer LLC".into(),
+                publisher: "Andrew Yates".into(),
+            })
         );
-        for text in [VERIFIED, other.as_str()] {
-            let e = judge(&tier_from(root), &parse_verify_output(&ran(0, text))).unwrap_err();
-            assert!(
-                e.contains("is `Microsoft Identity Verification Root"),
-                "{e}"
+        assert!(judge(&tier_from("Andrew Yates"), &other_report).is_err());
+        for (text, expected_leaf) in [
+            (VERIFIED, "Andrew Yates"),
+            (other.as_str(), "Mallory Unrelated Customer LLC"),
+        ] {
+            let report = parse_verify_output(&ran(0, text));
+            assert_eq!(
+                judge_reason(&tier_from(root), &report),
+                Err(RefusalReason::PublisherMismatch {
+                    got: expected_leaf.into(),
+                    publisher: root.into(),
+                })
             );
+            assert!(judge(&tier_from(root), &report).is_err());
         }
 
         let flat = "Verifying: aterm.exe
@@ -1326,13 +1417,12 @@ The signature is timestamped: Mon Sep 15 10:00:00 2026
 Successfully verified: aterm.exe
 ";
         let r = parse_verify_output(&ran(0, flat));
-        assert_eq!((r.issued_to, r.issued_by), (None, None));
-        let e = judge(
-            &tier_from("Andrew Yates"),
-            &parse_verify_output(&ran(0, flat)),
-        )
-        .unwrap_err();
-        assert!(e.contains("no signing certificate chain"), "{e}");
+        assert_eq!((r.issued_to.clone(), r.issued_by.clone()), (None, None));
+        assert_eq!(
+            judge_reason(&tier_from("Andrew Yates"), &r),
+            Err(RefusalReason::MissingChain)
+        );
+        assert!(judge(&tier_from("Andrew Yates"), &r).is_err());
     }
 
     #[test]
@@ -1351,22 +1441,51 @@ Successfully verified: aterm.exe
     #[test]
     fn the_active_tier_refuses_everything_but_the_anchored_trusted_timestamped_leaf() {
         let active = tier_from("Andrew Yates");
-        assert!(judge(&active, &parse_verify_output(&ran(0, VERIFIED))).is_ok());
+        let verified = parse_verify_output(&ran(0, VERIFIED));
+        assert_eq!(judge_reason(&active, &verified), Ok(()));
+        assert!(judge(&active, &verified).is_ok());
+
         let wrong = tier_from("Someone Else");
-        let e = judge(&wrong, &parse_verify_output(&ran(0, VERIFIED))).unwrap_err();
-        assert!(e.contains("signed by `Andrew Yates`"), "{e}");
-        let e = judge(&active, &parse_verify_output(&ran(1, UNTRUSTED))).unwrap_err();
-        assert!(e.contains("root"), "{e}");
-        let e = judge(
-            &active,
-            &parse_verify_output(&ran(1, "SignTool Error: No signature found.\n")),
-        )
-        .unwrap_err();
-        assert!(e.contains("no signature"), "{e}");
+        assert_eq!(
+            judge_reason(&wrong, &verified),
+            Err(RefusalReason::PublisherMismatch {
+                got: "Andrew Yates".into(),
+                publisher: "Someone Else".into(),
+            })
+        );
+        assert!(judge(&wrong, &verified).is_err());
+
+        let untrusted = parse_verify_output(&ran(1, UNTRUSTED));
+        assert_eq!(
+            judge_reason(&active, &untrusted),
+            Err(RefusalReason::UntrustedRoot)
+        );
+        assert!(judge(&active, &untrusted).is_err());
+
+        let unverified_policy = parse_verify_output(&ran(1, "SignTool Error: Digest mismatch.\n"));
+        assert_eq!(
+            judge_reason(&active, &unverified_policy),
+            Err(RefusalReason::UnverifiedPolicy)
+        );
+        assert!(judge(&active, &unverified_policy).is_err());
+
+        let unsigned = parse_verify_output(&ran(1, "SignTool Error: No signature found.\n"));
+        assert_eq!(
+            judge_reason(&active, &unsigned),
+            Err(RefusalReason::Unsigned)
+        );
+        assert!(judge(&active, &unsigned).is_err());
+
         let no_ts = VERIFIED.replace("The signature is timestamped", "The signature is not");
-        let e = judge(&active, &parse_verify_output(&ran(0, &no_ts))).unwrap_err();
-        assert!(e.contains("timestamped"), "{e}");
-        assert!(judge(&Tier::Inactive, &parse_verify_output(&ran(1, UNTRUSTED))).is_ok());
+        let no_ts_report = parse_verify_output(&ran(0, &no_ts));
+        assert_eq!(
+            judge_reason(&active, &no_ts_report),
+            Err(RefusalReason::NotTimestamped)
+        );
+        assert!(judge(&active, &no_ts_report).is_err());
+
+        assert_eq!(judge_reason(&Tier::Inactive, &untrusted), Ok(()));
+        assert!(judge(&Tier::Inactive, &untrusted).is_ok());
     }
 
     #[test]
@@ -1485,29 +1604,6 @@ Successfully verified: aterm.exe
     }
 
     #[test]
-    fn the_fake_spells_paths_the_way_the_windows_machine_it_models_would() {
-        for spelling in [
-            r"C:\PF\dotnet",
-            "C:/PF/dotnet",
-            r"C:\PF/dotnet",
-            r"C:\\PF\\\dotnet",
-            r"C:\PF\dotnet\",
-        ] {
-            assert_eq!(win_path(Path::new(spelling)), r"C:\PF\dotnet", "{spelling}");
-        }
-        assert_eq!(
-            win_path(Path::new(r"\\server\share\x")),
-            r"\\server\share\x"
-        );
-        assert_eq!(win_path(Path::new(r"\dir\x")), r"\dir\x");
-        assert_ne!(win_path(Path::new(r"C:\PF")), win_path(Path::new(r"C:\pf")));
-        assert_ne!(
-            win_path(Path::new(r"C:\PF\dotnet")),
-            win_path(Path::new(r"C:\PF\dotnetx"))
-        );
-    }
-
-    #[test]
     fn signtool_is_found_newest_sdk_first_and_every_miss_is_named() {
         let mut h = Fake::new();
         h.env.insert("ProgramFiles(x86)".into(), r"C:\PFx86".into());
@@ -1618,10 +1714,28 @@ Successfully verified: aterm.exe
     fn sign_without_a_lane_refuses_by_name_and_help_exits_zero() {
         let mut h = Fake::new();
         h.files.push(PathBuf::from(r"C:\d\aterm.exe"));
-        assert_eq!(run(vec!["help".into()], &h), 0);
-        assert_eq!(run(vec!["sign".into(), r"C:\d\aterm.exe".into()], &h), 2);
-        assert_eq!(run(vec!["bogus".into()], &h), 2);
-        assert_eq!(run(vec!["sign".into(), "--nope".into()], &h), 2);
+        assert_eq!(run_with_tier(vec!["help".into()], &h, &Tier::Inactive), 0);
+        assert_eq!(
+            run_with_tier(
+                vec!["sign".into(), r"C:\d\aterm.exe".into()],
+                &h,
+                &Tier::Inactive
+            ),
+            2
+        );
+        assert_eq!(
+            run_with_tier(
+                vec!["sign".into(), r"C:\d\aterm.exe".into()],
+                &h,
+                &tier_from("Andrew Yates")
+            ),
+            2
+        );
+        assert_eq!(run_with_tier(vec!["bogus".into()], &h, &Tier::Inactive), 2);
+        assert_eq!(
+            run_with_tier(vec!["sign".into(), "--nope".into()], &h, &Tier::Inactive),
+            2
+        );
         assert!(h.runs.borrow().is_empty(), "nothing was executed");
     }
 
@@ -1637,7 +1751,11 @@ Successfully verified: aterm.exe
         h.env
             .insert("ATERM_WINSIGN_SIGNTOOL".into(), st.display().to_string());
         h.reply = ran(0, VERIFIED);
-        let code = run(vec!["sign".into(), exe.display().to_string()], &h);
+        let code = run_with_tier(
+            vec!["sign".into(), exe.display().to_string()],
+            &h,
+            &Tier::Inactive,
+        );
         assert_eq!(code, 0);
         let runs = h.runs.borrow();
         assert_eq!(runs.len(), 2, "one sign, one verify");
@@ -1704,7 +1822,11 @@ Successfully verified: aterm.exe
             "SignTool Error: An unexpected internal error has occurred.",
         );
         assert_eq!(
-            run(vec!["sign".into(), exe.display().to_string()], &h),
+            run_with_tier(
+                vec!["sign".into(), exe.display().to_string()],
+                &h,
+                &Tier::Inactive,
+            ),
             1,
             "a refused signature must not wear the missing-tool code"
         );
@@ -1717,7 +1839,11 @@ Successfully verified: aterm.exe
             "A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4".into(),
         );
         assert_eq!(
-            run(vec!["sign".into(), exe.display().to_string()], &gone),
+            run_with_tier(
+                vec!["sign".into(), exe.display().to_string()],
+                &gone,
+                &Tier::Inactive,
+            ),
             2,
             "nothing to sign with is still exit 2"
         );
@@ -1749,7 +1875,32 @@ Successfully verified: aterm.exe
             vec!["8.0.31".into()],
         );
         h.reply = ran(0, VERIFIED);
-        assert_eq!(run(vec!["sign".into(), exe.display().to_string()], &h), 0);
+        assert_eq!(
+            run_with_tier(
+                vec!["sign".into(), exe.display().to_string()],
+                &h,
+                &tier_from("Andrew Yates"),
+            ),
+            0
+        );
+        assert_eq!(
+            h.written.borrow().len(),
+            1,
+            "metadata written once through Host"
+        );
+        assert_same_path!(
+            &h.written.borrow()[0].0,
+            Path::new(r"C:\tmp\aterm-winsign-4242.json")
+        );
+        assert_eq!(
+            h.removed.borrow().len(),
+            1,
+            "metadata removed once through Host"
+        );
+        assert_same_path!(
+            &h.removed.borrow()[0],
+            Path::new(r"C:\tmp\aterm-winsign-4242.json")
+        );
         let runs = h.runs.borrow();
         assert_eq!(runs.len(), 2);
         assert!(runs[0].1.contains(&"/dlib".to_string()));
@@ -1761,12 +1912,26 @@ Successfully verified: aterm.exe
             r"C:\Users\u\AppData\Local\Microsoft\dotnet"
         );
         assert!(runs[1].2.is_empty(), "verify needs no runtime");
+        drop(runs);
+        assert_eq!(
+            run_with_tier(
+                vec!["verify".into(), exe.display().to_string()],
+                &h,
+                &tier_from("Someone Else"),
+            ),
+            1,
+            "active tier refuses a verified exe signed by a different publisher"
+        );
         let mut none = Fake::new();
         none.files.extend([exe.clone(), st.clone(), dlib.clone()]);
         none.env = h.env.clone();
         none.env.remove("LOCALAPPDATA");
         assert_eq!(
-            run(vec!["sign".into(), exe.display().to_string()], &none),
+            run_with_tier(
+                vec!["sign".into(), exe.display().to_string()],
+                &none,
+                &Tier::Inactive,
+            ),
             2
         );
         assert!(none.runs.borrow().is_empty());
@@ -1782,8 +1947,37 @@ Successfully verified: aterm.exe
         h.env
             .insert("ATERM_WINSIGN_SIGNTOOL".into(), st.display().to_string());
         h.reply = ran(1, UNTRUSTED);
-        assert_eq!(run(vec!["verify".into(), exe.display().to_string()], &h), 1);
+        assert_eq!(
+            run_with_tier(
+                vec!["verify".into(), exe.display().to_string()],
+                &h,
+                &Tier::Inactive,
+            ),
+            1
+        );
         h.reply = ran(0, VERIFIED);
-        assert_eq!(run(vec!["verify".into(), exe.display().to_string()], &h), 0);
+        assert_eq!(
+            run_with_tier(
+                vec!["verify".into(), exe.display().to_string()],
+                &h,
+                &Tier::Inactive,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn find_signtool_resolves_windows_semicolon_path_on_every_host() {
+        let mut h = Fake::new();
+        h.env.insert(
+            "PATH".into(),
+            r#"C:\empty;"C:\Windows Kits\bin";D:\other"#.into(),
+        );
+        h.files
+            .push(PathBuf::from(r"C:\Windows Kits\bin\signtool.exe"));
+        assert_same_path!(
+            find_signtool(&h, None).expect("signtool found on Windows PATH"),
+            Path::new(r"C:\Windows Kits\bin\signtool.exe")
+        );
     }
 }

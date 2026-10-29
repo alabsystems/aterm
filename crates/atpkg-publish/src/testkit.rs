@@ -96,7 +96,7 @@ impl Keys {
         atpkg_keys::sign(&self.master_key, bytes).expect("master signs")
     }
 
-    /// Build a context rooted at `home` and write the machine key and record into `~/.aterm`.
+    /// Build a context rooted at `home` and write the machine key and record into `~/.aterm/release-ring`.
     ///
     /// # Panics
     ///
@@ -104,7 +104,8 @@ impl Keys {
     #[must_use]
     pub fn ctx(&self, home: &Path, host: Arc<FakeHost>) -> Ctx {
         let ctx = self.ctx_over(home, host);
-        std::fs::create_dir_all(home.join(".aterm")).expect("mkdir ~/.aterm");
+        std::fs::create_dir_all(home.join(atpkg_keys::provision::RELEASE_RING_REL))
+            .expect("mkdir ~/.aterm/release-ring");
         std::fs::write(&ctx.identity.key, &self.machine_key).expect("write machine key");
         std::fs::write(
             &ctx.identity.record,

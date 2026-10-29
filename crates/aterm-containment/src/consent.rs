@@ -335,7 +335,7 @@ pub fn parse_open_probe_line(out: &str) -> Option<ProbeOutcome> {
 }
 
 /// [`OPEN_PROBE_VERB`]: open the one path named, close it unread, and print [`open_probe_line`].
-#[must_use]
+#[must_use = "return or inspect the command exit status"]
 pub fn run_open_probe_verb(args: &[std::ffi::OsString]) -> std::process::ExitCode {
     #[cfg(target_os = "macos")]
     if let [db] = args {
@@ -592,7 +592,7 @@ pub const fn classify_responsible(
     answer: Result<i32, ResponsibleError>,
 ) -> Responsible {
     match answer {
-        Ok(pid) if pid == self_pid => Responsible::SelfProcess,
+        Ok(pid) if pid > 0 && pid == self_pid => Responsible::SelfProcess,
         Ok(pid) if pid > 0 => Responsible::Other(pid),
         Err(ResponsibleError::Gone) => Responsible::Exited,
         Ok(_) | Err(_) => Responsible::Unknown,
@@ -2908,10 +2908,19 @@ pub fn log_store_readable() -> bool {
     std::fs::read_dir(DIAGNOSTICS_DIR).is_ok()
 }
 
-/// How far back [`probe_devtool`] reads tccd's answers, in seconds: tccd answers as a new
-/// program starts, and the window's Developer Tools reading is never older than this
-/// (`DEVTOOLS_TTL`), so a longer read finds nothing a reader still needs.
-pub const DEVTOOL_WINDOW_S: u64 = 120;
+macro_rules! devtool_window_minutes {
+    ($mins:literal) => {
+        /// How far back [`probe_devtool`] reads tccd's answers, in seconds: tccd answers as a new
+        /// program starts, and the window's Developer Tools reading is never older than this
+        /// (`DEVTOOLS_TTL`), so a longer read finds nothing a reader still needs.
+        pub const DEVTOOL_WINDOW_S: u64 = $mins * 60;
+
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        const DEVTOOL_LAST_ARG: &str = concat!($mins, "m");
+    };
+}
+
+devtool_window_minutes!(2);
 
 /// Where a person adds aterm to the Developer Tools list, in words.
 pub const DEVTOOLS_SETTINGS_WORDS: &str =
@@ -2933,7 +2942,7 @@ const DEVTOOL_PREDICATE: &str = "process == \"tccd\" AND eventMessage BEGINSWITH
 const DEVTOOL_LOG_ARGS: [&str; 10] = [
     "show",
     "--last",
-    "2m",
+    DEVTOOL_LAST_ARG,
     "--info",
     "--style",
     "ndjson",
@@ -3579,11 +3588,11 @@ fn access_columns(schema: &aterm_uds::sqlite_read::TableSchema) -> Option<Access
 
 fn decode_devtool_row(
     cols: &AccessColumns,
-    row: &[aterm_uds::sqlite_read::SqlValue],
+    row: &[aterm_uds::sqlite_read::SqlValue<'_>],
 ) -> Option<(String, u32, u32, i64)> {
     use aterm_uds::sqlite_read::SqlValue;
     let client = match row.get(cols.client)? {
-        SqlValue::Text(s) => s.clone(),
+        SqlValue::Text(s) => s.as_ref().to_owned(),
         SqlValue::Blob(b) => String::from_utf8_lossy(b).into_owned(),
         SqlValue::Null | SqlValue::Int(_) | SqlValue::Float(_) => return None,
     };
@@ -4228,8 +4237,9 @@ fn run_to_exit_keeping_heads<F: FnOnce(u32)>(argv: &[&str], on_spawn: F) -> Devt
         reader
             .filter(std::thread::JoinHandle::is_finished)
             .and_then(|reader| reader.join().ok())
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .unwrap_or_default()
+            .map_or_else(String::new, |bytes| {
+                String::from_utf8_lossy(&bytes).into_owned()
+            })
     };
     DevtoolsChangeRun::Exited {
         code: status.code(),
@@ -6257,7 +6267,7 @@ mod tests {
                 ),
             )
             .unwrap();
-            let converted = std::process::Command::new("/usr/bin/plutil")
+            let converted = aterm_uds::spawnfd::command("/usr/bin/plutil")
                 .args(["-convert", "binary1"])
                 .arg(&plist)
                 .status()
@@ -7141,6 +7151,8 @@ mod tests {
         assert_eq!(classify_responsible(me, Ok(4402)), Responsible::Other(4402));
         assert_eq!(classify_responsible(me, Ok(0)), Responsible::Unknown);
         assert_eq!(classify_responsible(me, Ok(-1)), Responsible::Unknown);
+        assert_eq!(classify_responsible(-1, Ok(-1)), Responsible::Unknown);
+        assert_eq!(classify_responsible(0, Ok(0)), Responsible::Unknown);
     }
 
     #[test]
@@ -9343,7 +9355,7 @@ mod tests {
         }
     }
 
-    fn encode_sqlite_record(cols: &[aterm_uds::sqlite_read::SqlValue]) -> Vec<u8> {
+    fn encode_sqlite_record(cols: &[aterm_uds::sqlite_read::SqlValue<'_>]) -> Vec<u8> {
         use aterm_uds::sqlite_read::SqlValue;
         let mut serials = Vec::new();
         let mut body = Vec::new();
@@ -9396,7 +9408,7 @@ mod tests {
     fn sqlite_db_with_table(
         table_name: &str,
         ddl: &str,
-        rows: &[Vec<aterm_uds::sqlite_read::SqlValue>],
+        rows: &[Vec<aterm_uds::sqlite_read::SqlValue<'_>>],
     ) -> Vec<u8> {
         use aterm_uds::sqlite_read::SqlValue;
         let mut db = vec![0u8; 8192];
@@ -9408,11 +9420,11 @@ mod tests {
         db[56..60].copy_from_slice(&1u32.to_be_bytes());
 
         let schema_rec = encode_sqlite_record(&[
-            SqlValue::Text("table".to_owned()),
-            SqlValue::Text(table_name.to_owned()),
-            SqlValue::Text(table_name.to_owned()),
+            SqlValue::Text("table".into()),
+            SqlValue::Text(table_name.into()),
+            SqlValue::Text(table_name.into()),
             SqlValue::Int(2),
-            SqlValue::Text(ddl.to_owned()),
+            SqlValue::Text(ddl.into()),
         ]);
         let schema_cell = encode_leaf_cell(1, &schema_rec);
         let schema_off = 4096 - schema_cell.len();
@@ -9438,16 +9450,16 @@ mod tests {
         db
     }
 
-    fn db_row_values(
-        service: &str,
-        client: aterm_uds::sqlite_read::SqlValue,
-        kind: aterm_uds::sqlite_read::SqlValue,
-        auth: aterm_uds::sqlite_read::SqlValue,
-        modified: aterm_uds::sqlite_read::SqlValue,
-    ) -> Vec<aterm_uds::sqlite_read::SqlValue> {
+    fn db_row_values<'a>(
+        service: &'a str,
+        client: aterm_uds::sqlite_read::SqlValue<'a>,
+        kind: aterm_uds::sqlite_read::SqlValue<'a>,
+        auth: aterm_uds::sqlite_read::SqlValue<'a>,
+        modified: aterm_uds::sqlite_read::SqlValue<'a>,
+    ) -> Vec<aterm_uds::sqlite_read::SqlValue<'a>> {
         use aterm_uds::sqlite_read::SqlValue;
         vec![
-            SqlValue::Text(service.to_owned()),
+            SqlValue::Text(service.into()),
             client,
             kind,
             auth,
@@ -9461,18 +9473,19 @@ mod tests {
         kind: u32,
         auth: u32,
         modified: i64,
-    ) -> Vec<aterm_uds::sqlite_read::SqlValue> {
+    ) -> Vec<aterm_uds::sqlite_read::SqlValue<'static>> {
         use aterm_uds::sqlite_read::SqlValue;
-        db_row_values(
-            DEVTOOL_SERVICE,
-            SqlValue::Text(client.to_owned()),
+        vec![
+            SqlValue::Text(DEVTOOL_SERVICE.into()),
+            SqlValue::Text(client.to_owned().into()),
             SqlValue::Int(i64::from(kind)),
             SqlValue::Int(i64::from(auth)),
+            SqlValue::Null,
             SqlValue::Int(modified),
-        )
+        ]
     }
 
-    fn db_of(rows: &[Vec<aterm_uds::sqlite_read::SqlValue>]) -> Vec<u8> {
+    fn db_of(rows: &[Vec<aterm_uds::sqlite_read::SqlValue<'_>>]) -> Vec<u8> {
         sqlite_db_with_table("access", TCC_ACCESS_DDL, rows)
     }
 
@@ -9497,7 +9510,7 @@ mod tests {
             db_row("com.apple.Terminal", 0, 0, 1_781_819_370),
             db_row_values(
                 "kTCCServiceAccessibility",
-                SqlValue::Text(ATERM.to_owned()),
+                SqlValue::Text(ATERM.into()),
                 SqlValue::Int(0),
                 SqlValue::Int(2),
                 SqlValue::Int(999),
@@ -9539,7 +9552,7 @@ mod tests {
                 "blob client bytes decode lossily as UTF-8",
                 vec![db_row_values(
                     DEVTOOL_SERVICE,
-                    SqlValue::Blob(ATERM.as_bytes().to_vec()),
+                    SqlValue::Blob(ATERM.as_bytes().into()),
                     SqlValue::Int(0),
                     SqlValue::Int(2),
                     SqlValue::Int(11),
@@ -9620,7 +9633,7 @@ mod tests {
                 "negative client_type",
                 db_row_values(
                     DEVTOOL_SERVICE,
-                    SqlValue::Text("a.b".to_owned()),
+                    SqlValue::Text("a.b".into()),
                     SqlValue::Int(-1),
                     SqlValue::Int(2),
                     SqlValue::Int(1),
@@ -9630,7 +9643,7 @@ mod tests {
                 "client_type overflow",
                 db_row_values(
                     DEVTOOL_SERVICE,
-                    SqlValue::Text("a.b".to_owned()),
+                    SqlValue::Text("a.b".into()),
                     SqlValue::Int(4_294_967_296),
                     SqlValue::Int(2),
                     SqlValue::Int(1),
@@ -9640,7 +9653,7 @@ mod tests {
                 "negative auth_value",
                 db_row_values(
                     DEVTOOL_SERVICE,
-                    SqlValue::Text("a.b".to_owned()),
+                    SqlValue::Text("a.b".into()),
                     SqlValue::Int(0),
                     SqlValue::Int(-2),
                     SqlValue::Int(1),
@@ -9650,7 +9663,7 @@ mod tests {
                 "auth_value overflow",
                 db_row_values(
                     DEVTOOL_SERVICE,
-                    SqlValue::Text("a.b".to_owned()),
+                    SqlValue::Text("a.b".into()),
                     SqlValue::Int(0),
                     SqlValue::Int(4_294_967_296),
                     SqlValue::Int(1),
@@ -9660,7 +9673,7 @@ mod tests {
                 "float last_modified",
                 db_row_values(
                     DEVTOOL_SERVICE,
-                    SqlValue::Text("a.b".to_owned()),
+                    SqlValue::Text("a.b".into()),
                     SqlValue::Int(0),
                     SqlValue::Int(2),
                     SqlValue::Float(1.5),
@@ -9670,7 +9683,7 @@ mod tests {
                 "negative last_modified",
                 db_row_values(
                     DEVTOOL_SERVICE,
-                    SqlValue::Text("a.b".to_owned()),
+                    SqlValue::Text("a.b".into()),
                     SqlValue::Int(0),
                     SqlValue::Int(2),
                     SqlValue::Int(-1),
@@ -9680,7 +9693,7 @@ mod tests {
                 "last_modified >= 10^18",
                 db_row_values(
                     DEVTOOL_SERVICE,
-                    SqlValue::Text("a.b".to_owned()),
+                    SqlValue::Text("a.b".into()),
                     SqlValue::Int(0),
                     SqlValue::Int(2),
                     SqlValue::Int(1_000_000_000_000_000_000),

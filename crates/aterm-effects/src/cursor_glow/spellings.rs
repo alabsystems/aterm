@@ -100,7 +100,7 @@ pub const TRAIL_STYLES: &[TrailStyleRow] = &[
         "sparkle",
         Some(GlowStyle::Sparkle),
         "Sparkle",
-        "A gold comet with a shower of rainbow stars",
+        "A gold comet with a shower of gold stars and moons",
     ),
     row_of(
         "lumen",
@@ -297,6 +297,9 @@ const TRAIL_STYLE_ALIAS_ROWS: [usize; TRAIL_STYLE_ALIASES.len()] = alias_row_ind
 #[must_use]
 pub const fn row(raw: &str) -> Option<&'static TrailStyleRow> {
     let raw = trim_whitespace_bytes(raw);
+    if raw.is_empty() {
+        return None;
+    }
     let mut i = 0;
     while i < TRAIL_STYLES.len() {
         if eq_ascii_ci(raw, TRAIL_STYLES[i].name) {

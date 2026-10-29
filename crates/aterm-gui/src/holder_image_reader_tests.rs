@@ -1174,3 +1174,98 @@ fn a_byte_free_edge_records_the_clock_its_empty_parse_ran_at() {
             .collect::<Vec<_>>()
     );
 }
+
+/// Writes `bytes` to the PTY's slave whole (the shell's output).
+fn write_slave(slave: i32, bytes: &[u8]) {
+    let mut sent = 0;
+    while sent < bytes.len() {
+        // SAFETY: Bounded write of a live slice to the test-owned slave.
+        let wrote =
+            unsafe { libc::write(slave, bytes[sent..].as_ptr().cast(), bytes.len() - sent) };
+        assert!(wrote > 0, "write the shell's bytes");
+        sent += wrote.cast_unsigned();
+    }
+}
+
+/// H2 PLACEMENT THROUGH THE GATHER (rule 2's "the command's own job"): an exec the watch hears
+/// is placed where the shell's output stood when the gather read the PTY's queue, which it
+/// reads before the foreground, so a job whose block's D the shell writes right after (here
+/// written by the foreground probe itself, between the two reads) is still placed in its own
+/// block; a prompt hook's exec heard once D and the prompt are parsed is placed in no block.
+/// Each is a real process (a `sleep`), so its names are the kernel's. NEGATIVE CONTROL
+/// (scratch): reading the foreground before the queue in `ExecEdges::note_execs` places the
+/// job's exec past its D, in no block (`Job(None)`), and the first assertion fails.
+#[test]
+fn an_exec_is_placed_in_its_jobs_block_though_its_d_follows_at_once() {
+    use crate::command_ran::{During, Window};
+    const ID: u64 = 9360;
+    const SHELL: i32 = 9_100;
+    set_image(SHELL, zsh(SHELL));
+    let rig = Rig::attach(ID, SHELL, KERNEL);
+    rig.write(SHELL, &prompt(), "<p1>");
+    rig.write(
+        SHELL,
+        &[&b"sleep 30\r\n"[..], &signed("133;C")].concat(),
+        "<typed>",
+    );
+    let sleeper = || {
+        let mut command = aterm_uds::spawnfd::command("/bin/sleep");
+        command.arg("30");
+        command.spawn().expect("spawn a sleep")
+    };
+    let mut job = sleeper();
+    let job_pid = i32::try_from(job.id()).expect("a pid");
+    let ended = [signed("133;D;0"), prompt()].concat();
+    let slave = rig.slave;
+    arm_probe(rig.session.master, move || {
+        write_slave(slave, &ended);
+        job_pid
+    });
+    let placed = |pid: i32| {
+        rig.session
+            .ctx
+            .ran
+            .within(Some(Window { from: 0, to: None }))
+            .into_iter()
+            .find(|e| e.pid == pid)
+            .map(|e| e.during)
+    };
+    // The exec is heard (held for the parse, or placed at once) before the test writes more:
+    // no byte of the test's own races the gather's reads.
+    let heard = |pid: i32| {
+        let seen = aterm_spec::wait::within(PATIENCE, Duration::from_millis(1), || {
+            (rig.session.ctx.ran.waiting() > 0 || placed(pid).is_some()).then_some(())
+        });
+        assert!(
+            seen.is_some(),
+            "timed out waiting for {pid}'s exec to be heard"
+        );
+    };
+    let script = rig.script();
+    script.post(&[ProcEvent::Exec {
+        pid: job_pid,
+        pgid: job_pid,
+        late: false,
+    }]);
+    heard(job_pid);
+    rig.write(SHELL, b"", "<ended>");
+    assert_eq!(script.pending(), 0, "the gather heard the exec");
+    let mut hook = sleeper();
+    let hook_pid = i32::try_from(hook.id()).expect("a pid");
+    set_fg(rig.session.master, hook_pid);
+    script.post(&[ProcEvent::Exec {
+        pid: hook_pid,
+        pgid: hook_pid,
+        late: false,
+    }]);
+    heard(hook_pid);
+    rig.write(hook_pid, b"", "<hooked>");
+    assert_eq!(script.pending(), 0, "the gather heard the hook's exec");
+    let (job_place, hook_place) = (placed(job_pid), placed(hook_pid));
+    let _ = job.kill();
+    let _ = job.wait();
+    let _ = hook.kill();
+    let _ = hook.wait();
+    assert_eq!(job_place, Some(During::Job(Some(0))), "the job's own block");
+    assert_eq!(hook_place, Some(During::Job(None)), "a hook's: no block's");
+}

@@ -1300,27 +1300,25 @@ mod tests {
 
     #[test]
     fn text_scale_is_sane_and_bounded() {
+        let norm = |text_scale: f32| {
+            AppearancePreferences {
+                text_scale,
+                ..AppearancePreferences::default()
+            }
+            .normalized()
+            .text_scale
+        };
         assert_eq!(
             AppearancePreferences::default().normalized().text_scale,
             1.0
         );
-        assert_eq!(
-            AppearancePreferences {
-                text_scale: f32::NAN,
-                ..AppearancePreferences::default()
-            }
-            .normalized()
-            .text_scale,
-            1.0
-        );
-        assert_eq!(
-            AppearancePreferences {
-                text_scale: 9.0,
-                ..AppearancePreferences::default()
-            }
-            .normalized()
-            .text_scale,
-            2.0
-        );
+        for non_positive_or_non_finite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -0.5] {
+            assert_eq!(norm(non_positive_or_non_finite), 1.0);
+        }
+        assert_eq!(norm(0.5), 0.85);
+        assert_eq!(norm(0.85), 0.85);
+        assert_eq!(norm(1.25), 1.25);
+        assert_eq!(norm(2.0), 2.0);
+        assert_eq!(norm(9.0), 2.0);
     }
 }

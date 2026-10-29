@@ -210,7 +210,7 @@ fn symbol_bitmaps_are_sized_inked_and_inside_the_box() {
 }
 
 #[test]
-fn mirrored_symbols_are_exact_mirrors() {
+fn mirrored_symbols_agree_within_one_subsample_step() {
     let (w, h) = (11usize, 23usize);
     let mirror = |v: &[u8]| -> Vec<u8> {
         (0..h)

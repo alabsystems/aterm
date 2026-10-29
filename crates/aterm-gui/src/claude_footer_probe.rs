@@ -28,7 +28,7 @@ pub(crate) const LIT_SWITCH: &str = " \u{25cf} on ";
 pub(crate) const OFF_SWITCH: &str = " \u{25cb} off ";
 
 /// The harness label's words at its widest for `harness`, its CLI's version left out:
-/// `alab claude harness v0.4`.
+/// `alab claude harness v0.5`.
 #[cfg(test)]
 pub(crate) fn harness_label(harness: aterm_phase::CliHarness) -> String {
     format!("alab {} harness v{}", harness.cli(), harness.version_str())
@@ -174,13 +174,26 @@ pub(crate) fn publish(app: &App, session: u64, facts: FooterFacts) {
 /// Transitions `session` to foreground card drawer `program` (`version`, `pgid`).
 #[cfg(test)]
 pub(crate) fn drawer(app: &App, session: u64, pgid: i32, program: &str, version: &str) -> u64 {
+    drawer_started(app, session, pgid, program, version, 1)
+}
+
+/// [`drawer`] for a particular process birth, including a reused process group.
+#[cfg(test)]
+pub(crate) fn drawer_started(
+    app: &App,
+    session: u64,
+    pgid: i32,
+    program: &str,
+    version: &str,
+    started: u64,
+) -> u64 {
     use atpkg::image::{ImageBuild, ImageSource, ProgramTag};
     let build = atpkg::vendor_direct::Version::parse(version)
         .expect("a vendor build")
         .build_id();
     let image = crate::holder_image::HolderImage::of(
         pgid,
-        Some(1),
+        Some(started),
         Some(std::path::PathBuf::from(format!(
             "/p/pkg/store/{program}/{build}/bin/{program}"
         ))),

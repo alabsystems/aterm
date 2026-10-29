@@ -95,13 +95,6 @@ fn the_lower_first_offer_reads_its_focus_and_its_description() {
 }
 
 #[test]
-fn a_narrow_offer_with_the_stepper_moved_reads_its_size() {
-    let rows = screen(AUTOCOMPACT_80COL_500K);
-    let o = offer(&rows).expect("the offer");
-    assert_eq!((o.tokens, o.focused), (500_000, OfferFocus::Accept));
-}
-
-#[test]
 fn the_fullscreen_panel_and_the_more_text_warning_are_read() {
     let rows = screen(AUTOCOMPACT_FULLSCREEN);
     let o = offer(&rows).expect("the offer");
@@ -284,7 +277,10 @@ fn accept_size_reads_every_size_the_vendor_draws() {
 #[test]
 fn a_served_size_off_the_ladder_is_read() {
     let rows = screen(AUTOCOMPACT_80COL_500K);
-    assert_eq!(offer(&rows).map(|o| o.tokens), Some(500_000));
+    assert_eq!(
+        offer(&rows).map(|o| (o.tokens, o.focused)),
+        Some((500_000, OfferFocus::Accept))
+    );
     for (words, tokens) in [("350k", 350_000), ("450k", 450_000), ("250k", 250_000)] {
         let at: Vec<String> = rows.iter().map(|r| r.replace("500k", words)).collect();
         assert_ne!(at, rows, "{words}");

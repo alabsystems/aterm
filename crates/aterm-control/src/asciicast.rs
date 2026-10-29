@@ -342,6 +342,42 @@ fn parse_json(text: &str) -> Result<Json, String> {
     Ok(v)
 }
 
+fn is_rfc8259_number(bytes: &[u8]) -> bool {
+    let mut i = usize::from(bytes.first() == Some(&b'-'));
+    match bytes.get(i) {
+        Some(b'0') => i += 1,
+        Some(b'1'..=b'9') => {
+            i += 1;
+            while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+                i += 1;
+            }
+        }
+        _ => return false,
+    }
+    if bytes.get(i) == Some(&b'.') {
+        i += 1;
+        if !bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            return false;
+        }
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+    }
+    if matches!(bytes.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(bytes.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        if !bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            return false;
+        }
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+    }
+    i == bytes.len()
+}
+
 struct JsonReader<'a> {
     s: &'a [u8],
     i: usize,
@@ -427,8 +463,9 @@ impl JsonReader<'_> {
                 {
                     self.i += 1;
                 }
-                let lit = String::from_utf8_lossy(&self.s[start..self.i]).into_owned();
-                if lit.parse::<f64>().is_err() {
+                let raw = &self.s[start..self.i];
+                let lit = String::from_utf8_lossy(raw).into_owned();
+                if !is_rfc8259_number(raw) || lit.parse::<f64>().is_err() {
                     return Err(format!("bad JSON number {lit:?}"));
                 }
                 Ok(Json::Num(lit))
@@ -452,8 +489,16 @@ impl JsonReader<'_> {
             .s
             .get(self.i..self.i + 4)
             .ok_or_else(|| "truncated \\u escape".to_string())?;
-        let text = std::str::from_utf8(digits).map_err(|_| "bad \\u escape".to_string())?;
-        let v = u32::from_str_radix(text, 16).map_err(|_| "bad \\u escape".to_string())?;
+        let mut v = 0u32;
+        for &b in digits {
+            let d = match b {
+                b'0'..=b'9' => u32::from(b - b'0'),
+                b'a'..=b'f' => u32::from(b - b'a') + 10,
+                b'A'..=b'F' => u32::from(b - b'A') + 10,
+                _ => return Err("bad \\u escape".to_string()),
+            };
+            v = (v << 4) | d;
+        }
         self.i += 4;
         Ok(v)
     }
@@ -766,6 +811,10 @@ mod tests {
         assert_eq!(plain.dropped, None, "a producer that does not say");
         let newer = keyed(9);
         assert_eq!(newer.resize_laws, &[ResizeLaw::Rewrap]);
+        let zero = read("{\"version\": 2, \"width\": 0, \"height\": 0}");
+        assert_eq!((zero.width, zero.height), (1, 1));
+        let huge = read("{\"version\": 2, \"width\": 100000, \"height\": 100000}");
+        assert_eq!((huge.width, huge.height), (u16::MAX, u16::MAX));
     }
 
     #[test]
@@ -893,5 +942,11 @@ mod tests {
         }
         let deep = format!("{}{}", "[".repeat(100), "]".repeat(100));
         assert!(parse_json(&deep).is_err(), "nesting is bounded");
+        for malformed in ["\"\\u+041\"", "\"\\u-041\"", "01", "-01", "1.", "1e", "1e+"] {
+            assert!(
+                parse_json(malformed).is_err(),
+                "{malformed} is not RFC 8259 JSON"
+            );
+        }
     }
 }

@@ -18,6 +18,17 @@ pub struct HolderScan {
     pub scanned: usize,
 }
 
+/// Unix platform services whose protected descriptor tables do not represent an unknown
+/// user's build-cache owner. The disk pass and package-cache sweep share this policy.
+#[must_use]
+pub fn unix_platform_service(exe: Option<&std::path::Path>) -> bool {
+    exe.is_some_and(|path| {
+        ["/System/", "/usr/libexec/", "/usr/sbin/", "/sbin/"]
+            .iter()
+            .any(|root| path.starts_with(root))
+    })
+}
+
 impl HolderScan {
     /// Whether `pid` holds the target.
     #[must_use]
@@ -1905,14 +1916,6 @@ mod tests {
         drop(kept);
 
         use super::Failed;
-        assert_eq!(Failed::of(3), Failed::Exited, "ESRCH");
-        assert_eq!(Failed::of(9), Failed::Closed, "EBADF");
-        assert_eq!(Failed::of(2), Failed::Dead, "ENOENT");
-        assert_eq!(Failed::of(1), Failed::Refused, "EPERM");
-        for other in [0, 12, 13, 22] {
-            assert_eq!(Failed::of(other), Failed::Other, "errno {other}");
-        }
-
         let vnode = super::Vnode {
             dev: 7,
             ino: 9,
@@ -1953,6 +1956,18 @@ mod tests {
                 [super::TableRead::Holds, super::TableRead::Unreadable],
                 "a refusal obscures only keys not positively found"
             );
+        }
+    }
+
+    #[test]
+    fn errno_is_classified_into_holder_failure_kinds() {
+        use super::Failed;
+        assert_eq!(Failed::of(3), Failed::Exited);
+        assert_eq!(Failed::of(9), Failed::Closed);
+        assert_eq!(Failed::of(2), Failed::Dead);
+        assert_eq!(Failed::of(1), Failed::Refused);
+        for other in [0, 12, 13, 22] {
+            assert_eq!(Failed::of(other), Failed::Other, "errno {other}");
         }
     }
 
@@ -2435,12 +2450,6 @@ mod tests {
         drop(master);
         let _ = child.kill();
         let _ = child.wait();
-    }
-
-    #[test]
-    fn an_unheld_rdev_has_no_holders() {
-        let scan = super::scan_rdev_holders(0xfeed_0001, &[]).expect("scan");
-        assert!(scan.holders.is_empty(), "{scan:?}");
     }
 
     #[test]

@@ -28,18 +28,24 @@ hold one secret, each reading the others at the level they allow
 
 USAGE:
   aterm fleet init [--allow facts|content] [--port N] [--host H] [--rotate]
-                         make this machine the fleet's issuer: mint its secret,
+                         found a fleet on this machine: mint its secret,
                          write the join code to a 0600 file and print that
                          file's path (never the code), set [fleet] listen/allow
-  aterm fleet join [--allow facts|content] [--port N] [--host H] [--code-file F]
-                         on each other machine: join with that code, read from
-                         stdin when piped, from F, or typed at the terminal
-                         unshown; never an argument
+  aterm fleet join [--allow facts|content] [--port N] [--host H] [--at H[:P]]
+                 [--code-file F]
+                         on each other machine: join with that code (the
+                         fleet's secret alone), read from stdin when piped,
+                         from F, or typed at the terminal unshown; never an
+                         argument. Any member records the join: the one --at
+                         names, else the place an older aterm's code names,
+                         else each member this machine's book holds, then
+                         the members advertising _alab._tcp on this LAN
   aterm fleet peers [--timeout S]
                          the machines this one knows (its book and aterm.toml's
                          [[fleet.peers]] host = \"<host[:port]>\" entries), each
                          checked at once (3 s; --timeout up to 10): on a
-                         member, its issuer's book of members too
+                         member, the book of the member that answered its
+                         join too
   aterm fleet peers add <host[:port]> | rm <host[:port]|node>
   aterm fleet allow facts|content
   aterm fleet allow drive --all | --from <host|node> [--from …]
@@ -47,18 +53,25 @@ USAGE:
                          (drive, granted here alone) drive its sessions from
                          every member or the nodes named, and every member
                          reads at content; facts|content takes it back
-  aterm fleet publish    an ALab vault admin holding the fleet issuer's code
-                         publishes it to every current and future ALab member
+  aterm fleet publish    an ALab vault admin on the Mac that minted the fleet's
+                         code publishes it to every current and future ALab
+                         member
   aterm fleet sync [--on]
                          join the signed default ALab fleet, or its newer code
                          from the default fleet this machine is in, keeping
                          the level set here (a new secret's join takes named
                          drive grants out, as every join does); a first join
-                         lets every member drive this machine. A fleet joined
-                         by hand to another code, one issued here, and a key
-                         it cannot read are left as they are. leave's
-                         fleet-off record keeps sync off until --on or a join
-                         here (an init keeps it)
+                         lets every member drive this machine, a vault
+                         admin's too. A fleet joined by hand to
+                         another code, one minted here, and a key it cannot
+                         read are left as they are. leave's fleet-off record
+                         keeps sync off until --on or a join here (an init
+                         keeps it)
+  aterm fleet census [--json] [--refresh]
+                         read this machine's cached swarm census of its own
+                         book (or compute it here): member labels,
+                         versions, window liveness, sessions, warm/leased/walled
+                         accounts, shortfall, converge checks and LAN stragglers
   aterm fleet leave      remove this machine's secret, join code, books and
                          [fleet] listen/allow/drive_from (its node key stays),
                          naming first each tab it holds on another Mac
@@ -69,9 +82,9 @@ and models; no text a person or a program wrote) or content (the tab titles,
 cwds, branches, prompts, an agent's newest words, and a shell's command line
 and last rows as well); without --allow, either keeps the level [fleet] allow
 names, else facts (a join into another fleet turns drive into content). --port
-is this machine's fleet port: init's is 7100, join's the issuer's (the port its
-code names), and either keeps the port [fleet] listen already names; a join
-that would listen at the issuer's own address (a loopback fleet's, with no
+is this machine's fleet port: init's is 7100, join's the port of the member it
+dials, and either keeps the port [fleet] listen already names; a join that
+would listen at the place of the member it dials (a loopback fleet's, with no
 --port) is refused, writing nothing, and one where another member's listener
 proves itself writing nothing of the fleet (a first join's node key stays).
 --host is the name the others dial this machine by: $HOSTNAME when set, else
@@ -89,8 +102,8 @@ result, turn, key, send and hold; close of a worker that node spawned; `aterm
 help workers`), and nobody else does. `--all` instead admits every node the
 issuer's book binds, under the key it binds. No plain join and no remote call
 turns either grant on; `sync` applies the default ALab full-membership policy.
-`init --rotate` mints the issuer a new secret, keeping the host and port its
-code names unless --host or --port names others (every member joins again;
+`init --rotate` mints the issuer a new secret, keeping the place [fleet]
+listen names unless --host or --port names others (every member joins again;
 the book keeps each until then; no drive grant is kept, here or on a member
 that joins again). Every write that leaves the level below drive (allow
 facts|content, an init's or a join's --allow) removes every drive grant.
@@ -111,30 +124,56 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// How long a verb's read of the fleet's listeners waits at most where the verb names no bound
-/// (`peers` with no `--timeout`, [`held_elsewhere`], a join's check of its own place):
-/// [`PEER_CHECK_WITHIN`], or what a test set: its hang detector for a read whose every listener
-/// serves in process, refuses at once or is held silent ([`member::HeldSilent`]), and so answers
-/// or ends.
+/// How long a verb's read of the fleet's listeners, and `peers`' status ask of the aterm here
+/// ([`aterm_here`]), wait at most where the verb names no bound (`peers` with no `--timeout`,
+/// [`held_elsewhere`], a join's check of its own place): [`PEER_CHECK_WITHIN`], or what a test
+/// set: its hang detector for a read whose every listener serves in process, refuses at once or
+/// is held silent ([`member::HeldSilent`]), and so answers or ends. A unit test sets it on its
+/// thread; a test of the binary sets the dev seam [`PEER_WITHIN_SEAM`] (milliseconds) on a verb
+/// whose every listener is an aterm on the same machine that serves or refuses at once, and whose
+/// aterm here answers its status or runs nowhere, which a loaded machine can keep from answering
+/// within [`PEER_CHECK_WITHIN`].
 fn peer_read_within() -> Duration {
     #[cfg(test)]
     if let Some(within) = PEER_READ_WITHIN.get() {
         return within;
     }
-    PEER_CHECK_WITHIN
+    seamed_within(PEER_WITHIN_SEAM, PEER_CHECK_WITHIN)
 }
 
 /// How long a verb's read of the issuer's book before it names a peer ([`copy_first`],
 /// [`check_peers`]) waits at most: [`PEER_CHECK_WITHIN`], or what a test set: its hang detector
 /// for an issuer that serves, and so must answer, or none, which leaves a survey's whole deadline
-/// to the host it dials.
+/// to the host it dials. A unit test sets it on its thread; a test of the binary sets the dev seam
+/// [`ISSUER_WITHIN_SEAM`] (milliseconds), as the issuer it dials is an aterm on the same machine,
+/// which a loaded machine can keep from answering within [`PEER_CHECK_WITHIN`].
 fn issuer_read_within() -> Duration {
     #[cfg(test)]
     if let Some(within) = ISSUER_READ_WITHIN.get() {
         return within;
     }
-    PEER_CHECK_WITHIN
+    seamed_within(ISSUER_WITHIN_SEAM, PEER_CHECK_WITHIN)
 }
+
+/// The milliseconds the dev seam `seam` names, or `or` where it names none.
+fn seamed_within(seam: &str, or: Duration) -> Duration {
+    aterm_types::dev_seam!(seam)
+        .and_then(|ms| ms.to_str()?.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map_or(or, Duration::from_millis)
+}
+
+/// The dev seam that sets [`issuer_read_within`] for a test of the binary.
+const ISSUER_WITHIN_SEAM: &str = "ATERM_DEBUG_FLEET_ISSUER_WITHIN_MS";
+
+/// The dev seam that sets [`peer_read_within`] for a test of the binary.
+const PEER_WITHIN_SEAM: &str = "ATERM_DEBUG_FLEET_PEER_WITHIN_MS";
+
+/// The dev seam that sets a fleet survey's per-peer deadline ([`survey_fleet`]) for a test of the
+/// binary, in place of its `--timeout` or default: a survey whose every peer is an aterm on the
+/// same machine that serves or refuses at once, which a loaded machine can keep from answering
+/// within the most `--timeout` allows.
+const SURVEY_WITHIN_SEAM: &str = "ATERM_DEBUG_FLEET_SURVEY_WITHIN_MS";
 
 const PEER_CHECK_MAX: Duration = Duration::from_secs(10);
 
@@ -171,6 +210,7 @@ pub(crate) fn main_entry(verb: &str, args: &[OsString]) -> ExitCode {
         "allow" => allow(&places, &args),
         "publish" => publish(&places, &args),
         "sync" => sync(&places, &args),
+        "census" => census(&places, &args),
         "leave" => leave(&places, &args),
         _ => Err(Failure::Usage(format!("no such command `{verb}`"))),
     });
@@ -240,13 +280,21 @@ struct Opts {
     host: Option<String>,
     rotate: bool,
     code_file: Option<PathBuf>,
+    /// `join --at <host[:port]>`: a member to dial first, since the code names none.
+    at: Option<(String, u16)>,
     /// `fleet sync`'s join, made only while this Mac holds the fleet sync read here, which a
     /// leave's [`member::OFF_FILE`] stops too.
     synced: Option<Held>,
+    /// Set when `join`'s issuer dial failed at connection or per-address capacity.
+    saw_capacity: std::sync::atomic::AtomicBool,
+    /// The `_alab._tcp` browse a join reads members' places from once none it knows answered
+    /// ([`advertised_places`]); `None`: one of its own, started then.
+    adverts: Option<std::sync::Arc<aterm_secrets::discover::Watch>>,
 }
 
 impl Opts {
-    /// The level a join writes over `table`'s: `--allow`, else a sync's first join's content.
+    /// The level a join writes over `table`'s: `--allow`, else a sync's first join's content
+    /// (until `grant_default` widens it to drive).
     fn level_over(&self, table: &FleetTable) -> Option<FleetScope> {
         self.allow.or_else(|| {
             (self.synced.is_some() && table.allow.is_none()).then_some(FleetScope::Content)
@@ -343,6 +391,12 @@ fn parse_opts(args: &[String], takes: &[&str], code_words: bool) -> Result<Opts,
                 }
                 opts.host = Some(value);
             }
+            "--at" => {
+                opts.at = Some(
+                    member::parse_host_port(&value, Some(member::default_port()))
+                        .map_err(|why| Failure::Usage(format!("--at <host[:port]>: {why}")))?,
+                );
+            }
             _ => opts.code_file = Some(PathBuf::from(value)),
         }
     }
@@ -352,16 +406,20 @@ fn parse_opts(args: &[String], takes: &[&str], code_words: bool) -> Result<Opts,
 fn allow_of(word: &str) -> Result<FleetScope, Failure> {
     FleetScope::from_word(&word.to_ascii_lowercase()).ok_or_else(|| {
         Failure::Usage(
-            "--allow is `facts` or `content`: driving this Mac is granted on it alone, to the \
-             nodes it names (`aterm fleet allow drive --from <host|node>`), never by an init or \
-             a join"
+            "--allow is `facts` or `content`: driving this Mac is granted on it alone, to every \
+             member (`aterm fleet allow drive --all`) or the nodes it names (`--from \
+             <host|node>`), never by an init or a join by hand"
                 .to_owned(),
         )
     })
 }
 
 fn parse_join(args: &[String]) -> Result<Opts, Failure> {
-    parse_opts(args, &["--allow", "--port", "--host", "--code-file"], true)
+    parse_opts(
+        args,
+        &["--allow", "--port", "--host", "--code-file", "--at"],
+        true,
+    )
 }
 
 /// Where [`read_code`] read the join code.
@@ -534,6 +592,14 @@ fn listen_on(issuer_host: &str, port: u16) -> String {
     }
 }
 
+/// The loopback address `[fleet] listen` names in `table`, if it names one ([`listen_on`]).
+fn loopback_listen(table: &FleetTable) -> Option<String> {
+    let (host, _) = member::parse_host_port(table.listen.as_deref()?, None).ok()?;
+    host.parse::<IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+        .then_some(host)
+}
+
 fn private_state(places: &Places, out: &mut String) -> Result<(), Failure> {
     if let Some(was) = member::ensure_private_dir(&places.state).map_err(failed)? {
         out.push_str(&narrowed(places, was));
@@ -606,11 +672,13 @@ enum Begun {
     /// An init again: its report.
     Again(String),
     /// The code and key of a new fleet, or a new secret, written.
-    Minted(Minted),
+    Minted(Box<Minted>),
 }
 
 struct Minted {
     code: JoinCode,
+    /// Where this machine listens for the fleet: the code names no place, so the report does.
+    place: (String, u16),
     written: Held,
     listen: String,
     ungranted: Option<String>,
@@ -632,12 +700,13 @@ fn init_private(places: &Places, opts: Opts) -> Result<String, Failure> {
     .map_err(failed)??;
     let Minted {
         code,
+        place,
         written,
         listen,
         ungranted,
     } = match begun {
         Begun::Again(report) => return Ok(report),
-        Begun::Minted(minted) => minted,
+        Begun::Minted(minted) => *minted,
     };
     let old_secret: Vec<Peer> = if opts.rotate {
         member::read_peers(&places.state)
@@ -683,7 +752,7 @@ fn init_private(places: &Places, opts: Opts) -> Result<String, Failure> {
         .and_then(|secret| serves_new_key(places, &secret));
     let mut out = format!(
         "aterm fleet init: this machine ({}, node {}) is the fleet's issuer{}\n",
-        aterm_codec::tty::one_line(&code.host, 80),
+        aterm_codec::tty::one_line(&place.0, 80),
         short(&node),
         if opts.rotate {
             " under a new secret: every member must join again"
@@ -726,8 +795,9 @@ fn init_private(places: &Places, opts: Opts) -> Result<String, Failure> {
         follows(
             unserved.as_deref(),
             &format!(
-                " Members dial {}.",
-                member::host_port(&code.host, code.port)
+                " The code names no member: a join finds one on this LAN, and `--at {}` names \
+                 this one.",
+                member::host_port(&place.0, place.1)
             )
         )
     ));
@@ -814,15 +884,11 @@ fn init_first(
             }
         )));
     }
-    let issued = if opts.rotate && (opts.host.is_none() || opts.port.is_none()) {
-        Some(issued_code(places, &code_path)?)
-    } else {
-        None
-    };
-    let host = match (opts.host.clone(), &issued) {
-        (Some(host), _) => host,
-        (None, Some(issued)) => issued.host.clone(),
-        (None, None) => aterm_uds::process::lan_host_name()
+    // A rotate keeps the place this machine listens at: a loopback fleet stays on the loopback.
+    let kept = opts.rotate.then(|| loopback_listen(&table)).flatten();
+    let host = match opts.host.clone().or(kept) {
+        Some(host) => host,
+        None => aterm_uds::process::lan_host_name()
             .filter(|host| member::is_host(host))
             .ok_or_else(|| {
                 failed(
@@ -832,9 +898,8 @@ fn init_first(
     };
     let port = opts
         .port
-        .or_else(|| issued.as_ref().map(|issued| issued.port))
         .or_else(|| table.listen_port())
-        .unwrap_or(member::DEFAULT_PORT);
+        .unwrap_or_else(member::default_port);
     let listen = listen_on(&host, port);
     // A new fleet keeps no drive grants (they named nodes of the fleet a leave stopped short of
     // aterm.toml left), and a new secret none either: a rotate is the remedy for a lost machine.
@@ -855,7 +920,12 @@ fn init_first(
     };
     let secret = member::mint_secret().map_err(failed)?;
     let written = FleetSecret::new(&secret).map_err(failed)?;
-    let code = JoinCode { secret, host, port };
+    // The file names where this Mac listens after the secret, as every code did before F17: an
+    // aterm before 0.147 reads no code without it (F20 drops it).
+    let code = JoinCode {
+        secret,
+        hint: Some((host.clone(), port)),
+    };
     // A person's init supersedes the default grant a sync's join owes.
     forget_owed_grant(places)?;
     book.write_code(&code)
@@ -873,12 +943,13 @@ fn init_first(
             }
         ))
     })?;
-    Ok(Begun::Minted(Minted {
+    Ok(Begun::Minted(Box::new(Minted {
         code,
+        place: (host, port),
         written: Held::Key(written),
         listen,
         ungranted,
-    }))
+    })))
 }
 
 /// Why an init that mints takes the drive grants out: a new fleet, or a new secret.
@@ -890,7 +961,7 @@ const fn minted_by(opts: &Opts) -> Ungrant {
     }
 }
 
-/// An init again's `[fleet] listen`, written where aterm.toml has none on the port its join code names (an init or a rotate stopped before aterm.toml), at the level `--allow` names as the stopped init would, and the line saying so; refused, with nothing written, where the key cannot be read, the code is of another secret (a rotate stopped between its two writes) or cannot be read beside a flag, `--host` or `--port` names another than the code does, or `--allow` another level than `[fleet] allow` with nothing to write.
+/// An init again's `[fleet] listen`, written where aterm.toml has none (an init or a rotate stopped before aterm.toml) at the place `--host` and `--port` name, at the level `--allow` names as the stopped init would, and the line saying so; refused, with nothing written, where the key cannot be read, the code is of another secret (a rotate stopped between its two writes) or cannot be read beside a flag, `--host` or `--port` names another place than `[fleet] listen`, or `--allow` another level than `[fleet] allow` with nothing to write.
 fn init_again_listen(
     places: &Places,
     book: &HeldBook<'_>,
@@ -929,18 +1000,29 @@ fn init_again_listen(
             places.state.join(KEY_FILE).display()
         )));
     }
-    if opts.host.as_ref().is_some_and(|host| *host != code.host)
-        || opts.port.is_some_and(|port| port != code.port)
+    let listening = table.listen_port();
+    if opts
+        .port
+        .is_some_and(|port| Some(port) != listening && listening.is_some())
     {
         return Err(Failure::Usage(format!(
-            "this machine is already the fleet's issuer, and its join code names {}: an init \
-             again writes [fleet] listen on that port, and another host or port takes \
-             `--rotate` (every member joins again)",
-            member::host_port(&code.host, code.port)
+            "this machine is already the fleet's issuer, listening on port {}: another port is \
+             aterm.toml's [fleet] listen to edit, not an init again",
+            listening.unwrap_or_default()
         )));
     }
-    if table.listen_port() == Some(code.port) {
-        // The code's own host and port, and the level [fleet] allow names, change nothing.
+    if let (Some(host), Some(port), Some(listen)) = (&opts.host, listening, &table.listen)
+        && listen_on(host, port) != *listen
+    {
+        return Err(Failure::Usage(format!(
+            "this machine is already the fleet's issuer, listening at {listen}: `--host {}` \
+             would listen at another place, which `aterm fleet init --rotate --host {0}` \
+             writes (every member joins again)",
+            aterm_codec::tty::one_line(host, 80)
+        )));
+    }
+    if listening.is_some() {
+        // The level [fleet] allow names changes nothing.
         return match opts.allow {
             Some(level) if table.level() != Some(level.word()) => Err(Failure::Usage(format!(
                 "this machine is already the fleet's issuer: a level is set by `aterm fleet \
@@ -950,19 +1032,24 @@ fn init_again_listen(
             _ => Ok(String::new()),
         };
     }
+    let host = opts
+        .host
+        .clone()
+        .or_else(aterm_uds::process::lan_host_name)
+        .unwrap_or_default();
     let line = write_fleet(
         book,
         config,
         &places.config,
         (
-            &listen_on(&code.host, code.port),
+            &listen_on(&host, opts.port.unwrap_or_else(member::default_port)),
             table.written_level(opts.allow, false),
         ),
         None,
     )?;
     Ok(format!(
-        "{}             written: aterm.toml had no [fleet] listen on the port its join code \
-         names (an init stopped before it), so no member could reach this machine\n{}",
+        "{}             written: aterm.toml had no [fleet] listen (an init stopped before it), \
+         so no member could reach this machine\n{}",
         line.0,
         line.1.unwrap_or_default()
     ))
@@ -1015,22 +1102,110 @@ fn follows(unserved: Option<&str>, then: &str) -> String {
     }
 }
 
-fn issued_code(places: &Places, path: &Path) -> Result<JoinCode, Failure> {
-    member::read_join_code(&places.state).map_err(|why| {
-        failed(format!(
-            "the join code in {} cannot be read ({why}), and it names the host and port \
-                 members dial: name both with --host and --port to rotate",
-            path.display()
-        ))
-    })
+/// The places a join dials, in turn, until a member records it
+/// (`docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1, F17: any member admits a join, and the code
+/// names none): `--at`, the place a code an older aterm wrote names, then each member the book in
+/// the state directory holds, the one heard last first.
+fn join_places(places: &Places, opts: &Opts, code: &JoinCode) -> Vec<(String, u16)> {
+    let own = member::read_node_id(&places.state).ok().flatten();
+    let mut book: Vec<Peer> = member::read_peers(&places.state)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|peer| peer.via != Via::Manual && peer.node.is_some() && peer.node != own)
+        .collect();
+    book.sort_by_key(|peer| std::cmp::Reverse(peer.seen_ms));
+    let mut dials: Vec<(String, u16)> = Vec::new();
+    let known = opts
+        .at
+        .iter()
+        .chain(&code.hint)
+        .cloned()
+        .chain(book.iter().map(|peer| {
+            (
+                peer.addr
+                    .map_or_else(|| peer.host.clone(), |a| a.to_string()),
+                peer.port,
+            )
+        }));
+    for (host, port) in known {
+        if !dials
+            .iter()
+            .any(|(held, at)| *at == port && same_host(held, &host))
+        {
+            dials.push((host, port));
+        }
+    }
+    dials
+}
+
+/// How long a join listens for `_alab._tcp` adverts, and then resolves them.
+const ADVERTS_WITHIN: Duration = Duration::from_secs(3);
+
+/// The places the members on this LAN advertise (`_alab._tcp`, F17), less those in `known`:
+/// `opts`' browse, else a fresh one given [`ADVERTS_WITHIN`] to hear them. None in a test or an
+/// isolated run (`ATERM_STATE_HOME`, `CI`), so no lab's world ever dials the live fleet.
+fn advertised_places(opts: &Opts, known: &[(String, u16)]) -> Vec<(String, u16)> {
+    let watch = match opts.adverts.clone() {
+        Some(watch) => watch,
+        None if cfg!(test)
+            || std::env::var_os("ATERM_STATE_HOME").is_some()
+            || std::env::var_os("CI").is_some() =>
+        {
+            return Vec::new();
+        }
+        None => {
+            let bell = std::sync::Arc::new(aterm_secrets::wake::Bell::default());
+            let watch = aterm_secrets::discover::Watch::start_for(
+                crate::node_service::ALAB_TCP_SERVICE,
+                &bell,
+                &[],
+            );
+            std::thread::sleep(ADVERTS_WITHIN);
+            std::sync::Arc::new(watch)
+        }
+    };
+    let mut found: Vec<(String, u16)> = Vec::new();
+    for advert in watch.adverts(ADVERTS_WITHIN) {
+        let place = (advert.host, advert.port);
+        if !known
+            .iter()
+            .chain(&found)
+            .any(|(host, port)| *port == place.1 && same_host(host, &place.0))
+        {
+            found.push(place);
+        }
+    }
+    found
 }
 
 fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure> {
     let code = JoinCode::parse(code_text).map_err(failed)?;
     let secret = FleetSecret::new(&code.secret).map_err(failed)?;
+    let mut dials = join_places(places, opts, &code);
+    // With no place it knows, the members that advertise themselves are its places; with one, they
+    // are dialled only once none of those answered.
+    let browsed = dials.is_empty();
+    if browsed {
+        dials = advertised_places(opts, &[]);
+    }
+    let Some(first) = dials.first().cloned() else {
+        // An issuer's own code names no member either: that it is this machine's own fleet's
+        // is the refusal to give, once a loose state directory reads.
+        let mut out = String::new();
+        if in_state(places, CODE_FILE)? {
+            private_state(places, &mut out)?;
+            not_an_issuer(places, &code, &secret).inspect_err(|_| say(&out))?;
+        }
+        return Err(Failure::Usage(
+            "the join code names no member, this Mac knows of none, and none advertises itself \
+             on this LAN: name one with `--at <host[:port]>` (a member's `aterm fleet peers` \
+             lists the fleet's places); nothing was written here"
+                .to_owned(),
+        ));
+    };
     // A member of a loopback fleet listens on the loopback alone ([`listen_on`]): it is dialled
     // there.
-    let host = match (opts.host.clone(), code.host.parse::<IpAddr>()) {
+    let host = match (opts.host.clone(), first.0.parse::<IpAddr>()) {
         (Some(host), _) => host,
         (None, Ok(ip)) if ip.is_loopback() => ip.to_string(),
         (None, _) => aterm_uds::process::lan_host_name()
@@ -1044,27 +1219,25 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
     };
     let config = ConfigFile::open(&places.config).map_err(failed)?;
     let table = fleet_table(text_of(&config)?).map_err(failed)?;
-    let port = opts
-        .port
-        .or_else(|| table.listen_port())
-        .unwrap_or(code.port);
+    // A fleet's members listen on one port: a join's is the member's it dials.
+    let port = opts.port.or_else(|| table.listen_port()).unwrap_or(first.1);
     // An issuer's own code is refused as its own fleet ([`not_an_issuer`]).
     let issues = !matches!(
         std::fs::symlink_metadata(places.state.join(CODE_FILE)),
         Err(e) if e.kind() == io::ErrorKind::NotFound
     );
-    if !issues && port == code.port && same_host(&host, &code.host) {
+    if !issues && port == first.1 && same_host(&host, &first.0) {
         let at = member::host_port(&host, port);
         return Err(Failure::Usage(match opts.port {
             Some(named) => format!(
-                "this machine would register and listen at {at}, the issuer's own address (the \
-                 code names it): `--port {named}` is the issuer's own port there, so name \
-                 another with `--port <n>`; nothing was written here"
+                "this machine would register and listen at {at}, the place of the member it \
+                 dials: `--port {named}` is that member's own port there, so name another with \
+                 `--port <n>`; nothing was written here"
             ),
             None => format!(
-                "this machine would register and listen at {at}, the issuer's own address (the \
-                 code names it): a member listens on a port of its own there, so name one with \
-                 `--port <n>`; nothing was written here"
+                "this machine would register and listen at {at}, the place of the member it \
+                 dials: a member listens on a port of its own there, so name one with `--port \
+                 <n>`; nothing was written here"
             ),
         }));
     }
@@ -1080,7 +1253,7 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
         || !names_issuer(places);
     if let Err(why) = with_fleet(
         text_of(&config)?,
-        &listen_on(&code.host, port),
+        &listen_on(&first.0, port),
         table.written_level(opts.level_over(&table), regrant),
         regrant,
     ) {
@@ -1094,23 +1267,36 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
     let me = member::node_identity(&places.state)
         .map_err(failed)
         .inspect_err(|_| say(&out))?;
-    let issuer_at = member::host_port(&code.host, code.port);
+    let issuer_at = member::host_port(&first.0, first.1);
     let registration = Registration {
         node: me.node().to_owned(),
         host,
         port,
         version: aterm_types::version::app_version().to_owned(),
-        key: Some(me.key()),
-    };
+        key: None,
+        signed: None,
+    }
+    .signed_by(&me, aterm_time::unix_millis().unwrap_or_default());
     let keys = Keyring::read(&places.state);
     let (joined, at, issuer_key) = match register_with(
-        &code,
+        &dials,
         (&secret, &me),
         (&keys, bound.as_ref()),
         &registration,
+        &|| {
+            if browsed {
+                Vec::new()
+            } else {
+                advertised_places(opts, &dials)
+            }
+        },
     ) {
         Ok(registered) => registered,
         Err(why) => {
+            if why.at_capacity() {
+                opts.saw_capacity
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             say(&out);
             return Err(failed(not_recorded(
                 &issuer_at,
@@ -1173,20 +1359,9 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
                  rm` there)."
             )));
         }
-        if same_fleet
-            && let Some((node, key)) = bound_issuer(places, &secret)
-                .map_err(|why| unfinished(&out, &issuer_at, why, not_keyed))?
-            && (node != joined.issuer.node || issuer_key != Some(key))
-        {
-            say(&out);
-            return Err(failed(not_recorded(
-                &issuer_at,
-                &JoinFailed::OtherIssuer {
-                    bound: node,
-                    proved: issuer_key.map(|_| joined.issuer.node.clone()),
-                },
-                (&places.state, minted),
-            )));
+        if same_fleet {
+            bound_issuer(places, &secret)
+                .map_err(|why| unfinished(&out, &issuer_at, why, not_keyed))?;
         }
         // A person's join supersedes the default grant a sync's join owes.
         if opts.synced.is_none() {
@@ -1301,14 +1476,14 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
             };
             let config = ConfigFile::open(&places.config).map_err(failed)?;
             let now = fleet_table(text_of(&config)?).map_err(failed)?;
-            // A sync's join owes the default grant where aterm.toml has a level it may replace,
-            // or the content beside the record a pass stopped here left: the record goes first,
-            // so a stop between the two writes leaves it for the next pass.
-            let owes = opts.synced.is_some()
-                && (default_grant_stands(&now)
-                    || (in_state(places, GRANT_OWED_FILE)?
-                        && now.level() == Some(FleetScope::Content.word())
-                        && now.drive_from.is_empty()));
+            // A sync's join owes the default grant where aterm.toml has a level it may replace, or
+            // the content beside the record a pass stopped here left: the record goes first, so
+            // a stop between the two writes leaves it for the next pass. A vault admin owes it as
+            // every member does (docs/DESIGN-fluid-swarm-2026-10-28.md F2).
+            let owed_content = in_state(places, GRANT_OWED_FILE)?
+                && now.level() == Some(FleetScope::Content.word())
+                && now.drive_from.is_empty();
+            let owes = opts.synced.is_some() && (default_grant_stands(&now) || owed_content);
             if owes {
                 owe_grant(places)?;
             }
@@ -1317,7 +1492,7 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
                 book,
                 &config,
                 &places.config,
-                (&listen_on(&code.host, port), allow),
+                (&listen_on(&first.0, port), allow),
                 ungrant,
             )?;
             at_step("grant");
@@ -1352,11 +1527,12 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
         key_from: None,
         host: joined.issuer.host.clone(),
         addr: Some(at),
-        port: code.port,
+        port: joined.issuer.port,
         version: Some(joined.issuer.version.clone()),
         seen_ms: aterm_time::unix_millis(),
         via: Via::Issuer,
         fleet: Some(secret.mark()),
+        signed: None,
     };
     at_step("book");
     let recorded = member::write_held(&places.state, Began::Under(&held), |book| {
@@ -1524,17 +1700,25 @@ enum JoinFailed {
     OtherKey(String),
     /// It answered as this node, which this machine binds to a key, and proved none.
     Unproved(String),
-    /// A join again of the fleet this machine holds, whose book binds its issuer `bound` to a key.
-    OtherIssuer {
-        /// The issuer this machine's book binds.
-        bound: String,
-        /// The node the machine that answered proved, when it proved one.
-        proved: Option<String>,
-    },
     /// It was; the machine that answered refused, or answered no join (its words).
     Registration(String),
     /// It was; no answer to the registration came.
     Unanswered(String),
+}
+
+impl JoinFailed {
+    /// Whether the failure matches an overloaded issuer listener at connection or per-address
+    /// capacity, so `sync.fleet` retries within minutes instead of waiting a full pass.
+    fn at_capacity(&self) -> bool {
+        match self {
+            Self::Dial(e) => e.at_capacity(),
+            Self::Unanswered(_) => true,
+            Self::PlaceHeld { .. }
+            | Self::OtherKey(_)
+            | Self::Unproved(_)
+            | Self::Registration(_) => false,
+        }
+    }
 }
 
 impl std::fmt::Display for JoinFailed {
@@ -1550,23 +1734,6 @@ impl std::fmt::Display for JoinFailed {
                 f,
                 "it answered as node {}, which this machine binds to a node key, and proved none",
                 short(node)
-            ),
-            Self::OtherIssuer {
-                bound,
-                proved: Some(node),
-            } => write!(
-                f,
-                "another node answered for the issuer this Mac binds (node {}): it proved node {}",
-                short(bound),
-                short(node)
-            ),
-            Self::OtherIssuer {
-                bound,
-                proved: None,
-            } => write!(
-                f,
-                "the machine that answered for the issuer this Mac binds (node {}) proved no node",
-                short(bound)
             ),
             Self::PlaceHeld { place, node } => write!(
                 f,
@@ -1595,10 +1762,6 @@ enum Advice {
     NoNetwork,
     /// The machine that answered claims a node this machine binds to a key.
     IssuerKey,
-    /// A join again of the fleet this machine holds reached another node than the issuer it binds.
-    BoundIssuer,
-    /// A join again of the fleet this machine holds reached a machine that proved no node.
-    BoundUnproved,
     /// The issuer binds this machine's node id to a node key it did not prove.
     NodeBound,
     /// The issuer recorded this machine's node from another address before keys came.
@@ -1625,9 +1788,7 @@ impl JoinFailed {
     /// shorter word names ([`named_here`]).
     fn bound_node(&self) -> &str {
         match self {
-            Self::OtherKey(node) | Self::Unproved(node) | Self::OtherIssuer { bound: node, .. } => {
-                node
-            }
+            Self::OtherKey(node) | Self::Unproved(node) => node,
             _ => "<its node>",
         }
     }
@@ -1641,8 +1802,6 @@ impl JoinFailed {
             Self::Registration(words) if words.contains(member::OWN_NODE) => Advice::IssuersNode,
             Self::Registration(words) if words.contains(member::MOVED_ON) => Advice::MovedOn,
             Self::OtherKey(_) | Self::Unproved(_) => Advice::IssuerKey,
-            Self::OtherIssuer { proved: None, .. } => Advice::BoundUnproved,
-            Self::OtherIssuer { .. } => Advice::BoundIssuer,
             Self::Dial(Unreached::NotFleet(_)) => Advice::PastTheLan,
             Self::Dial(e) if e.not_permitted() => Advice::Sandbox,
             Self::Dial(e) if e.no_route() => Advice::LocalNetwork,
@@ -1737,22 +1896,6 @@ fn not_recorded(issuer_at: &str, why: &JoinFailed, (state, minted): (&Path, bool
              Another machine answers at that host, or the issuer lost its node key (a \
              reinstall) or runs an older aterm (update it). If it is the issuer, `aterm fleet \
              peers rm {}` here takes the old binding out; then join again.",
-            why.bound_node()
-        ),
-        Advice::BoundIssuer => format!(
-            "the issuer at {issuer_at} is not the one this machine binds: {why}\n  {nothing} \
-             This machine joined this fleet before, and a join again is answered by the issuer \
-             it joined, under the node key it bound then. To move this machine to a new issuer \
-             on purpose, run `aterm fleet leave` here, then `aterm fleet join` with the code."
-        ),
-        Advice::BoundUnproved => format!(
-            "the issuer at {issuer_at} is not the one this machine binds: {why}\n  {nothing} \
-             This machine joined this fleet before, and a join again is answered by the issuer \
-             it joined, under the node key it bound then. If it is that issuer, it runs an \
-             older aterm (update it there) or lost its node key (a reinstall: `aterm fleet \
-             init` there mints one, and `aterm fleet peers rm {}` here then takes the old \
-             binding out); join again after. To move this machine to a new issuer on purpose, \
-             run `aterm fleet leave` here, then `aterm fleet join` with the code.",
             why.bound_node()
         ),
         Advice::NodeBound => format!(
@@ -1931,11 +2074,16 @@ fn bound_issuer(
     }
 }
 
+/// The join's registration with the first of `dials` whose member records it (any member does,
+/// F17): the answer, where it answered and the key it proved. One that answers another key than
+/// the book binds its node to, proves no node the book binds a key to, or is an aterm before 0.147
+/// that records no member, is passed over for the next; the first place's failure stands.
 fn register_with(
-    code: &JoinCode,
+    dials: &[(String, u16)],
     (secret, me): (&FleetSecret, &NodeIdentity),
-    (keys, bound): (&Keyring, Option<&(String, NodeKey)>),
+    (keys, _bound): (&Keyring, Option<&(String, NodeKey)>),
     registration: &Registration,
+    more: &dyn Fn() -> Vec<(String, u16)>,
 ) -> Result<(member::Joined, IpAddr, Option<NodeKey>), JoinFailed> {
     // Only another node's proof there is evidence the place is taken: nothing answering, another
     // secret or this machine's own listener registers as before.
@@ -1954,32 +2102,60 @@ fn register_with(
         });
     }
     let started = Instant::now();
-    let mut reached = member::dial(
-        &code.host,
-        None,
-        code.port,
-        (secret, Some(me)),
-        FleetOp::Join,
-        JOIN_WITHIN,
-    )
-    .map_err(JoinFailed::Dial)?;
+    // The first place's failure is the one the report names: the place named, or heard last.
+    let mut first = None;
+    // The places it knows, then, once none of them answered, those members advertise.
+    let mut advertised = None;
+    let mut known = dials.iter().cloned();
+    while let Some((host, port)) = known
+        .next()
+        .or_else(|| advertised.get_or_insert_with(|| more().into_iter()).next())
+    {
+        let left = (started + JOIN_WITHIN).saturating_duration_since(Instant::now());
+        if left.is_zero() && first.is_some() {
+            break;
+        }
+        match register_at(
+            (host.as_str(), port),
+            (secret, me),
+            keys,
+            registration,
+            left,
+        ) {
+            Ok(registered) => return Ok(registered),
+            // An aterm before 0.147 that holds no join code records no member, another may.
+            Err(refused @ JoinFailed::Registration(_))
+                if matches!(refused.advice(), Advice::NoIssuer) =>
+            {
+                first.get_or_insert(refused);
+            }
+            // A member's own words about this Mac hold wherever it is asked.
+            Err(refused @ JoinFailed::Registration(_)) => return Err(refused),
+            Err(why) => {
+                first.get_or_insert(why);
+            }
+        }
+    }
+    Err(first.unwrap_or_else(|| JoinFailed::Unanswered("no member was dialled".to_owned())))
+}
+
+fn register_at(
+    (host, port): (&str, u16),
+    (secret, me): (&FleetSecret, &NodeIdentity),
+    keys: &Keyring,
+    registration: &Registration,
+    within: Duration,
+) -> Result<(member::Joined, IpAddr, Option<NodeKey>), JoinFailed> {
+    let started = Instant::now();
+    let within = within.max(Duration::from_secs(1));
+    let mut reached = member::dial(host, None, port, (secret, Some(me)), FleetOp::Join, within)
+        .map_err(JoinFailed::Dial)?;
     if let Some(proof) = &reached.peer
         && keys.bound(&proof.node).is_some_and(|key| key != proof.key)
     {
         return Err(JoinFailed::OtherKey(proof.node.clone()));
     }
-    if let Some((node, key)) = bound
-        && reached
-            .peer
-            .as_ref()
-            .is_none_or(|proof| proof.node != *node || proof.key != *key)
-    {
-        return Err(JoinFailed::OtherIssuer {
-            bound: node.clone(),
-            proved: reached.peer.as_ref().map(|proof| proof.node.clone()),
-        });
-    }
-    let deadline = (started + JOIN_WITHIN).max(Instant::now() + Duration::from_secs(1));
+    let deadline = (started + within).max(Instant::now() + Duration::from_secs(1));
     let joined =
         member::register_by(&mut reached, registration, deadline).map_err(|e| match e {
             member::Unregistered::Answered(why) => JoinFailed::Registration(why),
@@ -1989,7 +2165,7 @@ fn register_with(
         Some(proof) if proof.node == joined.issuer.node => Some(proof.key),
         Some(proof) => {
             return Err(JoinFailed::Registration(format!(
-                "the issuer answered as node {} and proved node {}",
+                "the member answered as node {} and proved node {}",
                 short(&joined.issuer.node),
                 short(&proof.node)
             )));
@@ -2010,7 +2186,7 @@ fn peers(places: &Places, args: &[String]) -> Result<String, Failure> {
             narrowing(places, || list_peers(places, within))
         }
         [add, target] if add.as_str() == "add" => {
-            let (host, port) = member::parse_host_port(target, Some(member::DEFAULT_PORT))
+            let (host, port) = member::parse_host_port(target, Some(member::default_port()))
                 .map_err(|why| Failure::Usage(format!("add <host[:port]>: {why}")))?;
             let peer = manual_peer(host, port);
             let target = peer.target();
@@ -2128,6 +2304,7 @@ fn remove_peer(
     what: &str,
     unread: Option<&Missed>,
 ) -> Result<String, Failure> {
+    this_machine_alone(places, what).map_err(failed)?;
     let listed = member::read_peers(&places.state).map_err(failed)?;
     let found = named_here(places, &listed, what, unread).map_err(failed)?;
     // Every node that drives here before: the entry's own, and on a member each node only the copy
@@ -2280,6 +2457,20 @@ fn names_no_peer(places: &Places, word: &str, missed: Option<&Missed>) -> String
     }
 }
 
+/// The silence of this machine's issuer a refusal of `word` waits on: `missed` where it was
+/// silent and `word` names the issuer, whose book may say which Mac it is a moment later.
+fn silent_issuer<'a>(
+    places: &Places,
+    word: &str,
+    missed: Option<&'a Missed>,
+) -> Option<&'a Missed> {
+    missed.filter(|missed| {
+        missed.silent
+            && member::read_peers(&places.state)
+                .is_ok_and(|book| loosely_named_issuer(places, &book, word).is_some())
+    })
+}
+
 /// How a verb says `what` names no peer here while its issuer's book, which may name it, was not
 /// read (`missed`), cause first.
 fn unnamed_unread(what: &str, missed: &Missed) -> String {
@@ -2327,7 +2518,8 @@ fn configured(places: &Places) -> Vec<(String, Peer)> {
         .peers
         .into_iter()
         .filter_map(|entry| {
-            let (host, port) = member::parse_host_port(&entry, Some(member::DEFAULT_PORT)).ok()?;
+            let (host, port) =
+                member::parse_host_port(&entry, Some(member::default_port())).ok()?;
             Some((entry, manual_peer(host, port)))
         })
         .collect()
@@ -2379,7 +2571,8 @@ fn named_here(
         ));
     }
     let others = others_listed(places, book);
-    Ok(member::named(book, &others, what)?.cloned())
+    let identities = roster_identities(places);
+    Ok(member::named_with(book, &others, &identities, what)?.cloned())
 }
 
 /// Whether `what` names `peer` as no other peer can be named: its whole node id, or its address
@@ -2406,19 +2599,20 @@ fn uncopied_issuer<'a>(places: &Places, book: &'a [Peer]) -> Option<&'a Peer> {
 }
 
 /// The issuer `book` names on a member where `what` answers to it, alone or beside other peers,
-/// other than by its whole node id or its address and port ([`names_exactly`]): a copy holds no
-/// member that joined since this machine's last read, which such a word may name too.
+/// other than by its whole node id or its address and port ([`names_exactly`]), its short names
+/// among them ([`member::all_short_named`]): a copy holds no member that joined since this
+/// machine's last read, which such a word may name too.
 fn loosely_named_issuer<'a>(places: &Places, book: &'a [Peer], what: &str) -> Option<&'a Peer> {
     let own = own_node(places);
+    let identities = roster_identities(places);
     book.iter()
         .find(|peer| peer.via == Via::Issuer)
         .filter(|issuer| {
+            let alone = std::slice::from_ref(*issuer);
             issuer.node.is_some()
                 && issuer.node != own
-                && matches!(
-                    member::find(std::slice::from_ref(*issuer), what),
-                    Ok(Some(_))
-                )
+                && (matches!(member::find_with(alone, &identities, what), Ok(Some(_)))
+                    || !member::all_short_named(alone, &[], what).is_empty())
                 && !names_exactly(issuer, what)
         })
 }
@@ -2486,7 +2680,7 @@ fn drop_copied_grant(
     let Some(peer) = named_here(places, &book, what, unread).map_err(failed)? else {
         return Ok(None);
     };
-    if !matches!(member::find(&book, what), Ok(None)) {
+    if peer.via != Via::IssuerBook || book.iter().any(|entry| entry.node == peer.node) {
         return Ok(None);
     }
     let Some(node) = peer.node.as_deref() else {
@@ -2593,7 +2787,7 @@ fn known_peers(places: &Places) -> Result<Known, Failure> {
     let mut entries = vec![None; peers.len()];
     let mut skipped = Vec::new();
     for entry in &table.peers {
-        match member::parse_host_port(entry, Some(member::DEFAULT_PORT)) {
+        match member::parse_host_port(entry, Some(member::default_port())) {
             Ok((host, port)) => {
                 let peer = manual_peer(host, port);
                 if !peers.iter().any(|known| known.same_place(&peer)) {
@@ -2639,6 +2833,7 @@ fn manual_peer(host: String, port: u16) -> Peer {
         seen_ms: None,
         via: Via::Manual,
         fleet: None,
+        signed: None,
     }
 }
 
@@ -2707,7 +2902,7 @@ fn check_peers(places: &Places, within: Duration) -> Result<Listing, Failure> {
                 };
                 (read, listener)
             });
-            let dropped = keep_book(places, &secret, &book, own.as_deref());
+            let dropped = keep_book(places, &secret, (&reads, &book), own.as_deref());
             let issuer_read = reads.iter().find(|read| read.peer.via == Via::Issuer);
             let missed = Missed::of_read(&book, issuer_read.map(|read| &read.read));
             // The read's own write lowered the level or took grants out: the header says the
@@ -3191,16 +3386,92 @@ fn own_node(places: &Places) -> Option<String> {
     member::read_node_id(&places.state).ok().flatten()
 }
 
-/// This machine's own node, where `word` names it ([`member::names_node`]).
+/// Vault paths associated with `places`: a scratch test root holding `.secrets/`, or the live
+/// home when `places.state` is the live account's state directory.
+fn vault_paths_for(places: &Places) -> Option<aterm_secrets::client::Paths> {
+    if let Some(root) = places.state.parent()
+        && root.join(".secrets").is_dir()
+    {
+        return Some(aterm_secrets::client::Paths::for_home(root));
+    }
+    if aterm_types::dirs::state_dir().as_deref() == Some(places.state.as_path()) {
+        return aterm_secrets::client::Paths::live().ok();
+    }
+    None
+}
+
+/// Swarm-roster [`member::PeerIdentity`] rows from the locally applied vault copy, if any.
+fn roster_identities(places: &Places) -> Vec<member::PeerIdentity> {
+    let Some(paths) = vault_paths_for(places) else {
+        return Vec::new();
+    };
+    let Ok(Some(roster)) = aterm_secrets::client::swarm_roster(&paths) else {
+        return Vec::new();
+    };
+    roster
+        .members
+        .into_iter()
+        .map(|member| member::PeerIdentity {
+            node: member.node_id,
+            host: None,
+            label: Some(member.label),
+            aliases: member.aliases,
+            vault_name: (!member.vault_name.is_empty()).then_some(member.vault_name),
+        })
+        .collect()
+}
+
+/// This machine's own node, where `word` names it ([`member::names_node`]). Also matches `[fleet]
+/// machine` in aterm.toml.
 fn names_this_machine(places: &Places, word: &str) -> Option<String> {
-    own_node(places).filter(|own| member::names_node(own, word))
+    let own = own_node(places)?;
+    if member::names_node(&own, word) {
+        return Some(own);
+    }
+    let word = word.trim();
+    if !word.is_empty()
+        && let Ok(config) = ConfigFile::open(&places.config)
+        && let Ok(text) = text_of(&config)
+        && let Ok(table) = fleet_table(text)
+        && table
+            .machine
+            .as_deref()
+            .is_some_and(|machine| machine.trim().eq_ignore_ascii_case(word))
+    {
+        return Some(own);
+    }
+    None
+}
+
+/// This machine's own node where `word` names it ([`names_this_machine`]) and no other peer here
+/// does ([`member::all_named`] over the book, the copy and the `[[fleet.peers]]` entries), for
+/// every verb that takes a peer's word.
+/// # Errors
+/// `word` names this machine and another peer too: one sentence naming each by its whole node id,
+/// this machine as itself.
+fn this_machine_alone(places: &Places, word: &str) -> Result<Option<String>, String> {
+    let Some(own) = names_this_machine(places, word) else {
+        return Ok(None);
+    };
+    let book = member::read_peers(&places.state).unwrap_or_default();
+    let others = others_listed(places, &book);
+    let identities = roster_identities(places);
+    let beside: Vec<&Peer> = member::all_named_with(&book, &others, &identities, word)
+        .into_iter()
+        .filter(|peer| peer.node.as_deref() != Some(own.as_str()))
+        .collect();
+    if beside.is_empty() {
+        Ok(Some(own))
+    } else {
+        Err(member::several(word, Some(&own), &beside))
+    }
 }
 
 /// This machine's own node, where `word` names its own listener without a dial: its `[fleet]
 /// listen` port at its loopback, an interface address or its host name, as `peers add` refuses
 /// that place ([`unread_place`]). A verb asks it once no list it reads names the word.
 fn at_own_place(places: &Places, word: &str) -> Option<String> {
-    let (host, port) = member::parse_host_port(word, Some(member::DEFAULT_PORT)).ok()?;
+    let (host, port) = member::parse_host_port(word, Some(member::default_port())).ok()?;
     let config = ConfigFile::open(&places.config).ok()?;
     let table = fleet_table(text_of(&config).ok()?).ok()?;
     (table.listen_port() == Some(port) && this_machine_is(&host))
@@ -3212,44 +3483,111 @@ fn own_identity(places: &Places) -> Option<NodeIdentity> {
     member::read_node_identity(&places.state).ok().flatten()
 }
 
-/// What `read`, a read under `secret`, leaves as the copy of the issuer's book, and the grants a
-/// proven book backs no more taken out, in one take of the book's lock while that fleet is held
-/// still ([`member::write_held`]): a read that ends after a leave, or after a join of another
-/// fleet, keeps nothing of the fleet it read.
+/// What `read`, a read under `secret`, leaves as the copy of the issuer's book, the members that
+/// answered it (`reads`, this machine's own node aside) noted as answering now
+/// ([`member::ANSWERED_FILE`]), and the grants a proven book backs no more taken out, in one take
+/// of the book's lock while that fleet is held still ([`member::write_held`]): a read that ends
+/// after a leave, or after a join of another fleet, keeps nothing of the fleet it read. A read
+/// that got no book keeps the copy as it is, and notes its answers still.
 fn keep_book(
     places: &Places,
     secret: &FleetSecret,
-    read: &BookRead,
+    (reads, read): (&[member::PeerRead], &BookRead),
     own: Option<&str>,
 ) -> Option<String> {
+    let vault_paths = vault_paths_for(places);
+    let log = vault_paths
+        .as_ref()
+        .and_then(|paths| crate::fleet_log::LocalLog::of(paths).keys());
+    let denied = vault_paths
+        .as_ref()
+        .and_then(|paths| {
+            aterm_secrets::client::swarm_denied_nodes(paths)
+                .ok()
+                .flatten()
+        })
+        .unwrap_or_default();
+    let checked_peers: Vec<Peer> = reads.iter().map(|r| r.peer.clone()).collect();
+    member::prune_pushed_facts(&places.state, &checked_peers, &denied, log.as_deref());
     let copy = match read {
-        BookRead::Fetched(book) => Some((book.node.as_str(), member::copies_of(book, own))),
-        BookRead::Refused(_) | BookRead::NoIssuer => None,
-        BookRead::Unshared(_) | BookRead::Unread(_) => return None,
+        BookRead::Fetched(book) => {
+            member::prune_pushed_facts(&places.state, &book.peers, &denied, log.as_deref());
+            let mut copies = member::copies_of(book, own);
+            copies.retain(|copy| {
+                !copy
+                    .node
+                    .as_deref()
+                    .is_some_and(|node| aterm_net::fleet::is_denied_node(node, &denied))
+                    && !copy.key.is_some_and(|key| {
+                        aterm_net::fleet::is_denied_key(&key, &denied)
+                            || log.as_ref().is_some_and(|log| log.holds_out(&key))
+                    })
+            });
+            Some(Some((book.node.as_str(), copies)))
+        }
+        BookRead::Refused(_) | BookRead::NoIssuer => Some(None),
+        BookRead::Unshared(_) | BookRead::Unread(_) => None,
     };
+    let answers = answered_now(reads, own);
+    if copy.is_none() && answers.is_empty() {
+        return None;
+    }
     let proven = matches!(read, BookRead::Fetched(book) if book.proven);
     at_step("keep");
     member::write_held(
         &places.state,
         Began::Under(&Held::Key(secret.clone())),
         |book| {
+            // A record of when each member last answered: one this machine cannot write costs
+            // `peers` its "since" line, never the read.
+            let _ = book.note_answered(&answers);
             book.keep_issuer_book(
-                copy.as_ref()
+                copy.as_ref()?
+                    .as_ref()
                     .map(|(issuer, copies)| (*issuer, copies.as_slice())),
             )
             .ok()?;
-            proven.then(|| drop_unbacked_grants(places, book)).flatten()
+            proven
+                .then(|| drop_unbacked_grants(places, book, log.as_deref(), &denied))
+                .flatten()
         },
     )
     .ok()
     .flatten()
 }
 
-fn drop_unbacked_grants(places: &Places, held: &HeldBook<'_>) -> Option<String> {
+/// The members that answered `reads` now, each by its [`member::answer_key`] with this machine's
+/// clock: every answer but this machine's own node's.
+fn answered_now(reads: &[member::PeerRead], own: Option<&str>) -> Vec<(String, u64)> {
+    let Some(now_ms) = aterm_time::unix_millis() else {
+        return Vec::new();
+    };
+    reads
+        .iter()
+        .filter(|read| {
+            matches!(&read.read, Ok(surveyed)
+                if !is_this_machine(surveyed.node.as_deref(), surveyed.proven, own))
+        })
+        .map(|read| (member::answer_key(&read.peer), now_ms))
+        .collect()
+}
+
+fn drop_unbacked_grants(
+    places: &Places,
+    held: &HeldBook<'_>,
+    log: Option<&member::MemberKeys>,
+    denied: &[String],
+) -> Option<String> {
     let keys = Keyring::read(&places.state);
     let gone = drop_grants(places, held, |word| {
-        DriveGrant::from_word(word)
-            .is_some_and(|grant| !grant.all() && keys.bound(&grant.node) != Some(grant.key))
+        DriveGrant::from_word(word).is_some_and(|grant| {
+            !grant.all()
+                && (aterm_net::fleet::is_denied_node(&grant.node, denied)
+                    || aterm_net::fleet::is_denied_key(&grant.key, denied)
+                    || log.is_some_and(|log| log.holds_out(&grant.key))
+                    || (!log.is_some_and(|log| log.admits(&grant.key))
+                        && keys.bound(&grant.node) != Some(grant.key)))
+        })
     })
     .ok()??;
     Some(format!(
@@ -3327,7 +3665,7 @@ fn book_note(peers: &[Peer], read: &BookRead) -> Option<String> {
 }
 
 fn shown_name(peer: &Peer) -> String {
-    if peer.port == member::DEFAULT_PORT {
+    if peer.port == member::default_port() {
         peer.host.clone()
     } else {
         member::host_port(&peer.host, peer.port)
@@ -3364,6 +3702,14 @@ fn list_peers(places: &Places, within: Duration) -> Result<String, Failure> {
     let minted = code_minted(places);
     let mut no_route = 0;
     let mut unreached = 0;
+    let mut reached = 0;
+    let mut last_heard_ms = None;
+    // When each member last answered this machine, and the newest such answer among those that
+    // did not answer now: what the away line's "since" says. Each member that did not answer
+    // gets a line of its own after the table (`last_answers`), so no row's words change.
+    let answered = member::read_answered(&places.state);
+    let mut answered_ms = None;
+    let mut last_answers = Vec::new();
     out.push_str(&format!(
         "  {:<8}  {:<11}  {:<23}  {:<21}  {:<15}  {:<7}  {:<8}  CHECK\n",
         "NODE", "VIA", "HOST", "ADDRESS", "VERSION", "JOINED", "KEY"
@@ -3380,24 +3726,36 @@ fn list_peers(places: &Places, within: Duration) -> Result<String, Failure> {
                     taken_out_by(places, row)
                 )
             }
-            Some(Ok(checked)) => match (&peer.node, &checked.node) {
-                (None, Some(node)) => format!(
-                    "ok, serves {} (node {}{})",
-                    checked.scope.word(),
-                    short(node),
-                    if checked.proven { ", proven" } else { "" }
-                ),
-                _ => format!("ok, serves {}", checked.scope.word()),
-            },
+            Some(Ok(checked)) => {
+                reached += 1;
+                match (&peer.node, &checked.node) {
+                    (None, Some(node)) => format!(
+                        "ok, serves {} (node {}{})",
+                        checked.scope.word(),
+                        short(node),
+                        if checked.proven { ", proven" } else { "" }
+                    ),
+                    _ => format!("ok, serves {}", checked.scope.word()),
+                }
+            }
             Some(Err(why)) => {
                 // A peer never dialled (a name that did not resolve) says
                 // nothing of this machine's route either way.
                 if why.dialled() {
                     unreached += 1;
+                    last_heard_ms = last_heard_ms.max(peer.seen_ms);
                 }
                 if why.no_route() {
                     no_route += 1;
                 }
+                let last = answered.get(&member::answer_key(peer)).copied();
+                answered_ms = answered_ms.max(last);
+                last_answers.push((
+                    peer.node
+                        .as_deref()
+                        .map_or_else(|| peer.target(), |node| short(node).to_owned()),
+                    last,
+                ));
                 aterm_codec::tty::one_line(
                     &unreached_words(peer, why, &listed, (own.as_deref(), minted)),
                     200,
@@ -3409,6 +3767,8 @@ fn list_peers(places: &Places, within: Duration) -> Result<String, Failure> {
             peer.node.as_deref().map_or("-", short),
             if row.configured.is_some() {
                 "config"
+            } else if peer.is_dormant_at(now_ms) {
+                "dormant"
             } else {
                 peer.via.word()
             },
@@ -3424,6 +3784,18 @@ fn list_peers(places: &Places, within: Duration) -> Result<String, Failure> {
             },
         ));
     }
+    let offset_s = i64::try_from(now_ms / 1000)
+        .ok()
+        .and_then(aterm_uds::zone::local_offset_at);
+    if let Some(away) = away_words(
+        (reached, unreached),
+        (last_heard_ms, answered_ms),
+        now_ms,
+        offset_s,
+    ) {
+        out.push_str(&away);
+    }
+    out.push_str(&last_answer_words(&last_answers, now_ms, offset_s));
     if no_route > 0 && no_route == unreached {
         out.push_str(
             "Every peer not reached had no route: on a Mac that is local-network privacy, \
@@ -3719,6 +4091,78 @@ fn in_aterm_toml(places: &Places, entry: &str) -> String {
     )
 }
 
+/// The lines `peers` ends its table with when it dialled peers and none answered (`reached`,
+/// `unreached`): this machine is away from every member, and the last this book heard of one
+/// (`last_heard_ms`, the newest `seen_ms` of those dialled, a register or heartbeat it took);
+/// then, where [`member::ANSWERED_FILE`] holds one, since when (`answered_ms`, the newest time a
+/// member not answering now last answered this machine). Each time is a clock at `offset_s`
+/// east of UTC (UTC when the zone is unknown) and an age at `now_ms`.
+fn away_words(
+    (reached, unreached): (usize, usize),
+    (last_heard_ms, answered_ms): (Option<u64>, Option<u64>),
+    now_ms: u64,
+    offset_s: Option<i64>,
+) -> Option<String> {
+    if reached > 0 || unreached == 0 {
+        return None;
+    }
+    let none = if unreached == 1 {
+        "the one peer dialled did not answer".to_owned()
+    } else {
+        format!("none of the {unreached} peers dialled answered")
+    };
+    let heard = last_heard_ms.map_or_else(
+        || "this book holds no time it heard of one".to_owned(),
+        |ms| {
+            format!(
+                "the last this book heard of one was at {}",
+                clock_ago(ms, now_ms, offset_s)
+            )
+        },
+    );
+    let mut words = format!("Away from every member: {none}; {heard}.\n");
+    if let Some(ms) = answered_ms {
+        words.push_str(&format!(
+            "Away from every member since {}: the last answer one gave this Mac.\n",
+            clock_ago(ms, now_ms, offset_s)
+        ));
+    }
+    Some(words)
+}
+
+/// The lines `peers` gives, after its table, to each member that did not answer now (`last`:
+/// its node's first eight digits, or its place for a peer with no node id, and when it last
+/// answered this machine, [`member::ANSWERED_FILE`]), in the table's order: one line each, which
+/// starts with words no row starts with, so a script that reads the rows reads them as it did.
+/// Each time is a clock at `offset_s` east of UTC (UTC when the zone is unknown) and an age at
+/// `now_ms`.
+fn last_answer_words(last: &[(String, Option<u64>)], now_ms: u64, offset_s: Option<i64>) -> String {
+    last.iter()
+        .map(|(who, ms)| {
+            format!(
+                "Last answer to this Mac from {}: {}.\n",
+                aterm_codec::tty::one_line(who, 64),
+                ms.map_or_else(
+                    || "none recorded".to_owned(),
+                    |ms| clock_ago(ms, now_ms, offset_s)
+                )
+            )
+        })
+        .collect()
+}
+
+/// `ms` (Unix milliseconds) as a clock at `offset_s` east of UTC (`UTC` said when the zone is
+/// unknown) and its age at `now_ms`: `09:00 (2h ago)`.
+fn clock_ago(ms: u64, now_ms: u64, offset_s: Option<i64>) -> String {
+    let at = i64::try_from(ms).unwrap_or(i64::MAX);
+    format!(
+        "{}{} ({} ago)",
+        crate::supervise::occupancy::said::clock_words(at, offset_s.unwrap_or(0)),
+        if offset_s.is_some() { "" } else { " UTC" },
+        age(now_ms.saturating_sub(ms))
+    )
+}
+
 fn age(ms: u64) -> String {
     let s = ms / 1000;
     match s {
@@ -3734,11 +4178,28 @@ fn publish(places: &Places, args: &[String]) -> Result<String, Failure> {
         return Err(Failure::Usage("publish takes no flags".into()));
     }
     let code = member::read_join_code(&places.state)
-        .map_err(|why| failed(format!("this machine is not a fleet issuer: {why}")))?;
+        .map_err(|why| failed(format!("this machine minted no fleet's code here: {why}")))?;
+    // The code is the secret alone (F17); the vault's entry ends with a place, a member to dial
+    // first, which an aterm before 0.147 needs to read the code at all: the one the code's file
+    // names (the init's, its `--host` among them), else this Mac's.
+    let text = match &code.hint {
+        Some(_) => code.written(),
+        None => {
+            let config = ConfigFile::open(&places.config).map_err(failed)?;
+            let port = fleet_table(text_of(&config)?)
+                .map_err(failed)?
+                .listen_port()
+                .unwrap_or_else(member::default_port);
+            let host = aterm_uds::process::lan_host_name()
+                .filter(|host| member::is_host(host))
+                .ok_or_else(|| failed("this machine's host name is no host a member can dial"))?;
+            code.text_at((&host, port))
+        }
+    };
     let vault = aterm_secrets::client::Paths::live().map_err(failed)?;
     aterm_secrets::client::admin_publish_alab_fleet(
         &vault,
-        &aterm_secrets::SecretBytes::from(code.text()),
+        &aterm_secrets::SecretBytes::from(text),
     )
     .map_err(failed)?;
     Ok("published the existing fleet's join code to every ALab vault member; members converge on their next vault apply".into())
@@ -3759,9 +4220,20 @@ const SYNCED_FILE: &str = "fleet-synced";
 /// under the book's lock, so no level a person set is widened by it.
 const GRANT_OWED_FILE: &str = "fleet-sync-grant";
 
+/// An older build's steward's mark of the fleet it formed; a leave removes it.
+const STEWARDED_FILE: &str = "fleet-stewarded";
+
+/// An older build's steward's record that the vault published its fleet; a leave removes it.
+const STEWARD_PUBLISHED_FILE: &str = "fleet-steward-published";
+
+/// An older build's steward's record that an admin removed its fleet's code; a leave removes it.
+const STEWARD_REMOVED_FILE: &str = "fleet-steward-removed";
+
 /// What a sync of the default ALab fleet did (`aterm fleet sync`, [`sync_from_cache`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FleetSync {
+    /// `[swarm] enabled = false` in `aterm.toml`.
+    SwarmOff,
     /// `aterm fleet leave` turned sync off (its `fleet-off` record).
     Off,
     /// No vault is configured.
@@ -3789,6 +4261,7 @@ impl FleetSync {
     #[must_use]
     pub fn report(&self) -> String {
         match self {
+            FleetSync::SwarmOff => aterm_secrets::swarm::SWARM_OFF.into(),
             FleetSync::Off => "fleet sync is off after aterm fleet leave; `aterm fleet sync --on` \
                                turns it on and joins the default fleet"
                 .into(),
@@ -3830,6 +4303,15 @@ fn sync(places: &Places, args: &[String]) -> Result<String, Failure> {
     }
 }
 
+/// Why [`try_sync_from_cache`] did not finish, and whether the issuer listener was at capacity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetSyncError {
+    /// Human-readable diagnostic.
+    pub why: String,
+    /// `true` when the issuer dial failed at connection or per-address capacity.
+    pub at_capacity: bool,
+}
+
 /// Converge this Mac on the default ALab fleet from the signed vault copy it already applied:
 /// `aterm fleet sync` without the vault sync it makes first, which stays the vault subscriber's
 /// (or the app's) to make, so two of them never materialize at once. It reads aterm's own state
@@ -3840,14 +4322,24 @@ fn sync(places: &Places, args: &[String]) -> Result<String, Failure> {
 /// code cannot be read; or the join or the default grant did not finish (the issuer not
 /// answering, say), for the next pass to try again.
 pub fn sync_from_cache() -> Result<FleetSync, String> {
-    let places = Places::here().map_err(Failure::into_text)?;
-    sync_with(
-        &places,
-        false,
-        || vault_code(Fetch::Cache),
-        &Opts::default(),
-    )
-    .map_err(Failure::into_text)
+    try_sync_from_cache().map_err(|err| err.why)
+}
+
+/// [`sync_from_cache`], preserving whether an issuer refusal came from listener capacity so
+/// `sync.fleet` retries within minutes instead of waiting for the next 30-minute pass.
+///
+/// # Errors
+/// As [`sync_from_cache`], paired with `at_capacity` on [`FleetSyncError`].
+pub fn try_sync_from_cache() -> Result<FleetSync, FleetSyncError> {
+    let places = Places::here().map_err(|err| FleetSyncError {
+        why: err.into_text(),
+        at_capacity: false,
+    })?;
+    let opts = Opts::default();
+    sync_with(&places, false, || vault_code(Fetch::Cache), &opts).map_err(|err| FleetSyncError {
+        why: err.into_text(),
+        at_capacity: opts.saw_capacity.load(std::sync::atomic::Ordering::Relaxed),
+    })
 }
 
 /// What a sync of the default ALab fleet from the signed vault copy would find, read without
@@ -3882,6 +4374,9 @@ fn check_with(
     places: &Places,
     vault: impl FnOnce() -> Result<VaultCode, Failure>,
 ) -> Result<FleetCheck, Failure> {
+    if !aterm_secrets::swarm::enabled_at(&places.config).map_err(failed)? {
+        return Ok(FleetCheck::Idle(FleetSync::SwarmOff));
+    }
     if in_state(places, "fleet-off")? {
         return Ok(FleetCheck::Idle(FleetSync::Off));
     }
@@ -3889,7 +4384,7 @@ fn check_with(
         VaultCode::NoVault => return Ok(FleetCheck::Idle(FleetSync::NoVault)),
         VaultCode::NotAlab => return Ok(FleetCheck::Idle(FleetSync::NotAlab)),
         VaultCode::NoCode => return Ok(FleetCheck::Idle(FleetSync::NoCode)),
-        VaultCode::Code(code) => code,
+        VaultCode::Code { code, .. } => code,
     };
     let code = code
         .as_str()
@@ -3929,7 +4424,9 @@ enum VaultCode {
     NotAlab,
     NoCode,
     /// The signed default fleet code (never printed).
-    Code(aterm_secrets::SecretBytes),
+    Code {
+        code: aterm_secrets::SecretBytes,
+    },
 }
 
 /// Read the vault this Mac joined (the live one: `$HOME`'s) for the default ALab fleet code,
@@ -3946,8 +4443,8 @@ fn vault_code(fetch: Fetch) -> Result<VaultCode, Failure> {
         aterm_secrets::client::sync(&vault, None).map_err(failed)?;
     }
     Ok(
-        match aterm_secrets::client::alab_fleet_code(&vault).map_err(failed)? {
-            Some(code) => VaultCode::Code(code),
+        match aterm_secrets::client::alab_fleet(&vault).map_err(failed)? {
+            Some(fleet) => VaultCode::Code { code: fleet.code },
             None => VaultCode::NoCode,
         },
     )
@@ -3971,6 +4468,9 @@ fn sync_with(
         .map_err(failed)?
         .map_err(|error| failed(format!("could not clear fleet-off: {error}")))?;
     }
+    if !on && !aterm_secrets::swarm::enabled_at(&places.config).map_err(failed)? {
+        return Ok(FleetSync::SwarmOff);
+    }
     if in_state(places, member::OFF_FILE)? {
         return Ok(FleetSync::Off);
     }
@@ -3978,7 +4478,7 @@ fn sync_with(
         VaultCode::NoVault => return Ok(FleetSync::NoVault),
         VaultCode::NotAlab => return Ok(FleetSync::NotAlab),
         VaultCode::NoCode => return Ok(FleetSync::NoCode),
-        VaultCode::Code(code) => code,
+        VaultCode::Code { code } => code,
     };
     let code = code
         .as_str()
@@ -3995,10 +4495,12 @@ const LEAVE_THEN_ON: &str = "`aterm fleet leave`, then `aterm fleet sync --on`";
 /// one a sync last found it in ([`SYNCED_FILE`]: the vault's code moved on); another fleet a
 /// person joined by hand, one this Mac issues, and a key it cannot read are left as they are.
 /// A sync's join keeps the level written before it (a new secret's join lowers drive to
-/// content and takes named grants out, as every join does), and a first join reads at content.
-/// The default grant (every member may drive) goes only with a join made here, and only where no
-/// narrower level stands ([`default_grant_stands`]), so a level set after a sync's join stays;
-/// one that join owed and did not write ([`GRANT_OWED_FILE`]) is written by a later pass.
+/// content and takes named grants out, as every join does); a first join reads at content until
+/// its default grant. The default grant (every member may drive) goes with a join made here on
+/// every member, a vault admin included (docs/DESIGN-fluid-swarm-2026-10-28.md F2), and only
+/// where no narrower level stands ([`default_grant_stands`]), so a level a person set after a
+/// sync's join stays; one that join owed and did not write ([`GRANT_OWED_FILE`]) is written by a
+/// later pass.
 fn converge_on(places: &Places, code: &str, at: &Opts) -> Result<FleetSync, Failure> {
     let parsed = JoinCode::parse(code).map_err(failed)?;
     let current = FleetSecret::new(&parsed.secret).map_err(failed)?;
@@ -4040,7 +4542,13 @@ fn converge_on(places: &Places, code: &str, at: &Opts) -> Result<FleetSync, Fail
                 synced: Some(from),
                 ..Opts::default()
             };
-            FleetSync::Joined(join(places, &opts, code)?)
+            let joined = join(places, &opts, code).inspect_err(|_| {
+                if opts.saw_capacity.load(std::sync::atomic::Ordering::Relaxed) {
+                    at.saw_capacity
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            })?;
+            FleetSync::Joined(joined)
         }
         None => {
             record_synced(places, &current)?;
@@ -4065,20 +4573,19 @@ fn unread_for_sync(places: &Places, error: &aterm_net::fleet::KeyFileError) -> S
 /// The default grant (every member may drive this Mac) a sync's join owes it
 /// ([`GRANT_OWED_FILE`]), beside `book`: written while the record stands, where `[fleet]` reads
 /// at a level the default grant may replace or at the content that join left, the record
-/// removed either way. `None` where nothing is owed now: a person's `allow`, `join`, `init` or
-/// `leave` took the record.
+/// removed either way. A vault admin is granted as every member is: no member is a steward
+/// (docs/DESIGN-fluid-swarm-2026-10-28.md F2, which retired C19a's exemption with the open
+/// approver). `None` where nothing is owed now: a person's `allow`, `join`, `init` or `leave`
+/// took the record.
 fn grant_default(places: &Places, book: &HeldBook<'_>) -> Result<Option<String>, Failure> {
     if !in_state(places, GRANT_OWED_FILE)? {
         return Ok(None);
     }
     let config = ConfigFile::open(&places.config).map_err(failed)?;
     let table = fleet_table(text_of(&config)?).map_err(failed)?;
-    // The steward issues the fleet and is granted nothing here.
-    let due = table.listen.is_some()
-        && !in_state(places, CODE_FILE)?
-        && (default_grant_stands(&table)
-            || (table.level() == Some(FleetScope::Content.word()) && table.drive_from.is_empty()));
-    let report = if due {
+    let owed_content =
+        table.level() == Some(FleetScope::Content.word()) && table.drive_from.is_empty();
+    let report = if table.listen.is_some() && (default_grant_stands(&table) || owed_content) {
         let all = aterm_net::fleet::ALL_MEMBERS;
         let mut nodes = if table.level() == Some(aterm_net::fleet::DRIVE_LEVEL) {
             table.drive_from
@@ -4455,7 +4962,7 @@ fn write_level(
         // Members read at content still only where they did: a list a hand left at facts rises.
         let still = drove || was == Some(FleetScope::Content.word());
         out.push_str(&grants_removed(
-            had.len(),
+            &had,
             &format!("allow is {word} now, below drive"),
             if still && word == FleetScope::Content.word() {
                 CONTENT_LEFT
@@ -4526,16 +5033,15 @@ fn drive_grants(
     missed: Option<Missed>,
 ) -> Result<(Vec<DriveGrant>, String), Failure> {
     let mut unconfirmed = String::new();
-    if let Some((word, own)) = words
-        .iter()
-        .find_map(|word| Some((word, names_this_machine(places, word)?)))
-    {
-        return Err(failed(format!(
-            "`{}` is this machine itself (node {}): `allow drive --from` names another Mac of the \
-             fleet, and this one's own sessions are driven here with `aterm ctl`",
-            aterm_codec::tty::one_line(word, 40),
-            short(&own)
-        )));
+    for word in words {
+        if let Some(own) = this_machine_alone(places, word).map_err(failed)? {
+            return Err(failed(format!(
+                "`{}` is this machine itself (node {}): `allow drive --from` names another Mac of \
+                 the fleet, and this one's own sessions are driven here with `aterm ctl`",
+                aterm_codec::tty::one_line(word, 40),
+                short(&own)
+            )));
+        }
     }
     let mut nodes = Vec::new();
     for word in words {
@@ -4647,6 +5153,51 @@ fn bound_peer(places: &Places, what: &str, unread: Option<&Missed>) -> Result<Bo
     })
 }
 
+/// The word a `--host` drive or read binds for `what` ([`drive_fleet`], [`survey_fleet`]): `what`
+/// itself where it names this machine ([`names_this_machine`], its `[fleet] machine` among them)
+/// or a peer answers to it as every verb reads a peer's word ([`member::all_named_with`] over the
+/// book, the copy, the `[[fleet.peers]]` entries and the swarm roster's labels and aliases), or
+/// where no short name of a peer's host is it; else the whole node id (or the address and port,
+/// for an entry with no node) of the one peer a short name names ([`member::all_short_named`]:
+/// `MacbookAir` or `m27` for `MacbookAir-m27-M5-32GB-4TB.local`; `m102` of
+/// `m102-macbook-M4-Pro-24GB-500GB.local` is read by [`member::all_named_with`] already, as every
+/// verb reads a host's leading `m<N>`). A word that names no peer either way is read as today: a
+/// drive refuses it, and a survey reads it as a host by DNS and multicast DNS. A short name this
+/// machine's issuer answers to is left as it is while no copy of its book is held or its read
+/// before brought none to keep (`unread`), so [`named_here`] refuses it as it does every word that
+/// names the issuer loosely: a member that joined since may answer to it.
+/// # Errors
+/// The book cannot be read, or `what` is a short name of more than one peer
+/// ([`member::several_short`]).
+fn host_word(places: &Places, what: &str, unread: Option<&Missed>) -> Result<String, String> {
+    host_word_among(places, what, unread, &roster_identities(places))
+}
+
+/// [`host_word`] with the swarm roster's `identities` given.
+/// # Errors
+/// As [`host_word`].
+fn host_word_among(
+    places: &Places,
+    what: &str,
+    unread: Option<&Missed>,
+    identities: &[member::PeerIdentity],
+) -> Result<String, String> {
+    let book = member::read_peers(&places.state).map_err(|e| e.to_string())?;
+    let others = others_listed(places, &book);
+    if names_this_machine(places, what).is_some()
+        || !member::all_named_with(&book, &others, identities, what).is_empty()
+        || (loosely_named_issuer(places, &book, what).is_some()
+            && (unread.is_some() || uncopied_issuer(places, &book).is_some()))
+    {
+        return Ok(what.to_owned());
+    }
+    match member::all_short_named(&book, &others, what).as_slice() {
+        [] => Ok(what.to_owned()),
+        [peer] => Ok(peer.node.clone().unwrap_or_else(|| peer.target())),
+        many => Err(member::several_short(what, many)),
+    }
+}
+
 /// `[fleet] drive_from` without the grants `gone` picks, in aterm.toml, and below drive without
 /// the rest ([`with_level`]); nothing is written where `gone` picks none.
 /// # Errors
@@ -4695,13 +5246,13 @@ fn drop_grants(
         left: match (kept.is_empty(), swept) {
             (false, _) => String::new(),
             (true, 0) => format!(
-                ", and allow is {level}: no Mac drives this one until `aterm fleet allow drive \
-                 --from <host|node>` grants again{reads}"
+                ", and allow is {level}: no Mac drives this one until {} grants again{reads}",
+                grants_again(&table.drive_from)
             ),
             (true, swept) => format!(
                 ", with the {swept} more it listed, as allow is {level}, below drive: no Mac \
-                 drives this one until `aterm fleet allow drive --from <host|node>` grants \
-                 again{reads}"
+                 drives this one until {} grants again{reads}",
+                grants_again(&table.drive_from)
             ),
         },
     }))
@@ -4750,11 +5301,36 @@ fn leave(places: &Places, args: &[String]) -> Result<String, Failure> {
     if !args.is_empty() {
         return Err(Failure::Usage("leave takes nothing".to_owned()));
     }
-    leave_within(places, PEER_CHECK_WITHIN)
+    #[cfg(not(test))]
+    {
+        let home = aterm_types::dirs::home_dir();
+        leave_within_node(
+            places,
+            home.as_deref(),
+            Some(&crate::node_service::LiveSupervisor),
+            PEER_CHECK_WITHIN,
+        )
+    }
+    #[cfg(test)]
+    {
+        leave_within(places, PEER_CHECK_WITHIN)
+    }
 }
 
 /// [`leave`], this machine's own listener given `within` to prove itself ([`listens_here`]).
+#[cfg_attr(unix, cfg(test))]
 fn leave_within(places: &Places, within: Duration) -> Result<String, Failure> {
+    leave_within_node(places, None, None, within)
+}
+
+/// [`leave_within`], also removing `systems.alab.aterm-node` under `home` via `supervisor` when
+/// provided (C20).
+fn leave_within_node(
+    places: &Places,
+    node_home: Option<&Path>,
+    node_supervisor: Option<&dyn crate::node_service::ServiceSupervisor>,
+    within: Duration,
+) -> Result<String, Failure> {
     // Read before anything goes: once it has left, this machine reaches no Mac to hand a tab back,
     // and an issuer's fleet, which goes with it, takes no join again.
     let issues = in_state(places, CODE_FILE).unwrap_or(false);
@@ -4789,9 +5365,13 @@ fn leave_within(places: &Places, within: Duration) -> Result<String, Failure> {
         ];
         // The leave's first write, so one stopped short keeps sync off too; none in no fleet. What
         // cannot be read counts as held, and its removal below says why it failed.
-        let holds = files
-            .iter()
-            .any(|(name, _)| in_state(places, name).unwrap_or(true))
+        let has_node_job = node_home
+            .zip(node_supervisor)
+            .is_some_and(|(home, sup)| sup.unit_file(home).is_file());
+        let holds = has_node_job
+            || files
+                .iter()
+                .any(|(name, _)| in_state(places, name).unwrap_or(true))
             || ConfigFile::open(&places.config)
                 .ok()
                 .and_then(|config| without_fleet(text_of(&config).ok()?).ok())
@@ -4837,9 +5417,17 @@ fn leave_within(places: &Places, within: Duration) -> Result<String, Failure> {
                 unkeyed |= name == KEY_FILE;
             }
         }
-        // What a sync recorded goes with the fleet, unreported: a later join by hand is the
-        // person's, and owes no default grant.
-        for name in [SYNCED_FILE, GRANT_OWED_FILE] {
+        // What a sync or an older build's steward recorded goes with the fleet, unreported: a
+        // later join by hand is the person's, and owes no default grant. So does the record of
+        // when each member last answered, which alone holds no fleet.
+        for name in [
+            member::ANSWERED_FILE,
+            SYNCED_FILE,
+            GRANT_OWED_FILE,
+            STEWARDED_FILE,
+            STEWARD_PUBLISHED_FILE,
+            STEWARD_REMOVED_FILE,
+        ] {
             leaving
                 .remove(name)
                 .map_err(|e| failed(format!("{}: {e}", places.state.join(name).display())))?;
@@ -4862,6 +5450,13 @@ fn leave_within(places: &Places, within: Duration) -> Result<String, Failure> {
             left = true;
         }
         at_step("unlisten");
+        if let Some((home, sup)) = node_home.zip(node_supervisor)
+            && let Some(unit) =
+                crate::node_service::remove_with(home, &places.state, false, sup).map_err(failed)?
+        {
+            out.push_str(&format!("  removed    {} (the node job)\n", unit.display()));
+            left = true;
+        }
         Ok(())
     })
     .map_err(failed)?
@@ -4904,12 +5499,13 @@ fn leave_within(places: &Places, within: Duration) -> Result<String, Failure> {
 /// can.
 fn held_lines(places: &Places, once: &str, again: Option<&str>) -> String {
     let own = own_node(places);
-    let lifts = aterm_ctl::lifts_there(own.as_deref().unwrap_or("-"));
+    let lifts = |rm| aterm_ctl::lifts_there(own.as_deref().unwrap_or("-"), rm);
     let found = held_elsewhere(places);
-    let held = found.held.iter().map(|(at, sid)| {
+    let held = found.held.iter().map(|(at, sid, rm)| {
         format!(
             "  hold       {sid} on {at} stays held by this machine, which reaches that Mac no more \
-             {once}: {lifts}{}\n",
+             {once}: {}{}\n",
+            lifts(*rm),
             again.map_or_else(String::new, |again| format!(
                 ", and so does `aterm ctl --host {at} hold {sid} off` here once this machine \
                  {again}"
@@ -4917,17 +5513,19 @@ fn held_lines(places: &Places, once: &str, again: Option<&str>) -> String {
         )
     });
     // A Mac it could not read may hold a tab of its own: that is said too, never left out.
-    let unread = found.unread.iter().map(|(at, why)| {
+    let unread = found.unread.iter().map(|(at, why, rm)| {
         format!(
             "  unread     {at}: this machine could not read it just now ({why}), so it cannot say \
-             which tabs it holds there, and any it holds stays held {once}: {lifts}\n"
+             which tabs it holds there, and any it holds stays held {once}: {}\n",
+            lifts(*rm)
         )
     });
     let book = found.book.iter().map(|why| {
         format!(
             "  unread     its issuer's book was not read just now ({why}), so this machine cannot \
              say which tabs it holds on a member only that book names, and any it holds stays \
-             held {once}: {lifts}\n"
+             held {once}: {}\n",
+            lifts(aterm_ctl::RmLifts::Issuer)
         )
     });
     held.chain(unread).chain(book).collect()
@@ -4936,10 +5534,11 @@ fn held_lines(places: &Places, once: &str, again: Option<&str>) -> String {
 /// What [`held_elsewhere`] read of the fleet.
 #[derive(Default)]
 struct HeldElsewhere {
-    /// Each tab this machine holds on another Mac, beside the name a drive dials that Mac by.
-    held: Vec<(String, String)>,
-    /// Each Mac it could not read, beside why.
-    unread: Vec<(String, String)>,
+    /// Each tab this machine holds on another Mac, beside the name a drive dials that Mac by and
+    /// whose `peers rm` of this machine lifts it there.
+    held: Vec<(String, String, aterm_ctl::RmLifts)>,
+    /// Each Mac it could not read, beside why and whose `peers rm` lifts a hold there.
+    unread: Vec<(String, String, aterm_ctl::RmLifts)>,
     /// Why the issuer's book, which names the members, was not read.
     book: Option<String>,
 }
@@ -4974,24 +5573,34 @@ fn held_elsewhere(places: &Places) -> HeldElsewhere {
         },
         ..HeldElsewhere::default()
     };
+    // A Mac's own book binds this machine where one of them is the other's issuer; any other
+    // member binds it through its copy of the issuer's book.
+    let issues = in_state(places, CODE_FILE).unwrap_or(false);
     let held = &mut found.held;
     for read in reads {
         if read.peer.node.as_deref() == Some(own.as_str()) {
             continue;
         }
         let name = || aterm_codec::tty::one_line(&shown_name(&read.peer), 80);
+        let rm = if issues || read.peer.via == Via::Issuer {
+            aterm_ctl::RmLifts::There
+        } else {
+            aterm_ctl::RmLifts::Issuer
+        };
         let surveyed = match read.read {
             Ok(surveyed) if surveyed.proven => surveyed,
             Ok(_) => {
                 found
                     .unread
-                    .push((name(), "it proved no node of the fleet".to_owned()));
+                    .push((name(), "it proved no node of the fleet".to_owned(), rm));
                 continue;
             }
             Err(why) => {
-                found
-                    .unread
-                    .push((name(), aterm_codec::tty::one_line(&why.to_string(), 160)));
+                found.unread.push((
+                    name(),
+                    aterm_codec::tty::one_line(&why.to_string(), 160),
+                    rm,
+                ));
                 continue;
             }
         };
@@ -5012,9 +5621,9 @@ fn held_elsewhere(places: &Places) -> HeldElsewhere {
                 && let Some(sid) = field("sid").filter(|sid| {
                     sid.len() <= 64 && aterm_types::control_request::Sid::parse(sid).is_some()
                 })
-                && !held.iter().any(|(_, seen)| seen == sid)
+                && !held.iter().any(|(_, seen, _)| seen == sid)
             {
-                held.push((name(), sid.to_owned()));
+                held.push((name(), sid.to_owned(), rm));
             }
         }
     }
@@ -5022,13 +5631,20 @@ fn held_elsewhere(places: &Places) -> HeldElsewhere {
 }
 
 /// The fleet client of `aterm ctl survey --fleet | --host`
-/// (`aterm_ctl::LocalVerbs::fleet_survey`).
+/// (`aterm_ctl::LocalVerbs::fleet_survey`), each peer read within the survey's bound, or the one
+/// [`SURVEY_WITHIN_SEAM`] names in a test of the binary.
 /// # Errors
 /// This machine holds no fleet key it can read, aterm.toml or the book cannot be read, or
 /// `--host` names more than one peer, or neither a peer nor a host.
-pub fn survey_fleet(ask: &aterm_ctl::FleetAsk<'_>) -> Result<aterm_ctl::FleetRead, String> {
+pub fn survey_fleet(
+    ask: &aterm_ctl::FleetAsk<'_>,
+) -> Result<aterm_ctl::FleetRead, aterm_ctl::FleetRefused> {
     let places = Places::here().map_err(failure_words)?;
-    survey_fleet_in(&places, ask)
+    let ask = aterm_ctl::FleetAsk {
+        within: seamed_within(SURVEY_WITHIN_SEAM, ask.within),
+        ..*ask
+    };
+    survey_fleet_in(&places, &ask)
 }
 
 /// The fleet client of `aterm ctl --host` (`aterm_ctl::LocalVerbs::fleet_drive`): a drive of
@@ -5060,14 +5676,18 @@ fn drive_fleet_in(
         "this machine holds no node key it can read, so it proves no node and drives none: \
          `aterm fleet join` again mints it (on the fleet's issuer, `aterm fleet init`)",
     )?;
-    if member::names_node(me.node(), host) {
-        return Err(format!(
+    let itself = |own: &str| -> aterm_ctl::DriveRefused {
+        format!(
             "`{}` is this machine itself (node {}): its own sessions are driven here with `aterm \
              ctl`, never over the fleet",
             aterm_codec::tty::one_line(host, 80),
-            short(me.node())
+            short(own)
         )
-        .into());
+        .into()
+    };
+    // Its whole id names no other node: refused before any read.
+    if me.node().eq_ignore_ascii_case(host.trim()) {
+        return Err(itself(me.node()));
     }
     let deadline = (Instant::now() + within, within);
     let check = issuer_read_within().min(within);
@@ -5077,27 +5697,29 @@ fn drive_fleet_in(
         host,
         (Instant::now() + check, check),
     );
-    let named = |unread: Option<&Missed>| -> Result<_, aterm_ctl::DriveRefused> {
+    // A Mac's short name (`m102`) binds the one peer it names, by its whole node id.
+    let mut word = host_word(places, host, unread.as_ref())?;
+    if let Some(own) = this_machine_alone(places, &word)? {
+        return Err(itself(&own));
+    }
+    let named = |word: &str, unread: Option<&Missed>| -> Result<_, aterm_ctl::DriveRefused> {
         let known = known_peers(places).map_err(failure_words)?;
         let book: Vec<Peer> = known.peers.into_iter().map(|(peer, _)| peer).collect();
-        let bound = bound_peer(places, host, unread).map_err(failure_words)?;
+        let bound = bound_peer(places, word, unread).map_err(failure_words)?;
         Ok((known.keys, book, bound))
     };
-    let (mut keys, mut book, mut bound) = named(unread.as_ref()).map_err(|refused| {
-        // A word naming the issuer waits on its book: a silent issuer may answer a moment later.
-        let waits = member::read_peers(&places.state)
-            .is_ok_and(|book| loosely_named_issuer(places, &book, host).is_some());
-        match &unread {
-            Some(missed) if missed.silent && waits => aterm_ctl::DriveRefused {
+    let (mut keys, mut book, mut bound) = named(&word, unread.as_ref()).map_err(|refused| {
+        match silent_issuer(places, &word, unread.as_ref()) {
+            Some(missed) => aterm_ctl::DriveRefused {
                 again: true,
                 unserved: missed.unserved,
                 ..refused
             },
-            _ => refused,
+            None => refused,
         }
     })?;
     if matches!(bound, Bound::Nobody) {
-        if let Some(own) = at_own_place(places, host) {
+        if let Some(own) = at_own_place(places, &word) {
             return Err(format!(
                 "`{}` is this machine itself (node {}): its own sessions are driven here with \
                  `aterm ctl`, never over the fleet",
@@ -5108,7 +5730,13 @@ fn drive_fleet_in(
         }
         if !read {
             match copy_again(places, &secret, Some(&me), (Instant::now() + check, check)) {
-                Ok(true) => (keys, book, bound) = named(None)?,
+                Ok(true) => {
+                    word = host_word(places, host, None)?;
+                    if let Some(own) = this_machine_alone(places, &word)? {
+                        return Err(itself(&own));
+                    }
+                    (keys, book, bound) = named(&word, None)?;
+                }
                 Ok(false) => {}
                 Err(why) => unread = Some(why),
             }
@@ -5137,6 +5765,7 @@ fn drive_fleet_in(
                         left: None,
                         unserved: missed.unserved,
                         silent: false,
+                        ungranted: false,
                         why: format!(
                             "{why}; try again once it answers (`aterm fleet peers` says why it \
                              does not)"
@@ -5154,9 +5783,9 @@ fn drive_fleet_in(
                 left: own_node(places).map(aterm_ctl::Left::Book),
                 ..aterm_ctl::DriveRefused::once(format!(
                     "`{shown}` is no Mac this machine's book records (`aterm fleet peers`): a \
-                     drive goes only to a node the book holds, named by its host, node id or \
-                     the address and port it lists, never to whichever member answers at an \
-                     address"
+                     drive goes only to a node the book holds, named by its host, its short \
+                     name (`m102`), node id or the address and port it lists, never to \
+                     whichever member answers at an address"
                 ))
             });
         }
@@ -5170,6 +5799,11 @@ fn drive_fleet_in(
                 left: None,
                 unserved: unserved(&why),
                 silent: drive_silent(&why),
+                ungranted: matches!(
+                    &why,
+                    Unreached::Handshake(_, FleetError::UnknownOp(op))
+                        if op == FleetOp::Drive.word()
+                ),
                 // The peer is named once: a reason that names its host already goes alone.
                 why: if said.contains(&peer.host) {
                     said
@@ -5335,18 +5969,22 @@ fn failure_words(failure: Failure) -> String {
 fn survey_fleet_in(
     places: &Places,
     ask: &aterm_ctl::FleetAsk<'_>,
-) -> Result<aterm_ctl::FleetRead, String> {
+) -> Result<aterm_ctl::FleetRead, aterm_ctl::FleetRefused> {
     let secret = aterm_net::fleet::read_key_file(&places.state).map_err(|e| no_key(places, &e))?;
     let known = known_peers(places).map_err(failure_words)?;
     let mut book: Vec<Peer> = known.peers.into_iter().map(|(peer, _)| peer).collect();
     let me = own_identity(places);
     if let Some(what) = ask.host {
-        if let Some(own) = names_this_machine(places, what) {
-            return Err(format!(
+        let itself = |own: &str| {
+            format!(
                 "`{}` is this machine itself (node {}): `aterm ctl survey` reads its own sessions",
                 aterm_codec::tty::one_line(what, 80),
-                short(&own)
-            ));
+                short(own)
+            )
+        };
+        // Its whole id names no other node: refused before any read.
+        if let Some(own) = own_node(places).filter(|own| own.eq_ignore_ascii_case(what.trim())) {
+            return Err(itself(&own).into());
         }
         let deadline = (Instant::now() + ask.within, ask.within);
         // A member's copy holds no member that joined since its last read: the issuer's book is
@@ -5358,22 +5996,28 @@ fn survey_fleet_in(
             what,
             (Instant::now() + check, check),
         );
+        // A Mac's short name (`m102`) reads the one peer it names, by its whole node id.
+        let mut word = host_word(places, what, missed.as_ref())?;
+        if let Some(own) = this_machine_alone(places, &word)? {
+            return Err(itself(&own).into());
+        }
         let mut keys = known.keys;
         if read {
             let known = known_peers(places).map_err(failure_words)?;
             keys = known.keys;
             book = known.peers.into_iter().map(|(peer, _)| peer).collect();
         }
-        let mut bound = bound_peer(places, what, missed.as_ref()).map_err(failure_words)?;
+        let mut bound = bound_peer(places, &word, missed.as_ref()).map_err(|refused| {
+            aterm_ctl::FleetRefused {
+                unserved: silent_issuer(places, &word, missed.as_ref())
+                    .is_some_and(|missed| missed.unserved),
+                why: failure_words(refused),
+            }
+        })?;
         let mut unread = None;
         if matches!(bound, Bound::Nobody) {
-            if let Some(own) = at_own_place(places, what) {
-                return Err(format!(
-                    "`{}` is this machine itself (node {}): `aterm ctl survey` reads its own \
-                     sessions",
-                    aterm_codec::tty::one_line(what, 80),
-                    short(&own)
-                ));
+            if let Some(own) = at_own_place(places, &word) {
+                return Err(itself(&own).into());
             }
             if read {
                 unread = missed;
@@ -5388,7 +6032,11 @@ fn survey_fleet_in(
                         let known = known_peers(places).map_err(failure_words)?;
                         keys = known.keys;
                         book = known.peers.into_iter().map(|(peer, _)| peer).collect();
-                        bound = bound_peer(places, what, None).map_err(failure_words)?;
+                        word = host_word(places, what, None)?;
+                        if let Some(own) = this_machine_alone(places, &word)? {
+                            return Err(itself(&own).into());
+                        }
+                        bound = bound_peer(places, &word, None).map_err(failure_words)?;
                     }
                     Ok(false) => {}
                     Err(why) => unread = Some(why),
@@ -5400,10 +6048,15 @@ fn survey_fleet_in(
             Bound::Node(peer) | Bound::Unbound(peer) | Bound::ByHand(peer) => peer,
             // A node's word no book here binds is never asked of DNS or multicast DNS as a host.
             Bound::Nobody if member::is_node_word(what) => {
-                return Err(names_no_peer(places, what, unread.as_ref()));
+                return Err(aterm_ctl::FleetRefused {
+                    why: names_no_peer(places, what, unread.as_ref()),
+                    unserved: unread
+                        .as_ref()
+                        .is_some_and(|missed| missed.silent && missed.unserved),
+                });
             }
             Bound::Nobody => {
-                let (host, port) = member::parse_host_port(what, Some(member::DEFAULT_PORT))
+                let (host, port) = member::parse_host_port(what, Some(member::default_port()))
                     .map_err(|why| {
                         format!(
                             "`{}` is no peer this machine knows (`aterm fleet peers`), and no \
@@ -5476,7 +6129,7 @@ fn survey_fleet_in(
         ask.within,
         "survey",
     );
-    let dropped = keep_book(places, &secret, &book_read, own.as_deref());
+    let dropped = keep_book(places, &secret, (&reads, &book_read), own.as_deref());
     // A place this machine's own node answered at is this machine, which its own survey reads.
     let (entries, answers): (Vec<Peer>, Vec<_>) = reads
         .into_iter()
@@ -5507,6 +6160,7 @@ fn survey_fleet_in(
                 fault: aterm_ctl::PeerFault::NotDialled,
                 unproven: false,
                 node: None,
+                addr: None,
             }),
     );
     Ok(aterm_ctl::FleetRead {
@@ -5603,6 +6257,10 @@ fn peer_survey(
             _ => name,
         },
         node: peer.node.clone(),
+        addr: read
+            .as_ref()
+            .ok()
+            .map(|surveyed| surveyed.addr.ip().to_string()),
         fault: read
             .as_ref()
             .err()
@@ -5695,6 +6353,7 @@ fn raise_open_files() {
 /// `[fleet]` as aterm.toml says it now.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct FleetTable {
+    machine: Option<String>,
     listen: Option<String>,
     allow: Option<String>,
     /// Each `[[fleet.peers]]` entry's `host`.
@@ -5770,6 +6429,7 @@ fn fleet_table(text: &str) -> Result<FleetTable, String> {
         })
         .unwrap_or_default();
     Ok(FleetTable {
+        machine: string("machine"),
         listen: string("listen"),
         allow: string("allow"),
         peers,
@@ -5888,17 +6548,29 @@ fn with_level(text: &str, level: &str, drive_from: &[String]) -> Result<Option<S
 /// # Errors
 /// As [`with_fleet`].
 fn without_fleet(text: &str) -> Result<Option<String>, String> {
+    without_fleet_keys(text, &["listen", "allow", "drive_from"])
+}
+
+/// [`without_fleet`] for `keys` of `[fleet]` alone (each `listen`, `allow` or `drive_from`).
+/// # Errors
+/// As [`without_fleet`]'s.
+fn without_fleet_keys(text: &str, keys: &[&str]) -> Result<Option<String>, String> {
     use aterm_toml::edit::DocumentMut;
     let now = fleet_table(text)?;
-    if now.listen.is_none() && now.allow.is_none() && now.drive_from.is_empty() {
+    let set = |key: &str| match key {
+        "listen" => now.listen.is_some(),
+        "allow" => now.allow.is_some(),
+        _ => !now.drive_from.is_empty(),
+    };
+    if !keys.iter().any(|key| set(key)) {
         return Ok(None);
     }
     let mut doc: DocumentMut = text
         .parse()
         .map_err(|e| format!("aterm.toml is not valid TOML, so it is left as it was: {e}"))?;
-    doc.remove_path(&["fleet", "listen"]);
-    doc.remove_path(&["fleet", "allow"]);
-    doc.remove_path(&["fleet", "drive_from"]);
+    for key in keys {
+        doc.remove_path(&["fleet", key]);
+    }
     if doc
         .get("fleet")
         .and_then(aterm_toml::edit::Item::as_table_like)
@@ -5908,9 +6580,9 @@ fn without_fleet(text: &str) -> Result<Option<String>, String> {
     }
     let edited = doc.to_string();
     reads_back(text, &edited, |fleet| {
-        fleet.remove("listen");
-        fleet.remove("allow");
-        fleet.remove("drive_from");
+        for key in keys {
+            fleet.remove(key);
+        }
     })?;
     Ok(Some(edited))
 }
@@ -6013,17 +6685,31 @@ enum Ungrant {
     NewSecret,
 }
 
-/// The line saying `n` drive grants were removed, as `why` says, and what that `left`.
-fn grants_removed(n: usize, why: &str, left: &str) -> String {
+/// The line saying the drive grants `had` were removed, as `why` says, and what that `left`.
+fn grants_removed(had: &[String], why: &str, left: &str) -> String {
     format!(
         "  drive      {} of [fleet] drive_from removed, as {why}: no Mac drives this one \
-         until `aterm fleet allow drive --from <host|node>` grants again{left}\n",
-        if n == 1 {
+         until {} grants again{left}\n",
+        if had.len() == 1 {
             "its grant".to_owned()
         } else {
-            format!("its {n} grants")
-        }
+            format!("its {} grants", had.len())
+        },
+        grants_again(had)
     )
+}
+
+/// The verb that grants a drive again once the grants `had` are gone: `--all` too where the `"*"`
+/// grant was among them.
+fn grants_again(had: &[String]) -> &'static str {
+    if had
+        .iter()
+        .any(|word| word.trim() == aterm_net::fleet::ALL_MEMBERS)
+    {
+        "`aterm fleet allow drive --all` (every member, as before) or `--from <host|node>`"
+    } else {
+        "`aterm fleet allow drive --from <host|node>`"
+    }
 }
 
 /// Write `[fleet] listen` and `allow` beside `held`, with the drive grants out where `ungrant`
@@ -6057,7 +6743,7 @@ fn write_fleet(
     let gone =
         (had > 0 && (ungrant.is_some() || allow != aterm_net::fleet::DRIVE_LEVEL)).then(|| {
             grants_removed(
-                had,
+                &before.drive_from,
                 &match ungrant {
                     Some(Ungrant::OtherFleet) => {
                         "they named the nodes of the fleet this machine held before".to_owned()
@@ -6074,6 +6760,36 @@ fn write_fleet(
             )
         });
     Ok((out, gone))
+}
+
+fn census(places: &Places, args: &[String]) -> Result<String, Failure> {
+    let mut json = false;
+    let mut force_refresh = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--refresh" => force_refresh = true,
+            other => {
+                return Err(Failure::Usage(format!(
+                    "unexpected argument `{other}` (expected `[--json] [--refresh]`)"
+                )));
+            }
+        }
+    }
+    let home = aterm_types::dirs::home_dir();
+    let now_s = aterm_time::unix_secs().unwrap_or(0);
+    let snapshot = crate::fleet_census::read_or_compute_census(
+        &places.state,
+        home.as_deref(),
+        force_refresh,
+        now_s,
+    )
+    .map_err(failed)?;
+    if json {
+        Ok(snapshot.to_json())
+    } else {
+        Ok(snapshot.render_human())
+    }
 }
 
 #[cfg(test)]

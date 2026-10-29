@@ -1532,7 +1532,7 @@ fn redirect_hazard(seg: &[String], i: usize) -> Option<String> {
     }
 }
 
-fn git_subcommand(seg: &[String], git_idx: usize) -> Option<(usize, &str)> {
+pub(crate) fn git_subcommand(seg: &[String], git_idx: usize) -> Option<(usize, &str)> {
     let mut j = git_idx + 1;
     while j < seg.len() {
         let t = seg[j].as_str();
@@ -2763,6 +2763,9 @@ const JQ: Grammar = Grammar {
     operands_read: true,
 };
 
+/// gawk's options (`abbreviates`: its `getopt_long`, REASONED from its manual). macOS awk ignores
+/// every long option, so one reaches this grammar only with its value glued (`--assign=N=P`): a
+/// line the two read otherwise is refused ([`bwk_reads_otherwise`]).
 const AWK: Grammar = Grammar {
     short: &[
         ('F', Val::Text),
@@ -3411,7 +3414,7 @@ fn plain_number(w: &str) -> bool {
 }
 
 fn awk_args_write(args: &[String]) -> Option<String> {
-    let mut programs: Vec<&str> = Vec::new();
+    let mut programs: Vec<(usize, &str)> = Vec::new();
     let mut explicit = false;
     let mut k = 0;
     while k < args.len() {
@@ -3424,13 +3427,15 @@ fn awk_args_write(args: &[String]) -> Option<String> {
             return Some("awk -f (a program file)".to_string());
         }
         if matches!(w, "-e" | "--source") {
-            programs.extend(args.get(k + 1).map(String::as_str));
+            if let Some(p) = args.get(k + 1) {
+                programs.push((k + 1, p));
+            }
             explicit = true;
             k += 2;
             continue;
         }
         if let Some(p) = w.strip_prefix("--source=") {
-            programs.push(p);
+            programs.push((k, p));
             explicit = true;
             k += 1;
             continue;
@@ -3455,16 +3460,63 @@ fn awk_args_write(args: &[String]) -> Option<String> {
         }
         break;
     }
-    if !explicit {
-        programs.push(args.get(k)?);
+    if !explicit && let Some(p) = args.get(k) {
+        programs.push((k, p));
     }
-    if let Some(program) = programs.iter().find(|p| p.contains(SUBSTITUTION)) {
+    let operands = if explicit { k } else { k + 1 };
+    if let Some(why) = bwk_reads_otherwise(args, &programs, operands) {
+        return Some(why);
+    }
+    if let Some((_, program)) = programs.iter().find(|(_, p)| p.contains(SUBSTITUTION)) {
         return Some(format!("awk: a program this check cannot read ({program})"));
     }
     programs
         .iter()
-        .any(|p| awk_program_writes(p))
+        .any(|(_, p)| awk_program_writes(p))
         .then(|| "awk writes (system, a redirect or a pipe in the program)".to_string())
+}
+
+/// Why macOS awk (BWK 20200816) reads `args` otherwise than gawk, whose reading [`awk_args_write`]
+/// made (`programs`, each with its word's index, and `operands`, the index of the first operand),
+/// if it does. BWK takes each word that starts with `-` for an option until `--` or a plain word,
+/// reads `-F` and `-v` (the value glued or the next word) and `-f`, and ignores every other one as
+/// one word, a long option and `-e` included; its program is the next word and each later word an
+/// operand (MEASURED 2026-10-23 and 2026-10-29 on `/usr/bin/awk`: `awk --field-separator
+/// 'BEGIN{system("touch m1")}' in.txt` printed `unknown option --field-separator ignored` and made
+/// `m1`, `--assign` the same; `awk --source='{print}' 'BEGIN{system("touch m3")}'` made `m3`; `awk
+/// -e '{print}' -e key` read `-e` and `key` as files). A line the two read differently is refused,
+/// so the program checked is the one either runs.
+fn bwk_reads_otherwise(
+    args: &[String],
+    programs: &[(usize, &str)],
+    operands: usize,
+) -> Option<String> {
+    let mut j = 0;
+    while let Some(w) = args.get(j).filter(|w| w.starts_with('-') && w.len() > 1) {
+        if w == "--" {
+            j += 1;
+            break;
+        }
+        j += if matches!(w.as_str(), "-F" | "-v") {
+            2
+        } else {
+            1
+        };
+    }
+    let agree = match args.get(j) {
+        Some(_) => matches!(programs, [(at, _)] if *at == j) && operands == j + 1,
+        None => programs.is_empty(),
+    };
+    (!agree).then(|| {
+        let option = args
+            .iter()
+            .find(|w| (w.starts_with("--") && w.len() > 2) || *w == "-e")
+            .map_or("-e", String::as_str);
+        format!(
+            "awk {option}: macOS awk (BWK) reads its words otherwise than gawk (it ignores \
+             every long option and -e, and runs the next word as its program)"
+        )
+    })
 }
 
 fn awk_program_writes(p: &str) -> bool {
@@ -3881,29 +3933,95 @@ pub(crate) fn program_words(src: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
-fn program_words_nested(src: &str) -> Vec<(Vec<String>, bool)> {
+fn program_words_nested(src: &str) -> Vec<NestedSegment> {
+    scan_words(src).segments
+}
+
+/// A segment's quote-resolved words and whether it lies inside a substitution.
+type NestedSegment = (Vec<String>, bool);
+
+/// A segment's words and the first glob character the shell may expand in
+/// them ([`command_words_globbed`]).
+pub(crate) type GlobbedSegment = (Vec<String>, Option<char>);
+
+/// What [`scan_words`] reads off a line.
+struct Scanned {
+    /// [`program_words_nested`]'s segments.
+    segments: Vec<NestedSegment>,
+    /// Beside each segment, the first glob character the shell may expand in
+    /// its words (an unquoted, unescaped `*`, `?` or `[`, or one in an
+    /// unquoted parameter expansion such as `$*`, `$?` or `${x:-*}`, as
+    /// [`unquoted_glob`] counts them) or in a `$(…)` or backquoted
+    /// substitution among them, whose output becomes its words.
+    globs: Vec<Option<char>>,
+    /// The text of every parameter expansion outside single quotes
+    /// ([`expanded_parameters`]).
+    params: Vec<String>,
+}
+
+fn scan_words(src: &str) -> Scanned {
     let chars: Vec<char> = src.chars().collect();
     let mut scan = WordScan {
         chars: &chars,
         i: 0,
         segments: Vec::new(),
+        globs: Vec::new(),
+        params: Vec::new(),
         seg: Vec::new(),
         cur: String::new(),
         in_word: false,
         nest: 0,
+        glob: None,
     };
     scan.run(None);
-    scan.segments
+    Scanned {
+        segments: scan.segments,
+        globs: scan.globs,
+        params: scan.params,
+    }
+}
+
+/// The text of every parameter expansion `line` holds outside single quotes, a substitution's
+/// among them: a name (`HOME`, `1`), a braced body (`x:-*`, `#x`, `!x`), and every name a braced
+/// body expands in turn (`TOKEN` of `${x:-$TOKEN}`), the name after zsh's `=`, `^`, `+` or `~`
+/// flags among them (`TOKEN` of `$=TOKEN`). The special parameters (`$?`, `$@`, …) are none.
+///
+/// # Errors
+///
+/// The line's lexing refusal ([`prelex`]).
+pub(crate) fn expanded_parameters(line: &str) -> Result<Vec<String>, String> {
+    Ok(scan_words(&strip_alarm_idiom(&prelex(line)?)).params)
+}
+
+/// [`command_words`], each segment with the first glob character the shell
+/// may expand in its own words or in a substitution nested in them
+/// ([`scan_words`]). A glob in one command of a pipeline or a list is never
+/// another's words; a substitution's output is its parent's.
+pub(crate) fn command_words_globbed(line: &str) -> Result<Vec<GlobbedSegment>, String> {
+    let Scanned {
+        segments, globs, ..
+    } = scan_words(&strip_alarm_idiom(&prelex(line)?));
+    Ok(segments
+        .into_iter()
+        .map(|(seg, _)| seg)
+        .zip(globs)
+        .collect())
 }
 
 struct WordScan<'a> {
     chars: &'a [char],
     i: usize,
     segments: Vec<(Vec<String>, bool)>,
+    /// Beside each of `segments`, its glob ([`scan_words`]).
+    globs: Vec<Option<char>>,
+    /// [`Scanned::params`].
+    params: Vec<String>,
     seg: Vec<String>,
     cur: String,
     in_word: bool,
     nest: usize,
+    /// The current segment's first glob.
+    glob: Option<char>,
 }
 
 impl WordScan<'_> {
@@ -3915,41 +4033,64 @@ impl WordScan<'_> {
     }
     fn end_seg(&mut self) {
         self.end_word();
+        let glob = self.glob.take();
         if !self.seg.is_empty() {
             self.segments
                 .push((std::mem::take(&mut self.seg), self.nest > 0));
+            self.globs.push(glob);
         }
     }
     fn nested(&mut self, stop: char) {
         let seg = std::mem::take(&mut self.seg);
         let cur = std::mem::take(&mut self.cur);
+        let glob = self.glob.take();
+        let inner = self.globs.len();
         self.in_word = false;
         self.nest += 1;
         self.run(Some(stop));
         self.nest -= 1;
         self.seg = seg;
         self.cur = cur;
+        self.glob = glob.or_else(|| self.globs[inner..].iter().find_map(|g| *g));
         self.cur.push_str(SUBSTITUTION);
         self.in_word = true;
     }
     fn mark_parameter(&mut self) {
         self.i += 1;
+        let flags = self.chars[self.i..]
+            .iter()
+            .take_while(|c| matches!(c, '=' | '^' | '+' | '~'))
+            .count();
+        if flags > 0
+            && self
+                .chars
+                .get(self.i + flags)
+                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '{'))
+        {
+            self.i += flags;
+        }
         match self.chars.get(self.i) {
             Some('{') => {
                 self.i += 1;
+                let from = self.i;
                 while self.i < self.chars.len() && self.chars[self.i] != '}' {
                     self.i += 1;
                 }
+                let body: String = self.chars[from..self.i].iter().collect();
+                self.params.extend(scan_words(&body).params);
+                self.params.push(body);
                 if self.i < self.chars.len() {
                     self.i += 1;
                 }
             }
             Some(&c) if c.is_ascii_alphanumeric() || c == '_' => {
+                let from = self.i;
                 while self.i < self.chars.len()
                     && (self.chars[self.i].is_ascii_alphanumeric() || self.chars[self.i] == '_')
                 {
                     self.i += 1;
                 }
+                self.params.push(self.chars[from..self.i].iter().collect());
             }
             Some('@' | '*' | '#' | '?' | '$' | '!' | '-') => self.i += 1,
             _ => {
@@ -4028,7 +4169,16 @@ impl WordScan<'_> {
                     self.i += 2;
                     self.nested(')');
                 }
-                '$' => self.mark_parameter(),
+                '$' => {
+                    let from = self.i + 1;
+                    self.mark_parameter();
+                    if self.glob.is_none() {
+                        self.glob = self.chars[from.min(self.i)..self.i]
+                            .iter()
+                            .copied()
+                            .find(|c| matches!(c, '*' | '?' | '['));
+                    }
+                }
                 '`' if stop == Some('`') => {
                     self.i += 1;
                     self.end_seg();
@@ -4075,6 +4225,9 @@ impl WordScan<'_> {
                     self.i += 1;
                 }
                 _ => {
+                    if matches!(c, '*' | '?' | '[') && self.glob.is_none() {
+                        self.glob = Some(c);
+                    }
                     self.cur.push(c);
                     self.in_word = true;
                     self.i += 1;

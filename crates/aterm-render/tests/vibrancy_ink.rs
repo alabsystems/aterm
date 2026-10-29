@@ -32,6 +32,15 @@ fn bg_alpha_is_rounded_and_monotone() {
         let o = i as f32 / 100.0;
         assert!(is_translucent(o) && bg_quad_alpha(o) < 255, "opacity={o}");
     }
+    let below_one = f32::from_bits(1.0_f32.to_bits() - 1);
+    for o in [0.9985, 0.999, below_one] {
+        assert!(is_translucent(o), "opacity={o} below 1.0 is translucent");
+        assert_eq!(
+            bg_quad_alpha(o),
+            254,
+            "translucent opacity={o} must stay below solid 255"
+        );
+    }
 }
 
 #[test]

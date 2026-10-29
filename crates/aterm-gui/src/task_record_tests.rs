@@ -714,6 +714,78 @@ fn a_workers_needs_you_entry_raises_the_task_records_attention() {
     assert_eq!(flag(), before, "a person's entry is not the task's news");
 }
 
+/// A WAIT IS NO TASK NEWS: `await task` wakes on a worker done, exited, stalled or needing a
+/// person, and a wait it sits out is none of those. So a `kind=wait` entry leaves the record's
+/// attention down and its rev where it stood, under codex-alab's own wait owner
+/// (`codex-alab-wait`, no task owner) and under the task owners alike (aterm's harness waiting
+/// out a limit under `supervisor`, a wait under `codex-alab` or `needs`); an ask turned into a
+/// wait takes the attention down. NEGATIVE CONTROL: the same words as an ask under a task owner
+/// raise it and move the rev, and `codex-alab-wait` moves nothing whatever its kind.
+#[test]
+fn a_kind_wait_entry_never_raises_the_task_records_attention() {
+    use crate::session_timeline::{MetaEdit, write_attention_kind};
+    use aterm_types::needs::AttentionKind;
+    let handle = crate::session_store::test_handle(4);
+    let ctx = &handle.ctx;
+    let write = |owner: &str, edit: MetaEdit<'_>, kind: Option<AttentionKind>| {
+        write_attention_kind(ctx, owner, edit, kind, aterm_slog::Actor::Harness).unwrap();
+    };
+    let flag = || {
+        let r = ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .task()
+            .cloned()
+            .expect("a task");
+        (r.rev, r.attention)
+    };
+    let (wait, ask) = (Some(AttentionKind::Wait), Some(AttentionKind::Ask));
+    let words = "waiting out the usage limit \u{b7} resets 15:00";
+    let codex_wait = "codex-alab-wait";
+    let supervisor = crate::harness_host::ATTENTION_OWNER;
+    let owners = [
+        codex_wait,
+        crate::task_record::SELF_CLAIM_ATTENTION_OWNER,
+        supervisor,
+        crate::harness_host::NEEDS_ATTENTION_OWNER,
+    ];
+    assert!(!crate::task_record::owner_moves_task(codex_wait));
+    mark_session_task(ctx, 4, &TaskMark::new(TaskState::Working)).expect("unfenced");
+    let before = flag();
+    assert_eq!(before, (1, false));
+    for owner in owners {
+        write(owner, MetaEdit::Set(words), wait);
+        assert_eq!(flag(), before, "{owner}'s wait is no news");
+    }
+    for owner in owners {
+        write(owner, MetaEdit::Clear, None);
+    }
+    assert_eq!(flag(), before, "and its clearing is none");
+
+    write(codex_wait, MetaEdit::Set(words), ask);
+    assert_eq!(flag(), before, "codex-alab-wait is no task owner");
+    write(codex_wait, MetaEdit::Clear, None);
+    write(supervisor, MetaEdit::Set(words), ask);
+    assert_eq!(flag(), (2, true), "the same limit as an ask raises it");
+    write(supervisor, MetaEdit::Set(words), wait);
+    assert_eq!(
+        flag(),
+        (3, false),
+        "the ask turned into a wait takes it down"
+    );
+    write(
+        crate::task_record::SELF_CLAIM_ATTENTION_OWNER,
+        MetaEdit::Set("box: Allow this command?"),
+        None,
+    );
+    assert_eq!(
+        flag(),
+        (4, true),
+        "codex-alab's ask, no kind named, raises it"
+    );
+}
+
 #[test]
 fn the_task_verb_reads_marks_and_refuses_an_edge_the_mark() {
     let handle = crate::session_store::test_handle(5);
@@ -1628,6 +1700,7 @@ fn the_repair_cas_still_matches_after_a_fact_edit() {
             uuid: "a-1".to_string(),
         },
         transcript: dir.path().join("t.jsonl"),
+        from: aterm_agent::harness::result::Conversation::Transcript,
     };
     let repaired = |bump: bool| {
         let handle = crate::session_store::test_handle(14);

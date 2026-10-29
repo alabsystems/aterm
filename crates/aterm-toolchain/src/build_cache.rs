@@ -180,6 +180,132 @@ pub enum BuildDir {
     TrustEnv(String),
 }
 
+/// The explicit target and manifest a managed build already chose. This is observation only:
+/// creating or owning a directory belongs to the package manager, never to this resolver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplicitCache {
+    pub target: PathBuf,
+    pub manifest: PathBuf,
+}
+
+/// Resolve an explicit target without moving a build or calling Cargo metadata. Help, clean,
+/// unknown aliases, unverified-lane refusals and custom directory configs grant no creation.
+#[must_use]
+pub fn explicit_cache(args: &[String], tool: Tool, m: &Machine<'_>) -> Option<ExplicitCache> {
+    let home = m.home?;
+    let cwd = m.cwd?;
+    if !home.is_absolute() || !cwd.is_absolute() || !cwd.starts_with(home) {
+        return None;
+    }
+    if (m.env)(BUILD_DIR_ENV).is_some() {
+        return None;
+    }
+    if args.iter().take_while(|a| a.as_str() != "--").any(|a| {
+        matches!(
+            a.as_str(),
+            "-h" | "--help" | "help" | "-V" | "--version" | "clean"
+        )
+    }) {
+        return None;
+    }
+    let root = m.root.map_or_else(|| cache_root(home), Path::to_path_buf);
+    let at = usize::from(tool == Tool::Cargo && args.first().is_some_and(|a| a.starts_with('+')));
+    let line = Line::read(&args[at..], tool, home, &root)?;
+    let cargo_home = (m.env)("CARGO_HOME")
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| home.join(".cargo"), PathBuf::from);
+    let mut alias_builds = false;
+    for dir in cwd
+        .ancestors()
+        .map(|p| p.join(".cargo"))
+        .chain([cargo_home])
+    {
+        let named = config_scan(&dir, line.alias.as_deref(), m);
+        if named.build {
+            return None;
+        }
+        alias_builds |= named.alias_builds;
+    }
+    if line.alias.is_some() && !alias_builds {
+        return None;
+    }
+    let absolute = |path: PathBuf| {
+        let path = if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
+        (!path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir))
+        .then(|| path.components().collect::<PathBuf>())
+    };
+    let target = line
+        .target_dir
+        .map(PathBuf::from)
+        .or_else(|| (m.env)("CARGO_TARGET_DIR").map(PathBuf::from))
+        .or_else(|| (m.env)("CARGO_BUILD_TARGET_DIR").map(PathBuf::from))?;
+    if target.as_os_str().is_empty() {
+        return None;
+    }
+    let manifest = match line.manifest_path {
+        Some(path) => absolute(PathBuf::from(path))?,
+        None => cwd
+            .ancestors()
+            .take_while(|p| p.starts_with(home) && *p != home)
+            .take(32)
+            .map(|p| p.join("Cargo.toml"))
+            .find(|p| (m.read)(p).is_ok_and(|text| text.is_some()))?,
+    };
+    Some(ExplicitCache {
+        target: absolute(target)?,
+        manifest,
+    })
+}
+
+/// A configuration can select a target without an argv or environment target. When this
+/// observer cannot resolve that choice, its caller must retain whole-cache ownership rather
+/// than letting a managed writer use an older owner's cache without observing the new owner.
+#[must_use]
+pub fn unresolved_directory(args: &[String], m: &Machine<'_>) -> bool {
+    if (m.env)(BUILD_DIR_ENV).is_some() {
+        return true;
+    }
+    let mut words = args.iter().map(String::as_str);
+    while let Some(word) = words.next() {
+        if word == "--" {
+            break;
+        }
+        if word.starts_with("-C") {
+            return true;
+        }
+        let config = if word == "--config" {
+            words.next()
+        } else {
+            word.strip_prefix("--config=")
+        };
+        if config.is_some_and(|value| !value.contains('=') || names_a_dir(value)) {
+            return true;
+        }
+    }
+    let (Some(home), Some(cwd)) = (m.home, m.cwd) else {
+        return true;
+    };
+    if !cwd.starts_with(home) {
+        return true;
+    }
+    let cargo_home = (m.env)("CARGO_HOME")
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| home.join(".cargo"), PathBuf::from);
+    cwd.ancestors()
+        .map(|path| path.join(".cargo"))
+        .chain([cargo_home])
+        .any(|dir| {
+            let named = config_scan(&dir, None, m);
+            named.target || named.build
+        })
+}
+
 /// Decide the build-cache placement ([`BuildDir::Cache`], [`BuildDir::Target`]).
 #[must_use]
 pub fn decide(args: &[String], tool: Tool, m: &Machine<'_>) -> Option<BuildDir> {
@@ -305,6 +431,8 @@ struct Line {
     trust: bool,
     /// A `--target-dir` before `--`.
     target_dir: Option<String>,
+    /// The last explicit manifest, before `--`, independent of the launcher's cwd.
+    manifest_path: Option<String>,
     /// A verb cargo does not build by itself, which builds only as an alias that does.
     alias: Option<String>,
 }
@@ -324,6 +452,7 @@ impl Line {
         let mut verb = (tool == Tool::Tippy).then_some("tippy");
         let mut unverified = false;
         let mut target_dir = None;
+        let mut manifest_path = None;
         let mut it = args.iter().map(String::as_str);
         while let Some(a) = it.next() {
             let ok = match a {
@@ -333,13 +462,17 @@ impl Line {
                     true
                 }
                 "--config" => it.next().is_some_and(config_ok),
-                "--manifest-path" => it.next().is_some_and(manifest_ok),
+                "--manifest-path" => it.next().is_some_and(|v| {
+                    manifest_path = Some(v.to_owned());
+                    manifest_ok(v)
+                }),
                 "--target-dir" => it.next().map(|v| target_dir = Some(v.to_owned())).is_some(),
                 "-Z" | "--color" | "--explain" => verb.is_some() || it.next().is_some(),
                 _ => {
                     if let Some(v) = a.strip_prefix("--config=") {
                         config_ok(v)
                     } else if let Some(v) = a.strip_prefix("--manifest-path=") {
+                        manifest_path = Some(v.to_owned());
                         manifest_ok(v)
                     } else if let Some(v) = a.strip_prefix("--target-dir=") {
                         target_dir = Some(v.to_owned());
@@ -370,6 +503,7 @@ impl Line {
             cache,
             trust,
             target_dir,
+            manifest_path,
             alias,
         })
     }

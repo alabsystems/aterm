@@ -436,6 +436,142 @@ fn the_report_reads_the_sidecars_and_turns_ratios_into_failures() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A Settings frame's grid is its cursor scene card, a small part of the window: the page the
+/// caret is judged on is the card's, the grid's most common colour, not the window chrome that
+/// fills the most of the frame (the negative control).
+#[test]
+fn a_cards_caret_is_judged_on_the_cards_page_not_the_window() {
+    const CHROME: Rgb = [0xd8, 0xd8, 0xd9];
+    const CARD: Grid = Grid {
+        ox: 10,
+        oy: 12,
+        cw: 6,
+        ch: 10,
+        rows: 3,
+        cols: 8,
+        source: "dims",
+    };
+    let (w, h) = (80, 60);
+    let mut frame = Image::from_pixels(w, h, vec![CHROME; w * h]);
+    let card = PxBox {
+        x0: CARD.ox,
+        y0: CARD.oy,
+        x1: CARD.ox + CARD.cols * CARD.cw,
+        y1: CARD.oy + CARD.rows * CARD.ch,
+    };
+    paint(&mut frame, card, PAGE);
+    paint(&mut frame, CARD.cell_box(1, 3, 1), CARET);
+    assert_eq!(frame.most_common(), CHROME, "negative control");
+    assert_eq!(grid_page(&frame, &CARD), PAGE);
+    let dir = scratch("card-page");
+    let png = dir.join("x-light-settings.motion-0300.png");
+    std::fs::write(&png, encode_rgb(&frame)).unwrap();
+    std::fs::write(
+        dir.join("x-light-settings.motion-0300.dims.txt"),
+        "OK 3 8 48 30 cell_w=6 cell_h=10 pad=10 pad_top=12 head=0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("x-light-settings.motion-0300.cursor.txt"),
+        "OK 1 3 1 blinking_block\n",
+    )
+    .unwrap();
+    let png_s = png.to_string_lossy().into_owned();
+    let r = report(&parse_args(&args(&[&png_s, "--no-clean", "--row", "0"])).unwrap()).unwrap();
+    assert_eq!(r.get("page").and_then(J::as_str), Some(hex(PAGE).as_str()));
+    let caret = r.get("caret").unwrap();
+    assert_eq!(
+        caret.get("contrast").and_then(J::as_f64),
+        Some(round_to(contrast(CARET, PAGE), 2))
+    );
+}
+
+/// An icon caret in a halo that fills its cell (Laser's bolt) reads by its ink against the closer of
+/// page and halo, not by the halo the cell's median falls in (the wash, the negative control). A speck
+/// of ink under [`CARET_INK_SHARE`] does not lift the reading, a halo near the ink holds it down, and a
+/// flash that fills most of its cell reads against the page, not against its own soft edge.
+#[test]
+fn an_icon_caret_reads_by_its_ink_against_the_halo_it_sits_in() {
+    const HALO: Rgb = [0x43, 0x41, 0x40];
+    const NEAR: Rgb = [0x60, 0x60, 0x60];
+    const BOLT: Rgb = [0xcd, 0xb6, 0xf8];
+    const FLASH: Rgb = [0xf4, 0xee, 0xff];
+    const FRINGE: Rgb = [0x7b, 0x6d, 0x92];
+    let (row, col) = (1, 3);
+    let cell = GRID.cell_box(row, col, 1);
+    let lit = |halo: Rgb, ink: PxBox, colour: Rgb| {
+        let mut frame = Image::from_pixels(W, H, vec![PAGE; W * H]);
+        paint(&mut frame, cell, halo);
+        paint(&mut frame, ink, colour);
+        measure_caret(&frame, &GRID, row, col, PAGE)
+    };
+    let caret = |halo: Rgb, ink: PxBox| lit(halo, ink, BOLT);
+    let read = |c: &J, k: &str| c.get(k).and_then(J::as_f64).unwrap();
+    let bolt = PxBox {
+        x0: cell.x0 + 1,
+        y0: cell.y0 + 1,
+        x1: cell.x0 + 4,
+        y1: cell.y0 + 9,
+    };
+    let speck = PxBox {
+        x0: bolt.x0,
+        y0: bolt.y0,
+        x1: bolt.x0 + 1,
+        y1: bolt.y0 + 2,
+    };
+    assert!(contrast(HALO, PAGE) < LEGIBLE && contrast(BOLT, HALO) >= LEGIBLE);
+
+    let icon = caret(HALO, bolt);
+    assert_eq!(
+        read(&icon, "contrast"),
+        round_to(contrast(BOLT, PAGE).min(contrast(BOLT, HALO)), 2)
+    );
+    assert!(read(&icon, "contrast") >= LEGIBLE);
+    assert_eq!(
+        icon.get("ground").and_then(J::as_str),
+        Some(hex(HALO).as_str())
+    );
+    assert_eq!(
+        read(&icon, "wash_contrast"),
+        round_to(contrast(HALO, PAGE), 2),
+        "negative control: the cell's median is the halo"
+    );
+
+    let dot = caret(HALO, speck);
+    assert_eq!(
+        read(&dot, "contrast"),
+        round_to(contrast(HALO, PAGE), 2),
+        "a speck reads as the wash"
+    );
+
+    assert!(contrast(NEAR, PAGE) < contrast(BOLT, PAGE).sqrt());
+    let near = caret(NEAR, bolt);
+    assert_eq!(read(&near, "contrast"), round_to(contrast(BOLT, NEAR), 2));
+    assert!(
+        read(&near, "contrast") < LEGIBLE && contrast(BOLT, PAGE) >= LEGIBLE,
+        "a halo near the ink holds the reading down though the ink reads against the page"
+    );
+
+    assert!(contrast(FRINGE, PAGE) < contrast(FLASH, PAGE).sqrt());
+    assert!(
+        contrast(FLASH, FRINGE) < LEGIBLE,
+        "negative control: the edge would hold it down"
+    );
+    let flash = lit(
+        FRINGE,
+        PxBox {
+            y0: cell.y0 + 1,
+            ..cell
+        },
+        FLASH,
+    );
+    assert_eq!(
+        flash.get("ground").and_then(J::as_str),
+        Some(hex(PAGE).as_str())
+    );
+    assert_eq!(read(&flash, "contrast"), round_to(contrast(FLASH, PAGE), 2));
+}
+
 #[test]
 fn the_report_renders_one_cell_per_line_and_parses_back() {
     let dir = scratch("render");

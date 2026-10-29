@@ -35,34 +35,73 @@ pub(crate) fn dir_in(parent: &Path, prefix: &str) -> Dir {
 }
 
 impl Drop for Dir {
+    /// Removed as a build cache pass removes a stage ([`crate::build_cache::remove::tree`]): no
+    /// one entry a test left unremovable (a folder without its owner's bits, a `deny delete`
+    /// ACL) keeps the rest. What that leaves (the remover under test failing) is unlocked and
+    /// removed without it ([`unlock`]), so a failed test leaves no scratch a plain remover
+    /// cannot remove.
     fn drop(&mut self) {
-        if std::fs::remove_dir_all(&self.path).is_err() {
-            restore_owner_access(&self.path);
+        if !crate::build_cache::remove::tree(&self.path).whole() {
+            unlock(&self.path);
             let _ = std::fs::remove_dir_all(&self.path);
         }
     }
 }
 
-/// Give `dir` and every directory under it (never through a symlink) its owner's
-/// `rwx` back, so `remove_dir_all` can empty them.
+/// Give `at` and every entry under it, never through a link, its owner's access back by path,
+/// with nothing of the build cache's remover, a folder before what it holds and never by
+/// recursion (a tree of any depth unlocks in one frame): each folder its owner's `rwx` and each
+/// file its owner's `rw`, then on macOS each one's extended ACL cleared: `/bin/chmod -N`, and
+/// `-h -N` on a link (its own ACL, never its target's). `-h` opens what it names, so it refuses an
+/// entry that denies its own reading, which plain `-N` clears.
 #[cfg(unix)]
-fn restore_owner_access(dir: &Path) {
+fn unlock(at: &Path) {
     use std::os::unix::fs::PermissionsExt as _;
-    let Ok(meta) = std::fs::symlink_metadata(dir) else {
-        return;
-    };
-    if !meta.is_dir() {
-        return;
-    }
-    let mode = meta.permissions().mode() | 0o700;
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode));
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        restore_owner_access(&entry.path());
+    let mut stack = vec![at.to_path_buf()];
+    while let Some(at) = stack.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&at) else {
+            continue;
+        };
+        let owner = if meta.is_dir() {
+            0o700
+        } else if meta.is_file() {
+            0o600
+        } else {
+            0
+        };
+        if owner != 0 {
+            let mode = meta.permissions().mode() | owner;
+            let _ = std::fs::set_permissions(&at, std::fs::Permissions::from_mode(mode));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use aterm_uds::spawnfd::Stdio;
+            let mut chmod = aterm_uds::spawnfd::command("/bin/chmod");
+            if meta.file_type().is_symlink() {
+                chmod.arg("-h");
+            }
+            let _ = chmod
+                .arg("-N")
+                .arg(&at)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        if meta.is_dir() {
+            stack.extend(
+                std::fs::read_dir(&at)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| e.path()),
+            );
+        }
     }
 }
 
 #[cfg(not(unix))]
-fn restore_owner_access(_: &Path) {}
+const fn unlock(_: &Path) {}
 
 impl Deref for Dir {
     type Target = PathBuf;
@@ -138,4 +177,46 @@ pub(crate) fn each_side_by_side<T: Sync>(items: &[T], case: impl Fn(usize, &T) +
             std::panic::resume_unwind(panic);
         }
     });
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::path::Path;
+
+    /// A chain of `levels` folders named `d` under `top`, each at 0o500 (its owner may not
+    /// remove what it holds).
+    fn sealed_chain(top: &Path, levels: usize) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut deep = top.to_path_buf();
+        for _ in 0..levels {
+            deep.push("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        while deep != top {
+            std::fs::set_permissions(&deep, std::fs::Permissions::from_mode(0o500)).unwrap();
+            deep.pop();
+        }
+    }
+
+    /// THE SCRATCH'S FALLBACK UNLOCKS A TREE OF ANY DEPTH IN ONE FRAME: a chain of 300 folders
+    /// each at 0o500 is given its owner's bits back by [`super::unlock`] on a thread of 128 KiB
+    /// of stack (one frame a folder runs out of it), and then goes by a plain remover.
+    /// NEGATIVE CONTROL: an identical chain refuses `std::fs::remove_dir_all`.
+    #[test]
+    fn the_fallback_unlocks_a_tree_of_any_depth_in_one_frame() {
+        let dir = super::dir("testdir-unlock-deep");
+        let (top, control) = (dir.join("top"), dir.join("control"));
+        sealed_chain(&top, 300);
+        sealed_chain(&control, 300);
+        assert!(std::fs::remove_dir_all(&control).is_err());
+
+        let at = top.clone();
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || super::unlock(&at))
+            .unwrap()
+            .join()
+            .unwrap();
+        std::fs::remove_dir_all(&top).unwrap();
+    }
 }

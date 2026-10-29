@@ -59,6 +59,10 @@ fn damage_iterator_size_hint_after_exhaustion() {
     assert_eq!(iter.next(), Some(5));
     assert_eq!(iter.next(), None);
     assert_eq!(iter.size_hint(), (0, Some(0)));
+
+    let mut inverted = DamagedRowIterator::Full { current: 5, max: 3 };
+    assert_eq!(inverted.size_hint(), (0, Some(0)));
+    assert_eq!(inverted.next(), None);
 }
 
 #[test]

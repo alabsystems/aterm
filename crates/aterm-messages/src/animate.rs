@@ -479,15 +479,6 @@ pub fn ease_out_quad(u: u32) -> u32 {
     u32::try_from(ONE - ((v * v) >> 16)).unwrap_or(u32::MAX)
 }
 
-/// The bell: `4u(1 − u)`, 0 at both ends and 1 in the middle.
-#[inline]
-#[must_use]
-#[cfg(test)]
-pub(crate) fn bell(u: u32) -> u32 {
-    let u = u64::from(u).min(ONE);
-    u32::try_from((4 * u * (ONE - u)) >> 16).unwrap_or(u32::MAX)
-}
-
 /// `t` as a Q16 fraction of `span`, clamped to [0, 1].
 #[inline]
 fn frac(t: Duration, span: Duration) -> u32 {
@@ -893,9 +884,6 @@ mod tests {
         assert_eq!(breath(65_536), 65_536);
         assert_eq!(ease_out_cubic(0), 0);
         assert_eq!(ease_out_cubic(65_536), 65_536);
-        assert_eq!(bell(0), 0);
-        assert_eq!(bell(65_536), 0);
-        assert_eq!(bell(32_768), 65_536);
         assert_eq!(ease_out_quad(0), 0);
         assert_eq!(ease_out_quad(65_536), 65_536);
         assert_eq!(ease_out_quad(32_768), 49_152, "three quarters at half time");

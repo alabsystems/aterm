@@ -2021,6 +2021,92 @@ fn sync_window_refit_gate_latches_once_a_share_exists() {
     );
 }
 
+/// Press in `wid`'s front terminal and drag across "hello", the button still down.
+pub(crate) fn start_selection_drag(app: &mut App, wid: WindowId) {
+    let terminal = app.front_terminal(wid).expect("front terminal");
+    crate::term_lock(&terminal.term).process(b"hello world");
+    app.windows.get_mut(&wid).expect("window").last_mouse_cell = (0, 0);
+    app.begin_selection(wid, aterm_core::selection::SelectionType::Simple);
+    app.drag_selection(wid, 0, 4);
+    assert!(
+        app.windows[&wid].selecting,
+        "fixture: a drag is in progress"
+    );
+}
+
+#[test]
+fn a_selection_drag_goes_on_while_a_tab_closes_behind_it() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let behind = app.next_session_id;
+    app.push_stub_tab(wid, stub_session(behind));
+    let front = app.next_session_id;
+    app.push_stub_tab(wid, stub_session(front));
+    start_selection_drag(&mut app, wid);
+
+    assert!(app.close_session_by_id(behind).is_ok());
+    assert_eq!(app.focused_session_id(wid), Some(front));
+    assert!(
+        app.windows[&wid].selecting,
+        "a tab closing behind the front leaves the drag going"
+    );
+    app.drag_selection(wid, 0, 10);
+    app.finish_selection(wid, true);
+    assert_eq!(
+        crate::term_lock(&app.front_terminal(wid).expect("front terminal").term)
+            .selection_to_string()
+            .as_deref(),
+        Some("hello worl"),
+        "the drag went on past where it was when the tab closed"
+    );
+
+    start_selection_drag(&mut app, wid);
+    app.switch_tab_in(wid, 0);
+    assert!(
+        !app.windows[&wid].selecting,
+        "control: a tab switch ends the drag"
+    );
+}
+
+#[test]
+fn a_selection_drag_ends_when_its_pane_is_re_laid() {
+    let wid = WindowId(0);
+    let side_by_side = || {
+        let mut app = App::headless_for_test();
+        let sibling = app.split_active_stub_tab(wid);
+        app.focus_pane(crate::pane::FocusDir::Left);
+        assert_eq!(app.focused_session_id(wid), Some(0), "fixture: left pane");
+        (app, sibling)
+    };
+
+    let (mut app, _) = side_by_side();
+    start_selection_drag(&mut app, wid);
+    app.toggle_pane_zoom_in(wid);
+    assert!(
+        !app.windows[&wid].selecting,
+        "a zoom re-lays the pane, so the drag ends rather than map the pointer onto a new grid"
+    );
+
+    let (mut app, sibling) = side_by_side();
+    start_selection_drag(&mut app, wid);
+    assert!(app.exit_session_logical(sibling).is_empty());
+    assert!(
+        !app.windows[&wid].selecting,
+        "a pane beside it closing re-lays it (even while its take-back is held), so the drag ends"
+    );
+
+    let mut app = App::headless_for_test();
+    let below = app.split_active_stub_tab_dir(wid, crate::pane::SplitDir::Horizontal);
+    app.focus_pane(crate::pane::FocusDir::Up);
+    assert_eq!(app.focused_session_id(wid), Some(0), "fixture: top pane");
+    start_selection_drag(&mut app, wid);
+    assert!(app.exit_session_logical(below).is_empty());
+    assert!(
+        !app.windows[&wid].selecting,
+        "a pane below it closing re-lays it too"
+    );
+}
+
 #[test]
 fn copy_on_select_fires_only_on_completed_drag_when_enabled() {
     use aterm_core::selection::{SelectionSide, SelectionType};
@@ -3175,11 +3261,29 @@ fn the_title_drift_gate_fires_for_a_newly_labeling_window_and_not_otherwise() {
     }
     let later = quiet + std::time::Duration::from_millis(500);
     app.observe_title_drift(0, later);
+    assert_eq!(
+        app.title_drift.last_flush.get(&0).copied(),
+        Some(later),
+        "past the debounce interval, a newly labeling window flushes at once"
+    );
     assert!(
-        app.title_drift.last_flush.get(&0).copied() != flushed_at
-            || app.title_drift.pending.contains(&0),
-        "a window that started labeling this session since the last flush \
-         was not refreshed — its tab keeps a stale label"
+        !app.title_drift.pending.contains(&0),
+        "an immediate flush leaves nothing pending"
+    );
+
+    if let Some(ws) = app.windows.get_mut(&wid) {
+        ws.tab_title_epochs.remove(&0);
+    }
+    let debounced = later + std::time::Duration::from_millis(10);
+    app.observe_title_drift(0, debounced);
+    assert_eq!(
+        app.title_drift.last_flush.get(&0).copied(),
+        Some(later),
+        "within the debounce interval, the gate defers the flush"
+    );
+    assert!(
+        app.title_drift.pending.contains(&0),
+        "within the debounce interval, the session is marked pending"
     );
 }
 

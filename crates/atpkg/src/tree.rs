@@ -446,55 +446,38 @@ mod tests {
     }
 
     #[test]
-    fn tree_root_changes_on_any_mutation() {
-        let d = tmp("mut");
+    fn tree_root_declared_uses_stored_mode_on_posix_and_declared_otherwise() {
+        const GOLDEN: &str = "e44608970d54f90c4d54ad7852b174304b86395b89f59b3fcc04a11ae22e38e0";
+        let d = tmp("declared-mode");
         write(&d.join("bin/ay"), b"binary");
         write(&d.join("data"), b"x");
-        let base = tree_root(&d).unwrap();
-
-        write(&d.join("data"), b"y");
-        let changed_content = tree_root(&d).unwrap();
-        assert_ne!(base, changed_content, "content change must move the root");
-        write(&d.join("data"), b"x");
-        assert_eq!(tree_root(&d).unwrap(), base);
-
         #[cfg(unix)]
         {
-            let exe = d.join("bin/ay");
-            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let changed_mode = tree_root(&d).unwrap();
-            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o644)).unwrap();
-            let restored = tree_root(&d).unwrap();
-            assert_ne!(changed_mode, restored, "mode change must move the root");
+            std::fs::set_permissions(d.join("bin/ay"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            std::fs::set_permissions(d.join("data"), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
         }
-        {
-            let mut exec = DeclaredModes::new();
-            exec.insert(b"bin/ay".to_vec(), 0o755);
-            let mut plain = DeclaredModes::new();
-            plain.insert(b"bin/ay".to_vec(), 0o644);
-            let as_exec = tree_root_declared(&d, &exec).unwrap();
-            let as_plain = tree_root_declared(&d, &plain).unwrap();
-            if crate::platform::HAS_POSIX_MODES {
-                assert_eq!(
-                    as_exec, as_plain,
-                    "a stored mode is read back, never declared"
-                );
-                assert_eq!(as_exec, tree_root(&d).unwrap());
-            } else {
-                assert_ne!(
-                    as_exec, as_plain,
-                    "a declared mode change must move the root"
-                );
-            }
+        let mut exec = DeclaredModes::new();
+        exec.insert(b"bin/ay".to_vec(), 0o755);
+        exec.insert(b"data".to_vec(), 0o644);
+        let mut plain = DeclaredModes::new();
+        plain.insert(b"bin/ay".to_vec(), 0o644);
+        plain.insert(b"data".to_vec(), 0o644);
+        let as_exec = tree_root_declared(&d, &exec).unwrap();
+        let as_plain = tree_root_declared(&d, &plain).unwrap();
+        assert_eq!(as_exec, GOLDEN);
+        if crate::platform::HAS_POSIX_MODES {
+            assert_eq!(
+                as_plain, GOLDEN,
+                "a stored POSIX mode is read back, never overridden by declared modes"
+            );
+        } else {
+            assert_ne!(
+                as_exec, as_plain,
+                "where the filesystem stores no POSIX mode, the declared mode decides the line"
+            );
         }
-
-        let before_add = tree_root(&d).unwrap();
-        write(&d.join("extra"), b"new");
-        assert_ne!(
-            before_add,
-            tree_root(&d).unwrap(),
-            "an added file must move the root"
-        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

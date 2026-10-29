@@ -52,12 +52,16 @@ impl Paths {
         self.state_dir.join("acaffiene-code.noindex")
     }
 
+    /// The folder of the session-only launchd plists ([`Self::session_plist`]).
+    #[must_use]
+    pub fn session_dir(&self) -> PathBuf {
+        self.state_dir.join("acaffiene")
+    }
+
     /// Session-only launchd plist when Enable at Startup is off.
     #[must_use]
     pub fn session_plist(&self, label: &str) -> PathBuf {
-        self.state_dir
-            .join("acaffiene")
-            .join(format!("{label}.plist"))
+        self.session_dir().join(format!("{label}.plist"))
     }
 
     /// Where launchd finds the jobs it loads at every login: `~/Library/LaunchAgents`.

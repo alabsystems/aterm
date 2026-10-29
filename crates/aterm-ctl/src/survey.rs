@@ -84,6 +84,8 @@ pub struct PeerSurvey {
     pub unproven: bool,
     /// The node the read asked for, when the book names one.
     pub node: Option<String>,
+    /// The address it answered at, where it answered.
+    pub addr: Option<String>,
 }
 
 /// Failure category for a fleet peer query ([`fleet_note`]).
@@ -116,8 +118,33 @@ pub struct FleetRead {
     pub alone: Option<String>,
 }
 
+/// Why a [`FleetSurveyFn`] read no peer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FleetRefused {
+    /// The refusal, cause first.
+    pub why: String,
+    /// The issuer whose book says which Mac `--host` names took the connection and sent no fleet
+    /// handshake in time: exit 2, as a drive's.
+    pub unserved: bool,
+}
+
+impl std::fmt::Display for FleetRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
+impl From<String> for FleetRefused {
+    fn from(why: String) -> Self {
+        Self {
+            why,
+            unserved: false,
+        }
+    }
+}
+
 /// Fleet survey callback linked by the `aterm` binary.
-pub type FleetSurveyFn = fn(&FleetAsk<'_>) -> Result<FleetRead, String>;
+pub type FleetSurveyFn = fn(&FleetAsk<'_>) -> Result<FleetRead, FleetRefused>;
 
 /// Whether `parts` asks for `survey`.
 pub(crate) fn is_survey(parts: &[String]) -> bool {
@@ -217,6 +244,13 @@ pub(crate) struct Survey {
     pub(crate) header: Fields,
     /// One record per session, in the server's order.
     pub(crate) sessions: Vec<Fields>,
+    /// One record per account row of the instance's pools (`account` lines), where its header
+    /// counts them (`accounts=<n>`); `None` from an aterm that says nothing of its accounts (one
+    /// older than the field).
+    pub(crate) accounts: Option<Vec<Fields>>,
+    /// The pools whose rows its instance could not read (`accounts_unread=`), which a reader
+    /// takes as unknown, never as none.
+    pub(crate) unread: Vec<String>,
 }
 
 /// A record's `key=value` fields in wire order, values decoded.
@@ -252,14 +286,24 @@ impl Fields {
 pub(crate) fn parse_reply(lines: &[String]) -> Result<Survey, String> {
     let mut survey = Survey::default();
     let mut header = false;
+    let mut accounts = Vec::new();
     for line in lines {
         if line.starts_with("instance ") {
             survey.header = Fields::of(line);
             header = true;
         } else if line.starts_with("session ") {
             survey.sessions.push(Fields::of(line));
+        } else if line.starts_with("account ") {
+            accounts.push(Fields::of(line));
         }
     }
+    survey.accounts = survey.header.number("accounts").map(|_| accounts);
+    survey.unread = survey
+        .header
+        .get("accounts_unread")
+        .map_or_else(Vec::new, |pools| {
+            pools.split(',').map(str::to_owned).collect()
+        });
     if header {
         Ok(survey)
     } else {
@@ -328,6 +372,15 @@ fn class_of(s: &Fields) -> Class {
     } else {
         Class::Shell
     }
+}
+
+/// How many of `survey`'s sessions are at work, as its header line counts them (`N busy`).
+pub(crate) fn busy_sessions(survey: &Survey) -> usize {
+    survey
+        .sessions
+        .iter()
+        .filter(|s| class_of(s) == Class::Busy)
+        .count()
 }
 
 /// Urgency rank of a decoded session record (`0` = most pressing).
@@ -436,6 +489,114 @@ fn fit_place(label: &str, cap: usize) -> String {
         return format!("{name}{tail}");
     }
     format!("{}{tail}", fit(&name, cap.saturating_sub(n(&tail)).max(1)))
+}
+
+/// An account row's label as a survey carries and shows it: itself, or, where it holds an `@`
+/// (an email, which no row's label is: `accounts.toml`'s grammar refuses one), its first two
+/// characters and `…@…`, so no email crosses the fleet or reaches a screen.
+#[must_use]
+pub fn masked_label(label: &str) -> String {
+    if !label.contains('@') {
+        return label.to_owned();
+    }
+    let head: String = label.chars().take_while(|c| *c != '@').take(2).collect();
+    format!("{head}\u{2026}@\u{2026}")
+}
+
+/// A label a reply's account row names, as [`accounts_line`] shows it: a peer's that is no plain
+/// word is `?`, but where it is an email, masked.
+fn label_shown(label: &str, remote: bool) -> String {
+    if !remote || is_word(label) {
+        shown(&masked_label(label), 32)
+    } else if label.contains('@') {
+        shown(&masked_label(label), 8)
+    } else {
+        "?".to_owned()
+    }
+}
+
+/// When an account row's wall ends (`walled_until=`, Unix seconds), in Unix milliseconds on its
+/// instance's clock, as its header's `at_ms=`.
+pub(crate) fn walled_until_ms(row: &Fields) -> Option<u64> {
+    row.number("walled_until").map(|s| s.saturating_mul(1000))
+}
+
+/// What one account row says, for [`accounts_line`]: its label (`id=`), and its windows where it
+/// can take a session, else why not (`walled 3h` from the instance's own clock, `at_ms=`, which a
+/// wall that ended by then no longer stands on: its rows may be read up to a minute before it
+/// answers).
+fn account_said(row: &Fields, at_ms: Option<u64>, remote: bool) -> String {
+    let label = label_shown(row.get("id").unwrap_or("?"), remote);
+    let condition = row.get("condition");
+    if row.get("enrolled") == Some("0") || condition == Some("not-enrolled") {
+        return format!("{label} not enrolled");
+    }
+    match condition {
+        Some("limited") => match walled_until_ms(row).zip(at_ms) {
+            Some((until, at)) if until <= at => {}
+            stands => {
+                let left =
+                    stands.map_or_else(String::new, |(until, at)| format!(" {}", age(until - at)));
+                return format!("{label} walled{left}");
+            }
+        },
+        Some("signed-out") => return format!("{label} signed out"),
+        _ => {}
+    }
+    let mut said = label;
+    let mut figures = false;
+    for (key, window) in [("pct7", "7d"), ("pct5", "5h")] {
+        if let Some(pct) = row.number(key) {
+            said.push_str(&format!(" {window} {pct}%"));
+            figures = true;
+        }
+    }
+    match condition {
+        Some("low") => said.push_str(" low"),
+        Some("limited") if !figures => said.push_str(" wall ended"),
+        Some(word) if !figures => {
+            said.push(' ');
+            said.push_str(if !remote || is_word(word) { word } else { "?" });
+        }
+        _ => {}
+    }
+    said
+}
+
+/// The one line a block's header is followed by where its instance lists account rows: each
+/// pool's rows in the order it sent them, then each pool it could not read (`  accounts: claude
+/// main 7d 42% 5h 10%, work-2 walled 3h · codex codex-1 not enrolled · grok unread`), cut to
+/// [`LINE_CHARS`]; `None` where it lists none or said nothing of them.
+fn accounts_line(survey: &Survey, remote: bool) -> Option<String> {
+    let rows = survey.accounts.as_ref()?;
+    if rows.is_empty() && survey.unread.is_empty() {
+        return None;
+    }
+    let at_ms = survey.header.number("at_ms");
+    let pool_shown = |p: &str| shown(if !remote || is_word(p) { p } else { "?" }, 16);
+    let mut pools: Vec<(String, Vec<String>)> = Vec::new();
+    for row in rows {
+        let pool = pool_shown(row.get("pool").unwrap_or("?"));
+        let said = account_said(row, at_ms, remote);
+        match pools.iter_mut().find(|(name, _)| *name == pool) {
+            Some((_, said_of)) => said_of.push(said),
+            None => pools.push((pool, vec![said])),
+        }
+    }
+    pools.extend(
+        survey
+            .unread
+            .iter()
+            .map(|pool| (pool_shown(pool), vec!["unread".to_owned()])),
+    );
+    let pools: Vec<String> = pools
+        .into_iter()
+        .map(|(program, rows)| format!("{program} {}", rows.join(", ")))
+        .collect();
+    Some(fit(
+        &format!("  accounts: {}", pools.join(" \u{b7} ")),
+        LINE_CHARS,
+    ))
 }
 
 fn header_line(reply: &HostReply, survey: &Survey) -> String {
@@ -1116,8 +1277,12 @@ fn blocks_of(replies: &[HostReply], own: Option<&str>) -> Blocks {
                     })
                     .collect();
                 entries.sort_by_key(|entry| entry.class);
+                let header = header_line(reply, survey);
                 Ok(Block {
-                    header: header_line(reply, survey),
+                    header: match accounts_line(survey, reply.remote) {
+                        Some(accounts) => format!("{header}\n{accounts}"),
+                        None => header,
+                    },
                     entries,
                 })
             }
@@ -1263,6 +1428,8 @@ pub(crate) fn render_sid(replies: &[HostReply], sid: &str, own: Option<&str>) ->
                 for row in value.split('\n') {
                     out.push_str(&format!("  rows: {}\n", shown(row, EXCERPT_CHARS * 4)));
                 }
+            } else if key == "account" {
+                out.push_str(&format!("  account: {}\n", shown(&masked_label(value), 64)));
             } else {
                 out.push_str(&format!("  {key}: {}\n", shown(value, EXCERPT_CHARS * 4)));
             }
@@ -1337,20 +1504,28 @@ pub(crate) fn sid_not_found(replies: &[HostReply], sid: &str, fleet: bool) -> St
 
 /// Render replies as a single-line JSON array (`--json`).
 pub(crate) fn render_json(replies: &[HostReply]) -> String {
-    let object = |fields: &Fields| {
+    // Each record as an object, its `masked` key (a session's `account`, an account row's `id`)
+    // as `masked_label` shows it, so a peer's email never reaches the page.
+    let object_masking = |fields: &Fields, masked: &str| {
         let members: Vec<String> = fields
             .0
             .iter()
             .map(|(k, v)| {
+                let v = if k == masked {
+                    masked_label(v)
+                } else {
+                    v.clone()
+                };
                 format!(
                     "\"{}\":\"{}\"",
                     aterm_codec::json::escape(k),
-                    aterm_codec::json::escape(v)
+                    aterm_codec::json::escape(&v)
                 )
             })
             .collect();
         format!("{{{}}}", members.join(","))
     };
+    let object = |fields: &Fields| object_masking(fields, "account");
     let hosts: Vec<String> = replies
         .iter()
         .map(|reply| {
@@ -1366,8 +1541,18 @@ pub(crate) fn render_json(replies: &[HostReply]) -> String {
             );
             match &reply.answer {
                 Ok(survey) => format!(
-                    "{{{head},\"instance\":{},\"sessions\":[{}]}}",
+                    "{{{head},\"instance\":{},\"accounts\":{},\"sessions\":[{}]}}",
                     object(&survey.header),
+                    survey.accounts.as_ref().map_or_else(
+                        || "null".to_owned(),
+                        |rows| format!(
+                            "[{}]",
+                            rows.iter()
+                                .map(|row| object_masking(row, "id"))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )
+                    ),
                     survey
                         .sessions
                         .iter()
@@ -1494,7 +1679,7 @@ pub(crate) fn read_survey(
         let peers = peers.map(|asked| {
             asked
                 .join()
-                .unwrap_or_else(|_| Err("the fleet client failed".to_string()))
+                .unwrap_or_else(|_| Err("the fleet client failed".to_string().into()))
         });
         (here, peers)
     });
@@ -1519,15 +1704,21 @@ pub(crate) fn read_survey(
                 alone = read.alone;
                 read.peers
             }
-            Err(why) if args.host.is_some() => {
-                return Printed::refused(format!("ERR survey: {why}"), 1);
+            Err(refused) if args.host.is_some() => {
+                let code = if refused.unserved {
+                    crate::EXIT_UNREACHABLE
+                } else {
+                    1
+                };
+                return Printed::refused(format!("ERR survey: {}", refused.why), code);
             }
-            Err(why) => vec![PeerSurvey {
+            Err(refused) => vec![PeerSurvey {
                 label: "the fleet".to_string(),
-                answer: Err(why),
+                answer: Err(refused.why),
                 fault: PeerFault::NotDialled,
                 unproven: false,
                 node: None,
+                addr: None,
             }],
         };
         notes.extend(fleet_note(&peers).map(str::to_owned));

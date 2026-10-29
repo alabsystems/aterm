@@ -32,8 +32,7 @@ pub(super) const LAUNCHER_MINT: Rule = Rule {
 fn launcher_mint(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     for file in tree.corpus.under(PRODUCT) {
         if LAUNCHERS.iter().any(|l| file.rel.starts_with(l))
-            || !file.rel.contains("/src/")
-            || crate::is_test_file(Path::new(&file.rel))
+            || (crate::is_test_file(Path::new(&file.rel)) && !file.rel.contains("/benches/"))
             || !file.mentions(&[MINT])
         {
             continue;
@@ -108,6 +107,9 @@ mod tests {
             &LAUNCHER_MINT,
             &[
                 ("crates/aterm-pty/src/lib.rs", mints),
+                ("crates/aterm-pty/build.rs", mints),
+                ("crates/aterm-pty/examples/demo.rs", mints),
+                ("crates/aterm-pty/benches/perf.rs", mints),
                 ("crates/aterm-pty/src/unix_tests.rs", mints),
                 ("crates/aterm-pty/tests/smoke.rs", mints),
                 ("crates/aterm-gui/src/lib.rs", mints),
@@ -118,14 +120,28 @@ mod tests {
                 ),
             ],
         );
-        assert_eq!(spots(&found), ["crates/aterm-pty/src/lib.rs:1"]);
+        assert_eq!(
+            spots(&found),
+            [
+                "crates/aterm-pty/benches/perf.rs:1",
+                "crates/aterm-pty/build.rs:1",
+                "crates/aterm-pty/examples/demo.rs:1",
+                "crates/aterm-pty/src/lib.rs:1",
+            ]
+        );
     }
 
     #[test]
     fn a_shipped_table_enabling_the_feature_is_found_and_a_dev_edge_is_not() {
         let text = "[package]\nname = \"x\"\n\n[features]\nopen = [\"aterm-cap/launcher-mint\"]\n\
-                    weak = [\"aterm-cap?/launcher-mint\"]\nfine = []\n\n[dependencies]\n\
-                    aterm-cap = { workspace = true, features = [\"launcher-mint\"] }\n\n\
+                    weak = [\"aterm-cap?/launcher-mint\"]\nalias = [\"cap/launcher-mint\"]\n\
+                    fine = []\n\n[dependencies]\n\
+                    aterm-cap = { workspace = true, features = [\"launcher-mint\"] }\n\
+                    cap = { package = \"aterm-cap\", path = \"../aterm-cap\", features = [\"launcher-mint\"] }\n\n\
+                    [dependencies.cap_dotted]\n\
+                    package = \"aterm-cap\"\n\
+                    path = \"../aterm-cap\"\n\
+                    features = [\"launcher-mint\"]\n\n\
                     [target.'cfg(unix)'.dependencies]\n\
                     aterm-cap = { path = \"../aterm-cap\", features = [\"launcher-mint\"] }\n\n\
                     [dev-dependencies]\n\
@@ -133,7 +149,7 @@ mod tests {
         let found =
             crate::scan_set::shipped_feature_enablers(text, "crates/x/Cargo.toml", CAP, FEATURE)
                 .expect("parses");
-        assert_eq!(found.len(), 4, "{found:?}");
+        assert_eq!(found.len(), 7, "{found:?}");
         assert!(found.iter().all(|f| !f.contains("dev-dependencies")));
     }
 

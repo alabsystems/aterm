@@ -24,6 +24,8 @@ fn cli(id: &'static str, state: State, mark: Mark, fact: &str) -> AiCli {
         fact: fact.to_string(),
         path: None,
         version: Some("1.2.3".to_string()),
+        offers_fix: state.needs_act(true),
+        mend: None,
     }
 }
 
@@ -61,8 +63,16 @@ fn reading() -> AiReading {
                     "grok",
                     State::Off,
                     Mark::Note,
-                    "not installed: an opt-in program, installed only where asked (`aterm pkg \
-                     install grok`)",
+                    "[packages] exclude names it",
+                )
+            },
+            AiCli {
+                version: None,
+                ..cli(
+                    "kimi",
+                    State::Off,
+                    Mark::Note,
+                    "uninstalled here on purpose (`aterm pkg install kimi` brings it back)",
                 )
             },
         ],
@@ -357,6 +367,194 @@ fn the_lines_name_each_cli_that_needs_you_and_leave_claude_to_accounts() {
         ai_entries(&r, false).is_empty(),
         "a due Claude login is accounts v2's"
     );
+}
+
+/// A CODEX ROW THAT OFFERS NO FIX ASKS NOTHING OF ANYONE: the window's reading carries whether
+/// each row offers a fix ([`AiReading::of`]), and a signed-out or due Codex row that offers none
+/// (nothing here signs it in: another Mac's warm set holds it, or its login still works and only
+/// Codex's own sign-in renews it) raises no entry, offers no Sign in and is not said to need you,
+/// so no press opens a tab whose `aterm ai login codex` refuses. CONTROL: the same rows with
+/// their fix raise their entry and offer Sign in.
+#[test]
+fn a_codex_row_that_offers_no_fix_asks_nothing_of_anyone() {
+    let codex = connector::connector("codex").expect("a connection");
+    let (local, notes) = config::read("[ai]\npreferred = \"codex\"\n");
+    let settings = config::resolve(&local, None, None, notes);
+    for state in [State::SignedOut, State::Due(2_000_000)] {
+        for fix in [None, Some("aterm ai login codex".to_string())] {
+            let offered = fix.is_some();
+            let look = aterm_agent::ai::cli::Look {
+                settings: settings.clone(),
+                facts: Vec::new(),
+                rows: vec![aterm_agent::ai::state::Row {
+                    connector: codex,
+                    wanted: true,
+                    state,
+                    mark: Mark::Fail,
+                    fact: "what the look saw".to_string(),
+                    actor: offered.then_some(aterm_agent::ai::state::Actor::Person),
+                    fix,
+                    mend: None,
+                    version: None,
+                    plan: None,
+                    used: None,
+                    renew_by: None,
+                    limited_until: None,
+                }],
+                store_note: None,
+                asker: aterm_agent::ai::permission::Asker::Person,
+                held: None,
+            };
+            let reading = AiReading::of(&look, 1_000_000, Some(0));
+            let case = format!("{state:?}, offered {offered}");
+            assert_eq!(
+                keys(&ai_entries(&reading, false)),
+                if offered {
+                    vec![format!("ai.codex.{}", state.word())]
+                } else {
+                    Vec::new()
+                },
+                "{case}"
+            );
+            let ai = AiState {
+                enabled: true,
+                looking: false,
+                choices: AiChoices::of(&settings),
+                reading: Some(reading),
+                unavailable: None,
+            };
+            let sign_in = offered.then_some(AiAct::SignIn);
+            assert_eq!(
+                ai.actionable_cli("codex").and_then(AiCli::act),
+                sign_in,
+                "{case}"
+            );
+            let p = ai.projection(true);
+            let row = p.clis.iter().find(|row| row.id == "codex").expect("a row");
+            assert_eq!(row.act, sign_in, "{case}");
+            assert_eq!(
+                p.health.starts_with(codex.product),
+                offered,
+                "{case}: {}",
+                p.health
+            );
+        }
+    }
+}
+
+/// A CLAUDE ROW WHOSE SIGN-IN STARTS NOTHING OFFERS NO SIGN IN AND STILL NEEDS YOU: where
+/// accounts.toml is refused, `aterm ai login claude` only says so, so the row the agent's look
+/// judges ([`aterm_agent::ai::state::assess`]) offers no command but a person's step
+/// ([`aterm_agent::ai::state::Row::mend`]), and the window raises no entry and offers no Sign in,
+/// while the card's first line says Claude Code needs you, the row's fact says why and its detail
+/// names the step. CONTROL: the same row with no roster, whose sign-in asks a person for the
+/// account's email, raises its entry and offers Sign in, and names no step of its own.
+#[test]
+fn a_claude_row_whose_sign_in_starts_nothing_offers_no_sign_in() {
+    use aterm_agent::ai::facts::{ClaudeAccounts, Facts, Managed};
+    let claude = connector::connector("claude").expect("a connection");
+    let (local, notes) = config::read("[ai]\npreferred = \"claude\"\n");
+    let settings = config::resolve(&local, None, None, notes);
+    let view = |refused: Option<&str>| ClaudeAccounts {
+        label: "main".to_string(),
+        listed: false,
+        refused: refused.map(str::to_string),
+        unread: None,
+        renews: false,
+        login: None,
+        made: false,
+        state: None,
+        renew_by: None,
+        limited_until: None,
+        served_at: None,
+        renewed_at: None,
+        signed_out_at: None,
+        next_sign_in: None,
+        tried: None,
+        unattended: false,
+        off: None,
+    };
+    for refused in [Some("row 1: no label"), None] {
+        let offered = refused.is_none();
+        let facts = Facts {
+            connector: claude,
+            kept: None,
+            managed: Some(Managed {
+                path: PathBuf::from("/pkg/agents/claude"),
+                version: None,
+            }),
+            foreign: None,
+            home: Ok(PathBuf::from("/home/me/.claude")),
+            home_var: None,
+            home_exists: false,
+            login_file: None,
+            hidden_store: false,
+            profile_signed_in: false,
+            plan: None,
+            accounts: Some(view(refused)),
+            limited_until: None,
+            record: aterm_agent::ai::store::Record::default(),
+            env_credentials: Vec::new(),
+            pool: None,
+        };
+        let row = aterm_agent::ai::state::assess(&facts, true, 1_000_000);
+        assert_eq!(row.state, State::SignedOut, "{}", row.fact);
+        let look = aterm_agent::ai::cli::Look {
+            settings: settings.clone(),
+            facts: vec![facts],
+            rows: vec![row],
+            store_note: None,
+            asker: aterm_agent::ai::permission::Asker::Person,
+            held: None,
+        };
+        let reading = AiReading::of(&look, 1_000_000, Some(0));
+        let case = format!("refused {refused:?}");
+        let cli = reading.cli("claude").expect("claude");
+        assert_eq!(cli.offers_fix, offered, "{case}");
+        assert_eq!(
+            cli.fact.contains("accounts.toml is refused"),
+            !offered,
+            "{case}: {}",
+            cli.fact
+        );
+        assert_eq!(
+            keys(&ai_entries(&reading, false)),
+            if offered {
+                vec!["ai.claude.signed-out".to_string()]
+            } else {
+                Vec::new()
+            },
+            "{case}"
+        );
+        let ai = AiState {
+            enabled: true,
+            looking: false,
+            choices: AiChoices::of(&settings),
+            reading: Some(reading),
+            unavailable: None,
+        };
+        let sign_in = offered.then_some(AiAct::SignIn);
+        assert_eq!(
+            ai.actionable_cli("claude").and_then(AiCli::act),
+            sign_in,
+            "{case}"
+        );
+        let p = ai.projection(true);
+        let row = p.clis.iter().find(|row| row.id == "claude").expect("a row");
+        assert_eq!(row.act, sign_in, "{case}");
+        assert!(
+            p.health.starts_with("Claude Code needs you"),
+            "{case}: {}",
+            p.health
+        );
+        let step = "mend accounts.toml (`aterm harness accounts` says how), then sign claude in";
+        assert_eq!(
+            row.detail.ends_with(step),
+            !offered,
+            "{case}: {}",
+            row.detail
+        );
+    }
 }
 
 /// Shell launch lines quote the executable path and refuse control characters or unsafe expansions.

@@ -200,8 +200,9 @@ pub fn watched_past(seen: &Seen, now: i64) -> bool {
 /// in front of the chains' window, captured until its chip is drawn where its program draws one,
 /// and its `autopilot` line (title and all) kept in [`Window::held`](super::Window::held)
 /// ([`NOT_IN_STRIP`] where its label was not in the strip, `-` where `chrome` held no line for
-/// it); then the tab labelled `back` (the chains' window's front tab), or where the run has none
-/// the tab selected before the look, in front again.
+/// it, nothing where that `chrome` read failed: the next pass looks again); then the tab labelled
+/// `back` (the chains' window's front tab), or where the run has none the tab selected before the
+/// look, in front again.
 pub(in crate::forever) fn look_step(door: &Door<'_>, tab: &mut Tab, back: Option<&str>) {
     if !tab.chain.same_reply() {
         return;
@@ -219,23 +220,31 @@ pub(in crate::forever) fn look_step(door: &Door<'_>, tab: &mut Tab, back: Option
     let t = now_ms();
     let line = read
         .as_ref()
-        .map_or_else(|| NOT_IN_STRIP.to_string(), |(_, l)| l.clone());
-    let nodes = if read.is_some() {
+        .map_or_else(|| Ok(NOT_IN_STRIP.to_string()), |(_, l)| l.clone());
+    let nodes = if matches!(read, Some((_, Ok(_)))) {
         ax_of(&door.out(&["chrome"]), &tab.sid)
     } else {
         "-".to_string()
     };
+    let shown = match &line {
+        Ok(l) => one_line(l, 400),
+        Err(e) => format!(
+            "its line unread, the next pass looks again: {}",
+            one_line(e, 400)
+        ),
+    };
     println!(
-        "  [{}] +{} held    in front {} s past its hold ({}): {}",
+        "  [{}] +{} held    in front {} s past its hold ({}): {shown}",
         tab.chain.name(),
         at(tab.t0, t),
         (t - stall) / 1000,
         read.as_ref()
-            .map_or("not in the front window's strip", |(said, _)| said.as_str()),
-        one_line(&line, 400)
+            .map_or("not in the front window's strip", |(said, _)| said.as_str())
     );
-    tab.seen.window.held.push((t, line));
-    tab.seen.window.held_ax.push((t, nodes));
+    if let Ok(line) = line {
+        tab.seen.window.held.push((t, line));
+        tab.seen.window.held_ax.push((t, nodes));
+    }
     if let Some(label) = restore
         && let Some(i) = strip_tabs(&door.out(&["chrome"]))
             .into_iter()

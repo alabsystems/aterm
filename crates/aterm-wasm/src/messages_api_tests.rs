@@ -1581,7 +1581,28 @@ fn the_web_band_is_the_native_golden() {
     );
 }
 
-fn post_page_rows(t: &mut AtermTerminal, t0: Instant) -> Vec<String> {
+fn engine_page_export(
+    t: &AtermTerminal,
+    tag: &str,
+    problems: bool,
+    offset_s: i64,
+    wall: u64,
+) -> String {
+    let desk = WebDesk {
+        now_unix_ms: wall,
+        utc_offset_s: offset_s,
+    };
+    let filter = MessagesFilter {
+        tag: (!tag.is_empty()).then(|| tag.to_string()),
+        warn_only: problems,
+    };
+    let lines = page::wire_lines(&MessagesState::of(&t.band.center, &desk), &filter);
+    format!("OK {}\n{}", lines.len(), lines.join("\n"))
+}
+
+#[test]
+fn the_web_page_is_the_engines_page() {
+    let (mut t, t0) = clocked(20, 80);
     for (i, line) in [
         "post ci Build finished -- 12 tests\\nall green",
         "post ci sev=warn hold=5 Disk nearly full -- 2 GB left",
@@ -1594,88 +1615,37 @@ fn post_page_rows(t: &mut AtermTerminal, t0: Instant) -> Vec<String> {
         assert!(reply.starts_with("OK "), "{reply}");
     }
     let _ = t.messages_tick_at(t0 + ms(1000));
-    let at = stamp().unix_ms;
-    let wall = at + 90_000;
-    let rev = t.band.center.revision();
-    vec![
-        format!(
-            "page\trev={rev}\tnow={wall}\ttotal=3\tshown=3\tall=3\tproblems=2\tstatus=3 messages{}",
-            page_chrome(3, 2, None)
-        ),
-        "chip\ttag=deploy\twords=Deploy\tcount=1\ton=0\tlabel=Deploy \u{00b7} 1".to_string(),
-        "chip\ttag=ci\twords=CI\tcount=2\ton=0\tlabel=CI \u{00b7} 2".to_string(),
-        format!(
-            "entry\tid=3\tat={at}\twhen=1 min ago\tlocal=Today 2:13:20 PM\ttag=deploy\ttag_words=Deploy\tsev=error\tsev_words=Error\tmark=\u{2715}\ttitle=Deploy failed\tstate=held\tstate_words=showing now\trep=1\tdescription=Error, Deploy, 1 minute ago\tsentence=exit 1\ttechnical=see the job log\tmeta=Today 2:13:20 PM \u{00b7} showing now\tcopy=Deploy failed\\n2026-09-21 14:13:20 UTC \u{00b7} deploy \u{00b7} error\\nexit 1\\nsee the job log"
-        ),
-        format!(
-            "entry\tid=2\tat={at}\twhen=1 min ago\tlocal=Today 2:13:20 PM\ttag=ci\ttag_words=CI\tsev=warn\tsev_words=Warning\tmark=\u{26a0}\ttitle=Disk nearly full\tstate=held\tstate_words=showing now\trep=1\tdescription=Warning, CI, 1 minute ago\tsentence=2 GB left\ttechnical=\tmeta=Today 2:13:20 PM \u{00b7} showing now\tcopy=Disk nearly full\\n2026-09-21 14:13:20 UTC \u{00b7} ci \u{00b7} warn\\n2 GB left"
-        ),
-        format!(
-            "entry\tid=1\tat={at}\twhen=1 min ago\tlocal=Today 2:13:20 PM\ttag=ci\ttag_words=CI\tsev=info\tsev_words=Info\tmark=\u{2139}\ttitle=Build finished\tstate=recorded\tstate_words=recorded\trep=1\tdescription=Info, CI, 1 minute ago\tsentence=12 tests\ttechnical=all green\tmeta=Today 2:13:20 PM \u{00b7} recorded\tcopy=Build finished\\n2026-09-21 14:13:20 UTC \u{00b7} ci \u{00b7} info\\n12 tests\\nall green"
-        ),
-    ]
-}
-
-fn page_chrome(all: usize, problems: usize, chip: Option<&str>) -> String {
-    let on = u8::from(chip.is_none());
-    let current = chip.unwrap_or("All");
-    format!(
-        "\theading=Messages\tsubtitle=What aterm reported, newest first.\tall_words=All \u{00b7} {all}\tproblems_words=Problems \u{00b7} {problems}\tall_tags=All tags\tall_tags_on={on}\ttag_menu=Tag: {current}\ttag_menu_name=Filter by tag: {current}\tcopy_all_button=Copy All\tcopy_all_name=Copy All shown messages\tempty=Nothing yet.\ttechnical_caption=Technical details\tcopy_button=Copy"
-    )
-}
-
-#[test]
-fn the_web_page_is_the_engines_page() {
-    let (mut t, t0) = clocked(20, 80);
-    let want = post_page_rows(&mut t, t0);
     let wall = stamp().unix_ms + 90_000;
-    assert_eq!(
-        t.messages_page_at("", false, 0, wall),
-        format!("OK {}\n{}", want.len(), want.join("\n"))
-    );
-    let rev = t.band.center.revision();
-    let deploy = t.messages_page_at("deploy", false, 0, wall);
-    let lines: Vec<&str> = deploy.lines().collect();
-    assert_eq!(lines.len(), 5, "{deploy}");
-    assert_eq!(lines[0], "OK 4");
-    assert_eq!(
-        lines[1],
-        format!(
-            "page\trev={rev}\tnow={wall}\ttotal=3\tshown=1\tall=1\tproblems=1\tstatus=1 of 3{}",
-            page_chrome(1, 1, Some("Deploy"))
-        )
-    );
-    assert_eq!(
-        lines[2],
-        "chip\ttag=deploy\twords=Deploy\tcount=1\ton=1\tlabel=Deploy \u{00b7} 1"
-    );
-    assert_eq!(
-        lines[3],
-        "chip\ttag=ci\twords=CI\tcount=2\ton=0\tlabel=CI \u{00b7} 2"
-    );
-    assert_eq!(lines[4], want[3]);
-    let problems = t.messages_page_at("", true, 0, wall);
-    let lines: Vec<&str> = problems.lines().collect();
-    assert_eq!(
-        lines[1],
-        format!(
-            "page\trev={rev}\tnow={wall}\ttotal=3\tshown=2\tall=3\tproblems=2\tstatus=2 of 3{}",
-            page_chrome(3, 2, None)
-        )
-    );
-    assert_eq!(
-        lines[3],
-        "chip\ttag=ci\twords=CI\tcount=1\ton=0\tlabel=CI \u{00b7} 1"
-    );
-    assert_eq!(lines[4..], [want[3].as_str(), want[4].as_str()]);
+
+    for (tag, problems, offset_s, want_entries) in [
+        ("", false, 0, 3usize),
+        ("deploy", false, 0, 1),
+        ("", true, 0, 2),
+        ("", false, utc_offset_s(-120.0), 3),
+    ] {
+        let got = t.messages_page_at(tag, problems, offset_s, wall);
+        let want = engine_page_export(&t, tag, problems, offset_s, wall);
+        assert_eq!(
+            got, want,
+            "tag={tag:?} problems={problems} offset={offset_s}"
+        );
+        assert_eq!(
+            got.lines().filter(|l| l.starts_with("entry\t")).count(),
+            want_entries,
+            "{got}"
+        );
+    }
+
     assert_eq!(utc_offset_s(-120.0), 7200);
     assert_eq!(utc_offset_s(420.0), -25_200);
     for junk in [f64::NAN, f64::INFINITY, 1440.0, -2000.0] {
         assert_eq!(utc_offset_s(junk), 0, "{junk}");
     }
-    let east = t.messages_page_at("", false, utc_offset_s(-120.0), wall);
-    assert!(east.contains("\tlocal=Today 4:13:20 PM\t"), "{east}");
-    assert!(!east.contains("2:13:20 PM"), "{east}");
+    assert_ne!(
+        t.messages_page_at("", false, utc_offset_s(-120.0), wall),
+        t.messages_page_at("", false, 0, wall),
+        "a non-zero UTC offset shifts local entry timestamps"
+    );
 }
 
 #[test]

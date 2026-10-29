@@ -388,14 +388,14 @@ impl crate::App {
     pub(crate) fn pre_commit_typed_windows(&self) -> Vec<WindowId> {
         self.handoff_deferred_input
             .iter()
-            .filter(|(_, event)| {
+            .filter(|(_, event, _)| {
                 matches!(
                     event,
                     aterm_window::event::WindowEvent::KeyboardInput { .. }
                         | aterm_window::event::WindowEvent::Ime(_)
                 )
             })
-            .filter_map(|(winit_id, _)| self.winit_to_window.get(winit_id).copied())
+            .filter_map(|(winit_id, ..)| self.winit_to_window.get(winit_id).copied())
             .collect()
     }
 

@@ -616,12 +616,13 @@ impl CompletedBlock {
     }
 }
 
-/// Reads completed and executing shell-integration blocks from `term` for the session log.
+/// Reads completed and executing shell-integration blocks from `term` for the session log, each
+/// block's detail confirmed against what `ran` heard in its window ([`block_detail`]).
 pub(crate) fn block_read(
     term: &aterm_core::terminal::Terminal,
     from: Option<u64>,
     since_wall: Option<u64>,
-    running_detail: Option<String>,
+    ran: &crate::command_ran::Ran,
 ) -> crate::session_log::BlockRead {
     use aterm_types::BlockState;
 
@@ -638,12 +639,14 @@ pub(crate) fn block_read(
         .take_while(|b| from.is_none_or(|f| b.id >= f))
         .collect();
     past.reverse();
-    let ran = |b: &aterm_types::OutputBlock| {
+    let started = |b: &aterm_types::OutputBlock| {
         matches!(b.state, BlockState::Executing | BlockState::Complete)
     };
     let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
-    read.started_held = count(past.iter().filter(|b| ran(b)).count());
-    read.started_at_from = past.first().is_some_and(|b| Some(b.id) == from && ran(b));
+    read.started_held = count(past.iter().filter(|b| started(b)).count());
+    read.started_at_from = past
+        .first()
+        .is_some_and(|b| Some(b.id) == from && started(b));
     if let (Some(f), Some(oldest)) = (from, past.first().map(|b| b.id))
         && oldest > f
     {
@@ -651,7 +654,8 @@ pub(crate) fn block_read(
         read.through = Some(oldest - 1);
     }
     for (i, block) in past.iter().copied().enumerate() {
-        let closed_at = past.get(i + 1).and_then(|next| next.prompt_time_ms);
+        let next = past.get(i + 1);
+        let closed_at = next.and_then(|next| next.prompt_time_ms);
         let end = match block.state {
             BlockState::Executing if Some(block.id) == current => Some(BlockEnd::Running),
             BlockState::Complete => Some(BlockEnd::Done(CompletedBlock::of(block))),
@@ -670,7 +674,7 @@ pub(crate) fn block_read(
         });
         if end.is_some() && read.facts.len() == BLOCK_READ_MAX {
             read.more = true;
-            read.started_unread = count(past.iter().skip(i).filter(|b| ran(b)).count());
+            read.started_unread = count(past.iter().skip(i).filter(|b| started(b)).count());
             break;
         }
         let settled = Some(block.id) != current
@@ -681,15 +685,18 @@ pub(crate) fn block_read(
         let Some(end) = end else {
             continue;
         };
-        let detail = match end {
-            BlockEnd::Running => running_detail.clone(),
-            _ => block_command_line(term, block).and_then(|line| command_detail(&line)),
+        let prior = match i.checked_sub(1) {
+            Some(prior) => past.get(prior).copied(),
+            None => before(term, block),
         };
+        let next_exec = next.and_then(|next| next.command_exec_start_time_ms);
+        let reading = block_detail(term, block, prior, (closed_at, next_exec), ran);
         read.facts.push(BlockFact {
             id: block.id,
             started_ms: block.command_exec_start_time_ms,
             end,
-            detail,
+            detail_final: reading.as_ref().is_some_and(|r| r.own),
+            detail: reading.map(|r| r.text),
         });
     }
     read
@@ -697,9 +704,56 @@ pub(crate) fn block_read(
 
 pub(crate) const BLOCK_READ_MAX: usize = 32;
 
-/// Extracts the sanitized [`command_detail`] for `term`'s currently executing block.
-pub(crate) fn executing_detail(term: &aterm_core::terminal::Terminal) -> Option<String> {
-    command_detail(&executing_command_line(term)?)
+/// The [`command_detail`] of `term`'s currently executing block, confirmed against `ran`.
+pub(crate) fn executing_detail(
+    term: &aterm_core::terminal::Terminal,
+    ran: &crate::command_ran::Ran,
+) -> Option<String> {
+    let block = term.current_block()?;
+    if block.state != aterm_types::BlockState::Executing {
+        return None;
+    }
+    let line = block_command_line(term, block)?;
+    let window = crate::command_ran::Window::of_block(block, before(term, block), None, None);
+    command_detail(
+        &line,
+        &ran.heard(block.id, window, block.working_directory.as_deref()),
+    )
+}
+
+/// The block `term` holds just before `block`.
+fn before<'a>(
+    term: &'a aterm_core::terminal::Terminal,
+    block: &aterm_types::OutputBlock,
+) -> Option<&'a aterm_types::OutputBlock> {
+    term.all_blocks().rev().find(|b| b.id < block.id)
+}
+
+/// The text reader's unconfirmed reading of `term`'s executing command ([`ProgramCandidate::text`]),
+/// for a decision made here and now that is never shown, stored or sent: a path link's
+/// remote-shell check, which must still hold where nothing reports execs (a ConPTY).
+pub(crate) fn executing_candidate(term: &aterm_core::terminal::Terminal) -> Option<String> {
+    candidate(&executing_command_line(term)?).map(|c| c.text())
+}
+
+/// `block`'s [`command_detail`] reading: its line's candidate, confirmed against the execs `ran`
+/// placed in the block (its own job's, and those stamped in its window, which the block `before`
+/// it bounds and its D, else `closed_ms`, the A of the prompt that closed it, ends, cut before
+/// `next_ms`, the next block's C: [`crate::command_ran::Window::of_block`]), and the files its
+/// program word names from its working directory.
+fn block_detail(
+    term: &aterm_core::terminal::Terminal,
+    block: &aterm_types::OutputBlock,
+    before: Option<&aterm_types::OutputBlock>,
+    (closed_ms, next_ms): (Option<u64>, Option<u64>),
+    ran: &crate::command_ran::Ran,
+) -> Option<Reading> {
+    let line = block_command_line(term, block)?;
+    let window = crate::command_ran::Window::of_block(block, before, closed_ms, next_ms);
+    command_reading(
+        &line,
+        &ran.heard(block.id, window, block.working_directory.as_deref()),
+    )
 }
 
 /// Extracts the full command line of `term`'s currently executing block.
@@ -760,6 +814,11 @@ struct Wrapper {
     numeric: bool,
     /// env's lone `-`, the old spelling of `-i`.
     lone_dash: bool,
+    /// Whether it runs the program after it by `exec`ing it (sudo, env, nice, nohup, exec, and
+    /// `time` as a program, `/usr/bin/time`): the program word after it is a program file the
+    /// kernel maps, never the shell's builtin of that name. `command` and `builtin` run a
+    /// builtin as the shell's own, as the shell's `time` keyword does.
+    execs: bool,
 }
 
 /// Who reads a wrapper's `NAME=value` words, by whose rule: the reader decides what is an
@@ -778,7 +837,7 @@ enum Assignments {
     Keyword,
 }
 
-const WRAPPERS: [Wrapper; 7] = [
+const WRAPPERS: [Wrapper; 8] = [
     Wrapper {
         name: "sudo",
         short: &[
@@ -834,6 +893,7 @@ const WRAPPERS: [Wrapper; 7] = [
         assignments: Assignments::Argv,
         numeric: false,
         lone_dash: false,
+        execs: true,
     },
     Wrapper {
         name: "env",
@@ -856,6 +916,7 @@ const WRAPPERS: [Wrapper; 7] = [
         assignments: Assignments::Argv,
         numeric: false,
         lone_dash: true,
+        execs: true,
     },
     Wrapper {
         name: "time",
@@ -879,6 +940,7 @@ const WRAPPERS: [Wrapper; 7] = [
         assignments: Assignments::Keyword,
         numeric: false,
         lone_dash: false,
+        execs: true,
     },
     Wrapper {
         name: "nice",
@@ -887,6 +949,7 @@ const WRAPPERS: [Wrapper; 7] = [
         assignments: Assignments::None,
         numeric: true,
         lone_dash: false,
+        execs: true,
     },
     Wrapper {
         name: "command",
@@ -895,6 +958,7 @@ const WRAPPERS: [Wrapper; 7] = [
         assignments: Assignments::None,
         numeric: false,
         lone_dash: false,
+        execs: false,
     },
     Wrapper {
         name: "nohup",
@@ -903,6 +967,7 @@ const WRAPPERS: [Wrapper; 7] = [
         assignments: Assignments::None,
         numeric: false,
         lone_dash: false,
+        execs: true,
     },
     Wrapper {
         name: "exec",
@@ -915,9 +980,22 @@ const WRAPPERS: [Wrapper; 7] = [
         assignments: Assignments::None,
         numeric: false,
         lone_dash: false,
+        execs: true,
+    },
+    Wrapper {
+        name: "builtin",
+        short: &[],
+        long: &[],
+        assignments: Assignments::None,
+        numeric: false,
+        lone_dash: false,
+        execs: false,
     },
 ];
-const KEYWORD_OPENERS: [&str; 6] = ["for", "while", "if", "until", "case", "{"];
+/// The words that open a compound command whose own segment is the line's candidate: a loop,
+/// a test, a case, a `{` group (stepped over to the command inside) and fish's `begin` (a lone
+/// `begin` segment opens a group whose next segment is the command that runs: [`candidate`]).
+const KEYWORD_OPENERS: [&str; 7] = ["for", "while", "if", "until", "case", "{", "begin"];
 /// The words, as typed, that the shell reads in a command's first place without running them,
 /// stepped over to the command they stand before: `!` alone negates its pipeline's status, `{`
 /// and `(` open a group and a subshell, and pwsh's `&` calls the program its next word names.
@@ -945,8 +1023,10 @@ enum Lead {
     Nameless(&'static str),
     /// No program can be named: a word with no letter or digit, a history designator (`!!`,
     /// `!$`, `!git`, `^old^new`), whose words are another line's, an arithmetic command
-    /// (`((n+1))`), which runs none, or a word whose name holds an `=` the shell takes for no
-    /// assignment (`'FOO=1'`, `"A=b c"`, `1=x`, pwsh's `$env:A='b'`), which reads as a value.
+    /// (`((n+1))`), which runs none, a comment (`#note`, a program word only under zsh's
+    /// default, which closing fails safe for), or a word whose name holds an `=` the shell
+    /// takes for no assignment (`'FOO=1'`, `"A=b c"`, `1=x`, pwsh's `$env:A='b'`), which reads
+    /// as a value.
     Closed,
 }
 
@@ -962,7 +1042,7 @@ fn lead(raw: Option<&str>, text: &str) -> Lead {
         return Lead::Nameless(word);
     }
     let designator = text.starts_with('^') || (text.starts_with('!') && text.len() > 1);
-    if designator || typed.starts_with("((") {
+    if designator || typed.starts_with("((") || typed.starts_with('#') {
         return Lead::Closed;
     }
     if shell_assignment(typed.strip_prefix('(').unwrap_or(typed)) {
@@ -1438,13 +1518,19 @@ fn shell_words(segment: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+/// Where the word from `start` ends. A compound assignment's value (`arr=(one two)`,
+/// `a[1]+=(x y)`) is one word through the `)` that closes it, as the shell reads it: its
+/// elements are the value, never a program word; one the segment never closes runs to its end.
 fn word_end(segment: &str, start: usize, escape_in_single: bool) -> usize {
     let mut quote: Option<char> = None;
+    let mut depth = 0usize;
     let mut chars = segment[start..].char_indices();
     while let Some((offset, c)) = chars.next() {
         let at = start + offset;
         match quote {
-            None if c.is_whitespace() => return at,
+            None if depth == 0 && c.is_whitespace() => return at,
+            None if c == '(' && (depth > 0 || compound_opens(&segment[start..at])) => depth += 1,
+            None if c == ')' && depth > 0 => depth -= 1,
             None if c == '\'' || c == '"' => quote = Some(c),
             Some(q) if c == q => quote = None,
             _ => {}
@@ -1468,6 +1554,12 @@ fn word_end(segment: &str, start: usize, escape_in_single: bool) -> usize {
         .map_or(segment.len(), |offset| start + offset)
 }
 
+/// Whether `head`, a word so far, is an assignment's name and `=` (`arr=`, `hosts+=`, `a[1]=`)
+/// that a `(` next opens a compound value for.
+fn compound_opens(head: &str) -> bool {
+    head.ends_with('=') && shell_assignment(head)
+}
+
 fn windows_path_so_far(head: &str) -> bool {
     let mut chars = head.chars();
     let drive = matches!(
@@ -1477,16 +1569,383 @@ fn windows_path_so_far(head: &str) -> bool {
     drive || head.contains('\\')
 }
 
-/// Reduces a shell command line to a safe `program [subcommand]` summary without flags or paths.
-pub(crate) fn command_detail(cmdline: &str) -> Option<String> {
-    const MAX_CHARS: usize = 48;
+/// The words a shell runs without mapping any image: the builtins and reserved words of bash,
+/// zsh, fish and POSIX sh. A detail keeps one only when the text reader's candidate is exactly
+/// that word, typed bare ([`ProgramCandidate::confirmed`]); any other program word is kept only when an
+/// image of that name ran in the command's window.
+pub(crate) const SHELL_BUILTINS: &[&str] = &[
+    ":",
+    ".",
+    "[",
+    "[[",
+    "{",
+    "abbr",
+    "alias",
+    "and",
+    "argparse",
+    "autoload",
+    "begin",
+    "bg",
+    "bind",
+    "bindkey",
+    "break",
+    "builtin",
+    "case",
+    "cd",
+    "chdir",
+    "command",
+    "compdef",
+    "complete",
+    "contains",
+    "continue",
+    "coproc",
+    "count",
+    "declare",
+    "dirs",
+    "disown",
+    "echo",
+    "emulate",
+    "enable",
+    "end",
+    "eval",
+    "exec",
+    "exit",
+    "export",
+    "false",
+    "fc",
+    "fg",
+    "for",
+    "foreach",
+    "funced",
+    "funcsave",
+    "function",
+    "functions",
+    "getopts",
+    "hash",
+    "history",
+    "if",
+    "jobs",
+    "kill",
+    "let",
+    "local",
+    "logout",
+    "math",
+    "noglob",
+    "not",
+    "or",
+    "popd",
+    "print",
+    "printf",
+    "pushd",
+    "pwd",
+    "read",
+    "readonly",
+    "rehash",
+    "repeat",
+    "return",
+    "select",
+    "set",
+    "setopt",
+    "shift",
+    "shopt",
+    "source",
+    "status",
+    "string",
+    "suspend",
+    "test",
+    "time",
+    "times",
+    "trap",
+    "true",
+    "type",
+    "typeset",
+    "ulimit",
+    "umask",
+    "unalias",
+    "unfunction",
+    "unhash",
+    "unset",
+    "unsetopt",
+    "until",
+    "wait",
+    "whence",
+    "where",
+    "which",
+    "while",
+    "zle",
+    "zmodload",
+    "zstyle",
+];
 
+/// How a candidate word was typed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Typed {
+    /// Exactly its name: the shell may run it as a builtin.
+    Bare,
+    /// A path (`./deploy.sh`, `/usr/bin/time`): the shell execs that file.
+    Path,
+    /// Any other spelling (an escape, a Windows extension).
+    Other,
+}
+
+impl Typed {
+    fn of(text: &str, name: &str) -> Self {
+        if text == name {
+            Self::Bare
+        } else if text.contains(['/', '\\']) {
+            Self::Path
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// What the text reader picked of a command line ([`candidate`]): the program word's name, the
+/// wrappers it was reached through and the allowlisted subcommand after it. Nothing of it
+/// reaches a detail until [`ProgramCandidate::confirmed`] finds that it ran.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProgramCandidate {
+    /// The program word's name ([`basename`]), untruncated.
+    program: String,
+    typed: Typed,
+    /// The program word as typed, when it is a path ([`Typed::Path`]): the path the shell execs,
+    /// from the block's working directory, which the gate resolves to a file. Never a detail.
+    path: Option<Box<str>>,
+    /// The [`SUBCOMMANDS`] word after it.
+    sub: Option<&'static str>,
+    /// The wrappers read before it, outermost first.
+    wrappers: Vec<Wrapped>,
+}
+
+/// One wrapper the text reader read before a program word ([`ProgramCandidate::wrappers`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Wrapped {
+    name: &'static str,
+    /// How it was typed.
+    typed: Typed,
+    /// Whether it runs the program after it by `exec` ([`Wrapper::execs`]; never the shell's
+    /// own `time` keyword).
+    execs: bool,
+}
+
+impl Wrapped {
+    /// Whether the shell ran it as its own builtin, which maps no image: typed bare, a listed
+    /// builtin (`command`, `builtin`, `exec`), and `time` only as the shell's keyword (as a
+    /// program it is `/usr/bin/time`, which must be heard).
+    fn shells_own(&self) -> bool {
+        self.typed == Typed::Bare
+            && SHELL_BUILTINS.contains(&self.name)
+            && (self.name != "time" || !self.execs)
+    }
+}
+
+const DETAIL_MAX_CHARS: usize = 48;
+
+fn detail_text(program: &str, sub: Option<&str>) -> String {
+    let program_end = program
+        .char_indices()
+        .nth(DETAIL_MAX_CHARS)
+        .map_or(program.len(), |(end, _)| end);
+    let mut detail = program[..program_end].to_string();
+    if let Some(sub) = sub {
+        detail.push(' ');
+        detail.push_str(sub);
+    }
+    if let Some((end, _)) = detail.char_indices().nth(DETAIL_MAX_CHARS) {
+        detail.truncate(end);
+    }
+    detail
+}
+
+/// Whether `name` is a name the kernel keeps for an image one of `ran` mapped (its canonical
+/// file's, or macOS's `p_name`: [`ExecNames::iter`]), whole: a name the kernel cut short confirms
+/// nothing longer. No process sets either, so a bare word equal to one names that program.
+///
+/// [`ExecNames::iter`]: crate::command_ran::ExecNames::iter
+fn ran_named(ran: &[std::sync::Arc<crate::command_ran::Exec>], name: &str) -> bool {
+    ran.iter()
+        .flat_map(|exec| exec.names.iter())
+        .any(|image| image == name || basename(image) == Some(name))
+}
+
+/// Whether an image's canonical file name is a wrapper's ([`WRAPPERS`]): a wrapper runs the
+/// program after it, so it never stands in while another image of the job is no wrapper.
+fn wrapper_image(name: &str) -> bool {
+    basename(name).and_then(wrapper_named).is_some()
+}
+
+/// What a confirmed candidate reads ([`ProgramCandidate::reading`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Reading {
+    /// The detail.
+    pub(crate) text: String,
+    /// Whether it names the command's own program (a builtin, or the program or script that
+    /// ran), which no later read betters; `false` for a stand-in, a program the command's own
+    /// job ran while the program word's own file was not heard (an alias's or a function's
+    /// program, a script's interpreter, the wrapper that ran), which a later read may replace.
+    pub(crate) own: bool,
+}
+
+impl ProgramCandidate {
+    /// What the word `name`, typed as `typed` (as `path` when it is a path), names against
+    /// `heard`: a shell builtin typed bare at the command's own place (`builtin`: no wrapper
+    /// that `exec`s its program came before it), or a bare word equal to a name the kernel keeps
+    /// for an image that ran ([`ran_named`]), ran; otherwise the file the shell would exec for
+    /// it, compared by identity with the images that ran ([`crate::command_ran::Heard::look`]; a
+    /// lookup the worker has not answered is [`crate::command_ran::Look::Pending`], which
+    /// confirms nothing yet).
+    fn look(
+        name: &str,
+        typed: Typed,
+        path: Option<&str>,
+        builtin: bool,
+        heard: &crate::command_ran::Heard<'_>,
+    ) -> crate::command_ran::Look {
+        use crate::command_ran::{Look, Word};
+        match typed {
+            Typed::Bare
+                if (builtin && SHELL_BUILTINS.contains(&name)) || ran_named(&heard.execs, name) =>
+            {
+                Look::Ran
+            }
+            Typed::Bare => heard.look(Word::Bare(name)),
+            Typed::Path => path.map_or(Look::Nothing, |path| heard.look(Word::Path(path))),
+            Typed::Other if ran_named(&heard.execs, name) => Look::Ran,
+            Typed::Other => Look::Nothing,
+        }
+    }
+
+    /// The detail this candidate gives against `heard`, its block's execs: the program (with its
+    /// subcommand) when the file the shell would exec for it ran, as an image or as a `#!`
+    /// script whose interpreter ran (its own name); else, standing in, the first image the
+    /// command's own job ran that is no wrapper, by its canonical file name
+    /// ([`crate::command_ran::Heard::stand_in`]: an alias's or a function's program, a script's
+    /// interpreter, the program a re-exec stub ran), never a prompt hook's or another command's;
+    /// else the innermost wrapper that ran (`sudo` runs its program in a child of its own); else
+    /// nothing. A word naming a directory with no wrapper before it reads nothing: the shell
+    /// changed into it ([`crate::command_ran::Look::Cd`]), running no program of its own; nor
+    /// does one whose lookup is not yet answered ([`crate::command_ran::Look::Pending`]), which
+    /// may be a directory: a later read gives its stand-in once the lookup knows. Every
+    /// word of it is a builtin's name or the name of an image or script that ran, never a word
+    /// only typed, and never a string a process wrote.
+    pub(crate) fn confirmed(&self, heard: &crate::command_ran::Heard<'_>) -> Option<String> {
+        self.reading(heard).map(|r| r.text)
+    }
+
+    /// [`Self::confirmed`], with whether it names the program itself.
+    pub(crate) fn reading(&self, heard: &crate::command_ran::Heard<'_>) -> Option<Reading> {
+        use crate::command_ran::Look;
+        let builtin = !self.wrappers.iter().any(|w| w.execs);
+        let look = Self::look(
+            &self.program,
+            self.typed,
+            self.path.as_deref(),
+            builtin,
+            heard,
+        );
+        if look == Look::Ran {
+            return Some(Reading {
+                text: detail_text(&self.program, self.sub),
+                own: true,
+            });
+        }
+        if matches!(look, Look::Cd | Look::Pending) && self.wrappers.is_empty() {
+            // The shell changed into a directory: no program of the command's own ran. A word
+            // whose lookup the worker has not answered may name one too (a stalled or slow file
+            // system), so nothing stands in for it until a later read knows: a directory hook's
+            // program is never written for it, not even for now, as an amend only moves up.
+            return None;
+        }
+        let stand_in = |text: String| Reading { text, own: false };
+        if let Some(program) = heard.stand_in(wrapper_image) {
+            return Some(stand_in(detail_text(program, None)));
+        }
+        self.wrappers
+            .iter()
+            .rev()
+            .find(|w| w.shells_own() || ran_named(&heard.execs, w.name))
+            .map(|w| stand_in(w.name.to_owned()))
+    }
+
+    /// The text reader's own reading, unconfirmed: what the detail would be if every candidate
+    /// ran. Never a detail: only [`executing_candidate`]'s local decisions and the reader's tests
+    /// read it.
+    pub(crate) fn text(&self) -> String {
+        detail_text(&self.program, self.sub)
+    }
+}
+
+/// Reduces a shell command line to a `program [subcommand]` summary without flags or paths,
+/// naming only what ran: the text reader picks the candidate ([`candidate`]) and `heard`, the
+/// execs heard in the command's window, confirms it ([`ProgramCandidate::confirmed`]).
+pub(crate) fn command_detail(
+    cmdline: &str,
+    heard: &crate::command_ran::Heard<'_>,
+) -> Option<String> {
+    candidate(cmdline)?.confirmed(heard)
+}
+
+/// [`command_detail`], with whether it names the program itself ([`Reading::own`]).
+pub(crate) fn command_reading(
+    cmdline: &str,
+    heard: &crate::command_ran::Heard<'_>,
+) -> Option<Reading> {
+    candidate(cmdline)?.reading(heard)
+}
+
+/// `cmdline` with each backslash-newline pair outside single quotes taken out, the shell's first
+/// step: a line continuation (zsh reports it as typed) is never a word, so a value flag never
+/// takes it for its value.
+fn joined(cmdline: &str) -> std::borrow::Cow<'_, str> {
+    if !cmdline.contains("\\\n") {
+        return cmdline.into();
+    }
+    let mut out = String::with_capacity(cmdline.len());
+    let mut single = false;
+    let mut chars = cmdline.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                single = !single;
+                out.push(c);
+            }
+            '\\' if !single => match chars.next() {
+                Some('\n') => {}
+                Some(next) => {
+                    out.push(c);
+                    out.push(next);
+                }
+                None => out.push(c),
+            },
+            _ => out.push(c),
+        }
+    }
+    out.into()
+}
+
+/// The text reader: the program word of `cmdline`'s running command, the wrappers before it and
+/// its allowlisted subcommand, or `None` when no word in its first place names a program.
+pub(crate) fn candidate(cmdline: &str) -> Option<ProgramCandidate> {
+    let cmdline = joined(cmdline);
+    let cmdline: &str = &cmdline;
     let segments = split_list(cmdline);
-    let segment = segments
+    let opener = segments
         .iter()
-        .map(|(_, text)| *text)
-        .find(|text| leading_word(text).is_some_and(|w| KEYWORD_OPENERS.contains(&&*w)))
-        .unwrap_or_else(|| running_segment(cmdline, &segments));
+        .position(|(_, text)| leading_word(text).is_some_and(|w| KEYWORD_OPENERS.contains(&&*w)));
+    let segment = match opener {
+        // fish's lone `begin` opens a group: the command that runs is its next segment, and a
+        // lone `end` closes it, never a command of its own.
+        Some(at) if segments[at].1.trim() == "begin" => segments[at + 1..]
+            .iter()
+            .map(|(_, text)| *text)
+            .find(|text| !text.trim().is_empty())
+            .filter(|text| !lone_end(text))?,
+        Some(at) => segments[at].1,
+        None => running_segment(cmdline, &segments),
+    };
+    if lone_end(segment) {
+        return None;
+    }
     let mut words = Spliced {
         split: None,
         rest: argv(segment),
@@ -1495,40 +1954,66 @@ pub(crate) fn command_detail(cmdline: &str) -> Option<String> {
         command_word(&mut words, |w| lead(w.raw, &w.text), |_| false)?;
     match first {
         Lead::Program => {}
-        Lead::Nameless(command) => return Some(command.to_owned()),
+        Lead::Nameless(command) => {
+            return Some(ProgramCandidate {
+                program: command.to_owned(),
+                typed: Typed::Bare,
+                path: None,
+                sub: None,
+                wrappers: Vec::new(),
+            });
+        }
         Lead::Assignment | Lead::Step(_) | Lead::Closed => return None,
     }
+    let mut wrappers: Vec<Wrapped> = Vec::new();
     let mut keyword = time_keyword(&program_word, assigned);
     while let Some(wrapper) = basename(&program_word.text).and_then(wrapper_named) {
         let time = std::mem::take(&mut keyword);
+        let typed = Typed::of(&program_word.text, wrapper.name);
+        let closed = |wrappers: Vec<Wrapped>| {
+            Some(ProgramCandidate {
+                program: wrapper.name.to_owned(),
+                typed,
+                path: None,
+                sub: None,
+                wrappers,
+            })
+        };
         match unwrap(wrapper, time, &mut words) {
-            Unwrap::Program(word) => program_word = word,
+            Unwrap::Program(word) => {
+                wrappers.push(Wrapped {
+                    name: wrapper.name,
+                    typed,
+                    execs: wrapper.execs && !time,
+                });
+                program_word = word;
+            }
             Unwrap::Split(value, from) if words.split.is_none() => {
                 let Some(value) = split_value(&value, from) else {
-                    return Some(wrapper.name.to_owned());
+                    return closed(wrappers);
                 };
+                // env reads the value's words as more of its own: the next pass reads them.
                 words.split = Some((value, 0));
             }
-            Unwrap::Split(..) | Unwrap::Closed => return Some(wrapper.name.to_owned()),
+            Unwrap::Split(..) | Unwrap::Closed => return closed(wrappers),
         }
     }
     let program = basename(&program_word.text)?;
-    let program_end = program
-        .char_indices()
-        .nth(MAX_CHARS)
-        .map_or(program.len(), |(end, _)| end);
-    let mut detail = program[..program_end].to_string();
-    if let Some((_, vocabulary)) = SUBCOMMANDS.iter().find(|(p, _)| *p == program) {
-        let sub = words.find(|w| !w.text.is_empty() && !w.text.starts_with('-'));
-        if let Some(sub) = sub.filter(|s| vocabulary.contains(&&*s.text)) {
-            detail.push(' ');
-            detail.push_str(&sub.text);
-        }
-    }
-    if let Some((end, _)) = detail.char_indices().nth(MAX_CHARS) {
-        detail.truncate(end);
-    }
-    Some(detail)
+    let typed = Typed::of(&program_word.text, program);
+    let sub = SUBCOMMANDS
+        .iter()
+        .find(|(p, _)| *p == program)
+        .and_then(|(_, vocabulary)| {
+            let sub = words.find(|w| !w.text.is_empty() && !w.text.starts_with('-'))?;
+            vocabulary.iter().copied().find(|v| *v == &*sub.text)
+        });
+    Some(ProgramCandidate {
+        program: program.to_owned(),
+        typed,
+        path: (typed == Typed::Path).then(|| program_word.text.as_ref().into()),
+        sub,
+        wrappers,
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1568,6 +2053,19 @@ fn split_list(cmdline: &str) -> Vec<(ListOp, &str)> {
                 i += 2;
                 continue;
             }
+            b'#' if i == 0
+                || matches!(
+                    bytes[i - 1],
+                    b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')'
+                ) =>
+            {
+                // A comment, to the end of its line: what it holds is never a command, and
+                // its `;`, `&&` and `||` cut nothing.
+                segments.push((op, &cmdline[start..i]));
+                i = cmdline[i..].find('\n').map_or(bytes.len(), |n| i + n);
+                start = i;
+                continue;
+            }
             b'\'' | b'"' | b'`' => {
                 quote = Some(c);
                 i += 1;
@@ -1602,10 +2100,15 @@ fn split_list(cmdline: &str) -> Vec<(ListOp, &str)> {
     segments
 }
 
+/// Whether a segment is fish's lone `end`, which closes a block and runs nothing of its own.
+fn lone_end(segment: &str) -> bool {
+    segment.trim() == "end"
+}
+
 fn running_segment<'a>(cmdline: &'a str, segments: &[(ListOp, &'a str)]) -> &'a str {
     let Some(end) = segments
         .iter()
-        .rposition(|(_, text)| !text.trim().is_empty())
+        .rposition(|(_, text)| !text.trim().is_empty() && !lone_end(text))
     else {
         return cmdline;
     };
@@ -1931,7 +2434,8 @@ pub(crate) fn needs_fields(verdict: &crate::needs::Verdict) -> String {
     format!("{} needs_n={n}", verdict.needs_word())
 }
 
-/// Formats the `needs_told=` development diagnostic field for `status` output.
+/// Formats the `needs_told=` development diagnostic field for `status` output, from the sets
+/// every reader reads ([`crate::needs::told_of`]: a proven self-claim's own while it stands).
 #[cfg(any(test, debug_assertions))]
 pub(crate) fn needs_told_field(told: &crate::needs::ToldNeeds, entry: Option<&str>) -> String {
     match (told.words_for(entry), told.current()) {
@@ -2173,18 +2677,21 @@ impl StatusObserver {
         }
     }
 
-    /// Schedules an off-thread Codex rollout log tap read for `session` when due.
+    /// Schedules an off-thread Codex rollout log tap read for `session` when due: the target a
+    /// live proven claim names, or, with none, the read-only copy of a released claim's process
+    /// while it leads the foreground group `pgid` ([`crate::self_claim::tap_target`]).
     pub(crate) fn request_rollout_if_due(
         &mut self,
         session: u64,
         ctx: &std::sync::Arc<crate::SessionCtx>,
         program: Option<&str>,
+        pgid: i32,
         now: Instant,
         wake: &crate::claude_footer::LogWake,
     ) {
         use crate::codex_rollout_tap::{due, follow_ask};
         let target = crate::self_claim::fronts_claimant(program)
-            .then(|| crate::self_claim::rollout_target(ctx))
+            .then(|| crate::self_claim::tap_target(ctx, pgid))
             .flatten();
         follow_ask(
             due(&mut self.rollout_asked, session, target, now),
@@ -2744,6 +3251,7 @@ impl StatusObserver {
     }
 
     /// Folds an OSC 7501 program-state reading for `session` and returns whether it changed.
+    #[cfg(test)]
     pub(crate) fn observe_program_state(
         &mut self,
         session: u64,
@@ -2758,6 +3266,28 @@ impl StatusObserver {
             .observe(report, honoured, group_moved, now)
     }
 
+    /// Folds an OSC 7501 program-state reading for `session` and returns whether it changed, with
+    /// the edges of its codex's turns no shown move claims
+    /// ([`crate::program_state::ProgramStateGate::observe_fed`]; `codex_front`: a codex is the
+    /// program in front).
+    pub(crate) fn observe_program_fed(
+        &mut self,
+        session: u64,
+        report: aterm_core::terminal::program_state::ProgramStateReport,
+        honoured: bool,
+        codex_front: bool,
+        group_moved: bool,
+        now: Instant,
+    ) -> (bool, Vec<crate::program_state::FedEdge>) {
+        self.program_states.entry(session).or_default().observe_fed(
+            report,
+            honoured,
+            codex_front,
+            group_moved,
+            now,
+        )
+    }
+
     /// Returns the active OSC 7501 `(state, since)` reading for `session`, if any.
     pub(crate) fn program_state(
         &self,
@@ -2766,6 +3296,13 @@ impl StatusObserver {
         self.program_states
             .get(&session)
             .and_then(crate::program_state::ProgramStateGate::shown)
+    }
+
+    /// How many times `session`'s shown OSC 7501 report has moved.
+    pub(crate) fn program_state_moves(&self, session: u64) -> u64 {
+        self.program_states
+            .get(&session)
+            .map_or(0, crate::program_state::ProgramStateGate::moves)
     }
 
     /// `session`'s `status program_state= program_state_ms=` fields, from its gate alone.
@@ -2940,7 +3477,7 @@ impl crate::App {
             let content_seq = guard.content_seq();
             let generation = crate::control::screen_gen(&guard);
             let resize_probe = crate::resize_ledger::EngineProbe::sample(&guard);
-            let detail = executing_detail(&guard);
+            let detail = executing_detail(&guard, &session.ctx.ran);
             let cwd_report = guard.reported_cwd_seq();
             let pgid = if master >= 0 {
                 (self.session_factory.fg_probe)(master)
@@ -2959,7 +3496,7 @@ impl crate::App {
                     timeline.slog().opened_wall(),
                 )
             };
-            let blocks = block_read(&guard, from, since_wall, detail.clone());
+            let blocks = block_read(&guard, from, since_wall, &session.ctx.ran);
             let (program, front_agent) = {
                 let timeline = session
                     .ctx
@@ -3043,7 +3580,7 @@ impl crate::App {
                 timeline.slog_mut().observe_status(facts, at);
                 timeline.record(STATUS_CHANGE);
             }
-            let (previous_group, wake, program_honoured) = {
+            let (previous_group, wake, program_honoured, codex_front) = {
                 let mut timeline = session
                     .ctx
                     .timeline
@@ -3055,6 +3592,9 @@ impl crate::App {
                 timeline.slog_mut().observe_engine(&engine, at);
                 timeline.slog_mut().program_tick(at);
                 timeline.slog_mut().shown_tick(at);
+                // A program state the tick wrote is a `program-state` row: its watchers hear it
+                // now, not at the next record.
+                timeline.ring_rows();
                 // The claim is judged by the program in front once this sweep's foreground move
                 // is noted (unnamed right after one), never by the name read before it, and only
                 // where the report names that program.
@@ -3062,7 +3602,13 @@ impl crate::App {
                     timeline.agent().program.as_deref(),
                     program_report.state.map(|s| s.app),
                 );
-                (previous, timeline.slog_wake(), honoured)
+                // The edges of a codex's turns are fed by the same judgement, the report standing
+                // or not.
+                let codex_front = crate::program_state::honoured_for(
+                    timeline.agent().program.as_deref(),
+                    Some(aterm_core::terminal::program_state::ProgramApp::Codex),
+                );
+                (previous, timeline.slog_wake(), honoured, codex_front)
             };
             self.session_status.slog_wakes.note(id, wake);
             let group_changed = previous_group.is_some();
@@ -3076,10 +3622,11 @@ impl crate::App {
                 claims_cleared.push(id);
             }
             let turn_begun = program_report.turns != self.session_status.program_turns(id);
-            let program_state_moved = self.session_status.observe_program_state(
+            let (program_state_moved, fed) = self.session_status.observe_program_fed(
                 id,
                 program_report,
                 program_honoured,
+                codex_front,
                 group_changed,
                 now,
             );
@@ -3100,13 +3647,22 @@ impl crate::App {
                     })
                     .map(|_| program_report.began),
             );
-            if program_state_moved {
-                session
+            if program_state_moved || !fed.is_empty() {
+                let mut timeline = session
                     .ctx
                     .timeline
                     .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .note_program_state(shown, program_report.began);
+                    .unwrap_or_else(|p| p.into_inner());
+                // Tick, then the edges, then the move's mark: a held `working` the tick wrote
+                // opens its turn before the edge that ended it closes it.
+                if !fed.is_empty() {
+                    timeline.note_program_edges(&fed);
+                }
+                if program_state_moved {
+                    timeline.note_program_state(shown, program_report.began);
+                }
+            }
+            if program_state_moved {
                 if shown.is_some_and(|state| {
                     state.state == aterm_core::terminal::program_state::ProgramStateWord::Done
                 }) {
@@ -3172,6 +3728,7 @@ impl crate::App {
                 } else {
                     program.as_deref()
                 },
+                pgid,
                 now,
                 &footer_wake,
             );
@@ -3488,20 +4045,31 @@ impl crate::App {
     /// Returns the short status text displayed in `session`'s tab chrome, if any.
     pub(crate) fn session_status_text(&self, session: u64) -> Option<String> {
         let status = self.session_status.status(session);
-        if status.is_none_or(|s| s.phase != Phase::Exited)
-            && let (_, Some(reading)) = self.session_status.agent_reading(session)
-            && let Some(text) = agent_activity_text(&reading.phase)
-        {
-            return Some(text);
+        if status.is_none_or(|s| s.phase != Phase::Exited) {
+            if let (_, Some(reading)) = self.session_status.agent_reading(session)
+                && let Some(text) = agent_activity_text(&reading.phase)
+            {
+                return Some(text);
+            }
+            // A reader that names no phase (codex's) leaves the line to what the program says
+            // itself (OSC 7501), as the hover's state line does; only while the sweep keeps that
+            // report current (Tab Status on: off, nothing folds it and it would stand stale).
+            if self.config.tab_status_or_default()
+                && let Some((state, _)) = self.session_status.program_state(session)
+            {
+                return Some(crate::program_state::row_word(state).to_string());
+            }
         }
         status.and_then(summary_text)
     }
 
-    /// Returns a combined revision counter covering both shell status and agent reading for `session`.
+    /// Returns a combined revision counter covering shell status, agent reading and the program's
+    /// own report for `session`.
     pub(crate) fn session_status_revision(&self, session: u64) -> u64 {
         self.session_status
             .revision(session)
             .wrapping_add(self.session_status.agent_reading_seq(session))
+            .wrapping_add(self.session_status.program_state_moves(session))
     }
 
     /// Returns `session`'s contribution to its tab's indicator bits.
@@ -3580,7 +4148,8 @@ impl crate::App {
                 Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
                 Err(std::sync::TryLockError::WouldBlock) => None,
             };
-            term.as_deref().and_then(executing_detail)
+            term.as_deref()
+                .and_then(|t| executing_detail(t, &pooled.ctx.ran))
         };
         let status = self.session_status.status(session);
         let (revision, detail) = match status {
@@ -3621,9 +4190,11 @@ impl crate::App {
             .hold_advisory()
             .map_or_else(|| "-".to_string(), |h| h.reason);
         let editing = crate::control_edit::hold::count(session);
+        let editor = self.editor_word(session);
         let fabric = crate::fabric::fabric_state();
         let fabric_tail = crate::fabric::fabric_status_tail();
         let fleet = crate::fleet_listen::fleet_status_word();
+        let units = crate::fleet_listen::units_status_word();
         let setup = crate::system_state_access::setup_field(self.system_state_host.latest_status());
         let pin = {
             let meta = pooled.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
@@ -3666,7 +4237,9 @@ impl crate::App {
                 }
             }
         };
-        let detail = term.as_deref().and_then(executing_detail);
+        let detail = term
+            .as_deref()
+            .and_then(|t| executing_detail(t, &pooled.ctx.ran));
         let stamp = term
             .as_deref()
             .filter(|t| !crate::frame_unfinished_now(t))
@@ -3752,7 +4325,7 @@ impl crate::App {
             (supervised_agent, group),
             last_act,
             face,
-            (pause, held),
+            pause,
             slog,
             goal,
         ) = {
@@ -3777,7 +4350,7 @@ impl crate::App {
                 ),
                 timeline.last_act().unwrap_or("-").to_string(),
                 timeline.task_face().map(|(face, _)| face),
-                (timeline.pause(), timeline.land_held()),
+                timeline.pause(),
                 slog,
                 goal_field(timeline.goal()),
             )
@@ -3791,21 +4364,10 @@ impl crate::App {
             crate::autopilot::land_at_field(land_at.filter(|_| supervised_agent.is_some()));
         let task = crate::autopilot::task_field(face, claimed_here || proven, supervised_agent);
         let pause = crate::autopilot::pause_field(pause, claimed_here, supervised_agent);
-        let under_land = supervised_agent.is_some_and(|agent| {
-            crate::autopilot::AutopilotView::of(self.harness_posture().for_agent(Some(agent)), word)
-                .mode()
-                == Some(aterm_agent::supervise::Autopilot::Land)
-        }) && !matches!(
-            face,
-            Some(
-                aterm_agent::harness::acts::TaskFace::Landed
-                    | aterm_agent::harness::acts::TaskFace::Theirs
-            )
-        );
-        let land = land_fields(held.filter(|_| claimed_here && under_land));
+        let land = land_fields(self.shown_hold(session).map(|shown| shown.hold.held));
         let land = format!(
             "{land}{}{}",
-            stop_field(self.shown_stop(session).filter(|_| claimed_here)),
+            stop_field(self.shown_stop(session).map(|stop| stop.arm)),
             wait_field(self.shown_wait(session).filter(|_| claimed_here))
         );
         #[cfg(any(test, debug_assertions))]
@@ -3823,14 +4385,18 @@ impl crate::App {
         };
         let presence = self.presence_status_tail(session);
         #[cfg(any(test, debug_assertions))]
-        let needs_entry = pooled
-            .ctx
-            .meta
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .attention_owners
-            .get(crate::harness_host::NEEDS_ATTENTION_OWNER)
-            .map(str::to_string);
+        let needs_told = {
+            let entry = pooled
+                .ctx
+                .meta
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .attention_owners
+                .get(crate::harness_host::NEEDS_ATTENTION_OWNER)
+                .map(str::to_string);
+            let told = crate::needs::told_of(&pooled.ctx, crate::metrics::now_us());
+            needs_told_field(&told, entry.as_deref())
+        };
         let (needs, hold_by) = {
             let timeline = pooled
                 .ctx
@@ -3839,11 +4405,7 @@ impl crate::App {
                 .unwrap_or_else(|p| p.into_inner());
             let need = timeline.need();
             #[cfg(any(test, debug_assertions))]
-            let needs = format!(
-                "{}{}",
-                needs_fields(need),
-                needs_told_field(&timeline.harness_needs(), needs_entry.as_deref())
-            );
+            let needs = format!("{}{needs_told}", needs_fields(need));
             #[cfg(not(any(test, debug_assertions)))]
             let needs = needs_fields(need);
             (needs, need.hold_word())
@@ -3883,12 +4445,12 @@ impl crate::App {
                  phase=unknown since_ms=- outcome=none exit_code=- signal=- detail={} \
                  confidence=unknown reasons=- attribution={} fs_consent={} conflict=false \
                  revision=0 enabled={enabled} hold={hold} hold_advisory={hold_advisory} \
-                 fabric={fabric} {fabric_tail} fleet={fleet} setup={setup} \
+                 fabric={fabric} {fabric_tail} fleet={fleet} units={units} setup={setup} \
                  {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} {program_state} last_act={last_act} {appearance}{conpty} integration={integration} \
                  {input} supervisor={supervisor} autopilot={autopilot} human_ms={human_ms} \
                  human_seq={human_seq} {launch} {owner} \
                  history_lost={history_lost} {journal} integration_rev={integration_rev} {born} {resize} \
-                 land_at={land_at} task={task} pause={pause}{land}{end} goal={goal} {task_record} {slog} editing={editing} {bells} gen={generation} seq={seq} hash={hash}",
+                 land_at={land_at} task={task} pause={pause}{land}{end} goal={goal} {task_record} {slog} editing={editing} editor={editor} {bells} gen={generation} seq={seq} hash={hash}",
                 opt(subject.as_deref()),
                 opt(detail.as_deref()),
                 consent.attribution.as_str(),
@@ -3917,12 +4479,12 @@ impl crate::App {
              phase={} since_ms={since_ms} outcome={} exit_code={exit_code} signal={signal} \
              detail={} confidence={} reasons={reasons} attribution={} fs_consent={} \
              conflict={} revision={} enabled={enabled} hold={hold} hold_advisory={hold_advisory} \
-             fabric={fabric} {fabric_tail} fleet={fleet} setup={setup} \
+             fabric={fabric} {fabric_tail} fleet={fleet} units={units} setup={setup} \
              {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} {program_state} last_act={last_act} {appearance}{conpty} integration={integration} \
              {input} supervisor={supervisor} autopilot={autopilot} human_ms={human_ms} \
              human_seq={human_seq} {launch} {owner} \
              history_lost={history_lost} {journal} integration_rev={integration_rev} {born} {resize} \
-             land_at={land_at} task={task} pause={pause}{land}{end} goal={goal} {task_record} {slog} editing={editing} {bells} gen={generation} seq={seq} hash={hash}",
+             land_at={land_at} task={task} pause={pause}{land}{end} goal={goal} {task_record} {slog} editing={editing} editor={editor} {bells} gen={generation} seq={seq} hash={hash}",
             opt(subject.as_deref()),
             status.phase.as_str(),
             status.last_outcome.as_str(),
@@ -3959,7 +4521,12 @@ pub(crate) fn goal_field(goal: Option<&str>) -> String {
     goal.map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode)
 }
 
-/// Formats the `land_held` and `land_detail` fields for `status` output.
+/// Formats the `land_held`, `land_nudges` and `land_since` fields for `status` output (§12.3.3
+/// item 3, §14.3.3): Land's hold of whoever drives the session ([`crate::App::shown_hold`]: aterm
+/// while it claims it, a codex-alab under its own proven claim), its legs once a yield was read,
+/// its nudges and the second its land act began; `-` for each where no hold stands and where its
+/// chip's face is no `⤓ land` (landed, quiet, another mode), as every other surface of the hold
+/// reads it.
 pub(crate) fn land_fields(held: Option<aterm_agent::harness::acts::LandHeld>) -> String {
     let Some(held) = held else {
         return " land_held=- land_nudges=- land_since=-".to_string();
@@ -3983,8 +4550,11 @@ pub(crate) fn land_fields(held: Option<aterm_agent::harness::acts::LandHeld>) ->
 }
 
 /// Formats the `held` field for `status` output (§14.3): the arm that stopped the typing
-/// (`same-reply`, `no-work`), `-` where aterm types on. A reader that finds no `held=` (a build
-/// before it) reads it as unknown, never as `-`.
+/// (`same-reply`, `no-work`) of whoever drives the session ([`crate::App::shown_stop`]: aterm
+/// while it claims it, a codex-alab under its own proven claim, §14.3.2), `-` where it types on
+/// and where its chip's face carries no mode (landed, quiet, off), as every other surface of the
+/// stop reads it. A reader that finds no `held=` (a build before it) reads it as unknown, never
+/// as `-`.
 pub(crate) fn stop_field(stopped: Option<aterm_agent::harness::acts::HeldBy>) -> String {
     format!(
         " held={}",

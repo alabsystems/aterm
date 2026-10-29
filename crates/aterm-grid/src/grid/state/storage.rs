@@ -93,6 +93,10 @@ pub struct GridStorage {
     pub(crate) history_renumber_epoch: u64,
     /// Counter bumped when a rows-grow resize reveals history lines back onto the screen.
     pub(crate) history_reveal_gen: u64,
+    /// Newest scrollback lines guaranteed present in a bounded replay step/keyframe chain.
+    pub(crate) replay_carried_history: std::sync::atomic::AtomicUsize,
+    /// Monotonic count of history pullbacks or deep rewraps that reached older than `replay_carried_history`.
+    pub(crate) deep_history_pullback_ordinal: u64,
     /// Extracted extras (`CellExtras`) for rows in ring scrollback.
     pub(crate) ring_extras: RingExtras,
     /// Alt-screen rows-only shrink undo state.
@@ -105,6 +109,8 @@ pub struct GridStorage {
     pub absolute_row_counter: u64,
     /// Monotonic content generation bumped by every content-damage mutation.
     pub content_gen: u64,
+    /// This grid's process-unique identity, fixed when it was built ([`Grid::instance`](crate::Grid::instance)).
+    pub(crate) instance: u64,
     /// Generation bumped when a reader scroll primitive in [`crate::grid::scroll`] lands at `display_offset == 0`.
     pub(crate) reader_live_bottom_gen: u64,
     /// Autowrap serial bumped once per `advance_autowrap_line`.
@@ -148,6 +154,119 @@ impl GridStorage {
         if self.ring_head != 0 {
             self.rows.rotate_left(self.ring_head);
             self.ring_head = 0;
+        }
+    }
+
+    /// Record `n` lines pushed onto the newest end of scrollback.
+    #[inline]
+    pub(crate) fn note_history_pushed(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let sb = self.scrollback_lines();
+        let cur = self
+            .replay_carried_history
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let next = cur.saturating_add(n).min(sb);
+        self.replay_carried_history
+            .store(next, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Record `n` lines popped from `sb_before` scrollback lines onto the viewport, advancing `deep_history_pullback_ordinal` when the pop reaches past the carried suffix.
+    #[inline]
+    pub(crate) fn note_history_popped(&mut self, sb_before: usize, n: usize) {
+        let carried_before = self
+            .replay_carried_history
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(sb_before);
+        self.note_history_popped_after(carried_before, n);
+    }
+
+    /// Reconcile `n` popped lines against a pre-captured `carried_before` suffix.
+    #[inline]
+    pub(crate) fn note_history_popped_after(&mut self, carried_before: usize, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if n > carried_before {
+            self.deep_history_pullback_ordinal = self.deep_history_pullback_ordinal.wrapping_add(1);
+        }
+        let rem = carried_before
+            .saturating_sub(n)
+            .min(self.scrollback_lines());
+        self.replay_carried_history
+            .store(rem, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Reset the carried history suffix when scrollback is cleared.
+    #[inline]
+    pub(crate) fn note_history_cleared(&self) {
+        self.replay_carried_history
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Clamp the carried history suffix after a bounded step (`max_lines`) or retention shrink.
+    #[inline]
+    pub(crate) fn clamp_replay_carried_history(&self, max_lines: usize) {
+        let cap = self.scrollback_lines().min(max_lines);
+        let cur = self
+            .replay_carried_history
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if cur > cap {
+            self.replay_carried_history
+                .store(cap, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Seed the carried history suffix from a keyframe bounded to `max_lines`.
+    #[inline]
+    pub(crate) fn seed_replay_carried_history(&self, max_lines: usize) {
+        let cap = self.scrollback_lines().min(max_lines);
+        self.replay_carried_history
+            .store(cap, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Reconcile `replay_carried_history` right after width-reflowed scrollback is restored.
+    #[inline]
+    pub(crate) fn reconcile_replay_carried_after_width_restore(
+        &mut self,
+        sb_before: usize,
+        carried_before: usize,
+    ) {
+        if self.scrollback_detached_for_reflow {
+            return;
+        }
+        if carried_before == sb_before {
+            self.replay_carried_history.store(
+                self.scrollback_lines(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        } else {
+            self.deep_history_pullback_ordinal = self.deep_history_pullback_ordinal.wrapping_add(1);
+            self.replay_carried_history
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Reconcile `replay_carried_history` at the end of a non-width-reflow resize pass.
+    #[inline]
+    pub(crate) fn reconcile_replay_carried_after_resize(
+        &mut self,
+        sb_before: usize,
+        carried_before: usize,
+    ) {
+        if self.scrollback_detached_for_reflow {
+            return;
+        }
+        let sb_after = self.scrollback_lines();
+        if sb_after >= sb_before {
+            let next = carried_before
+                .saturating_add(sb_after - sb_before)
+                .min(sb_after);
+            self.replay_carried_history
+                .store(next, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.note_history_popped_after(carried_before, sb_before - sb_after);
         }
     }
 
@@ -414,24 +533,6 @@ impl GridStorage {
         removed
     }
 
-    #[cfg(test)]
-    pub(crate) fn sync_extras_flags_for_row(&mut self, row: u16, cols: u16) {
-        let Some(idx) = self.row_index(row) else {
-            return;
-        };
-        let rows = &mut self.rows;
-        let extras = &self.cursor_state.presentation.extras;
-        let Some(r) = rows.get_mut(idx) else {
-            return;
-        };
-        for col in 0..cols {
-            let has = extras.get(CellCoord::new(row, col)).is_some();
-            if let Some(cell) = r.get_mut(col) {
-                cell.set_has_extras(has);
-            }
-        }
-    }
-
     /// Synchronize `HAS_EXTRAS` cell flags across all visible rows from their extras maps.
     pub(crate) fn sync_all_extras_flags(&mut self) {
         for row in &mut self.rows {
@@ -622,7 +723,8 @@ mod tests {
     }
 
     /// A row's addressable width halves on every double-width or
-    /// double-height line size, and columns clamp to it.
+    /// double-height line size, columns clamp to it, and `set_row_line_size`
+    /// maintains `any_double_width` across transitions.
     #[test]
     fn line_size_halves_the_addressable_columns() {
         for (size, cols) in [
@@ -632,10 +734,16 @@ mod tests {
             (LineSize::DoubleHeightBottom, 40),
         ] {
             let mut g = make_storage(5, 80);
-            g.storage.any_double_width = true;
-            if let Some(row) = g.storage.row_mut(2) {
-                row.set_line_size(size);
-            }
+            assert_eq!(
+                g.set_row_line_size(2, size),
+                size != LineSize::SingleWidth,
+                "{size:?}: changed flag"
+            );
+            assert_eq!(
+                g.has_any_double_width(),
+                size != LineSize::SingleWidth,
+                "{size:?}: any_double_width"
+            );
             assert_eq!(g.storage.effective_cols_for_row(2), cols, "{size:?}");
             assert_eq!(g.storage.max_col_for_row(2), cols - 1, "{size:?}");
             assert_eq!(g.storage.effective_cols_for_row(0), 80, "{size:?}: row 0");
@@ -646,7 +754,15 @@ mod tests {
                     "{size:?} col {col}"
                 );
             }
+            if size != LineSize::SingleWidth {
+                assert!(g.set_row_line_size(2, LineSize::SingleWidth));
+                assert!(!g.has_any_double_width());
+                assert_eq!(g.storage.effective_cols_for_row(2), 80);
+            }
         }
+        let mut g = make_storage(5, 80);
+        assert!(!g.set_row_line_size(99, LineSize::DoubleWidth));
+        assert!(!g.has_any_double_width());
     }
 
     /// A shift by zero rows, or by more than the range holds, moves nothing.
@@ -751,25 +867,6 @@ mod tests {
             }
         }
         assert!(shifts > 0);
-    }
-
-    /// Negative control: replacing one ring row with a fresh allocation (what a
-    /// copy-based shift would do) changes both readings the A3 test compares.
-    #[test]
-    fn a_row_replaced_by_a_fresh_allocation_is_seen_by_both_readings() {
-        let mut g = Grid::with_scrollback(6, 8, 4);
-        for _ in 0..10 {
-            g.write_char('x');
-            g.carriage_return();
-            g.line_feed();
-        }
-        let identities = ring_slice_identities(&g);
-        let allocations = g.storage.pages.stats().allocations;
-        // SAFETY: The new row is allocated from `g.storage.pages`, which outlives `g.storage.rows`.
-        let fresh = unsafe { crate::Row::new(8, &mut g.storage.pages) };
-        g.storage.rows[0] = fresh;
-        assert_ne!(ring_slice_identities(&g), identities);
-        assert_ne!(g.storage.pages.stats().allocations, allocations);
     }
 
     #[test]

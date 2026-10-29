@@ -913,6 +913,41 @@ pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
     Some((age_s.max(0.0) * 1e9) as u64)
 }
 
+/// The key event AppKit is dispatching now (`-[NSApp currentEvent]`), as `hwkey` records the
+/// events it posts ([`crate::hwkey::PostedKey`]); `None` headless, off the main thread, outside a
+/// dispatch, or for an event that is not a key-down or key-up.
+#[cfg(target_os = "macos")]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn current_key_event() -> Option<crate::hwkey::PostedKey> {
+    use aterm_objc::{class, sel};
+
+    use crate::appkit::{self, MainThread};
+
+    let _windowed = Windowed::get()?;
+    let _main_thread = MainThread::new()?;
+    // SAFETY: `+sharedApplication` is `-(id)`, the main-thread AppKit singleton (`_main_thread`
+    // is the witness); `-currentEvent` is `-(id)` and nil outside a dispatch; `-type` is
+    // `-(NSEventType)`, an `NSUInteger`, valid on any event; `-keyCode` is `-(unsigned short)`
+    // and `-timestamp` `-(NSTimeInterval)`, read only once `-type` said key-down or key-up, the
+    // kinds `-keyCode` is defined for (it raises on others).
+    unsafe {
+        let app = appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication));
+        if app.is_null() {
+            return None;
+        }
+        let event = appkit::send_id(app, sel!(currentEvent));
+        if event.is_null() {
+            return None;
+        }
+        let kind = appkit::send_usize(event, sel!(type));
+        crate::hwkey::is_key_kind(kind).then(|| crate::hwkey::PostedKey {
+            kind,
+            keycode: appkit::send_u16(event, sel!(keyCode)),
+            timestamp: appkit::send_f64(event, sel!(timestamp)),
+        })
+    }
+}
+
 /// This window's `-[NSWindow windowNumber]`, or `0` with no AppKit window.
 #[cfg(target_os = "macos")]
 #[must_use]
@@ -988,6 +1023,36 @@ pub(crate) fn user_input_source(headless: bool) -> fn(std::time::Duration) -> bo
 #[must_use]
 pub(crate) const fn no_recent_user_input_event(_within: std::time::Duration) -> bool {
     false
+}
+
+/// Whether macOS's idle time (`HIDIdleTime`) can be read now: [`recent_user_input_event`] reads
+/// one it cannot read as input just now, which holds a rest but shows nobody at the Mac.
+#[cfg(target_os = "macos")]
+fn user_input_idle_readable() -> bool {
+    hid_idle::seconds_since_last_input().is_some()
+}
+
+/// Non-macOS peer: no idle time to read ([`recent_user_input_event`] reads none recent).
+#[cfg(not(target_os = "macos"))]
+const fn user_input_idle_readable() -> bool {
+    false
+}
+
+/// Whether the input-activity source an `App` holds ([`user_input_source`]) reads an idle time
+/// it was given: the live one only while macOS gives one.
+pub(crate) fn user_input_readable_source(headless: bool) -> fn() -> bool {
+    if headless {
+        user_input_read_as_given
+    } else {
+        user_input_idle_readable
+    }
+}
+
+/// For headless instances and unit tests: the injected input-activity source is the whole
+/// reading, so it always reads.
+#[must_use]
+pub(crate) const fn user_input_read_as_given() -> bool {
+    true
 }
 
 /// Whether this login's screen is out of a person's reach: locked
@@ -1883,6 +1948,9 @@ mod reduce_motion {
     /// The workspace notification for a wake from sleep.
     pub(crate) const DID_WAKE_NOTIFICATION: &str = "NSWorkspaceDidWakeNotification";
 
+    /// The workspace notification posted before the Mac sleeps.
+    pub(crate) const WILL_SLEEP_NOTIFICATION: &str = "NSWorkspaceWillSleepNotification";
+
     /// The system colours changed (the accent colour among them).
     pub(crate) const SYSTEM_COLORS_NOTIFICATION: &str = "NSSystemColorsDidChangeNotification";
 
@@ -1891,6 +1959,7 @@ mod reduce_motion {
         relay: Box<dyn Fn()>,
         woke: Box<dyn Fn()>,
         colors: Box<dyn Fn()>,
+        sleeps: Box<dyn Fn()>,
     }
 
     aterm_objc::declare_class! {
@@ -1909,6 +1978,11 @@ mod reduce_motion {
                 (self.ivars().woke)();
             }
 
+            @sel(systemWillSleep:)
+            fn system_will_sleep(&self, _note: aterm_objc::Id) {
+                (self.ivars().sleeps)();
+            }
+
             @sel(systemColorsDidChange:)
             fn system_colors_did_change(&self, _note: aterm_objc::Id) {
                 (self.ivars().colors)();
@@ -1921,6 +1995,7 @@ mod reduce_motion {
         relay: Box<dyn Fn()>,
         woke: Box<dyn Fn()>,
         colors: Box<dyn Fn()>,
+        sleeps: Box<dyn Fn()>,
     ) -> Option<aterm_objc::Retained<ReduceMotionTarget>> {
         ReduceMotionTarget::alloc_init(
             mtm,
@@ -1928,6 +2003,7 @@ mod reduce_motion {
                 relay,
                 woke,
                 colors,
+                sleeps,
             },
         )
     }
@@ -1978,6 +2054,7 @@ mod reduce_motion {
                     aterm_objc::sel!(reduceMotionDidChange:),
                 ),
                 (DID_WAKE_NOTIFICATION, aterm_objc::sel!(systemDidWake:)),
+                (WILL_SLEEP_NOTIFICATION, aterm_objc::sel!(systemWillSleep:)),
             ];
             for (notification, selector) in observations {
                 let Some(name) = aterm_objc::ns_string(notification) else {
@@ -2061,7 +2138,7 @@ mod reduce_motion {
         workspace_flag(sel!(accessibilityDisplayShouldDifferentiateWithoutColor))
     }
 
-    /// Register a workspace-notification observer for the accessibility display-options change and the wake from sleep, and return the retained target (the caller keeps it alive for the process life — the notification center references it weakly, and it is never removed, exactly like the menu target).
+    /// Register a workspace-notification observer for the accessibility display-options change, the wake from sleep and the sleep to come, and return the retained target (the caller keeps it alive for the process life — the notification center references it weakly, and it is never removed, exactly like the menu target).
     pub(crate) fn observe(
         proxy: &EventLoopProxy<Wake>,
     ) -> Option<aterm_objc::Retained<ReduceMotionTarget>> {
@@ -2077,6 +2154,9 @@ mod reduce_motion {
             Box::new(move || {
                 let _ = colors.send_event(Wake::SystemColorsChanged);
             }),
+            // Before the Mac sleeps, the account claims this Mac keeps last at most two hours more
+            // (docs/DESIGN-fluid-swarm-2026-10-28.md F19).
+            Box::new(crate::harness_host::claims_quiet_before_sleep),
         )?;
         if register(&target) {
             Some(target)
@@ -2091,8 +2171,8 @@ mod reduce_motion {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         use super::{
-            DID_WAKE_NOTIFICATION, DISPLAY_OPTIONS_NOTIFICATION, ReduceMotionTarget, new_target,
-            register,
+            DID_WAKE_NOTIFICATION, DISPLAY_OPTIONS_NOTIFICATION, ReduceMotionTarget,
+            WILL_SLEEP_NOTIFICATION, new_target, register,
         };
 
         fn unregister(target: &aterm_objc::Retained<ReduceMotionTarget>) {
@@ -2172,6 +2252,8 @@ mod reduce_motion {
             let woke = Arc::clone(&wakes);
             let recolors = Arc::new(AtomicUsize::new(0));
             let recolored = Arc::clone(&recolors);
+            let sleeps = Arc::new(AtomicUsize::new(0));
+            let slept = Arc::clone(&sleeps);
             let target = new_target(
                 crate::appkit::test_witness(),
                 Box::new(move || {
@@ -2182,6 +2264,9 @@ mod reduce_motion {
                 }),
                 Box::new(move || {
                     recolored.fetch_add(1, Ordering::SeqCst);
+                }),
+                Box::new(move || {
+                    slept.fetch_add(1, Ordering::SeqCst);
                 }),
             )
             .expect("+alloc/-init produced a ReduceMotionTarget");
@@ -2219,10 +2304,12 @@ mod reduce_motion {
             post();
             post();
             post_named(DID_WAKE_NOTIFICATION);
+            post_named(WILL_SLEEP_NOTIFICATION);
             post_default(super::SYSTEM_COLORS_NOTIFICATION);
             unregister(&target);
             post();
             post_named(DID_WAKE_NOTIFICATION);
+            post_named(WILL_SLEEP_NOTIFICATION);
             post_default(super::SYSTEM_COLORS_NOTIFICATION);
             assert_eq!(
                 recolors.load(Ordering::SeqCst),
@@ -2243,6 +2330,13 @@ mod reduce_motion {
                 "AppKit did not deliver NSWorkspaceDidWakeNotification to the wake \
                  selector exactly once"
             );
+            // The account claims' quiet before sleep (docs/DESIGN-fluid-swarm-2026-10-28.md F19).
+            assert_eq!(
+                sleeps.load(Ordering::SeqCst),
+                1,
+                "AppKit did not deliver NSWorkspaceWillSleepNotification to the sleep \
+                 selector exactly once"
+            );
         }
 
         #[test]
@@ -2260,6 +2354,7 @@ mod reduce_motion {
                 Box::new(move || {
                     let _ = &spy;
                 }),
+                Box::new(|| {}),
                 Box::new(|| {}),
                 Box::new(|| {}),
             )

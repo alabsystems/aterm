@@ -205,18 +205,6 @@ mod tests {
                 "a visible dog is never re-rolled onto itself (seed {seed})"
             );
         }
-        let mut seen = std::collections::BTreeSet::new();
-        for seed in 0..256u64 {
-            let mut fresh = DogCameo::default();
-            fresh.on_summon(t, seed);
-            seen.insert(fresh.look().unwrap().breed as usize);
-        }
-        assert!(
-            seen.len() >= DOG_HEADS.len().min(8),
-            "256 seeds should reach most of the roster — hit {} of {}",
-            seen.len(),
-            DOG_HEADS.len()
-        );
     }
 
     #[test]

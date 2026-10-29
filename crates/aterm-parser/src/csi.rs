@@ -50,7 +50,10 @@ impl Parser {
         {
             self.params.clear();
             self.intermediates.clear();
+            self.current_param = 0;
+            self.param_started = false;
             self.subparam_mask = 0;
+            self.last_was_colon = false;
             sink.csi_dispatch(
                 pty_wrap_ref(self.params.as_slice()),
                 pty_wrap_ref(self.intermediates.as_slice()),
@@ -67,7 +70,10 @@ impl Parser {
             if (0x40..=0x7E).contains(&b1) {
                 self.params.set_single(d0);
                 self.intermediates.clear();
+                self.current_param = 0;
+                self.param_started = false;
                 self.subparam_mask = 0;
+                self.last_was_colon = false;
                 sink.csi_dispatch(
                     pty_wrap_ref(self.params.as_slice()),
                     pty_wrap_ref(self.intermediates.as_slice()),
@@ -88,7 +94,10 @@ impl Parser {
                 if (0x40..=0x7E).contains(&b2) {
                     self.params.set_single(p1);
                     self.intermediates.clear();
+                    self.current_param = 0;
+                    self.param_started = false;
                     self.subparam_mask = 0;
+                    self.last_was_colon = false;
                     sink.csi_dispatch(
                         pty_wrap_ref(self.params.as_slice()),
                         pty_wrap_ref(self.intermediates.as_slice()),
@@ -140,6 +149,7 @@ impl Parser {
         self.subparam_mask = 0;
         self.current_param = 0;
         self.param_started = false;
+        self.last_was_colon = false;
 
         let limit = if input.len() < 65 { input.len() } else { 65 };
         let scan = input.get(..limit).unwrap_or(input);
@@ -157,6 +167,7 @@ impl Parser {
                 pos = pos.saturating_add(1);
             } else if b == b':' {
                 self.push_current_param(false);
+                self.last_was_colon = true;
                 return self.parse_csi_general_from(input, sink, pos.saturating_add(1), true);
             } else if (0x40..=0x7E).contains(&b) {
                 self.close_params(false);
@@ -203,11 +214,13 @@ impl Parser {
                 next_is_subparam = true;
                 pos = pos.saturating_add(1);
             } else if (0x40..=0x7E).contains(&b) {
+                self.last_was_colon = next_is_subparam;
                 self.close_params(next_is_subparam);
                 self.csi_dispatch_final(sink, b);
                 self.state = State::Ground;
                 return Some(pos.saturating_add(1));
             } else if (0x20..=0x2F).contains(&b) {
+                self.last_was_colon = next_is_subparam;
                 self.close_params(next_is_subparam);
                 return self.parse_csi_intermediates(input, sink, pos, limit);
             } else {
@@ -225,6 +238,7 @@ impl Parser {
         self.subparam_mask = 0;
         self.current_param = 0;
         self.param_started = false;
+        self.last_was_colon = false;
         self.intermediates.clear();
 
         let mut pos = 0;
@@ -257,11 +271,13 @@ impl Parser {
                 next_is_subparam = true;
                 pos = pos.saturating_add(1);
             } else if (0x40..=0x7E).contains(&b) {
+                self.last_was_colon = next_is_subparam;
                 self.close_params(next_is_subparam);
                 self.csi_dispatch_final(sink, b);
                 self.state = State::Ground;
                 return Some(pos.saturating_add(1));
             } else if (0x20..=0x2F).contains(&b) {
+                self.last_was_colon = next_is_subparam;
                 self.close_params(next_is_subparam);
                 return self.parse_csi_intermediates(input, sink, pos, limit);
             } else {

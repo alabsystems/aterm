@@ -296,8 +296,15 @@ fn global_clauses(ctx: &Ctx<'_>, s: &Snapshot) -> Vec<String> {
             words::cores(busy),
             cpu.total()
         ));
-    } else if s.cpu.is_some() {
-        parts.push("core utilization unavailable (counters did not advance)".into());
+    } else if let Some(total) = s.total_cores() {
+        let why = if s.cpu.is_some() {
+            "counters did not advance"
+        } else {
+            "the first sample has no interval"
+        };
+        parts.push(format!(
+            "{total} cores total, utilization unavailable ({why})"
+        ));
     } else {
         parts.push("cores measuring (the first sample has no interval)".into());
     }
@@ -311,14 +318,14 @@ fn global_clauses(ctx: &Ctx<'_>, s: &Snapshot) -> Vec<String> {
     if let Some(w) = s.global.wait.filter(|w| *w >= 0.1) {
         parts.push(format!("≥{} waiting for a core (own processes)", c1(w)));
     }
-    if let Some(g) = s.gpu.as_ref() {
-        parts.push(format!("GPU {:.0}%", (g.load.raw * 100.0).round()));
+    if s.gpu_sample().is_some() {
+        parts.push(format!("GPU {}", gpu_words(s)));
     }
     if let Some(m) = s.mem.as_ref() {
         parts.extend(mem_clauses(m));
     }
     if let Some(v) = s.volume.as_ref() {
-        parts.push(format!("disk {} free", words::disk(v.available)));
+        parts.push(format!("disk {}", words::disk_space_line(v)));
     }
     if let Some(net) = s.net.as_ref() {
         parts.extend(net_clause(net));
@@ -347,14 +354,10 @@ fn net_clause(net: &crate::model::NetView) -> Option<String> {
     (!sub.is_empty()).then(|| format!("net {}", sub.join(", ")))
 }
 
-/// Memory's words for a sentence: `memory 16.6 of 128 GiB used, pressure
-/// normal` and `swap 0` (with `, swapping <rate>` while it moves).
+/// Memory's used, available and total capacities with pressure, followed by swap
+/// (with `, swapping <rate>` while it moves).
 pub(super) fn mem_clauses(m: &crate::model::MemView) -> [String; 2] {
-    let mut w = format!(
-        "memory {} of {} GiB used",
-        words::gib_figure(m.sample.used()),
-        words::gib_total(m.sample.total)
-    );
+    let mut w = format!("memory {}", words::memory_space_line(&m.sample));
     if m.sample.pressure != crate::model::Pressure::Unknown {
         w.push_str(&format!(", pressure {}", m.sample.pressure.word()));
     }
@@ -734,6 +737,13 @@ pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
             .map(|e| event_line(ctx, s, e))
             .collect()
     });
+    let hw_notes: Vec<Line> = match (ctx.snap, q.view) {
+        (Some(s), View::Cores | View::Why) => super::hardware::lines(s)
+            .into_iter()
+            .map(|s| note("cpu_hardware", s))
+            .collect(),
+        _ => Vec::new(),
+    };
     match ctx.snap {
         None => lines.push(note(
             "state",
@@ -751,7 +761,7 @@ pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
             View::Disk => disk_text(q, ctx, s, &mut lines),
             View::Net => net_text(q, s, &mut lines),
             View::Procs => procs_text(q, ctx, s, &mut lines),
-            View::Why => why::why_text(q, ctx, s, &mut lines, &events),
+            View::Why => why::why_text(q, ctx, s, &mut lines, &hw_notes, &events),
             View::Report => {
                 lines.push(note("report", "CPU diagnostic report; cause not established. Use --json to export raw evidence."));
                 lines.extend(
@@ -767,15 +777,7 @@ pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
     {
         scheduling_context_text(ctx, s, &mut lines);
     }
-    if let Some(s) = ctx.snap
-        && matches!(q.view, View::Cores | View::Why)
-    {
-        lines.extend(
-            super::hardware::lines(s)
-                .into_iter()
-                .map(|s| note("cpu_hardware", s)),
-        );
-    }
+    lines.extend(hw_notes);
     lines.extend(events);
     Reply {
         view: q.view,
@@ -1066,8 +1068,10 @@ fn machine_line(ctx: &Ctx<'_>, s: &Snapshot) -> String {
             .map(|c| format!("{} {}", c.cores.len(), device_word(&c.name)))
             .collect();
         parts.push(cl.join(" + "));
+    } else if let Some(total) = s.total_cores() {
+        parts.push(format!("{total} cores"));
     }
-    if let Some(g) = s.gpu.as_ref() {
+    if let Some(g) = s.gpu_sample() {
         match g.cores {
             Some(n) => parts.push(format!("{n}-core GPU")),
             None => parts.push("GPU".into()),
@@ -1114,6 +1118,12 @@ fn global_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>)
                 rec(cpu.current_busy().map(words::cores), "no_counter_delta"),
                 cpu.total()
             );
+            if let Some(busy) = cpu.current_busy() {
+                t.push_str(&format!(
+                    " · {} cores idle",
+                    words::cores((cpu.total() as f32 - busy).max(0.0))
+                ));
+            }
             for c in &cpu.clusters {
                 let busy = cpu.current_cluster_busy(c);
                 t.push_str(&format!(
@@ -1184,12 +1194,7 @@ fn global_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>)
     if let Some(v) = s.volume.as_ref() {
         lines.push(line(
             "disk",
-            format!(
-                "disk     {} {} free of {}",
-                pct(&v.mount),
-                words::disk(v.available),
-                words::disk(v.total)
-            ),
+            format!("disk     {} {}", pct(&v.mount), words::disk_space_line(v)),
         ));
     }
     if let Some(net) = s.net.as_ref() {
@@ -1260,15 +1265,34 @@ fn proc_cpu(r: &ProcView) -> String {
 }
 
 fn gpu_words(s: &Snapshot) -> String {
-    let Some(g) = s.gpu.as_ref() else {
+    let Some(g) = s.gpu_sample() else {
         return unavailable("unsupported");
     };
-    let mut t = format!("{:.0}% busy, whole percent", (g.load.raw * 100.0).round());
-    if let (Some(r), Some(ti)) = (g.sample.renderer_pct, g.sample.tiler_pct) {
+    let mut t = g.device_pct.map_or_else(
+        || format!("{} busy", unavailable("not_sampled:device_utilization")),
+        |pct| format!("{}% busy, whole percent", pct.min(100)),
+    );
+    if let Some(name) = g.name.as_deref() {
+        t.push_str(&format!(" · {}", device_word(name)));
+    }
+    if let Some(cores) = g.cores {
+        t.push_str(&format!(" · {cores} cores"));
+    }
+    if let (Some(r), Some(ti)) = (g.renderer_pct, g.tiler_pct) {
         t.push_str(&format!(" (renderer {r}, tiler {ti})"));
     }
-    if let Some(b) = g.sample.in_use_bytes {
+    if let Some(b) = g.in_use_bytes {
         t.push_str(&format!(" · {} in use", words::mem(b)));
+    }
+    if let Some(b) = g.alloc_bytes {
+        t.push_str(&format!(" · {} allocated", words::mem(b)));
+    }
+    t.push_str(" · GPU memory total not reported · available not reported");
+    if g.name
+        .as_deref()
+        .is_some_and(|name| name.starts_with("Apple "))
+    {
+        t.push_str(" (unified system memory)");
     }
     t
 }
@@ -1331,7 +1355,11 @@ fn mem_sum_words(m: &crate::model::MemView, exact: bool) -> String {
 }
 
 fn mem_class_words(m: &crate::model::MemView, exact: bool) -> String {
-    let mut t = m.sample.pressure.word().to_owned();
+    let mut t = format!(
+        "{} · pressure {}",
+        words::memory_space_line(&m.sample),
+        m.sample.pressure.word()
+    );
     if let Some(k) = m.sample.kernel_available_pct {
         t.push_str(&format!(" (kernel: {k}% available)"));
     }
@@ -1506,8 +1534,9 @@ fn cores_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
                 format!(
                     "core name={label} cpu={core} busy_pm={}",
                     rec(
-                        cpu.cores[*core]
-                            .current()
+                        cpu.cores
+                            .get(*core)
+                            .and_then(crate::model::CoreView::current)
                             .map(|load| { (load * 1000.0).round().clamp(0.0, 1000.0) as u32 }),
                         "no_counter_delta"
                     )
@@ -1546,25 +1575,9 @@ fn cores_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
 }
 
 fn gpu_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
-    let name = s
-        .gpu
-        .as_ref()
-        .and_then(|g| g.name.clone())
-        .or_else(|| ctx.machine.cpu.clone())
-        .unwrap_or_else(|| "GPU".into());
-    let cores = s
-        .gpu
-        .as_ref()
-        .and_then(|g| g.cores)
-        .map(|n| format!(", {n} cores"))
-        .unwrap_or_default();
     lines.push(line(
         "gpu",
-        format!(
-            "gpu     {} GPU{cores}, reported as one device · {}",
-            device_word(&name),
-            gpu_words(s)
-        ),
+        format!("gpu     {} · reported as one device", gpu_words(s)),
     ));
     lines.push(line("split", gpu_split_words(ctx, s)));
     let (clients, withheld) = gpu_clients(ctx, s);
@@ -1691,13 +1704,14 @@ fn mem_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         None => unavailable(thrashing_why(m)),
     };
     let mut head = format!(
-        "mem     {} GiB · pressure {}",
-        words::gib_total(m.sample.total),
+        "mem     {} · pressure {}",
+        words::memory_space_line(&m.sample),
         m.sample.pressure.word()
     );
     if let Some(k) = m.sample.kernel_available_pct {
         head.push_str(&format!(" (kernel: {k}% available)"));
     }
+    head.push_str(" · available is free + reclaimable file cache");
     let exact = exact_partition(ctx);
     head.push_str(&format!(
         " · thrashing: {thrash} · {}",
@@ -1889,6 +1903,18 @@ fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         ScopeArg::Aterm => "aterm".into(),
         ScopeArg::Global => "global".into(),
     };
+    if let Some(v) = ctx.volume {
+        let volume = crate::model::VolumeSample {
+            total: v.total,
+            free: v.free,
+            available: v.available,
+            mount: v.mount.clone(),
+        };
+        lines.push(line(
+            "space",
+            format!("space {}", words::disk_space_line(&volume)),
+        ));
+    }
     lines.push(line(
         "disk",
         format!(
@@ -2375,8 +2401,10 @@ fn as_of_json(view: View, ctx: &Ctx<'_>) -> Jv {
 
 fn machine_json(ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
     let mut o = Jv::obj([] as [(&str, Jv); 0]);
+    if let Some(total) = s.total_cores() {
+        o.set("cpus", Jv::u(total as u64));
+    }
     if let Some(cpu) = s.cpu.as_ref() {
-        o.set("cpus", Jv::u(cpu.total() as u64));
         o.set(
             "levels",
             Jv::Arr(
@@ -2397,18 +2425,21 @@ fn machine_json(ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
     o.set(
         "gpu_cores",
         Jv::known_or(
-            s.gpu.as_ref().and_then(|g| g.cores).map(u64::from),
+            s.gpu_sample().and_then(|g| g.cores).map(u64::from),
             "unsupported",
         ),
     );
+    if let Some(name) = s.gpu_sample().and_then(|g| g.name.as_ref()) {
+        o.set("gpu_name", Jv::s(name.clone()));
+    }
     if let Some(m) = s.mem.as_ref() {
         o.set("memory_bytes", Jv::u(m.sample.total));
     }
-    if let (Some(cpu), Some(m)) = (s.cpu.as_ref(), s.mem.as_ref()) {
+    if let (Some(total), Some(m)) = (s.total_cores(), s.mem.as_ref()) {
         o.set(
             "capacity",
             Jv::obj([
-                ("cpu_mc", Jv::u(cpu.total() as u64 * 1000)),
+                ("cpu_mc", Jv::u(total as u64 * 1000)),
                 ("mem_bytes", Jv::u(m.sample.total)),
                 ("source", Jv::s("host")),
             ]),
@@ -2431,6 +2462,10 @@ fn global_json(s: &Snapshot) -> Jv {
             |c| Jv::known_or(c.current_busy().map(mc), "no_counter_delta"),
         ),
     )]);
+    o.set(
+        "cpu_cores",
+        Jv::known_or(s.total_cores().map(|n| n as u64), "warming"),
+    );
     if let Some(cpu) = s.cpu.as_ref() {
         o.set(
             "cpu_by_level_mc",
@@ -2468,19 +2503,34 @@ fn global_json(s: &Snapshot) -> Jv {
         s.thermal
             .map_or_else(|| Jv::why("unsupported"), |t| Jv::s(t.level.word())),
     );
-    o.set(
-        "gpu_pm",
-        s.gpu.as_ref().map_or_else(
-            || Jv::why("unsupported"),
-            |g| Jv::u((g.load.raw * 1000.0).round().max(0.0) as u64),
-        ),
-    );
+    o.set("gpu_pm", gpu_device_json(s));
     if let Some(m) = s.mem.as_ref() {
         o.set("mem_pressure", Jv::s(m.sample.pressure.word()));
         o.set("mem_used_bytes", Jv::u(m.sample.used()));
+        o.set(
+            "mem_available_bytes",
+            Jv::known_or(m.sample.available(), "not_reported"),
+        );
+        o.set("mem_total_bytes", Jv::u(m.sample.total));
+        o.set("mem_available_basis", Jv::s("free_plus_reclaimable_cache"));
         o.set("swap_used_bytes", Jv::u(m.sample.swap_used));
     } else {
         o.set("mem_pressure", Jv::why("unsupported"));
+        o.set("mem_available_bytes", Jv::why("unsupported"));
+        o.set("mem_total_bytes", Jv::why("unsupported"));
+    }
+    for (name, value) in [
+        (
+            "disk_used_bytes",
+            s.volume.as_ref().map(crate::model::VolumeSample::occupied),
+        ),
+        (
+            "disk_available_bytes",
+            s.volume.as_ref().map(|v| v.available.min(v.total)),
+        ),
+        ("disk_total_bytes", s.volume.as_ref().map(|v| v.total)),
+    ] {
+        o.set(name, Jv::known_or(value, "not_sampled"));
     }
     o.set(
         "disk_free_bytes",
@@ -2975,8 +3025,9 @@ fn cores_json(s: &Snapshot) -> Jv {
                     (
                         "busy_pm",
                         Jv::known_or(
-                            cpu.cores[*core]
-                                .current()
+                            cpu.cores
+                                .get(*core)
+                                .and_then(crate::model::CoreView::current)
                                 .map(|load| (load * 1000.0).round().clamp(0.0, 1000.0) as u64),
                             "no_counter_delta",
                         ),
@@ -2996,31 +3047,44 @@ fn cores_json(s: &Snapshot) -> Jv {
     ])
 }
 
+fn gpu_device_json(s: &Snapshot) -> Jv {
+    s.gpu_sample().map_or_else(
+        || Jv::why("unsupported"),
+        |g| {
+            Jv::known_or(
+                g.device_pct.map(|pct| u64::from(pct.min(100)) * 10),
+                "not_sampled:device_utilization",
+            )
+        },
+    )
+}
+
 fn gpu_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
-    let Some(g) = s.gpu.as_ref() else {
+    let Some(g) = s.gpu_sample() else {
         return Jv::why("unsupported");
     };
-    let pm = |p: Option<u8>| Jv::known_or(p.map(|v| u64::from(v) * 10), "unsupported");
+    let pm = |p: Option<u8>| Jv::known_or(p.map(|v| u64::from(v.min(100)) * 10), "unsupported");
     let mut o = Jv::obj([
-        (
-            "device_pm",
-            Jv::u((g.load.raw * 1000.0).round().max(0.0) as u64),
-        ),
-        ("renderer_pm", pm(g.sample.renderer_pct)),
-        ("tiler_pm", pm(g.sample.tiler_pct)),
-        (
-            "in_use_bytes",
-            Jv::known_or(g.sample.in_use_bytes, "unsupported"),
-        ),
+        ("device_pm", gpu_device_json(s)),
+        ("renderer_pm", pm(g.renderer_pct)),
+        ("tiler_pm", pm(g.tiler_pct)),
+        ("in_use_bytes", Jv::known_or(g.in_use_bytes, "unsupported")),
         ("cores", Jv::known_or(g.cores.map(u64::from), "unsupported")),
         ("split_pm", gpu_split_json(ctx, s)),
         ("clients", Jv::why(GPU_LANE_OFF)),
-        ("exact", Jv::s("exact")),
+        (
+            "exact",
+            if g.device_pct.is_some() {
+                Jv::s("exact")
+            } else {
+                Jv::why("not_sampled:device_utilization")
+            },
+        ),
     ]);
     if let Some(n) = g.name.as_ref() {
         o.set("name", Jv::s(n.clone()));
     }
-    if g.split.is_some() {
+    if s.gpu.as_ref().is_some_and(|g| g.split.is_some()) {
         let (rows, withheld) = gpu_clients(ctx, s);
         o.set(
             "clients",

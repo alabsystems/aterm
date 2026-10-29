@@ -6,7 +6,8 @@
 //! ([`cache_root`]) only where none is found:
 //! - the chrome-headless-shell ([`Archive::host`]), where no headless browser is found
 //!   ([`super::headless_oauth::find_headless_browser`]) and a headless sign-in waits on one alone
-//!   (the Grok gate's automatic rung, `super::grok_signin::LiveAuto`): the browser lane's own pin;
+//!   (the Grok gate's automatic rung, `super::grok_signin::LiveAuto`, where the vendor's page
+//!   answers that browser, which accounts.x.ai's does not): the browser lane's own pin;
 //! - the full Chrome for Testing that opens a window ([`Archive::host_window`]), where no such
 //!   Chromium is found ([`super::browser_window::find_window_browser`]) and `aterm harness
 //!   accounts browser` would open one ([`super::browser_window::fetch_window_browser`]).
@@ -63,9 +64,10 @@ const FAILED_PREFIX: &str = ".failed-";
 const FAILED_WHY_MAX: usize = 240;
 
 /// How long a failure record is read ([`last_failure`]): a failed fetch says what the network or
-/// the cache was like then, and an older one no longer keeps `accounts browser` out of Grok
-/// Build's sign-in need, so one dropped connection does not leave the need on the mailbox for
-/// good. A later failure writes it anew.
+/// the cache was like then, and an older one no longer keeps `accounts browser` out of the steps
+/// Grok Build's sign-in gate names (its setup, `super::grok_signin::Setup`, and the way out of
+/// an automatic refusal), so one dropped connection does not keep it out for good. A later
+/// failure writes it anew.
 pub const FAILURE_KEPT: Duration = Duration::from_secs(60 * 60);
 
 /// A scratch left by a fetch that was killed is removed once it is this old.

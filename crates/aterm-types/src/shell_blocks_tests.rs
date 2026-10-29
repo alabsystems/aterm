@@ -66,3 +66,16 @@ fn command_and_output_rows_saturate_at_u64_max() {
     let rows = block.output_rows().expect("should have output rows");
     assert_eq!(rows, (u64::MAX, u64::MAX), "output_rows must not wrap");
 }
+
+#[test]
+fn command_and_output_rows_never_invert_when_end_precedes_start() {
+    let mut block = make_block(0, 10);
+    block.command_start_row = Some(10);
+    block.output_start_row = Some(8);
+    block.end_row = Some(5);
+    assert_eq!(block.command_rows(), Some((10, 10)));
+    assert_eq!(block.output_rows(), Some((8, 8)));
+
+    block.output_start_row = None;
+    assert_eq!(block.command_rows(), Some((10, 10)));
+}

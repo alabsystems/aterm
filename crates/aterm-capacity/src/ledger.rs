@@ -64,6 +64,9 @@ pub struct Held {
     pub admitted_ms: u64,
     /// The cores it was granted.
     pub cores: u32,
+    /// Whether its memory was admitted ALONE ([`crate::Short::Alone`]): while it is held, no
+    /// other memory claim is admitted.
+    pub alone: bool,
 }
 
 /// One claim's record: who holds it, for what, and whether it is admitted.
@@ -119,7 +122,19 @@ impl Record {
         o.insert("margin".to_owned(), Value::from(self.need.margin));
         o.insert("cores".to_owned(), Value::from(self.need.cores));
         o.insert("disk".to_owned(), Value::from(self.need.disk));
-        o.insert("quiet".to_owned(), Value::from(self.need.quiet));
+        let quiet = self.need.quiet.map(|q| {
+            if q.is_nan() || q < 0.0 {
+                0.0
+            } else if q.is_infinite() {
+                f64::MAX
+            } else {
+                q
+            }
+        });
+        o.insert("quiet".to_owned(), Value::from(quiet));
+        if self.need.alone {
+            o.insert("alone".to_owned(), Value::from(true));
+        }
         if let Some(p) = self.need.patience {
             let mut q = Map::new();
             q.insert("reserve_ms".to_owned(), Value::from(millis(p.reserve)));
@@ -139,6 +154,9 @@ impl Record {
         let mut o = Map::new();
         o.insert("admitted_ms".to_owned(), Value::from(held.admitted_ms));
         o.insert("cores".to_owned(), Value::from(held.cores));
+        if held.alone {
+            o.insert("alone".to_owned(), Value::from(true));
+        }
         line_of(o)
     }
 
@@ -199,26 +217,32 @@ impl Record {
         }
         let num = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64);
         let start_ms = num(&head, "start_ms")?;
-        let patience = head.get("patience").and_then(|p| {
-            Some(Patience {
+        let patience = match head.get("patience") {
+            None | Some(Value::Null) => None,
+            Some(p) => Some(Patience {
                 reserve: Duration::from_millis(num(p, "reserve_ms")?),
                 start: Duration::from_millis(num(p, "start_ms")?),
                 hold: Duration::from_millis(num(p, "hold_ms")?),
-            })
-        });
+            }),
+        };
+        let quiet = match head.get("quiet") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(v.as_f64().filter(|q| q.is_finite() && *q >= 0.0)?),
+        };
         let need = Need {
             what: head.get("what").and_then(Value::as_str)?.to_owned(),
             mem: num(&head, "mem")?,
             margin: num(&head, "margin").unwrap_or(0),
             cores: u32::try_from(num(&head, "cores")?).ok()?,
             disk: num(&head, "disk")?,
-            quiet: head.get("quiet").and_then(Value::as_f64),
+            quiet,
             patience,
             path: head
                 .get("volume")
                 .and_then(Value::as_str)
                 .map(PathBuf::from),
             checkout: None,
+            alone: head.get("alone").and_then(Value::as_bool) == Some(true),
         };
         // The lines after the head, in the order they were added: a quiet waiter's `next_ms`,
         // the admission, then the measured writes' (written over in place) and each credit,
@@ -233,11 +257,13 @@ impl Record {
                     Some(Held {
                         admitted_ms: num(v, "admitted_ms")?,
                         cores: u32::try_from(num(v, "cores")?).ok()?,
+                        alone: v.get("alone").and_then(Value::as_bool) == Some(true),
                     })
                 })
                 .unwrap_or(Held {
                     admitted_ms: start_ms,
                     cores: need.cores,
+                    alone: false,
                 })
         });
         let next_ms = after.iter().find_map(|v| num(v, "next_ms"));
@@ -335,6 +361,12 @@ impl Laid {
             Some(offset) => offset,
             None => self.lock.seek(SeekFrom::End(0))?,
         };
+        if offset.saturating_add(WROTE_LINE as u64) > RECORD_MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                format!("the record would pass {RECORD_MAX} bytes"),
+            ));
+        }
         self.lock.seek(SeekFrom::Start(offset))?;
         self.lock.write_all(Record::wrote_line(bytes).as_bytes())?;
         *at = Some(offset);

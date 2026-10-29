@@ -6,12 +6,13 @@
 //! [`super::wakes::WakeBook::declare`], the refusals of a peer outside the tree on
 //! [`super::declarer::prove`], an edge on `on_source` and `on_look`, the park on
 //! [`super::wakes::ParkBook::park`], the answer on `answer_begin` and `answer_done`, the claim, the
-//! write, the release and the reconcile on their own functions, each projected by the Tier-1 bind
-//! (`tests/conformance_wakes.rs`). Proof and test builds only.
+//! write, the release and the reconcile on their own functions (a left claim kept on
+//! `reconcile` too), each projected by the Tier-1 bind (`tests/conformance_wakes.rs`). Proof and
+//! test builds only.
 
 /// The world, the loop's and the board's steps, and the mutants of `WakeBook`: the levels a look
-/// reads, the need and the loop's door and guards the book's callers judge, a turn seen, and each
-/// `Buggy` member.
+/// reads, the need and the loop's door and guards the book's callers judge, a turn seen, a line
+/// left in the composer and what the person or the policy does with it, and each `Buggy` member.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
@@ -218,6 +219,46 @@
         machine = "WakeBook",
         action = "AnswerTwice",
         reason = "Buggy=15 negative control only; a second answer to a wake already answered, which WakeBook::answer_begin refuses"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "WakeBook",
+        action = "WriteLeft",
+        reason = "A door's write that left its claim's line in the composer unsent (Written::Left): the loop's (Session::left_write books its left row and keeps the claim, FactsState::leave, bound to LeftWrite by tests/conformance_left.rs). The book is not called: the claim stays Claimed. The Tier-1 bind books the left row exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "WakeBook",
+        action = "SubmitLeft",
+        reason = "The left line sent, by the person's Enter or the policy's draft step: the session's, which the loop sees as its submit count risen at its next look. The Tier-1 bind tells the book (Write) only after it."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "WakeBook",
+        action = "ClearLeft",
+        reason = "The left line cleared from the composer unsent: the person's. The Tier-1 bind gives the claim back (Release) only after it."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "WakeBook",
+        action = "ReleaseOnLeft",
+        reason = "Buggy=16 negative control only; a claim given back while its line stands left, as every door did before the slice-2 plan's 2.9b (the Tier-1 bind plants ReleaseOnLeft in reconcile_claim)"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "WakeBook",
+        action = "KeepOnClear",
+        reason = "Buggy=1 liveness mutant only; a claim kept for good though its left line was cleared unsent, which FactsState::look releases (tests/conformance_left.rs plants LeftNeverSettles)"
     )
 )]
 #[doc(hidden)]

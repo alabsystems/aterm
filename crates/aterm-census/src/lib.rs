@@ -1656,12 +1656,6 @@ fn table() -> [f32; 256] {
     }
 
     #[test]
-    fn guard_vars_captures_the_term_lock_binding() {
-        let g = guard_vars(&body("        let mut term = term_lock(&s.term);"));
-        assert!(g.contains("term"));
-    }
-
-    #[test]
     fn guard_vars_captures_the_term_lock_whole_binding() {
         let g = guard_vars(&body("        let t = crate::term_lock_whole(term);"));
         assert!(

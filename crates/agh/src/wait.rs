@@ -296,7 +296,7 @@ const CONDITIONS: &str = "conditions: exists, published, prerelease, latest, not
 /// is called any of these.
 #[inline]
 fn asset_name(name: &str) -> bool {
-    !name.is_empty() && name != "." && name != ".." && !name.bytes().any(|b| b < 0x20 || b == 0x7f)
+    crate::github::public::refuse_bad_asset(name).is_ok()
 }
 
 /// `path::refuse_bad_tag` for a wait on `tag` of `slug`, given before any request: no round
@@ -486,6 +486,23 @@ impl Condition for ReleaseCondition {
 
     fn check(&mut self, gh: &Github) -> Result<Verdict> {
         refuse_tag(&self.observer.tag, &self.observer.slug)?;
+        match &self.cond {
+            ReleaseCond::Asset(names) => {
+                for name in names {
+                    crate::github::public::refuse_bad_asset(name).map_err(|e| {
+                        e.with_next("agh help release wait")
+                            .with_repo(self.observer.slug.to_string())
+                    })?;
+                }
+            }
+            ReleaseCond::Digest { name, .. } | ReleaseCond::AnonVisible(name) => {
+                crate::github::public::refuse_bad_asset(name).map_err(|e| {
+                    e.with_next("agh help release wait")
+                        .with_repo(self.observer.slug.to_string())
+                })?;
+            }
+            _ => {}
+        }
         if let ReleaseCond::AnonVisible(name) = &self.cond {
             let observer = &self.observer;
             return match gh.public().probe(&observer.slug, &observer.tag, name) {

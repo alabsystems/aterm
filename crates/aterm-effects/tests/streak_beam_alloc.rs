@@ -28,24 +28,14 @@ fn geom() -> Geom {
 
 fn cfg(style: GlowStyle) -> GlowConfig {
     GlowConfig {
-        classic_mono: false,
-        ribbon_tall: true,
-        ribbon_flat: false,
-        enabled: true,
-        dark_theme: true,
-        theme_fg: 0x00C8_D3F5,
-        theme_bg: 0x001A_1B26,
         style,
-        color: 0x0050_FA7B,
         accent: 0x007A_A2F7,
         duration: Duration::from_millis(240),
         length: 18,
-        intensity: 1.0,
-        audible: false,
         radius: 0.6,
         ring: true,
         beam: true,
-        head_dx: 0.5,
+        ..Default::default()
     }
 }
 

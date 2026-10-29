@@ -4,8 +4,9 @@
 //! Mount-table enumeration, volume space queries, and pure path-to-mount lookups.
 //!
 //! [`table`] lists mounts without querying remote filesystems; [`mount_of`],
-//! [`mounts_under`], [`Table::is_under`], and [`Table::is_mount_point`] resolve
-//! paths lexically across macOS firmlinks and Windows volume GUIDs/`subst` drives.
+//! [`mounts_under`], and [`Table::is_mount_point`] resolve paths lexically across
+//! macOS firmlinks and Windows volume GUIDs/`subst` drives, while [`Table::is_under`]
+//! resolves Windows volume mounts/`subst` drives and uses `Path::starts_with` elsewhere.
 //! [`read`] queries only local, non-automounted volumes, and [`file_id`] returns
 //! device and inode/file-ID identity.
 
@@ -217,8 +218,9 @@ impl Table {
         self.on_data(path).unwrap_or_else(|| path.to_path_buf())
     }
 
-    /// Check whether `path` is at or under `dir`, resolving macOS firmlinks and
-    /// Windows volume mounts/`subst` drives. Returns `None` if placement is ambiguous.
+    /// Check whether `path` is at or under `dir`, resolving Windows volume mounts and
+    /// `subst` drives (`None` if placement is ambiguous) and using `Path::starts_with`
+    /// as [`paths::is_under`] elsewhere.
     #[must_use]
     pub fn is_under(&self, path: &Path, dir: &Path) -> Option<bool> {
         under_in(path, dir, self, cfg!(windows))
@@ -966,7 +968,8 @@ pub fn is_fixed(m: &Mount) -> Option<bool> {
 ///
 /// # Errors
 ///
-/// Returns [`Unread::NoMount`] if unmounted in `t`, or the error from [`read`].
+/// Returns [`Unread::Unsupported`] on unsupported platforms, [`Unread::NoMount`] if
+/// unmounted in `t`, or the error from [`read`].
 pub fn read_path(path: &Path, t: &Table) -> Result<Reading, Unread> {
     if cfg!(not(any(target_os = "macos", target_os = "linux", windows))) {
         return Err(Unread::Unsupported);

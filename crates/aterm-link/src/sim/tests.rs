@@ -352,7 +352,7 @@ fn each_rule_switched_off_is_caught() {
                 o
             }),
             "model:",
-            14,
+            78,
         ),
         (
             "the endpoint forgets the offsets a move took (no loss)",
@@ -520,7 +520,7 @@ fn each_rule_switched_off_is_caught() {
             "the attach records the predecessor's will it read",
             Box::new(|s| Opts::with_a_sibling(s).with(Mutant::IgnoreWitnessedWill)),
             "presence:",
-            10,
+            25,
         ),
         (
             "a lower incarnation's row under another state dir's mark is not its own",
@@ -538,7 +538,7 @@ fn each_rule_switched_off_is_caught() {
             "an offset below the self-lane window is not added to it",
             Box::new(|s| Opts::seed(s).with(Mutant::RememberBelowTheWindow)),
             "forged-self",
-            28,
+            92,
         ),
         (
             "the recovery a write error stopped is done before the run record",
@@ -556,19 +556,19 @@ fn each_rule_switched_off_is_caught() {
             "an own record is delivered only once its in-flight entry is gone",
             Box::new(|s| Opts::seed(s).with(Mutant::DeliverPastAStandingEntry)),
             "dup delivery",
-            558,
+            14,
         ),
         (
             "a mirror floor covers a batch only once this open made it durable",
             Box::new(|s| Opts::seed(s).with(Mutant::TrustTheFloorThatReads)),
             "mirror total",
-            683,
+            443,
         ),
         (
             "an attach delivers on a new log only once its witness is written",
             Box::new(|s| both_ways(s).with(Mutant::AttachPastAnUnwrittenWitness)),
             "dup delivery",
-            681,
+            158,
         ),
         (
             "a run whose recovery is owed makes no clean stop",
@@ -580,7 +580,7 @@ fn each_rule_switched_off_is_caught() {
             "a recovery tried again moves each file once",
             Box::new(|s| both_ways_erring(s).with(Mutant::CopyOnEveryTry)),
             "quarantine copies:",
-            1,
+            17,
         ),
         (
             "the broker escalates aterm's table (the oracle keeps it)",
@@ -666,7 +666,7 @@ fn each_rule_switched_off_is_caught() {
             "a read back that meets its subject's floor reads again told",
             Box::new(|s| Opts::seed(s).with(Mutant::ReadBackWithoutTheHeld)),
             "dup post",
-            104,
+            602,
         ),
         (
             "a read of one offset below its filter's oldest reads again told (F3)",
@@ -684,7 +684,7 @@ fn each_rule_switched_off_is_caught() {
             "a topic replay reads on from a floor retention raised (F4)",
             Box::new(|s| asking(s).with(Mutant::TopicReplayWithAPlainFetch)),
             "topic:",
-            3,
+            13,
         ),
         (
             "a topic replay tells aterm what retention gave up of the topic (F4)",
@@ -696,7 +696,7 @@ fn each_rule_switched_off_is_caught() {
             "a topic catch-up tells the uncounted notice below the first broadcast it delivers (F4)",
             Box::new(|s| asking(s).with(Mutant::TopicReplayDropsAnUncountedNotice)),
             "silent skip",
-            463,
+            233,
         ),
         (
             "the broadcast face's gap notice hands its cursors to the catch-up (F4)",
@@ -715,37 +715,37 @@ fn each_rule_switched_off_is_caught() {
             Box::new(|s| asking(s).with(Mutant::ExpireWithoutReadingBack)),
             " expired 2 times",
             // 1149 before the merge with critic item B09's refill and the review's fixes.
-            1688,
+            5832,
         ),
         (
             "a hand-off whose heads the disk refuses keeps the journal (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::HandOffWithoutTheHeads)),
             "dup post|answered 2 times| expired 2 times",
-            126,
+            466,
         ),
         (
             "an answer is delivered only once the deadline it settles is off the disk (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::DeliverOverAnUnwrittenSettle)),
             "was handed",
-            537,
+            472,
         ),
         (
             "an attach takes a hand-off's files before its incarnation (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::AdoptAfterTheAttach)),
             "dup post|answered 2 times| expired 2 times",
-            202,
+            244,
         ),
         (
             "an adoption names the attach of the hand-off it takes (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::AdoptWithoutTheAttach)),
             "dup post|answered 2 times| expired 2 times",
-            202,
+            5132,
         ),
         (
             "a post retires only once its deadline is on disk (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::RetireOverAnUnwrittenDeadline)),
             "neither answered nor expired",
-            336,
+            360,
         ),
     ];
     // The replay's drain rule (a record the attach published again is delivered once its
@@ -912,6 +912,14 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
         400,
         "an entry read back from its head on a log a move continued below it",
     ),
+    // R6's proof (a successor's start that writes nothing) moved 558's, 4067's and 36319's
+    // trajectories off this bug (each holds every law still); the first seed of a plain search
+    // to 60,000 that reaches it with its rule off.
+    (
+        9002,
+        400,
+        "an entry read back from its head on a log a move continued below it",
+    ),
     // The post journal (B19) and its review (each attach named in the journal) moved every
     // seed's writes, so not every row reaches its bug with the rule off any more; each rule
     // keeps one that does (each_found_bug_is_reached_again_with_its_rule_off), 31 added for
@@ -1021,6 +1029,13 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
         400,
         "a record dropped while the disk refused the drop",
     ),
+    // R6's proof moved 10236's and 8680's trajectories off this bug (each holds every law
+    // still); the first seed of this world that reaches it with its rule off.
+    (
+        1851,
+        400,
+        "a record dropped while the disk refused the drop",
+    ),
 ];
 
 const FOUND_BOTH_WAYS: &[(u64, usize, &str)] = &[
@@ -1049,6 +1064,13 @@ const FOUND_BOTH_WAYS_ERRING: &[(u64, usize, &str)] = &[
     ),
     (
         7755,
+        400,
+        "a move an `auto` mirror met before its hello left its pinned batch to recover",
+    ),
+    // R6's proof moved 6751's and 7755's trajectories off this bug (each holds every law
+    // still); the first seed of this world that reaches it with its rule off.
+    (
+        735,
         400,
         "a move an `auto` mirror met before its hello left its pinned batch to recover",
     ),
@@ -1085,6 +1107,14 @@ const FOUND_QUITTING: &[FoundIn] = &[
     (
         erring_quitting,
         41,
+        400,
+        "a post retried at its pin after a cut dropped its key",
+    ),
+    // R6's proof moved 41's trajectory off this bug (it holds every law still); the first seed
+    // of this world that reaches it with its rule off.
+    (
+        erring_quitting,
+        46,
         400,
         "a post retried at its pin after a cut dropped its key",
     ),
@@ -1418,7 +1448,7 @@ fn a_torn_mirror_pin_after_a_power_cut_is_set_aside_and_the_mirror_resumes() {
         "the same seed with the torn pin kept, on a device that never tears, breaks no law"
     );
     for (mutant, law, witness) in [
-        (Mutant::KeyInThePinAlone, "alias keys", 7),
+        (Mutant::KeyInThePinAlone, "alias keys", 3),
         (Mutant::TotalInThePinAlone, "mirror total", 3),
     ] {
         let off = breaking_at(
@@ -2328,6 +2358,248 @@ fn once_an_attach_is_admitted_a_power_cut_never_reads_the_clean_stop() {
     }
 }
 
+/// A world's core for the proof laws: a tearing device under the state dir at `root`.
+fn proof_world(root: &std::path::Path, seed: u64) -> std::sync::Arc<super::Core> {
+    let mut device = Device::new(root);
+    device.tears = true;
+    super::Core::new(
+        seed,
+        bus::Broker::new(Tier::Strict, Escalation::aterm()),
+        device,
+    )
+}
+
+/// The state dir on `core`'s device, opened by process `pid` in boot `n`, its proofs made and read
+/// by `rule`.
+fn proof_open(
+    core: &std::sync::Arc<super::Core>,
+    root: &std::path::Path,
+    pid: u64,
+    n: u8,
+    rule: crate::state::ProofRule,
+) -> crate::state::StateDir {
+    let process = super::Process::new(std::sync::Arc::clone(core), pid);
+    let st = crate::state::StateDir::open_on(root, crate::fx::Disk::Sim(process))
+        .expect("the state dir on the device");
+    st.set_inc_seam(crate::state::IncSeam {
+        boot: Some(Some(crate::durability::test_boot(n))),
+        off_volume: false,
+        kill_at: None,
+        mutant: 0,
+        span: None,
+    });
+    st.set_proof_rule(rule);
+    st
+}
+
+/// R6: A START THE PROOF ADMITTED LEAVES NO CLEAN STOP UNDER A POWER CUT. A successor that finds
+/// the OPEN it would write, its inode the one `run.durable` links, writes nothing, so the law of
+/// [`once_an_attach_is_admitted_a_power_cut_never_reads_the_clean_stop`] must hold with the proof
+/// standing in for that write. Boot 1 runs and stops cleanly; a second start, in the same boot or
+/// the next, finishes, is killed at a write, or has its record's rename made and its directory
+/// flush fail; two successors in turn, each a handoff's or a restart's, attach in that boot;
+/// a tearing power cut follows. Every schedule in which an attach was admitted reads an open
+/// record after the cut. Controls: the proof made as soon as the rename is visible, whatever its
+/// flush does ([`crate::state::ProofRule::AtTheRename`]), and a proof read by its presence, not
+/// by the inode it links ([`crate::state::ProofRule::ByPresence`]): each leaves an admitted attach
+/// under the clean stop's record. The law also counts successors the proof admitted, after a
+/// start in full in the same boot and, after a reboot, after a start by the barrier that the
+/// boot's first incarnation flushed.
+#[test]
+fn a_start_its_proof_admitted_never_leaves_the_clean_stop_under_a_power_cut() {
+    use crate::state::{Flushed, ProofRule, StateDir};
+    for (control, rule) in [
+        ("", ProofRule::Ships),
+        ("at_the_rename", ProofRule::AtTheRename),
+        ("by_presence", ProofRule::ByPresence),
+    ] {
+        let attach = |st: &StateDir| -> Result<Flushed, &'static str> {
+            let began = st.begin_run().map_err(|_| "its start failed")?;
+            st.take_incarnation(0)
+                .map_err(|_| "its incarnation failed")?;
+            Ok(began)
+        };
+        let (mut admitted, mut broken) = (0u64, 0u64);
+        let mut proven = [0u64; 2];
+        for reboot in [false, true] {
+            let b = if reboot { 2 } else { 1 };
+            for seed in 1..=16u64 {
+                for fault in 0..=5u64 {
+                    let dir = aterm_tempfile::Builder::new()
+                        .prefix("sim-proof-run")
+                        .tempdir_in("/tmp")
+                        .expect("scratch");
+                    let root = dir.path();
+                    let core = proof_world(root, seed);
+                    let first = proof_open(&core, root, 1, 1, rule);
+                    first.begin_run().expect("boot 1's run");
+                    first.take_incarnation(0).expect("boot 1's incarnation");
+                    write_every_torn_kind(&first);
+                    first.end_run_clean().expect("its clean stop");
+                    drop(first);
+                    if reboot {
+                        core.device.power_cut(&mut Rng::new(seed));
+                    }
+                    let second = proof_open(&core, root, 2, b, rule);
+                    match fault {
+                        0 => {}
+                        5 => core.device.fail_after_its_rename(&root.join("run")),
+                        k => core.arm_kill(2, k),
+                    }
+                    let tried =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| attach(&second)));
+                    core.disarm_kill();
+                    if fault == 5 {
+                        assert!(
+                            matches!(tried, Ok(Err("its start failed"))),
+                            "control {control:?}, reboot={reboot}, seed {seed}: the fault named \
+                             fails the second start: {tried:?}"
+                        );
+                    }
+                    let mut any = match tried {
+                        Err(payload) => {
+                            assert!(payload.is::<super::SimKill>(), "a real panic in the start");
+                            false
+                        }
+                        Ok(began) => began.is_ok(),
+                    };
+                    drop(second);
+                    for pid in [3, 4] {
+                        let successor = proof_open(&core, root, pid, b, rule);
+                        if let Ok(began) = attach(&successor) {
+                            any = true;
+                            proven[usize::from(reboot)] += u64::from(began.proven);
+                        }
+                    }
+                    core.device.power_cut(&mut Rng::new(seed * 64 + fault));
+                    let next = StateDir::open(root).expect("the next boot's look");
+                    next.set_inc_seam(crate::state::IncSeam {
+                        boot: Some(Some(crate::durability::test_boot(b + 1))),
+                        ..crate::state::IncSeam::default()
+                    });
+                    if any {
+                        admitted += 1;
+                        broken += u64::from(matches!(next.last_run(), Ok(Some(run)) if run.clean));
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "proof of the run, control {control:?}: {admitted} schedules admitted an attach, \
+             {broken} of them read the clean stop after the cut; successors admitted by the \
+             proof: {} in the same boot, {} after a reboot",
+            proven[0], proven[1]
+        );
+        if control.is_empty() {
+            assert_eq!(
+                broken, 0,
+                "an admitted attach under the clean stop's record"
+            );
+            assert!(
+                admitted > 0 && proven[0] > 0 && proven[1] > 0,
+                "the law was exercised, the proof after a start in full and after one the \
+                 barrier ordered"
+            );
+        } else {
+            assert!(
+                broken > 0,
+                "CONTROL {control}: an admitted attach never under the clean stop's record"
+            );
+        }
+    }
+}
+
+/// R6: A FLOOR ITS PROOF ADMITTED IS NEVER TAKEN BACK BY A POWER CUT. Every floor a raise answers
+/// is one the mirror sends batches under, so a later boot must read one at least as high. A
+/// first open raises the floor; a second raises it again and finishes, is killed at a write, or
+/// has its rename made and its directory flush fail; two fresh opens of the same boot, each a
+/// successor's, raise to a top below it, admitting the floor that reads where `logfloor.durable`
+/// links its inode ([`crate::state::StateDir::admit_logfloor_by_its_proof`]) and writing it again
+/// where it does not; a tearing power cut follows. Controls as for the run's proof
+/// ([`a_start_its_proof_admitted_never_leaves_the_clean_stop_under_a_power_cut`]): each lets a
+/// cut take back a floor a batch was sent under.
+#[test]
+fn a_floor_its_proof_admitted_is_never_taken_back_by_a_power_cut() {
+    use crate::state::{ProofRule, StateDir};
+    for (control, rule) in [
+        ("", ProofRule::Ships),
+        ("at_the_rename", ProofRule::AtTheRename),
+        ("by_presence", ProofRule::ByPresence),
+    ] {
+        let (mut runs, mut broken, mut proven) = (0u64, 0u64, 0u64);
+        for seed in 1..=16u64 {
+            for fault in 0..=5u64 {
+                let dir = aterm_tempfile::Builder::new()
+                    .prefix("sim-proof-floor")
+                    .tempdir_in("/tmp")
+                    .expect("scratch");
+                let root = dir.path();
+                let core = proof_world(root, seed);
+                let first = proof_open(&core, root, 1, 1, rule);
+                let mut sent_under = first.raise_logfloor(100).expect("the first floor");
+                drop(first);
+                let second = proof_open(&core, root, 2, 1, rule);
+                match fault {
+                    0 => {}
+                    5 => core
+                        .device
+                        .fail_after_its_rename(&root.join(crate::state::LOGFLOOR)),
+                    k => core.arm_kill(2, k),
+                }
+                let tried = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    second.raise_logfloor(200)
+                }));
+                core.disarm_kill();
+                match tried {
+                    Err(payload) => {
+                        assert!(payload.is::<super::SimKill>(), "a real panic in the raise");
+                    }
+                    Ok(Ok(floor)) => sent_under = sent_under.max(floor),
+                    Ok(Err(_)) => {}
+                }
+                if fault == 5 {
+                    assert!(
+                        !second.logfloor_admitted(),
+                        "control {control:?}, seed {seed}: the fault named fails the raise"
+                    );
+                }
+                drop(second);
+                for pid in [3, 4] {
+                    let successor = proof_open(&core, root, pid, 1, rule);
+                    let before = successor.ops().fsyncs;
+                    if let Ok(floor) = successor.raise_logfloor(150) {
+                        sent_under = sent_under.max(floor);
+                        proven += u64::from(successor.ops().fsyncs == before);
+                    }
+                }
+                core.device.power_cut(&mut Rng::new(seed * 64 + fault));
+                let after = StateDir::open(root)
+                    .expect("the next boot's look")
+                    .logfloor()
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+                runs += 1;
+                broken += u64::from(after < sent_under);
+            }
+        }
+        eprintln!(
+            "proof of the floor, control {control:?}: {runs} schedules, {broken} of them read a \
+             floor below one a batch was sent under after the cut; {proven} raises admitted by \
+             the proof"
+        );
+        if control.is_empty() {
+            assert_eq!(broken, 0, "a floor a batch was sent under, taken back");
+            assert!(proven > 0, "the law was exercised");
+        } else {
+            assert!(
+                broken > 0,
+                "CONTROL {control}: no cut ever takes back a floor a batch was sent under"
+            );
+        }
+    }
+}
+
 fn rewrite_every_torn_kind(st: &crate::state::StateDir) {
     let pin = |seq| crate::state::PublishPin {
         seq,
@@ -2362,7 +2634,7 @@ fn rewrite_every_torn_kind(st: &crate::state::StateDir) {
 
 #[test]
 fn a_durable_write_whose_flush_failed_is_not_trusted_and_is_written_again() {
-    use crate::state::{StateDir, LOGFLOOR};
+    use crate::state::{StateDir, LOGFLOOR, LOGFLOOR_PROOF};
     let boot = |n| crate::state::IncSeam {
         boot: Some(Some(crate::durability::test_boot(n))),
         off_volume: false,
@@ -2480,10 +2752,27 @@ fn a_durable_write_whose_flush_failed_is_not_trusted_and_is_written_again() {
             assert_eq!(st.raise_logfloor(60).unwrap(), 100);
             assert_eq!(st.ops().fsyncs, before, "a floor this open made durable");
             let (_fresh_core, fresh) = open(root, 3);
-            assert!(!fresh.logfloor_admitted(), "a fresh open admits none");
+            assert!(
+                !fresh.logfloor_admitted(),
+                "a fresh open has admitted none by a write of its own"
+            );
             let before = fresh.ops().fsyncs;
             assert_eq!(fresh.raise_logfloor(60).unwrap(), 100);
-            assert_eq!(fresh.ops().fsyncs, before + 2, "its first raise writes it");
+            assert_eq!(
+                fresh.ops().fsyncs,
+                before,
+                "its first raise admits the floor the proof links, written by none (R6)"
+            );
+            assert!(fresh.logfloor_admitted());
+            std::fs::remove_file(root.join(LOGFLOOR_PROOF)).expect("the proof");
+            let (_bare_core, bare) = open(root, 4);
+            let before = bare.ops().fsyncs;
+            assert_eq!(bare.raise_logfloor(60).unwrap(), 100);
+            assert_eq!(
+                bare.ops().fsyncs,
+                before + 2,
+                "CONTROL: with no proof, a fresh open's first raise writes it"
+            );
         }
         let _ = core.device.power_cut(&mut Rng::new(cut));
         st.logfloor().unwrap()
@@ -2984,7 +3273,7 @@ fn the_round_refines_its_exactly_once_model() {
     })
     .expect("some run delivered a record a move took");
     assert!(taken.violations.is_empty(), "{}", report(&taken));
-    let reused = witnessed(&Opts::seed, 14, RARE_SEEDS, &|out| {
+    let reused = witnessed(&Opts::seed, 108, RARE_SEEDS, &|out| {
         out.model.2.contains("Reuse")
     })
     .expect("some committed run put a later record at an offset a move took");

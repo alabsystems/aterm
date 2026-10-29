@@ -3293,7 +3293,7 @@ fn text_ticks(row: &Live, layout: &RowLayout, q: Instant, look: Look) -> [Option
     let e = q.saturating_duration_since(row.started_at);
     let elapsed = layout
         .elapsed
-        .map(|_| row.started_at + e + elapsed_word_change(e));
+        .and_then(|_| elapsed_word_change(e).map(|d| row.started_at + e + d));
     if layout.eta.is_some() {
         [elapsed, row.track.next_change(q), None]
     } else {
@@ -3483,8 +3483,7 @@ fn carried_message(l: &Live, on_glass: bool, posted_severity: Option<Severity>) 
             .msg
             .meter
             .as_ref()
-            .map(|m| m.stats.clone())
-            .unwrap_or_default(),
+            .map_or_else(String::new, |m| m.stats.clone()),
         busy: l.msg.meter.as_ref().is_some_and(|m| m.busy),
         on_glass,
         excerpt: l.msg.excerpt,

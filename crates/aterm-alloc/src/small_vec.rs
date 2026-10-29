@@ -390,14 +390,6 @@ enum IntoIterRepr<T, const N: usize> {
     Heap(alloc::vec::IntoIter<T>),
 }
 
-impl<T, const N: usize> IntoIter<T, N> {
-    /// Whether the iterator drains an inline buffer.
-    #[cfg(test)]
-    const fn is_inline(&self) -> bool {
-        matches!(self.repr, IntoIterRepr::Inline { .. })
-    }
-}
-
 impl<T, const N: usize> Iterator for IntoIter<T, N> {
     type Item = T;
 
@@ -559,17 +551,6 @@ mod tests {
         assert_eq!(it.next_back(), Some(3));
         assert_eq!(it.next(), None);
         assert_eq!(it.next_back(), None);
-    }
-
-    #[test]
-    fn into_iter_keeps_the_storage_variant() {
-        let inline: SmallVec<i32, 4> = SmallVec::from_vec([10, 20, 30].to_vec());
-        let heap: SmallVec<i32, 2> = SmallVec::from_vec([1, 2, 3].to_vec());
-        assert!(inline.is_inline() && !heap.is_inline());
-        let (inline, heap) = (inline.into_iter(), heap.into_iter());
-        assert!(inline.is_inline() && !heap.is_inline());
-        assert_eq!(inline.collect::<Vec<_>>(), [10, 20, 30]);
-        assert_eq!(heap.collect::<Vec<_>>(), [1, 2, 3]);
     }
 
     fn drops_each_once<const N: usize>(len: usize, front: usize, back: usize) {

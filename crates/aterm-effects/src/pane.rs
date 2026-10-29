@@ -191,13 +191,14 @@ pub fn translate_free_into_pane(
     if free.is_empty() {
         return;
     }
-    let px_box = place.px_box();
+    let (x0, y0, x1, y1) = place.px_box();
+    let box_rect = aterm_core::render::PxRect::new(x0, y0, x1, y1);
     let (dx, dy) = place.px_shift();
     free.retain_mut(|s| {
         s.x = s.x.saturating_add(dx);
         s.y = s.y.saturating_add(dy);
-        s.clip = s.clip.translate(dx, dy);
-        crop_free_sprite(s, px_box)
+        s.clip = s.clip.translate(dx, dy).intersect(box_rect);
+        !s.is_blank()
     });
 }
 
@@ -222,17 +223,20 @@ pub fn translate_nova_into_pane(nova: &mut Vec<aterm_render::GlowQuad>, place: P
         return;
     }
     let (bx0, by0, bx1, by1) = place.px_box();
+    let (clamp_x0, clamp_y0) = (bx0.max(0), by0.max(0));
+    let (clamp_x1, clamp_y1) = (bx1.min(i32::from(u16::MAX)), by1.min(i32::from(u16::MAX)));
+    if clamp_x1 <= clamp_x0 || clamp_y1 <= clamp_y0 {
+        nova.clear();
+        return;
+    }
     let (dx, dy) = place.px_shift();
     nova.retain_mut(|q| {
         let x0 = i32::from(q.x).saturating_add(dx);
         let y0 = i32::from(q.y).saturating_add(dy);
         let x1 = x0.saturating_add(i32::from(q.w));
         let y1 = y0.saturating_add(i32::from(q.h));
-        let (cx0, cy0) = (x0.max(bx0).max(0), y0.max(by0).max(0));
-        let (cx1, cy1) = (
-            x1.min(bx1).min(i32::from(u16::MAX)),
-            y1.min(by1).min(i32::from(u16::MAX)),
-        );
+        let (cx0, cy0) = (x0.max(clamp_x0), y0.max(clamp_y0));
+        let (cx1, cy1) = (x1.min(clamp_x1), y1.min(clamp_y1));
         if cx1 <= cx0 || cy1 <= cy0 {
             return false;
         }

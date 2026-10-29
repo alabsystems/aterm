@@ -35,11 +35,44 @@ pub(crate) enum MenuAct {
     Fact(Fact, FactAct),
 }
 
-/// Owner of the open card (Autopilot chip or composer-rule fact).
+/// Owner of the open card (Autopilot chip, a program's own cell, or composer-rule fact).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MenuOwner {
     Autopilot,
+    /// The Autopilot menu a program asked for at a cell of its own screen
+    /// (`@<sid> open autopilot-menu at=`), with what it opened over.
+    Program(ProgramAnchor),
     Fact(Fact),
+}
+
+/// What a program's Autopilot menu opened over, all of which it stands on: the frame cells of
+/// the session's pane, the session's foreground group, and which of its screens (main or
+/// alternate) shows. A program that exits or is replaced changes the group or the screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProgramAnchor {
+    pane: MenuRect,
+    pgid: i32,
+    alternate: bool,
+}
+
+/// The Autopilot menu a program asks for at a cell of its own screen
+/// (`@<sid> open autopilot-menu at=<row>,<col> [by=pointer|keys]`), as the wire reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProgramMenu {
+    /// The session the request is aimed at.
+    pub(crate) session: u64,
+    /// The 0-based `(row, col)` of the session's own screen.
+    pub(crate) cell: (usize, usize),
+    /// `by=keys`: the first choice lit, as a keyboard open lights it.
+    pub(crate) keyboard: bool,
+}
+
+impl MenuOwner {
+    /// Whether the card is the Autopilot menu, the chip's or a program's.
+    #[must_use]
+    pub(crate) const fn is_autopilot(self) -> bool {
+        matches!(self, Self::Autopilot | Self::Program(_))
+    }
 }
 
 impl MenuAct {
@@ -814,7 +847,7 @@ impl AutopilotMenu {
     #[must_use]
     pub(crate) fn controls_lines(&self, sid: &str) -> Vec<String> {
         let (target, fact) = match self.owner {
-            MenuOwner::Autopilot => ("autopilot-menu", String::new()),
+            MenuOwner::Autopilot | MenuOwner::Program(_) => ("autopilot-menu", String::new()),
             MenuOwner::Fact(fact) => ("fact-menu", format!(" fact={}", fact.key())),
         };
         let mut out = vec![format!(
@@ -1013,6 +1046,18 @@ impl App {
         anchor: (usize, usize),
         keyboard: bool,
     ) {
+        self.open_autopilot_menu_as(MenuOwner::Autopilot, wid, session, anchor, keyboard);
+    }
+
+    /// [`Self::open_autopilot_menu`] for `owner`, whose anchor [`Self::paint_autopilot_menu`] checks.
+    fn open_autopilot_menu_as(
+        &mut self,
+        owner: MenuOwner,
+        wid: WindowId,
+        session: u64,
+        anchor: (usize, usize),
+        keyboard: bool,
+    ) {
         self.close_autopilot_menu();
         self.autopilot_menu_spent = None;
         self.note_land_at_offer();
@@ -1031,7 +1076,7 @@ impl App {
             .filter(|ws| ws.pointer_position_known)
             .map(|ws| ws.last_cursor_px);
         self.autopilot_menu = Some(AutopilotMenu {
-            owner: MenuOwner::Autopilot,
+            owner,
             wid,
             session,
             focus,
@@ -1053,7 +1098,7 @@ impl App {
         if !self
             .autopilot_menu
             .as_ref()
-            .is_some_and(|menu| menu.session == local_id && menu.owner == MenuOwner::Autopilot)
+            .is_some_and(|menu| menu.session == local_id && menu.owner.is_autopilot())
         {
             return;
         }
@@ -1177,6 +1222,85 @@ impl App {
         Ok(())
     }
 
+    /// Open `request.session`'s Autopilot menu at `request.cell`, a 0-based cell of its own
+    /// screen, for the program drawing there (`@<sid> open autopilot-menu at=<row>,<col>`),
+    /// which shows no Autopilot chip of aterm's: only where the session is the front window's
+    /// focused one, as every reader and key of the card is the front window's, and on its live
+    /// screen, the cell clamped into its pane. The card stands while the session keeps what it
+    /// opened over ([`ProgramAnchor`]); it types nothing into the session, and its rows are the
+    /// chip's.
+    pub(crate) fn open_program_autopilot_menu(
+        &mut self,
+        request: ProgramMenu,
+    ) -> Result<(), String> {
+        let ProgramMenu {
+            session,
+            cell: (row, col),
+            keyboard,
+        } = request;
+        let wid = self
+            .frontmost_window
+            .filter(|&wid| self.focused_session_id(wid) == Some(session))
+            .ok_or_else(|| "the session is not focused in the front window".to_string())?;
+        if !self.shows_live_screen(session) {
+            return Err("the session's pane is scrolled back or rewound".to_string());
+        }
+        let stands_on = self
+            .program_anchor(wid, session)
+            .ok_or_else(|| "the session's pane shows no cells".to_string())?;
+        let pane = stands_on.pane;
+        let anchor = (
+            pane.row + row.min(pane.h - 1),
+            pane.col + col.min(pane.w - 1),
+        );
+        self.open_autopilot_menu_as(
+            MenuOwner::Program(stands_on),
+            wid,
+            session,
+            anchor,
+            keyboard,
+        );
+        Ok(())
+    }
+
+    /// What a program's menu over `session` in `wid` stands on now ([`ProgramAnchor`]), or
+    /// `None` where no pane of `wid` shows frame cells of it.
+    fn program_anchor(&self, wid: WindowId, session: u64) -> Option<ProgramAnchor> {
+        self.visible_session_rect(wid, session)?;
+        let (rows, cols) = self.autopilot_menu_pane(wid, session);
+        if rows.is_empty() || cols.is_empty() {
+            return None;
+        }
+        let entry = self.pool.get(session)?;
+        let pgid = entry
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .agent()
+            .program_pgid;
+        Some(ProgramAnchor {
+            pane: MenuRect {
+                row: rows.start,
+                col: cols.start,
+                w: cols.len(),
+                h: rows.len(),
+            },
+            pgid,
+            alternate: crate::term_lock(&entry.term).is_alternate_screen(),
+        })
+    }
+
+    /// Whether `session`'s pane shows its live screen, the one a program's cells name: neither
+    /// scrolled back nor under a Rewind view.
+    fn shows_live_screen(&self, session: u64) -> bool {
+        !self.pool.is_rewound(session)
+            && self
+                .pool
+                .get(session)
+                .is_some_and(|entry| crate::term_lock(&entry.term).grid().display_offset() == 0)
+    }
+
     /// Paint the open menu into `wid`'s frame scratch, or close it if its anchor or focus moved.
     pub(crate) fn splice_autopilot_menu(&mut self, wid: WindowId) {
         let rect = self.paint_autopilot_menu(wid);
@@ -1199,6 +1323,14 @@ impl App {
         let (session, anchor, focus, owner) = (menu.session, menu.anchor, menu.focus, menu.owner);
         let anchored = match owner {
             MenuOwner::Autopilot => self.shows_autopilot_chip(wid, session, anchor),
+            // aterm cannot tell where a program redraws its line after a re-grid, a moved pane,
+            // a scroll back or a Rewind view, nor whether the program that asked still draws
+            // there once the foreground group or the screen changed, so the card closes then,
+            // as at a focus change.
+            MenuOwner::Program(stands_on) => {
+                self.shows_live_screen(session)
+                    && self.program_anchor(wid, session) == Some(stands_on)
+            }
             MenuOwner::Fact(fact) => self.shows_fact_on_row(wid, session, fact, anchor.0),
         };
         if self.focused_session_id(wid) != focus || !anchored {
@@ -1510,7 +1642,7 @@ impl App {
         match self
             .autopilot_menu
             .as_ref()
-            .filter(|m| Some(m.wid) == self.frontmost_window && m.owner == MenuOwner::Autopilot)
+            .filter(|m| Some(m.wid) == self.frontmost_window && m.owner.is_autopilot())
         {
             Some(menu) => {
                 let sid = self

@@ -1,12 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aos-search --workers` as processes (design §11.7): the six-line plans file on three workers at
-//! a ten-second lease, honest and under each injected fault, against one local run. Each run is
-//! held to the one-minute hang detector on its next new step (a worker frame's step its
-//! coordinator says under `--frames`, or its end), never on its whole length, and never retried.
-//! A run is CPU-bound, so one past the detector on a host whose load exceeds its CPUs is COULD NOT
-//! RUN, naming the load.
+//! `aos-search --workers` as processes (design §11.7): the six-line plans file on three workers,
+//! honest and under each injected fault, against one local run. A lease window is the default
+//! minute, except where a fault waits one out ([`expiring`]); a pool run's hello and drain grace
+//! are past the run ([`PAST_THE_RUN`]), except the grace where a fault never answers its `Cancel`
+//! ([`unanswered`]) and in `foreign@0`'s one-worker run, which drains nothing, so no deadline of
+//! the coordinator's ends a stall its detector should judge. The two signal tests
+//! ([`sigterm_voids_and_reaps`], [`sigkill_to_the_coordinator_ends_every_worker_by_the_lifeline`])
+//! spawn with `--workers 3` alone (no `--frames`), at [`LIMITS_V1`]'s deadlines: each waits under
+//! a bare one-minute detector, with no starvation verdict, for all three workers' pid lines (their
+//! accepted hellos), then signals and asserts what the signal ends.
+//! Every other run is held to the one-minute hang detector on its next new step or its end, and
+//! never retried. A pool run says its steps under `--frames` (a worker frame's step or one of the
+//! coordinator's own [`PHASES`]), so its detector restarts at each and never spans its whole
+//! length; a local or threaded run says none, so its detector spans the run. A run is CPU-bound,
+//! so one past the detector whose threads waited for a core at least half as long as they were
+//! watched, and longer than they ran, from 10 s into the stretch and again over its last 10 s
+//! ([`starved_through`]), is COULD NOT RUN, naming both; one that waited less, or ran longer,
+//! hung, and fails however loaded the host.
 
 #![cfg(target_os = "macos")]
 
@@ -15,7 +27,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::sync::{Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aterm_effects::aos_momentum::bundle::UncheckedBundle;
 use aterm_effects::aos_momentum::lease::LIMITS_V1;
@@ -35,7 +47,9 @@ const SIX: &str = "\
 010003000000000000000000
 ";
 
-/// At most two runs at once: each is four processes judging on this host's cores.
+/// At most a third as many runs at once as this host has cores (two on an 8-core host, four on
+/// a 14-core one), never fewer than one: each run is four processes judging, about two cores'
+/// worth.
 fn slot() -> impl Drop {
     struct Slot;
     static GATE: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
@@ -46,8 +60,10 @@ fn slot() -> impl Drop {
             GATE.1.notify_one();
         }
     }
+    let cap =
+        (std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get) / 3).max(1);
     let mut n = GATE.0.lock().unwrap_or_else(|p| p.into_inner());
-    while *n >= 2 {
+    while *n >= cap {
         n = GATE.1.wait(n).unwrap_or_else(|p| p.into_inner());
     }
     *n += 1;
@@ -166,12 +182,24 @@ fn said(
     (told, text)
 }
 
+/// The stretches of the coordinator's own work after a search's last claim, which `--frames` says
+/// as each begins (`aos-workers step=G.<phase>`).
+const PHASES: [&str; 3] = ["check", "held-out", "verify"];
+
 /// Whether the coordinator's stderr `line` names a step of the run not taken before (`--frames`):
-/// a worker's hello, or item `k < items` or the end of a lease on an attempt within
-/// `max_attempts` ([`LIMITS_V1`]). A slot has at most `max_attempts × (items + 1)` such steps and
-/// the command's plans fix its slots, so a run that keeps trading frames without finishing (a
-/// lease re-run without end, a frame said again) takes no new step, and the detector ends it.
+/// a worker's hello, item `k < items` or the end of a lease on an attempt within `max_attempts`
+/// ([`LIMITS_V1`]), or one of the coordinator's [`PHASES`] of a search. A slot has at most
+/// `max_attempts × (items + 1)` such steps, a search [`PHASES`]' three, and the command's plans fix
+/// its slots, so a run that keeps trading frames without finishing (a lease re-run without end, a
+/// frame said again) takes no new step, and the detector ends it.
 fn advanced(line: &str, taken: &mut BTreeSet<String>) -> bool {
+    if let Some(step) = line.strip_prefix("aos-workers step=") {
+        let step = step.trim_end();
+        let own = step.split_once('.').is_some_and(|(search, phase)| {
+            search.parse::<u32>().is_ok() && PHASES.contains(&phase)
+        });
+        return own && taken.insert(step.to_owned());
+    }
     let Some(step) = line
         .strip_prefix("aos-workers frame ")
         .and_then(|l| l.split_whitespace().find_map(|w| w.strip_prefix("step=")))
@@ -194,38 +222,141 @@ fn advanced(line: &str, taken: &mut BTreeSet<String>) -> bool {
     bounded && taken.insert(step.to_owned())
 }
 
+/// What a run's processes had used when read: the coordinator's and each of its children's (its
+/// workers') CPU time and runnable time (on a core or waiting for one), ns, by pid and start.
+type Used = BTreeMap<(u32, u64), (u64, u64)>;
+
+/// [`Used`] now, for the run whose coordinator is `coordinator`.
+fn used(coordinator: u32) -> Used {
+    aterm_sysprobe::procs::processes()
+        .map(|sweep| {
+            sweep
+                .procs
+                .into_iter()
+                .filter(|p| p.pid == coordinator || p.ppid == coordinator)
+                .filter_map(|p| Some(((p.pid, p.start?), (p.cpu_ns?, p.runnable_ns?))))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// What a run's processes did between two reads of them, summed over them and their threads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Spent {
+    /// How long they waited for a core: runnable time less CPU time.
+    waited: Duration,
+    /// How long they ran on one: CPU time.
+    ran: Duration,
+}
+
+impl Spent {
+    /// Whether a run that took no step in a stretch of `span` was starved of cores, which is the
+    /// machine's: it waited for one at least half as long as the stretch, and longer than it ran
+    /// on one. One that waited less was blocked or stopped; one that ran longer was given cores
+    /// and took no step on them (it spun), however long its threads' waits add up to: four threads
+    /// spinning on a host just past its CPUs wait half the stretch between them. Either one hung.
+    fn starved(self, span: Duration) -> bool {
+        self.waited * 2 >= span && self.waited > self.ran
+    }
+}
+
+/// [`Spent`] between two reads of a run's processes: each one's CPU time, and its runnable time
+/// less its CPU time, grown since `before` (all of it for one `before` lacks, which started
+/// since), summed over them.
+fn spent(before: &Used, now: &Used) -> Spent {
+    let (waited, ran) = now
+        .iter()
+        .map(|(member, &(cpu, runnable))| {
+            let (cpu0, runnable0) = before.get(member).copied().unwrap_or_default();
+            let ran = cpu.saturating_sub(cpu0);
+            (runnable.saturating_sub(runnable0).saturating_sub(ran), ran)
+        })
+        .fold((0u64, 0u64), |(w, r), (dw, dr)| {
+            (w.saturating_add(dw), r.saturating_add(dr))
+        });
+    Spent {
+        waited: Duration::from_nanos(waited),
+        ran: Duration::from_nanos(ran),
+    }
+}
+
+/// How far into a stretch without a step the detector reads the run's processes: 10 s in, so that
+/// a stretch it ends is judged on what they did in the rest of it, and 10 s before it ends, on what
+/// they did at its end.
+const READS: [Duration; 2] = [
+    Duration::from_secs(10),
+    MUST_HAPPEN.saturating_sub(Duration::from_secs(10)),
+];
+
+/// Whether a stretch past the detector was the machine's, from what the run's processes spent from
+/// each of its [`READS`] to its end (`spans`): starved ([`Spent::starved`]) from the first read on,
+/// and still from the last. A run whose wait was spent early and that then took no step without
+/// waiting (its workers' evaluator builds starved beside a coordinator that had stopped) hung.
+fn starved_through(spans: &[(Duration, Spent)]) -> bool {
+    spans.len() == READS.len() && spans.iter().all(|&(span, s)| s.starved(span))
+}
+
 fn finish(mut child: Child, dir: aterm_tempfile::TempDir, out: PathBuf) -> Run {
     let stdout = drain(child.stdout.take().expect("piped"));
     let (told, stderr) = said(child.stderr.take().expect("piped"));
     let mut taken = BTreeSet::new();
+    let coordinator = child.id();
     // The detector waits for the run's next new step ([`advanced`]) or its end.
     let status = loop {
-        let next =
-            aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(50), || {
-                match child.try_wait().ok().flatten() {
-                    Some(s) => Some(Some(s)),
-                    None => told
-                        .try_iter()
-                        .any(|line| advanced(&line, &mut taken))
-                        .then_some(None),
-                }
-            });
+        let since = Instant::now();
+        let mut reads: Vec<(Instant, Used)> = Vec::new();
+        let next = aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(50), || {
+            if let Some(s) = child.try_wait().ok().flatten() {
+                return Some(Some(s));
+            }
+            if told.try_iter().any(|line| advanced(&line, &mut taken)) {
+                return Some(None);
+            }
+            if READS
+                .get(reads.len())
+                .is_some_and(|&at| since.elapsed() >= at)
+            {
+                reads.push((Instant::now(), used(coordinator)));
+            }
+            None
+        });
         match next {
             Some(Some(s)) => break s,
             Some(None) => {}
             None => {
+                // A run's stretches without a step (the evaluator builds before the hellos, each
+                // of the coordinator's own phases) are CPU-bound, and a full verify's load has
+                // starved one past the detector, which is the machine's ([`starved_through`]). A
+                // run that was not starved hung (blocked, stopped, or spinning on cores it was
+                // given), however loaded the host, and fails.
+                let now = used(coordinator);
+                let spans: Vec<(Duration, Spent)> = reads
+                    .iter()
+                    .map(|(at, before)| (at.elapsed(), spent(before, &now)))
+                    .collect();
                 let _ = child.kill();
                 let _ = child.wait();
-                // A run's stretches without a frame (the workers' evaluator builds before their
-                // hellos, the coordinator's own judging) are CPU-bound, and a full verify's load
-                // has stretched a run past the detector; on such a host it times the load.
-                if let Some(load) = aterm_spec::host::oversubscribed() {
+                let detail: String = spans
+                    .iter()
+                    .map(|(span, s)| {
+                        format!(
+                            "; in its last {span:.1?} its threads waited {:.1?} for a core and \
+                             ran {:.1?}",
+                            s.waited, s.ran
+                        )
+                    })
+                    .collect();
+                if starved_through(&spans) {
+                    let load = aterm_spec::host::oversubscribed()
+                        .unwrap_or_else(|| "load within the CPUs".to_owned());
                     aterm_spec::host::could_not_run(format!(
-                        "aos-search took no new step and did not end within {MUST_HAPPEN:?} on \
-                         an oversubscribed host ({load})"
+                        "aos-search took no new step and did not end within {MUST_HAPPEN:?}{detail} \
+                         ({load})"
                     ));
                 }
-                panic!("aos-search took no new step and did not end within {MUST_HAPPEN:?}");
+                panic!(
+                    "aos-search took no new step and did not end within {MUST_HAPPEN:?}{detail}"
+                );
             }
         }
     };
@@ -249,10 +380,51 @@ fn run(args: &[&str]) -> Run {
     finish(child, dir, out)
 }
 
+/// A day, past any run's end, for a coordinator deadline on something that must happen. Such a
+/// deadline starts at a spawn or a `Cancel`, not at the run's last step, and ends a stretch with a
+/// loss, not a verdict, so none may end a stall before [`finish`]'s detector judges it against
+/// the run's wait for a core.
+const PAST_THE_RUN: &str = "86400000";
+
+/// A pool run on three workers at the default lease window, its drain grace past the run: a
+/// holder's answer to `Cancel` (its ack, or a late result) and a worker's exit once its stdin
+/// closes must happen, so a loaded host cannot turn one into a `DrainTimeout` loss or a kill. A
+/// passing run waits for each and no longer.
 fn workers(extra: &[&str]) -> Run {
-    let mut args = vec!["--workers", "3", "--lease-ms", "10000"];
+    pool(PAST_THE_RUN, extra)
+}
+
+/// A pool run on three workers with the drain grace `grace_ms`, each worker's hello past the run:
+/// it says hello once its evaluator is built and its own executable digested, which a loaded host
+/// stretches, and must happen, so a slow one is never a `HelloTimeout` loss and a kill.
+fn pool(grace_ms: &str, extra: &[&str]) -> Run {
+    let mut args = vec![
+        "--workers",
+        "3",
+        "--hello-ms",
+        PAST_THE_RUN,
+        "--grace-ms",
+        grace_ms,
+    ];
     args.extend_from_slice(extra);
     run(&args)
+}
+
+/// `--lease-ms 10000`: a ten-second lease window, for a fault whose lease must expire; the run
+/// waits the window out once.
+const EXPIRING: [&str; 2] = ["--lease-ms", "10000"];
+
+/// [`workers`] at the [`EXPIRING`] window.
+fn expiring(extra: &[&str]) -> Run {
+    workers(&[&EXPIRING[..], extra].concat())
+}
+
+/// [`expiring`] at `LIMITS_V1`'s drain grace, for a fault that never answers its `Cancel`: its
+/// drain can end only by that grace, the product's bound on a holder that does not stop, so the
+/// run waits it out once.
+fn unanswered(extra: &[&str]) -> Run {
+    let grace = (LIMITS_V1.grace_ns / 1_000_000).to_string();
+    pool(&grace, &[&EXPIRING[..], extra].concat())
 }
 
 /// The local run every distributed one is compared with.
@@ -295,7 +467,8 @@ fn fired_once(r: &Run, spec: &str) {
 
 /// The void cancelled live leases and each drain ended by its holder's acknowledgement: every
 /// worker killed is the offender or a holder retired by its ack (a retired worker is killed,
-/// design §11.5), and no drain timed out.
+/// design §11.5), and no drain timed out. Its callers' hello and drain grace are past the run
+/// ([`workers`], [`pool`]), so a loaded host times neither out: a loss is a worker's own end.
 fn drained_by_acks(r: &Run) {
     let cancelled = r.count("cancelled");
     assert!(
@@ -322,8 +495,8 @@ fn voided(r: &Run, refusal: &str) {
     r.reaped_all();
 }
 
-/// The detector's steps: each counts once, and only within the ledger's bounds; no other line
-/// counts.
+/// The detector's steps, a worker frame's and the coordinator's own: each counts once, and only
+/// within the ledger's bounds or [`PHASES`]; no other line counts.
 #[test]
 fn a_step_counts_once_and_only_within_the_ledgers_bounds() {
     let mut taken = BTreeSet::new();
@@ -338,6 +511,14 @@ fn a_step_counts_once_and_only_within_the_ledgers_bounds() {
     ] {
         assert!(advanced(&line(step), &mut taken), "{step}: new");
         assert!(!advanced(&line(step), &mut taken), "{step}: said again");
+    }
+    let own = |step: &str| format!("aos-workers step={step}\n");
+    for step in ["1.check", "1.held-out", "1.verify", "2.check"] {
+        assert!(advanced(&own(step), &mut taken), "{step}: new");
+        assert!(!advanced(&own(step), &mut taken), "{step}: said again");
+    }
+    for step in ["1.write", "x.check", "1", "check", "1.check.0", "-"] {
+        assert!(!advanced(&own(step), &mut taken), "{step}: no phase");
     }
     for step in [
         format!("1.0.{}.0", LIMITS_V1.max_attempts + 1),
@@ -355,6 +536,55 @@ fn a_step_counts_once_and_only_within_the_ledgers_bounds() {
         "a pid line"
     );
     assert!(!advanced("aos-search: any other line\n", &mut taken));
+}
+
+/// A stretch is judged on what the run's processes did in it: each one's growth in CPU time and in
+/// runnable time less CPU time, all of one that started since, none of one gone. It was starved
+/// only if they waited for a core half the stretch and longer than they ran, over the whole of it
+/// and at its end.
+#[test]
+fn a_stretch_is_judged_on_the_runs_wait_for_a_core() {
+    let s = |n: u64| n * 1_000_000_000;
+    let secs = Duration::from_secs;
+    let before: Used = [
+        ((1, 7), (s(2), s(3))),
+        ((2, 7), (s(1), s(1))),
+        ((3, 7), (s(1), s(1))),
+    ]
+    .into();
+    let now: Used = [
+        ((1, 7), (s(5), s(46))), // starved: runnable 43 s, on a core 3 s of it
+        ((2, 7), (s(1), s(1))),  // blocked: neither grew
+        ((4, 7), (s(1), s(9))),  // started since: all of its 8 s wait
+    ]
+    .into();
+    let starved = spent(&before, &now);
+    let (waited, ran) = (secs(48), secs(4));
+    assert_eq!(starved, Spent { waited, ran });
+    assert!(starved.starved(secs(50)));
+    let blocked = spent(&now, &now);
+    let (waited, ran) = (Duration::ZERO, Duration::ZERO);
+    assert_eq!(blocked, Spent { waited, ran });
+    assert!(!blocked.starved(secs(50)), "a hung run waits for no core");
+    // Four threads spinning for 50 s on a host just past its CPUs: each waits 9 s of it, 36 s
+    // between them, past half the stretch, and runs 41 s.
+    let spinning: Used = [((5, 7), (s(4 * 41), s(4 * 50)))].into();
+    let spun = spent(&Used::new(), &spinning);
+    let (waited, ran) = (secs(36), secs(164));
+    assert_eq!(spun, Spent { waited, ran });
+    assert!(!spun.starved(secs(50)), "a spinning run was given cores");
+    // Workers whose evaluator builds starved beside a stopped coordinator and then blocked: the
+    // whole stretch waited (32 s, measured at load 160), its last 10 s did not.
+    let (waited, ran) = (secs(32), secs(3));
+    let early = Spent { waited, ran };
+    assert!(!starved_through(&[(secs(50), early), (secs(10), blocked)]));
+    let (waited, ran) = (secs(9), secs(1));
+    let still = Spent { waited, ran };
+    assert!(starved_through(&[(secs(50), early), (secs(10), still)]));
+    assert!(
+        !starved_through(&[(secs(50), early)]),
+        "a stretch the detector did not read at its end is not the machine's"
+    );
 }
 
 #[test]
@@ -383,6 +613,13 @@ fn honest_workers_give_the_local_result() {
         .filter(|l| l.starts_with("aos-workers worker="))
         .count();
     assert_eq!(pids, 3, "{}", r.stderr);
+    // The coordinator says each stretch of its own work after the last claim as a step.
+    let own: Vec<&str> = r
+        .stderr
+        .lines()
+        .filter_map(|l| l.strip_prefix("aos-workers step="))
+        .collect();
+    assert_eq!(own, ["1.check", "1.held-out", "1.verify"], "{}", r.stderr);
 }
 
 #[test]
@@ -418,25 +655,32 @@ fn a_killed_worker_costs_a_retry_only() {
 
 #[test]
 fn a_hung_worker_expires_and_is_retried() {
-    let r = workers(&["--fault", "hang@1.1.1:2"]);
+    let r = unanswered(&["--fault", "hang@1.1.1:2"]);
     same_as_local(&r, Mode::Distributed);
     fired_once(&r, "hang@1.1.1:2");
     assert!(r.count("expired") >= 1, "{}", r.summary);
     assert!(r.count("retries") >= 1, "{}", r.summary);
 }
 
+/// The slow worker judges its last items only after the lease it stopped on expires; the drain's
+/// grace is past the run ([`PAST_THE_RUN`]), not a latency budget, so a loaded host cannot retire
+/// it before its result is compared.
 #[test]
 fn a_slow_worker_is_stale_and_its_late_progress_dropped() {
-    let r = workers(&["--fault", "slow@1.0.1:3"]);
+    let r = expiring(&["--fault", "slow@1.0.1:3"]);
     same_as_local(&r, Mode::Distributed);
     fired_once(&r, "slow@1.0.1:3");
     assert!(r.count("late_progress") >= 1, "{}", r.summary);
     assert!(r.count("stale") >= 1, "{}", r.summary);
 }
 
+/// The late worker answers only once the lease it held is cancelled, inside the drain; the
+/// drain's grace is past the run ([`PAST_THE_RUN`]), not a latency budget, so a loaded host
+/// cannot lose the answer before it is compared (as it lost the late lie's: `lost=1`, the search
+/// passing).
 #[test]
 fn a_late_equal_result_is_stale() {
-    let r = workers(&["--fault", "late@1.1.1"]);
+    let r = expiring(&["--fault", "late@1.1.1"]);
     same_as_local(&r, Mode::Distributed);
     fired_once(&r, "late@1.1.1");
     assert!(r.count("stale") >= 1, "{}", r.summary);
@@ -450,9 +694,10 @@ fn an_equal_resend_is_a_duplicate() {
     assert_eq!(r.count("duplicate"), 1, "{}", r.summary);
 }
 
+/// The late lie is compared only if the drain waits for it (`a_late_equal_result_is_stale`).
 #[test]
 fn a_late_lie_voids() {
-    let r = workers(&["--fault", "late-lie@1.1.1"]);
+    let r = expiring(&["--fault", "late-lie@1.1.1"]);
     voided(&r, "Differs");
     fired_once(&r, "late-lie@1.1.1");
 }
@@ -524,7 +769,16 @@ fn a_foreign_worker_is_refused_alone() {
         "{}",
         r.summary
     );
-    let alone = run(&["--workers", "1", "--fault", "foreign@0"]);
+    // Its one worker's hello must come, as a pool run's: only that refusal leaves it none.
+    let alone = run(&[
+        "--workers",
+        "1",
+        "--hello-ms",
+        PAST_THE_RUN,
+        "--fault",
+        "foreign@0",
+    ]);
+    assert_eq!(alone.count("foreign"), 1, "{}", alone.summary);
     voided(&alone, "NoWorkers");
 }
 
@@ -562,6 +816,52 @@ fn a_void_in_an_earlier_search_runs_no_later_one() {
     assert!(
         r.summary.contains(" searches=1 winners=0\n"),
         "{}",
+        r.summary
+    );
+}
+
+/// A lie the shutdown drain reads voids the command too: `close-lie` holds its lie until the
+/// coordinator closes the worker's stdin, which its shutdown does after the last search wrote its
+/// bundle, so only the drain can read it. The bundle it wrote is removed (`voided` finds none).
+#[test]
+fn a_lie_the_shutdown_drain_reads_removes_the_bundle() {
+    let r = workers(&["--fault", "close-lie@1.0.1"]);
+    voided(&r, "Differs");
+    fired_once(&r, "close-lie@1.0.1");
+    assert!(
+        r.summary
+            .lines()
+            .any(|l| l.starts_with("aos-search removed ") && l.contains("plans.bundle")),
+        "the search wrote its bundle before the drain read the lie\n{}",
+        r.summary
+    );
+}
+
+/// Every lie a worker holds is sent at the close, in the order held: on one worker, which draws
+/// every lease, `close-lie` on slots 0 and 1 voids on slot 0's, the first held, and each spec
+/// fires once (a fault's line names only the spec keyed by the lease it fired on).
+#[test]
+fn every_held_lie_is_sent_at_the_close_in_order() {
+    let r = run(&[
+        "--workers",
+        "1",
+        "--hello-ms",
+        PAST_THE_RUN,
+        "--grace-ms",
+        PAST_THE_RUN,
+        "--fault",
+        "close-lie@1.0.1",
+        "--fault",
+        "close-lie@1.1.1",
+    ]);
+    voided(&r, "Differs");
+    let fired = r.fired();
+    assert_eq!(fired.get("close-lie@1.0.1"), Some(&1), "{fired:?}");
+    assert_eq!(fired.get("close-lie@1.1.1"), Some(&1), "{fired:?}");
+    assert_eq!(fired.len(), 2, "{fired:?}");
+    assert!(
+        r.summary.contains("for search 1 slot 0 differs"),
+        "the first lie held is the first read\n{}",
         r.summary
     );
 }
@@ -610,7 +910,7 @@ fn signal(sig: &str, pid: u32) -> bool {
 #[test]
 fn sigterm_voids_and_reaps() {
     let _slot = slot();
-    let (mut child, dir, out) = spawn(&["--workers", "3", "--lease-ms", "10000"]);
+    let (mut child, dir, out) = spawn(&["--workers", "3"]);
     let stdout = drain(child.stdout.take().expect("piped"));
     let stderr = tee(child.stderr.take().expect("piped"));
     let _ = pids(&stderr, 3);
@@ -640,7 +940,7 @@ fn sigterm_voids_and_reaps() {
 #[test]
 fn sigkill_to_the_coordinator_ends_every_worker_by_the_lifeline() {
     let _slot = slot();
-    let (mut child, _dir, _out) = spawn(&["--workers", "3", "--lease-ms", "10000"]);
+    let (mut child, _dir, _out) = spawn(&["--workers", "3"]);
     let _stdout = drain(child.stdout.take().expect("piped"));
     let stderr = tee(child.stderr.take().expect("piped"));
     let pids = pids(&stderr, 3);

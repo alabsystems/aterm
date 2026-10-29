@@ -10,9 +10,7 @@ use aterm_core::render::RenderInput;
 use aterm_core::terminal::{ClockReading, Terminal};
 use aterm_effects::companion::{CompanionOwner, GlowOwnership, PetFacts};
 use aterm_effects::cursor_glow::GlowStyle;
-use aterm_effects::host::{
-    CaptureMode, FrameGeom, HostFrameInput, SingFacts, TerminalFacts, Visibility,
-};
+use aterm_effects::host::{FrameGeom, HostFrameInput, TerminalFacts};
 use aterm_effects::kitty_pet::{PetAction, PetFrame, PetInputKind};
 use aterm_effects::pet_world::{PetPane, PetWorldFacts};
 use aterm_effects::word_decorations::{DecoConfig, WordDecorations};
@@ -235,38 +233,26 @@ impl Host {
         if self.contract == Contract::Raw {
             facts.frame_unfinished = false;
         }
-        let host = HostFrameInput {
-            now: self.now,
-            visibility: Visibility::Focused,
-            reduced_motion: false,
-            serious: false,
-            shed_envelope: 1.0,
-            shed_active: false,
-            pointer_px: None,
-            capture: CaptureMode::Present,
-            geometry: FrameGeom {
+        let host = HostFrameInput::new(
+            self.now,
+            FrameGeom {
                 rows: ROWS,
                 cols: COLS,
                 cell_w: CW,
                 cell_h: CH,
                 origin_px: (0, 0),
             },
-        };
+        );
         let tick = self.owner.prepare(
-            PetFacts {
-                facts: &facts,
-                host: &host,
-                glow: GlowOwnership {
+            PetFacts::new(
+                &facts,
+                &host,
+                GlowOwnership {
                     enabled: true,
                     style: GlowStyle::RainbowKitty,
                     style_raw_names_pet: true,
                 },
-                sing: SingFacts::default(),
-                focused: true,
-                obscured: false,
-                pane: None,
-                room: None,
-            },
+            ),
             &mut self.decos,
         );
         let frame = self.owner.tick(tick).pet;

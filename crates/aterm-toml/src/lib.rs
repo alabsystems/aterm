@@ -39,6 +39,6 @@ mod value;
 
 pub use datetime::{Date, Datetime, DatetimeParseError, Offset, Time};
 pub use de::from_str;
-pub use error::{Error, Result};
+pub use error::{Error, LogWords, Result};
 pub use ser::to_string;
 pub use value::{Index, Map, Table, Value};

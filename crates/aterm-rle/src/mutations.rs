@@ -145,12 +145,11 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
         value: T,
     ) {
         let mut range_len = 0u32;
-        for i in start_run_idx..=end_run_idx {
+        for (offset, run) in self.runs[start_run_idx..=end_run_idx].iter().enumerate() {
             count_run_iteration();
-            let run = &self.runs[i];
-            let segment_len = if i == start_run_idx {
+            let segment_len = if offset == 0 {
                 run.length.saturating_sub(start_offset)
-            } else if i == end_run_idx {
+            } else if offset == end_run_idx - start_run_idx {
                 end_offset
             } else {
                 run.length

@@ -225,7 +225,10 @@ const INV_FADE_SPAN_MS: f32 = 1.0 / (NUKE_TOTAL_MS - SKIRT_END_MS) as f32;
 /// underway, so the cap first appears fire-lit.
 #[inline]
 const fn cool(t_ms: u64) -> f32 {
-    aterm_scene::smoothstep((t_ms.saturating_sub(1500) as f32 * INV_COOL_SPAN_MS).clamp(0.0, 1.0))
+    if t_ms <= 1500 {
+        return 0.0;
+    }
+    aterm_scene::smoothstep(((t_ms - 1500) as f32 * INV_COOL_SPAN_MS).clamp(0.0, 1.0))
 }
 
 #[inline]
@@ -239,10 +242,14 @@ const fn fade_after_skirt(t_ms: u64) -> f32 {
 
 #[inline]
 const fn cap_geom(t_ms: u64) -> (f32, f32, f32, f32) {
-    let q = ((t_ms - CAP_BLOOM_START_MS) as f32 * INV_CAP_BLOOM_SPAN_MS).clamp(0.0, 1.0);
-    let omq = 1.0 - q;
-    let (sin_q, _) = crate::supernova::sin_cos_f32(core::f32::consts::PI * q);
-    let bloom = (1.0 - omq * omq * omq) + 0.06 * sin_q;
+    let (q, bloom) = if t_ms >= CAP_BLOOM_END_MS {
+        (1.0, 1.0)
+    } else {
+        let q = ((t_ms - CAP_BLOOM_START_MS) as f32 * INV_CAP_BLOOM_SPAN_MS).clamp(0.0, 1.0);
+        let omq = 1.0 - q;
+        let (sin_q, _) = crate::supernova::sin_cos_f32(core::f32::consts::PI * q);
+        (q, (1.0 - omq * omq * omq) + 0.06 * sin_q)
+    };
     let tail = (t_ms.saturating_sub(CAP_BLOOM_END_MS) as f32 * INV_TAIL_SPAN_MS).clamp(0.0, 1.0);
     let spread = 1.0 + 0.55 * tail;
     let sx = (0.45 + 0.75 * bloom) * spread;

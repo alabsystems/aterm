@@ -63,8 +63,12 @@ impl CursorGlow {
         };
         let t = ((self.cursor_temp - Self::FORGE_MIN_TEMP) * (1.0 / (1.0 - Self::FORGE_MIN_TEMP)))
             .clamp(0.0, 1.0);
-        let (s, _) = crate::supernova::sin_cos_f32(self.flame_phase * 1.7);
-        let breathe = 0.045 * t * s;
+        let breathe = if t == 0.0 {
+            0.0
+        } else {
+            let (s, _) = crate::supernova::sin_cos_f32(self.flame_phase * 1.7);
+            0.045 * t * s
+        };
         Some(fire_ramp(band.at(t, breathe)))
     }
 

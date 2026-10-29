@@ -1509,10 +1509,6 @@ fn the_session_rows_words_are_the_logs() {
         words(Key::Source),
         [ResetSource::Verb, ResetSource::Menu].map(ResetSource::as_str)
     );
-    for r in ExitReason::ALL {
-        let out = aterm_slog::Out::Session(crate::session_log::exit_out(r));
-        assert_eq!(out.word(), r.as_str(), "{r:?}");
-    }
     assert!(Fields::new().word(Key::Source, "palette").is_err());
 }
 

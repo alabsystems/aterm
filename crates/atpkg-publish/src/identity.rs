@@ -81,7 +81,7 @@ impl MachineKey {
     }
 }
 
-/// The machine's public record (`~/.aterm/machine.toml`): its roster id and pubkey.
+/// The machine's public record (`~/.aterm/release-ring/machine.toml`): its roster id and pubkey.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MachineRecord {
     /// The roster id.
@@ -211,5 +211,32 @@ fn read_record(ctx: &Ctx, key_pub: &str) -> Result<MachineRecord> {
             ctx.shown(&ctx.identity.record),
             restore()
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// `signer_for` reads `~/.aterm/release-ring/machine.toml` and ignores `~/.aterm/machine.toml`
+    /// (`id != m22` in 0.146).
+    /// NEGATIVE CONTROL: reading `~/.aterm/machine.toml` sees `"m99"` instead of `"m3"` and
+    /// refuses it: its pubkey is not the key's.
+    #[test]
+    fn signer_for_reads_release_ring_and_ignores_host_machine_toml() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let home = dir.path();
+
+        let ring = crate::testkit::Keys::mint("m3", &[]);
+        let host = Arc::new(crate::host::fake::FakeHost::default());
+        let ctx = ring.ctx(home, host);
+        std::fs::write(
+            home.join(".aterm/machine.toml"),
+            "id = \"m99\"\npubkey = \"wrong-pubkey\"\n",
+        )
+        .expect("write host machine.toml");
+        let signer = signer_for(&ctx, &ring.roster).expect("release-ring record signs");
+        assert_eq!(signer.record.id, "m3");
     }
 }

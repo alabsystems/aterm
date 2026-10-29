@@ -27,8 +27,16 @@ fn carriage_return_returns_to_col0_overwriting() {
 
 #[test]
 fn backspace_moves_cursor_left() {
-    let s = run(b"abc\x08X");
-    assert_eq!(s.row(0), "abX");
+    let s = run(b"abc\x08");
+    assert_eq!(s.cursor(), (0, 2));
+
+    let overwritten = run(b"abc\x08X");
+    assert_eq!(overwritten.row(0), "abX");
+    assert_eq!(overwritten.cursor(), (0, 3));
+
+    let saturated = run(b"a\x08\x08Z");
+    assert_eq!(saturated.row(0), "Z");
+    assert_eq!(saturated.cursor(), (0, 1));
 }
 
 #[test]

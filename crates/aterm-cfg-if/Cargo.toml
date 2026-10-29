@@ -24,5 +24,9 @@ rustc-dep-of-std = []
 # `tests/differential.rs` compares against `core::cfg!` directly because
 # `[patch.crates-io]` would redirect a `cfg-if` dev-dependency to this crate.
 
+[dev-dependencies]
+aterm-models-core.workspace = true
+aterm-spec.workspace = true
+
 [lints]
 workspace = true

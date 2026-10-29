@@ -149,37 +149,44 @@ impl Writer {
     }
 
     #[inline]
-    pub(crate) fn align(&mut self, align: usize) {
+    pub(crate) fn align(&mut self, align: usize) -> Result<()> {
         let pos = self.pos();
+        if pos > MAX_MESSAGE {
+            return Err(Error::Invalid("offset past the longest message"));
+        }
         let pad = pad_to(pos, align).saturating_sub(pos);
         self.buf.resize(self.buf.len().saturating_add(pad), 0);
+        Ok(())
     }
 
     #[inline]
-    fn u16(&mut self, v: u16) {
-        self.align(2);
+    fn u16(&mut self, v: u16) -> Result<()> {
+        self.align(2)?;
         match self.endian {
             Endian::Little => self.buf.extend_from_slice(&v.to_le_bytes()),
             Endian::Big => self.buf.extend_from_slice(&v.to_be_bytes()),
         }
+        Ok(())
     }
 
     #[inline]
-    pub(crate) fn u32(&mut self, v: u32) {
-        self.align(4);
+    pub(crate) fn u32(&mut self, v: u32) -> Result<()> {
+        self.align(4)?;
         match self.endian {
             Endian::Little => self.buf.extend_from_slice(&v.to_le_bytes()),
             Endian::Big => self.buf.extend_from_slice(&v.to_be_bytes()),
         }
+        Ok(())
     }
 
     #[inline]
-    fn u64(&mut self, v: u64) {
-        self.align(8);
+    fn u64(&mut self, v: u64) -> Result<()> {
+        self.align(8)?;
         match self.endian {
             Endian::Little => self.buf.extend_from_slice(&v.to_le_bytes()),
             Endian::Big => self.buf.extend_from_slice(&v.to_be_bytes()),
         }
+        Ok(())
     }
 
     /// Overwrites the `u32` at buffer index `at` (an array's length slot).
@@ -199,7 +206,7 @@ impl Writer {
             return Err(Error::Invalid("NUL inside a string"));
         }
         let len = u32::try_from(s.len()).map_err(|_| Error::Invalid("string longer than 4 GiB"))?;
-        self.u32(len);
+        self.u32(len)?;
         self.buf.extend_from_slice(s.as_bytes());
         self.buf.push(0);
         Ok(())
@@ -234,10 +241,10 @@ impl Writer {
         each: impl FnOnce(&mut Self) -> Result<()>,
     ) -> Result<()> {
         self.enter()?;
-        self.align(4);
+        self.align(4)?;
         let slot = self.buf.len();
-        self.u32(0);
-        self.align(elem_align);
+        self.u32(0)?;
+        self.align(elem_align)?;
         let start = self.buf.len();
         each(self)?;
         let len = self.buf.len().saturating_sub(start);
@@ -252,14 +259,14 @@ impl Writer {
     pub(crate) fn value(&mut self, value: &Value) -> Result<()> {
         match value {
             Value::Byte(v) => self.buf.push(*v),
-            Value::Bool(v) => self.u32(u32::from(*v)),
-            Value::I16(v) => self.u16(*v as u16),
-            Value::U16(v) => self.u16(*v),
-            Value::I32(v) => self.u32(*v as u32),
-            Value::U32(v) => self.u32(*v),
-            Value::I64(v) => self.u64(*v as u64),
-            Value::U64(v) => self.u64(*v),
-            Value::F64(v) => self.u64(v.to_bits()),
+            Value::Bool(v) => self.u32(u32::from(*v))?,
+            Value::I16(v) => self.u16(*v as u16)?,
+            Value::U16(v) => self.u16(*v)?,
+            Value::I32(v) => self.u32(*v as u32)?,
+            Value::U32(v) => self.u32(*v)?,
+            Value::I64(v) => self.u64(*v as u64)?,
+            Value::U64(v) => self.u64(*v)?,
+            Value::F64(v) => self.u64(v.to_bits())?,
             Value::Str(s) => self.string(s)?,
             Value::Path(p) => self.string(p.as_str())?,
             Value::Sig(s) => self.signature(s.as_str())?,
@@ -280,7 +287,7 @@ impl Writer {
                 self.array(8, |w| {
                     d.entries().iter().try_for_each(|(k, v)| {
                         w.enter()?;
-                        w.align(8);
+                        w.align(8)?;
                         w.value(k)?;
                         w.value(v)?;
                         w.leave();
@@ -293,7 +300,7 @@ impl Writer {
                     return Err(Error::Invalid("empty struct"));
                 }
                 self.enter()?;
-                self.align(8);
+                self.align(8)?;
                 for field in fields {
                     self.value(field)?;
                 }
@@ -684,6 +691,14 @@ mod tests {
         assert!(matches!(
             encode(&[Value::Byte(1)], Endian::Little, MAX_MESSAGE + 1),
             Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            encode(
+                &[Value::Byte(1), Value::U16(2)],
+                Endian::Little,
+                MAX_MESSAGE
+            ),
+            Err(Error::Invalid("offset past the longest message"))
         ));
     }
 

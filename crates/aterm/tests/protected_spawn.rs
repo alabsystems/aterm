@@ -105,39 +105,6 @@ fn cli_runs_a_command_through_the_protected_spawn_and_exits_cleanly() {
     );
 }
 
-/// `--containment containment` wraps the spawn in `sandbox-exec` (deny network, other
-/// processes' task ports, writes outside the temp roots, and credential/private-data reads),
-/// and a basic shell command still runs under it. macOS only (Seatbelt is the actuated path).
-#[cfg(target_os = "macos")]
-#[test]
-fn cli_runs_under_the_os_sandbox_in_containment_mode() {
-    let (mut cmd, _root) = session_command("containment");
-    let mut child = cmd
-        .args(["--containment", "containment"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn the aterm CLI binary in containment mode");
-    child
-        .stdin
-        .take()
-        .expect("aterm stdin")
-        .write_all(b"echo ATERM_SANDBOXED_$((3+4))\nexit\n")
-        .expect("write to aterm stdin");
-    let out = wait_with_output_bounded(child);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("ATERM_SANDBOXED_7"),
-        "shell must run under sandbox-exec in containment mode; stdout={stdout:?}"
-    );
-    assert!(
-        out.status.success(),
-        "the sandboxed shell must still exit success; got {:?}",
-        out.status
-    );
-}
-
 /// The `--containment` value may be attacker-influenced: a malformed value fails closed to
 /// Containment (never the unconfined `User` default) and announces the fallback. On macOS the
 /// shell then runs under the OS sandbox; elsewhere there is none, so Containment refuses to

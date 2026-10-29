@@ -256,44 +256,96 @@ pub enum LinkScope {
     Exact,
 }
 
-/// The params of a `Link` entry: the text up to the first `,` outside quotes (RFC 8288),
-/// and the text after that `,`.
-fn link_params(text: &str) -> (&str, &str) {
+/// Splits `text` at the first `sep` outside RFC 8288 / RFC 9110 double quotes (`\"` escaped).
+fn split_unquoted_once(text: &str, sep: char) -> Option<(&str, &str)> {
     let mut quoted = false;
+    let mut escaped = false;
     for (i, c) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
         match c {
+            '\\' if quoted => escaped = true,
             '"' => quoted = !quoted,
-            ',' if !quoted => return (&text[..i], &text[i + 1..]),
+            c if c == sep && !quoted => return Some((&text[..i], &text[i + c.len_utf8()..])),
             _ => {}
         }
     }
-    (text, "")
+    None
+}
+
+/// The params of a `Link` entry: the text up to the first `,` outside quotes (RFC 8288),
+/// and the text after that `,`.
+fn link_params(text: &str) -> (&str, &str) {
+    split_unquoted_once(text, ',').unwrap_or((text, ""))
+}
+
+/// Unquotes a `Link` parameter value (`token` or RFC 9110 `quoted-string`).
+fn unquote_param(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let Some(inner) = raw.strip_prefix('"') else {
+        return (!raw.contains('"')).then(|| raw.to_string());
+    };
+    let inner = inner.strip_suffix('"')?;
+    let mut out = String::with_capacity(inner.len());
+    let mut escaped = false;
+    for c in inner.chars() {
+        if escaped {
+            out.push(c);
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            return None;
+        } else {
+            out.push(c);
+        }
+    }
+    (!escaped).then_some(out)
 }
 
 /// The `rel="next"` URL of a `Link` header.
 #[must_use]
 pub fn link_next(link: &str) -> Option<String> {
-    let mut rest = link;
-    loop {
-        let (_, open) = rest.split_once('<')?;
+    let mut rest = link.trim_start();
+    while !rest.is_empty() {
+        let open = rest.strip_prefix('<')?;
         let (url, after) = open.split_once('>')?;
         let (params, tail) = link_params(after);
-        rest = tail;
-        let next = params.split(';').any(|param| {
-            let Some((name, value)) = param.trim().split_once('=') else {
-                return false;
+        rest = tail.trim_start();
+        let mut rem = params.trim();
+        if let Some(stripped) = rem.strip_prefix(';') {
+            rem = stripped;
+        } else if !rem.is_empty() {
+            return None;
+        }
+        let mut is_next = false;
+        while !rem.is_empty() {
+            let (param, next_rem) = split_unquoted_once(rem, ';').unwrap_or((rem, ""));
+            rem = next_rem;
+            let param = param.trim();
+            if param.is_empty() {
+                continue;
+            }
+            let Some((name, value)) = param.split_once('=') else {
+                continue;
             };
-            name.trim().eq_ignore_ascii_case("rel")
-                && value
-                    .trim()
-                    .trim_matches('"')
+            if name.trim().eq_ignore_ascii_case("rel")
+                && let Some(val) = unquote_param(value)
+                && val
                     .split_ascii_whitespace()
                     .any(|rel| rel.eq_ignore_ascii_case("next"))
-        });
-        if next {
+            {
+                is_next = true;
+                break;
+            }
+        }
+        if is_next {
             return Some(url.to_string());
         }
     }
+    None
 }
 
 /// The refusal of a next link: CouldNotRun, `Sub::Protocol`.
@@ -332,13 +384,23 @@ fn segments(path: &str) -> Vec<&str> {
     path.trim_start_matches('/').split('/').collect()
 }
 
-/// The first value a query gives `name`.
-fn query_value<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+/// Every value a query gives `name`, in appearance order.
+fn query_values<'a>(query: &'a str, name: &str) -> Vec<&'a str> {
+    if query.is_empty() {
+        return Vec::new();
+    }
     query
         .split('&')
+        .filter(|pair| !pair.is_empty())
         .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
-        .find(|(key, _)| *key == name)
+        .filter(|(key, _)| *key == name)
         .map(|(_, value)| value)
+        .collect()
+}
+
+/// The first value a query gives `name`.
+fn query_value<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+    query_values(query, name).into_iter().next()
 }
 
 /// Whether a next link's path is one `LinkScope::Repo(slug)` accepts: `/repos/{o}/{r}` with
@@ -397,8 +459,8 @@ fn owner_link(path: &str, first: &str, id: u64) -> Result<(), String> {
 }
 
 /// Validate a next link (design §13.1): the api origin; a path `scope` accepts (`repo_id` for
-/// a numeric repository link, `None` there → Protocol); `page` strictly above `last_page`;
-/// `per_page` at most 100. Anything else → CouldNotRun, `Sub::Protocol`, why `GitHub's next
+/// a numeric repository link, `None` there → Protocol); one `page` strictly above `last_page`;
+/// at most one `per_page` in `1..=100`. Anything else → CouldNotRun, `Sub::Protocol`, why `GitHub's next
 /// link {url} is refused: {reason}`. A link with no usable `page` (none, or not a number) that
 /// carries `since`, `cursor`, `after` or `before` is refused naming that cursor, with a next
 /// that says to read one page at a time; any other link with no usable `page` is refused with
@@ -434,7 +496,12 @@ pub fn next_link(
         LinkScope::Exact => Err("its path is not the listing's".to_string()),
     };
     scoped.map_err(|reason| refuse(&reason))?;
-    let page = query_value(query, "page")
+    let pages = query_values(query, "page");
+    if pages.len() > 1 {
+        return Err(refuse("it names more than one page"));
+    }
+    let page = pages
+        .first()
         .and_then(|v| v.parse::<u32>().ok())
         .ok_or_else(|| unnumbered_link(next_url, query))?;
     if page <= last_page {
@@ -442,10 +509,17 @@ pub fn next_link(
             "page {page} does not follow page {last_page}"
         )));
     }
-    if let Some(per_page) = query_value(query, "per_page") {
+    let per_pages = query_values(query, "per_page");
+    if per_pages.len() > 1 {
+        return Err(refuse("it names more than one per_page"));
+    }
+    if let Some(&per_page) = per_pages.first() {
         let per_page = per_page
             .parse::<u64>()
             .map_err(|_| refuse("its per_page is not a number"))?;
+        if per_page == 0 {
+            return Err(refuse("per_page 0 is below 1"));
+        }
         if per_page > MAX_PER_PAGE {
             return Err(refuse(&format!(
                 "per_page {per_page} is over {MAX_PER_PAGE}"
@@ -757,21 +831,28 @@ fn walk_as(
     scope: &LinkScope,
     shape: Shape,
 ) -> Result<Listing<Value>> {
-    let too_many = || Error::usage(format!("per_page is at most {MAX_PER_PAGE}"));
-    if u64::from(opts.per_page) > MAX_PER_PAGE {
-        return Err(too_many());
+    let bad_per_page = || Error::usage(format!("per_page must be 1..={MAX_PER_PAGE}"));
+    if opts.per_page == 0 || u64::from(opts.per_page) > MAX_PER_PAGE {
+        return Err(bad_per_page());
     }
     let path_query = first.path.split_once('?').map_or("", |(_, query)| query);
-    let named = first
+    let named: Vec<&str> = first
         .query
         .iter()
-        .find(|(key, _)| key == "per_page")
+        .filter(|(key, _)| key == "per_page")
         .map(|(_, value)| value.as_str())
-        .or_else(|| query_value(path_query, "per_page"));
-    let first = match named {
-        Some(value) if value.parse::<u64>().is_ok_and(|n| n <= MAX_PER_PAGE) => first,
-        Some(_) => return Err(too_many()),
-        None => first.query("per_page", opts.per_page.to_string()),
+        .chain(query_values(path_query, "per_page"))
+        .collect();
+    let first = match named.as_slice() {
+        [] => first.query("per_page", opts.per_page.to_string()),
+        [value]
+            if value
+                .parse::<u64>()
+                .is_ok_and(|n| (1..=MAX_PER_PAGE).contains(&n)) =>
+        {
+            first
+        }
+        _ => return Err(bad_per_page()),
     };
     let consistency = match shape {
         Shape::Items => opts.consistency,
@@ -790,7 +871,7 @@ fn walk_as(
     .run()
 }
 
-/// Walk an array listing to its end (design §13.1): 1. the first call gets `per_page` (`opts.per_page`, unless its query names one; over 100 → Usage `per_page is at most 100`); 2. each page is a `gh.call`, whose body must be a JSON array (else CouldNotRun `Protocol`, why `page {n} is not a JSON array`), and whose `Link` next goes through `next_link`: a numeric `/repositories/{id}` link asks `gh.repo_id` once, through the memo; 3. at `max_pages` with a next link: `partial` → `End::Capped { pages }`; otherwise Incomplete `Capped { pages }`, next `--max-pages N, or --partial`; a page reached by a next link that GitHub answers 422 `Only the first N results are available.` (its result cap, which the releases listing has at 1000) ends the walk the same way: `partial` → `End::Capped { pages }` (the pages read); otherwise Incomplete `Capped { pages }`, the exchange kept, next `--partial`; 4. a limit stops once `limit` items are held and more remain: `End::Limited`; 5.
+/// Walk an array listing to its end (design §13.1): 1. the first call gets `per_page` (`opts.per_page`, unless its query names one; outside `1..=100` or named more than once → Usage `per_page must be 1..=100`); 2. each page is a `gh.call`, whose body must be a JSON array (else CouldNotRun `Protocol`, why `page {n} is not a JSON array`), and whose `Link` next goes through `next_link`: a numeric `/repositories/{id}` link asks `gh.repo_id` once, through the memo; 3. at `max_pages` with a next link: `partial` → `End::Capped { pages }`; otherwise Incomplete `Capped { pages }`, next `--max-pages N, or --partial`; a page reached by a next link that GitHub answers 422 `Only the first N results are available.` (its result cap, which the releases listing has at 1000) ends the walk the same way: `partial` → `End::Capped { pages }` (the pages read); otherwise Incomplete `Capped { pages }`, the exchange kept, next `--partial`; 4. a limit stops once `limit` items are held and more remain: `End::Limited`; 5.
 /// # Errors
 /// The first page's error; Incomplete (cap, torn); Protocol (a refused link).
 pub fn walk(

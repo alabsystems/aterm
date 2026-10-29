@@ -406,6 +406,7 @@ mod tests {
             bells: Default::default(),
             screen_moves: Default::default(),
             job_feed: Default::default(),
+            ran: Default::default(),
             box_banner: Default::default(),
             update_parked: Default::default(),
             watchers: observed.watchers,

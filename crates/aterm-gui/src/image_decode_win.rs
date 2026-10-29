@@ -210,6 +210,25 @@ struct CodecInfoVtbl {
     get_file_extensions: unsafe extern "system" fn(Raw, u32, *mut u16, *mut u32) -> i32,
 }
 
+// Each slot the decoder calls sits at its documented COM vtable index.
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    const SLOT: usize = size_of::<usize>();
+    assert!(offset_of!(ImagingFactoryVtbl, create_decoder_from_stream) == 4 * SLOT);
+    assert!(offset_of!(ImagingFactoryVtbl, create_format_converter) == 10 * SLOT);
+    assert!(offset_of!(ImagingFactoryVtbl, create_stream) == 14 * SLOT);
+    assert!(offset_of!(ImagingFactoryVtbl, create_color_context) == 15 * SLOT);
+    assert!(offset_of!(ImagingFactoryVtbl, create_color_transformer) == 16 * SLOT);
+    assert!(offset_of!(ImagingFactoryVtbl, create_component_enumerator) == 23 * SLOT);
+    assert!(offset_of!(StreamVtbl, initialize_from_memory) == 16 * SLOT);
+    assert!(offset_of!(DecoderVtbl, get_frame) == 13 * SLOT);
+    assert!(offset_of!(SourceVtbl, get_size) == 3 * SLOT);
+    assert!(offset_of!(SourceVtbl, copy_pixels) == 7 * SLOT);
+    assert!(offset_of!(FrameVtbl, get_color_contexts) == 9 * SLOT);
+    assert!(offset_of!(FormatConverterVtbl, initialize) == 8 * SLOT);
+    assert!(offset_of!(CodecInfoVtbl, get_file_extensions) == 17 * SLOT);
+};
+
 /// The vtable of the live interface `object`, viewed as `V`.
 ///
 /// # Safety
@@ -558,70 +577,7 @@ fn split_extensions(list: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CodecInfoVtbl, DecoderVtbl, FormatConverterVtbl, FrameVtbl, ImagingFactoryVtbl, SourceVtbl,
-        StreamVtbl, bgra_to_rgba, decodable_extensions, decode_rgba8, split_extensions,
-    };
-
-    #[test]
-    fn the_vtables_put_each_called_slot_at_its_index() {
-        let slot = |offset: usize| offset / std::mem::size_of::<usize>();
-        assert_eq!(
-            slot(std::mem::offset_of!(
-                ImagingFactoryVtbl,
-                create_decoder_from_stream
-            )),
-            4
-        );
-        assert_eq!(
-            slot(std::mem::offset_of!(
-                ImagingFactoryVtbl,
-                create_format_converter
-            )),
-            10
-        );
-        assert_eq!(
-            slot(std::mem::offset_of!(ImagingFactoryVtbl, create_stream)),
-            14
-        );
-        assert_eq!(
-            slot(std::mem::offset_of!(
-                ImagingFactoryVtbl,
-                create_color_context
-            )),
-            15
-        );
-        assert_eq!(
-            slot(std::mem::offset_of!(
-                ImagingFactoryVtbl,
-                create_color_transformer
-            )),
-            16
-        );
-        assert_eq!(
-            slot(std::mem::offset_of!(
-                ImagingFactoryVtbl,
-                create_component_enumerator
-            )),
-            23
-        );
-        assert_eq!(
-            slot(std::mem::offset_of!(StreamVtbl, initialize_from_memory)),
-            16
-        );
-        assert_eq!(slot(std::mem::offset_of!(DecoderVtbl, get_frame)), 13);
-        assert_eq!(slot(std::mem::offset_of!(SourceVtbl, get_size)), 3);
-        assert_eq!(slot(std::mem::offset_of!(SourceVtbl, copy_pixels)), 7);
-        assert_eq!(slot(std::mem::offset_of!(FrameVtbl, get_color_contexts)), 9);
-        assert_eq!(
-            slot(std::mem::offset_of!(FormatConverterVtbl, initialize)),
-            8
-        );
-        assert_eq!(
-            slot(std::mem::offset_of!(CodecInfoVtbl, get_file_extensions)),
-            17
-        );
-    }
+    use super::{bgra_to_rgba, decodable_extensions, decode_rgba8, split_extensions};
 
     #[test]
     fn a_codecs_extensions_are_bare_and_lower_case() {

@@ -10,8 +10,10 @@ use std::time::Duration;
 
 use aterm_types::needs::NeedWord;
 
-/// How often the issuer (or a `[fleet] watch` Mac) reads the fleet.
+/// How often this Mac reads the fleet automatically while a read reaches a peer.
 pub(crate) const POLL_EVERY: Duration = Duration::from_secs(60);
+/// The longest wait between reads that reach no peer ([`Quiet`]).
+pub(crate) const QUIET_MAX: Duration = Duration::from_secs(30 * 60);
 /// On menu open, a read younger than this is fresh enough.
 pub(crate) const MENU_FRESH: Duration = Duration::from_secs(15);
 /// A fleet need counts on the badge only from a read this young.
@@ -92,6 +94,8 @@ pub(crate) struct FleetMac {
     pub(crate) working: usize,
     /// Rows its reply cap left out (`sessions=` past every session row sent, exited ones included: the header counts them too).
     pub(crate) left_out: usize,
+    /// Other live instances the peer reports, whose sessions this reply did not read.
+    pub(crate) instances_unread: usize,
     /// Its needs.
     pub(crate) needs: Vec<FleetNeed>,
     /// Its sessions this Mac holds over the fleet, whatever their need: a hold is never a need.
@@ -115,9 +119,12 @@ impl FleetMac {
         !self.older && !self.unproven
     }
 
-    /// Whether its needs count on the badge at `now_ms`: its rows were read no longer than [`COUNT_FRESH`] ago.
+    /// Whether its needs count on the badge at `now_ms`: its rows were read no longer than
+    /// [`COUNT_FRESH`] ago, and the read is not ahead of the current clock.
     pub(crate) fn fresh(&self, now_ms: u64) -> bool {
-        now_ms.saturating_sub(self.read_at_ms) <= millis(COUNT_FRESH)
+        now_ms
+            .checked_sub(self.read_at_ms)
+            .is_some_and(|age| age <= millis(COUNT_FRESH))
     }
 }
 
@@ -146,9 +153,12 @@ pub(crate) struct FleetSnapshot {
 }
 
 impl FleetSnapshot {
-    /// Whether the read itself is no older than [`COUNT_FRESH`] at `now_ms` (each Mac's own rows: [`FleetMac::fresh`]).
+    /// Whether the read itself is no older than [`COUNT_FRESH`] at `now_ms`, without a future
+    /// timestamp (each Mac's own rows: [`FleetMac::fresh`]).
     pub(crate) fn fresh(&self, now_ms: u64) -> bool {
-        now_ms.saturating_sub(self.read_at_ms) <= millis(COUNT_FRESH)
+        now_ms
+            .checked_sub(self.read_at_ms)
+            .is_some_and(|age| age <= millis(COUNT_FRESH))
     }
 
     /// The Macs that answered this read (a [`FleetMac::carried`] one did not).
@@ -165,12 +175,13 @@ impl FleetSnapshot {
             .sum()
     }
 
-    /// The first instant after `now_ms` (unix ms) at which the read, or one Mac's rows in it, stops counting.
-    pub(crate) fn next_lapse(&self, now_ms: u64) -> Option<u64> {
+    /// The first instant after `now_ms` (unix ms) at which the read, or one Mac's rows in it,
+    /// starts or stops counting. A read ahead of a corrected clock starts at its timestamp.
+    pub(crate) fn next_freshness_change(&self, now_ms: u64) -> Option<u64> {
         std::iter::once(self.read_at_ms)
             .chain(self.macs.iter().map(|m| m.read_at_ms))
-            .map(|at| at.saturating_add(millis(COUNT_FRESH)).saturating_add(1))
-            .filter(|lapse| *lapse > now_ms)
+            .flat_map(|at| [at, at.saturating_add(millis(COUNT_FRESH)).saturating_add(1)])
+            .filter(|change| *change > now_ms)
             .min()
     }
 }
@@ -352,6 +363,10 @@ fn mac_of(
         older,
         unproven,
         sessions: rows.len(),
+        instances_unread: field(instance, "instances")
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or(1)
+            .saturating_sub(1),
         ..FleetMac::default()
     };
     let claimed = field(instance, "sessions").and_then(|n| n.parse::<usize>().ok());
@@ -525,8 +540,9 @@ pub(crate) fn parse(
 pub(crate) struct BookFacts {
     /// It holds a fleet key: it is in a fleet.
     pub(crate) in_fleet: bool,
-    /// Its book has peers that joined it: it is the fleet's issuer, and its read is the whole fleet.
-    pub(crate) issuer: bool,
+    /// It minted the fleet's code (`aterm fleet init`). Joined peer rows no longer
+    /// establish this local fact after F17; it never overrides the watch preference.
+    pub(crate) minted: bool,
     /// The issuer a member's book names, where it is all the book holds and no copy of that issuer's book was read.
     pub(crate) issuer_label: Option<String>,
     /// The issuer a member's book names with no key bound to it (it joined before node keys came, or its issuer proved none then).
@@ -559,8 +575,8 @@ fn read_book_peers(_state: &Path, in_fleet: bool) -> BookFacts {
     }
 }
 
-/// [`read_book`]'s book: whether it names peers that joined this Mac, or
-/// only its issuer — and then, since the issuer's book (S11) makes a
+/// [`read_book`]'s book: whether this Mac minted the fleet's code, or its
+/// book names only its issuer — and then, since the issuer's book (S11) makes a
 /// member's read whole, whether the last read got that book
 /// ([`aterm_net::fleet_member::holds_issuer_book`]): a member holding it
 /// knows the whole fleet, one without it (its issuer an older aterm that
@@ -569,9 +585,8 @@ fn read_book_peers(_state: &Path, in_fleet: bool) -> BookFacts {
 #[cfg(unix)]
 fn read_book_peers(state: &Path, in_fleet: bool) -> BookFacts {
     let book = aterm_net::fleet_member::read_peers(state).unwrap_or_default();
-    let issuer = book
-        .iter()
-        .any(|p| p.via == aterm_net::fleet_member::Via::Joined);
+    let minted = std::fs::symlink_metadata(state.join(aterm_net::fleet_member::CODE_FILE))
+        .is_ok_and(|meta| meta.is_file());
     let issuer_label = book
         .iter()
         .all(|p| p.via == aterm_net::fleet_member::Via::Issuer)
@@ -591,26 +606,71 @@ fn read_book_peers(state: &Path, in_fleet: bool) -> BookFacts {
         .map(|p| p.host.clone());
     BookFacts {
         in_fleet,
-        issuer,
+        minted,
         issuer_label,
         unbound_issuer,
     }
 }
 
-/// WHEN TO READ THE FLEET: never in no fleet.
+/// WHEN TO READ THE FLEET: never in no fleet; on its own when `watch`, every `every` ([`Quiet::every`]).
 pub(crate) fn should_poll(
     book: &BookFacts,
     watch: bool,
     last_ms: Option<u64>,
     now_ms: u64,
     menu_opening: bool,
+    every: Duration,
 ) -> bool {
     if !book.in_fleet {
         return false;
     }
-    let older_than =
-        |span: Duration| last_ms.is_none_or(|at| now_ms.saturating_sub(at) >= millis(span));
-    (menu_opening && older_than(MENU_FRESH)) || ((book.issuer || watch) && older_than(POLL_EVERY))
+    let older_than = |span: Duration| {
+        last_ms
+            .and_then(|at| now_ms.checked_sub(at))
+            .is_none_or(|age| age >= millis(span))
+    };
+    (menu_opening && older_than(MENU_FRESH)) || (watch && older_than(every))
+}
+
+/// THE READ'S BACKOFF WHILE AWAY (docs/DESIGN-fluid-swarm-2026-10-28.md F4): a read that reached
+/// no peer of those it dialled (a Mac on a hotspot, every peer dark) doubles the wait before the
+/// next, from [`POLL_EVERY`] up to [`QUIET_MAX`]; a read that reached one, and a move of this
+/// Mac's network ([`Kick::Moved`]), start it again from [`POLL_EVERY`]. A read that failed says
+/// nothing of the peers and leaves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Quiet {
+    every: Duration,
+}
+
+impl Default for Quiet {
+    fn default() -> Self {
+        Self { every: POLL_EVERY }
+    }
+}
+
+impl Quiet {
+    /// The wait before the next read of its own.
+    pub(crate) const fn every(self) -> Duration {
+        self.every
+    }
+
+    /// A read answered `read`: whether the wait changed.
+    pub(crate) fn after(&mut self, read: &Result<FleetSnapshot, String>) -> bool {
+        let before = self.every;
+        match read {
+            Ok(read) if read.answered() == 0 && !read.unanswered.is_empty() => {
+                self.every = self.every.saturating_mul(2).min(QUIET_MAX);
+            }
+            Ok(_) => self.every = POLL_EVERY,
+            Err(_) => {}
+        }
+        self.every != before
+    }
+
+    /// This Mac's network moved: the wait starts again.
+    pub(crate) fn moved(&mut self) {
+        self.every = POLL_EVERY;
+    }
 }
 
 /// The shared slot the reader writes and the status item reads.
@@ -715,6 +775,9 @@ pub(crate) enum Kick {
     MenuOpening,
     /// Read the Fleet Now: read whatever the last read's age.
     Now,
+    /// This Mac's network moved: the read's backoff ends ([`Quiet::moved`]), and a Mac that reads
+    /// on its own reads now.
+    Moved,
 }
 
 /// The reader thread's inputs besides its runner.
@@ -731,6 +794,9 @@ pub(crate) struct ReaderSeams {
     pub(crate) post: Box<dyn Fn() -> bool + Send>,
     /// How long the thread waits for a kick before it looks again.
     pub(crate) tick: Duration,
+    /// This process's "network moved" signal, each move a [`Kick::Moved`]; none in a test that
+    /// kicks by hand.
+    pub(crate) moved: Option<crate::network_moved::Watch>,
 }
 
 /// The fleet glance's handle: the slot and the kick channel.
@@ -764,11 +830,26 @@ impl FleetGlance {
     }
 }
 
-/// START THE READER on thread `aterm-fleet-glance` with `runner` and `seams`, its watch switch starting at `watch`.
-pub(crate) fn spawn(runner: Box<dyn FleetRunner>, seams: ReaderSeams) -> Option<FleetGlance> {
+/// START THE READER on thread `aterm-fleet-glance` with `runner` and `seams`, its watch switch starting at `watch`, and its moves ([`ReaderSeams::moved`]) on `aterm-fleet-moved`.
+pub(crate) fn spawn(runner: Box<dyn FleetRunner>, mut seams: ReaderSeams) -> Option<FleetGlance> {
     let slot = Arc::new(Mutex::new(FleetSlot::default()));
     let (tx, rx) = std::sync::mpsc::channel();
     let watch = Arc::clone(&seams.watch);
+    if let Some(mut moved) = seams.moved.take() {
+        let kick = tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("aterm-fleet-moved".to_string())
+            .spawn(move || {
+                crate::qos::set_self(crate::qos::Role::Background);
+                loop {
+                    let woke = moved.wait(crate::network_moved::LONG);
+                    if woke != crate::network_moved::Woke::Timer && kick.send(Kick::Moved).is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+    }
     let thread_slot = Arc::clone(&slot);
     std::thread::Builder::new()
         .name("aterm-fleet-glance".to_string())
@@ -785,10 +866,11 @@ pub(crate) fn spawn(runner: Box<dyn FleetRunner>, seams: ReaderSeams) -> Option<
 }
 
 /// The reader: look, read when [`should_poll`] (or a [`Kick::Now`]) says,
-/// write the slot ([`carry`]ing a silent Mac's last rows), tell the App,
-/// then wait for a kick, the tick, or the next instant the read or one Mac's
-/// rows in it stops counting ([`FleetSnapshot::next_lapse`]), whichever is
-/// first.
+/// at the wait [`Quiet`] keeps (a [`Kick::Moved`] starts it again and reads
+/// as if no read was made), write the slot ([`carry`]ing a silent Mac's last
+/// rows), tell the App, then wait for a kick, the tick, or the next instant
+/// the read or one Mac's rows in it starts or stops counting
+/// ([`FleetSnapshot::next_freshness_change`]), whichever is first.
 fn reader_loop(
     mut runner: Box<dyn FleetRunner>,
     seams: &ReaderSeams,
@@ -798,16 +880,28 @@ fn reader_loop(
     let lock = || slot.lock().unwrap_or_else(|p| p.into_inner());
     let mut kick: Option<Kick> = None;
     let mut first = true;
-    let mut lapse_at: Option<u64> = None;
+    let mut freshness_at: Option<u64> = None;
     let mut told_ms: u64 = 0;
+    let mut quiet = Quiet::default();
     loop {
         let book = (seams.book)();
         let now = (seams.now_ms)();
-        let tried = lock().tried_ms;
+        let moved = kick == Some(Kick::Moved);
+        if moved {
+            quiet.moved();
+        }
+        let tried = lock().tried_ms.filter(|_| !moved);
         let watch = seams.watch.load(std::sync::atomic::Ordering::Acquire);
         let read = book.in_fleet
             && (kick == Some(Kick::Now)
-                || should_poll(&book, watch, tried, now, kick == Some(Kick::MenuOpening)));
+                || should_poll(
+                    &book,
+                    watch,
+                    tried,
+                    now,
+                    kick == Some(Kick::MenuOpening),
+                    quiet.every(),
+                ));
         let book_moved = {
             let mut slot = lock();
             let moved = slot.book != book;
@@ -815,9 +909,10 @@ fn reader_loop(
             slot.reading = read;
             moved
         };
-        let lapsed = lapse_at.is_some_and(|at| now >= at);
+        let freshness_changed = freshness_at.is_some_and(|at| now >= at);
+        let clock_rewound = now < told_ms;
         let first_look = std::mem::take(&mut first);
-        if read || book_moved || lapsed || first_look {
+        if read || book_moved || freshness_changed || clock_rewound || first_look {
             if !(seams.post)() {
                 return;
             }
@@ -830,6 +925,9 @@ fn reader_loop(
                 let no_route = stderr.contains(aterm_ctl::NO_ROUTE_NOTE);
                 parse(&json, no_route, seams.own_node.as_deref(), now)
             });
+            if quiet.after(&parsed) {
+                aterm_log::info!("{}", quiet_line(quiet));
+            }
             {
                 let mut slot = lock();
                 slot.reading = false;
@@ -855,11 +953,11 @@ fn reader_loop(
             told_ms = now;
         }
         let now = (seams.now_ms)();
-        lapse_at = lock()
+        freshness_at = lock()
             .snapshot
             .as_deref()
-            .and_then(|snapshot| snapshot.next_lapse(told_ms));
-        let wait = lapse_at.map_or(seams.tick, |at| {
+            .and_then(|snapshot| snapshot.next_freshness_change(told_ms));
+        let wait = freshness_at.map_or(seams.tick, |at| {
             Duration::from_millis(at.saturating_sub(now)).min(seams.tick)
         });
         kick = match rx.recv_timeout(wait) {
@@ -867,6 +965,19 @@ fn reader_loop(
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return,
         };
+    }
+}
+
+/// The aterm.log line for the read's wait as [`Quiet`] set it.
+pub(crate) fn quiet_line(quiet: Quiet) -> String {
+    if quiet.every() == POLL_EVERY {
+        "fleet glance: a fleet Mac answered; the fleet is read every minute again".to_owned()
+    } else {
+        format!(
+            "fleet glance: no fleet Mac answered; the next read in {} min, or at once when \
+             this Mac's network moves",
+            quiet.every().as_secs() / 60
+        )
     }
 }
 
@@ -970,10 +1081,7 @@ impl crate::App {
         #[cfg(not(unix))]
         let own_node = None;
         let watch = Arc::new(std::sync::atomic::AtomicBool::new(
-            self.config
-                .fleet
-                .as_ref()
-                .is_some_and(crate::app_config::FleetConfig::watch_or_default),
+            self.config.fleet_watch_enabled(),
         ));
         let seams = ReaderSeams {
             book: Box::new(move || state.as_deref().map(read_book).unwrap_or_default()),
@@ -982,6 +1090,7 @@ impl crate::App {
             now_ms: Box::new(|| aterm_time::unix_millis().unwrap_or(0)),
             post: Box::new(move || proxy.send_event(crate::Wake::FleetRead).is_ok()),
             tick: POLL_EVERY,
+            moved: Some(crate::network_moved::watch()),
         };
         self.start_fleet_glance_with(Box::new(ChildRunner::fleet()), seams);
     }
@@ -1011,12 +1120,7 @@ impl crate::App {
     /// `[fleet] watch` moved (a config commit): the reader follows it.
     pub(crate) fn follow_fleet_watch(&self) {
         if let Some(fleet) = &self.fleet_glance {
-            fleet.set_watch(
-                self.config
-                    .fleet
-                    .as_ref()
-                    .is_some_and(crate::app_config::FleetConfig::watch_or_default),
-            );
+            fleet.set_watch(self.config.fleet_watch_enabled());
         }
     }
 

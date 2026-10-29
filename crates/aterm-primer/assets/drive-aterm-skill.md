@@ -2,7 +2,7 @@
 name: drive-aterm
 description: Drive, observe and screenshot another aterm session (a tab or window on this machine, or a session on another fleet Mac that lets this one drive it) over its control socket. Use when asked to watch or control another terminal or another agent's session, wait for a command to really finish, or run several sessions at once.
 ---
-<!-- aterm skill v12 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v15 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # Driving another aterm session
 
@@ -11,8 +11,9 @@ description: Drive, observe and screenshot another aterm session (a tab or windo
 unknown verb`. There is no MCP server: use `aterm ctl`, `aterm drive` or the `aterm-agent`
 library. Another machine's sessions are read with `aterm ctl survey --fleet` (`aterm help
 fleet`), and driven only where that Mac's person ran `aterm fleet allow drive --from <this
-Mac>`: `aterm ctl --host <h> <verb>` with a worker's verbs, each session by its sid, the
-first wait `await task @<w> since=0` (`aterm help workers`, ON ANOTHER MAC).
+Mac>` (or `--all`, which lets every member drive it, as `aterm fleet sync`'s first join does):
+`aterm ctl --host <h> <verb>` with a worker's verbs, each session by its sid, the first wait
+`await task @<w> since=0` (`aterm help workers`, ON ANOTHER MAC).
 
 A one-shot non-interactive command belongs in your own shell, not in a session.
 
@@ -22,7 +23,8 @@ Text typed into an agent's prompt reaches it as its human's next instruction. Be
 `turn`, `send`, `key` or `paste` into a peer, read what is there:
 
 - `aterm ctl "@$SID" status`: `detail=` is the running program (`claude`, `codex`,
-  `targo%20test`; `-` when idle), `program=` the foreground program, `agent=` the server's
+  `targo%20test`; `-` when idle; for an alias or a function, the program it ran, such as
+  `ls` for `ll`), `program=` the foreground program, `agent=` the server's
   verdict on an agent's screen (`busy|prompt|question|idle|survey|wall:<kind>|unknown`),
   `supervisor=` other than `-` means its prompts are already answered
   (`aterm-harness@<pid>` is the window's own host), `human_ms=` how long since a person
@@ -152,8 +154,9 @@ aterm ctl "@$SID" turn settle=gone:esc.to.interrupt timeout=600000 'msg'   # an 
 
 `turn` types the text, verifies submit, waits to settle and prints the verdict (stderr) and
 screen (stdout). `ERR busy turn=<id>` or `ERR busy lease=<holder>` means another driver (or
-your own lease) holds it. Run long turns in the background (or with a Bash timeout >2m), and
-read the screen before retrying a killed `turn`.
+your own lease) holds it. Run long turns in the background (or with a Bash timeout >2m; in
+codex-alab, in the foreground as `Wait` says), and read the screen before retrying a killed
+`turn`.
 
 A Claude Code worker's task goes via `aterm ctl @self spawn agent=claude -` (stdin), not
 `turn` (which arrives as bracketed paste). For a one-line follow-up, `turn typed=1
@@ -175,7 +178,10 @@ settle=submitted` types key by key, returns `task_rev=<n>` once the composer cle
   `<cmd>; echo SENTINEL` and `await match '^SENTINEL$'` (anchored: the echoed command line
   contains it too).
 - Park at most one wait (every tab shares the slot pool; no sleep loops), and run waits >2m
-  (`timeout=600000`, `await task|inbox|agent`) in the background.
+  (`timeout=600000`, `await task|inbox|agent`) in the background. codex-alab's shell tool
+  wakes no turn when a command ends: there, run each wait in the foreground with `timeout=`,
+  keep reading that same process when the tool call returns before it exits, and re-arm on
+  exit 124 (`OK timeout`).
 - Exit 75 means the instance vanished mid-exchange (crash, quit or self-update): locate the
   session with `ls`, read the screen before re-sending a `turn`, and re-post only with the
   same `key=`.

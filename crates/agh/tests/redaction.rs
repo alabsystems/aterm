@@ -76,6 +76,17 @@ fn the_longest_learned_value_goes_first() {
     redactor.learn(b"overlap-1234");
     redactor.learn(b"overlap-1234-longer");
     assert_eq!(redactor.apply("x overlap-1234-longer y"), "x [redacted] y");
+
+    // Learning a secret that is itself a substring of `[redacted]` must stay idempotent
+    // rather than re-redacting inside an already-emitted `[redacted]` marker.
+    let marker_sub = Redactor::new();
+    marker_sub.learn(b"redacted");
+    marker_sub.learn(b"other-secret-value");
+    marker_sub.learn(b"[redacted]-with-secret-tail");
+    let once =
+        marker_sub.apply("a other-secret-value and redacted and [redacted]-with-secret-tail");
+    assert_eq!(once, "a [redacted] and [redacted] and [redacted]");
+    assert_eq!(marker_sub.apply(&once), once);
 }
 
 #[test]

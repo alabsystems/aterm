@@ -265,8 +265,11 @@ impl App {
         true
     }
 
-    /// Paste the clipboard into `window`'s in-grid rename field (one line; the reducer strips control characters).
+    /// Paste the clipboard into `window`'s in-grid rename field (one line; the reducer strips control characters). A control client's gesture reads no clipboard ([`Self::refuse_clipboard_gesture`]).
     pub(crate) fn rename_paste_in(&mut self, window: WindowId) -> bool {
+        if self.refuse_clipboard_gesture("rename-field paste") {
+            return false;
+        }
         #[cfg(target_os = "linux")]
         let text = crate::control::pbpaste_owned();
         #[cfg(not(target_os = "linux"))]

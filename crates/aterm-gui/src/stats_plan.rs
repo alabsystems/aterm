@@ -1393,9 +1393,18 @@ pub(crate) fn place_key(mut spans: Vec<KeySpan>, items: &[KeyItem], m: &FaceMetr
         Some(score)
     };
     let mut best: Option<(KeyScore, [Option<usize>; 3])> = None;
-    for &over in &choices {
-        for &ramp in &choices {
-            for &not_read in &choices {
+    // An item `items` leaves out stands nowhere: every combo that places one scores `None`, so it
+    // is searched at `None` alone, which visits the combos that score in the same order.
+    let [over_at, ramp_at, not_read_at] = KeyItem::SEARCH.map(|item| {
+        if items.contains(&item) {
+            choices.as_slice()
+        } else {
+            &[None]
+        }
+    });
+    for &over in over_at {
+        for &ramp in ramp_at {
+            for &not_read in not_read_at {
                 let combo = [over, ramp, not_read];
                 if let Some(s) = score(combo)
                     && best.is_none_or(|(b, _)| s.beats(b))
@@ -2685,43 +2694,52 @@ mod tests {
                 .filter(|l| matches!(l.label, Label::Scope(_)))
                 .count()
         };
+        let faces = [hn(), FaceMetrics::test_stack()];
+        let widths: Vec<(usize, u32)> = (0..faces.len())
+            .flat_map(|face| (160..=5120).map(move |w| (face, w)))
+            .collect();
         // Bars under the % seen in Full and in fslim, and Full slim's column.
-        let mut seen = [0_u32; 3];
-        for m in [hn(), FaceMetrics::test_stack()] {
-            for w in (160..=5120).map(f64::from) {
-                let full = plan_full(w, &m);
-                if !full.ground_only && full.pct.is_some() {
-                    let at = format!("Full {:?} W {w}", full.kind);
-                    let bar = full.meter.bar;
-                    assert!(bar.is_some() != full.bar_under().is_some(), "{at}");
-                    match (full.kind, bar) {
-                        (FullKind::Slim, None) => seen[0] += 1,
-                        (FullKind::Slim, Some(_)) => seen[2] += 1,
-                        (_, bar) => assert!(bar.is_some(), "{at}: its column"),
-                    }
-                    let n = scopes(&header_full(&full, TEXT, None, &m));
-                    assert!(n == 0 || n == 3, "{at}: the legend in part, {n} names");
+        let seen = aterm_spec::check::each(&widths, |&(face, w)| {
+            let (m, w) = (&faces[face], f64::from(w));
+            let mut seen = [0_u32; 3];
+            let full = plan_full(w, m);
+            if !full.ground_only && full.pct.is_some() {
+                let at = format!("Full {:?} W {w}", full.kind);
+                let bar = full.meter.bar;
+                assert!(bar.is_some() != full.bar_under().is_some(), "{at}");
+                match (full.kind, bar) {
+                    (FullKind::Slim, None) => seen[0] += 1,
+                    (FullKind::Slim, Some(_)) => seen[2] += 1,
+                    (_, bar) => assert!(bar.is_some(), "{at}: its column"),
                 }
-                let folded = plan_folded(w, &m);
-                if folded.ground_only {
-                    continue;
-                }
-                for block in folded.blocks.iter().filter(|b| b.pct.is_some()) {
-                    let at = format!("Folded {:?} W {w}", block.kind);
-                    let bar = block.meter.bar;
-                    assert!(bar.is_some() != block.bar_under().is_some(), "{at}");
-                    match (block.kind, bar) {
-                        (BlockKind::Slim, bar) => {
-                            assert_eq!(bar, None, "{at}: fnarrow lays slim's column first");
-                            seen[1] += 1;
-                        }
-                        (_, bar) => assert!(bar.is_some(), "{at}: its column"),
-                    }
-                }
-                let n = scopes(&header_folded(&folded, TEXT, [None, None], &m));
-                assert!(n == 0 || n == 3, "Folded W {w}: the legend once, {n} names");
+                let n = scopes(&header_full(&full, TEXT, None, m));
+                assert!(n == 0 || n == 3, "{at}: the legend in part, {n} names");
             }
-        }
+            let folded = plan_folded(w, m);
+            if folded.ground_only {
+                return seen;
+            }
+            for block in folded.blocks.iter().filter(|b| b.pct.is_some()) {
+                let at = format!("Folded {:?} W {w}", block.kind);
+                let bar = block.meter.bar;
+                assert!(bar.is_some() != block.bar_under().is_some(), "{at}");
+                match (block.kind, bar) {
+                    (BlockKind::Slim, bar) => {
+                        assert_eq!(bar, None, "{at}: fnarrow lays slim's column first");
+                        seen[1] += 1;
+                    }
+                    (_, bar) => assert!(bar.is_some(), "{at}: its column"),
+                }
+            }
+            let n = scopes(&header_folded(&folded, TEXT, [None, None], m));
+            assert!(n == 0 || n == 3, "Folded W {w}: the legend once, {n} names");
+            seen
+        })
+        .into_iter()
+        .fold([0_u32; 3], |mut all, one| {
+            all.iter_mut().zip(one).for_each(|(n, more)| *n += more);
+            all
+        });
         assert!(seen.iter().all(|&n| n > 10), "CONTROL: {seen:?}");
     }
 
@@ -3725,6 +3743,9 @@ mod tests {
         })
     }
 
+    /// Every half-point width from 160 to 5120 pt on both faces, on every core. A width whose
+    /// plan the half point before it already planned is not headed again: the headers are
+    /// functions of the plan, and the plans read whole points ([`whole_width`]).
     #[test]
     fn key_is_placed() {
         let long = StateLabel {
@@ -3754,43 +3775,47 @@ mod tests {
                 .count();
             assert_eq!(times, 1, "{what}: one time label");
         };
-        for m in [hn(), FaceMetrics::test_stack()] {
-            for px2 in 320..=10_240 {
-                let w = f64::from(px2) / 2.0;
-                let full = plan_full(w, &m);
-                if !full.ground_only {
-                    check(
-                        &header_full(&full, TEXT, None, &m),
-                        &m,
-                        false,
-                        &format!("Full W {w}"),
-                    );
-                    // A state over the names may take the key's room there.
-                    let said = full.details.is_none();
-                    check(
-                        &header_full(&full, TEXT, Some(long), &m),
-                        &m,
-                        said,
-                        &format!("Full W {w}, a state"),
-                    );
-                }
-                let folded = plan_folded(w, &m);
-                if folded.ground_only {
-                    continue;
-                }
-                let states: [[Option<StateLabel<'_>>; 2]; 5] = [
-                    [None, None],
-                    [Some(long), None],
-                    [None, Some(short)],
-                    [Some(short), Some(long)],
-                    [Some(long), Some(long)],
-                ];
-                for pair in states {
-                    let both = pair.iter().all(Option::is_some);
-                    let head = header_folded(&folded, TEXT, pair, &m);
-                    check(&head, &m, both, &format!("Folded W {w}"));
-                }
+        let faces = [hn(), FaceMetrics::test_stack()];
+        let widths: Vec<(usize, u32)> = (0..faces.len())
+            .flat_map(|face| (320..=10_240).map(move |px2| (face, px2)))
+            .collect();
+        aterm_spec::check::each(&widths, |&(face, px2)| {
+            let m = &faces[face];
+            let w = f64::from(px2) / 2.0;
+            let before = f64::from(px2 - 1) / 2.0;
+            let full = plan_full(w, m);
+            if !full.ground_only && (px2 == 320 || plan_full(before, m) != full) {
+                check(
+                    &header_full(&full, TEXT, None, m),
+                    m,
+                    false,
+                    &format!("Full W {w}"),
+                );
+                // A state over the names may take the key's room there.
+                let said = full.details.is_none();
+                check(
+                    &header_full(&full, TEXT, Some(long), m),
+                    m,
+                    said,
+                    &format!("Full W {w}, a state"),
+                );
             }
-        }
+            let folded = plan_folded(w, m);
+            if folded.ground_only || (px2 != 320 && plan_folded(before, m) == folded) {
+                return;
+            }
+            let states: [[Option<StateLabel<'_>>; 2]; 5] = [
+                [None, None],
+                [Some(long), None],
+                [None, Some(short)],
+                [Some(short), Some(long)],
+                [Some(long), Some(long)],
+            ];
+            for pair in states {
+                let both = pair.iter().all(Option::is_some);
+                let head = header_folded(&folded, TEXT, pair, m);
+                check(&head, m, both, &format!("Folded W {w}"));
+            }
+        });
     }
 }

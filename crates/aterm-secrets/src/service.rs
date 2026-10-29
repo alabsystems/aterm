@@ -97,6 +97,54 @@ pub fn log_path(home: &Path, job: Job) -> PathBuf {
     secrets_dir(home).join(format!("{}.log", job.label()))
 }
 
+/// The system LaunchDaemon label on always-on members (`aterm machines apply`).
+pub const DAEMON_LABEL: &str = "systems.alab.aterm-vault-server";
+
+/// Where the system LaunchDaemon's property list sits on macOS.
+pub const DAEMON_PLIST: &str = "/Library/LaunchDaemons/systems.alab.aterm-vault-server.plist";
+
+/// Where the system LaunchDaemon stores served envelopes on macOS.
+pub const DAEMON_STORE: &str = "/Library/Application Support/aterm/vault-server/served";
+
+/// Where launchd writes the system LaunchDaemon's stdout and stderr on macOS.
+pub const DAEMON_LOG: &str = "/Library/Logs/aterm/systems.alab.aterm-vault-server.log";
+
+/// The arguments (after the `aterm` executable) of the system LaunchDaemon: `secrets serve`
+/// pinned to [`crate::ALAB_SIGNER`], advertising `advertise` (`_alab-vault._tcp` under the host's
+/// own label) or `--no-advertise` when `None` so an unlabelled daemon never contends for
+/// `alab-secrets.local`.
+#[must_use]
+pub fn daemon_serve_args(store: &Path, advertise: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "secrets".into(),
+        "serve".into(),
+        "--store".into(),
+        store.to_string_lossy().into_owned(),
+        "--pin".into(),
+        format!("{}={}", crate::ALAB_VAULT, crate::ALAB_SIGNER),
+    ];
+    match advertise.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => {
+            args.push("--advertise".into());
+            args.push(name.into());
+        }
+        None => args.push("--no-advertise".into()),
+    }
+    args
+}
+
+/// The launchd property list for [`DAEMON_LABEL`] in `system`: runs at boot before any user logs
+/// in (no `LimitLoadToSessionType`, no per-login `HOME`), kept alive as a Background process.
+#[must_use]
+pub fn daemon_plist_text(
+    program: &Path,
+    args: &[String],
+    log: &Path,
+    bundle_id: Option<&str>,
+) -> String {
+    plist_text_in(DAEMON_LABEL, program, args, log, Domain::Gui, bundle_id)
+}
+
 /// The record that the person turned this login's subscriber off:
 /// `~/.config/aterm/secrets/subscriber-off`. `agent off` writes it, and so does a `join` or
 /// `create` with `--no-agent` where no subscriber runs; an [`install`] of the subscriber
@@ -115,7 +163,7 @@ pub fn subscriber_turned_off(home: &Path) -> bool {
 /// Record that the person turned this login's subscriber off ([`subscriber_off_path`]), in
 /// the 0700 `~/.config/aterm/secrets`.
 pub fn record_subscriber_off(home: &Path) -> crate::Result<()> {
-    let _decision = SubscriberDecision::take(home)?;
+    let _decision = JobDecision::take(home, Job::Subscriber)?;
     record_subscriber_off_locked(home)
 }
 
@@ -128,16 +176,58 @@ fn record_subscriber_off_locked(home: &Path) -> crate::Result<()> {
     )
 }
 
-/// Orders the subscriber's local on/off decision and service changes across
-/// processes. It is separate from the vault's data lock and never spans a fetch.
-struct SubscriberDecision(std::fs::File);
+/// The record that the person turned this login's vault server off:
+/// `~/.config/aterm/secrets/server-off`. `server off` writes it, and an [`install`] of the server
+/// removes it, so automatic setup (`sync.steward.server.standby`) and [`move_held`] leave the
+/// server off by choice.
+pub fn server_off_path(home: &Path) -> PathBuf {
+    secrets_dir(home).join("server-off")
+}
 
-impl SubscriberDecision {
-    fn take(home: &Path) -> crate::Result<Self> {
+/// Whether the person turned this login's vault server off ([`server_off_path`]). A record that
+/// cannot be read is no record.
+pub fn server_turned_off(home: &Path) -> bool {
+    crate::fsx::kind(&server_off_path(home)).is_ok_and(|kind| kind != crate::fsx::Kind::Missing)
+}
+
+/// Record that the person turned this login's vault server off ([`server_off_path`]), in the 0700
+/// `~/.config/aterm/secrets`.
+pub fn record_server_off(home: &Path) -> crate::Result<()> {
+    let _decision = JobDecision::take(home, Job::Server)?;
+    record_server_off_locked(home)
+}
+
+fn record_server_off_locked(home: &Path) -> crate::Result<()> {
+    crate::fsx::ensure_private_dir(&secrets_dir(home))?;
+    crate::fsx::write_atomic(
+        &server_off_path(home),
+        b"the server was turned off by choice; aterm secrets server on turns it back on\n",
+        0o600,
+    )
+}
+
+/// Orders a job's local on/off decision and service changes across processes
+/// ([`decision_lock_path`]): an `on`, an `off`, a repair and a mend's move of the same job never
+/// interleave, so a move ([`move_held`]) never undoes an `off` or a pin that came while the mend
+/// judged the job. It is separate from the vault's data lock, and spans a fetch only in
+/// [`move_held_serving`], which holds it until the moved job is seen serving (up to a minute) or
+/// is put back, so an `off` meanwhile waits for that and then stands.
+struct JobDecision(std::fs::File);
+
+/// The lock [`JobDecision`] takes for `job`: `~/.config/aterm/secrets/subscriber.lock`, the one
+/// earlier releases take for the subscriber, or `server.lock`.
+fn decision_lock_path(home: &Path, job: Job) -> PathBuf {
+    secrets_dir(home).join(match job {
+        Job::Subscriber => "subscriber.lock",
+        Job::Server => "server.lock",
+    })
+}
+
+impl JobDecision {
+    fn take(home: &Path, job: Job) -> crate::Result<Self> {
         use std::os::unix::fs::OpenOptionsExt as _;
-        let dir = secrets_dir(home);
-        crate::fsx::ensure_private_dir(&dir)?;
-        let path = dir.join("subscriber.lock");
+        crate::fsx::ensure_private_dir(&secrets_dir(home))?;
+        let path = decision_lock_path(home, job);
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -154,14 +244,14 @@ impl SubscriberDecision {
         }
         #[expect(
             clippy::disallowed_methods,
-            reason = "the take of SubscriberDecision, whose Drop releases the local service decision lock"
+            reason = "the take of JobDecision, whose Drop releases the local service decision lock"
         )]
         file.lock()?;
         Ok(Self(file))
     }
 }
 
-impl Drop for SubscriberDecision {
+impl Drop for JobDecision {
     fn drop(&mut self) {
         let _ = self.0.unlock();
     }
@@ -204,6 +294,16 @@ pub fn back_within_restart_window<E>(
 /// Remove the person's record that the subscriber is off: it is on again.
 fn clear_subscriber_off(home: &Path) -> crate::Result<()> {
     let path = subscriber_off_path(home);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::new(format!("{}: {e}", path.display()))),
+    }
+}
+
+/// Remove the person's record that the server is off: it is on again.
+fn clear_server_off(home: &Path) -> crate::Result<()> {
+    let path = server_off_path(home);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -256,13 +356,21 @@ pub fn plist_text_in(
         argv.push_str(&format!("\t\t{}\n", string(arg)));
     }
     let environment = home_of_log(log).map_or_else(String::new, |home| {
+        let pkg_bin = home.join("Library/Application Support/aterm/pkg/bin");
+        let path = format!(
+            "{}:/usr/bin:/bin:/usr/sbin:/sbin",
+            pkg_bin.to_string_lossy()
+        );
         format!(
             "\t<key>EnvironmentVariables</key>\n\
              \t<dict>\n\
              \t\t<key>HOME</key>\n\
              \t\t{}\n\
+             \t\t<key>PATH</key>\n\
+             \t\t{}\n\
              \t</dict>\n",
-            string(&home.to_string_lossy())
+            string(&home.to_string_lossy()),
+            string(&path),
         )
     });
     let session = domain.session().map_or_else(String::new, |session| {
@@ -592,6 +700,38 @@ pub fn launchctl_argv(uid: u32, call: Launchctl<'_>) -> Vec<String> {
     }
 }
 
+/// What a `launchctl` call does in `system` (a root LaunchDaemon's domain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemLaunchctl<'a> {
+    /// `print system/<label>`: read the daemon's state.
+    Print(&'a str),
+    /// `bootout system/<label>`: stop the daemon and unload it.
+    Bootout(&'a str),
+    /// `bootstrap system <plist>`: load (and with `RunAtLoad`, start) the daemon a plist defines.
+    Bootstrap(&'a Path),
+    /// `kickstart system/<label>`: start the daemon unless it runs.
+    Kickstart(&'a str),
+    /// `kickstart -k system/<label>`: start the daemon, killing a running instance first.
+    Restart(&'a str),
+}
+
+/// The argv (after `/bin/launchctl`) of one call in `system`.
+#[must_use]
+pub fn system_launchctl_argv(call: SystemLaunchctl<'_>) -> Vec<String> {
+    let job = |label: &str| format!("system/{label}");
+    match call {
+        SystemLaunchctl::Print(label) => vec!["print".into(), job(label)],
+        SystemLaunchctl::Bootout(label) => vec!["bootout".into(), job(label)],
+        SystemLaunchctl::Bootstrap(plist) => vec![
+            "bootstrap".into(),
+            "system".into(),
+            plist.to_string_lossy().into_owned(),
+        ],
+        SystemLaunchctl::Kickstart(label) => vec!["kickstart".into(), job(label)],
+        SystemLaunchctl::Restart(label) => vec!["kickstart".into(), "-k".into(), job(label)],
+    }
+}
+
 /// The argv (after `systemctl`) of one call to this user's manager: `--user` and `words`.
 pub fn systemctl_argv(words: &[&str]) -> Vec<String> {
     std::iter::once("--user")
@@ -855,8 +995,9 @@ fn app_of_executable(program: &Path) -> Option<&Path> {
 }
 
 /// [`kept_program`], once it starts as aterm ([`check_program_starts`]): a job is put back on a
-/// program it keeps (a held snapshot) only while that program runs, and never moved off it onto
-/// another aterm, so one that cannot start is refused, naming it.
+/// program it keeps (a held snapshot) only while that program runs, and a repair never moves it
+/// off it onto another aterm (only [`move_held`] does, for a hold that can no longer do what it
+/// was for), so one that cannot start is refused, naming it.
 /// # Errors
 /// The program the job keeps does not start as aterm.
 pub fn kept_program_that_starts(home: &Path, job: Job) -> crate::Result<Option<PathBuf>> {
@@ -899,8 +1040,10 @@ pub fn unit_file(home: &Path, job: Job) -> PathBuf {
 /// The program `job`'s unit file starts, when that is an executable file in a lasting place
 /// (one [`service_program`] names as itself): what a repair keeps ([`repair_subscriber`]), so a
 /// repair never moves a job a person pointed at another aterm (`agent on --program`, a held
-/// snapshot) onto the aterm that repairs it; only an explicit [`install`] does. `None` where
-/// the unit names no such program (none, one gone, a build, a copy that goes away).
+/// snapshot) onto the aterm that repairs it; only an explicit [`install`] does, or [`move_held`]
+/// for a held approver that can no longer read the vault's admin locker and that no person
+/// pinned ([`crate::client::mend_held`]). `None` where the unit names no such program (none, one
+/// gone, a build, a copy that goes away).
 pub fn kept_program(home: &Path, job: Job) -> Option<PathBuf> {
     kept(
         unit_program(&unit_file(home, job)),
@@ -1151,17 +1294,31 @@ fn install_restarting(
     restart: bool,
 ) -> crate::Result<String> {
     check_own_home(home)?;
-    if job != Job::Subscriber {
-        return install_job(home, job, program, args, restart);
+    match job {
+        Job::Subscriber => {
+            install_subscriber_with(home, || install_job(home, job, program, args, restart))
+        }
+        Job::Server => install_server_with(home, || install_job(home, job, program, args, restart)),
     }
-    install_subscriber_with(home, || install_job(home, job, program, args, restart))
+}
+
+fn install_server_with(
+    home: &Path,
+    install: impl FnOnce() -> crate::Result<String>,
+) -> crate::Result<String> {
+    let _decision = JobDecision::take(home, Job::Server)?;
+    let line = install()?;
+    Ok(match clear_server_off(home) {
+        Ok(()) => line,
+        Err(e) => format!("{line}; the record that it was turned off stays ({e})"),
+    })
 }
 
 fn install_subscriber_with(
     home: &Path,
     install: impl FnOnce() -> crate::Result<String>,
 ) -> crate::Result<String> {
-    let _decision = SubscriberDecision::take(home)?;
+    let _decision = JobDecision::take(home, Job::Subscriber)?;
     let line = install()?;
     // The job runs either way: a record left behind says less than the job that runs.
     Ok(match clear_subscriber_off(home) {
@@ -1196,8 +1353,16 @@ pub fn repair_subscriber(
 /// from the same address and store. `None` where nothing is repaired: no server job, one whose
 /// program is there (left as it is, running or not, wherever it is), one a person switched off
 /// (a plist's `Disabled` key), one in a shape `aterm secrets server on` never writes (no
-/// `secrets serve` after its program), or a home that is not this login's own, whose jobs
-/// launchd and systemd never read (as [`state`]). `program` is asked only for a repair.
+/// `secrets serve` after its program), one while the system LaunchDaemon `aterm machines apply`
+/// installs ([`DAEMON_LABEL`]) is there, installed or running, which serves this Mac's vaults on
+/// the port a user job would take ([`daemon_state_for_home`]), or a home that is not this login's
+/// own, whose jobs launchd and systemd never read (as [`state`]). The job's decision lock
+/// (`JobDecision`) is taken only once its unit file reads as a `secrets serve` job whose program
+/// is gone, and the job read again under it, so a Mac with no server job gets no lock file (nor
+/// `~/.config/aterm/secrets`) from the mend. `program` is asked only for a repair.
+/// # Errors
+/// The job's decision lock or the system LaunchDaemon's state cannot be read, or a repair was due
+/// and `program` cannot be named or the job did not install.
 pub fn repair_server(
     home: &Path,
     program: &dyn Fn() -> crate::Result<PathBuf>,
@@ -1208,42 +1373,334 @@ pub fn repair_server(
     repair_server_with(
         home,
         &|path| std::fs::symlink_metadata(path).is_ok(),
+        &|| daemon_state_for_home(home),
         |args| install_job(home, Job::Server, &program()?, args, false),
     )
 }
 
-/// [`repair_server`], `exists` saying whether anything is at a path and `install` installing
-/// the job with these arguments.
-fn repair_server_with(
+/// [`repair_server`], `exists` saying whether anything is at a path, `daemon` reading the system
+/// LaunchDaemon's state and `install` installing the job with these arguments.
+pub(crate) fn repair_server_with(
     home: &Path,
     exists: &dyn Fn(&Path) -> bool,
+    daemon: &dyn Fn() -> crate::Result<State>,
     install: impl FnOnce(&[String]) -> crate::Result<String>,
 ) -> crate::Result<Option<String>> {
-    let Ok(text) = std::fs::read_to_string(unit_file(home, Job::Server)) else {
+    if server_repair_due(home, exists).is_none() {
+        return Ok(None);
+    }
+    let _decision = JobDecision::take(home, Job::Server)?;
+    let Some(args) = server_repair_due(home, exists) else {
         return Ok(None);
     };
+    if matches!(daemon()?, State::Installed { .. }) {
+        return Ok(None);
+    }
+    install(&args).map(Some)
+}
+
+/// The arguments of `home`'s server job when [`repair_server`] would install it again: its unit
+/// file reads as a `secrets serve` job, not switched off, whose program `exists` finds gone.
+fn server_repair_due(home: &Path, exists: &dyn Fn(&Path) -> bool) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(unit_file(home, Job::Server)).ok()?;
     let argv = if cfg!(target_os = "macos") {
         plist_argv(&text).filter(|_| !text.contains("<key>Disabled</key>"))
     } else {
         exec_argv(&text)
     };
-    let Some((held, args)) = argv.as_deref().and_then(<[String]>::split_first) else {
-        return Ok(None);
-    };
+    let (held, args) = argv.as_deref().and_then(<[String]>::split_first)?;
     let serves = args
         .get(..2)
         .is_some_and(|words| words == ["secrets", "serve"]);
-    if !serves || exists(Path::new(held)) {
+    (serves && !exists(Path::new(held))).then(|| args.to_vec())
+}
+
+/// A vault job held on another aterm than the one asking ([`held`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Held {
+    /// The job.
+    pub job: Job,
+    /// The program its unit file names, a lasting one ([`kept_program`]), canonical.
+    pub program: PathBuf,
+    /// Its arguments after the program, as `agent on` or `server on` wrote them.
+    pub args: Vec<String>,
+    /// The program the person's pin record names ([`pin_path`]), canonical: one naming another
+    /// program than `program` (the job was moved since) pins nothing ([`Held::pinned`]), but a
+    /// move reads it again before it moves the job ([`move_held`]).
+    pub pin: Option<PathBuf>,
+}
+
+impl Held {
+    /// Whether a person pinned the job to the program it runs, on purpose ([`pin_path`]).
+    #[must_use]
+    pub fn pinned(&self) -> bool {
+        self.pin.as_ref() == Some(&self.program)
+    }
+}
+
+/// `job` under `home` when it runs a lasting program other than `program` (a held snapshot,
+/// [`kept_program`]; `program` is the aterm asking, where it is one a job may run) in the shape
+/// `agent on` or `server on` writes (`secrets watch`; `secrets serve …`) and is not switched off
+/// (a plist's `Disabled` key): what the window's mend may move onto `program`
+/// ([`crate::client::mend_held`]). `None` otherwise, and for a home that is not this login's
+/// own, whose jobs launchd and systemd never read (as [`state`]).
+pub fn held(home: &Path, job: Job, program: Option<&Path>) -> Option<Held> {
+    check_own_home(home).ok()?;
+    held_at(home, job, program)
+}
+
+/// [`held`] under `home`, whoever's it is.
+pub(crate) fn held_at(home: &Path, job: Job, program: Option<&Path>) -> Option<Held> {
+    let text = std::fs::read_to_string(unit_file(home, job)).ok()?;
+    let canonical = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    held_in(
+        job,
+        &text,
+        kept_program(home, job).map(|kept| canonical(&kept)),
+        program.map(canonical).as_deref(),
+        pinned_to(home, job).map(|pin| canonical(&pin)),
+    )
+}
+
+/// [`held`] of the unit file `text`, whose program [`kept_program`] reads as `kept`, the pin
+/// record naming `pin` ([`pin_path`]).
+fn held_in(
+    job: Job,
+    text: &str,
+    kept: Option<PathBuf>,
+    program: Option<&Path>,
+    pin: Option<PathBuf>,
+) -> Option<Held> {
+    let argv = if cfg!(target_os = "macos") {
+        plist_argv(text).filter(|_| !text.contains("<key>Disabled</key>"))
+    } else {
+        exec_argv(text)
+    };
+    let (_, args) = argv.as_deref().and_then(<[String]>::split_first)?;
+    let shaped = match job {
+        Job::Subscriber => args == ["secrets", "watch"],
+        Job::Server => args
+            .get(..2)
+            .is_some_and(|words| words == ["secrets", "serve"]),
+    };
+    let kept = kept.filter(|kept| shaped && program != Some(kept.as_path()))?;
+    Some(Held {
+        job,
+        program: kept,
+        args: args.to_vec(),
+        pin,
+    })
+}
+
+/// The record that a person pinned `job` to a program on purpose, naming it:
+/// `~/.config/aterm/secrets/<label>.pinned`. `agent on --program <path>` and `server on --program
+/// <path>` write it, before their install ([`install_pinned`]); `on` with no `--program` (which
+/// puts the job on the aterm that runs it) and `off` remove it. The window's mend never moves a
+/// job whose record names the program it runs ([`crate::client::mend_held`]); a record naming
+/// another program (the job was moved since) is none.
+pub fn pin_path(home: &Path, job: Job) -> PathBuf {
+    secrets_dir(home).join(format!("{}.pinned", job.label()))
+}
+
+/// The program [`pin_path`]'s record names: `None` where there is none, or it cannot be read.
+fn pinned_to(home: &Path, job: Job) -> Option<PathBuf> {
+    let bytes = crate::fsx::read_private(&pin_path(home, job), 4096).ok()??;
+    let text = std::str::from_utf8(bytes.as_slice()).ok()?;
+    let program = Path::new(text.trim_end_matches('\n'));
+    program.is_absolute().then(|| program.to_path_buf())
+}
+
+/// Record that a person pinned `job` to `program` ([`pin_path`]).
+/// # Errors
+/// The record could not be written.
+pub fn record_pin(home: &Path, job: Job, program: &Path) -> crate::Result<()> {
+    let Some(text) = program.to_str() else {
+        return Err(Error::new(format!(
+            "{}: not a UTF-8 path",
+            program.display()
+        )));
+    };
+    crate::fsx::ensure_private_dir(&secrets_dir(home))?;
+    crate::fsx::write_atomic(&pin_path(home, job), format!("{text}\n").as_bytes(), 0o600)
+}
+
+/// Remove [`pin_path`]'s record: the job is no longer pinned.
+/// # Errors
+/// The record is there and could not be removed.
+pub fn clear_pin(home: &Path, job: Job) -> crate::Result<()> {
+    let path = pin_path(home, job);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::new(format!("{}: {e}", path.display()))),
+    }
+}
+
+/// Move the job `held` names off the program it holds onto `program`, the aterm that runs this,
+/// with the arguments it had, once [`crate::client::mend_held`] judged the hold can no longer do
+/// what it was for. Under the job's decision lock (`JobDecision`, which `on` and `off` take),
+/// the job is read again first and moved only while it still is `held` (the same program,
+/// arguments and pin record) and, for the subscriber, the person has not turned it off; what a
+/// person did while the mend judged it (an `off`, an `on`, an `on --program`, whose pin record
+/// comes before its install) stands (`None`). The server moves nothing (`None`) while the system
+/// LaunchDaemon `aterm machines apply` installs ([`DAEMON_LABEL`]) is there, installed or
+/// running ([`daemon_state_for_home`]): it serves this Mac's vaults, and a user job started
+/// beside it would take its port, as `server on` refuses to. launchd boots the job out (its
+/// running process ends) and starts it on `program`; where that fails (a bootstrap refused after
+/// the bootout, say), the job is installed again on the program it held, so it runs as it did,
+/// and the error names both.
+/// # Errors
+/// The home is not this login's own, the job's decision lock, the subscriber's off record or
+/// the system LaunchDaemon's state (for the server) cannot be read, or the job did not start on
+/// `program`.
+pub fn move_held(home: &Path, held: &Held, program: &Path) -> crate::Result<Option<String>> {
+    check_own_home(home)?;
+    move_held_with(
+        home,
+        held,
+        program,
+        &|| daemon_state_for_home(home),
+        &mut |program| install_job(home, held.job, program, &held.args, false),
+    )
+}
+
+/// [`move_held`] under `home`, `daemon` reading the system LaunchDaemon's state and `install`
+/// installing the job on a program.
+pub(crate) fn move_held_with(
+    home: &Path,
+    held: &Held,
+    program: &Path,
+    daemon: &dyn Fn() -> crate::Result<State>,
+    install: &mut dyn FnMut(&Path) -> crate::Result<String>,
+) -> crate::Result<Option<String>> {
+    let _decision = JobDecision::take(home, held.job)?;
+    let off_path = match held.job {
+        Job::Subscriber => subscriber_off_path(home),
+        Job::Server => server_off_path(home),
+    };
+    if crate::fsx::kind(&off_path)? != crate::fsx::Kind::Missing {
         return Ok(None);
     }
-    install(args).map(Some)
+    if held_at(home, held.job, Some(program)).as_ref() != Some(held) {
+        return Ok(None);
+    }
+    if held.job == Job::Server && matches!(daemon()?, State::Installed { .. }) {
+        return Ok(None);
+    }
+    moved_or_put_back(held, program, install).map(Some)
+}
+
+/// [`move_held`], counting the job moved only once `serves` finds it on `program` doing what it
+/// did (the server serving its store, `DESIGN-fluid-swarm` §4.3 step 1); where `serves` fails,
+/// the job is put back on the program it held, as when it does not start there.
+/// # Errors
+/// As [`move_held`]'s, or `serves` failed.
+pub fn move_held_serving(
+    home: &Path,
+    held: &Held,
+    program: &Path,
+    serves: &dyn Fn() -> crate::Result<()>,
+) -> crate::Result<Option<String>> {
+    check_own_home(home)?;
+    move_held_serving_with(
+        home,
+        held,
+        program,
+        &|| daemon_state_for_home(home),
+        &mut |to| install_job(home, held.job, to, &held.args, false),
+        serves,
+    )
+}
+
+/// [`move_held_serving`] under `home`, `daemon` reading the system LaunchDaemon's state and
+/// `install` installing the job on a program.
+pub(crate) fn move_held_serving_with(
+    home: &Path,
+    held: &Held,
+    program: &Path,
+    daemon: &dyn Fn() -> crate::Result<State>,
+    install: &mut dyn FnMut(&Path) -> crate::Result<String>,
+    serves: &dyn Fn() -> crate::Result<()>,
+) -> crate::Result<Option<String>> {
+    move_held_with(home, held, program, daemon, &mut |to| {
+        let line = install(to)?;
+        if to == program {
+            serves()?;
+        }
+        Ok(line)
+    })
+}
+
+/// `agent on` and `server on`'s `install` of `job`, with the person's pin ([`pin_path`]): `pin`
+/// names the program they pinned it to (`--program`), recorded before the install, so a mend that
+/// reads the job meanwhile finds the pin and moves nothing ([`move_held`]); with `None` (no
+/// `--program`: the job goes on the aterm that runs it) the record goes once the install ran. An
+/// install that fails puts the record back as it was. The install's line, and why the record
+/// could not be changed where it could not.
+/// # Errors
+/// The install failed.
+pub fn install_pinned(
+    home: &Path,
+    job: Job,
+    pin: Option<&Path>,
+    install: impl FnOnce() -> crate::Result<String>,
+) -> crate::Result<(String, Option<Error>)> {
+    let Some(pin) = pin else {
+        let line = install()?;
+        return Ok((line, clear_pin(home, job).err()));
+    };
+    let before = pinned_to(home, job);
+    let unrecorded = record_pin(home, job, pin).err();
+    match install() {
+        Ok(line) => Ok((line, unrecorded)),
+        Err(error) => {
+            if unrecorded.is_none() {
+                // Best effort: the install's error is what the person needs to read.
+                let _ = match before {
+                    Some(before) => record_pin(home, job, &before),
+                    None => clear_pin(home, job),
+                };
+            }
+            Err(error)
+        }
+    }
+}
+
+/// [`move_held`]'s install of `held` onto `program`, `install` installing the job on a
+/// program, and on the program it held again where that fails.
+fn moved_or_put_back(
+    held: &Held,
+    program: &Path,
+    install: &mut dyn FnMut(&Path) -> crate::Result<String>,
+) -> crate::Result<String> {
+    let error = match install(program) {
+        Ok(line) => return Ok(line),
+        Err(error) => error,
+    };
+    let on = match held.job {
+        Job::Subscriber => "agent on",
+        Job::Server => "server on",
+    };
+    Err(match install(&held.program) {
+        Ok(_) => Error::new(format!(
+            "{error}; the {} job was put back on {}, as it ran",
+            held.job.label(),
+            held.program.display()
+        )),
+        Err(back) => Error::new(format!(
+            "{error}; putting the {} job back on {} failed too ({back}), so it is down until \
+             aterm secrets {on} installs it again",
+            held.job.label(),
+            held.program.display()
+        )),
+    })
 }
 
 fn repair_subscriber_with(
     home: &Path,
     install: impl FnOnce() -> crate::Result<String>,
 ) -> crate::Result<Option<String>> {
-    let _decision = SubscriberDecision::take(home)?;
+    let _decision = JobDecision::take(home, Job::Subscriber)?;
     if crate::fsx::kind(&subscriber_off_path(home))? != crate::fsx::Kind::Missing {
         return Ok(None);
     }
@@ -1380,8 +1837,9 @@ fn install_launchd(
 
 /// The bundle identifier of the app `program` is the main executable of
 /// (`X.app/Contents/MacOS/<program>`, its `Contents/Info.plist`'s `CFBundleIdentifier`).
-#[cfg(any(target_os = "macos", all(test, unix)))]
-fn bundle_id_of(program: &Path) -> Option<String> {
+#[cfg(unix)]
+#[must_use]
+pub fn bundle_id_of(program: &Path) -> Option<String> {
     let macos = program.parent()?;
     let contents = macos.parent()?;
     let bundle = contents.parent()?;
@@ -1414,15 +1872,13 @@ fn bundle_id_of(program: &Path) -> Option<String> {
 }
 
 /// The largest `Info.plist` [`bundle_id_of`] reads.
-#[cfg(any(target_os = "macos", all(test, unix)))]
+#[cfg(unix)]
 const INFO_PLIST_MOST: u64 = 256 * 1024;
 
 /// Stop and remove `job`, for this login's own `home` ([`own_home`]).
 pub fn uninstall(home: &Path, job: Job) -> crate::Result<bool> {
     check_own_home(home)?;
-    let _decision = (job == Job::Subscriber)
-        .then(|| SubscriberDecision::take(home))
-        .transpose()?;
+    let _decision = JobDecision::take(home, job)?;
     uninstall_job(home, job)
 }
 
@@ -1430,17 +1886,26 @@ pub fn uninstall(home: &Path, job: Job) -> crate::Result<bool> {
 /// the job in one local decision, so an older automatic repair cannot undo it.
 pub fn turn_off(home: &Path, job: Job) -> crate::Result<bool> {
     check_own_home(home)?;
-    if job != Job::Subscriber {
-        return uninstall_job(home, job);
+    match job {
+        Job::Subscriber => turn_off_subscriber_with(home, || uninstall_job(home, job)),
+        Job::Server => turn_off_server_with(home, || uninstall_job(home, job)),
     }
-    turn_off_subscriber_with(home, || uninstall_job(home, job))
+}
+
+fn turn_off_server_with(
+    home: &Path,
+    remove: impl FnOnce() -> crate::Result<bool>,
+) -> crate::Result<bool> {
+    let _decision = JobDecision::take(home, Job::Server)?;
+    record_server_off_locked(home)?;
+    remove()
 }
 
 fn turn_off_subscriber_with(
     home: &Path,
     remove: impl FnOnce() -> crate::Result<bool>,
 ) -> crate::Result<bool> {
-    let _decision = SubscriberDecision::take(home)?;
+    let _decision = JobDecision::take(home, Job::Subscriber)?;
     record_subscriber_off_locked(home)?;
     remove()
 }
@@ -1547,6 +2012,53 @@ pub fn state(home: &Path, job: Job) -> crate::Result<State> {
         };
         Ok(State::Installed { pid, unit })
     }
+}
+
+/// [`DAEMON_LABEL`]'s state for `home`: absent for a scratch `home` that is not this login's own
+/// ([`own_home`], so isolated CLI tests ask launchd nothing).
+pub fn daemon_state_for_home(home: &Path) -> crate::Result<State> {
+    if check_own_home(home).is_err() {
+        return Ok(State::Absent);
+    }
+    daemon_state()
+}
+
+/// [`DAEMON_LABEL`]'s state in `system` on macOS; [`State::Absent`] elsewhere.
+pub fn daemon_state() -> crate::Result<State> {
+    #[cfg(target_os = "macos")]
+    {
+        let plist = Path::new(DAEMON_PLIST);
+        let on_disk = crate::fsx::kind(plist)? != crate::fsx::Kind::Missing;
+        daemon_state_with(plist, on_disk, &mut |call| {
+            run(Path::new(LAUNCHCTL), &system_launchctl_argv(call))
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(State::Absent)
+    }
+}
+
+/// [`daemon_state`]'s judgement over an injected `launchctl` call and plist check.
+pub fn daemon_state_with(
+    plist: &Path,
+    on_disk: bool,
+    launchctl: &mut dyn FnMut(SystemLaunchctl<'_>) -> crate::Result<std::process::Output>,
+) -> crate::Result<State> {
+    let out = launchctl(SystemLaunchctl::Print(DAEMON_LABEL))?;
+    if out.status.success() {
+        return Ok(State::Installed {
+            pid: print_pid(&String::from_utf8_lossy(&out.stdout)),
+            unit: plist.to_path_buf(),
+        });
+    }
+    if on_disk {
+        return Ok(State::Installed {
+            pid: None,
+            unit: plist.to_path_buf(),
+        });
+    }
+    Ok(State::Absent)
 }
 
 #[cfg(test)]
@@ -1780,10 +2292,15 @@ mod tests {
         };
         let repair = |exists: bool| {
             let mut installed = None;
-            let line = repair_server_with(home, &|path| exists && path == gone, |args| {
-                installed = Some(args.to_vec());
-                Ok("installed".to_string())
-            })
+            let line = repair_server_with(
+                home,
+                &|path| exists && path == gone,
+                &|| Ok(State::Absent),
+                |args| {
+                    installed = Some(args.to_vec());
+                    Ok("installed".to_string())
+                },
+            )
             .expect("read");
             (line, installed)
         };
@@ -1815,11 +2332,459 @@ mod tests {
         );
     }
 
+    /// A held job is one `agent on` or `server on` wrote on another lasting aterm and nobody
+    /// switched off; it is pinned only where the person's pin record names its program, which
+    /// `on --program` writes and `on` or `off` removes.
+    /// NEGATIVE CONTROL: a [`held_in`] that ignores the pin reads the pinned job as unpinned.
+    #[test]
+    fn a_held_job_is_one_on_another_aterm_and_its_pin_is_the_persons_record() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let home = root.path();
+        let held = Path::new("/Users//x/.local/share/aterm-secrets/aterm");
+        let installed = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
+        let serve: Vec<String> = ["secrets", "serve", "--advertise", "alab-secrets"]
+            .map(String::from)
+            .into();
+        let watch: Vec<String> = ["secrets", "watch"].map(String::from).into();
+        let unit_text = |job: Job, program: &Path, args: &[String]| {
+            if cfg!(target_os = "macos") {
+                plist_text(job.label(), program, args, Path::new("/tmp/log"))
+            } else {
+                systemd_unit(job.description(), program, args)
+            }
+        };
+        for (job, args) in [(Job::Server, &serve), (Job::Subscriber, &watch)] {
+            let text = unit_text(job, held, args);
+            let read = |text: &str, kept: Option<&Path>| {
+                held_in(
+                    job,
+                    text,
+                    kept.map(Path::to_path_buf),
+                    Some(installed),
+                    pinned_to(home, job),
+                )
+            };
+            let unpinned = Held {
+                job,
+                program: held.to_path_buf(),
+                args: args.clone(),
+                pin: None,
+            };
+            assert_eq!(read(&text, Some(held)), Some(unpinned.clone()), "{job:?}");
+            assert!(!unpinned.pinned());
+            record_pin(home, job, held).expect("pinned");
+            let pinned = read(&text, Some(held)).expect("held");
+            assert_eq!(
+                pinned,
+                Held {
+                    pin: Some(held.to_path_buf()),
+                    ..unpinned.clone()
+                },
+                "{job:?} pinned"
+            );
+            assert!(pinned.pinned(), "{job:?} pinned");
+            record_pin(home, job, installed).expect("pinned elsewhere");
+            let elsewhere = read(&text, Some(held)).expect("held");
+            assert!(
+                !elsewhere.pinned(),
+                "{job:?}: a pin of another program pins nothing"
+            );
+            assert_eq!(elsewhere.pin.as_deref(), Some(installed));
+            clear_pin(home, job).expect("unpinned");
+            clear_pin(home, job).expect("none to remove");
+            assert_eq!(read(&text, Some(held)), Some(unpinned));
+            assert_eq!(
+                read(&text, None),
+                None,
+                "{job:?}: a program gone or not lasting"
+            );
+            let on = unit_text(job, installed, args);
+            assert_eq!(read(&on, Some(installed)), None, "{job:?} on this aterm");
+            if cfg!(target_os = "macos") {
+                let off = text.replace(
+                    "<key>RunAtLoad</key>",
+                    "<key>Disabled</key>\n\t<true/>\n\t<key>RunAtLoad</key>",
+                );
+                assert_eq!(read(&off, Some(held)), None, "{job:?} switched off");
+            }
+        }
+        let odd = unit_text(Job::Subscriber, held, &serve);
+        assert_eq!(
+            held_in(
+                Job::Subscriber,
+                &odd,
+                Some(held.into()),
+                Some(installed),
+                None
+            ),
+            None,
+            "not a subscriber's arguments"
+        );
+    }
+
+    /// A move whose install on this aterm fails (a bootstrap refused after the bootout) installs
+    /// the job again on the program it held, so it runs as before; the move is still an error.
+    /// NEGATIVE CONTROL: a [`moved_or_put_back`] that only reports the failure leaves the job
+    /// down, never installed on the held program again.
+    #[test]
+    fn a_move_that_does_not_start_puts_the_job_back_on_the_program_it_held() {
+        let held = Held {
+            job: Job::Server,
+            program: PathBuf::from("/Users//x/.local/share/aterm-secrets/aterm"),
+            args: ["secrets", "serve"].map(String::from).into(),
+            pin: None,
+        };
+        let installed = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
+        let mut tried = Vec::new();
+        let mut install = |program: &Path| {
+            tried.push(program.to_path_buf());
+            if program == installed {
+                Err(Error::new("Bootstrap failed: 5: Input/output error"))
+            } else {
+                Ok("installed".to_string())
+            }
+        };
+        moved_or_put_back(&held, installed, &mut install).expect_err("the move failed");
+        assert_eq!(tried, [installed.to_path_buf(), held.program.clone()]);
+
+        let mut tried = 0;
+        let mut down = |_: &Path| {
+            tried += 1;
+            Err(Error::new("Bootstrap failed"))
+        };
+        moved_or_put_back(&held, installed, &mut down).expect_err("both failed");
+        assert_eq!(tried, 2, "one move, one put back");
+        let mut fine = |program: &Path| Ok(program.display().to_string());
+        assert_eq!(
+            moved_or_put_back(&held, installed, &mut fine),
+            Ok(installed.display().to_string())
+        );
+    }
+
+    /// A move reads the job again under its decision lock and moves it only while it is still
+    /// the job the mend judged, so what a person did meanwhile stands: a `server off` (its unit
+    /// gone), an `agent on --program` (its pin record, written before its install, then the
+    /// install) and an `agent off` (its off record). A job left as it was moves, the lock held
+    /// across the install, so an `on` or `off` that comes then waits for it.
+    /// NEGATIVE CONTROL: a [`move_held_with`] that installs without reading the job again starts
+    /// the server turned off and moves the subscriber its person pinned since.
+    #[test]
+    fn a_move_never_undoes_an_off_or_a_pin_that_landed_after_the_mend_read_the_job() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let home = root.path();
+        // Lasting programs outside any temporary directory, as a held snapshot and the
+        // installed aterm are.
+        let snapshot = Path::new("/bin/sh");
+        let installed = Path::new("/usr/bin/true");
+        let named = Path::new("/bin/cat");
+        let serve: Vec<String> = ["secrets", "serve"].map(String::from).into();
+        let watch: Vec<String> = ["secrets", "watch"].map(String::from).into();
+        let write_unit = |job: Job, program: &Path, args: &[String]| {
+            let path = unit_file(home, job);
+            std::fs::create_dir_all(path.parent().expect("a directory")).expect("unit directory");
+            let text = if cfg!(target_os = "macos") {
+                plist_text(job.label(), program, args, Path::new("/tmp/log"))
+            } else {
+                systemd_unit(job.description(), program, args)
+            };
+            std::fs::write(path, text).expect("unit written");
+        };
+        let tried = std::cell::RefCell::new(Vec::new());
+        let mut install = |program: &Path| -> crate::Result<String> {
+            tried.borrow_mut().push(program.to_path_buf());
+            Ok("installed".to_string())
+        };
+        let no_daemon = || Ok(State::Absent);
+
+        write_unit(Job::Server, snapshot, &serve);
+        let server = held_at(home, Job::Server, Some(installed)).expect("CONTROL: held");
+        std::fs::remove_file(unit_file(home, Job::Server)).expect("`server off` removes it");
+        assert_eq!(
+            move_held_with(home, &server, installed, &no_daemon, &mut install),
+            Ok(None),
+            "the server turned off stays off"
+        );
+
+        write_unit(Job::Subscriber, snapshot, &watch);
+        let subscriber = held_at(home, Job::Subscriber, Some(installed)).expect("CONTROL: held");
+        record_pin(home, Job::Subscriber, named).expect("`agent on --program` pins first");
+        assert_eq!(
+            move_held_with(home, &subscriber, installed, &no_daemon, &mut install),
+            Ok(None),
+            "the pin stands while its install waits"
+        );
+        write_unit(Job::Subscriber, named, &watch);
+        assert_eq!(
+            move_held_with(home, &subscriber, installed, &no_daemon, &mut install),
+            Ok(None),
+            "its install stands"
+        );
+        assert_eq!(pinned_to(home, Job::Subscriber).as_deref(), Some(named));
+
+        clear_pin(home, Job::Subscriber).expect("unpinned");
+        write_unit(Job::Subscriber, snapshot, &watch);
+        let subscriber = held_at(home, Job::Subscriber, Some(installed)).expect("CONTROL: held");
+        record_subscriber_off(home).expect("`agent off` records it");
+        assert_eq!(
+            move_held_with(home, &subscriber, installed, &no_daemon, &mut install),
+            Ok(None),
+            "the subscriber turned off stays off"
+        );
+        clear_subscriber_off(home).expect("on again");
+        assert!(
+            tried.borrow().is_empty(),
+            "nothing moved: {:?}",
+            tried.borrow()
+        );
+
+        write_unit(Job::Server, snapshot, &serve);
+        for job in [Job::Server, Job::Subscriber] {
+            let held = held_at(home, job, Some(installed)).expect("CONTROL: held");
+            let mut moving = |program: &Path| {
+                assert_job_decision_held(home, job);
+                install(program)
+            };
+            assert_eq!(
+                move_held_with(home, &held, installed, &no_daemon, &mut moving),
+                Ok(Some("installed".to_string())),
+                "{job:?} left as it was moves"
+            );
+        }
+        assert_eq!(
+            *tried.borrow(),
+            [installed.to_path_buf(), installed.to_path_buf()]
+        );
+    }
+
+    /// While the system LaunchDaemon `aterm machines apply` installs is there, installed or
+    /// running, the mend never starts a user server beside it on its port: a held server job is
+    /// not moved and a server job whose program is gone is not repaired. The subscriber is no
+    /// server and moves as before; a daemon state that cannot be read moves nothing either.
+    /// NEGATIVE CONTROL: a [`move_held_with`] or [`repair_server_with`] that does not read the
+    /// daemon's state installs the user server beside the running daemon.
+    #[test]
+    fn no_user_server_is_moved_or_repaired_beside_the_system_launch_daemon() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let home = root.path();
+        // Lasting programs outside any temporary directory, as a held snapshot and the
+        // installed aterm are.
+        let snapshot = Path::new("/bin/sh");
+        let installed = Path::new("/usr/bin/true");
+        let gone = Path::new("/Volumes/aterm/aterm.app/Contents/MacOS/aterm");
+        let serve: Vec<String> = ["secrets", "serve"].map(String::from).into();
+        let watch: Vec<String> = ["secrets", "watch"].map(String::from).into();
+        let write_unit = |job: Job, program: &Path, args: &[String]| {
+            let path = unit_file(home, job);
+            std::fs::create_dir_all(path.parent().expect("a directory")).expect("unit directory");
+            let text = if cfg!(target_os = "macos") {
+                plist_text(job.label(), program, args, Path::new("/tmp/log"))
+            } else {
+                systemd_unit(job.description(), program, args)
+            };
+            std::fs::write(path, text).expect("unit written");
+        };
+        let daemon_plist = PathBuf::from(DAEMON_PLIST);
+        let running = State::Installed {
+            pid: Some(4242),
+            unit: daemon_plist.clone(),
+        };
+        let stopped = State::Installed {
+            pid: None,
+            unit: daemon_plist,
+        };
+        let tried = std::cell::RefCell::new(Vec::new());
+        let mut install = |program: &Path| -> crate::Result<String> {
+            tried.borrow_mut().push(program.to_path_buf());
+            Ok("installed".to_string())
+        };
+
+        write_unit(Job::Server, snapshot, &serve);
+        let server = held_at(home, Job::Server, Some(installed)).expect("CONTROL: held");
+        for daemon in [&running, &stopped] {
+            assert_eq!(
+                move_held_with(
+                    home,
+                    &server,
+                    installed,
+                    &|| Ok(daemon.clone()),
+                    &mut install
+                ),
+                Ok(None),
+                "the held server stays beside {daemon:?}"
+            );
+        }
+        move_held_with(
+            home,
+            &server,
+            installed,
+            &|| Err(Error::new("launchctl could not run")),
+            &mut install,
+        )
+        .expect_err("the daemon's state unread");
+        assert!(
+            tried.borrow().is_empty(),
+            "nothing moved: {:?}",
+            tried.borrow()
+        );
+        write_unit(Job::Subscriber, snapshot, &watch);
+        let subscriber = held_at(home, Job::Subscriber, Some(installed)).expect("CONTROL: held");
+        assert_eq!(
+            move_held_with(
+                home,
+                &subscriber,
+                installed,
+                &|| Ok(running.clone()),
+                &mut install
+            ),
+            Ok(Some("installed".to_string())),
+            "the subscriber is no server"
+        );
+        assert_eq!(
+            move_held_with(
+                home,
+                &server,
+                installed,
+                &|| Ok(State::Absent),
+                &mut install
+            ),
+            Ok(Some("installed".to_string())),
+            "CONTROL: with no daemon the held server moves"
+        );
+        assert_eq!(
+            *tried.borrow(),
+            [installed.to_path_buf(), installed.to_path_buf()]
+        );
+
+        write_unit(Job::Server, gone, &serve);
+        let repair = |daemon: &State| {
+            repair_server_with(home, &|path| path != gone, &|| Ok(daemon.clone()), |args| {
+                Ok(format!("installed {}", args.join(" ")))
+            })
+        };
+        assert_eq!(
+            repair(&running),
+            Ok(None),
+            "not repaired beside it, running"
+        );
+        assert_eq!(repair(&stopped), Ok(None), "nor installed, not running");
+        assert_eq!(
+            repair(&State::Absent),
+            Ok(Some("installed secrets serve".to_string())),
+            "CONTROL: with no daemon the server whose program is gone is repaired"
+        );
+    }
+
+    /// The mend takes the server's decision lock only once a repair is due (a `secrets serve`
+    /// job whose program is gone) and holds it across the install, so a Mac with no server job,
+    /// or one whose program is there, gets no `~/.config/aterm/secrets` nor `server.lock` from
+    /// the mend that runs at every launch and every half hour.
+    /// NEGATIVE CONTROL: a [`repair_server_with`] that takes the lock before it reads the unit
+    /// file leaves `server.lock` in a home with no server job.
+    #[test]
+    fn a_mend_leaves_no_server_lock_on_a_mac_with_no_server_job() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let home = root.path();
+        let gone = Path::new("/Volumes/aterm/aterm.app/Contents/MacOS/aterm");
+        let serve: Vec<String> = ["secrets", "serve"].map(String::from).into();
+        let lock = decision_lock_path(home, Job::Server);
+        let untouched = || {
+            repair_server_with(
+                home,
+                &|path| path != gone,
+                &|| panic!("the daemon read with no repair due"),
+                |_| panic!("installed with no repair due"),
+            )
+        };
+        assert_eq!(untouched(), Ok(None), "no server job");
+        assert!(
+            !lock.exists() && !secrets_dir(home).exists(),
+            "{} made with no server job",
+            lock.display()
+        );
+        let unit = unit_file(home, Job::Server);
+        std::fs::create_dir_all(unit.parent().expect("a directory")).expect("unit directory");
+        let text = |program: &Path| {
+            if cfg!(target_os = "macos") {
+                plist_text(Job::Server.label(), program, &serve, Path::new("/tmp/log"))
+            } else {
+                systemd_unit(Job::Server.description(), program, &serve)
+            }
+        };
+        std::fs::write(&unit, text(Path::new("/bin/sh"))).expect("unit written");
+        assert_eq!(untouched(), Ok(None), "its program there");
+        assert!(!lock.exists(), "{} made with no repair due", lock.display());
+
+        std::fs::write(&unit, text(gone)).expect("unit written");
+        assert_eq!(
+            repair_server_with(home, &|path| path != gone, &|| Ok(State::Absent), |_| {
+                assert_job_decision_held(home, Job::Server);
+                Ok("installed".to_string())
+            },),
+            Ok(Some("installed".to_string())),
+            "CONTROL: a repair due runs under the lock"
+        );
+    }
+
+    /// `on --program` records the person's pin before its install, so a mend that reads the job
+    /// while the install waits finds the pin; an install that fails puts the record back as it
+    /// was; `on` with no `--program` drops the record only once its install ran.
+    /// NEGATIVE CONTROL: an [`install_pinned`] that records the pin after the install leaves the
+    /// job unpinned while it installs.
+    #[test]
+    fn on_program_records_its_pin_before_the_install_and_a_failed_install_puts_it_back() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let home = root.path();
+        let first = Path::new("/Users//x/.local/share/aterm-secrets/aterm");
+        let second = Path::new("/Users//x/held/aterm");
+        let job = Job::Server;
+        record_pin(home, job, first).expect("pinned");
+        let (line, unrecorded) = install_pinned(home, job, Some(second), || {
+            assert_eq!(
+                pinned_to(home, job).as_deref(),
+                Some(second),
+                "the pin is there before the install"
+            );
+            Ok("installed".to_string())
+        })
+        .expect("installed");
+        assert_eq!((line.as_str(), unrecorded), ("installed", None));
+        install_pinned(home, job, Some(first), || {
+            Err(Error::new("Bootstrap failed: 5: Input/output error"))
+        })
+        .expect_err("the install failed");
+        assert_eq!(
+            pinned_to(home, job).as_deref(),
+            Some(second),
+            "put back as it was"
+        );
+        clear_pin(home, job).expect("unpinned");
+        install_pinned(home, job, Some(first), || {
+            Err(Error::new("Bootstrap failed"))
+        })
+        .expect_err("the install failed");
+        assert_eq!(pinned_to(home, job), None, "none, as before");
+        record_pin(home, job, first).expect("pinned");
+        install_pinned(home, job, None, || {
+            assert_eq!(
+                pinned_to(home, job).as_deref(),
+                Some(first),
+                "dropped only once the install ran"
+            );
+            Ok("installed".to_string())
+        })
+        .expect("installed");
+        assert_eq!(pinned_to(home, job), None, "`on` unpins");
+    }
+
     fn assert_subscriber_decision_held(home: &Path) {
+        assert_job_decision_held(home, Job::Subscriber);
+    }
+
+    fn assert_job_decision_held(home: &Path, job: Job) {
         let independent = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(secrets_dir(home).join("subscriber.lock"))
+            .open(decision_lock_path(home, job))
             .unwrap();
         #[expect(
             clippy::disallowed_methods,
@@ -1999,7 +2964,7 @@ mod tests {
         use std::cell::Cell;
         let scratch = aterm_tempfile::tempdir().unwrap();
         let home = scratch.path();
-        let decision = SubscriberDecision::take(home).unwrap();
+        let decision = JobDecision::take(home, Job::Subscriber).unwrap();
         std::fs::create_dir(subscriber_off_path(home)).unwrap();
         drop(decision);
         let removed = Cell::new(false);
@@ -2063,13 +3028,16 @@ mod tests {
             "\t<key>SoftResourceLimits</key>\n\t<dict>\n\t\t<key>NumberOfFiles</key>\n\t\t<integer>4096</integer>\n\t</dict>\n"
         ));
         assert!(text.contains(
-            "\t<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>HOME</key>\n\t\t<string>/Users//a&amp;b</string>\n\t</dict>\n"
+            "\t<key>EnvironmentVariables</key>\n\t<dict>\n\
+             \t\t<key>HOME</key>\n\t\t<string>/Users//a&amp;b</string>\n\
+             \t\t<key>PATH</key>\n\t\t<string>/Users//a&amp;b/Library/Application Support/aterm/pkg/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>\n\
+             \t</dict>\n"
         ));
         let log_line =
             "<string>/Users//a&amp;b/.config/aterm/secrets/systems.alab.aterm-secrets.log</string>";
         assert!(text.contains(&format!("\t<key>StandardOutPath</key>\n\t{log_line}\n")));
         assert!(text.contains(&format!("\t<key>StandardErrorPath</key>\n\t{log_line}\n")));
-        assert_eq!(text.matches("<key>").count(), 12, "{text}");
+        assert_eq!(text.matches("<key>").count(), 13, "{text}");
     }
 
     /// A job in the user domain names the session launchd loads it in, and one attributed to an
@@ -2856,5 +3824,105 @@ mod tests {
             Ok(false)
         );
         assert_eq!(clock.get(), t0 + RESTART_WINDOW);
+    }
+
+    #[test]
+    fn vault_daemon_plist_and_argv_target_system_domain_without_login_session() {
+        let store = Path::new(DAEMON_STORE);
+        let labelled = daemon_serve_args(store, Some("m19"));
+        assert_eq!(
+            labelled,
+            vec![
+                "secrets".to_string(),
+                "serve".to_string(),
+                "--store".to_string(),
+                DAEMON_STORE.to_string(),
+                "--pin".to_string(),
+                format!("{}={}", crate::ALAB_VAULT, crate::ALAB_SIGNER),
+                "--advertise".to_string(),
+                "m19".to_string(),
+            ]
+        );
+        // Negative control: an unlabelled daemon passes `--no-advertise` so it never contends for
+        // `alab-secrets.local`.
+        let unlabelled = daemon_serve_args(store, None);
+        assert_eq!(
+            unlabelled.last().map(String::as_str),
+            Some("--no-advertise")
+        );
+
+        let program = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
+        let text = daemon_plist_text(
+            program,
+            &labelled,
+            Path::new(DAEMON_LOG),
+            Some("com.aterm.aterm"),
+        );
+        assert!(text.contains(&format!("<string>{DAEMON_LABEL}</string>")));
+        assert!(!text.contains("LimitLoadToSessionType"));
+        assert!(!text.contains("<key>HOME</key>"));
+        assert_eq!(
+            plist_argv(&text).as_deref(),
+            Some(
+                std::iter::once(program.to_string_lossy().into_owned())
+                    .chain(labelled)
+                    .collect::<Vec<_>>()
+                    .as_slice()
+            )
+        );
+
+        let plist = Path::new(DAEMON_PLIST);
+        assert_eq!(
+            system_launchctl_argv(SystemLaunchctl::Print(DAEMON_LABEL)),
+            vec!["print", "system/systems.alab.aterm-vault-server"]
+        );
+        assert_eq!(
+            system_launchctl_argv(SystemLaunchctl::Bootstrap(plist)),
+            vec!["bootstrap", "system", DAEMON_PLIST]
+        );
+        assert_eq!(
+            system_launchctl_argv(SystemLaunchctl::Bootout(DAEMON_LABEL)),
+            vec!["bootout", "system/systems.alab.aterm-vault-server"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_state_reads_system_domain_and_ignores_scratch_homes() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let plist = Path::new(DAEMON_PLIST);
+        let out = |raw: i32, stdout: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(raw << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(
+            daemon_state_with(plist, true, &mut |_| {
+                Ok(out(
+                    0,
+                    "system/systems.alab.aterm-vault-server = {\n\tpid = 4242\n}\n",
+                ))
+            })
+            .unwrap(),
+            State::Installed {
+                pid: Some(4242),
+                unit: plist.to_path_buf(),
+            }
+        );
+        assert_eq!(
+            daemon_state_with(plist, true, &mut |_| Ok(out(113, ""))).unwrap(),
+            State::Installed {
+                pid: None,
+                unit: plist.to_path_buf(),
+            }
+        );
+        assert_eq!(
+            daemon_state_with(plist, false, &mut |_| Ok(out(113, ""))).unwrap(),
+            State::Absent
+        );
+        assert_eq!(
+            daemon_state_for_home(Path::new("/nonexistent/scratch-home-for-test")).unwrap(),
+            State::Absent
+        );
     }
 }

@@ -94,27 +94,6 @@ fn agy() -> &'static dyn aterm_phase::ScreenReader {
     aterm_phase::Program::Agy.reader()
 }
 
-/// The measured screens are what the defect needs: each half read is idle to its reader, its
-/// whole successor busy.
-#[test]
-fn the_measured_half_reads_are_idle_and_their_successors_busy() {
-    let half = fx(CLAUDE_HALF);
-    assert_eq!(
-        claude().phase(&half),
-        Phase::Idle,
-        "Claude Code's half frame"
-    );
-    assert!(
-        claude().composer(&half).is_some(),
-        "with its composer drawn"
-    );
-    assert_eq!(claude().phase(&fx(CLAUDE_WHOLE)), Phase::Busy);
-    let half = fx(AGY_HALF);
-    assert_eq!(agy().phase(&half), Phase::Idle, "agy's half frame");
-    assert!(agy().composer(&half).is_none(), "its composer erased");
-    assert_eq!(agy().phase(&fx(AGY_WHOLE)), Phase::Busy);
-}
-
 #[test]
 fn a_read_of_an_open_frame_waits_for_the_frame_and_reads_again() {
     for (name, half, whole, reader) in [

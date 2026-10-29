@@ -99,48 +99,6 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
-    fn scalar_one(lead: u8, rem: &[u8]) -> Option<(char, usize)> {
-        if lead >= 0xF0 {
-            if let &[c0, c1, c2, ..] = rem
-                && (c0 & 0xC0) == 0x80
-                && (c1 & 0xC0) == 0x80
-                && (c2 & 0xC0) == 0x80
-            {
-                let cp = (u32::from(lead & 0x07) << 18)
-                    | (u32::from(c0 & 0x3F) << 12)
-                    | (u32::from(c1 & 0x3F) << 6)
-                    | u32::from(c2 & 0x3F);
-                if (0x10000..=0x0010_FFFF).contains(&cp) {
-                    return char::from_u32(cp).map(|c| (c, 3));
-                }
-            }
-            None
-        } else if lead >= 0xE0 {
-            if let &[c0, c1, ..] = rem
-                && (c0 & 0xC0) == 0x80
-                && (c1 & 0xC0) == 0x80
-            {
-                let cp = (u32::from(lead & 0x0F) << 12)
-                    | (u32::from(c0 & 0x3F) << 6)
-                    | u32::from(c1 & 0x3F);
-                if cp >= 0x800 && !(0xD800..=0xDFFF).contains(&cp) {
-                    return char::from_u32(cp).map(|c| (c, 2));
-                }
-            }
-            None
-        } else {
-            if let &[c0, ..] = rem
-                && (c0 & 0xC0) == 0x80
-            {
-                let cp = (u32::from(lead & 0x1F) << 6) | u32::from(c0 & 0x3F);
-                if cp >= 0x80 {
-                    return char::from_u32(cp).map(|c| (c, 1));
-                }
-            }
-            None
-        }
-    }
-
     fn ref_run(bytes: &[u8]) -> (Vec<char>, usize) {
         let mut out = Vec::new();
         let mut i = 0usize;
@@ -167,7 +125,7 @@ mod tests {
             if class(lead) != run_class {
                 break;
             }
-            match scalar_one(lead, bytes.get(i + 1..).unwrap_or(&[])) {
+            match crate::Parser::decode_multibyte_char(lead, bytes.get(i + 1..).unwrap_or(&[])) {
                 Some((c, consumed)) => {
                     out.push(c);
                     i += 1 + consumed;
@@ -223,10 +181,7 @@ mod tests {
                         let input = [lead, second, third, fourth];
                         let mut out: ArrayVec<char, RUN_CAP> = ArrayVec::new();
                         let consumed = bulk_decode_run(&input, &mut out);
-                        let oracle = (0xC0..=0xF7)
-                            .contains(&lead)
-                            .then(|| crate::Parser::decode_multibyte_char(lead, &input[1..]))
-                            .flatten();
+                        let oracle = crate::Parser::decode_multibyte_char(lead, &input[1..]);
                         match oracle {
                             Some((c, continuations)) => {
                                 assert!(consumed > continuations, "{input:02x?}");

@@ -119,6 +119,12 @@ impl BoxWord {
         BoxWord(lookup(BOX_WORDS, word).unwrap_or(UNKNOWN))
     }
 
+    /// Every box, in [`BOX_WORDS`] order: each one a step's `box=` can name. A word outside
+    /// them decodes as `unknown` ([`BoxWord::from_wire`]), whose need is `other`'s.
+    pub fn all() -> impl Iterator<Item = BoxWord> {
+        BOX_WORDS.iter().map(|w| BoxWord(w))
+    }
+
     /// The `box=` word.
     #[inline]
     #[must_use]
@@ -143,16 +149,19 @@ impl BoxWord {
         self.0 == "question"
     }
 
-    /// The need this box raises: `approval:<kind>`, the question dialog's `question`.
+    /// The need this box raises: `approval:<kind>` where [`NEED_WORDS`] names it, else
+    /// `approval:other`; the question dialog's `question`.
     #[must_use]
     pub fn need(self) -> &'static str {
         if self.is_question() {
             return "question";
         }
-        let mut want = String::with_capacity(32);
-        want.push_str("approval:");
-        want.push_str(self.kind());
-        lookup(NEED_WORDS, &want).unwrap_or("approval:other")
+        let kind = self.kind();
+        NEED_WORDS
+            .iter()
+            .copied()
+            .find(|w| w.strip_prefix("approval:") == Some(kind))
+            .unwrap_or("approval:other")
     }
 }
 

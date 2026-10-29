@@ -6,10 +6,15 @@
 
 use std::fmt::Write as _;
 
+use super::handler::handler_decrsps::{CursorRestore, write_cursor_restore};
 use super::{SavedCursorState, Terminal};
 use crate::grid::{Cursor, Grid};
 use aterm_grid::ScrollRegion;
 use aterm_types::CharacterSetState;
+
+#[cfg(test)]
+#[path = "serialize_ansi_wrap_tests.rs"]
+mod wrap_tests;
 
 impl Terminal {
     /// Serialize the terminal to a replayable ANSI string.
@@ -63,7 +68,11 @@ impl Terminal {
     }
 
     /// Bytes that bring a terminal this size, from any state, to this one's screens and to the state that decides where and how later output lands.
-    /// They reset (RIS), then restore the title, the palette, tab stops, the main screen and its saved cursor, the alternate screen and its saved cursor when it is up, margins, origin mode, the cursor (with its deferred wrap outside origin mode and left and right margins), the character sets, the insert, newline, wrap, reverse-video, cursor-visible and reverse-wrap modes, and the pen; an alternate screen kept for a later `?47h` is not.
+    /// They reset (RIS), then restore the title, the palette, tab stops, the main screen and its saved cursor, the alternate screen and its saved cursor when it is up, margins, origin mode, the cursor with its deferred wrap, the character sets, the insert, newline, wrap, reverse-video, cursor-visible and reverse-wrap modes, and the pen; an alternate screen kept for a later `?47h` is not.
+    ///
+    /// Standard DECRSPS restores cursor flags without drawing or replacing a save. The ordinary
+    /// CUP/full-width-row prelude keeps common exports useful to readers that ignore that
+    /// control; those readers approximate origin/margin and edited-edge wraps and protection.
     #[must_use]
     pub fn serialize_restore_ansi(&self) -> String {
         let rows = self.grid.rows();
@@ -176,6 +185,15 @@ impl Terminal {
         {
             let _ = write!(out, "\x1b[{};{}H", cursor.row + 1, cursor.col + 1);
         }
+        write_cursor_restore(
+            out,
+            CursorRestore {
+                cursor,
+                origin_mode: self.modes.origin_mode,
+                pending_wrap: self.grid.pending_wrap(),
+                protected: self.style.protected,
+            },
+        );
         out.push_str(&self.charset.restore_ansi());
         for (on, set) in [
             (self.modes.insert_mode, "\x1b[4h"),
@@ -266,6 +284,15 @@ fn saved_slot(out: &mut String, saved: &SavedCursorState, grid: &Grid, region: S
     } else if !saved.pending_wrap || !reprint_wrapped(out, grid, c) {
         let _ = write!(out, "\x1b[{};{}H", c.row + 1, c.col + 1);
     }
+    write_cursor_restore(
+        out,
+        CursorRestore {
+            cursor: c,
+            origin_mode: saved.origin_mode,
+            pending_wrap: saved.pending_wrap,
+            protected: saved.style.protected,
+        },
+    );
     out.push_str(&saved.charset.restore_ansi());
     let _ = write!(
         out,
@@ -277,6 +304,9 @@ fn saved_slot(out: &mut String, saved: &SavedCursorState, grid: &Grid, region: S
 /// Undo [`saved_slot`]: the default pen and character sets, origin mode off and the whole screen the scroll region.
 fn reset_slot(out: &mut String, saved: &SavedCursorState) {
     out.push_str("\x1b[0m");
+    if saved.style.protected {
+        out.push_str("\x1b[0\"q");
+    }
     if saved.charset != CharacterSetState::new() {
         out.push_str("\x1b(B\x1b)B\x1b*B\x1b+B\x0f\x1b}");
     }
@@ -416,8 +446,7 @@ mod tests {
     }
 
     /// A resize keeps the cursor's next write (aterm-grid `resize-keeps-the-next-write`), and the
-    /// state it leaves is one a restore paint carries: a deferred wrap only ever waits on the last
-    /// column of a row the glyph just printed fills.
+    /// states in this matrix leave a deferred wrap only on a full-width row's last column.
     #[test]
     fn a_restore_paint_carries_where_a_resize_left_the_next_write() {
         let mut wrong = Vec::new();

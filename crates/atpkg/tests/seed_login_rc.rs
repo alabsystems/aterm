@@ -71,6 +71,9 @@ impl Fixture {
             .expect("run dev atpkg seed")
     }
 
+    /// The runner's `ZDOTDIR` is not inherited: shell-setup puts zsh's block in
+    /// `$ZDOTDIR/.zshrc`, so one set where the tests run sent this scratch home's block into
+    /// that folder's real `.zshrc`.
     fn shell_setup(&self, login: &str, shell: &str) -> Output {
         Command::new(env!("CARGO_BIN_EXE_atpkg"))
             .args(["shell-setup", "--path", "--toolset-coming", "--bin-dir"])
@@ -78,6 +81,7 @@ impl Fixture {
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("XDG_DATA_HOME", self.home.join(".local/share"))
+            .env_remove("ZDOTDIR")
             .env(atpkg::hooks::LOGIN_SHELL_SEAM, login)
             .env("SHELL", shell)
             .env_remove("ATERM_CHILD")

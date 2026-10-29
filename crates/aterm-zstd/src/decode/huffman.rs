@@ -83,6 +83,11 @@ impl HuffmanTable {
             let mut dec2 = FseDecoder::new(&self.fse_table);
             dec1.init_state(&mut br)?;
             dec2.init_state(&mut br)?;
+            if br.bits_remaining() < 0 {
+                return Err(DecodeError::Corrupt(
+                    "Huffman weight stream shorter than its initial states",
+                ));
+            }
 
             loop {
                 self.weights.push(dec1.symbol());
@@ -312,5 +317,8 @@ mod tests {
         assert!(t.build_decoder(&[]).is_err());
         assert!(t.build_decoder(&[129, 0x00]).is_err());
         assert!(t.build_decoder(&[128, 0xC0]).is_err());
+        // FSE weight table (probs = [-1, 31], accuracy_log = 5) followed by a 0-bit stream (0x01)
+        // lacks the 10 bits needed to initialize both FSE states and must be refused.
+        assert!(t.build_decoder(&[3, 0x00, 0x7E, 0x01]).is_err());
     }
 }

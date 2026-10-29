@@ -757,8 +757,13 @@ mod tests {
         };
         assert!(!acted(Closed::NotNow, false));
         assert!(!acted(Closed::Lapsed, false));
+        assert!(
+            !acted(Closed::GaveWay, false),
+            "a press elsewhere is no act on the page"
+        );
         assert!(acted(Closed::NotNow, true));
         assert!(acted(Closed::Lapsed, true));
+        assert!(acted(Closed::GaveWay, true));
         for why in [
             Closed::SwitchedOn,
             Closed::Done,

@@ -980,7 +980,7 @@ fn install_bootstrap(
         ));
     }
     let bootstrap = crate::commons::bootstrap::Bootstrap::from_creation_snapshot(paths, snapshot)?;
-    let journal = crate::commons::journal::Journal::open_existing(
+    let journal = crate::commons::journal::Journal::read_existing(
         bootstrap.journal_dir(),
         bootstrap.trust(),
     )?;

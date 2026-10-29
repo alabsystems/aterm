@@ -58,8 +58,16 @@ pub fn plain(p: &Path) -> Cow<'_, Path> {
     if rest.contains('/') {
         return Cow::Borrowed(p);
     }
-    if let Some(share) = rest.strip_prefix(r"UNC\") {
-        return Cow::Owned(PathBuf::from(format!(r"\\{share}")));
+    if let Some(share) = rest
+        .get(..4)
+        .filter(|u| u.eq_ignore_ascii_case(r"UNC\"))
+        .and_then(|_| rest.get(4..))
+    {
+        return if !share.starts_with('\\') && unc_root(share).is_some() {
+            Cow::Owned(PathBuf::from(format!(r"\\{share}")))
+        } else {
+            Cow::Borrowed(p)
+        };
     }
     match rest.as_bytes() {
         [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic() => Cow::Owned(PathBuf::from(rest)),
@@ -109,7 +117,11 @@ pub fn short_spelled(p: &Path) -> Option<ShortSpelled<'_>> {
 
 fn verbatim_root(root: &str, verbatim: bool) -> String {
     if verbatim {
-        return format!(r"\\?\{}", &root[4..]);
+        let v = &root[4..];
+        if v.get(..4).is_some_and(|u| u.eq_ignore_ascii_case(r"UNC\")) {
+            return format!(r"\\?\UNC\{}", &v[4..]);
+        }
+        return format!(r"\\?\{v}");
     }
     match root.as_bytes() {
         [a, b, ..] if (*a == b'\\' || *a == b'/') && (*b == b'\\' || *b == b'/') => {

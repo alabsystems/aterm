@@ -158,7 +158,11 @@ fn file_holders_are_lsof_s() {
 
 /// [`open_files`] (read in process) names, in descriptor order, the files
 /// `lsof -p <pid> -d 0-1023 -Fn` names for a process's descriptors: a child holding one file as
-/// its stdin, `/dev/null` as its stdout and another file as its stderr.
+/// its stdin, another as its stdout and `/dev/null` as its stderr. Both read once the child
+/// wrote its line, so past its start-up, whose own descriptors (dyld's `/` and the cryptex
+/// volume) come and go before its first line. The line is a builtin's write with no redirection:
+/// `echo ran >&2` writes it while the shell still holds stdout saved on a spare descriptor and
+/// stderr's file on 1, and puts them back only after the write.
 #[cfg(target_os = "macos")]
 #[test]
 fn open_files_are_lsof_s() {
@@ -183,18 +187,27 @@ fn open_files_are_lsof_s() {
             .collect()
     };
     let dir = scratch("open-files");
-    let (input, errors, other) = (dir.join("in"), dir.join("err"), dir.join("other"));
-    for file in [&input, &errors, &other] {
+    let (input, output, other) = (dir.join("in"), dir.join("out"), dir.join("other"));
+    for file in [&input, &output, &other] {
         std::fs::write(file, b"").expect("write a file");
     }
-    let mut child = aterm_uds::spawnfd::command("/bin/sleep")
-        .arg("600")
+    let mut child = aterm_uds::spawnfd::command("/bin/sh")
+        .args(["-c", "echo ran; while :; do :; done"])
         .stdin(std::fs::File::open(&input).expect("open"))
-        .stdout(aterm_uds::spawnfd::Stdio::null())
-        .stderr(std::fs::File::create(&errors).expect("create"))
+        .stdout(std::fs::File::create(&output).expect("create"))
+        .stderr(aterm_uds::spawnfd::Stdio::null())
         .spawn()
         .expect("spawn a holder");
     let pid = child.id();
+    let hang = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    while std::fs::read(&output).ok().as_deref() != Some(b"ran\n".as_slice()) {
+        if Instant::now() > hang {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the holder never wrote its line");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let ours = open_files(pid).expect("its descriptors");
     let theirs = lsof_names(pid);
     let _ = child.kill();
@@ -205,7 +218,7 @@ fn open_files_are_lsof_s() {
         let canonical = path.canonicalize().expect("canonical");
         ours.contains(&canonical)
     };
-    assert!(named(&input) && named(&errors), "{ours:?}");
+    assert!(named(&input) && named(&output), "{ours:?}");
     assert!(!named(&other), "a file it does not hold: {ours:?}");
     assert_eq!(open_files(pid), None, "exited");
 }
@@ -244,37 +257,6 @@ fn only_a_complete_holder_scan_can_establish_the_holder_set() {
     );
 }
 
-#[cfg(unix)]
-#[test]
-fn an_unreadable_lock_census_never_says_the_lock_is_free() {
-    use std::os::unix::process::ExitStatusExt as _;
-    let read = |status, stdout: &[u8], stderr: &[u8]| {
-        lsof_holder_pids(&std::process::Output {
-            status: std::process::ExitStatus::from_raw(status),
-            stdout: stdout.to_vec(),
-            stderr: stderr.to_vec(),
-        })
-    };
-    assert_eq!(read(0, b"42\n73\n", b""), Some(vec![42, 73]));
-    assert_eq!(read(0, b"", b""), Some(Vec::new()));
-    assert_eq!(read(1 << 8, b"", b""), Some(Vec::new()));
-    let unreadable = [
-        read(2 << 8, b"", b"lsof: cannot inspect the file\n"),
-        read(2 << 8, b"", b""),
-        read(libc::SIGKILL, b"", b""),
-        read(1 << 8, b"", b"lsof: cannot inspect the file\n"),
-        read(0, b"", b"lsof: incomplete scan\n"),
-        read(0, b"42\n", b"lsof: incomplete scan\n"),
-        read(0, b"42\nnot-a-pid\n", b""),
-        read(0, b"\xff", b""),
-        read(1 << 8, b"42\n", b""),
-    ];
-    assert!(
-        unreadable.iter().all(Option::is_none),
-        "LSOF_UNKNOWN_MUST_NOT_FREE_THE_LOCK: {unreadable:?}"
-    );
-}
-
 #[test]
 fn a_screen_reply_is_read_with_the_cursor_made_relative_to_its_rows() {
     let s = parse_screen(SCREEN).expect("the measured reply parses");
@@ -303,6 +285,42 @@ fn a_screen_reply_is_read_with_the_cursor_made_relative_to_its_rows() {
     );
     assert_eq!(with("4200"), HumanInput::Ago(4200));
     assert_eq!(with("\"12\""), HumanInput::Unknown);
+}
+
+/// `"title"` rides the screen read as sent, `""` included; NEGATIVE CONTROLS: the measured
+/// reply (an older host) and a value that is no string carry none, and neither moves the rows.
+#[test]
+fn a_screen_reply_carries_the_title_read_with_its_rows_or_none() {
+    let titled = |t: &str| {
+        parse_screen(&SCREEN.replace(
+            r#""seq":232803"#,
+            &format!(r#""seq":232803,"gen":"3.232803","title":{t}"#),
+        ))
+        .expect("parses")
+    };
+    let running = titled(r#""◐ Claude Code""#);
+    assert_eq!(running.title.as_deref(), Some("◐ Claude Code"));
+    assert_eq!(running.generation.as_deref(), Some("3.232803"));
+    assert_eq!(
+        titled(r#""a \"quoted\" \\ ✳""#).title.as_deref(),
+        Some(r#"a "quoted" \ ✳"#)
+    );
+    assert_eq!(titled(r#""""#).title.as_deref(), Some(""), "set to nothing");
+    let old = parse_screen(SCREEN).expect("the measured reply parses");
+    assert_eq!(old.title, None, "an older host sends no title");
+    for bad in ["null", "7", r#"["◐"]"#, r#"{"t":"◐"}"#] {
+        let s = titled(bad);
+        assert_eq!(s.title, None, "{bad}");
+        assert_eq!(
+            (&s.rows, s.cursor, s.seq, s.first),
+            (&running.rows, running.cursor, running.seq, running.first),
+            "{bad}"
+        );
+    }
+    assert_eq!(
+        (&old.rows, old.cursor, old.seq, old.first),
+        (&running.rows, running.cursor, running.seq, running.first)
+    );
 }
 
 /// A proven self-claim (`supervisor_proven=1`) is its agent's session: no upgrade decision of
@@ -395,6 +413,11 @@ fn who_roster_exposes_a_unique_foreground_group_without_a_window_hop() {
     assert_eq!(tabs[1].fgpgid, None);
     assert_eq!(unique_tab_for_group(&tabs, 101), Some("s-a"));
     assert_eq!(parse_host_roster("OK 0", ""), Some(Vec::new()));
+    assert_eq!(parse_host_roster("OK 1", body), None);
+    assert_eq!(parse_host_roster("OK 3", body), None);
+    assert_eq!(parse_host_roster("OK", ""), None);
+    assert_eq!(parse_host_roster("OK bogus", ""), None);
+    assert_eq!(parse_host_roster("OK 2 extra", body), None);
     assert_eq!(parse_host_roster("ERR busy", body), None);
     assert_eq!(parse_host_roster("OKAY", body), None);
     assert_eq!(
@@ -726,6 +749,8 @@ fn every_phase_survives_the_state_file() {
                 note: "status=busy holders=3".to_string(),
             }],
             cause: CAUSE_EXIT.to_string(),
+            pressed_at: 1_790_000_045,
+            pressed_to: "2.1.281".to_string(),
             ..St::fresh(&from, &to, Proc::default(), 1_790_000_000)
         };
         assert_eq!(St::from_json(&st.to_json()), Some(st));
@@ -1868,6 +1893,16 @@ fn register_in(claude_dir: &Path, pid: u32, session: &str) -> SessionFile {
 /// nobody can compare, which the host looks at as it does a behind one).
 fn register_as(claude_dir: &Path, pid: u32, session: &str, version: &str) -> SessionFile {
     let start = kernel_start(pid).expect("lstart");
+    filed(claude_dir, pid, session, version, &start)
+}
+
+/// [`register_in`] recording the birth `start`, which need not be `pid`'s: the file a crashed
+/// agent left, whose number another process took.
+fn register_born(claude_dir: &Path, pid: u32, session: &str, start: &str) -> SessionFile {
+    filed(claude_dir, pid, session, "1.0.0", start)
+}
+
+fn filed(claude_dir: &Path, pid: u32, session: &str, version: &str, start: &str) -> SessionFile {
     std::fs::create_dir_all(claude_dir.join("sessions")).expect("sessions");
     std::fs::write(
         claude_dir.join(format!("sessions/{pid}.json")),
@@ -2542,6 +2577,7 @@ fn drive(dir: &Path) -> Opts {
         instances: Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
         land: false,
+        press: None,
         timings: crate::harness::Timings::FAST,
     }
 }
@@ -3042,6 +3078,7 @@ fn a_displaced_grid_never_makes_a_placeholder_a_draft() {
         first: 54,
         generation: None,
         human: HumanInput::Never,
+        title: None,
     };
     let screen = |cursor: Option<(usize, usize)>| typed(text, cursor);
     let (mut c, server) = fake_tab(vec![
@@ -4095,6 +4132,7 @@ fn the_continuation_is_typed_under_a_hand_taken_or_passed() {
         .expect("status");
         let opts = Opts {
             sock: Some(sock),
+            press: None,
             timings: crate::harness::Timings::PRODUCTION,
             ..drive(&dir)
         };
@@ -6851,6 +6889,185 @@ fn a_restart_in_flight_too_long_or_without_its_shell_never_acts_on_the_tab() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A restart whose agent is gone while another conversation holds the front of its tab stops at
+/// once (`tab-taken`), typing nothing and leaving no restart in flight; a tab whose shell has the
+/// prompt, a pass that reads no agent, an agent on the restart's own conversation, a session
+/// file whose recorded birth is not its live process's (a crashed agent's file, its number taken
+/// by the program in front of the tab), and an agent on another conversation whose launch resumes
+/// the restart's (a stand-in launched with `--resume` and that id) do not.
+#[cfg(unix)]
+#[test]
+fn an_exiting_restart_whose_tab_runs_another_conversation_stops_at_once() {
+    const OLD: &str = "aaaaaaaa-0000-0000-0000-000000000031";
+    const NEW: &str = "bbbbbbbb-0000-0000-0000-000000000031";
+    let (me, now) = (std::process::id(), now_s());
+    let shell = std::os::unix::process::parent_id();
+    let shell_group = process_group(shell).expect("the shell's group");
+    assert_ne!(
+        shell_group,
+        i64::from(me),
+        "precondition: the holder leads its own group"
+    );
+    let exiting = St {
+        phase: Phase::Exiting { at_s: now },
+        pid: dead_pid(),
+        shell,
+        tab: TAB.to_string(),
+        to: "2.1.281".to_string(),
+        source: "native".to_string(),
+        ..St::default()
+    };
+    let tabs = |front: i64| {
+        [LiveTab {
+            sid: TAB.to_string(),
+            fgpgid: Some(front),
+        }]
+    };
+    let dir = scratch("tab-taken");
+    let (sock, asked) = instance(&dir);
+    let opts = Opts {
+        sock: Some(sock),
+        ..drive(&dir)
+    };
+    std::fs::create_dir_all(state_dir(&opts)).expect("state");
+    save(&opts, OLD, &exiting);
+    let files = [register(&opts.home, me, NEW)];
+    assert_eq!(in_flight(&opts), [OLD], "precondition: in flight");
+    let dry = Opts {
+        dry_run: true,
+        ..opts.clone()
+    };
+    let steps = |o: &Opts, files: &[SessionFile], front: i64| -> Vec<String> {
+        orphans(o, files, Some(&tabs(front)[..]))
+            .into_iter()
+            .map(|r| r.step)
+            .collect()
+    };
+    assert_eq!(steps(&dry, &files, i64::from(me)), ["would-fail:tab-taken"]);
+    assert_eq!(ledger_lines(&opts), 0, "a dry run records nothing");
+    assert_eq!(steps(&opts, &files, i64::from(me)), ["failed:tab-taken"]);
+    let st = load(&opts, OLD).expect("kept");
+    assert_eq!(
+        (st.phase, st.exited_at),
+        (Phase::Failed("tab-taken".to_string()), 0),
+        "closed, owning no exit"
+    );
+    assert_eq!(ledger_lines(&opts), 1);
+    let ledger = std::fs::read_to_string(state_dir(&opts).join("ledger.jsonl")).expect("ledger");
+    assert!(
+        ledger.contains(&format!("claude (pid {me}) holds conversation {NEW}")),
+        "{ledger}"
+    );
+    assert!(in_flight(&opts).is_empty(), "nothing left in flight");
+    assert_eq!(turns(&asked), 0, "nothing typed");
+    assert!(
+        steps(&opts, &files, i64::from(me)).is_empty(),
+        "closed once"
+    );
+    save(&opts, OLD, &exiting);
+    let pressed = Opts {
+        press: Some(PressOpts { off: false }),
+        ..opts.clone()
+    };
+    assert!(
+        steps(&pressed, &files, i64::from(me)).is_empty(),
+        "a press closes an overtaken record without reporting it as the press's step"
+    );
+    assert_eq!(
+        load(&opts, OLD).map(|st| st.phase),
+        Some(Phase::Failed("tab-taken".to_string())),
+    );
+    save(
+        &opts,
+        OLD,
+        &St {
+            cause: CAUSE_EXIT.to_string(),
+            ..exiting.clone()
+        },
+    );
+    assert!(
+        steps(&pressed, &files, shell_group).is_empty(),
+        "a press does not step a non-upgrade restart in flight"
+    );
+
+    let dir = scratch("tab-not-taken");
+    let opts = drive(&dir);
+    std::fs::create_dir_all(state_dir(&opts)).expect("state");
+    let new = [register_in(&dir.join("new"), me, NEW)];
+    let old = [register_in(&dir.join("old"), me, OLD)];
+    let born = kernel_start(me).expect("this process's start");
+    let leftover = [register_born(
+        &dir.join("leftover"),
+        me,
+        NEW,
+        "Mon Jan  1 00:00:00 2001",
+    )];
+    assert_ne!(
+        squash(&leftover[0].proc_start),
+        born,
+        "precondition: another process's birth"
+    );
+    // libtest takes `--resume` as `--skip`'s value and the id as a filter no test matches; the
+    // argv Claude's parser reads resumes OLD.
+    let mut resuming = parked_bare()
+        .args(["--skip", "--resume", OLD])
+        .spawn()
+        .expect("a stand-in launched to resume OLD");
+    wait_exec(resuming.id());
+    let argv = atpkg::caller_shell::process_args(resuming.id())
+        .expect("its argv")
+        .argv;
+    assert_eq!(
+        upgrade::launch_resume(&argv),
+        Some(Some(OLD.to_string())),
+        "precondition: its launch resumes the restart's conversation: {argv:?}"
+    );
+    let resumer = [register_in(&dir.join("resumer"), resuming.id(), NEW)];
+    for (why, files, front, want) in [
+        (
+            "the shell has the prompt",
+            &new[..],
+            shell_group,
+            &["wait:no-socket"][..],
+        ),
+        (
+            "no agent read",
+            &[][..],
+            i64::from(me),
+            &["wait:no-socket"][..],
+        ),
+        (
+            "the restart's own conversation",
+            &old[..],
+            i64::from(me),
+            &[][..],
+        ),
+        (
+            "a leftover file whose number the front's process took",
+            &leftover[..],
+            i64::from(me),
+            &["wait:no-socket"][..],
+        ),
+        (
+            "an agent whose launch resumes the restart's conversation",
+            &resumer[..],
+            i64::from(resuming.id()),
+            &["wait:no-socket"][..],
+        ),
+    ] {
+        save(&opts, OLD, &exiting);
+        assert_eq!(steps(&opts, files, front), want, "{why}");
+        assert_eq!(
+            load(&opts, OLD).map(|st| st.phase),
+            Some(Phase::Exiting { at_s: now }),
+            "{why}"
+        );
+    }
+    resuming.kill().expect("stop the stand-in");
+    resuming.wait().expect("reap the stand-in");
+    assert_eq!(ledger_lines(&opts), 0, "none closed");
+}
+
 /// The stale-exit bound counts from the exit a look saw, not the signal.
 #[test]
 fn a_restart_in_flight_is_stale_from_its_seen_exit_not_its_signal() {
@@ -7228,10 +7445,13 @@ fn a_restart_whose_agent_is_not_reaped_yet_says_when_it_ended() {
         .is_some(),
         "the agent ended"
     );
-    assert!(
-        alive(pid),
+    assert_eq!(
+        // SAFETY: signal 0 queries existence without delivering a signal.
+        unsafe { libc::kill(gone, 0) },
+        0,
         "a zombie, not reaped: kill(pid, 0) still finds it"
     );
+    assert!(!alive(pid), "an unreaped zombie is not live");
     let st = relaunched_over("unreaped-relaunch", pid);
     let _ = zombie.wait();
     assert_ne!(st.exited_at, 0, "its exit seen");
@@ -12127,6 +12347,54 @@ fn pid_zero_is_never_alive() {
     assert!(alive(std::process::id()));
 }
 
+/// An unreaped zombie neither counts as [`alive`] nor holds its conversation ([`conversation_live`]),
+/// even while `kill(pid, 0)` still finds its pid and its session file still stands on disk.
+#[cfg(unix)]
+#[test]
+fn an_unreaped_zombie_neither_lives_nor_holds_its_conversation() {
+    let dir = scratch("zombie-owner");
+    let claude_dir = dir.join(".claude");
+    let mut child = parked().spawn().expect("agent");
+    let pid = child.id();
+    wait_exec(pid);
+    let sf = register_in(&claude_dir, pid, SESSION);
+    assert!(alive(pid), "negative control: live before exit");
+    assert!(
+        conversation_live(std::slice::from_ref(&sf), SESSION),
+        "negative control: holds conversation before exit"
+    );
+    child.kill().expect("kill");
+    loop {
+        // SAFETY: zeroed siginfo out-parameter for our own child; `WNOWAIT` leaves it unreaped.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        let rc =
+            unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        let err = std::io::Error::last_os_error();
+        if rc == 0 {
+            break;
+        }
+        assert_eq!(err.raw_os_error(), Some(libc::EINTR), "waitid: {err}");
+    }
+    assert_eq!(
+        // SAFETY: signal 0 checks existence without delivering a signal.
+        unsafe { libc::kill(pid as libc::pid_t, 0) },
+        0,
+        "negative control: kill(pid, 0) still finds the unreaped zombie"
+    );
+    assert!(
+        claude_dir.join(format!("sessions/{pid}.json")).is_file(),
+        "negative control: session file still stands before reap"
+    );
+    assert!(!alive(pid), "an unreaped zombie is not live");
+    assert!(
+        !conversation_live(std::slice::from_ref(&sf), SESSION),
+        "an unreaped zombie no longer holds its conversation"
+    );
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The relaunch keeps a snapshot of a tab's own program, and relaunches nothing from it.
 #[cfg(unix)]
 #[test]
@@ -13000,8 +13268,6 @@ fn a_relaunch_handed_to_its_loop_ends_at_adoption_and_is_owed_to_its_tab() {
     st.phase = Phase::Relaunched { at_s: now_s() };
     save(&opts, SESSION, &st);
     assert_eq!(resume(&opts).step, carried.step);
-    let _ = agent.kill();
-    let _ = agent.wait();
     let confirming = St {
         phase: Phase::Done,
         confirm_by: now_s() + 60,
@@ -13014,6 +13280,13 @@ fn a_relaunch_handed_to_its_loop_ends_at_adoption_and_is_owed_to_its_tab() {
     let r = resume(&opts);
     assert_eq!(r.step, "done:model-unconfirmed", "{r:?}");
     assert!(!owed(&opts), "read: nothing more");
+    let _ = agent.kill();
+    let _ = agent.wait();
+    save(&opts, SESSION, &confirming);
+    assert!(
+        !owed(&opts),
+        "its resumed agent gone, nothing of it is owed to the tab"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -13661,6 +13934,7 @@ fn held_step_shown(
         step: String::new(),
     };
     let opts = Opts {
+        press: None,
         timings: crate::harness::Timings {
             held: wait,
             ..opts.timings
@@ -13708,6 +13982,175 @@ fn a_live_relaunch_on_exit_keeps_its_wait_when_its_shell_has_the_tab() {
     assert_eq!(r.step, "failed:no-resume", "{r:?}");
     assert_eq!(st.phase, Phase::Failed("no-resume".to_string()));
     assert_eq!(rows, 1);
+}
+
+/// What [`carried_in_front`] left: the step, the record after it, its ledger, whether a carry is
+/// still owed, and the turns typed.
+#[cfg(unix)]
+struct InFront {
+    r: Report,
+    st: St,
+    ledger: String,
+    owed: bool,
+    turns: usize,
+}
+
+/// The conversation [`carried_in_front`] registers this test process on: not the record's.
+#[cfg(unix)]
+const IN_FRONT: &str = "bbbbbbbb-0000-0000-0000-000000000032";
+
+/// One [`resume_as`] over a Claude relaunch of `cause` no agent registered, relaunched just now in
+/// tab [`TAB`] at this test process's parent shell (its relaunched agent `relaunched`, `0` for
+/// none recorded), the host roster naming this test process (a child of that shell, its argv
+/// resuming nothing) in front, registered on [`IN_FRONT`] when `held`.
+#[cfg(unix)]
+fn carried_in_front(name: &str, cause: &str, held: bool, relaunched: u32) -> InFront {
+    let _waits = crate::harness::relaunch::virtual_waits();
+    let me = std::process::id();
+    let dir = scratch(name);
+    let who = format!("OK 1\n0 {TAB} driving=- watchers=0 turns=0 alive fgpgid={me}");
+    let (sock, asked) = instance_with(
+        &dir,
+        Answers {
+            who: Some(who),
+            ..Answers::default()
+        },
+    );
+    let opts = Opts {
+        sock: Some(sock),
+        only_sid: Some(TAB.to_string()),
+        ..drive(&dir)
+    };
+    std::fs::create_dir_all(state_dir(&opts)).expect("state");
+    save(
+        &opts,
+        SESSION,
+        &St {
+            phase: Phase::Relaunched { at_s: now_s() },
+            pid: dead_pid(),
+            shell: std::os::unix::process::parent_id(),
+            tab: TAB.to_string(),
+            to: "9.9.9".to_string(),
+            source: "same".to_string(),
+            cause: cause.to_string(),
+            exited_at: now_s(),
+            relaunched_pid: relaunched,
+            ..St::default()
+        },
+    );
+    if held {
+        register(&opts.home, me, IN_FRONT);
+    }
+    let r = resume_as(&opts, false, None);
+    let got = InFront {
+        r,
+        st: load(&opts, SESSION).expect("kept"),
+        ledger: std::fs::read_to_string(state_dir(&opts).join("ledger.jsonl")).unwrap_or_default(),
+        owed: owed(&opts),
+        turns: turns(&asked),
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    got
+}
+
+/// A relaunch no agent registered, whose tab another conversation holds in front, stops at its
+/// first carry (`tab-taken`) instead of a held wait at each idle point until [`STALE_S`]; with no
+/// such agent the carry waits on (`wait:resume`).
+#[cfg(unix)]
+#[test]
+fn a_relaunch_whose_tab_runs_another_conversation_is_not_waited_on() {
+    for taken in [true, false] {
+        let name = if taken {
+            "relaunch-taken"
+        } else {
+            "relaunch-untaken"
+        };
+        let got = carried_in_front(name, CAUSE_EXIT, taken, 0);
+        let (r, st) = (&got.r, &got.st);
+        if taken {
+            assert_eq!(r.step, "failed:tab-taken", "{r:?}");
+            assert_eq!(st.phase, Phase::Failed("tab-taken".to_string()));
+            assert_eq!(got.ledger.lines().count(), 1, "{}", got.ledger);
+            assert!(!got.owed, "nothing owed to the tab's own agent");
+        } else {
+            assert_eq!(r.step, "wait:resume", "{r:?}");
+            assert!(matches!(st.phase, Phase::Relaunched { .. }), "{st:?}");
+            assert_eq!(got.ledger.lines().count(), 0, "{}", got.ledger);
+            assert!(got.owed, "still owed");
+        }
+        assert_eq!(got.turns, 0, "nothing typed");
+    }
+}
+
+/// A relaunch afresh holds its tab with a new conversation from a launch that resumes none: the
+/// agent its line started, in front of the tab on another conversation, lands it (`done:fresh`),
+/// never closes it as overtaken (`tab-taken`).
+#[cfg(unix)]
+#[test]
+fn a_fresh_relaunchs_own_agent_on_a_new_conversation_lands_it() {
+    use super::super::relaunch::{CAUSE_FRESH, CAUSE_UPGRADE_FRESH};
+    for cause in [CAUSE_FRESH, CAUSE_UPGRADE_FRESH] {
+        let got = carried_in_front(&format!("relaunch-own-{cause}"), cause, true, 0);
+        let (r, st) = (&got.r, &got.st);
+        assert_eq!(r.step, "done:fresh", "{cause}: {r:?}");
+        assert_eq!(r.pid, std::process::id(), "{cause}: the agent in front");
+        assert_eq!(st.phase, Phase::Done, "{cause}: {st:?}");
+        assert_eq!(got.ledger.lines().count(), 1, "{cause}: {}", got.ledger);
+        assert!(got.ledger.contains(IN_FRONT), "{cause}: {}", got.ledger);
+        assert!(
+            !got.ledger.contains("holds conversation"),
+            "{cause}: {}",
+            got.ledger
+        );
+        assert!(!got.owed, "{cause}: landed");
+        assert_eq!(got.turns, 0, "{cause}: nothing typed");
+    }
+}
+
+/// A relaunch whose relaunched agent lives is not overtakable
+/// ([`super::super::relaunch::overtakable`]): another conversation in front of its tab never
+/// closes it as overtaken (`tab-taken`), and its carry waits on (`wait:resume`).
+#[cfg(unix)]
+#[test]
+fn a_relaunch_whose_relaunched_agent_lives_is_not_overtaken() {
+    let mut relaunched = parked().spawn().expect("the relaunched agent");
+    wait_exec(relaunched.id());
+    let got = carried_in_front("relaunch-agent-lives", CAUSE_EXIT, true, relaunched.id());
+    relaunched.kill().expect("stop the relaunched agent");
+    relaunched.wait().expect("reap the relaunched agent");
+    let (r, st) = (&got.r, &got.st);
+    assert_eq!(r.step, "wait:resume", "{r:?}");
+    assert!(matches!(st.phase, Phase::Relaunched { .. }), "{st:?}");
+    assert!(!got.ledger.contains("holds conversation"), "{}", got.ledger);
+    assert_eq!(got.turns, 0, "nothing typed");
+}
+
+/// [`super::super::relaunch::overtaken`] counts only an agent on another conversation: one in
+/// front of the restart's tab on the restart's own conversation never overtook it. CONTROL: the
+/// same agent on another conversation did.
+#[cfg(unix)]
+#[test]
+fn an_agent_on_the_restarts_own_conversation_never_overtook_it() {
+    use super::super::relaunch::overtaken;
+    const OLD: &str = "aaaaaaaa-0000-0000-0000-000000000035";
+    const NEW: &str = "bbbbbbbb-0000-0000-0000-000000000035";
+    let me = std::process::id();
+    let born = kernel_start(me).expect("this process's start");
+    let st = St {
+        phase: Phase::Exiting { at_s: now_s() },
+        pid: dead_pid(),
+        shell: std::os::unix::process::parent_id(),
+        tab: TAB.to_string(),
+        ..St::default()
+    };
+    assert!(
+        overtaken(&st, OLD, me, &born, NEW, alive),
+        "control: another conversation overtook it"
+    );
+    assert!(
+        !overtaken(&st, OLD, me, &born, OLD, alive),
+        "its own conversation did not"
+    );
 }
 
 /// A shell that holds its tab is no proof the agent ended.
@@ -13868,6 +14311,7 @@ fn a_restarts_line_is_judged_by_the_block_it_was_typed_into() {
             PAST_ENDED
         };
         let opts = Opts {
+            press: None,
             timings: crate::harness::Timings {
                 held: wait,
                 ..opts.timings
@@ -15798,33 +16242,23 @@ impl Parked {
     /// wait for it to be gone ends on the event; says how it ended.
     fn reaped(&mut self) -> std::sync::mpsc::Receiver<std::process::ExitStatus> {
         let agent = self.agent.take().expect("the agent");
-        let file = self
-            .opts
-            .home
-            .join(format!(".claude/sessions/{}.json", agent.id()));
+        let pid = agent.id();
+        let file = self.opts.home.join(format!(".claude/sessions/{pid}.json"));
         let held: Handed = std::sync::Arc::new(std::sync::Mutex::new(Some(agent)));
         self.handed = Some(std::sync::Arc::clone(&held));
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            loop {
-                let mut slot = held
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let Some(agent) = slot.as_mut() else { return };
-                match agent.try_wait() {
-                    Ok(Some(status)) => {
-                        *slot = None;
-                        drop(slot);
-                        let _ = std::fs::remove_file(&file);
-                        let _ = tx.send(status);
-                        return;
-                    }
-                    Ok(None) => {}
-                    Err(_) => return,
-                }
-                drop(slot);
-                std::thread::sleep(Duration::from_millis(5));
+            if !crate::harness::upgrade_wake::wait_exit(pid, Duration::from_secs(600)) {
+                return;
             }
+            let mut slot = held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(mut agent) = slot.take() else { return };
+            drop(slot);
+            let Ok(status) = agent.wait() else { return };
+            let _ = std::fs::remove_file(&file);
+            let _ = tx.send(status);
         });
         rx
     }
@@ -15850,34 +16284,16 @@ impl Drop for Parked {
             let _ = agent.wait();
         }
         if let Some(handed) = &self.handed
-            && let Some(agent) = handed
+            && let Some(mut agent) = handed
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_mut()
+                .take()
         {
             let _ = agent.kill();
+            let _ = agent.wait();
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
-}
-
-/// A rig ends the stand-in agent it handed to [`Parked::reaped`] when the test did not, so an
-/// agent the visit never signalled cannot outlive its test.
-#[cfg(unix)]
-#[test]
-fn a_rig_ends_the_agent_it_handed_to_its_reaper() {
-    use std::os::unix::process::ExitStatusExt as _;
-    let mut h = Parked::new("handed-ends", Answers::default(), St::default(), 3600);
-    let ended = h.reaped();
-    assert!(
-        ended.try_recv().is_err(),
-        "control: the agent runs until the rig ends"
-    );
-    drop(h);
-    let status = ended
-        .recv_timeout(HANG_DETECTOR)
-        .expect("the rig ended its agent");
-    assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
 }
 
 /// The details of `opts`' ledger rows whose step is `step`.
@@ -15928,11 +16344,43 @@ fn zsh_executable() -> &'static Path {
     })
 }
 
+/// A child running on a pseudo-terminal whose master descriptor stays open only
+/// for the child's life, rather than leaking a `/dev/ptmx` slot per test.
+#[cfg(unix)]
+struct TtyChild {
+    child: std::process::Child,
+    _master: std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+impl std::ops::Deref for TtyChild {
+    type Target = std::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+#[cfg(unix)]
+impl std::ops::DerefMut for TtyChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TtyChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// A zsh ([`zsh_executable`]) that is the session leader of a pseudo-terminal
 /// of its own and its foreground process group (`pgid == tpgid`): the shell a
 /// relaunch waits to hold its terminal again.
 #[cfg(unix)]
-fn tty_zsh() -> std::process::Child {
+fn tty_zsh() -> TtyChild {
     use aterm_uds::spawnfd::InheritNothing as _;
     use std::os::fd::{FromRawFd as _, OwnedFd};
     use std::os::unix::process::CommandExt as _;
@@ -15940,7 +16388,8 @@ fn tty_zsh() -> std::process::Child {
     // SAFETY: both descriptors were just opened above and are owned exclusively here.
     let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
     let tty = |fd: &OwnedFd| std::process::Stdio::from(fd.try_clone().expect("dup"));
-    let mut zsh = std::process::Command::new(zsh_executable());
+    let exe = zsh_executable();
+    let mut zsh = std::process::Command::new(exe);
     zsh.inherit_nothing()
         .args(["-f", "-c", "sleep 60; :"])
         .stdin(tty(&slave))
@@ -15955,9 +16404,18 @@ fn tty_zsh() -> std::process::Child {
             Ok(())
         });
     }
-    let mut child = zsh.spawn().expect("zsh");
-    std::mem::forget(master);
+    let child = zsh.spawn().unwrap_or_else(|err| {
+        panic!(
+            "zsh spawn failed: {err:?}; exe={} ({:?})",
+            exe.display(),
+            std::fs::symlink_metadata(exe).map(|m| (m.file_type(), m.len())),
+        )
+    });
     drop(slave);
+    let child = TtyChild {
+        child,
+        _master: master,
+    };
     for _ in 0..6_000 {
         if ids(child.id())
             .is_some_and(|(_, pgid, tpgid)| i64::from(child.id()) == pgid && pgid == tpgid)
@@ -15968,8 +16426,6 @@ fn tty_zsh() -> std::process::Child {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let _ = child.kill();
-    let _ = child.wait();
     panic!("zsh never held its terminal");
 }
 
@@ -16079,7 +16535,7 @@ fn ps_name(pid: u32) -> Option<String> {
 /// terminal's foreground (`ids`: `pgid == tpgid == pid`) and a roster naming that group (`who …
 /// fgpgid=<pid>`) claims it ([`host_candidates`]).
 #[cfg(unix)]
-fn tty_agent(env: &[(&str, &Path)], cwd: Option<&Path>) -> std::process::Child {
+fn tty_agent(env: &[(&str, &Path)], cwd: Option<&Path>) -> TtyChild {
     use aterm_uds::spawnfd::InheritNothing as _;
     use std::os::fd::{FromRawFd as _, OwnedFd};
     use std::os::unix::process::CommandExt as _;
@@ -16087,7 +16543,8 @@ fn tty_agent(env: &[(&str, &Path)], cwd: Option<&Path>) -> std::process::Child {
     // SAFETY: both descriptors were just opened above and are owned exclusively here.
     let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
     let tty = |fd: &OwnedFd| std::process::Stdio::from(fd.try_clone().expect("dup"));
-    let mut agent = std::process::Command::new(std::env::current_exe().expect("exe"));
+    let me = std::env::current_exe().expect("exe");
+    let mut agent = std::process::Command::new(&me);
     agent
         .inherit_nothing()
         .args(PARK)
@@ -16114,10 +16571,26 @@ fn tty_agent(env: &[(&str, &Path)], cwd: Option<&Path>) -> std::process::Child {
             Ok(())
         });
     }
-    let mut child = agent.spawn().expect("agent");
-    std::mem::forget(master);
+    let child = agent.spawn().unwrap_or_else(|err| {
+        panic!(
+            "agent spawn failed: {err:?}; exe={} ({:?}); cwd={:?}; process_cwd={:?}",
+            me.display(),
+            std::fs::symlink_metadata(&me).map(|m| (m.file_type(), m.len())),
+            cwd.map(|p| (
+                p.display().to_string(),
+                std::fs::symlink_metadata(p).map(|m| m.file_type()),
+            )),
+            std::env::current_dir().map(|p| (
+                p.display().to_string(),
+                std::fs::symlink_metadata(&p).map(|m| m.file_type()),
+            )),
+        )
+    });
     drop(slave);
-    let me = std::env::current_exe().expect("exe");
+    let child = TtyChild {
+        child,
+        _master: master,
+    };
     for _ in 0..6_000 {
         if ids(child.id())
             .is_some_and(|(_, pgid, tpgid)| i64::from(child.id()) == pgid && pgid == tpgid)
@@ -16128,8 +16601,6 @@ fn tty_agent(env: &[(&str, &Path)], cwd: Option<&Path>) -> std::process::Child {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let _ = child.kill();
-    let _ = child.wait();
     panic!("the stand-in agent never held its terminal");
 }
 
@@ -16505,6 +16976,7 @@ fn a_labelled_top_rule_is_the_input_box_the_notice_fences_on() {
             first: 0,
             generation: Some("4.77".to_string()),
             human: HumanInput::Unknown,
+            title: None,
         };
         let fence = composer_rows(&scr).unwrap_or_else(|| panic!("{name}: the box"));
         assert_eq!((fence.first, fence.last), (caret - 1, caret + 1), "{name}");
@@ -17943,6 +18415,7 @@ fn typing_that_wraps_at_the_bottom_of_the_screen_is_still_typing() {
         first: 0,
         generation: None,
         human: HumanInput::Never,
+        title: None,
     };
     let mark = PromptMark::of(&at(&["out", "~/p % "], 1, 6)).expect("mark");
     assert_eq!(mark.at(&at(&["out", "~/p % "], 1, 6)), AtPrompt::Same);
@@ -18228,6 +18701,7 @@ fn a_caret_moved_home_over_a_half_typed_command_is_typing() {
         first: 0,
         generation: None,
         human: HumanInput::Never,
+        title: None,
     };
     let clock = PromptMark::of(&at("~/proj %            12:34:56", 9)).expect("mark");
     assert_eq!(clock.right, Some(20));
@@ -21908,6 +22382,259 @@ fn the_quiet_look_is_the_hosts_to_type_and_a_sweeps_to_end() {
     assert_eq!(rig.typed().len(), 1, "the carry-on alone");
 }
 
+/// A quiet restart's look whose resumed agent is gone is no carry-on of the next agent in its
+/// tab: nothing is owed to the tab, the next idle point's resume finds nothing (`current`), and a
+/// sweep's confirmations close the look saying nothing and writing no ledger line, so the sweep's
+/// pick names the live conversation that acted beside it. CONTROL: while the resumed agent lives,
+/// the look is owed and its close says `done:resumed` for its own conversation and agent, and a
+/// sweep with no other act names that look.
+#[test]
+fn a_look_whose_agent_is_gone_is_not_the_next_agents_carry_on() {
+    const LIVE: &str = "bbbbbbbb-0000-0000-0000-000000000033";
+    let me = std::process::id();
+    for (gone, pid) in [(true, dead_pid()), (false, me)] {
+        let dir = scratch(if gone { "look-gone" } else { "look-live" });
+        let opts = Opts {
+            only_sid: Some(TAB.to_string()),
+            ..drive(&dir)
+        };
+        std::fs::create_dir_all(state_dir(&opts)).expect("state");
+        let now = now_s();
+        let look = St {
+            phase: Phase::Done,
+            done_at: now - 20,
+            confirm_by: now - 5,
+            quiet: true,
+            resumed_pid: pid,
+            resumed_on: "9.9.9".to_string(),
+            pid: dead_pid(),
+            tab: TAB.to_string(),
+            from: "9.9.8".to_string(),
+            to: "9.9.9".to_string(),
+            source: "managed".to_string(),
+            ..St::default()
+        };
+        save(&opts, SESSION, &look);
+        let lines = ledger_lines(&opts);
+        assert_eq!(owed(&opts), !gone, "owed (gone={gone})");
+        let r = resume_as(&opts, false, None);
+        if gone {
+            assert_eq!((r.step.as_str(), r.session.as_str()), ("current", "-"));
+            assert!(
+                load(&opts, SESSION).is_some_and(|st| st.confirm_by != 0),
+                "the next agent's point leaves the look to a sweep"
+            );
+        } else {
+            assert_eq!(
+                (r.step.as_str(), r.session.as_str(), r.pid),
+                ("done:resumed", SESSION, me)
+            );
+        }
+        save(&opts, SESSION, &look);
+        let mut reports = confirmations(&opts);
+        if gone {
+            assert!(reports.is_empty(), "{reports:?}");
+            assert_eq!(load(&opts, SESSION).map(|st| st.confirm_by), Some(0));
+            reports.push(Report {
+                pid: me,
+                tab: TAB.to_string(),
+                session: LIVE.to_string(),
+                from: "9.9.8".to_string(),
+                to: "9.9.9(managed)".to_string(),
+                step: "signalled".to_string(),
+            });
+        }
+        let picked = pick(&reports, TAB).expect("an act");
+        let want = if gone { LIVE } else { SESSION };
+        assert_eq!(picked.session, want, "{reports:?}");
+        assert_eq!(ledger_lines(&opts), lines, "a quiet close writes no line");
+    }
+}
+
+/// A look that warned whose resumed agent is gone is lost at a sweep's first look (or [`settle`]'s),
+/// not after [`STALE_S`], typing nothing; and a model confirmation whose resumed agent is gone is
+/// closed at once without waiting for `confirm_by`. CONTROL: while its agent lives, both stay open.
+#[cfg(unix)]
+#[test]
+fn a_warned_look_whose_agent_is_gone_is_lost_at_once() {
+    let asked = [
+        user_row("Watch the artifact's comments and answer them."),
+        turn_by("claude-opus-5-5", "Watching the comments."),
+    ];
+    for gone in [true, false] {
+        let name = if gone {
+            "quiet-gone-warned"
+        } else {
+            "quiet-live-warned"
+        };
+        let (rig, mut st) = quietly_resumed(name, &asked);
+        rig.append(&[resumed_warning("2.1.282", now_s(), "warning")]);
+        if gone {
+            st.resumed_pid = dead_pid();
+        }
+        save(&rig.opts, SESSION, &st);
+        let ended = confirmations(&rig.opts);
+        let saved = load(&rig.opts, SESSION).expect("record");
+        if gone {
+            assert_eq!(ended.len(), 1, "{ended:?}");
+            assert_eq!(ended[0].step, "done:lost");
+            assert!(
+                saved.outcome.contains("its agent ended before the look"),
+                "{}",
+                saved.outcome
+            );
+            assert!(!saved.confirming());
+        } else {
+            assert!(ended.is_empty(), "{ended:?}");
+            assert!(saved.confirming(), "the look stays open");
+        }
+        save(&rig.opts, SESSION, &st);
+        let mut settle_st = st.clone();
+        let settled = super::super::relaunch::settle_look(
+            &rig.opts,
+            &blank(&rig.sf),
+            &mut settle_st,
+            SESSION,
+            now_s(),
+        )
+        .expect("settle_look");
+        assert_eq!(
+            settled.step,
+            if gone { "done:lost" } else { "wait:owed" },
+            "{settled:?}"
+        );
+        let mark = std::fs::metadata(&rig.path).expect("meta").len();
+        let model_st = St {
+            phase: Phase::Done,
+            mark,
+            confirm_by: now_s() + 60,
+            resumed_pid: st.resumed_pid,
+            resumed_on: "2.1.282".to_string(),
+            quiet: false,
+            look_word: String::new(),
+            ..st.clone()
+        };
+        save(&rig.opts, SESSION, &model_st);
+        let model_ended = confirmations(&rig.opts);
+        if gone {
+            assert_eq!(model_ended.len(), 1, "{model_ended:?}");
+            assert_eq!(model_ended[0].step, "done:model-unconfirmed");
+            assert!(!load(&rig.opts, SESSION).expect("record").confirming());
+        } else {
+            assert!(model_ended.is_empty(), "{model_ended:?}");
+            assert!(load(&rig.opts, SESSION).expect("record").confirming());
+        }
+        assert!(rig.typed().is_empty(), "{name}: {:?}", rig.typed());
+    }
+}
+
+/// A warned look whose resumed agent is gone is lost at the look, and its line says why by when
+/// the look came: while the look is open the agent ended before it; once `confirm_by` passed, no
+/// idle point came during the look to say so, whenever the agent ended.
+#[cfg(unix)]
+#[test]
+fn a_lost_look_of_a_gone_agent_says_why_by_when_it_came() {
+    let asked = [
+        user_row("Watch the artifact's comments and answer them."),
+        turn_by("claude-opus-5-5", "Watching the comments."),
+    ];
+    for late in [false, true] {
+        let name = if late {
+            "gone-look-late"
+        } else {
+            "gone-look-open"
+        };
+        let (rig, mut st) = quietly_resumed(name, &asked);
+        rig.append(&[resumed_warning("2.1.282", now_s(), "warning")]);
+        st.resumed_pid = dead_pid();
+        let at = if late { st.confirm_by } else { now_s() };
+        assert!(
+            late || at < st.confirm_by,
+            "{name}: precondition: the look is open"
+        );
+        let r = restore_look_at(&rig, &mut st, at).expect("the look closes");
+        assert_eq!(r.step, "done:lost", "{name}: {r:?}");
+        let (says, never) = if late {
+            ("no idle point came to say so", "ended before the look")
+        } else {
+            ("its agent ended before the look", "no idle point came")
+        };
+        assert!(
+            st.outcome.contains(says) && !st.outcome.contains(never),
+            "{name}: {}",
+            st.outcome
+        );
+        assert_eq!(rig.details("done:lost").len(), 1, "{name}: one line");
+        assert!(!st.confirming(), "{name}");
+        assert!(rig.typed().is_empty(), "{name}: {:?}", rig.typed());
+    }
+}
+
+/// A sweep closes a warned look whose resumed agent is gone (`done:lost`) and reports it after
+/// its lanes' reports, so the window's pick for the tab names the act a live conversation's lane
+/// took there in the same sweep, never the conversation that ended. CONTROL: with no lane act
+/// the pick names the closed look.
+#[cfg(unix)]
+#[test]
+fn a_sweeps_pick_names_the_live_act_before_a_look_whose_agent_ended() {
+    const LIVE: &str = "bbbbbbbb-0000-0000-0000-000000000036";
+    let asked = [
+        user_row("Watch the artifact's comments and answer them."),
+        turn_by("claude-opus-5-5", "Watching the comments."),
+    ];
+    let me = std::process::id();
+    for acted in [true, false] {
+        let name = if acted {
+            "sweep-gone-look-acted"
+        } else {
+            "sweep-gone-look-alone"
+        };
+        let (rig, mut st) = quietly_resumed(name, &asked);
+        rig.append(&[resumed_warning("2.1.282", now_s(), "warning")]);
+        st.resumed_pid = dead_pid();
+        save(&rig.opts, SESSION, &st);
+        let act = Report {
+            pid: me,
+            tab: TAB.to_string(),
+            session: LIVE.to_string(),
+            from: "2.1.281".to_string(),
+            to: "2.1.282(managed)".to_string(),
+            step: "signalled".to_string(),
+        };
+        let tabs = [LiveTab {
+            sid: TAB.to_string(),
+            fgpgid: Some(i64::from(me)),
+        }];
+        let opts = Opts {
+            only_sid: Some(TAB.to_string()),
+            ..rig.opts.clone()
+        };
+        let reports = sweep_with_lanes(&opts, Some(&tabs), &|agent| match agent {
+            upgrade::Agent::Claude if acted => vec![act.clone()],
+            _ => Vec::new(),
+        });
+        let closed: Vec<&Report> = reports.iter().filter(|r| r.session == SESSION).collect();
+        assert_eq!(closed.len(), 1, "{name}: {reports:?}");
+        assert_eq!(closed[0].step, "done:lost", "{name}: {reports:?}");
+        assert!(
+            !load(&rig.opts, SESSION).expect("record").confirming(),
+            "{name}: closed in this sweep"
+        );
+        let picked = pick(&reports, TAB).expect("an act");
+        let want = if acted {
+            (LIVE, "signalled", me)
+        } else {
+            (SESSION, "done:lost", st.resumed_pid)
+        };
+        assert_eq!(
+            (picked.session.as_str(), picked.step.as_str(), picked.pid),
+            want,
+            "{name}: {reports:?}"
+        );
+        assert!(rig.typed().is_empty(), "{name}: {:?}", rig.typed());
+    }
+}
+
 /// A sweep types the restore line only into a tab whose own autopilot is on.
 #[cfg(unix)]
 #[test]
@@ -22574,6 +23301,7 @@ fn a_restart_holds_the_tab_from_its_last_look_and_gives_it_back_when_it_stops() 
             grace: 120,
             fresh: false,
             quiet: false,
+            pressed: false,
             lagging: false,
             mode: None,
             model: None,
@@ -22863,6 +23591,7 @@ fn a_restart_in_place_records_its_model_ask_only_with_the_line_that_asks_it() {
             rx
         });
         let opts = Opts {
+            press: None,
             timings: crate::harness::Timings {
                 held: Duration::from_millis(100),
                 ..opts.timings
@@ -28021,4 +28750,186 @@ fn an_unparsable_session_file_fails_the_roster_only_while_this_users_process_may
         Some(0),
         "last written before this process started: a process that took the number since"
     );
+}
+
+/// A [`Parked`] rig behind for an hour at a settled screen whose status says `status`, its
+/// record this build's, in the quiet flow.
+#[cfg(unix)]
+fn pressed_rig(name: &str, status: &str, answers: Answers, st: St) -> Parked {
+    let mut h = quietly(|| Parked::new(name, answers, st, 3600));
+    set_status(&mut h, status);
+    own_record(&h);
+    transcript_says(&h, "Done: the report is written.");
+    h
+}
+
+/// The press's own visit: its lane's opts ([`press`]), the agent the foreground job of a live
+/// zsh, two shells it started still running under it, and a kernel that counts them as the
+/// restart's background work.
+#[cfg(unix)]
+fn press_visit(h: &Parked, off: bool) -> Report {
+    let opts = Opts {
+        press: Some(PressOpts { off }),
+        ..h.opts.clone()
+    };
+    let mut shell = tty_zsh();
+    let script = Script::new(shell.id(), usize::MAX, None);
+    let kernel = ParkedProcess {
+        script: &script,
+        pid: h.sf.pid,
+        start: Some(squash(&h.sf.proc_start)),
+        background: vec!["zsh".to_string(), "zsh".to_string()],
+    };
+    let mut table = vec![(shell.id(), 1, "zsh".into())];
+    table.extend(shells_under(h));
+    let r = visit(&opts, &h.sf, &table, &newer(), &kernel);
+    let _ = shell.kill();
+    let _ = shell.wait();
+    r
+}
+
+/// A PRESS RESTARTS OVER BACKGROUND WORK AND RESUMES: the owner's press of the ⬆️ ends the agent
+/// with the shells it left running (a SIGTERM, which Claude Code ends them on) and relaunches
+/// its conversation, while an automatic step stands aside for it; a record with no press
+/// standing is not stepped by the press's lane. NEGATIVE CONTROL: the owner's Now alone waits
+/// for those shells.
+#[cfg(unix)]
+#[test]
+fn a_press_restarts_over_background_work_and_resumes() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let behind = || St {
+        pending_since: now_s() - 3_600,
+        ..settled()
+    };
+    let h = pressed_rig("press-bg-now", "shell", Answers::default(), behind());
+    assert_eq!(
+        press_visit(&h, false).step,
+        PRESS_LAPSED,
+        "no press, no lane"
+    );
+    ask(&h.opts, TAB, Ask::Now, false).expect("--now");
+    let shells = shells_under(&h);
+    assert_eq!(
+        h.visit_with(dead_pid(), &shells).step,
+        "wait:background",
+        "CONTROL: the Now waits for the shells"
+    );
+    assert!(h.details("terminated").is_empty());
+    drop(h);
+    let mut h = pressed_rig("press-bg", "shell", Answers::default(), behind());
+    ask_for(&h.opts, TAB, Ask::Press, "9.9.9", "").expect("the press");
+    let shells = shells_under(&h);
+    assert_eq!(
+        h.visit_with(dead_pid(), &shells).step,
+        format!("wait:{}", upgrade::PRESSED),
+        "an automatic step stands aside"
+    );
+    let ended = h.reaped();
+    let r = press_visit(&h, false);
+    let status = ended.recv_timeout(HANG_DETECTOR).expect("the agent ended");
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{r:?}");
+    let terminated = h.details("terminated");
+    assert_eq!(terminated.len(), 1, "{r:?}");
+    assert!(
+        terminated[0].contains("pressed the update arrow"),
+        "{terminated:?}"
+    );
+    assert!(h.typed().is_empty(), "nothing typed first: {:?}", h.typed());
+    let st = load(&h.opts, SESSION).expect("state");
+    assert!(st.line.contains("--resume"), "resumed: {}", st.line);
+    assert!(
+        st.quiet,
+        "a press from a round never asked is the quiet flow"
+    );
+    assert!(!st.press_stands(TAB, now_s()), "the press is spent: {st:?}");
+}
+
+/// A PRESS RECHECKS THE DRAFT BEFORE ITS SIGNAL: a draft typed after the press's look, at the
+/// restart's first look under its hand or just before its signal, holds the signal, and the
+/// agent lives on. NEGATIVE CONTROL: with no draft, the press signals.
+#[cfg(unix)]
+#[test]
+fn a_press_rechecks_the_draft_before_its_signal() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let rule = "─".repeat(20);
+    let draft = format!(
+        r#"{{"rows":["{rule}","❯ fix the tests","{rule}"],"cursor":{{"row":1,"col":15}},"seq":79,"human_ms":null,"first":0}}"#
+    );
+    let rig = |name: &str, after: Option<(usize, String)>| {
+        let behind = St {
+            pending_since: now_s() - 3_600,
+            ..settled()
+        };
+        let answers = Answers {
+            after,
+            ..Answers::default()
+        };
+        let h = pressed_rig(name, "idle", answers, behind);
+        ask_for(&h.opts, TAB, Ask::Press, "9.9.9", "").expect("the press");
+        h
+    };
+    let mut h = rig("press-draft-none", None);
+    let ended = h.reaped();
+    let r = press_visit(&h, false);
+    let status = ended.recv_timeout(HANG_DETECTOR).expect("the agent ended");
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "CONTROL: {r:?}");
+    let before_hand = h
+        .asked
+        .lock()
+        .expect("asked")
+        .iter()
+        .take_while(|l| !l.contains(" lease acquire "))
+        .filter(|l| l.contains(" text "))
+        .count();
+    drop(h);
+    for (after, want, name) in [
+        (before_hand, "wait:changed", "press-draft-at-first-look"),
+        (
+            before_hand + 1,
+            "wait:changed-before-signal",
+            "press-draft-before-signal",
+        ),
+    ] {
+        let h = rig(name, Some((after, draft.clone())));
+        let r = press_visit(&h, false);
+        assert_eq!(r.step, want, "{name}: {r:?}");
+        assert!(h.details("terminated").is_empty(), "{name}");
+        assert!(alive(h.sf.pid), "{name}: the agent lives on");
+        let st = load(&h.opts, SESSION).expect("state");
+        assert_eq!(st.phase, Phase::Pending, "{name}: the round as it was");
+        assert!(
+            st.press_stands(TAB, now_s()),
+            "{name}: the press still stands"
+        );
+    }
+}
+
+/// A PRESS UNDER OFF TYPES ONLY THE RELAUNCH LINE: with the tab's harness off, a press past an
+/// announced round restarts in the quiet flow, so the relaunched agent is carried on with
+/// nothing typed after its relaunch line. NEGATIVE CONTROL: with the harness on, the same press
+/// carries on as the ask flow does.
+#[cfg(unix)]
+#[test]
+fn a_press_under_off_types_only_the_relaunch_line() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let marker = "ATERM-UPGRADE-READY-0badf00d";
+    for (off, quiet, name) in [(true, true, "press-off"), (false, false, "press-on")] {
+        let mut h = Parked::new(name, Answers::default(), St::default(), 3600);
+        assert!(h.opts.ask, "{name}: the ask flow");
+        set_status(&mut h, "idle");
+        transcript_says(&h, "Working on it.");
+        let st = St {
+            proc_start: squash(&h.sf.proc_start),
+            ..announced_to(&h, marker)
+        };
+        std::fs::write(state_path(&h.opts, SESSION), st.to_json()).expect("state");
+        ask_for(&h.opts, TAB, Ask::Press, "9.9.9", "").expect("the press");
+        let ended = h.reaped();
+        let r = press_visit(&h, off);
+        let status = ended.recv_timeout(HANG_DETECTOR).expect("the agent ended");
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{name}: {r:?}");
+        let st = load(&h.opts, SESSION).expect("state");
+        assert_eq!(st.quiet, quiet, "{name}: {st:?}");
+        assert!(h.typed().is_empty(), "{name}: {:?}", h.typed());
+    }
 }

@@ -10,7 +10,7 @@ use std::time::Duration;
 use super::discover::{Origin, Owned};
 use super::{
     CACHEDIR_SIGNATURE, MAX_WALK_ENTRIES, RUSTC_INFO, Removed, Witness, age_days,
-    cachedir_tag_signed, mtime_of,
+    cachedir_tag_signed,
 };
 #[cfg(not(windows))]
 use super::{walk_bytes, walk_bytes_until};
@@ -28,7 +28,8 @@ pub const INCREMENTAL: &str = "incremental";
 /// A profile's cache directories: the walk never enters them.
 pub const CACHE_DIRS: &[&str] = &[".fingerprint", "deps", "build", "incremental"];
 
-/// What dates a profile: the directories a compile writes, and `examples/`.
+/// What dates a legacy profile: the directories a compile writes, and `examples/`.
+/// Build-unit layouts also date each unit's output/fingerprint/run directories and invocation stamps.
 pub const CLOCK_DIRS: &[&str] = &[".fingerprint", "deps", "build", "examples"];
 
 /// A profile's directories cargo writes and rebuilds.
@@ -119,7 +120,7 @@ impl WalkBudget {
 pub struct Profile {
     /// Its path.
     pub path: PathBuf,
-    /// Last used: the newest mtime of its [`CLOCK_DIRS`].
+    /// Last used: its legacy directory clocks and bounded build-unit invocation/output clocks.
     pub last_used: Option<i64>,
     /// Does it hold a real (not linked) [`INCREMENTAL`] directory with anything in it? An empty one (a release profile's, a `CARGO_INCREMENTAL=0` build's) is nothing to reclaim.
     pub incremental: bool,
@@ -275,7 +276,7 @@ pub(super) fn target_witness(
     let marker = t.fences()?;
     if t.profiles.is_empty() {
         return Err(
-            "no cargo profile (a build lock beside deps/ or .fingerprint/) — cargo never built here"
+            "no recognized Cargo/Targo profile (a build lock beside deps/, .fingerprint/, or build/ with incremental/)"
                 .to_owned(),
         );
     }
@@ -755,10 +756,7 @@ fn holds_cache(dir: &Path) -> bool {
 }
 
 fn profile_clock(profile: &Path) -> Option<i64> {
-    CLOCK_DIRS
-        .iter()
-        .filter_map(|c| mtime_of(&profile.join(c)))
-        .max()
+    fd::clock(profile, WalkBudget::SHIPPED)
 }
 
 mod held {
@@ -1371,9 +1369,13 @@ mod fd {
     }
 
     fn has_layout(fd: &OwnedFd, names: &[OsString]) -> bool {
-        ["deps", ".fingerprint"].iter().any(|d| {
+        let holds_dir = |d: &str| {
             names.iter().any(|n| n == d) && matches!(open_dir(fd, OsStr::new(d)), Ok(Some(_)))
-        })
+        };
+        ["deps", ".fingerprint"].iter().any(|d| holds_dir(d))
+            // Targo's build-unit layout prepares these two directories instead
+            // of top-level deps/.fingerprint; the SAME profile locks guard it.
+            || (holds_dir("build") && holds_dir(INCREMENTAL))
     }
 
     struct Walker {
@@ -1540,22 +1542,143 @@ mod fd {
         matches!(open_dir(profile, OsStr::new(INCREMENTAL)), Ok(Some(inc)) if names(&inc).is_ok_and(|n| !n.is_empty()))
     }
 
-    fn clock_at(profile: &OwnedFd) -> Option<i64> {
-        let mtime = |fd: OwnedFd| {
-            std::fs::File::from(fd)
-                .metadata()
-                .ok()?
-                .modified()
-                .ok()?
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()
-                .and_then(|d| i64::try_from(d.as_secs()).ok())
+    fn modified(file: std::fs::File) -> Option<i64> {
+        file.metadata()
+            .ok()?
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_secs()).ok())
+    }
+
+    /// Read only the producer's bounded unit skeleton, never its artifact tree.
+    /// An unreadable/truncated clock is unknown, not evidence that a cache is old.
+    /// The same reader runs during the survey and again under all Cargo locks.
+    struct Clock {
+        budget: WalkBudget,
+        started: Instant,
+        entries: usize,
+        device: u64,
+        newest: Option<i64>,
+    }
+
+    impl Clock {
+        fn names(&mut self, fd: &OwnedFd) -> Option<Vec<OsString>> {
+            let names = names(fd).ok()?;
+            self.entries = self.entries.checked_add(names.len())?;
+            super::super::beat::tick(names.len());
+            (self.entries <= self.budget.entries && self.started.elapsed() < self.budget.wall)
+                .then_some(names)
+        }
+
+        fn directory(&mut self, parent: &OwnedFd, name: &OsStr) -> Option<Option<OwnedFd>> {
+            self.directory_entry(parent, name, false)
+        }
+
+        fn directory_entry(
+            &mut self,
+            parent: &OwnedFd,
+            name: &OsStr,
+            skip_plain_file: bool,
+        ) -> Option<Option<OwnedFd>> {
+            if self.started.elapsed() >= self.budget.wall {
+                return None;
+            }
+            let directory = match dirfd::openat(parent, name, dir_flags(), Mode::empty()) {
+                Ok(fd) => Some(fd),
+                Err(e) if e.0 == code::NOENT => None,
+                Err(e) if code::NOT_ENTERED.contains(&e.0) => {
+                    // Enumerated sibling files are not unit directories. A
+                    // fixed clock name must be a directory when present.
+                    if !skip_plain_file {
+                        return None;
+                    }
+                    open_file(parent, name)?;
+                    None
+                }
+                Err(_) => return None,
+            };
+            if let Some(fd) = directory.as_ref() {
+                if dev(fd).ok()? != self.device {
+                    return None;
+                }
+                // Reopen '.' to read metadata without consuming the pinned handle.
+                let meta = open_dir(fd, OsStr::new(".")).ok()??;
+                self.newest = self.newest.max(Some(modified(std::fs::File::from(meta))?));
+            }
+            Some(directory)
+        }
+
+        fn stamps(&mut self, directory: &OwnedFd) -> Option<()> {
+            for name in self.names(directory)? {
+                if self.started.elapsed() >= self.budget.wall {
+                    return None;
+                }
+                let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+                let fd = dirfd::openat(directory, &name, flags, Mode::empty()).ok()?;
+                if dev(&fd).ok()? != self.device {
+                    return None;
+                }
+                let file = std::fs::File::from(fd);
+                if !file.metadata().ok()?.is_file() {
+                    return None;
+                }
+                self.newest = self.newest.max(Some(modified(file)?));
+            }
+            Some(())
+        }
+    }
+
+    fn clock_at_bounded(profile: &OwnedFd, budget: WalkBudget) -> Option<i64> {
+        // profile/build/package/unit/fingerprint is the deepest directory.
+        if budget.depth < 4 {
+            return None;
+        }
+        let mut clock = Clock {
+            budget,
+            started: Instant::now(),
+            entries: 0,
+            device: dev(profile).ok()?,
+            newest: None,
         };
-        CLOCK_DIRS
-            .iter()
-            .filter_map(|c| open_dir(profile, OsStr::new(c)).ok().flatten())
-            .filter_map(mtime)
-            .max()
+        for name in CLOCK_DIRS {
+            clock.directory(profile, OsStr::new(name))?;
+        }
+        if let Some(build) = clock.directory(profile, OsStr::new("build"))? {
+            for name in clock.names(&build)? {
+                let Some(package) = clock.directory_entry(&build, &name, true)? else {
+                    continue;
+                };
+                for name in clock.names(&package)? {
+                    let Some(unit) = clock.directory_entry(&package, &name, true)? else {
+                        continue;
+                    };
+                    // Legacy build scripts use build/<package-hash>/out. A
+                    // new unit has fingerprint/out (and optionally run) at
+                    // build/<package>/<unit>/. Inspect only that skeleton.
+                    if let Some(fingerprint) = clock.directory(&unit, OsStr::new("fingerprint"))? {
+                        // invoked.timestamp dates START; existing hash/JSON
+                        // files are overwritten on successful completion, so
+                        // their mtimes matter even if the directory stayed old.
+                        clock.stamps(&fingerprint)?;
+                        clock.directory(&unit, OsStr::new("out"))?;
+                        if let Some(run) = clock.directory(&unit, OsStr::new("run"))? {
+                            clock.stamps(&run)?;
+                        }
+                    }
+                }
+            }
+        }
+        clock.newest
+    }
+
+    fn clock_at(profile: &OwnedFd) -> Option<i64> {
+        clock_at_bounded(profile, WalkBudget::SHIPPED)
+    }
+
+    pub(super) fn clock(profile: &Path, budget: WalkBudget) -> Option<i64> {
+        clock_at_bounded(&pin(profile).ok()?, budget)
     }
 
     #[derive(Default)]
@@ -2718,6 +2841,9 @@ pub(crate) use fd::{mark_cloned, mark_theirs, only_owners_pass};
 #[cfg(not(any(unix, windows)))]
 mod fd {
     use super::{Judge, Path, PathBuf, Removed, Select, Stage, WalkBudget, io};
+    pub(super) fn clock(_path: &Path, _budget: WalkBudget) -> Option<i64> {
+        None
+    }
     pub(super) fn find(_path: &Path, _budget: WalkBudget) -> (Vec<PathBuf>, Option<String>) {
         (
             Vec::new(),

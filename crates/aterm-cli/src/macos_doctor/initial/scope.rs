@@ -4,7 +4,8 @@
 //! Who gets the profile by itself (`docs/DESIGN-system-state-2026-10-21.md`
 //! §3.5, `docs/DESIGN-init-on-by-default-2026-10-25.md` §8.1). Every Mac syncs the
 //! base plan — aterm's own Permissions, the Secrets vault lane (discovery and the
-//! Sync rows ride it) and Spotlight for aterm's own folders. The rest of the profile
+//! Sync rows ride it) and Rust in Spotlight (this login's rustup docs and aterm's
+//! build caches kept out of Spotlight). The rest of the profile
 //! — the workstation preferences, Dock, Repositories and the Messages and FaceTime
 //! sign-outs — only on an ALab Mac, which is one whose login opened a locker in the
 //! ALab vault under this Mac's own freshly minted recipient key. Elsewhere the
@@ -14,7 +15,7 @@
 //! a saved plan.
 
 use super::*;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(any(test, debug_assertions))]
 mod watch_test;
@@ -38,10 +39,10 @@ pub(super) const LAN_OFF: &str = "Local Network is off for aterm";
 /// milliseconds on its own LAN, and a Mac elsewhere must not hold its first launch longer.
 const PROBE_WAIT: std::time::Duration = aterm_secrets::client::PROBE_DEADLINE;
 
-/// What the last probe of the ALab vault in this process heard.
+/// What a probe of the ALab vault heard, as aterm reads it on this network ([`heard_at`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum VaultHere {
-    /// No probe ran in this process.
+    /// No probe ran, or none that ran speaks for this network.
     Unasked,
     /// The ALab vault answered under the key built into aterm.
     Found,
@@ -73,31 +74,139 @@ impl VaultHere {
         }
     }
 
-    const fn code(self) -> u8 {
-        match self {
-            Self::Unasked => 0,
-            Self::Found => 1,
-            Self::Absent => 2,
-            Self::Unreached => 3,
-        }
-    }
-
-    const fn of(code: u8) -> Self {
-        match code {
-            1 => Self::Found,
-            2 => Self::Absent,
-            3 => Self::Unreached,
-            _ => Self::Unasked,
-        }
+    /// Whether it leaves the ALab vault off this network, as [`off_network`] reads a Secrets try:
+    /// a server there holds none, or nobody answered. The Repositories stage then runs on this
+    /// Mac's own GitHub credentials ([`vault_not_here`]).
+    pub(super) const fn not_here(self) -> bool {
+        matches!(self, Self::Absent | Self::Unreached)
     }
 }
 
-/// [`VaultHere`] of the last probe in this process.
-static LAST_PROBE: AtomicU8 = AtomicU8::new(0);
+/// What a probe of the ALab vault heard, and the network it heard it on, as a Secrets try keeps
+/// the network it ran on ([`secrets_retry::network`]; `None` where it could not be read).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Probe {
+    pub(super) here: VaultHere,
+    pub(super) on: Option<String>,
+}
 
-/// What the last probe of the ALab vault in this process heard.
-pub(super) fn vault_here() -> VaultHere {
-    VaultHere::of(LAST_PROBE.load(Ordering::Acquire))
+/// The last probe of the ALab vault in this process ([`probe_vault`], or Check again's
+/// [`look_again`]).
+static LAST_PROBE: std::sync::Mutex<Option<Probe>> = std::sync::Mutex::new(None);
+
+/// What aterm last heard at the ALab vault's address on the network `reads` reads now, for System
+/// State's vault row and the repositories beside it ([`heard_from`] this process's last probe).
+pub(super) fn heard_at(root: Option<&Path>, reads: &dyn secrets_retry::Reads) -> VaultHere {
+    let probe = LAST_PROBE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    heard_from(probe, root, reads)
+}
+
+/// [`heard_at`], with this process's last probe (`probe`): what it heard where it ran on the
+/// network `reads` reads now, or else what the last Secrets try of the run in force at `root` kept
+/// there ([`secrets_retry::last_rows`], read as [`off_network`] reads it). Each heard only its own
+/// network, by the one rule [`secrets_retry::on_network`]: a relaunch inside the Secrets retry
+/// pause asks nothing until the pause ends, so that launch has heard only what the record kept,
+/// and a run stopped on one network, which asks nothing again by itself, has heard nothing on
+/// another until Check again looks there ([`look_again`]), whether aterm reopened there or stayed
+/// open; nor has a record of another run.
+pub(super) fn heard_from(
+    probe: Option<Probe>,
+    root: Option<&Path>,
+    reads: &dyn secrets_retry::Reads,
+) -> VaultHere {
+    if let Some(probe) = probe
+        && secrets_retry::on_network(probe.on.as_deref(), reads)
+    {
+        return probe.here;
+    }
+    root.and_then(|root| secrets_retry::last_rows(root, revision_at(root).ok()?, reads))
+        .and_then(|rows| off_network(&rows))
+        .unwrap_or(VaultHere::Unasked)
+}
+
+/// The mark a worker holding a join password the person typed leaves beside its run's records:
+/// the run's revision and the aterm process that holds it ([`holding_join_password`]). Every
+/// aterm process sharing the state root reads it ([`join_typed`]); an older aterm reads none, and
+/// leaves none.
+pub(super) const JOIN_HELD: &str = "join-held.json";
+
+/// Keep whether the worker of run `revision` in `root` holds a join password the person typed
+/// (`held`): System State's Join sends one, which the worker keeps for the run's tries until one
+/// reaches the vault and spends it, each pass lending it to the Secrets stage or its lane and
+/// taking it back. A pass notes it as it begins and as it ends
+/// ([`execute_initial_for_revision`]) in a mark naming this process ([`JOIN_HELD`]); a worker
+/// holding none takes away its own run's mark only where it names this process, or one that no
+/// longer runs, since another aterm sharing the state root may hold a password for the same run
+/// and pass between this one's passes. The mark only steers a reading, so one that cannot be
+/// written leaves the row as for aterm's own join.
+pub(super) fn holding_join_password(root: &Path, revision: u64, held: bool) {
+    let own = i32::try_from(std::process::id()).ok();
+    let holder = held
+        .then_some(own)
+        .flatten()
+        .and_then(aterm_uds::process::read_identity);
+    let marked = join_held(root);
+    if let Some(holder) = holder {
+        if marked != Some((revision, holder.pid, holder.token())) {
+            let _ = keep_join_held(root, revision, &holder);
+        }
+    } else if let Some((marked, pid, holder)) = marked
+        && marked == revision
+        // A mark under this pid is this process's, or an ended one's that this pid was given.
+        && (own == Some(pid) || !still_runs(pid, &holder))
+    {
+        let _ = std::fs::remove_file(root.join(JOIN_HELD));
+    }
+}
+
+/// Mark run `revision` in `root` as holding a join password the person typed, in process
+/// `holder` ([`JOIN_HELD`]).
+pub(super) fn keep_join_held(
+    root: &Path,
+    revision: u64,
+    holder: &aterm_uds::process::Identity,
+) -> Result<(), String> {
+    write_json(
+        &root.join(JOIN_HELD),
+        &json!({"revision": revision, "pid": holder.pid, "holder": holder.token()}),
+    )
+}
+
+/// The run [`JOIN_HELD`] marks in `root`, and the process holding it: its pid and its
+/// [`aterm_uds::process::Identity::token`].
+fn join_held(root: &Path) -> Option<(u64, i32, String)> {
+    let bytes = std::fs::read(root.join(JOIN_HELD)).ok()?;
+    let mark: Value = aterm_json::from_slice(&bytes).ok()?;
+    Some((
+        mark["revision"].as_u64()?,
+        i32::try_from(mark["pid"].as_i64()?).ok()?,
+        mark["holder"].as_str()?.to_owned(),
+    ))
+}
+
+/// Whether the process a mark names still runs: the same pid, born when `holder` says, so a pid
+/// macOS gave a later process says nothing.
+fn still_runs(pid: i32, holder: &str) -> bool {
+    aterm_uds::process::read_identity(pid).is_some_and(|now| now.token() == holder)
+}
+
+/// Whether a join password the person typed is held for a try at the vault: the run whose worker
+/// held one in `root` as its last pass began or ended ([`JOIN_HELD`]) is the run in force there,
+/// has neither finished nor been stopped, and the aterm process that held it still runs, this one
+/// or another sharing the state root. Its worker ends on those same two readings
+/// ([`revision_at`], [`finished_at`]) and drops the password with it, a process that quit or
+/// crashed held none past its end, and a launch holds none until a Join sends one. A join typed in
+/// an older aterm leaves no mark, so it reads here as aterm's own, which carries no password and
+/// joins a vault only where one answers.
+pub(super) fn join_typed(root: &Path) -> bool {
+    join_held(root).is_some_and(|(revision, pid, holder)| {
+        revision_at(root).is_ok_and(|current| current == revision)
+            && finished_at(root).is_ok_and(|finished| !finished)
+            && still_runs(pid, &holder)
+    })
 }
 
 /// Ask the ALab vault's address once ([`aterm_secrets::client::probe_default`]).
@@ -120,7 +229,37 @@ pub(super) fn probe_vault() -> VaultHere {
         },
         probe_lan,
     );
-    LAST_PROBE.store(here.code(), Ordering::Release);
+    keep_probe(&LAST_PROBE, here, &secrets_retry::Live)
+}
+
+/// Check again's look at the ALab vault ([`super::probe_local_network_again`]): [`probe_lan`],
+/// which a kept answer never stands for, kept as this process's last probe as [`probe_vault`]'s
+/// is, so the vault row reads the newest look on this network ([`heard_at`]), a stopped run's
+/// too, which asks nothing again by itself.
+pub(super) fn look_again() {
+    look_again_with(&LAST_PROBE, probe_lan, &secrets_retry::Live);
+}
+
+/// [`look_again`]: what `look` heard, kept in `kept` on the network `reads` reads.
+pub(super) fn look_again_with(
+    kept: &std::sync::Mutex<Option<Probe>>,
+    look: impl FnOnce() -> VaultHere,
+    reads: &dyn secrets_retry::Reads,
+) -> VaultHere {
+    keep_probe(kept, look(), reads)
+}
+
+/// Keep `here`, what a look at the ALab vault heard, in `kept` with the network `reads` reads as
+/// the look ended, as a Secrets try keeps the network it ran on.
+fn keep_probe(
+    kept: &std::sync::Mutex<Option<Probe>>,
+    here: VaultHere,
+    reads: &dyn secrets_retry::Reads,
+) -> VaultHere {
+    let on = secrets_retry::network(reads);
+    *kept
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Probe { here, on });
     here
 }
 
@@ -146,10 +285,10 @@ fn look_place() -> Option<(std::path::PathBuf, Option<String>, u64)> {
     Some((home, aterm_secrets::heard::network_key(), now))
 }
 
-/// [`probe_vault`]'s look, keeping only what it heard of the LAN, and a definitive answer for
-/// the next look on this network ([`aterm_machines::init_secrets::keep_look`]): what the last
-/// probe of this process heard of the vault ([`vault_here`]) stays as it was. It is also Check
-/// again's look ([`super::probe_local_network_again`]), which a kept answer never stands for.
+/// [`probe_vault`]'s look, keeping what it heard of the LAN, and a definitive answer for the next
+/// look on this network ([`aterm_machines::init_secrets::keep_look`]); its caller keeps what it
+/// heard of the vault ([`LAST_PROBE`]). It is also Check again's look ([`look_again`]), which a
+/// kept answer never stands for.
 pub(super) fn probe_lan() -> VaultHere {
     use access::LanAnswer;
     use aterm_secrets::client::ProbeOutcome;
@@ -242,18 +381,16 @@ fn kept_if_found(kept: &AtomicBool, found: impl FnOnce() -> bool) -> bool {
 }
 
 /// The plan aterm admits by itself where nobody chose one: the whole profile on an
-/// ALab Mac; elsewhere the base plan every Mac syncs — aterm's own Permissions, the
-/// Secrets vault lane (the discovery look and the Sync rows ride it) and Spotlight
-/// for aterm's own folders. The workstation preferences, Dock, Repositories and the
-/// Messages and FaceTime sign-outs wait for the ALab signal ([`alab_mac`]); the base
-/// plan reaches every Mac so sync is on by default (§8.1).
+/// ALab Mac; elsewhere the base plan every Mac syncs
+/// ([`aterm_types::macos_setup::BASE_PLAN`]) — aterm's own Permissions, the Secrets
+/// vault lane (the discovery look and the Sync rows ride it) and Rust in Spotlight (this
+/// login's rustup docs and aterm's build caches kept out of Spotlight). The workstation
+/// preferences, Dock, Repositories and the Messages and FaceTime sign-outs wait for the
+/// ALab signal ([`alab_mac`]); the base plan reaches every Mac so sync is on by default
+/// (§8.1).
 fn scoped(mut plan: Plan, alab: bool) -> Plan {
     if !alab {
-        let mut selection = Selection::none();
-        selection.set(Setting::Permissions, true);
-        selection.set(Setting::Secrets, true);
-        selection.set(Setting::Spotlight, true);
-        plan.selection = selection;
+        plan.selection = aterm_types::macos_setup::BASE_PLAN;
     }
     plan
 }
@@ -1915,7 +2052,8 @@ mod tests {
             VaultHere::Absent,
             VaultHere::Unreached,
         ] {
-            assert_eq!(VaultHere::of(here.code()), here);
+            // Only what leaves the vault off this network has a note to say so.
+            assert_eq!(here.not_here(), here.note().is_some(), "{here:?}");
         }
     }
 

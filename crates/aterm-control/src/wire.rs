@@ -124,25 +124,13 @@ pub const fn resolve_wait_timeout_ms(requested: Option<u64>) -> u64 {
     }
 }
 
-/// Return `true` iff `ms <= WAIT_MAX_MS`.
-#[must_use]
-#[inline]
-pub const fn wait_within_bounds(ms: u64) -> bool {
-    ms <= WAIT_MAX_MS
-}
-
-/// Bound one park slice of a waiting verb by `poll_ms` (flooring `poll_ms` at `1`).
-#[must_use]
-#[inline]
-pub const fn hangup_slice_ms(remaining_ms: u64, poll_ms: u64) -> u64 {
-    let p = if poll_ms == 0 { 1 } else { poll_ms };
-    if remaining_ms < p { remaining_ms } else { p }
-}
-
-/// A wait verb's `<ms>`: a whole number of milliseconds, held at [`WAIT_MAX_MS`].
+/// A wait verb's `<ms>`: a whole number of milliseconds (ASCII digits only), held at [`WAIT_MAX_MS`].
 #[must_use]
 #[inline]
 pub fn wait_ms(token: &str) -> Option<u64> {
+    if token.is_empty() || !token.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     token.parse::<u64>().ok().map(clamp_wait_ms)
 }
 
@@ -195,16 +183,14 @@ mod tests {
     }
 
     #[test]
-    fn wait_and_hangup_const_helpers_invariants() {
+    fn wait_timeouts_default_and_clamp() {
         assert_eq!(clamp_wait_ms(1_000), 1_000);
         assert_eq!(clamp_wait_ms(u64::MAX), WAIT_MAX_MS);
         assert_eq!(resolve_wait_timeout_ms(None), WAIT_DEFAULT_MS);
         assert_eq!(resolve_wait_timeout_ms(Some(900_000)), WAIT_MAX_MS);
-        assert!(wait_within_bounds(WAIT_MAX_MS));
-        assert!(!wait_within_bounds(WAIT_MAX_MS + 1));
-        assert_eq!(hangup_slice_ms(50, 200), 50);
-        assert_eq!(hangup_slice_ms(500, 200), 200);
-        assert_eq!(hangup_slice_ms(500, 0), 1);
+        assert_eq!(wait_ms("0"), Some(0));
+        assert_eq!(wait_ms("+5"), None);
+        assert_eq!(wait_ms(""), None);
     }
 
     /// `push_visible` collapses first and trims second, under each rule, and

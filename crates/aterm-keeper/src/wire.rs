@@ -130,6 +130,8 @@ pub enum WireError {
     Oversize(Kind),
     /// The FD flag disagrees with the kind.
     FdFlag(Kind),
+    /// A HELLO class byte this build does not know.
+    UnknownClass(u8),
 }
 
 impl std::fmt::Display for WireError {
@@ -141,6 +143,7 @@ impl std::fmt::Display for WireError {
             WireError::Short(k) => write!(f, "{k:?} body too short"),
             WireError::Oversize(k) => write!(f, "{k:?} carries an oversize part"),
             WireError::FdFlag(k) => write!(f, "{k:?} descriptor flag disagrees with its kind"),
+            WireError::UnknownClass(c) => write!(f, "unknown peer class {c}"),
         }
     }
 }
@@ -508,7 +511,7 @@ impl Frame {
 
     /// Decode the body of a frame whose header was `header`.
     /// # Errors
-    /// `Short` for a truncated body, `Oversize` for a part over its bound.
+    /// `Short` for a truncated body, `Oversize` for a part over its bound, `UnknownClass` for an unknown HELLO class byte.
     pub fn decode(header: &Header, body: &[u8]) -> Result<Frame, WireError> {
         let kind = header.kind;
         let mut r = Reader {
@@ -522,7 +525,8 @@ impl Frame {
                 let class_byte = r.u8()?;
                 let caps = r.u8()?;
                 let build = r.short_str(MAX_LABEL)?;
-                let class = PeerClass::from_byte(class_byte).ok_or(WireError::Short(kind))?;
+                let class =
+                    PeerClass::from_byte(class_byte).ok_or(WireError::UnknownClass(class_byte))?;
                 let marker = if r.at < body.len() {
                     Some(MarkerRef {
                         nanos: r.u64()?,
@@ -1048,6 +1052,6 @@ mod tests {
             flags: 0,
             len: body.len(),
         };
-        assert!(Frame::decode(&h, &body).is_err());
+        assert_eq!(Frame::decode(&h, &body), Err(WireError::UnknownClass(9)));
     }
 }

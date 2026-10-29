@@ -73,10 +73,18 @@ pub fn add(mut r: Roster, id: &str, pubkey_b64: &str, now_unix: u64) -> Result<R
         added_at: aterm_types::rfc3339::format_rfc3339(now_unix),
         not_after: None,
     });
-    Ok(bump(r))
+    bump(r)
 }
 
 /// Remove a machine from `[[machine]]`, record it in `revoked`, and advance `roster_seq`.
+///
+/// Revoking an `id` already present in `revoked` succeeds with `machines` and `revoked`
+/// unchanged while still advancing `roster_seq` and restamping `valid_until`.
+///
+/// # Errors
+///
+/// Returns `Err` if `id` appears in neither `machines` nor `revoked`, or if `roster_seq` is
+/// already `u64::MAX`.
 pub fn revoke(mut r: Roster, id: &str, _now_unix: u64) -> Result<Roster, String> {
     if !r.machines.iter().any(|m| m.id == id) && !r.is_revoked(id) {
         let mut s = String::from("machine id '");
@@ -88,13 +96,16 @@ pub fn revoke(mut r: Roster, id: &str, _now_unix: u64) -> Result<Roster, String>
     if !r.is_revoked(id) {
         r.revoked.push(id.to_string());
     }
-    Ok(bump(r))
+    bump(r)
 }
 
-fn bump(mut r: Roster) -> Roster {
-    r.roster_seq += 1;
+fn bump(mut r: Roster) -> Result<Roster, String> {
+    r.roster_seq = r
+        .roster_seq
+        .checked_add(1)
+        .ok_or_else(|| "roster sequence has reached u64::MAX".to_string())?;
     r.valid_until = VALID_UNTIL_FOREVER.to_string();
-    r
+    Ok(r)
 }
 
 #[cfg(test)]
@@ -214,5 +225,20 @@ mod tests {
             Ok(()),
             "keys last forever: the replay window against floor-less clients never lapses"
         );
+    }
+
+    #[test]
+    fn sequence_ceiling_refuses_overflow() {
+        let max_seq = Roster {
+            roster_seq: u64::MAX,
+            ..empty(NOW)
+        };
+        let err = add(max_seq, "m3", M3_KEY, NOW).unwrap_err();
+        assert!(err.contains("u64::MAX"), "{err}");
+
+        let mut known = add(empty(NOW), "m3", M3_KEY, NOW).unwrap();
+        known.roster_seq = u64::MAX;
+        let err = revoke(known, "m3", NOW).unwrap_err();
+        assert!(err.contains("u64::MAX"), "{err}");
     }
 }

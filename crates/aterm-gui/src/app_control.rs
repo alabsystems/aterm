@@ -785,6 +785,64 @@ fn semantic_tree_lines(compiled: &CompiledUi) -> Vec<String> {
     lines
 }
 
+/// A grid view's inspection: its size, the rows it draws, its current cell, and its open cell
+/// editor. Rows and columns count from 1, the header being row 1, as the gutter numbers them.
+fn grid_inspection_lines(
+    lines: &mut Vec<String>,
+    key: &str,
+    grid: &crate::native_editor::GridProjection,
+) {
+    lines.push(format!(
+        "grid key={key:?} records={} columns={} delimiter={:?} shown={} pinned={} data_rows={} panel_lines={} problem_line={}",
+        grid.records,
+        grid.columns,
+        grid.delimiter.char(),
+        grid.shown
+            .iter()
+            .map(|shown| (shown.index + 1).to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        u8::from(grid.pinned),
+        grid.rows_layout.data,
+        grid.rows_layout.panel,
+        grid.problem_line
+            .map_or_else(|| "none".to_string(), |line| line.to_string()),
+    ));
+    for row in std::iter::once(&grid.header).chain(&grid.rows) {
+        let cells = row
+            .cells
+            .iter()
+            .map(|cell| {
+                if cell.missing {
+                    "∅".to_string()
+                } else {
+                    cell.text.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        lines.push(format!(
+            "grid-row key={key:?} row={} cells={cells:?}",
+            row.record + 1
+        ));
+    }
+    let cursor = &grid.cursor;
+    lines.push(format!(
+        "grid-cell key={key:?} row={} col={} line={} quoted={} missing={} value={:?}",
+        cursor.record + 1,
+        cursor.column + 1,
+        cursor.line,
+        cursor.quoted,
+        cursor.missing,
+        cursor.value,
+    ));
+    if let Some(draft) = grid.draft.as_ref() {
+        lines.push(format!(
+            "grid-draft key={key:?} caret={} value={:?}",
+            draft.caret, draft.text
+        ));
+    }
+}
+
 fn editor_viewport_inspection_lines(compiled: &CompiledUi) -> Vec<String> {
     let mut lines = Vec::new();
     for paint in &compiled.paint {
@@ -803,9 +861,10 @@ fn editor_viewport_inspection_lines(compiled: &CompiledUi) -> Vec<String> {
         let minibuffer = spec.minibuffer.as_deref();
         let painted_status = minibuffer.unwrap_or(spec.status.as_deref().unwrap_or("Ready"));
         let footer = painted_status;
-        let modeline = format!("EDIT · {} · {cursor} | EMACS · {footer}", spec.label);
+        let mode = if spec.grid.is_some() { "GRID" } else { "EDIT" };
+        let modeline = format!("{mode} · {} · {cursor} | EMACS · {footer}", spec.label);
         lines.push(format!(
-            "editor-view key={:?} mode=EDIT keymap=EMACS document={:?} dirty={} saving={} focused={} cursor={cursor:?}",
+            "editor-view key={:?} mode={mode} keymap=EMACS document={:?} dirty={} saving={} focused={} cursor={cursor:?}",
             paint.key.as_str(),
             spec.document_key,
             spec.dirty,
@@ -831,6 +890,10 @@ fn editor_viewport_inspection_lines(compiled: &CompiledUi) -> Vec<String> {
             minibuffer.is_some(),
             minibuffer.unwrap_or("Inactive"),
         ));
+        if let Some(grid) = spec.grid.as_ref() {
+            grid_inspection_lines(&mut lines, paint.key.as_str(), grid);
+            continue;
+        }
         let Some(projection) = spec.projection.as_ref() else {
             lines.push(format!(
                 "editor-rows key={:?} visible=0 total=unknown",
@@ -1347,6 +1410,7 @@ mod tests {
                             ],
                         }],
                     }),
+                    grid: None,
                     preedit: String::new(),
                     preedit_caret: None,
                     status: Some("Unknown config key…".to_string()),

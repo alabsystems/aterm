@@ -10,7 +10,7 @@ use aterm_spec::derive::Model;
 type Domain = (&'static str, fn() -> Model);
 
 /// One model of each domain crate.
-const DOMAINS: [Domain; 15] = [
+const DOMAINS: [Domain; 16] = [
     ("aterm-models-agh", aterm_models_agh::agh_route_wall_model),
     ("aterm-models-db", aterm_models_db::offline_rights_model),
     (
@@ -58,6 +58,10 @@ const DOMAINS: [Domain; 15] = [
         aterm_models_session::broadcast_cursor_checkpoint_model,
     ),
     ("aterm-models-setup", aterm_models_setup::setup_ledger_model),
+    (
+        "aterm-models-swarm",
+        aterm_models_swarm::ledger_publish_model,
+    ),
     (
         "aterm-models-update",
         aterm_models_update::native_update_handoff_bind_retry_model,

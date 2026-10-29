@@ -251,7 +251,7 @@ impl Class {
             }) => Self::AppleOnly,
             Some(Shape::Plain { .. }) => Self::Plain,
             Some(Shape::Bundle(_)) => Self::Bundle,
-            Some(Shape::Package(_)) => Self::Vendor,
+            Some(Shape::Package(_) | Shape::Bottle(_)) => Self::Vendor,
             None => Self::Unknown,
         }
     }
@@ -528,12 +528,24 @@ impl Run<'_> {
             std::process::id(),
             if opts.dry_run { " (DRY_RUN)" } else { "" }
         ));
-        if !opts.dry_run && !std::fs::metadata(&ctx.tokens.staging).is_ok_and(|m| m.len() > 0) {
-            return Err(Error::cannot_run(format!(
-                "staging token file missing/empty: {} — the lane reads the private staging \
-                 repos as that identity, never anonymously",
-                ctx.shown(&ctx.tokens.staging)
-            )));
+        if !opts.dry_run {
+            match ctx.usable_token(&ctx.tokens.staging) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(Error::cannot_run(format!(
+                        "staging token file missing/empty: {} — the lane reads the private staging \
+                         repos as that identity, never anonymously",
+                        ctx.shown(&ctx.tokens.staging)
+                    )));
+                }
+                Err(why) => {
+                    return Err(Error::cannot_run(format!(
+                        "staging token file invalid/unreadable: {} ({why}) — the lane reads the \
+                         private staging repos as that identity, never anonymously",
+                        ctx.shown(&ctx.tokens.staging)
+                    )));
+                }
+            }
         }
         let mut can = Vec::new();
         let mut cannot: Vec<(Triple, String)> = Vec::new();
@@ -790,19 +802,34 @@ impl Run<'_> {
         };
         let publish = have_key && (!ready.is_empty() || !signed_earlier.is_empty());
         if publish {
-            let token = std::fs::metadata(&ctx.tokens.channel).is_ok_and(|m| m.len() > 0);
-            if !token {
-                ready_md.refusal = Some(format!(
-                    "the channel token at {} is missing or empty, and the public uploads need \
-                     it.\nPut it there, then run the ceremony below.",
-                    ctx.shown(&ctx.tokens.channel)
-                ));
-                ready_md.write(Phase::Staged)?;
-                return Err(Error::refused(format!(
-                    "channel token file missing/empty: {} (the public uploads need it) — nothing \
-                     signed; ceremony: {ceremony}",
-                    ctx.shown(&ctx.tokens.channel),
-                )));
+            match ctx.usable_token(&ctx.tokens.channel) {
+                Ok(true) => {}
+                Ok(false) => {
+                    ready_md.refusal = Some(format!(
+                        "the channel token at {} is missing or empty, and the public uploads need \
+                         it.\nPut it there, then run the ceremony below.",
+                        ctx.shown(&ctx.tokens.channel)
+                    ));
+                    ready_md.write(Phase::Staged)?;
+                    return Err(Error::refused(format!(
+                        "channel token file missing/empty: {} (the public uploads need it) — nothing \
+                         signed; ceremony: {ceremony}",
+                        ctx.shown(&ctx.tokens.channel),
+                    )));
+                }
+                Err(why) => {
+                    ready_md.refusal = Some(format!(
+                        "the channel token at {} cannot be used ({why}), and the public uploads \
+                         need it.\nFix it, then run the ceremony below.",
+                        ctx.shown(&ctx.tokens.channel)
+                    ));
+                    ready_md.write(Phase::Staged)?;
+                    return Err(Error::refused(format!(
+                        "channel token file invalid/unreadable: {} ({why}) — nothing signed; \
+                         ceremony: {ceremony}",
+                        ctx.shown(&ctx.tokens.channel),
+                    )));
+                }
             }
             let key = match crate::identity::signer_for(ctx, &head.roster) {
                 Ok(signer) => signer.key,

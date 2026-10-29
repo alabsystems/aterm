@@ -26,13 +26,80 @@ pub(crate) fn proof(identity: &Identity, request: &Request, seed: &[u8; 32]) -> 
         .verify(&request.answer(identity, seed, &challenge).unwrap())
         .unwrap()
 }
+/// `[n + base; N]` for the fixture's n-th device below 200; past that, `[base, n, 1, ..]`
+/// (no bit X25519 clamps): distinct, never zero and never the authority's seed, for up to 256.
+fn fill<const N: usize>(n: usize, base: u8) -> [u8; N] {
+    if n < 200 {
+        return [n as u8 + base; N];
+    }
+    let mut out = [base; N];
+    out[1] = n as u8;
+    out[2] = 1;
+    out
+}
+/// A ledger whose 8-day watch heard nobody: the C26 gate is open.
+pub(crate) fn open_ledger(journal: &Journal) -> super::super::hearing::Ledger {
+    let now = aterm_time::unix_millis().unwrap();
+    super::super::hearing::Ledger::watched(journal.trust(), now - 8 * 86_400_000, now)
+}
+pub(crate) fn rotate_open(
+    journal: &Journal,
+    eligibility: &Eligibility,
+    grants: Vec<Grant>,
+) -> Result<Node> {
+    let ledger = open_ledger(journal);
+    rotate_gated(
+        &ROOT,
+        eligibility,
+        journal,
+        grants,
+        &[],
+        &[],
+        Some(&Gate {
+            ledger: &ledger,
+            now_ms: aterm_time::unix_millis().unwrap(),
+        }),
+    )
+}
 impl Fixture {
+    /// `count` members: founded with up to 63, the rest enrolled through an open gate.
     fn new(count: usize) -> Self {
-        Self::enrolled(count, count)
+        let mut fixture = Self::enrolled(count, count.min(LEGACY_MAX_MEMBERS));
+        if count > LEGACY_MAX_MEMBERS {
+            let grants = fixture.certified(count);
+            let node = rotate_open(&fixture.journal, &fixture.eligibility, grants).unwrap();
+            fixture.journal.ingest(node.bytes()).unwrap();
+        }
+        fixture
+    }
+    /// Grants for the first `count` devices: recorded where a binding is retained, otherwise
+    /// approved now.
+    fn certified(&self, count: usize) -> Vec<Grant> {
+        let constraints = self.journal.constraints().unwrap();
+        self.grants(count)
+            .into_iter()
+            .zip(&self.requests)
+            .enumerate()
+            .map(|(n, (grant, request))| {
+                if constraints.check_recorded_device(request.binding()).is_ok() {
+                    return grant;
+                }
+                let host = format!("m{}", n + 1);
+                let approved = super::super::membership::approve(
+                    &ROOT,
+                    &self.journal,
+                    &self.eligibility,
+                    &host,
+                    proof(&self.identities[n], request, &fill(n, 31)),
+                )
+                .unwrap();
+                Grant::certified(host, approved, Role::Reader)
+            })
+            .collect()
     }
     pub(crate) fn enrolled(count: usize, enrolled: usize) -> Self {
         let identities: Vec<_> = (0..count)
-            .map(|n| Identity::from_secret_bytes([n as u8 + 19; 32]))
+            .map(|n| Identity::from_secret_bytes(fill(n, 19)))
             .collect();
         let mut doc = Document::new_vault("m1", &identities[0].recipient().to_bech32());
         for (i, identity) in identities.iter().enumerate().skip(1) {
@@ -53,10 +120,10 @@ impl Fixture {
                 Request::create(
                     NETWORK,
                     authority(&ROOT).unwrap(),
-                    [n as u8 + 41; 16],
-                    [n as u8 + 47; 16],
+                    fill(n, 41),
+                    fill(n, 47),
                     identity,
-                    &[n as u8 + 31; 32],
+                    &fill(n, 31),
                 )
                 .unwrap()
             })
@@ -69,7 +136,7 @@ impl Fixture {
             .map(|(n, (identity, request))| {
                 Enrollment::new(
                     format!("m{}", n + 1),
-                    proof(identity, request, &[n as u8 + 31; 32]),
+                    proof(identity, request, &fill(n, 31)),
                     if n == 0 { Role::Writer } else { Role::Reader },
                 )
             })
@@ -781,6 +848,14 @@ fn member_and_epoch_bounds_refuse_growth_without_changing_the_current_journal() 
         })
         .collect();
     assert!(create(&ROOT, &fixture.eligibility, NETWORK, too_many).is_err());
+    let State::Ready { basis, .. } = fixture.journal.state() else {
+        panic!("a ready journal")
+    };
+    let full = fixture.journal.node(&basis).unwrap().bytes().len();
+    assert!(
+        full <= MAX_ROSTER_NODE && MAX_ROSTER_NODE <= MAX_NODE,
+        "{full}"
+    );
     let retired = fixture.requests.last().unwrap().binding().actor();
     let atomic = rotate_retiring(
         &ROOT,
@@ -822,6 +897,134 @@ fn member_and_epoch_bounds_refuse_growth_without_changing_the_current_journal() 
         .is_err()
     );
     assert_eq!(fixture.journal.state(), before);
+}
+
+#[test]
+fn one_recipient_capsule_is_measured() {
+    let fixture = Fixture::new(2);
+    let sealed = age::encrypt(&[fixture.identities[0].recipient()], &[7; CAPSULE_PLAIN]).unwrap();
+    assert_eq!(sealed.len(), MAX_CAPSULE);
+    let mut roster = decode(fixture.payload().as_slice()).unwrap();
+    assert!(roster.capsules.iter().all(|c| c.wire.len() == MAX_CAPSULE));
+    // Negative control: a capsule one byte past the measured size is refused.
+    roster.capsules[0].wire.push(0);
+    assert!(decode(encode(&roster).as_slice()).is_err());
+}
+
+#[test]
+fn a_128_member_roster_round_trips() {
+    let fixture = Fixture::new(128);
+    let first = current(&fixture.journal, &fixture.identities[0])
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.members().len(), 128);
+    let shared = key(&first, &fixture.journal);
+    for (identity, request) in fixture.identities.iter().zip(&fixture.requests) {
+        let access = current(&fixture.journal, identity).unwrap().unwrap();
+        assert_eq!(access.local().binding(), request.binding());
+        assert_eq!(access.members(), first.members());
+        assert_eq!(key(&access, &fixture.journal), shared);
+    }
+    let State::Ready { basis, .. } = fixture.journal.state() else {
+        panic!("a ready journal")
+    };
+    let node = fixture.journal.node(&basis).unwrap();
+    assert_eq!(node.facts().len(), 129);
+    assert!(node.bytes().len() <= MAX_NODE);
+    let payload = node.open(&fixture.identities[127]).unwrap();
+    assert_eq!(
+        encode(&decode(payload.as_slice()).unwrap()).as_slice(),
+        payload.as_slice()
+    );
+    // Negative control: 0.145's fact bound refuses the node that carries it.
+    assert!(
+        Node::verify_within(
+            node.bytes(),
+            NETWORK,
+            authority(&ROOT).unwrap(),
+            LEGACY_MAX_FACTS
+        )
+        .is_err()
+    );
+}
+
+fn gated(
+    fixture: &Fixture,
+    count: usize,
+    ledger: Option<&super::super::hearing::Ledger>,
+) -> Result<Node> {
+    let now_ms = aterm_time::unix_millis().unwrap();
+    let gate = ledger.map(|ledger| Gate { ledger, now_ms });
+    rotate_gated(
+        &ROOT,
+        &fixture.eligibility,
+        &fixture.journal,
+        fixture.certified(count),
+        &[],
+        &[],
+        gate.as_ref(),
+    )
+}
+
+#[test]
+fn the_gate_holds_the_first_roster_past_63_while_a_recent_member_runs_0_145() {
+    use super::super::hearing::{LIFTED, Ledger, Said, Version};
+    const DAY: u64 = 86_400_000;
+    let mut fixture = Fixture::enrolled(LEGACY_MAX_MEMBERS + 1, LEGACY_MAX_MEMBERS);
+    let now = aterm_time::unix_millis().unwrap();
+    let trust = fixture.journal.trust();
+    let older = fixture.requests[1].binding().actor();
+    let mut ledger = Ledger::watched(trust, now - 8 * DAY, now);
+    ledger.record(older, now - DAY, Said::Version(Version(0, 145, 0)));
+    // Held while m2, heard a day ago, runs 0.145; and an ungated write past the caps.
+    assert!(gated(&fixture, LEGACY_MAX_MEMBERS + 1, Some(&ledger)).is_err());
+    assert!(gated(&fixture, LEGACY_MAX_MEMBERS + 1, None).is_err());
+    // A roster within the caps needs no gate.
+    assert!(gated(&fixture, LEGACY_MAX_MEMBERS, None).is_ok());
+    // Opens once m2 reports 0.146, or past m2 once it was last heard 7 days ago.
+    let mut updated = ledger.clone();
+    updated.record(older, now, Said::Version(LIFTED));
+    assert!(gated(&fixture, LEGACY_MAX_MEMBERS + 1, Some(&updated)).is_ok());
+    let mut gone = Ledger::watched(trust, now - 40 * DAY, now);
+    gone.record(older, now - 8 * DAY, Said::Version(Version(0, 145, 0)));
+    let node = gated(&fixture, LEGACY_MAX_MEMBERS + 1, Some(&gone)).unwrap();
+    assert_eq!(node.facts().len(), LEGACY_MAX_FACTS + 1);
+    fixture.journal.ingest(node.bytes()).unwrap();
+    assert_eq!(
+        current(&fixture.journal, &fixture.identities[63])
+            .unwrap()
+            .unwrap()
+            .members()
+            .len(),
+        LEGACY_MAX_MEMBERS + 1
+    );
+    // Every 0.145 device stopped at that node, so later writes past the caps need no gate.
+    assert!(gated(&fixture, LEGACY_MAX_MEMBERS + 1, None).is_ok());
+    assert!(gated(&fixture, LEGACY_MAX_MEMBERS + 1, Some(&ledger)).is_ok());
+}
+
+#[test]
+fn a_0_145_verifier_refuses_the_first_roster_past_63() {
+    let fixture = Fixture::enrolled(LEGACY_MAX_MEMBERS + 1, LEGACY_MAX_MEMBERS);
+    let root = authority(&ROOT).unwrap();
+    let within = gated(&fixture, LEGACY_MAX_MEMBERS, None).unwrap();
+    assert_eq!(within.facts().len(), LEGACY_MAX_FACTS);
+    assert!(Node::verify_within(within.bytes(), NETWORK, root, LEGACY_MAX_FACTS).is_ok());
+    let ledger = open_ledger(&fixture.journal);
+    let past = gated(&fixture, LEGACY_MAX_MEMBERS + 1, Some(&ledger)).unwrap();
+    assert!(Node::verify(past.bytes(), NETWORK, root).is_ok());
+    // The negative control the gate exists for: 0.145 refuses this node outright, so every
+    // device still on it would stop here.
+    let refused = Node::verify_within(past.bytes(), NETWORK, root, LEGACY_MAX_FACTS).unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("too many control restrictions")
+    );
+    // And its roster decoder, bounded at 63 members, could not read the payload either.
+    let payload = past.open(&fixture.identities[0]).unwrap();
+    let count = u16::from_le_bytes(payload.as_slice()[HEADER - 2..HEADER].try_into().unwrap());
+    assert!(usize::from(count) > LEGACY_MAX_MEMBERS);
 }
 
 fn exposed(fixture: &Fixture, identity: &Identity) -> bool {

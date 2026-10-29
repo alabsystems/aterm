@@ -740,6 +740,9 @@ fn root_runs_no_program_another_account_can_change() {
 fn under_root_an_install_folder_with_an_acl_is_refused() {
     let scratch = Scratch::new();
     let mut lib = Lib::new();
+    // Each row's entry goes as its own call ends: a run killed mid-way (a guard's kill, a
+    // timeout) leaves the folder no `deny delete` beyond the one call it was killed in, which
+    // would refuse every plain remover of the scratch.
     lib.step(format!(
         "{FOREIGN_FIND}\n{FAKE_ROOT}\nFOREIGN_LIST=\"$TMPDIR/foreign\"; : >\"$FOREIGN_LIST\"\n\
          D=\"$TMPDIR/d\"; mkdir \"$D\" && chmod 755 \"$D\" && ln -s d \"$TMPDIR/dest-link\"\n\
@@ -749,6 +752,7 @@ fn under_root_an_install_folder_with_an_acl_is_refused() {
          \tfor p in \"$D\" \"$TMPDIR/dest-link\"; do\n\
          \t\tif root_dest_acl_open \"$p\"; then echo refused; else echo installs; fi\n\
          \tdone\n\
+         \tchmod -N \"$D\"\n\
          }}"
     ));
     let rows = [
@@ -774,7 +778,7 @@ fn under_root_an_install_folder_with_an_acl_is_refused() {
          chmod +a 'group:everyone allow add_subdirectory' \"$D\" && ! root_dest_acl_open \"$D\" )",
         &[],
     );
-    // A deny-delete entry left on the folder would keep it when the scratch goes.
+    // The folder ends with no ACL at all, the account run's allow entry gone too.
     let cleared = lib.call("chmod -N \"$D\"", &[]);
     let recs = lib.run(&scratch);
     assert_eq!(recs[cleared].rc, 0, "chmod -N: {}", recs[cleared].err);
@@ -794,27 +798,87 @@ fn under_root_an_install_folder_with_an_acl_is_refused() {
 }
 
 /// A scratch whose folder carries an ACL that denies its removal goes all the same once it
-/// drops, so no test, failed or not, leaves a folder behind in
-/// [`crate::support::scratch_root`]. NEGATIVE CONTROL: take the ACLs' removal out of Scratch's
-/// drop, and the scratch stays.
+/// drops, so no passing test leaves a folder behind in [`crate::support::scratch_root`], and a
+/// failed one's, which Scratch keeps, goes with the folder that holds it. The ACLs go from what
+/// the scratch holds alone: a file outside it that a link in it leads to keeps its own.
+/// NEGATIVE CONTROL: take the ACLs' removal out of Scratch's drop, and the scratch stays; take
+/// them off with `chmod -R -N`, and the file outside loses its ACL through the link.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_scratch_whose_folder_denies_its_removal_is_removed_all_the_same() {
+    const DENY: &str = "group:everyone deny delete";
+    let acl = |path: &std::path::Path| {
+        let added = aterm_uds::spawnfd::command("/bin/chmod")
+            .args(["+a", DENY])
+            .arg(path)
+            .status()
+            .expect("chmod +a");
+        assert!(added.success(), "chmod +a: {added}");
+    };
+    let listed = |path: &std::path::Path| {
+        let out = aterm_uds::spawnfd::command("/bin/ls")
+            .arg("-led")
+            .arg(path)
+            .output()
+            .expect("ls -led");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let outside = Scratch::new();
+    let theirs = outside.write("theirs", "a file outside the scratch\n");
+    acl(&theirs);
     let scratch = Scratch::new();
     let root = scratch.path().to_path_buf();
     let d = scratch.mkdir("d");
-    let added = aterm_uds::spawnfd::command("/bin/chmod")
-        .args(["+a", "group:everyone deny delete"])
-        .arg(&d)
-        .status()
-        .expect("chmod +a");
-    assert!(added.success(), "chmod +a: {added}");
+    acl(&d);
+    crate::support::symlink(&theirs, &d.join("link"));
     assert!(
         std::fs::remove_dir(&d).is_err(),
         "the entry denies the folder's removal"
     );
     drop(scratch);
     assert!(!root.exists(), "{} stayed", root.display());
+    let kept = listed(&theirs);
+    assert!(
+        kept.contains(DENY.trim_start_matches("group:")),
+        "the file a link in the scratch led to lost its ACL: {kept}"
+    );
+}
+
+/// A scratch dropped while its test fails is kept, programs and all: the run may have been cut
+/// off while macOS still checked a program's first start in it, and removing that file then can
+/// stall every program start on the Mac (install.sh's `showed_it_ran`). NEGATIVE CONTROL: a
+/// scratch dropped while no test fails goes, its program with it.
+#[test]
+fn a_failing_tests_scratch_keeps_its_programs() {
+    let mut laid = None;
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let scratch = Scratch::new();
+        laid = Some((
+            scratch.path().to_path_buf(),
+            scratch.program("p/aterm", "#!/bin/sh\nexit 0\n"),
+        ));
+        panic!("the test fails with its scratch in hand");
+    }));
+    assert!(failed.is_err(), "the test failed");
+    let (root, program) = laid.expect("laid");
+    assert!(
+        program.is_file(),
+        "{} went with its failing test",
+        program.display()
+    );
+    // Never run, so nothing checks its first start: the test removes what it kept.
+    std::fs::remove_dir_all(&root).expect("the kept scratch removed");
+    let scratch = Scratch::new();
+    let (root, program) = (
+        scratch.path().to_path_buf(),
+        scratch.program("p/aterm", "#!/bin/sh\nexit 0\n"),
+    );
+    drop(scratch);
+    assert!(
+        !program.exists() && !root.exists(),
+        "{} stayed",
+        root.display()
+    );
 }
 
 /// A dry run makes nothing, so under root it judges an install folder still to
@@ -1288,9 +1352,9 @@ ls_entry() {
 /// What a root source build reads, all root's: a checkout with a build in
 /// target/, a `.cargo/config.toml` above it, cargo's home, a developer folder
 /// with its SDK (DEVELOPER_DIR), and a store whose targo writes the PATH it ran
-/// on to `$TMPDIR/build-path`, the git config variables it was given to
-/// `$TMPDIR/build-git`, and the developer folder, SDK and toolchain xcrun would
-/// take to `$TMPDIR/build-dev`.
+/// on to `build-path` in the folder `mk` made (`$W`), the git config variables
+/// it was given to `$W/build-git`, and the developer folder, SDK and toolchain
+/// xcrun would take to `$W/build-dev`, so no two folders' builds share a file.
 const ROOT_LAYOUT: &str = r#"umask 022
 mk() {
 	W="$TMPDIR/$1"
@@ -1302,8 +1366,8 @@ mk() {
 	printf 'fn main() {}\n' >"$W/co/src/main.rs"
 	: >"$W/co/target/release/deps/libx.rlib"
 	printf '[build]\n' >"$W/.cargo/config.toml"
-	printf '#!/bin/sh\necho "$PATH" >"$TMPDIR/build-path"\necho "${GIT_CONFIG_GLOBAL-unset} ${GIT_CONFIG_NOSYSTEM-unset}" >"$TMPDIR/build-git"\necho "${DEVELOPER_DIR-unset} ${SDKROOT-unset} ${TOOLCHAINS-unset}" >"$TMPDIR/build-dev"\n' \
-		>"$W/store/trust/1/bin/targo"
+	printf '#!/bin/sh\necho "$PATH" >"%s/build-path"\necho "${GIT_CONFIG_GLOBAL-unset} ${GIT_CONFIG_NOSYSTEM-unset}" >"%s/build-git"\necho "${DEVELOPER_DIR-unset} ${SDKROOT-unset} ${TOOLCHAINS-unset}" >"%s/build-dev"\n' \
+		"$W" "$W" "$W" >"$W/store/trust/1/bin/targo"
 	printf '#!/bin/sh\n' >"$W/their-bin/sccache"
 	cp "$W/their-bin/sccache" "$W/their-bin/rustc"
 	cp "$W/their-bin/sccache" "$W/dev/usr/bin/clang"
@@ -1479,7 +1543,7 @@ fn under_root_a_source_build_reads_and_runs_nothing_another_account_can_change()
         .iter()
         .enumerate()
         .map(|(n, (_, setup, _))| {
-            lib.call(
+            lib.row(
                 format!(
                     "( mk row{n}; {setup}\n source_build_preflight; rc=$?; \
                      echo \"${{CARGO_RESOLVE_REASON:-}}\"; exit $rc )"
@@ -1488,19 +1552,18 @@ fn under_root_a_source_build_reads_and_runs_nothing_another_account_can_change()
             )
         })
         .collect();
-    let built = lib.call(
+    let built = lib.row(
         format!(
-            "( mk build; PATH=\"$W/their-bin:{}\"; cargo_build_pinned \"$ROOT\" && cat \"$TMPDIR/build-path\" )",
+            "( mk build; PATH=\"$W/their-bin:{}\"; cargo_build_pinned \"$ROOT\" && cat \"$W/build-path\" )",
             system_path()
         ),
         &[],
     );
-    let git = "cat \"$TMPDIR/build-git\"";
-    let built_git = lib.call(git, &[]);
-    let account_git = lib.call(
-        format!("( unset -f id; mk account; cargo_build_pinned \"$ROOT\" && {git} )"),
+    let account_git = lib.row(
+        "( unset -f id; mk account; cargo_build_pinned \"$ROOT\" && cat \"$W/build-git\" )",
         &[],
     );
+    let built_git = lib.call("cat \"$TMPDIR/build/build-git\"", &[]);
     let recs = lib.run(&scratch);
     for (n, ((label, _, want), i)) in rows.iter().zip(calls).enumerate() {
         let rec = &recs[i];
@@ -1787,7 +1850,7 @@ fn under_root_a_build_takes_no_name_a_link_another_account_can_redirect() {
     let calls: Vec<usize> = rows
         .iter()
         .enumerate()
-        .map(|(n, (to, _))| lib.call(format!("bin b{n} \"{to}\""), &[]))
+        .map(|(n, (to, _))| lib.row(format!("bin b{n} \"{to}\""), &[]))
         .collect();
     let by_mid = lib.call(
         "root_bin_dir \"$W/sealed/pbin\" && ! root_bin_dir \"$W/sealed/mid/pbin\" && \
@@ -1942,6 +2005,8 @@ folder_types() {
 /// never takes a fixture's device: `$W/gr` is a graft that shows Preboot's device with no mount of its
 /// own, `$W/un` a volume no line names, `$W/fs` a FUSE volume over a local one, `$W/uf` an
 /// account's disk that a forged local line names too, and `$W/lf` a local volume with a tree.
+/// `/dev/disk999s16x`, a node whose name only starts like `/dev/disk999s16`'s, has `$W/lf`'s
+/// device too.
 const FOREIGN_MACOS: &str = r#"mkdir -p "$W/gr/d" "$W/un/d" "$W/lf/d" "$W/lf/t/x" "$W/fs/d" "$W/uf/d" &&
 	ln -s x "$W/lf/t/l"
 printf '%s\n' "1:50 - /System/Volumes/Data$W/fl" "1:51 - $W/stack" \
@@ -1955,6 +2020,7 @@ for d in 0:40 8:1 1:50 0:42 1:71 1:51 1:52 1:53 0:44 1:54 0:45 0:46 1:73 1:74 1:
 	echo "/dev/disk999s$n $d" >>"$W/nodes"
 	n=$((n + 1))
 done
+echo "/dev/disk999s16x 1:60" >>"$W/nodes"
 disk_devices() {
 	local p d s=0
 	for p; do
@@ -2138,8 +2204,8 @@ fn under_root_a_walk_through_a_filesystem_whose_owners_say_nothing_refuses() {
             ("folder_failing sealed_entry /usr/bin", ""),
             // A walk that crosses no volume reads no table.
             (
-                "macos_mounts() { : >\"$W/read\"; }; folder_failing sealed_entry \"$W/obin\"; \
-                 [ ! -e \"$W/read\" ] || echo read",
+                "macos_mounts() { : >\"$W/read.obin\"; }; folder_failing sealed_entry \"$W/obin\"; \
+                 [ ! -e \"$W/read.obin\" ] || echo read",
                 "",
             ),
             ("no_table; folder_failing sealed_entry \"$W/ok/d\"", "$W/ok"),
@@ -2200,8 +2266,7 @@ fn under_root_a_walk_through_a_filesystem_whose_owners_say_nothing_refuses() {
             ),
             // A line that only starts like a node's is no disk's.
             (
-                "echo \"/dev/disk999s16x 1:60\" >>\"$W/nodes\"; eval \"base_$(declare -f macos_mounts)\"; \
-                 macos_mounts() { base_macos_mounts; \
+                "eval \"base_$(declare -f macos_mounts)\"; macos_mounts() { base_macos_mounts; \
                  echo \"/dev/disk999s16x on $W/zz (apfs, local, mounted by someone)\"; }; \
                  folder_failing sealed_entry \"$W/lf/d\"",
                 "",
@@ -2223,8 +2288,8 @@ fn under_root_a_walk_through_a_filesystem_whose_owners_say_nothing_refuses() {
             ),
             // A link in a tree on a volume reads no table.
             (
-                "macos_mounts() { : >\"$W/read\"; }; sealed_end \"$W/lf/t/l\" \"$W/lf/t\" >/dev/null || \
-                 echo refused; [ ! -e \"$W/read\" ] || echo read",
+                "macos_mounts() { : >\"$W/read.lf\"; }; sealed_end \"$W/lf/t/l\" \"$W/lf/t\" >/dev/null || \
+                 echo refused; [ ! -e \"$W/read.lf\" ] || echo read",
                 "",
             ),
             // APFS's names ignore case; on a volume whose names do not, the
@@ -2239,7 +2304,7 @@ fn under_root_a_walk_through_a_filesystem_whose_owners_say_nothing_refuses() {
     let calls: Vec<usize> = rows
         .iter()
         .map(|(walk, named)| {
-            lib.call(
+            lib.row(
                 format!("( o=\"$({walk})\"; [ \"$o\" = \"{named}\" ] || {{ echo \"named [$o]\"; exit 1; }} )"),
                 &[],
             )
@@ -2535,7 +2600,7 @@ fn under_root_cc_runs_only_from_a_developer_folder_and_sdk_root_alone_can_change
     // runs alone.
     let run = if macos {
         "source_build_preflight || { echo \"$CARGO_RESOLVE_REASON\"; exit 1; }; \
-         cargo_build_pinned \"$ROOT\" && cat \"$TMPDIR/build-dev\""
+         cargo_build_pinned \"$ROOT\" && cat \"$W/build-dev\""
     } else {
         "root_xcode_judged || { echo \"$CARGO_RESOLVE_REASON\"; exit 1; }; \
          echo \"$ROOT_DEVELOPER_DIR $ROOT_SDKROOT\""
@@ -2543,23 +2608,23 @@ fn under_root_cc_runs_only_from_a_developer_folder_and_sdk_root_alone_can_change
     let calls: Vec<usize> = rows
         .iter()
         .enumerate()
-        .map(|(n, (_, setup, _))| lib.call(format!("( mk row{n}; {setup}\n {run} )"), &[]))
+        .map(|(n, (_, setup, _))| lib.row(format!("( mk row{n}; {setup}\n {run} )"), &[]))
         .collect();
-    let by_name = lib.call(
+    let by_name = lib.row(
         "( mk by-name; export SDKROOT=macosx; ! root_xcode_judged && \
          [[ \"$CARGO_RESOLVE_REASON\" == *SDKROOT=macosx* ]] )",
         &[],
     );
     // A build the pre-flight did not judge judges the folder itself.
     let unjudged = macos.then(|| {
-        lib.call(
-            "( mk unjudged; theirs \"$W/dev/usr/bin/clang\"; rm -f \"$TMPDIR/build-dev\"; \
-             ! cargo_build_pinned \"$ROOT\" && [ ! -e \"$TMPDIR/build-dev\" ] )",
+        lib.row(
+            "( mk unjudged; theirs \"$W/dev/usr/bin/clang\"; \
+             ! cargo_build_pinned \"$ROOT\" && [ ! -e \"$W/build-dev\" ] )",
             &[],
         )
     });
     let git = macos.then(|| {
-        lib.call(
+        lib.row(
             format!(
                 "( mk git; mkdir \"$W/root-bin\" && \
                  printf '#!/bin/sh\\necho \"$DEVELOPER_DIR $SDKROOT ${{TOOLCHAINS-unset}}\"\\n' >\"$W/root-bin/git\" && \

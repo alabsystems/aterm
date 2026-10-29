@@ -350,7 +350,11 @@ impl TerminalHandler<'_> {
         _cap: &WindowOpsCapability,
     ) -> Option<WindowResponse> {
         if let Some(callback) = self.window_callback {
-            callback(op)
+            let resp = callback(op);
+            if resp.is_some() {
+                self.transient.host_io_ordinal = self.transient.host_io_ordinal.wrapping_add(1);
+            }
+            resp
         } else {
             None
         }

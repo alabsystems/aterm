@@ -231,7 +231,12 @@ fn call_args<'a>(attr: &'a [Tok], name: &str) -> Option<&'a [Tok]> {
         return None;
     }
     let end = group_end(attr, 1);
-    Some(&attr[2..end.saturating_sub(1).max(2)])
+    let close = if end > 2 && attr.get(end - 1).is_some_and(|t| t.is(Kind::Punct, ")")) {
+        end - 1
+    } else {
+        end
+    };
+    Some(&attr[2..close.max(2)])
 }
 
 fn serde_items(attr: &[Tok]) -> Vec<(&[Tok], bool)> {
@@ -280,8 +285,10 @@ fn form_of(item: &[Tok]) -> (String, String) {
         }
         return (key, "= <string>".into());
     }
-    if item[1].text == "(" {
-        let inner = &item[2..item.len() - 1];
+    if let [_, open, inner @ .., close] = item
+        && open.text == "("
+        && close.text == ")"
+    {
         let parts: Vec<String> = split_commas(inner)
             .into_iter()
             .map(|sub| {
@@ -381,14 +388,28 @@ impl Inventory {
         let mut i = 0;
         while i < n {
             let t = &toks[i];
-            if t.is(Kind::Punct, "#")
-                && toks
-                    .get(i + 1)
-                    .is_some_and(|x| x.text == "[" || x.text == "!")
-            {
-                let j = i + 1 + usize::from(toks[i + 1].text == "!");
+            let attr_open = if t.is(Kind::Punct, "#") {
+                if toks.get(i + 1).is_some_and(|x| x.is(Kind::Punct, "[")) {
+                    Some(i + 1)
+                } else if toks.get(i + 1).is_some_and(|x| x.is(Kind::Punct, "!"))
+                    && toks.get(i + 2).is_some_and(|x| x.is(Kind::Punct, "["))
+                {
+                    Some(i + 2)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(j) = attr_open {
                 let end = group_end(&toks, j);
-                let inner = &toks[(j + 1).min(end)..end.saturating_sub(1).max(j + 1)];
+                let close =
+                    if end > j + 1 && toks.get(end - 1).is_some_and(|t| t.is(Kind::Punct, "]")) {
+                        end - 1
+                    } else {
+                        end
+                    };
+                let inner = &toks[(j + 1).min(end)..close.max(j + 1)];
                 for (item, via) in serde_items(inner) {
                     let (key, form) = form_of(item);
                     pending.push(Pending {
@@ -714,13 +735,26 @@ mod tests {
 
     #[test]
     fn nested_forms_and_test_paths() {
-        let inv = scanned(&[(
-            "crates/x/tests/serde_test.rs",
-            "struct S { #[serde(with(a = \"b\", c))] f: u8 }",
-        )]);
-        assert!(inv.render("crates/").contains(
+        let inv = scanned(&[
+            (
+                "crates/x/tests/serde_test.rs",
+                "struct S { #[serde(with(a = \"b\", c))] f: u8 }",
+            ),
+            ("crates/x/src/broken_eof.rs", "#[serde(with("),
+            ("crates/x/src/shebang_eof.rs", "#!"),
+            (
+                "crates/x/src/broken_item.rs",
+                "#[serde(with(a) b)] struct B { f: u8 }",
+            ),
+        ]);
+        let rendered = inv.render("crates/");
+        assert!(rendered.contains(
             "field\twith\t(a = <string>, c bare)\t1\t1\t0\tcrates/x/tests/serde_test.rs:1\n"
         ));
+        assert!(
+            rendered
+                .contains("container\twith\t?( a ) b\t1\t0\t0\tcrates/x/src/broken_item.rs:1\n")
+        );
         assert!(test_path("crates/a/src/foo_tests.rs") && !test_path("crates/a/src/latest.rs"));
     }
 

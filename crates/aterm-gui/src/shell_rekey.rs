@@ -672,7 +672,10 @@ mod tests {
             engine.process(cycle("").as_bytes());
             engine.process(cycle(&format!(";id={}", "1".repeat(64))).as_bytes());
             assert_eq!(
-                crate::session_status::executing_detail(&engine),
+                crate::session_status::executing_detail(
+                    &engine,
+                    &crate::command_ran::Ran::running(&["claude"])
+                ),
                 None,
                 "{label}: unsigned and old-key marks stay dropped"
             );
@@ -683,7 +686,11 @@ mod tests {
             );
             engine.process(cycle(&format!(";id={key}")).as_bytes());
             assert_eq!(
-                crate::session_status::executing_detail(&engine).as_deref(),
+                crate::session_status::executing_detail(
+                    &engine,
+                    &crate::command_ran::Ran::running(&["claude"])
+                )
+                .as_deref(),
                 Some("claude"),
                 "{label}"
             );
@@ -738,7 +745,11 @@ mod tests {
         let mut engine = term.lock().unwrap();
         engine.process(cycle(&format!(";id={key}")).as_bytes());
         assert_eq!(
-            crate::session_status::executing_detail(&engine).as_deref(),
+            crate::session_status::executing_detail(
+                &engine,
+                &crate::command_ran::Ran::running(&["claude"])
+            )
+            .as_deref(),
             Some("claude"),
             "authorized at adoption, taken after the Commit"
         );
@@ -847,14 +858,24 @@ mod tests {
         engine.process(b"\x1b]133;D;0\x07");
         engine.process(cycle("").as_bytes());
         engine.process(cycle(&format!(";id={}", "1".repeat(64))).as_bytes());
-        assert_eq!(crate::session_status::executing_detail(&engine), None);
+        assert_eq!(
+            crate::session_status::executing_detail(
+                &engine,
+                &crate::command_ran::Ran::running(&["claude"])
+            ),
+            None
+        );
         assert_eq!(
             engine.shell_integration_posture(),
             ShellIntegrationPosture::Degraded
         );
         engine.process(cycle(&format!(";id={key}")).as_bytes());
         assert_eq!(
-            crate::session_status::executing_detail(&engine).as_deref(),
+            crate::session_status::executing_detail(
+                &engine,
+                &crate::command_ran::Ran::running(&["claude"])
+            )
+            .as_deref(),
             Some("claude")
         );
         assert_eq!(

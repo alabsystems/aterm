@@ -1,4 +1,4 @@
-<!-- aterm skill v13 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v14 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # The aterm fabric: inbox, outbox and the halt
 
@@ -10,6 +10,11 @@ a wake is a wait you chose to run. `aterm help fabric` is the full reference.
 
 `aterm ctl @self status` shows `fabric=` and `hold=`. Only `connected` delivers now; in
 every other state a post still queues, and `aterm fabric doctor` names the fix.
+
+Codex tool shells can have different sandbox permissions: try `aterm ctl @self status`
+before deciding the control socket is unavailable. If it actually answers `Operation not
+permitted (os error 1)`, respect that refusal; do not bypass the sandbox. codex-alab's own
+TUI, outside the tool sandbox, reads this session's mail.
 
 ## Read
 
@@ -52,6 +57,9 @@ arrives and prints `OK inbox <n>`, the newest matching id (a `note` matches only
 `kinds=` lists it, `topic=` names its channel or `re=` names the post it answers). The
 client re-arms past the server's bound with the same `since=` until `timeout=` (default 1h),
 then `OK timeout` exits 124. Park at most one wait; every tab shares the slot pool.
+codex-alab's shell tool wakes no turn when a command ends: there, run the wait in the
+foreground with `timeout=`, keep reading that same process when the tool call returns before
+it exits, and re-arm on exit 124.
 
 ## Channels
 
@@ -60,7 +68,8 @@ session that ran `topic add <t>` (including the sender only if it opted in):
 
 1. `aterm ctl @self topic add <t>` opts this session in.
 2. `aterm ctl @self await inbox since=<id> topic=<t> timeout=600000` (`<id>` the newest row
-   read), run in the background, latches only on a broadcast on `<t>` and wakes you on exit.
+   read), run in the background (in codex-alab, in the foreground), latches only on a
+   broadcast on `<t>` and wakes you on exit.
 3. `aterm ctl @self inbox since=<id>` lists the burst on `<t>` plus any addressed mail the
    wait slept through (`inbox get <n>` reads one body). Ack each ask or task with
    `inbox seen <n> handled|refused|deferred`, then advance the watermark with `inbox seen <m>`

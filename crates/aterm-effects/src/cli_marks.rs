@@ -11,7 +11,9 @@ use aterm_core::render::{
 use aterm_render::fx as fx_art;
 use aterm_render::premul_rgb;
 
+#[cfg(test)]
 use crate::color_math::floor_contrast_keeping_hue;
+#[cfg(test)]
 use crate::harness_card::dark_ground;
 
 /// Minimum WCAG contrast ratio for a CLI's name against its ground.
@@ -385,6 +387,9 @@ impl Fit {
 #[must_use]
 #[inline]
 pub const fn fit(mark: CliMark, cw: u16, ch: u16) -> Option<Fit> {
+    if cw == 0 {
+        return None;
+    }
     let box_w = ICON_CELLS as u32 * cw as u32;
     let box_h = ch as u32;
     let Some(room_h) = box_h.checked_sub(AIR_PX as u32) else {
@@ -477,8 +482,10 @@ pub const fn name_ink(mark: CliMark, letter: usize, dark: bool) -> u32 {
 #[inline]
 #[must_use]
 pub const fn name_fg(mark: CliMark, letter: usize, ground: u32) -> u32 {
-    let ink = name_ink(mark, letter, dark_ground(ground));
-    floor_contrast_keeping_hue(ink, ground, NAME_CONTRAST)
+    let table = crate::color_math::relative_luminance_table();
+    let lg = crate::color_math::relative_luminance_with(table, ground & 0x00FF_FFFF);
+    let ink = name_ink(mark, letter, lg < 0.5);
+    crate::color_math::floor_contrast_keeping_hue_with_ground_lum(table, ink, lg, NAME_CONTRAST)
 }
 
 /// Contrast-floored icon palette for `mark` on `ground`.
@@ -486,25 +493,26 @@ pub const fn name_fg(mark: CliMark, letter: usize, ground: u32) -> u32 {
 #[inline]
 pub fn icon_palette(mark: CliMark, ground: u32) -> Vec<FxInk> {
     let b = brand(mark);
-    let inks = b.icon.on(dark_ground(ground));
+    let table = crate::color_math::relative_luminance_table();
+    let lg = crate::color_math::relative_luminance_with(table, ground);
+    let inks = b.icon.on(lg < 0.5);
     let mut floored = [0u32; MAX_ICON_INKS];
     let mut k = 0;
     while k < inks.len() {
-        floored[k] = floor_contrast_keeping_hue(inks[k], ground, ICON_CONTRAST);
+        floored[k] = crate::color_math::floor_contrast_keeping_hue_with_ground_lum(
+            table,
+            inks[k],
+            lg,
+            ICON_CONTRAST,
+        );
         k += 1;
     }
     let mut out = Vec::with_capacity(b.texels.len());
-    let mut j = 0;
-    while j < b.texels.len() {
-        out.push(match b.texels[j] {
-            Texel::Ink(i) => FxInk::over(floored[usize::from(i)], 255),
-            Texel::Half(i) => {
-                FxInk::over(premul_rgb(floored[usize::from(i)], HALF_ALPHA), HALF_ALPHA)
-            }
-            Texel::Hole(rgb) => FxInk::over(rgb, 255),
-        });
-        j += 1;
-    }
+    out.extend(b.texels.iter().map(|&t| match t {
+        Texel::Ink(i) => FxInk::over(floored[usize::from(i)], 255),
+        Texel::Half(i) => FxInk::over(premul_rgb(floored[usize::from(i)], HALF_ALPHA), HALF_ALPHA),
+        Texel::Hole(rgb) => FxInk::over(rgb, 255),
+    }));
     out
 }
 

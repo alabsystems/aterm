@@ -12,13 +12,17 @@ use aterm_types::charset::{
 };
 use aterm_types::mouse::{MouseEncoding, MouseMode};
 use aterm_types::{
-    Appearance, BiDiMode, ColorPalette, CursorStyle, KittyKeyboardFlags,
-    KittyKeyboardStateSnapshot, ParagraphDirection, Rgb, TaskbarProgress, TerminalModes, VtLevel,
-    XtermKeyboardState,
+    Appearance, BiDiMode, ColorPalette, CursorStyle, ImageFormat, ImageScaling, KittyKeyboardFlags,
+    KittyKeyboardStateSnapshot, ParagraphDirection, Rgb, SourceRect, TaskbarProgress,
+    TerminalModes, VtLevel, XtermKeyboardState,
 };
 
 use super::checkpoint::{
-    DcsQueryCarry, DcsQueryKind, GridCursorRepr, PaneStepCarry, SavedCursorPendingWrap,
+    DcsQueryCarry, DcsQueryKind, GridCursorRepr, KittyFloatParentCarry, KittyFloatingCarry,
+    KittyFrameCarry, KittyImageCarry, KittyLayoutCarry, KittyParentCarry, KittyPlayStateCarry,
+    KittyRelationCarry, KittyVariantCarry, KittyVariantSourceCarry, KittyVirtualCarry,
+    KittyVirtualImageCarry, LooseImageCarry, PANE_HISTORY_IMAGE_LINES, PaneStepCarry,
+    PlacedGridCarry, PlacedImageSourceCarry, PlacedSpanCarry, SavedCursorPendingWrap,
     SavedCursorRepr, SavedCursorResized, ShellIntegrationNonce, StyleRepr, TerminalCheckpoint,
 };
 use super::checkpoint_holder::{
@@ -42,7 +46,7 @@ pub const CHECKPOINT_CANON_VERSION: u32 = 1;
 pub const CONFIG_CANON_VERSION: u32 = 1;
 
 /// The version [`PaneStepCarry::canonical`] writes after its magic.
-pub const PANE_CARRY_CANON_VERSION: u32 = 3;
+pub const PANE_CARRY_CANON_VERSION: u32 = 6;
 
 /// The version [`policy_canonical`] writes after its magic.
 pub const POLICY_CANON_VERSION: u32 = 1;
@@ -1995,6 +1999,1222 @@ fn dec_dcs_query(d: &mut R<'_>) -> Result<DcsQueryCarry, CanonFault> {
     })
 }
 
+fn enc_kitty_layout(w: &mut W, l: &KittyLayoutCarry) {
+    let KittyLayoutCarry {
+        cols,
+        rows,
+        z_index,
+        cell_offset_px: (off_x, off_y),
+        scaling,
+        source_rect,
+    } = l;
+    w.u16(*cols);
+    w.u16(*rows);
+    w.i32(*z_index);
+    w.u16(*off_x);
+    w.u16(*off_y);
+    w.u8(match scaling {
+        ImageScaling::Fit => 0,
+        ImageScaling::Stretch => 1,
+        ImageScaling::PixelExact => 2,
+    });
+    w.opt(*source_rect, |w, r| {
+        w.u32(r.x);
+        w.u32(r.y);
+        w.u32(r.width);
+        w.u32(r.height);
+    });
+}
+
+fn dec_kitty_layout(d: &mut R<'_>) -> Result<KittyLayoutCarry, CanonFault> {
+    let cols = d.u16("pane_carry.kitty_layout.cols")?;
+    let rows = d.u16("pane_carry.kitty_layout.rows")?;
+    if cols == 0 || cols > MAX_GRID_COLS || rows == 0 || rows > MAX_GRID_ROWS {
+        return Err(fault(
+            "pane_carry.kitty_layout.cols",
+            "cols and rows must stay within 1..=MAX_GRID",
+        ));
+    }
+    let z_index = d.i32("pane_carry.kitty_layout.z_index")?;
+    let off_x = d.u16("pane_carry.kitty_layout.cell_offset_px")?;
+    let off_y = d.u16("pane_carry.kitty_layout.cell_offset_px")?;
+    let scaling = match d.u8("pane_carry.kitty_layout.scaling")? {
+        0 => ImageScaling::Fit,
+        1 => ImageScaling::Stretch,
+        2 => ImageScaling::PixelExact,
+        _ => {
+            return Err(fault(
+                "pane_carry.kitty_layout.scaling",
+                "scaling tag is 0 (Fit), 1 (Stretch) or 2 (PixelExact)",
+            ));
+        }
+    };
+    let source_rect = d.opt("pane_carry.kitty_layout.source_rect", |d| {
+        let x = d.u32("pane_carry.kitty_layout.source_rect")?;
+        let y = d.u32("pane_carry.kitty_layout.source_rect")?;
+        let width = d.u32("pane_carry.kitty_layout.source_rect")?;
+        let height = d.u32("pane_carry.kitty_layout.source_rect")?;
+        if width == 0
+            || height == 0
+            || x.checked_add(width).is_none()
+            || y.checked_add(height).is_none()
+        {
+            return Err(fault(
+                "pane_carry.kitty_layout.source_rect",
+                "source_rect must have non-zero size without u32 overflow",
+            ));
+        }
+        Ok(SourceRect {
+            x,
+            y,
+            width,
+            height,
+        })
+    })?;
+    Ok(KittyLayoutCarry {
+        cols,
+        rows,
+        z_index,
+        cell_offset_px: (off_x, off_y),
+        scaling,
+        source_rect,
+    })
+}
+
+fn enc_kitty_raster(w: &mut W, format: ImageFormat, bytes: &[u8]) {
+    match format {
+        ImageFormat::Png => {
+            w.u8(0);
+            w.bytes(bytes);
+        }
+        ImageFormat::RawRgba8 { width, height } => {
+            w.u8(1);
+            w.u16(width);
+            w.u16(height);
+            w.bytes(bytes);
+        }
+        ImageFormat::Unknown => w.unnamed(format),
+    }
+}
+
+fn dec_kitty_raster(d: &mut R<'_>) -> Result<(ImageFormat, Vec<u8>), CanonFault> {
+    use super::handler::MAX_KITTY_IMAGE_BYTES;
+    use super::kitty_graphics::MAX_KITTY_DIMENSION;
+    match d.u8("pane_carry.kitty_raster.format")? {
+        0 => {
+            let bytes = d.bytes("pane_carry.kitty_raster.bytes")?.to_vec();
+            if bytes.is_empty() || bytes.len() > MAX_KITTY_IMAGE_BYTES {
+                return Err(fault(
+                    "pane_carry.kitty_raster.bytes",
+                    "PNG payload must be 1..=MAX_KITTY_IMAGE_BYTES",
+                ));
+            }
+            Ok((ImageFormat::Png, bytes))
+        }
+        1 => {
+            let width = d.u16("pane_carry.kitty_raster.format")?;
+            let height = d.u16("pane_carry.kitty_raster.format")?;
+            if width == 0
+                || height == 0
+                || u32::from(width) > MAX_KITTY_DIMENSION
+                || u32::from(height) > MAX_KITTY_DIMENSION
+            {
+                return Err(fault(
+                    "pane_carry.kitty_raster.format",
+                    "RGBA dimensions must be 1..=MAX_KITTY_DIMENSION",
+                ));
+            }
+            let expected = usize::from(width)
+                .saturating_mul(usize::from(height))
+                .saturating_mul(4);
+            let bytes = d.bytes("pane_carry.kitty_raster.bytes")?.to_vec();
+            if expected > MAX_KITTY_IMAGE_BYTES || bytes.len() != expected {
+                return Err(fault(
+                    "pane_carry.kitty_raster.bytes",
+                    "RGBA payload must equal 4 * width * height within MAX_KITTY_IMAGE_BYTES",
+                ));
+            }
+            Ok((ImageFormat::RawRgba8 { width, height }, bytes))
+        }
+        _ => Err(fault(
+            "pane_carry.kitty_raster.format",
+            "format tag is 0 (Png) or 1 (RawRgba8)",
+        )),
+    }
+}
+
+fn enc_kitty_store(w: &mut W, store: &[KittyImageCarry]) {
+    w.len(store.len());
+    for entry in store {
+        let KittyImageCarry {
+            id,
+            image_serial,
+            shown_frame,
+            state,
+            max_loops,
+            loops,
+            shown_at_ns,
+            frames,
+            variants,
+            virtuals,
+        } = entry;
+        w.u32(*id);
+        w.u32(image_serial.get());
+        w.u8(*shown_frame);
+        w.u8(match state {
+            KittyPlayStateCarry::Stopped => 0,
+            KittyPlayStateCarry::Loading => 1,
+            KittyPlayStateCarry::Running => 2,
+        });
+        w.u32(*max_loops);
+        w.u32(*loops);
+        w.u64(*shown_at_ns);
+        w.len(frames.len());
+        for fc in frames {
+            enc_kitty_raster(w, fc.format, &fc.bytes);
+            enc_kitty_layout(w, &fc.layout);
+            w.u32(fc.gap_ms);
+        }
+        w.len(variants.len());
+        for vc in variants {
+            match &vc.source {
+                KittyVariantSourceCarry::Frame(idx) => {
+                    w.u8(0);
+                    w.u8(*idx);
+                }
+                KittyVariantSourceCarry::Orphan { bytes, format } => {
+                    w.u8(1);
+                    enc_kitty_raster(w, *format, bytes);
+                }
+            }
+            enc_kitty_layout(w, &vc.layout);
+        }
+        w.len(virtuals.len());
+        for virt in virtuals {
+            w.u32(virt.placement_id);
+            w.u32(virt.image_serial.get());
+            w.u32(virt.serial.get());
+            match virt.image {
+                KittyVirtualImageCarry::Frame(idx) => {
+                    w.u8(0);
+                    w.u8(idx);
+                }
+                KittyVirtualImageCarry::Variant(idx) => {
+                    w.u8(1);
+                    w.u8(idx);
+                }
+            }
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "sequential wire decode and canonical validation of Kitty store entries"
+)]
+fn dec_kitty_store(d: &mut R<'_>) -> Result<Vec<KittyImageCarry>, CanonFault> {
+    use super::handler::{
+        MAX_KITTY_FRAMES, MAX_KITTY_IMAGES, MAX_KITTY_STORE_BYTES, MAX_KITTY_VARIANTS,
+        MAX_KITTY_VIRTUALS,
+    };
+    use core::num::NonZeroU32;
+    let n_images = d.count("pane_carry.kitty_store", 27)?;
+    if n_images > MAX_KITTY_IMAGES {
+        return Err(fault("pane_carry.kitty_store", "past MAX_KITTY_IMAGES"));
+    }
+    let mut store = Vec::with_capacity(n_images);
+    let mut prev_id = 0u32;
+    let mut total_bytes = 0usize;
+    let add_bytes = |total: &mut usize, n: usize| -> Result<(), CanonFault> {
+        *total = total
+            .checked_add(n)
+            .ok_or_else(|| fault("pane_carry.kitty_store", "kitty store bytes overflow usize"))?;
+        if *total > MAX_KITTY_STORE_BYTES {
+            return Err(fault(
+                "pane_carry.kitty_store",
+                "kitty store bytes exceed MAX_KITTY_STORE_BYTES",
+            ));
+        }
+        Ok(())
+    };
+    for _ in 0..n_images {
+        let id = d.u32("pane_carry.kitty_store.id")?;
+        if id <= prev_id {
+            return Err(fault(
+                "pane_carry.kitty_store.id",
+                "image ids must be non-zero and strictly ascending",
+            ));
+        }
+        prev_id = id;
+        let image_serial = NonZeroU32::new(d.u32("pane_carry.kitty_store.image_serial")?)
+            .ok_or_else(|| {
+                fault(
+                    "pane_carry.kitty_store.image_serial",
+                    "image_serial must be non-zero",
+                )
+            })?;
+        let shown_frame = d.u8("pane_carry.kitty_store.shown_frame")?;
+        let state = match d.u8("pane_carry.kitty_store.state")? {
+            0 => KittyPlayStateCarry::Stopped,
+            1 => KittyPlayStateCarry::Loading,
+            2 => KittyPlayStateCarry::Running,
+            _ => {
+                return Err(fault(
+                    "pane_carry.kitty_store.state",
+                    "play state tag is 0 (Stopped), 1 (Loading) or 2 (Running)",
+                ));
+            }
+        };
+        let max_loops = d.u32("pane_carry.kitty_store.max_loops")?;
+        let loops = d.u32("pane_carry.kitty_store.loops")?;
+        let shown_at_ns = d.u64("pane_carry.kitty_store.shown_at_ns")?;
+        let n_frames = d.count("pane_carry.kitty_store.frames", 17)?;
+        if n_frames == 0 || n_frames > MAX_KITTY_FRAMES {
+            return Err(fault(
+                "pane_carry.kitty_store.frames",
+                "frame count must be within 1..=MAX_KITTY_FRAMES",
+            ));
+        }
+        if usize::from(shown_frame) >= n_frames {
+            return Err(fault(
+                "pane_carry.kitty_store.shown_frame",
+                "shown_frame must index into frames",
+            ));
+        }
+        let mut frames = Vec::with_capacity(n_frames);
+        for _ in 0..n_frames {
+            let (format, bytes) = dec_kitty_raster(d)?;
+            let layout = dec_kitty_layout(d)?;
+            let gap_ms = d.u32("pane_carry.kitty_store.frames.gap_ms")?;
+            add_bytes(&mut total_bytes, bytes.len())?;
+            frames.push(KittyFrameCarry {
+                bytes,
+                format,
+                layout,
+                gap_ms,
+            });
+        }
+        add_bytes(
+            &mut total_bytes,
+            frames[usize::from(shown_frame)].bytes.len(),
+        )?;
+
+        let n_variants = d.count("pane_carry.kitty_store.variants", 16)?;
+        if n_variants > MAX_KITTY_VARIANTS {
+            return Err(fault(
+                "pane_carry.kitty_store.variants",
+                "past MAX_KITTY_VARIANTS",
+            ));
+        }
+        let mut variants: Vec<KittyVariantCarry> = Vec::with_capacity(n_variants);
+        for _ in 0..n_variants {
+            let source = match d.u8("pane_carry.kitty_store.variants.source")? {
+                0 => {
+                    let idx = d.u8("pane_carry.kitty_store.variants.source")?;
+                    if usize::from(idx) >= n_frames {
+                        return Err(fault(
+                            "pane_carry.kitty_store.variants.source",
+                            "variant source frame out of range",
+                        ));
+                    }
+                    add_bytes(&mut total_bytes, frames[usize::from(idx)].bytes.len())?;
+                    KittyVariantSourceCarry::Frame(idx)
+                }
+                1 => {
+                    let (format, bytes) = dec_kitty_raster(d)?;
+                    add_bytes(&mut total_bytes, bytes.len())?;
+                    KittyVariantSourceCarry::Orphan { bytes, format }
+                }
+                _ => {
+                    return Err(fault(
+                        "pane_carry.kitty_store.variants.source",
+                        "variant source tag is 0 (Frame) or 1 (Orphan)",
+                    ));
+                }
+            };
+            let layout = dec_kitty_layout(d)?;
+            if let KittyVariantSourceCarry::Frame(idx) = source {
+                if layout == frames[usize::from(idx)].layout {
+                    return Err(fault(
+                        "pane_carry.kitty_store.variants",
+                        "frame variant layout must differ from its source frame",
+                    ));
+                }
+                if variants.iter().any(|prev| {
+                    prev.source == KittyVariantSourceCarry::Frame(idx) && prev.layout == layout
+                }) {
+                    return Err(fault(
+                        "pane_carry.kitty_store.variants",
+                        "duplicate frame variant layout",
+                    ));
+                }
+            }
+            variants.push(KittyVariantCarry { source, layout });
+        }
+
+        let n_virtuals = d.count("pane_carry.kitty_store.virtuals", 14)?;
+        if n_virtuals > MAX_KITTY_VIRTUALS {
+            return Err(fault(
+                "pane_carry.kitty_store.virtuals",
+                "past MAX_KITTY_VIRTUALS",
+            ));
+        }
+        let mut virtuals: Vec<KittyVirtualCarry> = Vec::with_capacity(n_virtuals);
+        for _ in 0..n_virtuals {
+            let placement_id = d.u32("pane_carry.kitty_store.virtuals.placement_id")?;
+            if placement_id != 0
+                && virtuals
+                    .iter()
+                    .any(|prev| prev.placement_id == placement_id)
+            {
+                return Err(fault(
+                    "pane_carry.kitty_store.virtuals.placement_id",
+                    "duplicate non-zero virtual placement_id",
+                ));
+            }
+            let v_image_serial =
+                NonZeroU32::new(d.u32("pane_carry.kitty_store.virtuals.image_serial")?)
+                    .ok_or_else(|| {
+                        fault(
+                            "pane_carry.kitty_store.virtuals.image_serial",
+                            "virtual image_serial must be non-zero",
+                        )
+                    })?;
+            let serial = NonZeroU32::new(d.u32("pane_carry.kitty_store.virtuals.serial")?)
+                .ok_or_else(|| {
+                    fault(
+                        "pane_carry.kitty_store.virtuals.serial",
+                        "virtual serial must be non-zero",
+                    )
+                })?;
+            let image = match d.u8("pane_carry.kitty_store.virtuals.image")? {
+                0 => {
+                    let idx = d.u8("pane_carry.kitty_store.virtuals.image")?;
+                    if usize::from(idx) >= n_frames {
+                        return Err(fault(
+                            "pane_carry.kitty_store.virtuals.image",
+                            "virtual frame index out of range",
+                        ));
+                    }
+                    KittyVirtualImageCarry::Frame(idx)
+                }
+                1 => {
+                    let idx = d.u8("pane_carry.kitty_store.virtuals.image")?;
+                    if usize::from(idx) >= n_variants {
+                        return Err(fault(
+                            "pane_carry.kitty_store.virtuals.image",
+                            "virtual variant index out of range",
+                        ));
+                    }
+                    KittyVirtualImageCarry::Variant(idx)
+                }
+                _ => {
+                    return Err(fault(
+                        "pane_carry.kitty_store.virtuals.image",
+                        "virtual image tag is 0 (Frame) or 1 (Variant)",
+                    ));
+                }
+            };
+            virtuals.push(KittyVirtualCarry {
+                placement_id,
+                image_serial: v_image_serial,
+                serial,
+                image,
+            });
+        }
+
+        store.push(KittyImageCarry {
+            id,
+            image_serial,
+            shown_frame,
+            state,
+            max_loops,
+            loops,
+            shown_at_ns,
+            frames,
+            variants,
+            virtuals,
+        });
+    }
+    Ok(store)
+}
+
+fn dec_kitty_numbers(
+    d: &mut R<'_>,
+    store: &[KittyImageCarry],
+) -> Result<Vec<(u32, u32)>, CanonFault> {
+    use super::handler::MAX_KITTY_IMAGES;
+    let n = d.count("pane_carry.kitty_numbers", 8)?;
+    if n > MAX_KITTY_IMAGES {
+        return Err(fault("pane_carry.kitty_numbers", "past MAX_KITTY_IMAGES"));
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut prev_num = 0u32;
+    for _ in 0..n {
+        let num = d.u32("pane_carry.kitty_numbers")?;
+        let id = d.u32("pane_carry.kitty_numbers")?;
+        if num <= prev_num {
+            return Err(fault(
+                "pane_carry.kitty_numbers",
+                "image numbers must be non-zero and strictly ascending",
+            ));
+        }
+        prev_num = num;
+        if store.binary_search_by_key(&id, |e| e.id).is_err() {
+            return Err(fault(
+                "pane_carry.kitty_numbers",
+                "image number must name a stored image id",
+            ));
+        }
+        out.push((num, id));
+    }
+    Ok(out)
+}
+
+fn enc_kitty_pending(w: &mut W, cmd: &super::kitty_graphics::KittyCommand) {
+    use super::kitty_graphics::{KittyAction, KittyFormat, KittyMedium};
+    let super::kitty_graphics::KittyCommand {
+        action,
+        quiet,
+        format,
+        medium,
+        id,
+        number,
+        placement,
+        x,
+        y,
+        crop_width,
+        crop_height,
+        cursor_stays,
+        virtual_placement,
+        width,
+        height,
+        columns,
+        rows,
+        z_index,
+        cell_x_offset,
+        cell_y_offset,
+        parent_id,
+        parent_placement,
+        parent_dx,
+        parent_dy,
+        more,
+        compressed,
+        delete_target,
+        payload,
+    } = cmd;
+    w.u8(match action {
+        KittyAction::Transmit => 0,
+        KittyAction::TransmitAndDisplay => 1,
+        KittyAction::Query => 2,
+        KittyAction::Display => 3,
+        KittyAction::Delete => 4,
+        KittyAction::Frame => 5,
+        KittyAction::Animate => 6,
+        KittyAction::Compose => 7,
+    });
+    w.u8(*quiet);
+    w.u8(match format {
+        KittyFormat::Rgb => 0,
+        KittyFormat::Rgba => 1,
+        KittyFormat::Png => 2,
+    });
+    w.u8(match medium {
+        KittyMedium::Direct => 0,
+        KittyMedium::File => 1,
+        KittyMedium::TempFile => 2,
+        KittyMedium::SharedMemory => 3,
+    });
+    w.opt(*id, W::u32);
+    w.opt(*number, W::u32);
+    w.opt(*placement, W::u32);
+    w.opt(*x, W::u32);
+    w.opt(*y, W::u32);
+    w.opt(*crop_width, W::u32);
+    w.opt(*crop_height, W::u32);
+    w.bool(*cursor_stays);
+    w.bool(*virtual_placement);
+    w.opt(*width, W::u32);
+    w.opt(*height, W::u32);
+    w.opt(*columns, W::u32);
+    w.opt(*rows, W::u32);
+    w.opt(*z_index, W::i32);
+    w.opt(*cell_x_offset, W::u32);
+    w.opt(*cell_y_offset, W::u32);
+    w.opt(*parent_id, W::u32);
+    w.opt(*parent_placement, W::u32);
+    w.opt(*parent_dx, W::i32);
+    w.opt(*parent_dy, W::i32);
+    w.bool(*more);
+    w.bool(*compressed);
+    w.opt(*delete_target, |w, c| w.u32(u32::from(c)));
+    w.bytes(payload);
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "sequential wire decode and canonical validation of KittyCommand"
+)]
+fn dec_kitty_pending(
+    d: &mut R<'_>,
+    store: &[KittyImageCarry],
+    numbers: &[(u32, u32)],
+) -> Result<super::kitty_graphics::KittyCommand, CanonFault> {
+    use super::handler::MAX_KITTY_IMAGE_BYTES;
+    use super::kitty_graphics::{DuringLoad, KittyAction, KittyCommand, KittyFormat, KittyMedium};
+    let field = "pane_carry.kitty_pending";
+    let action = match d.u8(field)? {
+        0 => KittyAction::Transmit,
+        1 => KittyAction::TransmitAndDisplay,
+        2 => KittyAction::Query,
+        3 => KittyAction::Display,
+        4 => KittyAction::Delete,
+        5 => KittyAction::Frame,
+        6 => KittyAction::Animate,
+        7 => KittyAction::Compose,
+        _ => return Err(fault(field, "unknown KittyAction tag")),
+    };
+    let quiet = d.u8(field)?;
+    let format = match d.u8(field)? {
+        0 => KittyFormat::Rgb,
+        1 => KittyFormat::Rgba,
+        2 => KittyFormat::Png,
+        _ => return Err(fault(field, "unknown KittyFormat tag")),
+    };
+    let medium = match d.u8(field)? {
+        0 => KittyMedium::Direct,
+        1 => KittyMedium::File,
+        2 => KittyMedium::TempFile,
+        3 => KittyMedium::SharedMemory,
+        _ => return Err(fault(field, "unknown KittyMedium tag")),
+    };
+    let nz_u32 = |d: &mut R<'_>, sub: &'static str| -> Result<Option<u32>, CanonFault> {
+        let val = d.opt(sub, |d| d.u32(sub))?;
+        if val == Some(0) {
+            return Err(fault(sub, "protocol id must be non-zero when present"));
+        }
+        Ok(val)
+    };
+    let id = nz_u32(d, "pane_carry.kitty_pending.id")?;
+    let number = nz_u32(d, "pane_carry.kitty_pending.number")?;
+    let placement = nz_u32(d, "pane_carry.kitty_pending.placement")?;
+    let crop_x = d.opt(field, |d| d.u32(field))?;
+    let crop_y = d.opt(field, |d| d.u32(field))?;
+    let crop_width = d.opt(field, |d| d.u32(field))?;
+    let crop_height = d.opt(field, |d| d.u32(field))?;
+    let cursor_stays = d.bool(field)?;
+    let virtual_placement = d.bool(field)?;
+    let width = d.opt(field, |d| d.u32(field))?;
+    let height = d.opt(field, |d| d.u32(field))?;
+    let columns = d.opt(field, |d| d.u32(field))?;
+    let rows = d.opt(field, |d| d.u32(field))?;
+    let z_index = d.opt(field, |d| d.i32(field))?;
+    let cell_x_offset = d.opt(field, |d| d.u32(field))?;
+    let cell_y_offset = d.opt(field, |d| d.u32(field))?;
+    let parent_id = nz_u32(d, "pane_carry.kitty_pending.parent_id")?;
+    let parent_placement = nz_u32(d, "pane_carry.kitty_pending.parent_placement")?;
+    let parent_dx = d.opt(field, |d| d.i32(field))?;
+    let parent_dy = d.opt(field, |d| d.i32(field))?;
+    let more = d.bool(field)?;
+    let compressed = d.bool(field)?;
+    let delete_target = d.opt(field, |d| {
+        char::from_u32(d.u32(field)?)
+            .ok_or_else(|| fault(field, "delete_target must be a Unicode scalar"))
+    })?;
+    let payload = d.bytes("pane_carry.kitty_pending.payload")?.to_vec();
+    if payload.len() > MAX_KITTY_IMAGE_BYTES {
+        return Err(fault(
+            "pane_carry.kitty_pending.payload",
+            "pending payload exceeds MAX_KITTY_IMAGE_BYTES",
+        ));
+    }
+    let cmd = KittyCommand {
+        action,
+        quiet,
+        format,
+        medium,
+        id,
+        number,
+        placement,
+        x: crop_x,
+        y: crop_y,
+        crop_width,
+        crop_height,
+        cursor_stays,
+        virtual_placement,
+        width,
+        height,
+        columns,
+        rows,
+        z_index,
+        cell_x_offset,
+        cell_y_offset,
+        parent_id,
+        parent_placement,
+        parent_dx,
+        parent_dy,
+        more,
+        compressed,
+        delete_target,
+        payload,
+    };
+    if !cmd.more
+        || cmd.during_load() != DuringLoad::Continues
+        || (cmd.action == KittyAction::Query && cmd.id.is_none())
+        || (cmd.id.is_some() && cmd.number.is_some())
+        || !cmd.declares_loadable_size()
+    {
+        return Err(fault(
+            "pane_carry.kitty_pending",
+            "kitty_pending must be an in-flight direct loadable transfer",
+        ));
+    }
+    if cmd.action == KittyAction::Frame {
+        let resolved = cmd.id.or_else(|| {
+            let n = cmd.number?;
+            numbers
+                .binary_search_by_key(&n, |&(num, _)| num)
+                .ok()
+                .map(|i| numbers[i].1)
+        });
+        let has_target =
+            resolved.is_some_and(|rid| store.binary_search_by_key(&rid, |e| e.id).is_ok());
+        if !has_target {
+            // Note: an image could be deleted via `a=d`? No, `a=d` has `DuringLoad::Ends`, which clears `kitty_pending`!
+            return Err(fault(
+                "pane_carry.kitty_pending",
+                "chunked frame transfer must name a stored image",
+            ));
+        }
+    }
+    Ok(cmd)
+}
+
+fn enc_loose_raster(w: &mut W, format: ImageFormat, bytes: &[u8]) {
+    match format {
+        ImageFormat::Png => {
+            w.u8(0);
+            w.bytes(bytes);
+        }
+        ImageFormat::RawRgba8 { width, height } => {
+            w.u8(1);
+            w.u16(width);
+            w.u16(height);
+            w.bytes(bytes);
+        }
+        ImageFormat::Unknown => {
+            w.u8(2);
+            w.bytes(bytes);
+        }
+    }
+}
+
+fn dec_loose_raster(d: &mut R<'_>) -> Result<(ImageFormat, Vec<u8>), CanonFault> {
+    use super::handler_osc_1337::{MAX_IMAGE_BYTES, MAX_LIVE_IMAGE_BYTES};
+    match d.u8("pane_carry.loose_images.format")? {
+        0 => {
+            let bytes = d.bytes("pane_carry.loose_images.bytes")?.to_vec();
+            if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
+                return Err(fault(
+                    "pane_carry.loose_images.bytes",
+                    "PNG payload must be 1..=MAX_IMAGE_BYTES",
+                ));
+            }
+            Ok((ImageFormat::Png, bytes))
+        }
+        1 => {
+            let width = d.u16("pane_carry.loose_images.format")?;
+            let height = d.u16("pane_carry.loose_images.format")?;
+            if width == 0 || height == 0 {
+                return Err(fault(
+                    "pane_carry.loose_images.format",
+                    "RGBA dimensions must be non-zero",
+                ));
+            }
+            let expected = usize::from(width)
+                .saturating_mul(usize::from(height))
+                .saturating_mul(4);
+            let bytes = d.bytes("pane_carry.loose_images.bytes")?.to_vec();
+            if expected > MAX_IMAGE_BYTES || bytes.len() != expected {
+                return Err(fault(
+                    "pane_carry.loose_images.bytes",
+                    "RGBA payload must equal 4 * width * height within MAX_IMAGE_BYTES",
+                ));
+            }
+            Ok((ImageFormat::RawRgba8 { width, height }, bytes))
+        }
+        2 => {
+            let bytes = d.bytes("pane_carry.loose_images.bytes")?.to_vec();
+            if bytes.is_empty() || bytes.len() > MAX_LIVE_IMAGE_BYTES {
+                return Err(fault(
+                    "pane_carry.loose_images.bytes",
+                    "unknown-format inline payload must be 1..=MAX_LIVE_IMAGE_BYTES",
+                ));
+            }
+            Ok((ImageFormat::Unknown, bytes))
+        }
+        _ => Err(fault(
+            "pane_carry.loose_images.format",
+            "format tag is 0 (Png), 1 (RawRgba8) or 2 (Unknown)",
+        )),
+    }
+}
+
+fn enc_loose_images(w: &mut W, loose: &[LooseImageCarry]) {
+    w.len(loose.len());
+    for lc in loose {
+        enc_loose_raster(w, lc.format, &lc.bytes);
+        enc_kitty_layout(w, &lc.layout);
+    }
+}
+
+fn dec_loose_images(d: &mut R<'_>) -> Result<Vec<LooseImageCarry>, CanonFault> {
+    use super::handler_osc_1337::MAX_LIVE_IMAGE_BYTES;
+    const MAX_LOOSE_IMAGES: usize = 65_536;
+    const MAX_LOOSE_TOTAL_BYTES: usize = 8 * MAX_LIVE_IMAGE_BYTES;
+    let n = d.count("pane_carry.loose_images", 24)?;
+    if n > MAX_LOOSE_IMAGES {
+        return Err(fault("pane_carry.loose_images", "past MAX_LOOSE_IMAGES"));
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut total_bytes = 0usize;
+    for _ in 0..n {
+        let (format, bytes) = dec_loose_raster(d)?;
+        total_bytes = total_bytes.checked_add(bytes.len()).ok_or_else(|| {
+            fault(
+                "pane_carry.loose_images",
+                "loose image bytes overflow usize",
+            )
+        })?;
+        if total_bytes > MAX_LOOSE_TOTAL_BYTES {
+            return Err(fault(
+                "pane_carry.loose_images",
+                "loose image bytes exceed cap",
+            ));
+        }
+        let layout = dec_kitty_layout(d)?;
+        out.push(LooseImageCarry {
+            bytes,
+            format,
+            layout,
+        });
+    }
+    Ok(out)
+}
+
+fn enc_placed_source(w: &mut W, src: PlacedImageSourceCarry) {
+    match src {
+        PlacedImageSourceCarry::KittyFrame { image_id, frame } => {
+            w.u8(0);
+            w.u32(image_id);
+            w.u8(frame);
+        }
+        PlacedImageSourceCarry::KittyVariant { image_id, variant } => {
+            w.u8(1);
+            w.u32(image_id);
+            w.u8(variant);
+        }
+        PlacedImageSourceCarry::Loose(idx) => {
+            w.u8(2);
+            w.u32(idx);
+        }
+    }
+}
+
+fn dec_placed_source<'a>(
+    d: &mut R<'_>,
+    store: &'a [KittyImageCarry],
+    loose: &'a [LooseImageCarry],
+    next_loose: &mut u32,
+    field: &'static str,
+) -> Result<(PlacedImageSourceCarry, &'a KittyLayoutCarry), CanonFault> {
+    match d.u8(field)? {
+        0 => {
+            let image_id = d.u32(field)?;
+            let frame = d.u8(field)?;
+            let pos = store
+                .binary_search_by_key(&image_id, |e| e.id)
+                .map_err(|_| fault(field, "placed KittyFrame names an unstored image_id"))?;
+            let fc = store[pos]
+                .frames
+                .get(usize::from(frame))
+                .ok_or_else(|| fault(field, "placed KittyFrame index out of range"))?;
+            Ok((
+                PlacedImageSourceCarry::KittyFrame { image_id, frame },
+                &fc.layout,
+            ))
+        }
+        1 => {
+            let image_id = d.u32(field)?;
+            let variant = d.u8(field)?;
+            let pos = store
+                .binary_search_by_key(&image_id, |e| e.id)
+                .map_err(|_| fault(field, "placed KittyVariant names an unstored image_id"))?;
+            let vc = store[pos]
+                .variants
+                .get(usize::from(variant))
+                .ok_or_else(|| fault(field, "placed KittyVariant index out of range"))?;
+            Ok((
+                PlacedImageSourceCarry::KittyVariant { image_id, variant },
+                &vc.layout,
+            ))
+        }
+        2 => {
+            let idx = d.u32(field)?;
+            let slot = usize::try_from(idx)
+                .ok()
+                .and_then(|i| loose.get(i))
+                .ok_or_else(|| fault(field, "placed Loose index out of range"))?;
+            if idx > *next_loose {
+                return Err(fault(
+                    field,
+                    "loose images must appear in canonical first-reference order",
+                ));
+            }
+            if idx == *next_loose {
+                *next_loose = next_loose.saturating_add(1);
+            }
+            Ok((PlacedImageSourceCarry::Loose(idx), &slot.layout))
+        }
+        _ => Err(fault(
+            field,
+            "placed source tag is 0 (KittyFrame), 1 (KittyVariant) or 2 (Loose)",
+        )),
+    }
+}
+
+fn enc_kitty_tag(w: &mut W, tag: aterm_grid::KittyPlacementTag) {
+    w.u32(tag.image_id);
+    w.u32(tag.placement_id);
+    w.u32(tag.image_serial.get());
+    w.u32(tag.serial.get());
+}
+
+fn dec_kitty_tag(
+    d: &mut R<'_>,
+    field: &'static str,
+) -> Result<aterm_grid::KittyPlacementTag, CanonFault> {
+    use core::num::NonZeroU32;
+    let image_id = d.u32(field)?;
+    let placement_id = d.u32(field)?;
+    let image_serial = NonZeroU32::new(d.u32(field)?)
+        .ok_or_else(|| fault(field, "kitty tag image_serial must be non-zero"))?;
+    let serial = NonZeroU32::new(d.u32(field)?)
+        .ok_or_else(|| fault(field, "kitty tag serial must be non-zero"))?;
+    Ok(aterm_grid::KittyPlacementTag {
+        image_id,
+        placement_id,
+        image_serial,
+        serial,
+    })
+}
+
+fn enc_kitty_parent(w: &mut W, parent: KittyParentCarry) {
+    match parent {
+        KittyParentCarry::Named {
+            image_id,
+            placement_id,
+        } => {
+            w.u8(0);
+            w.u32(image_id);
+            w.u32(placement_id.get());
+        }
+        KittyParentCarry::Serial { image_id, serial } => {
+            w.u8(1);
+            w.u32(image_id);
+            w.u32(serial.get());
+        }
+    }
+}
+
+fn dec_kitty_parent(d: &mut R<'_>, field: &'static str) -> Result<KittyParentCarry, CanonFault> {
+    use core::num::NonZeroU32;
+    match d.u8(field)? {
+        0 => {
+            let image_id = d.u32(field)?;
+            let placement_id = NonZeroU32::new(d.u32(field)?)
+                .ok_or_else(|| fault(field, "named parent placement_id must be non-zero"))?;
+            Ok(KittyParentCarry::Named {
+                image_id,
+                placement_id,
+            })
+        }
+        1 => {
+            let image_id = d.u32(field)?;
+            let serial = NonZeroU32::new(d.u32(field)?)
+                .ok_or_else(|| fault(field, "serial parent serial must be non-zero"))?;
+            Ok(KittyParentCarry::Serial { image_id, serial })
+        }
+        _ => Err(fault(field, "parent tag is 0 (Named) or 1 (Serial)")),
+    }
+}
+
+fn enc_kitty_floating(w: &mut W, floating: &[KittyFloatingCarry]) {
+    w.len(floating.len());
+    for fl in floating {
+        enc_kitty_tag(w, fl.tag);
+        enc_placed_source(w, fl.image);
+        match fl.parent {
+            KittyFloatParentCarry::Virtual(p) => {
+                w.u8(0);
+                enc_kitty_parent(w, p);
+            }
+            KittyFloatParentCarry::Floating(p) => {
+                w.u8(1);
+                enc_kitty_parent(w, p);
+            }
+        }
+        w.i32(fl.dx);
+        w.i32(fl.dy);
+    }
+}
+
+fn dec_kitty_floating(
+    d: &mut R<'_>,
+    store: &[KittyImageCarry],
+    loose: &[LooseImageCarry],
+    next_loose: &mut u32,
+) -> Result<Vec<KittyFloatingCarry>, CanonFault> {
+    use super::kitty_floating::MAX_KITTY_FLOATING;
+    let n = d.count("pane_carry.kitty_floating", 34)?;
+    if n > MAX_KITTY_FLOATING {
+        return Err(fault(
+            "pane_carry.kitty_floating",
+            "past MAX_KITTY_FLOATING",
+        ));
+    }
+    let mut out: Vec<KittyFloatingCarry> = Vec::with_capacity(n);
+    for _ in 0..n {
+        let tag = dec_kitty_tag(d, "pane_carry.kitty_floating.tag")?;
+        if out.iter().any(|prev| prev.tag.serial == tag.serial) {
+            return Err(fault(
+                "pane_carry.kitty_floating.tag",
+                "duplicate floating placement serial",
+            ));
+        }
+        let (image, _) = dec_placed_source(
+            d,
+            store,
+            loose,
+            next_loose,
+            "pane_carry.kitty_floating.image",
+        )?;
+        let parent = match d.u8("pane_carry.kitty_floating.parent")? {
+            0 => KittyFloatParentCarry::Virtual(dec_kitty_parent(
+                d,
+                "pane_carry.kitty_floating.parent",
+            )?),
+            1 => KittyFloatParentCarry::Floating(dec_kitty_parent(
+                d,
+                "pane_carry.kitty_floating.parent",
+            )?),
+            _ => {
+                return Err(fault(
+                    "pane_carry.kitty_floating.parent",
+                    "float parent tag is 0 (Virtual) or 1 (Floating)",
+                ));
+            }
+        };
+        let dx = d.i32("pane_carry.kitty_floating.dx")?;
+        let dy = d.i32("pane_carry.kitty_floating.dy")?;
+        out.push(KittyFloatingCarry {
+            tag,
+            image,
+            parent,
+            dx,
+            dy,
+        });
+    }
+    Ok(out)
+}
+
+fn enc_kitty_relations(w: &mut W, relations: &[KittyRelationCarry]) {
+    w.len(relations.len());
+    for rel in relations {
+        enc_kitty_tag(w, rel.child);
+        enc_kitty_parent(w, rel.parent);
+        w.i32(rel.dx);
+        w.i32(rel.dy);
+    }
+}
+
+fn dec_kitty_relations(d: &mut R<'_>) -> Result<Vec<KittyRelationCarry>, CanonFault> {
+    const MAX_RELATIONS: usize = 65_536;
+    let n = d.count("pane_carry.kitty_relations", 29)?;
+    if n > MAX_RELATIONS {
+        return Err(fault("pane_carry.kitty_relations", "past MAX_RELATIONS"));
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut seen_serials = std::collections::HashSet::with_capacity(n);
+    for _ in 0..n {
+        let child = dec_kitty_tag(d, "pane_carry.kitty_relations.child")?;
+        if !seen_serials.insert(child.serial) {
+            return Err(fault(
+                "pane_carry.kitty_relations.child",
+                "duplicate relation child serial",
+            ));
+        }
+        let parent = dec_kitty_parent(d, "pane_carry.kitty_relations.parent")?;
+        let dx = d.i32("pane_carry.kitty_relations.dx")?;
+        let dy = d.i32("pane_carry.kitty_relations.dy")?;
+        out.push(KittyRelationCarry {
+            child,
+            parent,
+            dx,
+            dy,
+        });
+    }
+    Ok(out)
+}
+
+fn enc_placed_spans(w: &mut W, spans: &[PlacedSpanCarry]) {
+    w.len(spans.len());
+    for sp in spans {
+        w.u16(sp.start_col);
+        w.u16(sp.end_col);
+        w.u16(sp.image_row);
+        w.u16(sp.first_cell_col);
+        enc_placed_source(w, sp.image);
+        w.opt(sp.kitty, enc_kitty_tag);
+    }
+}
+
+fn dec_placed_spans(
+    d: &mut R<'_>,
+    store: &[KittyImageCarry],
+    loose: &[LooseImageCarry],
+    next_loose: &mut u32,
+) -> Result<Vec<PlacedSpanCarry>, CanonFault> {
+    let max_spans = usize::from(MAX_GRID_COLS) * aterm_grid::MAX_IMAGE_LAYERS;
+    let n = d.count("pane_carry.placed_grid.spans", 14)?;
+    if n == 0 || n > max_spans {
+        return Err(fault(
+            "pane_carry.placed_grid.spans",
+            "row span list must be non-empty and within MAX_GRID_COLS * MAX_IMAGE_LAYERS",
+        ));
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut prev_key: Option<((i32, u32, u32), u16)> = None;
+    for _ in 0..n {
+        let start_col = d.u16("pane_carry.placed_grid.span")?;
+        let end_col = d.u16("pane_carry.placed_grid.span")?;
+        if start_col >= end_col || end_col > MAX_GRID_COLS {
+            return Err(fault(
+                "pane_carry.placed_grid.span",
+                "span columns must satisfy start_col < end_col <= MAX_GRID_COLS",
+            ));
+        }
+        let image_row = d.u16("pane_carry.placed_grid.span")?;
+        let first_cell_col = d.u16("pane_carry.placed_grid.span")?;
+        let (image, layout) = dec_placed_source(
+            d,
+            store,
+            loose,
+            next_loose,
+            "pane_carry.placed_grid.span.image",
+        )?;
+        if image_row >= layout.rows
+            || u32::from(first_cell_col).saturating_add(u32::from(end_col - start_col))
+                > u32::from(layout.cols)
+        {
+            return Err(fault(
+                "pane_carry.placed_grid.span",
+                "span footprint exceeds image layout rows or cols",
+            ));
+        }
+        let kitty = d.opt("pane_carry.placed_grid.span.kitty", |d| {
+            dec_kitty_tag(d, "pane_carry.placed_grid.span.kitty")
+        })?;
+        let key = (aterm_types::layer_order(layout.z_index, kitty), start_col);
+        if prev_key.is_some_and(|prev| key < prev) {
+            return Err(fault(
+                "pane_carry.placed_grid.spans",
+                "spans must be sorted by (layer_order, start_col)",
+            ));
+        }
+        prev_key = Some(key);
+        out.push(PlacedSpanCarry {
+            start_col,
+            end_col,
+            image_row,
+            first_cell_col,
+            image,
+            kitty,
+        });
+    }
+    Ok(out)
+}
+
+fn enc_placed_grid(w: &mut W, grid: &PlacedGridCarry) {
+    w.len(grid.visible.len());
+    for &(row, ref spans) in &grid.visible {
+        w.u16(row);
+        enc_placed_spans(w, spans);
+    }
+    w.len(grid.history_rev.len());
+    for &(rev, ref spans) in &grid.history_rev {
+        w.u32(rev);
+        enc_placed_spans(w, spans);
+    }
+}
+
+fn dec_placed_grid(
+    d: &mut R<'_>,
+    store: &[KittyImageCarry],
+    loose: &[LooseImageCarry],
+    next_loose: &mut u32,
+) -> Result<PlacedGridCarry, CanonFault> {
+    let n_vis = d.count("pane_carry.placed_grid.visible", 10)?;
+    if n_vis > usize::from(MAX_GRID_ROWS) {
+        return Err(fault(
+            "pane_carry.placed_grid.visible",
+            "past MAX_GRID_ROWS",
+        ));
+    }
+    let mut visible = Vec::with_capacity(n_vis);
+    let mut prev_row: Option<u16> = None;
+    for _ in 0..n_vis {
+        let row = d.u16("pane_carry.placed_grid.visible.row")?;
+        if row >= MAX_GRID_ROWS || prev_row.is_some_and(|p| row <= p) {
+            return Err(fault(
+                "pane_carry.placed_grid.visible.row",
+                "visible rows must be < MAX_GRID_ROWS and strictly ascending",
+            ));
+        }
+        prev_row = Some(row);
+        let spans = dec_placed_spans(d, store, loose, next_loose)?;
+        visible.push((row, spans));
+    }
+
+    let n_hist = d.count("pane_carry.placed_grid.history_rev", 12)?;
+    if n_hist > PANE_HISTORY_IMAGE_LINES {
+        return Err(fault(
+            "pane_carry.placed_grid.history_rev",
+            "past PANE_HISTORY_IMAGE_LINES",
+        ));
+    }
+    let hist_cap = u32::try_from(PANE_HISTORY_IMAGE_LINES).unwrap_or(u32::MAX);
+    let mut history_rev = Vec::with_capacity(n_hist);
+    let mut prev_rev: Option<u32> = None;
+    for _ in 0..n_hist {
+        let rev = d.u32("pane_carry.placed_grid.history_rev.rev")?;
+        if rev >= hist_cap || prev_rev.is_some_and(|p| rev <= p) {
+            return Err(fault(
+                "pane_carry.placed_grid.history_rev.rev",
+                "history_rev indices must be < PANE_HISTORY_IMAGE_LINES and strictly ascending",
+            ));
+        }
+        prev_rev = Some(rev);
+        let spans = dec_placed_spans(d, store, loose, next_loose)?;
+        history_rev.push((rev, spans));
+    }
+
+    Ok(PlacedGridCarry {
+        visible,
+        history_rev,
+    })
+}
+
 impl PaneStepCarry {
     /// Canonical byte encoding of this [`PaneStepCarry`] (`PANE_CARRY_CANON_VERSION`).
     #[must_use]
@@ -2023,8 +3243,16 @@ impl PaneStepCarry {
             active_handback,
             inactive_handback,
             dcs_query,
+            kitty_store,
+            kitty_numbers,
+            kitty_pending,
+            loose_images,
+            kitty_floating,
+            kitty_relations,
+            active_images,
+            inactive_images,
         } = self;
-        let mut w = W(Vec::with_capacity(240));
+        let mut w = W(Vec::with_capacity(256));
         w.raw(PANE_CARRY_MAGIC);
         w.u32(PANE_CARRY_CANON_VERSION);
         w.opt_u64(*sync_start_ns);
@@ -2065,6 +3293,18 @@ impl PaneStepCarry {
         enc_handback(&mut w, *active_handback);
         w.opt(*inactive_handback, enc_handback);
         w.opt(dcs_query.as_ref(), enc_dcs_query);
+        enc_kitty_store(&mut w, kitty_store);
+        w.len(kitty_numbers.len());
+        for &(num, id) in kitty_numbers {
+            w.u32(num);
+            w.u32(id);
+        }
+        w.opt(kitty_pending.as_ref(), enc_kitty_pending);
+        enc_loose_images(&mut w, loose_images);
+        enc_kitty_floating(&mut w, kitty_floating);
+        enc_kitty_relations(&mut w, kitty_relations);
+        enc_placed_grid(&mut w, active_images);
+        w.opt(inactive_images.as_ref(), enc_placed_grid);
         w.0
     }
 
@@ -2072,6 +3312,10 @@ impl PaneStepCarry {
     ///
     /// # Errors
     /// Returns [`CanonFault`] naming the first non-canonical field.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "sequential wire decode and canonical validation of PaneStepCarry"
+    )]
     pub fn from_canonical(bytes: &[u8]) -> Result<Self, CanonFault> {
         let mut d = R { b: bytes };
         d.magic(
@@ -2136,6 +3380,32 @@ impl PaneStepCarry {
             dec_handback(d, "pane_carry.inactive_handback")
         })?;
         let dcs_query = d.opt("pane_carry.dcs_query", dec_dcs_query)?;
+        let kitty_store = dec_kitty_store(&mut d)?;
+        let kitty_numbers = dec_kitty_numbers(&mut d, &kitty_store)?;
+        let kitty_pending = d.opt("pane_carry.kitty_pending", |d| {
+            dec_kitty_pending(d, &kitty_store, &kitty_numbers)
+        })?;
+        let loose_images = dec_loose_images(&mut d)?;
+        let mut next_loose = 0u32;
+        let kitty_floating =
+            dec_kitty_floating(&mut d, &kitty_store, &loose_images, &mut next_loose)?;
+        let kitty_relations = dec_kitty_relations(&mut d)?;
+        let active_images = dec_placed_grid(&mut d, &kitty_store, &loose_images, &mut next_loose)?;
+        let inactive_images = d.opt("pane_carry.inactive_images", |d| {
+            dec_placed_grid(d, &kitty_store, &loose_images, &mut next_loose)
+        })?;
+        if inactive_images.is_some() != inactive_handback.is_some() {
+            return Err(fault(
+                "pane_carry.inactive_images",
+                "inactive_images presence must match inactive_handback",
+            ));
+        }
+        if usize::try_from(next_loose).ok() != Some(loose_images.len()) {
+            return Err(fault(
+                "pane_carry.loose_images",
+                "every loose image must be referenced at least once",
+            ));
+        }
         d.end("pane_carry")?;
         let carry = Self {
             sync_start_ns,
@@ -2161,6 +3431,14 @@ impl PaneStepCarry {
             active_handback,
             inactive_handback,
             dcs_query,
+            kitty_store,
+            kitty_numbers,
+            kitty_pending,
+            loose_images,
+            kitty_floating,
+            kitty_relations,
+            active_images,
+            inactive_images,
         };
         if carry.canonical() != bytes {
             return Err(fault(
@@ -2396,6 +3674,10 @@ pub fn policy_from_canonical(bytes: &[u8]) -> Result<aterm_policy::Policy, Canon
     }
     Ok(policy)
 }
+
+#[cfg(test)]
+#[path = "checkpoint_image_regressions.rs"]
+mod image_replay_regressions;
 
 #[cfg(test)]
 mod tests {
@@ -2778,6 +4060,370 @@ mod tests {
                 .expect_err("st_pending with string_utf8_tail")
                 .field,
             "pane_carry.dcs_query.parser"
+        );
+    }
+
+    #[test]
+    fn pane_step_carry_kitty_store_numbers_and_pending_roundtrip_and_reject_noncanonical() {
+        use crate::terminal::{KittyLayoutCarry, KittyVariantCarry, KittyVariantSourceCarry};
+        use aterm_types::{ImageFormat, ImageScaling};
+
+        let origin = aterm_time::Instant::now();
+        let cfg = crate::config::TerminalConfig::default();
+        let mut live = Terminal::new(6, 30);
+        live.set_cell_pixel_size(10, 20);
+        // Image 1 (assigned via number 42): 2 RGBA frames (3x1 = 12 bytes each), shown_frame = 1
+        // (c=2), playing, two U=1 virtual placements (one cropped variant, one stretched), and a
+        // placeholder cell.
+        live.process(b"\x1b_Ga=t,f=32,s=3,v=1,I=42;////AAAA////AAAA\x1b\\");
+        live.process(b"\x1b_Ga=f,f=32,s=3,v=1,i=1,z=80;AAAA////AAAA////\x1b\\");
+        live.process(b"\x1b_Ga=a,i=1,c=2,s=3\x1b\\");
+        live.process(b"\x1b_Ga=p,U=1,i=1,p=2,x=1,y=0,w=2,h=1,c=2,r=1\x1b\\");
+        live.process(b"\x1b_Ga=p,U=1,i=1,p=3,c=3,r=1\x1b\\");
+        live.process("\x1b[2;1H\x1b[38;5;1m\u{10EEEE}\u{0305}\u{0305}\x1b[39m".as_bytes());
+        // Image 9: 1x1 RGB (expanded to 1x1 RGBA = 4 bytes) plus an in-flight chunked transfer (`m=1`).
+        live.process(b"\x1b_Ga=t,f=24,s=1,v=1,i=9;/wAA\x1b\\");
+        live.process(b"\x1b_Ga=t,f=24,s=1,v=1,i=12,m=1;AP\x1b\\");
+        let _ = live.take_response();
+
+        let cp = live.checkpoint_pane_step(2048).expect("at ground");
+        let carry = PaneStepCarry::capture(&live, origin, 2048);
+        assert_eq!(carry.kitty_store.len(), 2);
+        assert_eq!(carry.kitty_numbers, vec![(42, 1)]);
+        assert!(carry.kitty_pending.is_some());
+
+        let replay_carry = live.capture_replay_carry();
+        assert!(replay_carry.retained_image_bytes() >= 12 + 12 + 4 + 2);
+        let from_rc = PaneStepCarry::from_replay_carry(&replay_carry, &cp, &cfg, None, origin);
+        assert_eq!(from_rc, carry);
+
+        let bytes = carry.canonical();
+        let decoded = PaneStepCarry::from_canonical(&bytes).expect("canonical kitty carry");
+        assert_eq!(decoded, carry);
+        assert_eq!(decoded.canonical(), bytes);
+
+        // Also exercise the Orphan variant arm roundtrip.
+        let mut with_orphan = carry.clone();
+        with_orphan.kitty_store[1].variants.push(KittyVariantCarry {
+            source: KittyVariantSourceCarry::Orphan {
+                bytes: vec![7, 8, 9, 255],
+                format: ImageFormat::RawRgba8 {
+                    width: 1,
+                    height: 1,
+                },
+            },
+            layout: KittyLayoutCarry {
+                cols: 2,
+                rows: 1,
+                z_index: 0,
+                cell_offset_px: (0, 0),
+                scaling: ImageScaling::Stretch,
+                source_rect: None,
+            },
+        });
+        let orphan_bytes = with_orphan.canonical();
+        let orphan_decoded =
+            PaneStepCarry::from_canonical(&orphan_bytes).expect("orphan variant decodes");
+        assert_eq!(orphan_decoded, with_orphan);
+        assert_eq!(orphan_decoded.canonical(), orphan_bytes);
+
+        let mut pane_replay = Terminal::replay_from_checkpoint(&cp);
+        pane_replay.set_cell_pixel_size(10, 20);
+        pane_replay.apply_pane_step_carry(&decoded, origin);
+
+        let mut carry_replay = Terminal::replay_from_checkpoint(&cp);
+        carry_replay.set_cell_pixel_size(10, 20);
+        carry_replay.apply_replay_carry(&replay_carry);
+
+        let tail = b"\x1b_Gm=0;8A\x1b\\\
+                     \x1b[3;1H\x1b_Ga=p,i=12,c=1,r=1\x1b\\\
+                     \x1b[4;1H\x1b_Ga=p,I=42,c=2,r=1\x1b\\\
+                     \x1b_Ga=a,i=1,c=1\x1b\\\
+                     \x1b_Ga=d,d=I,i=1\x1b\\";
+        live.process(tail);
+        pane_replay.process(tail);
+        carry_replay.process(tail);
+
+        let live_resp = live.take_response();
+        assert_eq!(pane_replay.take_response(), live_resp);
+        assert_eq!(carry_replay.take_response(), live_resp);
+        assert_eq!(pane_replay.checkpoint(), live.checkpoint());
+        assert_eq!(carry_replay.checkpoint(), live.checkpoint());
+        assert_eq!(
+            pane_replay.transient.kitty_total_bytes,
+            live.transient.kitty_total_bytes
+        );
+        assert_eq!(
+            carry_replay.transient.kitty_total_bytes,
+            live.transient.kitty_total_bytes
+        );
+        assert_eq!(
+            pane_replay.transient.live_image_charge,
+            live.transient.live_image_charge
+        );
+        assert_eq!(
+            carry_replay.transient.live_image_charge,
+            live.transient.live_image_charge
+        );
+
+        // Negative controls on canonical validation.
+        let mut zero_id = carry.clone();
+        zero_id.kitty_store[0].id = 0;
+        assert_eq!(
+            PaneStepCarry::from_canonical(&zero_id.canonical())
+                .expect_err("zero kitty id")
+                .field,
+            "pane_carry.kitty_store.id"
+        );
+
+        let mut unsorted = carry.clone();
+        unsorted.kitty_store.swap(0, 1);
+        assert_eq!(
+            PaneStepCarry::from_canonical(&unsorted.canonical())
+                .expect_err("unsorted kitty ids")
+                .field,
+            "pane_carry.kitty_store.id"
+        );
+
+        let mut bad_shown = carry.clone();
+        bad_shown.kitty_store[0].shown_frame = 2;
+        assert_eq!(
+            PaneStepCarry::from_canonical(&bad_shown.canonical())
+                .expect_err("shown_frame >= frames.len()")
+                .field,
+            "pane_carry.kitty_store.shown_frame"
+        );
+
+        let mut bad_cols = carry.clone();
+        bad_cols.kitty_store[0].frames[0].layout.cols = 0;
+        assert_eq!(
+            PaneStepCarry::from_canonical(&bad_cols.canonical())
+                .expect_err("zero frame layout cols")
+                .field,
+            "pane_carry.kitty_layout.cols"
+        );
+
+        let mut bad_rgba = carry.clone();
+        bad_rgba.kitty_store[0].frames[0].bytes = vec![0u8; 11];
+        assert_eq!(
+            PaneStepCarry::from_canonical(&bad_rgba.canonical())
+                .expect_err("RGBA byte length mismatch")
+                .field,
+            "pane_carry.kitty_raster.bytes"
+        );
+
+        let mut dup_variant = carry.clone();
+        let v0 = dup_variant.kitty_store[0].variants[0].clone();
+        dup_variant.kitty_store[0].variants.push(v0);
+        assert_eq!(
+            PaneStepCarry::from_canonical(&dup_variant.canonical())
+                .expect_err("duplicate variant layout")
+                .field,
+            "pane_carry.kitty_store.variants"
+        );
+
+        let mut orphan_num = carry.clone();
+        orphan_num.kitty_numbers = vec![(42, 999)];
+        assert_eq!(
+            PaneStepCarry::from_canonical(&orphan_num.canonical())
+                .expect_err("kitty_numbers id missing from store")
+                .field,
+            "pane_carry.kitty_numbers"
+        );
+
+        let mut settled_pending = carry;
+        settled_pending.kitty_pending.as_mut().unwrap().more = false;
+        assert_eq!(
+            PaneStepCarry::from_canonical(&settled_pending.canonical())
+                .expect_err("kitty_pending with more == false")
+                .field,
+            "pane_carry.kitty_pending"
+        );
+    }
+
+    #[test]
+    fn pane_step_carry_placed_images_floating_relations_and_history_roundtrip_and_reject_noncanonical()
+     {
+        let origin = aterm_time::Instant::now();
+        let cfg = crate::config::TerminalConfig::default();
+        let mut live = Terminal::new(6, 30);
+        live.set_cell_pixel_size(10, 20);
+
+        // 1. Place an iTerm2 OSC 1337 2-row loose image at the top and scroll its top row into
+        // primary history (`history_rev`), keeping its second row on screen (`visible`) sharing
+        // the same LooseImageCarry slot.
+        live.process(
+            b"\x1b]1337;File=inline=1;width=3;height=2;preserveAspectRatio=0:QUJDREVGRw==\x1b\\",
+        );
+        live.process(b"\x1b[6;1H\r\n");
+
+        // 2. Unnamed (`i=0`) Kitty `a=T` loose placement on the primary screen.
+        live.process(b"\x1b[1;10H\x1b_Ga=T,f=24,s=1,v=1,c=2,r=1;/wAA\x1b\\");
+
+        // 3. Stored 2-frame Kitty image `i=1` with:
+        //    - cell parent `p=10` + cell-relative child `p=11` (`kitty_relations`),
+        //    - virtual parent `p=2` + placeholder + floating child `p=21` (`kitty_floating`).
+        live.process(b"\x1b_Ga=t,f=32,s=2,v=1,i=1;////AAAA//8=\x1b\\");
+        live.process(b"\x1b_Ga=f,f=32,s=2,v=1,i=1,z=40;AAAA//////8=\x1b\\");
+        live.process(b"\x1b[3;2H\x1b_Ga=p,i=1,p=10,c=2,r=1\x1b\\");
+        live.process(b"\x1b_Ga=p,i=1,p=11,P=1,Q=10,H=3,V=0,c=1,r=1\x1b\\");
+        live.process(b"\x1b_Ga=p,U=1,i=1,p=2,c=2,r=1\x1b\\");
+        live.process(
+            "\x1b[4;2H\x1b[38;5;1;58;5;2m\u{10EEEE}\u{0305}\u{0305}\x1b[39;59m".as_bytes(),
+        );
+        live.process(b"\x1b_Ga=p,i=1,p=21,P=1,Q=2,H=1,V=0,c=1,r=1\x1b\\");
+
+        // 4. Enter alternate screen and place another loose OSC 1337 image so both `active_images`
+        // (alt) and `inactive_images` (primary visible + history_rev) carry placements.
+        live.process(b"\x1b[?1049h\x1b[2;2H\x1b]1337;File=inline=1;width=2;height=1:WFla\x1b\\");
+        let _ = live.take_response();
+
+        let cp = live.checkpoint_pane_step(2048).expect("at ground");
+        let carry = PaneStepCarry::capture(&live, origin, 2048);
+        assert_eq!(
+            carry.loose_images.len(),
+            3,
+            "alt OSC1337 + primary OSC1337 + primary i=0 a=T"
+        );
+        assert_eq!(carry.kitty_floating.len(), 1);
+        assert_eq!(carry.kitty_relations.len(), 1);
+        assert!(!carry.active_images.visible.is_empty());
+        let inactive = carry.inactive_images.as_ref().expect("alt up -> inactive");
+        assert!(!inactive.visible.is_empty());
+        assert!(!inactive.history_rev.is_empty());
+
+        let replay_carry = live.capture_replay_carry();
+        assert!(replay_carry.retained_image_bytes() > 0);
+        let from_rc = PaneStepCarry::from_replay_carry(&replay_carry, &cp, &cfg, None, origin);
+        assert_eq!(from_rc, carry);
+
+        let bytes = carry.canonical();
+        let decoded = PaneStepCarry::from_canonical(&bytes).expect("canonical placed carry");
+        assert_eq!(decoded, carry);
+        assert_eq!(decoded.canonical(), bytes);
+
+        let mut pane_replay = Terminal::replay_from_checkpoint(&cp);
+        pane_replay.set_cell_pixel_size(10, 20);
+        pane_replay.apply_pane_step_carry(&decoded, origin);
+
+        let mut carry_replay = Terminal::replay_from_checkpoint(&cp);
+        carry_replay.set_cell_pixel_size(10, 20);
+        carry_replay.apply_replay_carry(&replay_carry);
+
+        // Leave alt screen, move parent p=10 (cascades to relative child p=11), switch frame 2 on
+        // i=1, and delete parent p=10 (`d=P` cascades to p=11).
+        let base_clock = super::super::ClockReading::now();
+        let c1 = super::super::ClockReading {
+            monotonic: origin + core::time::Duration::from_millis(50),
+            ..base_clock
+        };
+        let tail = b"\x1b[?1049l\
+                     \x1b[3;6H\x1b_Ga=p,i=1,p=10,c=2,r=1\x1b\\\
+                     \x1b_Ga=a,i=1,c=2\x1b\\";
+        live.process_at(tail, c1);
+        pane_replay.process_at(tail, c1);
+        carry_replay.process_at(tail, c1);
+
+        let live_resp = live.take_response();
+        assert_eq!(pane_replay.take_response(), live_resp);
+        assert_eq!(carry_replay.take_response(), live_resp);
+        assert_eq!(pane_replay.checkpoint(), live.checkpoint());
+        assert_eq!(carry_replay.checkpoint(), live.checkpoint());
+        assert_eq!(
+            PaneStepCarry::capture(&pane_replay, origin, 2048),
+            PaneStepCarry::capture(&live, origin, 2048),
+        );
+        assert_eq!(
+            PaneStepCarry::capture(&carry_replay, origin, 2048),
+            PaneStepCarry::capture(&live, origin, 2048),
+        );
+
+        // Cascading delete of parent p=10 removes both p=10 and relative child p=11 identically.
+        let c2 = super::super::ClockReading {
+            monotonic: origin + core::time::Duration::from_millis(100),
+            ..base_clock
+        };
+        let del = b"\x1b_Ga=d,d=P,i=1,p=10\x1b\\";
+        live.process_at(del, c2);
+        pane_replay.process_at(del, c2);
+        carry_replay.process_at(del, c2);
+        assert_eq!(
+            PaneStepCarry::capture(&pane_replay, origin, 2048),
+            PaneStepCarry::capture(&live, origin, 2048),
+        );
+        assert_eq!(
+            PaneStepCarry::capture(&carry_replay, origin, 2048),
+            PaneStepCarry::capture(&live, origin, 2048),
+        );
+
+        // Negative controls on v5 canonical validation.
+        let mut unref_loose = carry.clone();
+        let extra_loose = unref_loose.loose_images[0].clone();
+        unref_loose.loose_images.push(extra_loose);
+        assert_eq!(
+            PaneStepCarry::from_canonical(&unref_loose.canonical())
+                .expect_err("unreferenced loose image")
+                .field,
+            "pane_carry.loose_images"
+        );
+
+        let mut swapped_loose = carry.clone();
+        swapped_loose.active_images.visible[0].1[0].image = PlacedImageSourceCarry::Loose(1);
+        assert_eq!(
+            PaneStepCarry::from_canonical(&swapped_loose.canonical())
+                .expect_err("Loose(1) referenced before Loose(0)")
+                .field,
+            "pane_carry.placed_grid.span.image"
+        );
+
+        let mut bad_store_ref = carry.clone();
+        bad_store_ref.active_images.visible[0].1[0].image = PlacedImageSourceCarry::KittyFrame {
+            image_id: 999,
+            frame: 0,
+        };
+        assert_eq!(
+            PaneStepCarry::from_canonical(&bad_store_ref.canonical())
+                .expect_err("unstored KittyFrame image_id")
+                .field,
+            "pane_carry.placed_grid.span.image"
+        );
+
+        let mut dup_float = carry.clone();
+        let fl0 = dup_float.kitty_floating[0];
+        dup_float.kitty_floating.push(fl0);
+        assert_eq!(
+            PaneStepCarry::from_canonical(&dup_float.canonical())
+                .expect_err("duplicate floating serial")
+                .field,
+            "pane_carry.kitty_floating.tag"
+        );
+
+        let mut dup_rel = carry.clone();
+        let rel0 = dup_rel.kitty_relations[0];
+        dup_rel.kitty_relations.push(rel0);
+        assert_eq!(
+            PaneStepCarry::from_canonical(&dup_rel.canonical())
+                .expect_err("duplicate relation serial")
+                .field,
+            "pane_carry.kitty_relations.child"
+        );
+
+        let mut bad_span = carry.clone();
+        bad_span.active_images.visible[0].1[0].image_row = 99;
+        assert_eq!(
+            PaneStepCarry::from_canonical(&bad_span.canonical())
+                .expect_err("span image_row >= layout.rows")
+                .field,
+            "pane_carry.placed_grid.span"
+        );
+
+        let mut bad_inactive = carry;
+        bad_inactive.inactive_images = None;
+        assert_eq!(
+            PaneStepCarry::from_canonical(&bad_inactive.canonical())
+                .expect_err("inactive_images None while inactive_handback Some")
+                .field,
+            "pane_carry.inactive_images"
         );
     }
 }

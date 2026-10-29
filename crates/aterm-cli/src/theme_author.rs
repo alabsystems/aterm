@@ -71,11 +71,12 @@ fn operands(
         };
         let value = match inline {
             Some(value) => value.to_string(),
-            None => iter
-                .next()
-                .and_then(|v| v.to_str())
-                .map(str::to_string)
-                .ok_or_else(|| format!("{flag} needs a value"))?,
+            None => {
+                let raw = iter.next().ok_or_else(|| format!("{flag} needs a value"))?;
+                raw.to_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("argument {:?} is not UTF-8", raw.to_string_lossy()))?
+            }
         };
         if value.is_empty() {
             return Err(format!("{flag} needs a value"));
@@ -1298,7 +1299,9 @@ mod tests {
             vec!["check"],
             vec!["check", "a", "b"],
             vec!["check", "a", "--format", "yaml"],
+            vec!["check", "a", "--format", "text", "--format", "json"],
             vec!["check", "a", "--strict=yes"],
+            vec!["check", "--help=extra"],
             vec!["new"],
             vec!["new", "x", "--appearance", "dim"],
             vec!["new", "Dracula"],
@@ -1311,6 +1314,23 @@ mod tests {
             let out = theme(&argv, None);
             assert_eq!(out.code, 2, "{argv:?}: {out:?}");
             assert!(out.stdout.is_empty(), "{argv:?}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            let bad = OsString::from_vec(vec![0xff]);
+            let out = run(
+                &[
+                    OsString::from("check"),
+                    OsString::from("a"),
+                    OsString::from("--format"),
+                    bad,
+                ],
+                None,
+                &NEVER_LISTS,
+            );
+            assert_eq!(out.code, 2);
+            assert!(out.stderr.contains("is not UTF-8"), "{}", out.stderr);
         }
     }
 

@@ -173,9 +173,20 @@ const RTF_GATEWAY: i32 = 0x2;
 #[cfg(target_os = "macos")]
 const RTF_LLINFO: i32 = 0x400;
 #[cfg(target_os = "macos")]
+const RTF_HOST: i32 = 0x4;
+#[cfg(target_os = "macos")]
 const RTA_DST: i32 = 0x1;
 #[cfg(target_os = "macos")]
 const RTA_GATEWAY: i32 = 0x2;
+#[cfg(target_os = "macos")]
+const RTA_IFP: i32 = 0x10;
+#[cfg(target_os = "macos")]
+const RTA_IFA: i32 = 0x20;
+/// `RTM_VERSION` and the `RTM_GET` message type (`net/route.h`).
+#[cfg(target_os = "macos")]
+const RTM_VERSION: u8 = 5;
+#[cfg(target_os = "macos")]
+const RTM_GET: u8 = 0x4;
 /// The sockaddr slots a route message's `rtm_addrs` bitmask can name (`RTAX_MAX`, `net/route.h`).
 #[cfg(target_os = "macos")]
 const RTAX_MAX: usize = 8;
@@ -275,28 +286,161 @@ fn for_each_route(table: &[u8], mut f: impl FnMut(i32, i32, &[u8])) {
 /// `ROUNDUP`). A sockaddr whose padded length runs past the block is read for what is there.
 #[cfg(target_os = "macos")]
 fn dst_and_gateway(block: &[u8], addrs: i32) -> (Option<&[u8]>, Option<&[u8]>) {
-    let (mut dst, mut gateway) = (None, None);
+    (
+        route_sockaddr(block, addrs, RTA_DST),
+        route_sockaddr(block, addrs, RTA_GATEWAY),
+    )
+}
+
+/// The sockaddr the bit `want` names in a route message's address block, found as
+/// [`dst_and_gateway`] finds its two: `None` where `addrs` does not name it, or the block ends
+/// before it.
+#[cfg(target_os = "macos")]
+fn route_sockaddr(block: &[u8], addrs: i32, want: i32) -> Option<&[u8]> {
     let mut at = 0;
     for slot in 0..RTAX_MAX {
         let bit = 1i32 << slot;
         if addrs & bit == 0 {
             continue;
         }
-        let Some(&sa_len) = block.get(at) else { break };
+        let &sa_len = block.get(at)?;
         let advance = if sa_len == 0 {
             4
         } else {
             (usize::from(sa_len) + 3) & !3
         };
-        let sockaddr = &block[at..(at + advance).min(block.len())];
-        match bit {
-            RTA_DST => dst = Some(sockaddr),
-            RTA_GATEWAY => gateway = Some(sockaddr),
-            _ => {}
+        if bit == want {
+            return Some(&block[at..(at + advance).min(block.len())]);
         }
         at += advance;
     }
-    (dst, gateway)
+    None
+}
+
+/// How long [`route_source_ipv4`] waits for the kernel's answer to its `RTM_GET`, which the
+/// kernel queues before the write returns: a bound, never a pace.
+#[cfg(target_os = "macos")]
+const ROUTE_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The local IPv4 address this Mac's kernel sends from toward `to`: the address of the route
+/// `to` takes, as `route -n get` reads it (a `PF_ROUTE` `RTM_GET` that asks for the route's
+/// interface, and so for its address, `RTA_IFA`). A UDP socket connected to `to` gets its
+/// address from the same lookup, but on macOS that connect toward a local-network destination (a
+/// LAN address, a multicast group such as mDNS's) can put macOS's Local Network question on
+/// screen. A routing socket sends no packet and is no network socket, so it asks nothing. `None`
+/// where no route takes `to`, the route has no IPv4 address but loopback's, or the kernel's
+/// answer does not come.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn route_source_ipv4(to: Ipv4Addr) -> Option<Ipv4Addr> {
+    use std::os::fd::FromRawFd as _;
+    static SEQUENCE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    let pid = i32::try_from(std::process::id()).ok()?;
+    let sequence = SEQUENCE
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .wrapping_add(1);
+    // SAFETY: socket(2) takes no pointer; a descriptor it returns is owned below.
+    let raw = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_INET) };
+    if raw < 0 {
+        return None;
+    }
+    // SAFETY: `raw` is the fresh descriptor socket(2) returned, owned by nothing else.
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+    crate::keep_out_of_children(&fd).ok()?;
+    let request = route_get_request(to, sequence);
+    // SAFETY: `request` is live and readable for its whole length. A destination no route takes
+    // fails the write (`ESRCH`).
+    let wrote = unsafe { libc::write(raw, request.as_ptr().cast(), request.len()) };
+    if usize::try_from(wrote).ok() != Some(request.len()) {
+        return None;
+    }
+    let deadline = std::time::Instant::now() + ROUTE_ANSWER_WAIT;
+    let mut buf = [0u8; 2048];
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        let mut poll = libc::pollfd {
+            fd: raw,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = libc::c_int::try_from(left.as_millis().max(1)).unwrap_or(libc::c_int::MAX);
+        // SAFETY: `poll` is one live pollfd and the count passed is 1.
+        let ready = unsafe { libc::poll(&raw mut poll, 1, millis) };
+        if ready < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return None;
+        }
+        if ready <= 0 {
+            continue;
+        }
+        // SAFETY: `buf` is live and writable for its whole length.
+        let read = unsafe { libc::recv(raw, buf.as_mut_ptr().cast(), buf.len(), 0) };
+        let Ok(read) = usize::try_from(read) else {
+            return None;
+        };
+        if let Some(answer) = route_get_answer(&buf[..read], pid, sequence) {
+            return answer;
+        }
+    }
+}
+
+/// The `RTM_GET` [`route_source_ipv4`] writes for `to` as `sequence`: the head, `to` as the
+/// destination, and an empty link-layer sockaddr in the interface's slot, which asks the kernel to
+/// name the route's interface and its address in the answer, as `route -n get` asks.
+#[cfg(target_os = "macos")]
+fn route_get_request(to: Ipv4Addr, sequence: i32) -> Vec<u8> {
+    let header = std::mem::size_of::<RtMsghdr>();
+    let mut destination = [0u8; std::mem::size_of::<libc::sockaddr_in>()];
+    destination[0] = destination.len() as u8;
+    destination[1] = libc::AF_INET as u8;
+    destination[4..8].copy_from_slice(&to.octets());
+    let mut interface = [0u8; std::mem::size_of::<libc::sockaddr_dl>()];
+    interface[0] = interface.len() as u8;
+    interface[1] = libc::AF_LINK as u8;
+    let mut message = vec![0u8; header];
+    let length = (header + destination.len() + interface.len()) as u16;
+    message[0..2].copy_from_slice(&length.to_ne_bytes());
+    message[std::mem::offset_of!(RtMsghdr, rtm_version)] = RTM_VERSION;
+    message[std::mem::offset_of!(RtMsghdr, rtm_type)] = RTM_GET;
+    let mut put = |offset: usize, value: i32| {
+        message[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+    };
+    put(std::mem::offset_of!(RtMsghdr, rtm_flags), RTF_UP | RTF_HOST);
+    put(std::mem::offset_of!(RtMsghdr, rtm_addrs), RTA_DST | RTA_IFP);
+    put(std::mem::offset_of!(RtMsghdr, rtm_seq), sequence);
+    message.extend_from_slice(&destination);
+    message.extend_from_slice(&interface);
+    message
+}
+
+/// What one message a routing socket read says to the `RTM_GET` process `pid` wrote as
+/// `sequence` ([`route_get_request`]): `None` when it answers something else (another process's
+/// lookup, another of this one's, a change of a route), else the address of the route found
+/// (`RTA_IFA`), `Some(None)` where the kernel found none or that address is no usable IPv4 one.
+#[cfg(target_os = "macos")]
+fn route_get_answer(message: &[u8], pid: i32, sequence: i32) -> Option<Option<Ipv4Addr>> {
+    let header = std::mem::size_of::<RtMsghdr>();
+    let msglen = usize::from(u16::from_ne_bytes([*message.first()?, *message.get(1)?]));
+    if msglen < header || msglen > message.len() {
+        return None;
+    }
+    let read = |offset: usize| i32::from_ne_bytes(message[offset..offset + 4].try_into().unwrap());
+    if message[std::mem::offset_of!(RtMsghdr, rtm_type)] != RTM_GET
+        || read(std::mem::offset_of!(RtMsghdr, rtm_pid)) != pid
+        || read(std::mem::offset_of!(RtMsghdr, rtm_seq)) != sequence
+    {
+        return None;
+    }
+    if read(std::mem::offset_of!(RtMsghdr, rtm_errno)) != 0 {
+        return Some(None);
+    }
+    let addrs = read(std::mem::offset_of!(RtMsghdr, rtm_addrs));
+    Some(
+        sockaddr_ipv4(route_sockaddr(&message[header..msglen], addrs, RTA_IFA))
+            .filter(|ip| !ip.is_unspecified() && !ip.is_loopback()),
+    )
 }
 
 /// The IPv4 address in a sockaddr whose family is `AF_INET` (a `sockaddr_in`, or the ARP table's
@@ -844,6 +988,138 @@ mod gateway_tests {
             &[&sockaddr_in(gw), &sockaddr_dl(&[])],
         );
         assert_eq!(gateway_hardware(&incomplete, gw), None);
+    }
+
+    /// `route_source_ipv4`'s lookup asks the kernel for the route to its destination with the
+    /// interface's slot set, as `route -n get` does, and reads the route's address only from the
+    /// answer to its own lookup: another process's, another sequence's, or a route change is
+    /// passed over, and a lookup the kernel refused or a loopback address is no source.
+    #[test]
+    fn a_route_lookup_asks_for_the_interface_and_reads_only_its_own_answer() {
+        let to = Ipv4Addr::new(224, 0, 0, 251);
+        let request = route_get_request(to, 7);
+        let field = |message: &[u8], offset: usize| {
+            i32::from_ne_bytes(message[offset..offset + 4].try_into().unwrap())
+        };
+        let header = std::mem::size_of::<RtMsghdr>();
+        assert_eq!(
+            usize::from(u16::from_ne_bytes([request[0], request[1]])),
+            request.len()
+        );
+        assert_eq!(request[std::mem::offset_of!(RtMsghdr, rtm_version)], 5);
+        assert_eq!(request[std::mem::offset_of!(RtMsghdr, rtm_type)], RTM_GET);
+        let addrs = field(&request, std::mem::offset_of!(RtMsghdr, rtm_addrs));
+        assert_eq!(
+            addrs,
+            RTA_DST | RTA_IFP,
+            "the interface's slot asks for its address"
+        );
+        assert_eq!(field(&request, std::mem::offset_of!(RtMsghdr, rtm_seq)), 7);
+        let block = &request[header..];
+        assert_eq!(
+            sockaddr_ipv4(route_sockaddr(block, addrs, RTA_DST)),
+            Some(to)
+        );
+        let ifp = route_sockaddr(block, addrs, RTA_IFP).unwrap();
+        assert_eq!(
+            (usize::from(ifp[0]), i32::from(ifp[1])),
+            (std::mem::size_of::<libc::sockaddr_dl>(), libc::AF_LINK)
+        );
+
+        let address = Ipv4Addr::new(192, 168, 1, 20);
+        let answer = |kind: u8, pid: i32, sequence: i32, errno: i32, ifa: Option<Ipv4Addr>| {
+            let netmask = [0u8; 0];
+            let mut sockaddrs: Vec<Vec<u8>> = vec![
+                sockaddr_in(to),
+                sockaddr_dl(&[1, 0, 0x5e, 0, 0, 0xfb]),
+                netmask.to_vec(),
+                sockaddr_dl(&[]),
+            ];
+            let mut addrs = RTA_DST | RTA_GATEWAY | 0x4 | RTA_IFP;
+            if let Some(ifa) = ifa {
+                sockaddrs.push(sockaddr_in(ifa));
+                addrs |= RTA_IFA;
+            }
+            let sockaddrs: Vec<&[u8]> = sockaddrs.iter().map(Vec::as_slice).collect();
+            let mut message = route_message(RTF_UP | RTF_HOST, addrs, &sockaddrs);
+            message[std::mem::offset_of!(RtMsghdr, rtm_type)] = kind;
+            for (offset, value) in [
+                (std::mem::offset_of!(RtMsghdr, rtm_pid), pid),
+                (std::mem::offset_of!(RtMsghdr, rtm_seq), sequence),
+                (std::mem::offset_of!(RtMsghdr, rtm_errno), errno),
+            ] {
+                message[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+            }
+            message
+        };
+        assert_eq!(
+            route_get_answer(&answer(RTM_GET, 41, 7, 0, Some(address)), 41, 7),
+            Some(Some(address)),
+            "its own answer names the route's address"
+        );
+        // Negative controls: another process's lookup, another of its own, and a route added
+        // meanwhile are not its answer.
+        assert_eq!(
+            route_get_answer(&answer(RTM_GET, 42, 7, 0, Some(address)), 41, 7),
+            None
+        );
+        assert_eq!(
+            route_get_answer(&answer(RTM_GET, 41, 8, 0, Some(address)), 41, 7),
+            None
+        );
+        assert_eq!(
+            route_get_answer(&answer(0x1, 41, 7, 0, Some(address)), 41, 7),
+            None
+        );
+        assert_eq!(
+            route_get_answer(&request[..header - 1], 41, 7),
+            None,
+            "too short"
+        );
+        // Its own answer with no source in it.
+        assert_eq!(
+            route_get_answer(&answer(RTM_GET, 41, 7, libc::ESRCH, Some(address)), 41, 7),
+            Some(None),
+            "no route"
+        );
+        assert_eq!(
+            route_get_answer(&answer(RTM_GET, 41, 7, 0, None), 41, 7),
+            Some(None)
+        );
+        assert_eq!(
+            route_get_answer(&answer(RTM_GET, 41, 7, 0, Some(Ipv4Addr::LOCALHOST)), 41, 7),
+            Some(None)
+        );
+    }
+
+    /// The kernel's own answer: the routing table gives the address a UDP socket connected to the
+    /// same destination takes. The destination is TEST-NET-1 (`192.0.2.1`), which the default
+    /// route carries off this Mac's network, so the connect asks macOS nothing; both read `None`
+    /// on a Mac with no default route. Loopback's route is the exception: its connected socket
+    /// takes `127.0.0.1`, and the lookup reads that address as none.
+    #[test]
+    fn the_route_lookup_gives_the_address_a_connected_socket_takes() {
+        let connected = |to: Ipv4Addr| {
+            std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+                .ok()
+                .filter(|socket| socket.connect((to, 9)).is_ok())
+                .and_then(|socket| socket.local_addr().ok())
+                .and_then(|local| match local.ip() {
+                    IpAddr::V4(ip) => Some(ip),
+                    IpAddr::V6(_) => None,
+                })
+        };
+        let to = Ipv4Addr::new(192, 0, 2, 1);
+        assert_eq!(
+            route_source_ipv4(to),
+            connected(to).filter(|ip| !ip.is_unspecified() && !ip.is_loopback())
+        );
+        assert_eq!(connected(Ipv4Addr::LOCALHOST), Some(Ipv4Addr::LOCALHOST));
+        assert_eq!(
+            route_source_ipv4(Ipv4Addr::LOCALHOST),
+            None,
+            "loopback's route has no address but loopback's"
+        );
     }
 }
 

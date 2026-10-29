@@ -22,7 +22,7 @@ use aterm_types::fabric_grammar::{Bye, DeadReason, ANSWER_KINDS};
 use crate::body::{via_ok, Body};
 use crate::ctl::{Ctl, Reply, REQUEST_LINE_MAX};
 use crate::fx::{BusCloser, Fx};
-use crate::mailbox::{EventMark, Item, Mailbox, Pushed, ReplayPressure, Source};
+use crate::mailbox::{End, EventMark, Item, Mailbox, Pushed, ReplayPressure, Source};
 use crate::pipeline::{HeldCommit, Link};
 use crate::presence::{Fields, Marked, Mode, Slot};
 use crate::render::trust_of;
@@ -53,6 +53,25 @@ fn ack_deadline() -> Duration {
         aterm_types::dev_seam!(ACK_DEADLINE_SEAM)
             .and_then(|ms| ms.to_str()?.parse::<u64>().ok())
             .map_or(ACK_DEADLINE, Duration::from_millis)
+    })
+}
+
+/// How long a subscription's reader reads nothing before it takes the link for dead
+/// ([`spawn_reader`]'s live read deadline, [`End::Silent`]): astream's
+/// [`astream_broker::IDLE_MARK_DEADLINE`], three of the broker's idle marks.
+const LIVE_DEADLINE: Duration = astream_broker::IDLE_MARK_DEADLINE;
+
+/// [`LIVE_DEADLINE`]'s seam, in milliseconds, in a seam-enabled build: the fabric_world
+/// harness sets it to the hang detector on every instance it starts (its `LIVE_WAIT`, beside
+/// [`ACK_DEADLINE_SEAM`]), since its broker runs on the test's loaded machine.
+const LIVE_DEADLINE_SEAM: &str = "ATERM_LINK_LIVE_DEADLINE_MS";
+
+fn live_deadline() -> Duration {
+    static AT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        aterm_types::dev_seam!(LIVE_DEADLINE_SEAM)
+            .and_then(|ms| ms.to_str()?.parse::<u64>().ok())
+            .map_or(LIVE_DEADLINE, Duration::from_millis)
     })
 }
 
@@ -868,9 +887,8 @@ struct SeqBlock {
 }
 
 /// The most publishes the bridge keeps unacked on its one pipelined connection: a send
-/// at the window settles acks first. astream's Ordered pipeline bench claims run at this
-/// window (`WINDOW=`), which this crate's `astream_fixture_tests` holds them to.
-pub const PIPELINE_WINDOW: usize = 64;
+/// at the window settles acks first.
+const PIPELINE_WINDOW: usize = 64;
 
 /// How long a round parks while an ack is owed before it reads the acks
 /// itself: a park that took nothing in this long settles them (blocking).
@@ -2142,15 +2160,19 @@ impl Bridge {
                         break;
                     }
                 }
-                Item::Closed(source) => {
-                    self.subscription_lost(source);
+                Item::Lost(source, end) => {
+                    self.subscription_lost(source, end);
                     break;
                 }
                 Item::Refused(source, reason) => {
                     self.subscription_refused(source, reason);
                     break;
                 }
-                Item::Event(_) | Item::Inbox(_) | Item::Say(_) | Item::Resume(..) => {}
+                Item::Event(_)
+                | Item::Inbox(_)
+                | Item::Say(_)
+                | Item::Resume(..)
+                | Item::Closed(_) => {}
             }
         }
         self.unsent = unsent;
@@ -8471,10 +8493,14 @@ impl Bridge {
         self.subscribe_face(Source::Say, say_from, &say_filter)
     }
 
-    fn subscription_lost(&mut self, source: Source) {
-        let face = face_name(source);
+    /// THE `face` SUBSCRIPTION'S READ ENDED (`end`): the link goes down under the face's cut
+    /// reason when the broker still answers a read, and the bridge reconnects either way. The
+    /// line it prints names the end its reader saw ([`End`]): only an end of file is the
+    /// broker's.
+    fn subscription_lost(&mut self, source: Source, end: End) {
+        let what = end.said(face_name(source));
         if self.conn.is_none() {
-            stderr_line!("aterm-link: the broker's {face} subscription ended; reconnecting");
+            stderr_line!("aterm-link: {what}; reconnecting");
             return;
         }
         let answers = self.unyielding(|bridge| {
@@ -8490,15 +8516,12 @@ impl Bridge {
         if answers {
             let reason = cut_reason(source);
             stderr_line!(
-                "aterm-link: the broker ended the {face} subscription and still answers \
-                 ({reason}); reconnecting every subscription"
+                "aterm-link: {what}, and the broker still answers ({reason}); reconnecting \
+                 every subscription"
             );
             self.link_down(reason);
         } else {
-            stderr_line!(
-                "aterm-link: the broker's {face} subscription ended and the broker does not \
-                 answer; reconnecting"
-            );
+            stderr_line!("aterm-link: {what}, and the broker does not answer; reconnecting");
         }
         self.conn = None;
     }
@@ -8560,7 +8583,7 @@ impl Bridge {
         let reader = self.fx.start_reader(
             sub,
             Arc::clone(&closer),
-            astream_broker::IDLE_MARK_DEADLINE,
+            live_deadline(),
             source,
             self.mailbox.clone(),
         );
@@ -8805,6 +8828,12 @@ impl Bridge {
                 flushed.full,
                 self.fx.now().saturating_duration_since(began).as_micros(),
                 aterm_durable::durable_flushes_note()
+            ),
+            Ok(flushed) if flushed.proven => stderr_line!(
+                "aterm-link: the run record says a bridge runs in this boot, on the media as its \
+                 proof ({}) shows: nothing written, no flush, in {} us",
+                crate::state::RUN_PROOF,
+                self.fx.now().saturating_duration_since(began).as_micros()
             ),
             Ok(_) => {}
             Err(e) => stderr_line!(
@@ -9375,15 +9404,15 @@ impl Bridge {
                 self.on_say_record(&r);
                 true
             }
-            Some(Item::Closed(Source::Aterm)) => {
+            Some(Item::Closed(_)) => {
                 self.in_round = false;
                 self.on_aterm_closed();
                 stderr_line!("aterm-link: aterm closed the bridge connection; exiting");
                 self.wind_down();
                 false
             }
-            Some(Item::Closed(source)) => {
-                self.subscription_lost(source);
+            Some(Item::Lost(source, end)) => {
+                self.subscription_lost(source, end);
                 true
             }
             Some(Item::Refused(source, reason)) => {
@@ -9860,7 +9889,7 @@ fn expired_body(t_ms: u64, off: u64, dl: u64) -> Body {
     verdict
 }
 
-fn span_of(ms: u64) -> String {
+pub(crate) fn span_of(ms: u64) -> String {
     if ms >= 1_000 && ms.is_multiple_of(1_000) {
         format!("{} s", ms / 1_000)
     } else {
@@ -10165,7 +10194,8 @@ pub(crate) fn spawn_reader(
         .name(format!("aterm-link-{source:?}"))
         .spawn(move || loop {
             let read = next_took(&mut sub, &closer, deadline);
-            if !reader_took(read, &mailbox, source, generation, &closer, clock.now()) {
+            let at = clock.now();
+            if !reader_took(read, &mailbox, source, generation, &closer, at, deadline) {
                 return;
             }
         })
@@ -10212,7 +10242,8 @@ pub(crate) fn next_took(
 }
 
 /// Routes one subscription read result into `mailbox` under incarnation `gen`, read at `at` (the
-/// reader's world's clock, [`Mailbox::push`]), returning `true` to continue.
+/// reader's world's clock, [`Mailbox::push`]), returning `true` to continue. A read that ended
+/// is pushed with how it ended ([`End`]), a timeout as the live read `deadline` passing.
 pub(crate) fn reader_took(
     read: io::Result<Option<Took>>,
     mailbox: &Mailbox,
@@ -10220,6 +10251,7 @@ pub(crate) fn reader_took(
     generation: u64,
     closer: &BusCloser,
     at: Instant,
+    deadline: Duration,
 ) -> bool {
     match read {
         Ok(Some(Took::Gap(g))) => {
@@ -10241,8 +10273,12 @@ pub(crate) fn reader_took(
             mailbox.push_refused(source, generation, link_reason(&e, "subscribe"));
             false
         }
-        Ok(None) | Err(_) => {
-            mailbox.push_closed(source, generation);
+        Ok(None) => {
+            mailbox.push_lost(source, generation, End::Eof);
+            false
+        }
+        Err(e) => {
+            mailbox.push_lost(source, generation, End::of(&e, deadline));
             false
         }
     }
@@ -11465,9 +11501,11 @@ mod tests {
         );
     }
 
+    /// What a fleet subscription's reader pushes once a stand-in broker marked its tail caught
+    /// up and then hangs the stream up (`hang_up`: the reader's live read deadline is the hang
+    /// detector, so only the hang-up can end it) or holds it silent past the reader's 200 ms.
     #[cfg(unix)]
-    #[test]
-    fn a_subscription_whose_link_goes_silent_is_closed_not_parked() {
+    fn lost_after_catch_up(hang_up: bool) -> Option<Item> {
         use astream_broker::proto::{
             decode_request, encode_response, read_frame, write_frame, Request, Response,
         };
@@ -11498,7 +11536,11 @@ mod tests {
                 "the subscription follows its opt-in"
             );
             write_frame(&mut c, &encode_response(&mark)).expect("the catch-up mark");
-            let _ = held.recv();
+            if hang_up {
+                drop(c);
+            } else {
+                let _ = held.recv();
+            }
         });
         let (conn, closer) =
             transport::connect(&sock.to_string_lossy(), Duration::from_secs(60)).expect("connect");
@@ -11507,21 +11549,70 @@ mod tests {
             .set_read_timeout(None)
             .expect("lift the dial's bound");
         let mailbox = Arc::new(Mailbox::default());
+        let deadline = if hang_up {
+            aterm_spec::wait::MUST_HAPPEN
+        } else {
+            Duration::from_millis(200)
+        };
         spawn_reader(
             sub,
             Arc::new(BusCloser::Os(closer)),
-            Duration::from_millis(200),
+            deadline,
             Source::Fleet,
             Arc::clone(&mailbox),
         )
         .expect("the reader thread");
-        let item = mailbox.take(Duration::from_secs(60), Instant::now());
-        assert!(
-            matches!(item, Some(Item::Closed(Source::Fleet))),
-            "a silent link ends the subscription: {item:?}"
-        );
+        let item = mailbox.take(aterm_spec::wait::MUST_HAPPEN, Instant::now());
         let _ = release.send(());
         broker.join().expect("the stand-in broker");
+        item
+    }
+
+    /// A LINK THAT GOES SILENT ENDS ITS SUBSCRIPTION, AND SAYS SO: past the live read deadline
+    /// with nothing read, the reader pushes [`End::Silent`] with that deadline, never parks,
+    /// and never says the broker ended the stream ([`End::Eof`], the next test's).
+    ///
+    /// PLANTED CONTROL (run, scratch-reverted): `reader_took` pushing every `Err` as
+    /// `End::Eof`, as the reader did before it named its end, fails here.
+    #[cfg(unix)]
+    #[test]
+    fn a_subscription_whose_link_goes_silent_is_closed_not_parked() {
+        let item = lost_after_catch_up(false);
+        assert!(
+            matches!(
+                item,
+                Some(Item::Lost(Source::Fleet, End::Silent(d))) if d == Duration::from_millis(200)
+            ),
+            "a silent link ends the subscription, as silence: {item:?}"
+        );
+        let Some(Item::Lost(_, end)) = item else {
+            unreachable!("matched above")
+        };
+        let said = end.said("fleet");
+        assert!(
+            said.contains(&span_of(200)) && !said.contains("broker"),
+            "its line names the deadline and no end the broker made: {said}"
+        );
+    }
+
+    /// A BROKER THAT HANGS THE STREAM UP ENDS IT AT END OF FILE ([`End::Eof`]), the one end
+    /// the bridge's line says the broker made.
+    ///
+    /// PLANTED CONTROL (run, scratch-reverted): `reader_took` pushing `Ok(None)` as
+    /// `End::Silent`, fails here.
+    #[cfg(unix)]
+    #[test]
+    fn a_subscription_the_broker_hangs_up_ends_at_end_of_file() {
+        let item = lost_after_catch_up(true);
+        assert!(
+            matches!(item, Some(Item::Lost(Source::Fleet, End::Eof))),
+            "a hung-up stream ends at end of file: {item:?}"
+        );
+        let said = End::Eof.said("fleet");
+        assert!(
+            said.contains("broker"),
+            "its line names the broker's end: {said}"
+        );
     }
 
     #[test]
@@ -12941,7 +13032,14 @@ mod tests {
         );
     }
 
-    fn assert_uncertain_in_flight_waits(kind: &str) {
+    #[derive(Clone, Copy, Debug)]
+    enum UncertainJournal {
+        Listing,
+        Entry,
+        Damaged,
+    }
+
+    fn assert_uncertain_in_flight_waits(kind: UncertainJournal) {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
         let (socket, _broker, _server) = serve_log(&lane, "broker");
         bridge.cfg.broker = socket;
@@ -12971,41 +13069,42 @@ mod tests {
         let root = bridge.state.root().to_path_buf();
         let dir = root.join(crate::state::journal::DIR);
         let entry = root.join(crate::state::journal::FILE);
-        let blocked = if kind == "listing" {
-            dir.clone()
-        } else {
-            entry.clone()
-        };
-        let saved = if kind == "listing" {
-            dir.with_extension("saved")
-        } else {
-            dir.join(".saved")
+        let (blocked, saved) = match kind {
+            UncertainJournal::Listing => (dir.clone(), dir.with_extension("saved")),
+            UncertainJournal::Entry | UncertainJournal::Damaged => {
+                (entry.clone(), dir.join(".saved"))
+            }
         };
         std::fs::rename(&blocked, &saved).unwrap();
-        if kind == "entry" {
-            std::fs::create_dir(&blocked).unwrap();
-        } else {
-            std::fs::write(&blocked, b"not a journal entry\n").unwrap();
+        match kind {
+            UncertainJournal::Entry => std::fs::create_dir(&blocked).unwrap(),
+            UncertainJournal::Listing | UncertainJournal::Damaged => {
+                std::fs::write(&blocked, b"not a journal entry\n").unwrap();
+            }
         }
         bridge.state = StateDir::open(&root).unwrap();
         assert!(
             !bridge.settle_in_flight(),
-            "{kind}: uncertain publication fate was accepted as settled"
+            "{kind:?}: uncertain publication fate was accepted as settled"
         );
-        assert!(saved.exists(), "{kind}: the original journal was discarded");
+        assert!(
+            saved.exists(),
+            "{kind:?}: the original journal was discarded"
+        );
         assert!(
             blocked.exists(),
-            "{kind}: the uncertain entry was discarded"
+            "{kind:?}: the uncertain entry was discarded"
         );
-        if kind == "entry" {
-            std::fs::remove_dir(&blocked).unwrap();
-        } else {
-            std::fs::remove_file(&blocked).unwrap();
+        match kind {
+            UncertainJournal::Entry => std::fs::remove_dir(&blocked).unwrap(),
+            UncertainJournal::Listing | UncertainJournal::Damaged => {
+                std::fs::remove_file(&blocked).unwrap();
+            }
         }
         std::fs::rename(&saved, &blocked).unwrap();
         assert!(
             bridge.settle_in_flight(),
-            "{kind}: the restored journal recovers"
+            "{kind:?}: the restored journal recovers"
         );
         assert!(
             bridge.self_acked.contains(&off),
@@ -13035,17 +13134,17 @@ mod tests {
 
     #[test]
     fn an_unlistable_in_flight_journal_stops_recovery_until_it_can_be_read() {
-        assert_uncertain_in_flight_waits("listing");
+        assert_uncertain_in_flight_waits(UncertainJournal::Listing);
     }
 
     #[test]
     fn an_unreadable_in_flight_entry_stops_recovery_until_it_can_be_read() {
-        assert_uncertain_in_flight_waits("entry");
+        assert_uncertain_in_flight_waits(UncertainJournal::Entry);
     }
 
     #[test]
     fn a_damaged_in_flight_entry_stops_recovery_until_it_is_repaired() {
-        assert_uncertain_in_flight_waits("damaged");
+        assert_uncertain_in_flight_waits(UncertainJournal::Damaged);
     }
 
     fn leave_journaled_publications(
@@ -13589,7 +13688,11 @@ mod tests {
 
     #[test]
     fn a_handoff_leaves_the_run_to_its_successor_and_a_quit_stops_it_cleanly() {
-        for bye in [Bye::Handoff, Bye::Quit] {
+        for (bye, proof) in [
+            (Bye::Handoff, true),
+            (Bye::Handoff, false),
+            (Bye::Quit, true),
+        ] {
             let (_lane, mut bridge) = FakeVerbLane::bridge(&[]);
             bridge.simulate_boot(crate::durability::test_boot(1), 0);
             bridge.begin_run();
@@ -13603,6 +13706,10 @@ mod tests {
                 bye == Bye::Quit,
                 "{bye:?}: a handoff leaves the run open"
             );
+            if !proof {
+                std::fs::remove_file(bridge.state.root().join(crate::state::RUN_PROOF))
+                    .expect("the proof the bridge's start in full made");
+            }
             let successor = StateDir::open(bridge.state.root()).unwrap();
             successor.set_inc_seam(crate::state::IncSeam {
                 boot: Some(Some(crate::durability::test_boot(1))),
@@ -13614,11 +13721,20 @@ mod tests {
             let began = successor.begin_run().unwrap();
             let stopped = successor.end_run_clean().unwrap();
             match bye {
+                Bye::Handoff if proof => {
+                    assert_eq!(
+                        (began.ordered, began.full, began.proven),
+                        (0, 0, true),
+                        "the successor admits the OPEN its predecessor published in full by its \
+                         proof, writing nothing (R6)"
+                    );
+                    assert_eq!(stopped.files, 1, "the reservation, inherited and flushed");
+                }
                 Bye::Handoff => {
                     assert_eq!(
-                        (began.ordered, began.full),
-                        (0, 2),
-                        "the successor admits OPEN independently, in full"
+                        (began.ordered, began.full, began.proven),
+                        (0, 2, false),
+                        "CONTROL: with no proof, the successor admits OPEN independently, in full"
                     );
                     assert_eq!(stopped.files, 1, "the reservation, inherited and flushed");
                 }
@@ -14156,12 +14272,14 @@ mod tests {
         bridge.close_subscriptions();
     }
 
+    /// The link's reason is the face's (`cut-<face>`) or `closed`, whichever end the reader saw
+    /// ([`End`]): the end changes only the line the bridge prints.
     #[test]
     fn a_cut_subscription_is_named_by_its_face_and_a_dead_broker_is_closed() {
         let (lane, mut bridge, mut server) = rig_with_broker(&[]);
         let last_link = |lane: &FakeVerbLane| lane.links.lock().unwrap().last().cloned();
 
-        bridge.subscription_lost(Source::Say);
+        bridge.subscription_lost(Source::Say, End::Eof);
         assert!(bridge.conn.is_none(), "the set reconnects either way");
         assert_eq!(
             last_link(&lane).as_deref(),
@@ -14172,7 +14290,7 @@ mod tests {
         bridge.conn = Some(conn.into());
         bridge.note_ack(Duration::from_millis(1));
         server.shutdown();
-        bridge.subscription_lost(Source::Inbox);
+        bridge.subscription_lost(Source::Inbox, End::Silent(Duration::from_secs(30)));
         assert!(bridge.conn.is_none());
         assert_eq!(last_link(&lane).as_deref(), Some("link down reason=closed"));
     }
@@ -16599,7 +16717,7 @@ mod tests {
                                 );
                                 if closed {
                                     let inbox = mailbox.broker_generation(Source::Inbox);
-                                    mailbox.push_closed(Source::Inbox, inbox);
+                                    mailbox.push_lost(Source::Inbox, inbox, End::Eof);
                                 }
                                 vec![Response::Mark {
                                     next: 10,
@@ -23094,7 +23212,7 @@ mod tests {
                 {
                     Some(Item::Event(line)) if line == barrier => return,
                     Some(Item::Event(line)) => bridge.on_event(&line),
-                    Some(Item::Closed(source)) => panic!("{source:?} closed mid-test"),
+                    Some(Item::Lost(source, end)) => panic!("{source:?} ended mid-test: {end:?}"),
                     Some(_) => {}
                     None => assert!(
                         Instant::now() < deadline,

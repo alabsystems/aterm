@@ -801,6 +801,27 @@ fn a_repository_whose_state_cannot_be_read_is_never_clean() {
             work.display()
         );
     }
+    let unread_dir = repo(&tmp.path().join("unread-dir"), true);
+    let hidden = unread_dir.join("hidden");
+    std::fs::create_dir_all(&hidden).expect("hidden");
+    std::fs::write(hidden.join("work.txt"), "work that Git must not erase\n").expect("work.txt");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::metadata(&hidden).expect("meta").permissions();
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let denied = std::fs::read_dir(&hidden).is_err();
+        let restricted = probe(&unread_dir, Some(&unread_dir), PROBE_LIMIT);
+        std::fs::set_permissions(&hidden, perms).expect("restore");
+        if denied {
+            assert_eq!(restricted, RepoRead::Unread);
+        } else {
+            assert!(restricted.found().is_some_and(|w| w.untracked == 1));
+        }
+    }
+    assert_eq!(
+        found(&unread_dir).map(|w| w.paths),
+        Some(vec!["hidden/".to_string()])
+    );
 }
 
 #[test]
@@ -1187,6 +1208,16 @@ fn a_guarded_folder_is_never_probed() {
             ..table.mounts[0].clone()
         });
         assert_eq!(unattended_dir(&work, Some(&home), &unavailable), None);
+    }
+    assert_eq!(
+        unattended_dir(&home.join("documents/work"), Some(&home), &table),
+        None
+    );
+    if home.join("DOCUMENTS").exists() {
+        assert_eq!(
+            unattended_dir(&home.join("developer/work"), Some(&home), &table),
+            Some(work)
+        );
     }
 }
 

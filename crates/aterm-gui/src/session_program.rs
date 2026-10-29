@@ -752,11 +752,9 @@ mod tests {
     #[cfg(unix)]
     fn kill_group(child: &mut aterm_uds::spawnfd::Child) {
         if let Ok(pid) = i32::try_from(child.id()) {
-            // SAFETY: signal delivery to the group this test created: `process_group(0)`
-            // made the child's pid its pgid, and the unreaped child keeps that pid from reuse.
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
+            // The group this test created: `process_group(0)` made the child's pid its pgid,
+            // and the unreaped child keeps that pid from reuse.
+            let _ = aterm_uds::process::kill_group_until_empty(pid);
         }
         let _ = child.kill();
         let _ = child.wait();
@@ -1294,7 +1292,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_shim_is_a_file_directly_in_a_managed_dir() {
-        let dir = std::env::temp_dir().join(format!("aterm-shimdir-{}", std::process::id()));
+        let scratch = aterm_tempfile::TempDir::new().expect("a scratch dir");
+        let dir = scratch.path().to_path_buf();
         let agents = dir.join("pkg/agents");
         std::fs::create_dir_all(&agents).expect("scratch dir");
         std::os::unix::fs::symlink(dir.join("pkg"), dir.join("link")).expect("symlink");
@@ -1308,7 +1307,6 @@ mod tests {
         assert!(!at(agents.join("sub/claude")), "deeper");
         assert!(!at(dir.join("pkg/claude")), "the prefix itself");
         assert!(!at(dir.join("elsewhere/agents/claude")), "another agents/");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

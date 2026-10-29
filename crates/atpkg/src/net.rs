@@ -641,7 +641,8 @@ pub struct GithubFetcher {
     /// Per-invocation memo of the raw `(pkg-<program>-<build>.toml, .sig)` bytes, keyed by
     /// `(slug, program, build)`.
     manifests: ManifestMemo,
-    /// The LAN peers an archive download races (`[packages] peers`, [`crate::peers::race`]).
+    /// The LAN peers an archive download races ([`crate::peers::unit_peers`]: `[packages]
+    /// peers`, else this machine's fleet members; [`crate::peers::race`]).
     unit_peers: Vec<String>,
 }
 
@@ -2505,23 +2506,23 @@ mod tests {
         }
     }
 
-    /// The scratch directory [`probe_a_first_round_over_counted_curl`] runs in, set only for
+    /// The scratch directory [`probe_a_first_round_over_counted_curl_if_asked`] runs in, set only for
     /// the child [`a_first_rounds_curls_are_one_per_head_offline_and_whole_online`] starts.
     #[cfg(unix)]
     const LINK_PROBE_ENV: &str = "ATPKG_TEST_LINK_PROBE_DIR";
     /// That probe's name, as `--exact` wants it.
     #[cfg(unix)]
-    const LINK_PROBE: &str = "net::tests::probe_a_first_round_over_counted_curl";
+    const LINK_PROBE: &str =
+        "net::tests::a_first_rounds_curls_are_one_per_head_offline_and_whole_online";
 
     /// The child's half: a first round of three HEADs over the PRODUCTION transport ([`Wire`],
     /// [`aterm_update_core::head_no_redirect_first`]), its curl the counting wrapper the
     /// parent laid ([`aterm_update_core::CURL_SEAM`]), then one whole HEAD of a fourth build —
     /// what the round's link verdict leaves a request after it.
     #[cfg(unix)]
-    #[test]
-    fn probe_a_first_round_over_counted_curl() {
+    fn probe_a_first_round_over_counted_curl_if_asked() -> bool {
         let Some(dir) = std::env::var_os(LINK_PROBE_ENV) else {
-            return;
+            return false;
         };
         let slug = "alabsystems/aterm";
         let round = probe_round(slug, &[1, 2, 4], &Wire);
@@ -2537,14 +2538,18 @@ mod tests {
             Err(e) => format!("after err {e:?}"),
         });
         std::fs::write(PathBuf::from(dir).join("verdicts"), out.join("\n")).unwrap();
+        true
     }
 
     /// PKG-4'S LINK PROBE, COUNTED IN PROCESSES. The first round runs in a child of this test
-    /// binary ([`probe_a_first_round_over_counted_curl`]) whose every curl is a wrapper that
+    /// binary ([`probe_a_first_round_over_counted_curl_if_asked`]) whose every curl is a wrapper that
     /// logs its URL and answers as the scenario says.
     #[cfg(unix)]
     #[test]
     fn a_first_rounds_curls_are_one_per_head_offline_and_whole_online() {
+        if probe_a_first_round_over_counted_curl_if_asked() {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt as _;
         let run = |scenario: &str| -> (std::collections::BTreeMap<u64, usize>, Vec<String>) {
             let dir = aterm_tempfile::tempdir().unwrap();

@@ -393,6 +393,7 @@ fn light_grains_keep_off_the_block_caret() {
                 hue: 0.5,
                 cov_scale: 1.0,
                 born: t,
+                edge_cut: false,
             });
             let (mut q, mut h, mut u) = (Vec::new(), Vec::new(), Vec::new());
             glow.emit_particles(

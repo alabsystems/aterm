@@ -109,6 +109,18 @@ impl Terminal {
         }
     }
 
+    /// The configured `(foreground, background)`: the pair the host's theme or config set, which
+    /// a program's OSC 10/11 (and their resets) and DECSCNM never move, read without cloning the
+    /// palette [`Self::color_baseline`] carries.
+    #[inline]
+    #[must_use]
+    pub const fn configured_colors(&self) -> (aterm_types::Rgb, aterm_types::Rgb) {
+        (
+            self.color.configured_foreground,
+            self.color.configured_background,
+        )
+    }
+
     /// Update the theme baseline while preserving active OSC colour overrides on top.
     #[inline]
     pub fn rebase_colors(&mut self, baseline: &ColorBaseline) -> ColorRebase {
@@ -911,6 +923,59 @@ mod tests {
             modes(&whole),
             set,
             "negative control: the whole config moves the program's modes"
+        );
+    }
+
+    /// The configured pair is the host's: a program's OSC 10/11, their resets OSC 110/111 and
+    /// DECSCNM move the live page and never the pair; `apply_config` and `rebase_colors` move it
+    /// (`docs/design/PRISM-GLASS.md` §15.1 P0.2a, the light latch's key).
+    #[test]
+    fn the_configured_colours_move_only_with_the_config() {
+        let light = TerminalConfig {
+            default_foreground: rgb(0x2b, 0x2d, 0x33),
+            default_background: rgb(0xf6, 0xf7, 0xf9),
+            ..TerminalConfig::default()
+        };
+        let mut t = Terminal::new(4, 16);
+        t.apply_config(&light);
+        let pair = (rgb(0x2b, 0x2d, 0x33), rgb(0xf6, 0xf7, 0xf9));
+        assert_eq!(t.configured_colors(), pair, "apply_config sets it");
+        for page in [
+            &b"\x1b]10;rgb:ff/00/00\x07"[..],
+            b"\x1b]11;rgb:00/00/00\x07",
+            b"\x1b]110\x07",
+            b"\x1b]111\x07",
+            b"\x1b]10;#d0d0d0\x1b\\\x1b]11;#111318\x1b\\",
+            b"\x1b[?5h",
+            b"\x1b[?5l",
+        ] {
+            t.process(page);
+            assert_eq!(
+                t.configured_colors(),
+                pair,
+                "{:?} moved the configured pair",
+                String::from_utf8_lossy(page)
+            );
+        }
+        t.process(b"\x1b[?5h\x1b]11;rgb:00/00/00\x07");
+        assert_ne!(
+            t.default_background(),
+            pair.1,
+            "control: the program moved the live page"
+        );
+        assert_eq!(t.configured_colors(), pair);
+
+        let dark = seeded_baseline(40);
+        t.rebase_colors(&dark);
+        assert_eq!(
+            t.configured_colors(),
+            (dark.foreground, dark.background),
+            "rebase_colors moves it"
+        );
+        assert_eq!(
+            t.configured_colors(),
+            (t.color_baseline().foreground, t.color_baseline().background),
+            "the baseline's pair"
         );
     }
 }

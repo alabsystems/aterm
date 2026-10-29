@@ -637,6 +637,191 @@ pub fn apply(
     Ok(())
 }
 
+/// How far past a lettered cell's box a frame whose bloom spares its letters
+/// ([`aterm_core::render::BloomGate::SparesLetters`]) keeps the post passes' source
+/// ([`spare_letters`]): the blur's whole reach ([`reach_px`]) and the
+/// half-res texel the extract widens a thin light to, so no light the passes
+/// keep reaches the cell's pixels.
+#[inline]
+#[must_use]
+pub fn letter_shield_px(radius: f32) -> u32 {
+    reach_px(radius).saturating_add(BLOOM_DOWNSCALE)
+}
+
+/// How far past a lettered cell's box the SDR crown's source keeps off it
+/// when the frame's bloom spares its letters: the crown screens each light
+/// over its own rect alone, so only the ring a letter's ground is read in
+/// (two pixels past its ink, which may lie at the cell's edge) needs keeping.
+pub const CROWN_SHIELD_PX: u32 = 2;
+
+/// The post passes' sources of a frame whose bloom spares its letters
+/// ([`aterm_core::render::BloomGate::SparesLetters`]): `source` (the lights
+/// both passes read, window px) kept [`CROWN_SHIELD_PX`] off every lettered
+/// cell into `crown`, and [`letter_shield_px`] off them into `bloom`. Both
+/// renderers draw from these, so they bloom and crown alike.
+pub fn spared_sources(
+    source: &[GlowQuad],
+    input: &aterm_core::render::RenderInput,
+    grid: LetterGrid,
+    radius: f32,
+    crown: &mut Vec<GlowQuad>,
+    bloom: &mut Vec<GlowQuad>,
+) {
+    crown.clear();
+    crown.extend_from_slice(source);
+    spare_letters(crown, input, grid, CROWN_SHIELD_PX);
+    bloom.clear();
+    bloom.extend_from_slice(source);
+    spare_letters(bloom, input, grid, letter_shield_px(radius));
+}
+
+/// Where a frame's grid lies in its window pixels ([`spare_letters`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LetterGrid {
+    /// The grid's left edge.
+    pub pad: usize,
+    /// The grid's top edge.
+    pub grid_top: usize,
+    /// Cell width, px.
+    pub cell_w: usize,
+    /// Cell height, px.
+    pub cell_h: usize,
+}
+
+/// Whether a cell holds ink a post pass must not light: a glyph, or the
+/// right half of a wide one.
+#[inline]
+fn lettered(c: &aterm_core::terminal::RenderCell) -> bool {
+    c.wide || !(c.ch == ' ' || c.ch == '\0' || c.ch.is_control())
+}
+
+/// Cut the post passes' source (`source`: the lights the bloom extracts and
+/// the SDR crown screens, window px) away from every lettered cell of
+/// `input`, each cell's box grown by `shield` px ([`letter_shield_px`]): a
+/// light is kept only where it lies farther than that from every glyph, so
+/// neither the bloom's blur nor the crown lays light on a letter. The
+/// frame's lights themselves are drawn whole; only their spill is withheld.
+///
+/// A light cut across its width keeps its gradient: each piece takes the
+/// colour and opacity the whole light had at its edges.
+pub fn spare_letters(
+    source: &mut Vec<GlowQuad>,
+    input: &aterm_core::render::RenderInput,
+    grid: LetterGrid,
+    shield: u32,
+) {
+    if source.is_empty() || grid.cell_w == 0 || grid.cell_h == 0 {
+        return;
+    }
+    let (mut bx0, mut by0, mut bx1, mut by1) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+    for q in source.iter().filter(|q| q.w > 0 && q.h > 0) {
+        bx0 = bx0.min(i64::from(q.x));
+        by0 = by0.min(i64::from(q.y));
+        bx1 = bx1.max(i64::from(q.x) + i64::from(q.w));
+        by1 = by1.max(i64::from(q.y) + i64::from(q.h));
+    }
+    if bx0 >= bx1 || by0 >= by1 {
+        return;
+    }
+    let grow = i64::from(shield);
+    let slack = i64::from(input.scroll_frac_px.unsigned_abs());
+    let (cw, ch) = (grid.cell_w as i64, grid.cell_h as i64);
+    let (pad, top) = (grid.pad as i64, grid.grid_top as i64);
+    let mut shields: Vec<[i64; 4]> = Vec::new();
+    for (r, line) in input.cells.iter().enumerate().take(input.rows) {
+        let y0 = top + r as i64 * ch - slack - grow;
+        let y1 = top + (r as i64 + 1) * ch + slack + grow;
+        if y1 <= by0 || y0 >= by1 {
+            continue;
+        }
+        let mut run: Option<(i64, i64)> = None;
+        for (c, cell) in line.iter().enumerate() {
+            if !lettered(cell) {
+                continue;
+            }
+            let (x0, x1) = (pad + c as i64 * cw - grow, pad + (c as i64 + 1) * cw + grow);
+            run = match run {
+                Some((a, b)) if x0 <= b => Some((a, x1)),
+                Some((a, b)) => {
+                    shields.push([a, y0, b, y1]);
+                    Some((x0, x1))
+                }
+                None => Some((x0, x1)),
+            };
+        }
+        if let Some((a, b)) = run {
+            shields.push([a, y0, b, y1]);
+        }
+    }
+    shields.retain(|s| s[0] < bx1 && s[2] > bx0);
+    if shields.is_empty() {
+        return;
+    }
+    let mut kept = Vec::with_capacity(source.len());
+    for s in &shields {
+        kept.clear();
+        for q in source.iter() {
+            cut_away(*q, *s, &mut kept);
+        }
+        std::mem::swap(source, &mut kept);
+    }
+}
+
+/// `q` with the rect `s` cut out of it, its pieces pushed to `out` (`q`
+/// itself where they do not meet).
+fn cut_away(q: GlowQuad, s: [i64; 4], out: &mut Vec<GlowQuad>) {
+    let (qx0, qy0) = (i64::from(q.x), i64::from(q.y));
+    let (qx1, qy1) = (qx0 + i64::from(q.w), qy0 + i64::from(q.h));
+    let [sx0, sy0, sx1, sy1] = s;
+    if q.w == 0 || q.h == 0 || sx0 >= qx1 || sx1 <= qx0 || sy0 >= qy1 || sy1 <= qy0 {
+        out.push(q);
+        return;
+    }
+    let band = |y0: i64, y1: i64| GlowQuad {
+        y: y0 as u16,
+        h: (y1 - y0) as u16,
+        ..q
+    };
+    if sy0 > qy0 {
+        out.push(band(qy0, sy0));
+    }
+    if sy1 < qy1 {
+        out.push(band(sy1, qy1));
+    }
+    let (my0, my1) = (qy0.max(sy0), qy1.min(sy1));
+    if sx0 > qx0 {
+        out.push(columns(band(my0, my1), 0, (sx0 - qx0) as u16));
+    }
+    if sx1 < qx1 {
+        out.push(columns(band(my0, my1), (sx1 - qx0) as u16, q.w));
+    }
+}
+
+/// Columns `a..b` of `q`, its gradient's colour and opacity at their edges.
+fn columns(q: GlowQuad, a: u16, b: u16) -> GlowQuad {
+    let w = u32::from(q.w).max(1);
+    let edge = |c0: u32, c1: u32, at: u16| -> u32 {
+        let at = u32::from(at);
+        (c0 * (w - at) + c1 * at + w / 2) / w
+    };
+    let edge_rgb = |c0: u32, c1: u32, at: u16| -> u32 {
+        if c0 == c1 {
+            return c0 & 0x00FF_FFFF;
+        }
+        let ch = |sh: u32| edge((c0 >> sh) & 0xff, (c1 >> sh) & 0xff, at);
+        (ch(16) << 16) | (ch(8) << 8) | ch(0)
+    };
+    GlowQuad {
+        x: q.x + a,
+        w: b - a,
+        color: edge_rgb(q.color, q.color2, a),
+        alpha: edge(u32::from(q.alpha), u32::from(q.alpha2), a) as u8,
+        color2: edge_rgb(q.color, q.color2, b),
+        alpha2: edge(u32::from(q.alpha), u32::from(q.alpha2), b) as u8,
+        ..q
+    }
+}
+
 fn check_frame(frame: &Frame) -> Result<(), String> {
     crate::checked_frame_size_px(frame.height, frame.width, 1, 1, 0, 0)?;
     if frame.width.checked_mul(frame.height) != Some(frame.pixels.len()) {
@@ -721,6 +906,117 @@ mod tests {
         let mut bare = frame(80, 40, 0);
         apply(&mut bare, &[], 3, BloomParams::default()).unwrap();
         assert!(bare.pixels.iter().all(|&p| p == 0));
+    }
+
+    /// A row of 10 cells 8x16 at the frame's origin, `x` standing in cells `3..5`.
+    fn lettered_row() -> (aterm_core::render::RenderInput, LetterGrid) {
+        let mut input = aterm_core::render::RenderInput::empty();
+        input.rows = 1;
+        input.cols = 10;
+        let mut row = vec![crate::RenderCell::default(); 10];
+        for cell in &mut row[3..5] {
+            cell.ch = 'x';
+        }
+        input.cells = vec![row];
+        let grid = LetterGrid {
+            pad: 0,
+            grid_top: 0,
+            cell_w: 8,
+            cell_h: 16,
+        };
+        (input, grid)
+    }
+
+    /// looks10 L1: the post passes' source keeps `shield` px off every lettered cell, and
+    /// keeps every other pixel of the light once, each at the colour and opacity the whole
+    /// light had there. NEGATIVE CONTROL: a light clear of the letters by more than the
+    /// shield is kept whole.
+    #[test]
+    fn spared_lights_keep_off_the_letters_and_keep_the_rest_whole() {
+        let (input, grid) = lettered_row();
+        let light = GlowQuad {
+            color2: 0x0000_00FF,
+            alpha2: 200,
+            ..GlowQuad::flat(0, 0, 4, 80, 8, 0x00FF_0000, 40)
+        };
+        let shield = 3;
+        let mut kept = vec![light];
+        spare_letters(&mut kept, &input, grid, shield);
+        let shielded = |x: usize, y: usize| {
+            (24 - shield as usize..40 + shield as usize).contains(&x) && y < 16 + shield as usize
+        };
+        let mut covered = vec![0u8; 80 * 16];
+        for q in &kept {
+            for y in usize::from(q.y)..usize::from(q.y + q.h) {
+                for x in usize::from(q.x)..usize::from(q.x + q.w) {
+                    assert!(!shielded(x, y), "a kept light at ({x}, {y}) by a letter");
+                    covered[y * 80 + x] += 1;
+                    let at = |c: u32, c2: u32, q: &GlowQuad, x: usize| {
+                        crate::glow_lerp_rgb(c, c2, (x - usize::from(q.x)) as u32, u32::from(q.w))
+                    };
+                    let (whole, piece) = (
+                        at(light.color, light.color2, &light, x),
+                        at(q.color, q.color2, q, x),
+                    );
+                    for sh in [16, 8, 0] {
+                        let d = ((whole >> sh) & 0xff).abs_diff((piece >> sh) & 0xff);
+                        assert!(
+                            d <= 1,
+                            "a piece's colour at x {x}: {piece:06x} for {whole:06x}"
+                        );
+                    }
+                }
+            }
+        }
+        for y in 4..12 {
+            for x in 0..80 {
+                let want = u8::from(!shielded(x, y));
+                assert_eq!(
+                    covered[y * 80 + x],
+                    want,
+                    "({x}, {y}) kept {} times",
+                    covered[y * 80 + x]
+                );
+            }
+        }
+        let clear = GlowQuad::flat(0, 60, 4, 16, 8, 0x00FF_0000, 40);
+        let mut whole = vec![clear];
+        spare_letters(&mut whole, &input, grid, shield);
+        assert_eq!(
+            whole,
+            vec![clear],
+            "a light clear of the letters is kept whole"
+        );
+    }
+
+    /// looks10 L1: the bloom of a light beside a letter, its source spared
+    /// ([`spared_sources`]), lays nothing on the letter's cell; bloomed from the light whole
+    /// (the control), it lights the cell.
+    #[test]
+    fn a_spared_bloom_lays_no_light_on_a_letter() {
+        let (input, grid) = lettered_row();
+        let light = [GlowQuad::flat(0, 44, 0, 32, 16, 0x00E0_E0E0, 0)];
+        let (mut crown, mut blur) = (Vec::new(), Vec::new());
+        spared_sources(&light, &input, grid, BLOOM_RADIUS, &mut crown, &mut blur);
+        let letter_lit = |glow: &[GlowQuad]| {
+            let mut f = frame(80, 16, 0);
+            apply(&mut f, glow, 1, BloomParams::default()).unwrap();
+            (0..16).any(|y| (24..40).any(|x| f.pixels[y * 80 + x] != 0))
+        };
+        assert!(
+            letter_lit(&light),
+            "control: the whole light blooms onto the letter"
+        );
+        assert!(
+            !blur.is_empty(),
+            "fixture: the light reaches past the bloom's shield"
+        );
+        assert!(!letter_lit(&blur), "the spared bloom lights the letter");
+        assert_eq!(
+            crown,
+            light.to_vec(),
+            "the crown keeps a light past its shield whole"
+        );
     }
 
     /// The SDR crown screens each quad once at its colour times the budget.

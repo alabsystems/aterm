@@ -161,6 +161,8 @@ struct Inner {
     write_timeout_ms: AtomicU64,
     recv_shutdown: AtomicBool,
     send_shutdown: AtomicBool,
+    #[cfg(test)]
+    parked_reads: std::sync::atomic::AtomicUsize,
 }
 
 impl Drop for Inner {
@@ -216,6 +218,8 @@ impl CtlStream {
             write_timeout_ms: AtomicU64::new(0),
             recv_shutdown: AtomicBool::new(false),
             send_shutdown: AtomicBool::new(false),
+            #[cfg(test)]
+            parked_reads: std::sync::atomic::AtomicUsize::new(0),
         })))
     }
 
@@ -389,6 +393,8 @@ impl io::Read for &CtlStream {
             let err = last_wsa_error();
             match err.raw_os_error() {
                 Some(ffi::WSAEWOULDBLOCK) => {
+                    #[cfg(test)]
+                    inner.parked_reads.fetch_add(1, Ordering::Release);
                     if !wait_interruptible(
                         inner.raw,
                         inner.net_ev,
@@ -638,7 +644,14 @@ mod tests {
             let mut buf = [0u8; 16];
             let _ = tx.send((&a).read(&mut buf));
         });
-        std::thread::sleep(Duration::from_millis(80));
+        let deadline = Instant::now() + HANG_DETECTOR;
+        while clone.0.parked_reads.load(Ordering::Acquire) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "reader never reached wait_interruptible"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         clone.shutdown(std::net::Shutdown::Both).expect("shutdown");
         let res = rx
             .recv_timeout(HANG_DETECTOR)

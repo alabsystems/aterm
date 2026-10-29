@@ -668,16 +668,21 @@ impl Grid {
     pub fn set_cell_complex_char(&mut self, row: u16, col: u16, s: &str) {
         use std::sync::Arc;
 
+        let mut width = 1u16;
         if let Some(r) = self.row_mut(row)
             && let Some(cell) = r.get_mut(col)
         {
             let mut flags = cell.flags();
+            if flags.contains(CellFlags::WIDE) {
+                width = 2;
+            }
             flags.insert(CellFlags::COMPLEX);
             cell.set_flags(flags);
             cell.set_overflow_index(0);
             cell.set_has_extras(true);
         }
 
+        self.storage.extras.clear_complex_ring_cell(row, col, width);
         let extra = self.storage.extras.get_or_create(CellCoord::new(row, col));
         extra.set_complex_char(Some(Arc::from(s)));
 

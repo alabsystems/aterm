@@ -213,15 +213,31 @@ pub const fn trail_sound_event(
     policy: &TrailSoundPolicy,
     gain: f32,
 ) -> crate::trail_sound::SoundEvent {
+    let last_col = if cols > 1 {
+        let last = (cols - 1) as f32;
+        Some((last, 1.0 / last))
+    } else {
+        None
+    };
+    trail_sound_event_with_last_col(cue, style, last_col, policy, gain)
+}
+
+#[must_use]
+#[inline]
+const fn trail_sound_event_with_last_col(
+    cue: &crate::cursor_glow::SoundCue,
+    style: crate::cursor_glow::GlowStyle,
+    last_col: Option<(f32, f32)>,
+    policy: &TrailSoundPolicy,
+    gain: f32,
+) -> crate::trail_sound::SoundEvent {
     crate::trail_sound::SoundEvent {
         style,
         voice: policy.voice,
         kind: crate::trail_sound::SoundGesture::Trail(cue.kind),
-        pan: if cols > 1 {
-            let last = (cols - 1) as f32;
-            ((cue.col as f32).min(last) / last) * 2.0 - 1.0
-        } else {
-            0.0
+        pan: match last_col {
+            Some((last, inv_last)) => ((cue.col as f32).min(last) * inv_last) * 2.0 - 1.0,
+            None => 0.0,
         },
         heat: cue.heat,
         hue: cue.hue,
@@ -246,9 +262,17 @@ pub fn drain_trail_sound_cues(
     let Some(gain) = policy.gain else {
         return 0;
     };
+    let last_col = if cols > 1 {
+        let last = (cols - 1) as f32;
+        Some((last, 1.0 / last))
+    } else {
+        None
+    };
     let mut emitted = 0;
     for cue in drain {
-        emit(trail_sound_event(&cue, style, cols, &policy, gain));
+        emit(trail_sound_event_with_last_col(
+            &cue, style, last_col, &policy, gain,
+        ));
         emitted += 1;
     }
     emitted
@@ -326,7 +350,16 @@ pub fn drain_curse_bonk_cues(
     };
     for cue in decos.drain_curse_cues() {
         let location = u32::from(cue.row) << 16 | u32::from(cue.col);
-        if !seen[..seen_len].contains(&location) {
+        let mut already_seen = false;
+        let mut si = 0;
+        while si < seen_len {
+            if seen[si] == location {
+                already_seen = true;
+                break;
+            }
+            si += 1;
+        }
+        if !already_seen {
             if seen_len < seen.len() {
                 seen[seen_len] = location;
                 seen_len += 1;

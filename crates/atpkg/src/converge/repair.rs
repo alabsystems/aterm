@@ -36,21 +36,6 @@ pub const STORE: &str = super::STORE;
 /// `base.shell.rc`'s reading when every rc that exists is wired.
 pub const RC_ALL_WIRED: &str = "every rc that exists sources ~/.aterm/shell.d";
 
-/// Every repair item's id, in run order.
-pub const IDS: [&str; 11] = [
-    COPIED_COMMANDS,
-    LINKS,
-    HOOKS,
-    RC,
-    STUBS,
-    RUSTUP_SEAM,
-    RUSTUP_LOCAL,
-    HELD_UPDATE,
-    SHIMS,
-    EXEC_ROOTS,
-    STORE,
-];
-
 /// Which surface runs the items, and so the one act that differs between them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pass {
@@ -178,7 +163,7 @@ impl Ground {
     }
 }
 
-/// The repair items over `ground`, in run order ([`IDS`]).
+/// The repair items over `ground`, in run order.
 #[must_use]
 pub fn items(ground: &Arc<Ground>) -> Vec<Box<dyn Item>> {
     [

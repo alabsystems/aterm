@@ -59,6 +59,10 @@ pub enum Family {
     /// System State's setup of this Mac (`setup.<cause>`): a fact its page says calmly, such
     /// as changes it made and could not log.
     Setup,
+    /// A credential this Mac needs that only a person can give
+    /// (`secrets.need.<want>.awaiting-person`, docs/DESIGN-credential-requests-2026-10-27.md
+    /// §10): the whole answer of the need ledger, every look.
+    Secrets,
 }
 
 impl Family {
@@ -88,6 +92,7 @@ impl Family {
             Self::FabricState => "fabric.state",
             Self::Occupancy => "harness.occupancy",
             Self::Setup => "setup",
+            Self::Secrets => "secrets.need",
         }
     }
 
@@ -109,7 +114,8 @@ impl Family {
             | Self::LongHold
             | Self::FleetUnreadable
             | Self::HugeDir
-            | Self::ServiceMemory => Mode::Level,
+            | Self::ServiceMemory
+            | Self::Secrets => Mode::Level,
             Self::Privacy
             | Self::Update
             | Self::UpgradeHost
@@ -127,7 +133,7 @@ impl Family {
     }
 
     /// Every family, in digest order.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::Privacy,
         Self::Update,
         Self::Upgrade,
@@ -149,6 +155,7 @@ impl Family {
         Self::FabricState,
         Self::Occupancy,
         Self::Setup,
+        Self::Secrets,
     ];
 
     /// The message tag the family's entries carry.
@@ -172,7 +179,8 @@ impl Family {
             | Self::FleetUnreadable
             | Self::HugeDir
             | Self::ServiceMemory
-            | Self::Setup => tags::SYSTEM,
+            | Self::Setup
+            | Self::Secrets => tags::SYSTEM,
             Self::Render => tags::RENDER,
             Self::Terminal | Self::Removed => tags::CONFIG,
             Self::FabricState => tags::FABRIC,

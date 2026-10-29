@@ -43,9 +43,15 @@ pub fn label_for(exe: &Path) -> String {
 /// Whether `text` is a label [`label_for`] makes ([`INSTALLED_LABEL`]).
 #[must_use]
 pub fn is_label(text: &str) -> bool {
-    text == INSTALLED_LABEL
+    label_of(text, INSTALLED_LABEL, DEV_LABEL_PREFIX)
+}
+
+/// Whether `text` is `installed`, or `dev_prefix`, a dot and eight lowercase hex digits: the
+/// grammar of [`label_for`]'s labels, under the mug's name now or before ([`crate::legacy`]).
+pub(crate) fn label_of(text: &str, installed: &str, dev_prefix: &str) -> bool {
+    text == installed
         || text
-            .strip_prefix(DEV_LABEL_PREFIX)
+            .strip_prefix(dev_prefix)
             .and_then(|rest| rest.strip_prefix('.'))
             .is_some_and(|hash| {
                 hash.len() == 8
@@ -220,6 +226,18 @@ fn utf8(path: &Path) -> io::Result<()> {
 /// Orphaned login plists in `~/Library/LaunchAgents` whose executable is gone ([`is_label`]).
 #[must_use]
 pub fn orphans(paths: &Paths) -> Vec<(String, std::path::PathBuf)> {
+    login_jobs(paths, is_label, &SERVE_ARGS, program_gone)
+}
+
+/// The login plists in `~/Library/LaunchAgents` named for a label `is_label` takes, each a
+/// regular file whose ProgramArguments are a program and `serve_args`, with `pick` true of that
+/// program: `(label, plist)`, sorted.
+pub(crate) fn login_jobs(
+    paths: &Paths,
+    is_label: fn(&str) -> bool,
+    serve_args: &[&str],
+    pick: impl Fn(&Path) -> bool,
+) -> Vec<(String, std::path::PathBuf)> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir(paths.launch_agents())
         .into_iter()
@@ -247,13 +265,7 @@ pub fn orphans(paths: &Paths) -> Vec<(String, std::path::PathBuf)> {
         let [program, rest @ ..] = args.as_slice() else {
             continue;
         };
-        let program = Path::new(program);
-        if rest == SERVE_ARGS
-            && program.is_absolute()
-            && !program.starts_with("/Volumes")
-            && std::fs::symlink_metadata(program)
-                .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
-        {
+        if rest == serve_args && pick(Path::new(program)) {
             found.push((label, plist));
         }
     }
@@ -261,14 +273,105 @@ pub fn orphans(paths: &Paths) -> Vec<(String, std::path::PathBuf)> {
     found
 }
 
+/// Whether a job's `program` is gone: an absolute path, off `/Volumes` (a volume that is not
+/// mounted now may come back), with nothing there.
+pub(crate) fn program_gone(program: &Path) -> bool {
+    program.is_absolute()
+        && !program.starts_with("/Volumes")
+        && std::fs::symlink_metadata(program).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+}
+
+/// Remove the temporaries that no write will rename beside the job plists, under this name and
+/// the old one ([`crate::legacy`]): in the session plists' folders and in
+/// `~/Library/LaunchAgents`, each beside a plist named for a label [`is_label`] or
+/// [`crate::legacy::is_label`] takes ([`aterm_uds::atomic_file::temp_target`]), with
+/// [`aterm_uds::atomic_file::sweep_temps_beside`] past
+/// [`aterm_uds::atomic_file::ABANDONED_AFTER`]. 0.145.0's window autostart, cut short by a
+/// refused command line, left one beside a session plist. Each plist that has one, with how many
+/// went, or its sweep's first error once the rest were tried, after which some may have gone;
+/// a folder that cannot be listed, with why, and none of its temporaries go.
+#[cfg(unix)]
+#[must_use]
+pub fn sweep_plist_temps(paths: &Paths) -> Vec<(std::path::PathBuf, io::Result<usize>)> {
+    let mut swept = Vec::new();
+    for dir in [
+        paths.session_dir(),
+        crate::legacy::session_dir(paths),
+        paths.launch_agents(),
+    ] {
+        match plists_with_temps(&dir) {
+            Ok(plists) => swept.extend(plists.into_iter().map(|plist| {
+                let after = aterm_uds::atomic_file::ABANDONED_AFTER;
+                let gone = aterm_uds::atomic_file::sweep_temps_beside(&plist, after);
+                (plist, gone)
+            })),
+            Err(e) => swept.push((dir, Err(e))),
+        }
+    }
+    swept
+}
+
+/// The job plists in `dir` with a temporary beside them ([`sweep_plist_temps`]), sorted; none
+/// for a missing `dir`.
+#[cfg(unix)]
+fn plists_with_temps(dir: &Path) -> io::Result<Vec<std::path::PathBuf>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut plists = std::collections::BTreeSet::new();
+    for entry in entries {
+        let name = entry?.file_name();
+        let Some(plist) = aterm_uds::atomic_file::temp_target(&name) else {
+            continue;
+        };
+        let ours = plist
+            .strip_suffix(".plist")
+            .is_some_and(|label| is_label(label) || crate::legacy::is_label(label));
+        if ours {
+            plists.insert(dir.join(plist));
+        }
+    }
+    Ok(plists.into_iter().collect())
+}
+
 /// Remove every [`orphans`] plist.
 #[cfg(unix)]
 pub fn prune_orphans(paths: &Paths) {
-    for (label, plist) in orphans(paths) {
-        let _ = std::fs::remove_file(&plist);
-        if matches!(job_state(&label), Ok(JobState::Loaded { pid: None })) {
-            let _ = bootout(&label);
+    let _ = retire(orphans(paths));
+}
+
+/// Remove each job's plist, and unload a job launchd has loaded but not running, so it is not
+/// started again this login ([`unload_idle`]). What could not be removed, one line each.
+#[cfg(unix)]
+pub(crate) fn retire(jobs: Vec<(String, std::path::PathBuf)>) -> Vec<String> {
+    retire_with(jobs, unload_idle)
+}
+
+/// [`retire`], unloading each job's label with `unload` once its plist is removed or fails to be.
+#[cfg(unix)]
+pub(crate) fn retire_with(
+    jobs: Vec<(String, std::path::PathBuf)>,
+    unload: impl Fn(&str),
+) -> Vec<String> {
+    let mut failed = Vec::new();
+    for (label, plist) in jobs {
+        if let Err(e) = std::fs::remove_file(&plist)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            failed.push(format!("{}: {e}", plist.display()));
         }
+        unload(&label);
+    }
+    failed
+}
+
+/// Boot out the job `label` when launchd has it loaded but not running.
+#[cfg(unix)]
+pub(crate) fn unload_idle(label: &str) {
+    if matches!(job_state(label), Ok(JobState::Loaded { pid: None })) {
+        let _ = bootout(label);
     }
 }
 
@@ -963,5 +1066,112 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_sweep_takes_what_cut_short_plist_writes_left_beside_the_mugs_jobs() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let paths = Paths {
+            state_dir: root.path().join("state"),
+            home: root.path().join("home"),
+            logs_dir: root.path().join("logs"),
+        };
+        assert!(sweep_plist_temps(&paths).is_empty(), "no folders at all");
+        let ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+        let plant = |dir: &Path, plist: &str, salt: &str, dated: bool| {
+            std::fs::create_dir_all(dir).expect("dir");
+            let temp = dir.join(format!(".{plist}.tmp.4294967295.{salt}"));
+            let file = std::fs::File::create(&temp).expect("plant");
+            if dated {
+                file.set_modified(ago).expect("date");
+            }
+            temp
+        };
+        let (session, old, agents) = (
+            paths.session_dir(),
+            crate::legacy::session_dir(&paths),
+            paths.launch_agents(),
+        );
+        let cut_short = [
+            plant(
+                &session,
+                "com.aterm.aterm.acaffiene.dev.0123abcd.plist",
+                "0123abcd",
+                true,
+            ),
+            plant(&old, "com.aterm.aterm.caffeine.plist", "0123abcd", true),
+            plant(&agents, "com.aterm.aterm.acaffiene.plist", "0123abcd", true),
+            plant(&agents, "com.aterm.aterm.acaffiene.plist", "89abcdef", true),
+            plant(
+                &agents,
+                "com.aterm.aterm.caffeine.dev.0123abcd.plist",
+                "0123abcd",
+                true,
+            ),
+        ];
+        let kept = [
+            plant(
+                &session,
+                "com.aterm.aterm.acaffiene.dev.0123abcd.plist",
+                "fedcba98",
+                false,
+            ),
+            plant(&agents, "com.example.other.plist", "0123abcd", true),
+            plant(
+                &agents,
+                "com.aterm.aterm.acaffiene.dev.0123ABCD.plist",
+                "0123abcd",
+                true,
+            ),
+            plant(&agents, "com.aterm.aterm.acaffiene", "0123abcd", true),
+        ];
+        let swept = sweep_plist_temps(&paths);
+        let answered: Vec<_> = swept
+            .iter()
+            .map(|(plist, gone)| (plist.clone(), *gone.as_ref().expect("swept")))
+            .collect();
+        assert_eq!(
+            answered,
+            [
+                (
+                    session.join("com.aterm.aterm.acaffiene.dev.0123abcd.plist"),
+                    1
+                ),
+                (old.join("com.aterm.aterm.caffeine.plist"), 1),
+                (agents.join("com.aterm.aterm.acaffiene.plist"), 2),
+                (
+                    agents.join("com.aterm.aterm.caffeine.dev.0123abcd.plist"),
+                    1
+                ),
+            ]
+        );
+        for temp in &cut_short {
+            assert!(!temp.exists(), "{}", temp.display());
+        }
+        for temp in &kept {
+            assert!(temp.exists(), "{}", temp.display());
+        }
+
+        use std::os::unix::fs::PermissionsExt as _;
+        let stuck = plant(
+            &session,
+            "com.aterm.aterm.acaffiene.plist",
+            "0123abcd",
+            true,
+        );
+        let mode = |bits| {
+            std::fs::set_permissions(&session, std::fs::Permissions::from_mode(bits))
+                .expect("chmod");
+        };
+        mode(0o300);
+        let swept = sweep_plist_temps(&paths);
+        mode(0o700);
+        let answered: Vec<_> = swept
+            .iter()
+            .map(|(dir, gone)| (dir.clone(), gone.as_ref().map_err(io::Error::kind).copied()))
+            .collect();
+        assert_eq!(answered, [(session, Err(io::ErrorKind::PermissionDenied))]);
+        assert!(stuck.exists(), "an unlisted folder's stay");
     }
 }

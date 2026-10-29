@@ -5,6 +5,11 @@
 #![cfg_attr(trust_verify, register_tool(trust))]
 
 //! First-party D-Bus for aterm: a synchronous client for unix sockets.
+//!
+//! Every byte the decoder reads may come from any process on the bus: `tests/mutations.rs`
+//! decodes seeded damage to the recorded messages and values (`tests/recorded/`), and `fuzz/`
+//! (a STOCK EXCEPTION cargo-fuzz lane: cargo-fuzz runs on a stock nightly) decodes input
+//! without a seed.
 
 #![deny(unsafe_code)]
 

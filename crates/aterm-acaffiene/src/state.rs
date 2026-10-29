@@ -5,12 +5,13 @@
 //! (`mode=off|forever|until`, `ends=<secs>`, `span=<secs>`, `deadline=<secs>`, `boot=<uuid>`).
 //!
 //! A timed mode ends at `ends` on the boot clock ([`Clocks::since_boot`]), so only a file of this
-//! boot is read against it. `deadline` is that end on the wall clock as the save read it, for
-//! builds that predate `ends`; the mug saves it again once the date changes ([`refresh`]). A file
-//! with no `ends` is read against the wall clock now, never as more than its span away, until the
-//! mug that takes it saves it back ([`take_saving`]). Missing or unparseable state, a mode saved
-//! in an earlier boot, and an expired span restore to [`Mode::Forever`]; only an explicit off of
-//! this boot restores to [`Mode::Off`].
+//! boot is read against it. `deadline` is that end on the wall clock as the save read it, for a
+//! person reading the file (every build that reads it reads `ends`); the mug saves it again once
+//! the date changes ([`refresh`]). A file with no `ends` (one written by hand) is read against
+//! the wall clock now, never as more than its span away, until the mug that takes it saves it
+//! back ([`take_saving`]). Missing or unparseable state, a mode saved in an earlier boot, and an
+//! expired span restore to [`Mode::Forever`]; only an explicit off of this boot restores to
+//! [`Mode::Off`].
 
 use std::io;
 use std::path::Path;
@@ -71,7 +72,7 @@ pub fn encode(saved: &Saved, now: Clocks) -> String {
     text
 }
 
-/// Decodes state text written by [`encode`]; a text with no `ends` (an older build's) has its
+/// Decodes state text written by [`encode`]; a text with no `ends` (written by hand) has its
 /// wall-clock deadline read at `now`, never as more than its span away.
 #[must_use]
 pub fn decode(text: &str, now: Clocks) -> Option<Saved> {
@@ -174,7 +175,8 @@ fn drifted(text: &str, mode: Mode, boot: Option<u128>, now: Clocks) -> bool {
 }
 
 /// Restores `saved` at `now` if its boot matches `boot_now`; missing, unreadable and earlier-boot
-/// state is forever, and an expired span returns to forever. Only an explicit off of this boot is off.
+/// state is forever, and an expired span returns to forever ([`Mode::kept`]). Only an explicit off
+/// of this boot is off.
 #[inline]
 #[must_use]
 pub const fn restore(saved: Option<Saved>, boot_now: Option<u128>, now: Clocks) -> Mode {
@@ -185,12 +187,17 @@ pub const fn restore(saved: Option<Saved>, boot_now: Option<u128>, now: Clocks) 
                 boot: Some(then),
             }),
             Some(now_boot),
-        ) if now_boot == then => match (mode, mode.settled(now)) {
-            (Mode::Until { .. }, Mode::Off) => Mode::Forever,
-            (_, settled) => settled,
-        },
+        ) if now_boot == then => mode.kept(now),
         _ => Mode::Forever,
     }
+}
+
+/// Whether the mode saved in `path` is on at `now`, as written ([`read`]): not as a restore
+/// answers it ([`load`]), which is forever for a save with no boot to match. A mug or a verb that
+/// has just saved off asks this to tell a writer's on that came after its save.
+#[must_use]
+pub fn saved_on(path: &Path, now: Clocks) -> bool {
+    read(path, now).is_some_and(|saved| saved.mode.is_on(now))
 }
 
 /// Reads and decodes at `now` the regular state file at `path` (up to [`READ_CAP`] bytes,
@@ -231,8 +238,9 @@ const HOLD_POLL: Duration = Duration::from_millis(1);
 
 /// A save's `flock` on the state file's directory (whose inode no rename of the file replaces),
 /// held from the flush over a [`save_over`]'s re-read and the rename, so no other save that takes
-/// it renames between the two; dropping it unlocks.
-struct Held(std::fs::File);
+/// it renames between the two; dropping it unlocks. A verb's change of mode holds one on another
+/// directory ([`hold_dir`]).
+pub(crate) struct Held(std::fs::File);
 
 impl Drop for Held {
     fn drop(&mut self) {
@@ -248,8 +256,23 @@ fn hold(dir: &Path, wait: Duration) -> Option<Held> {
 }
 
 /// [`hold`], with `pause` run between tries.
-fn hold_with(dir: &Path, wait: Duration, mut pause: impl FnMut()) -> Option<Held> {
-    let file = std::fs::File::open(dir).ok()?;
+fn hold_with(dir: &Path, wait: Duration, pause: impl FnMut()) -> Option<Held> {
+    hold_dir(dir, wait, pause).ok().flatten()
+}
+
+/// The [`Held`] on `dir`, waited for up to `wait` while another description holds it, with
+/// `pause` run between tries: `None` once `wait` is up. A verb's change of mode holds one on its
+/// own directory ([`crate::paths::Paths::session_dir`]).
+///
+/// # Errors
+///
+/// The directory cannot be opened (Windows' `File::open` opens none) or locked.
+pub(crate) fn hold_dir(
+    dir: &Path,
+    wait: Duration,
+    mut pause: impl FnMut(),
+) -> io::Result<Option<Held>> {
+    let file = std::fs::File::open(dir)?;
     let until = Instant::now() + wait;
     loop {
         #[expect(
@@ -258,9 +281,10 @@ fn hold_with(dir: &Path, wait: Duration, mut pause: impl FnMut()) -> Option<Held
         )]
         let taken = file.try_lock();
         match taken {
-            Ok(()) => return Some(Held(file)),
+            Ok(()) => return Ok(Some(Held(file))),
             Err(std::fs::TryLockError::WouldBlock) if Instant::now() < until => pause(),
-            Err(_) => return None,
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
         }
     }
 }
@@ -321,6 +345,33 @@ fn write_unless(
         let _ = std::fs::remove_file(&tmp);
     }
     written
+}
+
+/// Remove the temporaries that no write will rename beside the mode and the update bridge's pid
+/// file, under this name and the old one ([`crate::legacy`]), with
+/// [`aterm_uds::atomic_file::sweep_temps_beside`] past
+/// [`aterm_uds::atomic_file::ABANDONED_AFTER`]; the job plists' are
+/// [`crate::launchd::sweep_plist_temps`]'s. A process that ends while a thread of its own is
+/// saving leaves one: 0.145.0 started aCaffiene for every window argument it then refused, and
+/// left one in most runs of an old `aterm caffeine` login job. Each file, with how many of its
+/// temporaries went, or its sweep's first error once the rest were tried, after which some may
+/// have gone.
+#[cfg(unix)]
+#[must_use]
+pub fn sweep_temps(paths: &crate::paths::Paths) -> Vec<(std::path::PathBuf, io::Result<usize>)> {
+    [
+        paths.state_file(),
+        paths.bridge_file(),
+        crate::legacy::state_file(paths),
+        crate::legacy::bridge_file(paths),
+    ]
+    .into_iter()
+    .map(|file| {
+        let after = aterm_uds::atomic_file::ABANDONED_AFTER;
+        let swept = aterm_uds::atomic_file::sweep_temps_beside(&file, after);
+        (file, swept)
+    })
+    .collect()
 }
 
 /// Saves `mode` to `path`, stamped with this boot ([`crate::instance::boot_id`]) and encoded at
@@ -451,8 +502,8 @@ fn take_saving_with(path: &Path, now: Clocks, mut landing: impl FnMut(&Path)) ->
 
 /// Saves `mode` again, encoded at `now`, when the file at `path` holds it as a timed mode saved
 /// before a change of the date ([`drifted`]), unless a writer changes it first ([`save_over`]):
-/// whether it was saved. This keeps `deadline` true for a build that reads the end on the wall
-/// clock alone. The file is read only for a timed mode.
+/// whether it was saved. This keeps `deadline` true for a person reading the file. The file is
+/// read only for a timed mode.
 ///
 /// # Errors
 ///
@@ -492,6 +543,34 @@ mod tests {
     };
     const DAY: u64 = 24 * HOUR;
     const BOOT: u128 = 0x4D5A_1B2C_3E4F_5061_7283_94A5_B6C7_D8E9;
+
+    #[test]
+    fn saved_on_reads_the_mode_as_written_not_as_restored() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("acaffiene.state");
+        assert!(!saved_on(&file, NOW), "no file");
+        let at = |mode, boot| {
+            std::fs::write(&file, encode(&Saved { mode, boot }, NOW)).expect("write");
+            saved_on(&file, NOW)
+        };
+        assert!(!at(Mode::Off, Some(BOOT)));
+        assert!(
+            !at(Mode::Off, None),
+            "an off with no boot, which a restore reads as forever"
+        );
+        assert_eq!(load(&file, NOW), Mode::Forever, "as a restore reads it");
+        assert!(at(Mode::Forever, None));
+        assert!(at(Mode::Forever, Some(BOOT)));
+        let span = |deadline| Mode::Until {
+            deadline,
+            span: HOUR,
+        };
+        assert!(at(span(NOW.since_boot + HOUR), Some(BOOT)));
+        assert!(
+            !at(span(NOW.since_boot), Some(BOOT)),
+            "a span that has ended"
+        );
+    }
 
     #[test]
     fn every_mode_round_trips() {
@@ -614,6 +693,14 @@ mod tests {
         };
         assert_eq!(restore(Some(timed), Some(BOOT), NOW), timed.mode);
         assert_eq!(restore(Some(timed), Some(BOOT), NOW + 10), Mode::Forever);
+        let nothing = Saved {
+            mode: Mode::Until {
+                deadline: NOW.since_boot + HOUR,
+                span: 0,
+            },
+            boot: Some(BOOT),
+        };
+        assert_eq!(restore(Some(nothing), Some(BOOT), NOW), Mode::Forever);
         let off = Saved {
             mode: Mode::Off,
             boot: Some(BOOT),
@@ -622,7 +709,7 @@ mod tests {
     }
 
     /// A saved span keeps its time through the wall clock set back or forward a day, and the file
-    /// keeps its end on the wall clock for builds that read only that.
+    /// keeps its end on the wall clock in `deadline`.
     #[test]
     fn a_saved_span_keeps_its_time_through_a_change_of_the_date() {
         let saved = Saved {
@@ -644,7 +731,7 @@ mod tests {
     /// A file with no `ends` is read against the wall clock now, never as more than its span away,
     /// and from then on runs on the boot clock.
     #[test]
-    fn an_earlier_builds_file_restores_bounded_by_its_span() {
+    fn a_file_with_no_ends_restores_bounded_by_its_span() {
         let earlier = |deadline: u64| {
             format!(
                 "mode=until\ndeadline={deadline}\nspan=3600\nboot={}\n",
@@ -721,7 +808,7 @@ mod tests {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("acaffiene.state");
         assert_eq!(take(&path, NOW), (Mode::Forever, None), "no file");
-        std::fs::write(&path, earlier(NOW.wall + HOUR)).expect("an earlier build's file");
+        std::fs::write(&path, earlier(NOW.wall + HOUR)).expect("a file with no ends");
         assert_eq!(take(&path, NOW).1, Some(earlier(NOW.wall + HOUR)));
         write(
             &path,
@@ -789,7 +876,7 @@ mod tests {
         };
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("acaffiene.state");
-        std::fs::write(&path, earlier(NOW.wall + HOUR)).expect("an earlier build's file");
+        std::fs::write(&path, earlier(NOW.wall + HOUR)).expect("a file with no ends");
         let mut landed = 0;
         let taken = take_saving_with(&path, NOW, |path| {
             landed += 1;
@@ -802,7 +889,7 @@ mod tests {
             std::fs::read_to_string(&path).expect("state"),
             format!("mode=off\nboot={this}\n")
         );
-        std::fs::write(&path, earlier(NOW.wall + HOUR)).expect("an earlier build's file");
+        std::fs::write(&path, earlier(NOW.wall + HOUR)).expect("a file with no ends");
         let mut landed = 0;
         let taken = take_saving_with(&path, NOW, |path| {
             landed += 1;
@@ -832,7 +919,7 @@ mod tests {
         let path = dir.path().join("acaffiene.state");
         let hour = Mode::chosen(crate::model::Choice::Hours1, NOW);
         for lead in [0, 1, 2, DRIFT_SECS, DRIFT_SECS + 1] {
-            std::fs::write(&path, &earlier).expect("an earlier build's file");
+            std::fs::write(&path, &earlier).expect("a file with no ends");
             let writers = NOW + lead;
             let on = Mode::chosen(crate::model::Choice::Hours1, writers);
             let (mut landed, mut text) = (0, String::new());
@@ -931,6 +1018,58 @@ mod tests {
             let saved = refresh_with(&path, mode, NOW, read, || {});
             assert!(!saved.expect("refreshed"), "{mode:?}");
             assert_eq!(reads, want, "{mode:?}");
+        }
+    }
+
+    /// A refresh saves again only the mug's own timed mode of this boot whose `deadline` is
+    /// missing or more than [`DRIFT_SECS`] from where the wall clock now puts its end: drift up
+    /// to that is two readings of the clocks, and a file of another boot, with no boot, or
+    /// holding another mode (a writer's, or the mug's own with its `mode` edited by hand) is not
+    /// the mug's save.
+    #[test]
+    fn only_the_mugs_own_save_drifted_past_its_margin_is_saved_again() {
+        let hour = Mode::chosen(crate::model::Choice::Hours1, NOW);
+        let text = |mode, boot| encode(&Saved { mode, boot }, NOW);
+        let ours = text(hour, Some(BOOT));
+        let at = |off| Clocks {
+            wall: NOW.wall + off,
+            ..NOW
+        };
+        assert!(!drifted(&ours, hour, Some(BOOT), NOW));
+        assert!(!drifted(&ours, hour, Some(BOOT), at(DRIFT_SECS)));
+        assert!(drifted(&ours, hour, Some(BOOT), at(DRIFT_SECS + 1)));
+        let no_deadline: String = ours
+            .lines()
+            .filter(|line| !line.starts_with("deadline="))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert!(drifted(&no_deadline, hour, Some(BOOT), NOW));
+        for (file, boot) in [
+            (text(hour, Some(BOOT ^ 1)), Some(BOOT)),
+            (text(hour, None), Some(BOOT)),
+            (text(hour, None), None),
+            (ours.clone(), None),
+            (
+                text(
+                    Mode::chosen(crate::model::Choice::Hours1, NOW + 60),
+                    Some(BOOT),
+                ),
+                Some(BOOT),
+            ),
+            (
+                text(
+                    Mode::Until {
+                        deadline: NOW.since_boot + HOUR,
+                        span: 2 * HOUR,
+                    },
+                    Some(BOOT),
+                ),
+                Some(BOOT),
+            ),
+            (text(Mode::Forever, Some(BOOT)), Some(BOOT)),
+            (ours.replacen("mode=until", "mode=off", 1), Some(BOOT)),
+        ] {
+            assert!(!drifted(&file, hour, boot, at(DAY)), "{file:?} {boot:?}");
         }
     }
 
@@ -1056,5 +1195,54 @@ mod tests {
                 "the ordinary state still reads"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sweep_takes_what_cut_short_writes_left_beside_each_file_written_through_one() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let paths = crate::paths::Paths {
+            state_dir: dir.path().join("state"),
+            home: dir.path().join("home"),
+            logs_dir: dir.path().join("logs"),
+        };
+        std::fs::create_dir_all(&paths.state_dir).expect("state dir");
+        let ago = std::time::SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+        let plant = |name: &str, salt: &str, dated: bool| {
+            let temp = paths
+                .state_dir
+                .join(format!(".{name}.tmp.4294967295.{salt}"));
+            let file = std::fs::File::create(&temp).expect("plant");
+            if dated {
+                file.set_modified(ago).expect("date");
+            }
+            temp
+        };
+        let written = [
+            "acaffiene.state",
+            "acaffiene.bridge",
+            "caffeine.state",
+            "caffeine.bridge",
+        ];
+        let cut_short: Vec<_> = written
+            .iter()
+            .map(|name| plant(name, "0123abcd", true))
+            .collect();
+        let young = plant("acaffiene.state", "89abcdef", false);
+        let other = plant("acaffiene.lock", "0123abcd", true);
+        let swept = sweep_temps(&paths);
+        let files: Vec<_> = swept.iter().map(|(file, _)| file.clone()).collect();
+        assert_eq!(files, written.map(|name| paths.state_dir.join(name)));
+        for (file, gone) in swept {
+            assert_eq!(gone.expect("swept"), 1, "{}", file.display());
+        }
+        for temp in &cut_short {
+            assert!(!temp.exists(), "{}", temp.display());
+        }
+        assert!(young.exists(), "written within the hour");
+        assert!(
+            other.exists(),
+            "the lock is written in place, so this is none of its"
+        );
     }
 }

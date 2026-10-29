@@ -34,6 +34,7 @@ impl Bed {
             codex_thread: None,
             agy_conversation: None,
             codex_home: None,
+            codex_login: None,
             now: NOW,
             tz_s: 0,
             sid: String::new(),
@@ -61,6 +62,8 @@ impl Bed {
                 fetch: &|_, _| Ok(CSV.into()),
                 ladder: &[],
                 fleet_snapshots: &[],
+                heal: None,
+                allow_empty_pool: false,
             },
         )
         .unwrap()
@@ -302,7 +305,7 @@ fn a_staging_recovery_is_a_sync_change_and_is_reported_from_its_binding() {
     assert_eq!(json["changed"].as_bool(), Some(true));
     assert!(json["needs_renew"].as_array().unwrap().is_empty());
     let mut text = Vec::new();
-    write_sync_report(&report, NOW, false, &mut text, &mut Vec::new());
+    let _exit = write_sync_report(&report, NOW, false, &mut text, &mut Vec::new());
     assert!(
         !String::from_utf8(text)
             .unwrap()

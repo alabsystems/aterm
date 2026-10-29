@@ -731,6 +731,7 @@ impl TerminalHandler<'_> {
             .try_reserve_exact(add)
             .map_err(|_| "ENOSPC:out of memory")?;
         bytes.extend_from_slice(&stored.bytes);
+        bytes.shrink_to_fit();
         let variant = Arc::new(layout.image(bytes, stored.format));
         self.transient
             .kitty_variants
@@ -1666,7 +1667,7 @@ impl TerminalHandler<'_> {
     pub(in crate::terminal) fn advance_kitty_animations(
         &mut self,
         now: aterm_time::Instant,
-    ) -> (bool, Option<aterm_time::Instant>) {
+    ) -> (bool, bool, Option<aterm_time::Instant>) {
         let playing: Vec<u32> = self
             .transient
             .kitty_frames
@@ -1675,6 +1676,7 @@ impl TerminalHandler<'_> {
             .map(|(&id, _)| id)
             .collect();
         let mut advanced = false;
+        let mut mutated = false;
         let mut next: Option<aterm_time::Instant> = None;
         for id in playing {
             if !self.kitty_image_shown(id) {
@@ -1691,6 +1693,7 @@ impl TerminalHandler<'_> {
             };
             let mut due = animation.shown_at + gap(animation, index);
             if now >= due {
+                let prev_loops = animation.loops;
                 let mut rests = false;
                 loop {
                     let following = (index + 1) % animation.frames.len();
@@ -1710,6 +1713,9 @@ impl TerminalHandler<'_> {
                         break;
                     }
                 }
+                if animation.loops != prev_loops {
+                    mutated = true;
+                }
                 if rests {
                     continue;
                 }
@@ -1717,10 +1723,11 @@ impl TerminalHandler<'_> {
                 due = now + gap(animation, index);
                 self.set_kitty_current_frame(id, frame, now);
                 advanced = true;
+                mutated = true;
             }
             next = Some(next.map_or(due, |next| next.min(due)));
         }
-        (advanced, next)
+        (advanced, mutated, next)
     }
 
     fn kitty_image_shown(&self, id: u32) -> bool {
@@ -2220,7 +2227,7 @@ impl TerminalHandler<'_> {
         if payload.is_empty() || payload.len() > MAX_KITTY_IMAGE_BYTES {
             return None;
         }
-        let (format, px_w, px_h, bytes) = match cmd.format {
+        let (format, px_w, px_h, mut bytes) = match cmd.format {
             KittyFormat::Png => {
                 let (w, h) = png_dimensions(&payload).or_else(|| cmd.width.zip(cmd.height))?;
                 (ImageFormat::Png, w, h, payload)
@@ -2243,6 +2250,7 @@ impl TerminalHandler<'_> {
                 (fmt, w, h, if rgb { rgb_to_rgba(&payload) } else { payload })
             }
         };
+        bytes.shrink_to_fit();
         let (layout, crop_ok) = match self.kitty_layout(cmd, px_w, px_h) {
             Some(layout) => (layout, true),
             None => {
@@ -2258,6 +2266,9 @@ impl TerminalHandler<'_> {
                 (self.kitty_layout(&whole, px_w, px_h)?, false)
             }
         };
+        if cmd.medium != KittyMedium::Direct {
+            self.kitty_file_resolver.note_loaded();
+        }
         Some((layout.image(bytes, format), crop_ok))
     }
 }
@@ -2337,7 +2348,8 @@ fn kitty_rgba(frame: &ImageData) -> Result<KittyRgba<'_>, &'static str> {
 }
 
 #[inline]
-const fn raw_frame(bytes: Vec<u8>, width: u16, height: u16, like: &ImageData) -> ImageData {
+fn raw_frame(mut bytes: Vec<u8>, width: u16, height: u16, like: &ImageData) -> ImageData {
+    bytes.shrink_to_fit();
     KittyLayout::of(like).image(bytes, ImageFormat::RawRgba8 { width, height })
 }
 
@@ -2417,13 +2429,13 @@ fn raster_size(image: &ImageData) -> Option<(u32, u32)> {
     }
 }
 
-const MAX_KITTY_IMAGES: usize = 256;
-const MAX_KITTY_FRAMES: usize = 128;
+pub(crate) const MAX_KITTY_IMAGES: usize = 256;
+pub(crate) const MAX_KITTY_FRAMES: usize = 128;
 const KITTY_DEFAULT_GAP_MS: u32 = 40;
-const MAX_KITTY_VARIANTS: usize = 16;
-const MAX_KITTY_VIRTUALS: usize = 8;
-const MAX_KITTY_IMAGE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_KITTY_STORE_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_KITTY_VARIANTS: usize = 16;
+pub(crate) const MAX_KITTY_VIRTUALS: usize = 8;
+pub(crate) const MAX_KITTY_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_KITTY_STORE_BYTES: usize = 64 * 1024 * 1024;
 
 impl TerminalHandler<'_> {
     #[inline]
@@ -3166,6 +3178,10 @@ mod kitty_display_tests {
             (None, 4 * 1024 * 1024),
             (Some(DcsType::Decrqss), 256),
             (Some(DcsType::Xtgettcap), 1024),
+            (
+                Some(DcsType::Decrsps { discarded: false }),
+                crate::terminal::handler::handler_decrsps::DATA_CAP,
+            ),
             (Some(DcsType::Unknown), 0),
         ];
         let run: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();

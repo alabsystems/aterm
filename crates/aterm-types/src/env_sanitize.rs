@@ -53,6 +53,27 @@ pub const ENV_DEV_FAST_TIMERS: &str = "ATERM_DEV_FAST_TIMERS";
 /// Environment variable advertising `amacs` as the default editor to shell integration.
 pub const ENV_DEFAULT_EDITOR: &str = "ATERM_DEFAULT_EDITOR";
 
+/// The word an aterm tab exports as `EDITOR` when the person set none: amacs, bare, because a
+/// bundle path holds spaces that `sh -c "$EDITOR file"` would split.
+pub const DEFAULT_EDITOR_WORD: &str = "amacs";
+
+/// Environment variable every aterm tab's session carries (`ATERM_CHILD=1`).
+pub const ENV_ATERM_CHILD: &str = "ATERM_CHILD";
+
+/// Whether an inherited `EDITOR` is the default an outer aterm's tab exported rather than the
+/// person's own: exactly [`DEFAULT_EDITOR_WORD`], in an environment an aterm tab handed down
+/// (`aterm_child`, the inherited [`ENV_ATERM_CHILD`], is non-empty). Each aterm drops such an
+/// `EDITOR` and derives its own default under its own settings, as it does
+/// [`ENV_DEFAULT_EDITOR`]; a person who exports `EDITOR=amacs` in their startup files gets it back
+/// when those files run again.
+#[must_use]
+pub fn is_handed_down_editor(
+    editor: &std::ffi::OsStr,
+    aterm_child: Option<&std::ffi::OsStr>,
+) -> bool {
+    editor == DEFAULT_EDITOR_WORD && aterm_child.is_some_and(|value| !value.is_empty())
+}
+
 /// Exact environment variable names stripped before spawning a PTY child.
 pub const ENV_DENY_VARS: &[&str] = &[
     "ATERM_DEBUG_SEAMLESS_REEXEC",
@@ -261,6 +282,20 @@ mod tests {
         assert_eq!(ENV_DEFAULT_EDITOR, "ATERM_DEFAULT_EDITOR");
         assert!(is_ai_env_var(ENV_DEFAULT_EDITOR));
         assert!(is_ai_env_key(std::ffi::OsStr::new(ENV_DEFAULT_EDITOR)));
+    }
+
+    /// Only the bare default word under an inherited `ATERM_CHILD` is an outer aterm's `EDITOR`.
+    /// NEGATIVE CONTROL: the same word with no (or an empty) `ATERM_CHILD`, and any other
+    /// editor under one, are the person's.
+    #[test]
+    fn only_the_default_word_under_an_aterm_tab_is_handed_down() {
+        let os = std::ffi::OsStr::new;
+        assert!(is_handed_down_editor(os("amacs"), Some(os("1"))));
+        assert!(!is_handed_down_editor(os("amacs"), None));
+        assert!(!is_handed_down_editor(os("amacs"), Some(os(""))));
+        for own in ["vi", "amacs --wait", "/usr/local/bin/amacs", "Amacs", ""] {
+            assert!(!is_handed_down_editor(os(own), Some(os("1"))), "{own:?}");
+        }
     }
 
     /// What every child must keep: the ordinary environment; the shell

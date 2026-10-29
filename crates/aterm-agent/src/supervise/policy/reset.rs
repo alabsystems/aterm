@@ -413,6 +413,92 @@ mod tests {
     const NOW: i64 = 1_790_000_000;
     const HOUR: i64 = 3600;
 
+    /// Claude Code 2.1.312's 5-hour and full confirmations (`5-hour` where 2.1.311 said
+    /// `session`) are entered at a five-hour wall the host names by every build's word
+    /// (`aterm_phase::reset_limit_names`), as 2.1.311's are; a host naming 2.1.311's word alone
+    /// keeps 2.1.312's 5-hour reset, and a near miss of 2.1.312's word never reads.
+    #[test]
+    fn claude_2_1_312s_confirmations_are_entered_by_either_builds_name_of_the_wall() {
+        let five_hour: Vec<String> = aterm_phase::reset_limit_names("five_hour")
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        for (fixture, kind, left, limits) in [
+            (
+                composed::CONFIRM_SESSION_2_1_312,
+                ResetKind::Session,
+                2,
+                &["5-hour"][..],
+            ),
+            (
+                composed::CONFIRM_SESSION,
+                ResetKind::Session,
+                2,
+                &["session"],
+            ),
+            (
+                composed::CONFIRM_FULL_2_1_312,
+                ResetKind::Full,
+                1,
+                &["5-hour", "weekly"],
+            ),
+            (
+                composed::CONFIRM_FULL,
+                ResetKind::Full,
+                1,
+                &["session", "weekly"],
+            ),
+        ] {
+            assert_eq!(exact(fixture).limits, limits, "{kind:?}");
+            let own = ResetGo {
+                kind,
+                left,
+                limits: five_hour.clone(),
+                ..go()
+            };
+            assert_eq!(
+                confirm_verdict(&read(fixture), &own, None, NOW),
+                Verdict::Enter,
+                "{kind:?} {limits:?}"
+            );
+            let older = ResetGo {
+                limits: vec!["session".to_string()],
+                ..own.clone()
+            };
+            let by_older = if limits.contains(&"session") {
+                Verdict::Enter
+            } else {
+                Verdict::Keep(KeepWhy::OtherLimit)
+            };
+            assert_eq!(
+                confirm_verdict(&read(fixture), &older, None, NOW),
+                by_older,
+                "{kind:?} {limits:?} under 2.1.311's word alone"
+            );
+        }
+        let rows = screen(composed::CONFIRM_SESSION_2_1_312);
+        let own = ResetGo {
+            kind: ResetKind::Session,
+            left: 2,
+            limits: five_hour,
+            ..go()
+        };
+        for near in ["5-Hour", "five-hour", "session 5-hour", "5-hour session"] {
+            let edited: Vec<String> = rows
+                .iter()
+                .map(|row| row.replacen("your 5-hour", &format!("your {near}"), 1))
+                .collect();
+            assert_ne!(edited, rows, "{near}");
+            let reading = aterm_phase::read(Some("claude"), &edited, None);
+            let prompt = reading.prompt.as_ref().expect("the confirmation is a box");
+            assert_eq!(
+                confirm_verdict(&reset_confirm(prompt, &edited), &own, None, NOW),
+                Verdict::Keep(KeepWhy::Inexact("body")),
+                "{near}"
+            );
+        }
+    }
+
     /// Enter at the exact confirmation of the row taken, at a long wall,
     /// whatever its deadline, for each kind the step takes; and each
     /// [`KeepWhy`] the verdict can give, by one thing changed from that case
@@ -759,9 +845,9 @@ mod tests {
                 "{word}: {words}"
             );
         }
-        assert_eq!(
-            KeepWhy::plain_words("inexact-title").as_deref(),
-            Some("its confirmation did not read exactly as expected (its title)")
+        assert!(
+            KeepWhy::plain_words("inexact-title").is_some_and(|w| w.ends_with("(its title)")),
+            "the inexact part is named"
         );
         for unknown in ["frobbed", "inexact-", ""] {
             assert_eq!(KeepWhy::plain_words(unknown), None, "CONTROL: {unknown:?}");

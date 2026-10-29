@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! [`ProcWatch`] against the real kernel (Darwin) and its scripted twin (every unix).
+//! [`ProcWatch`] against the real kernel (Darwin), and its bookkeeping against a scripted kernel
+//! (every unix).
 
 use super::*;
 #[cfg(target_vendor = "apple")]
@@ -295,7 +296,7 @@ fn a_new_watch_adopts_running_children_silently() {
     let fifo = mkfifo(dir.path(), "gate");
     let mut shell = Shell::start();
     shell.run(&format!("/bin/cat {} > /dev/null &", fifo.display()));
-    let gate = open_writer(&fifo);
+    let _gate = open_writer(&fifo);
     let children = child_pids(shell.pid()).expect("the table answers");
     let [child] = children[..] else {
         panic!("one job: {children:?}");
@@ -305,7 +306,11 @@ fn a_new_watch_adopts_running_children_silently() {
     let mut seen = Vec::new();
     watch.drain(&mut seen);
     assert!(seen.is_empty(), "no past events: {seen:?}");
-    drop(gate);
+    // The job ends by `SIGKILL`, not by closing the gate: closed just as `cat`'s open returns,
+    // the FIFO's only writer can leave `cat` asleep in its read with no writer left (macOS 27
+    // under load, 2026-10-29), and its exit never comes. The gate stays open to the end.
+    // SAFETY: signalling the job this test's shell started.
+    unsafe { libc::kill(child, libc::SIGKILL) };
     drain_until(&mut watch, &mut seen, "the adopted job's exit", |seen| {
         seen.contains(&ProcEvent::Exit { pid: child })
     });
@@ -392,39 +397,6 @@ fn no_watch_off_darwin() {
 fn a_gone_shell_is_no_watch() {
     assert!(ProcWatch::new(1).is_none());
     assert!(ProcWatch::new(0).is_none());
-}
-
-#[test]
-fn a_scripted_watch_hands_out_what_was_posted() {
-    let (mut watch, script) = ProcWatch::scripted(4100).expect("pipe");
-    let readable = |watch: &ProcWatch| {
-        let mut fds = [libc::pollfd {
-            fd: watch.fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        }];
-        // SAFETY: one pollfd, live for the call; no wait.
-        unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) == 1 }
-    };
-    assert!(!readable(&watch));
-    let events = [
-        ProcEvent::Fork { child: 4200 },
-        ProcEvent::Exec {
-            pid: 4200,
-            pgid: 4200,
-            late: false,
-        },
-    ];
-    script.post(&events);
-    assert!(readable(&watch));
-    let mut seen = Vec::new();
-    watch.drain(&mut seen);
-    assert_eq!(seen, events);
-    assert!(!readable(&watch), "a drain empties the descriptor");
-    watch.follow(4200);
-    watch.unfollow();
-    assert_eq!(script.follows(), [Some(4200), None]);
-    assert_eq!(script.drains(), 1);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

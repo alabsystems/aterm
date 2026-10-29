@@ -224,14 +224,9 @@ impl<'a> FileJournal<'a> {
     }
 }
 
-impl Journal for FileJournal<'_> {
-    fn before_change(
-        &mut self,
-        id: &str,
-        from: &str,
-        to: &str,
-        _revert: Option<&str>,
-    ) -> Result<(), String> {
+impl FileJournal<'_> {
+    /// Append `line` as one JSON line, moving a journal past [`JOURNAL_ROTATE`] aside first.
+    fn append(&mut self, line: &aterm_json::Value) -> Result<(), String> {
         let mut text = match self.sys.read_file(&self.path) {
             Ok(b) => String::from_utf8_lossy(&b).into_owned(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -244,14 +239,33 @@ impl Journal for FileJournal<'_> {
                 .map_err(|e| format!("{}: {e}", old.display()))?;
             text.clear();
         }
-        let line = aterm_json::json!({
-            "time": self.sys.now(), "run": self.run, "id": id, "from": from, "to": to,
-        });
-        text.push_str(&aterm_json::to_string(&line).map_err(|e| e.to_string())?);
+        text.push_str(&aterm_json::to_string(line).map_err(|e| e.to_string())?);
         text.push('\n');
         self.sys
             .write_file(&self.path, text.as_bytes(), 0o600)
             .map_err(|e| format!("{}: {e}", self.path.display()))
+    }
+}
+
+impl Journal for FileJournal<'_> {
+    fn before_change(
+        &mut self,
+        id: &str,
+        from: &str,
+        to: &str,
+        _revert: Option<&str>,
+    ) -> Result<(), String> {
+        let line = aterm_json::json!({
+            "time": self.sys.now(), "run": self.run, "id": id, "from": from, "to": to,
+        });
+        self.append(&line)
+    }
+
+    fn failed(&mut self, id: &str, why: &str) -> Result<(), String> {
+        let line = aterm_json::json!({
+            "time": self.sys.now(), "run": self.run, "id": id, "failed": why,
+        });
+        self.append(&line)
     }
 }
 
@@ -764,6 +778,29 @@ mod tests {
         assert_eq!(lines[1]["from"].as_str(), Some("\"a\""));
         assert_eq!(lines[1]["run"].as_str(), Some("1-5"));
         assert_eq!(fake.mode_of("/A/state/journal.ndjson"), Some(0o600));
+    }
+
+    /// An item that ended failed in an apply run is a line of its own, with its run and why.
+    /// NEGATIVE CONTROL: a journal that keeps changes alone (the trait's default) records none.
+    #[test]
+    fn the_journal_records_an_item_that_failed() {
+        let fake = Fake::root();
+        let mut j = FileJournal::new(&fake, &layout(), "1-5");
+        j.before_change("power.ac.sleep", "10", "0", None).unwrap();
+        j.failed("power.ac.sleep", "pmset exited 1: not permitted")
+            .unwrap();
+        let text = String::from_utf8(fake.written("/A/state/journal.ndjson").unwrap()).unwrap();
+        let lines: Vec<aterm_json::Value> = text
+            .lines()
+            .map(|l| aterm_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert_eq!(lines[1]["id"].as_str(), Some("power.ac.sleep"));
+        assert_eq!(
+            lines[1]["failed"].as_str(),
+            Some("pmset exited 1: not permitted")
+        );
+        assert_eq!(lines[1]["run"].as_str(), Some("1-5"));
     }
 
     fn root_dir() -> Stat {

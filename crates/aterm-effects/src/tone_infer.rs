@@ -95,7 +95,7 @@ impl ToneTracker {
         }
         self.buf.push_back(ch);
         self.keys_since_infer = self.keys_since_infer.saturating_add(1);
-        if !infer_active {
+        if !infer_active || self.infer_pending {
             return;
         }
         let due = self.keys_since_infer >= INFER_KEYS

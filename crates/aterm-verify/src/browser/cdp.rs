@@ -9,7 +9,11 @@ use std::time::{Duration, Instant};
 
 use aterm_json::Value;
 
-/// How long any one answer or event may take before the lane calls it hung.
+use crate::browser::serve;
+
+/// How long any one answer or event may take before the lane calls it hung: from the call, from
+/// its page's last beat where the call waits on one ([`Cdp::call_beating`]), or from the page's
+/// last message where the wait is for a console line ([`Cdp::wait_console`]).
 pub(crate) const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
 /// How [`Cdp::take_console`] begins the line of an exception nobody caught.
@@ -65,17 +69,26 @@ impl Cdp {
         }
     }
 
-    fn recv(&mut self, t0: Instant, what: &str) -> Result<Value, String> {
-        let left = HANG_DETECTOR.saturating_sub(t0.elapsed());
-        match self.from.recv_timeout(left) {
-            Ok(m) => Ok(m),
-            Err(RecvTimeoutError::Timeout) => Err(format!(
-                "no {what} within {} s (a hang detector, not a budget)",
-                HANG_DETECTOR.as_secs()
-            )),
-            Err(RecvTimeoutError::Disconnected) => Err(format!(
-                "the browser closed its DevTools pipe before {what}"
-            )),
+    /// The next message, waited for until [`serve::hang_at`] of `t0` and the last of `beats` that
+    /// came after it.
+    fn recv(
+        &mut self,
+        t0: Instant,
+        what: &str,
+        beats: Option<&serve::Beats>,
+    ) -> Result<Value, String> {
+        loop {
+            let last = beats.and_then(serve::Beats::last);
+            let wait = serve::wait_step(t0, last, Instant::now(), what)?;
+            match self.from.recv_timeout(wait) {
+                Ok(m) => return Ok(m),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(format!(
+                        "the browser closed its DevTools pipe before {what}"
+                    ));
+                }
+            }
         }
     }
 
@@ -85,6 +98,28 @@ impl Cdp {
         session: Option<&str>,
         method: &str,
         params: Value,
+    ) -> Result<Value, String> {
+        self.call_until(session, method, params, None)
+    }
+
+    /// [`Self::call`] for a call whose page beats while it works: hung only once a minute passes
+    /// with no answer and no beat ([`serve::hang_at`]).
+    pub(crate) fn call_beating(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+        beats: &serve::Beats,
+    ) -> Result<Value, String> {
+        self.call_until(session, method, params, Some(beats))
+    }
+
+    fn call_until(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+        beats: Option<&serve::Beats>,
     ) -> Result<Value, String> {
         self.next += 1;
         let id = self.next;
@@ -101,7 +136,7 @@ impl Cdp {
             .map_err(|e| format!("could not send {method}: {e}"))?;
         let t0 = Instant::now();
         loop {
-            let m = self.recv(t0, &format!("answer to {method}"))?;
+            let m = self.recv(t0, &format!("answer to {method}"), beats)?;
             if m.get("id").and_then(Value::as_u64) != Some(id) {
                 self.events.push(m);
                 continue;
@@ -130,7 +165,7 @@ impl Cdp {
         }
         let t0 = Instant::now();
         loop {
-            let m = self.recv(t0, &format!("{method} event"))?;
+            let m = self.recv(t0, &format!("{method} event"), None)?;
             if is(&m) {
                 return Ok(m.get("params").cloned().unwrap_or(Value::Null));
             }
@@ -161,7 +196,7 @@ impl Cdp {
         }
         let mut t0 = Instant::now();
         loop {
-            let m = self.recv(t0, &format!("console line {marker:?}"))?;
+            let m = self.recv(t0, &format!("console line {marker:?}"), None)?;
             if is(&m) {
                 return Ok(());
             }

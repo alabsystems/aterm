@@ -70,7 +70,7 @@ fn window_presented(
         gpu.last_frame_on_d3d11(),
         "the window present drew on D3D11"
     );
-    gpu.presented_snapshot_after_present(win, 1)
+    gpu.presented_snapshot_after_present(win, 1_000)
         .expect("the snapshot stamps");
     gpu.presented_snapshot_finish(win)
         .expect("the snapshot completes");

@@ -351,27 +351,42 @@ impl EventMeta {
 
 const BLOCK_LEAD_MAX_S: f32 = 0.050;
 
+const ASCII_GLYPH_RANK: [u8; 128] = {
+    let mut table = [45u8; 128];
+    let mut b = 0usize;
+    while b < 128 {
+        let c = b as u8 as char;
+        table[b] = if c.is_ascii_alphabetic() {
+            1 + (c.to_ascii_lowercase() as u8 - b'a')
+        } else if c.is_ascii_digit() {
+            27 + (c as u8 - b'0')
+        } else {
+            match c {
+                '.' | ',' => 37,
+                ';' | ':' => 38,
+                '\'' | '"' => 39,
+                '!' | '?' => 40,
+                '-' | '_' | '+' | '=' => 41,
+                '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' => 42,
+                '/' | '\\' | '|' => 43,
+                c if c.is_ascii_punctuation() => 44,
+                _ => 45,
+            }
+        };
+        b += 1;
+    }
+    table
+};
+
 /// [`EventMeta::rank`] for a typed character: the one producer of the melody's alphabet order.
 #[must_use]
 #[inline]
 pub const fn typed_glyph_rank(typed: Option<char>) -> u8 {
     let Some(c) = typed else { return 0 };
-    if c.is_ascii_alphabetic() {
-        return 1 + (c.to_ascii_lowercase() as u8 - b'a');
-    }
-    if c.is_ascii_digit() {
-        return 27 + (c as u8 - b'0');
-    }
-    match c {
-        '.' | ',' => 37,
-        ';' | ':' => 38,
-        '\'' | '"' => 39,
-        '!' | '?' => 40,
-        '-' | '_' | '+' | '=' => 41,
-        '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' => 42,
-        '/' | '\\' | '|' => 43,
-        c if c.is_ascii_punctuation() => 44,
-        _ => 45,
+    if c.is_ascii() {
+        ASCII_GLYPH_RANK[c as usize]
+    } else {
+        45
     }
 }
 
@@ -413,29 +428,45 @@ pub mod glyph_class {
     pub const SECRET: u8 = 16;
 }
 
+const ASCII_GLYPH_CLASS: [u8; 128] = {
+    use glyph_class::*;
+    let mut table = [LETTER; 128];
+    let mut b = 0usize;
+    while b < 128 {
+        let c = b as u8 as char;
+        table[b] = match c {
+            '?' => QMARK,
+            '!' => BANG,
+            c if c.is_ascii_digit() => DIGIT,
+            '.' => STOP,
+            ',' => COMMA,
+            ';' => SEMI,
+            ':' => COLON,
+            '(' | '[' | '{' => OPEN,
+            ')' | ']' | '}' => CLOSE,
+            '\'' | '"' | '`' => QUOTE,
+            '-' => DASH,
+            '_' | '~' | '\\' | '|' => LINE,
+            '/' => RISE,
+            '+' | '=' | '*' | '%' | '^' | '<' | '>' => MATH,
+            c if c.is_ascii_punctuation() => SIGIL,
+            _ => LETTER,
+        };
+        b += 1;
+    }
+    table
+};
+
 /// [`EventMeta::glyph_class`] for a typed character: the one producer of the [`glyph_class`] table, shared by the host seam, the bench and the tests.
 #[must_use]
 #[inline]
 pub const fn typed_glyph_class(typed: Option<char>) -> u8 {
     use glyph_class::*;
-    match typed {
-        None => LETTER,
-        Some('?') => QMARK,
-        Some('!') => BANG,
-        Some(c) if c.is_ascii_digit() => DIGIT,
-        Some('.') => STOP,
-        Some(',') => COMMA,
-        Some(';') => SEMI,
-        Some(':') => COLON,
-        Some('(' | '[' | '{') => OPEN,
-        Some(')' | ']' | '}') => CLOSE,
-        Some('\'' | '"' | '`') => QUOTE,
-        Some('-') => DASH,
-        Some('_' | '~' | '\\' | '|') => LINE,
-        Some('/') => RISE,
-        Some('+' | '=' | '*' | '%' | '^' | '<' | '>') => MATH,
-        Some(c) if c.is_ascii_punctuation() => SIGIL,
-        Some(_) => LETTER,
+    let Some(c) = typed else { return LETTER };
+    if c.is_ascii() {
+        ASCII_GLYPH_CLASS[c as usize]
+    } else {
+        LETTER
     }
 }
 
@@ -815,6 +846,14 @@ const _: () = assert!(
     CELEBRATION_OUTRO_S < CELEBRATION_BAR_SECONDS,
     "the outro is shorter than a bar: it ends the song, it is not one more bar"
 );
+const _: () = assert!(
+    (7.0 + CELEBRATION_SWING) * CELEBRATION_EIGHTH < CELEBRATION_BAR_SECONDS,
+    "the last swung eighth starts inside its bar"
+);
+const _: () = assert!(
+    (u16::MAX as usize + 1).is_multiple_of(CELEBRATION_PHRASE_BARS),
+    "the u16 bar counter wraps on a phrase boundary"
+);
 
 const CELEBRATION_OUTRO_DECAY_S: f32 = 0.34;
 
@@ -871,38 +910,32 @@ const SONG_CODED_STEPS: u32 = 16;
 const SONG_STEPS: u32 = SONG_CODED_STEPS + 1;
 
 #[inline]
-const fn song_coded_degree(sig: u32, index: u32) -> i32 {
-    debug_assert!(index < SONG_CODED_STEPS);
+const fn song_degrees(sig: u32) -> [i32; SONG_STEPS as usize] {
+    let mut degrees = [0i32; SONG_STEPS as usize];
     let mut code = sig as u64;
-    let mut degree = (code % 5) as i32;
+    let first = (code % 5) as i32;
+    let mut degree = first;
+    degrees[0] = degree;
     code /= 5;
-    let mut i = 0;
-    while i < index {
+    let mut i = 1usize;
+    while i < SONG_CODED_STEPS as usize {
         let choice = (code & 3) as usize;
         code >>= 2;
         degree = (degree + SONG_INTERVALS[choice]).rem_euclid(5);
+        degrees[i] = degree;
         i += 1;
     }
-    degree
-}
-
-#[inline]
-const fn song_degree(sig: u32, ordinal: u32) -> i32 {
-    let index = ordinal % SONG_STEPS;
-    if index < SONG_CODED_STEPS {
-        return song_coded_degree(sig, index);
-    }
-    let first = song_coded_degree(sig, 0);
-    let last = song_coded_degree(sig, SONG_CODED_STEPS - 1);
-    let mut i = 0;
-    while i < SONG_INTERVALS.len() {
-        let bridge = (last + SONG_INTERVALS[i]).rem_euclid(5);
+    let last = degree;
+    let mut j = 0;
+    while j < SONG_INTERVALS.len() {
+        let bridge = (last + SONG_INTERVALS[j]).rem_euclid(5);
         if bridge != first {
-            return bridge;
+            degrees[SONG_CODED_STEPS as usize] = bridge;
+            break;
         }
-        i += 1;
+        j += 1;
     }
-    0
+    degrees
 }
 
 #[inline]
@@ -958,12 +991,13 @@ const fn celebration_bar_degrees(sig: u32, idx: usize) -> [i32; 8] {
     let Some(base) = verse_ordinal_base(idx) else {
         return row;
     };
+    let degrees = song_degrees(sig);
     let shelf = verse_register(idx);
     let mut ordinal = base;
     let mut i = 0;
     while i < row.len() {
         if row[i] != REST {
-            row[i] = song_degree(sig, ordinal) + shelf;
+            row[i] = degrees[(ordinal % SONG_STEPS) as usize] + shelf;
             ordinal += 1;
         }
         i += 1;
@@ -1401,6 +1435,7 @@ const fn kill_swoosh_band(voice: SoundVoice, style: GlowStyle) -> (f32, f32) {
 }
 
 impl TrailSynth {
+    #[inline]
     #[must_use]
     pub const fn new(sample_rate: f32, seed: u32) -> Self {
         Self {
@@ -2053,6 +2088,46 @@ impl TrailSynth {
             SoundKind::Stardust { .. } => POOF_KIND_GAIN,
         };
         let g = g * kg * shift_gain(&ev, kind);
+        match kind {
+            SoundKind::Land => {
+                self.design_land(&ev, g);
+                return;
+            }
+            SoundKind::Backspace => {
+                self.design_erase_poof(&ev, g);
+                return;
+            }
+            SoundKind::KillWord => {
+                self.design_word_poof(&ev, g);
+                return;
+            }
+            SoundKind::Space => {
+                self.design_space(&ev, g, pause);
+                return;
+            }
+            SoundKind::Kill => {
+                let (hi, lo) = kill_swoosh_band(ev.voice, ev.style);
+                let v = Voice {
+                    dur: 0.28,
+                    attack: 0.02,
+                    decay: 0.12,
+                    n_lvl: 0.5,
+                    n_f0: hi,
+                    n_f1: lo,
+                    n_glide: 0.10,
+                    n_q: 1.2,
+                    lp_cut: 2400.0,
+                    ..Voice::DEFAULT
+                };
+                self.spawn(v, g * 2.6, ev.pan);
+                return;
+            }
+            SoundKind::Poof => {
+                self.design_poof(&ev, g);
+                return;
+            }
+            _ => {}
+        }
         let col_off = (ev.pan).round() as i32;
         let shape = gesture_shape(kind);
         let ghosting = matches!(kind, SoundKind::Typed) && !self.song_accent;
@@ -2067,51 +2142,8 @@ impl TrailSynth {
             self.design_cursor(&ev, shape, deg, g);
             return;
         }
-
-        if matches!(kind, SoundKind::Land) {
-            self.design_land(&ev, g);
-            return;
-        }
-
-        if matches!(kind, SoundKind::Backspace) {
-            self.design_erase_poof(&ev, g);
-            return;
-        }
-
-        if matches!(kind, SoundKind::KillWord) {
-            self.design_word_poof(&ev, g);
-            return;
-        }
-
-        if matches!(kind, SoundKind::Space) {
-            self.design_space(&ev, g, pause);
-            return;
-        }
         if matches!(kind, SoundKind::Shift) {
             self.design_shift(&ev, deg, g);
-            return;
-        }
-
-        if matches!(kind, SoundKind::Kill) {
-            let (hi, lo) = kill_swoosh_band(ev.voice, ev.style);
-            let v = Voice {
-                dur: 0.28,
-                attack: 0.02,
-                decay: 0.12,
-                n_lvl: 0.5,
-                n_f0: hi,
-                n_f1: lo,
-                n_glide: 0.10,
-                n_q: 1.2,
-                lp_cut: 2400.0,
-                ..Voice::DEFAULT
-            };
-            self.spawn(v, g * 2.6, ev.pan);
-            return;
-        }
-
-        if matches!(kind, SoundKind::Poof) {
-            self.design_poof(&ev, g);
             return;
         }
 
@@ -2266,11 +2298,12 @@ impl TrailSynth {
                 self.since_space_step = 0.0;
                 let deg = self.space_run_deg;
                 let root = self.melody_hz(anchor, deg);
+                let inv_root = 1.0 / root;
                 let mut f = self.space_run_root_hz;
                 let mut n = self.space_run_len as i32;
                 while n >= 1 {
-                    let step =
-                        self.space_run_root_hz * (self.melody_hz(anchor, deg + n) / root).max(1.0);
+                    let step = self.space_run_root_hz
+                        * (self.melody_hz(anchor, deg + n) * inv_root).max(1.0);
                     if step < SPACE_STEP_HI_HZ {
                         f = step;
                         break;
@@ -2835,6 +2868,7 @@ impl TrailSynth {
     }
 
     /// Render interleaved stereo into `out` (length must be even).
+    #[inline]
     pub const fn render(&mut self, out: &mut [f32]) {
         debug_assert!(out.len().is_multiple_of(CHANNELS));
         let frames = out.len() / CHANNELS;
@@ -3134,8 +3168,9 @@ impl TrailSynth {
             } else {
                 (yl, yr)
             };
-            out[f * 2] = soft_clip(yl);
-            out[f * 2 + 1] = soft_clip(yr);
+            let base = f * 2;
+            out[base] = soft_clip(yl);
+            out[base + 1] = soft_clip(yr);
             f += 1;
         }
         if bed_target == 0.0 && self.bed.out_lvl < 1e-5 {
@@ -3370,6 +3405,7 @@ const fn palette_for(voice: SoundVoice, style: GlowStyle) -> PaletteKind {
 struct LumenPalette;
 
 impl LumenPalette {
+    #[inline]
     const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32, deg: i32) {
         let f = s.melody_hz(330.0, deg);
         let (f0, f1v) = (f * 0.97, f);
@@ -3439,6 +3475,7 @@ impl LumenPalette {
         }
     }
 
+    #[inline]
     const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let u1 = s.bed.lfo_u1();
         let b = &mut s.bed;
@@ -3453,6 +3490,7 @@ impl LumenPalette {
 struct PhaserPalette;
 
 impl PhaserPalette {
+    #[inline]
     const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32, col_off: i32) {
         let hue_deg = (ev.hue * 5.0) as i32;
         let d = hue_deg + col_off + gesture_shape(kind).offset + shift_lift(ev, kind);
@@ -3533,6 +3571,7 @@ impl PhaserPalette {
         }
     }
 
+    #[inline]
     const fn bed_grain(s: &mut TrailSynth, level: f32, gain: f32) {
         let grain_deg = (s.rnd() * 5.0) as i32;
         let f = s.melody_hz(392.0, grain_deg);
@@ -3559,6 +3598,7 @@ impl PhaserPalette {
         s.bed.timer = s.rnd_in(0.45, 1.2) / level.max(0.05);
     }
 
+    #[inline]
     const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let u1 = s.bed.lfo_u1();
         let b = &mut s.bed;
@@ -3577,6 +3617,7 @@ const KEY_BELL_BEND_TAU: f32 = 0.004;
 struct SparklePalette;
 
 impl SparklePalette {
+    #[inline]
     const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32, deg: i32) {
         let n = if matches!(kind, SoundKind::Jump) {
             3
@@ -3627,6 +3668,7 @@ impl SparklePalette {
         }
     }
 
+    #[inline]
     const fn bed_grain(s: &mut TrailSynth, level: f32, gain: f32) {
         let grain_deg = (s.rnd() * 8.0) as i32;
         let f = s.melody_hz(523.25, grain_deg);
@@ -3657,6 +3699,7 @@ impl SparklePalette {
         s.bed.timer = s.rnd_in(0.15, 0.5) / level.max(0.05);
     }
 
+    #[inline]
     const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let u2 = s.bed.lfo_u2();
         let b = &mut s.bed;
@@ -3671,6 +3714,7 @@ impl SparklePalette {
 struct FirePalette;
 
 impl FirePalette {
+    #[inline]
     const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32) {
         // Crackle: every key is an impulsive few-ms high-Q snap over a woody
         // ember knock; impulsiveness separates fire from water. Jump is the
@@ -3766,6 +3810,7 @@ impl FirePalette {
         }
     }
 
+    #[inline]
     const fn bed_grain(s: &mut TrailSynth, level: f32, gain: f32) {
         let low = s.rnd() < 0.12;
         let (centre, q, decay, lvl) = if low {
@@ -3795,6 +3840,7 @@ impl FirePalette {
         s.bed.timer = s.rnd_in(0.03, 0.18) / level.max(0.05);
     }
 
+    #[inline]
     const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let white = s.rnd() * 2.0 - 1.0;
         let b = &mut s.bed;
@@ -3810,6 +3856,7 @@ impl FirePalette {
 struct LaserPalette;
 
 impl LaserPalette {
+    #[inline]
     const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32, deg: i32) {
         let lift = shift_lift(ev, kind);
         let base_deg = deg - lift;
@@ -3916,6 +3963,7 @@ impl LaserPalette {
         }
     }
 
+    #[inline]
     const fn bed_grain(s: &mut TrailSynth, level: f32, gain: f32) {
         // The storm keeps grumbling: mostly distant rolls, now and then the
         // faint tick of a far-off strike.
@@ -3954,6 +4002,7 @@ impl LaserPalette {
         s.bed.timer = s.rnd_in(0.5, 1.4) / level.max(0.05);
     }
 
+    #[inline]
     const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let white = s.rnd() * 2.0 - 1.0;
         let b = &mut s.bed;
@@ -3969,6 +4018,7 @@ impl LaserPalette {
 struct BeamPalette;
 
 impl BeamPalette {
+    #[inline]
     const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32, deg: i32) {
         let lift = shift_lift(ev, kind);
         let f = s.melody_hz(330.0, ((deg - lift) / 2) * 2 + lift);
@@ -4049,6 +4099,7 @@ impl BeamPalette {
         }
     }
 
+    #[inline]
     const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let white = s.rnd() * 2.0 - 1.0;
         let u1 = s.bed.lfo_u1();
@@ -4066,6 +4117,7 @@ impl BeamPalette {
 struct WaterPalette;
 
 impl WaterPalette {
+    #[inline]
     const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32, deg: i32) {
         let f = s.melody_hz(430.0, deg);
         let (a, b) = (f * 0.85, f * 1.25);
@@ -4172,6 +4224,7 @@ impl WaterPalette {
         }
     }
 
+    #[inline]
     const fn bed_grain(s: &mut TrailSynth, level: f32, gain: f32) {
         let grain_deg = (s.rnd() * 6.0) as i32;
         let f = s.melody_hz(430.0, grain_deg);
@@ -4198,6 +4251,7 @@ impl WaterPalette {
         s.bed.timer = s.rnd_in(0.25, 0.9) / level.max(0.05);
     }
 
+    #[inline]
     const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let white = s.rnd() * 2.0 - 1.0;
         let u1 = s.bed.lfo_u1();
@@ -4215,6 +4269,7 @@ impl WaterPalette {
 struct CometPalette;
 
 impl CometPalette {
+    #[inline]
     const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32, deg: i32) {
         let f = s.melody_hz(220.0, deg);
         let (f0, f1v) = (f * 1.04, f * 0.97);
@@ -4341,6 +4396,7 @@ impl CometPalette {
         }
     }
 
+    #[inline]
     const fn bed_grain(s: &mut TrailSynth, level: f32, gain: f32) {
         let grain_deg = (s.rnd() * 5.0) as i32;
         let f = s.melody_hz(660.0, grain_deg);
@@ -4367,6 +4423,7 @@ impl CometPalette {
         s.bed.timer = s.rnd_in(0.6, 1.6) / level.max(0.05);
     }
 
+    #[inline]
     const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let u1 = s.bed.lfo_u1();
         let b = &mut s.bed;
@@ -4381,6 +4438,7 @@ impl CometPalette {
 struct MechPalette;
 
 impl MechPalette {
+    #[inline]
     const fn key(s: &mut TrailSynth, pan: f32, g: f32, body: f32, bright: f32, click_only: bool) {
         let click = Voice {
             dur: 0.035,
@@ -4424,6 +4482,7 @@ impl MechPalette {
         s.spawn(thock, g * 0.5, pan * 0.7);
     }
 
+    #[inline]
     const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32) {
         match kind {
             SoundKind::Typed => {
@@ -4487,6 +4546,7 @@ impl MechPalette {
 struct TypewriterPalette;
 
 impl TypewriterPalette {
+    #[inline]
     const fn strike(s: &mut TrailSynth, pan: f32, g: f32, bright: f32, ring: f32, body: f32) {
         let clack = Voice {
             dur: 0.04,
@@ -4554,6 +4614,7 @@ impl TypewriterPalette {
         }
     }
 
+    #[inline]
     const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32) {
         match kind {
             SoundKind::Typed => {
@@ -4647,6 +4708,7 @@ struct MarimbaPalette;
 impl MarimbaPalette {
     const BASE_HZ: f32 = 261.63;
 
+    #[inline]
     const fn bar(
         s: &mut TrailSynth,
         deg: i32,
@@ -4707,6 +4769,7 @@ impl MarimbaPalette {
         }
     }
 
+    #[inline]
     const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32, deg: i32) {
         match kind {
             SoundKind::Typed => {
@@ -4724,6 +4787,7 @@ impl MarimbaPalette {
         }
     }
 
+    #[inline]
     const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let u1 = s.bed.lfo_u1();
         let b = &mut s.bed;
@@ -4741,6 +4805,7 @@ struct FeltPalette;
 impl FeltPalette {
     const BASE_HZ: f32 = 196.0;
 
+    #[inline]
     const fn note(
         s: &mut TrailSynth,
         deg: i32,
@@ -4793,6 +4858,7 @@ impl FeltPalette {
         s.spawn(v, g * 0.5, pan);
     }
 
+    #[inline]
     const fn design(s: &mut TrailSynth, ev: &SoundEvent, kind: SoundKind, g: f32, deg: i32) {
         match kind {
             SoundKind::Typed => {
@@ -4810,6 +4876,7 @@ impl FeltPalette {
         }
     }
 
+    #[inline]
     const fn bed_sample(s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let b = &mut s.bed;
         b.ph1 = (b.ph1 + 392.0 * dt).fract();
@@ -5071,14 +5138,10 @@ mod tests {
             .chars()
             .map(|c| typed_glyph_rank(Some(c)))
             .collect();
-        assert!(
-            (2..=8).contains(&buckets.len()),
-            "ASCII punctuation collapsed into {} ranks; the table says eight",
-            buckets.len()
-        );
-        assert!(
-            buckets.iter().all(|r| (37..=44).contains(r)),
-            "a punctuation rank landed outside 37..=44: {buckets:?}"
+        assert_eq!(
+            buckets,
+            (37..=44).collect::<std::collections::BTreeSet<u8>>(),
+            "ASCII punctuation must populate all eight ranks 37..=44"
         );
         for c in ['漢', '£', 'é', '٣', ' ', '\t'] {
             assert_eq!(typed_glyph_rank(Some(c)), 45, "{c:?}");
@@ -6179,15 +6242,6 @@ mod tests {
                     );
                 }
             }
-        }
-    }
-
-    #[test]
-    fn celebration_form_is_wrap_safe() {
-        assert!(CELEBRATION_PHRASE_BARS.is_power_of_two());
-        assert_eq!((usize::from(u16::MAX) + 1) % CELEBRATION_PHRASE_BARS, 0);
-        const {
-            assert!((7.0 + CELEBRATION_SWING) * CELEBRATION_EIGHTH < CELEBRATION_BAR_SECONDS);
         }
     }
 

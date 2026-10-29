@@ -950,8 +950,10 @@ fn the_content_tier_never_reaches_the_journal() {
         )
         .expect("a title mark");
     });
-    let detail =
-        crate::session_status::command_detail("printf %s x SECRET-ARG-42").unwrap_or_default();
+    let ran = crate::command_ran::Ran::default();
+    let heard = crate::command_ran::Heard::of(&ran, Vec::new(), None, None);
+    let detail = crate::session_status::command_detail("printf %s x SECRET-ARG-42", &heard)
+        .unwrap_or_default();
     let f = Fields::new()
         .tok(aterm_slog::Key::Detail, &detail)
         .expect("a detail");
@@ -1438,13 +1440,6 @@ fn the_reader_is_bounded_and_skips_what_is_not_a_line() {
     rig.fs.put("p5-ff.1.slog", &big, false, false);
     let v = read_view(&rig.fs, "s-read", Budgets::READER);
     assert!(says(&v, "unread"), "an oversized segment is unread");
-    let _ = Meta {
-        size: 0,
-        mtime_ms: 0,
-        dev: 0,
-        ino: 0,
-        private: true,
-    };
 }
 
 /// The real directory's file rules: a segment is created exclusive (an
@@ -2111,11 +2106,11 @@ fn a_burst_between_passes_writes_no_evicted_gap() {
     assert_eq!(gaps, 0, "nothing the writer could take was evicted");
 }
 
-/// C7 (ROBUST-2): a write that fails gives its take back ([`aterm_slog::Journaled::unwritten`]),
-/// so under pressure in the backoff the ring evicts what is on disk (open detail) before the
-/// unwritten closed detail the failed take held, and the retry writes all of it with no gap.
+/// C7 (ROBUST-2), as G5's review left it: a write that fails keeps its lines and its take's hold
+/// ([`Unlanded`]), so under pressure in the backoff the ring spends what the writer holds, on disk
+/// or held, before what it has not reached, and the retry writes all of it with no gap.
 #[test]
-fn a_failed_write_marks_nothing_journaled_and_the_retry_writes_no_gap() {
+fn a_failed_write_holds_its_take_and_the_retry_writes_no_gap() {
     use aterm_slog::StepOut;
     let rig = Rig::new();
     let tl = rig.sessions.add("s-unwrit");
@@ -2171,6 +2166,7 @@ fn a_failed_write_marks_nothing_journaled_and_the_retry_writes_no_gap() {
         )
         .expect("closes");
     });
+    let took = with_log(&tl, |log| log.last_seq());
     assert_eq!(w.pass(), 0, "the disk is full");
     assert!(w.wait().is_some(), "backing off");
     let noted = with_log(&tl, |log| log.journaled());
@@ -2198,8 +2194,8 @@ fn a_failed_write_marks_nothing_journaled_and_the_retry_writes_no_gap() {
     );
     assert_eq!(
         noted,
-        Some(on_disk),
-        "a write that failed marked none of its take journaled"
+        Some(took),
+        "a write that failed keeps its take spent first: the writer holds its lines"
     );
     let v = rig.view("s-unwrit");
     assert!(
@@ -2393,10 +2389,11 @@ fn a_burst_during_a_write_spends_what_the_write_took() {
     assert!(gaps.is_empty(), "a burst during the write lost {gaps:?}");
 }
 
-/// C7's review: a write that fails while a producer holds its timeline's lock gives its take back
-/// at once, without the lock, so the backoff's pressure never spends the unwritten records first.
+/// C7's review, as G5's review left it: a write that fails while a producer holds its timeline's
+/// lock holds its lines and its take without the lock, so the backoff's pressure spends what the
+/// writer holds first and the retry loses nothing.
 #[test]
-fn a_write_that_fails_on_a_busy_timeline_gives_its_take_back_at_once() {
+fn a_write_that_fails_on_a_busy_timeline_holds_its_take_without_the_lock() {
     let rig = Rig::new();
     let tl = small_ring(&rig, "s-busyfail");
     turn_of_steps(&tl);
@@ -2405,16 +2402,24 @@ fn a_write_that_fails_on_a_busy_timeline_gives_its_take_back_at_once() {
     let on_disk = with_log(&tl, |log| log.last_seq());
     assert_eq!(with_log(&tl, |log| log.journaled()), Some(on_disk));
     closed_run(&tl);
+    let took = with_log(&tl, |log| log.last_seq());
     let (mut w, wrote) = pass_held_at_its_write(&rig, w, || {
         rig.fs.fault(Some(Fault::Always(libc::ENOSPC)));
         tl.lock().unwrap_or_else(|p| p.into_inner())
     });
     assert_eq!(wrote, 0, "the disk is full");
     assert!(w.wait().is_some(), "backing off");
+    assert!(
+        w.tracks
+            .get("s-busyfail")
+            .and_then(|t| t.unlanded.as_ref())
+            .is_some_and(|u| u.next == took),
+        "the failed take's lines are held"
+    );
     assert_eq!(
         with_log(&tl, |log| log.journaled()),
-        Some(on_disk),
-        "the failed take was given back while its timeline was busy"
+        Some(took),
+        "the failed take stays spent first while its timeline was busy"
     );
     marks_past_the_ring(&tl);
     rig.fs.fault(None);
@@ -2422,6 +2427,414 @@ fn a_write_that_fails_on_a_busy_timeline_gives_its_take_back_at_once() {
     assert!(w.pass() > 0, "the retry writes");
     let gaps = gaps_of(&rig);
     assert!(gaps.is_empty(), "the backoff lost {gaps:?}");
+}
+
+/// The seqs a session's journal view holds.
+fn view_seqs(rig: &Rig, sid: &str) -> Vec<u64> {
+    all(&rig.view(sid).log).iter().map(|r| r.seq).collect()
+}
+
+/// Passes until the writer owes nothing (a retry tick between them), at most `n`.
+fn drain(rig: &Rig, w: &mut Writer<Sessions>, n: usize) {
+    for _ in 0..n {
+        if !w.owed {
+            return;
+        }
+        rig.clock.advance(RETRY_TICK);
+        w.pass();
+    }
+}
+
+/// G5 (LOG2-1): a burst during a write that then fails evicts what the take had marked spent
+/// first, and loses none of it: the failed write's lines stay with the writer ([`Unlanded`]),
+/// with its take's hold, and it writes them again first, a snap at their head before them in the
+/// new segment. A retry that fails too holds all it took.
+#[test]
+fn a_burst_during_a_write_that_fails_loses_nothing_the_write_took() {
+    let rig = Rig::new();
+    let tl = small_ring(&rig, "s-inflightfail");
+    turn_of_steps(&tl);
+    let mut w = rig.writer();
+    assert!(w.pass() > 0, "the open path and the steps land");
+    let on_disk = with_log(&tl, |log| log.last_seq());
+    closed_run(&tl);
+    let took = with_log(&tl, |log| log.last_seq());
+    let (mut w, wrote) = pass_held_at_its_write(&rig, w, || {
+        rig.fs.fault(Some(Fault::Always(libc::ENOSPC)));
+        marks_past_the_ring(&tl);
+    });
+    assert_eq!(wrote, 0, "the disk is full");
+    assert!(w.wait().is_some(), "backing off");
+    let live: Vec<u64> = with_log(&tl, |log| all(log).iter().map(|r| r.seq).collect());
+    assert!(
+        (on_disk + 1..=took).any(|s| !live.contains(&s)),
+        "the burst evicted records the failed write took (positive control): {live:?}"
+    );
+    assert_eq!(
+        with_log(&tl, |log| log.journaled()),
+        Some(took),
+        "the failed take stays spent first: the writer holds it"
+    );
+    rig.clock.advance(BACKOFF_FIRST);
+    assert_eq!(w.pass(), 0, "the retry is refused too");
+    assert_eq!(
+        with_log(&tl, |log| log.journaled()),
+        Some(with_log(&tl, |log| log.last_seq())),
+        "a retry that fails holds all it took"
+    );
+    rig.fs.fault(None);
+    rig.clock.advance(BACKOFF_FIRST * 2);
+    assert!(w.pass() > 0, "the retry writes");
+    drain(&rig, &mut w, 8);
+    let head = with_log(&tl, |log| log.last_seq());
+    assert_eq!(
+        with_log(&tl, |log| log.journaled()),
+        Some(head),
+        "what landed is spent first"
+    );
+    let gaps = gaps_of(&rig);
+    assert!(
+        gaps.is_empty(),
+        "a burst during a failed write lost {gaps:?}"
+    );
+    assert_eq!(
+        view_seqs(&rig, "s-inflightfail"),
+        (1..=head).collect::<Vec<_>>(),
+        "every record reached the journal"
+    );
+}
+
+/// G5: what failed writes hold for a session never passes one take's records however long the
+/// disk stays full (the take after held lines reads only up to that bound), and what waited in
+/// the ring is written once the disk takes writes.
+#[test]
+fn a_session_holds_at_most_one_takes_records_through_a_long_full_disk() {
+    let rig = Rig::new();
+    let tl = rig.sessions.add("s-bound");
+    let limits = WriterLimits {
+        batch: 8,
+        ..WriterLimits::default()
+    };
+    let mut w = rig.writer_as("p1-a1", limits);
+    assert!(w.pass() > 0);
+    rig.fs.fault(Some(Fault::Always(libc::ENOSPC)));
+    let held = |w: &Writer<Sessions>| {
+        w.tracks
+            .get("s-bound")
+            .and_then(|t| t.unlanded.as_ref())
+            .map_or(0, |u| u.taken)
+    };
+    let mut ms = 1;
+    for _ in 0..6 {
+        for _ in 0..5 {
+            mark(&tl, ms);
+            ms += 1;
+        }
+        rig.clock.advance(BACKOFF_MAX);
+        assert_eq!(w.pass(), 0, "the disk is full");
+        assert!(
+            held(&w) <= 8,
+            "{} records held, past one take's 8",
+            held(&w)
+        );
+    }
+    assert_eq!(held(&w), 8, "a take's records held (positive control)");
+    rig.fs.fault(None);
+    rig.clock.advance(BACKOFF_MAX);
+    assert!(w.pass() > 0, "the held lines land");
+    drain(&rig, &mut w, 16);
+    let head = with_log(&tl, |log| log.last_seq());
+    assert_eq!(
+        view_seqs(&rig, "s-bound"),
+        (1..=head).collect::<Vec<_>>(),
+        "nothing lost"
+    );
+}
+
+/// G5: a write that failed in an update's drain holds its session's lines without the `#handed`
+/// the drain gave them once the update stands down, so a crash after the rollback still reads as
+/// one.
+#[test]
+fn a_held_drain_line_drops_its_handed_at_a_stand_down() {
+    let rig = Rig::new();
+    let tl = rig.sessions.add("s-heldhand");
+    let _ = cmd(&tl, 1);
+    let mut w = rig.writer();
+    assert!(w.pass() > 0);
+    tl.lock().expect("tl").slog_mut().carry_source();
+    w.begin_handing();
+    rig.fs.fault(Some(Fault::Always(libc::ENOSPC)));
+    assert_eq!(w.pass(), 0, "the drain's write is refused");
+    assert!(
+        w.tracks
+            .get("s-heldhand")
+            .and_then(|t| t.unlanded.as_ref())
+            .is_some_and(|u| u.handed_at.is_some()),
+        "the held lines carry the drain's #handed (positive control)"
+    );
+    tl.lock().expect("tl").slog_mut().lift_read_fence();
+    w.stood_down();
+    rig.fs.fault(None);
+    rig.clock.advance(BACKOFF_FIRST);
+    assert!(w.pass() > 0, "the session restates itself");
+    assert!(
+        !rig.frames()
+            .iter()
+            .any(|f| matches!(f, Frame::Handed { .. })),
+        "no #handed after the stand-down"
+    );
+    drop(w);
+    assert!(
+        rig.view("s-heldhand").crashed,
+        "a crash after the rollback reads as one"
+    );
+}
+
+/// G5's review: a stand-down takes only the `#handed` line out of what a failed write held. A pass
+/// between the fence's lift and the writer's word of the stand-down reads past the fence, so its
+/// records follow the held `#handed`; a retry refused too holds them after it, and every one of
+/// them reaches the journal.
+#[test]
+fn a_stand_down_keeps_the_held_records_after_the_drains_handed() {
+    let rig = Rig::new();
+    let tl = rig.sessions.add("s-pasthand");
+    let _ = cmd(&tl, 1);
+    let mut w = rig.writer();
+    assert!(w.pass() > 0);
+    tl.lock().expect("tl").slog_mut().carry_source();
+    w.begin_handing();
+    rig.fs.fault(Some(Fault::Always(libc::ENOSPC)));
+    assert_eq!(w.pass(), 0, "the drain's write is refused");
+    tl.lock().expect("tl").slog_mut().lift_read_fence();
+    for ms in 10..15 {
+        mark(&tl, ms);
+    }
+    rig.clock.advance(BACKOFF_FIRST);
+    assert_eq!(w.pass(), 0, "the pass past the lifted fence is refused too");
+    assert!(
+        w.tracks
+            .get("s-pasthand")
+            .and_then(|t| t.unlanded.as_ref())
+            .is_some_and(|u| {
+                u.taken == 5
+                    && u.handed_at
+                        .and_then(|at| u.lines.get(at..))
+                        .is_some_and(|rest| {
+                            rest.iter()
+                                .position(|&b| b == b'\n')
+                                .is_some_and(|p| p + 1 < rest.len())
+                        })
+            }),
+        "records follow the held #handed (positive control)"
+    );
+    w.stood_down();
+    rig.fs.fault(None);
+    rig.clock.advance(BACKOFF_FIRST * 2);
+    assert!(w.pass() > 0, "the held lines land");
+    drain(&rig, &mut w, 8);
+    let head = with_log(&tl, |log| log.last_seq());
+    assert_eq!(
+        view_seqs(&rig, "s-pasthand"),
+        (1..=head).collect::<Vec<_>>(),
+        "every record past the fence reached the journal"
+    );
+    assert!(
+        !rig.frames()
+            .iter()
+            .any(|f| matches!(f, Frame::Handed { .. })),
+        "no #handed after the stand-down"
+    );
+    drop(w);
+    assert!(
+        rig.view("s-pasthand").crashed,
+        "a crash after the rollback reads as one"
+    );
+}
+
+/// G5's review: what a failed write holds stays spent first through the backoff, so a burst then,
+/// smaller than the ring, spends those records (their lines are with the writer) before newer
+/// ones it has not reached, and the retry writes every record with no gap.
+#[test]
+fn a_burst_in_the_backoff_spends_the_held_records_first() {
+    let rig = Rig::new();
+    let tl = small_ring(&rig, "s-heldfirst");
+    let mut w = rig.writer();
+    assert!(w.pass() > 0, "the open path lands");
+    turn_of_steps(&tl);
+    rig.fs.fault(Some(Fault::Always(libc::ENOSPC)));
+    assert_eq!(w.pass(), 0, "the disk is full");
+    burst_past_the_ring(&tl);
+    rig.fs.fault(None);
+    rig.clock.advance(BACKOFF_FIRST);
+    assert!(w.pass() > 0, "the retry writes");
+    drain(&rig, &mut w, 8);
+    let gaps = gaps_of(&rig);
+    assert!(gaps.is_empty(), "the backoff's burst lost {gaps:?}");
+    let head = with_log(&tl, |log| log.last_seq());
+    assert_eq!(
+        view_seqs(&rig, "s-heldfirst"),
+        (1..=head).collect::<Vec<_>>(),
+        "every record reached the journal"
+    );
+}
+
+/// G5's review: lines a journal that stops lets go unwritten give their take back, so their
+/// records rank with the unwritten again: the writer no longer holds them.
+#[test]
+fn a_journal_that_stops_gives_back_what_it_held() {
+    let rig = Rig::new();
+    let tl = rig.sessions.add("s-stophold");
+    let mut w = rig.writer();
+    assert!(w.pass() > 0);
+    let on_disk = with_log(&tl, |log| log.last_seq());
+    for ms in 1..6 {
+        mark(&tl, ms);
+    }
+    let took = with_log(&tl, |log| log.last_seq());
+    rig.fs.fault(Some(Fault::Always(libc::EIO)));
+    assert_eq!(w.pass(), 0, "the volume fails the write");
+    assert_eq!(
+        with_log(&tl, |log| log.journaled()),
+        Some(took),
+        "held, the take stays spent first (positive control)"
+    );
+    for _ in 0..8 {
+        if w.is_stopped() {
+            break;
+        }
+        rig.clock.advance(BACKOFF_MAX);
+        w.pass();
+    }
+    assert!(w.is_stopped(), "repeated I/O errors stop the journal");
+    assert_eq!(
+        with_log(&tl, |log| log.journaled()),
+        Some(on_disk),
+        "the stopped journal gave back what it held"
+    );
+}
+
+/// G5: lines a failed write held are written only in the seq space they were taken from. A log
+/// put in place of theirs (an adoption's) leaves them unwritten, and the session restates itself
+/// in the new space: what reaches the journal after it is the new log's records, behind its snap.
+#[test]
+fn held_lines_are_never_written_in_a_replaced_logs_space() {
+    let rig = Rig::new();
+    let tl = rig.sessions.add("s-replaced");
+    let mut w = rig.writer();
+    assert!(w.pass() > 0);
+    for ms in 1..6 {
+        mark(&tl, ms);
+    }
+    rig.fs.fault(Some(Fault::Always(libc::ENOSPC)));
+    assert_eq!(w.pass(), 0, "the disk is full");
+    assert!(
+        w.tracks
+            .get("s-replaced")
+            .is_some_and(|t| t.unlanded.is_some()),
+        "the failed write's lines are held (positive control)"
+    );
+    let ep = with_log(&tl, |log| log.base_ep().max(log.ep())) + 7;
+    let mut next = Log::with_limits(ep, Limits::new(4096, 1 << 22).expect("a ring"));
+    next.open_session(
+        Kind::Spawn,
+        Src::Aterm,
+        Conf::Exact,
+        Actor::Nobody,
+        Fields::new(),
+        at(50),
+    )
+    .expect("opens");
+    tl.lock().expect("tl").slog_mut().replace_log(next);
+    mark(&tl, 60);
+    let before = rig.frames().len();
+    rig.fs.fault(None);
+    rig.clock.advance(BACKOFF_FIRST);
+    assert!(w.pass() > 0, "the session restates itself");
+    drain(&rig, &mut w, 8);
+    let after = rig.frames().split_off(before);
+    let snaps: Vec<(u32, u32, u64)> = after
+        .iter()
+        .filter_map(|f| match f {
+            Frame::Snap {
+                sid,
+                ep,
+                base,
+                head,
+                ..
+            } if sid.as_str() == "s-replaced" => Some((*ep, *base, *head)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        snaps,
+        vec![(ep, ep, 0)],
+        "one snap, in the new space, from its start"
+    );
+    let want: Vec<aterm_slog::Rec> = with_log(&tl, |log| all(log).iter().map(host).collect());
+    assert_eq!(
+        recs_of(&after, "s-replaced"),
+        want,
+        "only the new log's records follow the replacement"
+    );
+}
+
+/// G5 (LOG2-2): with a segment open, a reading that finds room ends the floor's pause though the
+/// pass has nothing to write: the notice clears, the writer runs, and the next pause starts at
+/// BACKOFF_FIRST again.
+#[test]
+fn a_reading_that_finds_room_ends_the_floors_pause_with_nothing_to_write() {
+    let rig = Rig::new();
+    let _tl = rig.sessions.add("s-roomback");
+    let mut w = rig.writer();
+    assert!(w.pass() > 0, "a segment is open");
+    rig.fs.state().free = Some(FREE_FLOOR - 1);
+    rig.clock.advance(FREE_CHECK_EVERY);
+    assert_eq!(w.pass(), 0, "the minute's check finds the floor");
+    assert_eq!(rig.report.attention().1, Attention::Paused(Cause::Full));
+    rig.fs.state().free = Some(u64::MAX);
+    rig.clock.advance(BACKOFF_FIRST);
+    assert_eq!(w.pass(), 0, "nothing new to write");
+    assert_eq!(
+        rig.report.attention().1,
+        Attention::None,
+        "the reading that found room ended the pause"
+    );
+    assert!(matches!(w.state, State::Running) && w.wait().is_none());
+    rig.fs.state().free = Some(FREE_FLOOR - 1);
+    rig.clock.advance(FREE_CHECK_EVERY);
+    assert_eq!(w.pass(), 0, "the floor again");
+    assert_eq!(
+        w.wait(),
+        Some(BACKOFF_FIRST),
+        "the next pause starts afresh"
+    );
+}
+
+/// G5: a refused write's pause (a full quota, whose volume's free count shows room) holds and
+/// doubles until a write lands: a reading that finds room ends only the floor's pause.
+#[test]
+fn a_refused_writes_pause_ends_only_at_a_write_that_lands() {
+    let rig = Rig::new();
+    let tl = rig.sessions.add("s-quota");
+    let mut w = rig.writer();
+    assert!(w.pass() > 0);
+    mark(&tl, 1);
+    rig.fs.fault(Some(Fault::Always(libc::EDQUOT)));
+    assert_eq!(w.pass(), 0, "the quota refuses the write");
+    assert_eq!(rig.report.attention().1, Attention::Paused(Cause::Full));
+    assert_eq!(w.wait(), Some(BACKOFF_FIRST));
+    rig.clock.advance(BACKOFF_FIRST);
+    assert_eq!(w.pass(), 0, "refused again, past a reading that found room");
+    assert_eq!(
+        rig.report.attention().1,
+        Attention::Paused(Cause::Full),
+        "the pause holds"
+    );
+    assert_eq!(w.wait(), Some(BACKOFF_FIRST * 2), "the pause doubled");
+    rig.fs.fault(None);
+    rig.clock.advance(BACKOFF_FIRST * 2);
+    assert!(w.pass() > 0, "the held lines land");
+    assert_eq!(rig.report.attention().1, Attention::None);
 }
 
 #[test]

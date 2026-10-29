@@ -208,3 +208,181 @@ fn deep_chain() -> u32 {
 fn forty_arms_stay_inside_the_default_recursion_limit() {
     assert_eq!(deep_chain(), 39);
 }
+
+#[test]
+fn statement_arm_preserves_caller_hygiene_for_let_bindings() {
+    cfg_if::cfg_if! {
+        if #[cfg(any())] {
+            let bound = 10u32;
+        } else if #[cfg(all())] {
+            let bound = 29u32;
+        } else {
+            let bound = 0u32;
+        }
+    }
+    assert_eq!(bound, 29);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expansion_state(
+    p1: i64,
+    p2: i64,
+    p3: i64,
+    has_else: i64,
+    phase: i64,
+    seen_true: i64,
+    selected: i64,
+    emitted_arms: i64,
+    leaked_dead_items: i64,
+    depth: i64,
+) -> aterm_spec::interp::State {
+    std::collections::BTreeMap::from([
+        ("p1", p1),
+        ("p2", p2),
+        ("p3", p3),
+        ("has_else", has_else),
+        ("phase", phase),
+        ("seen_true", seen_true),
+        ("selected", selected),
+        ("emitted_arms", emitted_arms),
+        ("leaked_dead_items", leaked_dead_items),
+        ("depth", depth),
+    ])
+}
+
+mod ungrouped_negative_control {
+    macro_rules! buggy_ungrouped {
+        (if #[cfg($($p:tt)+)] { $( $it:item )+ }) => {
+            #[cfg($($p)+)]
+            $( $it )+
+        };
+    }
+
+    buggy_ungrouped! {
+        if #[cfg(any())] {
+            pub fn first_stripped() -> i64 { 1 }
+            pub fn second_leaked_from_dead_arm() -> i64 { 1 }
+        }
+    }
+}
+
+#[test]
+fn cfg_if_expansion_conformance_and_tripwire_negative_controls() {
+    let m = aterm_models_core::cfg_if_expansion_model();
+    assert!(aterm_spec::interp::prove_and_catch(&m) > 1);
+    let check_step = |prev: &aterm_spec::interp::State,
+                      next: &aterm_spec::interp::State,
+                      expected: &'static str| {
+        assert_eq!(
+            aterm_spec::interp::admits(&m, prev, next),
+            Some(expected),
+            "step {expected} from {prev:?} to {next:?} must refine CfgIfExpansion"
+        );
+        for inv in &m.invariants {
+            assert!(
+                m.check_invariant(inv.name, next),
+                "invariant {} violated at {next:?}",
+                inv.name
+            );
+        }
+    };
+
+    // 1. Conformance trace for overlapping true arms (`all()`, `all()`, `else`):
+    //    `case_first_wins::real::pick()` selects arm 1 ("arm1") with 0 leaked dead items.
+    let sel_first = match case_first_wins::real::pick() {
+        "arm1" => 1,
+        "arm2" => 2,
+        _ => 3,
+    };
+    assert_eq!(sel_first, 1);
+    let s0 = m.init_state();
+    assert_eq!(s0, expansion_state(0, 0, 0, 1, 0, 0, 0, 0, 0, 0));
+    let s1 = expansion_state(1, 0, 0, 1, 0, 0, 0, 0, 0, 0);
+    check_step(&s0, &s1, "SetP1");
+    let s2 = expansion_state(1, 1, 0, 1, 0, 0, 0, 0, 0, 0);
+    check_step(&s1, &s2, "SetP2");
+    let s3 = expansion_state(1, 1, 0, 1, 1, 0, 0, 0, 0, 1);
+    check_step(&s2, &s3, "Enter");
+    let s4 = expansion_state(1, 1, 0, 1, 2, 1, sel_first, 1, 0, 2);
+    check_step(&s3, &s4, "StepArm1");
+    let s5 = expansion_state(1, 1, 0, 1, 3, 1, sel_first, 1, 0, 3);
+    check_step(&s4, &s5, "StepArm2");
+    let s6 = expansion_state(1, 1, 0, 1, 4, 1, sel_first, 1, 0, 4);
+    check_step(&s5, &s6, "StepArm3");
+    let s7 = expansion_state(1, 1, 0, 1, 5, 1, sel_first, 1, 0, 6);
+    check_step(&s6, &s7, "BaseEmpty");
+
+    // 2. Conformance trace for an else-less all-false chain (`no_arm_matches` -> 0 arms emitted).
+    fn all_false_elseless() -> i64 {
+        cfg_if::cfg_if! {
+            if #[cfg(any())] {
+                return 1;
+            } else if #[cfg(any())] {
+                return 2;
+            } else if #[cfg(any())] {
+                return 3;
+            }
+        }
+        0
+    }
+    let emitted_none = all_false_elseless();
+    assert_eq!(emitted_none, 0);
+    let n1 = expansion_state(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    check_step(&s0, &n1, "OmitElse");
+    let n2 = expansion_state(0, 0, 0, 0, 1, 0, 0, 0, 0, 1);
+    check_step(&n1, &n2, "Enter");
+    let n3 = expansion_state(0, 0, 0, 0, 2, 0, 0, 0, 0, 2);
+    check_step(&n2, &n3, "StepArm1");
+    let n4 = expansion_state(0, 0, 0, 0, 3, 0, 0, 0, 0, 3);
+    check_step(&n3, &n4, "StepArm2");
+    let n5 = expansion_state(0, 0, 0, 0, 4, 0, 0, 0, 0, 4);
+    check_step(&n4, &n5, "StepArm3");
+    let n6 = expansion_state(0, 0, 0, 0, 5, 0, 0, emitted_none, 0, 6);
+    check_step(&n5, &n6, "BaseEmpty");
+
+    // 3. Negative control 1 (last-match-wins / missing `not(any(seen))`):
+    //    omitting `not(any(..))` lets arm 2 fire after arm 1 already matched.
+    macro_rules! buggy_last_wins {
+        ($hits:ident; $( [$idx:expr, $($p:tt)+] )+) => {{
+            $(
+                #[cfg($($p)+)]
+                {
+                    $hits.push($idx);
+                }
+            )+
+        }};
+    }
+    let mut bug1_hits = Vec::<i64>::new();
+    buggy_last_wins!(bug1_hits; [1, all()] [2, all()] [3, all()]);
+    assert_eq!(bug1_hits, vec![1, 2, 3]);
+    let bug1_sel = *bug1_hits.last().expect("three arms fired");
+    let bug1_emitted = bug1_hits.len() as i64;
+    let bug1_step2 = expansion_state(1, 1, 0, 1, 3, 1, 2, 2, 0, 3);
+    assert_eq!(aterm_spec::interp::admits(&m, &s4, &bug1_step2), None);
+    assert_eq!(
+        aterm_spec::interp::admits(&aterm_spec::interp::with_buggy(&m, 1), &s4, &bug1_step2),
+        Some("StepArm2")
+    );
+    let bug1_final = expansion_state(1, 1, 1, 1, 5, 1, bug1_sel, bug1_emitted, 0, 6);
+    assert!(!m.check_invariant("FirstMatchSelected", &bug1_final));
+
+    // 4. Negative control 2 (un-grouped multi-item arm, upstream issue #90):
+    //    without `@__group`, `#[cfg(any())]` strips only item 1 and leaks item 2.
+    let leaked = ungrouped_negative_control::second_leaked_from_dead_arm();
+    assert_eq!(leaked, 1);
+    let bug2_enter = expansion_state(0, 0, 0, 1, 1, 0, 0, 0, 0, 1);
+    let bug2_step1 = expansion_state(0, 0, 0, 1, 2, 0, 0, 0, leaked, 2);
+    assert_eq!(
+        aterm_spec::interp::admits(&m, &bug2_enter, &bug2_step1),
+        None
+    );
+    assert_eq!(
+        aterm_spec::interp::admits(
+            &aterm_spec::interp::with_buggy(&m, 2),
+            &bug2_enter,
+            &bug2_step1
+        ),
+        Some("StepArm1")
+    );
+    assert!(!m.check_invariant("DeadArmFullyAbsent", &bug2_step1));
+}

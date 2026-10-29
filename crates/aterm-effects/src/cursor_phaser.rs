@@ -26,9 +26,10 @@ const BASE_DARK_THEME: u32 = 0x00FF_FFFF;
 #[inline]
 const fn light_emitter_fill(hue: f32, e: f32) -> u32 {
     let clean = hsv2rgb(crate::color_math::light_spectrum_hue(hue), 1.0, 1.0);
-    crate::color_math::floor_contrast_keeping_hue(
+    crate::color_math::floor_contrast_keeping_hue_with_ground_lum(
+        crate::color_math::relative_luminance_table(),
         crate::color_math::light_body_fill(clean, e),
-        0x00FF_FFFF,
+        1.0,
         crate::cursor_beam::LIGHT_EMITTER_CONTRAST,
     )
 }
@@ -270,11 +271,14 @@ impl CursorPhaser {
     ) {
         const WING_COV_CEILING: f32 = WING_STACK_BUDGET / WING_STACK_OVERLAP;
         let (cw, ch) = (geom.cw as f32, geom.ch as f32);
+        let reach = (REACH_IDLE + (REACH_MAX - REACH_IDLE) * e) * cw;
+        let cov_core = (COV_MAX * charge * cfg.intensity).min(WING_COV_CEILING);
+        if reach < 1.0 || cov_core < 1.0 {
+            return;
+        }
         let cell_l = i32::from(geom.origin_x) + cc as i32 * geom.cw as i32;
         let cell_r = cell_l + geom.cw as i32;
         let cy = f32::from(geom.origin_y) + (cr as f32 + 0.5) * ch;
-        let reach = (REACH_IDLE + (REACH_MAX - REACH_IDLE) * e) * cw;
-        let cov_core = (COV_MAX * charge * cfg.intensity).min(WING_COV_CEILING);
 
         let slab = ((ch * 0.125) as i32).max(2);
         let cy_i32 = cy as i32;

@@ -230,14 +230,13 @@ fn light_theme() -> Theme {
 
 #[test]
 fn over_veils_byte_exact_over_dark_and_light_frames() {
-    over_veils_parity("over_veils_byte_exact_over_dark_and_light_frames", false);
+    over_veils_parity("over_veils_byte_exact_over_dark_and_light_frames");
 }
 
-fn over_veils_parity(test: &str, oracle: bool) {
+fn over_veils_parity(test: &str) {
     let exact = ByteExact::default();
     for (label, theme) in [("dark", Theme::default()), ("light", light_theme())] {
         let (mut cpu, mut gpu) = backends(18.0, theme);
-        let _ = oracle;
         let mut win = aterm_gpu::WindowGpu::new();
         let (rows, cols) = (10usize, 40usize);
         let mut term = block_text_term(rows, cols, 1..8);

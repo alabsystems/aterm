@@ -118,7 +118,7 @@ pub enum ShapedRun {
 /// The most cells an N:1 collapse is admitted for (real programming ligatures span 2–4); a longer run stays per-cell.
 pub const LIG_SLICE_MAX: usize = 64;
 
-/// Extract cell `k`'s slice of a wide ligature raster as a cell-local tile (`cell_w × height`, left bearing 0).
+/// Extract signed cell `k`'s slice of a wide ligature raster as a cell-local tile (`cell_w × height`, left bearing 0).
 #[must_use]
 pub fn extract_cell_slice(
     raster: &[u8],
@@ -126,20 +126,23 @@ pub fn extract_cell_slice(
     height: usize,
     xmin: i32,
     cell_w: usize,
-    k: usize,
+    k: i64,
 ) -> Vec<u8> {
     if cell_w == 0 || height == 0 || raster.len() < raster_w.saturating_mul(height) {
         return Vec::new();
     }
     let mut tile = vec![0u8; cell_w * height];
-    let base = (k as i64) * (cell_w as i64) - xmin as i64;
+    let cell_w_i64 = i64::try_from(cell_w).unwrap_or(i64::MAX);
+    let base = k.saturating_mul(cell_w_i64).saturating_sub(i64::from(xmin));
     for row in 0..height {
         let src_row = row * raster_w;
         let dst_row = row * cell_w;
         for j in 0..cell_w {
-            let src_col = base + j as i64;
-            if src_col >= 0 && (src_col as usize) < raster_w {
-                tile[dst_row + j] = raster[src_row + src_col as usize];
+            let src_col = base.saturating_add(i64::try_from(j).unwrap_or(i64::MAX));
+            if let Ok(col) = usize::try_from(src_col)
+                && col < raster_w
+            {
+                tile[dst_row + j] = raster[src_row + col];
             }
         }
     }
@@ -889,8 +892,7 @@ mod tests {
                     let j = (dest - k * cell_w as i64) as usize;
                     let kk = (k - lo_cell as i64) as usize;
                     assert!(kk < n);
-                    let tile =
-                        extract_cell_slice(&raster, raster_w, height, xmin, cell_w, k as usize);
+                    let tile = extract_cell_slice(&raster, raster_w, height, xmin, cell_w, k);
                     assert_eq!(tile.len(), cell_w * height);
                     assert_eq!(
                         tile[row * cell_w + j],

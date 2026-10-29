@@ -48,15 +48,12 @@ fn the_named_codes_are_upstreams() {
     }
     assert_eq!(Error::INTERNAL_START, 2147483648);
     assert_eq!(Error::CUSTOM_START, 3221225472);
-    assert_eq!(size_of::<Error>(), 4);
-    assert_eq!(size_of::<Result<(), Error>>(), 4);
 }
 
-/// `(code, raw_os_error, Display, Debug, io kind, io raw_os_error, io Display)`.
+/// `(code, raw_os_error, Display, Debug, io raw_os_error, io Display)`.
 type Row = (
     u32,
     Option<i32>,
-    &'static str,
     &'static str,
     &'static str,
     Option<i32>,
@@ -71,7 +68,6 @@ const INTERNAL: &[Row] = &[
         None,
         "getrandom: this target is not supported",
         "Error { internal_code: 2147483648, description: \"getrandom: this target is not supported\" }",
-        "Other",
         None,
         "getrandom: this target is not supported",
     ),
@@ -80,7 +76,6 @@ const INTERNAL: &[Row] = &[
         None,
         "errno: did not return a positive value",
         "Error { internal_code: 2147483649, description: \"errno: did not return a positive value\" }",
-        "Other",
         None,
         "errno: did not return a positive value",
     ),
@@ -89,7 +84,6 @@ const INTERNAL: &[Row] = &[
         None,
         "unexpected situation",
         "Error { internal_code: 2147483650, description: \"unexpected situation\" }",
-        "Other",
         None,
         "unexpected situation",
     ),
@@ -98,7 +92,6 @@ const INTERNAL: &[Row] = &[
         None,
         "SecRandomCopyBytes: iOS Security framework failure",
         "Error { internal_code: 2147483651, description: \"SecRandomCopyBytes: iOS Security framework failure\" }",
-        "Other",
         None,
         "SecRandomCopyBytes: iOS Security framework failure",
     ),
@@ -107,7 +100,6 @@ const INTERNAL: &[Row] = &[
         None,
         "RtlGenRandom: Windows system function failure",
         "Error { internal_code: 2147483652, description: \"RtlGenRandom: Windows system function failure\" }",
-        "Other",
         None,
         "RtlGenRandom: Windows system function failure",
     ),
@@ -116,7 +108,6 @@ const INTERNAL: &[Row] = &[
         None,
         "RDRAND: failed multiple times: CPU issue likely",
         "Error { internal_code: 2147483653, description: \"RDRAND: failed multiple times: CPU issue likely\" }",
-        "Other",
         None,
         "RDRAND: failed multiple times: CPU issue likely",
     ),
@@ -125,7 +116,6 @@ const INTERNAL: &[Row] = &[
         None,
         "RDRAND: instruction not supported",
         "Error { internal_code: 2147483654, description: \"RDRAND: instruction not supported\" }",
-        "Other",
         None,
         "RDRAND: instruction not supported",
     ),
@@ -134,7 +124,6 @@ const INTERNAL: &[Row] = &[
         None,
         "Web Crypto API is unavailable",
         "Error { internal_code: 2147483655, description: \"Web Crypto API is unavailable\" }",
-        "Other",
         None,
         "Web Crypto API is unavailable",
     ),
@@ -143,7 +132,6 @@ const INTERNAL: &[Row] = &[
         None,
         "Calling Web API crypto.getRandomValues failed",
         "Error { internal_code: 2147483656, description: \"Calling Web API crypto.getRandomValues failed\" }",
-        "Other",
         None,
         "Calling Web API crypto.getRandomValues failed",
     ),
@@ -152,7 +140,6 @@ const INTERNAL: &[Row] = &[
         None,
         "randSecure: VxWorks RNG module is not initialized",
         "Error { internal_code: 2147483659, description: \"randSecure: VxWorks RNG module is not initialized\" }",
-        "Other",
         None,
         "randSecure: VxWorks RNG module is not initialized",
     ),
@@ -161,7 +148,6 @@ const INTERNAL: &[Row] = &[
         None,
         "Node.js crypto CommonJS module is unavailable",
         "Error { internal_code: 2147483660, description: \"Node.js crypto CommonJS module is unavailable\" }",
-        "Other",
         None,
         "Node.js crypto CommonJS module is unavailable",
     ),
@@ -170,7 +156,6 @@ const INTERNAL: &[Row] = &[
         None,
         "Calling Node.js API crypto.randomFillSync failed",
         "Error { internal_code: 2147483661, description: \"Calling Node.js API crypto.randomFillSync failed\" }",
-        "Other",
         None,
         "Calling Node.js API crypto.randomFillSync failed",
     ),
@@ -179,7 +164,6 @@ const INTERNAL: &[Row] = &[
         None,
         "Node.js ES modules are not directly supported, see https://docs.rs/getrandom#nodejs-es-module-support",
         "Error { internal_code: 2147483662, description: \"Node.js ES modules are not directly supported, see https://docs.rs/getrandom#nodejs-es-module-support\" }",
-        "Other",
         None,
         "Node.js ES modules are not directly supported, see https://docs.rs/getrandom#nodejs-es-module-support",
     ),
@@ -188,7 +172,6 @@ const INTERNAL: &[Row] = &[
         None,
         "Unknown Error: 2147483657",
         "Error { unknown_code: 2147483657 }",
-        "Other",
         None,
         "Unknown Error: 2147483657",
     ),
@@ -197,7 +180,6 @@ const INTERNAL: &[Row] = &[
         None,
         "Unknown Error: 2147483658",
         "Error { unknown_code: 2147483658 }",
-        "Other",
         None,
         "Unknown Error: 2147483658",
     ),
@@ -206,7 +188,6 @@ const INTERNAL: &[Row] = &[
         None,
         "Unknown Error: 2147483663",
         "Error { unknown_code: 2147483663 }",
-        "Other",
         None,
         "Unknown Error: 2147483663",
     ),
@@ -215,7 +196,6 @@ const INTERNAL: &[Row] = &[
         None,
         "Unknown Error: 3221225471",
         "Error { unknown_code: 3221225471 }",
-        "Other",
         None,
         "Unknown Error: 3221225471",
     ),
@@ -224,7 +204,6 @@ const INTERNAL: &[Row] = &[
         None,
         "Unknown Error: 3221225472",
         "Error { unknown_code: 3221225472 }",
-        "Other",
         None,
         "Unknown Error: 3221225472",
     ),
@@ -233,7 +212,6 @@ const INTERNAL: &[Row] = &[
         None,
         "Unknown Error: 3221225479",
         "Error { unknown_code: 3221225479 }",
-        "Other",
         None,
         "Unknown Error: 3221225479",
     ),
@@ -242,22 +220,19 @@ const INTERNAL: &[Row] = &[
         None,
         "Unknown Error: 4294967295",
         "Error { unknown_code: 4294967295 }",
-        "Other",
         None,
         "Unknown Error: 4294967295",
     ),
 ];
 
-/// OS error numbers. The io `Display` is std's (`… (os error N)`), not the
-/// error's, so it is left out (empty).
-#[cfg(unix)]
-const OS: &[Row] = &[
+/// OS error numbers whose Darwin and glibc `strerror` descriptions match upstream's recording.
+#[cfg(any(target_vendor = "apple", all(target_os = "linux", target_env = "gnu")))]
+const OS_RECORDED: &[Row] = &[
     (
         2147483647,
         Some(2147483647),
         "OS Error: 2147483647",
         "Error { os_error: 2147483647 }",
-        "Uncategorized",
         Some(2147483647),
         "",
     ),
@@ -266,7 +241,6 @@ const OS: &[Row] = &[
         Some(1),
         "Operation not permitted",
         "Error { os_error: 1, description: \"Operation not permitted\" }",
-        "PermissionDenied",
         Some(1),
         "",
     ),
@@ -275,7 +249,6 @@ const OS: &[Row] = &[
         Some(2),
         "No such file or directory",
         "Error { os_error: 2, description: \"No such file or directory\" }",
-        "NotFound",
         Some(2),
         "",
     ),
@@ -284,7 +257,6 @@ const OS: &[Row] = &[
         Some(4),
         "Interrupted system call",
         "Error { os_error: 4, description: \"Interrupted system call\" }",
-        "Interrupted",
         Some(4),
         "",
     ),
@@ -293,7 +265,6 @@ const OS: &[Row] = &[
         Some(5),
         "Input/output error",
         "Error { os_error: 5, description: \"Input/output error\" }",
-        "Uncategorized",
         Some(5),
         "",
     ),
@@ -302,14 +273,13 @@ const OS: &[Row] = &[
         Some(13),
         "Permission denied",
         "Error { os_error: 13, description: \"Permission denied\" }",
-        "PermissionDenied",
         Some(13),
         "",
     ),
 ];
 
 fn check(rows: &[Row]) {
-    for &(code, raw, display, debug, io_kind, io_raw, io_display) in rows {
+    for &(code, raw, display, debug, io_raw, io_display) in rows {
         let err = Error::from(NonZeroU32::new(code).expect("recorded codes are non-zero"));
         assert_eq!(err.code().get(), code);
         assert_eq!(err.raw_os_error(), raw, "{code}");
@@ -322,7 +292,7 @@ fn check(rows: &[Row]) {
                 std::io::Error::from_raw_os_error(errno).kind(),
                 "{code}"
             ),
-            None => assert_eq!(format!("{:?}", io.kind()), io_kind, "{code}"),
+            None => assert_eq!(io.kind(), std::io::ErrorKind::Other, "{code}"),
         }
         assert_eq!(io.raw_os_error(), io_raw, "{code}");
         if !io_display.is_empty() {
@@ -339,5 +309,46 @@ fn internal_and_custom_codes_answer_as_upstream() {
 #[cfg(unix)]
 #[test]
 fn os_codes_answer_as_upstream() {
-    check(OS);
+    check(&[(
+        2147483647,
+        Some(2147483647),
+        "OS Error: 2147483647",
+        "Error { os_error: 2147483647 }",
+        Some(2147483647),
+        "",
+    )]);
+    for errno in [1i32, 2, 4, 5, 13] {
+        let code = u32::try_from(errno).expect("positive errno");
+        let err = Error::from(NonZeroU32::new(code).expect("non-zero errno"));
+        assert_eq!(err.raw_os_error(), Some(errno));
+        let host_io = std::io::Error::from_raw_os_error(errno);
+        let suffix = format!(" (os error {errno})");
+        let host_text = host_io.to_string();
+        let host_desc = host_text
+            .strip_suffix(&suffix)
+            .filter(|d| !d.is_empty() && !d.starts_with("Unknown error"));
+        match host_desc {
+            Some(desc) => {
+                assert_eq!(err.to_string(), desc, "{errno}");
+                assert_eq!(
+                    format!("{err:?}"),
+                    format!("Error {{ os_error: {errno}, description: {desc:?} }}"),
+                    "{errno}"
+                );
+            }
+            None => {
+                assert_eq!(err.to_string(), format!("OS Error: {errno}"), "{errno}");
+                assert_eq!(
+                    format!("{err:?}"),
+                    format!("Error {{ os_error: {errno} }}"),
+                    "{errno}"
+                );
+            }
+        }
+        let io = std::io::Error::from(err);
+        assert_eq!(io.raw_os_error(), Some(errno), "{errno}");
+        assert_eq!(io.kind(), host_io.kind(), "{errno}");
+    }
+    #[cfg(any(target_vendor = "apple", all(target_os = "linux", target_env = "gnu")))]
+    check(OS_RECORDED);
 }

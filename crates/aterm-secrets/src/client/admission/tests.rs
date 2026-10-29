@@ -74,14 +74,26 @@ impl Lab {
         }
     }
 
-    fn queue(&self, open: bool, valid: bool) {
-        let mut admin = admin_open(&self.paths).unwrap();
-        if open {
-            let mut doc = admin.doc.clone();
-            doc.set_open(true).unwrap();
-            admin_publish(&self.paths, &admin, &doc).unwrap();
-            admin = admin_open(&self.paths).unwrap();
-        }
+    /// A Mac an open vault's approver let in before Allows closed it
+    /// (docs/DESIGN-fluid-swarm-2026-10-28.md F10): its evidence names the open approval.
+    fn admitted_open(&self) {
+        let admin = admin_open(&self.paths).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_open(true).unwrap();
+        doc.add_machine("m2", &self.peer_key()).unwrap();
+        publish_as(
+            &self.paths,
+            &admin,
+            &doc,
+            false,
+            &[(self.peer_key(), AdmissionMethod::Open)],
+            false,
+        )
+        .unwrap();
+    }
+
+    fn queue(&self, valid: bool) {
+        let admin = admin_open(&self.paths).unwrap();
         let password = admin
             .doc
             .join_password()
@@ -103,7 +115,7 @@ impl Lab {
         )
         .unwrap();
         let approved = auto_approve(&self.paths).unwrap();
-        assert_eq!(approved.approved.is_empty(), !open && !valid);
+        assert_eq!(approved.approved.is_empty(), !valid);
     }
 }
 
@@ -196,7 +208,7 @@ pub(crate) fn admission_transition(state: &ModelState, action: &str) -> ModelSta
     let lab = Lab::new();
     let (scenario, expected_evidence) = match action {
         "Password" => {
-            lab.queue(false, true);
+            lab.queue(true);
             (1, 2)
         }
         "Manual" => {
@@ -204,7 +216,7 @@ pub(crate) fn admission_transition(state: &ModelState, action: &str) -> ModelSta
             (2, 2)
         }
         "OpenClosed" => {
-            lab.queue(true, true);
+            lab.admitted_open();
             (3, 2)
         }
         "Removed" | "Readded" => {
@@ -244,7 +256,7 @@ pub(crate) fn admission_transition(state: &ModelState, action: &str) -> ModelSta
         "Legacy" => {
             lab.add(true, true);
             let admin = admin_open(&lab.paths).unwrap();
-            let bytes = seal(
+            let bytes = seal_with_admissions_and_parents(
                 &admin.config.name,
                 admin.seq() + 1,
                 &admin.seed,
@@ -252,6 +264,8 @@ pub(crate) fn admission_transition(state: &ModelState, action: &str) -> ModelSta
                 true,
                 &admin.doc,
                 &admin.handoff,
+                &admin.opened_heads,
+                &Ledger::default().retained(&admin.doc).unwrap(),
             )
             .unwrap();
             let parsed = envelope::parse(&bytes).unwrap();
@@ -283,6 +297,7 @@ pub(crate) fn admission_transition(state: &ModelState, action: &str) -> ModelSta
                     seq: parsed.seq,
                     time: parsed.time,
                     handoff: parsed.handoff,
+                    parents: parsed.parents,
                     lockers,
                 },
                 &admin.seed,
@@ -294,7 +309,7 @@ pub(crate) fn admission_transition(state: &ModelState, action: &str) -> ModelSta
         }
         "Draft" => (11, 0),
         "InvalidProof" => {
-            lab.queue(false, false);
+            lab.queue(false);
             (12, 0)
         }
         "ForeignRoot" => {
@@ -432,7 +447,7 @@ fn admission_codec_rejects_ambiguous_truncated_future_and_foreign_state() {
 #[test]
 fn draft_join_policy_cannot_bypass_the_authenticated_password() {
     let lab = Lab::new();
-    lab.queue(false, false);
+    lab.queue(false);
     let mut admin = admin_open(&lab.paths).unwrap();
     let before = admin.seq();
     admin.doc.set_open(true).unwrap();

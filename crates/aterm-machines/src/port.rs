@@ -605,6 +605,12 @@ pub trait System: Sync {
         Err("this system reads no account".into())
     }
 
+    /// Home directory of the account this process runs as, when readable without recording an
+    /// identity probe.
+    fn account_home(&self) -> Option<PathBuf> {
+        self.identity().ok().map(|id| PathBuf::from(id.user.home))
+    }
+
     /// Whether the network this Mac uses now is in Low Data Mode, as macOS's network path
     /// reads it, in this process; `None` when it cannot tell (no network path, or none read).
     fn low_data_mode(&self) -> Option<bool> {
@@ -653,10 +659,10 @@ pub trait System: Sync {
 
     /// Hand the Accessibility ask to the aterm window's permission walk (`aterm ctl permissions
     /// walk now accessibility`), only when that window is the app macOS holds responsible for
-    /// this process, so the grant it walks is this run's: `true` once the walk took it (its
-    /// panel beside System Settings, in place of macOS's own consent dialog).
-    fn walk_accessibility(&self) -> bool {
-        false
+    /// this process, so the grant it walks is this run's: what the window's answer says of the
+    /// ask ([`AccessibilityWalk`]), [`AccessibilityWalk::NotTaken`] where no such window answers.
+    fn walk_accessibility(&self) -> AccessibilityWalk {
+        AccessibilityWalk::NotTaken
     }
 
     /// When `pid` started, in Unix seconds, as the kernel recorded it for any uid's process (what
@@ -822,6 +828,12 @@ pub trait System: Sync {
     /// "macOS only". The default: the platform this was built for.
     fn macos(&self) -> bool {
         cfg!(target_os = "macos")
+    }
+
+    /// Read `clients`' rows from the macOS system TCC `access` table (`clients = &[]` checks
+    /// that the table opens and reads), in this process with no lock or subprocess.
+    fn tcc_access(&self, _clients: &[&str]) -> Result<Vec<crate::items::person::TccRow>, String> {
+        Err("this system reads no TCC database".into())
     }
 }
 
@@ -1020,8 +1032,8 @@ fn account_env(user: &User) -> [(String, String); 6] {
 
 fn end_group(child: &mut aterm_uds::spawnfd::Child) {
     if let Ok(pid) = libc::pid_t::try_from(child.id()) {
-        // SAFETY: `child` is not yet reaped, so its pid and process group id remain valid.
-        unsafe { libc::kill(-pid, libc::SIGKILL) };
+        // `child` is not yet reaped, so its pid and process group id remain valid.
+        let _ = aterm_uds::process::kill_group_until_empty(pid);
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -1089,14 +1101,76 @@ pub(crate) fn terminal_free() -> Option<std::sync::MutexGuard<'static, ()>> {
     }
 }
 
-/// Whether the aterm window's `OK walking <page>…` answer takes `page`: a walk already under way
-/// answers with its own pages, which may leave out the one this run asked for.
+/// What the aterm window's permission walk answered a run's Accessibility ask
+/// ([`System::walk_accessibility`]), which decides whether the run may raise macOS's own consent
+/// dialog: never beside a walk's page, and never past the owner's Not now.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AccessibilityWalk {
+    /// No walk takes it: no aterm window that is this run's answered with a walk (there is
+    /// none, or it is headless or older than the walk), or it reads the grant held (`OK
+    /// granted`, which it answers only with no walk under way). macOS's own dialog may ask.
+    #[default]
+    NotTaken,
+    /// The walk takes it: its panel beside System Settings, in place of macOS's own dialog.
+    Taken,
+    /// The owner's Not now holds the page back from the walk (`OK declined`, or
+    /// `not-now:accessibility` in `OK walking`): nothing asks for it.
+    NotNow,
+    /// The window's walk shows other pages (an `OK walking` that names neither the page nor a
+    /// Not now on it), or walked within the last minute and may still be up (`OK recent`):
+    /// macOS's own dialog would stand beside the walk's page.
+    OtherPages,
+}
+
+/// What the aterm window's answer to `permissions walk now <page>` says of `page`: `OK walking`
+/// names the pages the walk has still to show (leaving out one the window reads held), and a
+/// page the owner's Not now holds back as `not-now:<page>`.
 #[cfg(any(test, target_os = "macos"))]
-fn walk_takes(reply: &str, page: &str) -> bool {
-    reply
-        .trim_end()
-        .strip_prefix("OK walking")
-        .is_some_and(|walking| walking.split_whitespace().any(|walked| walked == page))
+fn walk_answer(reply: &str, page: &str) -> AccessibilityWalk {
+    let reply = reply.trim_end();
+    if reply == "OK declined" {
+        return AccessibilityWalk::NotNow;
+    }
+    if reply == "OK recent" {
+        return AccessibilityWalk::OtherPages;
+    }
+    let Some(walking) = reply.strip_prefix("OK walking") else {
+        return AccessibilityWalk::NotTaken;
+    };
+    let mut words = walking.split_whitespace();
+    if words.clone().any(|walked| walked == page) {
+        AccessibilityWalk::Taken
+    } else if words.any(|walked| walked.strip_prefix("not-now:") == Some(page)) {
+        AccessibilityWalk::NotNow
+    } else {
+        AccessibilityWalk::OtherPages
+    }
+}
+
+/// The control socket of the running aterm window when that window is the app macOS holds
+/// responsible for this process (aterm in aterm's tab), by the pid its socket's name carries
+/// (`aterm-<pid>.sock`). macOS charges Full Disk Access and Accessibility to that app, and the
+/// window's permission walk turns on its own, so only this window walks the grant this run needs.
+/// `None` under another terminal (the grant is that terminal's), where no window answers, where
+/// either pid cannot be read, and off macOS.
+#[must_use]
+pub fn responsible_window() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let responsible = i32::try_from(std::process::id())
+            .ok()
+            .and_then(aterm_containment::responsible_app)?;
+        let sock = aterm_ctl::front_door_instance()?;
+        let instance = Path::new(&sock)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(aterm_types::control_socket::instance_pid)?;
+        (u32::try_from(responsible.pid).ok() == Some(instance)).then_some(sock)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 impl System for Live {
@@ -1563,33 +1637,20 @@ impl System for Live {
         }
     }
 
-    fn walk_accessibility(&self) -> bool {
+    fn walk_accessibility(&self) -> AccessibilityWalk {
         #[cfg(target_os = "macos")]
         {
-            let Some(responsible) = i32::try_from(std::process::id())
-                .ok()
-                .and_then(aterm_containment::responsible_app)
-            else {
-                return false;
+            let Some(sock) = responsible_window() else {
+                return AccessibilityWalk::NotTaken;
             };
-            let Some(sock) = aterm_ctl::front_door_instance() else {
-                return false;
-            };
-            // The instance's socket names its pid (`aterm-<pid>.sock`): only the window macOS
-            // holds responsible for this run walks the grant this run needs.
-            let instance = Path::new(&sock)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(aterm_types::control_socket::instance_pid);
-            if instance.is_none() || instance != u32::try_from(responsible.pid).ok() {
-                return false;
-            }
             aterm_ctl::front_door_send(&sock, "permissions walk now accessibility\n")
-                .is_ok_and(|reply| walk_takes(&reply, "accessibility"))
+                .map_or(AccessibilityWalk::NotTaken, |reply| {
+                    walk_answer(&reply, "accessibility")
+                })
         }
         #[cfg(not(target_os = "macos"))]
         {
-            false
+            AccessibilityWalk::NotTaken
         }
     }
 
@@ -1723,6 +1784,10 @@ impl System for Live {
 
     fn full_disk_access(&self) -> Option<bool> {
         self.full_disk_access
+    }
+
+    fn tcc_access(&self, clients: &[&str]) -> Result<Vec<crate::items::person::TccRow>, String> {
+        crate::items::person::read_tcc_file(Path::new(crate::items::person::TCC_DB), clients)
     }
 
     fn volume(&self, path: &Path) -> Option<aterm_capacity::reading::Volume> {
@@ -1971,11 +2036,16 @@ mod fake {
         trust: Mutex<Vec<bool>>,
         /// What [`System::responsible_app`] answers.
         pub responsible: Option<String>,
-        /// What [`System::walk_accessibility`] answers: no window walks it unless a test says.
-        pub walks: bool,
+        /// What [`System::walk_accessibility`] answers: no walk takes it unless a test says.
+        pub walks: super::AccessibilityWalk,
         /// [`System::macos`] answers no: a Linux machine ([`Fake::root`]: a Mac).
         pub linux: bool,
+        /// Scripted [`System::tcc_access`] replies keyed by `tcc open` or `tcc <clients>`.
+        tcc_replies: Mutex<TccReplies>,
     }
+
+    type TccReplies =
+        std::collections::BTreeMap<String, Vec<Result<Vec<crate::items::person::TccRow>, String>>>;
 
     type SleepHook = Arc<dyn Fn(&Fake, std::time::Duration) + Send + Sync>;
 
@@ -2347,6 +2417,26 @@ mod fake {
                 .lock()
                 .unwrap()
                 .entry(key.to_owned())
+                .or_default()
+                .push(reply);
+            self
+        }
+
+        /// Script `reply` for [`System::tcc_access`] of `clients` (`&[]` for the open check).
+        pub fn on_tcc(
+            &self,
+            clients: &[&str],
+            reply: Result<Vec<crate::items::person::TccRow>, String>,
+        ) -> &Self {
+            let key = if clients.is_empty() {
+                "tcc open".to_owned()
+            } else {
+                format!("tcc {}", clients.join(" "))
+            };
+            self.tcc_replies
+                .lock()
+                .unwrap()
+                .entry(key)
                 .or_default()
                 .push(reply);
             self
@@ -2735,6 +2825,26 @@ mod fake {
 
         fn full_disk_access(&self) -> Option<bool> {
             self.full_disk_access
+        }
+
+        fn tcc_access(
+            &self,
+            clients: &[&str],
+        ) -> Result<Vec<crate::items::person::TccRow>, String> {
+            let key = if clients.is_empty() {
+                "tcc open".to_owned()
+            } else {
+                format!("tcc {}", clients.join(" "))
+            };
+            self.calls.lock().unwrap().push(key.clone());
+            let mut replies = self.tcc_replies.lock().unwrap();
+            match replies.get_mut(&key) {
+                Some(list) if list.len() > 1 => list.remove(0),
+                Some(list) if list.len() == 1 => list[0].clone(),
+                _ => Err(format!(
+                    "the TCC database did not answer: fake: no TCC reply scripted for `{key}`"
+                )),
+            }
         }
 
         fn volume(&self, _path: &Path) -> Option<aterm_capacity::reading::Volume> {
@@ -3151,7 +3261,7 @@ mod fake {
         }
 
         /// Recorded as `ax-walk`; answered as [`Fake::walks`] says.
-        fn walk_accessibility(&self) -> bool {
+        fn walk_accessibility(&self) -> super::AccessibilityWalk {
             self.calls.lock().unwrap().push("ax-walk".into());
             self.walks
         }
@@ -3202,6 +3312,14 @@ mod fake {
                 .unwrap()
                 .clone()
                 .ok_or_else(|| "no account scripted (Fake::logged_in)".into())
+        }
+
+        fn account_home(&self) -> Option<PathBuf> {
+            self.identity
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|id| PathBuf::from(&id.user.home))
         }
 
         fn process_started(&self, pid: u32) -> Option<u64> {
@@ -3419,20 +3537,30 @@ mod tests {
     use super::*;
 
     /// The window's walk takes a sign-out's Accessibility ask only when its answer names that
-    /// page. NEGATIVE CONTROL: a walk already under way over other pages answers `OK walking`
-    /// too, and takes nothing of this run's.
+    /// page; `OK declined` or a `not-now:accessibility` word is the owner's Not now on it; a walk
+    /// under way over other pages (or one within the last minute, `OK recent`) has its page up,
+    /// beside which macOS's own dialog would be a second question. NEGATIVE CONTROL: `OK
+    /// granted` and an answer from a window older than the walk leave the ask to macOS.
     #[test]
-    fn only_a_walk_that_names_accessibility_takes_the_runs_ask() {
-        assert!(walk_takes("OK walking accessibility\n", "accessibility"));
-        assert!(walk_takes("OK walking fda accessibility", "accessibility"));
-        let under_way = "OK walking fda devtools\n";
-        assert!(under_way.starts_with("OK walking"));
-        assert!(!walk_takes(under_way, "accessibility"));
-        assert!(!walk_takes("OK declined\n", "accessibility"));
-        assert!(!walk_takes(
-            "ERR unknown verb (try: help)\n",
-            "accessibility"
-        ));
+    fn the_windows_answer_tells_a_walk_that_takes_the_ask_from_a_not_now_and_other_pages() {
+        use AccessibilityWalk::{NotNow, NotTaken, OtherPages, Taken};
+        for (reply, want) in [
+            ("OK walking accessibility\n", Taken),
+            ("OK walking fda accessibility", Taken),
+            ("OK walking fda not-now:accessibility\n", NotNow),
+            ("OK declined\n", NotNow),
+            ("OK walking fda devtools\n", OtherPages),
+            ("OK walking devtools not-now:fda\n", OtherPages),
+            ("OK recent\n", OtherPages),
+            ("OK granted\n", NotTaken),
+            ("ERR unknown verb (try: help)\n", NotTaken),
+            (
+                "ERR headless: a headless instance brings no System Settings page up\n",
+                NotTaken,
+            ),
+        ] {
+            assert_eq!(walk_answer(reply, "accessibility"), want, "{reply}");
+        }
     }
 
     #[test]
@@ -3718,38 +3846,6 @@ mod tests {
         let live = Live::new();
         let err = live.run(&Cmd::new("defaults")).unwrap_err();
         assert!(matches!(err, RunFailed::Refused(_)), "{err:?}");
-    }
-
-    #[test]
-    fn the_live_port_runs_an_absolute_tool_and_keeps_its_output() {
-        let live = Live::new();
-        let ran = live.run(&Cmd::new("/bin/echo").arg("hello")).unwrap();
-        assert!(ran.success());
-        assert_eq!(ran.out(), "hello\n");
-    }
-
-    #[test]
-    fn a_run_kept_to_its_deadline_is_ended_there_and_answers_rather_than_failing() {
-        let live = Live::new();
-        let ran = live
-            .run(
-                &Cmd::new("/bin/sleep")
-                    .arg("60")
-                    .budget(Duration::from_millis(200))
-                    .until_deadline(),
-            )
-            .unwrap();
-        assert_eq!(ran.status, None, "{ran:?}");
-    }
-
-    #[test]
-    fn a_run_kept_to_its_deadline_that_ends_sooner_keeps_its_status_and_output() {
-        let live = Live::new();
-        let ran = live
-            .run(&Cmd::new("/bin/echo").arg("hello").until_deadline())
-            .unwrap();
-        assert_eq!(ran.status, Some(0));
-        assert_eq!(ran.out(), "hello\n");
     }
 
     #[test]

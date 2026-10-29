@@ -302,11 +302,85 @@ fn wall_unix_s() -> i64 {
         .unwrap_or(0)
 }
 
-/// One act of the trail: the act, and when it arrived — its monotonic instant, and that of its last repeat (a repeat within the dwell of it is no new entry), its local clock time and day, formatted at receipt, and its wall second (an entry older than a day is left out of the title).
+/// The longest name of a self-claim's holder the glass keeps ([`Claimant`]).
+const CLAIMANT_BYTES: usize = 24;
+
+/// WHO DID AN ACT WHERE IT WAS NOT ATERM'S OWN HARNESS: the name a proven self-claim's holder acts under ([`aterm_agent::harness::acts::claimant_name`]: `codex-alab` for `codex-alab@4242`), kept inline so the glass stays a copy.
+pub(crate) type Claimant = crate::claude_footer::Inline<CLAIMANT_BYTES>;
+
+/// The [`Claimant`] of a proven self-claim's `holder`.
+#[must_use]
+pub(crate) fn claimant(holder: &str) -> Claimant {
+    Claimant::new(aterm_agent::harness::acts::claimant_name(holder))
+}
+
+/// AN ACT IN WORDS, NAMING WHO DID IT WHERE IT WAS NOT ATERM'S OWN HARNESS: `✓ approved` for aterm's own, `codex-alab: ✓ approved` for a self-claim's ([`TrailEntry::by`]) — the words the title's trail and a SESSIONS row's `last:` say, so no act of another agent's reads as aterm's.
+#[must_use]
+pub(crate) fn act_words(act: Act, by: Option<Claimant>) -> String {
+    match by {
+        Some(by) => format!("{}: {} {}", by.as_str(), act.glyph(), act.word()),
+        None => format!("{} {}", act.glyph(), act.word()),
+    }
+}
+
+/// A STOP AS ITS SURFACES SAY IT ([`App::shown_stop`]): the arm of ruling F's hold that stopped the typing, and who stopped where it was not aterm's own harness (a proven self-claim's holder, `codex-alab`), as [`TrailEntry::by`] names who did an act.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ShownStop {
+    pub(crate) arm: HeldBy,
+    /// A proven self-claim's holder, for its own stop; `None` for aterm's.
+    pub(crate) by: Option<Claimant>,
+}
+
+impl ShownStop {
+    /// ITS WORDS IN `form`'s PLACE, NAMING WHO STOPPED WHERE IT WAS NOT ATERM'S OWN HARNESS: [`stop_words`]' own for aterm's, led by the holder's name for a self-claim's (`codex-alab stopped typing: the same reply twice, no work`), so no stop of another agent's reads as aterm's, as [`act_words`] names who did an act. For the surfaces [`App::shown_stop`] feeds: the state line, the hover and the Overview, and a worker's tip (a chip's title and description say only aterm's own, from its glass).
+    #[must_use]
+    pub(crate) fn words(self, form: HoldForm) -> String {
+        let words = stop_words(self.arm, form);
+        match self.by {
+            Some(by) => format!("{} {words}", by.as_str()),
+            None => words,
+        }
+    }
+}
+
+/// LAND'S HOLD AS ITS SURFACES SHOW IT ([`App::shown_hold`]): the hold on the glass, and whose Land it is where that is not aterm's own harness (a proven self-claim's holder, `codex-alab`), as [`ShownStop::by`] names who stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ShownHold {
+    pub(crate) hold: HeldGlass,
+    /// A proven self-claim's holder, for its own hold; `None` for aterm's.
+    pub(crate) by: Option<Claimant>,
+}
+
+impl ShownHold {
+    /// ITS WORDS IN `form`'s PLACE ([`hold_words`]), NAMING WHOSE LAND HOLDS WHERE IT IS NOT ATERM'S OWN HARNESS'S: aterm's in its own words, a self-claim's led by its holder's name (`codex-alab: not landed yet: 2 unpushed commits · 3 nudges`, as [`act_words`] names who did an act), so no hold of another agent's reads as aterm's — unless `after`, the stop said before it on the same line, already named that holder (`codex-alab stopped typing: … · not landed yet: …`, [`ShownStop::words`]), so a line names its holder once. For the surfaces [`App::shown_hold`] feeds that say words: the state line, the hover, the Overview's held line and a worker's tip (a chip's title and description say only aterm's own, from its glass).
+    #[must_use]
+    pub(crate) fn words(
+        self,
+        need: Option<&crate::needs::HarnessAsk>,
+        form: HoldForm,
+        today: Option<i64>,
+        after: Option<ShownStop>,
+    ) -> Option<String> {
+        let words = hold_words(&self.hold, need, form, today)?;
+        Some(
+            match self
+                .by
+                .filter(|by| after.is_none_or(|stop| stop.by != Some(*by)))
+            {
+                Some(by) => format!("{}: {words}", by.as_str()),
+                None => words,
+            },
+        )
+    }
+}
+
+/// One act of the trail: the act, who did it where it was not aterm's own harness, and when it arrived — its monotonic instant, and that of its last repeat (a repeat within the dwell of it is no new entry), its local clock time and day, formatted at receipt, and its wall second (an entry older than a day is left out of the title).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Single act in the trail with its arrival and repeat timestamps.
 pub(crate) struct TrailEntry {
     pub(crate) act: Act,
+    /// A proven self-claim's holder, for its act; `None` for aterm's own.
+    pub(crate) by: Option<Claimant>,
     pub(crate) at: Instant,
     pub(crate) repeated: Instant,
     pub(crate) clock: Clock,
@@ -314,9 +388,9 @@ pub(crate) struct TrailEntry {
     pub(crate) unix: i64,
 }
 
-/// What one act moved on the glass ([`SessionGlass::take`]).
+/// What one act moved on the glass ([`SessionGlass::take_by`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-/// Glass state changes caused by [`SessionGlass::take`].
+/// Glass state changes caused by [`SessionGlass::take_by`].
 pub(crate) struct Took {
     /// Whether the lit label lit or was replaced in place.
     pub(crate) lit: bool,
@@ -351,7 +425,7 @@ pub(crate) struct SessionGlass {
     end: Option<EndGlass>,
     /// How many ends this session told: the next end's [`EndGlass::serial`].
     ends: u32,
-    /// WHY LAND STILL HOLDS (§12.3.3 item 3), as the session's loop last told it ([`on_land_held`]), with its `since` stamped once: what the SESSIONS state line, the tab's hover and the Overview, the menu bar's worker row and the chip's title (the W4 title slice) say of a landing that has not landed — each only while the session's Autopilot is Land and its chip wears `⤓ land` ([`App::shown_hold`]).
+    /// WHY LAND STILL HOLDS (§12.3.3 item 3), as the session's loop last told it ([`on_land_held`]), with its `since` stamped once: what the SESSIONS state line, the tab's hover and the Overview, the menu bar's worker row and the chip's title (the W4 title slice) and description say of a landing that has not landed — each only while the session's Autopilot is Land and its chip wears `⤓ land`, and all but the chip's title and description only while aterm holds its claim ([`App::shown_hold`], which shows a codex-alab's own hold in its place under that agent's proven claim, §14.3.3).
     hold: Option<HeldGlass>,
     /// ATERM STOPPED TYPING INTO IT (§14.3), by which arm of ruling F's hold, as the session's loop last told its standing exception (`HostNote::ResumeException`'s `held`, [`on_stopped`]): set while the hold stands, whatever its urgency, and cleared as the loop lifts it or ends. What the chip's title and description, the state line, the hover and the Overview, a worker's tip and `status held=` say ([`stop_words`]), each only while the chip carries a mode ([`App::shown_stop`]).
     stopped: Option<HeldBy>,
@@ -501,16 +575,30 @@ impl SessionGlass {
                     },
                 )
             }),
+            last_by: self.trail[0].and_then(|e| e.by),
             trail: self.trail_gen.to_le_bytes()[0],
             pause: self.pause,
             ..ChipGlass::default()
         }
     }
 
-    /// Records `act` at `at` into the trail and lit label within [`DWELL`], [`BURST`], and [`QUIET`].
+    /// [`Self::take_by`] of aterm's own act, as the tests take one.
+    #[cfg(test)]
     pub(crate) fn take(&mut self, act: Act, at: Arrival, light: bool) -> Took {
+        self.take_by(act, None, at, light)
+    }
+
+    /// Records `act` at `at`, which `by` did (a proven self-claim's holder, `Some`, or aterm's own harness), into the trail and lit label within [`DWELL`], [`BURST`], and [`QUIET`]. A repeat is the same act by the same hand: one of aterm's never joins a self-claim's entry, nor theirs aterm's.
+    pub(crate) fn take_by(
+        &mut self,
+        act: Act,
+        by: Option<Claimant>,
+        at: Arrival,
+        light: bool,
+    ) -> Took {
         if let Some(newest) = self.trail[0].as_mut()
             && newest.act == act
+            && newest.by == by
             && at.now < newest.repeated + DWELL
             && at.now < newest.at + BURST
         {
@@ -527,6 +615,7 @@ impl SessionGlass {
         self.trail.rotate_right(1);
         self.trail[0] = Some(TrailEntry {
             act,
+            by,
             at: at.now,
             repeated: at.now,
             clock: at.clock(),
@@ -579,7 +668,7 @@ impl SessionGlass {
         self.trail_gen
     }
 
-    /// THE TRAIL AS THE TITLE LISTS IT (§9.2.1): newest first, each act's glyph and word and the clock time it arrived — `✓ approved 14:05, ↻ kept going 14:02` — an entry from another local date than `today` with its weekday (`Thu 23:58`), and one older than a day (at wall second `now_unix`) left out.
+    /// THE TRAIL AS THE TITLE LISTS IT (§9.2.1): newest first, each act's glyph and word and the clock time it arrived — `✓ approved 14:05, ↻ kept going 14:02`, a self-claim's led by its holder's name (`codex-alab: ✓ approved 14:05`, [`act_words`]) — an entry from another local date than `today` with its weekday (`Thu 23:58`), and one older than a day (at wall second `now_unix`) left out.
     #[must_use]
     /// Formats the trail for the chip title, newest first, against `now_unix` and `today`.
     pub(crate) fn trail_text(&self, now_unix: i64, today: i64) -> String {
@@ -591,9 +680,7 @@ impl SessionGlass {
             if !out.is_empty() {
                 out.push_str(", ");
             }
-            out.push_str(entry.act.glyph());
-            out.push(' ');
-            out.push_str(entry.act.word());
+            out.push_str(&act_words(entry.act, entry.by));
             out.push(' ');
             if entry.day != today {
                 out.push_str(Weekday::of_days(entry.day).short());
@@ -619,6 +706,7 @@ impl SessionGlass {
         let entry = self.trail[0].filter(|e| now_unix.saturating_sub(e.unix) <= TRAIL_AGE_S)?;
         let day = (entry.day != today).then(|| Weekday::of_days(entry.day));
         Some(crate::claude_lights::spoken_last(
+            entry.by.as_ref().map(Claimant::as_str),
             entry.act,
             entry.clock,
             day,
@@ -682,13 +770,29 @@ pub(crate) fn on_act(app: &mut App, session: u64, act: Act) {
 
 /// [`on_act`] at `at`, lighting only under Cruise or Land when acts are shown.
 pub(crate) fn on_act_at(app: &mut App, session: u64, act: Act, at: Arrival) {
+    on_act_by_at(app, session, act, None, at);
+}
+
+/// A PROVEN SELF-CLAIM'S ACT ON THE GLASS: `act`, recorded by `holder` on `session`'s proven claim (`HarnessFact::SelfAct`), lights the chip and joins the trail as aterm's own act does ([`on_act`]), worded as the holder's ([`act_words`]), and owes Settings ▸ Harness its reading.
+pub(crate) fn on_self_act(app: &mut App, session: u64, act: Act, holder: &str) {
+    on_act_by_at(app, session, act, Some(claimant(holder)), Arrival::now());
+}
+
+/// [`on_act_at`] of an act `by` did ([`SessionGlass::take_by`]).
+pub(crate) fn on_act_by_at(
+    app: &mut App,
+    session: u64,
+    act: Act,
+    by: Option<Claimant>,
+    at: Arrival,
+) {
     let (_, view, _) = app.session_autopilot(session);
     let light = view.carries() && app.harness_acts_shown();
     let took = app
         .harness_glass
         .entry(session)
         .or_default()
-        .take(act, at, light);
+        .take_by(act, by, at, light);
     if took.any() {
         crate::claude_footer::post_changed(session);
     }
@@ -1062,25 +1166,81 @@ fn speakable(words: &str) -> String {
 }
 
 impl App {
-    /// LAND'S HOLD OF SESSION `session` AS ITS SURFACES SHOW IT (§12.3.3 item 3, 3b's contract in §12.3.10): the hold on its glass, only while its chip's face is `⤓ land` ([`crate::claude_lights::ChipFace::of`] over its view and glass: its own word, else the default, is Land, a harness runs it, and its task is open or unknown).
+    /// LAND'S HOLD OF SESSION `session` AS ITS SURFACES SHOW IT (§12.3.3 item 3, 3b's contract in §12.3.10; §14.3.3), told by whoever drives it, as [`Self::shown_stop`] reads a stop — while aterm holds its claim, the hold on its glass ([`SessionGlass::hold`]); under a proven self-claim, the hold that claim told of its own landing (`meta set harness_land`, [`crate::session_timeline::SessionMeta::self_land`]) while the claim stands, named for its holder — and either only while its chip's face is `⤓ land` ([`crate::claude_lights::ChipFace::of`] over its view and glass: its own word, else the default, is Land, a harness runs it, and its task is open or unknown), so a codex-alab's own landing and a person's own exchange (`landed@v1`, `left-to-person@v1`) take its hold down as they take aterm's. Nobody's with neither claim: a hold left on aterm's glass is never shown under another's claim, nor after aterm's ends.
     #[must_use]
-    /// Land hold of `session` when its mode is Land, if any.
-    pub(crate) fn shown_hold(&self, session: u64) -> Option<HeldGlass> {
-        let hold = self.harness_glass.get(&session)?.hold?;
+    pub(crate) fn shown_hold(&self, session: u64) -> Option<ShownHold> {
+        let own = self
+            .harness_glass
+            .get(&session)
+            .and_then(SessionGlass::hold);
+        let told = self.pool.get(session).and_then(|entry| {
+            let meta = entry
+                .ctx
+                .meta
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = crate::metrics::now_us();
+            meta.self_land(now).map(|hold| ShownHold {
+                hold,
+                by: meta.live_supervisor(now).map(claimant),
+            })
+        });
+        if own.is_none() && told.is_none() {
+            return None;
+        }
+        let (_, view, supervised, _) = self.session_autopilot_for(
+            session,
+            self.session_agent(session),
+            &crate::autopilot::ClaimClock::default(),
+        );
+        let hold = if supervised {
+            own.map(|hold| ShownHold { hold, by: None })
+        } else {
+            told
+        }?;
         let glass = self.chip_glass(session);
-        (crate::claude_lights::ChipFace::of(self.session_autopilot(session).1, &glass)
-            == crate::claude_lights::ChipFace::Land)
+        (crate::claude_lights::ChipFace::of(view, &glass) == crate::claude_lights::ChipFace::Land)
             .then_some(hold)
     }
 
-    /// THE STOP OF SESSION `session` AS ITS SURFACES SAY IT (§14.3): the arm on its glass ([`SessionGlass::stopped`]), only while its chip carries a mode (`∞`, `∞ ⤓18:00`, `⤓ land`: [`crate::claude_lights::ChipFace::of`] over its view and glass), never on an Off, landed or quiet chip.
+    /// THE STOP OF SESSION `session` AS ITS SURFACES SAY IT (§14.3, §14.3.2), told by whoever drives it ([`crate::autopilot::carried`]'s rule) — while aterm holds its claim, the arm on its glass ([`SessionGlass::stopped`]); under a proven self-claim, the arm that claim told of its own typing (`meta set harness_held`, [`crate::session_timeline::SessionMeta::self_held`]) while the claim stands, named for its holder — and either only while its chip carries a mode (`∞`, `∞ ⤓18:00`, `⤓ land`: [`crate::claude_lights::ChipFace::of`] over its view and glass), never on an Off, landed or quiet chip, so `status held=` and the worker row's tip say a stop exactly where the hover, the Overview and the state line, which read the face, do: a codex-alab tells its own landing and a person's own exchange (`landed@v1`, `left-to-person@v1`) onto the same face, and its stop gives way to them as aterm's does. Nobody's with neither claim.
     #[must_use]
-    pub(crate) fn shown_stop(&self, session: u64) -> Option<HeldBy> {
-        let stopped = self.harness_glass.get(&session)?.stopped?;
+    pub(crate) fn shown_stop(&self, session: u64) -> Option<ShownStop> {
+        let own = self
+            .harness_glass
+            .get(&session)
+            .and_then(SessionGlass::stopped);
+        let told = {
+            let meta = self
+                .pool
+                .get(session)?
+                .ctx
+                .meta
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = crate::metrics::now_us();
+            meta.self_held(now).map(|arm| ShownStop {
+                arm,
+                by: meta.live_supervisor(now).map(claimant),
+            })
+        };
+        if own.is_none() && told.is_none() {
+            return None;
+        }
+        let (_, view, supervised, _) = self.session_autopilot_for(
+            session,
+            self.session_agent(session),
+            &crate::autopilot::ClaimClock::default(),
+        );
+        let stop = if supervised {
+            own.map(|arm| ShownStop { arm, by: None })
+        } else {
+            told
+        }?;
         let glass = self.chip_glass(session);
-        crate::claude_lights::ChipFace::of(self.session_autopilot(session).1, &glass)
+        crate::claude_lights::ChipFace::of(view, &glass)
             .carries()
-            .then_some(stopped)
+            .then_some(stop)
     }
 
     /// THE OUTAGE WAIT OF SESSION `session` (§14.17.5.2): the wait on its glass ([`SessionGlass::waiting`]), whatever its chip's face: only a running loop tells one, and the wait's end or the loop's takes it down.

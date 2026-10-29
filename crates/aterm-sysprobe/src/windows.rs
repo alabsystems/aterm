@@ -510,6 +510,7 @@ pub fn processes(bytes: &[u8], base: u64) -> Sweep {
                         rec,
                         offset_of!(ProcessInformation64, private_page_count),
                     )),
+                    resident: None,
                     disk_read: None,
                     disk_written: None,
                     name: short_image_name(name),

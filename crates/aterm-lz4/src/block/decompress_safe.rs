@@ -98,6 +98,9 @@ pub(crate) fn decompress_internal<const USE_DICT: bool, S: Sink>(
             input_pos += literal_length;
 
             let offset = read_u16(input, &mut literal_length.clone())? as usize;
+            if offset == 0 {
+                return Err(DecompressError::OffsetOutOfBounds);
+            }
             input_pos += 2;
 
             let mut match_length = MINMATCH + (token & 0xF) as usize;
@@ -110,7 +113,9 @@ pub(crate) fn decompress_internal<const USE_DICT: bool, S: Sink>(
                 match_length -= copied;
             }
 
-            let start = output.pos().saturating_sub(offset);
+            let Some(start) = output.pos().checked_sub(offset) else {
+                return Err(DecompressError::OffsetOutOfBounds);
+            };
             if offset >= match_length {
                 output.extend_from_within(start, 18, match_length);
             } else {
@@ -123,7 +128,10 @@ pub(crate) fn decompress_internal<const USE_DICT: bool, S: Sink>(
         let mut literal_length = (token >> 4) as usize;
         if literal_length != 0 {
             if literal_length == 15 {
-                literal_length += read_integer(input, &mut input_pos)? as usize;
+                let ext = read_integer(input, &mut input_pos)? as usize;
+                literal_length = literal_length
+                    .checked_add(ext)
+                    .ok_or(DecompressError::LiteralOutOfBounds)?;
             }
 
             if literal_length > input.len() - input_pos {
@@ -131,7 +139,7 @@ pub(crate) fn decompress_internal<const USE_DICT: bool, S: Sink>(
             }
             if literal_length > output.capacity() - output.pos() {
                 return Err(DecompressError::OutputTooSmall {
-                    expected: output.pos() + literal_length,
+                    expected: output.pos().saturating_add(literal_length),
                     actual: output.capacity(),
                 });
             }
@@ -146,14 +154,28 @@ pub(crate) fn decompress_internal<const USE_DICT: bool, S: Sink>(
         let offset = read_u16(input, &mut input_pos)? as usize;
         let mut match_length = MINMATCH + (token & 0xF) as usize;
         if match_length == MINMATCH + 15 {
-            match_length += read_integer(input, &mut input_pos)? as usize;
+            let ext = read_integer(input, &mut input_pos)? as usize;
+            match_length =
+                match_length
+                    .checked_add(ext)
+                    .ok_or(DecompressError::OutputTooSmall {
+                        expected: usize::MAX,
+                        actual: output.capacity(),
+                    })?;
         }
 
-        if output.pos() + match_length > output.capacity() {
+        if output
+            .pos()
+            .checked_add(match_length)
+            .is_none_or(|end| end > output.capacity())
+        {
             return Err(DecompressError::OutputTooSmall {
-                expected: output.pos() + match_length,
+                expected: output.pos().saturating_add(match_length),
                 actual: output.capacity(),
             });
+        }
+        if offset == 0 {
+            return Err(DecompressError::OffsetOutOfBounds);
         }
         if USE_DICT && offset > output.pos() {
             let copied = copy_from_dict(output, ext_dict, offset, match_length)?;
@@ -288,12 +310,47 @@ mod test {
             decompress(&[0xFFu8; 64], 64).is_err(),
             "pure 0xFF garbage must decode to Err, not panic or wrongly Ok"
         );
+        let mut bad_match = vec![0x1Fu8, b'a', 1, 0];
+        bad_match.extend(std::iter::repeat_n(0xFFu8, 4096));
+        assert!(
+            decompress(&bad_match, 64).is_err(),
+            "corrupt match-length 0xFF run must error without panic"
+        );
         let _ = decompress(&[], 0);
     }
 
     #[test]
     fn offset_oob() {
-        decompress(&[0x10, b'a', 2, 0], 4).unwrap_err();
-        decompress(&[0x40, b'a', 1, 0], 4).unwrap_err();
+        // Slow path: offset 2 > pos 1, and offset 0 (invalid in LZ4 block format).
+        assert!(matches!(
+            decompress(&[0x10, b'a', 2, 0], 8),
+            Err(DecompressError::OffsetOutOfBounds)
+        ));
+        assert!(matches!(
+            decompress(&[0x10, b'a', 0, 0], 8),
+            Err(DecompressError::OffsetOutOfBounds)
+        ));
+
+        // Fast path (`does_token_fit`, >= 18 trailing input bytes, >= 35 free output bytes):
+        // both `offset > pos` and `offset == 0` must fail closed instead of saturating to 0.
+        let mut fast_oob = vec![0x10, b'a', 5, 0, 0xE0];
+        fast_oob.extend_from_slice(&[b'z'; 24]);
+        assert!(matches!(
+            decompress(&fast_oob, 128),
+            Err(DecompressError::OffsetOutOfBounds)
+        ));
+
+        let mut fast_zero = vec![0x10, b'a', 0, 0, 0xE0];
+        fast_zero.extend_from_slice(&[b'z'; 24]);
+        assert!(matches!(
+            decompress(&fast_zero, 128),
+            Err(DecompressError::OffsetOutOfBounds)
+        ));
+
+        // Truncated literal run (4 literals declared, 3 bytes left).
+        assert!(matches!(
+            decompress(&[0x40, b'a', 1, 0], 4),
+            Err(DecompressError::LiteralOutOfBounds)
+        ));
     }
 }

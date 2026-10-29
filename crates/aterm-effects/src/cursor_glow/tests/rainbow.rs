@@ -4,55 +4,7 @@
 //! The rainbow kitty ribbon.
 
 use super::*;
-
-fn rainbow_occupied_coverage_model() -> aterm_spec::derive::Model {
-    use aterm_spec::ty_model;
-    ty_model! {
-        RainbowOccupiedCoverage {
-            const Cap = 236;
-            const RequestedMax = 270;
-            const Buggy = 0;
-            var requested = 0;
-            var emitted = 0;
-            action Raise when (requested <= RequestedMax - 1) {
-                requested = requested + 1;
-                emitted = if requested + 1 > Cap {
-                    if Buggy == 1 { requested + 1 } else { Cap }
-                } else {
-                    requested + 1
-                };
-            }
-            invariant OccupiedBodyBounded: emitted <= Cap;
-        }
-    }
-}
-
-fn rainbow_retract_rearm_model() -> aterm_spec::derive::Model {
-    use aterm_spec::ty_model;
-    ty_model! {
-        RainbowRetractRearm {
-            const Peak = 4;
-            const Buggy = 0;
-            var mode = 0;
-            var visibility = 4;
-            var discontinuity = 0;
-            action BeginFade when (mode == 0) { mode = 1; }
-            action Fade when (mode == 1 && visibility > 0) {
-                visibility = visibility - 1;
-            }
-            action Reclaim when (mode == 1) {
-                mode = 2;
-                visibility = if Buggy == 1 { Peak } else { visibility };
-                discontinuity = if Buggy == 1 { 1 } else { 0 };
-            }
-            action Rearm when (mode == 2 && visibility <= Peak - 1) {
-                visibility = visibility + 1;
-            }
-            invariant VisibilityBounded: visibility <= Peak;
-            invariant ReversalContinuous: discontinuity == 0;
-        }
-    }
-}
+use aterm_models_effects::{rainbow_occupied_coverage_model, rainbow_retract_rearm_model};
 
 #[test]
 fn rainbow_kitty_parse_and_beam() {
@@ -79,19 +31,229 @@ fn rainbow_kitty_parse_and_beam() {
 
 #[test]
 fn rainbow_occupied_coverage_derived_model_proves_and_catches_regression() {
+    let model = rainbow_occupied_coverage_model();
+    let cap = model
+        .consts
+        .iter()
+        .find(|(name, _)| *name == "Cap")
+        .expect("Cap const")
+        .1;
+    let requested_max = model
+        .consts
+        .iter()
+        .find(|(name, _)| *name == "RequestedMax")
+        .expect("RequestedMax const")
+        .1;
     assert_eq!(
         crate::rainbow_kitty::ribbon::UNDER_COV_CAP as i64,
-        236,
+        cap,
         "RainbowOccupiedCoverage::Cap must equal ribbon::UNDER_COV_CAP"
     );
-    let model = rainbow_occupied_coverage_model();
     aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+
+    let v2_cfg =
+        crate::rainbow_kitty::Config::from_glow(&cfg_for_style_name("rainbow kitty", true), false);
+    let mut state = model.init_state();
+    assert_eq!(
+        crate::rainbow_kitty::ribbon::clamp_bed_cov(&v2_cfg, false, 0.0).round() as i64,
+        state["emitted"]
+    );
+    let mut caught_unclamped = 0usize;
+    for req in 1..=requested_max {
+        assert!(model.fire("Raise", &mut state), "Raise at {req}");
+        let actual =
+            crate::rainbow_kitty::ribbon::clamp_bed_cov(&v2_cfg, false, req as f32).round() as i64;
+        assert_eq!(actual, state["emitted"], "requested coverage {req}");
+        assert!(model.check_invariant("OccupiedBodyBounded", &state));
+        let glass_actual =
+            crate::rainbow_kitty::ribbon::clamp_bed_cov(&v2_cfg, true, req as f32).round() as i64;
+        assert_eq!(glass_actual, req.min(255), "glass requested coverage {req}");
+        if req > cap {
+            let mut unclamped = state.clone();
+            unclamped.insert("emitted", req);
+            assert!(
+                !model.check_invariant("OccupiedBodyBounded", &unclamped),
+                "negative control: unclamped request {req} must break OccupiedBodyBounded"
+            );
+            caught_unclamped += 1;
+        }
+    }
+    assert!(caught_unclamped > 0);
 }
 
 #[test]
 fn rainbow_retract_rearm_model_proves_and_catches_brightness_snap() {
+    use crate::rainbow_kitty::{
+        Config as V2Config, Ctx as V2Ctx, Dir, Event, Flow, Licence, ribbon::Ribbon,
+        timing::EDGE_IN_S,
+    };
+
     let model = rainbow_retract_rearm_model();
     aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+
+    let peak = model
+        .consts
+        .iter()
+        .find(|(name, _)| *name == "Peak")
+        .expect("Peak const")
+        .1 as usize;
+    let g = retina_geom();
+    let v2_cfg = V2Config::from_glow(&cfg_for_style_name("rainbow kitty", true), false);
+    let ctx_at = |now: Instant, caret: (u16, u16)| V2Ctx {
+        now,
+        geom: g,
+        cfg: &v2_cfg,
+        disp: 1.0,
+        birth_disp: 1.0,
+        phase: 0.0,
+        caret,
+        caret_t: 0.0,
+        caret_walk: None,
+        mend: None,
+        surge: 0.0,
+        flow: Flow::EMPTY,
+    };
+
+    let mut caught_snap = 0usize;
+    for fade_steps in 0..=peak {
+        let mut state = model.init_state();
+        let mut ribbon = Ribbon::new();
+        let t0 = Instant::now();
+        ribbon.on_event(
+            &Event::Move {
+                from: (2, 2),
+                to: (2, 10),
+                licence: Licence::Nav,
+                dir: Dir::Right,
+            },
+            t0,
+            &ctx_at(t0, (2, 10)),
+        );
+        let mut now = t0 + Duration::from_millis(150);
+        ribbon.plan(&ctx_at(now, (2, 10)));
+
+        // Abandon the wake cohort on row 2 while staying on row 2 so its cells enter retract.
+        assert!(model.fire("BeginFade", &mut state));
+        ribbon.on_event(
+            &Event::Move {
+                from: (2, 10),
+                to: (2, 20),
+                licence: Licence::Pty,
+                dir: Dir::Right,
+            },
+            now,
+            &ctx_at(now, (2, 20)),
+        );
+        ribbon.plan(&ctx_at(now, (2, 20)));
+
+        let probe_env = |r: &Ribbon, now: Instant, caret: (u16, u16)| -> f32 {
+            let ctx = ctx_at(now, caret);
+            let cell = r
+                .cells()
+                .iter()
+                .find(|c| c.row == 2 && c.col == 2)
+                .expect("probed cell (2, 2) stays live through fade and re-arm");
+            r.debug_cell_envelope(&ctx, cell)
+        };
+
+        let mut prev_env = probe_env(&ribbon, now, (2, 20));
+        for step_idx in 0..fade_steps {
+            assert!(model.fire("Fade", &mut state));
+            now += Duration::from_millis(if step_idx == 0 { 105 } else { 45 });
+            ribbon.plan(&ctx_at(now, (2, 20)));
+            let cur_env = probe_env(&ribbon, now, (2, 20));
+            assert!(
+                cur_env < prev_env,
+                "fade step {step_idx} must lower envelope: {cur_env} vs {prev_env}"
+            );
+            prev_env = cur_env;
+            assert!(model.check_invariant("VisibilityBounded", &state));
+            assert!(model.check_invariant("ReversalContinuous", &state));
+        }
+
+        // Reclaim every fading wake cell on 2..=10 at the exact reversal instant `now`.
+        let ctx_before = ctx_at(now, (2, 20));
+        let before: Vec<(u16, f32)> = ribbon
+            .cells()
+            .iter()
+            .filter(|c| c.row == 2 && (2..=9).contains(&c.col))
+            .map(|c| (c.col, ribbon.debug_cell_envelope(&ctx_before, c)))
+            .collect();
+        assert!(!before.is_empty());
+
+        assert!(model.fire("Reclaim", &mut state));
+        ribbon.on_event(
+            &Event::Move {
+                from: (2, 20),
+                to: (2, 2),
+                licence: Licence::Nav,
+                dir: Dir::Left,
+            },
+            now,
+            &ctx_at(now, (2, 2)),
+        );
+        ribbon.plan(&ctx_at(now, (2, 2)));
+        let ctx_after = ctx_at(now, (2, 2));
+        let mut any_jump = false;
+        for &(col, env_before) in &before {
+            let cell = ribbon
+                .cells()
+                .iter()
+                .find(|c| c.row == 2 && c.col == col)
+                .unwrap_or_else(|| panic!("reclaimed cell (2, {col}) missing"));
+            let env_after = ribbon.debug_cell_envelope(&ctx_after, cell);
+            if (env_after - env_before).abs() >= 1e-5 {
+                any_jump = true;
+            }
+            assert!(
+                (env_after - env_before).abs() < 1e-5,
+                "col {col} at fade_steps={fade_steps}: envelope jumped {env_before} -> {env_after}"
+            );
+        }
+        assert_eq!(i64::from(any_jump), state["discontinuity"]);
+        assert!(model.check_invariant("VisibilityBounded", &state));
+        assert!(model.check_invariant("ReversalContinuous", &state));
+
+        if fade_steps > 0 {
+            let env_before = before[0].1;
+            assert!(
+                (1.0 - env_before).abs() > 1e-3,
+                "faded envelope must sit strictly below peak before reclaim"
+            );
+            let mut snapped = state.clone();
+            snapped.insert("discontinuity", 1);
+            assert!(
+                !model.check_invariant("ReversalContinuous", &snapped),
+                "negative control: snapping faded envelope to peak breaks ReversalContinuous"
+            );
+            caught_snap += 1;
+        }
+
+        let reclaim_at = now;
+        let rearm_dt = Duration::from_secs_f32(EDGE_IN_S / (peak as f32));
+        let mut last_rearm_env = probe_env(&ribbon, now, (2, 2));
+        while (state["visibility"] as usize) < peak {
+            assert!(model.fire("Rearm", &mut state));
+            now += rearm_dt;
+            ribbon.plan(&ctx_at(now, (2, 2)));
+            let cur_env = probe_env(&ribbon, now, (2, 2));
+            assert!(
+                cur_env + 1e-6 >= last_rearm_env,
+                "re-arm envelope must climb monotonically: {cur_env} < {last_rearm_env}"
+            );
+            last_rearm_env = cur_env;
+            assert!(model.check_invariant("VisibilityBounded", &state));
+            assert!(model.check_invariant("ReversalContinuous", &state));
+        }
+        now = reclaim_at + Duration::from_secs_f32(EDGE_IN_S + 0.01);
+        ribbon.plan(&ctx_at(now, (2, 2)));
+        let settled = probe_env(&ribbon, now, (2, 2));
+        assert!(
+            (settled - 1.0).abs() < 1e-4,
+            "completed re-arm returns the cell envelope to full strength (got {settled} at fade_steps={fade_steps})"
+        );
+    }
+    assert!(caught_snap > 0);
 }
 
 fn typed_burst(
@@ -161,6 +323,7 @@ fn the_brightest_pixel_in_the_frame_is_under_the_cursor() {
                         let mut caret = CursorRainbow::default();
                         let mut over = over_engine.clone();
                         let caret_cfg = RainbowConfig {
+                            light: crate::cursor_glow::Light::OFF,
                             enabled: true,
                             intensity: 1.0,
                             blinking: flare,

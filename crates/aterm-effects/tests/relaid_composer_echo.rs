@@ -8,7 +8,7 @@ use crate::common::{Ground, ground_or};
 use crate::trail_host::{Case, MF, Outcome, case, holds_but, holds_where};
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::Terminal;
-use aterm_effects::cursor_glow::{CURSOR_WITNESS_ROWS, CursorGlow, Geom, GlowConfig, GlowStyle};
+use aterm_effects::cursor_glow::{CURSOR_WITNESS_ROWS, CursorGlow, Geom, GlowConfig};
 use aterm_effects::rainbow_kitty::TypedClass;
 use std::time::{Duration, Instant};
 
@@ -73,15 +73,8 @@ const GROUND: Ground = Ground {
 
 fn cfg() -> GlowConfig {
     ground_or(GROUND).lay(GlowConfig {
-        classic_mono: false,
-        ribbon_tall: true,
-        ribbon_flat: false,
-        enabled: true,
-        dark_theme: true,
         theme_fg: GROUND.fg,
         theme_bg: GROUND.bg,
-        style: GlowStyle::RainbowKitty,
-        color: 0x0050_FA7B,
         accent: 0x007A_A2F7,
         duration: Duration::from_millis(240),
         length: 18,
@@ -89,8 +82,7 @@ fn cfg() -> GlowConfig {
         audible: true,
         radius: 0.6,
         ring: true,
-        beam: false,
-        head_dx: 0.5,
+        ..Default::default()
     })
 }
 

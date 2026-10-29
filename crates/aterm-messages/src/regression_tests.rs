@@ -350,13 +350,20 @@ fn a_torn_line_glued_to_the_next_never_decodes() {
             .key("wire.k"),
     ));
     let ea = a.encode();
-    let cut = ea.find("title=Build fai").unwrap() + "title=Build fai".len();
-    let glued = format!("{}{}", &ea[..cut], b.encode());
-    let decoded = LogLine::decode(&glued);
-    assert!(
-        decoded.is_err(),
-        "a torn line glued to the next decoded as {decoded:?}"
-    );
+    let eb = b.encode();
+    for (cut, _) in ea
+        .char_indices()
+        .skip(1)
+        .chain(std::iter::once((ea.len(), '\0')))
+    {
+        let glued = format!("{}{eb}", &ea[..cut]);
+        let decoded = LogLine::decode(&glued);
+        assert!(
+            decoded.is_err(),
+            "a torn line at byte {cut} ({:?}) glued to the next decoded as {decoded:?}",
+            &ea[..cut]
+        );
+    }
 }
 
 #[test]

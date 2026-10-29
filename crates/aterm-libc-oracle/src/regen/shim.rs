@@ -75,8 +75,9 @@ fn integer_value(value: &str) -> Option<String> {
         .find(|c: char| !(c.is_ascii_digit() || c == '_'))
         .unwrap_or(unsigned.len());
     let (number, suffix) = unsigned.split_at(end);
+    let has_digit = number.bytes().any(|b| b.is_ascii_digit());
     let suffixed = suffix.is_empty() || INT_SUFFIXES.contains(&suffix);
-    (!number.is_empty() && suffixed).then(|| format!("{sign}{}", number.replace('_', "")))
+    (has_digit && suffixed).then(|| format!("{sign}{}", number.replace('_', "")))
 }
 
 /// A constant's value as Rust source; `None` when only its bytes can state it
@@ -170,6 +171,9 @@ fn padded(
 ) -> Result<Vec<Slot>, String> {
     let name = &record.name;
     let packed = record.repr.as_ref().and_then(|r| r.packed);
+    if packed == Some(0) {
+        return Err(format!("{name}: packed(0) is invalid"));
+    }
     let mut slots = Vec::new();
     let (mut pos, mut pads) = (0, 0);
     let mut pad = |slots: &mut Vec<Slot>, bytes: u64, types: &mut TypeSizes| {
@@ -187,8 +191,20 @@ fn padded(
         let (field_size, field_align) = *types
             .get(&field.ty)
             .ok_or_else(|| format!("no measured size for field type `{}`", field.ty))?;
-        let natural = up(pos, packed.map_or(field_align, |p| field_align.min(p)));
+        let eff_align = packed.map_or(field_align, |p| field_align.min(p));
+        let natural = up(pos, eff_align).ok_or_else(|| {
+            format!(
+                "cannot place {name}.{}: alignment {eff_align} or offset {pos} is invalid",
+                field.name
+            )
+        })?;
         if natural < want {
+            if !want.is_multiple_of(eff_align) {
+                return Err(format!(
+                    "cannot place {name}.{}: measured {want} is not aligned to {eff_align}",
+                    field.name
+                ));
+            }
             pad(&mut slots, want - pos, types);
             pos = want;
         } else if natural > want {
@@ -200,7 +216,9 @@ fn padded(
             pos = natural;
         }
         slots.push((field.name.clone(), field.ty.clone(), true));
-        pos += field_size;
+        pos = pos
+            .checked_add(field_size)
+            .ok_or_else(|| format!("{name}.{}: extent overflowed u64", field.name))?;
     }
     if size > pos {
         pad(&mut slots, size - pos, types);
@@ -594,6 +612,9 @@ mod tests {
         assert_eq!(expr(Some("_"), None), Ok(None), "only bytes can state it");
         assert!(expr(None, Some("1.5f64")).is_err());
         assert!(expr(None, Some("8i31")).is_err());
+        assert!(expr(None, Some("_")).is_err());
+        assert!(expr(None, Some("__i32")).is_err());
+        assert!(expr(None, Some("-_")).is_err());
         assert!(!is_int_literal("0x") && !is_int_literal("_1") && is_int_literal("1_000"));
     }
 
@@ -684,6 +705,16 @@ mod tests {
                 &m
             )
             .is_err()
+        );
+        m.offset.insert(("s".into(), "b".into()), 10);
+        assert!(
+            struct_lines(
+                Os::Darwin,
+                &record("s", true, &[("a", "u8"), ("b", "u32")]),
+                &m
+            )
+            .is_err(),
+            "misaligned offset past natural placement is refused"
         );
     }
 

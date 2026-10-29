@@ -641,6 +641,135 @@ fn a_bad_line_is_counted_and_never_panics() {
     assert!(HarnessStats::new(0).is_empty());
 }
 
+fn self_claimed(ts: i64, sid: &str, holder: &str, act: &str) -> String {
+    approvals::SelfClaimRow { holder, act }.to_json(ts, Some(sid))
+}
+
+/// A PROVEN SELF-CLAIM'S ACTS ARE ITS HOLDER'S, NEVER ATERM'S: in a ledger beside aterm's own
+/// rows they count under the holder's name (every process of it one name) and in the session's
+/// share, each as aterm's own act of its rule, a landing and a re-exec booked apart, a point left
+/// to a person an act that counts nothing; aterm's own counts, rows and sessions read exactly
+/// what the ledger's old rows alone read, and an act before the window counts nowhere. Each
+/// family holds a count no other family holds, so an act booked in another's slot changes what
+/// the fold reads.
+/// NEGATIVE CONTROLS: the old rows alone fold to no self-claim at all, a self-claim's row with no
+/// holder is a bad line, and the same rules typed by aterm's own loop count as aterm's.
+#[test]
+fn a_self_claims_acts_count_as_its_holders_and_never_as_aterms() {
+    let t = 10_000;
+    let old = vec![
+        said(t, RULE_READ_ONLY, Outcome::Approved, ""),
+        typed(t, RULE_CONTINUE, "keep going"),
+        said(t, "decline@v1", Outcome::Declined, "no spend"),
+    ];
+    let mut lines = old.clone();
+    let mut ts = t;
+    for (holder, act, times) in [
+        ("codex-alab@4242", "approve-all@v1", 1),
+        ("codex-alab@4242", "plan-approve@v2", 1),
+        ("codex-alab@77", "answer-recommended@v1", 1),
+        ("codex-alab@4242", "answer-long-term@v1", 1),
+        ("codex-alab@4242", "answer-short-term@v1", 1),
+        ("codex-alab@4242", "continue@v1", 1),
+        ("codex-alab@4242", "api-retry@v1", 1),
+        ("codex-alab@4242", "api-back@v1", 1),
+        ("codex-alab@4242", "usage-resume@v1", 1),
+        ("codex-alab@4242", "api-cutoff@v1", 1),
+        ("codex-alab@4242", "land@v1", 3),
+        ("codex-alab@4242", "land-nudge@v1", 2),
+        ("codex-alab@4242", "landed@v1", 6),
+        ("codex-alab@4242", "upgrade@v1", 7),
+        ("codex-alab@4242", "left-to-person@v1", 1),
+    ] {
+        for _ in 0..times {
+            lines.push(self_claimed(ts, "s-9", holder, act));
+            ts += 1;
+        }
+    }
+    lines.push(self_claimed(t - 1, "s-9", "codex-alab@4242", "continue@v1"));
+    let fold = |lines: &[String]| {
+        let mut acc = HarnessStats::per_session(t);
+        for line in lines {
+            fold_ledger_line(&mut acc, line);
+        }
+        acc.end_reading();
+        acc
+    };
+    let (both, alone) = (fold(&lines), fold(&old));
+    assert!(
+        alone.self_claimed.is_empty(),
+        "NEGATIVE CONTROL: {alone:#?}"
+    );
+    assert_eq!(counts(&both), counts(&alone), "aterm's own counts");
+    assert_eq!(
+        (
+            both.rows,
+            both.sessions,
+            both.bad,
+            &both.by_rule,
+            both.landed
+        ),
+        (
+            alone.rows,
+            alone.sessions,
+            alone.bad,
+            &alone.by_rule,
+            alone.landed
+        )
+    );
+    assert_eq!((alone.rows, alone.sessions), (3, 1));
+    let codex = SelfClaimed {
+        approved: 2,
+        answered: 3,
+        continued: 1,
+        resumed: 4,
+        land_prompts: 5,
+        landed: 6,
+        upgraded: 7,
+        acts: 29,
+    };
+    assert_eq!(
+        both.self_claimed,
+        BTreeMap::from([("codex-alab".to_string(), codex.clone())]),
+        "one name for every process of it"
+    );
+    let shares = both.by_session.as_ref().expect("shares");
+    assert_eq!(shares["s-9"].self_claimed["codex-alab"], codex);
+    assert_eq!(counts_of(&shares["s-9"]), [0; 8], "none of aterm's own");
+    assert!(shares["s-1"].self_claimed.is_empty());
+    assert_eq!(
+        alone.by_session.as_ref().map(|s| s.contains_key("s-9")),
+        Some(false)
+    );
+    let mut held = HarnessStats::new(0);
+    fold_ledger_line(&mut held, &self_claimed(t, "s-9", "", "continue@v1"));
+    assert_eq!((held.bad, held.rows), (1, 0), "NEGATIVE CONTROL: no holder");
+    assert!(held.self_claimed.is_empty());
+    let typed_by_aterm = fold(&[
+        typed(t, RULE_CONTINUE, "keep going"),
+        typed(t, "land@v1", "[aterm harness] Autopilot is set to Land …"),
+    ]);
+    assert_eq!(
+        (typed_by_aterm.continued, typed_by_aterm.land_prompts),
+        (1, 1),
+        "NEGATIVE CONTROL: aterm's own rows of the rules count as aterm's"
+    );
+    assert!(typed_by_aterm.self_claimed.is_empty());
+}
+
+fn counts_of(t: &Tally) -> [u64; 8] {
+    [
+        t.approved,
+        t.declined,
+        t.answered,
+        t.continued,
+        t.land_prompts,
+        t.landed,
+        t.resumed,
+        t.upgraded,
+    ]
+}
+
 #[test]
 fn a_window_is_cut_only_where_a_long_file_begins_inside_it() {
     let keep = approvals::KEEP_ROWS;
@@ -692,6 +821,7 @@ fn sweep_opts(home: &Path, harness_state: &Path) -> Opts {
         instances: Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
         land: false,
+        press: None,
         timings: crate::harness::Timings::FAST,
     }
 }
@@ -1269,6 +1399,7 @@ fn todays_shares_sum_to_its_totals_and_a_cut_marks_its_own_session() {
         relaunched: acc.relaunched,
         upgraded: acc.upgraded,
         last_escalated_ms: None,
+        self_claimed: BTreeMap::new(),
         cut: false,
     };
     assert_eq!(sum, totals, "{shares:#?}");

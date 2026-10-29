@@ -948,7 +948,8 @@ pub const TOOLS: &[Tool] = &[
     unprovided(
         "gitleaks",
         &[],
-        "it is the publication engine's own dependency, put where `pub stage` finds it (row 19)",
+        "it is the publication engine's own dependency, put on the PATH `pub stage` runs with \
+         (row 19)",
         "the publication engine's own guard in `pub stage` and `ship check --export`; aterm never \
          runs it (row 19)",
     ),

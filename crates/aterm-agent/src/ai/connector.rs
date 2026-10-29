@@ -130,6 +130,10 @@ pub struct Review {
     pub levels: Levels,
     /// Whether permission-level flags precede `args`.
     pub levels_first: bool,
+    /// The one level its one-shot mode runs at whatever flags it is given, where it has one
+    /// (Kimi Code's `-p` forces Never Ask): a review at any other level does not run it, since
+    /// nothing would hold it to that level.
+    pub only_at: Option<super::permission::Level>,
     /// How the request goes in.
     pub prompt: PromptVia,
     /// Where the answer comes out.
@@ -206,6 +210,30 @@ impl Cli {
     pub fn ids() -> Vec<&'static str> {
         Cli::ALL.into_iter().map(Cli::id).collect()
     }
+
+    /// Whether a renewal of one of its rows can approve the vendor's sign-in page by itself, in
+    /// a headless browser ([`SignIn::headless_page`]; Claude Code's renewal is its own).
+    #[must_use]
+    pub const fn renews_headlessly(self) -> bool {
+        match &self.accounts().signin {
+            Some(signin) => signin.headless_page,
+            None => true,
+        }
+    }
+
+    /// The `aterm harness accounts` verb that signs one of its rows in, a row `with_email` or
+    /// not: `renew` where a renewal can approve the page itself ([`Cli::renews_headlessly`]),
+    /// else `login`, which a person runs on a terminal and approves (Claude Code's refuses a row
+    /// with an email, and another CLI's `renew` signs in only a row with one). Every next step
+    /// that names how a row signs in names this verb.
+    #[must_use]
+    pub const fn sign_in_verb(self, with_email: bool) -> &'static str {
+        if with_email && self.renews_headlessly() {
+            "renew"
+        } else {
+            "login"
+        }
+    }
 }
 
 /// Every [`Cli`] row carries an accounts block: evaluated at compile time, so a row without one
@@ -219,7 +247,8 @@ pub const EVERY_CLI_POOLS: () = {
 };
 
 /// The account pool's data for one CLI (design §0): how a session is pointed at one of its
-/// logins, where its roster and store live, and what its screens say at a wall.
+/// logins and where its roster and store live. The words its runs say at a wall are the
+/// [`Connector`] row's `auth_words` and `limit_words`.
 #[derive(Debug)]
 pub struct Accounts {
     /// How a session is pointed at a login.
@@ -233,8 +262,6 @@ pub struct Accounts {
     pub store_dir: &'static str,
     /// The vendor keys a roster row may carry beside the common ones.
     pub keys: RowKeys,
-    /// The phrases its screens and exit text say at a wall.
-    pub walls: Walls,
     /// Words in the sender of the vendor's sign-in mail, for the mailbox reader.
     pub mail_senders: &'static [&'static str],
     /// The vendor's own sign-in page, where `accounts browser` opens a row's browser profile for
@@ -252,7 +279,10 @@ pub struct Accounts {
     /// What the lab measured the CLI's walls on (the limit and login-ended rows a running
     /// session ends a turn on, or the records its limits are read from), where it did. Until it
     /// has, a session of the CLI is moved only where aterm launches it (its pin, or `next:`),
-    /// never mid-session ([`crate::harness::accounts::advise_session`]).
+    /// never mid-session ([`crate::harness::accounts::advise_session`]). Its pool's sync from
+    /// the vault's fleet does not wait on it: Codex's, Grok Build's and Kimi Code's pools sync by
+    /// default on every machine the fleet lists
+    /// ([`crate::harness::accounts_sync::syncs_by_default`]).
     pub walls_measured_on: Option<&'static str>,
     /// How the harness signs one of its logins in by itself; `None` for Claude Code, whose
     /// renewal is its own (`claude auth login` through the argv0 opener).
@@ -433,35 +463,6 @@ impl Region {
     }
 }
 
-/// The phrases a CLI's screens and exit text say at a wall, lowercase and matched within a
-/// line lowercased ([`Walls::limit_in`]).
-#[derive(Debug)]
-pub struct Walls {
-    /// The usage limit is reached (a wall).
-    pub limit: &'static [&'static str],
-    /// The login has ended.
-    pub ended: &'static [&'static str],
-    /// A passing throttle, which is never a wall even where a limit phrase also matches.
-    pub transient: &'static [&'static str],
-}
-
-impl Walls {
-    /// Whether `line` says the usage limit is reached and no passing throttle.
-    #[must_use]
-    pub fn limit_in(&self, line: &str) -> bool {
-        let line = line.to_lowercase();
-        !self.transient.iter().any(|w| line.contains(w))
-            && self.limit.iter().any(|w| line.contains(w))
-    }
-
-    /// Whether `line` says the login has ended.
-    #[must_use]
-    pub fn ended_in(&self, line: &str) -> bool {
-        let line = line.to_lowercase();
-        self.ended.iter().any(|w| line.contains(w))
-    }
-}
-
 /// How the harness signs one login of a pool in by itself (design §6): the vendor's own sign-in,
 /// run in a staging home, its page URL and code read off its output by a closed grammar, and the
 /// page approved in a headless browser on the pinned hosts only.
@@ -485,6 +486,12 @@ pub struct SignIn {
     /// account up as readily as it signs one in, and says which only once it is submitted
     /// (Kimi's, design §5 (f)), so the page waits for a person.
     pub types_email: bool,
+    /// Whether the vendor's sign-in page answers aterm's headless browser: `false` where its bot
+    /// protection answers it with a block page (accounts.x.ai's Cloudflare one, design §5 (g)),
+    /// which the approver stops on (`harness::headless_oauth::block_page`) and aterm never works
+    /// around, so every renewal of a row stops for a person and `accounts login` signs one in
+    /// ([`Cli::sign_in_verb`]).
+    pub headless_page: bool,
 }
 
 impl SignIn {
@@ -592,6 +599,7 @@ const CLAUDE_AUTH_WORDS: &[&str] = &[
 ];
 
 const CLAUDE_LIMIT_WORDS: &[&str] = &[
+    "hit your 5-hour limit",
     "hit your session limit",
     "hit your weekly limit",
     "hit your limit",
@@ -607,11 +615,6 @@ pub const CLAUDE_ACCOUNTS: Accounts = Accounts {
     default_home: ".claude",
     store_dir: "accounts",
     keys: RowKeys::Plain,
-    walls: Walls {
-        limit: CLAUDE_LIMIT_WORDS,
-        ended: CLAUDE_AUTH_WORDS,
-        transient: &[],
-    },
     mail_senders: &["anthropic"],
     sign_in_page: SignInPage::Fixed("https://claude.ai/login"),
     web_session_key: None,
@@ -660,6 +663,7 @@ pub const CODEX_SIGNIN: SignIn = SignIn {
     no_opener: true,
     no_desk: &["macos"],
     types_email: true,
+    headless_page: true,
 };
 
 /// The hosts every Grok Build sign-in page is on: xAI's issuer and its accounts app, which
@@ -715,12 +719,15 @@ pub const GROK_SIGNIN: SignIn = SignIn {
     no_opener: true,
     no_desk: &["macos"],
     types_email: true,
+    headless_page: false,
 };
 
-/// Kimi Code's sign-in, its device flow, recorded on 2.3.1 (lab gate (c): with no `open` on
-/// `PATH` it opens nothing; it prints the URL, on www.kimi.ai for `--region global`, and the
-/// code on standard error, and `Logged in to <provider>.` once approved, on the line of its
-/// `Waiting for authorization to complete…`, which ends with no newline). Its telemetry and its
+/// Kimi Code's sign-in, its device flow, recorded on 2.3.1 in a scratch home with no `open` on
+/// `PATH`, where it opened nothing, and cancelled: it prints the URL, on www.kimi.ai for
+/// `--region global`, and the code on standard error. Its `Logged in to <provider>.` once
+/// approved, on the line of its `Waiting for authorization to complete…`, which ends with no
+/// newline, comes from the binary's strings
+/// (`harness/fixtures/signin/kimi-2.3.1-login-global.stderr` holds both). Its telemetry and its
 /// self-update stay off; it is never handed an identity slug or custom headers.
 pub const KIMI_SIGNIN: SignIn = SignIn {
     routes: &[Route {
@@ -748,6 +755,7 @@ pub const KIMI_SIGNIN: SignIn = SignIn {
     no_opener: true,
     no_desk: &[],
     types_email: false,
+    headless_page: true,
 };
 
 const CODEX_AUTH_WORDS: &[&str] = &[
@@ -771,10 +779,18 @@ const CODEX_LIMIT_WORDS: &[&str] = &[
 /// Codex's pool: `CODEX_AUTH_PATH` names the account's `auth.json` while `CODEX_HOME`
 /// (`~/.codex`: `config.toml`, `sessions`, `archived_sessions`, `history.jsonl`, `skills`,
 /// `rules`, `plugins`, `AGENTS.override.md`, `AGENTS.md` and `codex-alab`'s databases) stays
-/// shared across accounts. `codex-alab` reads and refreshes `auth.json` at `CODEX_AUTH_PATH`
-/// when set, falling back to `$CODEX_HOME/auth.json` for the default login, and preserves
-/// `CODEX_AUTH_PATH` in its self-claimed session record so crash relaunches stay on the same
-/// account without symlink overlays.
+/// shared across accounts. `codex-alab` from its 355ba0a940 on reads and refreshes `auth.json`
+/// at `CODEX_AUTH_PATH` when set, falling back to `$CODEX_HOME/auth.json` for the default login,
+/// and preserves `CODEX_AUTH_PATH` in its self-claimed session record so crash relaunches stay on
+/// the same account without symlink overlays. OpenAI's builds (codex-old 0.164.0 and 0.165.0,
+/// Homebrew's 0.151.0) and codex-alab 0.1.0-dev.13633 (9fef22351) ignore the variable and read
+/// and rewrite `$CODEX_HOME/auth.json` (measured 2026-10-27), and a codex-alab before its
+/// cd79a420c can still share the keyring or a `$CODEX_HOME` daemon across logins, so a launch
+/// under a row of its own runs only on a program
+/// [`crate::harness::codex_alab::auth_path_unread`] passes (one whose binary holds
+/// [`crate::harness::codex_alab::AUTH_PATH_MARK`]). A sign-in sets
+/// `CODEX_HOME` to its staging directory too ([`crate::harness::login_drive::child_env`]), so
+/// every build writes the staged login there.
 pub const CODEX_ACCOUNTS: Accounts = Accounts {
     seam: Seam::LoginFile {
         var: "CODEX_AUTH_PATH",
@@ -784,17 +800,12 @@ pub const CODEX_ACCOUNTS: Accounts = Accounts {
     default_home: ".codex",
     store_dir: "accounts-codex",
     keys: RowKeys::Flow(Flow::Browser),
-    walls: Walls {
-        limit: CODEX_LIMIT_WORDS,
-        ended: CODEX_AUTH_WORDS,
-        transient: &[],
-    },
     mail_senders: &["openai", "chatgpt"],
     // Not yet opened by a lab pass.
     sign_in_page: SignInPage::Fixed("https://auth.openai.com/log-in"),
     web_session_key: None,
     measured: true,
-    measured_on: Some("codex-alab"),
+    measured_on: Some("codex-alab from 355ba0a940 (CODEX_AUTH_PATH)"),
     walls_measured_on: Some("codex rollouts' rate_limits"),
     signin: Some(CODEX_SIGNIN),
 };
@@ -824,8 +835,7 @@ pub const CODEX_ACCOUNTS: Accounts = Accounts {
 /// proxy's status `Not authenticated.` says no login is stored too, but its two words are no
 /// phrase: the build's own log lines end on them (`announcements refresh skipped: not
 /// authenticated`), and so does much other prose. A review's failed run reads these words
-/// ([`super::review::verdict_of`]: Grok Build's row is in [`ROWS`]); no running path asks a
-/// pool's [`Walls::ended_in`] yet.
+/// ([`super::review::verdict_of`]: Grok Build's row is in [`ROWS`]).
 ///
 /// None is bare `token expired`, `re-authenticate`, ``run `grok login` `` or `sign in again`, which
 /// the build also prints where no login of the row's ended: a passing failure (``Authentication
@@ -908,11 +918,6 @@ pub const GROK_ACCOUNTS: Accounts = Accounts {
     default_home: ".grok",
     store_dir: "accounts-grok",
     keys: RowKeys::Flow(Flow::Device),
-    walls: Walls {
-        limit: GROK_LIMIT_WORDS,
-        ended: GROK_AUTH_WORDS,
-        transient: &[],
-    },
     mail_senders: &["x.ai", "xai", "grok"],
     sign_in_page: SignInPage::Fixed("https://accounts.x.ai/sign-in"),
     web_session_key: None,
@@ -922,12 +927,16 @@ pub const GROK_ACCOUNTS: Accounts = Accounts {
     signin: Some(GROK_SIGNIN),
 };
 
-/// Kimi Code's texts for an ended login. `provider managed:kimi-code has no credential configured`
-/// is what kimi 2.3.1's `-p` fails with where the home's `config.toml` names the managed login and
-/// its token is gone (`docs/measured/kimi-credentials-2026-10-24.md` §5): the managed provider is
-/// the one `kimi login` writes, so its missing token is the row's login ended. The same sentence
-/// for another provider (`provider __kimi_env__ …`, an environment model with no key, or a
-/// hand-written provider with none) is no login of the row's.
+/// Kimi Code's texts for an ended login, each standing in a `kimi.auth.*` text aterm-phase holds
+/// to the installed build. `provider managed:kimi-code has no credential configured` is what
+/// `-p` fails with where the home's `config.toml` names the managed login and its token is gone
+/// (`docs/measured/kimi-credentials-2026-10-24.md` §5, on 2.3.1;
+/// `docs/measured/kimi-review-2026-10-27.md` §3, on 2.3.3): the managed provider is the one
+/// `kimi login` writes, so its missing token is the row's login ended. The same sentence for
+/// another provider (`provider __kimi_env__ …`, an environment model with no key, or a
+/// hand-written provider with none) is no login of the row's, and neither is a provider's 401
+/// (`provider.auth_error: 401 …`), which 2.3.3 says of a hand-written provider's key. Every
+/// `run /login` 2.3.3 prints is about a login it lacks or lost.
 const KIMI_AUTH_WORDS: &[&str] = &[
     "re-login required",
     "no token for \"kimi-code\"",
@@ -936,6 +945,10 @@ const KIMI_AUTH_WORDS: &[&str] = &[
     "provider managed:kimi-code has no credential configured",
 ];
 
+/// Kimi Code's words for a usage limit: its own quota classifier's (2.3.3's
+/// `KIMI_QUOTA_EXHAUSTED_MESSAGE_PATTERNS` and `_ERROR_CODES`, held as `kimi.wall.*` anchors),
+/// so a 429 kimi gives up on after its retries (`provider.rate_limit: 429 You exceeded your
+/// current quota, …`) is a limit.
 const KIMI_LIMIT_WORDS: &[&str] = &[
     "exceeded your current quota",
     "exceeded your current token quota",
@@ -985,11 +998,6 @@ pub const KIMI_ACCOUNTS: Accounts = Accounts {
     default_home: ".kimi-code",
     store_dir: "accounts-kimi",
     keys: RowKeys::Region,
-    walls: Walls {
-        limit: KIMI_LIMIT_WORDS,
-        ended: KIMI_AUTH_WORDS,
-        transient: &["concurrent request limit"],
-    },
     mail_senders: &["kimi", "moonshot"],
     sign_in_page: SignInPage::ByRegion {
         global: "https://www.kimi.ai/",
@@ -1036,6 +1044,7 @@ pub const CLAUDE: Connector = Connector {
             plan: &["--permission-mode", "plan", "--permission-prompts", "none"],
         },
         levels_first: false,
+        only_at: None,
         prompt: PromptVia::Stdin { dash: false },
         answer: AnswerVia::Stdout,
     },
@@ -1091,6 +1100,7 @@ pub const CODEX: Connector = Connector {
             plan: &["--sandbox", "read-only"],
         },
         levels_first: false,
+        only_at: None,
         prompt: PromptVia::Stdin { dash: true },
         answer: AnswerVia::File("-o"),
     },
@@ -1128,6 +1138,7 @@ pub const AGY: Connector = Connector {
             plan: &["--mode", "plan"],
         },
         levels_first: false,
+        only_at: None,
         prompt: PromptVia::Pointer("--print"),
         answer: AnswerVia::Stdout,
     },
@@ -1169,6 +1180,7 @@ pub const MUSE: Connector = Connector {
             plan: &["--disable-write", "--disable-shell"],
         },
         levels_first: true,
+        only_at: None,
         prompt: PromptVia::File("--prompt-file"),
         answer: AnswerVia::Stdout,
     },
@@ -1212,6 +1224,7 @@ pub const GROK: Connector = Connector {
             plan: &["--permission-mode", "plan"],
         },
         levels_first: false,
+        only_at: None,
         prompt: PromptVia::File("--prompt-file"),
         answer: AnswerVia::Stdout,
     },
@@ -1222,8 +1235,14 @@ pub const GROK: Connector = Connector {
     accounts: Some(&GROK_ACCOUNTS),
 };
 
-/// Kimi Code CLI (Moonshot AI). Its flags are read from 2.3.1's `--help`; no lab pass has run
-/// them.
+/// Kimi Code CLI (Moonshot AI). Its review is measured on 2.3.3
+/// (`docs/measured/kimi-review-2026-10-27.md`; no account signed in, a loopback stand-in model):
+/// `-p` reads `request.txt` outside its working directory by the absolute path its prompt names,
+/// writes the answer alone to stdout with no escape sequence, and forces kimi's `auto`
+/// permission mode (Never Ask) on every run, refusing `--yolo`, `--auto` and `--plan` beside it
+/// (`Cannot combine --prompt with --yolo.`, exit 1): a shell command the model asks for runs
+/// unasked and `AskUserQuestion` is refused to the model, so a review runs it at yolo alone
+/// ([`Review::only_at`]), with no level flag.
 pub const KIMI: Connector = Connector {
     id: "kimi",
     product: "Kimi Code CLI",
@@ -1260,29 +1279,27 @@ pub const KIMI: Connector = Connector {
     review: Review {
         args: &["--output-format", "text"],
         levels: Levels {
-            yolo: &["--auto"],
-            edits: &["--yolo"],
+            yolo: &[],
+            edits: &[],
             ask: &[],
-            plan: &["--plan"],
+            plan: &[],
         },
         levels_first: false,
+        only_at: Some(super::permission::Level::Yolo),
         prompt: PromptVia::Pointer("-p"),
         answer: AnswerVia::Stdout,
     },
     error_lead: None,
     auth_words: KIMI_AUTH_WORDS,
     limit_words: KIMI_LIMIT_WORDS,
-    measured: false,
+    measured: true,
     accounts: Some(&KIMI_ACCOUNTS),
 };
 
 /// All connector rows; [`connections`] yields them in `VENDORS` order. Each is a program atpkg's
-/// `VENDORS` serves; [`GROK`] is one outside its default set, so a machine that never asked for
-/// it reads it as off ([`super::facts::Kept::OptIn`]), not as an install it owes. [`KIMI`] is
-/// served too and is not a connection yet: until its review and sign-in are tested here as Grok
-/// Build's are (`connector_tests`, `review_tests`, `login_tests`), only its account pool
-/// ([`Cli`]) reads it.
-pub const ROWS: &[&Connector] = &[&CLAUDE, &CODEX, &AGY, &MUSE, &GROK];
+/// `VENDORS` serves, in its default set, so a machine without one owes its install unless a
+/// person keeps it off ([`super::facts::Kept`]).
+pub const ROWS: &[&Connector] = &[&CLAUDE, &CODEX, &AGY, &MUSE, &GROK, &KIMI];
 
 /// Connector IDs in [`ROWS`] order.
 pub const IDS: [&str; ROWS.len()] = {
@@ -1312,6 +1329,51 @@ pub fn connections() -> impl Iterator<Item = &'static Connector> {
 #[must_use]
 pub fn ids() -> Vec<&'static str> {
     connections().map(|c| c.id).collect()
+}
+
+/// Whose OAuth login the home path `name` (`~/…`) is, by the product's name, as the connector
+/// rows say where each CLI keeps it: a file of [`Connector::stores`] under the CLI's
+/// [`Home::default`], or the refresh aterm journals beside one
+/// ([`crate::harness::codex_app_login::JOURNAL_SUFFIX`]), or any file under the root where an
+/// account pool keeps its rows' logins (`Store::logins_dir`: `~/.aterm/logins/<cli>`, and
+/// Claude Code's under aterm's state directory where that is in the home). Matched without
+/// case, as macOS's file system matches names. The vault refuses these as entries, the shipped
+/// executable registering this as it starts (`aterm_secrets::text::on_cli_login`): each holds a
+/// refresh token that is single-use and rotates, so a copy on another machine signs one of them
+/// out.
+#[must_use]
+pub fn login_file(name: &str) -> Option<&'static str> {
+    use std::path::{Path, PathBuf};
+    let wanted = name.strip_prefix("~/")?.to_ascii_lowercase();
+    let fold = |path: &Path| path.to_string_lossy().to_ascii_lowercase();
+    let journal = crate::harness::codex_app_login::JOURNAL_SUFFIX;
+    let unjournaled = wanted.strip_suffix(journal).unwrap_or(&wanted);
+    let stored = ROWS
+        .iter()
+        .copied()
+        .chain(Cli::ALL.map(Cli::connector))
+        .find(|row| {
+            row.stores.iter().any(|store| {
+                let file = fold(&Path::new(row.home.default).join(store));
+                wanted == file || unjournaled == file
+            })
+        });
+    if let Some(row) = stored {
+        return Some(row.product);
+    }
+    let wanted = PathBuf::from(wanted);
+    let claude_state = aterm_types::dirs::state_dir()
+        .zip(aterm_types::dirs::home_dir())
+        .and_then(|(state, home)| state.strip_prefix(home).ok().map(Path::to_path_buf))
+        .map(|state| state.join("harness").join(crate::harness::cli::HARNESS));
+    Cli::ALL.into_iter().find_map(|cli| {
+        let store = match cli {
+            Cli::Claude => crate::harness::accounts::Store::at(claude_state.as_deref()?),
+            _ => crate::harness::accounts::Store::at_for(Path::new(""), cli, Path::new("")),
+        };
+        let root = PathBuf::from(fold(&store.logins_dir()));
+        (wanted.starts_with(&root) && wanted != root).then_some(cli.connector().product)
+    })
 }
 
 impl Connector {

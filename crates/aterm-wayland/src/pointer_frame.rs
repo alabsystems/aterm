@@ -29,7 +29,7 @@ impl AxisScroll {
     #[inline]
     fn merge(&mut self, other: &Self) {
         self.absolute += other.absolute;
-        self.discrete += other.discrete;
+        self.discrete = self.discrete.saturating_add(other.discrete);
         self.stop |= other.stop;
     }
 }
@@ -478,5 +478,33 @@ mod tests {
         });
         let frame = f.feed(Raw::Frame).expect("the enter");
         assert_eq!(frame.len(), 1, "{frame:?}");
+    }
+
+    #[test]
+    fn axis_discrete_merge_saturates_instead_of_overflowing() {
+        let mut f = Frames::new(5);
+        enter(&mut f, A);
+        f.feed(Raw::AxisDiscrete {
+            axis: VERTICAL,
+            discrete: i32::MAX,
+        });
+        f.feed(Raw::AxisDiscrete {
+            axis: VERTICAL,
+            discrete: 2,
+        });
+        let frame = f.feed(Raw::Frame).expect("axis frame");
+        assert_eq!(
+            frame[1].kind,
+            PointerKind::Axis {
+                time: 0,
+                horizontal: AxisScroll::default(),
+                vertical: AxisScroll {
+                    absolute: 0.0,
+                    discrete: i32::MAX,
+                    stop: false,
+                },
+                source: None,
+            }
+        );
     }
 }

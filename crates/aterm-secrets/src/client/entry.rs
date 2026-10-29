@@ -243,7 +243,7 @@ pub fn read_verified_entry(
     expected: &Config,
     name: &str,
 ) -> crate::Result<Option<VerifiedEntry>> {
-    read_entry(paths, expected, name, true)
+    Ok(read_entry(paths, expected, name, true)?.map(|(entry, _)| entry))
 }
 
 pub(crate) fn read_reserved_entry(
@@ -251,7 +251,26 @@ pub(crate) fn read_reserved_entry(
     expected: &Config,
     name: &str,
 ) -> crate::Result<Option<VerifiedEntry>> {
+    Ok(read_entry(paths, expected, name, false)?.map(|(entry, _)| entry))
+}
+
+pub(crate) fn read_reserved_entry_and_admin(
+    paths: &Paths,
+    expected: &Config,
+    name: &str,
+) -> crate::Result<Option<(VerifiedEntry, bool)>> {
     read_entry(paths, expected, name, false)
+}
+
+fn holds_admin_locker(envelope: &envelope::Envelope, identity: &Identity) -> crate::Result<bool> {
+    let Some(locker) = envelope.admin_locker() else {
+        return Ok(false);
+    };
+    match age::decrypt(std::slice::from_ref(identity), locker.armored.as_bytes()) {
+        Ok(_) => Ok(true),
+        Err(age::AgeError::NoMatch) => Ok(false),
+        Err(error) => Err(Error::new(format!("admin locker: {error}"))),
+    }
 }
 
 fn read_entry(
@@ -259,13 +278,20 @@ fn read_entry(
     expected: &Config,
     name: &str,
     materialized: bool,
-) -> crate::Result<Option<VerifiedEntry>> {
+) -> crate::Result<Option<(VerifiedEntry, bool)>> {
     let valid = if materialized {
         text::valid_entry_name(name) && !crate::reserved_name(name)
     } else {
         text::valid_entry_name(name)
             && name.starts_with("aterm-")
-            && (!crate::reserved_name(name) || name == "aterm-fleet-code")
+            && (!crate::reserved_name(name)
+                || matches!(
+                    name,
+                    "aterm-fleet-code"
+                        | crate::SWARM_ROSTER_ENTRY
+                        | crate::SWARM_POLICY_ENTRY
+                        | crate::SWARM_LEASE_ENTRY
+                ))
     };
     if !valid {
         return Err(Error::new("invalid or reserved secret entry name"));
@@ -283,27 +309,49 @@ fn read_entry(
         return Ok(None);
     }
     let state = load_state(paths)?;
-    if state.membership != Stored::In
-        || state.failed
-        || !state.pending.is_empty()
-        || !source_bound(&config, &state)
-    {
+    if state.membership != Stored::In || state.failed || !state.pending.is_empty() {
         return Ok(None);
     }
-    let Some(cached) = held_copy(paths, &config, &state) else {
-        return Ok(None);
-    };
-    let envelope = envelope::parse(&cached)?;
     let Some(identity) = read_identity(paths)? else {
         return Ok(None);
     };
-    let Some(entries) = open_lockers(&envelope, &identity)? else {
-        return Ok(None);
+    let (entries, envelope_digest, is_admin) = if state.digest.is_none()
+        && fsx::kind(&paths.cache_file())? == fsx::Kind::Missing
+    {
+        if state.source_identity != Some(source_identity(&config)) {
+            return Ok(None);
+        }
+        let Some(configured) = super::log_entries::trusted_configured_log(paths, &config)? else {
+            return Ok(None);
+        };
+        if !super::log_entries::reads_log(&configured.log, &identity) {
+            return Ok(None);
+        }
+        let Some(entries) = configured.log.open_entries(&identity)? else {
+            return Ok(None);
+        };
+        let digest = *configured.log.genesis().id();
+        (entries, digest, false)
+    } else {
+        if !source_bound(&config, &state) {
+            return Ok(None);
+        }
+        let Some(cached) = held_copy(paths, &config, &state) else {
+            return Ok(None);
+        };
+        let envelope = envelope::parse(&cached)?;
+        let (Some(entries), _) =
+            super::log_entries::open_entries_preferring_log(paths, &config, &envelope, &identity)?
+        else {
+            return Ok(None);
+        };
+        let admin = !materialized && holds_admin_locker(&envelope, &identity)?;
+        (entries, envelope.digest(), admin)
     };
     let Some(entry) = entries.into_iter().find(|entry| entry.name == name) else {
         return Ok(None);
     };
-    let value = if materialized {
+    let (value, admin) = if materialized {
         if state.manifest.files.get(name) != Some(&materialize::digest_hex(entry.value.as_slice()))
         {
             return Ok(None);
@@ -332,24 +380,27 @@ fn read_entry(
         if !aterm_digest::ct_eq(value.as_slice(), entry.value.as_slice()) {
             return Ok(None);
         }
-        value
+        (value, false)
     } else {
         if entry.if_absent || entry.anchor.is_some() {
             return Ok(None);
         }
-        entry.value.clone()
+        (entry.value.clone(), is_admin)
     };
-    Ok(Some(VerifiedEntry {
-        value,
-        snapshot: EntrySnapshot {
-            config,
-            name: name.into(),
-            fingerprint: fingerprint(&entry),
-            recipient: identity.recipient(),
-            seq: state.seq,
-            envelope: envelope.digest(),
+    Ok(Some((
+        VerifiedEntry {
+            value,
+            snapshot: EntrySnapshot {
+                config,
+                name: name.into(),
+                fingerprint: fingerprint(&entry),
+                recipient: identity.recipient(),
+                seq: state.seq,
+                envelope: envelope_digest,
+            },
         },
-    }))
+        admin,
+    )))
 }
 
 fn field(hash: &mut aterm_digest::Sha256, bytes: &[u8]) {
@@ -395,7 +446,11 @@ pub fn read_account_bound_entry(
     let Some(reference) = &preparation.secret else {
         return Ok(None);
     };
-    if expected.name != reference.vault || expected.signer != Some(reference.signer) {
+    if expected.name != reference.vault
+        || expected.signer.is_none()
+        || (expected.signer != Some(reference.signer)
+            && !expected.followed.contains(&reference.signer))
+    {
         return Ok(None);
     }
     let Some(entry) = read_verified_entry(paths, expected, &reference.entry)? else {

@@ -2486,62 +2486,14 @@ pub(crate) mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn pid_cpu_ns_reads_a_spinning_child_in_nanoseconds() {
-        #[repr(C)]
-        struct Rusage {
-            utime: libc::timeval,
-            stime: libc::timeval,
-            _counters: [libc::c_long; 14],
-        }
-        const _: () = assert!(std::mem::size_of::<Rusage>() == 144);
-        unsafe extern "C" {
-            fn wait4(
-                pid: libc::pid_t,
-                status: *mut libc::c_int,
-                options: libc::c_int,
-                usage: *mut Rusage,
-            ) -> libc::pid_t;
-        }
-        let micros = |t: libc::timeval| {
-            u64::try_from(t.tv_sec).expect("non-negative") * 1_000_000
-                + u64::try_from(t.tv_usec).expect("non-negative")
-        };
-
-        let child = aterm_uds::spawnfd::command("/bin/sh")
-            .args(["-c", "while :; do :; done"])
-            .spawn()
-            .expect("spawn a spinning shell");
-        let pid = libc::pid_t::try_from(child.id()).expect("pid");
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while pid_cpu_ns(pid).is_none_or(|ns| ns < 50_000_000) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        // SAFETY: `kill` takes no pointers; `pid` is this test's unreaped child.
-        let stop = unsafe { libc::kill(pid, libc::SIGSTOP) };
-        let mut stopped: libc::c_int = 0;
-        // SAFETY: `stopped` is a valid out-parameter and `pid` is this test's unreaped child.
-        let waited = unsafe { libc::waitpid(pid, &mut stopped, libc::WUNTRACED) };
-        let read = pid_cpu_ns(pid);
-        // SAFETY: as above; a stopped child is still this test's to kill.
-        let kill = unsafe { libc::kill(pid, libc::SIGKILL) };
-        let mut status: libc::c_int = 0;
-        let mut usage = std::mem::MaybeUninit::<Rusage>::zeroed();
-        // SAFETY: valid out-parameters for `wait4` reaping this test's child `pid`.
-        let reaped = unsafe { wait4(pid, &mut status, 0, usage.as_mut_ptr()) };
-        std::mem::forget(child);
-        assert_eq!(
-            (stop, waited, kill, reaped),
-            (0, pid, 0, pid),
-            "stop, wait for the stop, kill, reap"
-        );
-        assert!(
-            libc::WIFSTOPPED(stopped),
-            "read while stopped: {stopped:#x}"
+        let read_pid = |id: u32| pid_cpu_ns(libc::pid_t::try_from(id).expect("pid"));
+        let (read, kernel) = aterm_uds::deadline::spin_stopped(
+            50_000_000,
+            read_pid,
+            read_pid,
+            aterm_spec::wait::MUST_HAPPEN,
         );
         let read = read.expect("readable while stopped");
-        // SAFETY: `rusage` was zeroed and filled by the successful `wait4` call.
-        let usage = unsafe { usage.assume_init() };
-        let kernel = (micros(usage.utime) + micros(usage.stime)) * 1_000;
-        assert!(kernel > 0, "the child ran");
         assert!(
             read <= kernel * 2 && read * 2 >= kernel,
             "pid_cpu_ns read {read} ns; the reap's rusage for the same stopped child is {kernel} ns"

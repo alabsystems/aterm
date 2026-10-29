@@ -226,6 +226,12 @@ impl World {
 
     /// The instance's whole environment: nothing inherited.
     fn env(&self) -> Vec<(&'static str, OsString)> {
+        // Keep the platform's usual path under this private HOME, with or without
+        // development seams. The marker also disables live fleet services here.
+        #[cfg(target_os = "macos")]
+        let state = self.home.join("Library/Application Support/aterm");
+        #[cfg(not(target_os = "macos"))]
+        let state = self.home.join(".local/state/aterm");
         let mut env = vec![
             ("HOME", self.home.clone().into_os_string()),
             ("PATH", "/usr/bin:/bin:/usr/sbin:/sbin".into()),
@@ -234,6 +240,7 @@ impl World {
             ("TERM", "xterm-256color".into()),
             ("XDG_CONFIG_HOME", self.root.join("cfg").into_os_string()),
             ("XDG_RUNTIME_DIR", self.root.join("run").into_os_string()),
+            ("ATERM_STATE_HOME", state.into_os_string()),
             ("HISTFILE", "/dev/null".into()),
         ];
         if let Some(v) = std::env::var_os("ATERM_TRACE_SPAWN") {
@@ -626,8 +633,10 @@ impl Ctl {
 }
 
 /// The session's replay checks as `temporal status` counts them, `witnessed=<n> diverged=<n>` (`-` for a count it does not report).
+/// Folds `temporal` first so witnesses recorded during the row are judged before `temporal status` is read.
 #[must_use]
 pub fn replay_checks(ctl: &Ctl) -> String {
+    let _ = ctl.call(&["temporal"]);
     let reply = ctl.call(&["temporal", "status"]);
     let line = if reply.ok() { reply.line() } else { "" };
     format!(
@@ -778,6 +787,37 @@ mod tests {
         assert!(client(60).ok(&["status"]).is_ok());
         assert_eq!(client(0).call(&["status"]).code, None);
         assert!(client(0).ok(&["status"]).is_err());
+    }
+
+    #[test]
+    fn replay_checks_folds_temporal_before_reading_status() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let log = dir.path().join("calls.log");
+        let stand_in = dir.path().join("temporal-ctl");
+        std::fs::write(
+            &stand_in,
+            format!(
+                "#!/bin/sh\nshift 5\necho \"$*\" >> '{}'\nif [ \"$*\" = 'temporal status' ]; then\n  echo 'OK recording=on witnessed=7 diverged=0'\nelse\n  echo 'OK states=3'\nfi\n",
+                log.display()
+            ),
+        )
+        .expect("write stand-in");
+        std::fs::set_permissions(
+            &stand_in,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("chmod");
+        let ctl = Ctl {
+            bin: stand_in,
+            sock: PathBuf::from("/nonexistent.sock"),
+            home: PathBuf::from("/"),
+            budget: Budget::from_now(60),
+        };
+        assert_eq!(replay_checks(&ctl), "witnessed=7 diverged=0");
+        assert_eq!(
+            std::fs::read_to_string(&log).expect("calls"),
+            "temporal\ntemporal status\n"
+        );
     }
 
     /// A child starts with no role (the band the subject ran in before), and

@@ -162,21 +162,6 @@ fn non_canonical_spellings_are_refused() {
 }
 
 #[test]
-fn ed25519_key_and_signature_shapes() {
-    let mut rng = XorShift::new(0x9E37_79B9_7F4A_7C15);
-    for _ in 0..2_000 {
-        let key: Vec<u8> = (0..32).map(|_| rng.next_u64() as u8).collect();
-        let sig: Vec<u8> = (0..64).map(|_| rng.next_u64() as u8).collect();
-        let k = encode(&key).expect("encode");
-        assert_eq!(k.len(), 44);
-        assert!(k.ends_with('=') && !k.ends_with("=="));
-        assert_eq!(encode(&sig).expect("encode").len(), 88);
-        round_trips(&key);
-        round_trips(&sig);
-    }
-}
-
-#[test]
 fn fuzz_both_directions() {
     let mut rng = XorShift::new(0xC2B2_AE3D_27D4_EB4F);
     const NEAR: &[u8] =

@@ -1366,7 +1366,11 @@ impl Dir {
             std::slice::from_raw_parts(self.buf.as_ptr().cast::<u8>(), self.buf.len() * 8)
         };
         let bad = || Errno(ffi::ERROR_INVALID_DATA);
-        let field = |off: usize, len: usize| bytes.get(at + off..at + off + len).ok_or_else(bad);
+        let field = |off: usize, len: usize| {
+            let start = at.checked_add(off).ok_or_else(bad)?;
+            let end = start.checked_add(len).ok_or_else(bad)?;
+            bytes.get(start..end).ok_or_else(bad)
+        };
         let u32_at =
             |off| field(off, 4).map(|b| u32::from_le_bytes(b.try_into().unwrap_or_default()));
         let i64_at =
@@ -1405,6 +1409,11 @@ impl Dir {
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect();
         let reparse = attributes & ffi::FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        let next_at = if next == 0 {
+            None
+        } else {
+            Some(at.checked_add(next).ok_or_else(bad)?)
+        };
         Ok((
             DirEntry {
                 name: OsString::from_wide(&name),
@@ -1414,7 +1423,7 @@ impl Dir {
                 size: u64::try_from(size).unwrap_or(0),
                 allocation: u64::try_from(allocation).unwrap_or(0),
             },
-            (next != 0).then(|| at + next),
+            next_at,
         ))
     }
 }

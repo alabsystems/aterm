@@ -358,6 +358,17 @@ impl Grid {
         self.storage.content_gen
     }
 
+    /// This grid's process-unique identity, fixed when it was built: [`Self::content_gen`] starts
+    /// at 1 on every grid, so the pair names one grid's clock. A grid parked and put back
+    /// (`?47`, `?1047`) keeps its own; every grid built gets a new one (the alternate screen a
+    /// `?1049h` enters from the main screen, or a `?47h`/`?1047h` with none parked; a checkpoint
+    /// restore's).
+    #[must_use]
+    #[inline]
+    pub const fn instance(&self) -> u64 {
+        self.storage.instance
+    }
+
     /// Get cell extras storage.
     #[must_use]
     #[inline]
@@ -375,6 +386,22 @@ impl Grid {
     #[inline]
     pub const fn mark_has_double_width(&mut self) {
         self.storage.any_double_width = true;
+    }
+
+    /// Set visible `row`'s DEC line size (`DECSWL` / `DECDWL` / `DECDHL`), maintaining
+    /// `any_double_width` and returning whether the row's line size changed.
+    pub fn set_row_line_size(&mut self, row: u16, size: crate::LineSize) -> bool {
+        let Some(r) = self.row_mut(row) else {
+            return false;
+        };
+        let changed = r.line_size() != size;
+        r.set_line_size(size);
+        if size == crate::LineSize::SingleWidth {
+            self.resync_any_double_width();
+        } else {
+            self.storage.any_double_width = true;
+        }
+        changed
     }
 
     /// Whether the grid has (or recently had) any double-width rows.
@@ -477,12 +504,6 @@ impl Grid {
     #[inline]
     pub fn enforce_hyperlink_limit(&mut self) {
         self.storage.extras_mut().enforce_hyperlink_limit();
-    }
-
-    /// Sync a row's HAS_EXTRAS cell flags from the extras map, setting and clearing.
-    #[cfg(test)]
-    pub fn sync_extras_flags_for_row(&mut self, row: u16, cols: u16) {
-        self.storage.sync_extras_flags_for_row(row, cols);
     }
 
     /// Get the current scroll region.

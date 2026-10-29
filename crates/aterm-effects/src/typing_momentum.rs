@@ -53,6 +53,19 @@ impl TypingMomentum {
         }
     }
 
+    #[inline]
+    const fn value_after(&self, dt: f32) -> f32 {
+        if self.value < SNAP_ZERO {
+            return 0.0;
+        }
+        let v = if dt == 0.0 {
+            self.value
+        } else {
+            self.value * crate::color_math::exp_f32(-dt * (1.0 / TYPING_MOMENTUM_TAU))
+        };
+        if v < SNAP_ZERO { 0.0 } else { v }
+    }
+
     /// Evaluate at `now`, decaying over [`TYPING_MOMENTUM_TAU`] and snapping below [`SNAP_ZERO`].
     #[inline]
     #[must_use]
@@ -63,25 +76,37 @@ impl TypingMomentum {
         let Some(at) = self.at else {
             return 0.0;
         };
-        let dt = now.saturating_duration_since(at).as_secs_f32();
-        let v = if dt == 0.0 {
-            self.value
-        } else {
-            self.value * crate::color_math::exp_f32(-dt * (1.0 / TYPING_MOMENTUM_TAU))
+        if at == now {
+            return self.value;
+        }
+        self.value_after(now.saturating_duration_since(at).as_secs_f32())
+    }
+
+    /// Record one printable advance at `now`, returning `(decayed_before, value_after)`.
+    #[inline]
+    pub(crate) fn advance_reading(&mut self, now: Instant) -> (f32, f32) {
+        let (decayed, gap) = match self.at {
+            Some(at) => {
+                let dt = if at == now {
+                    0.0
+                } else {
+                    now.saturating_duration_since(at).as_secs_f32()
+                };
+                (self.value_after(dt), dt)
+            }
+            None => (0.0, TYPING_MOMENTUM_CREDIT_CAP_S),
         };
-        if v < SNAP_ZERO { 0.0 } else { v }
+        let credit = TYPING_MOMENTUM_RATE * gap.min(TYPING_MOMENTUM_CREDIT_CAP_S);
+        let next = (decayed + credit).min(1.0);
+        self.value = next;
+        self.at = Some(now);
+        (decayed, next)
     }
 
     /// Record one printable advance at `now`, crediting `RATE * min(gap, CREDIT_CAP_S)`.
     #[inline]
     pub fn advance(&mut self, now: Instant) {
-        let gap = match self.at {
-            Some(at) => now.saturating_duration_since(at).as_secs_f32(),
-            None => TYPING_MOMENTUM_CREDIT_CAP_S,
-        };
-        let credit = TYPING_MOMENTUM_RATE * gap.min(TYPING_MOMENTUM_CREDIT_CAP_S);
-        self.value = (self.value(now) + credit).min(1.0);
-        self.at = Some(now);
+        let _ = self.advance_reading(now);
     }
 
     /// Record one backspace at `now`, draining [`TYPING_MOMENTUM_DELETE_DRAIN`].
@@ -130,7 +155,7 @@ impl TypingMomentum {
     pub fn reading_low_crossing(&self, threshold: f32) -> Option<Instant> {
         debug_assert!(threshold.is_finite() && (0.0..=1.0).contains(&threshold));
         let at = self.at?;
-        if self.value(at) <= threshold {
+        if self.value_after(0.0) <= threshold {
             return Some(at);
         }
         let crossing = self.low_crossing(threshold.max(SNAP_ZERO))?;
@@ -149,28 +174,43 @@ mod tests {
     #[test]
     fn accrual_is_rate_capped_so_key_repeat_cannot_outrun_typing() {
         let t0 = Instant::now();
-        let run = |gap_ms: u64| {
+        let run = |gap_ms: u64, steps: u32| {
             let mut m = TypingMomentum::default();
             m.set_value(t0, 0.0);
+            let dt = Duration::from_millis(gap_ms);
             let mut t = t0;
-            while t <= t0 + Duration::from_millis(1000) {
-                t += Duration::from_millis(gap_ms);
+            for _ in 0..steps {
+                t += dt;
                 m.advance(t);
             }
-            m.value(t0 + Duration::from_millis(1000 + gap_ms))
+            m.value(t)
         };
-        let flood = run(5);
-        let sprint = run(30);
+        let geometric = |dt_s: f32, total_s: f32| {
+            let num = 1.0 - crate::color_math::exp_f32(-total_s / TYPING_MOMENTUM_TAU);
+            let den = 1.0 - crate::color_math::exp_f32(-dt_s / TYPING_MOMENTUM_TAU);
+            (TYPING_MOMENTUM_RATE * dt_s * (num / den)).min(1.0)
+        };
+        let flood = run(5, 200);
+        let sprint = run(25, 40);
         assert!(
-            (flood - sprint).abs() < 0.02,
-            "flood {flood} vs sprint {sprint}: cadence must not change the build rate"
+            (flood - geometric(0.005, 1.0)).abs() < 1e-4,
+            "flood {flood} disagrees with closed-form geometric series"
         );
-        let ceiling = TYPING_MOMENTUM_RATE
-            * TYPING_MOMENTUM_TAU
-            * (1.0 - (-1.05_f32 / TYPING_MOMENTUM_TAU).exp());
         assert!(
-            flood <= ceiling + 0.02,
-            "flood {flood} exceeds the analytic rate ceiling {ceiling}"
+            (sprint - geometric(0.025, 1.0)).abs() < 1e-4,
+            "sprint {sprint} disagrees with closed-form geometric series"
+        );
+        assert!(
+            flood <= sprint,
+            "key-repeat flood {flood} must never outrun human sprint {sprint} over 1.0 s"
+        );
+        let continuous_floor = TYPING_MOMENTUM_RATE
+            * TYPING_MOMENTUM_TAU
+            * (1.0 - crate::color_math::exp_f32(-1.0 / TYPING_MOMENTUM_TAU));
+        let discrete_ceiling = geometric(TYPING_MOMENTUM_CREDIT_CAP_S, 1.0);
+        assert!(
+            flood >= continuous_floor && sprint <= discrete_ceiling,
+            "flood {flood} / sprint {sprint} outside [{continuous_floor}, {discrete_ceiling}]"
         );
     }
 

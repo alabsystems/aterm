@@ -13,12 +13,30 @@ use std::path::{Path, PathBuf};
 use crate::durable::Flush;
 
 /// How a new private file is published: the flush that finishes its bytes, and
-/// whether its parent's entries are synced at once or left to the caller's batch
-/// barrier (a video recording's [`PinnedDir::sync`] before its marker).
+/// when its parent's entries are synced ([`ParentSync`]).
 #[derive(Clone, Copy)]
 struct Publication {
     flush: Flush,
-    sync_parent: bool,
+    parent: ParentSync,
+}
+
+/// When a new private file's parent entries are synced, against the rename that shows it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParentSync {
+    /// After the rename, and the published name is then revalidated against
+    /// the retained path (and removed again if that fails).
+    AfterPublish,
+    /// Left to the caller's batch barrier (a video recording's [`PinnedDir::sync`] before its marker).
+    Deferred,
+    /// Before the rename, the path checked on each side of the sync while
+    /// the file is invisible: the rename that shows it is the last call that
+    /// reaches the directory by path, so a completion marker's consumer may
+    /// remove the directory the moment the marker appears (where no no-replace
+    /// rename exists, the link that shows it is followed by the unlink of its
+    /// temporary name). A best-effort sync of the retained handle then attempts
+    /// to persist the entry; it names no path, and its failure leaves the marker
+    /// in place and the visible publication successful.
+    BeforePublish,
 }
 
 /// Whether `name` is one ordinary path component that every backend may hand a handle-relative call.
@@ -82,11 +100,62 @@ fn windows_component_is_safe(name: &OsStr) -> bool {
     })
 }
 
+/// A retained entry's name now reaches a different object: a real device/inode
+/// (volume/file-index) mismatch, never a failure to look.
 fn identity_changed() -> io::Error {
     io::Error::new(
         io::ErrorKind::NotFound,
         "confined artifact directory identity changed",
     )
+}
+
+/// A failed reopen of a retained entry's name to compare its identity: a name
+/// that reaches nothing is the entry having vanished, a case of its own beside
+/// [`identity_changed`], and every other failure (`EMFILE`, `EINTR`, ...) is
+/// returned as it came, errno and all.
+fn reopen_failed(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::NotFound {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("confined artifact entry vanished: {error}"),
+        )
+    } else {
+        error
+    }
+}
+
+/// A failed `O_NOFOLLOW` reopen (with `O_DIRECTORY` for a directory) of a
+/// retained entry's name: `ELOOP` (a symlink) and `ENOTDIR` (not a directory)
+/// prove the name now reaches another kind of object, a real mismatch
+/// (`Ok(false)`); any other failure is [`reopen_failed`].
+#[cfg(unix)]
+fn reopen_mismatch(error: io::Error) -> io::Result<bool> {
+    match error.raw_os_error() {
+        Some(libc::ELOOP | libc::ENOTDIR) => Ok(false),
+        _ => Err(reopen_failed(error)),
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// The errno the next identity comparison on this thread fails with ([`fail_next_identity_probe`]).
+    static IDENTITY_PROBE_FAULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Fail the next identity comparison on this thread with `errno`, as a kernel
+/// out of descriptors or interrupted mid-call would.
+#[cfg(test)]
+fn fail_next_identity_probe(errno: i32) {
+    IDENTITY_PROBE_FAULT.set(Some(errno));
+}
+
+/// The fault [`fail_next_identity_probe`] armed, taken once; `Ok` outside tests.
+fn identity_probe_fault() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(errno) = IDENTITY_PROBE_FAULT.take() {
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+    Ok(())
 }
 
 const REMOVE_MAX_ENTRIES: usize = 16_384;
@@ -168,8 +237,8 @@ mod imp {
     use aterm_dirfd::{RenameFlags, renameat_with};
 
     use super::{
-        OsStr, OsString, Path, PathBuf, Publication, identity_changed, io, validate_component,
-        validate_open_path,
+        OsStr, OsString, ParentSync, Path, PathBuf, Publication, identity_changed,
+        identity_probe_fault, io, reopen_mismatch, validate_component, validate_open_path,
     };
 
     fn directory_flags() -> OFlags {
@@ -187,23 +256,23 @@ mod imp {
         openat(parent, name, directory_flags(), Mode::empty()).map_err(Into::into)
     }
 
-    fn is_directory(fd: &impl aterm_dirfd::AsFd) -> bool {
-        fstat(fd)
-            .ok()
-            .is_some_and(|stat| FileType::from_raw_mode(stat.st_mode).is_dir())
+    fn is_directory(fd: &impl aterm_dirfd::AsFd) -> io::Result<bool> {
+        Ok(FileType::from_raw_mode(fstat(fd)?.st_mode).is_dir())
     }
 
-    fn is_regular_file(fd: &impl aterm_dirfd::AsFd) -> bool {
-        fstat(fd)
-            .ok()
-            .is_some_and(|stat| FileType::from_raw_mode(stat.st_mode).is_file())
+    fn is_regular_file(fd: &impl aterm_dirfd::AsFd) -> io::Result<bool> {
+        Ok(FileType::from_raw_mode(fstat(fd)?.st_mode).is_file())
     }
 
-    fn same_identity(left: &impl aterm_dirfd::AsFd, right: &impl aterm_dirfd::AsFd) -> bool {
-        let (Ok(left), Ok(right)) = (fstat(left), fstat(right)) else {
-            return false;
-        };
-        left.st_dev == right.st_dev && left.st_ino == right.st_ino
+    /// Whether two descriptors reach one inode: `Ok(false)` is a real
+    /// device/inode mismatch, and a failed `fstat` returns its errno.
+    fn same_identity(
+        left: &impl aterm_dirfd::AsFd,
+        right: &impl aterm_dirfd::AsFd,
+    ) -> io::Result<bool> {
+        identity_probe_fault()?;
+        let (left, right) = (fstat(left)?, fstat(right)?);
+        Ok(left.st_dev == right.st_dev && left.st_ino == right.st_ino)
     }
 
     #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
@@ -231,13 +300,17 @@ mod imp {
         unlinkat(directory, from, AtFlags::empty()).map_err(io::Error::from)
     }
 
+    /// Whether the retained directory lost its last link; a failure to tell
+    /// returns its errno.
     #[cfg(not(target_vendor = "apple"))]
-    fn directory_was_unlinked(directory: &impl aterm_dirfd::AsFd) -> bool {
-        fstat(directory).ok().is_some_and(|stat| stat.st_nlink == 0)
+    fn directory_was_unlinked(directory: &impl aterm_dirfd::AsFd) -> io::Result<bool> {
+        Ok(fstat(directory)?.st_nlink == 0)
     }
 
+    /// Whether the retained directory is no longer reachable at the path the
+    /// kernel last knew it by; a failure to tell returns its errno.
     #[cfg(target_vendor = "apple")]
-    fn directory_was_unlinked(directory: &impl aterm_dirfd::AsFd) -> bool {
+    fn directory_was_unlinked(directory: &impl aterm_dirfd::AsFd) -> io::Result<bool> {
         use std::os::fd::AsRawFd as _;
         use std::os::unix::ffi::OsStrExt as _;
 
@@ -252,14 +325,25 @@ mod imp {
             )
         } < 0
         {
-            return false;
+            return Err(io::Error::last_os_error());
         }
         // SAFETY: Successful F_GETPATH writes a NUL-terminated path.
         let path = unsafe { std::ffi::CStr::from_ptr(path.as_ptr()) };
         let path = OsStr::from_bytes(path.to_bytes());
-        open_directory_at(CWD, path)
-            .ok()
-            .is_none_or(|current| !same_identity(&current, directory))
+        match open_directory_at(CWD, path) {
+            Ok(current) => Ok(!same_identity(&current, directory)?),
+            // Nothing there, a non-directory, or a symlink: no directory at
+            // the old path, so the retained one is not reachable through it.
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP)
+                ) =>
+            {
+                Ok(true)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     #[derive(Debug)]
@@ -331,15 +415,22 @@ mod imp {
             self.identity()
         }
 
-        fn current_name_matches(&self) -> bool {
-            openat(
+        /// Whether this entry's name still reaches the retained file:
+        /// `Ok(false)` is a real device/inode mismatch (a symlink in its place
+        /// included, [`reopen_mismatch`]), a name that reaches nothing is the
+        /// entry having vanished ([`super::reopen_failed`]), and any other failure
+        /// returns its errno.
+        fn current_name_matches(&self) -> io::Result<bool> {
+            let current = match openat(
                 self.dir.leaf(),
                 &self.name,
                 file_read_flags(),
                 Mode::empty(),
-            )
-            .ok()
-            .is_some_and(|current| same_identity(&current, &self.file))
+            ) {
+                Ok(current) => current,
+                Err(errno) => return reopen_mismatch(errno.into()),
+            };
+            same_identity(&current, &self.file)
         }
 
         /// Revalidate this entry against its already-retained parent directory.
@@ -372,7 +463,7 @@ mod imp {
         /// Remove through the retained parent and certify success only when the
         /// retained inode lost its final link.
         pub(crate) fn remove_exact(self) -> io::Result<()> {
-            if !self.current_name_matches() {
+            if !self.current_name_matches()? {
                 return Err(identity_changed());
             }
             unlinkat(self.dir.leaf(), &self.name, AtFlags::empty()).map_err(io::Error::from)?;
@@ -484,6 +575,38 @@ mod imp {
             }
             Ok(self)
         }
+
+        /// Publish a fully written temporary file at a previously absent final
+        /// name as the last call on its directory ([`ParentSync::BeforePublish`]):
+        /// the no-replace rename runs through the retained parent, so it is
+        /// confined without a check after it.
+        fn publish_as_new_last_with_hook(
+            mut self,
+            name: &OsStr,
+            after_publish: impl FnOnce(),
+        ) -> io::Result<Self> {
+            validate_component(name)?;
+            if let Err(error) = self
+                .validate_path_identity()
+                .and_then(|()| self.dir.sync())
+                .and_then(|()| self.validate_path_identity())
+            {
+                let _ = self.remove_exact();
+                return Err(error);
+            }
+            if let Err(error) =
+                rename_no_replace_with_hook(self.dir.leaf(), &self.name, name, after_publish)
+            {
+                let _ = self.remove_exact();
+                return Err(error);
+            }
+            self.name = name.to_os_string();
+            // Attempt to persist the entry through the retained descriptor alone: an
+            // fsync of a directory its consumer already removed still succeeds,
+            // and a failure here must not take back a marker someone has seen.
+            let _ = self.dir.sync();
+            Ok(self)
+        }
     }
 
     impl PinnedDir {
@@ -498,7 +621,7 @@ mod imp {
             admit: impl FnOnce(&Path) -> bool,
         ) -> io::Result<Self> {
             let expected = open_directory_at(CWD, path)?;
-            if !is_directory(&expected) {
+            if !is_directory(&expected)? {
                 return Err(io::Error::new(
                     io::ErrorKind::NotADirectory,
                     "resolved path is not a directory",
@@ -506,7 +629,7 @@ mod imp {
             }
             let canonical = std::fs::canonicalize(path)?;
             let pinned = Self::open_with_admission(&canonical, admit)?;
-            if !same_identity(&expected, pinned.leaf()) {
+            if !same_identity(&expected, pinned.leaf())? {
                 return Err(identity_changed());
             }
             Ok(pinned)
@@ -526,7 +649,7 @@ mod imp {
             #[cfg(test)]
             super::note_pinned_chain_open();
             let root = open_directory_at(CWD, Path::new("/"))?;
-            if !is_directory(&root) {
+            if !is_directory(&root)? {
                 return Err(io::Error::new(
                     io::ErrorKind::NotADirectory,
                     "filesystem root is not a directory",
@@ -551,7 +674,7 @@ mod imp {
                 #[cfg(test)]
                 super::note_pinned_chain_open();
                 let directory = open_directory_at(parent, name)?;
-                if !is_directory(&directory) {
+                if !is_directory(&directory)? {
                     return Err(io::Error::new(
                         io::ErrorKind::NotADirectory,
                         "pinned component is not a directory",
@@ -619,12 +742,12 @@ mod imp {
 
         pub(crate) fn validate_path_identity(&self) -> io::Result<()> {
             let mut current = open_directory_at(CWD, Path::new("/"))?;
-            if !same_identity(&current, self.pinned.root.as_ref()) {
+            if !same_identity(&current, self.pinned.root.as_ref())? {
                 return Err(identity_changed());
             }
             for (name, expected) in &self.pinned.components {
                 let next = open_directory_at(&current, name.as_os_str())?;
-                if !is_directory(&next) || !same_identity(&next, expected.as_ref()) {
+                if !is_directory(&next)? || !same_identity(&next, expected.as_ref())? {
                     return Err(identity_changed());
                 }
                 current = next;
@@ -644,7 +767,7 @@ mod imp {
         pub(crate) fn child(&self, name: &OsStr) -> io::Result<Self> {
             validate_component(name)?;
             let child = open_directory_at(self.leaf(), name)?;
-            if !is_directory(&child) {
+            if !is_directory(&child)? {
                 return Err(io::Error::new(
                     io::ErrorKind::NotADirectory,
                     "pinned child is not a directory",
@@ -813,7 +936,29 @@ mod imp {
                 || {},
                 Publication {
                     flush: Flush::Ordered,
-                    sync_parent: true,
+                    parent: ParentSync::AfterPublish,
+                },
+            )
+        }
+
+        /// Publish a new private completion marker as the last call on this
+        /// directory ([`ParentSync::BeforePublish`]): `after_publish` runs the
+        /// moment the marker is visible.
+        pub(crate) fn write_new_private_marker(
+            &self,
+            name: &OsStr,
+            bytes: &[u8],
+            after_publish: impl FnOnce(),
+        ) -> io::Result<PinnedFile> {
+            self.write_new_private_with_authorizer_and_hooks(
+                name,
+                bytes,
+                || true,
+                || {},
+                after_publish,
+                Publication {
+                    flush: Flush::Ordered,
+                    parent: ParentSync::BeforePublish,
                 },
             )
         }
@@ -834,7 +979,7 @@ mod imp {
                 || {},
                 Publication {
                     flush: Flush::Ordered,
-                    sync_parent: false,
+                    parent: ParentSync::Deferred,
                 },
             )
         }
@@ -856,7 +1001,7 @@ mod imp {
                 after_publish,
                 Publication {
                     flush,
-                    sync_parent: true,
+                    parent: ParentSync::AfterPublish,
                 },
             )
         }
@@ -870,7 +1015,7 @@ mod imp {
             after_publish: impl FnOnce(),
             publication: Publication,
         ) -> io::Result<PinnedFile> {
-            let Publication { flush, sync_parent } = publication;
+            let Publication { flush, parent } = publication;
             validate_component(name)?;
             static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let mut authorize = Some(authorize);
@@ -899,19 +1044,24 @@ mod imp {
                         let after_publish = after_publish
                             .take()
                             .expect("publication hook runs exactly once");
-                        let file = if sync_parent {
-                            file.publish_as_new_with_hook(name, after_publish)?
-                        } else {
-                            file.publish_as_new_at_retained_with_hook(name, after_publish)?
+                        return match parent {
+                            ParentSync::AfterPublish => {
+                                let file = file.publish_as_new_with_hook(name, after_publish)?;
+                                if let Err(error) =
+                                    self.sync().and_then(|()| file.validate_path_identity())
+                                {
+                                    let _ = file.remove_exact();
+                                    return Err(error);
+                                }
+                                Ok(file)
+                            }
+                            ParentSync::Deferred => {
+                                file.publish_as_new_at_retained_with_hook(name, after_publish)
+                            }
+                            ParentSync::BeforePublish => {
+                                file.publish_as_new_last_with_hook(name, after_publish)
+                            }
                         };
-                        if sync_parent
-                            && let Err(error) =
-                                self.sync().and_then(|()| file.validate_path_identity())
-                        {
-                            let _ = file.remove_exact();
-                            return Err(error);
-                        }
-                        return Ok(file);
                     }
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(error) => return Err(error),
@@ -1024,7 +1174,7 @@ mod imp {
             validate_component(name).is_ok()
                 && openat(self.leaf(), name, file_read_flags(), Mode::empty())
                     .ok()
-                    .is_some_and(|fd| is_regular_file(&fd))
+                    .is_some_and(|fd| matches!(is_regular_file(&fd), Ok(true)))
         }
 
         /// Hard-bounded enumeration.
@@ -1120,13 +1270,13 @@ mod imp {
                     Ok(child) => child
                         .remove_contents(budget, depth + 1, removed)
                         .and_then(|()| {
-                            if !self.current_child_matches(&name, &child) {
+                            if !self.current_child_matches(&name, &child)? {
                                 return Err(identity_changed());
                             }
                             unlinkat(self.leaf(), &name, AtFlags::REMOVEDIR)
                                 .map_err(io::Error::from)?;
                             *removed = removed.saturating_add(1);
-                            if !directory_was_unlinked(child.leaf()) {
+                            if !directory_was_unlinked(child.leaf())? {
                                 return Err(identity_changed());
                             }
                             Ok(())
@@ -1165,11 +1315,11 @@ mod imp {
             let mut budget = super::REMOVE_MAX_ENTRIES;
             let mut removed = 0;
             child.remove_contents(&mut budget, 0, &mut removed)?;
-            if !self.current_child_matches(name, &child) {
+            if !self.current_child_matches(name, &child)? {
                 return Err(identity_changed());
             }
             unlinkat(self.leaf(), name, AtFlags::REMOVEDIR).map_err(io::Error::from)?;
-            if !directory_was_unlinked(child.leaf()) {
+            if !directory_was_unlinked(child.leaf())? {
                 return Err(identity_changed());
             }
             Ok(())
@@ -1180,11 +1330,11 @@ mod imp {
             let mut budget = super::REMOVE_MAX_ENTRIES;
             let mut removed = 0;
             child.remove_contents(&mut budget, 0, &mut removed)?;
-            if !self.current_child_matches(name, child) {
+            if !self.current_child_matches(name, child)? {
                 return Err(identity_changed());
             }
             unlinkat(self.leaf(), name, AtFlags::REMOVEDIR).map_err(io::Error::from)?;
-            if !directory_was_unlinked(child.leaf()) {
+            if !directory_was_unlinked(child.leaf())? {
                 return Err(identity_changed());
             }
             Ok(())
@@ -1205,12 +1355,12 @@ mod imp {
             after_check: impl FnOnce(),
         ) -> io::Result<()> {
             validate_component(name)?;
-            if !self.current_child_matches(name, child) {
+            if !self.current_child_matches(name, child)? {
                 return Err(identity_changed());
             }
             after_check();
             unlinkat(self.leaf(), name, AtFlags::REMOVEDIR).map_err(io::Error::from)?;
-            if !directory_was_unlinked(child.leaf()) {
+            if !directory_was_unlinked(child.leaf())? {
                 return Err(identity_changed());
             }
             Ok(())
@@ -1226,11 +1376,22 @@ mod imp {
             self.remove_empty_child_exact_with_hook_inner(name, child, after_check)
         }
 
-        pub(crate) fn current_child_matches(&self, name: &OsStr, expected: &Self) -> bool {
-            validate_component(name).is_ok()
-                && open_directory_at(self.leaf(), name)
-                    .ok()
-                    .is_some_and(|current| same_identity(&current, expected.leaf()))
+        /// Whether `name` here still reaches the directory `expected` retains:
+        /// `Ok(false)` is a real device/inode mismatch (a symlink or a
+        /// non-directory in its place included, [`reopen_mismatch`]), a name
+        /// that reaches nothing is the child having vanished
+        /// ([`super::reopen_failed`]), and any other failure returns its errno.
+        pub(crate) fn current_child_matches(
+            &self,
+            name: &OsStr,
+            expected: &Self,
+        ) -> io::Result<bool> {
+            validate_component(name)?;
+            let current = match open_directory_at(self.leaf(), name) {
+                Ok(current) => current,
+                Err(error) => return reopen_mismatch(error),
+            };
+            same_identity(&current, expected.leaf())
         }
 
         pub(crate) fn rename_child_exact(
@@ -1241,11 +1402,11 @@ mod imp {
         ) -> io::Result<()> {
             validate_component(from)?;
             validate_component(to)?;
-            if !self.current_child_matches(from, expected) {
+            if !self.current_child_matches(from, expected)? {
                 return Err(identity_changed());
             }
             self.rename(from, to)?;
-            if !self.current_child_matches(to, expected) {
+            if !self.current_child_matches(to, expected)? {
                 return Err(identity_changed());
             }
             Ok(())
@@ -1308,7 +1469,7 @@ mod imp {
             let fd = openat(self.leaf(), name, flags, Mode::RUSR | Mode::WUSR)
                 .map_err(io::Error::from)?;
             let file = std::fs::File::from(fd);
-            if !is_regular_file(&file) {
+            if !is_regular_file(&file)? {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "a private file is not a regular file",
@@ -1323,7 +1484,7 @@ mod imp {
             let fd = openat(self.leaf(), name, file_read_flags(), Mode::empty())
                 .map_err(io::Error::from)?;
             let file = std::fs::File::from(fd);
-            if !is_regular_file(&file) {
+            if !is_regular_file(&file)? {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "not a regular file",
@@ -1368,8 +1529,8 @@ mod imp {
     use crate::durable::Flush;
 
     use super::{
-        OsStr, OsString, Path, PathBuf, Publication, identity_changed, io, validate_component,
-        validate_open_path,
+        OsStr, OsString, ParentSync, Path, PathBuf, Publication, identity_changed,
+        identity_probe_fault, io, reopen_failed, validate_component, validate_open_path,
     };
 
     const FILE_SHARE_READ: u32 = 0x0000_0001;
@@ -1540,6 +1701,17 @@ mod imp {
     }
 
     fn probe_directory(path: &Path) -> io::Result<std::fs::File> {
+        probe_directory_or_other(path)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "probed path is a reparse point or not a directory",
+            )
+        })
+    }
+
+    /// Open `path` to compare its identity: `None` when it now reaches a
+    /// reparse point or a non-directory, another kind of object.
+    fn probe_directory_or_other(path: &Path) -> io::Result<Option<std::fs::File>> {
         let file = std::fs::OpenOptions::new()
             .access_mode(GENERIC_READ)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
@@ -1547,19 +1719,17 @@ mod imp {
             .open(path)?;
         let metadata = file.metadata()?;
         if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "probed path is a reparse point or not a directory",
-            ));
+            return Ok(None);
         }
-        Ok(file)
+        Ok(Some(file))
     }
 
-    fn same_identity(left: &std::fs::File, right: &std::fs::File) -> bool {
-        file_identity(left)
-            .ok()
-            .zip(file_identity(right).ok())
-            .is_some_and(|(left, right)| (left.volume, left.index) == (right.volume, right.index))
+    /// Whether two handles reach one file: `Ok(false)` is a real
+    /// volume/file-index mismatch, and a failed query returns its OS error.
+    fn same_identity(left: &std::fs::File, right: &std::fs::File) -> io::Result<bool> {
+        identity_probe_fault()?;
+        let (left, right) = (file_identity(left)?, file_identity(right)?);
+        Ok((left.volume, left.index) == (right.volume, right.index))
     }
 
     /// Open `<parent>\<name>` with DELETE for one rename or removal, and prove
@@ -1575,8 +1745,9 @@ mod imp {
             .access_mode(FILE_READ_ATTRIBUTES | DELETE_ACCESS)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)?;
-        if !same_identity(&file, expected) {
+            .open(path)
+            .map_err(reopen_failed)?;
+        if !same_identity(&file, expected)? {
             return Err(identity_changed());
         }
         ensure_direct_child(parent, &file)?;
@@ -1681,7 +1852,7 @@ mod imp {
         /// The name still reaches this exact file.
         pub(crate) fn validate_entry_identity_at_retained(&self) -> io::Result<()> {
             let current = probe_regular_file(&self.dir.path.join(&self.name))?;
-            if !same_identity(&current, &self.file) {
+            if !same_identity(&current, &self.file)? {
                 return Err(identity_changed());
             }
             ensure_direct_child(self.dir.leaf(), &self.file)
@@ -1702,7 +1873,7 @@ mod imp {
             self.validate_path_identity()?;
             target.validate_path_identity()?;
             let outgoing = open_disposable(&self.dir.path.join(&self.name))?;
-            if !same_identity(&outgoing, &self.file) {
+            if !same_identity(&outgoing, &self.file)? {
                 return Err(identity_changed());
             }
             ensure_direct_child(self.dir.leaf(), &outgoing)?;
@@ -1780,6 +1951,39 @@ mod imp {
             }
             Ok(self)
         }
+
+        /// Publish a fully written temporary file at a previously absent final
+        /// name as the last call on its directory ([`ParentSync::BeforePublish`]).
+        /// The rename resolves its destination by path, so a handle-only proof
+        /// that the file landed in the retained directory precedes `after_publish`;
+        /// nothing reopens the directory by path once the file is visible.
+        fn publish_as_new_last_with_hook(
+            mut self,
+            name: &OsStr,
+            after_publish: impl FnOnce(),
+        ) -> io::Result<Self> {
+            validate_component(name)?;
+            if let Err(error) = self
+                .validate_path_identity()
+                .and_then(|()| self.dir.sync())
+                .and_then(|()| self.validate_path_identity())
+            {
+                let _ = self.remove_exact();
+                return Err(error);
+            }
+            if let Err(error) = rename_file_handle(&self.file, &self.dir.path, name, false)
+                .and_then(|()| ensure_direct_child(self.dir.leaf(), &self.file))
+            {
+                let _ = self.remove_exact();
+                return Err(error);
+            }
+            self.name = name.to_os_string();
+            after_publish();
+            // Attempt to persist the entry through the retained handle alone; a
+            // failure here must not take back a marker someone has seen.
+            let _ = self.dir.sync();
+            Ok(self)
+        }
     }
 
     impl PinnedDir {
@@ -1796,7 +2000,7 @@ mod imp {
             let expected = open_directory(path)?;
             let canonical = std::fs::canonicalize(path)?;
             let pinned = Self::open_with_admission(&canonical, admit)?;
-            if !same_identity(&expected, pinned.leaf()) {
+            if !same_identity(&expected, pinned.leaf())? {
                 return Err(identity_changed());
             }
             Ok(pinned)
@@ -1860,7 +2064,7 @@ mod imp {
         pub(crate) fn validate_path_identity(&self) -> io::Result<()> {
             for (path, expected) in &self.pinned.components {
                 let current = probe_directory(path)?;
-                if !same_identity(&current, expected.as_ref()) {
+                if !same_identity(&current, expected.as_ref())? {
                     return Err(identity_changed());
                 }
             }
@@ -1936,7 +2140,7 @@ mod imp {
                 ));
             }
             let current = probe_regular_file(&path)?;
-            if !same_identity(&file, &current) {
+            if !same_identity(&file, &current)? {
                 return Err(identity_changed());
             }
             ensure_direct_child(self.leaf(), &file)?;
@@ -2115,7 +2319,29 @@ mod imp {
                 || {},
                 Publication {
                     flush: Flush::Ordered,
-                    sync_parent: true,
+                    parent: ParentSync::AfterPublish,
+                },
+            )
+        }
+
+        /// Publish a new private completion marker as the last call on this
+        /// directory ([`ParentSync::BeforePublish`]): `after_publish` runs the
+        /// moment the marker is visible.
+        pub(crate) fn write_new_private_marker(
+            &self,
+            name: &OsStr,
+            bytes: &[u8],
+            after_publish: impl FnOnce(),
+        ) -> io::Result<PinnedFile> {
+            self.write_new_private_with_authorizer_and_hooks(
+                name,
+                bytes,
+                || true,
+                || {},
+                after_publish,
+                Publication {
+                    flush: Flush::Ordered,
+                    parent: ParentSync::BeforePublish,
                 },
             )
         }
@@ -2135,7 +2361,7 @@ mod imp {
                 || {},
                 Publication {
                     flush: Flush::Ordered,
-                    sync_parent: false,
+                    parent: ParentSync::Deferred,
                 },
             )
         }
@@ -2156,7 +2382,7 @@ mod imp {
                 after_publish,
                 Publication {
                     flush,
-                    sync_parent: true,
+                    parent: ParentSync::AfterPublish,
                 },
             )
         }
@@ -2170,7 +2396,7 @@ mod imp {
             after_publish: impl FnOnce(),
             publication: Publication,
         ) -> io::Result<PinnedFile> {
-            let Publication { flush, sync_parent } = publication;
+            let Publication { flush, parent } = publication;
             validate_component(name)?;
             static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let mut authorize = Some(authorize);
@@ -2183,7 +2409,7 @@ mod imp {
                     &temporary,
                     bytes,
                     &mut after_temp_create,
-                    sync_parent,
+                    parent != ParentSync::Deferred,
                     flush,
                 ) {
                     Ok(file) => {
@@ -2200,19 +2426,24 @@ mod imp {
                         let after_publish = after_publish
                             .take()
                             .expect("publication hook runs exactly once");
-                        let file = if sync_parent {
-                            file.publish_as_new_with_hook(name, after_publish)?
-                        } else {
-                            file.publish_as_new_at_retained_with_hook(name, after_publish)?
+                        return match parent {
+                            ParentSync::AfterPublish => {
+                                let file = file.publish_as_new_with_hook(name, after_publish)?;
+                                if let Err(error) =
+                                    self.sync().and_then(|()| file.validate_path_identity())
+                                {
+                                    let _ = file.remove_exact();
+                                    return Err(error);
+                                }
+                                Ok(file)
+                            }
+                            ParentSync::Deferred => {
+                                file.publish_as_new_at_retained_with_hook(name, after_publish)
+                            }
+                            ParentSync::BeforePublish => {
+                                file.publish_as_new_last_with_hook(name, after_publish)
+                            }
                         };
-                        if sync_parent
-                            && let Err(error) =
-                                self.sync().and_then(|()| file.validate_path_identity())
-                        {
-                            let _ = file.remove_exact();
-                            return Err(error);
-                        }
-                        return Ok(file);
                     }
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(error) => return Err(error),
@@ -2432,15 +2663,23 @@ mod imp {
             )?)
         }
 
-        pub(crate) fn current_child_matches(&self, name: &OsStr, expected: &Self) -> bool {
-            validate_component(name).is_ok()
-                && probe_directory(&self.path.join(name)).is_ok_and(|current| {
-                    expected
-                        .pinned
-                        .components
-                        .last()
-                        .is_some_and(|(_, expected)| same_identity(&current, expected))
-                })
+        /// Whether `name` here still reaches the directory `expected` retains:
+        /// `Ok(false)` is a real volume/file-index mismatch (a reparse point or
+        /// a non-directory in its place included), a name that reaches
+        /// nothing is the child having vanished ([`reopen_failed`]), and any
+        /// other failure returns its OS error.
+        pub(crate) fn current_child_matches(
+            &self,
+            name: &OsStr,
+            expected: &Self,
+        ) -> io::Result<bool> {
+            validate_component(name)?;
+            let Some(current) =
+                probe_directory_or_other(&self.path.join(name)).map_err(reopen_failed)?
+            else {
+                return Ok(false);
+            };
+            same_identity(&current, expected.leaf())
         }
 
         pub(crate) fn rename_child_exact(
@@ -2457,7 +2696,7 @@ mod imp {
             let landed = ensure_direct_child(self.leaf(), &handle);
             drop(handle);
             landed?;
-            if !self.current_child_matches(to, expected) {
+            if !self.current_child_matches(to, expected)? {
                 return Err(identity_changed());
             }
             Ok(())
@@ -2765,6 +3004,83 @@ mod shared_backend_contract_tests {
         assert!(!root.join(tombstone).exists());
         assert!(!root.join(name).exists());
         drop(pinned);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An identity probe that could not look says why: the OS error passes
+    /// through as it came, a child that vanished says it vanished, and only a
+    /// real replacement reads as "identity changed".
+    #[test]
+    fn a_failed_identity_probe_names_its_error_not_a_replacement() {
+        #[cfg(unix)]
+        const TOO_MANY_OPEN_FILES: i32 = libc::EMFILE;
+        #[cfg(windows)]
+        const TOO_MANY_OPEN_FILES: i32 = 4; // ERROR_TOO_MANY_OPEN_FILES
+        let root = unique_dir("identity-probe-error");
+        let name = std::ffi::OsStr::new("recording");
+        let tombstone = std::ffi::OsStr::new(".prune-recording");
+        std::fs::create_dir_all(root.join(name)).unwrap();
+        let pinned = PinnedDir::open(&root).unwrap();
+        let recording = pinned.child(name).unwrap();
+        let injected = std::io::Error::from_raw_os_error(TOO_MANY_OPEN_FILES).to_string();
+
+        super::fail_next_identity_probe(TOO_MANY_OPEN_FILES);
+        let error = pinned
+            .rename_child_exact(name, &recording, tombstone)
+            .expect_err("a probe that could not look certifies no rename");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(TOO_MANY_OPEN_FILES),
+            "the errno passes through: {error}"
+        );
+        assert!(error.to_string().contains(&injected), "{error}");
+        super::fail_next_identity_probe(TOO_MANY_OPEN_FILES);
+        let error = pinned
+            .remove_empty_child_exact(name, &recording)
+            .expect_err("a probe that could not look certifies no removal");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(TOO_MANY_OPEN_FILES),
+            "the errno passes through: {error}"
+        );
+        assert!(root.join(name).is_dir(), "a failed probe moves nothing");
+
+        std::fs::rename(root.join(name), root.join("moved")).unwrap();
+        let error = pinned
+            .remove_empty_child_exact(name, &recording)
+            .expect_err("a vanished child is not removed");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("vanished"), "{error}");
+        assert!(!error.to_string().contains("identity changed"), "{error}");
+
+        std::fs::create_dir(root.join(name)).unwrap();
+        let error = pinned
+            .rename_child_exact(name, &recording, tombstone)
+            .expect_err("a replaced child is not renamed");
+        assert!(error.to_string().contains("identity changed"), "{error}");
+        assert!(root.join(name).is_dir() && root.join("moved").is_dir());
+        assert!(!root.join(tombstone).exists());
+
+        std::fs::remove_dir(root.join(name)).unwrap();
+        std::fs::write(root.join(name), b"").unwrap();
+        let error = pinned
+            .remove_empty_child_exact(name, &recording)
+            .expect_err("a child replaced by a file is not removed");
+        assert!(error.to_string().contains("identity changed"), "{error}");
+        assert!(root.join(name).is_file(), "the file in its place stays");
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(root.join(name)).unwrap();
+            std::os::unix::fs::symlink(root.join("moved"), root.join(name)).unwrap();
+            let error = pinned
+                .rename_child_exact(name, &recording, tombstone)
+                .expect_err("a child replaced by a symlink to it is not renamed");
+            assert!(error.to_string().contains("identity changed"), "{error}");
+            assert!(root.join("moved").is_dir() && !root.join(tombstone).exists());
+        }
+
+        drop((recording, pinned));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3795,6 +4111,87 @@ mod tests {
         let pinned = PinnedDir::open(&root).unwrap();
         assert!(pinned.names(4).is_err());
         assert_eq!(pinned.names(5).unwrap().len(), 5);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A completion marker's rename is the last call on its directory, so a
+    /// consumer that removes the directory the moment the marker appears fails
+    /// nothing; an ordinary publication still checks its path after the rename
+    /// and does fail (the negative control).
+    #[test]
+    fn a_marker_consumer_may_remove_the_directory_at_once() {
+        let consume = |root: &std::path::Path| {
+            let done = root.join("snapshot.png.done");
+            let root = root.to_path_buf();
+            move || {
+                assert!(done.is_file(), "the marker is visible");
+                std::fs::remove_dir_all(&root).unwrap();
+            }
+        };
+        let name = std::ffi::OsStr::new("snapshot.png.done");
+
+        let root = unique_dir("marker-last");
+        std::fs::create_dir_all(&root).unwrap();
+        let pinned = PinnedDir::open(&root).unwrap();
+        pinned
+            .write_new_private_marker(name, b"done", consume(&root))
+            .expect("nothing follows the marker's rename");
+        assert!(!root.exists());
+
+        let root = unique_dir("marker-ordinary");
+        std::fs::create_dir_all(&root).unwrap();
+        let pinned = PinnedDir::open(&root).unwrap();
+        let error = pinned
+            .write_new_private_with_hooks(
+                name,
+                b"done",
+                || {},
+                consume(&root),
+                crate::durable::Flush::Ordered,
+            )
+            .expect_err("an ordinary publication revalidates its path after the rename");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+    }
+
+    /// A retained file's exact removal says why it could not check its name:
+    /// the errno, or that the file vanished. Only another object at its name,
+    /// a symlink included, reads as "identity changed".
+    #[test]
+    fn exact_file_removal_names_its_probe_error() {
+        let root = unique_dir("file-probe-error");
+        std::fs::create_dir_all(&root).unwrap();
+        let pinned = PinnedDir::open(&root).unwrap();
+        let name = std::ffi::OsStr::new("index.json");
+        drop(pinned.write_new_private(name, b"{}").unwrap());
+
+        let file = pinned.pin_private_file(name).unwrap();
+        super::fail_next_identity_probe(libc::EINTR);
+        let error = file
+            .remove_exact()
+            .expect_err("a probe that could not look removes nothing");
+        assert_eq!(error.raw_os_error(), Some(libc::EINTR), "{error}");
+        assert!(root.join(name).is_file(), "a failed probe unlinks nothing");
+
+        let file = pinned.pin_private_file(name).unwrap();
+        std::fs::rename(root.join(name), root.join("moved.json")).unwrap();
+        let error = file
+            .remove_exact()
+            .expect_err("a vanished file is not removed");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("vanished"), "{error}");
+        assert!(root.join("moved.json").is_file());
+
+        drop(pinned.write_new_private(name, b"{}").unwrap());
+        let file = pinned.pin_private_file(name).unwrap();
+        std::fs::remove_file(root.join(name)).unwrap();
+        symlink(root.join("moved.json"), root.join(name)).unwrap();
+        let error = file
+            .remove_exact()
+            .expect_err("a file replaced by a symlink is not removed");
+        assert!(error.to_string().contains("identity changed"), "{error}");
+        assert!(root.join("moved.json").is_file(), "the link's target stays");
+
+        drop(pinned);
         let _ = std::fs::remove_dir_all(root);
     }
 

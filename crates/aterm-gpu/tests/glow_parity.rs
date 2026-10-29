@@ -645,3 +645,100 @@ fn cpu_bloom_twin_matches_the_gpu_bloom() {
         "negative control: half the strength misses"
     );
 }
+
+/// looks10 L1: a frame whose bloom spares its letters (`BloomGate::SparesLetters`) blooms on
+/// the GPU from the lights kept clear of them (`bloom::spared_sources`), as its CPU twin and
+/// the trail replay's judge do: the GPU's frame is the twin's within float rounding, and its
+/// letters' cells take none of the bloom. Negative control: the twin bloomed from the whole
+/// light, as an open gate blooms, misses.
+#[test]
+fn a_spared_gpu_bloom_matches_its_cpu_twin() {
+    let theme = Theme::default();
+    let (rows, cols) = (8usize, 40usize);
+    let (mut cpu, mut gpu) = backends(18.0, theme);
+    let (cw, ch) = cpu.cell_size();
+    let mut win = aterm_gpu::WindowGpu::new();
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.process(b"\x1b[?25l\x1b[4;9Hspared\x1b[6;25Hletters");
+    let mut input = term.cell_frame(rows, cols);
+    input.cursor_visible = false;
+    input.bloom_gate = aterm_core::render::BloomGate::SparesLetters;
+    input.cursor_glow_add = vec![
+        GlowQuad::flat(
+            3,
+            (2 * cw) as u16,
+            (3 * ch + ch / 2) as u16,
+            (30 * cw) as u16,
+            (ch / 2) as u16,
+            0x0060_A0E0,
+            0,
+        ),
+        GlowQuad::gradient(
+            5,
+            (20 * cw) as u16,
+            (5 * ch) as u16,
+            (16 * cw) as u16,
+            ch as u16,
+            0x00E0_2000,
+            0,
+            0x0000_20E0,
+            0,
+        ),
+    ];
+    let params = aterm_render::bloom::BloomParams::default();
+    gpu.set_bloom(true);
+    gpu.set_bloom_params(params.strength, params.radius);
+    let lit = gpu.render_input(&mut win, &input, None);
+    gpu.set_bloom(false);
+    let base = cpu.render_input(&input);
+    let place = cpu.fx_frame(base.width, base.height, rows);
+    let grid = aterm_render::bloom::LetterGrid {
+        pad: place.pad,
+        grid_top: place.grid_top,
+        cell_w: cw,
+        cell_h: ch,
+    };
+    let (mut crown, mut blur) = (Vec::new(), Vec::new());
+    aterm_render::bloom::spared_sources(
+        &input.cursor_glow_add,
+        &input,
+        grid,
+        params.radius,
+        &mut crown,
+        &mut blur,
+    );
+    assert!(
+        !blur.is_empty() && blur.len() > input.cursor_glow_add.len(),
+        "fixture: the lights cross the letters and reach past their shields"
+    );
+    let twin = |glow: &[GlowQuad]| {
+        let mut frame = base.clone();
+        aterm_render::bloom::apply(&mut frame, glow, rows, params).unwrap();
+        frame
+    };
+    let spared = twin(&blur);
+    let worst = max_channel_delta(&spared.pixels, &lit.pixels);
+    assert!(
+        worst <= 2,
+        "the spared CPU twin is within float rounding: {worst}"
+    );
+    let w = base.width;
+    for (r, c0, n) in [(3usize, 8usize, 6usize), (5, 24, 7)] {
+        let (x0, x1) = (place.pad + c0 * cw, place.pad + (c0 + n) * cw);
+        let (y0, y1) = (place.grid_top + r * ch, place.grid_top + (r + 1) * ch);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let (a, b) = (lit.pixels[y * w + x], spared.pixels[y * w + x]);
+                assert!(
+                    max_channel_delta(&[a], &[b]) <= 2,
+                    "the GPU's letter cell ({x}, {y}) differs from the twin's"
+                );
+            }
+        }
+    }
+    let open = twin(&input.cursor_glow_add);
+    assert!(
+        max_channel_delta(&open.pixels, &lit.pixels) > 2,
+        "negative control: the bloom of the whole light misses"
+    );
+}

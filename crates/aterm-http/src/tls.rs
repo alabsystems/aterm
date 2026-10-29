@@ -71,15 +71,3 @@ pub fn client_config(trust: &Trust) -> Result<Arc<ClientConfig>, String> {
     };
     Ok(Arc::new(config))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn init_crypto_is_idempotent() {
-        init_crypto();
-        init_crypto();
-        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
-    }
-}

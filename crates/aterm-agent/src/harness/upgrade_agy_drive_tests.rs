@@ -106,7 +106,9 @@ fn line_blocks(exit: Option<i64>) -> String {
 /// may change between attempts: `None` serves as before the line.
 #[derive(Default)]
 struct After {
+    before_screen: Option<String>,
     screen: Option<String>,
+    before_status: Option<String>,
     status: Option<String>,
     blocks: Option<String>,
     /// The shell's blocks BEFORE the line, in place of the exit's
@@ -148,11 +150,18 @@ fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
                 if relaunched {
                     served(&after.screen, &w.after_relaunch)
                 } else {
-                    w.after_exit.clone()
+                    after
+                        .before_screen
+                        .as_ref()
+                        .unwrap_or(&w.after_exit)
+                        .clone()
                 }
             ),
             "cell" => "OK > ccd3db 1e1e1e none".to_string(),
-            "status" => served(&after.status, &w.status),
+            "status" => served(
+                &after.status,
+                after.before_status.as_ref().unwrap_or(&w.status),
+            ),
             "help" if line.contains("help key") => {
                 "OK 2\nkey  key [if-gen=<epoch>.<seq>] [if=<re>] <name>\n     FENCES".to_string()
             }
@@ -489,6 +498,7 @@ impl Rig {
             instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
             agents_off: Vec::new(),
             land: false,
+            press: None,
             timings: crate::harness::Timings::FAST,
         };
         Rig {
@@ -1907,3 +1917,95 @@ fn tier1_the_real_agy_exit_read_conforms_to_the_model() {
 
 #[path = "upgrade_agy_live_drive_tests.rs"]
 mod live_tests;
+
+#[test]
+fn an_in_flight_agy_relaunch_waits_out_a_hand_and_counts_staleness_from_seen_exit() {
+    let rig = Rig::new("hand-and-exit-clock", 137, true, false, true);
+    std::fs::create_dir_all(state_dir(&rig.opts)).expect("state");
+    let snap = rig.snap(Some(C1));
+    let now = now_s();
+    let signal = now - STALE_S - 60;
+    let base = St {
+        agent: Agent::Agy,
+        thread: C1.to_string(),
+        agy_config: rig.config.to_string_lossy().into_owned(),
+        argv: snap.argv.clone(),
+        cwd: WORKSPACE.to_string(),
+        twin: rig.twin.to_string_lossy().into_owned(),
+        pid: TUI,
+        shell: SHELL,
+        proc_start: snap.start.clone(),
+        tab: TAB.to_string(),
+        from: VERSION.to_string(),
+        to: VERSION.to_string(),
+        source: super::super::SAME_PROGRAM.to_string(),
+        phase: Phase::Exiting { at_s: signal },
+        ..St::default()
+    };
+
+    save(&rig.opts, &key(TAB), &base);
+    rig.after.lock().expect("after").before_status =
+        Some("OK schema=1 hold=1 hand=- integration=on".to_string());
+    let held = rig.attempt(&snap, &ExitRecord::Crashed, ExitCause::Exit);
+    assert_eq!(held.step, WAIT_HAND_LIFTS, "{held:?}");
+    assert_eq!(rig.lines(), 0);
+    let st = rig.state();
+    assert_eq!(st.phase, Phase::Exiting { at_s: signal });
+    assert!(st.hand_seen_s >= now && st.exited_at >= now, "{st:?}");
+
+    rig.after.lock().expect("after").before_status = None;
+    let unconfirmed_keys = rig.attempt(&snap, &ExitRecord::Crashed, ExitCause::Exit);
+    assert_eq!(
+        unconfirmed_keys.step, "wait:keyed-while-held",
+        "{unconfirmed_keys:?}"
+    );
+    rig.after.lock().expect("after").before_screen = Some(shell_after().replace(
+        r#""human_ms":null"#,
+        r#""human_ms":null,"unkeyed_ms":86400000"#,
+    ));
+    let carried = rig.attempt(&snap, &ExitRecord::Crashed, ExitCause::Exit);
+    assert_eq!(carried.step, "continued", "{carried:?}");
+    assert_eq!(rig.lines(), 1);
+
+    rig.kernel.relaunched.store(false, Ordering::SeqCst);
+    let fresh_exit = St {
+        exited_at: now - 10,
+        ..base.clone()
+    };
+    save(&rig.opts, &key(TAB), &fresh_exit);
+    let r = carry_in_flight_with(
+        &rig.opts,
+        Report {
+            pid: TUI,
+            tab: TAB.to_string(),
+            session: key(TAB),
+            from: VERSION.to_string(),
+            to: VERSION.to_string(),
+            step: String::new(),
+        },
+        fresh_exit,
+        &key(TAB),
+        &rig.kernel,
+    );
+    assert_eq!(r.step, "continued", "{r:?}");
+
+    save(&rig.opts, &key(TAB), &base);
+    let expired_r = carry_in_flight_with(
+        &rig.opts,
+        Report {
+            pid: TUI,
+            tab: TAB.to_string(),
+            session: key(TAB),
+            from: VERSION.to_string(),
+            to: VERSION.to_string(),
+            step: String::new(),
+        },
+        base,
+        &key(TAB),
+        &rig.kernel,
+    );
+    assert_eq!(expired_r.step, "failed:stale-exit", "{expired_r:?}");
+    let failed = rig.state();
+    assert_eq!(failed.phase, Phase::Failed("stale-exit".to_string()));
+    assert!(failed.exited_at >= now, "{failed:?}");
+}

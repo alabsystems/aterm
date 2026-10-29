@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# The glass arm: light/queued-submit.trail under live glass, every light scheme (foreach-scheme
+# light: the built-ins and the pack themes) drawing Prism Glass's glass ahead of LIVE, so each
+# commit's trail-diff compares glass frames: a queued submit (main's melt).
+
+foreach-scheme light {
+  grid 24 100
+  style rainbow kitty
+  hz 60
+  live glass
+
+  at 0 pty "\e[?2026h\e[?25l\e[H\e[1;1H\e[K\e[2;1H\e[K\e[3;1H\e[K\e[4;1H\e[K\e[5;1H\e[K\e[6;1H\e[K\e[7;1H\e[K\e[8;1H\e[K\e[9;1H\e[K\e[10;1H\e[K\e[11;1H\e[K\e[12;1H⏺ Agent \"Lint pass: the parser crate\" failed: Agent terminated early\e[K\e[13;1H  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)\e[K\e[14;1H⏺ Goal paused · usage limit reached · continues automatically when it resets\e[K\e[15;1H✻ Cogitated for 1d 11h 24m · done 4:01 PM · 8 shells still running\e[K\e[16;1H❯ keep going, and check the other tab when you can.\e[K\e[17;1H✽ Whirlpooling… (37s · ↓ 2.5k tokens · thinking with xhigh effort)\e[K\e[18;1H\e[K\e[19;1H────────────────────────────────────────────────────────────────────────────────────────────────────\e[K\e[20;1H❯ \e[K\e[21;1H────────────────────────────────────────────────────────────────────────────────────────────────────\e[K\e[22;1H  ⏵⏵ bypass permissions on · 8 shells\e[K\e[23;1H\e[K\e[24;1H\e[K\e[24;1H\e[20;3H\e[?25h\e[?2026l"
+  at 700 key a
+  at 704 pty "\e[?2026h\e[?25l\e[H\r\e[2C\e[19Ba\e[24;1H\e[20;4H\e[?25h\e[?2026l"
+  at 800 key n
+  at 804 pty "\e[?2026h\e[?25l\e[H\r\e[3C\e[19Bn\e[24;1H\e[20;5H\e[?25h\e[?2026l"
+  at 900 key d
+  at 904 pty "\e[?2026h\e[?25l\e[H\r\e[4C\e[19Bd\e[24;1H\e[20;6H\e[?25h\e[?2026l"
+  at 1000 key space
+  at 1004 pty "\e[?2026h\e[?25l\e[20;7H\e[?25h\e[?2026l"
+  at 1100 key t
+  at 1104 pty "\e[?2026h\e[?25l\e[H\r\e[6C\e[19Bt\e[24;1H\e[20;8H\e[?25h\e[?2026l"
+  at 1200 key h
+  at 1204 pty "\e[?2026h\e[?25l\e[H\r\e[7C\e[19Bh\e[24;1H\e[20;9H\e[?25h\e[?2026l"
+  at 1300 key e
+  at 1304 pty "\e[?2026h\e[?25l\e[H\r\e[8C\e[19Be\e[24;1H\e[20;10H\e[?25h\e[?2026l"
+  at 1400 key n
+  at 1404 pty "\e[?2026h\e[?25l\e[H\r\e[9C\e[19Bn\e[24;1H\e[20;11H\e[?25h\e[?2026l"
+  at 1500 key space
+  at 1504 pty "\e[?2026h\e[?25l\e[20;12H\e[?25h\e[?2026l"
+  at 1600 key r
+  at 1604 pty "\e[?2026h\e[?25l\e[H\r\e[11C\e[19Br\e[24;1H\e[20;13H\e[?25h\e[?2026l"
+  at 1700 key u
+  at 1704 pty "\e[?2026h\e[?25l\e[H\r\e[12C\e[19Bu\e[24;1H\e[20;14H\e[?25h\e[?2026l"
+  at 1800 key n
+  at 1804 pty "\e[?2026h\e[?25l\e[H\r\e[13C\e[19Bn\e[24;1H\e[20;15H\e[?25h\e[?2026l"
+  at 1900 key space
+  at 1904 pty "\e[?2026h\e[?25l\e[20;16H\e[?25h\e[?2026l"
+  at 2000 key t
+  at 2004 pty "\e[?2026h\e[?25l\e[H\r\e[15C\e[19Bt\e[24;1H\e[20;17H\e[?25h\e[?2026l"
+  at 2100 key h
+  at 2104 pty "\e[?2026h\e[?25l\e[H\r\e[16C\e[19Bh\e[24;1H\e[20;18H\e[?25h\e[?2026l"
+  at 2200 key e
+  at 2204 pty "\e[?2026h\e[?25l\e[H\r\e[17C\e[19Be\e[24;1H\e[20;19H\e[?25h\e[?2026l"
+  at 2300 key space
+  at 2304 pty "\e[?2026h\e[?25l\e[20;20H\e[?25h\e[?2026l"
+  at 2400 key t
+  at 2404 pty "\e[?2026h\e[?25l\e[H\r\e[19C\e[19Bt\e[24;1H\e[20;21H\e[?25h\e[?2026l"
+  at 2500 key e
+  at 2504 pty "\e[?2026h\e[?25l\e[H\r\e[20C\e[19Be\e[24;1H\e[20;22H\e[?25h\e[?2026l"
+  at 2600 key s
+  at 2604 pty "\e[?2026h\e[?25l\e[H\r\e[21C\e[19Bs\e[24;1H\e[20;23H\e[?25h\e[?2026l"
+  at 2700 key t
+  at 2704 pty "\e[?2026h\e[?25l\e[H\r\e[22C\e[19Bt\e[24;1H\e[20;24H\e[?25h\e[?2026l"
+  at 2800 key s
+  at 2804 pty "\e[?2026h\e[?25l\e[H\r\e[23C\e[19Bs\e[24;1H\e[20;25H\e[?25h\e[?2026l"
+  at 2900 key enter
+  at 2904 pty "\e[?2026h\e[?25l\e[H\e[1;1H\e[K\e[2;1H\e[K\e[3;1H\e[K\e[4;1H\e[K\e[5;1H\e[K\e[6;1H\e[K\e[7;1H\e[K\e[8;1H\e[K\e[9;1H\e[K\e[10;1H\e[K\e[11;1H⏺ Agent \"Lint pass: the parser crate\" failed: Agent terminated early\e[K\e[12;1H  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)\e[K\e[13;1H⏺ Goal paused · usage limit reached · continues automatically when it resets\e[K\e[14;1H✻ Cogitated for 1d 11h 24m · done 4:01 PM · 8 shells still running\e[K\e[15;1H❯ keep going, and check the other tab when you can.\e[K\e[16;1H✽ Whirlpooling… (37s · ↓ 2.5k tokens · thinking with xhigh effort)\e[K\e[17;1H  ⎿  queued: and then run the tests\e[K\e[18;1H\e[K\e[19;1H────────────────────────────────────────────────────────────────────────────────────────────────────\e[K\e[20;1H❯ \e[K\e[21;1H────────────────────────────────────────────────────────────────────────────────────────────────────\e[K\e[22;1H  ⏵⏵ bypass permissions on · 8 shells\e[K\e[23;1H\e[K\e[24;1H\e[K\e[24;1H\e[20;3H\e[?25h\e[?2026l"
+  run 4400
+}

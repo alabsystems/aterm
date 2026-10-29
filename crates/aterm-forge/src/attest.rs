@@ -311,13 +311,86 @@ fn license_arms(expr: &str) -> Vec<String> {
     arms
 }
 
+fn spdx_tokens(expr: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = expr;
+    while let Some(idx) = rest.find(|c: char| !c.is_whitespace()) {
+        rest = &rest[idx..];
+        if let Some(after) = rest.strip_prefix('(') {
+            out.push("(");
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix(')') {
+            out.push(")");
+            rest = after;
+        } else {
+            let end = rest
+                .find(|c: char| c.is_whitespace() || c == '(' || c == ')')
+                .unwrap_or(rest.len());
+            out.push(&rest[..end]);
+            rest = &rest[end..];
+        }
+    }
+    out
+}
+
+fn eval_spdx_or(tokens: &[&str], pos: &mut usize) -> Option<bool> {
+    let mut mandatory = eval_spdx_and(tokens, pos)?;
+    while tokens.get(*pos) == Some(&"OR") {
+        *pos += 1;
+        let rhs = eval_spdx_and(tokens, pos)?;
+        mandatory = mandatory && rhs;
+    }
+    Some(mandatory)
+}
+
+fn eval_spdx_and(tokens: &[&str], pos: &mut usize) -> Option<bool> {
+    let mut mandatory = eval_spdx_atom(tokens, pos)?;
+    while tokens.get(*pos) == Some(&"AND") {
+        *pos += 1;
+        let rhs = eval_spdx_atom(tokens, pos)?;
+        mandatory = mandatory || rhs;
+    }
+    Some(mandatory)
+}
+
+fn eval_spdx_atom(tokens: &[&str], pos: &mut usize) -> Option<bool> {
+    match *tokens.get(*pos)? {
+        "(" => {
+            *pos += 1;
+            let inner = eval_spdx_or(tokens, pos)?;
+            if tokens.get(*pos) != Some(&")") {
+                return None;
+            }
+            *pos += 1;
+            Some(inner)
+        }
+        ")" | "OR" | "AND" | "WITH" => None,
+        id => {
+            *pos += 1;
+            if tokens.get(*pos) == Some(&"WITH") {
+                *pos += 1;
+                let exc = *tokens.get(*pos)?;
+                if matches!(exc, "(" | ")" | "OR" | "AND" | "WITH") {
+                    return None;
+                }
+                *pos += 1;
+            }
+            Some(id == "Apache-2.0")
+        }
+    }
+}
+
 /// Is the Apache-2.0 grant unavoidable for this expression?
 pub(crate) fn apache_is_mandatory(expr: &str) -> bool {
-    let arms: Vec<&str> = expr.split(" OR ").collect();
-    !arms.is_empty()
-        && arms
-            .iter()
-            .all(|arm| license_arms(arm).iter().any(|l| l == "Apache-2.0"))
+    let tokens = spdx_tokens(expr);
+    if tokens.is_empty() {
+        return false;
+    }
+    let mut pos = 0;
+    match eval_spdx_or(&tokens, &mut pos) {
+        Some(mandatory) if pos == tokens.len() => mandatory,
+        _ => license_arms(expr).iter().any(|l| l == "Apache-2.0"),
+    }
 }
 
 /// The `[licenses] allow` list from `deny.toml`.
@@ -355,6 +428,10 @@ impl Ver {
     pub(crate) const fn triple(self) -> (u64, u64, u64) {
         (self.major, self.minor, self.patch)
     }
+
+    const fn wide(self) -> (u128, u128, u128) {
+        (self.major as u128, self.minor as u128, self.patch as u128)
+    }
 }
 
 /// Parse a dotted version, tolerant of omitted components and of a `-prerelease` / `+build` suffix.
@@ -364,6 +441,9 @@ pub(crate) fn parse_version(text: &str) -> Option<Ver> {
     let major = parts.next()?.trim().parse().ok()?;
     let minor_text = parts.next();
     let patch_text = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
     let minor = match minor_text {
         Some(m) => m.trim().parse().ok()?,
         None => 0,
@@ -396,17 +476,17 @@ fn req_satisfied(req: &str, version: &str) -> Option<bool> {
         return Some(ok);
     }
     let upper = if r.major > 0 {
-        (r.major + 1, 0, 0)
+        (u128::from(r.major) + 1, 0, 0)
     } else if !r.stated_minor {
         (1, 0, 0)
     } else if r.minor > 0 {
-        (0, r.minor + 1, 0)
+        (0, u128::from(r.minor) + 1, 0)
     } else if r.stated_patch {
-        (0, 0, r.patch + 1)
+        (0, 0, u128::from(r.patch) + 1)
     } else {
         (0, 1, 0)
     };
-    Some(v.triple() >= r.triple() && v.triple() < upper)
+    Some(v.wide() >= r.wide() && v.wide() < upper)
 }
 
 /// Every version requirement the workspace states on `name`, as `(manifest, requirement)`.
@@ -443,25 +523,43 @@ fn workspace_requirements(root: &Path, name: &str) -> Vec<(String, String)> {
                 tables.push(t);
             }
         }
+        if let Some(targets) = doc.get("target").and_then(Item::as_table_like) {
+            for (_, gated) in targets.iter() {
+                if let Some(gated) = gated.as_table_like() {
+                    for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                        if let Some(t) = gated.get(key).and_then(Item::as_table_like) {
+                            tables.push(t);
+                        }
+                    }
+                }
+            }
+        }
         for table in tables {
-            let Some(entry) = table.get(name) else {
-                continue;
-            };
-            if let Some(req) = entry.as_str() {
-                out.push((rel_display(root, &manifest), req.to_string()));
-                continue;
-            }
-            let Some(entry) = entry.as_table_like() else {
-                continue;
-            };
-            if entry.get("path").is_some() || entry.get("git").is_some() {
-                continue;
-            }
-            if entry.get("workspace").is_some() {
-                continue;
-            }
-            if let Some(req) = entry.get("version").and_then(Item::as_str) {
-                out.push((rel_display(root, &manifest), req.to_string()));
+            for (key, entry) in table.iter() {
+                let declared = entry
+                    .as_table_like()
+                    .and_then(|t| t.get("package"))
+                    .and_then(Item::as_str)
+                    .unwrap_or(key);
+                if declared != name {
+                    continue;
+                }
+                if let Some(req) = entry.as_str() {
+                    out.push((rel_display(root, &manifest), req.to_string()));
+                    continue;
+                }
+                let Some(entry) = entry.as_table_like() else {
+                    continue;
+                };
+                if entry.get("path").is_some()
+                    || entry.get("git").is_some()
+                    || entry.get("workspace").is_some()
+                {
+                    continue;
+                }
+                if let Some(req) = entry.get("version").and_then(Item::as_str) {
+                    out.push((rel_display(root, &manifest), req.to_string()));
+                }
             }
         }
     }
@@ -1886,9 +1984,18 @@ mod tests {
     fn apache_is_only_mandatory_when_no_other_arm_exists() {
         assert!(apache_is_mandatory("Apache-2.0"));
         assert!(apache_is_mandatory("Apache-2.0 AND MIT"));
+        assert!(apache_is_mandatory("Apache-2.0 AND (MIT OR BSD-3-Clause)"));
+        assert!(apache_is_mandatory(
+            "(Apache-2.0 AND MIT) OR (Apache-2.0 AND BSD-3-Clause)"
+        ));
+        assert!(apache_is_mandatory(
+            "Apache-2.0 WITH LLVM-exception AND (MIT OR Zlib)"
+        ));
         assert!(!apache_is_mandatory("Apache-2.0 OR MIT"));
         assert!(!apache_is_mandatory("MIT OR Apache-2.0"));
+        assert!(!apache_is_mandatory("(Apache-2.0 OR MIT) AND BSD-3-Clause"));
         assert!(!apache_is_mandatory("MIT"));
+        assert!(!apache_is_mandatory(""));
     }
 
     #[test]
@@ -1914,6 +2021,22 @@ mod tests {
         assert_eq!(req_satisfied("=0.33.1", "0.33.1"), Some(true));
         assert_eq!(req_satisfied("=0.33.1", "0.33.2"), Some(false));
         assert_eq!(req_satisfied(">=1, <3", "2.0.0"), None);
+        assert!(parse_version("1.2.3.4").is_none());
+        assert_eq!(req_satisfied("1.2.3.4", "1.2.3"), None);
+        assert_eq!(req_satisfied("1.2.3", "1.2.3.4"), None);
+        let max = u64::MAX;
+        assert_eq!(
+            req_satisfied(&format!("^{max}.0.0"), &format!("{max}.{max}.{max}")),
+            Some(true)
+        );
+        assert_eq!(
+            req_satisfied(&format!("^0.{max}.0"), &format!("0.{max}.{max}")),
+            Some(true)
+        );
+        assert_eq!(
+            req_satisfied(&format!("^0.0.{max}"), &format!("0.0.{max}")),
+            Some(true)
+        );
     }
 
     #[test]
@@ -2070,6 +2193,33 @@ mod tests {
         assert!(
             accepted.is_empty(),
             "renaming a row must not bypass the requirement reader:\n{accepted:#?}"
+        );
+
+        // Wide zero-major requirements (`0`, `0.0`) span multiple semver lines and stay in scope,
+        // and renamed or target-gated dependencies (`alias = { package = "goodfork", ... }`) are read too.
+        for req in ["0", "0.0"] {
+            require(req);
+            let Attestation { ok, log, .. } = report(root);
+            assert!(
+                !ok && log.contains("FAIL [OB-2]"),
+                "`{req}` must not be dropped out of scope:\n{log}"
+            );
+        }
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/consumer\"]\n\n[patch.crates-io]\ngoodfork = { path = \"vendor/goodfork\" }\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/consumer")).unwrap();
+        std::fs::write(
+            root.join("crates/consumer/Cargo.toml"),
+            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\n[target.'cfg(unix)'.dependencies]\nalias = { package = \"goodfork\", version = \"2.0\" }\n",
+        )
+        .unwrap();
+        let Attestation { ok, log, .. } = report(root);
+        assert!(
+            !ok && log.contains("FAIL [OB-2]"),
+            "renamed target-gated dependency must be checked by OB-2:\n{log}"
         );
     }
 

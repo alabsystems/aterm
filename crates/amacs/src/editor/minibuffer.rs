@@ -149,7 +149,7 @@ impl EditorWorkspace {
                     "Search cancelled"
                 } else {
                     let matched = self.accept_search_match(store, view, &query, origin)?;
-                    view.last_search_query.clone_from(&query);
+                    self.remember_search(view, &query);
                     if matched { "" } else { "Not found" }
                 };
                 Ok(vec![EditorEffect::Status(status.to_string())])

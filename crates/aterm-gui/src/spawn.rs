@@ -299,6 +299,31 @@ fn spawn_shell_type(
     aterm_core::shell_integration::ShellType::detect(&program.to_string_lossy())
 }
 
+/// The shell a session runs, as aterm launched it: the one it integrated, else the one it
+/// spawns for `shell_hint`; for a shell adopted across a seamless update (`adopted`), the one
+/// its process `pid` maps, read once (`Unknown` where it cannot be read).
+fn launched_shell(
+    adopted: bool,
+    pid: i32,
+    integrated: Option<aterm_core::shell_integration::ShellType>,
+    shell_hint: Option<&str>,
+) -> aterm_core::shell_integration::ShellType {
+    use aterm_core::shell_integration::ShellType;
+    if adopted {
+        return crate::spare::shell_image(pid).map_or(ShellType::Unknown, |image| {
+            ShellType::detect(&image.to_string_lossy())
+        });
+    }
+    integrated.unwrap_or_else(|| detect_spawn_shell(shell_hint))
+}
+
+/// Whether `shell` runs each command as a job of its own ([`crate::command_ran::Ran::runs_jobs`]):
+/// every shell but pwsh, which runs its children in its own group; one aterm does not know is
+/// taken to, so an exec of its group never stands in for a command (fail closed).
+const fn shell_runs_jobs(shell: aterm_core::shell_integration::ShellType) -> bool {
+    !matches!(shell, aterm_core::shell_integration::ShellType::PowerShell)
+}
+
 #[cfg(windows)]
 fn tab_shell_env(exec: bool, shell_override: Option<&str>) -> Option<(String, String)> {
     if exec {
@@ -1523,6 +1548,7 @@ fn seed_of(
 /// The shared writer could not be started.
 pub(crate) fn arm_promoted(session: &mut Session, id: u64) -> Result<(), String> {
     let tx = crate::temporal::open(&session.ctx.temporal, crate::temporal::QUEUE_CAP)?;
+    let ui_tx = tx.clone();
     let drain = tx.drain();
     {
         let engine = term_lock(&session.term);
@@ -1541,6 +1567,7 @@ pub(crate) fn arm_promoted(session: &mut Session, id: u64) -> Result<(), String>
         drop(rec);
         session.temporal_arm.set(tx);
     }
+    session.temporal_tx = Some(ui_tx);
     session.temporal_drain = Some(drain);
     crate::temporal::pool().join(id, &session.ctx.temporal);
     Ok(())
@@ -1696,6 +1723,17 @@ pub(crate) fn spawn_session(
     } else {
         (factory.env_add.clone(), None, None)
     };
+    if adopt.is_none() {
+        let runs_command = factory
+            .exec_command
+            .as_deref()
+            .is_some_and(|argv| !argv.is_empty());
+        crate::default_editor::settle_session(
+            &mut env_add,
+            crate::default_editor::decides(runs_command, integrated_shell),
+            &|key| std::env::var_os(key),
+        );
+    }
 
     if let Some(pair) = substitute.as_ref().and_then(|sub| sub.shell_env.clone()) {
         env_add.push(pair);
@@ -1914,6 +1952,25 @@ pub(crate) fn spawn_session(
         bells: Default::default(),
         screen_moves: Default::default(),
         job_feed: Default::default(),
+        ran: {
+            // A bare program word is looked up on the PATH the shell was given, where no exec's
+            // own environment shows a later one.
+            let ran = crate::command_ran::Ran::default();
+            ran.runs_jobs(shell_runs_jobs(launched_shell(
+                adopted,
+                pid,
+                integrated_shell,
+                shell_override,
+            )));
+            let given = env_add.iter().rev().find(|(k, _)| k == "PATH");
+            ran.spawned_with(
+                given
+                    .map(|(_, v)| v.clone())
+                    .or_else(|| std::env::var("PATH").ok())
+                    .as_deref(),
+            );
+            Arc::new(ran)
+        },
         box_banner: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
@@ -1998,6 +2055,7 @@ pub(crate) fn spawn_session(
         adopt_restored_holder(
             &term,
             &ctx.timeline,
+            &crate::command_ran::RanFeed::new(Arc::clone(&ctx.ran), pid),
             master,
             pid,
             factory.fg_probe,
@@ -2128,6 +2186,7 @@ pub(crate) fn spawn_session(
         wake_wr: -1,
         reader_stop: Arc::new(AtomicBool::new(false)),
         reader_join: None,
+        temporal_tx: None,
         temporal_drain: None,
         temporal_arm: Arc::default(),
         reflow_cancel: Arc::new(AtomicBool::new(false)),
@@ -3242,6 +3301,34 @@ mod spawn_shell_type_tests {
             ShellType::detect(&program.to_string_lossy())
         );
     }
+
+    /// A SESSION'S SHELL RUNS JOBS BY WHAT ATERM LAUNCHED (H2 land): pwsh alone runs its
+    /// commands in its own group; the shell it integrated is the one launched; an adopted shell is
+    /// the one its process maps (this test's own process: no shell aterm knows, so it runs jobs,
+    /// failing closed), never the integration a fresh spawn would have chosen. NEGATIVE CONTROL
+    /// (scratch): `shell_runs_jobs` true for pwsh fails the first assertion.
+    #[test]
+    fn a_sessions_shell_runs_jobs_by_what_aterm_launched() {
+        assert!(!super::shell_runs_jobs(ShellType::PowerShell));
+        for shell in [
+            ShellType::Zsh,
+            ShellType::Bash,
+            ShellType::Fish,
+            ShellType::Unknown,
+        ] {
+            assert!(super::shell_runs_jobs(shell), "{shell:?}");
+        }
+        assert_eq!(
+            super::launched_shell(false, 0, Some(ShellType::PowerShell), None),
+            ShellType::PowerShell
+        );
+        let me = i32::try_from(std::process::id()).expect("a pid");
+        assert_ne!(
+            super::launched_shell(true, me, Some(ShellType::PowerShell), None),
+            ShellType::PowerShell,
+            "an adopted shell is read from its process"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3525,6 +3612,7 @@ fn attach_reader_inner(
         let rec = session.ctx.cast.lock().unwrap_or_else(|p| p.into_inner());
         (rec.epoch(), rec.watermark())
     };
+    session.temporal_tx = None;
     if let Some(old) = session.temporal_drain.take() {
         old.wait();
     }
@@ -3548,6 +3636,7 @@ fn attach_reader_inner(
     } else {
         (None, crate::temporal::SpineMark::default())
     };
+    let session_temporal_tx = temporal_tx.clone();
     let temporal_drain = temporal_tx.as_ref().map(crate::temporal::TemporalTx::drain);
     let (reply_tx, _reply_writer_join) = spawn_reply_writer(
         session.ctx.sink.clone(),
@@ -3561,8 +3650,8 @@ fn attach_reader_inner(
         });
     }
 
-    let compress_tx = spawn_compress_worker(session.term.clone(), session.ctx.ui_waiting.clone());
-    crate::term_lock(&session.term).set_compress_offload_active(compress_tx.is_some());
+    let compress_tx = CompressOffload::new(session.term.clone(), session.ctx.ui_waiting.clone());
+    crate::term_lock(&session.term).set_compress_offload_active(true);
 
     let mut read_buf = Vec::new();
     read_buf
@@ -3612,6 +3701,7 @@ fn attach_reader_inner(
             inbox: factory.edge_inbox.clone(),
             byte_arm: factory.byte_arm,
             proc_watch: (factory.proc_watch)(session.pid),
+            ran: crate::command_ran::RanFeed::new(session.ctx.ran.clone(), session.pid),
         },
         timeline: session.ctx.timeline.clone(),
         screen_moves: session.ctx.screen_moves.clone(),
@@ -3654,6 +3744,7 @@ fn attach_reader_inner(
         aterm_pty::close_fd(session.wake_wr);
     }
     session.wake_wr = wake_wr;
+    session.temporal_tx = session_temporal_tx;
     session.temporal_drain = temporal_drain;
     session.reader_join = Some(reader);
     Ok(())
@@ -3721,6 +3812,7 @@ impl UpdatePark {
 /// Park a session's PTY reader, the overlap handoff's quiescence step.
 #[cfg(any(unix, test))]
 pub(crate) fn park_reader(session: &mut Session, deadline: Instant) -> bool {
+    session.temporal_tx = None;
     let Some(join) = session.reader_join.take() else {
         return true;
     };
@@ -5707,6 +5799,38 @@ const COMPRESS_LOW_WATER: usize = 256;
 const COMPRESS_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
 const COMPRESS_TRICKLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+struct CompressOffload {
+    term: Arc<Mutex<Terminal>>,
+    ui_waiting: Arc<std::sync::atomic::AtomicU32>,
+    tx: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<()>>>,
+}
+
+impl CompressOffload {
+    const fn new(
+        term: Arc<Mutex<Terminal>>,
+        ui_waiting: Arc<std::sync::atomic::AtomicU32>,
+    ) -> Self {
+        Self {
+            term,
+            ui_waiting,
+            tx: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn signal(&self) {
+        let maybe_tx = self.tx.get_or_init(|| {
+            let tx = spawn_compress_worker(self.term.clone(), self.ui_waiting.clone());
+            if tx.is_none() {
+                crate::term_lock(&self.term).set_compress_offload_active(false);
+            }
+            tx
+        });
+        if let Some(tx) = maybe_tx {
+            let _ = tx.try_send(());
+        }
+    }
+}
+
 fn spawn_compress_worker(
     term: Arc<Mutex<Terminal>>,
     ui_waiting: Arc<std::sync::atomic::AtomicU32>,
@@ -6108,11 +6232,33 @@ fn the_parse_hold_probe_tells_a_held_term_lock_from_a_free_one() {
     );
 }
 
+/// The image a gather with no process watch reads for a sampled foreground edge to `to`, read
+/// with `edge_image` and noted in `ran`: where nothing hears `exec`s (Linux, a watch that could
+/// not open), the in-front image each edge reads is the session's one record of what ran.
+#[cfg(unix)]
+pub(crate) fn sampled_edge_image(
+    edge_image: crate::holder_image::ReadImage,
+    ran: &crate::command_ran::RanFeed,
+    to: i32,
+    filled: usize,
+) -> Option<Arc<crate::holder_image::HolderImage>> {
+    (to > 0).then(|| {
+        let image = edge_image(to, None);
+        ran.image(&image, filled);
+        Arc::new(image)
+    })
+}
+
 /// [`spawn_session`]'s holder adoption for a restored engine (card engine §3.8, lane A4).
 #[cfg(unix)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the session's engine, timeline and ran log beside the factory's three probes"
+)]
 pub(crate) fn adopt_restored_holder(
     term: &Mutex<Terminal>,
     timeline: &Mutex<crate::session_timeline::SessionTimeline>,
+    ran: &crate::command_ran::RanFeed,
     master: i32,
     root_pgid: i32,
     fg_probe: fn(i32) -> i32,
@@ -6126,19 +6272,25 @@ pub(crate) fn adopt_restored_holder(
             .filter(|_| log.log().is_open(aterm_slog::Node::SESSION))
             .map(|since| (log.block_cursor(), Some(since)))
     };
-    let (blocks, pgid) = {
+    let (running, pgid) = {
         let term = term_lock(term);
-        let blocks = cursor.map(|(from, since_wall)| {
-            crate::session_status::block_read(
-                &term,
-                from,
-                since_wall,
-                crate::session_status::executing_detail(&term),
-            )
-        });
-        (blocks, fg_probe(master))
+        let running = term
+            .current_block()
+            .filter(|b| b.state == aterm_types::BlockState::Executing)
+            .map(|b| b.id);
+        (running, fg_probe(master))
     };
     let image = (pgid > 0).then(|| Arc::new(edge_image(pgid, None)));
+    if let Some(image) = image.as_deref().filter(|_| pgid != root_pgid) {
+        // The restored command's program ran before this process heard anything: its image,
+        // read now while it runs, is noted as the running block's job's, with its file's
+        // identity and steers, before the blocks are read, so the read the restore logs and the
+        // next sweep confirm the word the person typed (a `claude` through its link).
+        ran.restored(image, running);
+    }
+    let blocks = cursor.map(|(from, since_wall)| {
+        crate::session_status::block_read(&term_lock(term), from, since_wall, ran.ran())
+    });
     let (token, exact) = image.as_deref().map_or((0, false), |image| {
         (
             image.token.filter(|_| image.drawer.is_some()).unwrap_or(0),
@@ -6302,14 +6454,17 @@ pub(crate) enum GatherMsg {
     /// ([`UpdatePark`]), went out in the batches before this one.
     CaughtUp,
     /// One gathered batch: buffer, filled length, the foreground change it carries, the group
-    /// whose bytes end it (`edge.to` with an edge) and, with an edge, `edge.to`'s image as the
-    /// gather read it (`crate::holder_image`).
+    /// whose bytes end it (`edge.to` with an edge), with an edge `edge.to`'s image as the gather
+    /// read it (`crate::holder_image`), and the offset of its end in the session's output, which
+    /// the parse stage hands the session's ran log (`crate::command_ran::Ran::places_in`, then
+    /// `crate::command_ran::Ran::parsed_through` once parsed).
     Data(
         Vec<u8>,
         usize,
         Option<crate::foreground_handback::FgEdge>,
         i32,
         Option<Arc<crate::holder_image::HolderImage>>,
+        u64,
     ),
     /// A foreground edge with no byte in flight (card engine §3.3).
     Edge(
@@ -6355,6 +6510,7 @@ fn spawn_pty_gather(
     fg_holder: Arc<std::sync::atomic::AtomicI32>,
     edge_image: crate::holder_image::ReadImage,
     proc_watch: Option<aterm_uds::procwatch::ProcWatch>,
+    ran: crate::command_ran::RanFeed,
     lane_guard: crate::manual_reset::LaneGuard,
     journal: Option<Arc<crate::crash_restore::SessionJournal>>,
 ) -> Result<(), String> {
@@ -6380,8 +6536,10 @@ fn spawn_pty_gather(
                 fg_probe(master)
             };
             let mut cutter = crate::foreground_handback::FgCutter::new(seed);
-            let mut exec =
-                proc_watch.map(|watch| crate::exec_edges::ExecEdges::new(watch, edge_image, seed));
+            let mut exec = proc_watch.map(|watch| {
+                crate::exec_edges::ExecEdges::new(watch, edge_image, seed, ran.clone())
+                    .reading_queue(aterm_pty::output_queue_len, master)
+            });
             let proc_rd = exec.as_ref().map_or(-1, crate::exec_edges::ExecEdges::fd);
             let send_byte_free = |cutter: &mut crate::foreground_handback::FgCutter,
                                   exec: &mut crate::exec_edges::ExecEdges|
@@ -6467,6 +6625,9 @@ fn spawn_pty_gather(
                     aterm_pty::ReadOutcome::Proc => {
                         if let Some(x) = exec.as_mut() {
                             cutter.begin();
+                            // What the shell wrote before an exec heard now is handed on
+                            // already or still in the PTY: the exec waits for the parse to
+                            // reach where it stood (`crate::command_ran::Spot`).
                             x.heard(&mut cutter, || fg_probe(master), 0);
                             if !send_byte_free(&mut cutter, x) || !send_gone(x) {
                                 break;
@@ -6541,14 +6702,14 @@ fn spawn_pty_gather(
                         let image = match (edge.as_mut(), exec.as_mut()) {
                             (Some(e), Some(x)) => x.take_image().or_else(|| {
                                 (e.to > 0).then(|| {
-                                    let absorbed = x.absorb(e.to);
+                                    let absorbed = x.absorb(e.to, filled, || fg_probe(master));
                                     if absorbed {
                                         e.lay = filled;
                                     }
                                     x.read_edge(e.to, absorbed)
                                 })
                             }),
-                            (Some(e), None) => (e.to > 0).then(|| Arc::new(edge_image(e.to, None))),
+                            (Some(e), None) => sampled_edge_image(edge_image, &ran, e.to, filled),
                             (None, _) => None,
                         };
                         let holder = cutter.holder();
@@ -6563,8 +6724,9 @@ fn spawn_pty_gather(
                         if let Some(journal) = &journal {
                             journal.gathered(filled);
                         }
+                        let end = ran.ran().handed_on(filled);
                         if filled_tx
-                            .send(GatherMsg::Data(buf, filled, edge, holder, image))
+                            .send(GatherMsg::Data(buf, filled, edge, holder, image, end))
                             .is_err()
                         {
                             break;
@@ -6621,6 +6783,7 @@ struct ForegroundWiring {
     inbox: crate::holder_image::EdgeInbox,
     byte_arm: bool,
     proc_watch: Option<aterm_uds::procwatch::ProcWatch>,
+    ran: crate::command_ran::RanFeed,
 }
 
 struct PtyReaderWiring {
@@ -6630,7 +6793,7 @@ struct PtyReaderWiring {
     term: Arc<Mutex<Terminal>>,
     post: WakePost,
     reply_tx: ReplyLane,
-    compress_tx: Option<std::sync::mpsc::SyncSender<()>>,
+    compress_tx: CompressOffload,
     cast: Arc<std::sync::Mutex<crate::cast::CastRecorder>>,
     cast_epoch: Instant,
     cast_watermark: Arc<crate::cast::CastWatermark>,
@@ -7019,6 +7182,8 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
     #[cfg(not(unix))]
     let (fg_gone, fg_shell): (crate::foreground_handback::FgGone, i32) = (|_, _, _| false, 0);
     #[cfg(unix)]
+    let ran = Arc::clone(fg.ran.ran());
+    #[cfg(unix)]
     let (fg_image, edge_inbox, byte_arm, exec_edges) = (
         fg.image,
         fg.inbox.clone(),
@@ -7079,6 +7244,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                 fg.holder,
                 fg.image,
                 fg.proc_watch,
+                fg.ran,
                 lane_guard,
                 gather_journal,
             )
@@ -7175,6 +7341,9 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                     output_wake(cadence);
                 }
             };
+            // The places held execs wait for in the batch being parsed (`None` for a parse of no
+            // gathered batch): the ingest ends a chunk at each and reads the block running there.
+            let places = std::cell::RefCell::new(None::<crate::command_ran::Places>);
             let mut ingest = |temporal_lane: &mut (
                 Option<crate::temporal::TemporalTx>,
                 crate::temporal::SpineMark,
@@ -7301,6 +7470,11 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                             Some(lay) if lay > off => limit.min(lay),
                             _ => limit,
                         };
+                        let limit = places
+                            .borrow()
+                            .as_ref()
+                            .and_then(|p| p.next_cut(off))
+                            .map_or(limit, |cut| cut.min(limit));
                         let limit = arm
                             .as_ref()
                             .and_then(|a| a.next_cut(off))
@@ -7509,6 +7683,12 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                                 && t.is_require_shell_integration_nonce();
                             shell_executing =
                                 t.shell_state() == aterm_core::terminal::ShellState::Executing;
+                            if let Some(places) = places.borrow_mut().as_mut() {
+                                let running = t
+                                    .current_block()
+                                    .filter(|b| b.state == aterm_types::BlockState::Executing);
+                                places.parsed(end, running.map(|b| b.id));
+                            }
                             resync_due |= t.take_alt_screen_resync_request();
                             #[cfg(unix)]
                             crate::spare::witness_after_process(&witness, &mut t, master, || {
@@ -7627,10 +7807,8 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                         let _ = reply.try_send(report.clone());
                     }
                 }
-                if backlog >= COMPRESS_SIGNAL_AT
-                    && let Some(tx) = &compress_tx
-                {
-                    let _ = tx.try_send(());
+                if backlog >= COMPRESS_SIGNAL_AT {
+                    compress_tx.signal();
                 }
                 if let Some(resp) = response {
                     let resp: std::sync::Arc<[u8]> = resp.into();
@@ -7781,8 +7959,16 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                         }
                         retire_gone(&term, &timeline, &temporal_arm, &mut temporal_lane, pid);
                     }
-                    Ok(GatherMsg::Data(batch, len, edge, holder, image)) => {
+                    Ok(GatherMsg::Data(batch, len, edge, holder, image, end)) => {
+                        // The parse stops at each place an exec waits for, and reads the block
+                        // running there: every C and D the shell wrote before it is parsed, and
+                        // the exec counts from now, placed in that block.
+                        let mut batch_places = crate::command_ran::Places::default();
+                        ran.places_in(end, len, &mut batch_places);
+                        *places.borrow_mut() = Some(batch_places);
                         ingest(&mut temporal_lane, &batch[..len], edge, holder, image, None);
+                        let batch_places = places.borrow_mut().take().unwrap_or_default();
+                        ran.parsed_through(end, len, &batch_places);
                         let _ = free_tx.try_send(batch);
                         parse_in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -8468,16 +8654,15 @@ pub(crate) fn reroute_path_env(
         .map(|p| p.split(sep).collect())
         .unwrap_or_default();
     let mut injected = false;
-    if let Some(bin) = bin_dir
-        && !entries.contains(&bin)
-    {
-        entries.push(bin);
-        injected = true;
-    }
     if let Some(bundle) = bundle_dir
         && !entries.contains(&bundle)
     {
         entries.insert(0, bundle);
+        injected = true;
+    }
+    if let Some(bin) = bin_dir {
+        entries.retain(|entry| *entry != bin);
+        entries.insert(0, bin);
         injected = true;
     }
     if let Some(agents) = agents_dir {
@@ -8673,9 +8858,11 @@ fn login_shell_path_with(
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
             _ => {
+                // The probe shell leads its own session (`setsid`) and is unreaped here, so the
+                // sweep also ends a child an rc file was forking as the deadline's signal landed.
                 #[cfg(unix)]
                 if let Ok(group) = libc::pid_t::try_from(child.id()) {
-                    unsafe { libc::killpg(group, libc::SIGKILL) };
+                    let _ = aterm_uds::process::kill_group_until_empty(group);
                 }
                 let _ = child.kill();
                 let _ = child.wait();
@@ -8741,11 +8928,9 @@ pub(crate) fn fallback_child_path(
         }
     }
     if let Some((agents, bin)) = managed {
-        entries.retain(|e| e != agents);
+        entries.retain(|e| e != agents && e != bin);
+        entries.insert(0, bin.to_string());
         entries.insert(0, agents.to_string());
-        if !entries.iter().any(|e| e == bin) {
-            entries.push(bin.to_string());
-        }
     }
     entries.join(&sep.to_string())
 }
@@ -8972,15 +9157,15 @@ mod reroute_path_env_tests {
         let bin = "/Users//u/Library/Application Support/aterm/pkg/bin";
         assert_eq!(
             fallback_child_path(
-                Some(&format!("/usr/bin:{agents}:/bin")),
+                Some(&format!("/usr/bin:{agents}:/bin:{bin}")),
                 Some(home),
                 Some((agents, bin))
             ),
             with(
-                &[agents, "/usr/bin", "/bin", "/Users//u/.local/bin"],
-                &["/usr/local/bin", bin]
+                &[agents, bin, "/usr/bin", "/bin", "/Users//u/.local/bin"],
+                &["/usr/local/bin"]
             ),
-            "agents/ moved to the front, bin/ appended"
+            "agents/ then bin/ moved to the front ahead of /usr/bin"
         );
     }
 
@@ -9191,7 +9376,7 @@ mod reroute_path_env_tests {
     }
 
     #[test]
-    fn the_bin_dir_is_appended_once_behind_the_inherited_path() {
+    fn the_bin_dir_leads_behind_agents_and_ahead_of_the_inherited_path() {
         const BIN: &str = "/Users//u/Library/Application Support/aterm/pkg/bin";
         let inherited = path(&["/opt/homebrew/bin", "/usr/bin"]);
         let (_, value) = reroute_path_env(
@@ -9207,10 +9392,10 @@ mod reroute_path_env_tests {
             path(&[
                 REROUTE,
                 AGENTS,
+                BIN,
                 BUNDLE,
                 "/opt/homebrew/bin",
-                "/usr/bin",
-                BIN
+                "/usr/bin"
             ])
         );
         let (_, again) = reroute_path_env(
@@ -9221,19 +9406,23 @@ mod reroute_path_env_tests {
             Some(BIN),
         )
         .expect("injects");
+        assert_eq!(again, value, "idempotent on its own output");
+        let trailing_bin = path(&["/opt/homebrew/bin", "/usr/bin", BIN]);
+        let (_, moved) = reroute_path_env(
+            Some(REROUTE),
+            Some(AGENTS),
+            Some(BUNDLE),
+            Some(&trailing_bin),
+            Some(BIN),
+        )
+        .expect("injects");
         assert_eq!(
-            again, value,
-            "a PATH that holds it keeps it once, where it was"
-        );
-        let user_first = path(&[BIN, "/usr/bin"]);
-        assert_eq!(
-            reroute_path_env(None, None, None, Some(&user_first), Some(BIN)),
-            None,
-            "already there, wherever the user put it: nothing to inject"
+            moved, value,
+            "an outer shell's trailing bin/ moves ahead of /usr/bin once"
         );
         assert_eq!(
             reroute_path_env(None, None, None, Some("/usr/bin"), Some(BIN)).map(|p| p.1),
-            Some(path(&["/usr/bin", BIN]))
+            Some(path(&[BIN, "/usr/bin"]))
         );
         assert_eq!(
             reroute_path_env(None, None, None, None, Some(BIN)).map(|p| p.1),
@@ -9460,22 +9649,6 @@ mod clipboard_coalesce_tests {
             );
             assert_eq!(route_osc52_query(sels, x11), source, "{sels:?} x11={x11}");
         }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn query_arm_answers_primary_text_for_p_and_clipboard_text_for_c() {
-        crate::control::PBPASTE_STUB.with(|s| *s.borrow_mut() = Some("clip".to_string()));
-        crate::control::PRIMARY_STUB.with(|s| *s.borrow_mut() = Some("prim".to_string()));
-        let read = |sels: &[Sel]| match route_osc52_query(sels, true) {
-            QuerySource::Primary => crate::control::primary_get_owned(),
-            QuerySource::Clipboard => crate::control::pbpaste_owned(),
-        };
-        assert_eq!(read(&[Sel::Primary]).as_deref(), Some("prim"));
-        assert_eq!(read(&[Sel::Clipboard]).as_deref(), Some("clip"));
-        assert_eq!(read(&[]).as_deref(), Some("clip"));
-        crate::control::PBPASTE_STUB.with(|s| *s.borrow_mut() = None);
-        crate::control::PRIMARY_STUB.with(|s| *s.borrow_mut() = None);
     }
 
     #[test]

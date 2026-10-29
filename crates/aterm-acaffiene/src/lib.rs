@@ -12,6 +12,7 @@ pub mod code;
 pub mod icon;
 pub mod instance;
 pub mod launchd;
+pub mod legacy;
 #[cfg(target_os = "macos")]
 mod macos;
 pub mod menu;

@@ -19,17 +19,26 @@ aterm secrets: one credentials file for every machine (aterm help secrets).
                                          fingerprint at a terminal), waiting up to 10 min
                                          for approval at a terminal unless --no-wait, and
                                          install the subscriber unless --no-agent
-  aterm secrets sync                     fetch and apply the latest version now
+  aterm secrets sync [--diagnostic]      fetch and apply the latest version now;
+                                         --diagnostic prints one value-free outcome record
   aterm secrets watch                    the subscriber (agent on installs it): apply each
                                          new version; on an admin of a <url> vault, also
                                          the approver, which lets in a machine that types
                                          the join password (any that asks, when open)
   aterm secrets ls                       the names this machine holds
   aterm secrets get <name>               print one value to stdout
+  aterm secrets need ls [--all] [--json] this machine's needs (a credential it lacks, asked
+                                         of the lab's Macs or a person), --all every request
+                                         in the lab's table; need <want> raises one by hand,
+                                         need retire <want|id> [--declined] [--note <text>]
+                                         withdraws or declines one, need pass runs this
+                                         machine's pass now (aterm secrets need --help)
+  aterm secrets git-credential [--dev-user <login>] [<op>]
+                                         git's credential helper over ~/.secrets
 admin (a machine in [admins]):
   aterm secrets create <url>|<path> [--import <dir>] [--name <host>]
-        [--no-agent] [--serve]           a new open vault (at a <url> each machine that asks
-                                         is let in until `password new` or `off` closes it;
+        [--no-agent] [--serve]           a new open vault (at a <url> a machine is let in by
+                                         a person's Allow on any member and its phrase;
                                          at a <path> an admin approves each key), this
                                          machine its first admin (--import: each regular
                                          file in <dir> with a valid entry name goes into
@@ -51,10 +60,10 @@ admin (a machine in [admins]):
   aterm secrets unset <name> [--for <host|code>...]
   aterm secrets password [show|set|new|open|off] [--no-agent]
                                          the join password: show (the default), set (typed
-                                         or piped), new (generated), open (none: every
-                                         machine that asks is let in), off (close the vault
-                                         or drop the password: machines wait for approval
-                                         by code); show and new print it only at a
+                                         or piped), new (generated), open (none: a
+                                         machine allowed on any member is let in), off
+                                         (drop the password: an Allow on a member or
+                                         approval by code); show and new print it only at a
                                          terminal; for a <url>, set, new and open also
                                          install the subscriber where it does not run,
                                          unless --no-agent
@@ -63,9 +72,11 @@ admin (a machine in [admins]):
                                          let in machines by the code each shows (--all:
                                          every one, asked at a terminal), or a key by name
                                          (how a machine joins a <path> vault)
-  aterm secrets revoke <host|code> [--drop-sections]
+  aterm secrets revoke <host|code> [--drop-sections] [--stolen]
                                          remove it from the vault (first retiring its Commons
-                                         membership, where the vault has Commons control); a
+                                         membership, denying its swarm label/node, and releasing
+                                         its pool slots); --stolen also rotates aterm-fleet-code
+                                         and prints a NEEDS YOU: provider rotation list; a
                                          section naming only it must be empty unless
                                          --drop-sections drops it too
   aterm secrets retire <host|code|age1...>... permanently retire Commons membership alone;
@@ -75,7 +86,13 @@ admin (a machine in [admins]):
   aterm secrets commons init             initialize Commons on this existing vault, sharing its
                                          control descriptor with every current vault machine
                                          and approving each one with no admission record;
-                                         retries finish the same network and never replace a root
+                                         retries finish the same network and never replace a root;
+                                         an open vault's only admin founds it by itself, with
+                                         the vault's open policy as each machine's approval
+  aterm secrets genesis <file>           ALab's admin, once, with a released aterm: sign
+                                         Genesis v2 (every [machines] key, with its Commons
+                                         binding where Commons holds one) into a new <file>;
+                                         prints only its digest and member count
 server and services:
   aterm secrets serve [--listen <addr:port>] [--advertise <name> | --no-advertise]
         [--pin <vault>=<key>] [--store <dir>] [--hold <1-60 secs>] [--no-keep-awake]
@@ -93,8 +110,9 @@ server and services:
                                          none)
   aterm secrets agent [on|off|status] [--program <path>] [--force]
                                          the subscriber as a launchd or systemd user job
-                                         (--program: the aterm it runs, else this aterm;
-                                         on leaves one running as set up, unless --force)
+                                         (--program: the aterm it runs, pinned so no
+                                         mend moves it, else this aterm; on leaves one
+                                         running as set up, unless --force)
   aterm secrets server [on|off|status] [--program <path>] [serve flags]
                                          serve as a launchd or systemd user job
 ";
@@ -124,12 +142,20 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let diagnostic = matches!(command, Command::Sync { diagnostic: true });
     #[cfg(unix)]
     {
         match unix::run(command) {
             Ok(code) => code,
             Err(error) => {
-                eprintln!("aterm secrets: {error}");
+                if diagnostic {
+                    println!(
+                        "{}",
+                        crate::sync_diagnostic::SyncDiagnostic::Failed(error.kind()).line()
+                    );
+                } else {
+                    eprintln!("aterm secrets: {error}");
+                }
                 ExitCode::FAILURE
             }
         }
@@ -137,7 +163,14 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     #[cfg(not(unix))]
     {
         let _ = command;
-        eprintln!("aterm secrets: available on macOS and Linux only");
+        if diagnostic {
+            println!(
+                "{}",
+                crate::sync_diagnostic::SyncDiagnostic::Failed(crate::ErrorKind::Other).line()
+            );
+        } else {
+            eprintln!("aterm secrets: available on macOS and Linux only");
+        }
         ExitCode::from(2)
     }
 }
@@ -153,10 +186,16 @@ enum Command {
         wait: bool,
         password_stdin: bool,
     },
-    Sync,
+    Sync {
+        diagnostic: bool,
+    },
     Watch,
     Ls,
     Get(String),
+    GitCredential {
+        dev_user: Option<String>,
+        operation: Option<String>,
+    },
     Create {
         source: String,
         import: Option<String>,
@@ -188,6 +227,7 @@ enum Command {
     Revoke {
         host: String,
         drop_sections: bool,
+        stolen: bool,
     },
     Retire(Vec<String>),
     Admins {
@@ -196,6 +236,7 @@ enum Command {
     },
     RotateKey,
     CommonsInit,
+    Genesis(String),
     Serve(Vec<String>),
     Agent {
         action: Action,
@@ -321,7 +362,7 @@ struct ServeSettings {
 
 /// The name `serve` registers over mDNS, as its flags give it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Advertise {
+pub(crate) enum Advertise {
     /// `--advertise <name>`.
     Named(String),
     /// Neither flag, on macOS, answering where the ALab URL points (every address, port 7484):
@@ -387,6 +428,96 @@ fn alab_role(
         pins.push((crate::ALAB_VAULT.to_string(), key));
     }
     (advertised, held_back)
+}
+
+/// Apply ALab member server-role rules (`DESIGN-fluid-swarm` §4.1 F6 & F7): every active ALab
+/// member pins the ALab vault key and advertises `_alab-vault._tcp` under its own `<label>.local`
+/// while [`crate::server::AlabNameWatcher`] governs `alab-secrets.local` with no lease.
+#[cfg(unix)]
+pub(crate) fn alab_policy_role(
+    advertise: Option<String>,
+    held_back: Option<String>,
+    policy_role: Option<(bool, Option<String>)>,
+    pins: &mut Vec<(String, [u8; 32])>,
+    alab_key: Option<[u8; 32]>,
+) -> (Option<String>, Option<String>) {
+    let Some((pin_alab, own_label)) = policy_role else {
+        return (advertise, held_back);
+    };
+    if pin_alab
+        && !pins.iter().any(|(name, _)| name == crate::ALAB_VAULT)
+        && let Some(key) = alab_key
+    {
+        pins.push((crate::ALAB_VAULT.to_string(), key));
+    }
+    if let Some(label) = own_label.filter(|l| {
+        !l.is_empty() && l != crate::alab_advertised() && crate::text::valid_machine_name(l)
+    }) {
+        if advertise.as_deref() == Some(crate::alab_advertised()) {
+            return (Some(label), None);
+        }
+        if advertise.is_none() && held_back.is_some() && pin_alab {
+            return (Some(label), None);
+        }
+    }
+    (advertise, held_back)
+}
+
+/// The store directory a `secrets serve …` argument list (`args` after the `aterm` executable)
+/// serves when this build parses every flag cleanly, and the URL of the ALab vault that server
+/// answers on this Mac (its listening address, loopback for an unspecified one)
+/// (`DESIGN-fluid-swarm` §4.1 F6).
+#[cfg(unix)]
+pub(crate) fn served_by(
+    paths: &crate::client::Paths,
+    args: &[String],
+) -> Option<(std::path::PathBuf, String)> {
+    let tail = args.strip_prefix(["secrets".to_owned(), "serve".to_owned()].as_slice())?;
+    let f = flags(tail, SERVE_VALUED, SERVE_SWITCHES).ok()?;
+    no_operands(&f, "aterm secrets serve").ok()?;
+    let mut settings = serve_settings(&f).ok()?;
+    let store = settings
+        .store
+        .as_deref()
+        .map_or_else(|| paths.served(), |dir| unix::store_dir(paths, dir));
+    // `local_url` names the first pinned vault: this asks for the ALab vault's.
+    settings.pins.clear();
+    Some((store, unix::local_url(&settings)))
+}
+
+/// Decide the advertised mDNS name and ALab pin for one tick of `serve` (`DESIGN-fluid-swarm`
+/// §4.1 F1: evaluated on each advert tick rather than once at start).
+#[cfg(unix)]
+pub(crate) fn decide_serve_role(
+    advertise: &Advertise,
+    store: &std::path::Path,
+    paths: &crate::client::Paths,
+    pins: &mut Vec<(String, [u8; 32])>,
+    alab_key: Option<[u8; 32]>,
+) -> (Option<String>, Option<String>) {
+    // A copy alone does not make this ALab's server: its Mac must follow the ALab vault too, by
+    // the vault's line, so a release that retires its key changes nothing here.
+    let follows = crate::client::config(paths)
+        .ok()
+        .flatten()
+        .is_some_and(|config| {
+            config.signer.is_some_and(|signer| {
+                crate::envelope::Retired::compiled().lineage(&signer, &config.followed)
+            })
+        });
+    let here = match (crate::server::holds_alab(store), follows) {
+        (true, true) => AlabHere::Server,
+        (true, false) => AlabHere::Copy,
+        (false, _) => AlabHere::Empty,
+    };
+    let (advertised, held_back) = alab_role(advertise.clone(), here, pins, alab_key);
+    alab_policy_role(
+        advertised,
+        held_back,
+        crate::client::steward_alab_policy_role(paths),
+        pins,
+        alab_key,
+    )
 }
 
 fn serve_settings(f: &Flags) -> Result<ServeSettings, String> {
@@ -493,8 +624,11 @@ fn parse(words: &[String]) -> Result<Command, String> {
             })
         }
         "sync" => {
-            no_operands(&flags(rest, &[], &[])?, "sync")?;
-            Ok(Command::Sync)
+            let flags = flags(rest, &[], &["--diagnostic"])?;
+            no_operands(&flags, "sync")?;
+            Ok(Command::Sync {
+                diagnostic: flags.has("--diagnostic"),
+            })
         }
         "watch" => {
             no_operands(&flags(rest, &[], &[])?, "watch")?;
@@ -510,6 +644,25 @@ fn parse(words: &[String]) -> Result<Command, String> {
                 [name] => Ok(Command::Get(name.clone())),
                 _ => Err("get takes one name".into()),
             }
+        }
+        "git-credential" => {
+            let f = flags(rest, &["--dev-user"], &[])?;
+            if f.operands.len() > 1 {
+                return Err("git-credential takes at most one operation".into());
+            }
+            let dev_users = f.all("--dev-user");
+            if dev_users.len() > 1 {
+                return Err("git-credential takes at most one --dev-user".into());
+            }
+            if let Some(user) = dev_users.first()
+                && !is_github_login(user)
+            {
+                return Err("git-credential --dev-user takes a GitHub login".into());
+            }
+            Ok(Command::GitCredential {
+                dev_user: dev_users.into_iter().next(),
+                operation: f.operands.first().cloned(),
+            })
         }
         "create" => {
             let f = flags(rest, &["--import", "--name"], &["--no-agent", "--serve"])?;
@@ -668,11 +821,12 @@ fn parse(words: &[String]) -> Result<Command, String> {
             }
         }
         "revoke" => {
-            let f = flags(rest, &[], &["--drop-sections"])?;
+            let f = flags(rest, &[], &["--drop-sections", "--stolen"])?;
             match f.operands.as_slice() {
                 [host] => Ok(Command::Revoke {
                     host: host.clone(),
                     drop_sections: f.has("--drop-sections"),
+                    stolen: f.has("--stolen"),
                 }),
                 _ => Err("revoke takes one host".into()),
             }
@@ -696,6 +850,13 @@ fn parse(words: &[String]) -> Result<Command, String> {
             match f.operands.as_slice() {
                 [verb] if verb == "init" => Ok(Command::CommonsInit),
                 _ => Err("commons takes init".into()),
+            }
+        }
+        "genesis" => {
+            let f = flags(rest, &[], &[])?;
+            match f.operands.as_slice() {
+                [file] => Ok(Command::Genesis(file.clone())),
+                _ => Err("genesis takes the new file to write".into()),
             }
         }
         "serve" => {
@@ -743,10 +904,22 @@ fn parse(words: &[String]) -> Result<Command, String> {
     }
 }
 
+/// Whether `value` is a syntactically valid GitHub account login.
+fn is_github_login(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 39
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && !value.contains("--")
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
 #[cfg(unix)]
 mod unix {
     use super::{
-        Action, Command, Fill, Password, SERVE_SWITCHES, SERVE_VALUED, alab_role, flags,
+        Action, Command, Fill, Password, SERVE_SWITCHES, SERVE_VALUED, flags, is_github_login,
         serve_settings,
     };
     use crate::client::{
@@ -765,20 +938,20 @@ mod unix {
     use zeroize::Zeroize;
 
     /// What an open vault means, said where one is made or shown.
-    const OPEN_VAULT: &str = "this vault is open: every machine that reaches its server and asks to join is let in within seconds, with no password or code, and reads [everyone]'s entries; a key you let go comes back only by its code, but a machine that makes a new key asks as a new machine (aterm secrets password set closes the vault)";
+    const OPEN_VAULT: &str = "this vault is open: a machine joins with no password or code once a person presses Allow on any member and types the phrase it shows, and reads [everyone]'s entries; a key you let go comes back only by its code, but a machine that makes a new key asks as a new machine (aterm secrets password set also lets in a machine that types the join password)";
 
     /// What a vault at a path says where one served at a URL says whom its `[join]` lets in: a
     /// path has no join queue, so nothing lets a machine in by itself there.
     const PATH_JOINS: &str = "a vault at a path has no join queue: a machine joins it only when an admin approves its key: aterm secrets approve <age1…> --name <host>";
 
     /// What a publish that let a machine go from an open vault says: only its key is kept out,
-    /// since an open vault lets in any new key that reaches the server.
-    const KEPT_OUT: &str = "the vault stays open, but not to the key you let go: it is a `code-only` line in [join], so that key is let back in only by its code (aterm secrets approve). The vault still lets in any new key that reaches its server, so if the machine was lost or compromised, close the vault now (aterm secrets password set), let go any machine in [machines] (aterm secrets edit) it may have joined as since, even under its old name, and only then rotate what it could read";
+    /// since a new key still joins by a person's Allow on any member.
+    const KEPT_OUT: &str = "the vault stays open, but not to the key you let go: it is a `code-only` line in [join], so that key is let back in only by its code (aterm secrets approve), never by a member's Allow. A new key still joins when a person presses Allow on any member, so if the machine was lost or compromised, let go any machine in [machines] (aterm secrets edit) it may have joined as since, even under its old name, and only then rotate what it could read";
 
     /// [`KEPT_OUT`] for a vault at a path: only an admin's approve of a key lets a machine in
     /// there, which a `code-only` line does not stop. A server may still serve the file
     /// (`server::take_from_store`), so the text gives [`KEPT_OUT`]'s steps too.
-    const KEPT_OUT_AT_A_PATH: &str = "at a path no server serves, the key you let go comes back only when an admin approves it (aterm secrets approve <age1…> --name <host>): if the machine was lost or compromised, rotate what it could read. If aterm secrets serve serves this file, it serves this version from its next request, and the open vault still lets in any new key that reaches it: if the machine was lost or compromised, close the vault now (aterm secrets password set), let go any machine in [machines] (aterm secrets edit) it may have joined as since, even under its old name, and only then rotate what it could read";
+    const KEPT_OUT_AT_A_PATH: &str = "at a path no server serves, the key you let go comes back only when an admin approves it (aterm secrets approve <age1…> --name <host>): if the machine was lost or compromised, rotate what it could read. If aterm secrets serve serves this file, it serves this version from its next request, and a new key still joins it when a person presses Allow on any member: if the machine was lost or compromised, let go any machine in [machines] (aterm secrets edit) it may have joined as since, even under its old name, and only then rotate what it could read";
 
     /// What marks a request whose key a `code-only` line names, where an open vault's requests
     /// are listed.
@@ -803,6 +976,13 @@ mod unix {
         "an admin Mac on an aterm older than open vaults cannot open this vault until it updates";
 
     pub(super) fn run(command: Command) -> crate::Result<ExitCode> {
+        if let Command::GitCredential {
+            dev_user,
+            operation,
+        } = command
+        {
+            return git_credential(dev_user.as_deref(), operation.as_deref());
+        }
         let paths = Paths::live()?;
         let state = || service::state(&paths.home, Job::Subscriber);
         // A command that needs an approver turns the subscriber on (clearing an off record)
@@ -828,7 +1008,7 @@ mod unix {
                 wait,
                 password_stdin,
             } => join(&paths, &source, name, agent, wait, password_stdin),
-            Command::Sync => sync(&paths),
+            Command::Sync { diagnostic } => sync(&paths, diagnostic),
             Command::Watch => {
                 client::watch(&paths, &|line| {
                     crate::log_line(&format!("{} {line}", stamp()));
@@ -842,6 +1022,7 @@ mod unix {
                 Ok(ExitCode::SUCCESS)
             }
             Command::Get(name) => get(&paths, &name),
+            Command::GitCredential { .. } => unreachable!(),
             Command::Create {
                 source,
                 import,
@@ -864,7 +1045,7 @@ mod unix {
             Command::Unset { name, hosts } => {
                 let admin = client::admin_open(&paths)?;
                 let mut doc = admin.doc.clone();
-                let hosts = machines_named(&doc, &hosts)?;
+                let hosts = machines_named_in_vault(&paths, &admin, &hosts)?;
                 if !doc
                     .unset_entry(&audience(&hosts), &name)
                     .map_err(text_error)?
@@ -883,7 +1064,8 @@ mod unix {
             Command::Revoke {
                 host,
                 drop_sections,
-            } => revoke(&paths, &host, drop_sections),
+                stolen,
+            } => revoke(&paths, &host, drop_sections, stolen),
             Command::Retire(subjects) => {
                 let admin = client::admin_open(&paths)?;
                 let retired = client::admin_retire(&paths, &admin, &subjects)?;
@@ -896,7 +1078,7 @@ mod unix {
             Command::Admins { add, host } => {
                 let admin = client::admin_open(&paths)?;
                 let mut doc = admin.doc.clone();
-                let host = client::machine_named(&doc, &host)?;
+                let host = client::machine_named_in_vault(&paths, &admin, &host)?;
                 if add {
                     doc.add_admin(&host).map_err(text_error)?;
                     let done = client::admin_publish_admin(&paths, &admin, &doc, &host)?;
@@ -942,6 +1124,15 @@ mod unix {
                 }
                 Ok(ExitCode::SUCCESS)
             }
+            Command::Genesis(file) => {
+                let done = client::admin_sign_genesis(&paths, Path::new(&file))?;
+                println!(
+                    "Genesis v2 digest {}, {} members",
+                    aterm_codec::hex::encode_lower(&done.digest),
+                    done.members
+                );
+                Ok(ExitCode::SUCCESS)
+            }
             Command::Serve(args) => serve(&paths, &args),
             Command::Agent {
                 action,
@@ -976,7 +1167,10 @@ mod unix {
         Error::new(error.to_string())
     }
 
-    /// The machines `words` name in `doc`, each by [`client::machine_named`].
+    /// The machines `words` name in `doc`, each by [`client::machine_named`]: the tests' reading
+    /// of a document alone, where the verbs read the vault ([`machines_named_in_vault`]).
+    #[cfg(test)]
+    #[cfg(test)]
     pub(super) fn machines_named(
         doc: &text::Document,
         words: &[String],
@@ -984,6 +1178,17 @@ mod unix {
         words
             .iter()
             .map(|word| client::machine_named(doc, word))
+            .collect()
+    }
+
+    fn machines_named_in_vault(
+        paths: &Paths,
+        admin: &client::Admin,
+        words: &[String],
+    ) -> crate::Result<Vec<String>> {
+        words
+            .iter()
+            .map(|word| client::machine_named_in_vault(paths, admin, word))
             .collect()
     }
 
@@ -1281,7 +1486,7 @@ mod unix {
             return None;
         };
         let mut join = String::from("aterm secrets join");
-        if url != crate::ALAB_DEFAULT_URL {
+        if !crate::is_alab_default_url(url) {
             join.push(' ');
             join.push_str("<vault-url>");
         }
@@ -1289,7 +1494,7 @@ mod unix {
             join.push_str(" --name ");
             join.push_str(name);
         }
-        let source_note = if url == crate::ALAB_DEFAULT_URL {
+        let source_note = if crate::is_alab_default_url(url) {
             ""
         } else {
             "; replace <vault-url> with this vault's full configured URL, including any query or signer pin"
@@ -1332,7 +1537,26 @@ mod unix {
     }
 
     fn service_line(paths: &Paths, job: Job) -> String {
-        service_words(&service::state(&paths.home, job))
+        let user_state = service::state(&paths.home, job);
+        if job == Job::Server && matches!(user_state, Ok(service::State::Absent)) {
+            return match service::daemon_state_for_home(&paths.home) {
+                Ok(service::State::Absent) => "not installed".into(),
+                Ok(service::State::Installed { pid: Some(pid), .. }) => {
+                    format!(
+                        "running as LaunchDaemon {} (pid {pid})",
+                        service::DAEMON_LABEL
+                    )
+                }
+                Ok(service::State::Installed { pid: None, .. }) => {
+                    format!(
+                        "LaunchDaemon {} installed, not running",
+                        service::DAEMON_LABEL
+                    )
+                }
+                Err(error) => format!("unknown ({error})"),
+            };
+        }
+        service_words(&user_state)
     }
 
     fn service_words(state: &crate::Result<service::State>) -> String {
@@ -1408,11 +1632,12 @@ mod unix {
         doc.open().then_some(OPEN_VAULT)
     }
 
-    /// Who an approver for `approval` lets in.
-    const fn joiner(approval: Approval) -> &'static str {
+    /// Who an approver for `approval` lets in: an open vault admits nothing new by itself, only
+    /// a machine a person allowed on a member (docs/DESIGN-fluid-swarm-2026-10-28.md F10).
+    pub(super) const fn joiner(approval: Approval) -> &'static str {
         match approval {
             Approval::Password => "a machine that types the join password",
-            Approval::Open => "a machine that asks to join",
+            Approval::Open => "a machine allowed on any member",
         }
     }
 
@@ -1573,6 +1798,22 @@ mod unix {
                 status.names.join(", ")
             );
         }
+        match client::conflicts(paths) {
+            Ok(conflicts) if !conflicts.is_empty() => println!(
+                "conflict: {} (saved with different values while apart; every Mac writes the same one, and aterm secrets set <name> picks it)",
+                conflicts.join(", ")
+            ),
+            Ok(_) => {}
+            Err(error) => println!("conflict: unreadable ({error})"),
+        }
+        match crate::need::peek(paths) {
+            Ok(needs) => {
+                if let Some(line) = crate::need::status_line(&needs) {
+                    println!("{line}");
+                }
+            }
+            Err(error) => println!("needs: unreadable ({error})"),
+        }
         if status.config.is_some() {
             let state = (subscriber.state)();
             println!("subscriber: {}", service_words(&state));
@@ -1647,7 +1888,7 @@ mod unix {
         let given = Cell::new(from_pipe);
         let ask_password = || -> Option<SecretBytes> {
             let password = ask_hidden(
-                "Join password (an admin Mac shows it: aterm secrets password; Enter joins without one: an open vault lets this Mac in, any other waits for approval by code): ",
+                "Join password (an admin Mac shows it: aterm secrets password; Enter joins without one and waits for Allow on any member, or for approval by code): ",
             )
             .filter(|typed| !typed.as_slice().trim_ascii().is_empty());
             given.set(password.is_some());
@@ -1739,15 +1980,23 @@ mod unix {
         })
     }
 
-    fn sync(paths: &Paths) -> crate::Result<ExitCode> {
-        let held = |served: Option<u64>| {
-            served.map_or("no vault".to_string(), |served| {
-                format!("seq {served}, older than this Mac's")
-            })
-        };
+    pub(super) fn sync_diagnostic(paths: &Paths) -> crate::sync_diagnostic::SyncDiagnostic {
+        use crate::sync_diagnostic::SyncDiagnostic;
+        match sync_outcome(paths) {
+            Ok((SyncOutcome::Applied { seq, report }, _)) => SyncDiagnostic::Applied {
+                seq,
+                failed: report.failed.len() as u64,
+            },
+            Ok((SyncOutcome::Unchanged { seq }, _)) => SyncDiagnostic::Unchanged(seq),
+            Ok((SyncOutcome::PutBack { seq, .. }, _)) => SyncDiagnostic::PutBack(seq),
+            Ok((SyncOutcome::NotIn, _)) => SyncDiagnostic::NotIn,
+            Err(error) => SyncDiagnostic::Failed(error.kind()),
+        }
+    }
+
+    fn sync_outcome(paths: &Paths) -> crate::Result<(SyncOutcome, Option<Option<u64>>)> {
         let mut outcome = client::sync(paths, None)?;
-        // A put-back writes no file here: files still unsettled are applied from the copy the
-        // source holds now. The first line says what the sync did, as before (a caller reads it).
+        // Restore local files after putting the held version back on its source.
         let mut put_back = None;
         if let SyncOutcome::PutBack { served, .. } = outcome
             && !client::materialization_ready(paths)?
@@ -1755,6 +2004,27 @@ mod unix {
             put_back = Some(served);
             outcome = client::sync(paths, None)?;
         }
+        Ok((outcome, put_back))
+    }
+
+    fn sync(paths: &Paths, diagnostic: bool) -> crate::Result<ExitCode> {
+        if diagnostic {
+            let outcome = sync_diagnostic(paths);
+            println!("{}", outcome.line());
+            return Ok(if outcome.success() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            });
+        }
+        let held = |served: Option<u64>| {
+            served.map_or("no vault".to_string(), |served| {
+                format!("seq {served}, older than this Mac's")
+            })
+        };
+        let (outcome, put_back) = sync_outcome(paths)?;
+        // A put-back writes no file here: files still unsettled are applied from the copy the
+        // source holds now. The first line says what the sync did, as before (a caller reads it).
         let first_put_back = || {
             if let Some(served) = put_back {
                 println!(
@@ -1781,6 +2051,9 @@ mod unix {
                 }
                 for (name, why) in &report.failed {
                     println!("  {name}: failed: {why}");
+                }
+                for (name, why) in &report.refused {
+                    println!("  {name}: not written: {why}");
                 }
                 Ok(if report.failed.is_empty() {
                     ExitCode::SUCCESS
@@ -1846,6 +2119,291 @@ mod unix {
             ))
         })?;
         Ok(value)
+    }
+
+    const DEV_TOKEN_FILE: &str = ".secrets/gh_access_token";
+    const RELEASE_TOKEN_FILE: &str = ".secrets/gh_access_token_alabsystems";
+    const CREDENTIAL_QUIT: &[u8] = b"quit=1\n";
+    const CREDENTIAL_INPUT_MAX: usize = 64 * 1024;
+    const CREDENTIAL_TOKEN_MAX: usize = 4 * 1024;
+    const VAULT_RECORD_MAX: usize = 4 * 1024;
+    const INIT_TOML_MAX: usize = 64 * 1024;
+
+    /// `aterm secrets git-credential [--dev-user <login>] [<op>]`: git's credential helper over
+    /// `~/.secrets`. Answers on `get` only; `store`, `erase` and unknown operations write nothing
+    /// and exit 0.
+    fn git_credential(dev_user: Option<&str>, operation: Option<&str>) -> crate::Result<ExitCode> {
+        let stdin = std::io::stdin();
+        let is_terminal = stdin.is_terminal();
+        let home = aterm_types::dirs::home_dir();
+        let xdg_config = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+        let reply = git_credential_reply(
+            home.as_deref(),
+            xdg_config.as_deref(),
+            dev_user,
+            operation,
+            is_terminal,
+            &mut stdin.lock(),
+        );
+        if !reply.as_slice().is_empty() {
+            let mut out = std::io::stdout().lock();
+            out.write_all(reply.as_slice())?;
+            out.flush()?;
+        }
+        Ok(ExitCode::SUCCESS)
+    }
+
+    /// Pure-input seam for [`git_credential`]: returns the exact stdout reply bytes, wiped on
+    /// drop (`SecretBytes`).
+    pub(super) fn git_credential_reply(
+        home: Option<&Path>,
+        xdg_config_home: Option<&Path>,
+        dev_user: Option<&str>,
+        operation: Option<&str>,
+        is_terminal: bool,
+        input: &mut dyn Read,
+    ) -> SecretBytes {
+        if operation != Some("get") {
+            return SecretBytes::new(Vec::new());
+        }
+        if is_terminal {
+            return SecretBytes::new(CREDENTIAL_QUIT.to_vec());
+        }
+        let Some(raw) = read_credential_attributes(input) else {
+            return SecretBytes::new(Vec::new());
+        };
+        let Ok(text) = std::str::from_utf8(raw.as_slice()) else {
+            return SecretBytes::new(Vec::new());
+        };
+        if text.contains('\0') {
+            return SecretBytes::new(Vec::new());
+        }
+        let (mut protocol, mut host, mut username) = (None, None, None);
+        for line in text.split('\n') {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if line.is_empty() {
+                break;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                return SecretBytes::new(Vec::new());
+            };
+            match key {
+                "protocol" => protocol = Some(value),
+                "host" => host = Some(value),
+                "username" => username = Some(value),
+                _ => {}
+            }
+        }
+        if !protocol.is_some_and(|p| p.eq_ignore_ascii_case("https"))
+            || !host.is_some_and(is_github_credential_host)
+        {
+            return SecretBytes::new(Vec::new());
+        }
+        let Some(home) = home else {
+            return SecretBytes::new(CREDENTIAL_QUIT.to_vec());
+        };
+        let public = aterm_types::channel::PUBLIC_OWNER;
+        if username.is_some_and(|u| u.eq_ignore_ascii_case(public)) {
+            return match read_credential_token(&home.join(RELEASE_TOKEN_FILE)) {
+                Some(token) => format_credential_reply(public, &token),
+                None => SecretBytes::new(CREDENTIAL_QUIT.to_vec()),
+            };
+        }
+        if username.is_none_or(|u| u.is_empty() || u.eq_ignore_ascii_case("x-access-token")) {
+            let Some(token) = read_credential_token(&home.join(DEV_TOKEN_FILE)) else {
+                return SecretBytes::new(CREDENTIAL_QUIT.to_vec());
+            };
+            let out_user = match username.filter(|u| !u.is_empty()) {
+                Some(explicit) => explicit.to_owned(),
+                None => known_dev_login(home, xdg_config_home, dev_user, Some(token.as_slice()))
+                    .unwrap_or_else(|| "x-access-token".to_owned()),
+            };
+            return format_credential_reply(&out_user, &token);
+        }
+        let requested = username.unwrap_or_default();
+        if !is_github_login(requested) {
+            return SecretBytes::new(Vec::new());
+        }
+        let token = read_credential_token(&home.join(DEV_TOKEN_FILE));
+        let known = known_dev_login(
+            home,
+            xdg_config_home,
+            dev_user,
+            token.as_ref().map(SecretBytes::as_slice),
+        );
+        if known
+            .as_deref()
+            .is_some_and(|login| login.eq_ignore_ascii_case(requested))
+        {
+            match token {
+                Some(token) => format_credential_reply(requested, &token),
+                None => SecretBytes::new(CREDENTIAL_QUIT.to_vec()),
+            }
+        } else {
+            SecretBytes::new(Vec::new())
+        }
+    }
+
+    fn read_credential_attributes(input: &mut dyn Read) -> Option<SecretBytes> {
+        let mut buf = Vec::with_capacity(128);
+        let mut line_len = 0usize;
+        let mut byte = [0u8; 1];
+        loop {
+            match input.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if buf.len() >= CREDENTIAL_INPUT_MAX {
+                        buf.zeroize();
+                        return None;
+                    }
+                    let b = byte[0];
+                    byte.zeroize();
+                    buf.push(b);
+                    if b == b'\n' {
+                        let content_len = if line_len > 0 && buf[buf.len() - 2] == b'\r' {
+                            line_len - 1
+                        } else {
+                            line_len
+                        };
+                        if content_len == 0 {
+                            break;
+                        }
+                        line_len = 0;
+                    } else {
+                        line_len += 1;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    byte.zeroize();
+                    buf.zeroize();
+                    return None;
+                }
+            }
+        }
+        Some(SecretBytes::new(buf))
+    }
+
+    fn is_github_credential_host(host: &str) -> bool {
+        let host = match host.rsplit_once(':') {
+            Some((name, port)) if !port.is_empty() && port.trim_start_matches('0') == "443" => name,
+            Some(_) => return false,
+            None => host,
+        };
+        let host = match host.strip_suffix('.') {
+            Some(rest) if !rest.is_empty() => rest,
+            _ => host,
+        };
+        host.eq_ignore_ascii_case("github.com") || host.eq_ignore_ascii_case("gist.github.com")
+    }
+
+    fn read_credential_token(path: &Path) -> Option<SecretBytes> {
+        let raw = fsx::read_private(path, CREDENTIAL_TOKEN_MAX)
+            .ok()
+            .flatten()?;
+        let trimmed = raw.as_slice().trim_ascii();
+        if trimmed.is_empty() || !trimmed.iter().all(u8::is_ascii_graphic) {
+            return None;
+        }
+        Some(SecretBytes::new(trimmed.to_vec()))
+    }
+
+    fn format_credential_reply(username: &str, token: &SecretBytes) -> SecretBytes {
+        let mut out = Vec::with_capacity(
+            "username=\npassword=\n".len() + username.len() + token.as_slice().len(),
+        );
+        out.extend_from_slice(b"username=");
+        out.extend_from_slice(username.as_bytes());
+        out.extend_from_slice(b"\npassword=");
+        out.extend_from_slice(token.as_slice());
+        out.extend_from_slice(b"\n");
+        SecretBytes::new(out)
+    }
+
+    fn known_dev_login(
+        home: &Path,
+        xdg_config_home: Option<&Path>,
+        explicit: Option<&str>,
+        loaded_token: Option<&[u8]>,
+    ) -> Option<String> {
+        if let Some(explicit) = explicit {
+            return Some(explicit.to_owned());
+        }
+        if let Some(login) = agh_recorded_dev_login(home, xdg_config_home, loaded_token) {
+            return Some(login);
+        }
+        init_toml_github_account(home)
+    }
+
+    fn agh_recorded_dev_login(
+        home: &Path,
+        xdg_config_home: Option<&Path>,
+        loaded_token: Option<&[u8]>,
+    ) -> Option<String> {
+        let config_dir = match xdg_config_home.filter(|p| p.is_absolute()) {
+            Some(xdg) => xdg.join("aterm"),
+            None => home.join(".config").join("aterm"),
+        };
+        let bytes = fsx::read_owned(&config_dir.join("agh").join("vault.toml"), VAULT_RECORD_MAX)
+            .ok()
+            .flatten()?;
+        let text = std::str::from_utf8(&bytes).ok()?;
+        let Ok(aterm_toml::Value::Table(table)) = aterm_toml::from_str::<aterm_toml::Value>(text)
+        else {
+            return None;
+        };
+        let dev = table.get("dev").and_then(aterm_toml::Value::as_table)?;
+        let login = dev.get("login").and_then(aterm_toml::Value::as_str)?;
+        let fp = dev.get("fingerprint").and_then(aterm_toml::Value::as_str)?;
+        if !is_github_login(login)
+            || fp.len() != 12
+            || !fp
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return None;
+        }
+        if let Some(token) = loaded_token
+            && fp.as_bytes() != agh_fingerprint(token)
+        {
+            return None;
+        }
+        Some(login.to_owned())
+    }
+
+    pub(super) fn agh_fingerprint(token: &[u8]) -> [u8; 12] {
+        let mut hasher = aterm_digest::Sha256::new();
+        hasher.update(b"agh/fp/v1\0");
+        hasher.update(token);
+        let digest = hasher.finalize();
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut hex = [0u8; 12];
+        for (i, &byte) in digest[..6].iter().enumerate() {
+            hex[i * 2] = DIGITS[usize::from(byte >> 4)];
+            hex[i * 2 + 1] = DIGITS[usize::from(byte & 0x0f)];
+        }
+        hex
+    }
+
+    fn init_toml_github_account(home: &Path) -> Option<String> {
+        let bytes = fsx::read_owned(
+            &home.join(".config").join("aterm").join("init.toml"),
+            INIT_TOML_MAX,
+        )
+        .ok()
+        .flatten()?;
+        let text = std::str::from_utf8(&bytes).ok()?;
+        let Ok(aterm_toml::Value::Table(table)) = aterm_toml::from_str::<aterm_toml::Value>(text)
+        else {
+            return None;
+        };
+        table
+            .get("github")
+            .and_then(aterm_toml::Value::as_table)
+            .and_then(|gh| gh.get("account"))
+            .and_then(aterm_toml::Value::as_str)
+            .filter(|account| is_github_login(account))
+            .map(str::to_owned)
     }
 
     /// `create`, then, for a vault at a URL, this Mac's approver unless `--no-agent`
@@ -1923,9 +2481,11 @@ mod unix {
             };
             match approval {
                 Some(Approval::Open) => {
-                    println!("the vault is open: every machine that asks to join is let in {by}");
                     println!(
-                        "to close it: aterm secrets password new (a join password) or password off (approval by code)"
+                        "the vault is open: a machine a person allows on any member is let in {by}"
+                    );
+                    println!(
+                        "a join password lets a machine in with no Allow: aterm secrets password new"
                     );
                 }
                 Some(Approval::Password) => {
@@ -1996,8 +2556,8 @@ mod unix {
             (Action::On, false),
             None,
             serve_args(serve),
-        )?;
-        Ok(())
+        )
+        .map(|_| ())
     }
 
     /// `secrets serve` and the flags `serve` names: the server job's arguments.
@@ -2182,6 +2742,9 @@ mod unix {
                 None => Err(Error::new("the file is not UTF-8")),
             };
             let confirmed = parsed.and_then(|mut doc| {
+                if let Some(why) = doc.added_cli_login(&admin.doc) {
+                    return Err(Error::new(why));
+                }
                 let kept = client::keep_admitted(&base, &admin.doc, &mut doc)?;
                 if !kept.is_empty() {
                     eprintln!("keeping {}: admitted while you edited", kept.join(", "));
@@ -2295,6 +2858,9 @@ mod unix {
                 "{name:?} is not a valid name (letters, digits, . _ -; or ~/a/b)"
             )));
         }
+        if let Some(why) = text::cli_login_refusal(name) {
+            return Err(Error::new(why));
+        }
         let value = match file {
             Some(file) => {
                 let path = expand(paths, &file);
@@ -2327,9 +2893,11 @@ mod unix {
                 "the value is empty; aterm secrets unset {name} removes an entry"
             )));
         }
-        let admin = client::admin_open(paths)?;
-        let hosts = &machines_named(&admin.doc, hosts)?;
+        let mut admin = client::admin_open(paths)?;
+        let hosts = &machines_named_in_vault(paths, &admin, hosts)?;
         let (doc, anchor) = set_in(&admin.doc, &audience(hosts), name, value.as_slice(), fill)?;
+        // A person's save settles a conflict the log holds for this entry.
+        admin.resolving(&audience(hosts), name);
         let done = client::admin_publish(paths, &admin, &doc)?;
         let gaps = match (fill.if_absent, anchor) {
             (false, _) => String::new(),
@@ -2395,18 +2963,15 @@ mod unix {
                     return Ok(ExitCode::SUCCESS);
                 }
                 let waiting = client::requests(paths, Some(&doc))?;
-                if interactive() {
-                    admit_on_opening(
-                        &mut doc,
-                        waiting,
-                        &mut |line| eprintln!("{line}"),
-                        &mut |question| yes(ask(question)),
-                    )?;
-                }
-                doc.set_open(true).map_err(text_error)?;
-                // Opening the vault's bulk prompt is not a pairing-code check
-                // and does not create Manual Commons admission evidence.
-                let done = client::admin_publish(paths, &admin, &doc)?;
+                let (mut say, mut agree) = (
+                    |line: String| eprintln!("{line}"),
+                    |question: &str| yes(ask(question)),
+                );
+                let terminal = interactive().then_some((
+                    &mut say as &mut dyn FnMut(String),
+                    &mut agree as &mut dyn FnMut(&str) -> bool,
+                ));
+                let done = open_vault(paths, &admin, &mut doc, waiting, terminal)?;
                 let code = published("opened the vault", &done);
                 if let Some(words) = lets_in_words(queued, &doc) {
                     println!("{words}");
@@ -2478,13 +3043,39 @@ mod unix {
         }
     }
 
-    /// What `password open` at a terminal does with the requests `waiting` as it opens the vault.
+    /// The person at a terminal as `password open` asks them: where a line is said, and what
+    /// answers a yes-or-no question ([`admit_on_opening`]).
+    pub(super) type Terminal<'a> = (&'a mut dyn FnMut(String), &'a mut dyn FnMut(&str) -> bool);
+
+    /// `password open` over a closed vault: opens `doc` and publishes it, each request in
+    /// `waiting` that the person at `terminal` lets in ([`admit_on_opening`]; none without one)
+    /// a machine in the same publish. Each is recorded as the open vault's approver records the
+    /// same admission (`Open`, never `Manual`: the prompt checks no code; through
+    /// [`client::admin_publish_opened`]), so in a vault with Commons control the publish shares
+    /// the control entry with it and it enrolls, as a machine the approver lets in does.
+    pub(super) fn open_vault(
+        paths: &Paths,
+        admin: &client::Admin,
+        doc: &mut text::Document,
+        waiting: Vec<client::Request>,
+        terminal: Option<Terminal<'_>>,
+    ) -> crate::Result<Published> {
+        let admitted = match terminal {
+            Some((say, agree)) => admit_on_opening(doc, waiting, say, agree)?,
+            None => Vec::new(),
+        };
+        doc.set_open(true).map_err(text_error)?;
+        client::admin_publish_opened(paths, admin, doc, &admitted)
+    }
+
+    /// What `password open` at a terminal does with the requests `waiting` as it opens the vault:
+    /// the keys it let in, each now a machine in `doc`.
     pub(super) fn admit_on_opening(
         doc: &mut text::Document,
         waiting: Vec<client::Request>,
         say: &mut dyn FnMut(String),
         agree: &mut dyn FnMut(&str) -> bool,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<Vec<String>> {
         let code_only = doc.code_only();
         let (mut offered, mut held, mut named) = (Vec::new(), Vec::new(), Vec::new());
         for request in &waiting {
@@ -2528,20 +3119,22 @@ mod unix {
             }
         }
         if offered.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let question = format!(
             "Let these {} in now? Any you do not know may be a machine you let go. Each reads every [everyone] secret. [y/N] ",
             offered.len()
         );
+        let mut admitted = Vec::new();
         if agree(&question) {
             for request in offered {
                 let host = client::free_name(doc, &request.host);
                 doc.add_machine(&host, &request.recipient)
                     .map_err(text_error)?;
+                admitted.push(request.recipient.clone());
             }
         }
-        Ok(())
+        Ok(admitted)
     }
 
     fn requests(paths: &Paths) -> crate::Result<ExitCode> {
@@ -2719,10 +3312,33 @@ mod unix {
         Ok(chosen)
     }
 
-    fn revoke(paths: &Paths, host: &str, drop_sections: bool) -> crate::Result<ExitCode> {
+    fn revoke(
+        paths: &Paths,
+        host: &str,
+        drop_sections: bool,
+        stolen: bool,
+    ) -> crate::Result<ExitCode> {
         let admin = client::admin_open(paths)?;
-        let host = &client::machine_named(&admin.doc, host)?;
+        let host = &client::machine_named_in_vault(paths, &admin, host)?;
         let held = exposure(&admin.doc, host);
+        if stolen {
+            let done = client::admin_revoke_stolen(paths, &admin, host, drop_sections)?;
+            let code = published(&format!("revoked {host}"), &done.revocation.published);
+            if let Some(retirement) = done.revocation.retirement {
+                println!(
+                    "Commons membership permanently retired ({} recipients, {} prior device bindings).",
+                    retirement.recipients, retirement.bindings
+                );
+            }
+            if done.fleet_code_rotated {
+                println!("rotated aterm-fleet-code in [everyone].");
+            }
+            if let Some(held) = held {
+                println!("{held}");
+            }
+            println!("{}", done.needs_you_line);
+            return Ok(code);
+        }
         let done = client::admin_revoke(paths, &admin, host, drop_sections)?;
         let code = published(&format!("revoked {host}"), &done.published);
         if let Some(retirement) = done.retirement {
@@ -2746,24 +3362,9 @@ mod unix {
             .map_or_else(|| paths.served(), |dir| store_dir(paths, dir));
         let alab_key = crate::b64::decode_padded(crate::ALAB_SIGNER)
             .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok());
-        // A copy alone does not make this ALab's server: its Mac must follow the ALab vault
-        // too, by the vault's line, so a release that retires its key changes nothing here.
-        let follows = client::config(paths).ok().flatten().is_some_and(|config| {
-            config.signer.is_some_and(|signer| {
-                crate::envelope::Retired::compiled().lineage(&signer, &config.followed)
-            })
-        });
-        let here = match (crate::server::holds_alab(&store), follows) {
-            (true, true) => super::AlabHere::Server,
-            (true, false) => super::AlabHere::Copy,
-            (false, _) => super::AlabHere::Empty,
-        };
-        let (advertise, held_back) = alab_role(
-            settings.advertise.clone(),
-            here,
-            &mut settings.pins,
-            alab_key,
-        );
+        let advertise_mode = settings.advertise.clone();
+        let (advertise, held_back) =
+            super::decide_serve_role(&advertise_mode, &store, paths, &mut settings.pins, alab_key);
         crate::log_line(&format!(
             "{} serving on {}, store {}",
             stamp(),
@@ -2773,14 +3374,26 @@ mod unix {
         if let Some(line) = held_back {
             crate::log_line(&format!("{} {line}", stamp()));
         }
-        crate::server::serve(crate::server::Options {
-            listen: settings.listen,
-            store,
-            advertise,
-            pins: settings.pins,
-            hold: settings.hold.unwrap_or(crate::server::DEFAULT_HOLD),
-            keep_awake: cfg!(target_os = "macos") && settings.keep_awake,
-        })?;
+        let role_decide: Option<crate::server::RoleDecider> =
+            (!matches!(advertise_mode, super::Advertise::Off)).then(|| {
+                let store = store.clone();
+                let paths = paths.clone();
+                Box::new(move |pins: &mut Vec<(String, [u8; 32])>| {
+                    super::decide_serve_role(&advertise_mode, &store, &paths, pins, alab_key).0
+                }) as crate::server::RoleDecider
+            });
+        crate::server::serve_with_role(
+            crate::server::Options {
+                listen: settings.listen,
+                store,
+                advertise,
+                pins: settings.pins,
+                hold: settings.hold.unwrap_or(crate::server::DEFAULT_HOLD),
+                keep_awake: cfg!(target_os = "macos") && settings.keep_awake,
+            },
+            Some(paths.clone()),
+            role_decide,
+        )?;
         Ok(ExitCode::SUCCESS)
     }
 
@@ -2795,6 +3408,21 @@ mod unix {
     ) -> crate::Result<ExitCode> {
         match action {
             Action::On => {
+                if job == Job::Server
+                    && matches!(
+                        service::daemon_state_for_home(&paths.home)?,
+                        service::State::Installed { pid: Some(_), .. }
+                    )
+                {
+                    return Err(Error::new(format!(
+                        "{} is already running as system LaunchDaemon {}; manage it with \
+                         `aterm machines apply` instead of starting a second user agent on the \
+                         same port",
+                        service::DAEMON_LABEL,
+                        service::DAEMON_PLIST
+                    )));
+                }
+                let pinned = program.is_some();
                 let program = match program {
                     Some(program) => {
                         let program = PathBuf::from(program);
@@ -2815,13 +3443,32 @@ mod unix {
                 } else {
                     service::install
                 };
-                println!("{}", install(&paths.home, job, &program, &args)?);
+                // A program a person names is their pin, which the window's mend never moves
+                // (`client::mend_held`), recorded before the install so a mend that reads the job
+                // meanwhile finds it; `on` with none puts the job on this aterm, unpinned.
+                let (line, unrecorded) = service::install_pinned(
+                    &paths.home,
+                    job,
+                    pinned.then_some(program.as_path()),
+                    || install(&paths.home, job, &program, &args),
+                )?;
+                println!("{line}");
+                if let Some(error) = unrecorded {
+                    eprintln!(
+                        "aterm secrets: {} runs, but its pin record was not changed: {error}",
+                        job.label()
+                    );
+                }
                 if job == Job::Server {
                     until_answering(args.get(2..).unwrap_or_default())?;
                 }
             }
             Action::Off => {
-                if service::turn_off(&paths.home, job)? {
+                let removed = service::turn_off(&paths.home, job)?;
+                if let Err(error) = service::clear_pin(&paths.home, job) {
+                    eprintln!("aterm secrets: {}'s pin record stays: {error}", job.label());
+                }
+                if removed {
                     println!("{} stopped and removed", job.label());
                 } else {
                     println!("{} was not installed", job.label());
@@ -2836,6 +3483,46 @@ mod unix {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_diagnostic_is_an_opt_in_flag_without_operands() {
+        assert_eq!(
+            parse(&["sync".into()]).unwrap(),
+            Command::Sync { diagnostic: false }
+        );
+        assert_eq!(
+            parse(&["sync".into(), "--diagnostic".into()]).unwrap(),
+            Command::Sync { diagnostic: true }
+        );
+        assert!(parse(&["sync".into(), "--diagnostic".into(), "extra".into()]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_diagnostic_reports_a_real_config_failure_without_its_path_or_contents() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = crate::client::Paths::for_home(root.path());
+        crate::fsx::ensure_private_dir(&paths.dir).unwrap();
+        crate::fsx::write_atomic(
+            &paths.dir.join("source.toml"),
+            b"private-value = [broken",
+            0o600,
+        )
+        .unwrap();
+        let result = unix::sync_diagnostic(&paths);
+        assert_eq!(
+            result,
+            crate::sync_diagnostic::SyncDiagnostic::Failed(crate::ErrorKind::Other)
+        );
+        assert!(!result.success());
+        let line = result.line();
+        assert!(!line.contains("private-value"));
+        assert!(!line.contains(root.path().to_str().unwrap()));
+        assert_eq!(
+            crate::sync_diagnostic::SyncDiagnostic::parse(&line),
+            Some(result)
+        );
+    }
 
     #[cfg(unix)]
     #[test]
@@ -3052,8 +3739,8 @@ mod tests {
         );
     }
 
-    /// `server on` returns once the job it started answers: a listener whose server starts
-    /// late is waited for. Negative control: an address nothing answers on ends at the hang.
+    /// `server on` returns once the job it started answers. Negative control: an address
+    /// nothing answers on ends at the hang.
     #[cfg(unix)]
     #[test]
     fn server_on_returns_once_the_server_answers() {
@@ -3068,12 +3755,9 @@ mod tests {
             hold: std::time::Duration::from_secs(1),
             keep_awake: false,
         };
-        let late = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            crate::server::start(listener, &options).expect("server starts")
-        });
+        let server = crate::server::start(listener, &options).expect("server starts");
         unix::answering(&url, std::time::Duration::from_secs(60)).expect("answered");
-        late.join().expect("started").stop();
+        server.stop();
 
         let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let nobody = format!("http://{}/v1/alab", silent.local_addr().expect("addr"));
@@ -3208,6 +3892,7 @@ mod tests {
             host: host.to_owned(),
             code: String::new(),
             at: None,
+            allowed: None,
             proof: None,
         };
         let mut said = Vec::new();
@@ -3363,6 +4048,7 @@ mod tests {
             host: host.into(),
             code: code.into(),
             at: None,
+            allowed: None,
             proof: None,
         };
         let pair = |k: &str, h: &str| (k.to_string(), h.to_string());
@@ -3427,6 +4113,97 @@ mod tests {
         }
         assert!(unix::approve(&paths, &[recipient], false, Some("wrong-host".into())).is_err());
         assert_eq!(client::admin_open(&paths).unwrap().seq(), 3);
+    }
+
+    /// `password open` at a terminal records each machine it lets in as the open vault's
+    /// approver records the same admission (`Open`; the prompt checks no code), so in a vault
+    /// with Commons control the same publish puts it in the control entry's audience.
+    /// CONTROL: a machine a plain publish adds gets no decision and stays outside, opening with
+    /// no terminal lets nothing in, and a closed vault records no open admission.
+    #[cfg(unix)]
+    #[test]
+    fn opening_at_a_terminal_records_each_machine_it_lets_in_as_the_approver_does() {
+        use crate::client::{self, AdmissionMethod};
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let paths = admin_of_a_path_vault(root.path());
+        let key = |n: u8| {
+            crate::age::Identity::from_secret_bytes([n; 32])
+                .recipient()
+                .to_bech32()
+        };
+        let request = |recipient: &str, host: &str| client::Request {
+            recipient: recipient.to_owned(),
+            host: host.to_owned(),
+            code: String::new(),
+            at: None,
+            allowed: None,
+            proof: None,
+        };
+        let in_audience = |admin: &client::Admin, host: &str| {
+            matches!(
+                admin.doc.commons_audience(),
+                Some(crate::text::Audience::Hosts(hosts)) if hosts.iter().any(|h| h == host)
+            )
+        };
+        // Closed, with a machine a plain publish adds: no decision, outside the audience.
+        let admin = client::admin_open(&paths).expect("open");
+        assert!(admin.doc.commons_audience().is_some(), "Commons control");
+        let mut doc = admin.doc.clone();
+        doc.set_open(false).expect("close");
+        doc.add_machine("m8", &key(48)).expect("machine");
+        client::admin_publish(&paths, &admin, &doc).expect("publish");
+        let admin = client::admin_open(&paths).expect("open");
+        assert!(!admin.doc.open());
+        assert!(
+            admin.commons_admission("m8").is_none() && !in_audience(&admin, "m8"),
+            "CONTROL: a plain publish records no decision"
+        );
+        let mut closed = admin.doc.clone();
+        closed.add_machine("m9", &key(49)).expect("machine");
+        let refused = client::admin_publish_opened(&paths, &admin, &closed, &[key(49)])
+            .expect_err("a closed vault records no open admission");
+        assert!(refused.0.contains("open vault"), "{refused}");
+
+        // Opened with no terminal: open, and nothing let in.
+        let mut doc = admin.doc.clone();
+        unix::open_vault(
+            &paths,
+            &admin,
+            &mut doc,
+            vec![request(&key(47), "m7")],
+            None,
+        )
+        .expect("opened");
+        let admin = client::admin_open(&paths).expect("open");
+        assert!(admin.doc.open());
+        assert!(!admin.doc.machines().iter().any(|m| m.recipient == key(47)));
+
+        // Closed again, then opened at a terminal whose person lets m7 in.
+        let mut doc = admin.doc.clone();
+        doc.set_open(false).expect("close");
+        client::admin_publish(&paths, &admin, &doc).expect("publish");
+        let admin = client::admin_open(&paths).expect("open");
+        let mut doc = admin.doc.clone();
+        let (mut say, mut agree) = (|_: String| {}, |_: &str| true);
+        unix::open_vault(
+            &paths,
+            &admin,
+            &mut doc,
+            vec![request(&key(47), "m7")],
+            Some((&mut say, &mut agree)),
+        )
+        .expect("opened");
+        let admin = client::admin_open(&paths).expect("open");
+        assert!(admin.doc.open());
+        let evidence = admin
+            .commons_admission("m7")
+            .expect("a decision for the machine let in");
+        assert_eq!(evidence.method, AdmissionMethod::Open);
+        assert!(
+            in_audience(&admin, "m7"),
+            "the same publish shares the control entry with it"
+        );
+        assert!(admin.commons_admission("m8").is_none() && !in_audience(&admin, "m8"));
     }
 
     /// `approve <code>` records the request it lets in for this Mac's approver, as the notice's
@@ -3511,6 +4288,16 @@ mod tests {
         assert_eq!(parse(&words("commons init")), Ok(Command::CommonsInit));
         assert!(parse(&words("commons")).is_err());
         assert!(parse(&words("commons replace")).is_err());
+    }
+
+    #[test]
+    fn genesis_takes_one_file() {
+        assert_eq!(
+            parse(&words("genesis alab.genesis")),
+            Ok(Command::Genesis("alab.genesis".into()))
+        );
+        assert!(parse(&words("genesis")).is_err());
+        assert!(parse(&words("genesis a b")).is_err());
     }
 
     #[test]
@@ -4005,6 +4792,36 @@ mod tests {
         assert_eq!(edit_dirs(&admin).len(), 1);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_that_adds_an_ai_clis_login_file_publishes_nothing() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let admin = admin_of_a_path_vault(root.path());
+        let began = crate::client::admin_open(&admin).expect("open").seq();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let code = unix::edit_with(
+            &admin,
+            &mut |file: &std::path::Path| {
+                let mut draft = std::fs::read_to_string(file).expect("draft");
+                draft.push_str("[everyone]\n~/.codex/auth.json={}\n");
+                std::fs::write(file, draft).expect("save");
+                Ok(true)
+            },
+            &|prompt: &str| {
+                asked.borrow_mut().push(prompt.to_string());
+                Some("n".to_string())
+            },
+        )
+        .expect("edit");
+        assert_eq!(code, ExitCode::FAILURE);
+        assert_eq!(*asked.borrow(), ["Edit again? [Y/n] "]);
+        assert_eq!(
+            crate::client::admin_open(&admin).expect("open").seq(),
+            began,
+            "nothing published"
+        );
+    }
+
     /// Run an edit where a concurrent publish forces a reopen, then quit unchanged and answer
     /// `publish`.
     #[cfg(unix)]
@@ -4352,15 +5169,12 @@ mod tests {
             (Approver::Unknown("played".into()), "unknown (played)"),
         ] {
             for (approval, who) in [
-                (
-                    Approval::Password,
-                    "a machine that types the join password waits",
-                ),
-                (Approval::Open, "a machine that asks to join waits"),
+                (Approval::Password, "a machine that types the join password"),
+                (Approval::Open, unix::joiner(Approval::Open)),
             ] {
                 let words = unix::approver_words(&approver, approval).expect("said");
                 assert!(words.contains(why), "{words}");
-                assert!(words.contains(who), "{words}");
+                assert!(words.contains(&format!("{who} waits")), "{words}");
                 assert!(
                     words.contains("aterm secrets agent on starts one"),
                     "{words}"
@@ -4398,11 +5212,11 @@ mod tests {
             assert!(!words.contains("let in"), "{words}");
         }
         assert_eq!(unix::lets_in_words(false, &closed), None);
+        // An open vault at a URL admits a machine by a person's Allow on a member, never by
+        // asking alone (docs/DESIGN-fluid-swarm-2026-10-28.md F10).
         let words = unix::lets_in_words(true, &open).expect("said");
-        assert!(
-            words.contains("every machine that reaches its server"),
-            "{words}"
-        );
+        assert!(words.contains("presses Allow on any member"), "{words}");
+        assert!(!words.contains("every machine"), "{words}");
         assert_eq!(unix::lets_in_words(true, &password), None);
         assert_eq!(unix::lets_in_words(true, &closed), None);
     }
@@ -4753,7 +5567,10 @@ mod tests {
             "{said}"
         );
         assert!(
-            said.contains("a machine that asks to join waits for approval by code"),
+            said.contains(&format!(
+                "{} waits for approval by code",
+                unix::joiner(Approval::Open)
+            )),
             "{said}"
         );
         // A status that cannot read what stopped the approver still says it is stuck, and
@@ -4782,8 +5599,263 @@ mod tests {
         ] {
             let said = line(Approval::Open, state);
             assert!(said.contains(why), "{said}");
-            assert!(said.contains("a machine that asks to join waits"), "{said}");
+            assert!(
+                said.contains(&format!("{} waits", unix::joiner(Approval::Open))),
+                "{said}"
+            );
             assert!(said.contains("aterm secrets agent on starts one"), "{said}");
         }
+    }
+
+    #[test]
+    fn git_credential_parses_options_and_operations() {
+        assert_eq!(
+            parse(&words("git-credential")),
+            Ok(Command::GitCredential {
+                dev_user: None,
+                operation: None,
+            })
+        );
+        assert_eq!(
+            parse(&words("git-credential get")),
+            Ok(Command::GitCredential {
+                dev_user: None,
+                operation: Some("get".into()),
+            })
+        );
+        assert_eq!(
+            parse(&words("git-credential --dev-user octo-cat get")),
+            Ok(Command::GitCredential {
+                dev_user: Some("octo-cat".into()),
+                operation: Some("get".into()),
+            })
+        );
+        for refused in [
+            "git-credential get extra",
+            "git-credential --dev-user -bad get",
+            "git-credential --dev-user a--b get",
+            "git-credential --dev-user a --dev-user b get",
+            "git-credential --unknown get",
+        ] {
+            assert!(parse(&words(refused)).is_err(), "{refused}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_credential_routes_vault_tokens_and_quits_when_unusable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let home = root.path().join("home");
+        let secrets = home.join(".secrets");
+        crate::fsx::ensure_private_dir(&secrets).expect("secrets dir");
+        let dev_path = secrets.join("gh_access_token");
+        let rel_path = secrets.join("gh_access_token_alabsystems");
+        crate::fsx::write_atomic(&dev_path, b"ghp_dev_token_1\n", 0o600).expect("dev token");
+        crate::fsx::write_atomic(&rel_path, b"ghp_rel_token_2\n", 0o600).expect("rel token");
+
+        let ask = |dev_user: Option<&str>, op: Option<&str>, term: bool, stdin: &[u8]| -> String {
+            let mut cursor = std::io::Cursor::new(stdin);
+            let reply =
+                unix::git_credential_reply(Some(&home), None, dev_user, op, term, &mut cursor);
+            String::from_utf8(reply.as_slice().to_vec()).expect("utf8")
+        };
+
+        // Without a known login, an unnamed github.com lookup gets the dev token as x-access-token.
+        assert_eq!(
+            ask(
+                None,
+                Some("get"),
+                false,
+                b"protocol=https\nhost=github.com\n\ntrailing=ignored"
+            ),
+            "username=x-access-token\npassword=ghp_dev_token_1\n"
+        );
+        // gist.github.com and default port / trailing dot route the same way.
+        assert_eq!(
+            ask(
+                Some("alice"),
+                Some("get"),
+                false,
+                b"protocol=HTTPS\nhost=gist.github.com.:0443\n\n"
+            ),
+            "username=alice\npassword=ghp_dev_token_1\n"
+        );
+        // alabsystems routes to gh_access_token_alabsystems regardless of dev user.
+        assert_eq!(
+            ask(
+                Some("alice"),
+                Some("get"),
+                false,
+                b"protocol=https\nhost=github.com\nusername=ALABSYSTEMS\n\n"
+            ),
+            "username=alabsystems\npassword=ghp_rel_token_2\n"
+        );
+
+        // agh's vault.toml record names the dev login when its fingerprint matches the loaded token.
+        let fp = String::from_utf8(unix::agh_fingerprint(b"ghp_dev_token_1").to_vec()).unwrap();
+        let agh_dir = home.join(".config").join("aterm").join("agh");
+        std::fs::create_dir_all(&agh_dir).unwrap();
+        crate::fsx::write_atomic(
+            &agh_dir.join("vault.toml"),
+            format!("[dev]\nfingerprint = \"{fp}\"\nlogin = \"octocat\"\n").as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        assert_eq!(
+            ask(
+                None,
+                Some("get"),
+                false,
+                b"protocol=https\nhost=github.com\n\n"
+            ),
+            "username=octocat\npassword=ghp_dev_token_1\n"
+        );
+        assert_eq!(
+            ask(
+                None,
+                Some("get"),
+                false,
+                b"protocol=https\nhost=github.com\nusername=OctoCat\n\n"
+            ),
+            "username=OctoCat\npassword=ghp_dev_token_1\n"
+        );
+
+        // Negative controls: rotated token with stale vault.toml fingerprint does not answer for
+        // the old login unless init.toml or --dev-user names it; stranger usernames, non-get ops,
+        // other hosts and plain HTTP get no answer.
+        crate::fsx::write_atomic(&dev_path, b"ghp_rotated_token\n", 0o600).unwrap();
+        assert_eq!(
+            ask(
+                None,
+                Some("get"),
+                false,
+                b"protocol=https\nhost=github.com\nusername=octocat\n\n"
+            ),
+            ""
+        );
+        crate::fsx::write_atomic(
+            &home.join(".config").join("aterm").join("init.toml"),
+            b"[github]\naccount = \"octocat\"\n",
+            0o600,
+        )
+        .unwrap();
+        assert_eq!(
+            ask(
+                None,
+                Some("get"),
+                false,
+                b"protocol=https\nhost=github.com\nusername=octocat\n\n"
+            ),
+            "username=octocat\npassword=ghp_rotated_token\n"
+        );
+        for silent in [
+            ask(
+                Some("octocat"),
+                Some("get"),
+                false,
+                b"protocol=https\nhost=github.com\nusername=stranger\n\n",
+            ),
+            ask(
+                Some("octocat"),
+                Some("store"),
+                false,
+                b"protocol=https\nhost=github.com\nusername=octocat\npassword=x\n\n",
+            ),
+            ask(
+                Some("octocat"),
+                Some("erase"),
+                false,
+                b"protocol=https\nhost=github.com\n\n",
+            ),
+            ask(
+                Some("octocat"),
+                None,
+                false,
+                b"protocol=https\nhost=github.com\n\n",
+            ),
+            ask(
+                Some("octocat"),
+                Some("get"),
+                false,
+                b"protocol=http\nhost=github.com\n\n",
+            ),
+            ask(
+                Some("octocat"),
+                Some("get"),
+                false,
+                b"protocol=https\nhost=gitlab.com\n\n",
+            ),
+            ask(
+                Some("octocat"),
+                Some("get"),
+                false,
+                b"protocol=https\nhost=github.com:8443\n\n",
+            ),
+        ] {
+            assert_eq!(silent, "");
+        }
+
+        // Terminal stdin, loose mode, empty/malformed content, symlink or missing token -> quit=1.
+        assert_eq!(
+            ask(
+                Some("octocat"),
+                Some("get"),
+                true,
+                b"protocol=https\nhost=github.com\n\n"
+            ),
+            "quit=1\n"
+        );
+        std::fs::set_permissions(&dev_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            ask(
+                None,
+                Some("get"),
+                false,
+                b"protocol=https\nhost=github.com\n\n"
+            ),
+            "quit=1\n"
+        );
+        crate::fsx::write_atomic(&dev_path, b"   \n", 0o600).unwrap();
+        assert_eq!(
+            ask(
+                None,
+                Some("get"),
+                false,
+                b"protocol=https\nhost=github.com\n\n"
+            ),
+            "quit=1\n"
+        );
+        crate::fsx::write_atomic(&dev_path, b"two words\n", 0o600).unwrap();
+        assert_eq!(
+            ask(
+                None,
+                Some("get"),
+                false,
+                b"protocol=https\nhost=github.com\n\n"
+            ),
+            "quit=1\n"
+        );
+        std::fs::remove_file(&dev_path).unwrap();
+        assert_eq!(
+            ask(
+                None,
+                Some("get"),
+                false,
+                b"protocol=https\nhost=github.com\nusername=octocat\n\n"
+            ),
+            "quit=1\n"
+        );
+        std::fs::remove_file(&rel_path).unwrap();
+        assert_eq!(
+            ask(
+                None,
+                Some("get"),
+                false,
+                b"protocol=https\nhost=github.com\nusername=alabsystems\n\n"
+            ),
+            "quit=1\n"
+        );
     }
 }

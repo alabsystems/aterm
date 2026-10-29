@@ -147,10 +147,10 @@ pub fn derive(asset: &[u8]) -> Result<Vec<u8>, DeriveError> {
     for (k, &x) in raw.b1().iter().enumerate() {
         b1[k] = narrow(fits(f64::from(x) * pow2(F), "b1", k)?, "b1", k)?;
     }
-    let s2 = f64::from(raw.w2_scale());
+    let inv_s2 = 127.0 / f64::from(raw.w2_scale());
     let mut b2 = [0i32; tone::TONE_COUNT];
     for (c, &x) in raw.b2().iter().enumerate() {
-        b2[c] = narrow(fits(f64::from(x) * 127.0 / s2, "b2", c)?, "b2", c)?;
+        b2[c] = narrow(fits(f64::from(x) * inv_s2, "b2", c)?, "b2", c)?;
     }
     let lut_len = (2 * T + 1) as usize;
     let mut lut = Vec::with_capacity(lut_len);

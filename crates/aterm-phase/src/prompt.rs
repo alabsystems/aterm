@@ -3081,6 +3081,12 @@ pub mod fixtures {
         include_str!("fixtures/claude-2.1.310-api-route-queued-120col.txt");
     pub const API_STALLED_QUEUED_2_1_310: &str =
         include_str!("fixtures/claude-2.1.310-api-stalled-queued-120col.txt");
+    pub const WALL_GOAL_API_UNREACHABLE_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-wall-goal-api-unreachable-measured.txt");
+    pub const WALL_GOAL_API_UNAVAILABLE_ALONE_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-wall-goal-api-unavailable-alone-hand-built.txt");
+    pub const WALL_GOAL_API_UNAVAILABLE_ECONNREFUSED_2_1_311: &str =
+        include_str!("fixtures/claude-2.1.311-wall-goal-api-unavailable-econnrefused.txt");
     pub const API_ERROR_QUEUED_SENT_MEASURED: &str =
         include_str!("fixtures/claude-2.1.283-api-error-queued-sent-measured.txt");
     pub const API_ERROR_TWICE_MEASURED: &str =

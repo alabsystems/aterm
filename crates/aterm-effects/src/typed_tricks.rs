@@ -211,6 +211,15 @@ impl Word {
 
     #[inline]
     fn pop(&mut self) -> Option<char> {
+        let len = self.len as usize;
+        if len == 0 {
+            return None;
+        }
+        let last = self.bytes[len - 1];
+        if last < 0x80 {
+            self.len -= 1;
+            return Some(last as char);
+        }
         let c = self.as_str().chars().next_back()?;
         let width = c.len_utf8() as u8;
         self.len = self.len.saturating_sub(width);
@@ -283,6 +292,11 @@ fn kind_of(c: char) -> Kind {
     }
 }
 
+#[inline]
+const fn is_stop(c: char) -> bool {
+    matches!(c, '.' | '!' | '?' | ',' | '\u{2026}')
+}
+
 /// A character of a script written without spaces between words: the
 /// vocabulary's no-space set minus Hangul, which is in that set only to be
 /// looked up raw (Korean writes its spaces).
@@ -298,10 +312,17 @@ fn glued(lexicon: &TrickLexicon, token: &str, scratch: &mut String) -> Option<(T
     if token.is_empty() || token.as_bytes()[0].is_ascii() {
         return None;
     }
+    let mut split_offsets = [0u8; TOKEN_CHARS];
     let mut chars = 0usize;
-    for c in token.chars() {
+    for (at, c) in token.char_indices() {
         if !is_unspaced_script(c) {
             return None;
+        }
+        if chars > 0 {
+            if at >= u128::BITS as usize || chars > split_offsets.len() {
+                return None;
+            }
+            split_offsets[chars - 1] = at as u8;
         }
         chars += 1;
     }
@@ -309,12 +330,12 @@ fn glued(lexicon: &TrickLexicon, token: &str, scratch: &mut String) -> Option<(T
         return None;
     }
     let mut found: Option<(Trick, Cuts)> = None;
-    let mut head_chars = 0usize;
-    for (at, _) in token.char_indices() {
-        if head_chars == 0 {
-            head_chars = 1;
-            continue;
-        }
+    let split_count = chars - 1;
+    let mut i = 0usize;
+    while i < split_count {
+        let head_chars = i + 1;
+        let at = split_offsets[i] as usize;
+        i += 1;
         let (head, tail) = token.split_at_checked(at)?;
         let head_role = lexicon.classify_glued_half(head, scratch);
         let name_first = match head_role {
@@ -324,21 +345,14 @@ fn glued(lexicon: &TrickLexicon, token: &str, scratch: &mut String) -> Option<(T
             {
                 false
             }
-            Some(_) | None => {
-                head_chars += 1;
-                continue;
-            }
+            Some(_) | None => continue,
         };
         let ((Some(TrickRole::Vocative), Some(TrickRole::Trick { trick, .. }))
         | (Some(TrickRole::Trick { trick, .. }), Some(TrickRole::Vocative))) =
             (head_role, lexicon.classify_glued_half(tail, scratch))
         else {
-            head_chars += 1;
             continue;
         };
-        if at >= u128::BITS as usize {
-            return None;
-        }
         let cut = 1u128 << (at as u32);
         match found.as_mut() {
             None => {
@@ -355,7 +369,6 @@ fn glued(lexicon: &TrickLexicon, token: &str, scratch: &mut String) -> Option<(T
             }
             Some(_) => return None,
         }
-        head_chars += 1;
     }
     found
 }
@@ -812,10 +825,15 @@ impl TrickListener {
         };
         let mut plain_token = self.line.token_is_live();
         if plain_token {
-            for c in self.line.token.as_str().chars() {
-                if !c.is_alphanumeric() {
-                    plain_token = false;
-                    break;
+            let s = self.line.token.as_str();
+            if s.is_ascii() {
+                plain_token = s.bytes().all(|b| b.is_ascii_alphanumeric());
+            } else {
+                for c in s.chars() {
+                    if !(c.is_ascii_alphanumeric() || (!c.is_ascii() && c.is_alphanumeric())) {
+                        plain_token = false;
+                        break;
+                    }
                 }
             }
         }
@@ -1014,8 +1032,7 @@ impl TrickListener {
             if !c.is_ascii() && aterm_grapheme::char_width(c) == 0 {
                 return self.poison();
             }
-            let glued = self.line.tail.is_some()
-                || matches!(self.line.left, Some(l) if kind_of(l) == Kind::Stop);
+            let glued = self.line.tail.is_some() || matches!(self.line.left, Some(l) if is_stop(l));
             if glued {
                 out = self.go_impure();
             }
@@ -1050,7 +1067,7 @@ impl TrickListener {
         match edge {
             Edge::Open => self.deliver_tail(now, fed),
             Edge::Stop => {
-                let run_continues = matches!(self.line.left, Some(l) if kind_of(l) == Kind::Stop);
+                let run_continues = matches!(self.line.left, Some(l) if is_stop(l));
                 if run_continues || self.line.any_word || !self.line.pure {
                     None
                 } else {

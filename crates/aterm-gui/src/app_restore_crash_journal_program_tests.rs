@@ -55,7 +55,7 @@ fn open_pty_pair() -> (i32, i32) {
 
 /// Spawn `argv` as the session leader of a fresh PTY with a hermetic `HOME` and `HISTFILE=/dev/null`.
 #[allow(clippy::zombie_processes)]
-fn spawn_leader(argv: &[&str], home: &std::path::Path) -> (i32, i32) {
+pub(crate) fn spawn_leader(argv: &[&str], home: &std::path::Path) -> (i32, i32) {
     let (master, slave) = open_pty_pair();
     // SAFETY: `slave` is an open fd the pair handed over; owned here.
     let slave = unsafe { OwnedFd::from_raw_fd(slave) };
@@ -126,14 +126,16 @@ fn a_leader_shell_has_a_scratch_home_and_saves_no_history() {
     assert!(seen.contains(&want), "{seen:?}");
 }
 
-fn type_line(master: i32, line: &str) {
+/// Type `line` into the terminal behind `master`.
+pub(crate) fn type_line(master: i32, line: &str) {
     // SAFETY: `master` is this test's open pty master; the buffer is live.
     let n = unsafe { libc::write(master, line.as_ptr().cast(), line.len()) };
     assert_eq!(usize::try_from(n).ok(), Some(line.len()), "write(master)");
 }
 
+/// Wait until `ready` holds: a one-minute hang detector, not a latency budget.
 #[track_caller]
-fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
+pub(crate) fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
     aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, what, || {
         ready().then_some(())
     });
@@ -171,7 +173,8 @@ fn name_group(app: &App, id: u64, pgid: i32, program: &str) {
     timeline.set_program(pgid, Some(program.to_string()));
 }
 
-fn kill_all(pids: &[i32], masters: &[i32]) {
+/// `SIGKILL` each of `pids`, then close each of `masters`, each once.
+pub(crate) fn kill_all(pids: &[i32], masters: &[i32]) {
     for pid in pids {
         // SAFETY: each pid is a process this test started (or its job), still unreaped by anyone but this test's sessions.
         unsafe { libc::kill(*pid, libc::SIGKILL) };

@@ -684,14 +684,13 @@ fn a_launchservices_pid_mismatch_after_transfer_is_rejected_and_reaped() {
     let (_cancel_tx, cancel_rx) = std::sync::mpsc::sync_channel(1);
     let stranger = leader.saturating_add(1);
     let in_flight = crate::app_launch_successor::LaunchInFlight::scripted(Some(stranger));
-    let started = std::time::Instant::now();
     assert_eq!(
         wait_handoff_ready(
             &proof_rd,
             expected,
             &cancel_rx,
             &[],
-            std::time::Instant::now() + std::time::Duration::from_secs(120),
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
             &mut || false,
             Some(super::LaunchCorroboration::of_dialer(
                 &in_flight,
@@ -701,12 +700,7 @@ fn a_launchservices_pid_mismatch_after_transfer_is_rejected_and_reaped() {
             )),
         ),
         crate::UpdateHandoffOutcome::Rejected,
-        "a launch answer naming another pid refuses the handoff"
-    );
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(60),
-        "the refusal is immediate, not at the deadline: {:?}",
-        started.elapsed()
+        "a launch answer naming another pid refuses the handoff rather than timing out"
     );
 
     let arbiter = crate::HandoffAttemptArbiter::new();
@@ -839,25 +833,28 @@ fn killed_and_reaped(
     reaped.warrant
 }
 
+/// `/bin/sleep` itself (no shell) in its own group, for `aterm_spec::wait::PARKED_SECS`: its image
+/// is final once `spawn` returns, and it outlives a `MUST_HAPPEN` hang detector, so the detector
+/// reads a live child (`waitid` reports no `CLD_CONTINUED` of a zombie).
+///
+/// On macOS an exec builds a new process and discards the outgoing one, and a `SIGSTOP` that lands
+/// while the candidate is inside an exec stops only the outgoing one, so the new image runs as if
+/// never stopped. `/bin/sh -c 'exec sleep 30'` execs twice after `spawn` returns (`/bin/sh` execs the
+/// shell `/private/var/select/sh` names, which execs `sleep`). With the stop sent right after
+/// `spawn`, 10000 scratch runs at load 13-31 saw it reported then undone in 117 and never reported
+/// (which fails `a_stopped_candidate_is_not_gone` at its stop detector; a stop reported then undone
+/// fails it too, as "still stopped once asked", when the exec lands before that check) in none;
+/// with it sent 0-6 ms late, 300 runs saw 38 and 1. `/bin/sleep` spawned directly kept every stop
+/// (3000 of 3000). `spawn` returns only after the exec of `/bin/sleep` has completed (std's
+/// close-on-exec error pipe closes with the outgoing process), and `sleep` execs nothing more.
 fn sleeping_candidate() -> (
     HandoffCandidate,
     HandoffCandidateHandle,
     ProcessGroupCleanup,
 ) {
-    candidate_in_own_group("exec sleep 30")
-}
-
-fn candidate_in_own_group(
-    script: &str,
-) -> (
-    HandoffCandidate,
-    HandoffCandidateHandle,
-    ProcessGroupCleanup,
-) {
-    let child = std::process::Command::new("/bin/sh")
+    let child = std::process::Command::new("/bin/sleep")
         .inherit_nothing()
-        .arg("-c")
-        .arg(script)
+        .arg(aterm_spec::wait::PARKED_SECS.to_string())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -874,32 +871,24 @@ fn a_stopped_candidate_is_not_gone() {
     let (candidate, mut handle, mut cleanup) = sleeping_candidate();
     let pid = libc::pid_t::try_from(candidate.pid).expect("bounded pid");
     // The test stops it, so the stop waits on no run of the candidate's own (a script's
-    // `kill -STOP $$` stops it only once it has been scheduled through its exec and its shell).
+    // `kill -STOP $$` stops it only once it has been scheduled through its exec and its shell),
+    // and the candidate runs no exec that could discard the stop (`sleeping_candidate`).
     // SAFETY: SIGSTOP to this test's own unreaped child.
     let sent = unsafe { libc::kill(pid, libc::SIGSTOP) };
     assert_eq!(sent, 0, "stop our own child");
-    let id = libc::id_t::try_from(pid).expect("positive pid");
-    let reported = |options: libc::c_int| {
-        // SAFETY: zeroed siginfo_t for waitid with WNOWAIT, which leaves the child waitable.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let rc = unsafe { libc::waitid(libc::P_PID, id, &mut info, options | libc::WNOWAIT) };
-        assert_eq!(rc, 0, "our own child");
-        info
-    };
-    let stopped_by = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-    while reported(libc::WSTOPPED | libc::WNOHANG).si_code != libc::CLD_STOPPED {
-        if std::time::Instant::now() >= stopped_by {
-            let ended = reported(libc::WEXITED | libc::WNOHANG);
-            // SAFETY: a waitid report of a child fills the SIGCHLD arm.
-            let status = unsafe { ended.si_status() };
-            panic!(
-                "the candidate stops (ended: code {} status {status})",
-                ended.si_code
-            );
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
+    if let Err(report) = aterm_uds::deadline::await_stopped(pid, aterm_spec::wait::MUST_HAPPEN) {
+        panic!("the candidate stops: {report:?}");
     }
     assert!(!handle.candidate_gone(candidate), "stopped is not gone");
+    // Stopped before the ask and after it, so the answer was given of a stopped candidate. One
+    // `stop_state` read, so a failure names the cause: continued, ended, or neither
+    // (on Apple with the kernel's state of the candidate, which tells a dropped stop from a taken
+    // report).
+    assert_eq!(
+        aterm_uds::deadline::stop_state(pid),
+        Ok(()),
+        "still stopped once asked"
+    );
     assert_eq!(
         killed_and_reaped(candidate, &mut handle),
         HandoffRollbackWarrant::Reaped

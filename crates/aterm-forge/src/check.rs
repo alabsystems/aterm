@@ -1183,9 +1183,9 @@ fn oracle_verdict(lock: &[(String, bool)]) -> OracleVerdict {
     }
 }
 
-/// Every workspace manifest that keeps `name` as a `[dev-dependencies]` entry stating a registry
-/// version requirement, as `(manifest, requirement)`: how a retired crate is held as a
-/// differential oracle.
+/// Every workspace manifest that keeps `name` as a `[dev-dependencies]` entry (or an
+/// `optional = true` `[dependencies]` entry) stating a registry version requirement, as
+/// `(manifest, requirement)`: how a retired crate is held as a differential oracle.
 fn dev_dependency_oracles(root: &Path, name: &str) -> Vec<(String, String)> {
     use aterm_toml::edit::{DocumentMut, Item, TableLike};
 
@@ -1209,23 +1209,28 @@ fn dev_dependency_oracles(root: &Path, name: &str) -> Vec<(String, String)> {
             continue;
         };
 
-        let mut tables: Vec<&dyn TableLike> = Vec::new();
+        let mut tables: Vec<(&dyn TableLike, bool)> = Vec::new();
         if let Some(t) = doc.get("dev-dependencies").and_then(Item::as_table_like) {
-            tables.push(t);
+            tables.push((t, false));
+        }
+        if let Some(t) = doc.get("dependencies").and_then(Item::as_table_like) {
+            tables.push((t, true));
         }
         if let Some(targets) = doc.get("target").and_then(Item::as_table_like) {
             for (_, gated) in targets.iter() {
-                if let Some(t) = gated
-                    .as_table_like()
-                    .and_then(|g| g.get("dev-dependencies"))
-                    .and_then(Item::as_table_like)
-                {
-                    tables.push(t);
+                let Some(gated) = gated.as_table_like() else {
+                    continue;
+                };
+                if let Some(t) = gated.get("dev-dependencies").and_then(Item::as_table_like) {
+                    tables.push((t, false));
+                }
+                if let Some(t) = gated.get("dependencies").and_then(Item::as_table_like) {
+                    tables.push((t, true));
                 }
             }
         }
 
-        for table in tables {
+        for (table, optional_only) in tables {
             for (key, entry) in table.iter() {
                 let declared = entry
                     .as_table_like()
@@ -1235,13 +1240,16 @@ fn dev_dependency_oracles(root: &Path, name: &str) -> Vec<(String, String)> {
                 if declared != name {
                     continue;
                 }
-                if let Some(req) = entry.as_str() {
+                if !optional_only && let Some(req) = entry.as_str() {
                     out.push((rel(root, &manifest), req.to_string()));
                     continue;
                 }
                 let Some(entry) = entry.as_table_like() else {
                     continue;
                 };
+                if optional_only && entry.get("optional").and_then(Item::as_bool) != Some(true) {
+                    continue;
+                }
                 if entry.get("path").is_some()
                     || entry.get("git").is_some()
                     || entry.get("workspace").is_some()
@@ -1548,7 +1556,8 @@ windows-sys-052 = { package = \"windows-sys\", path = \"crates/aterm-windows-sys
         assert_eq!(oracle_verdict(&[]), OracleVerdict::Captured);
     }
 
-    /// Plain, target-gated and renamed holders are all found; inherited and path entries are not.
+    /// Plain, target-gated, renamed and feature-optional holders are found; non-optional normal
+    /// dependencies, inherited entries and path entries are not.
     #[test]
     fn the_oracle_scanner_finds_plain_and_renamed_holders() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -1564,8 +1573,16 @@ windows-sys-052 = { package = \"windows-sys\", path = \"crates/aterm-windows-sys
                 "[target.'cfg(unix)'.dev-dependencies]\nmemchr = \"2\"\n",
             ),
             (
+                "optional_oracle",
+                "[dependencies]\nsha2_ref = { package = \"sha2\", version = \"=0.10.8\", optional = true }\n\
+                 normal_only = \"1.0\"\n\
+                 [target.'cfg(unix)'.dependencies]\n\
+                 blake_ref = { package = \"blake3\", version = \"1.5\", optional = true }\n",
+            ),
+            (
                 "inherited",
-                "[dev-dependencies]\narrayvec = { workspace = true }\nmemchr = { path = \"x\" }\n",
+                "[dev-dependencies]\narrayvec = { workspace = true }\nmemchr = { path = \"x\" }\n\
+                 [dependencies]\nsha2 = { workspace = true, optional = true }\n",
             ),
         ] {
             std::fs::create_dir_all(root.join("crates").join(name)).expect("crate dir");
@@ -1581,6 +1598,20 @@ windows-sys-052 = { package = \"windows-sys\", path = \"crates/aterm-windows-sys
         assert!(
             memchr.len() == 1 && memchr[0].0.contains("plain") && memchr[0].1 == "2",
             "the target-gated oracle, and only it, must be found: {memchr:?}"
+        );
+        let sha2 = dev_dependency_oracles(root, "sha2");
+        assert!(
+            sha2.len() == 1 && sha2[0].0.contains("optional_oracle") && sha2[0].1 == "=0.10.8",
+            "optional [dependencies] oracle must be found and workspace-inherited skipped: {sha2:?}"
+        );
+        let blake3 = dev_dependency_oracles(root, "blake3");
+        assert!(
+            blake3.len() == 1 && blake3[0].0.contains("optional_oracle") && blake3[0].1 == "1.5",
+            "optional target-gated [dependencies] oracle must be found: {blake3:?}"
+        );
+        assert!(
+            dev_dependency_oracles(root, "normal_only").is_empty(),
+            "non-optional [dependencies] entries are not dev/optional oracles"
         );
     }
 

@@ -17,10 +17,9 @@ fn state_of(body: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn doctor(w: &World, args: &[&str]) -> String {
-    let cmd = std::fs::read_to_string(w.tmp.join("fabric.cmd")).expect("the fabric command");
-    let cmd = cmd.trim();
-    let bin = cmd.split_whitespace().next().expect("the bridge binary");
+/// `<bin> fabric doctor <args>` in `w`'s scratch home, with `fabric_cmd` as its fabric command
+/// and each read of the world's instance bounded by [`harness::FABRIC_IO_WAIT`].
+fn doctor_command(w: &World, bin: &str, fabric_cmd: &str, args: &[&str]) -> std::process::Command {
     let mut doctor = std::process::Command::new(bin);
     doctor
         .arg("fabric")
@@ -28,9 +27,20 @@ fn doctor(w: &World, args: &[&str]) -> String {
         .args(args)
         .env("HOME", w.tmp.join("home"))
         .env("XDG_RUNTIME_DIR", w.tmp.join("run"))
-        .env("ATERM_FABRIC_COMMAND", cmd)
+        .env("ATERM_FABRIC_COMMAND", fabric_cmd)
+        .env(
+            harness::FABRIC_IO_WAIT.0,
+            harness::FABRIC_IO_WAIT.1.as_millis().to_string(),
+        )
         .stdin(std::process::Stdio::null());
-    let out = harness::output_within(&mut doctor, "the doctor");
+    doctor
+}
+
+fn doctor(w: &World, args: &[&str]) -> String {
+    let cmd = std::fs::read_to_string(w.tmp.join("fabric.cmd")).expect("the fabric command");
+    let cmd = cmd.trim();
+    let bin = cmd.split_whitespace().next().expect("the bridge binary");
+    let out = harness::output_within(&mut doctor_command(w, bin, cmd, args), "the doctor");
     format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -207,13 +217,7 @@ fn a_ghost_nodes_rows_are_retired_as_that_node_beside_a_live_bridge() {
         ghost_cap.display(),
         ghost_state.display()
     );
-    let mut doctor = std::process::Command::new(&bin);
-    doctor
-        .args(["fabric", "doctor", "--retire-ghosts", "--yes"])
-        .env("HOME", w.tmp.join("home"))
-        .env("XDG_RUNTIME_DIR", w.tmp.join("run"))
-        .env("ATERM_FABRIC_COMMAND", &ghost_cmd)
-        .stdin(std::process::Stdio::null());
+    let mut doctor = doctor_command(&w, &bin, &ghost_cmd, &["--retire-ghosts", "--yes"]);
     let out = harness::output_within(&mut doctor, "the doctor");
     let text = format!(
         "{}{}",

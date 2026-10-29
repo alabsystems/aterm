@@ -2200,20 +2200,6 @@ fn atomic_replace_locked(
 }
 
 #[cfg(test)]
-/// Retry an event-loop-patience journal call on transient lock contention.
-pub(crate) fn settle_busy<T>(mut attempt: impl FnMut() -> Result<T, String>) -> Result<T, String> {
-    let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-    loop {
-        match attempt() {
-            Err(error) if error.contains("is busy") && std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            settled => return settled,
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::document_store::{DocumentStore, TextEdit};
@@ -2351,7 +2337,7 @@ mod tests {
         assert!(error.contains("retry"), "{error}");
 
         drop(held);
-        let initialized = settle_busy(|| host.initialize(decision.clone(), &disk, &disk)).unwrap();
+        let initialized = host.initialize(decision, &disk, &disk).unwrap();
         assert!(recover_journal_for(initialized.key, &fs::read(initialized.path).unwrap()).is_ok());
         let _ = fs::remove_dir_all(root);
     }
@@ -2476,7 +2462,7 @@ mod tests {
         let (mut store, id, disk) = snapshots("base");
         let canonical = "file:///tmp/hostile-persistence.md";
         let decision = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
-        let initialized = settle_busy(|| host.initialize(decision.clone(), &disk, &disk)).unwrap();
+        let initialized = host.initialize(decision, &disk, &disk).unwrap();
         let original = fs::read(&initialized.path).unwrap();
         let _ = store.transact(
             id,
@@ -2564,7 +2550,7 @@ mod tests {
         };
         let canonical = "file:///tmp/draft.md";
         let first = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
-        settle_busy(|| host.initialize(first.clone(), &disk, &current)).unwrap();
+        host.initialize(first, &disk, &current).unwrap();
 
         let reopened = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
         assert_eq!(reopened.recovered_text.as_deref(), Some("base draft"));
@@ -2590,8 +2576,7 @@ mod tests {
         };
         let canonical = "file:///tmp/draft.md";
         let decision = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
-        let initialized =
-            settle_busy(|| host.initialize(decision.clone(), &disk, &current)).unwrap();
+        let initialized = host.initialize(decision, &disk, &current).unwrap();
         let original = fs::read(&initialized.path).unwrap();
 
         let conflict = host.inspect_open(canonical, b"external").unwrap();
@@ -2600,8 +2585,7 @@ mod tests {
             Some(RecoveryNotice::DiskConflict)
         ));
         let (other_store, _, external) = snapshots("external");
-        let preserved =
-            settle_busy(|| host.initialize(conflict.clone(), &external, &external)).unwrap();
+        let preserved = host.initialize(conflict, &external, &external).unwrap();
         let preserved_copy = |n: u32| {
             let stem = preserved.path.file_stem().unwrap().to_str().unwrap();
             root.join(format!("{stem}.preserved-{n}.atdj"))
@@ -2612,7 +2596,7 @@ mod tests {
         fs::write(&preserved.path, b"torn").unwrap();
         let corrupt = host.inspect_open(canonical, b"external").unwrap();
         assert!(matches!(corrupt.notice, Some(RecoveryNotice::Corrupt)));
-        let kept = settle_busy(|| host.initialize(corrupt.clone(), &external, &external)).unwrap();
+        let kept = host.initialize(corrupt, &external, &external).unwrap();
         assert_eq!(fs::read(preserved_copy(2)).unwrap(), b"torn");
         assert_eq!(kept.path, preserved.path);
         let _ = fs::remove_dir_all(root);
@@ -2627,7 +2611,7 @@ mod tests {
         let opened = journals
             .inspect_open(canonical, v0.text.as_bytes())
             .unwrap();
-        settle_busy(|| journals.initialize(opened.clone(), &v0, &v0)).unwrap();
+        journals.initialize(opened, &v0, &v0).unwrap();
 
         let host = DraftJournalHost::new(root.clone()).unwrap();
         let reopened = host.inspect_open(canonical, b"v1").unwrap();
@@ -2635,7 +2619,7 @@ mod tests {
         assert_eq!(reopened.recovered_text, None);
         assert!(!reopened.preserve_existing);
         let (_store, _id, v1) = snapshots("v1");
-        let initialized = settle_busy(|| host.initialize(reopened.clone(), &v1, &v1)).unwrap();
+        let initialized = host.initialize(reopened.clone(), &v1, &v1).unwrap();
         assert_eq!(initialized.notice, None);
         assert!(
             preserved_images(&root).is_empty(),
@@ -2673,10 +2657,10 @@ mod tests {
         let canonical = "file:///tmp/draft.md";
         let first = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
         let stale = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
-        let initialized = settle_busy(|| host.initialize(first.clone(), &disk, &disk)).unwrap();
+        let initialized = host.initialize(first, &disk, &disk).unwrap();
         let before = fs::read(&initialized.path).unwrap();
 
-        let error = settle_busy(|| host.initialize(stale.clone(), &disk, &disk)).unwrap_err();
+        let error = host.initialize(stale, &disk, &disk).unwrap_err();
         assert!(
             error.contains("changed after recovery inspection"),
             "{error}"
@@ -2695,7 +2679,7 @@ mod tests {
         let (_store, _id, disk) = snapshots("private");
         let canonical = "file:///Users//example/Secret%20Draft.md";
         let decision = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
-        let initialized = settle_busy(|| host.initialize(decision.clone(), &disk, &disk)).unwrap();
+        let initialized = host.initialize(decision, &disk, &disk).unwrap();
         assert_eq!(
             fs::metadata(&root).unwrap().permissions().mode() & 0o777,
             0o700
@@ -2722,7 +2706,7 @@ mod tests {
         let decision = journals
             .inspect_open("file:///tmp/draft.md", disk.text.as_bytes())
             .unwrap();
-        settle_busy(|| journals.initialize(decision.clone(), &disk, &disk)).unwrap();
+        journals.initialize(decision, &disk, &disk).unwrap();
 
         let _ = store.transact(
             id,
@@ -2812,7 +2796,7 @@ mod tests {
         let decision = journals
             .inspect_open("file:///tmp/deferred-draft.md", disk.text.as_bytes())
             .unwrap();
-        settle_busy(|| journals.initialize(decision.clone(), &disk, &disk)).unwrap();
+        journals.initialize(decision, &disk, &disk).unwrap();
 
         let _ = store.transact(
             id,
@@ -2888,7 +2872,7 @@ mod tests {
         let decision = journals
             .inspect_open("file:///tmp/deferred-checkpoint.md", disk.text.as_bytes())
             .unwrap();
-        settle_busy(|| journals.initialize(decision.clone(), &disk, &disk)).unwrap();
+        journals.initialize(decision, &disk, &disk).unwrap();
         let _ = store.transact(
             id,
             disk.seq,
@@ -2942,7 +2926,7 @@ mod tests {
         let decision = journals
             .inspect_open("file:///tmp/draft.md", disk.text.as_bytes())
             .unwrap();
-        settle_busy(|| journals.initialize(decision.clone(), &disk, &disk)).unwrap();
+        journals.initialize(decision, &disk, &disk).unwrap();
         let _ = store.transact(
             id,
             disk.seq,
@@ -3042,7 +3026,7 @@ mod tests {
         let (mut store, id, disk) = snapshots("base");
         let canonical = "file:///tmp/draft.md";
         let decision = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
-        let initialized = settle_busy(|| host.initialize(decision.clone(), &disk, &disk)).unwrap();
+        let initialized = host.initialize(decision, &disk, &disk).unwrap();
         let rewrite = checkpoint_plan(
             initialized.key,
             JournalRewriteGeneration(1),
@@ -3093,7 +3077,7 @@ mod tests {
         let (mut store, id, disk) = snapshots("base");
         let canonical = "file:///tmp/draft.md";
         let decision = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
-        let initialized = settle_busy(|| host.initialize(decision.clone(), &disk, &disk)).unwrap();
+        let initialized = host.initialize(decision, &disk, &disk).unwrap();
         let _ = store.transact(
             id,
             disk.seq,
@@ -3182,7 +3166,7 @@ mod tests {
         let host = DraftJournalHost::new(root.clone()).unwrap();
         let (_store, _id, disk) = snapshots("base");
         let decision = host.inspect_open(URI, disk.text.as_bytes()).unwrap();
-        let initialized = settle_busy(|| host.initialize(decision.clone(), &disk, &disk)).unwrap();
+        let initialized = host.initialize(decision, &disk, &disk).unwrap();
         let mut children: Vec<_> = ["one", "two"]
             .into_iter()
             .map(|role| {
@@ -3325,7 +3309,7 @@ mod tests {
         let decision = journals
             .inspect_open("file:///tmp/draft.md", disk.text.as_bytes())
             .unwrap();
-        settle_busy(|| journals.initialize(decision.clone(), &disk, &disk)).unwrap();
+        journals.initialize(decision, &disk, &disk).unwrap();
         let _ = store.transact(
             id,
             disk.seq,
@@ -3406,7 +3390,8 @@ mod tests {
             }],
         );
         let their_current = theirs.snapshot(their_id).unwrap();
-        settle_busy(|| successor.initialize(decision.clone(), &their_disk, &their_current))
+        successor
+            .initialize(decision, &their_disk, &their_current)
             .unwrap();
         let republished = fs::read(&path).unwrap();
 
@@ -3704,7 +3689,7 @@ mod tests {
         let disk = store.snapshot(id).unwrap();
         let decision = journals.inspect_open(uri, b"").unwrap();
         assert_eq!(decision.recovered_text, None, "{uri} starts with no draft");
-        settle_busy(|| journals.initialize(decision.clone(), &disk, &disk)).unwrap();
+        journals.initialize(decision, &disk, &disk).unwrap();
         let _ = store.transact(
             id,
             disk.seq,
@@ -3817,8 +3802,9 @@ mod tests {
             );
         }
         let current = store.snapshot(id).unwrap();
-        let initialized =
-            settle_busy(|| journals.initialize(decision.clone(), &base, &current)).unwrap();
+        let initialized = journals
+            .initialize(decision.clone(), &base, &current)
+            .unwrap();
         (decision, id, initialized)
     }
 

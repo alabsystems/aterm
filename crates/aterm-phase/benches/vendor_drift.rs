@@ -39,6 +39,10 @@ const ROWS: &[(&str, Check)] = &[
         every_reset_template_is_whole_in_the_store_claude,
     ),
     (
+        "every_composed_template_is_whole_in_the_store_claude",
+        every_composed_template_is_whole_in_the_store_claude,
+    ),
+    (
         "every_literal_agy_anchor_is_in_the_store_agy",
         every_literal_agy_anchor_is_in_the_store_agy,
     ),
@@ -249,20 +253,33 @@ fn every_rollout_key_is_in_the_store_codex() -> Outcome {
 }
 
 fn every_reset_template_is_whole_in_the_store_claude() -> Outcome {
+    templates_are_whole_in_the_store_claude("reset", "the reset's templates", reset_templates())
+}
+
+fn every_composed_template_is_whole_in_the_store_claude() -> Outcome {
+    templates_are_whole_in_the_store_claude(
+        "composed",
+        "the composed anchors' templates",
+        composed_templates(),
+    )
+}
+
+fn templates_are_whole_in_the_store_claude(
+    kind: &str,
+    what: &str,
+    templates: Vec<(&'static str, Vec<String>)>,
+) -> Outcome {
     let Some((path, bytes)) = store_binary("claude", "ATERM_CLAUDE_BIN") else {
-        return Outcome::CouldNotRun(
+        return Outcome::CouldNotRun(format!(
             "CANARY NOT RUN: no claude build found (set ATERM_CLAUDE_BIN, or install one: \
-             `aterm pkg install claude`) — the reset's templates are NOT checked against a \
-             build"
-                .into(),
-        );
+             `aterm pkg install claude`) — {what} are NOT checked against a build"
+        ));
     };
     let version = build_version(&path);
-    let templates = reset_templates();
     let missing = missing_templates(&bytes, &templates);
     assert!(
         missing.is_empty(),
-        "{path} ({}): {} reset templates not whole: {missing:?}",
+        "{path} ({}): {} {kind} templates not whole: {missing:?}",
         version.as_deref().unwrap_or("?"),
         missing.len()
     );
@@ -278,11 +295,11 @@ fn every_reset_template_is_whole_in_the_store_claude() -> Outcome {
         .collect();
     assert!(
         held.is_empty(),
-        "{path}: {} reset templates are held with a word changed: {held:?}",
+        "{path}: {} {kind} templates are held with a word changed: {held:?}",
         held.len()
     );
     eprintln!(
-        "{path} ({}): every reset template is whole ({}), and none with a word changed ({})",
+        "{path} ({}): every {kind} template is whole ({}), and none with a word changed ({})",
         version.as_deref().unwrap_or("?"),
         templates.len(),
         changed
@@ -291,7 +308,7 @@ fn every_reset_template_is_whole_in_the_store_claude() -> Outcome {
             .sum::<usize>()
     );
     Outcome::Pass(format!(
-        "{path} ({}): reset templates checked",
+        "{path} ({}): {kind} templates checked",
         version.as_deref().unwrap_or("unknown version")
     ))
 }
@@ -355,6 +372,21 @@ fn every_wall_phrase_is_in_the_store_claude() -> Outcome {
         "limit will reset",
     ];
     const SERVER_WORDS: &[&str] = &["verify your identity", "data loss prevention"];
+    // A phrase a build first drew, owed from that build on (an anchor's `since`).
+    const SINCE: &[(&str, &str)] = &[
+        ("5-hour limit reset", "2.1.312"),
+        ("reset your 5-hour limit", "2.1.312"),
+        ("resetting your 5-hour limit", "2.1.312"),
+        ("5-hour limit is already being reset", "2.1.312"),
+    ];
+    // A phrase and the last build that drew it, owed through that build (2.1.312 says
+    // `5-hour limit`); a build of no known version is taken for the newest, which draws none.
+    const UNTIL: &[(&str, &str)] = &[
+        ("session limit reset", "2.1.311"),
+        ("reset your session limit", "2.1.311"),
+        ("resetting your session limit", "2.1.311"),
+        ("session limit is already being reset", "2.1.311"),
+    ];
     let Some((path, bytes)) = store_binary("claude", "ATERM_CLAUDE_BIN") else {
         return Outcome::CouldNotRun(
             "CANARY NOT RUN: no claude build found (set ATERM_CLAUDE_BIN, or `aterm pkg \
@@ -362,16 +394,24 @@ fn every_wall_phrase_is_in_the_store_claude() -> Outcome {
                 .into(),
         );
     };
+    let version = build_version(&path);
+    let drawn = |phrase: &str| {
+        SINCE.iter().all(|&(p, since)| {
+            p != phrase || version.as_deref().is_none_or(|v| !newer_than(since, v))
+        }) && UNTIL.iter().all(|&(p, until)| {
+            p != phrase || version.as_deref().is_some_and(|v| !newer_than(v, until))
+        })
+    };
     let lower = bytes.to_ascii_lowercase();
     let owed: Vec<&str> = PHRASES
         .iter()
         .map(|(p, _)| *p)
-        .filter(|p| !OLDER_BUILDS.contains(p) && !SERVER_WORDS.contains(p))
+        .filter(|p| !OLDER_BUILDS.contains(p) && !SERVER_WORDS.contains(p) && drawn(p))
         .collect();
     if owed.is_empty() {
         return Outcome::CouldNotRun(format!(
             "{path} ({}): no wall phrases apply after the table's exclusions; no phrases checked",
-            build_version(&path).as_deref().unwrap_or("unknown version")
+            version.as_deref().unwrap_or("unknown version")
         ));
     }
     let curled: Vec<String> = owed.iter().map(|p| p.replace('\'', "\u{2019}")).collect();

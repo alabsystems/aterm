@@ -251,6 +251,34 @@ impl DeferredLine {
             .is_some_and(|extras| extras.images.iter().any(selected))
     }
 
+    /// Inline-image spans held by this deferred row, when non-empty.
+    fn image_spans(&self) -> Option<&[ImageSpan]> {
+        let spans = self.extras.as_deref()?.images.as_slice();
+        (!spans.is_empty()).then_some(spans)
+    }
+
+    /// Replace inline-image spans on this deferred row, returning `(before_staged_bytes, after_staged_bytes)`.
+    fn set_images(&mut self, spans: Vec<ImageSpan>) -> (usize, usize) {
+        let before = self.staged_bytes();
+        if spans.is_empty() {
+            if let Some(extras) = self.extras.as_deref_mut() {
+                extras.images.clear();
+                if extras.is_empty() {
+                    self.extras = None;
+                }
+            }
+        } else if let Some(extras) = self.extras.as_deref_mut() {
+            extras.images = spans;
+        } else {
+            self.extras = Some(Box::new(ScrolledRowExtras {
+                images: spans,
+                ..ScrolledRowExtras::default()
+            }));
+        }
+        self.cached = OnceCell::new();
+        (before, self.staged_bytes())
+    }
+
     /// Retain accepted image spans and invalidate a previously materialized copy.
     fn retain_images(&mut self, keep: &mut dyn FnMut(&ImageSpan) -> bool) -> bool {
         let Some(extras) = self.extras.as_deref_mut() else {
@@ -856,6 +884,36 @@ impl LazyBuffer {
         }
     }
 
+    /// Inline-image spans on staged line `idx` (`0` = oldest, including the flood marker), without materializing text.
+    #[must_use]
+    #[inline]
+    pub(crate) fn line_images(&self, idx: usize) -> Option<&[ImageSpan]> {
+        let deferred = match &self.cut {
+            Some(_) if idx == 0 => return None,
+            Some(_) => self.lines.get(idx - 1)?,
+            None => self.lines.get(idx)?,
+        };
+        deferred.image_spans()
+    }
+
+    /// Replace inline-image spans on staged line `idx` (`0` = oldest, including the flood marker), reconciling `staged_bytes`.
+    pub(crate) fn set_line_images(&mut self, idx: usize, spans: Vec<ImageSpan>) -> bool {
+        let deferred = match &self.cut {
+            Some(_) if idx == 0 => return false,
+            Some(_) => self.lines.get_mut(idx - 1),
+            None => self.lines.get_mut(idx),
+        };
+        let Some(deferred) = deferred else {
+            return false;
+        };
+        let (before, after) = deferred.set_images(spans);
+        self.staged_bytes = self
+            .staged_bytes
+            .saturating_sub(before)
+            .saturating_add(after);
+        true
+    }
+
     /// Clear all pending lines and the recycling pool.
     #[inline]
     pub(crate) fn clear(&mut self) {
@@ -1250,7 +1308,7 @@ impl Grid {
         }
     }
 
-    fn extract_image_spans_into(
+    pub(super) fn extract_image_spans_into(
         result: &mut ScrolledRowExtras,
         row: &Row,
         extras: &CellExtras,
@@ -1260,9 +1318,10 @@ impl Grid {
             return;
         }
         let cells = row.as_slice();
-        let mut open: Vec<(ImageSpan, u16)> = Vec::new();
-        let mut done: Vec<ImageSpan> = Vec::new();
-        let continues = |(span, next): &(ImageSpan, u16), layer: &crate::ImageRef| {
+        let mut open: Vec<(ImageSpan, u16, usize)> = Vec::new();
+        let mut done: Vec<(ImageSpan, usize)> = Vec::new();
+        let mut next_birth = 0usize;
+        let continues = |(span, next, _): &(ImageSpan, u16, usize), layer: &crate::ImageRef| {
             Arc::ptr_eq(&span.image, &layer.image)
                 && span.kitty == layer.kitty
                 && span.image_row == layer.cell_row
@@ -1284,9 +1343,9 @@ impl Grid {
                 if layers.iter().any(|layer| continues(&open[at], layer)) {
                     at += 1;
                 } else {
-                    let (mut span, _) = open.swap_remove(at);
+                    let (mut span, _, birth) = open.swap_remove(at);
                     span.end_col = col_u16;
-                    done.push(span);
+                    done.push((span, birth));
                 }
             }
             for layer in layers {
@@ -1303,17 +1362,24 @@ impl Grid {
                             Arc::clone(&layer.image),
                         )
                     };
-                    open.push((span, layer.cell_col.saturating_add(1)));
+                    let birth = next_birth;
+                    next_birth += 1;
+                    open.push((span, layer.cell_col.saturating_add(1), birth));
                 }
             }
         }
         let end_col = u16::try_from(cells.len()).unwrap_or(u16::MAX);
-        done.extend(open.into_iter().map(|(mut span, _)| {
+        done.extend(open.into_iter().map(|(mut span, _, birth)| {
             span.end_col = end_col;
-            span
+            (span, birth)
         }));
-        done.sort_by_key(|span| aterm_types::layer_order(span.image.z_index, span.kitty));
-        result.images.extend(done);
+        done.sort_by_key(|&(ref span, birth)| {
+            (
+                aterm_types::layer_order(span.image.z_index, span.kitty),
+                birth,
+            )
+        });
+        result.images.extend(done.into_iter().map(|(span, _)| span));
     }
 
     fn extract_hyperlinks_only_into(

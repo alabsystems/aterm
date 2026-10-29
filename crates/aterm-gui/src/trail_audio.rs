@@ -2790,7 +2790,7 @@ mod tests {
         let shared = Arc::new(FakeShared::default());
         let (tx, shutdown, state, _busy, worker, _dropped_backoff, _reopens_left) =
             spawn_fake_worker(Arc::clone(&shared));
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        wait_until("initial park", || ParkedMark::holds(&state));
         assert_eq!(shared.opens.load(Ordering::Relaxed), 0);
         assert_eq!(shared.pushes.load(Ordering::Relaxed), 0);
         assert_eq!(shared.ticks.load(Ordering::Relaxed), 0);
@@ -2825,7 +2825,7 @@ mod tests {
         let ticks_at_pause = shared.ticks.load(Ordering::Relaxed);
         let running_deadline = ticks_at_pause > 0;
         assert!(running_deadline, "the running worker services a deadline");
-        std::thread::sleep(std::time::Duration::from_millis(12));
+        wait_until("paused park", || ParkedMark::holds(&state));
         let paused_deadline = shared.ticks.load(Ordering::Relaxed) != ticks_at_pause;
         assert!(
             !paused_deadline,

@@ -22,7 +22,8 @@ impl Fixture {
         let home = root.path().join("home");
         let state = root.path().join("state");
         let path = root.path().join(cli.accounts().roster_file);
-        let store = accounts::Store::at_for(&state, cli, &home);
+        // A case's held lock stays held through the admission, which refuses at the first take.
+        let store = accounts::Store::at_for(&state, cli, &home).bounded_by(&[]);
         let raw = Roster {
             rows: ["work", "other"]
                 .into_iter()
@@ -89,12 +90,14 @@ impl Fixture {
         fs::create_dir_all(opener.parent().unwrap()).unwrap();
         fs::write(opener, b"inert opener fixture").unwrap();
         let ladder = LadderCtx {
+            roster_path: self.path.clone(),
             find_browser: &|_| true,
             vault_sync: |_| super::super::sign_in_ladder::Vault::NotMember,
             spawn_vault: &|_| panic!("no vault in an explicit selection"),
-            mailbox: &|_, _, _| super::super::sign_in_ladder::Mailbox::None,
+            mailbox: &|_, _, _| (super::super::sign_in_ladder::Mailbox::None, None),
             log: Arc::new(|_| {}),
             run_attempt: Some(run),
+            shared: shared_renewal::Effects::default(),
             hosts: 0,
         };
         spawn_row_renewal(
@@ -321,10 +324,13 @@ fn queued_selection_conforms_through_local_refusal_and_repair() {
     }
 }
 
+/// An unreadable sign-in lock fences a saved selection of each CLI whose renewal starts in the
+/// background, keeping it and dispatching nothing. A Grok row's starts none, whatever the lock
+/// (`Cli::renews_headlessly`, pinned in `accounts_sync_cli_tests.rs`).
 #[test]
 fn unreadable_signin_lock_preserves_saved_selection_without_dispatch() {
     let mut failures = Vec::new();
-    for cli in Cli::ALL {
+    for cli in Cli::ALL.into_iter().filter(|cli| cli.renews_headlessly()) {
         let fixture = Fixture::new(cli);
         let lock = fixture.store.shared_dir().join(accounts::SIGNIN_LOCK_FILE);
         aterm_types::fs_restricted::ensure_private_dir(&fixture.store.shared_dir()).unwrap();
@@ -473,9 +479,11 @@ fn fallback_admission_failure_keeps_the_current_request() {
     }
 }
 
+/// A vendor's renewal worker keeps its saved selection when its second take of the sign-in lock
+/// finds it unavailable. Codex's and Kimi's: no Grok worker starts (`Cli::renews_headlessly`).
 #[test]
 fn vendor_worker_keeps_selection_when_its_second_lock_take_is_unavailable() {
-    for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+    for cli in [Cli::Codex, Cli::Kimi] {
         let fixture = Fixture::new(cli);
         let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
         type Work = Box<dyn FnOnce() + Send>;

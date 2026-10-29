@@ -10,9 +10,10 @@ use aterm_agent::harness::acts::{HoldLeg, LandHeld, TaskFace};
 use aterm_agent::harness::repo_work::RepoWork;
 use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::turn_end::{
-    Composer, LAND, LAND_ANSWER, LAND_NUDGE, RULE_API_CUTOFF, RULE_LAND, RULE_LAND_ANSWER,
-    RULE_LAND_NUDGE, TurnEndAction, TurnEndReading, TurnEndState, WaitKind, clean_defense,
-    decide_turn_end, open_work_strict, open_work_suffix, repo_work_suffix, says_done,
+    Composer, LAND, LAND_ANSWER, LAND_NUDGE, Outage, RULE_API_CUTOFF, RULE_LAND, RULE_LAND_ANSWER,
+    RULE_LAND_NUDGE, Reach, TurnEndAction, TurnEndReading, TurnEndState, UNREACHABLE_HOLD,
+    WaitKind, clean_defense, decide_turn_end, open_work_strict, open_work_suffix, repo_work_suffix,
+    says_done,
 };
 use aterm_agent::supervise::{Autopilot, SupervisorConfig};
 use aterm_models_harness::supervisor_land_model;
@@ -74,7 +75,8 @@ struct Seen {
     earlier: usize,
 }
 
-fn point(said: &str, at: Seen, worked: Option<Duration>) -> TurnEndReading {
+/// `reach`: what the host measured of the API's reach, as the loop reads it there.
+fn point(said: &str, at: Seen, worked: Option<Duration>, reach: Reach) -> TurnEndReading {
     TurnEndReading {
         phase: if at.busy { Phase::Busy } else { Phase::Idle },
         authoritative: true,
@@ -120,7 +122,7 @@ fn point(said: &str, at: Seen, worked: Option<Duration>) -> TurnEndReading {
         conversation: aterm_agent::supervise::policy::turn_end::Conversation::Hostless,
         notice_elsewhere: false,
         reset_clock: None,
-        reach: Default::default(),
+        reach,
         program: aterm_phase::Program::Claude,
         seat: Default::default(),
         account: None,
@@ -144,6 +146,7 @@ fn point(said: &str, at: Seen, worked: Option<Duration>) -> TurnEndReading {
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::of_found(at.dirty.then(finding)),
         fact: None,
+        wake: None,
     }
 }
 
@@ -155,6 +158,8 @@ enum Verdict {
     Answer,
     WallAct,
     Wait,
+    /// The measured outage holds the act ([`UNREACHABLE_HOLD`]).
+    Held,
     Nothing,
 }
 
@@ -181,10 +186,22 @@ fn verdict(a: &TurnEndAction) -> Verdict {
             wait: WaitKind::BackOff { .. },
             ..
         } if why.contains("back-off") => Verdict::Wait,
+        TurnEndAction::WaitUntil {
+            why,
+            wait:
+                WaitKind::Outage {
+                    wall: Outage::Connection,
+                    tries: true,
+                },
+            ..
+        } if why == UNREACHABLE_HOLD => Verdict::Held,
         TurnEndAction::Nothing => Verdict::Nothing,
         other => panic!("an act the model has no word for: {other:?}"),
     }
 }
+
+/// The acts a measured outage holds (`down` = 1, `capped` = 0: its cap not yet passed).
+const HELD: [&str; 3] = ["Instruction", "Nudge", "Answer"];
 
 fn expected(m: &Model, st: &State) -> Verdict {
     for (action, word) in [
@@ -198,7 +215,12 @@ fn expected(m: &Model, st: &State) -> Verdict {
         }
     }
     if m.action_enabled("BackoffDue", st) {
-        Verdict::Wait
+        return Verdict::Wait;
+    }
+    let mut back = st.clone();
+    back.insert("down", 2);
+    if st["down"] == 1 && HELD.iter().any(|act| m.action_enabled(act, &back)) {
+        Verdict::Held
     } else {
         Verdict::Nothing
     }
@@ -226,7 +248,7 @@ enum Teller {
     OnEndNotes,
     /// Told at points alone, never at a live read.
     AtPointsOnly,
-    /// Landed for any done task — a person's exchange among them.
+    /// Landed for any done task — the person's exchange that opens the session among them.
     LandedForDone,
 }
 
@@ -259,9 +281,25 @@ struct Real {
     hold_teller: HoldTeller,
     /// The ledger's clock, unix ms: each act's row a minute after the last.
     row_ms: i64,
+    /// Since when the host measured the API down, while it does.
+    down: Option<Instant>,
+    /// A decider that ignores the measured outage (the negative control): its readings never
+    /// carry the Down.
+    blind: bool,
 }
 
 impl Real {
+    /// The reach a point's reading carries.
+    fn reach(&self) -> Reach {
+        match self.down {
+            Some(since) if !self.blind => Reach::Down { since },
+            _ => Reach::Unknown,
+        }
+    }
+
+    /// The decision at the point now, the wall's own wait run through (its ladder's clock,
+    /// which the model does not count), never the measured outage's hold, which its `NetUp` or
+    /// `OutageCapDue` ends.
     fn decide(&mut self) -> TurnEndAction {
         let r = point(
             self.said,
@@ -270,6 +308,7 @@ impl Real {
                 ..self.at
             },
             None,
+            self.reach(),
         );
         self.st.observe(&r, self.now);
         let cfg = SupervisorConfig::default();
@@ -331,6 +370,13 @@ impl Real {
         }
     }
 
+    /// The measured outage's cap passes (`OutageCapDue`): the clock moves to when the hold of
+    /// the outage standing ends (`TurnEndTiming::outage_holds_until`), the reach still Down.
+    fn outage_cap_passes(&mut self) {
+        let since = self.down.expect("an outage stands");
+        self.now = self.now.max(since + self.st.timing.outage_cap);
+    }
+
     fn ledgered(&mut self, rule: &'static str) {
         self.row_ms += 60_000;
         self.st.ledgered(rule, self.row_ms);
@@ -363,7 +409,8 @@ impl Real {
         self.now += worked;
         self.said = said;
         self.at = Seen { busy: false, ..at };
-        self.st.observe(&point(said, at, Some(worked)), self.now);
+        self.st
+            .observe(&point(said, at, Some(worked), self.reach()), self.now);
         self.tell(false);
     }
 }
@@ -371,8 +418,6 @@ impl Real {
 fn face(st: &State) -> TaskFace {
     if st["other"] == 1 {
         TaskFace::Open
-    } else if st["left"] == 1 {
-        TaskFace::Theirs
     } else if st["landed"] == 1 {
         TaskFace::Landed
     } else {
@@ -433,12 +478,13 @@ fn faces(real: &Real, st: &State) -> Result<(), String> {
 }
 
 fn projects(real: &TurnEndState, st: &State) {
-    let done = st["landed"] == 1 || st["left"] == 1;
+    let done = st["landed"] == 1;
     assert_eq!(real.landed(), st["landed"] == 1, "the landing at {st:?}");
-    assert_eq!(
-        real.left_to_person(),
-        st["left"] == 1,
-        "the person's exchange at {st:?}"
+    // Every walk begins after a point, so no person's exchange here opens the session: Land
+    // carries each one on (owner ruling 2026-10-27).
+    assert!(
+        !real.left_to_person(),
+        "a person's exchange left to them at {st:?}"
     );
     assert_eq!(real.task_done(), done, "the task's end at {st:?}");
     assert_eq!(
@@ -476,13 +522,19 @@ fn projects(real: &TurnEndState, st: &State) {
 fn mirror(action: &str, before: &State, real: &mut Real) {
     let plain = Seen::default();
     match action {
+        "NetDown" => real.down = Some(real.now),
+        "NetUp" => real.down = None,
+        "OutageCapDue" => real.outage_cap_passes(),
         "Instruction" | "Nudge" | "Answer" | "WallAct" => {
             let a = real.decide();
             assert!(
-                !matches!(verdict(&a), Verdict::Nothing | Verdict::Wait),
+                !matches!(
+                    verdict(&a),
+                    Verdict::Nothing | Verdict::Wait | Verdict::Held
+                ),
                 "{action} at {before:?}: {a:?}"
             );
-            let r = point(real.said, real.at, None);
+            let r = point(real.said, real.at, None, real.reach());
             real.st.acted(&a, &r, real.now);
             if let TurnEndAction::Type { rule_id, .. } = &a {
                 real.ledgered(rule_id);
@@ -555,14 +607,38 @@ fn start(base: Instant, teller: Teller, hold_teller: HoldTeller) -> Real {
         held: None,
         hold_teller,
         row_ms: 1_760_000_000_000,
+        down: None,
+        blind: false,
     };
     real.told = Some(real.st.face_start());
     if hold_teller != HoldTeller::Never {
         real.tell_hold();
     }
-    real.st
-        .observe(&point(PROGRESS, Seen::default(), Some(LONG)), real.now);
+    real.st.observe(
+        &point(PROGRESS, Seen::default(), Some(LONG), Reach::Unknown),
+        real.now,
+    );
     real.tell(false);
+    real
+}
+
+/// A walk's real side before any point is judged: no turn has ended under the loop yet.
+fn start_unjudged(base: Instant, teller: Teller) -> Real {
+    let mut real = Real {
+        st: TurnEndState::default(),
+        now: base,
+        said: PROGRESS,
+        at: Seen::default(),
+        told: None,
+        teller,
+        noted: false,
+        held: None,
+        hold_teller: HoldTeller::Loop,
+        row_ms: 1_760_000_000_000,
+        down: None,
+        blind: false,
+    };
+    real.told = Some(real.st.face_start());
     real
 }
 
@@ -624,7 +700,7 @@ fn walk_all(
             {
                 assert_eq!(*text, nudge(&st, &real.st), "the nudge at {st:?}");
             }
-            if st["landed"] == 0 && st["left"] == 0 && st["other"] == 0 && st["same"] <= 1 {
+            if st["landed"] == 0 && st["other"] == 0 && st["same"] <= 1 {
                 assert_ne!(got, Verdict::Nothing, "a silent point at {st:?}");
             }
             *verdicts.entry(format!("{got:?}")).or_default() += 1;
@@ -661,6 +737,7 @@ fn tier1_the_real_decider_lands_only_on_a_clean_defense_and_never_goes_quiet() {
         "Answer",
         "WallAct",
         "Wait",
+        "Held",
         "Nothing",
     ] {
         assert!(
@@ -676,13 +753,32 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
     let buggy = aterm_spec::interp::with_buggy(&m, 1);
     let base = Instant::now() + Duration::from_secs(3600);
 
-    for teller in [
-        Teller::OnEndNotes,
-        Teller::AtPointsOnly,
-        Teller::LandedForDone,
-    ] {
+    for teller in [Teller::OnEndNotes, Teller::AtPointsOnly] {
         let missed = walk_all(&m, teller, HoldTeller::Loop).expect_err("a face teller passed");
         assert!(missed.starts_with(&format!("{teller:?} told ")), "{missed}");
+    }
+    // A done task that is no landing is, under Land, the person's exchange that opens the session
+    // alone (owner ruling 2026-10-27), which the model's walks, begun after a point, never reach:
+    // a decider no point was judged in yet tells it theirs, and `LandedForDone` tells it landed.
+    for (teller, told) in [
+        (Teller::Loop, TaskFace::Theirs),
+        (Teller::LandedForDone, TaskFace::Landed),
+    ] {
+        let mut real = start_unjudged(base, teller);
+        real.ends(
+            ANSWERED,
+            Seen {
+                keyed: true,
+                ..Seen::default()
+            },
+            SHORT,
+        );
+        assert!(real.st.left_to_person(), "{teller:?}: the opening exchange");
+        assert_eq!(
+            real.told,
+            Some(told),
+            "{teller:?}: the opening exchange's face"
+        );
     }
     let path = ["Instruction", "YieldDefense", "OtherTurnRuns"];
     let mut right = m.init_state();
@@ -836,6 +932,71 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
     assert!(!real.st.seed_task_done());
     assert!(!real.st.task_done());
     assert_eq!(verdict(&real.clone().decide()), Verdict::WallAct);
+}
+
+/// A MEASURED OUTAGE HOLDS THE LAND ACT AND ITS RETURN OR ITS CAP TYPES IT: where the model's
+/// `down` holds Instruction, Nudge or Answer, the real decider waits on the outage
+/// ([`UNREACHABLE_HOLD`]), and once `NetUp` fires, or `OutageCapDue` with the reach still Down,
+/// it types the act it held. NEGATIVE CONTROLS: the `Buggy = 5` model, which types into the
+/// outage before its cap, breaks NoContinuationIsTypedIntoAMeasuredOutageBeforeItsCap (and
+/// nothing else), and a decider whose readings ignore the Down types the very act the model
+/// holds. Run against a decider with no `outage_hold`, this test and the full walk fail; against
+/// one whose hold has no cap (run: the `outage_cap` passing changes nothing), the cap's leg here
+/// and the full walk fail.
+#[test]
+fn tier1_a_measured_outage_holds_the_land_act_and_its_return_types_it() {
+    let m = supervisor_land_model();
+    let mistyped = aterm_spec::interp::with_buggy(&m, 5);
+    assert!(m.mutant_dials().contains(&5), "{:?}", m.mutant_dials());
+    assert_eq!(
+        aterm_spec::interp::violated_invariants(&mistyped),
+        BTreeSet::from(["NoContinuationIsTypedIntoAMeasuredOutageBeforeItsCap"]),
+    );
+    let base = Instant::now() + Duration::from_secs(3600);
+    let worked = ["Instruction", "YieldWork", "NetDown"];
+    let asked = ["Instruction", "YieldAsk", "BackoffDue", "NetDown"];
+    for (path, act, word) in [
+        (&["NetDown"][..], "Instruction", Verdict::Instruction),
+        (&worked[..], "Nudge", Verdict::Nudge),
+        (&asked[..], "Answer", Verdict::Answer),
+    ] {
+        let (st, real) = walk(&m, path, base);
+        assert!(!m.action_enabled(act, &st), "{path:?}");
+        assert_eq!(expected(&m, &st), Verdict::Held, "{path:?}");
+        assert_eq!(verdict(&real.clone().decide()), Verdict::Held, "{path:?}");
+        let mut b = st.clone();
+        assert!(mistyped.fire(act, &mut b), "{path:?}");
+        assert!(
+            !mistyped.check_invariant("NoContinuationIsTypedIntoAMeasuredOutageBeforeItsCap", &b),
+            "{path:?}"
+        );
+        let blind = Real {
+            blind: true,
+            ..real.clone()
+        };
+        assert_eq!(
+            verdict(&blind.clone().decide()),
+            word,
+            "a decider blind to the outage types into it: {path:?}"
+        );
+        let back = [path, &["NetUp"][..]].concat();
+        let (st, real) = walk(&m, &back, base);
+        assert!(m.action_enabled(act, &st), "{back:?}");
+        assert_eq!(verdict(&real.clone().decide()), word, "{back:?}");
+        let capped = [path, &["OutageCapDue"][..]].concat();
+        let (st, real) = walk(&m, &capped, base);
+        assert_eq!(st["down"], 1, "{capped:?}");
+        assert!(m.action_enabled(act, &st), "{capped:?}");
+        assert!(
+            matches!(real.reach(), Reach::Down { .. }),
+            "the reach still reads Down: {capped:?}"
+        );
+        assert_eq!(
+            verdict(&real.clone().decide()),
+            word,
+            "the cap's end types the act: {capped:?}"
+        );
+    }
 }
 
 #[test]

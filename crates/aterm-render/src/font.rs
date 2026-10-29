@@ -397,8 +397,8 @@ impl Font {
     #[must_use]
     pub fn horizontal_kern(&self, left: char, right: char, px: f32) -> Option<f32> {
         self.horizontal_kern_indexed(
-            self.lookup_glyph_index(left),
-            self.lookup_glyph_index(right),
+            self.unicode_glyph_index(left),
+            self.unicode_glyph_index(right),
             px,
         )
     }
@@ -416,11 +416,11 @@ impl Font {
         Some(f32::from(value) * self.scale_factor(px))
     }
 
-    /// Layout metrics for `ch` at `px`.
+    /// Layout metrics for the Unicode glyph of `ch` at `px`.
     #[inline]
     #[must_use]
     pub fn metrics(&self, ch: char, px: f32) -> Metrics {
-        self.metrics_indexed(self.lookup_glyph_index(ch), px)
+        self.metrics_indexed(self.unicode_glyph_index(ch), px)
     }
 
     /// [`Font::metrics`] by glyph id.
@@ -444,11 +444,12 @@ impl Font {
         }
     }
 
-    /// Rasterize `ch` at `px`.
+    /// Rasterize the Unicode glyph of `ch` at `px`, including character-addressed
+    /// synthetic bold and italic runs.
     #[inline]
     #[must_use]
     pub fn rasterize(&self, ch: char, px: f32) -> (Metrics, Vec<u8>) {
-        self.rasterize_indexed(self.lookup_glyph_index(ch), px)
+        self.rasterize_indexed(self.unicode_glyph_index(ch), px)
     }
 
     /// [`Font::rasterize`] by glyph id.
@@ -723,6 +724,75 @@ mod tests {
                 "U+{:04X}",
                 u32::from(*ch)
             );
+        }
+    }
+
+    /// Styled terminal cells use the character-addressed raster path. Reordering
+    /// cmap records must not turn their middle dots into summation signs.
+    #[cfg(feature = "embedded-font")]
+    #[test]
+    fn styled_latin_1_pixels_ignore_mac_roman_cmap_order() {
+        use crate::{GlyphImage, Renderer, StyleBits, Theme};
+
+        fn pixels(
+            renderer: &mut Renderer,
+            ch: char,
+            style: StyleBits,
+        ) -> (usize, usize, i32, i32, u32, Vec<u8>) {
+            let key = renderer.glyph_key_styled(ch, style);
+            let GlyphImage::Mono {
+                width,
+                height,
+                xmin,
+                ymin,
+                advance,
+                bytes,
+            } = renderer.glyph_image(key)
+            else {
+                panic!("Latin-1 text must produce a monochrome glyph");
+            };
+            (
+                *width,
+                *height,
+                *xmin,
+                *ymin,
+                advance.to_bits(),
+                bytes.clone(),
+            )
+        }
+
+        let original = crate::embedded_font();
+        let reordered = with_cmap_record_last(original, 1, 0).unwrap();
+        let parsed = Font::from_bytes(reordered.as_slice(), FontSettings::default()).unwrap();
+        assert_ne!(
+            parsed.lookup_glyph_index('·'),
+            parsed.unicode_glyph_index('·'),
+            "the fixture must exercise the legacy mapping conflict"
+        );
+        for px in [12.0, 18.0, 26.0] {
+            let mut expected = Renderer::from_bytes(original, px, Theme::default()).unwrap();
+            let mut actual = Renderer::from_bytes(&reordered, px, Theme::default()).unwrap();
+            #[cfg(target_os = "macos")]
+            {
+                expected.rasterizer = crate::RasterKind::Fontdue;
+                actual.rasterizer = crate::RasterKind::Fontdue;
+            }
+            for ch in LATIN_1 {
+                for style in [
+                    StyleBits::REGULAR,
+                    StyleBits::BOLD,
+                    StyleBits::ITALIC,
+                    StyleBits(StyleBits::BOLD.0 | StyleBits::ITALIC.0),
+                ] {
+                    assert_eq!(
+                        pixels(&mut actual, ch, style),
+                        pixels(&mut expected, ch, style),
+                        "U+{:04X}, style {}, {px}px",
+                        u32::from(ch),
+                        style.0
+                    );
+                }
+            }
         }
     }
 

@@ -112,6 +112,7 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
             model: Some("m-1.5"),
             trusted_here: true,
             permission_mode: None,
+            chrome: false,
         };
         let line =
             line(cli, Dialect::Zsh, &starter, &fresh).unwrap_or_else(|e| panic!("{agent:?}: {e}"));
@@ -206,6 +207,7 @@ fn model_and_the_trust_are_each_clis_own() {
             model,
             trusted_here,
             permission_mode: None,
+            chrome: false,
         };
         let named = line(cli, Dialect::Zsh, &plain, &fresh(Some("big-1"), false)).expect("a line");
         assert!(named.contains(" '--model' 'big-1' "), "{named}");
@@ -262,6 +264,28 @@ fn a_permission_mode_is_claude_codes_own_flag() {
             "{:?}: {err}",
             cli.agent
         );
+    }
+}
+
+/// A WORKER THAT DRIVES THE PERSON'S BROWSER IS CLAUDE CODE'S `--chrome` (a credit claim
+/// worker's, [`super::super::credit_offers::claim_task`]). CONTROL: not asked, no flag rides;
+/// asked of a CLI with no such flag, no worker starts.
+#[test]
+fn the_browser_is_claude_codes_own_flag() {
+    let claude = row(Program::Claude);
+    let with = Fresh {
+        chrome: true,
+        ..Fresh::default()
+    };
+    let typed = line(claude, Dialect::Zsh, &claude.plain(), &with).expect("a line");
+    assert!(typed.contains(" '--chrome' "), "{typed}");
+    assert_eq!(typed.matches("--chrome").count(), 1, "{typed}");
+    let plain = line(claude, Dialect::Zsh, &claude.plain(), &Fresh::default()).expect("a line");
+    assert!(!plain.contains("--chrome"), "{plain}");
+    for cli in WORKERS.iter().filter(|w| w.agent != Program::Claude) {
+        let err =
+            line(cli, Dialect::Zsh, &cli.plain(), &with).expect_err("a CLI with no browser flag");
+        assert!(err.contains("no browser flag"), "{:?}: {err}", cli.agent);
     }
 }
 
@@ -551,6 +575,10 @@ fn a_codex_starter_is_codex_alab_and_carries_its_config() {
         "default_permissions=\":danger-full-access\"",
         "-c",
         "permissions.dev.filesystem=\"write\"",
+        "-c",
+        "\"model\"=\"gpt-z\"",
+        "-c",
+        "sandbox_workspace_write . network_access = true",
         "--profile",
         "work",
         "-C",

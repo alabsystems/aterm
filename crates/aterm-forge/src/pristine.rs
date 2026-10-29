@@ -182,8 +182,13 @@ impl Pristine {
         if let Some(copy) = cached(&entry, &id) {
             return Ok(copy);
         }
-        if std::fs::symlink_metadata(&entry).is_ok() {
-            std::fs::remove_dir_all(&entry).map_err(|e| {
+        if let Ok(meta) = std::fs::symlink_metadata(&entry) {
+            let removed = if meta.file_type().is_dir() {
+                std::fs::remove_dir_all(&entry)
+            } else {
+                std::fs::remove_file(&entry)
+            };
+            removed.map_err(|e| {
                 format!(
                     "{} is an incomplete cache entry and could not be removed: {e}",
                     entry.display()
@@ -350,7 +355,13 @@ fn unpack(archive: &[u8], top: &str, into: &Path) -> Result<usize, String> {
                     long_name = Some(utf8(name)?);
                 }
                 b'x' => pax = parse_pax(&body)?,
-                _ => {}
+                b'g' => {
+                    let global = parse_pax(&body)?;
+                    if global.path.is_some() || global.size.is_some() {
+                        return Err("a global PAX header overrides member path or size".to_string());
+                    }
+                }
+                _ => unreachable!(),
             }
             continue;
         }
@@ -411,6 +422,16 @@ fn unpack(archive: &[u8], top: &str, into: &Path) -> Result<usize, String> {
     // Read to the end of the gzip stream, so its CRC-32 and length are checked.
     io::copy(&mut (&mut tar).take(UNPACKED_LIMIT), &mut io::sink())
         .map_err(|e| format!("the gzip stream: {e}"))?;
+    let mut extra = [0u8; 1];
+    if tar
+        .read(&mut extra)
+        .map_err(|e| format!("the gzip stream: {e}"))?
+        != 0
+    {
+        return Err(format!(
+            "more than {UNPACKED_LIMIT} trailing bytes after the archive"
+        ));
+    }
     Ok(members)
 }
 
@@ -700,6 +721,8 @@ pub(crate) mod tests {
         let asked = std::rc::Rc::clone(&served.asked);
         let sha = served.sha256.clone();
         let source = pristine(cache.path(), served);
+        std::fs::create_dir_all(cache.path().join("crates")).unwrap();
+        std::fs::write(cache.path().join("crates/upstream-1.2.3"), b"stale file").unwrap();
 
         let copy = source.copy("upstream", "1.2.3").expect("a held copy");
         assert!(copy.fetched && copy.sha256 == sha, "{}", copy.provenance());
@@ -773,6 +796,21 @@ pub(crate) mod tests {
                 .collect();
             assert!(left.is_empty(), "{path}: left {left:?}");
         }
+
+        let pax_record = b"23 path=/tmp/escape.rs\n";
+        let mut global_pax = Vec::new();
+        global_pax.extend_from_slice(&header("pax_global_header", pax_record.len(), b'g'));
+        global_pax.extend_from_slice(pax_record);
+        global_pax.resize(2 * BLOCK, 0);
+        global_pax.extend_from_slice(&header("upstream-1.2.3/ok.rs", 3, b'0'));
+        global_pax.extend_from_slice(b"ok\n");
+        global_pax.resize(global_pax.len().div_ceil(BLOCK) * BLOCK + 2 * BLOCK, 0);
+        let cache = aterm_tempfile::tempdir().unwrap();
+        let served = Served::honest("upstream", "1.2.3", gzip_stored(&global_pax));
+        let Err(why) = pristine(cache.path(), served).copy("upstream", "1.2.3") else {
+            panic!("a global PAX path override unpacked");
+        };
+        assert!(why.contains("global PAX header"), "{why}");
     }
 
     #[test]

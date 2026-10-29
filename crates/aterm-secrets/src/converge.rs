@@ -10,7 +10,11 @@
 //! each version it applies, and in a healthy round once [`Due`] says so), the aterm window's
 //! lane, and the first-launch Secrets stage as it ends. Each starts [`runner`] in a session of
 //! its own and never disclaims responsibility for it, so macOS keeps attributing the runner's
-//! Local Network use to the app that started it.
+//! Local Network use to the app that started it. A subscriber whose job runs a held copy (an
+//! admin Mac's snapshot, a program `agent on --program` named) starts that copy, and the copy
+//! hands the pass to the installed aterm.app (`aterm init --converge`'s hand-off), started as its
+//! own responsible process: the rows it applies and its Local Network use are aterm.app's, as
+//! the window's are.
 
 use crate::client::SyncOutcome;
 use aterm_uds::spawnfd::{Child, Command, Stdio};
@@ -19,6 +23,15 @@ use std::path::Path;
 
 /// The exit status a runner ends with while another pass holds the pass's lock: it did not run.
 pub const HELD: i32 = 75;
+
+/// The vault subscriber's `--trigger` word (`aterm_machines::sync::Trigger::Subscriber`).
+pub const SUBSCRIBER: &str = "subscriber";
+
+/// The aterm window's lane's `--trigger` word (`aterm_machines::sync::Trigger::Window`).
+pub const WINDOW: &str = "window";
+
+/// The first-launch Secrets stage's `--trigger` word (`aterm_machines::sync::Trigger::Setup`).
+pub const SETUP: &str = "setup";
 
 /// How long after it started a runner the subscriber starts another on the same routes: the
 /// pass's own recheck (`aterm_machines::sync::RECHECK`).
@@ -82,16 +95,20 @@ impl Last {
 }
 
 /// When the vault's subscriber starts a runner: as it starts, after each pass that applied a
-/// version, and after any other healthy pass once this Mac's routes moved or [`RECHECK_MS`]
-/// passed (or the clock went back) since the last start. One runner at a time: a start that
-/// comes due while the last one runs, or after one that found the lock held, is owed to the
-/// next round, so a version applied during a pass is never left to the next recheck.
+/// version, after the first healthy pass that follows failed ones (the vault came back, or this
+/// Mac came back to it: `docs/DESIGN-fluid-swarm-2026-10-28.md` §3.5.2), and after any other
+/// healthy pass once this Mac's routes moved or [`RECHECK_MS`] passed (or the clock went back)
+/// since the last start. One runner at a time: a start that comes due while the last one runs,
+/// or after one that found the lock held, is owed to the next round, so a version applied during
+/// a pass is never left to the next recheck.
 #[derive(Debug, Default)]
 pub struct Due {
     /// When the last runner started, in ms since the epoch, and the routes then.
     started: Option<(u64, Routes)>,
     /// A start came due while the last runner ran, or the last one found the lock held.
     owed: bool,
+    /// A pass failed since the last healthy one ([`Due::failed`]).
+    failing: bool,
 }
 
 impl Due {
@@ -111,7 +128,13 @@ impl Due {
         last: Last,
     ) -> bool {
         let applied = matches!(outcome, SyncOutcome::Applied { .. });
-        self.start(applied, now_ms, routes, last)
+        let back = std::mem::take(&mut self.failing);
+        self.start(applied || back, now_ms, routes, last)
+    }
+
+    /// Note a pass that failed: the next healthy one is due ([`Due::after_pass`]).
+    pub fn failed(&mut self) {
+        self.failing = true;
     }
 
     fn start(&mut self, called: bool, now_ms: u64, routes: Routes, last: Last) -> bool {
@@ -212,6 +235,31 @@ mod tests {
             "another pass held the lock: start again"
         );
         assert!(!due.after_pass(&unchanged(), 6 * MINUTE, HOME, Last::Ended));
+    }
+
+    /// The first healthy pass after failed ones starts a runner, on the routes and inside the
+    /// recheck of the last start, and the one after it does not.
+    /// NEGATIVE CONTROL: an `after_pass` that forgets the failed passes starts nothing.
+    #[test]
+    fn a_healthy_pass_after_failed_ones_is_due_once() {
+        let mut due = Due::default();
+        assert!(due.at_start(0, HOME, Last::None));
+        due.failed();
+        due.failed();
+        assert!(
+            due.after_pass(&unchanged(), MINUTE, HOME, Last::Ended),
+            "back after errors"
+        );
+        assert!(!due.after_pass(&unchanged(), 2 * MINUTE, HOME, Last::Ended));
+        due.failed();
+        assert!(
+            !due.after_pass(&unchanged(), 3 * MINUTE, HOME, Last::Running),
+            "never two at once"
+        );
+        assert!(
+            due.after_pass(&unchanged(), 4 * MINUTE, HOME, Last::Ended),
+            "owed once the runner ended"
+        );
     }
 
     /// The runner is `aterm init --converge --trigger <who>` of the program given, and never

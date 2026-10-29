@@ -8,12 +8,10 @@ use std::collections::BTreeMap;
 use atpkg::{Channel, Program};
 use atpkg_publish::api::{Delta, Yank};
 use atpkg_publish::channel::Log;
-use atpkg_publish::channel::index::{
-    Base, Plan, READERS, Readers, parse_delta, parse_yank, plan, plan_for, render,
-};
+use atpkg_publish::channel::index::{Base, Plan, parse_delta, parse_yank, plan, render};
 use atpkg_publish::error::Error;
 use atpkg_publish::triple::{
-    AARCH64_APPLE_DARWIN, AARCH64_UNKNOWN_LINUX_GNU, Triple, X86_64_UNKNOWN_LINUX_GNU,
+    AARCH64_APPLE_DARWIN, AARCH64_UNKNOWN_LINUX_GNU, X86_64_UNKNOWN_LINUX_GNU,
 };
 
 const LINUX: &str = "x86_64-unknown-linux-gnu";
@@ -280,68 +278,15 @@ fn harness_pins() -> Delta {
     delta(&pins)
 }
 
-/// NO HARNESS IS PINNED WHILE SOME READER OF THE INDEX WOULD INSTALL IT UNASKED: every aterm
-/// through v0.135.0 installs every program the index lists, and one may still read it
-/// (`READERS`), so `--pin` of any harness is refused, and so is carrying a head's harness pin
-/// unless this publish retires it; a program that is not a harness pins as before.
+/// A HARNESS PINS LIKE ANY ROW, INTO THE CLIENT'S DEFAULT SET (owner ruling 2026-10-27,
+/// `docs/DESIGN-harness-repos-2026-10-24.md` §11 D45): `plan` admits `--pin` of each of the five,
+/// its block names its own repo with no group and the prebuilt-only policy, and the index it
+/// makes installs it unasked; a head's harness pin, one the table lacks included, is carried
+/// like any other.
 #[test]
-fn no_harness_is_pinned_while_a_reader_would_install_it_unasked() {
-    assert_eq!(READERS, Readers::SomeInstallEveryProgram);
+fn each_harness_pins_under_its_own_repo_into_the_default_set() {
     let b = base(21, &[("ay", 1)]);
-    for (h, _) in HARNESSES {
-        let err = refused(&b, &delta(&["--pin", &format!("{h}=7")]));
-        assert!(err.contains(&format!("REFUSING --pin {h}=7")), "{err}");
-        assert!(err.contains("unasked"), "{err}");
-    }
-    let err = refused(&b, &harness_pins());
-    assert!(err.contains("is an ALab harness"), "{err}");
-
-    let stale = base(21, &[("ay", 1), ("muse-alab", 4), ("orca-alab", 2)]);
-    let err = refused(&stale, &delta(&["--pin", "ay=2"]));
-    assert!(
-        err.contains("REFUSING to carry the head's pin muse-alab=4")
-            && err.contains("--retire muse-alab"),
-        "{err}"
-    );
-    let err = refused(&stale, &delta(&["--retire", "muse-alab"]));
-    assert!(
-        err.contains("REFUSING to carry the head's pin orca-alab=2"),
-        "a head-only program named like a harness is one to every client: {err}"
-    );
-    let (p, _) = ok(
-        &stale,
-        &delta(&[
-            "--pin",
-            "ay=2",
-            "--retire",
-            "muse-alab",
-            "--retire",
-            "orca-alab",
-        ]),
-    );
-    assert_eq!(p.channel.pin.keys().collect::<Vec<_>>(), ["ay"]);
-    assert_eq!(p.retired, ["muse-alab", "orca-alab"]);
-    let (p, _) = ok(&b, &delta(&["--pin", "ty=3007"]));
-    assert_eq!(p.channel.pin.get("ty"), Some(&3007));
-}
-
-/// ONCE EVERY READER KEEPS A HARNESS OUT, A HARNESS PINS LIKE ANY ROW AND INSTALLS ONLY BY
-/// NAME: `--pin` of each is admitted (it is a table row), its block names its own repo with no
-/// group, and the index it makes is one whose client installs it only when asked.
-#[test]
-fn each_harness_pins_under_its_own_repo_and_stays_out_of_the_default_set() {
-    let b = base(21, &[("ay", 1)]);
-    let mut log = Log::capture("test");
-    let p = plan_for(
-        Readers::AllKeepHarnessesOut,
-        &b,
-        &harness_pins(),
-        "m3",
-        3,
-        VU,
-        &mut log,
-    )
-    .unwrap_or_else(|e| panic!("{e}\n{}", log.text()));
+    let (p, _) = ok(&b, &harness_pins());
     for (h, _) in HARNESSES {
         assert_eq!(p.channel.pin.get(h), Some(&7), "{h}");
         let (_, block) = p
@@ -353,15 +298,18 @@ fn each_harness_pins_under_its_own_repo_and_stays_out_of_the_default_set() {
         assert_eq!(block.coherence_group, None);
         assert_eq!(block.policy, "prebuilt-only");
     }
-    let index = index_of(&p);
+    let wanted = index_of(&p).installable(&[]);
     for (h, _) in HARNESSES {
-        assert!(
-            index.installable(&[]).contains(h),
-            "{h}: a person may install it"
-        );
-        assert!(!index.default_set(&[]).contains(h), "{h}: never unasked");
+        assert!(wanted.contains(h), "{h}: every client installs it unasked");
     }
-    assert!(index.default_set(&[]).contains("ay"));
+    assert!(wanted.contains("ay"));
+
+    let held = base(21, &[("ay", 1), ("muse-alab", 4), ("orca-alab", 2)]);
+    let (p, _) = ok(&held, &delta(&["--pin", "ay=2"]));
+    assert_eq!(p.channel.pin.get("ay"), Some(&2));
+    assert_eq!(p.channel.pin.get("muse-alab"), Some(&4), "carried");
+    assert_eq!(p.channel.pin.get("orca-alab"), Some(&2), "carried");
+    assert!(p.retired.is_empty());
 }
 
 #[test]
@@ -505,7 +453,6 @@ fn the_command_line_refuses_duplicates_and_malformed_values() {
         d.retire_target
             .contains(&(AARCH64_UNKNOWN_LINUX_GNU, Some("ay".to_string())))
     );
-    let _: Triple = AARCH64_APPLE_DARWIN;
 }
 
 #[test]

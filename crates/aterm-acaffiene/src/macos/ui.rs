@@ -125,21 +125,32 @@ impl StatusUi {
 
     /// Update the menu to show `rows`, retitling in place when the shape matches.
     pub(super) fn refresh_menu(&mut self, target: Id, choose: Sel, rows: Vec<Row>) {
-        autoreleasepool(|_| match changed_rows(&self.rows, &rows) {
-            Some(changed) => {
-                for i in changed {
-                    if let (Some(Some(item)), Some(row)) = (self.items.get(i), rows.get(i)) {
-                        update_item(item.id(), row);
-                    }
-                }
-            }
-            None => {
+        if let Err(rows) = self.retitle_menu(rows) {
+            autoreleasepool(|_| {
                 // SAFETY: `-removeAllItems` is `v16@0:8` on the live menu.
                 unsafe { send_v(self.menu.id(), sel!(removeAllItems)) };
                 self.items = add_rows(self.menu.id(), target, choose, &rows);
+            });
+            self.rows = rows;
+        }
+    }
+
+    /// Retitle and recheck the menu's items in place to show `rows`, or hand `rows` back when
+    /// their shape differs from the shown rows' ([`changed_rows`]). It adds and removes no item,
+    /// so it may run while the menu is open.
+    pub(super) fn retitle_menu(&mut self, rows: Vec<Row>) -> Result<(), Vec<Row>> {
+        let Some(changed) = changed_rows(&self.rows, &rows) else {
+            return Err(rows);
+        };
+        autoreleasepool(|_| {
+            for i in changed {
+                if let (Some(Some(item)), Some(row)) = (self.items.get(i), rows.get(i)) {
+                    update_item(item.id(), row);
+                }
             }
         });
         self.rows = rows;
+        Ok(())
     }
 
     /// Retain the menu and its button for [`pop_up`].
@@ -503,6 +514,63 @@ mod tests {
         let mut kinds = off.clone();
         kinds[1] = Row::Info("x".into());
         assert_eq!(changed_rows(&off, &kinds), None);
+    }
+
+    /// Every menu `compose` makes has one shape, so the open menu is always retitled in place
+    /// ([`StatusUi::retitle_menu`]), never emptied while AppKit tracks it; and across a span's end
+    /// the open menu moves its checkmark from that span's row to Forever's.
+    #[test]
+    fn an_open_menu_is_always_retitled_in_place() {
+        const NOW: Clocks = Clocks {
+            since_boot: 300_000,
+            wall: 1_790_000_000,
+        };
+        let mut modes = vec![
+            Mode::Off,
+            Mode::Forever,
+            Mode::activate(Some(2 * crate::model::HOUR), NOW),
+        ];
+        modes.extend(Choice::ALL.map(|choice| Mode::chosen(choice, NOW)));
+        let menus: Vec<Vec<Row>> = modes
+            .iter()
+            .flat_map(|&mode| {
+                [
+                    Startup::Off,
+                    Startup::On,
+                    Startup::Blocked,
+                    Startup::Disabled,
+                ]
+                .into_iter()
+                .flat_map(move |startup| {
+                    [NOW, NOW + 30, NOW + 25 * crate::model::HOUR]
+                        .map(|at| menu::compose(mode, at, startup, "1"))
+                })
+            })
+            .collect();
+        for shown in &menus {
+            for now in &menus {
+                assert!(changed_rows(shown, now).is_some(), "{shown:#?}\n{now:#?}");
+            }
+        }
+
+        let hour = Mode::chosen(Choice::Hours1, NOW);
+        let before = menu::compose(hour, NOW + (crate::model::HOUR - 30), Startup::Off, "1");
+        let after = menu::compose(hour, NOW + crate::model::HOUR + 1, Startup::Off, "1");
+        let row = |choice: Choice| {
+            before
+                .iter()
+                .position(|r| {
+                    matches!(r, Row::Action { action: MenuAction::Activate(c), .. } if *c == choice)
+                })
+                .expect("a row for each choice")
+        };
+        let checked = |rows: &[Row], i: usize| matches!(rows[i], Row::Action { checked: true, .. });
+        assert_eq!(
+            changed_rows(&before, &after),
+            Some(vec![row(Choice::Hours1), row(Choice::Forever)])
+        );
+        assert!(checked(&before, row(Choice::Hours1)) && !checked(&before, row(Choice::Forever)));
+        assert!(!checked(&after, row(Choice::Hours1)) && checked(&after, row(Choice::Forever)));
     }
 
     fn types(ret: &str, args: &[&str]) -> String {

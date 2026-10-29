@@ -424,7 +424,7 @@ pub struct GcReport {
 /// Reclaim superseded builds per program, keeping the live build and one rollback.
 #[must_use]
 pub fn run(layout: &Layout, channel: Option<&Channel>) -> GcReport {
-    run_in(layout, None, channel, &|_| None, &running_executables)
+    run_in(layout, None, channel, &|_| Vec::new(), &running_executables)
 }
 
 /// [`run`], sparing each program's `.part` and complete archive named by `pinned_asset`.
@@ -438,19 +438,27 @@ pub fn run_keeping_pinned_partials(
         layout,
         None,
         channel,
-        &|p: &str| pinned_asset(p).or_else(|| pursued_asset(layout, p)),
+        &|p: &str| pinned_asset(p).map_or_else(|| pursued_assets(layout, p), |asset| vec![asset]),
         &running_executables,
     )
 }
 
-/// The staging name a vendor-direct program is still working towards.
-fn pursued_asset(layout: &Layout, program: &str) -> Option<String> {
-    let spec = crate::vendor_direct::spec(program)?;
-    let head = crate::vendor_direct::ProgramStamp::read(layout, program)?.last_head?;
+/// Every staging name a vendor-direct program is still working towards.
+fn pursued_assets(layout: &Layout, program: &str) -> Vec<String> {
+    let Some(spec) = crate::vendor_direct::spec(program) else {
+        return Vec::new();
+    };
+    let Some(head) =
+        crate::vendor_direct::ProgramStamp::read(layout, program).and_then(|s| s.last_head)
+    else {
+        return Vec::new();
+    };
     let active = crate::ops::active_builds(layout).get(program).copied();
-    (active < Some(head.build_id())).then(|| {
-        crate::vendor_direct::resolve::staging_asset(spec, head, crate::cli::current_triple())
-    })
+    if active < Some(head.build_id()) {
+        crate::vendor_direct::resolve::staging_assets(spec, head, crate::cli::current_triple())
+    } else {
+        Vec::new()
+    }
 }
 
 /// [`run_keeping_pinned_partials`] confined to `programs`.
@@ -464,7 +472,7 @@ pub fn run_for_programs(
         layout,
         Some(&|p: &str| programs.contains(p)),
         None,
-        &|p: &str| pinned_asset(p).or_else(|| pursued_asset(layout, p)),
+        &|p: &str| pinned_asset(p).map_or_else(|| pursued_assets(layout, p), |asset| vec![asset]),
         &running_executables,
     )
 }
@@ -476,7 +484,13 @@ fn run_with(
     pinned_asset: &dyn Fn(&str) -> Option<String>,
     running: &dyn Fn() -> Option<Vec<PathBuf>>,
 ) -> GcReport {
-    run_in(layout, None, None, pinned_asset, running)
+    run_in(
+        layout,
+        None,
+        None,
+        &|p| pinned_asset(p).into_iter().collect(),
+        running,
+    )
 }
 
 /// Runs the GC pass over `scope` with `channel` rollback targets and injected `running`.
@@ -484,7 +498,7 @@ fn run_in(
     layout: &Layout,
     scope: Option<&dyn Fn(&str) -> bool>,
     channel: Option<&Channel>,
-    pinned_asset: &dyn Fn(&str) -> Option<String>,
+    pinned_assets: &dyn Fn(&str) -> Vec<String>,
     running: &dyn Fn() -> Option<Vec<PathBuf>>,
 ) -> GcReport {
     let in_scope = |program: &str| scope.is_none_or(|admits| admits(program));
@@ -562,6 +576,8 @@ fn run_in(
     for sidecar in debris.orphan_sidecars {
         let _ = std::fs::remove_file(sidecar);
     }
+    // A discarded build's kept unit went with it; its `units/` link goes now too.
+    crate::peers::sweep_kept(layout);
     let mut swept_scratch: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (program, name, path) in debris.scratch {
         // Reported only when removed; the next pass enumerates a survivor again.
@@ -585,9 +601,7 @@ fn run_in(
             let Ok(entries) = std::fs::read_dir(program.path()) else {
                 continue;
             };
-            let pinned = pinned_asset(&name);
-            let keep_part = pinned.as_ref().map(|asset| format!("{asset}.part"));
-            let keep_archive = pinned;
+            let kept = pinned_assets(&name);
             let mut gone: Vec<String> = Vec::new();
             for e in entries.filter_map(Result::ok) {
                 // Regular files only: never follow a symlink out of the prefix, and
@@ -596,7 +610,11 @@ fn run_in(
                     continue;
                 }
                 let entry_name = e.file_name().into_string().ok();
-                if entry_name.is_some() && (keep_archive == entry_name || keep_part == entry_name) {
+                if let Some(ref n) = entry_name
+                    && kept
+                        .iter()
+                        .any(|asset| n == asset || n.strip_prefix(asset.as_str()) == Some(".part"))
+                {
                     continue;
                 }
                 if let Some(n) = entry_name.as_ref()

@@ -3,9 +3,12 @@
 //! Conformance: the real `snapshot()` obeys the derived isolation discipline.
 
 use crate::support::{read_cap, write_cap};
-use aterm_buffer::{Edit, LineId, Range, Surface};
+use aterm_buffer::{Edit, LineId, Range, Snapshot, Surface};
 use aterm_models_session::snapshot_model;
+use aterm_spec::{interp, verify};
 use std::collections::BTreeMap;
+
+type State = BTreeMap<&'static str, i64>;
 
 fn full_range() -> Range {
     Range {
@@ -14,42 +17,80 @@ fn full_range() -> Range {
     }
 }
 
+fn project(s: &Surface, active: Option<(&Snapshot, &str)>) -> State {
+    let (snapped, leaked) = match active {
+        None => (0, 0),
+        Some((snap, baseline)) => {
+            let now = snap.read_text(&read_cap(), full_range()).text;
+            let leaked = i64::from(now != baseline || snap.at.0 > s.seq().0);
+            (1, leaked)
+        }
+    };
+    [
+        ("seq", i64::try_from(s.seq().0).expect("small seq")),
+        ("snapped", snapped),
+        ("leaked", leaked),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn conforms(prev: &State, next: &State, action: &str) -> (bool, String) {
+    verify::validate_transition_tiered(
+        &snapshot_model(),
+        &[("MaxSeq", 16)],
+        prev,
+        next,
+        Some(action),
+        "Surface snapshot conformance",
+    )
+}
+
 #[test]
 fn real_snapshot_isolated_from_later_writes() {
     let m = snapshot_model();
     let mut s = Surface::new();
-    s.apply(&write_cap(), Edit::AppendLine("a".into()));
-    s.apply(&write_cap(), Edit::AppendLine("b".into()));
+    let mut state = project(&s, None);
+    assert_eq!(state, m.init_state(), "empty surface is Init");
 
-    let snap = s.snapshot(&read_cap()); // capture the frozen world at seq = 2
-    let snap_at = snap.at.0;
+    for line in ["a", "b"] {
+        s.apply(&write_cap(), Edit::AppendLine(line.into()));
+        let next = project(&s, None);
+        let (ok, why) = conforms(&state, &next, "Write");
+        assert!(ok, "pre-snap Write {state:?} -> {next:?}\n{why}");
+        state = next;
+    }
+
+    let snap = s.snapshot(&read_cap());
+    assert_eq!(snap.at.0, 2, "snapshot captured head at seq = 2");
     let captured = snap.read_text(&read_cap(), full_range()).text;
+    let snapped_state = project(&s, Some((&snap, &captured)));
+    let (ok, why) = conforms(&state, &snapped_state, "Snap");
+    assert!(ok, "Snap {state:?} -> {snapped_state:?}\n{why}");
+    state = snapped_state;
 
     s.apply(&write_cap(), Edit::AppendLine("c".into()));
-
-    let snap_after = snap.read_text(&read_cap(), full_range()).text;
-    let surface_now = s.read_text(&read_cap(), full_range()).text;
-
-    assert_eq!(
-        snap_after, captured,
-        "snapshot view must be isolated from later writes (no leak)"
-    );
+    let after = project(&s, Some((&snap, &captured)));
+    let (ok, why) = conforms(&state, &after, "Write");
+    assert!(ok, "post-snap Write {state:?} -> {after:?}\n{why}");
     assert_ne!(
-        snap_after, surface_now,
-        "the later write is visible on the surface but NOT in the isolated snapshot"
+        snap.read_text(&read_cap(), full_range()).text,
+        s.read_text(&read_cap(), full_range()).text,
+        "the later write is visible on the surface but not in the isolated snapshot"
     );
-    assert_eq!(
-        snap_at, 2,
-        "snapshot captured the head at snapshot time (seq = 2)"
-    );
-    assert_eq!(s.seq().0, 3, "the surface advanced past the snapshot");
-
-    let observed: BTreeMap<&'static str, i64> =
-        [("seq", s.seq().0 as i64), ("snapped", 1), ("leaked", 0)]
-            .into_iter()
-            .collect();
     assert!(
-        m.check_invariant("SnapshotIsolated", &observed),
-        "the observed no-leak state satisfies the model's SnapshotIsolated invariant"
+        m.check_invariant("SnapshotIsolated", &after),
+        "projected post-write snapshot state satisfies SnapshotIsolated: {after:?}"
     );
+
+    let mut leaked = after.clone();
+    leaked.insert("leaked", 1);
+    assert!(!conforms(&state, &leaked, "Write").0);
+    assert!(
+        interp::with_consts(&interp::with_buggy(&m, 1), &[("MaxSeq", 16)])
+            .successors("Write", &state)
+            .contains(&leaked),
+        "Buggy = 1 admits the leaked post-snapshot write"
+    );
+    assert!(!m.check_invariant("SnapshotIsolated", &leaked));
 }

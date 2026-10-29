@@ -37,6 +37,7 @@ impl Bed {
             codex_thread: None,
             agy_conversation: None,
             codex_home: None,
+            codex_login: None,
             now: NOW,
             tz_s: 0,
             sid: String::new(),

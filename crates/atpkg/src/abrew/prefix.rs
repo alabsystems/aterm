@@ -471,7 +471,9 @@ impl Prefix {
             Kind::Cask => self.cask_dir(&inst.name, &inst.version),
         };
         if let Some(full) = receipt_word(&dir, "full_name")
+            && super::valid_name(&full)
             && full.contains('/')
+            && full.rsplit('/').next() == Some(inst.name.as_str())
         {
             return full;
         }
@@ -549,6 +551,20 @@ impl Prefix {
         self.pinned_version(name).is_some()
     }
 
+    fn cask_pin_bases_real(&self, token: &str) -> Result<(), String> {
+        for base in [
+            self.root.clone(),
+            self.caskroom(),
+            self.caskroom().join(token),
+            self.root.join("var"),
+            self.root.join("var/homebrew"),
+            self.root.join("var/homebrew/pinned_casks"),
+        ] {
+            real_base(&base)?;
+        }
+        Ok(())
+    }
+
     /// The version `token` is pinned at by a brew cask pin
     /// (`var/homebrew/pinned_casks/<token>` → the versioned caskroom
     /// path), when that target is this prefix's owned payload.
@@ -556,20 +572,17 @@ impl Prefix {
         if !super::valid_component(token) {
             return None;
         }
+        self.cask_pin_bases_real(token).ok()?;
         let dir = self.root.join("var/homebrew/pinned_casks");
-        let link = dir.join(token);
-        let target = std::fs::read_link(&link).ok()?;
-        let joined = if target.is_absolute() {
-            target.clone()
-        } else {
-            dir.join(&target)
-        };
-        // Brew writes the pin as a relative symlink full of `..`;
-        // compare canonical forms so the spelling doesn't matter.
-        let resolved = std::fs::canonicalize(&joined).ok()?;
-        let version = resolved.file_name()?.to_str()?.to_owned();
+        let target = std::fs::read_link(dir.join(token)).ok()?;
+        let version = target.file_name()?.to_str()?.to_owned();
+        if !super::valid_cask_version(&version) {
+            return None;
+        }
         let staged = self.cask_dir(token, &version);
-        (std::fs::canonicalize(&staged).ok().as_ref() == Some(&resolved)
+        (resolve_link_target(&dir, &target) == staged
+            && std::fs::symlink_metadata(&staged)
+                .is_ok_and(|m| m.file_type().is_dir() && !crate::platform::is_reparse(&m))
             && owned_receipt(&staged, Kind::Cask, token, &version))
         .then_some(version)
     }
@@ -578,12 +591,30 @@ impl Prefix {
         self.cask_pinned_version(token).is_some()
     }
 
-    /// Whether any pin symlink (ours or dangling) sits at the brew
-    /// cask pin path for `token`.
+    /// Returns whether `var/homebrew/pinned_casks/<token>` is a dangling symlink
+    /// into this caskroom's `<token>` versions.
+    pub(super) fn cask_pin_link_dangling_ours(&self, token: &str) -> bool {
+        if !super::valid_component(token) || self.cask_pin_bases_real(token).is_err() {
+            return false;
+        }
+        let dir = self.root.join("var/homebrew/pinned_casks");
+        let Ok(target) = std::fs::read_link(dir.join(token)) else {
+            return false;
+        };
+        let Some(version) = target.file_name().and_then(|v| v.to_str()) else {
+            return false;
+        };
+        let staged = self.cask_dir(token, version);
+        super::valid_cask_version(version)
+            && resolve_link_target(&dir, &target) == staged
+            && matches!(std::fs::symlink_metadata(&staged), Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound)
+    }
+
+    /// Whether an owned pin symlink (live or dangling into this prefix's
+    /// caskroom) sits at the brew cask pin path for `token`.
     pub fn cask_pin_link_present(&self, token: &str) -> bool {
-        super::valid_component(token)
-            && std::fs::symlink_metadata(self.root.join("var/homebrew/pinned_casks").join(token))
-                .is_ok_and(|m| m.file_type().is_symlink())
+        self.cask_is_pinned(token) || self.cask_pin_link_dangling_ours(token)
     }
 
     /// Pins cask `token` at its installed version, brew's shape: a
@@ -593,19 +624,15 @@ impl Prefix {
             return Err(format!("abrew: invalid cask token {token}"));
         }
         self.ensure()?;
+        self.cask_pin_bases_real(token)?;
         let Some(inst) = self.installed_one(Kind::Cask, token) else {
             return Err(format!("abrew: {token} is not installed"));
         };
         let dir = self.root.join("var/homebrew/pinned_casks");
         std::fs::create_dir_all(&dir).map_err(|e| format!("abrew: {e}"))?;
         let link = dir.join(token);
-        let dangling_ours = std::fs::read_link(&link).is_ok_and(|target| {
-            target
-                .to_string_lossy()
-                .contains(&format!("Caskroom/{token}/"))
-        });
         match std::fs::symlink_metadata(&link) {
-            Ok(_) if self.cask_is_pinned(token) || dangling_ours => {
+            Ok(_) if self.cask_pin_link_present(token) => {
                 std::fs::remove_file(&link).map_err(|e| format!("abrew: {e}"))?;
             }
             Ok(_) => {
@@ -629,6 +656,7 @@ impl Prefix {
             return Err(format!("abrew: invalid cask token {token}"));
         }
         self.ensure()?;
+        self.cask_pin_bases_real(token)?;
         let dir = self.root.join("var/homebrew/pinned_casks");
         let link = dir.join(token);
         if !self.cask_pin_link_present(token) {
@@ -1168,14 +1196,70 @@ mod tests {
         std::fs::remove_file(pins.join("widget")).unwrap();
         symlink_dir(std::path::Path::new("/tmp"), &pins.join("widget")).unwrap();
         assert!(!p.cask_is_pinned("widget"));
-        // The write side refuses that foreign symlink, then round-trips.
+        assert!(!p.cask_pin_link_present("widget"));
+        // Neither pin_cask nor unpin_cask removes a foreign symlink or file.
         assert!(p.pin_cask("widget").is_err());
+        assert!(p.unpin_cask("widget").is_err());
+        assert_eq!(
+            std::fs::read_link(pins.join("widget")).unwrap(),
+            std::path::Path::new("/tmp")
+        );
         std::fs::remove_file(pins.join("widget")).unwrap();
+        std::fs::write(pins.join("widget"), b"foreign").unwrap();
+        assert!(p.pin_cask("widget").is_err());
+        assert!(p.unpin_cask("widget").is_err());
+        assert_eq!(std::fs::read(pins.join("widget")).unwrap(), b"foreign");
+        std::fs::remove_file(pins.join("widget")).unwrap();
+        // A symlink mentioning Caskroom/<token>/ that resolves outside or to an
+        // unowned live directory is not treated as ours.
+        let unowned = p.cask_dir("widget", "unowned");
+        std::fs::create_dir_all(&unowned).unwrap();
+        for bad_target in [
+            std::path::PathBuf::from("../../../Caskroom/widget/unowned"),
+            std::path::PathBuf::from("../../../Caskroom/widget/1.0/../../other"),
+            std::path::PathBuf::from("/other/prefix/Caskroom/widget/2.0"),
+        ] {
+            symlink_dir(&bad_target, &pins.join("widget")).unwrap();
+            assert!(!p.cask_is_pinned("widget"), "{bad_target:?}");
+            assert!(!p.cask_pin_link_present("widget"), "{bad_target:?}");
+            assert!(p.pin_cask("widget").is_err(), "{bad_target:?}");
+            assert!(p.unpin_cask("widget").is_err(), "{bad_target:?}");
+            std::fs::remove_file(pins.join("widget")).unwrap();
+        }
+        std::fs::remove_dir_all(&unowned).unwrap();
+        // An owned dangling cask pin is recognized and cleaned up by both pin_cask and unpin_cask.
+        symlink_dir(
+            std::path::Path::new("../../../Caskroom/widget/1.0"),
+            &pins.join("widget"),
+        )
+        .unwrap();
+        assert!(!p.cask_is_pinned("widget"));
+        assert!(p.cask_pin_link_dangling_ours("widget"));
+        assert!(p.cask_pin_link_present("widget"));
         p.pin_cask("widget").unwrap();
+        assert_eq!(p.cask_pinned_version("widget").as_deref(), Some("2.0"));
         assert!(p.cask_is_pinned("widget"));
         p.unpin_cask("widget").unwrap();
         assert!(!p.cask_is_pinned("widget"));
         assert!(std::fs::symlink_metadata(&pins).is_err());
+        // Dangling pin removal when the cask itself was uninstalled.
+        std::fs::create_dir_all(&pins).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        symlink_dir(
+            std::path::Path::new("../../../Caskroom/widget/2.0"),
+            &pins.join("widget"),
+        )
+        .unwrap();
+        assert!(p.cask_pin_link_present("widget"));
+        p.unpin_cask("widget").unwrap();
+        assert!(std::fs::symlink_metadata(&pins).is_err());
+        // Aliased var/homebrew base is refused before touching external trees.
+        let outside = tmp.path().join("outside-var");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::remove_dir_all(p.root.join("var/homebrew")).unwrap();
+        symlink_dir(&outside, &p.root.join("var/homebrew")).unwrap();
+        assert!(p.pin_cask("widget").is_err());
+        assert!(p.unpin_cask("widget").is_err());
     }
 
     #[test]

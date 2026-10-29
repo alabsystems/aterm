@@ -1514,39 +1514,32 @@ pub(crate) fn pet_owner_tick_for_test(
         cmd_done: None,
         alt_screen: false,
     };
-    let host = aterm_effects::host::HostFrameInput {
-        now: sense.now,
-        visibility: aterm_effects::host::Visibility::Focused,
-        reduced_motion: sense.reduced_motion,
-        serious: false,
-        shed_envelope: 1.0,
-        shed_active: false,
-        pointer_px: sense
-            .pointer
-            .map(|(col, row)| (col * f32::from(sense.cell_w), row * f32::from(sense.cell_h))),
-        capture,
-        geometry: aterm_effects::host::FrameGeom {
+    let host = aterm_effects::host::HostFrameInput::new(
+        sense.now,
+        aterm_effects::host::FrameGeom {
             rows: sense.rows,
             cols: sense.cols,
             cell_w: sense.cell_w,
             cell_h: sense.cell_h,
             origin_px: (0, 0),
         },
-    };
-    let tick = ws.fx.pet_prepare(aterm_effects::companion::PetFacts {
-        facts: &facts,
-        host: &host,
-        glow: aterm_effects::companion::GlowOwnership {
+    )
+    .with_reduced_motion(sense.reduced_motion)
+    .with_pointer_px(
+        sense
+            .pointer
+            .map(|(col, row)| (col * f32::from(sense.cell_w), row * f32::from(sense.cell_h))),
+    )
+    .with_capture(capture);
+    let tick = ws.fx.pet_prepare(aterm_effects::companion::PetFacts::new(
+        &facts,
+        &host,
+        aterm_effects::companion::GlowOwnership {
             enabled: true,
             style: crate::cursor_glow::GlowStyle::RainbowKitty,
             style_raw_names_pet: true,
         },
-        sing: aterm_effects::host::SingFacts::default(),
-        focused: true,
-        obscured: false,
-        pane: None,
-        room: None,
-    });
+    ));
     ws.fx.companion_mut().tick(tick)
 }
 
@@ -1586,37 +1579,27 @@ pub(crate) fn pet_prepare_shed_for_test(
         cmd_done,
         alt_screen: false,
     };
-    let host = aterm_effects::host::HostFrameInput {
+    let host = aterm_effects::host::HostFrameInput::new(
         now,
-        visibility: aterm_effects::host::Visibility::Focused,
-        reduced_motion: false,
-        serious: false,
-        shed_envelope,
-        shed_active,
-        pointer_px: None,
-        capture: aterm_effects::host::CaptureMode::Present,
-        geometry: aterm_effects::host::FrameGeom {
+        aterm_effects::host::FrameGeom {
             rows: 24,
             cols: 80,
             cell_w: 8,
             cell_h: 16,
             origin_px: (0, 0),
         },
-    };
-    ws.fx.pet_prepare(aterm_effects::companion::PetFacts {
-        facts: &facts,
-        host: &host,
-        glow: aterm_effects::companion::GlowOwnership {
+    )
+    .with_shed_envelope(shed_envelope)
+    .with_shed_active(shed_active);
+    ws.fx.pet_prepare(aterm_effects::companion::PetFacts::new(
+        &facts,
+        &host,
+        aterm_effects::companion::GlowOwnership {
             enabled: true,
             style: crate::cursor_glow::GlowStyle::RainbowKitty,
             style_raw_names_pet: true,
         },
-        sing: aterm_effects::host::SingFacts::default(),
-        focused: true,
-        obscured: false,
-        pane: None,
-        room: None,
-    })
+    ))
 }
 
 #[cfg(test)]
@@ -1759,6 +1742,7 @@ impl RoutedCompanion {
 
 fn prepare_routed_head(
     ws: &mut WindowState,
+    ink: CompanionInk,
     geom: crate::word_decorations::EffectGeom,
     duty: CompanionDuty,
     cat_frame: crate::kitty_cursor::CatFrame,
@@ -1776,9 +1760,14 @@ fn prepare_routed_head(
         lift: seat.lift,
     };
     let motion = ws.fx.companions_mut().cursor_cat.placement_frame(now);
+    // The head keeps off the caret and the letters of the snapshot its seat
+    // was routed over (looks10 L10).
+    let cells: &[Vec<RenderCell>] = match ink {
+        CompanionInk::Single => &ws.input_scratch.cells,
+        CompanionInk::Composed => &ws.composed_focus_scratch.cells,
+    };
     ws.fx
-        .decos_mut()
-        .prepare_kitty_cursor_placement(layout, motion, cat_frame.pose)
+        .prepare_flying_head(layout, motion, cat_frame.pose, cells)
 }
 
 /// Route the single grid's cursor companion for this frame ([`route_v2_companion`], called for every duty: the impulse is consumed even on an idle or pet frame).
@@ -1806,7 +1795,7 @@ pub(crate) fn route_single_cursor_companion(
         &mut cat_frame,
         animate_head,
     );
-    let placement = prepare_routed_head(ws, geom, duty, cat_frame, seat, now);
+    let placement = prepare_routed_head(ws, CompanionInk::Single, geom, duty, cat_frame, seat, now);
     RoutedCompanion {
         duty,
         cat_frame,
@@ -2704,7 +2693,8 @@ fn scaled_border_px(base: usize, scale_q4: u8) -> usize {
     if scale_q4 == 0 {
         return base;
     }
-    ((base * usize::from(scale_q4)) / 16).max(1)
+    let scaled = (base as u128 * u128::from(scale_q4)) / 16;
+    usize::try_from(scaled).unwrap_or(usize::MAX).max(1)
 }
 
 #[cfg(test)]
@@ -2713,7 +2703,17 @@ mod scaled_border_px_tests {
 
     #[test]
     fn scaled_border_px_is_sixteenths_never_thinner_than_a_pixel() {
-        for (base, q4, want) in [(6, 0, 6), (6, 16, 6), (6, 24, 9), (1, 1, 1), (0, 16, 1)] {
+        for (base, q4, want) in [
+            (6, 0, 6),
+            (6, 16, 6),
+            (6, 24, 9),
+            (1, 1, 1),
+            (0, 16, 1),
+            (1 << 25, 32, 1 << 26),
+            (usize::MAX, 0, usize::MAX),
+            (usize::MAX, 16, usize::MAX),
+            (usize::MAX, 255, usize::MAX),
+        ] {
             assert_eq!(scaled_border_px(base, q4), want, "base {base} × {q4}/16");
         }
     }
@@ -4245,16 +4245,37 @@ impl ActivePaneMark {
         })
     }
 
-    /// This frame's term for [`crate::RepaintKey`].
-    pub(crate) fn key_term(mark: Option<Self>) -> u64 {
-        use std::hash::{Hash, Hasher};
-
+    /// This frame's term for [`crate::RepaintKey`]: `0` for `None`, and an injective `u64`
+    /// packing over `u16` cell coordinates (`rows >= 1`, `cols >= 1`) for `Some`.
+    pub(crate) const fn key_term(mark: Option<Self>) -> u64 {
         let Some(mark) = mark else {
             return 0;
         };
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (mark.row, mark.col, mark.rows, mark.cols).hash(&mut hasher);
-        hasher.finish() | 1
+        let r = if mark.row > u16::MAX as usize {
+            u16::MAX as u64
+        } else {
+            mark.row as u64
+        };
+        let c = if mark.col > u16::MAX as usize {
+            u16::MAX as u64
+        } else {
+            mark.col as u64
+        };
+        let h = if mark.rows == 0 {
+            1u64
+        } else if mark.rows > u16::MAX as usize {
+            u16::MAX as u64
+        } else {
+            mark.rows as u64
+        };
+        let w = if mark.cols == 0 {
+            1u64
+        } else if mark.cols > u16::MAX as usize {
+            u16::MAX as u64
+        } else {
+            mark.cols as u64
+        };
+        (r << 48) | (c << 32) | (w << 16) | h
     }
 }
 
@@ -4327,6 +4348,16 @@ fn terminal_frame_colors(term: &Terminal) -> (u32, u32, u32) {
     let default_bg = aterm_render::rgb_to_u32(blank.bg);
     let default_fg = aterm_render::rgb_to_u32(blank.fg);
     (default_bg, default_fg, terminal_cursor_color(term))
+}
+
+/// `term`'s configured `(fg, bg)` ([`Terminal::configured_colors`]) as `0x00RRGGBB`: the light
+/// latch's key, read under the same lock as the live ground.
+pub(crate) fn terminal_configured_colors(term: &Terminal) -> (u32, u32) {
+    let (fg, bg) = term.configured_colors();
+    (
+        aterm_render::rgb_to_u32([fg.r, fg.g, fg.b]),
+        aterm_render::rgb_to_u32([bg.r, bg.g, bg.b]),
+    )
 }
 
 #[cfg(test)]
@@ -4939,8 +4970,9 @@ struct FocusedComposedCursorEffects<'a> {
     trail_color: u32,
     active_cursor_fill: Option<u32>,
     fx_layers: &'a [aterm_core::render::FxLayer],
-    /// The focused pane's text holds the GPU's bloom ([`RenderInput::bloom_gate`]).
-    bloom_held: bool,
+    /// Whether the focused pane's text holds the GPU's bloom, or the post
+    /// passes spare its letters ([`RenderInput::bloom_gate`]).
+    bloom_gate: aterm_core::render::BloomGate,
     /// The pet's veil its last pet tick laid ([`aterm_effects::cursor_glow::CursorGlow::pet_veil`]),
     /// projected with the under stream on a frame that runs no pet tick (empty
     /// on a full frame, whose word publish lays it afresh).
@@ -4997,7 +5029,7 @@ fn project_focused_composed_cursor_effects(
     dst.fire_halo.clear();
     dst.cursor_trail.clear();
     dst.cursor_effect_style_override = None;
-    dst.bloom_gate = aterm_core::render::BloomGate::of(effects.bloom_held);
+    dst.bloom_gate = effects.bloom_gate;
 
     let Some(clip) = clip else {
         withdraw_fx_layers(&mut dst.fx_layers, effects.fx_layers);
@@ -5448,6 +5480,116 @@ pub(crate) struct TerminalCaptureLeaf {
     pub(crate) snapshot_seq: u64,
     /// Content-only arrival clock coherent with this leaf's cells.
     pub(crate) content_seq: u64,
+}
+
+/// Which grid a content clock belongs to: the terminal, whether its alternate screen is up, and
+/// the grid itself (`Grid::instance`), since a grid an alternate-screen enter or a checkpoint
+/// restore builds starts its clock over, while one `?47` or `?1047` parks and puts back keeps its
+/// own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GridKey {
+    terminal_id: u64,
+    alt: bool,
+    grid: u64,
+}
+
+impl GridKey {
+    /// The grid a fill read.
+    pub(crate) fn filled(input: &aterm_render::RenderInput) -> Self {
+        Self {
+            terminal_id: input.terminal_id,
+            alt: input.engine_alt,
+            grid: input.grid_instance,
+        }
+    }
+
+    /// The terminal's active grid now.
+    pub(crate) fn live(terminal: &aterm_core::terminal::Terminal) -> Self {
+        Self {
+            terminal_id: terminal.render_identity(),
+            alt: terminal.is_alternate_screen(),
+            grid: terminal.grid().instance(),
+        }
+    }
+}
+
+/// One terminal leaf a window's own successful present drew: its session, the grid its frame was
+/// filled from, and that grid's content clock at the fill, so `dims`' `presented_seq=` names what
+/// reached the window's target, never what was only composed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PresentedGrid {
+    pub(crate) session: u64,
+    pub(crate) grid: GridKey,
+    /// The grid's content clock at the fill (`Terminal::content_seq`).
+    pub(crate) content_seq: u64,
+}
+
+/// Records in `ws.presented_grids` the terminal leaves a successful present of the window drew,
+/// from what its compose staged beside the capture seqs: every leaf on the terminal route and
+/// none on another (a heterogeneous or native frame does not stage them, so what they hold is an
+/// earlier frame's), so the record never names a grid that frame did not show.
+fn record_presented_grids(
+    ws: &mut WindowState,
+    views: &crate::tab_model::ViewStore,
+    route: SuccessfulPresentRoute,
+    plan: &crate::tab_model::VisibleLeafPlan,
+) {
+    ws.presented_grids.clear();
+    if !matches!(route, SuccessfulPresentRoute::Terminal)
+        || plan.leaves.len() != ws.capture_leaf_content_seqs.len()
+        || plan.leaves.len() != ws.capture_leaf_grids.len()
+    {
+        return;
+    }
+    for ((leaf, &content_seq), &grid) in plan
+        .leaves
+        .iter()
+        .zip(&ws.capture_leaf_content_seqs)
+        .zip(&ws.capture_leaf_grids)
+    {
+        if let Some(crate::tab_model::View::Terminal(terminal)) = views.get(leaf.view).copied() {
+            ws.presented_grids.push(PresentedGrid {
+                session: terminal.session,
+                grid,
+                content_seq,
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod presented_grid_record_tests {
+    use super::{HostVisualState, SuccessfulPresentRoute};
+    use crate::WindowId;
+
+    /// A mixed frame after a terminal one clears the record: the leaves the terminal frame staged
+    /// are still there, but the mixed frame did not draw them.
+    #[test]
+    fn a_frame_off_the_terminal_route_clears_the_record() {
+        let wid = WindowId(0);
+        let mut app = crate::scripted_redraw_fixture::scripted_app();
+        app.redraw_window(wid);
+        assert_eq!(
+            app.windows[&wid].presented_grids.len(),
+            1,
+            "the terminal frame drew its grid"
+        );
+        let plan = app.active_visible_leaf_plan(wid).expect("visible plan");
+        app.finalize_successful_present(
+            wid,
+            crate::metrics::StartupPresentTiming::collapsed(std::time::Instant::now()),
+            0,
+            None,
+            SuccessfulPresentRoute::Heterogeneous,
+            crate::VisibleContentRoute::Heterogeneous,
+            HostVisualState::default(),
+            &plan,
+        );
+        assert!(
+            app.windows[&wid].presented_grids.is_empty(),
+            "a mixed frame names no terminal grid"
+        );
+    }
 }
 
 /// Focused terminal coordinate sample owned by the same lock as a capture's cells.
@@ -6301,6 +6443,7 @@ mod witness_row_capture_tests {
 
 /// One frame's terminal-state snapshot for [`App::cursor_frame`].
 pub(crate) struct CursorFxInputs {
+    pub vim_frame: Option<crate::vim_custody::Frame>,
     /// The animation clock (one `Instant` per redraw / capture).
     pub now: Instant,
     /// Window grid rows (terminal content — no tab-strip rows).
@@ -6331,6 +6474,12 @@ pub(crate) struct CursorFxInputs {
     pub row_probe_neighbors: Option<(bool, bool)>,
     /// The live default foreground (`0x00RRGGBB`), the twin of `default_bg`.
     pub default_fg: u32,
+    /// The front session's configured foreground ([`Terminal::configured_colors`],
+    /// `0x00RRGGBB`), read under the live ground's lock: the light latch's key, which DECSCNM
+    /// and OSC 10/11 never move.
+    pub scheme_fg: u32,
+    /// The configured background, the twin of `scheme_fg`.
+    pub scheme_bg: u32,
     /// The echo anchor (`Terminal::print_anchor`).
     pub print_anchor: Option<(u16, u16, u64)>,
     /// The glyph at that print run's last cell (`Terminal::print_anchor_glyph`), same hold and live-viewport guard.
@@ -6344,6 +6493,7 @@ impl CursorFxInputs {
     /// A neutral frame for tests that drive [`App::cursor_frame`] without caring about the terminal's exact state.
     pub(crate) fn sample_for_test(now: Instant) -> Self {
         Self {
+            vim_frame: None,
             now,
             rows: 24,
             cols: 80,
@@ -6359,6 +6509,8 @@ impl CursorFxInputs {
             row_probe: None,
             row_probe_neighbors: None,
             default_fg: Theme::default().fg,
+            scheme_fg: Theme::default().fg,
+            scheme_bg: Theme::default().bg,
             print_anchor: None,
             print_anchor_glyph: None,
             pane_text: None,
@@ -6434,6 +6586,7 @@ impl ComposedWitnessStamp {
 }
 
 struct FocusedComposedCursorFxSample {
+    vim_frame: Option<crate::vim_custody::Frame>,
     session: u64,
     witness_stamp: ComposedWitnessStamp,
     witness_rows: ComposedWitnessRows,
@@ -6446,6 +6599,8 @@ struct FocusedComposedCursorFxSample {
     cursor_recoloured: bool,
     default_bg: u32,
     default_fg: u32,
+    scheme_fg: u32,
+    scheme_bg: u32,
     alt: bool,
     blink_epoch: u64,
     content_scroll_state: ContentScrollState,
@@ -6749,6 +6904,7 @@ mod composed_witness_scroll_capture_tests {
         focused_composed_cursor_fx_sample(
             1,
             term,
+            None,
             true,
             true,
             true,
@@ -6808,6 +6964,7 @@ mod composed_witness_scroll_capture_tests {
 fn focused_composed_cursor_fx_sample(
     session: u64,
     terminal: &Terminal,
+    context: Option<&crate::SessionCtx>,
     capture_row_probes: bool,
     v2_owns_frame: bool,
     reads_neighbor_rows: bool,
@@ -6862,7 +7019,10 @@ fn focused_composed_cursor_fx_sample(
         witness_rows.active = 0;
     }
     let (print_anchor, print_anchor_glyph) = aterm_effects::host::motion_print_anchor(terminal);
+    let (scheme_fg, scheme_bg) = terminal_configured_colors(terminal);
     FocusedComposedCursorFxSample {
+        vim_frame: context
+            .and_then(|context| crate::vim_custody::capture(terminal, context, false)),
         session,
         witness_stamp: ComposedWitnessStamp::read(terminal),
         witness_rows,
@@ -6875,6 +7035,8 @@ fn focused_composed_cursor_fx_sample(
         cursor_recoloured: terminal.cursor_color_recoloured(),
         default_bg: aterm_render::rgb_to_u32(terminal_blank_cell(terminal).bg),
         default_fg: aterm_render::rgb_to_u32(terminal_blank_cell(terminal).fg),
+        scheme_fg,
+        scheme_bg,
         alt: terminal.is_alternate_screen(),
         blink_epoch: terminal.repaint_blink_epoch(),
         content_scroll_state,
@@ -7929,6 +8091,89 @@ impl App {
         Ok((v, now))
     }
 
+    /// What the host knows of the page under a window's text (`docs/design/PRISM-GLASS.md` §15.2
+    /// 1.7, D1): the window is opaque where its `background_opacity` is whole, and a wallpaper
+    /// lies under the text once its image is ready (`splice_wallpaper` lays it then). The light
+    /// glass draws only on a clear page ([`aterm_effects::host::PageFacts::clear`]).
+    pub(crate) fn page_facts(&self) -> aterm_effects::host::PageFacts {
+        aterm_effects::host::PageFacts {
+            opaque: self.config.background_opacity_or_default() >= 1.0,
+            wallpaper: matches!(
+                self.config_assets.wallpaper,
+                crate::app_config::WallpaperAsset::Ready { .. }
+            ),
+        }
+    }
+
+    /// Window `wid`'s light read outside its frame (`docs/design/PRISM-GLASS.md` §15.2 1.3): the
+    /// light its last frame latched, while that frame's session is still the window's front
+    /// session and that session's configured scheme is light now, read lock-free
+    /// ([`Self::session_scheme`]). [`aterm_effects::cursor_glow::Light::OFF`] once the scheme
+    /// flipped dark or the front session moved, until the window draws again.
+    pub(crate) fn window_light(&self, wid: WindowId) -> aterm_effects::cursor_glow::Light {
+        use aterm_effects::cursor_glow::Light;
+        let Some(ws) = self.windows.get(&wid) else {
+            return Light::OFF;
+        };
+        let Some(front) = ws.front_terminal().map(|front| front.session) else {
+            return Light::OFF;
+        };
+        let held = ws
+            .trail_ground
+            .seen()
+            .is_some_and(|(key, _)| key.session == front);
+        if held && aterm_effects::host::light_latch::scheme_light(self.session_scheme(front).1) {
+            ws.trail_ground.light()
+        } else {
+            Light::OFF
+        }
+    }
+
+    /// `trail light`: the front window's light latch as its last frame left it, and its light
+    /// read now ([`Self::window_light`]); `trail status` is unchanged.
+    pub(crate) fn trail_light(&self) -> Result<String, String> {
+        let Some(id) = self.frontmost_window else {
+            return Err("no focused window".to_string());
+        };
+        let Some(ws) = self.windows.get(&id) else {
+            return Err("no focused window".to_string());
+        };
+        let ground = &ws.trail_ground;
+        let out = ground.last();
+        let bit = |b: bool| u8::from(b);
+        let hex = |c: u32| format!("#{:06x}", c & 0x00FF_FFFF);
+        let key = match ground.seen() {
+            Some((key, raw)) => format!(
+                "session={} fg={} bg={} raw={}",
+                key.session,
+                hex(key.fg),
+                hex(key.bg),
+                bit(raw)
+            ),
+            None => "session=- fg=- bg=- raw=-".to_string(),
+        };
+        let front = ws.front_terminal().map(|front| front.session);
+        Ok(format!(
+            "trail-light window={} on={} scheme_changed={} fell={} {key} live={} light={} \
+             window_light={} front_session={} front_scheme_light={}",
+            id.0,
+            bit(out.on),
+            bit(out.scheme_changed),
+            bit(out.fell),
+            ground.live().word(),
+            ground.light().bits(),
+            self.window_light(id).bits(),
+            front.map_or_else(|| "-".to_string(), |s| s.to_string()),
+            front.map_or_else(
+                || "-".to_string(),
+                |s| bit(aterm_effects::host::light_latch::scheme_light(
+                    self.session_scheme(s).1
+                ))
+                .to_string()
+            ),
+        ))
+    }
+
     pub(crate) fn trail_status(&self) -> Result<String, String> {
         let Some(id) = self.frontmost_window else {
             return Err("no focused window".to_string());
@@ -8014,7 +8259,9 @@ impl App {
             pet_anchor: pet.console_anchor_id(),
             pet_event_seq: pet.console_event_seq(),
             pet_pose: pet.pose_name(),
+            pet_deep: pet.deep_asleep(),
             pet_body: ws.fx.companion().hit_rect(),
+            head_body: ws.fx.cursor().glow.head_body_window_box(),
             cat_active: ws.fx.companions().cursor_cat.is_active(),
             block_fill: ws.block_fill,
             flow: ws.fx.cursor().glow.flow_status(),
@@ -8024,7 +8271,19 @@ impl App {
             comet_alpha_max: comet_bed.iter().map(|cell| cell.alpha).max().unwrap_or(0),
         }
         .line_v2(ws.fx.cursor().glow.v2_status());
-        Ok(format!("{line} {}", self.trail_target_fields()?))
+        let mut icons = String::new();
+        for (x0, x1, y0, y1) in ws.fx.cursor().glow.word_icon_window_boxes() {
+            use std::fmt::Write as _;
+            let sep = if icons.is_empty() { "" } else { ";" };
+            let _ = write!(icons, "{sep}{x0},{x1},{y0},{y1}");
+        }
+        if icons.is_empty() {
+            icons.push_str("none");
+        }
+        Ok(format!(
+            "{line} word_icons={icons} {}",
+            self.trail_target_fields()?
+        ))
     }
 
     fn cursor_frame_for_present(
@@ -8040,6 +8299,25 @@ impl App {
         }
     }
 
+    pub(crate) fn vim_frame_is_current(
+        &self,
+        id: WindowId,
+        frame: crate::vim_custody::Frame,
+    ) -> bool {
+        let Some(front) = self.front_terminal(id) else {
+            return false;
+        };
+        if self.pool.is_rewound(front.session) {
+            return false;
+        }
+        let Some(session) = self.pool.get(front.session) else {
+            return false;
+        };
+        self.pool
+            .shown_term(front.session)
+            .is_some_and(|term| crate::vim_custody::still_current(frame, &term, &session.ctx))
+    }
+
     /// One window's cursor-effect frame.
     pub(crate) fn cursor_frame(
         &mut self,
@@ -8047,6 +8325,7 @@ impl App {
         fx: CursorFxInputs,
     ) -> Option<CursorFxTick> {
         let CursorFxInputs {
+            vim_frame,
             now: frame_started,
             rows,
             cols,
@@ -8060,6 +8339,8 @@ impl App {
             cursor_color_pinned,
             default_bg,
             default_fg,
+            scheme_fg,
+            scheme_bg,
             row_probe,
             row_probe_neighbors,
             print_anchor,
@@ -8067,10 +8348,29 @@ impl App {
             pane_text,
         } = fx;
         self.reconcile_licence(id);
+        let editable = vim_frame.is_some_and(|frame| {
+            let Some(front) = self.front_terminal(id) else {
+                return false;
+            };
+            let Some(session) = self.pool.get(front.session) else {
+                return false;
+            };
+            self.vim_frame_is_current(id, frame)
+                && self.agent_composer_in_front(id, false)
+                && session.ctx.licence.vim.frame(frame)
+                && session.ctx.licence.vim.epoch() == frame.epoch
+        });
         let cur = aterm_effects::host::motion_caret(cur, cursor_visible, hidden_withheld);
         let raw_focused = self.windows.get(&id)?.focused;
         let win_focused = self.cursor_fx_focus(id, raw_focused, frame_started);
         let deliveries = self.read_deliveries(id, frame_started);
+        if let Some((session, batch)) = &deliveries
+            && let Some(session) = self.pool.get(*session)
+        {
+            for ticket in batch.failed.iter().flatten() {
+                session.ctx.licence.vim.reject_entry(ticket.dispatched_at);
+            }
+        }
         let motion = self.motion_policy(win_focused);
         let scroll_motion = self.effect_policy(
             crate::motion::MotionEffect::SmoothScroll,
@@ -8095,9 +8395,19 @@ impl App {
             shed_env,
             win_focused,
         );
-        glow_cfg.dark_theme = aterm_render::theme_is_dark(default_bg);
-        glow_cfg.theme_fg = default_fg;
-        glow_cfg.theme_bg = default_bg;
+        let session = self.front_terminal(id).map_or(0, |front| front.session);
+        let page = self.page_facts();
+        self.windows.get_mut(&id)?.trail_ground.ground(
+            &mut glow_cfg,
+            (default_fg, default_bg),
+            aterm_effects::host::light_latch::LatchKey {
+                session,
+                fg: scheme_fg,
+                bg: scheme_bg,
+            },
+            page,
+            frame_started,
+        );
         let mut trail_cfg = self.trail_config_for(trail_presentation);
         trail_cfg.enabled &=
             cursor_motion.animate(crate::motion::MotionEffect::CursorGlow) && shed_env > 0.0;
@@ -8141,7 +8451,30 @@ impl App {
             win_h,
             head: fx_head,
         };
+        let vim_entry = if editable {
+            vim_frame.and_then(|frame| {
+                self.front_terminal(id)
+                    .and_then(|front| self.pool.get(front.session))
+                    .and_then(|session| session.ctx.licence.vim.entry_at(frame))
+            })
+        } else {
+            None
+        };
+        let editable =
+            editable && vim_frame.is_some_and(|frame| self.vim_frame_is_current(id, frame));
+        // What the live face lays of each glyph, for the letter guard (a thin face's stems show
+        // the light laid under them): read while the shared face is at this window's cells, the
+        // last reading standing while it is at another's.
+        let glyph_ink = (!self.backend.is_pending()
+            && self.backend.cell_size() == (glow_cw, glow_ch))
+            .then(|| self.backend.glyph_ink())
+            .flatten();
         let ws = self.windows.get_mut(&id)?;
+        if let Some(ink) = glyph_ink {
+            ws.fx.cursor_mut().glow.observe_glyph_ink(Some(ink));
+        }
+        ws.fx.cursor_mut().glow.note_composer_entry(vim_entry);
+        ws.fx.cursor_mut().glow.note_composer_insert_frame(editable);
         glow_cfg.head_dx = aterm_effects::cursor_fx::head_dx_for(cursor_style);
         let cursor_cell_bg = cur.and_then(|(row, col)| {
             ws.input_scratch
@@ -8168,8 +8501,8 @@ impl App {
             ws.delivery_seen = Some((session, batch.latest));
         }
         let step = ws.fx.cursor_step(
-            &aterm_effects::pipeline::CursorStep {
-                input: aterm_effects::cursor_fx::CursorFxInput {
+            &aterm_effects::pipeline::CursorStep::new(
+                aterm_effects::cursor_fx::CursorFxInput {
                     now: frame_started,
                     cur,
                     live_viewport,
@@ -8188,33 +8521,36 @@ impl App {
                     user_tinted: self.config.trail_color().chosen(),
                     accent_pinned: self.config.cursor_trail_accent_u32().is_some(),
                 },
-                glow: &glow_cfg,
-                trail: trail_cfg,
-                animate: cursor_motion.animate(crate::motion::MotionEffect::CursorGlow),
-                row_probe: row_probe.map(|(row, caret, trust)| {
-                    let (above, below) =
-                        row_probe_neighbors.unwrap_or((row > 0, usize::from(row) + 1 < rows));
-                    aterm_effects::pipeline::RowProbe {
-                        row,
-                        caret,
-                        trust,
-                        cols: &ws.poof_row_buf,
-                        flanks: Some((
-                            above.then_some(ws.poof_row_above_buf.as_slice()),
-                            below.then_some(ws.poof_row_below_buf.as_slice()),
-                        )),
-                    }
-                }),
-                frame_cells: Some(match pane_text {
-                    None => &ws.input_scratch.cells,
-                    Some(_) => &ws.composed_focus_scratch.cells,
-                }),
-                frame_cells_at: pane_text.unwrap_or((0, 0)),
-                pending_keys: 0,
-                print_anchor,
-                print_anchor_glyph,
-                caret_drawn: cursor_visible,
-            },
+                &glow_cfg,
+                trail_cfg,
+            )
+            .with_animate(cursor_motion.animate(crate::motion::MotionEffect::CursorGlow))
+            .with_row_probe(row_probe.map(|(row, caret, trust)| {
+                let (above, below) =
+                    row_probe_neighbors.unwrap_or((row > 0, usize::from(row) + 1 < rows));
+                aterm_effects::pipeline::RowProbe {
+                    row,
+                    caret,
+                    trust,
+                    cols: &ws.poof_row_buf,
+                    flanks: Some((
+                        above.then_some(ws.poof_row_above_buf.as_slice()),
+                        below.then_some(ws.poof_row_below_buf.as_slice()),
+                    )),
+                }
+            }))
+            .with_frame_cells(Some(match pane_text {
+                None => &ws.input_scratch.cells,
+                Some(_) => &ws.composed_focus_scratch.cells,
+            }))
+            .with_frame_cells_at(pane_text.unwrap_or((0, 0)))
+            .with_frame_cells_cols(match pane_text {
+                None => ws.input_scratch.cols,
+                Some(_) => ws.composed_focus_scratch.cols,
+            })
+            .with_print_anchor(print_anchor)
+            .with_print_anchor_glyph(print_anchor_glyph)
+            .with_caret_drawn(cursor_visible),
             receipts.into_iter().flatten(),
         );
         let frame = step.frame;
@@ -8410,8 +8746,10 @@ impl App {
             glow: cursor_glow,
             trail_scratch,
             bloom_held,
+            bloom_spares_letters,
             ..
         } = fx.cursor();
+        let bloom_gate = aterm_core::render::BloomGate::sparing(*bloom_held, *bloom_spares_letters);
         if valid {
             project_focused_composed_cursor_effects(
                 input_scratch,
@@ -8428,7 +8766,7 @@ impl App {
                     trail_color,
                     active_cursor_fill,
                     fx_layers: &[],
-                    bloom_held: *bloom_held,
+                    bloom_gate,
                     pet_veil: cursor_glow.pet_veil(),
                 },
                 clip,
@@ -8451,7 +8789,7 @@ impl App {
                     trail_color: 0,
                     active_cursor_fill: None,
                     fx_layers: &[],
-                    bloom_held: *bloom_held,
+                    bloom_gate,
                     pet_veil: &[],
                 },
                 None,
@@ -8630,6 +8968,9 @@ impl App {
                 focused_composed_cursor_fx_sample(
                     terminal_view.session,
                     &terminal,
+                    self.pool
+                        .get(terminal_view.session)
+                        .map(|entry| entry.ctx.as_ref()),
                     true,
                     v2_owns_frame,
                     reads_neighbor_rows,
@@ -8644,6 +8985,7 @@ impl App {
             }
         };
         let FocusedComposedCursorFxSample {
+            vim_frame,
             session: _,
             witness_stamp,
             witness_rows,
@@ -8656,6 +8998,8 @@ impl App {
             cursor_recoloured,
             default_bg,
             default_fg,
+            scheme_fg,
+            scheme_bg,
             alt,
             blink_epoch,
             content_scroll_state,
@@ -8854,6 +9198,7 @@ impl App {
         let Some(fx) = self.cursor_frame(
             wid,
             CursorFxInputs {
+                vim_frame,
                 now,
                 rows,
                 cols,
@@ -8867,6 +9212,8 @@ impl App {
                 cursor_color_pinned: self.config.cursor_color.is_some() || cursor_recoloured,
                 default_bg,
                 default_fg,
+                scheme_fg,
+                scheme_bg,
                 row_probe,
                 row_probe_neighbors: Some((row_above_present, row_below_present)),
                 print_anchor: (display_offset == 0)
@@ -9936,6 +10283,9 @@ impl App {
                             focused_composed_cursor_fx_sample(
                                 terminal_view.session,
                                 &terminal,
+                                self.pool
+                                    .get(terminal_view.session)
+                                    .map(|entry| entry.ctx.as_ref()),
                                 capture_row_probes,
                                 v2_owns_frame,
                                 reads_neighbor_rows,
@@ -10533,6 +10883,14 @@ impl App {
         self.reveal_successfully_presented_window(id);
         let app_frame_interval = self.frame_interval;
         let presented_at = crate::metrics::host_now();
+        // A present a capture forces (`image`, `window`) leaves the record as the window's own
+        // presents left it, so an observer's frame never satisfies a wait for the window's own.
+        if self.capture_barrier != Some(id) {
+            let views = &self.view_store;
+            if let Some(ws) = self.windows.get_mut(&id) {
+                record_presented_grids(ws, views, route, presented_plan);
+            }
+        }
         let present = self.windows.get_mut(&id).map(|state| {
             let present = acknowledge_successful_present(
                 state,
@@ -11542,6 +11900,7 @@ impl App {
             };
             let selection = term.text_selection().clone();
             let (default_bg_u32, default_fg_u32, cursor_color_u32) = terminal_frame_colors(&term);
+            let (scheme_fg, scheme_bg) = terminal_configured_colors(&term);
             let title = term.title_arc();
             let deco_suppress_alt = is_alt
                 && self
@@ -11597,6 +11956,10 @@ impl App {
             let pred_no_echo = is_alt || term.kitty_suppresses_predictive_echo();
             let pred_coords = content_scroll_state.coordinate_generation();
             let pred_blank = terminal_blank_cell(&term);
+            let vim_frame = self
+                .pool
+                .get(front_terminal.session)
+                .and_then(|entry| crate::vim_custody::capture(&term, &entry.ctx, false));
             self.refresh_hover_for_frame_locked(id, &term);
             drop(term);
             #[cfg(test)]
@@ -11609,6 +11972,7 @@ impl App {
                 id,
                 sync_hold,
                 CursorFxInputs {
+                    vim_frame,
                     now: frame_started,
                     rows,
                     cols,
@@ -11622,6 +11986,8 @@ impl App {
                     cursor_color_pinned: self.config.cursor_color.is_some() || cursor_recoloured,
                     default_bg: default_bg_u32,
                     default_fg: default_fg_u32,
+                    scheme_fg,
+                    scheme_bg,
                     row_probe,
                     row_probe_neighbors,
                     print_anchor: live_view.then_some(print_anchor).flatten(),
@@ -11783,55 +12149,57 @@ impl App {
             );
             ws.pet_pointer_sampled_px = Some(ws.last_cursor_px);
             ws.fx.companion_mut().set_species(pet_species);
-            let pet_tick = ws.fx.pet_prepare(aterm_effects::companion::PetFacts {
-                facts: &aterm_effects::host::TerminalFacts {
-                    session: front_terminal.session,
-                    caret: cur,
-                    cursor_visible: cur_drawn,
-                    frame_unfinished,
-                    sync_end_seq,
-                    sync_end_caret,
-                    display_offset: i32::try_from(display_offset).unwrap_or(i32::MAX),
-                    live_viewport: live_view,
-                    content_seq,
-                    wrap_serial,
-                    scrolled: scroll_change.changed(),
-                    shell_executing,
-                    cmd_done: cmd_done.map(|(seq, code)| (seq, code, cmd_dur_ms)),
-                    alt_screen: is_alt,
-                },
-                host: &aterm_effects::host::HostFrameInput {
-                    now: frame_started,
-                    visibility: pet_visibility(win_focused),
-                    reduced_motion: !cursor_motion.animate(crate::motion::MotionEffect::CursorGlow),
-                    serious: !cursor_companions_allowed,
-                    shed_envelope,
-                    shed_active: load_shed,
-                    pointer_px: Some((ws.last_cursor_px.0 as f32, ws.last_cursor_px.1 as f32)),
-                    capture: aterm_effects::host::CaptureMode::Present,
-                    geometry: pet_geom,
-                },
-                glow: aterm_effects::companion::GlowOwnership {
-                    enabled: glow_cfg.enabled,
-                    style: glow_cfg.style,
-                    style_raw_names_pet: pet_mode,
-                },
-                sing: aterm_effects::host::SingFacts {
+            let pet_tick = ws.fx.pet_prepare(
+                aterm_effects::companion::PetFacts::new(
+                    &aterm_effects::host::TerminalFacts {
+                        session: front_terminal.session,
+                        caret: cur,
+                        cursor_visible: cur_drawn,
+                        frame_unfinished,
+                        sync_end_seq,
+                        sync_end_caret,
+                        display_offset: i32::try_from(display_offset).unwrap_or(i32::MAX),
+                        live_viewport: live_view,
+                        content_seq,
+                        wrap_serial,
+                        scrolled: scroll_change.changed(),
+                        shell_executing,
+                        cmd_done: cmd_done.map(|(seq, code)| (seq, code, cmd_dur_ms)),
+                        alt_screen: is_alt,
+                    },
+                    &aterm_effects::host::HostFrameInput::new(frame_started, pet_geom)
+                        .with_visibility(pet_visibility(win_focused))
+                        .with_reduced_motion(
+                            !cursor_motion.animate(crate::motion::MotionEffect::CursorGlow),
+                        )
+                        .with_serious(!cursor_companions_allowed)
+                        .with_shed_envelope(shed_envelope)
+                        .with_shed_active(load_shed)
+                        .with_pointer_px(Some((
+                            ws.last_cursor_px.0 as f32,
+                            ws.last_cursor_px.1 as f32,
+                        ))),
+                    aterm_effects::companion::GlowOwnership {
+                        enabled: glow_cfg.enabled,
+                        style: glow_cfg.style,
+                        style_raw_names_pet: pet_mode,
+                    },
+                )
+                .with_sing(aterm_effects::host::SingFacts {
                     drive: sing_drive,
                     flying_alpha,
-                },
-                focused: win_focused,
-                obscured: ws.overlay_open() || ws.tab_menu.is_some() || rewound,
-                pane: None,
-                room: Some(room_facts(
+                })
+                .with_focused(win_focused)
+                .with_obscured(ws.overlay_open() || ws.tab_menu.is_some() || rewound)
+                .with_room(Some(room_facts(
                     self.pool.get(front_terminal.session),
                     self.session_status.status(front_terminal.session),
                     None,
                     self.harness_glass
                         .get(&front_terminal.session)
                         .and_then(crate::harness_glass::SessionGlass::landed),
-                )),
-            });
+                ))),
+            );
             mark_end_cheered(&mut self.harness_glass, pet_tick.landed_seen);
             let mut verdict_cue: Option<(bool, bool)> = None;
             if let Some((code, dur_ms)) = pet_tick.completion
@@ -11894,27 +12262,31 @@ impl App {
                     let companion_at = routed.on_glass(escort, pet.body_px);
                     let mut fp = ws
                         .fx
-                        .word_grid(&aterm_effects::pipeline::WordGrid {
-                            now: frame_started,
-                            lexicon: &rs.lexicon,
-                            cfg: tick_cfg,
-                            geom: effect_geom,
-                            cells: &ws.input_scratch.cells,
-                            line_sizes: &ws.input_scratch.line_sizes,
-                            base_y: ws.input_scratch.base_y,
-                            default_bg: default_bg_u32,
-                            epoch,
-                            rescan: deco_rescan.then_some(aterm_effects::pipeline::WordRescan {
-                                birth: frame_started,
-                                cursor: live_view.then_some((cpos.row, cpos.col)),
-                            }),
-                            companion_at,
-                            sel: crate::word_decorations::SelView {
-                                sel: &selection,
-                                display_offset: display_offset as i32,
-                            },
-                            focused: ws.focused,
-                        })
+                        .word_grid(
+                            &aterm_effects::pipeline::WordGrid::new(
+                                frame_started,
+                                &rs.lexicon,
+                                tick_cfg,
+                                effect_geom,
+                                &ws.input_scratch.cells,
+                                &ws.input_scratch.line_sizes,
+                                crate::word_decorations::SelView {
+                                    sel: &selection,
+                                    display_offset: display_offset as i32,
+                                },
+                            )
+                            .with_base_y(ws.input_scratch.base_y)
+                            .with_default_bg(default_bg_u32)
+                            .with_epoch(epoch)
+                            .with_rescan(deco_rescan.then_some(
+                                aterm_effects::pipeline::WordRescan {
+                                    birth: frame_started,
+                                    cursor: live_view.then_some((cpos.row, cpos.col)),
+                                },
+                            ))
+                            .with_companion_at(companion_at)
+                            .with_focused(ws.focused),
+                        )
                         .fp;
                     if deco_rescan {
                         ws.pending_deco_birth = None;
@@ -12098,6 +12470,7 @@ impl App {
                         cursor: (cpos.row as usize, cpos.col as usize),
                         viewport: (rows, cols),
                         content_seq,
+                        drawn_at: ws.input_scratch.drawn_at,
                         geom: glow_geom,
                     })
                     .as_ref(),
@@ -12480,6 +12853,9 @@ impl App {
             ws.capture_leaf_content_seqs.clear();
             ws.capture_leaf_content_seqs
                 .push(ws.input_scratch.content_seq);
+            ws.capture_leaf_grids.clear();
+            ws.capture_leaf_grids
+                .push(GridKey::filled(&ws.input_scratch));
         }
         if let Some(w) = &window {
             self.apply_title(id, w, &title);
@@ -13755,6 +14131,7 @@ impl App {
                     focused_composed_cursor_fx_sample(
                         *session,
                         &term,
+                        self.pool.get(*session).map(|entry| entry.ctx.as_ref()),
                         advance_cursor_fx,
                         ws.fx.cursor_mut().glow.v2_owns_frame(),
                         ws.fx.cursor_mut().glow.reads_neighbor_rows(),
@@ -13947,6 +14324,7 @@ impl App {
                     focused_cursor_fx_sample = Some(focused_composed_cursor_fx_sample(
                         session,
                         &term,
+                        self.pool.get(session).map(|entry| entry.ctx.as_ref()),
                         advance_cursor_fx,
                         ws.fx.cursor_mut().glow.v2_owns_frame(),
                         ws.fx.cursor_mut().glow.reads_neighbor_rows(),
@@ -14298,6 +14676,7 @@ impl App {
         let kitty_log = &mut self.kitty_log;
         let trail_audio = &mut self.trail_audio;
         let pool = &self.pool;
+        let installed_colors = &self.installed_colors;
         let Some(ws) = self.windows.get_mut(&wid) else {
             return 0;
         };
@@ -14330,33 +14709,33 @@ impl App {
                     session: r.session,
                     focused,
                     place: place_of(r),
-                    grid: snapshot.map(|snapshot| aterm_effects::pipeline::PaneGrid {
-                        cells: &snapshot.cells,
-                        line_sizes: &snapshot.line_sizes,
-                        base_y: snapshot.base_y,
-                        default_bg: snapshot.default_bg,
-                        epoch: snapshot.snapshot_seq,
-                        alt: snapshot.engine_alt,
-                        display_offset: snapshot.display_offset,
-                        cursor: (
+                    grid: snapshot.map(|snapshot| {
+                        aterm_effects::pipeline::PaneGrid::new(
+                            &snapshot.cells,
+                            &snapshot.line_sizes,
+                            &snapshot.selection,
+                        )
+                        .with_base_y(snapshot.base_y)
+                        .with_page(snapshot.default_fg, snapshot.default_bg)
+                        .with_epoch(snapshot.snapshot_seq)
+                        .with_alt(snapshot.engine_alt)
+                        .with_display_offset(snapshot.display_offset)
+                        .with_cursor((
                             u16::try_from(snapshot.cursor_row).unwrap_or(u16::MAX),
                             u16::try_from(snapshot.cursor_col).unwrap_or(u16::MAX),
-                        ),
-                        sel: &snapshot.selection,
+                        ))
+                        .with_scheme(Some(
+                            crate::session_theme::session_scheme(pool, installed_colors, r.session),
+                        ))
                     }),
                 }
             });
         let out = fx.word_panes(
-            &aterm_effects::pipeline::WordPanes {
-                now: ctx.now,
-                lexicon,
-                cfg: deco_cfg,
-                tick_cfg,
-                load_shed,
-                word_focus: ctx.word_focus,
-                window_focused: ws.focused,
-                companion_at,
-            },
+            &aterm_effects::pipeline::WordPanes::new(ctx.now, lexicon, deco_cfg, tick_cfg)
+                .with_load_shed(load_shed)
+                .with_word_focus(ctx.word_focus)
+                .with_window_focused(ws.focused)
+                .with_companion_at(companion_at),
             panes,
             |pane, decos| {
                 kitty_log.observe_ambient(
@@ -14545,7 +14924,15 @@ impl App {
                     &mut cat_frame,
                     ctx.animate_cat,
                 );
-                placement = prepare_routed_head(ws, router_geom, duty, cat_frame, seat, ctx.now);
+                placement = prepare_routed_head(
+                    ws,
+                    CompanionInk::Composed,
+                    router_geom,
+                    duty,
+                    cat_frame,
+                    seat,
+                    ctx.now,
+                );
                 seat
             },
         );
@@ -14887,6 +15274,7 @@ impl App {
         let mut focus_cursor_rgb: Option<[u8; 3]> = None;
         let mut focus_recoloured = false;
         let mut focus_default_bg = theme.bg;
+        let mut focus_scheme = (theme.fg, theme.bg);
         let mut focus_blank = divider_cell(grid);
         let mut focus_title_sample: Arc<str> = Arc::default();
         let mut focus_snapshot_valid = false;
@@ -14898,6 +15286,7 @@ impl App {
         let mut focus_probe_below = false;
         let mut focus_print_anchor: Option<(u16, u16, u64)> = None;
         let mut focus_print_anchor_glyph: Option<char> = None;
+        let mut focus_vim_frame = None;
         let mut focus_epoch = 0u64;
         let mut focus_content_seq = 0u64;
         let mut focus_wrap_serial = 0u64;
@@ -15051,6 +15440,7 @@ impl App {
                 focus_recoloured = term.cursor_color_recoloured();
                 focus_blank = terminal_blank_cell(&term);
                 focus_default_bg = aterm_render::rgb_to_u32(focus_blank.bg);
+                focus_scheme = terminal_configured_colors(&term);
                 focus_title_sample = term.title_arc();
                 focus_ambiguous_cjk = term.modes().ambiguous_width_double;
                 if let Some(ws) = self.windows.get_mut(&wid) {
@@ -15131,6 +15521,10 @@ impl App {
                                 )
                             });
                     focus_print_anchor_glyph = (!focus_scrolled).then_some(anchor_glyph).flatten();
+                    focus_vim_frame = self
+                        .pool
+                        .get(focus)
+                        .and_then(|entry| crate::vim_custody::capture(&term, &entry.ctx, false));
                     focus_scrolled_rows = usize::from(scroll_change.translated_rows)
                         + usize::from(scroll_change.invalidated)
                         + usize::from(scroll_change.band_moves);
@@ -15302,6 +15696,7 @@ impl App {
         let fx = self.cursor_frame(
             wid,
             CursorFxInputs {
+                vim_frame: focus_vim_frame,
                 now,
                 rows,
                 cols,
@@ -15315,6 +15710,8 @@ impl App {
                 cursor_color_pinned: self.config.cursor_color.is_some() || focus_recoloured,
                 default_bg: focus_default_bg,
                 default_fg: aterm_render::rgb_to_u32(focus_blank.fg),
+                scheme_fg: focus_scheme.0,
+                scheme_bg: focus_scheme.1,
                 row_probe: focus_probe,
                 row_probe_neighbors: Some((focus_probe_above, focus_probe_below)),
                 print_anchor: focus_print_anchor,
@@ -15447,57 +15844,64 @@ impl App {
                             rows: r.rows,
                         }),
                 );
-            let pet_tick = ws.fx.pet_prepare(aterm_effects::companion::PetFacts {
-                facts: &aterm_effects::host::TerminalFacts {
-                    session: focus,
-                    caret: (focus_pane_dims.is_some() && !focus_scrolled).then_some(focus_cur_pos),
-                    cursor_visible: focus_vis,
-                    frame_unfinished: focus_frame_unfinished,
-                    sync_end_seq: focus_sync_end_seq,
-                    sync_end_caret: focus_sync_end_caret,
-                    display_offset: i32::try_from(focus_d_off).unwrap_or(i32::MAX),
-                    live_viewport: !focus_scrolled,
-                    content_seq: focus_content_seq,
-                    wrap_serial: focus_wrap_serial,
-                    scrolled: focus_scrolled_rows > 0,
-                    shell_executing: focus_shell_exec,
-                    cmd_done: focus_cmd_done.map(|(seq, code)| (seq, code, focus_cmd_dur_ms)),
-                    alt_screen: focus_alt,
-                },
-                host: &aterm_effects::host::HostFrameInput {
-                    now,
-                    visibility: pet_visibility(focused),
-                    reduced_motion: !cursor_motion.animate(crate::motion::MotionEffect::CursorGlow),
-                    serious: !cursor_companions_allowed,
-                    shed_envelope,
-                    shed_active: load_shed,
-                    pointer_px: Some((ws.last_cursor_px.0 as f32, ws.last_cursor_px.1 as f32)),
-                    capture: aterm_effects::host::CaptureMode::Present,
-                    geometry: pet_frame_geom(
-                        (glow_cw, glow_ch),
-                        (usize::from(pane_rows), usize::from(pane_cols)),
-                        pet_origin,
-                    ),
-                },
-                glow: aterm_effects::companion::GlowOwnership {
-                    enabled: glow_cfg.enabled,
-                    style: glow_cfg.style,
-                    style_raw_names_pet: pet_mode,
-                },
-                sing: aterm_effects::host::SingFacts {
+            let pet_tick = ws.fx.pet_prepare(
+                aterm_effects::companion::PetFacts::new(
+                    &aterm_effects::host::TerminalFacts {
+                        session: focus,
+                        caret: (focus_pane_dims.is_some() && !focus_scrolled)
+                            .then_some(focus_cur_pos),
+                        cursor_visible: focus_vis,
+                        frame_unfinished: focus_frame_unfinished,
+                        sync_end_seq: focus_sync_end_seq,
+                        sync_end_caret: focus_sync_end_caret,
+                        display_offset: i32::try_from(focus_d_off).unwrap_or(i32::MAX),
+                        live_viewport: !focus_scrolled,
+                        content_seq: focus_content_seq,
+                        wrap_serial: focus_wrap_serial,
+                        scrolled: focus_scrolled_rows > 0,
+                        shell_executing: focus_shell_exec,
+                        cmd_done: focus_cmd_done.map(|(seq, code)| (seq, code, focus_cmd_dur_ms)),
+                        alt_screen: focus_alt,
+                    },
+                    &aterm_effects::host::HostFrameInput::new(
+                        now,
+                        pet_frame_geom(
+                            (glow_cw, glow_ch),
+                            (usize::from(pane_rows), usize::from(pane_cols)),
+                            pet_origin,
+                        ),
+                    )
+                    .with_visibility(pet_visibility(focused))
+                    .with_reduced_motion(
+                        !cursor_motion.animate(crate::motion::MotionEffect::CursorGlow),
+                    )
+                    .with_serious(!cursor_companions_allowed)
+                    .with_shed_envelope(shed_envelope)
+                    .with_shed_active(load_shed)
+                    .with_pointer_px(Some((
+                        ws.last_cursor_px.0 as f32,
+                        ws.last_cursor_px.1 as f32,
+                    ))),
+                    aterm_effects::companion::GlowOwnership {
+                        enabled: glow_cfg.enabled,
+                        style: glow_cfg.style,
+                        style_raw_names_pet: pet_mode,
+                    },
+                )
+                .with_sing(aterm_effects::host::SingFacts {
                     drive: sing_drive,
                     flying_alpha,
-                },
-                focused,
-                obscured: ws.overlay_open() || ws.tab_menu.is_some() || focus_rewound,
-                pane: Some((
+                })
+                .with_focused(focused)
+                .with_obscured(ws.overlay_open() || ws.tab_menu.is_some() || focus_rewound)
+                .with_pane(Some((
                     focus,
                     (
                         i32::from(focus_off.1) * glow_cw as i32,
                         i32::from(focus_off.0) * glow_ch as i32,
                     ),
-                )),
-                room: Some(room_facts(
+                )))
+                .with_room(Some(room_facts(
                     self.pool.get(focus),
                     self.session_status.status(focus),
                     sibling_talking.map(|(row, col)| {
@@ -15509,8 +15913,8 @@ impl App {
                     self.harness_glass
                         .get(&focus)
                         .and_then(crate::harness_glass::SessionGlass::landed),
-                )),
-            });
+                ))),
+            );
             mark_end_cheered(&mut self.harness_glass, pet_tick.landed_seen);
             if let Some((code, _)) = pet_tick.completion {
                 let focus_boundary = self.pool.get(focus).and_then(|session| {
@@ -15800,6 +16204,7 @@ impl App {
         let mut preedit_drawn = false;
         ws.capture_leaf_snapshot_seqs.clear();
         ws.capture_leaf_content_seqs.clear();
+        ws.capture_leaf_grids.clear();
         for (pane_index, (r, _)) in panes.iter().enumerate() {
             let (sub_rows, sub_cols) = (r.rows as usize, r.cols as usize);
             let focused_pane = pane_index == focus_index;
@@ -15814,6 +16219,8 @@ impl App {
                     .push(ws.pane_scratch.snapshot_seq);
                 ws.capture_leaf_content_seqs
                     .push(ws.pane_scratch.content_seq);
+                ws.capture_leaf_grids
+                    .push(GridKey::filled(&ws.pane_scratch));
                 if sole_pane {
                     ws.input_scratch.default_bg = aterm_render::rgb_to_u32(focus_blank.bg);
                 }
@@ -15865,6 +16272,8 @@ impl App {
                     .push(ws.pane_scratch.snapshot_seq);
                 ws.capture_leaf_content_seqs
                     .push(ws.pane_scratch.content_seq);
+                ws.capture_leaf_grids
+                    .push(GridKey::filled(&ws.pane_scratch));
                 (title, None, blank)
             };
             match pred_paint {
@@ -15985,7 +16394,7 @@ impl App {
                 trail_color,
                 active_cursor_fill,
                 fx_layers: &[],
-                bloom_held: cursor_fx.bloom_held,
+                bloom_gate: cursor_fx.bloom_gate(),
                 pet_veil: &[],
             },
             pane_clip,

@@ -138,70 +138,173 @@ pub struct Registration {
 /// Frontend callback invoked on a framework thread; must not block.
 pub type GlassSink = fn(GlassReport);
 
-static SINK: OnceLock<GlassSink> = OnceLock::new();
-static DELIVERED: AtomicU64 = AtomicU64::new(0);
-
 const ARM_HOT: u8 = 1;
 const ARM_OCCLUDED: u8 = 2;
 const ARM_HAS_PREV: u8 = 4;
-static ARM_FLAGS: AtomicU8 = AtomicU8::new(0);
-static ARM_INTERVAL_NS: AtomicU64 = AtomicU64::new(0);
-static ARM_PREV_NS: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(any(target_os = "macos", test))]
-static NEXT_SERIAL: AtomicU64 = AtomicU64::new(1);
-static TAKEABLE_SERIAL: AtomicU64 = AtomicU64::new(0);
-static TAKEABLE_NS: AtomicU64 = AtomicU64::new(0);
-
-/// Serial-indexed tag ring published via `REGISTERED` (Release/Acquire).
 #[cfg(any(target_os = "macos", test))]
 const TAG_RING: usize = 16;
-#[cfg(any(target_os = "macos", test))]
-static TAGS: [AtomicU8; TAG_RING] = [const { AtomicU8::new(PresentTag::Spaced as u8) }; TAG_RING];
-#[cfg(any(target_os = "macos", test))]
-static REGISTERED: AtomicU64 = AtomicU64::new(0);
+
+/// One present-to-glass domain: the process's is [`GLASS`]; a test builds its own.
+#[derive(Debug)]
+struct GlassRing {
+    sink: OnceLock<GlassSink>,
+    delivered: AtomicU64,
+    arm_flags: AtomicU8,
+    arm_interval_ns: AtomicU64,
+    arm_prev_ns: AtomicU64,
+    #[cfg(any(target_os = "macos", test))]
+    next_serial: AtomicU64,
+    takeable_serial: AtomicU64,
+    takeable_ns: AtomicU64,
+    /// Serial-tagged ring: each slot packs `(serial << 8) | tag` (Release/Acquire) so an
+    /// overwritten slot never impersonates an earlier serial's successor.
+    #[cfg(any(target_os = "macos", test))]
+    tags: [AtomicU64; TAG_RING],
+}
+
+static GLASS: GlassRing = GlassRing::new();
+
+impl GlassRing {
+    const fn new() -> Self {
+        Self {
+            sink: OnceLock::new(),
+            delivered: AtomicU64::new(0),
+            arm_flags: AtomicU8::new(0),
+            arm_interval_ns: AtomicU64::new(0),
+            arm_prev_ns: AtomicU64::new(0),
+            #[cfg(any(target_os = "macos", test))]
+            next_serial: AtomicU64::new(1),
+            takeable_serial: AtomicU64::new(0),
+            takeable_ns: AtomicU64::new(0),
+            #[cfg(any(target_os = "macos", test))]
+            tags: [const { AtomicU64::new(0) }; TAG_RING],
+        }
+    }
+
+    /// A test's own ring with `sink` installed, so no other test's present reaches it.
+    #[cfg(test)]
+    fn listening(sink: GlassSink) -> Self {
+        let ring = Self::new();
+        assert!(ring.install_sink(sink));
+        ring
+    }
+
+    fn install_sink(&self, sink: GlassSink) -> bool {
+        self.sink.set(sink).is_ok()
+    }
+
+    #[inline]
+    #[cfg(target_os = "macos")]
+    fn sink_installed(&self) -> bool {
+        self.sink.get().is_some()
+    }
+
+    #[inline]
+    fn delivered(&self) -> u64 {
+        self.delivered.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn arm_present(&self, armed: ArmedPresent) {
+        let mut flags = 0;
+        if armed.input_hot {
+            flags |= ARM_HOT;
+        }
+        if armed.occluded {
+            flags |= ARM_OCCLUDED;
+        }
+        if let Some(prev) = armed.prev_registered_ns {
+            flags |= ARM_HAS_PREV;
+            self.arm_prev_ns.store(prev, Ordering::Relaxed);
+        }
+        self.arm_interval_ns
+            .store(armed.interval_ns, Ordering::Relaxed);
+        self.arm_flags.store(flags, Ordering::Relaxed);
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn registration_begin(&self, registered_s: f64) -> (u64, PresentTag) {
+        let registered_ns = secs_to_ns(registered_s);
+        let flags = self.arm_flags.load(Ordering::Relaxed);
+        let burst = flags & ARM_HAS_PREV != 0 && {
+            let prev = self.arm_prev_ns.load(Ordering::Relaxed);
+            registered_ns.saturating_sub(prev) < self.arm_interval_ns.load(Ordering::Relaxed)
+        };
+        let tag = PresentTag::for_pacing(burst, flags & ARM_HOT != 0, flags & ARM_OCCLUDED != 0);
+        let serial = self.next_serial.fetch_add(1, Ordering::Relaxed);
+        let entry = (serial << 8) | u64::from(tag as u8);
+        self.tags[ring_slot(serial)].store(entry, Ordering::Release);
+        self.takeable_ns.store(registered_ns, Ordering::Relaxed);
+        self.takeable_serial.store(serial, Ordering::Relaxed);
+        (serial, tag)
+    }
+
+    #[inline]
+    fn take_registration(&self) -> Option<Registration> {
+        match self.takeable_serial.swap(0, Ordering::Relaxed) {
+            0 => None,
+            serial => Some(Registration {
+                serial,
+                registered_ns: self.takeable_ns.load(Ordering::Relaxed),
+            }),
+        }
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn deliver_report(&self, serial: u64, tag: PresentTag, sample: GlassSample) {
+        self.delivered.fetch_add(1, Ordering::Relaxed);
+        let successor = match serial.checked_add(1) {
+            Some(next) if (next >> 56) == 0 => {
+                let entry = self.tags[ring_slot(next)].load(Ordering::Acquire);
+                if (entry >> 8) == next {
+                    PresentTag::from_u8(entry as u8)
+                } else {
+                    tag
+                }
+            }
+            _ => tag,
+        };
+        if let Some(sink) = self.sink.get() {
+            sink(GlassReport {
+                sample,
+                tag,
+                successor,
+            });
+        }
+    }
+}
 
 /// Install the process sink; returns `false` if already installed.
 pub fn install_sink(sink: GlassSink) -> bool {
-    SINK.set(sink).is_ok()
+    GLASS.install_sink(sink)
 }
 
 #[inline]
 #[cfg(target_os = "macos")]
 pub(crate) fn sink_installed() -> bool {
-    SINK.get().is_some()
+    GLASS.sink_installed()
 }
 
 /// Total presented handlers delivered since process start.
 #[must_use]
 #[inline]
 pub fn delivered() -> u64 {
-    DELIVERED.load(Ordering::Relaxed)
+    GLASS.delivered()
 }
 
 /// Arm the pacing facts for the next present on the presenting thread.
 #[inline]
 pub fn arm_present(armed: ArmedPresent) {
-    let mut flags = 0;
-    if armed.input_hot {
-        flags |= ARM_HOT;
-    }
-    if armed.occluded {
-        flags |= ARM_OCCLUDED;
-    }
-    if let Some(prev) = armed.prev_registered_ns {
-        flags |= ARM_HAS_PREV;
-        ARM_PREV_NS.store(prev, Ordering::Relaxed);
-    }
-    ARM_INTERVAL_NS.store(armed.interval_ns, Ordering::Relaxed);
-    ARM_FLAGS.store(flags, Ordering::Relaxed);
+    GLASS.arm_present(armed);
 }
 
 #[inline]
-#[cfg(any(target_os = "macos", test))]
 fn secs_to_ns(secs: f64) -> u64 {
     if secs.is_finite() && secs > 0.0 {
-        u64::try_from(Duration::from_secs_f64(secs).as_nanos()).unwrap_or(u64::MAX)
+        Duration::try_from_secs_f64(secs).map_or(u64::MAX, |d| {
+            u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+        })
     } else {
         0
     }
@@ -209,33 +312,15 @@ fn secs_to_ns(secs: f64) -> u64 {
 
 /// Record a registration at `registered_s` (`CACurrentMediaTime` seconds), publish its tag,
 /// and leave it takeable.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 pub(crate) fn registration_begin(registered_s: f64) -> (u64, PresentTag) {
-    let registered_ns = secs_to_ns(registered_s);
-    let flags = ARM_FLAGS.load(Ordering::Relaxed);
-    let burst = flags & ARM_HAS_PREV != 0 && {
-        let prev = ARM_PREV_NS.load(Ordering::Relaxed);
-        registered_ns.saturating_sub(prev) < ARM_INTERVAL_NS.load(Ordering::Relaxed)
-    };
-    let tag = PresentTag::for_pacing(burst, flags & ARM_HOT != 0, flags & ARM_OCCLUDED != 0);
-    let serial = NEXT_SERIAL.fetch_add(1, Ordering::Relaxed);
-    TAGS[ring_slot(serial)].store(tag as u8, Ordering::Relaxed);
-    REGISTERED.store(serial, Ordering::Release);
-    TAKEABLE_NS.store(registered_ns, Ordering::Relaxed);
-    TAKEABLE_SERIAL.store(serial, Ordering::Relaxed);
-    (serial, tag)
+    GLASS.registration_begin(registered_s)
 }
 
 /// Take the most recent registration once; returns `None` if nothing registered since the last take.
 #[inline]
 pub fn take_registration() -> Option<Registration> {
-    match TAKEABLE_SERIAL.swap(0, Ordering::Relaxed) {
-        0 => None,
-        serial => Some(Registration {
-            serial,
-            registered_ns: TAKEABLE_NS.load(Ordering::Relaxed),
-        }),
-    }
+    GLASS.take_registration()
 }
 
 #[inline]
@@ -245,21 +330,9 @@ fn ring_slot(serial: u64) -> usize {
 }
 
 /// Deliver one handler's sample to the sink with the next serial's tag as successor.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 pub(crate) fn deliver_report(serial: u64, tag: PresentTag, sample: GlassSample) {
-    DELIVERED.fetch_add(1, Ordering::Relaxed);
-    let successor = if REGISTERED.load(Ordering::Acquire) > serial {
-        PresentTag::from_u8(TAGS[ring_slot(serial.wrapping_add(1))].load(Ordering::Relaxed))
-    } else {
-        tag
-    };
-    if let Some(sink) = SINK.get() {
-        sink(GlassReport {
-            sample,
-            tag,
-            successor,
-        });
-    }
+    GLASS.deliver_report(serial, tag, sample);
 }
 
 /// Classify a presented handler's `registered_s` and `presented_s` (`CACurrentMediaTime` seconds).
@@ -269,26 +342,17 @@ pub fn classify(registered_s: f64, presented_s: f64) -> GlassSample {
     if presented_s.is_nan() || presented_s <= 0.0 {
         return GlassSample::Skipped;
     }
-    let secs = presented_s - registered_s;
-    let ns = if secs.is_finite() && secs > 0.0 {
-        Duration::from_secs_f64(secs).as_nanos()
-    } else {
-        0
-    };
     GlassSample::OnGlass {
-        ns: u64::try_from(ns).unwrap_or(u64::MAX),
+        ns: secs_to_ns(presented_s - registered_s),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ArmedPresent, GlassReport, GlassSample, PresentTag, arm_present, classify, deliver_report,
-        delivered, registration_begin, take_registration,
+        ArmedPresent, GlassReport, GlassRing, GlassSample, PresentTag, TAG_RING, classify,
     };
     use std::sync::Mutex;
-
-    static SERIAL: Mutex<()> = Mutex::new(());
 
     #[test]
     fn classify_skips_unpresented_frames_and_clamps_the_span() {
@@ -303,6 +367,16 @@ mod tests {
             "16 ms span read as {ns} ns"
         );
         assert_eq!(classify(100.0, 99.0), GlassSample::OnGlass { ns: 0 });
+        assert_eq!(
+            classify(0.0, 1.0e30),
+            GlassSample::OnGlass { ns: u64::MAX },
+            "spans exceeding Duration::MAX saturate to u64::MAX instead of panicking"
+        );
+        assert_eq!(
+            classify(-1.0e308, 1.0e308),
+            GlassSample::OnGlass { ns: 0 },
+            "infinite spans fail closed to 0"
+        );
     }
 
     #[test]
@@ -364,96 +438,109 @@ mod tests {
 
     #[test]
     fn the_tag_is_decided_at_registration_against_the_previous_registration() {
-        let _turn = SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ring = GlassRing::new();
         let hz60_ns = 1_000_000_000_000 / 60_000;
-        arm_present(ArmedPresent {
+        ring.arm_present(ArmedPresent {
             input_hot: true,
             occluded: false,
             interval_ns: hz60_ns,
             prev_registered_ns: None,
         });
-        let (first, tag) = registration_begin(100.0);
+        let (first, tag) = ring.registration_begin(100.0);
         assert_eq!(
             tag,
             PresentTag::Spaced,
             "no previous registration is not a burst"
         );
-        let reg = take_registration().expect("registration is takeable");
+        let reg = ring.take_registration().expect("registration is takeable");
         assert_eq!(reg.serial, first);
         assert_eq!(reg.registered_ns, 100_000_000_000);
-        assert_eq!(take_registration(), None, "taken once");
+        assert_eq!(ring.take_registration(), None, "taken once");
 
-        arm_present(ArmedPresent {
+        ring.arm_present(ArmedPresent {
             input_hot: true,
             occluded: false,
             interval_ns: hz60_ns,
             prev_registered_ns: Some(reg.registered_ns),
         });
-        let (_, tag) = registration_begin(100.008_33);
+        let (_, tag) = ring.registration_begin(100.008_33);
         assert_eq!(tag, PresentTag::HotBurst);
 
-        arm_present(ArmedPresent {
+        ring.arm_present(ArmedPresent {
             input_hot: false,
             occluded: false,
             interval_ns: hz60_ns,
             prev_registered_ns: Some(reg.registered_ns),
         });
-        let (_, tag) = registration_begin(100.016_67);
+        let (_, tag) = ring.registration_begin(100.016_67);
         assert_eq!(tag, PresentTag::Spaced);
 
-        arm_present(ArmedPresent {
+        ring.arm_present(ArmedPresent {
             input_hot: false,
             occluded: false,
             interval_ns: hz60_ns,
             prev_registered_ns: Some(reg.registered_ns),
         });
-        let (_, tag) = registration_begin(100.004);
+        let (_, tag) = ring.registration_begin(100.004);
         assert_eq!(tag, PresentTag::IdleBurst);
-        let _ = take_registration();
     }
 
     #[test]
     fn a_report_names_the_next_registration_as_its_successor() {
-        let _turn = SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        static SEEN: Mutex<Vec<GlassReport>> = Mutex::new(Vec::new());
+        fn sink(report: GlassReport) {
+            SEEN.lock().unwrap().push(report);
+        }
+        let ring = GlassRing::listening(sink);
         let spaced = ArmedPresent {
             input_hot: false,
             occluded: false,
             interval_ns: 16_666_666,
             prev_registered_ns: None,
         };
-        arm_present(spaced);
-        let (a, tag_a) = registration_begin(200.0);
-        arm_present(ArmedPresent {
+        ring.arm_present(spaced);
+        let (a, tag_a) = ring.registration_begin(200.0);
+        ring.arm_present(ArmedPresent {
             input_hot: true,
             prev_registered_ns: Some(200_000_000_000),
             ..spaced
         });
-        let (b, tag_b) = registration_begin(200.005);
+        let (b, tag_b) = ring.registration_begin(200.005);
         assert_eq!(tag_b, PresentTag::HotBurst);
-        arm_present(spaced);
-        let (c, tag_c) = registration_begin(201.0);
+        ring.arm_present(spaced);
+        let (c, tag_c) = ring.registration_begin(201.0);
         assert_eq!(tag_c, PresentTag::Spaced);
-        let _ = take_registration();
 
-        static SEEN: Mutex<Vec<GlassReport>> = Mutex::new(Vec::new());
-        fn sink(report: GlassReport) {
-            SEEN.lock().unwrap().push(report);
-        }
-        let ours = super::install_sink(sink);
-        let before = delivered();
-        deliver_report(a, tag_a, GlassSample::Skipped);
-        deliver_report(c, tag_c, GlassSample::OnGlass { ns: 1 });
-        deliver_report(b, tag_b, GlassSample::OnGlass { ns: 1 });
-        assert_eq!(delivered(), before + 3);
-        if ours {
+        ring.deliver_report(a, tag_a, GlassSample::Skipped);
+        ring.deliver_report(c, tag_c, GlassSample::OnGlass { ns: 1 });
+        ring.deliver_report(b, tag_b, GlassSample::OnGlass { ns: 1 });
+        assert_eq!(ring.delivered(), 3);
+        {
             let seen = SEEN.lock().unwrap();
+            assert_eq!(seen.len(), 3);
             assert_eq!(seen[0].successor, PresentTag::HotBurst, "a → b");
             assert_eq!(seen[0].skip_attribution(), PresentTag::HotBurst);
             assert_eq!(seen[1].successor, tag_c, "c has nothing after it");
         }
+
+        ring.arm_present(spaced);
+        let (d, tag_d) = ring.registration_begin(202.0);
+        assert_eq!(tag_d, PresentTag::Spaced);
+        for i in 0..=u16::try_from(TAG_RING).unwrap() {
+            ring.arm_present(ArmedPresent {
+                input_hot: true,
+                prev_registered_ns: Some(202_000_000_000),
+                ..spaced
+            });
+            let (_, later_tag) = ring.registration_begin(202.001 + f64::from(i) * 0.000_1);
+            assert_eq!(later_tag, PresentTag::HotBurst);
+        }
+        ring.deliver_report(d, tag_d, GlassSample::Skipped);
+        let seen = SEEN.lock().unwrap();
+        assert_eq!(
+            seen[3].successor, tag_d,
+            "an overwritten TAG_RING slot falls back to d's own tag instead of impersonating d + 1"
+        );
+        assert_eq!(seen[3].skip_attribution(), PresentTag::Spaced);
     }
 }

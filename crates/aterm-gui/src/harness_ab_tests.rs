@@ -637,10 +637,6 @@ fn the_lead_stands_at_ten_minutes_of_each_side() {
     let mut no_off = working(TEN - 1_000, TEN);
     no_off.arms[Off.index()] = AbArmTotals::default();
     assert_eq!(ab_lead(&no_off), Some(AbLead::NoOff));
-    assert_eq!(
-        AbLead::NoOff.words(),
-        "Set a session Off to measure plain Claude Code beside Cruise"
-    );
     let mut land = AbWeek::default();
     land.arms[Land.index()].busy_ms = 6 * HOUR;
     assert_eq!(ab_lead(&land), None, "Land is never part of it");

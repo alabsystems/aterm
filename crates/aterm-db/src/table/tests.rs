@@ -17,39 +17,68 @@ use std::{path::PathBuf, time::Duration};
 const NETWORK: [u8; 16] = [9; 16];
 
 pub(crate) fn repair_commons(lab: &Lab, rounds: usize) {
+    let members: Vec<usize> = (0..lab.paths.len()).collect();
+    repair_commons_with(lab, rounds, &members, None);
+}
+
+/// [`repair_commons`] with each Mac's ring windows placed by its own clock, `now[n]` seconds.
+pub(crate) fn repair_commons_at(lab: &Lab, rounds: usize, now: &[u64]) {
+    let members: Vec<usize> = (0..lab.paths.len()).collect();
+    repair_commons_among(lab, rounds, &members, now);
+}
+
+/// [`repair_commons_at`] among `members` alone (the first exchanges with each other), as one
+/// side of a split.
+pub(crate) fn repair_commons_among(lab: &Lab, rounds: usize, members: &[usize], now: &[u64]) {
+    assert_eq!(now.len(), lab.paths.len(), "one clock per Mac");
+    repair_commons_with(lab, rounds, members, Some(now));
+}
+
+fn repair_commons_with(lab: &Lab, rounds: usize, members: &[usize], now: Option<&[u64]>) {
     use crate::control::{Endpoint, Repair, Side};
     use aterm_net::lan::{Connection, Scope as LinkScope};
-    let endpoints: Vec<_> = (0..2)
-        .map(|n| {
-            Endpoint::from_bootstrap(&lab.bootstrap(n))
+    let endpoints: Vec<_> = members
+        .iter()
+        .map(|&n| {
+            let endpoint = Endpoint::from_bootstrap(&lab.bootstrap(n))
                 .unwrap()
                 .unwrap()
                 .with_commons(lab.paths[n].clone(), lab.paths[n].home.join("config.toml"))
-                .unwrap()
+                .unwrap();
+            match now {
+                Some(now) => endpoint.with_ring_clock(now[n]),
+                None => endpoint,
+            }
         })
         .collect();
-    let (mut left, mut right) = (Repair::default(), Repair::default());
+    let mut repairs: Vec<_> = (0..endpoints.len()).map(|_| Repair::default()).collect();
     for _ in 0..rounds {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        std::thread::scope(|tasks| {
-            let incoming = tasks.spawn(|| {
-                endpoints[1].exchange(
-                    Connection::admit(listener.accept().unwrap().0, LinkScope::Loopback).unwrap(),
-                    Side::Responder,
-                    &mut right,
-                )
+        for peer in 1..endpoints.len() {
+            let (head, tail) = repairs.split_at_mut(peer);
+            let left = &mut head[0];
+            let right = &mut tail[0];
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            std::thread::scope(|tasks| {
+                let incoming = tasks.spawn(|| {
+                    endpoints[peer].exchange(
+                        Connection::admit(listener.accept().unwrap().0, LinkScope::Loopback)
+                            .unwrap(),
+                        Side::Responder,
+                        right,
+                    )
+                });
+                endpoints[0]
+                    .exchange(
+                        Connection::connect(address, LinkScope::Loopback, Duration::from_secs(60))
+                            .unwrap(),
+                        Side::Initiator,
+                        left,
+                    )
+                    .unwrap();
+                incoming.join().unwrap().unwrap();
             });
-            endpoints[0]
-                .exchange(
-                    Connection::connect(address, LinkScope::Loopback, Duration::from_secs(60))
-                        .unwrap(),
-                    Side::Initiator,
-                    &mut left,
-                )
-                .unwrap();
-            incoming.join().unwrap().unwrap();
-        });
+        }
     }
 }
 
@@ -109,6 +138,7 @@ pub(crate) fn seal(
 pub(crate) struct Lab {
     pub(crate) _home: aterm_tempfile::TempDir,
     pub(crate) paths: Vec<Paths>,
+    pub(crate) signer: String,
     source: PathBuf,
 }
 impl Lab {
@@ -127,7 +157,9 @@ impl Lab {
         let paths: Vec<_> = (0..roles.len())
             .map(|n| Paths::for_home(&home.path().join(format!("m{}", n + 1))))
             .collect();
-        client::test_create_unbound(&paths[0], source.to_str().unwrap(), None, Some("m1")).unwrap();
+        let created =
+            client::test_create_unbound(&paths[0], source.to_str().unwrap(), None, Some("m1"))
+                .unwrap();
         let admin = client::admin_open(&paths[0]).unwrap();
         let mut document = admin.doc.clone();
         for (n, path) in paths.iter().enumerate().skip(1) {
@@ -223,6 +255,7 @@ impl Lab {
         Self {
             _home: home,
             paths,
+            signer: created.signer,
             source,
         }
     }
@@ -495,6 +528,188 @@ fn rotation_preserves_old_read_evidence_and_demotion_does_not_grant_writes() {
         "past authorship is evidence, not a current write grant"
     );
     assert!(session.seal(scope, causal(), b"denied").is_err());
+}
+
+#[test]
+fn admitted_session_reuses_the_fresh_control_lock_and_refuses_foreign_custody() {
+    use std::time::Instant;
+
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let (bootstrap, journal) = Bootstrap::cached_with_journal_until(
+        &lab.paths[0],
+        Instant::now() + Duration::from_secs(60),
+    )
+    .unwrap()
+    .unwrap();
+    let expected = bootstrap.request().unwrap().binding().actor();
+    let error = Journal::open_existing(bootstrap.journal_dir(), bootstrap.trust())
+        .err()
+        .expect("the admitted journal retains the actual exclusive writer lock");
+    assert_eq!(error.kind(), aterm_secrets::ErrorKind::JournalBusy);
+    let session = Session::from_admitted_journal(&bootstrap, journal)
+        .expect("authorizing the held journal must not reopen its lock");
+    assert_eq!(session.actor(), expected);
+    assert_eq!(session.epoch(), 1);
+    drop(session);
+    let journal = Journal::open_existing(bootstrap.journal_dir(), bootstrap.trust()).unwrap();
+    drop(journal);
+
+    let read_only = Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust()).unwrap();
+    assert!(
+        Session::from_admitted_journal(&bootstrap, read_only).is_err(),
+        "a cached read view cannot impersonate the held writer admission"
+    );
+
+    let other = lab.bootstrap(1);
+    assert_eq!(other.trust(), bootstrap.trust());
+    let foreign = Journal::open_existing(other.journal_dir(), other.trust()).unwrap();
+    let error = Session::from_admitted_journal(&bootstrap, foreign)
+        .err()
+        .expect("equal network trust does not identify local custody");
+    assert!(
+        error.to_string().contains("another custody directory"),
+        "{error}"
+    );
+}
+
+#[test]
+fn admitted_session_uses_revocation_in_the_held_history() {
+    use std::time::Instant;
+
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let retained = lab.bootstrap(1);
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let (bootstrap, mut journal) = Bootstrap::cached_with_journal_until(
+        &lab.paths[0],
+        Instant::now() + Duration::from_secs(60),
+    )
+    .unwrap()
+    .unwrap();
+    let revocation = admin
+        .prepare_commons_rotation(
+            &journal,
+            vec![Grant::recorded(
+                "m2",
+                retained.request().unwrap().binding().clone(),
+                Role::Writer,
+            )],
+        )
+        .unwrap();
+    journal.ingest(revocation.bytes()).unwrap();
+    let error = Session::from_admitted_journal(&bootstrap, journal)
+        .err()
+        .expect("bootstrap custody cannot preserve a revoked application grant");
+    assert!(
+        error.to_string().contains("could not be decrypted"),
+        "{error}"
+    );
+}
+
+#[test]
+fn admitted_session_and_open_revalidate_source_identity_and_device_custody() {
+    use std::time::Instant;
+
+    for admitted in [false, true] {
+        for changed in ["source.toml", "identity", "commons/device.age"] {
+            let lab = Lab::new(&[Role::Writer]);
+            let (bootstrap, journal) = Bootstrap::cached_with_journal_until(
+                &lab.paths[0],
+                Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap()
+            .unwrap();
+            let journal = if admitted {
+                Some(journal)
+            } else {
+                drop(journal);
+                None
+            };
+            std::fs::remove_file(lab.paths[0].dir.join(changed)).unwrap();
+            let result = match journal {
+                Some(journal) => Session::from_admitted_journal(&bootstrap, journal),
+                None => Session::open(&bootstrap),
+            };
+            let error = result
+                .err()
+                .expect("no admission path can authorize changed source or custody");
+            assert!(error.to_string().contains("custody"), "{error}");
+        }
+    }
+}
+
+#[test]
+fn waiting_session_replays_revocation_before_authorizing_the_batch() {
+    use std::time::Instant;
+    use std::{cell::Cell, rc::Rc};
+
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let revoked = lab.bootstrap(0);
+    let retained = lab.bootstrap(1);
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let owner = Journal::open_existing(revoked.journal_dir(), revoked.trust()).unwrap();
+    let revocation = admin
+        .prepare_commons_rotation(
+            &owner,
+            vec![Grant::recorded(
+                "m2",
+                retained.request().unwrap().binding().clone(),
+                Role::Writer,
+            )],
+        )
+        .unwrap();
+    let waited = Rc::new(Cell::new(0));
+    let observed = waited.clone();
+    let mut owner = Some(owner);
+    let error = aterm_uds::private_file::with_lock_wait_observer(
+        move |_| {
+            observed.set(observed.get() + 1);
+            owner.as_mut().unwrap().ingest(revocation.bytes()).unwrap();
+            drop(owner.take());
+        },
+        || {
+            Session::open_until(&revoked, Instant::now() + Duration::from_secs(60))
+                .err()
+                .expect("the newly revoked device has no current table access")
+        },
+    );
+    assert_eq!(
+        waited.get(),
+        1,
+        "revocation was appended during actual contention"
+    );
+    assert!(
+        error.to_string().contains("could not be decrypted"),
+        "{error}"
+    );
+}
+
+#[test]
+fn waiting_session_revalidates_source_identity_and_device_custody() {
+    use std::{cell::Cell, rc::Rc, time::Instant};
+
+    for changed in ["source.toml", "identity", "commons/device.age"] {
+        let lab = Lab::new(&[Role::Writer]);
+        let bootstrap = lab.bootstrap(0);
+        let mut owner =
+            Some(Journal::open_existing(bootstrap.journal_dir(), bootstrap.trust()).unwrap());
+        let changed = lab.paths[0].dir.join(changed);
+        let waited = Rc::new(Cell::new(0));
+        let observed = waited.clone();
+        let error = aterm_uds::private_file::with_lock_wait_observer(
+            move |_| {
+                observed.set(observed.get() + 1);
+                std::fs::remove_file(&changed).unwrap();
+                drop(owner.take());
+            },
+            || {
+                Session::open_until(&bootstrap, Instant::now() + Duration::from_secs(60))
+                    .err()
+                    .expect("changed custody cannot authorize a waited batch")
+            },
+        );
+        assert_eq!(waited.get(), 1);
+        assert!(error.to_string().contains("custody"), "{error}");
+    }
 }
 
 fn envelope_transition(

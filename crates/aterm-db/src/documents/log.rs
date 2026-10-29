@@ -222,6 +222,19 @@ impl Log {
         }
         (cells, refusals, eligible)
     }
+    /// Every eligible operation with its decoded command, in record-id order. An application
+    /// whose records are append-only per writer reads these, never the cells, whose causal
+    /// replacement would let one writer's record hide another's.
+    pub(crate) fn eligible(&self) -> Vec<(Operation, Command)> {
+        let (_, _, eligible) = self.project(None);
+        self.records
+            .iter()
+            .filter(|(id, _)| eligible.contains(*id))
+            .filter_map(|(_, (operation, command))| {
+                command.clone().map(|command| (operation.clone(), command))
+            })
+            .collect()
+    }
     pub(crate) fn snapshot(&self) -> Snapshot {
         let (cells, refusals, eligible) = self.project(None);
         let operations = self
@@ -263,6 +276,14 @@ impl Log {
             ));
         }
         Ok(())
+    }
+    pub(crate) fn retained_counts(&self, actor: Actor) -> (usize, usize) {
+        let by_actor = self
+            .records
+            .values()
+            .filter(|(op, _)| op.header.actor == actor)
+            .count();
+        (self.retained, by_actor)
     }
     pub(crate) fn retry(&self, actor: Actor, command: &Command) -> Result<Option<Digest>> {
         let mut first = None;

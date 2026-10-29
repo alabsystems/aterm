@@ -543,14 +543,11 @@ fn test_tuple_struct() {
     test(
         TupleStruct(1, 2, 3),
         &[
-            Token::TupleStruct {
-                name: "TupleStruct",
-                len: 3,
-            },
+            Token::Tuple { len: 3 },
             Token::I32(1),
             Token::I32(2),
             Token::I32(3),
-            Token::TupleStructEnd,
+            Token::TupleEnd,
         ],
     );
     test(
@@ -1143,7 +1140,7 @@ fn test_box() {
 }
 
 #[test]
-fn test_boxed_slice() {
+fn test_boxed_array() {
     test(
         Box::new([0, 1, 2]),
         &[

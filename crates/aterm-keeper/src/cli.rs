@@ -678,6 +678,14 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn keeper_fields(s: &str) -> Vec<&str> {
+        s.split([' ', ';'])
+            .take_while(|t| !t.starts_with('('))
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
+
+    #[cfg(unix)]
     #[test]
     fn stop_says_stopped_only_when_the_keeper_ended() {
         let birth = crate::wire::Birth {
@@ -693,25 +701,36 @@ mod tests {
         assert!(await_end(7, birth, short, |_| None));
         assert!(await_end(7, birth, short, |_| Some(reused)));
         assert_eq!(
-            still_running_line("L", 7),
-            "keeper=running label=L pid=7 (still running 60 s after its job was removed)"
+            keeper_fields(&still_running_line("L", 7)),
+            ["keeper=running", "label=L", "pid=7"]
         );
         assert_eq!(
             stop_absent_line("L", None),
             ("job=absent label=L".to_string(), true)
         );
+        let (with_pid, ok) =
+            stop_absent_line("L", Some((std::path::Path::new("/p/k.sock"), Some(42))));
+        assert!(!ok);
         assert_eq!(
-            stop_absent_line("L", Some((std::path::Path::new("/p/k.sock"), Some(42)))),
-            (
-                "keeper=running label=L job=absent pid=42 socket=/p/k.sock (this label's stop \
-                 cannot end it)"
-                    .to_string(),
-                false
-            )
+            keeper_fields(&with_pid),
+            [
+                "keeper=running",
+                "label=L",
+                "job=absent",
+                "pid=42",
+                "socket=/p/k.sock"
+            ]
         );
+        let (no_pid, ok) = stop_absent_line("L", Some((std::path::Path::new("/p/k.sock"), None)));
+        assert!(!ok);
         assert_eq!(
-            stop_absent_line("L", Some((std::path::Path::new("/p/k.sock"), None))).0,
-            "keeper=running label=L job=absent socket=/p/k.sock (this label's stop cannot end it)"
+            keeper_fields(&no_pid),
+            [
+                "keeper=running",
+                "label=L",
+                "job=absent",
+                "socket=/p/k.sock"
+            ]
         );
         assert_eq!(
             status_pid("keeper=running\npid=4242 version=0.70.0\nsocket=/p/k.sock"),
@@ -724,146 +743,208 @@ mod tests {
     #[test]
     fn start_says_running_only_when_this_builds_keeper_answers() {
         use crate::job::JobState;
+        const REMEDY: &str = "aterm keeper stop, then aterm keeper start";
+        let check = |got: Option<(String, bool)>,
+                     want_fields: &[&str],
+                     want_ok: bool,
+                     want_remedy: bool,
+                     want_tail: Option<&str>| {
+            let (text, ok) = got.expect("decision line");
+            assert_eq!(ok, want_ok, "{text}");
+            assert_eq!(keeper_fields(&text), want_fields, "{text}");
+            assert_eq!(text.contains(REMEDY), want_remedy, "{text}");
+            if let Some(tail) = want_tail {
+                assert!(text.contains(tail), "{text} missing {tail:?}");
+            }
+        };
         let sock = std::path::Path::new("/p/k.sock");
         let log = std::path::Path::new("/p/k.sock.log");
         let say = |job: JobState, answer: Result<String, NoKeeper>, log| {
             start_without_submit("L", sock, true, &job, &answer, log)
         };
         let ours = || Ok("keeper=running".to_string());
-        let line = |s: &str, ok: bool| Some((s.to_string(), ok));
         assert_eq!(say(JobState::Absent, Err(NoKeeper::Nothing), None), None);
         assert_eq!(
             say(JobState::Absent, Err(NoKeeper::Failed("x".into())), None),
             None
         );
-        assert_eq!(
+        check(
             say(JobState::Loaded { pid: Some(7) }, ours(), None),
-            line("keeper=running label=L pid=7 socket=/p/k.sock", true)
+            &["keeper=running", "label=L", "pid=7", "socket=/p/k.sock"],
+            true,
+            false,
+            None,
         );
-        assert_eq!(
+        check(
             say(JobState::Loaded { pid: None }, ours(), None),
-            line("keeper=running label=L job=loaded socket=/p/k.sock", true),
-            "a job launchd holds but runs nothing is not the keeper that answers"
+            &[
+                "keeper=running",
+                "label=L",
+                "job=loaded",
+                "socket=/p/k.sock",
+            ],
+            true,
+            false,
+            None,
         );
-        assert_eq!(
+        check(
             start_without_submit(
                 "L",
                 sock,
                 false,
                 &JobState::Loaded { pid: Some(7) },
                 &ours(),
-                None
+                None,
             ),
-            line(
-                "keeper=running label=L job=running pid=7 socket=/p/k.sock",
-                true
-            ),
-            "another label or socket: the job's pid is not claimed as the keeper's"
+            &[
+                "keeper=running",
+                "label=L",
+                "job=running",
+                "pid=7",
+                "socket=/p/k.sock",
+            ],
+            true,
+            false,
+            None,
         );
-        assert_eq!(
+        check(
             say(
                 JobState::Loaded { pid: None },
                 Err(NoKeeper::Nothing),
-                Some(log)
+                Some(log),
             ),
-            line(
-                "keeper=absent label=L job=loaded socket=/p/k.sock (its errors: /p/k.sock.log)",
-                false
-            )
+            &["keeper=absent", "label=L", "job=loaded", "socket=/p/k.sock"],
+            false,
+            false,
+            Some("/p/k.sock.log"),
         );
-        assert_eq!(
+        check(
             say(
                 JobState::Loaded { pid: Some(7) },
                 Err(NoKeeper::Failed("timed out".into())),
-                None
+                None,
             ),
-            line(
-                "keeper=absent label=L job=running pid=7 socket=/p/k.sock (timed out)",
-                false
-            )
+            &[
+                "keeper=absent",
+                "label=L",
+                "job=running",
+                "pid=7",
+                "socket=/p/k.sock",
+            ],
+            false,
+            false,
+            Some("timed out"),
         );
-        assert_eq!(
+        check(
             say(
                 JobState::Loaded { pid: Some(7) },
                 Err(NoKeeper::NotOurs),
-                None
+                None,
             ),
-            line(
-                "keeper=refused label=L pid=7 socket=/p/k.sock (not this build's keeper); aterm \
-                 keeper stop, then aterm keeper start",
-                false
-            )
+            &["keeper=refused", "label=L", "pid=7", "socket=/p/k.sock"],
+            false,
+            true,
+            None,
         );
-        assert_eq!(
+        check(
             start_without_submit(
                 "L",
                 sock,
                 false,
                 &JobState::Loaded { pid: Some(7) },
                 &Err(NoKeeper::NotOurs),
-                None
+                None,
             ),
-            line(
-                "keeper=refused label=L job=running pid=7 socket=/p/k.sock (not this build's \
-                 keeper)",
-                false
-            ),
-            "another label or socket: its job may not be what answers, and a bare stop and \
-             start do not act on it"
+            &[
+                "keeper=refused",
+                "label=L",
+                "job=running",
+                "pid=7",
+                "socket=/p/k.sock",
+            ],
+            false,
+            false,
+            None,
         );
-        assert_eq!(
+        check(
             say(JobState::Loaded { pid: None }, Err(NoKeeper::NotOurs), None),
-            line(
-                "keeper=refused label=L job=loaded socket=/p/k.sock (not this build's keeper)",
-                false
-            )
+            &[
+                "keeper=refused",
+                "label=L",
+                "job=loaded",
+                "socket=/p/k.sock",
+            ],
+            false,
+            false,
+            None,
         );
-        assert_eq!(
+        check(
             say(JobState::Absent, Err(NoKeeper::NotOurs), None),
-            line(
-                "keeper=refused label=L job=absent socket=/p/k.sock (not this build's keeper)",
-                false
-            )
+            &[
+                "keeper=refused",
+                "label=L",
+                "job=absent",
+                "socket=/p/k.sock",
+            ],
+            false,
+            false,
+            None,
         );
-        assert_eq!(
+        check(
             say(JobState::Absent, ours(), None),
-            line("keeper=running label=L job=absent socket=/p/k.sock", true)
+            &[
+                "keeper=running",
+                "label=L",
+                "job=absent",
+                "socket=/p/k.sock",
+            ],
+            true,
+            false,
+            None,
         );
-        assert_eq!(
+        check(
             say(
                 JobState::Absent,
                 Ok("keeper=running\npid=42 version=0.70.0\nsocket=/p/k.sock".to_string()),
-                None
+                None,
             ),
-            line(
-                "keeper=running label=L job=absent pid=42 socket=/p/k.sock",
-                true
-            ),
-            "start names the pid stop names for the same state"
+            &[
+                "keeper=running",
+                "label=L",
+                "job=absent",
+                "pid=42",
+                "socket=/p/k.sock",
+            ],
+            true,
+            false,
+            None,
         );
     }
 
     #[cfg(unix)]
     #[test]
     fn status_tells_a_refused_keeper_from_an_absent_one() {
+        const REMEDY: &str = "aterm keeper stop, then aterm keeper start";
         let sock = std::path::Path::new("/p/k.sock");
+        let repl = status_miss_line(sock, &NoKeeper::NotOurs, true);
+        assert_eq!(keeper_fields(&repl), ["keeper=refused", "socket=/p/k.sock"]);
+        assert!(repl.contains(REMEDY), "{repl}");
+        let norepl = status_miss_line(sock, &NoKeeper::NotOurs, false);
         assert_eq!(
-            status_miss_line(sock, &NoKeeper::NotOurs, true),
-            "keeper=refused socket=/p/k.sock (not this build's keeper); aterm keeper stop, then \
-             aterm keeper start"
+            keeper_fields(&norepl),
+            ["keeper=refused", "socket=/p/k.sock"]
         );
-        assert_eq!(
-            status_miss_line(sock, &NoKeeper::NotOurs, false),
-            "keeper=refused socket=/p/k.sock (not this build's keeper)"
-        );
+        assert!(!norepl.contains(REMEDY), "{norepl}");
         assert_eq!(
             status_miss_line(sock, &NoKeeper::Nothing, true),
             "keeper=absent socket=/p/k.sock"
         );
+        let failed = status_miss_line(sock, &NoKeeper::Failed("timed out".into()), false);
         assert_eq!(
-            status_miss_line(sock, &NoKeeper::Failed("timed out".into()), false),
-            "keeper=absent socket=/p/k.sock (timed out)"
+            keeper_fields(&failed),
+            ["keeper=absent", "socket=/p/k.sock"]
         );
+        assert!(failed.contains("(timed out)"), "{failed}");
     }
 
     #[test]

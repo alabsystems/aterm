@@ -806,6 +806,8 @@ impl App {
             }
             HostNote::DiskWorker { task, folder } => self.start_disk_worker(task, &folder),
             HostNote::DiskWorkerExpired { sid } => self.disk_worker_expired(&sid),
+            HostNote::CreditClaim { sid, offer } => self.start_credit_claim(&sid, offer),
+            HostNote::CreditClaimExpired { sid } => self.credit_claim_expired(&sid),
             HostNote::ProgramCheckStuck { workers, limit } => {
                 self.post_message(message_reporters::program_check_stuck(workers, limit));
             }
@@ -855,12 +857,7 @@ impl App {
                 }
                 match standing {
                     Some(exception) if exception.when == Urgency::Later => {
-                        aterm_log::info!(
-                            "harness @{sid}: needs a person ({}): {} => {}",
-                            exception.kind.word(),
-                            exception.why,
-                            exception.action
-                        );
+                        aterm_log::info!("{}", needs_a_person_line(&sid, &exception));
                         self.resume_standing.insert(sid, (exception, agent));
                     }
                     Some(_) | None => {
@@ -1025,8 +1022,19 @@ impl App {
                     let due = pool.map_or(&[][..], |pool| pool.due.as_slice());
                     let wrong = pool.map_or(&[][..], |pool| pool.wrong.as_slice());
                     let sign_in = pool.map_or(&[][..], |pool| pool.sign_in.as_slice());
+                    // Where a renewal cannot approve the page itself (Grok's), the due entry asks
+                    // for each login's sign-in; a login whose renewal already stopped for it is
+                    // that task's ask, so the due entry leaves it out and the person is asked once.
+                    let due: Vec<String> = due
+                        .iter()
+                        .filter(|label| {
+                            cli.renews_headlessly()
+                                || !sign_in.iter().any(|(task, _)| task == *label)
+                        })
+                        .cloned()
+                        .collect();
                     for (cause, entry) in [
-                        ("due", message_reporters::accounts_due_entry_for(cli, due)),
+                        ("due", message_reporters::accounts_due_entry_for(cli, &due)),
                         (
                             "wrong-account",
                             message_reporters::accounts_wrong_entry_for(cli, wrong),
@@ -1231,13 +1239,7 @@ impl App {
     ) {
         let notice = exception.notice.as_ref();
         if self.host_noted.insert(resume_asked_key(sid)) {
-            aterm_log::warn!(
-                "harness @{sid}: needs a person now ({}{}): {} => {}",
-                exception.kind.word(),
-                notice.map_or_else(String::new, |n| format!(", notice {}", n.id)),
-                exception.why,
-                exception.action
-            );
+            aterm_log::warn!("{}", needs_a_person_line(sid, exception));
         }
         let key = message_reporters::notice_ask_key(sid, notice.map(|n| n.code));
         let wall = wall_stamp_now().unix_ms;
@@ -1673,10 +1675,25 @@ impl App {
         let demoted = self.messages.demotions();
         if demoted != self.demotions_logged {
             self.demotions_logged = demoted;
+            // The center keeps the last demoted message's key, else its title: a key the
+            // Messages store has filed is named, a title by its length (DESIGN §3.6).
+            let last = match self.messages.last_demoted() {
+                None => "-".to_string(),
+                Some(key)
+                    if self
+                        .messages
+                        .log()
+                        .records()
+                        .rev()
+                        .any(|r| r.key.as_deref() == Some(key)) =>
+                {
+                    format!("key={}", aterm_log::words::word(key))
+                }
+                Some(title) => format!("title={}", aterm_log::words::Len(title)),
+            };
             aterm_log::warn!(
                 "message rule: {demoted} message(s) recorded instead of shown: nothing earned \
-                 them a hold (last: {})",
-                self.messages.last_demoted().unwrap_or("-")
+                 them a hold (last: {last})"
             );
         }
     }
@@ -1743,6 +1760,31 @@ fn relaunch_told_key(sid: &str) -> String {
 
 /// The stem of [`resume_asked_key`].
 const RESUME_ASKED: &str = "resume-ask:";
+
+/// What aterm.log keeps of tab `sid`'s standing exception, Later and Now alike: its kind, its
+/// notice's id, the reason by its length and the action as a word or its length. The reason can
+/// be a `/goal` label read off the screen or a repository's finding, so the Messages row keeps
+/// the words (DESIGN §3.6).
+fn needs_a_person_line(
+    sid: &str,
+    exception: &aterm_agent::supervise::policy::exception::Exception,
+) -> String {
+    format!(
+        "harness @{sid}: needs a person{} ({}{}): why={} => {}",
+        if exception.when == Urgency::Now {
+            " now"
+        } else {
+            ""
+        },
+        exception.kind.word(),
+        exception
+            .notice
+            .as_ref()
+            .map_or_else(String::new, |n| format!(", notice {}", n.id)),
+        aterm_log::words::Len(&exception.why),
+        aterm_log::words::WordOrLen(&exception.action)
+    )
+}
 
 /// The `host_noted` key that says this process holds a tab's resume ask
 /// ([`App::raise_resume_ask`]).

@@ -201,6 +201,7 @@ fn account_admission_refuses_before_any_filesystem_work() {
         usage_tap: None,
         agents_off: Vec::new(),
         land: false,
+        press: None,
         timings: crate::harness::Timings::FAST,
     };
     let rows = roster();

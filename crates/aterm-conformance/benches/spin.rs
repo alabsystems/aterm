@@ -17,7 +17,7 @@ mod measuring {
 
     use aterm_conformance::measure::Rig;
     use aterm_conformance::measure::instance::CouldNotRun;
-    use aterm_conformance::measure::spin::{EFFECT_LANE, NEEDLE_LANE, SpinRow, SpinScene, measure};
+    use aterm_conformance::measure::spin::{EFFECT_LANE, SpinRow, SpinScene, measure};
     use aterm_conformance::measure::starvation::ShapeVerdict;
 
     const MAX_ARMS: u64 = 100;
@@ -42,6 +42,7 @@ mod measuring {
                 max_arms: MAX_ARMS,
                 max_timer_wakes: Some(12),
                 max_owner_fires: &[],
+                needle_owed: false,
                 max_wakes: 150,
             },
         ),
@@ -54,6 +55,7 @@ mod measuring {
                 max_arms: MAX_ARMS,
                 max_timer_wakes: None,
                 max_owner_fires: &[],
+                needle_owed: false,
                 max_wakes: 6,
             },
         ),
@@ -70,6 +72,7 @@ mod measuring {
                 max_arms: MAX_ARMS,
                 max_timer_wakes: Some(12),
                 max_owner_fires: &[],
+                needle_owed: false,
                 max_wakes: 12,
             },
         ),
@@ -95,6 +98,7 @@ mod measuring {
                 max_arms: MAX_ARMS,
                 max_timer_wakes: None,
                 max_owner_fires: &[],
+                needle_owed: false,
                 max_wakes: 200,
             },
         ),
@@ -102,8 +106,16 @@ mod measuring {
         // Reduce Motion is off) under the shipped cursor style, the rainbow kitty pet, measured
         // from 40 s after its prompt went quiet. A pet in deep sleep takes no frame and offers no
         // deadline, so the cursor-effect lane is bounded at 0. A window without the focus asks its
-        // pet for none either, so a take that does not end focused, at full motion with the pet
-        // asleep, is a refusal, never a pass (`PET_READY`). A release build of 921fbd893d
+        // pet for none either, so a take that does not open and end focused, at full motion with
+        // the pet past its breath window (`pet_deep`), is a refusal, never a pass (`PET_READY`).
+        // A window that loses the focus and regains it fades its pet back in over 0.30 s, about 18
+        // frames at a 120 Hz panel's effect interval: the best fit, by a reading of the code, for
+        // one take of main's dev bundle on 2026-10-28 that fired the lane 18 times with the pet
+        // asleep at both edges (it recorded no window events), so a take whose window took any
+        // event other than a redraw (`os_window_events`, `os_events_unidle`), or whose pet still
+        // asks for frames as the window opens (a fade, a pointer's warmth), is a refusal too, and
+        // the owners' fires count from the metrics read after that check. A release build of
+        // 921fbd893d
         // measured, focused with the pet asleep (`pet_sleep_0`) in each of three takes, 0
         // cursor-effect fires, 42 timer wakes (the Deck's live edge 30, the vitals 10, 2 devtools
         // hand-overs), 40 frames and 92 wakes, bounded at 200 as the row above. Proven red
@@ -112,13 +124,16 @@ mod measuring {
         // asleep, and the four rows above passed on it. The window's Folded deck draws the dial,
         // whose needle sweeps on its own deadline (`stats_needle`) after a reading that moves its
         // tip a device pixel or more (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §4.3). The
-        // dial reads the machine's own CPU, which even a quiet Mac moves past that pixel now and
-        // then, so the lane is bounded at 20, not 0: a dev build of 272f5972c9 measured 0 needle
-        // fires and 92 wakes here with 0.5 of 14 cores busy, 3 fires and 98 wakes with 1.2, and
-        // 31 fires and 155 wakes while another session's build ran beside it. Twenty leaves
-        // a quiet take room for its drift and one real swing (15 frames at a 60 Hz Mac's
-        // 33.3 ms), and fails a needle that asks three frames or more at each of the window's ten
-        // readings, which the 200-wake bound alone would pass.
+        // dial reads the machine's own CPU, so how often it sweeps is the Mac's load: on main's
+        // dev bundle of 2026-10-28, three takes asked 46, 19 and 34 needle frames at loads of
+        // 8.4, 6.2 and 3.7, and a fixed bound of 20 failed two of them. The app counts the frames
+        // each reading's episode owes the windows that animate the dial, on each window's own
+        // shortest effect interval (`needle_frames_owed`), and what the episode in flight as the
+        // window opens has left to fire (`needle_episode_left`), so the row bounds the needle's
+        // fires by those, each counted between the window's opening and closing metrics: a needle
+        // that fires more than its readings owed fails, whatever the
+        // Mac's load. The needle's own wakes, two a fire, are left out of the 200, which the
+        // rest of the window kept to 91 or 92 in each of those takes.
         (
             "a_pet_in_deep_sleep_fires_no_effect_wake",
             SpinRow {
@@ -126,7 +141,8 @@ mod measuring {
                 window: Duration::from_secs(10),
                 max_arms: MAX_ARMS,
                 max_timer_wakes: None,
-                max_owner_fires: &[(EFFECT_LANE, 0), (NEEDLE_LANE, 20)],
+                max_owner_fires: &[(EFFECT_LANE, 0)],
+                needle_owed: true,
                 max_wakes: 200,
             },
         ),

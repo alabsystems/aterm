@@ -51,11 +51,22 @@ pub(crate) struct ExecEdges {
     gone: Vec<i32>,
     /// Stuck-engine edge notified on process events ([`crate::vitals_host::PROC_EDGE`]).
     proc_edge: &'static crate::vitals_host::ProcEdge,
+    /// Where each heard `exec` is heard as it is drained ([`crate::command_ran::Ran`]).
+    feed: crate::command_ran::RanFeed,
+    /// Reads the bytes the PTY holds unread, with the master it is asked of (`TIOCOUTQ`;
+    /// `None` where it cannot be read, and each exec is placed by its stamp).
+    queued: (fn(i32) -> Option<usize>, i32),
 }
 
 impl ExecEdges {
-    /// The gather's half for `watch`, reading images with `read` (`SessionFactory::edge_image`).
-    pub(crate) fn new(mut watch: ProcWatch, read: ReadImage, holder: i32) -> Self {
+    /// The gather's half for `watch`, reading images with `read` (`SessionFactory::edge_image`)
+    /// and noting each `exec` it drains in `feed`.
+    pub(crate) fn new(
+        mut watch: ProcWatch,
+        read: ReadImage,
+        holder: i32,
+        feed: crate::command_ran::RanFeed,
+    ) -> Self {
         if holder > 0 && holder != watch.shell() {
             watch.follow(holder);
         }
@@ -70,7 +81,22 @@ impl ExecEdges {
             overflow: 0,
             gone: Vec::new(),
             proc_edge: &crate::vitals_host::PROC_EDGE,
+            feed,
+            queued: (|_| None, -1),
         }
+    }
+
+    /// This watch reading the PTY's unread bytes with `queued` asked of `master`
+    /// (`aterm_pty::output_queue_len`), so each `exec` heard in front is placed where the shell's
+    /// output stood when it was heard ([`crate::command_ran::Spot`]).
+    #[must_use]
+    pub(crate) const fn reading_queue(
+        mut self,
+        queued: fn(i32) -> Option<usize>,
+        master: i32,
+    ) -> Self {
+        self.queued = (queued, master);
+        self
     }
 
     /// The descriptor the gather's polls include.
@@ -91,6 +117,7 @@ impl ExecEdges {
         crate::metrics::note_proc_events(events.len());
         self.tell_vitals(&events);
         let mut fg = FgOnce::new(fg);
+        self.note_execs(&events, filled, || fg.get(), None);
         let mut deliver = false;
         for ev in events.drain(..) {
             deliver |= self.one(cutter, ev, &mut fg, filled);
@@ -106,6 +133,43 @@ impl ExecEdges {
     fn tell_vitals(&self, events: &[ProcEvent]) {
         if !events.is_empty() {
             self.proc_edge.heard();
+        }
+    }
+
+    /// Hear each `exec` of one drain in the session's ran log, as it is drained (a deferred one
+    /// is heard once, when drained, not again when replayed), when its group holds the terminal's
+    /// foreground, read once for the drain by `fg` (or, after a sampled edge, is `held`, the
+    /// group the edge found in front): a background job's or a hook's `exec` outside the
+    /// foreground is no command's, so it confirms nothing. The PTY's unread bytes are read once
+    /// first, after the drain and before the foreground, so `filled` and them, with the bytes
+    /// handed on, are where the shell's output stood when each was heard; an exec whose group
+    /// still held the foreground then is placed there ([`crate::command_ran::Spot`]): the shell
+    /// wrote its block's C before starting its job and writes the block's D only once the job is
+    /// done. It counts once the parse stage has parsed there ([`crate::command_ran::Ran::hear`]).
+    fn note_execs(
+        &self,
+        events: &[ProcEvent],
+        filled: usize,
+        mut fg: impl FnMut() -> i32,
+        held: Option<i32>,
+    ) {
+        let mut read: Option<(Option<usize>, i32)> = None;
+        let shell = self.feed.shell();
+        for ev in events {
+            if let ProcEvent::Exec { pid, pgid, .. } = *ev {
+                let (queued, front) = *read.get_or_insert_with(|| {
+                    let (probe, master) = self.queued;
+                    (probe(master), fg())
+                });
+                if pgid > 1 && (pgid == front || held == Some(pgid)) {
+                    let spot = crate::command_ran::Spot {
+                        filled,
+                        queued: queued.filter(|_| pgid == front),
+                        job: pgid != shell,
+                    };
+                    self.feed.exec(pid, pgid, spot);
+                }
+            }
         }
     }
 
@@ -185,14 +249,17 @@ impl ExecEdges {
         self.image.take()
     }
 
-    /// A sampled edge to `to` was found: watch its leader, then hear what is queued.
-    pub(crate) fn absorb(&mut self, to: i32) -> bool {
+    /// A sampled edge to `to` was found after `filled` bytes: watch its leader, then hear what
+    /// is queued, each exec of `to`'s group heard whether or not it still holds the foreground
+    /// `fg` reads now, and placed where the shell's output stood only when it does.
+    pub(crate) fn absorb(&mut self, to: i32, filled: usize, fg: impl FnMut() -> i32) -> bool {
         let start = std::time::Instant::now();
         self.watch.follow(to);
         let mut events = std::mem::take(&mut self.events);
         self.watch.drain(&mut events);
         crate::metrics::note_proc_events(events.len());
         self.tell_vitals(&events);
+        self.note_execs(&events, filled, fg, Some(to));
         let mut absorbed = false;
         for ev in events.drain(..) {
             match ev {

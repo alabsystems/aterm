@@ -56,6 +56,9 @@ pub struct Join {
     opened: BTreeMap<Node, u64>,
     /// Every transcript step's call id, and whether its result was sent.
     tools: Vec<(ShortId, Node, bool)>,
+    /// Every turn the transcript opened (`src=transcript`): the turns a partial
+    /// source may close (fix E1).
+    tx_turns: BTreeSet<Node>,
     /// The model's ghost: the first wrong record a step appended.
     pub g: i64,
     broken: Broken,
@@ -78,6 +81,7 @@ impl Join {
             floor: WALL0,
             opened: BTreeMap::new(),
             tools: Vec::new(),
+            tx_turns: BTreeSet::new(),
             g: 0,
             broken,
         }
@@ -161,16 +165,27 @@ impl Join {
                 _ => self.ghost(6),
             }
         }
+        self.tx_turns.extend(
+            recs.iter()
+                .filter(|r| r.op == Op::Open && r.node.lvl == Lvl::Turn && r.src == Src::Transcript)
+                .map(|r| r.node),
+        );
+        // A partial source adds and closes only what it opened (fix E1): its own steps and
+        // the turns it opened, and a result settles a step its turn's close cut off; it
+        // never closes the screen's turn, amends a turn's outcome, retracts, or confirms.
         if state == TxState::Partial
             && recs.iter().any(|r| {
                 r.src == Src::Transcript
                     && match r.op {
+                        Op::Close if r.node.lvl == Lvl::Turn => !self.tx_turns.contains(&r.node),
                         Op::Close => {
                             !matches!(r.k, Kind::Tool | Kind::Subagent | Kind::Compact)
                                 || r.out() == Some("retracted")
                         }
                         Op::Amend => {
-                            r.f.get(Key::Out).is_some() || r.f.get(Key::Confirmed).is_some()
+                            (r.f.get(Key::Out).is_some()
+                                && !matches!(r.k, Kind::Tool | Kind::Subagent))
+                                || r.f.get(Key::Confirmed).is_some()
                         }
                         _ => false,
                     }
@@ -226,9 +241,37 @@ impl Join {
         self.floor = self.floor.max(self.wall());
     }
 
+    /// Adopts the line a pre-E1 predecessor wrote while its partial source held the
+    /// unmapped vendor turn `vref` with no turn open ([`carried_unmapped`]).
+    pub fn adopt_unmapped(&mut self, vref: ShortId) {
+        let stamp = self.stamp();
+        let line = carried_unmapped(&self.tracker.carry_line(stamp), vref, self.wall());
+        self.tracker = TurnTracker::from_carry_line(&line, stamp).expect("an older line reads");
+        self.floor = self.floor.max(self.wall());
+    }
+
     fn open_turn(&self) -> Option<(Node, u64)> {
         open_turn(&self.log, self.run)
     }
+}
+
+/// THE LINE A PRE-E1 PREDECESSOR WROTE while its partial source held the unmapped vendor turn
+/// `vref`, read at `wall_ms`, with no turn open (fix E1 keeps the branch that reads it):
+/// `line` with its vendor turn replaced by `tx_v=<vref> tx_vp=<wall_ms>` and no `tx_vt`
+/// (`TranscriptJoin`'s `CarriedUnmapped`).
+pub fn carried_unmapped(line: &str, vref: ShortId, wall_ms: u64) -> String {
+    let mut toks: Vec<String> = line
+        .split(' ')
+        .filter(|t| {
+            !["tx_v=", "tx_vt=", "tx_ve=", "tx_vp="]
+                .iter()
+                .any(|k| t.starts_with(k))
+        })
+        .map(str::to_string)
+        .collect();
+    toks.push(format!("tx_v={vref}"));
+    toks.push(format!("tx_vp={wall_ms}"));
+    toks.join(" ")
 }
 
 fn open_turn(log: &Log, run: Node) -> Option<(Node, u64)> {
@@ -301,6 +344,11 @@ pub fn project_parts(
     let pend = view
         .settle
         .is_some_and(|(c, _)| matches!(c, SettleCause::Wall(_)));
+    let own = open_turn(log, run).is_some_and(|(n, _)| {
+        st.turn()
+            .filter(|o| o.node == n)
+            .is_some_and(|o| o.src == Src::Transcript)
+    });
     let vc = open_turn(log, run).is_some_and(|(n, t)| {
         tv.mapped == Some(n)
             && tv.prompt_ms <= t
@@ -329,6 +377,7 @@ pub fn project_parts(
         ("rf", i64::from(tv.refuted.is_some())),
         ("ts", open_tools(log, run).len() as i64),
         ("vc", i64::from(vc)),
+        ("own", i64::from(own)),
         ("g", if turns > 1 { 1 } else { g }),
     ]
     .into_iter()
@@ -416,12 +465,11 @@ pub enum Step {
     OldRow,
 }
 
-const PROMPTS: [&str; 6] = [
+const PROMPTS: [&str; 5] = [
     "PromptAttach",
     "PromptShare",
     "PromptSupersede",
     "PromptLate",
-    "PromptUnmapped",
     "PromptOpens",
 ];
 
@@ -518,6 +566,11 @@ pub fn apply(m: &Model, j: &mut Join, step: Step) -> Result<Option<Vec<&'static 
         Step::Adopt => {
             j.adopt(false);
             vec!["AdoptWithoutWatermark"]
+        }
+        Step::Carry if on("CarriedUnmapped") && j.ids.is_multiple_of(2) => {
+            let vref = j.id("u");
+            j.adopt_unmapped(vref);
+            vec!["CarriedUnmapped"]
         }
         Step::Carry => {
             j.adopt(true);

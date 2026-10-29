@@ -214,6 +214,8 @@ window_ledger! {
     /// The EVENT-LOOP scheduler audit.
     pub(crate) struct SchedLedger {
         pub(crate) event_wakes: Counter,
+        /// Window events other than a redraw (focus, occlusion, the pointer, keys, a resize), each counted under its kind as the loop dispatches it, however many redraws it brings.
+        pub(crate) os_window_events: Tally<{ OsWindowEvent::COUNT }>,
         pub(crate) timer_wakes: Counter,
         pub(crate) wait_cancelled_wakes: Counter,
         pub(crate) poll_wakes: Counter,
@@ -225,6 +227,9 @@ window_ledger! {
         pub(crate) streak_heals_by_owner: Tally<{ DeadlineOwner::COUNT }>,
         pub(crate) wake_late: MaxBy,
         pub(crate) deadline_late: MaxBy,
+        /// Readings that set the dial's needle sweeping, and the frames their episodes owe the windows that animate a dial ([`crate::stats_needle::Needle::frames_owed`]): each a `stats_needle` deadline, so that owner's fires in a window are at most these and what the episode in flight as it opened had left to fire ([`needle_episode_left`]), while no window moves to a faster display mid-episode.
+        pub(crate) needle_sweeps: Counter,
+        pub(crate) needle_frames_owed: Counter,
     }
 }
 
@@ -335,6 +340,9 @@ pub(crate) struct Live {
     pub(crate) lat_key: AtomicU64,
     pub(crate) handoff_input_dropped: AtomicU64,
     pub(crate) handoff_input_incoherent: AtomicU64,
+    /// The frames the needle's latest episode owed the windows when its reading landed (0 where it rested), and the `stats_needle` deadlines fired since.
+    pub(crate) needle_episode_owed: AtomicU64,
+    pub(crate) needle_episode_fired: AtomicU64,
     pub(crate) pty_sessions: AtomicUsize,
     pub(crate) spare_ptys: AtomicUsize,
 }
@@ -359,6 +367,8 @@ impl Live {
             lat_key: AtomicU64::new(0),
             handoff_input_dropped: AtomicU64::new(0),
             handoff_input_incoherent: AtomicU64::new(0),
+            needle_episode_owed: AtomicU64::new(0),
+            needle_episode_fired: AtomicU64::new(0),
             pty_sessions: AtomicUsize::new(0),
             spare_ptys: AtomicUsize::new(0),
         }
@@ -371,25 +381,26 @@ const INPUT_SLICE_CAP_NS: u64 = 5_000_000_000;
 
 const RESIZE_SLICE_CAP_NS: u64 = 2_000_000_000;
 
-#[cfg(all(unix, any(test, feature = "bench-support"), debug_assertions))]
+#[cfg(all(any(test, all(unix, feature = "bench-support")), debug_assertions))]
 thread_local! {
     /// The instant this thread's host clock reads are pinned to ([`pin_host_clock`]).
     static HOST_CLOCK: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }
 
 /// Pin (or, with `None`, release) this thread's host clock ([`host_now`]): `lab trail-diff`'s
-/// dump (`crate::trail_rig`) drives every frame and event at its own injected instant.
-#[cfg(all(unix, any(test, feature = "bench-support"), debug_assertions))]
+/// dump (`crate::trail_rig`) drives every frame and event at its own injected instant, and the
+/// curtain tests stamp a seam's curtain at their own instant on every target they build for.
+#[cfg(all(any(test, all(unix, feature = "bench-support")), debug_assertions))]
 pub(crate) fn pin_host_clock(at: Option<Instant>) {
     HOST_CLOCK.with(|clock| clock.set(at));
 }
 
 /// Whether this thread's host clock is pinned ([`pin_host_clock`]): its frames and events run at
 /// injected instants, so a cost measured on the wall clock belongs to none of them. Always `false`
-/// outside a debug test or `bench-support` build.
+/// outside a debug test build or a debug unix `bench-support` one.
 #[inline]
 pub(crate) fn host_clock_pinned() -> bool {
-    #[cfg(all(unix, any(test, feature = "bench-support"), debug_assertions))]
+    #[cfg(all(any(test, all(unix, feature = "bench-support")), debug_assertions))]
     if HOST_CLOCK.with(std::cell::Cell::get).is_some() {
         return true;
     }
@@ -400,10 +411,11 @@ pub(crate) fn host_clock_pinned() -> bool {
 /// [`now_ns`], the input path's, a window's focus, the resize throttle, the trail curtain a
 /// replaced front or a grid resize draws, the cursor effects' owner fence and scroll seam, the
 /// stats surfaces' pointer rest, the instant a present reached glass), or the instant
-/// `pin_host_clock` pinned on this thread in a debug test or `bench-support` build.
+/// `pin_host_clock` pinned on this thread in a debug test build or a debug unix `bench-support`
+/// one.
 #[inline]
 pub(crate) fn host_now() -> Instant {
-    #[cfg(all(unix, any(test, feature = "bench-support"), debug_assertions))]
+    #[cfg(all(any(test, all(unix, feature = "bench-support")), debug_assertions))]
     if let Some(at) = HOST_CLOCK.with(std::cell::Cell::get) {
         return at;
     }
@@ -522,6 +534,23 @@ impl EventWakeKind {
             .ok()
             .and_then(Self::from_index)
             .unwrap_or(Self::None)
+    }
+}
+
+label_enum! {
+    /// The kind of a window event other than `RedrawRequested`, as `os_window_events_by_kind` names it.
+    pub(crate) enum OsWindowEvent {
+        Focus => "focus",
+        Occlusion => "occlusion",
+        Pointer => "pointer",
+        Key => "key",
+        Ime => "ime",
+        Resize => "resize",
+        Move => "move",
+        Theme => "theme",
+        File => "file",
+        Close => "close",
+        Touch => "touch",
     }
 }
 
@@ -1360,6 +1389,12 @@ fn owner_labels() -> impl Iterator<Item = (usize, &'static str)> {
         .map(|owner| (owner.index(), owner.as_str()))
 }
 
+fn os_event_labels() -> impl Iterator<Item = (usize, &'static str)> {
+    OsWindowEvent::ALL
+        .into_iter()
+        .map(|kind| (kind.index(), kind.as_str()))
+}
+
 fn tag_labels() -> impl Iterator<Item = (usize, &'static str)> {
     aterm_gpu::present_glass::PresentTag::ALL
         .iter()
@@ -1893,6 +1928,11 @@ pub(crate) fn note_redraw_attempt() {
     METRICS.window.redraw.attempts.inc();
 }
 
+/// A window event other than `RedrawRequested`, of `kind`, reached the loop.
+pub(crate) fn note_os_window_event(kind: OsWindowEvent) {
+    METRICS.window.sched.os_window_events.inc(kind.index());
+}
+
 /// The stable RepaintKey/predictor/effect gate proved that no pixels changed.
 pub(crate) fn note_redraw_early_out() {
     METRICS.window.redraw.early_outs.inc();
@@ -2276,6 +2316,18 @@ pub(crate) fn note_deadline(
     METRICS.note_deadline(owner, requested, now, heal);
 }
 
+/// A reading retargeted the dial's needle, or a layout rested it, its new episode owing the windows `owed` frames.
+pub(crate) fn note_needle_episode(owed: u64) {
+    METRICS.note_needle_episode(owed);
+}
+
+/// What the needle's latest episode has left to fire: what it owed less the `stats_needle` deadlines fired since.
+fn needle_episode_left(live: &Live) -> u64 {
+    live.needle_episode_owed
+        .load(Ordering::Relaxed)
+        .saturating_sub(live.needle_episode_fired.load(Ordering::Relaxed))
+}
+
 pub(crate) fn note_gpu_repaint_totals(scissor_taken: u64, full_repaints: u64, scroll_rescues: u64) {
     let scope = &METRICS.window.gpu_scope;
     scope.scissor_taken.set_total(scissor_taken);
@@ -2288,6 +2340,15 @@ pub(crate) fn note_event_wake(kind: EventWakeKind) {
 }
 
 impl Metrics {
+    fn note_needle_episode(&self, owed: u64) {
+        if owed > 0 {
+            self.window.sched.needle_sweeps.inc();
+            self.window.sched.needle_frames_owed.add(owed);
+        }
+        self.live.needle_episode_fired.store(0, Ordering::Relaxed);
+        self.live.needle_episode_owed.store(owed, Ordering::Relaxed);
+    }
+
     fn note_deadline(
         &self,
         owner: DeadlineOwner,
@@ -2343,6 +2404,9 @@ impl Metrics {
             EventWakeKind::Timer => {
                 sched.timer_wakes.inc();
                 sched.fires_by_owner.inc(owner.index());
+                if owner == DeadlineOwner::StatsNeedle {
+                    live.needle_episode_fired.fetch_add(1, Ordering::Relaxed);
+                }
                 let due = live.last_deadline_due.load(Ordering::Relaxed);
                 let at = now_ns();
                 let late = if due == 0 { 0 } else { at.saturating_sub(due) };
@@ -2639,6 +2703,12 @@ pub(crate) fn emit_summary(
         live.capture_depth.load(Ordering::Relaxed) != 0,
     );
     s.count("event_wakes", w.sched.event_wakes.get());
+    let os_events = w.sched.os_window_events.sparse(os_event_labels());
+    s.count(
+        "os_window_events",
+        os_events.iter().map(|(_, count)| count).sum(),
+    );
+    s.count_pairs("os_window_events_by_kind", &os_events, "none");
     s.count("timer_wakes", w.sched.timer_wakes.get());
     s.count("wait_cancelled_wakes", w.sched.wait_cancelled_wakes.get());
     s.count("poll_wakes", w.sched.poll_wakes.get());
@@ -2694,6 +2764,9 @@ pub(crate) fn emit_summary(
         &w.sched.fires_by_owner.sparse(owner_labels()),
         "none",
     );
+    s.count("needle_sweeps", w.sched.needle_sweeps.get());
+    s.count("needle_frames_owed", w.sched.needle_frames_owed.get());
+    s.count("needle_episode_left", needle_episode_left(live));
     let wakes = if ctx.reads_process() {
         wakes::WAKES.attribution()
     } else {
@@ -3419,30 +3492,6 @@ mod window_input_attribution_tests {
     use super::{DrainedEdge, INPUT_SLICE_CAP_NS, Metrics, PendingInputStamp};
 
     #[test]
-    fn another_windows_present_cannot_close_this_windows_key() {
-        let mut typed_into = PendingInputStamp::default();
-        let mut streaming = PendingInputStamp::default();
-        typed_into.arm(1_000, 1_000);
-
-        assert_eq!(streaming.drain_slices(4_000_000), Vec::<u64>::new());
-        assert!(
-            typed_into.is_pending(),
-            "window B's frame closed window A's keystroke: the slice would read LOW"
-        );
-
-        let echo_at = 1_000 + 90_000_000;
-        assert_eq!(typed_into.drain_slices(echo_at), vec![90_000_000]);
-        assert!(
-            !typed_into.is_pending(),
-            "a content present consumes the stamp"
-        );
-        assert!(
-            typed_into.drain_slices(echo_at + 1).is_empty(),
-            "consumed once"
-        );
-    }
-
-    #[test]
     fn a_burst_before_one_present_books_every_edge() {
         let mut pending = PendingInputStamp::default();
         for arrival in [10, 20, 30, 40] {
@@ -3811,7 +3860,8 @@ mod lateness_attribution_tests {
     use super::{
         DeadlineOwner, EventWakeKind, Heal, Metrics, PresentClock, PresentObserver,
         SLOW_PRESENT_EPISODE_QUIET_NS, SLOW_PRESENT_LOG_THRESHOLD_NS, SlowEpisode, SlowEpisodeStep,
-        WindowPresentState, emit_lateness, now_ns, slow_episode_close, slow_episode_step, wire,
+        WindowPresentState, emit_lateness, inert_text, needle_episode_left, now_ns,
+        slow_episode_close, slow_episode_step, wire,
     };
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
@@ -3830,6 +3880,73 @@ mod lateness_attribution_tests {
         while now_ns() < LATE_NS + 50_000_000 {
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// The needle's latest episode has left what it owed less its own `stats_needle` fires (never
+    /// the grid's, never an interrupted wait), a rested episode owes none, and a reset clears the
+    /// window's sweeps and owed frames but keeps what the episode in flight has left: what the
+    /// `measure` spin row bounds the needle's fires by.
+    #[test]
+    fn a_needle_episode_has_left_what_it_owed_less_its_own_fires() {
+        let m = Metrics::new();
+        let now = Instant::now();
+        let soon = now + Duration::from_millis(5);
+        let fire = |owner| {
+            m.note_deadline(owner, Some(soon), now, passed(Some(soon)));
+            m.note_event_wake(EventWakeKind::Timer);
+        };
+        m.note_needle_episode(5);
+        fire(DeadlineOwner::StatsNeedle);
+        fire(DeadlineOwner::StatsLive);
+        fire(DeadlineOwner::StatsNeedle);
+        m.note_deadline(
+            DeadlineOwner::StatsNeedle,
+            Some(soon),
+            now,
+            passed(Some(soon)),
+        );
+        m.note_event_wake(EventWakeKind::WaitCancelled);
+        assert_eq!(needle_episode_left(&m.live), 3, "two of its own fires");
+        let text = inert_text(&m, 0);
+        for field in [
+            "needle_sweeps=1",
+            "needle_frames_owed=5",
+            "needle_episode_left=3",
+        ] {
+            assert!(
+                text.split_whitespace().any(|f| f == field),
+                "{field} in {text}"
+            );
+        }
+        m.reset();
+        assert_eq!(
+            (
+                m.window.sched.needle_sweeps.get(),
+                m.window.sched.needle_frames_owed.get(),
+                needle_episode_left(&m.live)
+            ),
+            (0, 0, 3),
+            "a reset keeps what the episode in flight has left"
+        );
+        for _ in 0..4 {
+            fire(DeadlineOwner::StatsNeedle);
+        }
+        assert_eq!(needle_episode_left(&m.live), 0, "fires past it leave none");
+        m.note_needle_episode(7);
+        assert_eq!(
+            needle_episode_left(&m.live),
+            7,
+            "a new episode starts afresh"
+        );
+        m.note_needle_episode(0);
+        assert_eq!(
+            (
+                needle_episode_left(&m.live),
+                m.window.sched.needle_sweeps.get()
+            ),
+            (0, 1),
+            "a rested episode owes none and is no sweep"
+        );
     }
 
     #[test]
@@ -4254,6 +4371,8 @@ mod window_tests {
             &live.lat_key,
             &live.handoff_input_dropped,
             &live.handoff_input_incoherent,
+            &live.needle_episode_owed,
+            &live.needle_episode_fired,
         ];
         for (n, cell) in (1..).zip(counts) {
             cell.store(n, Ordering::Relaxed);

@@ -1,27 +1,26 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-buffer: spec recovery from its 26 unit tests
+# aterm-buffer: spec recovery from its 25 unit tests
 
 > Status 2026-10-17, after the merge with the tests-and-gates audit: the rows naming 2 tests it
 > deleted are gone, and so is §4's row of a third, the deleted source-compatibility test.
-> Counts elsewhere in this file were taken before.
+> Counts below are reconciled with current `main` (2026-10-28).
 
 > Audit amendment: The 2026-10-16 code audit corrected the source invariant to use logical log.total() after eviction (§5.1). The dated inventory below records the earlier snapshot; behavior is unchanged.
 
-> Status 2026-10-15: this is the crate's migration worklist. The 14 specs below are proved
-> through Trust/Clean, then the tests each subsumes are deleted. The 2 tests in §4 sample no
-> spec and can be deleted now. No spec has been proved yet.
+> Status 2026-10-15: this is the crate's migration worklist. The 16 specs below are proved
+> through Trust/Clean, then the tests each subsumes are deleted. All non-spec tests from §4
+> have been retired or folded into conformance negative controls. No spec has been proved yet.
 
-Source: `crates/aterm-buffer` (read only). I read every `#[test]`
-(src/lib.rs 10, tests/{conformance_cursor 1, conformance_eventlog 2, conformance_evict_full 1,
-conformance_kernel 3, conformance_snapshot 1, conformance_subscribe 2, conformance_temporal 3,
-conformance_transact 2, public_edit_compat 1} = 26) and the code each one reaches. A raw grep
-finds 27 `#[test]` strings. The extra one is in the doc comment of `tests/buffer_suite.rs`
-("each file keeps its own `#[test]`s"), and that file has no test fn. Nothing was compiled or
-run. The claims below come from reading the code.
+Source: `crates/aterm-buffer` (read only). Every `#[test]` is mapped
+(src/lib.rs 11, tests/{conformance_cursor 1, conformance_eventlog 2, conformance_evict_full 1,
+conformance_kernel 2, conformance_snapshot 1, conformance_subscribe 2, conformance_temporal 3,
+conformance_transact 2} = 25) along with the code each one reaches. A raw grep
+finds 26 `#[test]` strings. The extra one is in the doc comment of `tests/buffer_suite.rs`
+("each file keeps its own `#[test]`s"), and that file has no test fn.
 
-Result: **14 specs**, covering **24 tests**. **2 tests are not spec samples** (§4).
+Result: **16 specs**, covering **25 tests**. **0 non-spec tests remain** (§4).
 
 ## 0. Notation used in the statements
 
@@ -53,7 +52,7 @@ Result: **14 specs**, covering **24 tests**. **2 tests are not spec samples** (�
   `&self` over `Arc` data with no interior mutability. That is a type-level fact, not a spec.
 - The kernel-family models in `aterm_spec::derive` (`kernel_model`, `ring_model`,
   `evict_full_model`, `cursor_model`, `subscribe_model`, `snapshot_model`, `transact_model`) are
-  scalar projections of these views. The first 13 specs are code-level statements.
+  scalar projections of these views. The first 15 specs are code-level statements.
   `refines-kernel-family-models` is the model-refinement statement that the conformance tests
   sample today.
 
@@ -72,7 +71,8 @@ id	kind	functions	statement	subsumes	difficulty	blocking gaps
 append-at-contract	contract	EventLog::{append_at,total,head}	∀ g∈LogReach, op, ts: let (seq, ev) = g.append_at(op, ts), with g' the log afterwards. Then seq = Seq(T(g)+1), T(g') = T(g)+1 and g'.head() = seq. If |R(g)| < MAX: ev = None and R(g') = R(g) ++ [Event{seq, op, ts}]. If |R(g)| = MAX: ev = Some(R(g)[0]) and R(g') = tail(R(g)) ++ [Event{seq, op, ts}]. The stored event carries exactly the op and ts it was given.	conformance_temporal::append_at_records_seq_tick_and_op, conformance_kernel::real_append_at_spine_conforms_to_kernel_model	MEDIUM: &mut self, VecDeque push_back/pop_front/len/capacity/reserve_exact, Option<Event>, enum Op payloads, tuple return, saturating_add	1, 2, 4
 log-window-invariant	invariant	EventLog::{append_at,live,oldest_live,newest_live,head}	∀ g∈LogReach: |R(g)| = min(T(g), MAX); seqs(g) = [lo(g), …, T(g)], ascending and contiguous, so n∈1..=T(g) is live ⇔ lo(g) ≤ n (EvictOldestContiguous); head() = Seq(T(g)); T(g) > 0 ⇒ newest_live().seq = head() ∧ oldest_live().seq = Seq(lo(g)); T(g) = 0 ⇒ both are None; live() yields R(g) in order. Preserved by append_at (by append-at-contract). Corollaries: T ≤ MAX ⇒ lo = 1; T > MAX ⇒ lo = T−MAX+1.	conformance_eventlog::real_eventlog_conforms_to_ring_spec, conformance_eventlog::real_eventlog_eviction_conforms_to_ring_spec, conformance_evict_full::real_eventlog_live_set_is_contiguous_window, conformance_temporal::dropping_the_evicted_event_loses_seqs_control	MEDIUM: a type invariant over a private VecDeque<Event> plus a u64 counter, a quantified clause over ring contents, &self/&mut self views	1, 2, 5
 no-silent-loss	round-trip	EventLog::{append_at,live}	∀ n < u64::MAX, ∀ inputs [(op_i, ts_i) | i∈1..=n]: start from EventLog::default(), make the n append_at calls in order, and collect each Some(ev) into spilled. Then spilled ++ R(g) = [Event{seq: Seq(i), op: op_i, ts: ts_i} | i∈1..=n], so order is kept and no seq is lost or duplicated, and |spilled| = n.saturating_sub(MAX). This is NoSilentLoss for a host that tiers every returned event. Induction on n over append-at-contract.	conformance_temporal::append_at_spills_every_evicted_event_no_silent_loss	MEDIUM: induction over a call sequence, Vec/VecDeque content equality, enum payloads	1, 2, 5, 7
-ring-capacity-bound	invariant	EventLog::append_at	∀ g∈LogReach: g.ring.capacity() ≤ MAX+1, so the deque never doubles to 2·MAX when it first fills. As the code stands, this depends on a model of std VecDeque growth: amortized power-of-two growth from 0 reaches exactly MAX, and reserve_exact(1) at len = cap = MAX yields MAX+1. See §5.2 for a code change that makes it the code's own property.	src/lib.rs::event_log_ring_does_not_double_past_max	HARD as written: std VecDeque capacity semantics (reserve_exact, push_back growth policy), a generic std container. TRIVIAL after §5.2	1, 2, 11
+ring-capacity-bound	invariant	EventLog::append_at	∀ g∈LogReach: g.ring.len() ≤ MAX ∧ g.ring.capacity() ≤ MAX, so the deque never exceeds MAX elements or reallocates past MAX when it fills (append_at pops the oldest element before pushing when len ≥ MAX).	src/lib.rs::event_log_ring_does_not_double_past_max	EASY: pop_front before push_back keeps len ≤ MAX at every push	1, 2, 11
+op-event-slot-sizes	invariant	Op, Event	size_of::<Op>() = 16 ∧ size_of::<Event>() = 32, so a full ring of MAX_LOG_EVENTS (65,536) events occupies 2 MiB of slot storage.	src/lib.rs::op_and_event_keep_their_slot_sizes	TRIVIAL: const evaluation of std::mem::size_of on concrete reprs	1
 live-after-is-filter	equivalence	EventLog::{live_after,live}	∀ g satisfying log-window-invariant, ∀ after: Seq (0 and u64::MAX included): live_after(after) yields exactly live().filter(|e| e.seq > after), in the same order. Hence after < lo(g) ⇒ all of R(g), and after ≥ T(g) ⇒ nothing. The start index after+1−lo is clamped to [0, |R|] without overflow or panic.	src/lib.rs::live_after_seek_matches_the_filter_and_the_ends_are_the_extremes	EASY-MEDIUM: returns impl Iterator over VecDeque::range, usize::try_from, saturating arithmetic, min	1, 2, 3, 5
 log-forget	contract	EventLog::{forget,append_at,total,head,live}	∀ g∈LogReach: after g.forget(), live() is empty, T and head() are unchanged, and the next append_at(op, ts) returns (Seq(T(g)+1), None) and leaves R = [Event{seq, op, ts}]. So a forgotten log evicts nothing and never reissues a seq.	src/lib.rs::a_forgotten_log_keeps_no_event_and_counts_on_from_its_head	LOW: &mut self, VecDeque replacement	1, 2
 ts-monotone-newest-is-max	invariant	EventLog::{append_at,newest_live}	∀ g∈LogReach built by append_at calls whose ts arguments are nondecreasing: the ts values along R(g) are nondecreasing. Hence R(g) ≠ [] ⇒ newest_live().ts = max over live() of e.ts.	(secondary only: src/lib.rs::live_after_seek_matches_the_filter_and_the_ends_are_the_extremes)	MEDIUM: an invariant conditioned on the caller's history (a ghost last-ts), a quantified clause over ring contents	1, 2, 5
@@ -86,12 +86,12 @@ transact-occ	contract	Surface::transact	∀ s∈Reach, base: Seq, body: Vec<Edit
 refines-kernel-family-models	refinement	Surface::{apply,transact,poll,snapshot}, EventLog::append_at	Each real transition, projected onto a model's variables, is a step of the matching aterm_spec::derive model, with the model's constants set to the real ones (Cap = MAX, MaxSeq lifted): (seq, count) → kernel_model Emit, SeqIsCount; (seq, lo) → ring_model Push; the live set → evict_full_model EvictOldestContiguous; (seq, cursor) → cursor_model Grow/Deliver, CursorBounded; (seq, lo, cursor, lost) → subscribe_model, PollGap ⇔ lo > cursor+1; (seq, snapped, leaked) → snapshot_model SnapshotIsolated; (seq, tbase, active, lost) → transact_model, CommitClean ⇔ seq = tbase, else Abort. Follows from append-at-contract, log-window-invariant, apply-refines-line-model, snapshot-isolation, poll-contract and transact-occ. The model-side facts (the guards, and Buggy admitting the defect) belong to aterm-spec's Tier-0 checks.	conformance_kernel::real_surface_spine_conforms_to_kernel_model	MEDIUM once the code specs hold: model-to-code refinement over projections of heap state (ty_model! models bound to Rust data), cross-crate model citation	1, 2, 10, 12
 ```
 
-### Distribution by kind (15)
+### Distribution by kind (16)
 
 | kind | count | ids |
 |---|---|---|
 | contract | 8 | append-at-contract, log-forget, line-lower-bound, read-text-contract, snapshot-isolation, cow-sharing, poll-contract, transact-occ |
-| invariant | 3 | log-window-invariant, ring-capacity-bound, ts-monotone-newest-is-max |
+| invariant | 4 | log-window-invariant, ring-capacity-bound, op-event-slot-sizes, ts-monotone-newest-is-max |
 | refinement | 2 | apply-refines-line-model, refines-kernel-family-models |
 | equivalence | 1 | live-after-is-filter |
 | round-trip | 1 | no-silent-loss |
@@ -108,9 +108,9 @@ refines-kernel-family-models	refinement	Surface::{apply,transact,poll,snapshot},
 
 | gap | specs |
 |---|---|
-| 0 (seal) | 14 |
-| 1 (non-scalar carriers) | 14 |
-| 2 (`&self`/`&mut self` views) | 14 |
+| 0 (seal) | 16 |
+| 1 (non-scalar carriers) | 16 |
+| 2 (`&self`/`&mut self` views) | 15 |
 | 3 (E6 body widening) | 5 |
 | 4 (callee-ensures composition) | 7 |
 | 5 (quantified clauses) | 5 |
@@ -133,7 +133,9 @@ src/lib.rs	equal_line_edits_advance_the_log_without_detaching_the_line_spine	cow
 src/lib.rs	narrow_tail_line_operations_do_logarithmic_work	line-lower-bound	read-text-contract (§5.5)
 src/lib.rs	subscribe_pulls_new_events_then_drains	poll-contract	
 src/lib.rs	event_log_ring_does_not_double_past_max	ring-capacity-bound	(§5.2)
+src/lib.rs	op_and_event_keep_their_slot_sizes	op-event-slot-sizes	ring-capacity-bound
 src/lib.rs	live_after_seek_matches_the_filter_and_the_ends_are_the_extremes	live-after-is-filter	ts-monotone-newest-is-max
+src/lib.rs	a_forgotten_log_keeps_no_event_and_counts_on_from_its_head	log-forget	append-at-contract, live-after-is-filter
 src/lib.rs	transact_is_atomic_and_cc_guarded	transact-occ	read-text-contract
 tests/conformance_cursor.rs	real_subscription_cursor_conforms_to_cursor_model	poll-contract	refines-kernel-family-models
 tests/conformance_eventlog.rs	real_eventlog_conforms_to_ring_spec	log-window-invariant	refines-kernel-family-models
@@ -141,7 +143,6 @@ tests/conformance_eventlog.rs	real_eventlog_eviction_conforms_to_ring_spec	log-w
 tests/conformance_evict_full.rs	real_eventlog_live_set_is_contiguous_window	log-window-invariant	refines-kernel-family-models
 tests/conformance_kernel.rs	real_surface_spine_conforms_to_kernel_model	refines-kernel-family-models	apply-refines-line-model, log-window-invariant, transact-occ
 tests/conformance_kernel.rs	real_append_at_spine_conforms_to_kernel_model	append-at-contract	log-window-invariant, refines-kernel-family-models
-tests/conformance_kernel.rs	a_gapped_append_is_the_buggy_step_the_bind_rejects	NON-SPEC (model-side negative control)	
 tests/conformance_snapshot.rs	real_snapshot_isolated_from_later_writes	snapshot-isolation	refines-kernel-family-models (§5.3)
 tests/conformance_subscribe.rs	real_poll_not_behind_delivers_matching_model	poll-contract	refines-kernel-family-models (§5.4)
 tests/conformance_subscribe.rs	real_poll_behind_gaps_no_silent_loss	poll-contract	refines-kernel-family-models (§5.4)
@@ -154,8 +155,8 @@ tests/conformance_transact.rs	real_transact_conflict_aborts_no_lost_update	trans
 
 ## 3. Coverage
 
-- 26 tests read. 24 map to one of the 14 specs. 2 are not spec samples (§4).
-- The biggest collapses are `cow-sharing` (4 primary), `poll-contract` (4), `log-window-invariant` (4)
+- 25 live tests mapped across the 16 specs (0 non-spec tests remain in §4).
+- The biggest collapses are `poll-contract` (4 primary), `log-window-invariant` (4), `cow-sharing` (3)
   and `transact-occ` (3).
 - `read-text-contract` and `ts-monotone-newest-is-max` have no primary test. Each is sampled only
   as a side assertion of another spec's test. They are still needed as lemmas: `read-text-contract`
@@ -166,49 +167,40 @@ tests/conformance_transact.rs	real_transact_conflict_aborts_no_lost_update	trans
 
 ## 4. Tests that are not spec samples
 
-| test | why | recommendation |
-|---|---|---|
-| conformance_kernel::a_gapped_append_is_the_buggy_step_the_bind_rejects | A negative control of the conformance binding that asserts only facts about `aterm_spec`'s `kernel_model`: it rejects a gapped state, `Buggy=1` admits it, and `SeqIsCount` fails on it. The only aterm-buffer code it reaches is one `apply`. Once `apply-refines-line-model`/`refines-kernel-family-models` are Certified, the proof's own mutant (body or spec) is the negative control the plan requires. The model facts belong to aterm-spec's Tier-0 checks. | **delete** (now, if aterm-spec already checks those model facts; otherwise move them there first) |
-
-Counts by action, of the rows left: delete 1.
+Status 2026-10-28: 0 standalone non-spec tests remain; `conformance_kernel::a_gapped_append_is_the_buggy_step_the_bind_rejects` was folded into `real_append_at_spine_conforms_to_kernel_model` as its `kernel_model` negative control.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **The crate doc's invariant is stale.** `src/lib.rs` says "every apply yields exactly one new
-   `Seq`, and `seq == log.len()`". After eviction the ring length stays at `MAX` while `seq` keeps
-   counting. The invariant holds for `total()`, the logical length, not for the live ring. Reword
-   it as `seq == log.total()` (that is `apply-refines-line-model`'s SeqIsCount).
-2. **`ring-capacity-bound` rests on unspecified std behaviour.** The bound `capacity ≤ MAX+1`
-   holds only if VecDeque's amortized growth lands exactly on 65536, and if `reserve_exact(1)` does
-   not over-allocate. std documents `reserve_exact` only as "minimum", and its growth policy not at
-   all. As a spec, this needs a pinned model of std (gap 11 and a std model). Better: allocate
-   `VecDeque::with_capacity(MAX + 1)` up front and drop the `reserve_exact` branch at
-   `src/lib.rs:206`. The bound then follows from "len ≤ MAX+1 at every push", which is the code's
-   own property, and the test becomes a corollary of `log-window-invariant`.
-3. **`conformance_snapshot` checks a tautology.** It hard-codes `leaked = 0` and `snapped = 1` into
-   the "observed" state, then checks the model invariant `SnapshotIsolated` on that constant. Only
-   its text-equality asserts test the code. `snapshot-isolation` states what those asserts sample.
-4. **`conformance_subscribe` projects the test's cursor, not the code's.** Both tests track the
-   cursor in the test and hard-code `lost = 0`, so the model-guard comparison checks the test's
-   own projection. `conformance_cursor` reads the cursor back through `poll` and is the stronger
-   form. `poll-contract` states the returned `Cursor` explicitly.
-5. **The logarithmic-work test measures with test-only instrumentation, and loosely.**
-   `narrow_tail_line_operations_do_logarithmic_work` counts comparisons through a
-   `#[cfg(test)]` thread-local (`src/lib.rs:318`). Its bounds (≤ 128 comparisons for a read, ≤ 64
-   for a `SetLine` at 4096 lines) are far looser than the real `⌈log2(n+1)⌉`. The spec
-   `line-lower-bound` states the loop's decreases bound instead. Delete the instrumentation with
-   the test.
-6. **Three test files restate the cap.** `conformance_eventlog.rs`, `conformance_evict_full.rs`
-   and `conformance_subscribe.rs` each define `CAP = 1 << 16` instead of using
-   `aterm_buffer::MAX_LOG_EVENTS`, and only a comment ties the two. The specs use `MAX` directly,
-   so the drift goes away when the tests do.
+1. **(Fixed 2026-10-16.) The crate doc's invariant was stale.** `src/lib.rs` now states the
+   invariant in terms of `log.total()`, the logical length across eviction (`apply-refines-line-model`'s
+   `SeqIsCount`).
+2. **(Fixed 2026-10-28.) `EventLog::append_at` pushed before popping (`len = MAX + 1`) and relied
+   on `reserve_exact(1)`.** `append_at` now pops the oldest entry before pushing whenever
+   `ring.len() >= MAX_LOG_EVENTS`, so `ring.len()` never exceeds `MAX_LOG_EVENTS`, the 2 MiB
+   `65,536 -> 65,537` reallocation is eliminated, and `capacity ≤ MAX` holds directly.
+3. **(Fixed 2026-10-28.) `conformance_snapshot` checked a tautology.** `conformance_snapshot` now
+   projects `snapped` and `leaked` from `Snapshot::read_text` vs the captured text across `Write`,
+   `Snap` and post-snapshot `Write` transitions (`validate_transition_tiered`), with a `Buggy = 1`
+   negative control.
+4. **(Fixed 2026-10-28.) `conformance_subscribe` projected the test's cursor, not the code's.**
+   Both tests now read the before/after cursor positions back through `poll`, derive `lost` from the
+   returned `SubUpdate`, validate `PollDeliver`/`PollGap` transitions (`validate_transition_tiered`),
+   and include the `Buggy = 1` silent-loss negative control.
+5. **(Fixed 2026-10-28.) `narrow_tail_line_operations_do_logarithmic_work` now enforces the exact
+   `⌈log2(n+1)⌉` binary-search bound** (`(n + 1).next_power_of_two().ilog2()` per `line_lower_bound`
+   call, `2 * bound` for `read_text` and `bound` for `SetLine`) across `n ∈ {1, 2, 3, 7, 8, 15, 16,
+   1023, 1024, 4096}`. The `#[cfg(test)]` comparison counter retires with the test once
+   `line-lower-bound` is Certified.
+6. **(Fixed 2026-10-28.) Three test files restated the cap.** `conformance_eventlog.rs`,
+   `conformance_evict_full.rs` and `conformance_subscribe.rs` now import
+   `aterm_buffer::MAX_LOG_EVENTS` directly.
 7. **A "control" that is a positive sample.** `dropping_the_evicted_event_loses_seqs_control` is
    called a negative control, but it asserts only that, after `MAX + 1000` appends, the live window
    starts at seq 1001 and holds `MAX` events. That is `log-window-invariant`'s corollary
    `lo = T − MAX + 1`. The "loss" it illustrates is the host's, and `no-silent-loss` states the
    positive side of it: the returned `Some(ev)` is the only remaining copy.
-8. **The raw test count is 27, but there are 26 tests.** `tests/buffer_suite.rs` mentions
-   `#[test]` only in a doc comment. A grep-based census over-counts this crate by one.
+8. **The raw test count is 26, and there are 25 live tests.** `tests/buffer_suite.rs` mentions
+   `#[test]` only in a doc comment. A naive substring grep over-counts this crate by one.
 
 ## 6. The three specs I would prove first (easiest, high value)
 
@@ -234,7 +226,8 @@ once gaps 1 and 2 land.
    Committed gives `base + |body|`) is a callee-ensures composition (gap 4) over SeqIsCount. It
    retires 3 tests, including both transact conformance tests.
 
-Runner-up: **`ring-capacity-bound`**, after the §5.2 code change (`with_capacity(MAX + 1)`). It then
-becomes `len ≤ MAX+1`, a corollary of `log-window-invariant`, and needs no std growth model.
+Runner-up: **`ring-capacity-bound`**. With the §5.2 pop-before-push fix in `record`
+(`VecDeque::with_capacity(MAX_LOG_ENTRIES)` and `if len == MAX { pop_front }`), `len ≤ MAX` holds at
+every step as a corollary of `log-window-invariant` without depending on std growth policy.
 Defer **`cow-sharing`** (gap 8: `Arc`/`String` internals) and **`refines-kernel-family-models`**
 (gaps 10 and 12) to the end.

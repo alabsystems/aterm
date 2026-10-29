@@ -47,6 +47,7 @@ fn walled(kind: WallKind, message: &str) -> TurnEndReading {
         worked: Some(3 * MIN),
         rules: None,
         fact: None,
+        wake: None,
         pending_input: false,
         interrupted: false,
         restartable: true,

@@ -78,6 +78,14 @@ fn link_next_finds_the_next_relation() {
         link_next(r#"<https://a/x?page=2>; rel="prev next""#).as_deref(),
         Some("https://a/x?page=2")
     );
+    assert_eq!(
+        link_next(r#"<https://a/x?page=2>; title="a;b, \"c\""; rel=NEXT"#).as_deref(),
+        Some("https://a/x?page=2")
+    );
+    assert_eq!(
+        link_next(r#"garbage <https://a/x?page=2>; rel="next""#),
+        None
+    );
 }
 
 #[test]
@@ -202,6 +210,27 @@ fn next_link_refuses_everything_else() {
     );
     refused(
         format!("{b}/repos/fixture-dev/repo/releases?per_page=101&page=2"),
+        &repo,
+        None,
+        first,
+        1,
+    );
+    refused(
+        format!("{b}/repos/fixture-dev/repo/releases?per_page=0&page=2"),
+        &repo,
+        None,
+        first,
+        1,
+    );
+    refused(
+        format!("{b}/repos/fixture-dev/repo/releases?page=2&page=3"),
+        &repo,
+        None,
+        first,
+        1,
+    );
+    refused(
+        format!("{b}/repos/fixture-dev/repo/releases?per_page=50&per_page=100&page=2"),
         &repo,
         None,
         first,
@@ -589,8 +618,12 @@ fn a_named_per_page_over_100_is_usage() {
     let route = || RouteRequest::read(RouteTarget::Repo(common::slug(REPO)));
     for first in [
         releases().query("per_page", "500"),
+        releases().query("per_page", "0"),
         releases().query("per_page", "many"),
+        releases().query("per_page", "50").query("per_page", "50"),
         Call::get(format!("{path}?per_page=500"), route()),
+        Call::get(format!("{path}?per_page=0"), route()),
+        Call::get(format!("{path}?per_page=50&per_page=50"), route()),
     ] {
         let transport = Arc::new(ScriptedTransport::new());
         let gh = common::scripted(&transport, API);

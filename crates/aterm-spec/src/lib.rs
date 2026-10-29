@@ -20,6 +20,8 @@ pub use aterm_spec_macros::{liveness, model, ty_model};
 pub mod check;
 mod compiled;
 pub mod derive;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub mod fs_lane;
 pub mod host;
 pub mod interp;
 pub use aterm_spec_anchor::registry;

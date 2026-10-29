@@ -15,6 +15,12 @@ use crate::Damage;
 use crate::Row;
 use crate::{MAX_GRID_COLS, MAX_GRID_ROWS};
 
+/// The next grid's identity ([`Grid::instance`]): every grid built in this process gets its own.
+fn next_instance() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Grid {
     /// Create a new grid with the given dimensions.
     #[must_use]
@@ -64,12 +70,15 @@ impl Grid {
                 scrollback_clear_gen: 0,
                 history_renumber_epoch: 0,
                 history_reveal_gen: 0,
+                replay_carried_history: std::sync::atomic::AtomicUsize::new(0),
+                deep_history_pullback_ordinal: 0,
                 ring_extras: super::ring_extras::RingExtras::new(),
                 resize_undo: None,
                 handback: super::resize_handback::HandBack::default(),
                 resize_law: super::resize_handback::ResizeLaw::default(),
                 absolute_row_counter: u64::from(rows),
                 content_gen: 1,
+                instance: next_instance(),
                 reader_live_bottom_gen: 0,
                 wrap_serial: 0,
                 any_double_width: false,
@@ -118,7 +127,8 @@ impl Grid {
         let rows = rows.clamp(1, MAX_GRID_ROWS);
         let cols = cols.clamp(1, MAX_GRID_COLS);
         let scrollback: ScrollbackStorage = scrollback.into();
-        let carried = u64::try_from(scrollback.line_count()).unwrap_or(u64::MAX);
+        let scrollback_count = scrollback.line_count();
+        let carried = u64::try_from(scrollback_count).unwrap_or(u64::MAX);
 
         let bytes_per_row = (cols as usize) * std::mem::size_of::<Cell>();
         let initial_bytes = (rows as usize) * bytes_per_row;
@@ -155,12 +165,15 @@ impl Grid {
                 scrollback_clear_gen: 0,
                 history_renumber_epoch: 0,
                 history_reveal_gen: 0,
+                replay_carried_history: std::sync::atomic::AtomicUsize::new(scrollback_count),
+                deep_history_pullback_ordinal: 0,
                 ring_extras: super::ring_extras::RingExtras::new(),
                 resize_undo: None,
                 handback: super::resize_handback::HandBack::default(),
                 resize_law: super::resize_handback::ResizeLaw::default(),
                 absolute_row_counter: u64::from(rows).saturating_add(carried),
                 content_gen: 1,
+                instance: next_instance(),
                 reader_live_bottom_gen: 0,
                 wrap_serial: 0,
                 any_double_width: false,

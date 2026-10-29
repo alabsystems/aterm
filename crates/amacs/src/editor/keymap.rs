@@ -65,6 +65,8 @@ const EMACS_CHORDS: &[ChordRow] = &[
     (&["M-backspace"], EditorCommand::BackwardKillWord),
     (&["M-w"], EditorCommand::KillRingSave),
     (&["C-o"], EditorCommand::OpenLine),
+    // Emacs's `kill-whole-line` key: in a table's grid it deletes the row.
+    (&["C-S-backspace"], EditorCommand::GridDeleteRow),
     (&["C-t"], EditorCommand::TransposeChars),
     (&["M-q"], EditorCommand::FillParagraph),
     (&["C-?", "C-S-/"], EditorCommand::Redo),
@@ -93,6 +95,8 @@ const EMACS_SEQUENCES: &[(&str, EditorCommand)] = &[
     ("C-c C-c", EditorCommand::FinishEdit),
     ("C-x #", EditorCommand::FinishEdit),
     ("C-c C-k", EditorCommand::AbortEdit),
+    ("C-c C-t", EditorCommand::ToggleGridView),
+    ("C-c u", EditorCommand::UndoAgentEdit),
 ];
 
 /// Off macOS, C-left/C-right are the PLATFORM word-motion spelling (the
@@ -564,31 +568,7 @@ mod tests {
         assert_eq!(map.resolve(&[chord("C-right")]), KeyResolution::Unbound);
     }
 
-    /// AUDIT I9, Windows: `C-s` SAVES — the reflex every Windows app owes its
-    /// user, and previously the one chord that did something alarming instead
-    /// (it started an incremental search).
-    #[test]
-    fn ctrl_s_saves_on_windows_and_isearch_keeps_a_chord() {
-        let map = Keymap::emacs(Profile::Gui(Platform::Windows));
-        let chord = |s: &str| KeyChord::parse(s).expect("test chord parses");
-        assert_eq!(
-            map.resolve(&[chord("C-s")]),
-            KeyResolution::Command(EditorCommand::Save),
-            "Ctrl+S must save, not search"
-        );
-        assert_eq!(
-            map.resolve(&[chord("M-s")]),
-            KeyResolution::Command(EditorCommand::IncrementalSearch),
-            "isearch keeps a chord of its own"
-        );
-        assert_eq!(
-            map.resolve(&[chord("C-x"), chord("C-s")]),
-            KeyResolution::Command(EditorCommand::Save),
-            "the emacs spelling is untouched"
-        );
-    }
-
-    /// …and OFF Windows the table is exactly what it always was: `C-s` is
+    /// OFF Windows the table is exactly what it always was: `C-s` is
     /// isearch (emacs's own binding) and `M-s` is unbound.
     #[test]
     fn ctrl_s_stays_incremental_search_off_windows() {

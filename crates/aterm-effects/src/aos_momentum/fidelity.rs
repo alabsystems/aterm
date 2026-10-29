@@ -136,7 +136,7 @@ impl LaneFidelity {
         let mut g = MomentumGlow::default();
         let (mut out, mut under) = (Vec::with_capacity(64), Vec::with_capacity(64));
         let (mut probe_out, mut probe_under) = (Vec::with_capacity(64), Vec::with_capacity(64));
-        let (mut drawn, mut probed) = (Enc::with_capacity(512), Enc::with_capacity(512));
+        let mut drawn = Enc::with_capacity(512);
         let mut n = 0usize;
         let mut next_input = 0usize;
         let mut last_inert = true;
@@ -269,9 +269,7 @@ impl LaneFidelity {
                     &mut probe_out,
                     &mut probe_under,
                 );
-                probed.clear();
-                encode_glass(&mut probed, &probe, &probe_out, &probe_under);
-                if probed.as_bytes() != drawn.as_bytes() {
+                if probe != frame || probe_out != out || probe_under != under {
                     return fail(
                         cursor,
                         NO_STEP_SLEPT,

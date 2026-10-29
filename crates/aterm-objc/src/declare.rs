@@ -94,6 +94,83 @@ impl ClassMeta {
     pub const fn ivar_offset(&self) -> isize {
         self.ivar_offset
     }
+
+    /// Whether `obj` is a non-null instance of [`Self::class`] or a subclass (including dynamic
+    /// KVO subclasses), walking the runtime `isa`/`superclass` chain without sending a message.
+    ///
+    /// # Safety
+    /// `obj` must be a live Objective-C object pointer, or null.
+    #[must_use]
+    pub unsafe fn is_instance(&self, obj: Id) -> bool {
+        let target = self.class();
+        // SAFETY: `obj` is live or null (`class_of` answers null for null), and every class along
+        // `superclass_of` is an immortal registered class object until the root's null superclass.
+        let mut cur = unsafe { crate::runtime::class_of(obj) };
+        while !cur.is_null() {
+            if cur == target {
+                return true;
+            }
+            // SAFETY: `cur` is non-null and came from `class_of`/`superclass_of`.
+            cur = unsafe { superclass_of(cur) };
+        }
+        false
+    }
+
+    /// Assert that `obj` is a live instance of [`Self::class`] or a subclass.
+    ///
+    /// # Safety
+    /// `obj` must be a live Objective-C object pointer, or null.
+    ///
+    /// # Panics
+    /// Panics if `obj` is null or its runtime class chain does not contain [`Self::class`].
+    pub unsafe fn assert_instance(&self, obj: Id) {
+        // SAFETY: forwarded from caller.
+        if unsafe { self.is_instance(obj) } {
+            return;
+        }
+        // SAFETY: `obj` is live or null; `self.class()` is a registered class.
+        let (found, expected) = unsafe {
+            (
+                crate::runtime::class_name(crate::runtime::class_of(obj)),
+                crate::runtime::class_name(self.class()),
+            )
+        };
+        panic!(
+            "aterm-objc: expected an instance of {:?}, got {:?}",
+            expected, found
+        );
+    }
+
+    /// Release `obj` (+1) and panic when an initializer substituted an instance outside
+    /// [`Self::class`], or return `obj` unchanged when it is null or a valid instance.
+    ///
+    /// # Safety
+    /// `obj` must be a +1 reference to a live Objective-C object, or null.
+    ///
+    /// # Panics
+    /// Panics (after releasing `obj`) if `obj` is non-null and not an instance of [`Self::class`].
+    #[must_use]
+    pub unsafe fn guard_init(&self, obj: Id) -> Id {
+        // SAFETY: `obj` is live or null.
+        if obj.is_null() || unsafe { self.is_instance(obj) } {
+            return obj;
+        }
+        // SAFETY: `obj` is live at +1, so `class_of` reads its live `isa`, and `class_name`
+        // borrows immortal class storage that outlives releasing `obj` below.
+        let (found, expected) = unsafe {
+            (
+                crate::runtime::class_name(crate::runtime::class_of(obj)),
+                crate::runtime::class_name(self.class()),
+            )
+        };
+        // SAFETY: `obj` is a non-null +1 reference owned by this call; releasing it before
+        // panicking balances the initializer's +1 return.
+        drop(unsafe { crate::Obj::from_owned(obj) });
+        panic!(
+            "aterm-objc: initializer for {:?} substituted an instance of {:?}",
+            expected, found
+        );
+    }
 }
 
 /// The per-instance ivar payload: an initialised flag plus the Rust value.

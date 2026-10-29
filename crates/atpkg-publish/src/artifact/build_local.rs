@@ -275,10 +275,16 @@ fn executable_of(stream: &[u8], bin: &str) -> Option<PathBuf> {
         .filter_map(|l| aterm_json::from_str::<aterm_json::Value>(l).ok())
         .filter(|v| {
             v.get("reason").and_then(aterm_json::Value::as_str) == Some("compiler-artifact")
-                && v.get("target")
-                    .and_then(|t| t.get("name"))
-                    .and_then(aterm_json::Value::as_str)
-                    == Some(bin)
+                && v.get("profile")
+                    .and_then(|p| p.get("test"))
+                    .and_then(aterm_json::Value::as_bool)
+                    != Some(true)
+                && v.get("target").is_some_and(|t| {
+                    t.get("name").and_then(aterm_json::Value::as_str) == Some(bin)
+                        && t.get("kind")
+                            .and_then(aterm_json::Value::as_array)
+                            .is_none_or(|ks| ks.iter().any(|k| k.as_str() == Some("bin")))
+                })
         })
         .filter_map(|v| {
             v.get("executable")

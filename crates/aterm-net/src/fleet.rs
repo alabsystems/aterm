@@ -28,7 +28,22 @@ pub const ALPN: &[u8] = b"atf/1";
 /// Preferred ALPN protocol (`atf/2`) where both ends exchange Ed25519 node proofs.
 pub const ALPN_NODES: &[u8] = b"atf/2";
 
+/// Database repair with signed membership records before application access.
+/// The fleet/node proofs are unchanged; both ends must select this protocol
+/// before using its repair order. Ordinary fleet connections do not offer it.
+pub const ALPN_DATABASE_REPAIR: &[u8] = b"atdb/2";
+
 const PROTOCOLS: [&[u8]; 2] = [ALPN_NODES, ALPN];
+
+/// ALPN protocol (`atf-ask/1`) of a Mac asking to join ALab (`docs/DESIGN-fluid-swarm-2026-10-28.md`
+/// F10): the one path a caller without the fleet secret reaches. It is not in [`PROTOCOLS`], so no
+/// fleet dialer offers it, and only a listener given an ask handler ([`serve_offering_with_ask`])
+/// negotiates it. No fleet op is ever dispatched on it: the stream goes to the ask handler alone.
+pub const ALPN_ASK: &[u8] = b"atf-ask/1";
+
+/// The protocols a listener that serves ask offers: the fleet's first, so a fleet dialer, which
+/// never offers [`ALPN_ASK`], negotiates exactly what it did before.
+const PROTOCOLS_ASKED: [&[u8]; 3] = [ALPN_NODES, ALPN, ALPN_ASK];
 
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-aterm-fleet-v1";
 
@@ -47,7 +62,8 @@ const TAG_LEN: usize = 32;
 
 const MAX_NODE_LINE: usize = 256;
 
-const SIG_LEN: usize = 64;
+/// An Ed25519 signature's byte length.
+pub const SIG_LEN: usize = 64;
 
 /// Visibility scope proved and served by a fleet listener (`[fleet] allow`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +115,12 @@ pub enum FleetOp {
     Drive,
     /// Replicate a separate application database; never grants terminal survey or drive.
     Database,
+    /// Push a member's C16 `survey facts` snapshot on the 3-minute heartbeat to the fleet issuer.
+    Facts,
+    /// Ask a steward for the newest sign-in code or link for a warm or leased email (`mail-code <email>`).
+    MailCode,
+    /// Read the cached swarm census computed every 5 minutes on the fleet issuer (`aterm fleet census`).
+    Census,
 }
 
 impl FleetOp {
@@ -112,6 +134,9 @@ impl FleetOp {
             Self::Join => "join",
             Self::Drive => "drive",
             Self::Database => "database",
+            Self::Facts => "facts",
+            Self::MailCode => "mail-code",
+            Self::Census => "census",
         }
     }
 
@@ -125,6 +150,9 @@ impl FleetOp {
             Self::Join,
             Self::Drive,
             Self::Database,
+            Self::Facts,
+            Self::MailCode,
+            Self::Census,
         ]
         .into_iter()
         .find(|op| op.word() == word)
@@ -245,12 +273,21 @@ impl fmt::Display for SecretLength {
 impl std::error::Error for SecretLength {}
 
 /// A node's 32-byte Ed25519 public key.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeKey([u8; NodeKey::LEN]);
 
 impl NodeKey {
     /// Public key byte length.
     pub const LEN: usize = 32;
+
+    /// The key whose raw bytes are `bytes`, as a membership log binds it
+    /// (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.2). Nothing checks that they are a point of
+    /// the curve: a key that is none verifies no signature.
+    #[inline]
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; Self::LEN]) -> Self {
+        Self(bytes)
+    }
 
     /// Raw 32-byte public key.
     #[inline]
@@ -407,6 +444,40 @@ impl NodeIdentity {
         sig.copy_from_slice(signed.as_ref());
         sig
     }
+
+    /// This node's signature of `body` as a record of `domain` ([`record_message`]): a book entry
+    /// it vouches for, or the proof a membership log's `Node` record carries that this node key
+    /// is the member's. No channel proof is such a message, so none can stand for another.
+    #[must_use]
+    pub fn sign_record(&self, domain: &str, body: &[u8]) -> [u8; SIG_LEN] {
+        let signed = self.pair.sign(&record_message(domain, body));
+        let mut sig = [0u8; SIG_LEN];
+        sig.copy_from_slice(signed.as_ref());
+        sig
+    }
+}
+
+/// What starts every record a node key signs ([`NodeIdentity::sign_record`]). A channel proof
+/// starts `aterm-fleet/v2 node`, so the two never meet.
+pub const RECORD_LABEL: &[u8] = b"aterm-fleet/v3 record ";
+
+/// The bytes a node key signs for a record of `domain`: [`RECORD_LABEL`], `domain`, a NUL, then
+/// `body`.
+#[must_use]
+pub fn record_message(domain: &str, body: &[u8]) -> Vec<u8> {
+    let mut message = RECORD_LABEL.to_vec();
+    message.extend_from_slice(domain.as_bytes());
+    message.push(0);
+    message.extend_from_slice(body);
+    message
+}
+
+/// Whether `sig` is `key`'s signature of `body` as a record of `domain` ([`record_message`]).
+#[must_use]
+pub fn verifies_record(key: &NodeKey, domain: &str, body: &[u8], sig: &[u8; SIG_LEN]) -> bool {
+    UnparsedPublicKey::new(&ED25519, key.bytes())
+        .verify(&record_message(domain, body), sig)
+        .is_ok()
 }
 
 impl fmt::Debug for NodeIdentity {
@@ -514,6 +585,8 @@ pub enum FleetError {
     Refused,
     /// Source address already holds its share of proved connections (`NO capacity`).
     AddressBusy,
+    /// Peer's node id is on the swarm roster's deny-list (`NO denied`).
+    DeniedNode,
     /// Peer presented a proof signed with this end's own role key.
     Reflection,
     /// Listener does not serve the requested operation (`NO op`).
@@ -555,6 +628,7 @@ impl FleetError {
             Self::DialerHungUp => Self::DialerHungUp,
             Self::Refused => Self::Refused,
             Self::AddressBusy => Self::AddressBusy,
+            Self::DeniedNode => Self::DeniedNode,
             Self::Reflection => Self::Reflection,
             Self::UnknownOp(op) => Self::UnknownOp(op.clone()),
             Self::UnknownScope(scope) => Self::UnknownScope(scope.clone()),
@@ -596,6 +670,10 @@ impl fmt::Display for FleetError {
                 "the listener already serves as many proved connections from this address as it \
                  serves one address at once; try again when one ends",
             ),
+            Self::DeniedNode => f.write_str(
+                "the listener refused this machine's node (deny-listed, or out of its \
+                     membership log)",
+            ),
             Self::Reflection => f.write_str("the peer sent back a proof of this end's own role"),
             Self::UnknownOp(op) => write!(f, "the listener does not serve fleet op `{op}`"),
             Self::UnknownScope(scope) => write!(
@@ -634,19 +712,29 @@ pub fn server_config() -> Arc<ServerConfig> {
     #[cfg(all(test, unix))]
     test_socket_headroom();
     static CONFIG: OnceLock<Arc<ServerConfig>> = OnceLock::new();
-    Arc::clone(CONFIG.get_or_init(|| {
-        tls::init_crypto();
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(KEY_DER));
-        let mut cfg = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .with_no_client_auth()
-            .with_single_cert(vec![CertificateDer::from(CERT_DER)], key)
-            .expect("the embedded fleet certificate and key are one Ed25519 pair");
-        cfg.alpn_protocols = PROTOCOLS.iter().map(|alpn| alpn.to_vec()).collect();
-        cfg.send_tls13_tickets = 0;
-        cfg.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
-        cfg.max_early_data_size = 0;
-        Arc::new(cfg)
-    }))
+    Arc::clone(CONFIG.get_or_init(|| listener_config(&PROTOCOLS)))
+}
+
+/// [`server_config`] that also offers [`ALPN_ASK`], for a listener with an ask handler.
+fn server_config_asked() -> Arc<ServerConfig> {
+    #[cfg(all(test, unix))]
+    test_socket_headroom();
+    static CONFIG: OnceLock<Arc<ServerConfig>> = OnceLock::new();
+    Arc::clone(CONFIG.get_or_init(|| listener_config(&PROTOCOLS_ASKED)))
+}
+
+fn listener_config(protocols: &[&[u8]]) -> Arc<ServerConfig> {
+    tls::init_crypto();
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(KEY_DER));
+    let mut cfg = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_no_client_auth()
+        .with_single_cert(vec![CertificateDer::from(CERT_DER)], key)
+        .expect("the embedded fleet certificate and key are one Ed25519 pair");
+    cfg.alpn_protocols = protocols.iter().map(|alpn| alpn.to_vec()).collect();
+    cfg.send_tls13_tickets = 0;
+    cfg.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    cfg.max_early_data_size = 0;
+    Arc::new(cfg)
 }
 
 /// Parallel loopback fixtures deliberately hold hundreds of cloned sockets.
@@ -689,17 +777,52 @@ pub fn client_config() -> Arc<ClientConfig> {
     #[cfg(all(test, unix))]
     test_socket_headroom();
     static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
-    Arc::clone(CONFIG.get_or_init(|| {
-        tls::init_crypto();
-        let verifier = PinnedServerVerifier::new(tls::cert_fingerprint(CERT_DER));
-        let mut cfg = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(verifier))
-            .with_no_client_auth();
-        cfg.alpn_protocols = PROTOCOLS.iter().map(|alpn| alpn.to_vec()).collect();
-        cfg.resumption = rustls::client::Resumption::disabled();
-        cfg.enable_early_data = false;
-        Arc::new(cfg)
+    Arc::clone(CONFIG.get_or_init(|| dialer_config(&PROTOCOLS)))
+}
+
+/// The dialer [`ClientConfig`] of a Mac asking to join: it offers [`ALPN_ASK`] alone, so it never
+/// negotiates a fleet protocol, and it holds no fleet secret to prove one with.
+fn ask_client_config() -> Arc<ClientConfig> {
+    #[cfg(all(test, unix))]
+    test_socket_headroom();
+    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    Arc::clone(CONFIG.get_or_init(|| dialer_config(&[ALPN_ASK])))
+}
+
+fn dialer_config(protocols: &[&[u8]]) -> Arc<ClientConfig> {
+    tls::init_crypto();
+    let verifier = PinnedServerVerifier::new(tls::cert_fingerprint(CERT_DER));
+    let mut cfg = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
+    cfg.alpn_protocols = protocols.iter().map(|alpn| alpn.to_vec()).collect();
+    cfg.resumption = rustls::client::Resumption::disabled();
+    cfg.enable_early_data = false;
+    Arc::new(cfg)
+}
+
+fn database_server_config() -> Arc<ServerConfig> {
+    let base = server_config();
+    static DATABASE_SERVER_TLS: OnceLock<Arc<ServerConfig>> = OnceLock::new();
+    Arc::clone(DATABASE_SERVER_TLS.get_or_init(|| {
+        let mut config = (*base).clone();
+        config
+            .alpn_protocols
+            .insert(0, ALPN_DATABASE_REPAIR.to_vec());
+        Arc::new(config)
+    }))
+}
+
+fn database_client_config() -> Arc<ClientConfig> {
+    let base = client_config();
+    static DATABASE_CLIENT_TLS: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    Arc::clone(DATABASE_CLIENT_TLS.get_or_init(|| {
+        let mut config = (*base).clone();
+        config
+            .alpn_protocols
+            .insert(0, ALPN_DATABASE_REPAIR.to_vec());
+        Arc::new(config)
     }))
 }
 
@@ -723,8 +846,65 @@ pub struct Accepted {
     pub transport: TlsTransport<ServerConnection>,
     /// Operation proved by the dialer.
     pub op: FleetOp,
-    /// Node proof presented by the dialer under [`ALPN_NODES`], if any.
+    /// Node proof presented by the dialer under a node-proof protocol, if any.
     pub peer: Option<NodeProof>,
+}
+
+/// Whether `node` matches any entry in `denied_nodes` (ASCII case-insensitive, trimmed).
+#[must_use]
+pub fn is_denied_node(node: &str, denied_nodes: &[String]) -> bool {
+    let node = node.trim();
+    !node.is_empty()
+        && denied_nodes
+            .iter()
+            .any(|denied| denied.trim().eq_ignore_ascii_case(node))
+}
+
+/// Whether `key`'s 64-hex Ed25519 encoding matches any entry in `denied_nodes`.
+#[must_use]
+pub fn is_denied_key(key: &NodeKey, denied_nodes: &[String]) -> bool {
+    is_denied_node(&key.hex(), denied_nodes)
+}
+
+/// Whom a listener refuses before any op (`NO denied`): node ids on the swarm roster's deny-list,
+/// and the node keys this Mac's membership log took out (`docs/DESIGN-fluid-swarm-2026-10-28.md`
+/// §3.3.7, F17: "the node key in the removed Mac's `Admit` is refused by every listener at once").
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Denied {
+    /// Node ids, as [`is_denied_node`] matches them.
+    pub nodes: Vec<String>,
+    /// Node keys.
+    pub keys: Vec<NodeKey>,
+}
+
+impl Denied {
+    /// The roster's node ids alone.
+    #[must_use]
+    pub fn nodes(nodes: &[String]) -> Self {
+        Self {
+            nodes: nodes.to_vec(),
+            keys: Vec::new(),
+        }
+    }
+
+    /// Whether it refuses no one.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty() && self.keys.is_empty()
+    }
+
+    /// Whether it refuses a dialer that proved `peer`: while it names anyone, both a named node
+    /// id or key and an unproved peer (`None`) are refused, so a removed machine cannot pass by
+    /// stripping its node key.
+    #[must_use]
+    pub fn refuses(&self, peer: Option<&NodeProof>) -> bool {
+        !self.is_empty()
+            && peer.is_none_or(|proof| {
+                is_denied_node(&proof.node, &self.nodes)
+                    || is_denied_key(&proof.key, &self.nodes)
+                    || self.keys.contains(&proof.key)
+            })
+    }
 }
 
 /// Complete the listener TLS and fleet handshake on `tcp` within `within`, proving `scope` and
@@ -740,10 +920,63 @@ pub fn server_handshake_as(
     serves: &[FleetOp],
     within: Duration,
 ) -> Result<Accepted, FleetError> {
-    let watchdog = arm(&tcp, within)?;
-    server_handshake_armed(tcp, watchdog, within, (secret, me), scope, serves, |_| true)
+    server_handshake_with_denied(tcp, secret, me, scope, serves, &Denied::default(), within)
 }
 
+/// [`server_handshake_as`], refusing any dialer `denied` refuses ([`Denied::refuses`]) with
+/// [`FleetError::DeniedNode`] (`NO denied`).
+/// # Errors
+/// As [`server_handshake_as`], plus [`FleetError::DeniedNode`].
+pub fn server_handshake_with_denied(
+    tcp: TcpStream,
+    secret: &FleetSecret,
+    me: Option<&NodeIdentity>,
+    scope: FleetScope,
+    serves: &[FleetOp],
+    denied: &Denied,
+    within: Duration,
+) -> Result<Accepted, FleetError> {
+    let watchdog = arm(&tcp, within)?;
+    server_handshake_armed(
+        tcp,
+        watchdog,
+        within,
+        (secret, me),
+        scope,
+        serves,
+        denied,
+        |_| true,
+        server_config(),
+    )
+}
+
+/// Authenticate a database-only listener, preferring [`ALPN_DATABASE_REPAIR`]
+/// and retaining the existing fleet protocols for older dialers. This serves
+/// only [`FleetOp::Database`], with no terminal survey or drive capability.
+///
+/// # Errors
+/// As [`server_handshake_as`].
+pub fn server_handshake_database_as(
+    tcp: TcpStream,
+    secret: &FleetSecret,
+    me: Option<&NodeIdentity>,
+    within: Duration,
+) -> Result<Accepted, FleetError> {
+    let watchdog = arm(&tcp, within)?;
+    server_handshake_armed(
+        tcp,
+        watchdog,
+        within,
+        (secret, me),
+        FleetScope::Facts,
+        &[FleetOp::Database],
+        &Denied::default(),
+        |_| true,
+        database_server_config(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn server_handshake_armed(
     tcp: TcpStream,
     watchdog: HandshakeWatchdog,
@@ -751,28 +984,103 @@ fn server_handshake_armed(
     (secret, me): (&FleetSecret, Option<&NodeIdentity>),
     scope: FleetScope,
     serves: &[FleetOp],
+    denied: &Denied,
     admit: impl FnOnce(FleetOp) -> bool,
+    config: Arc<ServerConfig>,
 ) -> Result<Accepted, FleetError> {
-    let (mut transport, (op, peer)) = bounded(tcp, watchdog, within, |tcp| {
-        let (mut transport, nodes) = accept_tls(tcp, server_config())?;
-        let exporter = transport.exporter().to_vec();
+    match server_handshake_or_ask(
+        tcp,
+        watchdog,
+        within,
+        (secret, me),
+        (scope, serves, denied),
+        admit,
+        config,
+        None,
+    )? {
+        Handshook::Proved(accepted) => Ok(*accepted),
+        Handshook::Asked => Err(FleetError::Alpn),
+    }
+}
+
+/// What an accepted connection became: a dialer that proved the fleet secret, or a caller with
+/// none whose [`ALPN_ASK`] stream the ask handler served to its end.
+enum Handshook {
+    Proved(Box<Accepted>),
+    Asked,
+}
+
+/// The listener's ask handler: it gets the [`ALPN_ASK`] stream of a caller that proved nothing,
+/// and the address it dialled from.
+pub type AskHandler = Arc<dyn Fn(&mut dyn Duplex, SocketAddr) -> io::Result<()> + Send + Sync>;
+
+/// A byte stream both ways: what an ask handler reads its caller's requests from and answers on.
+pub trait Duplex: Read + Write {}
+
+impl<T: Read + Write + ?Sized> Duplex for T {}
+
+/// [`server_handshake_armed`], serving an [`ALPN_ASK`] caller with `ask` when it is given: such a
+/// caller is never asked for a proof, never reaches `admit`, and never gets a fleet op. Its whole
+/// exchange runs inside the handshake's watchdog, so it holds its slot no longer than a fleet
+/// handshake may, and a listener given no ask handler does not offer the protocol at all.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "handshake binds transport, watchdog, deadline, credentials, scope, admission, TLS config and optional ask handler"
+)]
+fn server_handshake_or_ask(
+    tcp: TcpStream,
+    watchdog: HandshakeWatchdog,
+    within: Duration,
+    (secret, me): (&FleetSecret, Option<&NodeIdentity>),
+    (scope, serves, denied): (FleetScope, &[FleetOp], &Denied),
+    admit: impl FnOnce(FleetOp) -> bool,
+    config: Arc<ServerConfig>,
+    ask: Option<(&AskHandler, SocketAddr)>,
+) -> Result<Handshook, FleetError> {
+    let (mut transport, proved) = bounded(tcp, watchdog, within, |tcp| {
+        let (mut conn, exporter, spoken) = accept_tls_on(tcp, config)?;
+        let nodes = match spoken {
+            Spoken::Fleet { nodes } => nodes,
+            Spoken::Ask => {
+                let Some((ask, peer)) = ask else {
+                    return Err(FleetError::Alpn);
+                };
+                let mut stream = rustls::Stream::new(&mut conn, tcp);
+                ask(&mut stream, peer).map_err(FleetError::Io)?;
+                stream.flush().map_err(FleetError::Io)?;
+                return Ok((conn, exporter, None));
+            }
+        };
         let me = me.filter(|_| nodes);
         let proved = listener_proves(
-            transport.stream(),
+            &mut rustls::Stream::new(&mut conn, tcp),
             &exporter,
             (secret, me, nodes),
             scope,
             serves,
+            denied,
             admit,
         )?;
-        Ok((transport, proved))
+        Ok((conn, exporter, Some(proved)))
     })?;
+    let Some((op, peer)) = proved else {
+        end_asked(transport);
+        return Ok(Handshook::Asked);
+    };
     release_deadlines(transport.stream().get_ref())?;
-    Ok(Accepted {
+    Ok(Handshook::Proved(Box::new(Accepted {
         transport,
         op,
         peer,
-    })
+    })))
+}
+
+/// Close an answered ask connection: a TLS close, then the socket, waiting for neither.
+fn end_asked(mut transport: TlsTransport<ServerConnection>) {
+    let stream = transport.stream();
+    stream.conn.send_close_notify();
+    let _ = stream.conn.complete_io(&mut stream.sock);
+    let _ = stream.sock.shutdown(std::net::Shutdown::Both);
 }
 
 /// Dialer handshake without local node identity (delegates to [`client_handshake_as`]).
@@ -797,7 +1105,7 @@ pub struct Dialed {
     pub transport: TlsTransport<ClientConnection>,
     /// Scope proved by the listener.
     pub scope: FleetScope,
-    /// Node proof presented by the listener under [`ALPN_NODES`], if any.
+    /// Node proof presented by the listener under a node-proof protocol, if any.
     pub peer: Option<NodeProof>,
 }
 
@@ -814,6 +1122,29 @@ pub fn client_handshake_as(
     within: Duration,
 ) -> Result<Dialed, FleetError> {
     client_handshake_by(tcp, secret, me, op, within).map_err(|undialed| undialed.error)
+}
+
+/// Authenticate a database dialer, preferring [`ALPN_DATABASE_REPAIR`] and
+/// negotiating an existing fleet protocol with an older listener. TLS pins,
+/// secret proofs and exporter-bound node proofs are unchanged.
+///
+/// # Errors
+/// As [`client_handshake_as`].
+pub fn client_handshake_database_as(
+    tcp: TcpStream,
+    secret: &FleetSecret,
+    me: Option<&NodeIdentity>,
+    within: Duration,
+) -> Result<Dialed, FleetError> {
+    client_handshake_by_on(
+        tcp,
+        secret,
+        me,
+        FleetOp::Database,
+        within,
+        database_client_config(),
+    )
+    .map_err(|undialed| undialed.error)
 }
 
 /// A dialer's handshake that did not complete ([`client_handshake_by`]).
@@ -836,25 +1167,42 @@ pub fn client_handshake_by(
     op: FleetOp,
     within: Duration,
 ) -> Result<Dialed, Undialed> {
+    client_handshake_by_on(tcp, secret, me, op, within, client_config())
+}
+
+fn client_handshake_by_on(
+    tcp: TcpStream,
+    secret: &FleetSecret,
+    me: Option<&NodeIdentity>,
+    op: FleetOp,
+    within: Duration,
+    config: Arc<ClientConfig>,
+) -> Result<Dialed, Undialed> {
     let mut refused_by = None;
     let undialed = |error: FleetError, refused_by: Option<NodeProof>| Undialed {
-        refused_by: refused_by
-            .filter(|_| matches!(error, FleetError::UnknownOp(_) | FleetError::AddressBusy)),
+        refused_by: refused_by.filter(|_| {
+            matches!(
+                error,
+                FleetError::UnknownOp(_) | FleetError::AddressBusy | FleetError::DeniedNode
+            )
+        }),
         error,
     };
     let watchdog = arm(&tcp, within).map_err(|e| undialed(e, None))?;
     let (mut transport, (scope, peer)) = bounded(tcp, watchdog, within, |tcp| {
-        let (mut transport, nodes) = connect_tls(tcp, client_config())?;
-        let exporter = transport.exporter().to_vec();
+        let (mut conn, exporter, spoken) = connect_tls_on(tcp, config)?;
+        let Spoken::Fleet { nodes } = spoken else {
+            return Err(FleetError::Alpn);
+        };
         let me = me.filter(|_| nodes);
         let proved = dialer_proves(
-            transport.stream(),
+            &mut rustls::Stream::new(&mut conn, tcp),
             &exporter,
             (secret, me, nodes),
             op,
             &mut refused_by,
         )?;
-        Ok((transport, proved))
+        Ok((conn, exporter, proved))
     })
     .map_err(|e| undialed(e, refused_by.take()))?;
     release_deadlines(transport.stream().get_ref()).map_err(|e| undialed(e, None))?;
@@ -863,6 +1211,28 @@ pub fn client_handshake_by(
         scope,
         peer,
     })
+}
+
+/// Open an [`ALPN_ASK`] connection on `tcp` within `within`: TLS alone, pinned to [`CERT_DER`],
+/// with no fleet secret and no proof, so the listener hands it to its ask handler and nothing else.
+/// The socket's deadlines are cleared; the caller bounds each exchange.
+/// # Errors
+/// [`FleetError::Alpn`] when the listener serves no ask (a listener without an ask handler, or one
+/// older than this build), or a TLS, I/O or deadline failure.
+pub fn ask_handshake(
+    tcp: TcpStream,
+    within: Duration,
+) -> Result<TlsTransport<ClientConnection>, FleetError> {
+    let watchdog = arm(&tcp, within)?;
+    let (transport, ()) = bounded(tcp, watchdog, within, |tcp| {
+        let (conn, exporter, spoken) = connect_tls_on(tcp, ask_client_config())?;
+        if spoken != Spoken::Ask {
+            return Err(FleetError::Alpn);
+        }
+        Ok((conn, exporter, ()))
+    })?;
+    release_deadlines(transport.tcp())?;
+    Ok(transport)
 }
 
 /// Wall-clock deadline (3 s) for TLS and both proofs on an accepted fleet connection.
@@ -1137,20 +1507,19 @@ struct Admission {
 }
 impl Admission {
     fn inspect(
-        tcp: TcpStream,
+        tcp: &TcpStream,
         locality: Locality,
         #[cfg(unix)] witness: Option<crate::lan::ListenerWitness>,
-    ) -> io::Result<(TcpStream, Self)> {
+    ) -> io::Result<Self> {
         match locality {
-            Locality::Fleet => Ok((tcp, Self::default())),
+            Locality::Fleet => {
+                let _ = tcp;
+                Ok(Self::default())
+            }
             #[cfg(unix)]
             Locality::Link(scope) => {
-                let connection = match witness {
-                    Some(witness) => crate::lan::Connection::admitted_by(tcp, scope, witness)?,
-                    None => crate::lan::Connection::admit(tcp, scope)?,
-                };
-                let (tcp, proof) = connection.into_parts();
-                Ok((tcp, Self { proof: Some(proof) }))
+                let proof = crate::lan::Connection::admit_proof(tcp, scope, witness)?;
+                Ok(Self { proof: Some(proof) })
             }
         }
     }
@@ -1204,9 +1573,13 @@ pub fn serve<H, E>(
     H: Fn(Served, FleetOp) -> io::Result<()> + Send + Sync + Clone + 'static,
     E: Fn(FleetEvent) + Send + Sync + Clone + 'static,
 {
+    let empty = Arc::new(Denied::default());
     serve_inner(
         ListenerSocket::Fleet(listener),
-        (listening, &|| (listening.scope, listening.serves)),
+        (listening, &|| (listening.scope, listening.serves), &|| {
+            Arc::clone(&empty)
+        }),
+        None,
         running,
         Locality::Fleet,
         HANDSHAKE_WITHIN,
@@ -1229,12 +1602,95 @@ pub fn serve_offering<H, E>(
     H: Fn(Served, FleetOp) -> io::Result<()> + Send + Sync + Clone + 'static,
     E: Fn(FleetEvent) + Send + Sync + Clone + 'static,
 {
+    let empty = Arc::new(Denied::default());
     serve_inner(
         ListenerSocket::Fleet(listener),
-        (listening, offer),
+        (listening, offer, &|| Arc::clone(&empty)),
+        None,
         running,
         Locality::Fleet,
         HANDSHAKE_WITHIN,
+        hand_over,
+        on_event,
+    );
+}
+
+/// [`serve_offering`], also refusing any dialer `deny()` refuses ([`Denied::refuses`]) with
+/// [`FleetError::DeniedNode`] (`NO denied`).
+pub fn serve_offering_with_denied<H, E>(
+    listener: &TcpListener,
+    listening: &Listening,
+    offer: &dyn Fn() -> (FleetScope, &'static [FleetOp]),
+    deny: &dyn Fn() -> Arc<Denied>,
+    running: &AtomicBool,
+    hand_over: H,
+    on_event: E,
+) where
+    H: Fn(Served, FleetOp) -> io::Result<()> + Send + Sync + Clone + 'static,
+    E: Fn(FleetEvent) + Send + Sync + Clone + 'static,
+{
+    serve_inner(
+        ListenerSocket::Fleet(listener),
+        (listening, offer, deny),
+        None,
+        running,
+        Locality::Fleet,
+        HANDSHAKE_WITHIN,
+        hand_over,
+        on_event,
+    );
+}
+
+/// [`serve_offering_with_denied`], also serving a caller with no fleet secret that speaks
+/// [`ALPN_ASK`] when `ask` is given: its stream goes to `ask` alone, inside the handshake's deadline, and never to
+/// `hand_over`, so such a caller reaches no fleet op (`docs/DESIGN-fluid-swarm-2026-10-28.md` F10).
+#[allow(clippy::too_many_arguments)]
+pub fn serve_offering_with_ask<H, E>(
+    listener: &TcpListener,
+    listening: &Listening,
+    offer: &dyn Fn() -> (FleetScope, &'static [FleetOp]),
+    deny: &dyn Fn() -> Arc<Denied>,
+    ask: Option<AskHandler>,
+    running: &AtomicBool,
+    hand_over: H,
+    on_event: E,
+) where
+    H: Fn(Served, FleetOp) -> io::Result<()> + Send + Sync + Clone + 'static,
+    E: Fn(FleetEvent) + Send + Sync + Clone + 'static,
+{
+    serve_offering_with_ask_within(
+        listener,
+        (listening, offer, deny),
+        ask,
+        running,
+        HANDSHAKE_WITHIN,
+        hand_over,
+        on_event,
+    );
+}
+
+/// [`serve_offering_with_ask`], each connection's TLS and both proofs given `handshake_within`
+/// in place of [`HANDSHAKE_WITHIN`]: a test world whose every dialer is an aterm on the same
+/// machine, and so must finish each handshake however loaded it is, gives it its hang detector.
+pub fn serve_offering_with_ask_within<H, E>(
+    listener: &TcpListener,
+    (listening, offer, deny): (&Listening, OfferFn<'_>, DenyFn<'_>),
+    ask: Option<AskHandler>,
+    running: &AtomicBool,
+    handshake_within: Duration,
+    hand_over: H,
+    on_event: E,
+) where
+    H: Fn(Served, FleetOp) -> io::Result<()> + Send + Sync + Clone + 'static,
+    E: Fn(FleetEvent) + Send + Sync + Clone + 'static,
+{
+    serve_inner(
+        ListenerSocket::Fleet(listener),
+        (listening, offer, deny),
+        ask,
+        running,
+        Locality::Fleet,
+        handshake_within,
         hand_over,
         on_event,
     );
@@ -1255,9 +1711,13 @@ pub fn serve_with_handshake<H, E>(
     H: Fn(Served, FleetOp) -> io::Result<()> + Send + Sync + Clone + 'static,
     E: Fn(FleetEvent) + Send + Sync + Clone + 'static,
 {
+    let empty = Arc::new(Denied::default());
     serve_inner(
         ListenerSocket::Fleet(listener),
-        (listening, &|| (listening.scope, listening.serves)),
+        (listening, &|| (listening.scope, listening.serves), &|| {
+            Arc::clone(&empty)
+        }),
+        None,
         running,
         Locality::Fleet,
         handshake_within,
@@ -1282,9 +1742,13 @@ pub fn serve_lan<H, E>(
     E: Fn(FleetEvent) + Send + Sync + Clone + 'static,
 {
     let locality = Locality::Link(listener.scope);
+    let empty = Arc::new(Denied::default());
     serve_inner(
         ListenerSocket::Link(listener),
-        (listening, &|| (listening.scope, listening.serves)),
+        (listening, &|| (listening.scope, listening.serves), &|| {
+            Arc::clone(&empty)
+        }),
+        None,
         running,
         locality,
         HANDSHAKE_WITHIN,
@@ -1293,9 +1757,14 @@ pub fn serve_lan<H, E>(
     );
 }
 
+type OfferFn<'a> = &'a dyn Fn() -> (FleetScope, &'static [FleetOp]);
+type DenyFn<'a> = &'a dyn Fn() -> Arc<Denied>;
+
+#[allow(clippy::too_many_arguments)]
 fn serve_inner<H, E>(
     listener: ListenerSocket<'_>,
-    (listening, offer): (&Listening, &dyn Fn() -> (FleetScope, &'static [FleetOp])),
+    (listening, offer, deny): (&Listening, OfferFn<'_>, DenyFn<'_>),
+    ask: Option<AskHandler>,
     running: &AtomicBool,
     locality: Locality,
     handshake_within: Duration,
@@ -1305,6 +1774,7 @@ fn serve_inner<H, E>(
     H: Fn(Served, FleetOp) -> io::Result<()> + Send + Sync + Clone + 'static,
     E: Fn(FleetEvent) + Send + Sync + Clone + 'static,
 {
+    let _ = aterm_uds::keep_out_of_children(listener.tcp());
     if let Err(error) = listener.tcp().set_nonblocking(true) {
         drop(listener);
         on_event(FleetEvent::Stopped(format!(
@@ -1360,10 +1830,10 @@ fn serve_inner<H, E>(
             });
             continue;
         }
-        let armed = tcp
-            .try_clone()
-            .map_err(FleetError::Io)
-            .and_then(|line| Ok((line, arm(&tcp, handshake_within)?)));
+        let armed = tcp.try_clone().map_err(FleetError::Io).and_then(|line| {
+            let _ = aterm_uds::keep_out_of_children(&line);
+            Ok((line, arm(&tcp, handshake_within)?))
+        });
         let (line, watchdog) = match armed {
             Ok(armed) => armed,
             Err(e) => {
@@ -1387,22 +1857,31 @@ fn serve_inner<H, E>(
             ..
         } = listening.clone();
         let (scope, serves) = offer();
+        let denied = deny();
         let hand_over = hand_over.clone();
+        let ask = ask.clone();
         let tell = on_event.clone();
         #[cfg(unix)]
         let witness = listener.witness();
+        let mut armed_conn = (Some(watchdog), Some(tcp), release);
         let spawned = std::thread::Builder::new()
             .name("aterm-fleet-conn".to_owned())
             .spawn(move || {
-                let release = release;
+                let Some(tcp) = armed_conn.1.take() else {
+                    return;
+                };
+                let Some(watchdog) = armed_conn.0.take() else {
+                    return;
+                };
+                let release = armed_conn.2;
                 let handshake: Result<_, FleetError> = (|| {
-                    let (tcp, admission) = match Admission::inspect(
-                        tcp,
+                    let admission = match Admission::inspect(
+                        &tcp,
                         locality,
                         #[cfg(unix)]
                         witness,
                     ) {
-                        Ok(admitted) => admitted,
+                        Ok(admission) => admission,
                         Err(error) => {
                             // The native refusal still owns the armed phase.
                             // Retire its thread/socket before freeing the slot.
@@ -1410,13 +1889,12 @@ fn serve_inner<H, E>(
                             return Err(FleetError::Io(error));
                         }
                     };
-                    let accepted = server_handshake_armed(
+                    let accepted = server_handshake_or_ask(
                         tcp,
                         watchdog,
                         handshake_within,
                         (&secret, node.as_ref()),
-                        scope,
-                        serves,
+                        (scope, serves, &denied),
                         |op| {
                             let drive = op == FleetOp::Drive;
                             let share = if drive {
@@ -1426,19 +1904,27 @@ fn serve_inner<H, E>(
                             };
                             release.tenure.proved(drive, share)
                         },
+                        if ask.is_some() {
+                            server_config_asked()
+                        } else {
+                            server_config()
+                        },
+                        ask.as_ref().map(|ask| (ask, peer)),
                     )?;
                     admission.recheck().map_err(FleetError::Io)?;
                     Ok((accepted, admission))
                 })();
                 let event = match handshake {
-                    Ok((
-                        Accepted {
+                    Ok((Handshook::Asked, _)) => {
+                        drop(release);
+                        FleetEvent::Closed { peer, error: None }
+                    }
+                    Ok((Handshook::Proved(accepted), admission)) => {
+                        let Accepted {
                             transport,
                             op,
                             peer: proof,
-                        },
-                        admission,
-                    )) => {
+                        } = *accepted;
                         tell(FleetEvent::Admitted { peer, op });
                         let served = Served {
                             transport,
@@ -1580,16 +2066,24 @@ fn arm(tcp: &TcpStream, within: Duration) -> Result<HandshakeWatchdog, FleetErro
     arm_unauthenticated(tcp, within).map_err(FleetError::Io)
 }
 
-fn bounded<T>(
-    tcp: TcpStream,
+fn bounded<C, S, T>(
+    mut tcp: TcpStream,
     watchdog: HandshakeWatchdog,
     within: Duration,
-    handshake: impl FnOnce(TcpStream) -> Result<T, FleetError>,
-) -> Result<T, FleetError> {
-    let result = handshake(tcp);
+    handshake: impl FnOnce(&mut TcpStream) -> Result<(C, [u8; EXPORTER_LEN], T), FleetError>,
+) -> Result<(TlsTransport<C>, T), FleetError>
+where
+    C: std::ops::DerefMut + std::ops::Deref<Target = rustls::ConnectionCommon<S>>,
+    S: rustls::SideData,
+{
+    let result = handshake(&mut tcp);
     match (watchdog.finish(), result) {
         (Claim::Authed, Err(e)) if e.is_deadline() => Err(FleetError::Timeout(within)),
-        (Claim::Authed, result) => result,
+        (Claim::Authed, Ok((conn, exporter, out))) => Ok((
+            TlsTransport::from_parts(StreamOwned::new(conn, tcp), exporter),
+            out,
+        )),
+        (Claim::Authed, Err(e)) => Err(e),
         (Claim::Evicted, _) => Err(FleetError::Io(io::Error::new(
             io::ErrorKind::ConnectionAborted,
             DISPLACED,
@@ -1616,15 +2110,26 @@ where
         .map_err(|e| FleetError::Tls(io::Error::other(e)))
 }
 
+#[cfg(test)]
 fn accept_tls(
-    tcp: TcpStream,
+    mut tcp: TcpStream,
     config: Arc<ServerConfig>,
 ) -> Result<(TlsTransport<ServerConnection>, bool), FleetError> {
+    let (conn, exporter, spoken) = accept_tls_on(&mut tcp, config)?;
+    Ok((
+        TlsTransport::from_parts(StreamOwned::new(conn, tcp), exporter),
+        spoken == Spoken::Fleet { nodes: true },
+    ))
+}
+
+fn accept_tls_on(
+    tcp: &mut TcpStream,
+    config: Arc<ServerConfig>,
+) -> Result<(ServerConnection, [u8; EXPORTER_LEN], Spoken), FleetError> {
     let mut conn =
         ServerConnection::new(config).map_err(|e| FleetError::Tls(io::Error::other(e)))?;
-    let mut tcp = tcp;
     while conn.is_handshaking() {
-        if let Err(e) = conn.complete_io(&mut tcp) {
+        if let Err(e) = conn.complete_io(tcp) {
             return Err(
                 if matches!(rustls_error(&e), Some(rustls::Error::NoApplicationProtocol)) {
                     FleetError::Alpn
@@ -1634,40 +2139,58 @@ fn accept_tls(
             );
         }
     }
-    let Some(nodes) = speaks_nodes(conn.alpn_protocol()) else {
+    let Some(spoken) = spoken(conn.alpn_protocol()) else {
         return Err(FleetError::Alpn);
     };
     let exporter = export(&conn)?;
-    Ok((
-        TlsTransport::from_parts(StreamOwned::new(conn, tcp), exporter),
-        nodes,
-    ))
+    Ok((conn, exporter, spoken))
 }
 
-const fn speaks_nodes(alpn: Option<&[u8]>) -> Option<bool> {
+/// What a connection's two ends agreed to speak.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Spoken {
+    /// The fleet handshake, with node proofs under [`ALPN_NODES`] or [`ALPN_DATABASE_REPAIR`].
+    Fleet { nodes: bool },
+    /// A Mac asking to join, under [`ALPN_ASK`]: no secret, no proof, no op.
+    Ask,
+}
+
+const fn spoken(alpn: Option<&[u8]>) -> Option<Spoken> {
     match alpn {
-        Some(ALPN_NODES) => Some(true),
-        Some(ALPN) => Some(false),
+        Some(ALPN_NODES | ALPN_DATABASE_REPAIR) => Some(Spoken::Fleet { nodes: true }),
+        Some(ALPN) => Some(Spoken::Fleet { nodes: false }),
+        Some(ALPN_ASK) => Some(Spoken::Ask),
         _ => None,
     }
 }
 
+#[cfg(test)]
 fn connect_tls(
-    tcp: TcpStream,
+    mut tcp: TcpStream,
     config: Arc<ClientConfig>,
 ) -> Result<(TlsTransport<ClientConnection>, bool), FleetError> {
+    let (conn, exporter, spoken) = connect_tls_on(&mut tcp, config)?;
+    Ok((
+        TlsTransport::from_parts(StreamOwned::new(conn, tcp), exporter),
+        spoken == Spoken::Fleet { nodes: true },
+    ))
+}
+
+fn connect_tls_on(
+    tcp: &mut TcpStream,
+    config: Arc<ClientConfig>,
+) -> Result<(ClientConnection, [u8; EXPORTER_LEN], Spoken), FleetError> {
     let name = ServerName::try_from(SERVER_NAME).expect("\"aterm-fleet\" is a valid DNS name");
     let mut conn =
         ClientConnection::new(config, name).map_err(|e| FleetError::Tls(io::Error::other(e)))?;
-    let mut tcp = tcp;
     while conn.is_handshaking() {
-        if let Err(e) = conn.complete_io(&mut tcp) {
+        if let Err(e) = conn.complete_io(tcp) {
             let pre_fleet = match rustls_error(&e) {
                 Some(rustls::Error::AlertReceived(
                     rustls::AlertDescription::NoApplicationProtocol,
                 )) => true,
                 Some(rustls::Error::InvalidCertificate(_)) => {
-                    speaks_nodes(conn.alpn_protocol()).is_none()
+                    spoken(conn.alpn_protocol()).is_none()
                 }
                 _ => false,
             };
@@ -1678,14 +2201,11 @@ fn connect_tls(
             });
         }
     }
-    let Some(nodes) = speaks_nodes(conn.alpn_protocol()) else {
+    let Some(spoken) = spoken(conn.alpn_protocol()) else {
         return Err(FleetError::Alpn);
     };
     let exporter = export(&conn)?;
-    Ok((
-        TlsTransport::from_parts(StreamOwned::new(conn, tcp), exporter),
-        nodes,
-    ))
+    Ok((conn, exporter, spoken))
 }
 
 fn listener_proves<S: Read + Write>(
@@ -1694,6 +2214,7 @@ fn listener_proves<S: Read + Write>(
     (secret, me, nodes): (&FleetSecret, Option<&NodeIdentity>, bool),
     scope: FleetScope,
     serves: &[FleetOp],
+    denied: &Denied,
     admit: impl FnOnce(FleetOp) -> bool,
 ) -> Result<(FleetOp, Option<NodeProof>), FleetError> {
     let word = scope.word();
@@ -1719,7 +2240,7 @@ fn listener_proves<S: Read + Write>(
                 FleetError::DialerWrongSecret
             },
         );
-    }
+    };
     let peer = if nodes {
         match read_node_proof(stream, Signer::Dialer, exporter) {
             Ok(peer) => peer,
@@ -1734,6 +2255,9 @@ fn listener_proves<S: Read + Write>(
     // Past both proofs of the secret, a refusal names this node as `OK` does, so the dialer knows
     // which node refused it.
     let node = nodes.then(|| node_line(me, Signer::Listener, exporter));
+    if denied.refuses(peer.as_ref()) {
+        return refuse_as(stream, "denied", FleetError::DeniedNode, node);
+    }
     let Some(op) = FleetOp::from_word(word).filter(|op| serves.contains(op)) else {
         return refuse_as(stream, "op", FleetError::UnknownOp(word.to_owned()), node);
     };
@@ -1801,6 +2325,7 @@ fn dialer_proves<S: Read + Write>(
         Some("OK") => None,
         Some("NO op") => Some(FleetError::UnknownOp(word.to_owned())),
         Some("NO capacity") => Some(FleetError::AddressBusy),
+        Some("NO denied") => Some(FleetError::DeniedNode),
         Some("NO node") => return Err(FleetError::NodeProof),
         Some(verdict) if verdict.strip_prefix("NO ").is_some_and(is_word) => {
             return Err(FleetError::Refused);
@@ -2074,6 +2599,81 @@ mod tests {
     }
 
     #[test]
+    fn database_repair_negotiates_its_order_and_falls_back_with_legacy_node_peers() {
+        for (new_listener, new_dialer, expected) in [
+            (true, true, ALPN_DATABASE_REPAIR),
+            (true, false, ALPN_NODES),
+            (false, true, ALPN_NODES),
+            (false, false, ALPN_NODES),
+        ] {
+            let (listened, dialed) = over_loopback(
+                move |tcp| {
+                    let me = node(1);
+                    let mut accepted = if new_listener {
+                        server_handshake_database_as(tcp, &secret(7), Some(&me), HANG)
+                    } else {
+                        server_handshake_as(
+                            tcp,
+                            &secret(7),
+                            Some(&me),
+                            FleetScope::Facts,
+                            &[FleetOp::Database],
+                            HANG,
+                        )
+                    }
+                    .unwrap();
+                    assert_eq!(accepted.op, FleetOp::Database);
+                    assert_eq!(accepted.peer.unwrap().key, node(2).key());
+                    let exporter = accepted.transport.exporter().to_vec();
+                    let stream = accepted.transport.stream();
+                    stream.get_ref().set_read_timeout(Some(HANG)).unwrap();
+                    let alpn = stream.conn.alpn_protocol().unwrap().to_vec();
+                    let mut request = [0; 5];
+                    stream.read_exact(&mut request).unwrap();
+                    assert_eq!(&request, b"ping\n");
+                    stream.write_all(b"pong\n").unwrap();
+                    stream.flush().unwrap();
+                    (alpn, exporter)
+                },
+                move |tcp| {
+                    let me = node(2);
+                    let mut dialed = if new_dialer {
+                        client_handshake_database_as(tcp, &secret(7), Some(&me), HANG)
+                    } else {
+                        client_handshake_as(tcp, &secret(7), Some(&me), FleetOp::Database, HANG)
+                    }
+                    .unwrap();
+                    assert_eq!(dialed.scope, FleetScope::Facts);
+                    assert_eq!(dialed.peer.unwrap().key, node(1).key());
+                    let exporter = dialed.transport.exporter().to_vec();
+                    let stream = dialed.transport.stream();
+                    stream.get_ref().set_read_timeout(Some(HANG)).unwrap();
+                    let alpn = stream.conn.alpn_protocol().unwrap().to_vec();
+                    stream.write_all(b"ping\n").unwrap();
+                    stream.flush().unwrap();
+                    let mut answer = [0; 5];
+                    stream.read_exact(&mut answer).unwrap();
+                    assert_eq!(&answer, b"pong\n");
+                    (alpn, exporter)
+                },
+            );
+            assert_eq!(listened.0, expected);
+            assert_eq!(dialed.0, expected);
+            assert_eq!(listened.1, dialed.1);
+        }
+    }
+
+    #[test]
+    fn a_database_listener_does_not_grant_terminal_drive() {
+        let (listened, dialed) = over_loopback(
+            |tcp| server_handshake_database_as(tcp, &secret(7), Some(&node(1)), HANG).err(),
+            |tcp| client_handshake_as(tcp, &secret(7), Some(&node(2)), FleetOp::Drive, HANG).err(),
+        );
+        assert!(matches!(listened, Some(FleetError::UnknownOp(op)) if op == "drive"));
+        assert!(matches!(dialed, Some(FleetError::UnknownOp(op)) if op == "drive"));
+    }
+
+    #[test]
     fn each_end_proves_its_node_under_atf2_and_neither_under_atf1() {
         let proof = |me: &NodeIdentity| NodeProof {
             node: me.node().to_owned(),
@@ -2150,6 +2750,7 @@ mod tests {
                     (&secret(7), None, false),
                     FleetScope::Content,
                     EVERY_OP,
+                    &Denied::default(),
                     |_| true,
                 )
             },
@@ -2189,6 +2790,7 @@ mod tests {
                     (&secret(7), Some(&node(9)), true),
                     FleetScope::Facts,
                     EVERY_OP,
+                    &Denied::default(),
                     |_| true,
                 )
             });
@@ -2392,6 +2994,7 @@ mod tests {
                     (&secret(7), None, false),
                     FleetScope::Content,
                     EVERY_OP,
+                    &Denied::default(),
                     |_| true,
                 )
                 .map(|(op, _)| op)
@@ -2640,10 +3243,17 @@ mod tests {
                     let watchdog = arm(&tcp, HANG).unwrap();
                     let me = (&secret(7), listener.as_ref());
                     let scope = FleetScope::Facts;
-                    let _ =
-                        server_handshake_armed(tcp, watchdog, HANG, me, scope, READ_ONLY, |_| {
-                            !full
-                        });
+                    let _ = server_handshake_armed(
+                        tcp,
+                        watchdog,
+                        HANG,
+                        me,
+                        scope,
+                        READ_ONLY,
+                        &Denied::default(),
+                        |_| !full,
+                        server_config(),
+                    );
                 },
                 |tcp| {
                     let op = if full {
@@ -3454,5 +4064,359 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_concurrent_socket_descriptor_scan_during_handshake_never_drains_the_proved_stream() {
+        use std::os::fd::AsRawFd as _;
+        const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
+        const SOCKET_FDINFO_BYTES: libc::c_int = 792;
+        unsafe extern "C" {
+            fn proc_pidfdinfo(
+                pid: libc::c_int,
+                fd: libc::c_int,
+                flavor: libc::c_int,
+                buffer: *mut libc::c_void,
+                buffersize: libc::c_int,
+            ) -> libc::c_int;
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_fd = listener.as_raw_fd();
+        let addr = listener.local_addr().unwrap();
+        let _served = Serving::start(listener, listening(8, HANG));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let pid = std::process::id().cast_signed();
+        let scanners: Vec<_> = (0..2)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 1024];
+                    while !stop.load(Ordering::Relaxed) {
+                        for fd in base_fd..base_fd.saturating_add(16) {
+                            // SAFETY: `buf` holds at least `SOCKET_FDINFO_BYTES` writable bytes.
+                            unsafe {
+                                let _ = proc_pidfdinfo(
+                                    pid,
+                                    fd,
+                                    PROC_PIDFDSOCKETINFO,
+                                    buf.as_mut_ptr().cast(),
+                                    SOCKET_FDINFO_BYTES,
+                                );
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for round in 0..40 {
+            let tcp = TcpStream::connect_timeout(&addr, HANG).unwrap();
+            let (mut conn, _) = client_handshake(tcp, &secret(7), FleetOp::Survey, HANG)
+                .unwrap_or_else(|e| panic!("round {round} handshake: {e}"));
+            assert!(
+                echoes(&mut conn),
+                "round {round}: the proved stream must not be drained by a concurrent socket scan"
+            );
+        }
+
+        // NEGATIVE CONTROL: duplicating a live socket (`try_clone`) and closing the duplicate
+        // while `PROC_PIDFDSOCKETINFO` inspects it drains the shared socket (`SS_DRAINING`), so a
+        // blocking read on the still-open original descriptor fails at once with `EBADF`.
+        let mut control_drained = false;
+        let started = std::time::Instant::now();
+        while !control_drained && started.elapsed() < HANG {
+            let pair_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let pair_addr = pair_listener.local_addr().unwrap();
+            let reader = TcpStream::connect_timeout(&pair_addr, HANG).unwrap();
+            let (_writer, _) = pair_listener.accept().unwrap();
+            reader
+                .set_read_timeout(Some(Duration::from_millis(2)))
+                .unwrap();
+            for _ in 0..8 {
+                let dup = reader.try_clone().unwrap();
+                drop(dup);
+            }
+            let mut byte = [0u8; 1];
+            if (&reader)
+                .read(&mut byte)
+                .is_err_and(|e| e.raw_os_error() == Some(libc::EBADF))
+            {
+                control_drained = true;
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for scanner in scanners {
+            scanner.join().unwrap();
+        }
+        assert!(
+            control_drained,
+            "CONTROL: closing a try_clone duplicate under PROC_PIDFDSOCKETINFO drains the socket with EBADF"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admission_refusal_keeps_accepted_fd_open_until_watchdog_joins() {
+        use std::os::fd::AsRawFd as _;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let dialer = TcpStream::connect_timeout(&addr, HANG).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        let accepted_fd = accepted.as_raw_fd();
+        let watchdog = arm(&accepted, HANG).unwrap();
+        let evictor = watchdog.evictor();
+
+        let refused = Admission::inspect(&accepted, Locality::Link(crate::lan::Scope::Lan), None);
+        assert!(
+            refused.is_err(),
+            "loopback socket must be refused under Scope::Lan"
+        );
+
+        let mut bystander_client = TcpStream::connect_timeout(&addr, HANG).unwrap();
+        let (mut bystander_server, _) = listener.accept().unwrap();
+        bystander_server.set_read_timeout(Some(HANG)).unwrap();
+        assert_ne!(
+            bystander_client.as_raw_fd(),
+            accepted_fd,
+            "accepted fd must remain open while watchdog is still armed"
+        );
+        assert_ne!(
+            bystander_server.as_raw_fd(),
+            accepted_fd,
+            "accepted fd must remain open while watchdog is still armed"
+        );
+
+        assert!(evictor.evict());
+        assert_eq!(watchdog.finish(), Claim::Evicted);
+        drop((accepted, dialer));
+
+        bystander_client.write_all(b"ok").unwrap();
+        let mut buf = [0u8; 2];
+        bystander_server.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ok");
+
+        // NEGATIVE CONTROL: if `accepted` is closed before `watchdog.finish()` and its descriptor
+        // number (`victim_fd`) is reused by a bystander socket, `evictor.evict()` shuts down the
+        // bystander socket. `dup2` replaces `victim_fd` atomically while `accepted` still owns it
+        // so parallel test threads cannot claim `victim_fd` in between.
+        let dialer = TcpStream::connect_timeout(&addr, HANG).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        let victim_fd = accepted.as_raw_fd();
+        let watchdog = arm(&accepted, HANG).unwrap();
+        let evictor = watchdog.evictor();
+        let mut bystander_client = TcpStream::connect_timeout(&addr, HANG).unwrap();
+        let (bystander_server_orig, _) = listener.accept().unwrap();
+        bystander_server_orig.set_read_timeout(Some(HANG)).unwrap();
+        // SAFETY: both `bystander_server_orig` and `accepted` are open descriptors owned by this
+        // test; `dup2` atomically closes `accepted`'s descriptor (`victim_fd`) and duplicates
+        // `bystander_server_orig` onto `victim_fd` with no unallocated gap for sibling threads.
+        let duped = unsafe { libc::dup2(bystander_server_orig.as_raw_fd(), victim_fd) };
+        assert_eq!(duped, victim_fd, "dup2 onto victim_fd must succeed");
+        std::mem::forget(accepted);
+        drop(bystander_server_orig);
+        // SAFETY: `victim_fd` now uniquely owns the duplicated `bystander_server` socket.
+        let mut bystander_server: TcpStream =
+            unsafe { std::os::fd::FromRawFd::from_raw_fd(victim_fd) };
+        let _ = aterm_uds::keep_out_of_children(&bystander_server);
+        assert!(evictor.evict());
+        assert_eq!(watchdog.finish(), Claim::Evicted);
+        drop(dialer);
+        let cut = bystander_client.write_all(b"ok").is_err()
+            || bystander_server.read_exact(&mut buf).is_err();
+        assert!(
+            cut,
+            "CONTROL: closing accepted before watchdog.finish() shuts down the reused bystander fd"
+        );
+    }
+
+    /// A listener serving ask on its own: every op it offers, an ask handler that records the one
+    /// line it reads and answers `OK asked`, and a hand-over that records each op it is given.
+    struct Asked {
+        addr: SocketAddr,
+        ops: Arc<Mutex<Vec<FleetOp>>>,
+        lines: Arc<Mutex<Vec<String>>>,
+        running: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Asked {
+        fn start(serves_ask: bool) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let ops = Arc::new(Mutex::new(Vec::new()));
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            let running = Arc::new(AtomicBool::new(true));
+            let ask: AskHandler = Arc::new({
+                let lines = Arc::clone(&lines);
+                move |mut stream: &mut dyn Duplex, _peer| {
+                    let line = read_line(&mut stream)
+                        .map_err(|error| io::Error::other(error.to_string()))?
+                        .unwrap_or_default();
+                    lines.lock().unwrap().push(line);
+                    stream.write_all(b"OK asked\n")
+                }
+            });
+            let thread = std::thread::spawn({
+                let (ops, running) = (Arc::clone(&ops), Arc::clone(&running));
+                move || {
+                    let listening = Listening {
+                        secret: secret(7),
+                        scope: FleetScope::Content,
+                        node: None,
+                        serves: &[
+                            FleetOp::Survey,
+                            FleetOp::Book,
+                            FleetOp::Join,
+                            FleetOp::Drive,
+                            FleetOp::Facts,
+                            FleetOp::Census,
+                        ],
+                        slots: 8,
+                        per_source: 8,
+                        lifetime: HANG,
+                    };
+                    let empty = Arc::new(Denied::default());
+                    serve_inner(
+                        ListenerSocket::Fleet(&listener),
+                        (&listening, &|| (listening.scope, listening.serves), &|| {
+                            Arc::clone(&empty)
+                        }),
+                        serves_ask.then_some(ask),
+                        &running,
+                        Locality::Fleet,
+                        HANG,
+                        move |served: Served, op| {
+                            ops.lock().unwrap().push(op);
+                            served.answer(|stream| stream.write_all(b"OK served\n"))
+                        },
+                        |_| {},
+                    );
+                }
+            });
+            Self {
+                addr,
+                ops,
+                lines,
+                running,
+                thread: Some(thread),
+            }
+        }
+
+        fn dial(&self) -> TcpStream {
+            let tcp = TcpStream::connect_timeout(&self.addr, HANG).unwrap();
+            tcp.set_read_timeout(Some(HANG)).unwrap();
+            tcp
+        }
+    }
+
+    impl Drop for Asked {
+        fn drop(&mut self) {
+            self.running.store(false, Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// F10 (`docs/DESIGN-fluid-swarm-2026-10-28.md`): a caller without the fleet secret reaches the
+    /// ask handler and nothing else. Whatever it writes on [`ALPN_ASK`] (a survey, a drive, a join,
+    /// the fleet's own proof line) goes to the ask handler, and no op is handed over; on the fleet
+    /// protocol a wrong secret is refused before any op; and a listener with no ask handler does
+    /// not speak ask at all.
+    #[test]
+    fn a_caller_without_the_fleet_secret_reaches_only_ask() {
+        let listening = Asked::start(true);
+        let tries = [
+            "survey".to_owned(),
+            "version".to_owned(),
+            format!("drive {}", "0".repeat(64)),
+            format!("join {}", "0".repeat(64)),
+            format!("survey {}", "f".repeat(64)),
+        ];
+        for line in &tries {
+            let mut asked = ask_handshake(listening.dial(), HANG).expect("an ask is served");
+            asked
+                .stream()
+                .write_all(format!("{line}\n").as_bytes())
+                .unwrap();
+            asked.stream().flush().unwrap();
+            let reply = read_line(asked.stream()).unwrap();
+            assert_eq!(reply.as_deref(), Some("OK asked"), "{line}");
+        }
+        assert_eq!(*listening.lines.lock().unwrap(), tries);
+        assert!(
+            listening.ops.lock().unwrap().is_empty(),
+            "an ask reached a fleet op: {:?}",
+            listening.ops.lock().unwrap()
+        );
+        // CONTROL: the fleet secret reaches the hand-over, so the empty record above means something.
+        let (mut proved, _) = client_handshake(listening.dial(), &secret(7), FleetOp::Survey, HANG)
+            .expect("the secret proves survey");
+        assert_eq!(
+            read_line(proved.stream()).unwrap().as_deref(),
+            Some("OK served")
+        );
+        assert_eq!(*listening.ops.lock().unwrap(), [FleetOp::Survey]);
+        // A listener given no ask handler never negotiates ask.
+        let closed = Asked::start(false);
+        let refused = ask_handshake(closed.dial(), HANG);
+        assert!(
+            matches!(refused, Err(FleetError::Alpn)),
+            "{:?}",
+            refused.err()
+        );
+        assert!(closed.lines.lock().unwrap().is_empty() && closed.ops.lock().unwrap().is_empty());
+    }
+
+    /// A survey or a drive from a caller that does not hold the fleet secret is refused in the
+    /// handshake on a listener that also serves ask: the ask path is no way around the proof.
+    #[test]
+    fn a_survey_or_drive_without_the_fleet_secret_is_refused() {
+        let listening = Asked::start(true);
+        for op in [FleetOp::Survey, FleetOp::Drive] {
+            let wrong = client_handshake(listening.dial(), &secret(9), op, HANG);
+            assert!(
+                matches!(wrong, Err(FleetError::ListenerWrongSecret)),
+                "{op:?}: {:?}",
+                wrong.err()
+            );
+        }
+        // A dialer with no secret that ignores the listener's proof and presents its own guess.
+        for word in ["survey", "drive"] {
+            let (mut raw, _) = connect_tls(listening.dial(), client_config()).expect("tls");
+            read_line(raw.stream())
+                .unwrap()
+                .expect("the listener's proof");
+            raw.stream()
+                .write_all(format!("{word} {}\n", "0".repeat(64)).as_bytes())
+                .unwrap();
+            raw.stream().flush().unwrap();
+            let reply = read_line(raw.stream()).ok().flatten().unwrap_or_default();
+            assert_eq!(reply, "NO proof", "{word}");
+        }
+        assert!(
+            listening.ops.lock().unwrap().is_empty(),
+            "an op ran without the secret: {:?}",
+            listening.ops.lock().unwrap()
+        );
+        // CONTROL: the fleet secret reaches each op on the same listener.
+        for op in [FleetOp::Survey, FleetOp::Drive] {
+            let (mut proved, _) = client_handshake(listening.dial(), &secret(7), op, HANG)
+                .expect("the secret proves the op");
+            assert_eq!(
+                read_line(proved.stream()).unwrap().as_deref(),
+                Some("OK served")
+            );
+        }
+        assert_eq!(
+            *listening.ops.lock().unwrap(),
+            [FleetOp::Survey, FleetOp::Drive]
+        );
     }
 }

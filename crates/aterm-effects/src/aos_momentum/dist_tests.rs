@@ -565,7 +565,7 @@ fn check_all_judges_every_admitted_claim_and_records_search() {
     assert_eq!(judged.len(), want);
     assert!(ev.grid_cached(), "the search filled the grid's cache");
     let before = n(&ev.reads().train);
-    let grid = ev.grid_selection().expect("the grid's selection");
+    let grid = ev.grid_selection(&Serial).expect("the grid's selection");
     assert_eq!(
         n(&ev.reads().train),
         before,

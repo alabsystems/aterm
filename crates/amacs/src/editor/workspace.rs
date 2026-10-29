@@ -10,9 +10,11 @@ use aterm_buffer::Seq;
 use super::chord::KeyChord;
 use super::command::{CommandAuthority, EditorCommand, Invocation, PrefixArgument, TAB_STOP};
 use super::history::DocumentHistory;
+#[cfg(test)]
+use super::history::HistoryMutant;
 use super::keymap::{KeyResolution, Keymap, Platform, Profile};
 use super::kill::YankRecord;
-use super::macros::MacroStep;
+use super::macros::{KbdMacros, MacroStep};
 use super::minibuffer::Minibuffer;
 use super::projection::{EditorLines, editor_display_column, line_end, line_start, line_text_end};
 use super::view::{
@@ -52,6 +54,11 @@ pub enum EditorEffect {
     RevertDocument {
         document: DocumentId,
     },
+    /// Keep the buffer's text over its file's change on disk (the host's
+    /// file watch knows what that takes).
+    KeepDocument {
+        document: DocumentId,
+    },
     /// Close the view the command ran in.
     CloseView {
         why: CloseWhy,
@@ -78,13 +85,22 @@ pub(super) enum Recorded {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditorError {
     UnknownDocument,
-    StaleView { view: Seq, current: Seq },
+    StaleView {
+        view: Seq,
+        current: Seq,
+    },
     InvalidSelections,
-    TransactionConflict { current: Seq },
+    TransactionConflict {
+        current: Seq,
+    },
     TransactionRejected,
     NothingToUndo,
     NothingToRedo,
-    HistoryDiverged { expected: Seq, current: Seq },
+    /// An undo that would put back text a later change touched, or found
+    /// nothing of the kind it undoes: the words say which.
+    UndoRefused {
+        why: String,
+    },
     NoKill,
     MacroRecursion,
 }
@@ -131,23 +147,47 @@ impl LeftBy {
 /// State shared across every editor document and view in one workspace/window group.
 pub struct EditorWorkspace {
     pub buffers: Vec<DocumentId>,
+    /// The kills of input that carries [`CommandAuthority::Clipboard`] (the person's), each of
+    /// which reaches the clipboard: the ring their C-y and M-y read.
     pub kill_ring: VecDeque<String>,
+    /// The kill ring of input that carries no clipboard authority (in aterm, a control client's):
+    /// [`Self::kill_ring`] mirrors the clipboard, so such input kills to and yanks from this ring
+    /// instead, and neither input reads or adds to the other's kills ([`Self::kills`]).
+    pub(super) guest_kill_ring: VecDeque<String>,
+    /// [`Self::grid_kill`] for [`Self::guest_kill_ring`].
+    pub(super) guest_grid_kill: Option<String>,
     pub global_mark_ring: VecDeque<GlobalMark>,
     pub command_history: VecDeque<String>,
     pub keymap: Keymap,
     pub options: EditorOptions,
     /// The authority classes the input being reduced carries.
     pub granted: Vec<CommandAuthority>,
+    /// Whether the document the input being reduced goes to is held with LF and written with
+    /// CRLF (every line of its file ended so): a yank puts a kill's CRLF in as LF, as the face
+    /// does for typing and pastes, so the file does not save CR CR LF.
+    pub crlf_on_disk: bool,
     pub(super) histories: BTreeMap<DocumentId, DocumentHistory>,
-    pub(super) recording: Option<Vec<MacroStep>>,
-    pub(super) last_macro: Vec<MacroStep>,
+    /// The keyboard macros of input that carries [`CommandAuthority::Clipboard`] (the person's).
+    pub(super) macros: KbdMacros,
+    /// The keyboard macros of input that carries no clipboard authority (in aterm, a control
+    /// client's): a macro keeps the text typed while it was recorded, so neither input replays
+    /// or records into the other's ([`Self::macros_for`]).
+    pub(super) guest_macros: KbdMacros,
     pub(super) playing_macro: bool,
     pub(super) last_yank: Option<YankRecord>,
     pub(super) pending_commits: Vec<(DocumentId, Seq, Vec<EditDelta>)>,
     /// What the last command left ([`LeftBy`]).
     pub(super) last_left: Option<LeftBy>,
-    /// Whether the kill ring's newest entry changed since the face was last handed it.
+    /// Whether the person's kill ring's newest entry changed since the face was last handed it.
     pub(super) kill_ring_changed: bool,
+    /// The grid face's scan of the last revision it read.
+    pub(super) tables: crate::table::TableMemo,
+    /// The value the grid's last copy or cut put on the kill ring, until a text kill: a yank or
+    /// paste of exactly that text is a cell's whole value and keeps its final line break.
+    pub(super) grid_kill: Option<String>,
+    /// The rule a conformance rig breaks ([`HistoryMutant`]).
+    #[cfg(test)]
+    pub(super) history_mutant: Option<HistoryMutant>,
 }
 
 impl Default for EditorWorkspace {
@@ -162,19 +202,26 @@ impl EditorWorkspace {
         Self {
             buffers: Vec::new(),
             kill_ring: VecDeque::new(),
+            guest_kill_ring: VecDeque::new(),
+            guest_grid_kill: None,
             global_mark_ring: VecDeque::new(),
             command_history: VecDeque::new(),
             keymap,
             options: EditorOptions::default(),
             granted: CommandAuthority::ALL.to_vec(),
+            crlf_on_disk: false,
             histories: BTreeMap::new(),
-            recording: None,
-            last_macro: Vec::new(),
+            macros: KbdMacros::default(),
+            guest_macros: KbdMacros::default(),
             playing_macro: false,
             last_yank: None,
             pending_commits: Vec::new(),
             last_left: None,
             kill_ring_changed: false,
+            tables: crate::table::TableMemo::default(),
+            grid_kill: None,
+            #[cfg(test)]
+            history_mutant: None,
         }
     }
 
@@ -182,14 +229,29 @@ impl EditorWorkspace {
         Self::default()
     }
 
-    /// Every authority running `command` here needs.
+    /// Every authority running `command` here needs, for the input being reduced.
     pub fn authorities(&self, command: EditorCommand) -> Vec<CommandAuthority> {
+        self.authorities_for(command, &self.granted)
+    }
+
+    /// Every authority running `command` here needs, for input that carries `granted` (whose
+    /// macro `call-last-kbd-macro` replays: [`Self::macros_for`]).
+    pub(super) fn authorities_for(
+        &self,
+        command: EditorCommand,
+        granted: &[CommandAuthority],
+    ) -> Vec<CommandAuthority> {
         let mut needed = vec![command.authority()];
         if command == EditorCommand::PlayMacro {
-            needed.extend(self.last_macro.iter().filter_map(|step| match step {
-                MacroStep::Command(command, ..) => Some(command.authority()),
-                MacroStep::Text(_) => None,
-            }));
+            needed.extend(
+                self.macros_for(granted)
+                    .last
+                    .iter()
+                    .filter_map(|step| match step {
+                        MacroStep::Command(command, ..) => Some(command.authority()),
+                        MacroStep::Text(_) => None,
+                    }),
+            );
         }
         needed.sort_unstable();
         needed.dedup();
@@ -199,7 +261,7 @@ impl EditorWorkspace {
     /// Why `command` may not run under `granted`.
     #[must_use]
     pub fn refusal(&self, command: EditorCommand, granted: &[CommandAuthority]) -> Option<String> {
-        self.authorities(command)
+        self.authorities_for(command, granted)
             .into_iter()
             .find(|needed| !granted.contains(needed))
             .map(|missing| {
@@ -247,11 +309,24 @@ impl EditorWorkspace {
         Ok(EditorBufferView::new(document, document_view, seq))
     }
 
+    /// Insert typed text at every selection: a self-insert, so one
+    /// character joins the run of typing before it (one undo frame, up to
+    /// [`super::history::AMALGAM_CHARS`] characters).
     pub fn insert_text(
         &mut self,
         store: &mut DocumentStore,
         view: &mut EditorBufferView,
         text: &str,
+    ) -> Result<Vec<EditorEffect>, EditorError> {
+        self.insert_typed(store, view, text, true)
+    }
+
+    fn insert_typed(
+        &mut self,
+        store: &mut DocumentStore,
+        view: &mut EditorBufferView,
+        text: &str,
+        self_insert: bool,
     ) -> Result<Vec<EditorEffect>, EditorError> {
         if view.minibuffer_active() {
             return self.insert_minibuffer_text(store, view, text);
@@ -259,17 +334,21 @@ impl EditorWorkspace {
         if view.accept_argument_digit(text) {
             return Ok(Vec::new());
         }
-        if let Some(steps) = &mut self.recording
-            && !self.playing_macro
+        if !self.playing_macro
+            && let Some(steps) = &mut self.macros_mut().recording
         {
             steps.push(MacroStep::Text(text.to_owned()));
         }
         view.take_prefix_argument();
         view.last_command = None;
         let edits = edits_for_selections(&view.selections, text)?;
-        self.apply_recorded(store, view, edits)?;
+        self.apply_typed(store, view, edits, self_insert)?;
         self.last_yank = None;
-        Ok(Vec::new())
+        Ok(self
+            .take_history_note(view.document)
+            .map(EditorEffect::Status)
+            .into_iter()
+            .collect())
     }
 
     /// Insert a paste: one transaction, never read as keys.
@@ -282,7 +361,7 @@ impl EditorWorkspace {
         if !view.minibuffer_active() {
             view.take_prefix_argument();
         }
-        self.insert_text(store, view, text)
+        self.insert_typed(store, view, text, false)
     }
 
     pub fn handle_chord(
@@ -448,7 +527,7 @@ impl EditorWorkspace {
         if self.playing_macro {
             return;
         }
-        if let Some(steps) = &mut self.recording
+        if let Some(steps) = &mut self.macros_mut().recording
             && let Some(MacroStep::Command(recorded, _, args)) = steps.last_mut()
             && *recorded == command
             && args.is_empty()
@@ -502,8 +581,7 @@ impl EditorWorkspace {
         } else {
             view.take_prefix_argument()
         };
-        if let Some(steps) = &mut self.recording
-            && !self.playing_macro
+        if !self.playing_macro
             && recorded == Recorded::No
             && !matches!(
                 command,
@@ -514,20 +592,31 @@ impl EditorWorkspace {
                     | EditorCommand::DigitArgument
                     | EditorCommand::ExecuteCommand
             )
+            && let Some(steps) = &mut self.macros_mut().recording
         {
             steps.push(MacroStep::Command(command, argument, args.clone()));
         }
         self.remember_command(command.name());
+        self.end_run(view.document);
         let previous = view
             .last_command
             .filter(|_| self.last_left.as_ref() == Some(&LeftBy::now(store, view)));
-        let mut result = self.run(store, view, command, argument, previous, args);
+        let mut result = if view.grid().is_some() {
+            self.grid_run(store, view, command, argument, previous, args)
+        } else {
+            self.run(store, view, command, argument, previous, args)
+        };
         view.last_command = if argument_command {
             previous
         } else {
             Some(command)
         };
         self.last_left = Some(LeftBy::now(store, view));
+        if let Ok(effects) = &mut result
+            && let Some(note) = self.take_history_note(view.document)
+        {
+            effects.push(EditorEffect::Status(note));
+        }
         if !self.playing_macro
             && let Ok(effects) = &mut result
             && std::mem::take(&mut self.kill_ring_changed)
@@ -541,7 +630,8 @@ impl EditorWorkspace {
         result
     }
 
-    fn run(
+    /// Run one command on a text view (and the commands a grid view runs as text does).
+    pub(super) fn run(
         &mut self,
         store: &mut DocumentStore,
         view: &mut EditorBufferView,
@@ -749,8 +839,9 @@ impl EditorWorkspace {
             EditorCommand::KillRingSave => return self.kill_ring_save(store, view, previous),
             EditorCommand::Yank => self.yank(store, view, argument, count)?,
             EditorCommand::YankPop => return self.yank_pop(store, view),
-            EditorCommand::Undo => self.undo(store, view)?,
-            EditorCommand::Redo => self.redo(store, view)?,
+            EditorCommand::Undo => return self.undo(store, view),
+            EditorCommand::Redo => return self.redo(store, view),
+            EditorCommand::UndoAgentEdit => return self.undo_agent_edit(store, view),
             EditorCommand::Save => {
                 let snapshot = snapshot_for_view(store, view)?;
                 return Ok(vec![EditorEffect::SaveDocument {
@@ -851,6 +942,26 @@ impl EditorWorkspace {
             }
             EditorCommand::RevertBuffer => {
                 return Ok(vec![EditorEffect::RevertDocument {
+                    document: view.document,
+                }]);
+            }
+            EditorCommand::ToggleGridView => return Ok(self.toggle_grid(store, view)),
+            // The terminal face shows a table as text alone, so it points to an Editor tab.
+            EditorCommand::GridInsertRow | EditorCommand::GridDeleteRow
+                if self.keymap.profile() == Profile::Terminal =>
+            {
+                return Ok(vec![EditorEffect::Status(
+                    super::grid::TERMINAL_TABLE.to_string(),
+                )]);
+            }
+            EditorCommand::GridInsertRow | EditorCommand::GridDeleteRow => {
+                return Ok(vec![EditorEffect::Status(format!(
+                    "{} works in a table's grid view: C-c C-t or Cmd-E shows a .csv or .tsv file as one",
+                    command.name()
+                ))]);
+            }
+            EditorCommand::KeepBufferOverDisk => {
+                return Ok(vec![EditorEffect::KeepDocument {
                     document: view.document,
                 }]);
             }

@@ -18,7 +18,9 @@
 //! the wheel scrolled a transcript that long stub turns made taller than the lab's screen (24
 //! rows unless `LAB_LINES` says otherwise). `--vim` runs
 //! Claude's vim editor mode instead: an Escape into NORMAL must leave its motions dark, and `i`
-//! must light the typing again.
+//! must light the typing again, at the `❯` prompt and in shell mode (`!`), whose prompt box
+//! has a `!` caret. One Escape is a guarded `aterm ctl key if=…`, which the control thread
+//! writes, so the window learns of it only after Claude has drawn NORMAL.
 //!
 //! The verdict is 0 when every scenario reads as expected and 1 when one does not. 3 is COULD
 //! NOT RUN: the lab did not come up, an `aterm ctl` call was refused, a wait for something that
@@ -132,6 +134,10 @@ enum Boundary {
     Wheel,
     /// One `aterm ctl key` press.
     Key(&'static str),
+    /// One `aterm ctl key if=<re>` press (the guard, then the key): a guarded write goes to the
+    /// PTY from the control thread, so the window applies its licence fence only after Claude
+    /// has repainted for the key.
+    GuardedKey(&'static str, &'static str),
     /// One `aterm ctl key` press that interrupts the turn [`Prep::Streaming`] started: Claude's
     /// busy row must show before it and go after it.
     Interrupt(&'static str),
@@ -146,6 +152,8 @@ enum Prep {
     LongTurns,
     /// A slow stub turn, still streaming (a tick a second) when the boundary lands.
     Streaming,
+    /// An empty prompt and `!`: Claude's shell mode, whose prompt box has a `!` caret.
+    ShellMode,
 }
 
 /// One scenario: warm-up keys, its boundary, the keys judged, and what they must show.
@@ -267,6 +275,38 @@ const VIM: &[Scenario] = &[
         warm: &[],
         boundary: Boundary::Key("a"),
         keys: &["j", "k", "l"],
+        want: Want::Lit,
+    },
+    Scenario {
+        prep: Prep::None,
+        name: "guarded esc, NORMAL motions",
+        warm: &[],
+        boundary: Boundary::GuardedKey("INSERT", "esc"),
+        keys: &["h", "h", "h"],
+        want: Want::Dark,
+    },
+    Scenario {
+        prep: Prep::None,
+        name: "i after guarded esc, typing",
+        warm: &[],
+        boundary: Boundary::Key("i"),
+        keys: &["m", "n", "o"],
+        want: Want::Lit,
+    },
+    Scenario {
+        prep: Prep::ShellMode,
+        name: "shell mode: escape, motions",
+        warm: &["e", "c", "h", "o"],
+        boundary: Boundary::Key("esc"),
+        keys: &["h", "h", "h"],
+        want: Want::Dark,
+    },
+    Scenario {
+        prep: Prep::None,
+        name: "shell mode: i, typing again",
+        warm: &[],
+        boundary: Boundary::Key("i"),
+        keys: &["x", "y", "z"],
         want: Want::Lit,
     },
 ];
@@ -439,6 +479,12 @@ impl Probe<'_> {
         match b {
             Boundary::None => Ok(None),
             Boundary::Key(key) => self.must(&["key", key]).map(|_| None),
+            Boundary::GuardedKey(guard, key) => {
+                let reply = self.must(&["key", &format!("if={guard}"), key])?;
+                Ok(reply
+                    .contains("skipped")
+                    .then(|| format!("the guard if={guard} skipped {key}: {}", reply.trim())))
+            }
             Boundary::Interrupt(key) => {
                 let busy = busy_row();
                 if !self.door.await_match(&busy, 1)? {
@@ -499,6 +545,7 @@ impl Probe<'_> {
 /// (`--vim`) the composer starts in INSERT.
 fn launch(run: &Run, p: &Probe<'_>, vim: bool) -> Result<(), Fail> {
     let l = Launch {
+        replace_shell: vim,
         no_wait: true,
         envs: vec![
             "CLAUDE_CODE_NO_FLICKER=1".into(),
@@ -548,11 +595,151 @@ fn busy_row() -> String {
     aterm_phase::anchors::guard_prefix("busy.interrupt", 3)
 }
 
+/// Queue the first INSERT text before Claude can repaint its mode indicator.
+/// Only this lab's exact Claude executable is stopped, and every return resumes it.
+fn queued_insert(run: &Run, p: &Probe<'_>, append: bool) -> Result<bool, Fail> {
+    use aterm_uds::process::EndControl;
+    let entry = if append { "a" } else { "i" };
+    p.must(&["key", "esc"])?;
+    p.settle()?;
+    let normal = p.must(&["text"])?;
+    let rows: Vec<_> = normal.lines().map(str::to_owned).collect();
+    let confirmed_normal = aterm_phase::phase::prompt_box_bottom(&rows).is_some_and(|bottom| {
+        rows[bottom + 1..]
+            .iter()
+            .take_while(|row| !row.trim().is_empty())
+            .map(|row| row.trim_start())
+            .any(|row| row.starts_with(['⏵', '⏸']) || row.starts_with("! for shell mode"))
+    });
+    if !confirmed_normal {
+        return Err(could_not("queued input requires a confirmed NORMAL footer"));
+    }
+    crate::util::atomic_write(
+        &run.run.join(format!("queued-{entry}-normal.txt")),
+        normal.as_bytes(),
+    )
+    .map_err(|e| could_not(format!("cannot retain NORMAL frame: {e}")))?;
+    retain_frame(run, p, &format!("queued-{entry}-normal.png"))?;
+    let candidates: Vec<_> = crate::procs::descendants(run.instance_pid)
+        .into_iter()
+        .filter(|pid| {
+            aterm_uds::process::read_process_path(*pid)
+                .is_some_and(|path| path == std::path::Path::new(&run.claude_bin))
+        })
+        .collect();
+    let [pid] = candidates.as_slice() else {
+        return Err(could_not(
+            "cannot identify exactly one private Claude process to hold",
+        ));
+    };
+    let identity = aterm_uds::process::EndControlLive
+        .identity(*pid)
+        .ok_or_else(|| could_not("private Claude identity could not be read"))?;
+    struct Resume(aterm_uds::process::Identity);
+    impl Drop for Resume {
+        fn drop(&mut self) {
+            use aterm_uds::process::EndControl;
+            let mut control = aterm_uds::process::EndControlLive;
+            if control.identity(self.0.pid) == Some(self.0) {
+                let _ = control.signal(&self.0, libc::SIGCONT);
+            }
+        }
+    }
+    aterm_uds::process::EndControlLive
+        .signal(&identity, libc::SIGSTOP)
+        .map_err(|e| could_not(format!("cannot hold private Claude: {e}")))?;
+    let held = Resume(identity);
+    if !p.until(|_| Ok(crate::procs::state_of(*pid).is_some_and(|s| s.starts_with('T'))))? {
+        return Err(could_not("private Claude did not acknowledge its hold"));
+    }
+    let before = p.caret()?;
+    let since = p.last_seq()?;
+    // The earlier key is intentionally unread while this lab owns the stop.
+    p.must(&["key", "unread=ok", entry])?;
+    p.must(&["key", "unread=ok", "p"])?;
+    drop(held);
+    if !p.until(|p| Ok(p.caret()? != before))? {
+        return Err(could_not("queued INSERT text did not echo"));
+    }
+    if !p
+        .door
+        .await_match(&aterm_phase::anchors::guard_prefix("vim.insert", 3), 60)?
+    {
+        return Err(could_not(
+            "queued INSERT text did not restore the INSERT footer",
+        ));
+    }
+    p.frame()?;
+    p.frame()?;
+    let inserted = p.must(&["text"])?;
+    crate::util::atomic_write(
+        &run.run.join(format!("queued-{entry}-insert.txt")),
+        inserted.as_bytes(),
+    )
+    .map_err(|e| could_not(format!("cannot retain INSERT frame: {e}")))?;
+    retain_frame(run, p, &format!("queued-{entry}-insert.png"))?;
+    let all = p.admissions(32)?;
+    let origin = (before.0, before.1 + u16::from(append));
+    let target = (origin.0, origin.1 + 1);
+    if p.caret()? != target {
+        return Err(could_not(
+            "queued text did not make its one-cell INSERT move",
+        ));
+    }
+    let movement = format!(
+        "origin={},{} target={},{} ",
+        origin.0, origin.1, target.0, target.1
+    );
+    let echo: Vec<_> = all
+        .iter()
+        .filter(|a| a.line.contains(&movement))
+        .cloned()
+        .collect();
+    let (ok, words) = judged(&echo, since, 1, Want::Lit);
+    println!(
+        "  {:<5} {:<30} want lit   {}",
+        if ok { "ok" } else { "FAIL" },
+        format!("queued {entry} then first text (since {since})"),
+        words.join(" ")
+    );
+    if !ok {
+        for a in all.iter().filter(|a| a.seq > since) {
+            println!("          {}", a.line);
+        }
+    }
+    Ok(ok)
+}
+
+fn retain_frame(run: &Run, p: &Probe<'_>, name: &str) -> Result<(), Fail> {
+    p.must(&["image", name])?;
+    std::fs::copy(
+        std::path::Path::new(&run.sockdir).join("images").join(name),
+        run.run.join(name),
+    )
+    .map_err(|error| could_not(format!("cannot retain {name}: {error}")))?;
+    Ok(())
+}
+
 /// Erase what the scenarios before typed, so the composer holds only a turn's prompt.
 fn clear_composer(run: &Run, p: &Probe<'_>) -> Result<(), Fail> {
     let typed = crate::screen::composer_row(run.agent(), &p.must(&["text"])?).unwrap_or_default();
     for _ in 0..typed.chars().count() + 2 {
         p.must(&["key", "backspace"])?;
+    }
+    Ok(())
+}
+
+/// Empty the prompt and type `!`, then wait for Claude's shell-mode hint. End first: in vim's
+/// INSERT the caret can sit inside the text, and a backspace erases only what is before it.
+fn shell_mode(run: &Run, p: &Probe<'_>) -> Result<(), Fail> {
+    p.must(&["key", "end"])?;
+    clear_composer(run, p)?;
+    p.must(&["key", "!"])?;
+    if !p
+        .door
+        .await_match(&aterm_phase::anchors::guard_regex("! for shell mode"), 60)?
+    {
+        return Err(could_not("Claude showed no shell mode within 60 s of `!`"));
     }
     Ok(())
 }
@@ -620,6 +807,10 @@ fn probe(run: &Run, vim: bool, keep: bool) -> Res {
                 streaming_turn(run, &p)?;
                 None
             }
+            Prep::ShellMode => {
+                shell_mode(run, &p)?;
+                None
+            }
         };
         for key in s.warm {
             p.press(key)?;
@@ -662,6 +853,13 @@ fn probe(run: &Run, vim: bool, keep: bool) -> Res {
             failed += 1;
             for a in all.iter().filter(|a| a.seq > since) {
                 println!("          {}", a.line);
+            }
+        }
+    }
+    if vim {
+        for append in [false, true] {
+            if !queued_insert(run, &p, append)? {
+                failed += 1;
             }
         }
     }

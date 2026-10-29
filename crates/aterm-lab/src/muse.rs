@@ -9,7 +9,7 @@ use crate::LAB;
 use crate::door::Door;
 use crate::run::{Run, take_tag};
 use crate::stub::LAB_CODEX_KEY;
-use crate::util::shell_quote;
+use crate::util::{shell_prepend_path, shell_quote};
 use crate::{Fail, Res};
 
 fn lab(args: &[String]) -> Result<(Run, Vec<String>), Fail> {
@@ -83,8 +83,8 @@ pub fn launcher(run: &Run, envs: &[String], args: &[String]) -> String {
     let w = run.w.to_string_lossy();
     let home = format!("{w}/home");
     let shim = run.run.join("shim");
-    let px = &run.proxy;
-    let stub = format!("http://127.0.0.1:{}", run.port);
+    let px = shell_quote(&run.proxy);
+    let stub = shell_quote(&format!("http://127.0.0.1:{}", run.port));
     let q = |s: &str| shell_quote(s);
     let mut s = String::from("#!/bin/sh\nclear\n");
     s.push_str(
@@ -92,8 +92,8 @@ pub fn launcher(run: &Run, envs: &[String], args: &[String]) -> String {
          -u OPENROUTER_API_KEY -u OPENROUTER_BASE_URL -u CODEX_HOME -u CLAUDE_CONFIG_DIR -u MUSE_MODEL \\\n",
     );
     s.push_str(&format!(
-        "  PATH=\"{}:$PATH\" HOME={} TMPDIR={} XDG_CONFIG_HOME={} XDG_DATA_HOME={} XDG_STATE_HOME={} XDG_CACHE_HOME={} \\\n",
-        shim.display(),
+        "  PATH={} HOME={} TMPDIR={} XDG_CONFIG_HOME={} XDG_DATA_HOME={} XDG_STATE_HOME={} XDG_CACHE_HOME={} \\\n",
+        shell_prepend_path(&shim.to_string_lossy()),
         q(&home),
         q(&format!("{w}/tmp")),
         q(&format!("{home}/.config")),

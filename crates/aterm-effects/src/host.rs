@@ -7,6 +7,11 @@ pub use aterm_time::Instant;
 
 use aterm_core::terminal::{ShellState, Terminal};
 
+pub mod light_latch;
+mod trail_ground;
+
+pub use trail_ground::{PageFacts, TrailGround, pane_light};
+
 /// The host's tri-state presentability (the pipeline's `set_effects_visibility` as a type): `Focused` (full profile), `VisibleUnfocused` (calm cap and drain), `Hidden` (a hard cursor-coordinate boundary: the resident pet retires its coordinate space and returns as a fresh sighting).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Visibility {
@@ -73,6 +78,76 @@ pub struct HostFrameInput {
     pub pointer_px: Option<(f32, f32)>,
     pub capture: CaptureMode,
     pub geometry: FrameGeom,
+}
+
+impl HostFrameInput {
+    /// A focused, full-motion, unshed live present at `now` over `geometry`, with the pointer off
+    /// the surface; each `with_*` sets one field, and a field added later takes its default here,
+    /// so no host or harness literal changes (§15.1 P0.1).
+    #[inline]
+    #[must_use]
+    pub const fn new(now: Instant, geometry: FrameGeom) -> Self {
+        Self {
+            now,
+            visibility: Visibility::Focused,
+            reduced_motion: false,
+            serious: false,
+            shed_envelope: 1.0,
+            shed_active: false,
+            pointer_px: None,
+            capture: CaptureMode::Present,
+            geometry,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn with_visibility(mut self, visibility: Visibility) -> Self {
+        self.visibility = visibility;
+        self
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn with_reduced_motion(mut self, reduced_motion: bool) -> Self {
+        self.reduced_motion = reduced_motion;
+        self
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn with_serious(mut self, serious: bool) -> Self {
+        self.serious = serious;
+        self
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn with_shed_envelope(mut self, shed_envelope: f32) -> Self {
+        self.shed_envelope = shed_envelope;
+        self
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn with_shed_active(mut self, shed_active: bool) -> Self {
+        self.shed_active = shed_active;
+        self
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn with_pointer_px(mut self, pointer_px: Option<(f32, f32)>) -> Self {
+        self.pointer_px = pointer_px;
+        self
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn with_capture(mut self, capture: CaptureMode) -> Self {
+        self.capture = capture;
+        self
+    }
 }
 
 /// Facts read from the [`Terminal`] once per frame under whatever lock the host holds, by one reader for every host.
@@ -255,6 +330,60 @@ pub enum Wake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `new` is the literal a test host wrote, and each setter moves only its own field: the
+    /// constructor every host and harness builds a frame's input through (§15.1 P0.1).
+    #[test]
+    fn a_host_frame_input_built_by_new_is_the_literal() {
+        let now = Instant::now();
+        let geometry = FrameGeom {
+            rows: 20,
+            cols: 100,
+            cell_w: 15,
+            cell_h: 28,
+            origin_px: (3, 4),
+        };
+        let plain = HostFrameInput {
+            now,
+            visibility: Visibility::Focused,
+            reduced_motion: false,
+            serious: false,
+            shed_envelope: 1.0,
+            shed_active: false,
+            pointer_px: None,
+            capture: CaptureMode::Present,
+            geometry,
+        };
+        assert_eq!(
+            format!("{:?}", HostFrameInput::new(now, geometry)),
+            format!("{plain:?}")
+        );
+        let every = HostFrameInput {
+            now,
+            visibility: Visibility::VisibleUnfocused,
+            reduced_motion: true,
+            serious: true,
+            shed_envelope: 0.25,
+            shed_active: true,
+            pointer_px: Some((5.0, 6.0)),
+            capture: CaptureMode::StaticCapture,
+            geometry,
+        };
+        let built = HostFrameInput::new(now, geometry)
+            .with_visibility(Visibility::VisibleUnfocused)
+            .with_reduced_motion(true)
+            .with_serious(true)
+            .with_shed_envelope(0.25)
+            .with_shed_active(true)
+            .with_pointer_px(Some((5.0, 6.0)))
+            .with_capture(CaptureMode::StaticCapture);
+        assert_eq!(format!("{built:?}"), format!("{every:?}"));
+        assert_ne!(
+            format!("{plain:?}"),
+            format!("{every:?}"),
+            "control: the setters moved the input off its defaults"
+        );
+    }
 
     /// The reader against a real emulator: fresh state, OSC 133 `C` as `shell_executing`,
     /// `D;<code>` as `cmd_done` with the completion seq.

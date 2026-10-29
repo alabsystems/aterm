@@ -1146,11 +1146,9 @@ pub(crate) fn run_window_with(
         .map_err(|e| format!("{} did not start: {e}", browser_name(browser)))?;
     let pid = i32::try_from(child.id()).unwrap_or(0);
     let kill_group = |child: &mut aterm_uds::spawnfd::Child| {
-        if pid > 0 {
-            // SAFETY: signals the group this window made for its own child, which is not yet
-            // reaped, so the group's id names no other process.
-            unsafe { libc::kill(-pid, libc::SIGKILL) };
-        }
+        // The group this window made for its own child, which is not yet reaped, so the
+        // group's id names no other process.
+        let _ = aterm_uds::process::kill_group_until_empty(pid);
         let _ = child.kill();
         let _ = child.wait();
     };

@@ -805,3 +805,53 @@ fn find_closes_with_the_content_it_searches() {
         "a pane focus move closes find"
     );
 }
+
+/// A CONTROL CLIENT'S FIND NEXT RECALLS NONE OF THE PERSON'S FINDS: the person finds `hunter2`
+/// (not on screen) in a terminal and accepts it; a control client's Find Next (its `invoke`, or a
+/// key it sent, under the controller mark) and its `^S` in an empty find field recall a find of
+/// the client's own (none), so the find bar it reads never shows the person's query. The
+/// client's own accepted find is recalled for it, and the person's Find Next still recalls
+/// theirs.
+/// NEGATIVE CONTROL: with `remembered_find` mutated to pick the person's find for every gesture
+/// (main's one find memory, `147b22abdc`), the client's Find Next found the person's `hunter2`
+/// to step (it answered `Ok(())` where it must refuse).
+#[test]
+fn a_controllers_find_next_recalls_none_of_the_persons_finds() {
+    use crate::app_search::SearchEdit;
+    const SECRET: &str = "hunter2";
+    let wid = WindowId(0);
+    let mut app = App::headless_for_test();
+    let shown = |app: &App| query(app, wid).map(|(query, _)| query);
+    let accept = |app: &mut App, text: &str| {
+        app.search_enter();
+        app.search_edit_in(wid, SearchEdit::Insert(text.to_string()));
+        app.search_accept_in(wid);
+    };
+    accept(&mut app, SECRET);
+    assert_eq!(shown(&app), None, "PRECONDITION: the person accepted it");
+
+    let stepped = app.with_gesture_source(true, |app| app.search_find_again_in(wid, true));
+    assert!(
+        stepped.is_err(),
+        "the client has no find to step: {stepped:?}"
+    );
+    assert_eq!(shown(&app), None, "the client's Find Next");
+    app.with_gesture_source(true, |app| {
+        app.search_enter();
+        app.search_repeat_in(wid, true);
+    });
+    assert_eq!(shown(&app).as_deref(), Some(""), "the client's ^S");
+    app.search_close_in(wid, false);
+    app.with_gesture_source(true, |app| accept(app, "own"));
+    let stepped = app.with_gesture_source(true, |app| app.search_find_again_in(wid, true));
+    assert!(stepped.is_ok(), "{stepped:?}");
+    assert_eq!(shown(&app).as_deref(), Some("own"), "the client's own find");
+    app.search_close_in(wid, false);
+
+    assert!(app.search_find_again_in(wid, true).is_ok());
+    assert_eq!(
+        shown(&app).as_deref(),
+        Some(SECRET),
+        "the person's Find Next"
+    );
+}

@@ -229,120 +229,6 @@ fn the_checker_catches_every_mutant_host_in_its_clause() {
     assert!(missed.is_empty(), "{}", missed.join("\n"));
 }
 
-#[test]
-fn the_reviewed_interleavings_hold() {
-    let adaptive = adaptive_remote();
-    for (label, ops) in reviewed_interleavings() {
-        let mut trace = Some(String::new());
-        if let Err((at, v)) = run_traced(adaptive, &ops, &mut trace) {
-            panic!(
-                "{label}: op {at} broke `{}`: {}\ntrace:\n{}",
-                v.clause,
-                v.detail,
-                trace.unwrap_or_default()
-            );
-        }
-    }
-}
-
-fn reviewed_interleavings() -> [(&'static str, Vec<Op>); 3] {
-    let proven_line = [
-        Op::Key(0, 1),
-        Op::Program(1, 0),
-        Op::Advance(60),
-        Op::Deliver(1024),
-        Op::Key(0, 2),
-        Op::Program(1, 0),
-        Op::Advance(60),
-        Op::Deliver(1024),
-    ];
-    [
-        (
-            "a guess retired without credit owes its own echo",
-            [
-                &[
-                    Op::Key(79, 0),
-                    Op::Program(1, 0),
-                    Op::Deliver(1024),
-                    Op::Advance(300),
-                ][..],
-                &proven_line,
-                &[
-                    Op::Key(0, 6),
-                    Op::Unprompted(Unprompted::StatusLine, 0),
-                    Op::Advance(10),
-                    Op::Deliver(755),
-                    Op::Deliver(1024),
-                    Op::Advance(180),
-                    Op::Key(0, 6),
-                    Op::Key(0, 118),
-                    Op::Key(0, 2),
-                    Op::Advance(40),
-                    Op::Program(1, 0),
-                    Op::Deliver(1024),
-                    Op::Advance(30),
-                    Op::Program(1, 0),
-                    Op::Deliver(1024),
-                    Op::Advance(10),
-                    Op::Program(2, 0),
-                    Op::Deliver(1024),
-                ],
-            ]
-            .concat(),
-        ),
-        (
-            "a tab switched away and back keeps its owed echo",
-            [
-                &proven_line[..],
-                &[
-                    Op::Key(0, 6),
-                    Op::Advance(10),
-                    Op::HostReset(false),
-                    Op::Key(0, 6),
-                    Op::Advance(50),
-                    Op::Program(1, 0),
-                    Op::Deliver(1024),
-                    Op::Key(0, 2),
-                    Op::Advance(50),
-                    Op::Program(2, 0),
-                    Op::Deliver(1024),
-                ],
-            ]
-            .concat(),
-        ),
-        (
-            "a key refused at the no-echo gate is owed",
-            [
-                &proven_line[..],
-                &[
-                    Op::Key(79, 1),
-                    Op::Program(1, 5),
-                    Op::Advance(60),
-                    Op::Deliver(1024),
-                    Op::Advance(300),
-                    Op::Key(79, 1),
-                    Op::Program(1, 0),
-                    Op::Advance(200),
-                    Op::Key(0, 6),
-                    Op::Program(1, 0),
-                    Op::Advance(40),
-                    Op::Deliver(950),
-                    Op::Advance(5),
-                    Op::Key(0, 6),
-                    Op::Program(1, 0),
-                    Op::Advance(15),
-                    Op::Deliver(1),
-                    Op::Key(0, 7),
-                    Op::Program(1, 0),
-                    Op::Advance(10),
-                    Op::Deliver(1024),
-                ],
-            ]
-            .concat(),
-        ),
-    ]
-}
-
 struct NamedCase {
     name: &'static str,
     cfg: Config,
@@ -367,6 +253,19 @@ fn adaptive_remote() -> Config {
 
 fn echoed(key: Op) -> [Op; 4] {
     [key, Op::Program(1, 0), Op::Advance(60), Op::Deliver(1024)]
+}
+
+fn proven_line() -> [Op; 8] {
+    [
+        Op::Key(0, 1),
+        Op::Program(1, 0),
+        Op::Advance(60),
+        Op::Deliver(1024),
+        Op::Key(0, 2),
+        Op::Program(1, 0),
+        Op::Advance(60),
+        Op::Deliver(1024),
+    ]
 }
 
 fn named_cases() -> Vec<NamedCase> {
@@ -415,8 +314,91 @@ fn named_cases() -> Vec<NamedCase> {
         NamedCase {
             name: "a_guess_retired_without_credit_owes_its_own_glyph",
             cfg: adaptive_remote(),
-            ops: reviewed_interleavings()[0].1.clone(),
+            ops: [
+                &[
+                    Op::Key(79, 0),
+                    Op::Program(1, 0),
+                    Op::Deliver(1024),
+                    Op::Advance(300),
+                ][..],
+                &proven_line(),
+                &[
+                    Op::Key(0, 6),
+                    Op::Unprompted(Unprompted::StatusLine, 0),
+                    Op::Advance(10),
+                    Op::Deliver(755),
+                    Op::Deliver(1024),
+                    Op::Advance(180),
+                    Op::Key(0, 6),
+                    Op::Key(0, 118),
+                    Op::Key(0, 2),
+                    Op::Advance(40),
+                    Op::Program(1, 0),
+                    Op::Deliver(1024),
+                    Op::Advance(30),
+                    Op::Program(1, 0),
+                    Op::Deliver(1024),
+                    Op::Advance(10),
+                    Op::Program(2, 0),
+                    Op::Deliver(1024),
+                ],
+            ]
+            .concat(),
             mutants: vec![Host::Rule(Rule::TypedOwesSameGlyph)],
+        },
+        NamedCase {
+            name: "a_tab_switched_away_and_back_keeps_its_owed_echo",
+            cfg: adaptive_remote(),
+            ops: [
+                &proven_line()[..],
+                &[
+                    Op::Key(0, 6),
+                    Op::Advance(10),
+                    Op::HostReset(false),
+                    Op::Key(0, 6),
+                    Op::Advance(50),
+                    Op::Program(1, 0),
+                    Op::Deliver(1024),
+                    Op::Key(0, 2),
+                    Op::Advance(50),
+                    Op::Program(2, 0),
+                    Op::Deliver(1024),
+                ],
+            ]
+            .concat(),
+            mutants: vec![],
+        },
+        NamedCase {
+            name: "a_key_refused_at_the_no_echo_gate_is_owed",
+            cfg: adaptive_remote(),
+            ops: [
+                &proven_line()[..],
+                &[
+                    Op::Key(79, 1),
+                    Op::Program(1, 5),
+                    Op::Advance(60),
+                    Op::Deliver(1024),
+                    Op::Advance(300),
+                    Op::Key(79, 1),
+                    Op::Program(1, 0),
+                    Op::Advance(200),
+                    Op::Key(0, 6),
+                    Op::Program(1, 0),
+                    Op::Advance(40),
+                    Op::Deliver(950),
+                    Op::Advance(5),
+                    Op::Key(0, 6),
+                    Op::Program(1, 0),
+                    Op::Advance(15),
+                    Op::Deliver(1),
+                    Op::Key(0, 7),
+                    Op::Program(1, 0),
+                    Op::Advance(10),
+                    Op::Deliver(1024),
+                ],
+            ]
+            .concat(),
+            mutants: vec![],
         },
         NamedCase {
             name: "a_cancelled_glyph_leaves_its_cell_as_the_anchor",

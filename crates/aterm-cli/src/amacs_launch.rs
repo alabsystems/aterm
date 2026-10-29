@@ -9,7 +9,7 @@ use std::ffi::OsString;
 use std::process::ExitCode;
 
 /// Run amacs with `args` (argv past `amacs`, or past `aterm edit`).
-#[must_use]
+#[must_use = "return the editor's exit status from the front door"]
 pub fn run(args: Vec<OsString>) -> ExitCode {
     // SAFETY: the trusted entry of the amacs process, reached exactly once, before amacs processes
     // any of its input (an argument, a key, a file): the front door has only matched argv0 and the

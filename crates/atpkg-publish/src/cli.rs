@@ -39,6 +39,11 @@ pub const VERBS: &[Verb] = &[
         does: "pack, gate and sign a prebuilt package tree (codex, built in codex-alab)",
     },
     Verb {
+        name: "pack-bottle",
+        synopsis: artifact::bottle::SYNOPSIS,
+        does: "stage, relocate, gate and sign an upstream bottle or binary archive (gh, git)",
+    },
+    Verb {
         name: "build-local",
         synopsis: "build-local <program> <checkout> [--plan] [--policy repository|unverified] [--profile release|dev] [--jobs N] [--toolchain BIN] [--out DIR] [--link]",
         does: "development build of a program: unsigned, never packed or uploaded",
@@ -112,6 +117,7 @@ pub fn dispatch(ctx: &Ctx, verb: &str, rest: &[String]) -> Result<()> {
         "pack" => artifact::pack::run(ctx, rest),
         "pack-bundle" => artifact::bundle::run(ctx, rest),
         "pack-package" => artifact::package::run(ctx, rest),
+        "pack-bottle" => artifact::bottle::run(ctx, rest),
         "build-local" => artifact::build_local::run(ctx, rest),
         "sign" => artifact::sign::run(ctx, rest),
         "upload" => artifact::upload::run(ctx, rest),

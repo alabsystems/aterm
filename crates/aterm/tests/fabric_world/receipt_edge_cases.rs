@@ -451,12 +451,16 @@ fn x4_an_ask_deduped_onto_a_note_records_no_expired() {
 }
 
 /// X5. `post --wait-ack` with `dl=` and no receipt answers `ERR expired` when
-/// the deadline passes first.
+/// the deadline passes first. Each wait names the hang detector as its bound,
+/// so only its own `expired` releases it: the default bound, `dl=` plus the
+/// expiry grace, is a latency budget a loaded machine misses, and aterm-gui-fabric's
+/// `post_wait_ack_returns_the_verdict_or_the_expiry_and_is_bounded_by_dl` holds it.
 #[test]
 fn x5_wait_ack_past_its_deadline_answers_expired() {
     let w = World::boot_flags("rvx5", &["--receipts"]);
     w.wait_ready();
     let (a, b) = w.two_sessions();
+    let bound = DEADLINE.as_millis();
     let answers: Vec<(String, bool)> = std::thread::scope(|scope| {
         let posts: Vec<_> = [300u64, 600]
             .into_iter()
@@ -466,7 +470,7 @@ fn x5_wait_ack_past_its_deadline_answers_expired() {
                 scope.spawn(move || {
                     let t = Instant::now();
                     let r = w.verb(&format!(
-                        "@{a} post to=@{b} kind=ask dl={dl} --wait-ack nobody-acks-{i}"
+                        "@{a} post to=@{b} kind=ask dl={dl} --wait-ack={bound} nobody-acks-{i}"
                     ));
                     let took = t.elapsed();
                     let own = kv(r.header(), "off").is_some_and(|off| {

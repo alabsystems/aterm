@@ -131,6 +131,10 @@ fn scunthorpe_problem() {
         "wildcat", // not a listed form; "cat" is a substring only
         "bobcat",
         "located",
+        "cat_food",
+        "my_cat",
+        "concat_str",
+        "cat5",
     ] {
         assert_eq!(
             classes(decoy, &o),
@@ -147,15 +151,11 @@ fn code_and_path_context_suppressed() {
         "cat.txt",
         "/api/cat/list",
         "format.cat",
-        "cat_food",
-        "my_cat",
-        "concat_str",
         "github.com/cat",
         "https://example.com/cats",
         "--cat",
         "cat=1",
         "$cat",
-        "cat5",
     ] {
         assert_eq!(
             classes(code, &o),
@@ -328,23 +328,23 @@ fn every_surface_round_trips() {
             let witness = marked_witness(surface);
             let got = lx.scan(&witness, &o);
             assert!(
-                got.iter().any(|m| m.class == class),
+                got.iter().any(|m| m.class == class && !m.langs.is_empty()),
                 "marks-required surface {surface:?} ({class:?}) did not \
-                 round-trip via marked witness {witness:?}; got {got:?}"
+                 round-trip, with its langs, via marked witness {witness:?}; got {got:?}"
             );
             continue;
         }
         let got = lx.scan(surface, &o);
         assert!(
-            got.iter().any(|m| m.class == class),
-            "surface {surface:?} ({class:?}) did not round-trip; got {got:?}"
+            got.iter().any(|m| m.class == class && !m.langs.is_empty()),
+            "surface {surface:?} ({class:?}) did not round-trip with its langs; got {got:?}"
         );
     }
     for (surface, class) in lx.iter_cjk() {
         let got = lx.scan(surface, &o);
         assert!(
-            got.iter().any(|m| m.class == class),
-            "cjk surface {surface:?} ({class:?}) did not round-trip; got {got:?}"
+            got.iter().any(|m| m.class == class && !m.langs.is_empty()),
+            "cjk surface {surface:?} ({class:?}) did not round-trip with its langs; got {got:?}"
         );
     }
 }
@@ -562,7 +562,8 @@ fn form_hash_populated_and_position_independent() {
     let o = opts_allow_cat();
     let ms = lx.scan("cat and CAT and cats", &o);
     assert_eq!(ms.len(), 3);
-    assert_ne!(ms[0].form_hash, 0);
+    assert_eq!(ms[0].form_hash, aterm_lexicon::form_hash("cat"));
+    assert_eq!(ms[2].form_hash, aterm_lexicon::form_hash("cats"));
     assert_eq!(
         ms[0].form_id, ms[1].form_id,
         "form_id is the collision-free exact folded key: case/position independent"
@@ -692,34 +693,12 @@ fn empty_lang_interns_as_unknown() {
 }
 
 #[test]
-fn every_surface_has_langs() {
-    let lx = lex();
-    let o = ScanOptions {
-        allow_bare_cat: true,
-        cjk_single_char: true,
-        ..ScanOptions::default()
-    };
-    for (surface, class) in lx.iter_spaced().chain(lx.iter_cjk()) {
-        let text = if lx.surface_requires_marks(surface) {
-            marked_witness(surface)
-        } else {
-            surface.to_string()
-        };
-        let got = lx.scan(&text, &o);
-        assert!(
-            got.iter().any(|m| m.class == class && !m.langs.is_empty()),
-            "surface {surface:?} ({class:?}) has no langs; got {got:?}"
-        );
-    }
-}
-
-#[test]
 fn form_hash_populated_on_cjk_path() {
     let lx = lex();
     let o = default_opts();
     let a = lx.scan("子猫", &o);
     assert_eq!(a.len(), 1);
-    assert_ne!(a[0].form_hash, 0);
+    assert_eq!(a[0].form_hash, aterm_lexicon::form_hash("子猫"));
     let b = lx.scan("これは子猫です", &o);
     assert_eq!(b.len(), 1);
     assert_eq!(

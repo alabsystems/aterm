@@ -44,10 +44,13 @@ mod tests {
 
     #[test]
     fn a_failed_plain_exec_leaves_sigpipe_ignored_where_command_exec_does_not() {
+        if zz_helper_entry_if_asked() {
+            return;
+        }
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "exec_plain::tests::zz_helper_entry",
+                "exec_plain::tests::a_failed_plain_exec_leaves_sigpipe_ignored_where_command_exec_does_not",
                 "--nocapture",
                 "--test-threads=1",
             ])
@@ -66,10 +69,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn zz_helper_entry() {
+    fn zz_helper_entry_if_asked() -> bool {
         if std::env::var_os(HELPER_ENV).is_none() {
-            return;
+            return false;
         }
         println!();
         println!("PRECONDITION sigpipe_ignored={}", sigpipe_is_ignored());
@@ -93,5 +95,6 @@ mod tests {
             error.raw_os_error(),
             sigpipe_is_ignored()
         );
+        true
     }
 }

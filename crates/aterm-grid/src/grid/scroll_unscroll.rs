@@ -77,6 +77,7 @@ impl Grid {
                 "unscroll_from_scrollback: failed to remove {from_tiered} lines from scrollback: {e}"
             );
         }
+        self.storage.note_history_popped(available, n);
         self.storage.history_renumber_epoch = self.storage.history_renumber_epoch.saturating_add(1);
         self.force_selection_invalidation();
         let top_u16 = self.storage.scroll_region.top;

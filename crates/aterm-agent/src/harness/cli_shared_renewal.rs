@@ -280,6 +280,21 @@ impl Guard<'_> {
         Ok(())
     }
 
+    /// Observe the captured row, parent and authority after waiting for the writer.
+    pub(super) fn check_policy(
+        &self,
+        store: &accounts::Store,
+        policy: accounts::RenewalPolicy<'_>,
+        now: i64,
+    ) -> Result<(), String> {
+        store
+            .transact_renewal_within(&accounts::LOCK_LADDER, now, &mut None, policy, |_, _| {
+                self.check(policy.row)?;
+                Ok(Vec::new())
+            })
+            .map(|_| ())
+    }
+
     pub(super) fn publish(
         &mut self,
         logins: &mut accounts::Logins,
@@ -362,6 +377,14 @@ pub(in crate::harness) fn unmanaged(
 
 /// Run exactly one renewal. No fallback or retry re-enters a consumed grant.
 /// The provider's own sign-in may still require a person at the terminal.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountRenewalIdentity",
+        action = "Replay",
+        project = "aterm_agent::harness::cli::tests::renewal_identity::renewal_identity_transition"
+    )
+)]
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -524,4 +547,47 @@ pub fn run(
         guard.failed(&store, host.now().max(env.now), err);
         ExitCode::from(1)
     }
+}
+
+/// The upkeep already holds sign-in admission and has selected an unattended
+/// route. It uses the same grant consumption and publication as explicit renewal.
+pub(in crate::harness) fn background(
+    env: &Env,
+    host: &dyn AccountsHost,
+    store: &accounts::Store,
+    signin: &accounts::Lock,
+    policy: accounts::RenewalPolicy<'_>,
+    browser: &RenewBrowser,
+    authority: &dyn Authority,
+) -> Renewal {
+    let mut request = [0; 16];
+    if aterm_uds::rand::fill(&mut request).is_err() || request == [0; 16] {
+        return Renewal::Failed;
+    }
+    let mut guard = Guard::Shared {
+        authority,
+        request,
+        grant: None,
+        token: None,
+    };
+    let own_dir = policy
+        .roster
+        .row(&policy.row.label)
+        .and_then(|row| row.dir.as_deref());
+    let result = renew_one_guarded(
+        env,
+        host,
+        store,
+        signin,
+        policy,
+        own_dir,
+        browser,
+        &mut io::sink(),
+        &mut io::sink(),
+        &mut guard,
+    );
+    if result != Renewal::Renewed {
+        guard.failed(store, host.now().max(env.now), &mut io::sink());
+    }
+    result
 }

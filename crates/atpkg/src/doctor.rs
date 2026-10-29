@@ -45,20 +45,87 @@ const fn problem_listing_start(
     }
 }
 
+/// What the toolset row weighs: the default set this machine keeps
+/// ([`crate::cli::wanted_programs`], the index's programs and the vendor rows that serve here)
+/// against what is installed.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Missing {
+    /// How many wanted programs are installed or dev-linked.
+    present: usize,
+    /// Wanted and not installed, with no recorded reason.
+    unexplained: Vec<String>,
+    /// Wanted and not installed because a person removed it (the removed ledger).
+    on_purpose: Vec<String>,
+    /// In the default set here and not installed because `[packages].exclude` leaves it out.
+    excluded: Vec<String>,
+}
+
+/// [`Missing`] against the cached signed index and this machine's triple. With no index read
+/// yet it weighs the default set's vendor half alone ([`crate::cli::vendor_set_here`]) once
+/// this machine has taken the set on (the adoption marker `seed` and `install --default-set`
+/// write), since the vendor lane completes that half without an index; before then, nothing.
 fn missing_against_index(
     layout: &Layout,
     installed: &std::collections::BTreeMap<String, u64>,
     dev_linked: &std::collections::BTreeSet<String>,
-) -> (Vec<String>, Vec<String>, Vec<String>) {
-    let Some(index) = crate::cli::cached_index(layout) else {
-        return (Vec::new(), Vec::new(), Vec::new());
-    };
-    split_missing(
-        &crate::cli::wanted_programs(&index, crate::config::cached()),
+) -> Missing {
+    let index = crate::cli::cached_index(layout);
+    if index.is_none() && !layout.adopted().is_file() {
+        return Missing::default();
+    }
+    missing_from_set(
+        index.as_deref(),
+        crate::config::cached(),
+        crate::cli::current_triple(),
         installed,
         &layout.removed_programs(),
         dev_linked,
     )
+}
+
+/// [`Missing`] for `index` (or, with none, the vendor half alone) and `cfg` on `triple`.
+fn missing_from_set(
+    index: Option<&crate::manifest::Index>,
+    cfg: &crate::config::PackagesConfig,
+    triple: &str,
+    installed: &std::collections::BTreeMap<String, u64>,
+    removed: &std::collections::BTreeSet<String>,
+    dev_linked: &std::collections::BTreeSet<String>,
+) -> Missing {
+    let none = std::collections::BTreeSet::new();
+    let (default_set, wanted) = match index {
+        Some(index) => (
+            crate::cli::default_set_here(index, triple),
+            crate::cli::wanted_programs(index, cfg, triple),
+        ),
+        None => (
+            crate::cli::vendor_set_here(triple, &crate::config::PackagesConfig::default(), &none),
+            crate::cli::vendor_set_here(triple, cfg, &none),
+        ),
+    };
+    let here = |program: &String| installed.contains_key(program) || dev_linked.contains(program);
+    let (unexplained, on_purpose, _) = split_missing(&wanted, installed, removed, dev_linked);
+    let excluded = default_set
+        .difference(&wanted)
+        .filter(|program| !here(program))
+        .cloned()
+        .collect();
+    Missing {
+        present: wanted.iter().filter(|program| here(program)).count(),
+        unexplained,
+        on_purpose,
+        excluded,
+    }
+}
+
+/// The clause the toolset row adds for [`Missing::excluded`]: a person's narrowing, said
+/// without calling it a problem.
+fn excluded_clause(excluded: &[String]) -> String {
+    if excluded.is_empty() {
+        String::new()
+    } else {
+        format!("; [packages].exclude leaves out {}", excluded.join(", "))
+    }
 }
 
 fn live_dev_links(layout: &Layout) -> (std::collections::BTreeSet<String>, Vec<String>) {
@@ -273,6 +340,9 @@ pub struct Probes {
     /// the other probes and once for a pass whose repair items read it too
     /// ([`packages_rows_sharing`]); `None` leaves [`report_with`] to read it.
     pub exec_root: Option<(u64, Option<Result<crate::compat::Inspection, String>>)>,
+    /// LAN sharing of toolset archives as read ([`crate::peers::sharing`]), or `None` when
+    /// this report does not read it (the default: a fixture shares nothing).
+    pub lan: Option<crate::peers::Sharing>,
 }
 
 /// What [`probe_trust_chain`] found on the active Trust build's chain.
@@ -525,6 +595,7 @@ impl Default for Probes {
             login_rc: None,
             rustup_answers: None,
             exec_root: None,
+            lan: None,
         }
     }
 }
@@ -1132,6 +1203,7 @@ fn rows_reading(
         devtools: None,
         rustup_answers: Some(rustup_answers),
         exec_root,
+        lan: Some(crate::peers::sharing(layout, cfg.peers.as_deref())),
     };
     probes.devtools = devtools.and_then(|read| {
         read.join()
@@ -2516,6 +2588,14 @@ pub(crate) fn read(
         ),
         None => Finding::unread(c::DISK, Class::Person, title, "could not query free space"),
     });
+    if let Some(lan) = probes.lan.as_ref() {
+        f.push(Finding::ok(
+            c::LAN_SHARING,
+            Class::Install,
+            "LAN toolset sharing",
+            lan.line(),
+        ));
+    }
 
     if let Some(row) = probes.devtools.as_ref().and_then(crate::devtools::row) {
         let title = "aterm on the Developer Tools list";
@@ -3237,8 +3317,55 @@ pub(crate) fn read(
             }
         }
     }
-    let recorded_problems = recorded_problems(status.as_ref());
-    let toolset_unserved = toolset_unserved_here(status.as_ref());
+    let (toolset, active_count) = toolset_findings(layout, &installed, status.as_ref());
+    f.extend(toolset);
+
+    if active_count > 0
+        && let Some(verdict) = probes.cc.as_ref()
+    {
+        let title = "the C toolchain";
+        let line = verdict.line();
+        f.push(match verdict {
+            crate::prereq::CcVerdict::Ready { .. } => {
+                Finding::ok(c::CLT, Class::Elevate, title, line).essential()
+            }
+            crate::prereq::CcVerdict::NotProbed => {
+                Finding::note(c::CLT, Class::Elevate, title, line).essential()
+            }
+            crate::prereq::CcVerdict::Unanswered { .. }
+            | crate::prereq::CcVerdict::Unproven { .. } => {
+                Finding::unread(c::CLT, Class::Elevate, title, line)
+            }
+            _ => Finding::change(
+                c::CLT,
+                Class::Elevate,
+                title,
+                line,
+                "a C toolchain that builds",
+                verdict
+                    .fix()
+                    .map_or(Remedy::None, |fix| Remedy::Command(fix.to_owned())),
+            )
+            .essential(),
+        });
+    }
+    f
+}
+
+/// The toolset's findings, in report order (a dev link that does not run, the platform note,
+/// the toolset row [`c::TOOLSET`], each dev link and each program removed on purpose, then each
+/// recorded problem the row does not name), and how many programs are active: what `status`
+/// records and `installed` holds, weighed against the default set here
+/// ([`crate::cli::wanted_programs`]). It reads the store and the cached index alone: no
+/// program runs and nothing reaches the network.
+fn toolset_findings(
+    layout: &Layout,
+    installed: &std::collections::BTreeMap<String, u64>,
+    status: Option<&crate::Status>,
+) -> (Vec<Finding>, usize) {
+    let mut f: Vec<Finding> = Vec::new();
+    let recorded_problems = recorded_problems(status);
+    let toolset_unserved = toolset_unserved_here(status);
     let recorded_problems: Vec<String> = if toolset_unserved.is_some() {
         recorded_problems
             .into_iter()
@@ -3267,8 +3394,12 @@ pub(crate) fn read(
         .chain(dev_linked.iter())
         .collect::<std::collections::BTreeSet<_>>()
         .len();
-    let (missing_unexplained, missing_on_purpose, _indexed_dev_linked) =
-        missing_against_index(layout, &installed, &dev_linked);
+    let Missing {
+        present,
+        unexplained: missing_unexplained,
+        on_purpose: missing_on_purpose,
+        excluded,
+    } = missing_against_index(layout, installed, &dev_linked);
     let missing_unexplained = drop_unserved(missing_unexplained, toolset_unserved.as_deref());
     if let Some(unserved) = &toolset_unserved {
         let (vendors, alab): (Vec<&String>, Vec<&String>) = unserved
@@ -3353,11 +3484,7 @@ pub(crate) fn read(
     } else if active_count == 0 {
         match recorded_problems.first() {
             Some(why) => problem(format!("no ALab programs are installed ({why})")),
-            None => match status
-                .as_ref()
-                .map(|s| s.outcome.as_str())
-                .filter(|o| !o.is_empty())
-            {
+            None => match status.map(|s| s.outcome.as_str()).filter(|o| !o.is_empty()) {
                 Some(outcome) => problem(format!(
                     "no ALab programs are installed (last attempt: {outcome})"
                 )),
@@ -3370,18 +3497,22 @@ pub(crate) fn read(
         ))
     } else if !missing_unexplained.is_empty() {
         problem(format!(
-            "the toolset is incomplete: {} of {} program(s) the signed index serves are not \
-             installed ({})",
+            "the toolset is incomplete: {} of {} program(s) in the default set here are not \
+             installed ({}){}",
             missing_unexplained.len(),
-            active_count + missing_unexplained.len() + missing_on_purpose.len(),
-            missing_unexplained.join(", ")
+            present + missing_unexplained.len() + missing_on_purpose.len(),
+            missing_unexplained.join(", "),
+            excluded_clause(&excluded)
         ))
     } else {
         Finding::ok(
             c::TOOLSET,
             Class::Install,
             toolset,
-            format!("{active_count} program(s) active"),
+            format!(
+                "{active_count} program(s) active{}",
+                excluded_clause(&excluded)
+            ),
         )
         .detail(active_count.to_string())
     };
@@ -3425,37 +3556,20 @@ pub(crate) fn read(
             ));
         }
     }
+    (f, active_count)
+}
 
-    if active_count > 0
-        && let Some(verdict) = probes.cc.as_ref()
-    {
-        let title = "the C toolchain";
-        let line = verdict.line();
-        f.push(match verdict {
-            crate::prereq::CcVerdict::Ready { .. } => {
-                Finding::ok(c::CLT, Class::Elevate, title, line).essential()
-            }
-            crate::prereq::CcVerdict::NotProbed => {
-                Finding::note(c::CLT, Class::Elevate, title, line).essential()
-            }
-            crate::prereq::CcVerdict::Unanswered { .. }
-            | crate::prereq::CcVerdict::Unproven { .. } => {
-                Finding::unread(c::CLT, Class::Elevate, title, line)
-            }
-            _ => Finding::change(
-                c::CLT,
-                Class::Elevate,
-                title,
-                line,
-                "a C toolchain that builds",
-                verdict
-                    .fix()
-                    .map_or(Remedy::None, |fix| Remedy::Command(fix.to_owned())),
-            )
-            .essential(),
-        });
-    }
-    f
+/// The toolset row ([`c::TOOLSET`]) as `aterm pkg doctor` reports it, read without the rest of
+/// the report: `aterm init`'s `base.pkg.toolset` reads its check side here. It reads the store
+/// and the cached index alone ([`toolset_findings`]).
+#[must_use]
+pub fn toolset_row(layout: &Layout) -> Option<ItemReport> {
+    let installed = crate::ops::active_builds(layout);
+    let status = crate::status::read(layout);
+    let (findings, _) = toolset_findings(layout, &installed, status.as_ref());
+    crate::converge::report(findings)
+        .into_iter()
+        .find(|row| row.id == c::TOOLSET)
 }
 
 #[derive(Debug, Default)]
@@ -3468,7 +3582,8 @@ struct ToolsetFacts<'a> {
     recorded_problems: &'a [String],
     /// The owner declined the toolset.
     declined: bool,
-    /// Members the signed index serves are missing with no recorded reason.
+    /// Members of the default set here ([`crate::cli::wanted_programs`]) are missing with no
+    /// recorded reason.
     missing: bool,
     /// A member was removed on purpose (the removed ledger).
     removed_on_purpose: bool,
@@ -3574,6 +3689,7 @@ enum ToolClaim {
 fn withheld_summary(cannot: usize, unproven: usize) -> String {
     const UNPROVEN: &str = "may not run or cannot be checked";
     match (cannot, unproven) {
+        (0, 0) => String::new(),
         (c, 0) => format!("{c} managed tool(s) cannot run"),
         (0, u) => format!("{u} managed tool(s) {UNPROVEN}"),
         (c, u) => format!("{c} managed tool(s) cannot run and {u} {UNPROVEN}"),

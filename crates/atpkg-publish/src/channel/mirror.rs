@@ -419,7 +419,7 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
         match args[i].as_str() {
             "--dry-run" => opts.dry_run = true,
             "--quad" => dir = Some(PathBuf::from(flag_value(args, &mut i, "--quad")?)),
-            other if !other.starts_with("--") && dir.is_none() => dir = Some(PathBuf::from(other)),
+            other if !other.starts_with('-') && dir.is_none() => dir = Some(PathBuf::from(other)),
             other => {
                 return Err(Error::usage(format!(
                     "mirror: unknown argument `{other}` (mirror <quad-dir> [--dry-run])"
@@ -437,12 +437,21 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
         quad.index.attribution().machine_id
     ));
     if !opts.dry_run {
-        let ok = std::fs::metadata(&ctx.tokens.channel).is_ok_and(|m| m.len() > 0);
-        if !ok {
-            return Err(Error::refused(format!(
-                "publishing needs the public owner's token at {} (--dry-run plans without it)",
-                ctx.shown(&ctx.tokens.channel)
-            )));
+        match ctx.usable_token(&ctx.tokens.channel) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(Error::refused(format!(
+                    "publishing needs the public owner's token at {} (--dry-run plans without it)",
+                    ctx.shown(&ctx.tokens.channel)
+                )));
+            }
+            Err(why) => {
+                return Err(Error::refused(format!(
+                    "publishing needs the public owner's token at {}: {why} (--dry-run plans \
+                     without it)",
+                    ctx.shown(&ctx.tokens.channel)
+                )));
+            }
         }
     }
     mirror(ctx, &quad, &opts, &mut log).map(|_| ())

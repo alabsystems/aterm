@@ -393,13 +393,30 @@ fn elf(marker: u8, target: LinuxTarget) -> Vec<u8> {
 
 fn fixture_parent() -> PathBuf {
     use std::os::unix::fs::DirBuilderExt;
+    let temp = std::env::temp_dir().canonicalize().ok();
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .and_then(|p| p.canonicalize().ok());
     let beside_build = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent()?.parent().map(Path::to_path_buf));
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+        .and_then(|exe| exe.parent()?.parent()?.canonicalize().ok());
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let home = PathBuf::from(std::env::var_os("HOME")?);
+            if cfg!(target_os = "macos") {
+                Some(home.join("Library/Caches"))
+            } else {
+                Some(home.join(".cache"))
+            }
+        })
+        .and_then(|p| {
+            let _ = fs::DirBuilder::new().recursive(true).mode(0o700).create(&p);
+            p.canonicalize().ok()
+        });
     let mut refused = Vec::new();
-    for base in beside_build.into_iter().chain(home) {
-        let parent = base.join(".aterm-linux-update-tests");
+    for base in [temp, runtime, beside_build, cache].into_iter().flatten() {
+        let parent = base.join(".ubd/aterm-linux-update-tests.noindex");
         let made = fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)

@@ -46,6 +46,9 @@ pub struct Run {
     pub rows: String,
     /// `1` when the instance runs under the headless-restore seam.
     pub seam: String,
+    /// `1` when the instance reads the stub's route as the default route
+    /// (`ATERM_DEBUG_LAB_DEFAULT_ROUTE`, [`crate::lab::UpOpts::route_seam`]).
+    pub route_seam: String,
     /// The Codex binary the lab launches by path, when one is managed here.
     pub codex_bin: String,
     /// Its version, from its store package (`0.163.0`).
@@ -81,6 +84,13 @@ pub struct Run {
     /// `1` when the instance's disk scans read the jail's processes alone (`LAB_JAIL_SCAN=1`,
     /// [`crate::lab::UpOpts::jail_scan`]).
     pub jail_scan: String,
+    /// The live dir of the lab's own bus (`<sockdir>/fabric`: the broker's socket and logs, the
+    /// bridge's state) when `up --fabric` stood one ([`crate::bus::lay`]); empty when none.
+    pub fabric: String,
+    /// The lab's broker's pid (`up --fabric`), 0 when none.
+    pub broker_pid: i32,
+    /// `1` when `up --tab-strip` gave the instance its one-row tab strip (`tab_strip_rows = 1`).
+    pub tab_strip: String,
 }
 
 impl Run {
@@ -116,6 +126,7 @@ impl Run {
             ("COLS", self.cols.clone()),
             ("ROWS", self.rows.clone()),
             ("SEAM", self.seam.clone()),
+            ("ROUTE_SEAM", self.route_seam.clone()),
             ("CODEX_BIN", self.codex_bin.clone()),
             ("CODEX_VER", self.codex_ver.clone()),
             ("AGY_BIN", self.agy_bin.clone()),
@@ -139,6 +150,9 @@ impl Run {
             ("REROUTE", self.reroute.clone()),
             ("HOME_IMAGE", self.home_image.clone()),
             ("JAIL_SCAN", self.jail_scan.clone()),
+            ("FABRIC", self.fabric.clone()),
+            ("BROKER_PID", self.broker_pid.to_string()),
+            ("TAB_STRIP", self.tab_strip.clone()),
         ]
     }
 
@@ -179,6 +193,7 @@ impl Run {
                 "COLS" => r.cols = v,
                 "ROWS" => r.rows = v,
                 "SEAM" => r.seam = v,
+                "ROUTE_SEAM" => r.route_seam = v,
                 "CODEX_BIN" => r.codex_bin = v,
                 "CODEX_VER" => r.codex_ver = v,
                 "AGY_BIN" => r.agy_bin = v,
@@ -195,6 +210,9 @@ impl Run {
                 "REROUTE" => r.reroute = v,
                 "HOME_IMAGE" => r.home_image = v,
                 "JAIL_SCAN" => r.jail_scan = v,
+                "FABRIC" => r.fabric = v,
+                "BROKER_PID" => r.broker_pid = pid(&v),
+                "TAB_STRIP" => r.tab_strip = v,
                 _ => {}
             }
         }
@@ -384,6 +402,7 @@ mod tests {
             cols: "144".into(),
             rows: "50".into(),
             seam: "0".into(),
+            route_seam: "1".into(),
             codex_bin: "/Users//o/Library/Application Support/aterm/pkg/store/codex/1/bin/codex"
                 .into(),
             codex_ver: "0.163.0".into(),
@@ -403,6 +422,9 @@ mod tests {
             reroute: "1".into(),
             home_image: "/s/runs/t1/home.sparseimage".into(),
             jail_scan: "1".into(),
+            fabric: "/tmp/at.AbCd/fabric".into(),
+            broker_pid: 14,
+            tab_strip: "1".into(),
         };
         assert_eq!(Run::parse(&r.render()), r);
         assert_eq!(r.fixture_prefix(), "codex-0.163.0");

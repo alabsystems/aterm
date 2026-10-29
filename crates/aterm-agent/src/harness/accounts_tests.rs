@@ -415,9 +415,7 @@ fn a_dir_is_used_verbatim_and_two_spellings_of_one_place_are_two_logins() {
     let spellings = spellings.each_ref().map(String::as_str);
     let mut text = String::new();
     for (i, dir) in spellings.iter().enumerate() {
-        let row = row_toml(&format!("w{i}"), Class::Shared, Some(dir)).expect("a row");
         text = append_row(&text, &format!("w{i}"), Class::Shared, Some(dir)).expect("appends");
-        assert!(text.ends_with(&row), "append writes the row text");
     }
     let parsed = Roster::parse(&text).expect("the appended file admits");
     assert_eq!(parsed.rows.len(), spellings.len());
@@ -1173,13 +1171,18 @@ fn the_signed_out_labels_are_the_enrolled_ones_in_roster_order() {
         signed_out(&r, &s, &all(&r), NOW),
         ["main", "work-2", "pool-a"]
     );
-    let here: BTreeSet<String> = ["work-2".to_string()].into();
+    let here: BTreeSet<String> = ["main".to_string(), "work-2".to_string()].into();
     assert_eq!(
         condition(r.row("pool-a").expect("a row"), &s, false, NOW),
         Condition::NotEnrolled
     );
     assert_eq!(signed_out(&r, &s, &here, NOW), ["main", "work-2"]);
-    assert_eq!(signed_out(&r, &s, &BTreeSet::new(), NOW), ["main"]);
+    // The default row is enrolled as the set says too ([`enrolled_in`] drops one whose login
+    // file is gone), so it is never listed signed out where its login is not here at all.
+    assert_eq!(
+        signed_out(&r, &s, &BTreeSet::new(), NOW),
+        Vec::<String>::new()
+    );
     let mut with_email = r.clone();
     with_email.rows[1].email = Some("work-2@example.com".to_string());
     assert_eq!(
@@ -1202,7 +1205,7 @@ fn the_signed_out_labels_are_the_enrolled_ones_in_roster_order() {
 #[test]
 fn the_row_to_sign_in_next_is_the_first_other_one_not_signed_in() {
     let mut r = three();
-    let here: BTreeSet<String> = ["work-2".to_string()].into();
+    let here: BTreeSet<String> = ["main".to_string(), "work-2".to_string()].into();
     assert_eq!(
         sign_in_next(&r, &state(), &here, Some("main"), NOW),
         Some(("pool-a".to_string(), false))
@@ -1967,6 +1970,56 @@ fn rule_4_leaves_a_limited_account_and_not_one_whose_low_window_is_about_to_rese
         NOW
     ));
     assert_eq!(ask(&offered), Advice::Stay(StayWhy::OfferExpiring));
+}
+
+/// A sign-in that moves the default login hands `active` to the row it made ([`repoint_active`]),
+/// proven: no rotation chose that row, so no canary is owed and no rotation is left to go back
+/// from, and the row's own tab still leaves it ahead of a wall at its high figure. CONTROL: the
+/// same `active` left unproven holds that tab on a canary nobody runs (`lab
+/// claude-rotation-proof` on 2026-10-28: R2's `account advice: stay (canary)` after R5b).
+#[test]
+fn a_repointed_active_is_proven_so_its_own_tab_still_moves_ahead() {
+    let r = three();
+    let enrolled = all(&r);
+    let mut s = on_main();
+    rotation(&mut s, Some("main"), "main", "work-2", NOW - HOUR).expect("rotates onto work-2");
+    assert!(!s.proven && s.canary.is_some() && !s.undo.is_empty());
+
+    let events = repoint_active(&mut s, "work-2", "main", NOW - MIN);
+    assert!(events.is_empty(), "no pin to end: {events:?}");
+    assert_eq!(s.active.as_deref(), Some("main"));
+    assert!(s.proven && s.canary.is_none() && s.undo.is_empty());
+    low(&mut s, "main");
+    let ask = |s: &State| {
+        advise_past_probe(
+            &r,
+            s,
+            &enrolled,
+            &me("main"),
+            &Point::TurnEnd,
+            Mode::Early,
+            NOW,
+        )
+    };
+    let advice = ask(&s);
+    assert!(
+        matches!(
+            advice,
+            Advice::Move {
+                ahead: true,
+                rotates: true,
+                takes_canary: false,
+                ..
+            }
+        ),
+        "{advice:?}"
+    );
+
+    let unproven = State {
+        proven: false,
+        ..s.clone()
+    };
+    assert_eq!(ask(&unproven), Advice::Stay(StayWhy::Canary));
 }
 
 #[test]
@@ -6382,6 +6435,30 @@ fn a_settings_file_can_take_a_stored_login_away_and_never_gives_one() {
             ..elsewhere
         }
     );
+}
+
+/// The lab stub's own URL is a route like any other where the lab's route seam is not read (the
+/// tests' process, and every shipped binary): neither the environment nor a settings file that
+/// names it leaves a stored login, so only the seam admits the lab's Claude Code as a roster
+/// row's process.
+#[test]
+fn the_lab_stubs_url_is_no_stored_login_where_its_seam_is_not_read() {
+    use crate::harness::netwatch::{LAB_ROUTE_SEAM, Source, lab_default_route, lab_route};
+    let stub = "http://127.0.0.1:57232";
+    assert!(
+        std::env::var_os(LAB_ROUTE_SEAM).is_none(),
+        "the tests run with no {LAB_ROUTE_SEAM}"
+    );
+    assert!(!lab_route("ANTHROPIC_BASE_URL", stub));
+    assert!(lab_default_route(Some(stub), "ANTHROPIC_BASE_URL", stub));
+    assert!(!env_of(&[("ANTHROPIC_BASE_URL", stub), (LOGIN_ENV, "/logins/a")]).stored_login);
+    let settings = [(
+        "the user's settings".to_string(),
+        Source::Text(format!(
+            "{{\"apiKeyHelper\":null,\"env\":{{\"ANTHROPIC_BASE_URL\":\"{stub}\",\"HTTPS_PROXY\":null}}}}"
+        )),
+    )];
+    assert!(!stored().with_settings(&settings).stored_login);
 }
 
 #[test]

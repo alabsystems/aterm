@@ -28,16 +28,18 @@ USAGE:
     start      Put the mug in the menu bar as a launchd job of this login
                (acaffiene=started), or name the one there (acaffiene=running
                pid=<n>). The default.
-    on [span]  Keep the Mac awake for the span (forever by default; at most a
-               year) and put the mug in the menu bar. acaffiene=requested
-               until=… says the request is saved, not that the mug took it.
+    on [span]  Keep the Mac awake for the span, then forever (forever by
+               default; a span is at most a year), and put the mug in the
+               menu bar. acaffiene=requested until=… (the span's end) says
+               the request is saved, not that the mug took it.
     off        Stop keeping it awake; the mug stays, empty (acaffiene=off).
     status     acaffiene=on|off (the saved mode while a mug runs; a mug whose
-               activity was refused saves off), until=<unix seconds>|forever|-,
-               menu=running and pid=<n>, or menu=stopped, then the running
-               mug's job (else this build's): startup=on|off|blocked|disabled
-               and label=<launchd label>. It reads what was saved;
-               `pmset -g assertions` shows whether the activity is held.
+               activity was refused saves off), until=<unix seconds>|forever|-
+               (a span's end, after which it reads forever), menu=running and
+               pid=<n>, or menu=stopped, then the running mug's job (else this
+               build's): startup=on|off|blocked|disabled and label=<launchd
+               label>. It reads what was saved; `pmset -g assertions` shows
+               whether the activity is held.
     startup    Say whether this build's mug starts at every login; `on` or `off`
                sets it (a plist in ~/Library/LaunchAgents; `off` also removes
                any whose build is gone) and leaves the running mug as it is.
@@ -52,15 +54,18 @@ USAGE:
     serve      Run the mug in this process (what its launchd job runs). It
                exits 0 even when it refuses, so launchd does not restart it,
                and, as that job, 75 when an update replaces its aterm, so
-               launchd starts the new one.
+               launchd starts the new one, or when a mode set on while it
+               quits overtakes the Quit, so launchd starts it again.
     bridge     Keep the Mac awake while the mug restarts onto an aterm update,
                until the new mug takes over or keep-awake ends, at most 21 min
                (what a restarting mug runs).
 
 Every ordinary aterm window launch starts the mug and keeps the Mac awake forever;
-headless, diagnostic and private-control launches do not. Quit ends it until the
-next aterm launch, which turns it back on. Enable at Startup separately starts it
-at every login. Missing state, a reboot and an expired span return to forever.
+headless, diagnostic and private-control launches do not, and a window that an
+update or a launch-record renewal restarts keeps the mode as saved. Quit ends it
+until the next aterm launch, which turns it back on. Enable at Startup separately
+starts it at every login. Missing state, a reboot and an expired span return to
+forever.
 Exit status: 1 when a command fails, 2 for a refused command line. macOS only.
 ";
 
@@ -156,7 +161,7 @@ pub fn usage_error(why: &str) -> String {
 /// What every command but help says off macOS.
 pub const MACOS_ONLY: &str = "aterm acaffiene: macOS only";
 
-/// When `mode` ends, as `status` and `on` print it at `now`: `forever`, the deadline in Unix seconds as the wall clock reads now ([`Clocks::wall_at`]), or `-` when off.
+/// When the span of `mode` ends, as `status` and `on` print it at `now`: `forever`, the deadline in Unix seconds as the wall clock reads now ([`Clocks::wall_at`]), or `-` when off.
 #[must_use]
 pub fn until_word(mode: Mode, now: Clocks) -> String {
     match mode.settled(now) {
@@ -256,10 +261,39 @@ fn run(command: Command, version: &str) -> ExitCode {
     }
 }
 
-/// Start the mug for an ordinary aterm window launch, without writing to its standard output.
+/// How an ordinary aterm window came to start, as [`autostart`] takes it.
 #[cfg(target_os = "macos")]
-pub fn autostart() {
-    mac::autostart();
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Launch {
+    /// A launch: the mug is set to forever and started.
+    Fresh,
+    /// A running window's successor, an update's or a launch-record renewal's, which can come
+    /// while the person is away: the mug is started only when the mode saved restores on, and
+    /// nothing is saved, so their Off or Quit carries over it as over the mug's own restart onto
+    /// an update.
+    Successor,
+}
+
+/// Start the mug for an ordinary aterm window ([`Launch`]), without writing to its standard
+/// output.
+#[cfg(target_os = "macos")]
+pub fn autostart(launch: Launch) {
+    mac::autostart(launch);
+}
+
+/// The mug's files, when this process has the login's own roots ([`mac::login_paths`]).
+#[cfg(target_os = "macos")]
+pub(crate) fn login_paths() -> Result<crate::paths::Paths, String> {
+    mac::login_paths()
+}
+
+/// Take this login's turn to change the mode and start or end the mug on it ([`mac::change`]).
+#[cfg(target_os = "macos")]
+pub(crate) fn change(
+    paths: &crate::paths::Paths,
+    said: impl FnOnce(String),
+) -> Option<crate::state::Held> {
+    mac::change(paths, said)
 }
 
 /// The verbs, on macOS.
@@ -267,6 +301,7 @@ pub fn autostart() {
 mod mac {
     use std::path::{Path, PathBuf};
     use std::process::ExitCode;
+    use std::time::{Duration, Instant};
 
     use crate::code;
     use crate::instance::{self, Instance};
@@ -370,7 +405,8 @@ mod mac {
     }
 
     /// Whether a mug runs now, or how it was started.
-    enum Running {
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum Running {
         /// One runs, with this pid.
         Already(u32),
         /// launchd was asked to start it.
@@ -383,14 +419,106 @@ mod mac {
         instance::running_mug(&paths.lock_file(), &paths.code_dir())
     }
 
-    /// Make sure a mug runs: the one holding the lock, else this build's job, started.
+    /// How long [`ensure`] waits for a mug to hold the lock: this build's job's process holding
+    /// none to take it or end (a mug takes it as it starts, after its first exec, which macOS may
+    /// assess for seconds, and one that quits lets go of it just before it ends), and a job it
+    /// started to show its mug there.
+    const SETTLE: Duration = Duration::from_secs(10);
+
+    /// How often [`ensure`] looks again while it waits.
+    const SETTLE_POLL: Duration = Duration::from_millis(100);
+
+    /// Make sure a mug runs: the one holding the lock, else this build's job, started
+    /// ([`ensure_with`]).
     fn ensure(here: &Here) -> Result<Running, String> {
-        if let Some(holder) = running_mug(&here.paths) {
-            return Ok(Running::Already(holder.pid));
+        ensure_with(
+            || running_mug(&here.paths),
+            || launchd::ensure_running(&here.paths, &here.label, &here.origin),
+            Instant::now() + SETTLE,
+            || std::thread::sleep(SETTLE_POLL),
+        )
+    }
+
+    /// [`ensure`], with the mug holding the lock read by `mug` and this build's job started by
+    /// `job` ([`launchd::ensure_running`]), looking again after `pause` up to `until`. A job whose
+    /// process holds no lock is waited for until it does or ends: one starting has not taken it
+    /// yet, and one ending after the person's Quit has let go of it to read the mode again, so a
+    /// mode saved on after that read starts the job again once its process is gone, where that
+    /// mug would otherwise end, its job left loaded and idle, with nothing to start it; past
+    /// `until` that process is taken for the running mug. A job started is waited for until a mug
+    /// holds the lock with its job's label written: a [`change`] held across this then lasts
+    /// until a `quit` of another build finds that mug and its job, where it would otherwise find
+    /// neither, answer `stopped`, and leave the mug starting to read its off (a `quit` of this
+    /// build finds the job by its own label).
+    pub(super) fn ensure_with(
+        mut mug: impl FnMut() -> Option<instance::Holder>,
+        mut job: impl FnMut() -> Result<Started, String>,
+        until: Instant,
+        mut pause: impl FnMut(),
+    ) -> Result<Running, String> {
+        let mut started = false;
+        loop {
+            let holder = mug();
+            if started {
+                if holder.is_some_and(|holder| holder.label.is_some()) || Instant::now() >= until {
+                    return Ok(Running::Started);
+                }
+                pause();
+                continue;
+            }
+            if let Some(holder) = holder {
+                return Ok(Running::Already(holder.pid));
+            }
+            match job()? {
+                Started::AlreadyRunning { .. } if Instant::now() < until => pause(),
+                Started::AlreadyRunning { pid } => return Ok(Running::Already(pid)),
+                Started::Kicked | Started::Bootstrapped => started = true,
+            }
         }
-        match launchd::ensure_running(&here.paths, &here.label, &here.origin)? {
-            Started::AlreadyRunning { pid } => Ok(Running::Already(pid)),
-            Started::Kicked | Started::Bootstrapped => Ok(Running::Started),
+    }
+
+    /// How long a change waits for another's [`change`] before it goes on without it: past a
+    /// [`quit`]'s wait for the mug it ended ([`QUIT_WAIT`]) and its start of one again
+    /// ([`SETTLE`]).
+    const CHANGE_WAIT: Duration = Duration::from_secs(30);
+
+    /// How often a change waiting for another's looks again.
+    const CHANGE_POLL: Duration = Duration::from_millis(20);
+
+    /// Take this login's turn to change the mode and start or end the mug on it: a window's
+    /// start, `on` and [`quit`] each hold it from the read or save of the mode to the start or
+    /// end of the mug, and a job's mug ending after the person's Quit from before it removes its
+    /// copy, its lock still held, over its let-go of the lock, its read of the mode and its naming
+    /// of the job again, so none runs inside another. A `quit` run between a window's
+    /// save of forever and its start would otherwise save off, find no mug to end and answer
+    /// `stopped`, and the window would then start a mug that reads off. The turn is a `flock` on
+    /// the session plists' folder ([`Paths::session_dir`]), made if missing, which no save of the
+    /// mode locks ([`state::Held`]); `None`, with why passed to `said`, when it is not taken
+    /// within [`CHANGE_WAIT`] or cannot be, and the change goes on without it.
+    pub(super) fn change(paths: &Paths, said: impl FnOnce(String)) -> Option<state::Held> {
+        match change_in(&paths.session_dir(), CHANGE_WAIT) {
+            Ok(held) => Some(held),
+            Err(why) => {
+                said(format!(
+                    "{why}; going on without taking turns with another start or quit"
+                ));
+                None
+            }
+        }
+    }
+
+    /// [`change`]'s `flock` on `dir`, made if missing, waited for up to `wait`; why it was not
+    /// taken: still held by another once `wait` is up, or the folder's error.
+    pub(super) fn change_in(dir: &Path, wait: Duration) -> Result<state::Held, String> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        match state::hold_dir(dir, wait, || std::thread::sleep(CHANGE_POLL)) {
+            Ok(Some(held)) => Ok(held),
+            Ok(None) => Err(format!(
+                "another start or quit still held {} after {} s",
+                dir.display(),
+                wait.as_secs()
+            )),
+            Err(e) => Err(format!("{}: {e}", dir.display())),
         }
     }
 
@@ -407,7 +535,7 @@ mod mac {
         }
     }
 
-    pub(super) fn autostart() {
+    pub(super) fn autostart(launch: super::Launch) {
         let here = match here() {
             Ok(here) => here,
             Err(why) => {
@@ -416,12 +544,77 @@ mod mac {
             }
         };
         launchd::prune_orphans(&here.paths);
-        if let Err(why) = set_mode(&here.paths, Mode::Forever) {
-            aterm_log::warn!("acaffiene: could not keep aterm awake: {why}");
-            return;
+        for line in crate::legacy::tidy(&here.paths, &here.origin) {
+            aterm_log::warn!("acaffiene: what `aterm caffeine` left: {line}");
+        }
+        let beside = state::sweep_temps(&here.paths);
+        let plists = launchd::sweep_plist_temps(&here.paths);
+        for (file, swept) in beside.into_iter().chain(plists) {
+            match swept {
+                Ok(0) => {}
+                Ok(gone) => {
+                    let noun = if gone == 1 {
+                        "temporary"
+                    } else {
+                        "temporaries"
+                    };
+                    aterm_log::info!(
+                        "acaffiene: removed {gone} {noun} of {} that writes cut short left",
+                        file.display()
+                    );
+                }
+                Err(e) => aterm_log::warn!("acaffiene: temporaries of {}: {e}", file.display()),
+            }
+        }
+        let _turn = change(&here.paths, |why| aterm_log::warn!("acaffiene: {why}"));
+        match plan(launch, &here.paths.state_file(), now().ok()) {
+            Plan::Forever => {
+                if let Err(why) = set_mode(&here.paths, Mode::Forever) {
+                    aterm_log::warn!(
+                        "acaffiene: did not start with aterm to keep this Mac awake: saving \
+                         forever failed: {why}"
+                    );
+                    return;
+                }
+            }
+            Plan::Start => {}
+            Plan::Leave => {
+                aterm_log::info!(
+                    "acaffiene: not started with this window, which takes over a running one: \
+                     the mode saved is off"
+                );
+                return;
+            }
         }
         if let Err(why) = ensure(&here) {
             aterm_log::warn!("acaffiene: could not start with aterm: {why}");
+        }
+    }
+
+    /// What [`autostart`] does with the mug.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Plan {
+        /// Save forever, then make sure the mug runs.
+        Forever,
+        /// Make sure the mug runs, saving nothing.
+        Start,
+        /// Leave the mug and its mode as they are.
+        Leave,
+    }
+
+    /// What [`autostart`] does for `launch` with the mode saved in `file`, at `now` (`None`: the
+    /// clocks could not be read). A launch saves forever; a successor starts the mug only when
+    /// that mode restores on ([`state::load`]), as with no file, for a build that has not run
+    /// the mug yet, and leaves it otherwise, as it does when the clocks cannot be read.
+    pub(super) fn plan(launch: super::Launch, file: &Path, now: Option<Clocks>) -> Plan {
+        match launch {
+            super::Launch::Fresh => Plan::Forever,
+            super::Launch::Successor
+                if now.is_some_and(|now| state::load(file, now).is_on(now)) =>
+            {
+                Plan::Start
+            }
+            super::Launch::Successor => Plan::Leave,
         }
     }
 
@@ -434,8 +627,13 @@ mod mac {
     }
 
     pub(super) fn on(span: Option<u64>) -> ExitCode {
-        let (here, now) = match here_now() {
-            Ok(both) => both,
+        let here = match here() {
+            Ok(here) => here,
+            Err(why) => return fail(why),
+        };
+        let _turn = change(&here.paths, |why| eprintln!("{VERB}: {why}"));
+        let now = match now() {
+            Ok(now) => now,
             Err(why) => return fail(why),
         };
         let mode = Mode::activate(span, now);
@@ -535,8 +733,13 @@ mod mac {
     const QUIT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
     pub(super) fn quit(own: bool) -> ExitCode {
-        let (here, now) = match here_now() {
-            Ok(both) => both,
+        let here = match here() {
+            Ok(here) => here,
+            Err(why) => return fail(why),
+        };
+        let _turn = change(&here.paths, |why| eprintln!("{VERB}: {why}"));
+        let now = match now() {
+            Ok(now) => now,
             Err(why) => return fail(why),
         };
         let lock = here.paths.lock_file();
@@ -602,11 +805,29 @@ mod mac {
         if !other && here.paths.code_dir().exists() {
             discard_copy(&here.paths);
         }
+        if !own && saved.is_ok() && state::saved_on(&here.paths.state_file(), now) {
+            start_again(&here);
+        }
         match saved {
             Err(why) => fail(why),
             Ok(()) if !ended.is_empty() => answer("acaffiene=quit\n"),
             Ok(()) => answer("acaffiene=stopped\n"),
         }
+    }
+
+    /// Start a mug for a writer whose on landed while [`quit`] ended the last one: one that takes no
+    /// [`change`] (the ending mug's own menu, or a window's start or an `on` of a build before it)
+    /// found the ending mug still holding its lock and started none, and the bootout leaves no job
+    /// that launchd would start again. Said on stderr; `quit`'s answer stays.
+    /// Not after `quit own`, a scoped uninstall's: it ends this build because the build is going,
+    /// and the build that stays starts its own mug at its next window.
+    fn start_again(here: &Here) {
+        let how = match ensure(here) {
+            Ok(Running::Already(pid)) => format!("one runs (pid {pid})"),
+            Ok(Running::Started) => "one was started".to_string(),
+            Err(why) => format!("starting one failed: {why}"),
+        };
+        eprintln!("{VERB}: the mode was set on again while the mug quit; {how}");
     }
 
     /// Remove the ended mug's copy of the app, as a mug that quits from its menu does: once an
@@ -615,8 +836,9 @@ mod mac {
         let Ok(Some(held)) = Instance::try_hold(&paths.lock_file()) else {
             return;
         };
-        if let Err(e) = code::discard_copies(&paths.code_dir()) {
-            eprintln!("{VERB}: {}: {e}", paths.code_dir().display());
+        match code::discard_copies(&paths.code_dir()) {
+            Ok(kept) => kept.say(),
+            Err(e) => eprintln!("{VERB}: {}: {e}", paths.code_dir().display()),
         }
         drop(held);
     }
@@ -824,6 +1046,201 @@ mod tests {
         );
         let why = mac::login_paths().expect_err("a test binary's private root");
         assert!(why.contains("ATERM_STATE_HOME"), "{why}");
+    }
+
+    /// A launch saves forever whatever the file says; a running window's successor starts the
+    /// mug only for a mode saved on, read as a restore reads it ([`mac::plan`]): no file, as for
+    /// a build new to the mug, and a saved on do; the person's off and unreadable clocks do not.
+    /// Planning saves nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_windows_successor_starts_the_mug_only_for_a_mode_saved_on() {
+        use mac::{Plan, plan};
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("acaffiene.state");
+        let now = crate::state::clocks();
+        assert!(now.is_some(), "the clocks read");
+        assert_eq!(plan(Launch::Fresh, &file, now), Plan::Forever);
+        assert_eq!(
+            plan(Launch::Successor, &file, now),
+            Plan::Start,
+            "no file: a build new to the mug"
+        );
+        assert!(!file.exists(), "nothing saved");
+        crate::state::save(&file, Mode::Off).expect("save off");
+        let off = std::fs::read(&file).expect("off");
+        assert_eq!(
+            plan(Launch::Successor, &file, now),
+            Plan::Leave,
+            "the person's off"
+        );
+        assert_eq!(plan(Launch::Fresh, &file, now), Plan::Forever);
+        assert_eq!(
+            std::fs::read(&file).expect("read again"),
+            off,
+            "nothing saved"
+        );
+        crate::state::save(&file, Mode::Forever).expect("save forever");
+        assert_eq!(plan(Launch::Successor, &file, now), Plan::Start);
+        assert_eq!(
+            plan(Launch::Successor, &file, None),
+            Plan::Leave,
+            "no clocks"
+        );
+    }
+
+    /// A start finds the mug holding the lock; else, while this build's job runs a process that
+    /// holds none (a mug starting, or one ending after a Quit), it looks again until a mug holds
+    /// the lock or the job's process is gone and the job is started, and past its time takes the
+    /// job's process for the mug; a job it started it waits for until a mug holds the lock with
+    /// its label written, or its time is up ([`mac::ensure_with`]).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_start_waits_out_a_jobs_process_that_holds_no_lock() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+
+        use crate::instance::Holder;
+        use crate::launchd::Started;
+        use mac::{Running, ensure_with};
+        let later = Instant::now() + Duration::from_secs(60);
+        let named = |pid| Holder {
+            pid,
+            label: Some("com.aterm.aterm.acaffiene.dev.0123abcd".to_string()),
+        };
+        let bounded = |waits: &Cell<u32>| {
+            waits.set(waits.get() + 1);
+            assert!(waits.get() < 10, "a wait that ends");
+        };
+
+        let (kicked, looks, waits) = (Cell::new(false), Cell::new(0), Cell::new(0));
+        let ended = ensure_with(
+            || kicked.get().then(|| named(9)),
+            || {
+                looks.set(looks.get() + 1);
+                kicked.set(looks.get() == 3);
+                Ok(if kicked.get() {
+                    Started::Kicked
+                } else {
+                    Started::AlreadyRunning { pid: 7 }
+                })
+            },
+            later,
+            || bounded(&waits),
+        );
+        assert_eq!(
+            ended,
+            Ok(Running::Started),
+            "the ending mug's job, started again"
+        );
+        assert_eq!((looks.get(), waits.get()), (3, 2));
+
+        let (mugs, waits) = (Cell::new(0), Cell::new(0));
+        let starting = ensure_with(
+            || {
+                mugs.set(mugs.get() + 1);
+                (mugs.get() == 3).then(|| named(9))
+            },
+            || Ok(Started::AlreadyRunning { pid: 8 }),
+            later,
+            || bounded(&waits),
+        );
+        assert_eq!(
+            starting,
+            Ok(Running::Already(9)),
+            "a starting mug takes the lock"
+        );
+
+        let (mugs, waits) = (Cell::new(0), Cell::new(0));
+        let started = ensure_with(
+            || {
+                mugs.set(mugs.get() + 1);
+                match mugs.get() {
+                    1 => None,
+                    2 => Some(Holder {
+                        pid: 9,
+                        label: None,
+                    }),
+                    _ => Some(named(9)),
+                }
+            },
+            || Ok(Started::Bootstrapped),
+            later,
+            || bounded(&waits),
+        );
+        assert_eq!(started, Ok(Running::Started));
+        assert_eq!(
+            (mugs.get(), waits.get()),
+            (3, 1),
+            "the started job is waited for, a pause between looks, until its mug names its label"
+        );
+
+        let past = ensure_with(
+            || None,
+            || Ok(Started::AlreadyRunning { pid: 7 }),
+            Instant::now(),
+            || panic!("no wait past its time"),
+        );
+        assert_eq!(past, Ok(Running::Already(7)));
+        for started in [Started::Kicked, Started::Bootstrapped] {
+            assert_eq!(
+                ensure_with(
+                    || None,
+                    || Ok(started),
+                    Instant::now(),
+                    || panic!("no wait")
+                ),
+                Ok(Running::Started),
+                "a started job whose mug is not up in time"
+            );
+        }
+        let held = ensure_with(
+            || Some(named(5)),
+            || panic!("the mug holding the lock runs"),
+            later,
+            || panic!("no wait"),
+        );
+        assert_eq!(held, Ok(Running::Already(5)));
+        assert_eq!(
+            ensure_with(|| None, || Err("refused".to_string()), later, || {}),
+            Err("refused".to_string())
+        );
+    }
+
+    /// One change of mode and its start or end of the mug at a time: a second waits out the
+    /// first's turn up to its time, and takes it once the first lets go; the turn's folder is
+    /// made if missing, and a folder that cannot be made says why, at once ([`mac::change_in`]).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_change_waits_for_anothers_turn() {
+        use std::time::Duration;
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let folder = dir.path().join("state").join("acaffiene");
+        let first = mac::change_in(&folder, Duration::ZERO).expect("the first turn");
+        assert!(folder.is_dir(), "made");
+        let start = std::time::Instant::now();
+        let Err(why) = mac::change_in(&folder, Duration::from_millis(200)) else {
+            panic!("another's turn");
+        };
+        assert!(start.elapsed() >= Duration::from_millis(200), "waited");
+        assert!(
+            why.starts_with("another start or quit still held "),
+            "{why}"
+        );
+        drop(first);
+        assert!(
+            mac::change_in(&folder, Duration::ZERO).is_ok(),
+            "taken once the first let go"
+        );
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"").expect("a file where the folder goes");
+        let start = std::time::Instant::now();
+        let Err(why) = mac::change_in(&blocked.join("acaffiene"), Duration::from_secs(60)) else {
+            panic!("no folder");
+        };
+        assert!(start.elapsed() < Duration::from_secs(60), "no wait");
+        assert!(why.starts_with(&blocked.display().to_string()), "{why}");
+        assert!(!why.contains("still held"), "{why}");
     }
 
     /// A `serve` that will not run lets a bridge an update restart left go, and exits 0; one

@@ -190,7 +190,6 @@ pub struct ProcWatch {
 struct Script {
     queue: std::sync::Mutex<std::collections::VecDeque<ProcEvent>>,
     follows: std::sync::Mutex<Vec<Option<i32>>>,
-    drains: std::sync::atomic::AtomicUsize,
 }
 
 /// The test side of a [`ProcWatch::scripted`] watch.
@@ -222,12 +221,6 @@ impl ProcScript {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-    }
-
-    /// How many times the reader drained the watch.
-    #[must_use]
-    pub fn drains(&self) -> usize {
-        self.script.drains.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Events posted and not yet drained.
@@ -373,9 +366,6 @@ impl ProcWatch {
             let mut sink = [0u8; 64];
             // SAFETY: Reading into `sink`'s 64 bytes from this watch's own non-blocking pipe.
             while unsafe { libc::read(self.fd(), sink.as_mut_ptr().cast(), sink.len()) } > 0 {}
-            script
-                .drains
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             out.extend(
                 script
                     .queue

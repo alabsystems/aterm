@@ -147,6 +147,144 @@ fn copy_path_writes_the_absolute_cwd() {
     );
 }
 
+/// A CONTROL CLIENT'S ENTER ON A FACT MENU'S COPY ROW COPIES NOTHING: with the person's
+/// right-click menu open and Copy path highlighted, a control client's `key enter` (the seam's
+/// `autopilot_menu_input_event`, inside its marked dispatch) chooses the row and closes the menu
+/// but keeps the clipboard's text; the person's choice of the row copies the cwd.
+/// NEGATIVE CONTROL: against main's code at this leaf (`64ab1a704f`), the controller's Enter
+/// wrote the cwd to the clipboard (`choose_fact_act` had no check).
+#[test]
+fn a_controllers_enter_on_a_fact_copy_row_copies_nothing() {
+    let board = || crate::control::PBPASTE_STUB.with(|b| b.borrow().clone());
+    crate::control::PBPASTE_STUB.with(|b| *b.borrow_mut() = Some("before".into()));
+    let (mut app, wid, session, _reader) = glass(true);
+    let _host = host(&mut app);
+    menu_frame(&mut app, wid);
+    press_fact(&mut app, wid, session, Fact::Path, MouseButton::Right);
+    let i = row_of(&app, "fact-menu/path/copy-path");
+    app.autopilot_menu.as_mut().expect("open").highlight = Some(i);
+    let enter = crate::control::parse_key("enter").expect("a key");
+    let _ = app.input(wid, enter, crate::input::Source::Controller);
+    assert!(app.autopilot_menu.is_none(), "chosen and closed");
+    assert_eq!(board().as_deref(), Some("before"), "the controller's Enter");
+
+    menu_frame(&mut app, wid);
+    press_fact(&mut app, wid, session, Fact::Path, MouseButton::Right);
+    let i = row_of(&app, "fact-menu/path/copy-path");
+    app.choose_autopilot_menu_row(i);
+    assert_eq!(
+        board().as_deref(),
+        Some("/Users//someone/aterm"),
+        "the person's choice"
+    );
+    crate::control::PBPASTE_STUB.with(|b| *b.borrow_mut() = None);
+}
+
+#[test]
+fn recovery_copy_requires_activation_and_preserves_the_full_detail() {
+    use aterm_agent::harness::account_progress::{AccountProgress, ProgressPhase};
+
+    let sentinel = "existing clipboard";
+    crate::control::PBPASTE_STUB.with(|b| *b.borrow_mut() = Some(sentinel.into()));
+    let (mut app, wid, session, mut reader) = glass(false);
+    let _host = host(&mut app);
+    let detail = format!(
+        "current: {} complete recovery instruction tail",
+        "long route evidence ".repeat(12)
+    );
+    let mut progress = AccountProgress::unknown(1_793_040_000);
+    progress.account = Some("current".into());
+    progress.known = Some(2);
+    progress.eligible = Some(0);
+    progress.phase = ProgressPhase::Waiting;
+    progress.details.push(detail.clone());
+    progress.next_at = Some(1_793_040_160);
+    {
+        let entry = app.pool.get(session).expect("session");
+        let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(timeline.set_account_progress(PGID, None, None, Some(progress.clone())));
+    }
+    app.on_claude_footer_changed(session);
+    menu_frame(&mut app, wid);
+    press_fact(&mut app, wid, session, Fact::Account, MouseButton::Right);
+    assert_eq!(
+        crate::control::PBPASTE_STUB
+            .with(|b| b.borrow().clone())
+            .as_deref(),
+        Some(sentinel)
+    );
+    let choice = row_of(&app, "fact-menu/account/copy-recovery");
+    app.choose_autopilot_menu_row(choice);
+    let copied = crate::control::PBPASTE_STUB
+        .with(|b| b.borrow().clone())
+        .expect("copied report");
+    assert!(copied.contains(&detail));
+    assert!(copied.contains(&aterm_agent::harness::usage::rfc3339_utc(
+        progress.observed_at
+    )));
+    assert!(copied.contains(&aterm_agent::harness::usage::rfc3339_utc(
+        progress.next_at.unwrap()
+    )));
+    assert!(pty(&mut reader, 0).is_empty());
+    crate::control::PBPASTE_STUB.with(|b| *b.borrow_mut() = None);
+}
+
+#[test]
+fn recovery_copy_cannot_overwrite_clipboard_after_progress_is_cleared() {
+    use aterm_agent::harness::account_progress::{AccountProgress, ProgressPhase};
+
+    let sentinel = "leave this clipboard alone";
+    crate::control::PBPASTE_STUB.with(|b| *b.borrow_mut() = Some(sentinel.into()));
+    let (mut app, wid, session, mut reader) = glass(false);
+    let _host = host(&mut app);
+    let mut progress = AccountProgress::unknown(1_793_040_000);
+    progress.phase = ProgressPhase::Waiting;
+    progress.details.push("current: sign-in required".into());
+    {
+        let entry = app.pool.get(session).expect("session");
+        let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(timeline.set_account_progress(PGID, None, None, Some(progress)));
+    }
+    app.on_claude_footer_changed(session);
+    menu_frame(&mut app, wid);
+    press_fact(&mut app, wid, session, Fact::Account, MouseButton::Right);
+    let choice = row_of(&app, "fact-menu/account/copy-recovery");
+    {
+        let entry = app.pool.get(session).expect("session");
+        let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(timeline.set_account_progress(PGID, None, None, None));
+    }
+    // Keep the stale menu row visible: activation must consult the current owner.
+    app.choose_autopilot_menu_row(choice);
+    assert_eq!(
+        crate::control::PBPASTE_STUB
+            .with(|b| b.borrow().clone())
+            .as_deref(),
+        Some(sentinel)
+    );
+    {
+        let entry = app.pool.get(session).expect("session");
+        let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        let mut facts = timeline.claude_footer().expect("published facts").clone();
+        facts.account = Some("current".into());
+        assert!(timeline.set_claude_footer(PGID, None, Some(facts)));
+    }
+    app.on_claude_footer_changed(session);
+    menu_frame(&mut app, wid);
+    press_fact(&mut app, wid, session, Fact::Account, MouseButton::Right);
+    assert!(!app.autopilot_menu.as_ref().expect("account menu").rows.iter().any(|row| {
+            matches!(row,MenuRow::Item {act,enabled:true,..} if act.key()=="fact-menu/account/copy-recovery")
+        }));
+    assert_eq!(
+        crate::control::PBPASTE_STUB
+            .with(|b| b.borrow().clone())
+            .as_deref(),
+        Some(sentinel)
+    );
+    assert!(pty(&mut reader, 0).is_empty());
+    crate::control::PBPASTE_STUB.with(|b| *b.borrow_mut() = None);
+}
+
 #[test]
 fn new_tab_here_asks_for_the_cwd() {
     NEW_TABS_ASKED.with(|asked| asked.borrow_mut().clear());

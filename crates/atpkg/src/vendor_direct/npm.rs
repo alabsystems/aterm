@@ -152,7 +152,7 @@ fn held_to(doc: &aterm_json::Value, what: &str, want: &Expected<'_>) -> Result<(
                 aterm_json::Value::Array(items) => Some(items),
                 _ => None,
             })
-            .map(|items| items.iter().filter_map(aterm_json::Value::as_str).collect());
+            .and_then(|items| items.iter().map(aterm_json::Value::as_str).collect());
         if words.as_deref() != Some(&[word][..]) {
             return Err(format!(
                 "npm's {what} for {at} is not for {key} {word} alone"
@@ -480,7 +480,17 @@ mod tests {
                 "not for os linux alone",
             ),
             (
+                edit(LINUX_X64, "\"os\":[\"linux\"]", "\"os\":[\"linux\",123]"),
+                NPM_REGISTRY_KEYS,
+                "not for os linux alone",
+            ),
+            (
                 edit(LINUX_X64, "\"cpu\":[\"x64\"]", "\"cpu\":[\"arm64\"]"),
+                NPM_REGISTRY_KEYS,
+                "not for cpu x64 alone",
+            ),
+            (
+                edit(LINUX_X64, "\"cpu\":[\"x64\"]", "\"cpu\":[\"x64\",null]"),
                 NPM_REGISTRY_KEYS,
                 "not for cpu x64 alone",
             ),

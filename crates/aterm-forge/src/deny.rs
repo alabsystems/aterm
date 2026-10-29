@@ -126,10 +126,12 @@ pub fn findings(
                 .as_deref()
                 .map_or(Some(true), |req| satisfies(req, &pkg.version))
         };
+        let mut ban_findings = Vec::new();
+        let mut bad_req = false;
         for pkg in &graph.nodes {
             match matches(pkg) {
                 None => {
-                    out.push(Finding::BadRequirement { ban: ban.clone() });
+                    bad_req = true;
                     break;
                 }
                 Some(false) => {}
@@ -143,7 +145,7 @@ pub fn findings(
                         .collect();
                     let rooted = *pkg == graph.root;
                     if rooted || !via.is_empty() {
-                        out.push(Finding::Banned {
+                        ban_findings.push(Finding::Banned {
                             pkg: pkg.clone(),
                             via,
                             ban: ban.clone(),
@@ -151,6 +153,11 @@ pub fn findings(
                     }
                 }
             }
+        }
+        if bad_req {
+            out.push(Finding::BadRequirement { ban: ban.clone() });
+        } else {
+            out.extend(ban_findings);
         }
     }
     for (pkg, note) in annotations {
@@ -273,6 +280,24 @@ mod tests {
             findings(&unread, &graph(), &BTreeMap::new())[..],
             [Finding::BadRequirement { .. }]
         ));
+        let mut two_versions = graph();
+        two_versions.nodes.insert(id("ring", "not-semver"));
+        two_versions
+            .edges
+            .get_mut(&id("aterm", "1.0.0"))
+            .expect("root edges")
+            .insert(id("ring", "not-semver"));
+        let mixed = Policy {
+            bans: vec![ban("ring", Some(">=0.17.14"), &[])],
+            ..Policy::default()
+        };
+        assert_eq!(
+            findings(&mixed, &two_versions, &BTreeMap::new()),
+            [Finding::BadRequirement {
+                ban: ban("ring", Some(">=0.17.14"), &[])
+            }],
+            "an unparseable version on a later node discards earlier Banned hits for the same ban"
+        );
     }
 
     #[test]

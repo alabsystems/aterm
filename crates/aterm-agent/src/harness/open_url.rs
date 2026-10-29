@@ -28,6 +28,143 @@ pub const EMAIL_ENV: &str = "ATERM_OPEN_URL_EMAIL";
 /// Default mailbox subdirectory under `<accounts store>` when [`MAILBOX_ENV`] is unset.
 pub const DEFAULT_MAILBOX_DIR: &str = "mailbox";
 
+/// Environment variable naming the file a renewal reads what its opener's headless sign-in met
+/// from ([`Met`]): an absolute path in a private directory the renewal made for its one run.
+/// The opener writes it only where its sign-in ended without the callback on a page it can
+/// name, one line of one closed word and the host, never the URL, the page's text or a code.
+pub const OUTCOME_ENV: &str = "ATERM_OPEN_URL_OUTCOME";
+
+/// What a headless sign-in met where it ended without the callback ([`Met`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetWord {
+    /// Cloudflare's bot check, which did not clear
+    /// ([`super::headless_oauth::BOT_CHECK_UNCLEARED`]).
+    BotCheck,
+    /// Cloudflare's block page ([`super::headless_oauth::BLOCK_PAGE_MET`]).
+    BlockPage,
+    /// No callback in time, on a page that was neither.
+    Stall,
+}
+
+impl MetWord {
+    /// Its word in the outcome file.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            MetWord::BotCheck => "bot-check",
+            MetWord::BlockPage => "block-page",
+            MetWord::Stall => "stall",
+        }
+    }
+}
+
+/// What a headless sign-in met where it ended without the callback, and the host of the page it
+/// was last on, as the opener writes it to [`OUTCOME_ENV`]'s file (`bot-check claude.ai`) and a
+/// renewal's record names it ([`Met::words`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Met {
+    /// What it met.
+    pub word: MetWord,
+    /// The host it met it on: lowercase letters, digits, `.` and `-`, at most [`Met::HOST_MAX`]
+    /// bytes; `None` where none such was read.
+    pub host: Option<String>,
+}
+
+impl Met {
+    /// The longest host a [`Met`] keeps.
+    pub const HOST_MAX: usize = 32;
+
+    /// `word` on `host`, where `host` is one a [`Met`] keeps.
+    #[must_use]
+    pub fn new(word: MetWord, host: Option<&str>) -> Met {
+        let host = host.filter(|h| {
+            !h.is_empty()
+                && h.len() <= Met::HOST_MAX
+                && h.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+        });
+        Met {
+            word,
+            host: host.map(str::to_owned),
+        }
+    }
+
+    /// Its outcome file's line: the word, then the host where there is one.
+    #[must_use]
+    pub fn line(&self) -> String {
+        match &self.host {
+            Some(host) => format!("{} {host}", self.word.as_str()),
+            None => self.word.as_str().to_owned(),
+        }
+    }
+
+    /// The [`Met`] an outcome file's `text` names; `None` for anything but one [`Met::line`]
+    /// (another word, a host it would not keep, more than one line).
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Met> {
+        let line = text.strip_suffix('\n').unwrap_or(text);
+        if line.contains(['\n', '\r']) {
+            return None;
+        }
+        let (word, host) = match line.split_once(' ') {
+            Some((word, host)) => (word, Some(host)),
+            None => (line, None),
+        };
+        let word = [MetWord::BotCheck, MetWord::BlockPage, MetWord::Stall]
+            .into_iter()
+            .find(|w| w.as_str() == word)?;
+        let met = Met::new(word, host);
+        (met.host.as_deref() == host).then_some(met)
+    }
+
+    /// Its words in a renewal's record: what the page met, naming Cloudflare where it was
+    /// Cloudflare's.
+    #[must_use]
+    pub fn words(&self) -> String {
+        let on = self
+            .host
+            .as_deref()
+            .map_or_else(String::new, |host| format!(" on {host}"));
+        match self.word {
+            MetWord::BotCheck => {
+                format!("it met Cloudflare's bot check{on}, which aterm never tries to pass")
+            }
+            MetWord::BlockPage => format!("it met Cloudflare's block page{on}"),
+            MetWord::Stall => format!("its page{on} reached no callback in time"),
+        }
+    }
+}
+
+/// Writes `met` to the outcome file `path` names ([`OUTCOME_ENV`]), where `path` is absolute;
+/// a file that cannot be written is left, since the opener's exit still says it failed.
+pub fn write_outcome(path: &Path, met: &Met) {
+    if !path.is_absolute() {
+        return;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut file) = opts.open(path) {
+        let _ = writeln!(file, "{}", met.line());
+    }
+}
+
+/// The [`Met`] the outcome file at `path` holds, read once (at most a few hundred bytes).
+#[must_use]
+pub fn read_outcome(path: &Path) -> Option<Met> {
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(256)
+        .read_to_string(&mut text)
+        .ok()?;
+    Met::parse(&text)
+}
+
 /// The most bytes of Chrome's `Local State` that are read.
 pub const LOCAL_STATE_MAX: u64 = 8 * 1024 * 1024;
 
@@ -3752,7 +3889,9 @@ pub fn authorize_with_mailbox_config(
         || mailbox_cfg
             .effective_imap_url(resolved_email.as_deref())
             .is_some()
-        || mailbox_cfg.http_url.is_some();
+        || mailbox_cfg
+            .http_url_for(resolved_email.as_deref())
+            .is_some();
     if !force_headless && has_non_webmail {
         let mut pending_credential = None;
         let mut seen_otps = BTreeSet::new();
@@ -4035,7 +4174,7 @@ fn discover_store_dir() -> Option<PathBuf> {
 }
 
 /// Entry point for the `aterm-open-url` argv0 alias.
-#[must_use]
+#[must_use = "return or inspect the command exit status"]
 pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     let args: Vec<String> = args
         .iter()
@@ -4045,6 +4184,15 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     let email = std::env::var(EMAIL_ENV).ok();
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let store_dir = discover_store_dir();
+    // What the headless sign-in met, for the renewal that named an outcome file.
+    let note_outcome = || {
+        if let (Some(path), Some(met)) = (
+            std::env::var_os(OUTCOME_ENV).filter(|p| !p.is_empty()),
+            super::headless_oauth::take_met(),
+        ) {
+            write_outcome(Path::new(&path), &met);
+        }
+    };
     if let [url] = args.as_slice() {
         let force_headless = std::env::var(super::headless_oauth::HEADLESS_ENV)
             .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
@@ -4072,6 +4220,7 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
             ) {
                 Ok(()) => return ExitCode::from(0),
                 Err(why) => {
+                    note_outcome();
                     if force_headless || profile.as_deref().is_none_or(|p| p.trim().is_empty()) {
                         eprintln!("{OPENER}: not authorized: {why}");
                         return ExitCode::from(1);
@@ -4096,6 +4245,7 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
                 ) {
                     Ok(()) => return ExitCode::from(0),
                     Err(why) => {
+                        note_outcome();
                         eprintln!("{OPENER}: not authorized: {why}");
                         return ExitCode::from(1);
                     }

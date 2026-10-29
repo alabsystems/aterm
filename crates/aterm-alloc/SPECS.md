@@ -85,7 +85,7 @@ capacity-error-contract	contract	CapacityError::{new,element,simplify}, Display/
 sv-seq-contracts	refinement	SmallVec::{new,default,len,is_empty,push,pop,clear,extend_from_slice,from_slice,from_vec,from_elem,as_slice,as_mut_slice}, Clone/PartialEq/Debug/Deref/DerefMut/FromIterator/Extend for SmallVec, IntoIterator for &SmallVec and &mut SmallVec	SmallVec refines an unbounded Vec<T> through Seq. Seq(new()) = []. len = |Seq| and is_empty ⇔ Seq = []. push(x) gives Seq' = Seq ++ [x] and never panics, spilled or not. pop returns last and gives Seq' = init, or None on []. clear gives []. extend_from_slice(s) and extend(xs) append in order. from_slice(s) = s, from_vec(v) = v, from_elem(x,n) = replicate n x, from_iter(xs) = xs. Seq(clone) = Seq. a == b ⇔ Seq a = Seq b. Debug renders Seq as a list. as_slice, Deref and indexing read Seq, and writes through as_mut_slice go to Seq'. Whether the vec is inline or spilled never changes any of these.	-	enum with an inline MaybeUninit array arm and a Vec arm; match on &mut self.data; std Vec model; unsafe from_raw_parts; spill (ensure_heap loop with assume_init_read); for loops; Clone/fmt traits; generic T; const N	0,1,2,3,7,8,11,13
 sv-representation	contract	SmallVec::{new,with_capacity,push,from_vec,from_slice,is_inline,spilled,capacity,ensure_heap}	spilled(v) = ¬is_inline(v), and is_inline(v) ⇔ v.data is Inline. new() is Inline with capacity N. with_capacity(c) is Inline with capacity() = N when c ≤ N; otherwise it is Heap with capacity() ≥ min(c, 16_777_216). push keeps the vec Inline while |Seq| < N before the push. A push onto an Inline vec with |Seq| = N moves every element, in order and without dropping any, into a Heap vec and appends there. A Heap vec never returns to Inline. from_vec(v) is Inline ⇔ |v| ≤ N. The spill leaves Seq unchanged.	-	enum discriminant reasoning; Vec::with_capacity capacity postcondition (std model); min; the spill loop moving MaybeUninit slots; &mut self two-state	0,1,2,3,7,8,11
 sv-into-iter	contract	IntoIterator for SmallVec, IntoIter::{next,next_back,size_hint}, ExactSizeIterator/FusedIterator for IntoIter	∀ v with Seq v = xs, it = v.into_iter(): any interleaving of next and next_back yields xs from the front and the back with no repeats, then None from both ends forever (fused). size_hint = (r, Some r) and len() = r, where r is the number not yet yielded. Representation: into_iter of an Inline vec builds IntoIterRepr::Inline { start: 0, end: |xs| } and allocates nothing; a Heap vec builds IntoIterRepr::Heap(vec.into_iter()). The representation clause is stated on the private repr, not on the #[cfg(test)] helper IntoIter::is_inline.	src/small_vec.rs::test_into_iter_inline_double_ended	mem::replace of an enum field; by-value MaybeUninit array move; cursor invariant start ≤ end ≤ N; assume_init_read; std vec::IntoIter model; Iterator/DEI traits	0,1,2,8,11
-sv-drop-exactly-once	invariant	SmallVec::clear, Drop for SmallVec, Drop for IntoIter, IntoIter::{next,next_back}, drop_initialized	Inline or spilled alike: clear sets the length to 0 before any destructor runs, then drops Seq once each, in order, with slice drop glue. If one destructor panics, the rest are still dropped and v is empty on the unwinding exit. Drop for SmallVec = clear (Vec's drop when spilled). For it = v.into_iter() under any pattern of front and back consumption, yielded elements belong to the caller, and dropping it drops exactly the un-yielded range buf[start..end] once each, also when one destructor panics. So ExactlyOnce holds for every run, and the Ledger's contents do not depend on whether v spilled.	tests/panic_drop_parity.rs::small_vec_clear_drops_each_element_once_when_a_destructor_panics, tests/panic_drop_parity.rs::small_vec_drop_drops_each_element_once_when_a_destructor_panics, tests/panic_drop_parity.rs::small_vec_into_iter_drop_drops_each_element_once_when_a_destructor_panics	drop_in_place on a raw subslice; Drop impls; std Vec/vec::IntoIter drop semantics as an assumed model; Ledger; enum arms	0,1,2,8,11,U
+sv-drop-exactly-once	invariant	SmallVec::clear, Drop for SmallVec, Drop for IntoIter, IntoIter::{next,next_back}, drop_initialized	Inline or spilled alike: clear sets the length to 0 before any destructor runs, then drops Seq once each, in order, with slice drop glue. If one destructor panics, the rest are still dropped and v is empty on the unwinding exit. Drop for SmallVec = clear (Vec's drop when spilled). For it = v.into_iter() under any pattern of front and back consumption, yielded elements belong to the caller, and dropping it drops exactly the un-yielded range buf[start..end] once each, also when one destructor panics. So ExactlyOnce holds for every run, and the Ledger's contents do not depend on whether v spilled.	src/small_vec.rs::into_iter_drops_each_element_exactly_once, tests/panic_drop_parity.rs::small_vec_clear_drops_each_element_once_when_a_destructor_panics, tests/panic_drop_parity.rs::small_vec_drop_drops_each_element_once_when_a_destructor_panics, tests/panic_drop_parity.rs::small_vec_into_iter_drop_drops_each_element_once_when_a_destructor_panics	drop_in_place on a raw subslice; Drop impls; std Vec/vec::IntoIter drop semantics as an assumed model; Ledger; enum arms	0,1,2,8,11,U
 ```
 
 ### Distribution by kind (18)
@@ -134,9 +134,11 @@ Paths are relative to `crates/aterm-alloc`.
 file	test	primary	also
 src/array_vec.rs	test_into_inner_moves_without_double_drop	av-into-inner	av-bulk-drop-exactly-once
 src/array_vec.rs	test_drain_double_ended	av-drain	
+src/array_vec.rs	test_drain_forget_keeps_unyielded_elements	av-drain	av-bulk-drop-exactly-once
 src/array_vec.rs	test_drain_past_len_panics	av-drain	
 src/array_vec.rs	test_capacity_error_shape	capacity-error-contract	av-push
 src/small_vec.rs	test_into_iter_inline_double_ended	sv-into-iter	
+src/small_vec.rs	into_iter_drops_each_element_exactly_once	sv-drop-exactly-once	sv-into-iter
 tests/arrayvec_differential.rs	scripted_operation_sequence	av-refines-bounded-vec	av-push, av-extend-overflow, av-drain, av-retain
 tests/arrayvec_differential.rs	lcg_operation_fuzz	av-refines-bounded-vec	av-push, av-extend-overflow (panic polarity only, §5.2)
 tests/arrayvec_differential.rs	overflow_policy_parity	av-extend-overflow	av-refines-bounded-vec
@@ -147,6 +149,7 @@ tests/arrayvec_differential.rs	clone_from_parity	av-clone-from
 tests/arrayvec_differential.rs	by_reference_iteration_parity	av-slice-view	
 tests/arrayvec_differential.rs	owning_elements_drop_parity	av-bulk-drop-exactly-once	av-refines-bounded-vec
 tests/arrayvec_differential.rs	retain_with_a_panicking_predicate_parity	av-retain-unwind	av-retain
+tests/arrayvec_differential.rs	insert_out_of_bounds_panics_like_model	av-refines-bounded-vec	
 tests/panic_drop_parity.rs	array_vec_clear_drops_each_element_once_when_a_destructor_panics	av-bulk-drop-exactly-once	
 tests/panic_drop_parity.rs	array_vec_truncate_drops_each_element_once_when_a_destructor_panics	av-bulk-drop-exactly-once	
 tests/panic_drop_parity.rs	array_vec_drop_drops_each_element_once_when_a_destructor_panics	av-bulk-drop-exactly-once	
@@ -181,32 +184,27 @@ drop-count test samples one of the exactly-once specs.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **A test reaches the representation only through test-only code.**
-   `small_vec.rs::into_iter_keeps_the_storage_variant` calls `IntoIter::is_inline`, which is
-   `#[cfg(test)]` and has no production caller. The real spec (an inline source builds
-   `IntoIterRepr::Inline` and does not allocate) is stated on the private repr in `sv-into-iter`.
-   Delete the helper with the test.
-2. **The differential harness does not check what its header claims.** The header of
-   `tests/arrayvec_differential.rs` says the model checks that "an overflowing extend keeps the
-   prefix it wrote". But `apply` runs each op that may panic (`Push`, `Insert`,
-   `ExtendFromSlice`, `Extend`) on a clone and writes the clone back only on success, so
-   `scripted_operation_sequence` and `lcg_operation_fuzz` never observe a post-panic state. Only
-   `overflow_policy_parity` checks prefix retention. For those ops the fuzz compares panic
-   polarity and nothing else.
-3. **`Op::Insert` never reaches the out-of-bounds panic.** `apply` reduces the index mod
-   `len + 1`, so `ArrayVec::insert`'s `index > len` panic is never tested. The two sides also
-   check in a different order (index first in ArrayVec, fullness first in the model). Only
-   polarity is compared, so this is harmless today, but `av-refines-bounded-vec` therefore states
-   the panic condition as `i > len ∨ len = N` and names no message.
+1. **Test-only representation helper removed (resolved 2026-10-27).**
+   `small_vec::IntoIter::is_inline` (`#[cfg(test)]`) and `into_iter_keeps_the_storage_variant`
+   have been deleted. The representation clause on the private repr stays in `sv-into-iter`.
+2. **Differential post-panic scope.** `apply` in `tests/arrayvec_differential.rs` runs each op
+   that may panic (`Push`, `Insert`, `ExtendFromSlice`, `Extend`) on a clone and writes the
+   clone back only on success, so `scripted_operation_sequence` and `lcg_operation_fuzz` compare
+   panic polarity for those ops while `overflow_policy_parity` checks prefix retention.
+3. **`ArrayVec::insert` out-of-bounds panic sampled (resolved 2026-10-27).** `apply` reduces the
+   index mod `len + 1`, and `insert_out_of_bounds_panics_like_model` now exercises `index > len`
+   panics directly. Because `ArrayVec` checks index before fullness and the model checks fullness
+   first, `av-refines-bounded-vec` states the panic condition as `i > len ∨ len = N` and names no
+   message.
 4. **`Inv_AV`/`Inv_SV` are not proved anywhere.** Every function these specs cover that touches
    `MaybeUninit`, raw pointers or `Drop` is `#[cfg_attr(trust_verify, trust::skip)]`
    (`drop_initialized`, `pop`, `clear`, `truncate`, `as_slice`, `as_mut_slice`, `insert`,
    `remove`, `retain`, `into_inner`, `from_iter`, `extend` in `array_vec.rs`; most of
-   `small_vec.rs`). No current Trust row covers any of the 55 subsumed tests, so the floor
+   `small_vec.rs`). No current Trust row covers any of the subsumed tests, so the floor
    cannot rise beyond the safe accessors until gap 8 (unsafe discharge) and gap `U` exist.
-5. **An untested documented clause.** The `Drain` doc in `src/array_vec.rs` says that forgetting
-   a `Drain` leaves the un-drained elements in the vec, unlike upstream. No test checks it. It is
-   in `av-drain` as a clause with no sample.
+5. **Forgotten `Drain` clause sampled (resolved 2026-10-27).**
+   `src/array_vec.rs::test_drain_forget_keeps_unyielded_elements` now checks `av-drain`'s
+   `mem::forget` retention and drop-count clause.
 
 ## 6. Proof order (easiest high-value first)
 

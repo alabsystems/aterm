@@ -19,6 +19,16 @@ mod imp;
 /// The effect a capability authorizes here.
 pub enum Sandbox {}
 
+impl Sandbox {
+    /// Project `(applied, done)` for [`aterm_models_core::sandbox_model`]'s `Apply` step.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub const fn project_apply(requested: bool, result: &io::Result<()>) -> (i64, i64) {
+        let applied = if requested && result.is_ok() { 1 } else { 0 };
+        (applied, 1)
+    }
+}
+
 /// Resource limits to apply.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Limits {
@@ -116,171 +126,6 @@ impl Limits {
             .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
         imp::apply_to_job(self, job)
     }
-
-    /// True when every numeric limit is `None` and `restrict_ui` is `false`.
-    #[inline]
-    #[must_use]
-    pub const fn is_unrestricted(&self) -> bool {
-        self.cpu_seconds.is_none()
-            && self.address_space.is_none()
-            && self.file_size.is_none()
-            && self.open_files.is_none()
-            && self.active_processes.is_none()
-            && !self.restrict_ui
-    }
-
-    /// Combine two [`Limits`] policies by taking the stricter (smaller) bound for each resource.
-    #[inline]
-    #[must_use]
-    pub const fn merge_stricter(self, other: Self) -> Self {
-        const fn min_opt_u64(a: Option<u64>, b: Option<u64>) -> Option<u64> {
-            match (a, b) {
-                (Some(x), Some(y)) => Some(if x < y { x } else { y }),
-                (Some(x), None) => Some(x),
-                (None, Some(y)) => Some(y),
-                (None, None) => None,
-            }
-        }
-        const fn min_opt_u32(a: Option<u32>, b: Option<u32>) -> Option<u32> {
-            match (a, b) {
-                (Some(x), Some(y)) => Some(if x < y { x } else { y }),
-                (Some(x), None) => Some(x),
-                (None, Some(y)) => Some(y),
-                (None, None) => None,
-            }
-        }
-        Self {
-            cpu_seconds: min_opt_u64(self.cpu_seconds, other.cpu_seconds),
-            address_space: min_opt_u64(self.address_space, other.address_space),
-            file_size: min_opt_u64(self.file_size, other.file_size),
-            open_files: min_opt_u64(self.open_files, other.open_files),
-            active_processes: min_opt_u32(self.active_processes, other.active_processes),
-            restrict_ui: self.restrict_ui || other.restrict_ui,
-            binding: self.binding || other.binding,
-        }
-    }
-
-    /// Encode this [`Limits`] policy into a canonical 38-byte little-endian wire frame.
-    #[inline]
-    #[must_use]
-    pub const fn encode_wire_le(&self) -> [u8; 38] {
-        let mut mask = 0u8;
-        let cpu = match self.cpu_seconds {
-            Some(v) => {
-                mask |= 1 << 0;
-                v
-            }
-            None => 0,
-        };
-        let aspace = match self.address_space {
-            Some(v) => {
-                mask |= 1 << 1;
-                v
-            }
-            None => 0,
-        };
-        let fsize = match self.file_size {
-            Some(v) => {
-                mask |= 1 << 2;
-                v
-            }
-            None => 0,
-        };
-        let nofile = match self.open_files {
-            Some(v) => {
-                mask |= 1 << 3;
-                v
-            }
-            None => 0,
-        };
-        let nproc = match self.active_processes {
-            Some(v) => {
-                mask |= 1 << 4;
-                v
-            }
-            None => 0,
-        };
-        let flags = (self.restrict_ui as u8) | ((self.binding as u8) << 1);
-        let c = cpu.to_le_bytes();
-        let a = aspace.to_le_bytes();
-        let f = fsize.to_le_bytes();
-        let n = nofile.to_le_bytes();
-        let p = nproc.to_le_bytes();
-        [
-            mask, flags, c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], a[0], a[1], a[2], a[3],
-            a[4], a[5], a[6], a[7], f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], n[0], n[1],
-            n[2], n[3], n[4], n[5], n[6], n[7], p[0], p[1], p[2], p[3],
-        ]
-    }
-
-    /// Decode a canonical 38-byte little-endian [`Limits`] wire frame.
-    #[inline]
-    #[must_use]
-    pub const fn decode_wire_le(wire: &[u8; 38]) -> Option<Self> {
-        let mask = wire[0];
-        let flags = wire[1];
-        if (mask & !0b0001_1111) != 0 || (flags & !0b0000_0011) != 0 {
-            return None;
-        }
-        let cpu = u64::from_le_bytes([
-            wire[2], wire[3], wire[4], wire[5], wire[6], wire[7], wire[8], wire[9],
-        ]);
-        let aspace = u64::from_le_bytes([
-            wire[10], wire[11], wire[12], wire[13], wire[14], wire[15], wire[16], wire[17],
-        ]);
-        let fsize = u64::from_le_bytes([
-            wire[18], wire[19], wire[20], wire[21], wire[22], wire[23], wire[24], wire[25],
-        ]);
-        let nofile = u64::from_le_bytes([
-            wire[26], wire[27], wire[28], wire[29], wire[30], wire[31], wire[32], wire[33],
-        ]);
-        let nproc = u32::from_le_bytes([wire[34], wire[35], wire[36], wire[37]]);
-
-        let cpu_seconds = if (mask & (1 << 0)) != 0 {
-            Some(cpu)
-        } else if cpu == 0 {
-            None
-        } else {
-            return None;
-        };
-        let address_space = if (mask & (1 << 1)) != 0 {
-            Some(aspace)
-        } else if aspace == 0 {
-            None
-        } else {
-            return None;
-        };
-        let file_size = if (mask & (1 << 2)) != 0 {
-            Some(fsize)
-        } else if fsize == 0 {
-            None
-        } else {
-            return None;
-        };
-        let open_files = if (mask & (1 << 3)) != 0 {
-            Some(nofile)
-        } else if nofile == 0 {
-            None
-        } else {
-            return None;
-        };
-        let active_processes = if (mask & (1 << 4)) != 0 {
-            Some(nproc)
-        } else if nproc == 0 {
-            None
-        } else {
-            return None;
-        };
-        Some(Self {
-            cpu_seconds,
-            address_space,
-            file_size,
-            open_files,
-            active_processes,
-            restrict_ui: (flags & 1) != 0,
-            binding: (flags & 2) != 0,
-        })
-    }
 }
 
 #[cfg(test)]
@@ -364,12 +209,21 @@ mod tests {
         let auth = unsafe { Authority::root_authority() };
         let cap: Cap<Sandbox> = auth.grant(Tier::Trusted);
         set_limit(libc::RLIMIT_NOFILE, Some(300), false).expect("a known soft limit");
-        let before = (current(libc::RLIMIT_CPU), current(libc::RLIMIT_NOFILE));
+        let snapshot = || {
+            [
+                libc::RLIMIT_CPU,
+                libc::RLIMIT_AS,
+                libc::RLIMIT_FSIZE,
+                libc::RLIMIT_NOFILE,
+            ]
+            .map(|res| {
+                let lim = rlimit(res);
+                (lim.rlim_cur, lim.rlim_max)
+            })
+        };
+        let before = snapshot();
         Limits::inherit().apply(&cap).unwrap();
-        assert_eq!(
-            (current(libc::RLIMIT_CPU), current(libc::RLIMIT_NOFILE)),
-            before
-        );
+        assert_eq!(snapshot(), before);
     }
 
     #[cfg(unix)]
@@ -379,6 +233,11 @@ mod tests {
         let auth = unsafe { Authority::root_authority() };
         let cap: Cap<Sandbox> = auth.grant(Tier::Trusted);
         let target = 256u64;
+        let hard_before = current_hard(libc::RLIMIT_NOFILE);
+        assert!(
+            hard_before >= target,
+            "test precondition: inherited hard NOFILE ({hard_before}) must be >= {target}"
+        );
         let address_space: u64 = if cfg!(target_os = "macos") {
             1024 * 1024 * 1024
         } else {
@@ -413,12 +272,14 @@ mod tests {
             "macOS must not request a finite RLIMIT_AS"
         );
         #[cfg(not(target_os = "macos"))]
-        assert!(
-            d.address_space.is_some(),
-            "non-macOS should bound the address space"
+        assert_eq!(
+            d.address_space,
+            Some(16 * 1024 * 1024 * 1024),
+            "non-macOS should bound the address space to 16 GiB"
         );
-        assert!(
-            d.open_files.is_some(),
+        assert_eq!(
+            d.open_files,
+            Some(8192),
             "the working NOFILE limit must remain"
         );
     }
@@ -453,9 +314,10 @@ mod tests {
         let raise = core::cmp::min(applied * 4, hard_before);
         set_limit(libc::RLIMIT_NOFILE, Some(raise), false)
             .expect("raising the soft limit must succeed");
-        assert!(
-            current(libc::RLIMIT_NOFILE) >= applied,
-            "soft limit must be raisable above the applied sandbox default"
+        assert_eq!(
+            current(libc::RLIMIT_NOFILE),
+            raise,
+            "soft limit must raise to the requested value under the preserved hard ceiling"
         );
     }
 
@@ -595,24 +457,70 @@ mod tests {
     }
 
     #[test]
-    fn limits_wire_codec_and_merge_stricter_round_trip() {
-        assert!(Limits::inherit().is_unrestricted());
-        assert!(!Limits::shell_default().is_unrestricted());
-        let merged = Limits::shell_default().merge_stricter(Limits {
-            cpu_seconds: Some(300),
-            open_files: Some(1024),
-            binding: true,
-            ..Limits::inherit()
-        });
-        assert_eq!(merged.cpu_seconds, Some(300));
-        assert_eq!(merged.open_files, Some(1024));
-        assert!(merged.binding);
-        assert!(merged.restrict_ui);
+    fn apply_conforms_to_the_sandbox_model_and_rejects_mutants() {
+        use aterm_models_core::sandbox_model;
+        use aterm_spec::interp;
+        use aterm_spec::xref::StepEvidence;
 
-        let wire = merged.encode_wire_le();
-        assert_eq!(Limits::decode_wire_le(&wire), Some(merged));
-        let mut bad = wire;
-        bad[0] = 0xff;
-        assert_eq!(Limits::decode_wire_le(&bad), None);
+        #[cfg(unix)]
+        let _serialized = nofile_guard();
+        let auth = unsafe { Authority::root_authority() };
+        let trusted: Cap<Sandbox> = auth.grant(Tier::Trusted);
+        let untrusted: Cap<Sandbox> = auth.grant(Tier::Untrusted);
+
+        let base = sandbox_model();
+        let mut ev = StepEvidence::new("sandbox");
+        let scenarios: [i64; 4] = [0, 1, 2, 3];
+        let mut real_trace = Vec::with_capacity(scenarios.len());
+
+        for idx in scenarios {
+            let (req, sup) = match idx {
+                0 => (1i64, 1i64),
+                1 => (0, 1),
+                2 => (1, 0),
+                _ => (0, 0),
+            };
+            let model = interp::with_consts(&base, &[("Req", req), ("Sup", sup)]);
+            let mut expected = model.init_state();
+            assert!(model.fire("Apply", &mut expected));
+
+            let limits = if req == 1 {
+                Limits {
+                    open_files: Some(256),
+                    ..Limits::inherit()
+                }
+            } else {
+                Limits::inherit()
+            };
+            let cap = if sup == 1 { &trusted } else { &untrusted };
+            let result = ev.step("Apply", || limits.apply(cap));
+            let projected = Sandbox::project_apply(req == 1, &result);
+            assert_eq!(
+                projected,
+                (expected["applied"], expected["done"]),
+                "Req={req} Sup={sup}: {result:?}"
+            );
+            real_trace.push(projected);
+        }
+
+        let audit = ev.audit();
+        assert!(audit.is_complete(), "{}", audit.summary());
+
+        for dial in [1i64, 2] {
+            let mutant_base = interp::with_buggy(&base, dial);
+            let mutant_trace: Vec<(i64, i64)> = [(1i64, 1i64), (0, 1), (1, 0), (0, 0)]
+                .into_iter()
+                .map(|(req, sup)| {
+                    let m = interp::with_consts(&mutant_base, &[("Req", req), ("Sup", sup)]);
+                    let mut s = m.init_state();
+                    assert!(m.fire("Apply", &mut s));
+                    (s["applied"], s["done"])
+                })
+                .collect();
+            assert_ne!(
+                mutant_trace, real_trace,
+                "Buggy={dial} was not distinguished from Limits::apply"
+            );
+        }
     }
 }

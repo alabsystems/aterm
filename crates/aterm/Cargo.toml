@@ -47,6 +47,7 @@ agh = { path = "../agh" }               # `aterm agh`  — the GitHub client
 # `--json` in the one report schema. Both already in the graph through atpkg.
 aterm-converge = { workspace = true }
 aterm-json = { workspace = true }
+aterm-toml = { workspace = true }
 # Fixed native CPU-policy collector dispatch, before GUI initialization.
 aterm-sysprobe = { workspace = true }
 # The Full Disk Access probe's child, `aterm __tcc-open` (`consent::run_open_probe_verb`);
@@ -109,6 +110,10 @@ aterm-digest = { workspace = true }
 # base layer, the vault and the repositories. `aterm machines` itself stays macOS-only
 # (`machines_unavailable` in src/main.rs).
 aterm-machines = { workspace = true }
+# The fleet members an `aterm pkg` download races by default (`src/unit_peers.rs`,
+# `aterm_net::fleet_member::member_addrs`, unix-only). Already in the graph through aterm-gui;
+# the fleet listener's live test dials a real instance with it too.
+aterm-net = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # The transparent session's cancellable first-run countdown owns the tty before
@@ -131,8 +136,9 @@ dev-seams = [
 ]
 
 [dev-dependencies]
-# `plain_durable_flushes_in_tests!`: fabric_world and aterm_suite mark their process trees
-# as a test's, so the instances and brokers they start take a plain `fsync(2)`.
+# `plain_durable_flushes_in_tests!`: fabric_world, aterm_suite and the binary's own unit tests
+# mark their process trees as a test's, so their durable writes, and the instances and brokers
+# they start, take a plain `fsync(2)`.
 aterm-durable = { workspace = true }
 # The live tests' raw process and descriptor calls (signals, waits, process groups, fd flags,
 # rlimits).
@@ -148,11 +154,8 @@ aterm-models-session = { workspace = true }
 # close-on-exec from birth: an `openpty(3)` pair is inheritable, so a child would hold its own
 # master open.
 aterm-pty = { workspace = true }
-# The fleet listener's live test dials a real instance as a fleet member would
-# (`aterm_net::fleet::client_handshake`). Already in the graph through aterm-gui.
-aterm-net = { workspace = true }
-# The fabric worlds' fixture config is asserted as TOML.
-aterm-toml = { workspace = true }
+# The fabric worlds' fixture config is asserted as TOML (`aterm-toml` is in `[dependencies]`
+# for `converge.rs`, which the tests reach too).
 # The bus mirror's world (`tests/fabric_world/log_mirror.rs`) decodes and folds
 # the session logs' bus bodies as every reader does (`aterm_slog::bus`).
 aterm-slog = { workspace = true }

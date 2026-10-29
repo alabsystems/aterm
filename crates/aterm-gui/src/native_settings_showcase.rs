@@ -16,12 +16,16 @@ mod view;
 
 #[cfg(test)]
 pub(super) use view::SHEET_TITLE;
+#[cfg(all(test, target_os = "macos"))]
+pub(super) use view::forget_strip_names;
 pub(super) use view::{
-    BlocksShared, ListRoom, SharedBlocks, SharedDemo, SharedSheet, SharedStrip,
-    demo_font_candidate, demo_spec, laid_last, list_laid, list_room, themes_page,
+    Between, BlocksShared, ChooserFits, Held, ListRoom, PanelAt, Place, SharedBlocks, SharedDemo,
+    SharedHeading, SharedSheet, SharedSheetRows, SharedStrip, blocks_between, caption_over_row,
+    demo_font_candidate, demo_spec, laid_last, led_first_screen_least, list_laid, list_room,
+    listed_least, row_filtered_out, row_under_caption, themes_page,
 };
 #[cfg(test)]
-pub(super) use view::{list_blocks, row_height as chooser_row_height, section_items};
+pub(super) use view::{list_blocks, list_heights, row_height as chooser_row_height, section_items};
 
 /// Every action the page mints starts with this.
 pub(super) const SHOWCASE_ACTION_PREFIX: &str = "settings/showcase/";
@@ -158,25 +162,35 @@ pub(crate) struct Settled {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct NameFloor {
     pub(super) cards: usize,
-    pub(super) scale: u32,
+    /// The text scale, and the faces chrome text measures in
+    /// ([`crate::tray_raster::chrome_measure_epoch`]).
+    pub(super) text: (u32, u64),
     pub(super) heading: bool,
     pub(super) floor: f32,
 }
 
-/// A measured [`ShowcaseState::strip_names`] entry: for which rows (`cards`,
-/// by address), at which text scale, and in which title rooms (beside a
-/// trial's buttons without Keep ▾ and with it, their bits, and whether the
-/// theme a trial replaces sets type, so every trial shows Keep ▾).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct StripNames {
+/// The inputs of [`ShowcaseState::rows_tallest`]: rows, theme in use, width, text size, faces.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct RowsTallestAt {
     pub(super) cards: usize,
+    pub(super) in_use: String,
+    /// The rows that need attention, by address.
+    pub(super) attention: usize,
+    pub(super) inner: u32,
+    pub(super) narrow: bool,
     pub(super) scale: u32,
-    pub(super) rooms: (u32, u32, bool),
-    /// The most lines a name takes in its room.
-    pub(super) lines: usize,
-    /// Whether a word of a name is wider than its room.
-    pub(super) broken: bool,
+    /// The strip's font epoch: each renderer swap moves it, though it caps its face counts.
+    pub(super) faces: u64,
+    /// The faces chrome text measures in ([`crate::tray_raster::chrome_measure_epoch`]): coverage
+    /// faces by address, the UI's CJK faces counted, uncapped.
+    pub(super) measured: u64,
 }
+
+/// The tallest row at a width, and each theme row's height there and a thumb's gutter narrower.
+pub(super) type RowsKept = (f32, Arc<[[f32; 2]]>);
+
+/// A filter's query and disclosure, with the reach and the cards they admit.
+type Matched = (String, bool, MatchReach, Vec<usize>);
 
 /// Settings ▸ Themes' view state.
 #[derive(Debug)]
@@ -212,9 +226,12 @@ pub(crate) struct ShowcaseState {
     page_rows: Cell<usize>,
     /// Cached minimum width measurements for theme names ([`view::name_floor`]).
     pub(super) name_floors: RefCell<Vec<NameFloor>>,
-    /// The strip's names, as last measured ([`view::strip_names`]): a frame
-    /// measures every name once, not once a layout.
-    pub(super) strip_names: RefCell<Vec<StripNames>>,
+    /// The chooser's tallest row and every theme row's height at each width measured, latest first.
+    pub(super) rows_tallest: RefCell<Vec<(RowsTallestAt, RowsKept)>>,
+    /// The chooser's unpainted rows as renders built them, kept while what they read holds.
+    pub(super) blocks_kept: RefCell<Vec<SharedBlocks>>,
+    /// Last query and disclosure, with the reach and rows they admitted ([`Self::visible_for`]).
+    matched: RefCell<Option<Matched>>,
     /// Animation clock epoch when the page opened.
     pub(crate) demo_epoch_ms: Cell<Option<u64>>,
     /// Animation phase at the last user input on the page.
@@ -248,7 +265,9 @@ impl ShowcaseState {
             order: RefCell::new(Vec::new()),
             page_rows: Cell::new(8),
             name_floors: RefCell::new(Vec::new()),
-            strip_names: RefCell::new(Vec::new()),
+            rows_tallest: RefCell::new(Vec::new()),
+            blocks_kept: RefCell::new(Vec::new()),
+            matched: RefCell::new(None),
             demo_epoch_ms: Cell::new(None),
             last_input_phase_ms: Cell::new(0),
             input_pending: Cell::new(true),
@@ -268,21 +287,25 @@ impl ShowcaseState {
 
     /// Indices into `cards` admitted by `query` (trimmed, lowercase).
     pub(crate) fn visible_for(&self, query: &str) -> Vec<usize> {
-        let reach = self.reach_for(query);
-        self.cards
-            .iter()
-            .enumerate()
-            .filter(|(_, card)| {
-                (card.section != Section::Community || self.pack_open || !query.is_empty())
-                    && card.matches(query, reach)
-            })
-            .map(|(index, _)| index)
-            .collect()
+        self.matched(query).1
     }
 
     /// Match reach ([`MatchReach`]) for `query` across attention rows and cards.
     pub(crate) fn reach_for(&self, query: &str) -> MatchReach {
-        MatchReach::of(
+        self.matched(query).0
+    }
+
+    /// `query`'s reach and the cards it admits, matched once per query, disclosure and card set.
+    fn matched(&self, query: &str) -> (MatchReach, Vec<usize>) {
+        if let Some((_, _, reach, visible)) = self
+            .matched
+            .borrow()
+            .as_ref()
+            .filter(|(seen, open, _, _)| seen == query && *open == self.pack_open)
+        {
+            return (*reach, visible.clone());
+        }
+        let reach = MatchReach::of(
             self.attention
                 .iter()
                 .any(|row| attention_row_matches(row, query, MatchReach::Words))
@@ -290,7 +313,24 @@ impl ShowcaseState {
                     .cards
                     .iter()
                     .any(|card| card.matches(query, MatchReach::Words)),
-        )
+        );
+        let visible: Vec<usize> = self
+            .cards
+            .iter()
+            .enumerate()
+            .filter(|(_, card)| {
+                (card.section != Section::Community || self.pack_open || !query.is_empty())
+                    && card.matches(query, reach)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        self.matched.replace(Some((
+            query.to_string(),
+            self.pack_open,
+            reach,
+            visible.clone(),
+        )));
+        (reach, visible)
     }
 
     /// The rows the last render listed, in order.
@@ -368,8 +408,7 @@ impl SettingsViewState {
 
     /// Appearance side of the highlighted theme when following system with no manual side chosen.
     pub(super) fn showcase_highlight_side(&self) -> Option<aterm_types::Appearance> {
-        let following = prefs::theme_mode(self.raw_value(prefs::EDIT_THEME).as_deref())
-            == prefs::ThemeMode::FollowSystem;
+        let following = self.theme_follows_system();
         (self.showcase_on_glass() && following)
             .then_some(self.showcase.highlight_side)
             .flatten()
@@ -420,7 +459,9 @@ impl SettingsViewState {
             crate::settings_preview::theme_card::attention_rows(&self.assets.themes, &cards).into();
         self.showcase.cards = cards;
         self.showcase.name_floors.borrow_mut().clear();
-        self.showcase.strip_names.borrow_mut().clear();
+        self.showcase.rows_tallest.borrow_mut().clear();
+        self.showcase.blocks_kept.borrow_mut().clear();
+        self.showcase.matched.replace(None);
         self.showcase.trash_armed = None;
         self.reseat_focus_off_a_gone_row();
         if let Some(id) = self.showcase.trial_id().map(str::to_string)
@@ -631,6 +672,14 @@ impl SettingsViewState {
         let filter = UiKey::new(SHOWCASE_FILTER);
         let shown = self.keyboard_shown(true).is_some_and(|key| key == filter);
         let stop = self.scroll_plan().and_then(|plan| plan.stop_of(&filter));
+        // A pinned filter with the keyboard on it reveals its first result beside it (R5).
+        let pinned = stop.is_none()
+            && self
+                .common
+                .last_focus
+                .as_ref()
+                .is_some_and(|key| *key == filter)
+            && self.keyboard_on_page().is_some();
         self.drop_list_nudge();
         self.page_chrome_at.set(None);
         self.page_chromes.borrow_mut().clear();
@@ -642,8 +691,28 @@ impl SettingsViewState {
             self.showcase.visible().first().map(|&index| {
                 UiKey::new(format!("{CARD_PREFIX}{}", self.showcase.cards[index].slug))
             });
-        if let Some(first) = first.filter(|_| stop.is_some()) {
+        // The reveal a pinned filter's first result replaces, kept across its changes.
+        let before = match self.first_beside.take() {
+            Some((key, was)) if self.page_reveal.as_ref() == Some(&key) => was,
+            _ => (self.reveal_as == scroll::Reveal::Keep)
+                .then(|| self.page_reveal.clone())
+                .flatten(),
+        };
+        // A filter's earlier revealed result gives way to the new first result; a landing stays.
+        if self.reveal_as == scroll::Reveal::Keep
+            && self.page_reveal != self.common.last_focus
+            && first.is_some()
+            && self.page_reveal != first
+        {
+            self.page_reveal = None;
+        }
+        if let Some(first) = first.filter(|_| stop.is_some() || pinned) {
+            self.first_beside = pinned.then(|| (first.clone(), before));
             self.reveal_control(first);
+        }
+        // The list's top is asked anew whether it shows the first result whole.
+        if let Some(record) = self.scroll_record.borrow_mut().as_mut() {
+            record.forget_beside();
         }
     }
 
@@ -1020,14 +1089,11 @@ impl SettingsViewState {
 
     fn theme_id_drawn_by(&self, theme: Option<String>) -> String {
         let side = theme_visible_side(self, self.presented_motion.get().system_dark);
-        let config = Config {
-            theme: theme.or_else(|| {
-                self.environment_override(prefs::EDIT_THEME)
-                    .map(|active| active.effective.clone())
-            }),
-            ..Config::default()
-        };
-        config.resolved_colors(side, &self.assets.themes, None).id
+        let theme = theme.or_else(|| {
+            self.environment_override(prefs::EDIT_THEME)
+                .map(|active| active.effective.clone())
+        });
+        resolved_colors_from(self, side, ColorsFrom::theme(theme)).id
     }
 
     fn keep_value(&self, id: &str) -> (Option<String>, Option<aterm_types::Appearance>) {
@@ -1067,14 +1133,11 @@ impl SettingsViewState {
     fn theme_palette(&self) -> [aterm_types::Rgb; 16] {
         let system_dark = self.presented_motion.get().system_dark;
         let side = theme_visible_side(self, system_dark);
-        let config = Config {
-            theme: self.raw_value(prefs::EDIT_THEME),
-            ..Config::default()
+        let from = ColorsFrom {
+            candidate: self.showcase.trial_id().map(str::to_string),
+            ..ColorsFrom::theme(self.raw_value(prefs::EDIT_THEME))
         };
-        config
-            .resolved_colors_previewing(side, &self.assets.themes, self.showcase.trial_id())
-            .scheme
-            .ansi
+        resolved_colors_from(self, side, from).scheme.ansi
     }
 
     fn palette_entries(&self) -> Vec<String> {
@@ -1134,18 +1197,15 @@ impl SettingsViewState {
     }
 
     fn configured_theme_ids(&self) -> [String; 2] {
-        let config = Config {
-            theme: self.raw_value(prefs::EDIT_THEME).or_else(|| {
-                self.environment_override(prefs::EDIT_THEME)
-                    .map(|active| active.effective.clone())
-            }),
-            ..Config::default()
-        };
+        let theme = self.raw_value(prefs::EDIT_THEME).or_else(|| {
+            self.environment_override(prefs::EDIT_THEME)
+                .map(|active| active.effective.clone())
+        });
         [
             aterm_types::Appearance::Dark,
             aterm_types::Appearance::Light,
         ]
-        .map(|side| config.resolved_colors(side, &self.assets.themes, None).id)
+        .map(|side| resolved_colors_from(self, side, ColorsFrom::theme(theme.clone())).id)
     }
 }
 

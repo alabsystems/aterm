@@ -116,7 +116,7 @@ impl Outcome {
         }
     }
 
-    /// The outcome a row's `decision` word names, by [`Self::word`]'s own words, so a reader of the ledger (`harness::stats`) cannot drift from its writer; `None` for a word this build does not write.
+    /// The outcome a row's `decision` word names, by [`Self::word`]'s own words, so a reader of the ledger (`harness::stats`) cannot drift from its writer; `None` for a self-claim's row ([`SELF_CLAIM_DECISION`]) and for a word this build does not write.
     #[must_use]
     pub fn from_word(word: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|o| o.word() == word)
@@ -249,6 +249,77 @@ pub const PROGRAM: &str = "program";
 
 pub const BOOT: &str = "boot";
 
+/// The `decision` word of A PROVEN SELF-CLAIM'S ACT ([`SelfClaimRow`]): no [`Outcome`]'s word,
+/// so no reader of aterm's own acts (`typed`, `approved`, `waiting`, …) reads the row as one of
+/// its loop's, and a build before it reads a row it cannot place and counts no act of it.
+pub const SELF_CLAIM_DECISION: &str = "self-claim";
+
+/// The `rule_id` of every [`SelfClaimRow`]: one no rule of aterm's own loop is, so no reader
+/// that keys on a rule reads the holder's act as its own; the holder's own rule is the row's
+/// [`SELF_CLAIM_ACT`] field.
+pub const RULE_SELF_CLAIM_ACT: &str = "self-claim-act@v1";
+
+/// A [`SelfClaimRow`]'s field naming the holder of the proven claim.
+pub const SELF_CLAIM_HOLDER: &str = "holder";
+
+/// A [`SelfClaimRow`]'s field holding the act the holder recorded (`meta set harness_act
+/// <act>`), as the session log's `harness_act=` holds it.
+pub const SELF_CLAIM_ACT: &str = "harness_act";
+
+/// A [`SelfClaimRow`]'s field holding the act's word ([`crate::harness::acts::self_claim_act`];
+/// `unknown` for an act no word is), as the session log's `word=` holds it.
+pub const SELF_CLAIM_WORD: &str = "act";
+
+/// A PROVEN SELF-CLAIM'S ACT IN THE SESSION'S LEDGER: what an agent that supervises itself
+/// (codex-alab) recorded on its proven claim with `meta set harness_act <act>`, booked beside
+/// aterm's own rows in [`Row::to_json`]'s shape — its time, its session, a rule and a
+/// `decision`, an empty command — under [`RULE_SELF_CLAIM_ACT`] and [`SELF_CLAIM_DECISION`],
+/// then who held the claim, the act and its word. Written through [`Ledger`]'s one append, so a
+/// line of it and a line of the loop's never interleave.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfClaimRow<'a> {
+    /// The claim's holder (`codex-alab@<pid>`).
+    pub holder: &'a str,
+    /// The act it recorded (`continue@v1`).
+    pub act: &'a str,
+}
+
+impl SelfClaimRow<'_> {
+    /// The row as one JSON object, `ts` and `sid` given.
+    #[must_use]
+    pub fn to_json(&self, ts: i64, sid: Option<&str>) -> String {
+        let sid = sid.map_or_else(
+            || "null".to_string(),
+            |s| json_str(s.trim_start_matches('@')),
+        );
+        let word = crate::harness::acts::self_claim_act(self.act).map_or("unknown", |(w, _)| w);
+        format!(
+            "{{\"ts\":{ts},\"sid\":{sid},\"rule_id\":{},\"decision\":{},\"cmd_sha256\":{},\
+             \"command\":\"\",\"reason\":\"\",\"box_seq\":0,\"{SELF_CLAIM_HOLDER}\":{},\
+             \"{SELF_CLAIM_ACT}\":{},\"{SELF_CLAIM_WORD}\":{}}}",
+            json_str(RULE_SELF_CLAIM_ACT),
+            json_str(SELF_CLAIM_DECISION),
+            json_str(&sha256_hex("")),
+            json_str(self.holder),
+            json_str(self.act),
+            json_str(word)
+        )
+    }
+
+    /// The row a ledger line `v` is, if it is a self-claim's: its holder and its act.
+    #[must_use]
+    pub fn of(v: &aterm_json::Value) -> Option<SelfClaimRow<'_>> {
+        let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
+        if text("decision")? != SELF_CLAIM_DECISION {
+            return None;
+        }
+        Some(SelfClaimRow {
+            holder: text(SELF_CLAIM_HOLDER).unwrap_or_default(),
+            act: text(SELF_CLAIM_ACT).unwrap_or_default(),
+        })
+    }
+}
+
 #[must_use]
 pub fn last_act_count_in(body: &str, sid: Option<&str>) -> Option<(i64, Option<SleepStamp>)> {
     let last = *typed_at_in(body, sid).last()?;
@@ -322,9 +393,51 @@ pub const MAX_BYTES: u64 = 1024 * 1024;
 pub const KEEP_ROWS: usize = 1024;
 
 pub fn bound(path: &Path) {
-    let _ = crate::harness::cli::bound_ledger_cut(path, MAX_BYTES, &|rows, read| {
-        cut_rows(path, rows, read)
-    });
+    bound_with(path, &|rows, read| cut_rows(path, rows, read));
+}
+
+/// [`bound`] with the rows kept chosen by `cut`, under the ledger's lock ([`ledger_stripe`]) from
+/// the cut's first read to its rename.
+fn bound_with(path: &Path, cut: &crate::harness::cli::LedgerCut<'_>) {
+    let ledger_cut = ledger_stripe(path);
+    let _held = ledger_cut
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = crate::harness::cli::bound_ledger_cut(path, MAX_BYTES, cut);
+}
+
+/// The locks [`ledger_stripe`] stripes the ledgers' paths over.
+static LEDGER_LOCKS: [std::sync::Mutex<()>; 16] = [const { std::sync::Mutex::new(()) }; 16];
+
+/// THE LOCK A LEDGER'S CUT AND A SELF-CLAIM'S BOOKING SHARE IN THIS PROCESS, the stripe of
+/// [`LEDGER_LOCKS`] the ledger at `path` falls in: the cut ([`bound`]) holds it from its first
+/// read to its rename, and [`book_self_claim`] from its open to its append, so a row a control
+/// thread books while a loop's start cuts the same ledger lands in the file the cut leaves, never
+/// in the copy the cut read nor in the file it renamed over. The loop's own rows take no lock:
+/// the loop cuts its ledger before it opens it, on its own thread. Two ledgers share a lock only
+/// where their paths fall in one stripe, which only serializes them.
+fn ledger_stripe(path: &Path) -> &'static std::sync::Mutex<()> {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::hash::DefaultHasher::new();
+    path.hash(&mut hasher);
+    &LEDGER_LOCKS[usize::from(hasher.finish().to_le_bytes()[0]) % LEDGER_LOCKS.len()]
+}
+
+/// BOOK A PROVEN SELF-CLAIM'S ACT ([`SelfClaimRow`]) in session `sid`'s ledger at `path`, stamped
+/// `t_ms`: opened and appended through [`Ledger::write_self_claim`] under the lock the ledger's
+/// cut holds ([`ledger_stripe`]). The line, or `None` where nothing was written (why in `warn`).
+pub fn book_self_claim(
+    path: &Path,
+    sid: Option<&str>,
+    t_ms: i64,
+    row: &SelfClaimRow<'_>,
+    warn: &mut dyn Write,
+) -> Option<String> {
+    let ledger_cut = ledger_stripe(path);
+    let _held = ledger_cut
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ledger::open(Some(path), sid, warn).write_self_claim(t_ms, row, warn)
 }
 
 fn cut_rows(
@@ -842,6 +955,21 @@ impl Ledger {
         Some(line)
     }
 
+    /// Append a proven self-claim's act ([`SelfClaimRow`]) stamped `t_ms`, through the one
+    /// append the loop's own rows take.
+    pub fn write_self_claim(
+        &mut self,
+        t_ms: i64,
+        row: &SelfClaimRow<'_>,
+        warn: &mut dyn Write,
+    ) -> Option<String> {
+        if !self.journal.is_on() {
+            return None;
+        }
+        let line = row.to_json(t_ms, self.sid.as_deref());
+        self.journal.append_raw(&line, warn).then_some(line)
+    }
+
     pub(crate) fn write_counted_with_boot_text(
         &mut self,
         t_ms: i64,
@@ -958,6 +1086,23 @@ pub const LEFT_REASON: &str = "a person's own exchange: nothing is typed until t
 pub const LEFT_AT_WALL_REASON: &str =
     "a person's own exchange at a wall: its retry's short answer is theirs";
 
+/// What closes a `LEFT` row's reason where the exchange it leaves opens the session (the
+/// policy's own judgment as it was left, [`left_reason`]): such a record is the person's however
+/// the tab's books read before it ([`left_after_work_in`]), a program started fresh in a tab
+/// another ran included.
+pub const LEFT_OPENS: &str = " (the session's opening message)";
+
+/// A `LEFT` row's reason: `reason`, closed by [`LEFT_OPENS`] where the exchange `opens` the
+/// session.
+#[must_use]
+pub fn left_reason(reason: &str, opens: bool) -> String {
+    if opens {
+        format!("{reason}{LEFT_OPENS}")
+    } else {
+        reason.to_string()
+    }
+}
+
 pub const LEFT_AT_WALL: &str = "wall:";
 
 #[must_use]
@@ -1051,6 +1196,56 @@ pub fn open_left_in(body: &str, sid: Option<&str>) -> Option<String> {
         }
     }
     open
+}
+
+/// Whether the last person's exchange left to them for `sid` (a `skipped` row under
+/// [`RULE_LEFT`](super::policy::turn_end::RULE_LEFT)) was left after the session worked. A row
+/// whose reason closes with [`LEFT_OPENS`] was left as the session's opening message, so never;
+/// any other, by the books before it: an act a loop typed (a fact line, an accounts probe, an
+/// account move or a sign-in's done is none, as [`typed_at_in`] reads them), or a point it
+/// recorded at an earlier screen (`box_seq`). Under Land only a session's opening message is the
+/// person's (owner ruling 2026-10-27), so a record of one left after work is an older build's,
+/// under the superseded rule, or Off's.
+#[must_use]
+pub fn left_after_work_in(body: &str, sid: Option<&str>) -> bool {
+    use super::policy::login::RULE_LOGIN_DONE;
+    use super::policy::turn_end::{RULE_ACCOUNT, RULE_LEFT, RULE_USAGE_PROBE};
+    let want = sid.map(|s| s.trim_start_matches('@').to_string());
+    let (mut typed, mut first_point, mut after_work) = (false, None::<u64>, false);
+    for line in act_lines(body) {
+        let Ok(v) = aterm_json::from_str::<aterm_json::Value>(line) else {
+            continue;
+        };
+        let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
+        if text("sid").map(str::to_string) != want {
+            continue;
+        }
+        let rule = text("rule_id").unwrap_or("");
+        let seq = v.get("box_seq").and_then(aterm_json::Value::as_u64);
+        let moved = rule == RULE_ACCOUNT
+            && text("command").is_some_and(|c| c.starts_with(ACCOUNT_MOVE_COMMAND));
+        match text("decision") {
+            Some("typed")
+                if !is_fact_rule(rule)
+                    && rule != RULE_USAGE_PROBE
+                    && rule != RULE_LOGIN_DONE
+                    && !moved =>
+            {
+                typed = true;
+            }
+            Some("waiting") if rule == RULE_POINT => {
+                if let Some(seq) = seq {
+                    first_point = Some(first_point.map_or(seq, |first| first.min(seq)));
+                }
+            }
+            Some("skipped") if rule == RULE_LEFT => {
+                after_work = !text("reason").is_some_and(|r| r.ends_with(LEFT_OPENS))
+                    && (typed || first_point.zip(seq).is_some_and(|(first, at)| first < at));
+            }
+            _ => {}
+        }
+    }
+    after_work
 }
 
 #[must_use]
@@ -2052,6 +2247,44 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
         });
     }
     last.map(|l| StreakSeed { recorded, ..l })
+}
+
+/// CRUISE'S CARRIES IN THE BOOKS: when each of `sid`'s carries at a break of its own background
+/// work ([`RULE_BACKGROUND`](super::policy::cruise_carry::RULE_BACKGROUND)) was typed (unix ms,
+/// oldest first) since its books last started again on a row, so a loop after the ones that typed
+/// them replays their ladder ([`super::policy::cruise_carry::BackgroundCarries::replayed`]). The
+/// run ends, newest first, at an act of another rule typed, a point judged or a turn read running
+/// past one, a person's own exchange left to them, the session lifted off Off, or a carry that
+/// names no time. Empty with none since.
+#[must_use]
+pub fn background_carries_in(body: &str, sid: Option<&str>) -> Vec<i64> {
+    use super::policy::cruise_carry::RULE_BACKGROUND;
+    use super::policy::turn_end::RULE_LEFT;
+    let want = sid.map(|s| s.trim_start_matches('@'));
+    let mut run = Vec::new();
+    for line in act_lines(body).rev() {
+        let Ok(v) = aterm_json::from_str::<aterm_json::Value>(line) else {
+            continue;
+        };
+        let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
+        if text("sid") != want {
+            continue;
+        }
+        match (text("rule_id").unwrap_or(""), text("decision")) {
+            (RULE_BACKGROUND, Some("typed")) => {
+                let Some(ts) = v.get("ts").and_then(aterm_json::Value::as_i64) else {
+                    break;
+                };
+                run.push(ts);
+            }
+            (_, Some("typed"))
+            | (RULE_POINT | RULE_TURN_RAN | RULE_OFF_STOOD, _)
+            | (RULE_LEFT, Some("skipped")) => break,
+            _ => {}
+        }
+    }
+    run.reverse();
+    run
 }
 
 #[must_use]
@@ -3115,8 +3348,7 @@ mod tests {
 
     #[test]
     fn the_journal_sits_beside_the_ledger_and_both_are_bounded() {
-        let dir = std::env::temp_dir().join(format!("aterm-apr-bound-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::supervise::ScratchDir::new("apr", "bound");
         let ledger = path_under(&dir, Some("@s-7")).expect("the drive dir");
         assert_eq!(
             journal_beside(&ledger),
@@ -3140,14 +3372,12 @@ mod tests {
             std::fs::read_to_string(&small).expect("read"),
             "{\"ts\":1}\n"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_file_past_sixteen_mib_is_streamed_and_cut() {
         use super::super::policy::turn_end::RULE_MODEL_FALLBACK;
-        let dir = std::env::temp_dir().join(format!("aterm-apr-big-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::supervise::ScratchDir::new("apr", "big");
         let past = 17 << 20;
         let sid = "s-195cbb43bd1fc3dc2c7b";
         let journal = journal_beside(&path_under(&dir, Some(sid)).expect("the drive dir"));
@@ -3205,7 +3435,6 @@ mod tests {
             standing,
             "the standing switch survives the cut"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3282,9 +3511,7 @@ mod tests {
 
     #[test]
     fn typed_at_reads_the_sessions_typed_rows_only() {
-        let dir = std::env::temp_dir().join(format!("aterm-typed-at-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
+        let dir = crate::supervise::ScratchDir::new("apr", "typed-at");
         let path = dir.join("s-1.jsonl");
         let row = |outcome, command: &'static str| Row {
             rule_id: "continue@v1",
@@ -3318,7 +3545,6 @@ mod tests {
         assert_eq!(typed_at(&path, Some("@s-1")), [1_000, 3_000, 6_000]);
         assert_eq!(typed_at(&path, Some("s-2")), [4_000]);
         assert!(typed_at(&dir.join("none.jsonl"), Some("@s-1")).is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3400,12 +3626,93 @@ mod tests {
         );
     }
 
+    /// A person's exchange left after the session worked (an act typed, or a point recorded at
+    /// an earlier screen, before the LEFT row) reads as such; the opening message's record, with
+    /// only its own point (the same screen) before it, does not, nor a fact line before it.
+    /// NEGATIVE CONTROL: a reader that takes the record's own point for earlier work reads every
+    /// opening message's record as after work, and Land carries the person's first message.
+    #[test]
+    fn a_person_left_after_work_is_told_from_the_opening_message() {
+        use super::super::policy::login::RULE_LOGIN_DONE;
+        use super::super::policy::turn_end::{RULE_ACCOUNT, RULE_LEFT, RULE_USAGE_PROBE};
+        let row = |rule, outcome, box_seq| Row {
+            rule_id: rule,
+            outcome,
+            command: "prompt:u-1",
+            reason: LEFT_REASON,
+            box_seq,
+        };
+        let at = |rule, outcome, seq, ts| row(rule, outcome, seq).to_json(ts, Some("@s-1"));
+        let body = |rows: &[String]| rows.join("\n");
+        let opening = body(&[
+            at(RULE_POINT, Outcome::Waiting, 9, 1_000),
+            at(RULE_LEFT, Outcome::Skipped, 9, 1_001),
+        ]);
+        assert!(
+            !left_after_work_in(&opening, Some("@s-1")),
+            "the opening message"
+        );
+        let after_a_point = body(&[
+            at(RULE_POINT, Outcome::Waiting, 5, 1_000),
+            at(RULE_POINT, Outcome::Waiting, 9, 2_000),
+            at(RULE_LEFT, Outcome::Skipped, 9, 2_001),
+        ]);
+        assert!(left_after_work_in(&after_a_point, Some("@s-1")));
+        assert!(
+            !left_after_work_in(&after_a_point, Some("@s-2")),
+            "another session's"
+        );
+        let after_an_act = body(&[
+            at("continue@v1", Outcome::Typed, 3, 500),
+            at(RULE_POINT, Outcome::Waiting, 9, 1_000),
+            at(RULE_LEFT, Outcome::Skipped, 9, 1_001),
+        ]);
+        assert!(left_after_work_in(&after_an_act, Some("@s-1")));
+        assert!(!left_after_work_in(
+            &body(&[at(RULE_POINT, Outcome::Waiting, 5, 1_000)]),
+            Some("@s-1")
+        ));
+        // A record this build wrote says whether it opened the session: a program started fresh
+        // in a tab another worked keeps its opening message the person's, whatever came before.
+        let opens = left_reason(LEFT_REASON, true);
+        let fresh_after_another = body(&[
+            at("continue@v1", Outcome::Typed, 3, 500),
+            at(RULE_POINT, Outcome::Waiting, 5, 1_000),
+            Row {
+                reason: &opens,
+                ..row(RULE_LEFT, Outcome::Skipped, 9)
+            }
+            .to_json(2_001, Some("@s-1")),
+        ]);
+        assert!(
+            !left_after_work_in(&fresh_after_another, Some("@s-1")),
+            "an opening message's record"
+        );
+        assert_eq!(left_reason(LEFT_REASON, false), LEFT_REASON);
+        // What a loop types that is no work (as `typed_at_in` reads it) makes no record after
+        // work: an accounts probe, an account move, a sign-in's done.
+        let move_row = Row {
+            command: "relaunch under account b",
+            ..row(RULE_ACCOUNT, Outcome::Typed, 3)
+        };
+        for not_work in [
+            at(RULE_USAGE_PROBE, Outcome::Typed, 3, 500),
+            at(RULE_LOGIN_DONE, Outcome::Typed, 3, 500),
+            move_row.to_json(500, Some("@s-1")),
+        ] {
+            let left = body(&[
+                not_work,
+                at(RULE_POINT, Outcome::Waiting, 9, 1_000),
+                at(RULE_LEFT, Outcome::Skipped, 9, 1_001),
+            ]);
+            assert!(!left_after_work_in(&left, Some("@s-1")), "{left}");
+        }
+    }
+
     #[test]
     fn open_left_is_the_last_left_row_no_typed_row_closed() {
         use super::super::policy::turn_end::{RULE_LEFT, RULE_USAGE_PROBE};
-        let dir = std::env::temp_dir().join(format!("aterm-open-left-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
+        let dir = crate::supervise::ScratchDir::new("apr", "open-left");
         let path = dir.join("s-1.jsonl");
         let row = |rule, outcome, command: &'static str| Row {
             rule_id: rule,
@@ -3439,7 +3746,6 @@ mod tests {
         write(&[row("continue@v1", Outcome::Skipped, "answer:a").to_json(1_000, Some("@s-1"))]);
         assert_eq!(open_left(&path, Some("@s-1")), None, "another rule's");
         assert_eq!(open_left(&dir.join("none.jsonl"), Some("@s-1")), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3571,9 +3877,7 @@ mod tests {
     #[test]
     fn the_probes_rows_are_no_typed_act_and_say_whether_a_panel_is_owed() {
         use super::super::policy::turn_end::{RULE_COMPACT, RULE_USAGE_PROBE};
-        let dir = std::env::temp_dir().join(format!("aterm-probe-rows-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
+        let dir = crate::supervise::ScratchDir::new("apr", "probe-rows");
         let path = dir.join("s-1.jsonl");
         let row = |rule_id, outcome, command: &'static str, reason: &'static str| Row {
             rule_id,
@@ -3648,15 +3952,12 @@ mod tests {
         assert!(!probe_owed(&read(&path), Some("@s-1")));
         assert_eq!(typed_at(&path, Some("@s-1")), [1_000, 2_000]);
         assert!(!probe_owed(&read(&dir.join("none.jsonl")), Some("@s-1")));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_reset_row_taken_and_not_ended_is_owed_and_says_whether_it_was_entered() {
         use super::super::policy::approval::{RULE_LIMIT_RESET, RULE_LIMIT_WAIT};
-        let dir = std::env::temp_dir().join(format!("aterm-reset-rows-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
+        let dir = crate::supervise::ScratchDir::new("apr", "reset-rows");
         let path = dir.join("s-1.jsonl");
         let row = |rule_id, outcome, command: &'static str, reason: &'static str| {
             Row {
@@ -3782,13 +4083,12 @@ mod tests {
             reset_owed(&read(&dir.join("none.jsonl")), Some("@s-1")),
             None
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn typed_texts_are_what_the_sessions_loop_typed() {
-        let dir = std::env::temp_dir().join(format!("aterm-typed-texts-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = crate::supervise::ScratchDir::new("apr", "typed-texts");
+        let dir = scratch.join("state");
         let path = ledger_under(&dir, Some("@s-1"));
         assert!(!dir.exists(), "a reader's path makes nothing");
         assert_eq!(path_under(&dir, Some("@s-1")), Some(path.clone()));
@@ -3827,13 +4127,11 @@ mod tests {
         );
         assert_eq!(typed("s-2"), [(5_000, "carry on".to_string())]);
         assert!(typed_texts(&dir.join("drive/none.jsonl"), Some("@s-1")).is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_ledger_lives_under_the_state_root_by_sid_and_appends() {
-        let root = std::env::temp_dir().join(format!("aterm-approvals-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::supervise::ScratchDir::new("apr", "approvals");
         let path = path_under(&root, Some("@s-ab/../x")).expect("path");
         assert_eq!(path, root.join("drive").join("s-ab____x.jsonl"));
         assert_eq!(
@@ -3862,7 +4160,149 @@ mod tests {
                 .all(|l| l.contains("\"decision\":\"escalated\""))
         );
         assert!(warn.is_empty());
-        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A SELF-CLAIM'S ROW IS NONE OF THE LOOP'S ACTS: appended whole through the ledger's one
+    /// append in the row's shape, read back as the holder's act, and, for a rule each reader of
+    /// aterm's own acts reacts to (its typed times and sleep count, its streak, its done check,
+    /// its land episode, its person's exchange), read by none of them. NEGATIVE CONTROL: the
+    /// loop's own row of each of those rules changes its reader's answer, and is no self-claim's.
+    #[test]
+    fn a_self_claims_row_is_appended_whole_and_read_as_none_of_the_loops_acts() {
+        use super::super::policy::turn_end::{
+            RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LEFT,
+        };
+        let root = crate::supervise::ScratchDir::new("apr", "self-claim");
+        let sid = Some("@s-sc");
+        let path = path_under(&root, sid).expect("path");
+        let mut warn = Vec::new();
+        let mut ledger = Ledger::open(Some(&path), sid, &mut warn);
+        let row = SelfClaimRow {
+            holder: "codex-alab@4242",
+            act: "continue@v1",
+        };
+        let line = ledger
+            .write_self_claim(1_000, &row, &mut warn)
+            .expect("written");
+        assert!(warn.is_empty(), "{warn:?}");
+        let body = std::fs::read_to_string(&path).expect("ledger");
+        assert_eq!(body, format!("{line}\n"), "one whole line");
+        let v: aterm_json::Value = aterm_json::from_str(&line).expect("one JSON object");
+        assert_eq!(SelfClaimRow::of(&v), Some(row));
+        let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
+        assert_eq!(v.get("ts").and_then(aterm_json::Value::as_i64), Some(1_000));
+        assert_eq!(text("sid"), Some("s-sc"));
+        assert_eq!(text("rule_id"), Some(RULE_SELF_CLAIM_ACT));
+        assert_eq!(text(SELF_CLAIM_WORD), Some("continue"));
+        assert_eq!(text("decision").and_then(Outcome::from_word), None);
+        assert!(!is_fact_line(&line));
+        for act in [RULE_DONE_CHECK, RULE_LAND, RULE_LEFT] {
+            let row = SelfClaimRow {
+                holder: "codex-alab@4242",
+                act,
+            };
+            ledger
+                .write_self_claim(1_001, &row, &mut warn)
+                .expect("written");
+        }
+        let body = std::fs::read_to_string(&path).expect("ledger");
+        assert_eq!(body.lines().count(), 4, "{body}");
+        assert!(typed_at_in(&body, sid).is_empty());
+        assert_eq!(last_act_count_in(&body, sid), None);
+        assert_eq!(done_check_owed_in(&body, sid), done_check_owed_in("", sid));
+        assert_eq!(land_episode_in(&body, sid), land_episode_in("", sid));
+        assert_eq!(short_streak_in(&body, sid), short_streak_in("", sid));
+        assert_eq!(open_left_in(&body, sid), open_left_in("", sid));
+        let own = |rule_id, outcome, command| {
+            Row {
+                rule_id,
+                outcome,
+                command,
+                reason: "",
+                box_seq: 0,
+            }
+            .to_json(1_000, sid)
+        };
+        let typed = own(RULE_CONTINUE, Outcome::Typed, "keep going");
+        assert_eq!(typed_at_in(&typed, sid), [1_000], "NEGATIVE CONTROL");
+        assert_ne!(short_streak_in(&typed, sid), short_streak_in("", sid));
+        let check = own(RULE_DONE_CHECK, Outcome::Typed, "check your work");
+        assert_ne!(done_check_owed_in(&check, sid), done_check_owed_in("", sid));
+        let land = own(RULE_LAND, Outcome::Typed, "land it");
+        assert_ne!(land_episode_in(&land, sid), land_episode_in("", sid));
+        let left = own(RULE_LEFT, Outcome::Skipped, "their own exchange");
+        assert_ne!(open_left_in(&left, sid), open_left_in("", sid));
+        for own in [typed, check, land, left] {
+            let v: aterm_json::Value = aterm_json::from_str(&own).expect("one JSON object");
+            assert_eq!(SelfClaimRow::of(&v), None, "{own}");
+        }
+    }
+
+    /// A SELF-CLAIM'S ROW BOOKED WHILE A LOOP CUTS THE LEDGER LANDS IN THE FILE THE CUT LEAVES:
+    /// the cut ([`bound`]) holds the ledger's lock from its first read to its rename, and
+    /// [`book_self_claim`] opens and appends under it, so a booking begun mid-cut waits the cut
+    /// out and its row is the cut file's newest, and the lock is free once the cut is over.
+    /// NEGATIVE CONTROL: a row written through a handle opened before a cut's rename is in no
+    /// file the ledger's path names, which the shared lock rules out.
+    #[test]
+    fn a_self_claims_row_booked_during_a_cut_lands_in_the_file_the_cut_leaves() {
+        let dir = crate::supervise::ScratchDir::new("apr-cut", "self-claim");
+        let sid = Some("@s-cut");
+        let path = path_under(&dir, sid).expect("the drive dir");
+        let pad = format!("{{\"ts\":1,\"pad\":\"{}\"}}", "x".repeat(300));
+        let past: String = (0..usize::try_from(MAX_BYTES).unwrap() / pad.len() + 50)
+            .map(|k| format!("{pad}{k}\n"))
+            .collect();
+        let row = SelfClaimRow {
+            holder: "codex-alab@4242",
+            act: "continue@v1",
+        };
+
+        std::fs::write(&path, &past).expect("seed");
+        let mut warn = Vec::new();
+        let mut stale = Ledger::open(Some(&path), sid, &mut warn);
+        bound(&path);
+        let lost = stale
+            .write_self_claim(2_000, &row, &mut warn)
+            .expect("written");
+        let cut = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(cut.lines().count(), KEEP_ROWS, "the ledger is cut");
+        assert!(!cut.contains(&lost), "NEGATIVE CONTROL: {lost}");
+        assert!(warn.is_empty(), "{warn:?}");
+
+        std::fs::write(&path, &past).expect("seed");
+        let (at, row) = (path.as_path(), &row);
+        let booked = std::thread::scope(|scope| {
+            let booker = std::cell::RefCell::new(None);
+            bound_with(at, &|rows, read| {
+                assert!(
+                    ledger_stripe(at).try_lock().is_err(),
+                    "the cut holds the ledger's lock"
+                );
+                booker.replace(Some(
+                    scope.spawn(move || book_self_claim(at, sid, 2_001, row, &mut Vec::new())),
+                ));
+                cut_rows(at, rows, read)
+            });
+            let booker = booker.into_inner().expect("the cut read the ledger");
+            booker.join().expect("the booking").expect("booked")
+        });
+        let cut = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(cut.lines().count(), KEEP_ROWS + 1, "cut, then booked");
+        assert!(cut.ends_with(&format!("{booked}\n")), "{booked}");
+        // Another test's ledger can fall in this one's stripe and hold it a moment, so free is a
+        // take of it that ends (within a minute, as a hang detector), not one untaken right now.
+        let (freed, free) = std::sync::mpsc::channel();
+        let stripe = ledger_stripe(&path);
+        std::thread::spawn(move || {
+            drop(stripe.lock());
+            let _ = freed.send(());
+        });
+        assert!(
+            free.recv_timeout(std::time::Duration::from_secs(60))
+                .is_ok(),
+            "free once cut"
+        );
     }
 
     fn seed_ledger(dir: &Path, name: &str, rows: &[(i64, &str, Outcome, &str, String)]) -> PathBuf {

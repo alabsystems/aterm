@@ -15,6 +15,12 @@ use std::{collections::BTreeMap, net::TcpListener, thread, time::Duration};
 #[path = "dispatch_tests.rs"]
 mod dispatch;
 
+#[path = "process_tests.rs"]
+mod process;
+
+#[path = "retirement_tests.rs"]
+mod retirement_tests;
+
 fn allocation(lab: &Lab, shares: &[u64]) -> Allocation {
     let bootstrap = lab.bootstrap(0);
     let terms = Terms {
@@ -231,6 +237,83 @@ fn another_pin_for_the_same_resource_window_never_resets_this_installation() {
     assert!(!a.reserve([1; 16], 2).unwrap().fresh);
 }
 
+#[test]
+fn a_retained_allocation_pin_cannot_reinitialize_missing_table_custody() {
+    let lab = Lab::new(&[Role::Writer]);
+    let allocation = allocation(&lab, &[1]);
+    let db = resources(&lab, 0, &allocation);
+    db.initialize().unwrap();
+    let receipt = db.reserve([1; 16], 1).unwrap().receipt;
+    let (path, claim) = lose_custody(&lab, &allocation);
+    assert!(db.snapshot().is_err());
+    assert!(
+        db.initialize().is_err(),
+        "a retained pin is prior enrollment evidence"
+    );
+    assert!(db.reserve([2; 16], 1).is_err());
+    // Catalog repair may reenroll metadata, but that cannot replace the
+    // resource application's independently pinned custody.
+    reenroll(&lab, &allocation);
+    assert!(db.initialize().is_err());
+    assert!(db.snapshot().is_err());
+    assert!(db.reserve([2; 16], 1).is_err());
+    for name in [path, claim] {
+        std::fs::rename(&name, name.with_extension("reenrolled")).unwrap();
+        std::fs::rename(name.with_extension("preserved"), &name).unwrap();
+    }
+    db.initialize().unwrap();
+    assert_eq!(db.reserve([1; 16], 1).unwrap().receipt, receipt);
+    assert!(db.reserve([2; 16], 1).is_err());
+}
+
+fn lose_custody(lab: &Lab, allocation: &Allocation) -> (std::path::PathBuf, std::path::PathBuf) {
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    let scope = descriptor(&bootstrap, allocation).unwrap().scope;
+    let path = Directory::new(&lab.paths[0], bootstrap.trust())
+        .path(scope)
+        .unwrap();
+    let claim = crate::table::store::claim_dir(&session)
+        .unwrap()
+        .join(crate::table::store::claim_name(scope));
+    drop(session);
+    std::fs::rename(&path, path.with_extension("preserved")).unwrap();
+    std::fs::rename(&claim, claim.with_extension("preserved")).unwrap();
+    (path, claim)
+}
+
+fn reenroll(lab: &Lab, allocation: &Allocation) {
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    Directory::new(&lab.paths[0], bootstrap.trust())
+        .enroll(&session, descriptor(&bootstrap, allocation).unwrap().scope)
+        .unwrap();
+}
+
+#[test]
+fn a_legacy_allocation_pin_is_never_silently_rebound_to_current_custody() {
+    let lab = Lab::new(&[Role::Writer]);
+    let allocation = allocation(&lab, &[1]);
+    let db = resources(&lab, 0, &allocation);
+    db.initialize().unwrap();
+    db.reserve([1; 16], 1).unwrap();
+    let path = db.pin_path();
+    std::fs::rename(&path, path.with_extension("preserved")).unwrap();
+    let mut legacy = b"ARAP1".to_vec();
+    legacy.extend_from_slice(&allocation.id());
+    assert!(fsx::write_new(&path, &legacy, 0o600).unwrap());
+    assert!(db.initialize().unwrap_err().to_string().contains("legacy"));
+    assert!(db.snapshot().is_err());
+    assert!(db.reserve([2; 16], 1).is_err());
+    assert!(
+        db.dispatch_once([3; 16], 1, [4; 32], || panic!(
+            "legacy custody granted entry"
+        ))
+        .is_err()
+    );
+    assert_eq!(std::fs::read(path).unwrap(), legacy);
+}
+
 fn raw(lab: &Lab, allocation: &Allocation, debit: ledger::Debit) {
     let bootstrap = lab.bootstrap(0);
     let session = Session::open(&bootstrap).unwrap();
@@ -364,6 +447,13 @@ pub(crate) fn reservation_transition(
                 .receipt,
         );
     }
+    if matches!(action, "LostCustody" | "Reenrolled") {
+        db.reserve([1; 16], 3).unwrap();
+        lose_custody(&lab, &allocation);
+        if action == "Reenrolled" {
+            reenroll(&lab, &allocation);
+        }
+    }
     let result = match action {
         "Reserve" => db.reserve([1; 16], 3),
         "Retry" => db.reserve([1; 16], 2),
@@ -405,12 +495,17 @@ pub(crate) fn reservation_transition(
             other.reserve([1; 16], 3).unwrap();
             db.reserve([1; 16], 2)
         }
+        "LostCustody" | "Reenrolled" => db.initialize().and_then(|_| db.reserve([2; 16], 1)),
         _ => panic!("unknown resource action"),
     };
-    // Bad-history usage is the acknowledged prefix, not a spendable projection
-    // of the corrupted tail. The API must refuse to report any such balance.
-    let used = if action == "BadHistory" {
-        2
+    // Account for the acknowledged usage before corruption or loss. An unsafe
+    // fresh reservation after custody loss adds to that already consumed share.
+    let used = if matches!(action, "BadHistory" | "LostCustody" | "Reenrolled") {
+        if action == "BadHistory" {
+            2
+        } else {
+            3 + u64::from(result.as_ref().is_ok_and(|r| r.fresh))
+        }
     } else if matches!(action, "Uninitialized" | "NoPin") {
         0
     } else {
@@ -453,6 +548,8 @@ pub(crate) fn reservation_transition(
             "TwoOffline" => 8,
             "Uninitialized" => 9,
             "NoPin" => 10,
+            "LostCustody" => 11,
+            "Reenrolled" => 12,
             _ => unreachable!(),
         },
     );
@@ -474,19 +571,33 @@ pub(crate) fn reservation_transition(
 fn resource_reservations_conform_and_unsafe_receipts_are_detected() {
     let model = aterm_models_db::resource_reservation_model();
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
-    for state in aterm_spec::interp::reachable_states(&model) {
-        for action in &model.actions {
-            if model.action_enabled(action.name, &state) {
-                let next = reservation_transition(&state, action.name);
-                assert!(
-                    model.successors(action.name, &state).contains(&next),
-                    "{}: {next:?}",
-                    action.name
-                );
-            }
-        }
-    }
-    let mut unsafe_retry = reservation_transition(&model.init_state(), "Retry");
+    let steps: Vec<_> = aterm_spec::interp::reachable_states(&model)
+        .iter()
+        .flat_map(|state| {
+            model
+                .actions
+                .iter()
+                .filter(|action| model.action_enabled(action.name, state))
+                .map(|action| (state.clone(), action.name))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    // Each step builds its own Lab in its own temporary home: every core.
+    let reached =
+        aterm_spec::check::each_on(aterm_spec::fs_lane::PLACES, &steps, |(state, action)| {
+            let next = reservation_transition(state, action);
+            assert!(
+                model.successors(action, state).contains(&next),
+                "{action}: {next:?}"
+            );
+            next
+        });
+    let mut unsafe_retry = steps
+        .iter()
+        .zip(&reached)
+        .find(|((state, action), _)| *state == model.init_state() && *action == "Retry")
+        .map(|(_, next)| next.clone())
+        .expect("Retry is enabled initially");
     unsafe_retry.insert("fresh", 1);
     assert!(!model.check_invariant("RetryIsNotFresh", &unsafe_retry));
     assert!(

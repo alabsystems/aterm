@@ -1,24 +1,21 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-grapheme: spec recovery from its 119 unit tests
+# aterm-grapheme: spec recovery from its 46 unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 93 tests it
-> deleted (the 17 §4 tests among them) are gone, and the spec rows no longer cite those tests.
-> Counts elsewhere in this file were taken before.
+> Status 2026-10-28: this is the crate's migration worklist across its 29 specs and 46 live
+> `#[test]` fns (after the tests-and-gates audit deleted 93 redundant/non-spec tests and added
+> `P1-script-and-category-tables`, `H1-liang-hyphenation` and `L1-prose-and-code-line-breaks`
+> with their 14 tests). Each spec below is proved through Trust/Clean, then the tests it subsumes
+> are deleted.
 
-> Status 2026-10-15: nothing is deleted yet. The 26 specs below are the crate's migration
-> worklist: each is proved through Trust/Clean, then the tests it subsumes are deleted. The 21
-> tests in §4 sample no production spec; they go now, together with the `#[cfg(test)]`-only API
-> they exercise.
+Source: `crates/aterm-grapheme` (read only). Every live `#[test]`
+(src/{grapheme_iter.rs 6, hyphenate.rs 2, line_break.rs 8, props.rs 4, tests.rs 14, word.rs 7},
+tests/{emoji_data.rs 2, uax29_conformance.rs 3} = 46) and the code they reach (`width.rs`,
+`grid.rs`, `position.rs`, `props.rs`, `hyphenate.rs`, `line_break.rs`, `types.rs`,
+`tables/{width,gcb}.rs`) are mapped below.
 
-Source: `crates/aterm-grapheme` (read only). I read every `#[test]`
-(src/{tests.rs 63, ucs_detect_tests.rs 34, emoji_presentation.rs 5, grapheme_iter.rs 5, word.rs 7},
-tests/{emoji_data.rs 2, uax29_conformance.rs 3} = 119) and the code they reach (`width.rs`,
-`grid.rs`, `position.rs`, `types.rs`, `tables/{width,gcb}.rs`). Nothing was compiled or run. The
-claims below come from reading the code.
-
-Result: **26 specs**, covering **98 tests**. **21 tests are not spec samples** (§4).
+Result: **29 specs**, covering **46 tests**. **0 remaining non-spec tests** (§4).
 
 Gap numbers in §1 are the rows of the gap table in
 the historical development audit `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
@@ -56,7 +53,7 @@ Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secon
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
-S1-graphemes-are-uax29	refinement	grapheme_iter::{Graphemes::next, find_first_cluster_end, is_break}, GraphemeClusters::graphemes	∀ s: G(s) = UAX29(s). Every item is non-empty, the items concatenate to s, and a boundary falls between chars i-1 and i exactly when Brk(s,i) holds: GB9c conjuncts; GB11 only after ExtPict Extend* ZWJ (a second ZWJ, or an Extend after the ZWJ, breaks); GB12/13 RI pairing by parity. Corollary (size_hint): |s|=0 ⇒ (0,Some(0)); otherwise 1 ≤ |G(s)| ≤ |s|.	uax29_conformance::uax29_official_conformance, where_unicode_segmentation_disagreed_this_crate_follows_unicode_16; grapheme_iter::test_ethiopic_combining, test_extpict_zwj_extpict, test_gb11_needs_extend_only_between_pictograph_and_zwj	HARDEST pure spec: &str slicing, char_indices loop with early return, Iterator::next(&mut self), a Copy state struct (u32 + bools), GCB/InCB enum matches, a 15×15 static bool matrix, two-level gcb_class arrays, incb_class binary_search_by with a closure; needs a declarative Lean UAX #29 over List Char	0,1,2,3,5,7,13,14
+S1-graphemes-are-uax29	refinement	grapheme_iter::{Graphemes::next, find_first_cluster_end, is_break}, GraphemeClusters::graphemes	∀ s: G(s) = UAX29(s). Every item is non-empty, the items concatenate to s, and a boundary falls between chars i-1 and i exactly when Brk(s,i) holds: GB9c conjuncts; GB11 only after ExtPict Extend* ZWJ (a second ZWJ, or an Extend after the ZWJ, breaks); GB12/13 RI pairing by parity. Corollary (size_hint): |s|=0 ⇒ (0,Some(0)); otherwise 1 ≤ |G(s)| ≤ |s|.	uax29_conformance::uax29_official_conformance, where_unicode_segmentation_disagreed_this_crate_follows_unicode_16; grapheme_iter::test_ethiopic_combining, test_extpict_zwj_extpict, test_gb11_needs_extend_only_between_pictograph_and_zwj, ascii_boundaries_refine_the_derived_fast_path_model	HARDEST pure spec: &str slicing, char_indices loop with early return, Iterator::next(&mut self), a Copy state struct (u32 + bools), GCB/InCB enum matches, a 15×15 static bool matrix, two-level gcb_class arrays, incb_class binary_search_by with a closure; needs a declarative Lean UAX #29 over List Char	0,1,2,3,5,7,13,14
 S2-indices-are-running-offsets	equivalence	grapheme_iter::GraphemeIndices::next, GraphemeClusters::grapheme_indices	∀ s: GI(s) = zip(prefix_sums(map len G(s)), G(s)); the k-th item is (Σ_{j<k} |G(s)[j]|, G(s)[k]). The pointer-difference offset equals the byte position of the slice in s, and the lengths sum to |s|.	uax29_conformance::grapheme_indices_agree_with_graphemes	MEDIUM: as_ptr as usize subtraction (needs a provenance / slice-of model; gap 8 for that model), Option::map with a closure, &mut self iterator	0,1,2,3,7,8,13
 S3-boundary-class-reuse	equivalence	grapheme_iter::{find_first_cluster_end, Graphemes::next}	∀ non-empty s with first char c0: find_first_cluster_end(s, Some((gcb_class(c0), incb_class(c0)))) = find_first_cluster_end(s, None). A return (end, Some(k)) with end < |s| has k = (gcb_class, incb_class) of s[end..]'s first char; (end, None) ⇒ end = |s|. Hence the cached next_base in Graphemes::next yields the same clusters as reclassifying each cluster's first char.	grapheme_iter::test_boundary_class_reuse_across_clusters	MEDIUM: Option<(enum,enum)>, unwrap_or_else closure, char_indices loop, tuple return	0,1,3,5,7,13
 S4-gcb-incb-tables-are-ucd	table-property	tables::gcb::{gcb_class, incb_class}	∀ c: gcb_class(c) = UCD16.Grapheme_Cluster_Break(c), with Extended_Pictographic from emoji-data taking precedence as the generator does; incb_class(c) = UCD16.InCB(c), None where unassigned. Both total and panic-free. INCB_RANGES is sorted and disjoint, so binary_search_by finds the one containing range.	grapheme_iter::test_plane14_tag_classification	EASY by evaluation once tables are carriers: [u16;4352] and [u8;13568] arrays with get().copied().unwrap_or, nibble extraction, a 15-way match, binary_search_by over [(u32,u32,u8);403]; exhaustive over 1,112,064 scalars; needs GraphemeBreakProperty.txt and DerivedCoreProperties.txt vendored	0,1,5,13
@@ -64,9 +61,9 @@ S5-char-width-table	table-property	tables::width::{char_width, char_width_cjk}	�
 S6-cjk-differs-only-on-ambiguous	equivalence	tables::width::{char_width_cjk, char_width, is_ambiguous_width}	∀ c: char_width_cjk(c) = (Amb(c) ? 2 : char_width(c)), and Amb(c) ⇒ char_width(c) = 1. Side condition, decidable on the tables: no Hangul Extended-B V/T code point has raw class 3.	tests::test_char_width_cjk_widens_ambiguous	EASY: const fn, same table reads as S5, straight-line apart from range checks	0,1,3
 S7-char-width-range-no-panic	no-panic/bounds	tables::width::{char_width, char_width_cjk, is_ambiguous_width}	∀ c: char_width(c) ∈ {0,1,2} and char_width_cjk(c) ∈ {0,1,2}. No index is out of bounds: ∀ cp < 0x30000, WIDTH_LEVEL1[cp>>8]·64 + (cp&0xFF)/4 < 7104. The unreachable!() arm is dead because raw = x & 3.	(none; lemma for S5, S9, S17)	EASY: array indexing with a bounds proof over table contents, u32 shifts and masks, unreachable!()	0,1,3
 S8-str-width-is-sum	equivalence	tables::width::str_width	∀ s: str_width(s) = Σ_{c ∈ chars(s)} char_width(c).	(none directly; secondary of plane14_default_ignorables_are_zero_width)	EASY: Chars, map, sum (iterator adapter chain)	0,1,3,7,13
-S9-grapheme-display-width-cases	contract	width::{grapheme_display_width, grapheme_display_width_inner, spacing_chars, is_emoji_char, is_skin_tone_modifier}	For chars(g) empty, W = 0. A lone control has W = 1; every other lone c has W = cw_a(c). For a multi-codepoint cluster, drop the leading zero-width prefix to find spacing base f and its remaining tail t; no base gives W = 0. Otherwise W = 2 if is_vs16_emoji_capable(f) and VS16 occurs in g, or if (is_emoji_char(f) or is_vs16_emoji_capable(f)) and (the next character is a skin tone or t contains ZWJ). Otherwise W = min(cw_a(f), 2). Always W is in 0..=2. A GB9b Prepend sign does not hide its base or emoji presentation.	tests::prepend_cluster_is_measured_at_its_base	MEDIUM: chars() stepped by hand, str::contains(char), Iterator::any with a closure, a selected fn pointer (char_width vs char_width_cjk), range matches, usize::min; composes with S1 for multi-cluster samples	0,1,3,7,13
-S10-config-dispatch	equivalence	width::{grapheme_width_with_config, grapheme_display_width_with_config, split_graphemes_with_config, is_cjk}	∀ s, cfg: grapheme_width_with_config(s,cfg) = grapheme_width_inner(s, cfg.ambiguous_width = Double); likewise for grapheme_display_width_with_config and split_graphemes_with_config. TextShapingConfig::default().ambiguous_width ≠ Double, so the *_with_config(·, default) functions equal grapheme_width, grapheme_display_width, split_graphemes. With S6, S9: first spacing base of g not Amb ⇒ W(g,true) = W(g,false); a lone Amb non-control char has W(g,true) = 2, W(g,false) = 1.	-	EASY dispatch: &TextShapingConfig from aterm_types (cross-crate), matches! on an enum field, a cross-crate Default impl, struct equality	0,1,2,3,12
-S11-grapheme-width-aggregate	equivalence	width::{grapheme_width, grapheme_width_inner, is_emoji_grapheme}	∀ s, cjk: grapheme_width_inner(s,cjk) = {byte_count = |s|, grapheme_count = |G(s)|, display_width = Σ_{g∈G(s)} W(g,cjk), codepoint_count = |chars(s)|, has_emoji = ∃g∈G(s). is_emoji_grapheme(g) (the first spacing base, or the first scalar if all are zero-width, passes is_emoji_char), has_combining = ∃g. |chars(g)|>1 ∧ W(g,cjk) ≤ 1, has_wide = ∃g. W(g,cjk) = 2}. In particular s = "" ⇒ GraphemeInfo::default().	tests::prepend_cluster_is_measured_at_its_base	MEDIUM: a for loop over Graphemes, a struct accumulator with += and |=, chars().count(); sample values follow by composing with S1, S9, S5	0,1,2,3,4,7,13
+S9-grapheme-display-width-cases	contract	width::{grapheme_display_width, grapheme_display_width_inner, spacing_chars, is_emoji_char, is_skin_tone_modifier}	For chars(g) empty, W = 0. A lone control has W = 1; every other lone c has W = cw_a(c). For a multi-codepoint cluster, drop the leading zero-width prefix to find spacing base f and its remaining tail t; no base gives W = 0. Otherwise W = 2 if is_vs16_emoji_capable(f) and VS16 occurs in g, or if (is_emoji_char(f) or is_vs16_emoji_capable(f)) and (the next character is a skin tone or t contains ZWJ). Otherwise W = min(cw_a(f), 2). Always W is in 0..=2. A GB9b Prepend sign does not hide its base or emoji presentation.	tests::single_cluster_widths, tests::prepend_cluster_is_measured_at_its_base	MEDIUM: chars() stepped by hand, str::contains(char), Iterator::any with a closure, a selected fn pointer (char_width vs char_width_cjk), range matches, usize::min; composes with S1 for multi-cluster samples	0,1,3,7,13
+S10-config-dispatch	equivalence	width::{grapheme_width_with_config, grapheme_display_width_with_config, split_graphemes_with_config, is_cjk}	∀ s, cfg: grapheme_width_with_config(s,cfg) = grapheme_width_inner(s, cfg.ambiguous_width = Double); likewise for grapheme_display_width_with_config and split_graphemes_with_config. TextShapingConfig::default().ambiguous_width ≠ Double, so the *_with_config(·, default) functions equal grapheme_width, grapheme_display_width, split_graphemes. With S6, S9: first spacing base of g not Amb ⇒ W(g,true) = W(g,false); a lone Amb non-control char has W(g,true) = 2, W(g,false) = 1.	tests::ambiguous_double_widens_only_ambiguous_characters	EASY dispatch: &TextShapingConfig from aterm_types (cross-crate), matches! on an enum field, a cross-crate Default impl, struct equality	0,1,2,3,12
+S11-grapheme-width-aggregate	equivalence	width::{grapheme_width, grapheme_width_inner, is_emoji_grapheme}	∀ s, cjk: grapheme_width_inner(s,cjk) = {byte_count = |s|, grapheme_count = |G(s)|, display_width = Σ_{g∈G(s)} W(g,cjk), codepoint_count = |chars(s)|, has_emoji = ∃g∈G(s). is_emoji_grapheme(g) (the first spacing base, or the first scalar if all are zero-width, passes is_emoji_char), has_combining = ∃g. |chars(g)|>1 ∧ W(g,cjk) ≤ 1, has_wide = ∃g. W(g,cjk) = 2}. In particular s = "" ⇒ GraphemeInfo::default().	tests::grapheme_width_aggregates_clusters_and_cells, tests::prepend_cluster_is_measured_at_its_base	MEDIUM: a for loop over Graphemes, a struct accumulator with += and |=, chars().count(); sample values follow by composing with S1, S9, S5	0,1,2,3,4,7,13
 S12-split-graphemes-pointwise	equivalence	width::{split_graphemes, split_graphemes_inner}	∀ s, cjk: split_graphemes_inner(s,cjk) = map (λ(off,g). Grapheme{text: g, byte_offset: off, width: W(g,cjk), codepoint_count: |chars(g)|, is_emoji: is_emoji_grapheme(g) (the first spacing base, or the first scalar if all are zero-width, passes is_emoji_char), has_combining: |chars(g)|>1 ∧ W(g,cjk) ≤ 1}) GI(s). Corollary with S11: Σ width = display_width, count = grapheme_count, Σ codepoint_count = codepoint_count.	tests::test_split_graphemes_with_config_matches_aggregate; tests::prepend_cluster_is_measured_at_its_base	MEDIUM: impl Iterator + use<'a> returned from a fn, a move closure in map, a struct holding &'a str	0,1,2,7,11,13
 S13-emoji-tables-are-ucd	table-property	emoji_presentation::{is_emoji_presentation, is_vs16_emoji_capable}, width::is_emoji_modifier_base	∀ c: is_emoji_presentation(c) ⇔ UCD16.Emoji_Presentation(c); is_vs16_emoji_capable(c) ⇔ UCD16.Emoji(c) ∧ ¬UCD16.Emoji_Presentation(c); is_emoji_modifier_base(c) ⇔ UCD16.Emoji_Modifier_Base(c) (134 elements, a corollary).	emoji_data::the_emoji_tables_are_the_ucds	EASY by evaluation: static &[(u32,u32)] slices, binary_search_by with a closure (via S14), a large matches! on u32 ranges; emoji-data as a Clean def (already vendored)	0,1,5,13
 S14-in-ranges-membership	contract	emoji_presentation::in_ranges	requires SortedDisjoint(t) := ∀i. t[i].0 ≤ t[i].1 ∧ (i+1<|t| ⇒ t[i].1 < t[i+1].0); ensures in_ranges(t,cp) ⇔ ∃i. t[i].0 ≤ cp ≤ t[i].1. Table facts, decidable on the constants: SortedDisjoint holds for EMOJI_PRESENTATION, TEXT_DEFAULT_EMOJI, word::VIRAMA and word::JOINING, so every caller meets the precondition.	-	EASY-MEDIUM: slice binary_search_by with an Ordering closure (needs a std model), slice windows over static data	0,1,3,5,7,13
@@ -76,45 +73,48 @@ S17-grid-columns-refine-the-grid	refinement	grid::{GridColumns::step, GridColumn
 S18-grid-walk-additive	invariant	grid::{GridColumns::step, GridStep::advance, GridColumns::advance_str}	∀ st, c: col(step(st,c).0) = col(st) + step(st,c).1.advance(), with no saturation below usize::MAX. advance_str returns Σ advances and leaves col = col(st) + that sum. Hence GridCols_a(s ++ t) = GridCols_a(s) + (state after s).advance_str(t), and GridCols_a is monotone in prefix order.	(none; lemma for S20, S21)	EASY-MEDIUM: &mut self, enum match, saturating_add, a chars() loop	0,1,2,3,7
 S19-vs16-width-agrees-with-grid	equivalence	width::grapheme_display_width, grid::str_grid_columns	∀ c with ¬c.is_control(): grapheme_display_width([c, U+FE0F]) = str_grid_columns([c, U+FE0F]). A finite family of 1.1M strings: decidable by evaluation once both sides are reflected, or by case analysis on cw(c) ∈ {0,1,2} and is_vs16_emoji_capable(c) from S9 and S17's step cases.	emoji_data::a_base_and_vs16_are_as_wide_as_the_grid_draws_them	MEDIUM: String building from a char array, two reflected callees (composition), char::is_control	0,1,2,4,5,7
 S20-grid-graphemes-spans	contract	grid::{GridGraphemes::next, grid_graphemes, grid_graphemes_with}	∀ s, a: map (text, byte_offset) GG_a(s) = GI(s). For the k-th item (off,g), with st the GridColumns state after chars(s[..off]): end_col = col(state after chars(s[..off+|g|])); start_col = col(st), unless step(st, first(g)) = Folds{col}, then start_col = col. So start_col ≤ end_col, end_col is non-decreasing in k, and the last end_col = GridCols_a(s) (0 when s is empty).	(secondary only: tests::grid_columns_carry_fold_state_across_cluster_boundaries)	MEDIUM: a struct iterator holding GraphemeIndices plus GridColumns (&mut self), if-let on an enum, a chars loop	0,1,2,3,7,13
-S21-position-converters-count-grid-cells	contract	position::{byte_to_column, byte_to_column_with, column_to_char_index}	∀ s, b, a: byte_to_column_with(s,b,a) = end_col of the last item of GG_a(s) with byte_offset < b, else 0. So it lies in 0..=GridCols_a(s), byte_to_column(s,|s|) = GridCols_Single(s), and a b inside a cluster maps to the column after that cluster. ∀ s, col: column_to_char_index(s,col) = Σ_{items before k} |chars(text)|, where k is the first item of GG_Single(s) with col < end_col, else |chars(s)|. A zero-column cluster (end_col = previous end_col) is never named by a column. Corollary (the corpus loop): ∀ item k with columns [c0,c1), column_to_char_index(s,c) = chars before item k for every c ∈ [prev_end, c1).	position_converters_count_grid_cells	MEDIUM given S20: a for loop with early return over GridGraphemes, saturating_add, chars().count()	0,1,2,3,4,7,13
+S21-position-converters-count-grid-cells	contract	position::{byte_to_column, byte_to_column_with, column_to_char_index}	∀ s, b, a: byte_to_column_with(s,b,a) = end_col of the last item of GG_a(s) with byte_offset < b, else 0. So it lies in 0..=GridCols_a(s), byte_to_column(s,|s|) = GridCols_Single(s), and a b inside a cluster maps to the column after that cluster. ∀ s, col: column_to_char_index(s,col) = Σ_{items before k} |chars(text)|, where k is the first item of GG_Single(s) with col < end_col, else |chars(s)|. A zero-column cluster (end_col = previous end_col) is never named by a column. Corollary (the corpus loop): ∀ item k with columns [c0,c1), column_to_char_index(s,c) = chars before item k for every c ∈ [prev_end, c1).	position_converters_count_grid_cells, column_and_byte_conversions_count_grid_cells	MEDIUM given S20: a for loop with early return over GridGraphemes, saturating_add, chars().count()	0,1,2,3,4,7,13
 W1-words-well-formed	invariant	word::{words, Words::next, Words::step}	∀ t, F: Fn(char)->bool: the ranges of Words(t,F) are non-empty, on char boundaries of t, strictly increasing and separated (r_k.end < r_{k+1}.start, with at least one not-in-word unit between). A range's first char never has Role Mark or Joiner. Each range is a maximal run of units u with InWord(t,u,F). step consumes ≥ 1 char per call and returns None exactly at |t|.	(none; lemma for W3, W4)	MEDIUM: a generic closure F, &mut self iterator, Option<char> state, Range<usize>, str::get(at..), chars, saturating_add	0,1,2,3,7,11,13
 W2-word-membership-rules	contract	word::{Words::step, Words::spells_word, role, script_controls, ScriptControls::has_control, ScriptControls::has_letter}	∀ t, F, and each unit u of t (a char, a maximal Prepend run, or a maximal run of one script's own controls): Base c: InWord ⇔ F(c). Mark (GCB Extend/SpacingMark, or any non-control zero-width char): InWord ⇔ the previous unit is in a word. Break (a zero-width Control/CR/LF): never. Prepend run: InWord ⇔ the next non-Prepend char n has Role Base ∧ F(n). Script-control run (Mongolian U+180E, Egyptian U+13430..U+1343F, Duployan U+1BCA0..U+1BCA3): InWord ⇔ previous unit in a word ∧ the last letter is in that script's block ∧ the next char n is a letter of the script with Role Base ∧ F(n). ZWNJ/ZWJ j: InWord ⇔ previous unit in a word ∧ the next char continues (a Mark, or Base with F) ∧ (previous char is a virama ∨ next char is a virama ∨ the letters before and after, marks skipped, both joins_cursively ∨ (j = ZWJ ∧ both letters Extended_Pictographic)). Holds for every F: no Break or misplaced joiner is ever in a word.	word::a_joiner_belongs_to_a_word_only_where_it_spells_it, marks_attach_and_format_controls_separate	HARD: enum Role match, a generic closure, Chars clone/find with closures, Option combinators (is_some_and, then_some, filter), static [ScriptControls;3] iter().find; callees gcb_class/char_width/in_ranges (S4, S5, S14, S15)	0,1,2,3,4,7,11,13
 W3-word-break-before-locality	contract	word::{word_break_before, floor_char_boundary}	∀ t, p, F, with at = word_break_before(t,p,F): at ≤ floor(t,p), at is a char boundary, and at is 0 or the offset of the last char x before floor(t,p) with Role(x) = Break ∨ (Role(x) = Base ∧ ¬F(x)). map (+at) Words(t[at..],F) = filter (start ≥ at) Words(t,F). ∀ r ∈ Words(t,F): r.end > p ⇒ r.start ≥ at. floor_char_boundary(t,p) = floor(t,p).	word::the_words_after_a_break_are_the_words_of_the_whole_text	MEDIUM-HARD: str::get(..), char_indices().rev().find with a closure, map_or, a while loop on is_char_boundary, a generic closure; the shift lemma needs W1/W2 over the suffix	0,1,3,5,7,11,13
 W4-word-start-before	contract	word::word_start_before	∀ t, p, F: word_start_before(t,p,F) = the start of the last r ∈ Words(t,F) with r.start < floor(t,p), else None. Termination: each iteration strictly lowers end, or returns.	word::the_word_before_a_caret_is_the_last_word_that_starts_before_it	MEDIUM given W3: a nested loop with a decreasing measure, direct use of private Words fields (step/at/prev_in), a generic closure by reference, saturating_add	0,1,2,3,5,7,11,13
 W5-word-walk-linear-cost	other (cost bound)	word::{words, Words::step, word_break_before, word_start_before, role}	With Cost = number of role calls: a full words(t,F).count() makes Cost ≤ 3·|chars(t)|; word_break_before(t,p,F) makes Cost ≤ 1 + #chars in (result, floor(t,p)); word_start_before(t,p,F) makes Cost ≤ c·(#chars from the break before the returned word to floor(t,p)) for a small constant c. The tests sample this as ≤ 3, ≤ 8 and ≤ 3·len.	word::the_walk_classifies_each_character_a_bounded_number_of_times	HARD today: needs ghost state / cost instrumentation, which the audit gap table does not list as its own row (closest: 15); the ROLE_LOOKUPS thread_local seam is its runtime stand-in and goes when the spec lands	0,1,2,7,11,15
+P1-script-and-category-tables	table-property	props::{Script, GeneralCategory, script, script_runs, general_category, run_value}	SCRIPT_RUNS and GENERAL_CATEGORY_RUNS start at U+0000, have strictly ascending codepoint starts (e >> 8), and carry in-bounds table indices (e & 0xFF). ∀ c: script(c) = UCD16.Script(c) (Script::UNKNOWN where unassigned), general_category(c) = UCD16.General_Category(c) (Unassigned where unassigned), and script_runs() partitions [0, 0x110000) into ascending runs whose script equals script(c) at every scalar in the run. GeneralCategory::is_mark holds iff Mn|Mc|Me; is_letter holds iff Lu|Ll|Lt|Lm|Lo.	props::scripts_of_known_characters, props::categories_of_known_characters, props::script_runs_answer_what_script_answers, props::run_tables_are_well_formed	EASY by evaluation: partition_point over packed &[u32] run tables, [u8;4] Script newtype, repr(u8) enum	0,1,3,5,13
+H1-liang-hyphenation	contract	hyphenate::{hyphen_points, narrow_hyphen_points, syllable_points, syllable_points_leaving, letter_run_points, patterns}	hyphen_points(w) = [] whenever token_kind(w) ≠ TokenKind::Word; otherwise across each maximal alphabetic run of w (ASCII letters, length ≥ LEFT_MIN + RIGHT_MIN = 5), yields the byte offsets in LEFT_MIN ..= len − RIGHT_MIN from hyph-en-us's exception list if lower(run) is listed, else the odd inter-letter maximum levels from Liang's pattern table over "." ++ lower(run) ++ ".". narrow_hyphen_points uses NARROW_RIGHT_MIN = 2.	hyphenate::words_break_at_their_syllables, hyphenate::identifiers_take_no_hyphen	MEDIUM-HARD: OnceLock<Patterns>, HashMap lookups, nested slice loops over hyph-en-us.tex	0,1,3,5,7,13
+L1-prose-and-code-line-breaks	contract	line_break::{BreakKind, LineBreak, Piece, TokenKind, line_breaks, word_breaks, pieces, break_inside, break_into_line, token_kind, never_starts_a_line, is_break_space}	line_breaks(t) yields strictly ascending LineBreak{at, kind} with 0 < at < |t| on grapheme boundaries: Space after breaking whitespace (excluding glue U+00A0/U+2007/U+202F and tokens satisfying never_starts_a_line), Ideographic between CJK clusters respecting opening/closing kinsoku, and Joint after prose hyphens/slashes or before/after identifier path/URL joints. word_breaks(t) retains Space | Ideographic. pieces(t, keep) splits at kept breaks into non-empty trimmed Piece{text, at, spaced} slices. break_inside and break_into_line split overwide prose words along syllable tiers (marked) and identifiers along joint/extension/number/syllable tiers (unmarked), avoiding single-grapheme orphans when wider cuts exist.	line_break::latin_breaks_at_spaces_and_inside_prose_words, line_break::a_path_breaks_before_its_slashes_and_an_identifier_nowhere_else, line_break::a_piece_wider_than_its_line_breaks_where_a_typesetter_would, line_break::a_name_breaks_after_its_hyphens_and_keeps_its_extension, line_break::a_narrow_measure_keeps_a_word_to_its_syllables, line_break::cjk_breaks_between_characters_with_kinsoku, line_break::pieces_are_what_a_wrap_lays_down, line_break::word_breaks_are_spaces_and_cjk	HARD: grapheme_indices state machine, token classification, dyn Fn(&str)->bool measure callbacks, multi-tier fallback search	0,1,2,3,4,5,7,11,13
 ```
 
-### Distribution by kind (26)
+### Distribution by kind (29)
 
 | kind | count | ids |
 |---|---|---|
-| contract | 7 | S9, S14, S20, S21, W2, W3, W4 |
+| contract | 9 | S9, S14, S20, S21, W2, W3, W4, H1, L1 |
 | equivalence | 8 | S2, S3, S6, S8, S10, S11, S12, S19 |
-| table-property | 5 | S4, S5, S13, S15, S16 |
+| table-property | 6 | S4, S5, S13, S15, S16, P1 |
 | refinement | 2 | S1, S17 |
 | invariant | 2 | S18, W1 |
 | no-panic/bounds | 1 | S7 |
 | other | 1 | W5 (cost bound) |
 
-Four specs (S7, S8, S18, W1) and S20 retire no test as primary. They are the lemmas the others are
-built on, and are kept because the tests sample their consequences.
+Seven specs (S7, S8, S14, S16, S18, S20, W1) retire no test as primary. They are the lemmas the
+others are built on, and are kept because the tests sample their consequences.
 
 ### Gap histogram (specs blocked by each audit §7 gap)
 
 | gap | specs |
 |---|---|
-| 0 (seal publishes no Clean row) | 26 |
-| 1 (non-scalar carriers) | 26 |
-| 2 (`&self`/`&mut self` views) | 14 |
-| 3 (E6 body widening) | 19 |
-| 4 (callee-ensures composition) | 4 |
-| 5 (quantified clauses) | 10 |
-| 7 (loops) | 18 |
+| 0 (seal publishes no Clean row) | 29 |
+| 1 (non-scalar carriers) | 29 |
+| 2 (`&self`/`&mut self` views) | 15 |
+| 3 (E6 body widening) | 22 |
+| 4 (callee-ensures composition) | 5 |
+| 5 (quantified clauses) | 13 |
+| 7 (loops) | 20 |
 | 8 (pointer provenance model) | 1 |
 | 10 (model→code refinement surface) | 1 |
-| 11 (generics) | 6 |
+| 11 (generics) | 7 |
 | 12 (cross-crate citation) | 2 |
-| 13 (closures, higher-order) | 17 |
+| 13 (closures, higher-order) | 20 |
 | 14 (Clean elaborator coverage) | 1 |
 | 15 (test→spec tooling; ghost cost) | 1 |
 
@@ -127,11 +127,26 @@ The cheapest set is gaps {0,1}: S16; then {0,1,3}: S6, S7.
 
 ```tsv
 file	test	primary	also
+src/grapheme_iter.rs	ascii_boundaries_refine_the_derived_fast_path_model	S1-graphemes-are-uax29	S3-boundary-class-reuse
 src/grapheme_iter.rs	test_ethiopic_combining	S1-graphemes-are-uax29	
 src/grapheme_iter.rs	test_extpict_zwj_extpict	S1-graphemes-are-uax29	
 src/grapheme_iter.rs	test_gb11_needs_extend_only_between_pictograph_and_zwj	S1-graphemes-are-uax29	
-src/grapheme_iter.rs	test_boundary_class_reuse_across_clusters	S3-boundary-class-reuse	S1-graphemes-are-uax29 (comment mislabelled, §5)
+src/grapheme_iter.rs	test_boundary_class_reuse_across_clusters	S3-boundary-class-reuse	S1-graphemes-are-uax29
 src/grapheme_iter.rs	test_plane14_tag_classification	S4-gcb-incb-tables-are-ucd	
+src/hyphenate.rs	words_break_at_their_syllables	H1-liang-hyphenation	
+src/hyphenate.rs	identifiers_take_no_hyphen	H1-liang-hyphenation	
+src/line_break.rs	latin_breaks_at_spaces_and_inside_prose_words	L1-prose-and-code-line-breaks	
+src/line_break.rs	a_path_breaks_before_its_slashes_and_an_identifier_nowhere_else	L1-prose-and-code-line-breaks	
+src/line_break.rs	a_piece_wider_than_its_line_breaks_where_a_typesetter_would	L1-prose-and-code-line-breaks	H1-liang-hyphenation
+src/line_break.rs	a_name_breaks_after_its_hyphens_and_keeps_its_extension	L1-prose-and-code-line-breaks	
+src/line_break.rs	a_narrow_measure_keeps_a_word_to_its_syllables	L1-prose-and-code-line-breaks	H1-liang-hyphenation
+src/line_break.rs	cjk_breaks_between_characters_with_kinsoku	L1-prose-and-code-line-breaks	
+src/line_break.rs	pieces_are_what_a_wrap_lays_down	L1-prose-and-code-line-breaks	
+src/line_break.rs	word_breaks_are_spaces_and_cjk	L1-prose-and-code-line-breaks	
+src/props.rs	scripts_of_known_characters	P1-script-and-category-tables	
+src/props.rs	categories_of_known_characters	P1-script-and-category-tables	
+src/props.rs	script_runs_answer_what_script_answers	P1-script-and-category-tables	
+src/props.rs	run_tables_are_well_formed	P1-script-and-category-tables	
 src/word.rs	the_virama_table_is_the_ucds_combining_class_9	S15-virama-joining-tables-are-ucd	S14-in-ranges-membership
 src/word.rs	the_joining_table_is_the_ucds_joining_letters	S15-virama-joining-tables-are-ucd	S14-in-ranges-membership
 src/word.rs	a_joiner_belongs_to_a_word_only_where_it_spells_it	W2-word-membership-rules	W1-words-well-formed
@@ -139,8 +154,12 @@ src/word.rs	marks_attach_and_format_controls_separate	W2-word-membership-rules	W
 src/word.rs	the_walk_classifies_each_character_a_bounded_number_of_times	W5-word-walk-linear-cost	
 src/word.rs	the_word_before_a_caret_is_the_last_word_that_starts_before_it	W4-word-start-before	W3-word-break-before-locality
 src/word.rs	the_words_after_a_break_are_the_words_of_the_whole_text	W3-word-break-before-locality	W1-words-well-formed
+src/tests.rs	grapheme_width_aggregates_clusters_and_cells	S11-grapheme-width-aggregate	S9-grapheme-display-width-cases
+src/tests.rs	single_cluster_widths	S9-grapheme-display-width-cases	S11-grapheme-width-aggregate
+src/tests.rs	column_and_byte_conversions_count_grid_cells	S21-position-converters-count-grid-cells	S20-grid-graphemes-spans
 src/tests.rs	skin_tone_grid_columns_follow_the_grids_fold	S17-grid-columns-refine-the-grid	
 src/tests.rs	vs16_zwj_and_vs15_grid_columns_follow_the_grid	S17-grid-columns-refine-the-grid	
+src/tests.rs	prepend_cluster_is_measured_at_its_base	S9-grapheme-display-width-cases	S11-grapheme-width-aggregate, S12-split-graphemes-pointwise
 src/tests.rs	grid_columns_carry_fold_state_across_cluster_boundaries	S17-grid-columns-refine-the-grid	S20-grid-graphemes-spans
 src/tests.rs	position_converters_count_grid_cells	S21-position-converters-count-grid-cells	S20-grid-graphemes-spans
 src/tests.rs	test_char_width_cjk_widens_ambiguous	S6-cjk-differs-only-on-ambiguous	S5-char-width-table
@@ -148,6 +167,7 @@ src/tests.rs	test_char_width_table_boundaries	S5-char-width-table	S7-char-width-
 src/tests.rs	plane14_default_ignorables_are_zero_width	S5-char-width-table	S8-str-width-is-sum
 src/tests.rs	hangul_vowel_and_final_jamo_are_zero_width	S5-char-width-table	
 src/tests.rs	test_split_graphemes_with_config_matches_aggregate	S12-split-graphemes-pointwise	S11-grapheme-width-aggregate
+src/tests.rs	ambiguous_double_widens_only_ambiguous_characters	S10-config-dispatch	S6-cjk-differs-only-on-ambiguous, S9-grapheme-display-width-cases
 tests/emoji_data.rs	the_emoji_tables_are_the_ucds	S13-emoji-tables-are-ucd	
 tests/emoji_data.rs	a_base_and_vs16_are_as_wide_as_the_grid_draws_them	S19-vs16-width-agrees-with-grid	S9-grapheme-display-width-cases, S17-grid-columns-refine-the-grid
 tests/uax29_conformance.rs	uax29_official_conformance	S1-graphemes-are-uax29	
@@ -157,11 +177,12 @@ tests/uax29_conformance.rs	where_unicode_segmentation_disagreed_this_crate_follo
 
 ## 3. Coverage
 
-- 119 tests read. 98 map to one of the 26 specs. 21 are not spec samples (§4).
-- The biggest collapses: S9 grapheme display width (22 primary), S11 aggregate (16), S21 position
-  converters (14), S10 config dispatch (8), S1 UAX #29 (6) and S13 emoji tables (6).
-- S1 has 6 primary tests but carries the official `GraphemeBreakTest` corpus; it is also the
-  segmentation half of S2, S3, S11, S12, S20 and S21.
+- 46 live tests; all 46 map to one of the 29 specs, and 0 non-spec tests remain (§4).
+- The biggest collapses: L1 line breaks (8 primary), S1 UAX #29 (6), P1 script/category tables (4),
+  S5 char-width table (3), S17 grid columns (3), and 2 each for H1 hyphenation, S9 display width,
+  S15 virama/joining tables, S21 position converters and W2 word membership.
+- S1 has 6 primary tests and carries the official `GraphemeBreakTest` corpus; it is also the
+  segmentation half of S2, S3, S11, S12, S20, S21 and L1.
 
 ## 4. Tests that are not spec samples
 
@@ -176,9 +197,8 @@ they exercised, which had no production caller in the workspace.
    `grapheme_display_width` and `str_grid_columns` disagree on every lone control;
    `tests/emoji_data.rs` filters controls out to stay green (S19's `¬c.is_control()`). The owner
    should pick one rule.
-2. **Mislabelled prose.**
-   - `grapheme_iter::test_boundary_class_reuse_across_clusters`: the third case's comment says "ExtPict
-     boundary then standalone ZWJ+ExtPict", but the input U+1F600 U+1F601 has no ZWJ.
+2. *(Resolved)* **Mislabelled prose.** The misleading ZWJ comment in
+   `grapheme_iter::test_boundary_class_reuse_across_clusters` has been removed.
 3. **Missing oracles.** S4 and S5 cannot be stated against the UCD until `GraphemeBreakProperty.txt`,
    `DerivedCoreProperties.txt` and `EastAsianWidth.txt` are vendored beside the files already in
    `tests/data`, and the generator's zero-width rule is written as a Clean def.

@@ -962,8 +962,13 @@ fn kill_corroborated_candidate(pid: libc::pid_t) {
     if pid <= 1 {
         return;
     }
-    if candidate_leads_its_own_group(pid) || candidate_is_our_child(pid) {
-        // SAFETY: `SIGKILL` to the verified candidate process group.
+    if candidate_is_our_child(pid) {
+        // Our unreaped child pins the pid, and with it the group id, so the group is signalled
+        // until no member is left (a member's fork can dodge one signal on XNU).
+        let _ = aterm_uds::process::kill_group_until_empty(pid);
+    } else if candidate_leads_its_own_group(pid) {
+        // SAFETY: `SIGKILL` to the verified candidate process group. Not our child, its pid is
+        // not pinned, so the group is signalled once rather than swept.
         unsafe { libc::kill(-pid, libc::SIGKILL) };
     } else {
         aterm_log::warn!(
@@ -991,11 +996,11 @@ fn signal_handoff_candidate(candidate: HandoffCandidate) {
             // be reaped by launchd, and `-pid` would then name a stranger's group. So ask
             // the kernel now (`WNOWAIT`; ECHILD means not pinned).
             if candidate_is_our_child(pid) {
-                // SAFETY: `SIGKILL` to the verified candidate process group and candidate PID.
-                unsafe {
-                    libc::kill(-pid, libc::SIGKILL);
-                    libc::kill(pid, libc::SIGKILL);
-                }
+                // The pinned group, signalled until no member is left (a member's fork can
+                // dodge one signal on XNU).
+                let _ = aterm_uds::process::kill_group_until_empty(pid);
+                // SAFETY: `SIGKILL` to the verified candidate PID.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
             } else {
                 aterm_log::warn!(
                     "handoff candidate {pid} is not our child, so its pid is not pinned and \
@@ -7130,52 +7135,11 @@ impl App {
             }
             crate::DeferredHandoffTeardown::Mutations(mutations) => {
                 let _ = crate::menu::cancel_current_native_termination();
-                let closing_windows: std::collections::BTreeSet<_> = mutations
-                    .iter()
-                    .filter_map(|mutation| match mutation {
-                        crate::DeferredHandoffMutation::CloseWindow(window) => Some(*window),
-                        _ => None,
-                    })
-                    .collect();
-                let closing_tabs: std::collections::BTreeSet<_> = mutations
-                    .iter()
-                    .filter_map(|mutation| match mutation {
-                        crate::DeferredHandoffMutation::CloseTab { window, tab } => {
-                            Some((*window, *tab))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                let mut replay_close_windows = closing_windows.clone();
-                for mutation in mutations {
-                    match mutation {
-                        crate::DeferredHandoffMutation::ExitSession(session) => {
-                            replay_close_windows.extend(self.exit_session_logical(session));
-                        }
-                        crate::DeferredHandoffMutation::CloseView { window, tab, view }
-                            if !closing_windows.contains(&window)
-                                && !closing_tabs.contains(&(window, tab)) =>
-                        {
-                            if let Some(window) =
-                                self.replay_deferred_handoff_view_close(window, tab, view)
-                            {
-                                replay_close_windows.insert(window);
-                            }
-                        }
-                        crate::DeferredHandoffMutation::CloseTab { window, tab }
-                            if !closing_windows.contains(&window) =>
-                        {
-                            if self.replay_deferred_handoff_tab_close(window, tab) {
-                                replay_close_windows.insert(window);
-                            }
-                        }
-                        crate::DeferredHandoffMutation::CloseWindow(_)
-                        | crate::DeferredHandoffMutation::CloseView { .. }
-                        | crate::DeferredHandoffMutation::CloseTab { .. } => {}
-                    }
-                }
-                for window in replay_close_windows {
-                    self.close_window(el, window);
+                if matches!(
+                    self.replay_deferred_handoff_mutations(mutations),
+                    crate::CloseOutcome::Exit
+                ) {
+                    el.exit();
                 }
             }
             crate::DeferredHandoffTeardown::QuitRequested => {
@@ -7196,6 +7160,95 @@ impl App {
         for session in deferred_exits {
             self.settle_log_close(session);
         }
+    }
+
+    /// Replay the tab, view and window closes a returned handoff deferred, each under the
+    /// close attribution it was asked under (an `aterm ctl close` stays a ctl close), then
+    /// close the windows they leave empty under the attribution of the close that emptied
+    /// each, answering whether one of them closed the last window.
+    #[cfg(unix)]
+    pub(crate) fn replay_deferred_handoff_mutations(
+        &mut self,
+        mutations: std::collections::BTreeMap<
+            crate::DeferredHandoffMutation,
+            crate::DeferredCloseBy,
+        >,
+    ) -> crate::CloseOutcome {
+        let closing_windows: std::collections::BTreeSet<_> = mutations
+            .keys()
+            .filter_map(|mutation| match mutation {
+                crate::DeferredHandoffMutation::CloseWindow(window) => Some(*window),
+                _ => None,
+            })
+            .collect();
+        let closing_tabs: std::collections::BTreeSet<_> = mutations
+            .keys()
+            .filter_map(|mutation| match mutation {
+                crate::DeferredHandoffMutation::CloseTab { window, tab } => Some((*window, *tab)),
+                _ => None,
+            })
+            .collect();
+        let mut replay_close_windows: std::collections::BTreeMap<_, crate::DeferredCloseBy> =
+            mutations
+                .iter()
+                .filter_map(|(mutation, by)| match mutation {
+                    crate::DeferredHandoffMutation::CloseWindow(window) => {
+                        Some((*window, by.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+        for (mutation, by) in mutations {
+            let _closing = by.clone().map(|(reason, actor)| {
+                crate::session_store::CloseAttribution::enter(reason, actor)
+            });
+            let emptied: Vec<crate::WindowId> = match mutation {
+                crate::DeferredHandoffMutation::ExitSession(session) => {
+                    self.exit_session_logical(session)
+                }
+                crate::DeferredHandoffMutation::CloseView { window, tab, view }
+                    if !closing_windows.contains(&window)
+                        && !closing_tabs.contains(&(window, tab)) =>
+                {
+                    self.replay_deferred_handoff_view_close(window, tab, view)
+                        .into_iter()
+                        .collect()
+                }
+                crate::DeferredHandoffMutation::CloseTab { window, tab }
+                    if !closing_windows.contains(&window) =>
+                {
+                    if self.replay_deferred_handoff_tab_close(window, tab) {
+                        vec![window]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                crate::DeferredHandoffMutation::CloseWindow(_)
+                | crate::DeferredHandoffMutation::CloseView { .. }
+                | crate::DeferredHandoffMutation::CloseTab { .. } => Vec::new(),
+            };
+            for window in emptied {
+                replay_close_windows
+                    .entry(window)
+                    .or_insert_with(|| by.clone());
+            }
+        }
+        let mut outcome = crate::CloseOutcome::Stay;
+        for (window, by) in replay_close_windows {
+            let _closing = by.map(|(reason, actor)| {
+                crate::session_store::CloseAttribution::enter(reason, actor)
+            });
+            if !self.replayed_window_close_consented(window) {
+                continue;
+            }
+            if matches!(
+                self.close_window_through_barriers(window),
+                crate::CloseOutcome::Exit
+            ) {
+                outcome = crate::CloseOutcome::Exit;
+            }
+        }
+        outcome
     }
 
     #[cfg(unix)]
@@ -7376,21 +7429,18 @@ impl App {
                             )
                         })
                     };
-                    let committed = sources
-                        .as_deref()
-                        .and_then(|sources| {
-                            with_handoff_claims(sources, || {
-                                let mut write = || {
-                                    write_attempted = true;
-                                    crate::seamless::commit_and_exit(commit_fd, proof)
-                                };
-                                match self.harness.as_ref() {
-                                    Some(host) => host.with_suspended_at_commit(write),
-                                    None => Some(write()),
-                                }
-                            })
-                        })
-                        .flatten();
+                    let committed = sources.as_deref().and_then(|sources| {
+                        let write = || {
+                            write_attempted = true;
+                            crate::seamless::commit_and_exit(commit_fd, proof)
+                        };
+                        match self.harness.as_ref() {
+                            Some(host) => host.with_commit_stop_reserved(|stop| {
+                                with_handoff_claims(sources, || stop.write(write))
+                            }),
+                            None => with_handoff_claims(sources, write),
+                        }
+                    });
                     if committed.is_none() {
                         claims_fence_missed = true;
                         facts.exact_activity = false;
@@ -8152,6 +8202,7 @@ impl App {
             pending.revoked_by_activity,
         );
         let teardown = pending.teardown;
+        self.release_window_closes_the_teardown_dropped(&teardown);
         if let Some(live) = pending.parked_live.as_deref() {
             self.rollback_overlap(nonce.as_deref(), live);
         }

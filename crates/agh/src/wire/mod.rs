@@ -248,7 +248,13 @@ impl Origin {
             Some((host, port)) => (host, crate::path::digits::<u16>(port)?),
             None => (authority, default_port(scheme)),
         };
-        if host.is_empty() {
+        if host.is_empty()
+            || port == 0
+            || !host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+            || tail.bytes().any(|b| b <= b' ' || b == 0x7f)
+        {
             return None;
         }
         let path = if tail.is_empty() {

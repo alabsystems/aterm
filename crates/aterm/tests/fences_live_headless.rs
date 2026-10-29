@@ -12,7 +12,7 @@ use crate::live_ctl::Ctl;
 use crate::{child_output, headless_boot};
 
 use headless_boot::{
-    Instance, boot_session, client_command, ctl, ctl_ok, field, status, type_line,
+    Instance, boot_session, client_command, ctl, ctl_ok, field, status, type_line, watchers,
 };
 
 /// Boot one headless instance ([`headless_boot::boot`]).
@@ -40,18 +40,6 @@ fn await_program(inst: &Instance, sid: &str, wanted: &str) {
         Some(wanted),
         "foreground program did not resolve: {last}"
     );
-}
-
-/// `who`'s `watchers=` for `sid`.
-fn watchers(inst: &Instance, sid: &str) -> usize {
-    let who = ctl_ok(inst, &["who"]);
-    let row = who
-        .lines()
-        .find(|l| l.split_whitespace().nth(1) == Some(sid))
-        .unwrap_or_else(|| panic!("no `who` row for {sid}: {who}"));
-    field(row, "watchers")
-        .and_then(|n| n.parse().ok())
-        .unwrap_or_else(|| panic!("no watchers= in {row}"))
 }
 
 /// The fake worker: raw mode, a background reader appending every byte it

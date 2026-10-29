@@ -114,7 +114,7 @@ pub use trace::{
 pub use watch::{Segment, SegmentJudgement};
 
 /// The version of the input and observation encodings ([`MomentumSchema`]).
-pub const MOMENTUM_EVENT_ENCODING: u16 = 1;
+pub const MOMENTUM_EVENT_ENCODING: u16 = 2;
 
 /// The task artifact's name.
 pub const TASK_NAME: &str = "aterm.cursor.momentum-glow";
@@ -303,6 +303,7 @@ pub struct ConfigRecord {
     pub theme_bg: u32,
     pub block: bool,
     pub glyph_span: Option<(i32, i32)>,
+    pub light_vivid: bool,
 }
 
 impl From<&MomentumGlowConfig> for ConfigRecord {
@@ -329,6 +330,7 @@ impl ConfigRecord {
             theme_bg: c.theme_bg,
             block: c.block,
             glyph_span: c.glyph_span,
+            light_vivid: c.light_vivid,
         }
     }
 
@@ -337,6 +339,7 @@ impl ConfigRecord {
     #[must_use]
     pub const fn config(&self) -> MomentumGlowConfig {
         MomentumGlowConfig {
+            light: crate::cursor_glow::Light::OFF,
             enabled: self.enabled,
             intensity: f32::from_bits(self.intensity),
             tau_s: f32::from_bits(self.tau_s),
@@ -348,6 +351,7 @@ impl ConfigRecord {
             theme_bg: self.theme_bg,
             block: self.block,
             glyph_span: self.glyph_span,
+            light_vivid: self.light_vivid,
         }
     }
 }
@@ -669,10 +673,12 @@ impl Schema for MomentumSchema {
     type Input = MomentumEvent;
     type Observation = MomentumObservation;
 
+    #[inline]
     fn id(&self) -> &ArtifactId {
         &self.id
     }
 
+    #[inline]
     fn encode_state(&self, s: &MomentumState, e: &mut Enc) {
         match s.glow.snapshot(self.epoch) {
             Ok(snap) => e.raw(&snap.encode()),
@@ -681,6 +687,7 @@ impl Schema for MomentumSchema {
         e.opt(s.clock, |e, c| e.offset(c));
     }
 
+    #[inline]
     fn decode_state(&self, d: &mut Dec<'_>) -> Result<MomentumState, WireFault> {
         let bytes = d.raw("state.snapshot", MomentumGlowSnapshot::LEN)?;
         let snap = MomentumGlowSnapshot::decode(bytes).map_err(snapshot_fault)?;
@@ -689,6 +696,7 @@ impl Schema for MomentumSchema {
         Ok(MomentumState { glow, clock })
     }
 
+    #[inline]
     fn encode_input(&self, i: &MomentumEvent, e: &mut Enc) {
         match *i {
             MomentumEvent::Key { at, tau_bits } => {
@@ -727,6 +735,7 @@ impl Schema for MomentumSchema {
                     e.i32(first);
                     e.i32(end);
                 });
+                e.bool(cfg.light_vivid);
             }
             MomentumEvent::Query { at, frame_interval } => {
                 e.u8(3);
@@ -736,6 +745,7 @@ impl Schema for MomentumSchema {
         }
     }
 
+    #[inline]
     fn decode_input(&self, d: &mut Dec<'_>) -> Result<MomentumEvent, WireFault> {
         match d.u8("event.tag")? {
             0 => Ok(MomentumEvent::Key {
@@ -773,6 +783,7 @@ impl Schema for MomentumSchema {
                     glyph_span: d.opt("cfg.glyph_span", |d| {
                         Ok((d.i32("cfg.glyph_span")?, d.i32("cfg.glyph_span")?))
                     })?,
+                    light_vivid: d.bool("cfg.light_vivid")?,
                 };
                 Ok(MomentumEvent::Tick { cur, at, geom, cfg })
             }
@@ -826,6 +837,7 @@ impl Schema for MomentumSchema {
         }
     }
 
+    #[inline]
     fn paused_class(&self, i: &MomentumEvent) -> PausedClass {
         match i {
             MomentumEvent::Key { .. } | MomentumEvent::Reset => PausedClass::Queue,
@@ -859,7 +871,7 @@ pub fn task_artifact() -> ArtifactId {
     ArtifactId::new(ArtifactKind::Task, TASK_NAME, 1, e.as_bytes())
 }
 
-/// The schema artifact `momentum-glow.state+events` v1.
+/// The schema artifact `momentum-glow.state+events` v2.
 #[inline]
 #[must_use]
 pub fn schema_artifact() -> ArtifactId {
@@ -867,7 +879,7 @@ pub fn schema_artifact() -> ArtifactId {
     e.u16(MOMENTUM_GLOW_SNAPSHOT_SCHEMA);
     e.u16(MOMENTUM_EVENT_ENCODING);
     e.str("state: snapshot then optional clock; inputs Key|Reset|Tick|Query; observations Keyed|WasReset|Frame|Schedule|Refused");
-    ArtifactId::new(ArtifactKind::Schema, SCHEMA_NAME, 1, e.as_bytes())
+    ArtifactId::new(ArtifactKind::Schema, SCHEMA_NAME, 2, e.as_bytes())
 }
 
 /// The profile artifact.
@@ -1203,11 +1215,23 @@ impl Sched {
                     },
                     Err(r) => return Applied::Refused(r),
                 };
-                let answer = Applied::Schedule {
-                    is_active: self.is_active(s),
-                    settling: self.settling(s),
-                    cold_at: self.cold_at(s),
-                    deadline: self.next_change_deadline(s, now, frame_interval),
+                let answer = match self {
+                    Sched::Prebuilt(code) => Applied::Schedule {
+                        is_active: code.is_active(s),
+                        settling: code.settling(s),
+                        cold_at: code.cold_at(s),
+                        deadline: code.next_change_deadline(s, now, frame_interval),
+                    },
+                    #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+                    Sched::Plan(plan) => {
+                        let view = PlanView::of(&s.glow);
+                        Applied::Schedule {
+                            is_active: plan.is_active(&view),
+                            settling: plan.settling(&view),
+                            cold_at: view.cold_at(),
+                            deadline: plan.next_change_deadline(&view, now, frame_interval),
+                        }
+                    }
                 };
                 s.clock = Some(at);
                 answer
@@ -1272,10 +1296,12 @@ impl PrebuiltMomentum {
 }
 
 impl Code<MomentumSchema> for PrebuiltMomentum {
+    #[inline]
     fn id(&self) -> &ArtifactId {
         &self.id
     }
 
+    #[inline]
     fn entry(&self, schema: &MomentumSchema, state: &MomentumState) -> Result<(), EntryRefusal> {
         let res = match state.glow.snapshot(schema.epoch) {
             Ok(s) => s.validate(),
@@ -1529,10 +1555,12 @@ impl StrandedFold {
 }
 
 impl Contract<MomentumSchema> for NoStrandedLight {
+    #[inline]
     fn id(&self) -> &ArtifactId {
         &self.id
     }
 
+    #[inline]
     fn judge(
         &self,
         _schema: &MomentumSchema,
@@ -1557,6 +1585,7 @@ impl Contract<MomentumSchema> for NoStrandedLight {
         )
     }
 
+    #[inline]
     fn replay_judged<C: Code<MomentumSchema>>(
         &self,
         schema: &MomentumSchema,
@@ -1719,17 +1748,12 @@ enum HostMode {
     Hosted(Box<Hosted>),
 }
 
-/// Why the host stopped recording by itself: the light-page glow put on its vivid ink, which no input or state of the schema records.
-pub const VIVID_INK: &str = "vivid light-page ink";
-
 /// Why the host stopped recording by itself: live time passed the hosted horizon.
 pub const PAST_HORIZON: &str = "past the hosted horizon";
 
 /// The momentum glow as the host holds it.
 pub struct MomentumHost {
     mode: HostMode,
-    /// Whether the light-page glow wears its vivid ink, as the host last set it; a glow is never hosted while it does.
-    light_vivid: bool,
     /// Retired segments of the recordings the host dropped (a detach or a re-attach), oldest first, at most [`RETIRED_CAP`].
     left: Vec<Segment>,
     /// Why the host last stopped recording by itself, until [`Self::aos_take_detached`] takes it.
@@ -1741,7 +1765,6 @@ impl Default for MomentumHost {
     fn default() -> Self {
         MomentumHost {
             mode: HostMode::Direct(MomentumGlow::default()),
-            light_vivid: false,
             left: Vec::new(),
             detached: None,
         }
@@ -1893,6 +1916,7 @@ impl Hosted {
         }
     }
 
+    #[inline]
     fn deliver(
         &mut self,
         ev: &MomentumEvent,
@@ -2082,26 +2106,7 @@ impl MomentumHost {
         }
     }
 
-    /// Sets whether the light-page glow wears its hue's vivid ink (`MomentumGlow::set_light_vivid`, Sparkle's paper gold), which changes the Frame observations' quads and which no input or state of the schema records, so turning it on stops a recording ([`VIVID_INK`]).
-    #[inline]
-    pub fn set_light_vivid(&mut self, vivid: bool) {
-        self.light_vivid = vivid;
-        if vivid && self.aos_attached() {
-            self.detach_by_itself(VIVID_INK);
-        }
-        if let HostMode::Direct(g) = &mut self.mode {
-            g.set_light_vivid(vivid);
-        }
-    }
-
-    /// Whether the light-page glow wears its vivid ink, which [`Self::aos_attach`] refuses to record.
-    #[inline]
-    #[must_use]
-    pub const fn light_vivid(&self) -> bool {
-        self.light_vivid
-    }
-
-    /// Why the host stopped recording by itself since the last call ([`VIVID_INK`], [`PAST_HORIZON`]), taken.
+    /// Why the host stopped recording by itself since the last call ([`PAST_HORIZON`]), taken.
     #[inline]
     pub const fn aos_take_detached(&mut self) -> Option<&'static str> {
         self.detached.take()
@@ -2253,6 +2258,7 @@ impl MomentumHost {
         );
     }
 
+    #[inline]
     fn attach_sched(
         &mut self,
         epoch: Instant,
@@ -2262,9 +2268,6 @@ impl MomentumHost {
         queue_cap: usize,
         max_events: usize,
     ) {
-        if self.light_vivid {
-            return;
-        }
         if let HostMode::Hosted(h) = &mut self.mode
             && h.epoch() == epoch
             && h.sched() == sched
@@ -2327,11 +2330,10 @@ impl MomentumHost {
         }
     }
 
-    /// Stops hosting; the glow draws on in the ink the host last set.
+    /// Stops hosting; the glow draws on from its live state.
     #[inline]
     pub fn aos_detach(&mut self) {
-        let mut glow = self.take_glow();
-        glow.set_light_vivid(self.light_vivid);
+        let glow = self.take_glow();
         self.mode = HostMode::Direct(glow);
     }
 

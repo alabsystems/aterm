@@ -1,25 +1,20 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-toml: spec recovery from its 47 unit tests
+# aterm-toml: spec recovery from its 52 unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 2 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
+> Status 2026-10-28: this is the crate's migration worklist across its 28 specs and 52 live
+> `#[test]` fns (`tests/`). Each spec below is proved through Trust/Clean about the compiled Rust
+> function, and then the tests each one subsumes are deleted. The one test that samples no spec
+> (§4) moves to a bench.
 
-> Status 2026-10-15: this is the crate's migration worklist. The 27 specs below are each
-> proved through Trust/Clean about the compiled Rust function, and then the tests each one
-> subsumes are deleted. The one test that samples no spec (§4) moves to a bench. No spec
-> is proved yet, and no test has been deleted.
+Source: `crates/aterm-toml` (read only). Every live `#[test]` in `tests/`
+(cost.rs 1, depth.rs 4, edit.rs 15, fuzz.rs 5, roundtrip.rs 2, spec.rs 10, typed.rs 15 = 52)
+and the code each one reaches are mapped below. `src/` has no `#[test]` and no `#[cfg(test)]`.
+(An extra `#[test]` grep hit in `tests/toml_suite.rs` is the doc comment "keeps its own
+`#[test]`s", not a test.)
 
-Source: `crates/aterm-toml` (read only). I read every `#[test]` in `tests/`
-(cost.rs 1, depth.rs 4, edit.rs 13, fuzz.rs 5, roundtrip.rs 2, spec.rs 9, typed.rs 13 = 47)
-and the code each one reaches. `src/` has no `#[test]` and no `#[cfg(test)]`. The chunk
-manifest said 48: the 48th `#[test]` grep hit is the doc comment "keeps its own `#[test]`s" in
-`tests/toml_suite.rs`, which is not a test. Nothing was compiled or run. The claims below come
-from reading the code.
-
-Result: **27 specs**, covering **46 tests**. **1 test is not a spec sample** (§4).
+Result: **28 specs**, covering **51 tests**. **1 test is not a spec sample** (§4).
 
 ## 0. Notation used in the statements
 
@@ -64,7 +59,7 @@ id	kind	functions	statement	subsumes	difficulty	blocking_gaps
 roundtrip	round-trip	edit::parse::parse_document, edit::encode::encode_document, <DocumentMut as Display>::fmt, <DocumentMut as FromStr>::from_str	∀ s: &str, P(s) = Ok(d) ⇒ print(d) == s, byte for byte. This includes comments, blank lines, CRLF, a BOM, a missing final newline, every key, string and number spelling, interleaved dotted keys in authored order, and a super-table header that comes after its child.	roundtrip::every_toml_file_in_the_repository_round_trips_byte_for_byte, roundtrip::formatting_details_survive, fuzz::generated_documents_parse_and_round_trip, fuzz::single_character_mutations_round_trip_or_refuse_cleanly	HARD: loops over bytes, &str/String building, Vec and an ordered map tree, &mut self parser state, recursion, fmt::Formatter/Display	1,2,3,5,7,14
 accept-domain	refinement	edit::parse::parse_document, Parser::{document,table_header,open_table,keyval,value,basic_string,literal_string,multiline_string,escape}, insert_path	∀ s: &str, P(s).is_ok() ⇔ (s ∈ L ∧ depth(s) ≤ 128). ⇐ covers every refusal: a duplicate key under any spelling, a header reopening a table or a dotted-key table, a table over an array of tables or the reverse, appending to a static array, extending an inline table, a bad escape or surrogate, the number-grammar violations, impossible dates and times, a time without seconds, bare strings, trailing tokens, malformed headers. ⇒ covers every spec-allowed construct, including dotted-key tables extended by sub-table headers, empty quoted keys and a BOM.	spec::everything_the_spec_allows_parses, spec::everything_the_spec_forbids_is_refused	VERY HARD: a grammar model (Lean inductive for L) bound to a &str parser, loops, recursion, Vec/map tree, &mut self	1,3,5,7,10,14
 entry-points-agree	equivalence	de::from_str, <aterm_toml::Value as FromStr>::from_str, <aterm_toml::Table as FromStr>::from_str, <DocumentMut as FromStr>::from_str, <aterm_toml::Value as Deserialize>::deserialize, de::Deserializer::deserialize_any	∀ s: (a) from_str::<Value>(s).is_ok() ⇔ P(s).is_ok(), so deserializing any P-accepted root into Value is total. (b) Value::from_str(s) == from_str::<Value>(s) and Table::from_str(s) == from_str::<Table>(s). (c) P(s) = Err ⇒ every E ∈ Entries fed s (or, for the value and key entries, a token containing the same malformed fragment) returns Err.	(none primary; shared by the fuzz, depth, roundtrip, typed and spec tests in §2)	MEDIUM: serde Deserializer/Visitor traits, generic T, recursion over the Item tree; (b) is definitional	1,3,4,5,9,11
-depth-bound	contract	Parser::{check_depth,value,array,inline_table,keyval,table_header}	∀ s: depth(s) > 128 ⇒ P(s) = Err(e) ∧ ∀ T, from_str::<T>(s) = Err(e), with e.message_text() containing "limit", whichever constructs make up the depth (arrays, inline tables, dotted keys, headers, or any mix such as dotted keys inside nested inline tables, or a header plus a dotted key plus arrays). depth(s) ≤ 128 ⇒ neither check_depth nor the depth guard in value(depth) returns Err.	depth::deeply_nested_input_returns_an_error_instead_of_overflowing_the_stack, depth::ordinary_nesting_is_untouched, depth::constructs_that_each_fit_the_limit_cannot_stack_past_it	MEDIUM: recursion with a depth parameter, &mut self, usize arithmetic (path.len() + segs.len()), Vec	1,2,3,5,7
+depth-bound	contract	Parser::{check_depth,value,array,inline_table,keyval,table_header}	∀ s: depth(s) > 128 ⇒ P(s) = Err(e) ∧ ∀ T, from_str::<T>(s) = Err(e), with e.message_text() containing "limit", whichever constructs make up the depth (arrays, inline tables, dotted keys, headers, or any mix such as dotted keys inside nested inline tables, or a header plus a dotted key plus arrays). depth(s) ≤ 128 ⇒ neither check_depth nor the depth guard in value(depth) returns Err.	depth::deeply_nested_input_returns_an_error_instead_of_overflowing_the_stack, depth::exact_depth_limit_boundary_is_128_below_root, depth::constructs_that_each_fit_the_limit_cannot_stack_past_it	MEDIUM: recursion with a depth parameter, &mut self, usize arithmetic (path.len() + segs.len()), Vec	1,2,3,5,7
 no-panic-bounded-stack	no-panic/bounds	edit::parse::{parse_document,parse_value,parse_key_path}, de::from_str, <Item as Drop>, edit::encode::encode_document	∀ s: &str, ∀ E ∈ Entries: E(s) returns (Ok or Err) without a panic. Neither a successful parse nor the rejection path (including dropping a partially built tree) recurses deeper than c·128 frames, for a constant c independent of s. In particular nothing slices &str off a char boundary, so no unicode-escape window, error span or snippet panics.	depth::the_rejection_path_itself_is_safe, fuzz::punctuation_noise_never_panics	HARD: panic freedom over &str slicing; a recursion-depth (stack) bound including Drop glue, which no §7 row covers (see §5.9)	1,3,7,16
 span-aligned	invariant	Parser::{err,here,next_boundary,unicode_escape}, Error::{at,with_span,span}	∀ s, ∀ E ∈ Entries: E(s) = Err(e) ⇒ (a) if e is a syntax error, e.span() = Some(r); (b) every Some(r) satisfies CharAligned(s, r). For a parse_value refusal this includes r.end ≤ s.len().	spec::parse_errors_carry_a_span_inside_the_source, spec::token_spans_underline_the_token	MEDIUM: Range<usize>, &str char boundaries, loops, &self parser views, Option, every error construction site; built on char-boundary	1,2,3,4,5,7
 char-boundary	contract	Parser::next_boundary, error::floor_boundary	Lemma for span-aligned and error-display. (a) ∀ src, at ≤ src.len(): next_boundary(at) = the least j with at < j ≤ len ∧ src.is_char_boundary(j), or len if there is none; the result is ≥ at and a char boundary. (b) ∀ source, i: floor_boundary(source, i) = the greatest j ≤ min(i, len) with source.is_char_boundary(j); 0 is always a candidate.	(none; lemma)	EASY: while loops over usize, &str::is_char_boundary, min/max	1,3,7
@@ -80,21 +75,22 @@ parsed-spans	invariant	edit::parse::parse_document, edit::value::parsed, Item::s
 parsed-tree-shape	contract	edit::parse::parse_document, Parser::open_table, DocumentMut::{iter,get}, <DocumentMut as Index<&str>>::index, Table::is_implicit	∀ s with P(s) = Ok(d): (a) d.iter() yields each top-level key once, in order of first appearance in s. (b) k = val gives Item::Value, [k] gives Item::Table, [[k]] gives Item::ArrayOfTables with one element per occurrence, in order. (c) A table created only as a prefix of a deeper header has is_implicit() = true; an explicitly headed table has false. (d) ∀ k ∉ d: d.get(k) = None, &d[k] is Item::None, and d is unchanged.	edit::the_walking_surface	MEDIUM: ordered map, enum Item, &self Index returning a static, iterators	1,2,3,5,7
 item-kind-predicates	table-property	Item::{is_none,is_value,is_str,is_integer,is_float,is_bool,is_datetime,is_array,is_table,is_table_like,is_array_of_tables,as_value,as_table,as_table_like,as_array_of_tables,as_str,as_integer,as_float,as_bool,as_array,get}, edit::Value::is_str	∀ item: Item: is_none ⇔ Item::None; is_value ⇔ Item::Value(_); is_str, is_integer, is_float, is_bool, is_datetime, is_array ⇔ Item::Value of the matching variant; is_table ⇔ Item::Table; is_array_of_tables ⇔ Item::ArrayOfTables; is_table_like ⇔ Item::Table ∨ Item::Value(InlineTable). ∀ kind X: as_X(item).is_some() ⇔ is_X(item), and as_X returns the payload. Item::get(k) = as_table_like()?.get(k).	edit::item_kind_predicates	EASY: an enum match on nested enums, &self, Option<&T>; &dyn TableLike (trait object) for as_table_like/get	1,2,3
 edit-semantics	refinement	<DocumentMut as IndexMut<&str>>::index_mut, TableLike::insert, Table::insert, InlineTable::insert, edit::value::{inline_item,table_to_inline}, ArrayOfTables::push, DocumentMut::{remove,remove_path}, edit::encode::encode_document	∀ s with P(s) = Ok(d) (and for d = DocumentMut::new()), ∀ finite edit sequences ops (set by IndexMut, TableLike::insert into a Table or InlineTable, remove, remove_path, ArrayOfTables::push) whose semantic result is a legal TOML tree, with d' = ops(d): P(print(d')) is Ok and from_str::<Value>(print(d')) == Ok(sem_apply(ops, [[s]])). A Table or ArrayOfTables inserted into an InlineTable keeps its whole subtree's meaning, because inline_item converts it.	edit::a_nested_write_through_an_inline_table_lands_in_it	VERY HARD: &mut self through trait objects, recursion over the tree, String encoding, Vec, a two-state (before/after) spec; needs value-semantics	1,2,3,4,5,7,10
-edit-byte-locality	contract	DocumentMut::remove_path, edit::document::line_owner_depth, <DocumentMut as IndexMut<&str>>::index_mut, TableLike::insert, edit::Value::decor_mut, Decor::{set_prefix,set_suffix}, ArrayOfTables::push, edit::encode::{encode_document,encode_table,end_line}	∀ s with P(s) = Ok(d): (a) Replacing an existing key's value with one that adopts the old value's decor prints s with only the old token's bytes replaced by the new value's repr. (b) remove_path(p) of a key-value line prints s with exactly that line's own bytes deleted (key, value, same-line comment, terminator); comment and blank lines above it stay where they were, and if it was the last line of its table they stay after that table's last line. (c) Inserting a new key into an existing table T, a new table, or a new array-of-tables element prints s with new text inserted only at the end of T's printed region (after the root region for a root key), with a '\n' first when the preceding line had no terminator; every byte of s appears unchanged and in order; when T's region ends the file, print(d') starts with s. (d) s starts with U+FEFF ⇒ print(d') starts with U+FEFF after any edit sequence.	edit::a_non_destructive_edit_keeps_every_other_byte, edit::a_removed_line_keeps_the_comment_lines_above_it, edit::a_byte_order_mark_stays_first, edit::interleaved_dotted_keys_keep_their_authored_order, edit::a_key_added_after_an_unterminated_final_line_starts_its_own_line, edit::a_table_added_after_an_unterminated_final_line_starts_its_own_line	HARD: &mut self, String decor (RawString), a two-state relation between source and printed text, loops, recursion; reuses roundtrip	1,2,3,5,7
+edit-byte-locality	contract	DocumentMut::{remove_path,remove_path_pruning}, edit::document::{line_owner_depth,is_bare_table,is_bare_header}, <DocumentMut as IndexMut<&str>>::index_mut, TableLike::insert, edit::Value::decor_mut, Decor::{set_prefix,set_suffix}, ArrayOfTables::push, edit::encode::{encode_document,encode_table,end_line}	∀ s with P(s) = Ok(d): (a) Replacing an existing key's value with one that adopts the old value's decor prints s with only the old token's bytes replaced by the new value's repr. (b) remove_path(p) of a key-value line prints s with exactly that line's own bytes deleted (key, value, same-line comment, terminator); comment and blank lines above it stay where they were, and if it was the last line of its table they stay after that table's last line; remove_path_pruning(p) also removes empty uncommented ancestor tables and marks empty uncommented super-tables implicit while keeping any table that owns comment lines (including comments trailing its last line). (c) Inserting a new key into an existing table T, a new table, or a new array-of-tables element prints s with new text inserted only at the end of T's printed region (after the root region for a root key), with a '\n' first when the preceding line had no terminator; every byte of s appears unchanged and in order; when T's region ends the file, print(d') starts with s. (d) s starts with U+FEFF ⇒ print(d') starts with U+FEFF after any edit sequence.	edit::a_non_destructive_edit_keeps_every_other_byte, edit::a_removed_line_keeps_the_comment_lines_above_it, edit::a_removal_prunes_the_tables_it_left_bare, edit::the_comment_lines_under_a_tables_last_line_are_that_tables, edit::a_byte_order_mark_stays_first, edit::interleaved_dotted_keys_keep_their_authored_order, edit::a_key_added_after_an_unterminated_final_line_starts_its_own_line, edit::a_table_added_after_an_unterminated_final_line_starts_its_own_line	HARD: &mut self, String decor (RawString), a two-state relation between source and printed text, loops, recursion; reuses roundtrip	1,2,3,5,7
 canonical-encoding	contract	ser::{to_string,value_to_item,insert_unless_none,written}, ItemSerializer, StructSerializer::serialize_field, TableSerializer::{serialize_value,serialize_field_entry}, edit::encode::{encode_document,encode_key,encode_basic_string,encode_float}, <Datetime as Display>::fmt	∀ DocumentMut d built from new() by inserting only never-parsed items (no repr, default decor): print(d) == canonical(d), where canonical(d) = the root key-values, one 'encode_key(k) = repr\n' line each in insertion order, then each table as '\n[path]\n' followed by its key-value lines, recursively; strings use encode_basic_string, floats encode_float, arrays '[a, b]', datetimes Datetime::to_string; and canonical(d) ∈ L. ∀ x: Serialize whose serde model has a table root and no None but a struct field's: to_string(&x) = Ok(canonical(value_to_item(M⁻¹(x)))). A struct field whose value serializes to none (Item::None) is omitted, whether it arrives through SerializeStruct, SerializeStructVariant or SerializeMap::serialize_field_entry (a struct written as a map, a flattened struct); a none anywhere else (an array element, a tuple field, a map value, a variant's payload, a flattened enum's payload, inside some or a newtype) makes to_string Err("TOML has no null: …"), never a document missing it or its enclosing field; no null spelling is ever written. A map key is written as its text: str, char, unit variant, bool, an integer of any width in `Display`'s spelling, and newtype(k)/some(k) as k.	edit::a_document_built_by_hand_prints_legal_toml, typed::a_none_is_left_out_of_a_table_and_refused_anywhere_else, typed::a_none_field_is_left_out_and_a_none_map_value_refused	HARD: serde Serializer trait impls, generic T, String building, recursion, f64 formatting	1,2,3,5,7,9,11
 serde-roundtrip	round-trip	ser::to_string, de::from_str, <Datetime as Serialize>::serialize, <Datetime as Deserialize>::deserialize, de::KeyDeserializer, serde::de::value::TextKeyDeserializer (aterm-serde's buffered-text-key)	∀ T: Serialize + DeserializeOwned + PartialEq with serde-derived impls (structs; unit, newtype and struct enums; Option; Vec; maps keyed by String, an integer of any width, bool, char, a unit variant, or a newtype or Some over one, read directly or through serde's buffer (#[serde(flatten)], untagged, internally tagged); fixed arrays and tuples; aterm_toml::Datetime), ∀ x: T containing no NaN: to_string(&x) = Ok(t) ⇒ from_str::<T>(&t) = Ok(y) ∧ y == x. A None field is absent from t and reads back as None; any other None is refused (canonical-encoding), so to_string never succeeds with a value it lost.	typed::a_typed_value_survives_serialize_then_deserialize, typed::absent_keys_and_none_values, typed::datetimes_round_trip_through_serde, typed::every_table_the_writer_accepts_reads_back, typed::a_none_is_left_out_of_a_table_and_refused_anywhere_else	HARD: generic T over serde traits, proc-macro derives, composition of callee contracts (canonical-encoding, deser-refines-model), recursion	1,4,5,9,11
-deser-refines-model	refinement	de::from_str, de::Deserializer::{deserialize_any,deserialize_option,deserialize_struct,deserialize_enum}, de::MapAccess::{next_key_seed,next_value_seed}	∀ s ∈ dom(P), ∀ T: DeserializeOwned: from_str::<T>(s) is extensionally T::deserialize run on M([[s]]). Every table key, unknown ones included, is offered to the visitor, so deny_unknown_fields refuses a typo. A key reaches the visitor as a string, except that an integer request takes a key spelled as `Display` writes an integer (optional `-`, no leading zero, never `-0`) as that integer (u64/i64, wider u128/i128), a bool request takes `true`/`false`, and an option or newtype request sees the key itself; any other spelling reaches the visitor as a string, and its type error carries the key's span. An Integer i goes to visit_i64, so an iN/uN target accepts it ⇔ i is in range, and an f32/f64 target accepts every integer. A one-character String reads as char. An absent key reads as None (or the serde default). An enum reads from a bare string (unit variant) or a one-key table. Datetime reads through the private struct protocol.	typed::a_realistic_config_deserializes, typed::unknown_fields_are_refused_where_the_model_asks, typed::scalar_coercions, typed::a_key_reads_back_only_in_the_spelling_the_writer_uses	HARD: serde Deserializer/Visitor/MapAccess/SeqAccess/EnumAccess traits, generic T, recursion over the Item tree, derives	1,4,5,9,11
+deser-refines-model	refinement	de::from_str, de::Deserializer::{deserialize_any,deserialize_option,deserialize_map,deserialize_struct,deserialize_enum}, de::MapAccess::{next_key_seed,next_value_seed}	∀ s ∈ dom(P), ∀ T: DeserializeOwned: from_str::<T>(s) is extensionally T::deserialize run on M([[s]]). Every table key, unknown ones included, is offered to the visitor, so deny_unknown_fields refuses a typo. A key reaches the visitor as a string, except that an integer request takes a key spelled as `Display` writes an integer (optional `-`, no leading zero, never `-0`) as that integer (u64/i64, wider u128/i128), a bool request takes `true`/`false`, and an option or newtype request sees the key itself; any other spelling reaches the visitor as a string, and its type error carries the key's span. An Integer i goes to visit_i64, so an iN/uN target accepts it ⇔ i is in range, and an f32/f64 target accepts every integer. A one-character String reads as char. An absent key reads as None (or the serde default). An enum reads from a bare string (unit variant) or a one-key table. Datetime reads through the private struct protocol.	typed::a_realistic_config_deserializes, typed::unknown_fields_are_refused_where_the_model_asks, typed::scalar_coercions, typed::a_key_reads_back_only_in_the_spelling_the_writer_uses	HARD: serde Deserializer/Visitor/MapAccess/SeqAccess/EnumAccess traits, generic T, recursion over the Item tree, derives	1,4,5,9,11
 seq-drained	contract	de::drained, de::SeqAccess::next_element_seed, de::Deserializer::deserialize_any	(a) ∀ left, total: usize: drained(left, total) = Ok(()) ⇔ left = 0; otherwise Err(invalid_length(total, took = total.saturating_sub(left))). (b) ∀ s ∈ dom(P), ∀ fixed-length targets ([U; N], an N-tuple, a 1-tuple of structs) read from an array or array of tables of length m: the read succeeds only if m = N; when m ≠ N the error's span is the array node's span (the array token, or for an array of tables the key that names it). A Vec target accepts every m.	typed::a_fixed_length_target_refuses_a_longer_array	(a) EASY: a scalar comparison, saturating_sub and a serde error constructor (a call); (b) MEDIUM: the SeqAccess trait and generic visitors	1,3,4,11
 unit-variant-empty	contract	<VariantValue as VariantAccess>::unit_variant, <UnitVariant as VariantAccess>::unit_variant	∀ VariantValue{item, key, source}: unit_variant() = Ok(()) ⇔ item is an empty Item::Table, an empty Value::InlineTable or an empty Value::Array; otherwise Err, with a message naming key and item.type_name() and the span of the variant body or key attached by with_span. UnitVariant (a bare-string variant) always returns Ok. Hence a unit-variant target reads Ok from a bare string, from '{ v = {} }', '{ v = [] }' or an entry-less '[t.v]', and Err from any non-empty body.	typed::a_unit_variant_in_table_form_carries_nothing	EASY: a nested enum match, len() on map/Vec, self by value, String formatting for the error	1,2,3
 schema-error-location	invariant	de::Deserializer::{locate,mismatch}, Error::with_span, de::Node::span, de::MapAccess::next_value_seed, de::EnumAccess::variant_seed	∀ s ∈ dom(P), ∀ T: from_str::<T>(s) = Err(e) from deserialization (not syntax) ⇒ e.span() = Some(r) ∧ CharAligned(s, r). r is the span of the innermost node being deserialized when the error was raised, if it has one (a value token, or the [header] of an explicit table); otherwise the span of the key that names the node (a dotted or implied table, an array of tables via its first header's key, or a variant key in any of its three spellings). Display then follows error-display at r.start.	typed::schema_errors_carry_a_source_span, typed::a_schema_error_in_a_spanless_node_is_located_on_its_key	HARD: serde trait impls, generic T, Option<Range>, &self views, callee-error composition	1,2,4,5,9,11
 value-index	contract	<aterm_toml::Value as Index<I>>::index, aterm_toml::Value::{get,as_str,as_integer,as_float,as_table}, <str as value::Index>::index_into, <usize as value::Index>::index_into, <Map<String, Value> as Index<&str>>::index	∀ v: Value, i: I with I: value::Index: v.get(i) == i.index_into(v). index_into by str/String = Some(t[k]) if v = Table(t) ∧ k ∈ t, else None. index_into by usize = Some(a[n]) if v = Array(a) ∧ n < len, else None. v[i] = i.index_into(v).unwrap() when Some, and panics with a message containing "index not found" ⇔ it is None. Each as_X returns Some exactly on its variant.	typed::the_untyped_table_and_index_surface	EASY-MEDIUM: a sealed generic trait, enum match, BTreeMap lookup, Vec indexing, panic as a specified outcome (#[should_panic] becomes a panics-iff clause)	1,2,3,11
+error-log-words	contract	Error::log_words, <LogWords as Display>::fmt	What an app log may keep of an error (DESIGN-session-log §3.6, unit E7). ∀ e: Error: e.log_words() displays as "TOML error at line L, column C" when e has a position (L, C its 1-based line_col, the one Display prints), else "TOML error"; it depends on e only through that position, so it prints neither the offending line (Display's snippet) nor the message, which a serde error fills with the value it quotes.	spec::log_words_keeps_the_position_and_never_the_line	TRIVIAL: an Option<(usize, usize)> copy and one match in a Display impl	1,2,3
 ```
 
-### Distribution by kind (27)
+### Distribution by kind (28)
 
 | kind | count | ids |
 |---|---|---|
-| contract | 12 | depth-bound, char-boundary, unicode-escape, eof-empty-span, error-display, number-literal, parsed-tree-shape, edit-byte-locality, canonical-encoding, seq-drained, unit-variant-empty, value-index |
+| contract | 13 | depth-bound, char-boundary, unicode-escape, eof-empty-span, error-display, number-literal, parsed-tree-shape, edit-byte-locality, canonical-encoding, seq-drained, unit-variant-empty, value-index, error-log-words |
 | round-trip | 4 | roundtrip, key-parse-spelling, standalone-value, serde-roundtrip |
 | refinement | 4 | accept-domain, value-semantics, edit-semantics, deser-refines-model |
 | invariant | 3 | span-aligned, parsed-spans, schema-error-location |
@@ -104,7 +100,7 @@ value-index	contract	<aterm_toml::Value as Index<I>>::index, aterm_toml::Value::
 
 ### Proof dependency order
 
-`char-boundary` → `span-aligned`, `error-display` → `eof-empty-span`, `schema-error-location`.
+`char-boundary` → `span-aligned`, `error-display` → `eof-empty-span`, `schema-error-location`, `error-log-words`.
 `days-in-month`, `number-literal`, `unicode-escape`, `key-parse-spelling` are lemmas of
 `accept-domain` and `value-semantics`. `roundtrip` → `edit-byte-locality`.
 `value-semantics` → `edit-semantics`. `canonical-encoding` + `deser-refines-model` →
@@ -119,11 +115,13 @@ value-index	contract	<aterm_toml::Value as Index<I>>::index, aterm_toml::Value::
 file	test	primary	also
 tests/cost.rs	many_lines_under_a_long_header_cost_one_pass	NON-SPEC (move-to-bench)	roundtrip, value-semantics
 tests/depth.rs	deeply_nested_input_returns_an_error_instead_of_overflowing_the_stack	depth-bound	no-panic-bounded-stack, entry-points-agree
-tests/depth.rs	ordinary_nesting_is_untouched	depth-bound	roundtrip
 tests/depth.rs	constructs_that_each_fit_the_limit_cannot_stack_past_it	depth-bound	no-panic-bounded-stack, entry-points-agree
+tests/depth.rs	exact_depth_limit_boundary_is_128_below_root	depth-bound	roundtrip, standalone-value, entry-points-agree
 tests/depth.rs	the_rejection_path_itself_is_safe	no-panic-bounded-stack	
 tests/edit.rs	a_non_destructive_edit_keeps_every_other_byte	edit-byte-locality	edit-semantics
 tests/edit.rs	a_removed_line_keeps_the_comment_lines_above_it	edit-byte-locality	edit-semantics
+tests/edit.rs	a_removal_prunes_the_tables_it_left_bare	edit-byte-locality	edit-semantics
+tests/edit.rs	the_comment_lines_under_a_tables_last_line_are_that_tables	edit-byte-locality	edit-semantics
 tests/edit.rs	a_byte_order_mark_stays_first	edit-byte-locality	edit-semantics (pinned placement questioned, §5.6)
 tests/edit.rs	a_dotted_lookup_finds_the_value_and_keeps_its_span	parsed-spans	
 tests/edit.rs	key_parsing_and_canonical_spelling	key-parse-spelling	
@@ -150,7 +148,7 @@ tests/spec.rs	multiline_strings_handle_delimiter_runs	value-semantics
 tests/spec.rs	overflowing_float_literals_are_refused_in_both_signs	number-literal	value-semantics
 tests/spec.rs	a_schema_error_renders_the_offending_line	error-display	schema-error-location
 tests/spec.rs	end_of_input_errors_point_at_the_last_authored_line	eof-empty-span	error-display
-tests/spec.rs	token_spans_underline_the_token	span-aligned	(name claims more than it checks, §5.3)
+tests/spec.rs	token_spans_underline_the_token	span-aligned	(pins one token span: int = 010 -> 6..9, §5.3)
 tests/typed.rs	a_realistic_config_deserializes	deser-refines-model	
 tests/typed.rs	a_typed_value_survives_serialize_then_deserialize	serde-roundtrip	
 tests/typed.rs	absent_keys_and_none_values	serde-roundtrip	canonical-encoding
@@ -166,17 +164,16 @@ tests/typed.rs	every_table_the_writer_accepts_reads_back	serde-roundtrip	deser-r
 tests/typed.rs	a_key_reads_back_only_in_the_spelling_the_writer_uses	deser-refines-model	schema-error-location, serde-roundtrip
 tests/typed.rs	a_none_is_left_out_of_a_table_and_refused_anywhere_else	canonical-encoding	serde-roundtrip
 tests/typed.rs	a_none_field_is_left_out_and_a_none_map_value_refused	canonical-encoding	serde-roundtrip
+tests/spec.rs	log_words_keeps_the_position_and_never_the_line	error-log-words	schema-error-location
 ```
 
 ## 3. Coverage
 
-- 50 tests in the suite; 49 are mapped above, 48 of them to one of the 27 specs, and 1 is not a
-  spec sample (§4). `edit::a_removal_prunes_the_tables_it_left_bare` (`remove_path_pruning`)
-  landed after this map and is not mapped yet.
-- The biggest collapses: `edit-byte-locality` (6 primary), `roundtrip` (4 primary, plus 6
-  shared), `deser-refines-model` (4), `serde-roundtrip` (4), `canonical-encoding` (3), `depth-bound` and
-  `value-semantics` (3 each).
-- Three specs have no primary test: `entry-points-agree` (sampled by 9 tests as a side check),
+- 52 live tests in the suite; all 52 are mapped above, 51 of them to one of the 28 specs, and 1 is
+  not a spec sample (§4).
+- The biggest collapses: `edit-byte-locality` (8 primary), `roundtrip` (4 primary, plus 5
+  shared), `deser-refines-model` (4), `serde-roundtrip` (4), `depth-bound` (3), and `canonical-encoding` (3).
+- Three specs have no primary test: `entry-points-agree` (sampled by 8 tests as a side check),
   `char-boundary` (a lemma no test isolates) and `days-in-month` (sampled inside the grammar and
   datetime tests). Each is still needed: the first is how one parser proof covers six entry points,
   the other two are the scalar cores the bigger proofs are built on.
@@ -190,38 +187,33 @@ tests/typed.rs	a_none_field_is_left_out_and_a_none_map_value_refused	canonical-e
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **A tautological count.** `fuzz::a_multi_byte_character_inside_a_unicode_escape_is_an_error_not_an_abort`
-   says "2 widths x 12 offsets x 3 intruders" (72) in its assertion message, but the grid is
-   (4 + 8) lead offsets × 3 intruders = 36. The final `checked == 36` counts only its own loop
-   iterations, so it can never fail. `unicode-escape` states the real property.
-2. **Stale prose from the two-implementation era.** In `spec::everything_the_spec_forbids_is_refused`,
-   the INVALID doc ("Both implementations must REFUSE these") and the module text date from when the
-   crate was diffed against `toml`/`toml_edit`; only one implementation is exercised now. The module
-   doc says "509 deliberately-invalid .toml files" while the measured line says
-   "invalid: 492 pass / 0 fail".
-3. **A name claims more than the test checks.** `spec::token_spans_underline_the_token` claims every
-   span underlines the offending token, but its loop checks only bounds and char alignment, which
-   duplicates `parse_errors_carry_a_span_inside_the_source` on the `DocumentMut` entry. Token
-   underlining is pinned at one point (`int = 010` → `6..9`). No general token-span rule for errors
-   is stated or tested. `span-aligned` is what the test actually samples. If token underlining is
-   wanted, it is a new spec (the error-side analogue of `parsed-spans`).
+1. **Tautological count removed (resolved).** `fuzz::a_multi_byte_character_inside_a_unicode_escape_is_an_error_not_an_abort`
+   no longer carries the tautological `checked == 36` loop counter; `unicode-escape` states the property.
+2. **Two-implementation prose cleaned up (resolved).** `tests/spec.rs` now carries single-implementation
+   conformance docs matching the current crate.
+3. **Token underlining is pinned at one point.** `spec::token_spans_underline_the_token` had a loop
+   that checked only bounds and char alignment over `INVALID` on the `DocumentMut` entry, which
+   duplicated `parse_errors_carry_a_span_inside_the_source` (`from_str` and `DocumentMut::from_str`
+   both run `parse_document`, so they refuse with the same error). The loop was removed; the test
+   now pins one token span (`int = 010` → `6..9`). No general token-span rule for errors is stated
+   or tested. If token underlining is wanted, it is a new spec (the error-side analogue of
+   `parsed-spans`).
 4. **A repository guard sits in the crate's tests** (`roundtrip::every_toml_file_in_the_repository_round_trips_byte_for_byte`; see §4).
-5. **A message describes the wrong operator.** In `edit::the_walking_surface`, "indexing an absent key
-   must vivify to the vacant item" describes `IndexMut`. `&doc["missing"]` goes through `Index`, which
-   returns a static `VACANT` and inserts nothing. `parsed-tree-shape` (d) states the `Index` behaviour.
+5. **Absent-key `Index` message corrected (resolved 2026-10-27).** `edit::the_walking_surface` now
+   states that `&doc["missing"]` returns the static vacant item without mutating `doc`, matching
+   `parsed-tree-shape` (d).
 6. **A pinned output may contradict the edit contract.** `edit::a_byte_order_mark_stays_first` pins a
    newly set root key placed above the user's leading comment
    (`"\u{feff}font_px = 14.0\n# my aterm settings\n..."`), so the comment that opened the file moves
    below the new key. That cuts against the "comment lines stay where they were written" contract
    stated for `remove_path`. Confirm this placement is intended before it becomes part of
    `edit-byte-locality` (c), which as stated puts a root key at the end of the root region.
-7. **The depth bound's value is never pinned.** `depth::ordinary_nesting_is_untouched` and
-   `deeply_nested_input_returns_an_error_instead_of_overflowing_the_stack` probe 32 and 10,000+
-   levels while the limit is 128. The boundary (128 accepted, 129 refused) is never sampled.
-   `depth-bound` states it exactly. The message checks ("nesting" or "limit" in one test, "limit" in
-   another) pin prose; the spec keeps only "limit".
-8. **Inconsistent call-site counts in prose.** The `typed.rs` module and test docs say "the path 43
-   call sites" and "the other half of the 168 call sites". No test checks either number.
+7. **Exact depth boundary pinned (resolved 2026-10-27).**
+   `depth::exact_depth_limit_boundary_is_128_below_root` now pins the `128` accepted / `129` refused
+   boundary across arrays, inline tables, dotted keys, table headers, and standalone values, and
+   `deeply_nested_input_returns_an_error_instead_of_overflowing_the_stack` checks `"limit"` directly.
+8. **Call-site counts in `typed.rs` removed (resolved).** `tests/typed.rs` no longer embeds stale
+   call-site counts.
 9. **A spec with no gap row.** `no-panic-bounded-stack` needs a stack-depth (recursion and `Drop`
    glue) bound. No row of audit §7 covers stack-depth reasoning; the gaps listed (1, 3, 7, 16) are
    necessary but not sufficient. A new §7 row is needed, or the parser and `Drop` must be made
@@ -229,7 +221,7 @@ tests/typed.rs	a_none_field_is_left_out_and_a_none_map_value_refused	canonical-e
 
 ## 6. Proof order (easiest high-value first)
 
-No spec is blocked by gap 0 alone: gap 1 (non-scalar carriers) is the floor for all 27. So the order
+No spec is blocked by gap 0 alone: gap 1 (non-scalar carriers) is the floor for all 28. So the order
 below starts with specs whose only other blocker is gap 3 (calls, matches, loops in reflected bodies)
 and gap 7 (loops), on scalar or near-scalar cores.
 

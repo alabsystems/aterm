@@ -18,7 +18,7 @@
 //! assert to [`light_symbols_absent`] (§15.0.3). The Settings preview's producer has its
 //! companion pin in `settings_preview` (`the_preview_draws_every_dark_theme_by_mains_rule`).
 
-use crate::cursor_glow::GlowConfig;
+use crate::cursor_glow::{GlowConfig, Light, Live};
 use crate::trail_rig::TrailRig;
 use crate::{App, WindowId};
 use aterm_effects::rainbow_kitty::{self as rk, ribbon::BedInkLut};
@@ -172,8 +172,55 @@ struct Drawn {
     fill: (Option<u32>, Option<u32>),
     /// Which light arms drew.
     arms: ArmsDrawn,
+    /// The pipeline's frame light at the frame's instant (`EffectsPipeline::frame_light`).
+    light: Light,
+    /// Whether the window's light latch admitted the frame (`TrailGround::last`).
+    latched: bool,
+    /// The window's light read outside its frame (`App::window_light`).
+    window_light: Light,
+    /// The lights the frame's word pass gave its panes (`EffectsPipeline::pane_word_light`), the
+    /// first that is not [`Light::OFF`].
+    pane_light: Light,
+    /// The ribbon slabs laid as the light wedge since the last read
+    /// (`aterm_render::ribbon_wedge_into`).
+    wedges: usize,
+    /// The ribbon slabs laid as the light glass since the last read
+    /// (`aterm_render::ribbon_glass_into`).
+    glass_slabs: usize,
+    /// Whether the ribbon's last plan held the glass's geometry (`Ribbon::glass_planned`).
+    glass_planned: bool,
+    /// The glass's exits the ribbon ran since the last read: its envelopes, slab prices and
+    /// pixel cadences (`rainbow_kitty::ribbon::take_glass_exits`).
+    glass_exits: usize,
+    /// The rows of the hand's structural set the ribbon holds as left (`Ribbon::glass_wraps`,
+    /// each with its `left_at`), and whether it held the hand's row of a multi-row set
+    /// (`Ribbon::wrap_hand`).
+    glass_wraps: (usize, bool),
     /// Whether the band was live: the ribbon held cells.
     live: bool,
+    /// The Prism Glass solve units the frame ran (`prism_glass::take_solves`).
+    prism_glass_solves: usize,
+    /// The light words the frame left (`EffectsPipeline::light_words`).
+    light_words: usize,
+    /// Whether the frame laid light-owned glass (`CursorGlow::glass_laid`).
+    light_owned: bool,
+    /// Whether a yield ever cut a frame's glass (`CursorGlow::last_yield`).
+    yielded: bool,
+    /// The light the glow's last tick began under, which a held park's flush draws by
+    /// (`CursorGlow::tick_light`).
+    tick_light: Light,
+    /// The light each body engine's config carried: the rainbow block's, the momentum glow's,
+    /// the comet's and the beam rod's (`CursorFx::engine_lights`).
+    engine_lights: [Light; 4],
+    /// The light the Rainbow Kitty's config was last built with (`CursorGlow::v2_light`).
+    v2_light: Light,
+    /// The light the rainbow block's settle probe latched (`CursorRainbow::settle_light`).
+    settle_light: Option<Light>,
+    /// The glass's height the ribbon's last sync gave it (`Ribbon::glass_px`).
+    glass_px: f32,
+    /// How many light-owned spans the ink ledger was ever handed
+    /// (`CursorGlow::light_owned_noted`).
+    ledger_owned: u64,
 }
 
 /// `0x00RRGGBB`.
@@ -259,14 +306,114 @@ fn fill_breaks(twin: &[Drawn], drawn: &[Drawn]) -> Vec<String> {
 
 /// The light symbols, each absent on every dark ground (§15.0.3, §15.1 P0.9 "Grows with"): the
 /// place each phase adds the assert for the symbol it adds.
-/// - Today (P0.3): no light arm drew (`EffectsPipeline::light_arms_drawn`).
-/// - Then, as they land: 1.1 `light == OFF`, and the frame light in WordGrid and WordPanes is
-///   OFF; 1.3 the latch is off; 1.4 `prism_glass_solves == 0`; 1.10 `left_at` is empty; 2.1
-///   `ink_top_captures == 0`; 2.2 `fold_at == None`; 2.5 the pet span is None; 3.1 no
-///   LightPose; 3.5 no CaretHold; 3.6 `cursor_ink == None`; 4.3 no HeldBand; 4.5 no Afterimage.
+/// - P0.3: no light arm drew (`EffectsPipeline::light_arms_drawn`).
+/// - 1.1: the frame's config carries [`Light::OFF`], and so does the frame light the words, the
+///   pet and the yield read (`EffectsPipeline::frame_light`), each body engine's config
+///   (`CursorFx::engine_lights`: the rainbow block's, the momentum glow's, the comet's, the beam
+///   rod's), the Rainbow Kitty's (`CursorGlow::v2_light`) and the settle probe's latched one
+///   (`CursorRainbow::settle_light`).
+/// - 1.3: the window's latch admitted nothing (`TrailGround::last`), its light read outside the
+///   frame is [`Light::OFF`] (`App::window_light`), and so is every pane's word light
+///   (`EffectsPipeline::pane_word_light`) and the light a held park's flush draws by
+///   (`CursorGlow::tick_light`).
+/// - 1.4: no Prism Glass solve unit ran (`prism_glass_solves == 0`,
+///   `rainbow_kitty::prism_glass::take_solves`).
+/// - 1.5: the bed draws by main's table, not the glass ([`BedInkLut::glass_lit`]), and the
+///   frame leaves no light words (`EffectsPipeline::light_words`: the bed's glass, the palettes).
+/// - 1.6: no ribbon slab was laid as the light wedge
+///   (`aterm_render::test_counters::take_wedge_slabs`).
+/// - 1.7: no ribbon slab was laid as the light glass
+///   (`aterm_render::test_counters::take_glass_slabs`), and the ribbon planned no glass reach
+///   or hard step (`Ribbon::glass_planned`), and its glass has no height (`Ribbon::glass_px`).
+///   The page's sheer bit is a [`Light`] bit, so the 1.1 asserts hold it too.
+/// - 1.8: the ribbon folded no glass envelope, priced no glass slab and stepped no glass
+///   cadence (`glass_exits == 0`, `rainbow_kitty::ribbon::take_glass_exits`).
+/// - 1.9: no glass was laid light-owned, the letter guard's to leave and the yield's to cut,
+///   by the yield's record (`CursorGlow::glass_laid`) or the ink ledger's own
+///   (`CursorGlow::light_owned_noted`), and no yield cut a frame (`CursorGlow::last_yield`).
+/// - 1.10: the ribbon holds no `left_at` and no hand's row of a multi-row set
+///   (`Ribbon::glass_wraps`, `Ribbon::wrap_hand`).
+/// - 1.11: the Settings preview's light, which no frame of the app's carries, is asserted
+///   [`Light::OFF`] by the companion pin (`settings_preview`'s `preview_breaks`).
+/// - Then, as they land: 2.1 `ink_top_captures == 0`; 2.2 `fold_at == None`; 2.5 the pet span
+///   is None; 3.1 no LightPose; 3.5 no CaretHold; 3.6 `cursor_ink == None`; 4.3 no HeldBand;
+///   4.5 no Afterimage.
 fn light_symbols_absent(drawn: &Drawn, out: &mut Vec<&'static str>) {
     if !drawn.arms.is_empty() {
         out.push("light_arms_drawn");
+    }
+    if drawn.cfg.is_some_and(|cfg| cfg.light != Light::OFF) {
+        out.push("light");
+    }
+    if drawn.light != Light::OFF {
+        out.push("frame_light");
+    }
+    if drawn.wedges > 0 {
+        out.push("ribbon_wedge_into");
+    }
+    if drawn.glass_slabs > 0 {
+        out.push("ribbon_glass_into");
+    }
+    if drawn.glass_planned {
+        out.push("glass plan");
+    }
+    if drawn.glass_exits != 0 {
+        out.push("glass exits");
+    }
+    if drawn.glass_wraps.0 != 0 {
+        out.push("left_at");
+    }
+    if drawn.glass_wraps.1 {
+        out.push("wrap_hand");
+    }
+    if drawn.prism_glass_solves != 0 {
+        out.push("prism_glass_solves");
+    }
+    if drawn.latched {
+        out.push("latch");
+    }
+    if drawn.window_light != Light::OFF {
+        out.push("window_light");
+    }
+    if drawn.pane_light != Light::OFF {
+        out.push("pane_word_light");
+    }
+    if drawn.bed.glass_lit() {
+        out.push("bed glass");
+    }
+    if drawn.light_words != 0 {
+        out.push("light_words");
+    }
+    if drawn.light_owned {
+        out.push("light_owned");
+    }
+    if drawn.yielded {
+        out.push("yield");
+    }
+    if drawn.tick_light != Light::OFF {
+        out.push("tick_light");
+    }
+    for (light, engine) in drawn.engine_lights.iter().zip([
+        "rainbow light",
+        "momentum light",
+        "comet light",
+        "beamrod light",
+    ]) {
+        if *light != Light::OFF {
+            out.push(engine);
+        }
+    }
+    if drawn.v2_light != Light::OFF {
+        out.push("rk light");
+    }
+    if drawn.settle_light.is_some_and(|light| light != Light::OFF) {
+        out.push("settle light");
+    }
+    if drawn.glass_px != 0.0 {
+        out.push("glass_px");
+    }
+    if drawn.ledger_owned != 0 {
+        out.push("ledger light_owned");
     }
 }
 
@@ -280,8 +427,8 @@ fn same_table(a: &BedInkLut, b: &BedInkLut) -> bool {
             .all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
-/// The reads after a frame of `wid`.
-fn read(app: &App, wid: WindowId, t0: Instant) -> Drawn {
+/// The reads after the frame of `wid` at `now`.
+fn read(app: &App, wid: WindowId, t0: Instant, now: Instant) -> Drawn {
     let mirror = app.front_terminal(wid).expect("a front terminal");
     let term = crate::term_lock(&mirror.term);
     let (fg, bg) = (
@@ -304,11 +451,48 @@ fn read(app: &App, wid: WindowId, t0: Instant) -> Drawn {
             ws.block_fill.map(|owned| owned.fill),
         ),
         arms: ws.fx.light_arms_drawn(),
+        light: ws.fx.frame_light(now),
+        latched: ws.trail_ground.last().on,
+        window_light: app.window_light(wid),
+        pane_light: app
+            .pool
+            .ids()
+            .into_iter()
+            .map(|sid| ws.fx.pane_word_light(now, sid))
+            .find(|&light| light != Light::OFF)
+            .unwrap_or(Light::OFF),
+        wedges: aterm_render::test_counters::take_wedge_slabs(),
+        glass_slabs: aterm_render::test_counters::take_glass_slabs(),
+        glass_planned: ws
+            .fx
+            .cursor()
+            .glow
+            .v2_ribbon()
+            .is_some_and(aterm_effects::rainbow_kitty::ribbon::Ribbon::glass_planned),
+        glass_exits: rk::ribbon::take_glass_exits(),
+        glass_wraps: ws.fx.cursor().glow.v2_ribbon().map_or((0, false), |rib| {
+            (rib.glass_wraps().len(), rib.wrap_hand().is_some())
+        }),
         live: ws
             .fx
             .state_words(t0)
             .get("ribbon.cells.n")
             .is_some_and(|n| n > 0),
+        prism_glass_solves: rk::prism_glass::take_solves(),
+        light_words: ws.fx.light_words(t0).words().len(),
+        light_owned: !ws.fx.cursor().glow.glass_laid().is_empty(),
+        yielded: ws.fx.cursor().glow.last_yield().is_some(),
+        tick_light: ws.fx.cursor().glow.tick_light(),
+        engine_lights: ws.fx.cursor().engine_lights(),
+        v2_light: ws.fx.cursor().glow.v2_light(),
+        settle_light: ws.fx.cursor().rainbow.settle_light(),
+        glass_px: ws
+            .fx
+            .cursor()
+            .glow
+            .v2_ribbon()
+            .map_or(0.0, aterm_effects::rainbow_kitty::ribbon::Ribbon::glass_px),
+        ledger_owned: ws.fx.cursor().glow.light_owned_noted(),
     }
 }
 
@@ -437,7 +621,7 @@ fn run_with(
                     .expect("a windowless frame");
             }
         }
-        frames.push(rig.with_app(now, |app, wid| read(app, wid, t0)));
+        frames.push(rig.with_app(now, |app, wid| read(app, wid, t0, now)));
     };
     frame(&mut rig, at(1));
     // Past the grid's resize hush, a key at a time with its echo, a frame on each and between.
@@ -458,55 +642,79 @@ fn run_with(
 }
 
 /// Every dark ground, under every page, wherever it stands, through both of the host's entries
-/// to the cursor frame: every frame draws by main's rule, and none reaches a light symbol.
+/// to the cursor frame: every frame draws by main's rule, and none reaches a light symbol. Each
+/// ground under each page runs on a core of its own, its stands in order (its twin first), each
+/// run on a rig of its own.
 #[test]
 fn the_light_fork_is_unreachable_on_every_dark_ground() {
     let grounds = Ground::dark();
+    for theme in aterm_theme_pack::themes() {
+        if let Err(err) = aterm_types::scheme::parse_scheme_str(theme.text) {
+            panic!("pack theme {} parses: {err:?}", theme.id);
+        }
+    }
     assert!(
         grounds.iter().any(|g| matches!(g, Ground::Builtin(_)))
             && grounds.iter().any(|g| matches!(g, Ground::Pack { .. })),
         "the sweep holds dark built-ins and dark pack themes"
     );
-    let (mut runs, mut frames, mut twinned) = (0, 0, 0);
-    // Which polarities main's rule read: dark on a plain page, light under DECSCNM and OSC 11.
-    let mut polarity = [false; 2];
-    let mut failures = Vec::new();
-    for &ground in &grounds {
-        for page in Page::ALL {
-            // Each entry's dark twin: the instance stand, which runs first.
-            let mut twins: [Vec<Drawn>; Entry::ALL.len()] = Default::default();
-            for stand in Stand::ALL.into_iter().filter(|stand| stand.takes(ground)) {
-                for (e, entry) in Entry::ALL.into_iter().enumerate() {
-                    let case = format!("{ground} {page:?} {stand:?} {entry:?}");
-                    let (_, drawn) = run(ground, page, stand, entry);
-                    runs += 1;
-                    match stand {
-                        Stand::Instance => twins[e].clone_from(&drawn),
-                        Stand::TabTheme | Stand::SplitPane => {
-                            twinned += drawn.iter().filter(|d| d.fill.0.is_some()).count();
-                            for broke in fill_breaks(&twins[e], &drawn) {
-                                failures.push(format!("{case}, {broke}"));
-                            }
+    // COLOR_UNSET, then every dark scheme.
+    assert!(
+        grounds.len() > 37,
+        "{} dark schemes swept",
+        grounds.len() - 1
+    );
+    let cases: Vec<(Ground, Page)> = grounds
+        .iter()
+        .flat_map(|&ground| Page::ALL.map(|page| (ground, page)))
+        .collect();
+    let swept = aterm_spec::check::each(&cases, |&(ground, page)| {
+        let (mut runs, mut frames, mut twinned) = (0, 0, 0);
+        // Which polarities main's rule read: dark on a plain page, light under DECSCNM and OSC 11.
+        let mut polarity = [false; 2];
+        let mut failures = Vec::new();
+        // Each entry's dark twin: the instance stand, which runs first.
+        let mut twins: [Vec<Drawn>; Entry::ALL.len()] = Default::default();
+        for stand in Stand::ALL.into_iter().filter(|stand| stand.takes(ground)) {
+            for (e, entry) in Entry::ALL.into_iter().enumerate() {
+                let case = format!("{ground} {page:?} {stand:?} {entry:?}");
+                let (_, drawn) = run(ground, page, stand, entry);
+                runs += 1;
+                match stand {
+                    Stand::Instance => twins[e].clone_from(&drawn),
+                    Stand::TabTheme | Stand::SplitPane => {
+                        twinned += drawn.iter().filter(|d| d.fill.0.is_some()).count();
+                        for broke in fill_breaks(&twins[e], &drawn) {
+                            failures.push(format!("{case}, {broke}"));
                         }
                     }
-                    if !drawn.iter().any(|d| d.live) {
-                        failures.push(format!("{case}: the band never lit"));
+                }
+                if !drawn.iter().any(|d| d.live) {
+                    failures.push(format!("{case}: the band never lit"));
+                }
+                if !drawn.iter().any(|d| d.fill.0.is_some()) {
+                    failures.push(format!("{case}: no frame laid a caret fill"));
+                }
+                for (n, d) in drawn.iter().enumerate() {
+                    frames += 1;
+                    if let Some(cfg) = d.cfg {
+                        polarity[usize::from(cfg.dark_theme)] = true;
                     }
-                    if !drawn.iter().any(|d| d.fill.0.is_some()) {
-                        failures.push(format!("{case}: no frame laid a caret fill"));
-                    }
-                    for (n, d) in drawn.iter().enumerate() {
-                        frames += 1;
-                        if let Some(cfg) = d.cfg {
-                            polarity[usize::from(cfg.dark_theme)] = true;
-                        }
-                        for broke in breaks(d) {
-                            failures.push(format!("{case}, frame {n}: {broke}"));
-                        }
+                    for broke in breaks(d) {
+                        failures.push(format!("{case}, frame {n}: {broke}"));
                     }
                 }
             }
         }
+        (runs, frames, twinned, polarity, failures)
+    });
+    let (mut runs, mut frames, mut twinned) = (0, 0, 0);
+    let mut polarity = [false; 2];
+    let mut failures = Vec::new();
+    for (r, f, t, read, broke) in swept {
+        (runs, frames, twinned) = (runs + r, frames + f, twinned + t);
+        polarity = [polarity[0] || read[0], polarity[1] || read[1]];
+        failures.extend(broke);
     }
     assert!(
         failures.is_empty(),
@@ -572,9 +780,37 @@ fn a_recoloured_caret_beside_its_dark_twin_fails_the_pin() {
     );
 }
 
+/// The light reads' wiring: on a light configured scheme the latch admits, so the reads the pin
+/// holds to [`Light::OFF`] on every dark ground carry its light there, each read from the code
+/// that draws by it. The glass's own symbols (`glass_px`, the ledger's light-owned spans) stay
+/// off while the live phase is [`Live::Off`].
+#[test]
+fn the_light_reads_carry_a_light_schemes_light() {
+    let (_, drawn) = run(
+        Ground::Builtin(LIGHT_INSTANCE),
+        Page::Plain,
+        Stand::Instance,
+        Entry::Present,
+    );
+    let broke: std::collections::BTreeSet<&str> = drawn.iter().flat_map(breaks).collect();
+    for read in [
+        "light",
+        "tick_light",
+        "rainbow light",
+        "momentum light",
+        "comet light",
+        "beamrod light",
+        "rk light",
+    ] {
+        assert!(broke.contains(read), "{read} carried the light: {broke:?}");
+    }
+}
+
 /// The pin's negative control (§15.1 P0.9): on a dark ground, a frame forced onto the light
 /// polarity fails it, through the real cursor frame and as a read with only `dark_theme`
-/// forced; so does a light arm drawing.
+/// forced; so does a light arm drawing, a bed drawn by the glass, light words, a latched light
+/// in the frame's config or its frame light, an admitting latch, a light read outside the frame
+/// or given a pane, and each light symbol of [`light_symbols_absent`] set alone.
 #[test]
 fn forcing_dark_theme_false_on_a_dark_ground_fails_the_pin() {
     let (mut rig, drawn) = run(
@@ -602,7 +838,7 @@ fn forcing_dark_theme_false_on_a_dark_ground_fails_the_pin() {
         fx.cur = Some((3, 6));
         (fx.default_fg, fx.default_bg) = (0x002B_2D33, 0x00F6_F7F9);
         assert!(app.cursor_frame(wid, fx).is_some(), "a presented tick");
-        read(app, wid, t0)
+        read(app, wid, t0, now)
     });
     assert!(
         !told.cfg.expect("the forced frame's config").dark_theme,
@@ -631,4 +867,161 @@ fn forcing_dark_theme_false_on_a_dark_ground_fails_the_pin() {
         .arms
         .note("glass", aterm_effects::state_words::Streams::GLOW_UNDER);
     assert_eq!(breaks(&armed), ["light_arms_drawn"]);
+
+    // The bed a glass frame on Default Light's page syncs, and the light words a frame leaves.
+    let glass = GlowConfig {
+        dark_theme: false,
+        theme_fg: 0x002B_2D33,
+        theme_bg: 0x00F6_F7F9,
+        light: Light::at(Live::Glass),
+        ..cfg
+    };
+    let glassed = Drawn {
+        bed: BedInkLut::synced(&rk::Config::from_glow(&glass, false)),
+        ..live
+    };
+    assert!(
+        glassed.bed.glass_lit(),
+        "fixture: Default Light's glass ships"
+    );
+    assert_eq!(breaks(&glassed), ["bed ink table", "bed glass"]);
+    let worded = Drawn {
+        light_words: 1,
+        ..live
+    };
+    assert_eq!(breaks(&worded), ["light_words"]);
+    assert_eq!(
+        breaks(&Drawn {
+            light_owned: true,
+            ..live
+        }),
+        ["light_owned"]
+    );
+    assert_eq!(
+        breaks(&Drawn {
+            yielded: true,
+            ..live
+        }),
+        ["yield"]
+    );
+
+    // A latched light, in the frame's config or as the frame light, even at `Live::Off`.
+    let latched = Drawn {
+        cfg: Some(GlowConfig {
+            light: Light::at(Live::Off),
+            ..cfg
+        }),
+        ..live
+    };
+    assert_eq!(breaks(&latched), ["light"]);
+    let lit = Drawn {
+        light: Light::at(Live::Glass),
+        ..live
+    };
+    assert_eq!(breaks(&lit), ["frame_light"]);
+    assert_eq!(
+        breaks(&Drawn {
+            latched: true,
+            ..live
+        }),
+        ["latch"]
+    );
+    assert_eq!(
+        breaks(&Drawn {
+            window_light: Light::at(Live::Off),
+            ..live
+        }),
+        ["window_light"]
+    );
+    assert_eq!(
+        breaks(&Drawn {
+            pane_light: Light::at(Live::Glass),
+            ..live
+        }),
+        ["pane_word_light"]
+    );
+    assert_eq!(
+        breaks(&Drawn {
+            glass_exits: 1,
+            ..live
+        }),
+        ["glass exits"]
+    );
+    assert_eq!(
+        breaks(&Drawn {
+            glass_wraps: (1, false),
+            ..live
+        }),
+        ["left_at"]
+    );
+    assert_eq!(
+        breaks(&Drawn {
+            glass_wraps: (0, true),
+            ..live
+        }),
+        ["wrap_hand"]
+    );
+    let off = Light::at(Live::Off);
+    assert_eq!(
+        breaks(&Drawn {
+            tick_light: off,
+            ..live
+        }),
+        ["tick_light"]
+    );
+    for (engine, name) in [
+        "rainbow light",
+        "momentum light",
+        "comet light",
+        "beamrod light",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut engine_lights = [Light::OFF; 4];
+        engine_lights[engine] = off;
+        assert_eq!(
+            breaks(&Drawn {
+                engine_lights,
+                ..live
+            }),
+            [name]
+        );
+    }
+    assert_eq!(
+        breaks(&Drawn {
+            v2_light: off,
+            ..live
+        }),
+        ["rk light"]
+    );
+    assert_eq!(
+        breaks(&Drawn {
+            settle_light: Some(off),
+            ..live
+        }),
+        ["settle light"]
+    );
+    assert_eq!(
+        breaks(&Drawn {
+            settle_light: Some(Light::OFF),
+            ..live
+        }),
+        Vec::<&str>::new(),
+        "a probe latched dark is main's"
+    );
+    assert_eq!(
+        breaks(&Drawn {
+            glass_px: 1.0,
+            ..live
+        }),
+        ["glass_px"]
+    );
+    assert_eq!(
+        breaks(&Drawn {
+            ledger_owned: 1,
+            ..live
+        }),
+        ["ledger light_owned"]
+    );
 }

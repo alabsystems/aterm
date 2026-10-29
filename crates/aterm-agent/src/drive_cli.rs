@@ -194,7 +194,9 @@ fn classify_verb(args: &[String]) -> Result<Reply, String> {
     classify_verb_at(args, home.as_deref())
 }
 
-/// [`classify_verb`] under `home`: the classifier's verdict, then the default secret list's.
+/// [`classify_verb`] under `home`: the classifier's verdict, then the advisory word's on the line
+/// (`approval::command_read_only_at`: the proof gaps, the blanks and the default secret list), so
+/// the verb calls read-only no line the harness's rules refuse on its words.
 fn classify_verb_at(args: &[String], home: Option<&std::path::Path>) -> Result<Reply, String> {
     let sub = parse_sub("classify", args)?;
     let cmd = sub.rest.join(" ");
@@ -207,7 +209,7 @@ fn classify_verb_at(args: &[String], home: Option<&std::path::Path>) -> Result<R
     let allow = python_allow(&sub);
     let v = classify_command_with(&cmd, &allow);
     let verdict = if v.read_only {
-        supervise::policy::approval::command_reads_no_secret(&cmd, home)
+        supervise::policy::approval::command_read_only_at(&cmd, &allow, home)
     } else {
         Err(v.reason)
     };
@@ -981,6 +983,55 @@ mod tests {
         let r = classify_verb_at(&args(&["cat ~/.ssh/id_rsa > out"]), home).expect("ok");
         assert!(!r.text.contains("a read of a secret"), "{r:?}");
         assert_eq!(r.code, 1);
+    }
+
+    /// `classify` resolves the secret list's home roots under the `HOME` it runs with, and holds a
+    /// line to the proof gaps the advisory word holds it to, so the two agree on every line.
+    #[test]
+    fn classify_reads_the_shell_home_and_the_proof_gaps() {
+        let home = std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .map(PathBuf::from)
+            .expect("the test runs with a HOME");
+        for line in [
+            "cat ~/.config/gh/hosts.yml".to_string(),
+            format!("cat {}/Library/Preferences/x.plist", home.display()),
+            "cd ~ && cat .claude.json".to_string(),
+            "cat ~/.config/g?/hosts.yml".to_string(),
+            "grep -r token ~".to_string(),
+        ] {
+            let r = classify_verb(&args(&[&line])).expect("ok");
+            assert_eq!(r.code, 1, "{line}: {r:?}");
+            assert!(
+                r.text.starts_with("not-read-only a read of a secret"),
+                "{line}: {r:?}"
+            );
+        }
+        for (line, why) in [
+            ("FOO=1 cat README.md", "assigns a variable"),
+            ("env cat README.md", "runs env"),
+            (
+                "for f in a; do cat README.md; done",
+                "assigns a for loop's variable",
+            ),
+            ("sort src/*.rs", "an unquoted glob `*`"),
+            ("cat a\\  b", "not read as drawn"),
+            ("cat $(<files.txt)", "builds at run time"),
+            ("echo $GITHUB_TOKEN", "may be a secret"),
+        ] {
+            let r = classify_verb(&args(&[line])).expect("ok");
+            assert_eq!(r.code, 1, "{line}: {r:?}");
+            assert!(r.text.contains(why), "{line}: {r:?}");
+        }
+        // NEGATIVE CONTROLS
+        for line in [
+            "cat ~/.config/notes.txt",
+            "ls src/*.rs | sort",
+            "cat README.md",
+        ] {
+            let r = classify_verb(&args(&[line])).expect("ok");
+            assert_eq!(r, Reply::text("read-only\n".to_string()), "{line}");
+        }
     }
 
     #[test]

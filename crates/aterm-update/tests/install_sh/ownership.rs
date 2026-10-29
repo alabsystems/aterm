@@ -107,8 +107,8 @@ fn the_bin_entry_verdict() {
     symlink(&bundle_exe, &bundle);
     symlink(store.join("aterm"), &in_store);
     symlink("/usr/local/Cellar/other/bin/aterm", &elsewhere);
-    scratch.stand_in("bin.pre-store/aterm", "#!/bin/sh\necho \"aterm 0.4.0\"\n");
-    scratch.stand_in(
+    scratch.program("bin.pre-store/aterm", "#!/bin/sh\necho \"aterm 0.4.0\"\n");
+    scratch.program(
         "bin.foreign/aterm",
         "#!/bin/sh\necho \"aterm-ng 2.0 (the X terminal)\"\n",
     );
@@ -193,7 +193,7 @@ fn a_binary_asked_what_it_is_cannot_swallow_the_installers_stdin() {
     let store = scratch.mkdir("store");
     let tmp = scratch.mkdir("tmp");
     let home = scratch.mkdir("home");
-    let reader = scratch.stand_in("rd/aterm", READER);
+    let reader = scratch.program("rd/aterm", READER);
     let bundle = scratch.mkdir("rd/reader.app");
     scratch.stand_in("rd/reader.app/Contents/MacOS/aterm", READER);
     let dest = scratch.mkdir("rd/dest");
@@ -201,12 +201,12 @@ fn a_binary_asked_what_it_is_cannot_swallow_the_installers_stdin() {
     let apps = scratch.mkdir("rd/apps");
     let answering = scratch.stand_in("rd/apps/aterm.app/Contents/MacOS/aterm", ATERM);
     let bin = scratch.mkdir("rd/bin");
-    scratch.stand_in("rd/bin/aterm-ctl", READER);
+    scratch.program("rd/bin/aterm-ctl", READER);
     let placed = scratch.mkdir("rd/store");
     scratch.stand_in("rd/store/aterm", READER);
     let none = scratch.mkdir("rd/none");
     let candidate = scratch.stand_in("rd/candidate/aterm-linux", READER);
-    let cases: [(&str, &[&Path], String); 6] = [
+    let cases: [(&str, &[&Path], String); 7] = [
         (
             "bin_aterm_verdict \"$2\" \"$3\"",
             &[&reader, &store],
@@ -233,6 +233,11 @@ fn a_binary_asked_what_it_is_cannot_swallow_the_installers_stdin() {
         ),
         (
             "setup_aterm self-uninstall \"$2\" \"$3\"",
+            &[&none, &placed],
+            String::new(),
+        ),
+        (
+            "secrets_aterm \"$2\" \"$3\"",
             &[&none, &placed],
             String::new(),
         ),
@@ -305,7 +310,7 @@ fn a_binary_that_never_finishes_is_cut_off_and_answers_nothing() {
     let scratch = Scratch::new();
     let store = scratch.mkdir("store");
     let stall = staller();
-    let lone = scratch.stand_in("stall/aterm", &stall);
+    let lone = scratch.program("stall/aterm", &stall);
     let damaged = scratch.mkdir("stall/damaged.app");
     scratch.stand_in("stall/damaged.app/Contents/MacOS/aterm", &stall);
     let dest = scratch.mkdir("stall/dest");
@@ -313,7 +318,7 @@ fn a_binary_that_never_finishes_is_cut_off_and_answers_nothing() {
     let apps = scratch.mkdir("stall/apps");
     let answering = scratch.stand_in("stall/apps/aterm.app/Contents/MacOS/aterm", ATERM);
     let bin = scratch.mkdir("stall/bin");
-    scratch.stand_in("stall/bin/aterm-ctl", &stall);
+    scratch.program("stall/bin/aterm-ctl", &stall);
     let placed = scratch.mkdir("stall/store");
     scratch.stand_in("stall/store/aterm", &stall);
     let none = scratch.mkdir("stall/none");
@@ -368,6 +373,13 @@ fn a_binary_that_never_finishes_is_cut_off_and_answers_nothing() {
                 q(s(&none)),
                 q(s(&placed))
             ),
+            String::new(),
+        ),
+        (
+            "secrets",
+            "aterm 0.99.0",
+            "--version",
+            format!("secrets_aterm {} {}", q(s(&none)), q(s(&placed))),
             String::new(),
         ),
         (
@@ -489,7 +501,7 @@ fn a_bundle_with_an_unread_program_inventory_is_never_swapped() {
 fn a_program_that_has_not_shown_it_ran_is_left_where_it_is() {
     let scratch = Scratch::new();
     let silent = silent_staller();
-    let answers = scratch.stand_in("proof/answers", ATERM);
+    let answers = scratch.program("proof/answers", ATERM);
     let fails = scratch.stand_in("proof/fails", "#!/bin/sh\nexit 3\n");
     // As an old bundle's aterm-drive answers `--version`: its error on stderr, exit 1.
     let quiet = scratch.stand_in("proof/quiet", "#!/bin/sh\necho 'unknown' >&2\nexit 1\n");
@@ -521,17 +533,17 @@ fn a_program_that_has_not_shown_it_ran_is_left_where_it_is() {
     let inert = scratch.write("proof/inert", "#!/bin/sh\nexit 0\n");
     let toolset = scratch.mkdir("proof/toolset/aterm.app");
     let siblings = toolset.join("Contents/MacOS");
-    scratch.stand_in("proof/toolset/aterm.app/Contents/MacOS/aterm", ATERM);
-    scratch.stand_in("proof/toolset/aterm.app/Contents/MacOS/aterm-cli", ATERM);
-    scratch.stand_in("proof/toolset/aterm.app/Contents/MacOS/atpkg", &silent);
+    scratch.program("proof/toolset/aterm.app/Contents/MacOS/aterm", ATERM);
+    scratch.program("proof/toolset/aterm.app/Contents/MacOS/aterm-cli", ATERM);
+    scratch.program("proof/toolset/aterm.app/Contents/MacOS/atpkg", &silent);
     let whole = scratch.mkdir("proof/whole/aterm.app");
-    scratch.stand_in("proof/whole/aterm.app/Contents/MacOS/aterm", ATERM);
+    scratch.program("proof/whole/aterm.app/Contents/MacOS/aterm", ATERM);
     symlink(&stalls, &whole.join("Contents/MacOS/atpkg"));
     let dest = scratch.mkdir("proof/dest");
-    let held = scratch.stand_in("proof/dest/aterm.app/Contents/MacOS/aterm", &silent);
+    let held = scratch.program("proof/dest/aterm.app/Contents/MacOS/aterm", &silent);
     let staged = scratch.mkdir("proof/dest/aterm.app.installing.x");
     scratch.mkdir("proof/store");
-    let placed = scratch.stand_in("proof/store/aterm", &silent);
+    let placed = scratch.program("proof/store/aterm", &silent);
     let link = scratch.join("proof/store/aterm-ctl");
     symlink(&stalls, &link);
     let parked = |name: &str| scratch.join(&format!("proof/{name}.parked"));

@@ -1728,6 +1728,37 @@ mod tests {
         assert!(!live_model(&tail, Some(&b)).expect("an answer").by_command);
         let tail = [answer("claude-opus-5"), set_model("Mystery 9")].join("\n");
         assert_eq!(live_model(&tail, Some(&b)), None);
+        let non_native = Baked {
+            latest_per_family: vec![],
+            models: vec![
+                BakedModel {
+                    id: "claude-sonnet-5".into(),
+                    family: "sonnet".into(),
+                    display_name: "Sonnet 5".into(),
+                    native_1m: false,
+                    efforts: vec![],
+                },
+                BakedModel {
+                    id: "claude-opus-5-5".into(),
+                    family: "opus".into(),
+                    display_name: "Opus 5.5".into(),
+                    native_1m: true,
+                    efforts: vec![],
+                },
+            ],
+        };
+        assert_eq!(
+            model_of_display("Sonnet 5 (1M context) (default)", Some(&non_native)),
+            Some("claude-sonnet-5[1m]".into())
+        );
+        assert_eq!(
+            model_of_display("Sonnet 5 (default)", Some(&non_native)),
+            Some("claude-sonnet-5".into())
+        );
+        assert_eq!(
+            model_of_display("Opus 5.5 (1M context)", Some(&non_native)),
+            Some("claude-opus-5-5".into())
+        );
     }
 
     #[test]

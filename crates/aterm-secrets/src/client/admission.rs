@@ -164,6 +164,29 @@ impl Ledger {
         Ok(next)
     }
 
+    /// Combine authenticated branch decisions for surviving recipients under the
+    /// same root. Branch order breaks ties; an open approval never displaces an
+    /// existing non-open decision. No machine-list entry creates evidence.
+    pub(super) fn merged<'a>(
+        doc: &Document,
+        branches: impl IntoIterator<Item = &'a Self>,
+    ) -> crate::Result<Self> {
+        let mut merged = Self::default().retained(doc)?;
+        for branch in branches {
+            for (recipient, evidence) in branch.retained(doc)?.entries {
+                if merged.entries.get(&recipient).is_none_or(|held| {
+                    held.method == Method::Open && evidence.method != Method::Open
+                }) {
+                    merged.entries.insert(recipient, evidence);
+                }
+            }
+            if merged.entries.len() > LIMIT {
+                return Err(Error::new("merged admission ledger is full"));
+            }
+        }
+        Ok(merged)
+    }
+
     pub(super) fn record(
         &mut self,
         doc: &Document,

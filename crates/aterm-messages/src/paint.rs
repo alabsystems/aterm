@@ -118,7 +118,15 @@ pub struct Hover {
 }
 
 /// Cache key for painted band rows.
-pub type BandKey = (u64, usize, u64, Option<Hover>, Geometry, u64);
+pub type BandKey = (
+    u64,
+    usize,
+    crate::ink::BandInks,
+    bool,
+    Option<Hover>,
+    Geometry,
+    u64,
+);
 
 /// Repaint fingerprint combining `center_fp`, `hover`, `geom`, and `motion`.
 #[must_use]
@@ -133,25 +141,25 @@ pub fn band_fp(center_fp: u64, hover: Option<Hover>, geom: Geometry, motion_fp: 
         geom.hash(&mut h);
         h.finish()
     };
-    let term = match hover {
+    let hover_code = match hover {
         None => 0u64,
         Some(Hover { row, target }) => {
             let t = match target {
-                HoverTarget::Body => 0x100,
-                HoverTarget::Capsule(k) => 0x200 | u64::from(k.0),
+                HoverTarget::Body => 1u64,
+                HoverTarget::Capsule(k) => 2u64 + u64::from(k.0),
             };
-            (u64::from(row) << 16) | (t << 1) | 1
+            (u64::from(row) << 10) | t
         }
     };
-    let fp = center_fp ^ term.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let fp = if motion_fp == 0 {
-        fp
+    let base = if motion_fp == 0 {
+        center_fp
     } else {
-        fp ^ motion_fp
-            .wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
-            .rotate_left(17)
+        center_fp
+            ^ motion_fp
+                .wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+                .rotate_left(17)
     };
-    fp | 1
+    (base | 1) ^ (hover_code.wrapping_mul(0x9E37_79B9_7F4A_7C15) << 1)
 }
 
 /// Drawn vector icon replacing the glyph cell's font character.
@@ -523,9 +531,9 @@ impl Cells {
         let face = Face::Word(slot_ink(words));
         let mut chars = words.chars();
         let end = (col + width).min(self.cells.len()).max(col);
-        for x in col..end {
+        for cell in self.cells.iter_mut().take(end).skip(col) {
             let ch = chars.next().unwrap_or(' ');
-            self.cells[x] = Cell {
+            *cell = Cell {
                 ch,
                 face,
                 bold: false,
@@ -1404,10 +1412,10 @@ mod tests {
             }
             if fill[0] == 0 && fill[cols - 1] == 0 && fill.iter().any(|&f| f > 0) {
                 let lit = fill.iter().filter(|&&f| f > 0).count();
-                let fifth = cols as f64 * f64::from(crate::COMET_PERMILLE) / 1000.0;
+                let quarter = cols as f64 * f64::from(crate::COMET_PERMILLE) / 1000.0;
                 assert!(
-                    (lit as f64) >= fifth * 0.8 && (lit as f64) <= fifth * 1.4,
-                    "frame {k}: {lit} cells lit, a fifth of the window is {fifth:.1}"
+                    (lit as f64) >= quarter * 0.8 && (lit as f64) <= quarter * 1.4,
+                    "frame {k}: {lit} cells lit, a quarter of the window is {quarter:.1}"
                 );
             }
         }

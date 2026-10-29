@@ -5,10 +5,13 @@
 
 use std::time::{Duration, Instant};
 
-use aterm_core::{render::RenderInput, terminal::Terminal};
+use aterm_core::{
+    render::RenderInput,
+    terminal::{ClockReading, Terminal},
+};
 use aterm_effects::{
     cursor_glow::Geom,
-    output_streak::{OutputStreak, StreakConfig},
+    output_streak::{OutputStreak, StreakConfig, UNWATCHED_MS},
 };
 use aterm_models_effects::output_streak_attribution_model;
 use aterm_render::GlowQuad;
@@ -466,4 +469,53 @@ fn compact_row_growth_at_fixed_dimensions_preserves_live_output() {
     );
     assert_ne!(h.paint(), 0);
     assert!(h.out.iter().all(|q| q.x + q.w <= 5 * 8));
+}
+
+/// A LANDING NO FRAME WATCHED MINTS NO LIGHT: a prompt the program drew while no frame was drawn
+/// (an occluded window, a headless capture) is history by the frame that first shows it, so its
+/// ink licenses nothing and paints nothing once it is older than one longest sweep
+/// ([`UNWATCHED_MS`]). CONTROL: the same prompt seen one frame after it was drawn is arrival and
+/// sweeps its row.
+#[test]
+fn a_landing_no_frame_watched_mints_no_light() {
+    for (name, seen_after_ms, lit) in [
+        ("CONTROL: seen one frame after it was drawn", 16, true),
+        ("seen just past the longest sweep", UNWATCHED_MS + 1, false),
+        ("seen 16 s after it was drawn", 16_000, false),
+    ] {
+        let mut h = Host::new("old prompt\r\n");
+        let drawn = h.now + Duration::from_millis(100);
+        h.term.process_at(
+            "\x1b[6;1H\u{276F} ".as_bytes(),
+            ClockReading {
+                monotonic: drawn,
+                wall_ms: None,
+            },
+        );
+        h.now = drawn + Duration::from_millis(seen_after_ms);
+        h.term.cell_frame_into(&mut h.input, ROWS, COLS);
+        assert_eq!(
+            h.input.drawn_at,
+            Some(drawn),
+            "{name}: the fill dates its screen"
+        );
+        h.streak.note_drawn_at(h.input.drawn_at);
+        let licensed = h.streak.note_output_cells(
+            &h.input.cells,
+            (h.input.cursor_row, h.input.cursor_col),
+            (ROWS, COLS),
+            h.term.content_seq(),
+            h.now,
+            false,
+        );
+        assert_eq!(licensed, lit, "{name}: licence");
+        let fp = h.paint();
+        assert_eq!(fp != 0, lit, "{name}: painted {:?}", h.out);
+        assert_eq!(
+            h.out.iter().any(|q| q.row == 5),
+            lit,
+            "{name}: light on the prompt's row: {:?}",
+            h.out
+        );
+    }
 }

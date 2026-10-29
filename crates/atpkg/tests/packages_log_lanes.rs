@@ -153,10 +153,9 @@ fn a_pass_the_lock_refused_says_it_did_not_run() {
     assert_eq!(events[0].get("exit"), Some("75"));
 }
 
-#[test]
-fn concurrent_appender_child() {
+fn concurrent_appender_child_if_asked() -> bool {
     let Some(dir) = std::env::var_os("ATPKG_TEST_LOG_APPENDER_DIR") else {
-        return;
+        return false;
     };
     let dir = PathBuf::from(dir);
     let t = atpkg::packages_log::Transition {
@@ -175,6 +174,7 @@ fn concurrent_appender_child() {
         );
         atpkg::packages_log::append_line(&dir, &line, false).unwrap();
     }
+    true
 }
 
 struct Reaped(Child);
@@ -194,6 +194,9 @@ impl Drop for Reaped {
 
 #[test]
 fn two_processes_appending_at_once_interleave_whole_lines() {
+    if concurrent_appender_child_if_asked() {
+        return;
+    }
     let scratch = aterm_tempfile::Builder::new()
         .prefix("atpkg-packages-log-concurrent-")
         .tempdir()
@@ -203,7 +206,11 @@ fn two_processes_appending_at_once_interleave_whole_lines() {
     let spawn = || {
         Reaped(
             Command::new(&exe)
-                .args(["--exact", "concurrent_appender_child", "--test-threads=1"])
+                .args([
+                    "--exact",
+                    "two_processes_appending_at_once_interleave_whole_lines",
+                    "--test-threads=1",
+                ])
                 .env("ATPKG_TEST_LOG_APPENDER_DIR", dir)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())

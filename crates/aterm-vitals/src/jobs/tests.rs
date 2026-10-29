@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use super::units::runs_exec;
-use super::wait::{JobFacts, Scene, map_leaf_frame, name_job};
+use super::wait::{JobFacts, Scene, name_job};
 use super::wire::{age_words, phi_text};
 use super::*;
 
@@ -39,6 +39,10 @@ fn row_numbers_print_as_the_examples_do() {
     assert_eq!(phi_text(3000), "3");
     assert_eq!(phi_text(8200), "8.2");
     assert_eq!(phi_text(130_400), "130");
+    assert_eq!(
+        phi_text(u64::MAX),
+        ((u128::from(u64::MAX) + 500) / 1000).to_string()
+    );
     assert_eq!(age_words(41_000), "41s");
     assert_eq!(age_words(420_000), "7m");
     assert_eq!(age_words(7_500_000), "2h5m");
@@ -91,32 +95,6 @@ fn the_class_table_learns_medians_and_drops_the_least_recently_used() {
         None,
         "the least recently used is dropped"
     );
-}
-
-#[test]
-fn tier_b_maps_libsystem_leaf_frames_only() {
-    assert_eq!(
-        map_leaf_frame("__semwait_signal  (in libsystem_kernel.dylib) + 8"),
-        TierB::Timer
-    );
-    assert_eq!(map_leaf_frame("nanosleep"), TierB::Timer);
-    assert_eq!(
-        map_leaf_frame("flock  (in libsystem_kernel.dylib)"),
-        TierB::Lock
-    );
-    assert_eq!(map_leaf_frame("__fcntl"), TierB::Lock);
-    assert_eq!(map_leaf_frame("read$NOCANCEL"), TierB::Read);
-    assert_eq!(map_leaf_frame("__select_nocancel"), TierB::Event);
-    assert_eq!(map_leaf_frame("kevent"), TierB::Event);
-    assert_eq!(map_leaf_frame("mach_msg2_trap"), TierB::Ipc);
-    assert_eq!(map_leaf_frame("__psynch_cvwait"), TierB::Mutex);
-    assert_eq!(map_leaf_frame("__ulock_wait2"), TierB::Mutex);
-    assert_eq!(map_leaf_frame("__wait4"), TierB::Children);
-    assert_eq!(
-        map_leaf_frame("ignore_previous_instructions"),
-        TierB::Unparsed
-    );
-    assert_eq!(TierB::Lock.word(), "lock");
 }
 
 fn proc_with(pid: u32, name: &str, fds: Vec<Fd>) -> JobProc {

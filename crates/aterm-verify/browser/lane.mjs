@@ -67,7 +67,8 @@
 // calls it over the DevTools protocol. A browser it does not drive that way
 // opens `<kind>.html?post=1&next=<kind>,...` instead: the page fetches
 // spec.json, runs its lane, POSTs { answer } or { error } to
-// /answer/<kind>, and opens the next page.
+// /answer/<kind>, and opens the next page. Either way, while it works it
+// POSTs ./beat (beat()), which the Rust side's hang detector counts from.
 
 const ms = (t0) => Math.round((performance.now() - t0) * 1000) / 1000
 
@@ -88,11 +89,28 @@ function push(timings, key, v) {
   ;(timings[key] = timings[key] || []).push(v)
 }
 
+/// When this page or worker last beat.
+let beaten = -Infinity
+
+/// Tell the lane this page is still at work: a POST to ./beat, at most once a
+/// second, from each step and each frame the lane waits for. The Rust side
+/// calls a page hung only after a minute with no answer and no beat
+/// (serve.rs `hang_at`), so a page that is only slow (SwiftShader's readbacks
+/// on a busy machine) is waited for, and one that stopped is not. A beat that
+/// fails is dropped: the minute still runs.
+function beat() {
+  const now = performance.now()
+  if (now - beaten < 1000) return
+  beaten = now
+  fetch('./beat', { method: 'POST', body: '' }).catch(() => {})
+}
+
 /// One animation frame: the compositor runs between two of the lane's
 /// frames, as it does between a page's. A worker without
 /// requestAnimationFrame yields one task instead. The wait is counted apart
 /// (`frame_wait_ms`), so `total_ms` less it is the page's own work.
 async function waitFrame(timings) {
+  beat()
   const t0 = performance.now()
   const raf = globalThis.requestAnimationFrame
   await new Promise((resolve) => (raf ? raf(() => resolve()) : setTimeout(resolve, 0)))
@@ -138,6 +156,7 @@ function presented(canvas, timings) {
 
 /// `f()`, its error renamed for the step that failed.
 async function step(name, f) {
+  beat()
   try {
     return await f()
   } catch (e) {

@@ -76,7 +76,7 @@
 //!
 //! ## The cordon
 //!
-//! The crate root is `deny(unsafe_code)`, and exactly two modules re-permit it, for
+//! The crate root is `deny(unsafe_code)`, and its OS modules re-permit it, for
 //! hand-declared FFI calls with a `// SAFETY:` note each. `apple`
 //! (`cfg(target_vendor = "apple")`): `fcntl(F_BARRIERFSYNC)` behind [`barrier_sync`],
 //! `fsync` behind [`full_sync`] in a test's debug process,
@@ -87,6 +87,8 @@
 //! `acl_get_fd_np`, `acl_get_entry`, `acl_get_tag_type` and `acl_free` behind
 //! [`owner_private`] and [`owner_private_dir`]; the per-OS `O_NONBLOCK` and
 //! `O_NOFOLLOW` numbers [`open_nonblocking`] passes to safe `std` live there too.
+//! `file_identity` (`cfg(windows)`) reads the kernel's volume and file index for
+//! [`file_matches_path`], so a path replacement is never judged by size or time.
 //! Nothing else here may use `unsafe` — the compiler refuses it — and no errno or raw
 //! pointer leaves those modules: every call returns `io::Result` or an owned value.
 //! `astream-broker` stays `forbid(unsafe_code)` and reaches the OS through this
@@ -98,11 +100,11 @@
 //!
 //! aterm depends on this crate directly (astream's `docs/ROADMAP.md`, "What aterm
 //! uses beyond the fabric"). It reads the boot through [`boot_session`] and
-//! [`parse_boot_id`] in aterm-link, aterm-agent, aterm-caffeine, aterm-gui, aterm-uds,
+//! [`parse_boot_id`] in aterm-link, aterm-agent, aterm-acaffiene, aterm-gui, aterm-uds,
 //! aterm-release (its publisher fence's `fence-boot`, compared as 16 bytes) and
 //! aterm-update (which reads Linux's `boot_id` file itself and judges it with
 //! [`parse_boot_id`]), and writes the boot text it records (aterm-agent's ledger and
-//! tapes, aterm-caffeine's state file, aterm-release's fence, aterm-link's messages)
+//! tapes, aterm-acaffiene's state file, aterm-release's fence, aterm-link's messages)
 //! with [`boot_id_text`]. Outside tests (whose oracle is the kernel's own text), only
 //! aterm-machines reads `kern.bootsessionuuid` otherwise, with a `sysctl -n`
 //! subprocess, to read what its enrollment root script reads. On
@@ -171,6 +173,39 @@ mod apple;
 #[cfg(unix)]
 #[allow(unsafe_code)]
 mod owner;
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod file_identity;
+
+/// Whether the open descriptor and the path currently name the same file.
+/// Follows the path's final symlink, just as a normal file open does.
+///
+/// # Errors
+/// Propagates metadata/open errors, or returns `Unsupported` on platforms without
+/// a kernel file identity implementation.
+pub fn file_matches_path(file: &File, path: &std::path::Path) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata()?;
+        let named = std::fs::metadata(path)?;
+        Ok((opened.dev(), opened.ino()) == (named.dev(), named.ino()))
+    }
+    #[cfg(windows)]
+    {
+        let named = File::open(path)?;
+        Ok(file_identity::of(file)? == file_identity::of(&named)?)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, path);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "kernel file identity unavailable",
+        ))
+    }
+}
 
 #[macro_use]
 #[path = "../../astream-wire/contract_fn.rs"]
@@ -919,6 +954,34 @@ fn owner_only(file: &File, dir: bool) -> io::Result<Result<std::fs::Metadata, No
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn file_identity_survives_rename_and_distinguishes_replacement() {
+        let dir = std::env::temp_dir().join(format!("astream-sys-identity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("live");
+        let held = dir.join("held");
+        let hard = dir.join("hard");
+        std::fs::write(&path, b"same contents").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        assert!(super::file_matches_path(&file, &path).unwrap());
+        std::fs::hard_link(&path, &hard).unwrap();
+        assert!(super::file_matches_path(&file, &hard).unwrap());
+        #[cfg(unix)]
+        {
+            let link = dir.join("symbolic");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert!(super::file_matches_path(&file, &link).unwrap());
+        }
+        std::fs::rename(&path, &held).unwrap();
+        assert!(super::file_matches_path(&file, &held).unwrap());
+        assert!(super::file_matches_path(&file, &path).is_err());
+        std::fs::write(&path, b"same contents").unwrap();
+        assert!(!super::file_matches_path(&file, &path).unwrap());
+        drop(file);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::*;
 
     const ID: &str = "64C7D12D-5B0E-4F43-9A1C-2E7F00D1A9B3";

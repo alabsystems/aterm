@@ -310,6 +310,25 @@ pub(crate) fn soak_ink(rim: Rgb, over: Rgb, soak: f32) -> Rgb {
     ink::mix(rim, metal, (soak / 0.25).min(1.0))
 }
 
+/// What the bezel says of `Strain`'s `soak` in words (Stats Deck v2 §12), at the soak's thresholds
+/// it draws: nothing while the soak leaves it the rim's grey ([`SOAK_SHOWN`]), "recently" while
+/// the soak warms it, and "a long stretch" once the soak blooms it ([`BLOOM_FROM`]). A hot needle
+/// also warms and blooms the bezel; the needle's own words say that. The soak counts a bucket
+/// with memory pressure warn as at capacity ([`aterm_vitals::strain::WARN_SCORE`]), so its first
+/// words say "at or past"; warn alone soaks at most 0.5, short of the bloom, so only time past
+/// capacity reaches the long stretch.
+#[cfg(a11y_tree)]
+pub(crate) fn soak_words(soak: f32) -> Option<&'static str> {
+    let soak = drawn_soak(soak);
+    if soak >= BLOOM_FROM {
+        Some("Past capacity for a long stretch recently.")
+    } else if soak > SOAK_SHOWN {
+        Some("At or past capacity recently.")
+    } else {
+        None
+    }
+}
+
 /// `c` with its OkLab lightness moved by `dl` and its chroma scaled by `cm`.
 fn shade(c: Rgb, dl: f32, cm: f32) -> Rgb {
     let lab = ink::to_lab(c);

@@ -124,6 +124,9 @@ fn enormous_decgri_repeat_count_no_panic_no_oom() {
 
 #[test]
 fn payload_larger_than_global_dcs_budget_is_dropped_without_panic() {
+    // Path 1: raw stream bytes exceed `MAX_DCS_GLOBAL_BUDGET` (10 MiB) while the clamped
+    // 4096x6 raster stays well within budget (~98 KiB RGBA8); bytes past 10 MiB are dropped,
+    // the clamped prefix image is placed on row 0, and subsequent text flows onto row 1.
     let mut s = Screen::new(24, 80);
     s.feed(b"\x1bP0;0;8q\"1;1;4;6#1");
     let chunk = vec![b'~'; 1 << 20]; // 1 MiB of full sixel columns
@@ -131,7 +134,39 @@ fn payload_larger_than_global_dcs_budget_is_dropped_without_panic() {
         s.feed(&chunk);
     }
     s.feed(b"\x1b\\OK");
-    assert!(s.row(0).ends_with("OK") || s.row(1) == "OK");
+    let placed = s.images_row(0);
+    assert_eq!(
+        placed.len(),
+        80,
+        "clamped 4096x6 prefix raster within budget spans all 80 columns on row 0"
+    );
+    assert_eq!(
+        placed[0].1.image.format,
+        aterm_core::grid::extra::ImageFormat::RawRgba8 {
+            width: 4096,
+            height: 6,
+        }
+    );
+    assert!(
+        placed
+            .iter()
+            .all(|(_, r)| std::sync::Arc::ptr_eq(&r.image, &placed[0].1.image)),
+        "every placed cell on row 0 references the single clamped image"
+    );
+    assert_eq!(s.row(1), "OK");
+
+    // Path 2: decoded raster allocation pushes `total_bytes > MAX_DCS_GLOBAL_BUDGET`
+    // (3000 * 1002 * 4 = 12,024,000 bytes > 10 MiB, within SIXEL_MAX_IMAGE_BYTES = 16 MiB);
+    // the decoder aborts, no image is placed, and subsequent text prints on row 0.
+    let mut s = Screen::new(24, 80);
+    s.feed(b"\x1bP0;0;8q#1");
+    s.feed(&[b'-'; 166]);
+    s.feed(b"!3000~\x1b\\OK");
+    assert!(
+        s.images_row(0).is_empty(),
+        "raster allocation exceeding MAX_DCS_GLOBAL_BUDGET aborts without placing an image"
+    );
+    assert_eq!(s.row(0), "OK");
 }
 
 #[test]

@@ -172,6 +172,7 @@ fn key_for(
         clip: aterm_core::render::PxRect::EVERYWHERE,
         mark_hover: false,
         title_gen: 0,
+        chip: TopChip::NONE,
     }
 }
 
@@ -211,6 +212,89 @@ fn tailed_run(len: usize, tail: &[RenderCell]) -> TopRun {
 fn tag_in(len: usize) -> (usize, usize) {
     let start = plain_run(len).col + len + 1;
     (start, start + aterm_primer::CLAUDE_TOP_EFFORT_KEY.len())
+}
+
+/// A WIDE NAME MOVES WITH THE TAG: a session name of wide glyphs in Claude's label zone (a CJK
+/// `/rename`, a one-character emoji) is plain, each glyph's two halves moved together, so the
+/// harness's label ends the rule as beside a name of one-cell letters, Claude's cells laid whole
+/// left of the switch. CONTROL: a name with a combining mark stays where Claude drew it, the
+/// label left of it.
+#[test]
+fn a_wide_name_moves_with_the_tag() {
+    let cols = 120;
+    let gray = "\x1b[38;2;90;90;90m";
+    let paint = SwitchPaint {
+        cli_ver: Inline::new("2.1.305"),
+        ..LIT
+    };
+    for (name, plain) in [
+        ("workspace", true),
+        ("\u{4fee}\u{590d}", true),
+        ("\u{1f41b} fix", true),
+        ("cafe\u{0301}", false),
+    ] {
+        let width: usize = name.chars().map(aterm_grapheme::char_width).sum();
+        let top = format!(
+            "{gray}{} \x1b[38;2;175;135;255m{name}{gray} \u{2500}",
+            "\u{2500}".repeat(cols - 3 - width)
+        );
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let session = app.focused_session_id(wid).expect("the front session");
+        let _ = app.apply_term_resize(wid, 24, cols as u16);
+        bytes(&app, session, screen_with(cols, &top).as_bytes());
+        refill(&mut app, wid);
+        let ws = &app.windows[&wid];
+        let scratch = &ws.input_scratch;
+        let region = PaneTextRegion {
+            strip: scratch.cells.len() - usize::from(ws.rows),
+            row_off: 0,
+            col_off: 0,
+            rows: 24,
+            cols,
+        };
+        let blank = scratch.implicit_blank;
+        let run = read_top_run(scratch, region, 20, TopLine::Rule, blank, false).expect("the rule");
+        let zone = run.tail.expect("Claude's label zone");
+        assert_eq!(zone.plain, plain, "{name:?}: plain");
+        let row = scratch.cells[region.strip + 20].clone();
+        let tail: &[RenderCell] = if zone.plain {
+            &row[zone.col..zone.col + zone.len]
+        } else {
+            &[]
+        };
+        let key = TopKey {
+            frame_row: region.strip + 20,
+            ..key_for(
+                aterm_phase::Program::Claude,
+                run,
+                Some(paint),
+                Some(CardPalette::Cruise),
+                blank,
+                KeyFace::default(),
+            )
+        };
+        let mut top = ComposedTop::default();
+        compose_top(&key, &mut top, None, None, tail);
+        let s = top.switch.as_ref().expect("the switch");
+        let (label, _) = s.label.clone().expect("a label at 120 columns");
+        if plain {
+            assert_eq!(
+                label.end + CLOSE,
+                run.end,
+                "{name:?}: the label ends the rule"
+            );
+            assert!(
+                top.cells.windows(tail.len()).any(|cells| cells == tail),
+                "{name:?}: Claude's cells laid whole"
+            );
+        } else {
+            assert!(
+                label.end < zone.col,
+                "CONTROL: {name:?}: the zone stays, the label left of it"
+            );
+        }
+    }
 }
 
 /// THE HARNESS LAYS FROM THE RULE'S RIGHT END: on every top rule a program draws (plain, tagged,
@@ -740,11 +824,13 @@ fn the_ghost_sits_left_of_the_switch() {
             let (a, b) = top.ghost.expect("the ghost is drawn");
             let ghost = a - 1..b + 1;
             assert_eq!(text(ghost.clone()), ghost_text, "{at}: the ghost whole");
+            // Claude's grey, floored to read as words do ([`greyed_on`]).
+            let greyed = FactInks::of(run.rule.fg, blank().fg, run.rule.bg).stub;
             for c in ghost.clone() {
                 let cell = top.cells[c - top.col];
                 assert_eq!(
                     (cell.fg, cell.bold, cell.script),
-                    (run.rule.fg, false, aterm_core::terminal::Script::Normal),
+                    (greyed, false, aterm_core::terminal::Script::Normal),
                     "{at}: the ghost in Claude's gray"
                 );
             }
@@ -948,6 +1034,7 @@ fn rung_name(rung: Option<Rung>) -> String {
         (false, _, Some(Lockup::Icon), _) => "icon".into(),
         (false, _, None, _) => "nothing".into(),
         (true, _, _, Field::Run) => "last resort".into(),
+        (true, Some(label), Some(Lockup::Icon), _) => format!("T{label} icon"),
         (true, Some(label), _, _) => format!("T{label}"),
         (true, None, Some(Lockup::Full), _) => "T4".into(),
         (true, None, Some(Lockup::Icon), _) => "T4 icon".into(),
@@ -962,11 +1049,13 @@ fn first_fit(span: TopSpan, rungs: &[Rung]) -> Option<Rung> {
 
 /// Walks `rungs` from a wide line to nothing: each is laid in its turn, and what a narrower line
 /// gives up never comes back. The words go first (the label's CLI word, `harness`, the CLI's
-/// version, the label), then the lockup's name, then its icon.
+/// version, the label), then the lockup's name, then its icon; with the ⬆️ laid (`arrow`) the
+/// lockup's name goes before the CLI's version.
 fn walk_order(
     span_of: &dyn Fn(usize) -> TopSpan,
     widths: std::ops::RangeInclusive<usize>,
     rungs: &[Rung],
+    arrow: bool,
 ) -> Result<(), String> {
     let lockup = rungs.iter().any(|r| r.lockup.is_some());
     let rank = |r: &Rung| {
@@ -1004,7 +1093,12 @@ fn walk_order(
                 ));
             }
         }
-        if lockup && now.switch && now.lockup != Some(Lockup::Full) && now.label.is_some() {
+        let named = if arrow { LABEL_TIERS - 2 } else { LABEL_TIERS };
+        if lockup
+            && now.switch
+            && now.lockup != Some(Lockup::Full)
+            && now.label.is_some_and(|tier| tier < named)
+        {
             return Err(format!("{w}: {name}: the name went before the label"));
         }
         walked.push(now);
@@ -1063,18 +1157,21 @@ fn the_ladder_gives_up_words_then_the_name_then_the_icon() {
                     harness: None,
                     ..LIT
                 }),
+                Some(arrow_paint(UpState::Ready)),
+                Some(arrow_paint(UpState::Held)),
                 None,
             ] {
+                let arrow = switch.is_some_and(|p| p.up.shows());
                 for (line, span_of, least) in lines {
                     let (rungs, n) = ladder(span_of(200), switch, Some(mark.lockup_cells(build)));
-                    walk_order(&span_of, least..=260, &rungs[..n])
+                    walk_order(&span_of, least..=260, &rungs[..n], arrow)
                         .unwrap_or_else(|e| panic!("{mark:?} {build:?} {line} {switch:?}: {e}"));
                     walked += 1;
                 }
             }
         }
     }
-    assert_eq!(walked, CliMark::ALL.len() * Build::ALL.len() * 7 * 4);
+    assert_eq!(walked, CliMark::ALL.len() * Build::ALL.len() * 9 * 4);
     let span_of = |w: usize| tailed_run(w.saturating_sub(12), &tail).span(KeyFace::default());
     let (rungs, n) = ladder(
         span_of(200),
@@ -1089,14 +1186,25 @@ fn the_ladder_gives_up_words_then_the_name_then_the_icon() {
     let rung = skipped.remove(icon);
     skipped.insert(icon - 2, rung);
     assert!(
-        walk_order(&span_of, 0..=260, &skipped).is_err_and(|e| e.contains("laid")),
+        walk_order(&span_of, 0..=260, &skipped, false).is_err_and(|e| e.contains("laid")),
         "CONTROL: a rung the walk never lays is caught"
     );
     let mut early: Vec<Rung> = rungs[..n].to_vec();
     early[3].lockup = Some(Lockup::Icon);
     assert!(
-        walk_order(&span_of, 0..=260, &early).is_err_and(|e| e.contains("before the label")),
+        walk_order(&span_of, 0..=260, &early, false).is_err_and(|e| e.contains("before the label")),
         "CONTROL: the name dropped before the label is caught"
+    );
+    let (rungs, n) = ladder(
+        span_of(200),
+        Some(arrow_paint(UpState::Ready)),
+        Some(CliMark::Claude.lockup_cells(Build::Vendor)),
+    );
+    let mut early: Vec<Rung> = rungs[..n].to_vec();
+    early[1].lockup = Some(Lockup::Icon);
+    assert!(
+        walk_order(&span_of, 0..=260, &early, true).is_err_and(|e| e.contains("before the label")),
+        "CONTROL: with the arrow, the name dropped before T2 is caught"
     );
 }
 
@@ -1144,6 +1252,35 @@ fn the_ladder_lays_the_specs_tiers_at_the_specs_widths() {
         rung_at(tailed(80)),
         "T0",
         "the 80-column pane shows the whole label"
+    );
+    // With the ⬆️'s 3 cells the lockup's name goes before the CLI's build: a 60-column pane keeps
+    // the running build beside the offer (`alab v0.4 (v2.1.305)`, the lockup's icon alone).
+    // CONTROL: the order without the name's rung lays T3, the build gone.
+    let up = SwitchPaint {
+        cli_ver: Inline::new("2.1.305"),
+        ..arrow_paint(UpState::Ready)
+    };
+    let up_at = |w: usize| rung_name(lay_top(tailed(w), Some(up), lockup).map(|l| l.rung));
+    assert_eq!(up_at(63), "T2", "the arrow's 3 more");
+    assert_eq!(up_at(62), "T2 icon", "a column short: the name goes first");
+    assert_eq!(up_at(60), "T2 icon", "60 columns keep the build");
+    let (rungs, n) = ladder(tailed(60), Some(up), lockup);
+    let full = CliMark::Claude.lockup_cells(Build::Vendor);
+    let named: Vec<Rung> = rungs[..n]
+        .iter()
+        .map(|r| match (r.label, r.lockup) {
+            (Some(_), Some(Lockup::Icon)) => Rung {
+                lockup: Some(Lockup::Full),
+                need: r.need + full - aterm_effects::cli_marks::ICON_RUN,
+                ..*r
+            },
+            _ => *r,
+        })
+        .collect();
+    assert_eq!(
+        rung_name(first_fit(tailed(60), &named)),
+        "T3",
+        "CONTROL: the name kept, the build goes at 60"
     );
     for w in 22..=25 {
         assert_eq!(rung_at(tailed(w)), "last resort", "{w}: in the run");
@@ -1458,6 +1595,129 @@ fn the_rule_flows_into_the_switch() {
         assert!(
             flows(&reversed, CardPalette::Cruise, gap).is_err(),
             "CONTROL {what}: the left-to-right walk leaves a seam"
+        );
+    }
+}
+
+/// A SHORT GAP RAMPS TOO: where the pane leaves only a few `─` between the lockup and the
+/// harness (2 to 7 cells), they still run the arc from its end at the lockup to its start at the
+/// switch, one step a cell, as a wide gap does. CONTROL: the gap in one ink, the arc's start,
+/// does not flow.
+#[test]
+fn a_short_gap_ramps_too() {
+    let mut short = std::collections::BTreeSet::new();
+    for len in 20..68 {
+        let run = plain_run(len);
+        let top = composed(
+            run,
+            Some(LIT),
+            Some(CardPalette::Cruise),
+            KeyFace::default(),
+        );
+        let Some(s) = top.switch.as_ref() else {
+            continue;
+        };
+        if top.lockup.is_empty() {
+            continue;
+        }
+        let gap = top.lockup.end..s.cols.start;
+        let g = gap.len();
+        if !(2..8).contains(&g) {
+            continue;
+        }
+        short.insert(g);
+        let at = format!("run {len}, gap {g}");
+        flows(&top, CardPalette::Cruise, gap.clone()).unwrap_or_else(|e| panic!("{at}: {e}"));
+        for (j, c) in gap.clone().enumerate() {
+            assert_eq!(
+                top.cells[c - top.col].fg,
+                tint_at(CardPalette::Cruise, 1.0 - j as f32 / (g - 1) as f32),
+                "{at}: gap cell {j}"
+            );
+        }
+        let mut flat = top.cells.clone();
+        for c in gap.clone() {
+            flat[c - top.col].fg = tint_at(CardPalette::Cruise, 0.0);
+        }
+        let flat = ComposedTop {
+            cells: flat,
+            switch: top.switch.clone(),
+            lockup: top.lockup.clone(),
+            col: top.col,
+            ..ComposedTop::default()
+        };
+        assert!(
+            flows(&flat, CardPalette::Cruise, gap).is_err(),
+            "CONTROL {at}: one ink does not flow"
+        );
+    }
+    assert!(
+        short.len() >= 3,
+        "the walk meets short gaps of several widths: {short:?}"
+    );
+}
+
+/// CLAUDE'S TAG READS ON A LIGHT PAGE: the tag moved left of the switch keeps its hue and reads
+/// as words do on the ground it is laid on: Claude's dark-theme purple (`#af87ff`, 2.5:1 on
+/// Default Light's page) floored to 4.5:1 there, the zone's blanks as Claude drew them.
+/// CONTROL: on a dark ground the moved cells are Claude's, byte for byte.
+#[test]
+fn claudes_tag_reads_on_a_light_page() {
+    use aterm_effects::cli_marks::NAME_CONTRAST;
+    use aterm_effects::color_math::contrast_ratio;
+    let pack = |c: [u8; 3]| u32::from_be_bytes([0, c[0], c[1], c[2]]);
+    let reads = |a: [u8; 3], b: [u8; 3]| contrast_ratio(pack(a), pack(b));
+    let len = 60;
+    for (ground, light) in [([0xf6, 0xf7, 0xf9], true), ([0x11, 0x13, 0x18], false)] {
+        let tail: Vec<RenderCell> = claude_tail()
+            .into_iter()
+            .map(|c| RenderCell { bg: ground, ..c })
+            .collect();
+        let face = KeyFace {
+            tag: Some(tag_in(len)),
+            ..KeyFace::default()
+        };
+        let run = tailed_run(len, &tail);
+        let top = composed_with(CLAUDE, run, Some(LIT), Some(CardPalette::Land), face, &tail);
+        let moved = top.tag.expect("the tag moved");
+        let mut floored = 0;
+        for (k, claude) in tail.iter().enumerate() {
+            let cell = top.cells[moved.0 - 1 + k - top.col];
+            if !light || claude.ch == ' ' {
+                assert_eq!(cell, *claude, "light {light}: Claude's own cell {k}");
+                continue;
+            }
+            assert!(
+                reads(claude.fg, ground) < NAME_CONTRAST,
+                "CONTROL: Claude's ink at {:.2}:1",
+                reads(claude.fg, ground)
+            );
+            let k = reads(cell.fg, ground);
+            assert!(k >= NAME_CONTRAST, "{:?} at {k:.2}:1", cell.ch);
+            let [r, g, b] = cell.fg;
+            assert!(
+                b > r && r > g,
+                "{:?}: the purple's hue kept: {:?}",
+                cell.ch,
+                cell.fg
+            );
+            assert_eq!(
+                RenderCell {
+                    fg: claude.fg,
+                    ..cell
+                },
+                *claude,
+                "only the ink moves"
+            );
+            floored += 1;
+        }
+        assert_eq!(
+            floored,
+            if light {
+                aterm_primer::CLAUDE_TOP_EFFORT_KEY.len()
+            } else {
+                0
+            }
         );
     }
 }
@@ -2099,10 +2359,16 @@ fn the_bare_switch_reads_on_every_ground() {
                 HarnessSwitch::Turning,
                 HarnessSwitch::TurningOff,
             ] {
-                for hover in [HoverAt::None, HoverAt::Switch, HoverAt::Label] {
+                for hover in [
+                    HoverAt::None,
+                    HoverAt::Switch,
+                    HoverAt::Label,
+                    HoverAt::Arrow,
+                ] {
                     let paint = SwitchPaint {
                         hover,
                         cli_ver: Inline::new("2.1.305"),
+                        up: arrow_paint(UpState::Ready).up,
                         ..SwitchPaint::bare(face, Some(aterm_phase::CliHarness::ClaudeCode))
                     };
                     let inks = FaceInks::of(&paint, None, blank, accent);
@@ -2118,10 +2384,15 @@ fn the_bare_switch_reads_on_every_ground() {
                         let Some(f) = label_face(&paint, tier) else {
                             continue;
                         };
-                        let shown = slot_words(&paint).map(|w| LabelFace::fitted(&w, f.len));
-                        for &(ch, ink) in shown.as_ref().unwrap_or(&f).cells() {
-                            let c = label_cell(ch, ink, &inks, blank);
-                            cells.push((format!("label {tier} {ch:?}"), c));
+                        // The label, and every form of the words its slot may show in its place.
+                        let forms = slot_words(&paint, tier).map(|w| w.0).unwrap_or_default();
+                        let shown = std::iter::once(f)
+                            .chain(forms.iter().map(|form| LabelFace::of_words(form)));
+                        for face in shown {
+                            for &(ch, ink) in face.cells() {
+                                let c = label_cell(ch, ink, &inks, blank);
+                                cells.push((format!("label {tier} {ch:?}"), c));
+                            }
                         }
                     }
                     for (what, c) in cells {
@@ -2412,6 +2683,126 @@ fn up_row(
 fn the_arrow_offers_a_later_build_until_its_move_lands() {
     use aterm_agent::harness::upgrade::{GAVE_UP, Phase, Request};
     let up = |row| TopUp::of(&row);
+    {
+        // A REVISION UNDER ONE CORE IS OFFERED, NAMED WHOLE: the lane moves a Muse tab onto a
+        // later revision of the build it runs (codex-alab's lane mints no such move).
+        for (from, to, target) in [
+            ("1.4.10-R6400.1", "1.4.10-R6500.1", "v1.4.10 (R6500.1)"),
+            ("1.4.10-R6427.9", "1.4.10-R6427.10", "v1.4.10 (R6427.10)"),
+        ] {
+            let revised = up(up_row(from, to, Phase::Pending, ""));
+            assert_eq!(revised.state, UpState::Ready, "{to}: offered");
+            assert_eq!(
+                up_said(&revised, "", None).as_deref(),
+                Some(format!("update to {target} \u{b7} now").as_str()),
+                "{to}: the words name the build past the numbers"
+            );
+        }
+        let later = up(up_row(
+            "1.4.10-R6500.1",
+            "1.4.11-R6510.1",
+            Phase::Pending,
+            "",
+        ));
+        assert_eq!(
+            up_said(&later, "", None).as_deref(),
+            Some("update to v1.4.11 \u{b7} now"),
+            "a later core is named by its numbers"
+        );
+    }
+    {
+        // A MOVE ITS TAB SETS ASIDE IS HELD: nothing steps the tab, so the arrow says when it
+        // would land and why a press cannot ask for it, the person's Now included; but a Claude
+        // Code tab's press passes its Autopilot or its harness switched off, once, so there the
+        // arrow is Ready, the person's Now (which does not pass them) included.
+        use aterm_agent::harness::upgrade::Agent;
+        use aterm_agent::harness::upgrade_drive::{
+            AGENT_OFF, AUTOPILOT_OFF, CLAIMED, NOT_FOREGROUND,
+        };
+        let pending = up_row("2.1.305", "2.1.310", Phase::Pending, "background");
+        for agent in [Agent::Claude, Agent::Codex] {
+            for (aside, wait, why, pressed_past) in [
+                (
+                    AUTOPILOT_OFF,
+                    "once autopilot is on",
+                    "autopilot is off",
+                    true,
+                ),
+                (
+                    AGENT_OFF,
+                    "once the harness is on",
+                    "the harness is off",
+                    true,
+                ),
+                (
+                    CLAIMED,
+                    "once its supervisor lets go",
+                    "another supervisor holds it",
+                    false,
+                ),
+            ] {
+                for request in [Request::None, Request::Now] {
+                    let row = aterm_agent::harness::upgrade_drive::Row {
+                        aside: aside.to_owned(),
+                        wait: aside.to_owned(),
+                        request: request.clone(),
+                        agent,
+                        ..pending.clone()
+                    };
+                    let shown = up(row);
+                    if pressed_past && agent == Agent::Claude {
+                        assert_eq!(
+                            (shown.state, shown.why, shown.press),
+                            (UpState::Ready, "", Some("")),
+                            "{agent:?} {aside} {request:?}: a press passes it"
+                        );
+                    } else {
+                        assert_eq!(
+                            (shown.state, shown.wait, shown.why),
+                            (UpState::Held, wait, why),
+                            "{agent:?} {aside} {request:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // A ROW WHOSE AGENT IS NOT THE FOREGROUND JOB IS ANOTHER PROGRAM'S: the rule is drawn by
+        // the one in front (a Claude Code suspended under another), so it shows no arrow, set
+        // aside or held as not in front, kept or live.
+        for (aside, wait) in [(NOT_FOREGROUND, NOT_FOREGROUND), ("", NOT_FOREGROUND)] {
+            let behind = aterm_agent::harness::upgrade_drive::Row {
+                aside: aside.to_owned(),
+                wait: wait.to_owned(),
+                ..pending.clone()
+            };
+            assert_eq!(up(behind.clone()), TopUp::default(), "{aside:?} {wait:?}");
+            assert_eq!(TopUp::harness_off(&behind), TopUp::default(), "kept");
+        }
+        let codex = aterm_agent::harness::upgrade_drive::Row {
+            agent: Agent::Codex,
+            ..pending.clone()
+        };
+        let gone = TopUp::harness_off(&codex);
+        assert_eq!(
+            (gone.state, gone.wait, gone.why),
+            (
+                UpState::Held,
+                "once the harness is on",
+                "the harness is off"
+            ),
+            "the row kept from before the host stood down"
+        );
+        assert_eq!(
+            TopUp::harness_off(&pending),
+            up(pending.clone()),
+            "a Claude Code row kept as it stands: a press moves it with the harness off"
+        );
+        assert_eq!(
+            TopUp::harness_off(&up_row("2.1.305", "2.1.310", Phase::Done, "")),
+            TopUp::default(),
+            "CONTROL: a kept row with no move waiting shows none"
+        );
+    }
     let pending = up_row("2.1.305", "2.1.310", Phase::Pending, "background");
     let ready = up(pending.clone());
     assert_eq!(
@@ -2449,6 +2840,16 @@ fn the_arrow_offers_a_later_build_until_its_move_lands() {
         UpState::Ready,
         "a skip of another build"
     );
+    let other_revision = aterm_agent::harness::upgrade_drive::Row {
+        request: Request::Skip("1.4.10-R6499.1".to_string()),
+        agent: aterm_agent::harness::upgrade::Agent::Muse,
+        ..up_row("1.4.10-R6427.1", "1.4.10-R6500.1", Phase::Pending, "")
+    };
+    assert_eq!(
+        up(other_revision).state,
+        UpState::Ready,
+        "a skip of another revision"
+    );
     for (what, row) in [
         (
             "the same build",
@@ -2475,6 +2876,14 @@ fn the_arrow_offers_a_later_build_until_its_move_lands() {
                 ..pending.clone()
             },
         ),
+        (
+            "a skipped revision",
+            aterm_agent::harness::upgrade_drive::Row {
+                request: Request::Skip("1.4.10-R6500.1".to_string()),
+                agent: aterm_agent::harness::upgrade::Agent::Muse,
+                ..up_row("1.4.10-R6427.1", "1.4.10-R6500.1", Phase::Pending, "")
+            },
+        ),
     ] {
         assert_eq!(up(row), TopUp::default(), "CONTROL: {what}");
     }
@@ -2482,9 +2891,18 @@ fn the_arrow_offers_a_later_build_until_its_move_lands() {
         ("", "now"),
         ("next-point", "now"),
         ("background", "after background jobs"),
+        ("not-idle:shell", "after background jobs"),
+        ("busy", "at turn end"),
+        ("busy-thread", "at turn end"),
         ("not-idle:busy", "at turn end"),
         ("release:busy", "at turn end"),
-        ("settling", "at turn end"),
+        ("not-idle:waiting", "once its dialog is answered"),
+        ("not-idle", "once it is idle"),
+        ("status-stale:busy", "once it is idle"),
+        ("notice-shown", "once it is idle"),
+        ("settling", "once its tab settles"),
+        ("awaiting-ready", "once it agrees to move"),
+        ("not-ready", "once it agrees to move"),
         ("login", "after login"),
         ("limited:5h", "after the usage limit"),
         ("attended", "once you stop typing"),
@@ -2502,7 +2920,15 @@ fn arrow_paint(state: UpState) -> SwitchPaint {
         up: TopUp {
             state,
             to: Inline::new("2.1.310"),
+            revision: false,
             wait: "after background jobs",
+            why: if state == UpState::Held {
+                "autopilot is off"
+            } else {
+                ""
+            },
+            press: None,
+            agent: aterm_agent::harness::upgrade::Agent::Claude,
         },
         ..LIT
     }
@@ -2510,9 +2936,11 @@ fn arrow_paint(state: UpState) -> SwitchPaint {
 
 /// THE ARROW ENDS THE RULE A BLANK FROM ITS CLOSE: on a wide rule the ⬆️ takes the two cells
 /// before the close's blank, emoji-presented with its continuation, a blank before it, the label
-/// right-aligned to that blank; its hit takes it and both blanks. The ladder keeps it on every
-/// rung, three cells more: an 80-column pane lays T0 with it too, a 77-column one T1 with it.
-/// CONTROL: with no arrow the label ends at the close's blank.
+/// right-aligned to that blank; its hit takes it and both blanks. An asked move's one-cell `◐`
+/// takes the first of those cells with the second blank, and the close runs on from there as
+/// rule (`◐ ───`): one blank either side of it, as of the ⬆️. The ladder keeps it on every rung,
+/// three cells more: an 80-column pane lays T0 with it too, a 77-column one T1 with it. CONTROL:
+/// with no arrow the label ends at the close's blank.
 #[test]
 fn the_arrow_ends_the_rule_a_blank_from_its_close() {
     let tail = claude_tail();
@@ -2537,7 +2965,6 @@ fn the_arrow_ends_the_rule_a_blank_from_its_close() {
             "{state:?}: the arrow's hit"
         );
         assert_eq!(at(field - 6).ch, ' ', "{state:?}: the blank before it");
-        assert_eq!(at(field - 3).ch, ' ', "{state:?}: the close's blank");
         assert_eq!(
             [at(field - 2).ch, at(field - 1).ch],
             ['\u{2500}'; 2],
@@ -2548,12 +2975,18 @@ fn the_arrow_ends_the_rule_a_blank_from_its_close() {
                 assert_eq!(at(field - 5).ch, UP_ARROW);
                 assert!(at(field - 5).emoji_presentation, "emoji-presented");
                 assert!(at(field - 4).wide, "its continuation");
+                assert_eq!(at(field - 3).ch, ' ', "the close's blank");
             }
             _ => {
                 assert_eq!(
                     (at(field - 5).ch, at(field - 5).fg, at(field - 4).ch),
                     ('\u{25d0}', [0xd7, 0x77, 0x57], ' '),
                     "asked: the accent's half-moon, a blank"
+                );
+                assert_eq!(
+                    (at(field - 3).ch, at(field - 3).fg),
+                    ('\u{2500}', at(field - 2).fg),
+                    "asked: the close runs on to the half-moon's blank, in its own ink"
                 );
             }
         }
@@ -2587,12 +3020,13 @@ fn the_arrow_ends_the_rule_a_blank_from_its_close() {
         rung_name(lay_top(span, Some(paint), lockup).map(|l| l.rung))
     };
     let ready = arrow_paint(UpState::Ready);
+    // The arrow's 3 cells more on every rung, and the lockup's name gone before the CLI's build.
     for (name, need) in [
         ("T0", 78),
         ("T1", 71),
         ("T2", 63),
-        ("T3", 52),
-        ("T4", 42),
+        ("T2 icon", 56),
+        ("T3 icon", 45),
         ("T4 icon", 35),
         ("T4 bare", 29),
     ] {
@@ -2628,95 +3062,195 @@ fn the_arrow_ends_the_rule_a_blank_from_its_close() {
     );
 }
 
-/// AN ASKED MOVE NAMES BOTH BUILDS WHERE THEY FIT: once asked, the label reads `(v2.1.305 →
-/// v2.1.310)` at a tier with room for it, the plain `(v2.1.305)` where only that fits.
-/// CONTROL: a Ready arrow never lays the moving form.
+/// AN ASKED MOVE KEEPS THE LABEL'S WIDTH: a press turns the ⬆️ to `◐` and nothing else moves,
+/// the rung and the label as they were at every width; under the pointer the asked arrow says
+/// the move is on its way.
 #[test]
-fn an_asked_move_names_both_builds_where_they_fit() {
+fn an_asked_move_keeps_the_labels_width() {
     let tail = claude_tail();
     let lockup = Some(CliMark::Claude.lockup_cells(Build::Vendor));
-    let asked = arrow_paint(UpState::Asked);
     let laid_at = |paint: SwitchPaint, w: usize| {
         let span = tailed_run(w - 12, &tail).span(KeyFace::default());
         lay_top(span, Some(paint), lockup).expect("a rung")
     };
-    let wide = laid_at(asked, 158);
-    assert!(wide.rung.moving, "room for both builds");
-    assert_eq!(
-        wide.label.expect("a label").text(),
-        "alab claude harness v0.4 (v2.1.305 \u{2192} v2.1.310)"
-            .replace("0.4", aterm_phase::CliHarness::ClaudeCode.version_str())
-    );
-    let moving_t0 = label_face_in(&asked, 0, true).expect("the moving form").len;
-    let plain_t0 = label_face(&asked, 0).expect("the plain form").len;
-    let snug = laid_at(asked, 78 + (moving_t0 - plain_t0) - 1);
-    assert_eq!(
-        (snug.rung.label, snug.rung.moving),
-        (Some(0), false),
-        "a column short of both builds: the plain T0"
-    );
-    for w in [158, 78, 60] {
-        assert!(
-            !laid_at(arrow_paint(UpState::Ready), w).rung.moving,
-            "CONTROL {w}: Ready lays no moving form"
+    for w in [158, 78, 60, 46] {
+        let ready = laid_at(arrow_paint(UpState::Ready), w);
+        let asked = laid_at(arrow_paint(UpState::Asked), w);
+        assert_eq!(asked.rung, ready.rung, "{w}: the same rung");
+        assert_eq!(
+            asked.label.as_ref().map(LabelFace::text),
+            ready.label.as_ref().map(LabelFace::text),
+            "{w}: the same label"
         );
     }
+    assert_eq!(
+        up_said(&arrow_paint(UpState::Asked).up, "1 shell", None).as_deref(),
+        Some("updating to v2.1.310 \u{b7} after 1 shell")
+    );
 }
 
-/// THE ARROW'S WORDS TAKE THE LABEL'S SLOT: under the pointer the slot says when the move would
-/// land, right-aligned and cut with `…` to the label's cells; a refused press's words win for a
-/// few seconds; a sprite rings the arrow. CONTROL: at rest the label shows and nothing is ringed, and at a
-/// tier with no label the hover writes nothing new.
-#[test]
-fn the_arrows_words_take_the_labels_slot() {
+/// A top rule `w` columns wide composed for `paint`, Claude's tag in its zone: the key and what
+/// it laid.
+fn slot_top(paint: SwitchPaint, w: usize) -> (TopKey, ComposedTop) {
     let tail = claude_tail();
-    let run = tailed_run(158 - 12, &tail);
-    let compose = |paint: SwitchPaint, run: TopRun| {
-        let key = key_for(
-            aterm_phase::Program::Claude,
-            run,
-            Some(paint),
-            Some(CardPalette::Cruise),
-            blank(),
-            KeyFace::default(),
-        );
-        let mut top = ComposedTop::default();
-        compose_top(&key, &mut top, None, None, &tail);
-        (key, top)
-    };
-    let slot = |top: &ComposedTop| -> String {
-        let (cols, _) = top
-            .switch
-            .as_ref()
-            .and_then(|s| s.label.clone())
-            .expect("a label");
-        cols.map(|c| top.cells[c - top.col].ch).collect()
-    };
+    let key = key_for(
+        aterm_phase::Program::Claude,
+        tailed_run(w - 12, &tail),
+        Some(paint),
+        Some(CardPalette::Cruise),
+        blank(),
+        KeyFace {
+            tag: Some(tag_in(w - 12)),
+            ..KeyFace::default()
+        },
+    );
+    let mut top = ComposedTop::default();
+    compose_top(&key, &mut top, None, None, &tail);
+    (key, top)
+}
+
+/// The words in a composed top rule's label slot, its leading blanks dropped; `None` with no
+/// label.
+fn slot_of(top: &ComposedTop) -> Option<String> {
+    let (cols, _) = top.switch.as_ref()?.label.clone()?;
+    Some(
+        cols.map(|c| top.cells[c - top.col].ch)
+            .collect::<String>()
+            .trim_start()
+            .to_owned(),
+    )
+}
+
+/// Where a composed top rule laid the switch and Claude's tag, glass columns.
+fn laid_at(top: &ComposedTop) -> (std::ops::Range<usize>, Option<(usize, usize)>) {
+    (top.switch.as_ref().expect("laid").cols.clone(), top.tag)
+}
+
+/// THE ARROW'S WORDS TAKE THE LABEL'S OWN CELLS: under the pointer the slot says the verb, the
+/// target build bold in its own ink and when the move would land, in Claude's own job words
+/// where its mode row gives them, in the first form that fits the label's own cells, so neither
+/// the switch nor Claude's tag moves; a form that drops the verb keeps the target and when
+/// (`v2.1.310 · after 1 shell`), then the verb and the target, then the target alone; a
+/// refused press's words win for a few seconds; a sprite rings the arrow, and none rings an
+/// asked move's `◐`, which takes no press. CONTROL: at rest the label shows, and at a tier with
+/// no label the hover writes nothing new.
+#[test]
+fn the_arrows_words_take_the_labels_own_cells() {
     let rest = arrow_paint(UpState::Ready);
-    let (_, at_rest) = compose(rest, run);
+    let (rest_key, at_rest) = slot_top(rest, 158);
     let label = label_face(&rest, 0).expect("T0").text();
-    assert_eq!(slot(&at_rest), label, "CONTROL: at rest, the label");
+    assert_eq!(
+        slot_of(&at_rest).as_deref(),
+        Some(label.as_str()),
+        "CONTROL: at rest, the label"
+    );
     let hovered = SwitchPaint {
         hover: HoverAt::Arrow,
         ..rest
     };
-    let (key, over) = compose(hovered, run);
-    let words = LabelFace::fitted(
-        &[(
-            "update to v2.1.310 \u{b7} after background jobs".to_string(),
-            LabelInk::Muted,
-        )],
-        label.chars().count(),
-    )
-    .text();
-    let shown = slot(&over);
+    let jobs = hovered.with_jobs("1 shell");
+    let asked = SwitchPaint {
+        up: arrow_paint(UpState::Asked).up,
+        ..jobs
+    };
+    let idle = SwitchPaint {
+        up: TopUp {
+            wait: "now",
+            ..hovered.up
+        },
+        ..hovered
+    };
     assert!(
-        words.starts_with('\u{2026}') && words.ends_with("v2.1.310 \u{b7} after background jobs"),
-        "the words outrun T0's label, so they are cut at their left: {words:?}"
+        label.chars().count() < "updating to v2.1.310 \u{b7} after 1 shell".chars().count(),
+        "CONTROL: the asked verb's form is wider than the label: {label:?}"
     );
-    assert_eq!(shown, words, "the arrow's words, in the label's cells");
-    let mut rings = RingContents::default();
-    let ring = ring_layer(&key, &over, 1, &mut rings).expect("the arrow's ring");
+    // Each form is shorter than the one before, so every one can be the first that fits: a verb's
+    // form longer than the target and a short when (`v2.1.310 · now`, 14 cells, then `update to
+    // v2.1.310`, 18) never would be. CONTROL: a long when keeps the verb's form.
+    let widths = |paint: &SwitchPaint| -> Vec<usize> {
+        up_forms(&paint.up, paint.jobs.as_str(), paint.press)
+            .expect("forms")
+            .0
+            .iter()
+            .map(|form| form.iter().map(|(t, _)| t.chars().count()).sum())
+            .collect()
+    };
+    for (state, wait) in [
+        (UpState::Ready, "now"),
+        (UpState::Ready, "after background jobs"),
+        (UpState::Asked, "now"),
+        (UpState::Asked, "at turn end"),
+        (UpState::Held, ""),
+    ] {
+        let paint = SwitchPaint {
+            up: TopUp {
+                wait,
+                ..arrow_paint(state).up
+            },
+            ..hovered
+        };
+        let w = widths(&paint);
+        assert!(
+            w.windows(2).all(|p| p[1] < p[0]),
+            "{state:?}, {wait:?}: each form shorter than the one before: {w:?}"
+        );
+    }
+    assert_eq!(
+        widths(&hovered).len(),
+        4,
+        "CONTROL: a long when keeps the verb's form"
+    );
+    for (w, paint, want) in [
+        (158, jobs, "update to v2.1.310 \u{b7} after 1 shell"),
+        (158, hovered, "v2.1.310 \u{b7} after background jobs"),
+        (100, jobs, "update to v2.1.310 \u{b7} after 1 shell"),
+        (76, jobs, "v2.1.310 \u{b7} after 1 shell"),
+        (76, hovered, "update to v2.1.310"),
+        (50, jobs, "v2.1.310"),
+        // An asked move's words say it is under way wherever they keep when it lands: its verb's
+        // form (36 cells) is one past the owner's 35-cell label, so `→` takes the verb's place,
+        // never the offer's bare words; a label of 9 cells (`alab v0.5`) holds the target alone.
+        (158, asked, "\u{2192} v2.1.310 \u{b7} after 1 shell"),
+        (76, asked, "\u{2192} v2.1.310 \u{b7} after 1 shell"),
+        (50, asked, "v2.1.310"),
+        // An idle tab's move lands now: the short when says more than the verb would.
+        (158, idle, "update to v2.1.310 \u{b7} now"),
+        (76, idle, "update to v2.1.310 \u{b7} now"),
+        (50, idle, "v2.1.310"),
+    ] {
+        let (_, still) = slot_top(
+            SwitchPaint {
+                hover: HoverAt::None,
+                ..paint
+            },
+            w,
+        );
+        let (_, over) = slot_top(paint, w);
+        assert_eq!(slot_of(&over).as_deref(), Some(want), "{w}: {want}");
+        assert_eq!(
+            laid_at(&over),
+            laid_at(&still),
+            "{w}: the switch and the tag stand where they stood"
+        );
+    }
+    let (key, over) = slot_top(jobs, 158);
+    let inks = FaceInks::of(&jobs, Some(CardPalette::Cruise), blank(), key.mark_fg);
+    let (cols, _) = over
+        .switch
+        .as_ref()
+        .and_then(|s| s.label.clone())
+        .expect("a label");
+    let target: Vec<RenderCell> = cols
+        .map(|c| over.cells[c - over.col])
+        .skip_while(|c| c.ch == ' ')
+        .skip("update to ".len())
+        .take("v2.1.310".len())
+        .collect();
+    assert!(
+        target.iter().all(|c| c.bold && c.fg == inks.target) && inks.target != inks.muted,
+        "the target build bold in its own ink: {target:?}"
+    );
+    let ring = ring_layer(&key, &over, 7, &mut RingContents::default()).expect("a ring");
     let s = over.switch.as_ref().expect("laid");
     let arrow = s.arrow.clone().expect("an arrow");
     let cw = i32::from(key.cell.0);
@@ -2725,31 +3259,37 @@ fn the_arrows_words_take_the_labels_slot() {
         i32::try_from(arrow.start + 1).expect("a column") * cw - cw / 2,
         "the sprite rings the arrow, from half a cell left of its first cell"
     );
-    let (rest_key, _) = compose(rest, run);
+    assert!(ring_layer(&rest_key, &at_rest, 7, &mut RingContents::default()).is_none());
+    let (asked_key, asked_over) = slot_top(asked, 158);
     assert!(
-        ring_layer(&rest_key, &at_rest, 1, &mut rings).is_none(),
-        "CONTROL: at rest, no ring"
+        asked_key.switch.is_some_and(|p| p.hover == HoverAt::Arrow),
+        "CONTROL: the pointer is on the asked arrow"
     );
-    let refused = rest.refused_with(Some("press it again"));
-    let (_, said) = compose(refused, run);
+    assert!(
+        ring_layer(&asked_key, &asked_over, 7, &mut RingContents::default()).is_none(),
+        "an asked move's \u{25d0} takes no press: no ring"
+    );
+    let held = SwitchPaint {
+        up: arrow_paint(UpState::Held).up,
+        ..hovered
+    };
+    let (held_key, held_over) = slot_top(held, 158);
+    assert!(
+        held_key.switch.is_some_and(|p| p.hover == HoverAt::Arrow),
+        "CONTROL: the pointer is on the held arrow"
+    );
+    assert!(
+        ring_layer(&held_key, &held_over, 7, &mut RingContents::default()).is_none(),
+        "a held move's \u{2191} asks nothing: no ring"
+    );
+    let (_, said) = slot_top(rest.refused_with(Some("press it again")), 158);
     assert_eq!(
-        slot(&said).trim_start(),
-        "couldn't update \u{b7} press it again",
+        slot_of(&said).as_deref(),
+        Some("couldn't update \u{b7} press it again"),
         "a refusal's words"
     );
-    let narrow = tailed_run(60 - 12, &tail);
-    let (_, t3) = compose(rest, narrow);
-    let t3_label: String = slot(&t3);
-    let (_, t3_over) = compose(hovered, narrow);
-    let cut = slot(&t3_over);
-    assert!(
-        cut.starts_with('\u{2026}') && cut.chars().count() == t3_label.chars().count(),
-        "cut with … to the label's {} cells: {cut:?}",
-        t3_label.chars().count()
-    );
-    let bare = tailed_run(46 - 12, &tail);
-    let (_, t4) = compose(rest, bare);
-    let (_, t4_over) = compose(hovered, bare);
+    let (_, t4) = slot_top(rest, 40);
+    let (_, t4_over) = slot_top(hovered, 40);
     assert!(
         t4.switch.as_ref().is_some_and(|s| s.label.is_none()),
         "T4: no label"
@@ -2757,6 +3297,464 @@ fn the_arrows_words_take_the_labels_slot() {
     assert_eq!(
         t4_over.cells, t4.cells,
         "CONTROL: no label, the hover writes nothing new"
+    );
+}
+
+/// A HELD ARROW'S WORDS AND A REFUSAL KEEP THEIR REASON: at every width from 158 columns down to
+/// the narrowest that lays a label, the slot under the pointer on a held ⬆️ and after a refused
+/// press says why the move cannot be asked for (in its fewest words where the label is narrow:
+/// `v2.1.310 · autopilot off`, `the harness is off`), whole, never cut; it moves nothing where
+/// a form fits the label's own cells, and grows only as far as a whole form needs (`alab v0.5`
+/// gives way to `autopilot off`). CONTROL: a rule too narrow for any form keeps its label.
+#[test]
+fn a_held_arrows_words_and_a_refusal_keep_their_reason() {
+    use aterm_agent::harness::upgrade::{Agent, Phase, Request};
+    use aterm_agent::harness::upgrade_drive::{AGENT_OFF, AUTOPILOT_OFF};
+    // A CLI whose press is the tab menu's Upgrade Now: a Claude Code press passes these asides.
+    let held = |aside: &str| {
+        let row = aterm_agent::harness::upgrade_drive::Row {
+            aside: aside.to_owned(),
+            wait: aside.to_owned(),
+            request: Request::None,
+            agent: Agent::Codex,
+            ..up_row("2.1.305", "2.1.310", Phase::Pending, "background")
+        };
+        SwitchPaint {
+            up: TopUp::of(&row),
+            ..arrow_paint(UpState::Ready)
+        }
+    };
+    let autopilot = held(AUTOPILOT_OFF);
+    let harness = held(AGENT_OFF);
+    assert_eq!(
+        (autopilot.up.state, harness.up.state),
+        (UpState::Held, UpState::Held)
+    );
+    let cases: [(&str, SwitchPaint, &[&str]); 5] = [
+        (
+            "the held hover",
+            SwitchPaint {
+                hover: HoverAt::Arrow,
+                ..autopilot
+            },
+            &["once autopilot is on", "autopilot off"],
+        ),
+        (
+            "the harness-off hover",
+            SwitchPaint {
+                hover: HoverAt::Arrow,
+                ..harness
+            },
+            &["once the harness is on", "harness off"],
+        ),
+        (
+            "a held press",
+            autopilot.refused_with(Some("autopilot is off")),
+            &["autopilot is off", "autopilot off"],
+        ),
+        (
+            "a press with the harness off",
+            harness.refused_with(Some("the harness is off")),
+            &["the harness is off", "harness off"],
+        ),
+        (
+            "a lane's refusal",
+            arrow_paint(UpState::Ready).refused_with(Some("its restart is already under way")),
+            &["its restart is already under way", "already under way"],
+        ),
+    ];
+    for (what, paint, reasons) in cases {
+        let mut laid = 0;
+        for w in (40..=158).rev() {
+            let at_rest = SwitchPaint {
+                hover: HoverAt::None,
+                refused: Inline::EMPTY,
+                ..paint
+            };
+            let (_, still) = slot_top(at_rest, w);
+            let Some(label) = slot_of(&still) else {
+                continue;
+            };
+            let (_, shown) = slot_top(paint, w);
+            let words = slot_of(&shown).expect("the slot");
+            if words == label {
+                // No form fits: the label stands, never cut.
+                assert!(
+                    reasons.iter().all(|r| label.len() < r.len()),
+                    "{what} at {w}: the label stood though {reasons:?} fit {label:?}"
+                );
+                continue;
+            }
+            laid += 1;
+            assert!(
+                reasons.iter().any(|r| words.ends_with(r)) && !words.contains('\u{2026}'),
+                "{what} at {w}: {words:?} says why, whole"
+            );
+            let moved = laid_at(&shown) != laid_at(&still);
+            assert_eq!(
+                moved,
+                words.chars().count() > label.chars().count(),
+                "{what} at {w}: {words:?} in place of {label:?} moves the switch only to fit"
+            );
+        }
+        assert!(laid > 90, "{what}: said at {laid} widths");
+    }
+    let at = |paint: SwitchPaint, w| slot_of(&slot_top(paint, w).1);
+    let hover = SwitchPaint {
+        hover: HoverAt::Arrow,
+        ..autopilot
+    };
+    assert_eq!(
+        at(hover, 76).as_deref(),
+        Some("v2.1.310 \u{b7} autopilot off"),
+        "76: the target and why, in the label's own cells"
+    );
+    assert_eq!(
+        at(autopilot.refused_with(Some("autopilot is off")), 76).as_deref(),
+        Some("autopilot is off"),
+        "76: a held press says why"
+    );
+    assert_eq!(
+        at(harness.refused_with(Some("the harness is off")), 76).as_deref(),
+        Some("the harness is off"),
+        "76: with the harness off"
+    );
+    let (_, rest50) = slot_top(autopilot, 50);
+    let (_, press50) = slot_top(autopilot.refused_with(Some("autopilot is off")), 50);
+    let short = format!(
+        "alab v{}",
+        aterm_phase::CliHarness::ClaudeCode.version_str()
+    );
+    assert_eq!(slot_of(&rest50).as_deref(), Some(short.as_str()), "50: T3");
+    assert_eq!(
+        slot_of(&press50).as_deref(),
+        Some("autopilot off"),
+        "50: grown to the fewest words"
+    );
+    assert_eq!(
+        laid_at(&rest50).0.start - laid_at(&press50).0.start,
+        "autopilot off".len() - short.len(),
+        "50: the switch moved only as far as the words need"
+    );
+}
+
+/// THE LABEL'S HOVER SAYS ONLY WHAT IT LEAVES OUT: under the pointer a Muse label shows its
+/// whole build in the label's own inks (`alab` in the brand's), in the first form that fits the
+/// label's own cells (`alab v0.5 (v1.4.13-R6996.1)` where `alab muse harness v0.5 (v1.4.13)`
+/// stood), so nothing moves; where no form fits, and for Claude Code (whose build is its
+/// numbers), the label stands.
+#[test]
+fn the_labels_hover_says_only_what_it_leaves_out() {
+    let tail = claude_tail();
+    let compose = |paint: SwitchPaint, w: usize| {
+        let key = key_for(
+            aterm_phase::Program::Claude,
+            tailed_run(w - 12, &tail),
+            Some(paint),
+            Some(CardPalette::Cruise),
+            blank(),
+            KeyFace::default(),
+        );
+        let mut top = ComposedTop::default();
+        compose_top(&key, &mut top, None, None, &tail);
+        top
+    };
+    let slot = |top: &ComposedTop| -> (String, Vec<RenderCell>) {
+        let (cols, _) = top
+            .switch
+            .as_ref()
+            .and_then(|s| s.label.clone())
+            .expect("a label");
+        let cells: Vec<RenderCell> = cols.map(|c| top.cells[c - top.col]).collect();
+        (cells.iter().map(|c| c.ch).collect(), cells)
+    };
+    let muse = SwitchPaint {
+        cli_ver: Inline::new("1.4.13-R6996.1"),
+        ..SwitchPaint::bare(HarnessSwitch::On, Some(aterm_phase::CliHarness::Muse))
+    };
+    let over = SwitchPaint {
+        hover: HoverAt::Label,
+        ..muse
+    };
+    let (rest, _) = slot(&compose(muse, 158));
+    let (shown, cells) = slot(&compose(over, 158));
+    let whole = format!(
+        "alab muse harness v{} (v1.4.13-R6996.1)",
+        aterm_phase::CliHarness::Muse.version_str()
+    );
+    assert_eq!(
+        rest.trim_start(),
+        whole.replace("-R6996.1", ""),
+        "at rest, the numbers"
+    );
+    assert_eq!(
+        shown.trim_start(),
+        format!(
+            "alab v{} (v1.4.13-R6996.1)",
+            aterm_phase::CliHarness::Muse.version_str()
+        ),
+        "the hover, the whole build in the label's own cells"
+    );
+    assert_eq!(
+        compose(over, 158).switch.map(|s| s.cols),
+        compose(muse, 158).switch.map(|s| s.cols),
+        "the switch stands where it stood"
+    );
+    assert!(
+        whole.len() > rest.len(),
+        "CONTROL: the widest form would move it"
+    );
+    let inks = FaceInks::of(
+        &over,
+        Some(CardPalette::Cruise),
+        blank(),
+        [0xd7, 0x77, 0x57],
+    );
+    let lead = cells.iter().position(|c| c.ch != ' ').expect("words");
+    assert!(
+        cells[lead..lead + 4]
+            .iter()
+            .all(|c| c.bold && c.fg == inks.brand),
+        "`alab` keeps the brand's ink"
+    );
+    let snug = (60..158)
+        .find(|&w| {
+            compose(muse, w)
+                .switch
+                .as_ref()
+                .is_some_and(|s| s.label.is_some())
+        })
+        .expect("a width that lays the label");
+    let (snug_rest, _) = slot(&compose(muse, snug));
+    let (snug_over, _) = slot(&compose(over, snug));
+    assert_eq!(snug_over, snug_rest, "no room: the label stands, never cut");
+    let full_version = format!("1.2.3-{}", "r".repeat(CLI_VERSION_MAX - "1.2.3-".len()));
+    assert_eq!(full_version.len(), CLI_VERSION_MAX);
+    let full = SwitchPaint {
+        hover: HoverAt::Label,
+        cli_ver: Inline::new(&full_version),
+        ..SwitchPaint::bare(HarnessSwitch::On, Some(aterm_phase::CliHarness::CodexAlab))
+    };
+    let (shown, _) = slot(&compose(full, 250));
+    assert_eq!(
+        shown.trim_start(),
+        format!(
+            "alab codex harness v{} (v{full_version})",
+            aterm_phase::CliHarness::CodexAlab.version_str()
+        )
+    );
+    let overflow = SlotWords(vec![vec![("x".repeat(LABEL_MAX + 1), LabelInk::Muted)]], 0);
+    assert!(overflow.cells(LABEL_MAX + 1, LABEL_MAX + 1).is_none());
+    assert_eq!(LabelFace::of_words(&overflow.0[0]).len, LABEL_MAX);
+
+    let claude = SwitchPaint {
+        hover: HoverAt::Label,
+        cli_ver: Inline::new("2.1.305"),
+        ..LIT
+    };
+    let at_rest = compose(
+        SwitchPaint {
+            hover: HoverAt::None,
+            ..claude
+        },
+        158,
+    );
+    assert_eq!(
+        compose(claude, 158).cells,
+        at_rest.cells,
+        "CONTROL: Claude Code's label says all of its build"
+    );
+    // A pane that lays the last tier (`alab v0.4`) leaves the build out: the hover says it, in
+    // the label's own cells.
+    let narrow = 55;
+    let rest = SwitchPaint {
+        hover: HoverAt::None,
+        ..claude
+    };
+    let (rest_words, _) = slot(&compose(rest, narrow));
+    assert_eq!(
+        rest_words.trim_start(),
+        format!(
+            "alab v{}",
+            aterm_phase::CliHarness::ClaudeCode.version_str()
+        ),
+        "the last tier at {narrow}"
+    );
+    let (over_words, _) = slot(&compose(claude, narrow));
+    assert_eq!(
+        over_words.trim_start(),
+        "v2.1.305",
+        "the hover names the build the tier leaves out"
+    );
+    assert_eq!(
+        compose(claude, narrow).switch.map(|s| s.cols),
+        compose(rest, narrow).switch.map(|s| s.cols),
+        "the switch stands where it stood"
+    );
+}
+
+/// A KEPT ARROW STAYS WITH THE PROGRAM IT WAS MINTED FOR: the row a host last sent before it
+/// stood down shows on its tab's rule, with the harness off, only while the foreground group in
+/// front when it was kept still is, only on a rule of the CLI its lane moves, and only while its
+/// target is still past the running build; a build under the same numbers that the running one
+/// is already past is never offered as an update. CONTROL: the same row kept and nothing moved
+/// shows the arrow a press moves once (Claude Code's), or the held arrow (Muse Code's).
+#[test]
+fn a_kept_arrow_stays_with_the_program_it_was_minted_for() {
+    use crate::autopilot::{HarnessSwitch, SwitchOff};
+    use aterm_agent::harness::upgrade::{Agent, Phase};
+    let off = HarnessSwitch::Off(SwitchOff::Master);
+    let kept = |timeline: &mut crate::session_timeline::SessionTimeline, row| {
+        timeline.set_upgrade(Some(row));
+        timeline.set_upgrade(None);
+    };
+    let paint = |timeline: &crate::session_timeline::SessionTimeline, program| {
+        SwitchPaint::of(
+            off,
+            HoverAt::None,
+            Some(program),
+            TopCli::from_timeline(timeline),
+        )
+        .up
+    };
+    let mut timeline = crate::session_timeline::SessionTimeline::default();
+    timeline.note_foreground_group(4242);
+    kept(
+        &mut timeline,
+        up_row("2.1.305", "2.1.310", Phase::Pending, "background"),
+    );
+    let shown = paint(&timeline, aterm_phase::Program::Claude);
+    assert_eq!(
+        (shown.state, shown.to.as_str(), shown.why),
+        (UpState::Ready, "2.1.310", ""),
+        "CONTROL: kept, and nothing moved: a press moves it once with the harness off"
+    );
+    assert_eq!(
+        paint(&timeline, aterm_phase::Program::Muse),
+        TopUp::default(),
+        "Claude Code's row on a Muse Code rule: none"
+    );
+    let cli = TopCli::from_timeline(&timeline);
+    let foreign = TopCli {
+        kept: TopUp {
+            agent: Agent::Muse,
+            ..cli.kept
+        },
+        ..cli
+    };
+    assert_ne!(
+        cli.term(),
+        foreign.term(),
+        "a changed lane repaints its arrow"
+    );
+    timeline.note_foreground_group(4343);
+    assert_eq!(
+        paint(&timeline, aterm_phase::Program::Claude),
+        TopUp::default(),
+        "another program in front: none"
+    );
+    timeline.note_foreground_group(4242);
+    assert_eq!(
+        paint(&timeline, aterm_phase::Program::Claude).state,
+        UpState::Ready,
+        "the program it was kept for back in front"
+    );
+    let mut muse = crate::session_timeline::SessionTimeline::default();
+    muse.note_foreground_group(77);
+    kept(
+        &mut muse,
+        aterm_agent::harness::upgrade_drive::Row {
+            agent: Agent::Muse,
+            ..up_row("1.4.10-R6427.1", "1.4.10-R6500.1", Phase::Pending, "")
+        },
+    );
+    assert_eq!(
+        paint(&muse, aterm_phase::Program::Muse).state,
+        UpState::Held,
+        "CONTROL: a later revision kept for Muse Code"
+    );
+    // The build that runs now, past the kept target under the same numbers.
+    muse.set_claude_footer(
+        77,
+        None,
+        Some(aterm_agent::harness::footer::FooterFacts {
+            version: Some("1.4.10-R6501.1".to_owned()),
+            ..aterm_agent::harness::footer::FooterFacts::default()
+        }),
+    );
+    assert_eq!(
+        TopCli::from_timeline(&muse).kept,
+        TopUp::default(),
+        "the running R6501.1 is past the kept R6500.1: no downgrade offered"
+    );
+}
+
+/// A LIVE ARROW STAYS WITH ITS OWN PROGRAM: the tab's live row shows only on a rule of the CLI
+/// its lane moves, and a row whose agent is not the foreground job (a Claude Code suspended under
+/// another) shows on no rule and names no build in the label. CONTROL: Claude Code's row, its
+/// agent in front, on Claude Code's rule.
+#[test]
+fn a_live_arrow_stays_with_its_own_program() {
+    use crate::autopilot::HarnessSwitch;
+    use aterm_agent::harness::upgrade::Phase;
+    use aterm_agent::harness::upgrade_drive::NOT_FOREGROUND;
+    let paint = |timeline: &crate::session_timeline::SessionTimeline, program| {
+        SwitchPaint::of(
+            HarnessSwitch::On,
+            HoverAt::None,
+            Some(program),
+            TopCli::from_timeline(timeline),
+        )
+    };
+    let mut timeline = crate::session_timeline::SessionTimeline::default();
+    timeline.note_foreground_group(4242);
+    let row = up_row("2.1.305", "2.1.310", Phase::Pending, "background");
+    timeline.set_upgrade(Some(row.clone()));
+    let shown = paint(&timeline, aterm_phase::Program::Claude);
+    assert_eq!(
+        (shown.up.state, shown.up.to.as_str(), shown.cli_ver.as_str()),
+        (UpState::Ready, "2.1.310", "2.1.305"),
+        "CONTROL: Claude Code's own row"
+    );
+    assert_eq!(
+        paint(&timeline, aterm_phase::Program::Muse).up,
+        TopUp::default(),
+        "Claude Code's row on a Muse Code rule: none"
+    );
+    timeline.set_upgrade(Some(aterm_agent::harness::upgrade_drive::Row {
+        aside: NOT_FOREGROUND.to_owned(),
+        wait: NOT_FOREGROUND.to_owned(),
+        ..row
+    }));
+    let behind = paint(&timeline, aterm_phase::Program::Claude);
+    assert_eq!(behind.up, TopUp::default(), "a program behind: no arrow");
+    assert_eq!(behind.cli_ver.as_str(), "", "nor its build in the label");
+}
+
+/// A SLOT NEVER SHOWS A CUT FORM: a form longer than a slot's cells can hold, or with a
+/// character not one cell wide, is passed over for the next, however much room the rule has.
+/// CONTROL: the short form after them shows, right-aligned in the label's cells.
+#[test]
+fn a_slot_never_shows_a_cut_form() {
+    let words = |text: String| vec![(text, LabelInk::Muted)];
+    let slot = SlotWords(
+        vec![
+            words("x".repeat(LABEL_MAX + 4)),
+            words("wide \u{4e2d}".to_owned()),
+            words("short".to_owned()),
+        ],
+        0,
+    );
+    assert_eq!(
+        slot.cells(10, 4 * LABEL_MAX).map(|c| c.text()).as_deref(),
+        Some("     short"),
+        "CONTROL: the short form"
+    );
+    assert!(
+        SlotWords(vec![words("x".repeat(LABEL_MAX + 4))], 0)
+            .cells(10, 4 * LABEL_MAX)
+            .is_none(),
+        "past the cells: none"
     );
 }
 
@@ -2941,5 +3939,532 @@ fn the_switch_draws_no_box() {
     assert!(
         boxed(&key, &top, &[&over]).is_err(),
         "NEGATIVE CONTROL: the ring laid over the switch"
+    );
+}
+
+/// THE PRESS NAMES WHAT IT ENDS: a Claude Code press's words say when its restart lands, read off
+/// the screen as the press's own lane reads it (at once, at a turn's end, once a draft is sent),
+/// and name the background shells the restart ends, which it does
+/// (`upgrade::RESTART_ENDS_BACKGROUND`, measured). NEGATIVE CONTROLS: where a restart left them
+/// running the words name none; with no shells they name none; another CLI's arrow, whose press
+/// is the tab menu's Upgrade Now, keeps the lane's words.
+#[test]
+fn the_press_names_what_it_ends() {
+    assert_eq!(ends_words("1 shell", true), " \u{b7} ends 1 shell");
+    assert_eq!(
+        ends_words("1 shell", false),
+        "",
+        "CONTROL: shells that live on"
+    );
+    assert_eq!(ends_words("", true), "", "CONTROL: no shells");
+    let pressed = |press: Option<&'static str>| TopUp {
+        press,
+        ..arrow_paint(UpState::Ready).up
+    };
+    let ends = if aterm_agent::harness::upgrade::RESTART_ENDS_BACKGROUND {
+        " \u{b7} ends 1 shell"
+    } else {
+        ""
+    };
+    for (seen, live, when) in [
+        (Some(""), None, "now"),
+        (Some("busy"), None, "at turn end"),
+        (
+            Some(""),
+            Some("draft"),
+            "once your draft is sent or cleared",
+        ),
+        (Some("busy"), Some(""), "now"),
+    ] {
+        assert_eq!(
+            up_said(&pressed(seen), "1 shell", live).as_deref(),
+            Some(format!("update to v2.1.310 \u{b7} {when}{ends}").as_str()),
+            "{seen:?} {live:?}: the live screen's reading wins"
+        );
+    }
+    assert_eq!(
+        up_said(&pressed(None), "1 shell", Some("")).as_deref(),
+        Some("update to v2.1.310 \u{b7} after 1 shell"),
+        "CONTROL: another CLI's arrow keeps the lane's words"
+    );
+    assert_eq!(
+        up_said(&arrow_paint(UpState::Asked).up, "1 shell", Some("")).as_deref(),
+        Some("updating to v2.1.310 \u{b7} after 1 shell"),
+        "CONTROL: a press under way says the lane's words"
+    );
+    let rule = "\u{2500}".repeat(20);
+    let idle = vec![rule.clone(), "\u{276f} ".to_string(), rule.clone()];
+    let turn = vec![
+        "\u{273b} Pondering\u{2026} (3s \u{b7} esc to interrupt)".to_string(),
+        rule.clone(),
+        "\u{276f} ".to_string(),
+        rule,
+    ];
+    assert_eq!(press_wait(&idle, false), "", "an idle screen: at once");
+    assert_eq!(press_wait(&turn, false), "busy", "a turn: at its end");
+    assert_eq!(press_wait(&turn, true), "draft", "a draft before a turn");
+    assert_eq!(
+        press_wait_of("background"),
+        "",
+        "a press passes background work"
+    );
+    assert_eq!(press_wait_of("not-idle:shell"), "");
+    assert_eq!(
+        press_wait_of(aterm_agent::harness::upgrade_drive::AGENT_OFF),
+        ""
+    );
+    assert_eq!(press_wait_of("not-idle:busy"), "busy", "CONTROL: a turn");
+    assert_eq!(press_wait_of("release:draft"), "draft", "CONTROL: a draft");
+}
+
+/// AN ARROW SAYS A TURN'S END ONLY FOR A TURN: the words of an arrow no press reads the screen
+/// for (a move asked for or under way, another CLI's arrow) name what the lane's wait is: the
+/// settle before it acts, the agent's agreement, a dialog, background work or an agent not yet
+/// idle, never a turn that is not running. CONTROL: a running turn's wait says its end.
+#[test]
+fn an_arrow_says_a_turns_end_only_for_a_turn() {
+    use aterm_agent::harness::upgrade::{Agent, Phase, Request};
+    for (agent, request) in [
+        (Agent::Claude, Request::Now),
+        (Agent::Codex, Request::None),
+        (Agent::Codex, Request::Now),
+    ] {
+        for (wait, when) in [
+            ("settling", "once its tab settles"),
+            ("awaiting-ready", "once it agrees to move"),
+            ("notice-shown", "once it is idle"),
+            ("status-stale:busy", "once it is idle"),
+            ("not-idle:waiting", "once its dialog is answered"),
+            ("not-idle:shell", "after background jobs"),
+            ("not-idle:busy", "at turn end"),
+            ("busy", "at turn end"),
+        ] {
+            let row = aterm_agent::harness::upgrade_drive::Row {
+                agent,
+                request: request.clone(),
+                ..up_row("2.1.305", "2.1.310", Phase::Pending, wait)
+            };
+            let up = TopUp::of(&row);
+            let verb = if request == Request::Now {
+                (UpState::Asked, "updating to")
+            } else {
+                (UpState::Ready, "update to")
+            };
+            assert_eq!(up.state, verb.0, "{agent:?} {request:?} {wait:?}");
+            assert_eq!(
+                up_said(&up, "", None).as_deref(),
+                Some(format!("{} v2.1.310 \u{b7} {when}", verb.1).as_str()),
+                "{agent:?} {request:?} {wait:?}"
+            );
+        }
+    }
+}
+
+/// A PRESS'S HOVER KEEPS ITS WAIT AND WHAT IT ENDS: with a draft in the composer, the slot under
+/// the pointer on a Claude Code ⬆️ says the press waits for it and what the restart ends, before
+/// the press and once it is under way. Where no form that says both fits the label's own cells
+/// (35 here, with a shell to end), the slot grows left into the rule's room for the most said that
+/// does: the whole sentence at 144 and 230 columns alike, the wait in its fewest words (`v2.1.310 ·
+/// after your draft · ends 1 shell`) at 95; at 80, where none fits, it keeps the wait and cuts
+/// what the restart ends (`v2.1.310 · after your draft`), never to the verb and the target. A
+/// slot takes a form that says all it must wherever one fits, before one that cuts it. NEGATIVE
+/// CONTROLS: another CLI's arrow, whose words carry no restart, keeps to the label's own cells
+/// (its wait in the fewest words, the switch where it stood); a slot with no form that must be
+/// said shows the first that fits the label's cells.
+#[test]
+fn a_press_keeps_its_wait_and_what_it_ends() {
+    let words = |text: &str| vec![(text.to_owned(), LabelInk::Muted)];
+    let slot = |whole| SlotWords(vec![words("says all it must"), words("cut")], whole);
+    assert_eq!(
+        slot(1).cells(8, 20).map(|c| c.text()).as_deref(),
+        Some("says all it must"),
+        "the room holds the form that says all"
+    );
+    assert_eq!(
+        slot(1).cells(8, 10).map(|c| c.text()).as_deref(),
+        Some("     cut"),
+        "CONTROL: no room for it, the form that cuts"
+    );
+    assert_eq!(
+        slot(0).cells(8, 20).map(|c| c.text()).as_deref(),
+        Some("     cut"),
+        "NEGATIVE CONTROL: nothing that must be said, the label's own cells"
+    );
+    let ends = if aterm_agent::harness::upgrade::RESTART_ENDS_BACKGROUND {
+        " \u{b7} ends 1 shell"
+    } else {
+        ""
+    };
+    let draft = "once your draft is sent or cleared";
+    let ready = SwitchPaint {
+        hover: HoverAt::Arrow,
+        press: Some("draft"),
+        up: TopUp {
+            press: Some(""),
+            ..arrow_paint(UpState::Ready).up
+        },
+        ..arrow_paint(UpState::Ready)
+    }
+    .with_jobs("1 shell");
+    let asked = SwitchPaint {
+        up: TopUp {
+            state: UpState::Asked,
+            wait: draft,
+            ..ready.up
+        },
+        ..ready
+    };
+    let said = format!("update to v2.1.310 \u{b7} {draft}{ends}");
+    let terse = format!("v2.1.310 \u{b7} after your draft{ends}");
+    assert_eq!(
+        up_said(&ready.up, "1 shell", ready.press),
+        Some(said.clone())
+    );
+    // The verb's form grows wherever the room holds it. With no shell to end the forms are
+    // shorter: a narrower rule shows the first of them its room holds, the terse one in the label.
+    let asked_said = format!("updating to v2.1.310 \u{b7} {draft}{ends}");
+    let first_held = |forms: [String; 3], w: usize| {
+        let room = room_at(w);
+        forms
+            .into_iter()
+            .find(|form| form.chars().count() <= room)
+            .unwrap_or_else(|| terse.clone())
+    };
+    let (ready_95, narrow, asked_95) = if ends.is_empty() {
+        (
+            first_held(
+                [
+                    said.clone(),
+                    format!("v2.1.310 \u{b7} {draft}"),
+                    terse.clone(),
+                ],
+                95,
+            ),
+            terse.clone(),
+            first_held(
+                [
+                    asked_said.clone(),
+                    format!("\u{2192} v2.1.310 \u{b7} {draft}"),
+                    format!("\u{2192} {terse}"),
+                ],
+                95,
+            ),
+        )
+    } else {
+        (
+            terse.clone(),
+            "v2.1.310 \u{b7} after your draft".to_owned(),
+            format!("\u{2192} {terse}"),
+        )
+    };
+    for (w, paint, want) in [
+        (230, ready, said.clone()),
+        (144, ready, said.clone()),
+        (95, ready, ready_95),
+        (80, ready, narrow),
+        (144, asked, asked_said),
+        (95, asked, asked_95),
+    ] {
+        let (_, over) = slot_top(paint, w);
+        assert_eq!(slot_of(&over).as_deref(), Some(want.as_str()), "{w}");
+    }
+    let (_, still) = slot_top(
+        SwitchPaint {
+            hover: HoverAt::None,
+            ..ready
+        },
+        144,
+    );
+    let (_, over) = slot_top(ready, 144);
+    assert_ne!(
+        laid_at(&over),
+        laid_at(&still),
+        "the switch and the tag move left for the grown slot"
+    );
+    let other = SwitchPaint {
+        press: None,
+        up: TopUp {
+            press: None,
+            wait: draft,
+            ..ready.up
+        },
+        ..ready
+    };
+    let (_, other_over) = slot_top(other, 144);
+    assert_eq!(
+        slot_of(&other_over).as_deref(),
+        Some("v2.1.310 \u{b7} after your draft"),
+        "NEGATIVE CONTROL: another CLI's arrow, in the label's own cells"
+    );
+    assert_eq!(
+        laid_at(&other_over),
+        laid_at(&still),
+        "NEGATIVE CONTROL: its switch and tag stand where they stood"
+    );
+}
+
+/// The cells the slot under the pointer may grow into on a [`slot_top`] rule of `w` columns:
+/// the longest refusal it shows whole, which a slot shows only in its room once the refusal with
+/// its lead (`couldn't update · …`) does not fit there. Rooms past 60 cells are not read.
+fn room_at(w: usize) -> usize {
+    let room = (1..=60)
+        .rev()
+        .find(|&n| {
+            let why = "x".repeat(n);
+            let (_, top) = slot_top(
+                arrow_paint(UpState::Ready).refused_with(Some(why.as_str())),
+                w,
+            );
+            slot_of(&top).as_deref() == Some(why.as_str())
+        })
+        .expect("a room");
+    assert!(room < 60, "{w}: a room past what is read");
+    room
+}
+
+/// A PRESS'S HOVER KEEPS ITS VERB WHERE THE RULE HAS ROOM: with no draft, the slot under the
+/// pointer on a Claude Code ⬆️ whose press lands now says the whole sentence (`update to v2.1.310
+/// · now · ends 1 shell`), grown left into the rule's room, wherever the room holds it (230 and
+/// 144 columns, and 95 or 80 where theirs does), before the form without the verb that fits the
+/// label's own cells (`v2.1.310 · now · ends 1 shell`), which shows only where growing cannot
+/// fit. Of a slot's forms that say all they must, each in turn is shown wherever it fits, the
+/// label's cells or the room. NEGATIVE CONTROLS: where the room cannot hold the verb's form, the
+/// shorter one takes the label's cells and nothing moves; a slot with no form that must be said
+/// shows the first that fits the label's cells though the room would hold a longer one; and
+/// another CLI's arrow, whose words carry no restart, keeps to the label's own cells without its
+/// verb, its switch and tag where they stood.
+#[test]
+fn a_press_keeps_its_verb_where_the_rule_has_room() {
+    let words = |text: &str| vec![(text.to_owned(), LabelInk::Muted)];
+    let slot = |whole| {
+        SlotWords(
+            vec![
+                words("the most said form"),
+                words("said form"),
+                words("cut"),
+            ],
+            whole,
+        )
+    };
+    assert_eq!(
+        slot(2).cells(10, 20).map(|c| c.text()).as_deref(),
+        Some("the most said form"),
+        "the room holds the most said form: it grows before the shorter one fits the label"
+    );
+    assert_eq!(
+        slot(2).cells(10, 15).map(|c| c.text()).as_deref(),
+        Some(" said form"),
+        "NEGATIVE CONTROL: no room for it, the shorter one in the label's cells"
+    );
+    assert_eq!(
+        slot(0).cells(10, 20).map(|c| c.text()).as_deref(),
+        Some(" said form"),
+        "NEGATIVE CONTROL: nothing that must be said, the label's own cells first"
+    );
+    let ends = if aterm_agent::harness::upgrade::RESTART_ENDS_BACKGROUND {
+        " \u{b7} ends 1 shell"
+    } else {
+        ""
+    };
+    let ready = SwitchPaint {
+        hover: HoverAt::Arrow,
+        press: Some(""),
+        up: TopUp {
+            press: Some(""),
+            ..arrow_paint(UpState::Ready).up
+        },
+        ..arrow_paint(UpState::Ready)
+    }
+    .with_jobs("1 shell");
+    let said = format!("update to v2.1.310 \u{b7} now{ends}");
+    let verbless = format!("v2.1.310 \u{b7} now{ends}");
+    assert_eq!(
+        up_said(&ready.up, "1 shell", ready.press),
+        Some(said.clone())
+    );
+    let still = |w| {
+        slot_top(
+            SwitchPaint {
+                hover: HoverAt::None,
+                ..ready
+            },
+            w,
+        )
+        .1
+    };
+    let mut grew = Vec::new();
+    for w in [230, 144, 95, 80] {
+        let label = slot_of(&still(w)).expect("the label").chars().count();
+        let room = if w > 100 { usize::MAX } else { room_at(w) };
+        assert!(
+            verbless.chars().count() <= label,
+            "{w}: the form without the verb fits the label's {label} cells"
+        );
+        let grows = said.chars().count() <= room;
+        let (_, over) = slot_top(ready, w);
+        let shown = slot_of(&over).expect("the slot");
+        assert_eq!(
+            shown,
+            if grows {
+                said.as_str()
+            } else {
+                verbless.as_str()
+            },
+            "{w}: a label of {label} cells, a room of {room}"
+        );
+        assert_eq!(
+            laid_at(&over) != laid_at(&still(w)),
+            shown.chars().count() > label,
+            "{w}: the switch and the tag move left only for a grown slot"
+        );
+        grew.push(grows);
+    }
+    assert_eq!(&grew[..2], [true, true], "230 and 144 hold the verb's form");
+    let other = SwitchPaint {
+        press: None,
+        up: TopUp {
+            press: None,
+            wait: "after background jobs",
+            ..ready.up
+        },
+        ..ready
+    }
+    .with_jobs("");
+    let (_, other_over) = slot_top(other, 144);
+    assert_eq!(
+        slot_of(&other_over).as_deref(),
+        Some("v2.1.310 \u{b7} after background jobs"),
+        "NEGATIVE CONTROL: another CLI's arrow, in the label's own cells"
+    );
+    assert_eq!(
+        laid_at(&other_over),
+        laid_at(&still(144)),
+        "NEGATIVE CONTROL: its switch and tag stand where they stood"
+    );
+}
+
+/// A PRESS'S WAIT SURVIVES A NARROW RULE: where no form that names the shells a Claude Code
+/// restart ends fits (80 columns, Claude's effort tag on the rule), the slot under the pointer
+/// still says what the press waits for, in its fewest words, before the verb and the target:
+/// `v2.1.310 · after your draft`, `· after its dialog`, `· after the hold`, and an asked move's
+/// `→ v2.1.310 · after your draft`, each in the label's own cells, so nothing moves. CONTROLS:
+/// at 95 the form that names the shells still wins; the verb and the target remain the form after
+/// it. NEGATIVE CONTROLS: with no shell to end there is no second form in the fewest words (the
+/// one there is says the wait alone already); another CLI's arrow, whose words carry no restart,
+/// gets none either.
+#[test]
+fn a_press_keeps_its_wait_on_a_narrow_rule() {
+    let ends = if aterm_agent::harness::upgrade::RESTART_ENDS_BACKGROUND {
+        " \u{b7} ends 1 shell"
+    } else {
+        ""
+    };
+    let pressed = |wait: &'static str| {
+        SwitchPaint {
+            hover: HoverAt::Arrow,
+            press: Some(wait),
+            up: TopUp {
+                press: Some(""),
+                ..arrow_paint(UpState::Ready).up
+            },
+            ..arrow_paint(UpState::Ready)
+        }
+        .with_jobs("1 shell")
+    };
+    let texts = |paint: &SwitchPaint| -> Vec<String> {
+        up_forms(&paint.up, paint.jobs.as_str(), paint.press)
+            .expect("forms")
+            .0
+            .iter()
+            .map(|form| form.iter().map(|(t, _)| t.as_str()).collect())
+            .collect()
+    };
+    let still = SwitchPaint {
+        hover: HoverAt::None,
+        ..pressed("draft")
+    };
+    let (_, rest) = slot_top(still, 80);
+    let label = slot_of(&rest).expect("the label").chars().count();
+    for (wait, terse) in [
+        ("draft", "after your draft"),
+        ("box", "after its dialog"),
+        ("held", "after the hold"),
+    ] {
+        let paint = pressed(wait);
+        let bare = format!("v2.1.310 \u{b7} {terse}");
+        let forms = texts(&paint);
+        let at = forms
+            .iter()
+            .position(|f| *f == bare)
+            .expect("the wait alone");
+        assert_eq!(
+            forms.get(at + 1).map(String::as_str),
+            Some("update to v2.1.310"),
+            "{wait}: the verb and the target after it"
+        );
+        let (_, over) = slot_top(paint, 80);
+        let shown = slot_of(&over).expect("the slot");
+        assert!(
+            shown.starts_with(&bare),
+            "{wait} at 80: the wait survives, {shown:?}"
+        );
+        if wait == "draft" {
+            assert_eq!(shown, bare, "{wait} at 80: the wait alone");
+            assert!(
+                bare.chars().count() <= label,
+                "{wait}: in the label's own cells"
+            );
+            assert_eq!(
+                laid_at(&over),
+                laid_at(&rest),
+                "{wait}: its switch and tag stand where they stood"
+            );
+        }
+        let (_, wider) = slot_top(paint, 95);
+        let wider = slot_of(&wider).expect("the slot");
+        assert!(
+            ends.is_empty() || wider.ends_with(ends),
+            "CONTROL: {wait} at 95, the shells named: {wider:?}"
+        );
+    }
+    let asked = SwitchPaint {
+        up: TopUp {
+            state: UpState::Asked,
+            wait: "once your draft is sent or cleared",
+            ..pressed("draft").up
+        },
+        ..pressed("draft")
+    };
+    let (_, asked_over) = slot_top(asked, 80);
+    assert_eq!(
+        slot_of(&asked_over).as_deref(),
+        Some("\u{2192} v2.1.310 \u{b7} after your draft"),
+        "an asked move at 80"
+    );
+    let quiet = pressed("draft").with_jobs("");
+    assert_eq!(
+        texts(&quiet)
+            .iter()
+            .filter(|f| f.contains("after your draft"))
+            .count(),
+        1,
+        "NEGATIVE CONTROL: no shell to end, one form in the fewest words"
+    );
+    let other = SwitchPaint {
+        press: None,
+        up: TopUp {
+            press: None,
+            wait: "once your draft is sent or cleared",
+            ..pressed("draft").up
+        },
+        ..pressed("draft")
+    };
+    assert_eq!(
+        texts(&other)
+            .iter()
+            .filter(|f| f.contains("after your draft"))
+            .count(),
+        1,
+        "NEGATIVE CONTROL: another CLI's arrow, one form in the fewest words"
     );
 }

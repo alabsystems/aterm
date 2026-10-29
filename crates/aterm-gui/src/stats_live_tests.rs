@@ -1513,10 +1513,10 @@ fn fit_deck(app: &mut crate::App, wid: crate::WindowId) {
     );
 }
 
-/// A reading adopted at `at` whose CPU and GPU stand at `share` of their capacity: the needle
-/// retargeted to it.
+/// A reading adopted at `at` whose CPU and GPU stand at `share` of their capacity, the needle
+/// retargeted to it: the frames its episode owes the windows.
 #[cfg(unix)]
-fn busier(app: &mut crate::App, share: f64, at: Instant) -> crate::stats_needle::Needle {
+fn adopt(app: &mut crate::App, share: f64, at: Instant) -> u64 {
     let mut snap = (**app.vitals.snapshot.as_ref().expect("a reading")).clone();
     snap.seq += 1;
     for res in [aterm_vitals::Resource::Cpu, aterm_vitals::Resource::Gpu] {
@@ -1525,8 +1525,114 @@ fn busier(app: &mut crate::App, share: f64, at: Instant) -> crate::stats_needle:
     }
     app.vitals.snapshot = Some(std::sync::Arc::new(snap));
     app.vitals.landed_at = Some(at);
-    app.retarget_needle(at);
+    app.retarget_needle(at)
+}
+
+/// [`adopt`]'s needle.
+#[cfg(unix)]
+fn busier(app: &mut crate::App, share: f64, at: Instant) -> crate::stats_needle::Needle {
+    adopt(app, share, at);
     app.vitals.needle.get().expect("the reading's needle")
+}
+
+/// Follows the loop's needle deadlines from `from` while they come before `until`, drawing each
+/// of `wids` at each as the splice does: the deadlines it took.
+#[cfg(unix)]
+fn needle_deadlines(
+    app: &crate::App,
+    wids: &[crate::WindowId],
+    from: Instant,
+    until: Instant,
+) -> u64 {
+    for &wid in wids {
+        draw_needle_at(app, wid, from);
+    }
+    let (mut at, mut fired) = (from, 0);
+    while let Some(next) = app.stats_needle_deadline(at).filter(|&next| next < until) {
+        at = next;
+        for &wid in wids {
+            draw_needle_at(app, wid, at);
+        }
+        fired += 1;
+        assert!(fired <= 1_000, "{fired} deadlines and counting");
+    }
+    fired
+}
+
+/// `live_app` with the deck laid out wide in `wids` (window 0 and any it adds), each focused.
+#[cfg(unix)]
+fn needle_app(t0: Instant, wids: &[crate::WindowId]) -> crate::App {
+    let (mut app, _) = live_app(t0);
+    app.vitals.landed_period = Some(Duration::from_secs(3600));
+    for &wid in wids {
+        if !app.windows.contains_key(&wid) {
+            app.install_window_state(wid, crate::stub_session(90 + wid.0), 24, 80);
+        }
+        let ws = app.windows.get_mut(&wid).expect("the window");
+        ws.cols = 160;
+        ws.focused = true;
+        fit_deck(&mut app, wid);
+        let _ = app.stats_deck_fp(wid);
+    }
+    app
+}
+
+/// A reading's episode owes its window exactly the needle deadlines the loop then fires for it
+/// (`needle_frames_owed`, by which the `measure` spin row bounds the `stats_needle` owner):
+/// following the loop's own deadlines from the reading to rest, drawing each frame as the splice
+/// does, fires that many, and so does a reading that lands mid-sweep, walked from what the window
+/// drew. Two windows that draw the dial are owed a window's frames each, and the loop fires
+/// no more than both. The first reading, the same reading again and a reading no window animates
+/// owe none.
+#[cfg(unix)]
+#[test]
+fn a_readings_owed_frames_are_the_needle_deadlines_its_windows_fire() {
+    let _attached = crate::stats_deck::tests::attach_stats();
+    let one = [crate::WindowId(0)];
+    let t0 = Instant::now();
+    let far = t0 + Duration::from_secs(3600);
+    let mut app = needle_app(t0, &one);
+    assert_eq!(app.retarget_needle(t0), 0, "the first reading rests");
+    let t1 = t0 + Duration::from_secs(1);
+    let owed = adopt(&mut app, 0.95, t1);
+    assert!(owed > 0, "CONTROL: a swing owes frames");
+    assert_eq!(needle_deadlines(&app, &one, t1, far), owed, "owed as fired");
+    let t2 = t1 + Duration::from_secs(1);
+    let back = adopt(&mut app, 0.10, t2);
+    let mid = t2 + Duration::from_millis(150);
+    let drawn = needle_deadlines(&app, &one, t2, mid);
+    assert!(
+        drawn > 0 && drawn < back,
+        "CONTROL: {drawn} of {back} drawn before the next reading"
+    );
+    let again = adopt(&mut app, 0.95, mid);
+    assert!(again > 0, "CONTROL: it sweeps on from mid-sweep");
+    assert_eq!(
+        needle_deadlines(&app, &one, mid, far),
+        again,
+        "owed as fired, mid-sweep"
+    );
+    let t3 = mid + Duration::from_secs(1);
+    assert_eq!(adopt(&mut app, 0.95, t3), 0, "the same reading again");
+    app.config.motion = Some("reduced".into());
+    assert_eq!(
+        adopt(&mut app, 0.10, t3 + Duration::from_secs(1)),
+        0,
+        "no window animates the dial"
+    );
+    let two = [crate::WindowId(0), crate::WindowId(1)];
+    let mut both = needle_app(t0, &two);
+    assert_eq!(both.retarget_needle(t0), 0);
+    assert_eq!(
+        adopt(&mut both, 0.95, t1),
+        2 * owed,
+        "a window's frames each"
+    );
+    let fired = needle_deadlines(&both, &two, t1, far);
+    assert!(
+        (owed..=2 * owed).contains(&fired),
+        "{fired} deadlines for two windows owed {owed} each"
+    );
 }
 
 /// One needle for the app, retargeted where a reading is adopted: the first reading rests it on

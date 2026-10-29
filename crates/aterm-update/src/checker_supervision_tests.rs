@@ -929,10 +929,10 @@ fn a_stamp_just_past_the_readers_clock_is_progress_and_a_wrong_clock_is_not() {
         !crate::checker_holder_progressing(&path, fresh),
         "a stamp older than fresh is none"
     );
-    stamp(now() + Duration::from_secs(1));
+    stamp(now() + Duration::from_secs(60));
     assert!(
-        !crate::checker_holder_progressing(&path, fresh),
-        "a clock stepped back a second defers nothing"
+        !crate::checker_holder_progressing(&path, Duration::from_secs(120)),
+        "a clock stepped back a minute, inside fresh, defers nothing"
     );
     let _ = std::fs::remove_dir_all(&staging.root);
 }

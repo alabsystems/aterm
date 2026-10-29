@@ -1110,6 +1110,140 @@ fn above_the_floor_or_switched_off_an_ended_sessions_build_is_any_other() {
 }
 
 #[test]
+fn a_registered_cache_is_visible_after_the_broad_search_has_spent_its_budget() {
+    let tmp = Tmp::new("registered-holder");
+    let home = canon(&mkdirs(&tmp.path().join("home")));
+    let workspace = mkdirs(&home.join("codex"));
+    std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let parent = mkdirs(&home.join(".ubd"));
+    let cache = parent.join("codex-build.noindex");
+    assert!(atpkg::build_cache::registered::create_checked(&home, &cache, &workspace).unwrap());
+    lay_target(&cache);
+    let discovered = discover(
+        &Roots {
+            home: Some(home.clone()),
+            ..Roots::default()
+        },
+        Budget {
+            found: 0,
+            ..Budget::SHIPPED
+        },
+    );
+    assert!(discovered.found.is_empty());
+    let mut roots = SurveyRoots {
+        home: Some(home),
+        found: discovered.found,
+        found_notes: discovered.notes,
+        ..SurveyRoots::default()
+    };
+    let now = now_after_write(0);
+    let measure =
+        |roots: &SurveyRoots| scan(roots, now, Trigger::OnDemand, Config::default(), None);
+    let survey = measure(&roots);
+    assert!(
+        survey.targets.is_empty(),
+        "observations add no removal targets"
+    );
+    let report = report(&survey, Config::default());
+    assert!(
+        report.rows.is_empty(),
+        "observations add no removal witnesses"
+    );
+    assert_eq!(report.hogs.len(), 1);
+    let holder = &report.hogs[0];
+    assert_eq!(holder.path, cache);
+    assert_eq!(holder.serves.as_deref(), Some(workspace.as_path()));
+    assert_eq!(
+        (holder.bytes, holder.bytes_partial),
+        crate::harness::disk::target::total_bytes(&cache)
+    );
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains(cache.to_str().unwrap()))
+    );
+
+    // An independently discovered target and its receipt must not count the bytes twice.
+    roots.targets.push(cache.clone());
+    let same = crate::harness::disk::report(&measure(&roots), Config::default());
+    assert_eq!(same.hogs.len(), 1);
+    assert_eq!(same.hogs[0].bytes, holder.bytes);
+    roots.targets.clear();
+
+    // scan_target supplies profile facts without a total. Such an ancestor covers no bytes.
+    let mut incomplete = Survey::new(now);
+    incomplete.home = roots.home.clone();
+    let ancestor = crate::harness::disk::scan_target(&parent, now, 1, false).unwrap();
+    assert_eq!(ancestor.total, None);
+    incomplete.targets.push(ancestor);
+    crate::harness::disk::observe_registered_holders(&mut incomplete);
+    let visible = crate::harness::disk::report(&incomplete, Config::default());
+    assert_eq!(visible.hogs.len(), 1);
+    assert_eq!(visible.hogs[0].path, cache);
+    assert_eq!(visible.hogs[0].bytes, holder.bytes);
+    assert!(
+        visible
+            .notes
+            .iter()
+            .any(|note| note.contains(cache.to_str().unwrap()))
+    );
+
+    // A partial parent and its measured child share one bound, not two overlapping totals.
+    incomplete.targets[0].total = Some((0, true));
+    incomplete.registered_holders.clear();
+    crate::harness::disk::observe_registered_holders(&mut incomplete);
+    let partial = crate::harness::disk::report(&incomplete, Config::default());
+    assert_eq!(partial.hogs.len(), 1);
+    assert_eq!(partial.hogs[0].path, parent);
+    assert_eq!(partial.hogs[0].bytes, holder.bytes);
+    assert!(partial.hogs[0].bytes_partial);
+    assert!(
+        partial
+            .notes
+            .iter()
+            .any(|note| note.contains(cache.to_str().unwrap()))
+    );
+
+    // The cache may already have a complete target measurement of its own. Its partial
+    // ancestor must not discard that measurement when the receipt avoids a second walk.
+    let mut child = crate::harness::disk::scan_target(&cache, now, 1, false).unwrap();
+    child.total = Some((holder.bytes, false));
+    incomplete.targets.push(child);
+    incomplete.registered_holders.clear();
+    crate::harness::disk::observe_registered_holders(&mut incomplete);
+    assert!(incomplete.registered_holders.is_empty());
+    let nested = crate::harness::disk::report(&incomplete, Config::default());
+    assert_eq!(nested.hogs.len(), 1);
+    assert_eq!(nested.hogs[0].path, parent);
+    assert_eq!(nested.hogs[0].bytes, holder.bytes);
+    assert!(nested.hogs[0].bytes_partial);
+
+    // Physical overlap is resolved before bootstrap rows share their display path.
+    for target in &mut incomplete.targets {
+        target.origin = Origin::Bootstrap {
+            repo: workspace.clone(),
+            slim: false,
+        };
+    }
+    let bootstrap = crate::harness::disk::report(&incomplete, Config::default());
+    assert_eq!(bootstrap.hogs.len(), 1);
+    assert_eq!(bootstrap.hogs[0].path, workspace.join("build"));
+    assert_eq!(bootstrap.hogs[0].bytes, holder.bytes);
+
+    // A replacement with Cargo's usual marks cannot borrow the original creation receipt.
+    std::fs::rename(&cache, parent.join("kept-original.noindex")).unwrap();
+    lay_target(&cache);
+    let replacement = measure(&roots);
+    assert!(replacement.registered_holders.is_empty());
+    assert!(
+        crate::harness::disk::report(&replacement, Config::default())
+            .hogs
+            .is_empty()
+    );
+}
+
+#[test]
 fn the_largest_hogs_are_what_no_row_frees_biggest_first() {
     let home = PathBuf::from("/h");
     let td = |path: &str, origin: Origin, gib: u64| TargetDir {

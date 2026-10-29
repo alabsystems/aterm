@@ -9,13 +9,22 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+#[path = "lazy_init_calls.rs"]
+mod calls;
+use calls::{CallScope, known_free_exports};
+
 /// This walker's limits, printed after every red verdict.
 pub const LAZY_INIT_PRECISION_NOTE: &str =
     "    PRECISION / SCOPE (the honest limits of this census):
       - LEXICAL, name-based: cells are found at their `static NAME: <Lazy…>`
         declarations, blocking touches by the receiver identifier before a
         blocking method (or any mention, for a deref-lazy cell), and calls as
-        `<ident>(` over rustfmt-segmented fn bodies. No type, trait or borrow
+        `<ident>(` over rustfmt-segmented fn bodies. A two-segment dependency
+        call selects its crate only when Cargo's alias, an unshadowed source
+        name and an ordinary public free export are proved in source without
+        blocking lazy surfaces; all other calls keep the conservative by-name
+        walk. A differently named borrowed cell is not proved independent.
+        No type, trait or borrow
         information exists here. Two cells sharing an identifier are ONE node.
       - REACH IS DELIBERATELY SHALLOW, and this is the load-bearing precision
         decision. A name-merged call graph's transitive closure over an
@@ -129,7 +138,18 @@ struct Edge {
 pub fn run_lazy_init_census(root: &Path) -> CensusOutcome {
     let files = scan_files(root);
     let sources = read_sources(root, &files);
-    let derived = derive_from_sources(&sources);
+    let scopes: DependencyScopes = sources
+        .iter()
+        .filter_map(|(file, _)| source_crate(file))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|dir| {
+            crate::scan_set::member_dependency_aliases(root, dir)
+                .ok()
+                .map(|aliases| (dir.to_owned(), aliases))
+        })
+        .collect();
+    let derived = derive_with_scopes(&sources, &scopes);
     report(&root.display().to_string(), sources.len(), &derived)
 }
 
@@ -332,17 +352,36 @@ fn read_sources(root: &Path, files: &[PathBuf]) -> Vec<(String, String)> {
 }
 
 /// The derivation proper, over `(repo-relative path, raw text)` pairs.
+#[cfg(test)]
 fn derive_from_sources(raw_sources: &[(String, String)]) -> Derived {
+    derive_with_scopes(raw_sources, &DependencyScopes::new())
+}
+
+type DependencyScopes = BTreeMap<String, BTreeMap<String, BTreeSet<String>>>;
+
+fn source_crate(file: &str) -> Option<&str> {
+    file.split_once("/src/")
+        .map(|(dir, _)| dir)
+        .filter(|dir| dir.starts_with("crates/"))
+}
+
+fn owned_fn(dir: &str, name: &str) -> String {
+    format!("{dir}::{name}")
+}
+
+fn derive_with_scopes(raw_sources: &[(String, String)], scopes: &DependencyScopes) -> Derived {
     let sources: Vec<(String, String)> = raw_sources
         .iter()
         .map(|(rel, raw)| (rel.clone(), crate::lock_order::mask_cfg_test_items(raw)))
         .collect();
     let sources = &sources[..];
+    let exports = known_free_exports(sources);
     let mut cells: Vec<Cell> = Vec::new();
     let mut defs: BTreeMap<String, usize> = BTreeMap::new();
     let mut local: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
 
     for (rel, text) in sources {
+        let calls = CallScope::new(rel, text, scopes, &exports);
         let lines: Vec<&str> = text.lines().collect();
         let enclosing = enclosing_fns(&lines);
         let per_file = local.entry(rel.clone()).or_default();
@@ -353,12 +392,22 @@ fn derive_from_sources(raw_sources: &[(String, String)]) -> Derived {
             };
             if seen_here.insert(owner.clone()) {
                 *defs.entry(owner.clone()).or_default() += 1;
+                if let Some(dir) = source_crate(rel) {
+                    *defs.entry(owned_fn(dir, owner)).or_default() += 1;
+                }
             }
             let code = crate::strip_line_comment(line).to_string();
+            let targets = calls.callees(std::slice::from_ref(&code));
             per_file
                 .entry(owner.clone())
                 .or_default()
-                .extend(crate::callee_names(std::slice::from_ref(&code)));
+                .extend(targets.iter().cloned());
+            if let Some(dir) = source_crate(rel) {
+                per_file
+                    .entry(owned_fn(dir, owner))
+                    .or_default()
+                    .extend(targets);
+            }
         }
         collect_cells(text, rel, &mut cells);
     }
@@ -366,7 +415,8 @@ fn derive_from_sources(raw_sources: &[(String, String)]) -> Derived {
     let mut touches: Vec<Touch> = Vec::new();
     let mut inits: Vec<Initializer> = Vec::new();
     for (rel, text) in sources {
-        collect_touches_and_inits(text, rel, &cells, &mut touches, &mut inits);
+        let calls = CallScope::new(rel, text, scopes, &exports);
+        collect_touches_and_inits(text, rel, &cells, &mut touches, &mut inits, &calls);
     }
 
     let mut triggers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -380,6 +430,20 @@ fn derive_from_sources(raw_sources: &[(String, String)]) -> Derived {
         trigger_spans
             .entry((t.cell.clone(), f.clone()))
             .or_insert_with(|| format!("{} ({})", t.span, t.how));
+        if let Some(dir) = t
+            .span
+            .rsplit_once(':')
+            .and_then(|(file, _)| source_crate(file))
+        {
+            let owned = owned_fn(dir, f);
+            triggers
+                .entry(t.cell.clone())
+                .or_default()
+                .insert(owned.clone());
+            trigger_spans
+                .entry((t.cell.clone(), owned))
+                .or_insert_with(|| format!("{} ({})", t.span, t.how));
+        }
     }
 
     Derived {
@@ -540,6 +604,7 @@ fn collect_touches_and_inits(
     cells: &[Cell],
     touches: &mut Vec<Touch>,
     inits: &mut Vec<Initializer>,
+    calls: &CallScope<'_>,
 ) {
     let lines: Vec<&str> = text.lines().collect();
     let masked: Vec<String> = lines
@@ -576,7 +641,7 @@ fn collect_touches_and_inits(
                 cell: cell.name.clone(),
                 span: format!("{rel}:{}", ln + 1),
                 file: rel.to_string(),
-                callees: initializer_callees(&body),
+                callees: initializer_callees(&body, calls),
                 direct_touches: direct_touches(&body, cells),
             });
         }
@@ -608,7 +673,7 @@ fn collect_touches_and_inits(
                         cell: cell.name.clone(),
                         span: format!("{rel}:{}", i + 1),
                         file: rel.to_string(),
-                        callees: initializer_callees(&body),
+                        callees: initializer_callees(&body, calls),
                         direct_touches: direct_touches(&body, cells),
                     });
                 }
@@ -807,23 +872,20 @@ fn balanced(joined: &str, at: usize) -> Vec<String> {
 }
 
 /// Every `<ident>(` in the initializer.
-fn initializer_callees(body: &[String]) -> BTreeSet<String> {
-    let mut out = crate::callee_names(body);
+fn initializer_callees(body: &[String], calls: &CallScope<'_>) -> BTreeSet<String> {
+    let mut out = calls.callees(body);
     let joined = body.join(" ");
     let inner = joined
         .trim()
         .trim_start_matches('(')
         .trim_end_matches(')')
         .trim();
-    if !inner.contains('|') && !inner.contains('(') && !inner.is_empty() {
-        let last = inner.rsplit("::").next().unwrap_or(inner);
-        let ident: String = last
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
-        if !ident.is_empty() {
-            out.insert(ident);
-        }
+    if !inner.contains('|')
+        && !inner.contains('(')
+        && !inner.is_empty()
+        && let Some(target) = calls.reference(inner)
+    {
+        out.insert(target);
     }
     out
 }

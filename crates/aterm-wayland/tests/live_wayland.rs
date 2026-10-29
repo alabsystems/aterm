@@ -123,8 +123,8 @@ fn a_buffer_reaches_a_surface_and_a_refusal_is_seen() {
 }
 
 #[test]
-fn every_icon_has_a_themed_frame() {
-    use aterm_wayland::cursor::{Icon, Theme};
+fn a_theme_hands_out_its_default_frame() {
+    use aterm_wayland::cursor::Theme;
     let Some(display) = connect() else {
         return;
     };
@@ -140,37 +140,16 @@ fn every_icon_has_a_themed_frame() {
         .unwrap();
     // SAFETY: the wl_shm just bound outlives the theme (dropped first).
     let theme = unsafe { Theme::load(None, 24, shm) }.expect("a theme or the built-in cursors");
-    let mut found = Vec::new();
-    for icon in Icon::ALL {
-        if let Some(frame) = theme.frame(icon) {
-            assert!(frame.width > 0 && frame.height > 0, "{icon:?}");
-            assert!(frame.hotspot_x <= frame.width && frame.hotspot_y <= frame.height);
-            found.push(icon);
-        }
-    }
-    assert!(found.contains(&Icon::Default), "{found:?}");
-    eprintln!("themed icons: {found:?}");
+    let frame = theme
+        .frame_named(&[c"default", c"left_ptr"])
+        .expect("a default cursor");
+    assert!(frame.width > 0 && frame.height > 0);
+    assert!(frame.hotspot_x <= frame.width && frame.hotspot_y <= frame.height);
     queue.roundtrip().unwrap();
     assert_eq!(unsafe { display.display() }.error(), None);
     drop(theme);
     // SAFETY: the bound wl_shm, destroyed once, after the theme.
     unsafe { shm.destroy() };
-}
-
-#[test]
-fn every_icon_has_a_shape() {
-    use aterm_wayland::cursor::Icon;
-    use aterm_wayland::protocols::cursor_shape_v1::wp_cursor_shape_device_v1 as device;
-    let shapes: Vec<u32> = Icon::ALL.iter().map(|i| i.shape()).collect();
-    let mut unique = shapes.clone();
-    unique.sort_unstable();
-    unique.dedup();
-    assert_eq!(unique.len(), Icon::ALL.len(), "six distinct shapes");
-    assert!(
-        shapes
-            .iter()
-            .all(|s| (device::shape::DEFAULT..=device::shape::ZOOM_OUT).contains(s))
-    );
 }
 
 #[test]

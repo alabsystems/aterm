@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use aterm_agent::harness::acts::{HoldLeg, LandHeld, OpenWord, TaskFace};
 
-use super::{HeldGlass, HoldForm, hold_words, on_land_held};
+use super::{HeldGlass, HoldForm, ShownHold, hold_words, on_land_held};
 use crate::claude_lights::{ChipGlass, Clock, Stamp};
 use crate::harness_glass::PauseGlass;
 use crate::harness_screen::HarnessSessionRow;
@@ -343,7 +343,7 @@ fn row(
         today: TODAY,
         setting: "follows the default".to_string(),
         need,
-        hold,
+        hold: hold.map(|hold| ShownHold { hold, by: None }),
     }
 }
 
@@ -437,17 +437,20 @@ fn state_line_says_why_land_holds() {
 /// every leg, each count and nudges, so the state line is as tall as a hold
 /// makes it (the narrow sweeps read it at 22 to 42 columns, 1× and 2×).
 pub(crate) fn held_session(session: &mut crate::harness_screen::HarnessSession) {
-    session.hold = Some(glass(
-        LandHeld {
-            legs: every_leg(),
-            changed: 3,
-            untracked: 1,
-            stashes: 1,
-            unlanded: 4,
-            ..held()
-        },
-        0,
-    ));
+    session.hold = Some(ShownHold {
+        hold: glass(
+            LandHeld {
+                legs: every_leg(),
+                changed: 3,
+                untracked: 1,
+                stashes: 1,
+                unlanded: 4,
+                ..held()
+            },
+            0,
+        ),
+        by: None,
+    });
 }
 
 struct TestHost(crate::harness_host::HostHandle);
@@ -1219,4 +1222,552 @@ fn an_outage_wait_is_said_on_the_state_line_and_in_status_alone() {
     app.harness_screen_moved();
     let released = stop_surfaces(&mut app, AutopilotView::Cruise);
     assert!(!released[2].contains("waiting:"), "{}", released[2]);
+}
+
+/// Session 0 as a codex-alab tab under `word`, no claim standing yet: codex in front, its reader
+/// naming no state, as [`desk`] stands a Claude tab up but with no claim of aterm's.
+fn codex_desk(word: &str) -> (App, String, TestHost) {
+    let mut app = App::headless_for_test();
+    let host = TestHost(crate::harness_host::HostHandle::for_supervised_test(
+        Vec::new(),
+        Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
+    ));
+    app.harness = Some(host.0.clone());
+    let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+    {
+        let mut tl = ctx.timeline.lock().expect("timeline");
+        tl.note_foreground_group(7);
+        tl.set_program(7, Some("codex".into()));
+        tl.publish_agent(
+            "unknown",
+            None,
+            None,
+            Some(aterm_phase::Program::Codex),
+            crate::session_timeline::AgentStamp {
+                generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                fp: 1,
+            },
+        );
+    }
+    ctx.meta
+        .lock()
+        .expect("meta")
+        .set("autopilot", Some(word.into()));
+    let id = app.next_session_id;
+    app.push_stub_tab(WindowId(0), crate::stub_session(id));
+    (app, ctx.self_id.as_str().to_string(), host)
+}
+
+/// `meta <rest>` on session 0 through the real dispatch, from connection `conn` of the process
+/// [`crate::self_claim::stand_in`] proves, the window woken as its wakes say.
+fn self_meta(app: &mut App, rest: &str, conn: u64) -> String {
+    let session = app.pool.get(0).expect("session 0");
+    let (term, ctx) = (session.term.clone(), session.ctx.clone());
+    let (reply, wakes) = crate::control::meta_wakes_proving_for_test(
+        &app.store,
+        &term,
+        0,
+        &ctx,
+        rest,
+        Some(conn),
+        &|_| Some(crate::self_claim::stand_in::running()),
+    );
+    if wakes
+        .iter()
+        .any(|wake| matches!(wake, crate::Wake::MetaChanged { .. }))
+    {
+        app.on_meta_changed(0);
+    }
+    reply
+}
+
+/// Where session 0's stop is said of a tab without a chip: `status held=`, its Overview line's
+/// driver, the tab's hover, the Settings page's state line and the worker row's tip.
+fn codex_stop_surfaces(app: &mut App, sid: &str) -> [String; 5] {
+    let overview = app
+        .overview_parts()
+        .0
+        .iter()
+        .flat_map(|group| group.chips.iter())
+        .find(|chip| chip.sid.as_str() == sid)
+        .and_then(|chip| chip.driver.as_ref().map(crate::overview::Driver::words))
+        .unwrap_or_default();
+    if !app.harness_page_shown() {
+        assert!(app.open_harness_settings(WindowId(0), crate::harness_screen::HarnessFocus::Top));
+    }
+    app.harness_screen_moved();
+    let instance = app
+        .native_runtime
+        .instance_by_kind(crate::native_app::AppKind::Settings)
+        .expect("the Settings controller");
+    let Some(crate::native_app::NativeApp::Settings(settings)) = app.native_runtime.app(instance)
+    else {
+        unreachable!("a Settings instance")
+    };
+    let line = settings
+        .harness_snapshot()
+        .projection()
+        .sessions
+        .iter()
+        .find(|row| row.local_id == 0)
+        .and_then(HarnessSessionRow::state_line);
+    let handle = app.store.read().unwrap().by_local(0).cloned().expect("0");
+    let tip = app.status_session_row(&handle).landing_tip;
+    [
+        status(app, "held"),
+        overview,
+        driven(app).unwrap_or_default(),
+        line.unwrap_or_default(),
+        tip.unwrap_or_default(),
+    ]
+}
+
+/// CODEX-ALAB'S OWN STOP IS SAID WHERE ATERM'S IS, WHILE ITS PROVEN CLAIM STANDS (§14.3.2): a stop
+/// codex-alab tells on its claim (`meta set harness_held`) is `status held=`'s arm, leads the
+/// Settings ▸ Harness state line and the worker row's tip in aterm's stop words led by its own
+/// name (`codex-alab stopped typing: …`), so neither reads as aterm's stop, and is said after the
+/// mode on the Overview and the hover, which name aterm as the driver, as codex-alab's (`driven by
+/// aterm (land: codex-alab stopped typing)`); its unset, and the claim's end, take every one of
+/// them down. NEGATIVE CONTROLS: the same tab before its claim and after it says no stop, a stop
+/// aterm's own loop put on its glass is never said under codex-alab's claim, and aterm's own stop
+/// is said only while aterm holds the claim, in its own words with no name before them.
+#[test]
+fn a_codex_alabs_own_stop_is_said_where_aterms_is_while_its_claim_stands() {
+    use crate::harness_glass::stop_words;
+    use aterm_agent::harness::acts::{HeldBy, STOPPED_TYPING};
+    use aterm_agent::supervise::policy::exception::Exception;
+    let quiet = |surfaces: &[String; 5], case: &str| {
+        assert_eq!(surfaces[0], "-", "{case}: {surfaces:#?}");
+        assert!(
+            surfaces.iter().all(|s| !s.contains(STOPPED_TYPING)),
+            "{case}: {surfaces:#?}"
+        );
+    };
+    let (mut app, sid, _host) = codex_desk("land");
+    quiet(&codex_stop_surfaces(&mut app, &sid), "CONTROL: no claim");
+    assert_eq!(
+        self_meta(&mut app, "set harness_held same-reply", 4),
+        "ERR denied\n",
+        "CONTROL: no claim to tell it on"
+    );
+    let me = format!("codex-alab@{}", crate::self_claim::stand_in::pid());
+    assert_eq!(
+        self_meta(&mut app, &format!("set supervisor {me}"), 4),
+        "OK\n"
+    );
+    let claimed = codex_stop_surfaces(&mut app, &sid);
+    quiet(&claimed, "CONTROL: claimed, nothing told");
+    assert_eq!(
+        claimed[1], "driven by aterm (land)",
+        "CONTROL: the Overview names the claim's driver"
+    );
+    assert!(super::on_stopped(&mut app, 0, Some(HeldBy::NoWork)));
+    assert_eq!(
+        app.harness_glass[&0].stopped(),
+        Some(HeldBy::NoWork),
+        "CONTROL: on aterm's glass"
+    );
+    quiet(
+        &codex_stop_surfaces(&mut app, &sid),
+        "aterm's own glass under codex-alab's claim",
+    );
+    assert!(super::on_stopped(&mut app, 0, None));
+
+    for held_by in HeldBy::ALL {
+        let case = format!("{held_by:?}");
+        assert_eq!(
+            self_meta(&mut app, &format!("set harness_held {}", held_by.word()), 4),
+            "OK\n"
+        );
+        let [field, overview, hover, line, tip] = codex_stop_surfaces(&mut app, &sid);
+        assert_eq!(field, held_by.word(), "{case}");
+        let named = |form| format!("codex-alab {}", stop_words(held_by, form));
+        let driven = format!("driven by aterm (land: {})", named(HoldForm::Hover));
+        assert_eq!(overview, driven, "{case}");
+        assert_eq!(hover, driven, "{case}");
+        assert!(line.starts_with(&named(HoldForm::Line)), "{case}: {line}");
+        assert_eq!(tip, named(HoldForm::Tip), "{case}");
+    }
+    assert_eq!(self_meta(&mut app, "unset harness_held", 4), "OK\n");
+    quiet(&codex_stop_surfaces(&mut app, &sid), "its unset");
+    assert_eq!(
+        self_meta(&mut app, "set harness_held same-reply", 4),
+        "OK\n"
+    );
+    assert_eq!(status(&app, "held"), "same-reply", "CONTROL: told again");
+    assert_eq!(self_meta(&mut app, "unset supervisor", 4), "OK\n");
+    quiet(&codex_stop_surfaces(&mut app, &sid), "the claim's end");
+
+    let (mut app, sid, _host) = desk("cruise");
+    tell_stop(&mut app, &sid, Some(Exception::repeats(HeldBy::SameReply)));
+    let handle = app.store.read().unwrap().by_local(0).cloned().expect("0");
+    assert_eq!(status(&app, "held"), "same-reply", "CONTROL: aterm's claim");
+    assert_eq!(
+        app.status_session_row(&handle).landing_tip.as_deref(),
+        Some(stop_words(HeldBy::SameReply, HoldForm::Tip).as_str()),
+        "CONTROL: aterm's claim"
+    );
+    let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+    assert!(crate::session_timeline::release_supervisor(
+        &ctx,
+        None,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl
+    ));
+    assert_eq!(status(&app, "held"), "-", "no claim of aterm's");
+    assert_eq!(
+        app.status_session_row(&handle).landing_tip,
+        None,
+        "no claim of aterm's"
+    );
+}
+
+/// CODEX-ALAB'S STOP GIVES WAY WHERE ATERM'S DOES, ON EVERY SURFACE AT ONCE (§14.3.2): its told
+/// stop is said only under a face that carries a mode, as aterm's own is, so once codex-alab tells
+/// its own landing (`landed@v1`) or leaves the turn to a person (`left-to-person@v1`) none of
+/// `status held=`, the worker row's tip, the Overview, the hover and the Settings state line says
+/// it, and once its task is open again every one does, the claim and the kept stop standing
+/// throughout. NEGATIVE CONTROL: under the open face before each, every surface says it.
+#[test]
+fn a_codex_alabs_stop_gives_way_to_its_landed_or_quiet_face_on_every_surface() {
+    use aterm_agent::harness::acts::{HeldBy, STOPPED_TYPING};
+    let (mut app, sid, _host) = codex_desk("land");
+    let me = format!("codex-alab@{}", crate::self_claim::stand_in::pid());
+    assert_eq!(
+        self_meta(&mut app, &format!("set supervisor {me}"), 4),
+        "OK\n"
+    );
+    assert_eq!(
+        self_meta(&mut app, "set harness_held same-reply", 4),
+        "OK\n"
+    );
+    let said = |app: &mut App, case: &str| {
+        let surfaces = codex_stop_surfaces(app, &sid);
+        assert_eq!(
+            surfaces[0],
+            HeldBy::SameReply.word(),
+            "{case}: {surfaces:#?}"
+        );
+        assert!(
+            surfaces[1..].iter().all(|s| s.contains(STOPPED_TYPING)),
+            "{case}: {surfaces:#?}"
+        );
+    };
+    let quiet = |app: &mut App, case: &str| {
+        let surfaces = codex_stop_surfaces(app, &sid);
+        assert_eq!(surfaces[0], "-", "{case}: {surfaces:#?}");
+        assert!(
+            surfaces.iter().all(|s| !s.contains(STOPPED_TYPING)),
+            "{case}: {surfaces:#?}"
+        );
+    };
+    let tell = |app: &mut App, face: TaskFace| {
+        let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+        ctx.timeline.lock().expect("timeline").queue_self_task(face);
+        app.apply_harness_fact(&sid, crate::HarnessFact::SelfTask(face));
+        assert_eq!(app.chip_glass(0).task, Some(face), "codex-alab's face");
+        ctx.meta
+            .lock()
+            .expect("meta")
+            .self_held(crate::metrics::now_us())
+    };
+    for face in [TaskFace::Landed, TaskFace::Theirs] {
+        said(&mut app, "CONTROL: the open face");
+        assert_eq!(tell(&mut app, face), Some(HeldBy::SameReply), "{face:?}");
+        quiet(&mut app, &format!("{face:?}"));
+        assert_eq!(
+            tell(&mut app, TaskFace::Open),
+            Some(HeldBy::SameReply),
+            "{face:?}"
+        );
+    }
+    said(&mut app, "the open face again");
+}
+
+/// Where session 0's Land hold is shown of a tab without a chip, as [`codex_stop_surfaces`] reads
+/// its stop.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HoldSurfaces {
+    /// `status land_held= land_nudges= land_since=`.
+    status: [String; 3],
+    /// Whether the menu bar's row reads it landing, and This Mac's `landing` count.
+    landing: (bool, usize),
+    /// The worker row's tip.
+    tip: String,
+    /// The Overview's held line and its driver.
+    overview: (String, String),
+    /// The tab's hover.
+    hover: String,
+    /// The Settings ▸ Harness state line.
+    line: String,
+}
+
+impl HoldSurfaces {
+    /// Nothing of a Land hold anywhere: `-` in `status`, no landing, and no hold words on any
+    /// line.
+    fn assert_none(&self, case: &str) {
+        assert_eq!(self.status, ["-", "-", "-"], "{case}: {self:#?}");
+        assert_eq!(self.landing, (false, 0), "{case}: {self:#?}");
+        assert_eq!(self.overview.0, "", "{case}: {self:#?}");
+        for words in [&self.tip, &self.hover, &self.line] {
+            assert!(
+                !words.contains("not landed yet")
+                    && !words.contains("landing since")
+                    && !words.contains("nudge"),
+                "{case}: {self:#?}"
+            );
+        }
+    }
+}
+
+fn codex_hold_surfaces(app: &mut App, sid: &str) -> HoldSurfaces {
+    let overview = app
+        .overview_parts()
+        .0
+        .iter()
+        .flat_map(|group| group.chips.iter())
+        .find(|chip| chip.sid.as_str() == sid)
+        .map(|chip| {
+            (
+                chip.held.clone().unwrap_or_default(),
+                chip.driver
+                    .as_ref()
+                    .map(crate::overview::Driver::words)
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap_or_default();
+    if !app.harness_page_shown() {
+        assert!(app.open_harness_settings(WindowId(0), crate::harness_screen::HarnessFocus::Top));
+    }
+    app.harness_screen_moved();
+    let instance = app
+        .native_runtime
+        .instance_by_kind(crate::native_app::AppKind::Settings)
+        .expect("the Settings controller");
+    let Some(crate::native_app::NativeApp::Settings(settings)) = app.native_runtime.app(instance)
+    else {
+        unreachable!("a Settings instance")
+    };
+    let line = settings
+        .harness_snapshot()
+        .projection()
+        .sessions
+        .iter()
+        .find(|row| row.local_id == 0)
+        .and_then(HarnessSessionRow::state_line);
+    let handle = app.store.read().unwrap().by_local(0).cloned().expect("0");
+    let row = app.status_session_row(&handle);
+    HoldSurfaces {
+        status: land_fields(app),
+        landing: (row.landing, app.status_glance().here.landing),
+        tip: row.landing_tip.unwrap_or_default(),
+        overview,
+        hover: driven(app).unwrap_or_default(),
+        line: line.unwrap_or_default(),
+    }
+}
+
+/// [`held`] as codex-alab's `meta set harness_land` spells it.
+fn held_line() -> String {
+    format!(
+        "set harness_land since={} nudges=3 read=1 legs=needs,repo,open \
+         open=follow-up,not%20pushed unpushed=2",
+        SINCE_S * 1000
+    )
+}
+
+/// CODEX-ALAB'S OWN LAND HOLD IS SHOWN WHERE ATERM'S IS, WHILE ITS PROVEN CLAIM STANDS (§14.3.3): a
+/// hold codex-alab tells on its claim (`meta set harness_land`) is `status land_held= land_nudges=
+/// land_since=`, makes the tab landing on the menu bar (its row and This Mac's count), and is said
+/// on the worker row's tip, the Overview's held line, the hover and the Settings ▸ Harness state
+/// line in aterm's hold words led by its own name (`codex-alab: not landed yet: …`), as aterm's
+/// own is said there; a stop it told beside it names it once (`codex-alab stopped typing: … · not
+/// landed yet: …`); its nudges and its land act's instant move as told; its own landing, a
+/// person's own exchange and a mode other than Land hide it, and it comes back with the open face
+/// and Land; its unset and the claim's end take it down. NEGATIVE CONTROLS: the same tab before
+/// its claim and after it shows no hold and is denied the verb, a hold aterm's own loop put on its
+/// glass is never shown under codex-alab's claim, and a Claude tab's own hold is shown in aterm's
+/// own words with no name, only while aterm holds the claim.
+#[test]
+fn a_codex_alabs_own_land_hold_is_shown_where_aterms_is_while_its_claim_stands() {
+    use crate::harness_glass::stop_words;
+    use aterm_agent::harness::acts::HeldBy;
+    let since = SINCE_S.to_string();
+    let tip = hold_words(&glass(held(), TODAY), None, HoldForm::Tip, None).expect("a tip");
+    let hover = hold_words(&glass(held(), TODAY), None, HoldForm::Hover, None).expect("a hover");
+    let shown = |surfaces: &HoldSurfaces, case: &str| {
+        assert_eq!(
+            surfaces.status,
+            ["needs,repo,open", "3", since.as_str()],
+            "{case}: {surfaces:#?}"
+        );
+        assert_eq!(surfaces.landing, (true, 1), "{case}: {surfaces:#?}");
+        assert_eq!(surfaces.tip, format!("codex-alab: {tip}"), "{case}");
+        assert_eq!(surfaces.overview.0, format!("codex-alab: {tip}"), "{case}");
+        assert_eq!(
+            surfaces.overview.1, "driven by aterm (land)",
+            "{case}: the driver says no hold"
+        );
+        assert_eq!(
+            surfaces.hover,
+            format!("driven by aterm (land: codex-alab: {hover})"),
+            "{case}"
+        );
+        assert!(
+            surfaces.line.starts_with(
+                "codex-alab: not landed yet: a need named earlier in its reply; 2 unpushed"
+            ) && surfaces.line.contains(" \u{b7} landing since ")
+                && surfaces.line.ends_with(" \u{b7} 3 nudges"),
+            "{case}: {}",
+            surfaces.line
+        );
+    };
+    let (mut app, sid, _host) = codex_desk("land");
+    codex_hold_surfaces(&mut app, &sid).assert_none("CONTROL: no claim");
+    assert_eq!(
+        self_meta(&mut app, &held_line(), 4),
+        "ERR denied\n",
+        "CONTROL: no claim to tell it on"
+    );
+    let me = format!("codex-alab@{}", crate::self_claim::stand_in::pid());
+    assert_eq!(
+        self_meta(&mut app, &format!("set supervisor {me}"), 4),
+        "OK\n"
+    );
+    codex_hold_surfaces(&mut app, &sid).assert_none("CONTROL: claimed, nothing told");
+    assert!(super::on_land_held(&mut app, 0, Some(held())));
+    assert!(
+        app.harness_glass[&0].hold().is_some(),
+        "CONTROL: on aterm's glass"
+    );
+    codex_hold_surfaces(&mut app, &sid).assert_none("aterm's own glass under codex-alab's claim");
+    assert!(super::on_land_held(&mut app, 0, None));
+
+    assert_eq!(
+        self_meta(
+            &mut app,
+            &format!("set harness_land since={since}000 nudges=0"),
+            4
+        ),
+        "OK\n"
+    );
+    let begun = codex_hold_surfaces(&mut app, &sid);
+    assert_eq!(begun.status, ["-", "0", since.as_str()], "{begun:#?}");
+    assert_eq!(
+        begun.landing,
+        (true, 1),
+        "Land's instruction typed: landing"
+    );
+    assert_eq!(begun.tip, "", "no yield read, no nudge: no tip");
+    assert_eq!(begun.overview.0, "", "no yield read: no held line");
+    assert_eq!(begun.hover, "driven by aterm (land)", "no yield read");
+    assert!(
+        begun.line.starts_with("codex-alab: landing since "),
+        "{}",
+        begun.line
+    );
+    assert_eq!(
+        self_meta(
+            &mut app,
+            &format!("set harness_land since={since}000 nudges=1"),
+            4
+        ),
+        "OK\n"
+    );
+    let nudged = codex_hold_surfaces(&mut app, &sid);
+    assert_eq!(nudged.status, ["-", "1", since.as_str()]);
+    assert_eq!(nudged.tip, "codex-alab: 1 nudge");
+    assert!(nudged.line.ends_with(" \u{b7} 1 nudge"), "{}", nudged.line);
+
+    assert_eq!(self_meta(&mut app, &held_line(), 4), "OK\n");
+    shown(&codex_hold_surfaces(&mut app, &sid), "a judged yield");
+
+    assert_eq!(
+        self_meta(&mut app, "set harness_held same-reply", 4),
+        "OK\n"
+    );
+    let stopped = codex_hold_surfaces(&mut app, &sid);
+    let stop = |form| format!("codex-alab {}", stop_words(HeldBy::SameReply, form));
+    assert_eq!(
+        stopped.tip,
+        format!(
+            "{}{}{tip}",
+            stop(HoldForm::Tip),
+            crate::native_ui::FACT_SEPARATOR
+        ),
+        "the stop names its holder once"
+    );
+    assert_eq!(
+        stopped.hover,
+        format!("driven by aterm (land: {}; {hover})", stop(HoldForm::Hover))
+    );
+    assert!(
+        stopped.line.starts_with(&stop(HoldForm::Line))
+            && stopped.line.contains(" \u{b7} not landed yet: ")
+            && !stopped.line.contains("codex-alab: "),
+        "{}",
+        stopped.line
+    );
+    assert_eq!(
+        stopped.overview.0,
+        format!("codex-alab: {tip}"),
+        "a line of its own"
+    );
+    assert_eq!(self_meta(&mut app, "unset harness_held", 4), "OK\n");
+    shown(&codex_hold_surfaces(&mut app, &sid), "the stop lifted");
+
+    let tell = |app: &mut App, face: TaskFace| {
+        let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+        ctx.timeline.lock().expect("timeline").queue_self_task(face);
+        app.apply_harness_fact(&sid, crate::HarnessFact::SelfTask(face));
+        assert_eq!(app.chip_glass(0).task, Some(face), "codex-alab's face");
+    };
+    for face in [TaskFace::Landed, TaskFace::Theirs] {
+        tell(&mut app, face);
+        codex_hold_surfaces(&mut app, &sid).assert_none(&format!("{face:?}"));
+        tell(&mut app, TaskFace::Open);
+        shown(
+            &codex_hold_surfaces(&mut app, &sid),
+            &format!("open after {face:?}"),
+        );
+    }
+    meta(&mut app, "set autopilot cruise");
+    codex_hold_surfaces(&mut app, &sid).assert_none("under Cruise");
+    meta(&mut app, "set autopilot land");
+    shown(&codex_hold_surfaces(&mut app, &sid), "under Land again");
+
+    assert_eq!(self_meta(&mut app, "unset harness_land", 4), "OK\n");
+    codex_hold_surfaces(&mut app, &sid).assert_none("its unset");
+    assert_eq!(self_meta(&mut app, &held_line(), 4), "OK\n");
+    shown(&codex_hold_surfaces(&mut app, &sid), "CONTROL: told again");
+    assert_eq!(self_meta(&mut app, "unset supervisor", 4), "OK\n");
+    codex_hold_surfaces(&mut app, &sid).assert_none("the claim's end");
+
+    let (mut app, sid, _host) = desk("land");
+    tell_hold(&mut app, &sid, Some(held()));
+    let handle = app.store.read().unwrap().by_local(0).cloned().expect("0");
+    assert_eq!(
+        land_fields(&app),
+        ["needs,repo,open", "3", since.as_str()],
+        "CONTROL: aterm's claim"
+    );
+    assert_eq!(
+        app.status_session_row(&handle).landing_tip.as_deref(),
+        Some(tip.as_str()),
+        "CONTROL: aterm's own words, no name"
+    );
+    assert_eq!(driven(&app).as_deref(), Some(WHY), "CONTROL: aterm's claim");
+    let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+    assert!(crate::session_timeline::release_supervisor(
+        &ctx,
+        None,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl
+    ));
+    assert!(app.harness_glass[&0].hold().is_some(), "still on the glass");
+    assert_eq!(land_fields(&app), ["-", "-", "-"], "no claim of aterm's");
+    let row = app.status_session_row(&handle);
+    assert!(!row.landing, "no claim of aterm's");
+    assert_eq!(row.landing_tip, None, "no claim of aterm's");
 }

@@ -953,6 +953,14 @@ fn the_version_and_target_are_derived_from_what_is_packed() {
     );
     put(
         &w.src.join("release/trust-version.toml"),
+        b"[release]\ntrust_product_version = '0.7.1' # literal string + comment\n",
+    );
+    assert_eq!(
+        bundle::derive_version(&t, &w.src, &w.seal).expect("literal + comment"),
+        "0.7.1"
+    );
+    put(
+        &w.src.join("release/trust-version.toml"),
         b"[release]\ntrust_product_version = \"0.7.2\"\n",
     );
     git(&w.src, &["add", "-A"]);

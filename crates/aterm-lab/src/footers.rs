@@ -43,7 +43,7 @@ pub fn footer_row_pattern(screen: &str) -> Option<String> {
 }
 
 /// `✻ <Verb> for <N>…`: a turn's done row (`screen::is_done_row`), as a pattern.
-const DONE_ROW: &str = "✻.\\S+.for.[0-9]";
+const DONE_ROW: &str = r"^✻ (?s:.*) for [0-9]";
 
 /// How long the footer must stay unchanged to count as settled: its
 /// first-render hints give way to the mode row within this.
@@ -375,14 +375,30 @@ mod tests {
     #[test]
     fn the_done_row_pattern_reads_what_the_done_row_reader_reads() {
         let re = aterm_regex::Regex::new(DONE_ROW).unwrap();
+        let wired = aterm_regex::Regex::new(&crate::door::wire_pattern(DONE_ROW)).unwrap();
         for row in [
             "✻ Worked for 3m 2s · done 11:08 PM",
             "✻ Baked for 0s · done 5:39 AM",
+            "✻ Worked hard for 3s",
+            "✻  for 1s",
+            "✻ Worked for ever and for 9s",
         ] {
             assert!(re.is_match(row) && crate::screen::is_done_row(row), "{row}");
+            assert!(wired.is_match(row), "{row}");
         }
-        let busy = "✻ Working… (3s · ↓ 12 tokens)";
-        assert!(!re.is_match(busy) && !crate::screen::is_done_row(busy));
+        for not_done in [
+            "✻ Working… (3s · ↓ 12 tokens)",
+            "x ✻aWorkedXforY1",
+            "  ✻ Worked for 3s",
+            "✻\tWorked for 3s",
+            "✻ Worked for ever",
+        ] {
+            assert!(
+                !re.is_match(not_done) && !crate::screen::is_done_row(not_done),
+                "{not_done}"
+            );
+            assert!(!wired.is_match(not_done), "{not_done}");
+        }
     }
 
     #[test]

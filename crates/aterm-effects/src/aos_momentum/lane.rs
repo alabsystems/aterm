@@ -27,7 +27,7 @@ pub const LANE_MAX_EVENTS: usize = MOMENTUM_MAX_EVENTS;
 pub const HANG_NS: u64 = 60_000_000_000;
 
 /// The format byte a scenario's encoding opens with.
-pub const SCENARIO_FORMAT: u8 = 1;
+pub const SCENARIO_FORMAT: u8 = 2;
 
 /// The domain under which [`Scenario::digest`] digests a scenario's encoding.
 pub const SCENARIO_DOMAIN: &[u8] = b"aterm-aos-m4-scenario-v1\0";
@@ -128,6 +128,7 @@ impl Presentation {
             e.i32(first);
             e.i32(end);
         });
+        e.bool(c.light_vivid);
     }
 
     #[inline]
@@ -824,6 +825,7 @@ struct Lane<'g, G: Glow + ?Sized> {
     fnv: Fnv,
     /// The canonical encoding of the frame on glass, and the encoder of the next one.
     glass: Enc,
+    glass_key: u64,
     drawn: Enc,
     fault: Option<LaneFault>,
     /// A key arrived since the start or the last reset.
@@ -835,6 +837,7 @@ impl<'g, G: Glow + ?Sized> Lane<'g, G> {
     fn new(g: &'g mut G, origin: Instant, f_ns: u64) -> Self {
         let mut glass = Enc::with_capacity(512);
         encode_frame(&mut glass, &MomentumGlowFrame::default(), &[], &[]);
+        let glass_key = fnv1a(glass.as_bytes());
         Lane {
             g,
             origin,
@@ -848,6 +851,7 @@ impl<'g, G: Glow + ?Sized> Lane<'g, G> {
             counts: LaneCounts::default(),
             fnv: Fnv::new(),
             glass,
+            glass_key,
             drawn: Enc::with_capacity(512),
             fault: None,
             keyed: false,
@@ -937,9 +941,10 @@ impl<'g, G: Glow + ?Sized> Lane<'g, G> {
         self.drawn.clear();
         encode_frame(&mut self.drawn, &frame, &self.out, &self.under);
         let key = fnv1a(self.drawn.as_bytes());
-        let presented = self.drawn.as_bytes() != self.glass.as_bytes();
+        let presented = key != self.glass_key || self.drawn.as_bytes() != self.glass.as_bytes();
         if presented {
             self.counts.presented += 1;
+            self.glass_key = key;
             core::mem::swap(&mut self.glass, &mut self.drawn);
         }
         let mut stopped = false;
@@ -1135,6 +1140,7 @@ pub const fn s0_geom() -> Geom {
 const fn s0_config(page: Page, col: u16) -> MomentumGlowConfig {
     let dark = matches!(page, Page::Dark);
     MomentumGlowConfig {
+        light: crate::cursor_glow::Light::OFF,
         enabled: true,
         intensity: 1.0,
         tau_s: S0_TAU,
@@ -1146,6 +1152,7 @@ const fn s0_config(page: Page, col: u16) -> MomentumGlowConfig {
         theme_bg: if dark { 0x0010_1016 } else { 0x00FF_FFFF },
         block: true,
         glyph_span: Some((0, col as i32)),
+        light_vivid: false,
     }
 }
 

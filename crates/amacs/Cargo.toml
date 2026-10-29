@@ -25,6 +25,8 @@ aterm-cap = { workspace = true }
 aterm-types = { workspace = true }
 # FNV-1a/64, the stable hash behind the edit script's `line:h6` anchors.
 aterm-hash = { workspace = true }
+# `[amacs]` in aterm.toml, read as a TOML value tree (`amacs::config`).
+aterm-toml = { workspace = true }
 
 [dev-dependencies]
 # The engine's tests mint a root authority for the store's write cap; only a

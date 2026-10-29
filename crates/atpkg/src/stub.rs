@@ -37,7 +37,7 @@ pub const DEFAULT_SET_STUB_NAMES: &[(&str, &str)] = &[
 ];
 
 /// Coding agents managed by `aterm` vendor-direct, one per [`VENDORS`](crate::vendor_direct::VENDORS)
-/// row: the default set's members, and the rows a person installs by name (grok, kimi).
+/// row, every one in the default set.
 pub const AGENT_PROGRAMS: &[&str] = &{
     use crate::vendor_direct::VENDORS;
     let mut names = [""; VENDORS.len()];
@@ -1214,23 +1214,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// Adoption lays the whole roster minus removed/excluded/installed;
-    /// `remove_all_stubs` clears exactly the stubs.
+    /// Adoption lays the whole roster, every agent program included, minus
+    /// removed/excluded/installed; `remove_all_stubs` clears exactly the stubs.
     #[cfg(unix)]
     #[test]
     fn adoption_lays_the_roster_and_remove_all_clears_it() {
         let l = layout("adoption");
-        std::fs::write(l.removed(), "ny\n").unwrap();
+        std::fs::write(l.removed(), "ny\nkimi\n").unwrap();
         let cfg = crate::config::PackagesConfig {
-            exclude: Some(vec![String::from("agy")]),
+            exclude: Some(vec![String::from("agy"), String::from("grok")]),
             ..Default::default()
         };
         lay_adoption_stubs(&l, &cfg);
-        let agy = tool("agy");
-        assert!(
-            !l.shim(&agy).exists() && !l.agent_shim(&agy).exists(),
-            "an excluded program gets no stub, in bin/ or agents/"
-        );
+        for kept_off in ["agy", "grok", "kimi"] {
+            let t = tool(kept_off);
+            assert!(
+                !l.shim(&t).exists() && !l.agent_shim(&t).exists(),
+                "{kept_off}: an excluded or removed program gets no stub, in bin/ or agents/"
+            );
+        }
         for (name, _) in DEFAULT_SET_STUB_NAMES {
             let expect = *name != "ny";
             assert_eq!(
@@ -1242,22 +1244,29 @@ mod tests {
         let triple = crate::cli::current_triple();
         for name in AGENT_PROGRAMS {
             let row = crate::vendor_direct::spec(name).unwrap();
+            let laid = row.serves(triple) && !["agy", "grok", "kimi"].contains(name);
             assert_eq!(
                 pending_stub_exists(&l, name),
-                row.serves(triple) && row.default_set && *name != "agy",
-                "{name}: laid at adoption only where it can arrive, and only for the default set"
+                laid,
+                "{name}: laid at adoption wherever it can arrive"
             );
-            if !row.default_set {
-                assert!(
-                    !l.agent_shim(&tool(name)).exists(),
-                    "{name} is installed by name: no twin either"
-                );
-            }
+            assert_eq!(
+                l.agent_shim(&tool(name)).exists(),
+                laid,
+                "{name}: its twin too"
+            );
         }
-        assert!(
-            AGENT_PROGRAMS.contains(&"grok") && AGENT_PROGRAMS.contains(&"kimi"),
-            "PRECONDITION: the opt-in rows are agent programs"
-        );
+        let all = layout("adoption-all");
+        lay_adoption_stubs(&all, &crate::config::PackagesConfig::default());
+        for name in ["grok", "kimi"] {
+            let row = crate::vendor_direct::spec(name).unwrap();
+            assert_eq!(
+                pending_stub_exists(&all, name) && all.agent_shim(&tool(name)).exists(),
+                row.serves(triple),
+                "{name} is in the default set: adoption lays it and its twin where it is served"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&all.prefix);
         std::fs::write(l.bin_dir().join("mine"), "not a stub").unwrap();
         remove_all_stubs(&l);
         for name in compiled_names() {

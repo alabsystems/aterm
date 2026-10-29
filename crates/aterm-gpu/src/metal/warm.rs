@@ -35,14 +35,15 @@ pub struct FirstFrameKnobs {
 /// What a first window builds over its first frames under `knobs`, in the order it needs
 /// them, as `(row, swapchain format)`: the text frame's rows, the present blit at both
 /// swapchain formats (which one a window gets depends on its screen's EDR potential, which
-/// only the attach can read), then the aurora's rows and the fx Exact row. Where `fetch`, glow
-/// and fx draw through their twins ([`first_frame_twins`]), so the glow row serves only the
-/// bloom's extract and the fx row is not built.
+/// only the attach can read), then the aurora's rows (with its bloom, the blit at the
+/// Rgba8Unorm present copy too: the compose copy the bloom draws over) and the fx Exact row.
+/// Where `fetch`, glow and fx draw through their twins ([`first_frame_twins`]), so the glow
+/// row serves only the bloom's extract and the fx row is not built.
 pub(crate) fn first_frame_rows(
     knobs: FirstFrameKnobs,
     fetch: bool,
 ) -> Vec<(Pipeline, PixelFormat)> {
-    use PixelFormat::{Bgra8Unorm, Rgba16Float};
+    use PixelFormat::{Bgra8Unorm, Rgba8Unorm, Rgba16Float};
     let mut rows = vec![
         (Pipeline::Bg, Bgra8Unorm),
         (Pipeline::Glyph, Bgra8Unorm),
@@ -56,6 +57,7 @@ pub(crate) fn first_frame_rows(
         }
         if knobs.bloom {
             rows.push((Pipeline::Bloom, Bgra8Unorm));
+            rows.push((Pipeline::Blit, Rgba8Unorm));
         }
         if knobs.hdr_glow {
             rows.push((Pipeline::HdrGlow, Rgba16Float));
@@ -517,13 +519,20 @@ impl PresentKnobs {
 
 /// The destinations a present binds `row` against under `knobs`: the tray card the Rgba8Unorm
 /// present copy; the blit and the SDR crowns the swapchain, at f16 too where one may exist
-/// ([`PresentKnobs::hdr_glow`]). Any other row draws into an offscreen whose format does not
-/// depend on the destination: one build.
+/// ([`PresentKnobs::hdr_glow`]), and the blit the present copy as well (the compose copy,
+/// `present::encode_present_sequence`). Any other row draws into an offscreen whose format does
+/// not depend on the destination: one build.
 #[inline]
 const fn destinations(row: Pipeline, knobs: PresentKnobs) -> &'static [PixelFormat] {
     match row {
         Pipeline::Tray => &[PixelFormat::Rgba8Unorm],
-        Pipeline::Blit | Pipeline::SdrGlow | Pipeline::SdrGlowItems if knobs.hdr_glow => {
+        Pipeline::Blit if knobs.hdr_glow => &[
+            PixelFormat::Bgra8Unorm,
+            PixelFormat::Rgba16Float,
+            PixelFormat::Rgba8Unorm,
+        ],
+        Pipeline::Blit => &[PixelFormat::Bgra8Unorm, PixelFormat::Rgba8Unorm],
+        Pipeline::SdrGlow | Pipeline::SdrGlowItems if knobs.hdr_glow => {
             &[PixelFormat::Bgra8Unorm, PixelFormat::Rgba16Float]
         }
         _ => &[PixelFormat::Bgra8Unorm],

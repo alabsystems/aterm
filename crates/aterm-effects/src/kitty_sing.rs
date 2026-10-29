@@ -431,7 +431,11 @@ impl KittySing {
         let Some(start) = self.wind_start(now) else {
             return 1.0;
         };
-        let t = now.saturating_duration_since(start).as_secs_f32() * INV_SING_WIND_DOWN;
+        let elapsed = now.saturating_duration_since(start);
+        if elapsed >= SING_WIND_DOWN_DUR {
+            return 0.0;
+        }
+        let t = elapsed.as_secs_f32() * INV_SING_WIND_DOWN;
         if t >= 1.0 {
             return 0.0;
         }
@@ -553,18 +557,22 @@ impl KittySing {
     #[must_use]
     pub fn next_external_deadline(&self, now: Instant) -> Option<Instant> {
         let ext = self.external?;
-        if let Some(bar) = self.bar(now) {
-            if self.fan_bar != Some(bar) {
-                return Some(now);
+        let wind = self.wind_start(now);
+        if wind.is_none()
+            && let Some(anchor) = self.armed_at
+        {
+            const INV_SING_BAR_SECONDS: f32 = 1.0 / SING_BAR_SECONDS;
+            let bar =
+                (now.saturating_duration_since(anchor).as_secs_f32() * INV_SING_BAR_SECONDS) as u64;
+            if bar < u64::from(ext.bars) {
+                if self.fan_bar != Some(bar) {
+                    return Some(now);
+                }
+                let next = anchor + Duration::from_secs_f32(SING_BAR_SECONDS * (bar + 1) as f32);
+                return Some(next.min(ext.ends_at).max(now + Duration::from_micros(1)));
             }
-            let anchor = self.armed_at?;
-            let next = anchor + Duration::from_secs_f32(SING_BAR_SECONDS * (bar + 1) as f32);
-            return Some(next.min(ext.ends_at).max(now + Duration::from_micros(1)));
         }
-        let release = match self.wind_start(now) {
-            Some(start) => start,
-            None => ext.ends_at,
-        };
+        let release = wind.unwrap_or(ext.ends_at);
         if !ext.outro_taken {
             return Some(release.max(now));
         }
@@ -764,13 +772,18 @@ impl MusicNotes {
     #[inline]
     pub fn update(&mut self, now: Instant, streaming: bool, beat: Option<f32>) {
         if self.live != 0 {
+            let mut rem = self.live;
             let mut i = 0;
             while i < MAX_NOTES {
-                if let Some(n) = self.ring[i]
-                    && now.saturating_duration_since(n.born) >= NOTE_LIFE_DUR
-                {
-                    self.ring[i] = None;
-                    self.live -= 1;
+                if let Some(n) = self.ring[i] {
+                    if now.saturating_duration_since(n.born) >= NOTE_LIFE_DUR {
+                        self.ring[i] = None;
+                        self.live -= 1;
+                    }
+                    rem -= 1;
+                    if rem == 0 {
+                        break;
+                    }
                 }
                 i += 1;
             }
@@ -844,9 +857,13 @@ impl MusicNotes {
         if !(u >= 0.0 && u < 1.0) {
             return None;
         }
-        let fade_in = (u * (1.0 / 0.15)).min(1.0);
-        let fade_out = ((1.0 - u) * (1.0 / 0.4)).min(1.0);
-        let alpha = (fade_in * fade_out * 255.0) as u8;
+        let alpha = if u < 0.15 {
+            (u * (1.0 / 0.15) * 255.0) as u8
+        } else if u <= 0.6 {
+            255
+        } else {
+            ((1.0 - u) * (1.0 / 0.4) * 255.0) as u8
+        };
         let s = seed;
         let tint = NOTE_TINTS[(s % NOTE_TINTS.len() as u32) as usize];
         let x0 = 0.1 + (0.8 / 255.0) * ((s >> 8) & 0xff) as f32;

@@ -418,6 +418,7 @@ fn hooks(world: &Arc<World>, body: Arc<BodyFn>) -> Hooks {
         pause: Arc::new(quick_pause),
         carry_clock: Arc::new(MonotonicClock),
         upgrade_view: Arc::new(|_, _, _, _| ViewNext::default()),
+        upgrade_sources: Arc::new(crate::upgrade_host::UpgradeSources::default),
         disk: Arc::new(|_| {}),
         codex_roster: Arc::new(Vec::new),
         note: Arc::new(move |note| w6.notes.lock().unwrap().push(note)),
@@ -1127,8 +1128,13 @@ fn a_restart_in_flight_behind_the_claim_grace_is_carried_once_the_agent_is_gone(
     let _lane = crate::message_inbox::own_lane_for_test();
     let supervisable = Arc::new(AtomicBool::new(true));
     let stepped: Arc<Mutex<Vec<String>>> = Arc::default();
+    let looked = Arc::new(AtomicBool::new(false));
     let carry: Arc<CarryInFlightFn> = {
-        let (supervisable, stepped) = (Arc::clone(&supervisable), Arc::clone(&stepped));
+        let (supervisable, stepped, looked) = (
+            Arc::clone(&supervisable),
+            Arc::clone(&stepped),
+            Arc::clone(&looked),
+        );
         Arc::new(move |sid, _| {
             carry_in_flight_now(
                 || {
@@ -1138,7 +1144,13 @@ fn a_restart_in_flight_behind_the_claim_grace_is_carried_once_the_agent_is_gone(
                         .is_empty()
                         .then_some(upgrade::Agent::Claude)
                 },
-                || supervisable.load(Ordering::SeqCst),
+                || {
+                    let on = supervisable.load(Ordering::SeqCst);
+                    if on {
+                        looked.store(true, Ordering::SeqCst);
+                    }
+                    on
+                },
                 || {
                     stepped.lock().unwrap().push(sid.to_string());
                     "adopted".to_string()
@@ -1153,7 +1165,13 @@ fn a_restart_in_flight_behind_the_claim_grace_is_carried_once_the_agent_is_gone(
     let host = HostHandle::start(on(), false, true, h);
     host.defer_adopted_claims(vec!["s-exiting".into()], Duration::from_millis(200));
     host.resume_after_handoff(vec![("s-exiting".into(), "in tab 1".into())]);
-    std::thread::sleep(Duration::from_millis(50));
+    until("the carry found its agent supervised", || {
+        looked.load(Ordering::SeqCst)
+    });
+    assert!(
+        stepped.lock().unwrap().is_empty(),
+        "nothing stepped while the agent is supervised"
+    );
     supervisable.store(false, Ordering::SeqCst);
     until("the restart carried on once its agent was gone", || {
         !stepped.lock().unwrap().is_empty()
@@ -2600,6 +2618,105 @@ fn the_owners_view_is_looked_at_only_when_something_it_shows_may_have_moved() {
 }
 
 #[test]
+fn the_owners_view_rechecks_changed_foreground_custody_without_a_status_follow() {
+    use crate::claude_footer::probe::drawer_started;
+    use aterm_agent::harness::footer::{FactsOwner, FooterFacts};
+
+    for active in [true, false] {
+        for change in ["image", "group", "conversation"] {
+            let app = crate::App::headless_for_test();
+            let session = app.focused_session_id(crate::WindowId(0)).unwrap();
+            let ctx = app.pool.get(session).unwrap().ctx.clone();
+            let front = |pgid, birth| {
+                drawer_started(&app, session, pgid, "claude", "2.1.305", birth);
+                ctx.timeline
+                    .lock()
+                    .unwrap()
+                    .set_program(pgid, Some("claude".into()));
+            };
+            let facts = |conversation: &str, model: &str| {
+                ctx.timeline.lock().unwrap().set_claude_footer(
+                    4343,
+                    Some(1),
+                    Some(FooterFacts {
+                        owner: Some(FactsOwner {
+                            floor: Some(0),
+                            session_id: conversation.into(),
+                        }),
+                        version: Some("2.1.305".into()),
+                        model: Some(model.into()),
+                        ..FooterFacts::default()
+                    }),
+                );
+            };
+            front(4343, 1);
+            facts("conversation-a", "model-a");
+            let roster = || {
+                let all = super::roster_of(&app.store);
+                let wanted: HashMap<_, _> = all
+                    .iter()
+                    .map(|(sid, agent, _)| (sid.clone(), *agent))
+                    .collect();
+                let stamps: HashMap<_, _> = all
+                    .into_iter()
+                    .map(|(sid, _, stamp)| (sid, stamp))
+                    .collect();
+                (wanted, stamps)
+            };
+            let world = Arc::new(World::default());
+            let looks: Arc<Mutex<Vec<bool>>> = Arc::default();
+            let seen = Arc::clone(&looks);
+            let source_store = Arc::clone(&app.store);
+            let hooks = Hooks {
+                upgrade_sources: Arc::new(move || {
+                    crate::upgrade_host::UpgradeSources::capture(&source_store)
+                }),
+                upgrade_view: Arc::new(move |look, _, _, _| {
+                    seen.lock().unwrap().push(look);
+                    ViewNext::default()
+                }),
+                ..hooks(&world, parking_body(&world))
+            };
+            let taken = || std::mem::take(&mut *looks.lock().unwrap());
+            let mut view = ViewLook::default();
+            let (wanted, stamps) = roster();
+            assert!(!wanted.is_empty(), "the real roster includes the holder");
+            let _ = look_at_upgrades(&mut view, &wanted, &stamps, true, (0, 0), &hooks);
+            assert_eq!(taken(), [true]);
+            facts("conversation-a", "model-b");
+            let (wanted, stamps) = roster();
+            let _ = look_at_upgrades(&mut view, &wanted, &stamps, true, (0, 0), &hooks);
+            assert!(
+                taken().is_empty(),
+                "ordinary same-owner facts require no record read"
+            );
+            if !active {
+                let _ = look_at_upgrades(&mut view, &wanted, &stamps, false, (0, 0), &hooks);
+                assert_eq!(taken(), [false]);
+            }
+            match change {
+                "image" => front(4343, 2),
+                "group" => front(4344, 1),
+                "conversation" => facts("conversation-b", "model-b"),
+                _ => unreachable!(),
+            }
+            let (wanted, stamps) = roster();
+            let _ = look_at_upgrades(&mut view, &wanted, &stamps, active, (0, 0), &hooks);
+            assert_eq!(
+                taken(),
+                [active],
+                "{change}, active={active}: fresh custody needs a new publication"
+            );
+            let _ = look_at_upgrades(&mut view, &wanted, &stamps, active, (0, 0), &hooks);
+            assert!(
+                taken().is_empty(),
+                "the unchanged source is deduplicated again"
+            );
+        }
+    }
+}
+
+#[test]
 fn the_records_folder_the_view_cannot_list_is_said_to_the_owner() {
     let world = Arc::new(World::default());
     let dir = PathBuf::from("/state/harness/upgrade");
@@ -3756,7 +3873,7 @@ fn a_panicking_worker_is_restarted_past_its_budget_and_never_turned_off() {
         failing
             .iter()
             .all(|n| matches!(n, HostNote::SupervisorFailing { sid, why, .. }
-            if sid == "s-p" && why.contains("boom in the loop"))),
+            if sid == "s-p" && *why == format!("other panic ({}B)", "boom in the loop".len()))),
         "{failing:?}"
     );
     host.shutdown_and_join();
@@ -4228,24 +4345,20 @@ fn a_host_thread_that_panicked_is_started_again_in_place() {
     world.set(&[("s-b", Program::Claude)]);
     let mut h = hooks(&world, parking_body(&world));
     h.roster = Arc::new(|| panic!("the host run panics"));
-    h.backoff = Arc::new(|_| Duration::from_secs(3600));
+    let entered = Arc::new(AtomicBool::new(false));
+    let e = Arc::clone(&entered);
+    h.backoff = Arc::new(move |_| {
+        e.store(true, Ordering::SeqCst);
+        Duration::from_secs(3600)
+    });
     let host = HostHandle::start(on(), false, false, h);
-    std::thread::sleep(Duration::from_millis(200));
-    let asked = Instant::now();
+    until("the host in its back-off", || {
+        entered.load(Ordering::SeqCst)
+    });
     host.shutdown_and_join();
-    assert!(
-        asked.elapsed() < Duration::from_secs(60),
-        "the back-off held the shutdown for {:?}",
-        asked.elapsed()
-    );
-    assert!(
-        host.thread
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_none_or(JoinHandle::is_finished),
-        "the host thread ended"
-    );
+    until("the shutdown ended the host thread in its back-off", || {
+        host.shared.host_done.load(Ordering::SeqCst)
+    });
 }
 
 #[test]
@@ -5978,9 +6091,10 @@ fn suspend_stops_every_worker_before_it_returns() {
 
 #[test]
 fn a_worker_winding_down_is_stopped_once_not_at_every_pass() {
-    const WIND_DOWN: Duration = Duration::from_millis(300);
     let world = Arc::new(World::default());
     let (cuts, winding) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let gate = Arc::new(Mutex::new(gate));
     let mut hooks = hooks(&world, parking_body(&world));
     let (w, c, d) = (Arc::clone(&world), Arc::clone(&cuts), Arc::clone(&winding));
     hooks.body = Arc::new(move |job: &WorkerJob| {
@@ -5995,7 +6109,10 @@ fn a_worker_winding_down_is_stopped_once_not_at_every_pass() {
             std::thread::park();
         }
         d.fetch_add(1, Ordering::SeqCst);
-        std::thread::sleep(WIND_DOWN);
+        gate.lock()
+            .unwrap()
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the test releases the wind-down");
         BodyEnd::Stopped
     });
     let host = HostHandle::start(on(), false, false, hooks);
@@ -6005,12 +6122,26 @@ fn a_worker_winding_down_is_stopped_once_not_at_every_pass() {
     policy.set("dismiss_surveys", "false").unwrap();
     host.set_config(policy);
     until("winding down", || winding.load(Ordering::SeqCst) >= 1);
+    world.passes();
+    assert_eq!(
+        cuts.load(Ordering::SeqCst),
+        1,
+        "handed over once, whatever the passes"
+    );
+    release.send(()).unwrap();
     until("the successor runs", || {
         world.runs.load(Ordering::SeqCst) >= 2
     });
     assert_eq!(cuts.load(Ordering::SeqCst), 1, "handed over once");
     world.set(&[]);
     until("winding down", || winding.load(Ordering::SeqCst) >= 2);
+    world.passes();
+    assert_eq!(
+        cuts.load(Ordering::SeqCst),
+        2,
+        "stopped once, whatever the passes"
+    );
+    release.send(()).unwrap();
     until("reaped", || host.live().is_empty());
     assert_eq!(cuts.load(Ordering::SeqCst), 2, "stopped once");
     assert_eq!(world.runs.load(Ordering::SeqCst), 2, "no third run");
@@ -6219,6 +6350,11 @@ struct Acting {
     /// The grace the restart's record gives a person's keys over its line
     /// ([`Acts::line_grace`]); `None`: the tab's whole grace.
     line_grace: Mutex<Option<u32>>,
+    /// Each claim the relaunch took (`true`) or gave back, with how many relaunches and carries
+    /// were attempted before it ([`Acts::claim`]).
+    relaunch_claims: Mutex<Vec<(String, bool, usize)>>,
+    /// The relaunches and carries attempted, whatever each answered.
+    relaunch_attempts: AtomicUsize,
     carries: Mutex<Vec<(bool, Option<u32>)>>,
     /// Whether each carry was told a hand its exit was carried through had
     /// just lifted (`relaunch::carry_restart`'s `through_hand`).
@@ -6645,7 +6781,7 @@ impl Acting {
         let (a22, a23, a24, a25) = (w(self), w(self), w(self), w(self));
         let a14f = w(self);
         let (a26, a25b) = (w(self), w(self));
-        let (a27, a28) = (w(self), w(self));
+        let (a27, a28, a29) = (w(self), w(self), w(self));
         Hooks {
             roster: Arc::new(move || {
                 w1.passes.fetch_add(1, Ordering::SeqCst);
@@ -7052,6 +7188,7 @@ impl Acting {
                     step
                 }),
                 relaunch: Arc::new(move |sid, _, snap, left, upgrade, asked| {
+                    a5.relaunch_attempts.fetch_add(1, Ordering::SeqCst);
                     assert_eq!(snap.tab, sid, "the snapshot of the session that left");
                     if a5.busy_sweep.load(Ordering::SeqCst) {
                         return "busy:another-sweep".to_string();
@@ -7102,7 +7239,15 @@ impl Acting {
                 line_grace: Arc::new(move |_, grace, _, _| {
                     a28.line_grace.lock().unwrap().unwrap_or(grace)
                 }),
+                claim: Arc::new(move |sid, take| {
+                    let asked = a29.relaunch_attempts.load(Ordering::SeqCst);
+                    a29.relaunch_claims
+                        .lock()
+                        .unwrap()
+                        .push((sid.to_string(), take, asked));
+                }),
                 carry: Arc::new(move |sid, _, agent, pid, through_hand| {
+                    a19.relaunch_attempts.fetch_add(1, Ordering::SeqCst);
                     a19.carried_through.lock().unwrap().push(through_hand);
                     if let Some(key) = a19.carry_keys.lock().unwrap().pop_front() {
                         *a19.human_ms.lock().unwrap() = key;
@@ -7178,8 +7323,10 @@ impl Acting {
                 account_restart: Arc::new(|_, _| None),
                 account_made: Arc::new(|_, _, _| {}),
                 account_cold: Arc::new(|_| None),
+                codex_cold: Arc::new(|_| None),
                 hold: Arc::new(|_, _| true),
                 route: Arc::new(|_, _, _| Route::Custom("inert".to_string())),
+                net_path: Arc::new(crate::harness_netprobe::InertPath),
                 memory: Arc::new(|_, _| None),
                 watch: Arc::new(move |sid, _, how| {
                     a20.watches
@@ -7190,6 +7337,7 @@ impl Acting {
                 }),
                 startups: Arc::new(|_| Vec::new()),
                 startup_mark: Arc::new(|_, _| {}),
+                agent_resumed: Acts::inert().agent_resumed,
             },
             backoff: Arc::new(quick_backoff),
             pause: Arc::new(move |pause| {
@@ -7206,6 +7354,7 @@ impl Acting {
             }),
             carry_clock: Arc::new(MonotonicClock),
             upgrade_view: Arc::new(|_, _, _, _| ViewNext::default()),
+            upgrade_sources: Arc::new(crate::upgrade_host::UpgradeSources::default),
             disk: Arc::new(|_| {}),
             codex_roster: Arc::new(Vec::new),
             note: Arc::new(move |note| w5.notes.lock().unwrap().push(note)),
@@ -7447,6 +7596,59 @@ fn a_due_look_wants_a_point_and_the_point_spends_it() {
     let _ = idle.at_idle();
     assert_eq!(*idle.look_at.lock().unwrap(), None, "the point spent it");
     assert!(!idle.wants(), "nothing left to want");
+}
+
+/// A SETTLED CARRY-ON LEAVES A MOVE DUE BESIDE IT A LOOK: a press under Autopilot off restarts
+/// its agent with no supervisor to close the restart's look, so the first idle point of an agent
+/// started after it settles that record (`carry-on step=done:resumed`) and the move due for the
+/// new agent is looked at again soon after, as no later point may come to an agent left idle;
+/// the look steps the move. NEGATIVE CONTROL: with no move due, the settled carry-on leaves no
+/// look.
+#[test]
+fn a_settled_carry_on_leaves_a_move_due_beside_it_a_look() {
+    for due in [Due::Yes, Due::No] {
+        let world = Arc::new(World::default());
+        let owed = Arc::new(AtomicBool::new(true));
+        let stepped = Arc::new(AtomicUsize::new(0));
+        let (o, r, s) = (Arc::clone(&owed), Arc::clone(&owed), Arc::clone(&stepped));
+        let mut hooks = hooks(&world, parking_body(&world));
+        hooks.acts = Acts {
+            due: Arc::new(move |_| due),
+            owed: Arc::new(move |_, _| o.load(Ordering::SeqCst)),
+            resume: Arc::new(move |_, _, _| {
+                r.store(false, Ordering::SeqCst);
+                "done:resumed".to_string()
+            }),
+            step: Arc::new(move |_, _| {
+                s.fetch_add(1, Ordering::SeqCst);
+                "wait:settling".to_string()
+            }),
+            ..Acts::inert()
+        };
+        let idle = idle_host("s-stale", Program::Claude, switched(&on()), hooks);
+        let carried = idle.at_idle().expect("the carry-on's step");
+        assert_eq!(carried.line, "carry-on step=done:resumed", "{due:?}");
+        let look = *idle.look_at.lock().unwrap();
+        if due == Due::No {
+            assert_eq!(look, None, "NEGATIVE CONTROL: nothing due, no look");
+            continue;
+        }
+        assert!(look.is_some(), "the move due beside it is looked at again");
+        assert_eq!(
+            stepped.load(Ordering::SeqCst),
+            0,
+            "the carry-on took the point"
+        );
+        *idle.look_at.lock().unwrap() = Some(Instant::now() - Duration::from_millis(1));
+        assert!(idle.wants(), "the look come due is a point wanted");
+        let moved = idle.at_idle().expect("the move's step");
+        assert_eq!(moved.line, "upgrade step=wait:settling");
+        assert_eq!(
+            stepped.load(Ordering::SeqCst),
+            1,
+            "the look stepped the move"
+        );
+    }
 }
 
 #[test]
@@ -8813,11 +9015,23 @@ mod account_process;
 #[path = "harness_account_landing_tests.rs"]
 mod account_landing;
 
+#[path = "harness_account_landing_identity_tests.rs"]
+mod account_landing_identity;
+
+#[path = "harness_account_landing_snapshot_tests.rs"]
+mod account_landing_snapshot;
+
+#[path = "harness_account_served_identity_tests.rs"]
+mod account_served_identity;
+
 #[path = "harness_account_immediate_tests.rs"]
 mod account_immediate;
 
 #[path = "harness_account_policy_tests.rs"]
 mod account_policy;
+
+#[path = "harness_account_identity_tests.rs"]
+mod account_identity;
 
 #[path = "harness_account_origin_tests.rs"]
 mod account_origin;
@@ -8825,6 +9039,8 @@ mod account_origin;
 #[path = "harness_account_response_tests.rs"]
 mod account_response;
 
+#[path = "harness_account_pool_session_tests.rs"]
+mod account_pool_session;
 #[path = "harness_account_session_tests.rs"]
 mod account_session;
 
@@ -9799,7 +10015,7 @@ fn a_kimi_pool_turn_end_proves_its_own_row_ignoring_claude_settings_and_keys() {
 }
 
 #[test]
-fn codex_pool_advice_records_thread_rollout_sample_and_rotates_at_measured_wall() {
+fn codex_pool_advice_records_thread_rollout_sample_and_plans_at_measured_wall() {
     const THREAD: &str = "01900000-0000-7000-8000-000000000001";
     const OTHER: &str = "01900000-0000-7000-8000-000000000009";
     let a = Accts::new();
@@ -9911,7 +10127,8 @@ fn codex_pool_advice_records_thread_rollout_sample_and_rotates_at_measured_wall(
     );
     assert_eq!(
         store.load(ACCT_NOW).unwrap().0.active.as_deref(),
-        Some("main")
+        None,
+        "advice alone cannot commit a rotation before an executor accepts it"
     );
 }
 
@@ -10010,6 +10227,7 @@ fn a_move_commits_under_the_lock_and_relaunches_outside_it() {
             id: kept.as_ref().unwrap().id.clone(),
             origin: a.seat().context(),
             to: "work-2".to_string(),
+            at: AccountAt::Wall,
             login: None,
             process: now.clone(),
             untold: false,
@@ -11360,7 +11578,7 @@ fn reset_go(until_in: i64, long: bool) -> ResetGo {
     ResetGo {
         until: ACCT_NOW + until_in,
         long,
-        limits: vec!["session".to_string()],
+        limits: vec!["5-hour".to_string(), "session".to_string()],
         kind: aterm_phase::ResetKind::Session,
         left: 2,
         day: "Oct 5".to_string(),
@@ -11738,12 +11956,12 @@ fn a_limit_reset_is_claimed_only_at_the_process_own_wall_with_a_reset_a_grant_cl
     assert_eq!(NoReset::NoUntil.word(), ResetWord::No(ResetNo::NoReset));
     assert_eq!(NoReset::Window.word(), ResetWord::No(ResetNo::Window));
 
-    for (window, name) in [
-        ("five_hour", "session"),
-        ("seven_day", "weekly"),
-        ("seven_day_overage_included", "weekly"),
-        ("seven_day_opus", "Opus"),
-        ("seven_day_sonnet", "Sonnet"),
+    for (window, names) in [
+        ("five_hour", &["5-hour", "session"][..]),
+        ("seven_day", &["weekly"]),
+        ("seven_day_overage_included", &["weekly"]),
+        ("seven_day_opus", &["Opus"]),
+        ("seven_day_sonnet", &["Sonnet"]),
     ] {
         let a = Accts::new();
         a.spawn(sid, ACCT_TALK_A, "main");
@@ -11751,7 +11969,7 @@ fn a_limit_reset_is_claimed_only_at_the_process_own_wall_with_a_reset_a_grant_cl
         assert_eq!(
             a.worker(sid, &resetting()).reset_take(&ask),
             ResetWord::Take(ResetGo {
-                limits: vec![name.to_string()],
+                limits: names.iter().map(|name| (*name).to_string()).collect(),
                 ..reset_go(LONG_WALL, true)
             }),
             "{window}"
@@ -13727,6 +13945,7 @@ fn a_move_nobody_could_verify_stands_and_is_made_once_it_is_read() {
             id: moved.as_ref().unwrap().id.clone(),
             origin: a.seat().context(),
             to: "work-2".to_string(),
+            at: AccountAt::Wall,
             login: None,
             process: now.clone(),
             untold,
@@ -13759,6 +13978,12 @@ fn a_move_nobody_could_verify_stands_and_is_made_once_it_is_read() {
         idle.park.load(Ordering::SeqCst),
         "its next idle point asked"
     );
+    let step = idle.at_idle().expect("a step that stands");
+    assert!(
+        !step.moved && step.typed.is_none() && step.line.ends_with(" step=done:landed"),
+        "{step:?}"
+    );
+    assert_eq!(idle.at_idle(), None, "once");
     assert_eq!(idle.kept.lock().unwrap().account.moved, landed(false));
     assert_eq!(moves(&idle.account(AccountPoint::TurnEnd)), None);
     assert_eq!(a.asked("made:"), 0);
@@ -13796,6 +14021,97 @@ fn a_move_nobody_could_verify_stands_and_is_made_once_it_is_read() {
     assert!(state.account("work-2").walls.is_empty());
     let kept = idle.kept.lock().unwrap();
     assert!(kept.account.moved.is_none() && kept.account.flying.is_none());
+}
+
+/// An early move whose landing nobody could read when it was made (`wait:account-unverified`:
+/// the loop defers a move ahead of a wall and carries on) is told as made at the moved process's
+/// next plain turn end, where the deferred loop asks again: the loop adopts it, the host's next
+/// step stands so the point is decided as with no move, and the account it moved to is proven by
+/// the turn it serves. Told nothing, the loop never answers the move, the account stays unproven,
+/// and every early move on the machine waits on its canary. Control: the same move landed at a
+/// wall, a point of another kind, is dropped untold.
+#[test]
+fn a_move_ahead_nobody_could_verify_is_told_as_made_at_the_next_turn_end() {
+    let unread = |sid: &str| {
+        let a = Accts::new();
+        a.spawn(sid, ACCT_TALK_A, "main");
+        sampled(&a, "main", 95, 30);
+        let idle = a.worker(sid, &on());
+        a.unread.store(true, Ordering::SeqCst);
+        assert_eq!(moves(&idle.account(AccountPoint::TurnEnd)), Some("work-2"));
+        assert_eq!(
+            idle.restart(&move_to("work-2", AccountAt::Ahead))
+                .as_deref(),
+            Some("wait:account-unverified")
+        );
+        let state = a.state();
+        assert_eq!(state.active.as_deref(), Some("work-2"));
+        assert!(!state.proven);
+        assert_eq!(state.rotations.len(), 1);
+        a.readable();
+        idle.park.store(false, Ordering::SeqCst);
+        (a, idle)
+    };
+
+    let sid = "s-acct-ahead-unread";
+    let (a, idle) = unread(sid);
+    assert_eq!(
+        moves(&idle.account(AccountPoint::TurnEnd)),
+        Some("work-2"),
+        "landed: the loop that deferred it is advised its move once more at its next turn end"
+    );
+    assert_eq!(
+        a.state().sessions.get(sid).map(|s| s.account.as_str()),
+        Some("work-2")
+    );
+    let asked = a.asked("restart:");
+    assert_eq!(
+        idle.restart(&move_to("work-2", AccountAt::Ahead))
+            .as_deref(),
+        Some("adopted")
+    );
+    assert_eq!(
+        a.asked("restart:"),
+        asked,
+        "nothing relaunched: the move was made"
+    );
+    assert_eq!(a.state().rotations.len(), 1, "nor committed again");
+    assert!(
+        idle.park.load(Ordering::SeqCst),
+        "its next idle point asked"
+    );
+    let step = idle.at_idle().expect("a step that stands");
+    assert!(
+        !step.moved && step.typed.is_none() && step.line.ends_with(" step=done:landed"),
+        "{step:?}"
+    );
+    assert_eq!(idle.at_idle(), None, "once");
+    assert_eq!(
+        moves(&idle.account(AccountPoint::TurnEnd)),
+        None,
+        "told once"
+    );
+    idle.account_served();
+    assert!(a.state().proven, "the turn it served proves it");
+
+    let (_, idle) = unread("s-acct-ahead-unread-wall");
+    assert_ne!(
+        moves(&idle.account(usage_wall())),
+        Some("work-2"),
+        "not told as made at a wall"
+    );
+    assert_eq!(
+        idle.kept
+            .lock()
+            .unwrap()
+            .account
+            .moved
+            .as_ref()
+            .map(|m| (m.to.as_str(), m.untold)),
+        Some(("work-2", false)),
+        "control: made, and dropped untold at a point of another kind"
+    );
+    assert_eq!(moves(&idle.account(AccountPoint::TurnEnd)), None);
 }
 
 #[test]
@@ -13901,6 +14217,7 @@ fn a_move_the_hosts_carry_lands_is_a_made_move() {
             id: moved.as_ref().unwrap().id.clone(),
             origin: a.seat().context(),
             to: "work-2".to_string(),
+            at: AccountAt::Wall,
             login: None,
             process: now.clone(),
             untold: false,
@@ -14227,6 +14544,172 @@ fn a_cold_relaunch_carries_the_proven_active_account_under_the_stated_conditions
         "off: nothing is added, and a login the process had is re-applied"
     );
 }
+#[test]
+fn a_cold_codex_relaunch_starts_under_the_login_the_codex_cold_act_names() {
+    use aterm_agent::harness::relaunch::{AgentRun, CodexRun};
+    use aterm_agent::harness::self_claimed::Resume;
+    const WORK: &str = "/tmp/logins/codex/work/auth.json";
+    let codex = |sid: &str| {
+        let base = snap(sid);
+        let session = base.session.clone().unwrap();
+        Snapshot {
+            program: "/opt/bin/codex".into(),
+            argv: vec!["/opt/bin/codex".into()],
+            run: AgentRun::Codex(CodexRun {
+                home: "/tmp/codex-home".into(),
+                home_env: None,
+                self_claimed: Some(Resume {
+                    argv: vec!["/opt/bin/codex".into(), "resume".into(), session.clone()],
+                    session,
+                    codex_home: None,
+                    codex_auth_path: Some(WORK.into()),
+                    cwd: None,
+                }),
+            }),
+            ..base
+        }
+    };
+    let world = Arc::new(World::default());
+    // Each relaunch's sid and the `CODEX_AUTH_PATH` its resume carries.
+    let seen = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+    let mut h = hooks(&world, parking_body(&world));
+    let s = Arc::clone(&seen);
+    h.acts.relaunch_restored = Arc::new(move |sid, snap, _, _| {
+        let auth = snap
+            .codex()
+            .and_then(|run| run.self_claimed.as_ref())
+            .and_then(|resume| resume.codex_auth_path.clone());
+        s.lock().unwrap().push((sid.to_string(), auth));
+        "adopted".to_string()
+    });
+    // The pool's answer: `work` no longer serves, and `main`, the default login, does.
+    h.acts.codex_cold = Arc::new(|snap| {
+        let mut moved = snap.clone();
+        moved.codex_mut()?.self_claimed.as_mut()?.codex_auth_path = None;
+        Some(moved)
+    });
+    let host = HostHandle::start(on(), false, false, h);
+    host.relaunch_restored(vec![
+        RestoredAgent {
+            sid: "s-cold".to_string(),
+            snap: codex("s-cold"),
+            place: "in tab 1".to_string(),
+            cold: true,
+            asked: None,
+            was: None,
+        },
+        RestoredAgent {
+            sid: "s-live".to_string(),
+            snap: codex("s-live"),
+            place: "in tab 2".to_string(),
+            cold: false,
+            asked: None,
+            was: None,
+        },
+    ]);
+    until("both relaunched", || seen.lock().unwrap().len() == 2);
+    let seen = seen.lock().unwrap().clone();
+    host.shutdown_and_join();
+    assert_eq!(
+        seen,
+        [
+            ("s-cold".to_string(), None),
+            ("s-live".to_string(), Some(WORK.to_string())),
+        ],
+        "only the cold relaunch is routed through the pool"
+    );
+}
+
+/// THE PRODUCTION COLD CODEX ACT JUDGES THE PROGRAM THE RESUME LINE RUNS ([`codex_cold_at`]): a
+/// conversation on this machine's own login while `main` is walled stays there when its line runs
+/// a Codex build that keeps no row's login its own, which runs no other row, and moves onto `work`
+/// when it runs one that keeps `CODEX_AUTH_PATH`'s login its own (CONTROL).
+#[test]
+fn the_cold_codex_act_judges_the_program_its_resume_line_runs() {
+    use aterm_agent::harness::accounts::{self, Cli};
+    use aterm_agent::harness::codex_app_login::Usage;
+    use aterm_agent::harness::relaunch::{AgentRun, CodexRun};
+    use aterm_agent::harness::self_claimed::Resume;
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().canonicalize().expect("canonical");
+    let (cfg, state, home) = (root.join("cfg"), root.join("state"), root.join("home"));
+    for dir in [&cfg, &state, &home.join(".codex")] {
+        std::fs::create_dir_all(dir).expect("dir");
+    }
+    std::fs::write(home.join(".codex/auth.json"), "{}").expect("default login");
+    let work = root.join("logins/codex/work");
+    std::fs::create_dir_all(&work).expect("login dir");
+    std::fs::write(work.join("auth.json"), "{}").expect("auth");
+    std::fs::write(
+        cfg.join("accounts-codex.toml"),
+        format!(
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
+             [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
+            work.display()
+        ),
+    )
+    .expect("roster");
+    let now = 1_792_700_000_i64;
+    let seat = aterm_agent::harness::accounts_pool::Seat {
+        config_dir: &cfg,
+        state: &state,
+        home: &home,
+        now,
+    };
+    seat.store(Cli::Codex)
+        .transact_within(&accounts::LOCK_LADDER, now, &mut None, |s| {
+            s.active = Some("main".to_string());
+            s.proven = true;
+            Ok(accounts::note_wall(
+                s,
+                "main",
+                "five_hour",
+                Some(now + 3600),
+                now - 60,
+                now,
+            ))
+        })
+        .expect("`main` walled");
+    let old = aterm_agent::harness::codex_alab::lay_package(&root.join("store/old"), false);
+    let new = aterm_agent::harness::codex_alab::lay_package(&root.join("store/new"), true);
+    let on_default = |program: &std::path::Path| {
+        let base = snap("s-cold");
+        let session = base.session.clone().unwrap();
+        let program = program.display().to_string();
+        Snapshot {
+            program: program.clone().into(),
+            argv: vec![program.clone()],
+            run: AgentRun::Codex(CodexRun {
+                home: home.join(".codex"),
+                home_env: None,
+                self_claimed: Some(Resume {
+                    argv: vec![program, "resume".into(), session.clone()],
+                    session,
+                    codex_home: None,
+                    codex_auth_path: None,
+                    cwd: None,
+                }),
+            }),
+            ..base
+        }
+    };
+    let no_usage = |_: Cli, _: &std::path::Path, _: Option<&str>, _: i64| -> Option<Usage> { None };
+    assert!(
+        codex_cold_at(&seat, &on_default(&old), &no_usage).is_none(),
+        "that build runs no other row: the conversation stays on the default login"
+    );
+    let moved = codex_cold_at(&seat, &on_default(&new), &no_usage).expect("CONTROL: moved");
+    let auth = moved
+        .codex()
+        .and_then(|run| run.self_claimed.as_ref())
+        .and_then(|resume| resume.codex_auth_path.clone());
+    assert_eq!(
+        auth,
+        Some(work.join("auth.json").display().to_string()),
+        "CONTROL: onto `work`"
+    );
+}
+
 #[test]
 fn accounts_off_stops_everything_of_the_feature_but_the_recorder() {
     let mut none = on();
@@ -15879,6 +16362,164 @@ fn an_exit_the_relaunch_gives_up_on_is_told_to_the_accounts_recorder() {
     );
 }
 
+/// A RELAUNCHED AGENT PAINTS UNDER THE HOST'S CLAIM: the claim is taken just before each attempt
+/// types its line (a relaunch or a restart's carry), so the agent it lands draws its first frames
+/// under it (the glass wraps a pane only under a live claim); a step that lands leaves it to the
+/// loop it hands to, and every other step gives it back at once. CONTROL: an exit left alone
+/// (`[harness] relaunch = false`) and a codex, whose loop only watches, claim nothing.
+#[test]
+fn a_relaunched_agent_paints_under_the_hosts_claim() {
+    let a = Arc::new(Acting::default());
+    let hooks = a.hooks();
+    let sid = "s-claim";
+    let run = |agent: Program, cfg: &SupervisorConfig, restarted: bool, step: &'static str| {
+        a.relaunch_claims.lock().unwrap().clear();
+        a.relaunched.lock().unwrap().clear();
+        a.relaunch_attempts.store(0, Ordering::SeqCst);
+        a.restart_in_flight.store(restarted, Ordering::SeqCst);
+        *a.relaunches.lock().unwrap() = [step].into();
+        *a.carry_steps.lock().unwrap() = [step].into();
+        let job = left_job(sid, agent, cfg);
+        with_kept(&job, |k| k.snapshot = Some(snap(sid)));
+        on_agent_left(&job, &hooks);
+        a.relaunch_claims
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(s, take, asked)| {
+                assert_eq!(s, sid);
+                (*take, *asked)
+            })
+            .collect::<Vec<_>>()
+    };
+    let taken = (true, 0);
+    assert_eq!(
+        run(Program::Claude, &on(), false, "adopted"),
+        [taken],
+        "taken before the relaunch, left to its loop"
+    );
+    assert_eq!(
+        run(Program::Claude, &on(), true, "adopted"),
+        [taken],
+        "a restart's carry too"
+    );
+    assert_eq!(
+        run(Program::Claude, &on(), false, "ended:one-shot"),
+        [taken, (false, 1)],
+        "an exit left as its end gives it back"
+    );
+    assert_eq!(
+        run(Program::Claude, &on(), false, "refused:shell-gone"),
+        [taken, (false, 1)],
+        "a relaunch that cannot land gives it back"
+    );
+    let mut limited = on();
+    limited.set("relaunch", "false").unwrap();
+    assert_eq!(
+        run(Program::Claude, &limited, false, "adopted"),
+        [],
+        "CONTROL: left alone, nothing claimed"
+    );
+    assert_eq!(
+        a.relaunch_attempts.load(Ordering::SeqCst),
+        0,
+        "CONTROL: nor relaunched"
+    );
+    assert_eq!(
+        run(Program::Codex, &on(), false, "ended:one-shot"),
+        [],
+        "CONTROL: a codex's loop only watches"
+    );
+}
+
+#[test]
+fn a_relaunch_claim_is_given_back_when_its_landing_read_loses_admission() {
+    #[derive(Clone, Copy, Debug)]
+    enum Change {
+        Healthy,
+        Revoke,
+        Off,
+        ForGood,
+    }
+    for (change, restarted, agent) in [
+        (Change::Healthy, false, Program::Claude),
+        (Change::Healthy, true, Program::Claude),
+        (Change::Revoke, false, Program::Claude),
+        (Change::Revoke, true, Program::Claude),
+        (Change::Off, false, Program::Claude),
+        (Change::Off, true, Program::Claude),
+        (Change::ForGood, false, Program::Claude),
+        (Change::Healthy, false, Program::Codex),
+    ] {
+        let sid = "s-claim-read";
+        let a = Arc::new(Acting::default());
+        a.restart_in_flight.store(restarted, Ordering::SeqCst);
+        let job = left_job(sid, agent, &on());
+        with_kept(&job, |k| k.snapshot = Some(snap(sid)));
+        let mut hooks = a.hooks();
+        let original_read = Arc::clone(&hooks.acts.snapshot);
+        let revoked = Arc::clone(&job.revoked);
+        let switches = Arc::clone(&job.switches);
+        let left = Arc::clone(&job.left);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let read_count = Arc::clone(&reads);
+        let during = Arc::clone(&a);
+        hooks.acts.snapshot = Arc::new(move |sid| {
+            let snapshot = original_read(sid);
+            if during.relaunch_attempts.load(Ordering::SeqCst) != 0 {
+                read_count.fetch_add(1, Ordering::SeqCst);
+                match change {
+                    Change::Healthy => {}
+                    Change::Revoke => revoked.store(true, Ordering::SeqCst),
+                    Change::Off => switches.agents.store(0, Ordering::SeqCst),
+                    Change::ForGood => {
+                        left.stop();
+                        return None;
+                    }
+                }
+            }
+            snapshot
+        });
+        if matches!(change, Change::ForGood) {
+            hooks.still_wanted = Arc::new(|_, _| false);
+        }
+        on_agent_left(&job, &hooks);
+        let claims: Vec<bool> = a
+            .relaunch_claims
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, take, _)| *take)
+            .collect();
+        let expected: &[bool] = if agent == Program::Codex {
+            assert_eq!(reads.load(Ordering::SeqCst), 0, "watch-only control");
+            &[]
+        } else {
+            assert!(reads.load(Ordering::SeqCst) > 0, "the landing read ran");
+            if matches!(change, Change::Healthy) {
+                &[true]
+            } else {
+                &[true, false]
+            }
+        };
+        assert_eq!(
+            claims, expected,
+            "{change:?}, restart={restarted}, {agent:?}"
+        );
+        if !matches!(change, Change::Healthy) {
+            assert!(
+                with_kept(&job, |kept| kept.owed.is_none()),
+                "no relaunch debt"
+            );
+            assert_ne!(
+                job.left.read(),
+                Word::Watching,
+                "no loop handoff after loss"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_refusal_a_resume_does_not_remedy_reaches_the_window_with_its_remedy() {
     let a = Arc::new(Acting::default());
@@ -16125,6 +16766,38 @@ fn the_tabs_on_one_login_share_its_one_sign_in() {
     b.login_abandon();
 }
 
+/// A windowed host hands its probe the network path its acts name, which the probe watches from
+/// its first ask; a headless host (a lab instance among them) installs none, so nothing starts a
+/// watch there.
+#[test]
+fn a_windowed_host_watches_the_network_path_its_acts_name_and_a_headless_one_none() {
+    #[derive(Default)]
+    struct Counting(AtomicUsize);
+    impl crate::harness_netprobe::PathSource for Counting {
+        fn watch(
+            &self,
+            _: crate::harness_netprobe::PathSink,
+        ) -> Option<crate::harness_netprobe::PathWatch> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Some(Box::new(()))
+        }
+    }
+    for headless in [false, true] {
+        let world = Arc::new(World::default());
+        let source = Arc::new(Counting::default());
+        let mut h = hooks(&world, parking_body(&world));
+        h.acts.net_path = Arc::clone(&source) as Arc<dyn crate::harness_netprobe::PathSource>;
+        let host = HostHandle::start(on(), headless, false, h);
+        host.shared.net.watch_path();
+        assert_eq!(
+            source.0.load(Ordering::SeqCst),
+            usize::from(!headless),
+            "headless {headless}"
+        );
+        host.shutdown_and_join();
+    }
+}
+
 #[test]
 fn a_worker_measures_the_default_route_only_and_reads_it_once_per_agent() {
     use crate::harness_netprobe::Probe;
@@ -16183,6 +16856,7 @@ fn a_worker_measures_the_default_route_only_and_reads_it_once_per_agent() {
     };
     let idle = host(Program::Claude);
     assert_eq!(idle.reach(), Reach::Unknown, "no agent snapshotted yet");
+    assert_eq!(idle.reach_at(), None, "no agent snapshotted yet");
     assert!(routes.lock().unwrap().is_empty());
     idle.kept.lock().unwrap().snapshot = Some(snapshot(4242));
     let asked = Instant::now();
@@ -16193,10 +16867,16 @@ fn a_worker_measures_the_default_route_only_and_reads_it_once_per_agent() {
     }
     assert!(matches!(seen, Reach::Down { .. }), "{seen:?}");
     assert_eq!(idle.reach(), seen, "the run's start stands");
+    let before = Instant::now();
+    let landing = idle
+        .reach_at()
+        .expect("a measured route has a next measure");
+    assert!(landing > before, "the next measure is later than now");
     assert_eq!(*routes.lock().unwrap(), [4242], "read once per agent");
     custom.store(true, Ordering::SeqCst);
     idle.kept.lock().unwrap().snapshot = Some(snapshot(4343));
     assert_eq!(idle.reach(), Reach::Unknown);
+    assert_eq!(idle.reach_at(), None, "a custom route is not measured");
     assert_eq!(*routes.lock().unwrap(), [4242, 4343]);
     let mut placed = snapshot(4343);
     placed.cwd = "/private/tmp".to_string();
@@ -16210,6 +16890,7 @@ fn a_worker_measures_the_default_route_only_and_reads_it_once_per_agent() {
     custom.store(false, Ordering::SeqCst);
     idle.kept.lock().unwrap().snapshot = Some(snapshot(4444));
     assert_eq!(idle.reach(), Reach::Unknown);
+    assert_eq!(idle.reach_at(), None, "probe_api off measures nothing");
     switches.set(&on(), false);
     for (agent, pid) in [
         (Program::Codex, 4545),
@@ -16220,12 +16901,384 @@ fn a_worker_measures_the_default_route_only_and_reads_it_once_per_agent() {
         let h = host(agent);
         h.kept.lock().unwrap().snapshot = Some(snapshot(pid));
         assert_eq!(h.reach(), Reach::Unknown, "{agent:?}");
+        assert_eq!(h.reach_at(), None, "{agent:?}");
     }
     assert_eq!(
         *routes.lock().unwrap(),
         [4242, 4343, 4343],
         "unsupported agents must not read Claude settings or borrow its reach"
     );
+    net.stop();
+}
+
+/// Every session the probe does not measure reads the network path alone, with `probe_api` on:
+/// another agent, a Claude Code on a route of its own, and one not yet snapshotted. A lost path
+/// reads Down with a look owed and its return Unknown, so the outage holds and the return
+/// re-decides the wait; none of them probes the API host, which a measured Claude Code on the
+/// Default route still does.
+#[test]
+fn an_unmeasured_session_reads_the_network_path_alone_and_probes_nothing() {
+    use crate::harness_netprobe::{PathSink, PathSource, PathWatch, Probe};
+    use aterm_agent::harness::netwatch::{Cadence, NetState};
+    struct Counted(AtomicU64);
+    impl Probe for Counted {
+        fn resolve(&self, _: &str, _: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        }
+        fn connect(
+            &self,
+            _: std::net::SocketAddr,
+            _: Duration,
+        ) -> std::io::Result<std::net::TcpStream> {
+            unreachable!()
+        }
+        fn handshake(
+            &self,
+            _: std::net::TcpStream,
+            _: &str,
+            _: aterm_http::Deadline,
+        ) -> std::io::Result<()> {
+            unreachable!()
+        }
+    }
+    /// A path source that hands its sink to the test.
+    #[derive(Default)]
+    struct Handed(Mutex<Option<PathSink>>);
+    impl PathSource for Handed {
+        fn watch(&self, sink: PathSink) -> Option<PathWatch> {
+            *self.0.lock().unwrap() = Some(sink);
+            Some(Box::new(()))
+        }
+    }
+    let custom = Arc::new(AtomicBool::new(true));
+    let c1 = Arc::clone(&custom);
+    let mut hooks = hooks(
+        &Arc::new(World::default()),
+        Arc::new(|_: &WorkerJob| BodyEnd::Stopped),
+    );
+    hooks.acts = Acts {
+        route: Arc::new(move |_, _, _| {
+            if c1.load(Ordering::SeqCst) {
+                Route::Custom("ANTHROPIC_BASE_URL in the agent's environment".to_string())
+            } else {
+                Route::Default
+            }
+        }),
+        ..Acts::inert()
+    };
+    let probe = Arc::new(Counted(AtomicU64::new(0)));
+    let net = NetProbe::with_state(
+        Arc::clone(&probe) as Arc<dyn Probe>,
+        NetState::with_cadence(
+            Duration::from_secs(2),
+            Cadence {
+                settle: Duration::ZERO,
+                ..Cadence::default()
+            },
+        ),
+    );
+    let source = Arc::new(Handed::default());
+    assert!(net.path_from(Arc::clone(&source) as Arc<dyn PathSource>));
+    let read = |satisfied: bool| {
+        let sink = source.0.lock().unwrap();
+        (sink.as_ref().expect("the first read started the watch"))(
+            crate::harness_netprobe::PathEvent::Usable(satisfied),
+        );
+    };
+    let switches = switched(&on());
+    let host = |agent: Program, switches: &Arc<Switches>, pid: Option<u32>| {
+        let mut idle = idle_host("s-path", agent, Arc::clone(switches), hooks.clone());
+        idle.net = Arc::clone(&net);
+        idle.kept.lock().unwrap().snapshot = pid.map(|pid| Snapshot {
+            pid,
+            cwd: "/tmp".to_string(),
+            ..snap("s-path")
+        });
+        idle
+    };
+    let sessions = [
+        (
+            "a custom route",
+            host(Program::Claude, &switches, Some(4242)),
+        ),
+        ("no snapshot", host(Program::Claude, &switches, None)),
+        ("codex", host(Program::Codex, &switches, Some(4444))),
+        ("grok", host(Program::Grok, &switches, Some(4545))),
+        ("kimi", host(Program::Kimi, &switches, Some(4646))),
+        ("agy", host(Program::Agy, &switches, Some(4747))),
+        ("muse", host(Program::Muse, &switches, Some(4848))),
+        ("generic", host(Program::Generic, &switches, Some(4949))),
+    ];
+    for (what, idle) in &sessions {
+        assert_eq!(idle.reach(), Reach::Unknown, "{what}: no reading yet");
+        assert_eq!(idle.reach_at(), None, "{what}: nothing lost");
+    }
+    read(true);
+    read(false);
+    let lost = Instant::now();
+    for (what, idle) in &sessions {
+        assert!(
+            matches!(idle.reach(), Reach::Down { since } if since <= lost),
+            "{what}: a lost path reads Down: {:?}",
+            idle.reach()
+        );
+        assert!(
+            idle.reach_at().is_some_and(|at| at > lost),
+            "{what}: a lost path owes the wait a look"
+        );
+    }
+    read(true);
+    for (what, idle) in &sessions {
+        assert_eq!(idle.reach(), Reach::Unknown, "{what}: the path's return");
+        assert_eq!(idle.reach_at(), None, "{what}");
+    }
+    assert_eq!(
+        probe.0.load(Ordering::SeqCst),
+        0,
+        "no unmeasured session probes the API host"
+    );
+    custom.store(false, Ordering::SeqCst);
+    let measured = host(Program::Claude, &switches, Some(5050));
+    measured.reach();
+    let asked = Instant::now();
+    while probe.0.load(Ordering::SeqCst) == 0 && asked.elapsed() < aterm_spec::wait::MUST_HAPPEN {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        probe.0.load(Ordering::SeqCst) > 0,
+        "a Claude Code on the Default route is still measured"
+    );
+    net.stop();
+}
+
+/// With `probe_api` off no session reads the reach: a measured Claude Code and every session
+/// that would read the path alone get Unknown with no next look, nothing is probed, and the
+/// installed path watch never starts, so a windowed lab instance (whose scratch config writes
+/// `probe_api = false`) never runs a monitor on this Mac's network. Turned on, the next read
+/// starts the watch; turned off again, a watch already started is no longer read.
+#[test]
+fn with_probe_api_off_no_session_reads_the_reach_or_starts_the_path_watch() {
+    use crate::harness_netprobe::{PathSink, PathSource, PathWatch, Probe};
+    struct Counted(AtomicU64);
+    impl Probe for Counted {
+        fn resolve(&self, _: &str, _: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        }
+        fn connect(
+            &self,
+            _: std::net::SocketAddr,
+            _: Duration,
+        ) -> std::io::Result<std::net::TcpStream> {
+            unreachable!()
+        }
+        fn handshake(
+            &self,
+            _: std::net::TcpStream,
+            _: &str,
+            _: aterm_http::Deadline,
+        ) -> std::io::Result<()> {
+            unreachable!()
+        }
+    }
+    /// A path source that counts its watches and hands its sink to the test.
+    #[derive(Default)]
+    struct Handed {
+        sink: Mutex<Option<PathSink>>,
+        watches: AtomicUsize,
+    }
+    impl PathSource for Handed {
+        fn watch(&self, sink: PathSink) -> Option<PathWatch> {
+            self.watches.fetch_add(1, Ordering::SeqCst);
+            *self.sink.lock().unwrap() = Some(sink);
+            Some(Box::new(()))
+        }
+    }
+    let mut hooks = hooks(
+        &Arc::new(World::default()),
+        Arc::new(|_: &WorkerJob| BodyEnd::Stopped),
+    );
+    hooks.acts = Acts {
+        route: Arc::new(|_, _, _| Route::Default),
+        ..Acts::inert()
+    };
+    let probe = Arc::new(Counted(AtomicU64::new(0)));
+    let net = NetProbe::with(Arc::clone(&probe) as Arc<dyn Probe>, Duration::from_secs(2));
+    let source = Arc::new(Handed::default());
+    assert!(net.path_from(Arc::clone(&source) as Arc<dyn PathSource>));
+    let mut unprobed = on();
+    unprobed.probe_api = false;
+    let switches = switched(&unprobed);
+    let host = |agent: Program, pid: Option<u32>| {
+        let mut idle = idle_host("s-off", agent, Arc::clone(&switches), hooks.clone());
+        idle.net = Arc::clone(&net);
+        idle.kept.lock().unwrap().snapshot = pid.map(|pid| Snapshot {
+            pid,
+            cwd: "/tmp".to_string(),
+            ..snap("s-off")
+        });
+        idle
+    };
+    let sessions = [
+        ("a measured route", host(Program::Claude, Some(4242))),
+        ("no snapshot", host(Program::Claude, None)),
+        ("codex", host(Program::Codex, Some(4444))),
+        ("grok", host(Program::Grok, Some(4545))),
+        ("kimi", host(Program::Kimi, Some(4646))),
+        ("agy", host(Program::Agy, Some(4747))),
+        ("muse", host(Program::Muse, Some(4848))),
+        ("generic", host(Program::Generic, Some(4949))),
+    ];
+    for (what, idle) in &sessions {
+        assert_eq!(idle.reach(), Reach::Unknown, "{what}: probe_api off");
+        assert_eq!(idle.reach_at(), None, "{what}: no next look");
+    }
+    assert_eq!(
+        source.watches.load(Ordering::SeqCst),
+        0,
+        "probe_api off starts no path watch (an ask would start it with the probe's thread)"
+    );
+    switches.set(&on(), false);
+    let (_, codex) = &sessions[2];
+    assert_eq!(codex.reach(), Reach::Unknown, "on: no reading yet");
+    assert_eq!(
+        source.watches.load(Ordering::SeqCst),
+        1,
+        "turned on, the next read starts the watch"
+    );
+    {
+        let sink = source.sink.lock().unwrap();
+        let sink = sink.as_ref().expect("a watch started");
+        sink(crate::harness_netprobe::PathEvent::Usable(true));
+        sink(crate::harness_netprobe::PathEvent::Usable(false));
+    }
+    assert!(
+        matches!(codex.reach(), Reach::Down { .. }),
+        "on: a lost path reads Down"
+    );
+    switches.set(&unprobed, false);
+    assert_eq!(
+        codex.reach(),
+        Reach::Unknown,
+        "off again: the path is not read"
+    );
+    assert_eq!(codex.reach_at(), None);
+    assert_eq!(
+        probe.0.load(Ordering::SeqCst),
+        0,
+        "no probe ran: only a path-only session read with it on"
+    );
+    net.stop();
+}
+
+/// A worker's peek ([`IdleHost::reach_peek`]) is its reach unasked, under the same gate: with
+/// `probe_api` on, a measured Claude Code reads the probe's verdict and every other session the
+/// path alone, so a lost path reads Down for both, and no peek probes anything; with it off,
+/// every peek is Unknown and starts no path watch. NEGATIVE CONTROL (run): with
+/// `WorkerIdle::reach_peek`'s Measured arm made Unknown, the measured Claude Code reads no Down
+/// on the lost path and the test fails.
+#[test]
+fn a_worker_peeks_its_reach_under_the_reachs_gate_and_probes_nothing() {
+    use crate::harness_netprobe::{PathEvent, PathSink, PathSource, PathWatch, Probe};
+    struct Counted(AtomicU64);
+    impl Probe for Counted {
+        fn resolve(&self, _: &str, _: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        }
+        fn connect(
+            &self,
+            _: std::net::SocketAddr,
+            _: Duration,
+        ) -> std::io::Result<std::net::TcpStream> {
+            unreachable!()
+        }
+        fn handshake(
+            &self,
+            _: std::net::TcpStream,
+            _: &str,
+            _: aterm_http::Deadline,
+        ) -> std::io::Result<()> {
+            unreachable!()
+        }
+    }
+    /// A path source that counts its watches and hands its sink to the test.
+    #[derive(Default)]
+    struct Handed {
+        sink: Mutex<Option<PathSink>>,
+        watches: AtomicUsize,
+    }
+    impl PathSource for Handed {
+        fn watch(&self, sink: PathSink) -> Option<PathWatch> {
+            self.watches.fetch_add(1, Ordering::SeqCst);
+            *self.sink.lock().unwrap() = Some(sink);
+            Some(Box::new(()))
+        }
+    }
+    let mut hooks = hooks(
+        &Arc::new(World::default()),
+        Arc::new(|_: &WorkerJob| BodyEnd::Stopped),
+    );
+    hooks.acts = Acts {
+        route: Arc::new(|_, _, _| Route::Default),
+        ..Acts::inert()
+    };
+    let probe = Arc::new(Counted(AtomicU64::new(0)));
+    let net = NetProbe::with(Arc::clone(&probe) as Arc<dyn Probe>, Duration::from_secs(2));
+    let source = Arc::new(Handed::default());
+    assert!(net.path_from(Arc::clone(&source) as Arc<dyn PathSource>));
+    let mut unprobed = on();
+    unprobed.probe_api = false;
+    let switches = switched(&unprobed);
+    let host = |agent: Program, pid: u32| {
+        let mut idle = idle_host("s-peek", agent, Arc::clone(&switches), hooks.clone());
+        idle.net = Arc::clone(&net);
+        idle.kept.lock().unwrap().snapshot = Some(Snapshot {
+            pid,
+            cwd: "/tmp".to_string(),
+            ..snap("s-peek")
+        });
+        idle
+    };
+    let sessions = [
+        ("a measured Claude Code", host(Program::Claude, 4242)),
+        ("agy", host(Program::Agy, 4747)),
+    ];
+    for (what, idle) in &sessions {
+        assert_eq!(idle.reach_peek(), Reach::Unknown, "{what}: probe_api off");
+    }
+    assert_eq!(
+        source.watches.load(Ordering::SeqCst),
+        0,
+        "probe_api off: no peek starts the path watch"
+    );
+    switches.set(&on(), false);
+    for (what, idle) in &sessions {
+        assert_eq!(
+            idle.reach_peek(),
+            Reach::Unknown,
+            "{what}: nothing read yet"
+        );
+    }
+    assert_eq!(source.watches.load(Ordering::SeqCst), 1, "the first peek");
+    {
+        let sink = source.sink.lock().unwrap();
+        let sink = sink.as_ref().expect("a watch started");
+        sink(PathEvent::Usable(true));
+        sink(PathEvent::Usable(false));
+    }
+    for (what, idle) in &sessions {
+        assert!(
+            matches!(idle.reach_peek(), Reach::Down { .. }),
+            "{what}: a lost path reads Down"
+        );
+    }
+    switches.set(&unprobed, false);
+    for (what, idle) in &sessions {
+        assert_eq!(idle.reach_peek(), Reach::Unknown, "{what}: off again");
+    }
+    assert_eq!(probe.0.load(Ordering::SeqCst), 0, "no peek probed anything");
     net.stop();
 }
 
@@ -17933,16 +18986,19 @@ fn a_muse_landing_renews_no_claude_workers_counts() {
 
 #[test]
 fn an_agents_own_landing_parks_its_workers_alone() {
-    let own: Vec<Program> = if cfg!(target_os = "macos") {
-        vec![Program::Agy, Program::Muse]
-    } else {
-        Vec::new()
-    };
     assert_eq!(
-        own_marker_agents(),
-        own,
-        "agy's and Muse Code's markers are their own; Claude Code's and Codex's are the first"
+        own_marker_agents_served(|_| true),
+        vec![Program::Agy, Program::Muse],
+        "agy's and Muse Code's landings are their own; Claude Code's and Codex's wake every worker"
     );
+    assert_eq!(
+        own_marker_agents_served(|program| program != "muse"),
+        vec![Program::Agy],
+        "a program this platform has no build of (Muse Code off macOS) is watched for no one"
+    );
+    if cfg!(target_os = "macos") {
+        assert_eq!(own_marker_agents(), vec![Program::Agy, Program::Muse]);
+    }
     let a = Arc::new(Acting::default());
     a.busy.store(true, Ordering::SeqCst);
     for sid in ["s-cl", "s-mu", "s-y"] {
@@ -20112,6 +21168,209 @@ fn a_left_restart_keeps_its_cannot_line() {
     assert!(left_ends_relaunch_line(Say::Clear));
 }
 
+/// The told resume command is the agent's own launch argv (a system prompt's text, the
+/// directories it was given, a config directory): the tab's mark and the Messages row
+/// ([`RelaunchSay::Cannot`]) keep it whole, and aterm.log names it by its length, on the line that
+/// says the agent cannot come back and on the one that says it is too long for the mark
+/// (DESIGN §3.6; unit E7 overrides E4's note that the line is outside the class).
+#[test]
+fn a_cannot_line_names_the_told_command_by_its_length() {
+    use aterm_agent::harness::relaunch::{AgentRun, AgyRun};
+    let world = Arc::new(World::default());
+    let hooks = hooks(&world, parking_body(&world));
+    let claude_sid = "s-e7a1000000000000000001";
+    let claude = left_job(claude_sid, Program::Claude, &on());
+    let snapshot = Snapshot {
+        argv: [
+            "/opt/claude",
+            "--append-system-prompt",
+            "QZP7E7A1",
+            "--add-dir",
+            "/tmp/QZP7E7A2",
+        ]
+        .map(str::to_string)
+        .to_vec(),
+        session: Some("e7e7a1a1-0000-4000-8000-00000000e7a1".to_string()),
+        ..snap(claude_sid)
+    };
+    let told = resume_told(&snapshot).expect("CONTROL: a told command");
+    assert!(
+        told.contains("QZP7E7A1") && told.contains("/tmp/QZP7E7A2"),
+        "CONTROL: the told command carries the launch's argv"
+    );
+    with_kept(&claude, |k| k.snapshot = Some(snapshot));
+
+    let agy_sid = "s-e7a3000000000000000003";
+    let agy = left_job(agy_sid, Program::Agy, &on());
+    let deep = format!("--gemini_dir=/tmp/QZP7E7A3/{}", "p".repeat(170));
+    let agy_snapshot = Snapshot {
+        program: std::path::PathBuf::from("/opt/agy"),
+        argv: vec!["/opt/agy".to_string(), deep],
+        session: Some("e7e7a3a3-0000-4000-8000-00000000e7a3".to_string()),
+        run: AgentRun::Agy(AgyRun {
+            config: "/u/.gemini/antigravity-cli".into(),
+            env: Vec::new(),
+            lock: None,
+            crash: None,
+            started_ms: 0,
+            block: None,
+        }),
+        ..snap(agy_sid)
+    };
+    let agy_told = resume_told(&agy_snapshot).expect("CONTROL: agy's told line");
+    assert!(
+        agy_told.contains("QZP7E7A3") && agy_told.len() > 190,
+        "CONTROL: a told line longer than the mark holds"
+    );
+    with_kept(&agy, |k| k.snapshot = Some(agy_snapshot));
+
+    let logged = logged_while(|| {
+        tell(
+            &claude,
+            &hooks,
+            Say::Cannot,
+            "refused:shell-gone",
+            false,
+            false,
+        );
+        tell(
+            &agy,
+            &hooks,
+            Say::Cannot,
+            "refused:shell-gone",
+            false,
+            false,
+        );
+    });
+    for (sid, told) in [(claude_sid, &told), (agy_sid, &agy_told)] {
+        assert!(
+            logged
+                .iter()
+                .any(|line| line.starts_with(&format!("harness @{sid}: "))
+                    && line.contains(&format!("run the told command ({}B)", told.len()))
+                    && line.ends_with("(refused:shell-gone)")),
+            "@{sid}'s cannot line names the command by its length: {} lines",
+            logged.len()
+        );
+    }
+    assert!(
+        logged.iter().any(|line| line
+            == &format!(
+                "harness @{agy_sid}: the command that starts the agent by hand is too long for \
+                 the tab's mark whole ({}B)",
+                agy_told.len()
+            )),
+        "the too-long line is logged: {} lines",
+        logged.len()
+    );
+    assert!(
+        !logged.iter().any(|line| line.contains("QZP7E7A")),
+        "the log keeps the told command's words"
+    );
+    // CONTROL: the tab's mark and the Messages row keep the command (the mark as much of it as
+    // fits).
+    let mark = mark_text(
+        cannot_head(false),
+        &cannot_reason("refused:shell-gone"),
+        "run",
+        &told,
+        resume_place("refused:shell-gone"),
+    );
+    assert!(mark.is_some(), "CONTROL: the Claude tab is marked");
+    assert!(
+        world
+            .badges
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(sid, said)| sid == claude_sid && *said == mark),
+        "CONTROL: the tab's mark says the command"
+    );
+    for (sid, told) in [(claude_sid, &told), (agy_sid, &agy_told)] {
+        assert!(
+            world.notes.lock().unwrap().iter().any(|note| matches!(
+                note,
+                HostNote::Relaunch {
+                    sid: noted,
+                    said: RelaunchSay::Cannot { command: Some(command), .. },
+                } if noted == sid && command == told
+            )),
+            "CONTROL: @{sid}'s Messages row says the command"
+        );
+    }
+}
+
+/// A reader's panic reaches aterm.log as its kind and length, at the screen reader's fence and
+/// on the host thread: std's messages quote what they cut or compared, a session's screen
+/// (DESIGN §3.6).
+#[test]
+fn a_readers_panic_reaches_the_log_as_its_kind_and_length() {
+    let rows = vec!["\u{e9} QZP7E7C1 row".to_string()];
+    let cut = || rows[0][..1].len();
+    let compared = || {
+        assert_eq!(rows[0], "a box", "the box's row");
+        0
+    };
+    // CONTROL: the comparison's own message quotes the row.
+    let quoted = crate::reader_guard::guarded(compared).expect_err("the comparison panics");
+    assert!(
+        quoted.message.contains("QZP7E7C1"),
+        "CONTROL: the panic's text quotes the row"
+    );
+    let logged = logged_while(|| {
+        assert_eq!(
+            crate::reader_guard::read_or_none(0xE7C1_u64, "E7 cut", &rows, cut),
+            None
+        );
+        assert_eq!(
+            crate::reader_guard::read_or_none(0xE7C2_u64, "E7 compared", &rows, compared),
+            None
+        );
+        assert_eq!(host_caught("s-e7c3", "the E7 check", compared), None);
+        assert_eq!(caught("the E7 pass", "it runs again", compared), None);
+    });
+    for (head, kind) in [
+        (
+            format!(
+                "screen reader: aterm_phase panicked reading session {}'s screen for the E7 cut",
+                0xE7C1_u64
+            ),
+            "str-slice panic (",
+        ),
+        (
+            format!(
+                "screen reader: aterm_phase panicked reading session {}'s screen for the E7 \
+                 compared",
+                0xE7C2_u64
+            ),
+            "assert panic (",
+        ),
+        (
+            "harness @s-e7c3: the E7 check stopped after an internal panic on the host thread: \
+             assert panic ("
+                .to_string(),
+            "assert panic (",
+        ),
+        (
+            "harness: the E7 pass stopped after an internal panic; it runs again: assert panic ("
+                .to_string(),
+            "assert panic (",
+        ),
+    ] {
+        assert!(
+            logged
+                .iter()
+                .any(|line| line.starts_with(&head) && line.contains(kind)),
+            "{head:?} names the panic's kind: {} lines",
+            logged.len()
+        );
+    }
+    assert!(
+        !logged.iter().any(|line| line.contains("QZP7E7C")),
+        "the log keeps the panic's text"
+    );
+}
+
 #[test]
 fn the_mark_for_an_agent_that_cannot_come_back_names_why_and_the_command() {
     let cannot_mark = |restarted: bool, reason: &str, command: &str| {
@@ -20134,12 +21393,26 @@ fn the_mark_for_an_agent_that_cannot_come_back_names_why_and_the_command() {
     assert!(text.contains(&bare), "{text}");
     assert_eq!(
         text,
+        format!(
+            "{} ({}); run {bare} in this tab",
+            cannot_head(false),
+            cannot_reason("shell-gone")
+        )
+    );
+    assert_eq!(
         cannot_said(
             false,
             &cannot_reason("shell-gone"),
             Some(&bare),
             resume_place("refused:shell-gone")
-        )
+        ),
+        format!(
+            "{} ({}); run the told command ({}B) in this tab",
+            cannot_head(false),
+            cannot_reason("shell-gone"),
+            bare.len()
+        ),
+        "the log names the command by its length"
     );
     let long = format!("claude --model {} --resume {id}", "x".repeat(200));
     let text = cannot_mark(true, &cannot_reason("shell-gone"), &long).expect("a mark");
@@ -20158,8 +21431,8 @@ fn the_mark_for_an_agent_that_cannot_come_back_names_why_and_the_command() {
         None
     );
     assert!(
-        cannot_said(false, "x", Some(&deep), "in this tab").contains(&deep),
-        "the log keeps it whole"
+        !cannot_said(false, "x", Some(&deep), "in this tab").contains(&bare),
+        "the log keeps no word of it"
     );
     let home = cannot_reason("refused:home");
     assert_ne!(home, cannot_reason("refused:something-unknown"));
@@ -20824,9 +22097,12 @@ fn a_failing_relaunch_is_retried_and_said_and_an_impossible_one_is_said() {
         let badges = a.badges.lock().unwrap();
         assert!(
             matches!(&badges[..], [Some(failing), None]
-                if failing.starts_with("the agent exited; its relaunch keeps failing (the new \
-                                        agent never picked the conversation back up)")
-                    && failing.contains("; aterm still tries; or run claude --resume ")),
+            if failing.starts_with("the agent exited; its relaunch keeps failing (the new \
+                                    agent never picked the conversation back up)")
+                && failing.contains(
+                    "; aterm still tries; or run claude --resume \
+                     0badf00d-1111-2222-3333-444455556666"
+                )),
             "{badges:?}"
         );
     }
@@ -22573,6 +23849,300 @@ fn autopilot_off_stops_the_worker_and_starts_none_until_it_is_on_again() {
     host.shutdown_and_join();
 }
 
+/// AN AGENT STARTED IN AN OFF TAB IS NOTED BEHIND: Autopilot Off starts no worker to note the
+/// build a Claude Code agent runs behind (the record its ⬆️ reads, whose press passes the Off),
+/// so the host notes it: once for the agent, again for an agent started after it and at an
+/// activation notice, and never again while neither moves; once the tab leaves Off its worker
+/// notes it, and the host no more. NEGATIVE CONTROLS: a Cruise tab is noted only by its worker
+/// (at the activation notice, once), and a Codex tab under Off, which no press moves, never.
+#[test]
+fn an_agent_started_in_an_off_tab_is_noted_behind() {
+    let world = Arc::new(World::default());
+    let group = Arc::new(AtomicI32::new(100));
+    let noted: Arc<Mutex<Vec<String>>> = Arc::default();
+    let (w, g, n) = (Arc::clone(&world), Arc::clone(&group), Arc::clone(&noted));
+    let mut hooks = hooks(&world, parking_body(&world));
+    hooks.roster = Arc::new(move || {
+        let stamp = FollowStamp {
+            group: g.load(Ordering::SeqCst),
+            ..FollowStamp::default()
+        };
+        w.roster
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(sid, program)| (sid.clone(), *program, stamp))
+            .collect()
+    });
+    hooks.acts = Acts {
+        behind: Arc::new(move |sid, _| {
+            n.lock().unwrap().push(sid.to_string());
+            Behind::Noted
+        }),
+        ..Acts::inert()
+    };
+    let host = HostHandle::start(on(), false, false, hooks);
+    world.word("s-off", Some(Autopilot::Off));
+    world.word("s-codex", Some(Autopilot::Off));
+    world.set(&[
+        ("s-off", Program::Claude),
+        ("s-on", Program::Claude),
+        ("s-codex", Program::Codex),
+    ]);
+    // How often each of the Off tab, the Cruise tab and the Codex tab was noted.
+    let counts = || {
+        let noted = noted.lock().unwrap();
+        let of = |sid: &str| noted.iter().filter(|s| *s == sid).count();
+        (of("s-off"), of("s-on"), of("s-codex"))
+    };
+    until("the Off tab's agent noted", || counts().0 == 1);
+    until("s-on supervised", || host.live() == ["s-on"]);
+    world.passes();
+    assert_eq!(counts(), (1, 0, 0), "once for the agent");
+    group.store(101, Ordering::SeqCst);
+    ring();
+    until("an agent started after it noted", || counts().0 == 2);
+    world.passes();
+    assert_eq!(counts(), (2, 0, 0), "a new agent: the Off tab's alone");
+    host.note_activation();
+    until("noted at the activation notice", || counts() == (3, 1, 0));
+    world.passes();
+    assert_eq!(
+        counts(),
+        (3, 1, 0),
+        "at the notice, the Off tab by the host and the Cruise tab by its worker, once each"
+    );
+    world.word("s-off", Some(Autopilot::Cruise));
+    until("s-off supervised", || host.live() == ["s-off", "s-on"]);
+    group.store(102, Ordering::SeqCst);
+    world.passes();
+    assert_eq!(counts(), (3, 1, 0), "out of Off, its worker's to note");
+    host.shutdown_and_join();
+}
+
+/// AN AGENT STARTED UNDER THE HARNESS SWITCHED OFF IS NOTED BEHIND AND SHOWN: with the master
+/// switch off (`[harness] enabled = false`, what a press of the top rule's `● on` writes) or
+/// Claude Code's own (`[harness.claude] enabled = false`), no worker runs to note the build a
+/// Claude Code agent runs behind, so the host notes it (the record its ⬆️ reads, whose press passes
+/// the switch): once for the agent, again for an agent started after it and at an activation
+/// notice, and never again while neither moves; and the owner's view is looked at with the tab set
+/// aside for its harness off, which the window shows as the colour ⬆️ a press acts on. Once the
+/// harness is on again its worker notes it, and the host no more. NEGATIVE CONTROLS: a Muse Code
+/// tab, upgraded live but moved by no press, is never noted by the host (under the master off it
+/// is set aside with the rest; under Claude Code's switch off its worker notes it, at the notice,
+/// once); and with `[harness] upgrade = false` the master off stands the view down.
+#[test]
+fn an_agent_started_under_the_harness_switched_off_is_noted_behind_and_shown() {
+    /// One look at the owner's view: whether it was looked at, and the tabs set aside as their
+    /// harness off.
+    type Look = (bool, Vec<String>);
+    for master in [true, false] {
+        let world = Arc::new(World::default());
+        let group = Arc::new(AtomicI32::new(100));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let noted: Arc<Mutex<Vec<String>>> = Arc::default();
+        let looks: Arc<Mutex<Vec<Look>>> = Arc::default();
+        let (w, g, r) = (Arc::clone(&world), Arc::clone(&group), Arc::clone(&reads));
+        let (n, l) = (Arc::clone(&noted), Arc::clone(&looks));
+        let mut hooks = hooks(&world, parking_body(&world));
+        hooks.roster = Arc::new(move || {
+            r.fetch_add(1, Ordering::SeqCst);
+            let stamp = FollowStamp {
+                group: g.load(Ordering::SeqCst),
+                ..FollowStamp::default()
+            };
+            w.roster
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(sid, program)| (sid.clone(), *program, stamp))
+                .collect()
+        });
+        hooks.acts = Acts {
+            behind: Arc::new(move |sid, _| {
+                n.lock().unwrap().push(sid.to_string());
+                Behind::Noted
+            }),
+            ..Acts::inert()
+        };
+        hooks.upgrade_view = Arc::new(move |look, _, _, agent_off| {
+            l.lock().unwrap().push((look, agent_off.to_vec()));
+            ViewNext::default()
+        });
+        let host = HostHandle::start(on(), false, false, hooks);
+        world.set(&[("s-claude", Program::Claude), ("s-muse", Program::Muse)]);
+        // How often each of the Claude Code tab and the Muse Code tab was noted.
+        let counts = || {
+            let noted = noted.lock().unwrap();
+            let of = |sid: &str| noted.iter().filter(|s| *s == sid).count();
+            (of("s-claude"), of("s-muse"))
+        };
+        let last_look = || looks.lock().unwrap().last().cloned();
+        // Two passes of the host that read the roster.
+        let passes = || {
+            let seen = reads.load(Ordering::SeqCst);
+            until("two passes", || {
+                ring();
+                reads.load(Ordering::SeqCst) >= seen + 2
+            });
+        };
+        let case = if master { "master" } else { "claude" };
+        until("both supervised", || host.live() == ["s-claude", "s-muse"]);
+        passes();
+        assert_eq!(counts(), (0, 0), "{case}: supervised, noted by no host");
+        let switched_off = if master {
+            off()
+        } else {
+            let mut cfg = on();
+            cfg.off.push(Program::Claude);
+            cfg
+        };
+        host.set_config(switched_off.clone());
+        until("the Claude Code tab noted", || counts().0 == 1);
+        let aside: &[&str] = if master {
+            &["s-claude", "s-muse"]
+        } else {
+            &["s-claude"]
+        };
+        until("looked at with the tab set aside", || {
+            last_look().is_some_and(|(look, off)| look && off == aside)
+        });
+        passes();
+        assert_eq!(counts(), (1, 0), "{case}: once for the agent");
+        group.store(101, Ordering::SeqCst);
+        until("an agent started after it noted", || {
+            ring();
+            counts().0 == 2
+        });
+        passes();
+        assert_eq!(
+            counts(),
+            (2, 0),
+            "{case}: a new agent, the Claude Code tab's alone"
+        );
+        host.note_activation();
+        let at_notice = if master { (3, 0) } else { (3, 1) };
+        until("noted at the activation notice", || counts() == at_notice);
+        passes();
+        assert_eq!(
+            counts(),
+            at_notice,
+            "{case}: at the notice, the Claude Code tab by the host (and a supervised Muse Code \
+             tab by its worker), once each"
+        );
+        if master {
+            let mut quiet = off();
+            quiet.set("upgrade", "false").unwrap();
+            host.set_config(quiet);
+            until("the view stood down", || {
+                last_look().is_some_and(|(look, _)| !look)
+            });
+            host.set_config(switched_off);
+            until("looked at again", || {
+                last_look().is_some_and(|(look, off)| look && off == aside)
+            });
+        }
+        host.set_config(on());
+        until("supervised again", || host.live() == ["s-claude", "s-muse"]);
+        let noted_on = counts();
+        group.store(102, Ordering::SeqCst);
+        passes();
+        assert_eq!(counts(), noted_on, "{case}: on again, its worker's to note");
+        assert!(
+            looks
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(look, off)| !look || off.is_empty() || off == aside),
+            "{case}: {:?}",
+            looks.lock().unwrap()
+        );
+        host.shutdown_and_join();
+    }
+}
+
+/// `[harness] upgrade` WITH THE MASTER SWITCH ALONE OFF KEEPS THE PRESS'S NOTES: the host notes
+/// and shows the builds its agents run behind with `[harness] enabled = false` while `[harness]
+/// upgrade` is on ([`Switches::upgrade_while_off`]). NEGATIVE CONTROLS: the harness on (its
+/// workers note), `[harness] upgrade = false`, and a headless instance under `[harness] headless =
+/// false`, which was never to supervise.
+#[test]
+fn the_master_switch_alone_off_keeps_the_presss_notes() {
+    let cfg = |keys: &[(&str, &str)]| {
+        let mut c = SupervisorConfig::default();
+        for (key, value) in keys {
+            c.set(key, value).unwrap();
+        }
+        c
+    };
+    let cases = [
+        ("the master off", cfg(&[("enabled", "false")]), false, true),
+        (
+            "the master off, headless allowed",
+            cfg(&[("enabled", "false"), ("headless", "true")]),
+            true,
+            true,
+        ),
+        ("CONTROL: on", cfg(&[]), false, false),
+        (
+            "CONTROL: upgrade off",
+            cfg(&[("enabled", "false"), ("upgrade", "false")]),
+            false,
+            false,
+        ),
+        (
+            "CONTROL: headless, never to supervise",
+            cfg(&[("enabled", "false"), ("headless", "false")]),
+            true,
+            false,
+        ),
+    ];
+    for (what, cfg, headless, notes) in cases {
+        let switches = Switches::default();
+        switches.set(&cfg, headless);
+        assert_eq!(switches.upgrade_while_off(), notes, "{what}");
+    }
+}
+
+/// A CHANGE OF `[harness] upgrade` ALONE WAKES THE HOST: the policy the host holds leaves it out
+/// ([`effective`]), yet each pass reads it to look at the owner's view of the upgrades and to note
+/// the tabs no worker runs in, with the harness on and with its master switch off
+/// ([`Switches::upgrade_while_off`]), so the reload rings the host, once. NEGATIVE CONTROLS: the
+/// same policy again rings nothing, with the harness on or off. CONTROL: the master switch moved
+/// rings as before.
+#[test]
+fn a_change_of_the_upgrade_switch_alone_wakes_the_host() {
+    let cfg = |keys: &[(&str, &str)]| {
+        let mut c = SupervisorConfig::default();
+        for (key, value) in keys {
+            c.set(key, value).unwrap();
+        }
+        c
+    };
+    let world = Arc::new(World::default());
+    let host = HostHandle::start(on(), false, false, hooks(&world, parking_body(&world)));
+    let quiet = [("upgrade", "false")];
+    let off_quiet = [("enabled", "false"), ("upgrade", "false")];
+    for (what, to, rings) in [
+        ("NEGATIVE CONTROL: on, again", cfg(&[]), Some(0)),
+        ("on, upgrade off", cfg(&quiet), Some(1)),
+        ("on, upgrade on", cfg(&[]), Some(1)),
+        ("CONTROL: the master off", off(), None),
+        ("NEGATIVE CONTROL: the master off, again", off(), Some(0)),
+        ("the master off, upgrade off", cfg(&off_quiet), Some(1)),
+        ("the master off, upgrade on", off(), Some(1)),
+    ] {
+        let before = rings_here();
+        host.set_config(to);
+        let rung = rings_here() - before;
+        match rings {
+            Some(rings) => assert_eq!(rung, rings, "{what}"),
+            None => assert!(rung > 0, "{what}: {rung}"),
+        }
+    }
+    host.shutdown_and_join();
+}
+
 #[test]
 fn a_worker_started_as_its_sessions_off_lifts_is_told_so() {
     let world = Arc::new(World::default());
@@ -23390,6 +24960,7 @@ impl Probe {
             pause: Arc::new(quick_pause),
             carry_clock: Arc::new(MonotonicClock),
             upgrade_view: Arc::new(|_, _, _, _| ViewNext::default()),
+            upgrade_sources: Arc::new(crate::upgrade_host::UpgradeSources::default),
             disk: Arc::new(|_| {}),
             codex_roster: Arc::new(Vec::new),
             note: Arc::new(move |note| match note {
@@ -24183,6 +25754,7 @@ impl LookWorld {
             pause: Arc::new(quick_pause),
             carry_clock: Arc::new(MonotonicClock),
             upgrade_view: Arc::new(|_, _, _, _| ViewNext::default()),
+            upgrade_sources: Arc::new(crate::upgrade_host::UpgradeSources::default),
             disk: Arc::new(|_| {}),
             codex_roster: Arc::new(Vec::new),
             note: Arc::new(|_| {}),
@@ -26940,77 +28512,6 @@ fn a_relaunch_mark_no_ask_of_this_hosts_keeps_is_unset_as_an_agent_runs() {
 }
 
 #[test]
-fn a_relaunch_that_keeps_failing_marks_the_tab_with_the_command() {
-    let a = Arc::new(Acting::default());
-    *a.relaunches.lock().unwrap() = [
-        "wait:shell-prompt",
-        "failed:no-resume",
-        "wait:resume",
-        "adopted",
-    ]
-    .into();
-    a.open.lock().unwrap().insert("s-f".to_string());
-    a.set(&[("s-f", Program::Claude)]);
-    let host = HostHandle::start(on(), false, false, a.hooks());
-    a.attached(&host, "s-f");
-    a.set(&[]);
-    until("said failing", || {
-        relaunch_says(&a)
-            .iter()
-            .any(|s| matches!(s, RelaunchSay::Failing { .. }))
-    });
-    let marks: Vec<String> = a.badges.lock().unwrap().iter().flatten().cloned().collect();
-    assert!(
-        marks
-            .iter()
-            .any(|m| m.contains("keeps failing") && m.contains("claude --resume 0badf00d-")),
-        "{marks:?}"
-    );
-    until("landed", || a.relaunched.lock().unwrap().len() == 4);
-    until("the mark ended", || {
-        a.badges.lock().unwrap().last() == Some(&None)
-    });
-    host.shutdown_and_join();
-}
-
-#[test]
-fn a_persons_restarts_do_not_lengthen_a_later_crashs_back_off() {
-    let a = Arc::new(Acting::default());
-    a.open.lock().unwrap().insert("s-r".to_string());
-    a.set(&[("s-r", Program::Claude)]);
-    let host = HostHandle::start(on(), false, false, a.hooks());
-    a.attached(&host, "s-r");
-    for n in 1..=3 {
-        a.restart("s-r", restart_stamp::Cause::Asked);
-        a.set(&[]);
-        until("the restart relaunched", || {
-            a.relaunched.lock().unwrap().len() == n
-        });
-        until("detached", || host.live().is_empty());
-        let runs = a.runs.load(Ordering::SeqCst);
-        a.set(&[("s-r", Program::Claude)]);
-        until("the relaunched agent attached and read", || {
-            a.runs.load(Ordering::SeqCst) > runs && a.read_in("s-r")
-        });
-    }
-    assert_eq!(
-        a.asked_exits.lock().unwrap()[..],
-        [Some(restart_stamp::Cause::Asked); 3]
-    );
-    a.pauses.lock().unwrap().clear();
-    a.set(&[]);
-    until("the crash relaunched", || {
-        a.relaunched.lock().unwrap().len() == 4
-    });
-    let pauses = a.pauses.lock().unwrap().clone();
-    assert!(
-        pauses.contains(&relaunch::BACKOFF[0]) && !pauses.contains(&relaunch::BACKOFF[3]),
-        "the crash waits the first step, never ten minutes: {pauses:?}"
-    );
-    host.shutdown_and_join();
-}
-
-#[test]
 fn the_upgrades_carried_relaunch_waits_out_a_hold_uncounted() {
     let a = Arc::new(Acting::default());
     a.open.lock().unwrap().insert("s-h".to_string());
@@ -28537,11 +30038,16 @@ impl TapWorld {
     }
 
     fn tap(&self, api_ms: u64, pct: u32, login: Option<&str>) {
+        self.tap_in(api_ms, pct, login, None);
+    }
+
+    /// [`Self::tap`] from a process whose Claude home variable is `home` (`None`: unset).
+    fn tap_in(&self, api_ms: u64, pct: u32, login: Option<&str>, home: Option<&str>) {
         let vars = tap::TapVars {
             sid: Some(TAP_SID.to_string()),
             pid: Some(TAP_PID.to_string()),
             login: login.map(str::to_owned),
-            home: None,
+            home: home.map(str::to_owned),
         };
         let reset = self.born + 4 * 3600;
         let stdin = format!(
@@ -28810,6 +30316,7 @@ impl HostedLog {
                 started_ms: Some(wall(start)),
                 end,
                 detail: Some(detail.to_string()),
+                detail_final: true,
             }],
             ..BlockRead::default()
         };
@@ -28827,6 +30334,7 @@ impl HostedLog {
                 started_ms: Some(self.base.wall_ms + start),
                 end: BlockEnd::Running,
                 detail: Some("claude".to_string()),
+                detail_final: true,
             }],
             ..BlockRead::default()
         };
@@ -29619,6 +31127,73 @@ fn a_first_reading_under_an_epoch_is_tried_again_when_served_again() {
     );
 }
 
+/// A session a move put back on the default login carries the login variable set empty (its
+/// relaunch line names the default login so), and the tap in it reads the variable as set: the
+/// reading is still the default login's own and is taken. Lab `rp6` (Claude Code 2.1.311,
+/// 2026-10-27) logged every reading after its move back onto the default login as not its own, so
+/// a high figure there moved nothing. A reading naming a login directory stays another login's.
+#[cfg(unix)]
+#[test]
+fn a_reading_under_the_login_variable_set_empty_is_the_default_logins_own() {
+    let w = TapWorld::new();
+    *w.env.lock().unwrap() = vec![
+        "HOME=/Users//example".to_string(),
+        format!("{}=", accounts::LOGIN_ENV),
+    ];
+    let idle = w.worker(&tap_on(), tapped_argv(), true);
+    if let Some(snap) = idle.kept.lock().unwrap().snapshot.as_mut() {
+        snap.login = Some(String::new());
+    }
+    w.tap(10, 95, Some(""));
+    assert_eq!(idle.tap_step(TapAt::Point), Some("reading recorded"));
+    assert_eq!(w.sample().and_then(|s| s.session_pct), Some(95));
+    w.later(10);
+    w.tap(20, 97, Some("/logins/work-2"));
+    assert_eq!(
+        idle.tap_step(TapAt::Point),
+        Some(TAP_NOT_OWN),
+        "a login directory's reading"
+    );
+    assert_eq!(
+        w.sample().and_then(|s| s.session_pct),
+        Some(95),
+        "not taken"
+    );
+}
+
+/// A session whose Claude home variable is set empty (`CLAUDE_CONFIG_DIR=`, a person's own rc
+/// exporting it so) runs on the default home, as [`accounts::ProcessLogin::of_env`] and the tap's
+/// launch gate read it, and the tap in it reads the variable as set: its reading is still the
+/// default login's own and is taken. A reading from a home of its own stays another's.
+#[cfg(unix)]
+#[test]
+fn a_reading_under_the_home_variable_set_empty_is_the_default_logins_own() {
+    let w = TapWorld::new();
+    *w.env.lock().unwrap() = vec![
+        "HOME=/Users//example".to_string(),
+        format!("{}=", accounts::HOME_ENV),
+    ];
+    let idle = w.worker(&tap_on(), tapped_argv(), true);
+    if let Some(snap) = idle.kept.lock().unwrap().snapshot.as_mut() {
+        snap.home = Some(String::new());
+    }
+    w.tap_in(10, 95, None, Some(""));
+    assert_eq!(idle.tap_step(TapAt::Point), Some("reading recorded"));
+    assert_eq!(w.sample().and_then(|s| s.session_pct), Some(95));
+    w.later(10);
+    w.tap_in(20, 97, None, Some("/Users//example/.claude-other"));
+    assert_eq!(
+        idle.tap_step(TapAt::Point),
+        Some(TAP_NOT_OWN),
+        "a home of its own's reading"
+    );
+    assert_eq!(
+        w.sample().and_then(|s| s.session_pct),
+        Some(95),
+        "not taken"
+    );
+}
+
 /// One [`Acts::startup_mark`] as the deadlines' fakes keep it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Marked {
@@ -30067,8 +31642,8 @@ fn the_startup_deadline_marks_no_off_worker() {
 }
 
 /// AN INSTALL IS NO START THAT NEVER CAME. A worker whose launcher is still installing its
-/// program (Grok Build, installed on demand, with atpkg waiting up to 30 minutes for its lock and
-/// downloading about 100 MB) holds its shell's prompt, because nothing has been typed yet. Its
+/// program (one atpkg's store did not hold yet, with atpkg waiting up to 30 minutes for its lock
+/// and downloading about 100 MB) holds its shell's prompt, because nothing has been typed yet. Its
 /// record has been `working` since the spawn. The deadline does not judge it while the install
 /// runs, and falls a whole deadline after the last look that found it installing. CONTROL: the
 /// same worker, not installing, is stalled at the deadline counted from its record.
@@ -35318,7 +36893,7 @@ fn the_sweep_counts_the_bytes_of_what_it_swept() {
         (stage.clone(), Unused::Unfinished, 2 << 30),
         (stage.clone(), stale, 5 << 30),
     ];
-    let swept = [(stage.clone(), Unused::Unfinished), (stage, stale)];
+    let swept = [(stage.clone(), Unused::Unfinished), (stage.clone(), stale)];
     assert_eq!(disk_swept(&swept, &sized).0, 7 << 30);
     assert_eq!(
         disk_sweep_removals(&swept, &sized),
@@ -35326,6 +36901,27 @@ fn the_sweep_counts_the_bytes_of_what_it_swept() {
             (2 << 30, crate::disk_board::BUILD_CACHES),
             (5 << 30, crate::disk_board::BUILD_CACHES)
         ]
+    );
+
+    // A stage a removal could not finish counts the bytes of it that went, never what it was
+    // sized at before.
+    let stayed = Unused::Stayed {
+        stayed: 1,
+        freed: 6 << 30,
+    };
+    let swept = [(stage, stayed)];
+    let (freed, went) = disk_swept(&swept, &sized);
+    assert_eq!(freed, 6 << 30);
+    assert!(
+        went[0].ends_with(&format!(
+            "({})",
+            aterm_agent::harness::disk::sweep_reason(stayed)
+        )),
+        "{went:?}"
+    );
+    assert_eq!(
+        disk_sweep_removals(&swept, &sized),
+        [(6 << 30, crate::disk_board::BUILD_CACHES)]
     );
 }
 
@@ -35448,13 +37044,14 @@ fn the_sweep_journals_a_finished_stage_and_counts_it() {
     let board = Shelf::new();
     let sweep = |state: &Path| {
         disk_sweep_journalled(state, 1_790_000_000, &board, |record| {
-            atpkg::build_cache::reclaim_watched(
+            atpkg::build_cache::reclaim_watched_with_processes(
                 &root,
                 None,
                 std::time::SystemTime::now(),
                 atpkg::build_cache::RECLAIM_GONE_UNDER_PRESSURE,
                 None,
                 record,
+                &|_, _| Ok(aterm_uds::holders::PathScan::default()),
             )
         })
     };
@@ -37065,3 +38662,428 @@ fn the_live_launch_is_the_witnesss_last_start_with_no_gesture_since() {
 
 #[path = "harness_host_observation_tests.rs"]
 mod login_observation;
+
+use crate::test_log::logged_while;
+
+/// The loop's review reaches aterm.log as each line's words alone
+/// ([`aterm_agent::supervise::journal::log_words`]), however its lines are cut across writes
+/// (inside a word, inside a multi-byte character): never the reply, the box's command or the
+/// answer a real Claude Code run logged. The taped run's warn writer logs its lines whole.
+#[test]
+fn the_reviews_lines_reach_aterm_log_as_words() {
+    const SID: &str = "s-e4a10000000000000001";
+    const WARNED: &str = "aterm harness: tape store refused: /private/tmp/x/drive/tapes: \
+                          permission denied — the loop goes on without one";
+    let review = concat!(
+        "EVENT idle seq=12 ⏺ QZP7WORD6 is the reply's last line\n",
+        "EVENT prompt seq=13 kind=bash classify=not-read-only:touch command=touch QZP7WORD6\n",
+        "APPROVED seq=13 touch QZP7WORD6\n",
+        "CHOSE seq=14 rule=answer-recommended@v1 policy=recommended QZP7WORD6 (Recommended)\n",
+    );
+    let logged = logged_while(|| {
+        let mut out = LogLines::review(SID.to_string());
+        for chunk in review.as_bytes().chunks(7) {
+            out.write_all(chunk).expect("a log write");
+        }
+        let mut warn = LogLines::warn(SID.to_string());
+        for chunk in format!("{WARNED}\n").as_bytes().chunks(5) {
+            warn.write_all(chunk).expect("a log write");
+        }
+    });
+    assert!(
+        logged.iter().all(|m| !m.contains("QZP7WORD6")),
+        "the review's text reached the log: {logged:#?}"
+    );
+    for head in [
+        "EVENT idle seq=12 text=",
+        "EVENT prompt seq=13 text=",
+        "APPROVED seq=13 text=",
+        "CHOSE seq=14 rule=answer-recommended@v1 text=",
+    ] {
+        let want = format!("harness @{SID}: {head}");
+        assert!(
+            logged.iter().any(|m| m.starts_with(&want)),
+            "CONTROL: {want}… is logged: {logged:#?}"
+        );
+    }
+    assert!(
+        logged.contains(&format!("harness @{SID}: {WARNED}")),
+        "CONTROL: the tape's warning is logged whole: {logged:#?}"
+    );
+}
+
+/// A deadline's task line names its mark and its record, and the attention it raised by its
+/// length alone: the held stall's quote of the screen's last row and codex-alab's own words
+/// reach the standing attention (RAM, tier C, as designed) and never the log.
+#[test]
+fn a_deadlines_task_line_names_its_mark_never_its_attention() {
+    use crate::task_record::{TaskMark, TaskState};
+    let store = crate::session_store::new_store();
+    let h = crate::session_store::test_handle(7);
+    store.write().unwrap().register(h.clone());
+    let sid = h.sid.as_str().to_string();
+    let set = |state: TaskState, why: Option<&'static str>| {
+        let mut m = TaskMark::new(state);
+        m.why = why;
+        h.ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .mark_task(&m, false, Instant::now(), 0);
+    };
+    let standing = || {
+        h.ctx
+            .meta
+            .lock()
+            .unwrap()
+            .attention_owners
+            .get(ATTENTION_OWNER)
+            .map(str::to_string)
+            .unwrap_or_default()
+    };
+    let mut read = held_at("unknown", Progress::default());
+    read.last_row = Some("Enter to continue · QZP7WORD7 · Esc to cancel".to_string());
+    let asked = StartupHold::Asked {
+        text: "Sign in to continue: QZP7WORD8".to_string(),
+    };
+    let again = StartupHold::Asked {
+        text: "Sign in again: QZP7WORD8".to_string(),
+    };
+    let mut raised = Vec::new();
+    let logged = logged_while(|| {
+        set(TaskState::Working, None);
+        let held = StartupMark::Held {
+            read: &read,
+            held_for: Duration::from_secs(125),
+        };
+        startup_mark_with(&store, &sid, &held).expect("held");
+        raised.push(standing());
+        startup_mark_with(&store, &sid, &StartupMark::Moved).expect("moved");
+        set(TaskState::Working, None);
+        startup_mark_with(&store, &sid, &StartupMark::Stalled { hold: &asked }).expect("stalled");
+        raised.push(standing());
+        startup_mark_with(&store, &sid, &StartupMark::Restated { hold: &again }).expect("restated");
+        raised.push(standing());
+    });
+    for (said, plant) in raised.iter().zip(["QZP7WORD7", "QZP7WORD8", "QZP7WORD8"]) {
+        assert!(
+            said.contains(plant),
+            "CONTROL: the standing attention quotes {plant}: {said}"
+        );
+    }
+    assert!(
+        logged
+            .iter()
+            .all(|m| !m.contains("QZP7WORD7") && !m.contains("QZP7WORD8")),
+        "the attention's text reached the log: {logged:#?}"
+    );
+    for (why, said) in [("held", &raised[0]), ("startup", &raised[1])] {
+        let want = format!(" why={why} attention={}B", said.len());
+        assert!(
+            logged
+                .iter()
+                .any(|m| m.starts_with(&format!("harness @{sid}: task: rev=")) && m.contains(&want)),
+            "CONTROL: the {why} stall's task line names its mark ({want}): {logged:#?}"
+        );
+    }
+    assert!(
+        logged
+            .iter()
+            .any(|m| m.contains("state=working why=moved: it moved")),
+        "CONTROL: a mark that raises nothing keeps its own words: {logged:#?}"
+    );
+}
+
+/// A tab whose task record raises an attention: `task` answers a working record, its blocks are
+/// refused, and `task mark exited` answers `mark`, keeping the requests.
+struct ExitingTab {
+    mark: CtlReply,
+    asked: Vec<String>,
+}
+
+impl Ctl for ExitingTab {
+    fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
+        self.asked.push(args.join(" "));
+        let reply = |code: i32, stdout: &str, stderr: &str| CtlReply {
+            code,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+        };
+        Ok(match args.get(1..).unwrap_or_default() {
+            ["task"] => reply(
+                0,
+                "OK task rev=3 state=working from=ctl since_ms=5 result_bytes=0 agent=idle \
+                 attention=QZP7WORD9%20asks\n",
+                "",
+            ),
+            ["blocks", ..] => reply(1, "", "aterm-ctl: ERR no blocks\n"),
+            ["task", "mark", "exited", ..] => self.mark.clone(),
+            other => return Err(format!("unscripted: {other:?}")),
+        })
+    }
+}
+
+/// The `task mark exited` reply reaches the log as its record's words, never its `attention=`:
+/// the act the product runs ([`task_exited_with`], what [`task_exited_live`] calls over its
+/// socket), on an `OK` and on a refusal.
+#[test]
+fn a_task_exited_line_keeps_the_records_words_and_never_its_attention() {
+    let sid = "s-e4e4e4e4e4e4e4e4";
+    let marked = |mark: CtlReply| {
+        let mut tab = ExitingTab {
+            mark,
+            asked: Vec::new(),
+        };
+        let logged = logged_while(|| task_exited_with(&mut tab, sid));
+        assert!(
+            tab.asked
+                .iter()
+                .any(|r| r.starts_with(&format!("@{sid} task mark exited why=exit"))),
+            "CONTROL: the act marked the task exited: {:?}",
+            tab.asked
+        );
+        logged
+    };
+    for attention in [
+        "QZP7WORD9%20asks",
+        "\"QZP7WORD9 state=PRIVATE_STATE rev=PRIVATE_REV\"",
+        "\"QZP7WORD9 state=working rev=999\"",
+    ] {
+        let ok = marked(CtlReply {
+            code: 0,
+            stdout: format!(
+                "OK task rev=4 state=exited from=ctl since_ms=7 result_bytes=0 why=exit \
+                             agent=idle program_state=- attention={attention}\n"
+            ),
+            stderr: String::new(),
+        });
+        assert_eq!(
+            ok,
+            [format!(
+                "harness @{sid}: task: marked exited rev=4 state=exited"
+            )],
+            "the reply's attention reached the log"
+        );
+    }
+    let refused = marked(CtlReply {
+        code: 1,
+        stdout: String::new(),
+        stderr: "aterm-ctl: ERR denied\n".to_string(),
+    });
+    assert_eq!(refused, [format!("harness @{sid}: task: ERR denied")]);
+}
+
+#[test]
+fn worker_idle_agent_resumed_refreshes_an_uncaptured_foreground_snapshot() {
+    let world = Arc::new(World::default());
+    let start = "Wed Oct 28 17:00:10 2026";
+    let expected_started = process_started(start).expect("parsed lstart");
+    let check = |resumed_flag: bool, present: bool, stale_fg: Foreground| {
+        let snap = Snapshot {
+            tab: "s-idle".to_string(),
+            pid: 8888,
+            start: start.to_string(),
+            shell: 100,
+            program: PathBuf::from("/p/claude"),
+            argv: vec![
+                "claude".to_string(),
+                "--resume".to_string(),
+                "0badf00d-1111-2222-3333-444455556666".to_string(),
+            ],
+            session: Some("0badf00d-1111-2222-3333-444455556666".to_string()),
+            cwd: "/w".to_string(),
+            version: Some("2.1.312".to_string()),
+            run: relaunch::AgentRun::Claude,
+            dialect: None,
+            login: None,
+            home: None,
+            claude_dir: None,
+            stored_login: true,
+            profile: None,
+        };
+        let mut h = hooks(&world, parking_body(&world));
+        h.acts = Acts {
+            snapshot: Arc::new(move |_| present.then(|| snap.clone())),
+            follow: Arc::new(move |_, seen| {
+                if seen.pid == 8888 {
+                    Foreground::Agent
+                } else {
+                    stale_fg
+                }
+            }),
+            agent_resumed: Arc::new(move |sid, seen| {
+                assert_eq!(sid, "s-idle");
+                assert_eq!(seen.pid, 8888);
+                resumed_flag
+            }),
+            ..Acts::inert()
+        };
+        let idle = idle_of(h, Program::Claude, None);
+        if stale_fg == Foreground::Agent {
+            idle.kept.lock().unwrap().snapshot = None;
+            assert!(
+                with_kept_of(&idle.kept, |k| k.snapshot.is_none()),
+                "PRECONDITION: foreground snapshot not yet captured before banner read"
+            );
+        }
+        idle.agent_resumed()
+    };
+    assert_eq!(
+        check(true, true, Foreground::Agent),
+        Some(AgentResumed {
+            pid: 8888,
+            started: Some(expected_started),
+            resumed: true,
+        })
+    );
+    assert_eq!(
+        check(true, true, Foreground::Other),
+        Some(AgentResumed {
+            pid: 8888,
+            started: Some(expected_started),
+            resumed: true,
+        }),
+        "stale kept snapshot refreshes when another foreground pid replaced it"
+    );
+    assert_eq!(
+        check(true, false, Foreground::Shell),
+        None,
+        "control: dead kept snapshot at shell prompt reports no foreground agent"
+    );
+    assert_eq!(
+        check(false, true, Foreground::Agent),
+        Some(AgentResumed {
+            pid: 8888,
+            started: Some(expected_started),
+            resumed: false,
+        }),
+        "control: fresh agent"
+    );
+    assert_eq!(
+        check(true, false, Foreground::Agent),
+        None,
+        "control: no foreground agent"
+    );
+}
+
+#[test]
+fn account_move_claims_target_before_restarting_and_refuses_when_held_elsewhere() {
+    use aterm_agent::harness::claims::{self, Claim, Kind, LeaseKey, Row, Table, Tabled};
+
+    struct TestClaimsTable {
+        me: &'static str,
+        rows: Mutex<std::collections::BTreeMap<String, Row>>,
+        writable: Result<(), &'static str>,
+    }
+
+    impl Table for TestClaimsTable {
+        fn read(&self, _: &Path) -> Result<Tabled, String> {
+            let mut book = claims::Book::default();
+            for row in self.rows.lock().unwrap().values().cloned() {
+                book.insert(row);
+            }
+            Ok(Tabled {
+                me: self.me.to_owned(),
+                book,
+                writable: self.writable.map_err(str::to_owned),
+            })
+        }
+
+        fn write(&self, _: &Path, row: &Row) -> Result<(), String> {
+            self.writable.map_err(str::to_owned)?;
+            self.rows
+                .lock()
+                .unwrap()
+                .insert(row.machine.clone(), row.clone());
+            Ok(())
+        }
+    }
+
+    let setup = || {
+        let a = Accts::new();
+        let secrets = a.tmp.path().join("home/.secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        std::fs::write(secrets.join("ai-pool.toml"), "version = 1\n").unwrap();
+        let dir = |label: &str| a.login_dir(label);
+        std::fs::write(
+            a.roster_path(),
+            format!(
+                "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\nemail = \"main@example.test\"\n\n\
+                 [[account]]\nlabel = \"work-2\"\nclass = \"dedicated\"\nemail = \"work2@example.test\"\ndir = '{}'\n\n\
+                 [[account]]\nlabel = \"pool-a\"\nclass = \"shared\"\nemail = \"poola@example.test\"\ndir = '{}'\n",
+                dir("work-2"),
+                dir("pool-a")
+            ),
+        )
+        .unwrap();
+        a.spawn("s-claim-move", ACCT_TALK_A, "main");
+        a.wall(ACCT_TALK_A, ACCT_NOW - 10);
+        a
+    };
+
+    // 1. Free target row (`work-2`): `account_move` claims `work-2` before restarting onto it.
+    let a = setup();
+    let table = Arc::new(TestClaimsTable {
+        me: "aa01",
+        rows: Mutex::default(),
+        writable: Ok(()),
+    });
+    let idle = a.worker("s-claim-move", &on());
+    assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
+    let step = claims::with_table(table.clone(), || {
+        idle.restart(&move_to("work-2", AccountAt::Wall))
+    });
+    assert_eq!(step.as_deref(), Some("adopted"));
+    let work2 = LeaseKey::new("claude", "work2@example.test").unwrap();
+    let row = table
+        .rows
+        .lock()
+        .unwrap()
+        .get("aa01")
+        .cloned()
+        .expect("move wrote this Mac's claim row");
+    assert_eq!(
+        row.claims.iter().map(|c| &c.key).collect::<Vec<_>>(),
+        [&work2]
+    );
+
+    // 2. Another Mac's senior claim arrives on `work-2` between `account_advice` and `account_move`:
+    // `account_move` refuses with `wait:account-changed` and writes no claim, and the next advice
+    // picks `pool-a`.
+    let a = setup();
+    let mut rows = std::collections::BTreeMap::new();
+    rows.insert(
+        "bb02".to_owned(),
+        Row {
+            machine: "bb02".to_owned(),
+            label: "m2".to_owned(),
+            counter: 1,
+            until: ACCT_NOW + 3600,
+            claims: vec![Claim {
+                key: work2.clone(),
+                kind: Kind::Lease,
+                since: ACCT_NOW - 60,
+            }],
+        },
+    );
+    let table = Arc::new(TestClaimsTable {
+        me: "aa01",
+        rows: Mutex::new(rows),
+        writable: Ok(()),
+    });
+    let idle = a.worker("s-claim-move", &on());
+    assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
+    let step = claims::with_table(table.clone(), || {
+        idle.restart(&move_to("work-2", AccountAt::Wall))
+    });
+    assert_eq!(step.as_deref(), Some("wait:account-changed"));
+    assert!(
+        !table.rows.lock().unwrap().contains_key("aa01"),
+        "wrote no claim on a row held elsewhere"
+    );
+    assert_eq!(
+        moves(&idle.account(usage_wall())),
+        Some("pool-a"),
+        "settled lease on work-2 steers the next advice to pool-a"
+    );
+}

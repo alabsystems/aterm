@@ -18,11 +18,14 @@
 
 #[cfg(test)]
 aterm_durable::plain_durable_flushes_in_tests!();
+#[cfg(all(test, target_os = "macos"))]
+aterm_secrets::memoized_x25519_in_tests!();
 
 use aterm_containment::consent::{
     DEBUGGER_ACCESS_REVERT, DebuggerMember, DebuggerMode, DebuggerProbe, DebuggerProbeLabel,
     DrClass, FdaState, ProbeGate, ProbeLabel, SelfHardening,
 };
+use atpkg::reroute::{AGENTS_DIR_ENV, PASSTHROUGH_ENV, REROUTE_DIR_ENV};
 
 #[cfg(unix)]
 #[path = "driver_unix.rs"]
@@ -138,22 +141,6 @@ const HELP_HEAD: &str = concat!(
     "    -h, --help                Print this help and exit.\n",
     "    -V, --version             Print the version and exit.\n",
     "\n",
-    "SUBCOMMANDS (each exits without starting a shell):\n",
-    "    show-config               Print the version, shell, TERM, size and\n",
-    "                              containment default.\n",
-    "    explain-config            Explain how aterm resolves its configuration.\n",
-    "    doctor                    Check health, instances, the fabric broker and the\n",
-    "                              packages, and repair what aterm lays; --read-only\n",
-    "                              changes nothing. --check, --apply, --restore: the\n",
-    "                              macOS fleet settings profile alone.\n",
-    "    list-fonts                List available font families.\n",
-    "    show-face <family>        Show a font family's file and cell metrics.\n",
-    "    list-themes               List the built-in and custom themes (the same as\n",
-    "                              `aterm theme list`).\n",
-    "    list-kitty-commands       List the words the cursor cat obeys, by language.\n",
-    "    exceptions [--all]        List what needs a look later and the newest ten\n",
-    "                              filed entries (--all: every filed entry).\n",
-    "\n",
 );
 
 /// Windows update instructions shared by `aterm update status|check` and `aterm help update`.
@@ -180,6 +167,8 @@ pub enum Verb {
     Agh,
     /// `aterm fleet` — fleet membership (`init`, `join`, `peers`, `allow`, `leave`).
     Fleet,
+    /// `aterm node` — the windowless fleet, Commons and steward node job (`serve | status | on | off`).
+    Node,
     /// `aterm drive` — the window harness's readers (`classify`, `phase`, `answer`, `ledger`,
     /// `tape`, `replay`).
     Drive,
@@ -203,6 +192,9 @@ pub enum Verb {
     /// `aterm secrets` — the credentials vault, its keyless server and `~/.secrets`
     /// (docs/DESIGN-secrets-2026-10-20.md).
     Secrets,
+    /// `aterm members` — Macs joining ALab and the members that let them in
+    /// (docs/DESIGN-fluid-swarm-2026-10-28.md §3.3.3).
+    Members,
     /// `aterm db` — embedded replicated application databases, offline and LAN.
     Db,
     /// `aterm harness` — Claude Code harness read views, accounts roster, and live upgrade.
@@ -232,6 +224,7 @@ impl Verb {
         Verb::Pkg,
         Verb::Agh,
         Verb::Fleet,
+        Verb::Node,
         Verb::Drive,
         Verb::Link,
         Verb::Fabric,
@@ -242,6 +235,7 @@ impl Verb {
         Verb::Machines,
         Verb::Init,
         Verb::Secrets,
+        Verb::Members,
         Verb::Db,
         Verb::Harness,
         Verb::Keeper,
@@ -262,6 +256,7 @@ impl Verb {
             Verb::Pkg => "pkg",
             Verb::Agh => "agh",
             Verb::Fleet => "fleet",
+            Verb::Node => "node",
             Verb::Drive => "drive",
             Verb::Link => "link",
             Verb::Fabric => "fabric",
@@ -272,6 +267,7 @@ impl Verb {
             Verb::Machines => "machines",
             Verb::Init => "init",
             Verb::Secrets => "secrets",
+            Verb::Members => "members",
             Verb::Db => "db",
             Verb::Harness => "harness",
             Verb::Keeper => "keeper",
@@ -281,38 +277,6 @@ impl Verb {
             Verb::NewTab => "new-tab",
             Verb::NewWindow => "new-window",
             Verb::SplitPane => "split-pane",
-        }
-    }
-
-    /// The argv0 alias this verb also answers to, if any (a symlink onto the one binary).
-    #[cfg(test)]
-    const fn argv0_alias(self) -> Option<&'static str> {
-        match self {
-            Verb::Ctl => Some("aterm-ctl"),
-            Verb::Conn => None,
-            Verb::ResourceRun => None,
-            Verb::Pkg => Some("atpkg"),
-            Verb::Agh => None,
-            Verb::Fleet => Some("aterm-fleet"),
-            Verb::Drive => Some("aterm-drive"),
-            Verb::Link => Some("aterm-link"),
-            Verb::Fabric => None,
-            Verb::Edit => Some("amacs"),
-            Verb::Ship
-            | Verb::Update
-            | Verb::Agents
-            | Verb::Ai
-            | Verb::Machines
-            | Verb::Init
-            | Verb::Secrets
-            | Verb::Db
-            | Verb::Harness
-            | Verb::Keeper
-            | Verb::Acaffiene
-            | Verb::Theme
-            | Verb::NewTab
-            | Verb::NewWindow
-            | Verb::SplitPane => None,
         }
     }
 
@@ -328,6 +292,7 @@ impl Verb {
             | Verb::Pkg
             | Verb::Agh
             | Verb::Fleet
+            | Verb::Node
             | Verb::Drive
             | Verb::Link
             | Verb::Fabric
@@ -338,6 +303,7 @@ impl Verb {
             | Verb::Machines
             | Verb::Init
             | Verb::Secrets
+            | Verb::Members
             | Verb::Db
             | Verb::Harness
             | Verb::Keeper
@@ -356,6 +322,7 @@ impl Verb {
             Verb::Pkg => "aterm pkg <args>",
             Verb::Agh => "aterm agh <args>",
             Verb::Fleet => "aterm fleet <args>",
+            Verb::Node => "aterm node [<cmd>]",
             Verb::Drive => "aterm drive <args>",
             Verb::Link => "aterm link <args>",
             Verb::Fabric => "aterm fabric [<cmd>]",
@@ -368,6 +335,7 @@ impl Verb {
                 "aterm init [--plan|--check] [--json] [--develop|--no-develop] [--only <items>]"
             }
             Verb::Secrets => "aterm secrets [<cmd>]",
+            Verb::Members => "aterm members <cmd>",
             Verb::Db => "aterm db <cmd> --dir <database>",
             Verb::Harness => "aterm harness <cmd>",
             Verb::Keeper => "aterm keeper <cmd>",
@@ -404,10 +372,15 @@ impl Verb {
             Verb::Fleet => &[
                 "This machine's membership in a fleet, the aterms",
                 "of one LAN that read each other (init | join |",
-                "peers | allow | leave); `allow drive --from",
-                "<host|node>` lets that node drive this machine",
-                "(`aterm ctl --host <h> …`, `aterm help workers`).",
-                "Unix only.",
+                "peers | allow | publish | sync | leave); `allow",
+                "drive --from <host|node>` lets that node drive",
+                "this machine, `--all` every member (`aterm ctl",
+                "--host <h> …`, `aterm help workers`). Unix only.",
+            ],
+            Verb::Node => &[
+                "The windowless fleet and Commons job: answers",
+                "port 7100, wakes a window on spawn, and runs",
+                "Commons repair (status | on | off | serve). Unix.",
             ],
             Verb::Link => &[
                 "The fabric bridge: carries inbox and post traffic",
@@ -463,6 +436,12 @@ impl Verb {
                 "vault, its server and ~/.secrets (status | join |",
                 "sync | edit | approve | serve …); `status` is the",
                 "default. Unix only.",
+            ],
+            Verb::Members => &[
+                "Macs joining ALab: a new Mac asks every member",
+                "(join), a person presses Allow on any one and",
+                "types the phrase it shows (requests | allow |",
+                "invite | ignore | join | status). Unix only.",
             ],
             Verb::Db => &[
                 "Encrypted embedded application databases, local",
@@ -523,15 +502,15 @@ impl Verb {
 
 const VERB_BLURB_COLUMN: usize = 30;
 
-fn verb_help_block(verb: Verb) -> String {
+fn help_block(synopsis: &str, blurb: &[&str]) -> String {
     let mut out = String::new();
-    let mut lines = verb.blurb().iter();
+    let mut lines = blurb.iter();
     let width = VERB_BLURB_COLUMN - 4;
-    if verb.usage().len() >= width {
-        out.push_str(&format!("    {}\n", verb.usage()));
+    if synopsis.len() >= width {
+        out.push_str(&format!("    {synopsis}\n"));
     } else {
         let first = lines.next().unwrap_or(&"");
-        out.push_str(&format!("    {:<width$}{first}\n", verb.usage()));
+        out.push_str(&format!("    {synopsis:<width$}{first}\n"));
     }
     for line in lines {
         out.push_str(&format!("{:width$}{line}\n", "", width = VERB_BLURB_COLUMN));
@@ -539,11 +518,70 @@ fn verb_help_block(verb: Verb) -> String {
     out
 }
 
+fn verb_help_block(verb: Verb) -> String {
+    help_block(verb.usage(), verb.blurb())
+}
+
+fn diag_help_block(name: &str, desc: &str) -> String {
+    let (synopsis, blurb): (&str, &[&str]) = match name {
+        "show-config" => (
+            "show-config",
+            &[
+                "Print the version, shell, TERM, size and",
+                "containment default.",
+            ],
+        ),
+        "explain-config" => (
+            "explain-config",
+            &["Explain how aterm resolves its configuration."],
+        ),
+        "doctor" => (
+            "doctor",
+            &[
+                "Check health, instances, the fabric broker and the",
+                "packages, and repair what aterm lays; --read-only",
+                "changes nothing. --check, --apply, --restore: the",
+                "macOS fleet settings profile alone.",
+            ],
+        ),
+        "list-fonts" => ("list-fonts", &["List available font families."]),
+        "show-face" => (
+            "show-face <family>",
+            &["Show a font family's file and cell metrics."],
+        ),
+        "list-themes" => (
+            "list-themes",
+            &[
+                "List the built-in and custom themes (the same as",
+                "`aterm theme list`).",
+            ],
+        ),
+        "list-kitty-commands" => (
+            "list-kitty-commands",
+            &["List the words the cursor cat obeys, by language."],
+        ),
+        "exceptions" => (
+            "exceptions [--all]",
+            &[
+                "List what needs a look later and the newest ten",
+                "filed entries (--all: every filed entry).",
+            ],
+        ),
+        _ => (name, std::slice::from_ref(&desc)),
+    };
+    help_block(synopsis, blurb)
+}
+
 fn help_text() -> String {
     let mut out = format!(
         "{HELP_TITLE}{}\n\n{HELP_SESSION_LINE}{HELP_HEAD}",
         aterm_types::identity::ORIGIN_LINE
     );
+    out.push_str("SUBCOMMANDS (each exits without starting a shell):\n");
+    for &(name, desc) in DIAG_COMMANDS {
+        out.push_str(&diag_help_block(name, desc));
+    }
+    out.push('\n');
     out.push_str("VERBS (`aterm help <verb>` has each one's page):\n");
     for verb in Verb::ALL {
         out.push_str(&verb_help_block(*verb));
@@ -2068,6 +2106,7 @@ fn permissions_hand_over_live(missing: &Missing) {
             list.listing == aterm_containment::DevToolListing::On
         },
         refresh_verdict: &dt::refresh_verdict,
+        window_responsible: &window_responsible,
         open_fda_pane: &open_fda_pane,
         await_fda_on: &await_fda_on,
         local_day: &|at| local_day_words(at, i64::try_from(at).ok().and_then(local_offset_at)),
@@ -2095,11 +2134,29 @@ fn devtools_hand_over_after(facts: &atpkg::devtools::Facts, reach: &DevtoolsReac
 /// Hand every grant doctor found missing to the running aterm window's permission walk
 /// (`permissions walk now <subjects>`): one panel beside System Settings takes the person from
 /// page to page, each turning to the next once its switch reads on, so doctor opens nothing
-/// and waits for nothing. Where no walk takes them (no window, no answer, a window whose
-/// reading has them held already) doctor opens each page itself and waits for its switch; a
-/// window older than the walk takes Developer Tools through its own verb
+/// and waits for nothing. Full Disk Access goes to the walk only from the window macOS holds
+/// responsible for doctor (`window_responsible`): under another terminal the grant doctor read
+/// missing is that terminal's, so doctor opens its page itself and waits for its switch, and
+/// only then hands Developer Tools to the walk. Where no walk takes them (no window, no answer,
+/// a window that gave the request up before it took it (`ERR late`), a window whose reading has
+/// them held already) doctor opens each page itself and waits for its switch; a page the
+/// owner's Not now holds back from the walk (`OK declined`, or `not-now:<page>` in `OK walking`)
+/// it opens nothing for; a window older than the walk takes Developer Tools through its own verb
 /// ([`devtools_hand_over`]). Returns what it did, a line each.
 fn permissions_hand_over(missing: &Missing, reach: &DevtoolsReach<'_>) -> Vec<String> {
+    if missing.fda && !(reach.window_responsible)() {
+        // The walk would turn on the window's own Full Disk Access, not the terminal's that
+        // doctor read: its page here first, then the walk's, so the two are never up together.
+        let mut did = vec![fda_open_here(reach)];
+        let rest = Missing {
+            fda: false,
+            devtools: missing.devtools.clone(),
+        };
+        if let Some(rest) = rest.due() {
+            did.extend(permissions_hand_over(&rest, reach));
+        }
+        return did;
+    }
     let here = |missing: &Missing, reach: &DevtoolsReach<'_>| {
         let mut did = Vec::new();
         if missing.fda {
@@ -2115,18 +2172,33 @@ fn permissions_hand_over(missing: &Missing, reach: &DevtoolsReach<'_>) -> Vec<St
         WindowAnswer::Reply(reply) => reply,
     };
     let reply = reply.trim_end();
+    if reply.starts_with("ERR late") {
+        // The window's lane gave the request up before its main thread took it, so no walk
+        // starts for it, then or later.
+        return here(missing, reach);
+    }
     if reply.starts_with("OK walking") {
-        // A walk already under way answers with its own pages, which may leave out one doctor
-        // asked for: the window reads that grant held (another app holds doctor's grant, the
-        // terminal running it), as `OK granted` says, so doctor opens that page itself.
+        // The answer names the pages the walk has still to show. A page it names
+        // `not-now:<page>` the owner's Not now holds back from it, which stands as `OK declined`
+        // does: doctor opens nothing for it. Any other page it leaves out the window reads held,
+        // its reading older than doctor's, as `OK granted` says, so doctor opens that page
+        // itself.
         let walked = |word: &str| walk_names(reply, word);
-        let left = Missing {
-            fda: missing.fda && !walked("fda"),
-            devtools: missing.devtools.clone().filter(|_| !walked("devtools")),
-        };
+        let not_now = |word: &str| !walked(word) && walk_holds_back(reply, word);
         let taken = Missing {
-            fda: missing.fda && !left.fda,
-            devtools: missing.devtools.clone().filter(|_| left.devtools.is_none()),
+            fda: missing.fda && walked("fda"),
+            devtools: missing.devtools.clone().filter(|_| walked("devtools")),
+        };
+        let held = Missing {
+            fda: missing.fda && not_now("fda"),
+            devtools: missing.devtools.clone().filter(|_| not_now("devtools")),
+        };
+        let left = Missing {
+            fda: missing.fda && !taken.fda && !held.fda,
+            devtools: missing
+                .devtools
+                .clone()
+                .filter(|_| taken.devtools.is_none() && held.devtools.is_none()),
         };
         let mut did = Vec::new();
         if taken.fda || taken.devtools.is_some() {
@@ -2136,12 +2208,23 @@ fn permissions_hand_over(missing: &Missing, reach: &DevtoolsReach<'_>) -> Vec<St
                 taken.pages()
             ));
         }
+        if held.fda || held.devtools.is_some() {
+            let (pages, them) = match (held.fda, held.devtools.is_some()) {
+                (true, true) => ("Full Disk Access or Developer Tools", "them"),
+                (true, false) => ("Full Disk Access", "it"),
+                _ => ("Developer Tools", "it"),
+            };
+            did.push(format!(
+                "did not open {pages}: you said Not now to {them}; System State's Permissions \
+                 rows in the aterm window open {them} again"
+            ));
+        }
         did.extend(here(&left, reach));
         return did;
     }
     if reply == "OK granted" {
         // The window's reading has them held, doctor's a moment ago did not: the window's is
-        // older, or another app (the terminal running doctor) is the one without them.
+        // older.
         return here(missing, reach);
     }
     if reply.starts_with("ERR unknown verb") {
@@ -2177,23 +2260,46 @@ fn permissions_hand_over(missing: &Missing, reach: &DevtoolsReach<'_>) -> Vec<St
 
 /// `aterm init`'s hand-over of the grants its Permissions phase left to the person
 /// (`aterm_machines::init::Host::walk`): the running window's permission walk takes them, for a
-/// person at this Mac's console reading the run. The line to print once it does; `None` where
-/// no walk takes them, and the rows' own words stand.
+/// person at this Mac's console reading the run, Full Disk Access and Accessibility only when
+/// that window is the app macOS holds responsible for the run
+/// ([`aterm_machines::port::responsible_window`], [`walks`]). The line to print once it does;
+/// `None` where no walk takes them, and the rows' own words stand.
 #[must_use]
 pub fn init_permissions_walk(missing: &[aterm_types::macos_setup::Access]) -> Option<String> {
-    init_walk_over(missing, person_here(), &ask_window_for_walk)
+    init_walk_over(
+        missing,
+        person_here(),
+        window_responsible(),
+        &ask_window_for_walk,
+    )
 }
 
-/// [`init_permissions_walk`] over a person's presence and the window's answer.
+/// Whether the running window is the app macOS holds responsible for this process
+/// ([`aterm_machines::port::responsible_window`]), which charges it Full Disk Access and
+/// Accessibility.
+#[cfg(unix)]
+fn window_responsible() -> bool {
+    aterm_machines::port::responsible_window().is_some()
+}
+
+/// No app macOS holds responsible: this is not a Mac.
+#[cfg(not(unix))]
+const fn window_responsible() -> bool {
+    false
+}
+
+/// [`init_permissions_walk`] over a person's presence, whether the window is the app macOS holds
+/// responsible for the run (`own`), and the window's answer.
 fn init_walk_over(
     missing: &[aterm_types::macos_setup::Access],
     here: bool,
+    own: bool,
     ask_walk: &dyn Fn(&str) -> WindowAnswer,
 ) -> Option<String> {
     let walked: Vec<aterm_types::macos_setup::Access> = missing
         .iter()
         .copied()
-        .filter(|access| walks(*access))
+        .filter(|access| walks(*access, own))
         .collect();
     if !here || walked.is_empty() {
         return None;
@@ -2202,7 +2308,7 @@ fn init_walk_over(
     let WindowAnswer::Reply(reply) = ask_walk(&words.join(" ")) else {
         return None;
     };
-    // A walk already under way names its own pages: only those it takes are the window's.
+    // The answer names the pages the walk has still to show: only those are the window's.
     let names: Vec<&str> = walked
         .iter()
         .filter(|access| walk_names(&reply, access.word()))
@@ -2219,34 +2325,52 @@ fn init_walk_over(
 
 /// Whether the window's `OK walking <subject>…` answer names `word`'s page: the walk's own word
 /// (`fda`, `devtools`, `accessibility`, `debugger`), or a Permissions row's
-/// (`full-disk-access`, `developer-tools`), which the walk answers with its own.
+/// (`full-disk-access`, `developer-tools`), which the walk answers with its own. Its
+/// `not-now:<subject>` words name pages the walk does not take ([`walk_holds_back`]).
 fn walk_names(reply: &str, word: &str) -> bool {
-    fn own(word: &str) -> &str {
-        match word {
-            "full-disk-access" => "fda",
-            "developer-tools" => "devtools",
-            other => other,
-        }
-    }
+    walk_words(reply).any(|walked| own_walk_word(walked) == own_walk_word(word))
+}
+
+/// Whether the window's `OK walking …` answer names `word`'s page `not-now:<subject>`: one asked
+/// for that the owner's Not now holds back from the verb's walk. A window older than that word
+/// never names one.
+fn walk_holds_back(reply: &str, word: &str) -> bool {
+    walk_words(reply).any(|walked| {
+        walked
+            .strip_prefix("not-now:")
+            .is_some_and(|held| own_walk_word(held) == own_walk_word(word))
+    })
+}
+
+/// The words after an `OK walking` answer's prefix; none for any other answer.
+fn walk_words(reply: &str) -> impl Iterator<Item = &str> {
     reply
         .trim_end()
         .strip_prefix("OK walking")
-        .is_some_and(|walking| {
-            walking
-                .split_whitespace()
-                .any(|walked| own(walked) == own(word))
-        })
+        .unwrap_or_default()
+        .split_whitespace()
 }
 
-/// Whether the window's permission walk has a step for `access`: Local Network has no switch to
-/// turn (macOS asks it on a program's first look at the network), so it stays a row of its own.
-const fn walks(access: aterm_types::macos_setup::Access) -> bool {
+/// The walk's own word for a Permissions row's (`full-disk-access`, `developer-tools`).
+fn own_walk_word(word: &str) -> &str {
+    match word {
+        "full-disk-access" => "fda",
+        "developer-tools" => "devtools",
+        other => other,
+    }
+}
+
+/// Whether the window's permission walk takes `access` for this run: Local Network has no switch
+/// to turn (macOS asks it on a program's first look at the network), so it stays a row of its
+/// own. Full Disk Access and Accessibility macOS charges to the app it holds responsible for the
+/// run, and the walk turns on the window's own, so it takes them only when the window is that app
+/// (`own`, aterm's own tab); under another terminal their rows name that terminal's switch.
+/// Developer Tools is aterm's own entry and the debugger this Mac's, whoever runs.
+const fn walks(access: aterm_types::macos_setup::Access, own: bool) -> bool {
     use aterm_types::macos_setup::Access;
     match access {
-        Access::FullDiskAccess
-        | Access::DeveloperTools
-        | Access::Accessibility
-        | Access::Debugger => true,
+        Access::DeveloperTools | Access::Debugger => true,
+        Access::FullDiskAccess | Access::Accessibility => own,
         Access::LocalNetwork => false,
     }
 }
@@ -2449,6 +2573,10 @@ struct DevtoolsReach<'a> {
     /// switch read on (the running aterm, checked before, keeps that verdict until a
     /// fresh aterm process asks).
     refresh_verdict: &'a dyn Fn() -> Result<(), String>,
+    /// Whether the running aterm window is the app macOS holds responsible for doctor
+    /// ([`aterm_machines::port::responsible_window`]): only then is the Full Disk Access grant
+    /// its walk turns on the one doctor read.
+    window_responsible: &'a dyn Fn() -> bool,
     /// [`open_fda_pane`].
     open_fda_pane: &'a dyn Fn() -> Result<(), String>,
     /// [`await_fda_on`].
@@ -2868,31 +2996,6 @@ fn instances_row(census: &Result<aterm_ctl::census::Census, String>) -> (Mark, S
     (mark, detail)
 }
 
-/// Pure core of `doctor` without a `shell_origin` label.
-#[cfg(test)]
-fn doctor_checks(
-    shell: &str,
-    shell_check: ShellCheck,
-    privacy: &PrivacyFacts,
-    debugger: &DebuggerFacts,
-    instances: &Result<aterm_ctl::census::Census, String>,
-    recovery: &RecoveryFacts,
-    exceptions: &ExceptionsFacts,
-) -> (String, i32) {
-    doctor_checks_with_origin(
-        shell,
-        shell_check,
-        None,
-        privacy,
-        debugger,
-        &DevtoolsFacts::absent(),
-        instances,
-        recovery,
-        exceptions,
-        &MachineFacts::absent(),
-    )
-}
-
 const SHELL_REMEDY: &str = if cfg!(windows) {
     "set `shell` in aterm.toml to an installed shell"
 } else {
@@ -3168,6 +3271,9 @@ fn decide_args<I: Iterator<Item = String>>(args: I) -> CliAction {
                     cmd,
                     arg: Some(all.clone()),
                 },
+                [all, extra, ..] if all == "--all" => CliAction::Usage(format!(
+                    "aterm exceptions: unknown argument {extra:?} — usage: aterm exceptions [--all]"
+                )),
                 [other, ..] => CliAction::Usage(format!(
                     "aterm exceptions: unknown argument {other:?} — usage: aterm exceptions [--all]"
                 )),
@@ -3263,12 +3369,23 @@ fn decide_args<I: Iterator<Item = String>>(args: I) -> CliAction {
 /// `which_copy` lines, and the compiled update trust anchor fingerprint.
 #[must_use]
 pub fn version_text(copy: Option<&aterm_update::which_copy::WhichCopy>) -> String {
+    version_text_with_stamp(copy, aterm_types::version::installed())
+}
+
+/// [`version_text`] over an explicit [`aterm_types::version::BuildStamp`].
+#[must_use]
+pub fn version_text_with_stamp(
+    copy: Option<&aterm_update::which_copy::WhichCopy>,
+    stamp: Option<&aterm_types::version::BuildStamp>,
+) -> String {
+    let app_version = stamp
+        .unwrap_or(&aterm_types::version::BuildStamp::UNSTAMPED)
+        .app_version;
     let mut out = format!(
-        "aterm {}\n{}\n",
-        aterm_types::version::app_version(),
+        "aterm {app_version}\n{}\n",
         aterm_types::identity::ORIGIN_LINE
     );
-    if let Some(build) = running_build() {
+    if let Some(build) = running_build_from(stamp) {
         out.push_str(&format!("build: {build}\n"));
     }
     if let Some(copy) = copy {
@@ -3281,11 +3398,8 @@ pub fn version_text(copy: Option<&aterm_update::which_copy::WhichCopy>) -> Strin
     out
 }
 
-fn running_build() -> Option<u64> {
-    let build = aterm_types::version::installed()?
-        .build_number
-        .parse::<u64>()
-        .ok()?;
+fn running_build_from(stamp: Option<&aterm_types::version::BuildStamp>) -> Option<u64> {
+    let build = stamp?.build_number.parse::<u64>().ok()?;
     (build > 0).then_some(build)
 }
 
@@ -3428,9 +3542,6 @@ fn front_door_bin_dir() -> Option<String> {
     dir.to_str().map(str::to_owned)
 }
 
-const REROUTE_DIR_ENV: &str = "ATERM_REROUTE_DIR";
-const PASSTHROUGH_ENV: &str = "__ATERM_REROUTE_PASSTHROUGH";
-
 fn reroute_dir_from_env() -> Option<String> {
     reroute_dir_from_values(
         std::env::var(PASSTHROUGH_ENV).ok().as_deref(),
@@ -3457,8 +3568,6 @@ fn is_absolute_real_dir(dir: &str) -> bool {
 }
 
 const HOOK_AGENTS_ENV: &str = "ATPKG_AGENTS";
-
-const AGENTS_DIR_ENV: &str = "ATERM_AGENTS_DIR";
 
 fn managed_agents_dir(
     handed: Option<&str>,
@@ -3725,18 +3834,17 @@ mod tests {
     #[cfg(windows)]
     use super::show_config_report;
     use super::{
-        AGENTS_DIR_ENV, CliAction, DEBUGGER_ACCESS_REVERT, DIAG_COMMANDS, DebuggerFacts,
-        DebuggerMember, DebuggerMode, DebuggerProbe, DebuggerProbeLabel, DevtoolsFacts, DrClass,
-        ExceptionsFacts, FdaState, HOOK_AGENTS_ENV, MachineFacts, Mark, PASSTHROUGH_ENV,
-        PrivacyFacts, ProbeLabel, REROUTE_DIR_ENV, RecoveryFacts, SelfHardening, ShellCheck, Verb,
-        agents_dir_mode, config_conpty_from_text, decide_args, diag_report, doctor_checks,
+        CliAction, DEBUGGER_ACCESS_REVERT, DIAG_COMMANDS, DebuggerFacts, DebuggerMember,
+        DebuggerMode, DebuggerProbe, DebuggerProbeLabel, DevtoolsFacts, DrClass, ExceptionsFacts,
+        FdaState, MachineFacts, Mark, PrivacyFacts, ProbeLabel, RecoveryFacts, SelfHardening,
+        ShellCheck, Verb, agents_dir_mode, config_conpty_from_text, decide_args, diag_report,
         doctor_checks_with_origin, exceptions_report_at, explain_config_report, front_door_alias,
         front_door_verb, help_text, is_tool_candidate, list_fonts_report, list_themes_alias,
         managed_agents_dir, prepend_path, read_exceptions_log, reroute_dir_from_values,
         session_limits, session_path_env, show_face_report, version_text,
     };
     #[cfg(unix)]
-    use super::{args_read_withheld, fabric_fact, fabric_mark, unix_shell};
+    use super::{args_read_withheld, fabric_mark, unix_shell};
 
     fn decide(args: &[&str]) -> CliAction {
         decide_args(args.iter().map(|s| s.to_string()))
@@ -3957,17 +4065,25 @@ mod tests {
             decide(&["doctor", "--check", "--verbose"]),
             diag("doctor", Some("--check --verbose"))
         );
-        for argv in [
-            vec!["doctor", "--fix"],
-            vec!["doctor", "--verbose", "--verbose"],
-            vec!["doctor", "--apply", "--verbose"],
-            vec!["doctor", "--read-only", "x"],
-            vec!["doctor", "--json", "--json"],
-            vec!["doctor", "--check", "--apply"],
-            vec!["doctor", "--apply", "--only", "pkg"],
+        for (argv, bad_token) in [
+            (vec!["doctor", "--fix"], Some("\"--fix\"")),
+            (
+                vec!["doctor", "--verbose", "--verbose"],
+                Some("\"--verbose\""),
+            ),
+            (vec!["doctor", "--apply", "--verbose"], None),
+            (vec!["doctor", "--read-only", "x"], Some("\"x\"")),
+            (vec!["doctor", "--json", "--json"], Some("\"--json\"")),
+            (vec!["doctor", "--check", "--apply"], None),
+            (vec!["doctor", "--apply", "--only", "pkg"], None),
         ] {
             match decide(&argv) {
-                CliAction::Usage(msg) => assert!(msg.contains(USAGE), "{argv:?}: {msg}"),
+                CliAction::Usage(msg) => {
+                    assert!(msg.contains(USAGE), "{argv:?}: {msg}");
+                    if let Some(tok) = bad_token {
+                        assert!(msg.contains(tok), "{argv:?} should name {tok}: {msg}");
+                    }
+                }
                 other => panic!("{argv:?} must be a usage error, got {other:?}"),
             }
         }
@@ -3990,16 +4106,22 @@ mod tests {
                 cmd: "exceptions".to_string()
             }
         );
-        for argv in [
-            vec!["exceptions", "--json"],
-            vec!["exceptions", "--all", "extra"],
-            vec!["exceptions", "all"],
+        for (argv, bad_token) in [
+            (vec!["exceptions", "--json"], "\"--json\""),
+            (vec!["exceptions", "--all", "extra"], "\"extra\""),
+            (vec!["exceptions", "all"], "\"all\""),
         ] {
             match decide(&argv) {
-                CliAction::Usage(msg) => assert!(
-                    msg.contains("aterm exceptions [--all]"),
-                    "the refusal must state the grammar: {msg}"
-                ),
+                CliAction::Usage(msg) => {
+                    assert!(
+                        msg.contains("aterm exceptions [--all]"),
+                        "the refusal must state the grammar: {msg}"
+                    );
+                    assert!(
+                        msg.contains(bad_token),
+                        "{argv:?} should name {bad_token}: {msg}"
+                    );
+                }
                 other => panic!("{argv:?} must be a usage error, got {other:?}"),
             }
         }
@@ -4219,14 +4341,17 @@ mod tests {
     #[test]
     fn the_doctor_exceptions_row_counts_the_open_entries_and_never_fails() {
         let row = |facts: ExceptionsFacts| {
-            let (r, code) = doctor_checks(
+            let (r, code) = doctor_checks_with_origin(
                 "/bin/sh",
                 ShellCheck::Runs,
+                None,
                 &unmeasured(),
                 &no_debugger(),
+                &no_devtools(),
                 &no_census(),
                 &no_recovery(),
                 &facts,
+                &MachineFacts::absent(),
             );
             assert_eq!(code, 0, "{r}");
             r
@@ -4463,21 +4588,6 @@ mod tests {
     }
 
     #[test]
-    fn verb_argv0_aliases_are_distinct_and_unambiguous() {
-        let aliases: Vec<&str> = Verb::ALL.iter().filter_map(|v| v.argv0_alias()).collect();
-        for (i, alias) in aliases.iter().enumerate() {
-            assert!(
-                !aliases[..i].contains(alias),
-                "duplicate argv0 alias {alias}"
-            );
-            assert!(
-                Verb::from_operand(alias).is_none(),
-                "argv0 alias {alias} is also a verb name"
-            );
-        }
-    }
-
-    #[test]
     fn path_injection_prepends_once_and_is_idempotent() {
         let sep = if cfg!(windows) { ';' } else { ':' };
         let bin = "/opt/aterm/bin";
@@ -4625,14 +4735,6 @@ mod tests {
         assert_eq!(reroute, layout.prefix.join(atpkg::reroute::DIR_NAME));
         assert_eq!(layout.agents_dir(), layout.prefix.join("agents"));
         let _ = std::fs::remove_dir_all(&scratch);
-    }
-
-    #[test]
-    fn reroute_env_names_match_atpkg() {
-        assert_eq!(REROUTE_DIR_ENV, atpkg::reroute::REROUTE_DIR_ENV);
-        assert_eq!(PASSTHROUGH_ENV, atpkg::reroute::PASSTHROUGH_ENV);
-        assert_eq!(AGENTS_DIR_ENV, atpkg::reroute::AGENTS_DIR_ENV);
-        assert_ne!(AGENTS_DIR_ENV, HOOK_AGENTS_ENV);
     }
 
     #[test]
@@ -4997,14 +5099,46 @@ mod tests {
 
     #[test]
     fn doctor_checks_pass_and_flag_each_failure() {
-        let (r, code) = doctor_checks(
+        use aterm_containment::consent::{
+            DevToolList, DevToolListLabel, DevToolListing, DevToolProbe, DevToolProbeLabel,
+        };
+        let populated_devtools = DevtoolsFacts {
+            facts: Some(atpkg::devtools::Facts {
+                subject: Some("com.aterm.aterm".to_string()),
+                list: DevToolList {
+                    listing: DevToolListing::Off,
+                    label: DevToolListLabel::Read,
+                    modified_at_s: Some(1),
+                    rows: Some(2),
+                },
+                log: DevToolProbe::refused(DevToolProbeLabel::NoRecentRequest),
+                other_responsible: None,
+                program_check: None,
+            }),
+            did: None,
+        };
+        let populated_machine = MachineFacts {
+            copies: Some(atpkg::copies::Pruned::Done {
+                moved: vec![(
+                    std::path::PathBuf::from("/Applications/aterm-prev-1.app"),
+                    aterm_containment::consent::Retired::Moved,
+                )],
+                kept: Vec::new(),
+            }),
+            ..MachineFacts::absent()
+        };
+
+        let (r, code) = doctor_checks_with_origin(
             "/bin/sh",
             ShellCheck::Runs,
+            None,
             &unmeasured(),
             &no_debugger(),
+            &no_devtools(),
             &no_census(),
             &no_recovery(),
             &no_exceptions(),
+            &MachineFacts::absent(),
         );
         assert_eq!(code, 0, "{r}");
         assert!(r.contains("health: OK"), "{r}");
@@ -5020,41 +5154,43 @@ mod tests {
             );
         }
 
-        let (r, code) = doctor_checks(
-            "/no/such/shell",
-            ShellCheck::Missing,
+        let (r_with_rows, code) = doctor_checks_with_origin(
+            "/bin/sh",
+            ShellCheck::Runs,
+            None,
             &unmeasured(),
             &no_debugger(),
+            &populated_devtools,
             &no_census(),
             &no_recovery(),
             &no_exceptions(),
+            &populated_machine,
         );
-        assert_eq!(code, 1);
-        assert_eq!(mark_of(&r, "shell:"), "FAIL", "{r}");
-        assert!(r.contains("health: FAIL"), "{r}");
-        let (r, code) = doctor_checks(
-            "/etc/hosts",
-            ShellCheck::NotExecutable,
-            &unmeasured(),
-            &no_debugger(),
-            &no_census(),
-            &no_recovery(),
-            &no_exceptions(),
-        );
-        assert_eq!(code, 1);
-        assert_eq!(mark_of(&r, "shell:"), "FAIL", "{r}");
+        assert_eq!(code, 0, "{r_with_rows}");
+        assert_eq!(mark_of(&r_with_rows, "devtools:"), "warn", "{r_with_rows}");
+        assert_eq!(mark_of(&r_with_rows, "copies:"), "note", "{r_with_rows}");
 
-        let (r, code) = doctor_checks(
-            "",
-            ShellCheck::Missing,
-            &unmeasured(),
-            &no_debugger(),
-            &no_census(),
-            &no_recovery(),
-            &no_exceptions(),
-        );
-        assert_eq!(code, 1);
-        assert_eq!(mark_of(&r, "shell:"), "FAIL", "{r}");
+        for (shell, check) in [
+            ("/no/such/shell", ShellCheck::Missing),
+            ("/etc/hosts", ShellCheck::NotExecutable),
+            ("", ShellCheck::Missing),
+        ] {
+            let (r, code) = doctor_checks_with_origin(
+                shell,
+                check,
+                None,
+                &unmeasured(),
+                &no_debugger(),
+                &populated_devtools,
+                &no_census(),
+                &no_recovery(),
+                &no_exceptions(),
+                &populated_machine,
+            );
+            assert_eq!(code, 1, "{shell:?}: {r}");
+            assert_eq!(mark_of(&r, "shell:"), "FAIL", "{r}");
+            assert!(r.contains("health: FAIL"), "{r}");
+        }
     }
 
     /// `$SHELL` unset is not a failure: a plain `aterm` then starts the
@@ -5112,14 +5248,17 @@ mod tests {
 
     #[test]
     fn doctor_leaves_out_rows_for_probes_this_platform_lacks() {
-        let (r, code) = doctor_checks(
+        let (r, code) = doctor_checks_with_origin(
             "/bin/sh",
             ShellCheck::Runs,
+            None,
             &PrivacyFacts::not_measured(ProbeLabel::UnsupportedPlatform),
             &DebuggerFacts::not_measured(DebuggerProbeLabel::UnsupportedPlatform),
+            &no_devtools(),
             &no_census(),
             &no_recovery(),
             &no_exceptions(),
+            &MachineFacts::absent(),
         );
         assert_eq!(code, 0, "{r}");
         assert!(!r.contains("privacy:") && !r.contains("debugger:"), "{r}");
@@ -5136,16 +5275,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("no shell: row in\n{report}"))
                 .to_string()
         };
-        let (plain, _) = doctor_checks(
-            "/bin/sh",
-            ShellCheck::Runs,
-            &unmeasured(),
-            &no_debugger(),
-            &no_census(),
-            &no_recovery(),
-            &no_exceptions(),
-        );
-        let (unlabelled, _) = doctor_checks_with_origin(
+        let (unlabelled, code) = doctor_checks_with_origin(
             "/bin/sh",
             ShellCheck::Runs,
             None,
@@ -5157,7 +5287,12 @@ mod tests {
             &no_exceptions(),
             &MachineFacts::absent(),
         );
-        assert_eq!(plain, unlabelled, "no label, no change");
+        assert_eq!(code, 0);
+        assert_eq!(
+            shell_row(&unlabelled),
+            "shell:      ok    /bin/sh (executable)",
+            "no label, no origin suffix"
+        );
 
         let (labelled, code) = doctor_checks_with_origin(
             r"C:\Program Files\PowerShell\7\pwsh.exe",
@@ -5258,14 +5393,17 @@ mod tests {
     #[test]
     fn the_privacy_row_is_a_note_and_never_moves_the_exit_code() {
         let ok = |privacy: &PrivacyFacts| {
-            doctor_checks(
+            doctor_checks_with_origin(
                 "/bin/sh",
                 ShellCheck::Runs,
+                None,
                 privacy,
                 &no_debugger(),
+                &no_devtools(),
                 &no_census(),
                 &no_recovery(),
                 &no_exceptions(),
+                &MachineFacts::absent(),
             )
         };
 
@@ -5290,14 +5428,17 @@ mod tests {
             assert_eq!(mark_of(&r, "privacy:"), mark, "{r}");
         }
 
-        let (r, code) = doctor_checks(
+        let (r, code) = doctor_checks_with_origin(
             "/no/such/shell",
             ShellCheck::Missing,
+            None,
             &unmeasured(),
             &no_debugger(),
+            &no_devtools(),
             &no_census(),
             &no_recovery(),
             &no_exceptions(),
+            &MachineFacts::absent(),
         );
         assert_eq!(code, 1, "{r}");
         assert!(r.contains("health: FAIL"), "{r}");
@@ -5314,14 +5455,17 @@ mod tests {
             EndClass, LaunchKind, Pressure, PrevRun, Row, Tri, Uptime,
         };
         let check = |recovery: RecoveryFacts| {
-            doctor_checks(
+            doctor_checks_with_origin(
                 "/bin/sh",
                 ShellCheck::Runs,
+                None,
                 &unmeasured(),
                 &no_debugger(),
+                &no_devtools(),
                 &no_census(),
                 &recovery,
                 &no_exceptions(),
+                &MachineFacts::absent(),
             )
         };
         let (r, code) = check(no_recovery());
@@ -5387,14 +5531,17 @@ mod tests {
     fn the_instances_row_names_what_nothing_reaches_and_never_fails() {
         use aterm_ctl::census::{Census, Program, Unreached};
         let check = |census: Result<Census, String>| {
-            doctor_checks(
+            doctor_checks_with_origin(
                 "/bin/sh",
                 ShellCheck::Runs,
+                None,
                 &unmeasured(),
                 &no_debugger(),
+                &no_devtools(),
                 &census,
                 &no_recovery(),
                 &no_exceptions(),
+                &MachineFacts::absent(),
             )
         };
         let census = |instances: usize, unreached: Vec<Unreached>| {
@@ -5902,15 +6049,6 @@ mod tests {
         }
     }
 
-    /// `fabric_fact` reads the fabric row on Unix and never produces `Mark::Fail`.
-    #[cfg(unix)]
-    #[test]
-    fn the_doctors_machine_facts_read_the_fabric_row() {
-        let (mark, fact, _) = fabric_fact(None).expect("a fabric row on Unix");
-        assert!(!mark.is_fail(), "{fact}");
-        assert!(!fact.trim().is_empty());
-    }
-
     /// While the program check's pool is at the kernel's limit, doctor lists no
     /// program's command line, and the reason the census and the fabric rows give carries
     /// the reading itself.
@@ -6040,6 +6178,8 @@ mod tests {
         answer: super::WindowAnswer,
         /// What the window's permission walk answers.
         walk: super::WindowAnswer,
+        /// The window is the app macOS holds responsible for doctor (aterm's own tab).
+        responsible: bool,
         declined_at: Option<u64>,
         /// The wait sees the switch go on.
         switched: bool,
@@ -6052,6 +6192,7 @@ mod tests {
             Self {
                 answer,
                 walk: super::WindowAnswer::Reply("ERR unknown verb (try: help)".to_string()),
+                responsible: true,
                 declined_at: None,
                 switched: true,
                 before_wait: Box::new(|| {}),
@@ -6095,6 +6236,7 @@ mod tests {
                     note("refresh".to_string());
                     Ok(())
                 },
+                window_responsible: &|| self.responsible,
                 open_fda_pane: &|| {
                     note("open fda".to_string());
                     Ok(())
@@ -6615,8 +6757,9 @@ mod tests {
 
     /// `aterm doctor` hands what it found missing to the window's permission walk in one
     /// request, and then opens and waits for nothing. With no walk to take it (no window, no
-    /// answer, a window that reads them held) it opens each page itself and waits for each
-    /// switch; a window older than the walk gets Developer Tools through its own verb.
+    /// answer, a window that gave the request up before it took it, a window that reads them
+    /// held) it opens each page itself and waits for each switch; a window older than the walk
+    /// gets Developer Tools through its own verb.
     #[test]
     fn doctor_hands_every_missing_grant_to_the_windows_walk() {
         use super::{Missing, WindowAnswer};
@@ -6652,7 +6795,7 @@ mod tests {
         assert_eq!(log, ["walk fda"]);
 
         // A walk already under way over Developer Tools alone: the window reads Full Disk
-        // Access held (another app is the one without it), so doctor opens that page itself and
+        // Access held (its reading older than doctor's), so doctor opens that page itself and
         // leaves Developer Tools to the walk. NEGATIVE CONTROL: its answer is `OK walking` too.
         let mut under_way = Scripted::new(WindowAnswer::Unreachable);
         under_way.walk = reply("OK walking devtools\n");
@@ -6670,6 +6813,7 @@ mod tests {
         for answer in [
             WindowAnswer::Unreachable,
             WindowAnswer::Unanswered("did not answer within 10s".to_string()),
+            reply("ERR late: the window did not take the ask within 5s; no walk starts\n"),
             reply("OK granted"),
         ] {
             let mut script = Scripted::new(WindowAnswer::Unreachable);
@@ -6713,6 +6857,104 @@ mod tests {
         }
     }
 
+    /// A page the window's answer names `not-now:<page>` the owner's Not now holds back from the
+    /// walk: doctor opens nothing for it and says so, as for `OK declined`, and leaves the walk
+    /// the page it names. NEGATIVE CONTROL: a page the answer leaves out with no such word is
+    /// one the window reads held, and doctor opens it itself.
+    #[test]
+    fn doctor_opens_no_page_the_walk_held_back_for_the_owners_not_now() {
+        use super::{Missing, WindowAnswer};
+        use aterm_containment::DevToolListing;
+        let absent = devtools_facts_with(read_list(DevToolListing::Absent, 2));
+        let both = Missing {
+            fda: true,
+            devtools: Some(absent),
+        };
+        let run = |answer: &str| {
+            let mut script = Scripted::new(WindowAnswer::Unreachable);
+            script.walk = WindowAnswer::Reply(answer.to_owned());
+            script.with(|reach| super::permissions_hand_over(&both, reach))
+        };
+
+        let (did, log) = run("OK walking devtools not-now:fda\n");
+        assert_eq!(log, ["walk fda devtools"], "nothing opened here");
+        assert_eq!(did.len(), 2, "{did:?}");
+        assert!(
+            did[0].contains("walks you through Developer Tools "),
+            "{did:?}"
+        );
+        assert!(
+            did[1].starts_with("did not open Full Disk Access: you said Not now to it"),
+            "{did:?}"
+        );
+
+        let (did, log) = run("OK walking fda not-now:devtools\n");
+        assert_eq!(log, ["walk fda devtools"], "no spctl, page or wait");
+        assert!(
+            did[0].contains("walks you through Full Disk Access "),
+            "{did:?}"
+        );
+        assert!(
+            did[1].starts_with("did not open Developer Tools: you said Not now to it"),
+            "{did:?}"
+        );
+
+        let (did, log) = run("OK walking accessibility not-now:fda not-now:devtools\n");
+        assert_eq!(log, ["walk fda devtools"]);
+        assert_eq!(did.len(), 1, "{did:?}");
+        assert!(did[0].contains("Not now to them"), "{did:?}");
+
+        let (did, log) = run("OK walking devtools\n");
+        assert!(log.iter().any(|e| e == "open fda"), "{log:?}");
+        assert_eq!(did[1], "opened Full Disk Access; you switched it on");
+    }
+
+    /// Under another terminal (Terminal.app) the Full Disk Access doctor read missing is that
+    /// terminal's, and the window's walk turns on its own: doctor opens the page itself and
+    /// waits for the switch, and only then hands Developer Tools to the walk, never `fda`, so a
+    /// walk that adds the window's own missing Full Disk Access is not counted as doctor's, and
+    /// the two pages are never up together. With Full Disk Access alone nothing goes to the
+    /// window. NEGATIVE CONTROL: in aterm's own tab the one request carries both.
+    #[test]
+    fn doctor_opens_the_terminals_full_disk_access_itself_and_walks_only_developer_tools() {
+        use super::{Missing, WindowAnswer};
+        use aterm_containment::DevToolListing;
+        let absent = devtools_facts_with(read_list(DevToolListing::Absent, 2));
+        let both = Missing {
+            fda: true,
+            devtools: Some(absent),
+        };
+        let mut terminal = Scripted::new(WindowAnswer::Unreachable);
+        terminal.responsible = false;
+        terminal.walk = WindowAnswer::Reply("OK walking devtools fda\n".to_owned());
+        let (did, log) = terminal.with(|reach| super::permissions_hand_over(&both, reach));
+        let acts: Vec<&String> = log.iter().filter(|e| !e.starts_with("say ")).collect();
+        assert_eq!(acts, ["open fda", "wait fda", "walk devtools"], "{log:?}");
+        assert_eq!(did.len(), 2, "{did:?}");
+        assert_eq!(did[0], "opened Full Disk Access; you switched it on");
+        assert!(
+            did[1].contains("walks you through Developer Tools "),
+            "{did:?}"
+        );
+
+        let fda_only = Missing {
+            fda: true,
+            devtools: None,
+        };
+        let (did, log) = terminal.with(|reach| super::permissions_hand_over(&fda_only, reach));
+        assert!(!log.iter().any(|e| e.starts_with("walk")), "{log:?}");
+        assert_eq!(did, ["opened Full Disk Access; you switched it on"]);
+
+        let mut own = Scripted::new(WindowAnswer::Unreachable);
+        own.walk = WindowAnswer::Reply("OK walking fda devtools\n".to_owned());
+        let (did, log) = own.with(|reach| super::permissions_hand_over(&both, reach));
+        assert_eq!(log, ["walk fda devtools"]);
+        assert!(
+            did[0].contains("walks you through Full Disk Access, then Developer Tools"),
+            "{did:?}"
+        );
+    }
+
     /// Doctor's two waits (Full Disk Access, then the Developer Tools switch) share one stdin
     /// reader: each hears an Enter pressed after it began. NEGATIVE CONTROL: the Enter that ended
     /// the first wait does not end the second.
@@ -6749,14 +6991,14 @@ mod tests {
             Access::LocalNetwork,
             Access::Debugger,
         ];
-        let line = init_walk_over(&missing, true, &walking).expect("a walk took them");
+        let line = init_walk_over(&missing, true, true, &walking).expect("a walk took them");
         assert_eq!(
             asked.take(),
             ["full-disk-access debugger"],
             "Local Network has no step of the walk's"
         );
         assert_eq!(
-            init_walk_over(&[Access::LocalNetwork], true, &walking),
+            init_walk_over(&[Access::LocalNetwork], true, true, &walking),
             None,
             "nothing walkable asks nothing"
         );
@@ -6766,11 +7008,11 @@ mod tests {
             "{line}"
         );
         assert_eq!(
-            init_walk_over(&missing, false, &walking),
+            init_walk_over(&missing, false, true, &walking),
             None,
             "nobody here"
         );
-        assert_eq!(init_walk_over(&[], true, &walking), None);
+        assert_eq!(init_walk_over(&[], true, true, &walking), None);
         assert!(asked.take().is_empty(), "neither asks");
         for answer in [
             WindowAnswer::Unreachable,
@@ -6778,16 +7020,67 @@ mod tests {
             WindowAnswer::Reply("ERR unknown verb (try: help)".to_owned()),
             // A walk already under way over none of these pages.
             WindowAnswer::Reply("OK walking devtools".to_owned()),
+            // The owner's Not now holds Full Disk Access back from the walk.
+            WindowAnswer::Reply("OK walking devtools not-now:fda".to_owned()),
         ] {
             assert_eq!(
-                init_walk_over(&missing, true, &|_| answer.clone()),
+                init_walk_over(&missing, true, true, &|_| answer.clone()),
                 None,
                 "{answer:?}"
             );
         }
         let under_way = WindowAnswer::Reply("OK walking fda devtools\n".to_owned());
-        let line = init_walk_over(&missing, true, &|_| under_way.clone()).expect("it takes one");
+        let line =
+            init_walk_over(&missing, true, true, &|_| under_way.clone()).expect("it takes one");
         assert!(line.contains("through Full Disk Access beside"), "{line}");
+    }
+
+    /// Under another terminal (Terminal.app), Full Disk Access and Accessibility are that
+    /// terminal's grants, and the window's walk turns on its own: `aterm init` hands the walk
+    /// only Developer Tools and the debugger, and its line names only those; the Full Disk Access
+    /// and Accessibility rows keep their own words. NEGATIVE CONTROL: in aterm's own tab (the
+    /// window is the app macOS holds responsible) it hands all four.
+    #[test]
+    fn init_hands_the_walk_only_the_windows_own_grants_under_another_terminal() {
+        use super::{WindowAnswer, init_walk_over};
+        use aterm_types::macos_setup::Access;
+        let asked = std::cell::RefCell::new(Vec::new());
+        // The window takes what it is asked and adds its own missing Full Disk Access.
+        let walking = |words: &str| {
+            asked.borrow_mut().push(words.to_owned());
+            WindowAnswer::Reply(format!("OK walking {words} fda accessibility"))
+        };
+        let missing = [
+            Access::FullDiskAccess,
+            Access::DeveloperTools,
+            Access::Debugger,
+            Access::Accessibility,
+        ];
+        let line = init_walk_over(&missing, true, false, &walking).expect("a walk took some");
+        assert_eq!(asked.take(), ["developer-tools debugger"]);
+        assert!(line.contains("Developer Tools, then Debugger"), "{line}");
+        assert!(
+            !line.contains("Full Disk Access") && !line.contains("Accessibility"),
+            "the window's own pages are not this run's: {line}"
+        );
+        assert_eq!(
+            init_walk_over(
+                &[Access::FullDiskAccess, Access::Accessibility],
+                true,
+                false,
+                &walking
+            ),
+            None,
+            "nothing of the window's to walk"
+        );
+        assert!(asked.take().is_empty(), "nothing asked");
+
+        let line = init_walk_over(&missing, true, true, &walking).expect("a walk took them");
+        assert_eq!(
+            asked.take(),
+            ["full-disk-access developer-tools debugger accessibility"]
+        );
+        assert!(line.contains("Full Disk Access, then "), "{line}");
     }
 
     #[test]
@@ -6889,14 +7182,17 @@ mod tests {
             no_debugger(),
             unrecognised_words,
         ] {
-            let (r, code) = doctor_checks(
+            let (r, code) = doctor_checks_with_origin(
                 "/bin/sh",
                 ShellCheck::Runs,
+                None,
                 &unmeasured(),
                 &facts,
+                &no_devtools(),
                 &no_census(),
                 &no_recovery(),
                 &no_exceptions(),
+                &MachineFacts::absent(),
             );
             assert_eq!(code, 0, "the debugger row never moves the exit code\n{r}");
             assert!(r.contains("health: OK"), "{r}");
@@ -7078,10 +7374,11 @@ mod tests {
 
     #[test]
     fn version_text_names_the_running_copy_and_any_other() {
+        use aterm_types::version::BuildStamp;
         use aterm_update::which_copy::{OtherCopy, Running, WhichCopy};
         let identity = format!(
             "aterm {}\n{}\n",
-            aterm_types::version::app_version(),
+            BuildStamp::UNSTAMPED.app_version,
             aterm_types::identity::ORIGIN_LINE
         );
         assert!(identity.contains("by Andrew Yates") && identity.contains("alab.systems"));
@@ -7090,12 +7387,23 @@ mod tests {
             anchors.starts_with("trusts: master=") && !anchors.contains("channel="),
             "{anchors}"
         );
-        aterm_types::version::install(aterm_types::version::BuildStamp {
+        assert_eq!(
+            super::version_text_with_stamp(None, None),
+            format!("{identity}{anchors}")
+        );
+        assert_eq!(
+            super::version_text_with_stamp(None, Some(&BuildStamp::UNSTAMPED)),
+            format!("{identity}{anchors}")
+        );
+        let stamp = BuildStamp {
             build_number: "1789432052",
-            ..aterm_types::version::BuildStamp::UNSTAMPED
-        });
+            ..BuildStamp::UNSTAMPED
+        };
         let build = "build: 1789432052\n";
-        assert_eq!(version_text(None), format!("{identity}{build}{anchors}"));
+        assert_eq!(
+            super::version_text_with_stamp(None, Some(&stamp)),
+            format!("{identity}{build}{anchors}")
+        );
         let copy = WhichCopy {
             running: std::path::PathBuf::from("/Applications/aterm.app"),
             kind: Running::InstalledApp,
@@ -7105,7 +7413,7 @@ mod tests {
             }],
         };
         assert_eq!(
-            version_text(Some(&copy)),
+            super::version_text_with_stamp(Some(&copy), Some(&stamp)),
             format!(
                 "{identity}{build}running: /Applications/aterm.app\nanother copy: \
                  /Users//ana/Applications/aterm.app (0.60.0) \u{2014} the updater leaves it \
@@ -7267,10 +7575,11 @@ mod tests {
         );
 
         let raise = cap + 1;
-        assert!(
-            hard > raise as libc::rlim_t,
-            "test precondition: the inherited hard NOFILE ({hard}) must exceed {raise}"
-        );
+        if hard <= raise as libc::rlim_t {
+            aterm_spec::host::could_not_run(format!(
+                "the inherited hard NOFILE ({hard}) does not exceed {raise}"
+            ));
+        }
         let script = format!("ulimit -n {raise} 2>/dev/null; ulimit -n; ulimit -Hn");
         assert_eq!(
             child_lines(Cm::Safety, &script),

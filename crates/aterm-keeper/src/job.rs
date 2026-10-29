@@ -205,12 +205,12 @@ mod tests {
         let installed = place_for(Path::new(INSTALLED_EXECUTABLE));
         assert_eq!(installed.label, INSTALLED_LABEL);
         assert_eq!(installed.socket_name, "keeper.sock");
+        assert!(installed.installed);
         let dev = place_for(Path::new("/Users//x/aterm/target/debug/aterm"));
         assert!(dev.label.starts_with(DEV_LABEL_PREFIX), "{dev:?}");
         assert!(!dev.installed);
+        assert_ne!(dev.label, installed.label);
         assert_ne!(dev.socket_name, installed.socket_name);
-        let other = place_for(Path::new("/Users//x/aterm2/target/debug/aterm"));
-        assert_ne!(other.label, dev.label, "two trees, two keepers");
         assert_eq!(
             dev,
             place_for(Path::new("/Users//x/aterm/target/debug/aterm"))

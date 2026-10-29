@@ -596,6 +596,17 @@ fn a_walk_cut_short_is_said_on_the_glass() {
     assert!(r.walk_cut && r.caught_up && !r.complete(), "{r:?}");
     let text = text_of(&session, &r);
     assert!(text.ends_with("+? unread"), "{text}");
+    let facts = UsageFacts::of(
+        model_tokens(session.total_fold().per_model()),
+        None,
+        Some(&r),
+    )
+    .expect("tokens");
+    let rule = usage_text_at(&facts, UsageGrain::Rule).expect("the rule's text");
+    assert!(
+        !rule.contains('?') && rule.starts_with('\u{2191}'),
+        "the rule says no count it does not know: {rule}"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;

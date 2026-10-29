@@ -138,8 +138,9 @@ pub struct MetadataEvidence {
     pub catalog_eligible: bool,
 }
 
-/// One exclusive local replica of one immutable table generation. The index
-/// retains authenticated records and previously witnessed quarantined headers.
+/// A local handle for one immutable table generation. Writers are exclusive;
+/// observations retain a verified committed snapshot. The index retains
+/// authenticated records and previously witnessed quarantined headers.
 /// Plaintext is decrypted per read. Reopen after a control change; open for a
 /// short local batch, then drop the store and session before network I/O.
 pub struct Store {
@@ -149,7 +150,7 @@ pub struct Store {
     claim_dir: PathBuf,
     claim_name: String,
     claim: Vec<u8>,
-    log: Log,
+    log: Option<Log>,
     witness: Witness,
     poisoned: bool,
     capacity: Capacity,
@@ -169,9 +170,14 @@ impl Store {
     /// An interrupted, still-empty first initialization is resumable.
     pub fn join(session: &Session<'_>, dir: &Path, scope: Scope) -> Result<Self> {
         session.context(scope)?;
-        let claim_dir = claims(session)?;
+        if !session.has_control_writer() {
+            return Err(Error::new(
+                "table enrollment requires a locked control observation",
+            ));
+        }
+        let claim_dir = claim_dir(session)?;
         aterm_journal::create_private_dir_durable(&claim_dir)?;
-        let claim_name = format!("{}.claim", aterm_codec::hex::encode_lower(&scope.digest()));
+        let claim_name = claim_name(scope);
         if matches!(
             private_file::read_private(&claim_dir, &claim_name, CLAIM_LEN),
             Err(PrivateFileError::Missing)
@@ -190,8 +196,52 @@ impl Store {
     }
     /// Reopen with the independently retained ready enrollment claim. Missing
     /// custody, anchor, checkpoint or acknowledged bytes is damage, not a join.
+    /// An observation session reads without acquiring the data journal's writer.
     pub fn open(session: &Session<'_>, dir: &Path, scope: Scope) -> Result<Self> {
+        if !session.has_control_writer() {
+            return Self::observe(session, dir, scope);
+        }
         Self::open_mode(session, dir, scope, false)
+    }
+
+    /// Read the independently witnessed committed prefix beside any live writer.
+    /// This handle cannot append, repair a tail, publish a witness or enroll storage.
+    /// A custody change during the read is refused, so no unchecked snapshot escapes.
+    pub fn observe(session: &Session<'_>, dir: &Path, scope: Scope) -> Result<Self> {
+        Self::open_capacity_mode(session, dir, scope, false, Capacity::default(), true)
+    }
+
+    /// An absent table, an empty discovery reservation, or this replica's first
+    /// enrollment cut short after its pending claim (`join`, which resumes it) has
+    /// no enrolled storage: a pending claim holds no record, because none is
+    /// authored or ingested before `open_capacity_mode` makes the claim ready.
+    /// A ready claim or nonempty storage still requires intact established custody.
+    pub(crate) fn observe_if_exists(
+        session: &Session<'_>,
+        dir: &Path,
+        scope: Scope,
+    ) -> Result<Option<Self>> {
+        session.context(scope)?;
+        let claim_dir = claim_dir(session)?;
+        let claim_name = claim_name(scope);
+        match private_file::read_private(&claim_dir, &claim_name, CLAIM_LEN) {
+            Ok(claim) if pending_claim(&claim, scope, &session.actor()) => Ok(None),
+            Err(PrivateFileError::Missing) => {
+                match private_file::judge_private_dir(dir)? {
+                    private_file::PrivateDir::Missing => return Ok(None),
+                    private_file::PrivateDir::Private
+                        if std::fs::read_dir(dir)?.next().transpose()?.is_none() =>
+                    {
+                        // subscriptions() reserves a slot before Store::join creates
+                        // its independent enrollment claim and journal.
+                        return Ok(None);
+                    }
+                    _ => {}
+                }
+                Self::observe(session, dir, scope).map(Some)
+            }
+            _ => Self::observe(session, dir, scope).map(Some),
+        }
     }
     #[cfg_attr(
         any(test, debug_assertions),
@@ -304,6 +354,17 @@ impl Store {
         initialize: bool,
         capacity: Capacity,
     ) -> Result<Self> {
+        Self::open_capacity_mode(session, dir, scope, initialize, capacity, false)
+    }
+
+    fn open_capacity_mode(
+        session: &Session<'_>,
+        dir: &Path,
+        scope: Scope,
+        initialize: bool,
+        capacity: Capacity,
+        read_only: bool,
+    ) -> Result<Self> {
         if capacity.operations > MAX_RECORDS
             || capacity.bytes > MAX_BYTES
             || capacity.conflicts > MAX_CONFLICTS
@@ -311,8 +372,8 @@ impl Store {
             return Err(Error::new("table capacity exceeds custody bounds"));
         }
         session.context(scope)?;
-        let claim_dir = claims(session)?;
-        let claim_name = format!("{}.claim", aterm_codec::hex::encode_lower(&scope.digest()));
+        let claim_dir = claim_dir(session)?;
+        let claim_name = claim_name(scope);
         let mut claim = private_file::read_private(&claim_dir, &claim_name, CLAIM_LEN)
             .map_err(|_| Error::new("table enrollment claim is missing or damaged"))?;
         if claim.len() != CLAIM_LEN
@@ -342,14 +403,41 @@ impl Store {
         // The stable token binds the data directory even while the claim changes
         // from pending to ready. No record can be authored in the pending state.
         claim[4] = b'1';
-        let log = Log::open(
-            dir,
-            "table",
-            &claim[..ANCHOR_LEN],
-            !pending,
-            capacity.journal(),
-        )?;
         let acknowledged = Witness::decode(&claim[WITNESS_AT..])?;
+        let (log, replay) = if read_only {
+            let records = match aterm_journal::read_committed(
+                dir,
+                "table",
+                &claim[..ANCHOR_LEN],
+                capacity.journal(),
+                None,
+            )? {
+                aterm_journal::Committed::Rebuilt { records, .. } => records,
+                _ => {
+                    return Err(Error::new(
+                        "table observation did not provide its complete prefix",
+                    ));
+                }
+            };
+            (None, replay::read_observed(records, acknowledged)?)
+        } else {
+            let mut log = Log::open(
+                dir,
+                "table",
+                &claim[..ANCHOR_LEN],
+                !pending,
+                capacity.journal(),
+            )
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    Error::busy()
+                } else {
+                    error.into()
+                }
+            })?;
+            let replay = replay::read(&mut log, acknowledged, pending)?;
+            (Some(log), replay)
+        };
         let mut store = Self {
             scope,
             actor: session.actor(),
@@ -369,7 +457,6 @@ impl Store {
         };
         // The complete acknowledged prefix is verified before any opaque
         // record is considered for quarantine. The tail has no such authority.
-        let replay = replay::read(&mut store.log, acknowledged, pending)?;
         store.witness = replay.witness;
         for entry in replay.entries {
             let replay::Entry {
@@ -406,18 +493,30 @@ impl Store {
                 }
             }
         }
-        store.log.finish_open()?;
-        if pending || store.witness != acknowledged {
-            store.claim[ANCHOR_LEN..WITNESS_AT].copy_from_slice(&directory_identity(dir)?);
-            store.publish_witness(store.witness)?;
+        if let Some(log) = &mut store.log {
+            log.finish_open()?;
+            if pending || store.witness != acknowledged {
+                store.claim[ANCHOR_LEN..WITNESS_AT].copy_from_slice(&directory_identity(dir)?);
+                store.publish_witness(store.witness)?;
+            }
+            // Complete a possible earlier rename whose directory barrier failed.
+            aterm_durable::durable_dir(&store.claim_dir)?;
         }
-        // Complete a possible earlier rename whose directory barrier failed.
-        aterm_durable::durable_dir(&store.claim_dir)?;
         store.check(session)?;
         Ok(store)
     }
     pub const fn scope(&self) -> Scope {
         self.scope
+    }
+    /// Stable identity of this local enrollment, excluding its advancing
+    /// receipt witness. An application pin can detect replacement custody even
+    /// when generic discovery has already enrolled an empty table again.
+    pub(crate) fn custody_id(&self, session: &Session<'_>) -> Result<Digest> {
+        self.check(session)?;
+        let mut hash = aterm_digest::Sha256::new();
+        hash.update(b"aterm/commons/table-custody/1\0");
+        hash.update(&self.claim[..WITNESS_AT]);
+        Ok(hash.finalize())
     }
     #[cfg_attr(
         any(test, debug_assertions),
@@ -433,17 +532,32 @@ impl Store {
             || self.observation != session.observation()?
             || self.claim[ANCHOR_LEN..WITNESS_AT] != directory_identity(&self.data_dir)?
             || self.poisoned
-            || self.log.is_poisoned()
-            || private_file::read_private(&self.claim_dir, &self.claim_name, CLAIM_LEN)
-                .ok()
-                .as_deref()
-                != Some(&self.claim)
+            || self.log.as_ref().is_some_and(Log::is_poisoned)
         {
             return Err(Error::new(
                 "table custody changed or append is uncertain; reopen",
             ));
         }
-        Ok(())
+        let current = private_file::read_private(&self.claim_dir, &self.claim_name, CLAIM_LEN).ok();
+        if current.as_deref() == Some(&self.claim) {
+            return Ok(());
+        }
+        // An observer still refuses every changed claim. A same-custody advance
+        // can be read afresh; rollback, changed identity and unreadable custody
+        // remain hard failures. No unverified new receipt is exposed here.
+        if self.log.is_none()
+            && current.as_ref().is_some_and(|claim| {
+                claim.len() == CLAIM_LEN
+                    && claim[..WITNESS_AT] == self.claim[..WITNESS_AT]
+                    && Witness::decode(&claim[WITNESS_AT..])
+                        .is_ok_and(|witness| witness.count > self.witness.count)
+            })
+        {
+            return Err(Error::snapshot_changed());
+        }
+        Err(Error::new(
+            "table custody changed or append is uncertain; reopen",
+        ))
     }
     fn admit(&self, header: &Header, bytes: usize) -> Result<()> {
         if self.records.len() >= self.capacity.operations
@@ -527,13 +641,17 @@ impl Store {
     }
     // Publish the independently retained witness before returning any receipt.
     fn append(&mut self, subject: &str, wire: &[u8], id: Digest) -> Result<Receipt> {
+        let log = self
+            .log
+            .as_mut()
+            .ok_or_else(|| Error::new("read-only table observation cannot append"))?;
         let received_ms =
             aterm_time::unix_millis().ok_or_else(|| Error::new("receipt clock unavailable"))?;
         let mut body = received_ms.to_le_bytes().to_vec();
         body.extend_from_slice(wire);
         let witness = self.witness.advance(self.witness.count, id, received_ms)?;
         self.poisoned = true;
-        let offset = self.log.append(subject, body)?.0;
+        let offset = log.append(subject, body)?.0;
         if offset != self.witness.count {
             return Err(Error::new("table log and custody witness diverged"));
         }
@@ -801,6 +919,112 @@ impl Store {
         )
     )]
     pub fn commit_catalog(&mut self, session: &Session<'_>, payload: &[u8]) -> Result<Receipt> {
+        let projection = self.catalog_projection(session)?;
+        let parents = if self.scope == crate::catalog::scope(self.scope.trust()) {
+            BTreeSet::new()
+        } else {
+            projection.heads
+        };
+        self.commit_from(session, payload, &projection.ordered, parents)
+    }
+
+    /// Append against complete retained liability evidence, including history
+    /// hidden by peer retirement. The application must validate its allocation
+    /// and payload before calling this; storage admission grants no capacity.
+    /// Only this writer's predecessor becomes a new causal dependency: fixed
+    /// shares never depend on another writer's current catalog visibility.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbResourceRetirement",
+            action = "Reserve",
+            project = "aterm_db::resources::tests::retirement_tests::retirement_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbResourceRetirement",
+            action = "Dispatch",
+            project = "aterm_db::resources::tests::retirement_tests::retirement_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbResourceRetirement",
+            action = "Record",
+            project = "aterm_db::resources::tests::retirement_tests::retirement_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "DbResourceRetirement",
+            action = "LegacyPeer",
+            reason = "The fixture installs legacy membership and retires a peer before appending."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "DbResourceRetirement",
+            action = "LogPeer",
+            reason = "The fixture installs log-backed membership and removes a peer before appending."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "DbResourceRetirement",
+            action = "PeerCutoff",
+            reason = "The fixture retains an administrator cutoff of the peer's catalog history."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "DbResourceRetirement",
+            action = "LogCutoff",
+            reason = "The fixture retains a peer cutoff with log-backed membership."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "DbResourceRetirement",
+            action = "LocalCutoff",
+            reason = "The fixture retains an administrator cutoff of the local writer."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "DbResourceRetirement",
+            action = "MissingFrontier",
+            reason = "The fixture retains a cutoff naming an unavailable frontier."
+        )
+    )]
+    pub(crate) fn commit_liability(
+        &mut self,
+        session: &Session<'_>,
+        payload: &[u8],
+    ) -> Result<Receipt> {
+        let retained = self
+            .liability_evidence(session)?
+            .iter()
+            .map(|record| record.header().id)
+            .collect::<Vec<_>>();
+        self.commit_from(session, payload, &retained, BTreeSet::new())
+    }
+
+    fn commit_from(
+        &mut self,
+        session: &Session<'_>,
+        payload: &[u8],
+        retained: &[Digest],
+        mut parents: BTreeSet<Digest>,
+    ) -> Result<Receipt> {
         self.check(session)?;
         session.writer()?;
         if self.conflicted().contains(&self.actor) {
@@ -820,9 +1044,7 @@ impl Store {
                 "local table writer has unavailable source history",
             ));
         }
-        let projection = self.catalog_projection(session)?;
-        let previous = projection
-            .ordered
+        let previous = retained
             .iter()
             .filter_map(|id| self.index.get(id))
             .filter(|header| header.actor == self.actor)
@@ -834,7 +1056,7 @@ impl Store {
             .records
             .values()
             .filter(|record| record.header.actor == self.actor);
-        let visible: BTreeSet<_> = projection.ordered.iter().copied().collect();
+        let visible: BTreeSet<_> = retained.iter().copied().collect();
         if own
             .clone()
             .any(|record| !visible.contains(&record.header.id))
@@ -844,16 +1066,16 @@ impl Store {
                 "local table writer has withheld or forked history; repair required",
             ));
         }
-        if session.journal.constraints().map_err(super::failure)?.facts().any(|fact|
-            matches!(fact, Fact::Cutoff { table, actor, .. } if *table == self.scope.digest() && *actor == self.actor)) {
-            return Err(Error::new("local catalog writer is cut off in this table"));
+        if session_constraints(session)?.facts().any(|fact| {
+            matches!(
+                fact,
+                Fact::Cutoff { table, actor, .. }
+                    if *table == self.scope.digest() && *actor == self.actor
+            )
+        }) {
+            return Err(Error::new("local table writer is cut off in this table"));
         }
         let previous = previous.map(|h| h.id);
-        let mut parents = if self.scope == crate::catalog::scope(self.scope.trust()) {
-            BTreeSet::new()
-        } else {
-            projection.heads
-        };
         if let Some(id) = previous {
             parents.insert(id);
         }
@@ -882,7 +1104,7 @@ impl Store {
         // not form transferable cutoff evidence. Exclude those local-only
         // frontiers; the full index below still retains restrictive forks.
         let index = self.replication_index()?;
-        let constraints = session.journal.constraints().map_err(super::failure)?;
+        let constraints = session_constraints(session)?;
         let table = self.scope.digest();
         let allowed = constraints.catalog(table, &index);
         let writers: BTreeSet<_> = session
@@ -906,11 +1128,16 @@ impl Store {
             .records
             .iter()
             .filter(|(id, stored)| {
+                let authorized_writer = writers.contains(&stored.header.actor)
+                    || cutoffs.contains(&stored.header.actor)
+                    || (session.is_log_backed()
+                        && super::envelope_roster(&stored.wire).is_some_and(|roster| {
+                            session.historical_writer_in(&roster, &stored.header.actor)
+                        }));
                 withheld.contains(*id)
                     || !allowed.permits(id)
                     || stored.quarantine.is_some()
-                    || (!writers.contains(&stored.header.actor)
-                        && !cutoffs.contains(&stored.header.actor))
+                    || !authorized_writer
             })
             .map(|(id, _)| *id)
             .collect();
@@ -1276,7 +1503,7 @@ impl Store {
                 "table liability graph is incomplete or conflicting; keep allocations reserved",
             ));
         }
-        let constraints = session.journal.constraints().map_err(super::failure)?;
+        let constraints = session_constraints(session)?;
         // A complete, non-forking graph has at most one digest per writer dot.
         // Exact frontier matches therefore also reject conflicting cutoffs.
         for fact in constraints.facts() {
@@ -1315,6 +1542,19 @@ impl Store {
     }
 }
 
+fn session_constraints(
+    session: &Session<'_>,
+) -> Result<aterm_secrets::commons::constraints::Constraints> {
+    if session.is_log_backed() {
+        session
+            .journal
+            .retained_constraints()
+            .map_err(super::failure)
+    } else {
+        session.journal.constraints().map_err(super::failure)
+    }
+}
+
 fn operation_policy(scope: Scope, header: &Header, payload: usize) -> Result<()> {
     if scope == crate::catalog::scope(scope.trust())
         && (payload > crate::catalog::MAX_PAYLOAD
@@ -1327,13 +1567,29 @@ fn operation_policy(scope: Scope, header: &Header, payload: usize) -> Result<()>
     }
     Ok(())
 }
-fn claims(session: &Session<'_>) -> Result<PathBuf> {
+/// The directory that holds each enrolled table's independent claim, beside Commons custody.
+pub(crate) fn claim_dir(session: &Session<'_>) -> Result<PathBuf> {
     session
         .bootstrap
         .journal_dir()
         .parent()
         .map(|p| p.join("table-claims"))
         .ok_or_else(|| Error::new("Commons custody has no parent"))
+}
+
+/// Whether `claim` is `writer`'s well-formed pending enrollment claim for `scope`, exactly as
+/// `Store::join` writes one before the table's journal exists.
+fn pending_claim(claim: &[u8], scope: Scope, writer: &[u8]) -> bool {
+    claim.len() == CLAIM_LEN
+        && claim[..5] == *b"ATSC0"
+        && claim[5..5 + super::SCOPE_LEN] == scope.bytes()
+        && claim[5 + super::SCOPE_LEN..5 + super::SCOPE_LEN + 48] == *writer
+        && claim[ANCHOR_LEN..].iter().all(|byte| *byte == 0)
+}
+
+/// The file name of `scope`'s enrollment claim inside [`claim_dir`].
+pub(crate) fn claim_name(scope: Scope) -> String {
+    format!("{}.claim", aterm_codec::hex::encode_lower(&scope.digest()))
 }
 
 fn directory_identity(dir: &Path) -> Result<[u8; 16]> {

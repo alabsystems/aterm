@@ -13,7 +13,7 @@ use crate::wall::{ApiCause, Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 4, "0.4");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 5, "0.5");
 
 #[derive(Debug, Clone, Copy)]
 struct Frame {

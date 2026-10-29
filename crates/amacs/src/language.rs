@@ -29,6 +29,10 @@ pub enum Language {
     GitCommit,
     /// The todo list of `git rebase -i`.
     GitRebaseTodo,
+    /// Comma-separated values: a table the grid face edits cell by cell.
+    Csv,
+    /// Tab-separated values: a table the grid face edits cell by cell.
+    Tsv,
 }
 
 /// What a span of a line is, for a face to colour.
@@ -351,7 +355,7 @@ pub const SUMMARY_LIMIT: usize = 50;
 
 impl Language {
     /// Every language, in declaration order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::Plain,
         Self::Markdown,
         Self::Toml,
@@ -360,6 +364,8 @@ impl Language {
         Self::Diff,
         Self::GitCommit,
         Self::GitRebaseTodo,
+        Self::Csv,
+        Self::Tsv,
     ];
 
     /// The name config uses (`[amacs.language.git-commit]`, design §9).
@@ -373,6 +379,8 @@ impl Language {
             Self::Diff => "diff",
             Self::GitCommit => "git-commit",
             Self::GitRebaseTodo => "git-rebase-todo",
+            Self::Csv => "csv",
+            Self::Tsv => "tsv",
         }
     }
 
@@ -394,6 +402,8 @@ impl Language {
             Self::Diff => "Diff",
             Self::GitCommit => "GitCommit",
             Self::GitRebaseTodo => "GitRebaseTodo",
+            Self::Csv => "CSV",
+            Self::Tsv => "TSV",
         }
     }
 
@@ -404,6 +414,16 @@ impl Language {
             .or_else(|| by_extension(name))
             .or_else(|| by_first_line(first_line))
             .unwrap_or(Self::Plain)
+    }
+
+    /// What separates a table's cells: a comma for CSV, a tab for TSV, and none for a language
+    /// that is not a table. A language with one opens in the grid face.
+    pub const fn delimiter(self) -> Option<crate::table::Delimiter> {
+        match self {
+            Self::Csv => Some(crate::table::Delimiter::Comma),
+            Self::Tsv => Some(crate::table::Delimiter::Tab),
+            _ => None,
+        }
     }
 
     /// The column fill wraps at by default: 72 for a commit message, as git's own tools wrap it, and Emacs's 70 for everything else.
@@ -425,7 +445,7 @@ impl Language {
     /// The language's comment delimiters.
     pub const fn comment(self) -> CommentSyntax {
         let (line, block) = match self {
-            Self::Plain | Self::Diff => (None, None),
+            Self::Plain | Self::Diff | Self::Csv | Self::Tsv => (None, None),
             Self::Markdown => (None, Some(("<!-- ", " -->"))),
             Self::Rust => (Some("// "), Some(("/* ", " */"))),
             Self::Toml | Self::Shell | Self::GitCommit | Self::GitRebaseTodo => (Some("# "), None),
@@ -442,7 +462,7 @@ impl Language {
 
     fn lex_into(self, state: LexState, line: &str, out: &mut Spans) -> LexState {
         match self {
-            Self::Plain => state,
+            Self::Plain | Self::Csv | Self::Tsv => state,
             Self::Markdown => markdown::lex(state, line, out),
             Self::Toml => toml::lex(state, line, out),
             Self::Rust => rust::lex(state, line, out),
@@ -513,7 +533,7 @@ impl Language {
             Self::Toml | Self::Shell | Self::GitCommit | Self::GitRebaseTodo => {
                 hash_comment_leader(line)
             }
-            Self::Plain | Self::Diff => None,
+            Self::Plain | Self::Diff | Self::Csv | Self::Tsv => None,
         };
         let first = leader.unwrap_or_else(|| leading_blanks(line));
         FillPrefix {
@@ -554,7 +574,7 @@ fn by_extension(name: &str) -> Option<Language> {
     if stem.is_empty() {
         return None;
     }
-    let table: [(&[&str], Language); 5] = [
+    let table: [(&[&str], Language); 7] = [
         (
             &["md", "markdown", "mdown", "mkd", "mkdn"],
             Language::Markdown,
@@ -563,6 +583,8 @@ fn by_extension(name: &str) -> Option<Language> {
         (&["rs"], Language::Rust),
         (&["sh", "bash", "zsh", "ksh", "dash"], Language::Shell),
         (&["diff", "patch"], Language::Diff),
+        (&["csv"], Language::Csv),
+        (&["tsv", "tab"], Language::Tsv),
     ];
     table.into_iter().find_map(|(extensions, language)| {
         extensions

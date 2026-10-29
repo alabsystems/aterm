@@ -10,9 +10,7 @@ use aterm_core::render::RenderInput;
 use aterm_core::terminal::{ClockReading, Terminal};
 use aterm_effects::companion::{CompanionOwner, GlowOwnership, PetFacts};
 use aterm_effects::cursor_glow::GlowStyle;
-use aterm_effects::host::{
-    CaptureMode, FrameGeom, HostFrameInput, SingFacts, TerminalFacts, Visibility,
-};
+use aterm_effects::host::{FrameGeom, HostFrameInput, TerminalFacts};
 use aterm_effects::kitty_pet::{PetAction, PetFrame, PetInputKind};
 use aterm_effects::pet_world::{PetPane, PetRect, PetReserve, PetWorldFacts};
 use aterm_effects::word_decorations::{DecoConfig, WordDecorations};
@@ -420,38 +418,26 @@ impl Host {
         self.owner
             .observe_console_reserved(input, &world, PetPane::full(input), reserve);
         let facts = TerminalFacts::read(&self.term, 7, false);
-        let host = HostFrameInput {
-            now: self.now,
-            visibility: Visibility::Focused,
-            reduced_motion: false,
-            serious: false,
-            shed_envelope: 1.0,
-            shed_active: false,
-            pointer_px: None,
-            capture: CaptureMode::Present,
-            geometry: FrameGeom {
+        let host = HostFrameInput::new(
+            self.now,
+            FrameGeom {
                 rows: self.rows,
                 cols: self.cols,
                 cell_w: CW,
                 cell_h: CH,
                 origin_px: (0, 0),
             },
-        };
+        );
         let tick = self.owner.prepare(
-            PetFacts {
-                facts: &facts,
-                host: &host,
-                glow: GlowOwnership {
+            PetFacts::new(
+                &facts,
+                &host,
+                GlowOwnership {
                     enabled: true,
                     style: GlowStyle::RainbowKitty,
                     style_raw_names_pet: true,
                 },
-                sing: SingFacts::default(),
-                focused: true,
-                obscured: false,
-                pane: None,
-                room: None,
-            },
+            ),
             &mut self.decos,
         );
         let frame = self.owner.tick(tick).pet;
@@ -1811,17 +1797,16 @@ fn generating_flights() -> Vec<HostFlights> {
         })
         .collect();
     crate::common::par_map(&runs, |&(frame_ms, echo_ms, host, knobs)| {
-        let h = Host::replay(&TAKES[0], knobs);
-        let flights = flights_of(&h.shots);
+        let shots = replayed(0, knobs);
+        let flights = flights_of(shots);
         // The turn end's walk: the composer's first move to another row from 32 s on.
-        let walk = h
-            .shots
+        let walk = shots
             .windows(2)
             .find(|w| w[1].ms >= 32_000 + echo_ms && w[1].caret.0 != w[0].caret.0)
             .map_or(0, |w| w[1].ms);
         let grounded = flights
             .iter()
-            .map(|&(at, ..)| grounded_before(&h.shots, walk, at))
+            .map(|&(at, ..)| grounded_before(shots, walk, at))
             .collect();
         (
             format!("{frame_ms} ms a frame, echo +{echo_ms} ms, {host}"),
@@ -1998,18 +1983,17 @@ fn a_mid_line_insert_wraps_in_one_flight() {
             brand: harness,
             ..Knobs::SHIPPED
         };
-        let h = Host::replay(&TAKES[3], knobs);
-        let cols = h.cols;
+        let shots = replayed(3, knobs);
+        let cols = TAKES[3].cols;
         // Each wrap: when, the line the caret wrapped onto, and the cat's row then.
-        let wraps: Vec<(u64, u16, f32)> = h
-            .shots
+        let wraps: Vec<(u64, u16, f32)> = shots
             .windows(2)
             .filter(|w| {
                 w[1].caret.0 == w[0].caret.0 + 1 && w[0].caret.1 + 10 >= cols && w[1].caret.1 < 10
             })
             .map(|w| (w[1].ms, w[1].caret.0, w[0].frame.row))
             .collect();
-        (frame_ms, echo_ms, harness, wraps, flights_of(&h.shots))
+        (frame_ms, echo_ms, harness, wraps, flights_of(shots))
     });
     for (frame_ms, echo_ms, harness, wraps, flights) in &seen {
         let label = format!(

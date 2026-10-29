@@ -30,10 +30,18 @@ pub const ATERM: &str = "aterm";
 /// (`/private/var` for `/var`); the pair of names is a folder only aterm's worker launch makes.
 #[must_use]
 pub fn is_worker_folder(p: &Path) -> bool {
+    is_harness_folder(p, WORKER_FOLDER)
+}
+
+/// Whether `p` is the folder `name` right under the harness state directory: its last component
+/// is `name` and its parent's is [`HARNESS`], the rule [`is_worker_folder`] reads by (and the
+/// credit-claim worker's, [`crate::harness::credit_offers::is_claim_folder`]).
+#[must_use]
+pub fn is_harness_folder(p: &Path, name: &str) -> bool {
     let mut names = p.components().rev();
     let named =
         |c: Option<Component<'_>>, name: &str| matches!(c, Some(Component::Normal(n)) if n == name);
-    named(names.next(), WORKER_FOLDER) && named(names.next(), HARNESS)
+    named(names.next(), name) && named(names.next(), HARNESS)
 }
 
 /// Whether `words`, one simple command's words as the shell splits them, run `aterm harness

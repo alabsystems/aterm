@@ -115,6 +115,9 @@ impl StrokeDetector {
     }
 }
 
+#[cfg(any(test, debug_assertions))]
+mod state_words;
+
 #[cfg(test)]
 mod tests {
     use super::*;

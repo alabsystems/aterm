@@ -42,6 +42,10 @@ mod bus;
 #[cfg(target_os = "macos")]
 mod claude_login_proof;
 #[cfg(target_os = "macos")]
+mod claude_measure;
+#[cfg(target_os = "macos")]
+mod claude_rotation_proof;
+#[cfg(target_os = "macos")]
 mod clock;
 #[cfg(target_os = "macos")]
 mod codex;
@@ -56,6 +60,8 @@ mod codex_proof;
 #[cfg(target_os = "macos")]
 mod codex_rig;
 #[cfg(target_os = "macos")]
+mod commons_startup;
+#[cfg(target_os = "macos")]
 mod crash;
 #[cfg(target_os = "macos")]
 mod disk_ask_lane;
@@ -67,6 +73,8 @@ mod door;
 mod fleet_fixture;
 #[cfg(target_os = "macos")]
 mod fleet_judge;
+#[cfg(target_os = "macos")]
+mod fleet_menu;
 #[cfg(target_os = "macos")]
 mod fleet_probe;
 #[cfg(target_os = "macos")]
@@ -132,6 +140,8 @@ mod mac_nux;
 #[cfg(target_os = "macos")]
 mod mac_nux_guest;
 #[cfg(target_os = "macos")]
+mod measure;
+#[cfg(target_os = "macos")]
 mod meta_keys;
 #[cfg(target_os = "macos")]
 mod muse;
@@ -178,6 +188,8 @@ mod reroute_prefix;
 #[cfg(target_os = "macos")]
 mod resource_attribution;
 #[cfg(target_os = "macos")]
+mod restart_jobs;
+#[cfg(target_os = "macos")]
 mod restore;
 #[cfg(target_os = "macos")]
 mod run;
@@ -210,17 +222,23 @@ mod stop;
 #[cfg(target_os = "macos")]
 mod stub;
 #[cfg(target_os = "macos")]
+mod swarm;
+#[cfg(target_os = "macos")]
 mod sys;
 #[cfg(target_os = "macos")]
 mod tape;
 #[cfg(target_os = "macos")]
 mod trail_census;
 #[cfg(target_os = "macos")]
+mod trail_companion;
+#[cfg(target_os = "macos")]
 mod trail_contrast;
 #[cfg(target_os = "macos")]
 mod trail_diff;
 #[cfg(target_os = "macos")]
 mod trail_gallery;
+#[cfg(target_os = "macos")]
+mod trail_hue;
 #[cfg(target_os = "macos")]
 mod trail_keys;
 #[cfg(target_os = "macos")]
@@ -277,10 +295,17 @@ against a local API stub (Anthropic, Responses, Gemini or Meta). A lab is fully 
 
 usage: targo --unverified lab <command> [tag] [args]
        (tag: the first word when it names a lab that is up, else $LAB_TAG or \"lab\" and the word is an argument;
-       up takes one optional tag beside --window; down, ps, crash and sleep take any first word as the tag;
+       up takes one optional tag beside --window, --fabric and --tab-strip; down, ps, crash and sleep take any
+       first word as the tag;
        a verb that brings up its own lab defaults to a tag of its own)
-  up [tag] [--window]            start the stub, a black-hole proxy, the egress witness and a jailed private aterm
+  up [tag] [--window] [--fabric] [--tab-strip]
+                                 start the stub, a black-hole proxy, the egress witness and a jailed private aterm
                                  (headless by default; --window opens one real window in the same jail)
+                                 --fabric: the lab's own bus: a private broker in the jail and the lab's socket dir, node and
+                                 observer caps (<run>/fabric), the [fabric] table and the rendezvous file `aterm link` reads,
+                                 the bridge connected before up returns; `down` ends it (refused beside a LAB_ATERM_TOML [fabric])
+                                 --tab-strip: tab_strip_rows = 1, the row whose tab menu holds the session clause (`open
+                                 tab-menu`); it takes a grid row (refused beside a LAB_ATERM_TOML tab_strip_rows)
                                  (env: LAB_SURVEY=1 LAB_TRUST=1 LAB_FIRST_RUN=1 LAB_RESTORE=1 LAB_CLOCK=1
                                  LAB_HARNESS_KEYS='continue = false' LAB_ATERM_TOML LAB_COLS LAB_LINES LAB_SCALE
                                  LAB_PROXY=dead LAB_CLAUDE LAB_CODEX LAB_AGY LAB_MUSE
@@ -294,7 +319,8 @@ usage: targo --unverified lab <command> [tag] [args]
   claude [tag] [-e K=V]... [--no-wait] [--relay] [--subscriber] [--debug-log] [--by-name] [-- claude args]
                                  launch the managed Claude Code in tab 1 (--relay: behind the PTY relay; --subscriber: a
                                  fake claude.ai OAuth token, for `limit` headers; --debug-log: a scratch debug log;
-                                 --by-name: `claude` through PATH, the reroute stub and the twin of a LAB_REROUTE=1 lab)
+                                 --by-name: types `claude` at the prompt as a person does, the lab's environment as
+                                 assignment words before it; LAB_REROUTE=1 labs only)
   codex [tag] [--signed-out|--chatgpt[=PLAN]] [-e K=V]... [--no-wait] [-- codex args]
                                  launch the managed Codex in tab 1 (CODEX_HOME=<scratch>/codex-home, model
                                  $LAB_CODEX_MODEL when set; --chatgpt: a fake ChatGPT auth.json, plan plus by default,
@@ -338,6 +364,10 @@ usage: targo --unverified lab <command> [tag] [args]
   tool [tag] '<json>'            script the stub's tool mode ({\"name\":\"Bash\",\"input\":...} or a list; \"@PROJ@\", \"@PORT@\");
                                  trigger it with `turn TAG toolstart`
   headers [tag] ['<json>']       set extra /v1/messages headers {\"on200\":{...},\"on429\":{...}} (\"@SEQ:BASE:STEP@\"; '{}' clears)
+  headers-for [tag] LABEL ['<json>']
+                                 the same blocks for one credential alone (LABEL as the stub logs it: oat:lab-a, key),
+                                 merged over the shared ones
+  mode-for [tag] LABEL MODE|off  answer one credential's /v1/messages turns in MODE (any mode name; off: the stub's own)
   account [tag] composed|off|show|'<json>'
                                  set the stub's claude.ai oauth/usage, profile and bootstrap route bodies (\"@ISO+N@\",
                                  \"@NOW+N@\": now+N s as an ISO instant, as unix seconds)
@@ -384,6 +414,8 @@ usage: targo --unverified lab <command> [tag] [args]
                                  replay a cast: every idle spell inside a turn, how long it stood, whether it was vouched
   idle-points gate <lab logs dir>...
                                  place a Muse Code lab's harness points against its sessions' runs (mid-reply, in the gate)
+  restart-jobs [tag]             whether the upgrade restart's SIGTERM ends Claude Code's background shells, against
+                                 upgrade::RESTART_ENDS_BACKGROUND (exit 0 agrees, 1 disagrees, 3 could not run)
   probe [tag] [--replica]        run jail and replica-home isolation probes (--replica: replica home only)
   selftest [tag] [--keep]        end-to-end Claude Code proof (~25 s: turn, survey, harness, egress, tripwire, probes, twin)
   claude-login-proof [tag] [--keep]
@@ -392,6 +424,15 @@ usage: targo --unverified lab <command> [tag] [args]
                                  row added by `accounts add` backs aterm out of its picker before the host's own look at
                                  the roster (S3), a person's /login is left alone (S3b); no browser, no `auth login`, no
                                  egress, no owner's keychain item; a verdict table, exit 1 on FAIL (--keep: judged live)
+  claude-rotation-proof [tag] [--keep] [--no-route-seam]
+                                 the real Claude Code moved between the roster accounts a fleet file names, end to end
+                                 (~25 min): a wall moves the tab with its conversation (R1), no usable row waits for the
+                                 first to open and moves back (R3), a row whose login directory is gone gets an automatic
+                                 sign-in attempt (recorded no-route) while the tab waits on its own reset and resumes
+                                 (R4), a sign-in on the default login makes its row usable and displaces the one it held,
+                                 there and back (R5a, R5b), the usage tap's high figure moves it before any wall (R2);
+                                 nobody asked, no /login, no browser, no egress; a verdict table, exit 1 on FAIL
+                                 (--no-route-seam: the live negative control, R1 must FAIL and its control row PASS)
   nudge-trial [tag] [--mode on|log|off] [--trials N] [--expect on|log|off] [--via mode|key] [--no-hold]
                                  force N (1-3) PTY displacements on real Claude Code and verify the repaint nudge (~2.5 min)
   restore [tag] quit|crash [--keep] [--hold] [--clear] [--land|--land-open]
@@ -439,7 +480,8 @@ usage: targo --unverified lab <command> [tag] [args]
                                    same-land's hold (its chip's and its band's screen-reader nodes) off it
   crash [tag] [--gap SECS] [--keep-tree]
                                  SIGKILL the lab's own aterm instance and relaunch it on the same state after SECS (default
-                                 0; --keep-tree leaves its child processes, for PTY keeper testing; refused on windowed labs)
+                                 0; --keep-tree leaves its child processes, for PTY keeper testing; refused on a windowed lab
+                                 whose recorded pid may be its window's keeper, so crash an `up --window` lab's)
   sleep [tag] --for SECS [--hold SECS] [--at-act [--rule RULE] [--within SECS]]
                                  emulate macOS sleep on a LAB_CLOCK=1 lab: SIGSTOP aterm, advance clock offset by SECS,
                                  hold --hold SECS, and SIGCONT (--at-act waits for first CONTINUED journal act)
@@ -461,7 +503,7 @@ usage: targo --unverified lab <command> [tag] [args]
                                  (--keep-dumps: its scratch dumps too)
 
 Outside any lab (no jail, no stub):
-  instance [--window] [--band app|agent] [--aterm PATH] [--columns N] [--lines N] [--font-px N] [--scale N] [--scene band-icons]
+  instance [--window] [--band app|agent] [--aterm PATH] [--columns N] [--lines N] [--font-px N] [--scale N] [--scene band-icons|harness-layouts]
            [--env NAME=VALUE]... [--toml LINE]... [--toml-after LINE]... [--harness-key LINE]... [--home DIR] [--harness]
            [--reroute-prefix DIR] [--pre VERB]... [--image PNG] [--post VERB]... [--pages cold] [--keep] [-- PROGRAM ARGS]
                                  run a private aterm in a scratch HOME/XDG world, print its socket and hold it until
@@ -472,14 +514,36 @@ Outside any lab (no jail, no stub):
                                  --reroute-prefix DIR: DIR, new, is the HOME, its atpkg prefix holding a clone of the
                                  managed Claude Code's store build with its twin and reroute stub, and the instance reroutes)
                                  --scene band-icons draws procedural chrome icons beside H (debug/dev-seams build)
+                                 --scene harness-layouts draws labeled synthetic footer states through the real renderer
+                                 (debug/dev-seams build; no live agent, upgrade candidate or account is read)
   abrew-admission [--json] [--indexes DIR] [--this-machine | --arch A --macos V --xcode V|none --no-clt]
                                  evaluate abrew admission of Homebrew's formula.json and cask.json (fetched from
                                  formulae.brew.sh unless --indexes DIR holds them) on the newest Mac, that Mac with the
                                  named facts replaced, or this one (--this-machine)
+  commons-startup <aterm> <new-output-directory> [--log-backed] [--suppressed | --observe SECONDS]
+                                 start an ordinary window and node host on private custody and loopback Commons;
+                                 require enrollment, fresh signed table data in both directions and recovery after restart
+                                 (--suppressed: negative control, whose private socket prevents window runtime startup;
+                                 --observe: keep the successful window running 1-60 s, then save its frame and live state)
+  fleet-menu <aterm> <new-output-directory>
+                                 run an isolated reader window and a peer with a sibling on loopback; retain the
+                                 peer's two-instance survey, the reader's menu dump and frame (all private worlds kept)
   fleet-sim [--n N] [--runs R] [--keep] [--record]
                                  run N (default 30, 4-64) private headless aterms on loopback fleet ports and verify
                                  `aterm ctl survey --fleet` across R runs (default 3) under `ulimit -n 256` (--record:
                                  a passing run's record goes to docs/measured/)
+  swarm rotate [--aterm PATH] [--keep]
+                                 run a private headless aterm with two enrolled Claude Code logins, wall the first through
+                                 the usage-tap seam (`harness tap`), verify `rotations[]` grows, and serve a turn on the second
+  swarm mailbox-signin [--live] [--email EMAIL] [--label LABEL] [--mailbox PATH] [--record] [--aterm PATH] [--keep]
+                                 verify an unenrolled Claude row records `no-route` while mailbox config is withheld, then
+                                 signs in through `ai-mailbox.toml`, ends enrolled, and serves a proven turn (--live: run
+                                 against a real Claude account and ~/.secrets/ai-mailbox.toml; --record: write docs/measured/)
+  swarm partition [--one-url] [--writers both|a] [--hold SECS] [--aterm PATH] [--keep] [--record]
+                                 split five private headless aterms and a vault-only Mac on loopback into two islands
+                                 (the ATERM_DEBUG_PARTITION cut), publish and admit on each side, heal, and report what
+                                 the vault and the fleet did, with timings and what was lost (--one-url: F8's negative
+                                 control; --record: write docs/measured/)
   disk-lane [--aterm PATH] [--keep]
                                  mount an 8 GiB sparse APFS image and verify disk-pressure tier eviction and reserve order (~1 min)
   disk-ask [tag] [--keep] [--scenario clear|partial|unanswered|exhausted|worker]
@@ -516,6 +580,12 @@ Outside any lab (no jail, no stub):
                [--selection RRGGBB] [--pixels FILE] [--mud-max N] [--glyph-min X] ...
                                  the Prism Glass census of a trail frame and its clean twin, layer by layer: OKLab mud,
                                  glyph contrast, the band's steps, seams, the stroke's hang, stars, caret (`--help` for details)
+  trail-companion <path>... [--shave SHARE] [--max N] [--list all|hits]
+                                 the companion over the letters: each gallery frame's pet_body against its lettered cells,
+                                 the caret and the word icons, from the sidecars (`--help` for details)
+  trail-hue <path>... [--min-px N] [--max N] [--list all|hits]
+                                 the hue rulings: Fire's pixels never green, Sparkle's in the gold family, each gallery
+                                 frame read against its clean twin (`--help` for details)
   trail-diff [--base REF|merge-base] [--control same|plant] [--keep] [--jobs N] [SCRIPT.trail|DIR]...
                                  Prism Glass's dark proof: build aterm-gui's trail_dump here and in a worktree of the base
                                  (HEAD~1), run both on the scripts and compare main's state and streams (`--help` for details)
@@ -549,7 +619,7 @@ Outside any lab (no jail, no stub):
                [--rounds N] [--no-split] [--out DIR]
                                  OPENS A WINDOW (with --window): verify predictive editing over a simulated RTT `link` in
                                  single and split panes (defaults: both shells, 100 ms, both modes, 2 rounds)
-  codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--expect-rollout bound|unmeasured]
+  codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--expect-rollout bound|partial]
                    [--policy-only|--upgrade-only|--raw-upgrade-only]
                                  end-to-end native harness proof on the real codex-alab package against a loopback fake
                                  model (~11 min; --policy-only: the cybersecurity-refusal leg alone; --upgrade-only: one
@@ -560,12 +630,24 @@ Outside any lab (no jail, no stub):
                                  waits up to 20 min for another to end, then is NOT RUN)
   codex-measure [--package DIR] [--keep]
                                  measure a codex-alab build for the rollout tap, in a clean checkout (~25 min): the proof
-                                 in process expecting it unmeasured, its six legs' rollouts reduced to a fixed point and
+                                 in process expecting it partial, its six legs' rollouts reduced to a fixed point and
                                  written to aterm-agent's step testdata (which lists the build), the standing tests, the
                                  proof again expecting it bound, then a docs/measured note; or a refusal by class (STEM KEY
                                  ROLLOUTS FIXED-POINT NEW-KEY GONE PROOF-RED STANDING NOT-BOUND) that leaves the checkout
                                  as it was and keeps the worlds; exit 0, writing nothing, for a build whose six legs HEAD
                                  holds; NOT RUN for a codex reduction HEAD does not hold (a killed run's leftover)
+  claude-measure [--keep]
+                                 measure the managed Claude Code build (`claude --version`) for the session log's
+                                 transcript steps, in a clean checkout (two debug builds of aterm and the standing
+                                 tests' build, ~25 min; ~10 min to a refusal at step 5): one session in a lab of its own
+                                 (harness off, the stub's subscriber path: a turn, a Bash call through its box, the
+                                 five-hour limit) expecting it partial, its transcript reduced to a fixed point the
+                                 privacy oracle passes and written to aterm-agent's step testdata as <build>.jsonl
+                                 (which lists the build), the standing tests, the session again expecting it on, then a
+                                 docs/measured note; or a refusal by class (STEM KEY TRANSCRIPTS FIXED-POINT TEXT
+                                 NEW-KEY GONE PROOF-RED STANDING NOT-BOUND) that leaves the checkout as it was and
+                                 keeps the worlds; exit 0, writing nothing, for a build HEAD holds; NOT RUN for a Claude
+                                 Code reduction HEAD does not hold
   seamless --baseline PATH [--aterm PATH] [--runs N] [--keep]
                                  OPENS A WINDOW, one at a time: one instance of a debug or dev-seams aterm across a real
                                  seamless update (ATERM_DEBUG_SEAMLESS_REEXEC=1, `update apply`), legs gap, topics,
@@ -716,6 +798,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "rollout" => codex::cmd_rollout(args),
         "codex-selftest" => codex_proof::cmd_codex_selftest(args),
         "claude-login-proof" => claude_login_proof::cmd_claude_login_proof(args),
+        "claude-rotation-proof" => claude_rotation_proof::cmd_claude_rotation_proof(args),
         "agy" => agy::cmd_agy(args),
         "agy-selftest" => agy_proof::cmd_agy_selftest(args),
         "agy-captures" => agy_captures::cmd_agy_captures(args),
@@ -728,11 +811,16 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "agy-upgrade" => upgrade_agy::cmd_agy_upgrade(args),
         "agy-relaunch" => relaunch_agy::cmd_agy_relaunch(args),
         "fleet-sim" => fleet_sim::cmd(args),
+        "fleet-menu" => fleet_menu::cmd(args),
+        "commons-startup" => commons_startup::cmd(args),
+        "swarm" => swarm::cmd_swarm(args),
         "mode" => verbs::cmd_mode(args),
         "limit" => verbs::cmd_limit(args),
         "tool" => verbs::cmd_tool(args),
         "settings" => verbs::cmd_settings(args),
         "headers" => verbs::cmd_headers(args),
+        "headers-for" => verbs::cmd_headers_for(args),
+        "mode-for" => verbs::cmd_mode_for(args),
         "account" => stats::cmd_account(args),
         "claude-json" => stats::cmd_claude_json(args),
         "statusline" => stats::cmd_statusline(args),
@@ -778,6 +866,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "footers" => footers::cmd_footers(args),
         "halfdraw" => halfdraw::cmd_halfdraw(args),
         "idle-points" => idlepoints::cmd_idle_points(args),
+        "restart-jobs" => restart_jobs::cmd_restart_jobs(args),
         "paths" => verbs::cmd_paths(),
         "instance" => instance::cmd_instance(args),
         "resource-attribution" => resource_attribution::cmd(args),
@@ -790,6 +879,8 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "trail-contrast" => trail_contrast::cmd_trail_contrast(args),
         "trail-diff" => trail_diff::cmd_trail_diff(args),
         "trail-census" => trail_census::cmd_trail_census(args),
+        "trail-companion" => trail_companion::cmd_trail_companion(args),
+        "trail-hue" => trail_hue::cmd_trail_hue(args),
         "trail-keys" => trail_keys::cmd_trail_keys(args),
         "aos-repair" => aos_repair::cmd_aos_repair(args),
         "aos-search" => aos_search::cmd_aos_search(args),
@@ -803,6 +894,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "predict-live" => predict_live::cmd_predict_live(args),
         "codex-alab-proof" => codex_alab_proof::cmd_codex_alab_proof(args),
         "codex-measure" => codex_measure::cmd_codex_measure(args),
+        "claude-measure" => claude_measure::cmd_claude_measure(args),
         "seamless" => seamless::cmd_seamless(args),
         "linux" => linux::cmd_linux(args),
         "windows" => windows::cmd_windows(args),
@@ -858,10 +950,19 @@ fn main() -> std::process::ExitCode {
         .and_then(|n| n.to_str())
     {
         Some("node") => relay::main(&args),
+        Some("dash") if swarm::standin_configured() => {
+            swarm::claude_main(args.get(1..).unwrap_or_default())
+        }
         Some(name @ ("zsh" | "-zsh" | "bash" | "-bash")) => link::as_shell(name, &args),
         Some("security") => tripwire::main(&args),
         Some("open") => recorder::main(&args),
-        Some("claude") => fleet_fixture::claude(&args),
+        Some("claude") => {
+            if swarm::standin_configured() {
+                swarm::claude_main(&args)
+            } else {
+                fleet_fixture::claude(&args)
+            }
+        }
         Some("build-loop") => fleet_fixture::build_loop(&args),
         Some("ps") => codex_rig::ps_main(&args),
         _ => {
@@ -883,6 +984,10 @@ fn main() -> std::process::ExitCode {
                 "presence-standin" => presence::standin_main(rest),
                 slot_lane::HOLD_VERB => slot_lane::hold_main(rest),
                 aos_workers::WORKER_VERB => aos_workers::worker_main(rest),
+                swarm::partition::AGENT_VERB => swarm::partition::agent_main(rest),
+                "init" if std::env::var_os(swarm::partition::AGENT_SEAM).is_some() => {
+                    swarm::partition::converge_standin(rest).unwrap_or(2)
+                }
                 "key-dump" => meta_keys::keydump_main(rest),
                 "mcp-standin" => codex_rig::mcp_main(rest),
                 _ => {
@@ -898,9 +1003,12 @@ fn main() -> std::process::ExitCode {
                                 | "paths"
                                 | "protected"
                                 | "fleet-sim"
+                                | "swarm"
                                 | "reduce"
                                 | "trail-contrast"
                                 | "trail-census"
+                                | "trail-companion"
+                                | "trail-hue"
                                 | "abrew-admission"
                         ) {
                             dispatch(&cmd, &rest)

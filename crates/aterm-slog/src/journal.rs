@@ -194,7 +194,8 @@ pub enum Frame {
         base: u32,
         /// The log's first accounted seq.
         first: u64,
-        /// How many restated opens follow.
+        /// How many restated opens follow, one per node; the amends that ride an open
+        /// ([`crate::rides_open`]) follow it, restated too, and are not counted.
         open: u32,
         /// When (wall ms).
         t: u64,
@@ -496,8 +497,9 @@ pub struct Take {
     pub recs: Vec<Rec>,
     /// The overlaps the read crossed.
     pub holes: Vec<(u64, u64, GapWhy)>,
-    /// The open path (the session's open, then each open node's), when the writer asked for a snap
-    /// or the read lost records.
+    /// The open path (the session's open, then each open node's, each followed by the amends that
+    /// ride it, [`Log::open_path_records`]), when the writer asked for a snap or the read lost
+    /// records.
     pub opens: Option<Vec<Rec>>,
     /// The readers' fence, while an update's carry stands.
     pub fence: Option<u64>,
@@ -550,7 +552,7 @@ fn snap_frames(sid: ShortId, take: &Take, head: u64, t: u64, out: &mut Vec<Frame
         ep: take.ep,
         base: take.base,
         first: take.first,
-        open: u32::try_from(opens.len()).unwrap_or(u32::MAX),
+        open: u32::try_from(opens.iter().filter(|r| r.op == Op::Open).count()).unwrap_or(u32::MAX),
         t,
     });
     for r in opens {

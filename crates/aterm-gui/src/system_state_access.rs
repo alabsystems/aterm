@@ -14,8 +14,13 @@
 //!   it; the debugger step, an administrator-authorized change aterm starts, needs this
 //!   window's own admission (`App::admitted_access`).
 //! * A step puts something on screen only at [`App::access_step_moment`], one gesture at a
-//!   time; while one is up the window holds a [`MacosDialog`], so the setup worker's own
-//!   prompts wait too.
+//!   time, and never while a first permission walk may still start and waits only for the person
+//!   ([`App::walk_waits_for_the_person`]); while one is up the window holds a [`MacosDialog`], so
+//!   the setup worker's own prompts wait too. The Local Network trigger goes first, at a moment of
+//!   its own that waits for no walk still to come, and that walk waits for it and its alert's hold
+//!   ([`App::local_network_step_to_come`]) until the step alone has held a ready walk for
+//!   `permission_walk::LOCAL_NETWORK_WAIT` of unbroken looks (`App::waited_out_local_network`):
+//!   the walk then goes first, and the step asks once it is over.
 //! * A panel's Not now holds the window's page, and a control client's act on its row, for
 //!   the rest of its revision (`devtools_helper::declined_for`). A new revision, even one
 //!   approved while aterm runs ([`App::rearm_access_steps`]), asks again.
@@ -42,10 +47,10 @@ use crate::status_item::SystemStateLine;
 use crate::system_state::ToolsWait;
 use crate::{App, SetupStatus, devtools_helper};
 
-/// How long the Local Network alert counts as up after the trigger. macOS reports neither the
-/// alert nor its answer, so this is a bound, not a reading: the next step waits this long, and
-/// an alert still unanswered after it may have System Settings beside it.
-pub(crate) const LOCAL_NETWORK_ALERT_HOLD: Duration = Duration::from_secs(30);
+/// How long the Local Network alert counts as up after the trigger
+/// ([`aterm_types::macos_setup::LOCAL_NETWORK_QUESTION_HOLD`], a bound, not a reading).
+pub(crate) const LOCAL_NETWORK_ALERT_HOLD: Duration =
+    aterm_types::macos_setup::LOCAL_NETWORK_QUESTION_HOLD;
 
 /// How long a Local Network trigger that found no LAN to name waits before it
 /// looks again (the Wi-Fi may join after launch).
@@ -103,12 +108,51 @@ pub(crate) const FDA_AFTER_UPDATE: &str = "The update needs Full Disk Access re-
 /// only once a status has read the Secrets row.
 pub(crate) const JOIN_PENDING_KEY: &str = "privacy.secrets.join-pending";
 
+/// What a person's press on System State found of the window's own helper panel
+/// ([`App::press_meets_unseen_panel`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnseenPanel {
+    /// No panel held the press back unseen: it goes on as it would.
+    Clear,
+    /// The press asked for the panel's own page: System Settings came up at it, and the panel,
+    /// which shows only beside System Settings, with it.
+    BroughtForward,
+    /// The panel gave way to the press: it closed (no Not now, no act on its page), its walk
+    /// stepped aside, and the window's dialog guard went with it, so the press goes on now.
+    GaveWay,
+    /// No panel stood, but a pane aterm opened with none beside it held the guard for its bounded
+    /// time ([`PANE_HOLD`]): a press back in aterm is past that pane, and the guard went.
+    PaneLeft,
+}
+
+/// What the 1 s × 30 s LAN re-probe after [`AccessOutcome::Triggered`] observed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalNetworkProbe {
+    /// A LAN server answered: the person allowed Local Network.
+    Granted,
+    /// macOS refused a `.local` lookup (`-65570`): the person answered Don't Allow.
+    #[cfg(any(target_os = "macos", test))]
+    Refused,
+    /// The 30 s window elapsed with no definite answer.
+    #[cfg(any(target_os = "macos", test))]
+    Unanswered,
+}
+
 /// What the access steps reach outside the App, injected so the steps are
 /// tested without a LAN, a state directory or the process-wide dialog count.
 #[derive(Clone, Copy)]
 pub(crate) struct StepsReach {
     /// Raise macOS's Local Network question: `true` when a LAN peer was named.
     pub(crate) trigger_local_network: fn() -> bool,
+    /// Start the 1 s × 30 s LAN grant re-probe for `revision` after [`AccessOutcome::Triggered`].
+    pub(crate) start_local_network_probe: fn(u64),
+    /// Drain a completed LAN grant re-probe (`(revision, outcome)`), if any.
+    pub(crate) take_local_network_probe: fn() -> Option<(u64, LocalNetworkProbe)>,
+    /// Local Network's answer moved as the window heard it: its question went up (recorded
+    /// `triggered`, which the access record keeps as asked), or the re-probe after it ended,
+    /// whatever it heard. Each LAN reader looks again now, the converge pass's `sync.peers` among
+    /// them ([`crate::network_moved::local_network_moved`]).
+    pub(crate) lan_answer_moved: fn(),
     /// Open a named access pane; injected so headless fixtures reach no OS API.
     pub(crate) open_pane: fn(&App, Access) -> bool,
     /// Append one step's outcome, reporting any failure to the retry owner.
@@ -119,14 +163,21 @@ pub(crate) struct StepsReach {
     pub(crate) handed: fn(u64, Access) -> bool,
     /// Whether System State is the visible view of a focused window.
     pub(crate) frontmost: fn(&App) -> bool,
-    /// The quiet-moment rules ([`App::devtools_moment_is_quiet`]).
+    /// The steps' quiet-moment rules ([`App::step_moment_is_quiet`]).
     pub(crate) quiet: fn(&App, Instant) -> bool,
     /// Whether any macOS dialog this process started is up
     /// ([`aterm_types::macos_setup::macos_dialog_up`]).
     pub(crate) dialog_up: fn() -> bool,
+    /// Hand this process's LAN to the Commons runtime
+    /// ([`aterm_types::macos_setup::lan_first_use::hand_over`]) once the step's trigger has asked.
+    pub(crate) hand_lan_over: fn(u64),
     /// Whether the window holds a [`MacosDialog`] while its own gesture is up
     /// (a live windowed instance only: the count is process-wide).
     pub(crate) holds_dialog: bool,
+    /// Whether aterm.log names what holds the Local Network step
+    /// ([`App::note_local_network_hold`]): only where the step can run, a live windowed macOS
+    /// instance, never on an instance whose arms reach nothing.
+    pub(crate) names_holds: bool,
 }
 
 impl std::fmt::Debug for StepsReach {
@@ -141,6 +192,9 @@ impl StepsReach {
     /// Nothing reached: no trigger, no record, never frontmost, no dialog.
     pub(crate) const INERT: Self = Self {
         trigger_local_network: || false,
+        start_local_network_probe: |_| {},
+        take_local_network_probe: || None,
+        lan_answer_moved: || {},
         open_pane: |_, _| false,
         record: |_, _, _| Ok(()),
         recorded: |_, _| None,
@@ -148,21 +202,28 @@ impl StepsReach {
         frontmost: |_| false,
         quiet: |_, _| false,
         dialog_up: || false,
+        hand_lan_over: |_| {},
         holds_dialog: false,
+        names_holds: false,
     };
 
     /// The live arms of a windowed macOS instance.
     pub(crate) fn live() -> Self {
         Self {
             trigger_local_network: live_trigger_local_network,
+            start_local_network_probe: live_start_local_network_probe,
+            take_local_network_probe: live_take_local_network_probe,
+            lan_answer_moved: crate::network_moved::local_network_moved,
             open_pane: live_open_access_pane,
             record: live_record,
             recorded: live_recorded,
             handed: live_handed,
             frontmost: App::system_state_frontmost,
-            quiet: App::devtools_moment_is_quiet,
+            quiet: App::step_moment_is_quiet,
             dialog_up: aterm_types::macos_setup::macos_dialog_up,
+            hand_lan_over: aterm_types::macos_setup::lan_first_use::hand_over,
             holds_dialog: true,
+            names_holds: true,
         }
     }
 }
@@ -180,6 +241,10 @@ pub(crate) struct AccessSteps {
     /// The revision whose Local Network trigger found nothing to connect to (no LAN yet, or no
     /// socket), and when to try it again.
     local_network_retry: Option<(u64, Instant)>,
+    /// What held the Local Network step from its moment at the last look that found it held
+    /// ([`App::local_network_holds`]), as aterm.log last said it: a look that finds the same
+    /// says nothing.
+    local_network_held: Option<Vec<String>>,
     /// The opt-outs last told to the setup worker ([`App::publish_access_opt_outs`]),
     /// in [`OPT_OUT_ROWS`] order; `None` before the first.
     opt_outs: Option<[Option<OptOut>; 4]>,
@@ -266,6 +331,7 @@ impl AccessSteps {
             local_network_read: None,
             local_network_until: None,
             local_network_retry: None,
+            local_network_held: None,
             opt_outs: None,
             pane_act: None,
             pane_until: None,
@@ -354,12 +420,53 @@ pub(crate) fn lan_target(interfaces: &[LanInterface]) -> Option<Ipv4Addr> {
     pick(|address| address.is_private()).or_else(|| pick(|address| address.is_link_local()))
 }
 
+/// Why System State's Local Network step will not ask macOS on a network it has no subnet to
+/// name on ([`lan_target`]): one with only public IPv4 addresses (a campus network may hand those
+/// out), or an IPv6-only one.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const LOCAL_NETWORK_STEP_NO_LAN: &str = "this Mac's network has no private or \
+    link-local IPv4 subnet, so System State's Local Network step has nothing to ask macOS with";
+
+/// Why System State's Local Network step will not run in a window here (pure): `config_off`,
+/// the reason `aterm.toml` gives ([`crate::app_config::local_network_step_off_setting`]), else
+/// [`LOCAL_NETWORK_STEP_NO_LAN`] where this Mac is on a network (an IPv4 LAN segment among
+/// `interfaces`, or `ipv6_network`) but its `interfaces` give the step no LAN to name, so its
+/// trigger asks nothing ([`App::tick_local_network_step`]); `None` while it may, a Mac on no
+/// network yet included (the step asks once it joins one it can name). Uses that wait for the
+/// step go where it will not run.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn local_network_step_off_with(
+    config_off: Option<&'static str>,
+    interfaces: &[LanInterface],
+    ipv6_network: bool,
+) -> Option<&'static str> {
+    config_off.or_else(|| {
+        (lan_target(interfaces).is_none()
+            && (ipv6_network || interfaces.iter().any(|interface| interface.broadcast)))
+        .then_some(LOCAL_NETWORK_STEP_NO_LAN)
+    })
+}
+
+/// [`local_network_step_off_with`] of `aterm.toml` and this Mac's interfaces as they read now
+/// (`getifaddrs`: no socket, so no question).
+#[cfg(target_os = "macos")]
+pub(crate) fn local_network_step_off_here() -> Option<&'static str> {
+    local_network_step_off_with(
+        crate::app_config::local_network_step_off_setting(),
+        &interface_addresses(),
+        ipv6_network_up(),
+    )
+}
+
 /// `status`'s `setup=` (pure): where this Mac's setup stands, from the last status the worker
 /// published (its progress record and its prompt-free readings), so a `status` costs no probe.
 /// `pending:<row,...>` names each managed row that needs a person, waits, failed or, while the
 /// run goes, still differs (`fda`, `devtools`, `vault`, … [`setup_word`]); `done` once the plan
-/// finished or a person cancelled it with none of those left; `pending` while a run goes with
-/// none read; `-` before the worker said anything (no setup in this process).
+/// finished or a person cancelled it with none of those left, or once System State's headline
+/// says this Mac is set up ([`crate::system_state::Headline::set_up`]) before its run finished,
+/// as while its Secrets stage parks to ask again by itself for an ALab vault that did not answer,
+/// which the page does not count; `pending` while a run goes with none read; `-` before the
+/// worker said anything (no setup in this process).
 pub(crate) fn setup_field(status: &SetupStatus) -> String {
     let selection = status
         .plan
@@ -384,9 +491,17 @@ pub(crate) fn setup_field(status: &SetupStatus) -> String {
             pending.push(word);
         }
     }
+    // What the page says: a run going, a step that waits or failed, or a row not read yet keeps
+    // its headline off set up.
+    let set_up = || {
+        status.plan.as_ref().is_some_and(|plan| {
+            let rows = crate::system_state::rows(status, plan.selection);
+            crate::system_state::headline(status, &rows, Some(plan)).set_up
+        })
+    };
     if !pending.is_empty() {
         format!("pending:{}", pending.join(","))
-    } else if ended {
+    } else if ended || set_up() {
         "done".to_owned()
     } else if status.plan.is_some() || status.run.is_some() {
         "pending".to_owned()
@@ -457,7 +572,10 @@ pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<Sys
     let tools = status.repositories_tools_wait();
     // Apple's Command Line Tools installing is a wait that ends by itself (§3.3): no line.
     let mut needs: Vec<Subject> = managed_with(Standing::NeedsYou)
-        .filter(|subject| *subject != repositories || tools != Some(ToolsWait::Installing))
+        .filter(|subject| {
+            *subject != repositories
+                || !matches!(tools, Some(ToolsWait::Installing | ToolsWait::Queued))
+        })
         .collect();
     if fda_regressed && !needs.contains(&fda) {
         needs.push(fda);
@@ -550,10 +668,19 @@ impl App {
         })
     }
 
+    /// Whether the access record's latest line for this approval and row is `declined`: a Not
+    /// now an earlier process took, which [`Self::access_declined_here`] does not hold. Never
+    /// without an approved revision.
+    pub(crate) fn access_declined_on_record(&self, access: Access) -> bool {
+        self.access_revision().is_some_and(|revision| {
+            (self.access_steps.reach.recorded)(revision, access) == Some(AccessOutcome::Declined)
+        })
+    }
+
     /// The `[privacy]` switches leave the steps on: `enabled`, `check` and
-    /// `notice`.
+    /// `notice` ([`crate::app_config::Config::access_steps_allowed`]).
     pub(crate) fn access_steps_allowed(&self) -> bool {
-        self.config.privacy_probe_gate().permits() && self.config.privacy_notice()
+        self.config.access_steps_allowed()
     }
 
     /// Which Permissions rows the person opted out of, in [`OPT_OUT_ROWS`] order: every row
@@ -609,22 +736,31 @@ impl App {
     }
 
     /// Whether the window's own Developer Tools page came up in the access revision: its marker
-    /// names the revision's step, or the record holds its `handed`. `aterm doctor --fix` rewrites
+    /// names the revision's step, or the record holds its `handed`. `aterm doctor` rewrites
     /// the one-line marker under the running version, so the marker alone would bring the page
     /// up a second time in the revision. That marker names no bundle or Mac, nor does the
     /// record. (Full Disk Access's marker names both, so a page brought up while no revision
     /// stands keeps the revision's step there instead: `devtools_helper::fda_opened_word`.)
+    /// While no revision stands no page came up in one, whatever the marker's version says: a
+    /// reading then asks, and the window's own step waits queued for the revision and is judged
+    /// against it there (`App::devtools_hand_over_carrying`).
     pub(crate) fn devtools_shown_this_revision(&self) -> bool {
-        let key = self.access_marks().devtools;
+        let Some(revision) = self.access_revision() else {
+            return false;
+        };
+        let key = atpkg::devtools::revision_key(revision);
         (self.devtools_helper.reach().last_opened)().is_some_and(|(word, _)| word == key)
             || self.handed_this_revision(Access::DeveloperTools)
     }
 
-    /// Whether `fda-pane-opened` names the approved revision's step for this bundle and Mac
-    /// (`atpkg::devtools::same_step`): the window's own Full Disk Access page came up under it.
+    /// Whether this bundle's and Mac's newest Full Disk Access opening
+    /// (`atpkg::devtools::PageMarkers::opened_as`) names the approved revision's step
+    /// (`atpkg::devtools::same_step`): the window's own page came up under it. Each bundle's and
+    /// Mac's opening is kept beside the others' (`atpkg::devtools::PageMarkers::note_opened_beside`),
+    /// so another one's page under the revision leaves this one's.
     pub(crate) fn fda_shown_this_revision(&self) -> bool {
         let key = self.access_marks().fda;
-        (self.devtools_helper.fda_reach().last_opened)()
+        (self.devtools_helper.fda_reach().opened_as)(&key)
             .is_some_and(|(word, _)| atpkg::devtools::same_step(&word, &key))
     }
 
@@ -648,9 +784,20 @@ impl App {
     /// permission walk between its pages), a folder warm-up walking, an installer terminal, or
     /// an alert or pane's hold.
     pub(crate) fn access_gesture_up(&self, now: Instant) -> bool {
-        self.developer_tools_install_active()
-            || self.devtools_helper.panel().is_some()
+        self.devtools_helper.panel().is_some()
             || self.permission_walk.active()
+            || self.access_gesture_up_beside_walk(now)
+    }
+
+    /// [`Self::access_gesture_up`] leaving out the permission walk and its own panel: a
+    /// hand-over panel the walk did not bring up, a folder warm-up walking, an installer
+    /// terminal, or an alert or pane's hold.
+    pub(crate) fn access_gesture_up_beside_walk(&self, now: Instant) -> bool {
+        self.developer_tools_install_active()
+            || self
+                .devtools_helper
+                .panel()
+                .is_some_and(|panel| panel.origin() != devtools_helper::Origin::Walk)
             || self.consent_warmup.is_live()
             || self.access_steps.local_network_alert_up(now)
             || self.access_steps.pane_up(now)
@@ -662,7 +809,10 @@ impl App {
     }
 
     /// Reserve the worker's dialog slot before a pane, panel or folder worker
-    /// can start. A moment check alone cannot keep a worker from winning it.
+    /// can start. A moment check alone cannot keep a worker from winning it. A slot the window
+    /// holds already is taken as won: one gesture going on from its pane to its panel. Its
+    /// moment keeps a second gesture from starting beside the first
+    /// ([`Self::access_step_moment`], [`Self::control_ask_moment`]).
     pub(crate) fn reserve_access_dialog(&mut self) -> bool {
         if !self.access_steps.reach.holds_dialog || self.access_steps.dialog.is_some() {
             return true;
@@ -691,6 +841,33 @@ impl App {
         self.reserve_access_dialog()
     }
 
+    /// Win the dialog slot for a page of the control verb's permission walk while the walk holds
+    /// none (its first page), under the steps' one-gesture rule: `false` while another of the
+    /// window's gestures ([`Self::access_gesture_up_beside_walk`]) or another macOS dialog of
+    /// this process is up, and while a person's Install… press waits for the slot or its tab is
+    /// on its way ([`Self::install_press_waits`]): a person's press never waits behind a
+    /// control client's walk. A guard the window holds then is the walk's own, taken at a turn's
+    /// end while it waited ([`Self::settle_access_steps`]): it is given up and the slot won only
+    /// when none is up, so a setup-worker prompt that was up first is waited out, not stacked on.
+    pub(crate) fn reserve_walk_dialog(&mut self, now: Instant) -> bool {
+        if self.access_gesture_up_beside_walk(now) || self.install_press_waits() {
+            return false;
+        }
+        self.drop_access_dialog();
+        !self.access_dialog_up() && self.reserve_access_dialog()
+    }
+
+    /// Whether a person's press of the Repositories row's Install… waits for the dialog slot
+    /// (`Install::PressedQueued`) or its tab is on its way to landing (`Install::Pressed`), where
+    /// it takes the slot for its installer.
+    pub(crate) const fn install_press_waits(&self) -> bool {
+        matches!(
+            self.workstation_setup.developer_tools,
+            crate::clt_install::Install::PressedQueued { .. }
+                | crate::clt_install::Install::Pressed
+        )
+    }
+
     /// Give up the window's dialog slot outright: the permission walk hands it to the debugger
     /// change, whose administrator dialog takes a slot of its own.
     pub(crate) fn drop_access_dialog(&mut self) {
@@ -700,8 +877,8 @@ impl App {
     /// A failed start releases its reservation; an already visible gesture
     /// keeps the same guard, including when another helper replaces its panel.
     pub(crate) fn release_unused_access_dialog(&mut self, now: Instant) {
-        if !self.access_gesture_up(now) {
-            self.access_steps.dialog = None;
+        if !self.access_gesture_up(now) && self.access_steps.dialog.take().is_some() {
+            self.tick_developer_tools_install();
         }
     }
 
@@ -727,28 +904,281 @@ impl App {
     }
 
     /// The moment the first step (Local Network) may start: an approved
-    /// revision, the switches on, System State frontmost, no macOS gesture up and
-    /// the quiet-moment rules ([`StepsReach::quiet`]).
-    fn local_network_moment(&self, now: Instant) -> bool {
+    /// revision, the switches on, System State frontmost, no macOS gesture up,
+    /// the quiet-moment rules ([`StepsReach::quiet`]), and System Settings asking
+    /// nothing ([`Self::system_settings_asks`]), read last since it may read the
+    /// window list.
+    pub(crate) fn local_network_moment(&self, now: Instant) -> bool {
+        self.local_network_moment_but_settings(now) && !self.system_settings_asks()
+    }
+
+    /// [`Self::local_network_moment`] but for System Settings asking, for a reader that reads that
+    /// itself in this look, after (`App::waited_out_local_network`, whose look reads it last), or
+    /// in its own order (`App::access_step_moment`), so one look reads it once.
+    pub(crate) fn local_network_moment_but_settings(&self, now: Instant) -> bool {
         self.access_revision().is_some()
             && self.access_steps_allowed()
             && (self.access_steps.reach.frontmost)(self)
-            && !self.access_gesture_up(now)
-            && !(self.access_steps.reach.dialog_up)()
+            && self.no_gesture_up(now)
             && (self.access_steps.reach.quiet)(self, now)
+    }
+
+    /// Whether System Settings asks something of the person now, what the permission walk's Full
+    /// Disk Access done words wait for (`App::turn_after_fda`): one of its own windows over its
+    /// main one (its password window, or macOS's Quit & Reopen sheet after a Full Disk Access
+    /// switch: `devtools_helper::Lane::settings_asks`, which also counts one seen standing over a
+    /// main window since moved to another Space, hidden or minimized), or a quit asked of this
+    /// process (`WalkReach::quit_asked`: Quit & Reopen asks for one before its sheet goes). A walk
+    /// the close box ended, or a page a step opened, leaves System Settings up with that question
+    /// standing, and macOS's Local Network alert, a later step's page or dialog (the debugger's
+    /// among them, `App::debugger_step_moment`) and the walk that starts by itself
+    /// (`App::look_for_walk_start`) are not put beside it.
+    pub(crate) fn system_settings_asks(&self) -> bool {
+        (self.permission_walk.reach().quit_asked)() || self.devtools_helper.settings_asks()
+    }
+
+    /// [`Self::system_settings_asks`], or the question System Settings was seen asking still
+    /// listed over its main window off screen past `devtools_helper::ASKING_KEPT_FOR` after the
+    /// person left it (`devtools_helper::Lane::settings_may_ask`): what a gesture that opens one
+    /// of System Settings' pages waits for (the walk's start and its next page, the access steps
+    /// after Local Network), since an `open` under a standing sheet is lost
+    /// (`docs/measured/first-launch-permission-walk-0.145.0-2026-10-28.md`, finding 3). Only a
+    /// reading with its main window on screen ends it. The Local Network alert and the debugger's
+    /// dialog wait for [`Self::system_settings_asks`] alone.
+    pub(crate) fn system_settings_may_ask(&self) -> bool {
+        (self.permission_walk.reach().quit_asked)() || self.devtools_helper.settings_may_ask()
+    }
+
+    /// What holds the Local Network step from its moment ([`Self::local_network_moment`]) now,
+    /// in aterm.log's words: each unmet condition once, in the moment's order, and empty when
+    /// none is. A lasting hold (no approved revision, a `[privacy]` switch off) is said alone, so
+    /// the words change only when it does. System State not frontmost is said alone too, as the
+    /// part of it that fails ([`Self::system_state_front_gap`], read only when the step's own arm
+    /// says it fails), so keys typed, windows or apps switched to and the window's gestures and
+    /// dialogs coming and going while the person is elsewhere change nothing said. With System
+    /// State in front come the window's gestures and dialogs, the quiet moment's parts
+    /// ([`Self::step_quiet_gaps`], read only when the step's own arm says it fails; a part both
+    /// name is said once), and System Settings asking (read last, as the moment reads it, only
+    /// when nothing else holds the step: it may read the window list).
+    pub(crate) fn local_network_holds(&self, now: Instant) -> Vec<String> {
+        self.local_network_holds_read(now, None)
+    }
+
+    /// [`Self::local_network_holds`], with System Settings asking taken from `settings_asked`
+    /// when the caller read it already in this look (`App::start_walk_by_itself`).
+    pub(crate) fn local_network_holds_read(
+        &self,
+        now: Instant,
+        settings_asked: Option<bool>,
+    ) -> Vec<String> {
+        let lasting: Vec<String> = [
+            self.access_revision()
+                .is_none()
+                .then_some("no approved setup revision admits the Permissions group"),
+            (!self.access_steps_allowed())
+                .then_some("a [privacy] switch (enabled, check or notice) is off"),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::to_owned)
+        .collect();
+        if !lasting.is_empty() {
+            return lasting;
+        }
+        let mut holds: Vec<String> = Vec::new();
+        let mut hold = |words: &str| {
+            if !holds.iter().any(|held| held == words) {
+                holds.push(words.to_owned());
+            }
+        };
+        if !(self.access_steps.reach.frontmost)(self) {
+            return vec![
+                self.system_state_front_gap()
+                    .unwrap_or("System State is not the visible view of a focused window")
+                    .to_owned(),
+            ];
+        }
+        if let Some(panel) = self.devtools_helper.panel() {
+            hold(if panel.origin() == devtools_helper::Origin::Walk {
+                "the permission walk's helper panel is up"
+            } else {
+                "a System Settings helper panel is up"
+            });
+        }
+        if self.permission_walk.active() {
+            hold("a permission walk is under way");
+        }
+        if self.developer_tools_install_active() {
+            hold("the Developer Tools installer is up");
+        }
+        if self.consent_warmup.is_live() {
+            hold("the launch folder pass is walking");
+        }
+        if self.access_steps.local_network_alert_up(now) {
+            hold("the Local Network alert's hold");
+        }
+        if self.access_steps.pane_up(now) {
+            hold("the hold of a System Settings pane aterm opened");
+        }
+        if self.access_dialog_up() {
+            hold("a macOS dialog or page this process started counts as up");
+        }
+        if !(self.access_steps.reach.quiet)(self, now) {
+            let gaps = self.step_quiet_gaps(now);
+            if gaps.is_empty() {
+                hold("the quiet moment");
+            }
+            for gap in &gaps {
+                hold(gap);
+            }
+        }
+        if holds.is_empty() {
+            if settings_asked.unwrap_or_else(|| self.devtools_helper.settings_asks()) {
+                holds.push(format!(
+                    "System Settings shows a window of its own over its main one (its password \
+                     window, or Quit & Reopen's sheet), or, with its main window off screen, the \
+                     one last seen there is still listed over it (for at most {} min after the \
+                     person left it)",
+                    devtools_helper::ASKING_KEPT_FOR.as_secs() / 60
+                ));
+            }
+            if (self.permission_walk.reach().quit_asked)() {
+                holds.push(
+                    "a quit is asked of this process (System Settings' Quit & Reopen)".to_owned(),
+                );
+            }
+        }
+        holds
+    }
+
+    /// Say in aterm.log what holds the Local Network step ([`Self::local_network_holds`]) when it
+    /// differs from what was last said, so a step that waits names its hold once per change,
+    /// never once per look; never on an instance whose step cannot run
+    /// ([`StepsReach::names_holds`]). The line it wrote, if it wrote one.
+    fn note_local_network_hold(&mut self, now: Instant, revision: Option<u64>) -> Option<String> {
+        if !self.access_steps.reach.names_holds {
+            return None;
+        }
+        let holds = self.local_network_holds(now);
+        if holds.is_empty() || self.access_steps.local_network_held.as_ref() == Some(&holds) {
+            return None;
+        }
+        let of = revision.map_or_else(String::new, |revision| format!(" (revision {revision})"));
+        let line = format!(
+            "system state: the Local Network step waits{of}: {}",
+            holds.join("; ")
+        );
+        aterm_log::info!("{line}");
+        self.access_steps.local_network_held = Some(holds);
+        Some(line)
+    }
+
+    /// The one-gesture rule: none of the window's own access gestures up
+    /// ([`Self::access_gesture_up`]) and no macOS dialog of this process up.
+    fn no_gesture_up(&self, now: Instant) -> bool {
+        !self.access_gesture_up(now) && !self.access_dialog_up()
+    }
+
+    /// A control verb's moment (`devtools_helper::Origin::Ctl`): its own quiet moment, with no
+    /// approved revision and no System State in front needed (`App::devtools_moment_is_quiet`),
+    /// held to the steps' one-gesture rule, so its page waits out a panel or installer the window
+    /// has up and the Local Network alert's or a pane's hold (bounds, not readings: macOS does not
+    /// say when either closes).
+    pub(crate) fn control_ask_moment(&self, now: Instant) -> bool {
+        self.no_gesture_up(now) && self.devtools_moment_is_quiet(now)
     }
 
     /// Whether the Local Network step of the approved revision is still to run
     /// in this process.
-    fn local_network_pending(&self) -> bool {
-        self.access_revision()
-            .is_some_and(|revision| self.access_steps.local_network_done != Some(revision))
+    pub(crate) fn local_network_pending(&self) -> bool {
+        self.config.swarm_enabled()
+            && self
+                .access_revision()
+                .is_some_and(|revision| self.access_steps.local_network_done != Some(revision))
+    }
+
+    /// The Local Network step of `revision` ran in this process, as its trigger leaves it.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn local_network_ran_for_test(&mut self, revision: u64) {
+        self.access_steps.local_network_done = Some(revision);
+    }
+
+    /// Whether the approved revision's Local Network step is still to run in this process
+    /// ([`Self::local_network_pending`]), its record read first
+    /// ([`Self::local_network_on_record`]), so a revision the record already holds is done at this
+    /// look. The first permission walk to start by itself waits for it, as every step after
+    /// it does (`App::look_for_walk_start`): its alert goes first in the run, and its hold
+    /// ([`LOCAL_NETWORK_ALERT_HOLD`], ended early by the LAN re-probe's answer,
+    /// [`Self::on_local_network_probe_ready`]) is one of the window's gestures
+    /// ([`Self::access_gesture_up`]). The walk's wait ends once the step alone has held it ready
+    /// for `permission_walk::LOCAL_NETWORK_WAIT` of unbroken looks
+    /// (`App::waited_out_local_network`): the walk then goes first, and the step asks once it is
+    /// over.
+    pub(crate) fn local_network_step_to_come(&mut self) -> bool {
+        if let Some(revision) = self.access_revision() {
+            self.local_network_on_record(revision);
+        }
+        self.local_network_pending()
+    }
+
+    /// Read the access record's Local Network row for `revision`, once per revision: a row it
+    /// already holds (an earlier process's step) makes the step done in this one. Whether this read
+    /// found it.
+    fn local_network_on_record(&mut self, revision: u64) -> bool {
+        if self.access_steps.local_network_read == Some(revision) {
+            return false;
+        }
+        self.access_steps.local_network_read = Some(revision);
+        let recorded = (self.access_steps.reach.recorded)(revision, Access::LocalNetwork).is_some();
+        if recorded {
+            self.access_steps.local_network_done = Some(revision);
+        }
+        recorded
     }
 
     /// The step moment: an access step after Local Network may put its page, panel or folder
-    /// dialog on screen now ([`Self::local_network_moment`], with Local Network done).
+    /// dialog on screen now ([`Self::local_network_moment`], with Local Network done, and System
+    /// Settings asking nothing, nor a question seen asking lapsed off screen:
+    /// [`Self::system_settings_may_ask`], since a step's page opened under it is lost), and no
+    /// first walk that may still start by itself waits for the
+    /// person to come back ([`Self::walk_waits_for_the_person`]), so no step takes its first page.
+    /// The debugger step, judged by its own admission, waits on the same run order
+    /// (`App::debugger_step_moment`: Local Network still to run, System Settings asking).
     pub(crate) fn access_step_moment(&self, now: Instant) -> bool {
-        !self.local_network_pending() && self.local_network_moment(now)
+        !self.local_network_pending()
+            && self.local_network_moment_but_settings(now)
+            && !self.system_settings_may_ask()
+            && !self.walk_waits_for_the_person(now)
+    }
+
+    /// Drain a completed 1 s × 30 s LAN grant re-probe: release the Local Network alert hold and
+    /// its dialog slot first so the worker's Secrets lane sees no dialog up when [`AccessOutcome::Granted`]
+    /// wakes it, then record `Granted` when a LAN server answered. Whatever it heard, the LAN
+    /// readers look again now ([`StepsReach::lan_answer_moved`]): a grant or a Don't Allow moved
+    /// the answer, and a probe that heard nothing (no ALab vault on this network, or an answer
+    /// after its 30 s) still ends with the question asked, which a look before it did not know.
+    pub(crate) fn on_local_network_probe_ready(&mut self, now: Instant) {
+        if !self.config.swarm_enabled() {
+            cancel_local_network_probe();
+            self.access_steps.local_network_until = None;
+            self.release_unused_access_dialog(now);
+            return;
+        }
+        let Some((revision, probe)) = (self.access_steps.reach.take_local_network_probe)() else {
+            return;
+        };
+        if self.access_steps.local_network_done != Some(revision) {
+            return;
+        }
+        self.access_steps.local_network_until = None;
+        self.release_unused_access_dialog(now);
+        if probe == LocalNetworkProbe::Granted {
+            self.record_access_at(revision, Access::LocalNetwork, AccessOutcome::Granted);
+            aterm_log::info!(
+                "system state: Local Network granted (LAN answered, revision {revision})"
+            );
+        }
+        (self.access_steps.reach.lan_answer_moved)();
     }
 
     /// The Local Network step, first in the run: once per approved revision, a UDP connect
@@ -759,6 +1189,10 @@ impl App {
     /// revision; while none is approved it is kept but arms no deadline
     /// ([`Self::next_access_step_deadline`]), so the same revision coming back looks again.
     pub(crate) fn tick_local_network_step(&mut self, now: Instant) {
+        self.on_local_network_probe_ready(now);
+        if !self.config.swarm_enabled() {
+            return;
+        }
         if self
             .access_steps
             .local_network_until
@@ -774,6 +1208,9 @@ impl App {
             self.access_steps.pane_until = None;
         }
         let Some(revision) = self.access_revision() else {
+            if self.access_steps.local_network_done.is_none() {
+                let _ = self.note_local_network_hold(now, None);
+            }
             return;
         };
         if self
@@ -799,16 +1236,14 @@ impl App {
                 return;
             }
         }
-        if self.access_steps.local_network_read != Some(revision) {
-            self.access_steps.local_network_read = Some(revision);
-            if (self.access_steps.reach.recorded)(revision, Access::LocalNetwork).is_some() {
-                self.access_steps.local_network_done = Some(revision);
-                return;
-            }
-        }
-        if !self.local_network_moment(now) {
+        if self.local_network_on_record(revision) {
             return;
         }
+        if !self.local_network_moment(now) {
+            let _ = self.note_local_network_hold(now, Some(revision));
+            return;
+        }
+        self.access_steps.local_network_held = None;
         if self.access_steps.reach.holds_dialog {
             // Own the worker's dialog slot before either the trigger or its
             // record wakes it. The quiet-moment check cannot reserve the slot.
@@ -824,9 +1259,15 @@ impl App {
         }
         self.access_steps.local_network_done = Some(revision);
         if (self.access_steps.reach.trigger_local_network)() {
+            // macOS asked under this step's slot: the Commons runtime may use the LAN now.
+            (self.access_steps.reach.hand_lan_over)(revision);
             self.access_steps.local_network_retry = None;
             self.access_steps.local_network_until = Some(now + LOCAL_NETWORK_ALERT_HOLD);
             self.record_access_step(Access::LocalNetwork, AccessOutcome::Triggered);
+            // The record now says asked, so a LAN look made before it (`sync.peers`' "macOS has
+            // not asked") is stale from here: the readers look again now.
+            (self.access_steps.reach.lan_answer_moved)();
+            (self.access_steps.reach.start_local_network_probe)(revision);
             aterm_log::info!("system state: Local Network asked for (revision {revision})");
         } else {
             self.access_steps.dialog = None;
@@ -840,10 +1281,13 @@ impl App {
     }
 
     /// The end of the consent lanes' turn: park or release a walking launch folder pass, hold
-    /// or release the window's dialog guard, record the panels' Not now, spend the access
+    /// or release the window's dialog guard (held while one of the window's gestures is up, the
+    /// permission walk among them, except a control verb's walk that has not won the slot while a
+    /// person's Install… press waits for it), record the panels' Not now, spend the access
     /// card's ([`Self::spend_card_not_now`]), bring the pages back for a revision approved in
     /// this process ([`Self::rearm_access_steps`]), and end the retired digest entries once.
     pub(crate) fn settle_access_steps(&mut self, now: Instant) {
+        self.on_local_network_probe_ready(now);
         if self.access_steps.warmup_gate.is_some() && !self.consent_warmup.is_live() {
             self.note_launch_warmup_progress();
             self.access_steps.warmup_gate = None;
@@ -862,7 +1306,13 @@ impl App {
                 );
             }
         }
-        let up = self.access_steps.reach.holds_dialog && self.access_gesture_up(now);
+        // The control verb's walk that has not won the slot takes no guard while a person's
+        // Install… press waits for it, so the press's tab can open and land first.
+        let walk_gives_way = self.permission_walk.waits_for_slot() && self.install_press_waits();
+        let up = self.access_steps.reach.holds_dialog
+            && (self.devtools_helper.panel().is_some()
+                || self.access_gesture_up_beside_walk(now)
+                || (self.permission_walk.active() && !walk_gives_way));
         if up != self.access_steps.dialog.is_some() {
             self.access_steps.dialog = up.then(MacosDialog::up);
         }
@@ -1195,18 +1645,30 @@ impl App {
 
     /// A press on a Needs-you row's button (`Open Full Disk Access`, `Turn On…`); `true` when
     /// System Settings (or the debugger change) is up for it now. A person's press opens the
-    /// page past any Not now. A control client's act (`by_person` false) never mints the
-    /// standing yes: it does nothing without an approved revision or with a `[privacy]` switch
-    /// off, its Full Disk Access and Developer Tools pages pass the window's own hand-over rules
-    /// as [`devtools_helper::Origin::SystemStateAct`], and its Local Network and Accessibility
-    /// panes are queued for the step moment ([`Self::tick_queued_pane`]), answering `false`.
+    /// page past any Not now, and never waits behind a helper panel they cannot see
+    /// ([`Self::press_meets_unseen_panel`]): the panel's own row brings its page forward, and
+    /// any other row's press has the panel give way first. A control client's act (`by_person`
+    /// false) never mints the standing yes: it does nothing without an approved revision or with
+    /// a `[privacy]` switch off, its Full Disk Access and Developer Tools pages pass the window's
+    /// own hand-over rules as [`devtools_helper::Origin::SystemStateAct`], and its Local Network
+    /// and Accessibility panes are queued for the step moment ([`Self::tick_queued_pane`]),
+    /// answering `false`.
     pub(crate) fn open_access_from_system_state(
         &mut self,
         access: Access,
         by_person: bool,
     ) -> bool {
-        let walked = by_person.then(|| self.walk_from_row(access)).flatten();
-        let (opened, how) = if let Some(walked) = walked {
+        let unseen = if by_person {
+            self.press_meets_unseen_panel(Some(access), Instant::now())
+        } else {
+            UnseenPanel::Clear
+        };
+        let walked = (by_person && unseen != UnseenPanel::BroughtForward)
+            .then(|| self.walk_from_row(access))
+            .flatten();
+        let (opened, how) = if unseen == UnseenPanel::BroughtForward {
+            (true, "brought forward")
+        } else if let Some(walked) = walked {
             walked
         } else if !by_person && (self.access_revision().is_none() || !self.access_steps_allowed()) {
             (false, "no approved revision, or a [privacy] switch off")
@@ -1258,9 +1720,119 @@ impl App {
         opened
     }
 
+    /// A person's press on System State meets the window's own helper panel (a walk's page, or a
+    /// hand-over's), which holds the window's one macOS gesture while it stands
+    /// ([`Self::access_gesture_up`]), so every press that needs it (Turn On…, Install…) would
+    /// wait for the panel's answer. The panel stands beside System Settings and leaves the screen
+    /// whenever another app is active, so with aterm in front, where the press was made, the
+    /// person cannot see what waits: a press never waits behind it. One for the panel's own row
+    /// (`own`) brings its page forward ([`Self::reopen_panel_page`]); any other has the panel give
+    /// way ([`devtools_helper::Closed::GaveWay`]: no Not now, no act on its page, nothing the walk
+    /// queued opens after it) and the walk step aside, its pages still to come taken up by the
+    /// next walk that starts by itself (`WalkLane::give_way`), and lets the dialog guard go. A
+    /// walk between pages, with no panel up, steps aside too, except for a press on the row of
+    /// the page it is at, which takes that walk over (`WalkLane::pressed`, in
+    /// `Self::walk_from_row`). A panel the person can see (System Settings the active app)
+    /// stands. A pane aterm opened with no panel beside it (Local
+    /// Network's) holds the guard only for its bounded time, since macOS says nothing when the
+    /// person leaves it: a press made back in aterm is past it, so the guard goes then too.
+    pub(crate) fn press_meets_unseen_panel(
+        &mut self,
+        own: Option<Access>,
+        now: Instant,
+    ) -> UnseenPanel {
+        match self
+            .devtools_helper
+            .panel()
+            .map(devtools_helper::Panel::page)
+        {
+            None if !self.permission_walk.active() => {
+                if !self
+                    .access_steps
+                    .pane_until
+                    .take()
+                    .is_some_and(|until| now < until)
+                {
+                    return UnseenPanel::Clear;
+                }
+                self.release_unused_access_dialog(now);
+                aterm_log::info!(
+                    "system state: a person's press{} is past the pane aterm opened; its hold \
+                     on the dialog guard went",
+                    own.map_or_else(String::new, |access| format!(" on {}", access.name()))
+                );
+                return UnseenPanel::PaneLeft;
+            }
+            None if own.is_some()
+                && self
+                    .permission_walk
+                    .walk()
+                    .and_then(crate::permission_walk::Walk::current)
+                    .map(crate::permission_walk::Subject::access)
+                    == own =>
+            {
+                return UnseenPanel::Clear;
+            }
+            Some(_) if self.devtools_helper.panel_seen() => return UnseenPanel::Clear,
+            Some(page) if own == Some(page.access()) => {
+                let opened = self.reopen_panel_page(page);
+                aterm_log::info!(
+                    "system state: {} brought forward for a person's press ({})",
+                    page.as_str(),
+                    if opened {
+                        "System Settings is up at it"
+                    } else {
+                        "System Settings did not open"
+                    }
+                );
+                return UnseenPanel::BroughtForward;
+            }
+            _ => {}
+        }
+        self.permission_walk
+            .give_way("a person's press elsewhere on System State, with its page out of sight");
+        self.access_steps.pane_until = None;
+        self.devtools_helper.give_way();
+        self.release_unused_access_dialog(now);
+        aterm_log::info!(
+            "system state: the helper panel out of sight gave way to a person's press{}",
+            own.map_or_else(String::new, |access| format!(" on {}", access.name()))
+        );
+        UnseenPanel::GaveWay
+    }
+
+    /// Bring the page the helper panel stands beside up again in System Settings, through the
+    /// opener its hand-over used (`devtools_helper::Reach::open_pane` and `FdaReach::open_pane`,
+    /// `menu::open_privacy_settings`; the Accessibility pane's [`StepsReach::open_pane`]): System
+    /// Settings comes to the front at the page, and the panel, which shows only beside it, with
+    /// it. The panel's own Open ([`devtools_helper::Button::OpenPage`]) and a person's press on
+    /// its row ask it, both the owner's, which every hand-over admits whatever aterm read; the
+    /// page was brought up and recorded already. A headless instance's openers are inert.
+    /// `true` when System Settings opened.
+    pub(crate) fn reopen_panel_page(&mut self, page: devtools_helper::Page) -> bool {
+        use devtools_helper::Page;
+        let opened = match page {
+            Page::DeveloperTools => (self.devtools_helper.reach().open_pane)(),
+            Page::FullDiskAccess => (self.devtools_helper.fda_reach().open_pane)(),
+            Page::Accessibility => (self.access_steps.reach.open_pane)(self, Access::Accessibility),
+        };
+        aterm_log::info!(
+            "{}: the page again{}",
+            page.as_str(),
+            if opened {
+                ""
+            } else {
+                " (System Settings did not open)"
+            }
+        );
+        opened
+    }
+
     /// A person's press on the Full Disk Access, Developer Tools or Accessibility row starts the
     /// permission walk with that row's page first, going on to every other grant missing
-    /// (`crate::permission_walk`); a walk at another page gives way to it. `None` leaves the
+    /// (`crate::permission_walk`); a walk at another page gives way to it, and one at its page is
+    /// the person's from there on, so a control verb's walk waiting there opens it now
+    /// (`WalkLane::pressed`). `None` leaves the
     /// press to its own page: another row, a headless instance, or a grant the window reads held,
     /// whose page an owner's press opens anyway.
     fn walk_from_row(&mut self, access: Access) -> Option<(bool, &'static str)> {
@@ -1275,6 +1847,7 @@ impl App {
         self.take_walk_close(now);
         match self.permission_walk.walk().map(|walk| walk.current()) {
             Some(current) if current == Some(subject) => {
+                self.permission_walk.pressed();
                 self.drive_permission_walk(now);
                 return Some((true, "walking"));
             }
@@ -1286,7 +1859,7 @@ impl App {
             return None;
         }
         match self.start_permission_walk(&[subject], "a person's press", now) {
-            Started::Walking(_) => Some((true, "walking")),
+            Started::Walking { .. } => Some((true, "walking")),
             Started::Headless | Started::Granted | Started::Recent | Started::Declined => None,
         }
     }
@@ -1697,6 +2270,100 @@ fn live_trigger_local_network() -> bool {
     false
 }
 
+#[cfg(target_os = "macos")]
+static ACTIVE_LOCAL_NETWORK_PROBE_REVISION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(target_os = "macos")]
+static READY_LOCAL_NETWORK_PROBE: std::sync::Mutex<Option<(u64, LocalNetworkProbe)>> =
+    std::sync::Mutex::new(None);
+
+/// A master-Off change cancels the worker and discards its pending grant without another
+/// probe, permission record or join. An in-flight network call observes cancellation next.
+pub(crate) fn cancel_local_network_probe() {
+    #[cfg(target_os = "macos")]
+    {
+        ACTIVE_LOCAL_NETWORK_PROBE_REVISION.store(0, std::sync::atomic::Ordering::Release);
+        if let Ok(mut ready) = READY_LOCAL_NETWORK_PROBE.lock() {
+            *ready = None;
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn live_start_local_network_probe(revision: u64) {
+    use std::sync::atomic::Ordering;
+    ACTIVE_LOCAL_NETWORK_PROBE_REVISION.store(revision, Ordering::Release);
+    if let Ok(mut ready) = READY_LOCAL_NETWORK_PROBE.lock() {
+        *ready = None;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("aterm-local-network-probe".into())
+        .spawn(move || {
+            let outcome = aterm_secrets::client::probe_lan_for_grant(|| {
+                ACTIVE_LOCAL_NETWORK_PROBE_REVISION.load(Ordering::Acquire) != revision
+            });
+            if ACTIVE_LOCAL_NETWORK_PROBE_REVISION.load(Ordering::Acquire) != revision {
+                return;
+            }
+            if let aterm_secrets::client::LanGrantProbe::Granted(ref probed) = outcome
+                && let Ok(paths) = aterm_secrets::client::Paths::live()
+                && let Some(network) = aterm_secrets::heard::network_key()
+            {
+                let heard = match probed {
+                    aterm_secrets::client::ProbeOutcome::Found(found) => {
+                        Some(aterm_secrets::heard::Heard::Found {
+                            url: found.url.clone(),
+                            signer: found.fingerprint.clone(),
+                        })
+                    }
+                    aterm_secrets::client::ProbeOutcome::AnotherVault(_) => {
+                        Some(aterm_secrets::heard::Heard::Absent)
+                    }
+                    aterm_secrets::client::ProbeOutcome::Absent
+                    | aterm_secrets::client::ProbeOutcome::NotThisVault(_) => None,
+                };
+                if let Some(heard) = heard {
+                    let at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |since| since.as_secs());
+                    let _ = aterm_secrets::heard::write(
+                        &paths,
+                        &aterm_secrets::heard::Verdict { at, heard, network },
+                    );
+                }
+            }
+            let probe = match outcome {
+                aterm_secrets::client::LanGrantProbe::Granted(_) => LocalNetworkProbe::Granted,
+                aterm_secrets::client::LanGrantProbe::Refused => LocalNetworkProbe::Refused,
+                aterm_secrets::client::LanGrantProbe::Unanswered => LocalNetworkProbe::Unanswered,
+            };
+            if let Ok(mut ready) = READY_LOCAL_NETWORK_PROBE.lock() {
+                *ready = Some((revision, probe));
+            }
+            let _ = crate::workstation_setup::send_setup_wake(crate::Wake::LocalNetworkProbeReady);
+        });
+    if let Err(error) = spawned {
+        aterm_log::warn!("system state: Local Network grant probe did not start: {error}");
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn live_start_local_network_probe(_revision: u64) {}
+
+#[cfg(target_os = "macos")]
+fn live_take_local_network_probe() -> Option<(u64, LocalNetworkProbe)> {
+    READY_LOCAL_NETWORK_PROBE
+        .lock()
+        .ok()
+        .and_then(|mut ready| ready.take())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn live_take_local_network_probe() -> Option<(u64, LocalNetworkProbe)> {
+    None
+}
+
 /// This Mac's IPv4 interfaces that are up and not loopback.
 #[cfg(target_os = "macos")]
 fn interface_addresses() -> Vec<LanInterface> {
@@ -1750,6 +2417,56 @@ fn interface_addresses() -> Vec<LanInterface> {
     // SAFETY: `head` came from a successful getifaddrs and is freed once.
     unsafe { libc::freeifaddrs(head) };
     out
+}
+
+/// Whether one of this Mac's interfaces that is up, not loopback and a LAN segment (broadcast,
+/// not point-to-point: no VPN's `utun`) has an IPv6 address beyond link-local: this Mac is on an
+/// IPv6 network, which the Local Network step cannot name. A link-local address says nothing of
+/// a network: `awdl0` has one with none joined.
+#[cfg(target_os = "macos")]
+fn ipv6_network_up() -> bool {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs writes the head of a list it allocated into `head`.
+    if unsafe { libc::getifaddrs(&raw mut head) } != 0 {
+        return false;
+    }
+    let mut up = false;
+    let mut at = head;
+    while !at.is_null() && !up {
+        // SAFETY: `at` is a node of the list getifaddrs returned, freed only below.
+        let node = unsafe { &*at };
+        at = node.ifa_next;
+        let flags = node.ifa_flags;
+        if flags & libc::IFF_UP as u32 == 0
+            || flags & libc::IFF_LOOPBACK as u32 != 0
+            || flags & libc::IFF_BROADCAST as u32 == 0
+            || flags & libc::IFF_POINTOPOINT as u32 != 0
+            || node.ifa_addr.is_null()
+        {
+            continue;
+        }
+        // SAFETY: a non-null `ifa_addr` points at a sockaddr header.
+        let (family, len) = unsafe { ((*node.ifa_addr).sa_family, (*node.ifa_addr).sa_len) };
+        if i32::from(family) != libc::AF_INET6 {
+            continue;
+        }
+        // SAFETY: a non-null `ifa_addr` of the node is a sockaddr whose `sa_len` bytes are
+        // readable.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(node.ifa_addr.cast::<u8>(), usize::from(len)) };
+        // `sin6_addr` sits after `sin6_len`, `sin6_family`, `sin6_port` and `sin6_flowinfo`.
+        let Some(Ok(octets)) = bytes.get(8..24).map(<[u8; 16]>::try_from) else {
+            continue;
+        };
+        let address = std::net::Ipv6Addr::from(octets);
+        up = !address.is_unspecified()
+            && !address.is_loopback()
+            && !address.is_multicast()
+            && !address.is_unicast_link_local();
+    }
+    // SAFETY: `head` came from a successful getifaddrs and is freed once.
+    unsafe { libc::freeifaddrs(head) };
+    up
 }
 
 fn live_record(revision: u64, access: Access, outcome: AccessOutcome) -> std::io::Result<()> {

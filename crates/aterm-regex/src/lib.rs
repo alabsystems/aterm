@@ -390,7 +390,6 @@ impl std::error::Error for Error {}
 /// // program, one on the scan.
 /// let re = RegexBuilder::new(r"\d{1,5}")
 ///     .size_limit(128 * 1024)
-///     .dfa_size_limit(1 << 20)
 ///     .step_limit(1 << 22)
 ///     .build()?;
 /// assert!(re.is_match("port 8080"));
@@ -428,15 +427,6 @@ impl RegexBuilder {
         self
     }
 
-    /// Ceiling, in bytes, on a lazy-DFA cache: accepted for source compatibility and
-    /// ignored.
-    #[inline]
-    #[must_use]
-    /// Accepted for source compatibility with `regex`; ignored by the Pike VM.
-    pub const fn dfa_size_limit(self, _bytes: usize) -> Self {
-        self
-    }
-
     /// Ceiling on the work one search may do, in units of `positions × live threads`.
     #[inline]
     #[must_use]
@@ -444,15 +434,6 @@ impl RegexBuilder {
     pub const fn step_limit(mut self, steps: u64) -> Self {
         self.step_limit = steps;
         self
-    }
-
-    /// Read back the value passed to [`step_limit`](Self::step_limit).
-    #[inline]
-    #[must_use]
-    #[cfg(test)]
-    /// Return the configured [`step_limit`](Self::step_limit).
-    pub const fn get_step_limit(&self) -> u64 {
-        self.step_limit
     }
 
     /// Parse and compile the pattern.
@@ -689,7 +670,6 @@ mod step_budget_tests {
     fn one_mib_gate(pattern: &str) -> Regex {
         RegexBuilder::new(pattern)
             .size_limit(1 << 20)
-            .dfa_size_limit(1 << 20)
             .build()
             .expect("the amplifiers compile under a 1 MiB ceiling — that is the problem")
     }
@@ -835,17 +815,14 @@ mod step_budget_tests {
     fn a_find_iter_is_held_to_one_budget_not_one_per_match() {
         let row = row();
         let n = row.len();
+        let one_search = budget_needed_for_one_search(r"\w+=|\w", &row);
+        let shared_limit = one_search.saturating_mul(4);
         let re = RegexBuilder::new(r"\w+=|\w")
             .size_limit(128 * 1024)
-            .step_limit(CALL_SITE_STEP_LIMIT)
+            .step_limit(shared_limit)
             .build()
             .expect("compiles");
 
-        let one_search = budget_needed_for_one_search(r"\w+=|\w", &row);
-        assert!(
-            one_search.saturating_mul(16) < CALL_SITE_STEP_LIMIT,
-            "one search over the row needs {one_search} units; the budget is {CALL_SITE_STEP_LIMIT}"
-        );
         assert_eq!(
             re.try_find(&row).map(|m| m.map(|m| m.range())),
             Ok(Some(0..1))
@@ -855,13 +832,12 @@ mod step_budget_tests {
         let found = it.by_ref().count();
         assert!(
             it.step_limit_exceeded(),
-            "{found} of {n} matches yielded and no exhaustion reported: the \
-             iteration walked ~{} units against a budget of {CALL_SITE_STEP_LIMIT}",
-            u64::try_from(n / 2)
-                .unwrap_or(u64::MAX)
-                .saturating_mul(one_search)
+            "{found} of {n} matches yielded and no exhaustion reported against shared budget {shared_limit}"
         );
-        assert!(found < n, "a truncated iteration yields a prefix");
+        assert!(
+            (2..n).contains(&found),
+            "shared 4-search budget must yield multiple matches before truncating, got {found} of {n}"
+        );
         assert!(
             re.step_limit_exceeded(),
             "and records it for infallible callers"
@@ -1013,8 +989,21 @@ mod step_budget_tests {
                 .is_err(),
             "a small one refuses"
         );
-        assert_eq!(RegexBuilder::new("a").step_limit(7).get_step_limit(), 7);
-        assert_eq!(RegexBuilder::new("a").get_step_limit(), DEFAULT_STEP_LIMIT);
+        assert_eq!(
+            RegexBuilder::new("a")
+                .step_limit(7)
+                .build()
+                .expect("compiles")
+                .step_limit(),
+            7
+        );
+        assert_eq!(
+            RegexBuilder::new("a")
+                .build()
+                .expect("compiles")
+                .step_limit(),
+            DEFAULT_STEP_LIMIT
+        );
         assert_eq!(
             Regex::new("a").expect("compiles").step_limit(),
             DEFAULT_STEP_LIMIT

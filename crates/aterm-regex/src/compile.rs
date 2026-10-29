@@ -494,36 +494,74 @@ mod tests {
             r"[\w-]+@",
             ".x",
         ] {
-            let prefilter = program(pattern).first.expect("armed");
-            for b in 0x80..=0xbfu8 {
+            let prog = program(pattern);
+            let prefilter = prog.first.as_ref().expect("armed");
+            for b in (0x80..=0xc1u8).chain(0xf5..=0xffu8) {
                 assert!(
                     !prefilter.lead_bytes[b as usize],
-                    "{pattern:?} marked continuation byte {b:#04x}"
+                    "{pattern:?} marked non-UTF-8-lead byte {b:#04x}"
                 );
             }
-            for cp in [
-                0u32,
-                b'a'.into(),
-                b'Z'.into(),
-                b'0'.into(),
-                0xe9,
-                0x4f60,
-                0x1f600,
-            ] {
-                let Some(c) = char::from_u32(cp) else {
-                    continue;
-                };
-                let haystack = format!("{c}");
-                let re = crate::Regex::new(pattern).expect("compiles");
-                if re.is_match(&haystack)
-                    && let Some(&lead) = c.encode_utf8(&mut buf).as_bytes().first()
-                {
-                    assert!(
-                        prefilter.lead_bytes[lead as usize],
-                        "{pattern:?} can start with {c:?} but its lead byte is unmarked"
-                    );
+            assert!(
+                !prefilter.pcs.is_empty(),
+                "{pattern:?}: armed prefilter must carry consuming pcs"
+            );
+            let mut checked_any = false;
+            for &pc in &prefilter.pcs {
+                match prog.insts[pc] {
+                    Inst::Char { c, .. } => {
+                        let lead = c.encode_utf8(&mut buf).as_bytes()[0];
+                        assert!(
+                            prefilter.lead_bytes[lead as usize],
+                            "{pattern:?} pc {pc} consumes {c:?} but lead {lead:#04x} is unmarked"
+                        );
+                        checked_any = true;
+                    }
+                    Inst::Class { class, .. } => {
+                        let set = &prog.classes[class];
+                        for &(lo, hi) in &set.ranges {
+                            for c in [lo, hi] {
+                                if set.matches(c) {
+                                    let lead = c.encode_utf8(&mut buf).as_bytes()[0];
+                                    assert!(
+                                        prefilter.lead_bytes[lead as usize],
+                                        "{pattern:?} class {class} accepts {c:?} but lead {lead:#04x} is unmarked"
+                                    );
+                                    checked_any = true;
+                                }
+                            }
+                        }
+                        for cp in [
+                            0u32,
+                            b'a'.into(),
+                            b'Z'.into(),
+                            b'0'.into(),
+                            b'-'.into(),
+                            0xe9,
+                            0x0661,
+                            0x4f60,
+                            0x1f600,
+                        ] {
+                            let Some(c) = char::from_u32(cp) else {
+                                continue;
+                            };
+                            if set.matches(c) {
+                                let lead = c.encode_utf8(&mut buf).as_bytes()[0];
+                                assert!(
+                                    prefilter.lead_bytes[lead as usize],
+                                    "{pattern:?} class {class} accepts {c:?} but lead {lead:#04x} is unmarked"
+                                );
+                                checked_any = true;
+                            }
+                        }
+                    }
+                    other => panic!("{pattern:?}: non-consuming pc {pc} ({other:?}) in prefilter"),
                 }
             }
+            assert!(
+                checked_any,
+                "{pattern:?}: prefilter checked zero accepted code points"
+            );
         }
     }
 }

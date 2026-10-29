@@ -406,8 +406,14 @@ pub struct TrailStatus<'a> {
     pub pet_anchor: Option<u64>,
     pub pet_event_seq: u64,
     pub pet_pose: &'a str,
+    /// Whether the resident brain is in deep sleep: past its breath window, drawn at full strength
+    /// (no fade under way) and asking for no frame.
+    pub pet_deep: bool,
     /// Last drawn resident body `(x0, x1, y0, y1)` in frame pixels.
     pub pet_body: Option<(i32, i32, i32, i32)>,
+    /// The flying head's drawn body `(x0, x1, y0, y1)` in frame pixels
+    /// ([`CursorGlow::head_body_window_box`]).
+    pub head_body: Option<(i32, i32, i32, i32)>,
     /// Whether the flying cursor cat is animating.
     pub cat_active: bool,
     /// Active block-cursor fill override, if any.
@@ -462,8 +468,8 @@ impl TrailStatus<'_> {
              flow={:.2} combo={} combo_best={} \
              glow_active={} pet_active={} cat_active={} \
              block_fill={} block_fill_rgb={} block_fill_base={} block_fill_base_from={} \
-             pet_action={} pet_content={:.3} pet_pending={} pet_body={} \
-             pet_focus={} pet_reason={} pet_anchor={} pet_event_seq={} pet_pose={} \
+             pet_action={} pet_content={:.3} pet_pending={} pet_body={} head_body={} \
+             pet_focus={} pet_reason={} pet_anchor={} pet_event_seq={} pet_pose={} pet_deep={} \
              inserts_delivered={} inserts_lit={} inserts_retracted={} last_insert_cells={} \
              inflight_licensed={} inflight_forgotten={} credits={} swallowed_no_echo={} \
              park_returns={} park_flushed={} \
@@ -527,6 +533,10 @@ impl TrailStatus<'_> {
                 Some((x0, x1, y0, y1)) => write!(f, "{x0},{x1},{y0},{y1}"),
                 None => f.write_str("none"),
             }),
+            std::fmt::from_fn(|f| match self.head_body {
+                Some((x0, x1, y0, y1)) => write!(f, "{x0},{x1},{y0},{y1}"),
+                None => f.write_str("none"),
+            }),
             self.pet_focus,
             self.pet_reason,
             std::fmt::from_fn(|f| match self.pet_anchor {
@@ -535,6 +545,7 @@ impl TrailStatus<'_> {
             }),
             self.pet_event_seq,
             self.pet_pose,
+            self.pet_deep,
             self.inserts.delivered,
             self.inserts.lit,
             self.inserts.retracted,
@@ -1124,6 +1135,24 @@ impl TextSpans {
         false
     }
 
+    /// Whether any column in `c0..=c1` on `row` lies on a probed line of text.
+    #[inline]
+    pub(super) const fn covers_col_range(&self, row: i32, (c0, c1): (i32, i32)) -> bool {
+        if c0 > c1 {
+            return false;
+        }
+        let mut i = 0;
+        while i < self.rows.len() {
+            if let Some((r, first, end)) = self.rows[i]
+                && r == row
+            {
+                return c1 >= first && c0 < end;
+            }
+            i += 1;
+        }
+        false
+    }
+
     /// Probed lines packed from slot 0 with no `None` gaps.
     #[inline]
     pub(super) const fn packed_rows(&self) -> [Option<(i32, i32, i32)>; 3] {
@@ -1140,8 +1169,24 @@ impl TextSpans {
         out
     }
 
+    /// A test's probe: `self` with `row` read as blank, in the first free read slot.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) const fn with_blank_row(mut self, row: i32) -> Self {
+        let mut i = 0;
+        while i < self.read.len() {
+            if self.read[i].is_none() {
+                self.read[i] = Some(row);
+                return self;
+            }
+            i += 1;
+        }
+        self
+    }
+
     /// A test's probe of up to three lines `(row, first, end)`, each row read.
     #[cfg(test)]
+    #[inline]
     pub(crate) const fn of_lines(lines: &[(i32, i32, i32)]) -> Self {
         let mut s = Self::EMPTY;
         let limit = if lines.len() < 3 { lines.len() } else { 3 };
@@ -1187,9 +1232,20 @@ pub(crate) struct FrameText {
     pub(super) rows: Vec<Option<(i32, i32)>>,
     /// Row-major cell `(ink, ground)` pairs (`0x00RRGGBB`) for each read row.
     pub(super) pairs: Vec<Option<(Option<u32>, u32)>>,
+    /// Row-major, alongside [`Self::pairs`]: whether the cell's glyph keeps
+    /// under the x-height ([`super::emit::is_short_glyph`]).
+    pub(super) short: Vec<bool>,
+    /// Row-major, alongside [`Self::pairs`]: the cell's glyph as the face's
+    /// [`aterm_render::GlyphInk`] indexes it ([`aterm_render::GlyphInk::index`]).
+    pub(super) glyph: Vec<u8>,
     pub(super) cols: usize,
     /// The window column of `pairs`' first column (a split pane's offset).
     pub(super) col0: i32,
+    /// The pane whose cells the frame handed, in window cells: its rows
+    /// `0..1` and its columns `2..3`, end exclusive (`None`: no frame handed
+    /// any). A split's focused pane hands its own cells, so its edge lies
+    /// inside the window's grid, where the GUI clips the glow to the pane.
+    pub(super) pane: Option<[i32; 4]>,
 }
 
 impl Default for FrameText {
@@ -1205,8 +1261,11 @@ impl FrameText {
         lo: 0,
         rows: Vec::new(),
         pairs: Vec::new(),
+        short: Vec::new(),
+        glyph: Vec::new(),
         cols: 0,
         col0: 0,
+        pane: None,
     };
 
     /// The ink (`None` for a blank cell) and ground of cell `(row, col)` in
@@ -1221,6 +1280,47 @@ impl FrameText {
         let pairs = self.pairs.as_slice();
         if idx < pairs.len() { pairs[idx] } else { None }
     }
+
+    /// Whether window cell `(row, col)` lies outside the pane the frame
+    /// handed ([`Self::pane`]); `false` when no frame handed one.
+    #[inline]
+    pub(crate) const fn past_pane(&self, row: i32, col: i32) -> bool {
+        match self.pane {
+            Some([r0, r1, c0, c1]) => row < r0 || row >= r1 || col < c0 || col >= c1,
+            None => false,
+        }
+    }
+
+    /// Cell `(row, col)`'s glyph as [`aterm_render::GlyphInk::index`] names
+    /// it; [`aterm_render::GlyphInk::OTHER`] for a cell the frame did not read.
+    #[inline]
+    pub(crate) const fn glyph(&self, row: i32, col: i32) -> u8 {
+        let (i, col) = (row - self.lo, col - self.col0);
+        if i < 0 || i as usize >= self.rows.len() || col < 0 || col as usize >= self.cols {
+            return aterm_render::GlyphInk::OTHER;
+        }
+        let idx = i as usize * self.cols + col as usize;
+        let glyph = self.glyph.as_slice();
+        if idx < glyph.len() {
+            glyph[idx]
+        } else {
+            aterm_render::GlyphInk::OTHER
+        }
+    }
+
+    /// Whether cell `(row, col)`'s glyph keeps under the x-height
+    /// ([`super::emit::is_short_glyph`]); `false` for a cell the frame did not
+    /// read.
+    #[inline]
+    pub(crate) const fn short(&self, row: i32, col: i32) -> bool {
+        let (i, col) = (row - self.lo, col - self.col0);
+        if i < 0 || i as usize >= self.rows.len() || col < 0 || col as usize >= self.cols {
+            return false;
+        }
+        let idx = i as usize * self.cols + col as usize;
+        let short = self.short.as_slice();
+        idx < short.len() && short[idx]
+    }
 }
 
 /// Combined text view over the row probe and [`FrameText`].
@@ -1229,6 +1329,8 @@ pub(crate) struct TextView<'a> {
     pub(crate) spans: TextSpans,
     frame: &'a [Option<(i32, i32)>],
     lo: i32,
+    /// The frame's cells, whose grounds [`Self::grounds_read_as_page`] reads.
+    cells: Option<&'a FrameText>,
 }
 
 impl<'a> TextView<'a> {
@@ -1241,13 +1343,41 @@ impl<'a> TextView<'a> {
                 spans,
                 frame: f.rows.as_slice(),
                 lo: f.lo,
+                cells: Some(f),
             },
             None => Self {
                 spans,
                 frame: &[],
                 lo: 0,
+                cells: None,
             },
         }
+    }
+
+    /// Whether every cell of row `row` from column `c0` to `c1` the frame
+    /// read lies on the page's own ground `page`
+    /// ([`super::emit::reads_as_page`]): no selection or powerline bar laid
+    /// there. A cell the frame did not read counts as the page's.
+    #[inline]
+    pub(crate) const fn grounds_read_as_page(
+        &self,
+        row: i32,
+        (c0, c1): (i32, i32),
+        page: u32,
+    ) -> bool {
+        let Some(cells) = self.cells else {
+            return true;
+        };
+        let mut c = c0;
+        while c <= c1 {
+            if let Some((_, ground)) = cells.pair(row, c)
+                && !super::emit::reads_as_page(ground, page)
+            {
+                return false;
+            }
+            c += 1;
+        }
+        true
     }
 
     /// The frame's own read of `row`: `Some(span)` for a row it read
@@ -1289,6 +1419,21 @@ impl<'a> TextView<'a> {
         }
     }
 
+    /// Whether any column in `c0..=c1` on `row` lies on a line of text the frame shows.
+    #[inline]
+    pub(crate) const fn covers_col_range(&self, row: i32, (c0, c1): (i32, i32)) -> bool {
+        if c0 > c1 {
+            return false;
+        }
+        if self.spans.reads_row(row) {
+            return self.spans.covers_col_range(row, (c0, c1));
+        }
+        match self.frame_row(row) {
+            Some(Some((first, end))) => c1 >= first && c0 < end,
+            _ => false,
+        }
+    }
+
     /// Whether window pixel `(x, y)` lies in a cell on a line of text the frame shows.
     #[inline]
     pub(crate) const fn covers_px(
@@ -1306,25 +1451,49 @@ impl<'a> TextView<'a> {
     #[inline]
     pub(crate) const fn row_is_blank(&self, row: i32) -> bool {
         if self.spans.reads_row(row) {
-            let mut i = 0;
-            while i < self.spans.rows.len() {
-                if let Some((r, _, _)) = self.spans.rows[i]
-                    && r == row
-                {
-                    return false;
-                }
-                i += 1;
-            }
-            true
+            self.spans.line_at(row).is_none()
         } else {
             matches!(self.frame_row(row), Some(None))
+        }
+    }
+
+    /// Whether grid row `row` was read and contains at least one glyph.
+    #[inline]
+    pub(crate) const fn row_has_text(&self, row: i32) -> bool {
+        if self.spans.reads_row(row) {
+            self.spans.line_at(row).is_some()
+        } else {
+            matches!(self.frame_row(row), Some(Some(_)))
         }
     }
 
     /// Whether the dark streak treats cell `(row, col)` as text.
     #[inline]
     pub(crate) const fn over_text(&self, row: i32, col: i32) -> bool {
-        !self.knows_row(row) || self.covers_cell(row, col)
+        if self.spans.reads_row(row) {
+            return self.spans.covers_cell(row, col);
+        }
+        match self.frame_row(row) {
+            Some(Some((first, end))) => col >= first && col < end,
+            Some(None) => false,
+            None => true,
+        }
+    }
+
+    /// Whether the dark streak treats any column in `c0..=c1` on `row` as text.
+    #[inline]
+    pub(crate) const fn over_text_range(&self, row: i32, (c0, c1): (i32, i32)) -> bool {
+        if c0 > c1 {
+            return false;
+        }
+        if self.spans.reads_row(row) {
+            return self.spans.covers_col_range(row, (c0, c1));
+        }
+        match self.frame_row(row) {
+            Some(Some((first, end))) => c1 >= first && c0 < end,
+            Some(None) => false,
+            None => true,
+        }
     }
 }
 

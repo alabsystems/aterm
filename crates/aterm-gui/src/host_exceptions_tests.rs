@@ -3195,6 +3195,32 @@ fn a_repaint_that_gave_up_is_one_line_and_none_for_a_healed_epoch() {
     );
     assert_eq!(app.messages.digest_revision(), rev, "nothing moved");
     assert_eq!(message_regrids(), message);
+
+    let (registered, sid) = session_with_open_epoch(&mut app, 40);
+    app.note_render_unrepaired(registered, 1, GiveUp::NoAnswer);
+    assert_eq!(app.messages.digest().len(), 1);
+    assert_eq!(
+        app.messages.digest().entries[0].key,
+        mr::render_unrepaired_key(&sid)
+    );
+    assert_eq!(message_regrids(), message);
+    let session_ref = app.pool.get(registered).expect("registered session");
+    session_ref
+        .ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .evaluate_resizes(
+            crate::resize_ledger::EngineProbe {
+                lifetime: 1,
+                full_clears: 1,
+                geom: (24, 80),
+                ..crate::resize_ledger::EngineProbe::default()
+            },
+            2_000,
+        );
+    app.check_render_repairs();
+    assert!(app.messages.digest().is_empty(), "healed: the line ends");
 }
 
 /// A pool session the store knows (so `render.<sid>.unrepaired` can name it) whose timeline
@@ -4330,6 +4356,69 @@ fn a_background_sign_in_task_has_a_durable_action_and_clears_when_resolved() {
             .entries
             .iter()
             .any(|entry| entry.key == key)
+    );
+}
+
+/// A Grok login due whose background renewal already stopped at the block page is asked for
+/// once: its sign-in task's entry names `accounts login`, and the due entry leaves it out (and
+/// is cleared where it was the only one), keeping a due login with no task. CONTROL: Kimi's due
+/// entry, a fact for later of its background renewals, still lists a login its task names.
+#[test]
+fn a_grok_login_due_with_a_sign_in_task_is_asked_for_once() {
+    use crate::harness_host::PoolSaid;
+    use aterm_agent::harness::accounts::{Cli, SignInAction};
+    let mut app = App::headless_for_test();
+    let entries = |app: &App, key: &str| -> Vec<(String, Vec<String>)> {
+        app.messages
+            .digest()
+            .entries
+            .iter()
+            .filter(|entry| entry.key == key)
+            .map(|entry| (entry.then.clone(), entry.detail.clone()))
+            .collect()
+    };
+    let (due, sign_in) = (
+        mr::pool_notice_key(Cli::Grok, "due"),
+        mr::pool_notice_key(Cli::Grok, "sign-in"),
+    );
+    let said = |due: &[&str]| PoolSaid {
+        cli: Cli::Grok,
+        due: due.iter().map(|label| (*label).to_owned()).collect(),
+        wrong: Vec::new(),
+        sign_in: vec![("grok-1".into(), SignInAction::Login)],
+    };
+    app.note_harness_host(HostNote::Pools(vec![said(&["grok-1"])]));
+    assert!(
+        entries(&app, &due).is_empty(),
+        "grok-1 is asked for by its task"
+    );
+    let asked = entries(&app, &sign_in);
+    assert!(
+        asked.len() == 1 && asked[0].0.contains("accounts login grok-1 --cli grok"),
+        "{asked:?}"
+    );
+    app.note_harness_host(HostNote::Pools(vec![said(&["grok-1", "grok-2"])]));
+    let left = entries(&app, &due);
+    assert!(
+        left.len() == 1
+            && left[0].0.contains("accounts login grok-2 --cli grok")
+            && !left[0].1.iter().any(|line| line.contains("grok-1")),
+        "{left:?}"
+    );
+    app.note_harness_host(HostNote::Pools(vec![PoolSaid {
+        cli: Cli::Kimi,
+        due: vec!["kimi-1".to_owned()],
+        wrong: Vec::new(),
+        sign_in: vec![("kimi-1".into(), SignInAction::Browser)],
+    }]));
+    assert!(
+        entries(&app, &due).is_empty(),
+        "Grok's pool said nothing more"
+    );
+    assert_eq!(
+        entries(&app, &mr::pool_notice_key(Cli::Kimi, "due")).len(),
+        1,
+        "CONTROL: Kimi's due fact still lists kimi-1"
     );
 }
 

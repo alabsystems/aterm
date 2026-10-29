@@ -138,19 +138,13 @@ const fn merge(acc: u64, v: u64) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{STRIPE, Xxh64, xxh64};
+#[path = "../tests/support/sanity.rs"]
+mod test_sanity;
 
-    fn sanity(len: usize) -> Vec<u8> {
-        let mut g: u64 = 2_654_435_761;
-        (0..len)
-            .map(|_| {
-                let byte = (g >> 56) as u8;
-                g = g.wrapping_mul(11_400_714_785_074_694_797);
-                byte
-            })
-            .collect()
-    }
+#[cfg(test)]
+mod tests {
+    use super::test_sanity::sanity;
+    use super::{STRIPE, Xxh64, xxh64};
 
     #[test]
     fn split_feeding_matches_one_shot() {

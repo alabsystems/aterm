@@ -1201,6 +1201,7 @@ pub(crate) mod paste_order {
         /// A large paste's progress and stop.
         meter: Option<Arc<BulkMeter>>,
         completion: Option<crate::control_input_ack::InputCompletion>,
+        control_vim: Option<crate::control::ControlVim>,
         /// Who waits for this write's own receipt ([`Written`]).
         written: Option<SyncSender<crate::input::EgressReceipt>>,
         /// Last field: payloads above are dropped before capacity is returned.
@@ -1320,6 +1321,10 @@ pub(crate) mod paste_order {
 
     fn run_one(mut job: Job) {
         crate::echo_rtt::forget_write_start();
+        let vim = job
+            .control_vim
+            .as_ref()
+            .and_then(|observer| observer.capture(&job.term));
         let receipt = match &job.echo {
             Some(echo) => tracked_egress_metered(
                 &job.term,
@@ -1339,6 +1344,9 @@ pub(crate) mod paste_order {
                 crate::input::EgressMode::Backpressured,
             ),
         };
+        if let Some(observer) = &job.control_vim {
+            observer.accepted(vim, &job.ev, receipt);
+        }
         if let Some(completion) = job.completion.take() {
             completion.finish(receipt);
         }
@@ -1397,6 +1405,7 @@ pub(crate) mod paste_order {
                     modes: handle.ctx.modes.clone(),
                     sink: handle.ctx.sink.clone(),
                     echo: Some(handle.ctx.output_echo.clone()),
+                    control_vim: None,
                     ev: event,
                     ticket: None,
                     key_ns: 0,
@@ -1712,6 +1721,7 @@ pub(crate) mod paste_order {
             meter,
             completion,
             None,
+            None,
         )
     }
 
@@ -1731,6 +1741,7 @@ pub(crate) mod paste_order {
         meter: Option<Arc<BulkMeter>>,
         completion: Option<crate::control_input_ack::InputCompletion>,
         written: Option<SyncSender<crate::input::EgressReceipt>>,
+        control_vim: Option<crate::control::ControlVim>,
     ) -> Result<(), Rejected> {
         let bytes = retained_bytes(&ev).ok_or(Rejected::TooLarge)?;
         let paste = matches!(ev, InputEvent::Paste(..)) || echo.is_none();
@@ -1767,6 +1778,7 @@ pub(crate) mod paste_order {
             hot_key: hot_key.map(|(session, proxy)| (session, proxy.cloned())),
             meter: meter.clone(),
             completion,
+            control_vim,
             written,
             _reservation: Reservation {
                 budget,
@@ -1866,11 +1878,18 @@ pub(crate) mod paste_order {
         echo: &Arc<OutputEchoTracker>,
         ev: &InputEvent,
         completion: Option<crate::control_input_ack::InputCompletion>,
+        control_vim: Option<crate::control::ControlVim>,
     ) -> (crate::input::EgressReceipt, Option<Written>) {
         if !(ui_writes_can_block() || is_ordering(sink)) {
+            let vim = control_vim
+                .as_ref()
+                .and_then(|observer| observer.capture(term));
             let inline = queued_or_inline_observed(
                 false, term, modes, sink, echo, ev, None, None, completion,
             );
+            if let Some(observer) = control_vim {
+                observer.accepted(vim, ev, inline.0);
+            }
             return (inline.0, None);
         }
         let (written, receipt) = sync_channel(1);
@@ -1885,6 +1904,7 @@ pub(crate) mod paste_order {
             None,
             completion,
             Some(written),
+            control_vim,
         ) {
             Ok(()) => (
                 crate::input::EgressReceipt::deferred_full(),
@@ -2021,7 +2041,9 @@ pub(crate) mod paste_order {
             (None, None)
         };
         let frame = InputEvent::KeySequence(bytes);
-        match submit(term, modes, sink, None, frame, None, None, None, None, tx) {
+        match submit(
+            term, modes, sink, None, frame, None, None, None, None, tx, None,
+        ) {
             Ok(()) => (crate::input::EgressReceipt::deferred_full(), rx),
             Err(_) => (crate::input::EgressReceipt::queue_full(), None),
         }
@@ -2667,15 +2689,6 @@ fn grapheme_advances(text: &str, ambiguous_width_double: bool) -> impl Iterator<
     )
 }
 
-/// The per-grapheme cell widths of one committed Text/IME event, appended to `out` in order.
-#[cfg(test)]
-fn committed_grapheme_cells_into(text: &str, ambiguous_width_double: bool, out: &mut Vec<u16>) {
-    if aterm_grapheme::str_width(text) == 0 {
-        return;
-    }
-    out.extend(grapheme_advances(text, ambiguous_width_double));
-}
-
 /// The Backspace price memory.
 #[derive(Default)]
 pub(crate) struct ErasePriceMemory(Vec<u16>);
@@ -2734,7 +2747,7 @@ impl ErasePriceMemory {
 
 #[cfg(test)]
 mod erase_price_memory_tests {
-    use super::{ErasePriceMemory, committed_grapheme_cells_into};
+    use super::{ErasePriceMemory, grapheme_advances};
 
     #[test]
     fn large_commits_keep_only_the_bounded_erase_tail_without_retaining_their_allocation() {
@@ -2746,7 +2759,9 @@ mod erase_price_memory_tests {
             memory.push_zeros(ErasePriceMemory::CAP);
             reference.resize(ErasePriceMemory::CAP, 0);
             for text in ["ab", "\u{301}", "\u{301}日本", long.as_str(), "⚠️z"] {
-                committed_grapheme_cells_into(text, double_width, &mut reference);
+                if aterm_grapheme::str_width(text) > 0 {
+                    reference.extend(grapheme_advances(text, double_width));
+                }
                 if text == long {
                     assert!(reference.capacity() > 2 * ErasePriceMemory::CAP);
                 }
@@ -3590,17 +3605,19 @@ impl App {
     /// ([`Self::boundary_keeps_hand`]) the boundary keeps the hand: the composer is the row
     /// the hand types on, and doubting that row would let the agent's next repaint of another
     /// row (a footer hint after Escape or Ctrl-C, a spinner) park it, refusing the keys typed
-    /// on it until a navigation key or Return.
+    /// on it until a navigation key or Return. The boundary is stamped on the input path's clock
+    /// ([`input_clock`]), the clock its key's other stamps read.
     pub(crate) fn clear_move_license(&mut self, wid: WindowId) {
-        if self.boundary_keeps_hand(wid) {
+        let vim = self
+            .front_terminal(wid)
+            .and_then(|terminal| self.pool.get(terminal.session))
+            .is_some_and(|session| session.ctx.licence.vim.known());
+        if !vim && self.boundary_keeps_hand(wid) {
             self.clear_move_license_keeping_hand(wid);
             return;
         }
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.fx
-                .cursor_mut()
-                .glow
-                .clear_typed(std::time::Instant::now());
+            ws.fx.cursor_mut().glow.clear_typed(input_clock());
             ws.fx.cursor_mut().trail.clear_typed();
         }
     }
@@ -3609,7 +3626,7 @@ impl App {
     pub(crate) fn clear_move_license_keeping_hand(&mut self, wid: WindowId) {
         if let Some(ws) = self.windows.get_mut(&wid) {
             let fx = ws.fx.cursor_mut();
-            fx.glow.clear_typed_keeping_hand(std::time::Instant::now());
+            fx.glow.clear_typed_keeping_hand(input_clock());
             fx.trail.clear_typed();
         }
     }
@@ -3622,6 +3639,13 @@ impl App {
     /// that row and refuse every key typed on it.
     pub(crate) fn fence_pointer_license(&mut self, wid: WindowId) {
         self.clear_move_license_keeping_hand(wid);
+    }
+
+    /// A tab's context menu opening (`Wake::TabContextMenuOpening`): a right-click on its chip,
+    /// which types nothing, so it keeps the glow's hand as every pointer gesture does.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn on_tab_context_menu_opening(&mut self, window: WindowId) {
+        self.fence_pointer_license(window);
     }
 
     /// The licence fence [`press_fence`] classified.
@@ -4154,10 +4178,16 @@ impl App {
         completion: Option<crate::control_input_ack::InputCompletion>,
     ) -> InputOutcome {
         let _site = crate::resize_ledger::SiteScope::enter(crate::resize_ledger::Cause::Input);
-        self.input_to_session_inner(wid, ev, src, target_session, phase, completion)
+        // A control client's whole dispatch carries the mark, so a person-only act anywhere in it
+        // (a paste from, or a copy to, the clipboard) refuses it, not only the surfaces below
+        // that count a gesture.
+        self.with_controller_mark(matches!(src, Source::Controller), |app| {
+            app.input_to_session_inner(wid, ev, src, target_session, phase, completion)
+        })
     }
 
-    /// The body of [`Self::input_to_session`].
+    /// The body of [`Self::input_to_session`], marked as a control client's dispatch when it is
+    /// one ([`Self::with_controller_mark`]).
     fn input_to_session_inner(
         &mut self,
         wid: WindowId,
@@ -4168,6 +4198,7 @@ impl App {
         completion: Option<crate::control_input_ack::InputCompletion>,
     ) -> InputOutcome {
         self.ensure_sparkle();
+        let controller = self.person_gesture_refused();
         match crate::input_event_handoff_class(&ev) {
             crate::UpdateHandoffEventClass::Exempt => {}
             crate::UpdateHandoffEventClass::Tolerated => {
@@ -4228,7 +4259,6 @@ impl App {
                     ws.overlay_consumed_keys.insert(key.clone());
                 }
                 use crate::overlay::OverlayKind;
-                let controller = matches!(src, Source::Controller);
                 self.with_gesture_source(controller, |app| {
                     match app
                         .windows
@@ -4247,9 +4277,7 @@ impl App {
             }
         }
         if target_session.is_none()
-            && self.with_gesture_source(matches!(src, Source::Controller), |app| {
-                app.tab_menu_input_event(wid, &ev)
-            })
+            && self.with_gesture_source(controller, |app| app.tab_menu_input_event(wid, &ev))
         {
             if let InputEvent::Key {
                 key, event_type, ..
@@ -4296,7 +4324,7 @@ impl App {
         let arrival =
             (target_session.is_none() && typed).then(crate::metrics::native_input_arrival);
         if target_session.is_none()
-            && self.with_gesture_source(matches!(src, Source::Controller), |app| {
+            && self.with_gesture_source(controller, |app| {
                 app.timed_native_input_event(wid, &ev, arrival)
             })
         {
@@ -4461,6 +4489,7 @@ impl App {
                     glyph_shifted,
                 } = press_class;
                 let mut pending_key_sound = None;
+                let mut vim_input = None;
                 let is_repeat = phase == PressPhase::Repeat
                     || matches!(
                         &ev,
@@ -4658,24 +4687,11 @@ impl App {
                         && (!enter_like || (enter_like && !typed_enter && is_alt));
                     let supersedes =
                         typed_press_supersede || typed_enter || tab_key || paste_chord_key;
-                    // A generic press keeps the hand in an agent's composer, as
-                    // `clear_move_license` does; only such a press pays for the probe.
+                    // Preserve key-time mode evidence; a later frame proves the echo.
+                    vim_input = self.prepare_vim_input(wid, &ev, typed_forward == Some(true));
                     let keeps_hand = line_edit_key
                         || (!inert_modifier && !supersedes && self.boundary_keeps_hand(wid));
-                    // A key typed into an agent's composer that shows vim's INSERT settles the row
-                    // a boundary parked (an Escape into NORMAL, then `i`); only a parked row pays
-                    // for the probe.
-                    let reinserting = typed_forward == Some(true)
-                        && !tty_swallows
-                        && self
-                            .windows
-                            .get(&wid)
-                            .is_some_and(|ws| ws.fx.cursor().glow.caret_row_parked())
-                        && self.composer_inserting(wid);
                     if let Some(ws) = self.windows.get_mut(&wid) {
-                        if reinserting {
-                            ws.fx.cursor_mut().glow.note_composer_inserting();
-                        }
                         if let Some(prompt) =
                             front_prompt.filter(|_| line_terminator || keyed_enter)
                         {
@@ -5054,6 +5070,11 @@ impl App {
                     completion,
                 );
                 let outcome = receipt_outcome(receipt);
+                if outcome == InputOutcome::Ok
+                    && let (Some((licence, frame, key)), Some(at)) = (vim_input, input_now)
+                {
+                    licence.vim.key_at(frame, key, at);
+                }
                 if receipt.input_queue_full() {
                     self.refuse_input(session, InputRefusal::Busy);
                 }
@@ -7004,7 +7025,7 @@ impl App {
             ) {
                 keybinding::ChordResolution::Action(action) => {
                     if action == keybinding::Action::Copy {
-                        let _ = self.copy_selection_in(wid);
+                        let _ = self.copy_in(wid);
                     } else if action == keybinding::Action::SelectAll {
                         self.select_all_in(wid);
                     } else if native_binding_allowed(action) {
@@ -7040,7 +7061,7 @@ impl App {
                 return true;
             }
             if character.eq_ignore_ascii_case("c") {
-                let _ = self.copy_selection_in(wid);
+                let _ = self.copy_in(wid);
                 self.note_consumed_press(wid, ev);
                 return true;
             }
@@ -7164,6 +7185,17 @@ impl App {
                     return None;
                 }
                 let snapshot = self.document_store.snapshot(buffer.document)?;
+                if buffer.grid().is_some() {
+                    // A grid's selection is its cell: the value (or the open editor's text),
+                    // never the cell's quoted bytes, nor the empty range of its caret.
+                    let crate::native_app::NativeApp::Editor(editor) =
+                        self.native_runtime.app(instance)?
+                    else {
+                        return None;
+                    };
+                    let value = editor.grid_cell_text(state, &snapshot)?;
+                    return Some(read(&[value.as_str()]));
+                }
                 let selected = buffer
                     .selections
                     .iter()
@@ -7259,10 +7291,17 @@ impl App {
                 Key::Named(NamedKey::Escape) => (Some("\u{1b}"), 0),
                 _ => (None, 0),
             };
-            match crate::alert_keys::confirm_key(true, 0, chars, code) {
+            match crate::alert_keys::confirm_key(
+                true,
+                self.person_gesture_refused(),
+                0,
+                chars,
+                code,
+            ) {
                 crate::alert_keys::ConfirmKey::Accept => self.answer_paste_banner(true),
                 crate::alert_keys::ConfirmKey::Cancel => self.answer_paste_banner(false),
-                crate::alert_keys::ConfirmKey::PassThrough => {}
+                crate::alert_keys::ConfirmKey::PassThrough
+                | crate::alert_keys::ConfirmKey::Drop => {}
             }
             self.note_press_disposition(wid, &ev, None);
             return;
@@ -7273,14 +7312,21 @@ impl App {
                 Key::Named(NamedKey::Escape) => (Some("\u{1b}"), 0),
                 _ => (None, 0),
             };
-            match crate::alert_keys::confirm_key(true, 0, chars, code) {
+            match crate::alert_keys::confirm_key(
+                true,
+                self.person_gesture_refused(),
+                0,
+                chars,
+                code,
+            ) {
                 crate::alert_keys::ConfirmKey::Accept => {
                     self.answer_close_banner(true);
                 }
                 crate::alert_keys::ConfirmKey::Cancel => {
                     self.answer_close_banner(false);
                 }
-                crate::alert_keys::ConfirmKey::PassThrough => {}
+                crate::alert_keys::ConfirmKey::PassThrough
+                | crate::alert_keys::ConfirmKey::Drop => {}
             }
             self.note_press_disposition(wid, &ev, None);
             return;
@@ -7497,7 +7543,7 @@ impl App {
             && let Key::Character(s) = &ev.logical_key
             && s.eq_ignore_ascii_case("c")
         {
-            self.copy_selection_in(wid);
+            self.copy_in(wid);
             self.note_consumed_press(wid, &ev);
             return;
         }
@@ -7608,20 +7654,56 @@ impl App {
         self.agent_composer_in_front(wid, false) && !self.front_composer_in_vim_insert(wid)
     }
 
-    /// Whether an agent's composer in front of window `wid` shows vim's INSERT indicator, so
-    /// the keys typed into it are text: the press path then settles a row a boundary parked
-    /// (`CursorGlow::note_composer_inserting`). It runs only while a caret row is parked, and so
-    /// while the caret is visible in the composer: it reads the indicator from the caret's row
-    /// down first ([`Self::vim_insert_shown`]), which in vim's NORMAL answers no before the
-    /// agent probe runs, and reads the agent as [`Self::boundary_keeps_hand`] does, without
-    /// waiting.
-    fn composer_inserting(&self, wid: WindowId) -> bool {
-        self.vim_insert_shown(wid, true) && self.agent_composer_in_front(wid, false)
+    /// Record a key against the observed Vim mode and owner without waiting on the reader.
+    /// Only a later frame with matching ownership and a proved text echo may settle a parked
+    /// row. Unknown non-Vim typing avoids the row scan until a boundary parks its caret.
+    fn prepare_vim_input(
+        &self,
+        wid: WindowId,
+        event: &InputEvent,
+        text: bool,
+    ) -> Option<(
+        Arc<crate::licence_fence::LicenceFence>,
+        crate::vim_custody::Frame,
+        crate::vim_custody::Key,
+    )> {
+        let terminal = self.front_terminal(wid)?;
+        let session = self.pool.get(terminal.session)?;
+        let custody = &session.ctx.licence.vim;
+        if text
+            && !custody.known()
+            && !self
+                .windows
+                .get(&wid)
+                .is_some_and(|window| window.fx.cursor().glow.caret_row_parked())
+        {
+            return None;
+        }
+        if !self.agent_composer_in_front(wid, false) {
+            custody.invalidate();
+            return None;
+        }
+        let frame = terminal
+            .term
+            .try_lock()
+            .ok()
+            .and_then(|term| crate::vim_custody::capture(&term, &session.ctx, true));
+        match frame {
+            Some(frame) => Some((
+                session.ctx.licence.clone(),
+                frame,
+                crate::vim_custody::key(event, text),
+            )),
+            None => {
+                custody.invalidate();
+                None
+            }
+        }
     }
 
     /// [`Self::front_agent_composer`]; `wait` false reads the session's timeline only if no
     /// one holds it, and answers no if someone does.
-    fn agent_composer_in_front(&self, wid: WindowId, wait: bool) -> bool {
+    pub(crate) fn agent_composer_in_front(&self, wid: WindowId, wait: bool) -> bool {
         let Some(pooled) = self
             .front_terminal(wid)
             .and_then(|terminal| self.pool.get(terminal.session))
@@ -7662,10 +7744,12 @@ impl App {
     }
 
     /// Whether the front terminal shows vim's INSERT indicator (`-- INSERT --`, the
-    /// `vim.insert` anchor) opening a row of the footer under its composer's bottom rule, as
-    /// Claude Code's vim editor mode draws it. Escape there enters NORMAL, where the keys typed
-    /// next are motions rather than text, so the boundary keeps doubting the composer's row. A
-    /// terminal someone holds reads as no indicator.
+    /// `vim.insert` anchor) opening a row of the footer under its prompt box's bottom rule
+    /// ([`aterm_phase::phase::prompt_box_bottom`]: the `❯` composer's, or shell mode's `!` box),
+    /// as Claude Code's vim editor mode draws it. Escape there enters NORMAL, where the keys typed
+    /// next are motions rather than text, so the boundary keeps doubting the composer's row. The
+    /// PTY reader hands over a terminal it holds for a batch ([`crate::term_lock_ui_within`]); one
+    /// still held after [`crate::UI_READ_HANDOFF`] reads as no indicator.
     fn front_composer_in_vim_insert(&self, wid: WindowId) -> bool {
         self.vim_insert_shown(wid, false)
     }
@@ -7678,7 +7762,11 @@ impl App {
             return false;
         };
         let rows: Vec<String> = {
-            let Some(t) = crate::term_try_lock(&terminal.term) else {
+            let Some(t) = crate::term_lock_ui_within(
+                &terminal.term,
+                &terminal.ui_waiting,
+                crate::UI_READ_HANDOFF,
+            ) else {
                 return false;
             };
             let from = if below_caret {
@@ -7693,7 +7781,7 @@ impl App {
         let bottom = if below_caret {
             rows.iter().position(|row| aterm_phase::phase::is_rule(row))
         } else {
-            aterm_phase::phase::composer_bottom(&rows)
+            aterm_phase::phase::prompt_box_bottom(&rows)
         };
         bottom.is_some_and(|bottom| {
             rows[bottom + 1..]
@@ -8450,7 +8538,7 @@ impl App {
             }
             Action::TogglePaneZoom => self.toggle_pane_zoom_in(wid),
             Action::Copy => {
-                self.copy_selection_in(wid);
+                self.copy_in(wid);
             }
             Action::Paste => {
                 self.snap_to_bottom(wid);
@@ -9254,6 +9342,12 @@ impl App {
                 }
                 return true;
             }
+            // The toolbar's field copies and pastes through AppKit's own pasteboard calls.
+            if matches!(edit, RenameEditorEdit::Copy | RenameEditorEdit::Paste)
+                && self.refuse_clipboard_gesture("rename-field copy or paste")
+            {
+                return true;
+            }
             return self
                 ._toolbars
                 .get(&window)
@@ -9685,6 +9779,8 @@ impl App {
             return;
         }
         match action {
+            MenuAction::CopySessionId | MenuAction::CopyCwd
+                if self.refuse_clipboard_gesture(&format!("{action:?}")) => {}
             MenuAction::CopySessionId => {
                 if let Some(text) = self.session_id_text(origin.session) {
                     let _ = crate::control::pbcopy(&text);
@@ -10738,7 +10834,7 @@ mod predictive_echo_input_gate_tests {
 /// Typed-word summon plumbing (the detector's laws are proven in `aterm_effects::kitty_summon`).
 #[cfg(test)]
 #[path = "app_input_typed_kitty_summon_tests.rs"]
-mod typed_kitty_summon_tests;
+pub(crate) mod typed_kitty_summon_tests;
 
 /// Predictive echo at prompts that do not echo, end to end through the press path and the composed
 /// present.
@@ -10946,6 +11042,11 @@ mod tone_status_tests {
 #[cfg(test)]
 #[path = "app_input_rename_field_key_tests.rs"]
 mod rename_field_key_tests;
+
+/// No control client's gesture copies to, or pastes from, the person's clipboard.
+#[cfg(all(test, unix))]
+#[path = "app_input_controller_clipboard_tests.rs"]
+mod controller_clipboard_tests;
 
 /// The person at the keyboard (`human_ms=`, `EVENT <local> human`).
 #[cfg(all(test, unix))]

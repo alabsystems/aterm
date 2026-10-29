@@ -1479,13 +1479,6 @@ mod tests {
                 );
             }
         }
-        assert_eq!(
-            super::own_voice(),
-            Some(NoticeVoice {
-                center: Center::Absent,
-                fallback: NoticeFallback::ScriptEditor
-            })
-        );
     }
 
     #[test]

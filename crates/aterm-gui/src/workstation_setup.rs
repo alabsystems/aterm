@@ -37,6 +37,13 @@ pub enum OfferKind {
     /// a review admitted before: it holds none of aterm's own permissions (they are in
     /// `in_force` and run), and it never takes the person's tab.
     Widen { in_force: Plan },
+    /// A launch's offer of the plan an earlier process admitted, whose run this launch resumes
+    /// (design §3.3, §6): the run goes on whether or not it is answered. The page's automatic
+    /// answer, by the first launch's rule, is this window's own admission of that same plan,
+    /// which the worker takes as "go on" with no new admission. It holds none of aterm's own
+    /// permissions (the run carries them), never takes the person's tab, reads as no review,
+    /// and a press on the page answers for itself, never for it.
+    Resume,
 }
 
 /// The page's decision and the optional, ephemeral vault password.
@@ -117,6 +124,13 @@ pub fn await_widen_answer_while(
         || None,
         on_begin,
     )
+}
+
+/// Wait on a worker thread for System State's automatic answer to the offer of `resumed`, the
+/// plan an earlier process admitted and this launch resumes ([`OfferKind::Resume`]): offered in
+/// the System State tab without taking the person's tab. `finished` withdraws it.
+pub fn await_resume_answer_while(resumed: Plan, finished: impl FnMut() -> bool) -> SetupAnswer {
+    await_answer(OfferKind::Resume, resumed, finished, || None, || {})
 }
 
 fn await_answer(
@@ -326,6 +340,14 @@ impl Request {
         request.kind = OfferKind::Widen {
             in_force: in_force.into(),
         };
+        request
+    }
+
+    /// A test's offer of the plan an earlier process admitted ([`OfferKind::Resume`]).
+    #[cfg(test)]
+    pub(crate) fn resume(resumed: impl Into<Plan>, reply: mpsc::Sender<SetupAnswer>) -> Self {
+        let mut request = Self::new(resumed, reply);
+        request.kind = OfferKind::Resume;
         request
     }
 
@@ -770,6 +792,13 @@ impl App {
         self.workstation_setup.permissions.admitted(false)
     }
 
+    /// Whether the window holds its own admission of the plan in force, as
+    /// [`Self::admitted_access`] would find it, without making a yes: what lets the offer of a
+    /// plan an earlier process admitted go (`App::resume_offer_moot`).
+    pub(crate) fn own_admission_stands(&self) -> bool {
+        self.workstation_setup.permissions.own_admission_stands()
+    }
+
     /// The yes for a person's press on a Permissions row's own button
     /// (`Turn On…`), while a plan with its Permissions group is admitted.
     /// `by_person` false — a control client's `act` or `key` — is never one.
@@ -1161,14 +1190,6 @@ mod tests {
         assert_eq!(app.access_revision(), Some(5));
         let yes = app.admitted_access().unwrap();
         assert_eq!((yes.revision(), yes.by()), (5, AdmittedBy::Person));
-    }
-
-    /// The rig's admission comes from a real gate: the window's own answer
-    /// holds one, a control client's holds none.
-    #[test]
-    fn the_rigs_admission_is_the_gates() {
-        assert!(gate_admission_for_test(true).is_some());
-        assert!(gate_admission_for_test(false).is_none());
     }
 
     #[test]

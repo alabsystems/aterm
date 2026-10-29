@@ -1406,7 +1406,9 @@ fn someone_elses_done_turn_after_a_landing_is_never_read_as_the_landing() {
             "{tag}: their turn is no landing: {log}"
         );
         if !hand.is_empty() {
-            assert_eq!(told.last(), Some(&TaskFace::Theirs), "{tag}: {log}");
+            // A person's turn after the landing is no exchange of theirs under Land: the session
+            // worked before it (owner ruling 2026-10-27).
+            assert!(!told.contains(&TaskFace::Theirs), "{tag}: {log}");
         }
         assert_eq!(
             first.iter().filter(|l| landed_note(l)).count(),
@@ -1863,37 +1865,33 @@ fn a_tasks_end_is_noted_when_its_point_line_or_its_publish_fails() {
     }
 }
 
-/// A person's own exchange after a landing whose reply claims no done seeds `open`, then
-/// `theirs`, and nothing is typed into it.
+/// A person's turn after a landing whose reply claims no done seeds `open`, and stays open: under
+/// Land it is no exchange of theirs, since the session worked before it (owner ruling
+/// 2026-10-27), so Land carries it on with its nudge, nothing journals it LEFT and the face never
+/// turns to theirs.
 #[test]
 fn a_persons_turn_after_a_landing_that_leaves_the_task_open_seeds_open() {
     let (dir, ledger) = files("open-own-exchange", &[], &[]);
     let (told, turns, lines) = land_first(&ledger, vec![busy_screen(), ended(PROGRESS)], &[4, 5]);
-    assert_eq!(turns, 1, "{lines:#?}");
-    assert_eq!(
-        told,
-        [
-            TaskFace::Open,
-            TaskFace::Landed,
-            TaskFace::Open,
-            TaskFace::Theirs
-        ],
+    assert_eq!(turns, 2, "the land instruction, then its nudge: {lines:#?}");
+    assert!(
+        lines.iter().any(
+            |l| l.starts_with("CONTINUED ") && l.contains(&format!(" rule={RULE_LAND_NUDGE} "))
+        ),
         "{lines:#?}"
     );
-    let (told, turns, added, lines) = after_off(&ledger, "land", PROGRESS);
-    let log = format!("{added:#?}\n{lines:#?}");
     assert_eq!(
         told,
-        [TaskFace::Open, TaskFace::Theirs],
-        "open from the start, then the person's: {log}"
+        [TaskFace::Open, TaskFace::Landed, TaskFace::Open],
+        "{lines:#?}"
     );
-    assert_eq!(turns, 0, "nothing typed into their exchange: {log}");
+    let (told, _, added, lines) = after_off(&ledger, "land", PROGRESS);
+    let log = format!("{added:#?}\n{lines:#?}");
     assert!(
-        added
-            .iter()
-            .any(|l| l.starts_with("LEFT ") && l.contains(" rule=left-to-person@v1 ")),
-        "{log}"
+        !told.contains(&TaskFace::Theirs),
+        "open, never theirs: {log}"
     );
+    assert!(!added.iter().any(|l| l.starts_with("LEFT ")), "{log}");
     assert!(!added.iter().any(|l| landed_note(l)), "{log}");
     let _ = std::fs::remove_dir_all(&dir);
 }

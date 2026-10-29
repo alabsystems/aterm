@@ -1,0 +1,21 @@
+# claude-code 2.1.310 · MEASURED 2026-10-26 (the transcript rows), the composer rows composed: the rows down to the done row are `aterm ctl @s-2f2879e509aed6622953 offscreen max=2000` of the owner's own tab (the real Claude Code 2.1.310, supervised by aterm's harness), copied verbatim · a /goal turn whose request failed ENOTFOUND during a real network outage: the vendor's error row `⏺ API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)` over the /goal echo `⏺ Goal still active · the API was unavailable or the connection dropped · retrying in 1 min (1/3) · send a message to retry now`, the done row, the goal check-in, then the same error row over the (2/3) echo · the archive keeps no composer, so the blank row, the rules, the bare `❯` and the footer `⏵⏵ auto mode on (shift+tab to cycle)` under the last done row are those of claude-2.1.310-wall-invalid-api-key.txt (MEASURED 2026-10-25, 144 columns, idle at a turn's end); the owner's tab was wider (its archive rows run to 166 columns) and no row here passes 144, so the frame is that 144-column screen; the owner's own footer is not recorded
+  Ran 1 shell command
+
+⏺ API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)
+
+⏺ Goal still active · the API was unavailable or the connection dropped · retrying in 1 min (1/3) · send a message to retry now
+
+✻ Cooked for 49m 21s · done 2:28 PM
+
+⏺ Goal check-in: continuing after the last turn ended early
+
+⏺ API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)
+
+⏺ Goal still active · the API was unavailable or the connection dropped · retrying in 5 min (2/3) · send a message to retry now
+
+✻ Worked for 2m 57s · done 2:32 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

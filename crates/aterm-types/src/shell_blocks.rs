@@ -108,34 +108,38 @@ impl OutputBlock {
         matches!(self.exit_code, Some(code) if code != 0)
     }
 
-    /// Absolute `(start, end_exclusive)` rows of the command portion of this block.
+    /// Absolute `(start, end_exclusive)` rows of the command portion of this block,
+    /// clamped so `start <= end_exclusive` holds even if boundary rows were set out of order.
     #[inline]
     #[must_use]
     pub const fn command_rows(&self) -> Option<(u64, u64)> {
         let Some(start) = self.command_start_row else {
             return None;
         };
-        let end = match self.output_start_row {
+        let raw_end = match self.output_start_row {
             Some(row) => row,
             None => match self.end_row {
                 Some(row) => row,
                 None => start.saturating_add(1),
             },
         };
+        let end = if raw_end < start { start } else { raw_end };
         Some((start, end))
     }
 
-    /// Absolute `(start, end_exclusive)` rows of the output portion of this block.
+    /// Absolute `(start, end_exclusive)` rows of the output portion of this block,
+    /// clamped so `start <= end_exclusive` holds even if `end_row` precedes `output_start_row`.
     #[inline]
     #[must_use]
     pub const fn output_rows(&self) -> Option<(u64, u64)> {
         let Some(start) = self.output_start_row else {
             return None;
         };
-        let end = match self.end_row {
+        let raw_end = match self.end_row {
             Some(row) => row,
             None => start.saturating_add(1),
         };
+        let end = if raw_end < start { start } else { raw_end };
         Some((start, end))
     }
 }

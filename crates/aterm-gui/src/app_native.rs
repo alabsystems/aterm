@@ -1390,19 +1390,28 @@ enum NativeConfigJob {
 #[derive(Clone, Debug)]
 pub(crate) struct NativeConfigPersistenceCompletion {
     pub(crate) outcome: ConfigPatchOutcome,
-    pub(crate) observation: Result<crate::native_config_service::PreparedConfigObservation, String>,
+    pub(crate) observation: Result<
+        crate::native_config_service::PreparedConfigObservation,
+        crate::native_config_service::ConfigFailure,
+    >,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct NativeConfigReconciliationCompletion {
     pub(crate) pending_sequence: u64,
-    pub(crate) observation: Result<crate::native_config_service::PreparedConfigObservation, String>,
+    pub(crate) observation: Result<
+        crate::native_config_service::PreparedConfigObservation,
+        crate::native_config_service::ConfigFailure,
+    >,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct NativeConfigExternalPreparationCompletion {
     pub(crate) observation: crate::native_config_service::ConfigDiskObservation,
-    pub(crate) result: Result<crate::native_config_service::PreparedConfigObservation, String>,
+    pub(crate) result: Result<
+        crate::native_config_service::PreparedConfigObservation,
+        crate::native_config_service::ConfigFailure,
+    >,
 }
 
 pub(crate) enum NativeConfigWork {
@@ -1584,7 +1593,10 @@ fn native_config_queue() -> Result<&'static std::sync::mpsc::Sender<NativeConfig
 fn observe_and_prepare_native_config(
     path: &std::path::Path,
     themes: std::sync::Arc<crate::app_config::ThemeCatalog>,
-) -> Result<crate::native_config_service::PreparedConfigObservation, String> {
+) -> Result<
+    crate::native_config_service::PreparedConfigObservation,
+    crate::native_config_service::ConfigFailure,
+> {
     let observation = observe_config_for_a_person(path)?;
     crate::native_config_service::VersionedConfigService::prepare_observation(observation, themes)
 }
@@ -1650,6 +1662,7 @@ pub(crate) fn execute_native_config_persistence(
             })
             .and_then(|path| observe_config_for_a_person(&path))
     }
+    .map_err(crate::native_config_service::ConfigFailure::from)
     .and_then(|observation| {
         crate::native_config_service::VersionedConfigService::prepare_observation(
             observation,
@@ -2765,6 +2778,19 @@ impl App {
             toolbar,
             footer_rows,
         );
+        // A grid's row width in character cells, as the frame lays it out
+        // (`EditorApp::view`), so its sideways scroll stays where the frame shows it.
+        let grid_cells = {
+            let geometry = crate::native_ui::text_viewport_geometry(editor_rect, footer_rows);
+            ((editor_rect.right() - geometry.text_x).max(1.0) / geometry.cell_w).floor() as usize
+        };
+        let grid_width_changed = match self.native_runtime.view_state_mut(view) {
+            Some(crate::native_app::AppViewState::Editor(state)) => state
+                .buffer
+                .as_mut()
+                .is_some_and(|buffer| buffer.set_grid_width(grid_cells)),
+            _ => false,
+        };
         if matches!(
             self.native_runtime.view_state(view),
             Some(crate::native_app::AppViewState::Editor(state))
@@ -2772,7 +2798,10 @@ impl App {
                     buffer.viewport_lines() == visible_lines
                 })
         ) {
-            return Ok(false);
+            if grid_width_changed {
+                self.invalidate_native_view_cache(wid, view, DamageRegion::All);
+            }
+            return Ok(grid_width_changed);
         }
         let Some(_) = self.dispatch_editor_event(
             instance,
@@ -2963,6 +2992,18 @@ impl App {
                     "editor/revert" => {
                         AppEvent::EditorCommand(crate::native_editor::EditorCommand::RevertBuffer)
                     }
+                    "editor/grid-toggle" => {
+                        AppEvent::EditorCommand(crate::native_editor::EditorCommand::ToggleGridView)
+                    }
+                    "editor/grid-insert-row" => {
+                        AppEvent::EditorCommand(crate::native_editor::EditorCommand::GridInsertRow)
+                    }
+                    "editor/grid-delete-row" => {
+                        AppEvent::EditorCommand(crate::native_editor::EditorCommand::GridDeleteRow)
+                    }
+                    "editor/keep-local" => AppEvent::EditorCommand(
+                        crate::native_editor::EditorCommand::KeepBufferOverDisk,
+                    ),
                     "editor/finish" => {
                         AppEvent::EditorCommand(crate::native_editor::EditorCommand::FinishEdit)
                     }
@@ -4072,6 +4113,24 @@ impl App {
                     )?;
                 }
             }
+            // A native button or key's copy is a control client's when its gesture was (`act`,
+            // or a key a control client sent the view): it copies nothing, and the view says why.
+            AppEffect::Clipboard { reply, .. } if self.person_gesture_refused() => {
+                crate::app_take_over::note_clipboard_refused("native copy");
+                if self.native_runtime.completion_is_current(&reply) {
+                    self.dispatch_native_completion(
+                        wid,
+                        instance,
+                        view,
+                        AppEvent::ClipboardFinished {
+                            operation: reply.operation,
+                            outcome: ClipboardOutcome::Failed {
+                                message: crate::app_take_over::CLIPBOARD_REFUSED.to_string(),
+                            },
+                        },
+                    )?;
+                }
+            }
             AppEffect::Clipboard { request, reply } => {
                 let copied = match request {
                     ClipboardRequest::CopyText { text, .. } => crate::control::pbcopy(&text),
@@ -5066,7 +5125,10 @@ impl App {
                         } else {
                             self.native_config_service.restore_durable_snapshot().ok()
                         };
-                        (restored, Some(error))
+                        (
+                            restored,
+                            Some(crate::native_config_service::ConfigFailure::from(error)),
+                        )
                     }
                 }
             }
@@ -5097,12 +5159,14 @@ impl App {
             outcome,
             authoritative,
             reconciled_changed,
-            synchronization_error.clone(),
+            synchronization_error
+                .as_ref()
+                .map(|error| error.said.clone()),
         );
         if let Some(error) = synchronization_error {
-            self.surface_native_config_lane_error(format!(
-                "{saved_wording} could not be admitted: {error}"
-            ));
+            self.surface_native_config_lane_error(
+                error.headed(&format!("{saved_wording} could not be admitted: ")),
+            );
         }
         if self.config_watch_admission_pending() || self.native_config_external_pending.is_some() {
             self.native_config_service.mark_reconciliation_required();
@@ -5116,12 +5180,21 @@ impl App {
         }
     }
 
-    fn fail_native_config_reconciliation(&mut self, error: &str) {
+    /// The lane's reconciliation failed: every queued request is refused, and the failure said
+    /// ([`crate::native_config_service::ConfigFailure`]: aterm.log keeps its words).
+    pub(crate) fn fail_native_config_reconciliation(
+        &mut self,
+        error: impl Into<crate::native_config_service::ConfigFailure>,
+    ) {
+        let error = error.into();
         self.native_config_service.mark_reconciliation_required();
-        let rejected =
-            self.reject_pending_native_config(&format!("config reconciliation failed: {error}"));
+        let rejected = self
+            .reject_pending_native_config(error.clone().headed("config reconciliation failed: "));
         if rejected == 0 {
-            aterm_log::warn!("native config: reconciliation failed with nothing queued: {error}");
+            aterm_log::warn!(
+                "native config: reconciliation failed with nothing queued: {}",
+                error.log
+            );
             return;
         }
         let lost = if rejected == 1 {
@@ -5129,9 +5202,9 @@ impl App {
         } else {
             format!("{rejected} queued changes were")
         };
-        self.surface_native_config_lane_error(format!(
-            "Config reconciliation failed; {lost} not written: {error}"
-        ));
+        self.surface_native_config_lane_error(error.headed(&format!(
+            "Config reconciliation failed; {lost} not written: "
+        )));
     }
 
     pub(crate) fn finish_native_config_reconciliation(
@@ -5142,7 +5215,7 @@ impl App {
         let prepared = match completion.observation {
             Ok(prepared) => self.rebase_prepared_config_themes(prepared),
             Err(error) => {
-                self.fail_native_config_reconciliation(&error);
+                self.fail_native_config_reconciliation(error);
                 return;
             }
         };
@@ -5154,7 +5227,7 @@ impl App {
                 .native_config_service
                 .synchronize_prepared_observation(prepared)
             {
-                self.fail_native_config_reconciliation(&error);
+                self.fail_native_config_reconciliation(error);
                 return;
             }
             self.native_config_service.mark_reconciliation_required();
@@ -5195,7 +5268,7 @@ impl App {
         {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                self.fail_native_config_reconciliation(&error);
+                self.fail_native_config_reconciliation(error);
                 return;
             }
         };
@@ -5277,7 +5350,7 @@ impl App {
             }
             Err(error) => {
                 self.native_config_service.mark_reconciliation_required();
-                self.reject_pending_native_config(&format!(
+                self.reject_pending_native_config(format!(
                     "config generation could not be admitted: {error}"
                 ));
                 self.surface_native_config_lane_error(format!(
@@ -5340,7 +5413,7 @@ impl App {
                 &baseline,
                 crate::config_watcher::WatchFailureKind::ConfigPreparationFailed,
             );
-            self.reject_pending_native_config(&format!("config preparation failed: {error}"));
+            self.reject_pending_native_config(format!("config preparation failed: {error}"));
             self.surface_native_config_lane_error(error);
         }
     }
@@ -5367,9 +5440,9 @@ impl App {
                     &completion.observation.baseline,
                     crate::config_watcher::WatchFailureKind::ConfigInvalidToml,
                 );
-                self.surface_native_config_lane_error(format!(
-                    "Config observation was not valid TOML: {error}"
-                ));
+                self.surface_native_config_lane_error(
+                    error.headed("Config observation was not valid TOML: "),
+                );
                 if let Err(error) = self.pump_native_config() {
                     self.surface_native_config_lane_error(error);
                 }
@@ -5408,28 +5481,38 @@ impl App {
         self.request_redraw_all_windows();
     }
 
-    /// The native config lane's own error.
-    pub(crate) fn surface_native_config_lane_error(&mut self, message: String) {
-        aterm_log::warn!("native config: {message}");
-        self.post_message(crate::message_reporters::config_lane_error(&message));
+    /// The native config lane's own error: the Messages row says it, aterm.log keeps its log form
+    /// ([`crate::native_config_service::ConfigFailure`]).
+    pub(crate) fn surface_native_config_lane_error(
+        &mut self,
+        failure: impl Into<crate::native_config_service::ConfigFailure>,
+    ) {
+        let failure = failure.into();
+        aterm_log::warn!("native config: {}", failure.log);
+        self.post_message(crate::message_reporters::config_lane_error(&failure.said));
     }
 
     /// Answer every still-queued semantic request with one bounded rejection and empty the lane.
-    pub(crate) fn reject_pending_native_config(&mut self, message: &str) -> usize {
+    pub(crate) fn reject_pending_native_config(
+        &mut self,
+        failure: impl Into<crate::native_config_service::ConfigFailure>,
+    ) -> usize {
         let abandoned = std::mem::take(&mut self.native_config_pending);
         if abandoned.is_empty() {
             return 0;
         }
+        let failure = failure.into();
         let rejected = abandoned.len();
         aterm_log::warn!(
-            "native config: rejecting {} queued config request(s): {message}",
-            abandoned.len()
+            "native config: rejecting {} queued config request(s): {}",
+            abandoned.len(),
+            failure.log
         );
         for NativeConfigRequest { origin, .. } in abandoned {
             self.publish_native_config_origin(
                 origin,
                 ConfigPatchOutcome::Rejected {
-                    message: message.to_string(),
+                    message: failure.said.clone(),
                 },
                 None,
                 false,
@@ -5734,7 +5817,8 @@ impl App {
         let prepared = crate::native_config_service::VersionedConfigService::prepare_observation(
             observation,
             std::sync::Arc::clone(&self.native_config_service.snapshot().assets.themes),
-        )?;
+        )
+        .map_err(crate::native_config_service::ConfigFailure::into_said)?;
         if self.native_config_inflight {
             self.native_config_external_sequence = self
                 .native_config_external_sequence
@@ -6051,6 +6135,10 @@ impl App {
 
     /// Start one status-collection worker (no verb).
     pub(crate) fn start_native_packages_refresh(&mut self) {
+        #[cfg(test)]
+        {
+            self.packages_reads_asked += 1;
+        }
         let available = self.note_native_package_tool();
         let Some(proxy) = self.proxy.clone() else {
             self.publish_native_packages_state();
@@ -6144,8 +6232,9 @@ impl App {
         let state = self.messages_state();
         let revision = state.revision;
         let words_offset_s = state.utc_offset_s;
+        let wall = self.messages_wall;
         let words_change_in = state
-            .words_change_at(|at| crate::presence::local_offset_at(i64::try_from(at / 1000).ok()?))
+            .words_change_at(|at| wall.offset_at(i64::try_from(at / 1000).ok()?))
             .map(|at| std::time::Duration::from_millis(at.saturating_sub(state.now_unix_ms)));
         if !self
             .native_runtime
@@ -6205,7 +6294,7 @@ impl App {
         let zone_moved = std::cell::OnceCell::new();
         let zone_moved = || {
             *zone_moved.get_or_init(|| {
-                crate::presence::local_offset_s().unwrap_or(0) != self.messages_words_offset_s
+                self.messages_wall.offset_s().unwrap_or(0) != self.messages_words_offset_s
             })
         };
         let shown = |ws: &crate::WindowState| {
@@ -9886,8 +9975,29 @@ impl App {
             successor_reopens,
             CARRIED_SETTINGS_DRAFTS_CAP_BYTES,
         );
+        // A cell opened while the successor warmed holds text outside the document and its
+        // journal. Final validation is read-only: keep that draft here instead of certifying
+        // an update whose restore layout cannot carry it.
+        let changed_cells = self
+            .view_store
+            .iter()
+            .filter(|(view, _)| {
+                matches!(
+                    self.native_runtime.view_state(*view),
+                    Some(crate::native_app::AppViewState::Editor(state))
+                        if state.buffer.as_ref()
+                            .and_then(crate::native_editor::EditorBufferView::grid_draft)
+                            .is_some_and(|draft| draft.text != draft.original)
+                )
+            })
+            .count();
 
         let mut blockers = Vec::new();
+        if changed_cells > 0 {
+            blockers.push(format!(
+                "Wait: {changed_cells} edited table cell(s) are still open; Return keeps a cell, Escape drops it"
+            ));
+        }
         blockers.extend(settings.blocker());
         blockers.extend(drafts.blockers());
         if self.document_journal_writes_in_flight() {
@@ -10572,6 +10682,8 @@ pub(crate) fn packages_argv(request: &PackagesRequest) -> Vec<String> {
         PackagesRequest::InstallDefaultSet => &["install", "--default-set"],
         PackagesRequest::UninstallAll => &["uninstall", "--all"],
         PackagesRequest::MachineApply => &["machine", "apply"],
+        PackagesRequest::ServeUnits { on: true } => &["serve-units", "--on"],
+        PackagesRequest::ServeUnits { on: false } => &["serve-units", "--off"],
     };
     parts.iter().map(ToString::to_string).collect()
 }
@@ -10585,7 +10697,7 @@ pub(crate) const fn person_verb(
         PackagesRequest::CheckUpdate => Some(PackagesVerb::Check),
         PackagesRequest::InstallDefaultSet => Some(PackagesVerb::Install),
         PackagesRequest::UninstallAll => Some(PackagesVerb::Remove),
-        PackagesRequest::MachineApply => None,
+        PackagesRequest::MachineApply | PackagesRequest::ServeUnits { .. } => None,
     }
 }
 
@@ -10606,6 +10718,7 @@ pub(crate) const fn packages_busy(request: &PackagesRequest) -> PackagesBusy {
         PackagesRequest::InstallDefaultSet => PackagesBusy::Install,
         PackagesRequest::UninstallAll => PackagesBusy::Uninstall,
         PackagesRequest::MachineApply => PackagesBusy::MachineApply,
+        PackagesRequest::ServeUnits { on } => PackagesBusy::Sharing { on: *on },
     }
 }
 
@@ -10614,7 +10727,8 @@ pub(crate) fn packages_request_admissible(request: &PackagesRequest) -> Result<(
     match request {
         PackagesRequest::CheckUpdate
         | PackagesRequest::InstallDefaultSet
-        | PackagesRequest::UninstallAll => Ok(()),
+        | PackagesRequest::UninstallAll
+        | PackagesRequest::ServeUnits { .. } => Ok(()),
         PackagesRequest::MachineApply => {
             if cfg!(target_os = "macos") {
                 Ok(())

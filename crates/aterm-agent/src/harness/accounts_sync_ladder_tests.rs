@@ -66,14 +66,17 @@ impl Bench {
         UpkeepEffects {
             fetch: &|_: &Env, source: &str| Err(format!("no fetch in a test: {source}")),
             spawn_renewal: &inline,
+            quota_refresh: &|_, _, _, _| {},
             sync_cooldown: &self.cooldown,
             rediscovery: &self.rediscovery,
             renew_guard: &self.guard,
             find_browser,
             vault_sync: not_a_member,
             spawn_vault: &inline,
+            default_check: |_: &Path| crate::harness::cli::LoginCheck::CouldNotRun(String::new()),
             mailbox: &ladder_mailbox_files,
             log: Arc::new(move |line: &str| logged.lock().unwrap().push(line.to_owned())),
+            shared: shared_renewal::Effects::default(),
             run_attempt: Some(Arc::new(move |browser: &RenewBrowser, _headless: bool| {
                 handed.lock().unwrap().push(browser.clone());
                 ends
@@ -138,6 +141,140 @@ fn attempt_of(desk: &Desk, label: &str) -> Option<accounts::SignInAttempt> {
         .0
         .get(label)
         .and_then(|b| b.sign_in_attempt.clone())
+}
+
+#[test]
+fn a_roster_identity_edit_reconsiders_the_row_without_roster_rewrite_noise() {
+    let desk = Desk::new("m30");
+    hand_roster(&desk, false);
+    let bench = Bench::ending(Renewal::AuthFailed);
+    let no_route_count = || {
+        bench
+            .logged()
+            .iter()
+            .filter(|line| line.contains("account w3: automatic sign-in no-route"))
+            .count()
+    };
+    assert!(!bench.pass(&desk, NOW));
+    assert_eq!(no_route_count(), 1);
+    let original = fs::read_to_string(desk.roster()).unwrap();
+    fs::write(desk.roster(), format!("{original}\n# unchanged rows\n")).unwrap();
+    assert!(!bench.pass(&desk, NOW + 1));
+    assert_eq!(
+        no_route_count(),
+        1,
+        "rewriting an unchanged roster keeps its wait"
+    );
+
+    let replacement = original.replace("w3.m30.3@example.test", "new.m30.3@example.test");
+    assert_ne!(replacement, original);
+    fs::write(desk.roster(), replacement).unwrap();
+    assert!(!bench.pass(&desk, NOW + 2));
+    assert_eq!(
+        no_route_count(),
+        2,
+        "the new row is reconsidered immediately"
+    );
+    assert!(!bench.pass(&desk, NOW + 3));
+    assert_eq!(
+        no_route_count(),
+        2,
+        "the unchanged replacement keeps its own wait"
+    );
+    assert!(
+        bench.handed().is_empty(),
+        "no provider request without a route"
+    );
+}
+
+#[test]
+fn a_changed_account_does_not_receive_an_earlier_attempts_failure() {
+    for changed in ["same", "other", "email", "identity", "browser", "directory"] {
+        let desk = Desk::new("m30");
+        hand_roster(&desk, true);
+        let store = desk.store();
+        fs::create_dir_all(crate::harness::headless_oauth::browser_profile_dir(
+            &store.dir,
+            Some("w3"),
+        ))
+        .unwrap();
+        let bench = Bench {
+            browser: true,
+            ..Bench::ending(Renewal::AuthFailed)
+        };
+        let after = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&after);
+        let path = desk.roster();
+        let changed_store = desk.store();
+        let mut fx = bench.fx();
+        fx.run_attempt = Some(Arc::new(move |_, _| {
+            let mut roster = Roster::load(&path).unwrap();
+            let row = roster
+                .rows
+                .iter_mut()
+                .find(|row| row.label == "w3")
+                .unwrap();
+            match changed {
+                "same" | "other" => {}
+                "email" => row.email = Some("replacement@example.test".into()),
+                "identity" => row.identity_email = Some("provider@example.test".into()),
+                "browser" => row.browser = Some("Profile 2".into()),
+                "directory" => {
+                    row.dir = Some(
+                        path.with_file_name("replacement")
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                }
+                _ => unreachable!(),
+            }
+            if changed == "other" {
+                roster
+                    .rows
+                    .iter_mut()
+                    .find(|row| row.label == "main")
+                    .unwrap()
+                    .browser = Some("Profile 9".into());
+            }
+            fs::write(&path, format_roster_toml(&roster).unwrap()).unwrap();
+            *captured.lock().unwrap() = Some(
+                [
+                    changed_store.state_file(),
+                    changed_store.logins_file(),
+                    changed_store.ledger_path(),
+                ]
+                .map(|path| fs::read(path).ok()),
+            );
+            Renewal::AuthFailed
+        }));
+        assert!(auto_renew_next_account(
+            &desk.home,
+            &desk.state,
+            &desk.roster(),
+            NOW,
+            &fx
+        ));
+        if matches!(changed, "same" | "other") {
+            assert_eq!(
+                attempt_of(&desk, "w3").unwrap().outcome,
+                accounts::AttemptOutcome::Failed
+            );
+        } else {
+            assert_eq!(
+                [store.state_file(), store.logins_file(), store.ledger_path()]
+                    .map(|path| fs::read(path).ok()),
+                after.lock().unwrap().clone().unwrap(),
+                "a changed {changed} must not inherit an earlier attempt's record"
+            );
+            assert!(attempt_of(&desk, "w3").is_none());
+            assert!(
+                !bench
+                    .logged()
+                    .iter()
+                    .any(|line| line.contains("automatic sign-in failed"))
+            );
+        }
+    }
 }
 
 #[test]
@@ -410,5 +547,45 @@ fn a_person_turning_logins_off_stops_the_ladder() {
         );
         assert_eq!(bench.handed().len(), usize::from(started), "{logins}");
         assert_eq!(attempt_of(&desk, "w3").is_some(), started, "{logins}");
+    }
+}
+#[test]
+fn a_row_changed_during_route_read_gets_no_stale_no_route_summary() {
+    for changed in [false, true] {
+        let desk = Desk::new("m30");
+        hand_roster(&desk, false);
+        let path = desk.roster();
+        let mailbox = move |_: &Path, _: &accounts::Store, _: &Row| {
+            if changed {
+                let mut roster = Roster::load(&path).unwrap();
+                roster
+                    .rows
+                    .iter_mut()
+                    .find(|row| row.label == "w3")
+                    .unwrap()
+                    .email = Some("replacement@example.test".into());
+                fs::write(&path, format_roster_toml(&roster).unwrap()).unwrap();
+            }
+            (crate::harness::sign_in_ladder::Mailbox::None, None)
+        };
+        let bench = Bench::ending(Renewal::AuthFailed);
+        let mut fx = bench.fx();
+        fx.mailbox = &mailbox;
+        assert!(!auto_renew_next_account(
+            &desk.home,
+            &desk.state,
+            &desk.roster(),
+            NOW,
+            &fx
+        ));
+        assert_eq!(attempt_of(&desk, "w3").is_some(), !changed);
+        assert_eq!(
+            bench
+                .logged()
+                .iter()
+                .any(|line| line.contains("account w3: automatic sign-in no-route")),
+            !changed
+        );
+        assert!(bench.handed().is_empty());
     }
 }

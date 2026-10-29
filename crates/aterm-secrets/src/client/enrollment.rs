@@ -10,10 +10,17 @@ use crate::commons::{
     binding::{Binding, Possession},
     bootstrap::Bootstrap,
     constraints::Fact,
+    hearing::{Gate, Ledger, RECENT},
     journal::Journal,
     node::Node,
-    roster::{Grant, Role},
+    roster::{self, Access, Grant, MAX_MEMBERS, Role},
 };
+use astream_wire::sync::Actor;
+
+fn now_ms() -> crate::Result<u64> {
+    aterm_time::unix_millis()
+        .ok_or_else(|| Error::new("system clock cannot represent a Commons contact time"))
+}
 
 // A local plan is never retained across peer I/O or exposed as a grant.
 enum Candidate {
@@ -131,8 +138,21 @@ impl Admin {
                 .ok_or_else(|| Error::new("Commons enrolled device has no retained witness"));
         }
         access.check_addition(binding, Role::Writer)?;
+        let grants = self.kept(&access, |_| false)?;
+        Ok(Candidate::New { host, grants })
+    }
+
+    /// The current members a roster write keeps, as recorded grants: all but those `leaving`,
+    /// who leave the roster but not the vault. This device stays.
+    fn kept(&self, access: &Access, leaving: impl Fn(&Actor) -> bool) -> crate::Result<Vec<Grant>> {
+        let machines = self.published_doc.machines();
+        let local = access.local().binding().actor();
         let mut grants = Vec::new();
         for member in access.members() {
+            let actor = member.binding().actor();
+            if actor != local && leaving(&actor) {
+                continue;
+            }
             let name = machines
                 .iter()
                 .find(|m| Recipient::parse(&m.recipient).ok() == Some(member.binding().recipient()))
@@ -155,13 +175,131 @@ impl Admin {
                 member.role(),
             ));
         }
-        Ok(Candidate::New { host, grants })
+        Ok(grants)
+    }
+
+    /// Bring the roster in line with what this device heard (`ledger`, at `now_ms`): members
+    /// silent for 30 days leave it, and recorded devices of eligible vault machines heard again
+    /// within 7 days are re-enrolled as writers, in one gated rotation retained in `journal`.
+    /// Members never heard are first noted in `ledger`, which starts their 30 days. While the
+    /// C26 gate holds, returns stop at 63 members. `None` when nothing changes, or when an admin
+    /// device with a smaller writer reported aterm 0.146 within 15 minutes (it refreshes).
+    /// Retired devices never return. This performs no network I/O.
+    pub fn refresh_commons_roster(
+        &self,
+        bootstrap: &Bootstrap,
+        journal: &mut Journal,
+        ledger: &mut Ledger,
+        now_ms: u64,
+    ) -> crate::Result<Option<Node>> {
+        if bootstrap.trust() != journal.trust() {
+            return Err(Error::new("Commons refresh has another local root"));
+        }
+        if bootstrap.is_log_backed()? {
+            return Ok(None);
+        }
+        let Some(access) = bootstrap.access_in(journal)? else {
+            return Ok(None);
+        };
+        ledger.know_local(access.local().binding());
+        for member in access.members() {
+            ledger.note(member.binding().actor(), now_ms);
+        }
+        let machines = self.published_doc.machines();
+        let admins = recipients_of(&self.published_doc.admins(), &self.published_doc)?;
+        let local = access.local().binding().actor();
+        if ledger.defers(
+            &local,
+            access
+                .members()
+                .iter()
+                .filter(|member| admins.contains(&member.binding().recipient()))
+                .map(|member| member.binding().actor()),
+            now_ms,
+        ) {
+            return Ok(None);
+        }
+        let mut grants = self.kept(&access, |actor| ledger.silent(actor, now_ms))?;
+        let kept = grants.len();
+        let constraints = journal.constraints()?;
+        let (mut recipients, mut ids): (
+            std::collections::BTreeSet<_>,
+            std::collections::BTreeSet<_>,
+        ) = access
+            .members()
+            .iter()
+            .map(|m| (m.binding().recipient(), *m.binding().machine()))
+            .unzip();
+        let mut back = Vec::new();
+        for fact in constraints.facts() {
+            let Fact::Bind { binding } = fact else {
+                continue;
+            };
+            if recipients.contains(&binding.recipient())
+                || ids.contains(binding.machine())
+                || !ledger.heard_within(&binding.actor(), now_ms, RECENT)
+                || constraints.check_recorded_device(binding).is_err()
+            {
+                continue;
+            }
+            let Some(machine) = machines
+                .iter()
+                .find(|m| Recipient::parse(&m.recipient).ok() == Some(binding.recipient()))
+            else {
+                continue;
+            };
+            if !self
+                .commons_eligibility
+                .includes(&machine.name, binding.recipient())
+                || grants.len() == MAX_MEMBERS
+            {
+                continue;
+            }
+            recipients.insert(binding.recipient());
+            ids.insert(*binding.machine());
+            grants.push(Grant::recorded(
+                machine.name.clone(),
+                binding.clone(),
+                Role::Writer,
+            ));
+            back.push(binding);
+        }
+        // While the gate would refuse a roster past 63, fewer return, so those leaving still
+        // leave.
+        let room = ledger.room(
+            roster::crossed(journal),
+            access
+                .members()
+                .iter()
+                .map(|m| m.binding())
+                .chain(back.iter().copied()),
+            now_ms,
+        );
+        grants.truncate(room.max(kept));
+        if kept == access.members().len() && grants.len() == kept {
+            return Ok(None);
+        }
+        let node = roster::rotate_gated(
+            &self.commons_seed,
+            &self.commons_eligibility,
+            journal,
+            grants,
+            &[],
+            &[],
+            Some(&Gate { ledger, now_ms }),
+        )?;
+        journal.ingest(node.bytes())?;
+        bootstrap
+            .access_in(journal)?
+            .ok_or_else(|| Error::new("Commons refresh did not retain a usable roster"))?;
+        Ok(Some(node))
     }
 
     /// Enroll a jointly proven, durably approved device as a Commons writer.
     /// Preserve all current members and roles, refusing key replacement or an
-    /// unavailable/forked roster. The returned authority witness is durable in
-    /// `journal`; losing the network reply cannot mint another epoch on retry.
+    /// unavailable/forked roster; a roster past 63 members passes the C26 gate ([`Gate`]).
+    /// The returned authority witness is durable in `journal`; losing the network reply
+    /// cannot mint another epoch on retry.
     /// This performs no network I/O and grants no administrative or drive rights.
     pub fn enroll_commons_member(
         &self,
@@ -176,7 +314,19 @@ impl Admin {
         };
         let certificate = self.auto_approve_commons_member(journal, &host, possession)?;
         grants.push(Grant::certified(host, certificate, Role::Writer));
-        let node = self.prepare_commons_rotation(journal, grants)?;
+        let ledger = Ledger::read(bootstrap);
+        let node = roster::rotate_gated(
+            &self.commons_seed,
+            &self.commons_eligibility,
+            journal,
+            grants,
+            &[],
+            &[],
+            Some(&Gate {
+                ledger: &ledger,
+                now_ms: now_ms()?,
+            }),
+        )?;
         journal.ingest(node.bytes())?;
         let current = bootstrap
             .access_in(journal)?
@@ -194,8 +344,15 @@ impl Admin {
 /// repairing materialized files, or creating an identity. LAN enrollment must
 /// remain available while the compatibility vault server is offline.
 pub fn admin_cached(paths: &Paths) -> crate::Result<Admin> {
-    let _lock = StateLock::observe(paths)?
-        .ok_or_else(|| Error::new("vault state is changing; retry enrollment"))?;
+    admin_cached_with_lock(paths, StateLock::observe(paths)?)
+}
+
+pub(super) fn admin_cached_until(paths: &Paths, deadline: Instant) -> crate::Result<Admin> {
+    admin_cached_with_lock(paths, StateLock::observe_until(paths, deadline)?)
+}
+
+fn admin_cached_with_lock(paths: &Paths, lock: Option<StateLock>) -> crate::Result<Admin> {
+    let _lock = lock.ok_or_else(|| Error::new("vault state is changing; retry enrollment"))?;
     let config = config(paths)?.ok_or_else(|| Error::new("no cached vault configured"))?;
     let pin = config
         .signer
@@ -246,11 +403,32 @@ pub fn admin_cached(paths: &Paths) -> crate::Result<Admin> {
     if envelope::signer_public(&opened.seed)? != envelope.signer {
         return Err(Error::new("cached admin custody differs from its signer"));
     }
+    if super::admin_removed_in_log(paths, &config, &envelope, &identity, &opened.doc) {
+        return Err(Error::new("this device cannot open cached admin custody"));
+    }
+    let served_machines = opened
+        .doc
+        .machines()
+        .into_iter()
+        .map(|machine| machine.recipient)
+        .collect();
+    let mut doc = opened.doc.clone();
+    let mut admissions = opened.admissions.clone();
+    let log_base = admin_base(
+        paths,
+        &config,
+        &envelope,
+        &identity,
+        &opened,
+        &mut doc,
+        &mut admissions,
+    );
     Ok(Admin {
-        commons_eligibility: crate::commons::membership::Eligibility::from_document(&opened.doc),
-        admissions: opened.admissions.clone(),
-        doc: opened.doc.clone(),
-        published_doc: opened.doc.clone(),
+        commons_eligibility: crate::commons::membership::Eligibility::from_document(&doc),
+        admissions,
+        published_doc: doc.clone(),
+        served_machines,
+        doc,
         config,
         seed: opened.seed,
         commons_seed: opened.commons_seed,
@@ -259,6 +437,12 @@ pub fn admin_cached(paths: &Paths) -> crate::Result<Admin> {
         seq: envelope.seq,
         handoff,
         opened_pairs: envelope.handoff.len(),
+        opened_heads: ledger_publish::extend_parent_spine(
+            &[envelope.digest()],
+            &[envelope.parents.as_slice()],
+        ),
+        log_base,
+        resolve: BTreeSet::new(),
     })
 }
 

@@ -21,49 +21,6 @@ pub struct HostCapabilities {
     pub roster: bool,
 }
 
-impl HostCapabilities {
-    /// Headless daemon capabilities (`roster` enabled, no windowing or clipboard).
-    #[must_use]
-    #[inline]
-    pub const fn headless_daemon() -> Self {
-        Self {
-            frame_source: false,
-            event_loop: false,
-            clipboard: false,
-            roster: true,
-        }
-    }
-
-    /// Full GUI capabilities (all 4 facilities enabled).
-    #[must_use]
-    #[inline]
-    pub const fn full_gui() -> Self {
-        Self {
-            frame_source: true,
-            event_loop: true,
-            clipboard: true,
-            roster: true,
-        }
-    }
-
-    /// Whether the host can capture rendered window frames (`frame_source && event_loop`).
-    #[must_use]
-    #[inline]
-    pub const fn can_capture_frames(self) -> bool {
-        self.frame_source && self.event_loop
-    }
-
-    /// Count of enabled host facilities (`0..=4`).
-    #[must_use]
-    #[inline]
-    pub const fn enabled_count(self) -> u8 {
-        (self.frame_source as u8)
-            + (self.event_loop as u8)
-            + (self.clipboard as u8)
-            + (self.roster as u8)
-    }
-}
-
 /// Session lifecycle state in the `sessions` wire vocabulary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionState {
@@ -73,33 +30,6 @@ pub enum SessionState {
     Alive,
     /// Command exited while the engine remains readable.
     Exited,
-}
-
-impl SessionState {
-    /// Wire token for this session state (`"spawning"`, `"alive"`, or `"exited"`).
-    #[must_use]
-    #[inline]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Spawning => "spawning",
-            Self::Alive => "alive",
-            Self::Exited => "exited",
-        }
-    }
-
-    /// Whether the session's input sink can accept bytes (`Spawning` or `Alive`).
-    #[must_use]
-    #[inline]
-    pub const fn can_accept_input(self) -> bool {
-        matches!(self, Self::Spawning | Self::Alive)
-    }
-
-    /// Whether the session has exited.
-    #[must_use]
-    #[inline]
-    pub const fn is_exited(self) -> bool {
-        matches!(self, Self::Exited)
-    }
 }
 
 /// One row of [`SessionHost::sessions`] matching a `sessions`/`ls` wire line.
@@ -253,18 +183,5 @@ mod tests {
         assert_eq!(Selector::Id("s-0f1e").local_sid(), None);
         assert_eq!(Selector::Id("s-0f1e").stable_id(), Some("s-0f1e"));
         assert_eq!(Selector::Local(12).stable_id(), None);
-    }
-
-    #[test]
-    fn host_capabilities_and_session_state_const_helpers() {
-        let daemon = HostCapabilities::headless_daemon();
-        assert!(daemon.roster && !daemon.can_capture_frames());
-        assert_eq!(daemon.enabled_count(), 1);
-        let gui = HostCapabilities::full_gui();
-        assert!(gui.roster && gui.can_capture_frames());
-        assert_eq!(gui.enabled_count(), 4);
-        assert_eq!(SessionState::Spawning.as_str(), "spawning");
-        assert!(SessionState::Alive.can_accept_input() && !SessionState::Alive.is_exited());
-        assert!(SessionState::Exited.is_exited() && !SessionState::Exited.can_accept_input());
     }
 }

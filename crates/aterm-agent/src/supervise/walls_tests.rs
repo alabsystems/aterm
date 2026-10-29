@@ -386,19 +386,12 @@ fn a_limit_binds_its_own_seat_and_another_goes_at_once() {
         assert!(said[0].holds, "{tag}: the limit holds the host: {said:#?}");
         assert_eq!(said[1].holds, !moved, "{tag}: {said:#?}");
     }
-    for (name, at_wall, after, relauncher, moved) in [
-        ("login moved", &wall, &other_login, None, true),
-        ("account kept", &account_wall, &other_login, None, false),
-        (
-            "key kept, the host's relaunch",
-            &wall,
-            &ended,
-            Some(true),
-            false,
-        ),
+    for (name, at_wall, after, moved) in [
+        ("login moved", &wall, &other_login, true),
+        ("account kept", &account_wall, &other_login, false),
     ] {
         let tag = format!("seat-{name}");
-        let said = run_points_as(
+        let said = run_points(
             &tag,
             Autopilot::Land,
             &[
@@ -406,7 +399,6 @@ fn a_limit_binds_its_own_seat_and_another_goes_at_once() {
                 p(&shell(), Some("zsh"), 30, None),
                 p(after, None, 60, Some(4)),
             ],
-            relauncher,
         );
         let want = if moved { "act usage-resume@v1" } else { "wait" };
         assert_eq!(said[2].act, want, "{tag}: {said:#?}");

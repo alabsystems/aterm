@@ -115,6 +115,10 @@ fn fabric_cmd(s: &Scratch, env_cmd: Option<&str>, args: &[&str]) -> Command {
         .env("HOME", s.path("home"))
         .env("XDG_CONFIG_HOME", s.path("cfg"))
         .env("XDG_RUNTIME_DIR", s.path("run"))
+        .env(
+            harness::FABRIC_IO_WAIT.0,
+            harness::FABRIC_IO_WAIT.1.as_millis().to_string(),
+        )
         .stdin(Stdio::null());
     if let Some(c) = env_cmd {
         cmd.env("ATERM_FABRIC_COMMAND", c);
@@ -825,10 +829,19 @@ fn doctor_retire_ghosts_refuses_while_an_instance_has_not_answered() {
     let dir = std::path::PathBuf::from(s.path("run")).join("aterm");
     std::fs::create_dir_all(&dir).expect("run/aterm");
     let mute = dir.join(format!("aterm-{}.sock", std::process::id()));
-    let _listener = UnixListener::bind(&mute).expect("bind a mute instance socket");
+    let _listener = harness::kept(UnixListener::bind(&mute).expect("bind a mute instance socket"));
 
-    let (code, out, err) = fabric(&s, Some(&env_cmd), &["doctor", "--retire-ghosts", "--yes"]);
-    assert_ne!(code, 0, "out={out} err={err}");
+    // The product's bound on the instance's read, which the mute socket runs out.
+    let mut doctor = fabric_cmd(&s, Some(&env_cmd), &["doctor", "--retire-ghosts", "--yes"]);
+    doctor.env_remove(harness::FABRIC_IO_WAIT.0);
+    let out = harness::output_within(&mut doctor, "aterm fabric");
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "out={} err={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(
         last_body(&sock, &subject).as_deref(),
         Some(live),
@@ -1066,9 +1079,10 @@ fn refusing_broker(sock: &str) {
     use astream_broker::proto::{
         Request, Response, decode_request, encode_response, read_frame, write_frame,
     };
-    let listener = UnixListener::bind(sock).expect("bind the refusing broker");
+    let listener = harness::kept(UnixListener::bind(sock).expect("bind the refusing broker"));
     std::thread::spawn(move || {
-        while let Ok((mut c, _)) = listener.accept() {
+        while let Ok((c, _)) = listener.accept() {
+            let mut c = harness::kept(c);
             std::thread::spawn(move || {
                 while let Ok(Some(p)) = read_frame(&mut c) {
                     let answer = match decode_request(&p) {

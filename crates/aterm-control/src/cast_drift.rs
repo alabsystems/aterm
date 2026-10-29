@@ -489,17 +489,26 @@ fn scan_marks<D: AsRef<[u8]>>(events: &[CastEvent<D>]) -> Marks {
         clears: vec![false; events.len()],
         ..Marks::default()
     };
+    let mut buf = [0u8; 8];
+    let mut len = 0usize;
     for (i, ev) in events.iter().enumerate() {
         let CastEvent::Output { data, .. } = ev else {
             continue;
         };
-        let bytes = data.as_ref();
-        for (off, _) in bytes.iter().enumerate().filter(|(_, b)| **b == 0x1b) {
-            let tail = &bytes[off..];
-            for &(seq, toggle, exit, clears) in MARKS {
-                if !tail.starts_with(seq) {
-                    continue;
-                }
+        for (off, &b) in data.as_ref().iter().enumerate() {
+            if b == 0x1b {
+                buf[0] = 0x1b;
+                len = 1;
+                continue;
+            }
+            if len == 0 || len >= buf.len() {
+                len = 0;
+                continue;
+            }
+            buf[len] = b;
+            len += 1;
+            let cand = &buf[..len];
+            if let Some(&(_, toggle, exit, clears)) = MARKS.iter().find(|&&(seq, ..)| seq == cand) {
                 if toggle {
                     if m.first_toggle_exit.is_none() {
                         m.first_toggle_exit = Some(exit);
@@ -510,6 +519,9 @@ fn scan_marks<D: AsRef<[u8]>>(events: &[CastEvent<D>]) -> Marks {
                     m.last_clear = Some((i, off));
                     m.clears[i] = true;
                 }
+                len = 0;
+            } else if !MARKS.iter().any(|&(seq, ..)| seq.starts_with(cand)) {
+                len = 0;
             }
         }
     }
@@ -1235,6 +1247,7 @@ mod tests {
         /// The live engine stands in for an aterm before the resize undo: it
         /// drops the undo before every resize, so a quiet flap shifts it too.
         pre_undo: bool,
+        policy: ResizePolicy,
     }
 
     impl Rec {
@@ -1257,7 +1270,13 @@ mod tests {
                 live,
                 t: 0.0,
                 pre_undo: false,
+                policy: ResizePolicy::Native,
             }
+        }
+
+        fn set_policy(&mut self, policy: ResizePolicy) {
+            self.policy = policy;
+            self.live.set_console_host_posture(policy);
         }
 
         fn out(&mut self, dt: f64, bytes: &[u8]) -> f64 {
@@ -1275,7 +1294,7 @@ mod tests {
             if self.pre_undo {
                 self.live.grid_mut().drop_resize_undo();
             }
-            self.live.resize(rows, cols);
+            self.live.resize_with_policy(rows, cols, self.policy);
             self.events.push(CastEvent::Resize {
                 t: self.t,
                 cols,
@@ -1316,7 +1335,7 @@ mod tests {
                 &self.events,
                 Some(&self.screen()),
                 args,
-                ResizePolicy::Native,
+                self.policy,
             )
         }
     }
@@ -1335,18 +1354,12 @@ mod tests {
         let mut cursors = Vec::new();
         for policy in [ResizePolicy::ConPty, ResizePolicy::Native] {
             let mut rec = Rec::new(cols, rows, false);
-            rec.live.set_console_host_posture(policy);
+            rec.set_policy(policy);
             for chunk in &chunks {
                 rec.out(0.01, chunk);
             }
             let screen = rec.screen();
-            let report = analyze(
-                &rec.header,
-                &rec.events,
-                Some(&screen),
-                &DriftArgs::default(),
-                policy,
-            );
+            let report = rec.audit(&DriftArgs::default());
             assert_eq!(report.fidelity, Some(true), "{policy:?}: {report:?}");
             assert_eq!(report.cursor_live, screen.cursor, "{policy:?}");
             cursors.push(screen.cursor);
@@ -1355,6 +1368,29 @@ mod tests {
             cursors[0], cursors[1],
             "the recording must reach the conhost layout"
         );
+
+        let grow = |policy: ResizePolicy| {
+            let mut rec = Rec::new(20, 6, false);
+            rec.set_policy(policy);
+            for i in 0..12 {
+                rec.out(0.01, format!("L{i:02}\r\n").as_bytes());
+            }
+            rec.resize(0.1, 20, 10);
+            rec
+        };
+        let conpty = grow(ResizePolicy::ConPty);
+        let native = grow(ResizePolicy::Native);
+        assert_ne!(conpty.screen().rows, native.screen().rows);
+        assert_eq!(conpty.audit(&DriftArgs::default()).fidelity, Some(true));
+        assert_eq!(native.audit(&DriftArgs::default()).fidelity, Some(true));
+        let wrong_policy = analyze(
+            &conpty.header,
+            &conpty.events,
+            Some(&conpty.screen()),
+            &DriftArgs::default(),
+            ResizePolicy::Native,
+        );
+        assert_eq!(wrong_policy.fidelity, Some(false));
     }
 
     #[test]
@@ -1934,7 +1970,7 @@ mod tests {
         assert_eq!(report.runs_total, 83);
         assert_eq!(report.candidates.len(), 1, "the anchor bounds the work");
         assert_eq!(report.culprit_word(), fmt_t(last));
-        assert!(report.folds <= 3, "folds={}", report.folds);
+        assert_eq!(report.folds, 2);
         let capped = rec.audit(&DriftArgs {
             max_runs: 0,
             ..DriftArgs::default()
@@ -2277,6 +2313,25 @@ mod tests {
         assert_eq!(report.anchor, None);
         assert!(report.seed_alt);
         assert_eq!(report.verdict, Verdict::Clean, "{report:?}");
+
+        let mut split = Rec::new(20, 8, false);
+        split.out(0.1, b"\x1b[?10");
+        split.out(0.1, b"49h\x1b[1;1HA0");
+        split.flap(1.0);
+        split.out(0.1, b"\x1b[");
+        let clear_t = split.out(0.1, b"2J\x1b[1;1HB0");
+        let anchored = split.audit(&DriftArgs::default());
+        assert_eq!(anchored.seed_basis, SeedBasis::Toggle);
+        assert!(!anchored.seed_alt);
+        assert_eq!(anchored.anchor, Some(clear_t));
+        assert_eq!(anchored.eligible, 0);
+        assert_eq!(anchored.verdict, Verdict::Clean);
+        assert_eq!(anchored.fidelity, Some(true));
+
+        split.out(0.1, b"\x1b[?104");
+        split.out(0.1, b"9l");
+        let dropped = split.audit(&DriftArgs::default());
+        assert_eq!(dropped.anchor, None);
     }
 
     #[test]

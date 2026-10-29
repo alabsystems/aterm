@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::LAB;
-use crate::door::Door;
+use crate::door::{Door, Reply};
 use crate::lab::{Launch, UpOpts};
 use crate::procs::{alive, descendants};
 use crate::pyjson::J;
@@ -23,17 +23,24 @@ const LANDED_TEXT: &str = "Nothing left: the lab's work is committed and pushed 
 
 const LAND_WATCH: Duration = Duration::from_secs(170);
 
-fn task_of(door: &Door<'_>) -> String {
+fn task_of(door: &Door<'_>) -> Result<String, String> {
     status_word(door, "task")
 }
 
-fn land_typed(door: &Door<'_>, sid: &str) -> Vec<String> {
-    door.harness_ledger(sid)
-        .unwrap_or_default()
+/// The `land@v1 … typed` rows of tab `sid`'s harness ledger, or why it was not read
+/// ([`answered`]): a failed read is never "nothing typed".
+fn land_typed(door: &Door<'_>, sid: &str) -> Result<Vec<String>, String> {
+    let at = format!("@{sid}");
+    let reply = door
+        .check_socket()
+        .and_then(|()| door.harness(&["ledger", "--sock", &door.run().sock, &at]));
+    let r = answered(&format!("harness ledger {at}"), reply)?;
+    Ok(r.stdout
         .lines()
+        .chain(r.stderr.lines())
         .filter(|l| l.contains("land@v1") && l.contains("typed"))
         .map(str::to_string)
-        .collect()
+        .collect())
 }
 
 fn land_first(run: &Run, door: &Door<'_>, sid: &str) -> Result<Vec<String>, Fail> {
@@ -44,7 +51,7 @@ fn land_first(run: &Run, door: &Door<'_>, sid: &str) -> Result<Vec<String>, Fail
     )
     .map_err(|e| could_not(&format!("the stub's mode: {e}")))?;
     crate::verbs::set_mode(run, LANDED_MODE)?;
-    land_proves_the_journal(&status_word(door, "autopilot"))?;
+    land_proves_the_journal(&autopilot_before(door)?)?;
     let at = format!("@{sid}");
     let said = door
         .ctl(&[&at, "meta", "set", "autopilot", "land"])
@@ -54,15 +61,22 @@ fn land_first(run: &Run, door: &Door<'_>, sid: &str) -> Result<Vec<String>, Fail
         );
     let t_l = now_ms();
     journal_carries(run, sid, "the Land word", leaf_under_land, t_l)?;
-    let mut task = String::new();
+    let mut task = "?".to_string();
     for _ in 0..(6 * 60 * 2) {
-        task = task_of(door);
+        // A failed read is no reading: the tab is read again.
+        if let Ok(read) = task_of(door) {
+            task = read;
+        }
         if task == "landed" {
             break;
         }
         stop::sleep(Duration::from_millis(500))?;
     }
-    let typed = land_typed(door, sid);
+    let typed = land_typed(door, sid).map_err(|why| {
+        could_not(&format!(
+            "tab {sid}'s harness ledger was not read before aterm ends: {why}"
+        ))
+    })?;
     println!(
         "  land      tab {sid} under land ({said}): task={task} {} after; {} land instruction(s) typed",
         since(t_l, now_ms()),
@@ -75,6 +89,9 @@ fn land_first(run: &Run, door: &Door<'_>, sid: &str) -> Result<Vec<String>, Fail
 }
 
 /// `--land`, after the restart: the restored tab `sid` watched for [`LAND_WATCH`].
+/// # Errors
+/// No `status` read answered over the watch, or the tab's harness ledger was not read (FAIL),
+/// or interrupted.
 fn land_after(
     door: &Door<'_>,
     sid: &str,
@@ -82,15 +99,32 @@ fn land_after(
     before: &[String],
 ) -> Result<(Vec<String>, Vec<String>), Fail> {
     let mut seen: Vec<String> = Vec::new();
+    let mut unread = String::new();
     let end = now_ms() + i64::try_from(LAND_WATCH.as_millis()).unwrap_or(i64::MAX);
     while now_ms() < end {
-        let task = task_of(door);
-        if seen.last() != Some(&task) {
-            seen.push(task);
+        // A failed read records nothing: the tab is read again.
+        match task_of(door) {
+            Ok(task) if seen.last() != Some(&task) => seen.push(task),
+            Ok(_) => {}
+            Err(why) => unread = why,
         }
         stop::sleep(Duration::from_millis(500))?;
     }
-    let mut typed = land_typed(door, sid);
+    if seen.is_empty() {
+        return Err(Fail::exit(
+            1,
+            format!(
+                "restore: FAIL: no `status` read of tab {sid} answered in {} s: {unread}",
+                LAND_WATCH.as_secs()
+            ),
+        ));
+    }
+    let mut typed = land_typed(door, sid).map_err(|why| {
+        Fail::exit(
+            1,
+            format!("restore: FAIL: the restored tab {sid}'s harness ledger was not read: {why}"),
+        )
+    })?;
     if sid == old_sid {
         typed.retain(|r| !before.contains(r));
     }
@@ -261,12 +295,53 @@ fn leaf_carries(text: &str, sid: &str, on_leaf: fn(&aterm_toml::Table) -> bool) 
     aterm_toml::from_str::<Value>(text).is_ok_and(|doc| walk(&doc, sid, on_leaf))
 }
 
-fn status_word(door: &Door<'_>, key: &str) -> String {
-    door.out(&["status"])
+/// A client `reply` that answered (exit 0; from `ctl`, the server's OK), else why no reading
+/// stands: its exit code and both streams, trimmed, or why the client never ran. `what` names
+/// the read.
+fn answered(what: &str, reply: Result<Reply, String>) -> Result<Reply, String> {
+    match reply {
+        Ok(r) if r.code == 0 => Ok(r),
+        Ok(r) => {
+            let said = format!("{}{}", r.stdout, r.stderr);
+            Err(format!("`{what}` exited {}: {}", r.code, said.trim()))
+        }
+        Err(e) => Err(format!("`{what}` did not run: {e}")),
+    }
+}
+
+/// The tab's `status` word `key` ([`status_word_of`]).
+fn status_word(door: &Door<'_>, key: &str) -> Result<String, String> {
+    status_word_of(door.ctl(&["status"]), key)
+}
+
+/// Word `key` of a `status` `reply`. A reply that did not answer ([`answered`]), whose first
+/// line is not `OK`, or that names no `key=` (every status line names `task=` and
+/// `autopilot=`), is why no word stands, never a word.
+fn status_word_of(reply: Result<Reply, String>, key: &str) -> Result<String, String> {
+    let r = answered("status", reply)?;
+    let line = r.stdout.lines().next().unwrap_or("");
+    if line != "OK" && !line.starts_with("OK ") {
+        let said = format!("{}{}", r.stdout, r.stderr);
+        return Err(format!("`status` answered no OK line: {}", said.trim()));
+    }
+    r.stdout
         .split_whitespace()
         .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
-        .unwrap_or("?")
-        .to_string()
+        .map(str::to_string)
+        .ok_or_else(|| format!("`status` names no {key}=: {}", line.trim()))
+}
+
+/// The tab's `autopilot` before aterm ends, for a guard ([`land_proves_the_journal`],
+/// [`cruise_is_the_control`]).
+/// # Errors
+/// No `autopilot` word was read ([`status_word_of`]; COULD NOT RUN): no guard passes on a word
+/// nobody read.
+fn autopilot_before(door: &Door<'_>) -> Result<String, Fail> {
+    status_word(door, "autopilot").map_err(|why| {
+        could_not(&format!(
+            "the tab's autopilot was not read before aterm ends: {why}"
+        ))
+    })
 }
 
 /// Before the run puts the tab under Land: its `autopilot` must not be Land already.
@@ -877,7 +952,7 @@ fn run_restore(
     let landed_before = match land {
         Some(Land::Landed) => land_first(&run, &door, &old_sid)?,
         Some(Land::Open) => {
-            land_proves_the_journal(&status_word(&door, "autopilot"))?;
+            land_proves_the_journal(&autopilot_before(&door)?)?;
             let said = door
                 .ctl(&[&format!("@{old_sid}"), "meta", "set", "autopilot", "land"])
                 .map_or_else(
@@ -886,13 +961,13 @@ fn run_restore(
                 );
             println!(
                 "  land      tab {old_sid} under land mid-work ({said}): task={}",
-                task_of(&door)
+                task_of(&door).unwrap_or_else(|why| format!("? ({why})"))
             );
             journal_carries(&run, &old_sid, "the Land word", leaf_under_land, now_ms())?;
             Vec::new()
         }
         None if !hold => {
-            cruise_is_the_control(&status_word(&door, "autopilot"))?;
+            cruise_is_the_control(&autopilot_before(&door)?)?;
             Vec::new()
         }
         None => Vec::new(),
@@ -915,12 +990,36 @@ fn run_restore(
         return Ok(held_report(&run, &door, t_launch, after.as_ref()));
     }
     let ready = "❯|Choose the text style|Select login method|Welcome to Claude";
-    door.seen(ready, 30)?;
-    let screen = door.out(&["text"]);
+    // Onboarding is read off this screen alone: a broken wait, or a `text` read that failed,
+    // is no screen, and the leg fails on it rather than read "" as no onboarding.
+    let screen = match door.await_match(ready, 30) {
+        Ok(_) => answered("text", door.ctl(&["text"])).map(|r| r.stdout),
+        Err(f) if f.stopped.is_some() => return Err(f),
+        Err(f) => Err(f.msg.unwrap_or_default()),
+    };
     let typed_early = ledger_since(&run, t_launch);
     for row in &typed_early {
         println!("  typed     {row}");
     }
+    let resumed = after.as_ref().is_some_and(|(_, c)| *c == conv);
+    match &after {
+        Some((pid, c)) => println!(
+            "  agent     Claude Code pid {pid}, conversation {c}, registered {} after the relaunch came up ({} after the {how})",
+            since(t_up, t_agent),
+            since(t_end, t_agent)
+        ),
+        None => println!("  agent     NONE registered within 90 s of the relaunch"),
+    }
+    let screen = match screen {
+        Ok(screen) => screen,
+        Err(why) => {
+            println!(
+                "restore {how}: FAIL: the relaunched tab's screen was not read ({why}), so no \
+                 onboarding was judged"
+            );
+            return Ok(Verdict::Failed);
+        }
+    };
     let onboarding = [
         "Choose the text style",
         "Select login method",
@@ -931,15 +1030,6 @@ fn run_restore(
         || screen.contains("Let's get started")
         || screen.contains("Let\u{2019}s get started");
     let reply = screen.contains("I am the local lab stub");
-    let resumed = after.as_ref().is_some_and(|(_, c)| *c == conv);
-    match &after {
-        Some((pid, c)) => println!(
-            "  agent     Claude Code pid {pid}, conversation {c}, registered {} after the relaunch came up ({} after the {how})",
-            since(t_up, t_agent),
-            since(t_end, t_agent)
-        ),
-        None => println!("  agent     NONE registered within 90 s of the relaunch"),
-    }
     println!(
         "  screen    {}; the earlier reply on it: {}",
         if onboarding {
@@ -973,11 +1063,13 @@ fn run_restore(
                     println!("  journal   {line}");
                 }
                 println!("  status    {}", door.out(&["status"]).trim());
-                let carry_on = carry_on_judged(
-                    &journal,
-                    aterm_agent::harness::relaunch::CARRIED_DONE,
-                    &status_word(&door, "autopilot"),
-                );
+                let carry_on = status_word(&door, "autopilot").and_then(|autopilot| {
+                    carry_on_judged(
+                        &journal,
+                        aterm_agent::harness::relaunch::CARRIED_DONE,
+                        &autopilot,
+                    )
+                });
                 let task = seen.last().map_or("?", String::as_str);
                 if task != "landed"
                     || !typed.is_empty()
@@ -1005,8 +1097,8 @@ fn run_restore(
                     println!("  journal   {line}");
                 }
                 println!("  status    {}", door.out(&["status"]).trim());
-                let carry_on =
-                    carry_on_judged(&journal, LAND_RESUMED, &status_word(&door, "autopilot"));
+                let carry_on = status_word(&door, "autopilot")
+                    .and_then(|autopilot| carry_on_judged(&journal, LAND_RESUMED, &autopilot));
                 if carry_on.is_err() || continued_typed(&rows) > 0 {
                     println!(
                         "restore {how} --land-open: FAIL: {}, carry-on line(s) typed {}",
@@ -1034,12 +1126,10 @@ fn run_restore(
         }
         let want = cruise_step(clear);
         let mode = if clear { " --clear" } else { "" };
-        if let Err(why) = cruise_judged(
-            &journal,
-            want,
-            continued_typed(&rows),
-            &status_word(&door, "autopilot"),
-        ) {
+        let typed = continued_typed(&rows);
+        let judged = status_word(&door, "autopilot")
+            .and_then(|autopilot| cruise_judged(&journal, want, typed, &autopilot));
+        if let Err(why) = judged {
             println!("  status    {}", door.out(&["status"]).trim());
             println!("restore {how}{mode}: FAIL: {why}");
             return Ok(Verdict::Failed);
@@ -1308,7 +1398,7 @@ mod tests {
             assert!(said.contains("carry-on settled on"), "{said}");
         }
         assert!(open(&[LAND_RESUMED], "cruise").is_err(), "not under Land");
-        assert!(open(&[LAND_RESUMED], "?").is_err(), "no status");
+        assert!(open(&[LAND_RESUMED], "?").is_err(), "no autopilot word");
         assert!(
             carry_on_judged(&lines(&[LAND_RESUMED]), CARRIED_DONE, "land").is_err(),
             "--land settles on done:said-done"
@@ -1317,6 +1407,52 @@ mod tests {
         for before in ["cruise", "off", "?"] {
             assert!(land_proves_the_journal(before).is_ok(), "{before}");
         }
+    }
+
+    #[test]
+    fn a_failed_reply_is_no_reading() {
+        let reply = |code: i32, stdout: &str, stderr: &str| -> Result<Reply, String> {
+            Ok(Reply {
+                code,
+                stdout: stdout.to_string(),
+                stderr: stderr.to_string(),
+            })
+        };
+        let status = "OK schema=1 hold=0 supervisor=aterm-harness@1 autopilot=land task=open\n";
+        assert_eq!(
+            status_word_of(reply(0, status, ""), "autopilot"),
+            Ok("land".to_string())
+        );
+        assert_eq!(
+            status_word_of(reply(0, status, ""), "task"),
+            Ok("open".to_string())
+        );
+        for failed in [
+            reply(1, "", "aterm-ctl: ERR no such session autopilot=land"),
+            reply(1, status, ""),
+            reply(0, "ERR no such session autopilot=land\n", ""),
+            reply(0, "", ""),
+            reply(0, "OK schema=1 hold=0 subject=autopilot%3Dland\n", ""),
+            Err("could not run aterm: No such file or directory".to_string()),
+        ] {
+            let why = status_word_of(failed, "autopilot").expect_err("failed");
+            assert!(why.starts_with("`status` "), "{why}");
+        }
+        let why = answered(
+            "harness ledger @s-1",
+            reply(1, "", "aterm harness ledger: denied\n"),
+        )
+        .expect_err("exit 1");
+        assert_eq!(
+            why,
+            "`harness ledger @s-1` exited 1: aterm harness ledger: denied"
+        );
+        let body = answered("text", reply(0, "ERR at the top row\n", ""));
+        assert_eq!(
+            body.map(|r| r.stdout),
+            Ok("ERR at the top row\n".to_string()),
+            "a body's first line is data, not a verdict"
+        );
     }
 
     #[test]
@@ -1356,7 +1492,7 @@ mod tests {
         );
         assert!(
             cruise_judged(&lines(&["continued"]), plain, 1, "?").is_err(),
-            "no status"
+            "no autopilot word"
         );
         assert_eq!(
             cruise_judged(

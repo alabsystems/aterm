@@ -1928,8 +1928,9 @@ fn verdict_line(spec: &VendorSpec, verdict: &Verdict) -> String {
             why,
             keeping: k,
         } => format!(
-            "atpkg: {p} {version} deferred: its signature check did not finish ({why}); the \
-             next pass checks it again — {}",
+            "atpkg: {p} {version} deferred: it waits for its {} ({why}); the next pass checks \
+             it again — {}",
+            crate::cli::SIGNATURE_WAIT_CLAUSE,
             keeping(*k)
         ),
         Verdict::Linked => format!("atpkg: {p} dev-linked — skipped"),
@@ -4184,6 +4185,11 @@ mod tests {
         }
         assert!(matches!(o.verdict, Verdict::Deferred { .. }), "{o:?}");
         assert!(!o.is_failure(), "a wait is never a failure");
+        assert_eq!(
+            crate::cli::left_for_next_pass(&format!("atpkg: codex current\n{}\n", o.line())),
+            [o.line()],
+            "the pass's line leaves claude for the next pass"
+        );
         assert_eq!(o.active_version(), Some(v("2.1.281")));
         assert_eq!(shim_build(&l, "claude"), Some(v("2.1.281").build_id()));
         let downloads = f.downloads.borrow().len();

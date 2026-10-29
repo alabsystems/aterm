@@ -21,11 +21,11 @@ pub const DEV_SEAMS: bool = cfg!(any(debug_assertions, feature = "dev-seams"));
 pub struct PackagesConfig {
     /// `[packages].prefix`: the install prefix override; absent ⇒ [`crate::store::default_prefix`].
     pub prefix: Option<String>,
-    /// `[packages].enabled`: Automatic updates (Settings ▸ Packages), read through [`Self::enabled`].
+    /// `[packages].enabled`: Settings ▸ Packages ▸ "Keep ALab tools up to date" ([`crate::adoption::UPDATES_SWITCH`]), read through [`Self::enabled`].
     pub enabled: Option<bool>,
     /// Retired, folded into `enabled`: `auto_update = false` is still honoured ([`Self::enabled`]) and doctor names the rename; Settings drops this key when it writes `enabled`.
     pub auto_update: Option<bool>,
-    /// `[packages].auto_install`: the install consent (Settings ▸ Packages, "Install the ALab toolset"), read through [`Self::auto_install`].
+    /// `[packages].auto_install`: the install consent (Settings ▸ Packages ▸ "Install ALab tools", [`crate::adoption::INSTALLS_SWITCH`]), read through [`Self::auto_install`].
     pub auto_install: Option<bool>,
     /// Retired, folded into `auto_install`: `seed_install = false` is still honoured when `auto_install` is unset ([`Self::auto_install`]), and doctor names the rename.
     pub seed_install: Option<bool>,
@@ -39,8 +39,9 @@ pub struct PackagesConfig {
     pub exclude: Option<Vec<String>>,
     /// `[packages].peers`: LAN peers (`host` or `host:port`) a toolset archive download races,
     /// each unit taken from a peer only when its bytes hash to the signed digest
-    /// ([`crate::peers`]).
-    pub peers: Vec<String>,
+    /// ([`crate::peers`]). Unwritten, this machine's fleet members ([`crate::peers::unit_peers`]);
+    /// `peers = []`, none.
+    pub peers: Option<Vec<String>>,
     /// `[packages.links]`: `name = "/path/to/checkout"` (or `~/…`) declares a managed dev link ([`crate::linkmode`]: registry management skipped; never in Settings); `name = "owner/repo"` declares a private-repo fetch override for that program's release assets (verification unchanged), a development setting ([`DEV_SEAMS`]).
     pub links: BTreeMap<String, String>,
     /// Not a config key (`#[serde(skip)]`, so no `aterm.toml` can set it): true only of the table [`parse_packages`] could not read ([`PackagesConfig::unreadable_table`]).
@@ -63,7 +64,7 @@ impl PackagesConfig {
             ..Self::default()
         }
     }
-    /// Automatic updates: `[packages].enabled`, default true.
+    /// Keep ALab tools up to date: `[packages].enabled`, default true, and off wherever the retired `auto_update = false` stands.
     #[must_use]
     pub fn enabled(&self) -> bool {
         self.enabled.unwrap_or(true) && self.auto_update != Some(false)
@@ -305,10 +306,15 @@ impl MachineConfig {
             None | Some("") | Some("off") => UniversalControlPolicy::Off,
             Some("leave") => UniversalControlPolicy::Leave,
             Some(other) => {
-                crate::notice::say(&format!(
-                    "[machine] universal_control = {other:?} is not \"off\" or \"leave\" — \
-                     leaving Universal Control alone"
-                ));
+                // A host's log keeps the value's length: it is the person's aterm.toml.
+                let tail = "is not \"off\" or \"leave\" — leaving Universal Control alone";
+                crate::notice::say_with_log(
+                    &format!("[machine] universal_control = {other:?} {tail}"),
+                    &format!(
+                        "[machine] universal_control = {} {tail}",
+                        aterm_log::words::Len(other)
+                    ),
+                );
                 UniversalControlPolicy::Leave
             }
         }
@@ -480,10 +486,11 @@ pub fn parse_packages_at(text: &str, dev_seams: bool, home: Option<&Path>) -> Pa
             // is said once for both tables ([`say_not_toml`]); only a shape error is this
             // table's.
             if !say_not_toml(text) {
-                crate::notice::say_once(&format!(
-                    "[packages] in aterm.toml: {e} \u{2014} updates continue; new programs \
-                     wait until it is fixed"
-                ));
+                let tail = "\u{2014} updates continue; new programs wait until it is fixed";
+                crate::notice::say_once_with_log(
+                    &format!("[packages] in aterm.toml: {e} {tail}"),
+                    &format!("[packages] in aterm.toml: {} {tail}", e.log_words()),
+                );
             }
             PackagesConfig::unreadable_table()
         }
@@ -493,20 +500,24 @@ pub fn parse_packages_at(text: &str, dev_seams: bool, home: Option<&Path>) -> Pa
 /// When `text` is not valid TOML, say so once for every table read from it and answer true: the parser fails the whole file, so a per-table line would blame a table that has nothing wrong with it.
 fn say_not_toml(text: &str) -> bool {
     match not_toml_note(text) {
-        Some(note) => {
-            crate::notice::say_once(&note);
+        Some((said, logged)) => {
+            crate::notice::say_once_with_log(&said, &logged);
             true
         }
         None => false,
     }
 }
 
-/// The one line for an `aterm.toml` that is not valid TOML, or `None` when it parses.
-fn not_toml_note(text: &str) -> Option<String> {
+/// The one line for an `aterm.toml` that is not valid TOML, or `None` when it parses: what a
+/// person reads (the error with the line that did not parse) and what a host's log keeps (the
+/// error's position, [`aterm_toml::Error::log_words`]).
+fn not_toml_note(text: &str) -> Option<(String, String)> {
     let e = aterm_toml::from_str::<aterm_toml::Value>(text).err()?;
-    Some(format!(
-        "aterm.toml is not valid TOML ({e}) \u{2014} updates continue; new programs and the \
-         [machine] settings wait until it is fixed"
+    let tail = "\u{2014} updates continue; new programs and the [machine] settings wait until \
+                it is fixed";
+    Some((
+        format!("aterm.toml is not valid TOML ({e}) {tail}"),
+        format!("aterm.toml is not valid TOML ({}) {tail}", e.log_words()),
     ))
 }
 
@@ -556,7 +567,10 @@ fn admit_packages(mut cfg: PackagesConfig, dev_seams: bool, home: Option<&Path>)
         crate::notice::say_spelling(note);
     }
     if let Some(ignored) = cfg.ignored_prefix.as_deref() {
-        crate::notice::say_spelling(&ignored_prefix_note(ignored));
+        crate::notice::say_spelling_with_log(
+            &ignored_prefix_note(ignored),
+            &ignored_prefix_note_logged(ignored),
+        );
     }
     cfg
 }
@@ -564,11 +578,21 @@ fn admit_packages(mut cfg: PackagesConfig, dev_seams: bool, home: Option<&Path>)
 /// What a person is told about a `[packages] prefix` this build ignores ([`PackagesConfig::ignored_prefix`]) — doctor's warn, Settings ▸ Packages' line and the load-time notice all say these words.
 #[must_use]
 pub fn ignored_prefix_note(prefix: &Path) -> String {
+    ignored_prefix_words(&prefix.display())
+}
+
+/// [`ignored_prefix_note`] as a host's log keeps it: the path the person wrote by its length,
+/// in the one template both forms fill.
+fn ignored_prefix_note_logged(prefix: &Path) -> String {
+    ignored_prefix_words(&aterm_log::words::Len(&prefix.display().to_string()))
+}
+
+/// The ignored-prefix notice's one template, filled with the prefix as a form shows it.
+fn ignored_prefix_words(prefix: &dyn std::fmt::Display) -> String {
     format!(
-        "[packages] prefix = {} is not used by this build — aterm keeps its packages in \
+        "[packages] prefix = {prefix} is not used by this build — aterm keeps its packages in \
          the one default store — so nothing is installed automatically until you remove \
-         the line (what that prefix holds is left as it is)",
-        prefix.display()
+         the line (what that prefix holds is left as it is)"
     )
 }
 
@@ -582,10 +606,12 @@ pub fn parse_machine(text: &str) -> MachineConfig {
             // CLI verdict, Settings' This Mac status and the `machine-state:` record say why
             // nothing is applied, rather than show a machine deliberately switched off.
             if !say_not_toml(text) {
-                crate::notice::say(&format!(
-                    "[machine] in aterm.toml: {e} \u{2014} its settings are not applied; \
-                     Universal Control and Rosetta 2 are left as they are"
-                ));
+                let tail = "\u{2014} its settings are not applied; Universal Control and Rosetta \
+                            2 are left as they are";
+                crate::notice::say_with_log(
+                    &format!("[machine] in aterm.toml: {e} {tail}"),
+                    &format!("[machine] in aterm.toml: {} {tail}", e.log_words()),
+                );
             }
             MachineConfig {
                 unreadable: true,
@@ -764,11 +790,109 @@ mod tests {
         );
         let broken = parse_machine("[machine\nnot toml");
         assert_eq!(broken.universal_control(), UniversalControlPolicy::Leave);
-        let note = not_toml_note("[packages]\nexclude = [\"ay\"]\n[window]\ntitle = \"x\n")
+        let (note, _) = not_toml_note("[packages]\nexclude = [\"ay\"]\n[window]\ntitle = \"x\n")
             .expect("an unclosed quote is not TOML");
         assert!(note.starts_with("aterm.toml is not valid TOML"), "{note}");
         assert!(!note.contains("[packages] in"), "{note}");
         assert_eq!(not_toml_note("[machine]\nuniversal_control = 1\n"), None);
+    }
+
+    /// A host's aterm.log keeps no value and no line of aterm.toml: the universal_control
+    /// value by its length, an error by its position ([`aterm_toml::Error::log_words`]), while a
+    /// verb's stderr still says them whole (DESIGN §3.6).
+    #[test]
+    fn a_hosts_log_keeps_no_aterm_toml_value_or_line() {
+        // Each text is said once per process ([`crate::notice::say_once_with_log`]), so every
+        // sink reads its own sentinel.
+        let texts = |n: u8| {
+            [
+                format!("[machine]\nuniversal_control = \"QZP7E7J{n}a\"\n"),
+                format!("[machine]\nrosetta = \"QZP7E7J{n}b\"\n"),
+                format!("[packages]\nexclude = \"QZP7E7J{n}c\"\n"),
+                format!("# x\nfont_family = \"QZP7E7J{n}d\n"),
+            ]
+        };
+        let run = |[control, machine, packages, broken]: [String; 4]| {
+            assert_eq!(
+                parse_machine(&control).universal_control(),
+                UniversalControlPolicy::Leave
+            );
+            assert!(parse_machine(&machine).unreadable);
+            let _ = parse_packages_at(&packages, false, None);
+            assert!(parse_machine(&broken).unreadable);
+        };
+        let host = crate::notice::heard::while_running(crate::notice::Sink::HostLog, || {
+            run(texts(1));
+        });
+        assert!(host.stderr.is_empty(), "a host's notice reached stderr");
+        for head in [
+            "[machine] universal_control = 9B is not \"off\" or \"leave\"",
+            "[machine] in aterm.toml: TOML error at line 2, column 11 ",
+            "[packages] in aterm.toml: TOML error at line 2, column 11 ",
+            "aterm.toml is not valid TOML (TOML error at line 2, column 25) ",
+        ] {
+            assert!(
+                host.log.iter().any(|line| line.starts_with(head)),
+                "the log names {head:?}: {} lines",
+                host.log.len()
+            );
+        }
+        assert!(
+            !host.log.iter().any(|line| line.contains("QZP7E7J")),
+            "a host's log keeps aterm.toml's text"
+        );
+        // A pass whose stderr the window copies into its aterm.log (the package lanes,
+        // [`crate::notice::STDERR_IS_HOST_LOG_ENV`]) prints the same log forms there.
+        let copied =
+            crate::notice::heard::while_running(crate::notice::Sink::HostReadStderr, || {
+                run(texts(4));
+            });
+        assert!(
+            copied.log.is_empty(),
+            "a copied stderr's notice is not logged"
+        );
+        for head in [
+            "atpkg: [machine] universal_control = 9B is not \"off\" or \"leave\"",
+            "atpkg: [machine] in aterm.toml: TOML error at line 2, column 11 ",
+            "atpkg: [packages] in aterm.toml: TOML error at line 2, column 11 ",
+            "atpkg: aterm.toml is not valid TOML (TOML error at line 2, column 25) ",
+        ] {
+            assert!(
+                copied.stderr.lines().any(|line| line.starts_with(head)),
+                "the copied stderr names {head:?}: {} lines",
+                copied.stderr.lines().count()
+            );
+        }
+        assert!(
+            !copied.stderr.contains("QZP7E7J"),
+            "a stderr the host's log reads keeps aterm.toml's text"
+        );
+        // CONTROL: a verb's stderr says every value and line whole.
+        let verb = crate::notice::heard::while_running(crate::notice::Sink::Stderr, || {
+            run(texts(2));
+        });
+        assert!(verb.log.is_empty(), "a verb's notice is not logged");
+        for planted in ["QZP7E7J2a", "QZP7E7J2b", "QZP7E7J2c", "QZP7E7J2d"] {
+            assert!(verb.stderr.contains(planted), "stderr says {planted}");
+        }
+
+        // The ignored prefix: Settings, doctor and a verb say the path, a host's log its length.
+        let prefix = Path::new("/opt/QZP7E7J3");
+        let logged = ignored_prefix_note_logged(prefix);
+        assert!(!logged.contains("QZP7E7J"), "the log form keeps the path");
+        assert_eq!(
+            logged,
+            ignored_prefix_note(prefix).replace("/opt/QZP7E7J3", "13B"),
+            "the log form is the said form with the path by its length"
+        );
+        // Both forms fill one template, so a path that shares text with the notice's own words
+        // is still the one thing the log form replaces.
+        let shared = Path::new("packages");
+        assert_eq!(
+            ignored_prefix_note_logged(shared),
+            ignored_prefix_note(shared).replacen("prefix = packages", "prefix = 8B", 1),
+            "the log form fills the template's place for the path, and only it"
+        );
     }
 
     #[test]
@@ -1016,7 +1140,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_config_falls_back_to_defaults() {
+    fn malformed_config_reads_as_unreadable_fail_closed() {
         let cfg = parse_packages("[packages\nnot toml");
         assert!(
             !cfg.auto_install(),

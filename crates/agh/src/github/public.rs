@@ -29,10 +29,21 @@ pub enum Probe {
     Unknown(String),
 }
 
+/// Rejects an empty, slash-empty, control-byte, or dot-segment `asset`.
+pub(crate) fn refuse_bad_asset(asset: &str) -> Result<()> {
+    path::refuse_dot_segment("asset", asset)?;
+    if asset.split('/').any(str::is_empty) || asset.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(Error::usage(format!(
+            "asset \"{asset}\" is empty or holds an empty or control-byte part: no release can have it"
+        )));
+    }
+    Ok(())
+}
+
 /// `/{o}/{r}/releases/download/{tag}/{asset}`, each part one encoded segment.
 fn web_path(slug: &Slug, tag: &str, asset: &str) -> Result<String> {
     path::refuse_bad_tag(tag)
-        .and_then(|()| path::refuse_dot_segment("asset", asset))
+        .and_then(|()| refuse_bad_asset(asset))
         .map_err(|e| e.with_repo(slug.to_string()))?;
     Ok(format!(
         "/{}/{}/releases/download/{}/{}",
@@ -68,7 +79,7 @@ impl<'a> Public<'a> {
             .retry(Some(RetryPolicy::NONE));
         match self.gh.call(&call) {
             Ok(answered) => match answered.status {
-                200 | 302 => Probe::Present,
+                200 | 302 | 307 => Probe::Present,
                 404 => Probe::Absent,
                 status => Probe::Unknown(format!("the download host answered {status}")),
             },
@@ -81,9 +92,9 @@ impl<'a> Public<'a> {
     /// # Errors
     ///
     /// Usage, before any request, for a tag `path::refuse_bad_tag` refuses (empty, an empty
-    /// `/`-part, or a `.` or `..` part) or an asset with a `.` or `..` `/`-part
-    /// (`web_path`); Invalid over `cap` (the part file deleted); NotFound for a 404; the
-    /// call's or the write's error.
+    /// `/`-part, or a `.` or `..` part) or an asset `refuse_bad_asset` refuses (empty, an empty
+    /// or control-byte part, or a `.` or `..` `/`-part in `web_path`); Invalid over `cap` (the
+    /// part file deleted); NotFound for a 404; the call's or the write's error.
     pub fn fetch(
         &self,
         slug: &Slug,

@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::ai::connector::{AGY, CLAUDE, CODEX, GROK, MUSE};
+use crate::ai::connector::{AGY, CLAUDE, CODEX, GROK, KIMI, MUSE};
 use crate::ai::facts::{ClaudeAccounts, Managed};
 use crate::ai::permission::Level;
 use crate::ai::state::{Mark, State};
@@ -187,6 +187,7 @@ fn facts_of(c: &'static Connector, shim: PathBuf) -> Facts {
         }),
         foreign: None,
         home: Ok(PathBuf::from("/home/me/.x")),
+        home_var: None,
         home_exists: true,
         login_file: None,
         hidden_store: false,
@@ -208,6 +209,8 @@ fn row_of(c: &'static Connector, state: State) -> Row {
         mark: Mark::Ok,
         fact: "signed in".into(),
         fix: None,
+        mend: None,
+        actor: None,
         version: Some("1.0".into()),
         plan: None,
         used: None,
@@ -337,6 +340,7 @@ fn a_reviewer_runs_from_its_shim_in_the_repository_with_the_askers_environment_a
         label: "main".into(),
         listed: false,
         refused: None,
+        unread: None,
         renews: true,
         login: Some("/state/accounts/logins/main+1".into()),
         made: true,
@@ -345,7 +349,11 @@ fn a_reviewer_runs_from_its_shim_in_the_repository_with_the_askers_environment_a
         limited_until: None,
         served_at: None,
         renewed_at: None,
+        signed_out_at: None,
         next_sign_in: None,
+        tried: None,
+        unattended: true,
+        off: None,
     });
     let facts = vec![claude, facts_of(&CODEX, b.pkg.agents_dir().join("codex"))];
     let rows = [row_of(&CLAUDE, State::Ok), row_of(&CODEX, State::Ok)];
@@ -814,6 +822,12 @@ fn a_review_auth_completion_still_records_the_login_it_started_under() {
 
 /// The arguments `c` reviews with at `level`.
 fn args_at(c: &'static Connector, level: Level) -> Vec<String> {
+    let (_, mut calls) = review_at(c, level);
+    calls.pop().expect("ran")
+}
+
+/// What a review at `level` that asks `c` alone answers, and the arguments of each run it made.
+fn review_at(c: &'static Connector, level: Level) -> (Vec<Answer>, Vec<Vec<String>>) {
     let b = machine(&[c.id]);
     let store = Store::at(&b.state);
     let facts = vec![facts_of(c, b.pkg.agents_dir().join(c.id))];
@@ -838,8 +852,11 @@ fn args_at(c: &'static Connector, level: Level) -> Vec<String> {
         budget: Duration::from_secs(5),
         level,
     };
-    let _ = run_review(&host, &cands, &facts, &ask);
-    runner.calls().pop().expect("ran").args
+    let answers = run_review(&host, &cands, &facts, &ask);
+    (
+        answers,
+        runner.calls().into_iter().map(|call| call.args).collect(),
+    )
 }
 
 #[test]
@@ -880,7 +897,11 @@ fn each_reviewer_runs_at_the_level_in_its_own_flags() {
         let args = args_at(c, level);
         assert!(has(&args, want), "{} at {}: {args:?}", c.id, level.word());
     }
-    for c in crate::ai::connector::ROWS.iter().copied() {
+    for c in crate::ai::connector::ROWS
+        .iter()
+        .copied()
+        .filter(|c| c.review.only_at.is_none_or(|only| only == Level::Ask))
+    {
         let args = args_at(c, Level::Ask);
         assert!(
             !args
@@ -912,6 +933,101 @@ fn each_reviewer_runs_at_the_level_in_its_own_flags() {
     let yolo = muse.iter().position(|a| a == "--yolo").expect("--yolo");
     let exec = muse.iter().position(|a| a == "exec").expect("exec");
     assert!(yolo < exec, "{muse:?}");
+}
+
+/// KIMI CODE REVIEWS AT YOLO ALONE, WITH NO LEVEL FLAG: 2.3.3's `-p` forces Never Ask and exits 1
+/// on `--yolo`, `--auto` or `--plan` beside it (`docs/measured/kimi-review-2026-10-27.md` §4),
+/// so at yolo it runs `--output-format text -p <pointer to request.txt>`, and at edits, ask or
+/// plan, which nothing would hold it to, it is skipped with why and never run.
+#[test]
+fn kimi_reviews_at_yolo_alone_with_no_level_flag() {
+    let yolo = args_at(&KIMI, Level::Yolo);
+    assert_eq!(yolo.len(), 4, "{yolo:?}");
+    assert_eq!(yolo[..3], ["--output-format", "text", "-p"], "{yolo:?}");
+    assert!(
+        yolo[3].starts_with("Read the file /") && yolo[3].contains("request.txt"),
+        "the prompt points at the request by its absolute path: {yolo:?}"
+    );
+    for flag in ["--yolo", "--auto", "--plan", "-y", "--add-dir"] {
+        assert!(!yolo.iter().any(|a| a == flag), "{flag}: {yolo:?}");
+    }
+    for level in [Level::Edits, Level::Ask, Level::Plan] {
+        let (answers, calls) = review_at(&KIMI, level);
+        assert!(calls.is_empty(), "{} ran kimi: {calls:?}", level.word());
+        assert_eq!(answers.len(), 1, "{answers:?}");
+        assert_eq!(answers[0].verdict, Verdict::Skipped, "{answers:?}");
+        assert_eq!(
+            answers[0].why.as_deref(),
+            Some(
+                format!(
+                    "its one-shot mode runs at yolo alone, and this review is at {}",
+                    level.word()
+                )
+                .as_str()
+            )
+        );
+    }
+    // CONTROL: a row its flags hold to each level runs at every one.
+    for level in [Level::Yolo, Level::Edits, Level::Ask, Level::Plan] {
+        assert_eq!(review_at(&GROK, level).1.len(), 1, "{}", level.word());
+    }
+}
+
+/// KIMI CODE'S REVIEW VERDICTS READ 2.3.3'S OWN FAILURES (`kimi-review-2026-10-27.md` §3): a
+/// managed login with no token and a home with no model are its login (Auth), a quota kimi gave
+/// up on is its limit (Limit), and a hand-written provider's missing key or 401 is a failure of
+/// its own (Failed). A served answer that quotes a wall is served.
+#[test]
+fn kimi_review_verdicts_read_its_measured_failures() {
+    let failed = |line: &str| {
+        Ok(ran(
+            1,
+            "",
+            &format!(
+                "kimi version 2.3.3\nerror: failed to run prompt: {line}\nSee log: \
+                 /h/.kimi-code/logs/kimi-code.log\n"
+            ),
+        ))
+    };
+    for (line, want) in [
+        (
+            "provider managed:kimi-code has no credential configured",
+            Verdict::Auth,
+        ),
+        (
+            "No model configured. Run `kimi` and use /login to sign in, then retry; or set \
+             default_model in config.toml.",
+            Verdict::Auth,
+        ),
+        (
+            "Stored token for \"kimi-code\" was rejected; re-login required.",
+            Verdict::Auth,
+        ),
+        (
+            "provider.rate_limit: 429 You exceeded your current quota, please check your plan \
+             and billing details.",
+            Verdict::Limit,
+        ),
+        (
+            "provider home has no credential configured",
+            Verdict::Failed,
+        ),
+        (
+            "provider.auth_error: 401 Invalid Authentication",
+            Verdict::Failed,
+        ),
+    ] {
+        assert_eq!(
+            verdict_of(&KIMI, &failed(line), None, "n", "review the change").0,
+            want,
+            "{line}"
+        );
+    }
+    let quoted = "\u{2022} Finding: \"You exceeded your current quota\" is matched too loosely.";
+    assert_eq!(
+        verdict_of(&KIMI, &Ok(ran(0, quoted, "")), Some(quoted), "n", "").0,
+        Verdict::Served
+    );
 }
 
 #[test]
@@ -976,6 +1092,51 @@ fn a_live_limit_skips_a_cli_whatever_its_state() {
     );
     let got = candidates(&reviewers, None, "codex", &rows, 1_800_001_000);
     assert!(got[0].1.is_none());
+}
+
+/// A SKIPPED REVIEWER NAMES WHAT A PERSON DOES FIRST: a signed-out Claude Code row whose sign-in
+/// starts nothing until a person mends accounts.toml ([`Row::mend`], no [`Row::fix`]) is skipped
+/// with that step as its fix, and runs nothing. CONTROL: a signed-out row with a command keeps
+/// the command.
+#[test]
+fn a_skipped_reviewer_names_what_a_person_does_first() {
+    let b = machine(&["claude"]);
+    let store = Store::at(&b.state);
+    let facts = vec![facts_of(&CLAUDE, b.pkg.agents_dir().join("claude"))];
+    let step = "mend accounts.toml (`aterm harness accounts` says how), then sign claude in";
+    for (fix, mend, want) in [
+        (None, Some(step), step),
+        (Some("aterm ai login claude"), None, "aterm ai login claude"),
+    ] {
+        let mut row = row_of(&CLAUDE, State::SignedOut);
+        row.fix = fix.map(str::to_string);
+        row.mend = mend.map(str::to_string);
+        let rows = [row];
+        let reviewers: Vec<&'static Connector> = vec![&CLAUDE];
+        let cands = candidates(&reviewers, None, "codex", &rows, 0);
+        let runner = FakeRunner::with(|_| Ok(ran(0, "fine", "")));
+        let none = |_: &str| None;
+        let now = || 0;
+        let host = Host {
+            runner: &runner,
+            var: &none,
+            vars: &[],
+            store: &store,
+            now: &now,
+        };
+        let ask = Ask {
+            change: &change(),
+            asker: "codex",
+            words: None,
+            count: 1,
+            budget: Duration::from_secs(5),
+            level: Level::Yolo,
+        };
+        let answers = run_review(&host, &cands, &facts, &ask);
+        assert!(runner.calls().is_empty(), "{want}: {:?}", runner.calls());
+        assert_eq!(answers[0].verdict, Verdict::Skipped, "{answers:?}");
+        assert_eq!(answers[0].fix.as_deref(), Some(want), "{answers:?}");
+    }
 }
 
 fn scripted_claude_answer(exit: i32, stdout: String, stderr: String) -> Answer {
@@ -1247,6 +1408,154 @@ fn a_pooled_codex_reviewer_exports_serving_auth_path_unless_custom_home_or_keyri
     );
 }
 
+/// Writes `b`'s atpkg launcher for Codex to exec a codex-alab package laid beside it
+/// ([`crate::harness::codex_alab::lay_package`]), one that keeps `CODEX_AUTH_PATH`'s login where
+/// `reads`.
+fn alab_launcher(b: &crate::ai::testing::Box3, reads: bool) {
+    let exe = crate::harness::codex_alab::lay_package(&b.dir.path().join("store/codex"), reads);
+    std::fs::write(
+        b.pkg.agents_dir().join("codex"),
+        format!("#!/bin/sh\nexec '{}' \"$@\"\n", exe.display()),
+    )
+    .expect("launcher");
+}
+
+/// A POOLED CODEX REVIEW ON A ROW OF ITS OWN RUNS ONLY ON A BUILD THAT KEEPS `CODEX_AUTH_PATH`'S
+/// LOGIN ITS OWN: one that does not (OpenAI's, an older codex-alab, or a launcher that names no
+/// build) would review on the default login while the pool counted the outcome as the row's, so
+/// nothing is run, and the answer names the pin of the default row as its fix where that row can
+/// serve. Where it stands at a wall, the answer says so and offers no pin (the next read of the
+/// wall would end it). The default row's review needs no such build.
+#[test]
+fn a_pooled_codex_review_on_a_row_of_its_own_needs_a_build_that_reads_codex_auth_path() {
+    use crate::ai::facts::CliAccounts;
+    use crate::harness::codex_alab::DefaultRow;
+
+    let b = machine(&["codex"]);
+    let store = Store::at(&b.state);
+    let serves = DefaultRow::Serves("main".into());
+    let on_with = |login: Option<&str>, default: &DefaultRow| {
+        let mut f = facts_of(&CODEX, b.pkg.agents_dir().join("codex"));
+        f.pool = Some(CliAccounts {
+            roster: PathBuf::from("/config/accounts-codex.toml"),
+            rows: 2,
+            enrolled: 1,
+            serving_label: Some("work".into()),
+            default_label: Some("main".into()),
+            default_row: Some(default.clone()),
+            serving_login: Some(("CODEX_AUTH_PATH", login.map(str::to_string))),
+            ..CliAccounts::default()
+        });
+        vec![f]
+    };
+    let on = |login: Option<&str>| on_with(login, &serves);
+    let rows = [row_of(&CODEX, State::Idle)];
+    let reviewers: Vec<&'static Connector> = vec![&CODEX];
+    let cands = candidates(&reviewers, None, "claude", &rows, 0);
+    let var = |k: &str| (k == "HOME").then(|| "/home/me".to_string());
+    let now = || 1_800_000_000;
+    let runner = FakeRunner::with(|call| {
+        if let Some(out) = call
+            .args
+            .windows(2)
+            .find_map(|w| (w[0] == "-o").then_some(&w[1]))
+        {
+            std::fs::write(out, "no findings").expect("write answer");
+        }
+        Ok(ran(0, "", ""))
+    });
+    let host = Host {
+        runner: &runner,
+        var: &var,
+        vars: &[],
+        store: &store,
+        now: &now,
+    };
+    let review = |facts: &[Facts]| {
+        run_review(
+            &host,
+            &cands,
+            facts,
+            &Ask {
+                change: &change(),
+                asker: "claude",
+                words: None,
+                count: 1,
+                budget: Duration::from_secs(5),
+                level: Level::Yolo,
+            },
+        )
+    };
+    let row_login = "/state/logins/codex/work/auth.json";
+    for (what, reads) in [("names no build", None), ("old codex-alab", Some(false))] {
+        if let Some(reads) = reads {
+            alab_launcher(&b, reads);
+        }
+        let answers = review(&on(Some(row_login)));
+        assert_eq!(answers[0].verdict, Verdict::Failed, "{what}");
+        assert_eq!(
+            answers[0].fix.as_deref(),
+            Some("aterm harness accounts use main --cli codex"),
+            "{what}: {:?}",
+            answers[0].why
+        );
+        assert!(runner.calls().is_empty(), "{what}: nothing runs");
+    }
+    let walled = DefaultRow::Walled {
+        label: "main".into(),
+        window: "five_hour".into(),
+        reset: Some(1_800_003_600),
+        until: 1_800_003_750,
+    };
+    let answers = review(&on_with(Some(row_login), &walled));
+    let why = answers[0].why.as_deref().unwrap_or_default();
+    assert_eq!(answers[0].verdict, Verdict::Failed);
+    assert_eq!(answers[0].fix, None, "no pin of a walled row: {why}");
+    assert!(
+        why.contains("aterm pkg update codex") && !why.contains("accounts use"),
+        "{why}"
+    );
+    assert!(runner.calls().is_empty(), "nothing runs");
+    // Where the owner's pin holds the review to `work`, `main` serves only once that pin ends
+    // (its own pin, after its wall ends, or the pin's end) and its wall ends, never by itself.
+    let mut pinned = on_with(Some(row_login), &walled);
+    if let Some(pool) = pinned[0].pool.as_mut() {
+        pool.pinned = Some("work".into());
+    }
+    let answers = review(&pinned);
+    let why = answers[0].why.as_deref().unwrap_or_default();
+    assert_eq!(answers[0].verdict, Verdict::Failed);
+    assert_eq!(
+        answers[0].fix, None,
+        "no pin of a walled row before its wall ends: {why}"
+    );
+    assert!(
+        why.contains(&crate::harness::codex_alab::unread_fix(Some("main")))
+            && why.contains(&crate::harness::usage::rfc3339_utc(1_800_003_750)),
+        "{why}"
+    );
+    assert!(runner.calls().is_empty(), "nothing runs");
+    let answers = review(&on(None));
+    assert_eq!(
+        answers[0].verdict,
+        Verdict::Served,
+        "the default row's review"
+    );
+    assert_eq!(runner.calls().len(), 1);
+    alab_launcher(&b, true);
+    let answers = review(&on(Some(row_login)));
+    assert_eq!(answers[0].verdict, Verdict::Served, "{:?}", answers[0].why);
+    let calls = runner.calls();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        calls[1]
+            .env
+            .contains(&("CODEX_AUTH_PATH".to_string(), row_login.to_string())),
+        "{:?}",
+        calls[1].env
+    );
+}
+
 #[test]
 fn a_pooled_codex_review_limit_marks_only_the_serving_account_so_the_next_account_serves() {
     use crate::ai::facts::{Machine, gather};
@@ -1255,6 +1564,7 @@ fn a_pooled_codex_review_limit_marks_only_the_serving_account_so_the_next_accoun
     use crate::harness::accounts::{self, Cli, Store as AccountStore};
 
     let b = machine(&["codex"]);
+    alab_launcher(&b, true);
     let now_val = 1_800_000_000_i64;
     let config = b.dir.path().join("config");
     std::fs::create_dir_all(&config).expect("config");
@@ -1319,6 +1629,8 @@ fn a_pooled_codex_review_limit_marks_only_the_serving_account_so_the_next_accoun
         records: store.load().unwrap_or_else(|_| Records::default()),
         harness_state: Some(b.state.clone()),
         roster: Some(claude_roster.clone()),
+        accounts_mode: None,
+        config: None,
     };
     let f1 = gather(&m1, &CODEX);
     assert_eq!(
@@ -1413,4 +1725,430 @@ fn a_pooled_codex_review_limit_marks_only_the_serving_account_so_the_next_accoun
         store.load().expect("ai store").of("codex").used_at,
         Some(now_val)
     );
+}
+
+/// A pool of `cli`'s on a fresh machine: `main`, this machine's own login, and `work`, a login of
+/// its own, both signed in here, beside its roster in `config`. For Codex, `reads` lays atpkg's
+/// launcher onto a codex-alab that keeps `CODEX_AUTH_PATH`'s login (`true`) or one from before
+/// it (`false`).
+struct ReviewPool {
+    b: crate::ai::testing::Box3,
+    config: PathBuf,
+    cli: crate::harness::accounts::Cli,
+}
+
+impl ReviewPool {
+    const NOW: i64 = 1_800_000_000;
+
+    fn new(cli: crate::harness::accounts::Cli, reads: Option<bool>) -> ReviewPool {
+        let c = cli.connector();
+        let b = machine(&[c.id]);
+        if let Some(reads) = reads {
+            alab_launcher(&b, reads);
+        }
+        let config = b.dir.path().join("config");
+        std::fs::create_dir_all(&config).expect("config");
+        let pool = ReviewPool { b, config, cli };
+        let store = c.stores.first().copied().expect("a login file");
+        let default = pool.b.home.join(cli.accounts().default_home).join(store);
+        for login in [&default, &pool.work().join(store)] {
+            std::fs::create_dir_all(login.parent().expect("parent")).expect("login home");
+            std::fs::write(login, "{}").expect("stand-in login");
+        }
+        pool.roster(None);
+        pool
+    }
+
+    /// `work`'s own login home.
+    fn work(&self) -> PathBuf {
+        self.b
+            .home
+            .join(".aterm/logins")
+            .join(self.cli.id())
+            .join("work")
+    }
+
+    /// The roster of `main` and `work`, `main` held for the warm set of the Mac `held_by` names.
+    fn roster(&self, held_by: Option<&str>) {
+        use crate::harness::accounts;
+        // Kimi Code's rows name the account system their email belongs to.
+        let vendor = accounts::Vendor {
+            region: (self.cli == accounts::Cli::Kimi)
+                .then_some(crate::ai::connector::Region::Global),
+            ..accounts::Vendor::default()
+        };
+        let rows = [
+            accounts::Row {
+                label: "main".into(),
+                email: Some("owner@example.com".into()),
+                held_by: held_by.map(str::to_string),
+                vendor,
+                ..accounts::Row::default()
+            },
+            accounts::Row {
+                label: "work".into(),
+                email: Some("work@example.com".into()),
+                dir: Some(self.work().display().to_string()),
+                vendor,
+                ..accounts::Row::default()
+            },
+        ];
+        let text = accounts::append_rows_for(self.cli, "", &rows).expect("the rows admit");
+        std::fs::write(self.config.join(self.cli.accounts().roster_file), text).expect("roster");
+    }
+
+    fn store(&self) -> crate::harness::accounts::Store {
+        crate::harness::accounts::Store::at_for(&self.b.state, self.cli, &self.b.home)
+    }
+
+    fn state(&self, change: impl FnOnce(&mut crate::harness::accounts::State)) {
+        self.store()
+            .transact(Self::NOW, &mut None, |state| {
+                change(state);
+                Ok(Vec::new())
+            })
+            .expect("state");
+    }
+
+    fn pin(&self, label: &str) {
+        self.state(|state| {
+            state.active = Some(label.to_string());
+            state.pinned = true;
+        });
+    }
+
+    fn wall(&self, label: &str) {
+        let now = Self::NOW;
+        self.state(|state| {
+            crate::harness::accounts::note_wall(
+                state,
+                label,
+                "five_hour",
+                Some(now + 3600),
+                now - 60,
+                now,
+            );
+        });
+    }
+
+    /// The roster of `main` alone.
+    fn main_alone(&self) {
+        use crate::harness::accounts;
+        let row = accounts::Row {
+            label: "main".into(),
+            email: Some("owner@example.com".into()),
+            vendor: accounts::Vendor {
+                region: (self.cli == accounts::Cli::Kimi)
+                    .then_some(crate::ai::connector::Region::Global),
+                ..accounts::Vendor::default()
+            },
+            ..accounts::Row::default()
+        };
+        let text = accounts::append_rows_for(self.cli, "", &[row]).expect("the row admits");
+        std::fs::write(self.config.join(self.cli.accounts().roster_file), text).expect("roster");
+    }
+
+    /// `main` signed out here.
+    fn main_signed_out(&self) {
+        self.state(|state| {
+            let _ = crate::harness::accounts::note_auth(
+                state,
+                "main",
+                crate::harness::accounts::Auth::SignedOut,
+                Self::NOW,
+            );
+        });
+    }
+
+    /// `work` with no login here, as `accounts add` leaves it.
+    fn work_signed_out(&self) {
+        let work = self.work();
+        std::fs::remove_dir_all(&work).expect("work's login");
+        std::fs::create_dir_all(&work).expect("an empty home");
+    }
+
+    /// The Codex a launch aterm makes runs on this machine (`worker::codex_launch_program`, from
+    /// its atpkg layout); `None` for another CLI.
+    fn program(&self) -> Option<PathBuf> {
+        (self.cli == crate::harness::accounts::Cli::Codex).then(|| {
+            crate::harness::worker::codex_launch_program_in(Some(&self.b.pkg.agents_dir()))
+        })
+    }
+
+    /// What a launch of the pool's CLI takes (`accounts_pool::launch_env_for`), reading no usage.
+    fn launch(&self) -> Result<Option<crate::harness::accounts_pool::LoginEnv>, String> {
+        let seat = crate::harness::accounts_pool::Seat {
+            config_dir: &self.config,
+            state: &self.b.state,
+            home: &self.b.home,
+            now: Self::NOW,
+        };
+        let unread = |_: crate::harness::accounts::Cli, _: &Path, _: Option<&str>, _: i64| None;
+        crate::harness::accounts_pool::launch_env_for(
+            &seat,
+            self.cli,
+            &unread,
+            self.program().as_deref(),
+        )
+    }
+
+    /// The facts `aterm ai review --with <cli>` reads of the pool's CLI.
+    fn facts(&self) -> Facts {
+        use crate::ai::facts::{Machine, gather};
+        let home = self.b.home.display().to_string();
+        let var = |k: &str| (k == "HOME").then(|| home.clone());
+        let m = Machine {
+            now: Self::NOW,
+            home: Some(self.b.home.clone()),
+            var: &var,
+            pkg: Some(self.b.pkg.clone()),
+            exclude: Vec::new(),
+            records: Store::at(&self.b.state).load().unwrap_or_default(),
+            harness_state: Some(self.b.state.clone()),
+            roster: Some(self.config.join("accounts.toml")),
+            accounts_mode: None,
+            config: None,
+        };
+        gather(&m, self.cli.connector())
+    }
+
+    /// What `aterm ai review --with <cli>` answers, and the environment of each run it made.
+    fn review(&self) -> (Answer, Vec<Vec<(String, String)>>) {
+        let c = self.cli.connector();
+        let home = self.b.home.display().to_string();
+        let vars = vec![("HOME".to_string(), home.clone())];
+        let var = |k: &str| (k == "HOME").then(|| home.clone());
+        let store = Store::at(&self.b.state);
+        let facts = vec![self.facts()];
+        let rows = [crate::ai::state::assess(&facts[0], true, Self::NOW)];
+        let reviewers: Vec<&'static Connector> = vec![c];
+        let cands = candidates(&reviewers, Some(&[c.id]), "claude", &rows, Self::NOW);
+        let runner = FakeRunner::with(|call| {
+            if let Some(out) = call
+                .args
+                .windows(2)
+                .find_map(|w| (w[0] == "-o").then_some(&w[1]))
+            {
+                std::fs::write(out, "no findings").expect("write answer");
+            }
+            Ok(ran(0, "no findings", ""))
+        });
+        let now = || Self::NOW;
+        let host = Host {
+            runner: &runner,
+            var: &var,
+            vars: &vars,
+            store: &store,
+            now: &now,
+        };
+        let mut answers = run_review(
+            &host,
+            &cands,
+            &facts,
+            &Ask {
+                change: &change(),
+                asker: "claude",
+                words: None,
+                count: 1,
+                budget: Duration::from_secs(5),
+                level: Level::Yolo,
+            },
+        );
+        assert_eq!(answers.len(), 1, "{answers:?}");
+        let envs = runner.calls().into_iter().map(|call| call.env).collect();
+        (answers.remove(0), envs)
+    }
+}
+
+/// One state of a pool a review is judged in: its name, and how it is set on a fresh pool.
+type ReviewCase = (&'static str, fn(&ReviewPool));
+
+/// THE STATES OF A POOL A REVIEW IS JUDGED IN, UNDER ROTATION (`early`) AND WITH ROTATION OFF: no
+/// pin; `main` held for another Mac's warm set, which a launch passes over; the pin on either
+/// row; on `work` with no login of it here; on a label the roster does not list; `main` walled;
+/// both walled; `main` recorded signed out; and the pin on `work` while another Mac's claim
+/// holds it.
+fn review_cases() -> [ReviewCase; 10] {
+    [
+        ("no pin", |_| {}),
+        ("main held for another Mac", |pool| {
+            pool.roster(Some("other-mac"));
+        }),
+        ("pin on work", |pool| pool.pin("work")),
+        ("pin on main", |pool| pool.pin("main")),
+        ("pin on work, not signed in here", |pool| {
+            pool.pin("work");
+            pool.work_signed_out();
+        }),
+        ("pin on a label not listed", |pool| pool.pin("gone")),
+        ("main walled", |pool| pool.wall("main")),
+        ("both walled", |pool| {
+            pool.wall("main");
+            pool.wall("work");
+        }),
+        ("main signed out", ReviewPool::main_signed_out),
+        ("pin on work, which another Mac claims", |pool| {
+            pool.pin("work");
+            let now = ReviewPool::NOW;
+            pool.state(|state| state.note_lease("work", "other-mac", now + 3600, now));
+        }),
+    ]
+}
+
+/// `aterm ai review` OF A POOLED CLI RUNS UNDER THE ROW A LAUNCH TAKES, AND NOT AT ALL WHERE THE
+/// LAUNCH IS REFUSED: for Kimi Code, Grok Build and Codex (on a codex-alab that keeps
+/// `CODEX_AUTH_PATH`'s login and on one from before it), in each of [`review_cases`] under
+/// rotation and with it off, a launch that takes a row (`accounts_pool::launch_env_for`) has its
+/// review run once under that row's login (the seam's variable naming it, or unset for this
+/// machine's own login); one that takes no row has it run on this machine's own login; and one
+/// that is refused runs no reviewer, whose answer gives the launch's reason (or, at a wall, the
+/// limit or sign-out it is skipped for). With rotation off, which reads no usage, a launch runs
+/// into a wall or a sign-out the records show on the login it runs on (`main`'s, with no pin),
+/// and the review is skipped for that limit or sign-out; and a pin another Mac's claim holds is
+/// refused there as the launch refuses it. Before, a pin on a row not signed in here, or on a
+/// label not listed,
+/// refused every launch while the review ran on another row or on this machine's own login, and
+/// with `main` held for another Mac a launch took `work` while the review ran on `main`.
+#[test]
+fn a_pooled_review_takes_what_a_launch_takes() {
+    use crate::harness::accounts::Cli;
+    use crate::harness::accounts_pool::NO_WORKER;
+    let mut seen = std::collections::BTreeSet::new();
+    for (cli, reads) in [
+        (Cli::Kimi, None),
+        (Cli::Grok, None),
+        (Cli::Codex, Some(true)),
+        (Cli::Codex, Some(false)),
+    ] {
+        for off in [false, true] {
+            for (case, set) in review_cases() {
+                let at = format!("{} on {reads:?}, off={off}, {case}", cli.id());
+                let ready = || {
+                    let pool = ReviewPool::new(cli, reads);
+                    if off {
+                        std::fs::write(
+                            pool.config.join("aterm.toml"),
+                            "[harness]\naccounts = \"off\"\n",
+                        )
+                        .expect("aterm.toml");
+                    }
+                    set(&pool);
+                    pool
+                };
+                let reviewed = ready();
+                let (answer, envs) = reviewed.review();
+                let launched = ready();
+                let launch = launched.launch();
+                // Each pool's own folder, so the two pools' words compare.
+                let rooted = |pool: &ReviewPool, text: &str| {
+                    text.replace(&pool.b.dir.path().display().to_string(), "<root>")
+                };
+                let var = cli.accounts().seam.var();
+                let carried = |env: &[(String, String)]| {
+                    env.iter()
+                        .find(|(name, _)| name == var)
+                        .map(|(_, value)| value.clone())
+                };
+                // What the records show on the login a launch takes: a wall, or a sign-out.
+                let stops = |pool: &ReviewPool| {
+                    let facts = pool.facts();
+                    if facts.limited_until.is_some() {
+                        Some("a row at a wall")
+                    } else {
+                        (crate::ai::state::assess(&facts, true, ReviewPool::NOW).state
+                            == crate::ai::state::State::SignedOut)
+                            .then_some("a row signed out")
+                    }
+                };
+                match &launch {
+                    // Rotation off reads no usage, so its launch runs into a wall or a sign-out
+                    // the records show on the login it runs on; the review is skipped for it.
+                    Ok(_) if off && stops(&reviewed).is_some() => {
+                        seen.insert(stops(&reviewed).unwrap_or_default());
+                        assert_eq!(answer.verdict, Verdict::Skipped, "{at}: {answer:?}");
+                        assert!(envs.is_empty(), "{at}: no reviewer runs: {envs:?}");
+                    }
+                    Ok(pick) => {
+                        seen.insert(if pick.is_some() { "a row" } else { "no row" });
+                        assert_eq!(answer.verdict, Verdict::Served, "{at}: {answer:?}");
+                        assert_eq!(envs.len(), 1, "{at}: one run");
+                        // The row's login as the reviewed pool's roster names it.
+                        let want = pick.as_ref().and_then(|pick| {
+                            let roster = crate::harness::accounts::Roster::load_for(
+                                cli,
+                                &reviewed.config.join(cli.accounts().roster_file),
+                            )
+                            .expect("roster");
+                            let row = roster.row(&pick.label).expect("the launch's row");
+                            crate::harness::accounts::login_env_for(cli, row).1
+                        });
+                        assert_eq!(carried(&envs[0]), want, "{at}: {launch:?}");
+                    }
+                    Err(refused) => {
+                        seen.insert("refused");
+                        assert!(envs.is_empty(), "{at}: no reviewer runs: {envs:?}");
+                        assert_ne!(answer.verdict, Verdict::Served, "{at}");
+                        let why = answer.why.as_deref().unwrap_or_default();
+                        if answer.verdict == Verdict::Skipped {
+                            assert!(
+                                stops(&reviewed).is_some(),
+                                "{at}: skipped for its limit or sign-out: {why}"
+                            );
+                        } else {
+                            let refused = refused.strip_suffix(NO_WORKER).unwrap_or(refused);
+                            let (why, refused) =
+                                (rooted(&reviewed, why), rooted(&launched, refused));
+                            assert!(why.contains(&refused), "{at}: {why} / {refused}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        seen.len(),
+        5,
+        "a launch took a row, took none, ran into a wall, ran into a sign-out and was refused: \
+         {seen:?}"
+    );
+}
+
+/// A LAUNCH OF A POOL WHOSE ONE ROW IS THIS MACHINE'S OWN LOGIN TAKES NO ROW WHILE NO PIN STANDS,
+/// AND THE FACTS A REVIEW READS AGREE: for Kimi Code, Grok Build and Codex on either build, with
+/// `main` alone walled or signed out, a launch (`accounts_pool::launch_env_for`) runs on that
+/// login as it is, and the facts record no refusal (`launch_refused`). CONTROL: with `work`
+/// listed beside it and walled too, the launch is refused and the facts record it.
+#[test]
+fn a_lone_default_row_launch_takes_no_row_and_the_facts_refuse_none() {
+    use crate::harness::accounts::Cli;
+    for (cli, reads) in [
+        (Cli::Kimi, None),
+        (Cli::Grok, None),
+        (Cli::Codex, Some(true)),
+        (Cli::Codex, Some(false)),
+    ] {
+        let walled: fn(&ReviewPool) = |pool| pool.wall("main");
+        let signed_out: fn(&ReviewPool) = ReviewPool::main_signed_out;
+        for (case, set) in [("walled", walled), ("signed out", signed_out)] {
+            let at = format!("{} on {reads:?}, `main` alone {case}", cli.id());
+            let pool = ReviewPool::new(cli, reads);
+            pool.main_alone();
+            set(&pool);
+            assert_eq!(pool.launch(), Ok(None), "{at}");
+            let facts = pool.facts();
+            let accounts = facts.pool.as_ref().expect("the pool");
+            assert_eq!(accounts.launch_refused, None, "{at}: {accounts:?}");
+        }
+        let pool = ReviewPool::new(cli, reads);
+        pool.wall("main");
+        pool.wall("work");
+        assert!(pool.launch().is_err(), "CONTROL {}", cli.id());
+        let facts = pool.facts();
+        let accounts = facts.pool.as_ref().expect("the pool");
+        assert!(
+            accounts.launch_refused.is_some(),
+            "CONTROL {}: {accounts:?}",
+            cli.id()
+        );
+    }
 }

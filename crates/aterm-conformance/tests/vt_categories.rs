@@ -58,6 +58,8 @@ fn el2_erases_the_whole_line() {
 fn ed1_erases_above_the_cursor() {
     let s = run(b"top\r\nbot\x1b[2;2H\x1b[1J");
     assert_eq!(s.row(0), ""); // row above fully erased
+    assert_eq!(s.row(1), "  t"); // cursor row erased inclusively through col 1, leaving col 2
+    assert_eq!(s.cursor(), (1, 1));
 }
 
 #[test]
@@ -70,12 +72,16 @@ fn alt_screen_isolates_then_restores() {
 fn scroll_region_index_scrolls_only_the_region() {
     let mut s = Screen::new(5, 80);
     s.feed(b"\x1b[2;4r"); // DECSTBM rows 2-4
-    s.feed(b"\x1b[1;1Ha"); // row 1
+    s.feed(b"\x1b[1;1Ha"); // row 1 (above region)
     s.feed(b"\x1b[2;1Hb"); // row 2 (top of region)
     s.feed(b"\x1b[4;1Hd"); // row 4 (bottom of region)
+    s.feed(b"\x1b[5;1He"); // row 5 (below region)
     s.feed(b"\x1b[4;1H\x1bD"); // IND at bottom of region -> scroll region up
-    assert_eq!(s.row(0), "a"); // outside region, untouched
-    assert_eq!(s.row(1), ""); // region scrolled: old 'b' gone from top
+    assert_eq!(s.row(0), "a"); // above region untouched
+    assert_eq!(s.row(1), ""); // old 'b' scrolled off top of region
+    assert_eq!(s.row(2), "d"); // 'd' moved up from row 4 to row 3
+    assert_eq!(s.row(3), ""); // bottom of region cleared
+    assert_eq!(s.row(4), "e"); // below region untouched
 }
 
 #[test]

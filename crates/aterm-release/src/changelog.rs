@@ -396,7 +396,7 @@ pub const GITHUB_RELEASE_BODY_LIMIT: usize = 125_000;
 
 /// What GitHub counts against "maximum is 125000 characters": UTF-16 code units, the safe
 /// reading for a JSON API.
-fn github_length(text: &str) -> usize {
+pub(crate) fn github_length(text: &str) -> usize {
     text.chars().map(char::len_utf16).sum()
 }
 
@@ -497,12 +497,13 @@ mod release_body_bound_tests {
     /// document, not the section inside it.
     #[test]
     fn the_assembled_document_fits_what_github_accepts() {
-        let body = "### Section\n\n- entry\n\n".repeat(6000);
+        let body = "### Section\n\n- entry — with em dashes — in UTF-8\n\n".repeat(4000);
         let doc = release_notes_document("0.87.0", &body);
         assert!(
-            doc.len() <= GITHUB_RELEASE_BODY_LIMIT,
-            "assembled release notes are {} bytes, over the {GITHUB_RELEASE_BODY_LIMIT} \
-             GitHub takes",
+            super::github_length(&doc) <= GITHUB_RELEASE_BODY_LIMIT,
+            "assembled release notes are {} UTF-16 units ({} bytes), over the \
+             {GITHUB_RELEASE_BODY_LIMIT} GitHub takes",
+            super::github_length(&doc),
             doc.len()
         );
     }

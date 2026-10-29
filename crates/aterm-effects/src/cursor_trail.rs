@@ -84,6 +84,7 @@ impl BridgeReach {
         }
     }
 
+    #[must_use]
     #[inline]
     const fn ball(d: u16) -> Self {
         Self {
@@ -535,28 +536,28 @@ impl CursorTrail {
 
         let spawn_from = match self.last {
             Some(c) => Some(c),
-            None => match self.last_visible {
-                Some(((r, c), seen)) => {
+            None => match (self.last_visible, cur) {
+                (Some(((r, c), seen)), Some(to)) if (r, c) != to => {
                     let fresh =
                         now.saturating_duration_since(seen).as_millis() as u64 <= HIDE_BRIDGE_MS;
-                    let typed_fresh = self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH_DUR);
                     let nav_bridge = hint_fresh_dur(self.nav_hint, now, Self::NAV_HINT_FRESH_DUR)
                         && match self.nav_hint {
                             Some(key) => nav_bridge_admits(key, seen, now),
                             None => false,
                         };
-                    let reach = hide_bridge_reach(typed_fresh, nav_bridge, self.pane_columns);
-                    let plausible = match cur {
-                        Some(to) => reach.admits((r, c), to),
-                        None => false,
-                    };
-                    if (fresh || nav_bridge) && plausible {
-                        Some((r, c))
+                    if fresh || nav_bridge {
+                        let typed_fresh = self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH_DUR);
+                        let reach = hide_bridge_reach(typed_fresh, nav_bridge, self.pane_columns);
+                        if reach.admits((r, c), to) {
+                            Some((r, c))
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
                 }
-                None => None,
+                _ => None,
             },
         };
         let hidden_relocation = self.last.is_none()
@@ -735,6 +736,7 @@ impl CursorTrail {
             * (1.0 + CHAIN_LIFE_MULT * cfg.warmth.clamp(0.0, 1.0) + (IGNITED_LIFE_MULT - 1.0) * q))
             .max(1.0) as u64;
         let n = self.spawn_path.len() as u32;
+        let delta_alpha = head - tail;
         let mut i = 0;
         while i < self.spawn_path.len() {
             let (r, c) = self.spawn_path[i];
@@ -744,8 +746,7 @@ impl CursorTrail {
                 continue;
             }
             let frac = (cur_i + 1) * 255 / n; // 1/n .. 1, scaled to 0..=255
-            let born_alpha =
-                (tail + (head - tail) * frac / 255).min(READABLE_ALPHA_CAP as u32) as u8;
+            let born_alpha = (tail + delta_alpha * frac / 255).min(READABLE_ALPHA_CAP as u32) as u8;
             self.sparks.push(Spark {
                 row: r as u16,
                 col: c as u16,
@@ -858,6 +859,7 @@ impl TypingCadence {
         self.last = Some(now);
     }
 
+    #[must_use]
     #[inline]
     fn heat_at(&self, now: Instant) -> f32 {
         if self.heat <= 0.0 {
@@ -872,6 +874,7 @@ impl TypingCadence {
         }
     }
 
+    #[must_use]
     #[inline]
     const fn warmth_of(&self, heat: f32) -> f32 {
         let span = (self.params.knee_lo - self.params.gain).max(f32::EPSILON);
@@ -920,6 +923,9 @@ pub const fn ignite(cfg: &mut TrailConfig, intensity: f32, warmth: f32) {
     cfg.warmth = warmth.clamp(0.0, 1.0);
     cfg.color = heat_color(cfg.color, q);
 }
+
+#[cfg(any(test, debug_assertions))]
+mod state_words;
 
 #[cfg(test)]
 fn line_cells(r0: i32, c0: i32, r1: i32, c1: i32) -> Vec<(i32, i32)> {

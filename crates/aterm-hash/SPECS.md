@@ -106,13 +106,15 @@ src/fnv.rs	a_stream_of_writes_is_the_hash_of_their_concatenation	HASH-FNV-3	HASH
 src/lib.rs	test_fxhasher_unsigned_integers_match_rustc_hash	HASH-FX-1	HASH-FX-2 (u128 path through read_u64_le)
 src/lib.rs	test_fxhasher_signed_integers_match_rustc_hash	HASH-FX-1	
 src/lib.rs	test_fxhasher_bytes_match_rustc_hash	HASH-FX-3	HASH-FX-2, HASH-FX-1 (write_u64, finish)
+src/lib.rs	test_fxhasher_str_includes_terminator_byte	HASH-FX-3	HASH-FX-1 (write_u8(0xff), finish)
 ```
 
 ## 3. Coverage
 
-- Each of the 6 tests maps to one of the 6 specs (§2).
-- Retiring `test_fxhasher_bytes_match_rustc_hash` needs HASH-FX-1, -2 and -3 all Certified.
-  Retiring `a_stream_of_writes_is_the_hash_of_their_concatenation` needs all three FNV specs.
+- Each of the 7 tests maps to one of the 6 specs (§2).
+- Retiring `test_fxhasher_bytes_match_rustc_hash` and `test_fxhasher_str_includes_terminator_byte`
+  needs HASH-FX-1, -2 and -3 all Certified. Retiring `a_stream_of_writes_is_the_hash_of_their_concatenation`
+  needs all three FNV specs.
 - Every test here is a short list of sampled vectors. The specs replace them with the reference
   algorithm over all inputs, and the published vectors survive as `decide` corollaries that act as
   negative controls.
@@ -123,18 +125,18 @@ None.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **The 32-bit halves are not checked on a 64-bit host.** In the unsigned, signed and bytes tests,
-   every `if B32 { .. }` expected value is a 32-bit-target constant, and none of them runs on the
-   64-bit host. So that half of the claimed rustc-hash compatibility is unchecked here. A few
-   hand spot-checks agree with the model (32-bit `i32::MIN` and `i64::MIN` → 16384, `usize::MAX = u32::MAX`
-   → 1293006356). The specs must be proved per `cfg` arm, or the 32-bit arm must be named as unverified.
-2. **The production `str` path is not tested.** `test_fxhasher_bytes_match_rustc_hash` reaches
-   `FxHasher::write` only through the test-only `HashBytes` wrapper. Production `str` keys go through
-   std's `Hash for str`, which also calls `write_u8(0xff)`, and no test covers that path.
-   HASH-FX-1 and HASH-FX-3 compose to cover it only once that std impl is modelled (gap 11).
-3. **The short-input arms of `hash_bytes` are thinly sampled.** For lengths 1, 2 and 3 the literal
-   slice-pattern arms compute rustc-hash's `lo = bytes[0]`, `mid = bytes[len/2]`, `hi = bytes[len-1]`.
-   The only 2- or 3-byte test input is `b"uwu"`, so the real check is HASH-FX-3's case for each length.
+1. **Both 32-bit and 64-bit FxHash arms checked on 64-bit hosts (resolved 2026-10-28).** `src/fx32.rs`
+   shares the 32-bit `rustc-hash` 2.1 primitives (`add_to_hash_32`, `write_u64_32`, `write_u128_32`,
+   `finish_32`, `multiply_mix_32`) between `cfg(target_pointer_width = "32")` and `cfg(test)`, and
+   `test_hash!` verifies every unsigned, signed, and byte-slice vector against both native `FxBuildHasher`
+   and 32-bit `FxBuildHasher32` on 64-bit hosts without changing the 64-bit library build.
+2. **Production `str` path sampled (resolved 2026-10-27).**
+   `test_fxhasher_str_includes_terminator_byte` exercises `FxBuildHasher.hash_one` on `&str` (std's
+   `Hash for str`, which appends `write_u8(0xff)`). HASH-FX-1 and HASH-FX-3 compose to cover it in
+   proofs once that std impl is modelled (gap 11).
+3. **Short-input arms of `hash_bytes` sampled (resolved 2026-10-27).**
+   `test_fxhasher_bytes_match_rustc_hash` now exercises 1-, 2-, and 3-byte inputs against
+   rustc-hash's `lo = bs[0]`, `mid = bs[len / 2]`, `hi = bs[len - 1]` formula directly.
 4. **The obvious loop bound is false.** "off ≤ len − 16 at the exit test" fails because off steps
    by 16 and overshoots: with len = 21, off goes from 0 to 16 > 5. HASH-FX-3 states the bound that
    holds (`off ≡ 0 mod 16 ∧ off < len`), which is also what the in-bounds argument for

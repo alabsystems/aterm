@@ -1962,7 +1962,6 @@ impl Evaluator {
     /// # Errors
     /// [`NoOutcome::NoneAdmitted`], or [`NoOutcome::NoGain`] when the winner does not beat the
     /// baseline on training.
-    #[inline]
     pub fn select(&self, proposer: &mut dyn Proposer) -> Result<Selection, NoOutcome> {
         self.select_spread(proposer, &Serial)
     }
@@ -1984,11 +1983,12 @@ impl Evaluator {
         selected
     }
 
-    /// Return the grid's selection, running the grid search once per evaluator if needed.
+    /// Return the grid's selection, running the grid search once per evaluator if needed, its
+    /// plans judged over `spread` (which changes only speed).
     #[inline]
-    pub(super) fn grid_selection(&self) -> Option<GridSelection> {
+    pub(super) fn grid_selection(&self, spread: &dyn Spread) -> Option<GridSelection> {
         *self.grid.get_or_init(|| {
-            self.select_local(&mut GridProposer::new(), &Serial)
+            self.select_local(&mut GridProposer::new(), spread)
                 .0
                 .as_ref()
                 .ok()
@@ -2322,7 +2322,6 @@ impl Evaluator {
     /// # Errors
     /// [`NoOutcome::HeldOut`] at the first held-out refusal (no runner-up is tried), or
     /// [`NoOutcome::Foreign`] for a selection made in another build.
-    #[inline]
     pub fn held_out(&self, selection: Selection) -> Result<Admitted, NoOutcome> {
         if selection.build != self.build {
             return Err(NoOutcome::Foreign {
@@ -2337,7 +2336,6 @@ impl Evaluator {
     /// [`Self::select`], then [`Self::held_out`].
     /// # Errors
     /// Either one's.
-    #[inline]
     pub fn search(&self, proposer: &mut dyn Proposer) -> Result<Admitted, NoOutcome> {
         self.held_out(self.select(proposer)?)
     }
@@ -2345,7 +2343,6 @@ impl Evaluator {
     /// The same pipeline for the one candidate `bytes`, training then held out.
     /// # Errors
     /// The first [`CandidateRefusal`], on either split.
-    #[inline]
     pub fn admit_one(&self, bytes: &[u8]) -> Result<Admitted, CandidateRefusal> {
         let winner = self.train(bytes)?;
         self.gate(Selection {
@@ -3039,7 +3036,6 @@ impl Evaluator {
     /// # Errors
     /// [`LabelRefusal::ScopeMismatch`], a token set's [`LabelRefusal::Pool`] or
     /// [`LabelRefusal::Budget`], before anything is judged.
-    #[inline]
     pub fn label_spread(
         &self,
         scope: LabelScope,

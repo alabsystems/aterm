@@ -809,12 +809,22 @@ fn preflight(ctx: &Ctx, deps: &Deps<'_>) -> Result<()> {
         ("channel", &ctx.tokens.channel),
         ("staging", &ctx.tokens.staging),
     ] {
-        if std::fs::metadata(path).map_or(true, |m| m.len() == 0) {
-            return Err(Error::cannot_run(format!(
-                "{what} token file missing/empty: {} — the unattended lane speaks only as its \
-                 owners' tokens",
-                ctx.shown(path)
-            )));
+        match ctx.usable_token(path) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(Error::cannot_run(format!(
+                    "{what} token file missing/empty: {} — the unattended lane speaks only as its \
+                     owners' tokens",
+                    ctx.shown(path)
+                )));
+            }
+            Err(why) => {
+                return Err(Error::cannot_run(format!(
+                    "{what} token file invalid/unreadable: {} ({why}) — the unattended lane speaks \
+                     only as its owners' tokens",
+                    ctx.shown(path)
+                )));
+            }
         }
     }
     deps.packer
@@ -829,7 +839,8 @@ fn horizon_note(ctx: &Ctx, head: &VerifiedQuad) -> Result<Option<String>> {
             head.index.valid_until
         ))
     })?;
-    let left = (vu - ctx.now_unix) / 86_400;
+    let secs = vu.saturating_sub(ctx.now_unix);
+    let left = secs / 86_400 - i64::from(secs % 86_400 < 0);
     Ok((left < HORIZON_WARN_DAYS).then(|| {
         format!(
             "index horizon {} is {left} day(s) away — publish with a later `--valid-until` \

@@ -313,6 +313,53 @@ fn a_session_without_its_close_past_a_relaunch_is_partial() {
 }
 
 #[test]
+fn a_nodes_will_of_either_word_makes_its_unclosed_sessions_partial_node_gone() {
+    for will in ["away", "gone"] {
+        let mut a = session(1, 1_760_000_000_000);
+        let mut r = read_of(&[("n-1", "s-a", bodies(&mut a))]);
+        let mut row = |sid: &str, body: &str| r.presence("n-1", sid, body.as_bytes()).unwrap();
+        row("node", "v=1 t=1 state=live inc=1");
+        row("s-a", "v=1 t=1 inc=1 state=live");
+        let partial = |r: &Read| {
+            let text = render_json(&cfg(), &json_opts(), r, 1_760_000_001_000, None);
+            let v = json_of(&text);
+            let s = &sessions_of(&v)[0];
+            assert_eq!(
+                s.get("need").and_then(aterm_json::Value::as_str),
+                Some("failure"),
+                "{text}"
+            );
+            s.get("partial")
+                .and_then(aterm_json::Value::as_array)
+                .expect("partial")
+                .iter()
+                .filter_map(aterm_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert!(partial(&r).is_empty(), "{will}: live");
+        r.presence(
+            "n-1",
+            "node",
+            format!("v=1 t=2 state={will} inc=1 fabric=disconnected").as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            partial(&r),
+            ["node-gone"],
+            "{will}: a node's will, either word, leaves its unclosed session's need to nobody"
+        );
+        let text = render(&cfg(), &BriefOpts::default(), &r, 1_760_000_001_000);
+        assert!(text.contains("partial why=node-gone"), "{will}: {text}");
+        r.presence("n-1", "node", b"v=1 t=3 state=live inc=2")
+            .unwrap();
+        r.presence("n-1", "s-a", b"v=1 t=3 inc=2 state=live")
+            .unwrap();
+        assert!(partial(&r).is_empty(), "{will}: a reattach restores it");
+    }
+}
+
+#[test]
 fn many_sessions_are_held_to_the_budget() {
     let items: Vec<(String, Vec<String>)> = (0..60)
         .map(|i| {
@@ -680,7 +727,8 @@ fn the_json_brief_names_no_claimed_need() {
 /// NEITHER BRIEF PRINTS A HOST OR CONTENT FIELD A RAW BODY CARRIES (session log Phase 6 fix
 /// unit F6, PRIV-3). Hand-written v=2 `ev` bodies, as a writer of another build could publish
 /// them, go through the real ingest path (`Read::ingest`, then `BusSpace::offer`): a run open
-/// carrying `cwd=`, `title=` and `from=`, a `need` mark carrying a Host and a Content key, and a
+/// carrying `cwd=`, `title=` and `from=`, an observed `need` mark (the meta `escalated`, the one
+/// mark a fold raises as an observed need) carrying a Host and a Content key, and a
 /// `seen` mark (a bus mark the text brief prints as a line) carrying both too. A presence row
 /// carrying `attention=` and `title=` goes through `Read::presence`. Each is folded (the run, the
 /// need, the `seen` line and the presence state are in the briefs), and neither brief prints a
@@ -705,8 +753,8 @@ fn neither_brief_prints_a_host_or_content_field_a_raw_body_carries() {
         ),
         body(
             3,
-            "op=mark node=r1 k=need word=help cwd=%2Fprivate%2Ftmp%2Fx%2FQZP6WORD4 \
-             title=QZP6WORD5 src=screen conf=strong",
+            "op=mark node=r1 k=need word=escalated cwd=%2Fprivate%2Ftmp%2Fx%2FQZP6WORD4 \
+             title=QZP6WORD5 src=meta conf=strong",
         ),
         body(
             4,
@@ -731,7 +779,7 @@ fn neither_brief_prints_a_host_or_content_field_a_raw_body_carries() {
     assert!(!text.contains("QZP6WORD"), "{text}");
     assert!(text.contains("@s-a@n-1 live ep=1 "), "the presence: {text}");
     assert!(text.contains("- claude r1 "), "the run: {text}");
-    assert!(text.contains(" need=help "), "the need: {text}");
+    assert!(text.contains(" need=escalated "), "the need: {text}");
     assert!(
         text.lines()
             .any(|l| l.starts_with("4 seen ") && l.contains(" detail=qzp6meta ")),
@@ -756,7 +804,7 @@ fn neither_brief_prints_a_host_or_content_field_a_raw_body_carries() {
     assert_eq!(sessions.len(), 1, "{json}");
     assert_eq!(
         sessions[0].get("need").and_then(aterm_json::Value::as_str),
-        Some("help"),
+        Some("escalated"),
         "the need: {json}"
     );
     fn keys(v: &aterm_json::Value, out: &mut Vec<String>) {

@@ -24,6 +24,10 @@ pub const ROWS: u16 = 14;
 pub const COLS: u16 = 72;
 const FRAME_MS: u64 = 16;
 pub const BAR: f64 = 4.5;
+/// The share of its own reading a letter keeps where that reading is under [`BAR`] on the bare
+/// page (the letter guard's `OWN_SHARE`): a dim theme's letters, and in [`Scene::Context`] the
+/// theme's own powerline segments and selected row.
+const OWN_SHARE: f64 = 0.97;
 const SOLID_SHARE: f64 = 0.85;
 const CORE_SHARE: f64 = 0.70;
 const BLANK_BELOW: f64 = 1.5;
@@ -433,6 +437,19 @@ pub struct Replay {
     pub frames_at: Option<Vec<u64>>,
     /// The pane's rows: [`ROWS`], or a scene's own ([`Scene::rows`]).
     pub rows: u16,
+    /// Frames to keep in [`Replay::kept`] as the glass shows them: their times, ms.
+    pub keep: Vec<u64>,
+    /// The frames [`Replay::keep`] names, in time order.
+    pub kept: Vec<Kept>,
+}
+
+/// A frame a replay kept ([`Replay::keep`]): its time, its pixels (`0x00RRGGBB`) as the glass
+/// shows them, its width, and the grid's top on it.
+pub struct Kept {
+    pub ms: u64,
+    pub px: Vec<u32>,
+    pub w: usize,
+    pub top: usize,
 }
 
 /// `cursor_glow_sdr_boost`'s default, the SDR crown's ([`Replay::post`]).
@@ -495,6 +512,8 @@ impl Replay {
             keys_unnoted: false,
             frames_at: None,
             rows,
+            keep: Vec::new(),
+            kept: Vec::new(),
         }
     }
 
@@ -541,22 +560,57 @@ impl Replay {
             )
             .expect("the frame blooms");
         }
+        let place = self.rend.fx_frame(frame.width, frame.height, rows);
         if self.post {
             use aterm_render::{bloom, hdr};
             let bg = self.look.bg;
+            // The GPU's bloom source (`fx_gpu::bloom_source`): the over-text stream with each
+            // ramp row the quad it stands for, then the `bloom` layers' quads. The crown reads
+            // the same lights.
+            let mut source = Vec::new();
+            input
+                .cursor_glow_add_ramps
+                .expand_into(&input.cursor_glow_add, &mut source);
+            aterm_render::fx_bloom_quads(
+                &place,
+                &input.fx_layers,
+                &input.fx_occluders,
+                &mut aterm_render::FxSlicer::default(),
+                &mut aterm_render::SpriteCols::default(),
+                &mut source,
+            );
+            // A frame whose bloom spares its letters crowns and blooms from the
+            // lights kept off them (`bloom::spared_sources`), as the GPU does.
+            let (mut crown, mut blur) = (Vec::new(), Vec::new());
+            let (crown, blur) = if input.bloom_gate.spares_letters() {
+                let grid = bloom::LetterGrid {
+                    pad: place.pad,
+                    grid_top: place.grid_top,
+                    cell_w: cw,
+                    cell_h: ch,
+                };
+                bloom::spared_sources(
+                    &source,
+                    &input,
+                    grid,
+                    bloom::BLOOM_RADIUS,
+                    &mut crown,
+                    &mut blur,
+                );
+                (&crown, &blur)
+            } else {
+                (&source, &source)
+            };
             if !input.bloom_gate.held() {
                 let params = bloom::BloomParams {
                     strength: bloom::BLOOM_STRENGTH * hdr::light_page_bloom_share(bg),
                     radius: bloom::BLOOM_RADIUS,
                 };
-                bloom::apply(&mut frame, &input.cursor_glow_add, input.rows, params)
-                    .expect("the frame blooms");
+                bloom::apply(&mut frame, blur, input.rows, params).expect("the frame blooms");
             }
             let budget = hdr::sdr_glow_budget(hdr::packed_luma(bg), SDR_BOOST);
-            bloom::sdr_crown(&mut frame, &input.cursor_glow_add, input.rows, budget)
-                .expect("the frame is crowned");
+            bloom::sdr_crown(&mut frame, crown, input.rows, budget).expect("the frame is crowned");
         }
-        let place = self.rend.fx_frame(frame.width, frame.height, rows);
         let mut bodies = Vec::new();
         aterm_render::knock_rects(
             &place,
@@ -640,6 +694,14 @@ impl Replay {
         if let Some(i) = self.dump.iter().position(|(at, _)| *at == self.ms) {
             let (_, path) = self.dump.remove(i);
             std::fs::write(&path, frame.to_png()).expect("dump");
+        }
+        if self.keep.contains(&self.ms) {
+            self.kept.push(Kept {
+                ms: self.ms,
+                px: frame.pixels.clone(),
+                w: frame.width,
+                top: place.grid_top,
+            });
         }
         let w = frame.width;
         let clean = &self.clean.as_ref().expect("rendered above").2;
@@ -881,6 +943,10 @@ pub enum Scene {
     /// The gallery's `split` burst: [`Scene::Burst`] in the caret's pane of a window split
     /// top over bottom, 6 rows, the line on its last row but one ([`Scene::rows`]).
     SplitBurst,
+    /// The gallery's `context`: the typed line between a filled powerline row above and a
+    /// selected row below, behind a prompt segment, lettered rows past both (a shell prompt
+    /// under a powerline, Claude Code's input box between its rules).
+    Context,
 }
 
 impl Scene {
@@ -928,9 +994,42 @@ impl Scene {
         }
     }
 
+    /// [`Scene::events`] on `look`: the context's selected row in the gallery's selection
+    /// colour for the theme (`aterm-lab`'s `trail_gallery`).
+    pub fn events_on(self, look: Look) -> (Vec<(u64, Ev)>, u64) {
+        let (mut ev, tail) = self.events();
+        if self == Scene::Context && luma(look.bg) > 0.5 {
+            for (_, e) in &mut ev {
+                if let Ev::Out(bytes) = e {
+                    let text = String::from_utf8_lossy(bytes).replace("51;65;94", "182;227;255");
+                    *bytes = text.into_bytes();
+                }
+            }
+        }
+        (ev, tail)
+    }
+
     pub fn events(self) -> (Vec<(u64, Ev)>, u64) {
         let prompt = |at: u64| (at, Ev::Out(b"\x1b[2J\x1b[5H$ ".to_vec()));
         match self {
+            Scene::Context => {
+                let sel = format!(
+                    "\x1b[48;2;51;65;94m{:<72}\x1b[0m\r\n",
+                    "src/trail.rs:412  a selected line under the prompt"
+                );
+                let page = format!(
+                    "\x1b[2J\x1b[3H\
+                     Above: Typography jumps; quick brown gyps (qwerty) _gy|\r\n\
+                     \x1b[30;42m ok \x1b[97;44m ~/aterm \x1b[30;43m main +2 \x1b[0;48;5;236m\x1b[K\x1b[0m\r\n\
+                     \r\n{sel}\
+                     Below: every glyph here must stay legible! pqgyj {{braces}} [ok]\r\n\
+                     \x1b[31merror\x1b[0m: \x1b[1mcolour contrast\x1b[0m below the caret path\r\n\
+                     \x1b[5H\x1b[30;46m aterm \x1b[0m "
+                );
+                let mut ev = vec![(200, Ev::Out(page.into_bytes()))];
+                ev.extend(typed(TYPING_TEXT, 1_000, 60));
+                (ev, 600)
+            }
             Scene::Typing => {
                 let mut ev = vec![prompt(200)];
                 ev.extend(typed(TYPING_TEXT, 1_000, 60));
@@ -1051,9 +1150,12 @@ pub fn look_bar(look: Look) -> f64 {
 }
 
 /// Replay `style` on `look` through `scene` in the trail colour `color`, the letter guard on
-/// or off, every frame judged at [`look_bar`]; `dump` names frames to keep as PNGs. A pinned
-/// colour's Classic runs at the full default intensity, as
-/// [`classic_in_a_chosen_colour_keeps_every_letter`] runs it.
+/// or off, every frame judged as the glass shows it, through the host's post passes (the bloom
+/// and the SDR crown, [`Replay::post`]), at [`look_bar`]; `dump` names frames to keep as PNGs. A
+/// pinned colour's Classic runs at the full default intensity, as
+/// [`classic_in_a_chosen_colour_keeps_every_letter`] runs it. In [`Scene::Context`] a letter
+/// whose own reading is under the bar on the bare page (the theme's own powerline segments and
+/// selected row) is judged at [`OWN_SHARE`] of it.
 pub fn replay_in(
     style: &'static str,
     look: Look,
@@ -1062,7 +1164,21 @@ pub fn replay_in(
     dump: Vec<(u64, String)>,
     color: TrailColor,
 ) -> Verdict {
-    let mut r = Replay::new(style, look, color);
+    replay_spared(style, look, scene, guard, true, dump, color)
+}
+
+/// [`replay_in`] with the host's post passes sparing the letters (`BloomGate::SparesLetters`)
+/// or, as a negative control, taking light from beside them too (`spares` false).
+pub fn replay_spared(
+    style: &'static str,
+    look: Look,
+    scene: Scene,
+    guard: bool,
+    spares: bool,
+    dump: Vec<(u64, String)>,
+    color: TrailColor,
+) -> Verdict {
+    let mut r = Replay::sized(style, look, color, scene.rows());
     if matches!(color, TrailColor::Pinned(_)) {
         r.fx.set_cursor_glow(
             true,
@@ -1078,8 +1194,11 @@ pub fn replay_in(
         );
     }
     r.fx.set_letter_guard(guard);
+    r.fx.set_bloom_spares_letters(spares);
+    r.post = true;
+    r.own = scene == Scene::Context;
     r.dump = dump;
-    let (ev, tail) = scene.events();
+    let (ev, tail) = scene.events_on(look);
     let judged = r.run(&ev, tail);
     let bar = look_bar(look);
     Verdict {
@@ -1088,7 +1207,12 @@ pub fn replay_in(
         scene,
         under: judged
             .iter()
-            .map(|j| j.letters.iter().filter(|l| l.judged() < bar).count())
+            .map(|j| {
+                j.letters
+                    .iter()
+                    .filter(|l| l.judged() < bar.min(OWN_SHARE * l.own))
+                    .count()
+            })
             .sum(),
         worst: worst(&judged),
     }
@@ -1134,19 +1258,33 @@ pub fn replay_all_in(
 }
 
 const SCENES: [Scene; 4] = [Scene::Typing, Scene::EnterBottom, Scene::Burst, Scene::Cjk];
+/// The scenes the every-letter law is judged through: [`SCENES`], the gallery's `move-up`, its
+/// split pane's burst and its `context`.
+const LAW_SCENES: [Scene; 7] = [
+    Scene::Typing,
+    Scene::EnterBottom,
+    Scene::Burst,
+    Scene::Cjk,
+    Scene::MoveUp,
+    Scene::SplitBurst,
+    Scene::Context,
+];
 const LOOKS: [Look; 3] = [DARK, GITHUB_LIGHT, DEFAULT_LIGHT];
 const DIM_LOOKS: [Look; 3] = [DIM_GREY, SOLARIZED_DARK, PAPER_GREY];
 
 /// Every style but classic (whose spectrum face keeps its v0.28 bytes), on dark, GitHub Light
 /// and Default Light, through typing, a burst, an Enter at the bottom row (the echo and the
-/// printed line every frame after it) and wide letters, keeps every letter it lies on at 4.5:1
-/// or better, frame by frame.
+/// printed line every frame after it), wide letters, a move up, a split pane's burst and the
+/// gallery's context, keeps every letter it lies on at 4.5:1 or better, frame by frame, as the
+/// glass shows it: through the host's bloom and SDR crown ([`replay_in`]). Judged before the
+/// post passes, as it was until looks10, Lumen's typing kept `x` at 6.25:1 where the glass
+/// showed 4.37 ([`the_post_passes_spare_the_letters`]).
 #[test]
 fn every_letter_a_trail_lies_on_reads_at_the_bar() {
     let mut jobs = Vec::new();
     for style in STYLES.into_iter().filter(|s| *s != "classic") {
         for look in LOOKS {
-            for scene in SCENES {
+            for scene in LAW_SCENES {
                 jobs.push((style, look, scene));
             }
         }
@@ -1167,13 +1305,60 @@ fn every_letter_a_trail_lies_on_reads_at_the_bar() {
     assert!(verdicts.iter().all(|v| v.worst.is_some()));
 }
 
-/// Negative control: with the letter guard off, each of these replays buries a letter (the
-/// ribbon's and Laser's Enter flares across the printed line, the caret blooms on the newest
-/// letters, Water's wave, the ribbon head's bloom in the burst, Fire's spark on a wide letter).
+/// looks10 L1, THE POST PASSES SPARE THE LETTERS: the host blooms and crowns the over-text
+/// lights after the letter guard has weighed them (`aterm_render::bloom`), and the bloom's
+/// 12 px reach carried a cut light's neighbours back over the letters it spared: on the dark
+/// page Lumen's typing left `x` at 4.37:1, Phaser's Enter `q` at 4.37 and Sparkle's `x` at
+/// 4.38. A frame whose guard spares the letters (`BloomGate::SparesLetters`) blooms and crowns
+/// only the light laid clear of them (`bloom::spared_sources`). Negative control: these
+/// replays, the post passes taking light from beside the letters too, bury a letter.
+#[test]
+fn the_post_passes_spare_the_letters() {
+    let jobs = [
+        ("lumen", DARK, Scene::Typing),
+        ("phaser", DARK, Scene::EnterBottom),
+        ("sparkle", DARK, Scene::EnterBottom),
+    ];
+    for (style, look, scene) in jobs {
+        let spared = replay_spared(
+            style,
+            look,
+            scene,
+            true,
+            true,
+            Vec::new(),
+            TrailColor::Automatic,
+        );
+        assert_eq!(
+            spared.under, 0,
+            "spared, a letter falls under the bar: {spared}"
+        );
+        let bloomed = replay_spared(
+            style,
+            look,
+            scene,
+            true,
+            false,
+            Vec::new(),
+            TrailColor::Automatic,
+        );
+        assert!(
+            bloomed.under > 0,
+            "the post passes over the letters keep every letter (the control no longer \
+             controls): {bloomed}"
+        );
+    }
+}
+
+/// Negative control: with the letter guard off, each of these replays buries a letter (Laser's
+/// Enter flare across the printed line, the caret blooms on the newest letters, Water's wave, the
+/// ribbon head's bloom in the burst, Fire's spark on a wide letter). The flat ribbon's Enter on
+/// Default Light stood here until its paper Return came out from under the printed line instead
+/// of flaring across it (looks9 Q5, `rainbow_kitty::meteor`): unguarded it now keeps every letter
+/// at 7.28:1 or better, so it controls nothing.
 #[test]
 fn without_the_letter_guard_the_trails_bury_letters() {
     let jobs = [
-        ("flat rainbow", DEFAULT_LIGHT, Scene::EnterBottom),
         ("laser", DARK, Scene::EnterBottom),
         ("beam", DARK, Scene::Typing),
         ("phaser", DARK, Scene::Burst),
@@ -1256,13 +1441,17 @@ fn classic_in_a_chosen_colour_keeps_every_letter() {
 /// wide letters and the trail gallery's `move-up` (the caret moved up into a program's lettered
 /// lines, where the ring lands among their letters), Classic on GitHub Light and on Default Light
 /// keeps every letter at the bar, frame by frame. Negative control: the letter guard passing
-/// Classic's paper face by, as it did, leaves a letter beside the `move-up` landing under the bar
-/// on each.
+/// Classic's paper face by, as it did, with the paper ring laid over the letters as it was until
+/// looks10 L12 (now it is whole and off the letters, or not drawn), leaves a letter beside the
+/// `move-up` landing under the bar on each. Since L12 either law alone keeps those letters, so
+/// each is held alone as well: the guard with the ring laid over the letters, and the ring with
+/// the guard passing the face by, each keep every letter beside the `move-up` landing.
 #[test]
 fn classic_on_paper_keeps_every_letter() {
-    let run = |look: Look, scene: Scene, guarded: bool| {
+    let run = |look: Look, scene: Scene, guarded: bool, ring_cut: bool| {
         let mut r = Replay::new("classic", look, TrailColor::Automatic);
         r.fx.set_letter_guard_classic_paper(guarded);
+        r.fx.set_classic_paper_ring_cut(ring_cut);
         let (ev, tail) = scene.events();
         let judged = r.run(&ev, tail);
         let bar = look_bar(look);
@@ -1279,7 +1468,7 @@ fn classic_on_paper_keeps_every_letter() {
     };
     for look in [GITHUB_LIGHT, DEFAULT_LIGHT] {
         for scene in SCENES.into_iter().chain([Scene::MoveUp]) {
-            let v = run(look, scene, true);
+            let v = run(look, scene, true, false);
             assert!(
                 v.worst.is_some(),
                 "fixture: the judge read the letters: {v}"
@@ -1289,11 +1478,22 @@ fn classic_on_paper_keeps_every_letter() {
                 "a letter under Classic on paper reads under the bar: {v}"
             );
         }
-        let old = run(look, Scene::MoveUp, false);
+        let guard = run(look, Scene::MoveUp, true, true);
+        assert_eq!(
+            guard.under, 0,
+            "the letter guard alone, the ring laid over the letters, takes a letter under the \
+             bar: {guard}"
+        );
+        let ring = run(look, Scene::MoveUp, false, false);
+        assert_eq!(
+            ring.under, 0,
+            "the ring alone, the guard passing the face by, takes a letter under the bar: {ring}"
+        );
+        let old = run(look, Scene::MoveUp, false, true);
         assert!(
             old.under > 0,
-            "negative control: the guard passing Classic's paper face by keeps every letter \
-             (the control no longer controls): {old}"
+            "negative control: the guard passing Classic's paper face by, with the ring laid \
+             over the letters as it was, keeps every letter (the control no longer controls): {old}"
         );
     }
 }
@@ -1306,9 +1506,13 @@ fn classic_on_paper_keeps_every_letter() {
 /// too little of it keeps its whole light the ring is not drawn at all, looks8 round 3, so
 /// the replay lays it whatever its share to judge the letters it passes under). Negative controls: laid over the
 /// text as it was, the rim crosses `echo` after the Enter (the trail gallery read its `e` at
-/// 4.26:1 under Lumen) and, bloomed, takes letters under the bar under Lumen, Sparkle and
+/// 4.26:1 under Lumen) and, bloomed over the letters as the host bloomed it until looks10
+/// (`BloomGate::SparesLetters` off), takes letters under the bar under Lumen, Sparkle and
 /// Phaser; laid under the text at its whole light, it spends the room the guard leaves a letter
-/// and the bloom of the trail's own light takes one under the bar under Lumen and Laser.
+/// and the bloom of the trail's own light over the letters takes one under the bar under Lumen
+/// (and under Laser until its crackle kinked, looks10). With the post passes sparing the letters each control keeps them (Lumen's `e`
+/// at 4.81:1 with the rim over it, its `c` at 4.73 with the rim whole): two laws now hold
+/// the bloom off these letters.
 #[test]
 fn the_dark_ring_passes_under_the_letters() {
     let (ev, tail) = Scene::EnterBottom.events();
@@ -1320,6 +1524,8 @@ fn the_dark_ring_passes_under_the_letters() {
     let run = |style: &'static str, over: bool, share: Option<f32>| {
         let mut r = Replay::new(style, DARK, TrailColor::Automatic);
         r.post = true;
+        // Each control blooms over the letters, as the host did until looks10.
+        r.fx.set_bloom_spares_letters(!over && share.is_none());
         // The rim laid whatever share of it keeps its whole light: there, after an Enter
         // at the bottom row, the ring is otherwise not drawn at all (`RIM_SHOWN_SHARE`).
         r.fx.set_dark_rim_fragments(true);
@@ -1363,27 +1569,28 @@ fn the_dark_ring_passes_under_the_letters() {
              longer controls): {old}"
         );
     }
-    for style in ["lumen", "laser"] {
-        let whole = run(style, false, Some(1.0));
-        assert!(
-            whole.under > 0,
-            "negative control: the rim under the text at its whole light keeps every letter (the \
-             control no longer controls): {whole}"
-        );
-    }
+    // Lumen's rim controls. Laser's did until looks10, whose crackle kinks
+    // (`spawn_bolt`) and draws its sparks from another stretch of the trail's
+    // random stream: its worst letter there reads 4.80 at the whole light.
+    let whole = run("lumen", false, Some(1.0));
+    assert!(
+        whole.under > 0,
+        "negative control: the rim under the text at its whole light keeps every letter (the \
+         control no longer controls): {whole}"
+    );
 }
 
 /// On [`DIM_GREY`] and [`SOLARIZED_DARK`], whose solid ink reads under the guard's floor on the
 /// bare page (a guard that gave up on it would leave every light whole), every style but classic,
 /// through every scene, keeps each letter it lies on at four fifths of the theme's own contrast
-/// ([`look_bar`]). Negative control: the guard off buries a letter under that bar in each control
-/// replay.
+/// ([`look_bar`]), through the host's post passes ([`replay_in`]). Negative control: the guard
+/// off buries a letter under that bar in each control replay.
 #[test]
 fn every_letter_on_a_dim_theme_keeps_its_own_reading() {
     let mut jobs = Vec::new();
     for look in [DIM_GREY, SOLARIZED_DARK] {
         for style in STYLES.into_iter().filter(|s| *s != "classic") {
-            for scene in SCENES {
+            for scene in LAW_SCENES {
                 jobs.push((style, look, scene));
             }
         }
@@ -1797,7 +2004,8 @@ fn phaser_s_dark_bar_keeps_no_stripe_in_a_word_gap() {
 
 #[test]
 #[ignore = "survey: prints every style's worst letter (TRAIL_SURVEY_STYLES, TRAIL_LOOKS=dark|light|dim, \
-            TRAIL_GUARD=0, TRAIL_COLOR=#rrggbb, TRAIL_DUMP=<dir>, TRAIL_DUMP_MS=<ms,...>)"]
+            TRAIL_SCENES=<Scene,...>, TRAIL_GUARD=0, TRAIL_COLOR=#rrggbb, TRAIL_DUMP=<dir>, \
+            TRAIL_DUMP_MS=<ms,...>)"]
 fn survey_every_style_s_worst_letter() {
     let want: Option<Vec<String>> = std::env::var("TRAIL_SURVEY_STYLES")
         .ok()
@@ -1808,13 +2016,19 @@ fn survey_every_style_s_worst_letter() {
         Some("dim") => DIM_LOOKS.to_vec(),
         _ => LOOKS.to_vec(),
     };
+    let scenes: Vec<Scene> = std::env::var("TRAIL_SCENES").map_or(SCENES.to_vec(), |s| {
+        LAW_SCENES
+            .into_iter()
+            .filter(|scene| s.split(',').any(|w| w == format!("{scene:?}")))
+            .collect()
+    });
     let mut jobs = Vec::new();
     for style in STYLES {
         if want.as_ref().is_some_and(|w| !w.iter().any(|x| x == style)) {
             continue;
         }
         for &look in &looks {
-            for scene in SCENES {
+            for &scene in &scenes {
                 jobs.push((style, look, scene));
             }
         }
@@ -2095,6 +2309,101 @@ fn a_dim_page_s_trail_shows_below_its_letters() {
 /// A column under the row this far over the clean frame shows light ([`Judged::rail`]).
 const BELOW_LIT: u8 = 40;
 
+/// looks10 round 3, L6: A ONE-COLOUR MOVE UP A DIM PAGE IS ONE STROKE TO THE CARET. Classic in
+/// a chosen colour (`#d03a8c`) on Solarized Dark, the trail gallery's `move-up`: the caret
+/// leaves the `[vim]` row for `println!`'s `!` five rows up, over `// every glyph` and the
+/// `}` row. On a dim page the tracer keeps no light over the letters, and under them it lays a
+/// shade at the page's own luminance in its hue; laid at the tracer's share of its light and
+/// cut with the lights in its cells by the letter guard, that shade kept a trace no eye found
+/// at 1x (1.02:1), and the judges saw a lone lavender slash in the blank rows. Laid whole and
+/// kept from the guard (it can only darken the ground of a letter lighter than the page), it
+/// carries the stroke's hue over `// every glyph` to the caret's row: in the up move's frames,
+/// the rows from the caret's to the comment's hold a run of pixels whose red stands clear of
+/// their green ([`HUE_LIFT`]), and every letter keeps the page's bar. Negative control: the
+/// shade laid faint and cut, as round 2 laid it (`set_classic_faint_shade`), leaves those rows
+/// none.
+#[test]
+fn a_one_colour_move_up_a_dim_page_is_one_stroke() {
+    let pink = TrailColor::Pinned(0x00D0_3A8C);
+    let (ev, tail) = Scene::MoveUp.events();
+    let up = ev.last().map_or(0, |e| e.0);
+    let frames: Vec<u64> = (0..4)
+        .map(|k| up.div_ceil(FRAME_MS) * FRAME_MS + k * FRAME_MS)
+        .collect();
+    let read = |faint: bool| {
+        let mut r = Replay::new("classic", SOLARIZED_DARK, pink);
+        r.fx.set_cursor_glow(
+            true,
+            "classic",
+            pink,
+            None,
+            260,
+            24,
+            1.0,
+            0.6,
+            true,
+            SOLARIZED_DARK.cursor,
+        );
+        r.fx.set_classic_faint_shade(faint);
+        r.post = true;
+        r.keep.clone_from(&frames);
+        let judged = r.run(&ev, tail);
+        let bar = look_bar(SOLARIZED_DARK);
+        let under: usize = judged
+            .iter()
+            .map(|j| j.letters.iter().filter(|l| l.judged() < bar).count())
+            .sum();
+        let (_, ch) = r.cell;
+        // Each kept frame's warm pixels in the caret's row (`println!`, row 3) and in the
+        // comment's under it (row 4): the least of the two.
+        let hued: Vec<(u64, usize)> = r
+            .kept
+            .iter()
+            .map(|k| {
+                let in_row = |row: usize| {
+                    let (y0, y1) = (k.top + row * ch, k.top + (row + 1) * ch);
+                    k.px[y0 * k.w..y1 * k.w]
+                        .iter()
+                        .filter(|&&p| {
+                            let (red, green) = ((p >> 16) & 0xFF, (p >> 8) & 0xFF);
+                            red >= green + HUE_LIFT
+                        })
+                        .count()
+                };
+                (k.ms, in_row(3).min(in_row(4)))
+            })
+            .collect();
+        assert_eq!(
+            hued.len(),
+            frames.len(),
+            "fixture: the replay kept the up move's frames"
+        );
+        (under, hued, worst(&judged), ch)
+    };
+    let (under, hued, least, ch) = read(false);
+    assert_eq!(
+        under, 0,
+        "a letter under the move up reads under the bar (least {least:?})"
+    );
+    for &(ms, n) in &hued {
+        assert!(
+            n >= ch,
+            "at {ms} ms the stroke shows {n} warm pixels in the caret's row or the comment's, \
+             under a cell's height ({ch}): it does not reach the caret"
+        );
+    }
+    let (_, faint, _, _) = read(true);
+    assert!(
+        faint.iter().all(|&(_, n)| n < ch / 4),
+        "control: the shade laid faint and cut, the rows to the caret still show the stroke: \
+         {faint:?}"
+    );
+}
+
+/// A pixel whose red stands this far over its green shows a warm hue on a teal page
+/// ([`a_one_colour_move_up_a_dim_page_is_one_stroke`]).
+const HUE_LIFT: u32 = 16;
+
 /// What the letter under the caret keeps: [`BAR`], or 97% of what the theme's own caret
 /// leaves it where that is under the bar (the lab's dim-page rule).
 fn caret_bar(own: f64) -> f64 {
@@ -2115,6 +2424,7 @@ fn caret_letter_least(
     r.caret = true;
     if let Some(law) = off {
         r.fx.set_caret_letter_law(law, false);
+        r.fx.set_bloom_spares_letters(false);
     }
     r.run(&ev, tail)
         .iter()
@@ -2137,8 +2447,10 @@ type CaretVerdict = (&'static str, Look, Option<(u64, Letter)>);
 /// it. Replayed with the host's post passes, every style but Classic keeps the letter under
 /// the caret at the bar ([`caret_bar`]) on the dark, GitHub Light, Default Light and Solarized
 /// Dark pages, every frame the caret holds it. Negative controls, each law off on the dark
-/// page: Laser's bolt kept over the letter hides it, Fire's ember held to the page floor
-/// leaves it under the bar, and Water's light left on the caret's cell lifts it under the bar.
+/// page and the post passes over the letters as the host drew them until looks10
+/// (`BloomGate::SparesLetters` off): Laser's bolt kept over the letter hides it, Fire's ember
+/// held to the page floor leaves it under the bar, and Water's light left on the caret's cell
+/// lifts it under the bar (spared, Water keeps `!` at 4.79:1 with its light left on).
 #[test]
 fn the_letter_under_the_caret_reads() {
     use aterm_effects::cursor_glow::CaretLetterLaw;

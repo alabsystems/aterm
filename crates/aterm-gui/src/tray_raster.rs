@@ -147,9 +147,35 @@ struct SemanticPrewarmResult {
     elapsed_ms: u64,
 }
 
+#[derive(Default)]
+struct SemanticPrewarmSlot {
+    job: Option<SemanticPrewarmJob>,
+    closed: bool,
+}
+
 struct SemanticPrewarmQueue {
-    semantic_job: Mutex<Option<SemanticPrewarmJob>>,
+    semantic_job: Mutex<SemanticPrewarmSlot>,
     ready: Condvar,
+}
+
+impl SemanticPrewarmQueue {
+    fn new() -> Self {
+        Self {
+            semantic_job: Mutex::new(SemanticPrewarmSlot::default()),
+            ready: Condvar::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_job(job: SemanticPrewarmJob) -> Self {
+        Self {
+            semantic_job: Mutex::new(SemanticPrewarmSlot {
+                job: Some(job),
+                closed: false,
+            }),
+            ready: Condvar::new(),
+        }
+    }
 }
 
 struct SemanticPrewarmWorker {
@@ -173,10 +199,7 @@ impl SemanticPrewarmWorker {
     }
 
     fn spawn_serialized_by(gate: &'static Mutex<()>, role: crate::qos::Role) -> Option<Self> {
-        let queue = Arc::new(SemanticPrewarmQueue {
-            semantic_job: Mutex::new(None),
-            ready: Condvar::new(),
-        });
+        let queue = Arc::new(SemanticPrewarmQueue::new());
         let worker_queue = Arc::clone(&queue);
         let (tx, results) = std::sync::mpsc::channel();
         crate::qos::spawn_lane_thread("aterm-semantic-font-prewarm", role, move || {
@@ -187,13 +210,16 @@ impl SemanticPrewarmWorker {
                     .semantic_job
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                while slot.is_none() {
+                while slot.job.is_none() && !slot.closed {
                     slot = worker_queue
                         .ready
                         .wait(slot)
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
-                let Some(job) = slot.take() else {
+                if slot.closed {
+                    break;
+                }
+                let Some(job) = slot.job.take() else {
                     continue;
                 };
                 drop(slot);
@@ -201,14 +227,21 @@ impl SemanticPrewarmWorker {
                 let _serial = gate
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if worker_queue
-                    .semantic_job
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .as_ref()
-                    .is_some_and(|newer| newer.generation != job.generation)
                 {
-                    continue;
+                    let current = worker_queue
+                        .semantic_job
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if current.closed {
+                        break;
+                    }
+                    if current
+                        .job
+                        .as_ref()
+                        .is_some_and(|newer| newer.generation != job.generation)
+                    {
+                        continue;
+                    }
                 }
                 let started = std::time::Instant::now();
                 if let Some(mut renderer) = job.base {
@@ -261,7 +294,10 @@ impl SemanticPrewarmWorker {
             .semantic_job
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(previous) = pending.take() {
+        if pending.closed {
+            return;
+        }
+        if let Some(previous) = pending.job.take() {
             let carries_base = crate::semantic_prewarm_replacement_carries_base(
                 job.base.is_some(),
                 previous.base.is_some(),
@@ -270,7 +306,7 @@ impl SemanticPrewarmWorker {
                 job.base = previous.base;
             }
         }
-        *pending = Some(job);
+        pending.job = Some(job);
         drop(pending);
         self.queue.ready.notify_one();
     }
@@ -280,7 +316,22 @@ impl SemanticPrewarmWorker {
             .semantic_job
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .job
             .take();
+    }
+}
+
+impl Drop for SemanticPrewarmWorker {
+    fn drop(&mut self) {
+        let mut slot = self
+            .queue
+            .semantic_job
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.job = None;
+        slot.closed = true;
+        drop(slot);
+        self.queue.ready.notify_all();
     }
 }
 
@@ -970,6 +1021,9 @@ pub(crate) enum LinesRule {
     Copy,
     /// A setting's name on its row's label lines (`native_settings::row_name_lines`).
     RowName,
+    /// A setting's name and the state its last line holds, as the row's line reads them
+    /// (`native_settings::row_name_lines_holding`).
+    RowNameHolding,
 }
 
 type LinesAt = (LinesRule, u16, u32, u32);
@@ -1365,9 +1419,26 @@ fn land_chrome_coverage(warm: impl FnOnce() -> usize, wake: impl FnOnce()) -> us
 /// first open's Japanese, parsed by the coverage warm or a terminal's fallback) is drawn
 /// again once it has, not left blank until something else redraws.
 pub(crate) fn chrome_coverage_epoch() -> u64 {
+    use std::hash::Hasher;
+
+    coverage_epoch_locked(&mut lock_fonts()).finish()
+}
+
+/// EVERY FACE CHROME TEXT MEASURES IN: [`chrome_coverage_epoch`]'s, and the terminal faces
+/// installed as chrome's primary and bold ([`set_chrome_fonts`]), by install, which measure a
+/// char the UI face lacks before any other ([`ChromeFonts::face_for`]).
+pub(crate) fn chrome_measure_epoch() -> u64 {
     use std::hash::{Hash, Hasher};
 
     let mut fonts = lock_fonts();
+    let mut epoch = coverage_epoch_locked(&mut fonts);
+    fonts.semantic_generation.hash(&mut epoch);
+    epoch.finish()
+}
+
+fn coverage_epoch_locked(fonts: &mut ChromeFonts) -> std::collections::hash_map::DefaultHasher {
+    use std::hash::Hash;
+
     fonts.sync_coverage();
     let mut epoch = std::collections::hash_map::DefaultHasher::new();
     fonts
@@ -1380,7 +1451,7 @@ pub(crate) fn chrome_coverage_epoch() -> u64 {
     }
     fonts.ui_regular.as_ref().map(Arc::as_ptr).hash(&mut epoch);
     fonts.ui_semibold.as_ref().map(Arc::as_ptr).hash(&mut epoch);
-    epoch.finish()
+    epoch
 }
 
 /// How many chars chrome text has measured or drawn with no face of the chrome stack (a
@@ -1487,10 +1558,7 @@ pub(crate) fn install_settled_chrome_fonts_for_test(mut renderer: Renderer) -> u
 pub(crate) fn install_pending_chrome_fonts_for_test(
     renderer: Renderer,
 ) -> PendingChromeFontsForTest {
-    let queue = Arc::new(SemanticPrewarmQueue {
-        semantic_job: Mutex::new(None),
-        ready: Condvar::new(),
-    });
+    let queue = Arc::new(SemanticPrewarmQueue::new());
     let (tx, results) = std::sync::mpsc::channel();
     let mut fonts = lock_fonts();
     install_chrome_faces_locked(&mut fonts, None, None, Some(renderer));
@@ -1515,6 +1583,7 @@ impl PendingChromeFontsForTest {
             .semantic_job
             .lock()
             .unwrap()
+            .job
             .take()
             .expect("a real font request");
         assert!(
@@ -1690,6 +1759,15 @@ pub(crate) fn host_ui_cjk_faces_for_test() -> Option<Arc<UiCjkFaces>> {
     UiCjkFaces::host().map(Arc::new)
 }
 
+/// Stand `face` in for this test thread's UI faces, regular and semibold, until the next install
+/// ([`set_chrome_fonts`]): a test that holds it measures in the same faces whatever the host's.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn set_ui_face_for_test(face: &Arc<ChromeFont>) {
+    let mut fonts = lock_fonts();
+    fonts.ui_regular = Some(Arc::clone(face));
+    fonts.ui_semibold = Some(Arc::clone(face));
+}
+
 /// The inverse seam: return this test thread's chrome stack to the cold, UI-face-less store.
 #[cfg(test)]
 pub(crate) fn clear_ui_fonts_for_test() {
@@ -1736,6 +1814,23 @@ pub(crate) fn prepared_semantic_font_for_direct_view_test(
             pending: false,
         },
         renderer: Some(renderer),
+    }
+}
+
+/// A host-prepared semantic font over `renderer` (a test's own face, such as a system one:
+/// macOS's, the only host a test reads one on).
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn prepared_semantic_font_from_renderer_for_test(
+    renderer: Renderer,
+) -> PreparedSemanticFont {
+    PreparedSemanticFont {
+        candidate: crate::widget::SemanticFontCandidate::default(),
+        snapshot: SemanticFontSnapshot {
+            status: "host-prepared test renderer ready".to_string(),
+            ready_epoch: 1,
+            pending: false,
+        },
+        renderer: Some(Rc::new(renderer)),
     }
 }
 
@@ -2545,7 +2640,18 @@ pub(crate) fn warm_chrome_font_assets() {}
 /// chrome-face install epoch with the parsed East Asian UI faces, the coverage rung's size and
 /// the UI regular's presence folded in.
 pub(crate) fn strip_band_font_epoch() -> u64 {
+    font_epoch_in(&mut lock_fonts())
+}
+
+/// The UI face `face` sets text in, then [`strip_band_font_epoch`], read under one lock.
+pub(crate) fn ui_font_and_epoch(face: TextFace) -> (Option<Arc<ChromeFont>>, u64) {
     let mut fonts = lock_fonts();
+    let font = fonts.ui_font(face).cloned();
+    (font, font_epoch_in(&mut fonts))
+}
+
+/// [`strip_band_font_epoch`] of `fonts`.
+fn font_epoch_in(fonts: &mut ChromeFonts) -> u64 {
     fonts.poll_semantic_renderer();
     fonts.sync_coverage();
     let ui_cjk = fonts
@@ -2936,6 +3042,19 @@ pub(crate) fn ui_text_wrap_ranges(
     ui_text_wrap_ranges_impl(text, px, maximum_width).0
 }
 
+thread_local! {
+    /// Whether a [`ui_text_width_for`] in [`ui_measures_whole`] measured a width the memo drops.
+    static UI_MEASURE_PARTIAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// What `measure` returns, and whether every UI-face width it measured is one the memo keeps.
+pub(crate) fn ui_measures_whole<T>(measure: impl FnOnce() -> T) -> (T, bool) {
+    let outer = UI_MEASURE_PARTIAL.with(|partial| partial.replace(false));
+    let out = measure();
+    let partial = UI_MEASURE_PARTIAL.with(|partial| partial.replace(outer || partial.get()));
+    (out, !partial)
+}
+
 /// Face-aware proportional measure.
 pub(crate) fn ui_text_width_for(face: TextFace, s: &str, px: f32) -> f32 {
     let mut fonts = lock_fonts();
@@ -2946,8 +3065,9 @@ pub(crate) fn ui_text_width_for(face: TextFace, s: &str, px: f32) -> f32 {
     }
     let font = fonts.ui_font(face).cloned();
     let (width, _, whole) = ui_text_width_walk(&mut fonts, face, s, px, 0.0);
-    if whole && let Some(font) = font.as_ref() {
-        fonts.measures.keep_width(face, font, px, s, width);
+    match font.as_ref() {
+        Some(font) if whole => fonts.measures.keep_width(face, font, px, s, width),
+        _ => UI_MEASURE_PARTIAL.with(|partial| partial.set(true)),
     }
     width
 }
@@ -3998,14 +4118,79 @@ fn render_specimen_frame(spec: &TerminalSpecimenSpec, scale: f32) -> Option<ater
         let input = walled.as_ref().unwrap_or(&*spec.input);
         Some(match spec.motion.as_deref() {
             Some(scene) => {
-                let input = scene.decorate(input, renderer.cell_size());
+                let ink = renderer.glyph_ink();
+                let input = scene.decorate_inked(input, renderer.cell_size(), Some(&ink));
                 let mut frame = renderer.try_render_input(&input).ok()?;
-                scene.post_process(&mut frame, &input).ok()?;
+                let place = renderer.fx_frame(frame.width, frame.height, input.rows);
+                let (cell_w, cell_h) = renderer.cell_size();
+                let grid = aterm_render::bloom::LetterGrid {
+                    pad: place.pad,
+                    grid_top: place.grid_top,
+                    cell_w,
+                    cell_h,
+                };
+                scene.post_process(&mut frame, &input, grid).ok()?;
                 frame
             }
             None => renderer.try_render_input(input).ok()?,
         })
     })
+}
+
+/// `spec`'s card with `input` (a cursor scene's decorated cells, its lights cleared) in place
+/// of its own and no scene played: the bare twin `settings card clean` answers.
+pub(crate) fn render_bare_scene_card(
+    spec: &TerminalSpecimenSpec,
+    input: aterm_render::RenderInput,
+    scale: f32,
+) -> Option<aterm_render::Frame> {
+    render_specimen_frame(
+        &TerminalSpecimenSpec {
+            input: std::sync::Arc::new(input),
+            motion: None,
+            wallpaper: None,
+            ..spec.clone()
+        },
+        scale,
+    )
+}
+
+/// What `spec`'s card face lays of each glyph at `scale` ([`Renderer::glyph_ink`]), as the
+/// card's raster hands its scene. A fork rasterizes every printable glyph again, so this
+/// thread keeps the ink of each face, size, line height and theme it has asked for; an entry
+/// holds its face, so no later face takes its address.
+#[cfg(test)]
+pub(crate) fn specimen_glyph_ink_for_test(
+    spec: &TerminalSpecimenSpec,
+    scale: f32,
+) -> Option<std::sync::Arc<aterm_render::GlyphInk>> {
+    type Inks = Vec<(
+        Rc<Renderer>,
+        (u32, u32, aterm_render::Theme),
+        Arc<aterm_render::GlyphInk>,
+    )>;
+    thread_local! {
+        static INKS: std::cell::RefCell<Inks> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let face = spec.prepared_font.renderer.as_ref()?;
+    let px = spec.font_px * scale;
+    let key = (px.to_bits(), spec.line_height.to_bits(), spec.theme);
+    let held = INKS.with_borrow(|inks| {
+        inks.iter()
+            .find(|(held, at, _)| Rc::ptr_eq(held, face) && *at == key)
+            .map(|(_, _, ink)| Arc::clone(ink))
+    });
+    if held.is_some() {
+        return held;
+    }
+    let mut renderer = spec.prepared_font.fork(px, spec.theme)?;
+    renderer.set_pad(0);
+    renderer.set_head(0);
+    renderer.set_line_height(spec.line_height);
+    renderer.activate_px(px);
+    let ink = renderer.glyph_ink();
+    INKS.with_borrow_mut(|inks| inks.push((Rc::clone(face), key, Arc::clone(&ink))));
+    Some(ink)
 }
 
 /// The device cell size a specimen renders with at `scale`, from a fresh fork.
@@ -4487,11 +4672,9 @@ impl Canvas {
         let Some(frame) = specimen_frame(spec, scale) else {
             return;
         };
-        self.blit_terminal_frame(
-            &frame,
-            (x * scale).round() as i32,
-            (y * scale).round() as i32,
-        );
+        let at = ((x * scale).round() as i32, (y * scale).round() as i32);
+        self.blit_terminal_frame(&frame, at.0, at.1);
+        crate::settings_preview::note_scene_card_painted(spec, scale, at);
     }
 
     fn blit_terminal_frame(&mut self, frame: &aterm_render::Frame, x: i32, y: i32) {
@@ -5406,11 +5589,14 @@ fn replay_tray(
             ),
             DrawPrim::TerminalSpecimen { x, y, spec } => {
                 match frames.iter().find(|(at, _)| *at == index) {
-                    Some((_, frame)) => cv.blit_terminal_frame(
-                        frame,
-                        (x * scale).round() as i32,
-                        (y * scale).round() as i32,
-                    ),
+                    Some((_, frame)) => {
+                        // The occluding specimen's frame, prepared once for the whole raster: a
+                        // cursor scene card blitted here is the one a capture shows, as
+                        // [`Canvas::terminal_specimen`] notes its own.
+                        let at = ((x * scale).round() as i32, (y * scale).round() as i32);
+                        cv.blit_terminal_frame(frame, at.0, at.1);
+                        crate::settings_preview::note_scene_card_painted(spec, scale, at);
+                    }
                     None => cv.terminal_specimen(*x, *y, spec, scale),
                 }
             }
@@ -7350,10 +7536,7 @@ mod tests {
         fonts.semantic_prewarm_ms = Some(0);
         let (_results_tx, results) = std::sync::mpsc::channel();
         fonts.semantic_worker = Some(SemanticPrewarmWorker {
-            queue: Arc::new(SemanticPrewarmQueue {
-                semantic_job: Mutex::new(None),
-                ready: Condvar::new(),
-            }),
+            queue: Arc::new(SemanticPrewarmQueue::new()),
             results,
         });
         fonts.semantic_worker_generation = Some(1);
@@ -7390,10 +7573,7 @@ mod tests {
         fonts.semantic_prewarm_ms = Some(0);
         let (_results_tx, results) = std::sync::mpsc::channel();
         fonts.semantic_worker = Some(SemanticPrewarmWorker {
-            queue: Arc::new(SemanticPrewarmQueue {
-                semantic_job: Mutex::new(None),
-                ready: Condvar::new(),
-            }),
+            queue: Arc::new(SemanticPrewarmQueue::new()),
             results,
         });
         fonts.semantic_worker_generation = Some(1);
@@ -7469,15 +7649,12 @@ mod tests {
         let model = aterm_models_misc::semantic_prewarm_generation_model();
         let mut fonts = default_chrome_fonts();
         fonts.semantic_generation = 1;
-        let queue = Arc::new(SemanticPrewarmQueue {
-            semantic_job: Mutex::new(Some(SemanticPrewarmJob {
-                generation: 1,
-                request: 1,
-                candidate: crate::widget::SemanticFontCandidate::default(),
-                base: None,
-            })),
-            ready: Condvar::new(),
-        });
+        let queue = Arc::new(SemanticPrewarmQueue::with_job(SemanticPrewarmJob {
+            generation: 1,
+            request: 1,
+            candidate: crate::widget::SemanticFontCandidate::default(),
+            base: None,
+        }));
         let (_results_tx, results) = std::sync::mpsc::channel();
         fonts.semantic_worker = Some(SemanticPrewarmWorker {
             queue: Arc::clone(&queue),
@@ -7493,6 +7670,7 @@ mod tests {
                 .semantic_job
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .job
                 .as_ref()
                 .map_or(0, |job| job.generation);
             state.insert("queued", i64::try_from(queued).expect("small generation"));
@@ -7569,10 +7747,7 @@ mod tests {
                             }
                             let (results_tx, results) = std::sync::mpsc::channel();
                             fonts.semantic_worker = Some(SemanticPrewarmWorker {
-                                queue: Arc::new(SemanticPrewarmQueue {
-                                    semantic_job: Mutex::new(None),
-                                    ready: Condvar::new(),
-                                }),
+                                queue: Arc::new(SemanticPrewarmQueue::new()),
                                 results,
                             });
                             results_tx
@@ -7693,6 +7868,102 @@ mod tests {
             "returning to B is a bounded renderer-cache swap"
         );
         assert_eq!(fonts.semantic_identity.as_ref(), Some(&second));
+    }
+
+    #[test]
+    fn dropping_the_semantic_prewarm_worker_stops_an_idle_thread_and_frees_its_retained_base() {
+        let wait_exited = |weak: &std::sync::Weak<SemanticPrewarmQueue>, label: &str| {
+            let started = std::time::Instant::now();
+            while weak.strong_count() > 0 && started.elapsed() < std::time::Duration::from_secs(60)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert_eq!(
+                weak.strong_count(),
+                0,
+                "idle semantic prewarm thread survived after owner drop ({label})"
+            );
+        };
+
+        let gate: &'static Mutex<()> = Box::leak(Box::new(Mutex::new(())));
+
+        // 1. Negative control: while `slot.closed` stays false (as before `Drop` closed and woke
+        //    the queue), a parked worker thread continues holding its `Arc<SemanticPrewarmQueue>`.
+        let mut unclosed = std::mem::ManuallyDrop::new(
+            SemanticPrewarmWorker::spawn_serialized_by(gate, crate::qos::Role::Responsive)
+                .expect("spawn semantic prewarm worker"),
+        );
+        let weak_unclosed = Arc::downgrade(&unclosed.queue);
+        assert_eq!(
+            weak_unclosed.strong_count(),
+            2,
+            "negative control: without Drop closing the slot, both owner and parked thread hold the queue"
+        );
+        unclosed.queue.ready.notify_all();
+        std::thread::yield_now();
+        assert_eq!(
+            weak_unclosed.strong_count(),
+            2,
+            "negative control: spurious wake with slot.closed == false leaves the worker parked"
+        );
+        // SAFETY: `unclosed` was initialized once above and is never accessed again after drop.
+        unsafe { std::mem::ManuallyDrop::drop(&mut unclosed) };
+        wait_exited(&weak_unclosed, "cold parked worker");
+
+        // 2. Warm-parked worker holding a prepared `Renderer` base and face cache exits on drop.
+        let mut renderer = Renderer::from_bytes(
+            aterm_render::embedded_font(),
+            14.0,
+            aterm_render::Theme::default(),
+        )
+        .expect("embedded renderer");
+        renderer.set_runtime_font_discovery(false);
+        let mut fonts = default_chrome_fonts();
+        fonts.semantic_worker =
+            SemanticPrewarmWorker::spawn_serialized_by(gate, crate::qos::Role::Responsive);
+        let weak_warm = Arc::downgrade(
+            &fonts
+                .semantic_worker
+                .as_ref()
+                .expect("spawned warm worker")
+                .queue,
+        );
+        fonts.semantic_generation = 1;
+        fonts.semantic = Some(renderer);
+        fonts.semantic_identity = Some(crate::widget::SemanticFontCandidate::default());
+        let candidate = crate::widget::SemanticFontCandidate {
+            regular: Some("No Such Candidate Warm 4D2A".to_string()),
+            ..crate::widget::SemanticFontCandidate::default()
+        };
+        assert!(fonts.ensure_semantic_candidate(&candidate));
+        await_semantic_landing(&mut fonts);
+        fonts.semantic_worker = None;
+        wait_exited(&weak_warm, "warm parked worker with retained base");
+
+        // 3. Worker blocked on `gate` after popping a job exits without building once dropped.
+        let serial = gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let worker = SemanticPrewarmWorker::spawn_serialized_by(gate, crate::qos::Role::Responsive)
+            .expect("spawn gated worker");
+        let weak_gated = Arc::downgrade(&worker.queue);
+        worker.submit_latest(SemanticPrewarmJob {
+            generation: 3,
+            request: 1,
+            candidate: crate::widget::SemanticFontCandidate::default(),
+            base: None,
+        });
+        let started = std::time::Instant::now();
+        while weak_gated
+            .upgrade()
+            .is_some_and(|q| q.semantic_job.lock().unwrap().job.is_some())
+            && started.elapsed() < std::time::Duration::from_secs(60)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        drop(worker);
+        drop(serial);
+        wait_exited(&weak_gated, "worker waiting on serialization gate");
     }
 
     #[test]

@@ -399,7 +399,7 @@ macro_rules! bind {
                 self.term.cursor_style() as u8
             }
 
-            /// Set the default DECSCUSR cursor style (`1..=6`; out-of-range ignored).
+            /// Set the default DECSCUSR cursor style (`0..=6`, where `0` aliases `1`; out-of-range ignored).
             pub fn set_default_cursor_style(&mut self, n: u8) {
                 self.note_host_visual_change();
                 if let Some(style) = CursorStyle::from_param(u16::from(n)) {

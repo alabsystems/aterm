@@ -7,6 +7,7 @@ fn write_session(state: &aterm_spec::interp::State) -> [i64; 4] {
     let observed = snap("s-session-model");
     let generation: Arc<Mutex<()>> = Arc::default();
     let look = AccountLook {
+        profile_env: Vec::new(),
         who: accounts::ProcessLogin::of_env([]),
         label: Some("work-2".into()),
         snap: observed.clone(),

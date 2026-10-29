@@ -387,14 +387,20 @@ mod tests {
             )],
         );
         let details: Vec<&str> = found.iter().map(|f| f.detail.as_str()).collect();
-        assert_eq!(
-            details,
-            [
-                "`Instant::now`: the monotonic clock, in Aos step code: time and randomness enter \
-                 only as recorded inputs (M0-14)",
-                "`rand::`: a random draw through the `rand` module, in Aos step code: time and \
-                 randomness enter only as recorded inputs (M0-14)",
-            ]
+        assert_eq!(details.len(), 2, "{details:?}");
+        let monotonic = AOS_READS
+            .iter()
+            .find(|r| r.0 == "Instant::now")
+            .expect("the Instant::now row")
+            .2;
+        assert!(
+            details[0].starts_with("`Instant::now`:") && details[0].contains(monotonic),
+            "{details:?}"
+        );
+        assert!(details[1].starts_with("`rand::`:"), "{details:?}");
+        assert!(
+            details.iter().all(|d| d.ends_with(ENTERS_AS_INPUT)),
+            "{details:?}"
         );
         assert!(found.iter().all(|f| f.rule == "aos-step-clock"));
     }

@@ -202,7 +202,11 @@ struct Lab {
 impl Lab {
     fn new(scratch: &Scratch) -> Self {
         let t = scratch.mkdir("lab");
+        // A program install.sh only runs is a shared stand-in; one whose verdict is where it
+        // resolves (gate_store_targo's physical path: a store's targo, a stray one) is a
+        // program, a file of its own in the lab.
         let lay = |rel: &str, body: &str| scratch.stand_in(&format!("lab/{rel}"), body);
+        let program = |rel: &str, body: &str| scratch.program(&format!("lab/{rel}"), body);
         for dir in [
             "cargo-home/bin",
             "rustup-keg",
@@ -240,7 +244,7 @@ impl Lab {
         for dir in ["nohome", "none"] {
             scratch.mkdir(&format!("lab/{dir}"));
         }
-        lay("atpkg/store/trust/9192/bin/targo", STORE_TARGO);
+        program("atpkg/store/trust/9192/bin/targo", STORE_TARGO);
         lay(
             "atpkg/store/trust/9192/bin/trustc",
             "#!/bin/sh\necho \"rustc 9.9.9-dev (fake00000 2026-01-01) (trustc 0.1.0)\"\n",
@@ -258,12 +262,12 @@ impl Lab {
         lay("atpkg-cli/aterm", FAKE_ATERM);
         lay("bare-aterm/aterm", BARE_ATERM);
         lay("not-me/id", NOT_ME_ID);
-        lay("atpkg-broken/store/trust/9193/bin/targo", STORE_TARGO);
+        program("atpkg-broken/store/trust/9193/bin/targo", STORE_TARGO);
         scratch.exe(
             "lab/atpkg-broken/bin/targo",
             &shim("atpkg-broken/store/trust/9193/bin/targo"),
         );
-        lay("stray-targo/targo", STORE_TARGO);
+        program("stray-targo/targo", STORE_TARGO);
         scratch.write(
             "lab/stock-pin/rust-toolchain.toml",
             "[toolchain]\nchannel = \"stable\"\n",
@@ -1263,9 +1267,9 @@ fn under_root_the_proof_runs_no_toolchain_file_another_account_can_change() {
     let root = s(&lab.checkout).to_string();
     let theirs_cargo =
         format!("#!/bin/sh\necho \"theirs $*\" >>\"${{SHIM_LOG:?}}\"\necho \"{PIN_VERSION}\"\n");
-    scratch.stand_in("lab/theirs/toolchain/bin/cargo", &theirs_cargo);
-    scratch.stand_in("lab/theirs/rustc", RUSTUP);
-    scratch.stand_in(
+    scratch.program("lab/theirs/toolchain/bin/cargo", &theirs_cargo);
+    scratch.program("lab/theirs/rustc", RUSTUP);
+    scratch.program(
         "lab/theirs/trustc",
         "#!/bin/sh\necho \"theirs $*\" >>\"${SHIM_LOG:?}\"\n",
     );
@@ -1275,7 +1279,7 @@ fn under_root_the_proof_runs_no_toolchain_file_another_account_can_change() {
         "../../theirs/rustc",
         &scratch.join("lab/mixed-home/bin/rustc"),
     );
-    scratch.stand_in("lab/root-store/store/trust/7/bin/targo", STORE_TARGO);
+    scratch.program("lab/root-store/store/trust/7/bin/targo", STORE_TARGO);
     symlink(
         "../../../../../theirs/trustc",
         &scratch.join("lab/root-store/store/trust/7/bin/trustc"),
@@ -1286,7 +1290,7 @@ fn under_root_the_proof_runs_no_toolchain_file_another_account_can_change() {
         "lab/rootchain/bin/cargo",
         &format!("#!/bin/sh\necho \"{PIN_VERSION}\"\n"),
     );
-    scratch.stand_in(
+    scratch.program(
         "lab/theirs/pin-rustc",
         "#!/bin/sh\necho \"theirs $*\" >>\"${SHIM_LOG:?}\"\n",
     );

@@ -29,12 +29,21 @@ fn told(birth: u64) -> String {
 }
 
 /// What a step of a run reads: a break of the agent's background work, or a turn end the
-/// policy decides at (the agent's last words numbered by the step).
+/// policy decides at (the agent's last words numbered by the step); or such a turn end whose
+/// decision is not carried out (the host's step went first) and which the policy decides again
+/// (`Session::turn_end_now`, its re-decision of the same point); or a turn end whose words say
+/// the work is done (the policy's done check).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
     Break,
     End,
+    Again,
+    Done,
 }
+
+/// What moves between a point's decision and its act: the session, and the options the act is
+/// carried out under.
+type Between<'a> = &'a dyn Fn(&mut Session<'_, Logged<'_>>, &mut SuperviseOpts);
 
 struct Run<'a> {
     tag: &'a str,
@@ -42,6 +51,17 @@ struct Run<'a> {
     steps: Vec<(i64, Step)>,
     host: Arc<DoorHost>,
     seed: Option<(String, i64)>,
+    /// Run at each `Step::End` and `Step::Done` between the decision and the act.
+    between: Option<Between<'a>>,
+    /// From the step it names on, the run's points and breaks are under this policy (the owner's
+    /// configuration read again).
+    policy_from: Option<(usize, SupervisorConfig)>,
+    /// The step whose read holds, in its composer, the last text the run wrote (a line left
+    /// standing there).
+    standing: Option<usize>,
+    /// The session goes after the last step: the loop's end is booked as a gone session's
+    /// (`Session::loop_ended` on `GONE`).
+    gone: bool,
 }
 
 struct Both {
@@ -49,6 +69,8 @@ struct Both {
     /// Each step's writes' texts (`send … -- <text>`).
     sent: Vec<Vec<String>>,
     told: Vec<bool>,
+    /// Each point's decided act (`Step::End` and `Step::Done`), as its `Debug` spells it.
+    decided: Vec<String>,
 }
 
 impl Both {
@@ -121,6 +143,10 @@ impl<'a> Run<'a> {
             steps: steps.to_vec(),
             host,
             seed: None,
+            between: None,
+            policy_from: None,
+            standing: None,
+            gone: false,
         }
     }
 
@@ -148,17 +174,18 @@ impl<'a> Run<'a> {
             ledger: path.clone(),
             seen: Vec::new(),
         };
-        let opts = SuperviseOpts {
-            policy: self.policy.clone(),
+        let opts_under = |policy: &SupervisorConfig| SuperviseOpts {
+            policy: policy.clone(),
             idle_host: Some(Arc::clone(&self.host) as Arc<dyn IdleHost>),
             ..hosted(30)
         };
         // The breaks run the facts' doors alone, without Cruise's carry (`cruise_carry_loop_tests`).
-        let breaks = SupervisorConfig {
+        let breaks_under = |policy: &SupervisorConfig| SupervisorConfig {
             continue_policy: false,
-            ..self.policy.clone()
+            ..policy.clone()
         };
-        let mut sent = Vec::new();
+        let mut sent: Vec<Vec<String>> = Vec::new();
+        let mut decided = Vec::new();
         let (noted, told) = {
             let clock = Arc::new(crate::supervise::fx::ScriptedClock::default());
             clock.stand_mono();
@@ -185,14 +212,33 @@ impl<'a> Run<'a> {
                 }
                 *self.host.facts_at.lock().expect("facts_at") = at_ms;
                 before(&mut s, &self.host, i);
+                let policy = match &self.policy_from {
+                    Some((from, policy)) if i >= *from => policy,
+                    _ => &self.policy,
+                };
+                let (opts, breaks) = (opts_under(policy), breaks_under(policy));
                 let rows = match step {
                     Step::Break => break_screen(),
-                    Step::End => ran_then_ended(&format!(
+                    Step::End | Step::Again => ran_then_ended(&format!(
                         "Stage {i} of the parser is in; the lexer is next."
                     )),
+                    Step::Done => ran_then_ended("Fixed the parser; all done."),
                 };
-                s.ctl.m.screens = vec![rows];
+                let (rows, stands) = match sent.iter().flatten().last() {
+                    Some(text) if self.standing == Some(i) => (drafted(rows, text), true),
+                    _ => (rows, false),
+                };
+                // A re-decision reads the point again.
+                s.ctl.m.screens = match step {
+                    Step::Again => vec![rows.clone(), rows],
+                    Step::Break | Step::End | Step::Done => vec![rows],
+                };
                 s.ctl.m.served = 0;
+                if stands {
+                    // The caret sits after the line it left, as a typed draft reads.
+                    s.ctl.m.screen_cols.insert(0, 12);
+                    s.ctl.m.screen_cols.insert(1, 12);
+                }
                 let from = s.ctl.seen.len();
                 let screen = s.screen().expect("the step's read");
                 s.clock_marks = Some((s.fx.mono(), at_ms));
@@ -200,14 +246,33 @@ impl<'a> Run<'a> {
                     Step::Break => s
                         .host_steps_in_background(&screen, &mut since, Some(&breaks), &mut heard)
                         .expect("the break's step"),
-                    Step::End => {
+                    Step::End | Step::Done => {
                         since = None;
                         let point = s.turn_of(screen);
                         let action = s
+                            .turn_end_looked(
+                                &point,
+                                Some(Duration::from_secs(720)),
+                                &opts,
+                                &mut heard,
+                            )
+                            .expect("the point's decision");
+                        decided.push(format!("{action:?}"));
+                        let mut act_opts = opts.clone();
+                        if let Some(between) = self.between {
+                            between(&mut s, &mut act_opts);
+                        }
+                        s.turn_end_execute(&point, action, &act_opts, &[], &mut heard)
+                            .expect("the point's act");
+                    }
+                    Step::Again => {
+                        since = None;
+                        let point = s.turn_of(screen);
+                        let _left = s
                             .turn_end_at_point(&point, Some(Duration::from_secs(720)), &opts)
                             .expect("the point's decision");
-                        s.turn_end_execute(&point, action, &opts, &[], &mut heard)
-                            .expect("the point's act");
+                        s.turn_end_now(&point, &opts, &[], &mut heard)
+                            .expect("the point's re-decision");
                     }
                 }
                 sent.push(
@@ -216,6 +281,11 @@ impl<'a> Run<'a> {
                         .filter_map(|(r, _)| sent_text(r))
                         .collect(),
                 );
+            }
+            if self.gone {
+                let policy = self.policy_from.as_ref().map_or(&self.policy, |(_, p)| p);
+                let end = Err(GONE.to_string());
+                s.loop_ended(&end, &opts_under(policy), &mut heard);
             }
             let told = asked
                 .iter()
@@ -240,6 +310,7 @@ impl<'a> Run<'a> {
             },
             sent,
             told,
+            decided,
         }
     }
 }
@@ -657,8 +728,12 @@ fn a_restart_does_not_retell_a_told_call() {
     );
 }
 
+/// AN ACT LEFT IN THE COMPOSER LEAVES THE FACT IT CARRIED (the slice-2 plan's 2.9b): written and
+/// its Enter not gone, by the fenced `key` or each `turn` verb's skip, the fact is neither told
+/// nor untold (`fact-no-progress@v1 waiting … left`), owed the next look
+/// (`occupancy_left_ride_tests`).
 #[test]
-fn a_prompt_left_in_the_composer_says_its_fact_not_submitted() {
+fn a_prompt_left_in_the_composer_leaves_its_fact_to_the_next_look() {
     let fenced = Run::new(
         "facts-left",
         keyed(Occupancy::Off, false),
@@ -716,15 +791,16 @@ fn a_prompt_left_in_the_composer_says_its_fact_not_submitted() {
         assert_eq!(
             rows.last()
                 .map(|(rule, decision, _)| (rule.as_str(), decision.as_str())),
-            Some((NO_PROGRESS, "skipped")),
+            Some((NO_PROGRESS, "waiting")),
             "{rows:#?}"
         );
         assert!(
             rows.last()
-                .is_some_and(|(_, _, reason)| reason.ends_with(" why=not-submitted")),
+                .is_some_and(|(_, _, reason)| reason.ends_with(" door=turn-end left")),
             "{rows:#?}"
         );
         assert_eq!(left.told, [false], "{:#?}", left.ran.noted);
+        assert_eq!(left.facts("turn-end"), ["left"], "{:#?}", left.ran.noted);
     }
 }
 
@@ -877,3 +953,6 @@ fn a_due_wake_goes_before_the_stuck_fact_at_a_break() {
         alone.ran.noted
     );
 }
+
+#[path = "occupancy_wake_ride_tests.rs"]
+mod wake_ride;

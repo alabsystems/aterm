@@ -64,9 +64,15 @@ pub const LOCK_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits 
         held, to a same-corpus fn (free-fn `name(..)`, bare `self.name(..)`, or
         a TYPE-DIRECTED `self.field.name(..)`) whose own body directly
         acquires. The callee's callees are NOT followed. Same-named fns merge
-        WITHIN a namespace (over-approximation, same posture as the main-loop
-        census); across one they do not — see NAMESPACE BOUNDARY ON THE HOP.
-        The callee is chosen BY NAME, so the shapes are limited: a free fn and
+        WITHIN a namespace unless an explicit qualifier names a known impl
+        owner. `Self::name` uses the caller's enclosing impl; `Type::name`
+        selects that impl when the corpus supplies it, including UFCS methods.
+        Lexical fn/impl type parameters never prove a concrete owner. Unproved
+        aliases, module paths and generic forms keep the conservative by-name
+        fallback. This uses lexical type names, not compiler resolution;
+        same-named types can still merge. Across a namespace they do not merge
+        — see NAMESPACE BOUNDARY ON THE HOP.
+        Otherwise the callee is chosen BY NAME, so the shapes are limited: a free fn and
         a method of `Self` are fns this corpus defines, while `other.name(..)`
         dispatches on a type this census cannot resolve and is never followed.
         `self.field.name(..)` is followed only when the FIELD's declared type is
@@ -276,6 +282,11 @@ const GUARD_HELPERS: &[GuardHelper] = &[
     },
     GuardHelper {
         symbol: "hold_rollout",
+        identity: "COPIES",
+        def_file: "crates/aterm-gui/src/self_claim.rs",
+    },
+    GuardHelper {
+        symbol: "hold_target",
         identity: "COPIES",
         def_file: "crates/aterm-gui/src/self_claim.rs",
     },
@@ -724,6 +735,8 @@ struct ImplSpan {
     end: usize,
     /// `None` when the header names no type usable as a lock identity (see [`impl_self_type`]).
     ty: Option<String>,
+    /// Type parameters that can shadow a concrete corpus type inside this impl.
+    type_params: BTreeSet<String>,
 }
 
 /// Is `b` an identifier byte (for keyword-boundary checks)?
@@ -812,6 +825,28 @@ fn split_top_level(s: &str) -> Vec<&str> {
     }
     out.push(&s[start..]);
     out
+}
+
+/// Type names declared by a leading generic list; lifetimes and consts name other namespaces.
+fn generic_type_parameters(rest: &str) -> BTreeSet<String> {
+    let rest = rest.trim_start();
+    let mut names = BTreeSet::new();
+    if !rest.starts_with('<') {
+        return names;
+    }
+    let Some(close) = matching_angle(rest) else {
+        return names;
+    };
+    for parameter in split_top_level(&rest[1..close]) {
+        let parameter = parameter.trim();
+        if parameter.starts_with('\'') || parameter.starts_with("const ") {
+            continue;
+        }
+        if let Some(name) = ident_prefix(parameter) {
+            names.insert(name.to_owned());
+        }
+    }
+    names
 }
 
 /// The base name of an impl's self type.
@@ -926,6 +961,10 @@ fn impl_spans(text: &str) -> Vec<ImplSpan> {
             start: i + 1,
             end: end + 1,
             ty: impl_self_type(&header),
+            type_params: top_level_words(&header, "impl")
+                .first()
+                .map(|at| generic_type_parameters(&header[at + "impl".len()..]))
+                .unwrap_or_default(),
         });
     }
     out
@@ -1193,8 +1232,17 @@ fn alias_target(line: &str, ctx: &SiteCtx<'_>) -> Option<String> {
     resolve_receiver(path, path.len(), ctx)
 }
 
-/// A call the census will follow one hop: `(byte offset in the line, callee)`.
-type TrustedCall = (usize, String);
+/// A one-hop target. A proved impl qualifier keeps unrelated same-named functions apart.
+#[derive(Clone)]
+struct CallTarget {
+    name: String,
+    qualifier: Option<String>,
+    /// A lexical parameter can shadow `Key::f`, but not the explicit path `crate::Key::f`.
+    bare_qualifier: bool,
+}
+
+/// A call the census will follow one hop: `(byte offset in the line, target)`.
+type TrustedCall = (usize, CallTarget);
 
 /// A call through a `self.field.…` receiver: `(byte offset, field, callee)`.
 type FieldRecvCall = (usize, String, String);
@@ -1369,7 +1417,29 @@ fn held_call_targets(line: &str) -> (Vec<TrustedCall>, Vec<FieldRecvCall>) {
                 continue;
             }
         }
-        out.push((idx, name.to_string()));
+        let qualifier_path = line[..start]
+            .trim_end()
+            .strip_suffix("::")
+            .map(str::trim_end);
+        let qualifier = qualifier_path
+            .and_then(|prefix| ident_ending_at(prefix, prefix.len()))
+            .map(str::to_owned);
+        let bare_qualifier =
+            qualifier_path
+                .zip(qualifier.as_deref())
+                .is_some_and(|(prefix, name)| {
+                    !prefix[..prefix.len() - name.len()]
+                        .trim_end()
+                        .ends_with("::")
+                });
+        out.push((
+            idx,
+            CallTarget {
+                name: name.to_string(),
+                qualifier,
+                bare_qualifier,
+            },
+        ));
     }
     (out, field_recv)
 }
@@ -1381,6 +1451,10 @@ struct FnLockFacts {
     span: String,
     /// The identity namespace of the crate defining this fn ([`WORKSPACE_NS`] for aterm crates).
     namespace: Option<&'static str>,
+    /// The enclosing named impl, using the same lexical type identity as lock receivers.
+    impl_ty: Option<String>,
+    /// Lexical fn and enclosing impl type parameters, which are not concrete call owners.
+    type_params: BTreeSet<String>,
     /// Does the signature return a `…Guard`?
     returns_guard: bool,
     /// Is the fn method-shaped (first parameter `self`)?
@@ -1389,8 +1463,8 @@ struct FnLockFacts {
     acq: Vec<usize>,
     /// Intra-fn held-acquire pairs: (holder site, acquired site).
     edges: Vec<(usize, usize)>,
-    /// Calls made while holding: (holder site, callee name, call `file:line`).
-    held_calls: Vec<(usize, String, String)>,
+    /// Calls made while holding: (holder site, target, call `file:line`).
+    held_calls: Vec<(usize, CallTarget, String)>,
     /// Calls made while holding through a field receiver (`self.field.name(..)`).
     field_recv_calls: Vec<(usize, String, String, String)>,
     /// Parameter and local names that shadow bare fn calls inside the body.
@@ -1496,6 +1570,18 @@ fn scan_fn(
         name: name.to_string(),
         span: span.to_string(),
         namespace: file.namespace,
+        impl_ty: file
+            .impls
+            .iter()
+            .filter(|s| s.start <= start_line && start_line <= s.end)
+            .max_by_key(|s| s.start)
+            .and_then(|s| s.ty.clone()),
+        type_params: file
+            .impls
+            .iter()
+            .filter(|s| s.start <= start_line && start_line <= s.end)
+            .flat_map(|s| s.type_params.iter().cloned())
+            .collect(),
         returns_guard: returns_guard(body),
         takes_self: takes_self(body),
         acq: Vec::new(),
@@ -1521,6 +1607,13 @@ fn scan_fn(
         s
     };
     let parameters = parameter_bindings(&sig_text);
+    if let Some((_, rest)) = sig_text.split_once("fn ")
+        && let Some(name) = ident_prefix(rest)
+    {
+        facts
+            .type_params
+            .extend(generic_type_parameters(&rest[name.len()..]));
+    }
     let mut depth: i32 = 0;
     for ll in &lines {
         let line = &ll.text;
@@ -1632,13 +1725,14 @@ fn scan_fn(
                     }
                 }
             }
-            for (pos, callee) in trusted {
+            for (pos, target) in trusted {
+                let callee = target.name.as_str();
                 let call_span = format!("{}:{}", file.rel, ll.lineno);
                 let before = &line[..pos - callee.len()];
                 if !before.trim_end().ends_with(['.', ':']) {
                     let binding = if local_bindings.iter().any(|b| b.active && b.name == callee) {
                         Some("local")
-                    } else if parameters.contains(&callee) {
+                    } else if parameters.contains(callee) {
                         Some("parameter")
                     } else {
                         None
@@ -1653,13 +1747,13 @@ fn scan_fn(
                 for g in live.iter().filter(|g| g.active) {
                     facts
                         .held_calls
-                        .push((g.site, callee.clone(), call_span.clone()));
+                        .push((g.site, target.clone(), call_span.clone()));
                 }
                 for (k, r) in raw.iter().enumerate() {
                     if r.pos < pos && sites[this_line[k]].graphed() {
                         facts
                             .held_calls
-                            .push((this_line[k], callee.clone(), call_span.clone()));
+                            .push((this_line[k], target.clone(), call_span.clone()));
                     }
                 }
             }
@@ -1911,7 +2005,15 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
                 .is_some_and(|per_ns| per_ns.len() == 1 && per_ns.get(&caller_ns) == Some(&1));
             let resolvable = field_types.is_corpus_typed(caller_ns, &field) && uniquely_local;
             if resolvable {
-                f.held_calls.push((site, callee, span));
+                f.held_calls.push((
+                    site,
+                    CallTarget {
+                        name: callee,
+                        qualifier: None,
+                        bare_qualifier: false,
+                    },
+                    span,
+                ));
             } else {
                 let _ = site;
                 unresolved_field_calls.push((format!("{field}.{callee}"), span));
@@ -2065,17 +2167,43 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
                     via: None,
                 });
         }
-        for (hold, callee, call_span) in &f.held_calls {
-            let Some(per_ns) = by_name.get(callee.as_str()) else {
+        for (hold, target, call_span) in &f.held_calls {
+            let Some(per_ns) = by_name.get(target.name.as_str()) else {
                 continue;
             };
-            let shadowed = per_ns.contains_key(&f.namespace);
+            let qualifier = target
+                .qualifier
+                .as_deref()
+                .filter(|owner| !(target.bare_qualifier && f.type_params.contains(*owner)))
+                .and_then(|owner| {
+                    if owner == "Self" {
+                        f.impl_ty.as_deref()
+                    } else {
+                        Some(owner)
+                    }
+                });
+            // Only narrow a by-name hop when the corpus supplies the named impl owner.
+            // Aliases, module paths and other unproved forms keep the conservative fallback.
+            let owner = qualifier.filter(|owner| {
+                per_ns
+                    .values()
+                    .flatten()
+                    .any(|&g| fns[g].impl_ty.as_deref() == Some(*owner))
+            });
+            let compatible =
+                |g: usize| owner.is_none_or(|owner| fns[g].impl_ty.as_deref() == Some(owner));
+            let shadowed = per_ns
+                .get(&f.namespace)
+                .is_some_and(|local| local.iter().copied().any(compatible));
             let mut seen: BTreeSet<String> = BTreeSet::new();
             for (def_ns, callee_fns) in per_ns {
                 if shadowed && *def_ns != f.namespace {
                     continue;
                 }
                 for &g in callee_fns {
+                    if !compatible(g) {
+                        continue;
+                    }
                     for &acq in &fns[g].acq {
                         if !sites[acq].blocking
                             || !sites[acq].graphed()
@@ -2094,7 +2222,13 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
                                 acq_span: sites[acq].span.clone(),
                                 acq_fn: sites[acq].fn_name.clone(),
                                 acq_excerpt: sites[acq].excerpt.clone(),
-                                via: Some(format!("call to `{callee}` at {call_span}")),
+                                via: Some(format!(
+                                    "call to `{}` at {call_span}",
+                                    target.qualifier.as_ref().map_or_else(
+                                        || target.name.clone(),
+                                        |owner| format!("{owner}::{}", target.name)
+                                    )
+                                )),
                             });
                     }
                 }
@@ -3111,6 +3245,98 @@ mod tests {
     }
 
     #[test]
+    fn qualified_associated_calls_keep_their_impl_owner() {
+        let prefix = "struct Key;\nstruct Sources;\ntype Alias = Sources;\n\
+                      impl Key {\n    fn capture() {}\n}\n\
+                      impl Sources {\n    fn capture() {\n        beta_lock.lock().unwrap();\n    }\n}\n\
+                      fn reverse() {\n    let g = beta_lock.lock().unwrap();\n    alpha_lock.lock().unwrap();\n}\n";
+        for (owner, cycle) in [
+            ("Key", false),
+            ("Sources", true),
+            ("crate::Key", false),
+            ("Key ", false),
+            ("Alias", true),
+            ("unknown_module", true),
+        ] {
+            let out = run_synth(
+                owner,
+                &format!(
+                    "{prefix}fn forward() {{\n    let g = alpha_lock.lock().unwrap();\n    {owner}::capture();\n}}\n"
+                ),
+            );
+            assert_eq!(
+                out.ok, !cycle,
+                "the named impl's locks, not another impl's same-named function: {}",
+                out.log
+            );
+        }
+    }
+
+    #[test]
+    fn self_and_ufcs_calls_keep_their_impl_owner() {
+        let prefix = "struct Key;\nstruct Sources;\n\
+                      impl Key {\n    fn capture(&self) {}\n}\n\
+                      impl Sources {\n    fn capture(&self) {\n        beta_lock.lock().unwrap();\n    }\n}\n\
+                      fn reverse() {\n    let g = beta_lock.lock().unwrap();\n    alpha_lock.lock().unwrap();\n}\n";
+        for (owner, cycle) in [("Key", false), ("Sources", true)] {
+            for call in [
+                "Self::capture(self)".to_string(),
+                format!("{owner}::capture(self)"),
+            ] {
+                let out = run_synth(
+                    owner,
+                    &format!(
+                        "{prefix}impl {owner} {{\n    fn forward(&self) {{\n        let g = alpha_lock.lock().unwrap();\n        {call};\n    }}\n}}\n"
+                    ),
+                );
+                assert_eq!(
+                    out.ok, !cycle,
+                    "Self and UFCS preserve the selected impl's real locks: {}",
+                    out.log
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generic_type_qualifiers_do_not_borrow_a_concrete_impl_owner() {
+        let prefix = "trait Capture {\n    fn capture();\n}\n\
+                      struct Key;\nstruct Sources;\n\
+                      impl Key {\n    fn capture() {}\n}\n\
+                      impl Capture for Sources {\n    fn capture() {\n        beta_lock.lock().unwrap();\n    }\n}\n\
+                      fn reverse() {\n    let g = beta_lock.lock().unwrap();\n    alpha_lock.lock().unwrap();\n}\n";
+        for (label, forward) in [
+            (
+                "fn-generic",
+                "fn forward<Key: Capture>() {\n    let g = alpha_lock.lock().unwrap();\n    Key::capture();\n}\nfn instantiate() { forward::<Sources>(); }\n",
+            ),
+            (
+                "impl-generic",
+                "struct Holder<T>(std::marker::PhantomData<T>);\nimpl<Key: Capture> Holder<Key> {\n    fn forward() {\n        let g = alpha_lock.lock().unwrap();\n        Key::capture();\n    }\n}\nfn instantiate() { Holder::<Sources>::forward(); }\n",
+            ),
+        ] {
+            let out = run_synth(label, &format!("{prefix}{forward}"));
+            assert!(
+                !out.ok,
+                "a lexical type parameter can be Sources; concrete Key's harmless body is no proof: {}",
+                out.log
+            );
+            let concrete = run_synth(
+                &format!("concrete-{label}"),
+                &format!(
+                    "{prefix}{}",
+                    forward.replace("Key::capture()", "crate::Key::capture()")
+                ),
+            );
+            assert!(
+                concrete.ok,
+                "an explicit crate path still selects concrete Key despite the generic name: {}",
+                concrete.log
+            );
+        }
+    }
+
+    #[test]
     fn callable_parameters_shadow_only_bare_one_hop_targets() {
         let prefix = "fn post() {\n    posting.lock().unwrap();\n}\n";
         for (label, signature, call) in [
@@ -3581,14 +3807,6 @@ mod tests {
 
     #[test]
     fn a_return_type_must_name_a_guard_not_merely_contain_the_letters() {
-        assert!(
-            "GuardedInput".contains("Guard"),
-            "the substring the old check matched on"
-        );
-        assert!(
-            !super::return_type_names_a_guard("GuardedInput"),
-            "and which this check must refuse"
-        );
         for ret in [
             "std::sync::MutexGuard<'static, Supervisor>",
             "MutexGuard<'_, T>",

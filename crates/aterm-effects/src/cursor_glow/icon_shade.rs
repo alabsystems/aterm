@@ -119,15 +119,12 @@ impl CursorGlow {
             return false;
         };
         let (x, y) = (x - ox as f32, y - oy as f32);
+        let (x_lo, x_hi, y_lo, y_hi) = (x - reach, x + reach, y - reach, y + reach);
         let icons = self.word_icons.as_slice();
         let mut i = 0;
         while i < icons.len() {
             let (x0, x1, y0, y1) = icons[i];
-            if x + reach >= x0 as f32
-                && x - reach < x1 as f32
-                && y + reach >= y0 as f32
-                && y - reach < y1 as f32
-            {
+            if x_hi >= x0 as f32 && x_lo < x1 as f32 && y_hi >= y0 as f32 && y_lo < y1 as f32 {
                 return true;
             }
             i += 1;
@@ -183,18 +180,29 @@ impl CursorGlow {
             let icon = (icon.0 + ox, icon.1 + ox, icon.2 + oy, icon.3 + oy);
             if icon.0 < icon.1 && icon.2 < icon.3 {
                 drawn_rows(icon, self.word_icon_src.get(i), (ox, oy), &mut bands);
-                lifted |= shade_stream(
-                    (&mut *over.0, &mut *over.1),
-                    &bands,
-                    (&mut pieces, &mut piece_ramps, &mut cut),
-                );
-                lifted |= shade_stream(
-                    (&mut *under.0, &mut *under.1),
-                    &bands,
-                    (&mut pieces, &mut piece_ramps, &mut cut),
-                );
-                lifted |= shade_halos(halos, &bands, (&mut halo_pieces, &mut cut));
-                lifted |= shade_patches(patches, &bands, (&mut patch_pieces, &mut cut));
+                if !bands.is_empty() {
+                    let bounds = bands_bounds(&bands);
+                    lifted |= shade_stream_with_bounds(
+                        (&mut *over.0, &mut *over.1),
+                        (&bands, bounds),
+                        (&mut pieces, &mut piece_ramps, &mut cut),
+                    );
+                    lifted |= shade_stream_with_bounds(
+                        (&mut *under.0, &mut *under.1),
+                        (&bands, bounds),
+                        (&mut pieces, &mut piece_ramps, &mut cut),
+                    );
+                    lifted |= shade_halos_with_bounds(
+                        halos,
+                        (&bands, bounds),
+                        (&mut halo_pieces, &mut cut),
+                    );
+                    lifted |= shade_patches_with_bounds(
+                        patches,
+                        (&bands, bounds),
+                        (&mut patch_pieces, &mut cut),
+                    );
+                }
             }
             i += 1;
         }
@@ -229,11 +237,12 @@ fn lift_stars(
         mi += 1;
         let r = mark.reach / 2;
         let (x, y) = (mark.at.0 - ox, mark.at.1 - oy);
+        let (x_lo, x_hi, y_lo, y_hi) = (x - r, x + r, y - r, y + r);
         let mut hit = false;
         let mut ii = 0;
         while ii < icons.len() {
             let (x0, x1, y0, y1) = icons[ii];
-            if x + r >= x0 && x - r < x1 && y + r >= y0 && y - r < y1 {
+            if x_hi >= x0 && x_lo < x1 && y_hi >= y0 && y_lo < y1 {
                 hit = true;
                 break;
             }
@@ -566,6 +575,8 @@ const fn bands_bounds(bands: &[PxBox]) -> PxBox {
 
 /// Cut every quad of `quads` the icon's drawn rows reach ([`cut_rect`]); a
 /// split keeps its horizontal gradient. Returns whether any was cut.
+#[cfg(test)]
+#[inline]
 fn shade_quads(
     quads: &mut Vec<GlowQuad>,
     bands: &[PxBox],
@@ -574,7 +585,18 @@ fn shade_quads(
     if quads.is_empty() || bands.is_empty() {
         return false;
     }
-    let bounds = bands_bounds(bands);
+    shade_quads_with_bounds(quads, (bands, bands_bounds(bands)), (pieces, cut))
+}
+
+#[inline]
+fn shade_quads_with_bounds(
+    quads: &mut Vec<GlowQuad>,
+    (bands, bounds): (&[PxBox], PxBox),
+    (pieces, cut): (&mut Vec<GlowQuad>, &mut Vec<PxBox>),
+) -> bool {
+    if quads.is_empty() || bands.is_empty() {
+        return false;
+    }
     let mut any = false;
     let mut i = 0;
     while i < quads.len() {
@@ -614,18 +636,35 @@ fn reached(b: PxBox, bands: &[PxBox], bounds: PxBox, cut: &mut Vec<PxBox>) -> bo
 /// and around kept as ramps, all in the stream's order. Returns whether
 /// any light was cut; a stream nothing was cut from stays as laid, and
 /// costs no copy: the stream is rebuilt only once a light is known reached.
+#[cfg(test)]
+#[inline]
 fn shade_stream(
     (quads, ramps): ShadeStream<'_>,
     bands: &[PxBox],
     (pieces, piece_ramps, cut): (&mut Vec<GlowQuad>, &mut GlowRamps, &mut Vec<PxBox>),
 ) -> bool {
+    if bands.is_empty() {
+        return false;
+    }
+    shade_stream_with_bounds(
+        (quads, ramps),
+        (bands, bands_bounds(bands)),
+        (pieces, piece_ramps, cut),
+    )
+}
+
+#[inline]
+fn shade_stream_with_bounds(
+    (quads, ramps): ShadeStream<'_>,
+    (bands, bounds): (&[PxBox], PxBox),
+    (pieces, piece_ramps, cut): (&mut Vec<GlowQuad>, &mut GlowRamps, &mut Vec<PxBox>),
+) -> bool {
     if ramps.is_empty() {
-        return shade_quads(quads, bands, (pieces, cut));
+        return shade_quads_with_bounds(quads, (bands, bounds), (pieces, cut));
     }
     if bands.is_empty() {
         return false;
     }
-    let bounds = bands_bounds(bands);
     let mut any_reached = false;
     let mut qi = 0;
     while qi < quads.len() {
@@ -691,6 +730,7 @@ const fn ramp_clear(ramp: &GlowRamp, (bx0, bx1, by0, by1): PxBox) -> bool {
 
 /// Each span of `ramp`'s rows a band of `bands` reaches, widened to its run
 /// where it meets it, spans that touch merged, top to bottom.
+#[inline]
 fn ramp_spans(ramp: &GlowRamp, bands: &[PxBox], mut each: impl FnMut((u16, u16))) {
     let rb = ramp_box(ramp);
     let run = if ramp.joined > 0 {
@@ -732,6 +772,7 @@ fn ramp_spans(ramp: &GlowRamp, bands: &[PxBox], mut each: impl FnMut((u16, u16))
 
 /// Whether the icon's drawn rows reach any light of `ramp` (its ends in
 /// `ends`): the lights [`shade_ramp`] would cut.
+#[inline]
 fn ramp_reached(
     ramp: &GlowRamp,
     ends: &[GlowEnd],
@@ -765,6 +806,7 @@ fn ramp_reached(
 /// where it meets it, [`ramp_spans`]) as the quads its lights stand for,
 /// cut ([`push_pieces`]), and each span between as a ramp of those rows.
 /// Returns whether any light was cut.
+#[inline]
 fn shade_ramp(
     ramp: &GlowRamp,
     ends: &[GlowEnd],
@@ -802,6 +844,7 @@ fn shade_ramp(
 
 /// Lay `q`'s pieces outside the icon's drawn rows (`cut`, [`cut_rect`]'s),
 /// each continuing the quad's horizontal gradient.
+#[inline]
 fn push_pieces(q: &GlowQuad, cut: &[PxBox], pieces: &mut Vec<GlowQuad>) {
     #[inline]
     const fn lerp_ch(c0: i32, c1: i32, wk: i32, k: i32, half_w_max: i32, w_max: i32) -> u32 {
@@ -895,15 +938,15 @@ fn push_pieces(q: &GlowQuad, cut: &[PxBox], pieces: &mut Vec<GlowQuad>) {
 
 /// Cut every halo of `halos` the icon's drawn rows reach ([`cut_rect`]);
 /// each piece keeps its centre and falloff, so what stays lit is unchanged.
-fn shade_halos(
+#[inline]
+fn shade_halos_with_bounds(
     halos: &mut Vec<RainHalo>,
-    bands: &[PxBox],
+    (bands, (bx0, bx1, by0, by1)): (&[PxBox], PxBox),
     (pieces, cut): (&mut Vec<RainHalo>, &mut Vec<PxBox>),
 ) -> bool {
     if halos.is_empty() || bands.is_empty() {
         return false;
     }
-    let (bx0, bx1, by0, by1) = bands_bounds(bands);
     let mut any = false;
     let mut i = 0;
     while i < halos.len() {
@@ -944,15 +987,15 @@ fn shade_halos(
 /// Cut every fire patch of `patches` the icon's drawn rows reach
 /// ([`cut_rect`]); each piece samples the same window-anchored field (its
 /// root, height and phase kept), so what stays lit is unchanged.
-fn shade_patches(
+#[inline]
+fn shade_patches_with_bounds(
     patches: &mut Vec<FirePatch>,
-    bands: &[PxBox],
+    (bands, (bx0, bx1, by0, by1)): (&[PxBox], PxBox),
     (pieces, cut): (&mut Vec<FirePatch>, &mut Vec<PxBox>),
 ) -> bool {
     if patches.is_empty() || bands.is_empty() {
         return false;
     }
-    let (bx0, bx1, by0, by1) = bands_bounds(bands);
     let mut any = false;
     let mut i = 0;
     while i < patches.len() {

@@ -48,6 +48,43 @@ impl Version {
     }
 }
 
+#[derive(PartialEq, Eq)]
+enum BuildIdentity {
+    Numeric(Version),
+    Vendor(atpkg::vendor_direct::Version),
+}
+
+impl std::fmt::Display for BuildIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Numeric(v) => std::fmt::Display::fmt(v, f),
+            Self::Vendor(v) => std::fmt::Display::fmt(v, f),
+        }
+    }
+}
+
+fn build_identity(agent: Agent, text: &str) -> Option<BuildIdentity> {
+    if let Some(version) = Version::parse(text) {
+        return Some(BuildIdentity::Numeric(version));
+    }
+    match agent {
+        Agent::Claude | Agent::Codex => None,
+        Agent::Muse | Agent::Agy => {
+            let text = text.trim();
+            let text = text.strip_prefix('v').unwrap_or(text);
+            super::upgrade_muse_live::build_version(text, None).map(BuildIdentity::Vendor)
+        }
+    }
+}
+
+/// Whether `agent`'s version grammar validates `a` and `b` as one build. Dotted numeric aliases
+/// compare through [`Version`]; Muse and agy also accept their revision-aware vendor grammar.
+/// A leading `v` and outer blanks are ignored. Identical unvalidated strings are no build.
+#[must_use]
+pub fn same_build(agent: Agent, a: &str, b: &str) -> bool {
+    build_identity(agent, a).is_some_and(|a| Some(a) == build_identity(agent, b))
+}
+
 impl Ord for Version {
     fn cmp(&self, other: &Self) -> Ordering {
         let n = self.0.len().max(other.0.len());
@@ -225,6 +262,18 @@ impl Agent {
             .find(|agent| agent.record_tab(key).is_some())
     }
 
+    /// Whether a press of its tab's ⬆️ moves this agent once by its own lane
+    /// ([`upgrade_drive::press`](super::upgrade_drive::press)), past an Autopilot or agent
+    /// switched off and its own background work ([`press_gate`]): Claude Code's restart resumes
+    /// its conversation. Another CLI's press is the tab menu's Upgrade Now.
+    #[must_use]
+    pub const fn presses(self) -> bool {
+        match self {
+            Agent::Claude => true,
+            Agent::Codex | Agent::Agy | Agent::Muse => false,
+        }
+    }
+
     /// State-file identifier word (empty for Claude Code).
     #[must_use]
     pub const fn word(self) -> &'static str {
@@ -368,6 +417,10 @@ const FLAGS: &[(&str, Arity, Fate)] = &[
     ("--disable-slash-commands", Arity::None, Fate::Keep),
     ("--disallowedTools", Arity::Many, Fate::Keep),
     ("--disallowed-tools", Arity::Many, Fate::Keep),
+    // Dropped (owner direction 2026-09-23: the default settings' effort unless there is a great
+    // reason not to use it): a relaunch, resumed or afresh, comes back at the person's default
+    // effort, their settings', never pinned to the effort it was launched with. A launch
+    // `--settings` is still carried.
     ("--effort", Arity::One, Fate::Drop),
     ("--environment", Arity::One, Fate::Refuse),
     (
@@ -772,8 +825,15 @@ pub fn relaunch_line_env(
     relaunch_line_on(LineDiscipline::HOST, dialect, heal, cd, env, exe, args)
 }
 
+/// Builds [`relaunch_line_env`] with each variable in `unset` explicitly removed
+/// from the launched process, including variables inherited from its shell.
+///
+/// # Errors
+///
+/// An invalid variable name, a variable both set and removed, a control character,
+/// an unsupported directory change, or a line exceeding the terminal's bound.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn relaunch_line_env_clear(
+pub fn relaunch_line_env_clear(
     dialect: Dialect,
     heal: Option<&Path>,
     cd: Option<&str>,
@@ -2333,8 +2393,8 @@ pub(crate) fn begins_unnumbered_by(
         || (meta && lead.is_some_and(|t| t.trim_start().starts_with(MISSED_TASK_NOTICE)))
 }
 
-pub(crate) const TURN_ORIGIN: &str = "turnOrigin";
-pub(crate) const SCHEDULED_TASK_ID: &str = "scheduledTaskId";
+pub(crate) const TURN_ORIGIN: &str = aterm_phase::anchor!("transcript.turnOrigin");
+pub(crate) const SCHEDULED_TASK_ID: &str = aterm_phase::anchor!("transcript.scheduledTaskId");
 
 /// Returns whether `id` starts a newly numbered turn distinct from `running`.
 pub(crate) fn numbered_anew<T: PartialEq>(
@@ -3459,7 +3519,33 @@ pub struct Facts {
     pub rung: Rung,
     pub typing: bool,
     pub still_s: u64,
+    pub press: Press,
 }
+
+/// The owner's press of the top rule's ⬆️ as one step reads it: a one-shot Now that passes
+/// what only defers a move ([`press_gate`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Press {
+    /// No press stands.
+    #[default]
+    None,
+    /// A press stands, and this step is not its lane: an automatic step stands aside
+    /// ([`PRESSED`]) while the press lane moves the tab.
+    Stands,
+    /// A press stands, and this step is its lane (or the watch's dry read of it).
+    Acting,
+}
+
+/// How long a press of the ⬆️ stands unless its move lands: the ask's own re-ask span.
+pub const PRESS_S: u64 = REASK_S;
+
+/// The wait an automatic step records while a press stands ([`Press::Stands`]).
+pub const PRESSED: &str = "pressed";
+
+/// Whether a restart of Claude Code ends the background shells it runs: measured by
+/// `targo --unverified lab restart-jobs` (`docs/measured/claude-code-restart-jobs-2026-10-27.md`),
+/// it does (Claude Code ends them itself on SIGTERM), so a press's words name them.
+pub const RESTART_ENDS_BACKGROUND: bool = true;
 
 /// Escalation rung on the upgrade urgency ladder based on how long a session is behind.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -3681,6 +3767,38 @@ fn restart_gate(f: &Facts, lags: bool) -> Gate {
         Gate::Go if f.background_point => Gate::Wait("background"),
         gate => gate,
     }
+}
+
+#[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "HarnessUpgradeProgress",
+        action = "RestartOnPress",
+        project = "aterm_agent::harness::upgrade_drive::progress_projection"
+    )
+)]
+/// Evaluates whether the owner's press of the ⬆️ may restart the agent now: it waits only for
+/// what a restart would lose (a held tab, a box, a draft), a wall (a usage limit, a login), and
+/// a running turn, and passes what only defers an automatic move (the agent's own background
+/// work, a break, the settle, a person's recent keys).
+pub fn press_gate(f: &Facts) -> Gate {
+    if f.held {
+        return Gate::Wait("held");
+    }
+    if let Some(hold) = person_hold(f) {
+        return Gate::Wait(hold);
+    }
+    if f.limited {
+        return Gate::Wait("limited");
+    }
+    if f.login {
+        return Gate::Wait("login");
+    }
+    if f.busy_footer {
+        return Gate::Wait("busy");
+    }
+    Gate::Go
 }
 
 pub(super) fn own_work_holds(w: &str) -> bool {
@@ -4257,16 +4375,40 @@ impl Request {
     /// Returns whether this request skips or defers upgrading to `target` at `now_s`.
     #[must_use]
     pub fn holds_build(&self, target: &str, now_s: u64) -> bool {
+        self.holds_build_for(Agent::Claude, target, now_s)
+    }
+
+    /// Whether this word skips `agent`'s validated target or still defers the bound move.
+    #[must_use]
+    pub fn holds_build_for(&self, agent: Agent, target: &str, now_s: u64) -> bool {
         match self {
-            Self::Skip(v) => Version::parse(v).is_some_and(|v| Some(v) == Version::parse(target)),
+            Self::Skip(_) => self.skips_for(agent, target),
             Self::DeferUntil(t) => now_s < *t,
             Self::None | Self::Now => false,
         }
     }
 
+    /// Whether this request skips a legacy numeric target.
+    #[must_use]
+    pub fn skips(&self, target: &str) -> bool {
+        self.skips_for(Agent::Claude, target)
+    }
+
+    /// Whether this request skips `agent`'s validated target ([`same_build`]).
+    #[must_use]
+    pub fn skips_for(&self, agent: Agent, target: &str) -> bool {
+        matches!(self, Self::Skip(v) if same_build(agent, v, target))
+    }
+
     /// Parses a [`Request`] from its state-file word.
     #[must_use]
     pub fn parse(word: &str) -> Option<Self> {
+        Self::parse_for(Agent::Claude, word)
+    }
+
+    /// Decode a persisted word using the record's agent, including valid vendor revisions.
+    #[must_use]
+    pub fn parse_for(agent: Agent, word: &str) -> Option<Self> {
         match word {
             "" | "-" => Some(Self::None),
             "now" => Some(Self::Now),
@@ -4275,13 +4417,15 @@ impl Request {
                     return t.parse().ok().map(Self::DeferUntil);
                 }
                 let v = word.strip_prefix("skip:")?;
-                Version::parse(v).map(|v| Self::Skip(v.to_string()))
+                build_identity(agent, v).map(|v| Self::Skip(v.to_string()))
             }
         }
     }
 }
 
-/// Computes [`next_step`] honoring the operator's [`Request`] override for `target`.
+/// Computes [`next_step`] honoring the operator's [`Request`] override for `target`, and their
+/// standing press of the ⬆️ ([`Facts::press`]): its lane restarts at [`press_gate`], and an
+/// automatic step waits [`PRESSED`] meanwhile.
 #[must_use]
 pub fn requested_step(
     request: &Request,
@@ -4293,6 +4437,22 @@ pub fn requested_step(
 ) -> Step {
     if request.holds(phase, target, now_s) {
         return Step::Wait(held_word(request));
+    }
+    let pressable = match phase {
+        Phase::Pending | Phase::Announced { .. } => true,
+        Phase::Failed(why) => why == GAVE_UP,
+        Phase::Exiting { .. } | Phase::Relaunched { .. } | Phase::Done => false,
+    };
+    match f.press {
+        Press::Stands if pressable => return Step::Wait(PRESSED),
+        Press::Acting if pressable => {
+            return match press_gate(f) {
+                Gate::Go if f.taskless => Step::Fresh,
+                Gate::Go => Step::Terminate,
+                Gate::Wait(w) => Step::Wait(w),
+            };
+        }
+        Press::None | Press::Stands | Press::Acting => {}
     }
     let step = if *request == Request::Now {
         let now = Facts {

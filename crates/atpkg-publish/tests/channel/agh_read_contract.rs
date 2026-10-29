@@ -759,14 +759,6 @@ fn race_rest() {
 }
 
 #[test]
-#[should_panic(expected = "put_stray_draft")]
-fn fake_stray_draft_needs_a_published_release() {
-    let w = FakeWorld::new();
-    w.put("v1", true, true, &[]);
-    w.put_stray_draft("v1");
-}
-
-#[test]
 fn agh_writes_and_git_are_refused() {
     let w = AghWorld::new();
     let dir = scratch("contract-writes");

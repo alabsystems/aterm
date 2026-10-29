@@ -157,8 +157,12 @@ fn scrolls_move_only_the_region_rows() {
             grid.set_scroll_region(top, bottom);
         }
         grid.set_cursor(cursor, 0);
+        let total_before = grid.total_lines();
         op(&mut grid);
         assert_eq!(column_zero(&grid), want, "{name}");
+        if name.starts_with("SD") || name.contains("down") {
+            assert_eq!(grid.total_lines(), total_before, "{name}: total_lines");
+        }
         grid.assert_invariants();
     }
 

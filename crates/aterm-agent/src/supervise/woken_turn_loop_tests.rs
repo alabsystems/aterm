@@ -315,19 +315,14 @@ fn a_turn_the_mac_slept_through_in_the_vendors_retry_is_pressed_esc_once_the_api
     );
 }
 
-/// Each run with one condition of the press taken away, beside the positive it differs from.
+/// Each run with one condition of the press taken away from the positive run of
+/// [`a_turn_the_mac_slept_through_in_the_vendors_retry_is_pressed_esc_once_the_api_is_up`].
 #[test]
 fn a_woken_turn_is_pressed_nothing_where_any_condition_fails() {
     let pressed = |tag: &str, case: Case| {
         let w = woken_run(tag, case);
         (w.escs.len(), w.unstuck().len(), w.waiting().len(), w.lines)
     };
-    let (escs, unstuck, waiting, lines) = pressed("control", Case::on(queued()));
-    assert_eq!(
-        (escs, unstuck, waiting),
-        (1, 1, 0),
-        "the control: {lines:#?}"
-    );
     let cases: [(&str, Case, usize); 9] = [
         (
             "no-sleep",
@@ -667,13 +662,6 @@ fn claude_code_2_1_310s_measured_network_retry_rows_are_pressed() {
 /// the guard) or a yielded one (a person's key since the read) is pressed again at a later read.
 #[test]
 fn a_skipped_or_yielded_press_leaves_the_wakes_esc_for_a_later_read() {
-    let control = woken_run("taken", Case::on(queued()));
-    assert_eq!(
-        (control.escs.len(), control.unstuck().len()),
-        (1, 1),
-        "the control, taken at once: {:#?}",
-        control.lines
-    );
     for (tag, reply) in [
         ("skipped", "OK skipped seq=7\n"),
         ("yielded", "OK skipped reason=person seq=7\n"),

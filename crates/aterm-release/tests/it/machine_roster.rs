@@ -525,7 +525,7 @@ fn the_credentials_profile_names_the_roster_and_the_signature_is_its_sibling() {
 fn a_profile_s_tilde_roster_is_read_under_the_home_it_is_loaded_in() {
     let dir = tempdir("tilde-roster");
     let document = roster_doc(&[], &MASTER);
-    let roster_dir = dir.join(".aterm/roster");
+    let roster_dir = dir.join(".aterm/release-ring/roster");
     std::fs::create_dir_all(&roster_dir).unwrap();
     std::fs::write(roster_dir.join("aterm-machines.toml"), &document.bytes).unwrap();
     std::fs::write(
@@ -544,7 +544,7 @@ fn a_profile_s_tilde_roster_is_read_under_the_home_it_is_loaded_in() {
         )
     };
 
-    let profile = named("~/.aterm/roster/aterm-machines.toml");
+    let profile = named("~/.aterm/release-ring/roster/aterm-machines.toml");
     let creds = sign::ReleaseCredentials::load(&profile, Some(&dir)).expect("loads");
     assert_eq!(
         creds.machine_roster(),
@@ -562,7 +562,7 @@ fn a_profile_s_tilde_roster_is_read_under_the_home_it_is_loaded_in() {
         creds.machine_roster(),
         Some(
             other_home
-                .join(".aterm/roster/aterm-machines.toml")
+                .join(".aterm/release-ring/roster/aterm-machines.toml")
                 .as_path()
         ),
         "the same profile names the roster under each home it is loaded in"
@@ -577,7 +577,7 @@ fn a_profile_s_tilde_roster_is_read_under_the_home_it_is_loaded_in() {
         assert!(refused.contains("HOME"), "{relative:?}: {refused}");
     }
 
-    let profile = named("~//.aterm/roster/aterm-machines.toml");
+    let profile = named("~//.aterm/release-ring/roster/aterm-machines.toml");
     let creds = sign::ReleaseCredentials::load(&profile, Some(&dir)).expect("loads");
     assert_eq!(
         creds.machine_roster(),

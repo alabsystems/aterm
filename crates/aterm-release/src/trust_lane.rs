@@ -26,10 +26,6 @@ pub const DEFAULT_BUDGET: Duration = Duration::from_secs(6 * 3600);
 /// Maximum time to wait for a foreign or silent `trustd` to leave the socket.
 pub const TRUSTD_WAIT: Duration = Duration::from_secs(330);
 
-/// The memory (`16 GiB`, and never more than half the RAM) a check claims when the cost
-/// history has no peak for its library ([`claim_need`]).
-const HEAVY_BYTES: u64 = 16 << 30;
-
 /// How often the slots are polled.
 const POLL: Duration = Duration::from_millis(250);
 
@@ -751,18 +747,17 @@ pub fn auto_slots(cores: usize) -> usize {
 }
 
 /// The memory a check of a library claims: its last recorded peak (`cost`'s largest process)
-/// plus a margin ([`trust_facts::peak_claim`]), or with no peak recorded [`HEAVY_BYTES`] or
-/// half of `ram` (this host's RAM, when read), whichever is less, so a host of any size can
-/// admit a library it has not measured. A claim is never cut to fit the RAM: one that is not
-/// below what can ever be available (the RAM less what is wired) is refused up front
-/// ([`trust_facts::peak_seen`]), and under `--try-refused` it starts at once
-/// ([`Admission::admit`]).
+/// plus a margin ([`aterm_capacity::peak_claim`]), or with no peak recorded 16 GiB or half of
+/// `ram` (this host's RAM, when read; 0 unread), whichever is less
+/// ([`aterm_capacity::cold_claim`]), so a host of any size can admit a library it has not
+/// measured. A claim is never cut to fit the RAM: one that is not below what can ever be
+/// available (the RAM less what is wired) is refused up front ([`trust_facts::peak_seen`]), and
+/// under `--try-refused` it starts at once ([`Admission::admit`]).
 #[must_use]
 pub fn claim_need(cost: Option<&Cost>, ram: u64) -> u64 {
     match cost.filter(|c| c.maxrss > 0) {
-        Some(c) => trust_facts::peak_claim(c.maxrss),
-        None if ram > 0 => HEAVY_BYTES.min(ram / 2),
-        None => HEAVY_BYTES,
+        Some(c) => aterm_capacity::peak_claim(c.maxrss),
+        None => aterm_capacity::cold_claim(Some(ram).filter(|r| *r > 0)),
     }
 }
 
@@ -4451,7 +4446,11 @@ pub mod proc_tree {
         if let Some(pids) = LISTED.with(|l| l.borrow().clone()) {
             return table_from(mark, held, slot, LISTING, &mut || Ok(pids.clone()));
         }
-        table_from(mark, held, slot, LISTING, &mut aterm_uds::holders::uid_pids)
+        #[cfg(test)]
+        let mut pids = || aterm_uds::holders::uid_pids().map(this_binarys);
+        #[cfg(not(test))]
+        let mut pids = aterm_uds::holders::uid_pids;
+        table_from(mark, held, slot, LISTING, &mut pids)
     }
 
     #[cfg(test)]
@@ -4460,6 +4459,84 @@ pub mod proc_tree {
         /// can judge a sweep by a listing whose wholeness no other process's churn decides.
         pub(super) static LISTED: std::cell::RefCell<Option<Vec<u32>>> =
             const { std::cell::RefCell::new(None) };
+    }
+
+    /// Of `pids`, those this test binary started and those its tree left to an adopter: each
+    /// whose parents, read up from it while they are younger than this process, lead to this
+    /// process, or to an adopter of orphans that did not start it itself. The adopters are pid 1
+    /// and this process's ancestors, since a Linux subreaper (`systemd --user`) adopts only its
+    /// descendants' orphans. Apple keeps a process's launcher's pid version through adoption
+    /// ([`launched_by`]), so there what an adopter started itself, launchd's jobs and the
+    /// installed app's new tabs, is left out; Linux keeps none, so there every process an
+    /// ancestor started since this one is kept. On both, what another program daemonized since
+    /// this one started is kept, with all it starts. [`table`] lists only these under test, so
+    /// the rest of the machine's churn does not decide the wholeness a test's sweep needs: on a
+    /// loaded machine a list after the first nearly always names a process not read yet, and a
+    /// sweep then keeps the record it watched for as long as the load lasts. A listed process
+    /// gone by its read is left out; one whose parent went mid-read is kept, since an adopter
+    /// then holds it, and so is one whose parents' pids were reused into a loop.
+    #[cfg(test)]
+    fn this_binarys(pids: Vec<u32>) -> Vec<u32> {
+        let me = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
+        let Some(born) = aterm_uds::process::process_serial(me) else {
+            return pids;
+        };
+        let mut adopters = BTreeSet::from([1]);
+        let mut up = me;
+        while let Some(parent) = aterm_uds::process::read_process_parent(up)
+            .and_then(|p| i32::try_from(p).ok())
+            .filter(|&p| adopters.insert(p))
+        {
+            up = parent;
+        }
+        let mut known: BTreeMap<i32, bool> = BTreeMap::new();
+        pids.into_iter()
+            .filter(|&pid| {
+                let Ok(pid) = i32::try_from(pid) else {
+                    return false;
+                };
+                let mut chain = Vec::new();
+                let mut at = pid;
+                let ours = loop {
+                    if at == me || chain.contains(&at) {
+                        break true;
+                    }
+                    if let Some(&ours) = known.get(&at) {
+                        break ours;
+                    }
+                    let Some(k) = kin(at) else {
+                        break at != pid;
+                    };
+                    if k.serial < born {
+                        break false;
+                    }
+                    chain.push(at);
+                    if adopters.contains(&k.ppid) {
+                        break !launched_by(at, k.ppid);
+                    }
+                    at = k.ppid;
+                };
+                for p in chain {
+                    known.insert(p, ours);
+                }
+                ours
+            })
+            .collect()
+    }
+
+    /// Whether `parent`, `pid`'s parent now, started it rather than adopted it: its launcher's
+    /// pid version, which Apple keeps through adoption, is `parent`'s.
+    #[cfg(all(test, target_vendor = "apple"))]
+    fn launched_by(pid: i32, parent: i32) -> bool {
+        let launcher = aterm_uds::process::bsdinfo_uniq(pid).map(|i| i.p_orig_ppidversion);
+        launcher.is_some()
+            && launcher == aterm_uds::process::uniq_identifier(parent).map(|i| i.p_idversion)
+    }
+
+    /// See the Apple twin: no launcher is kept here, so no process reads as its parent's own.
+    #[cfg(all(test, not(target_vendor = "apple")))]
+    fn launched_by(_pid: i32, _parent: i32) -> bool {
+        false
     }
 
     /// The serial [`table_from`] reads for a process that exited and is not yet reaped, whose
@@ -4971,7 +5048,14 @@ pub mod trustd {
     use std::time::{Duration, Instant};
 
     /// targo's own deadline over connect, IDENTITY and STATUS.
+    #[cfg(not(test))]
     const TARGO_GIVES: Duration = Duration::from_millis(500);
+
+    /// Under test, the one-minute hang detector: a unit test's stand-in answers from a thread
+    /// of the test binary, which a loaded machine can keep from running for longer than targo's
+    /// 0.5 s, and no test's property is how fast a stand-in answers.
+    #[cfg(test)]
+    const TARGO_GIVES: Duration = aterm_spec::wait::MUST_HAPPEN;
 
     /// Path to `trustd`'s per-user Unix domain socket.
     #[must_use]
@@ -6350,12 +6434,21 @@ mod tests {
         );
     }
 
-    /// `--admit now` starts a check whose claim has no room at once, and says what it would
-    /// have waited for.
+    /// `--admit now` starts a check whose claim has no room beside a held claim at once, and says
+    /// what it would have waited for.
     #[test]
     fn admit_now_starts_a_check_at_once_and_says_what_it_would_wait_for() {
         let (_d, l) = ledger();
-        let m = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 10, 14));
+        let m = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 20, 14));
+        let _held = aterm_capacity::admit_with(
+            &l,
+            &m,
+            aterm_capacity::Need::new("held").mem_gib(10),
+            aterm_capacity::Admit::Wait,
+            aterm_capacity::Pace::default(),
+            &mut |_| {},
+        )
+        .expect("holder admitted");
         let mut f = fake(&[("big", 3)]);
         f.gate = Some(gate(&l, &m, aterm_capacity::Admit::Now));
         let (r, _) = slots(&mut f, vec![needing("big", 30)], 1, 100);
@@ -6479,10 +6572,10 @@ mod tests {
         assert_eq!(said.len(), 2, "the bound's line, then the wait's: {said:?}");
         for (line, named) in [
             (0, "capacity: trust check alpha: needs 44.2 GiB, this "),
-            (
-                0,
-                " can never have more than 44 GiB of its 48 GiB of memory available (4 GiB of it is wired); 44.5 GiB could be available when this run was planned, so it waits for what is wired to fall",
-            ),
+            (0, "44 GiB of its 48 GiB"),
+            (0, "4 GiB of it is wired"),
+            (0, "44.5 GiB"),
+            (0, "waits"),
             (1, "capacity: trust check alpha waits (0s): memory short by"),
         ] {
             assert!(
@@ -6775,12 +6868,12 @@ mod tests {
     }
 
     const UMASK_PROBE_ENV: &str = "ATERM_RELEASE_TRUST_LANE_UMASK_DIR";
-    const UMASK_PROBE: &str = "trust_lane::tests::probe_the_lanes_directories_under_umask_002";
+    const UMASK_PROBE: &str =
+        "trust_lane::tests::the_lanes_directories_are_admitted_under_umask_002";
 
-    #[test]
-    fn probe_the_lanes_directories_under_umask_002() {
+    fn probe_the_lanes_directories_under_umask_002_if_asked() -> bool {
         let Some(dir) = std::env::var_os(UMASK_PROBE_ENV) else {
-            return;
+            return false;
         };
         // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail in this
         // single-test process.
@@ -6788,10 +6881,14 @@ mod tests {
         let slot = PathBuf::from(dir).join("target-trust.noindex/j0");
         owner_dirs(&slot).unwrap();
         assert_eq!(refused_component(&slot), None, "{}", slot.display());
+        true
     }
 
     #[test]
     fn the_lanes_directories_are_admitted_under_umask_002() {
+        if probe_the_lanes_directories_under_umask_002_if_asked() {
+            return;
+        }
         let base = aterm_tempfile::Builder::new()
             .prefix("trust-lane-dirs")
             .tempdir_in(slots_base())
@@ -7883,6 +7980,15 @@ mod tests {
         s
     }
 
+    /// Asserts that one line of `said` starts with `head` and names each of `facts`.
+    fn a_line_names(said: &str, head: &str, facts: &[&str]) {
+        assert!(
+            said.lines()
+                .any(|l| l.starts_with(head) && facts.iter().all(|f| l.contains(f))),
+            "no line starting {head:?} names each of {facts:?}: {said}"
+        );
+    }
+
     /// A library whose last recorded check peaked above this host's RAM is refused up front
     /// under any prover, in one line naming the peak, its date and the RAM, and no check
     /// starts. So is one whose peak is below the RAM but whose claim, with its margin, is
@@ -7890,7 +7996,6 @@ mod tests {
     /// claim too. Negative controls: a claim below the RAM runs, and `--try-refused` runs it.
     #[test]
     fn a_library_whose_recorded_peak_is_above_the_ram_is_refused_up_front() {
-        let line = "alpha not verified here: its last check peaked at 62.45 GB on 2026-10-20, above this host's 51.5 GB (48 GiB) of RAM";
         for takes in [false, true] {
             let mut s = with_peak(62_450_089_984, takes);
             let (outcome, said, _) = run_site(&mut s);
@@ -7899,13 +8004,12 @@ mod tests {
                 "{outcome:?}: {said}"
             );
             assert!(s.started.is_empty(), "no check starts: {said}");
-            assert!(said.contains(&format!("trust: {line}\n")), "{said}");
-            assert!(
-                said.contains(
-                    "it needs a host with more RAM than its recorded peak and its margin"
-                ),
-                "{said}"
+            a_line_names(
+                &said,
+                "trust: alpha not verified here",
+                &["62.45 GB", "2026-10-20", "51.5 GB (48 GiB)"],
             );
+            assert!(said.contains("more RAM than its recorded peak"), "{said}");
             let plan = fs::read_to_string(root_of(&s).join("logs/.plan")).unwrap();
             assert!(
                 plan.contains("\nrefused alpha\tpeak\t-\t62450089984\t2026-10-20T17:45:18Z\n"),
@@ -7919,9 +8023,10 @@ mod tests {
             "{outcome:?}: {said}"
         );
         assert!(tight.started.is_empty(), "no check starts: {said}");
-        assert!(
-            said.contains("trust: alpha not verified here: its last check peaked at 42.95 GB on 2026-10-20, and with its margin it claims 51.54 GB, not below this host's 51.5 GB (48 GiB) of RAM, which the launch gate never has available\n"),
-            "{said}"
+        a_line_names(
+            &said,
+            "trust: alpha not verified here",
+            &["42.95 GB", "51.54 GB", "51.5 GB (48 GiB)"],
         );
         let mut fits = with_peak(39 * GIB, false);
         let (outcome, said, _) = run_site(&mut fits);
@@ -7955,9 +8060,10 @@ mod tests {
             "{outcome:?}: {said}"
         );
         assert!(s.started.is_empty(), "no check starts: {said}");
-        assert!(
-            said.contains("trust: alpha not verified here: its last check peaked at 40.80 GB on 2026-10-20, and with its margin it claims 48.96 GB, not below the 47.8 GB of this host's 51.5 GB (48 GiB) of RAM that can ever be available, the rest being wired\n"),
-            "{said}"
+        a_line_names(
+            &said,
+            "trust: alpha not verified here",
+            &["40.80 GB", "48.96 GB", "47.8 GB", "51.5 GB (48 GiB)"],
         );
         let plan = fs::read_to_string(root_of(&s).join("logs/.plan")).unwrap();
         for row in [
@@ -7988,10 +8094,10 @@ mod tests {
             (Outcome::Pass, 1),
             "{said}"
         );
-        assert!(
-            said.contains("needs 45.6 GiB, this Mac can never have more than 44.5 GiB of its 48 GiB of memory available (3.5 GiB of it is wired): it can never be admitted here, so it starts at once and holds its claim\n")
-                || said.contains("needs 45.6 GiB, this machine can never have more than 44.5 GiB of its 48 GiB of memory available (3.5 GiB of it is wired): it can never be admitted here, so it starts at once and holds its claim\n"),
-            "{said}"
+        a_line_names(
+            &said,
+            "trust: capacity: trust check alpha",
+            &["45.6 GiB", "44.5 GiB", "3.5 GiB", "starts at once"],
         );
         assert!(ledger.list().unwrap().is_empty(), "its claim let go");
         let mut old = with_peak(38 * GIB, false);
@@ -8022,9 +8128,10 @@ mod tests {
             matches!(&outcome, Outcome::CouldNotRun(why) if why.starts_with("interrupted")),
             "{outcome:?}: {said}"
         );
-        assert!(
-            said.contains("44.5 GiB could be available when this run was planned, so it waits for what is wired to fall\n"),
-            "{said}"
+        a_line_names(
+            &said,
+            "trust: capacity: trust check alpha",
+            &["44.5 GiB", " waits "],
         );
         assert!(!said.contains("starts at once"), "{said}");
     }
@@ -8046,10 +8153,10 @@ mod tests {
         ));
         let (outcome, said, _) = run_site(&mut s);
         assert_eq!((outcome, s.started.len()), (Outcome::Pass, 1), "{said}");
-        assert!(
-            said.contains("trust: capacity: trust check alpha: needs 69.8 GiB, this Mac has 48 GiB of memory: it can never be admitted here, so it starts at once and holds its claim\n")
-                || said.contains("trust: capacity: trust check alpha: needs 69.8 GiB, this machine has 48 GiB of memory: it can never be admitted here, so it starts at once and holds its claim\n"),
-            "{said}"
+        a_line_names(
+            &said,
+            "trust: capacity: trust check alpha",
+            &["69.8 GiB", "48 GiB of memory", "starts at once"],
         );
         assert!(!said.contains(" waits "), "{said}");
         assert!(ledger.list().unwrap().is_empty(), "its claim let go");
@@ -8100,9 +8207,10 @@ mod tests {
         let mut unread = site(Scope::Packages(vec!["alpha".into()]));
         unread.ceiling = Err("trustc -Z help exited 1".into());
         let (_, said, _) = run_site(&mut unread);
-        assert!(
-            said.contains("trust: trustc -Z help exited 1; this prover is taken to have no verifier memory ceiling"),
-            "{said}"
+        a_line_names(
+            &said,
+            "trust: trustc -Z help exited 1",
+            &["no verifier memory ceiling"],
         );
         run_site(&mut unread);
         assert_eq!(unread.ceiling_probes, 2, "an unread answer is not kept");
@@ -8817,7 +8925,8 @@ mod tests {
     }
 
     /// [`a_held_root_is_waited_for_until_its_holder_dies_by_its_own_hand`]'s holder.
-    const ROOT_HOLDER: &str = "trust_lane::tests::a_root_holder_stand_in";
+    const ROOT_HOLDER: &str =
+        "trust_lane::tests::a_held_root_is_waited_for_until_its_holder_dies_by_its_own_hand";
     /// The run lock the stand-in takes.
     const ROOT_HOLDER_ENV: &str = "ATERM_RELEASE_TEST_ROOT_HOLDER";
     /// What the stand-in says once it holds the root (libtest's own words share its line).
@@ -8825,8 +8934,7 @@ mod tests {
 
     /// Not a test alone: as [`ROOT_HOLDER`] it takes the run lock at [`ROOT_HOLDER_ENV`]'s path,
     /// says [`ROOT_HOLDER_HOLDS`], and at its first line on stdin dies by its own `SIGKILL`.
-    #[test]
-    fn a_root_holder_stand_in() {
+    fn a_root_holder_stand_in_if_asked() {
         let Some(path) = std::env::var_os(ROOT_HOLDER_ENV) else {
             return;
         };
@@ -8838,11 +8946,31 @@ mod tests {
         aterm_uds::process::kill_self_now()
     }
 
+    /// The waiter's `out`: the first line it writes tells the stand-in to die.
+    struct DieOnFirstWrite {
+        heard: Vec<u8>,
+        die: Option<std::process::ChildStdin>,
+    }
+
+    impl Write for DieOnFirstWrite {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.heard.extend_from_slice(buf);
+            if let Some(mut stdin) = self.die.take() {
+                stdin.write_all(b"die\n")?;
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     /// A second run on a held target root waits with its holder named, and has the root once
     /// the holder is gone, though the holder died by its own `SIGKILL` and nobody signalled
     /// anyone. Negative control: `--no-wait` refuses at once, naming the same holder.
     #[test]
     fn a_held_root_is_waited_for_until_its_holder_dies_by_its_own_hand() {
+        a_root_holder_stand_in_if_asked();
         use std::io::BufRead as _;
         use std::os::unix::process::ExitStatusExt as _;
         let d = tmp("trust-lane-lock-wait");
@@ -8878,23 +9006,6 @@ mod tests {
         assert!(refused.contains(&named), "{refused}");
         assert!(quiet.is_empty(), "--no-wait says nothing of a wait");
 
-        /// The waiter's `out`: the first line it writes tells the stand-in to die.
-        struct Out {
-            heard: Vec<u8>,
-            die: Option<std::process::ChildStdin>,
-        }
-        impl Write for Out {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.heard.extend_from_slice(buf);
-                if let Some(mut stdin) = self.die.take() {
-                    stdin.write_all(b"die\n")?;
-                }
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
         let die = holder.stdin.take();
         let (died, death) = std::sync::mpsc::channel();
         let reaper = std::thread::spawn(move || {
@@ -8904,7 +9015,7 @@ mod tests {
         });
         let (took, taken) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
-            let mut out = Out {
+            let mut out = DieOnFirstWrite {
                 heard: Vec::new(),
                 die,
             };
@@ -9066,13 +9177,57 @@ mod tests {
             .join(" ")
     }
 
-    /// `pid`'s `ps -o stat=` state, empty once no process holds it.
-    fn state(pid: u32) -> String {
-        let o = command("/bin/ps")
-            .args(["-o", "stat=", "-p", &pid.to_string()])
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&o.stdout).trim().to_owned()
+    /// What the kernel holds at a pid ([`state`]).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum State {
+        /// No process holds it.
+        Gone,
+        /// A process that exited, or is exiting, and is not yet reaped.
+        Zombie,
+        /// A stopped process.
+        Stopped,
+        /// A process that runs.
+        Runs,
+    }
+
+    impl State {
+        /// It runs nothing again: gone, or a zombie.
+        fn ended(self) -> bool {
+            matches!(self, State::Gone | State::Zombie)
+        }
+    }
+
+    /// `pid`'s [`State`], read in this process: a test's poll of it spawns nothing, so it adds
+    /// no process to the listing of another test's sweep running beside it
+    /// ([`proc_tree::table`]), which a `ps` per poll kept from ever being whole on a loaded
+    /// machine.
+    #[cfg(target_vendor = "apple")]
+    fn state(pid: u32) -> State {
+        use aterm_uds::process::{BsdShortInfo, ProcessPresence};
+        let pid = i32::try_from(pid).unwrap();
+        // A zombie, and a process whose exit has begun, read no record here.
+        match aterm_uds::process::read_short_info(pid) {
+            Some(info) if info.pbsi_status == BsdShortInfo::SSTOP => State::Stopped,
+            Some(_) => State::Runs,
+            None => match aterm_uds::process::process_presence(pid) {
+                ProcessPresence::Absent => State::Gone,
+                _ => State::Zombie,
+            },
+        }
+    }
+
+    /// See the Apple twin: the state letter of `/proc/<pid>/stat`.
+    #[cfg(not(target_vendor = "apple"))]
+    fn state(pid: u32) -> State {
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return State::Gone;
+        };
+        match aterm_uds::process::procfs::stat_start(&stat, i32::try_from(pid).unwrap()) {
+            Some(('Z' | 'X', _)) => State::Zombie,
+            Some(('T' | 't', _)) => State::Stopped,
+            Some(_) => State::Runs,
+            None => State::Gone,
+        }
     }
 
     /// The program at `path` as a process whose environment another can read: macOS withholds
@@ -9133,17 +9288,7 @@ mod tests {
     /// Whether `pid` still holds the process `serial` names, as more than a zombie.
     fn alive(pid: u32, serial: u64) -> bool {
         aterm_uds::process::process_serial(i32::try_from(pid).unwrap()) == Some(serial)
-            && !state(pid).is_empty_or_zombie()
-    }
-
-    trait ZombieWord {
-        fn is_empty_or_zombie(&self) -> bool;
-    }
-
-    impl ZombieWord for String {
-        fn is_empty_or_zombie(&self) -> bool {
-            self.is_empty() || self.starts_with('Z')
-        }
+            && !state(pid).ended()
     }
 
     /// Whether `pid`'s process `serial` ends within a minute; it is killed if not.
@@ -9190,11 +9335,9 @@ mod tests {
 
         /// Whether it still runs, neither stopped nor killed.
         fn running(&self) -> bool {
-            let state = state(self.pid);
             aterm_uds::process::process_serial(i32::try_from(self.pid).unwrap())
                 == Some(self.serial)
-                && !state.is_empty()
-                && !state.starts_with(['T', 'Z'])
+                && state(self.pid) == State::Runs
         }
     }
 
@@ -9233,13 +9376,10 @@ mod tests {
                 .status();
             let deadline = Instant::now() + Duration::from_secs(60);
             loop {
-                let o = command("/bin/ps")
-                    .args(["-A", "-o", "pgid="])
-                    .output()
-                    .unwrap();
-                if !String::from_utf8_lossy(&o.stdout)
-                    .split_whitespace()
-                    .any(|g| g == group)
+                // Read in this process, as `state` is: a `ps` per turn adds to the listing of
+                // every sweep running beside it.
+                if aterm_uds::process::group_members(self.root)
+                    .is_some_and(|m| m.complete && m.pids.is_empty())
                 {
                     return true;
                 }
@@ -9265,10 +9405,20 @@ mod tests {
         }
     }
 
+    /// What a test's beating loop runs after each turn's `read -t 1`: macOS's bash 3.2 returns 1
+    /// both when the second runs out and when the pipe closes, so a loop that turns nine times
+    /// within one second of `$SECONDS` is reading a closed pipe (its test is gone, killed before
+    /// it ended the loop) and ends, where one that waits out each second beats on. A loop that
+    /// read on would append to its beat file and spin a core for good.
+    const SURVIVOR_ENDS: &str =
+        "[ \"$SECONDS\" != \"$t\" ] && t=$SECONDS && n=0; n=$((n+1)); [ $n -lt 9 ] || exit;";
+
     /// Starts a [`Group`] whose processes carry `mark` when given, its root starting in `cwd`
     /// (the test's own when `None`) and running the shell words `prelude` before the subshell,
     /// which inherits all three. The subshell forks nothing: it waits out each turn reading
-    /// a pipe no one writes, so every look reads it, environment and all, as it is.
+    /// a pipe no one writes, so every look reads it, environment and all, as it is. Once that
+    /// pipe closes (the test is gone, killed before it ended the group) each read returns at
+    /// once, and the subshell ends at the ninth turn within one second ([`SURVIVOR_ENDS`]).
     fn rootless_group(dir: &Path, mark: Option<&str>, cwd: Option<&Path>, prelude: &str) -> Group {
         let pidfile = dir.join("left.pid");
         let beat = dir.join(format!("beat.{}", nonce()));
@@ -9276,8 +9426,8 @@ mod tests {
         let mut cmd = command(readable("/bin/bash"));
         cmd.arg("-c")
             .arg(format!(
-                "{prelude}exec 3<&0; while :; do echo >> \"$2\"; read -t 1 -u 3; done & \
-                 echo $! > \"$1\"; wait"
+                "{prelude}exec 3<&0; t=; n=0; while :; do echo >> \"$2\"; read -t 1 -u 3; \
+                 {SURVIVOR_ENDS} done & echo $! > \"$1\"; wait"
             ))
             .arg("sh")
             .arg(&pidfile)
@@ -10564,7 +10714,8 @@ mod tests {
 
     /// A check's process that ignores `SIGTERM`, unmarked and tied only by the root and its
     /// session, which the `SIGTERM` ends, is still killed by the reap, which then takes the
-    /// record.
+    /// record. It ends by itself once the test's pipe closes ([`SURVIVOR_ENDS`]), so a test
+    /// killed before its reap leaves no loop behind.
     #[test]
     fn what_outlives_the_reaps_sigterm_is_ended_by_it() {
         let d = tmp("trust-lane-survivor");
@@ -10575,11 +10726,11 @@ mod tests {
         let nonce = nonce();
         let mut cmd = command("/bin/bash");
         cmd.arg("-c")
-            .arg(
+            .arg(format!(
                 "exec 3<&0; /usr/bin/env -i /bin/bash -c \
-                 'trap \"\" TERM; while :; do echo >> \"$0\"; read -t 1 -u 3; done' \"$2\" & \
-                 echo $! > \"$1\"; wait",
-            )
+                 'trap \"\" TERM; t=; n=0; while :; do echo >> \"$0\"; read -t 1 -u 3; \
+                 {SURVIVOR_ENDS} done' \"$2\" & echo $! > \"$1\"; wait",
+            ))
             .arg("sh")
             .arg(&pidfile)
             .arg(&beat)
@@ -11716,14 +11867,14 @@ mod tests {
         let pid = ASKED.load(Ordering::SeqCst);
         assert!(pid > 1, "the root's serial was never asked for");
         let state = state(pid.unsigned_abs());
-        if !state.is_empty_or_zombie() {
+        if !state.ended() {
             let _ = command("/bin/kill")
                 .args(["-KILL", &pid.to_string()])
                 .status();
         }
         assert!(
-            state.is_empty_or_zombie(),
-            "the root is left running or stopped: {state}"
+            state.ended(),
+            "the root is left running or stopped: {state:?}"
         );
         reap_until_gone(
             &root,
@@ -11734,14 +11885,14 @@ mod tests {
     }
 
     const DIES_STARTING_ENV: &str = "ATERM_RELEASE_TRUST_LANE_DIES_STARTING";
-    const DIES_STARTING: &str = "trust_lane::tests::probe_a_lane_that_dies_starting_a_check";
+    const DIES_STARTING: &str =
+        "trust_lane::tests::a_lane_killed_starting_a_check_leaves_no_root_waiting";
 
     /// Run by [`a_lane_killed_starting_a_check_leaves_no_root_waiting`] in a process of its
     /// own: starts a check under the directory [`DIES_STARTING_ENV`] names, and as it reads the
     /// root's serial writes the root's pid and serial to `root.pid` there and dies by
     /// `SIGKILL`, before the record names the root.
-    #[test]
-    fn probe_a_lane_that_dies_starting_a_check() {
+    fn probe_a_lane_that_dies_starting_a_check_if_asked() {
         let Some(dir) = std::env::var_os(DIES_STARTING_ENV) else {
             return;
         };
@@ -11772,6 +11923,7 @@ mod tests {
     /// record.
     #[test]
     fn a_lane_killed_starting_a_check_leaves_no_root_waiting() {
+        probe_a_lane_that_dies_starting_a_check_if_asked();
         use std::os::unix::process::ExitStatusExt as _;
         let d = tmp("trust-lane-dies-starting");
         let out = command(std::env::current_exe().unwrap())
@@ -11796,13 +11948,14 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(60);
         while alive(root.pid, root.serial) {
             let state = state(root.pid);
-            assert!(
-                !state.starts_with('T'),
-                "the lane's death left its check's root stopped: {state}"
+            assert_ne!(
+                state,
+                State::Stopped,
+                "the lane's death left its check's root stopped"
             );
             assert!(
                 Instant::now() < deadline,
-                "the root outlived its lane by a minute: {state}"
+                "the root outlived its lane by a minute: {state:?}"
             );
             std::thread::yield_now();
         }
@@ -11821,38 +11974,40 @@ mod tests {
     }
 
     const DIES_SWEEPING_ENV: &str = "ATERM_RELEASE_TRUST_LANE_DIES_SWEEPING";
-    const DIES_SWEEPING: &str = "trust_lane::tests::probe_a_lane_that_dies_after_its_sigterm";
+    const DIES_SWEEPING: &str =
+        "trust_lane::tests::what_a_dead_lanes_sigterm_reached_is_ended_by_the_next_reap";
+
+    /// The kernel's reads and signals, but the lane dies once it has sent `SIGTERM`.
+    struct DiesAfterSigterm<'a>(proc_tree::Live<'a>, bool);
+
+    impl proc_tree::Procs for DiesAfterSigterm<'_> {
+        fn table(&mut self) -> Option<proc_tree::Listing> {
+            self.0.table()
+        }
+        fn session(&mut self, listed: &[proc_tree::Proc]) -> Option<i32> {
+            self.0.session(listed)
+        }
+        fn alive(&mut self, p: &proc_tree::Proc) -> bool {
+            if self.1 {
+                aterm_uds::process::kill_self_now()
+            }
+            self.0.alive(p)
+        }
+        fn keep(&mut self, procs: &[proc_tree::Proc]) -> bool {
+            self.0.keep(procs)
+        }
+        fn send(&mut self, procs: &[proc_tree::Proc], sig: i32) -> Vec<(i32, u64)> {
+            self.1 |= sig == proc_tree::SIGTERM;
+            self.0.send(procs, sig)
+        }
+    }
 
     /// Run by [`what_a_dead_lanes_sigterm_reached_is_ended_by_the_next_reap`] in a process of
     /// its own: starts a check under the directory [`DIES_SWEEPING_ENV`] names, its root leading
     /// a session with a member that ignores `SIGTERM` and reads without the mark, writes the
     /// member's pid and serial to `member.pid` there, and ends the check as `RealCheck::end`
     /// does, dying by `SIGKILL` as the sweep first waits after its `SIGTERM`.
-    #[test]
-    fn probe_a_lane_that_dies_after_its_sigterm() {
-        /// The kernel's reads and signals, but the lane dies once it has sent `SIGTERM`.
-        struct DiesAfterSigterm<'a>(proc_tree::Live<'a>, bool);
-        impl proc_tree::Procs for DiesAfterSigterm<'_> {
-            fn table(&mut self) -> Option<proc_tree::Listing> {
-                self.0.table()
-            }
-            fn session(&mut self, listed: &[proc_tree::Proc]) -> Option<i32> {
-                self.0.session(listed)
-            }
-            fn alive(&mut self, p: &proc_tree::Proc) -> bool {
-                if self.1 {
-                    aterm_uds::process::kill_self_now()
-                }
-                self.0.alive(p)
-            }
-            fn keep(&mut self, procs: &[proc_tree::Proc]) -> bool {
-                self.0.keep(procs)
-            }
-            fn send(&mut self, procs: &[proc_tree::Proc], sig: i32) -> Vec<(i32, u64)> {
-                self.1 |= sig == proc_tree::SIGTERM;
-                self.0.send(procs, sig)
-            }
-        }
+    fn probe_a_lane_that_dies_after_its_sigterm_if_asked() {
         let Some(dir) = std::env::var_os(DIES_SWEEPING_ENV) else {
             return;
         };
@@ -11934,6 +12089,7 @@ mod tests {
     /// parent, the root, which alone proved the session) and takes the record.
     #[test]
     fn what_a_dead_lanes_sigterm_reached_is_ended_by_the_next_reap() {
+        probe_a_lane_that_dies_after_its_sigterm_if_asked();
         use std::os::unix::process::ExitStatusExt as _;
         let d = tmp("trust-lane-dies-sweeping");
         let out = command(std::env::current_exe().unwrap())
@@ -12234,16 +12390,8 @@ mod tests {
     /// execs `/bin/sleep`, so only the end ends it.
     #[test]
     fn ending_a_check_ends_its_whole_tree() {
-        let pgid = |pid: u32| {
-            let o = command("/bin/ps")
-                .args(["-o", "pgid=", "-p", &pid.to_string()])
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse::<u32>()
-                .ok()
-        };
+        let pgid =
+            |pid: u32| aterm_uds::process::read_lineage(i32::try_from(pid).ok()?).map(|l| l.pgid);
         let d = tmp("trust-lane-tree");
         let pidfile = d.path().join("grandchild.pid");
         let orphanfile = d.path().join("orphan.pid");
@@ -12481,7 +12629,7 @@ mod tests {
     fn the_probe_tells_this_builds_trustd_from_another() {
         let private = short_dir("p");
         let d = private.path();
-        let wait = Duration::from_secs(10);
+        let wait = aterm_spec::wait::MUST_HAPPEN;
         let none = trustd::probe(&d.join("absent.sock"), "aa", wait);
         assert_eq!(none.held, trustd::Held::None);
         let ours = d.join("ours.sock");

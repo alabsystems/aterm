@@ -10,7 +10,17 @@ use std::ffi::OsString;
 use std::ops::ControlFlow;
 use std::process::ExitCode;
 
+#[cfg(target_os = "macos")]
+mod compact_zone;
+#[cfg(test)]
+mod macho_order;
+
 use aterm_cli::{AliasRoute, alias_route};
+
+#[cfg(test)]
+aterm_durable::plain_durable_flushes_in_tests!();
+#[cfg(all(test, unix))]
+aterm_secrets::memoized_x25519_in_tests!();
 
 macro_rules! println {
     () => {
@@ -47,6 +57,110 @@ fn machines_unavailable() -> ExitCode {
 fn secrets_unavailable() -> ExitCode {
     eprintln!("aterm secrets: not available on this platform (Unix only)");
     ExitCode::FAILURE
+}
+
+/// `aterm node` where `systems.alab.aterm-node` cannot run (Unix only).
+#[cfg(not(unix))]
+fn node_unavailable() -> ExitCode {
+    eprintln!("aterm node: not available on this platform (Unix only)");
+    ExitCode::FAILURE
+}
+
+/// Background Commons runtime and steward enroller held by `aterm node serve` (C22), yielding
+/// local observation and transport whenever an interactive window runs.
+#[cfg(unix)]
+fn start_node_commons_runtime() -> Option<aterm_db::runtime::Runtime> {
+    if std::env::var_os("ATERM_STATE_HOME").is_some() || std::env::var_os("CI").is_some() {
+        return None;
+    }
+    let paths = aterm_secrets::client::Paths::live().ok()?;
+    let config = aterm_types::dirs::aterm_config_path()?;
+    let lan = commons_lan::gate(&config, commons_lan::Host::NodeServe);
+    match aterm_db::runtime::Runtime::start_background(paths, config, lan, |status| match status {
+        aterm_db::runtime::Status::Refused => aterm_log::warn!(
+            "Commons node background repair refused local configuration or trust state"
+        ),
+        aterm_db::runtime::Status::LanHeld => {
+            aterm_log::info!("Commons node background repair: {status:?}");
+        }
+        _ => aterm_log::debug!("Commons node background repair: {status:?}"),
+    }) {
+        Ok(runtime) => Some(runtime),
+        Err(error) => {
+            aterm_log::warn!("Commons node background runtime could not start: {error}");
+            None
+        }
+    }
+}
+
+#[cfg(unix)]
+fn dispatch_node(forwarded: &[OsString]) -> ExitCode {
+    let args: Vec<String> = forwarded
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let subcmd = args.first().map_or("status", String::as_str);
+    if matches!(subcmd, "-h" | "--help" | "help") {
+        let _ = aterm_uds::stdout::write_all(aterm_agent::node_service::NODE_USAGE.as_bytes());
+        return ExitCode::SUCCESS;
+    }
+    let rest = args.get(1..).unwrap_or(&[]);
+    if subcmd == "serve" {
+        if rest.len() == 1 && matches!(rest[0].as_str(), "-h" | "--help" | "help") {
+            let _ = aterm_uds::stdout::write_all(aterm_agent::node_service::NODE_USAGE.as_bytes());
+            return ExitCode::SUCCESS;
+        }
+        if !rest.is_empty() {
+            eprint!(
+                "aterm node serve: unexpected argument {:?}\n{}",
+                rest[0],
+                aterm_agent::node_service::NODE_USAGE
+            );
+            return ExitCode::from(2);
+        }
+        aterm_gui::install_session_log();
+        let commons = start_node_commons_runtime();
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(runtime) = commons.as_ref() {
+            let _ = NODE_OBSERVATION.set(runtime.network_observation());
+        }
+        // A Commons peer heard again after a silence is the node job's "network moved" too.
+        if let Some(observation) = commons
+            .as_ref()
+            .map(aterm_db::runtime::Runtime::network_observation)
+        {
+            aterm_gui::hear_commons(move || observation.snapshot().peers);
+        }
+        return aterm_gui::run_node_serve();
+    }
+    let Some(home) = aterm_types::dirs::home_dir() else {
+        eprintln!("aterm node: HOME is not set");
+        return ExitCode::FAILURE;
+    };
+    let Some(state) = aterm_types::dirs::state_dir() else {
+        eprintln!("aterm node: state directory is unavailable");
+        return ExitCode::FAILURE;
+    };
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("aterm"));
+    let isolated =
+        std::env::var_os("ATERM_STATE_HOME").is_some() || std::env::var_os("CI").is_some();
+    let supervisor: &dyn aterm_agent::node_service::ServiceSupervisor = if isolated {
+        &aterm_agent::node_service::FileOnlySupervisor
+    } else {
+        &aterm_agent::node_service::LiveSupervisor
+    };
+    match aterm_agent::node_service::run_admin_subcommand(
+        subcmd, rest, &home, &state, &exe, supervisor,
+    ) {
+        Ok(out) => {
+            let _ = aterm_uds::stdout::write_all(out.as_bytes());
+            ExitCode::SUCCESS
+        }
+        Err((msg, code)) => {
+            eprint!("{msg}");
+            ExitCode::from(code)
+        }
+    }
 }
 
 const CTL_LOCAL: aterm_ctl::LocalVerbs = aterm_ctl::LocalVerbs {
@@ -149,11 +263,41 @@ pub(crate) fn main() -> ExitCode {
     if let Some(code) = aterm_uds::tether::entry() {
         return code;
     }
+    #[cfg(target_os = "macos")]
+    aterm_uds::process::register_allocator_relief(compact_zone::release_free_memory);
     #[cfg(windows)]
     if let Some(code) = aterm_pty::serve_console_client() {
         return code;
     }
     aterm_types::version::install(BUILD_STAMP);
+    // Before any vault path runs: the vault refuses every AI CLI's login file as an entry, as the
+    // connector rows say where each keeps it (aterm-secrets cannot read them itself).
+    #[cfg(unix)]
+    aterm_secrets::text::on_cli_login(aterm_agent::ai::connector::login_file);
+    // A Mac waiting to be let into ALab asks ALab's members on the LAN to show its request from
+    // its vault subscriber, every minute, over the fleet port's `ask` (aterm-secrets cannot dial
+    // it itself), with the ask the Secrets stage registers below.
+    #[cfg(unix)]
+    aterm_secrets::client::on_ask_members(|paths| {
+        aterm_agent::members_cli::ask_members(&paths.home).map_err(aterm_secrets::Error::new)
+    });
+    // Every `aterm pkg` download races this Mac's fleet members unless `[packages] peers` says
+    // otherwise, and its doctor counts them; the read runs only when one of those asks for it.
+    #[cfg(unix)]
+    atpkg::peers::set_fleet(unit_peers::fleet);
+    // Once a look heard the Local Network switch on, no route to a LAN vault host is a host that
+    // did not answer (a LAN this Mac left), never the permission.
+    #[cfg(target_os = "macos")]
+    aterm_secrets::transport::set_local_network_granted(|| {
+        matches!(
+            aterm_cli::macos_doctor::local_network_heard(),
+            aterm_cli::macos_doctor::LocalNetworkHeard::On
+        )
+    });
+    // The Secrets stage of System State and `aterm init` asks ALab's members for an Allow once
+    // its join waits on the ALab vault, as `aterm members join --no-wait` does.
+    #[cfg(unix)]
+    aterm_machines::init_secrets::on_ask_members(aterm_agent::members_cli::ask_members);
     // The fixed collector runs before GUI initialization or any per-user state is read.
     #[cfg(target_os = "macos")]
     let early_args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -171,6 +315,10 @@ pub(crate) fn main() -> ExitCode {
         ));
     }
     aterm_gui::mark_rust_main_start();
+    #[cfg(unix)]
+    shared_login::install_automatic();
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    account_claims::install(claims_observation);
     #[cfg(windows)]
     let _ = aterm_gui::attach_parent_console();
     let mut args_os = std::env::args_os();
@@ -238,6 +386,11 @@ pub(crate) fn main() -> ExitCode {
         return aterm_gui::run_reopen_after(rest.get(1..).unwrap_or(&[]));
     }
 
+    // aCaffiene's name before 0.145.0: an old login job runs `caffeine serve` at every login.
+    if first == aterm_acaffiene::legacy::VERB {
+        return aterm_acaffiene::legacy::main_entry(rest.get(1..).unwrap_or(&[]));
+    }
+
     #[cfg(unix)]
     if first == "hook" && rest.get(1).is_some_and(|a| a == "run") {
         return dispatch_link(
@@ -263,6 +416,10 @@ pub(crate) fn main() -> ExitCode {
             }
             aterm_cli::Verb::Agh => agh::cli::main_entry(forwarded),
             aterm_cli::Verb::Fleet => aterm_agent::fleet_cli::main_entry(forwarded),
+            #[cfg(unix)]
+            aterm_cli::Verb::Node => dispatch_node(&forwarded),
+            #[cfg(not(unix))]
+            aterm_cli::Verb::Node => node_unavailable(),
             aterm_cli::Verb::Drive => aterm_agent::drive_cli::main_entry(forwarded),
             #[cfg(unix)]
             aterm_cli::Verb::Link => dispatch_link(
@@ -360,6 +517,12 @@ pub(crate) fn main() -> ExitCode {
                     .first()
                     .and_then(|s| s.to_str())
                     .map(str::to_owned);
+                if first.as_deref() == Some("need") {
+                    // The need verbs read the lab's table, which aterm-db holds.
+                    return aterm_db::credentials::cli::main_entry(
+                        forwarded.into_iter().skip(1).collect(),
+                    );
+                }
                 let code = aterm_secrets::cli::main_entry(forwarded);
                 if code == ExitCode::SUCCESS
                     && matches!(
@@ -387,6 +550,13 @@ pub(crate) fn main() -> ExitCode {
             }
             #[cfg(not(unix))]
             aterm_cli::Verb::Secrets => secrets_unavailable(),
+            #[cfg(unix)]
+            aterm_cli::Verb::Members => aterm_agent::members_cli::main_entry(forwarded),
+            #[cfg(not(unix))]
+            aterm_cli::Verb::Members => {
+                eprintln!("aterm members: not available on this platform (Unix only)");
+                ExitCode::from(2)
+            }
             aterm_cli::Verb::Keeper => {
                 aterm_keeper::cli::main_entry(forwarded, aterm_types::version::app_version())
             }
@@ -508,7 +678,7 @@ pub(crate) fn main() -> ExitCode {
     }) {
         aterm_log::env::set(
             "PATH",
-            atpkg::store::append_bin_to_path(std::env::var_os("PATH").as_deref(), &bin),
+            atpkg::store::prepend_bin_to_path(std::env::var_os("PATH").as_deref(), &bin),
         );
     }
 
@@ -540,7 +710,7 @@ pub(crate) fn main() -> ExitCode {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if session_lane_is_interactive() {
-        spawn_commons_runtime();
+        spawn_commons_runtime(commons_lan::Host::SessionLane);
         let build = aterm_gui::running_build_number();
         #[cfg(target_os = "linux")]
         start_linux_session_trial(build);
@@ -886,15 +1056,38 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
     let _ = (host, handoff);
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let ordinary = ordinary_window(&args);
+    // A command line the window's parser answers (`--list-fonts`) or refuses (a word no verb or
+    // other front-door route took, which a launch without a terminal brings here) ends in this
+    // check, before the Commons runtime and, on macOS, aCaffiene's autostart, which keeps the
+    // Mac awake for good.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if ordinary {
-        spawn_commons_runtime();
+        aterm_gui::check_window_args(args.clone());
+    }
+    let first_run = wire_window(&args);
+    // System State's Local Network step asks macOS first, in a window that runs first-run setup
+    // only: there its Commons runtime, its Secrets stage, Tab Control's sweep and the network
+    // signal's Bonjour browse wait for it; a window that runs none takes no step, so its Commons
+    // gate asks by itself and nothing else waits. One decision feeds the gate and the reader, and
+    // the reader is in place before the GUI starts any of the others.
+    #[cfg(target_os = "macos")]
+    let runs_step = first_lan_uses_wait_for_the_step(ordinary, first_run);
+    #[cfg(target_os = "linux")]
+    let runs_step = false;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if ordinary {
+        spawn_commons_runtime(commons_lan::Host::Window {
+            runs_setup: runs_step,
+        });
     }
     #[cfg(target_os = "macos")]
     if ordinary {
-        spawn_acaffiene_autostart();
+        spawn_acaffiene_autostart(acaffiene_launch(std::env::var_os));
     }
-    let first_run = wire_window(&args);
+    #[cfg(target_os = "macos")]
+    if runs_step && let Some(config) = aterm_types::dirs::aterm_config_path() {
+        commons_lan::hold_first_uses_for_the_step(&config);
+    }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let network_source = ordinary.then(network_state_source).flatten();
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -907,25 +1100,108 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
     ExitCode::SUCCESS
 }
 
-/// Whether this is an ordinary window launch rather than a one-shot or private control session.
+/// Whether no word of `args`, the command after `-e` included, is `--headless`, `--diagnose` or
+/// a `--control-sock` with a socket of its own: with no value, or one other than `0` and `off`
+/// (no socket, as `--no-control-sock`) and the empty one (the default socket)
+/// ([`aterm_types::control_socket::socket_directive`]). A launch with one starts no Commons
+/// runtime, aCaffiene or network source. [`run_window`] lets the window's parser end a one-shot
+/// or refused one of the rest first.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn ordinary_window(args: &[OsString]) -> bool {
-    !args.iter().any(|a| {
-        matches!(
-            a.to_string_lossy().as_ref(),
-            "--headless" | "--diagnose" | "--control-sock"
-        )
-    })
+    use aterm_types::control_socket::{SocketDirective, socket_directive};
+    let mut words = args.iter().map(|a| a.to_string_lossy());
+    while let Some(word) = words.next() {
+        let private = match word.as_ref() {
+            "--headless" | "--diagnose" => true,
+            "--control-sock" => words.next().is_none_or(|value| {
+                matches!(
+                    socket_directive(Some(value.as_ref()), None),
+                    SocketDirective::Explicit(_)
+                )
+            }),
+            _ => false,
+        };
+        if private {
+            return false;
+        }
+    }
+    true
 }
 
-/// Start aCaffiene beside an ordinary window, leaving its saved mode and login-item choice alone.
+/// How this window came to start, as aCaffiene's autostart takes it: a running window's
+/// successor when `var` (the environment's reader) finds
+/// [`aterm_update::RELAUNCH_OF_RUNNING_ENV`], which an update and a launch-record renewal set,
+/// else a launch.
 #[cfg(target_os = "macos")]
-fn spawn_acaffiene_autostart() {
+fn acaffiene_launch(
+    var: impl Fn(&'static str) -> Option<OsString>,
+) -> aterm_acaffiene::cli::Launch {
+    if var(aterm_update::RELAUNCH_OF_RUNNING_ENV).is_some() {
+        aterm_acaffiene::cli::Launch::Successor
+    } else {
+        aterm_acaffiene::cli::Launch::Fresh
+    }
+}
+
+/// Whether a window's first LAN uses (its Commons runtime's, [`commons_lan::Host::Window`]'s
+/// `runs_setup`; its Secrets stage's vault probe and join, Tab Control's Bonjour sweep and the
+/// network signal's Bonjour browse) wait for System State's Local Network step: only in an
+/// `ordinary` window that runs first-run setup (`first_run`, [`wire_window`]'s), whose System
+/// State runs the step. A window that runs none (started over ssh or away from the console, under
+/// a private state root, outside the person's scope, or running a command) takes no step unless a
+/// person presses Set up now, so none of its uses waits on one: its Commons gate asks by itself.
+#[cfg(target_os = "macos")]
+const fn first_lan_uses_wait_for_the_step(ordinary: bool, first_run: Option<fn() -> bool>) -> bool {
+    ordinary && first_run.is_some()
+}
+
+/// How long a thread [`run_window`] starts ahead of the window's logger waits for that logger
+/// ([`aterm_log::wait_for_logger`]) before it goes on without one. A process settles its
+/// logging, with a logger or without one ([`aterm_log::settle_logger`]), which ends the wait:
+/// a window early in its start, and a terminal session in
+/// [`aterm_gui::install_session_log`] before it starts the Commons runtime, so this bounds only
+/// a window that has not got that far.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const EARLY_LOG_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Log `line` as a warning: at once when a logger takes it (a terminal session's), and otherwise
+/// from a thread of its own once the window's logger does ([`EARLY_LOG_WAIT`]), since
+/// [`run_window`]'s own thread has it before [`aterm_gui::main_entry_with_network`] installs
+/// the logger, which drops what comes first. To stderr when that thread cannot start.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn warn_when_logging(line: String) {
+    if aterm_log::wait_for_logger(std::time::Duration::ZERO) {
+        aterm_log::warn!("{line}");
+        return;
+    }
+    let shown = line.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("aterm-early-warning".into())
+        .spawn(move || {
+            let _ = aterm_log::wait_for_logger(EARLY_LOG_WAIT);
+            aterm_log::warn!("{line}");
+        })
+    {
+        eprintln!("aterm: {shown} (no thread to log it: {error})");
+    }
+}
+
+/// Start aCaffiene beside an ordinary window once the window has set up its logging
+/// ([`EARLY_LOG_WAIT`]): set to keep the Mac awake for good on a launch, and as saved beside a
+/// running window's successor ([`aterm_acaffiene::cli::Launch`]). Its login-item choice is left
+/// alone.
+#[cfg(target_os = "macos")]
+fn spawn_acaffiene_autostart(launch: aterm_acaffiene::cli::Launch) {
     if let Err(error) = std::thread::Builder::new()
         .name("aterm-acaffiene-autostart".into())
-        .spawn(aterm_acaffiene::cli::autostart)
+        .spawn(move || {
+            // The window installs its logger in main_entry_with_network, after this thread
+            // starts; a line the autostart logs before that would be dropped.
+            let _ = aterm_log::wait_for_logger(EARLY_LOG_WAIT);
+            aterm_acaffiene::cli::autostart(launch);
+        })
     {
-        aterm_log::warn!("acaffiene: could not start with aterm: {error}");
+        warn_when_logging(format!("acaffiene: could not start with aterm: {error}"));
     }
 }
 
@@ -935,8 +1211,39 @@ fn spawn_acaffiene_autostart() {
 static COMMONS_RUNTIME: std::sync::OnceLock<aterm_db::runtime::Runtime> =
     std::sync::OnceLock::new();
 
+/// What the node job's background Commons runtime observes (`aterm node serve`, which keeps its
+/// runtime to itself and serves the census): the presence its account claims lapse by.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn spawn_commons_runtime() {
+static NODE_OBSERVATION: std::sync::OnceLock<aterm_db::network_state::ObservationHandle> =
+    std::sync::OnceLock::new();
+
+/// What this process's Commons runtime last observed of the network, where one runs here (a
+/// window's or session lane's, else the node job's), else what the local owner publishes over its
+/// relay (a one-shot verb such as `aterm fleet census --refresh`): the presence account claims
+/// lapse by. While a window owns Commons, the node job's runtime publishes that window's relayed
+/// observation, or a waiting one that claims read no presence from.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn claims_observation() -> Option<aterm_types::network_state::NetworkObservation> {
+    if let Some(runtime) = COMMONS_RUNTIME.get() {
+        return runtime
+            .network_observation()
+            .try_publication()
+            .map(account_claims::current_observation);
+    }
+    if let Some(node) = NODE_OBSERVATION.get() {
+        return node
+            .try_publication()
+            .map(account_claims::current_observation);
+    }
+    if std::env::var_os("ATERM_STATE_HOME").is_some() || std::env::var_os("CI").is_some() {
+        return None;
+    }
+    aterm_db::network_state::read_live_observation(&aterm_types::dirs::aterm_config_path()?).ok()
+}
+
+/// Start this process's Commons runtime once, for `host` (its LAN gate, [`commons_lan::gate`]).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn spawn_commons_runtime(host: commons_lan::Host) {
     if std::env::var_os("ATERM_STATE_HOME").is_some()
         || std::env::var_os("CI").is_some()
         || COMMONS_RUNTIME.get().is_some()
@@ -949,19 +1256,26 @@ fn spawn_commons_runtime() {
     let Some(config) = aterm_types::dirs::aterm_config_path() else {
         return;
     };
-    match aterm_db::runtime::Runtime::start(paths, config, |status| {
-        if status == aterm_db::runtime::Status::Refused {
-            aterm_log::warn!(
+    let lan = commons_lan::gate(&config, host);
+    match aterm_db::runtime::Runtime::start(paths, config, lan, |status| {
+        // In a window, the owner thread can report its first status before the window installs
+        // its logger, and it reports a status only when it changes, so a dropped one stays
+        // unsaid. A terminal session has settled its logging before this runtime starts.
+        let _ = aterm_log::wait_for_logger(EARLY_LOG_WAIT);
+        match status {
+            aterm_db::runtime::Status::Refused => aterm_log::warn!(
                 "Commons automatic control repair refused local configuration or trust state"
-            );
-        } else {
-            aterm_log::debug!("Commons control repair: {status:?}");
+            ),
+            aterm_db::runtime::Status::LanHeld => {
+                aterm_log::info!("Commons control repair: {status:?}");
+            }
+            _ => aterm_log::debug!("Commons control repair: {status:?}"),
         }
     }) {
         Ok(runtime) => {
             let _ = COMMONS_RUNTIME.set(runtime);
         }
-        Err(error) => aterm_log::warn!("Commons runtime could not start: {error}"),
+        Err(error) => warn_when_logging(format!("Commons runtime could not start: {error}")),
     }
 }
 
@@ -999,8 +1313,31 @@ fn network_state_source() -> Option<aterm_gui::NetworkSnapshotSource> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn network_state_source_from(
     network: Option<aterm_db::network_state::ObservationHandle>,
-    services: Option<std::sync::Arc<std::sync::Mutex<aterm_types::network_state::ServiceStates>>>,
+    services: Option<aterm_db::service_state::ObservationHandle>,
     retained: Option<aterm_types::network_state::NetworkObservation>,
+) -> aterm_gui::NetworkSnapshotSource {
+    network_state_source_with_readers(
+        move || {
+            network
+                .as_ref()
+                .and_then(|network| network.try_publication())
+        },
+        move || {
+            services
+                .as_ref()
+                .and_then(|services| services.try_publication())
+        },
+        retained,
+        || (std::time::Instant::now(), aterm_time::unix_millis()),
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn network_state_source_with_readers(
+    network: impl Fn() -> Option<aterm_db::network_state::Publication> + Send + Sync + 'static,
+    services: impl Fn() -> Option<aterm_db::service_state::Publication> + Send + Sync + 'static,
+    retained: Option<aterm_types::network_state::NetworkObservation>,
+    clock: impl Fn() -> (std::time::Instant, Option<u64>) + Send + Sync + 'static,
 ) -> aterm_gui::NetworkSnapshotSource {
     use aterm_types::network_state::{
         HistoryState, NetworkObservation, NetworkStateSnapshot, Reachability, ServiceState,
@@ -1025,37 +1362,60 @@ fn network_state_source_from(
         peer.last_checked_ms = None;
     }
     retained.detail = format!(
-        "Network observer could not start; current reachability is unknown. {}",
+        "Network observation is unavailable; current reachability is unknown. {}",
         retained.detail
     );
-    let current = Mutex::new(Arc::new(NetworkStateSnapshot::default()));
+    let unavailable_services = ServiceStates {
+        accounts: ServiceState {
+            detail: "Service observation is unavailable".into(),
+            ..ServiceState::default()
+        },
+        secrets: ServiceState {
+            detail: "Service observation is unavailable".into(),
+            ..ServiceState::default()
+        },
+    };
+    let fallback = Arc::new(NetworkStateSnapshot {
+        network: retained.clone(),
+        services: unavailable_services.clone(),
+        ..NetworkStateSnapshot::default()
+    });
+    let current = Mutex::new((
+        fallback.clone(),
+        None::<aterm_db::network_state::Publication>,
+        None::<aterm_db::service_state::Publication>,
+    ));
     Arc::new(move || {
-        let network = network.as_ref().map_or_else(
+        // This callback runs on the UI thread. A worker paused while publishing
+        // must not pause drawing; retained timestamps still expire in the GUI.
+        let mut current = match current.try_lock() {
+            Ok(current) => current,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return fallback.clone(),
+        };
+        if let Some(publication) = network() {
+            current.1 = Some(publication);
+        }
+        if let Some(publication) = services() {
+            current.2 = Some(publication);
+        }
+        let (now, wall) = clock();
+        let network = current.1.as_ref().map_or_else(
             || retained.clone(),
-            aterm_db::network_state::ObservationHandle::snapshot,
+            |publication| publication.current_at(now, wall),
         );
-        let services = services.as_ref().map_or_else(
-            || ServiceStates {
-                accounts: ServiceState {
-                    detail: "Service observer is unavailable".into(),
-                    ..ServiceState::default()
-                },
-                secrets: ServiceState {
-                    detail: "Service observer is unavailable".into(),
-                    ..ServiceState::default()
-                },
-            },
-            |services| services.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+        let services = current.2.as_ref().map_or_else(
+            || unavailable_services.clone(),
+            |publication| publication.current_at(now, wall),
         );
-        let mut current = current.lock().unwrap_or_else(|p| p.into_inner());
-        if current.network != network || current.services != services {
-            *current = Arc::new(NetworkStateSnapshot {
-                revision: current.revision.saturating_add(1),
+        if current.0.network != network || current.0.services != services {
+            current.0 = Arc::new(NetworkStateSnapshot {
+                revision: current.0.revision.saturating_add(1),
                 network,
                 services,
             });
         }
-        current.clone()
+        current.0.clone()
     })
 }
 
@@ -1280,6 +1640,10 @@ fn run_startup_setup_with(mut widened: Option<Widened>, review: Review) {
 }
 
 /// A cancelled or closed review ends its attempt; other outcomes retain their watch maintenance.
+/// A Cancel, recorded for good, still starts the converge pass's window lane: its `sync.peers`
+/// reads the Cancel and joins nothing, and the rest is the upkeep a vault's subscriber runs
+/// anyway. A review closed unanswered is "not this launch": nothing of setup's runs, the lane
+/// (which would join the vault the review offers) included, and the next launch offers again.
 #[cfg(target_os = "macos")]
 fn run_prepared_startup_with(
     prepared: PreparedSetup<StartupClaim>,
@@ -1287,6 +1651,9 @@ fn run_prepared_startup_with(
     sent: StartupSent,
     maintain: impl FnMut(WatchMaintenance),
 ) {
+    if matches!(prepared, PreparedSetup::Cancelled) {
+        (setup_io().converge_lane)();
+    }
     if matches!(prepared, PreparedSetup::Cancelled | PreparedSetup::Closed) {
         return;
     }
@@ -2368,6 +2735,7 @@ impl StartupSent {
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SetupAdmission {
+    plan: aterm_types::macos_setup::Plan,
     revision: u64,
     completed: bool,
 }
@@ -2428,6 +2796,15 @@ trait SetupStartup {
     fn may_offer(&mut self) -> bool {
         true
     }
+    /// Offer the plan of `admission`, the run this startup resumes, back to System State without
+    /// waiting for its answer (design §3.3, §6): the page answers it by itself as it answers the
+    /// first launch's offer, and that answer, taken as "go on with this revision" (nothing new
+    /// admitted, the page's receipt accepted at once), is the window's own admission of the
+    /// plan, which the debugger's step needs and an earlier process's yes never gives. Every
+    /// startup offers it, a launch's, an update successor's, a heal's or a Restore's alike: the
+    /// page answers only with a person at this Mac, and lets the offer go when the window holds
+    /// its own admission of the plan in force already.
+    fn offer_resume(&mut self, _admission: &SetupAdmission) {}
     fn initial(&mut self) -> Result<aterm_types::macos_setup::Plan, String>;
     fn offer(
         &mut self,
@@ -2497,6 +2874,159 @@ struct LiveSetupStartup<F> {
     /// The plan the last review showed when it was answered: the one offered, or the plan this
     /// Mac's ALab signal widened it to while it was up. A Cancel names it.
     reviewed: Option<aterm_types::macos_setup::Plan>,
+}
+
+/// What the offer of a resumed run's plan reads and waits on ([`run_resume_offer`]): the live
+/// records and System State's channel in aterm ([`LiveResumeOffer`]), a script in a test.
+#[cfg(any(target_os = "macos", test))]
+trait ResumeOfferReach {
+    /// Whether the resumed run is still the one admitted, unfinished and unstopped; `None` while
+    /// the records cannot be read (a write under way, say).
+    fn current(&mut self) -> Option<bool>;
+    /// Whether a choice of the page's waits for the setup claim
+    /// ([`SetupStartup::choice_awaits_claim`]): the page's own choice goes first.
+    fn choice_awaits_claim(&mut self) -> bool;
+    /// Offer `plan` on System State and wait for the answer, which the offer's going
+    /// ([`Self::current`] false, or a choice waiting for the claim) withdraws as `Unavailable`.
+    fn answer(&mut self, plan: aterm_types::macos_setup::Plan) -> aterm_gui::SetupAnswer;
+    /// Wait up to `limit`, or until a setup wake.
+    fn back_off(&mut self, limit: std::time::Duration);
+}
+
+/// How the offer of a resumed run's plan ended ([`run_resume_offer`]).
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResumeOffer {
+    /// The page's automatic answer of the plan as offered, its receipt accepted: the window's own
+    /// admission of the resumed revision.
+    Admitted,
+    /// The offer went unanswered, or its answer was let go.
+    LetGo,
+}
+
+/// Offer `plan`, the plan of the run a startup resumes, back until the page answers it
+/// ([`SetupStartup::offer_resume`]). The page's automatic answer of that same plan is taken as
+/// "go on": nothing is written, and its receipt is accepted while the run is still the one
+/// admitted, unfinished and unstopped, so the window's own admission names that revision. Any
+/// other answer, or one that comes after the run went, is let go. An offer no window could show
+/// is made again once one can, each time only while the run is still current and no choice of the
+/// page's waits for the claim, so a stale offer never reaches a page whose person chose since.
+#[cfg(any(target_os = "macos", test))]
+fn run_resume_offer(
+    reach: &mut impl ResumeOfferReach,
+    plan: &aterm_types::macos_setup::Plan,
+) -> ResumeOffer {
+    use aterm_gui::WorkstationSetupDecision;
+    loop {
+        if reach.choice_awaits_claim() || reach.current() == Some(false) {
+            return ResumeOffer::LetGo;
+        }
+        let mut answer = reach.answer(plan.clone());
+        match answer.decision {
+            WorkstationSetupDecision::Begin(ref answered) => {
+                let Some(receipt) = answer.receipt.take() else {
+                    return ResumeOffer::LetGo;
+                };
+                let as_offered = answered == plan
+                    && receipt.admission() == aterm_gui::InitialSetupAdmission::Automatic
+                    && !answer.chosen
+                    && !answer.vault_typed
+                    && answer.changed.is_none();
+                if !as_offered {
+                    return ResumeOffer::LetGo;
+                }
+                // A read that met a write is tried again for a moment; a receipt let go refuses
+                // the answer, and the page reads the records again.
+                let mut reads = 0;
+                let still = loop {
+                    match reach.current() {
+                        Some(still) => break still,
+                        None if reads < 8 => {
+                            reads += 1;
+                            reach.back_off(std::time::Duration::from_millis(250));
+                        }
+                        None => break false,
+                    }
+                };
+                if !still {
+                    return ResumeOffer::LetGo;
+                }
+                receipt.accept();
+                return ResumeOffer::Admitted;
+            }
+            WorkstationSetupDecision::Unavailable => reach.back_off(SETUP_RETRY_WAIT),
+            WorkstationSetupDecision::Cancelled | WorkstationSetupDecision::Closed => {
+                return ResumeOffer::LetGo;
+            }
+        }
+    }
+}
+
+/// The live [`ResumeOfferReach`] of the run of `revision`, whose startup's admission number is
+/// `sent` (a Stop pressed since covers it).
+#[cfg(target_os = "macos")]
+struct LiveResumeOffer {
+    revision: u64,
+    sent: u64,
+    seen: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl LiveResumeOffer {
+    fn current_of(revision: u64, sent: u64) -> Option<bool> {
+        if stop_covers(sent) {
+            return Some(false);
+        }
+        aterm_cli::macos_doctor::initial_setup_admission()
+            .ok()
+            .map(|admission| {
+                admission
+                    .is_some_and(|admission| admission.revision == revision && !admission.completed)
+            })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ResumeOfferReach for LiveResumeOffer {
+    fn current(&mut self) -> Option<bool> {
+        Self::current_of(self.revision, self.sent)
+    }
+
+    fn choice_awaits_claim(&mut self) -> bool {
+        choice_awaits_claim()
+    }
+
+    fn answer(&mut self, plan: aterm_types::macos_setup::Plan) -> aterm_gui::SetupAnswer {
+        let (revision, sent) = (self.revision, self.sent);
+        aterm_gui::await_resume_answer_while(plan, move || {
+            choice_awaits_claim() || Self::current_of(revision, sent) == Some(false)
+        })
+    }
+
+    fn back_off(&mut self, limit: std::time::Duration) {
+        SETUP_WAKES.back_off(&mut self.seen, limit);
+    }
+}
+
+/// Offer `plan`, the run of `revision` a startup resumes, back to System State on a thread of its
+/// own ([`run_resume_offer`]), so the run never waits for the answer.
+#[cfg(target_os = "macos")]
+fn offer_resumed_plan(plan: aterm_types::macos_setup::Plan, revision: u64, sent: u64) {
+    let spawned = std::thread::Builder::new()
+        .name("aterm-setup-resume-offer".into())
+        .spawn(move || {
+            let mut reach = LiveResumeOffer {
+                revision,
+                sent,
+                seen: SETUP_WAKES.count(),
+            };
+            if run_resume_offer(&mut reach, &plan) == ResumeOffer::Admitted {
+                aterm_log::info!("initial setup: the window admitted resumed revision {revision}");
+            }
+        });
+    if let Err(why) = spawned {
+        aterm_log::warn!("initial setup: the resumed plan's offer could not start: {why}");
+    }
 }
 
 /// What a startup's review asks each second while it is up: the plan the ALab signal widens its
@@ -2690,6 +3220,7 @@ impl<
     fn admission(&mut self) -> Result<Option<SetupAdmission>, String> {
         aterm_cli::macos_doctor::initial_setup_admission().map(|admission| {
             admission.map(|admission| SetupAdmission {
+                plan: admission.plan,
                 revision: admission.revision,
                 completed: admission.completed,
             })
@@ -2715,6 +3246,10 @@ impl<
             return false;
         }
         true
+    }
+
+    fn offer_resume(&mut self, admission: &SetupAdmission) {
+        offer_resumed_plan(admission.plan.clone(), admission.revision, self.sent.sent);
     }
 
     fn offer(
@@ -3142,7 +3677,7 @@ fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim
     }
     enum BeforeOffer {
         Initial(aterm_types::macos_setup::Plan),
-        Resume(u64),
+        Resume(SetupAdmission),
         Finished,
         Superseded,
         Withheld,
@@ -3174,7 +3709,7 @@ fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim
                 return Ok(if admission.completed {
                     BeforeOffer::Finished
                 } else {
-                    BeforeOffer::Resume(admission.revision)
+                    BeforeOffer::Resume(admission)
                 });
             }
             if !host.may_offer() {
@@ -3187,8 +3722,23 @@ fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim
         }
         let initial = match ready {
             Ok(BeforeOffer::Initial(initial)) => initial,
-            Ok(BeforeOffer::Resume(revision)) => {
-                return Ok(PreparedSetup::Authorized { claim, revision });
+            Ok(BeforeOffer::Resume(admission)) => {
+                // A startup that resumes a run an earlier process admitted (Quit & Reopen's or an
+                // update's relaunch, say) may find its window with no admission of its own, so
+                // the plan is offered back for the page's automatic answer, while the run goes
+                // on; a window that holds its own admission lets the offer go. Only a plan with
+                // aterm's own permissions needs that admission (§6).
+                if admission
+                    .plan
+                    .selection
+                    .contains(aterm_types::macos_setup::Setting::Permissions)
+                {
+                    host.offer_resume(&admission);
+                }
+                return Ok(PreparedSetup::Authorized {
+                    claim,
+                    revision: admission.revision,
+                });
             }
             Ok(BeforeOffer::Finished) => return Ok(PreparedSetup::Finished),
             Ok(BeforeOffer::Superseded | BeforeOffer::Withheld) => {
@@ -3377,6 +3927,10 @@ fn run_prepared_setup(
             // after a finished setup. Its effects take the profile lock a pass holds, so it
             // never acts beside the run's own Secrets stage.
             (setup_io().mend_subscriber)();
+            // The converge pass's window lane, for the same reason: a run waiting on a person
+            // ends no time soon, and one whose Secrets stage is done starts no pass of its own.
+            // Its `sync.peers` leaves the join to a Secrets stage the run still owes.
+            (setup_io().converge_lane)();
             // One lock order, the setup slot before the automatic claim: never wait for the slot
             // holding the claim, or a person's choice, which holds the slot while it waits for
             // the claim, never gets it. The retry loop claims again once it holds the slot.
@@ -3408,7 +3962,12 @@ fn run_prepared_setup(
             // hold up the watch for the ALab vault that starts once this returns.
             (setup_io().start_follow_up)();
         }
-        PreparedSetup::Cancelled | PreparedSetup::Closed | PreparedSetup::Unavailable => {}
+        // No run here, now or later in this process (an update's successor that withholds the
+        // review, a Stop, a newer choice): the window lane is this launch's converge pass beside
+        // the subscriber's, each item keeping its own off switch.
+        PreparedSetup::Unavailable => (setup_io().converge_lane)(),
+        // The startup ends these before a run ([`run_prepared_startup_with`]).
+        PreparedSetup::Cancelled | PreparedSetup::Closed => {}
     }
 }
 
@@ -3419,7 +3978,8 @@ fn run_prepared_setup(
 /// keeps nothing in sync for now; the mend reads again at its next turn.
 #[cfg(target_os = "macos")]
 fn vault_sync_kept() -> bool {
-    aterm_cli::macos_doctor::initial_setup_keeps_vault_sync().unwrap_or(false)
+    aterm_secrets::swarm::enabled_live().unwrap_or(false)
+        && aterm_cli::macos_doctor::initial_setup_keeps_vault_sync().unwrap_or(false)
         && aterm_cli::macos_doctor::initial_setup_revision()
             .is_ok_and(|revision| !setup_stop_requested(revision))
 }
@@ -4108,7 +4668,8 @@ impl SetupRetryHost for LiveSetupRetry {
         // stale or owed subscriber (started once per process: a run admitted at launch started
         // it already), and System State's Secrets rows show the rest.
         (setup_io().mend_subscriber)();
-        // The converge pass's window lane starts once the run completed, never beside it.
+        // The converge pass's window lane (started once per process: a run admitted at launch
+        // started it already).
         (setup_io().converge_lane)();
     }
 }
@@ -5588,7 +6149,7 @@ impl Drop for InitialSetupBusy {
 }
 
 /// How long the startup coordinator waits before it tries a failed read or write again.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const SETUP_RETRY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Automatic claims this process's startup coordinator holds, or is asking
@@ -6336,8 +6897,8 @@ struct SetupIo {
     /// Watch this Mac's vault subscriber once setup is finished
     /// (`aterm_gui::mend_secrets_subscriber`).
     mend_subscriber: fn(),
-    /// Start the converge pass's window lane once a run ended, finished or completed, never
-    /// before one (`aterm_gui::start_converge_lane`).
+    /// Start the converge pass's window lane: whatever the launch's setup does, and once a run
+    /// a person's choice admitted completed (`aterm_gui::start_converge_lane`, once per process).
     converge_lane: fn(),
     /// Start one converge pass for the Secrets stage that just ended
     /// (`aterm_gui::converge_after_secrets_stage`).
@@ -10277,11 +10838,13 @@ mod initial_setup_result_tests {
         );
     }
 
-    /// A launch that resumes an admitted run starts the vault subscriber's mend before the run:
-    /// the run may wait on a person past its done Secrets stage for as long as they take, which
-    /// would leave a subscriber whose program is gone dead meanwhile.
+    /// A launch that resumes an admitted run starts the vault subscriber's mend and the converge
+    /// pass's window lane before the run: the run may wait on a person past its done Secrets
+    /// stage for as long as they take, which would leave a subscriber whose program is gone dead
+    /// meanwhile, and the Mac with no window pass for the process's life.
+    /// NEGATIVE CONTROL: a resumed run that starts no lane fails here.
     #[test]
-    fn a_launch_resuming_a_run_starts_the_vault_mend() {
+    fn a_launch_resuming_a_run_starts_the_vault_mend_and_the_converge_lane() {
         let _globals = globals();
         let _io = TestIo::install();
         let claim = StartupClaim::claim().unwrap().unwrap();
@@ -10294,10 +10857,31 @@ mod initial_setup_result_tests {
         assert_eq!(script().mends, 1);
         assert_eq!(
             script().converge_lanes,
-            0,
-            "the converge lane waits for the run to end (its Secrets stage starts a pass)"
+            1,
+            "the converge pass's window lane"
         );
         clear_setup_run(8);
+    }
+
+    /// A launch whose setup runs nothing still starts the converge pass's window lane, since no
+    /// run's end starts it later in this process: one unavailable (an update's successor that
+    /// withholds the review), or a Cancel recorded for good. A review closed unanswered ("not
+    /// this launch") starts nothing.
+    /// NEGATIVE CONTROL: an unavailable or cancelled launch that starts no lane fails here.
+    #[test]
+    fn a_launch_with_no_run_still_starts_the_converge_lane() {
+        let _globals = globals();
+        let _io = TestIo::install();
+        run_prepared_setup(PreparedSetup::Unavailable, None, StartupSent::default());
+        assert_eq!(script().converge_lanes, 1, "unavailable");
+        for (prepared, lanes) in [(PreparedSetup::Cancelled, 1), (PreparedSetup::Closed, 0)] {
+            let _io = TestIo::install();
+            run_prepared_startup_with(prepared, None, StartupSent::default(), |_| {
+                panic!("no watch for a review that ended")
+            });
+            assert_eq!(script().converge_lanes, lanes, "lanes {lanes}");
+            assert!(script().runs.is_empty());
+        }
     }
 
     /// The converge pass runs as the Secrets stage ends: not as it starts, and not at another
@@ -13677,9 +14261,22 @@ fn routes_to_doctor(first: &str, rest: &[OsString]) -> bool {
 #[cfg(unix)]
 mod shared_login;
 
+/// The Commons table account claims ride.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod account_claims;
+
 /// `aterm init --converge`'s live ports.
 #[cfg(unix)]
 mod converge;
+
+/// This Mac's fleet as LAN toolset sharing reads it: the members a download races by default.
+#[cfg(unix)]
+mod unit_peers;
+
+/// When the Commons runtime may make its first LAN use: after System State's Local Network
+/// question, on a Mac.
+#[cfg(unix)]
+mod commons_lan;
 
 #[path = "doctor.rs"]
 mod doctor;
@@ -13695,10 +14292,145 @@ mod startup_scope_tests;
 #[cfg(test)]
 mod tests {
 
+    /// The offer of a resumed run's plan ([`super::run_resume_offer`]) on a scripted reach.
+    mod resume_offer {
+        use super::super::{ResumeOffer, ResumeOfferReach, run_resume_offer};
+        use aterm_gui::{
+            InitialSetupAdmission, InitialSetupApplyReceipt, SetupAnswer, WorkstationSetupDecision,
+        };
+        use aterm_types::macos_setup::{Plan, Selection};
+        use std::collections::VecDeque;
+        use std::sync::mpsc::Receiver;
+
+        #[derive(Default)]
+        struct Script {
+            /// What each read of the run says, in order; once spent, the run is current.
+            currents: VecDeque<Option<bool>>,
+            /// The answers the page gives, one per offer.
+            answers: VecDeque<SetupAnswer>,
+            offers: usize,
+            back_offs: usize,
+        }
+
+        impl ResumeOfferReach for Script {
+            fn current(&mut self) -> Option<bool> {
+                self.currents.pop_front().unwrap_or(Some(true))
+            }
+
+            fn choice_awaits_claim(&mut self) -> bool {
+                false
+            }
+
+            fn answer(&mut self, _plan: Plan) -> SetupAnswer {
+                self.offers += 1;
+                self.answers
+                    .pop_front()
+                    .expect("an offer the script has no answer for")
+            }
+
+            fn back_off(&mut self, _limit: std::time::Duration) {
+                self.back_offs += 1;
+            }
+        }
+
+        fn resumed() -> Plan {
+            Plan::from(Selection::all())
+        }
+
+        /// The page's automatic answer of `plan` as offered, and its receipt's answer.
+        fn automatic(plan: Plan) -> (SetupAnswer, Receiver<bool>) {
+            let (receipt, accepted) =
+                InitialSetupApplyReceipt::detached_as(InitialSetupAdmission::Automatic, false);
+            let mut answer = SetupAnswer::from(WorkstationSetupDecision::Begin(plan));
+            answer.receipt = Some(receipt);
+            (answer, accepted)
+        }
+
+        /// The page's automatic answer of the plan as offered, while the run is current, is the
+        /// window's own admission: its receipt is accepted. Negative controls: the run gone by
+        /// the answer, an answer that changed the plan, and a person's press each let it go.
+        #[test]
+        fn the_pages_automatic_answer_of_the_resumed_plan_is_accepted() {
+            let (answer, accepted) = automatic(resumed());
+            let mut reach = Script {
+                answers: [answer].into(),
+                ..Script::default()
+            };
+            assert_eq!(
+                run_resume_offer(&mut reach, &resumed()),
+                ResumeOffer::Admitted
+            );
+            assert_eq!(accepted.try_recv(), Ok(true), "the receipt accepted");
+
+            let (answer, accepted) = automatic(resumed());
+            let mut reach = Script {
+                currents: [Some(true), None, Some(false)].into(),
+                answers: [answer].into(),
+                ..Script::default()
+            };
+            assert_eq!(run_resume_offer(&mut reach, &resumed()), ResumeOffer::LetGo);
+            assert_eq!(accepted.try_recv(), Ok(false), "the run went first");
+            assert_eq!(reach.back_offs, 1, "an unread record is read again");
+
+            let (answer, accepted) = automatic(Plan::from(Selection::none()));
+            let mut reach = Script {
+                answers: [answer].into(),
+                ..Script::default()
+            };
+            assert_eq!(run_resume_offer(&mut reach, &resumed()), ResumeOffer::LetGo);
+            assert_eq!(accepted.try_recv(), Ok(false), "another plan");
+
+            let (receipt, accepted) = InitialSetupApplyReceipt::detached(false);
+            let mut answer = SetupAnswer::from(WorkstationSetupDecision::Begin(resumed()));
+            answer.receipt = Some(receipt);
+            let mut reach = Script {
+                answers: [answer].into(),
+                ..Script::default()
+            };
+            assert_eq!(run_resume_offer(&mut reach, &resumed()), ResumeOffer::LetGo);
+            assert_eq!(accepted.try_recv(), Ok(false), "a press answers for itself");
+        }
+
+        /// An offer no window could show is made again after a back-off, but only while the run
+        /// is still current: a run that went meanwhile (a person's Set up now admitted another
+        /// revision) gets no stale offer, whose answer would wipe that person's admission.
+        #[test]
+        fn an_offer_no_window_showed_is_made_again_only_for_a_current_run() {
+            let (answer, accepted) = automatic(resumed());
+            let mut reach = Script {
+                answers: [WorkstationSetupDecision::Unavailable.into(), answer].into(),
+                ..Script::default()
+            };
+            assert_eq!(
+                run_resume_offer(&mut reach, &resumed()),
+                ResumeOffer::Admitted
+            );
+            assert_eq!((reach.offers, reach.back_offs), (2, 1));
+            assert_eq!(accepted.try_recv(), Ok(true));
+
+            // Current at the first offer, gone by the time the back-off ends.
+            let mut reach = Script {
+                currents: [Some(true), Some(false)].into(),
+                answers: [WorkstationSetupDecision::Unavailable.into()].into(),
+                ..Script::default()
+            };
+            assert_eq!(run_resume_offer(&mut reach, &resumed()), ResumeOffer::LetGo);
+            assert_eq!((reach.offers, reach.back_offs), (1, 1), "no second offer");
+
+            // A closed page ends the offer for this launch.
+            let mut reach = Script {
+                answers: [WorkstationSetupDecision::Closed.into()].into(),
+                ..Script::default()
+            };
+            assert_eq!(run_resume_offer(&mut reach, &resumed()), ResumeOffer::LetGo);
+            assert_eq!(reach.offers, 1);
+        }
+    }
+
     mod setup_startup {
         use super::super::{PreparedSetup, SetupAdmission, SetupStartup, prepare_setup};
         use aterm_gui::WorkstationSetupDecision::{self, Begin, Cancelled, Closed, Unavailable};
-        use aterm_types::macos_setup::{Plan, Selection};
+        use aterm_types::macos_setup::{Plan, Selection, Setting};
         use std::cell::{Cell, RefCell};
         use std::collections::VecDeque;
         use std::rc::Rc;
@@ -13749,10 +14481,17 @@ mod tests {
             cancels: VecDeque<Result<bool, &'static str>>,
             cancel_calls: usize,
             closed_calls: usize,
+            /// The admitted runs whose plan the startup offered back as it resumed them.
+            resumed: Vec<SetupAdmission>,
         }
 
         impl SetupStartup for Host {
             type Claim = Claim;
+
+            fn offer_resume(&mut self, admission: &SetupAdmission) {
+                assert_eq!(self.active.get(), 1, "the resumed run keeps its claim");
+                self.resumed.push(admission.clone());
+            }
 
             fn choice_awaits_claim(&mut self) -> bool {
                 self.choice_awaits.pop_front().unwrap_or(false)
@@ -14061,42 +14800,63 @@ mod tests {
             }
         }
 
+        /// A startup that resumes a run an earlier process admitted (Quit & Reopen's relaunch
+        /// mid-setup) offers nothing for review and writes no admission: it offers the admitted
+        /// plan back for the window's own answer, without waiting for it, so the page's automatic
+        /// answer gives this window the admission the debugger's step needs (design §3.3, §6).
+        /// A plan without aterm's own permissions resumes with no such offer.
         #[test]
         fn an_admitted_pending_run_resumes_without_another_offer() {
-            let selected = Plan {
+            let mut selected = Plan {
                 selection: Selection::from_bits(1 << 10).unwrap(),
                 vault_url: "http://saved.local/v1/team".into(),
             };
-            let mut host = Host {
-                revisions: [Ok(7), Ok(7)].into(),
-                claims: [Ok(true)].into(),
-                finished: [Ok(false), Ok(false)].into(),
-                known_admissions: [Ok(Some(SetupAdmission {
+            selected.selection.set(Setting::Permissions, true);
+            let mut unpermitted = selected.clone();
+            unpermitted.selection.set(Setting::Permissions, false);
+            for (plan, offered_back) in [(selected.clone(), true), (unpermitted, false)] {
+                let admitted = SetupAdmission {
+                    plan: plan.clone(),
                     revision: 7,
                     completed: false,
-                }))]
-                .into(),
-                initial: [Ok(selected.clone())].into(),
-                offers: [Begin(selected.clone())].into(),
-                ..Host::default()
-            };
-            let result = prepare_setup(&mut host).unwrap();
-            assert_eq!(
-                host.offer_calls, 0,
-                "an admitted choice needs no second offer"
-            );
-            assert!(
-                host.authorized.is_empty(),
-                "keep the live worker's admitted revision"
-            );
-            assert!(matches!(
-                result,
-                PreparedSetup::Authorized { revision: 7, .. }
-            ));
-            assert_eq!(host.initial, [Ok(selected)]);
-            assert_eq!(host.active.get(), 1);
-            drop(result);
-            assert_eq!(host.active.get(), 0);
+                };
+                let mut host = Host {
+                    revisions: [Ok(7), Ok(7)].into(),
+                    claims: [Ok(true)].into(),
+                    finished: [Ok(false), Ok(false)].into(),
+                    known_admissions: [Ok(Some(admitted.clone()))].into(),
+                    initial: [Ok(plan.clone())].into(),
+                    offers: [Begin(plan.clone())].into(),
+                    ..Host::default()
+                };
+                let result = prepare_setup(&mut host).unwrap();
+                assert_eq!(
+                    host.offer_calls, 0,
+                    "an admitted choice needs no second review"
+                );
+                assert!(
+                    host.authorized.is_empty(),
+                    "keep the live worker's admitted revision"
+                );
+                assert!(matches!(
+                    result,
+                    PreparedSetup::Authorized { revision: 7, .. }
+                ));
+                assert_eq!(
+                    host.resumed,
+                    if offered_back {
+                        vec![admitted]
+                    } else {
+                        Vec::new()
+                    },
+                    "plan {:?}",
+                    plan.selection
+                );
+                assert_eq!(host.initial, [Ok(plan)]);
+                assert_eq!(host.active.get(), 1);
+                drop(result);
+                assert_eq!(host.active.get(), 0);
+            }
         }
 
         #[test]
@@ -14108,6 +14868,7 @@ mod tests {
                 known_admissions: [
                     Err("admission snapshot changed"),
                     Ok(Some(SetupAdmission {
+                        plan: Plan::default(),
                         revision: 7,
                         completed: false,
                     })),
@@ -14136,6 +14897,7 @@ mod tests {
                     claims: [Ok(true)].into(),
                     finished: [Ok(false)].into(),
                     known_admissions: [Ok(Some(SetupAdmission {
+                        plan: Plan::default(),
                         revision,
                         completed,
                     }))]
@@ -15427,6 +16189,58 @@ mod tests {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
+    fn network_publication_cache_never_renews_stalled_or_busy_evidence() {
+        use aterm_db::network_state::Publication;
+        use aterm_types::network_state::{NetworkObservation, Visibility};
+        use std::{
+            sync::{Arc, Mutex},
+            time::{Duration, Instant},
+        };
+
+        for prefetch in [false, true] {
+            let at = Instant::now();
+            let publisher = Arc::new(Mutex::new(Some(Publication::new(
+                NetworkObservation {
+                    observed_at_ms: 100_000,
+                    visibility: Visibility::Active,
+                    ..NetworkObservation::default()
+                },
+                at,
+            ))));
+            let clock = Arc::new(Mutex::new((at, Some(100_000))));
+            let reader = publisher.clone();
+            let timer = clock.clone();
+            let read = super::network_state_source_with_readers(
+                move || reader.try_lock().ok().and_then(|state| state.clone()),
+                || None,
+                None,
+                move || *timer.lock().unwrap(),
+            );
+            if prefetch {
+                assert_eq!(read().network.visibility, Visibility::Active);
+            }
+            *clock.lock().unwrap() = (at + Duration::from_secs(20), Some(120_000));
+            assert_eq!(read().network.visibility, Visibility::Unavailable);
+            let mut held = publisher.lock().unwrap();
+            *clock.lock().unwrap() = (at + Duration::from_secs(21), Some(113_000));
+            let during = read();
+            assert_eq!(during.network.visibility, Visibility::Unavailable);
+            assert_eq!(during.network.observed_at_ms, 100_000);
+            *held = Some(Publication::new(
+                NetworkObservation {
+                    observed_at_ms: 113_000,
+                    visibility: Visibility::Active,
+                    ..NetworkObservation::default()
+                },
+                at + Duration::from_secs(21),
+            ));
+            drop(held);
+            assert_eq!(read().network.visibility, Visibility::Active);
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
     fn service_observations_survive_an_absent_network_runtime() {
         use aterm_types::network_state::{
             HistoryState, ServiceAvailability, ServiceStates, Visibility,
@@ -15436,8 +16250,17 @@ mod tests {
         let mut services = ServiceStates::default();
         services.secrets.availability = ServiceAvailability::Cached;
         services.secrets.observed_at_ms = 1000;
-        let services = Arc::new(Mutex::new(services));
-        let read = super::network_state_source_from(None, Some(services.clone()), None);
+        let at = std::time::Instant::now();
+        let services = Arc::new(Mutex::new(aterm_db::service_state::Publication::new(
+            services, at,
+        )));
+        let publisher = services.clone();
+        let read = super::network_state_source_with_readers(
+            || None,
+            move || Some(publisher.lock().unwrap().clone()),
+            None,
+            move || (at, Some(2000)),
+        );
         let first = read();
         assert_eq!(first.network.visibility, Visibility::Unavailable);
         assert_eq!(first.network.history, HistoryState::Unavailable);
@@ -15447,7 +16270,9 @@ mod tests {
         );
         assert!(Arc::ptr_eq(&first, &read()));
 
-        services.lock().unwrap().secrets.availability = ServiceAvailability::Unavailable;
+        let mut changed = first.services.clone();
+        changed.secrets.availability = ServiceAvailability::Unavailable;
+        *services.lock().unwrap() = aterm_db::service_state::Publication::new(changed, at);
         let second = read();
         assert!(second.revision > first.revision);
         assert_eq!(
@@ -15458,6 +16283,145 @@ mod tests {
             first.services.secrets.availability,
             ServiceAvailability::Cached
         );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_busy_service_publisher_cannot_stall_the_network_ui_reader() {
+        use aterm_types::network_state::{ServiceAvailability, ServiceStates};
+        use std::sync::{Arc, Mutex, mpsc};
+
+        for prefetch in [false, true] {
+            let mut initial = ServiceStates::default();
+            initial.secrets.availability = ServiceAvailability::Cached;
+            initial.secrets.observed_at_ms = 1000;
+            let at = std::time::Instant::now();
+            let services = Arc::new(Mutex::new(aterm_db::service_state::Publication::new(
+                initial, at,
+            )));
+            let reader = services.clone();
+            let read = super::network_state_source_with_readers(
+                || None,
+                move || reader.try_lock().ok().map(|state| state.clone()),
+                None,
+                move || (at, Some(2000)),
+            );
+            let first = prefetch.then(|| read());
+            let mut publisher = services.lock().unwrap();
+            let mut changed = ServiceStates::default();
+            changed.secrets.availability = ServiceAvailability::Unavailable;
+            changed.secrets.observed_at_ms = 2000;
+            *publisher = aterm_db::service_state::Publication::new(changed, at);
+            let concurrent = read.clone();
+            let (send, receive) = mpsc::channel();
+            let task = std::thread::spawn(move || send.send(concurrent()).unwrap());
+            let result = receive.recv_timeout(std::time::Duration::from_secs(60));
+            drop(publisher);
+            task.join().unwrap();
+            let during = result.expect("a publishing worker must not stall the UI reader");
+            if let Some(first) = first {
+                assert!(Arc::ptr_eq(&first, &during));
+                assert_eq!(during.services.secrets.observed_at_ms, 1000);
+            } else {
+                assert_eq!(during.services.secrets.observed_at_ms, 0);
+                assert_eq!(
+                    during.services.secrets.availability,
+                    ServiceAvailability::Unknown
+                );
+            }
+            let after = read();
+            assert_eq!(after.services.secrets.observed_at_ms, 2000);
+            assert_eq!(
+                after.services.secrets.availability,
+                ServiceAvailability::Unavailable
+            );
+            assert!(after.revision > during.revision);
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn service_publication_cache_expires_without_network_and_never_renews_on_rollback() {
+        use aterm_types::network_state::{ServiceAvailability, ServiceStates, Visibility};
+        use std::{
+            sync::{Arc, Mutex},
+            time::{Duration, Instant},
+        };
+        let at = Instant::now();
+        let mut states = ServiceStates::default();
+        states.secrets.availability = ServiceAvailability::Cached;
+        states.secrets.observed_at_ms = 100_000;
+        states.secrets.revision = Some("retained revision".into());
+        let publisher = Arc::new(Mutex::new(aterm_db::service_state::Publication::new(
+            states.clone(),
+            at,
+        )));
+        let clock = Arc::new(Mutex::new((at, Some(100_000))));
+        let source = publisher.clone();
+        let timer = clock.clone();
+        let read = super::network_state_source_with_readers(
+            || None,
+            move || source.try_lock().ok().map(|state| state.clone()),
+            None,
+            move || *timer.lock().unwrap(),
+        );
+        assert_eq!(
+            read().services.secrets.availability,
+            ServiceAvailability::Cached
+        );
+        *clock.lock().unwrap() = (at + Duration::from_secs(61), Some(161_001));
+        assert_eq!(
+            read().services.secrets.availability,
+            ServiceAvailability::Unknown
+        );
+        let mut held = publisher.lock().unwrap();
+        *clock.lock().unwrap() = (at + Duration::from_secs(62), Some(130_000));
+        let stale = read();
+        assert_eq!(stale.network.visibility, Visibility::Unavailable);
+        assert_eq!(
+            stale.services.secrets.availability,
+            ServiceAvailability::Unknown
+        );
+        assert_eq!(stale.services.secrets.observed_at_ms, 100_000);
+        assert_eq!(stale.services.secrets.revision, states.secrets.revision);
+        drop(held);
+        assert_eq!(
+            read().services.secrets.availability,
+            ServiceAvailability::Unknown
+        );
+        held = publisher.lock().unwrap();
+        states.secrets.observed_at_ms = 130_000;
+        *held = aterm_db::service_state::Publication::new(states, at + Duration::from_secs(62));
+        drop(held);
+        let restored = read();
+        assert_eq!(
+            restored.services.secrets.availability,
+            ServiceAvailability::Cached
+        );
+        assert!(restored.revision > stale.revision);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn first_service_read_after_a_stall_and_rollback_is_not_fresh() {
+        use aterm_types::network_state::{ServiceAvailability, ServiceStates};
+        use std::time::{Duration, Instant};
+        let at = Instant::now();
+        let mut states = ServiceStates::default();
+        states.accounts.availability = ServiceAvailability::Current;
+        states.accounts.observed_at_ms = 100_000;
+        let publication = aterm_db::service_state::Publication::new(states, at);
+        let read = super::network_state_source_with_readers(
+            || None,
+            move || Some(publication.clone()),
+            None,
+            move || (at + Duration::from_secs(120), Some(110_000)),
+        );
+        assert_eq!(
+            read().services.accounts.availability,
+            ServiceAvailability::Unknown
+        );
+        assert_eq!(read().services.accounts.observed_at_ms, 100_000);
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -15535,20 +16499,54 @@ mod tests {
     #[test]
     fn only_an_ordinary_window_autostarts_acaffiene() {
         let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
-        for args in [osv(&[]), osv(&["--window"]), osv(&["-d", "."])] {
+        for args in [
+            osv(&[]),
+            osv(&["--window"]),
+            osv(&["-d", "."]),
+            osv(&["--no-control-sock"]),
+            osv(&["--window", "--control-sock", "off"]),
+            osv(&["--control-sock", "OFF"]),
+            osv(&["--control-sock", "0"]),
+            osv(&["--control-sock", ""]),
+        ] {
             assert!(ordinary_window(&args), "{args:?}");
         }
         for args in [
             osv(&["--headless"]),
             osv(&["--diagnose"]),
             osv(&["--control-sock", "/tmp/private.sock"]),
+            osv(&["--control-sock"]),
+            osv(&["--control-sock", "off", "--headless"]),
+            osv(&["--control-sock", "--headless"]),
+            osv(&["-e", "sh", "--control-sock", "/tmp/private.sock"]),
         ] {
             assert!(!ordinary_window(&args), "{args:?}");
         }
     }
 
+    /// A running window's successor, an update's or a launch-record renewal's, which can come
+    /// while the person is away, starts aCaffiene as saved; any other window launch, forever.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_running_windows_successor_starts_acaffiene_as_saved() {
+        use aterm_acaffiene::cli::Launch;
+        let only = |set: &'static str| {
+            move |name: &'static str| (name == set).then(|| OsString::from("1"))
+        };
+        assert_eq!(
+            acaffiene_launch(only(aterm_update::RELAUNCH_OF_RUNNING_ENV)),
+            Launch::Successor
+        );
+        assert_eq!(acaffiene_launch(|_| None), Launch::Fresh);
+        assert_eq!(acaffiene_launch(only("ATERM_UPDATED_FROM")), Launch::Fresh);
+    }
+
     #[test]
     fn a_spawn_is_handed_to_the_sibling_as_new_window_never_as_a_plain_launch() {
+        assert_eq!(
+            alias_route("aterm-gui", "new-window"),
+            AliasRoute::AliasWindowVerb
+        );
         for intent in [
             aterm_cli::LaunchIntent::NewTab,
             aterm_cli::LaunchIntent::NewWindow,
@@ -15563,9 +16561,10 @@ mod tests {
                 };
                 let argv = spawn_handoff_argv(&request);
                 let (verb, rest) = argv.split_first().expect("the verb leads");
-                assert_eq!(verb.to_string_lossy(), "new-window", "{intent:?}");
+                let verb_str = verb.to_string_lossy();
+                assert_eq!(verb_str, "new-window", "{intent:?}");
                 assert_eq!(
-                    alias_route("aterm-gui", "new-window"),
+                    alias_route("aterm-gui", &verb_str),
                     AliasRoute::AliasWindowVerb
                 );
                 let reparsed =
@@ -15930,6 +16929,65 @@ mod tests {
         );
         aterm_log::env::unset(var);
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn front_door_verbs_and_completion_flags_have_no_duplicates() {
+        let verbs = super::front_door_verbs();
+        let mut seen_verbs = std::collections::BTreeSet::new();
+        for &verb in &verbs {
+            assert!(
+                seen_verbs.insert(verb),
+                "duplicate front-door completion verb: {verb:?}"
+            );
+        }
+        assert!(seen_verbs.contains("help"));
+        for verb in aterm_cli::Verb::ALL {
+            assert!(seen_verbs.contains(verb.name()), "missing {}", verb.name());
+        }
+        for &(name, _) in aterm_cli::DIAG_COMMANDS {
+            assert!(seen_verbs.contains(name), "missing diag {name}");
+        }
+
+        let mut seen_flags = std::collections::BTreeSet::new();
+        for &(flag, desc) in super::COMPLETION_FLAGS {
+            assert!(flag.starts_with("--"), "flag {flag:?} must start with --");
+            assert!(!desc.is_empty(), "flag {flag:?} must carry a description");
+            assert!(
+                seen_flags.insert(flag),
+                "duplicate front-door completion flag: {flag:?}"
+            );
+        }
+
+        for (shell, wiring) in [
+            ("bash", "complete -F _aterm aterm\n"),
+            ("zsh", "#compdef aterm\n"),
+            ("fish", "complete -c aterm -f\n"),
+        ] {
+            let script =
+                aterm_ctl::front_door_completion_script(shell, &verbs, super::COMPLETION_FLAGS)
+                    .unwrap_or_else(|| panic!("{shell} script"));
+            if shell == "zsh" {
+                assert!(script.starts_with(wiring), "zsh must start with {wiring:?}");
+            } else {
+                assert!(script.contains(wiring), "{shell} missing {wiring:?}");
+            }
+            for &verb in &verbs {
+                assert!(script.contains(verb), "{shell} missing verb {verb:?}");
+            }
+            for &(flag, _) in super::COMPLETION_FLAGS {
+                let want = if shell == "fish" {
+                    flag.trim_start_matches('-')
+                } else {
+                    flag
+                };
+                assert!(script.contains(want), "{shell} missing flag {want:?}");
+            }
+        }
+        assert!(
+            aterm_ctl::front_door_completion_script("tcsh", &verbs, super::COMPLETION_FLAGS)
+                .is_none()
+        );
     }
 }
 

@@ -258,6 +258,7 @@ pub(super) const fn padded() -> Geom {
 /// The host's configuration on a dark or a light page, in `hue`.
 pub(super) const fn config(dark: bool, hue: u32) -> MomentumGlowConfig {
     MomentumGlowConfig {
+        light: crate::cursor_glow::Light::OFF,
         enabled: true,
         intensity: 1.0,
         tau_s: TAU,
@@ -269,6 +270,7 @@ pub(super) const fn config(dark: bool, hue: u32) -> MomentumGlowConfig {
         theme_bg: if dark { 0x0010_1016 } else { 0x00FF_FFFF },
         block: true,
         glyph_span: None,
+        light_vivid: false,
     }
 }
 

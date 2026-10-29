@@ -284,6 +284,61 @@ impl Terminal {
         self.kitty_file_resolver.installed()
     }
 
+    /// Monotonic count of live host reads that pure replay cannot reproduce: non-direct Kitty payloads (`t=f`, `t=t`, `t=s`) that built an image, answered `OSC 52 ; ?` clipboard queries, and non-empty `WindowCallback` responses. Never reset across RIS.
+    #[inline]
+    #[must_use]
+    pub fn host_io_ordinal(&self) -> u64 {
+        self.transient
+            .host_io_ordinal
+            .wrapping_add(self.kitty_file_resolver.loaded_count())
+    }
+
+    /// Monotonic count of primary-history pullbacks (`CSI n + T` unscrolls, rows-grow reveals, deficit fills, or deep width rewraps) that reached older than the bounded replay suffix. Invariant across alternate-screen switches and preserved across RIS.
+    #[inline]
+    #[must_use]
+    pub fn deep_history_pullback_ordinal(&self) -> u64 {
+        self.grid.deep_history_pullback_ordinal().wrapping_add(
+            self.alt_grid
+                .as_ref()
+                .map_or(0, crate::grid::Grid::deep_history_pullback_ordinal),
+        )
+    }
+
+    /// Whether either grid currently has its tiered scrollback detached for an off-thread reflow.
+    #[inline]
+    #[must_use]
+    pub fn has_detached_scrollback(&self) -> bool {
+        self.grid.has_detached_scrollback()
+            || self
+                .alt_grid
+                .as_ref()
+                .is_some_and(crate::grid::Grid::has_detached_scrollback)
+    }
+
+    /// Clamp the primary grid's carried replay-history suffix to `max_history` after a bounded spine step.
+    #[inline]
+    pub fn note_bounded_replay_step(&self, max_history: usize) {
+        if self.modes.alternate_screen {
+            if let Some(main) = &self.alt_grid {
+                main.clamp_replay_carried_history(max_history);
+            }
+        } else {
+            self.grid.clamp_replay_carried_history(max_history);
+        }
+    }
+
+    /// Seed the primary grid's carried replay-history suffix from a keyframe bounded to `max_history`.
+    #[inline]
+    pub fn note_bounded_replay_keyframe(&self, max_history: usize) {
+        if self.modes.alternate_screen {
+            if let Some(main) = &self.alt_grid {
+                main.seed_replay_carried_history(max_history);
+            }
+        } else {
+            self.grid.seed_replay_carried_history(max_history);
+        }
+    }
+
     /// Authorize a clipboard access class for parser-origin sequences: `Write` covers OSC 52 set/clear and OSC 1337 `CopyToClipboard` / `EndCopy` / `Copy=`; `Query` covers OSC 52 queries.
     #[inline]
     pub const fn authorize_clipboard_access(

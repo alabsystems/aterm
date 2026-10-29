@@ -1724,4 +1724,89 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(fifo);
     }
+
+    #[test]
+    fn names_producers_checks_policy_following_floor_and_sealing_ceiling() {
+        let floor = FIRST_POLICY_FOLLOWING_BUILD;
+        assert!(HandoffPolicy::default().names_producers(&[]).is_ok());
+
+        let unbounded = policy("schema = 1\ncarry = \"visible\"\n");
+        let empty_err = unbounded.names_producers(&[]).unwrap_err();
+        assert!(empty_err.contains("no build can hand over"), "{empty_err}");
+        let past_newest = unbounded.names_producers(&[floor, floor + 10]).unwrap_err();
+        assert!(
+            past_newest.contains(&format!("applies to builds after {}", floor + 10)),
+            "{past_newest}"
+        );
+
+        let pre_policy = policy(&format!(
+            "schema = 1\napplies_to_producers = [1, {}]\ncarry = \"visible\"\n",
+            floor - 1
+        ));
+        let pre_err = pre_policy
+            .names_producers(&[floor - 1, floor + 10])
+            .unwrap_err();
+        assert!(pre_err.contains(&format!("from {floor} on")), "{pre_err}");
+
+        let valid = policy(&format!(
+            "schema = 1\napplies_to_producers = [{floor}, {}]\ncarry = \"visible\"\n",
+            floor + 10
+        ));
+        valid
+            .names_producers(&[floor - 5, floor, floor + 10])
+            .expect("covers policy-following builds without exceeding newest");
+
+        let multi = file(&format!(
+            "schema = 1\napplies_to_producers = [{floor}, {}]\ncarry = \"repaint\"\n\n\
+             [[ranges]]\nproducers = [{floor}, {}]\ncarry = \"visible\"\nreason = \"first\"\n\n\
+             [[ranges]]\nproducers = [{}, {}]\ncarry = \"repaint\"\nreason = \"too high\"\n",
+            floor + 20,
+            floor + 10,
+            floor + 11,
+            floor + 20,
+        ));
+        let file_err = multi.names_producers(&[floor, floor + 10]).unwrap_err();
+        assert!(
+            file_err.contains(&format!(
+                "its rescue for builds [{}, {}]",
+                floor + 11,
+                floor + 20
+            )),
+            "{file_err}"
+        );
+        multi
+            .names_producers(&[floor, floor + 15, floor + 20])
+            .expect("both rescues valid when newest reaches floor + 20");
+    }
+
+    #[test]
+    fn adopt_returns_follow_policy_only_when_it_asks_something_of_this_build() {
+        assert_eq!(adopt(&PolicyRead::Absent, 150, "v0.99.0"), None);
+        assert_eq!(
+            adopt(&PolicyRead::Ignored("corrupt".to_string()), 150, "v0.99.0"),
+            None
+        );
+        assert_eq!(
+            adopt(&PolicyRead::Unread("busy".to_string()), 150, "v0.99.0"),
+            None
+        );
+
+        let parsed = PolicyRead::Parsed(file(&two_rescues()));
+        assert_eq!(
+            adopt(&parsed, 150, "v0.99.0").map(|p| p.carry_ceiling()),
+            Some(CarryCeiling::Repaint)
+        );
+        assert_eq!(adopt(&parsed, 220, "v0.99.0"), None);
+
+        let asks_nothing = PolicyRead::Parsed(file("schema = 1\ncarry = \"full\"\n"));
+        assert_eq!(adopt(&asks_nothing, 150, "v0.99.0"), None);
+
+        let unreadable_ranges = PolicyRead::Parsed(file(
+            "schema = 1\napplies_to_producers = [100, 199]\ncarry = \"visible\"\nranges = 7\n",
+        ));
+        assert_eq!(
+            adopt(&unreadable_ranges, 150, "v0.99.0").map(|p| p.carry_ceiling()),
+            Some(CarryCeiling::Visible)
+        );
+    }
 }

@@ -1150,29 +1150,6 @@ fn a_scrolled_back_view_keeps_claudes_panel() {
 }
 
 #[test]
-fn a_still_panel_goes_idle_to_zero() {
-    let t0 = Instant::now();
-    let (mut app, wid, _) = glass(t0);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
-    app.windows.get_mut(&wid).unwrap().focused = false;
-    frame(&mut app, wid);
-    let mut wakes = 0;
-    while let Some(d) = app.claude_panel_deadline() {
-        wakes += 1;
-        assert!(wakes < 400, "the wakes end");
-        crate::claude_card::set_test_now(Some(d));
-        let due = app.claude_panels_due(d);
-        if !due.is_empty() {
-            assert_eq!(due, vec![wid]);
-            probe::pass(&mut app, wid);
-        }
-    }
-    assert!(wakes > 0, "CONTROL: the dots turned");
-    assert!(!app.claude_panels_live());
-    crate::claude_card::set_test_now(None);
-}
-
-#[test]
 fn a_turn_that_moves_no_dot_asks_no_frame() {
     let t0 = Instant::now();
     let (mut app, wid, _) = glass(t0);
@@ -1209,12 +1186,14 @@ fn a_turn_that_moves_no_dot_asks_no_frame() {
             "the key moves with the look ({wakes})"
         );
         if moved {
+            assert_eq!(due, vec![wid]);
             asked += 1;
             probe::pass(&mut app, wid);
         } else {
             quiet += 1;
         }
     }
+    assert!(!app.claude_panels_live(), "the panel goes idle to zero");
     assert!(
         asked > 0 && quiet > 0,
         "CONTROL: {asked} ticks moved a look, {quiet} none"

@@ -38,10 +38,22 @@ fn one(code: &str) -> Stmt {
 }
 
 fn dumped(text: &str) -> String {
+    dumped_with(text, trail_script::Detail::default())
+}
+
+fn dumped_with(text: &str, detail: trail_script::Detail) -> String {
     let script = parse(text).expect("the script parses");
     let mut out = Vec::new();
-    dump("typed", &script, trail_script::Detail::default(), &mut out).expect("the dump runs");
+    dump("typed", &script, detail, &mut out).expect("the dump runs");
     String::from_utf8(out).expect("the dump is text")
+}
+
+/// The light word `name` a `--full --frame` dump printed (`  W light <name> <hex>`).
+fn light_word(text: &str, name: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let (word, hex) = line.strip_prefix("  W light ")?.split_once(' ')?;
+        (word == name).then(|| u64::from_str_radix(hex, 16).expect("a word is hex"))
+    })
 }
 
 #[test]
@@ -217,7 +229,125 @@ fn a_held_frame_prints_main_s_state() {
         lines[at + 1].starts_with("  state n="),
         "a held frame prints its state words next:\n{held}"
     );
-    assert_eq!(lines[at + 2], "  light n=0");
+    let drawn = lines[..at]
+        .iter()
+        .rfind(|l| l.starts_with("  light "))
+        .expect("a frame drew before the hold");
+    assert_eq!(
+        lines[at + 2],
+        *drawn,
+        "the held frame's light words are the last drawn frame's:\n{held}"
+    );
+    assert!(
+        drawn
+            .strip_prefix("  light n=6 latch=")
+            .is_some_and(|hash| hash.len() == 16),
+        "on main's dark ground the light words are the window's latch alone:\n{held}"
+    );
+}
+
+/// The ink ledger's per-frame products (`docs/design/PRISM-GLASS.md` §15.9's preamble) print on a
+/// drawn frame's `ledger` line, right after its `state` line, and a held frame, which draws
+/// nothing, prints none; under `--full` its words print as `W ledger` lines and none of them as a
+/// `W state` line.
+#[test]
+fn a_drawn_frame_prints_its_ledger_and_a_held_frame_none() {
+    let script = "grid 6 40\nstyle rainbow kitty\nhz 60\nat 0 pty \"$ \"\nat 100 key a\n\
+                  at 102 pty \"a\"\nat 300 pty \"\\e[?2026h\"\nat 600 pty \"\\e[?2026l\"\nrun 900\n";
+    let text = dumped(script);
+    let lines: Vec<&str> = text.lines().collect();
+    let starts: Vec<usize> = (0..lines.len())
+        .filter(|&i| lines[i].starts_with("F "))
+        .collect();
+    let (mut drawn, mut held) = (0, 0);
+    for (k, &at) in starts.iter().enumerate() {
+        let end = starts.get(k + 1).copied().unwrap_or(lines.len());
+        let block = &lines[at..end];
+        let ledgers: Vec<usize> = (0..block.len())
+            .filter(|&i| block[i].starts_with("  ledger n="))
+            .collect();
+        if block[0].ends_with(" held") {
+            held += 1;
+            assert!(ledgers.is_empty(), "a held frame prints no ledger:\n{text}");
+        } else {
+            drawn += 1;
+            assert!(
+                matches!(ledgers[..], [i] if block[i - 1].starts_with("  state n=")),
+                "a drawn frame prints one ledger line after its state:\n{}",
+                block.join("\n")
+            );
+        }
+    }
+    assert!(
+        drawn > 0 && held > 0,
+        "fixture: frames drawn and held:\n{text}"
+    );
+    let frame: u64 = lines
+        .iter()
+        .rfind(|l| l.starts_with("F ") && !l.ends_with(" held"))
+        .and_then(|l| l.split(' ').nth(1)?.parse().ok())
+        .expect("the last drawn frame's number");
+    let full = dumped_with(
+        script,
+        trail_script::Detail {
+            full_frame: Some(frame),
+        },
+    );
+    let words: Vec<&str> = full
+        .lines()
+        .filter_map(|l| l.strip_prefix("  W ledger "))
+        .collect();
+    assert!(
+        !words.is_empty() && words.iter().all(|w| w.starts_with("ink.")),
+        "the ledger is the ink ledger's: {words:?}"
+    );
+    for product in ["ink.rails", "ink.rail_ramps", "ink.dims", "ink.notes"] {
+        assert!(
+            !full.lines().any(|l| l
+                .strip_prefix("  W state ")
+                .is_some_and(|w| w.starts_with(product))),
+            "{product} is no state word:\n{full}"
+        );
+    }
+}
+
+/// `live <level>` previews its level on a frame the latch admits, a light configured scheme over
+/// a light page, and on no other: a dark scheme's frames stay `light=0` at every level.
+#[test]
+fn live_lights_only_what_the_latch_admits() {
+    let lit = |theme: &str, live: &str| {
+        let text = dumped_with(
+            &format!(
+                "grid 6 40\nstyle rainbow kitty\nhz 60\ntheme {theme}\n{live}at 0 pty \"$ \"\nrun 50\n"
+            ),
+            trail_script::Detail {
+                full_frame: Some(0),
+            },
+        );
+        let frames: Vec<&str> = text.lines().filter(|l| l.starts_with("F ")).collect();
+        assert!(!frames.is_empty(), "{text}");
+        let lights: std::collections::BTreeSet<String> = frames
+            .iter()
+            .filter_map(|l| l.split(' ').find(|w| w.starts_with("light=")))
+            .map(str::to_string)
+            .collect();
+        let latch = (
+            light_word(&text, "latch.on").expect("frame 0's latch"),
+            light_word(&text, "latch.live").expect("frame 0's level"),
+        );
+        (lights, latch)
+    };
+    let set = |words: &[&str]| words.iter().map(|w| (*w).to_string()).collect();
+    let paper = "#2b2d33 #f6f7f9";
+    let dark = "#d0d0d0 #111318";
+    assert_eq!(lit(paper, ""), (set(&["light=1"]), (1, 0)));
+    assert_eq!(lit(paper, "live glass\n"), (set(&["light=3"]), (1, 1)));
+    assert_eq!(lit(paper, "live vanish\n"), (set(&["light=31"]), (1, 4)));
+    assert_eq!(
+        lit(dark, "live vanish\n"),
+        (set(&["light=0"]), (0, 4)),
+        "a dark scheme is never lit"
+    );
 }
 
 /// Keys typed in a split's right pane, then in its left one once the focus moves there.
@@ -593,19 +723,45 @@ fn shed_script(motion: &str, ns: u64) -> String {
     )
 }
 
+/// `dump` with each frame's `shed` state word left out: what the frames drew and every other
+/// engine's state.
+fn beside_shed(dump: &str) -> String {
+    dump.lines()
+        .map(|l| match l.strip_prefix("  state ") {
+            Some(words) => {
+                let kept: Vec<&str> = words
+                    .split(' ')
+                    .filter(|w| !w.starts_with("shed="))
+                    .collect();
+                format!("  state {}", kept.join(" "))
+            }
+            None => l.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
 fn present_costs_shed_only_under_auto_motion() {
     // 50 ms is over 1.5 of the 60 Hz panel's 16.7 ms frame, 1 ms under it.
     let (over, under) = (50_000_000, 1_000_000);
     assert_ne!(
-        dumped(&shed_script("auto", over)),
-        dumped(&shed_script("auto", under)),
+        beside_shed(&dumped(&shed_script("auto", over))),
+        beside_shed(&dumped(&shed_script("auto", under))),
         "under motion auto, three presents over budget shed the trail"
     );
-    assert_eq!(
+    let (full_over, full_under) = (
         dumped(&shed_script("full", over)),
         dumped(&shed_script("full", under)),
-        "motion full never sheds"
+    );
+    assert_ne!(
+        full_over, full_under,
+        "the latch reads every present's cost, under any motion"
+    );
+    assert_eq!(
+        beside_shed(&full_over),
+        beside_shed(&full_under),
+        "motion full never sheds: the costs move the latch's own words and nothing it draws"
     );
 }
 

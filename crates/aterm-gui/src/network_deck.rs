@@ -4,8 +4,8 @@
 //! Pure network-cell projection and drawing in the System Resources band.
 
 use aterm_types::network_state::{
-    HistoryState, MachineIdentity, NetworkStateSnapshot, Reachability, ServiceAvailability,
-    ServiceState, Visibility,
+    HistoryState, MachineIdentity, NetworkStateSnapshot, PeerObservation, Reachability,
+    ServiceAvailability, ServiceState, Visibility,
 };
 use aterm_vitals::ink::Rgb;
 
@@ -24,6 +24,40 @@ pub(crate) fn inactive_snapshot() -> std::sync::Arc<NetworkStateSnapshot> {
     std::sync::Arc::new(snapshot)
 }
 
+fn current_peer_reachability(peer: &PeerObservation, now_ms: Option<u64>) -> Reachability {
+    if peer.reachability != Reachability::Reachable {
+        return peer.reachability;
+    }
+    let ages = now_ms.and_then(|now| {
+        let checked = peer.last_checked_ms?;
+        if peer.last_seen_ms == 0 || checked == 0 {
+            return None;
+        }
+        Some((
+            now.checked_sub(peer.last_seen_ms)?,
+            now.checked_sub(checked)?,
+        ))
+    });
+    match ages {
+        Some((seen, checked)) if seen <= 15_000 && checked <= 15_000 => Reachability::Reachable,
+        Some(_) => Reachability::LastSeen,
+        None => Reachability::Unknown,
+    }
+}
+
+/// Derived peer expiry does not advance the source revision.
+pub(crate) fn hash_peer_reachability(
+    snapshot: &NetworkStateSnapshot,
+    state: &mut impl std::hash::Hasher,
+) {
+    use std::hash::Hash;
+    snapshot.network.peers.len().hash(state);
+    for peer in &snapshot.network.peers {
+        peer.slot.hash(state);
+        std::mem::discriminant(&peer.reachability).hash(state);
+    }
+}
+
 /// Expire current evidence outside painting, retaining the journal and its timestamps.
 pub(crate) fn fresh_snapshot(
     snapshot: std::sync::Arc<NetworkStateSnapshot>,
@@ -32,8 +66,21 @@ pub(crate) fn fresh_snapshot(
     let recent = |observed, age| {
         now_ms.is_some_and(|now| observed != 0 && observed <= now && now - observed <= age)
     };
-    let network_stale = snapshot.network.visibility == Visibility::Active
-        && !recent(snapshot.network.observed_at_ms, 15_000);
+    let current_network_claim = match snapshot.network.visibility {
+        Visibility::Active | Visibility::Offline | Visibility::Disabled | Visibility::Waiting => {
+            true
+        }
+        Visibility::Checking => snapshot.network.observed_at_ms != 0,
+        Visibility::Unavailable => false,
+    };
+    let network_stale = current_network_claim && !recent(snapshot.network.observed_at_ms, 15_000);
+    let check_peers = !network_stale && snapshot.network.visibility == Visibility::Active;
+    let peers_stale = check_peers
+        && snapshot
+            .network
+            .peers
+            .iter()
+            .any(|peer| current_peer_reachability(peer, now_ms) != peer.reachability);
     // Service reads run independently. Past one minute, their availability
     // is retained evidence, not a current access claim.
     let service_stale = |service: &ServiceState| {
@@ -42,7 +89,7 @@ pub(crate) fn fresh_snapshot(
     };
     let accounts_stale = service_stale(&snapshot.services.accounts);
     let secrets_stale = service_stale(&snapshot.services.secrets);
-    if !network_stale && !accounts_stale && !secrets_stale {
+    if !network_stale && !peers_stale && !accounts_stale && !secrets_stale {
         return snapshot;
     }
     let mut expired = snapshot.as_ref().clone();
@@ -52,6 +99,11 @@ pub(crate) fn fresh_snapshot(
             "Current observation expired or its clock is unavailable; retained history remains. {}",
             expired.network.detail
         );
+    }
+    if check_peers {
+        for peer in &mut expired.network.peers {
+            peer.reachability = current_peer_reachability(peer, now_ms);
+        }
     }
     for (service, stale) in [
         (&mut expired.services.accounts, accounts_stale),
@@ -157,6 +209,17 @@ fn observation_time(at_ms: u64) -> String {
 }
 
 pub(crate) fn summary(snapshot: &NetworkStateSnapshot) -> String {
+    let mut text = status_summary(snapshot);
+    if snapshot.network.visibility != Visibility::Active && !snapshot.network.peers.is_empty() {
+        text.push_str(&format!(" · {} known", snapshot.network.peers.len()));
+    }
+    if snapshot.network.retention_limited {
+        text.push_str(" · partial history");
+    }
+    text
+}
+
+fn status_summary(snapshot: &NetworkStateSnapshot) -> String {
     let network = &snapshot.network;
     if network.visibility == Visibility::Unavailable {
         return "Network visibility unavailable".into();
@@ -173,7 +236,15 @@ pub(crate) fn summary(snapshot: &NetworkStateSnapshot) -> String {
         .filter(|p| p.reachability == Reachability::Reachable)
         .count();
     match network.visibility {
-        Visibility::Active => format!("{reachable} reachable · {} known", network.peers.len()),
+        Visibility::Active => format!(
+            "{reachable} reachable · {} known{}",
+            network.peers.len(),
+            if network.via_local_process.is_some() {
+                " · via local aterm"
+            } else {
+                ""
+            },
+        ),
         Visibility::Checking => "Checking network".into(),
         Visibility::Offline => "Network offline · history retained".into(),
         Visibility::Disabled => "Network visibility off".into(),
@@ -214,7 +285,32 @@ fn observed_reachability(visibility: Visibility, reachability: Reachability) -> 
 
 pub(crate) fn details(snapshot: &NetworkStateSnapshot, target: Target) -> Vec<(String, String)> {
     let network = &snapshot.network;
-    let mut rows = vec![("Network".into(), summary(snapshot))];
+    let observer_first = target == Target::Overview
+        && (network.visibility != Visibility::Active || network.history != HistoryState::Ready)
+        && !network.detail.is_empty();
+    let mut rows = Vec::new();
+    if observer_first {
+        // The overview must explain a blocked observation before optional
+        // service metadata consumes the available panel height.
+        rows.push(("Observer".into(), network.detail.clone()));
+    }
+    rows.push(("Network".into(), summary(snapshot)));
+    if target == Target::Overview {
+        rows.insert(
+            1,
+            (
+                "Observation time".into(),
+                observation_time(network.observed_at_ms),
+            ),
+        );
+    }
+    if network.retention_limited {
+        rows.push((
+            "History coverage".into(),
+            "Older samples or peers omitted".into(),
+        ));
+    }
+    let context_rows = rows.len();
     match target {
         Target::Peer(slot) => {
             if let Some(peer) = network.peers.iter().find(|p| p.slot == slot) {
@@ -262,9 +358,7 @@ pub(crate) fn details(snapshot: &NetworkStateSnapshot, target: Target) -> Vec<(S
                 network.unverified_endpoints
             ),
         )),
-        Target::Accounts => {
-            rows.extend(service_details("AI accounts", &snapshot.services.accounts))
-        }
+        Target::Accounts => rows.extend(account_service_details(&snapshot.services.accounts)),
         Target::Secrets => rows.extend(service_details("Secrets", &snapshot.services.secrets)),
         Target::Overview => {
             rows.push((
@@ -275,13 +369,33 @@ pub(crate) fn details(snapshot: &NetworkStateSnapshot, target: Target) -> Vec<(S
                     network.history
                 ),
             ));
-            rows.extend(service_details("AI accounts", &snapshot.services.accounts));
+            rows.extend(account_service_details(&snapshot.services.accounts));
             rows.extend(service_details("Secrets", &snapshot.services.secrets));
         }
     }
-    if !network.detail.is_empty() {
+    if matches!(target, Target::Accounts | Target::Secrets) {
+        // The selected service is the first detail the lens must keep when
+        // its height is constrained. General network context comes after it.
+        rows.rotate_left(context_rows);
+    }
+    if !observer_first && !network.detail.is_empty() {
         rows.push(("Observer".into(), network.detail.clone()));
     }
+    if let Some(pid) = network.via_local_process {
+        rows.push((
+            "Observation source".into(),
+            format!("Read from local aterm process {pid}; original observation times retained"),
+        ));
+    }
+    rows
+}
+
+fn account_service_details(service: &ServiceState) -> Vec<(String, String)> {
+    let mut rows = service_details("Commons account catalog", service);
+    rows.insert(1, (
+        "Scope".into(),
+        "Shared account proposals in Commons. Harness rosters and provider sign-in are tracked separately.".into(),
+    ));
     rows
 }
 
@@ -462,7 +576,7 @@ pub(crate) fn paint_with_inks(
         },
         inks.aterm,
         Target::Local,
-        false,
+        snapshot.network.retention_limited,
     );
     let available = (g.w - cell_x - 95.0 * scale).max(0.0);
     let slots = (available / (14.0 * scale)) as usize;
@@ -505,7 +619,7 @@ pub(crate) fn paint_with_inks(
         );
     }
     if next_x + 90.0 * scale < g.w {
-        let text = match snapshot.network.visibility {
+        let mut text = match snapshot.network.visibility {
             Visibility::Active => format!(
                 "{} reachable",
                 snapshot
@@ -521,6 +635,29 @@ pub(crate) fn paint_with_inks(
             Visibility::Waiting => "Waiting".into(),
             Visibility::Unavailable => "Unavailable".into(),
         };
+        if snapshot.network.visibility == Visibility::Active
+            && snapshot.network.via_local_process.is_some()
+        {
+            let full = format!("{text} · via local aterm");
+            let room = g.w - next_x - 20.0 * scale;
+            text = if p.ui_text_w(&full, false) <= room {
+                full
+            } else {
+                "via aterm".into()
+            };
+        }
+        if snapshot.network.visibility != Visibility::Active && !peers.is_empty() {
+            let known = format!("{text} · {} known", peers.len());
+            if p.ui_text_w(&known, false) <= g.w - next_x - 20.0 * scale {
+                text = known;
+            }
+        }
+        if snapshot.network.retention_limited {
+            let partial = format!("{text} · partial history");
+            if p.ui_text_w(&partial, false) <= g.w - next_x - 20.0 * scale {
+                text = partial;
+            }
+        }
         p.ui_text(
             next_x + 20.0 * scale,
             first_y + 3.0 * scale,
@@ -572,7 +709,7 @@ pub(crate) fn paint_with_inks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aterm_types::network_state::{NetworkObservation, PeerObservation};
+    use aterm_types::network_state::NetworkObservation;
 
     fn peer(slot: u64, reachability: Reachability) -> PeerObservation {
         PeerObservation {
@@ -590,6 +727,214 @@ mod tests {
             samples: Vec::new(),
         }
     }
+
+    #[test]
+    fn waiting_network_keeps_remembered_count_visible_without_claiming_reachability() {
+        let mut snapshot = NetworkStateSnapshot::default();
+        snapshot.network.visibility = Visibility::Waiting;
+        snapshot.network.history = HistoryState::Ready;
+        snapshot
+            .network
+            .peers
+            .push(peer(2, Reachability::Reachable));
+        let g = DeckGeom {
+            w: 700.0,
+            h: 200.0,
+            pad: 0.0,
+            scale: 1.0,
+            font_px: 14.0,
+        };
+        let inks = crate::stats_deck::cached_inks([20, 20, 20], [230, 230, 230], [100, 180, 200]);
+        let (prims, _) = paint_with_inks(&g, 170.0, &snapshot, &inks, false);
+        assert!(prims.iter().any(|prim| matches!(prim,
+            DrawPrim::Text { s, .. } if s == "Waiting · 1 known"
+        )));
+        let summary = summary(&snapshot);
+        assert!(summary.contains("1 known"));
+        assert!(!summary.contains("reachable"));
+    }
+
+    #[test]
+    fn reachable_peer_expires_before_a_still_fresh_observer() {
+        let mut snapshot = NetworkStateSnapshot::default();
+        snapshot.network.visibility = Visibility::Active;
+        snapshot.network.history = HistoryState::Ready;
+        snapshot.network.observed_at_ms = 10_000;
+        let mut remote = peer(2, Reachability::Reachable);
+        remote.last_seen_ms = 2_000;
+        remote.last_checked_ms = Some(2_000);
+        snapshot.network.peers.push(remote);
+        let snapshot = std::sync::Arc::new(snapshot);
+        let expired = fresh_snapshot(snapshot.clone(), Some(17_001));
+        assert_eq!(expired.network.visibility, Visibility::Active);
+        assert_eq!(
+            expired.network.peers[0].reachability,
+            Reachability::LastSeen
+        );
+        assert_eq!(
+            expired.network.observed_at_ms,
+            snapshot.network.observed_at_ms
+        );
+        assert_eq!(expired.network.peers[0].last_seen_ms, 2_000);
+        assert_eq!(expired.network.peers[0].last_checked_ms, Some(2_000));
+        assert_eq!(
+            expired.network.peers[0].samples,
+            snapshot.network.peers[0].samples
+        );
+        assert_eq!(expired.network.revision, snapshot.network.revision);
+        assert_eq!(expired.revision, snapshot.revision);
+    }
+
+    #[test]
+    fn peer_contact_and_check_clocks_each_bound_current_reachability() {
+        for (seen, checked, expected) in [
+            (2_001, Some(2_001), Reachability::Reachable),
+            (2_000, Some(2_001), Reachability::LastSeen),
+            (2_001, Some(2_000), Reachability::LastSeen),
+            (0, Some(2_001), Reachability::Unknown),
+            (2_001, None, Reachability::Unknown),
+            (2_001, Some(0), Reachability::Unknown),
+            (17_002, Some(2_001), Reachability::Unknown),
+            (2_001, Some(17_002), Reachability::Unknown),
+        ] {
+            let mut snapshot = NetworkStateSnapshot::default();
+            snapshot.network.visibility = Visibility::Active;
+            snapshot.network.observed_at_ms = 10_000;
+            let mut remote = peer(2, Reachability::Reachable);
+            remote.last_seen_ms = seen;
+            remote.last_checked_ms = checked;
+            snapshot.network.peers.push(remote.clone());
+            let projected = fresh_snapshot(std::sync::Arc::new(snapshot), Some(17_001));
+            remote.reachability = expected;
+            assert_eq!(projected.network.peers, vec![remote]);
+        }
+    }
+
+    #[test]
+    fn observer_refresh_does_not_refresh_retained_peer_evidence() {
+        let mut snapshot = NetworkStateSnapshot::default();
+        snapshot.network.visibility = Visibility::Active;
+        snapshot.network.observed_at_ms = 10_000;
+        let mut remote = peer(2, Reachability::Reachable);
+        remote.last_seen_ms = 2_000;
+        remote.last_checked_ms = Some(2_000);
+        snapshot.network.peers.push(remote);
+        let first = fresh_snapshot(std::sync::Arc::new(snapshot.clone()), Some(17_001));
+        assert_eq!(first.network.peers[0].reachability, Reachability::LastSeen);
+        snapshot.network.observed_at_ms = 18_000;
+        let refreshed = fresh_snapshot(std::sync::Arc::new(snapshot.clone()), Some(18_000));
+        assert_eq!(
+            refreshed.network.peers[0].reachability,
+            Reachability::LastSeen
+        );
+        snapshot.network.peers[0].last_seen_ms = 18_000;
+        snapshot.network.peers[0].last_checked_ms = Some(18_000);
+        let contacted = fresh_snapshot(std::sync::Arc::new(snapshot), Some(18_000));
+        assert_eq!(
+            contacted.network.peers[0].reachability,
+            Reachability::Reachable
+        );
+        let mut retained = first.as_ref().clone();
+        retained.network.observed_at_ms = 18_000;
+        retained.network.peers[0].last_seen_ms = 18_000;
+        retained.network.peers[0].last_checked_ms = Some(18_000);
+        assert_eq!(
+            fresh_snapshot(std::sync::Arc::new(retained), Some(18_000))
+                .network
+                .peers[0]
+                .reachability,
+            Reachability::LastSeen
+        );
+    }
+
+    #[test]
+    fn peer_expiry_invalidates_an_open_network_lens_without_a_source_revision() {
+        let mut app = crate::App::headless_for_test();
+        let wid = *app.windows.keys().next().expect("window");
+        let mut snapshot = NetworkStateSnapshot::default();
+        snapshot.network.visibility = Visibility::Active;
+        snapshot.network.observed_at_ms = 10_000;
+        let mut remote = peer(2, Reachability::Reachable);
+        remote.last_seen_ms = 2_000;
+        remote.last_checked_ms = Some(2_000);
+        snapshot.network.peers.push(remote);
+        app.network_snapshot = std::sync::Arc::new(snapshot);
+        assert!(app.open_network_lens());
+        let before = app.stats_lens_fp(wid);
+        assert_ne!(before, 0);
+        app.network_snapshot = fresh_snapshot(app.network_snapshot.clone(), Some(17_001));
+        assert_eq!(app.network_snapshot.revision, 0);
+        assert_eq!(app.network_snapshot.network.revision, 0);
+        assert_eq!(app.network_snapshot.network.visibility, Visibility::Active);
+        assert_ne!(app.stats_lens_fp(wid), before);
+    }
+
+    #[test]
+    fn observation_time_changes_the_lens_fingerprint() {
+        let mut app = crate::App::headless_for_test();
+        let wid = *app.windows.keys().next().expect("window");
+        let mut snapshot = NetworkStateSnapshot::default();
+        snapshot.network.visibility = Visibility::Waiting;
+        snapshot.network.observed_at_ms = 1_000;
+        app.network_snapshot = std::sync::Arc::new(snapshot);
+        assert!(app.open_network_lens());
+        let before = app.stats_lens_fp(wid);
+        let mut updated = app.network_snapshot.as_ref().clone();
+        updated.network.observed_at_ms = 2_000;
+        app.network_snapshot = std::sync::Arc::new(updated);
+        assert_eq!(app.network_snapshot.revision, 0);
+        assert_ne!(app.stats_lens_fp(wid), before);
+    }
+
+    #[test]
+    fn retention_limit_changes_visible_coverage_without_moving_cells() {
+        let mut snapshot = NetworkStateSnapshot::default();
+        snapshot.network.visibility = Visibility::Active;
+        snapshot.network.history = HistoryState::Ready;
+        snapshot.network.observer = Some(peer(1, Reachability::Reachable).identity);
+        snapshot
+            .network
+            .peers
+            .push(peer(2, Reachability::Reachable));
+        let g = DeckGeom {
+            w: 700.0,
+            h: 200.0,
+            pad: 0.0,
+            scale: 1.0,
+            font_px: 14.0,
+        };
+        let inks = crate::stats_deck::cached_inks([20, 20, 20], [230, 230, 230], [100, 180, 200]);
+        let before = paint_with_inks(&g, 170.0, &snapshot, &inks, false);
+        let before_summary = summary(&snapshot);
+        let before_details = details(&snapshot, Target::Overview);
+        snapshot.network.retention_limited = true;
+        let limited = paint_with_inks(&g, 170.0, &snapshot, &inks, false);
+        assert_ne!(summary(&snapshot), before_summary);
+        assert_ne!(
+            crate::stats_deck::prims_fp(&limited.0),
+            crate::stats_deck::prims_fp(&before.0)
+        );
+        assert_eq!(limited.1, before.1);
+        assert!(details(&snapshot, Target::Overview).len() > before_details.len());
+        assert_eq!(snapshot.network.peers.len(), 1);
+        assert_eq!(
+            snapshot.network.peers[0].reachability,
+            Reachability::Reachable
+        );
+    }
+
+    #[test]
+    fn retention_limit_invalidates_network_details_without_a_revision_change() {
+        let mut app = crate::App::headless_for_test();
+        let wid = *app.windows.keys().next().expect("window");
+        assert!(app.open_network_lens());
+        let before = app.stats_lens_fp(wid);
+        let mut snapshot = app.network_snapshot.as_ref().clone();
+        snapshot.network.retention_limited = true;
+        app.network_snapshot = std::sync::Arc::new(snapshot);
+        assert_ne!(app.stats_lens_fp(wid), before);
+    }
+
     #[test]
     fn peer_slots_survive_status_and_input_order_changes() {
         let mut snapshot = NetworkStateSnapshot {
@@ -617,6 +962,13 @@ mod tests {
         snapshot.network.peers[0].reachability = Reachability::Unknown;
         let second = paint_with_inks(&g, 170.0, &snapshot, &inks, false).1;
         assert_eq!(first, second);
+        snapshot.network.via_local_process = Some(42);
+        let (relayed, relayed_hits) = paint_with_inks(&g, 170.0, &snapshot, &inks, false);
+        assert_eq!(second, relayed_hits);
+        assert!(relayed.iter().any(|prim| {
+            matches!(prim, DrawPrim::Text { s, face, .. }
+                if s.contains("via local aterm") && *face != crate::widget::TextFace::Mono)
+        }));
         assert_eq!(step(&snapshot, Target::Local, true), Target::Peer(2));
     }
 
@@ -750,10 +1102,10 @@ mod tests {
         let mut snapshot = NetworkStateSnapshot::default();
         snapshot.network.visibility = Visibility::Active;
         snapshot.network.observed_at_ms = 10_000;
-        snapshot
-            .network
-            .peers
-            .push(peer(2, Reachability::Reachable));
+        let mut remote = peer(2, Reachability::Reachable);
+        remote.last_seen_ms = 10_000;
+        remote.last_checked_ms = Some(10_000);
+        snapshot.network.peers.push(remote);
         let snapshot = std::sync::Arc::new(snapshot);
         assert!(std::sync::Arc::ptr_eq(
             &fresh_snapshot(snapshot.clone(), Some(25_000)),
@@ -764,6 +1116,63 @@ mod tests {
             assert_eq!(expired.network.visibility, Visibility::Unavailable);
             assert_eq!(expired.network.peers, snapshot.network.peers);
             assert_eq!(expired.network.observed_at_ms, 10_000);
+        }
+    }
+
+    #[test]
+    fn direct_visibility_claims_expire_without_losing_history_or_repeated_expiry() {
+        for visibility in [
+            Visibility::Offline,
+            Visibility::Disabled,
+            Visibility::Waiting,
+            Visibility::Checking,
+        ] {
+            let mut snapshot = NetworkStateSnapshot::default();
+            snapshot.network.visibility = visibility;
+            snapshot.network.observed_at_ms = 100_000;
+            snapshot.network.history = HistoryState::Ready;
+            snapshot.network.peers.push(peer(2, Reachability::LastSeen));
+            let snapshot = std::sync::Arc::new(snapshot);
+            assert!(snapshot.network.via_local_process.is_none());
+            assert!(std::sync::Arc::ptr_eq(
+                &fresh_snapshot(snapshot.clone(), Some(115_000)),
+                &snapshot,
+            ));
+            for now in [Some(115_001), Some(99_999), None] {
+                let expired = fresh_snapshot(snapshot.clone(), now);
+                assert_eq!(expired.network.visibility, Visibility::Unavailable);
+                assert_eq!(
+                    expired.network.observed_at_ms,
+                    snapshot.network.observed_at_ms
+                );
+                assert_eq!(expired.network.history, snapshot.network.history);
+                assert_eq!(expired.network.peers, snapshot.network.peers);
+                assert!(std::sync::Arc::ptr_eq(
+                    &fresh_snapshot(expired.clone(), now),
+                    &expired
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn initial_checking_and_unavailable_history_do_not_expire_again() {
+        for (visibility, observed_at_ms, source) in [
+            (Visibility::Checking, 0, None),
+            (Visibility::Unavailable, 100_000, None),
+            (Visibility::Unavailable, 100_000, Some(41)),
+        ] {
+            let mut snapshot = NetworkStateSnapshot::default();
+            snapshot.network.visibility = visibility;
+            snapshot.network.observed_at_ms = observed_at_ms;
+            snapshot.network.via_local_process = source;
+            let snapshot = std::sync::Arc::new(snapshot);
+            for now in [Some(115_001), None] {
+                assert!(std::sync::Arc::ptr_eq(
+                    &fresh_snapshot(snapshot.clone(), now),
+                    &snapshot
+                ));
+            }
         }
     }
 
@@ -848,6 +1257,7 @@ mod tests {
         let wid = *app.windows.keys().next().expect("window");
         let mut snapshot = NetworkStateSnapshot::default();
         snapshot.network.visibility = Visibility::Offline;
+        snapshot.network.observed_at_ms = 61_001;
         snapshot.services.secrets.availability = ServiceAvailability::Cached;
         snapshot.services.secrets.observed_at_ms = 1000;
         app.network_snapshot = std::sync::Arc::new(snapshot);
@@ -888,11 +1298,59 @@ mod tests {
     }
 
     #[test]
+    fn relayed_observations_name_their_source_without_refreshing_expired_evidence() {
+        let mut snapshot = NetworkStateSnapshot::default();
+        snapshot.network.visibility = Visibility::Active;
+        snapshot.network.history = HistoryState::Ready;
+        snapshot.network.observed_at_ms = 100_000;
+        snapshot
+            .network
+            .peers
+            .push(peer(2, Reachability::Reachable));
+        let direct = summary(&snapshot);
+        snapshot.network.via_local_process = Some(41);
+        assert_ne!(summary(&snapshot), direct);
+        assert!(
+            details(&snapshot, Target::Overview)
+                .iter()
+                .any(|(key, value)| { key == "Observation source" && value.contains("41") })
+        );
+        let expired = fresh_snapshot(std::sync::Arc::new(snapshot), Some(115_001));
+        assert_eq!(expired.network.visibility, Visibility::Unavailable);
+        assert_eq!(expired.network.observed_at_ms, 100_000);
+        assert_eq!(expired.network.via_local_process, Some(41));
+        assert_eq!(
+            observed_reachability(
+                expired.network.visibility,
+                expired.network.peers[0].reachability
+            ),
+            Reachability::Unknown
+        );
+        let mut offline = expired.as_ref().clone();
+        offline.network.visibility = Visibility::Offline;
+        let expired_offline = fresh_snapshot(std::sync::Arc::new(offline), Some(115_001));
+        assert_eq!(expired_offline.network.visibility, Visibility::Unavailable);
+        assert_eq!(expired_offline.network.observed_at_ms, 100_000);
+    }
+
+    #[test]
     fn absent_observer_does_not_promise_a_pending_read() {
         let snapshot = inactive_snapshot();
         assert_eq!(snapshot.network.visibility, Visibility::Unavailable);
         assert_eq!(snapshot.network.history, HistoryState::Unavailable);
         assert!(!snapshot.network.detail.is_empty());
+    }
+
+    #[test]
+    fn changing_the_relay_source_invalidates_network_details() {
+        let mut app = crate::App::headless_for_test();
+        let wid = *app.windows.keys().next().expect("window");
+        assert!(app.open_network_lens());
+        let before = app.stats_lens_fp(wid);
+        let mut snapshot = app.network_snapshot.as_ref().clone();
+        snapshot.network.via_local_process = Some(42);
+        app.network_snapshot = std::sync::Arc::new(snapshot);
+        assert_ne!(app.stats_lens_fp(wid), before);
     }
 
     #[test]

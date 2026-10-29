@@ -6,6 +6,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use aterm_agent::harness::upgrade_agy_live::{Open, open_work};
+
 use crate::door::Door;
 use crate::pyjson::J;
 use crate::relaunch_agy::{lock_conversation, resumed, shell_exports, twin_script};
@@ -13,7 +15,8 @@ use crate::relaunch_check::{host_said, newest_dump, open_files, request_with, sa
 use crate::run::{Run, is_run};
 use crate::stop;
 use crate::upgrade_muse::{
-    RAN_MS, held_while, ledger, quiet, record_naming, row_at, show_held, show_rows,
+    RAN_MS, ends_on_last_tick, held_while, ledger, quiet, record_naming, row_at, said_whole,
+    show_held, show_rows, shows,
 };
 use crate::util::now_ms;
 use crate::{Fail, LAB, Res};
@@ -266,6 +269,38 @@ fn show_moved(m: &Moved, build: u64, what: &str) {
     );
 }
 
+/// Whether agy's transcript `transcript` holds the stub's `slow` reply whole:
+/// a `DONE` `PLANNER_RESPONSE` row whose reply ends with its last tick, which
+/// the stub sends last, so a turn a restart cut has none.
+fn agy_reply_whole(transcript: &str) -> bool {
+    transcript
+        .lines()
+        .filter_map(|l| J::parse(l).ok())
+        .any(|r| {
+            r.get("type").and_then(J::as_str) == Some("PLANNER_RESPONSE")
+                && r.get("status").and_then(J::as_str) == Some("DONE")
+                && r.get("content")
+                    .and_then(J::as_str)
+                    .is_some_and(ends_on_last_tick)
+        })
+}
+
+/// agy's transcript of `conversation`.
+fn transcript(run: &Run, conversation: &str) -> PathBuf {
+    config(run)
+        .join("brain")
+        .join(conversation)
+        .join(".system_generated/logs/transcript.jsonl")
+}
+
+/// [`agy_reply_whole`] of `conversation`'s transcript; `Err` names one that could not be read.
+fn slow_reply_whole(run: &Run, conversation: &str) -> Result<bool, String> {
+    let path = transcript(run, conversation);
+    std::fs::read_to_string(&path)
+        .map(|text| agy_reply_whole(&text))
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
 fn kept(m: Option<&Moved>) -> bool {
     m.is_some_and(|m| m.holds_lock && quiet(&m.rows))
 }
@@ -440,7 +475,7 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
 
     crate::verbs::set_tool(
         &run,
-        r#"{"name":"run_command","input":{"CommandLine":"sleep 40; echo LAB-BG-DONE","Cwd":"@PROJ@","WaitMsBeforeAsync":500,"toolAction":"Running background sleep","toolSummary":"Background sleep"}}"#,
+        r#"{"name":"run_command","input":{"CommandLine":"sleep 40; echo LAB-BG-DONE","WaitMsBeforeAsync":500,"toolSummary":"Background sleep"}}"#,
     )?;
     crate::verbs::turn(&door, "toolstart")?;
     let child = wait_for(30, || {
@@ -459,7 +494,7 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         versions[2],
         ids[2]
     );
-    let (held2, ended2) = held_while(&run, pid, t2, 120, || children(pid) > 0)?;
+    let (held2, ended2) = held_while(&run, pid, t2, 120, || Some(children(pid) > 0))?;
     let ran2 = ran(child, ended2);
     println!(
         "  bg ended  {}; the agy stood while it ran={held2}, and after its end; it ran its course={ran2}",
@@ -490,9 +525,10 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
     crate::verbs::set_tool(
         &run,
         &format!(
-            r#"[{{"name":"invoke_subagent","input":{{"Subagents":[{{"Model":"inherit","Prompt":"LABSUB-HOLD: reply with the single word DONE.","Role":"Lab Waiter","TypeName":"research"}}],"toolAction":"Invoking lab subagent","toolSummary":"Lab subagent"}}}},{{"when":"LABSUB-HOLD","text":"DONE","delay_ms":{SUBAGENT_HOLD_MS}}}]"#
+            r#"[{{"name":"invoke_subagent","input":{{"Model":"inherit","Prompt":"LABSUB-HOLD: reply with the single word DONE.","Role":"Lab Waiter","TypeName":"research"}}}},{{"when":"LABSUB-HOLD","text":"DONE","delay_ms":{SUBAGENT_HOLD_MS}}}]"#
         ),
     )?;
+    let asked3 = u64::try_from(now_ms() / 1000 - 1).unwrap_or(0);
     crate::verbs::turn(&door, "toolstart")?;
     let working = wait_for(30, || {
         door.out(&["text"])
@@ -509,9 +545,20 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         versions[3],
         ids[3]
     );
-    let (held3, ended3) = held_while(&run, pid, t3, 180, || {
-        door.out(&["text"]).contains("subagent(s)")
+    // agy's footer counts a working subagent, which holds the restart before
+    // its transcript is read, so no hold of this leg shows the transcript's
+    // guard: it is asked of agy's transcript while the subagent works (agy
+    // writes the spawn row as it starts one, whose model call the stub holds
+    // `SUBAGENT_HOLD_MS`).
+    let guard3 = wait_for(20, || {
+        let text = std::fs::read_to_string(transcript(&run, &conversation)).ok()?;
+        (open_work(&text, asked3) == Err(Open::Subagent)).then_some(())
     })?;
+    println!(
+        "  guard     agy's transcript reads the subagent open={}",
+        guard3.is_some()
+    );
+    let (held3, ended3) = held_while(&run, pid, t3, 180, || shows(&door, "subagent(s)"))?;
     let ran3 = ran(working, ended3);
     println!(
         "  sub idle  {}; the agy stood while it worked={held3}, and after it went idle; it ran its course={ran3}",
@@ -529,8 +576,13 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         show_moved(m, ids[3], "");
     }
     said(
-        working.is_some() && held3 && ran3 && after(m3.as_ref(), ended3) && kept(m3.as_ref()),
-        "3. an agy whose subagent works is not restarted while it works, and is once it went idle",
+        working.is_some()
+            && guard3.is_some()
+            && held3
+            && ran3
+            && after(m3.as_ref(), ended3)
+            && kept(m3.as_ref()),
+        "3. an agy whose subagent works is not restarted while it works (its transcript reads it open), and is once it went idle",
         &mut failed,
     );
     let Some(m3) = m3 else {
@@ -541,7 +593,7 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
 
     crate::verbs::set_tool(
         &run,
-        r#"{"name":"run_command","input":{"CommandLine":"sleep 40","Cwd":"@PROJ@","IsDaemon":true,"WaitMsBeforeAsync":500,"toolAction":"Running daemon sleep","toolSummary":"Daemon sleep"}}"#,
+        r#"{"name":"run_command","input":{"CommandLine":"sleep 40","IsDaemon":true,"WaitMsBeforeAsync":500,"toolSummary":"Daemon sleep"}}"#,
     )?;
     crate::verbs::turn(&door, "toolstart")?;
     let daemon = wait_for(30, || {
@@ -558,7 +610,7 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         versions[4],
         ids[4]
     );
-    let (held4, ended4) = held_while(&run, pid, t4, 120, || children(pid) > 0)?;
+    let (held4, ended4) = held_while(&run, pid, t4, 120, || Some(children(pid) > 0))?;
     let ran4 = ran(daemon, ended4);
     println!(
         "  dmn ended {}; the agy stood while it ran={held4}, and after its end; it ran its course={ran4}",
@@ -593,30 +645,31 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
     store
         .land(&versions[5])
         .map_err(|e| could_not(&format!("landing {}: {e}", versions[5])))?;
+    // The turn's end wakes nothing, so the restart can follow it before the
+    // next look at the screen, which then cannot say which came first; agy's
+    // record of the reply can: whole after the restart, and not at the landing.
+    let open5 = slow_reply_whole(&run, &conversation);
     println!(
-        "  busy      the turn running={busy}; landed {} at {}",
-        versions[5], ids[5]
-    );
-    let (held5, ended5) = held_while(&run, pid, t5, 240, || {
-        door.out(&["text"]).contains("esc to cancel")
-    })?;
-    println!(
-        "  turn end  {}; the agy stood while it ran={held5}, and after its end",
-        ended5.map_or_else(
-            || "NOT within 120 s".to_string(),
-            |t| format!("after {} ms", t - t5)
-        )
+        "  busy      the turn running={busy}; landed {} at {}; the reply whole then={}",
+        versions[5],
+        ids[5],
+        said_whole(&open5)
     );
     let m5 = moved_onto(&run, &store.store(), ids[5], &conversation, pid, 180, t5)?;
     if m5.as_ref().is_some_and(|m| m.holds_lock) {
         store.ran(ids[5]);
     }
+    let whole5 = slow_reply_whole(&run, &conversation);
+    println!(
+        "  reply     agy's transcript holds the slow reply whole={}",
+        said_whole(&whole5)
+    );
     show_held(&run, t5);
     if let Some(m) = &m5 {
         show_moved(m, ids[5], " after the turn");
     }
     said(
-        busy && held5 && ended5.is_some() && after(m5.as_ref(), ended5) && kept(m5.as_ref()),
+        busy && open5 == Ok(false) && whole5 == Ok(true) && kept(m5.as_ref()),
         "5. a busy agy is not restarted mid-turn, and is once its turn ended",
         &mut failed,
     );
@@ -659,7 +712,7 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
             turns_at_restart = Some(main_turns(&run));
             break;
         }
-        if turn_end6.is_none() && !door.out(&["text"]).contains("esc to cancel") {
+        if turn_end6.is_none() && shows(&door, "esc to cancel") == Some(false) {
             turn_end6 = Some(now_ms());
         }
     }
@@ -749,6 +802,39 @@ pub fn cmd_agy_upgrade(args: &[String]) -> Res {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reply_is_whole_once_agy_wrote_it_done_to_its_last_tick() {
+        let row = |kind: &str, status: &str, content: &str| {
+            format!(
+                r#"{{"step_index":9,"source":"MODEL","type":"{kind}","status":"{status}","created_at":"2026-10-29T07:02:23Z","content":"{content}"}}"#
+            )
+        };
+        let ticks = |to: i64| {
+            (16..=to)
+                .map(|i| format!("tick {i}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let last = crate::stub::SLOW_SECONDS;
+        assert!(agy_reply_whole(&row(
+            "PLANNER_RESPONSE",
+            "DONE",
+            &ticks(last)
+        )));
+        assert!(
+            !agy_reply_whole(&row("PLANNER_RESPONSE", "DONE", &ticks(last - 1))),
+            "a reply cut before its last tick"
+        );
+        assert!(
+            !agy_reply_whole(&row("PLANNER_RESPONSE", "RUNNING", &ticks(last))),
+            "a reply agy had not finished"
+        );
+        assert!(
+            !agy_reply_whole(&row("USER_INPUT", "DONE", &ticks(last))),
+            "another row's words"
+        );
+    }
 
     #[test]
     fn a_plain_versions_build_id_is_atpkgs() {

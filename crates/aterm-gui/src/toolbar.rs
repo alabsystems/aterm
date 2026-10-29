@@ -842,7 +842,7 @@ mod macos {
         /// Whether the chip at `index` draws a leading divider when `active` is selected.
         #[must_use]
         const fn separates(index: usize, active: usize) -> bool {
-            index > 0 && index != active && index != active + 1
+            index > 0 && index != active && index - 1 != active
         }
     }
 
@@ -4168,7 +4168,8 @@ mod macos {
         };
 
         use super::{
-            ChromeButton, NeedsPill, STRIP_ITEM_ID, TabRenameTarget, TabView, ToolbarDelegate,
+            ChromeButton, NeedsPill, STRIP_ITEM_ID, TabGeometry, TabRenameTarget, TabView,
+            ToolbarDelegate,
         };
         use crate::appkit;
 
@@ -4453,6 +4454,18 @@ mod macos {
                     }
                 }
             });
+        }
+
+        #[test]
+        fn tab_dividers_skip_the_first_chip_and_both_edges_of_active_up_to_usize_max() {
+            assert!(!TabGeometry::separates(0, 0));
+            assert!(!TabGeometry::separates(0, 2));
+            assert!(!TabGeometry::separates(1, 0));
+            assert!(!TabGeometry::separates(1, 1));
+            assert!(TabGeometry::separates(2, 0));
+            assert!(TabGeometry::separates(1, usize::MAX));
+            assert!(!TabGeometry::separates(usize::MAX, usize::MAX));
+            assert!(!TabGeometry::separates(usize::MAX, usize::MAX - 1));
         }
     }
 }

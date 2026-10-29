@@ -262,6 +262,17 @@ fn the_static_verifier_trusts_the_updaters_paper_master() {
         answer(rec),
         "refused\troster is not signed by the pinned paper master"
     );
+    assert_eq!(
+        aterm_bootstrap_verify::verify_binary(
+            laid.candidate.as_os_str(),
+            "arm64",
+            &chain::sha256(&case.binary),
+            case.binary.len() as u64,
+        ),
+        Err(aterm_bootstrap_verify::Refusal::new(
+            "unsupported Linux architecture"
+        ))
+    );
 }
 
 #[test]

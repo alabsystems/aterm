@@ -5,7 +5,10 @@
 //! accepts multicast; the OS interface binding and multicast source constrain
 //! transmission. Received packets never grant membership or application access.
 
-use super::{Attachment, Scope, listener, local_attachments, native, refuse, same_subnet, unicast};
+use super::{
+    Attachment, BindFailure, Scope, listener, local_attachments, native, refuse, same_subnet,
+    unicast,
+};
 use std::{
     io,
     net::{Ipv4Addr, SocketAddr, UdpSocket},
@@ -30,38 +33,58 @@ impl Multicast {
     /// Peers use the same port; zero is useful for isolated tests. Loopback is
     /// an explicit local/test policy and is never inferred as a LAN.
     pub fn bind(source: Ipv4Addr, group: Ipv4Addr, port: u16, scope: Scope) -> io::Result<Self> {
-        crate::loopback::check(crate::loopback::Reach::Listen((source, port).into()))?;
+        Self::try_bind(source, group, port, scope).map_err(|failure| failure.error)
+    }
+
+    /// [`Self::bind`], saying of a failure whether it reached its socket ([`BindFailure`]): a
+    /// join whose attachment changed before its re-check fails after its LAN syscall.
+    pub fn try_bind(
+        source: Ipv4Addr,
+        group: Ipv4Addr,
+        port: u16,
+        scope: Scope,
+    ) -> Result<Self, BindFailure> {
+        crate::loopback::check(crate::loopback::Reach::Listen((source, port).into()))
+            .map_err(BindFailure::before)?;
         if group.octets()[..2] != [239, 255] {
-            return Err(refuse(
+            return Err(BindFailure::before(refuse(
                 "discovery requires an administrative-local multicast group",
-            ));
+            )));
         }
         let local = SocketAddr::from((source, 0));
         let attachment = match scope {
-            Scope::Lan => Some(listener::select(
-                local,
-                &local_attachments(Some(local), None)?,
-            )?),
+            Scope::Lan => Some(
+                local_attachments(Some(local), None)
+                    .and_then(|attachments| listener::select(local, &attachments))
+                    .map_err(BindFailure::before)?,
+            ),
             Scope::Loopback if source.is_loopback() => None,
-            Scope::Loopback => return Err(refuse("loopback discovery requires a loopback source")),
+            Scope::Loopback => {
+                return Err(BindFailure::before(refuse(
+                    "loopback discovery requires a loopback source",
+                )));
+            }
         };
-        let socket = native::multicast::bind(
-            source,
-            group,
-            port,
-            attachment.as_ref().map(|a| (a.index, a.name.as_str())),
-        )?;
-        let local = socket.local_addr()?;
-        let result = Self {
-            socket,
-            source,
-            destination: (group, local.port()).into(),
-            local,
-            attachment,
-            withdrawn: AtomicBool::new(false),
-        };
-        result.recheck()?;
-        Ok(result)
+        (|| {
+            let socket = native::multicast::bind(
+                source,
+                group,
+                port,
+                attachment.as_ref().map(|a| (a.index, a.name.as_str())),
+            )?;
+            let local = socket.local_addr()?;
+            let result = Self {
+                socket,
+                source,
+                destination: (group, local.port()).into(),
+                local,
+                attachment,
+                withdrawn: AtomicBool::new(false),
+            };
+            result.recheck()?;
+            Ok(result)
+        })()
+        .map_err(BindFailure::after)
     }
 
     /// Joined receive port, including a kernel-assigned test port.

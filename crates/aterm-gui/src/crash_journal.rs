@@ -3974,7 +3974,6 @@ pub(crate) mod tests {
             &layout(&[("/older", "zsh")]),
             false,
         );
-        std::thread::sleep(Duration::from_millis(2));
         let newer = run(
             dir.path(),
             logs.path(),

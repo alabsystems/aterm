@@ -1,8 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Deserialization types for `data/lexicon.toml` and `data/exceptions.toml`,
-//! shared between `build.rs` and runtime override loading.
+//! Deserialization types for `data/lexicon.toml`, `data/exceptions.toml` and
+//! `data/tricks.toml`, shared between `build.rs` and run-time decoding.
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -60,4 +60,52 @@ pub(crate) struct RawException {
     pub(crate) _lang: String,
     #[serde(default, rename = "meaning")]
     pub(crate) _meaning: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawTricks {
+    #[serde(default)]
+    pub(crate) trick: Vec<RawTrickRow>,
+    #[serde(default)]
+    pub(crate) vocative: Vec<RawWordRow>,
+    #[serde(default)]
+    pub(crate) filler: Vec<RawWordRow>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawTrickRow {
+    pub(crate) id: String,
+    pub(crate) lang: String,
+    #[serde(default)]
+    pub(crate) words: Vec<String>,
+    #[serde(default)]
+    pub(crate) address: Vec<String>,
+    #[serde(default)]
+    pub(crate) gated: bool,
+    #[serde(default)]
+    pub(crate) cjk: bool,
+    #[serde(default)]
+    pub(crate) unglued: Vec<String>,
+    /// Reviewer prose in the TOML; type-checked (`deny_unknown_fields`), never read.
+    #[serde(default, rename = "notes")]
+    pub(crate) _notes: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawWordRow {
+    pub(crate) lang: String,
+    #[serde(default)]
+    pub(crate) words: Vec<String>,
+    #[serde(default)]
+    pub(crate) gated: bool,
+    #[serde(default)]
+    pub(crate) cjk: bool,
+    #[serde(default)]
+    pub(crate) unglued: Vec<String>,
+    /// Reviewer prose in the TOML; type-checked (`deny_unknown_fields`), never read.
+    #[serde(default, rename = "notes")]
+    pub(crate) _notes: String,
 }

@@ -132,42 +132,28 @@ Actions that come with the migration:
 | item | action |
 |---|---|
 | The `panic_message` helper (`catch_unwind` + downcast) | **delete with `exact_panic_message_matches_display`**. |
-| The doc comment on `panic_cast_failed!` names `exact_panic_message_matches_display` as its guard | **rewrite in the same commit** to cite `cast-slice-refines-try` and `pod-cast-error-display-table`. |
+| The doc comment on `panic_cast_failed!` | *(Resolved)* Already states the `PodCastError` `Display` text contract directly without citing a test name. |
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **`SizeMismatch` is misnamed by its doc and message.** `exact_panic_message_matches_display` pins
-   the `SizeMismatch` text using the ZST mismatch (`cast_slice::<(), u8>(&[()])`). The variant's doc
-   says "The source slice is not large enough to cover one target value", and `Display` says "input
-   slice is smaller than one output value". But `try_cast_slice` never returns `SizeMismatch` for a
-   too-short non-ZST slice: 0 bytes to `u32` is `Ok(empty)` when aligned, and 3 bytes to `u32` is
-   `OutputSliceWouldHaveSlop`. The spec calls it the ZST size mismatch. The doc and message are
-   candidates to fix. Changing the message changes the pinned string in `panic_cast_failed!` too.
-2. **`empty_slice_cast` passes only because of where its slice lives.** Its empty `&[u8]` inherits
-   the 4-aligned address of an empty `[u32; 0]` local. Alignment is checked before length, so an
-   empty `&[u8]` at an address that is not 4-aligned (an empty `u8` slice is only guaranteed
-   1-aligned) gives `try_cast_slice::<u8, u32>` `Err(TargetAlignmentGreaterAndInputNotAligned)`,
-   not `Ok(empty)`. The test name suggests that empty casts always succeed, which is false. The spec
-   (`try-cast-slice-classify`) states the real address-dependent rule.
-3. **`try_cast_slice_slop_returns_err` depends on the check order.** It reaches the slop branch only
-   because `bytes[..6]` starts at a `u32`-aligned address. "A non-multiple length is slop" holds only
-   after the alignment check passes, so the statement must include the ordering.
-4. **`cast_slice`'s `# Panics` doc lists the cases in a different order from the code.** The doc
-   says size mismatch, slop, then misalignment. The code decides ZST, then alignment, then slop. When
-   both alignment and slop fail, the alignment error wins. This is not a test defect, but don't read
-   the doc as the spec.
+1. *(Partially resolved)* **`SizeMismatch`'s doc now names the ZST mismatch**; its `Display` text is
+   kept unchanged while `panic_cast_failed!` and `exact_panic_message_matches_display` pin it.
+2. *(Resolved)* **`empty_slice_cast` now checks both aligned and unaligned empty slices.** Alignment is
+   checked before length, so an empty `&[u8]` at a non-4-aligned address returns
+   `Err(TargetAlignmentGreaterAndInputNotAligned)` from `try_cast_slice::<u8, u32>`, matching
+   `try-cast-slice-classify`.
+3. *(Resolved)* **`try_cast_slice_slop_returns_err` explicitly asserts `u32` alignment before testing slop.** "A non-multiple length is slop" holds only after the alignment check passes, matching the check ordering in `Classify`.
+4. *(Resolved)* **`cast_slice`'s `# Panics` doc now lists all three error conditions in check order**
+   (ZST mismatch, alignment, slop).
 5. **The ZST `Ok` branch does not alias `src`.** It returns a fresh `&[]`. That is sound and
    unobservable, since an empty slice's address cannot be observed through the slice API. But
    `addr(out) = addr(src)` holds only on branch 4, so the spec must not claim it in general.
-6. **`bytes_of` uses `ptr.is_null()`, which `try_cast_slice` deliberately avoids.** The comments in
-   `try_cast_slice` say `is_null()` is a call boundary the verifier cannot lower, and use an integer
-   compare (`ptr as usize == 0`) instead. `bytes_of` still calls `ptr.is_null()`. Before
-   `bytes-of-view` can be lowered by Trust, rewrite that guard the same way. The branch is
-   unreachable either way (a reference is never null), so the rewrite does not change behaviour.
-7. **The doc comment on `panic_cast_failed!` cites a test as its guard.** It names
-   `exact_panic_message_matches_display` as what keeps the literals equal to the `Display` text. Once
-   that test is deleted the comment points at nothing. Rewrite it to cite `cast-slice-refines-try`
-   and `pod-cast-error-display-table` in the same commit (see §4).
+6. **`bytes_of` keeps `ptr.is_null()` because it is `pub const fn`.** `try_cast_slice` avoids
+   `is_null()` via `ptr as usize == 0`, which is not a `const fn`, whereas rustc const-eval rejects
+   pointer-to-integer casts (`ptr as usize`) inside `pub const fn bytes_of`. Lowering `bytes-of-view`
+   in Trust therefore needs a verifier model for `ptr::is_null` (or a const-compatible lowering)
+   rather than rewriting `bytes_of` to `ptr as usize == 0`.
+7. *(Resolved)* **The doc comment on `panic_cast_failed!` no longer cites `exact_panic_message_matches_display`**; it states the `"<op> failed: <message>"` `PodCastError` `Display` contract directly.
 
 ## 6. Proof order (easiest high-value first)
 
@@ -188,5 +174,5 @@ gap 11 (generics).
    observation in the spec language.
 
 Then `cast-slice-bytes-round-trip` (free), `bytes-of-view` (same shape as branch 4 of the classify
-spec; first replace its `is_null()` guard with an integer compare, §5.6), and
+spec once `ptr::is_null` is modelled for `const fn`, §5.6), and
 `zeroed-is-all-zero-bits` (needs a `core::mem::zeroed` intrinsic model).

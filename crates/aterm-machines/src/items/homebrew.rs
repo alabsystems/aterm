@@ -80,14 +80,17 @@ pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
             return Err("[homebrew] pkg: Homebrew.pkg is signed; unsigned does not apply".into());
         }
     }
+    let not_applicable = matches!(arch_gate(ctx), Some(Probe::NotApplicable { .. }));
     let mut items: Vec<Box<dyn Item>> = vec![
         Box::new(Pkg {
             art: table.pkg.clone(),
             owner: owner.clone(),
+            not_applicable,
             notes: Notes::default(),
         }),
         Box::new(Ruby {
             owner: owner.clone(),
+            not_applicable,
         }),
     ];
     for (names, cask) in [(&table.formulae, false), (&table.casks, true)] {
@@ -97,6 +100,7 @@ pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
                 name: name.clone(),
                 cask,
                 owner: owner.clone(),
+                not_applicable,
             }));
         }
     }
@@ -179,6 +183,7 @@ fn name_owner(sys: &dyn System, owner: &User) -> Result<(), String> {
 struct Pkg {
     art: Option<Artifact>,
     owner: User,
+    not_applicable: bool,
     notes: Notes,
 }
 
@@ -286,7 +291,11 @@ impl Item for Pkg {
     }
 
     fn after(&self) -> Vec<String> {
-        vec!["developer.command-line-tools".into()]
+        if self.not_applicable {
+            Vec::new()
+        } else {
+            vec!["developer.command-line-tools".into()]
+        }
     }
 
     fn detail(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<String> {
@@ -358,6 +367,7 @@ fn portable_ruby(sys: &dyn System) -> Result<RubyState, String> {
 
 struct Ruby {
     owner: User,
+    not_applicable: bool,
 }
 
 impl Item for Ruby {
@@ -431,7 +441,11 @@ impl Item for Ruby {
     }
 
     fn after(&self) -> Vec<String> {
-        vec!["homebrew.pkg".into()]
+        if self.not_applicable {
+            Vec::new()
+        } else {
+            vec!["homebrew.pkg".into()]
+        }
     }
 }
 
@@ -439,6 +453,7 @@ struct Package {
     name: String,
     cask: bool,
     owner: User,
+    not_applicable: bool,
 }
 
 impl Package {
@@ -558,7 +573,11 @@ impl Item for Package {
     }
 
     fn after(&self) -> Vec<String> {
-        vec!["homebrew.pkg".into(), "homebrew.ruby".into()]
+        if self.not_applicable {
+            Vec::new()
+        } else {
+            vec!["homebrew.pkg".into(), "homebrew.ruby".into()]
+        }
     }
 }
 
@@ -645,13 +664,31 @@ mod tests {
         ctx.facts.arch = "x86_64".into();
         let items = expand(&table(HOMEBREW_SHA), &ctx).unwrap();
         for item in &items {
+            assert!(item.after().is_empty());
             assert!(matches!(
                 item.probe(&sys, &ctx),
                 Probe::NotApplicable { .. }
             ));
         }
+        let report = crate::engine::run(
+            &items,
+            Mode::Apply,
+            &sys,
+            &ctx,
+            &mut crate::engine::NoJournal,
+        );
+        assert!(
+            report
+                .iter()
+                .all(|row| row.outcome == Outcome::NotApplicable),
+            "{report:?}"
+        );
         ctx.facts.arch = String::new();
         assert!(matches!(items[0].probe(&sys, &ctx), Probe::Unusable { .. }));
+        let unread = expand(&table(HOMEBREW_SHA), &ctx).unwrap();
+        assert_eq!(unread[0].after(), ["developer.command-line-tools"]);
+        assert_eq!(unread[1].after(), ["homebrew.pkg"]);
+        assert_eq!(unread[2].after(), ["homebrew.pkg", "homebrew.ruby"]);
         assert!(sys.calls().is_empty());
     }
 

@@ -1444,6 +1444,17 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
             if let Some(say) = say {
                 eprintln!("{say}");
             }
+            if upstream == "cargo"
+                && !machine.passthrough
+                && let Err(error) = crate::build_cache::registered::observe_command(
+                    &args,
+                    crate::build_cache::Tool::Cargo,
+                    cwd.as_deref(),
+                )
+            {
+                eprintln!("atpkg: {error}; no build started");
+                return ExitCode::from(75);
+            }
             let args = if upstream == "cargo" && !machine.passthrough {
                 upstream_cargo_args(
                     &target,
@@ -1459,6 +1470,16 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
         Plan::Quiet { copy, args } => exec_branded(layout, &copy, &args),
         Plan::Branded { say, copy, args } => {
             eprintln!("{say}");
+            if upstream == "cargo"
+                && let Err(error) = crate::build_cache::registered::observe_command(
+                    &args,
+                    crate::build_cache::Tool::Targo,
+                    cwd.as_deref(),
+                )
+            {
+                eprintln!("atpkg: {error}; no build started");
+                return ExitCode::from(75);
+            }
             let args = if upstream == "cargo" {
                 crate::build_cache::with_build_dir_here(&args, crate::build_cache::Tool::Targo)
                     .unwrap_or(args)

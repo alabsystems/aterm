@@ -302,6 +302,11 @@ fn parse_entry(data: &[u8]) -> (Option<Entry>, &[u8]) {
         }
         i += 1;
     }
+    if let Some((x, y)) = octal {
+        value.push(b'\\');
+        value.push(x);
+        value.extend(y);
+    }
     let rest = data.get(i..).unwrap_or_default();
     (Some(Entry { components, value }), rest)
 }
@@ -430,6 +435,10 @@ mod tests {
             db.get_string("aterm.background", "ATerm.Background"),
             Some("#000")
         );
+        let escapes = Database::parse(b"aterm.one: \\1\naterm.two: \\12\naterm.eof: \\7");
+        assert_eq!(escapes.get_string("aterm.one", ""), Some("\\1"));
+        assert_eq!(escapes.get_string("aterm.two", ""), Some("\\12"));
+        assert_eq!(escapes.get_string("aterm.eof", ""), Some("\\7"));
     }
 
     #[test]

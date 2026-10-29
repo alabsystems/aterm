@@ -3,11 +3,10 @@
 
 //! Kitty-command vocabulary (`tricks`): typed pet commands, vocatives, and fillers.
 
+use crate::raw::{RawTrickRow, RawTricks, RawWordRow};
 use crate::{DebugText, Langs, LexError, fold, is_matchable_token, is_no_space_surface};
 use aterm_hash::FxHashMap;
 use std::sync::OnceLock;
-
-const BUILTIN_TRICKS: &str = include_str!("../data/tricks.toml");
 
 /// Action the cursor pet can be told to perform, in listing order ([`Trick::ALL`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -222,52 +221,60 @@ fn push_surface_list(line: &mut String, surfaces: &[String]) {
     }
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawTricks {
-    #[serde(default)]
-    trick: Vec<RawTrickRow>,
-    #[serde(default)]
-    vocative: Vec<RawWordRow>,
-    #[serde(default)]
-    filler: Vec<RawWordRow>,
+/// One `[[trick]]` row of `data/tricks.toml`, decoded at build time (`build.rs`); its `notes`
+/// are never read, so they are not kept.
+struct BuiltinTrickRow {
+    id: &'static str,
+    lang: &'static str,
+    words: &'static [&'static str],
+    address: &'static [&'static str],
+    gated: bool,
+    cjk: bool,
+    unglued: &'static [&'static str],
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawTrickRow {
-    id: String,
-    lang: String,
-    #[serde(default)]
-    words: Vec<String>,
-    #[serde(default)]
-    address: Vec<String>,
-    #[serde(default)]
+/// One `[[vocative]]` or `[[filler]]` row of `data/tricks.toml`, decoded at build time.
+struct BuiltinWordRow {
+    lang: &'static str,
+    words: &'static [&'static str],
     gated: bool,
-    #[serde(default)]
     cjk: bool,
-    #[serde(default)]
-    unglued: Vec<String>,
-    /// Reviewer prose in the TOML; type-checked (`deny_unknown_fields`), never read.
-    #[serde(default, rename = "notes")]
-    _notes: String,
+    unglued: &'static [&'static str],
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawWordRow {
-    lang: String,
-    #[serde(default)]
-    words: Vec<String>,
-    #[serde(default)]
-    gated: bool,
-    #[serde(default)]
-    cjk: bool,
-    #[serde(default)]
-    unglued: Vec<String>,
-    /// Reviewer prose in the TOML; type-checked (`deny_unknown_fields`), never read.
-    #[serde(default, rename = "notes")]
-    _notes: String,
+// `BUILTIN_TRICK_ROWS`, `BUILTIN_VOCATIVE_ROWS` and `BUILTIN_FILLER_ROWS`, in file order.
+include!(concat!(env!("OUT_DIR"), "/builtin_tricks.rs"));
+
+/// The embedded vocabulary's rows as a run-time decode of `data/tricks.toml` gives them, rebuilt
+/// from the rows the build decoded: compiling the embedded vocabulary parses no TOML, whose parse
+/// tree peaked at 7 MB of heap for the 360 KB file and left that much dirty in a launch.
+fn builtin_tricks() -> RawTricks {
+    let owned = |list: &[&str]| -> Vec<String> { list.iter().map(|s| (*s).to_owned()).collect() };
+    let word = |r: &BuiltinWordRow| RawWordRow {
+        lang: r.lang.to_owned(),
+        words: owned(r.words),
+        gated: r.gated,
+        cjk: r.cjk,
+        unglued: owned(r.unglued),
+        _notes: String::new(),
+    };
+    RawTricks {
+        trick: BUILTIN_TRICK_ROWS
+            .iter()
+            .map(|r| RawTrickRow {
+                id: r.id.to_owned(),
+                lang: r.lang.to_owned(),
+                words: owned(r.words),
+                address: owned(r.address),
+                gated: r.gated,
+                cjk: r.cjk,
+                unglued: owned(r.unglued),
+                _notes: String::new(),
+            })
+            .collect(),
+        vocative: BUILTIN_VOCATIVE_ROWS.iter().map(word).collect(),
+        filler: BUILTIN_FILLER_ROWS.iter().map(word).collect(),
+    }
 }
 
 /// Compiled value behind one key.
@@ -319,10 +326,7 @@ impl TrickLexicon {
     /// Load the embedded vocabulary with `gated` rows enabled for `langs` (`["all"]` enables all).
     #[must_use]
     pub fn with_languages(langs: &[&str]) -> TrickLexicon {
-        match Self::from_source(BUILTIN_TRICKS, langs) {
-            Ok(tricks) => tricks,
-            Err(e) => std::panic::panic_any(embedded_parse_panic(&e)),
-        }
+        Self::from_raw(builtin_tricks(), langs)
     }
 
     /// Shared cached vocabulary with only ungated rows loaded (`languages = ["en"]`).
@@ -335,9 +339,13 @@ impl TrickLexicon {
     /// Compile a [`TrickLexicon`] from a `tricks.toml` source string for `langs`.
     pub fn from_source(tricks_toml: &str, langs: &[&str]) -> Result<TrickLexicon, LexError> {
         let raw: RawTricks = aterm_toml::from_str(tricks_toml).map_err(LexError::Toml)?;
+        Ok(Self::from_raw(raw, langs))
+    }
+
+    fn from_raw(raw: RawTricks, langs: &[&str]) -> TrickLexicon {
         let mut conflicts = Vec::new();
         let rows = ordered_rows(raw, &mut conflicts);
-        Ok(compile(&rows, &Langs::new(langs), conflicts))
+        compile(&rows, &Langs::new(langs), conflicts)
     }
 
     /// Parse listing rows from a `tricks.toml` source string in [`all_rows`](Self::all_rows) order.
@@ -419,10 +427,7 @@ impl TrickLexicon {
     /// Return all well-formed rows of the embedded `tricks.toml` grouped by language.
     #[must_use]
     pub fn all_rows() -> Vec<TrickRow> {
-        match Self::rows_from_source(BUILTIN_TRICKS) {
-            Ok(rows) => rows,
-            Err(e) => std::panic::panic_any(embedded_parse_panic(&e)),
-        }
+        ordered_rows(builtin_tricks(), &mut Vec::new())
     }
 }
 
@@ -474,14 +479,6 @@ fn push_collapsed(chars: &[char], keep: usize, out: &mut String) {
         }
         at = at.saturating_add(run.max(1));
     }
-}
-
-/// The panic payload for an embedded file that fails to parse — unreachable
-/// for shipped data (the test suite parses it), composed without `format!`.
-fn embedded_parse_panic(e: &LexError) -> String {
-    let mut msg = String::from("embedded tricks vocabulary must parse: ");
-    msg.push_str(&DebugText(e).to_string());
-    msg
 }
 
 /// Resolve the three raw arrays into listing rows: unknown trick ids and

@@ -61,6 +61,184 @@ pub(crate) fn posted_keys() -> u64 {
     POSTED.load(Ordering::Acquire)
 }
 
+/// `NSEventTypeKeyDown`.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) const NS_EVENT_TYPE_KEY_DOWN: usize = 10;
+/// `NSEventTypeKeyUp`.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) const NS_EVENT_TYPE_KEY_UP: usize = 11;
+
+/// Whether an `NSEventType` is a key-down or key-up, the kinds a burst posts.
+#[cfg_attr(any(test, not(target_os = "macos")), allow(dead_code))]
+pub(crate) const fn is_key_kind(kind: usize) -> bool {
+    matches!(kind, NS_EVENT_TYPE_KEY_DOWN | NS_EVENT_TYPE_KEY_UP)
+}
+
+/// One key event, as the main thread can tell a burst's apart from a person's in
+/// `-[NSApp currentEvent]`: its `NSEventType`, virtual keycode and timestamp (seconds since boot).
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PostedKey {
+    pub kind: usize,
+    pub keycode: u16,
+    pub timestamp: f64,
+}
+
+impl PostedKey {
+    /// Whether `seen` is this event: the same kind and key, stamped within [`STAMP_SLACK`].
+    fn is(&self, seen: &Self) -> bool {
+        self.kind == seen.kind
+            && self.keycode == seen.keycode
+            && (self.timestamp - seen.timestamp).abs() <= STAMP_SLACK
+    }
+}
+
+/// How far apart two stamps of one event may read: a stamp that went through
+/// CoreGraphics' integer clock and back (whole nanoseconds, or mach ticks) moves by less.
+const STAMP_SLACK: f64 = 1e-6;
+
+/// How many posted events the ledger keeps waiting for the main thread: every key of four
+/// longest bursts, down and up. Past this many a burst posts no more keys ([`note_posted`]): a
+/// waiting key is never dropped, since one AppKit then dispatched would run as the person's.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+const LEDGER_CAP: usize = 4 * 2 * MAX_COUNT as usize;
+
+/// The key events bursts posted that the main thread has not yet dispatched, in the order they
+/// were posted, and the last one it found, so a second look at the event being dispatched finds
+/// it again.
+#[derive(Debug, Default)]
+struct Ledger {
+    waiting: std::collections::VecDeque<PostedKey>,
+    found: Option<PostedKey>,
+}
+
+impl Ledger {
+    /// How many more keys it can wait for.
+    fn room(&self) -> usize {
+        LEDGER_CAP.saturating_sub(self.waiting.len())
+    }
+
+    /// Wait for every one of `keys`, or for none of them when there is no room for all: it fails
+    /// closed, never dropping a key it waits for.
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+    #[must_use]
+    fn note(&mut self, keys: &[PostedKey]) -> bool {
+        if keys.len() > self.room() {
+            return false;
+        }
+        self.waiting.extend(keys.iter().copied());
+        true
+    }
+
+    /// Whether `seen`, the event being dispatched, is a posted key. A key found clears every key
+    /// of its kind posted before it: one burst posts at a time and notes each key just before its
+    /// post (`hwkey::post`), and AppKit dequeues the key-downs (and the key-ups) in the order they
+    /// were posted, so each of those left the queue before it unseen (an input method or a modal
+    /// panel took it) and would only hold room.
+    fn take(&mut self, seen: &PostedKey) -> bool {
+        if self.found.is_some_and(|found| found.is(seen)) {
+            return true;
+        }
+        let Some(at) = self.waiting.iter().position(|key| key.is(seen)) else {
+            return false;
+        };
+        self.found = self.waiting.remove(at);
+        let mut index = 0;
+        self.waiting.retain(|key| {
+            let earlier = index < at;
+            index += 1;
+            !(earlier && key.kind == seen.kind)
+        });
+        true
+    }
+}
+
+#[cfg(not(test))]
+static LEDGER: std::sync::Mutex<Ledger> = std::sync::Mutex::new(Ledger {
+    waiting: std::collections::VecDeque::new(),
+    found: None,
+});
+
+#[cfg(test)]
+thread_local! {
+    /// The test build's ledger: one per test thread, where its burst and its dispatch both run.
+    static LEDGER: std::cell::RefCell<Ledger> = std::cell::RefCell::new(Ledger::default());
+    /// The test build's stand-in for `-[NSApp currentEvent]` ([`current_key`]).
+    pub(crate) static CURRENT_KEY_STUB: std::cell::Cell<Option<PostedKey>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn with_ledger<R>(f: impl FnOnce(&mut Ledger) -> R) -> R {
+    #[cfg(not(test))]
+    {
+        f(&mut LEDGER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+    #[cfg(test)]
+    {
+        LEDGER.with(|ledger| f(&mut ledger.borrow_mut()))
+    }
+}
+
+/// Set once a burst noted a key in this process: until then no key is a burst's, and the main
+/// thread reads no event to tell (the person's typing pays nothing for `hwkey`).
+static NOTED: AtomicBool = AtomicBool::new(false);
+
+/// Record `keys` (one press: its key-down and key-up) as a burst's, before they are posted, or
+/// refuse them all, unposted, while the ledger waits for as many keys as it can hold.
+///
+/// # Errors
+///
+/// The `ERR hwkey: busy` reply line when the ledger has no room for all of `keys`.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn note_posted(keys: &[PostedKey]) -> Result<(), String> {
+    if !with_ledger(|ledger| ledger.note(keys)) {
+        return Err(format!(
+            "ERR hwkey: busy: {LEDGER_CAP} keys bursts posted are still waiting for aterm to \
+             take them, so this burst posts no more\n"
+        ));
+    }
+    NOTED.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// Held across each press's note and post (`hwkey::post`), so bursts on several control
+/// connections post one at a time and the ledger waits for keys in the order AppKit queues them
+/// ([`Ledger::take`]).
+#[cfg(target_os = "macos")]
+static POSTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The key event AppKit is dispatching now (a test build's stand-in: [`CURRENT_KEY_STUB`]).
+fn current_key() -> Option<PostedKey> {
+    #[cfg(test)]
+    {
+        CURRENT_KEY_STUB.with(std::cell::Cell::get)
+    }
+    #[cfg(all(not(test), target_os = "macos"))]
+    {
+        crate::platform::current_key_event()
+    }
+    #[cfg(all(not(test), not(target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Whether the event AppKit is dispatching now is a key a burst posted: it takes the person's own
+/// key path (a menu's key equivalent, a binding, the focused view) with no gesture mark of its
+/// own, and it is a control client's.
+pub(crate) fn current_event_posted() -> bool {
+    NOTED.load(Ordering::Acquire) && current_key().is_some_and(event_posted)
+}
+
+/// Whether `seen`, a key event a native monitor holds before AppKit dispatches it, is a key a
+/// burst posted ([`current_event_posted`] for the event in dispatch). Taken from the ledger once
+/// found, as a dispatch takes it.
+pub(crate) fn event_posted(seen: PostedKey) -> bool {
+    NOTED.load(Ordering::Acquire) && with_ledger(|ledger| ledger.take(&seen))
+}
+
 /// One burst: `count` presses `interval_ms` apart, each posted by `post_one`, with the gate read
 /// before every key. Once `front` is set the burst stops with nothing more posted, and its `Err`
 /// says how many were. Each key is counted into `posted` before `post_one` runs. A `post_one`
@@ -355,9 +533,6 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
 
     use crate::appkit;
 
-    const NS_EVENT_TYPE_KEY_DOWN: usize = 10;
-    const NS_EVENT_TYPE_KEY_UP: usize = 11;
-
     if window_number == 0 {
         return Err("ERR hwkey: no frontmost AppKit window to post into\n".to_string());
     }
@@ -447,16 +622,33 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
                 if down.is_null() {
                     return Err("ERR hwkey: NSEvent construction failed\n".to_string());
                 }
+                let up = key_event(NS_EVENT_TYPE_KEY_UP);
+                // The main thread tells the key from a person's by these, as it dispatches it
+                // (`current_event_posted`), so it is recorded before AppKit can dispatch it.
+                // SAFETY: `-type` (`-(NSEventType)`, an `NSUInteger`) and `-timestamp`
+                // (`-(NSTimeInterval)`) are scalar getters on a live key event this thread built
+                // and has not yet posted.
+                let stamp = |event: Id| unsafe {
+                    PostedKey {
+                        kind: appkit::send_usize(event, sel!(type)),
+                        keycode: spec.keycode,
+                        timestamp: appkit::send_f64(event, sel!(timestamp)),
+                    }
+                };
+                let press: Vec<Id> = [down, up].into_iter().filter(|e| !e.is_null()).collect();
+                let keys: Vec<PostedKey> = press.iter().map(|&event| stamp(event)).collect();
+                let _order = POSTING
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                note_posted(&keys)?;
                 // SAFETY: `-postEvent:atStart:` is `-(void)(NSEvent *, BOOL)` on the shared
                 // application with a live event; AppKit documents it as safe from any thread, and
                 // this runs on the control thread.
                 unsafe {
                     let post: unsafe extern "C-unwind" fn(Id, Sel, Id, Bool) =
                         aterm_objc::checked_msg();
-                    post(app, sel!(postEvent:atStart:), down, Bool::NO);
-                    let up = key_event(NS_EVENT_TYPE_KEY_UP);
-                    if !up.is_null() {
-                        post(app, sel!(postEvent:atStart:), up, Bool::NO);
+                    for event in press {
+                        post(app, sel!(postEvent:atStart:), event, Bool::NO);
                     }
                 }
                 Ok(())
@@ -518,7 +710,109 @@ pub(crate) fn post(_spec: &HwKeySpec, _window_number: i64) -> Result<u32, String
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    use super::{FLAG_CONTROL, FLAG_FUNCTION, FLAG_SHIFT, MAX_COUNT, parse_hwkey, run_burst};
+    use super::{
+        CURRENT_KEY_STUB, FLAG_CONTROL, FLAG_FUNCTION, FLAG_SHIFT, LEDGER_CAP, Ledger, MAX_COUNT,
+        NS_EVENT_TYPE_KEY_DOWN, NS_EVENT_TYPE_KEY_UP, PostedKey, current_event_posted, note_posted,
+        parse_hwkey, run_burst,
+    };
+
+    /// A FULL LEDGER REFUSES KEYS RATHER THAN FORGET ONE: every posted key must be found when
+    /// AppKit dispatches it, however many wait ahead of it, or it runs as the person's (its ⌘V
+    /// pastes the clipboard). So once the ledger waits for all it can hold, a burst's next press
+    /// is refused whole, unposted (`ERR hwkey: busy`), and the oldest waiting key is still found;
+    /// a key found clears every key of its kind posted before it (AppKit took those unseen, an
+    /// input method say), which makes room again, and leaves the other kind waiting.
+    /// NEGATIVE CONTROL: with `Ledger::note` dropping the oldest waiting key at the cap and
+    /// taking the new one (as the branch had it at `0e59d97e00`), the press past the cap was
+    /// taken.
+    #[test]
+    fn a_full_ledger_refuses_keys_rather_than_forget_one() {
+        let key = |n: u32, kind: usize| PostedKey {
+            kind,
+            keycode: 9,
+            timestamp: 3_000.0 + f64::from(n),
+        };
+        let half = u32::try_from(LEDGER_CAP / 2).expect("a small cap");
+        let down = |n| key(n, NS_EVENT_TYPE_KEY_DOWN);
+        let up = |n| key(n, NS_EVENT_TYPE_KEY_UP);
+
+        let mut ledger = Ledger::default();
+        for n in 0..half {
+            assert!(ledger.note(&[down(n), up(n)]), "press {n}");
+        }
+        assert_eq!(ledger.room(), 0, "PRECONDITION: full");
+        assert!(!ledger.note(&[down(half), up(half)]), "past the cap");
+        assert!(ledger.take(&down(0)), "the oldest key is still found");
+        assert!(!ledger.note(&[down(half), up(half)]), "no room for a press");
+
+        assert!(ledger.take(&down(9)), "a later key-down");
+        assert_eq!(
+            ledger.room(),
+            1 + 9,
+            "it and the key-downs before it are gone"
+        );
+        assert!(!ledger.take(&down(5)), "a key-down AppKit took unseen");
+        assert!(ledger.take(&up(5)), "the key-ups wait on");
+        assert!(ledger.note(&[down(half), up(half)]), "room again");
+
+        let mut refused = Ok(());
+        for n in 0..=half {
+            refused = note_posted(&[down(n), up(n)]);
+            if refused.is_err() {
+                assert_eq!(n, half, "refused only at the cap");
+            }
+        }
+        let refused = refused.expect_err("a burst past the cap is refused");
+        assert!(refused.starts_with("ERR hwkey: busy"), "{refused}");
+    }
+
+    /// THE MAIN THREAD TELLS A POSTED KEY FROM A PERSON'S: a key event the burst noted is found
+    /// as it is dispatched, with a stamp CoreGraphics' integer clock moved by a nanosecond, and
+    /// again on a second look at the same event (a menu's key equivalent, then a view); the
+    /// person's key with another stamp, kind or keycode is not, and takes nothing from the ledger;
+    /// a found key is not found again once another was.
+    /// NEGATIVE CONTROL: with `STAMP_SLACK` at 0 the posted key with its rounded stamp was not
+    /// found.
+    #[test]
+    fn the_main_thread_tells_a_posted_key_from_a_persons() {
+        let at = |key: PostedKey| {
+            CURRENT_KEY_STUB.with(|current| current.set(Some(key)));
+            let posted = current_event_posted();
+            CURRENT_KEY_STUB.with(|current| current.set(None));
+            posted
+        };
+        let down = PostedKey {
+            kind: NS_EVENT_TYPE_KEY_DOWN,
+            keycode: 9,
+            timestamp: 5_000.123_456_789,
+        };
+        note_posted(&[down]).expect("room");
+        assert!(!current_event_posted(), "no event is being dispatched");
+        let later = PostedKey {
+            timestamp: 5_000.2,
+            ..down
+        };
+        assert!(!at(later), "the person's ⌘V a moment later");
+        let up = PostedKey {
+            kind: NS_EVENT_TYPE_KEY_UP,
+            ..down
+        };
+        assert!(!at(up), "another kind");
+        assert!(!at(PostedKey { keycode: 8, ..down }), "another key");
+        let rounded = PostedKey {
+            timestamp: 5_000.123_456_79,
+            ..down
+        };
+        assert!(
+            at(rounded),
+            "the posted key, its stamp in whole nanoseconds"
+        );
+        assert!(at(down), "a second look at it");
+
+        note_posted(&[up]).expect("room");
+        assert!(at(up), "its key-up");
+        assert!(!at(down), "the key-down, once the key-up was found");
+    }
 
     /// System State (or a gateway card) coming to the front after the second key of five stops
     /// the burst, which says how many it posted; every posted key was counted before its post.
@@ -651,11 +945,18 @@ mod tests {
     }
 
     #[test]
-    fn pacing_tokens_are_additive_and_bounded() {
+    fn pacing_and_modifier_tokens_combine_and_enforce_bounds() {
         let s = parse_hwkey("x count=200 interval=25").unwrap();
         assert_eq!(s.count, 200);
         assert_eq!(s.interval_ms, 25);
         assert_eq!(s.keycode, parse_hwkey("x").unwrap().keycode);
+
+        let combined = parse_hwkey("x mods=shift mods=ctrl").unwrap();
+        assert_eq!(combined.flags, FLAG_SHIFT | FLAG_CONTROL);
+        assert_eq!(
+            parse_hwkey("shift+x mods=ctrl").unwrap().flags,
+            FLAG_SHIFT | FLAG_CONTROL
+        );
 
         assert!(parse_hwkey("x count=0").is_err());
         assert!(parse_hwkey(&format!("x count={}", MAX_COUNT + 1)).is_err());

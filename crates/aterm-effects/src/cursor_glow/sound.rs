@@ -28,7 +28,9 @@ impl CursorGlow {
     /// Record one sound cue (drops when the backlog is full).
     #[inline]
     pub(super) fn cue_sound(&mut self, kind: crate::trail_sound::SoundKind, col: u16) {
-        self.cue_sound_at(kind, col, self.blaze());
+        if self.sound_cues.len() < Self::MAX_SOUND_CUES {
+            self.cue_sound_at(kind, col, self.blaze());
+        }
     }
 
     /// [`Self::cue_sound`] with the blaze supplied rather than sampled, for the key-time click.
@@ -167,6 +169,9 @@ impl CursorGlow {
     /// The standing heat/flare cooled to `now` as the next tick will cool them: [`Self::keyed_blaze`] without the cadence charge, for a cue whose press earns no echo (the Shift lift).
     #[inline]
     pub(super) fn cooled_blaze(&self, now: Instant) -> (f32, f32) {
+        if self.heat == 0.0 && self.flare == 0.0 {
+            return (0.0, 0.0);
+        }
         let dt = match self.heat_at {
             Some(t) => now.saturating_duration_since(t).as_secs_f32(),
             None => 0.0,

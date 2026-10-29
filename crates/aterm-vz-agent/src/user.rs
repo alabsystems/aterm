@@ -26,7 +26,7 @@ pub struct User {
 fn accounts(passwd: &str) -> impl Iterator<Item = User> + '_ {
     passwd.lines().filter_map(|line| {
         let f: Vec<&str> = line.split(':').collect();
-        if f.len() < 7 {
+        if f.len() < 7 || f[0].is_empty() || f[0].starts_with('#') {
             return None;
         }
         Some(User {
@@ -67,7 +67,7 @@ pub fn groups(group: &str, user: &User) -> Vec<u32> {
     let mut out = vec![user.gid];
     for line in group.lines() {
         let f: Vec<&str> = line.split(':').collect();
-        if f.len() < 4 {
+        if f.len() < 4 || f[0].is_empty() || f[0].starts_with('#') {
             continue;
         }
         let Ok(gid) = f[2].parse::<u32>() else {
@@ -136,12 +136,19 @@ bad:x:nan:dana
         let two = format!("{PASSWD}other:x:600:600::/home/other.guest:/bin/sh\n");
         let refused = lane_user(&two).unwrap_err();
         assert!(refused.contains("dana, other"), "{refused}");
+        let commented = format!(
+            "#commented:x:700:700::/home/#commented.guest:/bin/sh\n\
+             :x:701:701::/home/.guest:/bin/sh\n\
+             {PASSWD}"
+        );
+        assert_eq!(lane_user(&commented).unwrap().name, "dana");
     }
 
     #[test]
     fn groups_are_the_primary_first_then_each_listing_by_exact_name_once() {
         let user = lane_user(PASSWD).unwrap();
-        assert_eq!(groups(GROUP, &user), [1001, 4, 27, 44]);
+        let group = format!("#wheel:x:99:dana\n:x:98:dana\n{GROUP}");
+        assert_eq!(groups(&group, &user), [1001, 4, 27, 44]);
         assert_eq!(
             identity(PASSWD, GROUP).unwrap(),
             Identity::Switch {

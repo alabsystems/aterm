@@ -9,7 +9,7 @@ use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 
 use super::*;
-use crate::harness::upgrade::{Facts, Step};
+use crate::harness::upgrade::{Facts, Press, Step};
 use crate::harness::upgrade_drive::watch::look_word;
 use crate::harness::upgrade_drive::{WATCH_GAP, at_point};
 
@@ -73,10 +73,23 @@ fn phase_of(s: &State) -> Phase {
 /// Where a look is taken.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Look {
-    /// At a point the loop offers: at a settled break, the break's step (`background_point`).
+    /// At a point the loop offers: at a settled break, the break's step (`background_point`). A
+    /// standing press is not this step's: it stands aside ([`Press::Stands`]).
     Point,
-    /// The watch's dry read, off any point: it never knows a break.
+    /// The watch's dry read, off any point: it never knows a break, and reads a standing press
+    /// as its lane would ([`Press::Acting`]).
     Read,
+    /// The press's own lane (`upgrade_drive::press`), off any point.
+    Press,
+}
+
+/// The owner's word in state `s`: their Now (a press writes one too), else none.
+fn request_of(s: &State) -> Request {
+    if s["now"] == 1 {
+        Request::Now
+    } else {
+        Request::None
+    }
 }
 
 fn facts(s: &State, look: Look) -> Facts {
@@ -100,6 +113,11 @@ fn facts(s: &State, look: Look) -> Facts {
         failed_s: if clock { upgrade::RETRY_S } else { 60 },
         rung: upgrade::rung(BEHIND[0]),
         still_s: 3_600,
+        press: match (s["pressed"], look) {
+            (0, _) => Press::None,
+            (_, Look::Point) => Press::Stands,
+            (_, Look::Read | Look::Press) => Press::Acting,
+        },
         ..Facts::default()
     };
     match s["posture"] {
@@ -125,7 +143,7 @@ fn facts(s: &State, look: Look) -> Facts {
 fn real_step(s: &State, look: Look) -> (Step, Facts) {
     let f = facts(s, look);
     let step = upgrade::requested_step(
-        &Request::None,
+        &request_of(s),
         &phase_of(s),
         &f,
         s["ready"] == 1,
@@ -140,7 +158,7 @@ fn real_step(s: &State, look: Look) -> (Step, Facts) {
     (step, f)
 }
 
-fn dry_word(step: &Step, f: &Facts) -> String {
+fn dry_word(s: &State, step: &Step, f: &Facts) -> String {
     let act = match step {
         Step::Wait(why) => return format!("wait:{why}"),
         Step::Announce => "would-announce".to_string(),
@@ -150,7 +168,7 @@ fn dry_word(step: &Step, f: &Facts) -> String {
         Step::Rearm => format!("would-rearm:{}", upgrade::GAVE_UP),
         Step::Void(why) => format!("would-void:{why}"),
     };
-    match upgrade::held_point(&Request::None, step, f, NOW, TARGET) {
+    match upgrade::held_point(&request_of(s), step, f, NOW, TARGET) {
         Some(held) => at_point(&act, &upgrade::wait_word(held, &f.status)),
         None => act,
     }
@@ -206,9 +224,52 @@ fn the_real_reducer_is_the_derived_machine() {
     );
     let kept = latched("keep");
     let buggy = interp::with_buggy(&harness_upgrade_progress_model(), 1);
-    let (mut idle_acts, mut break_acts, mut reads, mut acting) = (0, 0, 0, 0);
+    let (mut idle_acts, mut break_acts, mut reads, mut acting, mut pressed) = (0, 0, 0, 0, 0);
     let mut caught: BTreeSet<&str> = BTreeSet::new();
     for s in states.iter().filter(|s| s["phase"] <= 2) {
+        let (step, f) = real_step(s, Look::Press);
+        let presses = s["pressed"] == 1 && lands(step) == Some(3);
+        assert_eq!(
+            today.action_enabled("RestartOnPress", s),
+            presses,
+            "RestartOnPress at {s:?}: the press's step {step:?}\n{f:?}"
+        );
+        if presses {
+            let mut after = s.clone();
+            assert!(today.fire("RestartOnPress", &mut after));
+            assert_eq!(after["phase"], 3, "{s:?}: {step:?}");
+            pressed += 1;
+            if s["work"] == 1 {
+                // The press read as the Now it writes (`PressReadAsNow`): no press, the owner's
+                // Now alone.
+                let as_now = Facts {
+                    press: Press::None,
+                    ..f.clone()
+                };
+                let now_step = upgrade::requested_step(
+                    &Request::Now,
+                    &phase_of(s),
+                    &as_now,
+                    s["ready"] == 1,
+                    NOW,
+                    TARGET,
+                );
+                if lands(now_step) != Some(3) {
+                    caught.insert("PressReadAsNow");
+                }
+            }
+        }
+        if buggy.action_enabled("PressPassesInput", s) {
+            assert_eq!(lands(step), None, "{s:?}: the press waits for {f:?}");
+            caught.insert("PressPassesInput");
+        }
+        if buggy.action_enabled("NowAsPress", s) {
+            for look in [Look::Point, Look::Read] {
+                let (step, _) = real_step(s, look);
+                assert_ne!(lands(step), Some(3), "{s:?} at {look:?}: {step:?}");
+            }
+            caught.insert("NowAsPress");
+        }
         for (action, posture) in [("StepAtIdle", 2), ("RestartAtIdle", 2), ("StepAtBreak", 1)] {
             let (step, f) = real_step(s, Look::Point);
             let landed = lands(step);
@@ -248,7 +309,7 @@ fn the_real_reducer_is_the_derived_machine() {
             caught.insert("RestartOverWork");
         }
         let (step, f) = real_step(s, Look::Read);
-        let dry = dry_word(&step, &f);
+        let dry = dry_word(s, &step, &f);
         let word = look_word(&dry, true, || f.status.clone());
         assert!(!word.is_empty(), "{s:?}: every read is worded: `{dry}`");
         let mut looked = s.clone();
@@ -294,13 +355,16 @@ fn the_real_reducer_is_the_derived_machine() {
         }
     }
     assert!(
-        idle_acts > 0 && break_acts > 0 && reads > 0 && acting > 0,
-        "{idle_acts} {break_acts} {reads} {acting}"
+        idle_acts > 0 && break_acts > 0 && reads > 0 && acting > 0 && pressed > 0,
+        "{idle_acts} {break_acts} {reads} {acting} {pressed}"
     );
     assert_eq!(
         caught,
         BTreeSet::from([
             "0.94's break arm",
+            "NowAsPress",
+            "PressPassesInput",
+            "PressReadAsNow",
             "RecordedWordStands",
             "RestartOverWork",
             "the posture-blind word",
@@ -323,6 +387,7 @@ fn the_real_reducer_is_the_derived_machine() {
         anchored,
         [
             ("RestartAtIdle", "gate_restart"),
+            ("RestartOnPress", "press_gate"),
             ("StepAtBreak", "break_step"),
             ("StepAtIdle", "next_step"),
             ("Watch", "watch_with"),
@@ -334,6 +399,7 @@ fn the_real_reducer_is_the_derived_machine() {
         "HarnessUpgradeProgress::StepAtIdle @ next_step",
         "HarnessUpgradeProgress::StepAtBreak @ break_step",
         "HarnessUpgradeProgress::RestartAtIdle @ gate_restart",
+        "HarnessUpgradeProgress::RestartOnPress @ press_gate",
     ] {
         assert!(entered.contains(id), "{id} entered: {entered:?}");
     }
@@ -351,17 +417,27 @@ fn quiet_facts(s: &State) -> Facts {
 
 fn read_word(s: &State, f: &Facts) -> String {
     let step = upgrade::requested_step(
-        &Request::None,
+        &request_of(s),
         &phase_of(s),
         f,
         s["ready"] == 1,
         NOW,
         TARGET,
     );
-    look_word(&dry_word(&step, f), true, || f.status.clone())
+    look_word(&dry_word(s, &step, f), true, || f.status.clone())
 }
 
 fn quiet_truth(s: &State) -> Option<BTreeSet<i64>> {
+    if s["pressed"] == 1 {
+        // A standing press waits only for a held tab, a wall (a limit whose reset passed is
+        // none: the quiet read sees it gone) or a running turn.
+        return match (s["posture"], s["reset"]) {
+            (0, _) => Some(BTreeSet::from([0])),
+            (3, 0) => Some(BTreeSet::from([2])),
+            (4, _) => Some(BTreeSet::from([1])),
+            _ => None,
+        };
+    }
     if s["phase"] == 2 && s["clock"] == 0 {
         return Some(BTreeSet::from([0]));
     }
@@ -428,14 +504,14 @@ fn the_quiet_upgrades_read_records_what_holds_its_restart() {
             caught.insert("main before C9");
         }
         let step = upgrade::requested_step(
-            &Request::None,
+            &request_of(s),
             &phase_of(s),
             &f,
             s["ready"] == 1,
             NOW,
             TARGET,
         );
-        let dry = dry_word(&step, &f);
+        let dry = dry_word(s, &step, &f);
         let act = dry
             .split_once(crate::harness::upgrade_drive::AT_POINT)
             .map_or(dry.as_str(), |(act, _)| act);
@@ -504,6 +580,14 @@ fn row(s: &State, behind: u64, progress: u64) -> Row {
             (2, 1) => NOW - LIMIT_GRACE_S - 60,
             (2, _) => NOW + 3_600,
             _ => 0,
+        },
+        request: request_of(s),
+        request_at: if s["now"] == 1 { progress } else { 0 },
+        pressed_at: if s["pressed"] == 1 { progress } else { 0 },
+        pressed_to: if s["pressed"] == 1 {
+            pending(3_600).to
+        } else {
+            String::new()
         },
         ..pending(3_600)
     }
@@ -578,12 +662,14 @@ fn the_real_view_is_the_derived_machine() {
         for behind in BEHIND {
             let r = row(s, behind, NOW - 60);
             let proj = progress_projection(&r, NOW);
-            let mut want: BTreeMap<&str, i64> = ["phase", "rearmed", "cause", "clock"]
-                .into_iter()
-                .map(|k| (k, s[k]))
-                .collect();
+            let mut want: BTreeMap<&str, i64> =
+                ["phase", "rearmed", "cause", "clock", "pressed", "now"]
+                    .into_iter()
+                    .map(|k| (k, s[k]))
+                    .collect();
             want.insert("reset", if s["cause"] == 2 { s["reset"] } else { 0 });
             assert_eq!(proj, want, "{s:?}\n{r:?}");
+            assert_eq!(r.word_in_force(NOW), s["now"] == 1, "{s:?}");
             assert_eq!(
                 proj["cause"] == 0,
                 r.overdue_cause(NOW) == OWN_WORK,

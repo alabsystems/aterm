@@ -128,7 +128,7 @@ fn unreadable_login_bindings_produce_a_structured_refusal_for_every_pool() {
             let mut out = Vec::new();
             let mut err = Vec::new();
             assert_eq!(
-                run_accounts_report(cli, &env, json, &mut out, &mut err),
+                run_accounts_report((cli, Launch::default()), &env, json, &mut out, &mut err),
                 ExitCode::from(1)
             );
             assert!(
@@ -149,7 +149,7 @@ fn unreadable_login_bindings_produce_a_structured_refusal_for_every_pool() {
         let mut out = Vec::new();
         let mut err = Vec::new();
         assert_eq!(
-            run_accounts_use(cli, &env, Some("main"), &mut out, &mut err),
+            run_accounts_use((cli, &NoUsage), &env, Some("main"), &mut out, &mut err),
             ExitCode::from(1)
         );
         assert!(!store.state_file().exists(), "no selection was persisted");
@@ -178,14 +178,14 @@ impl AccountsHost for FreshUsage {
         0
     }
     fn usage_reader(&self) -> Option<crate::harness::accounts_pool::ReadUsage<'static>> {
-        Some(&|_, _, now| {
+        Some(&|_: Cli, _: &Path, _: Option<&str>, now: i64| {
             Some(crate::harness::codex_app_login::Usage {
                 sample: accounts::Sample {
                     session_pct: Some(100),
                     at: now,
                     ..accounts::Sample::default()
                 },
-                wall: Some(("five_hour", Some(now + 3600))),
+                walls: vec![("five_hour", Some(now + 3600))],
             })
         })
     }
@@ -244,14 +244,27 @@ impl AccountsHost for NoUsage {
         0
     }
     fn usage_reader(&self) -> Option<crate::harness::accounts_pool::ReadUsage<'static>> {
-        Some(&|_, _, _| panic!("an unreadable pool must not start a usage probe"))
+        Some(&|_: Cli,
+               _: &Path,
+               _: Option<&str>,
+               _: i64|
+         -> Option<crate::harness::codex_app_login::Usage> {
+            panic!("an unreadable pool must not start a usage probe")
+        })
     }
 }
 
+/// A pool whose records do not read (its state, its bindings or its roster), or whose roster a
+/// rule refuses (a Kimi row with an email and no region, which its report refuses too), refuses
+/// its statistics before any usage read, writing nothing: exit 1, why on standard error, and
+/// under `--json` `refused` with no rows.
 #[test]
 fn unreadable_pools_refuse_statistics_before_provider_io() {
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
-        for damaged in ["state", "logins", "roster"] {
+        for damaged in ["state", "logins", "roster", "region"] {
+            if damaged == "region" && cli != Cli::Kimi {
+                continue;
+            }
             let tmp = tmp_dir("stats-state-refusal");
             let env = env_at(&tmp);
             let path = env.accounts_roster_for(cli).unwrap();
@@ -262,12 +275,17 @@ fn unreadable_pools_refuse_statistics_before_provider_io() {
             .unwrap();
             let store = env.accounts_store_for(cli).unwrap();
             store.ensure().unwrap();
-            let damaged = match damaged {
-                "state" => store.state_file(),
-                "logins" => store.logins_file(),
-                _ => path,
+            let (damaged, text) = match damaged {
+                "state" => (store.state_file(), "{"),
+                "logins" => (store.logins_file(), "{"),
+                "roster" => (path, "{"),
+                _ => (
+                    path,
+                    "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\nemail = \
+                     \"main@example.com\"\n",
+                ),
             };
-            std::fs::write(&damaged, "{").unwrap();
+            std::fs::write(&damaged, text).unwrap();
             let before = every_file(tmp.path());
             for json in [false, true] {
                 let mut out = Vec::new();

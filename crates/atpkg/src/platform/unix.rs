@@ -392,6 +392,30 @@ pub fn dir_meta_is_system(meta: &Metadata) -> bool {
     meta.uid() == 0 && meta.mode() & 0o022 == 0
 }
 
+/// Whether the CALLING user may take `path`'s name out of the folder holding it (rename it away
+/// or remove it), as the kernel authorizes that now. On macOS `access(2)` is asked for
+/// `_DELETE_OK` (`<sys/unistd.h>`; `libc` has no name for it), which weighs what a rename of it
+/// weighs: its own flags and ACL (`uchg`, `schg`, an append-only flag, a `deny delete` entry) and
+/// its folder's (its write bit, a `delete_child` entry, the sticky bit). Elsewhere the folder's
+/// write bit alone ([`dir_writable_by_caller`]); an immutable flag there is not read.
+#[must_use]
+pub fn may_take_name(path: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        /// `_DELETE_OK` of `<sys/unistd.h>`: the right to delete the file or folder.
+        const DELETE_OK: libc::c_int = 1 << 12;
+        let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        // SAFETY: `c` is a NUL-terminated C string that outlives the call; `access` only reads it.
+        unsafe { libc::access(c.as_ptr(), DELETE_OK) == 0 }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        path.parent().is_some_and(dir_writable_by_caller)
+    }
+}
+
 /// Whether a directory's metadata says it is private-write-safe.
 #[must_use]
 pub fn dir_meta_is_private(meta: &Metadata) -> bool {
@@ -565,10 +589,27 @@ pub fn shim_executable_to_env(
     env: &crate::shim_env::ShimEnv,
 ) -> io::Result<crate::lay::Executable> {
     let route = crate::compat::route_for_shim(shim, target);
-    Ok(crate::lay::Executable::new(
-        shim,
-        super::sh_shim_content_routed(target, env, route.as_deref()),
-    ))
+    let mut body = super::sh_shim_content_routed(target, env, route.as_deref());
+    if cfg!(target_os = "macos")
+        && let Some(tool) = target.file_name().and_then(|word| word.to_str())
+        && matches!(tool, "targo" | "targo-tippy")
+    {
+        let standing = crate::metadata_io::read_bounded_regular_utf8(shim, 64 << 10)
+            .ok()
+            .and_then(|text| crate::build_cache::registered::shim_helper(&text));
+        let helper = crate::stub::Embedder::this_process()
+            .embed(standing.as_deref())
+            .or(standing);
+        if let Some(helper) = helper {
+            let call = crate::build_cache::registered::shim_call(&helper, tool);
+            body = body.replacen(
+                "# aterm: build intermediates out of Spotlight\n",
+                &format!("{call}# aterm: build intermediates out of Spotlight\n"),
+                1,
+            );
+        }
+    }
+    Ok(crate::lay::Executable::new(shim, body))
 }
 
 /// The `agents/` twin's shim.
@@ -764,7 +805,7 @@ extern "C" fn forward_to_child(sig: libc::c_int) {
 }
 
 /// Leave this process the way `status` says its child left.
-#[must_use]
+#[must_use = "return or inspect the child exit status"]
 pub fn exit_code_like(status: std::process::ExitStatus) -> std::process::ExitCode {
     use std::os::unix::process::ExitStatusExt as _;
     if let Some(code) = status.code() {

@@ -25,7 +25,7 @@ pub(crate) struct TargetStreams {
     pub screen: bool,
     /// Emit `DELTA <sid> seq=<n> cursor <row> <col> <visible> <style>` on any caret change (position, DECSCUSR style, or DECTCEM visibility) — even at an unchanged seq.
     pub cursor: bool,
-    /// The lifecycle digest: `EVENT <sid> block-complete <id> exit=<code>` on OSC 133 D, `EVENT <sid> turn <id> submitted=<0|1> status=<..> dur_ms=<..>` per completed turn (the turn ledger), `EVENT <sid> title <pct>` on an OSC 0/2 title change, `EVENT <sid> bell total=<n>` on a BEL, the timeline kinds [`timeline_wire_kind`] carries (`meta field=<f> value=<pct|->`, `agent`, `status`, `human`, `render`, the fabric digest), and at retirement `EVENT <sid> closing reason=<token> by=<sid|human|ctl|bridge|->` then `EVENT <sid> exited`.
+    /// The lifecycle digest: `EVENT <sid> block-complete <id> exit=<code>` on OSC 133 D, `EVENT <sid> turn <id> submitted=<0|1> status=<..> dur_ms=<..>` per completed turn (the turn ledger), `EVENT <sid> title <pct>` on an OSC 0/2 title change, `EVENT <sid> bell total=<n>` on a BEL, the timeline kinds [`timeline_wire_kind`] carries (`meta field=<f> value=<pct|->`, `agent`, `status`, `human`, `render`, a program's own `program state=<w>[ kind=<k>] rev=<id>` and `act <act> rev=<id>`, the fabric digest), and at retirement `EVENT <sid> closing reason=<token> by=<sid|human|ctl|bridge|->` then `EVENT <sid> exited`.
     pub events: bool,
     /// Emit `DELTA <sid> seq=<n> cells <nbytes>\n<styled-json>` when the styled frame changes — the LOSSLESS styled-screen frame (Item 1's payload) pushed live, so an outer agent sees the inner TUI's colour/attrs, not plaintext.
     pub cells: bool,
@@ -563,7 +563,7 @@ fn drain_title_event(
     }
 }
 
-/// Scan the target's event timeline past `last_id` and push each record kind [`timeline_wire_kind`] carries as `EVENT <sid> <kind>[ <payload>]`, the payload being the record's own pre-encoded tail (`meta`'s is `field=<f> value=<pct|->`). It reads the session log's view: a row id past the watermark the log issued and no longer holds is said first as `GAP <sid> events-dropped=<n>`.
+/// Scan the target's event timeline past `last_id` and push each record kind [`timeline_wire_kind`] carries as `EVENT <sid> <kind>[ <payload>]`, the payload being the record's own pre-encoded tail (`meta`'s is `field=<f> value=<pct|->`), a program's claim's as [`timeline_wire_payload`] words it. It reads the session log's view: a row id past the watermark the log issued and no longer holds is said first as `GAP <sid> events-dropped=<n>`.
 pub(crate) fn drain_timeline_events(
     tl: &crate::session_timeline::SessionTimeline,
     sid: &str,
@@ -583,13 +583,33 @@ pub(crate) fn drain_timeline_events(
         let Some(kind) = timeline_wire_kind(e.kind) else {
             continue;
         };
-        if e.payload.is_empty() {
+        let payload = timeline_wire_payload(e);
+        if payload.is_empty() {
             out.push_str(&format!("EVENT {sid} {kind}\n"));
         } else {
-            out.push_str(&format!("EVENT {sid} {kind} {}\n", e.payload));
+            out.push_str(&format!("EVENT {sid} {kind} {payload}\n"));
         }
     }
     Some(hi)
+}
+
+/// A PROGRAM'S CLAIM IS PUSHED AS THE CLAIM AND ITS ROW, NEVER AS AN AGENT'S WORD: a `program-state` row (`state=<w> kind=<k|->`) is pushed as `program state=<w>[ kind=<k>] rev=<id>` (`kind=` only on a blocked state that names one) and a self-claim's `harness-act` row (`act=<act> holder=<h>`) as `act <act> rev=<id>`, `<id>` the row's own id (`timeline`'s `event <id>`), so a codex's or Grok Build's moves and a self-claim's acts reach an `events` watcher while `agent` stays the screen verdict's alone. Every other row's payload is its own, verbatim.
+fn timeline_wire_payload(e: &crate::session_timeline::TimelineEvent) -> std::borrow::Cow<'_, str> {
+    match e.kind {
+        crate::session_timeline::PROGRAM_STATE => {
+            let shown = e.payload.strip_suffix(" kind=-").unwrap_or(&e.payload);
+            std::borrow::Cow::Owned(format!("{shown} rev={}", e.id))
+        }
+        crate::session_timeline::HARNESS_ACT => {
+            let act = e
+                .payload
+                .strip_prefix("act=")
+                .and_then(|tail| tail.split(' ').next())
+                .unwrap_or("-");
+            std::borrow::Cow::Owned(format!("{act} rev={}", e.id))
+        }
+        _ => std::borrow::Cow::Borrowed(&e.payload),
+    }
 }
 
 fn drain_resize_events(
@@ -638,6 +658,8 @@ pub(crate) fn timeline_wire_kind(kind: &str) -> Option<&'static str> {
         crate::harness_policy_verb::HARNESS_POLICY_EVENT => Some("harness-policy"),
         crate::sys_host::JOB_CHANGE => Some("job"),
         crate::occupancy_wakes::WAKE_READY => Some("wake"),
+        crate::session_timeline::PROGRAM_STATE => Some("program"),
+        crate::session_timeline::HARNESS_ACT => Some("act"),
         other => crate::fabric::fabric_event_wire_kind(other),
     }
 }
@@ -3687,6 +3709,215 @@ mod tests {
              EVENT 7 task rev=2 state=exited attention=0 why=exit exit=3\n"
         );
         assert_eq!(wm, Some(2));
+    }
+
+    /// What [`evented_tab`] hands a test: the app, the tab's engine, timeline and watchers, the
+    /// watch, and the instant of the next sweep.
+    type EventedTab = (
+        crate::App,
+        Arc<Mutex<Terminal>>,
+        Arc<Mutex<crate::session_timeline::SessionTimeline>>,
+        Arc<Watchers>,
+        Watch,
+        std::time::Instant,
+    );
+
+    /// A stub tab under `program` in front (group 4242) on a fresh headless app, swept at `t0`
+    /// and two seconds on, so what the program's arrival publishes (`agent unknown` under a
+    /// codex) and the status it settles on come before the watch, and an `events` watch on it
+    /// seeded at its view's head: the app, the tab's engine, timeline and watchers, the watch, and the
+    /// instant of the next sweep.
+    fn evented_tab(program: &str) -> EventedTab {
+        let mut app = crate::App::headless_for_test();
+        let sid = app.next_session_id;
+        app.push_stub_tab(crate::WindowId(0), crate::stub_session(sid));
+        let pooled = app.pool.get(sid).expect("pooled");
+        let target = ResolvedTarget {
+            local_id: sid,
+            term: Arc::clone(&pooled.term),
+            src: WatchSource::of(&pooled.ctx),
+        };
+        let (term, timeline, watchers) = (
+            Arc::clone(&pooled.term),
+            Arc::clone(&pooled.ctx.timeline),
+            Arc::clone(&pooled.ctx.watchers),
+        );
+        {
+            let mut tl = timeline.lock().unwrap();
+            tl.note_foreground_group(4242);
+            tl.set_program(4242, Some(program.into()));
+        }
+        let t0 = std::time::Instant::now();
+        let _ = app.observe_session_statuses(t0);
+        let _ = app.observe_session_statuses(t0 + Duration::from_secs(2));
+        let streams = TargetStreams {
+            events: true,
+            ..Default::default()
+        };
+        let mut watch = new_watch(&target, streams, &PushOptions::default());
+        let _ = wake_text(&mut watch, streams, true);
+        (
+            app,
+            term,
+            timeline,
+            watchers,
+            watch,
+            t0 + Duration::from_secs(3),
+        )
+    }
+
+    /// The `program-state` rows' ids, oldest first.
+    fn program_row_ids(tl: &Mutex<crate::session_timeline::SessionTimeline>) -> Vec<u64> {
+        tl.lock()
+            .unwrap()
+            .since(None)
+            .filter(|e| e.kind == crate::session_timeline::PROGRAM_STATE)
+            .map(|e| e.id)
+            .collect()
+    }
+
+    /// The `program`, `act` and `agent` lines of a push, in order.
+    fn claim_and_verdict_lines(push: &str) -> String {
+        push.lines()
+            .filter(|l| {
+                [" program ", " act ", " agent "]
+                    .iter()
+                    .any(|k| l.contains(k))
+            })
+            .map(|l| format!("{l}\n"))
+            .collect()
+    }
+
+    /// A CODEX'S OWN REPORT IS A `program` EVENT, NEVER AN `agent` ONE, through the real sweep
+    /// (`App::observe_session_statuses`) and a real `events` watch: a real engine fed the bytes
+    /// codex writes under a published `codex` pushes one `EVENT <local> program state=<w>[
+    /// kind=<k>] rev=<id>` per honoured move, `<id>` its `program-state` row's (`kind=` only on
+    /// the blocked state that names one), and no `agent` or `act` line beside it.
+    /// NEGATIVE CONTROL: the same bytes under a published `claude` push none of them, and a
+    /// Claude verdict there still pushes `agent` alone.
+    #[test]
+    fn a_codex_move_pushes_one_program_event_and_a_claude_verdict_agent_alone() {
+        const WORKING: &[u8] = b"\x1b]7501;state=working:app=codex\x1b\\";
+        const BLOCKED: &[u8] = b"\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\";
+        const CLEAR: &[u8] = b"\x1b]7501;state=clear\x1b\\";
+        let streams = TargetStreams {
+            events: true,
+            ..Default::default()
+        };
+        for codex in [true, false] {
+            let (mut app, term, timeline, _, mut watch, mut t) =
+                evented_tab(if codex { "codex" } else { "claude" });
+            let sid = watch.local_id;
+            let mut pushed = Vec::new();
+            for bytes in [WORKING, BLOCKED, CLEAR] {
+                crate::term_lock(&term).process(bytes);
+                let _ = app.observe_session_statuses(t);
+                t += Duration::from_secs(1);
+                pushed.push(claim_and_verdict_lines(&wake_text(
+                    &mut watch, streams, true,
+                )));
+            }
+            let ids = program_row_ids(&timeline);
+            if codex {
+                assert_eq!(ids.len(), 3, "one row a move: {pushed:?}");
+                assert_eq!(
+                    pushed,
+                    [
+                        format!("EVENT {sid} program state=working rev={}\n", ids[0]),
+                        format!(
+                            "EVENT {sid} program state=blocked kind=permission rev={}\n",
+                            ids[1]
+                        ),
+                        format!("EVENT {sid} program state=- rev={}\n", ids[2]),
+                    ]
+                );
+            } else {
+                assert!(ids.is_empty(), "control: no row under claude: {ids:?}");
+                assert!(
+                    pushed.iter().all(String::is_empty),
+                    "control: no claim pushed under claude: {pushed:?}"
+                );
+                let stamp = crate::session_timeline::AgentStamp {
+                    generation: crate::control::ScreenGen { epoch: 1, seq: 7 },
+                    fp: 0x5eed,
+                };
+                assert!(timeline.lock().unwrap().publish_agent(
+                    "busy",
+                    None,
+                    None,
+                    Some(aterm_phase::Program::Claude),
+                    stamp,
+                ));
+                let rev = timeline.lock().unwrap().agent().rev;
+                let got = claim_and_verdict_lines(&wake_text(&mut watch, streams, true));
+                assert_eq!(
+                    got,
+                    format!("EVENT {sid} agent busy rev={rev} gen=1.7 fp=0000000000005eed\n"),
+                    "control: a Claude verdict is `agent` alone"
+                );
+            }
+        }
+    }
+
+    /// THE SWEEP'S TICK RINGS THE PROGRAM STATE IT WRITES: a codex flapping past its marks'
+    /// burst within one second of the log's clock leaves its newest state pending, and the next
+    /// second's status sweep, with nothing new on the screen, writes it
+    /// (`SessionLog::program_tick`) and rings the session's watchers, so an `events` watch is
+    /// woken for it then, not at the session's next record.
+    #[test]
+    fn the_sweeps_tick_rings_the_program_state_it_writes() {
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        const WORKING: &[u8] = b"\x1b]7501;state=working:app=codex\x1b\\";
+        const BLOCKED: &[u8] = b"\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\";
+        let streams = TargetStreams {
+            events: true,
+            ..Default::default()
+        };
+        let (mut app, term, timeline, watchers, mut watch, mut t) = evented_tab("codex");
+        let sid = watch.local_id;
+        let hand = Arc::new(AtomicU64::new(0));
+        {
+            let mut tl = timeline.lock().unwrap();
+            let base = tl.slog().now();
+            let read = Arc::clone(&hand);
+            tl.slog_mut()
+                .set_clock(crate::session_log::Clock::reading(move || {
+                    let ms = read.load(SeqCst);
+                    aterm_slog::Stamp::new(base.wall_ms + ms, base.mono_ms + ms)
+                }));
+        }
+        let burst = crate::session_log::observed::PROGRAM_BURST;
+        for i in 0..=burst {
+            crate::term_lock(&term).process([WORKING, BLOCKED][usize::from(i % 2 == 1)]);
+            let _ = app.observe_session_statuses(t);
+            t += Duration::from_secs(1);
+        }
+        assert_eq!(
+            program_row_ids(&timeline).len() as u64,
+            burst,
+            "PRECONDITION: the burst is written and its last move waits for a token"
+        );
+        let _ = wake_text(&mut watch, streams, true);
+        let rung = watchers.records_rung();
+        hand.store(1_000, SeqCst);
+        let _ = app.observe_session_statuses(t);
+        let ids = program_row_ids(&timeline);
+        assert_eq!(
+            ids.len() as u64,
+            burst + 1,
+            "the tick wrote the newest state"
+        );
+        assert!(
+            watchers.records_rung() > rung,
+            "the tick's row rang the session's watchers"
+        );
+        assert_eq!(
+            wake_text(&mut watch, streams, true),
+            format!(
+                "EVENT {sid} program state=working rev={}\n",
+                ids[ids.len() - 1]
+            )
+        );
     }
 
     #[test]

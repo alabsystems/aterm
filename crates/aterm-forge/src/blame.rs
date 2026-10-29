@@ -959,4 +959,22 @@ mod tests {
         assert_eq!(shortest_paths(&g, &ghost, 10).0.len(), 0);
         assert_eq!(count_paths(&g, &ghost), (0, false));
     }
+
+    #[test]
+    fn write_path_respects_w_line_for_short_segments() {
+        let chain: Vec<PkgId> = (0..14)
+            .map(|i| PkgId::new(format!("aterm-crate-{i:02}"), "0.142.0"))
+            .collect();
+        let mut out = String::new();
+        write_path(&mut out, "      [ 1] ", &chain);
+        for line in out.lines() {
+            assert!(
+                line.chars().count() <= W_LINE,
+                "path line exceeded W_LINE ({W_LINE}): len={} {line:?}",
+                line.chars().count()
+            );
+        }
+        assert!(out.contains("aterm-crate-00 0.142.0 ->"));
+        assert!(out.trim_end().ends_with("aterm-crate-13 0.142.0"));
+    }
 }

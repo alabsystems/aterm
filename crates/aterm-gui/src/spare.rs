@@ -205,7 +205,8 @@ pub(crate) fn shell_version(pid: i32) -> Option<i32> {
     }
 }
 
-fn shell_image(pid: i32) -> Option<PathBuf> {
+/// The executable `pid` maps (macOS `proc_pidpath`, Linux `/proc/<pid>/exe`), where it can be read.
+pub(crate) fn shell_image(pid: i32) -> Option<PathBuf> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         (pid > 0)
@@ -2006,10 +2007,9 @@ pub(crate) fn kill_session(pid: i32) {
             unsafe { libc::kill(p, libc::SIGKILL) };
         }
     }
-    // SAFETY: the spare's shell leads its own group and `pid` is unreaped.
-    unsafe {
-        libc::killpg(pid, libc::SIGKILL);
-    }
+    // The spare's shell leads its own group and `pid` is unreaped, so the sweep also ends a child
+    // the shell was forking as the first signal landed.
+    let _ = aterm_uds::process::kill_group_until_empty(pid);
 }
 
 /// No-op off Unix.
@@ -2806,6 +2806,7 @@ impl Wake {
             | Wake::NativeDocumentJournaled { .. }
             | Wake::NativeDocumentJournalRewritten { .. }
             | Wake::NativeDocumentJournalReseated { .. }
+            | Wake::NativeDocumentFileChanged(..)
             | Wake::OsAppearance(..)
             | Wake::ControlAppearance { .. }
             | Wake::ControlTextScale { .. }
@@ -2832,6 +2833,7 @@ impl Wake {
             | Wake::ToneStatus { .. }
             | Wake::TrailAdmissions { .. }
             | Wake::TrailStatus { .. }
+            | Wake::TrailLight { .. }
             | Wake::KittyCollection { .. }
             | Wake::KittyWear { .. }
             | Wake::TypingMomentum { .. }
@@ -2850,6 +2852,7 @@ impl Wake {
             | Wake::ConnectionsChanged
             | Wake::SettingsOverlay { .. }
             | Wake::SettingsShowSection { .. }
+            | Wake::SettingsCard { .. }
             | Wake::Input { .. }
             | Wake::WorkerLaunch { .. }
             | Wake::HwKeyTarget { .. }
@@ -2884,9 +2887,11 @@ impl Wake {
             | Wake::FrontControlSurface { .. }
             | Wake::OpenAuxWindow { .. }
             | Wake::OpenFactMenu { .. }
+            | Wake::OpenProgramAutopilotMenu { .. }
             | Wake::PkgSeed { .. }
             | Wake::AgentUpgrade { .. }
             | Wake::AgentUpgradeWord { .. }
+            | Wake::AgentUpgradePress { .. }
             | Wake::HostNote(..)
             | Wake::HarnessWait { .. }
             | Wake::HarnessFact { .. }
@@ -2911,6 +2916,7 @@ impl Wake {
             | Wake::PkgGroupAborted { .. }
             | Wake::PkgMachineRefused(..)
             | Wake::AppNotice { .. }
+            | Wake::HeldAgentMessages(..)
             | Wake::Notice { .. }
             | Wake::DevToolsHandOverAsked { .. }
             | Wake::PermissionWalkAsked { .. }
@@ -2923,8 +2929,12 @@ impl Wake {
             | Wake::ReadHarnessPolicy { .. } => None,
             #[cfg(unix)]
             Wake::Snapshot => None,
+            #[cfg(unix)]
+            Wake::Members { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::MemoryPressure { .. } => None,
+            #[cfg(target_os = "macos")]
+            Wake::LocalNetworkProbeReady => None,
             #[cfg(target_os = "macos")]
             Wake::UpdateLaunchUnregistered { .. } => None,
             #[cfg(target_os = "macos")]

@@ -12,6 +12,10 @@ use aterm_codec::hex;
 /// TLS 1.3 transport with RFC 5705 keying-material exporter and stream relay.
 pub mod tls;
 
+/// Process-owned Bonjour service discovery on macOS.
+#[cfg(target_os = "macos")]
+pub mod bonjour;
+
 mod slots;
 
 /// Mutual exporter-bound fleet handshake and listener.
@@ -20,6 +24,9 @@ pub mod fleet;
 /// Fleet membership, peer book, and survey/drive client.
 #[cfg(unix)]
 pub mod fleet_member;
+
+#[cfg(unix)]
+mod tcp_connect;
 
 /// Physical-link locality for applications that require LAN-only transport.
 #[cfg(unix)]

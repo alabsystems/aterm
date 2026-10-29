@@ -12,8 +12,6 @@ use serde::{Deserialize, Serialize};
 use super::durable;
 use super::table::is_vendor;
 use super::version::{Version, is_vendor_build};
-#[cfg(test)]
-use crate::manifest::Channel;
 use crate::manifest::Index;
 use crate::sig::{BuildFloor, TrustedIndex};
 use crate::store::Layout;
@@ -41,13 +39,6 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// The vendor entries of `channel.yanked`.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn from_channel(channel: &Channel) -> Self {
-        Self::from_entries(channel.yanked.iter().map(String::as_str))
-    }
-
     /// The vendor entries of every channel of `index`.
     #[must_use]
     pub fn from_index(index: &Index) -> Self {
@@ -252,26 +243,6 @@ impl YankLatch {
         self.checked_at > 0 && (-LATCH_CLOCK_SLACK_SECS..=LATCH_CURRENT_FOR_SECS).contains(&age)
     }
 
-    /// Record `channel`'s vendor yanks from `index_build`, verified at `checked_at`, unless the
-    /// latch holds a newer index.
-    ///
-    /// # Errors
-    /// The latch could not be written.
-    #[cfg(test)]
-    pub(crate) fn update_from_fresh_index(
-        layout: &Layout,
-        index_build: u64,
-        channel: &Channel,
-        checked_at: i64,
-    ) -> io::Result<bool> {
-        Self::update(
-            layout,
-            (index_build, 0, None),
-            Policy::from_channel(channel),
-            checked_at,
-        )
-    }
-
     /// Record every channel's yanks from `index`, verified at `checked_at`, unless the latch
     /// holds a newer index.
     ///
@@ -340,6 +311,7 @@ fn rank(index: &TrustedIndex) -> (u64, u64, Option<u64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::Channel;
 
     fn v(text: &str) -> Version {
         Version::parse(text).unwrap()
@@ -430,7 +402,7 @@ mod tests {
 
     #[test]
     fn a_vendor_programs_entries_name_versions_or_builds() {
-        let ch = channel(&[
+        let entries = [
             "claude@2.1.279",
             "codex@0.155.1",
             "trust@4790",
@@ -441,8 +413,9 @@ mod tests {
             "claude@",
             "claude@-1",
             "claude@3000000000000000000",
-        ]);
-        let p = Policy::from_channel(&ch);
+        ];
+        let p = Policy::from_index(&index(1, &entries));
+        assert_eq!(p, Policy::from_entries(entries));
         assert!(p.is_yanked("claude", v("2.1.279")));
         assert!(p.is_yanked("codex", v("0.155.1")));
         assert!(!p.is_yanked("claude", v("2.1.280")));
@@ -463,7 +436,7 @@ mod tests {
         let entry = format!("claude@{id}");
         let ch = channel(&[entry.as_str()]);
         assert!(crate::gate::is_yanked(&ch, "claude", id));
-        let p = Policy::from_channel(&ch);
+        let p = Policy::from_index(&index(1, &[entry.as_str()]));
         assert!(p.is_yanked("claude", v("2.1.285")));
         assert!(!p.is_legacy_yanked("claude", id));
         let padded = format!("claude@0{id}");
@@ -500,31 +473,35 @@ mod tests {
     fn the_latch_advances_with_fresh_indexes_and_never_by_staleness() {
         let l = layout("advance");
         assert_eq!(YankLatch::read(&l), None);
-        let first = channel(&[
-            "claude@2.1.279",
-            "trust@4790",
-            "claude@2026091901",
-            "codex@1000000000156000001",
-        ]);
-        assert!(YankLatch::update_from_fresh_index(&l, 44, &first, 100).unwrap());
+        let first = index(
+            44,
+            &[
+                "claude@2.1.279",
+                "trust@4790",
+                "claude@2026091901",
+                "codex@1000000000156000001",
+            ],
+        );
+        assert!(YankLatch::update_from_index(&l, &first, 100).unwrap());
         let got = YankLatch::read(&l).unwrap();
         assert_eq!(got.index_build, 44);
+        assert_eq!(got.roster_seq, Some(crate::sig::testkit::SEQ));
         assert_eq!(got.checked_at, 100);
         assert_eq!(
             got.policy,
-            Policy::from_channel(&first),
+            Policy::from_index(&first),
             "every spelling round-trips"
         );
         assert!(got.policy.is_yanked("claude", v("2.1.279")));
         assert!(got.policy.is_yanked("codex", v("0.156.1")));
         assert!(got.policy.is_legacy_yanked("claude", 2_026_091_901));
-        assert!(!YankLatch::update_from_fresh_index(&l, 44, &first, 100).unwrap());
-        assert!(YankLatch::update_from_fresh_index(&l, 44, &first, 200).unwrap());
+        assert!(!YankLatch::update_from_index(&l, &first, 100).unwrap());
+        assert!(YankLatch::update_from_index(&l, &first, 200).unwrap());
         let confirmed = YankLatch::read(&l).unwrap();
         assert_eq!((confirmed.index_build, confirmed.checked_at), (44, 200));
         assert_eq!(confirmed.policy, got.policy);
-        let older = channel(&[]);
-        assert!(!YankLatch::update_from_fresh_index(&l, 43, &older, 300).unwrap());
+        let older = index(43, &[]);
+        assert!(!YankLatch::update_from_index(&l, &older, 300).unwrap());
         assert_eq!(YankLatch::read(&l).unwrap().checked_at, 200);
         assert!(
             YankLatch::read(&l)
@@ -532,18 +509,33 @@ mod tests {
                 .policy
                 .is_yanked("claude", v("2.1.279"))
         );
-        assert!(YankLatch::update_from_fresh_index(&l, 45, &older, 300).unwrap());
+        let newer = index(45, &[]);
+        assert!(YankLatch::update_from_index(&l, &newer, 300).unwrap());
         let lifted = YankLatch::read(&l).unwrap();
         assert_eq!(lifted.index_build, 45);
         assert!(!lifted.policy.is_yanked("claude", v("2.1.279")));
-        let again = channel(&["codex@0.156.0"]);
-        assert!(YankLatch::update_from_fresh_index(&l, 45, &again, 300).unwrap());
+        let again = index(45, &["codex@0.156.0"]);
+        assert!(YankLatch::update_from_index(&l, &again, 300).unwrap());
         assert!(
             YankLatch::read(&l)
                 .unwrap()
                 .policy
                 .is_yanked("codex", v("0.156.0"))
         );
+
+        let pre_gen = layout("pre-gen");
+        std::fs::write(
+            latch_path(&pre_gen),
+            "schema = 1\nindex_build = 44\nchecked_at = 50\n[yanks]\nclaude = [\"2.1.279\"]\n",
+        )
+        .unwrap();
+        assert_eq!(YankLatch::read(&pre_gen).unwrap().roster_seq, None);
+        assert!(!YankLatch::update_from_index(&pre_gen, &older, 60).unwrap());
+        assert!(Policy::current(&pre_gen, Some(&older)).is_yanked("claude", v("2.1.279")));
+        assert!(YankLatch::update_from_index(&pre_gen, &newer, 70).unwrap());
+        let upgraded = YankLatch::read(&pre_gen).unwrap();
+        assert_eq!(upgraded.roster_seq, Some(crate::sig::testkit::SEQ));
+        assert_eq!(upgraded.index_build, 45);
     }
 
     #[test]
@@ -599,7 +591,7 @@ mod tests {
         assert!(got.policy.is_yanked("claude", v("2.1.279")));
         assert!(got.policy.is_legacy_yanked("claude", 2_026_091_901));
         std::fs::write(latch_path(&l), "garbage").unwrap();
-        assert!(YankLatch::update_from_fresh_index(&l, 1, &channel(&[]), 1).unwrap());
+        assert!(YankLatch::update_from_index(&l, &index(1, &[]), 1).unwrap());
         assert_eq!(YankLatch::read(&l).unwrap().index_build, 1);
     }
 }

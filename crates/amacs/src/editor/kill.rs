@@ -3,13 +3,16 @@
 
 //! The kill ring: the kills (kill-region, kill-line, kill-word and
 //! backward-kill-word) push to it once their deletion commits, kill-ring-save
-//! copies to it, and yank and yank-pop insert from it.
+//! copies to it, and yank and yank-pop insert from it. Input without clipboard
+//! authority (in aterm, a control client's) has a ring of its own
+//! ([`EditorWorkspace::kills`]), as the person's ring mirrors the clipboard.
 
+use std::collections::VecDeque;
 use std::ops::Range;
 
 use aterm_buffer::Seq;
 
-use super::command::{EditorCommand, PrefixArgument};
+use super::command::{CommandAuthority, EditorCommand, PrefixArgument};
 use super::projection::line_text_end;
 use super::view::{
     EditorBufferView, Selection, next_boundary, next_word_boundary, previous_word_boundary,
@@ -201,16 +204,14 @@ impl EditorWorkspace {
         argument: Option<PrefixArgument>,
         count: usize,
     ) -> Result<(), EditorError> {
+        let (ring, _) = self.kills();
         let ring_index = match argument {
-            Some(PrefixArgument::Numeric { .. }) => {
-                count.saturating_sub(1) % self.kill_ring.len().max(1)
-            }
+            Some(PrefixArgument::Numeric { .. }) => count.saturating_sub(1) % ring.len().max(1),
             Some(PrefixArgument::Raw(_)) | None => 0,
         };
-        let text = self
-            .kill_ring
+        let text = ring
             .get(ring_index)
-            .cloned()
+            .map(|kill| self.held_kill(kill))
             .ok_or(EditorError::NoKill)?;
         let edits = edits_for_selections(&view.selections, &text)?;
         let ranges = resulting_insert_ranges(&edits);
@@ -246,11 +247,11 @@ impl EditorWorkspace {
             self.last_yank = None;
             return Ok(vec![EditorEffect::Status(YANK_POP_STALE.to_string())]);
         }
-        let next_index = previous.ring_index.saturating_add(1) % self.kill_ring.len().max(1);
-        let replacement = self
-            .kill_ring
+        let (ring, _) = self.kills();
+        let next_index = previous.ring_index.saturating_add(1) % ring.len().max(1);
+        let replacement = ring
             .get(next_index)
-            .cloned()
+            .map(|kill| self.held_kill(kill))
             .ok_or(EditorError::NoKill)?;
         let edits = previous
             .ranges
@@ -276,13 +277,21 @@ impl EditorWorkspace {
     /// command before was a kill (`backward` puts it in front, as a
     /// backward kill reads), else as a new entry, the oldest falling off
     /// past [`KILL_RING_LIMIT`].
-    fn record_kill(&mut self, text: String, previous: Option<EditorCommand>, backward: bool) {
+    pub(super) fn record_kill(
+        &mut self,
+        text: String,
+        previous: Option<EditorCommand>,
+        backward: bool,
+    ) {
         if text.is_empty() {
             return;
         }
-        self.kill_ring_changed = true;
+        // Only the person's ring reaches the clipboard (`EditorEffect::KillToClipboard`).
+        self.kill_ring_changed |= self.reaches_persons_kills();
+        let (ring, grid_kill) = self.kills_mut();
+        *grid_kill = None;
         if appends_kill(previous)
-            && let Some(newest) = self.kill_ring.front_mut()
+            && let Some(newest) = ring.front_mut()
         {
             // A backward kill goes in front: the new text with the entry
             // appended, which no index can make panic (`insert_str` can).
@@ -295,8 +304,47 @@ impl EditorWorkspace {
             }
             return;
         }
-        self.kill_ring.push_front(text);
-        self.kill_ring.truncate(KILL_RING_LIMIT);
+        ring.push_front(text);
+        ring.truncate(KILL_RING_LIMIT);
+    }
+
+    /// Whether the input being reduced reaches the person's kill ring: only input that carries
+    /// [`CommandAuthority::Clipboard`] does, as that ring is what the clipboard mirrors.
+    fn reaches_persons_kills(&self) -> bool {
+        self.granted.contains(&CommandAuthority::Clipboard)
+    }
+
+    /// The kill ring the input being reduced kills to and yanks from, and the value the grid's
+    /// last copy or cut put on it: the person's ([`Self::kill_ring`], [`Self::grid_kill`]) for
+    /// input with clipboard authority, else [`Self::guest_kill_ring`] and
+    /// [`Self::guest_grid_kill`], so input without it never reads or adds to the person's kills.
+    pub(super) fn kills(&self) -> (&VecDeque<String>, Option<&str>) {
+        if self.reaches_persons_kills() {
+            (&self.kill_ring, self.grid_kill.as_deref())
+        } else {
+            (&self.guest_kill_ring, self.guest_grid_kill.as_deref())
+        }
+    }
+
+    /// [`Self::kills`], to change.
+    pub(super) fn kills_mut(&mut self) -> (&mut VecDeque<String>, &mut Option<String>) {
+        if self.reaches_persons_kills() {
+            (&mut self.kill_ring, &mut self.grid_kill)
+        } else {
+            (&mut self.guest_kill_ring, &mut self.guest_grid_kill)
+        }
+    }
+}
+
+impl EditorWorkspace {
+    /// `kill` as a yank writes it into the document the input goes to: its CRLF as LF when the
+    /// document is held with LF for CRLF on disk ([`Self::crlf_on_disk`]), else as it is.
+    pub(super) fn held_kill(&self, kill: &str) -> String {
+        if self.crlf_on_disk {
+            kill.replace("\r\n", "\n")
+        } else {
+            kill.to_string()
+        }
     }
 }
 

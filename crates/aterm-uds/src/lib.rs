@@ -18,6 +18,10 @@ pub type CtlStream = std::os::unix::net::UnixStream;
 #[cfg(unix)]
 pub type CtlListener = std::os::unix::net::UnixListener;
 
+/// Unix-domain connections bounded by an absolute deadline.
+#[cfg(unix)]
+pub mod connect;
+
 /// Keep a socket out of every child this process forks or spawns (`FD_CLOFORK`).
 ///
 /// On macOS a socket is drained for good when one of its descriptors closes while another
@@ -102,6 +106,8 @@ pub mod nofollow;
 pub mod output;
 /// Who holds a file's owner lock (the PTY keeper reads a dead window's crash marker with it).
 pub mod ownerlock;
+/// The partition lane's cut: in a debug build, `ATERM_DEBUG_PARTITION` names the `ip:port`s aterm-net's and aterm-http's connect funnels refuse to dial (fleet dials, a loopback-scope `lan::Connection`, vault requests; [`partition::check`]); a LAN-scope `lan::Connection` and a direct `TcpStream` connect are not cut.
+pub mod partition;
 /// The kernel's record of a socket peer: its uid and (Darwin) audit token.
 pub mod peer;
 /// Unix-only: strict private files, the user's own regular file directly in the user's own 0700 directory, with no second link, no symlink and no ACL grant (lifted from aterm-net's `fleet_member`).

@@ -333,6 +333,12 @@ pub fn prompt_band_word(detail: Option<&str>) -> String {
     }
 }
 
+/// The state line's context words for `pct` per cent left, warned at [`CTX_WARN_PCT`] or under.
+fn context_left_words(pct: u8) -> String {
+    let warn = if pct <= CTX_WARN_PCT { " \u{26a0}" } else { "" };
+    format!("ctx {pct}% left{warn}")
+}
+
 /// The hover's state line for `slot` (`program`: the host's name for the agent in front, `claude`).
 #[must_use]
 pub fn state_line<V: Host>(slot: &Slot<V>, program: Option<&str>) -> Option<String> {
@@ -355,14 +361,16 @@ pub fn state_line<V: Host>(slot: &Slot<V>, program: Option<&str>) -> Option<Stri
             };
             parts.push(word);
             if let Some(pct) = agent.context_pct {
-                let warn = if pct <= CTX_WARN_PCT { " \u{26a0}" } else { "" };
-                parts.push(format!("ctx {pct}% left{warn}"));
+                parts.push(context_left_words(pct));
             }
         }
         None => match slot.program {
             Some((word, _)) => {
                 parts.clear();
                 parts.push(word.to_string());
+                if let Some(pct) = slot.program_ctx_left {
+                    parts.push(context_left_words(pct));
+                }
             }
             None => {
                 if let Some((word, _)) = slot.shell {

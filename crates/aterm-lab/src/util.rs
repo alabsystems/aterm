@@ -102,6 +102,25 @@ pub fn shell_quote(s: &str) -> String {
     }
 }
 
+/// Formats `<prefix>:$PATH` as a single POSIX shell word (`"<escaped>:$PATH"`, or
+/// `'<prefix>':"$PATH"` when `prefix` holds a newline).
+#[must_use]
+pub fn shell_prepend_path(prefix: &str) -> String {
+    if prefix.contains('\n') {
+        return format!("{}:\"$PATH\"", shell_quote(prefix));
+    }
+    let mut out = String::with_capacity(prefix.len() + 8);
+    out.push('"');
+    for c in prefix.chars() {
+        if matches!(c, '\\' | '"' | '$' | '`') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push_str(":$PATH\"");
+    out
+}
+
 /// Unquotes a shell word from `env.sh`.
 #[must_use]
 pub fn shell_unquote(s: &str) -> String {
@@ -523,6 +542,18 @@ mod tests {
             "/a/Application Support/b"
         );
         assert_eq!(shell_unquote(r"$'a\nb'"), "a\nb");
+        assert_eq!(
+            shell_prepend_path("/s/runs/t/shim"),
+            "\"/s/runs/t/shim:$PATH\""
+        );
+        assert_eq!(
+            shell_prepend_path(r#"/s/"a"$b`c`\d/shim"#),
+            r#""/s/\"a\"\$b\`c\`\\d/shim:$PATH""#
+        );
+        assert_eq!(
+            shell_prepend_path("/s/a\nb/shim"),
+            "'/s/a\nb/shim':\"$PATH\""
+        );
     }
 
     #[test]

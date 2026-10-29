@@ -35,12 +35,18 @@ pub(crate) fn register_budget_share(term: &Terminal) -> ScrollbackBudgetShare {
 }
 
 impl WebTerminal {
-    /// Frame-boundary scrollback maintenance, called by `render()`.
+    /// Apply any pending global or per-pane scrollback-budget share to `self.term`.
     #[inline]
-    pub(crate) fn drain_compress_backlog_on_render(&mut self) {
+    pub(crate) fn apply_pending_scrollback_budget(&mut self) {
         if let Some(bytes) = self.budget_share.pending_effective() {
             let _ = self.term.set_memory_budget(bytes);
         }
+    }
+
+    /// Frame-boundary scrollback maintenance, called by `render()`.
+    #[inline]
+    pub(crate) fn drain_compress_backlog_on_render(&mut self) {
+        self.apply_pending_scrollback_budget();
         if self.term.lazy_backlog_len() > 0 {
             self.term.trickle_lazy_bounded(RENDER_DRAIN_BATCH_LINES);
         }
@@ -55,9 +61,7 @@ macro_rules! bind {
             /// Set this pane's scrollback byte budget.
             pub fn set_scrollback_budget(&mut self, bytes: u32) {
                 self.budget_share.set_configured(bytes as usize);
-                if let Some(effective) = self.budget_share.pending_effective() {
-                    let _ = self.term.set_memory_budget(effective);
-                }
+                self.apply_pending_scrollback_budget();
             }
 
             /// Set the MODULE-GLOBAL scrollback budget shared by every pane of this wasm
@@ -84,9 +88,7 @@ macro_rules! bind {
             /// (`0` = the render-frame batch size) and apply any pending global-share
             /// change.
             pub fn drain_scrollback_backlog(&mut self, max_lines: u32) -> u32 {
-                if let Some(bytes) = self.budget_share.pending_effective() {
-                    let _ = self.term.set_memory_budget(bytes);
-                }
+                self.apply_pending_scrollback_budget();
                 let batch = if max_lines == 0 {
                     RENDER_DRAIN_BATCH_LINES
                 } else {

@@ -20,6 +20,33 @@ type BuiltRestoreLeaf = (
     Option<crate::tab_model::TabId>,
 );
 
+/// A historical held-tab notice. Codex preparation reads account and executable files, so it
+/// runs off the main thread. Its result is only logged; it never starts or changes a session.
+struct HeldNotice {
+    sid: String,
+    place: String,
+    agent: restore::AgentRestore,
+    stopped_by_hold: bool,
+    fleet: bool,
+    lifted: bool,
+}
+
+impl HeldNotice {
+    fn message(&self, resume: Option<&str>) -> Option<aterm_messages::Message> {
+        crate::message_reporters::restored_agent_held(
+            &self.sid,
+            &self.place,
+            &crate::message_reporters::HeldAgent {
+                name: self.agent.name().unwrap_or_default(),
+                resume,
+                stopped_by_hold: self.stopped_by_hold,
+                fleet: self.fleet,
+                lifted: self.lifted,
+            },
+        )
+    }
+}
+
 /// A window's tabs before a native restore stages its leaf, and which one was active.
 struct RestoreStagingMark {
     active: Option<crate::tab_model::TabId>,
@@ -1775,10 +1802,13 @@ impl App {
         &mut self,
         held: impl IntoIterator<Item = ((u64, restore::AgentRestore, bool, Vec<String>), bool)>,
     ) {
+        use aterm_agent::harness::upgrade::Agent;
+
         let relaunching = self
             .harness
             .as_ref()
             .is_some_and(crate::harness_host::HostHandle::relaunches_restored);
+        let mut notices = Vec::new();
         let mut said: Vec<(u32, String)> = Vec::new();
         for ((id, agent, fleet, _), lifted) in held {
             let (pid, start) = agent.ran_as();
@@ -1811,20 +1841,73 @@ impl App {
             if let (Some(host), Some(was)) = (&self.harness, agent.ran_in_another(&sid)) {
                 host.note_earlier_tab(&sid, &was);
             }
-            let resume = agent.resume_line();
             let name = agent.name();
-            if let Some(record) = crate::message_reporters::restored_agent_held(
-                &sid,
-                &place,
-                &crate::message_reporters::HeldAgent {
-                    name: name.unwrap_or_default(),
-                    resume: resume.as_deref(),
-                    stopped_by_hold: relaunching && agent.resumes() && name.is_some(),
-                    fleet,
-                    lifted,
-                },
-            ) {
-                self.record_message(record);
+            let notice = HeldNotice {
+                sid,
+                place,
+                stopped_by_hold: relaunching && agent.resumes() && name.is_some(),
+                agent,
+                fleet,
+                lifted,
+            };
+            let reads_accounts = match notice.agent.agent() {
+                Some(Agent::Codex) => !matches!(
+                    notice.agent.run.as_ref(),
+                    Some(restore::RunRestore::Codex(restore::CodexRestore {
+                        alab: Some(restore::AlabRestore {
+                            codex_home: Some(home),
+                            codex_auth_path: None,
+                            ..
+                        }),
+                        ..
+                    })) if !home.is_empty()
+                ),
+                Some(Agent::Claude | Agent::Agy | Agent::Muse) | None => false,
+            };
+            if reads_accounts {
+                notices.push(notice);
+            } else {
+                // An explicit Codex home with no named override cannot use the pool. Like
+                // other agents' recorded commands, it is a pure rendering and stays immediate.
+                let resume = notice.agent.resume_line_at(None);
+                if let Some(message) = notice.message(resume.as_deref()) {
+                    self.record_message(message);
+                }
+            }
+        }
+        if notices.is_empty() {
+            return;
+        }
+        // If a worker cannot start, preserve the historical notice without offering an
+        // unchecked command. A late result is still a historical record, not a live action.
+        let fallback: Vec<_> = notices
+            .iter()
+            .filter_map(|notice| notice.message(None))
+            .collect();
+        let spawned = self.proxy.clone().ok_or(()).and_then(|proxy| {
+            std::thread::Builder::new()
+                .name("aterm-held-resume".into())
+                .spawn(move || {
+                    crate::qos::set_self(crate::qos::Role::Background);
+                    let pool_seat = crate::task_launch::PoolSeat::here();
+                    let seat = pool_seat.as_ref().map(crate::task_launch::PoolSeat::seat);
+                    let messages = notices
+                        .iter()
+                        .filter_map(|notice| {
+                            let resume = seat
+                                .as_ref()
+                                .and_then(|seat| notice.agent.resume_line_at(Some(seat)));
+                            notice.message(resume.as_deref())
+                        })
+                        .collect();
+                    let _ = proxy.send_event(crate::Wake::HeldAgentMessages(messages));
+                })
+                .map(|_| ())
+                .map_err(|_| ())
+        });
+        if spawned.is_err() {
+            for message in fallback {
+                self.record_message(message);
             }
         }
     }
@@ -4331,4 +4414,4 @@ mod carried_draft_settle_tests;
 
 #[cfg(all(test, unix))]
 #[path = "app_restore_crash_journal_program_tests.rs"]
-mod crash_journal_program_tests;
+pub(crate) mod crash_journal_program_tests;

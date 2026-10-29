@@ -11,8 +11,7 @@ use aterm_scene::{PathTransform, Tile, fill_path_fixed};
 
 use crate::cat_glyphs_gen::{CatGlyphId, GLYPHS, GlyphRole, Layer, Recolor};
 use crate::color_math::{
-    RelativeLuminanceTable, hsv2rgb, relative_luminance, relative_luminance_table,
-    relative_luminance_with, rgb2hsv,
+    hsv2rgb, relative_luminance, relative_luminance_table, relative_luminance_with, rgb2hsv,
 };
 use crate::effect_util::lerp_rgb as mix_rgb;
 
@@ -99,15 +98,16 @@ impl CatBaker {
     #[inline]
     #[must_use]
     pub const fn slot_count(cell_h: u16) -> usize {
-        let ch = if cell_h < 1 { 1 } else { cell_h as usize };
+        if cell_h == 0 {
+            return 0;
+        }
+        let ch = cell_h as u64;
         let slot_bytes = (4 * ch) * (2 * ch) * 4;
-        let n = MAX_ATLAS_BYTES / slot_bytes;
-        if n < 1 {
-            1
-        } else if n > MAX_SLOTS {
+        let n = (MAX_ATLAS_BYTES as u64) / slot_bytes;
+        if n > MAX_SLOTS as u64 {
             MAX_SLOTS
         } else {
-            n
+            n as usize
         }
     }
 
@@ -456,6 +456,7 @@ pub(crate) fn paint_dark_masked_disc(
         .min(tile.height() as i32);
     let tile_w = tile.width();
     let mask_px = eye_mask.pixels();
+    let alpha_16 = alpha * 0.0625;
     let mut y = y0;
     while y < y1 {
         let cur_y = y;
@@ -476,14 +477,14 @@ pub(crate) fn paint_dark_masked_disc(
         }
         let dy1 = dy0 + 0.25;
         let dy2_v = dy0 + 0.50;
-        let dy2 = [dy0_2, dy1 * dy1, dy2_v * dy2_v, dy3_2];
+        let rem = [rr - dy0_2, rr - dy1 * dy1, rr - dy2_v * dy2_v, rr - dy3_2];
         let dy2_max = dy0_2.max(dy3_2);
-        let row_base = (cur_y as u32 * tile_w) as usize;
+        let row_base4 = (cur_y as u32 * tile_w) as usize * 4;
         let mut x = x0;
         while x < x1 {
             let cur_x = x;
             x += 1;
-            let i = (row_base + cur_x as usize) * 4;
+            let i = row_base4 + (cur_x as usize) * 4;
             if mask_px[i + 3] == 0 {
                 continue;
             }
@@ -515,18 +516,17 @@ pub(crate) fn paint_dark_masked_disc(
             let mut hit = 0u32;
             let mut ky = 0;
             while ky < 4 {
-                let dy2_k = dy2[ky];
-                if dy2_k <= rr {
-                    let rem = rr - dy2_k;
-                    hit += u32::from(dx2[0] <= rem)
-                        + u32::from(dx2[1] <= rem)
-                        + u32::from(dx2[2] <= rem)
-                        + u32::from(dx2[3] <= rem);
+                let rem_k = rem[ky];
+                if rem_k >= 0.0 {
+                    hit += u32::from(dx2[0] <= rem_k)
+                        + u32::from(dx2[1] <= rem_k)
+                        + u32::from(dx2[2] <= rem_k)
+                        + u32::from(dx2[3] <= rem_k);
                 }
                 ky += 1;
             }
             if hit > 0 {
-                tile.over(cur_x, cur_y, col, alpha * (hit as f32 * 0.0625));
+                tile.over(cur_x, cur_y, col, hit as f32 * alpha_16);
             }
         }
     }
@@ -571,14 +571,31 @@ impl CatColorKey {
     #[inline]
     #[must_use]
     pub const fn from_rgb(background: u32, foreground: u32, surrounding: u32) -> Self {
+        Self::from_rgb_with(
+            relative_luminance_table(),
+            background,
+            foreground,
+            surrounding,
+        )
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) const fn from_rgb_with(
+        table: &crate::color_math::RelativeLuminanceTable,
+        background: u32,
+        foreground: u32,
+        surrounding: u32,
+    ) -> Self {
+        const INV_30: f32 = 1.0 / 30.0;
         let harmonized = mix_rgb(foreground, surrounding, 0.35);
         let (h, s, _) = rgb2hsv(harmonized);
         let accent = if s < 0.12 {
             12
         } else {
-            (((h + 15.0) / 30.0).floor() as u8) % 12
+            (((h + 15.0) * INV_30).floor() as u8) % 12
         };
-        let background = background_band(background);
+        let background = background_band_with(table, background);
         Self { accent, background }
     }
 
@@ -592,7 +609,27 @@ impl CatColorKey {
         min_background_band: u8,
         max_background_band: u8,
     ) -> Self {
-        let mut key = Self::from_rgb(background, foreground, surrounding);
+        Self::from_rgb_span_with(
+            relative_luminance_table(),
+            background,
+            foreground,
+            surrounding,
+            min_background_band,
+            max_background_band,
+        )
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) const fn from_rgb_span_with(
+        table: &crate::color_math::RelativeLuminanceTable,
+        background: u32,
+        foreground: u32,
+        surrounding: u32,
+        min_background_band: u8,
+        max_background_band: u8,
+    ) -> Self {
+        let mut key = Self::from_rgb_with(table, background, foreground, surrounding);
         let min_b = if min_background_band < 3 {
             min_background_band
         } else {
@@ -617,6 +654,15 @@ impl CatColorKey {
 
     #[inline]
     #[must_use]
+    pub(crate) const fn background_band_with(
+        table: &crate::color_math::RelativeLuminanceTable,
+        background: u32,
+    ) -> u8 {
+        background_band_with(table, background)
+    }
+
+    #[inline]
+    #[must_use]
     pub const fn dark(self) -> bool {
         self.background <= 1
     }
@@ -624,7 +670,19 @@ impl CatColorKey {
 
 #[inline]
 const fn background_band(background: u32) -> u8 {
-    let l = relative_luminance(background);
+    background_band_from_lum(relative_luminance(background))
+}
+
+#[inline]
+const fn background_band_with(
+    table: &crate::color_math::RelativeLuminanceTable,
+    background: u32,
+) -> u8 {
+    background_band_from_lum(relative_luminance_with(table, background))
+}
+
+#[inline]
+const fn background_band_from_lum(l: f32) -> u8 {
     if l < BG_BAND_DARKEST_MAX {
         0
     } else if l < BG_BAND_DARK_MAX {
@@ -665,12 +723,14 @@ pub struct ResolvedFills {
     pub outline: (f32, f32, f32),
     /// Pale outer keyline painted beneath `outline` for a mixed-background footprint.
     pub outline_underlay: Option<(f32, f32, f32)>,
+    coat_lum: f32,
 }
 
 #[derive(Clone, Copy)]
 struct CoatEyePair {
     coat: (f32, f32, f32),
     eye_ink: (f32, f32, f32),
+    coat_lum: f32,
 }
 
 const OUTLINE_BASES: [u32; 5] = [
@@ -689,6 +749,7 @@ struct FillsLut {
 }
 
 impl FillsLut {
+    #[inline]
     const fn build() -> Self {
         let zero = (0.0f32, 0.0f32, 0.0f32);
         let mut iris = [[zero; CONTEXT_ACCENTS.len()]; EYE_RAMP.len()];
@@ -727,6 +788,7 @@ impl FillsLut {
         let zero_pair = CoatEyePair {
             coat: zero,
             eye_ink: zero,
+            coat_lum: 0.0,
         };
         let mut coat_eye = [[[zero_pair; 2]; CONTEXT_ACCENTS.len()]; COAT_RAMP.len()];
         let mut coat_idx = 0;
@@ -751,7 +813,12 @@ impl FillsLut {
                     } else {
                         dark_eye
                     };
-                    coat_eye[coat_idx][accent_idx][lift] = CoatEyePair { coat, eye_ink };
+                    let coat_lum = relative_luminance(packed_rgb(coat));
+                    coat_eye[coat_idx][accent_idx][lift] = CoatEyePair {
+                        coat,
+                        eye_ink,
+                        coat_lum,
+                    };
                     lift += 1;
                 }
                 accent_idx += 1;
@@ -815,7 +882,11 @@ impl ResolvedFills {
         };
         let lift = matches!(colors.background, 0 | 4) as usize;
         let lut = fills_lut();
-        let CoatEyePair { coat, eye_ink } = lut.coat_eye[coat_idx][accent_idx][lift];
+        let CoatEyePair {
+            coat,
+            eye_ink,
+            coat_lum,
+        } = lut.coat_eye[coat_idx][accent_idx][lift];
         Self {
             coat,
             iris: lut.iris[iris_idx][accent_idx],
@@ -826,6 +897,7 @@ impl ResolvedFills {
             } else {
                 None
             },
+            coat_lum,
         }
     }
 }
@@ -927,17 +999,13 @@ pub const fn resolve_layer(layer: &Layer, fills: &ResolvedFills) -> ((f32, f32, 
 const fn resolve_glyph_layer(
     layer: &Layer,
     fills: &ResolvedFills,
-    coat_lum: Option<(&RelativeLuminanceTable, f32)>,
+    use_eye_ink: bool,
 ) -> ((f32, f32, f32), f32) {
-    if matches!(layer.role, GlyphRole::Eye)
+    if use_eye_ink
+        && matches!(layer.role, GlyphRole::Eye)
         && matches!(layer.recolor, Recolor::Fixed)
-        && let Some((table, coat_lum)) = coat_lum
     {
-        let eye_lum = relative_luminance_with(table, layer.fill);
-        let contrast = (eye_lum.max(coat_lum) + 0.05) / (eye_lum.min(coat_lum) + 0.05);
-        if contrast < MIN_EYE_CONTRAST {
-            return (fills.eye_ink, 1.0);
-        }
+        return (fills.eye_ink, 1.0);
     }
     resolve_layer(layer, fills)
 }
@@ -1196,7 +1264,7 @@ struct OpenEyeReflection {
 
 #[derive(Clone, Copy)]
 struct GlyphMeta {
-    needs_coat_lum: bool,
+    fixed_eye_lum: Option<f32>,
     eye_line: Option<f32>,
     eye_paths: &'static [&'static [PathSeg]],
     reflections: [Option<OpenEyeReflection>; MAX_GLYPH_EYE_PATHS],
@@ -1204,9 +1272,10 @@ struct GlyphMeta {
 }
 
 impl GlyphMeta {
+    #[inline]
     const fn from_def(def: &crate::cat_glyphs_gen::GlyphDef) -> Self {
         let mut has_coat = false;
-        let mut has_fixed_eye = false;
+        let mut fixed_eye_fill: Option<u32> = None;
         let mut eye_layer: Option<&Layer> = None;
         let mut catch_light_layer: Option<&Layer> = None;
         let mut i = 0;
@@ -1216,8 +1285,8 @@ impl GlyphMeta {
                 has_coat = true;
             }
             if matches!(layer.role, GlyphRole::Eye) {
-                if matches!(layer.recolor, Recolor::Fixed) {
-                    has_fixed_eye = true;
+                if matches!(layer.recolor, Recolor::Fixed) && fixed_eye_fill.is_none() {
+                    fixed_eye_fill = Some(layer.fill);
                 }
                 if eye_layer.is_none() {
                     eye_layer = Some(layer);
@@ -1228,6 +1297,12 @@ impl GlyphMeta {
             }
             i += 1;
         }
+        let fixed_eye_lum = match fixed_eye_fill {
+            Some(fill) if has_coat => {
+                Some(relative_luminance_with(relative_luminance_table(), fill))
+            }
+            _ => None,
+        };
         let eye_line = match eye_layer {
             Some(eyes) => layer_eye_line(eyes),
             None => None,
@@ -1276,7 +1351,7 @@ impl GlyphMeta {
             }
         }
         Self {
-            needs_coat_lum: has_coat && has_fixed_eye,
+            fixed_eye_lum,
             eye_line,
             eye_paths,
             reflections,
@@ -1287,7 +1362,7 @@ impl GlyphMeta {
 
 static GLYPH_META: [GlyphMeta; GLYPHS.len()] = {
     let mut meta = [GlyphMeta {
-        needs_coat_lum: false,
+        fixed_eye_lum: None,
         eye_line: None,
         eye_paths: &[],
         reflections: [None; MAX_GLYPH_EYE_PATHS],
@@ -1412,14 +1487,12 @@ fn paint_glyph(
     let idx = id as usize;
     let def = &GLYPHS[idx];
     let meta = &GLYPH_META[idx];
-    let coat_lum = if meta.needs_coat_lum {
-        let table = relative_luminance_table();
-        Some((
-            table,
-            relative_luminance_with(table, packed_rgb(fills.coat)),
-        ))
-    } else {
-        None
+    let use_eye_ink = match meta.fixed_eye_lum {
+        Some(eye_lum) => {
+            let coat_lum = fills.coat_lum;
+            (eye_lum.max(coat_lum) + 0.05) / (eye_lum.min(coat_lum) + 0.05) < MIN_EYE_CONTRAST
+        }
+        None => false,
     };
     let eye_xform = if !matches!(eyes, EyesFrame::Open)
         && let Some(yc) = meta.eye_line
@@ -1451,7 +1524,7 @@ fn paint_glyph(
         } else {
             xform
         };
-        let (col, alpha) = resolve_glyph_layer(layer, fills, coat_lum);
+        let (col, alpha) = resolve_glyph_layer(layer, fills, use_eye_ink);
         if matches!(layer.role, GlyphRole::Outline | GlyphRole::Whisker) {
             paint_outline_halo(tile, layer, fills, alpha, lxform);
         }
@@ -1653,11 +1726,17 @@ mod tests {
 
     #[test]
     fn slot_count_is_structural() {
-        for ch in [14u16, 20, 40, 56, 90] {
+        assert_eq!(CatBaker::slot_count(0), 0);
+        assert_eq!(CatBaker::slot_count(256), 1);
+        assert_eq!(CatBaker::slot_count(257), 0);
+        for ch in [0u16, 1, 14, 20, 40, 56, 90, 256, 257, 1_024, u16::MAX] {
             let bytes =
-                CatBaker::slot_count(ch) * (4 * usize::from(ch)) * (2 * usize::from(ch)) * 4;
-            assert!(bytes <= MAX_ATLAS_BYTES, "ch={ch}: {bytes} > 2 MiB");
+                (CatBaker::slot_count(ch) as u64) * (4 * u64::from(ch)) * (2 * u64::from(ch)) * 4;
+            assert!(bytes <= MAX_ATLAS_BYTES as u64, "ch={ch}: {bytes} > 2 MiB");
         }
+        let mut oversize = CatBaker::default();
+        oversize.begin_frame(512, u16::MAX);
+        assert!(oversize.get_v4(&vk(0)).is_none());
     }
 
     #[test]

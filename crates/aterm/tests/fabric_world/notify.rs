@@ -137,7 +137,7 @@ impl Watch {
     fn suppressed(&self) -> u64 {
         std::fs::read_to_string(self.state.join("notify/suppressed"))
             .ok()
-            .and_then(|s| s.trim().parse().ok())
+            .and_then(|s| s.split_whitespace().next()?.parse().ok())
             .unwrap_or(0)
     }
 
@@ -335,7 +335,7 @@ fn a_crash_between_the_exec_and_its_journal_entry_refires_and_says_dup() {
     assert!(
         w.journal()
             .iter()
-            .any(|l| l == &format!("{off} firing on=attention")),
+            .any(|l| l.starts_with(&format!("{off} firing on=attention t="))),
         "the journal is left in doubt: {:?}",
         w.journal()
     );
@@ -573,7 +573,7 @@ fn a_page_checkpoint_waits_for_the_last_notification_command() {
     assert!(
         w.journal()
             .iter()
-            .any(|line| line == &format!("{second} firing on=attention")),
+            .any(|line| line.starts_with(&format!("{second} firing on=attention t="))),
         "the second command is in doubt until released"
     );
 

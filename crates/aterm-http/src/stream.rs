@@ -176,7 +176,9 @@ impl TcpConnector {
     /// why, before the next address is tried: the error alone does not name the address it
     /// came from, which a caller that judges a refusal by where it went (a LAN address, a
     /// public one) needs. A connect's error returned is the last one `failed` was told; a
-    /// failed lookup, or a deadline spent before the next address, is told nothing.
+    /// failed lookup, or a deadline spent before the next address, is told nothing. Each
+    /// address the lookup gave gets an even share of what the deadline has left, the last one
+    /// all of it, so one that never answers leaves the next its turn.
     ///
     /// # Errors
     ///
@@ -217,17 +219,55 @@ where
     let within = deadline.remaining_or_timeout()?;
     let addrs = resolve_within(host, port, within, resolver)
         .map_err(|error| refused_local(host, error, denial_wait(&deadline), denied))?;
+    connect_each(
+        host,
+        &addrs,
+        &deadline,
+        crate::connect::connect_timeout,
+        failed,
+    )
+}
+
+/// Connect by `connect` to the first of `addrs`, `host`'s, that answers within `deadline`,
+/// telling `failed` of each that did not ([`TcpConnector::connect_noting`]). Each address still
+/// to try gets an even share of what is left, the last one all of it: an address that never
+/// answers (a stale mDNS answer for a Mac that moved, a broken IPv6 path) leaves the ones after it
+/// their turn, and the time a prompt refusal leaves goes to them.
+fn connect_each(
+    host: &str,
+    addrs: &[SocketAddr],
+    deadline: &Deadline,
+    mut connect: impl FnMut(&SocketAddr, Duration) -> io::Result<TcpStream>,
+    failed: &mut dyn FnMut(SocketAddr, &io::Error),
+) -> io::Result<TcpStream> {
     let mut last = None;
-    for addr in addrs {
+    for (tried, addr) in addrs.iter().enumerate() {
         let (budget, cap) = deadline.per_call()?;
-        match crate::connect::connect_timeout(&addr, budget) {
+        let left = u32::try_from(addrs.len() - tried).unwrap_or(u32::MAX);
+        // Never a zero timeout, which a connect refuses as invalid rather than spends.
+        let share = (budget / left).max(Duration::from_millis(1)).min(budget);
+        match connect(addr, share) {
             Ok(stream) => {
                 stream.set_nodelay(true)?;
                 return Ok(stream);
             }
             Err(error) => {
-                let error = deadline.as_timeout(error, cap);
-                failed(addr, &error);
+                let timed_out = matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                );
+                let error = if timed_out && share < budget {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "no answer within its share of the deadline ({}ms)",
+                            share.as_millis()
+                        ),
+                    )
+                } else {
+                    deadline.as_timeout(error, cap)
+                };
+                failed(*addr, &error);
                 last = Some(error);
             }
         }
@@ -820,6 +860,57 @@ mod tests {
             let kept = without_mdns(host, error);
             assert_eq!((kept.kind(), kept.to_string()), (kind, text), "{host}");
         }
+    }
+
+    /// Each address the lookup gave gets an even share of what the deadline has left and the
+    /// last all of it: two stale answers that never answer leave the live one its turn, each
+    /// told as timed out.
+    /// NEGATIVE CONTROL: give each address the whole of what is left and the first takes it.
+    #[test]
+    fn each_address_gets_its_share_of_the_deadline_and_the_last_the_rest() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let live = listener.local_addr().expect("addr");
+        // TEST-NET-1: never dialled, a stale answer's stand-in.
+        let stale: [SocketAddr; 2] = [
+            "192.0.2.1:7484".parse().expect("addr"),
+            "192.0.2.2:7484".parse().expect("addr"),
+        ];
+        let given = std::cell::RefCell::new(Vec::new());
+        let mut told = Vec::new();
+        let stream = connect_each(
+            "alab-secrets.local",
+            &[stale[0], stale[1], live],
+            &Deadline::after(HANG_DETECTOR),
+            |addr, within| {
+                given.borrow_mut().push(within);
+                if *addr == live {
+                    crate::connect::connect_timeout(addr, within)
+                } else {
+                    Err(io::Error::new(io::ErrorKind::TimedOut, "timed out"))
+                }
+            },
+            &mut |addr, error| told.push((addr, error.kind())),
+        )
+        .expect("the live address connects");
+        assert_eq!(stream.peer_addr().expect("a peer"), live);
+        let given = given.into_inner();
+        assert_eq!(given.len(), 3, "{given:?}");
+        assert!(given[0] <= HANG_DETECTOR / 3, "a third: {given:?}");
+        assert!(
+            given[1] <= HANG_DETECTOR / 2,
+            "half of what is left: {given:?}"
+        );
+        assert!(
+            given[2] > HANG_DETECTOR / 2,
+            "the last gets the rest: {given:?}"
+        );
+        assert_eq!(
+            told,
+            [
+                (stale[0], io::ErrorKind::TimedOut),
+                (stale[1], io::ErrorKind::TimedOut)
+            ]
+        );
     }
 
     /// The wait to ask is [`DENIAL_WAIT`] with time to spare, never more than

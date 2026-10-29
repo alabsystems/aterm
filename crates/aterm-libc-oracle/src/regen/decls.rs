@@ -171,7 +171,8 @@ pub fn derivable_traits(name: &str, inner: &Value, doc: &Doc) -> Result<Vec<&'st
         let Some(path) = tr.get("path").and_then(Value::as_str) else {
             continue;
         };
-        let Some(trait_name) = DERIVABLE_TRAITS.iter().find(|t| **t == path) else {
+        let seg = path.rsplit("::").next().unwrap_or(path);
+        let Some(trait_name) = DERIVABLE_TRAITS.iter().find(|t| **t == seg) else {
             continue;
         };
         let negative = imp.get("is_negative").and_then(Value::as_bool) == Some(true);
@@ -394,7 +395,7 @@ mod tests {
             r#""7":{"id":7,"name":"A","inner":{"variant":{"kind":"plain","discriminant":{"expr":"1","value":"1"}}}}"#.into(),
             r#""10":{"id":10,"inner":{"impl":{"trait":{"path":"Hash","id":20,"args":null},"is_synthetic":false,"blanket_impl":null,"is_negative":false,"items":[]}}}"#.into(),
             r#""11":{"id":11,"inner":{"impl":{"trait":{"path":"Send","id":21,"args":null},"is_synthetic":true,"blanket_impl":null,"is_negative":false,"items":[]}}}"#.into(),
-            r#""12":{"id":12,"inner":{"impl":{"trait":{"path":"Clone","id":22,"args":null},"is_synthetic":false,"blanket_impl":null,"is_negative":false,"items":[]}}}"#.into(),
+            r#""12":{"id":12,"inner":{"impl":{"trait":{"path":"core::clone::Clone","id":22,"args":null},"is_synthetic":false,"blanket_impl":null,"is_negative":false,"items":[]}}}"#.into(),
         ]
         .join(",");
         doc(&[1, 2, 3, 4, 6], &index, "")

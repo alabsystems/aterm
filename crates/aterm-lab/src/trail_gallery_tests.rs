@@ -250,7 +250,10 @@ fn rainbow_measurement_intent_uses_the_final_config_and_shared_style_and_motion_
         ),
         ("rainbow kitty pet", Some("cursor_trail = false"), false),
         ("rainbow kitty pet", Some("motion = ' REDUCE '"), false),
-        ("rainbow kitty pet", Some("motion = 'off'"), true),
+        // `off` and `none` ask for no motion: the shared parser reads them as
+        // Reduced (settings demo round 3), so no rainbow is expected.
+        ("rainbow kitty pet", Some("motion = 'off'"), false),
+        ("rainbow kitty pet", Some("motion = 'none'"), false),
         ("rainbow kitty pet", Some("motion = 'unknown'"), true),
         ("rainbow kitty pet", Some("serious_mode = true"), false),
         (
@@ -738,4 +741,81 @@ fn the_widened_scenarios_name_their_frames_and_paint_their_page() {
     for s in Scenario::ALL.into_iter().filter(|&s| s != Scenario::MoveUp) {
         assert!(!paint(s, Theme::Light).contains(MOVE_UP_MARK), "{s:?}");
     }
+}
+
+fn rgb_png(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut encoder = aterm_png::Encoder::new(&mut bytes, width, height);
+    encoder.set_color(aterm_png::ColorType::Rgb);
+    encoder.set_depth(aterm_png::BitDepth::Eight);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(rgb).unwrap();
+    writer.finish().unwrap();
+    bytes
+}
+
+/// A settings frame's clean twin is the frame with the bare card `settings card clean` answers laid at its place;
+/// every other pixel is the frame's. A card that does not lie inside the frame, or whose bytes are not the ones
+/// it declares, makes no twin.
+#[test]
+fn a_cards_clean_twin_lays_the_bare_card_at_its_place() {
+    let lit: Vec<u8> = (0..4 * 3).flat_map(|i| [i as u8, 100, 200]).collect();
+    let lit_png = rgb_png(4, 3, &lit);
+    let card_png = rgb_png(2, 1, &[7, 7, 7, 9, 9, 9]);
+    let encoded = aterm_codec::base64::encode(&card_png).unwrap();
+    let reply = format!("OK 1\nclean 1 1 2 1 {} {encoded}\n", card_png.len());
+    let twin = card_clean_twin(&lit_png, &reply).expect("a twin");
+    let (px, w, h) = aterm_png::decode_rgba8(&twin, 64).expect("the twin decodes");
+    assert_eq!((w, h), (4, 3));
+    for y in 0..3 {
+        for x in 0..4 {
+            let got = &px[(y * 4 + x) * 4..][..3];
+            let want: [u8; 3] = match (x, y) {
+                (1, 1) => [7, 7, 7],
+                (2, 1) => [9, 9, 9],
+                _ => [(y * 4 + x) as u8, 100, 200],
+            };
+            assert_eq!(got, want, "pixel {x},{y}");
+        }
+    }
+    let outside = format!("clean 3 1 2 1 {} {encoded}\n", card_png.len());
+    assert!(
+        card_clean_twin(&lit_png, &outside).is_err(),
+        "a card past the frame's edge"
+    );
+    let short = format!("clean 1 1 2 1 {} {encoded}\n", card_png.len() - 1);
+    assert!(
+        card_clean_twin(&lit_png, &short).is_err(),
+        "a byte count that is not the card's"
+    );
+}
+
+/// A `settings card` reply's lines become the terminal frame's sidecars, a client run's `OK <n>` head passed over;
+/// a reply without its dims line keeps none.
+#[test]
+fn a_card_reply_names_the_frames_sidecars() {
+    let files = card_sidecars(
+        "OK 5\ndims OK 2 4 36 32 cell_w=9 cell_h=16 pad=10 pad_top=20 head=0\ncursor OK 1 2 1 steady_block\n\
+         status phase=52 pet_body=none word_icons=none\ntext ab\ntext\n",
+    )
+    .expect("the sidecars");
+    let get = |suffix: &str| {
+        files
+            .iter()
+            .find(|(s, _)| *s == suffix)
+            .map(|(_, body)| body.as_str())
+    };
+    assert_eq!(
+        get("dims.txt"),
+        Some("OK 2 4 36 32 cell_w=9 cell_h=16 pad=10 pad_top=20 head=0\n")
+    );
+    assert_eq!(get("cursor.txt"), Some("OK 1 2 1 steady_block\n"));
+    assert_eq!(
+        get("status.txt"),
+        Some("phase=52 pet_body=none word_icons=none\n")
+    );
+    assert_eq!(get("text.txt"), Some("ab\n\n"));
+    let grid = crate::trail_contrast::grid_from_dims(get("dims.txt").unwrap()).expect("a grid");
+    assert_eq!((grid.ox, grid.oy, grid.cw, grid.ch), (10, 20, 9, 16));
+    assert!(card_sidecars("OK 1\ncursor OK 1 2 1 steady_block\n").is_err());
 }

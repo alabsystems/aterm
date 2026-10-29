@@ -77,8 +77,9 @@ impl AccountsHost for Host<'_> {
     fn status_in_home(&self, _: &str) -> Result<Captured, String> {
         Ok(Captured {code:Some(0),stdout:format!(r#"{{"loggedIn":true,"authMethod":"claude.ai","email":"{MAIL}","subscriptionType":"max"}}"#).into_bytes()})
     }
-    fn claude_principal_in_home(&self, home: &str) -> Option<[u8; 32]> {
-        profile::principal_in_home(Path::new(home))
+
+    fn claude_identity_in_home(&self, home: &str, email: &str) -> profile::IdentityObservation {
+        profile::identity_in_home(Path::new(home), email)
     }
 }
 
@@ -409,14 +410,18 @@ impl AccountsHost for ScenarioHost<'_> {
         result
     }
     fn status_in_home(&self, home: &str) -> Result<Captured, String> {
+        if self.case == 8 {
+            std::fs::write(
+                Path::new(home).join(".claude.json"),
+                format!(r#"{{"oauthAccount":{{"emailAddress":"{MAIL}"}}}}"#),
+            )
+            .unwrap();
+        }
         self.base.status_in_home(home)
     }
-    fn claude_principal_in_home(&self, home: &str) -> Option<[u8; 32]> {
-        if self.case == 8 {
-            None
-        } else {
-            self.base.claude_principal_in_home(home)
-        }
+
+    fn claude_identity_in_home(&self, home: &str, email: &str) -> profile::IdentityObservation {
+        self.base.claude_identity_in_home(home, email)
     }
 }
 
@@ -1139,8 +1144,9 @@ impl AccountsHost for CheckpointFailureHost<'_> {
         }
         Ok(checked)
     }
-    fn claude_principal_in_home(&self, home: &str) -> Option<[u8; 32]> {
-        self.base.claude_principal_in_home(home)
+
+    fn claude_identity_in_home(&self, home: &str, email: &str) -> profile::IdentityObservation {
+        self.base.claude_identity_in_home(home, email)
     }
 }
 

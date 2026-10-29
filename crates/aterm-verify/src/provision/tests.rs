@@ -1081,8 +1081,25 @@ fn bash_is_built_from_its_source_and_each_patch_in_order_where_the_tests_resolve
             "LDFLAGS",
             "CPATH",
             "LIBRARY_PATH",
+            "LIBS",
+            "CPP",
+            "YACC",
+            "LD",
+            "CONFIG_SITE",
+            "CONFIG_SHELL",
+            "SDKROOT",
+            "MAKE",
+            "MAKEFLAGS",
+            "EGREP_TRADITIONAL",
+            "ac_cv_path_install",
+            "bash_cv_termcap_lib",
         ] {
-            assert!(step.remove.iter().any(|k| k == gone), "{gone}: {step:?}");
+            assert!(
+                step.remove
+                    .iter()
+                    .any(|k| k == gone || k.strip_suffix('*').is_some_and(|p| gone.starts_with(p))),
+                "{gone}: {step:?}"
+            );
         }
     }
 

@@ -6,10 +6,19 @@
 //! committed builds read as the verb reads them, an interrupt read as the run's, and a refusal,
 //! an interrupt, a panic or a second interrupt after the fixtures leaving the checkout as it was.
 
+use std::collections::BTreeSet;
 use std::os::unix::process::ExitStatusExt as _;
+use std::process::ExitStatus;
+use std::time::Duration;
 
 use super::*;
 use crate::instance::World;
+use crate::measure::{
+    Written, aterm_artifact, built, committed, fixed_point, git, header_build, made, passed_tests,
+    previous, read_but_not_held, repo_with, standing_verdict, step_shapes,
+};
+use crate::reduce;
+use crate::stop::Stopped;
 
 const COMMITTED: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -132,20 +141,29 @@ fn a_reduction_whose_own_line_names_another_build_refuses_key() {
             ))
         }
     };
-    let text = reduce_leg("first", &source, B, &names(header(B))).expect("its own line names B");
-    assert_eq!(header_build(&text), Some(B));
-    let r = reduce_leg("first", &source, B, &names(header(other))).expect_err("another build");
+    let text =
+        reduce_leg(&CODEX, "first", &source, B, &names(header(B))).expect("its own line names B");
+    assert_eq!(header_build(Program::Codex, &text), Some(B));
+    let r =
+        reduce_leg(&CODEX, "first", &source, B, &names(header(other))).expect_err("another build");
     assert_eq!(r.class, Class::Key, "{}", r.why);
     assert!(
         r.why.contains("own line names") && r.why.contains(other),
         "{}",
         r.why
     );
-    let r = reduce_leg("first", &source, B, &names("# codex - · lab reduce".into()))
-        .expect_err("no build");
+    let r = reduce_leg(
+        &CODEX,
+        "first",
+        &source,
+        B,
+        &names("# codex - · lab reduce".into()),
+    )
+    .expect_err("no build");
     assert_eq!(r.class, Class::Key, "{}", r.why);
     assert!(r.why.contains("no build"), "{}", r.why);
-    let r = reduce_leg("first", &meta(other), B, &names(header(B))).expect_err("the rollout's own");
+    let r = reduce_leg(&CODEX, "first", &meta(other), B, &names(header(B)))
+        .expect_err("the rollout's own");
     assert_eq!(r.class, Class::Key, "{}", r.why);
     assert!(r.why.contains("row 1"), "{}", r.why);
 }
@@ -198,7 +216,8 @@ fn a_reduction_that_is_no_fixed_point_refuses_fixed_point() {
     let path = format!("{COMMITTED}/codex-alab-0.165.0-dev.13594-first.jsonl");
     let committed = std::fs::read_to_string(&path).expect("a committed reduction");
     assert_eq!(
-        fixed_point("first", &committed, &reduce_checked).expect("the real reducer"),
+        fixed_point("first", &committed, &reduce_checked(Program::Codex))
+            .expect("the real reducer"),
         committed,
         "a committed reduction is its own fixed point"
     );
@@ -218,7 +237,7 @@ fn a_key_or_record_no_build_showed_refuses_new_key() {
         &old,
     )];
     let same = vec![("first", old.replace("13580", "13586"))];
-    let j = judge(B, &same, &committed).expect("nothing new");
+    let j = judge(&CODEX, B, &same, &committed).expect("nothing new");
     assert_eq!(
         (j.builds, j.prev.as_deref()),
         (1, Some("0.165.0-dev.13580+gaaaaaaaaa"))
@@ -230,7 +249,7 @@ fn a_key_or_record_no_build_showed_refuses_new_key() {
             r#"{"type":"event_msg","payload":{"type":"task_complete","brand_new_key":1}}"#
         ),
     )];
-    let r = judge(B, &key, &committed).expect_err("a key no build showed");
+    let r = judge(&CODEX, B, &key, &committed).expect_err("a key no build showed");
     assert_eq!(r.class, Class::NewKey, "{}", r.why);
     assert!(r.why.contains("key \"brand_new_key\""), "{}", r.why);
     let kind = vec![(
@@ -240,13 +259,23 @@ fn a_key_or_record_no_build_showed_refuses_new_key() {
             r#"{"type":"event_msg","payload":{"type":"brand_new_event"}}"#
         ),
     )];
-    let r = judge(B, &kind, &committed).expect_err("a record no build showed");
+    let r = judge(&CODEX, B, &kind, &committed).expect_err("a record no build showed");
     assert_eq!(r.class, Class::NewKey, "{}", r.why);
     assert!(
         r.why.contains("record event_msg/brand_new_event"),
         "{}",
         r.why
     );
+    // A name the reducer gives a key (`k<n>`) holds nothing of the program's: a build whose
+    // reduction renames more keys than any measured one showed shows no new key by it.
+    let renamed = vec![(
+        "first",
+        format!(
+            "{old}{}\n",
+            r#"{"type":"event_msg","payload":{"type":"task_complete","k9":{"k10":1}}}"#
+        ),
+    )];
+    judge(&CODEX, B, &renamed, &committed).expect("the reducer's key names are no new key");
 }
 
 #[test]
@@ -264,17 +293,26 @@ fn a_rollout_key_the_previous_build_showed_refuses_gone() {
         &old,
     )];
     let lost = vec![("first", old.replace(",\"duration_ms\":3", ""))];
-    let r = judge(B, &lost, &committed).expect_err("a key the fold reads is gone");
+    let r = judge(&CODEX, B, &lost, &committed).expect_err("a key the fold reads is gone");
     assert_eq!(r.class, Class::Gone, "{}", r.why);
     assert!(r.why.contains("rollout.duration_ms"), "{}", r.why);
     let unread = vec![("first", old.replace(",\"extra\":1", ""))];
-    let j = judge(B, &unread, &committed).expect("a key no reader reads may go");
+    let j = judge(&CODEX, B, &unread, &committed).expect("a key no reader reads may go");
     assert_eq!(
         j.noted,
         ["first: key \"extra\" gone since 0.165.0-dev.13580+gaaaaaaaaa"]
     );
     let other_leg = vec![("carry", old.replace(",\"duration_ms\":3", ""))];
-    judge(B, &other_leg, &committed).expect("only the same leg is held to it");
+    judge(&CODEX, B, &other_leg, &committed).expect("only the same leg is held to it");
+}
+
+#[test]
+fn gone_holds_a_build_to_every_rollout_key_the_fold_reads() {
+    assert_eq!(
+        read_but_not_held(&CODEX, Path::new(COMMITTED)),
+        Vec::<String>::new(),
+        "keys the fold reads of a committed reduction that ROLLOUT_KEYS does not name"
+    );
 }
 
 /// The codex-alab builds measured before 13594, which its measurement was held to.
@@ -287,7 +325,7 @@ const BEFORE_13594: [&str; 4] = [
 
 #[test]
 fn every_codex_alab_build_in_the_step_testdata_is_its_six_legs() {
-    let all = committed(Path::new(COMMITTED)).expect("the step testdata");
+    let all = committed(&CODEX, Path::new(COMMITTED)).expect("the step testdata");
     let builds: BTreeSet<&str> = all
         .iter()
         .filter_map(|r| r.build.as_deref())
@@ -307,7 +345,7 @@ fn every_codex_alab_build_in_the_step_testdata_is_its_six_legs() {
 
 #[test]
 fn the_committed_builds_read_as_measured_with_nothing_the_verb_would_refuse() {
-    let all = committed(Path::new(COMMITTED)).expect("the step testdata");
+    let all = committed(&CODEX, Path::new(COMMITTED)).expect("the step testdata");
     let build = "0.165.0-dev.13594+g870dabaa6";
     assert_eq!(admit(build, &all).expect("listed"), None);
     // 13594 as the verb would have judged it: against the builds measured before it, whatever
@@ -336,12 +374,12 @@ fn the_committed_builds_read_as_measured_with_nothing_the_verb_would_refuse() {
             (*leg, r.text.clone())
         })
         .collect();
-    let j = judge(build, &legs, &others).expect("13594 as the verb would have judged it");
+    let j = judge(&CODEX, build, &legs, &others).expect("13594 as the verb would have judged it");
     assert_eq!(j.prev.as_deref(), Some("0.164.0-dev.13172+g32a73bca2"));
     assert_eq!(j.builds, 4);
     assert!(j.noted.is_empty(), "{:?}", j.noted);
     assert_eq!(
-        step_shapes(&legs[2].1),
+        step_shapes(Program::Codex, &legs[2].1),
         [
             "prompt",
             "model",
@@ -356,11 +394,11 @@ fn the_committed_builds_read_as_measured_with_nothing_the_verb_would_refuse() {
         "the approval leg"
     );
     assert_eq!(
-        previous("0.164.0-dev.12672+g089291d37", &others).as_deref(),
+        previous(&CODEX, "0.164.0-dev.12672+g089291d37", &others).as_deref(),
         Some("0.164.0-dev.12521+g3d3eb12d8")
     );
     assert_eq!(
-        previous("0.164.0-dev.12000+gaaaaaaaaa", &others).as_deref(),
+        previous(&CODEX, "0.164.0-dev.12000+gaaaaaaaaa", &others).as_deref(),
         Some("0.164.0-dev.13172+g32a73bca2"),
         "none older: the newest"
     );
@@ -391,7 +429,7 @@ fn a_refusal_after_the_fixtures_leaves_the_checkout_as_it_was() {
         })
         .collect();
     let mut seen = 0;
-    let f = landed(&fixtures, |w| -> Result<(), Fail> {
+    let f = landed(&CODEX, &fixtures, |w| -> Result<(), Fail> {
         seen = status(repo).lines().count();
         w.create(&repo.join("note.md"), b"a note")
             .map_err(Fail::die)?;
@@ -408,10 +446,10 @@ fn a_refusal_after_the_fixtures_leaves_the_checkout_as_it_was() {
         "kept\n"
     );
     let taken = vec![(steps.join("codex-0.163.0.jsonl"), "over".to_string())];
-    let f = landed(&taken, |_| Ok(())).expect_err("never written over");
+    let f = landed(&CODEX, &taken, |_| Ok(())).expect_err("never written over");
     assert!(f.msg.unwrap_or_default().contains("never written over"));
     assert_eq!(status(repo), before);
-    let f = landed(&fixtures, |_| -> Result<(), Fail> {
+    let f = landed(&CODEX, &fixtures, |_| -> Result<(), Fail> {
         Err(Stopped(libc::SIGINT).into())
     })
     .expect_err("the run's interrupt");
@@ -426,7 +464,9 @@ fn a_refusal_after_the_fixtures_leaves_the_checkout_as_it_was() {
     );
     assert_eq!(status(repo), before, "an interrupt removes them too");
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        landed(&fixtures, |_| -> Result<(), Fail> { panic!("planted") })
+        landed(&CODEX, &fixtures, |_| -> Result<(), Fail> {
+            panic!("planted")
+        })
     }));
     assert!(panicked.is_err(), "the planted panic");
     assert_eq!(status(repo), before, "a panic removes them by the drop");
@@ -435,7 +475,7 @@ fn a_refusal_after_the_fixtures_leaves_the_checkout_as_it_was() {
         !made().iter().any(ours),
         "nothing of ours is left for a hard exit"
     );
-    let (w, ()) = landed(&fixtures, |_| Ok(())).expect("written");
+    let (w, ()) = landed(&CODEX, &fixtures, |_| Ok(())).expect("written");
     assert_eq!(w.len(), 6);
     assert_eq!(status(repo).lines().count(), 7);
     assert!(!made().iter().any(ours), "kept: no hard exit removes them");
@@ -493,32 +533,6 @@ fn a_second_interrupt_removes_what_the_run_wrote_before_it_ends_the_process() {
     assert!(left.is_empty(), "the hard exit removed them: {left:?}");
 }
 
-/// A git repository at `repo` holding the step testdata directory, one commit in it.
-fn repo_with(repo: &Path, files: &[(String, String)]) {
-    git(repo, &["init", "-q"]).expect("git init");
-    let steps = repo.join(STEPS);
-    std::fs::create_dir_all(&steps).expect("the steps dir");
-    for (name, text) in files {
-        std::fs::write(steps.join(name), text).expect("a reduction");
-    }
-    git(repo, &["add", "--", STEPS]).expect("git add");
-    git(
-        repo,
-        &[
-            "-c",
-            "user.name=lab",
-            "-c",
-            "user.email=lab@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-qm",
-            "the step testdata",
-        ],
-    )
-    .expect("git commit");
-}
-
 #[test]
 fn the_step_testdata_is_read_only_as_head_holds_it() {
     let tmp = aterm_tempfile::tempdir().expect("a scratch dir");
@@ -530,13 +544,13 @@ fn the_step_testdata_is_read_only_as_head_holds_it() {
         .chain([("claude-2.1.303.jsonl".to_string(), "{}\n".to_string())])
         .collect();
     repo_with(repo, &files);
-    let all = committed_in(repo).expect("as HEAD holds it");
+    let all = committed_in(&CODEX, repo).expect("as HEAD holds it");
     assert_eq!(all.len(), 6, "the codex reductions alone");
     assert_eq!(admit(measured, &all).expect("measured"), None);
     let steps = repo.join(STEPS);
     let leftover = "codex-alab-0.165.0-dev.13586-first.jsonl";
     std::fs::write(steps.join(leftover), format!("{}\n", header(B))).expect("a leftover");
-    let f = committed_in(repo).expect_err("an untracked reduction");
+    let f = committed_in(&CODEX, repo).expect_err("an untracked reduction");
     assert_eq!(f.code, 3);
     let msg = f.msg.unwrap_or_default();
     assert!(
@@ -545,19 +559,19 @@ fn the_step_testdata_is_read_only_as_head_holds_it() {
         "{msg}"
     );
     assert_eq!(
-        admit(B, &committed(&steps).expect("the files")).map_err(|r| r.class),
+        admit(B, &committed(&CODEX, &steps).expect("the files")).map_err(|r| r.class),
         Err(Class::Stem),
         "and were it read from the files, one leg would not read as measured either"
     );
     std::fs::remove_file(steps.join(leftover)).expect("removed");
     let changed = steps.join(&files[0].0);
     std::fs::write(&changed, "changed\n").expect("a change");
-    let f = committed_in(repo).expect_err("a changed reduction");
+    let f = committed_in(&CODEX, repo).expect_err("a changed reduction");
     assert!(f.msg.unwrap_or_default().contains(&files[0].0));
     git(repo, &["checkout", "-q", "--", STEPS]).expect("restored");
     std::fs::write(repo.join(".gitignore"), "*.ignored.jsonl\n").expect("an ignore");
     std::fs::write(steps.join("codex-alab-x.ignored.jsonl"), "x\n").expect("ignored");
-    let f = committed_in(repo).expect_err("an ignored reduction");
+    let f = committed_in(&CODEX, repo).expect_err("an ignored reduction");
     assert!(
         f.msg.unwrap_or_default().contains("!! "),
         "ignored files are named"
@@ -565,7 +579,7 @@ fn the_step_testdata_is_read_only_as_head_holds_it() {
     std::fs::remove_file(steps.join("codex-alab-x.ignored.jsonl")).expect("removed");
     std::fs::write(steps.join("notes.txt"), "x\n").expect("no reduction");
     assert_eq!(
-        committed_in(repo)
+        committed_in(&CODEX, repo)
             .expect("only codex reductions are held")
             .len(),
         6
@@ -613,11 +627,11 @@ fn the_standing_tests_pass_only_when_each_is_seen_passing_and_an_interrupt_is_th
         .map(|n| format!("test {n} ... ok\n"))
         .collect();
     assert_eq!(
-        standing_verdict(Ok(()), ok, &all).expect("every one passed"),
+        standing_verdict(&CODEX, Ok(()), ok, &all).expect("every one passed"),
         STANDING
     );
     let short = all.replace(&format!("test {} ... ok\n", STANDING[2]), "");
-    let f = standing_verdict(Ok(()), ok, &short).expect_err("one did not run");
+    let f = standing_verdict(&CODEX, Ok(()), ok, &short).expect_err("one did not run");
     let msg = f.msg.unwrap_or_default();
     assert!(
         msg.starts_with("REFUSED STANDING:")
@@ -625,13 +639,14 @@ fn the_standing_tests_pass_only_when_each_is_seen_passing_and_an_interrupt_is_th
         "{msg}"
     );
     let red = format!("{all}test x::y ... FAILED\n");
-    let f = standing_verdict(Ok(()), failed, &red).expect_err("the run failed");
+    let f = standing_verdict(&CODEX, Ok(()), failed, &red).expect_err("the run failed");
     let msg = f.msg.unwrap_or_default();
     assert!(
         msg.starts_with("REFUSED STANDING:") && msg.contains("(failed: x::y; did not pass: none)"),
         "{msg}"
     );
     let f = standing_verdict(
+        &CODEX,
         Err(Stopped(libc::SIGINT)),
         ExitStatus::from_raw(libc::SIGINT),
         "",

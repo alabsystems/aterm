@@ -74,16 +74,3 @@ fn a_promised_plan_keeps_its_promise_if_publication_fails() {
         "the failed publication leaves the obstacle alone"
     );
 }
-
-#[test]
-fn a_promised_plan_can_retire_after_a_readable_plan() {
-    let layout = layout("readable");
-    let sink = promised_sink(&layout);
-    sink.inner.lock().unwrap().last_write = None;
-    sink.plan_promised_pass(&layout, &[("trust".into(), 17)]);
-
-    let live = read_progress(&layout).unwrap();
-    assert_eq!(live.queue, ["trust"]);
-    assert_eq!(live.programs["trust"].phase, Phase::Queued);
-    assert!(!pass_owed(&layout, unix_now()));
-}

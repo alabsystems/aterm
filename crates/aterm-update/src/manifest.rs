@@ -1257,10 +1257,8 @@ mod tests {
 
     #[test]
     fn a_quarantine_suppresses_forever_while_the_shape_it_used_to_take_does_not() {
-        let root = std::env::temp_dir().join(format!("aterm-quarantine-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("failed.toml");
+        let staging = crate::paths::Staging::scratch("quarantine");
+        let path = staging.failed();
         let sha = "ab".repeat(32);
 
         FailedMark::record(&path, 42, &sha);
@@ -1287,8 +1285,12 @@ mod tests {
         assert!(!timed.is_quarantine());
         assert!(timed.suppresses(42, &sha, 100));
         assert!(!timed.suppresses(42, &sha, 100 + RETRY_BACKOFF_SECS[3]));
+        assert!(
+            artifact_quarantined(&staging, 42, &sha),
+            "record_stage_failure migrates a legacy quarantine in failed.toml to quarantine.toml"
+        );
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&staging.root);
     }
 
     fn timeline_class(now: u64, deadline: u64) -> i64 {

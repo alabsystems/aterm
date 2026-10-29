@@ -60,7 +60,7 @@ impl Manager {
             ),
         };
         let global = registry.find(name)?;
-        let version = global.version.min(max);
+        let version = global.version.min(max).max(1);
         let proxy = registry.bind(&global, iface, version)?;
         Some(Manager {
             kind,

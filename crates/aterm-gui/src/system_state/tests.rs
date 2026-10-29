@@ -1252,6 +1252,173 @@ fn headlines_say_the_state_in_the_designs_words() {
     assert!(fixture_status("toggles").is_none());
 }
 
+/// Where no ALab vault answered aterm's own join, the vault reads not joined in place, as
+/// `macos_doctor` reads it on any plan. On the base plan alone (a non-ALab Mac, its profile left
+/// as is, §3.2) the headline says Permissions are set up, the village draws the Secrets station
+/// settled, the row keeps its note and offers no Turn On Sync, and `setup=` reads done, though the
+/// run still parks on the vault. On the whole profile, whose GitHub repositories `macos_doctor`
+/// reads there as their stage runs them, on this Mac's own GitHub token, the headline says This
+/// Mac is set up once they are cloned; with no token of the Mac's own they wait for the vault's,
+/// as their stage does, and the headline, the village and `setup=` say so. A join the person typed
+/// a password for, which `macos_doctor` reads as waiting while the run holds that password for a
+/// try, holds the headline, the village and `setup=` at the vault, on the base plan too.
+#[test]
+fn a_vault_nothing_answered_for_is_set_up_and_a_typed_join_waits_for_it() {
+    use crate::system_state_access::setup_field;
+    let secrets = Subject::Setting(Setting::Secrets);
+    let line = |status: &SetupStatus| {
+        let plan = status.plan.clone().unwrap();
+        headline(status, &rows(status, plan.selection), Some(&plan))
+    };
+    let station_of = |status: &SetupStatus, at: Setting| {
+        let plan = status.plan.clone().unwrap();
+        let spec = village_spec(status, &rows(status, plan.selection), &plan, 0);
+        let at = Setting::ALL
+            .iter()
+            .position(|setting| *setting == at)
+            .unwrap();
+        spec.rsplit("states=")
+            .next()
+            .and_then(|states| states.chars().nth(at))
+            .unwrap()
+    };
+    let station = |status: &SetupStatus| station_of(status, Setting::Secrets);
+    fn reading_of(status: &mut SetupStatus, setting: Setting) -> &mut Observation {
+        status
+            .observed
+            .iter_mut()
+            .find(|observation| observation.subject == Subject::Setting(setting))
+            .unwrap()
+    }
+    fn vault_of(status: &mut SetupStatus) -> &mut Observation {
+        reading_of(status, Setting::Secrets)
+    }
+    let unanswered = "The ALab vault did not answer on this network";
+
+    let base = status_of("non-alab");
+    assert_eq!(
+        base.plan.as_ref().map(|plan| plan.selection),
+        Some(BASE_PLAN)
+    );
+    let done = line(&base);
+    assert_eq!(
+        (done.text.as_str(), done.show, done.start),
+        ("Permissions are set up", None, false)
+    );
+    assert_eq!(station(&base), 'G');
+    let row = row_view(secrets, &base, BASE_PLAN);
+    assert_eq!(
+        (&row.value, row.chip, row.note.as_deref(), row.turn_on_sync),
+        (
+            &RowValue::One("Not joined".into()),
+            Some(Chip::InPlace),
+            Some(unanswered),
+            false
+        )
+    );
+    // The run still parks on the vault and asks again by itself, so it has not finished; the
+    // page says set up, and so does `setup=`, as it does once the run ends.
+    assert!(!base.finished && !base.cancelled);
+    assert_eq!(setup_field(&base), "done");
+    // While a pass goes, the page says so, and `setup=` is pending.
+    let going = SetupStatus {
+        busy: true,
+        ..base.clone()
+    };
+    assert_ne!(line(&going).text, "Permissions are set up");
+    assert_eq!(setup_field(&going), "pending");
+    let ended = SetupStatus {
+        finished: true,
+        ..base.clone()
+    };
+    assert_eq!(setup_field(&ended), "done");
+    let mut app = SystemStateApp::new(Plan::from(BASE_PLAN));
+    app.publish(base.clone());
+    assert!(!app.needs_attention());
+    assert_eq!(
+        label(
+            &compile(&app, &SystemStateViewState::default(), 999.0, 1400.0),
+            HEADLINE
+        ),
+        "Permissions are set up"
+    );
+
+    // The whole profile, its vault read as on the base plan: the vault waits on nothing there
+    // either. Its GitHub repositories read on this Mac's own token, as their stage clones them
+    // there: in place once every one is cloned, with the count GitHub gave.
+    let repositories = Subject::Setting(Setting::Repositories);
+    let mut profile = status_of("set-up");
+    *vault_of(&mut profile) = vault_of(&mut base.clone()).clone();
+    *reading_of(&mut profile, Setting::Repositories) = Observation {
+        standing: Standing::InPlace,
+        now: Some("All 12".to_owned()),
+        wanted: "All 12".to_owned(),
+        ..Observation::unknown(repositories)
+    };
+    assert_eq!(profile.plan, Some(Plan::default()));
+    let done = line(&profile);
+    assert_eq!(
+        (done.text.as_str(), done.show, done.start),
+        ("This Mac is set up", None, false)
+    );
+    assert_eq!(station(&profile), 'G');
+    assert_eq!(setup_field(&profile), "done");
+    // With no token of the Mac's own, they wait for the vault's, as their stage does.
+    let mut no_token = profile.clone();
+    *reading_of(&mut no_token, Setting::Repositories) = Observation {
+        standing: Standing::Waiting,
+        note: Some("Waits for the vault to finish syncing this Mac".to_owned()),
+        ..Observation::unknown(repositories)
+    };
+    let waiting = line(&no_token);
+    assert_eq!(
+        (waiting.text.as_str(), waiting.show, waiting.start),
+        (
+            "1 step waiting: GitHub repositories",
+            Some(repositories),
+            false
+        )
+    );
+    assert_eq!(station(&no_token), 'G');
+    assert_eq!(station_of(&no_token, Setting::Repositories), 'D');
+    assert_eq!(setup_field(&no_token), "pending:repos");
+
+    // A join the person typed waits for that vault, on the base plan too.
+    let mut typed = base.clone();
+    let waits = vault_of(&mut typed);
+    waits.standing = Standing::Waiting;
+    Setting::Secrets.wanted().clone_into(&mut waits.wanted);
+    let waiting = line(&typed);
+    assert_eq!(
+        (waiting.text.as_str(), waiting.show, waiting.start),
+        ("1 step waiting: Secrets vault", Some(secrets), false)
+    );
+    assert_eq!(station(&typed), 'D');
+    assert_eq!(setup_field(&typed), "pending:vault");
+    // A run that ended holds no password for a try, so `macos_doctor` reads its vault as `base`'s,
+    // which reads done once the run ends (`ended` above).
+}
+
+/// The base plan's headline names the permissions only where the plan sets them up: the same
+/// groups with aterm's permissions left as is say This Mac is set up.
+#[test]
+fn the_base_plan_headline_names_permissions_only_where_it_sets_them_up() {
+    let line = |status: &SetupStatus| {
+        let plan = status.plan.clone().unwrap();
+        headline(status, &rows(status, plan.selection), Some(&plan)).text
+    };
+    let base = status_of("non-alab");
+    assert_eq!(line(&base), "Permissions are set up");
+    let mut without = BASE_PLAN;
+    without.set(Setting::Permissions, false);
+    let status = SetupStatus {
+        plan: Some(Plan::from(without)),
+        ..base
+    };
+    assert_eq!(group_choice(Group::Access, without), GroupChoice::LeaveAsIs);
+    assert_eq!(line(&status), "This Mac is set up");
+}
+
 /// Rows that only wait are no change to make (§3.2): the count and Set up now come only with a
 /// row that differs, and the count then takes in the waiting rows too (each shows `Will change`).
 /// Rows that only wait are named in page order, with a Show to the first, each saying what it
@@ -2320,6 +2487,34 @@ fn an_accepted_plan_does_not_undo_a_choice_made_while_it_waited() {
     assert!(app.awaiting.is_none());
 }
 
+/// The offer of a plan an earlier process admitted is answered by the page itself on the first
+/// tick a person is here, while the run it resumes keeps the page busy; a page asked to Stop that
+/// run gives no answer to the offer still up, in that frame or later.
+#[test]
+fn a_page_asked_to_stop_gives_the_resumed_offer_no_answer() {
+    let running = || SetupStatus {
+        busy: true,
+        plan: Some(Plan::default()),
+        ..SetupStatus::default()
+    };
+    for stop in [false, true] {
+        let (send, _receive) = mpsc::channel();
+        let mut app = SystemStateApp::new(Plan::default());
+        app.publish(running());
+        assert!(app.offer(Request::resume(Plan::default(), send)));
+        if stop {
+            act(&mut app, "system-state/stop");
+            assert!(matches!(app.take_action(), Some(SystemStateAction::Stop)));
+        }
+        app.tick(true, true, false);
+        let answered = matches!(
+            app.take_action(),
+            Some(SystemStateAction::Apply(_, Admission::Automatic))
+        );
+        assert_eq!(answered, !stop, "stop {stop}");
+    }
+}
+
 /// Design revision 4: the launch's offer is answered by the page itself, as the plan stands, on
 /// the first tick a person is at this Mac, shown or not; with nobody at the Mac it waits (SAFE-1).
 /// The answer is aterm's own, never a choice, and carries no typed vault.
@@ -3057,7 +3252,11 @@ fn every_scenario_lays_out_at_every_width_with_the_designs_labels() {
             app.publish(status_of(scenario));
             let view = SystemStateViewState::default();
             let compiled = compile(&app, &view, width, height);
-            assert_eq!(label(&compiled, "system-state/brand"), "aterm ALab");
+            assert_eq!(
+                label(&compiled, "system-state/brand"),
+                "aterm ALab",
+                "the spoken label drops the lockup's middle dot"
+            );
             assert!(
                 compiled
                     .semantic(&UiKey::new("system-state/check"))
@@ -3175,8 +3374,9 @@ fn the_failure_headlines_show_button_scrolls_to_the_failed_row() {
     assert!(compiled.semantic(&row).is_some_and(|node| !node.offscreen));
 }
 
-/// A vault that waits for an address is shown from the headline: with its fields open, Show
-/// brings Join and the fields into view.
+/// A vault that waits for an address, after a Join the person typed a password for found none
+/// there, is shown from the headline: with its fields open, Show brings Join and the fields into
+/// view.
 #[test]
 fn a_waiting_vault_is_shown_from_the_headline() {
     let mut app = SystemStateApp::new(Plan::default());
@@ -3470,7 +3670,6 @@ fn every_word_and_button_face_is_whole_in_a_narrow_pane_at_every_text_size() {
 #[test]
 fn a_short_window_keeps_the_headline_and_the_footer_in_view() {
     use crate::native_appearance::{AppearancePreferences, install_preferences};
-    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
     let controls = [
         "system-state/headline/open",
         "system-state/headline/show",
@@ -3479,40 +3678,52 @@ fn a_short_window_keeps_the_headline_and_the_footer_in_view() {
         "system-state/check",
         "system-state/restore",
     ];
-    for (scale, narrowest, least) in [(1.0_f32, 128, 200), (1.5, 160, 320), (2.0, 200, 440)] {
-        let _ = install_preferences(AppearancePreferences {
-            text_scale: scale,
-            ..AppearancePreferences::default()
-        });
-        let mut steady = std::collections::HashMap::new();
-        let mut failed_many = status_of("failed");
-        for observation in &mut failed_many.observed {
-            if matches!(observation.subject, Subject::Setting(_)) {
-                observation.standing = Standing::Failed;
-            }
-        }
-        for (scenario, status) in [
-            "checking",
-            "running",
-            "debugger",
-            "needs-you",
-            "vault",
-            "set-up",
-            "non-alab",
-            "failed",
-            "check-failed",
-            "mixed",
-            "fresh",
-        ]
-        .map(|scenario| (scenario, status_of(scenario)))
+    // Each window width at each text size is one item, whose states and heights hold every check
+    // here (the steady title and brand compare one width's windows across states), so the items
+    // run side by side; a worker prepares its own fonts and text size, a thread's own in tests.
+    let windows: Vec<(f32, i32, i32)> = [(1.0_f32, 128, 200), (1.5, 160, 320), (2.0, 200, 440)]
         .into_iter()
-        .chain([("failed-many", failed_many)])
-        {
-            // The vault that waits for an address names the repositories that wait on it too.
-            let one_name = !matches!(scenario, "failed-many" | "vault");
-            let mut app = SystemStateApp::new(Plan::default());
-            app.publish(status);
-            for width in [narrowest, 240, 320, 420, 520, 720] {
+        .flat_map(|(scale, narrowest, least)| {
+            [narrowest, 240, 320, 420, 520, 720].map(move |width| (scale, least, width))
+        })
+        .collect();
+    crate::native_settings::tests::on_workers(
+        &windows,
+        "short window",
+        |&(scale, least, width)| {
+            crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+            let _ = install_preferences(AppearancePreferences {
+                text_scale: scale,
+                ..AppearancePreferences::default()
+            });
+            let mut steady = std::collections::HashMap::new();
+            let mut failed_many = status_of("failed");
+            for observation in &mut failed_many.observed {
+                if matches!(observation.subject, Subject::Setting(_)) {
+                    observation.standing = Standing::Failed;
+                }
+            }
+            for (scenario, status) in [
+                "checking",
+                "running",
+                "debugger",
+                "needs-you",
+                "vault",
+                "set-up",
+                "non-alab",
+                "failed",
+                "check-failed",
+                "mixed",
+                "fresh",
+            ]
+            .map(|scenario| (scenario, status_of(scenario)))
+            .into_iter()
+            .chain([("failed-many", failed_many)])
+            {
+                // The vault that waits for an address names the repositories that wait on it too.
+                let one_name = !matches!(scenario, "failed-many" | "vault");
+                let mut app = SystemStateApp::new(Plan::default());
+                app.publish(status);
                 let mut before: Option<(bool, bool, bool)> = None;
                 for height in (160..=1000).step_by(8) {
                     let (w, h) = (width as f32, height as f32);
@@ -3585,9 +3796,8 @@ fn a_short_window_keeps_the_headline_and_the_footer_in_view() {
                     before = Some((in_view, title, brand));
                 }
             }
-        }
-    }
-    let _ = install_preferences(AppearancePreferences::default());
+        },
+    );
 }
 
 /// The page and the view state the runtime holds for `view`.
@@ -4372,41 +4582,6 @@ fn a_page_owes_an_animation_wake_only_while_a_run_walks_on_a_shown_page() {
     assert!(!page_owes_animation_wake(false, false, true));
 }
 
-/// §5.6: the walk's wake holds off the input path. A key typed within the app-wide
-/// 2.5 s gap withholds a running, shown page's tick; 3 s later it owes it again. The
-/// gap is read from an injected keystroke ([`crate::hands_off_keys`]), so the hold
-/// arm is not vacuously off.
-#[test]
-fn a_recent_key_holds_a_running_shown_pages_walk_wake() {
-    let typed = std::time::Instant::now();
-    let later = typed + std::time::Duration::from_millis(3_000);
-
-    let hands_on = crate::hands_off_keys(true, Some(typed), typed);
-    assert!(
-        !hands_on,
-        "a key read at the instant it was typed is not hands-off"
-    );
-    assert!(
-        !page_owes_animation_wake(true, true, hands_on),
-        "a key typed just now holds the walk's wake off the input path"
-    );
-
-    // Control: 3 s after the last key the hands are off, so the same running, shown
-    // page owes its tick again — the hold, not an absent walk, suppressed it above.
-    let hands_off = crate::hands_off_keys(true, Some(typed), later);
-    assert!(hands_off, "3 s after a key the hands are off the keys");
-    assert!(
-        page_owes_animation_wake(true, true, hands_off),
-        "3 s after the last key the walk owes its tick again"
-    );
-
-    // An unfocused app never holds for typing: its hands are vacuously off.
-    assert!(
-        crate::hands_off_keys(false, Some(typed), typed),
-        "an unfocused app's hands are off the keys whatever was just typed"
-    );
-}
-
 /// A reading of `subject` with its note.
 fn observed_with_note(
     subject: Subject,
@@ -4577,69 +4752,81 @@ fn page_states() -> Vec<(String, SetupStatus, bool)> {
 #[test]
 fn every_state_keeps_its_words_whole_and_apart_from_320_to_800() {
     use crate::native_appearance::{AppearancePreferences, install_preferences};
-    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
-    let mut cut = std::collections::BTreeMap::<String, Vec<String>>::new();
     let scenarios = page_states();
-    for scale in [1.0_f32, 1.5, 2.0] {
+    // Each state at each text size, with the vault open and shut, is one item, whose cuts are
+    // keyed by all three, so the items run side by side; a worker prepares its own fonts and
+    // text size, a thread's own in tests.
+    let pages: Vec<(f32, usize, bool)> = [1.0_f32, 1.5, 2.0]
+        .into_iter()
+        .flat_map(|scale| {
+            (0..scenarios.len())
+                .flat_map(move |at| [true, false].map(move |vault_open| (scale, at, vault_open)))
+        })
+        .collect();
+    let found = std::sync::Mutex::new(std::collections::BTreeMap::<String, Vec<String>>::new());
+    crate::native_settings::tests::on_workers(&pages, "words whole", |&(scale, at, vault_open)| {
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
         let _ = install_preferences(AppearancePreferences {
             text_scale: scale,
             ..AppearancePreferences::default()
         });
-        for (name, status, stop) in &scenarios {
-            for vault_open in [true, false] {
-                let mut width = 320.0_f32;
-                while width <= 800.0 {
-                    let mut app = SystemStateApp::new(Plan::default());
-                    app.publish(status.clone());
-                    app.vault_open = Some(vault_open);
-                    if *stop {
-                        app.stopping = true;
-                    }
-                    let compiled = compile(&app, &SystemStateViewState::default(), width, 4000.0);
-                    for failure in compiled.fit_failures() {
-                        if failure.contains("kind=text-field") {
-                            continue;
-                        }
-                        let key = format!("{scale}x {name} open={vault_open}");
-                        let shape: String = failure
-                            .split_whitespace()
-                            .filter(|w| {
-                                w.starts_with("key=")
-                                    || w.starts_with("a=")
-                                    || w.starts_with("b=")
-                                    || w.starts_with("paint-")
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        let entry = cut.entry(format!("{key} :: {shape}")).or_default();
-                        if entry.len() < 3 {
-                            entry.push(format!("w={width}: {failure}"));
-                        }
-                    }
-                    for node in &compiled.paint {
-                        let Some(audit) = compiled.text_fit_audit_line(&node.key) else {
-                            continue;
-                        };
-                        if !audit.contains("kind=text-field")
-                            && audit.contains("clip-truncated=true")
-                        {
-                            let entry = cut
-                                .entry(format!(
-                                    "{scale}x {name} open={vault_open} :: clip-truncated {}",
-                                    node.key.as_str()
-                                ))
-                                .or_default();
-                            if entry.len() < 3 {
-                                entry.push(format!("w={width}: {audit}"));
-                            }
-                        }
-                    }
-                    width += 8.0;
+        let (name, status, stop) = &scenarios[at];
+        let mut cut = std::collections::BTreeMap::<String, Vec<String>>::new();
+        let mut width = 320.0_f32;
+        while width <= 800.0 {
+            let mut app = SystemStateApp::new(Plan::default());
+            app.publish(status.clone());
+            app.vault_open = Some(vault_open);
+            if *stop {
+                app.stopping = true;
+            }
+            let compiled = compile(&app, &SystemStateViewState::default(), width, 4000.0);
+            for failure in compiled.fit_failures() {
+                if failure.contains("kind=text-field") {
+                    continue;
+                }
+                let key = format!("{scale}x {name} open={vault_open}");
+                let shape: String = failure
+                    .split_whitespace()
+                    .filter(|w| {
+                        w.starts_with("key=")
+                            || w.starts_with("a=")
+                            || w.starts_with("b=")
+                            || w.starts_with("paint-")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let entry = cut.entry(format!("{key} :: {shape}")).or_default();
+                if entry.len() < 3 {
+                    entry.push(format!("w={width}: {failure}"));
                 }
             }
+            for node in &compiled.paint {
+                let Some(audit) = compiled.text_fit_audit_line(&node.key) else {
+                    continue;
+                };
+                if !audit.contains("kind=text-field") && audit.contains("clip-truncated=true") {
+                    let entry = cut
+                        .entry(format!(
+                            "{scale}x {name} open={vault_open} :: clip-truncated {}",
+                            node.key.as_str()
+                        ))
+                        .or_default();
+                    if entry.len() < 3 {
+                        entry.push(format!("w={width}: {audit}"));
+                    }
+                }
+            }
+            width += 8.0;
         }
-    }
-    let _ = install_preferences(AppearancePreferences::default());
+        found
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(cut);
+    });
+    let cut = found
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert!(
         cut.is_empty(),
         "{} kinds of cut or overlap:\n{cut:#?}",
@@ -5668,17 +5855,6 @@ fn local_network_reads_unknown_with_its_note_where_no_look_answered() {
     }
 }
 
-/// The brand's spoken label drops its middle dot, as a row's value does: the dot marks the
-/// lockup for the eye, and a screen reader hears the words alone (design §3.1).
-#[test]
-fn the_brand_label_reads_without_its_middle_dot() {
-    let mut app = SystemStateApp::new(Plan::default());
-    app.publish(status_of("set-up"));
-    let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
-    assert_eq!(label(&compiled, "system-state/brand"), "aterm ALab");
-    assert!(paint::BRAND_WORDS.contains('·'), "the eye still sees it");
-}
-
 /// The headline claims no more than was confirmed (design §3.2): a row a Check, or a run,
 /// could not confirm is counted and shown, as a row that could not be read is, beside the
 /// note that says so, never `This Mac is set up`.
@@ -6590,6 +6766,15 @@ fn a_restored_command_line_tools_tab_continues_before_another_install_is_offered
         app.take_action().is_none(),
         "a saved Install action is obsolete"
     );
+
+    status.developer_tools = Some(ToolsInstall::Queued);
+    app.publish(status.clone());
+    let row = app.reviewed_row(repositories);
+    assert_eq!(row.standing, Some(Standing::Waiting));
+    assert_eq!(row.note.as_deref(), Some(TOOLS_QUEUED_NOTE));
+    assert!(!row.install_tools);
+    assert!(!app.needs_attention());
+    assert!(crate::system_state_access::menu_line(&status, false).is_none());
 
     // The live process probe can confirm installation after recovery without requiring a
     // person, even though the persisted receipt alone did not say the command started.

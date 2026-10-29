@@ -249,6 +249,62 @@ pub(crate) fn group_memory(pid: u32) -> Option<crate::GroupMemory> {
     })
 }
 
+/// [`crate::group_usage`] on macOS (at most [`crate::MAX_GROUP_PIDS`] members).
+pub(crate) fn group_usage(pgid: u32) -> Option<Vec<crate::MemberUsage>> {
+    i32::try_from(pgid).ok().filter(|p| *p > 0)?;
+    let mut pids = [0 as c_int; crate::MAX_GROUP_PIDS];
+    let bytes = c_int::try_from(std::mem::size_of_val(&pids)).ok()?;
+    // SAFETY: `pids` is writable for `bytes` bytes, the size passed; the call returns how many
+    // bytes it wrote.
+    let n = unsafe { proc_listpids(PROC_PGRP_ONLY, pgid, pids.as_mut_ptr().cast(), bytes) };
+    let n = usize::try_from(n).ok()? / std::mem::size_of::<c_int>();
+    let (numer, denom) = crate::procs::imp::timebase();
+    let ns = |ticks: u64| crate::procs::ticks_to_ns(ticks, numer, denom);
+    Some(
+        pids.iter()
+            .take(n.min(crate::MAX_GROUP_PIDS))
+            .filter(|m| **m > 0)
+            .filter_map(|&m| {
+                let u = crate::procs::imp::rusage(m)?;
+                Some(crate::MemberUsage {
+                    pid: m.unsigned_abs(),
+                    start: u.ri_proc_start_abstime,
+                    cpu_ns: ns(u.ri_user_time.saturating_add(u.ri_system_time)),
+                    runnable_ns: ns(u.ri_runnable_time),
+                    io_bytes: u
+                        .ri_diskio_bytesread
+                        .saturating_add(u.ri_diskio_byteswritten)
+                        .saturating_add(u.ri_logical_writes),
+                    footprint: u.ri_phys_footprint,
+                    peak_footprint: u.ri_lifetime_max_phys_footprint,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// [`crate::hid_idle`] on macOS: `IOHIDSystem`'s `HIDIdleTime` property, nanoseconds.
+pub(crate) fn hid_idle() -> Option<std::time::Duration> {
+    // SAFETY: a NUL-terminated class name; `IOServiceGetMatchingService` consumes the matching
+    // dictionary, and the service it answers is ours (+1), released below.
+    let service = unsafe {
+        let matching = iokit::IOServiceMatching(c"IOHIDSystem".as_ptr());
+        if matching.is_null() {
+            return None;
+        }
+        iokit::IOServiceGetMatchingService(MAIN_PORT_DEFAULT, matching.cast_const())
+    };
+    if service == 0 {
+        return None;
+    }
+    let idle = Cf::string(c"HIDIdleTime")
+        .and_then(|key| Cf::property(service, key.0))
+        .and_then(|value| cf_u64(value.0));
+    // SAFETY: the +1 service this function was given, released once, after its last use.
+    unsafe { iokit::IOObjectRelease(service) };
+    idle.map(std::time::Duration::from_nanos)
+}
+
 /// [`crate::lone_group_leader`] on macOS.
 pub(crate) fn lone_group_leader(pid: u32) -> Option<String> {
     let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
@@ -380,16 +436,17 @@ fn vm_statistics() -> Option<libc::vm_statistics64> {
     (kr == 0).then_some(vm)
 }
 
-/// [`crate::machine_memory`] on macOS: one `HOST_VM_INFO64` read, sized by `vm.pagesize`.
+/// [`crate::machine_memory`] on macOS: one `HOST_VM_INFO64` read, sized by `vm.pagesize` and capped at physical memory when known.
 pub(crate) fn machine_memory() -> Option<crate::MachineMemory> {
     let page_bytes = vm_pagesize()?;
     let vm = vm_statistics()?;
+    let physical = physical_memory_mib();
     let available_mib = crate::available_mib_of(
         u64::from(vm.free_count),
         u64::from(vm.inactive_count),
         u64::from(vm.purgeable_count),
         page_bytes,
-        physical_memory_mib(),
+        physical,
     )?;
     let used_mib = crate::used_mib_of(
         u64::from(vm.internal_page_count),
@@ -400,7 +457,7 @@ pub(crate) fn machine_memory() -> Option<crate::MachineMemory> {
     )?;
     Some(crate::MachineMemory {
         available_mib,
-        used_mib: u64::from(used_mib),
+        used_mib: crate::clamp_physical_mib(u64::from(used_mib), physical),
     })
 }
 

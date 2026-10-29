@@ -19,7 +19,14 @@ fn init_from_flag_rejects_unparsable_values() {
             for value in ["", "2", "ESCALATE_TO_ROOT"] {
                 let result =
                     aterm_containment::init_mode_from_flag(Some(value), ContainmentMode::User);
-                assert!(result.is_err(), "{value:?} must be rejected");
+                let err = result.expect_err("unparsable value must be rejected");
+                assert_eq!(
+                    err.to_string(),
+                    format!(
+                        "invalid containment mode: {value:?} (expected: user, safety, containment)"
+                    ),
+                    "{value:?}: Display must format without duplicating the prefix"
+                );
                 assert_eq!(
                     aterm_containment::try_current_mode(),
                     None,

@@ -3001,10 +3001,18 @@ fn a_foreign_trial_whose_owner_is_still_launching_is_never_disarmed() {
                 "round {round}: inside the budget"
             );
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
         let attempts = sentinel.observe_launch(1000).unwrap();
         assert!(attempts >= 1, "the owner really did advance its own trial");
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        let trial_mtime = std::fs::metadata(s.root.join("boot.sentinel"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(foreign_trial_path(&s))
+            .unwrap()
+            .set_modified(trial_mtime - std::time::Duration::from_secs(10))
+            .unwrap();
         assert!(
             !escape_wedged_foreign_trial(&s, 1001, 1000),
             "round {round}: an advance restarts the budget instead of completing it"

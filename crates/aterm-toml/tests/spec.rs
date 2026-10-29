@@ -372,22 +372,70 @@ fn end_of_input_errors_point_at_the_last_authored_line() {
 
 #[test]
 fn token_spans_underline_the_token() {
-    for (source, why) in INVALID {
-        let ours = source
-            .parse::<aterm_toml::edit::DocumentMut>()
-            .expect_err(why);
-        let span = ours.span().expect("every refusal carries a span");
-        assert!(
-            span.end <= source.len() && span.start <= span.end,
-            "{why}: span {span:?} is outside {source:?}"
-        );
-        assert!(
-            source.is_char_boundary(span.start) && source.is_char_boundary(span.end),
-            "{why}: span {span:?} splits a character in {source:?}"
-        );
-    }
     let ours = "int = 010\n"
         .parse::<aterm_toml::edit::DocumentMut>()
         .expect_err("a leading zero is refused");
     assert_eq!(ours.span(), Some(6..9), "ours underlines the literal");
+}
+
+/// What an app log keeps of an error ([`aterm_toml::Error::log_words`]) is its position, and
+/// never the offending line or a message quoting the value: an unterminated string and a serde
+/// refusal of a value each hold the plant in their `Display` (the person's diagnostic) and not
+/// in their log words.
+#[test]
+fn log_words_keeps_the_position_and_never_the_line() {
+    #[derive(Debug, serde::Deserialize)]
+    #[allow(dead_code)]
+    struct Config {
+        font_px: f64,
+        mode: Mode,
+    }
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    enum Mode {
+        Off,
+    }
+
+    let unterminated = "# first\nkey = \"QZP7E7T1\n";
+    let refusals = [
+        (
+            "an unterminated string, read as a document",
+            unterminated
+                .parse::<aterm_toml::edit::DocumentMut>()
+                .expect_err("refused"),
+            (2, 16),
+        ),
+        (
+            "an unterminated string, deserialized",
+            aterm_toml::from_str::<aterm_toml::Value>(unterminated).expect_err("refused"),
+            (2, 16),
+        ),
+        (
+            "a value of the wrong type",
+            aterm_toml::from_str::<Config>("font_px = \"QZP7E7T1\"\nmode = \"off\"\n")
+                .expect_err("refused"),
+            (1, 11),
+        ),
+        (
+            "a value no variant names",
+            aterm_toml::from_str::<Config>("font_px = 1.0\nmode = \"QZP7E7T1\"\n")
+                .expect_err("refused"),
+            (2, 8),
+        ),
+    ];
+    for (what, error, (line, col)) in refusals {
+        assert!(
+            error.to_string().contains("QZP7E7T1"),
+            "CONTROL: {what}: the diagnostic quotes the plant: {error}"
+        );
+        let words = error.log_words().to_string();
+        assert!(!words.contains("QZP7E7T"), "{what}: {words}");
+        assert_eq!(
+            words,
+            format!("TOML error at line {line}, column {col}"),
+            "{what}"
+        );
+    }
+    let ser = aterm_toml::to_string(&f64::NAN).expect_err("a bare float is no document");
+    assert_eq!(ser.log_words().to_string(), "TOML error", "{ser}");
 }

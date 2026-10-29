@@ -257,15 +257,22 @@ end
 # existed when last fronted so the per-prompt hot path only stats when a
 # directory was absent.
 set -g __aterm_managed_want
+set -g __aterm_managed_bin_on 0
 set -g __aterm_managed_agents_on 0
 set -g __aterm_managed_reroute_on 0
 function __aterm_reroute_path_front
     set -g __aterm_managed_want
+    set -g __aterm_managed_bin_on 0
     set -g __aterm_managed_agents_on 0
     set -g __aterm_managed_reroute_on 0
+    if test -n "$ATPKG_AGENTS"; and test -n "$ATPKG_BIN"; and test (string replace -r '/[^/]+/?$' '' -- "$ATPKG_BIN") = (string replace -r '/[^/]+/?$' '' -- "$ATPKG_AGENTS"); and test -d "$ATPKG_BIN"
+        __aterm_path_front "$ATPKG_BIN"
+        set -g __aterm_managed_want "$ATPKG_BIN"
+        set -g __aterm_managed_bin_on 1
+    end
     if test -n "$ATPKG_AGENTS"; and test -d "$ATPKG_AGENTS"
         __aterm_path_front "$ATPKG_AGENTS"
-        set -g __aterm_managed_want "$ATPKG_AGENTS"
+        set -g __aterm_managed_want "$ATPKG_AGENTS" $__aterm_managed_want
         set -g __aterm_managed_agents_on 1
     end
     if test -n "$ATERM_REROUTE_DIR"; and test -d "$ATERM_REROUTE_DIR"
@@ -275,23 +282,20 @@ function __aterm_reroute_path_front
     end
 end
 __aterm_reroute_path_front
-# Keep atpkg's managed `bin/` at the end of PATH after all startup files have run
-# so it never shadows user or system directories.
-function __aterm_managed_bin_last
-    test -n "$ATPKG_BIN"; and test "$PATH[-1]" != "$ATPKG_BIN"; and contains -- "$ATPKG_BIN" $PATH
-    or return 0
-    set -l rest
-    for d in $PATH
-        if test "$d" != "$ATPKG_BIN"
-            set -a rest "$d"
-        end
-    end
-    set -gx PATH $rest "$ATPKG_BIN"
+# Export `EDITOR=$ATERM_DEFAULT_EDITOR` (aterm's own editor, amacs) only when
+# neither `EDITOR` nor `VISUAL` is set once config.fish has run and the word
+# names a program on PATH; drop the hint either way, so no child inherits it.
+function __aterm_default_editor
+    set -l __aterm_word "$ATERM_DEFAULT_EDITOR"
+    set -q ATERM_DEFAULT_EDITOR; and set -e ATERM_DEFAULT_EDITOR
+    test -n "$__aterm_word"; and test -z "$EDITOR"; and test -z "$VISUAL"; or return 0
+    command -q -- $__aterm_word; or return 0
+    set -gx EDITOR $__aterm_word
 end
 function __aterm_reroute_first_prompt --on-event fish_prompt
     functions -e __aterm_reroute_first_prompt
     __aterm_reroute_path_front
-    __aterm_managed_bin_last
+    __aterm_default_editor
 end
 
 # Live managed PATH re-assertion on `fish_prompt` and `fish_preexec` (builtin-only:
@@ -359,6 +363,9 @@ function __aterm_managed_path_live
         end
     end
     set -l refront 0
+    if test "$__aterm_managed_bin_on" != 1; and test -n "$ATPKG_AGENTS"; and test -n "$ATPKG_BIN"; and test (string replace -r '/[^/]+/?$' '' -- "$ATPKG_BIN") = (string replace -r '/[^/]+/?$' '' -- "$ATPKG_AGENTS"); and test -d "$ATPKG_BIN"
+        set refront 1
+    end
     if test "$__aterm_managed_agents_on" != 1; and test -n "$ATPKG_AGENTS"; and test -d "$ATPKG_AGENTS"
         set refront 1
     end
@@ -433,9 +440,17 @@ function __aterm_rekey_check
     set -l st $status $pipestatus
     __aterm_prompt_inner; and set -g __aterm_prompt_status $st
     test -n "$__aterm_rekey_path"; and test -f "$__aterm_rekey_path"; or return 0
+    __aterm_rekey_take
+    command rm -f -- "$__aterm_rekey_path"
+end
+
+# Take a new nonce from the re-key file with builtins alone, leaving the file: a
+# command's D, signed with it, comes before any program runs (the `rm` of
+# `__aterm_rekey_check` follows the D).
+function __aterm_rekey_take
+    test -n "$__aterm_rekey_path"; and test -f "$__aterm_rekey_path"; or return 0
     set -l key ""
     read -l key <"$__aterm_rekey_path" 2>/dev/null
-    command rm -f -- "$__aterm_rekey_path"
     if string match -qr '^[0-9a-f]{64}$' -- "$key"
         set -g __aterm_shell_nonce "$key"
         set -g __aterm_id_suffix_str ";id=$key"
@@ -724,6 +739,7 @@ function __aterm_body_prompt
         return 0
     end
     __aterm_prompt_give_back_arm
+    __aterm_exec_mark_last
     __aterm_rekey_check
     __aterm_managed_path_live
     __aterm_report_cwd
@@ -860,19 +876,54 @@ function __aterm_fish_preexec --on-event fish_preexec
         end
         __aterm_osc "0;$cmd_title"
     end
-    __aterm_mark_exec_start
+    if functions -q __aterm_fish_exec_mark
+        set -g __aterm_exec_owed 1
+    else
+        __aterm_mark_exec_start
+    end
 end
 
-# fish_postexec - runs after command execution
-function __aterm_fish_postexec --on-event fish_postexec
-    set -l st $status $pipestatus
-    set -g __aterm_last_status $st[1]
-    set -g __aterm_last_pipestatus $st[2..-1]
+# The command's C, after every user fish_preexec handler: owed by
+# `__aterm_fish_preexec`, which wrote its E. fish runs an event's handlers in the
+# order they were defined, so `__aterm_exec_mark_last` defines this one again
+# whenever a handler was defined after it; a program a user's preexec handler runs
+# then comes before C, never inside the command.
+function __aterm_exec_mark_last
+    set -l last (functions --handlers-type generic | string match -- 'fish_preexec *')[-1]
+    test "$last" = "fish_preexec __aterm_fish_exec_mark"; and return 0
+    functions -e __aterm_fish_exec_mark
+    function __aterm_fish_exec_mark --on-event fish_preexec
+        set -q __aterm_exec_owed; or return 0
+        set -e __aterm_exec_owed
+        __aterm_mark_exec_start
+    end
+end
+
+# fish_postexec - runs after command execution. The handler is defined once per
+# shell (a live body leaves it where it was among the fish_postexec handlers, which
+# fish runs in the order they were defined: ahead of every one config.fish or a
+# later line defines), and writes the command's D before anything else.
+if not functions -q __aterm_fish_postexec
+    or not string match -q -- '*__aterm_body_postexec*' (functions --no-details __aterm_fish_postexec)
+    functions -e __aterm_fish_postexec
+    function __aterm_fish_postexec --on-event fish_postexec
+        __aterm_body_postexec $status $pipestatus
+    end
+end
+function __aterm_body_postexec
+    set -g __aterm_last_status $argv[1]
+    set -g __aterm_last_pipestatus $argv[2..-1]
+    if set -q __aterm_exec_owed
+        set -e __aterm_exec_owed
+        __aterm_mark_exec_start
+    end
+    __aterm_rekey_take
+    __aterm_mark_exec_finish $__aterm_last_status
+    __aterm_rekey_check
     set -e __aterm_prompt_status
     __aterm_prompt_wrap
     __aterm_prompt_give_back_arm
-    __aterm_rekey_check
-    __aterm_mark_exec_finish $__aterm_last_status
+    __aterm_exec_mark_last
 end
 
 # Update cwd on directory change and at startup

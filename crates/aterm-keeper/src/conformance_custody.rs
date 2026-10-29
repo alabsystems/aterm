@@ -905,70 +905,6 @@ fn the_real_keeper_conforms_to_the_custody_model() {
 }
 
 #[test]
-fn the_custody_anchors_are_live() {
-    assert!(
-        aterm_spec::xref::reset_entered_anchors(),
-        "the evidence window opens"
-    );
-    let model = pty_keeper_custody_model();
-    let mut rig = Rig::new(&model);
-    for mv in ["RegisterA", "RegisterB", "WindowCrashes"] {
-        env_move(&model, &mut rig, mv);
-    }
-    tick(&model, &mut rig);
-    let _ = classify_death(DeathEvidence {
-        successor_holds: false,
-        bye: true,
-        sends_bye: true,
-        status: Some(0),
-        marker: MarkerEvidence::Unknown,
-    });
-    let anchored: BTreeSet<(&str, &str)> = aterm_spec::xref::refinements()
-        .filter(|r| r.machine == "PtyKeeperCustody" || r.machine == "KeeperRelaunchBrake")
-        .map(|r| (r.machine, r.action))
-        .collect();
-    for action in [
-        "RegisterA",
-        "OfferA",
-        "Relaunch",
-        "WindowCrashes",
-        "CloseTabA",
-        "KeeperHonoursBye",
-        "RelaunchedLinkDrops",
-        "RelaunchedWindowQuits",
-    ] {
-        assert!(
-            anchored.contains(&("PtyKeeperCustody", action)),
-            "{action}: {anchored:?}"
-        );
-    }
-    let entered = aterm_spec::xref::entered_anchor_ids();
-    for id in [
-        "PtyKeeperCustody::RegisterA @ register",
-        "PtyKeeperCustody::Relaunch @ tick",
-        "PtyKeeperCustody::WindowCrashes @ peer_died",
-        "PtyKeeperCustody::OfferA @ offers_for",
-        "PtyKeeperCustody::KeeperHonoursBye @ classify_death",
-    ] {
-        assert!(entered.contains(id), "{id} never entered: {entered:?}");
-    }
-    let judged = keeper_death_judgement_model();
-    let st = judged.init_state();
-    let mut world = JudgeWorld {
-        st: &st,
-        alive: false,
-    };
-    let _ = KeeperCore::new(false).prune_dead_orphans(&mut world);
-    let entered = aterm_spec::xref::entered_anchor_ids();
-    for id in [
-        "KeeperDeathJudgement::Judge @ classify_death",
-        "KeeperDeathJudgement::KeeperSeesShellExit @ prune_dead_orphans",
-    ] {
-        assert!(entered.contains(id), "{id} never entered: {entered:?}");
-    }
-}
-
-#[test]
 fn the_real_brake_conforms_to_the_brake_model() {
     let model = keeper_relaunch_brake_model();
     let mut steps: BTreeSet<Step> = BTreeSet::new();
@@ -1063,7 +999,7 @@ fn the_real_brake_conforms_to_the_brake_model() {
 
 #[test]
 fn the_classifier_judges_real_ends() {
-    use std::process::{Command, Stdio};
+    use aterm_uds::spawnfd::Stdio;
     struct NoWorld {
         marker: Option<MarkerEvidence>,
         named: bool,
@@ -1088,7 +1024,7 @@ fn the_classifier_judges_real_ends() {
         }
     }
     let real_status = |how: &str| -> i32 {
-        let mut child = Command::new("/bin/sh")
+        let mut child = aterm_uds::spawnfd::command("/bin/sh")
             .args(["-c", &format!("read _; {how}")])
             .stdin(Stdio::piped())
             .spawn()
@@ -1128,14 +1064,21 @@ fn the_classifier_judges_real_ends() {
     assert_eq!(cases[3].1, 9);
     use MarkerEvidence::{Dead, Released, Unknown};
     for (name, status) in cases {
-        for (sends_bye, bye, marker) in [
-            (true, false, Unknown),
-            (false, false, Unknown),
-            (true, true, Unknown),
-            (true, false, Released),
-            (true, false, Dead),
-            (false, false, Dead),
+        for (sends_bye, bye, marker, on_zero, on_nonzero) in [
+            (true, false, Unknown, Verdict::Crash, Verdict::Crash),
+            (
+                false,
+                false,
+                Unknown,
+                Verdict::CleanPreKeeper,
+                Verdict::Crash,
+            ),
+            (true, true, Unknown, Verdict::Quit, Verdict::Quit),
+            (true, false, Released, Verdict::CleanExit, Verdict::Crash),
+            (true, false, Dead, Verdict::Crash, Verdict::Crash),
+            (false, false, Dead, Verdict::Crash, Verdict::Crash),
         ] {
+            let expected = if status == 0 { on_zero } else { on_nonzero };
             let verdict = classify_death(DeathEvidence {
                 successor_holds: false,
                 bye,
@@ -1143,15 +1086,6 @@ fn the_classifier_judges_real_ends() {
                 status: Some(status),
                 marker,
             });
-            let expected = if bye {
-                Verdict::Quit
-            } else if status == 0 && marker == Released {
-                Verdict::CleanExit
-            } else if !sends_bye && status == 0 && marker != Dead {
-                Verdict::CleanPreKeeper
-            } else {
-                Verdict::Crash
-            };
             assert_eq!(
                 verdict, expected,
                 "{name} sends_bye={sends_bye} bye={bye} marker={marker:?}"

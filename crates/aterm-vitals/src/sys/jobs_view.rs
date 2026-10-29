@@ -376,6 +376,10 @@ pub fn row_json(r: &JobRow, tab_number: Option<usize>) -> Jv {
     }
     o.set("verdict", Jv::s(r.verdict.word()));
     o.set("no_progress", Jv::Bool(r.no_progress));
+    if let Some((pid, start)) = r.working_descendant {
+        o.set("working_descendant", Jv::u(u64::from(pid)));
+        o.set("working_descendant_start", Jv::u(start));
+    }
     o.set("episode", Jv::u(u64::from(r.episode)));
     if let Some(e) = r.exit {
         o.set("exit", Jv::Int(i64::from(e)));
@@ -651,6 +655,29 @@ mod tests {
         assert!(contract_violations(&s).is_empty());
         assert_eq!(s.get("stuck"), Some(&Jv::Int(1)));
         assert_eq!(s.get("worst_quiet_ms"), Some(&Jv::Int(1_152_000)));
+    }
+
+    #[test]
+    fn json_preserves_the_active_descendant_that_qualifies_a_quiet_wrapper() {
+        let mut wrapper = stuck("a14175", 7);
+        wrapper.class = Class::Polling;
+        wrapper.working_descendant = Some((72956, 1_793_213_706_219_818));
+        let wire = wrapper.wire();
+        let json = row_json(&wrapper, Some(1));
+        assert!(wire.contains(" working_descendant=72956 "));
+        assert_eq!(json.get("working_descendant"), Some(&Jv::Int(72956)));
+        assert_eq!(
+            json.get("working_descendant_start"),
+            Some(&Jv::Int(1_793_213_706_219_818))
+        );
+        assert_eq!(json.get("verdict"), Some(&Jv::s("stuck")));
+        assert_eq!(json.get("class"), Some(&Jv::s("polling")));
+        assert!(contract_violations(&json).is_empty());
+
+        wrapper.working_descendant = None;
+        let json = row_json(&wrapper, Some(1));
+        assert!(json.get("working_descendant").is_none());
+        assert!(json.get("working_descendant_start").is_none());
     }
 
     #[test]

@@ -301,6 +301,7 @@ thread_local! {
     static FOOTER_ROWS_COMPARED: Cell<usize> = const { Cell::new(0) };
     static FOOTER_TOP_READS: Cell<usize> = const { Cell::new(0) };
     static FOOTER_TOPS_COMPOSED: Cell<usize> = const { Cell::new(0) };
+    static EFFORT_HINT_READS: Cell<usize> = const { Cell::new(0) };
 }
 
 pub(crate) fn harness_clock_read() {
@@ -424,6 +425,14 @@ pub(crate) fn take_footer_card_reads() -> usize {
 
 pub(crate) fn footer_top_read() {
     bump(&FOOTER_TOP_READS);
+}
+
+/// One whole-screen read for Claude's effort hint at an output (`App::read_claude_effort_hint`).
+pub(crate) fn effort_hint_read() {
+    bump(&EFFORT_HINT_READS);
+}
+pub(crate) fn take_effort_hint_reads() -> usize {
+    take(&EFFORT_HINT_READS)
 }
 pub(crate) fn take_footer_top_reads() -> usize {
     take(&FOOTER_TOP_READS)
@@ -581,6 +590,8 @@ thread_local! {
     static SETTINGS_LISTS_MEASURED: Cell<usize> = const { Cell::new(0) };
     static DOCK_LAYOUTS: Cell<usize> = const { Cell::new(0) };
     static BAR_LAYOUTS: Cell<usize> = const { Cell::new(0) };
+    static LIST_SEATS: Cell<usize> = const { Cell::new(0) };
+    static SHEET_LEASTS: Cell<usize> = const { Cell::new(0) };
     static PAGE_WORK_UNCOUNTED: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -595,6 +606,10 @@ pub(crate) struct SettingsPageWork {
     pub(crate) docks: usize,
     /// Status bars laid out.
     pub(crate) bars: usize,
+    /// Lists seated, for a page built or a screen told.
+    pub(crate) seats: usize,
+    /// The Customize sheet's least lists laid out, each laying its open pickers.
+    pub(crate) sheet_leasts: usize,
 }
 
 fn bump_page_work(counter: &'static std::thread::LocalKey<Cell<usize>>) {
@@ -628,11 +643,19 @@ pub(crate) fn dock_laid_out() {
 pub(crate) fn bar_laid_out() {
     bump_page_work(&BAR_LAYOUTS);
 }
+pub(crate) fn list_seated() {
+    bump_page_work(&LIST_SEATS);
+}
+pub(crate) fn sheet_least_laid() {
+    bump_page_work(&SHEET_LEASTS);
+}
 pub(crate) fn take_settings_page_work() -> SettingsPageWork {
     SettingsPageWork {
         pages: take(&SETTINGS_PAGES_BUILT),
         measures: take(&SETTINGS_LISTS_MEASURED),
         docks: take(&DOCK_LAYOUTS),
         bars: take(&BAR_LAYOUTS),
+        seats: take(&LIST_SEATS),
+        sheet_leasts: take(&SHEET_LEASTS),
     }
 }

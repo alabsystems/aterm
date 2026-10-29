@@ -602,9 +602,7 @@ impl ReleaseHost for RestHost {
     }
 
     fn reads_anonymously(&self) -> bool {
-        self.token_file
-            .as_ref()
-            .is_none_or(|f| !std::fs::metadata(f).is_ok_and(|m| m.len() > 0))
+        matches!(self.token(), Ok(None))
     }
 
     fn fetch_repo(&self, slug: &Slug, dir: &Path) -> Result<(), HostError> {
@@ -739,6 +737,36 @@ mod tests {
         assert!(
             cmd.get_envs()
                 .any(|(k, v)| k == GIT_TOKEN_ENV && v.is_none())
+        );
+
+        let anon = RestHost::at(None, Origins::github(), "https://github.com".into());
+        assert!(crate::host::ReleaseHost::reads_anonymously(&anon));
+        let absent = RestHost::at(
+            Some(dir.path().join("missing-token")),
+            Origins::github(),
+            "https://github.com".into(),
+        );
+        assert!(crate::host::ReleaseHost::reads_anonymously(&absent));
+        assert!(!crate::host::ReleaseHost::reads_anonymously(&host));
+
+        let blank = dir.path().join("blank-token");
+        std::fs::write(&blank, "  \n\t\r\n").expect("blank token");
+        let blank_host = RestHost::at(Some(blank), Origins::github(), "https://github.com".into());
+        assert!(
+            crate::host::ReleaseHost::reads_anonymously(&blank_host),
+            "whitespace-only token file reads anonymously through CDN probes"
+        );
+
+        let corrupt = dir.path().join("corrupt-token");
+        std::fs::write(&corrupt, b"ghp_bad\x00token\n").expect("corrupt token");
+        let corrupt_host = RestHost::at(
+            Some(corrupt),
+            Origins::github(),
+            "https://github.com".into(),
+        );
+        assert!(
+            !crate::host::ReleaseHost::reads_anonymously(&corrupt_host),
+            "corrupt token file must not silently fall back to anonymous reads"
         );
     }
 }

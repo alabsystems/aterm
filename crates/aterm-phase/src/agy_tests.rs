@@ -1448,16 +1448,12 @@ fn every_panel_row_and_every_count_shows_background_work() {
         plain_rule_width(&rows[f.bottom])
     );
     assert_eq!(
-        unwrap_agent_token("Agent(self: Cursor Trail Rendering Engineer)"),
-        Some("Cursor Trail Rendering Engineer")
+        split_agent_token("Agent(self: Cursor Trail Rendering Engineer)"),
+        Some(("Cursor Trail Rendering Engineer", ""))
     );
     assert_eq!(
-        unwrap_agent_token("Agent(research: Codebase Researcher)"),
-        Some("research: Codebase Researcher")
-    );
-    assert_eq!(
-        unwrap_agent_token("Agent(self: Researcher (GUI))"),
-        Some("Researcher (GUI)")
+        split_agent_token("Agent(research: Codebase Researcher)"),
+        Some(("research: Codebase Researcher", ""))
     );
     assert_eq!(
         split_agent_token("Agent(self: Researcher (GUI))  Reading file (foo.rs) · 5s"),
@@ -1467,9 +1463,8 @@ fn every_panel_row_and_every_count_shows_background_work() {
         panel_work("  ● Agent(self: Researcher (GUI))  Reading file (foo.rs) · 5s"),
         Some(SUBAGENT_WORKING)
     );
-    assert_eq!(unwrap_agent_token("Agent(explore)"), Some("explore"));
-    assert_eq!(unwrap_agent_token("Agent()"), None);
-    assert_eq!(unwrap_agent_token("Agent(a) trailing"), None);
+    assert_eq!(split_agent_token("Agent(explore)"), Some(("explore", "")));
+    assert_eq!(split_agent_token("Agent()"), None);
 }
 
 #[test]

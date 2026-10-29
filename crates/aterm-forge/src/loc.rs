@@ -26,10 +26,6 @@ pub fn package_dir(root: &Path, id: &PkgId, printed: Option<&Path>) -> Option<Pa
             return Some(candidate);
         }
     }
-    let member = root.join("crates").join(&id.name);
-    if member.is_dir() {
-        return Some(member);
-    }
     printed.filter(|p| p.is_dir()).map(Path::to_path_buf)
 }
 
@@ -73,25 +69,7 @@ fn patch_targets(root: &Path) -> &'static MemberIndex {
 /// `[package] version` from a manifest directory, if it reads.
 pub(crate) fn manifest_version(dir: &Path) -> Option<String> {
     let text = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
-    let mut in_package = false;
-    for line in text.lines() {
-        let t = line.trim();
-        if t.starts_with('[') {
-            in_package = t == "[package]";
-            continue;
-        }
-        if !in_package {
-            continue;
-        }
-        if let Some(rest) = t.strip_prefix("version") {
-            let mut it = rest.split('"');
-            let _ = it.next();
-            if let Some(v) = it.next().filter(|v| !v.is_empty()) {
-                return Some(v.to_string());
-            }
-        }
-    }
-    None
+    package_version(&text)
 }
 
 /// (package name, version) → directory.
@@ -416,7 +394,7 @@ mod tests {
         );
         w(
             "vendor/indexmap/Cargo.toml",
-            "[package]\nname = \"indexmap\"\nversion = \"2.14.0\"\n",
+            "[package]\nname = \"indexmap\"\nversion_note = \"9.9.9\"\nversion = \"2.14.0\"\n",
         );
         w("vendor/astream/crates/astream-aead/src/lib.rs", "");
         w(
@@ -440,6 +418,11 @@ mod tests {
             dir("aterm-core", "0.9.0", None),
             Some(root.join("crates/aterm-core")),
             "an inherited version is the workspace's"
+        );
+        assert_eq!(
+            dir("aterm-core", "9.9.9", None),
+            None,
+            "a member whose folder matches its package name still answers only at its own version"
         );
         assert_eq!(
             dir("indexmap", "2.14.0", None),

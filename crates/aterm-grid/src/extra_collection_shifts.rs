@@ -31,6 +31,7 @@ impl CellExtras {
         let shift_start = top.checked_add(n);
         let mut new_data =
             FxHashMap::with_capacity_and_hasher(self.data.len(), aterm_hash::FxBuildHasher);
+        let mut max_row: Option<u16> = None;
         for (coord, extra) in self.data.drain() {
             // Internal row < offset: stale, drop.
             if coord.row < offset {
@@ -39,6 +40,7 @@ impl CellExtras {
             let ext_row = coord.row - offset;
 
             if ext_row < top || ext_row > bottom {
+                max_row = Some(max_row.map_or(ext_row, |m| m.max(ext_row)));
                 new_data.insert(CellCoord::new(ext_row, coord.col), extra);
                 continue;
             }
@@ -46,10 +48,13 @@ impl CellExtras {
             if let Some(shift_start) = shift_start
                 && ext_row >= shift_start
             {
-                new_data.insert(CellCoord::new(ext_row - n, coord.col), extra);
+                let dst_row = ext_row - n;
+                max_row = Some(max_row.map_or(dst_row, |m| m.max(dst_row)));
+                new_data.insert(CellCoord::new(dst_row, coord.col), extra);
             }
         }
         self.data = new_data;
+        self.max_row_cache.set_exact_opt(max_row);
         self.enforce_hyperlink_limit();
     }
 
@@ -73,6 +78,7 @@ impl CellExtras {
         let drop_start = bottom.saturating_sub(n.saturating_sub(1));
         let mut new_data =
             FxHashMap::with_capacity_and_hasher(self.data.len(), aterm_hash::FxBuildHasher);
+        let mut max_row: Option<u16> = None;
         for (coord, extra) in self.data.drain() {
             if coord.row < offset {
                 continue;
@@ -81,13 +87,17 @@ impl CellExtras {
 
             if ext_row >= top && ext_row <= bottom {
                 if ext_row < drop_start {
-                    new_data.insert(CellCoord::new(ext_row.saturating_add(n), coord.col), extra);
+                    let dst_row = ext_row.saturating_add(n);
+                    max_row = Some(max_row.map_or(dst_row, |m| m.max(dst_row)));
+                    new_data.insert(CellCoord::new(dst_row, coord.col), extra);
                 }
             } else {
+                max_row = Some(max_row.map_or(ext_row, |m| m.max(ext_row)));
                 new_data.insert(CellCoord::new(ext_row, coord.col), extra);
             }
         }
         self.data = new_data;
+        self.max_row_cache.set_exact_opt(max_row);
         self.enforce_hyperlink_limit();
     }
 
@@ -110,6 +120,7 @@ impl CellExtras {
         let shift_start = top.checked_add(n);
         let mut new_data =
             FxHashMap::with_capacity_and_hasher(self.data.len(), aterm_hash::FxBuildHasher);
+        let mut max_row: Option<u16> = None;
         for (coord, extra) in self.data.drain() {
             if coord.row < offset {
                 continue;
@@ -117,6 +128,7 @@ impl CellExtras {
             let ext_row = coord.row - offset;
 
             if ext_row < top || ext_row > bottom || coord.col < left || coord.col > right {
+                max_row = Some(max_row.map_or(ext_row, |m| m.max(ext_row)));
                 new_data.insert(CellCoord::new(ext_row, coord.col), extra);
                 continue;
             }
@@ -124,10 +136,13 @@ impl CellExtras {
             if let Some(shift_start) = shift_start
                 && ext_row >= shift_start
             {
-                new_data.insert(CellCoord::new(ext_row - n, coord.col), extra);
+                let dst_row = ext_row - n;
+                max_row = Some(max_row.map_or(dst_row, |m| m.max(dst_row)));
+                new_data.insert(CellCoord::new(dst_row, coord.col), extra);
             }
         }
         self.data = new_data;
+        self.max_row_cache.set_exact_opt(max_row);
         self.enforce_hyperlink_limit();
     }
 
@@ -150,6 +165,7 @@ impl CellExtras {
         let drop_start = bottom.saturating_sub(n.saturating_sub(1));
         let mut new_data =
             FxHashMap::with_capacity_and_hasher(self.data.len(), aterm_hash::FxBuildHasher);
+        let mut max_row: Option<u16> = None;
         for (coord, extra) in self.data.drain() {
             if coord.row < offset {
                 continue;
@@ -157,15 +173,19 @@ impl CellExtras {
             let ext_row = coord.row - offset;
 
             if ext_row < top || ext_row > bottom || coord.col < left || coord.col > right {
+                max_row = Some(max_row.map_or(ext_row, |m| m.max(ext_row)));
                 new_data.insert(CellCoord::new(ext_row, coord.col), extra);
                 continue;
             }
 
             if ext_row < drop_start {
-                new_data.insert(CellCoord::new(ext_row.saturating_add(n), coord.col), extra);
+                let dst_row = ext_row.saturating_add(n);
+                max_row = Some(max_row.map_or(dst_row, |m| m.max(dst_row)));
+                new_data.insert(CellCoord::new(dst_row, coord.col), extra);
             }
         }
         self.data = new_data;
+        self.max_row_cache.set_exact_opt(max_row);
         self.enforce_hyperlink_limit();
     }
 
@@ -208,16 +228,25 @@ impl CellExtras {
         if count == 0 || self.data.is_empty() {
             return;
         }
+        let Some(internal_row) = self.internal_row_checked(row) else {
+            return;
+        };
         #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_shift_ops(self.data.len());
-        let internal_row = self.internal_row(row);
         let extracted = self.take_row_range(internal_row, start_col, max_col);
+        let had_any = !extracted.is_empty();
+        let mut reinserted = false;
         for (col, extra) in extracted {
             let new_col = col.saturating_add(count);
             if new_col < max_col {
                 self.data
                     .insert(CellCoord::new(internal_row, new_col), extra);
+                reinserted = true;
             }
+        }
+        if had_any && !reinserted {
+            self.max_row_cache
+                .on_remove(internal_row, self.data.is_empty());
         }
         self.maybe_shrink();
     }
@@ -228,16 +257,25 @@ impl CellExtras {
         if count == 0 || self.data.is_empty() {
             return;
         }
+        let Some(internal_row) = self.internal_row_checked(row) else {
+            return;
+        };
         #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_shift_ops(self.data.len());
-        let internal_row = self.internal_row(row);
         let shift_start = start_col.saturating_add(count);
         let extracted = self.take_row_range(internal_row, start_col, max_col);
+        let had_any = !extracted.is_empty();
+        let mut reinserted = false;
         for (col, extra) in extracted {
             if col >= shift_start {
                 self.data
                     .insert(CellCoord::new(internal_row, col - count), extra);
+                reinserted = true;
             }
+        }
+        if had_any && !reinserted {
+            self.max_row_cache
+                .on_remove(internal_row, self.data.is_empty());
         }
         self.maybe_shrink();
     }
@@ -256,7 +294,6 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum Shift {
         RowsUp {
-            start: u16,
             n: u16,
         },
         RegionUp {
@@ -300,7 +337,7 @@ mod tests {
     impl Shift {
         fn apply(self, extras: &mut CellExtras) {
             match self {
-                Self::RowsUp { start, n } => extras.shift_rows_up_by(start, n),
+                Self::RowsUp { n } => extras.shift_rows_up_by(n),
                 Self::RegionUp { top, bottom, n } => extras.shift_region_up_by(top, bottom, n),
                 Self::RegionDown { top, bottom, n } => extras.shift_region_down_by(top, bottom, n),
                 Self::RectUp {
@@ -351,7 +388,7 @@ mod tests {
                 }
             };
             match self {
-                Self::RowsUp { start, n } => up(start, u16::MAX, 0, u16::MAX, n),
+                Self::RowsUp { n } => up(0, u16::MAX, 0, u16::MAX, n),
                 Self::RegionUp { top, bottom, n } => up(top, bottom, 0, u16::MAX, n),
                 Self::RegionDown { top, bottom, n } => down(top, bottom, 0, u16::MAX, n),
                 Self::RectUp {
@@ -655,7 +692,7 @@ mod tests {
             (
                 "SU after a full-screen offset",
                 &[
-                    RowsUp { start: 0, n: 2 },
+                    RowsUp { n: 2 },
                     RegionUp {
                         top: 0,
                         bottom: 23,
@@ -666,7 +703,7 @@ mod tests {
             (
                 "ICH after a full-screen offset",
                 &[
-                    RowsUp { start: 0, n: 3 },
+                    RowsUp { n: 3 },
                     ColsRight {
                         row: 4,
                         start: 2,
@@ -675,14 +712,8 @@ mod tests {
                     },
                 ],
             ),
-            ("partial-screen scroll", &[RowsUp { start: 1, n: 1 }]),
         ];
         for (name, shifts) in scenarios {
-            // A partial-screen `shift_rows_up_by` wipes both rings instead of
-            // moving them; only the map follows the model there.
-            let rings_follow = !shifts
-                .iter()
-                .any(|s| matches!(s, RowsUp { start, .. } if *start > 0));
             for dense in [true, false] {
                 let cells: Vec<(u16, u16)> = (0..ROWS)
                     .flat_map(|r| (0..COLS).map(move |c| (r, c)))
@@ -715,10 +746,6 @@ mod tests {
                     want.iter().map(|(&at, &(r, c))| (at, fg(r, c))).collect();
                 assert_eq!(got, want_map, "{name} (dense: {dense}): map");
                 assert_eq!(extras.len(), want.len(), "{name} (dense: {dense}): len");
-
-                if !rings_follow {
-                    continue;
-                }
                 for row in 0..ROWS {
                     for col in 0..COLS + 8 {
                         let origin = want.get(&(row, col)).copied();

@@ -354,14 +354,6 @@ impl WriteReceiptError {
         self.refused
     }
 
-    /// Number of bytes accepted before the error.
-    #[must_use]
-    #[cfg(test)]
-    #[inline]
-    pub const fn accepted(&self) -> usize {
-        self.receipt.accepted()
-    }
-
     /// Accepted serialization/spill order, or `None` when no bytes moved.
     #[must_use]
     #[inline]
@@ -3787,16 +3779,18 @@ mod input_io_tests {
                 let refused = sink
                     .write_frame_interactive_with_receipt(b"K")
                     .expect_err("a key into a full input queue is refused");
-                tx.send((refused.is_refused(), refused.accepted(), refused.order()))
-                    .expect("receiver");
+                let is_refused = refused.is_refused();
+                let order = refused.order();
+                let kind = refused.into_error().kind();
+                tx.send((is_refused, order, kind)).expect("receiver");
             });
         }
-        let (is_refused, accepted_bytes, order) = rx
+        let (is_refused, order, kind) = rx
             .recv_timeout(Duration::from_secs(60))
             .expect("the interactive egress did not park");
         assert!(is_refused);
-        assert_eq!(accepted_bytes, 0, "no byte of a refused key is accepted");
-        assert_eq!(order, None);
+        assert_eq!(order, None, "no byte of a refused key is accepted");
+        assert_eq!(kind, io::ErrorKind::WouldBlock);
         let dead = SinkWriter::new(-1)
             .write_frame_interactive_with_receipt(b"x")
             .expect_err("a dead fd fails");

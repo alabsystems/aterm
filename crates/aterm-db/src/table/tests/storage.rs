@@ -347,6 +347,7 @@ fn storage_transition(
                 .unwrap();
             store.ingest(&session, &fork).unwrap();
             usable = store.commit_catalog(&session, b"must refuse").is_ok();
+            assert!(store.commit_liability(&session, b"must refuse").is_err());
         }
         _ => {}
     }

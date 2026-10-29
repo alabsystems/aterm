@@ -6,6 +6,10 @@
 use std::path::{Path, PathBuf};
 
 use super::*;
+
+#[path = "accounts_pool_quota_tests.rs"]
+mod quota;
+
 use crate::harness::accounts::{Condition, State};
 use crate::harness::upgrade::Dialect;
 
@@ -17,6 +21,29 @@ const HOUR: i64 = 3600;
 // production Result directly, including the distinction from an unmanaged launch.
 fn launch_env(seat: &Seat<'_>, cli: Cli, read: ReadUsage<'_>) -> Option<LoginEnv> {
     super::launch_env(seat, cli, read).ok().flatten()
+}
+
+// Pool-only fixtures have no concurrently replaced GUI process. Runtime callers
+// must instead consume the note while holding their local process context guard.
+fn session_move(seat: &Seat<'_>, s: &Session<'_>) -> Moved {
+    super::session_move(seat, s, |note| note.record())
+}
+
+fn session_move_using(
+    seat: &Seat<'_>,
+    s: &Session<'_>,
+    prepare: impl FnMut(&Row) -> Option<String>,
+) -> Moved {
+    super::session_move_using(seat, s, prepare, |note| note.record())
+}
+
+fn record_session(
+    seat: &Seat<'_>,
+    s: &Session<'_>,
+    who: &accounts::ProcessLogin,
+    row: &Row,
+) -> Result<Roster, String> {
+    super::record_session(seat, s, who, row, |note| note.record())
 }
 
 #[path = "accounts_pool_launch_tests.rs"]
@@ -40,6 +67,30 @@ mod sample_context;
 #[path = "accounts_pool_move_policy_tests.rs"]
 mod move_policy;
 
+#[path = "accounts_pool_stored_identity_tests.rs"]
+mod stored_identity;
+
+#[path = "accounts_pool_identity_tests.rs"]
+mod identity;
+
+#[path = "accounts_pool_preparation_tests.rs"]
+mod preparation;
+
+#[path = "accounts_pool_preparation_race_tests.rs"]
+mod preparation_races;
+
+#[path = "accounts_pool_planning_tests.rs"]
+mod planning;
+
+#[path = "accounts_pool_canary_tests.rs"]
+mod canary;
+
+#[path = "accounts_pool_cold_resume_tests.rs"]
+mod cold_resume_capability;
+
+#[path = "accounts_pool_claims_tests.rs"]
+mod claims;
+
 struct World {
     _dir: aterm_tempfile::TempDir,
     root: PathBuf,
@@ -58,13 +109,19 @@ impl World {
         for sub in ["cfg", "state", "home"] {
             std::fs::create_dir_all(root.join(sub)).expect("world dir");
         }
-        World {
+        let world = World {
             _dir: dir,
             cfg: root.join("cfg"),
             state: root.join("state"),
             home: root.join("home"),
             root,
+        };
+        // Each pooled CLI's default login is signed in on this machine, as a roster's default
+        // row (`main`) is enrolled only while it is ([`accounts::enrolled_in`]).
+        for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+            world.default_login(cli);
         }
+        world
     }
 
     fn seat(&self) -> Seat<'_> {
@@ -89,6 +146,20 @@ impl World {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("login dir");
         std::fs::write(&path, "{}").expect("stand-in login file");
         dir
+    }
+
+    /// The file `cli` keeps the machine's default login in, made in its default home.
+    fn default_login(&self, cli: Cli) -> PathBuf {
+        let file = cli
+            .connector()
+            .stores
+            .first()
+            .copied()
+            .unwrap_or("auth.json");
+        let path = self.home.join(cli.accounts().default_home).join(file);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("default home");
+        std::fs::write(&path, "{}").expect("stand-in default login");
+        path
     }
 
     /// `cli`'s roster of two: `main`, the machine's default login, and `work`.
@@ -138,7 +209,7 @@ fn near_wall() -> Sample {
 const NO_FLAGS: &[String] = &[];
 
 /// A [`ReadUsage`] that reads nothing.
-fn no_usage(_: Cli, _: &Path, _: i64) -> Option<Usage> {
+fn no_usage(_: Cli, _: &Path, _: Option<&str>, _: i64) -> Option<Usage> {
     None
 }
 
@@ -770,7 +841,9 @@ fn accounts_off_places_a_launch_on_the_owners_pin_alone() {
     )
     .expect("aterm.toml");
     assert_eq!(world.seat().mode(), Mode::Off);
-    let read = |_: Cli, _: &Path, _: i64| -> Option<Usage> { panic!("off reads no usage") };
+    let read = |_: Cli, _: &Path, _: Option<&str>, _: i64| -> Option<Usage> {
+        panic!("off reads no usage")
+    };
     assert_eq!(
         launch_env(&world.seat(), Cli::Codex, &read),
         None,
@@ -1126,9 +1199,9 @@ fn a_launch_reads_each_rows_usage_in_its_own_home_and_leaves_a_full_one() {
             at: NOW,
             ..Sample::default()
         },
-        wall: Some((accounts::SESSION_LIMIT, Some(reset))),
+        walls: vec![(accounts::SESSION_LIMIT, Some(reset))],
     };
-    let read = |cli: Cli, home: &Path, _: i64| {
+    let read = |cli: Cli, home: &Path, _: Option<&str>, _: i64| {
         assert_eq!(cli, Cli::Codex);
         homes.lock().expect("homes").push(home.to_path_buf());
         (home == default_home).then(|| full(NOW + 2 * HOUR))
@@ -1229,9 +1302,9 @@ fn record_usage_reads_the_default_home_before_linking_overlays_so_startup_files_
             at: NOW,
             ..Sample::default()
         },
-        wall: Some((accounts::SESSION_LIMIT, Some(NOW + 2 * HOUR))),
+        walls: vec![(accounts::SESSION_LIMIT, Some(NOW + 2 * HOUR))],
     };
-    let read = |cli: Cli, home: &Path, _: i64| {
+    let read = |cli: Cli, home: &Path, _: Option<&str>, _: i64| {
         assert_eq!(cli, Cli::Kimi);
         std::fs::create_dir_all(home).expect("home dir");
         let agents = home.join("AGENTS.md");
@@ -1253,7 +1326,7 @@ fn record_usage_reads_the_default_home_before_linking_overlays_so_startup_files_
     pre_drifted.on_main(Cli::Kimi, &[]);
     std::fs::write(bad_work.join("AGENTS.md"), "already-own").expect("own file");
     let bad_default = pre_drifted.home.join(".kimi-code");
-    let read_bad = |_: Cli, home: &Path, _: i64| {
+    let read_bad = |_: Cli, home: &Path, _: Option<&str>, _: i64| {
         std::fs::create_dir_all(home).expect("home");
         let agents = home.join("AGENTS.md");
         if std::fs::symlink_metadata(&agents).is_err() {
@@ -1302,10 +1375,14 @@ fn fleet_synced_single_enrolled_row_and_lazy_backup_measure_usage_and_launch_unt
             at: NOW,
             ..Sample::default()
         },
-        wall: None,
+        walls: Vec::new(),
     };
-    let pick = launch_env(&world.seat(), Cli::Codex, &|_, _, _| Some(ok_usage.clone()))
-        .expect("single enrolled dedicated row must launch");
+    let pick = launch_env(
+        &world.seat(),
+        Cli::Codex,
+        &|_: Cli, _: &Path, _: Option<&str>, _: i64| Some(ok_usage.clone()),
+    )
+    .expect("single enrolled dedicated row must launch");
     assert_eq!(pick.label, "codex-1");
     assert_eq!(pick.value, Some(c1.join("auth.json").display().to_string()));
 
@@ -1321,10 +1398,14 @@ fn fleet_synced_single_enrolled_row_and_lazy_backup_measure_usage_and_launch_unt
             at: later.now,
             ..Sample::default()
         },
-        wall: Some((accounts::WEEK_LIMIT, Some(later.now + 24 * HOUR))),
+        walls: vec![(accounts::WEEK_LIMIT, Some(later.now + 24 * HOUR))],
     };
     assert_eq!(
-        launch_env(&later, Cli::Codex, &|_, _, _| Some(week_walled.clone())),
+        launch_env(
+            &later,
+            Cli::Codex,
+            &|_: Cli, _: &Path, _: Option<&str>, _: i64| Some(week_walled.clone())
+        ),
         None,
         "codex-1 is now walled and codex-2 is not yet enrolled"
     );
@@ -1385,15 +1466,19 @@ fn fleet_synced_single_enrolled_row_and_lazy_backup_measure_usage_and_launch_unt
     )
     .expect("lazy roster");
     assert_eq!(
-        launch_env(&lazy.seat(), Cli::Codex, &|_, _, now| {
-            Some(Usage {
-                sample: Sample {
-                    at: now,
-                    ..week_walled.sample.clone()
-                },
-                ..week_walled.clone()
-            })
-        }),
+        launch_env(
+            &lazy.seat(),
+            Cli::Codex,
+            &|_: Cli, _: &Path, _: Option<&str>, now: i64| {
+                Some(Usage {
+                    sample: Sample {
+                        at: now,
+                        ..week_walled.sample.clone()
+                    },
+                    ..week_walled.clone()
+                })
+            }
+        ),
         None
     );
     assert!(matches!(
@@ -1409,7 +1494,7 @@ fn fleet_synced_single_enrolled_row_and_lazy_backup_measure_usage_and_launch_unt
         "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n",
     )
     .expect("lone roster");
-    let panic_read = |_: Cli, _: &Path, _: i64| -> Option<Usage> {
+    let panic_read = |_: Cli, _: &Path, _: Option<&str>, _: i64| -> Option<Usage> {
         panic!("unpinned lone default row must not read usage")
     };
     assert_eq!(launch_env(&lone.seat(), Cli::Codex, &panic_read), None);
@@ -1418,4 +1503,450 @@ fn fleet_synced_single_enrolled_row_and_lazy_backup_measure_usage_and_launch_unt
         launch_env(&lone.seat(), Cli::Codex, &no_usage).expect("pinned lone default row");
     assert_eq!(pinned_pick.label, "main");
     assert_eq!(pinned_pick.value, None);
+}
+
+/// A [`UsageReader`] answering each home its own [`Reading`], and nothing for any other.
+struct Readings(Vec<(PathBuf, Reading)>);
+
+impl UsageReader for Readings {
+    fn read(&self, _: Cli, home: &Path, _: Option<&str>, _: i64) -> Reading {
+        self.0
+            .iter()
+            .find(|(at, _)| at == home)
+            .map_or(Reading::Unread, |(_, reading)| reading.clone())
+    }
+}
+
+#[test]
+fn a_login_the_provider_refused_is_signed_out_and_launches_leave_it_until_it_reads_again() {
+    let world = World::new("refused-login");
+    let work = world.two(Cli::Codex);
+    world.on_main(Cli::Codex, &[]);
+    wall(&world, Cli::Codex, "main", NOW + HOUR);
+    let refused = Readings(vec![(work.clone(), Reading::SignedOut)]);
+    let launch = super::launch_env(&world.seat(), Cli::Codex, &refused);
+    assert!(
+        launch
+            .as_ref()
+            .is_err_and(|why| why.contains("no usable account")),
+        "{launch:?}"
+    );
+    assert_eq!(
+        condition_of(&world, Cli::Codex, "work"),
+        Condition::SignedOut
+    );
+    // Every row is shut, and only `main`'s wall ends by waiting.
+    let Condition::Limited { until } = condition_of(&world, Cli::Codex, "main") else {
+        panic!("main is at its limit");
+    };
+    assert_eq!(launch_opening(&world.seat(), Cli::Codex, None), Some(until));
+    // With rotation switched off the launch starts on its own login: it waits on no row.
+    std::fs::write(
+        world.cfg.join("aterm.toml"),
+        "[harness]\naccounts = \"off\"\n",
+    )
+    .expect("aterm.toml");
+    assert_eq!(launch_opening(&world.seat(), Cli::Codex, None), None, "off");
+    std::fs::remove_file(world.cfg.join("aterm.toml")).expect("rotation on again");
+
+    // A reading of its usage again (a sign-in by hand in its home) signs it in again.
+    let served = Readings(vec![(
+        work.clone(),
+        Reading::Usage(Usage {
+            sample: Sample {
+                session_pct: Some(10),
+                session_reset: Some(NOW + 4 * HOUR),
+                at: NOW,
+                ..Sample::default()
+            },
+            walls: Vec::new(),
+        }),
+    )]);
+    let pick = launch_env(&world.seat(), Cli::Codex, &served).map(|pick| pick.label);
+    assert_eq!(pick.as_deref(), Some("work"));
+    assert_eq!(condition_of(&world, Cli::Codex, "work"), Condition::Usable);
+    assert_eq!(
+        launch_opening(&world.seat(), Cli::Codex, None),
+        None,
+        "a row serves"
+    );
+}
+
+#[test]
+fn a_default_row_whose_login_file_is_gone_is_not_signed_in_here() {
+    let world = World::new("default-gone");
+    let work = world.two(Cli::Codex);
+    world.on_main(Cli::Codex, &[]);
+    let pick = launch_env(&world.seat(), Cli::Codex, &no_usage).map(|pick| pick.label);
+    assert_eq!(pick.as_deref(), Some("main"), "PRECONDITION: main serves");
+    std::fs::remove_file(world.home.join(".codex/auth.json")).expect("sign main out");
+    let pick = launch_env(&world.seat(), Cli::Codex, &no_usage).map(|pick| pick.value);
+    assert_eq!(
+        pick,
+        Some(Some(work.join("auth.json").display().to_string())),
+        "the active default row with no login file is passed over"
+    );
+    let roster = world.seat().roster(Cli::Codex).expect("roster");
+    assert_eq!(
+        accounts::enrolled_in(Cli::Codex, &roster, &world.home),
+        ["work".to_string()].into_iter().collect()
+    );
+    assert!(!accounts::default_login_made(Cli::Codex, &world.home));
+}
+
+#[test]
+fn a_cold_relaunch_leaves_a_row_that_no_longer_serves_and_keeps_one_that_does() {
+    let world = World::new("cold");
+    let work = world.two(Cli::Codex);
+    world.on_main(Cli::Codex, &[]);
+    let work_auth = work.join("auth.json").display().to_string();
+    let on_work = [("CODEX_AUTH_PATH", work_auth.as_str())];
+    // `work` serves: the relaunch stays on it.
+    assert_eq!(
+        cold_launch_env(&world.seat(), Cli::Codex, &on_work, &no_usage, None),
+        None
+    );
+    // `work` is at its limit: the relaunch starts on `main`, the default login.
+    wall(&world, Cli::Codex, "work", NOW + HOUR);
+    let moved = cold_launch_env(&world.seat(), Cli::Codex, &on_work, &no_usage, None)
+        .map(|pick| (pick.label, pick.value));
+    assert_eq!(moved, Some(("main".to_string(), None)));
+    // CONTROL: a conversation on a home of its own is left alone, as is one whose pool has
+    // no row serving.
+    assert_eq!(
+        cold_launch_env(
+            &world.seat(),
+            Cli::Codex,
+            &[("CODEX_HOME", "/scratch/codex")],
+            &no_usage,
+            None
+        ),
+        None
+    );
+    wall(&world, Cli::Codex, "main", NOW + HOUR);
+    assert_eq!(
+        cold_launch_env(&world.seat(), Cli::Codex, &on_work, &no_usage, None),
+        None
+    );
+}
+
+/// ON A CODEX PROGRAM THAT KEEPS NO ROW'S LOGIN ITS OWN, A REFUSED LAUNCH WAITS FOR THE DEFAULT
+/// ROW'S WALL, NOT FOR ANOTHER ROW'S: with `work` usable, and with `work` walled to an earlier
+/// reset, the opening is the instant the refusal names, `main`'s. Under the owner's pin on
+/// `work`, which that build refuses whatever the wait, nothing opens by waiting, nor with `main`
+/// signed out. CONTROL: a program that keeps the row's login waits on no row while `work`
+/// serves, and on `work`'s earlier reset once it is walled.
+#[test]
+fn a_refused_launch_on_a_program_that_ignores_codex_auth_path_waits_on_the_default_row_alone() {
+    let world = World::new("opening-unread");
+    world.two(Cli::Codex);
+    world.on_main(Cli::Codex, &[]);
+    let old = crate::harness::codex_alab::lay_package(&world.root.join("store/old"), false);
+    let new = crate::harness::codex_alab::lay_package(&world.root.join("store/new"), true);
+    let opening = |program: &Path| launch_opening(&world.seat(), Cli::Codex, Some(program));
+    wall(&world, Cli::Codex, "main", NOW + 2 * HOUR);
+    let Condition::Limited { until: main_until } = condition_of(&world, Cli::Codex, "main") else {
+        panic!("`main` is at its limit");
+    };
+    let refused = super::launch_env_for(&world.seat(), Cli::Codex, &no_usage, Some(&old))
+        .expect_err("that build runs no row but `main`");
+    let named = crate::harness::usage::rfc3339_utc(main_until);
+    assert!(refused.contains(&format!("until {named}")), "{refused}");
+    assert_eq!(opening(&old), Some(main_until));
+    assert_eq!(opening(&new), None, "CONTROL: `work` serves");
+
+    wall(&world, Cli::Codex, "work", NOW + HOUR);
+    let Condition::Limited { until: work_until } = condition_of(&world, Cli::Codex, "work") else {
+        panic!("`work` is at its limit");
+    };
+    assert!(work_until < main_until, "{work_until} {main_until}");
+    assert_eq!(
+        opening(&old),
+        Some(main_until),
+        "never `work`'s earlier reset"
+    );
+    assert_eq!(
+        opening(&new),
+        Some(work_until),
+        "CONTROL: the first row to open"
+    );
+
+    pin(&world, Cli::Codex, "work").expect("the owner pins `work`");
+    assert!(
+        super::launch_env_for(&world.seat(), Cli::Codex, &no_usage, Some(&old)).is_err(),
+        "a pin on a row of its own does not run on that build"
+    );
+    assert_eq!(opening(&old), None, "the pin's refusal ends by no wait");
+    let mut note = None;
+    world
+        .seat()
+        .store(Cli::Codex)
+        .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |state| {
+            state.pinned = false;
+            Ok(accounts::note_auth(
+                state,
+                "main",
+                accounts::Auth::SignedOut,
+                NOW,
+            ))
+        })
+        .expect("unpin, and sign `main` out");
+    assert_eq!(opening(&old), None, "a signed-out `main` opens by no wait");
+}
+
+/// ON SUCH A PROGRAM A COLD RELAUNCH MOVES A CONVERSATION ONLY ONTO THIS MACHINE'S OWN LOGIN:
+/// one that ran on the default login while `main` is walled stays on it, since that build runs
+/// no other row (its relaunch then needs no row of its own's login), and one on `work` at its
+/// limit moves onto `main`. CONTROL: a program that keeps `CODEX_AUTH_PATH`'s login moves the
+/// first onto `work`.
+#[test]
+fn a_cold_relaunch_on_a_program_that_ignores_codex_auth_path_moves_only_onto_the_default_row() {
+    let world = World::new("cold-unread");
+    let work = world.two(Cli::Codex);
+    world.on_main(Cli::Codex, &[]);
+    let old = crate::harness::codex_alab::lay_package(&world.root.join("store/old"), false);
+    let new = crate::harness::codex_alab::lay_package(&world.root.join("store/new"), true);
+    let work_auth = work.join("auth.json").display().to_string();
+    wall(&world, Cli::Codex, "main", NOW + HOUR);
+    let on_main = |program: &Path| {
+        cold_launch_env(&world.seat(), Cli::Codex, &[], &no_usage, Some(program))
+            .map(|pick| (pick.label, pick.value))
+    };
+    assert_eq!(on_main(&old), None, "it stays on the default login");
+    assert_eq!(
+        on_main(&new),
+        Some(("work".to_string(), Some(work_auth.clone()))),
+        "CONTROL"
+    );
+
+    let world = World::new("cold-unread-work");
+    let work = world.two(Cli::Codex);
+    world.on_main(Cli::Codex, &[]);
+    let work_auth = work.join("auth.json").display().to_string();
+    wall(&world, Cli::Codex, "work", NOW + HOUR);
+    let moved = cold_launch_env(
+        &world.seat(),
+        Cli::Codex,
+        &[("CODEX_AUTH_PATH", work_auth.as_str())],
+        &no_usage,
+        Some(&old),
+    )
+    .map(|pick| (pick.label, pick.value));
+    assert_eq!(moved, Some(("main".to_string(), None)));
+}
+
+/// ON SUCH A PROGRAM A DEFAULT ROW A SIGN-IN ALREADY MOVED ONTO A LOGIN OF ITS OWN IS NAMED SO,
+/// never as a roster with no row on this machine's own login whose fix is `adopt-default`
+/// (which refuses while the roster file's row names no `dir`), and the moved row is refused
+/// like any row of its own there. The refusal names rotation off, under which that launch takes
+/// no row and runs on this machine's own login, and what else that switch turns off, which holds:
+/// the accounts' sync and aterm's own sign-ins of every pool. CONTROL: a roster that never listed
+/// that login is offered `adopt-default`.
+#[test]
+fn a_default_row_a_sign_in_moved_is_named_as_moved_on_a_program_that_ignores_codex_auth_path() {
+    let world = World::new("moved-default");
+    world.two(Cli::Codex);
+    world.on_main(Cli::Codex, &[]);
+    let old = crate::harness::codex_alab::lay_package(&world.root.join("store/old"), false);
+    let staging = world.root.join("logins/codex/main+1");
+    std::fs::create_dir_all(&staging).expect("staging");
+    std::fs::write(staging.join("auth.json"), "{}").expect("staged login");
+    let mut note = None;
+    world
+        .seat()
+        .store(Cli::Codex)
+        .transact_logins(NOW, &mut note, |state, logins| {
+            Ok(accounts::note_renewed(
+                state,
+                logins,
+                "main",
+                None,
+                &staging.display().to_string(),
+                None,
+                NOW,
+            ))
+        })
+        .expect("a sign-in binds `main` to its own login");
+    let refused = super::launch_env_for(&world.seat(), Cli::Codex, &no_usage, Some(&old))
+        .expect_err("no row is on the default login now");
+    assert!(
+        refused.contains(
+            "`main`, the row that login was listed as, was signed in to a login of its own"
+        ),
+        "{refused}"
+    );
+    assert!(!refused.contains("adopt-default"), "{refused}");
+    let switch = refused
+        .split_once("`[harness] accounts = \"off\"`")
+        .map(|(_, after)| after)
+        .expect("the refusal names rotation off's switch");
+    assert!(
+        switch.contains("sync") && switch.contains("sign-ins"),
+        "it says the switch also stops the sync and aterm's own sign-ins: {refused}"
+    );
+    // The way back it names: with rotation off and no pin, the launch takes no row, so Codex
+    // runs on this machine's own login; and that switch does what the words say besides.
+    let config = world.cfg.join("aterm.toml");
+    std::fs::write(&config, "[harness]\naccounts = \"off\"\n").expect("aterm.toml");
+    assert_eq!(
+        super::launch_env_for(&world.seat(), Cli::Codex, &no_usage, Some(&old)),
+        Ok(None),
+        "rotation off runs the launch on the default login"
+    );
+    assert!(crate::harness::accounts_sync::accounts_sync_off(Some(
+        &config
+    )));
+    assert!(crate::harness::accounts_sync::sign_ins_off(&config).is_some());
+
+    let world = World::new("unlisted-default");
+    let work = world.work_dir(Cli::Codex);
+    std::fs::write(
+        world.cfg.join(Cli::Codex.accounts().roster_file),
+        format!(
+            "[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
+            work.display()
+        ),
+    )
+    .expect("roster");
+    let refused = super::launch_env_for(&world.seat(), Cli::Codex, &no_usage, Some(&old))
+        .expect_err("CONTROL: no row is on the default login");
+    assert!(refused.contains("adopt-default"), "{refused}");
+}
+
+#[test]
+fn accounts_off_moves_no_cold_relaunch_onto_the_owners_pin() {
+    let world = World::new("cold-off");
+    let program = crate::harness::codex_alab::lay_package(&world.root.join("codex"), true);
+    let work = world.two(Cli::Codex);
+    world.on_main(Cli::Codex, &[]);
+    let work_auth = work.join("auth.json").display().to_string();
+    let on_work = [("CODEX_AUTH_PATH", work_auth.as_str())];
+    pin(&world, Cli::Codex, "main").expect("pin");
+    wall(&world, Cli::Codex, "work", NOW + HOUR);
+    // PRECONDITION: with rotation on, the limited row's tab starts on the pinned one.
+    let moved = cold_launch_env(&world.seat(), Cli::Codex, &on_work, &no_usage, None)
+        .map(|pick| pick.label);
+    assert_eq!(moved.as_deref(), Some("main"));
+    std::fs::write(
+        world.cfg.join("aterm.toml"),
+        "[harness]\naccounts = \"off\"\n",
+    )
+    .expect("aterm.toml");
+    assert_eq!(world.seat().mode(), Mode::Off);
+    assert_eq!(
+        cold_launch_env(&world.seat(), Cli::Codex, &on_work, &no_usage, None),
+        None,
+        "off moves no session, a cold one included"
+    );
+    assert_eq!(
+        cold_resume_env(&world.seat(), Cli::Codex, &on_work, &program).unwrap(),
+        None,
+        "off moves no held resume line onto the owner's pin"
+    );
+}
+
+#[test]
+fn cold_resume_env_routes_off_recorded_unusable_rows_without_locking_or_writing() {
+    let world = World::new("cold-resume");
+    let work = world.two(Cli::Codex);
+    world.on_main(Cli::Codex, &[]);
+    let work_auth = work.join("auth.json").display().to_string();
+    let on_work = [("CODEX_AUTH_PATH", work_auth.as_str())];
+    let program = crate::harness::codex_alab::lay_package(&world.root.join("codex"), true);
+
+    // While `work` still serves, its resume line stays on `work`.
+    assert_eq!(
+        cold_resume_env(&world.seat(), Cli::Codex, &on_work, &program).unwrap(),
+        None
+    );
+
+    // Once `work` is recorded limited, `cold_resume_env` routes onto `main` (`value: None`)
+    // even while another caller holds the store's writer lock, and writes nothing to `logins.json`.
+    wall(&world, Cli::Codex, "work", NOW + HOUR);
+    let logins_before = world.seat().store(Cli::Codex).load_logins(NOW).unwrap().0;
+    let held = world
+        .seat()
+        .store(Cli::Codex)
+        .acquire_within(&[])
+        .expect("lock")
+        .expect("acquired");
+    assert_eq!(
+        cold_resume_env(&world.seat(), Cli::Codex, &on_work, &program).unwrap(),
+        Some(LoginEnv {
+            label: "main".to_string(),
+            var: "CODEX_AUTH_PATH",
+            value: None,
+        }),
+        "lock-free main-thread read routes off limited `work` onto `main`"
+    );
+    drop(held);
+    let logins_after = world.seat().store(Cli::Codex).load_logins(NOW).unwrap().0;
+    assert_eq!(
+        logins_after, logins_before,
+        "offering a resume line never mutates served_at or bindings"
+    );
+
+    // Reverse direction: a held tab on `main` (default login, empty env) whose `~/.codex/auth.json`
+    // was removed (`NotEnrolled`) routes onto `work` once `work`'s wall has passed.
+    std::fs::remove_file(world.home.join(".codex/auth.json")).expect("remove default login");
+    let later = Seat {
+        now: NOW + 2 * HOUR,
+        ..world.seat()
+    };
+    assert_eq!(
+        cold_resume_env(&later, Cli::Codex, &[], &program).unwrap(),
+        Some(LoginEnv {
+            label: "work".to_string(),
+            var: "CODEX_AUTH_PATH",
+            value: Some(work_auth.clone()),
+        }),
+        "held default-row tab whose login file is gone routes onto serving `work`"
+    );
+
+    // Negative control: a conversation on a custom `CODEX_HOME` of its own is never moved.
+    assert_eq!(
+        cold_resume_env(
+            &world.seat(),
+            Cli::Codex,
+            &[
+                ("CODEX_HOME", "/scratch/codex"),
+                ("CODEX_AUTH_PATH", work_auth.as_str()),
+            ],
+            &program,
+        )
+        .unwrap(),
+        None
+    );
+}
+
+/// A CODEX DEFAULT ROW THIS MAC CANNOT CLAIM SAYS WHY IN WORDS: where this Mac cannot record its
+/// claims and is not the row's home ([`accounts::WhyNot::Unclaimed`]), [`default_serving`]'s
+/// reason, which `aterm ai login codex` and a refused launch quote, says so, never the slug
+/// `unclaimed`. CONTROL: on the row's home Mac it serves.
+#[test]
+fn an_unclaimed_codex_default_row_says_its_claims_cannot_be_recorded() {
+    let roster = Roster {
+        rows: vec![Row {
+            label: "main".to_string(),
+            ..Row::default()
+        }],
+    };
+    let mut state = State {
+        unrecorded: true,
+        ..State::default()
+    };
+    let enrolled = std::collections::BTreeSet::from(["main".to_string()]);
+    match default_serving(&roster, &state, &enrolled, NOW) {
+        Err(crate::harness::codex_alab::DefaultRow::Other { label, why }) => {
+            assert_eq!(label, "main");
+            assert!(why.contains("cannot record its claims"), "{why}");
+            assert!(!why.contains(accounts::WhyNot::Unclaimed.as_str()), "{why}");
+        }
+        other => panic!("{other:?}"),
+    }
+    state.home_accounts.insert("main".to_string());
+    assert!(
+        default_serving(&roster, &state, &enrolled, NOW).is_ok(),
+        "CONTROL"
+    );
 }

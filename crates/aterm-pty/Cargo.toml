@@ -42,6 +42,8 @@ aterm-spec = { workspace = true }
 aterm-tempfile = { workspace = true }
 # The sandbox-wrap enforcement tests reuse the policy crate's base profile.
 aterm-containment = { workspace = true }
+# `spawn_locale_model` conformance check (`unix_tests::spawn_locale_conformance_child_always_utf8_ctype`).
+aterm-models-session = { workspace = true }
 
 [lints]
 workspace = true

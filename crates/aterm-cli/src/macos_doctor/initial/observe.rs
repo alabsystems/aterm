@@ -10,7 +10,10 @@
 use super::*;
 use aterm_machines::init::WorkstationGroup;
 use aterm_machines::model::{Effect, Mode, Outcome};
-use aterm_types::macos_setup::{Access, Observation, Standing, Subject};
+use aterm_types::macos_setup::{Access, Observation, SYNC_OFF, Standing, Subject};
+
+#[cfg(test)]
+mod typed_join_tests;
 
 /// Read `subjects` for `plan` without changing anything. `network` adds the
 /// GitHub repositories row (the network and the keychain); without it that row
@@ -38,6 +41,11 @@ fn observe_subjects(plan: &Plan, subjects: &[Subject], network: bool) -> Vec<Obs
     };
     let sys = aterm_machines::port::Live::new();
     let mut out = Vec::with_capacity(subjects.len());
+    let root = state_root().ok();
+    // What aterm last heard at the ALab vault's address, read once for the vault row and the
+    // repositories beside it.
+    let heard = std::cell::OnceCell::new();
+    let here = || *heard.get_or_init(|| heard_for(plan, root.as_deref(), &secrets_retry::Live));
 
     let mut workstation = Selection::none();
     for subject in subjects {
@@ -54,7 +62,6 @@ fn observe_subjects(plan: &Plan, subjects: &[Subject], network: bool) -> Vec<Obs
             workstation,
         )
         .and_then(|prepared| prepared.run_tagged(&sys, Mode::Plan));
-        let root = state_root().ok();
         let held = root.as_deref().map_or_else(Selection::none, held_at_login);
         let changed_by_you = root
             .as_deref()
@@ -98,18 +105,12 @@ fn observe_subjects(plan: &Plan, subjects: &[Subject], network: bool) -> Vec<Obs
         );
     }
     if wants(Setting::Secrets) {
-        out.push(vault(plan).unwrap_or_else(|why| vault_unread(&why)));
+        out.push(vault(plan, here(), root.as_deref()).unwrap_or_else(|why| vault_unread(&why)));
     }
     if network && wants(Setting::Repositories) {
         out.push(
             context()
-                .and_then(|ctx| {
-                    super::repositories::observe(
-                        &sys,
-                        &ctx,
-                        super::Stage::Secrets.selected(plan).then_some(plan),
-                    )
-                })
+                .and_then(|ctx| repositories_heard(&sys, &ctx, plan, here))
                 .unwrap_or_else(|why| unread(Subject::Setting(Setting::Repositories), &why)),
         );
     }
@@ -188,15 +189,23 @@ enum VaultRead {
     Unconfigured,
     /// Another vault, or another signer, than the plan names.
     OtherVault,
-    /// Asked to join; an admin Mac has not approved it yet: `approve` is the command that
-    /// lets it in, when this Mac has a key ([`client::Status::approve_command`]: its code, or at
-    /// a path, which has no queue, its key and name).
+    /// Asked to join a vault other than ALab's, or one at a path, which no Allow reaches; an admin
+    /// Mac has not approved it yet: `approve` is the command that lets it in, when this Mac has a
+    /// key ([`client::Status::approve_command`]: its code, or at a path, which has no queue, its
+    /// key and name).
     /// `with_password` when a join password went with the request
     /// (`client::asked_with_password`): only then can a mistyped one be why it waits.
     Pending {
         approve: Option<String>,
         with_password: bool,
     },
+    /// Asked to join the ALab vault at a URL: an Allow on any Mac in ALab and the phrase that Mac
+    /// shows let it in ([`aterm_machines::init_secrets::LET_IN`]), so its note names no admin.
+    /// `with_password` as for [`Self::Pending`].
+    Asking { with_password: bool },
+    /// Asked to join the ALab vault, and a member let it in: it holds that member's `Allowed`
+    /// ([`aterm_secrets::client::holds_allowed`]) and waits for the vault to record it.
+    Allowed,
     /// Asked to join with a join password an admin Mac refused
     /// (`client::password_refused`): only the password typed again lets it in, so the row's
     /// fields open for it.
@@ -314,7 +323,38 @@ fn sync_turned_off(home: &Path) -> bool {
         )
 }
 
-fn vault(plan: &Plan) -> Result<Observation, String> {
+/// What aterm last heard at the ALab vault's address ([`scope::heard_at`]), for a `plan` that names
+/// that vault: only its address is probed, so a plan naming another vault hears nothing there.
+fn heard_for(
+    plan: &Plan,
+    root: Option<&Path>,
+    reads: &dyn secrets_retry::Reads,
+) -> scope::VaultHere {
+    if plan.vault_url == aterm_types::macos_setup::DEFAULT_VAULT_URL {
+        scope::heard_at(root, reads)
+    } else {
+        scope::VaultHere::Unasked
+    }
+}
+
+/// The GitHub repositories row for `plan`, read as their stage runs ([`repositories::observe`]):
+/// through the plan's vault where Secrets is in the plan, but on this Mac's own GitHub credentials
+/// where what aterm last heard at the ALab vault's address (`here`, [`heard_for`], read only then)
+/// leaves it off this network, as the stage runs them beside a Secrets try that left it so
+/// ([`vault_not_here`]).
+fn repositories_heard(
+    sys: &dyn aterm_machines::port::System,
+    ctx: &aterm_machines::items::Ctx,
+    plan: &Plan,
+    here: impl FnOnce() -> scope::VaultHere,
+) -> Result<Observation, String> {
+    let vault = super::Stage::Secrets.selected(plan).then_some(plan);
+    super::repositories::observe(sys, ctx, vault, vault.is_some() && here().not_here())
+}
+
+/// The Secrets vault row for `plan`, from this Mac's vault records and what aterm last heard at the
+/// ALab vault's address (`here`, [`heard_for`]), with the run's records in `root`.
+fn vault(plan: &Plan, here: scope::VaultHere, root: Option<&Path>) -> Result<Observation, String> {
     use aterm_secrets::client::{self, Membership, Paths};
     let paths = Paths::live().map_err(|error| error.to_string())?;
     let status = client::status(&paths).map_err(|error| error.to_string())?;
@@ -325,13 +365,7 @@ fn vault(plan: &Plan) -> Result<Observation, String> {
         (_, Membership::Unconfigured) => VaultRead::Unconfigured,
         (None, _) => VaultRead::OtherVault,
         (Some(_), Membership::Pending) if client::password_refused(&paths) => VaultRead::Refused,
-        (Some(_), Membership::Pending) if sync_turned_off(&paths.home) => VaultRead::PendingOff {
-            approve: status.approve_command(),
-        },
-        (Some(_), Membership::Pending) => VaultRead::Pending {
-            approve: status.approve_command(),
-            with_password: client::asked_with_password(&paths),
-        },
+        (Some(_), Membership::Pending) => pending_read(&paths, &status),
         (Some(_), Membership::Revoked { .. }) => VaultRead::Revoked,
         (Some(config), Membership::In { .. } | Membership::Plain) => member_read(
             client::materialization_ready_for(&paths, config).map_err(|error| error.to_string())?,
@@ -342,16 +376,61 @@ fn vault(plan: &Plan) -> Result<Observation, String> {
                 .as_deref(),
         ),
     };
-    // Only the ALab vault's address is probed: a plan naming another vault gets
-    // no word about this network from that probe.
-    let here = (plan.vault_url == aterm_types::macos_setup::DEFAULT_VAULT_URL)
-        .then(scope::vault_here)
-        .and_then(|here| here.note_for(super::access::last_answer()));
-    Ok(vault_observation(
+    Ok(vault_heard(
         &read,
-        plan.selection.contains(Setting::Secrets),
+        plan.selection,
         here,
+        super::access::last_answer(),
+        root,
     ))
+}
+
+/// The Secrets row's read of this Mac's join while it waits (`status`, with the records under
+/// `paths`). The ALab vault at a URL lets a Mac in by an Allow on any Mac in ALab and the phrase
+/// that Mac shows (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.3.1), so its words name no admin
+/// ([`VaultRead::Asking`], and [`VaultRead::Allowed`] once a member let it in); another vault,
+/// or one at a path, which no Allow reaches, by the approve an admin Mac runs
+/// ([`aterm_secrets::client::Status::approve_command`]).
+fn pending_read(
+    paths: &aterm_secrets::client::Paths,
+    status: &aterm_secrets::client::Status,
+) -> VaultRead {
+    use aterm_secrets::client;
+    use aterm_secrets::transport::Source;
+    let allow = status.config.as_ref().is_some_and(|config| {
+        matches!(config.source, Source::Url(_)) && client::alab_vault(config)
+    });
+    let approve = status.approve_command().filter(|_| !allow);
+    let with_password = client::asked_with_password(paths);
+    if sync_turned_off(&paths.home) {
+        VaultRead::PendingOff { approve }
+    } else if allow && client::holds_allowed(paths) {
+        VaultRead::Allowed
+    } else if allow {
+        VaultRead::Asking { with_password }
+    } else {
+        VaultRead::Pending {
+            approve,
+            with_password,
+        }
+    }
+}
+
+/// [`vault_observation`] of `read` for `selection`, with what aterm last heard at the ALab vault's
+/// address for its plan (`here`, [`heard_for`]), said with what a LAN look last heard of macOS's
+/// Local Network switch (`lan`, [`scope::VaultHere::note_for`]), and whether a join password the
+/// person typed is held for a try there ([`scope::join_typed`]), as the records in `root` say.
+fn vault_heard(
+    read: &VaultRead,
+    selection: Selection,
+    here: scope::VaultHere,
+    lan: Option<super::access::LanAnswer>,
+    root: Option<&Path>,
+) -> Observation {
+    let here = here.note_for(lan);
+    // Only a row the probe left a note on can wait for a join, so only then is the run read.
+    let typed = here.is_some() && root.is_some_and(scope::join_typed);
+    vault_observation(read, selection, here, typed)
 }
 
 /// The Secrets vault row's note when aterm cannot read this Mac's vault settings (a
@@ -384,18 +463,13 @@ const STOPPED: &str = "The sync is not running; Set up now starts it";
 /// it off. It names no command, since several leave it so.
 const NOT_SET_UP: &str = "Not set up to sync this Mac; Set up now installs it";
 
-/// The value of a member Mac whose subscriber the person turned off, which is
-/// also what the row wants then (design §4: an explicit opt-out is the row's
-/// wanted state).
-const SYNC_OFF: &str = "Sync off";
-
 /// The note of a member Mac whose subscriber the person turned off
 /// (`aterm_secrets::service::subscriber_off_path`): their choice, said as theirs.
 /// The row's quiet Turn On Sync button turns it back on.
 const TURNED_OFF: &str = "You turned sync off on this Mac";
 
 /// The note of a Mac that asked to join and whose sync the person turned off since:
-/// an admin Mac's approval lands only once sync is on again.
+/// the join lands only once sync is on again.
 const PENDING_OFF: &str = "You turned sync off, so an approved join lands once it's on";
 
 /// The note of a member Mac whose subscriber cannot run from the copy of aterm
@@ -415,17 +489,30 @@ const RETYPE: &str = "or retype the join password";
 /// (`aterm secrets approve <code>`, or `<age1…> --name <host>` at a path).
 const APPROVE: &str = "On an admin Mac:";
 
+/// The note of a Mac a member let into the ALab vault, which waits for the vault to record it.
+const ALLOWED: &str = "Allowed; waits for the vault to record this Mac";
+
 /// The value of a join an admin Mac refused for its join password: its fields open to take it
 /// again (no note, so `vault_shown` opens them).
 const WRONG_PASSWORD: &str = "Wrong password";
 
 /// The Secrets vault row in §3.3's words: Not joined, Awaiting code, Other vault, Out of sync,
 /// Not syncing, Not set up, In sync, or Sync off (the person's choice, so in place). A stopped or
-/// uninstalled subscriber differs, with a note only on a managed row. `here` is the last ALab
-/// vault probe's note when the plan names that vault ([`scope::VaultHere::note`]): a managed row
-/// not joined waits with it until setup asks again.
-fn vault_observation(read: &VaultRead, managed: bool, here: Option<&str>) -> Observation {
+/// uninstalled subscriber differs, with a note only on a row `selection` manages. `here` is the
+/// note of what aterm last heard at the ALab vault's address when the plan names that vault
+/// ([`scope::heard_at`], [`scope::VaultHere::note`]), kept on a managed row not joined. Where the
+/// run in force holds a join password the person typed (`typed`, [`scope::join_typed`]), which it
+/// keeps for a try that reaches the vault, the row waits with it. Otherwise the join is aterm's
+/// own, which joins a vault only where one answers, so the row stands not joined, in place,
+/// whatever other groups `selection` sets up.
+fn vault_observation(
+    read: &VaultRead,
+    selection: Selection,
+    here: Option<&str>,
+    typed: bool,
+) -> Observation {
     let subject = Subject::Setting(Setting::Secrets);
+    let managed = selection.contains(Setting::Secrets);
     let person = if managed {
         Standing::NeedsYou
     } else {
@@ -484,16 +571,39 @@ fn vault_observation(read: &VaultRead, managed: bool, here: Option<&str>) -> Obs
                 APPROVAL.to_owned()
             }),
         ),
-        VaultRead::Refused => (person, WRONG_PASSWORD, None),
-        VaultRead::Unconfigured if managed && here.is_some() => {
-            (Standing::Waiting, "Not joined", here.map(str::to_owned))
+        VaultRead::Asking { with_password } => {
+            let allow = format!("To join, {}", aterm_machines::init_secrets::LET_IN);
+            (
+                person,
+                "Awaiting code",
+                Some(if *with_password {
+                    format!("{allow}, {RETYPE}")
+                } else {
+                    allow
+                }),
+            )
         }
+        VaultRead::Allowed => (Standing::Waiting, "Awaiting code", Some(ALLOWED.to_owned())),
+        VaultRead::Refused => (person, WRONG_PASSWORD, None),
+        // No ALab vault answered: aterm's own join has none to join, so the row waits on nothing
+        // on any plan, while the Secrets stage still asks again by itself. A join the person
+        // typed a password for waits for that vault.
+        VaultRead::Unconfigured if managed && here.is_some() => (
+            if typed {
+                Standing::Waiting
+            } else {
+                Standing::InPlace
+            },
+            "Not joined",
+            here.map(str::to_owned),
+        ),
         VaultRead::Unconfigured | VaultRead::Revoked => (Standing::Differs, "Not joined", None),
         VaultRead::OtherVault => (Standing::Differs, "Other vault", None),
     };
-    // An opt-out is the row's wanted value, as for a grant (`access::honor_opt_out`).
-    let wanted = if matches!(read, VaultRead::TurnedOff | VaultRead::PendingOff { .. }) {
-        SYNC_OFF
+    // A row in place wants what it reads: In sync, the person's opt-out (as for a grant,
+    // `access::honor_opt_out`), or Not joined where no vault answered aterm's own join.
+    let wanted = if standing == Standing::InPlace {
+        now
     } else {
         subject.wanted()
     };
@@ -620,6 +730,7 @@ fn held_at_login_in(root: &Path, session: &str) -> Selection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aterm_types::macos_setup::BASE_PLAN;
 
     #[test]
     fn a_restore_refused_before_effects_keeps_the_pending_login_reading() {
@@ -781,7 +892,7 @@ mod tests {
     #[test]
     fn the_vault_row_says_what_the_records_hold_in_its_own_words() {
         let words = |read: VaultRead, here: Option<&str>| {
-            let seen = vault_observation(&read, true, here);
+            let seen = vault_observation(&read, Selection::all(), here, false);
             (seen.standing, seen.now.unwrap(), seen.note)
         };
         assert_eq!(
@@ -826,21 +937,9 @@ mod tests {
             (Standing::NeedsYou, WRONG_PASSWORD.into(), None)
         );
         assert_eq!(
-            vault_observation(&VaultRead::Refused, false, None).standing,
+            vault_observation(&VaultRead::Refused, Selection::none(), None, false).standing,
             Standing::Differs
         );
-        // What the probe heard is a note, and only the words it can stand behind:
-        // nothing answering is not proof there is no vault.
-        for heard in [scope::VaultHere::Absent, scope::VaultHere::Unreached] {
-            assert_eq!(
-                words(VaultRead::Unconfigured, heard.note()),
-                (
-                    Standing::Waiting,
-                    "Not joined".into(),
-                    heard.note().map(str::to_owned)
-                )
-            );
-        }
         assert_eq!(scope::VaultHere::Absent.note(), Some(scope::NO_VAULT));
         assert_eq!(scope::VaultHere::Unreached.note(), Some(scope::NOT_REACHED));
         assert_eq!(scope::VaultHere::Found.note(), None);
@@ -863,12 +962,6 @@ mod tests {
             words(VaultRead::Unconfigured, None),
             (Standing::Differs, "Not joined".into(), None)
         );
-        // A row nobody manages makes no claim about this network.
-        let unmanaged = vault_observation(&VaultRead::Unconfigured, false, Some(scope::NO_VAULT));
-        assert_eq!(
-            (unmanaged.standing, unmanaged.note),
-            (Standing::Differs, None)
-        );
         assert_eq!(
             words(VaultRead::OtherVault, None),
             (Standing::Differs, "Other vault".into(), None)
@@ -877,6 +970,10 @@ mod tests {
             VaultRead::Unconfigured,
             VaultRead::OtherVault,
             pending(None, true),
+            VaultRead::Asking {
+                with_password: true,
+            },
+            VaultRead::Allowed,
             VaultRead::Revoked,
             VaultRead::Member { synced: false },
             VaultRead::Stopped,
@@ -886,8 +983,71 @@ mod tests {
             VaultRead::Fleeting,
             VaultRead::Refused,
         ] {
-            let now = vault_observation(&read, true, None).now.unwrap();
+            let now = vault_observation(&read, Selection::all(), None, false)
+                .now
+                .unwrap();
             assert!(now.chars().count() <= 14, "{now}");
+        }
+    }
+
+    /// A vault not joined where no ALab vault answered waits on nothing for aterm's own join,
+    /// whatever else the plan sets up: whether a server there holds no vault, nobody answered, or
+    /// Local Network kept the probe in, the row reads Not joined in place, the value it then
+    /// wants, and keeps what the probe heard as its note, on the base plan, on it with any one
+    /// group of the ALab profile, and on the whole profile. A join the person typed a password
+    /// for waits for that vault with the same note, on the base plan too.
+    #[test]
+    fn a_vault_nothing_answered_for_waits_only_for_a_join_the_person_typed() {
+        let mut narrower = BASE_PLAN;
+        narrower.set(Setting::Spotlight, false);
+        let mut plans = vec![BASE_PLAN, narrower, Selection::all()];
+        for setting in Setting::ALL {
+            if !BASE_PLAN.contains(setting) {
+                let mut beyond = BASE_PLAN;
+                beyond.set(setting, true);
+                plans.push(beyond);
+            }
+        }
+        let reads = |selection, here, typed| {
+            let seen = vault_observation(&VaultRead::Unconfigured, selection, here, typed);
+            (seen.standing, seen.now.unwrap(), seen.wanted, seen.note)
+        };
+        for note in [scope::NO_VAULT, scope::NOT_REACHED, scope::LAN_OFF] {
+            for selection in plans.iter().copied() {
+                let settled = reads(selection, Some(note), false);
+                assert_eq!(
+                    settled,
+                    (
+                        Standing::InPlace,
+                        "Not joined".into(),
+                        "Not joined".into(),
+                        Some(note.into())
+                    ),
+                    "{note} {selection:?}"
+                );
+                assert!(settled.0.settled(), "{note} {selection:?}");
+                assert_eq!(
+                    reads(selection, Some(note), true),
+                    (
+                        Standing::Waiting,
+                        "Not joined".into(),
+                        Setting::Secrets.wanted().into(),
+                        Some(note.into())
+                    ),
+                    "{note} {selection:?}"
+                );
+            }
+            // A row nobody manages makes no claim about this network, typed or not.
+            for typed in [false, true] {
+                let unmanaged = reads(Selection::none(), Some(note), typed);
+                assert_eq!((unmanaged.0, unmanaged.3), (Standing::Differs, None));
+            }
+        }
+        // With no word from the probe (none ran, or it found the vault) the join is a change to
+        // make, typed or not.
+        for typed in [false, true] {
+            let unheard = reads(BASE_PLAN, None, typed);
+            assert_eq!((unheard.0, unheard.3), (Standing::Differs, None));
         }
     }
 
@@ -907,8 +1067,9 @@ mod tests {
         assert_eq!(observation.detail.as_deref(), Some(why));
     }
 
-    /// Every Secrets read, managed or not, with and without a vault this network
-    /// did not answer for.
+    /// Every Secrets read, under the whole profile, the base plan alone and a plan that leaves
+    /// the vault as is, with and without a vault this network did not answer for, for aterm's own
+    /// join and for one the person typed a password for.
     fn every_vault_observation() -> Vec<(VaultRead, Observation)> {
         let mut out = Vec::new();
         for read in [
@@ -930,6 +1091,13 @@ mod tests {
                 approve: Some("aterm secrets approve abcd-efgh".into()),
                 with_password: true,
             },
+            VaultRead::Asking {
+                with_password: false,
+            },
+            VaultRead::Asking {
+                with_password: true,
+            },
+            VaultRead::Allowed,
             VaultRead::Member { synced: false },
             VaultRead::Member { synced: true },
             VaultRead::Stopped,
@@ -943,9 +1111,14 @@ mod tests {
             VaultRead::Revoked,
             VaultRead::Refused,
         ] {
-            for managed in [true, false] {
+            for selection in [Selection::all(), BASE_PLAN, Selection::none()] {
                 for here in [None, scope::VaultHere::Absent.note()] {
-                    out.push((read.clone(), vault_observation(&read, managed, here)));
+                    for typed in [false, true] {
+                        out.push((
+                            read.clone(),
+                            vault_observation(&read, selection, here, typed),
+                        ));
+                    }
                 }
             }
         }
@@ -981,13 +1154,14 @@ mod tests {
                 "You turned sync off; once it's on, aterm secrets approve abcd-efgh on an admin Mac finishes the join".to_owned(),
             ),
         ] {
-            for managed in [true, false] {
+            for selection in [Selection::all(), BASE_PLAN, Selection::none()] {
                 let seen = vault_observation(
                     &VaultRead::PendingOff {
                         approve: approve.clone(),
                     },
-                    managed,
+                    selection,
                     None,
+                    false,
                 );
                 assert_eq!(
                     (seen.standing, seen.now.as_deref(), seen.wanted.as_str()),
@@ -1029,7 +1203,7 @@ mod tests {
             member_read(true, Subscriber::Running, Some(installed)),
             VaultRead::Member { synced: true }
         );
-        let seen = vault_observation(&VaultRead::Fleeting, true, None);
+        let seen = vault_observation(&VaultRead::Fleeting, Selection::all(), None, false);
         assert_eq!(
             (seen.standing, seen.now.as_deref(), seen.note.as_deref()),
             (Standing::NeedsYou, Some("Out of sync"), Some(FLEETING))
@@ -1037,7 +1211,7 @@ mod tests {
         assert!(FLEETING.contains("Applications"));
         // A Secrets group left as is asks nothing of anyone.
         assert_eq!(
-            vault_observation(&VaultRead::Fleeting, false, None).standing,
+            vault_observation(&VaultRead::Fleeting, Selection::none(), None, false).standing,
             Standing::Differs
         );
     }
@@ -1049,7 +1223,12 @@ mod tests {
         let installed = Some(Path::new("/Applications/aterm.app/Contents/MacOS/aterm"));
         let subject = Subject::Setting(Setting::Secrets);
         let words = |read: VaultRead, managed| {
-            let seen = vault_observation(&read, managed, None);
+            let selection = if managed {
+                Selection::all()
+            } else {
+                Selection::none()
+            };
+            let seen = vault_observation(&read, selection, None, false);
             (seen.standing, seen.now.unwrap(), seen.note)
         };
         for written in [true, false] {
@@ -1073,8 +1252,9 @@ mod tests {
             );
             let off = vault_observation(
                 &member_read(written, Subscriber::TurnedOff, installed),
-                true,
+                Selection::all(),
                 None,
+                false,
             );
             assert_eq!(
                 (off.standing, off.now.as_deref(), off.note.as_deref()),
@@ -1105,11 +1285,108 @@ mod tests {
         }
     }
 
+    /// A join waiting on the ALab vault is let in by an Allow on any Mac in ALab and the phrase
+    /// that Mac shows (`docs/DESIGN-fluid-swarm-2026-10-28.md` F10: the joiner's words drop
+    /// "admin"), with sync on or off. Another vault, at a URL or at a path, has no Allow to wait
+    /// for, so its row still names the approve an admin Mac runs. A Mac a member already let in
+    /// waits for the vault to record it, with nothing more to press. Read on a scratch home.
+    /// NEGATIVE CONTROL: a read that takes no vault for ALab's names the admin's approve on the
+    /// ALab row; one that takes every vault at a URL for ALab's tells a team vault to press
+    /// Allow; one that reads no `Allowed` asks the Mac a member let in to press Allow again; an
+    /// approve kept for ALab with sync off names it in the sync-off note.
+    #[test]
+    fn a_join_waiting_on_the_alab_vault_says_press_allow_and_names_no_admin() {
+        use aterm_secrets::client::{Config, Membership, Paths, Status};
+        use aterm_secrets::commons::bootstrap::Device;
+        use aterm_secrets::members::Allowed;
+        use aterm_secrets::transport::Source;
+        let home = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(home.path());
+        let alab: [u8; 32] = aterm_secrets::b64::decode_padded(aterm_secrets::ALAB_SIGNER)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let waiting = |source: Source, signer: [u8; 32]| Status {
+            config: Some(Config {
+                source,
+                name: "alab".into(),
+                signer: Some(signer),
+                followed: Vec::new(),
+                host: "m99".into(),
+            }),
+            machine: Some((aterm_secrets::age::Recipient([7; 32]), "abcd-efgh".into())),
+            membership: Membership::Pending,
+            names: Vec::new(),
+        };
+        let row = |status: &Status| {
+            vault_observation(&pending_read(&paths, status), Selection::all(), None, false)
+        };
+        let alab_at = || Source::Url(aterm_types::macos_setup::DEFAULT_VAULT_URL.into());
+        let asking = row(&waiting(alab_at(), alab));
+        let note = asking.note.unwrap();
+        assert_eq!(asking.standing, Standing::NeedsYou, "{note}");
+        assert!(
+            note.contains(aterm_machines::init_secrets::LET_IN),
+            "{note}"
+        );
+        assert!(
+            !note.contains("admin") && !note.contains("approve"),
+            "{note}"
+        );
+        // CONTROL: another vault, at a URL or at a path, is let in only by an admin Mac's approve
+        // of this Mac's code or key, so its row keeps naming it.
+        for source in [
+            Source::Url("http://vault.example:7484/v1/team".into()),
+            Source::Path("/Volumes/team/team.vault".into()),
+        ] {
+            let team = waiting(source, [9; 32]);
+            let approve = team.approve_command().unwrap();
+            assert_eq!(
+                row(&team).note.as_deref(),
+                Some(format!("{APPROVE} {approve}").as_str())
+            );
+        }
+        // A member let it in: it holds that member's `Allowed`.
+        let member = Paths::for_home(&home.path().join("member"));
+        let device = |paths: &Paths| {
+            aterm_secrets::client::machine_identity(paths).unwrap();
+            Device::open(paths).unwrap().unwrap()
+        };
+        let request = device(&paths).request([1; 16], [2; 32]).unwrap();
+        let allowed = device(&member)
+            .with_seed(|seed| Allowed::sign(request.binding(), "m99", seed))
+            .unwrap();
+        aterm_secrets::fsx::ensure_private_dir(&paths.dir).unwrap();
+        aterm_secrets::fsx::write_atomic(
+            &paths.dir.join("allowed"),
+            format!("{}\n", allowed.to_text()).as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        let let_in = row(&waiting(alab_at(), alab));
+        assert_eq!(
+            (let_in.standing, let_in.note.as_deref()),
+            (Standing::Waiting, Some(ALLOWED))
+        );
+        // Sync turned off: the ALab join lands once it is on, still with no admin in the words.
+        // A scratch home has no launchd job of its own, so this reads no launchd state.
+        let off = aterm_secrets::service::subscriber_off_path(&paths.home);
+        std::fs::create_dir_all(off.parent().unwrap()).unwrap();
+        std::fs::write(&off, b"").unwrap();
+        let off = row(&waiting(alab_at(), alab));
+        assert_eq!(
+            (off.now.as_deref(), off.note.as_deref()),
+            (Some(SYNC_OFF), Some(PENDING_OFF))
+        );
+    }
+
     /// Only a pending join sent with a password offers to retype it, beside the code or the wait.
     #[test]
     fn a_pending_join_sent_with_a_password_says_it_can_be_retyped() {
         for (read, seen) in every_vault_observation() {
-            let VaultRead::Pending { with_password, .. } = read else {
+            let (VaultRead::Pending { with_password, .. } | VaultRead::Asking { with_password }) =
+                read
+            else {
                 continue;
             };
             let Some(note) = seen.note else {
@@ -1129,7 +1406,9 @@ mod tests {
             with_password: true,
         };
         assert_eq!(
-            vault_observation(&code, true, None).note.as_deref(),
+            vault_observation(&code, Selection::all(), None, false)
+                .note
+                .as_deref(),
             Some("On an admin Mac: aterm secrets approve abcd-efgh, or retype the join password")
         );
     }

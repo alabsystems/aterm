@@ -136,22 +136,44 @@ impl std::fmt::Debug for Completion {
 }
 
 pub(crate) struct Lane {
-    tx: SyncSender<Request>,
+    tx: Option<SyncSender<Request>>,
+    proxy: Option<EventLoopProxy<Wake>>,
     pending: Option<Request>,
 }
 
 impl Lane {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "callers keep the fallible startup signature while the worker spawns on first demand"
+    )]
     pub(crate) fn spawn(proxy: EventLoopProxy<Wake>) -> Result<Self, String> {
-        let (tx, rx) = sync_channel(1);
-        crate::qos::spawn_lane_thread(
-            "aterm-font-catalog",
-            crate::qos::Role::Background,
-            move || {
-                worker(rx, proxy);
-            },
-        )
-        .map_err(|error| format!("could not start font catalog worker: {error}"))?;
-        Ok(Self { tx, pending: None })
+        Ok(Self {
+            tx: None,
+            proxy: Some(proxy),
+            pending: None,
+        })
+    }
+
+    fn ensure_worker(&mut self) -> Option<&SyncSender<Request>> {
+        if self.tx.is_none() {
+            let proxy = self.proxy.take()?;
+            let (tx, rx) = sync_channel(1);
+            match crate::qos::spawn_lane_thread(
+                "aterm-font-catalog",
+                crate::qos::Role::Background,
+                move || {
+                    worker(rx, proxy);
+                },
+            ) {
+                Ok(_) => self.tx = Some(tx),
+                Err(error) => {
+                    crate::logging::stderr_line!(
+                        "aterm-gui: could not start font catalog worker: {error}"
+                    );
+                }
+            }
+        }
+        self.tx.as_ref()
     }
 
     /// True only when the request is queued or retained behind a live receiver.
@@ -168,7 +190,10 @@ impl Lane {
         let Some(request) = self.pending.take() else {
             return true;
         };
-        match self.tx.try_send(request) {
+        let Some(tx) = self.ensure_worker() else {
+            return false;
+        };
+        match tx.try_send(request) {
             Ok(()) => true,
             Err(TrySendError::Full(request)) => {
                 self.pending = Some(request);
@@ -181,7 +206,14 @@ impl Lane {
     #[cfg(test)]
     fn test_pair() -> (Self, Receiver<Request>) {
         let (tx, rx) = sync_channel(1);
-        (Self { tx, pending: None }, rx)
+        (
+            Self {
+                tx: Some(tx),
+                proxy: None,
+                pending: None,
+            },
+            rx,
+        )
     }
 }
 

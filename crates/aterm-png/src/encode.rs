@@ -300,13 +300,16 @@ impl<W: Write> Writer<W> {
     /// Write `IEND` and flush.
     /// # Errors
     /// [`EncodingError::Io`] if the sink refuses the final write; [`EncodingError::Parameter`]
-    /// after a failed image-data write, whose file is incomplete.
+    /// if no image data was written or after a failed image-data write, whose file is incomplete.
     pub fn finish(mut self) -> Result<(), EncodingError> {
         let Some(mut sink) = self.sink.take() else {
             return Err(EncodingError::Parameter(
                 "image data failed part way; the file is incomplete",
             ));
         };
+        if !self.wrote_data {
+            return Err(EncodingError::Parameter("no image data written"));
+        }
         write_chunk(&mut sink, b"IEND", &[])?;
         io(sink.flush())
     }
@@ -316,7 +319,9 @@ impl<W: Write> Drop for Writer<W> {
     fn drop(&mut self) {
         // Call sites rely on drop closing the file. A failure here cannot be
         // reported; a best-effort IEND beats a file silently missing one.
-        if let Some(mut sink) = self.sink.take() {
+        if let Some(mut sink) = self.sink.take()
+            && self.wrote_data
+        {
             let _ = write_chunk(&mut sink, b"IEND", &[]);
             let _ = sink.flush();
         }
@@ -415,7 +420,9 @@ fn io(r: std::io::Result<()>) -> Result<(), EncodingError> {
 /// Write one chunk: big-endian length, four-byte type, body, CRC over type+body.
 fn write_chunk<W: Write>(sink: &mut W, kind: &[u8; 4], data: &[u8]) -> Result<(), EncodingError> {
     let len = u32::try_from(data.len())
-        .map_err(|_| EncodingError::Parameter("chunk exceeds 2^32-1 bytes"))?;
+        .ok()
+        .filter(|&n| n <= 0x7FFF_FFFF)
+        .ok_or(EncodingError::Parameter("chunk exceeds 2^31-1 bytes"))?;
     io(sink.write_all(&len.to_be_bytes()))?;
     io(sink.write_all(kind))?;
     io(sink.write_all(data))?;

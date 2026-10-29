@@ -616,24 +616,54 @@ fn the_deck_says_more_only_when_the_mac_struggles() {
         let said: Vec<(Owner, Vec<String>)> = Owner::ALL
             .map(|o| (o, runs(&owner_laid_at(o, form, OWNER_W, &m))))
             .into();
-        let chars = |runs: &[String]| -> usize { runs.iter().map(|r| r.chars().count()).sum() };
         let of = |o: Owner| &said.iter().find(|(w, _)| *w == o).expect("a scene").1;
-        let calm = chars(of(Owner::Light));
-        let ladder = [Owner::Idle, Owner::Light, Owner::Busy, Owner::HotHard].map(|o| chars(of(o)));
-        assert!(
-            ladder.windows(2).all(|w| w[0] <= w[1]),
-            "{form:?}: idle, light, busy, hot-hard say more in turn: {ladder:?}"
-        );
-        // Full's Details says the unusual clauses; Folded at this width has no Details, so
-        // its extra words are the states beside the amounts.
-        let (more, how) = if form == DeckForm::Full {
-            (13, "a third again")
-        } else {
-            (11, "a tenth again")
+        // Standing hardware/capacity facts vary in digit count. The extra information under
+        // load is its state/cause, not a minimum increase in all the card's characters.
+        let pressure =
+            aterm_vitals::words::state(Resource::Memory, &owner_scene(Owner::HotHard), &MAC)
+                .expect("HotHard has a memory pressure state");
+        assert_eq!(pressure.state, State::Warn, "CONTROL: HotHard pressure");
+        let exceptional = |runs: &[String]| -> bool {
+            runs.iter().any(|run| {
+                // Without room in Details or a run, the same state uses its compact header.
+                run == &pressure.label
+                    || [
+                        "waiting",
+                        "pressure warn",
+                        "pressure critical",
+                        "swapping",
+                        "stuck",
+                    ]
+                    .iter()
+                    .any(|word| run.contains(word))
+            })
         };
         assert!(
-            chars(of(Owner::HotHard)) * 10 > calm * more,
-            "{form:?}: hot-hard says {how} what light says: {ladder:?}"
+            !exceptional(of(Owner::Idle)) && !exceptional(of(Owner::Light)),
+            "{form:?}: calm states have no exceptional clauses: {said:?}"
+        );
+        assert!(
+            exceptional(of(Owner::HotHard)),
+            "{form:?}: struggle must name a state or cause: {said:?}"
+        );
+        // Light's measured growth predicts a full disk even while current pressure is calm.
+        // Keep that forecast visible without classifying it as an urgent struggle clause.
+        let light = owner_scene(Owner::Light);
+        let forecast = format!(
+            "full in {}",
+            aterm_vitals::words::duration_approx(light.facts.filling.expect("Light grows").secs)
+        );
+        // Full has Details at this width; Folded has no room for a nonurgent forecast.
+        if form == DeckForm::Full {
+            assert!(
+                of(Owner::Light).iter().any(|r| r.contains(&forecast)),
+                "{form:?}: the expected forecast {forecast:?}: {:?}",
+                of(Owner::Light)
+            );
+        }
+        assert!(
+            !of(Owner::Idle).iter().any(|r| r.contains("full in")),
+            "{form:?}: Idle has no measured growth forecast"
         );
         // What a strip of this form at this width draws: Full's 1h multi-scale horizon, or
         // Folded's multi-scale blocks.
@@ -658,11 +688,20 @@ fn the_deck_says_more_only_when_the_mac_struggles() {
             // The legend shows a mark only while a strip draws it.
             let scene = owner_scene(*o);
             let over_drawn = match form {
-                DeckForm::Full => scene.resources[..DECK_RESOURCES.len()].iter().any(|v| {
-                    v.heat_multi_scale(form_strips[0].spec, AT, SLOT_COVER_MS, &scene.time_gaps)
-                        .iter()
-                        .any(|s| s.cell.over)
-                }),
+                DeckForm::Full => scene.resources[..DECK_RESOURCES.len()]
+                    .iter()
+                    .enumerate()
+                    .any(|(ri, v)| {
+                        aterm_vitals::words::strip_words(DECK_RESOURCES[ri], &scene).is_none()
+                            && v.heat_multi_scale(
+                                form_strips[0].spec,
+                                AT,
+                                SLOT_COVER_MS,
+                                &scene.time_gaps,
+                            )
+                            .iter()
+                            .any(|s| s.cell.over)
+                    }),
                 DeckForm::Folded => {
                     // Folded's header queries words.over_shown(&plan.blocks[0].strip), which checks
                     // all non-text rows against block A's multi-scale spec.
@@ -748,9 +787,9 @@ fn the_run_says_the_machines_reading_where_it_fits() {
         runs(&lay(&owner_geom_at(form, w, 2.0), &input, &words, &m, true))
     };
     let readings = [
-        ("0.8", "of 18 cores", "cores"),
-        ("16.5", "of 128 GiB", "GiB"),
-        ("1.31", "of 2.00 TB", "TB"),
+        ("0.8 of 18 cores", "0.8 of 18 cores", "0.8 cores"),
+        ("16.5 of 128 GiB used", "16.5/128 GiB used", "16.5 GiB used"),
+        ("1.31 of 2.00 TB used", "1.31/2.00 TB used", "1.31 TB used"),
     ];
     let scopes = ["0.4", "0.1", "2.2", "0.5", "48", "3"];
     let (mut with_run, mut without) = (0, 0);
@@ -776,27 +815,30 @@ fn the_run_says_the_machines_reading_where_it_fits() {
                 (p.blocks[0].meter.run, p.blocks[0].rows.amount_pt)
             }
         };
-        for (mac, max, unit) in readings {
-            let long = format!("{mac} {max}");
-            let short = format!("{mac} {unit}");
+        for (long, compact, short) in readings {
             match run {
                 Some(run) => {
+                    let want = if m.width(long, pt, false) <= run.w + 1e-9 {
+                        long
+                    } else {
+                        compact
+                    };
                     assert!(
-                        m.width(&long, pt, false) <= run.w + 1e-9,
-                        "{w} pt {form:?}: {long:?} fits the run {run:?}"
+                        m.width(want, pt, false) <= run.w + 1e-9,
+                        "{w} pt {form:?}: {want:?} fits the run {run:?}"
                     );
                     assert!(
-                        runs.contains(&long),
-                        "{w} pt {form:?}: {long:?} in {runs:?}"
+                        runs.iter().any(|r| r == want),
+                        "{w} pt {form:?}: {want:?} in {runs:?}"
                     );
                 }
                 None => assert!(
-                    !runs.iter().any(|r| *r == long || *r == short),
-                    "{w} pt {form:?}: no run, yet {mac:?} is said: {runs:?}"
+                    !runs.iter().any(|r| r == long || r == compact || r == short),
+                    "{w} pt {form:?}: no amount column, yet a separate amount is said: {runs:?}"
                 ),
             }
             assert!(
-                !runs.contains(&short),
+                !runs.iter().any(|r| r == short),
                 "{w} pt {form:?}: {short:?} without its maximum: {runs:?}"
             );
         }
@@ -1350,4 +1392,55 @@ fn every_scope_shows_its_own_ink_in_the_bar_under_the_percent() {
         }
     }
     assert!(shown > 100, "CONTROL: {shown} scopes above zero");
+}
+
+/// The gauge says to a screen reader what it draws (§12): its Meter's value is the needle (past
+/// capacity reads 100), its words the needle now and the bezel's hour at the soak's thresholds the
+/// bezel's ink and bloom draw, so spike and recovering say a warm bezel and only hot-hard a long
+/// stretch. Its place first in the tree is `a11y_tree`'s test's.
+#[cfg(a11y_tree)]
+#[test]
+fn the_gauge_says_what_it_draws() {
+    let want = [
+        (Owner::Idle, Some(1.0), "Strain 1 percent of capacity now."),
+        (Owner::Light, Some(5.0), "Strain 5 percent of capacity now."),
+        (
+            Owner::Busy,
+            Some(70.0),
+            "Strain 70 percent of capacity now.",
+        ),
+        (
+            Owner::Spike,
+            Some(22.0),
+            "Strain 22 percent of capacity now. At or past capacity recently.",
+        ),
+        (
+            Owner::HotHard,
+            Some(100.0),
+            "Strain past capacity now. Past capacity for a long stretch recently.",
+        ),
+        (
+            Owner::Recovering,
+            Some(6.0),
+            "Strain 6 percent of capacity now. At or past capacity recently.",
+        ),
+    ];
+    for (o, value, words) in want {
+        let snap = owner_scene(o);
+        let input = owner_input(&snap);
+        let group = stats_a11y_group(Some(&snap), &input.tab_panes, &input.locale);
+        let gauge = group.gauge.expect("the gauge's meter");
+        assert_eq!(
+            (gauge.name.as_str(), gauge.value, gauge.words.as_str()),
+            ("Strain", value, words),
+            "{o:?}"
+        );
+    }
+    let reading = stats_a11y_group(None, &[FRONT], &MAC)
+        .gauge
+        .expect("the gauge's meter");
+    assert_eq!(
+        (reading.value, reading.words.as_str()),
+        (None, "Strain: reading.")
+    );
 }

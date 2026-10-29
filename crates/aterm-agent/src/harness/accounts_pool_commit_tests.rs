@@ -37,8 +37,15 @@ fn run_operation(world: &World, cli: Cli, operation: i64, mut arm: impl FnMut())
     if operation == 8 {
         s.sample = None;
     }
+    if operation == 10 {
+        s.sample = None;
+        s.point = Point::Wall {
+            window: "five_hour".into(),
+            at: None,
+        };
+    }
     match operation {
-        1 => super::super::session_move_using(&world.seat(), &s, |row| {
+        1 | 10 => super::session_move_using(&world.seat(), &s, |row| {
             let env = login_env(cli, row, &world.home).unwrap();
             let line = relaunch::pool_line(&s.relaunch, cli, &env).unwrap();
             arm();
@@ -51,12 +58,18 @@ fn run_operation(world: &World, cli: Cli, operation: i64, mut arm: impl FnMut())
             let enrolled = accounts::enrolled_for(cli, &before.roster);
             let home_path = world.home.join(cli.accounts().default_home);
             arm();
-            super::super::poll_usage(&world.seat(), cli, &before, &enrolled, &|_, home, _| {
-                (home == home_path).then(|| Usage {
-                    sample: near_wall(),
-                    wall: None,
-                })
-            })
+            super::super::poll_usage(
+                &world.seat(),
+                cli,
+                &before,
+                &enrolled,
+                &|_: Cli, home: &Path, _: Option<&str>, _: i64| {
+                    (home == home_path).then(|| Usage {
+                        sample: near_wall(),
+                        walls: Vec::new(),
+                    })
+                },
+            )
             .is_ok()
         }
         5..=9 => {
@@ -68,7 +81,7 @@ fn run_operation(world: &World, cli: Cli, operation: i64, mut arm: impl FnMut())
             };
             let row = before.roster.row("main").unwrap();
             arm();
-            super::super::record_session(&world.seat(), &s, &who, row).is_ok()
+            super::record_session(&world.seat(), &s, &who, row).is_ok()
         }
         _ => unreachable!(),
     }
@@ -76,7 +89,7 @@ fn run_operation(world: &World, cli: Cli, operation: i64, mut arm: impl FnMut())
 
 fn observe(operation: i64, fault: i64) -> [bool; 6] {
     let cli = match operation {
-        1 | 2 | 5 | 8 | 9 => Cli::Codex,
+        1 | 2 | 5 | 8 | 9 | 10 => Cli::Codex,
         3 | 6 => Cli::Grok,
         4 | 7 => Cli::Kimi,
         _ => unreachable!(),
@@ -89,6 +102,20 @@ fn observe(operation: i64, fault: i64) -> [bool; 6] {
         store
             .transact(NOW, &mut None, |state| {
                 state.proven = false;
+                Ok(Vec::new())
+            })
+            .unwrap();
+    }
+    if operation == 10 {
+        store
+            .transact(NOW, &mut None, |state| {
+                state.active = Some("work".into());
+                state.proven = false;
+                state.canary = Some(accounts::Canary {
+                    sid: "silent".into(),
+                    at: NOW - accounts::CANARY_HOLD_S - 1,
+                    took: false,
+                });
                 Ok(Vec::new())
             })
             .unwrap();
@@ -145,7 +172,7 @@ fn observe(operation: i64, fault: i64) -> [bool; 6] {
             default_home: true,
             stored_login: true,
         };
-        super::super::record_session(
+        super::record_session(
             &world.seat(),
             &s,
             &who,
@@ -156,12 +183,12 @@ fn observe(operation: i64, fault: i64) -> [bool; 6] {
     let state = store.load(NOW).unwrap().0;
     let logins = store.load_logins(NOW).unwrap().0;
     let kind = match operation {
-        1 => Some(accounts::Kind::Rotate),
+        1 | 10 => Some(accounts::Kind::Rotate),
         8 => None,
         9 => Some(accounts::Kind::Proven),
         _ => Some(accounts::Kind::Sample),
     };
-    let account = "main";
+    let account = if operation == 10 { "work" } else { "main" };
     let event_count = store
         .tail(100)
         .unwrap()
@@ -177,6 +204,15 @@ fn observe(operation: i64, fault: i64) -> [bool; 6] {
                 .canary
                 .as_ref()
                 .is_some_and(|canary| canary.sid == "s-one")
+    } else if operation == 10 {
+        state.active.as_deref() == Some("work")
+            && state.rotations.is_empty()
+            && !state.proven
+            && state.canary_holds(NOW)
+            && state
+                .canary
+                .as_ref()
+                .is_some_and(|c| c.sid == "s-one" && c.took)
     } else {
         (if operation == 8 {
             state.account(account).sample.is_none()
@@ -260,7 +296,7 @@ pub(crate) fn commit_transition(
         "AnotherFault" => {
             next.insert("fault", state["fault"] + 1);
         }
-        "Rotate" | "Usage" | "Observe" => {
+        "Rotate" | "Usage" | "Observe" | "Take" => {
             let values = observe(state["operation"], state["fault"]);
             next.insert("phase", 1);
             for (key, value) in [

@@ -11,7 +11,7 @@ pub mod mail;
 #[path = "fold_snap.rs"]
 mod snap;
 use crate::vocab::{Actor, CLS_WORDS, Conf, Kind, Lvl, Node, Op, Src};
-use crate::words::{BoxWord, WallKind, need_rank};
+use crate::words::{BoxWord, Out, StepOut, WallKind, need_rank};
 pub use mail::{
     MAIL_LINK_WINDOW_MS, MAX_MAIL_WAITING, MailLink, MailLinkOf, MailWaiting, mail_in_window,
     mail_link_of,
@@ -222,10 +222,10 @@ pub struct Need {
 }
 
 impl Need {
-    /// Whether it was OBSERVED, not claimed: raised by a record of its own (a box, a wall, a run's failure), never by a `need` mark, which any author can write.
+    /// Whether it was OBSERVED, not claimed: raised by a record of its own (a box, a wall, a run's failure, the session's close, the owner's attention flag), never by a `need` mark a consumer wrote, which any author can write. Its word is one a fold can raise as observed ([`may_observe`]), whatever a snapshot or a mark from another source names.
     #[must_use]
     pub fn observed(&self) -> bool {
-        self.src != Src::Mark && self.conf != Conf::Claim
+        self.src != Src::Mark && self.conf != Conf::Claim && may_observe(self.word)
     }
 }
 
@@ -1056,7 +1056,9 @@ impl Fold {
         for (k, v) in r.f.iter() {
             f.offer(*k, v.clone(), r.conf, r.seq);
         }
-        let out = match amended.filter(|h| amend_refines_out(r.conf, r.seq, h.conf, h.seq)) {
+        let out = match amended
+            .filter(|h| amend_refines_out(node.lvl, out, (r.conf, r.seq), h.conf, h.seq))
+        {
             Some(Held {
                 val: Val::Word(w), ..
             }) => w,
@@ -1152,10 +1154,12 @@ impl Fold {
             Kind::Need => {
                 // A mark's need is the session's: it outlives the node the
                 // mark attached to, and only a `clear` or the session's close lifts it.
+                // One exception ([`mark_need_node`], fix E3): the owner's attention
+                // flag raised on a step is that step's, and its close ends it.
                 if let Some(w) = need_raised(r) {
                     self.raise(Need {
                         word: w,
-                        node: Node::SESSION,
+                        node: mark_need_node(r),
                         kind: r.k,
                         since_seq: r.seq,
                         t: r.t,
@@ -1274,7 +1278,7 @@ impl Fold {
             if let Some(new) = r.out() {
                 let (held_conf, held_seq) =
                     c.f.held(Key::Out).map_or((c.conf, 0), |h| (h.conf, h.seq));
-                if amend_refines_out(held_conf, held_seq, r.conf, r.seq) {
+                if amend_refines_out(node.lvl, c.out, (held_conf, held_seq), r.conf, r.seq) {
                     c.f.offer(Key::Out, Val::Word(new), r.conf, r.seq);
                     let old = std::mem::replace(&mut c.out, new);
                     if node.lvl == Lvl::Turn && old != new {
@@ -1346,10 +1350,18 @@ pub fn lifts_failure(kind: Kind, out: &str, closed: Node, need: &Need) -> bool {
         && need.node != closed
 }
 
-/// THE OUTCOME REFINEMENT (§2.3, §3.7): whether an amend's `out=` at (`conf`, `seq`) replaces the outcome a closed node holds at (`held_conf`, `held_seq`).
+/// THE OUTCOME REFINEMENT (§2.3, §3.7): whether an amend's `out=` at (`conf`, `seq`) replaces the outcome `held_out` a closed node at level `lvl` holds at (`held_conf`, `held_seq`). Only an exact amend refines an outcome, with one exception (fix E1, E2E-7): a step's `gone` is its parent's cascade, never an observation, so any amend the confidence law admits gives it its real outcome. A turn's outcome stays exact-only.
 #[must_use]
-pub const fn amend_refines_out(held_conf: Conf, held_seq: u64, conf: Conf, seq: u64) -> bool {
-    matches!(conf, Conf::Exact) && confidence_law(held_conf, held_seq, conf, seq)
+pub fn amend_refines_out(
+    lvl: Lvl,
+    held_out: &str,
+    (held_conf, held_seq): (Conf, u64),
+    conf: Conf,
+    seq: u64,
+) -> bool {
+    confidence_law(held_conf, held_seq, conf, seq)
+        && (matches!(conf, Conf::Exact)
+            || (lvl == Lvl::Step && held_out == Out::Step(StepOut::Gone).word()))
 }
 
 fn turn_bucket<'a>(t: &'a mut Totals, out: &str) -> &'a mut u32 {
@@ -1396,6 +1408,45 @@ pub fn mark_may_raise(src: Src, word: &str) -> bool {
     matches!(word, "review" | "decision" | "help") || (word == "escalated" && src == Src::Meta)
 }
 
+/// THE NODE A `need` MARK'S NEED IS BOUND TO (§7.1; fix E3, finding E2E-3): the session's
+/// ([`Node::SESSION`]), so the need outlives the node the mark landed on, with one exception. The
+/// owner's attention flag (`escalated`, `src=meta`) whose record names a step is THAT step's: its
+/// producer names the open approval or question step the harness asked the person about
+/// (`Log::open_decision_step`), so the step's close ends it in the same apply, as an epoch reset
+/// does, and the harness's clear lifts it earlier ([`clear_lifts`]). A claim (`review`,
+/// `decision`, `help`) stays the session's wherever it was written.
+#[must_use]
+pub fn mark_need_node(r: &Rec) -> Node {
+    if r.src == Src::Meta && r.node.lvl == Lvl::Step && r.f.get_word(Key::Word) == Some("escalated")
+    {
+        r.node
+    } else {
+        Node::SESSION
+    }
+}
+
+/// THE NEEDS A FOLD NAMES AS OBSERVED (§7.1), declared once: whether [`need_raised`] gives `word` for a record that is no claim. A box's step ([`BoxWord::need`] of each of [`BoxWord::all`], which an unknown or missing `box=` reads as `other`'s, and the question dialog's `question`), a wall's ([`WallKind::wire`] of each of [`WallKind::ALL`]), an input stall's `unresponsive`, a failed run's `failure`, the session's close's `exited`, and `escalated`, the one word [`mark_may_raise`] takes from a source other than a consumer's mark (the owner's attention flag, `src=meta`). The other mark words (`review`, `decision`, `help`) are claims, and the rest of [`crate::vocab::NEED_WORDS`] is what a mark or a snapshot may spell but no fold raises: [`Need::observed`] holds a need to this list, so [`SessionState::top_observed_need`] names nothing else.
+#[must_use]
+pub fn may_observe(word: &str) -> bool {
+    match word.split_once(':') {
+        Some(("approval", _)) => BoxWord::all().any(|b| b.need() == word),
+        Some(("wall", _)) => WallKind::ALL.iter().any(|k| k.wire() == word),
+        Some(_) => false,
+        None => {
+            word == BoxWord::QUESTION.need()
+                || matches!(word, "unresponsive" | "failure" | "exited" | "escalated")
+        }
+    }
+}
+
+/// [`may_observe`]'s words, in [`crate::vocab::NEED_WORDS`] order: the needs a reader of the bus can be told rose (`aterm link notify --on need:<word>` takes these).
+pub fn observed_need_words() -> impl Iterator<Item = &'static str> {
+    crate::vocab::NEED_WORDS
+        .iter()
+        .copied()
+        .filter(|w| may_observe(w))
+}
+
 /// THE NEED A RECORD RAISES (§7.1), or `None`: a step's open ([`step_need`]), a run's close `out=fail` (`failure`), the session's close (`exited`), or a `need` mark [`mark_may_raise`] admits.
 #[must_use]
 pub fn need_raised(r: &Rec) -> Option<&'static str> {
@@ -1410,11 +1461,11 @@ pub fn need_raised(r: &Rec) -> Option<&'static str> {
     }
 }
 
-/// THE CLEAR RULE (§7.1, §3.7): whether a `clear` from `by` at `src` (naming need `word`, or every need) lifts `need`.
+/// THE CLEAR RULE (§7.1, §3.7): whether a `clear` from `by` at `src` (naming need `word`, or every need) lifts `need`. A step's own need (its box, question, wall or stall) ends only with its step; a need a mark raised is lifted wherever it is bound, a step's escalation included ([`mark_need_node`], fix E3); a consumer's clear (`src=mark`) lifts only a consumer's need.
 #[must_use]
 pub fn clear_lifts(src: Src, by: Actor, word: Option<&str>, need: &Need) -> bool {
     word.is_none_or(|w| need.word == w)
-        && need.node.lvl != Lvl::Step
+        && (need.node.lvl != Lvl::Step || need.kind == Kind::Need)
         && (need.by == by || by.overrides(&need.by))
         && (src != Src::Mark || need.src == Src::Mark)
 }

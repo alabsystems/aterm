@@ -189,6 +189,12 @@ impl App {
         }
     }
 
+    /// Session `sid`'s configured `(fg, bg)` (`0x00RRGGBB`) read without its terminal's lock
+    /// ([`session_scheme`]): what a reader outside the frame takes for the light latch's key.
+    pub(crate) fn session_scheme(&self, sid: u64) -> (u32, u32) {
+        session_scheme(&self.pool, &self.installed_colors, sid)
+    }
+
     /// The resolution session `sid` draws: its own, else the instance's.
     pub(crate) fn resolved_colors_for_session(&self, sid: u64) -> ResolvedColors {
         match self.session_draw(sid) {
@@ -380,6 +386,26 @@ impl App {
             hex(colors.scheme.foreground),
             hex(colors.scheme.background),
         )
+    }
+}
+
+/// Session `sid`'s configured `(fg, bg)` (`0x00RRGGBB`) read without its terminal's lock: the
+/// projection of its own theme when it draws one, else the instance's, as the last install
+/// applied them. Once that install has run it is the pair
+/// [`aterm_core::terminal::Terminal::configured_colors`] reads under the lock, which no program
+/// moves.
+pub(crate) fn session_scheme(
+    pool: &crate::SessionPool,
+    installed: &ResolvedColors,
+    sid: u64,
+) -> (u32, u32) {
+    let pack = |c: aterm_types::Rgb| aterm_render::rgb_to_u32([c.r, c.g, c.b]);
+    match pool.own_colors(sid) {
+        Some(own) => (pack(own.default_foreground), pack(own.default_background)),
+        None => (
+            pack(installed.scheme.foreground),
+            pack(installed.scheme.background),
+        ),
     }
 }
 

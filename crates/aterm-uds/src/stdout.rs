@@ -57,7 +57,6 @@ pub fn answer_status<C>(verb: &str, written: io::Result<()>, code: C) -> Result<
 }
 
 /// Writes `verb`'s `text` answer to stdout and returns `code`, or exits 1 on write failure.
-#[must_use]
 pub fn answer_exit(verb: &str, text: &str, code: u8) -> ExitCode {
     let status = answer_status(verb, write_all(text.as_bytes()), code).unwrap_or_else(|line| {
         let _ = writeln!(io::stderr(), "{line}");

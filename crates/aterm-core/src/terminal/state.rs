@@ -645,37 +645,7 @@ mod damage_epoch_tests {
 #[cfg(test)]
 mod content_scroll_delta_tests {
     use super::{CONTENT_SCROLL_BAND_RING, ContentScrollDelta, ContentScrollState, RowBandMove};
-
-    fn band_history_model() -> aterm_spec::derive::Model {
-        aterm_spec::ty_model! {
-            ContentScrollBandHistory {
-                const Cap = 16;
-                const Buggy = 0;
-                var moves = 0;
-                var unexplained = 0;
-                var verdict = 0;
-                action Step when (moves <= Cap) {
-                    moves = moves + 1;
-                    verdict = if unexplained == 1 { 2 } else {
-                        if moves <= Cap - 1 || Buggy == 1 { 1 } else { 2 }
-                    };
-                }
-                action Poison when (unexplained == 0) {
-                    unexplained = 1;
-                    verdict = 2;
-                }
-                action Baseline when (moves > 0 || unexplained == 1) {
-                    moves = 0;
-                    unexplained = 0;
-                    verdict = 0;
-                }
-                invariant Bounds: moves <= Cap + 1 && unexplained <= 1 && verdict <= 2;
-                invariant ReplayComplete: verdict == 0 || verdict == 2 ||
-                    (moves > 0 && moves <= Cap && unexplained == 0);
-                invariant RetireIncomplete: (moves <= Cap && unexplained == 0) || verdict == 2;
-            }
-        }
-    }
+    use aterm_models_core::content_scroll_band_history_model as band_history_model;
 
     #[test]
     fn band_history_model_proves_and_catches_overwritten_replay() {

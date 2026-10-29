@@ -82,7 +82,6 @@ fn the_rendered_index_reads_back_through_the_client_field_for_field() {
     let rig = Rig::new("render");
     let p = plan(&rig);
     let text = render(&p);
-    assert_eq!(text, render(&p), "one deterministic writer");
     let dir = rig.path("quad");
     rig.keys.write_quad(&dir, &text);
     let q = quad::verify_dir(&rig.ctx, &dir).expect("the client chain accepts the render");

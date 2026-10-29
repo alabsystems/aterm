@@ -7,3 +7,4 @@
 
 pub use aterm_toolchain::discovery::*;
 pub use aterm_toolchain::rustup;
+pub use aterm_toolchain::trust_recreate_bootstrap_cmd;

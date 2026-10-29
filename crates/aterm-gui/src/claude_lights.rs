@@ -144,6 +144,8 @@ struct Inks {
     amber: [u8; 3],
     ink: [u8; 3],
     dim: [u8; 3],
+    /// The off chips' words ([`off_of`]).
+    off: [u8; 3],
     title: [u8; 3],
     ground: [u8; 3],
 }
@@ -156,6 +158,7 @@ impl Inks {
             amber: land_ink(blank.bg),
             ink: crate::claude_footer::legible_on(blank.fg, blank.bg),
             dim: dim_of(blank),
+            off: off_of(blank),
             title: title_ink(blank),
             ground: blank.bg,
         }
@@ -167,6 +170,7 @@ impl Inks {
             ChipTone::Accent => self.accent,
             ChipTone::Amber => self.amber,
             ChipTone::Dim => self.dim,
+            ChipTone::Off => self.off,
         }
     }
 }
@@ -304,6 +308,9 @@ pub(crate) struct ChipGlass {
     pub(crate) land_at: Option<LandAtGlass>,
     /// The trail's newest act and the clock time and day it arrived.
     pub(crate) last: Option<(Act, Stamp)>,
+    /// Who did [`Self::last`] where it was a proven self-claim's act
+    /// ([`crate::harness_glass::TrailEntry::by`]); `None` for aterm's own.
+    pub(crate) last_by: Option<crate::harness_glass::Claimant>,
     /// The trail's generation.
     pub(crate) trail: u8,
     /// The loop's pause after short turns while one stands.
@@ -521,7 +528,9 @@ pub(crate) enum OverChips {
     No,
     /// A chip: a press acts on it.
     Chip,
-    /// The blank between two chips.
+    /// Glass a press does nothing on: the blank between two chips, or a top line's harness label
+    /// (hover only, every button on it swallowed). The arrow cursor, and the motion is not the
+    /// pane's.
     Gap,
 }
 
@@ -529,8 +538,8 @@ impl OverChips {
     /// What [`App::claude_glass_at`] found.
     pub(crate) const fn of_glass(at: Option<&(u64, GlassAt)>) -> Self {
         match at {
-            None | Some((_, GlassAt::Mark | GlassAt::Label)) => Self::No,
-            Some((_, GlassAt::Chip(None))) => Self::Gap,
+            None | Some((_, GlassAt::Mark)) => Self::No,
+            Some((_, GlassAt::Chip(None) | GlassAt::Label)) => Self::Gap,
             Some((
                 _,
                 GlassAt::Chip(Some(_)) | GlassAt::Switch(_) | GlassAt::Upgrade | GlassAt::Fact(..),
@@ -762,8 +771,9 @@ pub(crate) enum GlassAt {
     Switch(crate::autopilot::HarnessSwitch),
     /// A top line's lockup (`mark_hits`).
     Mark,
-    /// A top line's harness label (`border_toggles`): a hover shows its whole words, a press does
-    /// nothing.
+    /// A top line's harness label (`border_toggles`): a hover shows the CLI's whole build in the
+    /// label's slot, only where the label shortens it (`label_whole`); every press on it is
+    /// swallowed.
     Label,
     /// A top line's ⬆️ of a newer CLI build (`border_toggles`): a press asks for the move now.
     Upgrade,
@@ -843,6 +853,9 @@ pub(crate) struct WindowLights {
     glass_hover_px: Option<(f64, f64)>,
     /// The grid the lists were laid.
     drawn_at: Option<crate::app_mouse::GlassGrid>,
+    /// Where the last paint laid what a pointer hit-tests ([`WindowLights::places`]) and the
+    /// hover it was laid under ([`App::settle_glass_hover`]).
+    laid: Option<(u64, GlassHover)>,
     /// A paint after a re-grid moved the hover under a still pointer ([`App::settle_glass_hover`]).
     cursor_owed: bool,
     /// The facts on the glass.
@@ -862,7 +875,7 @@ pub(crate) struct BorderSwitch {
     /// The switch's cells (` ● on ` when lit, ` ○ off ` when off), its blanks included: a press
     /// anywhere on them turns it.
     pub(crate) cols: std::ops::Range<usize>,
-    /// The harness label's cells (`alab claude harness v0.4 (v2.1.305)`): hover only.
+    /// The harness label's cells (`alab claude harness v0.5 (v2.1.305)`): hover only.
     pub(crate) label: Option<std::ops::Range<usize>>,
     /// The ⬆️ of a newer CLI build with its side blanks: a press asks for the move now.
     pub(crate) arrow: Option<std::ops::Range<usize>>,
@@ -872,6 +885,9 @@ pub(crate) struct BorderSwitch {
     /// The paint it was drawn with (`claude_footer::switch_words` rebuilds its words from it).
     pub(crate) paint: crate::claude_footer::SwitchPaint,
     pub(crate) program: aterm_phase::Program,
+    /// The line's Autopilot chip stood down beside it ([`crate::claude_footer::chip_stands_down`]),
+    /// so the line is the switch's alone.
+    pub(crate) chip_down: bool,
 }
 
 /// One panel row's title, `in Bash 4m12s` ([`WindowLights::panel_readings`]).
@@ -1109,7 +1125,57 @@ pub(crate) fn lights_now() -> Instant {
     Instant::now()
 }
 
+/// The pointer's hover on the glass: a chip or fact, a switch, a top line's part, a lockup.
+type GlassHover = (
+    Option<(u64, Target)>,
+    Option<u64>,
+    Option<(u64, crate::claude_footer::HoverAt)>,
+    Option<u64>,
+);
+
 impl WindowLights {
+    /// The pointer's hover on the glass now ([`GlassHover`]).
+    const fn glass_hover(&self) -> GlassHover {
+        (
+            self.hover,
+            self.switch_hover,
+            self.part_hover,
+            self.mark_hover,
+        )
+    }
+
+    /// A digest of where the last paint laid what a pointer hit-tests ([`App::claude_glass_at`]):
+    /// the chips' cells, the switches with their labels and arrows, the facts and the lockups.
+    fn places(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.hits.len().hash(&mut h);
+        for hit in &self.hits {
+            (hit.frame_row, hit.term_row, hit.col, hit.session, hit.chip).hash(&mut h);
+        }
+        self.border_toggles.len().hash(&mut h);
+        for b in &self.border_toggles {
+            (
+                b.frame_row,
+                b.term_row,
+                &b.cols,
+                &b.label,
+                &b.arrow,
+                b.session,
+            )
+                .hash(&mut h);
+        }
+        self.fact_hits.len().hash(&mut h);
+        for f in &self.fact_hits {
+            (f.frame_row, f.term_row, f.cols, f.session, f.fact).hash(&mut h);
+        }
+        self.mark_hits.len().hash(&mut h);
+        for m in &self.mark_hits {
+            (m.frame_row, m.term_row, &m.cols, m.session).hash(&mut h);
+        }
+        h.finish()
+    }
+
     /// Everything about the lights that is GUI state rather than grid content, for the repaint key.
     pub(crate) fn fingerprint(&self, now: impl Fn() -> Instant) -> u64 {
         let read = std::cell::Cell::new(None);
@@ -1226,6 +1292,23 @@ impl WindowLights {
     pub(crate) fn top_effort_read(&self, session: u64) -> (bool, bool) {
         let at = Some((session, Target::Fact(Fact::TopEffort)));
         (self.hover == at, self.selected == at)
+    }
+
+    /// Whether the pointer or the keyboard is on `session`'s Autopilot chip, so its title is laid.
+    #[must_use]
+    pub(crate) fn autopilot_lit(&self, session: u64) -> bool {
+        let at = Some((session, Target::Chip(Chip::Autopilot)));
+        self.hover == at || self.selected == at
+    }
+
+    /// The frame cells `(row, col)` this frame painted `chip` of `session` in, left to right.
+    #[cfg(test)]
+    pub(crate) fn painted_cells(&self, session: u64, chip: Chip) -> Vec<(usize, usize)> {
+        self.hits
+            .iter()
+            .filter(|h| h.session == session && h.chip == Some(chip))
+            .map(|h| (h.frame_row, h.col))
+            .collect()
     }
 
     /// Whether this frame drew a block of chips for `session`.
@@ -1346,6 +1429,22 @@ impl WindowLights {
         self.sessions.entry(session).or_default().rewritten = rewritten;
     }
 
+    /// `session`'s chip is laid on its program's top line this frame
+    /// (`crate::claude_footer::ChipLine::TopLine`), where Autopilot is its one chip: what an
+    /// earlier program in the session left of Claude Code's lights (their reading, a toggle in
+    /// flight or refused, a toggle's notice, a fact menu's notice) and of the Team chip is let
+    /// go, or a tab that ran Claude Code in plan mode would lay its mode light beside the chip.
+    pub(crate) fn note_top_line(&mut self, session: u64) {
+        let s = self.sessions.entry(session).or_default();
+        s.shown = lights::Reading::UNKNOWN;
+        s.pending = None;
+        s.refused = None;
+        s.notice = None;
+        s.fact_notice = None;
+        s.team = None;
+        s.rewritten = false;
+    }
+
     /// [`Self::note_autopilot_at`] at `now`.
     #[cfg(test)]
     fn note_autopilot(
@@ -1449,6 +1548,11 @@ impl WindowLights {
     /// Whether the pointer rests on `session`'s top line's lockup.
     pub(crate) fn mark_hovered(&self, session: u64) -> bool {
         self.mark_hover == Some(session)
+    }
+
+    /// The window pixel the pointer last hovered a switch or a lockup at, while it does.
+    pub(crate) fn glass_hover_px(&self) -> Option<(f64, f64)> {
+        self.glass_hover_px
     }
 
     /// Let every switch turning on or off go.
@@ -2038,12 +2142,22 @@ impl WindowLights {
             }
             None => {}
         }
+        let mut before = None;
         for chip in Chip::row().filter(|c| drawn(*c)) {
             if !cells.is_empty() {
                 cells.push(blank);
+                if before.is_some_and(|(chip, worded)| gap_after(chip, worded) > 1) {
+                    let mut rule = blank;
+                    rule.ch = CHIP_RULE;
+                    rule.fg = inks.dim;
+                    cells.push(rule);
+                    cells.push(blank);
+                }
             }
+            let face = face_of(chip, s, keep, inks);
+            before = Some((chip, face.worded()));
             let start = cells.len();
-            for (ch, ink) in face_of(chip, s, keep, inks).cells() {
+            for (ch, ink) in face.cells() {
                 let mut c = blank;
                 c.ch = ch;
                 c.fg = ink;
@@ -2113,19 +2227,38 @@ fn drawn_at(
     }
 }
 
-/// The cells `chips` take in the row at `keep`, one blank apart, each its face ([`face_of`]).
+/// The cells `chips` take in the row at `keep`, each its face ([`face_of`]) and set off from the
+/// next by [`gap_after`] it.
 fn chips_width_at(
     s: &SessionLights,
     chips: impl Iterator<Item = Chip>,
     keep: Keep,
     inks: Inks,
 ) -> usize {
-    chips
-        .map(|chip| face_of(chip, s, keep, inks).width())
-        .fold(None, |row: Option<usize>, face| {
-            Some(row.map_or(face, |row| row + 1 + face))
-        })
-        .unwrap_or(0)
+    let mut width = 0;
+    let mut before: Option<(Chip, bool)> = None;
+    for chip in chips {
+        let face = face_of(chip, s, keep, inks);
+        width += before.map_or(0, |(chip, worded)| gap_after(chip, worded)) + face.width();
+        before = Some((chip, face.worded()));
+    }
+    width
+}
+
+/// The `─` that sets a worded Autopilot chip off from the next ([`gap_after`]): the rule's own,
+/// which the rule's layout draws in its ink ([`Block::rule_gaps`]).
+pub(crate) const CHIP_RULE: char = '\u{2500}';
+
+/// The cells between `chip` and the next: a blank, the rule's `─` and a blank after an Autopilot
+/// chip with words (`○ off ─ yolo`, `⤓ land ─ yolo`), which would otherwise read as one phrase
+/// with the mode's word; one blank after a bare glyph (`∞ yolo`) and after the mode's chip, whose
+/// word the next chip's glyph sets off (`∞ yolo ⇠ lab-sweep`).
+fn gap_after(chip: Chip, worded: bool) -> usize {
+    if worded && chip == Chip::Autopilot {
+        3
+    } else {
+        1
+    }
 }
 
 /// What `light`'s title says after its name.
@@ -2439,6 +2572,18 @@ impl ChipFace {
         self.glyph()
     }
 
+    /// The cells it takes laid whole with `glass` ([`Face::width`]): its glyph, its word and its
+    /// clock.
+    #[must_use]
+    pub(crate) fn cells(self, glass: &ChipGlass) -> usize {
+        Face {
+            word: self.word(),
+            clock: self.clock(glass),
+            ..Face::plain(self.glyph(), None, [0; 3])
+        }
+        .width()
+    }
+
     /// The word drawn a space after the glyph.
     #[must_use]
     pub(crate) const fn word(self) -> Option<&'static str> {
@@ -2471,11 +2616,10 @@ impl ChipFace {
             ChipFace::Cruise => (ChipTone::Accent, ChipTone::Accent),
             ChipFace::CruiseUntil => (ChipTone::Accent, ChipTone::Amber),
             ChipFace::Land | ChipFace::Landed => (ChipTone::Amber, ChipTone::Amber),
-            ChipFace::Theirs
-            | ChipFace::Off
-            | ChipFace::MasterOff
-            | ChipFace::AgentOff(_)
-            | ChipFace::Unhosted => (ChipTone::Dim, ChipTone::Dim),
+            ChipFace::Theirs => (ChipTone::Dim, ChipTone::Dim),
+            ChipFace::Off | ChipFace::MasterOff | ChipFace::AgentOff(_) | ChipFace::Unhosted => {
+                (ChipTone::Off, ChipTone::Off)
+            }
         }
     }
 
@@ -2840,12 +2984,21 @@ pub(crate) const fn act_label(
                   `a11y_tree` cfg (Linux, macOS and Windows)"
     )
 )]
+/// Its newest act, named for the one who did it where that is a proven self-claim's holder
+/// (`by`: `Last: codex-alab approved at 14:05.`), so a screen reader never hears another
+/// agent's act as aterm's.
 #[must_use]
-pub(crate) fn spoken_last(act: Act, clock: Clock, day: Option<Weekday>) -> String {
+pub(crate) fn spoken_last(
+    by: Option<&str>,
+    act: Act,
+    clock: Clock,
+    day: Option<Weekday>,
+) -> String {
+    let who = by.map_or_else(String::new, |by| format!("{by} "));
     match day {
-        None => format!("Last: {} at {}.", act.spoken(), clock.as_str()),
+        None => format!("Last: {who}{} at {}.", act.spoken(), clock.as_str()),
         Some(day) => format!(
-            "Last: {} on {} at {}.",
+            "Last: {who}{} on {} at {}.",
             act.spoken(),
             day.long(),
             clock.as_str()
@@ -2907,16 +3060,34 @@ fn title_ink(blank: RenderCell) -> [u8; 3] {
 }
 
 /// `blank`'s ink halfway to its ground.
-fn dim_of(blank: RenderCell) -> [u8; 3] {
+fn halfway_of(blank: RenderCell) -> [u8; 3] {
     let mix = |a: u8, b: u8| ((u16::from(a) + u16::from(b)) / 2) as u8;
-    crate::claude_footer::visible_on(
-        [
-            mix(blank.fg[0], blank.bg[0]),
-            mix(blank.fg[1], blank.bg[1]),
-            mix(blank.fg[2], blank.bg[2]),
-        ],
-        blank.bg,
-    )
+    [
+        mix(blank.fg[0], blank.bg[0]),
+        mix(blank.fg[1], blank.bg[1]),
+        mix(blank.fg[2], blank.bg[2]),
+    ]
+}
+
+/// `blank`'s ink halfway to its ground, floored to be seen (3:1): a worker's `⇠`, a manager's
+/// mark, an unknown mode's `◌`, a quiet tab's `⤓ quiet`.
+fn dim_of(blank: RenderCell) -> [u8; 3] {
+    crate::claude_footer::visible_on(halfway_of(blank), blank.bg)
+}
+
+/// The off chips' ink (`○ off`, `⊘ off`): `blank`'s halfway ink floored to read as words do
+/// (4.5:1), quiet, never faint, and never louder than the row's own ink.
+fn off_of(blank: RenderCell) -> [u8; 3] {
+    use crate::claude_footer::legible_on;
+    let reads = |c: [u8; 3]| {
+        let pack = |c: [u8; 3]| u32::from_be_bytes([0, c[0], c[1], c[2]]);
+        aterm_effects::color_math::contrast_ratio(pack(c), pack(blank.bg))
+    };
+    let (off, ink) = (
+        legible_on(halfway_of(blank), blank.bg),
+        legible_on(blank.fg, blank.bg),
+    );
+    if reads(off) > reads(ink) { ink } else { off }
 }
 
 #[cfg(test)]
@@ -2961,7 +3132,8 @@ pub(crate) struct Block {
     pub(crate) short_title: Vec<RenderCell>,
     /// The title is a reason ([`what_of`]), which outranks the branch and the path in the rule.
     pub(crate) reason: bool,
-    /// The chips, one blank apart (the rule's layout pads the block).
+    /// The chips, one blank apart, a worded Autopilot chip ` ─ ` ([`Block::rule_gaps`]); the
+    /// rule's layout pads the block.
     pub(crate) lights: Vec<RenderCell>,
     /// The cells the block holds in the rule (`footer::LightsWidth`'s chips).
     pub(crate) holds: usize,
@@ -2971,6 +3143,35 @@ pub(crate) struct Block {
 }
 
 impl Block {
+    /// Synthetic private-dev input through the production lights reading and chip composition.
+    #[cfg(any(debug_assertions, feature = "dev-seams"))]
+    pub(crate) fn layout_scene(blank: RenderCell, accent: [u8; 3]) -> Block {
+        let mut lights = WindowLights::default();
+        let rows = [
+            "─".repeat(80),
+            "❯ ".to_owned(),
+            "─".repeat(80),
+            "  ⏸ plan mode on (shift+tab to cycle)".to_owned(),
+        ];
+        lights.observe(0, lights::read_lights(&rows));
+        let now = Instant::now();
+        let view = AutopilotView::Land;
+        lights.note_autopilot_at(0, view.mode(), view, ChipGlass::default(), || now);
+        let mut block = Block::default();
+        lights.block_into(
+            0,
+            blank,
+            now,
+            accent,
+            None,
+            None,
+            Keep::Revealed,
+            (None, None, None),
+            &mut block,
+        );
+        block
+    }
+
     /// Whether `chip` is drawn.
     pub(crate) fn shows(&self, chip: impl Into<Chip>) -> bool {
         let chip = chip.into();
@@ -2980,6 +3181,15 @@ impl Block {
     /// The fit that laid it, unique in its window (`0`: none numbered it).
     pub(crate) const fn fit(&self) -> u64 {
         self.fit
+    }
+
+    /// The cells of [`Self::lights`] that set a worded Autopilot chip off from the next
+    /// ([`CHIP_RULE`]), which the rule's layout draws as its own rule.
+    pub(crate) fn rule_gaps(&self) -> impl Iterator<Item = usize> + '_ {
+        self.lights.iter().enumerate().filter_map(|(at, cell)| {
+            (cell.ch == CHIP_RULE && !self.cols.iter().any(|(cols, _)| cols.contains(&at)))
+                .then_some(at)
+        })
     }
 }
 
@@ -3350,24 +3560,23 @@ impl App {
             return;
         };
         let regridded = std::mem::replace(&mut ws.claude_lights.drawn_at, grid) != grid;
-        if regridded && ws.pointer_position_known {
+        let lights = &mut ws.claude_lights;
+        let was = lights.glass_hover();
+        let laid = (lights.places(), was);
+        // Glass laid elsewhere under the same hover moved under a still pointer (a re-laid rule,
+        // a newly drawn ⬆️): track it again. A paint under a hover that changed since the last
+        // paint (a motion's, or a track's here) only records its places, so glass a hover
+        // itself re-lays never moves the hover again.
+        let moved = lights
+            .laid
+            .replace(laid)
+            .is_some_and(|(places, hover)| hover == was && places != laid.0);
+        if (regridded || moved) && ws.pointer_position_known {
             let (x, y) = ws.last_cursor_px;
-            let lights = &ws.claude_lights;
-            let was = (
-                lights.hover,
-                lights.switch_hover,
-                lights.part_hover,
-                lights.mark_hover,
-            );
             let _ = self.track_claude_light_hover(wid, x, y);
             if let Some(ws) = self.windows.get_mut(&wid) {
                 let lights = &mut ws.claude_lights;
-                lights.cursor_owed |= (
-                    lights.hover,
-                    lights.switch_hover,
-                    lights.part_hover,
-                    lights.mark_hover,
-                ) != was;
+                lights.cursor_owed |= lights.glass_hover() != was;
             }
         }
         let Some(lights) = self.windows.get(&wid).map(|ws| &ws.claude_lights) else {
@@ -3775,8 +3984,8 @@ impl App {
             .get(&wid)
             .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
         let Some((session, glass)) = self.claude_glass_at(wid, x, y) else {
-            if let Some((session, url)) = self.claude_notice_at(wid, x, y) {
-                return self.press_claude_notice(wid, session, url, at);
+            if let Some((session, url)) = self.claude_glass_hit_at(wid, x, y) {
+                return self.press_claude_glass_hit(wid, session, url, at);
             }
             // A cell a rewritten row vacated takes the press: nothing of Claude's is under it.
             return self.glass_swallows_at(wid, x, y);
@@ -3793,6 +4002,9 @@ impl App {
                 }
                 self.press_visible_claude_chip(wid, session, chip, at)
             }
+            // A secondary click (control-click on macOS) is a right-click: on the switch or the
+            // ⬆️ it turns nothing and asks for no move, as a right-click there does.
+            GlassAt::Switch(_) | GlassAt::Upgrade if secondary => true,
             GlassAt::Switch(face) => {
                 self.press_switch_as_clicked(wid, session, face, at);
                 true
@@ -3805,7 +4017,10 @@ impl App {
             GlassAt::Fact(fact, restores) => {
                 self.press_visible_claude_fact(wid, session, fact, restores)
             }
-            GlassAt::Mark | GlassAt::Label => false,
+            // The label is hover only: its press, and its release, go nowhere. The lockup's is the
+            // pane's, as before the rule wore one.
+            GlassAt::Label => true,
+            GlassAt::Mark => false,
         }
     }
 
@@ -3832,12 +4047,18 @@ impl App {
         }
     }
 
-    /// A press of `session`'s ⬆️ in `wid`: the tab menu's Upgrade Now for the build it offers
-    /// (`App::send_upgrade_word`), which skips the hold clock and keeps every safety gate; an
-    /// asked move's `◐` takes no second press. A tab name being edited settles first.
+    /// A press of `session`'s ⬆️ in `wid`: for Claude Code a one-shot restart of its own
+    /// (`upgrade_host::WordAsk::pressed`), which moves past its Autopilot or its harness switched
+    /// off and the agent's own background work and waits only for what a restart would lose or
+    /// cannot pass (`upgrade::press_gate`); for another CLI the tab menu's Upgrade Now for the
+    /// build it offers (`App::send_upgrade_word`), which skips the hold clock and keeps every
+    /// safety gate. An asked move's `◐` takes no second press, and a held one asks nothing and
+    /// says why it cannot move (another supervisor holds it, or another CLI's harness or
+    /// Autopilot is off, [`crate::claude_footer::UpState::Held`]). A tab name being edited settles
+    /// first.
     pub(crate) fn press_upgrade_arrow(&mut self, wid: WindowId, session: u64) -> bool {
         use crate::claude_footer::UpState;
-        let Some(up) = self.windows.get(&wid).and_then(|ws| {
+        let Some((up, face)) = self.windows.get(&wid).and_then(|ws| {
             ws.claude_lights
                 .border_toggles
                 .iter()
@@ -3846,7 +4067,7 @@ impl App {
                         && b.arrow.is_some()
                         && !self.chrome_owns_terminal_row(wid, b.term_row)
                 })
-                .map(|b| b.paint.up)
+                .map(|b| (b.paint.up, b.paint.face))
         }) else {
             return false;
         };
@@ -3854,17 +4075,41 @@ impl App {
             self.clear_strip_press(wid);
             self.settle_rename_edit(wid);
         }
+        if up.state == UpState::Held {
+            // The slot says why for a few seconds where the rule has a label; the messages row
+            // says it at every width, with what lets the move be asked for.
+            self.show_upgrade_refusal(session, up.why);
+            let place = self
+                .session_sid(session)
+                .map(|tab| self.upgrade_place(&tab))
+                .unwrap_or_default();
+            let _ = self.post_message(crate::message_reporters::agent_upgrade_held(
+                up.agent,
+                up.to.as_str(),
+                up.why,
+                crate::claude_footer::held_then(up.why),
+                &place,
+            ));
+            return true;
+        }
         if up.state != UpState::Ready {
             return true;
         }
         let Some(tab) = self.session_sid(session) else {
             return true;
         };
-        self.send_upgrade_word(crate::upgrade_host::WordAsk::new(
-            tab,
-            up.to.as_str().to_string(),
-            aterm_messages::UpgradeWord::Now,
-        ));
+        let to = up.to.as_str().to_string();
+        let ask = if up.agent.presses() {
+            // With the harness or the Autopilot off, the restart types only its relaunch line.
+            let aside_off = self.upgrade_view.row_for(&tab).is_some_and(|r| {
+                use aterm_agent::harness::upgrade_drive::{AGENT_OFF, AUTOPILOT_OFF};
+                matches!(r.aside.as_str(), AGENT_OFF | AUTOPILOT_OFF)
+            });
+            crate::upgrade_host::WordAsk::pressed(tab, to, face.is_off() || aside_off)
+        } else {
+            crate::upgrade_host::WordAsk::new(tab, to, aterm_messages::UpgradeWord::Now)
+        };
+        self.send_upgrade_word(ask);
         true
     }
 
@@ -3895,14 +4140,15 @@ impl App {
         true
     }
 
-    /// A left press on the harness banner over Claude Code's update notice of `session`.
+    /// A left press on `session`'s harness words on the glass ([`Self::claude_glass_hit_at`]: a
+    /// banner's rows, the card line's link).
     ///
-    /// On the link a plain press (no modifier held) in the focused pane opens it, as a
+    /// On a link a plain press (no modifier held) in the focused pane opens it, as a
     /// link-modifier press does in any pane, once per double click; in an unfocused pane a plain
     /// press is that pane's focus click and opens nothing, and a press with another modifier
-    /// (Shift extending a selection, Option taking one from a tracking app) is the notice rows'
-    /// own. A press the banner takes settles a tab name being edited first.
-    fn press_claude_notice(
+    /// (Shift extending a selection, Option taking one from a tracking app) is the rows' own. A
+    /// press the words take settles a tab name being edited first.
+    fn press_claude_glass_hit(
         &mut self,
         wid: WindowId,
         session: u64,
@@ -4603,7 +4849,7 @@ impl App {
                 | HarnessChip::Usage
                 | HarnessChip::Account
                 | HarnessChip::Title
-                | HarnessChip::Link
+                | HarnessChip::Link(_)
                 | HarnessChip::Upgrade => {}
                 HarnessChip::Mode => {
                     if let Some(s) = ws.claude_lights.sessions.get(&node.session) {
@@ -4697,7 +4943,7 @@ impl App {
         }
         chips.retain(|node| !node.label.is_empty());
         chips.extend(switches);
-        chips.extend(self.claude_notice_links_a11y(wid, strip));
+        chips.extend(self.claude_links_a11y(wid, strip));
         chips
     }
 
@@ -4729,8 +4975,8 @@ impl App {
                 return;
             }
             HarnessChip::Title => return,
-            HarnessChip::Link => {
-                self.open_claude_notice_for_reader(wid, session);
+            HarnessChip::Link(link) => {
+                self.open_claude_link_for_reader(wid, session, link);
                 return;
             }
             HarnessChip::Upgrade => {
@@ -4840,7 +5086,7 @@ pub(crate) fn harness_switch_nodes(
             width: b.cols.len(),
         });
     }
-    let up_words = crate::claude_footer::up_words(&b.paint.up);
+    let up_words = crate::claude_footer::up_said(&b.paint.up, b.paint.jobs.as_str(), b.paint.press);
     if let (Some(cols), Some(words)) = (b.arrow.as_ref(), up_words) {
         let description = if b.paint.refused.is_empty() {
             words
@@ -5063,10 +5309,107 @@ mod tests {
         assert_eq!(text, "\u{221e} \u{23F8} plan", "the light follows");
     }
 
+    /// A WORDED CHIP NEVER RUNS INTO THE NEXT: after `○ off` or `⤓ land` the rule threads
+    /// between the chips (` ─ `, the rule's own cell once laid in the rule), so `○ off ─ ⏸ plan`
+    /// never reads as one phrase; the block's width counts it and no chip's hit takes it.
+    /// CONTROL: Cruise's bare `∞` stays one blank from the next chip.
+    #[test]
+    fn a_worded_chip_never_runs_into_the_next() {
+        let now = Instant::now();
+        let bare = "\u{2500}".repeat(60);
+        let text = |cells: &[RenderCell]| -> String { cells.iter().map(|c| c.ch).collect() };
+        for (view, lead) in [
+            (AutopilotView::Off, "\u{25cb} off \u{2500} "),
+            (AutopilotView::Land, "\u{2913} land \u{2500} "),
+            (AutopilotView::Cruise, "\u{221e} "),
+        ] {
+            let mut w = WindowLights::default();
+            observe(&mut w, &screen(&bare, PLAN, ""));
+            w.note_autopilot(7, view.mode(), view, now);
+            let block = w.block(7, blank(), now, ACCENT, Keep::Revealed);
+            assert_eq!(
+                text(&block.lights),
+                format!("{lead}\u{23F8} plan"),
+                "{view:?}"
+            );
+            let gaps: Vec<usize> = block.rule_gaps().collect();
+            let worded = lead.contains('\u{2500}');
+            assert_eq!(
+                gaps,
+                if worded {
+                    vec![lead.chars().count() - 2]
+                } else {
+                    Vec::new()
+                },
+                "{view:?}"
+            );
+            assert!(
+                gaps.iter()
+                    .all(|g| !block.cols.iter().any(|(cols, _)| cols.contains(g))),
+                "{view:?}: no chip's hit takes the rule"
+            );
+            let s = &w.sessions[&7];
+            let inks = Inks::of(blank(), ACCENT);
+            let drawn = drawn_at(s, now, None, None, Keep::Revealed);
+            assert_eq!(
+                chips_width_at(s, Chip::row().filter(|c| drawn(*c)), Keep::Revealed, inks),
+                block.lights.len(),
+                "{view:?}: the fit counts it"
+            );
+        }
+    }
+
+    /// THE MODE'S CHIP KEEPS ONE BLANK BEFORE THE TEAM CHIP: the rule sets off the Autopilot
+    /// chip's word alone, where `○ off yolo` would misread; after the mode's word the Team chip's
+    /// own glyph sets it off (`∞ ⏸ plan ⇠ lab-sweep`), as before the rule was drawn, and the fit
+    /// counts what is drawn. CONTROL: an Off Autopilot keeps the rule before the mode.
+    #[test]
+    fn the_mode_chip_keeps_one_blank_before_the_team_chip() {
+        let now = Instant::now();
+        let bare = "\u{2500}".repeat(60);
+        let text = |cells: &[RenderCell]| -> String { cells.iter().map(|c| c.ch).collect() };
+        let mut w = WindowLights::default();
+        observe(&mut w, &screen(&bare, PLAN, ""));
+        w.sessions.get_mut(&7).unwrap().team = Some(TeamFace::Worker {
+            manager: Some(3),
+            label: std::sync::Arc::from("lab-sweep"),
+            task: None,
+        });
+        for (view, want, gaps) in [
+            (
+                AutopilotView::Cruise,
+                "\u{221e} \u{23F8} plan \u{21e0} lab-sweep",
+                0,
+            ),
+            (
+                AutopilotView::Off,
+                "\u{25cb} off \u{2500} \u{23F8} plan \u{21e0} lab-sweep",
+                1,
+            ),
+        ] {
+            w.note_autopilot(7, view.mode(), view, now);
+            let block = w.block(7, blank(), now, ACCENT, Keep::Revealed);
+            assert_eq!(text(&block.lights), want, "{view:?}");
+            assert_eq!(block.rule_gaps().count(), gaps, "{view:?}: the rule cells");
+            let s = &w.sessions[&7];
+            let drawn = drawn_at(s, now, None, None, Keep::Revealed);
+            assert_eq!(
+                chips_width_at(
+                    s,
+                    Chip::row().filter(|c| drawn(*c)),
+                    Keep::Revealed,
+                    Inks::of(blank(), ACCENT)
+                ),
+                block.lights.len(),
+                "{view:?}: the fit counts it"
+            );
+        }
+    }
+
     #[test]
     fn the_autopilot_chip_says_its_view_in_its_ink() {
         let now = Instant::now();
-        let dim = dim_of(blank());
+        let dim = off_of(blank());
         let mut w = WindowLights::default();
         let rows = [
             (
@@ -5196,11 +5539,27 @@ mod tests {
             let refused = w.block(7, blank, now, ACCENT, Keep::Drawn);
             assert!(refused.reason && !refused.title.is_empty(), "{name}");
             assert!(in_ink(&refused.title), "{name}: the refusal's ink");
+            // The ink the titles and the off chips wore before: the pane's halfway to its
+            // ground, floored at 3:1 alone.
+            let halfway = std::array::from_fn(|k| {
+                ((u16::from(blank.fg[k]) + u16::from(blank.bg[k])) / 2) as u8
+            });
             let (title, text, facts, old) = (
                 contrast(ink, bg),
                 contrast(fg, bg),
                 contrast(crate::claude_footer::value_fg([136; 3], fg), bg),
-                contrast(dim_of(blank), bg),
+                contrast(crate::claude_footer::visible_on(halfway, blank.bg), bg),
+            );
+            let dim = contrast(off_of(blank), bg);
+            assert!(
+                dim >= CHIP_INK_FLOOR,
+                "{name}: the off chips read ({dim:.2})"
+            );
+            assert!(dim < text, "{name}: and stay quiet ({dim:.2} < {text:.2})");
+            assert_eq!(
+                dim_of(blank),
+                crate::claude_footer::visible_on(halfway, blank.bg),
+                "{name}: the quiet marks keep the halfway ink at 3:1"
             );
             eprintln!(
                 "{name}: title {ink:?} {title:.2}:1, text {text:.2}:1, facts {facts:.2}:1, \
@@ -5218,7 +5577,11 @@ mod tests {
             assert!(old < CHIP_INK_FLOOR, "{name}: the old ink ({old:.2})");
             w.note_autopilot(7, Some(Autopilot::Off), AutopilotView::Off, now);
             let off = w.block(7, blank, now, ACCENT, Keep::Drawn);
-            assert_eq!(off.lights[0].fg, dim_of(blank), "{name}: `○ off`, dim");
+            assert_eq!(
+                off.lights[0].fg,
+                off_of(blank),
+                "{name}: `○ off`, the off ink"
+            );
         }
     }
 
@@ -6914,7 +7277,7 @@ mod gesture_tests {
         feed(&app, session, b"\x1b[?1000h\x1b[?1006h");
         frame(&mut app, wid);
         let accent = crate::chrome_band::band_colors(app.theme).accent;
-        let dim = super::dim_of(app.windows[&wid].input_scratch.implicit_blank);
+        let dim = super::off_of(app.windows[&wid].input_scratch.implicit_blank);
         let human = human_seq(&app, session);
         assert_eq!(
             autopilot(&app, session),
@@ -7411,7 +7774,7 @@ mod gesture_tests {
         publish_facts(&app, session);
         draw_claude(&app, session, BYPASS);
         frame(&mut app, wid);
-        let dim = super::dim_of(app.windows[&wid].input_scratch.implicit_blank);
+        let dim = super::off_of(app.windows[&wid].input_scratch.implicit_blank);
         let chip = hit(&app, wid, Chip::Autopilot);
         assert_eq!(
             (cell_at(&app, wid, chip).ch, cell_at(&app, wid, chip).fg),
@@ -7568,8 +7931,8 @@ mod gesture_tests {
             assert!(text.contains("\u{25cb} off"), "own={own}: {text:?}");
             assert_eq!(
                 cell_at(&app, wid, chip).fg,
-                super::dim_of(app.windows[&wid].input_scratch.implicit_blank),
-                "own={own}: dim"
+                super::off_of(app.windows[&wid].input_scratch.implicit_blank),
+                "own={own}: the off ink"
             );
         }
     }

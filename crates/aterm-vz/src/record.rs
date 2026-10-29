@@ -93,13 +93,20 @@ impl Paths {
         self.root.join("live").join(format!("{VM}.img.lock"))
     }
 
-    /// The socket path, refused by name when it does not fit `sun_path`.
+    /// The socket path, refused by name when it contains an interior NUL or does not fit `sun_path`.
     ///
     /// # Errors
-    /// It is [`SUN_PATH`] bytes or longer.
+    /// It contains a NUL byte or is [`SUN_PATH`] bytes or longer.
     pub fn checked_socket(&self) -> Result<PathBuf, String> {
         let path = self.socket();
-        let len = path.as_os_str().len();
+        let bytes = path.as_os_str().as_encoded_bytes();
+        if bytes.contains(&0) {
+            return Err(format!(
+                "the helper's control socket {} contains an interior NUL byte",
+                path.display()
+            ));
+        }
+        let len = bytes.len();
         if len >= SUN_PATH {
             return Err(format!(
                 "the helper's control socket {} is {len} bytes, past sun_path's {SUN_PATH} \
@@ -163,7 +170,10 @@ impl Record {
     pub fn parse(text: &str) -> Option<Self> {
         let v = aterm_json::from_str::<aterm_json::Value>(text).ok()?;
         let text_of = |key: &str| v.get(key).and_then(aterm_json::Value::as_str);
-        let opt = |key: &str| text_of(key).map(str::to_string);
+        let opt_text = |key: &str| match v.get(key) {
+            None | Some(aterm_json::Value::Null) => Some(None),
+            Some(val) => val.as_str().map(|s| Some(s.to_string())),
+        };
         Some(Self {
             pid: u32::try_from(v.get("pid")?.as_u64()?)
                 .ok()
@@ -173,12 +183,12 @@ impl Record {
                 None => 0,
                 Some(birth) => birth.as_u64()?,
             },
-            helper_sha256: opt("helper_sha256")?,
+            helper_sha256: text_of("helper_sha256")?.to_string(),
             proto: u32::try_from(v.get("proto")?.as_u64()?).ok()?,
             live_disk: PathBuf::from(text_of("live_disk")?),
             started: v.get("started")?.as_u64()?,
-            boot_id: opt("boot_id"),
-            agent_sha256: opt("agent_sha256"),
+            boot_id: opt_text("boot_id")?,
+            agent_sha256: opt_text("agent_sha256")?,
         })
     }
 
@@ -689,6 +699,30 @@ mod tests {
         let long = Paths::at(format!("/tmp/{}", "d".repeat(90)));
         let why = long.checked_socket().expect_err("too long");
         assert!(why.contains("past sun_path's 104"), "{why}");
+        let nul = Paths::at("/tmp/vz\0bad");
+        let why = nul.checked_socket().expect_err("interior NUL");
+        assert!(why.contains("interior NUL"), "{why}");
+
+        let mut v = aterm_json::from_str::<aterm_json::Value>(&record(4242, 77).json()).unwrap();
+        v.as_object_mut().unwrap().remove("boot_id");
+        v.as_object_mut()
+            .unwrap()
+            .insert("agent_sha256".into(), aterm_json::Value::Null);
+        let parsed = Record::parse(&aterm_json::to_string(&v).unwrap()).expect("absent/null ok");
+        assert_eq!(parsed.boot_id, None);
+        assert_eq!(parsed.agent_sha256, None);
+        for key in ["boot_id", "agent_sha256"] {
+            let mut bad =
+                aterm_json::from_str::<aterm_json::Value>(&record(4242, 77).json()).unwrap();
+            bad.as_object_mut()
+                .unwrap()
+                .insert(key.into(), aterm_json::Value::from(123u64));
+            assert_eq!(
+                Record::parse(&aterm_json::to_string(&bad).unwrap()),
+                None,
+                "non-string {key} must be refused"
+            );
+        }
     }
 
     #[test]

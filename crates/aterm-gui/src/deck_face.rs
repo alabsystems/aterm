@@ -138,6 +138,9 @@ const HELVETICA_NEUE: [(char, u16, u16); 100] = [
 pub(crate) struct FaceMetrics {
     /// `(char, regular, bold)` advances per em, in char order.
     advances: Vec<(char, f64, f64)>,
+    /// The `(regular, bold)` advances of printable ASCII from `advances`, by
+    /// [`ascii_slot`]: nearly every char the deck measures, looked up without a search.
+    ascii: [Option<(f64, f64)>; ASCII_CHARS],
     /// `((left, right), regular, bold)` kerning per em of the pairs whose
     /// kerning is not zero, in pair order.
     kerns: Vec<((char, char), f64, f64)>,
@@ -150,16 +153,33 @@ pub(crate) struct FaceMetrics {
     missing: f64,
 }
 
+/// How many chars printable ASCII (`' '..='~'`) has.
+const ASCII_CHARS: usize = 95;
+
+/// `ch`'s place in [`FaceMetrics`]' ASCII table, when it is printable ASCII.
+fn ascii_slot(ch: char) -> Option<usize> {
+    (' '..='~')
+        .contains(&ch)
+        .then(|| ch as usize - ' ' as usize)
+}
+
 impl FaceMetrics {
     fn from_rows(rows: impl Iterator<Item = (char, f64, f64)>) -> Self {
         let mut advances: Vec<_> = rows.collect();
         advances.sort_by_key(|&(ch, _, _)| ch);
+        let mut ascii = [None; ASCII_CHARS];
+        for &(ch, regular, bold) in &advances {
+            if let Some(slot) = ascii_slot(ch).and_then(|at| ascii.get_mut(at)) {
+                *slot = Some((regular, bold));
+            }
+        }
         let missing = advances
             .iter()
             .map(|&(_, regular, bold)| regular.max(bold))
             .fold(0.6, f64::max);
         Self {
             advances,
+            ascii,
             kerns: Vec::new(),
             tracking: 0.0,
             missing,
@@ -248,11 +268,16 @@ impl FaceMetrics {
     }
 
     fn advance(&self, ch: char, bold: bool) -> Option<f64> {
-        self.advances
-            .binary_search_by_key(&ch, |&(c, _, _)| c)
-            .ok()
-            .and_then(|at| self.advances.get(at))
-            .map(|&(_, regular, heavy)| if bold { heavy } else { regular })
+        let (regular, heavy) = match ascii_slot(ch) {
+            Some(at) => self.ascii.get(at).copied().flatten()?,
+            None => self
+                .advances
+                .binary_search_by_key(&ch, |&(c, _, _)| c)
+                .ok()
+                .and_then(|at| self.advances.get(at))
+                .map(|&(_, regular, heavy)| (regular, heavy))?,
+        };
+        Some(if bold { heavy } else { regular })
     }
 
     fn kern(&self, left: char, right: char, bold: bool) -> f64 {
@@ -446,6 +471,26 @@ mod tests {
     /// The deck header's size in points (`stats_plan`'s), which rule F's cases are written at.
     const HEADER_PT: f64 = 9.5;
 
+    /// The ASCII table answers what a search of the sorted rows does, for every char of both
+    /// faces' tables and the chars around them, in both weights.
+    #[test]
+    fn the_ascii_table_answers_as_the_rows_do() {
+        for m in [FaceMetrics::helvetica_neue(), FaceMetrics::test_stack()] {
+            for ch in ('\0'..='\u{2100}').chain(['\u{1F600}']) {
+                for bold in [false, true] {
+                    let searched = m
+                        .advances
+                        .binary_search_by_key(&ch, |&(c, _, _)| c)
+                        .ok()
+                        .and_then(|at| m.advances.get(at))
+                        .map(|&(_, regular, heavy)| if bold { heavy } else { regular });
+                    assert_eq!(m.advance(ch, bold), searched, "{ch:?} bold={bold}");
+                }
+            }
+            assert!(m.advance('~', true).is_some() && m.advance('…', false).is_some());
+        }
+    }
+
     #[test]
     fn rule_f_takes_the_first_form_that_fits_else_cuts_the_last() {
         let m = FaceMetrics::helvetica_neue();
@@ -497,31 +542,6 @@ mod tests {
             "the case tells regular from bold"
         );
         assert_eq!(fit(&[], 100.0, HEADER_PT, false, &m), "");
-    }
-
-    #[test]
-    fn boxes_are_kept_only_once_a_test_asks_for_them() {
-        let mut boxes = Boxes::default();
-        boxes.note(BoxKind::Text, [0.0, 0.0, 1.0, 1.0], "unasked", None);
-        assert_eq!(boxes.take(), Vec::new());
-        boxes.record();
-        boxes.note(
-            BoxKind::Mark,
-            [1.0, 2.0, 3.0, 4.0],
-            "kept",
-            Some((0.5, 5.0)),
-        );
-        assert_eq!(
-            boxes.take(),
-            vec![Boxed {
-                kind: BoxKind::Mark,
-                text: "kept".to_owned(),
-                r: [1.0, 2.0, 3.0, 4.0],
-                room: Some((0.5, 5.0)),
-            }]
-        );
-        boxes.note(BoxKind::Text, [0.0, 0.0, 1.0, 1.0], "after the take", None);
-        assert_eq!(boxes.take(), Vec::new(), "a take ends the recording");
     }
 
     /// Prints [`HELVETICA_NEUE`] from the face the macOS chrome draws in and

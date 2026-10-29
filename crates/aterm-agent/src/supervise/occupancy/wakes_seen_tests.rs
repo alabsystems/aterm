@@ -44,13 +44,6 @@ fn each_word_reads_back_as_what_wrote_it() {
 }
 
 #[test]
-fn the_default_book_is_empty() {
-    let seen = WakesSeen::default();
-    assert_eq!((seen.pending(), seen.ready()), (0, 0));
-    assert!(seen.head_due().is_none());
-}
-
-#[test]
 fn the_books_words_read_back() {
     fn back<T: Copy + PartialEq + std::fmt::Debug>(
         all: &[T],

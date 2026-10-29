@@ -938,3 +938,34 @@ fn a_box_drawn_as_one_row_has_no_anchor() {
     assert_eq!(box_anchor(&claude, &half), None);
     assert!(box_anchor(&claude, &whole).is_some(), "{whole:#?}");
 }
+
+/// Fix E3 (E2E-3): the harness's `act word=escalate` reaches the session log when it hands the
+/// box over: after its ask goes up and before it waits for the box to leave. Before the fix the
+/// act waited for the look to return, which an escalated box holds until the person answers,
+/// so the log had it at the answer (9 s and 58 s late in the two end-to-end runs).
+#[test]
+fn the_escalate_act_is_marked_at_the_hand_over_before_the_wait() {
+    let mut m = Mock::new(vec![busy_screen(), bash_one_row(), busy_screen()]);
+    m.attention_gates = vec![(1, 0)];
+    m.vanish_after = Some(2);
+    let (a, lines) = watched("box-act-at-hand-over", &mut m, &handing(), |_| {});
+    assert_eq!((a.prompts, a.sets), (1, 1), "{lines:#?}\n{:#?}", m.requests);
+    let at = |prefix: &str| {
+        m.requests
+            .iter()
+            .position(|r| r.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no `{prefix}`: {:#?}", m.requests))
+    };
+    let badge = at("meta set attention owner=supervisor ");
+    let act = at("mark - act word=escalate");
+    let wait = badge
+        + m.requests[badge..]
+            .iter()
+            .position(|r| r.starts_with("await "))
+            .unwrap_or_else(|| panic!("no wait after the hand-over: {:#?}", m.requests));
+    assert!(
+        badge < act && act < wait,
+        "the act between the hand-over ({badge}) and the wait ({wait}), not at {act}: {:#?}",
+        m.requests
+    );
+}

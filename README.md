@@ -194,9 +194,11 @@ routes through the agent, so a person can type at any time, even mid-turn.
 
 When a window opens a session, aterm keeps a short primer current in the global
 context file of each coding agent it finds — Claude Code, Codex CLI, agy
-and OpenCode (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, …). Claude Code also
-gets five skills (`drive-aterm`, `supervise-agent`, `rust-in-aterm`,
-`aterm-themes`, `aterm-fabric`); Codex CLI and OpenCode get `aterm-fabric` as a command. The primer applies
+and OpenCode (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, …). Claude Code and
+Codex CLI also get seven skills (`drive-aterm`, `supervise-agent`,
+`rust-in-aterm`, `aterm-themes`, `aterm-fabric`, `system-state`,
+`open-in-amacs`); OpenCode gets
+`aterm-fabric` as a command. The primer applies
 only inside aterm (`TERM_PROGRAM=aterm`, `ATERM_CHILD=1`), where `aterm help`
 prints the agent brief with the caller's session ID filled in. Keep your own
 rules outside its markers. `aterm agents` shows status, `aterm agents remove`

@@ -8,7 +8,6 @@ use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use aterm_window::application::ApplicationHandler as _;
 use aterm_window::event::WindowEvent;
 use aterm_window::event_loop::{ActiveEventLoop, EventLoopProxy};
 use aterm_window::keyboard::ModifiersState;
@@ -398,7 +397,14 @@ struct Held {
     menu: MenuMark,
     /// Whether a modifier change for a new window was already applied to `typed_into`.
     applied: bool,
+    /// Whether an `hwkey` burst posted it, decided as it arrived (`App::key_event_posted`): its
+    /// replay runs as a control client's gesture then, whatever event AppKit is dispatching.
+    posted: bool,
 }
+
+/// A held input event released for replay ([`App::replay_window_event`]): the OS window it goes
+/// through, the event, and whether an `hwkey` burst posted it ([`Held::posted`]).
+pub(crate) type Released = (WinitWindowId, WindowEvent, bool);
 
 const fn is_pointer(event: &WindowEvent) -> bool {
     matches!(
@@ -465,7 +471,7 @@ fn sift_held(
     landed: bool,
     through: Option<WinitWindowId>,
     now: Instant,
-) -> (Vec<(WinitWindowId, WindowEvent)>, u32) {
+) -> (Vec<Released>, u32) {
     let mut replay = Vec::with_capacity(held.len());
     let mut dropped = 0u32;
     let mut pressed = Vec::new();
@@ -476,7 +482,7 @@ fn sift_held(
             } else {
                 through.unwrap_or(h.typed_into)
             };
-            replay.push((via, h.event));
+            replay.push((via, h.event, h.posted));
             continue;
         }
         let keep = match &h.event {
@@ -505,7 +511,7 @@ fn sift_held(
             }
         };
         if keep {
-            replay.push((h.typed_into, h.event));
+            replay.push((h.typed_into, h.event, h.posted));
         }
     }
     (replay, dropped)
@@ -611,6 +617,7 @@ impl TabSpawns {
             && last.target == held.target
             && last.spawn == held.spawn
             && last.menu == held.menu
+            && last.posted == held.posted
             && coalesce(&mut last.event, &held.event)
         {
             last.until = last.until.max(held.until);
@@ -713,11 +720,23 @@ impl MenuMarks {
 
 static NATIVE_MENU_MARKS: OnceLock<Arc<MenuMarks>> = OnceLock::new();
 
-/// The window and focused leaf from which a palette posted a menu command.
+/// The window and focused leaf from which a palette posted a menu command, and whose gesture
+/// chose it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MenuOrigin {
     window: WindowId,
     content: Option<crate::front_content::FrontContent>,
+    /// A control client's gesture chose the row: the command runs marked as one
+    /// ([`App::dispatch_marked_menu_action`]), so a person-only act in it refuses the client.
+    controller: bool,
+}
+
+#[cfg(all(test, unix))]
+impl MenuOrigin {
+    /// Whether a control client's gesture chose the row.
+    pub(crate) const fn controller(self) -> bool {
+        self.controller
+    }
 }
 
 /// Serve `marks` to the native menu and toolbar's posts.
@@ -725,20 +744,25 @@ pub(crate) fn serve_native_menu_marks(marks: &Arc<MenuMarks>) {
     let _ = NATIVE_MENU_MARKS.set(Arc::clone(marks));
 }
 
-/// Post `action` as a [`Wake::MenuAction`] recorded in `marks`.
+/// Post `action` as a [`Wake::MenuAction`] recorded in `marks`, run as a control client's
+/// gesture when `controller` is set.
 pub(crate) fn post_menu_action(
     proxy: &EventLoopProxy<Wake>,
     marks: Option<&MenuMarks>,
     action: crate::menu::MenuAction,
+    controller: bool,
 ) -> bool {
-    post_menu_action_from(proxy, marks, action, None)
+    post_menu_action_from(proxy, marks, action, None, controller)
 }
 
+/// Post `action` as a [`Wake::MenuAction`], run as a control client's gesture when `controller`
+/// is set or `origin` says so ([`App::run_posted_menu_action`]).
 fn post_menu_action_from(
     proxy: &EventLoopProxy<Wake>,
     marks: Option<&MenuMarks>,
     action: crate::menu::MenuAction,
     origin: Option<MenuOrigin>,
+    controller: bool,
 ) -> bool {
     let mark = marks.map_or(MenuMark::NONE, |marks| marks.mint(Instant::now()));
     let sent = proxy
@@ -746,6 +770,7 @@ fn post_menu_action_from(
             action,
             mark,
             origin,
+            controller,
         })
         .is_ok();
     if !sent && let Some(marks) = marks {
@@ -754,13 +779,29 @@ fn post_menu_action_from(
     sent
 }
 
-/// Post `action` from a native menu or toolbar callback using [`NATIVE_MENU_MARKS`].
+/// Post `action` from a native menu or toolbar callback using [`NATIVE_MENU_MARKS`], marked as a
+/// control client's gesture when one chose it ([`native_post_by_controller`]).
 #[cfg(target_os = "macos")]
 pub(crate) fn post_native_menu_action(
     proxy: &EventLoopProxy<Wake>,
     action: crate::menu::MenuAction,
 ) -> bool {
-    post_menu_action(proxy, NATIVE_MENU_MARKS.get().map(Arc::as_ref), action)
+    post_menu_action_from(
+        proxy,
+        NATIVE_MENU_MARKS.get().map(Arc::as_ref),
+        action,
+        None,
+        native_post_by_controller(),
+    )
+}
+
+/// Whether the native menu or toolbar item AppKit runs now is a control client's gesture: the
+/// key that chose it by its key equivalent (⌘V is Edit ▸ Paste) is one an `hwkey` burst posted,
+/// which takes the person's own event path with no mark of its own
+/// ([`crate::hwkey::current_event_posted`]).
+#[cfg(any(target_os = "macos", all(test, unix)))]
+pub(crate) fn native_post_by_controller() -> bool {
+    crate::hwkey::current_event_posted()
 }
 
 struct Spawner {
@@ -1301,7 +1342,7 @@ impl App {
         window: WindowId,
         spawn: Option<u64>,
         landed: bool,
-    ) -> (Vec<(WinitWindowId, WindowEvent)>, Option<WindowId>) {
+    ) -> (Vec<Released>, Option<WindowId>) {
         let spawns = &mut self.tab_spawns;
         let Some(spawn) = spawn.filter(|_| spawns.in_flight.iter().any(|t| t.window == window))
         else {
@@ -1341,12 +1382,12 @@ impl App {
     pub(crate) fn replay_settled_input(
         &mut self,
         el: &ActiveEventLoop,
-        replay: Vec<(WinitWindowId, WindowEvent)>,
+        replay: Vec<Released>,
         repair: Option<WindowId>,
     ) {
         self.replaying(true, |app| {
-            for (winit_id, event) in replay {
-                app.window_event(el, winit_id, event);
+            for (winit_id, event, posted) in replay {
+                app.replay_window_event(el, winit_id, event, posted);
             }
         });
         if let Some(ws) = repair.and_then(|at| self.windows.get_mut(&at)) {
@@ -1365,17 +1406,21 @@ impl App {
         out
     }
 
-    /// Post `action` as a marked [`Wake::MenuAction`] on this App's event loop.
+    /// Post `action` as a marked [`Wake::MenuAction`] on this App's event loop, run as a control
+    /// client's gesture when one is being dispatched now ([`Self::person_gesture_refused`]): a
+    /// posted ⌘Q, or a `pointer` press on the version slot, posts its action as the client's.
     pub(crate) fn post_menu_action(&self, action: crate::menu::MenuAction) -> bool {
-        self.proxy
-            .as_ref()
-            .is_some_and(|proxy| post_menu_action(proxy, Some(&self.tab_spawns.menu), action))
+        let controller = self.person_gesture_refused();
+        self.proxy.as_ref().is_some_and(|proxy| {
+            post_menu_action(proxy, Some(&self.tab_spawns.menu), action, controller)
+        })
     }
 
     pub(crate) fn palette_menu_origin(&self, window: WindowId) -> Option<MenuOrigin> {
         self.windows.get(&window).map(|state| MenuOrigin {
             window,
             content: state.front_content,
+            controller: self.person_gesture_refused(),
         })
     }
 
@@ -1389,7 +1434,13 @@ impl App {
             return false;
         };
         self.proxy.as_ref().is_some_and(|proxy| {
-            post_menu_action_from(proxy, Some(&self.tab_spawns.menu), action, Some(origin))
+            post_menu_action_from(
+                proxy,
+                Some(&self.tab_spawns.menu),
+                action,
+                Some(origin),
+                false,
+            )
         })
     }
 
@@ -1400,7 +1451,10 @@ impl App {
     ) -> Option<crate::menu::MenuAction> {
         if let Some(origin) = origin
             && (self.frontmost_window != Some(origin.window)
-                || self.palette_menu_origin(origin.window) != Some(origin))
+                || self
+                    .palette_menu_origin(origin.window)
+                    .map(|now| now.content)
+                    != Some(origin.content))
         {
             self.pending_action_refusal =
                 Some("palette command cancelled because its active content changed".to_string());
@@ -1416,27 +1470,39 @@ impl App {
         action: crate::menu::MenuAction,
         mark: MenuMark,
         origin: Option<MenuOrigin>,
+        controller: bool,
     ) {
         let booked = self.tab_spawns.in_flight.len();
-        if let Some(action) = self.menu_action_for_origin(action, origin) {
-            self.dispatch_menu_action(el, action);
-        }
+        self.run_posted_menu_action(action, origin, controller, |app, action| {
+            app.dispatch_menu_action(el, action);
+        });
         if self.tab_spawns.menu.settle(mark) {
             let release = self.claim_menu_held_input(mark, booked);
             self.replaying(false, |app| {
-                for (winit_id, event) in release {
-                    app.window_event(el, winit_id, event);
+                for (winit_id, event, posted) in release {
+                    app.replay_window_event(el, winit_id, event, posted);
                 }
             });
         }
     }
 
-    /// Resolve input held under `mark`: rebind to spawns past `booked`, or return for replay.
-    pub(crate) fn claim_menu_held_input(
+    /// Run a posted menu `action` with `dispatch` unless its origin moved, marked as a control
+    /// client's gesture when the post was one (`controller`) or its origin's chooser was.
+    pub(crate) fn run_posted_menu_action(
         &mut self,
-        mark: MenuMark,
-        booked: usize,
-    ) -> Vec<(WinitWindowId, WindowEvent)> {
+        action: crate::menu::MenuAction,
+        origin: Option<MenuOrigin>,
+        controller: bool,
+        dispatch: impl FnOnce(&mut Self, crate::menu::MenuAction),
+    ) {
+        let controller = controller || origin.is_some_and(|origin| origin.controller);
+        if let Some(action) = self.menu_action_for_origin(action, origin) {
+            self.with_gesture_source(controller, |app| dispatch(app, action));
+        }
+    }
+
+    /// Resolve input held under `mark`: rebind to spawns past `booked`, or return for replay.
+    pub(crate) fn claim_menu_held_input(&mut self, mark: MenuMark, booked: usize) -> Vec<Released> {
         let spawns = &mut self.tab_spawns;
         if !spawns.held.iter().any(|h| h.menu == mark) {
             return Vec::new();
@@ -1469,16 +1535,16 @@ impl App {
                 .rev()
                 .find(|(from, ..)| typed.is_some() && *from == typed);
             let Some(&(_, target, until, id)) = spawn else {
-                release.push((h.typed_into, h.event));
+                release.push((h.typed_into, h.event, h.posted));
                 continue;
             };
             if Some(target) != typed {
                 if is_pointer(&h.event) {
-                    release.push((h.typed_into, h.event));
+                    release.push((h.typed_into, h.event, h.posted));
                     continue;
                 }
                 if matches!(h.event, WindowEvent::ModifiersChanged(_)) {
-                    release.push((h.typed_into, h.event.clone()));
+                    release.push((h.typed_into, h.event.clone(), h.posted));
                     h.applied = true;
                 }
             }
@@ -1783,6 +1849,7 @@ impl App {
             until,
             menu,
             applied: now_too.is_some(),
+            posted: self.key_event_posted,
         });
         now_too
     }
@@ -1792,7 +1859,7 @@ impl App {
         &mut self,
         typed_into: WinitWindowId,
         now: Instant,
-    ) -> (Vec<(WinitWindowId, WindowEvent)>, Option<WindowId>) {
+    ) -> (Vec<Released>, Option<WindowId>) {
         let spawns = &mut self.tab_spawns;
         spawns.refresh_holds(now);
         let expired = |h: &Held| h.typed_into == typed_into && h.until <= now;
@@ -1887,7 +1954,7 @@ impl App {
         &mut self,
         wid: WindowId,
         landed: bool,
-    ) -> (Vec<(WinitWindowId, WindowEvent)>, Option<WindowId>) {
+    ) -> (Vec<Released>, Option<WindowId>) {
         let through = self
             .winit_to_window
             .iter()
@@ -2450,8 +2517,8 @@ pub(crate) mod tests {
         WindowEvent::Ime(Ime::Commit(text.to_string()))
     }
 
-    fn replay(app: &mut App, wid: WindowId, events: Vec<(WinitWindowId, WindowEvent)>) {
-        for (_, event) in events {
+    fn replay(app: &mut App, wid: WindowId, events: Vec<Released>) {
+        for (_, event, _) in events {
             if let WindowEvent::Ime(Ime::Commit(text)) = event {
                 app.on_ime_commit(wid, text);
             }
@@ -2611,7 +2678,7 @@ pub(crate) mod tests {
         assert!(
             events
                 .iter()
-                .all(|(_, e)| matches!(e, WindowEvent::ModifiersChanged(_))),
+                .all(|(_, e, _)| matches!(e, WindowEvent::ModifiersChanged(_))),
             "only the modifier changes replay: {events:?}"
         );
         assert_eq!(events.len(), 1);
@@ -3304,7 +3371,7 @@ pub(crate) mod tests {
         let (events, repair) = app.settle_tab_spawn_input(wid, true);
         assert_eq!(repair, None);
         assert!(
-            events.iter().all(|(through, _)| *through == own_winit),
+            events.iter().all(|(through, ..)| *through == own_winit),
             "replayed through the new window's own OS window"
         );
         replay(&mut app, wid, events);
@@ -3593,10 +3660,10 @@ pub(crate) mod tests {
         WindowEvent::ModifiersChanged(aterm_window::event::Modifiers::default())
     }
 
-    fn named(events: &[(WinitWindowId, WindowEvent)]) -> Vec<String> {
+    fn named(events: &[Released]) -> Vec<String> {
         events
             .iter()
-            .map(|(_, event)| match event {
+            .map(|(_, event, _)| match event {
                 WindowEvent::Ime(Ime::Commit(t)) => t.clone(),
                 WindowEvent::ModifiersChanged(_) => "mods".to_string(),
                 WindowEvent::CursorMoved { position, .. } => format!("move {}", position.x),
@@ -3649,7 +3716,7 @@ pub(crate) mod tests {
             named(&events),
             ["a", "move 3", "press", "release", "wheel 3", "b"]
         );
-        assert!(events.iter().all(|(via, _)| *via == winit_id));
+        assert!(events.iter().all(|(via, ..)| *via == winit_id));
 
         let (_, window) =
             test_support::book_window(&mut app, None, SpawnAdmission::Plain, TabSpawnThen::Nothing);
@@ -3934,6 +4001,144 @@ pub(crate) mod tests {
         );
     }
 
+    /// A HELD KEY REPLAYS AS THE KEY IT ARRIVED AS: whether a key is one an `hwkey` burst posted
+    /// is read off the event AppKit is dispatching (`-[NSApp currentEvent]`), which by a held
+    /// key's replay is another one (the person's mouse, or a burst's next key). So it is decided
+    /// as the key arrives (`crate::arriving_key_posted`, into `App::key_event_posted`) and the
+    /// hold carries it: a posted ⌘V held under a pending menu mark (a burst's ⌘T, say) comes back
+    /// posted, and its replay through the key arm (`App::replay_window_event` runs
+    /// `App::dispatch_hw_key` with the carried word) pastes no clipboard while nothing posted is
+    /// being dispatched; the person's ⌘V held beside it comes back the person's and pastes while a
+    /// burst's key is being dispatched. A key typed before an incoming handoff's Commit carries
+    /// the word the same way.
+    /// NEGATIVE CONTROL: with the hold keeping no word (`posted: false` in
+    /// `defer_tab_spawn_input`, which is what the branch's replay that read the current event
+    /// found here: no posted key under dispatch), the burst's held ⌘V sent `s3cret-pass`.
+    #[test]
+    fn a_held_key_replays_as_the_key_it_arrived_as() {
+        use aterm_window::event::{DeviceId, ElementState, KeyEvent};
+        use aterm_window::keyboard::{
+            Key, KeyCode, KeyLocation, ModifiersState, PhysicalKey, SmolStr,
+        };
+
+        use crate::hwkey::{CURRENT_KEY_STUB, NS_EVENT_TYPE_KEY_DOWN, PostedKey, note_posted};
+        const SECRET: &str = "s3cret-pass";
+        if !crate::app_input::HARDCODED_SUPER_CHORDS {
+            return;
+        }
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let winit_id = WinitWindowId::from(0u64);
+        app.winit_to_window.insert(winit_id, wid);
+        let (mut pty, input) = std::os::unix::net::UnixStream::pair().expect("an input observer");
+        pty.set_nonblocking(true).expect("nonblocking");
+        let sink = Arc::new(SinkWriter::new_owned(input.into()));
+        app.push_stub_tab(
+            wid,
+            crate::stub_session_with_sink(app.next_session_id, Arc::clone(&sink)),
+        );
+        // What the front program has been sent, once the sink's ordered egress drained.
+        let mut sent = || {
+            use std::io::Read as _;
+            crate::app_input::paste_order::await_drain_for_test(&sink);
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while let Ok(n @ 1..) = pty.read(&mut chunk) {
+                bytes.extend_from_slice(&chunk[..n]);
+            }
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        crate::control::PBPASTE_STUB.with(|board| *board.borrow_mut() = Some(SECRET.into()));
+        let cmd_v = || WindowEvent::KeyboardInput {
+            device_id: DeviceId::dummy(),
+            event: KeyEvent::synthetic_for_test(
+                PhysicalKey::Code(KeyCode::KeyV),
+                Key::Character(SmolStr::new("v")),
+                Some(SmolStr::new("v")),
+                KeyLocation::Standard,
+                ElementState::Pressed,
+                false,
+            ),
+            is_synthetic: false,
+        };
+        let key = |stamp: f64, posted: bool| {
+            let key = PostedKey {
+                kind: NS_EVENT_TYPE_KEY_DOWN,
+                keycode: 9,
+                timestamp: stamp,
+            };
+            if posted {
+                note_posted(&[key]).expect("room");
+            }
+            key
+        };
+        let dispatching = |current: Option<PostedKey>, f: &mut dyn FnMut()| {
+            CURRENT_KEY_STUB.with(|stub| stub.set(current));
+            f();
+            CURRENT_KEY_STUB.with(|stub| stub.set(None));
+        };
+        // The event as `App::on_window_event` takes it: decided as it arrives, then held.
+        let arrive = |app: &mut App, current: PostedKey| {
+            let mut posted = false;
+            dispatching(Some(current), &mut || {
+                posted = crate::arriving_key_posted(&cmd_v())
+            });
+            app.key_event_posted = posted;
+            assert!(app.defer_tab_spawn_input(wid, winit_id, cmd_v()).is_none());
+            app.key_event_posted = false;
+            posted
+        };
+        // The replay as `App::replay_window_event` runs it through the key arm.
+        let replay = |app: &mut App, released: Released, current: Option<PostedKey>| {
+            let (_, WindowEvent::KeyboardInput { event, .. }, posted) = released else {
+                panic!("a key");
+            };
+            app.windows.get_mut(&wid).unwrap().mods = ModifiersState::SUPER;
+            dispatching(current, &mut || {
+                app.dispatch_hw_key(wid, event.clone(), posted)
+            });
+            app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
+        };
+
+        let marks = Arc::clone(&app.tab_spawns.menu);
+        let mark = marks.mint(Instant::now());
+        assert!(arrive(&mut app, key(2_000.25, true)), "a burst's ⌘V");
+        assert!(!arrive(&mut app, key(2_000.5, false)), "the person's ⌘V");
+        assert!(marks.settle(mark));
+        let mut back = app.claim_menu_held_input(mark, app.tab_spawns.in_flight.len());
+        let words: Vec<bool> = back.iter().map(|(.., posted)| *posted).collect();
+        let persons = back.pop().expect("the person's ⌘V");
+        let bursts = back.pop().expect("the burst's ⌘V");
+        replay(&mut app, bursts, None);
+        let burst_sent = sent();
+        assert!(
+            !burst_sent.contains(SECRET),
+            "the burst's held ⌘V sent {burst_sent:?}"
+        );
+        replay(&mut app, persons, Some(key(2_000.75, true)));
+        let person_sent = sent();
+        assert!(
+            person_sent.contains(SECRET),
+            "the person's held ⌘V sent {person_sent:?}"
+        );
+        assert_eq!(words, [true, false], "each came back as it arrived");
+
+        app.incoming_handoff_pending = true;
+        app.key_event_posted = true;
+        app.queue_pre_commit_input(winit_id, cmd_v());
+        app.key_event_posted = false;
+        app.queue_pre_commit_input(winit_id, cmd_v());
+        assert_eq!(
+            app.handoff_deferred_input
+                .iter()
+                .map(|(.., posted)| *posted)
+                .collect::<Vec<_>>(),
+            [true, false],
+            "a key typed before Commit carries its word"
+        );
+        crate::control::PBPASTE_STUB.with(|board| *board.borrow_mut() = None);
+    }
+
     #[test]
     fn input_typed_before_a_menu_command_is_dispatched_waits_for_it() {
         let mut app = App::headless_for_test();
@@ -4017,7 +4222,7 @@ pub(crate) mod tests {
             .map(|h| {
                 (
                     h.target,
-                    named(&[(h.typed_into, h.event.clone())]).remove(0),
+                    named(&[(h.typed_into, h.event.clone(), h.posted)]).remove(0),
                 )
             })
             .collect();
@@ -4047,9 +4252,9 @@ pub(crate) mod tests {
         assert!(handed_back.is_some(), "typed before the pending mark");
     }
 
-    fn redeliver(app: &mut App, wid: WindowId, events: Vec<(WinitWindowId, WindowEvent)>) {
+    fn redeliver(app: &mut App, wid: WindowId, events: Vec<Released>) {
         app.replaying(true, |app| {
-            for (via, event) in events {
+            for (via, event, _) in events {
                 if let Some(WindowEvent::Ime(Ime::Commit(text))) =
                     app.defer_tab_spawn_input(wid, via, event)
                 {

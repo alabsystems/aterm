@@ -1,0 +1,27 @@
+# claude-code 2.1.312 · COMPOSED 2026-10-28, never captured: the quoted texts are the bundle's (byte offsets into the store's 2.1.312 binary, sha256 6b5ec691…: `OJ.successLine` @228882855, `OJ.label` @228882669, the five-hour wall `You've hit your ${e}${n}${d}` @225067709 with `Wce.five_hour` = `5-hour limit` @225060028, the full kind's head `Limits reset`), the frame and the Bash rows are claude-2.1.302-bash-output-and-posttooluse-hook-system-message-login-phrase-empty-reply.txt's (measured 144x50), the values are invented · NEGATIVE CONTROL: the worker's own tool output, a diff and its reply quote 2.1.312's reset and wall words, none of it Claude Code's notice. The reply is short and holds ` · `, so it is read as a vendor error row, and what keeps it from reading as a five-hour wall is the not-a-wall head it opens with (`5-hour limit reset`, wall.rs's 2.1.312 rows): the screen reads no wall, no reset line and no dialog. A short reply that opens with the wall itself (`You've hit your 5-hour limit · resets 3pm …`) still reads as one, as one with `session limit` did before 2.1.312
+ ▐▛███▛█   Claude Code v2.1.312
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ what does 2.1.312 draw once a reset is used?
+
+⏺ Bash(printf "5-hour limit reset · next reset available Oct 9 at 5am · your weekly limit still applies\nReset your 5-hour limit now\n")
+  ⎿  5-hour limit reset · next reset available Oct 9 at 5am · your weekly limit still applies
+     Reset your 5-hour limit now
+
+⏺ Bash(git diff --unified=0 notes.txt)
+  ⎿  @@ -1 +1 @@
+     -You've hit your session limit · resets 3pm
+     +You've hit your 5-hour limit · resets 3pm
+
+⏺ 2.1.312 says 5-hour limit reset · next reset available Oct 9 at 5am · your weekly limit still applies once
+  the weekly 5-hour reset is used, Limits reset · 1 full reset left after a full one, and You've hit your
+  5-hour limit · resets 3pm at the wall; none of them is on this screen as its own notice.
+
+✻ Churned for 5s · done 7:05 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts

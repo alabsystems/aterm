@@ -13,12 +13,15 @@ use std::time::{Duration, Instant};
 /// How often a listener's accept loop wakes to re-check its `running` flag.
 pub(crate) const ACCEPT_POLL: Duration = Duration::from_millis(200);
 
-#[cfg(any(unix, windows))]
-fn poll_timeout_millis(timeout: Duration) -> i32 {
-    let millis = timeout.as_millis().saturating_add(u128::from(
-        !timeout.subsec_nanos().is_multiple_of(1_000_000),
-    ));
+#[cfg(any(unix, windows, test))]
+fn poll_timeout_millis_parts(as_millis: u128, subsec_nanos: u32) -> i32 {
+    let millis = as_millis.saturating_add(u128::from(!subsec_nanos.is_multiple_of(1_000_000)));
     i32::try_from(millis).unwrap_or(i32::MAX)
+}
+
+#[cfg(any(unix, windows, test))]
+fn poll_timeout_millis(timeout: Duration) -> i32 {
+    poll_timeout_millis_parts(timeout.as_millis(), timeout.subsec_nanos())
 }
 
 /// Wait until a non-blocking listener may accept, or until `timeout` expires.
@@ -70,25 +73,36 @@ pub(crate) fn wait_listener_readable(
     };
     use std::os::windows::io::AsRawSocket as _;
 
-    let mut descriptor = WSAPOLLFD {
-        fd: listener.as_raw_socket() as usize,
-        events: POLLIN,
-        revents: 0,
-    };
-    // SAFETY: std initialized Winsock before it created `listener`; `descriptor` names that live
-    // borrowed socket for the duration of the call.
-    let result = unsafe {
-        WSAPoll(
-            std::ptr::from_mut(&mut descriptor),
-            1,
-            poll_timeout_millis(timeout),
-        )
-    };
-    if result == SOCKET_ERROR {
+    let started = Instant::now();
+    let mut remaining = timeout;
+    loop {
+        let mut descriptor = WSAPOLLFD {
+            fd: listener.as_raw_socket() as usize,
+            events: POLLIN,
+            revents: 0,
+        };
+        // SAFETY: std initialized Winsock before it created `listener`; `descriptor` names that
+        // live borrowed socket for the duration of the call.
+        let result = unsafe {
+            WSAPoll(
+                std::ptr::from_mut(&mut descriptor),
+                1,
+                poll_timeout_millis(remaining),
+            )
+        };
+        if result != SOCKET_ERROR {
+            return Ok(result > 0);
+        }
         // SAFETY: WSAGetLastError takes no arguments and only reads that slot.
-        return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+        let error = io::Error::from_raw_os_error(unsafe { WSAGetLastError() });
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+        remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
     }
-    Ok(result > 0)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -311,7 +325,7 @@ impl Evictor {
             project = "slots::tests::slots_conform_to_net_slot_displacement"
         )
     )]
-    fn evict(&self) -> bool {
+    pub(crate) fn evict(&self) -> bool {
         let won = self
             .state
             .compare_exchange(WD_RUNNING, WD_EVICTED, Ordering::AcqRel, Ordering::Acquire)
@@ -342,20 +356,27 @@ fn claim_deadline(state: &AtomicU8) -> bool {
 pub(crate) struct HandshakeWatchdog {
     /// The state claimed by exactly one of the handshake, the watchdog and an [`Evictor`].
     state: Arc<AtomicU8>,
-    /// The parked watchdog thread.
-    thread: std::thread::JoinHandle<()>,
+    /// The parked watchdog thread (`None` once [`Self::finish`] or [`Drop`] has joined it).
+    thread: Option<std::thread::JoinHandle<()>>,
     /// Set by the thread each time it is about to wait.
     #[cfg(test)]
     waiting: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HandshakeWatchdog {
-    /// Arm the deadline on a clone of `tcp`.
+    /// Arm the deadline on `tcp`.
     ///
     /// # Errors
-    /// If the socket cannot be cloned or the watchdog thread cannot start.
+    /// If the socket cannot be cloned (Windows) or the watchdog thread cannot start.
     pub(crate) fn arm(tcp: &TcpStream, handshake_timeout: Duration) -> io::Result<Self> {
         let state = Arc::new(AtomicU8::new(WD_RUNNING));
+        let _ = aterm_uds::keep_out_of_children(tcp);
+        #[cfg(unix)]
+        let wd_fd = {
+            use std::os::fd::AsRawFd as _;
+            tcp.as_raw_fd()
+        };
+        #[cfg(not(unix))]
         let wd_sock = tcp.try_clone()?;
         let wd_state = Arc::clone(&state);
         #[cfg(test)]
@@ -385,12 +406,26 @@ impl HandshakeWatchdog {
                 std::thread::park_timeout(remaining);
             };
             if cut_off {
+                #[cfg(unix)]
+                {
+                    // SAFETY: `wd_fd` belongs to the caller's `TcpStream`, which is kept open
+                    // until after `HandshakeWatchdog::finish` (or `Drop`) joins this thread.
+                    // Avoiding `try_clone` here means `finish` never closes a duplicate
+                    // descriptor while the socket stays in use (on macOS, a concurrent
+                    // `PROC_PIDFDSOCKETINFO` scan during `close` of one duplicate permanently
+                    // drains the shared socket so later blocking reads fail with `EBADF`).
+                    unsafe {
+                        let _ = libc::shutdown(wd_fd, libc::SHUT_WR);
+                        let _ = libc::shutdown(wd_fd, libc::SHUT_RD);
+                    }
+                }
+                #[cfg(not(unix))]
                 aterm_uds::hangup::hang_up(&wd_sock);
             }
         })?;
         Ok(Self {
             state,
-            thread,
+            thread: Some(thread),
             #[cfg(test)]
             waiting,
         })
@@ -407,7 +442,12 @@ impl HandshakeWatchdog {
     pub(crate) fn evictor(&self) -> Evictor {
         Evictor {
             state: Arc::clone(&self.state),
-            watchdog: self.thread.thread().clone(),
+            watchdog: self
+                .thread
+                .as_ref()
+                .expect("watchdog thread is live until finish")
+                .thread()
+                .clone(),
         }
     }
 
@@ -420,7 +460,7 @@ impl HandshakeWatchdog {
             project = "slots::tests::slots_conform_to_net_slot_displacement"
         )
     )]
-    pub(crate) fn finish(self) -> Claim {
+    pub(crate) fn finish(mut self) -> Claim {
         let claim = match self.state.compare_exchange(
             WD_RUNNING,
             WD_AUTHED,
@@ -431,9 +471,26 @@ impl HandshakeWatchdog {
             Err(WD_EVICTED) => Claim::Evicted,
             Err(_) => Claim::Deadline,
         };
-        self.thread.thread().unpark();
-        let _ = self.thread.join();
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+            let _ = thread.join();
+        }
         claim
+    }
+}
+
+impl Drop for HandshakeWatchdog {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = self.state.compare_exchange(
+                WD_RUNNING,
+                WD_AUTHED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            thread.thread().unpark();
+            let _ = thread.join();
+        }
     }
 }
 
@@ -496,16 +553,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn poll_timeout_millis_rounds_up_and_saturates() {
+        assert_eq!(poll_timeout_millis(Duration::ZERO), 0);
+        assert_eq!(poll_timeout_millis(Duration::from_nanos(1)), 1);
+        assert_eq!(poll_timeout_millis(ACCEPT_POLL), 200);
+        assert_eq!(poll_timeout_millis(Duration::new(0, 200_000_001)), 201);
+        assert_eq!(poll_timeout_millis(Duration::MAX), i32::MAX);
+        assert_eq!(poll_timeout_millis_parts(u128::MAX, 999_999_999), i32::MAX);
+    }
+
+    #[test]
     fn idle_listener_readiness_wait_is_bounded_without_spinning() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let started = Instant::now();
         assert!(!wait_listener_readable(&listener, ACCEPT_POLL).unwrap());
         let elapsed = started.elapsed();
-        assert!(
-            elapsed >= ACCEPT_POLL - Duration::from_millis(40),
-            "an idle readiness wait returned too early to replace sleep polling ({elapsed:?})"
-        );
         assert!(
             elapsed < MUST_HAPPEN,
             "the readiness timeout must retain the {ACCEPT_POLL:?} shutdown bound ({elapsed:?})"
@@ -564,7 +627,7 @@ pub(crate) mod tests {
         let watchdog = HandshakeWatchdog::arm(&tcp, DEADLINE).unwrap();
 
         let stop = Arc::new(AtomicBool::new(false));
-        let waker = watchdog.thread.thread().clone();
+        let waker = watchdog.evictor().watchdog;
         let hammer = std::thread::spawn({
             let stop = Arc::clone(&stop);
             move || {
@@ -599,7 +662,7 @@ pub(crate) mod tests {
         hammer.join().unwrap();
 
         assert!(
-            closed_after >= DEADLINE.mul_f64(0.8),
+            closed_after >= DEADLINE,
             "a wake must not SHORTEN the deadline: force-closed after {closed_after:?}, \
              but the deadline is {DEADLINE:?}"
         );

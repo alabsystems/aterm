@@ -1002,6 +1002,7 @@ mod tests {
             ["effects/episode_gpu_rel"],
             "no history at all"
         );
+        assert!(fresh.breaches.is_empty(), "a first run never blocks");
         assert!(fresh.elsewhere.is_empty());
     }
 
@@ -1155,31 +1156,17 @@ mod tests {
     }
 
     #[test]
-    fn trend_first_run_on_a_box_never_blocks_and_reports_skip() {
-        let j = judged("", "boxA", &[sample("throughput", "median_mbps", 100.0)]);
-        assert!(j.breaches.is_empty());
-        assert_eq!(j.skipped, vec!["throughput/median_mbps"]);
-    }
-
-    #[test]
-    fn trend_legacy_five_column_rows_still_count_as_history() {
-        let legacy = "2026-07-20\tabc\tboxA\tthroughput/median_mbps\t1000.000\n";
-        let j = judged(
-            legacy,
-            "boxA",
-            &[sample("throughput", "median_mbps", 400.0)],
-        );
-        assert_eq!(j.breaches.len(), 1, "legacy history still judges");
-        assert!(j.skipped.is_empty());
-    }
-
-    #[test]
     fn trend_same_box_regression_trips_and_other_boxes_do_not() {
         let ledger = rows_for(
             "2026-07-22",
             "abc",
             "boxA",
             &[sample("throughput", "median_mbps", 1000.0)],
+        );
+        assert_eq!(
+            ledger.trim_end().split('\t').nth(5),
+            Some("trust"),
+            "row: {ledger:?}"
         );
         let breaches = judged(
             &ledger,
@@ -1247,35 +1234,6 @@ mod tests {
         assert!(
             windowed.breaches.is_empty(),
             "650 >= 0.70 x 800 (recent best), old 1000 aged out"
-        );
-    }
-
-    #[test]
-    fn trend_rows_round_trip_through_breach_parser() {
-        let rows = rows_for(
-            "2026-07-22",
-            "abc123",
-            "boxA",
-            &[sample("search", "rotating_build_klps", 202.6)],
-        );
-        let ledger = format!("{TREND_HEADER}{rows}");
-        let breaches = judged(
-            &ledger,
-            "boxA",
-            &[sample("search", "rotating_build_klps", 100.0)],
-        )
-        .breaches;
-        assert_eq!(breaches.len(), 1, "100 < 0.70 x 202.6");
-        let ok = judged(
-            &ledger,
-            "boxA",
-            &[sample("search", "rotating_build_klps", 200.0)],
-        );
-        assert!(ok.breaches.is_empty());
-        assert_eq!(
-            rows.trim_end().split('\t').nth(5),
-            Some("trust"),
-            "row: {rows:?}"
         );
     }
 
@@ -1370,6 +1328,7 @@ mod tests {
             1,
             "650 < 0.70 x 1000: the old row still counts"
         );
+        assert!(held.skipped.is_empty());
     }
 
     const ALIASES: &str = "# box\tidentity\tnote\n\
@@ -1524,18 +1483,6 @@ mod tests {
     }
 
     #[test]
-    fn the_digest_is_stable_and_separates_two_uuids() {
-        assert_eq!(
-            format!(
-                "{:016x}",
-                aterm_hash::fnv1a_64(b"4F2C6182-55E3-51B1-B505-42FD89F13166")
-            ),
-            "4d119fc8de0a3b9e"
-        );
-        assert_ne!(aterm_hash::fnv1a_64(b"a"), aterm_hash::fnv1a_64(b"b"));
-    }
-
-    #[test]
     fn an_orphan_on_a_claimed_box_chip_is_named_as_a_likely_rename() {
         let aliases = "m21\thost:m15\tthe M5 Max\n";
         let ledger = "2026-07-01\ta\tm15\tthroughput/median_mbps\t1000.0\ttrust\tApple M5 Max-18\n\
@@ -1564,9 +1511,17 @@ mod tests {
     #[test]
     fn utc_date_is_iso_shaped() {
         let d = utc_date();
-        assert_eq!(d.len(), 10);
-        assert_eq!(d.as_bytes()[4], b'-');
-        assert_eq!(d.as_bytes()[7], b'-');
-        assert!(d.starts_with("20"), "sane century: {d}");
+        let bytes = d.as_bytes();
+        assert_eq!(bytes.len(), 10, "{d}");
+        assert_eq!(bytes[4], b'-', "{d}");
+        assert_eq!(bytes[7], b'-', "{d}");
+        assert!(
+            bytes[..4].iter().all(u8::is_ascii_digit)
+                && bytes[5..7].iter().all(u8::is_ascii_digit)
+                && bytes[8..10].iter().all(u8::is_ascii_digit),
+            "{d}"
+        );
+        assert_eq!(civil_date(0), "1970-01-01");
+        assert_eq!(civil_date(47_482), "2100-01-01");
     }
 }

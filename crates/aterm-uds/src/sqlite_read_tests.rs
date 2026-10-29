@@ -38,11 +38,7 @@ fn create_table_ddl_extracts_columns_and_rowid_alias() {
     assert_eq!(aliased.rowid_alias_col, Some(0));
     assert_eq!(
         aliased.defaults,
-        [
-            SqlValue::Null,
-            SqlValue::Text("a,b".to_owned()),
-            SqlValue::Null
-        ]
+        [SqlValue::Null, SqlValue::Text("a,b".into()), SqlValue::Null]
     );
 
     let composite = parse_create_table(
@@ -65,7 +61,10 @@ fn create_table_ddl_extracts_columns_and_rowid_alias() {
     .expect("reordered without rowid");
     assert_eq!(reordered_wr.columns, ["payload", "k1", "k2", "extra"]);
     assert_eq!(reordered_wr.disk_to_table, Some(vec![2, 1, 0, 3]));
-    assert_eq!(reordered_wr.defaults[3], SqlValue::Blob(b"AB".to_vec()));
+    assert_eq!(
+        reordered_wr.defaults[3],
+        SqlValue::Blob(b"AB".as_slice().into())
+    );
 
     let col_wr =
         parse_create_table("CREATE TABLE col_wr (val TEXT, k TEXT PRIMARY KEY) WITHOUT ROWID")
@@ -135,10 +134,12 @@ fn create_table_ddl_extracts_columns_and_rowid_alias() {
     // IEEE-754 NaN in serial type 7 decodes to `SqlValue::Null`, matching SQLite's `vdbeaux.c`.
     let mut nan_record = vec![2u8, 7u8];
     nan_record.extend_from_slice(&f64::NAN.to_bits().to_be_bytes());
+    let mut nan_vals = Vec::new();
     assert_eq!(
-        decode_record(&nan_record, TextEncoding::Utf8),
-        Some(vec![SqlValue::Null])
+        decode_record_into(&nan_record, TextEncoding::Utf8, &mut nan_vals),
+        Some(())
     );
+    assert_eq!(nan_vals, vec![SqlValue::Null]);
 }
 
 #[test]
@@ -506,7 +507,7 @@ mod live_sqlite {
             let rows = crate::foreign_db::read_bytes(&quirk_db, 16 << 20, |main, wal| {
                 scan_table(main, wal, tbl, |schema, row| {
                     Some((
-                        row.get(schema.column_index("id")?)?.clone(),
+                        row.get(schema.column_index("id")?)?.clone().into_owned(),
                         row.get(schema.column_index("body")?)?.to_list_field(),
                     ))
                 })

@@ -628,6 +628,20 @@ pub fn read_copy(pid: u32, start: &str, typed: Option<&Resume>) -> Option<Copy> 
     Some(copy_seen(pid, start, home, seen, &live, typed))
 }
 
+/// Read the record of live process `(pid, start)` under `home` now, with no resume line
+/// validated: what a READ-ONLY copy takes (aterm's rollout tap, with no claim standing). The
+/// identity is looked at before and after the read, as [`read_copy`] does: `None` when it was
+/// not live across it.
+#[must_use]
+pub fn read_seen(home: &Path, pid: u32, start: &str) -> Option<Seen> {
+    use super::restart_stamp::alive_as;
+    if !alive_as(pid, start) {
+        return None;
+    }
+    let seen = read_record(&record_path(home, pid));
+    alive_as(pid, start).then_some(seen)
+}
+
 /// Exit classification derived from the last live [`struct@Copy`] ([`verdict`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {

@@ -267,6 +267,15 @@ impl TrailRig {
         }
     }
 
+    /// Preview `live` in place of `prism_glass::LIVE` on every frame the window's light latch
+    /// admits from now on, or restore `LIVE` with `None` (a script's `live <level>`): a frame the
+    /// latch refuses stays off whatever the level.
+    pub fn live(&mut self, live: Option<aterm_effects::cursor_glow::Live>) {
+        if let Some(ws) = self.app.windows.get_mut(&self.wid) {
+            ws.trail_ground.force_live(live);
+        }
+    }
+
     /// The launch kitty's look, which the pet wears, from `seed`.
     pub fn kitty_seed(&mut self, seed: u64) {
         self.app.launch_kitty = aterm_effects::kitty_registry::KittyLook::for_launch(seed);
@@ -343,6 +352,34 @@ impl TrailRig {
             },
         );
         self.at(at, |app, _| app.on_output_wake(session, at));
+    }
+
+    /// Pane `pane`'s terminal (in pane order, focused or not) reads `bytes` at `at`, as
+    /// [`Self::pty`] hands the focused one its bytes.
+    #[cfg(test)]
+    pub(crate) fn pty_in(&mut self, pane: usize, bytes: &[u8], at: Instant) {
+        let session = self.panes[pane];
+        let term = self
+            .app
+            .pool
+            .get(session)
+            .expect("the pane's session")
+            .term
+            .clone();
+        term_lock(&term).process_at(
+            bytes,
+            aterm_core::terminal::ClockReading {
+                monotonic: at,
+                wall_ms: None,
+            },
+        );
+        self.at(at, |app, _| app.on_output_wake(session, at));
+    }
+
+    /// Pane `pane`'s session (in pane order).
+    #[cfg(test)]
+    pub(crate) fn pane_session(&self, pane: usize) -> u64 {
+        self.panes[pane]
     }
 
     /// Whether `key` is spelled as the control socket's `key` verb takes it.

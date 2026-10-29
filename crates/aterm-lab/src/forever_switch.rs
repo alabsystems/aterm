@@ -27,6 +27,9 @@
 //! session's Autopilot word moved: decided after a <ms> ms settle` ([`wake_after`]), within
 //! [`WAKE_WITHIN_MS`] of a switch at rest; the session's tapes say which wait carried the word
 //! ([`woke_witness`]: `await agent|seq|gone … autopilot=cruise`, answered `OK autopilot land`).
+//!
+//! A write of the word `meta set` did not take (refused, or its client failed) is no switch: the
+//! chain fails on it, its reply named ([`untaken`]).
 
 use std::path::Path;
 
@@ -42,7 +45,7 @@ use super::{
     backoff_due, backoff_named, backoff_streak, idle_words, on, word,
 };
 use crate::Fail;
-use crate::door::Door;
+use crate::door::{Door, Reply};
 use crate::run::Run;
 use crate::util::{now_ms, one_line};
 
@@ -115,8 +118,12 @@ pub struct Switched {
     pub at: i64,
     /// The word set.
     pub word: &'static str,
-    /// What `meta set` answered.
+    /// What `meta set` answered; where it did not take the word, how it failed (its exit status
+    /// and both streams, or why its client could not run).
     pub reply: String,
+    /// Whether `meta set` took the word ([`taken`]): a write it did not is no switch
+    /// ([`untaken`]).
+    pub took: bool,
     /// `status phase=` just before it.
     pub phase: String,
 }
@@ -367,6 +374,18 @@ fn land_within(
     Some(*tl)
 }
 
+/// The first of the lab's writes of the word that `meta set` did not take, as a fail naming its
+/// reply: a refused or failed write is no switch, so what followed it is never judged as one's.
+fn untaken(seen: &Seen, t0: i64) -> Option<Verdict> {
+    let w = seen.cover.words.iter().find(|w| !w.took)?;
+    Some(Verdict::Fail(format!(
+        "the write of {} at +{} did not take: {}",
+        w.word,
+        at(t0, w.at),
+        one_line(&w.reply, 160)
+    )))
+}
+
 /// A verdict of `said` and `bad`: a fail where anything is bad, else a pass.
 fn verdict(said: &[String], bad: &[String]) -> Verdict {
     let said = said.join("; ");
@@ -388,6 +407,9 @@ pub fn judge_at_rest(seen: &Seen, t0: i64) -> Verdict {
             at(t0, seen.end_ms)
         ));
     };
+    if let Some(v) = untaken(seen, t0) {
+        return v;
+    }
     let Some((tw, wl)) = rest_from(seen, t0).filter(|(t, _)| *t < sw.at) else {
         return Verdict::Fail(format!(
             "switched at +{}, but no back-off at rest stood before it",
@@ -446,6 +468,9 @@ pub fn judge_draft(seen: &Seen, t0: i64) -> Verdict {
             at(t0, d.typed_ms)
         ));
     };
+    if let Some(v) = untaken(seen, t0) {
+        return v;
+    }
     let Some(cleared) = d.cleared_ms.filter(|_| d.emptied) else {
         return Verdict::Unobserved(format!(
             "switched at +{} under the draft, but it was not cleared",
@@ -516,8 +541,10 @@ pub fn judge_draft(seen: &Seen, t0: i64) -> Verdict {
     verdict(&said, &bad)
 }
 
-/// SWF: Land then Off within [`FLIP_WITHIN_MS`] in its back-off at rest: its wake journaled,
-/// nothing typed from the flip on, `autopilot=off` standing, watched past the back-off's due.
+/// SWF: Land then Off within [`FLIP_WITHIN_MS`] in its back-off at rest, both writes taken: its
+/// wake journaled, nothing typed from the flip on, `autopilot=off` standing, watched past the
+/// back-off's due. A Land write that did not take would leave Off's wake, word and quiet to pass
+/// for a flip that never raced, so it fails ([`untaken`]).
 #[must_use]
 pub fn judge_flip(seen: &Seen, t0: i64) -> Verdict {
     let [land, off] = seen.cover.words.as_slice() else {
@@ -531,6 +558,9 @@ pub fn judge_flip(seen: &Seen, t0: i64) -> Verdict {
             "the flip wrote {} then {}, not land then off",
             land.word, off.word
         ));
+    }
+    if let Some(v) = untaken(seen, t0) {
+        return v;
     }
     if off.at - land.at > FLIP_WITHIN_MS {
         return Verdict::Unobserved(format!(
@@ -602,6 +632,9 @@ pub fn judge_held(seen: &Seen, t0: i64) -> Verdict {
             at(t0, *ts)
         ));
     };
+    if let Some(v) = untaken(seen, t0) {
+        return v;
+    }
     if sw.at <= *ts {
         return Verdict::Fail(format!(
             "switched at +{}, before the hold at +{}",
@@ -679,6 +712,9 @@ pub fn held_line(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let Some(sw) = seen.cover.words.first() else {
         return Verdict::Unobserved("the switch was never made".into());
     };
+    if let Some(v) = untaken(seen, cx.t0) {
+        return v;
+    }
     let Some((_, sl)) = stall_of(seen, cx.t0) else {
         return Verdict::Unobserved("no hold before the switch".into());
     };
@@ -733,6 +769,9 @@ pub fn judge_busy(seen: &Seen, t0: i64) -> Verdict {
     let Some(sw) = seen.cover.words.first() else {
         return Verdict::Unobserved("the switch was never made".into());
     };
+    if let Some(v) = untaken(seen, t0) {
+        return v;
+    }
     if let Some((tp, _)) = point_after(seen, t0).filter(|(t, _)| *t <= sw.at) {
         return Verdict::Unobserved(format!(
             "the turn's point at +{} came before the switch at +{}",
@@ -809,23 +848,51 @@ pub fn watched(chain: Chain, seen: &Seen, now: i64) -> bool {
     }
 }
 
+/// Whether `meta set`'s reply `r` took the word: its client exited 0 with an answer that is no
+/// `ERR` (one it prints on stderr, exiting 1).
+fn taken(r: &Reply) -> bool {
+    let head = r
+        .stdout
+        .lines()
+        .next()
+        .or_else(|| r.stderr.lines().next())
+        .unwrap_or("")
+        .trim();
+    r.code == 0 && !head.is_empty() && !head.starts_with("ERR")
+}
+
 /// Writes `words` to tab `tab`'s Autopilot in turn, as fast as the socket takes them, each kept in
-/// [`super::Cover::words`].
+/// [`super::Cover::words`] with whether `meta set` took it ([`taken`]); one it did not take is kept
+/// with how it failed, never as a switch made.
 fn set(door: &Door<'_>, tab: &mut Tab, words: &[&'static str]) {
     let phase = word(&on(door, &tab.sid, &["status"]), "phase").unwrap_or_else(|| "?".into());
+    let who = format!("@{}", tab.sid);
     for w in words {
         let t = now_ms();
-        let reply = on(door, &tab.sid, &["meta", "set", "autopilot", w]);
+        let (took, reply) = match door.ctl(&[&who, "meta", "set", "autopilot", w]) {
+            Ok(r) if taken(&r) => (true, r.stdout.trim().to_string()),
+            Ok(r) => (
+                false,
+                format!(
+                    "exit {}: {}",
+                    r.code,
+                    [r.stdout.trim(), r.stderr.trim()].join(" ").trim()
+                ),
+            ),
+            Err(e) => (false, e),
+        };
         println!(
-            "  [{}] +{} word    meta set autopilot {w}: {} (phase={phase})",
+            "  [{}] +{} word    meta set autopilot {w}: {}{} (phase={phase})",
             tab.chain.name(),
             at(tab.t0, t),
-            one_line(reply.trim(), 120)
+            if took { "" } else { "DID NOT TAKE: " },
+            one_line(&reply, 120)
         );
         tab.seen.cover.words.push(Switched {
             at: t,
             word: w,
-            reply: reply.trim().to_string(),
+            reply,
+            took,
             phase: phase.clone(),
         });
     }

@@ -4750,7 +4750,7 @@ fn person_scenarios() -> Vec<Scenario> {
         out.push(Scenario {
             name: format!("KI1016-P6 the act's answer Esc'd, then a person's exchange ({tag})"),
             t0: T0,
-            // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+            // Land carries a person's message once the session worked (owner ruling 2026-10-27).
             policy: land_policy(),
             host: None,
             beats,
@@ -4763,7 +4763,9 @@ fn person_scenarios() -> Vec<Scenario> {
 }
 
 fn run_all(scenarios: &[Scenario], seed: bool) -> Vec<(String, Tally)> {
-    aterm_spec::check::each(scenarios, |sc| run_matrix(sc, seed))
+    aterm_spec::check::each_on(aterm_spec::fs_lane::PLACES, scenarios, |sc| {
+        run_matrix(sc, seed)
+    })
 }
 
 #[test]
@@ -5417,11 +5419,31 @@ fn a_sleep_inside_a_tries_turn_is_no_work_of_the_turns() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A sleep inside a person's turn is no work of it: the message that opens the session is theirs
+/// by the work its turn did awake, and one after the session worked (here after an Esc'd act) is
+/// carried at its turn's end, read first at the wake, whatever its length (owner ruling
+/// 2026-10-27).
 #[test]
 fn a_sleep_inside_a_persons_turn_is_no_work_of_it() {
     let dir = crate::supervise::test_scratch_path("seed-matrix", "sleep-in-person");
     for (what, worked, asleep, left) in SLEEP_IN_PERSON {
-        let sc = sleep_in_person(what, worked, asleep, left);
+        let sc = sleep_in_person(what, worked, asleep, Asked::Opening, left);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let first = run_first(&sc, &dir);
+        let why = format!("{}\n{}", sc.name, first.log.join("\n"));
+        let acts: Vec<i64> = first.acts.iter().map(|a| a.at).collect();
+        let end = T0 + 1 + worked + asleep;
+        if left {
+            assert!(acts.is_empty(), "left to the person: {why}");
+        } else {
+            assert!(
+                acts.first()
+                    .is_some_and(|t| (end..end + 2 * MIN).contains(t)),
+                "continued at the turn's end: {why}"
+            );
+        }
+        let sc = sleep_in_person(what, worked, asleep, Asked::AfterWork, false);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
         let first = run_first(&sc, &dir);
@@ -5431,18 +5453,23 @@ fn a_sleep_inside_a_persons_turn_is_no_work_of_it() {
             panic!("the act: {why}");
         };
         let end = carried + 90 + worked + asleep;
-        if left {
-            assert!(after.is_empty(), "left to the person: {why}");
-        } else {
-            assert!(
-                after
-                    .first()
-                    .is_some_and(|t| (end..end + 2 * MIN).contains(t)),
-                "continued at the turn's end: {why}"
-            );
-        }
+        assert!(
+            after
+                .first()
+                .is_some_and(|t| (end..end + 5 * MIN).contains(t)),
+            "carried after the turn's end, a person's typing and the short streak's back-off \
+             waited out: {why}"
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Where a person's message stands in the session: the one that opens it (no turn before it), or
+/// one after the session worked.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Asked {
+    Opening,
+    AfterWork,
 }
 
 const SLEEP_IN_PERSON: [(&str, i64, i64, bool); 4] = [
@@ -5467,7 +5494,10 @@ const SLEEP_IN_PERSON: [(&str, i64, i64, bool); 4] = [
     ),
 ];
 
-fn sleep_in_person(what: &str, worked: i64, asleep: i64, left: bool) -> Scenario {
+fn sleep_in_person(what: &str, worked: i64, asleep: i64, at: Asked, left: bool) -> Scenario {
+    if at == Asked::Opening {
+        return sleep_in_opening(what, worked, asleep, left);
+    }
     let w0 = work0();
     let progress = "⏺ Stage 3 of 5 is in; stage 4 is next.";
     let p0 = cc(
@@ -5528,7 +5558,7 @@ fn sleep_in_person(what: &str, worked: i64, asleep: i64, left: bool) -> Scenario
     Scenario {
         name: format!("{what}: after an Esc"),
         t0: T0,
-        // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+        // Land carries a person's message once the session worked (owner ruling 2026-10-27).
         policy: land_policy(),
         host: None,
         beats,
@@ -5538,6 +5568,50 @@ fn sleep_in_person(what: &str, worked: i64, asleep: i64, left: bool) -> Scenario
     }
 }
 
+/// A person's message that opens a session no turn ran in yet, its turn `worked` awake and
+/// `asleep` with the Mac asleep, read first at the wake.
+fn sleep_in_opening(what: &str, worked: i64, asleep: i64, left: bool) -> Scenario {
+    let ask = "what is left?";
+    let span = worked + asleep;
+    let end = turn(Some(ask), &["⏺ The parser and the docs."], span, 0);
+    let read_at = if asleep > 0 {
+        Ev::Woke(asleep, cc(&end, &[], ""))
+    } else {
+        Ev::Point(cc(&end, &[], ""))
+    };
+    let mut beats = vec![
+        beat(At::Start(0), "a person's keystroke", Ev::Key),
+        beat(
+            At::Start(1),
+            "a person's message opens the session",
+            Ev::Busy(live(&[], ask)),
+        ),
+        beat(
+            At::Start(1 + span),
+            "the person's turn ends, read first at the wake",
+            read_at,
+        ),
+    ];
+    if !left {
+        beats.push(taken(0, &end, "keep going"));
+    }
+    Scenario {
+        name: format!("{what}: the session's opening message"),
+        t0: T0,
+        // The person's own exchange is Land's to leave where it opens the session (owner rulings
+        // 2026-10-26 and 2026-10-27).
+        policy: land_policy(),
+        host: None,
+        beats,
+        tail_s: 3 * HOUR,
+        take: false,
+        person_on_screen: true,
+    }
+}
+
+/// A sleep before a person's prompt is no part of their turn: the message that opens the session,
+/// sent once the Mac woke with the session fresh, is theirs by its own turn's length (the
+/// exchange's bound applies to the opening message alone under Land, owner ruling 2026-10-27).
 #[test]
 fn a_sleep_before_a_persons_prompt_is_no_part_of_their_turn() {
     let dir = crate::supervise::test_scratch_path("seed-matrix", "sleep-before-person");
@@ -5546,15 +5620,13 @@ fn a_sleep_before_a_persons_prompt_is_no_part_of_their_turn() {
         for asleep in [2 * HOUR, 0] {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("dir");
-            let probe = run_first(&sleep_before_person(work, asleep, 0, left), &dir);
-            let a0 = probe.acts.first().expect("the act").at;
-            let adj = (second - (a0 + SLEPT_BEFORE_ENTER + work)).rem_euclid(60);
+            let adj = (second - (T0 + SLEPT_BEFORE_ENTER + work)).rem_euclid(60);
             let sc = sleep_before_person(work, asleep, adj, left);
             let first = run_first(&sc, &dir);
             let why = format!("{}\n{}", sc.name, first.log.join("\n"));
-            let end = a0 + SLEPT_BEFORE_ENTER + adj + work;
+            let end = T0 + SLEPT_BEFORE_ENTER + adj + work;
             assert_eq!(end.rem_euclid(60), second, "the end's second: {why}");
-            let after: Vec<i64> = first.acts.iter().skip(1).map(|a| a.at).collect();
+            let after: Vec<i64> = first.acts.iter().map(|a| a.at).collect();
             if left {
                 assert!(after.is_empty(), "left to the person: {why}");
             } else {
@@ -5595,82 +5667,36 @@ fn a_sleep_before_a_persons_prompt_is_no_part_of_their_turn() {
 const SLEPT_BEFORE_ENTER: i64 = 2 * HOUR + 5 * MIN + 5;
 
 fn sleep_before_person(work: i64, asleep: i64, adj: i64, left: bool) -> Scenario {
-    let w0 = work0();
-    let progress = "⏺ Stage 3 of 5 is in; stage 4 is next.";
-    let p0 = cc(
-        &with(&w0, &turn(None, &[progress], 0, T0 + 2 * MIN)),
-        &[],
-        "",
-    );
-    let h1 = with(
-        &w0,
-        &s(&[
-            "❯ keep going",
-            "",
-            "⏺ Working on stage 4.",
-            "  ⎿  Interrupted · What should Claude do instead?",
-            "",
-        ]),
-    );
-    let ask1 = "what is left?";
-    let end1 = with(
-        &h1,
-        &turn(Some(ask1), &["⏺ The parser and the docs."], 3, 0),
-    );
     let ask = "now do the parser and the docs";
-    let end = with(
-        &end1,
-        &turn(Some(ask), &["⏺ The parser and the docs are in."], work, 0),
-    );
+    let end = turn(Some(ask), &["⏺ The parser and the docs are in."], work, 0);
     let enter = SLEPT_BEFORE_ENTER + adj;
-    let mut beats = vec![
-        beat(
-            At::Start(0),
-            "the worker's turn",
-            Ev::Busy(live(&w0, "carry on with the task")),
-        ),
-        beat(At::Start(2 * MIN), "the worker's progress", Ev::Point(p0)),
-        taken(0, &w0, "keep going"),
-        beat(At::Act(0, 60), "a person's Esc", Ev::Key),
-        beat(
-            At::Act(0, 60),
-            "the act's turn stopped with Esc",
-            Ev::Point(cc(&h1, &[], "")),
-        ),
-        beat(At::Act(0, 89), "a person's keystroke", Ev::Key),
-        beat(
-            At::Act(0, 90),
-            "a person's question runs",
-            Ev::Busy(live(&h1, ask1)),
-        ),
-        beat(
-            At::Act(0, 93),
-            "their own exchange ends: left to them",
-            Ev::Point(cc(&end1, &[], "")),
-        ),
-    ];
+    let mut beats = vec![beat(
+        At::Start(0),
+        "a session nobody has asked anything",
+        Ev::Point(cc(&[], &[], "")),
+    )];
     if asleep > 0 {
         beats.push(beat(
-            At::Act(0, enter - 5),
+            At::Start(enter - 5),
             "the Mac woke, idle",
-            Ev::Woke(asleep, cc(&end1, &[], "")),
+            Ev::Woke(asleep, cc(&[], &[], "")),
         ));
     }
     beats.extend([
-        beat(At::Act(0, enter - 1), "a person's keystroke", Ev::Key),
+        beat(At::Start(enter - 1), "a person's keystroke", Ev::Key),
         beat(
-            At::Act(0, enter),
-            "a person's message runs",
-            Ev::Busy(live(&end1, ask)),
+            At::Start(enter),
+            "a person's message opens the session",
+            Ev::Busy(live(&[], ask)),
         ),
         beat(
-            At::Act(0, enter + work),
+            At::Start(enter + work),
             "the person's turn ends",
             Ev::Point(cc(&end, &[], "")),
         ),
     ]);
     if !left {
-        beats.push(taken(1, &end, "keep going"));
+        beats.push(taken(0, &end, "keep going"));
     }
     let mac = if asleep > 0 {
         "asleep before it"
@@ -5680,7 +5706,8 @@ fn sleep_before_person(work: i64, asleep: i64, adj: i64, left: bool) -> Scenario
     Scenario {
         name: format!("a person's {work} s turn, the Mac {mac} (adj {adj})"),
         t0: T0,
-        // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+        // The person's own exchange is Land's to leave where it opens the session (owner rulings
+        // 2026-10-26 and 2026-10-27).
         policy: land_policy(),
         host: None,
         beats,
@@ -5690,6 +5717,9 @@ fn sleep_before_person(work: i64, asleep: i64, adj: i64, left: bool) -> Scenario
     }
 }
 
+/// Sleeps after a person's exchange that opened the session leave it theirs for a loop that
+/// follows: attached after the last wake, with books cut while the message ran, it types nothing,
+/// as the first loop did.
 #[test]
 fn sleeps_after_a_persons_exchange_leave_it_theirs_for_a_loop_that_follows() {
     let dir = crate::supervise::test_scratch_path("seed-matrix", "exchange-then-sleeps");
@@ -5699,16 +5729,16 @@ fn sleeps_after_a_persons_exchange_leave_it_theirs_for_a_loop_that_follows() {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
         let mut first = run_first(&sc, &dir);
-        let a0 = first.acts.first().expect("the act").at;
         let why = format!("{}\n{}", sc.name, first.log.join("\n"));
-        assert_eq!(first.acts.len(), 1, "left to the person: {why}");
+        assert!(first.acts.is_empty(), "left to the person: {why}");
+        let asked = T0 + exchange_asked();
         assert_eq!(
-            (a0 + 90 + EXCHANGE_THEN_SLEEPS).rem_euclid(60),
+            (asked + EXCHANGE_THEN_SLEEPS).rem_euclid(60),
             58,
             "the end's second: {why}"
         );
-        let rows = before_ms(&first.stamped, (a0 + 91) * 1000);
-        let journal = before_ms(&first.journal, (a0 + 91) * 1000);
+        let rows = before_ms(&first.stamped, (asked + 1) * 1000);
+        let journal = before_ms(&first.journal, (asked + 1) * 1000);
         let last_wake = first.events.iter().map(|e| e.0).max().expect("events");
         first.machine = Machine::default();
         let books = Books {
@@ -5720,7 +5750,7 @@ fn sleeps_after_a_persons_exchange_leave_it_theirs_for_a_loop_that_follows() {
             &sc,
             &first,
             books,
-            (last_wake + 1, 1, Some(a0)),
+            (last_wake + 1, 0, None),
             None,
             &dir,
             true,
@@ -5736,61 +5766,35 @@ fn sleeps_after_a_persons_exchange_leave_it_theirs_for_a_loop_that_follows() {
 
 const EXCHANGE_THEN_SLEEPS: i64 = 5 * MIN + 28;
 
+/// When the opening message of [`exchange_then_sleeps`] runs, after `T0`: its turn ends at second
+/// 58 of a minute.
+fn exchange_asked() -> i64 {
+    1 + (57 - (T0 + EXCHANGE_THEN_SLEEPS)).rem_euclid(60)
+}
+
 fn exchange_then_sleeps(s1: i64, s2: i64) -> Scenario {
-    let w0 = work0();
-    let progress = "⏺ Stage 3 of 5 is in; stage 4 is next.";
-    let p0 = cc(
-        &with(&w0, &turn(None, &[progress], 0, T0 + 2 * MIN)),
-        &[],
-        "",
-    );
-    let h1 = with(
-        &w0,
-        &s(&[
-            "❯ keep going",
-            "",
-            "⏺ Working on stage 4.",
-            "  ⎿  Interrupted · What should Claude do instead?",
-            "",
-        ]),
-    );
     let ask = "what is left?";
     let work = EXCHANGE_THEN_SLEEPS;
-    let end1 = with(
-        &h1,
-        &turn(Some(ask), &["⏺ The parser and the docs."], work, 0),
-    );
+    let asked = exchange_asked();
+    let end1 = turn(Some(ask), &["⏺ The parser and the docs."], work, 0);
     let mut beats = vec![
+        beat(At::Start(asked - 1), "a person's keystroke", Ev::Key),
         beat(
-            At::Start(0),
-            "the worker's turn",
-            Ev::Busy(live(&w0, "carry on with the task")),
-        ),
-        beat(At::Start(2 * MIN), "the worker's progress", Ev::Point(p0)),
-        taken(0, &w0, "keep going"),
-        beat(At::Act(0, 60), "a person's Esc", Ev::Key),
-        beat(
-            At::Act(0, 60),
-            "the act's turn stopped with Esc",
-            Ev::Point(cc(&h1, &[], "")),
-        ),
-        beat(At::Act(0, 89), "a person's keystroke", Ev::Key),
-        beat(
-            At::Act(0, 90),
-            "a person's message runs",
-            Ev::Busy(live(&h1, ask)),
+            At::Start(asked),
+            "a person's message opens the session",
+            Ev::Busy(live(&[], ask)),
         ),
         beat(
-            At::Act(0, 90 + work),
+            At::Start(asked + work),
             "their own exchange ends: left to them",
             Ev::Point(cc(&end1, &[], "")),
         ),
     ];
-    let mut t = 90 + work + 5;
+    let mut t = asked + work + 5;
     if s1 > 0 {
         t += s1;
         beats.push(beat(
-            At::Act(0, t),
+            At::Start(t),
             "the Mac woke from its first sleep",
             Ev::Woke(s1, cc(&end1, &[], "")),
         ));
@@ -5798,7 +5802,7 @@ fn exchange_then_sleeps(s1: i64, s2: i64) -> Scenario {
     }
     t += s2;
     beats.push(beat(
-        At::Act(0, t),
+        At::Start(t),
         "the Mac woke from its last sleep",
         Ev::Woke(s2, cc(&end1, &[], "")),
     ));
@@ -5810,7 +5814,8 @@ fn exchange_then_sleeps(s1: i64, s2: i64) -> Scenario {
     Scenario {
         name,
         t0: T0,
-        // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+        // The person's own exchange is Land's to leave where it opens the session (owner rulings
+        // 2026-10-26 and 2026-10-27).
         policy: land_policy(),
         host: None,
         beats,
@@ -5906,11 +5911,9 @@ fn a_loop_that_follows_across_a_sleep_types_as_the_first_loop_at_every_handoff()
     let slept: Vec<Scenario> = SLEEP_IN_TRY
         .iter()
         .map(|&(what, ran, span, asleep, _)| sleep_in_try(what, ran, span, asleep))
-        .chain(
-            SLEEP_IN_PERSON
-                .iter()
-                .map(|&(what, worked, asleep, left)| sleep_in_person(what, worked, asleep, left)),
-        )
+        .chain(SLEEP_IN_PERSON.iter().map(|&(what, worked, asleep, _)| {
+            sleep_in_person(what, worked, asleep, Asked::AfterWork, false)
+        }))
         .collect();
     let runs = run_all(&slept, true);
     let cells: usize = runs.iter().map(|(_, t)| t.cells).sum();
@@ -6373,13 +6376,22 @@ fn a_persons_exchange_read_running_by_the_loop_before_is_dated_from_that_read() 
     std::fs::create_dir_all(&dir).expect("dir");
     let now_ms = T0 * 1000;
     let point = approvals::point_reason(approvals::Carried::streak(0), false);
-    for (ran_min, key_ms, left) in [(2, 10_000, true), (2, 130_000, true), (15, 10_000, false)] {
-        let ledger = dir.join(format!("books-{ran_min}-{key_ms}.jsonl"));
+    // The opening turn a restart cut (the books hold its turn-ran row alone) is still the one that
+    // opens the session: the person's own exchange where it is short; once a point is recorded the
+    // session worked, and Land carries the person's message whatever its date (owner ruling
+    // 2026-10-27).
+    for (worked, ran_min, key_ms, left) in [
+        (false, 2, 10_000, true),
+        (false, 15, 10_000, false),
+        (true, 2, 10_000, false),
+        (true, 2, 130_000, false),
+    ] {
+        let ledger = dir.join(format!("books-{worked}-{ran_min}-{key_ms}.jsonl"));
         let rows = [
             (20, approvals::RULE_POINT, point.as_str()),
             (ran_min, approvals::RULE_TURN_RAN, approvals::TURN_RAN),
         ];
-        let body: String = rows
+        let body: String = rows[usize::from(!worked)..]
             .iter()
             .map(|(ago_min, rule_id, reason)| {
                 let row = Row {
@@ -6423,7 +6435,8 @@ fn a_persons_exchange_read_running_by_the_loop_before_is_dated_from_that_read() 
         s.ctl.served = 0;
         let mut p = point_at(&s, reply, 102);
         p.screen.human = crate::supervise::screen::HumanInput::Ago(key_ms);
-        // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+        // The person's own exchange is Land's to leave where it opens the session (owner rulings
+        // 2026-10-26 and 2026-10-27).
         let land = SuperviseOpts {
             policy: land_policy(),
             ..auto(30)
@@ -6432,7 +6445,7 @@ fn a_persons_exchange_read_running_by_the_loop_before_is_dated_from_that_read() 
         assert_eq!(
             s.turn_end.left_to_person(),
             left,
-            "read running {ran_min} min ago, the key {key_ms} ms ago"
+            "worked={worked}: read running {ran_min} min ago, the key {key_ms} ms ago"
         );
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -6727,7 +6740,9 @@ fn an_acts_answer_no_loop_read_run_stopped_by_an_esc_ends_the_carry_for_a_loop_t
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
         let first = run_first(&sc, &dir);
-        assert!(first.acts.len() <= 1, "{}: {:?}", sc.name, first.acts);
+        // The act, then Land's carry after the person's message: the session worked before it
+        // (owner ruling 2026-10-27).
+        assert_eq!(first.acts.len(), 2, "{}: {:?}", sc.name, first.acts);
         let act = first.acts.first().expect("the first loop's act").at;
         let esc = first
             .events
@@ -7124,12 +7139,14 @@ fn restored_cells(sc: &Scenario, i: usize, noted: bool, owed: bool) -> (usize, V
 fn a_loop_in_a_tab_a_cold_restore_reopened_types_as_the_first_loop_at_every_handoff() {
     let run = |scenarios: &[Scenario], noted: bool, owed: bool| {
         let indexed: Vec<(usize, &Scenario)> = scenarios.iter().enumerate().collect();
-        aterm_spec::check::each(&indexed, |&(i, sc)| restored_cells(sc, i, noted, owed))
-            .into_iter()
-            .fold((0, Vec::new()), |(c, mut b), (c1, b1)| {
-                b.extend(b1);
-                (c + c1, b)
-            })
+        aterm_spec::check::each_on(aterm_spec::fs_lane::PLACES, &indexed, |&(i, sc)| {
+            restored_cells(sc, i, noted, owed)
+        })
+        .into_iter()
+        .fold((0, Vec::new()), |(c, mut b), (c1, b1)| {
+            b.extend(b1);
+            (c + c1, b)
+        })
     };
     let all = scenarios();
     let (cells, broken) = run(&all, true, false);

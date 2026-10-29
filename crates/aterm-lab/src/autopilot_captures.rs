@@ -67,16 +67,16 @@ impl Who {
         }
     }
 
-    /// Why it draws no chip on this tree, so its rest shots have no hovered title beside them;
-    /// `None` where it draws one on every scene, and a rest shot with no chip is a
-    /// [`Fault::NoChip`]. Each of the three supervised harnesses draws a footer, so a chip, on
-    /// every scene. agy draws its chip under Autopilot Off too: only an off harness switch (the
-    /// master's or its agent's) leaves its footer bare, and no scene turns one off.
+    /// Why its rest shots may show no chip, so no hovered title beside them; `None` where it
+    /// draws one on every scene, and a rest shot with no chip is a [`Fault::NoChip`]. Each of the
+    /// three supervised harnesses draws a footer, so a chip, on every scene. agy draws its chip
+    /// under Autopilot Off too: only an off harness switch (the master's or its agent's) leaves
+    /// its footer bare, and no scene turns one off.
     #[must_use]
     pub const fn chipless(self) -> Option<&'static str> {
         match self {
             Who::Agent(_) => None,
-            Who::CodexAlab => Some(NO_CHIP_UNTIL_2D),
+            Who::CodexAlab => Some(PAD_CHIP_UNREAD),
         }
     }
 
@@ -88,9 +88,11 @@ impl Who {
     }
 }
 
-/// Why codex-alab takes no hovered title: no chip line until 2d.
-pub const NO_CHIP_UNTIL_2D: &str =
-    "codex-alab draws no chip on this tree (chrome's why=no-footer) until 2d (§14.2, with 8b)";
+/// Why codex-alab takes no hovered title: its chip is on its composer's slab pad (8b), and this
+/// verb looks for a chip on the `─` rules alone (`rule_rows`, `CHIP_COLS`); the recording
+/// predates the chip.
+pub const PAD_CHIP_UNREAD: &str = "codex-alab's chip is on its slab pad (8b), on no rule this \
+     verb reads; the recording predates it (chrome's why=no-footer)";
 
 /// A scene the captures show.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

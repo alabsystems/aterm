@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 
 use super::super::config::{BreakGrant, StuckBreakGrant, SupervisorConfig};
 use super::super::facts::{EpisodeKey, Fact, FactKind, FactsState};
-use super::super::occupancy::door::{self, AtWrite, FactDoor, StuckVerdict, Told};
+use super::super::occupancy::door::{self, AtWrite, FactDoor, LeftRow, StuckVerdict, Told};
+use super::super::occupancy::fault::{Fault, armed};
 use super::super::occupancy::rules::Books;
 use super::super::occupancy::templates;
-use super::super::policy::turn_end::{TurnEndAction, carries_fact, fact_may_ride};
+use super::super::policy::turn_end::{RideFact, TurnEndAction, carries_fact, fact_may_ride};
 use super::approvals::Outcome;
 use super::occupancy_loop::ASK_EVERY_MS;
 use super::turn_end_loop::Written;
@@ -23,6 +24,12 @@ pub(super) struct FactsWatch {
     pub(super) state: FactsState,
     /// The fact the act decided last carries ([`Session::fact_for`]), told once it is typed.
     offered: Option<Fact>,
+    /// The declared wake's fact the act decided last carries (`Session::wake_ride`), claimed
+    /// just before the act is typed and told once it is typed with it.
+    pub(super) offered_wake: Option<RideFact>,
+    /// Under `observe`, the declared wake (its ordinal and episode) the act decided last would
+    /// have carried under `prompt` (`Session::wake_ride`): booked once the act is typed.
+    pub(super) offered_would: Option<(u16, u64)>,
     /// The stuck episode whose write made its reads and wrote nothing, with when (the hold
     /// clock's milliseconds) its reads may be made again.
     again: Option<(EpisodeKey, i64)>,
@@ -64,9 +71,19 @@ impl<C: Ctl> Session<'_, C> {
         self.facts.state.pending(reading.as_ref(), now_ms)
     }
 
-    /// The decision is `action`: the fact it carries (`fact`, where it rode) waits for the act.
-    pub(super) fn fact_offer(&mut self, fact: Option<Fact>, action: &TurnEndAction) {
+    /// The decision is `action`: the fact it carries (`fact`, or a declared wake's `wake`, where
+    /// it rode) waits for the act.
+    pub(super) fn fact_offer(
+        &mut self,
+        fact: Option<Fact>,
+        wake: Option<RideFact>,
+        action: &TurnEndAction,
+    ) {
         self.facts.offered = fact.filter(|f| carries_fact(action, f));
+        self.facts.offered_wake = wake.filter(|w| carries_fact(action, w.fact()));
+        if !fact_may_ride(&self.turn_end, action) {
+            self.facts.offered_would = None;
+        }
     }
 
     /// Books the intent row for the fact `action` carries before the write.
@@ -122,6 +139,18 @@ impl<C: Ctl> Session<'_, C> {
             &door::fact_outcome_reason(fact.key, FactDoor::TurnEnd, told),
             seq,
         );
+    }
+
+    /// The act the fact rode was written and not submitted (`Written::Left`): its line stands
+    /// left in the composer ([`Self::left_write`]), told or released at the next look; under the
+    /// planted `ReleaseOnLeft`, skipped as before.
+    pub(super) fn fact_left(&mut self, fact: &Fact, seq: u64, review: &mut dyn Review) {
+        let row = LeftRow::Fact {
+            door: FactDoor::TurnEnd,
+        };
+        if !self.left_write(fact.key, row, &fact.text, seq, review) {
+            self.fact_rode(fact, Some("not-submitted"), seq, review);
+        }
     }
 
     /// Types the session's untold no-progress fact at a settled background break when due.
@@ -260,13 +289,26 @@ impl<C: Ctl> Session<'_, C> {
         );
         let line = templates::stuck_line(&fact.text);
         let point = self.turn_of(screen.clone());
-        let why =
-            match self.type_fact(BreakGrant::StuckBreak(grant), &point, &line, rule, review)? {
-                Some(Written::Submitted) => None,
-                None => Some("unfenced"),
-                Some(Written::Not) => Some("not-written"),
-                Some(Written::Left) => Some("not-submitted"),
-            };
+        let written = self.type_fact(BreakGrant::StuckBreak(grant), &point, &line, rule, review)?;
+        let why = match written {
+            Some(Written::Submitted) => None,
+            None => Some("unfenced"),
+            Some(Written::Not) => Some("not-written"),
+            Some(Written::Left) => Some("not-submitted"),
+        };
+        let row = LeftRow::Fact {
+            door: FactDoor::Break,
+        };
+        if written == Some(Written::Left) && self.left_write(fact.key, row, &line, seq, review) {
+            // Tried again, should a look release it, only past the session's pace; it is the
+            // break's one line, as a typed one is.
+            self.facts.again = Some((
+                fact.key,
+                clock_ms.saturating_add(super::super::occupancy::rules::SESSION_PACE_MS),
+            ));
+            self.facts.said = Some((fact.key, StuckSaid::Skipped("not-submitted")));
+            return Ok(!armed(Fault::StuckLeftNotTheLine));
+        }
         let told = why.map_or(Told::Typed, Told::Skipped);
         if let Some(why) = why {
             self.facts.again = Some((

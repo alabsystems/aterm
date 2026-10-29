@@ -1,0 +1,13 @@
+# claude-code 2.1.312 · COMPOSED 2026-10-28, never captured: the texts are the bundle's (byte offsets into the store's 2.1.312 binary, sha256 6b5ec691…, scratchpad phase-drift-2312/build/wording.md: the confirmation's title `fh.confirmTitle` `Use a {kind}?` @228879139 over [body `confirmBody` `Refills your {limits} now \xB7 {returns} \xB7 your weekly reset day stays {week}` @228879168, dim detail `confirmDetail` @228879263], yes `confirmYes` @228879320 then `No, keep it`, the focus opening on yes; `{limits}` `ar()` @251668807 (`case"five_hour":s.add("5-hour")` @251668904, 2.1.311 `session`)), the frame is the wall dialog's hand-built one (claude-2.1.287-usage-limit-dialog-fullscreen-panel.txt, as the 2.1.304 reset screens), the values are invented · OPEN: replace with a capture (SPEC §6) · the 5-hour reset's confirmation as it opens: its body names the window `5-hour`, its count `five-hour`
+⏺ Suites are running; I'll report the number when it lands.
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Use a 5-hour reset?
+
+   Refills your 5-hour limit now · your weekly reset day stays Oct 9 at 5am
+   2 five-hour resets left · use by Oct 5 at 3pm
+
+   ❯ Yes, use my 5-hour reset
+     No, keep it
+
+   Enter to confirm · Esc to cancel

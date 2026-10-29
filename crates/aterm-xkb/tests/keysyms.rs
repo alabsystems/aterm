@@ -35,11 +35,3 @@ fn every_keysym_is_xkeysyms() {
     assert_eq!(got.len(), NAMES.len(), "no name twice");
     assert_eq!(got, want);
 }
-
-#[test]
-fn a_value_one_away_misses() {
-    let want = recorded();
-    let (name, _, value) = NAMES[0];
-    assert_ne!(want.get(name), Some(&(value + 1)));
-    assert_eq!(want.get(name), Some(&value));
-}

@@ -71,6 +71,14 @@ pub struct Table {
     /// `aterm pkg install --default-set --wait-lock 1800` as each CLI user.
     #[serde(default)]
     pub toolset: Option<bool>,
+    /// `systems.alab.aterm-vault-server` as a system LaunchDaemon on always-on members
+    /// (`Form::Desktop` with AC `sleep = 0`; `NotApplicable` elsewhere).
+    #[serde(default)]
+    pub vault_server: Option<bool>,
+    /// The mDNS host label `aterm-vault-server` advertises (`_alab-vault._tcp`); defaults to the
+    /// host's leading `{tag}` when valid, or `--no-advertise` when `""`.
+    #[serde(default)]
+    pub vault_advertise: Option<String>,
 }
 
 /// The items `table` asks for: `aterm.app`, then `aterm.cli@<user>` for each CLI user, then (with
@@ -115,6 +123,19 @@ pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
             })
             .collect::<Result<_, _>>()?
     };
+    let advertise = match table.vault_advertise.as_deref() {
+        None => {
+            let candidate = super::names::tag(&ctx.host_name);
+            is_dns_label(candidate).then(|| candidate.to_owned())
+        }
+        Some("") => None,
+        Some(label) if is_dns_label(label) => Some(label.to_owned()),
+        Some(label) => {
+            return Err(format!(
+                "[aterm] vault_advertise {label:?} is not a DNS host label"
+            ));
+        }
+    };
     let toolset = table.toolset == Some(true);
     let mut items: Vec<Box<dyn Item>> = vec![Box::new(App {
         version: table.version.clone(),
@@ -137,6 +158,13 @@ pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
             }));
         }
     }
+    let on = table.vault_server.unwrap_or(true);
+    items.push(Box::new(VaultServer {
+        on,
+        desktop: ctx.facts.form == crate::model::Form::Desktop,
+        advertise,
+        users: cli_users,
+    }));
     Ok(items)
 }
 
@@ -756,6 +784,367 @@ fn doctor_says(ran: &Ran, user: &str, to: String) -> Probe {
     }
 }
 
+fn is_dns_label(label: &str) -> bool {
+    (1..=63).contains(&label.len())
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+struct VaultServer {
+    on: bool,
+    desktop: bool,
+    advertise: Option<String>,
+    users: Vec<User>,
+}
+
+impl VaultServer {
+    fn plist_text(&self) -> String {
+        let args = aterm_secrets::service::daemon_serve_args(
+            Path::new(aterm_secrets::service::DAEMON_STORE),
+            self.advertise.as_deref(),
+        );
+        aterm_secrets::service::daemon_plist_text(
+            Path::new(EXE),
+            &args,
+            Path::new(aterm_secrets::service::DAEMON_LOG),
+            Some(BUNDLE_ID),
+        )
+    }
+
+    fn wanted(&self) -> String {
+        match &self.advertise {
+            Some(label) => format!(
+                "{} running in system (advertising {label})",
+                aterm_secrets::service::DAEMON_LABEL
+            ),
+            None => format!(
+                "{} running in system (--no-advertise)",
+                aterm_secrets::service::DAEMON_LABEL
+            ),
+        }
+    }
+}
+
+fn ac_sleep_minutes(sys: &dyn System) -> Result<u64, Probe> {
+    let cmd = Cmd::new(super::power::PMSET).args(["-g", "custom"]);
+    let ran = match sys.run(&cmd) {
+        Ok(ran) if ran.success() => ran,
+        Ok(ran) => {
+            return Err(Probe::Unusable {
+                why: format!("{}: {}", cmd.display(), ran.describe()),
+            });
+        }
+        Err(e) => {
+            return Err(Probe::Unusable {
+                why: format!("{}: {e}", cmd.display()),
+            });
+        }
+    };
+    let sections = super::power::parse_custom(&ran.out());
+    let Some((_, rows)) = sections.iter().find(|(name, _)| name == "AC Power") else {
+        return Err(Probe::NotApplicable {
+            why: "this Mac has no AC Power profile (`pmset -g custom` prints no AC Power section)"
+                .to_owned(),
+        });
+    };
+    let Some((_, value)) = rows.iter().find(|(key, _)| key == "sleep") else {
+        return Err(Probe::NotApplicable {
+            why: "this Mac's AC Power profile has no `sleep` setting".to_owned(),
+        });
+    };
+    value.parse().map_err(|_| Probe::Unusable {
+        why: format!("`pmset -g custom` gave sleep {value:?}, not a number"),
+    })
+}
+
+fn always_on_desktop(sys: &dyn System, ctx: &Ctx) -> Result<(), Probe> {
+    if ctx.facts.form != crate::model::Form::Desktop {
+        return Err(Probe::NotApplicable {
+            why: "only always-on desktop Macs run the vault server as a LaunchDaemon; other Macs \
+                  use the per-login LaunchAgent"
+                .to_owned(),
+        });
+    }
+    let sleep = ac_sleep_minutes(sys)?;
+    if sleep != 0 {
+        return Err(Probe::NotApplicable {
+            why: format!(
+                "this desktop sleeps on AC power (`sleep = {sleep}`); only always-on desktops \
+                 (`sleep = 0`) run the vault server LaunchDaemon"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn daemon_loaded_pid(sys: &dyn System) -> Result<Option<Option<u32>>, String> {
+    let cmd =
+        Cmd::new(super::sharing::LAUNCHCTL).args(aterm_secrets::service::system_launchctl_argv(
+            aterm_secrets::service::SystemLaunchctl::Print(aterm_secrets::service::DAEMON_LABEL),
+        ));
+    match sys.run(&cmd) {
+        Ok(ran) if ran.success() => Ok(Some(aterm_secrets::service::print_pid(&ran.out()))),
+        Ok(ran) if ran.status == Some(super::sharing::NOT_LOADED) => Ok(None),
+        Ok(ran) => Err(format!("{}: {}", cmd.display(), ran.describe())),
+        Err(e) => Err(format!("{}: {e}", cmd.display())),
+    }
+}
+
+fn run_launchctl(sys: &dyn System, args: Vec<String>) -> Result<Ran, String> {
+    let cmd = Cmd::new(super::sharing::LAUNCHCTL).args(args);
+    sys.run(&cmd).map_err(|e| format!("{}: {e}", cmd.display()))
+}
+
+impl Item for VaultServer {
+    fn id(&self) -> String {
+        "aterm.vault-server".to_owned()
+    }
+
+    fn family(&self) -> &'static str {
+        "aterm"
+    }
+
+    fn title(&self) -> String {
+        format!(
+            "the vault server LaunchDaemon {}",
+            if self.on { "on" } else { "off" }
+        )
+    }
+
+    fn probe(&self, sys: &dyn System, ctx: &Ctx) -> Probe {
+        let plist_path = Path::new(aterm_secrets::service::DAEMON_PLIST);
+        if !self.on {
+            let on_disk = match sys.stat(plist_path) {
+                Ok(_) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => {
+                    return Probe::Unusable {
+                        why: format!("{}: {e}", plist_path.display()),
+                    };
+                }
+            };
+            let loaded = match daemon_loaded_pid(sys) {
+                Ok(loaded) => loaded,
+                Err(why) => return Probe::Unusable { why },
+            };
+            return match (on_disk, loaded) {
+                (false, None) => Probe::Ok { now: "off".into() },
+                (true, Some(Some(pid))) => Probe::Change {
+                    from: format!("running in system (pid {pid})"),
+                    to: "off".into(),
+                },
+                (true, _) => Probe::Change {
+                    from: "plist installed".into(),
+                    to: "off".into(),
+                },
+                (false, Some(_)) => Probe::Change {
+                    from: "loaded in system".into(),
+                    to: "off".into(),
+                },
+            };
+        }
+        if let Err(not_here) = always_on_desktop(sys, ctx) {
+            return not_here;
+        }
+        let to = self.wanted();
+        match sys.stat(Path::new(EXE)) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Probe::Change {
+                    from: "aterm is not installed yet".into(),
+                    to,
+                };
+            }
+            Err(e) => {
+                return Probe::Unusable {
+                    why: format!("{EXE}: {e}"),
+                };
+            }
+        }
+        let held = match sys.read_file(plist_path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Probe::Unusable {
+                    why: format!("{}: {e}", plist_path.display()),
+                };
+            }
+        };
+        let loaded = match daemon_loaded_pid(sys) {
+            Ok(loaded) => loaded,
+            Err(why) => return Probe::Unusable { why },
+        };
+        let expected = self.plist_text();
+        let plist_matches = held.as_deref() == Some(expected.as_bytes());
+        match (plist_matches, loaded) {
+            (true, Some(Some(pid))) => Probe::Ok {
+                now: format!(
+                    "{} running in system (pid {pid})",
+                    aterm_secrets::service::DAEMON_LABEL
+                ),
+            },
+            (true, Some(None)) => Probe::Change {
+                from: "loaded in system, not running".into(),
+                to,
+            },
+            (true, None) => Probe::Change {
+                from: "plist installed, not loaded in system".into(),
+                to,
+            },
+            (false, _) if held.is_some() => Probe::Change {
+                from: "stale LaunchDaemon plist".into(),
+                to,
+            },
+            (false, _) => Probe::Change {
+                from: "not installed".into(),
+                to,
+            },
+        }
+    }
+
+    fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
+        let plist_path = Path::new(aterm_secrets::service::DAEMON_PLIST);
+        let label = aterm_secrets::service::DAEMON_LABEL;
+        if !self.on {
+            let bootout = aterm_secrets::service::system_launchctl_argv(
+                aterm_secrets::service::SystemLaunchctl::Bootout(label),
+            );
+            let ran = run_launchctl(sys, bootout)?;
+            if !ran.success()
+                && ran.status != Some(super::sharing::NO_SUCH_PROCESS)
+                && ran.status != Some(super::sharing::NOT_LOADED)
+            {
+                return Err(format!(
+                    "launchctl bootout system/{label}: {}",
+                    ran.describe()
+                ));
+            }
+            sys.remove(plist_path)
+                .map_err(|e| format!("{}: {e}", plist_path.display()))?;
+            return Ok(());
+        }
+        match always_on_desktop(sys, ctx) {
+            Ok(()) => {}
+            Err(Probe::NotApplicable { .. }) => return Ok(()),
+            Err(Probe::Unusable { why }) => return Err(why),
+            Err(other) => return Err(format!("aterm.vault-server: {other:?}")),
+        }
+        // Retire any per-login user LaunchAgent on the same port before starting the daemon.
+        let user_label = aterm_secrets::service::Job::Server.label();
+        for user in &self.users {
+            for domain in [
+                aterm_secrets::service::Domain::Gui,
+                aterm_secrets::service::Domain::User,
+            ] {
+                let _ = run_launchctl(
+                    sys,
+                    aterm_secrets::service::launchctl_argv(
+                        user.uid,
+                        aterm_secrets::service::Launchctl::Bootout(domain, user_label),
+                    ),
+                );
+            }
+            let agent_plist = aterm_secrets::service::plist_path(
+                Path::new(&user.home),
+                aterm_secrets::service::Job::Server,
+            );
+            let _ = sys.remove(&agent_plist);
+        }
+        let store_dir = Path::new(aterm_secrets::service::DAEMON_STORE);
+        sys.create_dir_all(store_dir, 0o700)
+            .map_err(|e| format!("{}: {e}", store_dir.display()))?;
+        if let Some(log_dir) = Path::new(aterm_secrets::service::DAEMON_LOG).parent() {
+            sys.create_dir_all(log_dir, 0o755)
+                .map_err(|e| format!("{}: {e}", log_dir.display()))?;
+        }
+        if let Some(daemons) = plist_path.parent() {
+            sys.create_dir_all(daemons, 0o755)
+                .map_err(|e| format!("{}: {e}", daemons.display()))?;
+        }
+        let expected = self.plist_text();
+        sys.write_file(plist_path, expected.as_bytes(), 0o644)
+            .map_err(|e| format!("{}: {e}", plist_path.display()))?;
+        sys.chown(plist_path, 0, 0)
+            .map_err(|e| format!("chown {}: {e}", plist_path.display()))?;
+        if daemon_loaded_pid(sys)?.is_some() {
+            let bootout = aterm_secrets::service::system_launchctl_argv(
+                aterm_secrets::service::SystemLaunchctl::Bootout(label),
+            );
+            let ran = run_launchctl(sys, bootout)?;
+            if !ran.success()
+                && ran.status != Some(super::sharing::NO_SUCH_PROCESS)
+                && ran.status != Some(super::sharing::NOT_LOADED)
+            {
+                return Err(format!(
+                    "launchctl bootout system/{label}: {}",
+                    ran.describe()
+                ));
+            }
+        }
+        let enable = run_launchctl(sys, vec!["enable".into(), format!("system/{label}")])?;
+        if !enable.success() {
+            return Err(format!(
+                "launchctl enable system/{label}: {}",
+                enable.describe()
+            ));
+        }
+        let bootstrap = run_launchctl(
+            sys,
+            aterm_secrets::service::system_launchctl_argv(
+                aterm_secrets::service::SystemLaunchctl::Bootstrap(plist_path),
+            ),
+        )?;
+        if !bootstrap.success() {
+            return Err(format!(
+                "launchctl bootstrap system {}: {}",
+                plist_path.display(),
+                bootstrap.describe()
+            ));
+        }
+        let kickstart = run_launchctl(
+            sys,
+            aterm_secrets::service::system_launchctl_argv(
+                aterm_secrets::service::SystemLaunchctl::Kickstart(label),
+            ),
+        )?;
+        if !kickstart.success() {
+            return Err(format!(
+                "launchctl kickstart system/{label}: {}",
+                kickstart.describe()
+            ));
+        }
+        Ok(())
+    }
+
+    fn revert(&self) -> Option<String> {
+        let label = aterm_secrets::service::DAEMON_LABEL;
+        let plist = aterm_secrets::service::DAEMON_PLIST;
+        if self.on {
+            Some(format!(
+                "{} bootout system/{label}; /bin/rm -f {plist}",
+                super::sharing::LAUNCHCTL
+            ))
+        } else {
+            Some("aterm machines apply (with [aterm] vault_server = true)".to_owned())
+        }
+    }
+
+    fn effect(&self) -> Effect {
+        Effect::Now
+    }
+
+    fn after(&self) -> Vec<String> {
+        if self.on && self.desktop {
+            vec!["aterm.app".into(), "power.ac.sleep".into()]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,6 +1183,8 @@ mod tests {
             owner: None,
             cli_users: vec![],
             toolset: None,
+            vault_server: None,
+            vault_advertise: None,
         }
     }
 
@@ -818,7 +1209,15 @@ mod tests {
         t.toolset = Some(true);
         let items = expand(&t, &ctx).unwrap();
         let ids: Vec<String> = items.iter().map(|i| i.id()).collect();
-        assert_eq!(ids, ["aterm.app", "aterm.cli@admin", "aterm.toolset@admin"]);
+        assert_eq!(
+            ids,
+            [
+                "aterm.app",
+                "aterm.cli@admin",
+                "aterm.toolset@admin",
+                "aterm.vault-server"
+            ]
+        );
         assert_eq!(
             items[1].after(),
             ["aterm.app", "developer.command-line-tools"]
@@ -1224,7 +1623,7 @@ mod tests {
         let mut t = table();
         t.toolset = Some(true);
         let items = expand(&t, &ctx).unwrap();
-        let toolset = &items[2..];
+        let toolset = &items[2..3];
         let rows = crate::engine::run(
             toolset,
             Mode::Plan,
@@ -1410,5 +1809,199 @@ mod tests {
                 .contains("bootstrap failed")
         );
         assert_eq!(items[2].stood_aside(), None);
+    }
+
+    #[test]
+    fn always_on_desktop_installs_vault_server_launchdaemon_before_login_and_retires_user_agent() {
+        let pmset_always_on = "AC Power:\n sleep\t\t0\n displaysleep\t15\n";
+        let print_cmd = format!(
+            "{} print system/{}",
+            super::super::sharing::LAUNCHCTL,
+            aterm_secrets::service::DAEMON_LABEL
+        );
+        let enable_cmd = format!(
+            "{} enable system/{}",
+            super::super::sharing::LAUNCHCTL,
+            aterm_secrets::service::DAEMON_LABEL
+        );
+        let bootstrap_cmd = format!(
+            "{} bootstrap system {}",
+            super::super::sharing::LAUNCHCTL,
+            aterm_secrets::service::DAEMON_PLIST
+        );
+        let kickstart_cmd = format!(
+            "{} kickstart system/{}",
+            super::super::sharing::LAUNCHCTL,
+            aterm_secrets::service::DAEMON_LABEL
+        );
+        let user_agent_plist =
+            "/Users//admin/Library/LaunchAgents/systems.alab.aterm-secrets-server.plist";
+
+        let sys = Fake::root();
+        sys.file(EXE, b"");
+        // Negative control: before login (`console_user == None` after a reboot), a per-user
+        // LaunchAgent plist on disk is not loaded in `system` and leaves the vault server absent.
+        sys.file(user_agent_plist, b"<plist/>");
+        sys.on("/usr/bin/pmset -g custom", ok(pmset_always_on));
+        sys.on(&print_cmd, err(super::super::sharing::NOT_LOADED, ""));
+        sys.on(&print_cmd, err(super::super::sharing::NOT_LOADED, ""));
+        sys.on(
+            &print_cmd,
+            ok("system/systems.alab.aterm-vault-server = {\n\tpid = 7484\n}\n"),
+        );
+
+        let mut ctx = ctx_with(&sys, &[], true);
+        ctx.facts.form = crate::model::Form::Desktop;
+        ctx.facts.console_user = None;
+        ctx.console = None;
+        ctx.host_name = "m19-Mac-Studio-M4-Max".into();
+
+        let t = table();
+        assert_eq!(t.vault_server, None, "C7a LaunchDaemon defaults on (F6)");
+        let items = expand(&t, &ctx).unwrap();
+        let daemon = items
+            .iter()
+            .find(|item| item.id() == "aterm.vault-server")
+            .unwrap();
+        assert_eq!(daemon.after(), ["aterm.app", "power.ac.sleep"]);
+        assert_eq!(
+            daemon.probe(&sys, &ctx),
+            Probe::Change {
+                from: "not installed".into(),
+                to: "systems.alab.aterm-vault-server running in system (advertising m19)".into(),
+            }
+        );
+
+        sys.on("/usr/bin/pmset -g custom", ok(pmset_always_on));
+        sys.on(
+            &format!(
+                "{} bootout gui/501/systems.alab.aterm-secrets-server",
+                super::super::sharing::LAUNCHCTL
+            ),
+            err(super::super::sharing::NO_SUCH_PROCESS, ""),
+        );
+        sys.on(
+            &format!(
+                "{} bootout user/501/systems.alab.aterm-secrets-server",
+                super::super::sharing::LAUNCHCTL
+            ),
+            err(super::super::sharing::NO_SUCH_PROCESS, ""),
+        );
+        sys.on(&enable_cmd, ok(""));
+        sys.on(&bootstrap_cmd, ok(""));
+        sys.on(&kickstart_cmd, ok(""));
+        daemon.apply(&sys, &ctx).unwrap();
+
+        assert!(
+            sys.read_file(Path::new(user_agent_plist)).is_err(),
+            "per-login LaunchAgent plist retired so port 7484 is not contested at login"
+        );
+        let written = String::from_utf8(
+            sys.read_file(Path::new(aterm_secrets::service::DAEMON_PLIST))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(written.contains("<string>systems.alab.aterm-vault-server</string>"));
+        assert!(written.contains("<string>--advertise</string>"));
+        assert!(written.contains("<string>m19</string>"));
+        assert!(!written.contains("LimitLoadToSessionType"));
+        assert!(!written.contains("<key>HOME</key>"));
+
+        // After reboot before any login (`console_user == None`), `system/systems.alab.aterm-vault-server`
+        // is loaded and running.
+        sys.on("/usr/bin/pmset -g custom", ok(pmset_always_on));
+        assert_eq!(
+            daemon.probe(&sys, &ctx),
+            Probe::Ok {
+                now: "systems.alab.aterm-vault-server running in system (pid 7484)".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn laptops_and_sleeping_desktops_keep_launchagent_and_vault_server_off_removes_daemon() {
+        let sys = Fake::root();
+        sys.file(EXE, b"");
+        let mut ctx = ctx_with(&sys, &[], true);
+        ctx.host_name = "m22-MacBook-Pro".into();
+        ctx.facts.form = crate::model::Form::Laptop;
+
+        let mut t = table();
+        assert_eq!(t.vault_server, None, "C7a LaunchDaemon defaults on (F6)");
+        let items = expand(&t, &ctx).unwrap();
+        let daemon = items.last().unwrap();
+        assert!(daemon.after().is_empty());
+        assert!(matches!(
+            daemon.probe(&sys, &ctx),
+            Probe::NotApplicable { ref why } if why.contains("LaunchAgent")
+        ));
+        let laptop_run = crate::engine::run(
+            &items,
+            Mode::Apply,
+            &sys,
+            &ctx,
+            &mut crate::engine::NoJournal,
+        );
+        assert_eq!(laptop_run[0].outcome, Outcome::Blocked);
+        assert_eq!(laptop_run.last().unwrap().outcome, Outcome::NotApplicable);
+
+        ctx.facts.form = crate::model::Form::Desktop;
+        sys.on("/usr/bin/pmset -g custom", ok("AC Power:\n sleep\t\t10\n"));
+        assert!(matches!(
+            daemon.probe(&sys, &ctx),
+            Probe::NotApplicable { ref why } if why.contains("sleep = 10")
+        ));
+
+        t.vault_advertise = Some("-bad".into());
+        assert!(expand(&t, &ctx).is_err());
+
+        // Turning `vault_server = false` boots out and unlinks an installed daemon even when
+        // `aterm.app` is blocked.
+        let mut off_table = table();
+        off_table.vault_server = Some(false);
+        let off_items = expand(&off_table, &ctx).unwrap();
+        let off = off_items.last().unwrap();
+        assert!(off.after().is_empty());
+        sys.file(aterm_secrets::service::DAEMON_PLIST, b"<plist/>");
+        let print_cmd = format!(
+            "{} print system/{}",
+            super::super::sharing::LAUNCHCTL,
+            aterm_secrets::service::DAEMON_LABEL
+        );
+        let bootout_cmd = format!(
+            "{} bootout system/{}",
+            super::super::sharing::LAUNCHCTL,
+            aterm_secrets::service::DAEMON_LABEL
+        );
+        sys.on(
+            &print_cmd,
+            ok("system/systems.alab.aterm-vault-server = {\n\tpid = 7484\n}\n"),
+        );
+        sys.on(
+            &print_cmd,
+            ok("system/systems.alab.aterm-vault-server = {\n\tpid = 7484\n}\n"),
+        );
+        sys.on(&print_cmd, err(super::super::sharing::NOT_LOADED, ""));
+        assert_eq!(
+            off.probe(&sys, &ctx),
+            Probe::Change {
+                from: "running in system (pid 7484)".into(),
+                to: "off".into(),
+            }
+        );
+        sys.on(&bootout_cmd, ok(""));
+        let off_run = crate::engine::run(
+            &off_items,
+            Mode::Apply,
+            &sys,
+            &ctx,
+            &mut crate::engine::NoJournal,
+        );
+        assert_eq!(off_run[0].outcome, Outcome::Blocked);
+        assert_eq!(off_run.last().unwrap().outcome, Outcome::Changed);
+        assert!(
+            sys.read_file(Path::new(aterm_secrets::service::DAEMON_PLIST))
+                .is_err()
+        );
     }
 }

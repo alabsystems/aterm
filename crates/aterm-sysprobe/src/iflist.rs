@@ -405,11 +405,14 @@ pub fn links_of(buf: &[u8]) -> Vec<LinkReading> {
     let mut out = Vec::new();
     let mut at = 0usize;
     while out.len() < MAX_LINKS {
-        let Some(lead) = buf.get(at..at + 4) else {
+        let Some(rest) = buf.get(at..) else {
             break;
         };
-        let len = usize::from(u16::from_ne_bytes([lead[0], lead[1]]));
-        let Some(msg) = buf.get(at..at + len).filter(|_| len >= 4) else {
+        if rest.len() < 4 {
+            break;
+        }
+        let len = usize::from(u16::from_ne_bytes([rest[0], rest[1]]));
+        let Some(msg) = rest.get(..len).filter(|_| len >= 4) else {
             break;
         };
         at += len;
@@ -562,12 +565,6 @@ pub fn tcp_summary_of_pcblist64(buf: &[u8]) -> Option<TcpSummary> {
         (rtts[(n - 1) / 2] + rtts[n / 2]) * 0.5
     });
     Some(TcpSummary { counts, srtt_ms })
-}
-
-/// Decode Darwin's `net.inet.tcp.pcblist64` buffer into [`TcpCounts`].
-#[must_use]
-pub fn tcp_counts_of_pcblist64(buf: &[u8]) -> Option<TcpCounts> {
-    tcp_summary_of_pcblist64(buf).map(|s| s.counts)
 }
 
 #[cfg(test)]
@@ -978,7 +975,9 @@ mod tests {
             buf.extend_from_slice(&pcb(state, xso));
         }
         buf.extend_from_slice(&xinpgen());
-        let counts = tcp_counts_of_pcblist64(&buf).expect("valid pcblist64");
+        let counts = tcp_summary_of_pcblist64(&buf)
+            .map(|s| s.counts)
+            .expect("valid pcblist64");
         assert_eq!(
             counts,
             TcpCounts {
@@ -994,13 +993,13 @@ mod tests {
 
         // Missing trailer is rejected.
         let without_trailer = &buf[..buf.len() - XINPGEN_SIZE];
-        assert_eq!(tcp_counts_of_pcblist64(without_trailer), None);
+        assert_eq!(tcp_summary_of_pcblist64(without_trailer), None);
 
         // Bad xso_len is rejected.
         let mut bad_xso = xinpgen();
         bad_xso.extend_from_slice(&pcb(4, 99));
         bad_xso.extend_from_slice(&xinpgen());
-        assert_eq!(tcp_counts_of_pcblist64(&bad_xso), None);
+        assert_eq!(tcp_summary_of_pcblist64(&bad_xso), None);
     }
 
     #[test]

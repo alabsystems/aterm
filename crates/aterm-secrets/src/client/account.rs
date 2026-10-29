@@ -77,7 +77,11 @@ impl Admin {
                 commitment = Some(entry::fingerprint(&entry));
             }
         }
-        let control = access.head();
+        let control = if access.is_log_backed() {
+            access.basis()
+        } else {
+            access.head()
+        };
         let authored_ms = aterm_time::unix_millis()
             .ok_or_else(|| Error::new("clock cannot represent an author timestamp"))?;
         Record::issue(

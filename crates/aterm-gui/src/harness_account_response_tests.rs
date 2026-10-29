@@ -16,6 +16,7 @@ fn publish_state(state: &aterm_spec::interp::State) -> [i64; 3] {
         id: MoveId::default(),
         origin: seat.context(),
         to: "work-2".into(),
+        at: AccountAt::Wall,
         login: None,
         process: Snapshot {
             pid: observed.pid + u32::from(state["entry"] == 2),

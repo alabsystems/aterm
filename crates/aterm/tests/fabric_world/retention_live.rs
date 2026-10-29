@@ -204,6 +204,12 @@ fn every_reader_reads_on_past_the_brokers_own_cut() {
                 );
                 return None;
             }
+            // The verb's own 10 s for the bridge's read is no answer about the record (as
+            // bridge_wake reads it): on a loaded machine the read lands later, and this
+            // wait's hang detector bounds it.
+            if header.starts_with("ERR timeout ") {
+                return None;
+            }
             let floor = header
                 .strip_prefix("ERR retained-from=")
                 .and_then(|rest| rest.split_whitespace().next())

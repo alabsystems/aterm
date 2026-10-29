@@ -23,6 +23,9 @@ mod upgrade_policy;
 #[path = "cli_renewal_read_tests.rs"]
 mod renewal_read;
 
+#[path = "cli_renewal_identity_tests.rs"]
+mod renewal_identity;
+
 #[path = "cli_signin_epoch_tests.rs"]
 mod signin_epoch;
 
@@ -48,6 +51,7 @@ fn env_at(tmp: &Tmp) -> Env {
         codex_thread: None,
         agy_conversation: None,
         codex_home: None,
+        codex_login: None,
         now: 1_758_412_800,
         sid: "s-test".to_string(),
         sock: Some(tmp.path().join("no.sock").to_string_lossy().into_owned()),
@@ -71,6 +75,207 @@ fn go(cmd: &Cmd, env: &Env) -> (bool, String, String) {
 
 fn words(s: &str) -> Vec<String> {
     s.split(' ').map(str::to_string).collect()
+}
+
+fn pending_kimi_env(tag: &str) -> (Tmp, Env) {
+    let tmp = tmp_dir(tag);
+    let env = env_at(&tmp);
+    let home = env.home.as_ref().unwrap();
+    std::fs::create_dir_all(home.join(".secrets")).unwrap();
+    std::fs::write(env.config.as_ref().unwrap(), "[fleet]\nmachine = \"m16\"\n").unwrap();
+    std::fs::write(
+        home.join(".secrets/ai-accounts.csv"),
+        "email,computer,kimi\npending@example.test,m16,1\n",
+    )
+    .unwrap();
+    (tmp, env)
+}
+
+#[test]
+fn pending_import_uses_the_source_identity_and_explicit_region() {
+    let (_tmp, env) = pending_kimi_env("import-success");
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = run_accounts_import(
+        Cli::Kimi,
+        &env,
+        "kimi-m16",
+        accounts::Vendor {
+            region: Some(crate::ai::connector::Region::Global),
+            flow: None,
+        },
+        &mut out,
+        &mut err,
+    );
+    assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
+    let roster = Roster::load_for(Cli::Kimi, &env.accounts_roster_for(Cli::Kimi).unwrap()).unwrap();
+    let row = roster.row("kimi-m16").expect("the imported row");
+    assert_eq!(row.email.as_deref(), Some("pending@example.test"));
+    assert_eq!(
+        row.vendor.region,
+        Some(crate::ai::connector::Region::Global)
+    );
+}
+
+#[test]
+fn pending_import_requires_the_preferred_machine() {
+    let (_tmp, env) = pending_kimi_env("import-preferred");
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    std::fs::write(
+        env.home.as_ref().unwrap().join(".secrets/ai-accounts.csv"),
+        "email,computer,kimi\npending@example.test,m22,1\n",
+    )
+    .unwrap();
+    let code = run_accounts_import(
+        Cli::Kimi,
+        &env,
+        "kimi-m22",
+        accounts::Vendor {
+            region: Some(crate::ai::connector::Region::Global),
+            flow: None,
+        },
+        &mut out,
+        &mut err,
+    );
+    assert_eq!(code, ExitCode::from(1));
+    assert!(String::from_utf8_lossy(&err).contains("preferred for m22"));
+    assert!(!env.accounts_roster_for(Cli::Kimi).unwrap().exists());
+}
+
+#[test]
+fn pending_import_does_not_guess_a_missing_region() {
+    let (_tmp, env) = pending_kimi_env("import-region");
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = run_accounts_import(
+        Cli::Kimi,
+        &env,
+        "kimi-m16",
+        accounts::Vendor::default(),
+        &mut out,
+        &mut err,
+    );
+    assert_eq!(code, ExitCode::from(1));
+    assert!(String::from_utf8_lossy(&err).contains("explicit --region"));
+    assert!(!env.accounts_roster_for(Cli::Kimi).unwrap().exists());
+}
+
+#[test]
+fn pending_import_refuses_a_real_region_conflict() {
+    let (_tmp, env) = pending_kimi_env("import-region-conflict");
+    std::fs::write(
+        env.home.as_ref().unwrap().join(".secrets/ai-accounts.csv"),
+        "email,computer,kimi\npending@example.test,m16,global\n",
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = run_accounts_import(
+        Cli::Kimi,
+        &env,
+        "kimi-m16",
+        accounts::Vendor {
+            region: Some(crate::ai::connector::Region::MainlandCn),
+            flow: None,
+        },
+        &mut out,
+        &mut err,
+    );
+    assert_eq!(code, ExitCode::from(1));
+    assert!(
+        String::from_utf8_lossy(&err).contains("another Kimi region"),
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+    assert!(!env.accounts_roster_for(Cli::Kimi).unwrap().exists());
+}
+
+#[test]
+fn kimi_adopts_its_existing_default_login_without_inventing_an_email() {
+    let tmp = tmp_dir("kimi-adopt-default");
+    let env = env_at(&tmp);
+    let (cmd, _) = parse(&words(
+        "accounts adopt-default kimi-m22 --cli kimi --region mainland-cn",
+    ))
+    .expect("the local adoption parses");
+    let (ok, _, err) = go(&cmd, &env);
+    assert!(ok, "{err}");
+    let roster = Roster::load_for(Cli::Kimi, &env.accounts_roster_for(Cli::Kimi).unwrap()).unwrap();
+    let row = roster.row("kimi-m22").expect("the adopted row");
+    assert_eq!(row.dir, None);
+    assert_eq!(row.email, None);
+    assert_eq!(
+        row.vendor.region,
+        Some(crate::ai::connector::Region::MainlandCn)
+    );
+}
+
+#[test]
+fn the_account_table_separates_assignment_readiness_and_local_logins() {
+    let (_tmp, env) = pending_kimi_env("table-readiness");
+    let home = env.home.as_ref().unwrap();
+    std::fs::write(
+        home.join(".secrets/ai-accounts.csv"),
+        "email,computer,kimi,grok\nfirst@example.test,m16,global,\nsecond@example.test,m22,1,\n",
+    )
+    .unwrap();
+    let login = home.join("local-login");
+    login_made_in(&login);
+    std::fs::create_dir_all(login.join("credentials")).unwrap();
+    std::fs::write(login.join("credentials/kimi-code.json"), "{}").unwrap();
+    let roster = accounts::append_row("", "kimi-m22", Class::Dedicated, None).unwrap();
+    let roster =
+        accounts::append_row(&roster, "kimi-local", Class::Dedicated, login.to_str()).unwrap();
+    std::fs::write(env.accounts_roster_for(Cli::Kimi).unwrap(), roster).unwrap();
+    let store = env.accounts_store_for(Cli::Kimi).unwrap();
+    let mut logins = accounts::Logins::default();
+    logins.labels.insert(
+        "kimi-local".to_owned(),
+        accounts::Binding {
+            dir: login.to_str().map(str::to_owned),
+            ..accounts::Binding::default()
+        },
+    );
+    store.save_logins(&logins).unwrap();
+    store
+        .transact(env.now, &mut None, |state| {
+            Ok(accounts::note_sample(
+                state,
+                "kimi-local",
+                accounts::Sample {
+                    session_pct: Some(13),
+                    session_reset: Some(env.now + 1500),
+                    at: env.now,
+                    ..accounts::Sample::default()
+                },
+                env.now,
+            ))
+        })
+        .unwrap();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = run_accounts_source_table(Some(Cli::Kimi), &env, true, &mut out, &mut err);
+    assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
+    let doc: Value = aterm_json::from_slice(&out).unwrap();
+    let rows = doc["pools"][0]["accounts"].as_array().unwrap();
+    let readiness = |label: &str| {
+        rows.iter()
+            .find(|row| row["label"].as_str() == Some(label))
+            .and_then(|row| row["readiness"].as_str())
+            .unwrap()
+    };
+    assert_eq!(readiness("kimi-m16"), "elsewhere");
+    assert_eq!(readiness("kimi-m22"), "needs-region");
+    assert_eq!(readiness("kimi-local"), "usable");
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    assert_eq!(
+        run_accounts_source_table(Some(Cli::Grok), &env, true, &mut out, &mut err),
+        ExitCode::SUCCESS,
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+    let doc: Value = aterm_json::from_slice(&out).unwrap();
+    assert_eq!(doc["pools"][0]["status"].as_str(), Some("needs-source"));
 }
 
 #[test]
@@ -199,6 +404,14 @@ fn the_grammar_parses_what_the_help_text_advertises() {
         (
             "accounts stats --json",
             Cmd::Accounts(AccountsCmd::Stats { json: true }),
+        ),
+        (
+            "accounts refresh --cli kimi --json",
+            Cmd::AccountsOf(AccountsOf {
+                cli: Cli::Kimi,
+                form: AccountsCmd::Refresh { json: true },
+                vendor: accounts::Vendor::default(),
+            }),
         ),
         (
             "accounts add work-2",
@@ -997,8 +1210,8 @@ fn usage_from_codex_tools_folds_its_conversation_at_list_prices() {
     assert!(ok);
     assert_eq!(
         out.lines().next(),
-        Some("gpt ?%/5h · ?%/7d · acct codex · resets ? · none  [source=rollout]"),
-        "{out}"
+        Some("gpt 12%/5h · ?%/7d · acct codex · resets in 365d14h · rollout 0s  [source=rollout]"),
+        "every token count of `count` carries a 12% five-hour window, written after now: {out}"
     );
     assert!(
         out.contains(
@@ -1136,6 +1349,378 @@ fn usage_from_codex_tools_folds_its_conversation_at_list_prices() {
     assert!(!out.contains("source=rollout"), "{out}");
 }
 
+/// One conversation under `<tmp>/codex-home` whose root thread is `ROOT` (`gpt-5.6-sol`, one
+/// turn) with `root_rows` after its turn and a subagent rollout of `sub_rows`; `now` an hour after
+/// the root opened.
+fn codex_limits_home(tmp: &Tmp, root_rows: &[String], sub_rows: &[String]) -> Env {
+    use crate::harness::codex_rollout::fixtures::{context, count_unlimited, meta};
+    const ROOT: &str = "01900000-0000-7000-8000-000000000011";
+    const SUB: &str = "01900000-0000-7000-8000-000000000012";
+    let codex = tmp.path().join("codex-home");
+    let day = codex.join("sessions/2026/10/15");
+    std::fs::create_dir_all(&day).expect("sessions");
+    let b: i64 = 1_790_000_000_000;
+    let write = |thread: &str, body: String| {
+        std::fs::write(
+            day.join(format!("rollout-2026-10-15T10-00-00-{thread}.jsonl")),
+            body,
+        )
+        .expect("rollout");
+    };
+    write(
+        ROOT,
+        [
+            meta(b, ROOT, ROOT, None),
+            context(b + 1000, "gpt-5.6-sol", None),
+            count_unlimited(b + 5000, (1000, 800, 50), (1000, 800, 50)),
+        ]
+        .into_iter()
+        .chain(root_rows.iter().cloned())
+        .collect(),
+    );
+    write(
+        SUB,
+        [meta(b + 10_000, SUB, ROOT, None)]
+            .into_iter()
+            .chain(sub_rows.iter().cloned())
+            .collect(),
+    );
+    let mut env = env_at(tmp);
+    env.now = b / 1000 + 3600;
+    env.codex_home = Some(codex.to_string_lossy().into_owned());
+    env.codex_thread = Some(ROOT.to_owned());
+    env
+}
+
+/// `usage` in a Codex tab, as text (its first line) and as `--json`.
+fn codex_usage(env: &Env) -> (String, Value) {
+    let (ok, out, err) = go(
+        &Cmd::Usage {
+            json: false,
+            agy: false,
+        },
+        env,
+    );
+    assert!(ok, "{err}");
+    let (ok, json, err) = go(
+        &Cmd::Usage {
+            json: true,
+            agy: false,
+        },
+        env,
+    );
+    assert!(ok, "{err}");
+    let doc: Value = aterm_json::from_str(&json).expect("json");
+    assert_eq!(doc["source"].as_str(), Some("rollout"), "{json}");
+    (out.lines().next().unwrap_or_default().to_owned(), doc)
+}
+
+#[test]
+fn usage_from_codex_tools_shows_both_windows_of_the_newest_reading_and_its_age() {
+    use crate::harness::codex_rollout::fixtures::rate;
+    let tmp = tmp_dir("usage-codex-limits");
+    let b: i64 = 1_790_000_000_000;
+    let now = b / 1000 + 3600;
+    let env = codex_limits_home(
+        &tmp,
+        &[
+            rate(
+                b + 60_000,
+                "codex",
+                Some((30.0, 300, now + 4000)),
+                Some((50.0, 10080, now + 3 * 86_400 + 100)),
+            ),
+            rate(
+                b + 2_880_000,
+                "codex",
+                Some((42.3, 300, now + 4000)),
+                Some((61.0, 10080, now + 3 * 86_400 + 100)),
+            ),
+            rate(
+                b + 3_000_000,
+                "codex_bengalfox",
+                Some((90.0, 300, now + 600)),
+                None,
+            ),
+        ],
+        &[rate(
+            b + 1_000_000,
+            "codex",
+            Some((99.0, 300, now + 4500)),
+            None,
+        )],
+    );
+    let (hud, doc) = codex_usage(&env);
+    assert_eq!(
+        hud, "gpt 43%/5h · 61%/7d · acct codex · resets in 1h6m · rollout 12m  [source=rollout]",
+        "the newest `codex` reading, written 12 minutes before now: neither another family's \
+         newer one nor an older reading's larger share in another rollout"
+    );
+    let windows = &doc["usage"]["accounts"][0]["windows"];
+    for (name, pct, resets) in [
+        ("five_hour", 43u64, now + 4000),
+        ("seven_day", 61, now + 3 * 86_400 + 100),
+    ] {
+        let w = &windows[name];
+        assert_eq!(w["used_pct"], Value::from(pct), "{name}: {doc:?}");
+        assert_eq!(w["resets_at"], Value::from(resets), "{name}");
+        assert_eq!(w["source"], Value::from("rollout"), "{name}");
+        assert_eq!(w["age_s"], Value::from(720u64), "{name}");
+    }
+
+    let later = Env {
+        now: now + 4001,
+        ..env.clone()
+    };
+    let (hud, doc) = codex_usage(&later);
+    assert!(
+        hud.starts_with("gpt ?%/5h · 61%/7d · acct codex · resets in 2d"),
+        "a window whose reset has passed is void, never the share it had: {hud}"
+    );
+    assert!(hud.ends_with(" · rollout 1h18m  [source=rollout]"), "{hud}");
+    assert!(
+        doc["usage"]["accounts"][0]["windows"]
+            .get("five_hour")
+            .is_none(),
+        "{doc:?}"
+    );
+}
+
+#[test]
+fn usage_from_codex_tools_with_no_codex_window_prints_unknown_windows() {
+    use crate::harness::codex_rollout::fixtures::{limits_only, rate};
+    let tmp = tmp_dir("usage-codex-no-limits");
+    let b: i64 = 1_790_000_000_000;
+    let now = b / 1000 + 3600;
+    let unknown = "gpt ?%/5h · ?%/7d · acct codex · resets ? · none  [source=rollout]";
+    let env = codex_limits_home(&tmp, &[], &[]);
+    let (hud, doc) = codex_usage(&env);
+    assert_eq!(
+        hud, unknown,
+        "every token count says `\"rate_limits\":null`"
+    );
+    assert_eq!(
+        doc["usage"]["accounts"][0]["windows"],
+        Value::Object(Map::new()),
+        "{doc:?}"
+    );
+    let tmp = tmp_dir("usage-codex-other-limits");
+    let env = codex_limits_home(
+        &tmp,
+        &[
+            limits_only(b + 60_000),
+            rate(
+                b + 120_000,
+                "codex_bengalfox",
+                Some((90.0, 300, now + 600)),
+                None,
+            ),
+        ],
+        &[],
+    );
+    assert_eq!(
+        codex_usage(&env).0,
+        unknown,
+        "a `codex` reading with no window, and another family's windows"
+    );
+    let tmp = tmp_dir("usage-codex-limits-control");
+    let env = codex_limits_home(
+        &tmp,
+        &[rate(b + 60_000, "codex", Some((7.0, 300, now + 600)), None)],
+        &[],
+    );
+    assert!(
+        codex_usage(&env).0.starts_with("gpt 7%/5h · ?%/7d · "),
+        "control: a `codex` window is shown"
+    );
+}
+
+#[test]
+fn usage_from_codex_tools_names_the_row_its_auth_path_names() {
+    let tmp = tmp_dir("usage-codex-account");
+    let mut env = codex_limits_home(&tmp, &[], &[]);
+    let work = tmp.path().join("logins").join("work");
+    let work = work.to_str().expect("utf-8").to_owned();
+    let auth = format!("{work}/auth.json");
+    let roster = env.accounts_roster_for(Cli::Codex).expect("a config dir");
+    let one = "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n".to_owned();
+    let two =
+        format!("{one}\n[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{work}\"\n");
+    std::fs::write(&roster, &two).expect("roster");
+    // The login as `Env::from_process` reads it from a Codex tool's environment: the thread, the
+    // tab's session variable where `in_tab`, and `pairs`.
+    let thread = env.codex_thread.clone().expect("a thread");
+    let tool_env = |pairs: &[(&str, &str)], in_tab: bool| {
+        let vars = [("CODEX_THREAD_ID", thread.as_str())]
+            .into_iter()
+            .chain(in_tab.then_some((TAB_SESSION_VAR, "s-test")))
+            .chain(pairs.iter().copied())
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)));
+        let (read, login) = codex_of_env(vars);
+        assert_eq!(read.as_deref(), Some(thread.as_str()));
+        login
+    };
+    let login = |pairs: &[(&str, &str)]| tool_env(pairs, true);
+    let shown = |env: &Env| {
+        let (hud, doc) = codex_usage(env);
+        let label = doc["usage"]["accounts"][0]["label"]
+            .as_str()
+            .expect("a label")
+            .to_owned();
+        assert!(
+            hud.contains(&format!(" · acct {label} · ")),
+            "{hud} / {label}"
+        );
+        label
+    };
+    let other = tmp.path().join("logins").join("other").join("auth.json");
+    let other = other.to_str().expect("utf-8");
+    for (pairs, label, why) in [
+        (
+            &[("CODEX_AUTH_PATH", auth.as_str())][..],
+            "work",
+            "the row whose directory holds the auth file, which no one wrote",
+        ),
+        (
+            &[][..],
+            "main",
+            "the row with no directory: Codex's own login",
+        ),
+        (
+            &[("CODEX_AUTH_PATH", other)][..],
+            "codex",
+            "a path no row names",
+        ),
+        (
+            &[
+                ("CODEX_AUTH_PATH", auth.as_str()),
+                ("CODEX_HOME", "/elsewhere"),
+            ][..],
+            "codex",
+            "a Codex home of its own",
+        ),
+        (
+            &[
+                ("CODEX_AUTH_PATH", auth.as_str()),
+                ("CODEX_ACCESS_TOKEN", "k"),
+            ][..],
+            "codex",
+            "a credential ahead of the auth file",
+        ),
+    ] {
+        env.codex_login = login(pairs);
+        assert_eq!(shown(&env), label, "{why}");
+    }
+    for pairs in [&[][..], &[("CODEX_AUTH_PATH", auth.as_str())][..]] {
+        env.codex_login = tool_env(pairs, false);
+        assert_eq!(
+            shown(&env),
+            "codex",
+            "a tool environment without the tab's variable (`inherit = \"core\"`) may have lost \
+             `CODEX_AUTH_PATH` too, so it names no row, never the dir-less one: {pairs:?}"
+        );
+    }
+    assert!(
+        !Path::new(&auth).exists(),
+        "the label is the path's: no auth file is there to open"
+    );
+    env.codex_login = None;
+    assert_eq!(shown(&env), "codex", "no login read");
+    env.codex_login = login(&[("CODEX_AUTH_PATH", auth.as_str())]);
+    std::fs::write(
+        &roster,
+        format!("[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{work}\"\n"),
+    )
+    .expect("roster");
+    assert_eq!(shown(&env), "codex", "a roster of one names no account");
+}
+
+/// A CODEX TOOL'S THREAD AND LOGIN ARE READ FROM ITS VARIABLES (`codex_of_env`, the feed of
+/// `Env::from_process`): `CODEX_THREAD_ID` where it is a thread id, and under it, beside the tab's
+/// session variable, the login `CODEX_AUTH_PATH` names, every variable read lossily.
+/// NEGATIVE CONTROLS: a Claude Code tool's environment (a session and no thread), a thread id
+/// that is none, and one without the tab's variable read no login.
+#[test]
+fn a_codex_tools_environment_names_its_thread_and_login() {
+    const THREAD: &str = "01900000-0000-7000-8000-000000000011";
+    let read = |pairs: &[(&str, &str)]| {
+        codex_of_env(
+            pairs
+                .iter()
+                .map(|(name, value)| (OsString::from(name), OsString::from(value))),
+        )
+    };
+    let work = [
+        ("CODEX_THREAD_ID", THREAD),
+        (TAB_SESSION_VAR, "s-a"),
+        ("CODEX_AUTH_PATH", "/logins/work/auth.json"),
+    ];
+    let want = accounts::ProcessLogin {
+        login: Some("/logins/work".to_owned()),
+        default_home: true,
+        stored_login: true,
+    };
+    assert_eq!(read(&work), (Some(THREAD.to_owned()), Some(want.clone())));
+    assert_eq!(
+        read(&work[..2]).1.map(|who| who.login),
+        Some(None),
+        "no `CODEX_AUTH_PATH` beside the tab's variable: the default login"
+    );
+    let (thread, login) = read(&[
+        (
+            "CLAUDE_CODE_SESSION_ID",
+            "8f6e3b2a-0000-4000-8000-000000000001",
+        ),
+        (TAB_SESSION_VAR, "s-a"),
+        ("CODEX_AUTH_PATH", "/logins/work/auth.json"),
+    ]);
+    assert_eq!((thread, login), (None, None), "control: no Codex thread");
+    assert_eq!(
+        read(&[("CODEX_THREAD_ID", "not-a-thread"), work[1], work[2]]),
+        (None, None),
+        "control: no thread id"
+    );
+    assert_eq!(
+        read(&[work[0], work[2]]),
+        (Some(THREAD.to_owned()), None),
+        "control: no tab variable"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+        let raw =
+            |pairs: &[(&str, &[u8])]| {
+                codex_of_env(pairs.iter().map(|(name, value)| {
+                    (OsString::from(name), OsString::from_vec(value.to_vec()))
+                }))
+                .1
+            };
+        let thread = THREAD.as_bytes();
+        let base = [
+            ("CODEX_THREAD_ID", thread),
+            (TAB_SESSION_VAR, b"s-a".as_slice()),
+        ];
+        let lang: (&str, &[u8]) = ("LANG", b"\xffC");
+        let path: (&str, &[u8]) = ("CODEX_AUTH_PATH", b"/logins/work/auth.json");
+        assert_eq!(
+            raw(&[base[0], base[1], lang, path]),
+            Some(want),
+            "a variable that is not UTF-8 is read lossily, and the others still are"
+        );
+        let lossy = raw(&[
+            base[0],
+            base[1],
+            ("CODEX_AUTH_PATH", b"/logins/w\xffrk/auth.json"),
+        ])
+        .and_then(|who| who.login);
+        assert_eq!(
+            lossy.as_deref(),
+            Some("/logins/w\u{fffd}rk"),
+            "a path no row's directory is"
+        );
+    }
+}
+
 #[test]
 fn usage_from_codex_tools_with_a_relative_codex_home_folds_nothing_and_says_so() {
     let tmp = tmp_dir("usage-codex-relative");
@@ -1257,6 +1842,65 @@ impl Ctl for TabCtl {
     }
 }
 
+#[derive(Default)]
+struct RefreshCtl {
+    calls: Vec<String>,
+    fail_at: Option<usize>,
+    already_gone: bool,
+    timeout_at: Option<usize>,
+    empty_usage: bool,
+}
+
+impl Ctl for RefreshCtl {
+    fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
+        self.calls.push(args.join(" "));
+        let step = self.calls.len();
+        if self.already_gone && matches!(args.get(1), Some(&"signal")) {
+            return Ok(CtlReply {
+                code: 1,
+                stdout: String::new(),
+                stderr: "ERR no such session".to_owned(),
+            });
+        }
+        if self.already_gone && args.get(1) == Some(&"await") && args.get(2) == Some(&"gone") {
+            return Ok(CtlReply {
+                code: 1,
+                stdout: String::new(),
+                stderr: "ERR exited".to_owned(),
+            });
+        }
+        if self.fail_at == Some(step) {
+            return Err("injected startup failure".to_owned());
+        }
+        if self.timeout_at == Some(step) {
+            return Ok(CtlReply {
+                code: 0,
+                stdout: "OK timeout\n".to_owned(),
+                stderr: String::new(),
+            });
+        }
+        let stdout = match step {
+            1 => "OK s-quota".to_owned(),
+            9 => "OK schema=1 sid=s-quota program=kimi".to_owned(),
+            10 if self.empty_usage => text_json(&rows(&["Plan: monthly", "Usage not read yet"])),
+            10 => text_json(&rows(&[
+                "   ╭ Usage ─────────────────────────────────────────╮",
+                "   │   5h limit    ███████░░░  36% used  resets in 25m │",
+                "   │   Monthly limit  ███░░░░  13% used  resets in 26d 20h 27m │",
+                "   ╰─────────────────────────────────────────────────╯",
+            ])),
+            13 => panic!("the quota tab was used after it closed"),
+            _ if args.get(1) == Some(&"await") => format!("OK {} 1", args[2]),
+            _ => "OK".to_owned(),
+        };
+        Ok(CtlReply {
+            code: 0,
+            stdout,
+            stderr: String::new(),
+        })
+    }
+}
+
 fn scripted(stdout: String, code: i32, stderr: &str) -> Scripted {
     Scripted {
         reply: CtlReply {
@@ -1288,6 +1932,234 @@ fn the_memory_banner_is_its_own_wall_and_no_limit() {
         limits_text(&v).starts_with("wall=memory resets_at=- "),
         "{}",
         limits_text(&v)
+    );
+}
+
+#[test]
+fn kimi_limits_report_the_month_and_optional_week_with_absolute_resets() {
+    let rows = rows(&[
+        "   ╭ Usage ─────────────────────────────────────────╮",
+        "   │   5h limit    ███████░░░  36% used  resets in 25m │",
+        "   │   Monthly limit  ███░░░░  13% used  resets in 26d 20h 27m │",
+        "   ╰─────────────────────────────────────────────────╯",
+    ]);
+    let now = 1_758_412_800;
+    let view = limits_view(Program::Kimi.reader(), &rows, now, 0, &|_, _| None);
+    assert_eq!(view.windows.len(), 2);
+    assert_eq!(view.windows[0].0.name, "five_hour");
+    assert_eq!(view.windows[0].0.used_pct, 36);
+    assert_eq!(view.windows[0].1, Some(now + 25 * 60));
+    assert_eq!(view.windows[1].0.name, "monthly");
+    assert_eq!(view.windows[1].0.used_pct, 13);
+    assert_eq!(
+        view.windows[1].1,
+        Some(now + 26 * 86_400 + 20 * 3600 + 27 * 60)
+    );
+    let json = limits_json(&view);
+    assert!(json.contains("\"name\":\"monthly\""), "{json}");
+    assert!(json.contains("\"reset\":\"in 26d 20h 27m\""), "{json}");
+}
+
+#[test]
+fn a_kimi_limits_read_persists_the_month_and_session() {
+    let tmp = tmp_dir("kimi-limits-store");
+    let env = env_at(&tmp);
+    let roster = accounts::append_row("", "kimi-m22", Class::Dedicated, None).unwrap();
+    std::fs::write(env.accounts_roster_for(Cli::Kimi).unwrap(), roster).unwrap();
+    let rows = rows(&[
+        "   ╭ Usage ─────────────────────────────────────────╮",
+        "   │   5h limit    ███████░░░  36% used  resets in 25m │",
+        "   │   Monthly limit  ███░░░░  13% used  resets in 26d 20h 27m │",
+        "   ╰─────────────────────────────────────────────────╯",
+    ]);
+    let view = limits_view(Program::Kimi.reader(), &rows, env.now, 0, &|_, _| None);
+    record_limits_usage(&env, "@s-worker", Cli::Kimi, &view, 0).unwrap();
+    let store = env.accounts_store_for(Cli::Kimi).unwrap();
+    let (state, _) = store.load(env.now).unwrap();
+    let account = state.account("kimi-m22");
+    assert_eq!(account.sample.as_ref().unwrap().session_pct, Some(36));
+    let monthly = account.windows.get("monthly").unwrap();
+    assert_eq!(monthly.whole(), 13);
+    assert_eq!(monthly.at, env.now);
+    assert_eq!(monthly.reset, env.now + 26 * 86_400 + 20 * 3600 + 27 * 60);
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = run_accounts_stats_of(
+        Cli::Kimi,
+        &env,
+        &FakeHost::new(&never_asked),
+        true,
+        &mut out,
+        &mut err,
+    );
+    assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
+    let doc: Value = aterm_json::from_slice(&out).unwrap();
+    assert_eq!(doc["rows"][0]["monthly"]["pct"].as_u64(), Some(13));
+    assert_eq!(doc["rows"][0]["monthly_read_at"].as_i64(), Some(env.now));
+}
+
+#[test]
+fn kimi_refresh_uses_a_quota_only_tab_and_always_closes_it() {
+    let tmp = tmp_dir("kimi-refresh");
+    let env = env_at(&tmp);
+    let roster = accounts::append_row("", "kimi-m22", Class::Dedicated, None).unwrap();
+    std::fs::write(env.accounts_roster_for(Cli::Kimi).unwrap(), roster).unwrap();
+    let mut ctl = RefreshCtl {
+        calls: Vec::new(),
+        fail_at: None,
+        already_gone: false,
+        ..RefreshCtl::default()
+    };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = run_kimi_refresh_with(&mut ctl, &env, true, &mut out, &mut err);
+    assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
+    assert_eq!(ctl.calls.len(), 12, "{:?}", ctl.calls);
+    assert_eq!(ctl.calls[2], "@s-quota send exec kimi");
+    assert_eq!(ctl.calls[5], "@s-quota send /usage");
+    assert_eq!(ctl.calls[10], "@s-quota signal kill");
+    assert_eq!(ctl.calls[11], "@s-quota await gone .* timeout=10000");
+    let doc: Value = aterm_json::from_slice(&out).unwrap();
+    assert_eq!(doc["windows"][1]["name"].as_str(), Some("monthly"));
+    let store = env.accounts_store_for(Cli::Kimi).unwrap();
+    let (state, _) = store.load(env.now).unwrap();
+    assert!(state.account("kimi-m22").windows.contains_key("monthly"));
+}
+
+#[test]
+fn kimi_refresh_closes_its_tab_when_startup_fails() {
+    let tmp = tmp_dir("kimi-refresh-failure");
+    let env = env_at(&tmp);
+    let roster = accounts::append_row("", "kimi-m22", Class::Dedicated, None).unwrap();
+    std::fs::write(env.accounts_roster_for(Cli::Kimi).unwrap(), roster).unwrap();
+    let mut ctl = RefreshCtl {
+        calls: Vec::new(),
+        fail_at: Some(5),
+        already_gone: false,
+        ..RefreshCtl::default()
+    };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = run_kimi_refresh_with(&mut ctl, &env, true, &mut out, &mut err);
+    assert_eq!(code, ExitCode::from(1));
+    assert_eq!(ctl.calls.len(), 7, "{:?}", ctl.calls);
+    assert_eq!(ctl.calls[5], "@s-quota signal kill");
+    assert_eq!(ctl.calls[6], "@s-quota await gone .* timeout=10000");
+    assert!(String::from_utf8_lossy(&err).contains("injected startup failure"));
+}
+
+#[test]
+fn kimi_refresh_takes_an_already_gone_tab_as_closed() {
+    let tmp = tmp_dir("kimi-refresh-gone");
+    let env = env_at(&tmp);
+    let roster = accounts::append_row("", "kimi-m22", Class::Dedicated, None).unwrap();
+    std::fs::write(env.accounts_roster_for(Cli::Kimi).unwrap(), roster).unwrap();
+    let mut ctl = RefreshCtl {
+        calls: Vec::new(),
+        fail_at: None,
+        already_gone: true,
+        ..RefreshCtl::default()
+    };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = run_kimi_refresh_with(&mut ctl, &env, true, &mut out, &mut err);
+    assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
+}
+
+#[test]
+fn kimi_refresh_refuses_wait_timeouts_and_unmeasured_usage() {
+    for (timeout_at, empty_usage) in [
+        (Some(5), false),
+        (Some(8), false),
+        (Some(12), false),
+        (None, true),
+    ] {
+        let tmp = tmp_dir("kimi-refresh-unobserved");
+        let env = env_at(&tmp);
+        let roster = accounts::append_row("", "kimi-m22", Class::Dedicated, None).unwrap();
+        std::fs::write(env.accounts_roster_for(Cli::Kimi).unwrap(), roster).unwrap();
+        let mut ctl = RefreshCtl {
+            timeout_at,
+            empty_usage,
+            ..RefreshCtl::default()
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_eq!(
+            run_kimi_refresh_with(&mut ctl, &env, true, &mut out, &mut err),
+            ExitCode::from(1),
+            "timeout={timeout_at:?}, empty={empty_usage}: {}",
+            String::from_utf8_lossy(&out),
+        );
+        assert!(ctl.calls.iter().any(|call| call == "@s-quota signal kill"));
+        assert_eq!(
+            ctl.calls.last().unwrap(),
+            "@s-quota await gone .* timeout=10000"
+        );
+        let why = String::from_utf8_lossy(&err);
+        assert!(
+            why.contains(if empty_usage {
+                "no measured quota"
+            } else {
+                "timeout"
+            }),
+            "{why}"
+        );
+        if timeout_at.is_some_and(|step| step < 12) || empty_usage {
+            assert!(out.is_empty(), "unobserved quota was reported");
+            let store = env.accounts_store_for(Cli::Kimi).unwrap();
+            let (state, _) = store.load(env.now).unwrap();
+            assert!(state.account("kimi-m22").windows.is_empty());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn kimi_refresh_executes_the_enrolled_home_as_an_environment_assignment() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tmp_dir("kimi-refresh-enrolled");
+    let env = env_at(&tmp);
+    let login = tmp.path().join("kimi space's home");
+    std::fs::create_dir_all(&login).unwrap();
+    let roster = accounts::append_row("", "dedicated", Class::Dedicated, login.to_str()).unwrap();
+    std::fs::write(env.accounts_roster_for(Cli::Kimi).unwrap(), roster).unwrap();
+    let store = env.accounts_store_for(Cli::Kimi).unwrap();
+    let mut logins = accounts::Logins::default();
+    logins.labels.insert(
+        "dedicated".into(),
+        accounts::Binding {
+            dir: login.to_str().map(str::to_owned),
+            ..accounts::Binding::default()
+        },
+    );
+    store.save_logins(&logins).unwrap();
+    store
+        .transact(env.now, &mut None, |state| {
+            state.active = Some("dedicated".into());
+            Ok(Vec::new())
+        })
+        .unwrap();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let fake = bin.join("kimi");
+    std::fs::write(&fake, "#!/bin/sh\nprintf '%s\\n' \"$KIMI_CODE_HOME\"\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut shell = aterm_uds::spawnfd::command("/bin/sh");
+    shell
+        .env("PATH", &bin)
+        .arg("-c")
+        .arg(kimi_refresh_command(&env).unwrap());
+    let output = aterm_uds::deadline::output_within(&mut shell, std::time::Duration::from_secs(60))
+        .expect("scratch shell completes");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{}\n", login.display())
     );
 }
 
@@ -2936,6 +3808,60 @@ fn the_ledger_verb_reads_the_supervisors_approval_ledger() {
     let (ok, out, _) = ledger(LedgerFile::Approvals(None), 20, false);
     assert!(ok);
     assert!(out.contains("s-test.jsonl"), "{out}");
+}
+
+/// `harness ledger @<sid>` LISTS A SELF-CLAIM'S ACT AS ITS HOLDER'S: `self-claim <holder> <word>
+/// <act>`, beside aterm's own rows in their own words. NEGATIVE CONTROL: aterm's own row of the
+/// same rule names no holder.
+#[test]
+fn the_ledger_verb_lists_a_self_claims_act_as_its_holders() {
+    let tmp = tmp_dir("ledger-self-claim");
+    let env = env_at(&tmp);
+    let root = env.aterm_state.clone().expect("injected");
+    let sid = "@s-codex";
+    let path = approvals::path_under(&root, Some(sid)).expect("path");
+    let mut warn = Vec::new();
+    let mut l = approvals::Ledger::open(Some(&path), Some(sid), &mut warn);
+    l.write(
+        crate::supervise::journal::unix_ms(),
+        &approvals::Row {
+            rule_id: "continue@v1",
+            outcome: approvals::Outcome::Typed,
+            command: "keep going",
+            reason: "",
+            box_seq: 0,
+        },
+        &mut warn,
+    );
+    l.write_self_claim(
+        crate::supervise::journal::unix_ms(),
+        &approvals::SelfClaimRow {
+            holder: "codex-alab@4242",
+            act: "continue@v1",
+        },
+        &mut warn,
+    )
+    .expect("written");
+    assert!(warn.is_empty(), "{}", String::from_utf8_lossy(&warn));
+    let (ok, out, _) = go(
+        &Cmd::Ledger {
+            file: LedgerFile::Approvals(Some(sid.into())),
+            count: 20,
+            json: false,
+        },
+        &env,
+    );
+    assert!(ok, "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 2, "{out}");
+    assert!(
+        lines[0].ends_with(" typed continue@v1 keep going") && !lines[0].contains("codex-alab"),
+        "NEGATIVE CONTROL: {out}"
+    );
+    assert!(
+        lines[1].ends_with(" self-claim codex-alab@4242 continue continue@v1"),
+        "{out}"
+    );
 }
 
 #[test]
@@ -5048,6 +5974,88 @@ fn the_json_report_has_every_key_and_null_for_what_nobody_read() {
 }
 
 #[test]
+fn a_survey_reads_each_row_as_the_report_does() {
+    let tmp = tmp_dir("accounts-survey");
+    let env = env_at(&tmp);
+    three_accounts(&tmp, &env);
+    reported_state(&env);
+    let now = env.now;
+    let config = env.config.clone().expect("a config path");
+    let places = (config.as_path(), env.state.as_path(), env.home.as_deref());
+    let pool = survey_accounts(Cli::Claude, places, now).expect("the pool reads");
+    let [main, work, pool_a] = pool.rows.as_slice() else {
+        panic!("three rows: {:?}", pool.rows);
+    };
+    assert_eq!(
+        (main.label.as_str(), main.class, main.enrolled),
+        ("main", Class::Dedicated, true)
+    );
+    assert_eq!(main.condition, accounts::Condition::Usable);
+    assert_eq!((main.five_hour_pct, main.seven_day_pct), (Some(42), None));
+    assert_eq!(main.used_at, Some(now - 5));
+    assert_eq!(
+        (work.label.as_str(), work.enrolled, work.condition),
+        (
+            "work-2",
+            true,
+            accounts::Condition::Limited {
+                until: now + 3600 + accounts::RESET_GRACE_S
+            }
+        )
+    );
+    assert_eq!(
+        (pool_a.label.as_str(), pool_a.class, pool_a.enrolled),
+        ("pool-a", Class::Shared, false)
+    );
+    assert_eq!(pool_a.condition, accounts::Condition::NotEnrolled);
+    assert_eq!((pool_a.five_hour_pct, pool_a.used_at), (None, None));
+    assert_eq!(
+        pool.sessions,
+        BTreeMap::from([
+            ("s-a1".to_owned(), "main".to_owned()),
+            ("s-b2".to_owned(), "work-2".to_owned())
+        ])
+    );
+
+    // The report says the same of each row.
+    let (code, out, err) = acc_quiet(AccountsCmd::Report { json: true }, &env);
+    assert_eq!(code, exit(0), "{err}");
+    let doc: Value = aterm_json::from_str(out.trim()).expect("JSON");
+    let reported = doc.get("accounts").and_then(Value::as_array).expect("rows");
+    for (row, read) in reported.iter().zip(&pool.rows) {
+        assert_eq!(
+            row.get("condition").and_then(Value::as_str),
+            Some(read.condition.as_str())
+        );
+        assert_eq!(
+            row.get("session_pct").and_then(Value::as_u64),
+            read.five_hour_pct.map(u64::from)
+        );
+        assert_eq!(
+            row.get("enrolled").and_then(Value::as_bool),
+            Some(read.enrolled)
+        );
+    }
+
+    // A pool with no roster has no rows, and is no refusal.
+    let codex = survey_accounts(Cli::Codex, places, now).expect("no roster reads");
+    assert_eq!(codex, SurveyPool::default());
+}
+
+#[test]
+fn a_survey_of_a_mac_with_no_roster_reads_its_own_login() {
+    let tmp = tmp_dir("accounts-survey-own");
+    let env = env_at(&tmp);
+    reported_state(&env);
+    let config = env.config.clone().expect("a config path");
+    let places = (config.as_path(), env.state.as_path(), env.home.as_deref());
+    let pool = survey_accounts(Cli::Claude, places, env.now).expect("the pool reads");
+    let labels: Vec<&str> = pool.rows.iter().map(|row| row.label.as_str()).collect();
+    assert_eq!(labels, [ACCOUNTS_OWN_LABEL], "the login its tap read");
+    assert!(pool.rows[0].enrolled && pool.rows[0].five_hour_pct == Some(42));
+}
+
+#[test]
 fn the_check_after_a_sign_in_needs_user_or_logname() {
     type Vars = &'static [(&'static str, &'static str)];
     let var = |vars: Vars| {
@@ -7071,7 +8079,7 @@ fn the_sweep_rows_say_why_each_build_cache_went() {
     let tmp = tmp_dir("sweep-why");
     let state = tmp.path().join("state");
     let path = Path::new("/c/ws/.cargo-build");
-    let cases: [(Unused, &[&str]); 7] = [
+    let cases: [(Unused, &[&str]); 8] = [
         (
             Unused::Gone {
                 idle: std::time::Duration::from_secs(26 * 3_600),
@@ -7109,6 +8117,13 @@ fn the_sweep_rows_say_why_each_build_cache_went() {
             &["40d", "30d", "verify provision"],
         ),
         (Unused::GivenUp, &["first-exec"]),
+        (
+            Unused::Stayed {
+                stayed: 2,
+                freed: 3 << 30,
+            },
+            &["3.0 GiB", "2 entries"],
+        ),
     ];
     for (why, _) in cases {
         assert!(disk_sweep_journal(&state, path, 7, why, false, 1));
@@ -7127,7 +8142,7 @@ fn the_sweep_rows_say_why_each_build_cache_went() {
             .collect();
         assert_eq!(actions, ["removing", "removed"]);
         let words = disk::sweep_words(why);
-        let part = matches!(why, Unused::Stale { .. });
+        let part = matches!(why, Unused::Stale { .. } | Unused::Stayed { .. });
         for r in pair {
             let text = r["text"].as_str().unwrap_or_default();
             assert!(text.contains(&words), "{why:?}: {text}");
@@ -7143,6 +8158,45 @@ fn the_sweep_rows_say_why_each_build_cache_went() {
         !idle.contains("gone") && !idle.contains("removed workspace"),
         "{idle}"
     );
+}
+
+/// A stage a removal could not finish is journalled with what stayed of it, named under the
+/// stage as it stands, never what it holds. NEGATIVE CONTROL: a removal whole names nothing.
+#[test]
+fn a_stage_a_removal_could_not_finish_is_journalled_with_what_stayed() {
+    use atpkg::build_cache::Unused;
+    let tmp = tmp_dir("sweep-stayed");
+    let stage = tmp.path().join(".cargo-build.removing");
+    std::fs::create_dir_all(stage.join("tmp/install-sh.1/tmp/d")).expect("the stage");
+    std::fs::write(stage.join("tmp/secret"), b"never read").expect("a file");
+    let stayed = disk::sweep_row(
+        1,
+        &stage,
+        "removed",
+        5 << 30,
+        Unused::Stayed {
+            stayed: 2,
+            freed: 5 << 30,
+        },
+    );
+    let row: Value = aterm_json::from_str(&stayed).expect("a row");
+    let text = row["text"].as_str().unwrap_or_default();
+    let named = atpkg::build_cache::remove::named(&stage, 2);
+    assert_eq!(
+        named.first,
+        [
+            PathBuf::from("tmp/install-sh.1/tmp/d"),
+            PathBuf::from("tmp/secret")
+        ]
+    );
+    assert!(text.contains(&named.words(&stage)), "{text}");
+    assert!(!text.contains("never read"), "{text}");
+    let whole = disk::sweep_row(1, &stage, "removed", 5 << 30, Unused::Unfinished);
+    let whole: Value = aterm_json::from_str(&whole).expect("a row");
+    let whole = whole["text"].as_str().unwrap_or_default();
+    for p in &named.first {
+        assert!(!whole.contains(&*p.to_string_lossy()), "{whole}");
+    }
 }
 
 #[test]
@@ -7702,6 +8756,9 @@ mod signin;
 #[path = "cli_identity_tests.rs"]
 mod identity;
 
+#[path = "cli_plain_login_commit_tests.rs"]
+mod plain_login_commit;
+
 #[path = "cli_adopt_identity_tests.rs"]
 mod adopt_identity;
 
@@ -7729,7 +8786,11 @@ mod admission;
 #[path = "cli_signin_lock_tests.rs"]
 mod signin_lock;
 
-/// `signin` takes `--cli grok` alone, and `--wait` belongs to it.
+#[path = "cli_codex_next_tests.rs"]
+mod codex_next;
+
+/// `signin` takes `--cli grok` alone, and `--wait` belongs to it; its help shows the need's own
+/// `NEEDS YOU` line ([`crate::harness::grok_signin::needs_you_line`]).
 #[test]
 fn signin_parses_for_grok_alone_and_wait_belongs_to_it() {
     for (line, want) in [
@@ -7768,9 +8829,8 @@ fn signin_parses_for_grok_alone_and_wait_belongs_to_it() {
     ] {
         assert!(parse(&words(line)).is_err(), "{line} should be refused");
     }
-    let signin = help_page(HelpPage::Signin);
-    assert!(signin.contains("Grok Build signs in by itself from now on"));
-    assert!(signin.contains("aterm approves its page itself first, in a headless browser"));
+    let need = crate::harness::grok_signin::needs_you_line(None, "<url>", Some("<code>"));
+    assert!(help_page(HelpPage::Signin).contains(&need), "{need}");
 }
 
 #[test]
@@ -7882,4 +8942,180 @@ fn disk_free_removes_a_scratch_cache_journals_it_and_exits_nonzero_on_a_refusal(
         .map(|r| r["action"].as_str().unwrap_or_default().to_owned())
         .collect();
     assert_eq!(actions, ["removing", "removed", "refused"], "{ledger}");
+}
+
+#[test]
+fn accounts_report_reads_rotation_from_parsed_config_and_names_running_sessions() {
+    let tmp = tmp_dir("accounts-c17a");
+    let env = env_at(&tmp);
+    let (work, _) = three_accounts(&tmp, &env);
+    login_made_in(Path::new(&work));
+
+    let read_both = |env: &Env| -> (String, Value) {
+        let (code, text, err) = acc_quiet(AccountsCmd::Report { json: false }, env);
+        assert_eq!(code, exit(0), "{err}");
+        let (code, json, err) = acc_quiet(AccountsCmd::Report { json: true }, env);
+        assert_eq!(code, exit(0), "{err}");
+        let doc: Value = aterm_json::from_str(json.trim()).expect("JSON");
+        (text, doc)
+    };
+
+    // 1. Default config (`early`, `limit_reset = false`, `rotations = []`), no running sessions
+    //    and `state.active == None`: `limit_reset` and `observed` are false (breaking the old
+    //    `moves = true` literal on `limit_reset`), and `active:` reports `none (0 sessions running)`.
+    let (text, doc) = read_both(&env);
+    assert!(
+        text.starts_with("active: none (0 sessions running)\n"),
+        "{text}"
+    );
+    assert_eq!(doc["active"], Value::Null);
+    assert_eq!(doc["running"], Value::Array(Vec::new()));
+    assert_eq!(doc["rotation"]["follows_use"], Value::from(true));
+    assert_eq!(doc["rotation"]["at_limit"], Value::from(true));
+    assert_eq!(doc["rotation"]["ahead_of_limit"], Value::from(true));
+    assert_eq!(doc["rotation"]["probe"], Value::from(true));
+    assert_eq!(doc["rotation"]["limit_reset"], Value::from(false));
+    assert_eq!(doc["rotation"]["observed"], Value::from(false));
+
+    // 2. Running session on `work-2` while `state.active` is still `None`: `active:` names `work-2`
+    //    (not `"none chosen yet"`), marks `work-2` active, and treats `work-2` as the account in use.
+    let mut state = accounts::State::default();
+    accounts::note_session(&mut state, "s-live-1", "work-2", None, env.now - 5);
+    env.accounts_store().save(&state).expect("save");
+    let (text, doc) = read_both(&env);
+    assert!(
+        text.starts_with("active: work-2, 1 of 1 sessions on it\n"),
+        "{text}"
+    );
+    assert!(text.contains("next: main\n"), "{text}");
+    assert!(
+        text.contains("not next: work-2: the account in use"),
+        "{text}"
+    );
+    assert_eq!(doc["active"], Value::from("work-2"));
+    assert_eq!(doc["running"], Value::Array(vec![Value::from("work-2")]));
+    let rows = doc["accounts"].as_array().expect("rows");
+    assert_eq!(rows[0]["active"], Value::from(false), "main idle");
+    assert_eq!(rows[1]["active"], Value::from(true), "work-2 running");
+
+    // 3. Two sessions running across `main` and `work-2`, plus `[harness] accounts = "wall"`,
+    //    `limit_reset = true`, and a recorded rotation in `state.rotations`.
+    accounts::note_session(&mut state, "s-live-2", "main", None, env.now - 2);
+    state.rotations.push(env.now - 30);
+    env.accounts_store().save(&state).expect("save");
+    let cfg_path = env.config.as_ref().expect("config path");
+    std::fs::write(
+        cfg_path,
+        "[harness]\naccounts = \"wall\"\nlimit_reset = true\n",
+    )
+    .expect("write config");
+    let (text, doc) = read_both(&env);
+    assert!(
+        text.starts_with("active: main (1), work-2 (1), 2 sessions running\n"),
+        "{text}"
+    );
+    assert_eq!(doc["active"], Value::Null);
+    assert_eq!(
+        doc["running"],
+        Value::Array(vec![Value::from("main"), Value::from("work-2")])
+    );
+    assert_eq!(doc["rotation"]["follows_use"], Value::from(true));
+    assert_eq!(doc["rotation"]["at_limit"], Value::from(true));
+    assert_eq!(doc["rotation"]["ahead_of_limit"], Value::from(false));
+    assert_eq!(doc["rotation"]["probe"], Value::from(false));
+    assert_eq!(doc["rotation"]["limit_reset"], Value::from(true));
+    assert_eq!(doc["rotation"]["observed"], Value::from(true));
+
+    // 4. `[harness] accounts = "off"` turns rotation switches off while keeping `observed = true`.
+    std::fs::write(
+        cfg_path,
+        "[harness]\naccounts = \"off\"\nlimit_reset = false\n",
+    )
+    .expect("write config");
+    let (_, doc) = read_both(&env);
+    assert_eq!(doc["rotation"]["follows_use"], Value::from(false));
+    assert_eq!(doc["rotation"]["at_limit"], Value::from(false));
+    assert_eq!(doc["rotation"]["ahead_of_limit"], Value::from(false));
+    assert_eq!(doc["rotation"]["probe"], Value::from(false));
+    assert_eq!(doc["rotation"]["limit_reset"], Value::from(false));
+    assert_eq!(doc["rotation"]["observed"], Value::from(true));
+
+    // 5. `[harness.claude] enabled = false` turns every Claude rotation switch off too.
+    std::fs::write(
+        cfg_path,
+        "[harness]\naccounts = \"early\"\nlimit_reset = true\n[harness.claude]\nenabled = false\n",
+    )
+    .expect("write config");
+    let (_, doc) = read_both(&env);
+    for key in [
+        "follows_use",
+        "at_limit",
+        "ahead_of_limit",
+        "probe",
+        "limit_reset",
+    ] {
+        assert_eq!(doc["rotation"][key], Value::from(false), "{key}");
+    }
+}
+
+/// THE FLEET SOURCE TABLE reads a Codex default row (no directory) as here only while the
+/// owner's `~/.codex/auth.json` is, as a launch does, whether the sheet lists the row or it is
+/// the machine's own; signed in, it is ready to be read.
+#[test]
+fn the_source_tables_default_codex_row_is_here_only_with_its_login_file() {
+    use crate::harness::accounts_sync::{CliFleet, FleetAccount, FleetRoster};
+    let tmp = tmp_dir("source-table-default-row");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let roster = Roster {
+        rows: vec![accounts::Row {
+            label: "main".into(),
+            email: Some("owner@example.test".into()),
+            ..accounts::Row::default()
+        }],
+    };
+    let local = || LocalSourceTable {
+        records: accounts::AccountRecords {
+            roster: roster.clone(),
+            ..accounts::AccountRecords::default()
+        },
+        machine: Some("m16".into()),
+        now: 1_790_000_000,
+        error: None,
+        home: Some(home.clone()),
+    };
+    let listed = CliFleet {
+        cli: Cli::Codex,
+        roster: FleetRoster {
+            source: "sheet".into(),
+            accounts: vec![FleetAccount {
+                label: "main".into(),
+                machines: vec!["m16".into()],
+                class: Class::Dedicated,
+                email: "owner@example.test".into(),
+                browser: None,
+                vendor: accounts::Vendor::default(),
+            }],
+        },
+        held: Vec::new(),
+    };
+    let own = CliFleet {
+        roster: FleetRoster {
+            accounts: Vec::new(),
+            ..listed.roster.clone()
+        },
+        ..listed.clone()
+    };
+    let readiness = |fleet: &CliFleet| {
+        let (_, rows) = source_table_rows(Cli::Codex, fleet, Some(local()));
+        rows.into_iter()
+            .map(|(label, state, .., readiness)| format!("{label} {state} {readiness}"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(readiness(&listed), ["main active not-enrolled"]);
+    assert_eq!(readiness(&own), ["main local not-enrolled"]);
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    std::fs::write(home.join(".codex").join("auth.json"), "{}").unwrap();
+    assert_eq!(readiness(&listed), ["main active unseen"]);
+    assert_eq!(readiness(&own), ["main local unseen"]);
 }

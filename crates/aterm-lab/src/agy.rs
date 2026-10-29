@@ -9,7 +9,7 @@ use crate::door::Door;
 use crate::pyjson::{J, Style};
 use crate::run::{Run, take_tag};
 use crate::sys::{PutSrc, put, scratch_remove};
-use crate::util::shell_quote;
+use crate::util::{shell_prepend_path, shell_quote};
 use crate::{Fail, LAB, Res};
 
 /// Fake API key agy sends as `x-goog-api-key`.
@@ -166,14 +166,14 @@ pub fn parse_launch(args: &[String]) -> Result<Launch, String> {
 pub fn launcher(run: &Run, envs: &[String], args: &[String]) -> String {
     let w = run.w.to_string_lossy();
     let shim = run.run.join("shim");
-    let px = &run.proxy;
+    let px = shell_quote(&run.proxy);
     let mut s = String::from("#!/bin/sh\nclear\n");
     s.push_str(
         "exec env -u GOOGLE_API_KEY -u GOOGLE_GENAI_USE_VERTEXAI -u GOOGLE_CLOUD_PROJECT -u GOOGLE_APPLICATION_CREDENTIALS \\\n",
     );
     s.push_str(&format!(
-        "  PATH=\"{}:$PATH\" HOME={} TMPDIR={} \\\n",
-        shim.display(),
+        "  PATH={} HOME={} TMPDIR={} \\\n",
+        shell_prepend_path(&shim.to_string_lossy()),
         shell_quote(&format!("{w}/{HOME}")),
         shell_quote(&format!("{w}/tmp"))
     ));
@@ -182,8 +182,8 @@ pub fn launcher(run: &Run, envs: &[String], args: &[String]) -> String {
     ));
     s.push_str("  NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \\\n");
     s.push_str(&format!(
-        "  GEMINI_API_KEY={LAB_GEMINI_KEY} GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:{} \\\n",
-        run.port
+        "  GEMINI_API_KEY={LAB_GEMINI_KEY} GOOGLE_GEMINI_BASE_URL={} \\\n",
+        shell_quote(&format!("http://127.0.0.1:{}", run.port))
     ));
     s.push_str(&format!(
         "  AGY_CLI_DISABLE_AUTO_UPDATE=true BROWSER={} LAB_OPEN_LOG={} LAB_SECURITY_LOG={} \\\n",

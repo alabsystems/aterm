@@ -359,14 +359,15 @@ pub(crate) enum HarnessChip {
     Switch,
     /// Passive status title beside the chips.
     Title,
-    /// The harness banner's link over Claude Code's update notice (`claude_card::NOTICE`).
-    Link,
+    /// A link of the harness words on the glass: a banner's, or the card line's
+    /// (`claude_card::GlassLink`), each in a slot of its own.
+    Link(crate::claude_card::GlassLink),
     /// The top rule's ⬆️ of a newer CLI build: a press asks for the move now.
     Upgrade,
 }
 
 impl HarnessChip {
-    const SLOTS: u64 = 16;
+    const SLOTS: u64 = 32;
 
     const fn index(self) -> u64 {
         match self {
@@ -383,8 +384,10 @@ impl HarnessChip {
             Self::Title => 10,
             Self::Context => 11,
             Self::Account => 12,
-            Self::Link => 13,
-            Self::Upgrade => 14,
+            Self::Link(crate::claude_card::GlassLink::Notice) => 13,
+            Self::Link(crate::claude_card::GlassLink::Line) => 14,
+            Self::Link(crate::claude_card::GlassLink::Announcement) => 15,
+            Self::Upgrade => 16,
         }
     }
 
@@ -403,8 +406,10 @@ impl HarnessChip {
             10 => Self::Title,
             11 => Self::Context,
             12 => Self::Account,
-            13 => Self::Link,
-            14 => Self::Upgrade,
+            13 => Self::Link(crate::claude_card::GlassLink::Notice),
+            14 => Self::Link(crate::claude_card::GlassLink::Line),
+            15 => Self::Link(crate::claude_card::GlassLink::Announcement),
+            16 => Self::Upgrade,
             _ => return None,
         })
     }
@@ -441,7 +446,7 @@ impl HarnessChip {
             | Self::Mode
             | Self::Switch
             | Self::Title
-            | Self::Link
+            | Self::Link(_)
             | Self::Upgrade => None,
         }
     }
@@ -584,7 +589,7 @@ fn push_chips(
         let title = chip.chip == HarnessChip::Title;
         let mut node = Node::new(if title {
             Role::Status
-        } else if chip.chip == HarnessChip::Link {
+        } else if matches!(chip.chip, HarnessChip::Link(_)) {
             Role::Link
         } else if chip.toggled.is_some() {
             Role::Switch
@@ -679,6 +684,9 @@ pub(crate) struct StatsMeter {
 pub(crate) struct StatsGroup {
     /// "Stats deck, newest first".
     pub(crate) name: &'static str,
+    /// The strain gauge at the deck's top left, read first: how hard the whole machine works
+    /// now and lately.
+    pub(crate) gauge: Option<StatsMeter>,
     /// One meter a resource, in row order.
     pub(crate) meters: Vec<StatsMeter>,
     /// The cores' group's name: "18 CPU cores".
@@ -714,6 +722,8 @@ pub(crate) struct StatsLens {
 }
 
 const STATS_LENS: u64 = STATS_BASE + 48;
+/// The strain gauge's meter, past the resource meters' 15 ids.
+const STATS_GAUGE: NodeId = NodeId(STATS_BASE + 16);
 
 fn stats_meter_id(k: usize) -> Option<NodeId> {
     (k < 15).then(|| NodeId(STATS_BASE + 1 + k as u64))
@@ -733,7 +743,11 @@ fn push_stats(nodes: &mut Vec<(NodeId, Node)>, stats: &GridStats) -> NodeId {
     };
     let group = &stats.group;
     let group_id = NodeId(STATS_BASE);
-    let mut children = Vec::with_capacity(group.meters.len() + 1);
+    let mut children = Vec::with_capacity(group.meters.len() + 2);
+    if let Some(m) = &group.gauge {
+        nodes.push((STATS_GAUGE, meter_node(m)));
+        children.push(STATS_GAUGE);
+    }
     for (k, m) in group.meters.iter().enumerate() {
         let Some(id) = stats_meter_id(k) else {
             break;
@@ -2164,6 +2178,7 @@ mod tests {
         let stats = GridStats {
             group: StatsGroup {
                 name: "Stats deck, newest first",
+                gauge: Some(meter("Strain", Some(100.0))),
                 meters: vec![meter("CPU", Some(98.0)), meter("Tokens", None)],
                 cores_name: "2 CPU cores".into(),
                 cores: vec![
@@ -2189,8 +2204,15 @@ mod tests {
         assert_eq!(group.role(), Role::Group);
         assert_eq!(group.label(), Some("Stats deck, newest first"));
         let kids = group.children();
-        assert_eq!(kids.len(), 3, "two meters and the cores");
-        let cpu = node(&update, kids[0]);
+        assert_eq!(kids.len(), 4, "the gauge, two meters and the cores");
+        let gauge = node(&update, kids[0]);
+        assert_eq!(
+            (gauge.role(), gauge.label(), gauge.numeric_value()),
+            (Role::Meter, Some("Strain"), Some(100.0)),
+            "the gauge at the deck's top left is read first"
+        );
+        assert_eq!(gauge.description(), Some("Strain said"));
+        let cpu = node(&update, kids[1]);
         assert_eq!(
             (cpu.role(), cpu.label(), cpu.numeric_value()),
             (Role::Meter, Some("CPU"), Some(98.0))
@@ -2200,13 +2222,13 @@ mod tests {
             (Some(0.0), Some(100.0))
         );
         assert_eq!(cpu.description(), Some("CPU said"));
-        let tokens = node(&update, kids[1]);
+        let tokens = node(&update, kids[2]);
         assert_eq!(
             (tokens.label(), tokens.numeric_value()),
             (Some("Tokens"), None)
         );
         assert_eq!(tokens.description(), Some("Tokens said"));
-        let cores = node(&update, kids[2]);
+        let cores = node(&update, kids[3]);
         assert_eq!(
             (cores.role(), cores.label()),
             (Role::Group, Some("2 CPU cores"))
@@ -2727,7 +2749,9 @@ mod tests {
             HarnessChip::Title,
             HarnessChip::Context,
             HarnessChip::Account,
-            HarnessChip::Link,
+            HarnessChip::Link(crate::claude_card::GlassLink::Notice),
+            HarnessChip::Link(crate::claude_card::GlassLink::Line),
+            HarnessChip::Link(crate::claude_card::GlassLink::Announcement),
             HarnessChip::Upgrade,
         ];
         let mut ids = std::collections::HashSet::new();
@@ -2763,8 +2787,22 @@ mod tests {
                 "Permission mode: click for bypass or auto",
                 8,
             ),
-            at(HarnessChip::Link, "https://alab.systems", 28),
-            at(HarnessChip::Upgrade, "Update Claude Code to 2.1.310", 34),
+            at(
+                HarnessChip::Link(crate::claude_card::GlassLink::Notice),
+                "https://alab.systems",
+                28,
+            ),
+            at(
+                HarnessChip::Link(crate::claude_card::GlassLink::Line),
+                "alab.systems",
+                34,
+            ),
+            at(
+                HarnessChip::Link(crate::claude_card::GlassLink::Announcement),
+                "https://alab.systems",
+                14,
+            ),
+            at(HarnessChip::Upgrade, "Update Claude Code to 2.1.310", 22),
         ];
         let update = grid_tree(
             &snap,
@@ -2779,7 +2817,7 @@ mod tests {
             let title = chip.chip == HarnessChip::Title;
             let role = match chip.chip {
                 HarnessChip::Title => Role::Status,
-                HarnessChip::Link => Role::Link,
+                HarnessChip::Link(_) => Role::Link,
                 _ => Role::Button,
             };
             assert_eq!(n.role(), role, "{:?}", chip.chip);

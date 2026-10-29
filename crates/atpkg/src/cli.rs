@@ -187,10 +187,11 @@ const TABLE: &[Verb] = &[
     Verb {
         name: "serve-units",
         tier: Tier::Occasional,
-        usage: "aterm pkg serve-units [--listen <addr:port>] | --off  — serve the toolset \
-                archives this Mac installs to LAN peers that name it in `[packages] peers` \
-                (opt-in: listens on 0.0.0.0:7487 until stopped, and keeps each archive it \
-                installs from now on beside its build; --off stops keeping them)",
+        usage: "aterm pkg serve-units [--listen <addr:port>] | --off | --on  — LAN sharing \
+                of toolset archives, on by default: aterm serves the archives this Mac keeps \
+                beside its builds to its fleet members while it runs; this serves them in the \
+                foreground (0.0.0.0:7487 until stopped) where aterm does not run; --off stops \
+                every server, keeps no archive and stays off until --on",
         arity: Arity::Own,
         program_flags: None,
         mutates_store: false,
@@ -216,12 +217,13 @@ const TABLE: &[Verb] = &[
         usage: "aterm pkg machine                 — (macOS) the [machine] settings, as the \
                 doctor reads them\n\
                 aterm pkg machine apply           — apply them now (by default Universal \
-                Control off for this host, Rosetta 2 on Apple silicon), then reclaim what \
-                `machine cache` lists\n\
-                aterm pkg machine cache           — what the apply would take from the Rust \
-                build cache, the tooling cache and the retired verify gate's leftovers, and \
-                why; removes nothing\n\
-                aterm pkg machine cache clean     — reclaim only that, without applying host \
+                Control off for this host, Rosetta 2 on Apple silicon), then attempt cache \
+                cleanup\n\
+                aterm pkg machine cache           — advisory cleanup candidates and their \
+                footprints in the Rust build cache, tooling cache and retired verify gate's \
+                leftovers; cleanup rechecks eligibility and checks active use of build and \
+                tooling caches; removes nothing\n\
+                aterm pkg machine cache clean     — run that cleanup, without applying host \
                 settings",
         arity: Arity::Own,
         program_flags: None,
@@ -236,7 +238,10 @@ const TABLE: &[Verb] = &[
                 available memory, swap, free disk above the floor the window's disk watch holds \
                 <path>'s volume to) and the \
                 claims every session's heavy or timing-sensitive work holds or waits for; \
-                read-only",
+                read-only. Each claim, held or waiting, says what it reserves against the claims \
+                behind it (`mem <need>, reserves <size>`, `disk <need> on <volume>, reserves \
+                <size>`; --json: `reserved_mem`, `reserved_disk`), and a waiter whose disk is more \
+                than its volume has free above the floor is `unservable`",
         arity: Arity::Own,
         program_flags: None,
         mutates_store: false,
@@ -541,12 +546,21 @@ fn levenshtein(a: &str, b: &str) -> usize {
 
 /// The whole package-manager CLI as a callable.
 pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
+    // A pass the window runs and copies into its aterm.log says its notices in the log's form.
+    crate::notice::stderr_form_from_env();
     // The private window's lead ([`PRIVATE_STATE_ROOT_FLAG`]), taken off before anything
     // reads the first word as the verb: this pass carries no `[machine]` edit, whatever this
     // build's seams say.
-    if argv.first().and_then(|v| v.to_str()) == Some(PRIVATE_STATE_ROOT_FLAG) {
+    let private_lead = argv.first().and_then(|v| v.to_str()) == Some(PRIVATE_STATE_ROOT_FLAG);
+    if private_lead {
         argv.remove(0);
-        PRIVATE_STATE_ROOT_LEAD.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    PRIVATE_STATE_ROOT_LEAD.with(|cell| cell.set(private_lead));
+    HEAD_WATCH_PASS.with(|cell| cell.set(false));
+    DEFER_BUSY_FLIP.with(|cell| cell.set(false));
+    if argv.first().and_then(|v| v.to_str()) == Some(crate::build_cache::registered::REGISTER_VERB)
+    {
+        return crate::build_cache::registered::run_hidden(&argv[1..]);
     }
     if argv.first().and_then(|v| v.to_str()) == Some(crate::warm::HIDDEN_VERB) {
         return crate::warm::run_hidden(&argv[1..]);
@@ -564,17 +578,13 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
         Some("seed" | "update" | "install")
     ) {
         strip_progress_file_flag(&mut args);
-        if take_flag(&mut args, HEAD_WATCH_FLAG) {
-            HEAD_WATCH_PASS.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
+        HEAD_WATCH_PASS.with(|cell| cell.set(take_flag(&mut args, HEAD_WATCH_FLAG)));
         if let Some(bound) = take_wait_lock_flag(&mut args) {
             configure_wait_lock(&args, bound);
         }
         if args.first().is_some_and(|verb| verb == "update") {
             PUBLISHED_INDEX_HINT.with(|hint| hint.set(take_published_index_hint_flag(&mut args)));
-            if take_flag(&mut args, DEFER_BUSY_FLIP_FLAG) {
-                DEFER_BUSY_FLIP.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
+            apply_defer_busy_flip_flag(&mut args);
         }
     }
     let verb = args.first().map(String::as_str);
@@ -1164,6 +1174,9 @@ pub const PUBLISHED_INDEX_HINT_FLAG: &str = "--published-index-hint";
 
 thread_local! {
     static PUBLISHED_INDEX_HINT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static HEAD_WATCH_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PRIVATE_STATE_ROOT_LEAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DEFER_BUSY_FLIP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn take_published_index_hint_flag(args: &mut Vec<String>) -> Option<u64> {
@@ -1181,16 +1194,20 @@ fn take_published_index_hint_flag(args: &mut Vec<String>) -> Option<u64> {
     hint
 }
 
-static HEAD_WATCH_PASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 fn take_flag(args: &mut Vec<String>, flag: &str) -> bool {
     let before = args.len();
     args.retain(|a| a != flag);
     args.len() != before
 }
 
+fn apply_defer_busy_flip_flag(args: &mut Vec<String>) -> bool {
+    let defer = take_flag(args, DEFER_BUSY_FLIP_FLAG);
+    DEFER_BUSY_FLIP.with(|cell| cell.set(defer));
+    defer
+}
+
 fn head_watch_pass() -> bool {
-    HEAD_WATCH_PASS.load(std::sync::atomic::Ordering::Relaxed)
+    HEAD_WATCH_PASS.with(std::cell::Cell::get)
 }
 
 /// The flag the unattended lanes (the window's package loop, a terminal session's detached pass) put on every whole `update`.
@@ -1199,18 +1216,13 @@ pub const DEFER_BUSY_FLIP_FLAG: &str = "--defer-busy-flip";
 /// The word a window under a private state root puts ahead of the verb of every pass it spawns.
 pub const PRIVATE_STATE_ROOT_FLAG: &str = "--private-state-root";
 
-static PRIVATE_STATE_ROOT_LEAD: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 fn under_private_state_root() -> bool {
-    PRIVATE_STATE_ROOT_LEAD.load(std::sync::atomic::Ordering::Relaxed)
+    PRIVATE_STATE_ROOT_LEAD.with(std::cell::Cell::get)
         || aterm_types::dirs::runs_under_private_state_root()
 }
 
-static DEFER_BUSY_FLIP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 fn flip_policy() -> crate::quiet::FlipPolicy {
-    if DEFER_BUSY_FLIP.load(std::sync::atomic::Ordering::Relaxed) {
+    if DEFER_BUSY_FLIP.with(std::cell::Cell::get) {
         crate::quiet::FlipPolicy::WhenQuiet
     } else {
         crate::quiet::FlipPolicy::Now
@@ -2303,11 +2315,35 @@ fn wait_then_run(
         eprintln!("{}", not_installed_fix(program));
         return ExitCode::from(127);
     }
+    #[cfg(unix)]
+    if let Some(shim) = gated_shim(layout, tool) {
+        use std::os::unix::process::CommandExt as _;
+        #[expect(
+            clippy::disallowed_types,
+            reason = "a pending stub becomes the landed program's shim by exec: its caller's descriptors are the shim's"
+        )]
+        let err = std::process::Command::new(&shim).args(passthrough).exec();
+        eprintln!("atpkg: could not run {}: {err}", shim.display());
+        return ExitCode::from(126);
+    }
     let mut rest = Vec::with_capacity(passthrough.len() + 2);
     rest.push(tool.to_string());
     rest.push("--".to_string());
     rest.extend_from_slice(passthrough);
     cmd_run(&rest)
+}
+
+/// THE SHIM A PENDING STUB HANDS A PROGRAM WITH A SIGN-IN GATE ONCE IT LANDS: its `bin/` shim,
+/// which carries the sign-in block ([`crate::platform::sh_signin_prelude`]) the twin does, so a
+/// signed-out interactive launch under aterm stops at `aterm harness signin` before the program
+/// can open a sign-in page in the person's browser. [`cmd_run`] would exec the store build past
+/// that block (`docs/DESIGN-harness-repos-2026-10-24.md` D44). `None` for a row with no gate,
+/// which keeps `cmd_run`'s path, and for a tool name atpkg refuses.
+#[cfg(unix)]
+fn gated_shim(layout: &crate::store::Layout, tool: &str) -> Option<std::path::PathBuf> {
+    let program = crate::stub::program_of_in(layout, tool);
+    crate::vendor_direct::spec(&program)?.signin_gate.as_ref()?;
+    Some(layout.shim(&crate::store::ToolName::new(tool)?))
 }
 
 fn landed_without_line(layout: &crate::store::Layout, program: &str, tool: &str) -> String {
@@ -2611,7 +2647,8 @@ fn print_unreachable_followup(e: &crate::FlowError, rerun: &str) {
     }
 }
 
-/// `serve-units`: serve this store's kept units on the LAN until stopped, or `--off`.
+/// `serve-units`: serve this store's kept units on the LAN in the foreground until stopped;
+/// `--off` turns LAN sharing off for good and `--on` back on.
 fn cmd_serve_units(rest: &[String]) -> ExitCode {
     let Some(layout) = layout() else {
         return ExitCode::from(1);
@@ -2621,13 +2658,32 @@ fn cmd_serve_units(rest: &[String]) -> ExitCode {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--off" if rest.len() == 1 => {
-                return match crate::peers::serve_off(&layout) {
+                return match crate::peers::turn_off(&layout) {
                     Ok(()) => {
-                        println!("atpkg: serve-units: off — this Mac keeps no toolset archives");
+                        println!(
+                            "atpkg: serve-units: off — this Mac keeps and serves no toolset \
+                             archive until `aterm pkg serve-units --on`"
+                        );
                         ExitCode::SUCCESS
                     }
                     Err(e) => {
                         eprintln!("atpkg: serve-units: --off: {e}");
+                        ExitCode::from(1)
+                    }
+                };
+            }
+            "--on" if rest.len() == 1 => {
+                return match crate::peers::turn_on(&layout) {
+                    Ok(()) => {
+                        println!(
+                            "atpkg: serve-units: on — aterm serves this Mac's toolset archives \
+                             to its fleet members while it runs, and keeps each one it installs \
+                             while it serves"
+                        );
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("atpkg: serve-units: --on: {e}");
                         ExitCode::from(1)
                     }
                 };
@@ -2647,12 +2703,26 @@ fn cmd_serve_units(rest: &[String]) -> ExitCode {
     }
     match crate::peers::serve(&layout, listen, |bound| {
         println!(
-            "atpkg: serve-units: serving this Mac's toolset archives on {bound} — another Mac \
-             takes them with `[packages] peers = [\"<this Mac's address>:{}\"]`; Ctrl-C stops",
+            "atpkg: serve-units: serving this Mac's toolset archives on {bound} — its fleet \
+             members take them unasked, another Mac with `[packages] peers = [\"<this Mac's \
+             address>:{}\"]`; Ctrl-C stops",
             bound.port()
         );
     }) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            println!("atpkg: serve-units: stopped — LAN sharing was turned off (`--off`)");
+            ExitCode::SUCCESS
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            match crate::peers::serving(&layout) {
+                Some(at) => eprintln!(
+                    "atpkg: serve-units: this Mac already serves its toolset archives on {at} \
+                     (aterm serves them while it runs)"
+                ),
+                None => eprintln!("atpkg: serve-units: {listen}: {e}"),
+            }
+            ExitCode::from(1)
+        }
         Err(e) => {
             eprintln!("atpkg: serve-units: {e}");
             ExitCode::from(1)
@@ -5165,7 +5235,7 @@ fn github_fetcher(layout: &crate::store::Layout) -> crate::GithubFetcher {
         .with_overrides(crate::repo_overrides(cfg))
         .with_index_floor(floor)
         .with_index_hint(hint)
-        .with_unit_peers(crate::peers::configured(&cfg.peers))
+        .with_unit_peers(crate::peers::unit_peers(cfg.peers.as_deref()))
 }
 
 fn discovery_hint(
@@ -5344,13 +5414,52 @@ fn removed_programs(layout: &crate::store::Layout) -> std::collections::BTreeSet
     layout.removed_programs()
 }
 
-/// The programs this machine keeps complete: the index's default set
-/// ([`crate::manifest::Index::default_set`]), so a harness lands only when a person names it.
+/// The default set on `triple` before `[packages].exclude` narrows it, the one list every
+/// surface completes and judges (`install --default-set`, the update pass that follows
+/// `seed`, `pkg doctor`'s toolset row): every program the index lists, an ALab harness
+/// included ([`crate::manifest::Index::installable`]; owner ruling 2026-10-27, "everything
+/// must be ON BY DEFAULT in atpkg!!!"), and its vendor half ([`vendor_set_here`]).
+pub(crate) fn default_set_here(
+    index: &crate::manifest::Index,
+    triple: &str,
+) -> std::collections::BTreeSet<String> {
+    let mut set = index.installable(&[]);
+    set.extend(vendor_set_here(
+        triple,
+        &crate::config::PackagesConfig::default(),
+        &std::collections::BTreeSet::new(),
+    ));
+    set
+}
+
+/// The vendor half of the default set on `triple`: every vendor row
+/// ([`crate::vendor_direct::VENDORS`]) that serves `triple` and [`vendor_wanted`] admits for
+/// `cfg` and `removed`. It needs no index, as the vendor lane lands these from their vendors.
+/// The lane's own plan ([`vendor_plan_reading`], [`read_vendors_ahead`]) also takes a wanted
+/// row that serves no build here, and answers it `unavailable on <target>` without asking a
+/// host, so what it can land is this set.
+pub(crate) fn vendor_set_here(
+    triple: &str,
+    cfg: &crate::config::PackagesConfig,
+    removed: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<String> {
+    crate::vendor_direct::VENDORS
+        .iter()
+        .filter(|spec| spec.serves(triple) && vendor_wanted(cfg, removed, spec.program))
+        .map(|spec| spec.program.to_owned())
+        .collect()
+}
+
+/// The programs this machine keeps complete: [`default_set_here`] less `[packages].exclude`.
+/// A removal (`aterm pkg uninstall`) is the caller's to weigh ([`removed_programs`]).
 pub(crate) fn wanted_programs(
     index: &crate::manifest::Index,
     cfg: &crate::config::PackagesConfig,
+    triple: &str,
 ) -> std::collections::BTreeSet<String> {
-    index.default_set(cfg.exclude())
+    let mut set = default_set_here(index, triple);
+    set.retain(|program| !cfg.exclude().iter().any(|excluded| excluded == program));
+    set
 }
 
 fn reconcile_system_satisfied_with(
@@ -6309,43 +6418,50 @@ fn cache_plan_words(why: crate::build_cache::Unused) -> String {
     };
     match why {
         Unused::Gone { idle, after } => format!(
-            "goes whole: its workspace is gone and nothing wrote it for {} (the pass takes one \
-             unwritten {})",
+            "candidate for the whole folder: its workspace is gone and nothing wrote it for {} \
+             (age threshold {})",
             days(idle),
             days(after)
         ),
         Unused::Idle { idle } => format!(
-            "goes whole: nothing wrote it for {}, a month or more",
+            "candidate for the whole folder: nothing wrote it for {}, a month or more",
             days(idle)
         ),
         Unused::Moved { idle, after } => format!(
-            "goes whole: it is in the root the cache moved from (builds now go under .ubd, out \
-             of fseventsd's stream) and nothing wrote it for {} (the pass takes one unwritten {})",
+            "candidate for the whole folder: it is in the root the cache moved from (builds now \
+             go under .ubd, out of fseventsd's stream) and nothing wrote it for {} (age threshold \
+             {})",
             days(idle),
             days(after)
         ),
         Unused::Unfinished => {
-            "an earlier pass moved it aside and did not finish removing it".to_owned()
+            "candidate: an earlier pass moved it aside and did not finish removing it".to_owned()
         }
         Unused::Tooling { idle, after } => format!(
-            "goes whole: a pinned tool nothing ran for {} (the pass takes one unused \
+            "candidate for the whole tool folder: no use observed for {} (age threshold \
              {}; `targo --unverified verify provision` lays it again, with `--linux` for the \
              Linux lane's rows and `--record` for wasm-bindgen)",
             days(idle),
             days(after)
         ),
-        Unused::GivenUp => "goes whole: a scratch a failed provisioning run left, past \
-                            macOS's first-exec assessment of what ran from it"
+        Unused::GivenUp => "candidate for the whole scratch folder: a failed provisioning run \
+                            left it after execution was observed"
             .to_owned(),
         Unused::Stale {
             incremental,
             units,
             after,
         } => format!(
-            "stays; {incremental} incremental crate folder(s) and {units} unit(s) built by a \
-             compiler that is no longer the store's current one go, each unwritten for {} or \
-             more",
+            "partial cleanup candidate: {incremental} incremental crate folder(s) and {units} \
+             unit(s) built by a compiler that is no longer the store's current one, each \
+             unwritten for {} or more",
             days(after)
+        ),
+        Unused::Stayed { stayed, freed } => format!(
+            "stays staged: {stayed} entr{} of it would not go even once made removable, and {} \
+             of it went; the next pass tries again",
+            if stayed == 1 { "y" } else { "ies" },
+            crate::cost::human_bytes(freed)
         ),
     }
 }
@@ -6408,16 +6524,32 @@ fn retire_verify_gate() -> usize {
 }
 
 fn reclaim_build_cache() -> usize {
+    use crate::build_cache::Unused;
     let retired = retire_verify_gate();
     let removed = crate::build_cache::reclaim_home();
+    let mut stayed = 0;
+    for (stage, why) in &removed {
+        if let Unused::Stayed {
+            stayed: count,
+            freed,
+        } = *why
+        {
+            stayed += 1;
+            println!(
+                "{}; {} of it went, and the next pass tries again",
+                crate::build_cache::remove::stayed_words(stage, count),
+                crate::cost::human_bytes(freed)
+            );
+        }
+    }
     let parts = removed
         .iter()
-        .filter(|(_, why)| matches!(why, crate::build_cache::Unused::Stale { .. }))
+        .filter(|(_, why)| matches!(why, Unused::Stale { .. }))
         .count();
-    if removed.len() > parts {
+    if removed.len() > parts + stayed {
         println!(
             "removed {} unused Rust build cache folder(s)",
-            removed.len() - parts
+            removed.len() - parts - stayed
         );
     }
     if parts > 0 {
@@ -6508,7 +6640,7 @@ fn cmd_machine(rest: &[String]) -> ExitCode {
                     one.path.display(),
                     cache_plan_words(one.why),
                     if one.held {
-                        " — a build holds its locks now, so a pass now keeps it"
+                        " — Cargo locks were unavailable when checked"
                     } else {
                         ""
                     }
@@ -6537,12 +6669,14 @@ fn cmd_machine(rest: &[String]) -> ExitCode {
             }
             let gate = leftovers.iter().filter(|l| l.goes()).count();
             println!(
-                "{} to go from {} Rust build cache folder(s){} at the next `aterm pkg machine \
-                 apply` (nothing removed now)",
+                "Sum of candidate footprints: {} across {} cache candidate(s){} (nothing removed \
+                 now)\nCleanup rechecks eligibility and active use. Candidates may be kept.\n\
+                 Candidates may overlap; the sum can count \
+                 the same bytes more than once.",
                 crate::cost::human_bytes(total),
                 planned.len(),
                 if gate > 0 {
-                    format!(" and {gate} retired verify gate folder(s)")
+                    format!(" and {gate} retired verify gate candidate(s)")
                 } else {
                     String::new()
                 }
@@ -6553,14 +6687,14 @@ fn cmd_machine(rest: &[String]) -> ExitCode {
             let problem = if let [word] = other {
                 format!(
                     "unknown argument {word:?} — a bare `machine` reads, `machine apply` \
-                     applies, `machine cache` shows what the apply would take from the build \
-                     cache, and `machine cache clean` reclaims only that cache"
+                     applies, `machine cache` previews advisory cache cleanup candidates, \
+                     and `machine cache clean` attempts that cleanup"
                 )
             } else {
                 format!(
                     "too many arguments ({}) — a bare `machine` reads, `machine apply` \
-                     applies, `machine cache` shows what the apply would take from the build \
-                     cache, and `machine cache clean` reclaims only that cache",
+                     applies, `machine cache` previews advisory cache cleanup candidates, \
+                     and `machine cache clean` attempts that cleanup",
                     other.len()
                 )
             };
@@ -7148,19 +7282,11 @@ fn answer_announcement(ok: bool) {
 const SEED_FOLLOW_ON: &str = "atpkg: these tools are on PATH in every aterm shell — \
                               aterm pkg list shows them; aterm <tool> runs one anywhere";
 
-const fn should_complete_set(
-    consent: bool,
-    adopted: bool,
-    asked: bool,
-    enabled: bool,
-    declined: bool,
-    config_unreadable: bool,
-) -> bool {
-    consent && (adopted || asked) && enabled && !declined && !config_unreadable
-}
-
-fn declined(layout: &crate::store::Layout) -> bool {
-    layout.declined().is_file()
+/// Whether the pass completes the default set: no off of a person's
+/// ([`crate::adoption::unattended_install_off`]) and the set taken on, by adoption or a written
+/// `auto_install = true`.
+const fn should_complete_set(consented: bool, adopted: bool, asked: bool) -> bool {
+    consented && (adopted || asked)
 }
 
 fn record_decline(layout: &crate::store::Layout) {
@@ -8390,12 +8516,9 @@ impl Drop for PromiseEnds<'_> {
 
 fn completes_the_set(layout: &crate::store::Layout, cfg: &crate::config::PackagesConfig) -> bool {
     should_complete_set(
-        cfg.installs_unattended(),
+        crate::adoption::unattended_install_off(layout, cfg).is_none(),
         adopted(layout),
         cfg.auto_install == Some(true),
-        cfg.enabled(),
-        declined(layout),
-        cfg.unreadable,
     )
 }
 
@@ -8811,7 +8934,7 @@ fn run_update_pass_in<'scope, 'env>(
         resolved
             .as_ref()
             .and_then(|answer| answer.as_ref().ok())
-            .map(&apply_index)
+            .map(apply_index)
     } else {
         None
     };
@@ -9365,14 +9488,7 @@ fn install_default_set_inner(
     let ch = &ch;
     let groups = crate::apply::plan_groups_here(layout, index, ch, current_triple());
     let mut installed = crate::active_builds(layout);
-    let mut wanted = wanted_programs(index, cfg);
-    for spec in crate::vendor_direct::VENDORS {
-        if spec.serves(current_triple())
-            && vendor_wanted(cfg, &std::collections::BTreeSet::new(), spec.program)
-        {
-            wanted.insert(spec.program.to_string());
-        }
-    }
+    let mut wanted = wanted_programs(index, cfg, current_triple());
     for p in removed_programs(layout) {
         wanted.remove(&p);
     }
@@ -9932,14 +10048,7 @@ fn prefetch_set_manifests(
         return;
     };
     let groups = crate::apply::plan_groups_here(layout, index, &ch, triple);
-    let mut wanted = wanted_programs(index, cfg);
-    for spec in crate::vendor_direct::VENDORS {
-        if spec.serves(triple)
-            && vendor_wanted(cfg, &std::collections::BTreeSet::new(), spec.program)
-        {
-            wanted.insert(spec.program.to_string());
-        }
-    }
+    let mut wanted = wanted_programs(index, cfg, triple);
     for p in removed_programs(layout) {
         wanted.remove(&p);
     }
@@ -10560,7 +10669,7 @@ fn seed_serviceable(
         layout,
         fetcher,
         index,
-        &wanted_programs(index, cfg),
+        &wanted_programs(index, cfg, current_triple()),
         &removed_programs(layout),
     )
 }
@@ -10673,7 +10782,7 @@ fn index_serves(
     if !seed_serviceable(layout, fetcher, index, cfg).is_empty() {
         return IndexServes::Yes;
     }
-    let unnarrowed = index.default_set(&[]);
+    let unnarrowed = default_set_here(index, current_triple());
     let everything = serviceable_among(
         layout,
         fetcher,
@@ -11011,7 +11120,7 @@ fn recorded_unusable_body(
     if state != crate::state::TOOLSET_UNSERVED {
         let index = read_cached_index()?;
         let removed = removed_programs(layout);
-        if wanted_programs(&index, cfg)
+        if wanted_programs(&index, cfg, current_triple())
             .iter()
             .any(|program| !removed.contains(program))
         {
@@ -11477,17 +11586,16 @@ struct VendorLanes {
     complete_the_set: bool,
 }
 
-/// Whether the default set holds `program` and `[packages].exclude` and this machine's
-/// removals leave it wanted. A vendor row outside the default set (grok, kimi) is never
-/// wanted: it lands only when a person installs it, and is updated once installed.
+/// Whether `[packages].exclude` and this machine's removals leave `program` wanted: the one
+/// membership test of the default set's vendor half ([`vendor_set_here`] adds that the row
+/// serves the machine). Every vendor row is in the default set, so a person's exclude or
+/// removal is the only thing that keeps one off a machine it serves.
 pub(crate) fn vendor_wanted(
     cfg: &crate::config::PackagesConfig,
     removed: &std::collections::BTreeSet<String>,
     program: &str,
 ) -> bool {
-    crate::vendor_direct::spec(program).is_none_or(|s| s.default_set)
-        && !cfg.exclude().iter().any(|p| p == program)
-        && !removed.contains(program)
+    !cfg.exclude().iter().any(|p| p == program) && !removed.contains(program)
 }
 
 fn vendor_set_wanted_on(
@@ -11495,9 +11603,7 @@ fn vendor_set_wanted_on(
     cfg: &crate::config::PackagesConfig,
     removed: &std::collections::BTreeSet<String>,
 ) -> bool {
-    crate::vendor_direct::VENDORS
-        .iter()
-        .any(|spec| spec.serves(triple) && vendor_wanted(cfg, removed, spec.program))
+    !vendor_set_here(triple, cfg, removed).is_empty()
 }
 
 fn legacy_index_for(
@@ -12100,7 +12206,23 @@ fn fresh_landing_terminal(arrived: &[&str], deferred: &[&str], planned: usize) -
     ))
 }
 
-const SIGNATURE_WAIT_CLAUSE: &str = "signature check to finish";
+/// What every line a pass prints of a program it leaves for its next pass says: a vendor
+/// landing whose signature check did not finish (`Verdict::Deferred`'s line, and the pass's
+/// terminal when every announced landing waits so). [`left_for_next_pass`] reads it.
+pub(crate) const SIGNATURE_WAIT_CLAUSE: &str = "signature check to finish";
+
+/// The lines of a pass's `output` (its stdout and stderr) that leave a program for the next
+/// pass, as atpkg printed them: no fault, so the pass exits 0 with that program not installed
+/// (`aterm init`'s `base.pkg.toolset` stands aside on them instead of failing).
+#[must_use]
+pub fn left_for_next_pass(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains(SIGNATURE_WAIT_CLAUSE))
+        .map(str::to_owned)
+        .collect()
+}
 
 fn report_vendor(
     layout: &crate::store::Layout,
@@ -12564,25 +12686,52 @@ fn report_channel_apply(
         names.extend(failed_names);
         record_outcome(layout, failed_programs_outcome(&names));
     }
-    if let Some(line) = channel_apply_summary(&current, &moved, other_outcomes, whole_set) {
+    if let Some(line) = channel_apply_summary(
+        &current,
+        &moved,
+        other_outcomes,
+        whole_set,
+        crate::flow::last_resolve().as_ref(),
+    ) {
         println!("atpkg: {line}");
     }
     failures
 }
 
+/// What a pass's summary adds when its index came from the cache: the index did not answer, so
+/// "up to date" is as of that copy and nothing newer could be seen (round 12: an offline pass
+/// said "all 11 ALab tools are up to date" and nothing more, then exited offline).
+fn cached_index_clause(resolve: Option<&crate::flow::ResolveProvenance>) -> String {
+    match resolve {
+        Some(resolve) if !resolve.reached => format!(
+            " (by the cached index: {})",
+            resolve
+                .why
+                .as_deref()
+                .map_or_else(|| String::from("the index was not reached"), clip_cause)
+        ),
+        _ => String::new(),
+    }
+}
+
+/// The pass's one summary line (after `atpkg: `), or none when nothing is current or moved:
+/// what moved, what is up to date, and [`cached_index_clause`] for the index `resolve` says it
+/// came from.
 fn channel_apply_summary(
     current: &[String],
     moved: &[(String, Option<u64>, u64)],
     other_outcomes: bool,
     whole_set: bool,
+    resolve: Option<&crate::flow::ResolveProvenance>,
 ) -> Option<String> {
+    let clause = cached_index_clause(resolve);
     if moved.is_empty() {
         return match (current.len(), other_outcomes, whole_set) {
             (0, _, _) => None,
-            (1, _, _) => Some(format!("{} is up to date", current[0])),
-            (_, _, false) => Some(format!("{} are up to date", current.join(", "))),
-            (n, false, true) => Some(format!("all {n} ALab tools are up to date")),
-            (n, true, true) => Some(format!("{n} ALab tools are up to date")),
+            (1, _, _) => Some(format!("{} is up to date{clause}", current[0])),
+            (_, _, false) => Some(format!("{} are up to date{clause}", current.join(", "))),
+            (n, false, true) => Some(format!("all {n} ALab tools are up to date{clause}")),
+            (n, true, true) => Some(format!("{n} ALab tools are up to date{clause}")),
         };
     }
     let mut runs: Vec<(Vec<&str>, Option<u64>, u64)> = Vec::new();
@@ -12603,6 +12752,7 @@ fn channel_apply_summary(
     if !current.is_empty() {
         line.push_str("; the rest are up to date");
     }
+    line.push_str(&clause);
     Some(line)
 }
 
@@ -12770,10 +12920,21 @@ fn cmd_verify(program: Option<&String>) -> ExitCode {
     }
     for (name, o) in &outcomes {
         use crate::verify::VerifyOutcome::{
-            BuildMismatch, Drift, Match, NoSignedRoot, NotInstalled, Unreadable, VendorRoot,
-            WiredSysroot,
+            BuildMismatch, DevLinkUnavailable, DevLinked, Drift, Match, NoSignedRoot, NotInstalled,
+            Unreadable, VendorRoot, WiredSysroot,
         };
         match o {
+            DevLinked { checkout } => {
+                eprintln!(
+                    "atpkg: {name} is dev-linked to {} — not attested against a signed store tree; managed from that checkout",
+                    checkout.display()
+                );
+            }
+            DevLinkUnavailable { error } => {
+                eprintln!(
+                    "atpkg: {name} development link is unavailable: {error} — inspect the checkout and `aterm pkg which {name}`"
+                );
+            }
             VendorRoot {
                 build,
                 vendor,

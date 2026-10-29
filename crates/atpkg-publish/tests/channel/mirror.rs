@@ -394,6 +394,27 @@ fn every_build_any_target_resolves_is_mirrored_once() {
 fn a_quad_missing_its_roster_moves_no_pack() {
     let (rig, _) = setup("mirror-quad", index());
     let dir = rig.path("quad");
+    let flag_err = mirror::run(&rig.ctx, &["-n".into(), dir.display().to_string()])
+        .expect_err("single-dash flag is not a quad dir");
+    assert_eq!(flag_err.exit_code(), 2, "{flag_err}");
+    assert!(
+        flag_err
+            .to_string()
+            .contains("mirror: unknown argument `-n`"),
+        "{flag_err}"
+    );
+
+    std::fs::write(&rig.ctx.tokens.channel, "  \n").expect("whitespace token");
+    let blank_err = mirror::run(&rig.ctx, &[dir.display().to_string()])
+        .expect_err("whitespace-only channel token refused before mirroring");
+    assert!(
+        blank_err
+            .to_string()
+            .contains("publishing needs the public owner's token at ~/.secrets/"),
+        "{blank_err}"
+    );
+    assert!(rig.host.calls().is_empty());
+
     std::fs::remove_file(dir.join("aterm-machines.toml")).expect("rm");
     let e = mirror::run(&rig.ctx, &[dir.display().to_string(), "--dry-run".into()])
         .expect_err("refused");

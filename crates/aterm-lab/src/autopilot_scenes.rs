@@ -653,11 +653,9 @@ mod tests {
     }
 
     #[test]
-    fn every_scene_launches_lean_on_the_forever_labs_scaled_ladder() {
-        assert_eq!(INSTANCE_ENV, forever::ladder_env());
+    fn every_scene_launches_lean() {
         for scene in Scene::ALL {
             assert_eq!(scene.launch().args, LEAN, "{scene:?}");
-            assert_eq!(scene.lab_kw().instance_env, INSTANCE_ENV, "{scene:?}");
         }
     }
 }

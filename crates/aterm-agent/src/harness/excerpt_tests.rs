@@ -225,10 +225,9 @@ fn a_cut_never_falls_inside_a_join_code() {
     use aterm_net::fleet_member::code_spans;
     let code = aterm_net::fleet_member::JoinCode {
         secret: [0x5a; aterm_net::fleet_member::SECRET_LEN],
-        host: "m7.local".to_owned(),
-        port: 7100,
+        hint: None,
     }
-    .text();
+    .text_at(("m7.local", 7100));
     let groups: Vec<String> = code["atf1-".len()..]
         .split('@')
         .next()

@@ -1,0 +1,22 @@
+{
+  "now_s": 1793320000,
+  "local_label": "m15",
+  "census": {
+    "generated_at": 1793319980,
+    "members": [
+      { "label": "m15", "aliases": [], "version": "0.146.0", "window": true, "sessions": 1, "last_seen": 1793319995 },
+      { "label": "m100", "aliases": ["m32"], "host": "m100.local", "version": "0.146.0", "window": false, "sessions": 0, "last_seen": 1793316400, "accounts": { "warm": 1, "leased": 0, "walled": 1 } },
+      { "label": "m101", "aliases": [], "host": "m101.local" },
+      { "label": "m102", "aliases": [], "host": "m102.local", "version": "0.146.0", "window": false, "sessions": 0, "last_seen": 1793319995 }
+    ],
+    "stragglers": [
+      { "name": "guest-mac", "host": "guest-mac.local", "reason": "no aterm" }
+    ]
+  },
+  "configured": [
+    { "uuid": "alias-cache", "name": "m32", "address": "m32.local", "state": { "last_seen": 1793320000, "hello": "{\"os_version\":\"27.0\",\"vitals\":{\"cpu_busy_pct\":12,\"cpu_cores\":18},\"sessions\":[{\"instance_pid\":71,\"local_id\":2,\"sid\":\"offline-example\",\"program\":\"codex\",\"agent\":\"busy\",\"task\":\"Offline monitor example\"}]}" } },
+    { "uuid": "canonical-cache", "name": "m100", "address": "m100.local", "state": { "last_seen": 1793320000, "hello": "{\"os_version\":\"27.0\",\"vitals\":{\"cpu_busy_pct\":12,\"cpu_cores\":18},\"sessions\":[{\"instance_pid\":72,\"local_id\":3,\"sid\":\"offline-second\",\"program\":\"claude\",\"agent\":\"idle\",\"task\":\"Second cached monitor observation\"}]}" } },
+    { "uuid": "repeat-cache", "name": "m32", "address": "m32.local", "state": { "last_seen": 1793320000, "hello": "{\"sessions\":[{\"instance_pid\":71,\"local_id\":2,\"sid\":\"offline-example\",\"program\":\"codex\",\"agent\":\"busy\",\"task\":\"Offline monitor example\"}]}" } },
+    { "uuid": "zero-cache", "name": "m102", "address": "m102.local", "state": { "last_seen": 1793320000, "hello": "{\"sessions\":[]}" } }
+  ]
+}

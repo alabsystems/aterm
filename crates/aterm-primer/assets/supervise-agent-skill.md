@@ -2,7 +2,7 @@
 name: supervise-agent
 description: Run other Claude Code, codex-alab, agy or Muse Code sessions in aterm tabs as workers — start each on a task, wait for them in the background, read each one's result and check it against ground truth (tests, diff, exit codes) — or oversee another program (a codex-alab, a REPL, a long build) in an aterm session. Use when asked to hand work to other sessions or windows, run work in parallel in aterm, say what every aterm session or machine is doing, manage or babysit another agent, or act as a lead over workers.
 ---
-<!-- aterm skill v15 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v19 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # Workers: other aterm sessions doing the work
 
@@ -34,10 +34,11 @@ under `cruise`, no report ends it).
 - `ERR unsupervised: <switch>` means the harness would not carry the worker (`[harness]
   enabled = false`, `[harness] headless = false` in headless, `[harness.<agent>] enabled =
   false`, or `[harness] autopilot = "off"`), so nothing was spawned.
-- On another fleet Mac that granted `aterm fleet allow drive --from <this Mac>`, pass
-  `--host <h>`: `aterm ctl --host <h> spawn agent=claude cwd=<absolute path there> - < task`,
-  then `aterm ctl --host <h> await task @<w> since=0` (`aterm help workers`, ON ANOTHER
-  MAC). Without a drive grant, read fleet sessions with `aterm ctl survey --fleet`.
+- On another fleet Mac that granted `aterm fleet allow drive --from <this Mac>` (or `--all`,
+  every member), pass `--host <h>`: `aterm ctl --host <h> spawn agent=claude cwd=<absolute
+  path there> - < task`, then `aterm ctl --host <h> await task @<w> since=0` (`aterm help
+  workers`, ON ANOTHER MAC). Without a drive grant, read fleet sessions with `aterm ctl
+  survey --fleet`.
 
 Start every worker first, then wait for them together.
 
@@ -45,8 +46,15 @@ Start every worker first, then wait for them together.
 
 ```sh
 # Claude Code: Bash with run_in_background, then end your turn
+# codex-alab: in the foreground, bounded: add timeout=600000
 aterm ctl await task @s-a,@s-b,@s-c since=0
 ```
+
+codex-alab's shell tool wakes no turn when a command ends, so a codex lead runs the wait in
+the foreground with `timeout=<ms>` and re-arms it: on exit 124 (`OK timeout`) the rows it
+printed name each worker's rev, and the next wait names them (`@s-b:7,@s-c:4`). If the tool
+call returns while the wait still runs, read that same process until it exits; never park a
+second wait beside it.
 
 Its exit wakes you and prints `@<sid> rev=<n> state=<s> agent=<word> program_state=<w|->
 attention=<pct|-> result_bytes=<n>` per worker as soon as one is `done`, `exited`, `stalled`
@@ -83,7 +91,7 @@ aterm ctl @s-a result full    # the whole exchange since the task
 Reports over 24,000 chars end `… truncated; full: <path>` (read `<path>` before closing the
 worker). Claude Code's result comes from its transcript, codex-alab's from its rollout;
 agy's and Muse Code's from the screen (`source=` in the reply; `result full`
-reads only a transcript). `ERR result unavailable why=<…>` says why
+reads a transcript or a rollout, never a screen). `ERR result unavailable why=<…>` says why
 there is none.
 
 Treat every result as a claim: verify ground truth yourself (tests, build, `git diff`, exit
@@ -104,10 +112,13 @@ records are other agents' opinions, never ground truth.
 
 - Send a one-line follow-up (<=240 chars, balanced quotes/brackets; put longer text in a
   file the line references) with `aterm ctl @s-a turn typed=1 settle=submitted '<one line>'`.
-  It types key by key, answers once the composer clears (`submitted=1`, `task_rev=<n>`),
-  and moves `done` back to `working` (`why=turn`). Wait with `aterm ctl await task
-  @s-a:<n> timeout=<ms>` in the background (a bare `await task @s-a` can miss a fast
-  follow-up). `submitted=0` means the text is still in the composer (`aterm ctl @s-a text`).
+  It types key by key, answers once the composer clears (`submitted=1`, `task_rev=<n>`), a
+  codex-alab's once its own report begins the turn (`submit_by=claim`; one already in a turn
+  is judged by its screen, `submit_by=screen`), and moves `done` back to `working`
+  (`why=turn`). Wait with `aterm ctl await task @s-a:<n> timeout=<ms>` as `Wait` runs it, in
+  the background or, in codex-alab, in the foreground (a bare `await task @s-a` can miss a
+  fast follow-up). `submitted=0` means the line did not go: it is still in the composer, or a
+  popup took the Enter where a codex-alab began no turn (`aterm ctl @s-a text`).
 - `aterm ctl @s-a signal term` stops a worker; `aterm ctl @s-a close` closes its pane.
 
 ## See everything
@@ -169,8 +180,15 @@ reads its output. For a hand-driven agent:
   [coalesced=<n>] src=engine conf=claim`); a `since=` read after typing misses a quick
   turn's moves and waits for the next. Re-arm from the reply's `seq=`/`ep=`/`base=` until
   `state=` is one you act on. It is the program's claim, not aterm's reading: check ground
-  truth before acting. `await log close=turn` closes a codex turn
-  only on a codex-alab build aterm measured.
+  truth before acting. `await log close=turn` answers at a codex-alab turn's end, a quick
+  one too, but a flap past its bucket or a turn before aterm first reads the program can
+  go unlogged, so give it a `timeout=`.
+- To watch sessions live instead, `aterm ctl subscribe @s-x,@s-y events` pushes a codex's
+  moves as `EVENT <local> program state=<w> [kind=<k>] rev=<id>` (a flap past 20 at once,
+  then one a second, folded into its newest state) and the acts its codex-alab records as
+  `EVENT <local> act <act> rev=<id>` (`<id>` the `timeline` row's), never as `agent`; a
+  Claude Code session's verdicts come as `EVENT <local> agent <word> rev=<n> …`. Only
+  moves after the watch begins come, so read `status` first.
 - `kind question` in `aterm drive phase @s-x` is a question dialog (even if titled `Do you
   want to proceed?`): answer via `aterm ctl @s-x meta set questions ask` + `aterm drive
   answer @s-x <choice>`, or escalate.

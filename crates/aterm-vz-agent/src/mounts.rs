@@ -86,8 +86,8 @@ pub fn parse(mountinfo: &str) -> Vec<Mounted> {
             Some(Mounted {
                 root: unescape(head[3]),
                 point: unescape(head[4]),
-                fstype: tail.next()?.to_string(),
-                source: tail.next()?.to_string(),
+                fstype: unescape(tail.next()?).into_os_string().into_string().ok()?,
+                source: unescape(tail.next()?).into_os_string().into_string().ok()?,
             })
         })
         .collect()
@@ -117,24 +117,47 @@ fn bindable(path: &Path) -> bool {
 /// bind to its own entry after the plan ran.
 ///
 /// # Errors
-/// A share's name is not one directory, or its path is not bindable.
+/// A share's name is not one directory, or its path is not bindable. Two shares binding
+/// the same path are also refused.
 pub fn plan(mounted: &[Mounted], shares: &[Share]) -> Result<Vec<Op>, String> {
     use std::os::unix::ffi::OsStrExt as _;
-    let mut binds = Vec::new();
+    let mut binds: Vec<(PathBuf, PathBuf)> = Vec::new();
     for s in shares {
-        let name = Path::new(&s.name);
-        let one_dir = name.components().count() == 1
-            && matches!(name.components().next(), Some(Component::Normal(_)));
-        if !one_dir {
+        let valid_name =
+            !s.name.is_empty() && s.name != "." && s.name != ".." && !s.name.contains(['/', '\0']);
+        if !valid_name {
             return Err(format!(
                 "share `{}` is not one directory of the share",
                 s.name
             ));
         }
+        let name = Path::new(&s.name);
+        let valid_raw_path = !s.path.contains(&0) && s.path.starts_with(b"/") && {
+            let mut any = false;
+            let mut plain = true;
+            for seg in s.path[1..]
+                .split(|&b| b == b'/')
+                .filter(|seg| !seg.is_empty())
+            {
+                any = true;
+                if seg == b"." || seg == b".." {
+                    plain = false;
+                    break;
+                }
+            }
+            any && plain
+        };
         let path = PathBuf::from(std::ffi::OsStr::from_bytes(&s.path));
-        if !bindable(&path) {
+        if !valid_raw_path || !bindable(&path) {
             return Err(format!(
                 "share `{}` cannot be bound at {}: not an absolute path of plain directories outside {AT}",
+                s.name,
+                path.display()
+            ));
+        }
+        if binds.iter().any(|(_, prev)| *prev == path) {
+            return Err(format!(
+                "share `{}` duplicates bind path {}",
                 s.name,
                 path.display()
             ));
@@ -146,16 +169,22 @@ pub fn plan(mounted: &[Mounted], shares: &[Share]) -> Result<Vec<Op>, String> {
     let mut ops = Vec::new();
     let mut stale: Vec<&PathBuf> = mounted
         .iter()
+        .rev()
         .filter(ours)
         .map(|m| &m.point)
         .filter(|p| *p != at)
         .collect();
     stale.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
-    stale.dedup();
     ops.extend(stale.into_iter().map(|p| Op::Unmount(p.clone())));
-    if mounted.iter().filter(ours).any(|m| m.point == at) {
-        ops.push(Op::Unmount(at.to_path_buf()));
-    }
+    let at_mounts = mounted
+        .iter()
+        .filter(ours)
+        .filter(|m| m.point == at)
+        .count();
+    ops.extend(std::iter::repeat_n(
+        Op::Unmount(at.to_path_buf()),
+        at_mounts,
+    ));
     ops.push(Op::Mkdir(at.to_path_buf()));
     ops.push(Op::MountShare);
     binds.sort_by_key(|(_, to)| to.components().count());
@@ -225,7 +254,7 @@ mod tests {
     #[test]
     fn mountinfo_lines_are_read_with_their_escapes() {
         let text = format!(
-            "{BOOTED}50 25 0:42 /repo /Users//me/My\\040Work/aterm ro,relatime shared:30 - virtiofs aterm ro\nnot a line\n"
+            "{BOOTED}50 25 0:42 /repo /Users//me/My\\040Work/aterm ro,relatime shared:30 - virtio\\146s aterm\\040tag ro\nnot a line\n"
         );
         let m = parse(&text);
         assert_eq!(m.len(), 5);
@@ -235,7 +264,7 @@ mod tests {
                 root: "/repo".into(),
                 point: "/Users//me/My Work/aterm".into(),
                 fstype: "virtiofs".into(),
-                source: "aterm".into(),
+                source: "aterm tag".into(),
             }
         );
         assert_eq!(m[2].source, "aterm-boot");
@@ -293,6 +322,27 @@ mod tests {
             ],
             "the boot and rosetta shares are another tag's and stay"
         );
+
+        let stacked = format!(
+            "{BOOTED}\
+             60 25 0:42 / /mnt/aterm ro,relatime shared:30 - virtiofs aterm ro\n\
+             61 60 0:43 / /mnt/aterm ro,relatime shared:31 - virtiofs aterm ro\n\
+             62 25 0:42 /repo /Users//me/old ro,relatime shared:30 - virtiofs aterm ro\n\
+             63 62 0:43 /repo2 /Users//me/old ro,relatime shared:31 - virtiofs aterm ro\n"
+        );
+        let stacked_ops = plan(&parse(&stacked), &[]).unwrap();
+        assert_eq!(
+            stacked_ops,
+            [
+                Op::Unmount(p("/Users//me/old")),
+                Op::Unmount(p("/Users//me/old")),
+                Op::Unmount(p("/mnt/aterm")),
+                Op::Unmount(p("/mnt/aterm")),
+                Op::Mkdir(p("/mnt/aterm")),
+                Op::MountShare,
+            ],
+            "stacked stale binds emit one detach per mount layer"
+        );
     }
 
     #[test]
@@ -332,17 +382,30 @@ mod tests {
         let m = parse(BOOTED);
         for bad in [
             share("", "/x"),
+            share(".", "/x"),
             share("..", "/x"),
             share("a/b", "/x"),
+            share("a\0b", "/x"),
             share("/abs", "/x"),
             share("repo", "relative/path"),
             share("repo", "/"),
+            share("repo", "/Users/."),
+            share("repo", "/Users/./me"),
             share("repo", "/Users/../etc"),
+            share("repo", "/Users//me\0x"),
             share("repo", "/mnt/aterm/repo"),
             share("repo", "/mnt/aterm"),
         ] {
             assert!(plan(&m, std::slice::from_ref(&bad)).is_err(), "{bad:?}");
         }
+        assert!(
+            plan(
+                &m,
+                &[share("a", "/Users//me/same"), share("b", "/Users//me/same")]
+            )
+            .is_err(),
+            "duplicate target bind paths must be refused"
+        );
         assert!(plan(&m, &[]).is_ok());
     }
 }

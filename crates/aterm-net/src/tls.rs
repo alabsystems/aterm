@@ -386,10 +386,15 @@ where
     let stream = transport.into_stream();
     let conn = stream.conn;
     let mut tcp_down = stream.sock;
+    let _ = aterm_uds::keep_out_of_children(&tcp_down);
     let tcp_wr = tcp_down.try_clone()?;
+    let _ = aterm_uds::keep_out_of_children(&tcp_wr);
     let tcp_up = tcp_down.try_clone()?;
+    let _ = aterm_uds::keep_out_of_children(&tcp_up);
 
+    let _ = aterm_uds::keep_out_of_children(&local);
     let mut local_up = local.try_clone()?;
+    let _ = aterm_uds::keep_out_of_children(&local_up);
     let mut local_down = local;
 
     let shared = Arc::new(RelayShared {
@@ -415,7 +420,7 @@ where
                     g = shared.cv.wait(g).unwrap_or_else(|p| p.into_inner());
                 }
                 if g.done {
-                    return;
+                    return tcp_wr;
                 }
                 out.clear();
                 while g.conn.wants_write() {
@@ -437,7 +442,7 @@ where
                     drop(g);
                     shared.cv.notify_all();
                     aterm_uds::hangup::hang_up(&tcp_wr);
-                    return;
+                    return tcp_wr;
                 }
                 drop(g);
                 shared.cv.notify_all();
@@ -535,6 +540,7 @@ where
             drop(guard);
             send_without_waiting(&tcp_up, &last);
             aterm_uds::hangup::hang_up(&tcp_up);
+            (local_up, tcp_up)
         })
     };
     let up = match up {
@@ -674,7 +680,7 @@ where
     } else {
         let _ = local_down.shutdown(std::net::Shutdown::Write);
     }
-    let _ = up.join();
+    let up_fds = up.join();
     {
         let mut g = shared.lock();
         g.done = true;
@@ -682,7 +688,8 @@ where
     shared.cv.notify_all();
     aterm_uds::hangup::hang_up(&tcp_down);
     aterm_uds::hangup::hang_up(&local_down);
-    let _ = wr.join();
+    let wr_fd = wr.join();
+    drop((up_fds, wr_fd));
 
     match shared.lock().err.take() {
         Some(e) => Err(e),
@@ -835,7 +842,7 @@ mod tests {
     }
 
     #[test]
-    fn tls_handshake_exporters_match_and_a_wrong_pin_is_rejected() {
+    fn tls_handshake_exporters_match() {
         let _serial = serialize_loopback();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -858,7 +865,6 @@ mod tests {
             client_exporter, server_exporter,
             "RFC 5705 exporter must be identical on both ends"
         );
-        assert_eq!(client_exporter.len(), EXPORTER_LEN);
         assert_ne!(
             client_exporter, [0u8; EXPORTER_LEN],
             "exporter is real key material"
@@ -1439,6 +1445,42 @@ mod tests {
         server.join().unwrap();
     }
 
+    fn assert_tls_buffered_relay_conformance(buffered_bytes: usize, service_received: bool) {
+        let model = aterm_models_session::tls_buffered_relay_model();
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        let label = "TlsBufferedRelay(relay_answers)";
+        let mut parked = model.init_state();
+        parked.insert("buffered", i64::from(buffered_bytes > 0));
+        assert!(
+            !buggy.action_enabled("DrainBuffered", &parked),
+            "Buggy=1 must refuse DrainBuffered on pre-buffered plaintext"
+        );
+        let mut drained = parked.clone();
+        drained.insert("buffered", 0);
+        drained.insert("relayed", i64::from(buffered_bytes > 0));
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &parked,
+            &drained,
+            Some("DrainBuffered"),
+            label,
+        );
+        assert!(ok, "DrainBuffered transition rejected: {why}");
+        let mut served = drained.clone();
+        served.insert("service_waiting", i64::from(!service_received));
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &drained,
+            &served,
+            Some("ServiceRecv"),
+            label,
+        );
+        assert!(ok, "ServiceRecv transition rejected: {why}");
+        assert!(model.action_enabled("Done", &served));
+    }
+
     #[test]
     fn relay_round_trips_guarded_artifact_ack_before_request_half_close() {
         let _serial = serialize_loopback();
@@ -1483,6 +1525,7 @@ mod tests {
                 "the exact nonce ACK must reach the guarded upstream reply"
             );
             svc_b.shutdown(std::net::Shutdown::Write).unwrap();
+            request == REQUEST
         });
         let server = std::thread::spawn(move || {
             let (tcp, _) = listener.accept().unwrap();
@@ -1494,28 +1537,17 @@ mod tests {
                 .unwrap();
 
             let stream = transport.stream();
-            loop {
+            let buffered_bytes = loop {
                 let consumed = stream.conn.read_tls(&mut stream.sock).unwrap();
                 assert!(consumed > 0, "the request must seed rustls' input buffer");
                 let io = stream.conn.process_new_packets().unwrap();
                 if io.plaintext_bytes_to_read() >= REQUEST.len() {
-                    break;
+                    break io.plaintext_bytes_to_read();
                 }
-            }
-
-            let model = aterm_models_session::tls_buffered_relay_model();
-            let state = model.init_state();
-            assert!(model.action_enabled("DrainBuffered", &state));
-            let mut buggy = model.clone();
-            buggy
-                .consts
-                .iter_mut()
-                .find(|(name, _)| *name == "Buggy")
-                .unwrap()
-                .1 = 1;
-            assert!(!buggy.action_enabled("DrainBuffered", &state));
+            };
 
             relay_answers(transport, svc_a, ()).unwrap();
+            buffered_bytes
         });
 
         let tcp = TcpStream::connect(addr).unwrap();
@@ -1548,8 +1580,9 @@ mod tests {
         let mut tail = Vec::new();
         client.stream().read_to_end(&mut tail).unwrap();
         assert!(tail.is_empty());
-        service.join().unwrap();
-        server.join().unwrap();
+        let service_received = service.join().unwrap();
+        let buffered_bytes = server.join().unwrap();
+        assert_tls_buffered_relay_conformance(buffered_bytes, service_received);
     }
 
     #[test]

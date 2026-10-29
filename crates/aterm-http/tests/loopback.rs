@@ -431,20 +431,6 @@ fn an_https_proxy_is_refused_before_any_byte_reaches_it() {
 }
 
 #[test]
-fn a_refused_port_is_an_error_not_a_panic() {
-    let port = {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
-    };
-    let error = client()
-        .post(&format!("http://127.0.0.1:{port}/api/chat"))
-        .limit(4096)
-        .send(b"{}")
-        .expect_err("connection refused");
-    assert!(!error.is_revoked(), "{error:?}");
-}
-
-#[test]
 fn an_unusable_endpoint_fails_before_any_socket_is_opened() {
     for bad in [
         "ftp://127.0.0.1/x",

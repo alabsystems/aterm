@@ -424,9 +424,9 @@ fn the_paint_key_moves_with_every_term_it_paints_from() {
     let mut view = View::default();
     let _ = view.prepare(&center, &l, at, Look::MOVING);
     assert!(view.paint(&center, 80, None, g, false, &|| dark).is_some());
-    let mfp = view.motion_fp();
+    let prev_rows = view.motion().expect("prepared").rows.clone();
     let _ = view.prepare(&center, &l, at + ANIM_FRAME * 5, Look::MOVING);
-    assert_ne!(view.motion_fp(), mfp);
+    assert_ne!(view.motion().expect("prepared").rows, prev_rows);
     assert!(
         view.paint(&center, 80, None, g, false, &|| dark).is_some(),
         "motion"

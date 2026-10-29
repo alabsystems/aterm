@@ -37,6 +37,12 @@
 //!    (an anti-rollback log only).
 //! 8. [`Step::IntentRemoved`]: `<log>.compact` is gone.
 //!
+//! The kept copy is exclusively locked before step 4 and its exact descriptor
+//! becomes the live log before any fallible post-rename work. A failed switch
+//! therefore keeps the replacement owned until the poisoned log is dropped.
+//! Openers recheck their locked descriptor against the current pathname before
+//! reading sidecars, refusing an old inode detached while they acquired its lock.
+//!
 //! # Recovery
 //!
 //! An open ([`recover`]) that finds an intent compares its two identities with the log's
@@ -67,9 +73,9 @@
 
 use crate::logid;
 use crate::store::{
-    create_like, flush_file, log_identity, open_regular_sidecar, open_with_options, read_base,
-    read_state_base, remove_file_path, rename_path, state_path, sync_parent_dir, write_base,
-    AtRestRef,
+    create_like, create_like_read_write, flush_file, log_identity, open_regular_sidecar,
+    open_with_options, read_base, read_state_base, remove_file_path, rename_path, state_path,
+    sync_parent_dir, write_base, AtRestRef,
 };
 use astream_wire::frame::decode_frame_header_bytes;
 use astream_wire::{Frame, HEADER_SIZE, MAX_PAYLOAD_LEN};
@@ -625,7 +631,7 @@ pub(crate) fn reidentify(
 /// it wraps or nothing. Under `cfg(test)` it CRASHES the compaction after a durable
 /// [`Step`] (it stops dead there, cleaning nothing up, the log poisoned: what the files
 /// hold is what the next open recovers), sets the copy's chunk, meters every read the
-/// copy makes, and can hold the unlocked copy at its start.
+/// copy makes, and can hold the unlocked copy at its start or a durable step.
 #[derive(Clone, Default)]
 pub(crate) struct Seam {
     #[cfg(test)]
@@ -636,12 +642,19 @@ pub(crate) struct Seam {
     pub(crate) meter: Option<Arc<Meter>>,
     #[cfg(test)]
     pub(crate) gate: Option<Gate>,
+    #[cfg(test)]
+    pub(crate) step_gate: Option<(Step, Gate)>,
 }
 
 impl Seam {
     /// The injected crash after `step`, if armed there.
     #[cfg(test)]
     pub(crate) fn crash(&self, step: Step) -> io::Result<()> {
+        if let Some((at, gate)) = &self.step_gate {
+            if *at == step {
+                gate.hold();
+            }
+        }
         if self.crash_after == Some(step) {
             return Err(io::Error::other(format!("injected crash after {step:?}")));
         }
@@ -745,6 +758,18 @@ impl GateHandle {
     }
 }
 
+#[cfg(test)]
+impl Gate {
+    fn hold(&self) {
+        let _ = self.reached.send(());
+        let _ = self
+            .resume
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv();
+    }
+}
+
 /// A gate for the seam, and the test's handle on it.
 #[cfg(test)]
 pub(crate) fn gate() -> (Gate, GateHandle) {
@@ -810,7 +835,7 @@ impl KeptCopy {
     ) -> io::Result<KeptCopy> {
         let src = open_with_options(OpenOptions::new().read(true), log)?;
         let kept = kept_path(log);
-        let dst = create_like(&kept, perms)?;
+        let dst = create_like_read_write(&kept, perms)?;
         let chunk = seam.chunk();
         Ok(KeptCopy {
             src,
@@ -976,6 +1001,16 @@ impl KeptCopy {
         &self.kept
     }
 
+    /// The replacement descriptor, locked before its name becomes the live log.
+    pub(crate) const fn destination(&self) -> &File {
+        &self.dst
+    }
+
+    /// Transfer the exact locked descriptor; closing the source cannot unlock it.
+    pub(crate) fn into_destination(self) -> File {
+        self.dst
+    }
+
     /// The compaction's seam, which the held store's append before the copy crashes at too.
     pub(crate) const fn seam(&self) -> &Seam {
         &self.seam
@@ -985,6 +1020,7 @@ impl KeptCopy {
     pub(crate) fn abandon(self) {
         let kept = self.kept;
         drop(self.src);
+        let _ = self.dst.unlock();
         drop(self.dst);
         let _ = remove_file_path(&kept);
     }

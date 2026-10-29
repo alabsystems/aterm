@@ -1456,7 +1456,7 @@ case \"$0\" in *-aterm) echo '{frozen_says}' ;; \
         refused(
             with(metrics(0.0), "startup_phase_schema", json!(1.0)),
             &LAWS,
-            "startup_phase_schema=1",
+            "startup_phase_schema=1.0; expected 1",
         );
         refused(
             with(metrics(0.0), "startup_attach_schema", json!(true)),

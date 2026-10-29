@@ -68,7 +68,7 @@ pub(crate) const DEFAULT_INDEXED_MINIMUM_CONTRAST: f32 = if cfg!(windows) { 4.5 
 pub(crate) const DEFAULT_SCROLLBAR: bool = cfg!(windows);
 
 /// Whether new tabs keep Rewind's screen history when `temporal_recording` is unset.
-pub(crate) const DEFAULT_TEMPORAL_RECORDING: bool = false;
+pub(crate) const DEFAULT_TEMPORAL_RECORDING: bool = true;
 
 /// `mb` mebibytes in bytes.
 const fn mib(mb: u32) -> usize {
@@ -210,6 +210,7 @@ pub(crate) struct Config {
     pub(crate) rewind_total_mb: Option<u32>,
     pub(crate) fabric: Option<FabricConfig>,
     pub(crate) fleet: Option<FleetConfig>,
+    pub(crate) swarm: Option<SwarmConfig>,
     pub(crate) update: Option<UpdateConfig>,
     pub(crate) sparkle_words: Option<SparkleWordsConfig>,
     pub(crate) matrix_rain: Option<MatrixRainConfig>,
@@ -228,6 +229,9 @@ pub(crate) struct Config {
     pub(crate) harness: HarnessPolicy,
     #[serde(skip)]
     pub(crate) ai: AiPolicy,
+    /// `[amacs]`, read by the engine's one parser ([`crate::default_editor::AmacsPolicy`]).
+    #[serde(skip)]
+    pub(crate) amacs: crate::default_editor::AmacsPolicy,
 }
 
 /// Tab status bounds, shared with `prefs` so a Settings save never writes a value the resolver would clamp.
@@ -365,24 +369,46 @@ fn read_and_fingerprint_path_feed_with_reader(
 
 /// Word-decoration runtime compiled for one admitted config generation.
 #[derive(Clone)]
-pub(crate) struct PreparedSparkleRuntime {
-    resolved: Option<crate::word_decorations::Resolved>,
+pub(crate) struct PreparedSparkleRuntime(std::sync::Arc<PreparedSparkleInner>);
+
+struct PreparedSparkleInner {
+    resolved: PreparedSparkleResolved,
     tricks: TrickVocabulary,
 }
 
-#[derive(Clone)]
-struct TrickVocabulary(std::sync::Arc<std::sync::OnceLock<aterm_lexicon::TrickLexicon>>);
+enum PreparedSparkleResolved {
+    Disabled,
+    Eager(Box<crate::word_decorations::Resolved>),
+    LazyBuiltin(Box<LazyBuiltinSparkle>),
+}
+
+struct LazyBuiltinSparkle {
+    cfg: crate::word_decorations::DecoConfig,
+    langs: Vec<String>,
+    built: std::sync::OnceLock<crate::word_decorations::Resolved>,
+}
+
+struct TrickVocabulary {
+    built: std::sync::Arc<std::sync::OnceLock<aterm_lexicon::TrickLexicon>>,
+    lazy_langs: Option<Vec<String>>,
+}
 
 impl TrickVocabulary {
     fn compiled(langs: Vec<String>) -> Self {
-        let vocabulary = Self(std::sync::Arc::default());
-        let _ = vocabulary.0.set(compile_trick_vocabulary(&langs));
+        let vocabulary = Self {
+            built: std::sync::Arc::default(),
+            lazy_langs: None,
+        };
+        let _ = vocabulary.built.set(compile_trick_vocabulary(&langs));
         vocabulary
     }
 
     fn compiling(langs: Vec<String>) -> Self {
-        let vocabulary = Self(std::sync::Arc::default());
-        let landing = std::sync::Arc::clone(&vocabulary.0);
+        let vocabulary = Self {
+            built: std::sync::Arc::default(),
+            lazy_langs: None,
+        };
+        let landing = std::sync::Arc::clone(&vocabulary.built);
         let worker_langs = langs.clone();
         let spawned = std::thread::Builder::new()
             .name("aterm-tricks-compile".into())
@@ -395,14 +421,24 @@ impl TrickVocabulary {
                 let _ = landing.set(compile_trick_vocabulary(&worker_langs));
             });
         if spawned.is_err() {
-            let _ = vocabulary.0.set(compile_trick_vocabulary(&langs));
+            let _ = vocabulary.built.set(compile_trick_vocabulary(&langs));
         }
         vocabulary
     }
 
+    fn lazy(langs: Vec<String>) -> Self {
+        Self {
+            built: std::sync::Arc::default(),
+            lazy_langs: Some(langs),
+        }
+    }
+
     fn get(&self) -> &aterm_lexicon::TrickLexicon {
+        if let Some(langs) = self.lazy_langs.as_deref() {
+            return self.built.get_or_init(|| compile_trick_vocabulary(langs));
+        }
         static EMPTY: std::sync::OnceLock<aterm_lexicon::TrickLexicon> = std::sync::OnceLock::new();
-        self.0
+        self.built
             .get()
             .unwrap_or_else(|| EMPTY.get_or_init(aterm_lexicon::TrickLexicon::default))
     }
@@ -428,28 +464,54 @@ pub(crate) struct PreparedPathFeedGeneration {
 }
 
 impl PreparedSparkleRuntime {
+    pub(crate) fn resolved(&self) -> Option<crate::word_decorations::Resolved> {
+        match &self.0.resolved {
+            PreparedSparkleResolved::Disabled => None,
+            PreparedSparkleResolved::Eager(resolved) => Some((**resolved).clone()),
+            PreparedSparkleResolved::LazyBuiltin(lazy) => Some(
+                lazy.built
+                    .get_or_init(|| {
+                        let refs: Vec<&str> = lazy.langs.iter().map(String::as_str).collect();
+                        crate::word_decorations::Resolved {
+                            cfg: lazy.cfg.clone(),
+                            lexicon: std::sync::Arc::new(aterm_lexicon::Lexicon::with_languages(
+                                &refs,
+                            )),
+                        }
+                    })
+                    .clone(),
+            ),
+        }
+    }
+
     /// This generation's kitty-command vocabulary, borrowed for one press.
     pub(crate) fn tricks(&self) -> &aterm_lexicon::TrickLexicon {
-        self.tricks.get()
+        self.0.tricks.get()
     }
 
     /// Custom-spec consumers for this generation (valid Toy Packs, then inline overrides), so Settings can disclose dependencies without reopening manifests.
     pub(crate) fn consumer_capabilities(&self) -> aterm_effects::spec::SpecConsumerCapabilities {
-        let Some(resolved) = self.resolved.as_ref() else {
-            return Default::default();
-        };
-        let mut consumers = resolved.cfg.spec_table.consumer_capabilities();
-        let opts = aterm_lexicon::ScanOptions {
-            allow_bare_cat: resolved.cfg.allow_bare_cat,
-            cjk_single_char: resolved.cfg.cjk_single_char,
-            ignore: (!resolved.cfg.ignore.is_empty()).then_some(&resolved.cfg.ignore),
-        };
-        consumers.emphasis_class_default = resolved.lexicon.has_scannable_class_surface(
-            aterm_lexicon::Class::Emphasis,
-            &opts,
-            |form_hash| resolved.cfg.spec_table.override_for(form_hash).is_some(),
-        );
-        consumers
+        match &self.0.resolved {
+            PreparedSparkleResolved::Disabled => Default::default(),
+            // Builtin-only lexicons ship zero `Class::Emphasis` surfaces (`lexicon.toml`).
+            PreparedSparkleResolved::LazyBuiltin(lazy) => {
+                lazy.cfg.spec_table.consumer_capabilities()
+            }
+            PreparedSparkleResolved::Eager(resolved) => {
+                let mut consumers = resolved.cfg.spec_table.consumer_capabilities();
+                let opts = aterm_lexicon::ScanOptions {
+                    allow_bare_cat: resolved.cfg.allow_bare_cat,
+                    cjk_single_char: resolved.cfg.cjk_single_char,
+                    ignore: (!resolved.cfg.ignore.is_empty()).then_some(&resolved.cfg.ignore),
+                };
+                consumers.emphasis_class_default = resolved.lexicon.has_scannable_class_surface(
+                    aterm_lexicon::Class::Emphasis,
+                    &opts,
+                    |form_hash| resolved.cfg.spec_table.override_for(form_hash).is_some(),
+                );
+                consumers
+            }
+        }
     }
 }
 
@@ -1835,7 +1897,36 @@ pub(crate) struct KeeperConfig {
     pub(crate) enabled: Option<bool>,
 }
 
+/// The `[swarm]` table (`[swarm] enabled = false` turns off swarm participation).
+#[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
+#[serde(default)]
+pub(crate) struct SwarmConfig {
+    pub(crate) enabled: Option<bool>,
+}
+
 impl Config {
+    /// Whether swarm participation is on (`[swarm] enabled`, default `true`).
+    pub(crate) fn swarm_enabled(&self) -> bool {
+        self.swarm.as_ref().and_then(|s| s.enabled).unwrap_or(true)
+    }
+
+    /// `[fleet]` as the window runs it (`None` while `[swarm] enabled = false`).
+    pub(crate) fn effective_fleet(&self) -> Option<&FleetConfig> {
+        self.swarm_enabled()
+            .then_some(self.fleet.as_ref())
+            .flatten()
+    }
+
+    /// Whether background Fleet reads are on: default true, off with the swarm or an explicit watch opt-out.
+    pub(crate) fn fleet_watch_enabled(&self) -> bool {
+        self.swarm_enabled()
+            && self
+                .fleet
+                .as_ref()
+                .is_none_or(FleetConfig::watch_or_default)
+    }
+
     /// Whether the PTY keeper is on (`[keeper] enabled`, default `false`).
     pub(crate) fn keeper_enabled(&self) -> bool {
         self.keeper
@@ -1936,7 +2027,7 @@ impl<'de> serde::Deserialize<'de> for FabricCommand {
     }
 }
 
-/// The `[fleet]` table: this machine's fleet listener, off by default.
+/// The `[fleet]` table: this machine's listener, permissions and background reads.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[cfg_attr(test, derive(Debug))]
 #[serde(default)]
@@ -1948,9 +2039,47 @@ pub(crate) struct FleetConfig {
 }
 
 impl FleetConfig {
-    /// `watch`, absent as false.
+    /// `watch`, absent as true.
     pub(crate) fn watch_or_default(&self) -> bool {
-        self.watch.unwrap_or(false)
+        self.watch.unwrap_or(true)
+    }
+}
+
+#[cfg(test)]
+mod fleet_watch_tests {
+    use super::Config;
+
+    #[test]
+    fn a_member_reads_automatically_unless_watch_or_swarm_is_off() {
+        for (text, reads) in [
+            ("", true),
+            ("[fleet]\n", true),
+            ("[fleet]\nwatch = true\n", true),
+            ("[fleet]\nwatch = false\n", false),
+            ("[swarm]\nenabled = false\n", false),
+            ("[swarm]\nenabled = false\n[fleet]\nwatch = true\n", false),
+        ] {
+            let config = aterm_toml::from_str::<Config>(text).expect("valid configuration");
+            for minted in [false, true] {
+                let book = crate::fleet_glance::BookFacts {
+                    in_fleet: true,
+                    minted,
+                    ..crate::fleet_glance::BookFacts::default()
+                };
+                assert_eq!(
+                    crate::fleet_glance::should_poll(
+                        &book,
+                        config.fleet_watch_enabled(),
+                        None,
+                        1_000,
+                        false,
+                        crate::fleet_glance::POLL_EVERY,
+                    ),
+                    reads,
+                    "minted={minted} {text:?}"
+                );
+            }
+        }
     }
 }
 
@@ -2092,6 +2221,7 @@ impl Config {
         let mut config: Self = aterm_toml::from_str(text)?;
         config.harness = HarnessPolicy::read(text);
         config.ai = AiPolicy::read(text);
+        config.amacs = crate::default_editor::AmacsPolicy::read(text);
         Ok(config)
     }
 
@@ -2100,6 +2230,7 @@ impl Config {
         Self {
             harness: HarnessPolicy::read(text),
             ai: AiPolicy::read(text),
+            amacs: crate::default_editor::AmacsPolicy::read(text),
             ..Self::default()
         }
     }
@@ -2814,38 +2945,55 @@ impl Config {
 
     #[cfg(test)]
     pub(crate) fn prepare_sparkle_runtime(&self) -> PreparedSparkleRuntime {
-        self.prepare_sparkle_runtime_with_fingerprint(TrickVocabulary::compiled)
+        self.prepare_sparkle_runtime_with_fingerprint(TrickVocabulary::compiled, false)
             .0
     }
 
     fn prepare_sparkle_runtime_with_fingerprint(
         &self,
         tricks: fn(Vec<String>) -> TrickVocabulary,
+        lazy_builtin: bool,
     ) -> (PreparedSparkleRuntime, u64) {
         let (parts, fingerprint) = self.sparkle_runtime_parts_with_fingerprint();
         let langs = self.sparkle_languages();
         let tricks = tricks(langs.clone());
-        let resolved = parts.map(|(cfg, override_toml)| {
-            let refs: Vec<&str> = langs.iter().map(String::as_str).collect();
-            let lexicon = aterm_lexicon::Lexicon::with_languages_and_override(
-                &refs,
-                override_toml.as_deref(),
-            )
-            .unwrap_or_else(|error| {
-                crate::logging::stderr_line!(
-                    "aterm-gui: sparkle words lexicon override rejected ({error}); using builtin"
-                );
-                aterm_lexicon::Lexicon::with_languages(&refs)
-            });
-            for warning in sparkle_logged_warnings(lexicon.conflicts(), cfg.cjk_single_char) {
-                crate::logging::stderr_line!("aterm-gui: sparkle_words lexicon: {warning}");
+        let resolved = match parts {
+            None => PreparedSparkleResolved::Disabled,
+            Some((cfg, None)) if lazy_builtin => {
+                PreparedSparkleResolved::LazyBuiltin(Box::new(LazyBuiltinSparkle {
+                    cfg,
+                    langs,
+                    built: std::sync::OnceLock::new(),
+                }))
             }
-            crate::word_decorations::Resolved {
-                cfg,
-                lexicon: std::sync::Arc::new(lexicon),
+            Some((cfg, override_toml)) => {
+                let refs: Vec<&str> = langs.iter().map(String::as_str).collect();
+                let lexicon = aterm_lexicon::Lexicon::with_languages_and_override(
+                    &refs,
+                    override_toml.as_deref(),
+                )
+                .unwrap_or_else(|error| {
+                    crate::logging::stderr_line!(
+                        "aterm-gui: sparkle words lexicon override rejected ({error}); using builtin"
+                    );
+                    aterm_lexicon::Lexicon::with_languages(&refs)
+                });
+                for warning in sparkle_logged_warnings(lexicon.conflicts(), cfg.cjk_single_char) {
+                    crate::logging::stderr_line!("aterm-gui: sparkle_words lexicon: {warning}");
+                }
+                PreparedSparkleResolved::Eager(Box::new(crate::word_decorations::Resolved {
+                    cfg,
+                    lexicon: std::sync::Arc::new(lexicon),
+                }))
             }
-        });
-        (PreparedSparkleRuntime { resolved, tricks }, fingerprint)
+        };
+        (
+            PreparedSparkleRuntime(std::sync::Arc::new(PreparedSparkleInner {
+                resolved,
+                tricks,
+            })),
+            fingerprint,
+        )
     }
 
     /// Files this config names by path whose content is applied state.
@@ -2910,19 +3058,27 @@ impl Config {
 
     /// Prepare every path-backed effect consumer and identify it from the exact same-handle bytes that entered its parser.
     pub(crate) fn prepare_path_feed_generation(&self) -> PreparedPathFeedGeneration {
-        self.prepare_path_feed_generation_with(TrickVocabulary::compiled)
+        self.prepare_path_feed_generation_with(TrickVocabulary::compiled, false)
     }
 
     /// [`Self::prepare_path_feed_generation`] for the launch's config-runtime worker, which the boot joins before the first window.
     pub(crate) fn prepare_launch_path_feed_generation(&self) -> PreparedPathFeedGeneration {
-        self.prepare_path_feed_generation_with(TrickVocabulary::compiling)
+        self.prepare_path_feed_generation_with(TrickVocabulary::compiling, false)
+    }
+
+    /// [`Self::prepare_path_feed_generation`] for a `--headless` launch, deferring builtin lexicon and trick table compilation until first pixel or input use.
+    pub(crate) fn prepare_headless_launch_path_feed_generation(
+        &self,
+    ) -> PreparedPathFeedGeneration {
+        self.prepare_path_feed_generation_with(TrickVocabulary::lazy, true)
     }
 
     fn prepare_path_feed_generation_with(
         &self,
         tricks: fn(Vec<String>) -> TrickVocabulary,
+        lazy_builtin: bool,
     ) -> PreparedPathFeedGeneration {
-        let (sparkle, deco) = self.prepare_sparkle_runtime_with_fingerprint(tricks);
+        let (sparkle, deco) = self.prepare_sparkle_runtime_with_fingerprint(tricks, lazy_builtin);
         PreparedPathFeedGeneration {
             sparkle,
             fingerprints: PathFeedFps { deco },
@@ -3250,6 +3406,25 @@ impl Config {
     /// The `[privacy]` `notice` bit (default true).
     pub(crate) fn privacy_notice(&self) -> bool {
         self.privacy.as_ref().and_then(|p| p.notice).unwrap_or(true)
+    }
+
+    /// The `[privacy]` switches leave System State's access steps on: `enabled`, `check` and
+    /// `notice` (each on by default).
+    pub(crate) fn access_steps_allowed(&self) -> bool {
+        self.privacy_probe_gate().permits() && self.privacy_notice()
+    }
+
+    /// Why System State's Local Network step will not run in a window of this config: a
+    /// `[privacy]` switch off ([`Self::access_steps_allowed`]), or swarm participation off
+    /// (`App::tick_local_network_step` asks nothing then); `None` while it may.
+    pub(crate) fn local_network_step_off(&self) -> Option<&'static str> {
+        if !self.access_steps_allowed() {
+            Some(LOCAL_NETWORK_STEP_PRIVACY_OFF)
+        } else if !self.swarm_enabled() {
+            Some(LOCAL_NETWORK_STEP_SWARM_OFF)
+        } else {
+            None
+        }
     }
 
     /// The `[privacy]` `report_attribution` bit (default true).
@@ -5199,6 +5374,33 @@ pub(crate) fn agents_auto_prime_setting() -> bool {
     }
 }
 
+/// [`Config::local_network_step_off`]'s reason while a `[privacy]` switch is off.
+pub(crate) const LOCAL_NETWORK_STEP_PRIVACY_OFF: &str = "a [privacy] switch is off";
+
+/// [`Config::local_network_step_off`]'s reason while swarm participation is off.
+pub(crate) const LOCAL_NETWORK_STEP_SWARM_OFF: &str =
+    "[swarm] enabled is off, so System State asks no Local Network question";
+
+/// [`Config::local_network_step_off`] of `aterm.toml` as it reads now, read without
+/// [`load_config`]'s stderr lines or notices (another thread of the process asks it). A missing
+/// file reads as the defaults; one that cannot be read or parsed says nothing is off, so no
+/// waiver comes from it.
+pub(crate) fn local_network_step_off_setting() -> Option<&'static str> {
+    let Some(path) = config_path() else {
+        return Config::default().local_network_step_off();
+    };
+    match crate::native_config_service::VersionedConfigService::observe_path(&path, true) {
+        Ok(observation) => local_network_step_off_from_text(&observation.text),
+        Err(_) => None,
+    }
+}
+
+fn local_network_step_off_from_text(text: &str) -> Option<&'static str> {
+    aterm_toml::from_str::<Config>(text)
+        .ok()
+        .and_then(|config| config.local_network_step_off())
+}
+
 /// Read source and application policy from one persisted config observation.
 pub(crate) fn update_check_settings_setting() -> Option<aterm_update::CheckSettings> {
     let config = if let Some(path) = config_path() {
@@ -5404,6 +5606,7 @@ pub(crate) fn collect_unaccepted_value_notices(
 ) {
     use crate::message_reporters::ConfigFamily;
     collect_harness_notices(warns, config);
+    warns.extend(ConfigFamily::UnacceptedValues, config.amacs.notices());
     warns.extend_shown_in_settings(
         ConfigFamily::UnacceptedValues,
         font_size_load_notices(config),
@@ -5910,7 +6113,7 @@ impl App {
         {
             None
         } else {
-            self.prepared_sparkle.resolved.clone()
+            self.prepared_sparkle.resolved()
         };
     }
 
@@ -7237,7 +7440,7 @@ impl App {
                     &admitted_baseline,
                     crate::config_watcher::WatchFailureKind::ConfigPreparationFailed,
                 );
-                self.reject_pending_native_config(&format!(
+                self.reject_pending_native_config(format!(
                     "config generation could not be admitted: {error}"
                 ));
                 aterm_log::warn!("native config service rejected watcher snapshot: {error}");
@@ -7318,9 +7521,12 @@ impl App {
         let claude_footer_changed = self.config.claude_footer != config.claude_footer;
         let ai_changed = self.config.ai != config.ai;
         self.config = config.clone();
+        if !self.config.swarm_enabled() {
+            crate::system_state_access::cancel_local_network_probe();
+        }
         self.reconcile_consent_config();
         let _ = self.reconcile_consent_observer();
-        crate::fleet_listen::configure_fleet_listener(self.config.fleet.as_ref());
+        crate::fleet_listen::configure_fleet_listener(self.config.effective_fleet());
         self.follow_fleet_watch();
         let view = typography.overlay(&config).into_owned();
         self.font_size_scale_milli = view.font_size_scale_milli_or_default();
@@ -7388,6 +7594,8 @@ impl App {
         self.session_factory
             .shell_args
             .clone_from(&config.shell_args);
+        let contained = self.session_factory.sandbox_wrap.is_some();
+        crate::default_editor::settle(&mut self.session_factory.env_add, &config, contained);
         self.mark_status_dirty();
         aterm_pty::set_console_host(aterm_pty::ConsoleHostChoice::from_config(
             config.conpty.as_deref(),
@@ -7834,6 +8042,54 @@ impl App {
 #[cfg(test)]
 mod reload_render_transaction_tests {
     use super::{Config, FontConfig, ReloadRenderSnapshot, RenderKnobs};
+
+    /// The rollback writer ([`ReloadRenderSnapshot::rollback`]) reinstalls the colours it
+    /// captured, so a window's light latch, keyed by the configured scheme, sees the scheme
+    /// change on the frame after a candidate's colours and again on the frame after the
+    /// rollback, which re-enters at once (`docs/design/PRISM-GLASS.md` §15.2 1.3).
+    #[cfg(unix)]
+    #[test]
+    fn a_rollback_writes_the_scheme_back_and_raises_scheme_changed() {
+        use crate::trail_rig::TrailRig;
+        use std::time::{Duration, Instant};
+        let font = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../aterm-render/tests/fixtures/jetbrains-mono.ttf"
+        );
+        let mut rig = TrailRig::new(std::path::Path::new(font)).expect("the rig");
+        let t0 = rig.t0();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        rig.configure(
+            "trail_sounds = false\ncursor_trail_style = \"rainbow kitty\"\nmotion = \"full\"\n\
+             theme = \"Default Light\"\n",
+            t0,
+        )
+        .expect("the config admits");
+        rig.grid(8, 40, t0).expect("the grid");
+        rig.pty(b"\x1b[4;1H$ ", t0);
+        let latch = |rig: &mut TrailRig, now: Instant| {
+            rig.frame(now).expect("a presented frame");
+            rig.with_app(now, |app, wid| app.windows[&wid].trail_ground.last())
+        };
+        assert!(latch(&mut rig, at(1)).on, "Default Light admits");
+        let previous = rig.with_app(at(50), |app, _| {
+            let previous = ReloadRenderSnapshot::capture(app);
+            // A candidate's colours, installed before its rebuild fails.
+            app.config.theme = Some("Dracula".to_string());
+            app.install_resolved_colors(crate::app_colorscheme::ThemeChange::ConfigReload);
+            previous
+        });
+        let candidate = latch(&mut rig, at(66));
+        assert!(
+            candidate.scheme_changed && !candidate.on && candidate.fell,
+            "{candidate:?}"
+        );
+        rig.with_app(at(100), |app, _| previous.rollback(app));
+        let back = latch(&mut rig, at(116));
+        assert!(back.scheme_changed && back.on, "{back:?}");
+        let steady = latch(&mut rig, at(150));
+        assert!(steady.on && !steady.scheme_changed, "{steady:?}");
+    }
 
     #[test]
     fn failed_backend_rebuild_rolls_back_complete_render_slice_only() {
@@ -8892,20 +9148,26 @@ mod cfg_engine_tests {
     }
 
     #[test]
-    fn restart_notices_flags_columns_and_lines_but_nothing_else() {
+    fn restart_notices_flags_columns_lines_and_gpu_only() {
         use super::restart_notices;
-        let a = cfg("columns = 100\nlines = 40");
+        let a = cfg("columns = 100\nlines = 40\ngpu = true");
         assert!(restart_notices(&a, &a).is_empty());
-        let hot = cfg("columns = 100\nlines = 40\nfont_px = 18");
+        let hot = cfg("columns = 100\nlines = 40\ngpu = true\nfont_px = 18");
         assert!(restart_notices(&a, &hot).is_empty());
-        let cols = cfg("columns = 120\nlines = 40");
+        let cols = cfg("columns = 120\nlines = 40\ngpu = true");
         assert_eq!(restart_notices(&a, &cols).len(), 1);
-        let rows = cfg("columns = 100\nlines = 50");
+        let rows = cfg("columns = 100\nlines = 50\ngpu = true");
         assert_eq!(restart_notices(&a, &rows).len(), 1);
-        let both = cfg("columns = 120\nlines = 50");
+        let both = cfg("columns = 120\nlines = 50\ngpu = true");
         assert_eq!(restart_notices(&a, &both).len(), 1);
-        let cleared = cfg("lines = 40");
+        let cleared = cfg("lines = 40\ngpu = true");
         assert_eq!(restart_notices(&a, &cleared).len(), 1);
+        let gpu_flipped = cfg("columns = 100\nlines = 40\ngpu = false");
+        assert_eq!(restart_notices(&a, &gpu_flipped).len(), 1);
+        let gpu_cleared = cfg("columns = 100\nlines = 40");
+        assert_eq!(restart_notices(&a, &gpu_cleared).len(), 1);
+        let dims_and_gpu = cfg("columns = 120\nlines = 40\ngpu = false");
+        assert_eq!(restart_notices(&a, &dims_and_gpu).len(), 2);
     }
 
     #[test]
@@ -10811,7 +11073,7 @@ mod reload_dedupe_tests {
         aterm_spec::wait::until_within(
             aterm_spec::wait::MUST_HAPPEN,
             "the launch generation's kitty vocabulary to land",
-            || launch.sparkle.tricks.0.get().map(|_| ()),
+            || launch.sparkle.0.tricks.built.get().map(|_| ()),
         );
         assert!(
             reload
@@ -10836,7 +11098,10 @@ mod reload_dedupe_tests {
 
     #[test]
     fn an_unlanded_kitty_vocabulary_classifies_nothing() {
-        let unlanded = super::TrickVocabulary(std::sync::Arc::default());
+        let unlanded = super::TrickVocabulary {
+            built: std::sync::Arc::default(),
+            lazy_langs: None,
+        };
         let mut scratch = String::new();
         assert_eq!(unlanded.get().classify("sit", &mut scratch), None);
         assert_eq!(unlanded.get().surface_count(), 0);
@@ -11692,6 +11957,23 @@ mod trail_style_resolution_tests {
             ..Config::default()
         }
         .cursor_trail_style_warning()
+    }
+
+    #[test]
+    fn the_default_glow_config_is_the_shipped_resolve() {
+        let app = crate::App::headless_for_test();
+        assert_eq!(
+            app.glow_config(),
+            GlowConfig::default(),
+            "a test's ..Default::default() takes what a window with no config resolves"
+        );
+        let mut tinted = crate::App::headless_for_test();
+        tinted.config.cursor_trail_color = Some("#d03a8c".to_string());
+        assert_ne!(
+            tinted.glow_config(),
+            GlowConfig::default(),
+            "control: a set trail colour resolves away from the default"
+        );
     }
 
     #[test]

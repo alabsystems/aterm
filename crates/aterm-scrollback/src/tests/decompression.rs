@@ -230,7 +230,7 @@ fn set_memory_budget_reports_cold_rejection() {
 }
 
 #[test]
-fn corrupt_warm_block_quarantined_after_threshold() {
+fn corrupt_warm_block_quarantines_only_on_final_eviction_attempt() {
     let mut sb = Scrollback::with_block_size(5, 5, 10_000_000, 5);
 
     for i in 0..10 {
@@ -238,36 +238,6 @@ fn corrupt_warm_block_quarantined_after_threshold() {
     }
     assert_eq!(sb.warm_line_count(), 5);
     assert_eq!(sb.warm.block_count(), 1);
-
-    sb.warm.corrupt_oldest_block();
-
-    for batch in 0..crate::tier::QUARANTINE_THRESHOLD {
-        for i in 0..5 {
-            sb.push_str(&format!("Batch{batch}_{i}"));
-        }
-    }
-
-    let tier_sum = sb.hot_line_count() + sb.warm_line_count() + sb.cold_line_count();
-    assert_eq!(
-        sb.line_count(),
-        tier_sum,
-        "line_count must equal hot+warm+cold after quarantine"
-    );
-
-    assert_eq!(
-        sb.line_count(),
-        20,
-        "quarantined block's 5 lines should be subtracted"
-    );
-}
-
-#[test]
-fn corrupt_warm_block_quarantines_only_on_final_eviction_attempt() {
-    let mut sb = Scrollback::with_block_size(5, 5, 10_000_000, 5);
-
-    for i in 0..10 {
-        sb.push_str(&format!("Line {i}"));
-    }
     sb.warm.corrupt_oldest_block();
 
     let threshold = usize::from(crate::tier::QUARANTINE_THRESHOLD);
@@ -368,11 +338,37 @@ fn iterator_skips_quarantined_block_without_redundant_decompression() {
         }
     }
 
-    let lines: Vec<_> = sb.iter().map(|l| l.to_string()).collect();
+    let _ = crate::line::take_records_walked();
+    let mut iter = sb.iter();
+    let lines: Vec<_> = (&mut iter).map(|l| l.to_string()).collect();
+    let walked = crate::line::take_records_walked();
     assert_eq!(
         lines.len(),
         non_corrupt_count,
         "iterator should skip quarantined block lines"
+    );
+    assert_eq!(
+        iter.skipped_lines(),
+        5,
+        "quarantined 5-line block must be counted in skipped_lines()"
+    );
+    assert_eq!(
+        lines.len() + iter.skipped_lines(),
+        sb.line_count(),
+        "yielded + skipped must equal line_count()"
+    );
+    assert_eq!(
+        walked, 5,
+        "only the healthy 5-line warm block should walk serialized records"
+    );
+    assert_eq!(
+        sb.warm
+            .blocks_mut()
+            .front_mut()
+            .expect("quarantined warm block remains present")
+            .failure_count(),
+        crate::tier::QUARANTINE_THRESHOLD,
+        "quarantined block must not attempt another decompression during iteration"
     );
 
     for (i, line) in lines.iter().enumerate() {

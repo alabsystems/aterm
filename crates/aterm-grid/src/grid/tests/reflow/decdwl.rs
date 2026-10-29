@@ -9,15 +9,11 @@ use crate::{CellFlags, Grid, LineSize};
 fn decdhl_top_bottom_preserved_on_shrink() {
     let mut grid = Grid::new(5, 80);
     grid.write_char('T');
-    grid.row_mut(0)
-        .unwrap()
-        .set_line_size(LineSize::DoubleHeightTop);
+    grid.set_row_line_size(0, LineSize::DoubleHeightTop);
 
     grid.set_cursor(1, 0);
     grid.write_char('B');
-    grid.row_mut(1)
-        .unwrap()
-        .set_line_size(LineSize::DoubleHeightBottom);
+    grid.set_row_line_size(1, LineSize::DoubleHeightBottom);
 
     grid.resize(5, 40);
     grid.assert_invariants();
@@ -40,9 +36,7 @@ fn decdwl_round_trip_shrink_then_grow() {
     for i in 0..20u16 {
         grid.write_char((b'A' + (i % 26) as u8) as char);
     }
-    grid.row_mut(0)
-        .unwrap()
-        .set_line_size(LineSize::DoubleWidth);
+    grid.set_row_line_size(0, LineSize::DoubleWidth);
 
     grid.resize(5, 40);
     assert_eq!(grid.row(0).unwrap().line_size(), LineSize::DoubleWidth);
@@ -61,9 +55,7 @@ fn decdwl_mixed_with_normal_rows_on_shrink() {
     for c in "ABCDEFGHIJ".chars() {
         grid.write_char(c);
     }
-    grid.row_mut(0)
-        .unwrap()
-        .set_line_size(LineSize::DoubleWidth);
+    grid.set_row_line_size(0, LineSize::DoubleWidth);
 
     grid.set_cursor(1, 0);
     for c in "1234567890".chars() {
@@ -94,9 +86,7 @@ fn decdwl_continuation_row_survives_shrink_merge() {
         grid.row(1).unwrap().is_wrapped(),
         "sanity: row 1 is a wrap continuation"
     );
-    grid.row_mut(1)
-        .unwrap()
-        .set_line_size(LineSize::DoubleWidth);
+    grid.set_row_line_size(1, LineSize::DoubleWidth);
 
     grid.resize(5, 6);
     grid.assert_invariants();
@@ -120,9 +110,7 @@ fn decdwl_continuation_row_not_merged_on_grow() {
         grid.write_char_wrap(c);
     }
     assert!(grid.row(1).unwrap().is_wrapped());
-    grid.row_mut(1)
-        .unwrap()
-        .set_line_size(LineSize::DoubleWidth);
+    grid.set_row_line_size(1, LineSize::DoubleWidth);
 
     grid.resize(5, 20);
     grid.assert_invariants();
@@ -147,9 +135,7 @@ fn decdwl_continuation_row_not_merged_on_grow() {
 #[test]
 fn decdwl_shrink_blanks_a_wide_char_cut_at_the_new_edge() {
     let mut grid = Grid::new(3, 100);
-    grid.row_mut(0)
-        .unwrap()
-        .set_line_size(LineSize::DoubleWidth);
+    grid.set_row_line_size(0, LineSize::DoubleWidth);
     for _ in 0..39 {
         grid.write_char('a');
     }

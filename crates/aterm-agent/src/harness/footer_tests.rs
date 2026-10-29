@@ -154,7 +154,6 @@ fn tail_cache_reuses_only_one_process_and_one_unchanged_file() {
     let whole = format!("{old}{}\n", assistant_row("claude-opus-7", during));
     assert_eq!(whole.len(), old.len() + newer.len());
     let old_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(20));
     std::fs::write(&path, &whole).unwrap();
     std::fs::OpenOptions::new()
         .write(true)
@@ -394,7 +393,7 @@ fn the_tail_takes_the_newest_main_thread_model_and_effort() {
     let body = concat!(
         r#"{"type":"assistant","effort":"high","message":{"model":"claude-opus-5"}}"#,
         "\n",
-        r#"{"type":"assistant","effort":"xhigh","message":{"model":"claude-opus-5-5"}}"#,
+        r#"{"type":"assistant","effort":"medium","message":{"model":"claude-opus-5-5"}}"#,
         "\n",
         r#"{"type":"assistant","isSidechain":true,"effort":"low","message":{"model":"claude-haiku-4-5"}}"#,
         "\n",
@@ -406,6 +405,15 @@ fn the_tail_takes_the_newest_main_thread_model_and_effort() {
     let facts = tail_facts(body.as_bytes(), None);
     assert_eq!(facts.model.shown(), Some("Opus 5.5"));
     assert_eq!(facts.effort.shown(), Some("xhigh"));
+
+    let answered = format!(
+        "{body}{}\n",
+        r#"{"type":"assistant","effort":"max","message":{"model":"claude-opus-5-5"}}"#
+    );
+    assert_eq!(
+        tail_facts(answered.as_bytes(), None).effort.shown(),
+        Some("max")
+    );
     assert_eq!(
         tail_facts(b"", None),
         TailFacts::default(),
@@ -4977,8 +4985,9 @@ fn rewritten(rows: &[String], m: &ModeRow) -> String {
 }
 
 /// THE MODE ROW KEEPS ONLY THE JOBS (§6): every known mode, the pill and its hint dropped, the
-/// key hints and `⧉` items and the effort and auto-compact readings dropped; the live `/rc
-/// active` and an item this build does not know kept after the jobs; vim's indicator first.
+/// key hints, a finished jobs' count (`← 2 done`, the way to tasks Claude finished) and `⧉`
+/// items and the effort and auto-compact readings dropped; the live `/rc active` and an item
+/// this build does not know kept after the jobs; vim's indicator first.
 #[test]
 fn the_mode_row_keeps_only_claudes_jobs() {
     let wide = |left: &str, right: &str| format!("{left}{}{right}", " ".repeat(20));
@@ -4998,7 +5007,22 @@ fn the_mode_row_keeps_only_claudes_jobs() {
             "2 shells · ← 2 agents",
             false,
         ),
-        ("  ⏵⏵ auto mode on · ← 2 done".to_owned(), "← 2 done", false),
+        ("  ⏵⏵ auto mode on · ← 2 done".to_owned(), "", false),
+        (
+            "  ⏵⏵ bypass permissions on · 1 shell · ← 2 done".to_owned(),
+            "1 shell",
+            false,
+        ),
+        (
+            "  ⏵⏵ bypass permissions on · ← 1 done · 1 shell".to_owned(),
+            "1 shell",
+            false,
+        ),
+        (
+            "  ⏵⏵ bypass permissions on · 1 shell · ← 2 agents".to_owned(),
+            "1 shell · ← 2 agents",
+            false,
+        ),
         (
             "  ⏵⏵ bypass permissions on (shift+tab to cycle)".to_owned(),
             "",
@@ -5080,16 +5104,48 @@ fn the_mode_row_keeps_only_claudes_jobs() {
     );
 }
 
-/// A CUT OR UNKNOWN ROW STANDS AS DRAWN: a cut pill, a cut hint, a cut item, a lone separator,
-/// a pill this build does not know, a pill run into its next word, and a row that is not the
-/// mode row are never rewritten. CONTROL: the whole row is.
+/// THE JOB WORDS ARE CLAUDE'S RUNNING COUNTS: the counts the row keeps, as Claude words them,
+/// a returned count without its `←`, a finished one left out; vim's indicator, `/rc active` and
+/// an unknown item are no jobs. CONTROL: a row with no count says none.
+#[test]
+fn the_job_words_are_claudes_running_counts() {
+    for (row, words) in [
+        ("  ⏵⏵ bypass permissions on · 1 shell", "1 shell"),
+        (
+            "  ⏵⏵ bypass permissions on · 2 shells · 1 monitor · ↓ to manage",
+            "2 shells · 1 monitor",
+        ),
+        (
+            "  ⏵⏵ bypass permissions on · 2 shells · ← 2 agents",
+            "2 shells · 2 agents",
+        ),
+        ("  ⏵⏵ auto mode on · 1 shell · ← 2 done", "1 shell"),
+        (
+            "  -- INSERT -- ⏵⏵ bypass permissions on · 1 shell · ← for agents",
+            "1 shell",
+        ),
+        (
+            "  ⏵⏵ bypass permissions on · 3 widgets · 1 shell",
+            "1 shell",
+        ),
+        ("  ⏵⏵ auto mode on · ← 2 done", ""),
+        ("  ⏵⏵ bypass permissions on (shift+tab to cycle)", ""),
+    ] {
+        let (rows, bottom) = under_rule(&[row]);
+        let m = mode_row_rewrite_under(&rows, bottom).unwrap_or_else(|| panic!("{row:?}"));
+        assert_eq!(m.job_words(&rows[m.row]), words, "{row:?}");
+    }
+}
+
+/// A CUT OR UNKNOWN ROW STANDS AS DRAWN: a cut pill, a cut hint, a lone separator, a pill this
+/// build does not know, a pill run into its next word, and a row that is not the mode row are
+/// never rewritten (a cut item: [`a_cut_last_item_the_rewrite_drops_anyway_goes_with_it`]).
+/// CONTROL: the whole row is.
 #[test]
 fn a_cut_or_unknown_mode_row_is_not_rewritten() {
     for footer in [
         "  ⏵⏵ bypass permissi",
         "  ⏵⏵ auto mode on (shift+tab to",
-        "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for …",
-        "  ⏸ manual mode on · ? for shor…",
         "  ⏵⏵ auto mode on  ·",
         "  ⏵⏵ auto mode on ·",
         "  ⏵⏵ bypass permissions only",
@@ -5105,6 +5161,65 @@ fn a_cut_or_unknown_mode_row_is_not_rewritten() {
         mode_row_rewrite_under(&rows, bottom).is_some(),
         "CONTROL: the whole row"
     );
+}
+
+/// A CUT LAST ITEM THE REWRITE DROPS ANYWAY GOES WITH IT: at 80 columns, for some 8 s after a
+/// launch, Claude cuts its row's last item (`· ← for ag…`); where what the item still shows can
+/// begin only an item the rewrite drops (a key hint, a `⧉` item, the auto-compact reading), the
+/// row is rewritten without it, its cells blanked with the row's, and an effort hint wrapped
+/// under it is read. CONTROL: a cut item that is not the row's last, one that may begin a job
+/// count (`←`, `← 2`) or `/rc active` (`/`), and one of an item the rewrite keeps or does not
+/// know stand as drawn.
+#[test]
+fn a_cut_last_item_the_rewrite_drops_anyway_goes_with_it() {
+    let hint = "                                   ◐ medium · /effort";
+    for (footer, kept) in [
+        (
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for ag…",
+            "",
+        ),
+        (
+            "  ⏵⏵ bypass permissions on · 1 shell · esc to interrupt · ← for ag…",
+            "1 shell",
+        ),
+        ("  ⏵⏵ auto mode on (shift+tab to cycle) · ← for …", ""),
+        ("  ⏸ manual mode on · ? for shor…", ""),
+        (
+            "  ⏵⏵ bypass permissions on · 2 shells · ⧉ prism-gl…",
+            "2 shells",
+        ),
+        ("  ⏵⏵ bypass permissions on · 1 shell · /tas…", "1 shell"),
+        (
+            "  ⏵⏵ bypass permissions on · 1 shell · 7% until auto-c…",
+            "1 shell",
+        ),
+    ] {
+        let (rows, bottom) = under_rule(&[footer, hint]);
+        let m = mode_row_rewrite_under(&rows, bottom).unwrap_or_else(|| panic!("{footer:?}"));
+        assert_eq!(rewritten(&rows, &m), kept, "{footer:?}");
+        assert_eq!(
+            (m.row, m.end),
+            (bottom + 1, footer.chars().count()),
+            "{footer:?}: the cut item's cells are the row's"
+        );
+        assert_eq!(m.effort_said(), Some((bottom + 2, "medium")), "{footer:?}");
+    }
+    for footer in [
+        "  ⏵⏵ bypass permissions on · ← for ag… · 1 shell",
+        "  ⏵⏵ bypass permissions on · esc to interrupt · ←…",
+        "  ⏵⏵ bypass permissions on · esc to interrupt · ← 2…",
+        "  ⏵⏵ bypass permissions on · esc to interrupt · /…",
+        "  ⏵⏵ bypass permissions on · esc to interrupt · 1 sh…",
+        "  ⏵⏵ bypass permissions on · esc to interrupt · Not logged…",
+        "  ⏵⏵ bypass permissions on · esc to interrupt · …",
+    ] {
+        let (rows, bottom) = under_rule(&[footer, hint]);
+        assert_eq!(
+            mode_row_rewrite_under(&rows, bottom),
+            None,
+            "CONTROL: {footer:?}"
+        );
+    }
 }
 
 /// THE REWRITTEN ROW MAPS EACH KEPT ITEM TO ITS OWN CELLS: a glass cell of a kept item is
@@ -5145,6 +5260,84 @@ fn the_rewritten_row_maps_each_item_to_claudes_cells() {
         None,
         "CONTROL: another row under it stays"
     );
+}
+
+/// THE EFFORT HINT STAYS WHERE THE RULE NAMES NO EFFORT: kept, Claude's hint is the last item,
+/// in Claude's own cells, and a hint wrapped to the row under is left there as drawn (nothing
+/// blanks it). CONTROL: unkept, the row drops it and blanks the wrapped one; a row with no hint
+/// keeps what it kept.
+#[test]
+fn the_effort_hint_stays_where_the_rule_names_no_effort() {
+    let row = format!(
+        "  ⏵⏵ bypass permissions on · 1 shell · ← for agents{}◐ medium · /effort",
+        " ".repeat(20)
+    );
+    let (rows, bottom) = under_rule(&[&row]);
+    let m = mode_row_rewrite_under(&rows, bottom).expect("the row");
+    assert_eq!(rewritten(&rows, &m), "1 shell", "CONTROL: dropped");
+    let kept = m.keeping_effort().expect("room for it");
+    assert_eq!(
+        rewritten(&rows, &kept),
+        "1 shell · ◐ medium",
+        "the level kept, its `/effort` key hint dropped"
+    );
+    assert_eq!(kept.kept().last().map(|k| k.item), Some(ModeItem::Effort));
+    assert_eq!(kept.job_words(&rows[kept.row]), "1 shell", "no job");
+    let hint = kept.kept().len() - 1;
+    let at = row[..row.find('◐').expect("the hint")].chars().count();
+    assert_eq!(
+        kept.grid_col(kept.glass_of(hint).start),
+        Some(at),
+        "Claude's cells"
+    );
+    let (rows, bottom) = under_rule(&[
+        "  ⏵⏵ bypass permissions on · 1 shell",
+        "                          ◐ medium · /effort",
+    ]);
+    let m = mode_row_rewrite_under(&rows, bottom).expect("the wrapped row");
+    assert_eq!(m.effort, Some((bottom + 2, 44)), "CONTROL: blanked unkept");
+    let kept = m.keeping_effort().expect("room");
+    assert_eq!(kept.effort, None, "the wrapped hint stands");
+    assert_eq!(rewritten(&rows, &kept), "1 shell");
+    let (rows, bottom) = under_rule(&["  ⏵⏵ bypass permissions on · 2 shells"]);
+    let m = mode_row_rewrite_under(&rows, bottom).expect("no hint");
+    assert_eq!(m.keeping_effort(), Some(m), "CONTROL: nothing to keep");
+}
+
+/// THE EFFORT HINT SAYS ITS LEVEL: the row reads the effort Claude's hint names and the row it is
+/// drawn on, on the mode row (`◐ medium`, 2.1.283's `✦ workspace · xhigh + workflows`) or
+/// wrapped to the row under it, kept or dropped. CONTROL: a row with no hint, or a hint that names
+/// no level, says none.
+#[test]
+fn the_effort_hint_says_its_level() {
+    let pill = "  ⏵⏵ bypass permissions on · 1 shell";
+    for (hint, level) in [
+        ("◐ medium · /effort", "medium"),
+        ("✦ workspace · xhigh + workflows · /effort", "xhigh"),
+    ] {
+        let row = format!("{pill}{}{hint}", " ".repeat(20));
+        let (rows, bottom) = under_rule(&[&row]);
+        let m = mode_row_rewrite_under(&rows, bottom).expect("the row");
+        assert_eq!(m.effort_said(), Some((bottom + 1, level)), "{hint}");
+        assert_eq!(
+            m.keeping_effort().and_then(|k| k.effort_said()),
+            Some((bottom + 1, level)),
+            "{hint}: kept"
+        );
+        let under = format!("{hint:>50}");
+        let (rows, bottom) = under_rule(&[pill, &under]);
+        let m = mode_row_rewrite_under(&rows, bottom).expect("the wrapped row");
+        assert_eq!(
+            m.effort_said(),
+            Some((bottom + 2, level)),
+            "{hint}: wrapped"
+        );
+    }
+    for row in [pill.to_owned(), format!("{pill}  ◐ fast · /effort")] {
+        let (rows, bottom) = under_rule(&[&row]);
+        let m = mode_row_rewrite_under(&rows, bottom).expect("the row");
+        assert_eq!(m.effort_said(), None, "CONTROL: {row:?}");
+    }
 }
 
 #[test]
@@ -6270,6 +6463,45 @@ fn account_progress_survives_optional_facts_and_its_wall_opens_accounts() {
 }
 
 #[test]
+fn compact_recovery_retains_its_blocker_before_the_retry_timestamp() {
+    use super::super::account_progress::{AccountProgress, ProgressPhase};
+    let mut progress = AccountProgress::unknown(1_793_040_000);
+    progress.phase = ProgressPhase::Waiting;
+    progress.known = Some(2);
+    progress.eligible = Some(0);
+    progress.next_at = Some(1_793_040_160);
+    let blocker = "current: sign-in needed";
+    progress.details.push(blocker.into());
+    let mut facts = FooterFacts {
+        account_progress: Some(progress.clone()),
+        ..Default::default()
+    };
+    for room in [40, 60] {
+        let fit = fit_rule(&facts, room, None);
+        assert!(fit.width(None) <= room);
+        assert!(
+            fit.segments
+                .iter()
+                .any(|s| s.mark == WALL_MARK && s.text.contains(blocker))
+        );
+    }
+    facts.account_progress.as_mut().unwrap().wall = Some("weekly".into());
+    let fit = fit_rule(&facts, 60, None);
+    assert!(fit.width(None) <= 60);
+    assert!(fit.segments.iter().any(|s| s.text.contains(blocker)));
+    let wide = fit_rule(&facts, 160, None);
+    let next = super::super::usage::rfc3339_utc(progress.next_at.unwrap());
+    assert!(wide.segments.iter().any(|s| s.text.contains(&next)));
+    let tiny = fit_rule(&facts, 30, None);
+    assert!(tiny.width(None) <= 30);
+    assert!(tiny.segments.iter().any(|s| s.mark == WALL_MARK));
+    assert_eq!(
+        facts.account_progress.as_ref().unwrap().next_at,
+        progress.next_at
+    );
+}
+
+#[test]
 fn a_transcript_limit_survives_an_older_idle_account_observation() {
     use super::super::account_progress::{AccountProgress, ProgressPhase};
     let mut progress = AccountProgress::unknown(100);
@@ -6338,6 +6570,53 @@ fn healthy_account_inventory_does_not_present_a_pending_recovery_event() {
     assert_eq!(idle, account_progress_text(&progress, true));
     progress.wall = Some("weekly".into());
     assert_ne!(idle, account_progress_text(&progress, false));
+}
+
+/// AN ACCOUNT WATCH THAT KNOWS NOTHING IS NOT ON THE RULE: after a relaunch the account
+/// observation is a watch with no limit and no inventory, which the person at the tab can do
+/// nothing with, so the rule lays no `⧗` for it at any width and its other facts stand; the
+/// observation stays on the facts for the hover and the Accounts menu. CONTROL: a watch that
+/// knows its inventory, or a limit, is on the rule.
+#[test]
+fn an_account_watch_that_knows_nothing_is_not_on_the_rule() {
+    use super::super::account_progress::{AccountProgress, ProgressPhase};
+    let mut progress = AccountProgress::unknown(100);
+    progress.phase = ProgressPhase::Watching;
+    let mut facts = FooterFacts {
+        model: Some("Opus 5.5".into()),
+        path: Some("~/aterm".into()),
+        account_progress: Some(progress.clone()),
+        ..Default::default()
+    };
+    let marks = |facts: &FooterFacts, room| -> Vec<char> {
+        fit_rule(facts, room, None)
+            .segments
+            .iter()
+            .map(|s| s.mark)
+            .collect()
+    };
+    for room in [40, 80, 200] {
+        let on = marks(&facts, room);
+        assert!(!on.contains(&WALL_MARK), "{room}: {on:?}");
+        assert!(on.contains(&MODEL_MARK), "{room}: the model stands: {on:?}");
+    }
+    assert!(
+        facts.account_progress_view().is_some(),
+        "kept for the hover and the menu"
+    );
+    progress.known = Some(2);
+    facts.account_progress = Some(progress.clone());
+    assert!(
+        marks(&facts, 200).contains(&WALL_MARK),
+        "CONTROL: an inventory is on the rule"
+    );
+    progress.known = None;
+    progress.wall = Some("weekly".into());
+    facts.account_progress = Some(progress);
+    assert!(
+        marks(&facts, 200).contains(&WALL_MARK),
+        "CONTROL: a limit is on the rule"
+    );
 }
 
 #[test]

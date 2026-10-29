@@ -71,7 +71,7 @@ impl<'a> PageDesk<'a> {
 
 impl page::Host for PageDesk<'_> {
     fn now_unix_ms(&self) -> u64 {
-        wall_stamp_now().unix_ms
+        self.app.messages_wall.now().unix_ms
     }
 
     fn log_folder(&self) -> Option<String> {
@@ -87,7 +87,7 @@ impl page::Host for PageDesk<'_> {
     }
 
     fn utc_offset_s(&self) -> i64 {
-        crate::presence::local_offset_s().unwrap_or(0)
+        self.app.messages_wall.offset_s().unwrap_or(0)
     }
 
     fn staged_build(&self) -> Option<u64> {
@@ -151,10 +151,67 @@ pub(crate) fn message_regrids() -> u64 {
     PTY_RESIZES_FOR_MESSAGES.with(|c| c.get())
 }
 
+/// What aterm.log keeps of a message: its key where that is a word, and its title's length.
+/// The title and detail stay in the Messages store: a title can name a tab by the program's own
+/// title, a worker's label or an exception's reason (DESIGN §3.6).
+pub(crate) fn logged_as(msg: &Message) -> String {
+    format!(
+        "key={} title={}",
+        msg.key.as_deref().map_or("-", aterm_log::words::word),
+        aterm_log::words::Len(&msg.title)
+    )
+}
+
 /// Returns the current wall-clock timestamp in Unix epoch milliseconds.
 pub(crate) fn wall_stamp_now() -> WallStamp {
     let unix_ms = aterm_time::unix_millis().unwrap_or(0);
     WallStamp { unix_ms }
+}
+
+/// The wall clock and zone Settings ▸ Messages says its times on, and the clock
+/// [`App::post_message`] and [`App::record_message`] stamp a record with.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WallClock {
+    /// The host's clock ([`wall_stamp_now`]) and zone ([`crate::presence::local_offset_at`]).
+    Host,
+    /// The instant `unix_ms`, in a zone `offset_s` east of UTC at every instant: a test's
+    /// fixed time, which stands still until the test sets another.
+    #[cfg(test)]
+    Pinned {
+        /// Unix milliseconds.
+        unix_ms: u64,
+        /// Seconds east of UTC.
+        offset_s: i64,
+    },
+}
+
+impl WallClock {
+    /// The time now.
+    pub(crate) fn now(self) -> WallStamp {
+        match self {
+            Self::Host => wall_stamp_now(),
+            #[cfg(test)]
+            Self::Pinned { unix_ms, .. } => WallStamp { unix_ms },
+        }
+    }
+
+    /// The zone's offset from UTC in seconds now.
+    pub(crate) fn offset_s(self) -> Option<i64> {
+        match self {
+            Self::Host => crate::presence::local_offset_s(),
+            #[cfg(test)]
+            Self::Pinned { offset_s, .. } => Some(offset_s),
+        }
+    }
+
+    /// The zone's offset from UTC in seconds at the unix second `unix`.
+    pub(crate) fn offset_at(self, unix: i64) -> Option<i64> {
+        match self {
+            Self::Host => crate::presence::local_offset_at(unix),
+            #[cfg(test)]
+            Self::Pinned { offset_s, .. } => Some(offset_s),
+        }
+    }
 }
 
 /// Builds a [`Restatement`] from `msg`'s fields for updating a live row in place.
@@ -291,7 +348,7 @@ fn open_path_external(path: &str) -> bool {
 impl App {
     /// Posts `msg` into the message center at the current timestamp, logs it, and syncs the band.
     pub(crate) fn post_message(&mut self, msg: Message) -> MessageId {
-        self.post_message_at(msg, wall_stamp_now())
+        self.post_message_at(msg, self.messages_wall.now())
     }
 
     /// Posts `msg` into the message center with an explicit ingress `stamp` and syncs the band.
@@ -303,7 +360,7 @@ impl App {
 
     /// Posts `msg` as a `Hold::LogOnly` record without showing a row on the glass.
     pub(crate) fn record_message(&mut self, msg: Message) -> MessageId {
-        self.post_unsynced(msg.hold(Hold::LogOnly), wall_stamp_now())
+        self.post_unsynced(msg.hold(Hold::LogOnly), self.messages_wall.now())
     }
 
     /// Replaces config warning rows after a full reload and reconciles the font-warning row.
@@ -491,7 +548,12 @@ impl App {
     fn post_unsynced_at(&mut self, msg: Message, stamp: WallStamp, now: Instant) -> MessageId {
         let posted = self.messages.post(msg, stamp, now);
         if let Some(live) = self.messages.live(posted.id) {
-            aterm_log::info!("message {} {}: {}", posted.id, live.msg.tag, live.msg.title);
+            aterm_log::info!(
+                "message {} {} {}",
+                posted.id,
+                live.msg.tag,
+                logged_as(&live.msg)
+            );
         }
         self.note_message_rule();
         posted.id
@@ -797,6 +859,8 @@ impl App {
     pub(crate) fn drain_message_inbox(&mut self) {
         #[cfg(unix)]
         self.follow_join_requests();
+        #[cfg(unix)]
+        self.follow_member_requests();
         let queued = crate::message_inbox::take_queued();
         let exceptions = crate::message_inbox::take_queued_exceptions();
         let folders = crate::spawn_folder::take_noted();
@@ -1024,6 +1088,34 @@ impl App {
                 #[cfg(not(unix))]
                 {
                     let _ = recipient;
+                    false
+                }
+            }
+            Intent::AllowJoin { request } => {
+                #[cfg(unix)]
+                {
+                    match self.allow_member_request(request) {
+                        Ok(()) => true,
+                        Err(why) => {
+                            aterm_log::info!("message {id}: Allow refused: {why}");
+                            false
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = request;
+                    false
+                }
+            }
+            Intent::IgnoreJoin { request } => {
+                #[cfg(unix)]
+                {
+                    self.ignore_member_request(request)
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = request;
                     false
                 }
             }
@@ -1899,7 +1991,7 @@ impl App {
                 if on_screen && self.messages.has_live_capacity() {
                     aterm_log::info!(
                         "message: left unseen, posted again for a visible band: {}",
-                        owed.msg.title
+                        logged_as(&owed.msg)
                     );
                     let id = self.post_unsynced_at(owed.msg.clone(), wall_stamp_now(), now);
                     owed.seen = self.messages.live(id).is_some_and(|live| !live.is_queued());
@@ -1924,7 +2016,7 @@ impl App {
             if showing {
                 aterm_log::info!(
                     "message: said while no window was on screen, shown now: {}",
-                    owed.msg.title
+                    logged_as(&owed.msg)
                 );
                 self.note_message_rule();
             }

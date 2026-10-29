@@ -28,6 +28,11 @@ pub(crate) fn allow(session: u64, nbytes: usize) -> bool {
         tokens: CAP_BYTES,
         last: now,
     });
+    step(b, now, nbytes)
+}
+
+/// One bucket's refill to `now` and its charge for `nbytes` ([`allow`]'s step).
+fn step(b: &mut Bucket, now: Instant, nbytes: usize) -> bool {
     let elapsed = now.saturating_duration_since(b.last).as_secs_f64();
     b.tokens = (b.tokens + elapsed * REFILL_BYTES_PER_SEC).min(CAP_BYTES);
     b.last = now;
@@ -53,6 +58,7 @@ pub(crate) fn forget(session: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn floor_admits_under_cap_and_refuses_a_burst_storm() {
@@ -67,15 +73,33 @@ mod tests {
 
     #[test]
     fn floor_throttles_a_tight_loop_then_recovers() {
-        let s = 9_999_002;
         let chunk = (CAP_BYTES as usize) / 4;
-        let mut admitted = 0;
-        for _ in 0..8 {
-            if allow(s, chunk) {
-                admitted += 1;
-            }
-        }
-        assert!(admitted <= 5, "burst is bounded, got {admitted} admits");
+        let t0 = Instant::now();
+        let mut bucket = Bucket {
+            tokens: CAP_BYTES,
+            last: t0,
+        };
+        let admitted = (0..8).filter(|_| step(&mut bucket, t0, chunk)).count();
+        assert_eq!(admitted, 4, "a full bucket admits four quarters at once");
+        let later = t0 + Duration::from_millis(250);
+        assert!(
+            step(&mut bucket, later, chunk),
+            "a quarter second refills a quarter"
+        );
+        assert!(!step(&mut bucket, later, chunk), "and only a quarter");
+
+        let s = 9_999_002;
+        let t0 = Instant::now();
+        let admitted = (0..8).filter(|_| allow(s, chunk)).count();
+        let credit = t0.elapsed().as_secs_f64() * REFILL_BYTES_PER_SEC;
+        assert!(
+            admitted >= 4,
+            "a full bucket admits four quarters: {admitted}"
+        );
+        assert!(
+            (admitted * chunk) as f64 <= CAP_BYTES + credit,
+            "allow keeps the session's bucket: {admitted} admits in {credit} bytes of refill"
+        );
         forget(s);
     }
 }

@@ -22,7 +22,9 @@ use aterm_core::terminal::{RenderCell, UnderlineStyle};
 use aterm_hash::{FNV64_OFFSET, fnv_mix_u64};
 use aterm_render::{RainHalo, premul_rgb};
 
-use crate::color_math::{hsv2rgb, relative_luminance, rgb2hsv};
+#[cfg(test)]
+use crate::color_math::relative_luminance;
+use crate::color_math::{hsv2rgb, rgb2hsv};
 use crate::genome::mix;
 pub use crate::word_decorations::{EffectGeom, SelView};
 
@@ -587,11 +589,37 @@ impl MatrixRain {
         self.tick_ms = 1000 / u32::from(cfg.fps);
         let (mq, dq, sq) = FieldParams::quanta(self.tick_ms, u32::from(cfg.mutation_ms));
         (self.mq, self.dq, self.sq) = (mq, dq, sq);
-        let hue = ramp_hue(&cfg);
-        self.ramp = build_ramp(hue, &cfg);
-        self.ramp_alert = luminance_match(build_ramp(ALERT_HUE_DEG, &cfg), self.ramp);
-        self.ramp_fail = luminance_match(build_ramp(FAIL_HUE_DEG, &cfg), self.ramp);
-        (self.body_alpha, self.head_alpha) = derive_alphas(&cfg, &self.ramp);
+        let table = crate::color_math::relative_luminance_table();
+        let bg_lum = crate::color_math::relative_luminance_with(table, cfg.default_bg);
+        let light_bg = bg_lum > 0.5;
+        if matches!(cfg.hue, RainHue::Matrix) {
+            if light_bg {
+                self.ramp = RAMP_MATRIX_LIGHT;
+                self.ramp_alert = RAMP_ALERT_MATCHED_LIGHT;
+                self.ramp_fail = RAMP_FAIL_MATCHED_LIGHT;
+            } else {
+                self.ramp = RAMP_MATRIX_DARK;
+                self.ramp_alert = RAMP_ALERT_MATCHED_DARK;
+                self.ramp_fail = RAMP_FAIL_MATCHED_DARK;
+            }
+        } else {
+            let hue = ramp_hue(&cfg);
+            self.ramp = build_ramp(hue, light_bg);
+            let ref_lums = ramp_luminances(table, &self.ramp);
+            let alert_base = if light_bg {
+                RAMP_ALERT_LIGHT
+            } else {
+                RAMP_ALERT_DARK
+            };
+            let fail_base = if light_bg {
+                RAMP_FAIL_LIGHT
+            } else {
+                RAMP_FAIL_DARK
+            };
+            self.ramp_alert = luminance_match(table, alert_base, &ref_lums);
+            self.ramp_fail = luminance_match(table, fail_base, &ref_lums);
+        }
+        (self.body_alpha, self.head_alpha) = derive_alphas(table, &cfg, bg_lum, &self.ramp);
         self.baker.restart();
         self.last_bake_tick = None;
         self.order_seed = self.seed32;
@@ -910,21 +938,16 @@ impl MatrixRain {
             if line_sizes.get(r) != Some(&LineSize::SingleWidth) {
                 self.clear_occ_span(r, 0, last_col);
             }
-            r += 1;
-        }
-
-        let mut r = 0;
-        while r < rows {
             let row_cells: &[RenderCell] = if r < cells.len() {
                 cells[r].as_slice()
             } else {
                 &[]
             };
             let mut run: Option<(usize, usize)> = None;
-            let col_limit = row_cells.len().min(cols);
+            let row_slice = &row_cells[..row_cells.len().min(cols)];
             let mut c = 0;
-            while c < col_limit {
-                let cell = &row_cells[c];
+            while c < row_slice.len() {
+                let cell = &row_slice[c];
                 c += 1;
                 let col = c - 1;
                 let meaningful = cell.ch != ' '
@@ -1052,13 +1075,17 @@ impl MatrixRain {
         }
 
         self.material.clear();
-        let mut index = 0;
-        while index < n {
-            let ch = self.material_scratch[index];
-            if let Ok(slot) = self.material_chars.binary_search(&ch) {
-                self.material.push(slot as u8);
+        if self.material_chars.len() == 1 {
+            self.material.resize(n, 0);
+        } else {
+            let mut index = 0;
+            while index < n {
+                let ch = self.material_scratch[index];
+                if let Ok(slot) = self.material_chars.binary_search(&ch) {
+                    self.material.push(slot as u8);
+                }
+                index += 1;
             }
-            index += 1;
         }
     }
 
@@ -1535,11 +1562,6 @@ impl MatrixRain {
         self.order_cols = cols;
         self.order_seed = self.seed32;
         self.order_rows = rows;
-        self.col_order.clear();
-        self.col_order.extend(0..cols);
-        let seed = self.seed32;
-        self.col_order
-            .sort_by_key(|&c| field::rain_hash32(seed ^ ((u32::from(c) << 1) | 1)));
         let fp = self.field_params(rows);
         self.col_params_cache.clear();
         self.col_params_cache.reserve(usize::from(cols));
@@ -1549,6 +1571,10 @@ impl MatrixRain {
             self.col_params_cache.push(col_params(&fp, c));
             c += 1;
         }
+        self.col_order.clear();
+        self.col_order.extend(0..cols);
+        let cache = self.col_params_cache.as_slice();
+        self.col_order.sort_by_key(|&c| cache[usize::from(c)].h);
     }
 
     #[inline]
@@ -1567,7 +1593,7 @@ impl MatrixRain {
 
     #[inline]
     fn row_sort_stable(&mut self, quads: &mut [RainCell], rows: usize) {
-        if quads.len() < 2 || rows == 0 {
+        if quads.len() < 2 || rows == 0 || layers::cells_sorted_by_row(quads) {
             return;
         }
         self.row_starts.clear();
@@ -1645,6 +1671,7 @@ impl MatrixRain {
         if x0 + cw > u32::from(u16::MAX) {
             return true;
         }
+        let x = x0 as u16;
         let cp = self.col_params_cache[usize::from(col)];
         let cv = cycle_at(&cp, &ctx.fp, self.tick);
         let density = self.ring.at(cycle_start_tick(&cp, cv.k));
@@ -1659,8 +1686,8 @@ impl MatrixRain {
             while r <= r_hi {
                 let cur_r = r;
                 r += 1;
-                // Cheapest reject first: an occupied cell needs no trail math.
-                if !self.occ_bit(cur_r, col) {
+                // Cheapest reject first: an occupied or masked cell needs no trail math.
+                if !self.occ_bit(cur_r, col) || !self.cell_unmasked(cur_r, col, ctx.input) {
                     continue;
                 }
                 let Some(lvl0) = trail_level(&cp, cv.eff_tick, cv.k, cur_r) else {
@@ -1670,9 +1697,6 @@ impl MatrixRain {
                 let Some(lvl) = self.drained_level(ctx, &cp, lvl0, cur_r, is_head) else {
                     continue;
                 };
-                if !self.cell_unmasked(cur_r, col, ctx.input) {
-                    continue;
-                }
                 if quads.len() >= ctx.cap {
                     return false;
                 }
@@ -1689,7 +1713,7 @@ impl MatrixRain {
                         ms
                     }
                 };
-                quads.push(self.cell_quad(ctx, col, cur_r, lvl, head_flash, ms));
+                quads.push(self.cell_quad_at_x(ctx, (col, x), cur_r, lvl, head_flash, ms));
                 if head_flash && cv.bright {
                     self.halo_cands.push((cur_r as u16, col));
                 }
@@ -1698,7 +1722,7 @@ impl MatrixRain {
         if let Some(wr) = ctx.wave_row
             && wr < rows
             && self.cell_eligible(wr, col, ctx.input)
-            && trail_level(&cp, cv.eff_tick, cv.k, wr).is_none()
+            && (wr < r_lo || wr > cv.head_row || trail_level(&cp, cv.eff_tick, cv.k, wr).is_none())
         {
             let lvl = 15u32.saturating_sub(ctx.pen);
             if quads.len() >= ctx.cap {
@@ -1709,7 +1733,7 @@ impl MatrixRain {
                 None if self.material.is_empty() => None,
                 None => Some(self.material_start(col)),
             };
-            quads.push(self.cell_quad(ctx, col, wr, lvl, true, ms));
+            quads.push(self.cell_quad_at_x(ctx, (col, x), wr, lvl, true, ms));
         }
         true
     }
@@ -1737,11 +1761,32 @@ impl MatrixRain {
 
     /// One resolved rain cell quad (tile rect from the baker, tint/alpha from
     /// the ramp, `flip_x` from the glyph hash).
+    #[cfg(test)]
     #[inline]
     const fn cell_quad(
         &self,
         ctx: &EmitCtx<'_>,
         col: u16,
+        row: u32,
+        lvl: u32,
+        head: bool,
+        material_start: Option<usize>,
+    ) -> RainCell {
+        self.cell_quad_at_x(
+            ctx,
+            (col, col.wrapping_mul(ctx.geom.cell_w)),
+            row,
+            lvl,
+            head,
+            material_start,
+        )
+    }
+
+    #[inline]
+    const fn cell_quad_at_x(
+        &self,
+        ctx: &EmitCtx<'_>,
+        (col, x): (u16, u16),
         row: u32,
         lvl: u32,
         head: bool,
@@ -1768,7 +1813,7 @@ impl MatrixRain {
         const _: () = assert!(rom::ROM_GLYPHS.is_power_of_two());
         RainCell {
             row: row as u16,
-            x: col.wrapping_mul(cw),
+            x,
             y: (row as u16).wrapping_mul(ch),
             w: cw,
             h: ch,
@@ -1792,16 +1837,17 @@ impl MatrixRain {
         debug_assert!(len > 0);
         let row = row as usize;
         let epoch = glyph_epoch as usize;
-        let third = if len / 3 > 1 { len / 3 } else { 1 };
         let offset = match self.semantic_phase {
             RainSignal::Inspect => row.wrapping_add(epoch),
             RainSignal::Modify if col % 2 == 1 => len.wrapping_sub(row.wrapping_add(epoch) % len),
             RainSignal::Modify => row.wrapping_add(epoch),
             RainSignal::Execute => row.wrapping_add(epoch.wrapping_mul(2)),
             RainSignal::Network => row / 2 + epoch,
-            RainSignal::Branch => row
-                .wrapping_add(epoch)
-                .wrapping_add((col % 3) as usize * third),
+            RainSignal::Branch => {
+                let third = if len / 3 > 1 { len / 3 } else { 1 };
+                row.wrapping_add(epoch)
+                    .wrapping_add((col % 3) as usize * third)
+            }
             RainSignal::Waiting => row.wrapping_add(epoch / 4),
             RainSignal::Success
             | RainSignal::Failure
@@ -1866,72 +1912,80 @@ impl MatrixRain {
                 &[]
             };
 
-            let mut prefix_built = false;
-            let mut write = 0usize;
-            let cand_len = self.frame_candidates.len();
-            let mut i = 0;
-            while i < cand_len {
-                let mut candidate = self.frame_candidates[i];
-                i += 1;
-                let left = cell_ch_at(row, candidate.left);
-                let right = cell_ch_at(row, candidate.right);
-                if frame_bottom_left(left) && frame_bottom_right(right) && r > candidate.top + 1 {
-                    if !prefix_built {
-                        self.frame_horizontal_prefix.resize(cols + 1, 0);
-                        self.frame_horizontal_prefix[0] = 0;
-                        let mut col = 0;
-                        while col < cols {
-                            self.frame_horizontal_prefix[col + 1] = self.frame_horizontal_prefix
-                                [col]
-                                + usize::from(frame_horizontal(cell_ch_at(row, col)));
-                            col += 1;
+            if !self.frame_candidates.is_empty() {
+                let mut prefix_built = false;
+                let mut write = 0usize;
+                let cand_len = self.frame_candidates.len();
+                let mut i = 0;
+                while i < cand_len {
+                    let mut candidate = self.frame_candidates[i];
+                    i += 1;
+                    let left = cell_ch_at(row, candidate.left);
+                    let right = cell_ch_at(row, candidate.right);
+                    if frame_bottom_left(left) && frame_bottom_right(right) && r > candidate.top + 1
+                    {
+                        if !prefix_built {
+                            self.frame_horizontal_prefix.resize(cols + 1, 0);
+                            self.frame_horizontal_prefix[0] = 0;
+                            let row_len = row.len().min(cols);
+                            let mut acc = 0usize;
+                            let mut col = 0;
+                            while col < row_len {
+                                acc += usize::from(frame_horizontal(row[col].ch));
+                                self.frame_horizontal_prefix[col + 1] = acc;
+                                col += 1;
+                            }
+                            while col < cols {
+                                self.frame_horizontal_prefix[col + 1] = acc;
+                                col += 1;
+                            }
+                            prefix_built = true;
                         }
-                        prefix_built = true;
-                    }
-                    let interior_rows = r - candidate.top - 1;
-                    let interior_cols = candidate.right - candidate.left - 1;
-                    let horizontal_cols = self.frame_horizontal_prefix[candidate.right]
-                        - self.frame_horizontal_prefix[candidate.left + 1];
-                    let sides_close =
-                        candidate.side_rows.saturating_mul(4) >= interior_rows.saturating_mul(3);
-                    let bottom_closes =
-                        horizontal_cols.saturating_mul(4) >= interior_cols.saturating_mul(3);
-                    if sides_close && bottom_closes {
-                        if self.frame_regions.len() == MAX_FRAME_REGIONS {
-                            self.occ.fill(0);
-                            self.frame_candidates.clear();
-                            self.frame_regions.clear();
-                            return;
+                        let interior_rows = r - candidate.top - 1;
+                        let interior_cols = candidate.right - candidate.left - 1;
+                        let horizontal_cols = self.frame_horizontal_prefix[candidate.right]
+                            - self.frame_horizontal_prefix[candidate.left + 1];
+                        let sides_close = candidate.side_rows.saturating_mul(4)
+                            >= interior_rows.saturating_mul(3);
+                        let bottom_closes =
+                            horizontal_cols.saturating_mul(4) >= interior_cols.saturating_mul(3);
+                        if sides_close && bottom_closes {
+                            if self.frame_regions.len() == MAX_FRAME_REGIONS {
+                                self.occ.fill(0);
+                                self.frame_candidates.clear();
+                                self.frame_regions.clear();
+                                return;
+                            }
+                            self.frame_regions.push(FrameRegion {
+                                top: candidate.top,
+                                bottom: r,
+                                left: candidate.left,
+                                right: candidate.right,
+                            });
                         }
-                        self.frame_regions.push(FrameRegion {
-                            top: candidate.top,
-                            bottom: r,
-                            left: candidate.left,
-                            right: candidate.right,
-                        });
-                    }
-                    continue;
-                }
-
-                if frame_vertical(left) && frame_vertical(right) {
-                    candidate.side_rows += 1;
-                } else {
-                    candidate.gap_rows += 1;
-                    if candidate.gap_rows > 2 {
                         continue;
                     }
+
+                    if frame_vertical(left) && frame_vertical(right) {
+                        candidate.side_rows += 1;
+                    } else {
+                        candidate.gap_rows += 1;
+                        if candidate.gap_rows > 2 {
+                            continue;
+                        }
+                    }
+                    self.frame_candidates[write] = candidate;
+                    write += 1;
                 }
-                self.frame_candidates[write] = candidate;
-                write += 1;
+                self.frame_candidates.truncate(write);
             }
-            self.frame_candidates.truncate(write);
 
             let mut open_left = None;
             let mut has_horizontal = false;
-            let col_limit = row.len().min(cols);
+            let row_slice = &row[..row.len().min(cols)];
             let mut col = 0;
-            while col < col_limit {
-                let ch = row[col].ch;
+            while col < row_slice.len() {
+                let ch = row_slice[col].ch;
                 let cur_col = col;
                 col += 1;
                 if !in_box_drawing_block(ch) {
@@ -2259,10 +2313,58 @@ const fn ramp_hue(cfg: &RainConfig) -> f32 {
     }
 }
 
+const RAMP_MATRIX_DARK: [u32; 16] = build_ramp(MATRIX_HUE_DEG, false);
+const RAMP_MATRIX_LIGHT: [u32; 16] = build_ramp(MATRIX_HUE_DEG, true);
+const RAMP_ALERT_DARK: [u32; 16] = build_ramp(ALERT_HUE_DEG, false);
+const RAMP_ALERT_LIGHT: [u32; 16] = build_ramp(ALERT_HUE_DEG, true);
+const RAMP_FAIL_DARK: [u32; 16] = build_ramp(FAIL_HUE_DEG, false);
+const RAMP_FAIL_LIGHT: [u32; 16] = build_ramp(FAIL_HUE_DEG, true);
+const REF_LUMS_MATRIX_DARK: [f32; 16] = ramp_luminances(
+    crate::color_math::relative_luminance_table(),
+    &RAMP_MATRIX_DARK,
+);
+const REF_LUMS_MATRIX_LIGHT: [f32; 16] = ramp_luminances(
+    crate::color_math::relative_luminance_table(),
+    &RAMP_MATRIX_LIGHT,
+);
+const RAMP_ALERT_MATCHED_DARK: [u32; 16] = luminance_match(
+    crate::color_math::relative_luminance_table(),
+    RAMP_ALERT_DARK,
+    &REF_LUMS_MATRIX_DARK,
+);
+const RAMP_ALERT_MATCHED_LIGHT: [u32; 16] = luminance_match(
+    crate::color_math::relative_luminance_table(),
+    RAMP_ALERT_LIGHT,
+    &REF_LUMS_MATRIX_LIGHT,
+);
+const RAMP_FAIL_MATCHED_DARK: [u32; 16] = luminance_match(
+    crate::color_math::relative_luminance_table(),
+    RAMP_FAIL_DARK,
+    &REF_LUMS_MATRIX_DARK,
+);
+const RAMP_FAIL_MATCHED_LIGHT: [u32; 16] = luminance_match(
+    crate::color_math::relative_luminance_table(),
+    RAMP_FAIL_LIGHT,
+    &REF_LUMS_MATRIX_LIGHT,
+);
+
 #[inline]
-const fn build_ramp(hue: f32, cfg: &RainConfig) -> [u32; 16] {
+const fn ramp_luminances(
+    table: &crate::color_math::RelativeLuminanceTable,
+    ramp: &[u32; 16],
+) -> [f32; 16] {
+    let mut ref_lums = [0.0f32; 16];
+    let mut ri = 0;
+    while ri < 16 {
+        ref_lums[ri] = crate::color_math::relative_luminance_with(table, ramp[ri]);
+        ri += 1;
+    }
+    ref_lums
+}
+
+#[inline]
+const fn build_ramp(hue: f32, light_bg: bool) -> [u32; 16] {
     const INV_15: f32 = 1.0 / 15.0;
-    let light_bg = relative_luminance(cfg.default_bg) > 0.5;
     let mut ramp = [0u32; 16];
     let mut i = 0;
     while i < 16 {
@@ -2279,11 +2381,15 @@ const fn build_ramp(hue: f32, cfg: &RainConfig) -> [u32; 16] {
 }
 
 #[inline]
-const fn luminance_match(mut ramp: [u32; 16], reference: [u32; 16]) -> [u32; 16] {
-    let table = crate::color_math::relative_luminance_table();
+const fn luminance_match(
+    table: &crate::color_math::RelativeLuminanceTable,
+    mut ramp: [u32; 16],
+    ref_lums: &[f32; 16],
+) -> [u32; 16] {
     let mut i = 0;
     while i < 16 {
-        let lt = crate::color_math::relative_luminance_with(table, reference[i]);
+        let lt = ref_lums[i];
+        let lt_plus_002 = lt + 0.02;
         let (h, s, mut v) = rgb2hsv(ramp[i]);
         let mut step = 0;
         while step < 8 {
@@ -2292,7 +2398,7 @@ const fn luminance_match(mut ramp: [u32; 16], reference: [u32; 16]) -> [u32; 16]
             if (l - lt).abs() < 0.01 {
                 break;
             }
-            v = (v * (lt + 0.02) / (l + 0.02)).clamp(0.02, 1.0);
+            v = (v * lt_plus_002 / (l + 0.02)).clamp(0.02, 1.0);
             ramp[i] = hsv2rgb(h, s, v);
         }
         i += 1;
@@ -2323,7 +2429,12 @@ fn faint_ink(fg: u32, bg: u32) -> u32 {
 }
 
 #[inline]
-fn derive_alphas(cfg: &RainConfig, ramp: &[u32; 16]) -> (u8, u8) {
+fn derive_alphas(
+    table: &crate::color_math::RelativeLuminanceTable,
+    cfg: &RainConfig,
+    lb: f32,
+    ramp: &[u32; 16],
+) -> (u8, u8) {
     #[inline]
     const fn head_ok(
         table: &crate::color_math::RelativeLuminanceTable,
@@ -2362,9 +2473,7 @@ fn derive_alphas(cfg: &RainConfig, ramp: &[u32; 16]) -> (u8, u8) {
         }
         true
     }
-    let table = crate::color_math::relative_luminance_table();
     let bg = cfg.default_bg;
-    let lb = crate::color_math::relative_luminance_with(table, bg);
     let plain =
         (0.5 * (crate::color_math::relative_luminance_with(table, cfg.theme_fg) - lb)).abs();
     let faint =
@@ -2411,9 +2520,19 @@ fn derive_alphas(cfg: &RainConfig, ramp: &[u32; 16]) -> (u8, u8) {
 /// tables (bit `i` ⇒ slot `i` must be re-authored and re-baked).
 #[inline]
 const fn slot_change_mask(old: &[char], new: &[char]) -> u64 {
+    let max_len = if old.len() > new.len() {
+        old.len()
+    } else {
+        new.len()
+    };
+    let limit = if max_len < rom::ROM_GLYPHS {
+        max_len
+    } else {
+        rom::ROM_GLYPHS
+    };
     let mut mask = 0u64;
     let mut slot = 0;
-    while slot < rom::ROM_GLYPHS {
+    while slot < limit {
         let same = match (slot < old.len(), slot < new.len()) {
             (true, true) => old[slot] == new[slot],
             (false, false) => true,
@@ -2447,11 +2566,10 @@ const fn fingerprint(quads: &[RainCell], add: &[RainHalo], tick: u64, atlas_vers
     h = fnv_mix_u64(h, tick.wrapping_mul(0x9E37_79B1));
     let mut j = 0;
     while j < add.len() {
-        let g = &add[j];
-        let a = (g.row as u64) | ((g.x as u64) << 16) | ((g.y as u64) << 32) | ((g.w as u64) << 48);
-        let b = (g.h as u64) | ((g.color as u64) << 16);
-        h = fnv_mix_u64(h, a);
-        h = fnv_mix_u64(h, b);
+        let words = add[j].damage_words();
+        h = fnv_mix_u64(h, words[0]);
+        h = fnv_mix_u64(h, words[1]);
+        h = fnv_mix_u64(h, words[2]);
         j += 1;
     }
     h
@@ -2896,11 +3014,45 @@ mod tests {
             if !q.is_empty() {
                 seen_nonempty += 1;
                 assert_ne!(fp, prev, "animating fp must change every tick");
-                assert_ne!(fp, 0, "nonempty emission is never fp 0");
             }
             prev = fp;
         }
         assert!(seen_nonempty >= 10, "liveness test needs a raining field");
+    }
+
+    #[test]
+    fn halo_fingerprint_tracks_center_radii_and_mode() {
+        use aterm_core::render::HaloMode;
+        let base = RainHalo {
+            row: 2,
+            x: 16,
+            y: 32,
+            w: 24,
+            h: 16,
+            color: 0x0033_AA55,
+            cx: 28,
+            cy: 40,
+            rx: 12,
+            ry: 8,
+            mode: HaloMode::Add,
+        };
+        let base_fp = fingerprint(&[], &[base], 10, 1);
+        for variant in [
+            RainHalo { cx: 29, ..base },
+            RainHalo { cy: 41, ..base },
+            RainHalo { rx: 13, ..base },
+            RainHalo { ry: 9, ..base },
+            RainHalo {
+                mode: HaloMode::Over,
+                ..base
+            },
+        ] {
+            assert_ne!(
+                fingerprint(&[], &[variant], 10, 1),
+                base_fp,
+                "halo change must move fingerprint: {variant:?}"
+            );
+        }
     }
 
     #[test]

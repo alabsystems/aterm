@@ -360,15 +360,14 @@ pub(crate) struct Placed {
     pub(crate) place: Place,
 }
 
-/// The body: on a shell `lw` pt wide, two columns of `(lw − 36)/2` from 640 pt.
+/// The body, using the same column choice as its measured section forms.
 pub(crate) fn lens_body(
-    lw: f64,
+    (two, cw): (bool, f64),
     top: f64,
     bottom: f64,
     sections: &[Section<'_>],
     (two_order, keeps_first): (&[usize], bool),
 ) -> Vec<Placed> {
-    let (two, cw) = columns(lw);
     let cols: Vec<(f64, Vec<usize>)> = if two {
         let order: Vec<usize> = if two_order.is_empty() {
             (0..sections.len()).collect()
@@ -1619,13 +1618,62 @@ impl Ctx<'_> {
 fn lab_network_doc(
     snapshot: Option<&aterm_types::network_state::NetworkStateSnapshot>,
     target: crate::network_deck::Target,
+    metrics: &FaceMetrics,
+    width: f64,
 ) -> LensDoc<'static> {
     let empty = aterm_types::network_state::NetworkStateSnapshot::default();
     let snapshot = snapshot.unwrap_or(&empty);
-    let rows = crate::network_deck::details(snapshot, target);
+    let mut rows = crate::network_deck::details(snapshot, target);
+    // A selected service needs its own scope before generic network guidance.
+    // Keep Scope in the complete report, but present it once in the lens header.
+    let scope = if target == crate::network_deck::Target::Accounts {
+        rows.iter()
+            .position(|(name, _)| name == "Scope")
+            .map(|index| rows.remove(index).1)
+    } else {
+        None
+    };
+    let line_tab = rows
+        .iter()
+        .map(|(name, _)| tab_after(metrics.width(name, HEAD_PT, true)))
+        .fold(0.0, f64::max);
     let mut sections: Vec<_> = rows
         .into_iter()
-        .map(|(name, value)| line_section(&name, &name, vec![value], false))
+        .map(|(name, value)| {
+            if (target == crate::network_deck::Target::Overview && name != "Observer")
+                || metrics.width(&value, BODY_PT, false) <= width - line_tab
+            {
+                return line_section(&name, &name, vec![value], false);
+            }
+            let lines = wrap(metrics, &value, width, BODY_PT);
+            let label = name.clone();
+            let compact = (target == crate::network_deck::Target::Overview && name == "Observer")
+                .then(|| line_form(&name, vec![value.clone()]));
+            let mut forms = vec![form(rows_h(lines.len(), false), move |pen, p| {
+                heading(pen, p, &label, &[]);
+                let ink = pen.inks.words2;
+                for (i, line) in lines.iter().enumerate() {
+                    pen.text(
+                        p.x,
+                        p.y + ROW0_BASE + PITCH * i as f64,
+                        line,
+                        BODY_PT,
+                        false,
+                        ink,
+                    );
+                }
+            })];
+            if let Some(compact) = compact {
+                forms.push(compact);
+            }
+            Section {
+                name,
+                words: vec![value],
+                right: false,
+                parts: Vec::new(),
+                forms,
+            }
+        })
         .collect();
     if let crate::network_deck::Target::Peer(slot) = target
         && let Some(peer) = snapshot.network.peers.iter().find(|peer| peer.slot == slot)
@@ -1688,8 +1736,12 @@ fn lab_network_doc(
     }
     LensDoc {
         name: "Network State",
-        sources: vec!["This aterm's authenticated observations and retained history".into()],
-        explainer: "Filled: reachable. Hollow: last seen. A warning marks an unknown observation. ↑/↓ selects a machine or service; ←/→ selects an instrument. Reachability does not grant account or secret access.".into(),
+        sources: vec![if target == crate::network_deck::Target::Accounts {
+            "Local observation of the Commons account catalog".into()
+        } else {
+            "This machine's local observer and retained authenticated history".into()
+        }],
+        explainer: scope.unwrap_or_else(|| "Filled peer: reachable; hollow peer: unconfirmed. Warnings: peer = unknown visibility, local = partial history, service = refresh failed. ↑/↓: machine or service; ←/→: instrument. Reachability grants no account or secret access.".into()),
         answer: Some(("Now", crate::network_deck::summary(snapshot), InkKind::Words2)),
         sections,
         two_order: Vec::new(),
@@ -1700,6 +1752,283 @@ fn lab_network_doc(
 #[cfg(test)]
 mod network_tests {
     use super::*;
+
+    #[test]
+    fn overview_observation_time_is_visible() {
+        use aterm_types::network_state::{HistoryState, Visibility};
+        let resource = Snapshot::default();
+        let mut network = aterm_types::network_state::NetworkStateSnapshot::default();
+        network.network.visibility = Visibility::Waiting;
+        network.network.history = HistoryState::Ready;
+        network.network.detail = "Another process owns repair".into();
+        network.network.observed_at_ms = 1_793_040_000_000;
+        let mut input = crate::stats_deck::tests::input(&resource);
+        input.network = Some(&network);
+        input.network_target = crate::network_deck::Target::Overview;
+        let lens = Lens {
+            focus: Instrument::NetworkState,
+            bar: Bar::Global,
+            how: Opened::Keyboard,
+        };
+        let geometry =
+            lens_geom(StatsBars::Deck, 0, 80.0, 0.0, 80.0, 840.0, 300.0, 1.0, 14.0).unwrap();
+        let laid = lay_lens(
+            &geometry,
+            &input,
+            &lens,
+            &FaceMetrics::helvetica_neue(),
+            true,
+        );
+        let drawn = laid
+            .prims
+            .iter()
+            .filter_map(|prim| match prim {
+                DrawPrim::Text { s, .. } => Some(s.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let time = aterm_types::rfc3339::format_rfc3339(network.network.observed_at_ms / 1000);
+        assert!(drawn.contains(&time), "observation time missing: {drawn}");
+        assert!(drawn.contains(&network.network.detail));
+    }
+
+    #[test]
+    fn blocked_overview_keeps_the_observer_reason_in_a_short_lens() {
+        use aterm_types::network_state::{HistoryState, Visibility};
+        let resource = Snapshot::default();
+        let mut network = aterm_types::network_state::NetworkStateSnapshot::default();
+        network.network.visibility = Visibility::Waiting;
+        network.network.history = HistoryState::Ready;
+        network.network.detail =
+            "Another observer holds the repair lease; waiting for current network evidence".into();
+        network.services.accounts.detail =
+            "Account metadata is retained separately from provider sign-in".into();
+        network.services.accounts.revision = Some("account revision".into());
+        network.services.secrets.detail =
+            "Local vault metadata does not establish remote currency".into();
+        network.services.secrets.revision = Some("vault revision".into());
+        let mut input = crate::stats_deck::tests::input(&resource);
+        input.network = Some(&network);
+        input.network_target = crate::network_deck::Target::Overview;
+        let lens = Lens {
+            focus: Instrument::NetworkState,
+            bar: Bar::Global,
+            how: Opened::Keyboard,
+        };
+        for (width, height) in [(420.0, 196.0), (840.0, 300.0)] {
+            let geometry = lens_geom(
+                StatsBars::Deck,
+                0,
+                80.0,
+                0.0,
+                80.0,
+                width,
+                height,
+                1.0,
+                14.0,
+            )
+            .unwrap();
+            let laid = lay_lens(
+                &geometry,
+                &input,
+                &lens,
+                &FaceMetrics::helvetica_neue(),
+                true,
+            );
+            let drawn = laid
+                .prims
+                .iter()
+                .filter_map(|prim| match prim {
+                    DrawPrim::Text { s, .. } => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                drawn.contains(&network.network.detail),
+                "observer reason was omitted at {width} by {height}: {drawn}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_observer_reason_keeps_a_visible_prefix_and_complete_report() {
+        use aterm_types::network_state::{HistoryState, Visibility};
+        let resource = Snapshot::default();
+        let mut network = aterm_types::network_state::NetworkStateSnapshot::default();
+        network.network.visibility = Visibility::Waiting;
+        network.network.history = HistoryState::Ready;
+        network.network.detail = format!(
+            "Observer holds repair lease; {}",
+            "retained evidence ".repeat(80)
+        );
+        let mut input = crate::stats_deck::tests::input(&resource);
+        input.network = Some(&network);
+        input.network_target = crate::network_deck::Target::Overview;
+        let lens = Lens {
+            focus: Instrument::NetworkState,
+            bar: Bar::Global,
+            how: Opened::Keyboard,
+        };
+        let geometry =
+            lens_geom(StatsBars::Deck, 0, 80.0, 0.0, 80.0, 420.0, 196.0, 1.0, 14.0).unwrap();
+        let laid = lay_lens(
+            &geometry,
+            &input,
+            &lens,
+            &FaceMetrics::helvetica_neue(),
+            true,
+        );
+        let drawn = laid
+            .prims
+            .iter()
+            .filter_map(|prim| match prim {
+                DrawPrim::Text { s, .. } => Some(s.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            drawn.contains("Observer holds repair lease"),
+            "reason prefix is missing: {drawn}"
+        );
+        assert!(
+            laid.wells
+                .iter()
+                .any(|(_, words)| words == &network.network.detail)
+        );
+    }
+
+    #[test]
+    fn network_service_explanations_are_drawn_in_full_at_both_widths() {
+        let resource = Snapshot::default();
+        let mut input = crate::stats_deck::tests::input(&resource);
+        let mut network = aterm_types::network_state::NetworkStateSnapshot::default();
+        let detail = (0..60)
+            .map(|n| format!("detail{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        network.services.secrets.detail = detail.clone();
+        input.network = Some(&network);
+        input.network_target = crate::network_deck::Target::Secrets;
+        let lens = Lens {
+            focus: Instrument::NetworkState,
+            bar: Bar::Global,
+            how: Opened::Keyboard,
+        };
+        for (width, height) in [(420.0, 260.0), (840.0, 600.0)] {
+            let geometry = lens_geom(
+                StatsBars::Deck,
+                0,
+                80.0,
+                0.0,
+                80.0,
+                width,
+                height,
+                1.0,
+                14.0,
+            )
+            .unwrap();
+            let laid = lay_lens(
+                &geometry,
+                &input,
+                &lens,
+                &FaceMetrics::helvetica_neue(),
+                true,
+            );
+            assert_eq!(
+                laid.stacks.len(),
+                1,
+                "Network State uses the full panel width"
+            );
+            let drawn = laid
+                .prims
+                .iter()
+                .filter_map(|prim| match prim {
+                    DrawPrim::Text { s, .. } => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                drawn.contains(&detail),
+                "service explanation was cut for a {width} by {height} grid"
+            );
+        }
+    }
+
+    #[test]
+    fn account_catalog_status_and_scope_remain_visible_in_a_short_lens() {
+        use aterm_types::network_state::ServiceAvailability;
+        let resource = Snapshot::default();
+        let lens = Lens {
+            focus: Instrument::NetworkState,
+            bar: Bar::Global,
+            how: Opened::Keyboard,
+        };
+        for (availability, detail) in [
+            (
+                ServiceAvailability::Unavailable,
+                "Shared account catalog has not been received or initialized",
+            ),
+            (
+                ServiceAvailability::Cached,
+                "2 account proposals retained; catalog access does not prove login readiness or remote currency",
+            ),
+        ] {
+            let mut network = aterm_types::network_state::NetworkStateSnapshot::default();
+            network.services.accounts.availability = availability;
+            network.services.accounts.detail = detail.into();
+            network.services.accounts.observed_at_ms = 1_793_040_000_000;
+            network.services.accounts.last_success_ms = Some(1_793_040_000_000);
+            network.services.accounts.revision = Some("retained catalog revision".into());
+            let mut input = crate::stats_deck::tests::input(&resource);
+            input.network = Some(&network);
+            input.network_target = crate::network_deck::Target::Accounts;
+            let expected = crate::network_deck::details(&network, input.network_target);
+            assert_eq!(
+                expected[1].0, "Scope",
+                "scope must follow the selected service status"
+            );
+            for (width, height) in [(420.0, 196.0), (840.0, 600.0)] {
+                let geometry = lens_geom(
+                    StatsBars::Deck,
+                    0,
+                    80.0,
+                    0.0,
+                    80.0,
+                    width,
+                    height,
+                    1.0,
+                    14.0,
+                )
+                .unwrap();
+                let laid = lay_lens(
+                    &geometry,
+                    &input,
+                    &lens,
+                    &FaceMetrics::helvetica_neue(),
+                    true,
+                );
+                let drawn = laid
+                    .prims
+                    .iter()
+                    .filter_map(|prim| match prim {
+                        DrawPrim::Text { s, .. } => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                for (_, value) in &expected[..2] {
+                    assert!(
+                        drawn.contains(value),
+                        "selected catalog status or scope was cut at {width} by {height}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn network_details_do_not_require_a_resource_reading() {
@@ -2804,8 +3133,8 @@ fn memory_doc(c: Ctx<'_>) -> LensDoc<'_> {
         ],
         None => vec![format!("as of {at}")],
     };
-    let explainer = "Heat is how much memory is in use: apps, wired and compressed. File cache \
-                     is not counted; macOS gives it back when apps need it."
+    let explainer = "Heat is how much memory is in use: apps, wired and compressed. Available \
+                     is free memory plus reclaimable file cache; unclassified memory is excluded."
         .to_owned();
     let now = snap.at_unix_ms;
     let vals: Vec<Option<f64>> = c
@@ -2838,6 +3167,7 @@ fn memory_doc(c: Ctx<'_>) -> LensDoc<'_> {
         _ => vec!["not read yet".to_owned()],
     };
     let sections = vec![
+        memory_capacity_section(c),
         classes_section(c),
         trace_section(
             c,
@@ -2860,7 +3190,60 @@ fn memory_doc(c: Ctx<'_>) -> LensDoc<'_> {
         answer: c.now_answer(Resource::Memory, "capacity"),
         sections,
         two_order: Vec::new(),
-        keeps_first: false,
+        keeps_first: true,
+    }
+}
+
+/// The measured physical capacity, kept even when the lens has room for no history.
+fn memory_capacity_section(c: Ctx<'_>) -> Section<'_> {
+    let Some(m) = c.snap.mem.as_ref().filter(|m| m.sample.total > 0) else {
+        return line_section("Capacity", "Capacity", vec!["not read yet".into()], false);
+    };
+    let sample = m.sample;
+    let line = words::memory_space_line(&sample);
+    let available = sample
+        .available()
+        .map_or_else(|| "not reported".into(), words::gib_figure);
+    let short = format!(
+        "{} used · {} available · {} total GiB",
+        words::gib_figure(sample.used()),
+        available,
+        words::gib_total(sample.total)
+    );
+    let rows = [
+        format!("Used {} GiB", words::gib_figure(sample.used())),
+        sample.available().map_or_else(
+            || "Available not reported".into(),
+            |bytes| {
+                format!(
+                    "Available {} GiB (free + file cache)",
+                    words::gib_figure(bytes)
+                )
+            },
+        ),
+        format!("Total {} GiB", words::gib_total(sample.total)),
+    ];
+    let full = form(rows_h(rows.len(), false), move |pen, p| {
+        heading(pen, p, "Capacity", &[]);
+        let ink = pen.inks.words2;
+        for (i, row) in rows.iter().enumerate() {
+            let text = pen.cut(row, p.w, BODY_PT, false);
+            pen.text(
+                p.x,
+                p.y + ROW0_BASE + PITCH * i as f64,
+                &text,
+                BODY_PT,
+                false,
+                ink,
+            );
+        }
+    });
+    Section {
+        name: "Capacity".into(),
+        words: vec![line.clone()],
+        right: false,
+        parts: Vec::new(),
+        forms: vec![full, line_form("Capacity", vec![line, short])],
     }
 }
 
@@ -4069,6 +4452,17 @@ fn text_well(c: Ctx<'_>, focus: Instrument) -> LensDoc<'_> {
                 if let Some(a) = g.alloc_bytes {
                     lines.push(format!("{} GPU memory allocated", words::mem(a)));
                 }
+                lines.push(
+                    if c.loc.platform == Platform::MacOs
+                        && g.name
+                            .as_deref()
+                            .is_some_and(|name| name.starts_with("Apple "))
+                    {
+                        "GPU memory total not reported; available not reported; uses unified system memory".into()
+                    } else {
+                        "GPU memory total not reported; available not reported".into()
+                    },
+                );
             }
             match f.gpu_resets {
                 Some((n, since)) => lines.push(format!(
@@ -4093,13 +4487,28 @@ fn text_well(c: Ctx<'_>, focus: Instrument) -> LensDoc<'_> {
     let mut seen = std::collections::HashSet::new();
     lines.retain(|l| seen.insert(l.clone()));
     let now_lines = wrap(c.m, &sentence, c.cw, BODY_PT);
+    let mut sources = Vec::new();
+    if res == Resource::Gpu
+        && let Some(g) = f.gpu.as_ref()
+    {
+        let model = g
+            .name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("GPU");
+        if let Some(cores) = g.cores {
+            sources.push(format!("{model} · {cores} cores · as of {at}"));
+        }
+        sources.push(format!("{model} · as of {at}"));
+    }
+    sources.push(format!("as of {at}"));
     let sections = vec![
         lines_section("Now", now_lines, vec![sentence.clone()], false),
         lines_section("Details", lines.clone(), lines, true),
     ];
     LensDoc {
         name,
-        sources: vec![format!("as of {at}")],
+        sources,
         explainer: explainer.into(),
         answer: None,
         sections,
@@ -4351,7 +4760,11 @@ pub(crate) fn lay_lens(
     }
     let shell = pen.p.prims.len();
     let (lw, lh) = lg.shell_pt();
-    let (two, cw) = columns(lw);
+    let (two, cw) = if lens.focus == Instrument::NetworkState {
+        (false, lw - 2.0 * SIDE)
+    } else {
+        columns(lw)
+    };
     let mut laid = LensLaid {
         prims: Vec::new(),
         shell,
@@ -4395,7 +4808,7 @@ pub(crate) fn lay_lens(
                 cw,
             };
             let doc = if lens.focus == Instrument::NetworkState {
-                lab_network_doc(input.network, input.network_target)
+                lab_network_doc(input.network, input.network_target, metrics, cw)
             } else {
                 doc_for(c, lens.focus)
             };
@@ -4407,7 +4820,7 @@ pub(crate) fn lay_lens(
                 .map_or(0.0, |f| f.h);
             let top = head(&mut pen, &doc, lens.how, lw, lh, reserve);
             let placed = lens_body(
-                lw,
+                (two, cw),
                 top,
                 lh - FOOT,
                 &doc.sections,
@@ -4563,6 +4976,10 @@ impl crate::App {
         self.network_snapshot.revision.hash(&mut h);
         std::mem::discriminant(&self.network_snapshot.network.visibility).hash(&mut h);
         self.network_snapshot.network.detail.hash(&mut h);
+        self.network_snapshot.network.observed_at_ms.hash(&mut h);
+        self.network_snapshot.network.via_local_process.hash(&mut h);
+        self.network_snapshot.network.retention_limited.hash(&mut h);
+        crate::network_deck::hash_peer_reachability(&self.network_snapshot, &mut h);
         self.network_snapshot.services.hash(&mut h);
         self.windows
             .get(&wid)
@@ -4926,8 +5343,13 @@ impl crate::App {
             return true;
         }
         if open.how != Opened::Hover {
+            // The lens's two copies write the person's clipboard, which a control client's
+            // gesture never reaches: a key an `hwkey` burst posted arrives here by the person's
+            // key path under the controller mark ([`App::dispatch_hw_key`]).
             if open.focus == Instrument::Cpu && command("c") && mods.shift_key() {
-                if let Some(snap) = self.vitals.snapshot.as_deref() {
+                if !self.refuse_clipboard_gesture("CPU diagnostic report copy")
+                    && let Some(snap) = self.vitals.snapshot.as_deref()
+                {
                     let _ = crate::control::pbcopy(&cpu_diagnostic_report(snap));
                 }
                 return true;
@@ -4991,7 +5413,9 @@ impl crate::App {
                 return true;
             }
             if command("c") || copy_chord {
-                let _ = self.copy_stats_sentence(wid);
+                if !self.refuse_clipboard_gesture("lens copy") {
+                    let _ = self.copy_stats_sentence(wid);
+                }
                 return true;
             }
         }

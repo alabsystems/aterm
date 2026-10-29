@@ -6,8 +6,9 @@
 //! account home.
 
 use super::{
-    PreparedSetup, SetupAdmission, SetupStartup, doctor_startup_env, doctor_startup_env_from,
-    first_run_window_eligible, prepare_setup,
+    DoctorStartupEnv, PreparedSetup, SetupAdmission, SetupStartup, doctor_startup_env,
+    doctor_startup_env_from, first_lan_uses_wait_for_the_step, first_run_window_eligible,
+    ordinary_window, prepare_setup,
 };
 use aterm_cli::macos_doctor::{
     AutomaticSetupClaim, InitialSetupObservation, InitialSetupSnapshot, ProvisionalSetupWatchTest,
@@ -52,6 +53,8 @@ struct Startup {
     successor: bool,
     /// The reviews it withheld.
     withheld: usize,
+    /// The admitted runs whose plan the startup offered back for the window's own answer.
+    resumed: Vec<SetupAdmission>,
 }
 
 impl Startup {
@@ -138,9 +141,14 @@ impl SetupStartup for Startup {
         // pending run is returned without any record write, as the before/after pins prove.
         let revision = ProvisionalSetupWatchTest::at(&self.root()).recover()?;
         Ok(Some(SetupAdmission {
+            plan: self.snapshot()?.plan,
             revision,
             completed: false,
         }))
+    }
+
+    fn offer_resume(&mut self, admission: &SetupAdmission) {
+        self.resumed.push(admission.clone());
     }
 
     fn may_offer(&mut self) -> bool {
@@ -236,12 +244,15 @@ fn startup(home: &Path) -> Startup {
         after_bind: None,
         successor: false,
         withheld: 0,
+        resumed: Vec::new(),
     }
 }
 
 /// An update successor never shows a review: on records nobody admitted a run of, it reads no
 /// plan, offers nothing and leaves setup as it was, where a launch the person started offers the
-/// plan. A run already admitted resumes in the successor as in any launch.
+/// plan. A run already admitted resumes in the successor as in any launch, and either offers its
+/// admitted plan back for the window's own answer (design §3.3, §6): the page answers it only with
+/// a person at this Mac.
 #[test]
 fn an_update_successor_resumes_an_admitted_run_and_never_offers_a_review() {
     for successor in [true, false] {
@@ -279,6 +290,17 @@ fn an_update_successor_resumes_an_admitted_run_and_never_offers_a_review() {
         assert_eq!(
             host.withheld, 0,
             "an admitted run asks nothing of the review"
+        );
+        let saved = host.snapshot().unwrap().plan;
+        assert!(saved.selection.contains(Setting::Permissions));
+        assert_eq!(
+            host.resumed,
+            [SetupAdmission {
+                plan: saved,
+                revision,
+                completed: false,
+            }],
+            "a launch and a successor alike offer the admitted plan back (successor {successor})"
         );
     }
 }
@@ -326,6 +348,64 @@ fn a_real_home_keeps_first_run_setup_and_a_scratch_home_never_starts_it() {
     // The launch's own reader: a test binary runs under its private state root, a lasting
     // refusal, so this process is never the person's.
     assert!(doctor_startup_env().outside_person_scope);
+}
+
+/// A window's other first LAN uses wait for System State's Local Network step only where the
+/// window runs first-run setup, whose System State runs the step: one started over ssh or away
+/// from the console, under a private state root or outside the person's scope, one that runs a
+/// command, and a launch that is not ordinary wait on no step this window will not take.
+#[test]
+fn only_a_window_that_runs_setup_holds_its_lan_uses_for_the_step() {
+    fn start() -> bool {
+        true
+    }
+    let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
+    let waits = |args: &[OsString], env: DoctorStartupEnv| {
+        let start: fn() -> bool = start;
+        first_lan_uses_wait_for_the_step(
+            ordinary_window(args),
+            first_run_window_eligible(args, env).then_some(start),
+        )
+    };
+    let at_the_mac = DoctorStartupEnv::default();
+    assert!(waits(&osv(&["--window"]), at_the_mac));
+    assert!(waits(&[], at_the_mac), "a Dock launch");
+    for (env, why) in [
+        (
+            DoctorStartupEnv {
+                remote: true,
+                ..at_the_mac
+            },
+            "over ssh, or away from the console",
+        ),
+        (
+            DoctorStartupEnv {
+                isolated: true,
+                ..at_the_mac
+            },
+            "a private state root or CI",
+        ),
+        (
+            DoctorStartupEnv {
+                outside_person_scope: true,
+                ..at_the_mac
+            },
+            "outside the person's scope",
+        ),
+    ] {
+        assert!(
+            ordinary_window(&osv(&["--window"])),
+            "{why}: still an ordinary window"
+        );
+        assert!(!waits(&osv(&["--window"]), env), "{why}");
+    }
+    for args in [
+        osv(&["-e", "zsh"]),
+        osv(&["--headless"]),
+        osv(&["--control-sock", "/tmp/private"]),
+    ] {
+        assert!(!waits(&args, at_the_mac), "{args:?}");
+    }
 }
 
 #[test]

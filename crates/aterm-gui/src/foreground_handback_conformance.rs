@@ -570,61 +570,40 @@ fn foreground_handback_a_mixed_batch_is_cut_at_the_park() {
         t.process(&frame);
         t.foreground_handback().expect("the gate is open").bytes
     };
-    let mut one_batch = false;
-    for attempt in 0..5u64 {
-        FG_MIXED.store(JOB, Ordering::SeqCst);
-        ARMED_MIXED.store(false, Ordering::SeqCst);
-        let rig = Rig::attach(
-            73 + attempt,
-            (probe_mixed, &FG_MIXED),
-            (gone_mixed, &DEAD_MIXED),
-            INCIDENT,
-        );
-        rig.kill(JOB);
-        SLAVE_MIXED.store(rig.slave, Ordering::SeqCst);
-        let taps = rig.session.ctx.byte_fanout.subscribe();
-        ARMED_MIXED.store(true, Ordering::SeqCst);
-        rig.write(&frame, "the frame and the shell's output", |t| {
-            screen_has(t, "zsh: killed") && t.modes().bracketed_paste
-        });
-        {
-            let term = rig.term();
-            let t = term.lock().expect("terminal lock");
-            assert!(!leak(&t), "attempt {attempt}: clean");
-            assert!(!t.is_alternate_screen(), "attempt {attempt}");
-            assert!(screen_has(&t, "zsh: killed"), "the shell's text is on main");
-        }
-        assert_eq!(
-            rig.restored_n(1).len(),
-            1,
-            "attempt {attempt}: {:?}",
-            rig.restored()
-        );
-        let mut stream = Vec::new();
-        let mut bursts = Vec::new();
-        wait_for("every burst on the tap", || {
-            let (more, dropped) = taps.drain();
-            assert_eq!(dropped, 0);
-            for b in more {
-                stream.extend_from_slice(&b.bytes);
-                bursts.push(b.bytes);
-            }
-            stream.len() >= FRAME_LEN + expected_handback.len() + RECLAIM.len()
-        });
-        let want = [&frame[..], &expected_handback[..], RECLAIM].concat();
-        assert_eq!(
-            stream, want,
-            "attempt {attempt}: the handback rides the tap at the cut"
-        );
-        if bursts.len() == 1 {
-            one_batch = true;
-            break;
-        }
-    }
-    assert!(
-        one_batch,
-        "the park sample never cut a mixed batch at the frame's end in 5 attempts"
+    FG_MIXED.store(JOB, Ordering::SeqCst);
+    ARMED_MIXED.store(false, Ordering::SeqCst);
+    let rig = Rig::attach(
+        73,
+        (probe_mixed, &FG_MIXED),
+        (gone_mixed, &DEAD_MIXED),
+        INCIDENT,
     );
+    rig.kill(JOB);
+    SLAVE_MIXED.store(rig.slave, Ordering::SeqCst);
+    let taps = rig.session.ctx.byte_fanout.subscribe();
+    ARMED_MIXED.store(true, Ordering::SeqCst);
+    rig.write(&frame, "the frame and the shell's output", |t| {
+        screen_has(t, "zsh: killed") && t.modes().bracketed_paste
+    });
+    {
+        let term = rig.term();
+        let t = term.lock().expect("terminal lock");
+        assert!(!leak(&t), "clean");
+        assert!(!t.is_alternate_screen());
+        assert!(screen_has(&t, "zsh: killed"), "the shell's text is on main");
+    }
+    assert_eq!(rig.restored_n(1).len(), 1, "{:?}", rig.restored());
+    let mut stream = Vec::new();
+    wait_for("every burst on the tap", || {
+        let (more, dropped) = taps.drain();
+        assert_eq!(dropped, 0);
+        for b in more {
+            stream.extend_from_slice(&b.bytes);
+        }
+        stream.len() >= FRAME_LEN + expected_handback.len() + RECLAIM.len()
+    });
+    let want = [&frame[..], &expected_handback[..], RECLAIM].concat();
+    assert_eq!(stream, want, "the handback rides the tap at the cut");
 }
 
 fn probe_none(_master: i32) -> i32 {

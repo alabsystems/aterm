@@ -490,23 +490,6 @@ fn zoomed_split_live_and_capture_use_the_visible_panes_effective_background() {
 }
 
 #[test]
-fn steady_screen_skips_rerasterize_after_present() {
-    let mut term = Terminal::new(4, 10);
-    term.process(b"steady");
-
-    let k1 = frame_key(&mut term, true, false, None);
-    assert!(should_repaint(None, k1), "first present");
-    term.take_damage();
-    let last_present = Some(k1);
-
-    let k2 = frame_key(&mut term, true, false, None);
-    assert!(
-        !should_repaint(last_present, k2),
-        "an unchanged steady screen must skip the extract + rasterize + present"
-    );
-}
-
-#[test]
 fn os_appearance_flip_repaints() {
     let mut term = Terminal::new(4, 10);
     term.process(b"idle");

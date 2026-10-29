@@ -234,7 +234,10 @@ pub fn main(args: &[String]) -> i32 {
     }
 }
 
-fn attempt<R>(f: impl FnOnce() -> R) -> Result<R, String> {
+/// `f`'s result, or its panic's message: for a fan-out whose every item must run and report
+/// whatever another item does ([`each`] re-raises the first panic, and a worker that meets one
+/// runs no further items).
+pub fn attempt<R>(f: impl FnOnce() -> R) -> Result<R, String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
         payload
             .downcast_ref::<&str>()
@@ -246,10 +249,19 @@ fn attempt<R>(f: impl FnOnce() -> R) -> Result<R, String> {
 
 /// `work` over every item on every core, results in item order.
 pub fn each<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    each_on(cores, items, work)
+}
+
+/// [`each`] on at most `workers` threads: for items whose work is mostly file system calls,
+/// which the kernel serves no faster past a few callers at once.
+pub fn each_on<T: Sync, R: Send>(
+    workers: usize,
+    items: &[T],
+    work: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
     let next = AtomicUsize::new(0);
-    let workers = std::thread::available_parallelism()
-        .map_or(4, std::num::NonZeroUsize::get)
-        .min(items.len().max(1));
+    let workers = workers.clamp(1, items.len().max(1));
     let mut done: Vec<(usize, R)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {

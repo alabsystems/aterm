@@ -951,13 +951,15 @@ mod tests {
             );
         }
         for re in ["+5", "@", "", "@-1"] {
-            assert_eq!(
-                parse(
-                    "post",
-                    &words(&format!("--cap-file c to=@s-a@n-b re={re} hi"))
-                ),
-                Err(format!("re={re} is not a bus offset")),
-                "re={re}"
+            let refused = parse(
+                "post",
+                &words(&format!("--cap-file c to=@s-a@n-b re={re} hi")),
+            );
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|e| e.contains(&format!("re={re}"))),
+                "re={re}: refused, naming the key and the value: {refused:?}"
             );
         }
         for bad in [

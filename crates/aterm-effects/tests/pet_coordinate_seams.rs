@@ -11,9 +11,7 @@ use aterm_effects::companion::{
     CompanionFrame, CompanionOwner, ContrastFallback, GlowOwnership, PetFacts, PetGlass,
 };
 use aterm_effects::cursor_glow::GlowStyle;
-use aterm_effects::host::{
-    CaptureMode, FrameGeom, HostFrameInput, SingFacts, TerminalFacts, Visibility,
-};
+use aterm_effects::host::{FrameGeom, HostFrameInput, TerminalFacts};
 use aterm_effects::kitty_pet::{PetAction, PetFrame};
 use aterm_effects::pet_glyphs_gen::PetGlyphId;
 use aterm_effects::pet_world::{PetPane, PetWorldFacts};
@@ -169,23 +167,16 @@ impl Host {
             .owner
             .observe_console(&input, &world, PetPane::full(&input), &[]);
         let facts = TerminalFacts::read(&self.term, self.session, false);
-        let host = HostFrameInput {
-            now: self.now,
-            visibility: Visibility::Focused,
-            reduced_motion: false,
-            serious: false,
-            shed_envelope: 1.0,
-            shed_active: false,
-            pointer_px: None,
-            capture: CaptureMode::Present,
-            geometry: FrameGeom {
+        let host = HostFrameInput::new(
+            self.now,
+            FrameGeom {
                 rows,
                 cols,
                 cell_w: self.cell.0,
                 cell_h: self.cell.1,
                 origin_px: self.origin,
             },
-        };
+        );
         if self.offer {
             let focused = PetGlass {
                 session: self.session,
@@ -205,20 +196,16 @@ impl Host {
                 .offer_glass(std::iter::once(focused).chain(other).chain(third));
         }
         let tick = self.owner.prepare(
-            PetFacts {
-                facts: &facts,
-                host: &host,
-                glow: GlowOwnership {
+            PetFacts::new(
+                &facts,
+                &host,
+                GlowOwnership {
                     enabled: true,
                     style: GlowStyle::RainbowKitty,
                     style_raw_names_pet: true,
                 },
-                sing: SingFacts::default(),
-                focused: true,
-                obscured: false,
-                pane: self.pane.map(|origin| (self.session, origin)),
-                room: None,
-            },
+            )
+            .with_pane(self.pane.map(|origin| (self.session, origin))),
             &mut self.decos,
         );
         let frame = self.owner.tick(tick);

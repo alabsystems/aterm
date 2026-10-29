@@ -40,7 +40,7 @@ fn session_move_refuses_policy_already_stale_before_preparation() {
                 window: "five_hour".into(),
                 at: Some(NOW - MIN),
             };
-            let result = super::super::session_move_using(&world.seat(), &s, |_| {
+            let result = super::session_move_using(&world.seat(), &s, |_| {
                 prepared.set(true);
                 Some("prepared stale-policy command".into())
             });
@@ -115,7 +115,7 @@ fn prepared_session_move_refuses_a_target_renewed_in_the_same_directory() {
             Mode::Early,
             Path::new("/opt/provider"),
         );
-        let result = super::super::session_move_using(&world.seat(), &s, |row| {
+        let result = super::session_move_using(&world.seat(), &s, |row| {
             let env = login_env(cli, row, &world.home).unwrap();
             let line = relaunch::pool_line(&s.relaunch, cli, &env).unwrap();
             // Same directory and timestamp: only the retained generation changes.
@@ -223,14 +223,14 @@ fn run_case(cli: Cli, follows: bool, case: i64) -> (bool, i64) {
         .unwrap();
     }
     if cli != Cli::Codex {
-        let result = super::super::session_move_using(&world.seat(), &s, |_| {
+        let result = super::session_move_using(&world.seat(), &s, |_| {
             panic!("unmeasured running-session moves must not prepare a relaunch")
         });
         assert_eq!(result, Moved::stay(StayWhy::Unmeasured));
         assert!(world.load(cli).rotations.is_empty());
         return (false, 0);
     }
-    let result = super::super::session_move_using(&world.seat(), &s, |row| {
+    let result = super::session_move_using(&world.seat(), &s, |row| {
         let env = login_env(cli, row, &world.home).unwrap();
         let line = relaunch::pool_line(&s.relaunch, cli, &env).unwrap();
         match case {

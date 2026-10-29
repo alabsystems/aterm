@@ -36,13 +36,15 @@ mod graph_hygiene;
 pub use drift::{CastDriftFn, CastDriftJob, DriftCut, DriftPeer, LocalVerbs};
 mod redial;
 pub use redial::{EXIT_REPLACED, target_sid};
+mod any_host;
 mod remote;
-pub use remote::{DriveLink, DriveRefused, DriveStream, FleetDriveFn, Left, lifts_there};
+pub use remote::{DriveLink, DriveRefused, DriveStream, FleetDriveFn, Left, RmLifts, lifts_there};
 mod survey;
 pub use survey::{
     DEFAULT_BUDGET, EXCERPT_CHARS, EXCERPT_WIDE_CHARS, EXCERPTS_CUT, FLEET_WITHIN, FleetAsk,
-    FleetRead, FleetSurveyFn, LEFT_OUT_LEAD, NO_ROUTE_NOTE, PeerFault, PeerSurvey,
-    UNANSWERED_REASON_CHARS, UNANSWERED_ROOM, agent_word_shown, survey_rank, survey_urgent,
+    FleetRead, FleetRefused, FleetSurveyFn, LEFT_OUT_LEAD, NO_ROUTE_NOTE, PeerFault, PeerSurvey,
+    UNANSWERED_REASON_CHARS, UNANSWERED_ROOM, agent_word_shown, masked_label, survey_rank,
+    survey_urgent,
 };
 
 const SYNOPSIS: &str =
@@ -58,13 +60,23 @@ OPTIONS:
     --sock PATH   connect to the control socket at PATH.
     --pid PID     connect to instance PID's socket, <dir>/aterm-<PID>.sock.
     --host H      drive another Mac's aterm over the fleet (its host, node id
-                  or address, as `aterm fleet peers` names it), when its person
-                  lets this Mac (`aterm fleet allow drive --from <this Mac>`
-                  there): a worker's verbs alone, each session by its sid —
+                  or address, as `aterm fleet peers` names it, its host's
+                  first label, or its short name: the lead word of its host,
+                  m102 of m102-macbook-…, else a word m<N> in it, m27 of
+                  MacbookAir-m27-…; a name two Macs answer to is refused,
+                  naming both), when its person
+                  lets this Mac (`aterm fleet allow drive --from <this Mac>`,
+                  or `--all` for every member, there): a worker's verbs
+                  alone, each session by its sid —
                   spawn agent=claude [cwd=<absolute>] - < task, await task
                   @<w> since=0 (the first wait; later ones @<w>:<rev>),
                   @<w> result|status|text|screen|turn|key|send|close,
                   hold <w> on|off (its sid bare, no @). `aterm help workers`.
+                  `--host any spawn agent=<claude|codex> - < task` picks the
+                  member: of those that let this Mac drive them and have an
+                  enrolled, unwalled account of that program, the least used
+                  week, then five hours, then the fewest busy sessions, named
+                  on stderr (`--host any: chose <host> (<addr>): …`).
                   `--host H survey` is `survey --host H`, a fleet read that
                   needs no drive grant (and names no --fleet or --host of
                   its own).
@@ -80,7 +92,9 @@ OPTIONS:
                   by it whatever its timeout=, with the rows its last leg
                   read, whose wait ends up to a second before it (exit 124;
                   75 where the peer served none of its last legs, the one
-                  this cuts in flight among them, EXIT CODES).
+                  this cuts in flight among them; 1, its rows first, where
+                  no grant on the peer admits this Mac since its baseline:
+                  EXIT CODES).
                   A fleet survey (`survey --fleet`, `--host`) takes
                   it the same way: each peer's read (3 s, or survey's own
                   --timeout) is cut to a shorter one. On `subscribe`, an
@@ -102,23 +116,31 @@ EXIT CODES:
          `windows`: the socket directory was read and holds no instance — the
          only case that prints `no live aterm instances found`. For a fleet
          survey (`survey --fleet`, `--host`): no machine it read answered
-         (each row names why), and not each one as row 2 says.
+         (each row names why), and not each one as row 2 says. With --host,
+         an `await task` whose peer served its baseline and then admits
+         this Mac's drive under no grant (its fleet level below drive, or
+         its `ERR denied grant=none:`: its person took back this Mac's
+         grant, or its books bind this Mac's node no more): its rows print
+         first, and stderr says so, whatever its timeout. Any other denial
+         ends it in its own words; a worker the peer hosts no more is a
+         closed row, as on one Mac.
     2    could not reach: the instance accepted the connection but did not
          serve it within 10 s (or a shorter --timeout; --timeout 0 waits
          without bound), so the request was not sent. With --host, an aterm
          took the connection and sent no fleet handshake in time: a drive's
          peer within 28 s (each `await task` leg's: its wait and 8 s) or a
          shorter --timeout; this machine's issuer, read for which Mac a word
-         no book here holds names; or the peer a `survey --host` read,
-         within its deadline. That aterm is stopped, frozen or overloaded,
-         and the request was not sent. Any other cause exits 1, even where
-         its refusal also says to try again: nothing listening there or no
-         route, a connection refused or hung up, another fleet's secret,
-         a denial. An `await task` past its baseline asks a peer that does
-         not answer again instead (75). For `ls`/`instances`/`windows`: no
-         socket found answered, or the directory is missing, unreadable or
-         unresolvable (every variable it is read from unset); stderr names
-         each socket's cause and a hint.
+         no book here holds names, where its silence refuses the word (a
+         drive's and a `survey --host`'s alike); or the peer a `survey
+         --host` read, within its deadline. That aterm is stopped, frozen or
+         overloaded, and the request was not sent. Any other cause exits 1,
+         even where its refusal also says to try again: nothing listening
+         there or no route, a connection refused or hung up, another fleet's
+         secret, a denial. An `await task` past its baseline asks a peer
+         that does not answer again instead (75). For `ls`/`instances`/
+         `windows`: no socket found answered, or the directory is missing,
+         unreadable or unresolvable (every variable it is read from unset);
+         stderr names each socket's cause and a hint.
     124  timeout: the client's deadline fired, or the server reported one (a
          `turn` with status=timeout, or `OK timeout` from await/ready/wait);
          for `ls`/`instances`/`windows`, every socket found timed out.
@@ -1039,12 +1061,24 @@ fn targets_own_session_implicitly(parts: &[String], sock: Option<&str>, pid: Opt
     {
         return false;
     }
-    let sel_idx = usize::from(first == "subscribe");
-    let selector = parts.get(sel_idx).filter(|t| t.starts_with('@'));
+    let allow_rev = await_task::is_await_task(parts);
+    let selector = selector_index(parts).map(|idx| parts[idx].as_str());
     let unpinned = sock.is_none() && pid.is_none();
     match selector {
-        Some(sel) if sel.split(',').any(|e| e == "@self" || e == "@env") => true,
-        Some(sel) if sel.split(',').all(|e| e == "@.") => unpinned,
+        Some(sel)
+            if sel
+                .split(',')
+                .any(|e| matches!(selector_element_parts(e, allow_rev).0, "@self" | "@env")) =>
+        {
+            true
+        }
+        Some(sel)
+            if sel
+                .split(',')
+                .all(|e| selector_element_parts(e, allow_rev).0 == "@.") =>
+        {
+            unpinned
+        }
         Some(_) => false,
         None => unpinned,
     }
@@ -1376,7 +1410,16 @@ fn resolve_target(
     pid: Option<u32>,
     self_sid: Option<String>,
 ) -> io::Result<(String, TargetOrigin)> {
-    Ok(targets(sock, pid, self_sid, None)?.probed())
+    resolve_target_in(socket_dir(), sock, pid, self_sid)
+}
+
+fn resolve_target_in(
+    dir: Option<PathBuf>,
+    sock: Option<String>,
+    pid: Option<u32>,
+    self_sid: Option<String>,
+) -> io::Result<(String, TargetOrigin)> {
+    Ok(targets_in(dir, sock, pid, self_sid, None)?.probed())
 }
 
 fn targets(
@@ -2239,23 +2282,9 @@ impl ForeignFacts {
             said.push("running a deleted binary".to_string());
         }
         if let Some(up) = up {
-            said.push(format!("up {}", fmt_uptime(up)));
+            said.push(format!("up {}", census::age_words(up.as_secs())));
         }
         (!said.is_empty()).then(|| said.join("; "))
-    }
-}
-
-fn fmt_uptime(up: std::time::Duration) -> String {
-    let s = up.as_secs();
-    let (d, h, m) = (s / 86_400, (s % 86_400) / 3_600, (s % 3_600) / 60);
-    if d > 0 {
-        format!("{d}d{h}h")
-    } else if h > 0 {
-        format!("{h}h{m}m")
-    } else if m > 0 {
-        format!("{m}m")
-    } else {
-        format!("{s}s")
     }
 }
 
@@ -3549,7 +3578,7 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
             host = Some(args.next().ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "--host requires a HOST (a fleet peer's name, node id or address)",
+                    "--host requires a HOST (a fleet peer's name, short name, node id or address)",
                 )
             })?);
         } else if let Some(h) = arg.strip_prefix("--host=") {
@@ -3827,19 +3856,46 @@ fn binary_frame_prefix(selector: Option<&str>, verb: &str) -> String {
     s
 }
 
-fn selector_index(parts: &[String]) -> usize {
-    usize::from(parts.first().map(String::as_str) == Some("subscribe"))
+fn selector_index(parts: &[String]) -> Option<usize> {
+    if parts.first().is_some_and(|p| p.starts_with('@')) {
+        return Some(0);
+    }
+    if parts.first().map(String::as_str) == Some("subscribe") {
+        return parts
+            .get(1)
+            .is_some_and(|p| p.starts_with('@'))
+            .then_some(1);
+    }
+    if parts.first().map(String::as_str) == Some("await")
+        && parts.get(1).map(String::as_str) == Some("task")
+    {
+        let mut idx = 2;
+        while let Some(word) = parts.get(idx) {
+            if word.starts_with('@') {
+                return Some(idx);
+            }
+            idx += if word == "timeout" { 2 } else { 1 };
+        }
+    }
+    None
+}
+
+fn selector_element_parts(element: &str, allow_rev: bool) -> (&str, Option<&str>) {
+    if allow_rev && let Some((head, tail)) = element.split_once(':') {
+        (head, Some(tail))
+    } else {
+        (element, None)
+    }
 }
 
 fn refuse_empty_selectors(parts: &[String]) -> io::Result<()> {
-    let Some(tok) = parts
-        .get(selector_index(parts))
-        .filter(|t| t.starts_with('@'))
-    else {
+    let Some(sel_idx) = selector_index(parts) else {
         return Ok(());
     };
-    let names_nothing = tok.split(',').any(|element| {
-        element
+    let allow_rev = await_task::is_await_task(parts);
+    let names_nothing = parts[sel_idx].split(',').any(|element| {
+        selector_element_parts(element, allow_rev)
+            .0
             .strip_prefix('@')
             .is_some_and(|body| !aterm_types::control_verbs::selector_body_names_something(body))
     });
@@ -3853,11 +3909,14 @@ fn refuse_empty_selectors(parts: &[String]) -> io::Result<()> {
 }
 
 fn expand_self_selector(parts: &mut [String], self_sid: Option<String>) -> io::Result<()> {
-    let sel_idx = selector_index(parts);
-    let Some(tok) = parts.get(sel_idx) else {
+    let Some(sel_idx) = selector_index(parts) else {
         return Ok(());
     };
-    let has_self = tok.split(',').any(|e| e == "@self" || e == "@env");
+    let allow_rev = await_task::is_await_task(parts);
+    let tok = &parts[sel_idx];
+    let has_self = tok
+        .split(',')
+        .any(|e| matches!(selector_element_parts(e, allow_rev).0, "@self" | "@env"));
     if !has_self {
         return Ok(());
     }
@@ -3866,12 +3925,10 @@ fn expand_self_selector(parts: &mut [String], self_sid: Option<String>) -> io::R
         .ok_or_else(self_selector_error)?;
     let expanded = tok
         .split(',')
-        .map(|e| {
-            if e == "@self" || e == "@env" {
-                format!("@{sid}")
-            } else {
-                e.to_string()
-            }
+        .map(|e| match selector_element_parts(e, allow_rev) {
+            ("@self" | "@env", Some(tail)) => format!("@{sid}:{tail}"),
+            ("@self" | "@env", None) => format!("@{sid}"),
+            _ => e.to_string(),
         })
         .collect::<Vec<_>>()
         .join(",");
@@ -3894,6 +3951,30 @@ fn parse_timeout(v: &str) -> io::Result<Option<std::time::Duration>> {
         )
     })?;
     Ok((secs != 0).then(|| std::time::Duration::from_secs(secs)))
+}
+
+pub(crate) fn instant_after(
+    start: std::time::Instant,
+    wait: std::time::Duration,
+) -> std::time::Instant {
+    if let Some(at) = start.checked_add(wait) {
+        return at;
+    }
+    let (mut lo, mut hi) = (0_u64, wait.as_secs());
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if start
+            .checked_add(std::time::Duration::from_secs(mid))
+            .is_some()
+        {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    start
+        .checked_add(std::time::Duration::from_secs(lo))
+        .unwrap_or(start)
 }
 
 const MAX_FEED_BIN: usize = 256 * 1024;
@@ -5249,7 +5330,7 @@ fn exchange_on(
             Err(e) => redial::is_hangup(e),
         };
     if hung_up && redial::reports_replacement(&request_parts) {
-        let until = deadline.map(|d| started + d);
+        let until = deadline.map(|d| instant_after(started, d));
         let again = |next: &str| {
             let left = deadline.map(|d| {
                 d.saturating_sub(started.elapsed())

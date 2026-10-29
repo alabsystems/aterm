@@ -27,10 +27,9 @@ pub fn pinned_set(layout: &Layout) -> BTreeSet<String> {
     };
     let mut out = BTreeSet::new();
     for line in body.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        if out.len() >= MAX_PINNED_PROGRAMS {
+        if out.insert(line.to_string()) && out.len() > MAX_PINNED_PROGRAMS {
             return BTreeSet::new();
         }
-        out.insert(line.to_string());
     }
     out
 }
@@ -43,18 +42,22 @@ pub fn is_pinned(layout: &Layout, program: &str) -> bool {
 
 /// Sets or clears the local pin for `program`, returning `Ok(changed)`.
 pub fn set_pinned(layout: &Layout, program: &str, pinned: bool) -> io::Result<bool> {
+    static PIN_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     if program.is_empty()
         || program == "."
         || program == ".."
+        || program.trim() != program
         || program.contains('/')
         || program.contains('\\')
         || program.contains('\n')
+        || program.contains('\r')
         || program.contains('\0')
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "program name must be a single safe path component (no separators, `.`, `..`, \
-             newline, or NUL)",
+             outer whitespace, CR/LF, or NUL)",
         ));
     }
     let mut set = pinned_set(layout);
@@ -63,15 +66,30 @@ pub fn set_pinned(layout: &Layout, program: &str, pinned: bool) -> io::Result<bo
     } else {
         set.remove(program)
     };
+    if set.len() > MAX_PINNED_PROGRAMS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("cannot pin more than {MAX_PINNED_PROGRAMS} programs"),
+        ));
+    }
+    let body: String = set.iter().map(|p| format!("{p}\n")).collect();
+    if body.len() > MAX_PIN_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("pin file exceeds {MAX_PIN_FILE_BYTES}-byte limit"),
+        ));
+    }
     layout.ensure_dir(&layout.prefix)?;
     let dest = pins_path(layout);
+    let seq = PIN_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = layout
         .prefix
-        .join(format!(".pins.tmp-{}", std::process::id()));
-    let body: String = set.iter().map(|p| format!("{p}\n")).collect();
+        .join(format!(".pins.tmp-{}-{seq}", std::process::id()));
     fs::write(&tmp, body.as_bytes())?;
-    crate::platform::harden_file(&tmp)?;
-    fs::rename(&tmp, &dest)?;
+    if let Err(err) = crate::platform::harden_file(&tmp).and_then(|()| fs::rename(&tmp, &dest)) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
     Ok(changed)
 }
 
@@ -108,7 +126,9 @@ mod tests {
     #[test]
     fn rejects_unsafe_program_names() {
         let l = layout("unsafe");
-        for bad in ["", ".", "..", "a/b", "a\\b", "x\ny", "x\0y"] {
+        for bad in [
+            "", ".", "..", "a/b", "a\\b", "x\ny", "x\ry", "x\0y", " ay", "ay ", "\tay", "   ",
+        ] {
             let err = set_pinned(&l, bad, true).unwrap_err();
             assert_eq!(
                 err.kind(),
@@ -139,6 +159,24 @@ mod tests {
         let file = fs::File::create(&path).unwrap();
         file.set_len((MAX_PIN_FILE_BYTES + 1) as u64).unwrap();
         assert!(pinned_set(&l).is_empty());
+
+        let exact_with_dup: String = (0..MAX_PINNED_PROGRAMS)
+            .map(|index| format!("p{index}\n"))
+            .chain(std::iter::once("p0\n".to_string()))
+            .collect();
+        fs::write(&path, exact_with_dup).unwrap();
+        assert_eq!(
+            pinned_set(&l).len(),
+            MAX_PINNED_PROGRAMS,
+            "duplicate lines do not push a 2048-member set over the cap"
+        );
+        let err = set_pinned(&l, "p2048", true).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            pinned_set(&l).len(),
+            MAX_PINNED_PROGRAMS,
+            "refusing the 2049th pin preserves all 2048 existing pins"
+        );
 
         let body: String = (0..=MAX_PINNED_PROGRAMS)
             .map(|index| format!("p{index}\n"))

@@ -44,7 +44,7 @@ impl Iterator for DamagedRowIterator<'_> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
             DamagedRowIterator::Full { current, max } => {
-                let remaining = (*max - *current) as usize;
+                let remaining = usize::from(max.saturating_sub(*current));
                 (remaining, Some(remaining))
             }
             DamagedRowIterator::Partial(iter) => iter.size_hint(),

@@ -1,17 +1,16 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-windows-sys-052: spec recovery from its 1 unit tests
+# aterm-windows-sys-052: spec recovery (1 compile-time-discharged spec, 0 unit tests)
 
-> Status 2026-10-16: this file is the crate's migration worklist. The one spec
-> below gets discharged at compile time (or through Trust/Clean once gap 0 is
-> closed). After that, the test it subsumes is deleted and the crate has zero `#[test]` fns.
+> Status 2026-10-28: `WSYS052-PF-VALUE` is discharged at compile time in `tests/recorded.rs`,
+> and its former `#[test]` fn is deleted, so the crate has zero runtime `#[test]` fns.
 
-Source: `crates/aterm-windows-sys-052` (read only). I read its one `#[test]`
-(`tests/recorded.rs` 1), the declarations in `src/lib.rs`, and the oracle's
-`tests/oracle/conformance/src/lib.rs`. Nothing was compiled or run.
+Source: `crates/aterm-windows-sys-052` (read only). `tests/recorded.rs` checks all four
+recorded declarations at compile time (`0` `#[test]` fns), against `src/lib.rs` and
+`tests/oracle/conformance/src/lib.rs`.
 
-Result: **1 spec**, covering **1 test**. **0 tests are not spec samples** (§4).
+Result: **1 spec** (discharged at compile time), **0 runtime `#[test]` fns**. **0 tests are not spec samples** (§4).
 
 ## 0. Notation used in the statements
 
@@ -20,10 +19,10 @@ Result: **1 spec**, covering **1 test**. **0 tests are not spec samples** (§4).
 - `RECORDED` := the answers windows-sys 0.52.0 gave the oracle (`tests/oracle/PROVENANCE.md`;
   `targo --unverified run -p aterm-win32-oracle -- oracle-052` runs it; x86_64- and
   aarch64-pc-windows-msvc, recorded 2026-10-15).
-- `tests/recorded.rs` holds the other three recorded declarations as `const _` items, so the
-  compiler checks them on every build: `BOOL = i32`, `PROCESSOR_FEATURE_ID = u32`, and
-  `IsProcessorFeaturePresent : unsafe extern "system" fn(u32) -> i32`. They are not tests and need no spec.
-  Only the constant's value is held by a `#[test]`.
+- `tests/recorded.rs` checks all four recorded declarations as `const _` items on every build:
+  `BOOL = i32`, `PROCESSOR_FEATURE_ID = u32`,
+  `IsProcessorFeaturePresent : unsafe extern "system" fn(u32) -> i32`, and
+  `assert!(PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE == 30)`. No runtime `#[test]` fn remains.
 
 ## 1. Specs (TSV)
 
@@ -32,23 +31,24 @@ Columns: `id`, `kind`, `functions`, `statement`, `subsumes`,
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking gaps
-WSYS052-PF-VALUE	table-property	windows_sys::Win32::System::Threading::PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE	PF : u32 ∧ PF == 30, the winnt.h value that windows-sys 0.52.0 RECORDED on x86_64- and aarch64-pc-windows-msvc. The statement has one row and no free variables, so it holds on every host and target where the crate compiles. Nothing is quantified. Cheapest sound discharge: `const _: () = assert!(PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE == 30);` in tests/recorded.rs, next to the three existing `const _` checks. rustc CTFE proves it on every build of the test target, and planting any other value breaks the build (the negative control). A Clean island form (`def pf_arm_v8_crypto : UInt32 := 30`, with the Rust const bound to it) would only restate the same constant.	tests/recorded.rs::the_constant_holds_its_recorded_value	TRIVIAL: one scalar u32 const. No loops, no heap, no &mut, no unsafe. The spec does not reach the surrounding extern "system" fn declaration.	0
+WSYS052-PF-VALUE	table-property	windows_sys::Win32::System::Threading::PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE	PF : u32 ∧ PF == 30, the winnt.h value that windows-sys 0.52.0 RECORDED on x86_64- and aarch64-pc-windows-msvc. The statement has one row and no free variables, so it holds on every host and target where the crate compiles. Nothing is quantified. Cheapest sound discharge: `const _: () = assert!(PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE == 30);` in tests/recorded.rs, next to the three existing `const _` checks. rustc CTFE proves it on every build of the test target, and planting any other value breaks the build (the negative control). A Clean island form (`def pf_arm_v8_crypto : UInt32 := 30`, with the Rust const bound to it) would only restate the same constant.	(none: discharged at compile time in tests/recorded.rs)	TRIVIAL: one scalar u32 const. No loops, no heap, no &mut, no unsafe. The spec does not reach the surrounding extern "system" fn declaration.	0
 ```
 
 ## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
+`the_constant_holds_its_recorded_value` was replaced by the compile-time `const _` assertion in
+`tests/recorded.rs`, leaving `0` runtime `#[test]` fns.
 
 ```tsv
 file	test	primary	also
-tests/recorded.rs	the_constant_holds_its_recorded_value	WSYS052-PF-VALUE	
 ```
 
 ## 3. Coverage
 
-- 1 original test read. 1 maps to the 1 spec. 0 are not spec samples.
-- After the conversion the crate has no `#[test]` fns. All four recorded declarations are then
-  checked by the compiler on every build of `tests/recorded.rs`. Planted mismatches against the registry crate
+- 0 runtime `#[test]` fns remain (1 original test converted to CTFE; 0 non-spec samples).
+- All four recorded declarations, including `WSYS052-PF-VALUE`, are checked by the compiler on
+  every build of `tests/recorded.rs`. Planted mismatches against the registry crate
   stay with the oracle (`tests/oracle/`).
 
 ## 4. Tests that are not spec samples
@@ -61,20 +61,13 @@ None. The one test samples a real (if degenerate) property.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **`tests/recorded.rs::the_constant_holds_its_recorded_value`: the spec is right but its form is
-   wrong.** The value 30 matches winnt.h and `src/lib.rs`. But the file header says it holds "the four
-   declarations" so that a change "fails wherever the workspace tests run". Three of the four are
-   compile-time `const _` items. The fourth is a value fixed at compile time, yet it is held by a
-   runtime `#[test]`, which passes only when tests are run, not on every build. Replacing it with
-   `const _: () = assert!(PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE == 30);` gives a strictly stronger check
-   that needs no test harness. This is how `tests/oracle/conformance/src/lib.rs` already checks the same
-   value, with a `plant-const` arm (31) as its negative control. Once converted, delete the `#[test]`.
+1. **(Fixed 2026-10-28.) `tests/recorded.rs` now checks all four declarations at compile time.**
+   `the_constant_holds_its_recorded_value` was replaced with
+   `const _: () = assert!(PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE == 30);`, discharging
+   `WSYS052-PF-VALUE` on every build of `tests/recorded.rs` without needing a runtime test.
 
 ## 6. Proof order (easiest, high value first)
 
-1. **`WSYS052-PF-VALUE`**. It is blocked only by gap 0, and only on the Clean route. The compile-time
-   `const _: () = assert!(..)` discharge needs no gap closed, so it can land now: add the const
-   assertion to `tests/recorded.rs`, delete `the_constant_holds_its_recorded_value`, and change the
-   header comment to say all four declarations are compile-time checks. A Clean island binding
-   adds nothing over CTFE for a closed scalar constant. Do it only if the migration needs every spec
-   to carry a Trust-published row, and then only after the gap 0 seal update.
+1. **`WSYS052-PF-VALUE`** *(discharged at compile time in `tests/recorded.rs`)*. A Clean island
+   binding adds nothing over CTFE for a closed scalar constant; add one only if a future policy
+   requires every spec row to carry a Trust-published entry after the gap 0 seal update.

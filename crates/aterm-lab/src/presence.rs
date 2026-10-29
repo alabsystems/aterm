@@ -185,6 +185,37 @@ fn cut(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// A reply that gave no reading, as a row's evidence: what was asked, its exit
+/// status and its words, trimmed to one line.
+fn failed(asked: &str, r: &Reply) -> String {
+    let said = |s: &str| {
+        let words: Vec<&str> = s
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        cut(&words.join(" | "), 160)
+    };
+    format!(
+        "no reading from `{asked}`: exit {} stdout='{}' stderr='{}'",
+        r.code,
+        said(&r.stdout),
+        said(&r.stderr)
+    )
+}
+
+/// A `resizes` reply's rows.
+///
+/// # Errors
+/// The reply failed or carried no `OK` header: its words ([`failed`]), never an
+/// empty ledger.
+fn ledger_rows(asked: &str, r: &Reply) -> Result<Vec<Resize>, String> {
+    if r.code != 0 || r.header().is_empty() {
+        return Err(failed(asked, r));
+    }
+    Ok(r.stdout.lines().filter_map(parse_resize).collect())
+}
+
 /// One held control connection: a schedule's requests go out milliseconds
 /// apart, or pipelined in one write.
 struct Held {
@@ -284,12 +315,27 @@ impl Probe {
         self.ctl(&["status"]).first()
     }
 
+    /// `resizes since=<since>` (every retained row at 0): the reply and its
+    /// resize rows.
+    ///
+    /// # Errors
+    /// The reply gave no reading ([`ledger_rows`]).
+    fn resizes(&self, since: u64) -> Result<(Reply, Vec<Resize>), String> {
+        let since = format!("since={since}");
+        let r = self.ctl(&["resizes", &since]);
+        let rows = ledger_rows(&format!("resizes {since}"), &r)?;
+        Ok((r, rows))
+    }
+
     /// `resizes since=<last>`: its header and how many resize rows are new;
     /// `last` moves past them.
-    fn read_resizes(&mut self, show: bool) -> (String, usize) {
-        let since = format!("since={}", self.last);
-        let r = self.ctl(&["resizes", &since]);
-        let rows: Vec<Resize> = r.stdout.lines().filter_map(parse_resize).collect();
+    ///
+    /// # Errors
+    /// The reply gave no reading ([`ledger_rows`]). `last` stays where it was,
+    /// so the next read that succeeds counts the rows this one missed too: a
+    /// failed read before a count can only add rows to it.
+    fn read_resizes(&mut self, show: bool) -> Result<(String, usize), String> {
+        let (r, rows) = self.resizes(self.last)?;
         if let Some(m) = rows.iter().map(|x| x.id).max() {
             self.last = self.last.max(m);
         }
@@ -302,7 +348,7 @@ impl Probe {
                 println!("      {}", cut(l, 200));
             }
         }
-        (r.header(), rows.len())
+        Ok((r.header(), rows.len()))
     }
 
     /// Back to `level=quiet`: a human keypress through the OS event queue
@@ -316,7 +362,7 @@ impl Probe {
                 verdict(&self.ctl(&["hwkey", "x"]))
             );
             sleep(1.0)?;
-            self.read_resizes(false);
+            let _ = self.read_resizes(false);
             sleep(5.0)?;
         }
         Ok(())
@@ -325,7 +371,14 @@ impl Probe {
     /// A step's own ledger rows add no flap and no risk.
     fn no_new_flap(&mut self, what: &str) {
         let st = self.status();
-        let (head, _) = self.read_resizes(false);
+        let what = format!("{what}: no flap, no render risk");
+        let head = match self.read_resizes(false) {
+            Ok((head, _)) => head,
+            Err(why) => {
+                self.row(false, &what, &why);
+                return;
+            }
+        };
         let flaps = field(&head, "flaps").unwrap_or_else(|| "-".into());
         let risks = field(&head, "risks").unwrap_or_else(|| "-".into());
         let render = field(&st, "render").unwrap_or_default();
@@ -338,20 +391,32 @@ impl Probe {
                 self.base_flaps, self.base_risks
             )
         };
-        self.row(ok, &format!("{what}: no flap, no render risk"), &evidence);
+        self.row(ok, &what, &evidence);
     }
 
-    fn gen_of_status(&self) -> String {
-        field(&self.status(), "gen").unwrap_or_default()
+    /// `status gen=`: the generation a fence names.
+    ///
+    /// # Errors
+    /// The `status` reply failed or named no generation: its words ([`failed`]).
+    fn gen_of_status(&self) -> Result<String, String> {
+        let r = self.ctl(&["status"]);
+        match field(&r.first(), "gen") {
+            Some(g) if r.code == 0 => Ok(g),
+            _ => Err(failed("status", &r)),
+        }
     }
 
     fn phase_a(&mut self) -> Result<(), Stopped> {
         println!("---- A: 5 fence-refused turns (stale generation)");
         self.quiet()?;
-        self.read_resizes(false);
+        let _ = self.read_resizes(false);
         let (mut refused, mut rows) = (0, 0);
+        // Why a trial's read failed, until a later read counts the rows it missed.
+        let mut unread = None;
         for i in 1..=5 {
-            let g0 = self.gen_of_status();
+            // Unread, the fence is a bare `if-gen=`, which the turn refuses as
+            // usage, never `reason=changed`: the trial is not counted refused.
+            let g0 = self.gen_of_status().unwrap_or_default();
             let sent = self.ctl(&["send", "."]).first();
             if let Some(seq) = field(&sent, "seq").and_then(|s| s.parse::<u64>().ok()) {
                 let next = (seq + 1).to_string();
@@ -360,7 +425,14 @@ impl Probe {
             let fence = format!("if-gen={g0}");
             let r = verdict(&self.ctl(&["turn", &fence, "yield=0.2", "hello"]));
             sleep(0.8)?;
-            rows += self.read_resizes(true).1;
+            match self.read_resizes(true) {
+                Ok((_, n)) => {
+                    rows += n;
+                    // `last` stayed behind a failed read: this one counted its rows.
+                    unread = None;
+                }
+                Err(why) => unread = Some(format!("A{i}: {why}")),
+            }
             println!("      A{i} gen0={g0} -> {}", cut(&r, 120));
             if r.contains("skipped reason=changed") {
                 refused += 1;
@@ -371,11 +443,11 @@ impl Probe {
             "A: every stale-fenced turn refused reason=changed",
             &format!("{refused} of 5"),
         );
-        self.row(
-            rows == 0,
-            "A: a refused turn re-grids nothing",
-            &format!("{rows} resize rows"),
-        );
+        let (ok, evidence) = match unread {
+            None => (rows == 0, format!("{rows} resize rows")),
+            Some(why) => (false, format!("{rows} resize rows, then {why}")),
+        };
+        self.row(ok, "A: a refused turn re-grids nothing", &evidence);
         Ok(())
     }
 
@@ -386,13 +458,15 @@ impl Probe {
         let mut typed = 0;
         for i in 1..=6 {
             self.quiet()?;
-            let g = self.gen_of_status();
+            // Unread, the fence is a bare `if-gen=`, which the turn refuses as
+            // usage: the trial is not counted typed.
+            let g = self.gen_of_status().unwrap_or_default();
             let fence = format!("if-gen={g}");
             let r =
                 verdict(&self.ctl(&["turn", &fence, "yield=0.2", "idle=1", "timeout=10000", "hi"]));
             sleep(0.8)?;
             println!("      H{i} gen={g} -> {}", cut(&r, 120));
-            self.read_resizes(true);
+            let _ = self.read_resizes(true);
             if r.contains("submitted=1") {
                 typed += 1;
             }
@@ -412,7 +486,7 @@ impl Probe {
         let r = verdict(&self.ctl(&["turn", "idle=1", "timeout=10000", "hi"]));
         sleep(0.8)?;
         println!("      B -> {}", cut(&r, 120));
-        self.read_resizes(true);
+        let _ = self.read_resizes(true);
         let ok = r.contains("submitted=1");
         let evidence = if ok {
             "submitted=1".to_string()
@@ -427,20 +501,19 @@ impl Probe {
     fn phase_d(&mut self) -> Result<(), Stopped> {
         println!("---- D: a 2 s foreign drive lease");
         self.quiet()?;
-        self.read_resizes(false);
+        let _ = self.read_resizes(false);
         let acquired = self.ctl(&["lease", "acquire", "holder=probe", "ttl=3000"]);
         println!("      acquire: {}", verdict(&acquired));
         sleep(2.0)?;
         let released = self.ctl(&["lease", "release", "holder=probe"]);
         println!("      release: {}", verdict(&released));
         sleep(0.9)?;
-        let (_, new) = self.read_resizes(true);
-        let evidence = if new == 0 {
-            "0 resize rows across acquire, 2 s, release".to_string()
-        } else {
-            format!("{new} resize rows")
+        let (ok, evidence): (bool, String) = match self.read_resizes(true) {
+            Ok((_, 0)) => (true, "0 resize rows across acquire, 2 s, release".into()),
+            Ok((_, new)) => (false, format!("{new} resize rows")),
+            Err(why) => (false, why),
         };
-        self.row(new == 0, "D: a foreign lease re-grids nothing", &evidence);
+        self.row(ok, "D: a foreign lease re-grids nothing", &evidence);
         Ok(())
     }
 
@@ -449,10 +522,20 @@ impl Probe {
             "---- T: {trials} back-to-back trials: turn one; status gen=; turn if-gen=<that> two"
         );
         let mut changed = 0;
+        // Trials that measured nothing: turn one did not type, `status` named no
+        // generation, or turn two neither typed nor was refused.
+        let mut unmeasured = Vec::new();
         for i in 1..=trials {
             self.quiet()?;
             let r1 = verdict(&self.ctl(&["turn", "idle=1", "timeout=10000", "one"]));
-            let g = self.gen_of_status();
+            let g = match self.gen_of_status() {
+                Ok(g) => g,
+                Err(why) => {
+                    println!("      T{i} one -> {} | {why}", cut(&r1, 60));
+                    unmeasured.push(format!("T{i}: {why}"));
+                    continue;
+                }
+            };
             let fence = format!("if-gen={g}");
             let r2 = verdict(&self.ctl(&[
                 "turn",
@@ -468,49 +551,67 @@ impl Probe {
                 cut(&r1, 60),
                 cut(&r2, 80)
             );
-            self.read_resizes(false);
+            let _ = self.read_resizes(false);
             if r2.contains("skipped reason=changed") {
                 changed += 1;
+            } else if !r1.contains("submitted=1") {
+                unmeasured.push(format!("T{i} one: {}", cut(&r1, 80)));
+            } else if !r2.contains("submitted=1") {
+                unmeasured.push(format!("T{i} two: {}", cut(&r2, 80)));
             }
         }
+        let evidence = if unmeasured.is_empty() {
+            format!("{changed} of {trials} refused reason=changed")
+        } else {
+            format!(
+                "{changed} of {trials} refused reason=changed; {} measured nothing: {}",
+                unmeasured.len(),
+                unmeasured.join("; ")
+            )
+        };
         self.row(
-            changed == 0,
+            changed == 0 && unmeasured.is_empty(),
             "T: no follow-up refused by the first turn's own re-grid",
-            &format!("{changed} of {trials} refused reason=changed"),
+            &evidence,
         );
         self.no_new_flap("T");
         Ok(())
     }
 
-    /// The newest resize row's id now.
-    fn newest_resize(&self) -> u64 {
-        self.ctl(&["resizes"])
-            .stdout
-            .lines()
-            .filter_map(parse_resize)
-            .map(|r| r.id)
-            .max()
-            .unwrap_or(0)
-    }
-
-    fn rows_since(&self, base: u64) -> Vec<Resize> {
-        let since = format!("since={base}");
-        self.ctl(&["resizes", &since])
-            .stdout
-            .lines()
-            .filter_map(parse_resize)
-            .collect()
+    /// The newest resize row's id now (0: the ledger holds none).
+    ///
+    /// # Errors
+    /// The reply gave no reading ([`ledger_rows`]): never base 0, which would
+    /// measure the whole ledger.
+    fn newest_resize(&self) -> Result<u64, String> {
+        let (_, rows) = self.resizes(0)?;
+        Ok(rows.iter().map(|r| r.id).max().unwrap_or(0))
     }
 
     /// What the resize rows after `base` show, each row and pair printed. A rise
-    /// nothing has taken back yet is waited for, up to [`HANG`].
-    fn measured_since(&self, base: u64) -> Result<Measured, Stopped> {
+    /// nothing has taken back yet is waited for, up to [`HANG`]. A read that
+    /// gives no reading is passed over: the last reading stands and the ledger
+    /// is polled again in the same wait. The inner `Err`: every read in it failed.
+    fn measured_since(&self, base: u64) -> Result<Result<Measured, String>, Stopped> {
+        let settled = |read: &Result<Vec<Resize>, String>| matches!(read, Ok(rows) if !matches!(measure(rows), Measured::Stuck(_)));
         let deadline = Instant::now() + HANG;
-        let mut rows = self.rows_since(base);
-        while matches!(measure(&rows), Measured::Stuck(_)) && Instant::now() < deadline {
+        let mut read = self.resizes(base).map(|(_, rows)| rows);
+        while !settled(&read) && Instant::now() < deadline {
             sleep(0.25)?;
-            rows = self.rows_since(base);
+            let next = self.resizes(base).map(|(_, rows)| rows);
+            if next.is_ok() || read.is_err() {
+                read = next;
+            }
         }
+        let rows = match read {
+            Ok(rows) => rows,
+            Err(why) => {
+                return Ok(Err(format!(
+                    "every read in {} s failed, the last: {why}",
+                    HANG.as_secs()
+                )));
+            }
+        };
         for r in &rows {
             println!(
                 "      resize {} t={} rows {} -> {}",
@@ -527,7 +628,7 @@ impl Probe {
             Measured::Missed(why) => println!("      no pair: {why}"),
             Measured::Stuck(why) => println!("      no pair: {why} in {} s", HANG.as_secs()),
         }
-        Ok(m)
+        Ok(Ok(m))
     }
 
     /// The tab strip rises `lead` before the band's quiet shrink falls due (its
@@ -550,7 +651,17 @@ impl Probe {
             return Ok(Err(format!("no message id in {posted:?}")));
         };
         sleep(0.8)?;
-        let base = self.newest_resize();
+        let base = match self.newest_resize() {
+            Ok(base) => base,
+            Err(why) => {
+                let r = c
+                    .req(&format!("notice dismiss {mid}"))
+                    .unwrap_or_else(|e| e);
+                println!("      cleanup: dismiss {mid}: {r}");
+                sleep(2.5)?;
+                return Ok(Err(format!("the base read: {why}")));
+            }
+        };
         let t0 = Instant::now();
         let r = c
             .req(&format!("notice dismiss {mid}"))
@@ -569,7 +680,7 @@ impl Probe {
         let r = c.req("settings unset tab_strip_rows").unwrap_or_else(|e| e);
         println!("      cleanup: strip down: {r}");
         sleep(2.5)?;
-        Ok(Ok(m))
+        Ok(m)
     }
 
     /// A band row rises and the tab strip falls on the next request (one write):
@@ -582,7 +693,15 @@ impl Probe {
         let r = c.req("settings set tab_strip_rows 1").unwrap_or_else(|e| e);
         println!("      strip up: {r}");
         sleep(2.5)?;
-        let base = self.newest_resize();
+        let base = match self.newest_resize() {
+            Ok(base) => base,
+            Err(why) => {
+                let r = c.req("settings unset tab_strip_rows").unwrap_or_else(|e| e);
+                println!("      cleanup: strip down: {r}");
+                sleep(2.5)?;
+                return Ok(Err(format!("the base read: {why}")));
+            }
+        };
         let t0 = Instant::now();
         if let Err(e) = c.send(&[BAND, "settings unset tab_strip_rows"]) {
             return Ok(Err(e));
@@ -604,7 +723,7 @@ impl Probe {
             println!("      cleanup: dismiss {mid}: {r}");
         }
         sleep(2.5)?;
-        Ok(Ok(m))
+        Ok(m)
     }
 
     fn judge(&mut self, case: &str, ran: Result<Vec<Measured>, String>) {
@@ -637,7 +756,7 @@ impl Probe {
             "---- X: cross-source chrome pairs, the stand-in busy (size read 20 ms late, a glyph every 5 ms)"
         );
         self.quiet()?;
-        self.read_resizes(false);
+        let _ = self.read_resizes(false);
         println!("      busy: {}", verdict(&self.ctl(&["ctrl", "n"])));
         sleep(0.5)?;
         let mut swept = Ok(Vec::new());
@@ -660,7 +779,7 @@ impl Probe {
         self.judge(SCHEDULES[1], ran.map(|m| vec![m]));
         println!("      quiet: {}", verdict(&self.ctl(&["ctrl", "o"])));
         sleep(0.5)?;
-        self.read_resizes(false);
+        let _ = self.read_resizes(false);
         self.no_new_flap("X");
         Ok(())
     }
@@ -896,7 +1015,10 @@ pub fn cmd_presence_flap(args: &[String]) -> Res {
         &format!("pid={pid}"),
     );
     let base = p.status();
-    let (head, _) = p.read_resizes(false);
+    let (head, why_not) = match p.read_resizes(false) {
+        Ok((head, _)) => (head, "the header names no flaps= or risks=".to_string()),
+        Err(why) => (String::new(), why),
+    };
     p.base_flaps = field(&head, "flaps").unwrap_or_default();
     p.base_risks = field(&head, "risks").unwrap_or_default();
     println!(
@@ -907,7 +1029,7 @@ pub fn cmd_presence_flap(args: &[String]) -> Res {
         p.base_risks
     );
     if p.base_flaps.is_empty() || p.base_risks.is_empty() {
-        p.row(false, "baseline: the resizes ledger answers", "no header");
+        p.row(false, "baseline: the resizes ledger answers", &why_not);
         p.base_flaps = "0".into();
         p.base_risks = "0".into();
     }
@@ -1188,5 +1310,34 @@ mod tests {
             stderr: String::new(),
         };
         assert_eq!(verdict(&r), "OK lease released");
+    }
+
+    #[test]
+    fn a_resizes_reply_that_failed_is_no_reading_never_an_empty_ledger() {
+        let ok = Reply {
+            code: 0,
+            stdout: "resize 7 t=1234 run=2 ord=3 from=80x24 to=80x23 alt=1\nrun 2 t=1 n=1\n".into(),
+            stderr: "aterm-ctl: OK 2 total=7 runs=2 flaps=0 risks=0 render=ok\n".into(),
+        };
+        assert_eq!(
+            ledger_rows("resizes since=6", &ok),
+            Ok(vec![rz(7, 1234, 24, 23)])
+        );
+        let none = Reply {
+            stderr: "OK 0 total=7 runs=2 flaps=0 risks=0 render=ok\n".into(),
+            ..Reply::default()
+        };
+        assert_eq!(ledger_rows("resizes since=7", &none), Ok(Vec::new()));
+
+        let refused = Reply {
+            code: 1,
+            stdout: String::new(),
+            stderr: "aterm-ctl: ERR usage: resizes [<n>] [since=<id>]\n".into(),
+        };
+        let why = ledger_rows("resizes since=x", &refused).unwrap_err();
+        assert!(why.contains("ERR usage"), "{why}");
+        let timed_out = Reply { code: 124, ..ok };
+        assert!(ledger_rows("resizes since=6", &timed_out).is_err());
+        assert!(ledger_rows("resizes since=6", &Reply::default()).is_err());
     }
 }

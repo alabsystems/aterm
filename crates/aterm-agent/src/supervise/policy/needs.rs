@@ -947,11 +947,45 @@ fn wraps(need: &str, next: &str) -> bool {
         && !need.trim_end().ends_with(['.', '!', '?', ':'])
 }
 
+const CUT_INSTRUCTIONS: [&str; 3] = [
+    "and carry on.",
+    "and carry on with everything else.",
+    "and land the rest.",
+];
+
+fn cut_instruction(rest: &str, rows: &[&str]) -> bool {
+    const CLOSERS: &[char] = &[')', ']', '"', '\'', '`', '”', '’', '*', '_'];
+    let is_cut = |words: &str| {
+        let words = words.trim_end_matches(CLOSERS);
+        CUT_INSTRUCTIONS.iter().any(|inst| {
+            words == *inst
+                || words
+                    .strip_prefix(inst)
+                    .is_some_and(|after| after.trim_start_matches(CLOSERS).starts_with(' '))
+        })
+    };
+    let mut words = rest.to_string();
+    if is_cut(&words) {
+        return true;
+    }
+    for row in rows {
+        if !wraps(&words, row) {
+            break;
+        }
+        words.push(' ');
+        words.push_str(unquoted(row).trim_end());
+        if is_cut(&words) {
+            return true;
+        }
+    }
+    false
+}
+
 const MID_OPENS: &[char] = &['*', '_', '`', '['];
 
 const MID_QUOTES: &[char] = &['"', '“', '‘', '\''];
 
-fn mid_head<'a>(row: &'a str, above: &str) -> Option<(usize, &'a str)> {
+fn mid_head<'a>(row: &'a str, above: &str, below: &[&str]) -> Option<(usize, &'a str)> {
     if unquoted(row).starts_with('⎿') {
         return None;
     }
@@ -997,6 +1031,7 @@ fn mid_head<'a>(row: &'a str, above: &str) -> Option<(usize, &'a str)> {
         let own =
             lead.trim_end().is_empty() || lead.trim_end().ends_with(['.', ';', '!', '?', '—', '–']);
         head_from(past_need_lead(&row[start..]), quoted || article)
+            .filter(|rest| !cut_instruction(rest, below))
             .filter(|rest| own || rest.chars().any(char::is_alphanumeric))
             .map(|rest| (cut, rest))
     })
@@ -1058,7 +1093,7 @@ fn needs_lines_by(tail: &str, by: &NoneWords<'_>) -> NeedLines {
             i += 1;
             continue;
         }
-        if i == 0 && need_rest(row).is_some_and(|rest| rest.starts_with("and ")) {
+        if need_rest(row).is_some_and(|rest| cut_instruction(rest, &rows[i + 1..])) {
             i += 1;
             continue;
         }
@@ -1082,7 +1117,7 @@ fn needs_lines_by(tail: &str, by: &NoneWords<'_>) -> NeedLines {
                 i += 1;
                 continue;
             }
-            None => match mid_head(row, above) {
+            None => match mid_head(row, above, &rows[i + 1..]) {
                 Some((cut, rest)) => {
                     out.cuts.push((i, cut));
                     rest
@@ -1164,7 +1199,13 @@ fn needs_lines_by(tail: &str, by: &NoneWords<'_>) -> NeedLines {
 fn sanitized(need: &str) -> String {
     let clean: String = need
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| {
+            if c.is_control() || aterm_messages::text::is_hidden_char(c) {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     let words = clean.split_whitespace().collect::<Vec<_>>().join(" ");
     let words = words.trim_matches(|c: char| matches!(c, '*' | '_') || c.is_whitespace());
@@ -1180,12 +1221,16 @@ fn sanitized(need: &str) -> String {
 /// What the report `tail` names only a person can give, each need one line.
 #[must_use]
 pub fn needs_you(tail: &str) -> Vec<String> {
+    let read = needs_lines(tail);
     let mut out: Vec<String> = Vec::new();
-    for need in needs_lines(tail).needs {
-        let need = sanitized(&need);
+    for need in &read.needs {
+        let need = sanitized(need);
         if !need.is_empty() && !out.contains(&need) {
             out.push(need);
         }
+    }
+    if out.is_empty() && !read.cleared && !read.needs.is_empty() {
+        out.push(UNREAD_NEED.to_string());
     }
     out
 }

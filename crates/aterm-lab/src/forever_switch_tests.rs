@@ -48,12 +48,13 @@ fn row(t: i64, rule: &str, decision: &str) -> Row {
     }
 }
 
-/// The lab's write of `word` at `t` after [`T0`].
+/// The lab's write of `word` at `t` after [`T0`], taken.
 fn switched(t: i64, word: &'static str) -> Switched {
     Switched {
         at: T0 + t,
         word,
         reply: "OK".into(),
+        took: true,
         phase: "idle".into(),
     }
 }
@@ -390,6 +391,29 @@ fn a_flip_to_land_and_back_to_off_types_nothing_past_the_back_offs_due() {
     let mut slow = flipped(DUE_AT + 40_000);
     slow.cover.words[1].at = T0 + 13_700 + FLIP_WITHIN_MS + 1;
     assert!(matches!(judge_flip(&slow, T0), Verdict::Unobserved(_)));
+    // A Land write that did not take: Off's wake, word and quiet are all there, but no flip raced.
+    let mut refused = flipped(DUE_AT + 40_000);
+    refused.cover.words[0].took = false;
+    refused.cover.words[0].reply = "exit 1: ERR the control server is busy".into();
+    let Verdict::Fail(why) = judge_flip(&refused, T0) else {
+        panic!("a flip whose Land write did not take passed");
+    };
+    assert!(why.contains("the write of land at +13.7"), "{why}");
+    assert!(why.contains("did not take: exit 1"), "{why}");
+}
+
+#[test]
+fn a_write_meta_set_refused_or_failed_is_not_taken() {
+    let reply = |code: i32, stdout: &str, stderr: &str| Reply {
+        code,
+        stdout: stdout.into(),
+        stderr: stderr.into(),
+    };
+    assert!(taken(&reply(0, "OK autopilot land\n", "")));
+    // Controls: an `ERR` on stderr (exit 1), an `ERR` exiting 0, no answer at all.
+    assert!(!taken(&reply(1, "", "ERR the control server is busy\n")));
+    assert!(!taken(&reply(0, "ERR usage: meta set\n", "")));
+    assert!(!taken(&reply(0, "", "")));
 }
 
 /// When `switch-held`'s hold was journaled, after [`T0`].

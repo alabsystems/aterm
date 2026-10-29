@@ -33,6 +33,9 @@ type Tidies = Vec<(PathBuf, Option<(String, String)>)>;
 /// The pages handed over: each one's host and code.
 type Handed = Vec<(Option<String>, Option<String>)>;
 
+/// What runs inside an [`Script::Ends`] sign-in, after its plan and before its end is recorded.
+type During = Box<dyn Fn(&Request<'_>)>;
+
 struct SignInHost {
     script: Script,
     home: PathBuf,
@@ -60,6 +63,8 @@ struct SignInHost {
     marked_at_window: Cell<Option<bool>>,
     /// At the pass after the window: the holds alive, and whether the mark was still there.
     at_tidy: Cell<Option<(i32, bool)>>,
+    /// Run inside an [`Script::Ends`] sign-in ([`During`]).
+    during: Option<During>,
 }
 
 impl SignInHost {
@@ -86,6 +91,7 @@ impl SignInHost {
             holds: std::rc::Rc::new(Cell::new(0)),
             marked_at_window: Cell::new(None),
             at_tidy: Cell::new(None),
+            during: None,
         }
     }
 
@@ -226,10 +232,15 @@ impl AccountsHost for SignInHost {
                     Duration::from_secs(60),
                 )
             }
-            Script::Ends(outcome) => Drove {
-                outcome: outcome.clone(),
-                host: Some("www.kimi.ai".to_owned()),
-            },
+            Script::Ends(outcome) => {
+                if let Some(during) = &self.during {
+                    during(req);
+                }
+                Drove {
+                    outcome: outcome.clone(),
+                    host: Some("www.kimi.ai".to_owned()),
+                }
+            }
             Script::Codex(email) => crate::harness::codex_app_login::tests::mock_login_in_home(
                 req.staging,
                 *email,
@@ -468,6 +479,61 @@ fn a_codex_sign_ins_staging_home_keeps_only_auth_json_under_codex_auth_path_and_
     assert!(!home.join(".aterm/logins/codex/codex-one+2").exists());
 }
 
+/// WITH CODEX'S LOGIN IN THE OS KEYRING, THE ROW ON THIS MACHINE'S OWN LOGIN IS NOT TOLD ITS
+/// SIGN-IN WOULD REPLACE THAT LOGIN INSTEAD OF MAKING ITS OWN: that login is the row's, so its
+/// refusal says why the pool's staged sign-in cannot make it and what signs it in; a row of its
+/// own keeps the refusal that its sign-in would replace this machine's own login. Neither runs a
+/// sign-in or makes a staging home.
+#[test]
+fn under_a_keyring_login_the_default_rows_renewal_refusal_is_its_own() {
+    let tmp = tmp_dir("signin-codex-keyring-default");
+    let mut env = env_at(&tmp);
+    env.sock = None;
+    let home = tmp.path().join("home");
+    let work = home.join(".aterm/logins/codex/work");
+    std::fs::create_dir_all(&work).expect("work's home");
+    let text = accounts::append_rows_for(
+        Cli::Codex,
+        "",
+        &[
+            accounts::Row {
+                label: "main".into(),
+                email: Some("main@example.com".into()),
+                ..accounts::Row::default()
+            },
+            accounts::Row {
+                label: "work".into(),
+                email: Some("work@example.com".into()),
+                dir: Some(work.display().to_string()),
+                ..accounts::Row::default()
+            },
+        ],
+    )
+    .expect("the rows admit");
+    std::fs::write(env.accounts_roster_for(Cli::Codex).expect("a roster"), text).expect("roster");
+    std::fs::create_dir_all(home.join(".codex")).expect("default codex dir");
+    std::fs::write(
+        home.join(".codex/config.toml"),
+        "cli_auth_credentials_store = \"keyring\"\n",
+    )
+    .expect("config");
+    for (label, own) in [("main", true), ("work", false)] {
+        let host = SignInHost::new(Script::Codex(Some("main@example.com")), &home);
+        let (code, out, err) = renew(&format!("accounts renew {label} --cli codex"), &env, &host);
+        assert_eq!(code, exit(1), "{label}: {out}{err}");
+        assert!(err.contains(&keyring_staging(label, own)), "{label}: {err}");
+        assert!(
+            !err.contains(&keyring_staging(label, !own)),
+            "{label}: {err}"
+        );
+        assert_eq!(host.calls.get(), 0, "{label}: no sign-in ran");
+        assert!(
+            !home.join(format!(".aterm/logins/codex/{label}+1")).exists(),
+            "{label}: no staging home"
+        );
+    }
+}
+
 #[test]
 fn ledger_accounts_reads_the_named_clis_ledger() {
     let (tmp, env) = kimi_env("ledger-cli");
@@ -583,8 +649,8 @@ fn a_codex_adopt_default_takes_the_email_its_app_server_names() {
         "{roster}"
     );
 
-    // Negative: a login reader that names no account writes nothing, and another CLI still
-    // needs --email.
+    // Negative: a Codex login reader that names no account writes nothing. Kimi may adopt an
+    // existing default login without a verified email; Claude Code still requires --email.
     let other = tmp_dir("adopt-codex-none");
     let mut env = env_at(&other);
     env.sock = None;
@@ -596,7 +662,7 @@ fn a_codex_adopt_default_takes_the_email_its_app_server_names() {
     assert_eq!(code, exit(1), "{err}");
     assert!(err.contains("--email"), "{err}");
     assert!(!other.path().join("accounts-codex.toml").exists());
-    assert!(parsed("accounts adopt-default kimi-1 --cli kimi --region global").is_err());
+    assert!(parsed("accounts adopt-default kimi-1 --cli kimi --region global").is_ok());
     assert!(
         parsed("accounts adopt-default main").is_err(),
         "Claude Code's needs it"
@@ -644,7 +710,12 @@ fn codex_adopt_default_checks_an_explicit_canonical_identity() {
     }
 }
 
-fn full_main(cli: Cli, home: &Path, now: i64) -> Option<crate::harness::codex_app_login::Usage> {
+fn full_main(
+    cli: Cli,
+    home: &Path,
+    _: Option<&str>,
+    now: i64,
+) -> Option<crate::harness::codex_app_login::Usage> {
     (cli == Cli::Codex && !home.to_string_lossy().contains("logins")).then(|| {
         crate::harness::codex_app_login::Usage {
             sample: accounts::Sample {
@@ -653,7 +724,7 @@ fn full_main(cli: Cli, home: &Path, now: i64) -> Option<crate::harness::codex_ap
                 at: now,
                 ..accounts::Sample::default()
             },
-            wall: Some((accounts::SESSION_LIMIT, Some(now + 3600))),
+            walls: vec![(accounts::SESSION_LIMIT, Some(now + 3600))],
         }
     })
 }
@@ -670,7 +741,7 @@ fn a_pools_stats_list_each_row_alike_as_text_and_json() {
     assert_eq!(text_code, exit(0), "{err}");
     assert_eq!(json_code, text_code, "both forms exit alike");
     assert!(
-        text.contains("aterm reads no usage of Kimi Code")
+        text.contains("Kimi Code CLI usage is read from its `/usage` panel")
             && text.contains("kimi-one: not-enrolled")
             && text.contains("no reading yet"),
         "{text}"
@@ -689,7 +760,9 @@ fn a_pools_stats_list_each_row_alike_as_text_and_json() {
         account: None,
         usage: Some(&full_main),
     };
+    // `main`, the default home's row, is signed in here only while its login file is there.
     std::fs::create_dir_all(tmp.path().join("home/.codex")).expect("default home");
+    std::fs::write(tmp.path().join("home/.codex/auth.json"), "{}").expect("default login");
     let (code, out, err) = renew("accounts stats --cli codex", &env, &reads);
     assert_eq!(code, exit(0), "{err}");
     assert!(
@@ -1165,11 +1238,15 @@ fn a_renewal_finding_the_profile_signed_out_names_accounts_browser() {
     assert_eq!(code, exit(1), "{out}{err}");
     assert!(
         out.contains(
-            "NEEDS YOU: sign `kimi-one` in once in its own browser profile: run `aterm harness \
-             accounts browser kimi-one --cli kimi` at this machine's desk, then `aterm harness \
-             accounts renew kimi-one --cli kimi`"
+            "NEEDS YOU: sign `kimi-one` in once in its own browser profile at this machine's \
+             desk (`aterm harness accounts browser kimi-one --cli kimi` opens it); aterm's later \
+             renewals approve its sign-in there by themselves"
         ),
         "{out}"
+    );
+    assert!(
+        !out.contains("accounts renew"),
+        "no renewal handed to a person: {out}"
     );
     assert!(!out.contains("accounts login"), "{out}");
     assert!(
@@ -1195,6 +1272,316 @@ fn a_renewal_finding_the_profile_signed_out_names_accounts_browser() {
             && out.contains("accounts login kimi-one --cli kimi")
             && !out.contains("accounts browser"),
         "{out}"
+    );
+}
+
+/// A GROK ROW IS SIGNED IN BY `accounts login`, NEVER A RENEWAL: accounts.x.ai answers the
+/// headless browser with a block page, so `add`'s `run:` step, `accounts --cli grok` and
+/// `accounts stats --cli grok` for a row that needs a sign-in (before any renewal stopped for it:
+/// the window's upkeep starts none), `browser`'s `next:` step and a renewal that found the
+/// profile signed out (and the task it records) each name `accounts login <label> --cli grok`,
+/// and none promises that a renewal approves the page. CONTROLS: a Kimi row's `add` names
+/// `renew`, its report and stats name no sign-in step (aterm signs it in by itself), its
+/// signed-out renewal names `accounts browser` then `renew`, and a stored browser task names
+/// that on Kimi and the login on Grok.
+#[test]
+fn a_grok_rows_next_steps_name_its_login_never_a_renewal() {
+    let tmp = tmp_dir("grok-next-steps");
+    let home = tmp.path().join("home");
+    let mut env = env_at(&tmp);
+    env.sock = None;
+    let (code, out, err) = run_line(
+        "accounts add grok-one --cli grok --email grok-one@example.com",
+        &env,
+    );
+    assert_eq!(code, exit(0), "{err}");
+    assert!(
+        out.contains("run: aterm harness accounts login grok-one --cli grok"),
+        "{out}"
+    );
+    let (code, out, err) = run_line(
+        "accounts add kimi-one --cli kimi --email kimi-one@example.com --region global",
+        &env,
+    );
+    assert_eq!(code, exit(0), "{err}");
+    assert!(
+        out.contains("run: aterm harness accounts renew kimi-one --cli kimi"),
+        "CONTROL: {out}"
+    );
+    let pool = PoolHost {
+        account: None,
+        usage: None,
+    };
+    for (cli, line) in [
+        (Cli::Grok, "accounts --cli grok"),
+        (Cli::Grok, "accounts stats --cli grok"),
+        (Cli::Kimi, "accounts --cli kimi"),
+        (Cli::Kimi, "accounts stats --cli kimi"),
+    ] {
+        let (code, out, err) = renew(line, &env, &pool);
+        assert_eq!(code, exit(0), "{line}: {out}{err}");
+        if cli == Cli::Grok {
+            assert!(
+                out.contains(
+                    "sign-in needed: Run aterm harness accounts login grok-one --cli grok"
+                ),
+                "{line}: {out}"
+            );
+        } else {
+            assert!(!out.contains("sign-in needed"), "CONTROL: {line}: {out}");
+        }
+        // The JSON listing and stats say the same: the step, and (the listing) that the row
+        // itself renews by itself only where its CLI's does.
+        let stats = line.contains("stats");
+        let line = format!("{line} --json");
+        let (code, out, err) = renew(&line, &env, &pool);
+        assert_eq!(code, exit(0), "{line}: {out}{err}");
+        let needed = if cli == Cli::Grok {
+            "\"sign_in_needed\":\"Run aterm harness accounts login grok-one --cli grok\""
+        } else {
+            "\"sign_in_needed\":null"
+        };
+        assert!(out.contains(needed), "{line}: {out}");
+        if !stats {
+            let label = if cli == Cli::Grok {
+                "grok-one"
+            } else {
+                "kimi-one"
+            };
+            let doc: Value = aterm_json::from_str(out.trim()).expect("json");
+            let row = doc["accounts"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|row| row["label"].as_str() == Some(label)))
+                .unwrap_or_else(|| panic!("{line}: no {label} row: {out}"));
+            assert_eq!(
+                row["renews"].as_bool(),
+                Some(cli != Cli::Grok),
+                "{line}: {label}'s own row: {out}"
+            );
+        }
+    }
+
+    let desk = SignInHost::desk(&home);
+    let (code, out, err) = renew("accounts browser grok-one --cli grok", &env, &desk);
+    assert_eq!(code, exit(0), "{out}{err}");
+    assert_eq!(desk.opened.borrow().len(), 1, "one window");
+    assert!(
+        out.contains("next: aterm harness accounts login grok-one --cli grok")
+            && !out.contains("accounts renew")
+            && !out.contains("the renewal checks it")
+            && !out.contains("headlessly"),
+        "{out}"
+    );
+
+    let store = env.accounts_store_for(Cli::Grok).expect("grok's store");
+    let signed_out = SignInHost::new(
+        Script::Ends(login_drive::Outcome::NeedsSignIn(
+            "the sign-in waits on `accounts.x.ai/oauth2/device` for a person".to_owned(),
+        )),
+        &home,
+    );
+    let (code, out, err) = renew("accounts renew grok-one --cli grok", &env, &signed_out);
+    assert_eq!(code, exit(1), "{out}{err}");
+    assert!(
+        out.contains(
+            "NEEDS YOU: approve the Grok Build sign-in for grok-one: run `aterm harness accounts \
+             login grok-one --cli grok`"
+        ) && !out.contains("accounts browser"),
+        "{out}"
+    );
+    let task = |store: &accounts::Store, label: &str| {
+        store
+            .load_logins(env.now)
+            .expect("logins")
+            .0
+            .get(label)
+            .and_then(|b| b.sign_in_task)
+            .map(|t| t.action)
+    };
+    assert_eq!(
+        task(&store, "grok-one"),
+        Some(accounts::SignInAction::Login)
+    );
+
+    let kimi = env.accounts_store_for(Cli::Kimi).expect("kimi's store");
+    let (code, out, _) = renew("accounts renew kimi-one --cli kimi", &env, &signed_out);
+    assert_eq!(code, exit(1), "CONTROL: {out}");
+    assert!(
+        out.contains("accounts browser kimi-one --cli kimi")
+            && out.contains("aterm's later renewals approve its sign-in there by themselves"),
+        "CONTROL: {out}"
+    );
+    assert_eq!(
+        task(&kimi, "kimi-one"),
+        Some(accounts::SignInAction::Browser)
+    );
+
+    assert_eq!(
+        accounts::SignInAction::Browser.next_step(Cli::Grok, "grok-one"),
+        "Run aterm harness accounts login grok-one --cli grok"
+    );
+    assert!(
+        accounts::SignInAction::Browser
+            .next_step(Cli::Kimi, "kimi-one")
+            .starts_with("Run aterm harness accounts browser kimi-one --cli kimi"),
+        "CONTROL"
+    );
+}
+
+/// A renewal whose page met Cloudflare's bot check, which did not clear, ends as a failure on
+/// record naming Cloudflare (design R-13): no NEEDS YOU line and no person's sign-in task, and
+/// its ledger row says `bot-check`. CONTROL: a stop on the vendor's sign-in still names one.
+#[test]
+fn a_renewal_on_a_bot_check_fails_on_record_and_asks_no_one() {
+    let (tmp, env) = kimi_env("bot-check-renew");
+    let home = tmp.path().join("home");
+    let store = env.accounts_store_for(Cli::Kimi).expect("kimi's store");
+    let checked = SignInHost::new(
+        Script::Ends(login_drive::Outcome::BotCheck(
+            "Cloudflare's bot check on `www.kimi.ai/code/authorize_device` did not clear in 90 \
+             s; aterm never tries to pass it"
+                .to_owned(),
+        )),
+        &home,
+    );
+    let (code, out, err) = renew("accounts renew kimi-one --cli kimi", &env, &checked);
+    assert_eq!(code, exit(1), "{out}{err}");
+    assert!(!out.contains("NEEDS YOU"), "{out}");
+    assert!(
+        err.contains("Cloudflare's bot check on `www.kimi.ai/code/authorize_device` did not clear")
+            && !err.contains("person"),
+        "{err}"
+    );
+    let ledger = read(&store.ledger_path());
+    assert!(ledger.contains("www.kimi.ai device bot-check"), "{ledger}");
+    let logins = read(&store.dir.join("logins.json"));
+    assert!(
+        !logins.contains("sign_in_task"),
+        "no person's task: {logins}"
+    );
+
+    let signed_out = SignInHost::new(
+        Script::Ends(login_drive::Outcome::NeedsSignIn(
+            "the sign-in waits on `www.kimi.ai/code/authorize_device` for a person".to_owned(),
+        )),
+        &home,
+    );
+    let (_, out, _) = renew("accounts renew kimi-one --cli kimi", &env, &signed_out);
+    assert!(out.contains("NEEDS YOU"), "CONTROL: {out}");
+    assert!(
+        read(&store.dir.join("logins.json")).contains("sign_in_task"),
+        "CONTROL: a person's stop notes a task"
+    );
+}
+
+/// A RENEWAL ON A BOT CHECK THAT COULD NOT GO ON RECORD STILL ENDS AS A BOT CHECK, which the
+/// background holds as long as a stop for a person (design R-13), not as a plain failure that only
+/// the 15-minute cooldown holds: with no line on record a restart has nothing to hold the row by,
+/// so its end is all there is. Its record fails where the binding moved during the sign-in, or
+/// where the ledger cannot be written. CONTROLS: a plain failure so unrecorded ends `Failed`, and
+/// a bot check on record ends `BotCheck` with its line there.
+#[test]
+fn an_unrecorded_bot_check_still_ends_as_a_bot_check() {
+    let (tmp, env) = kimi_env("unrecorded-bot-check");
+    let home = tmp.path().join("home");
+    let roster_path = tmp.path().join("accounts-kimi.toml");
+    let store = env.accounts_store_for(Cli::Kimi).expect("kimi's store");
+    let roster = accounts::Roster::parse_for(Cli::Kimi, &read(&roster_path)).expect("the roster");
+    let row = roster.row("kimi-one").expect("the row").clone();
+    let bot_check = || {
+        login_drive::Outcome::BotCheck(
+            "Cloudflare's bot check on `www.kimi.ai/code/authorize_device` did not clear in 90 s"
+                .to_owned(),
+        )
+    };
+    let renewal = |outcome: login_drive::Outcome, during: Option<During>| {
+        let host = SignInHost {
+            during,
+            ..SignInHost::new(Script::Ends(outcome), &home)
+        };
+        let logins = store.load_logins(env.now).expect("logins").0;
+        renew_one_for(
+            Cli::Kimi,
+            0,
+            &host,
+            &store,
+            (&row, &roster_path, &logins),
+            row.dir.as_deref(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+    };
+    // The binding moves under the sign-in: another login is bound to the row meanwhile.
+    let moves = || -> Option<During> {
+        Some(Box::new(|req: &Request<'_>| {
+            let dir = req.staging.to_string_lossy().into_owned();
+            req.store
+                .transact_logins_within(
+                    &accounts::LOCK_LADDER,
+                    1_758_412_900,
+                    &mut None,
+                    |_, logins| {
+                        logins.labels.insert(
+                            "kimi-one".to_owned(),
+                            accounts::Binding {
+                                dir: Some(dir),
+                                ..accounts::Binding::default()
+                            },
+                        );
+                        Ok(Vec::new())
+                    },
+                )
+                .expect("the binding moves");
+        }))
+    };
+    let bot_checks_on_record = || read(&store.ledger_path()).matches(" bot-check").count();
+    assert_eq!(
+        renewal(bot_check(), moves()),
+        Renewal::BotCheck,
+        "binding moved"
+    );
+    assert_eq!(bot_checks_on_record(), 0, "the bot check is not on record");
+    assert_eq!(
+        renewal(login_drive::Outcome::Failed, moves()),
+        Renewal::Failed,
+        "CONTROL: a plain failure, unrecorded"
+    );
+    // Where the last sign-in staged its login: a renewal removes it only once its end is on
+    // record, so a staging directory still there says the end never went on record.
+    let staged = std::rc::Rc::new(RefCell::new(PathBuf::new()));
+    let noting = || -> Option<During> {
+        let staged = std::rc::Rc::clone(&staged);
+        Some(Box::new(move |req: &Request<'_>| {
+            *staged.borrow_mut() = req.staging.to_path_buf();
+        }))
+    };
+    assert_eq!(renewal(bot_check(), noting()), Renewal::BotCheck, "CONTROL");
+    assert_eq!(bot_checks_on_record(), 1, "CONTROL: its line is on record");
+    assert!(
+        !staged.borrow().exists(),
+        "CONTROL: on record, its staging directory is removed"
+    );
+
+    // The ledger cannot be written: a directory stands where it is.
+    let ledger = store.ledger_path();
+    let unwritable = || -> Option<During> {
+        let ledger = ledger.clone();
+        let staged = std::rc::Rc::clone(&staged);
+        Some(Box::new(move |req: &Request<'_>| {
+            *staged.borrow_mut() = req.staging.to_path_buf();
+            std::fs::rename(&ledger, ledger.with_extension("kept")).expect("the ledger moves");
+            std::fs::create_dir_all(&ledger).expect("a directory at the ledger");
+        }))
+    };
+    assert_eq!(
+        renewal(bot_check(), unwritable()),
+        Renewal::BotCheck,
+        "ledger unwritable"
+    );
+    assert!(
+        staged.borrow().is_dir(),
+        "not on record, its staging directory is kept: {}",
+        staged.borrow().display()
     );
 }
 
@@ -1387,8 +1774,9 @@ fn accounts_browser_opens_nothing_on_a_profile_a_headless_sign_in_holds() {
 }
 
 /// A renewal of another CLI that stopped where only a person can go on (its page waits on one,
-/// a block page, its time ran out) is `NeedsPerson`, which the background's backoff keys on.
-/// CONTROL: a sign-in the CLI said failed is a plain failure.
+/// a block page, its time ran out) is `NeedsPerson`, and one that met Cloudflare's bot check is
+/// `BotCheck`, which the background's backoff keys on alike. CONTROL: a sign-in the CLI said
+/// failed is a plain failure.
 #[test]
 fn a_renewal_that_stopped_for_a_person_says_so() {
     let (tmp, env) = kimi_env("renew-needs-person");
@@ -1427,6 +1815,14 @@ fn a_renewal_that_stopped_for_a_person_says_so() {
             "{outcome:?}"
         );
     }
+    assert_eq!(
+        renewal(login_drive::Outcome::BotCheck(
+            "Cloudflare's bot check on `www.kimi.ai/code/authorize_device` did not clear in 90 \
+             s; aterm never tries to pass it"
+                .to_owned()
+        )),
+        Renewal::BotCheck
+    );
     assert_eq!(
         renewal(login_drive::Outcome::Failed),
         Renewal::Failed,

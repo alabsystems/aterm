@@ -288,7 +288,7 @@ struct Wait {
 impl Wait {
     fn from_now(bound: Duration, until: Option<Instant>) -> Self {
         let started = Instant::now();
-        let bound = started + bound;
+        let bound = super::instant_after(started, bound);
         Self {
             started,
             deadline: until.map_or(bound, |until| until.min(bound)),
@@ -1279,7 +1279,7 @@ pub(crate) fn relay_subscription(
     out: &mut impl io::Write,
 ) -> io::Result<ExitCode> {
     let watch = watch.map(|limit| (Instant::now(), limit));
-    let until = watch.map(|(start, limit)| start + limit);
+    let until = watch.map(|(start, limit)| super::instant_after(start, limit));
     let mut redial = redial.clone();
     let mut tracker = FrameTracker::new(request);
     let exit = redial.watch_exit(first.server);

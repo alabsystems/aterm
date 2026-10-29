@@ -391,6 +391,46 @@ impl Instance {
     /// # Errors
     /// The log, the lifeline or the process could not be made.
     pub fn start(world: &World, l: Launch) -> Result<Instance, String> {
+        Self::start_on_socket(world, l, &world.sock)
+    }
+
+    /// Start a window through the ordinary executable entry point, using its
+    /// default socket beneath this world's private runtime directory. The caller
+    /// supplies an environment without `ATERM_STATE_HOME` or `CI`, and confines
+    /// any automatic network lanes the measurement enables.
+    /// # Errors
+    /// A headless launch, mismatched private roots, a suppressed runtime,
+    /// or any failure named by [`Self::start`].
+    pub fn start_ordinary(world: &World, l: Launch) -> Result<Instance, String> {
+        if l.headless
+            || l.env
+                .iter()
+                .any(|(key, _)| key == "ATERM_STATE_HOME" || key == "CI")
+            || [
+                ("HOME", &world.home),
+                ("XDG_CONFIG_HOME", &world.cfg),
+                ("XDG_RUNTIME_DIR", &world.run),
+            ]
+            .into_iter()
+            .any(|(wanted, path)| {
+                !l.env
+                    .iter()
+                    .any(|(key, value)| key == wanted && Path::new(value) == path)
+            })
+        {
+            return Err("ordinary instance needs a window and its private home, config and runtime directories, without runtime-suppression variables".into());
+        }
+        // Empty means the ordinary per-instance socket, rather than an explicit
+        // socket that would suppress Commons startup in the executable.
+        let mut instance = Self::start_on_socket(world, l, Path::new(""))?;
+        instance.sock = world
+            .run
+            .join("aterm")
+            .join(aterm_types::control_socket::LATEST_SOCK_FILE);
+        Ok(instance)
+    }
+
+    fn start_on_socket(world: &World, l: Launch, socket: &Path) -> Result<Instance, String> {
         let quiet = windowed_quiet(&l)?;
         let log = world.dir.join("aterm.log");
         let out = std::fs::File::create(&log)
@@ -400,7 +440,7 @@ impl Instance {
             .map_err(|e| format!("cannot share the instance log: {e}"))?;
         let (lifeline, far) = aterm_uds::lifeline::Lifeline::open(&world.dir)
             .map_err(|e| format!("the lifeline: {e}"))?;
-        let line = line(&l, Via::Child, &paths().exe, &world.sock);
+        let line = line(&l, Via::Child, &paths().exe, socket);
         let (program, argv) = line.split_first().ok_or("an empty command line")?;
         let child = aterm_uds::spawnfd::command(program)
             .env_clear()
@@ -714,8 +754,13 @@ pub fn cmd_instance(args: &[String]) -> Res {
     let font_px = take_value(&mut a, "--font-px")?;
     let scale = take_value(&mut a, "--scale")?;
     let scene = take_value(&mut a, "--scene")?;
-    if scene.as_deref().is_some_and(|s| s != "band-icons") {
-        return Err(Fail::usage("instance: --scene takes band-icons"));
+    if scene
+        .as_deref()
+        .is_some_and(|s| !matches!(s, "band-icons" | "harness-layouts"))
+    {
+        return Err(Fail::usage(
+            "instance: --scene takes band-icons or harness-layouts",
+        ));
     }
     let image = take_value(&mut a, "--image")?.map(|p| from_caller(&p));
     let toml = take_values(&mut a, "--toml")?;

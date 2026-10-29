@@ -5,8 +5,8 @@
 
 use aterm_models_session::session_log_fold_model;
 use aterm_slog::{
-    Actor, Amend, ClauseRow, Close, Conf, Cursor, Fields, Fold, Key, Kind, Log, Mark, Node, Op,
-    Open, Out, Rec, RunOut, Src, StepOut, TurnOut, amend_refines_out, confidence_law,
+    Actor, Amend, ClauseRow, Close, Conf, Cursor, Fields, Fold, Key, Kind, Log, Lvl, Mark, Node,
+    Op, Open, Out, Rec, RunOut, Src, StepOut, TurnOut, amend_refines_out, confidence_law,
     need_takes_amend, shown_label, turn_out_rebucket,
 };
 use aterm_spec::derive::Model;
@@ -476,7 +476,22 @@ fn fold_conformance_rejects_each_broken_call() {
         .expect("held");
     let seq = w.log.last_seq() + 1;
     assert!(confidence_law(held.conf, held.seq, Conf::Strong, seq));
-    assert!(!amend_refines_out(held.conf, held.seq, Conf::Strong, seq));
+    let out = w.fold.state().last[1]
+        .as_ref()
+        .map(|c| c.out)
+        .expect("closed");
+    assert_eq!(out, "done");
+    assert!(
+        !amend_refines_out(Lvl::Turn, out, (held.conf, held.seq), Conf::Strong, seq),
+        "a turn's held outcome takes an exact amend only, even its `gone`"
+    );
+    assert!(!amend_refines_out(
+        Lvl::Turn,
+        "gone",
+        (held.conf, held.seq),
+        Conf::Strong,
+        seq
+    ));
     w.real("AmendOutStrong", &mut XorShift::new(1));
     let honest = w.project();
     admitted(&m, "AmendOutStrong", &prev, &honest);

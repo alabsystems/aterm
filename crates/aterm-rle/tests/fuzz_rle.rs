@@ -40,13 +40,18 @@ impl Lcg {
     }
 }
 
-/// Assert that cached `total_length` matches the 64-bit run-length sum and never exceeds `u32::MAX`.
+/// Assert the canonical RLE invariant `Inv(r)`: positive run lengths, distinct adjacent values, and exact `u64` total.
 fn assert_invariant(rle: &Rle<u8>) {
-    let sum: u64 = rle
-        .runs()
-        .iter()
-        .map(|r: &Run<u8>| u64::from(r.length))
-        .sum();
+    let runs = rle.runs();
+    assert!(
+        runs.iter().all(|r| r.length > 0),
+        "zero-length run accumulated in RLE: {runs:?}"
+    );
+    assert!(
+        runs.windows(2).all(|w| w[0].value != w[1].value),
+        "adjacent equal-valued runs accumulated in RLE: {runs:?}"
+    );
+    let sum: u64 = runs.iter().map(|r: &Run<u8>| u64::from(r.length)).sum();
     assert!(
         sum <= u64::from(u32::MAX),
         "run length sum {sum} exceeded u32::MAX — checked_run_length_sum would saturate"

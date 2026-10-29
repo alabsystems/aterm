@@ -224,116 +224,134 @@ fn modifieds_row_whose_facts_the_strip_holds_is_shown_and_turned_past() {
     assert!(found > 0, "Modified holds such a row at these sizes");
 }
 
-#[test]
-fn page_keys_turn_over_exactly_what_a_screen_showed_whole() {
-    let mut turned = 0usize;
-    let mut faults = Vec::new();
-    for source in ["", CHANGED] {
-        for route in SettingsRoute::ALL {
-            if route == SettingsRoute::Messages {
-                continue;
+/// Page Down from the list's top, then Page Up from where it ends, `limit` the list's last top:
+/// no turn short of the list's end shows again a stop the screen before it showed whole, and
+/// each shows every stop of `showable` (the stops some screen showed whole), Page Down's screens
+/// told from `first`. The turns made, and the faults told in `context`.
+fn page_keys_turn(
+    runtime: &mut NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    cx: &ViewCx<'_>,
+    context: &str,
+    (first, limit): (usize, usize),
+    showable: &BTreeSet<usize>,
+) -> (usize, Vec<String>) {
+    let (mut turned, mut faults) = (0usize, Vec::new());
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.scroll_page_to(0);
+        state.page_reveal = None;
+    }
+    for direction in [1, -1] {
+        let mut screens = vec![if direction > 0 { first } else { limit }];
+        let start = screen_now(runtime, instance, view, cx).expect("a list").0;
+        let want = if direction > 0 { 0 } else { limit };
+        if start.top != want {
+            faults.push(format!(
+                "{context}: Page {} starts from {} not {want}",
+                if direction > 0 { "Down" } else { "Up" },
+                start.top
+            ));
+            continue;
+        }
+        let mut seen = start.whole.clone();
+        let mut before = start;
+        loop {
+            runtime
+                .dispatch(instance, view, AppEvent::ScrollPage(direction))
+                .unwrap();
+            let (now, _) = screen_now(runtime, instance, view, cx).expect("a list");
+            if now.place() == before.place() {
+                break;
             }
-            for (width, height) in std::iter::once((444.0, 292.0)).chain(PAGING_SIZES) {
-                let context = format!(
-                    "{route:?} {width}x{height}{}",
-                    if source.is_empty() { "" } else { " changed" }
-                );
-                let cx = view_cx_at(width, height);
-                let (mut runtime, instance, view) = paging_view(source, route);
-                let Some((first, plan)) = screen_now(&runtime, instance, view, &cx) else {
-                    continue;
-                };
-                let limit = plan.limit();
-                if limit == 0 {
-                    continue;
+            turned += 1;
+            screens.push(now.top);
+            let at_end = if direction > 0 {
+                now.top == limit
+            } else {
+                now.place() == (0, 0)
+            };
+            if !at_end {
+                let again: Vec<_> = now.whole.intersection(&before.whole).collect();
+                if !again.is_empty() {
+                    faults.push(format!(
+                        "{context}: Page {} from {} to {} shows {again:?} again \
+                         (shown whole {:?} then {:?})",
+                        if direction > 0 { "Down" } else { "Up" },
+                        before.top,
+                        now.top,
+                        before.whole,
+                        now.whole
+                    ));
                 }
-                let mut showable = BTreeSet::new();
-                for top in 0..=limit {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                        unreachable!();
-                    };
-                    state.scroll_page_to(top);
-                    state.page_reveal = None;
-                    if let Some((screen, _)) = screen_now(&runtime, instance, view, &cx) {
-                        if screen.top != top {
-                            faults.push(format!(
-                                "{context}: screen {top} draws from stop {}",
-                                screen.top
-                            ));
-                        }
-                        showable.extend(screen.whole);
-                    }
-                }
-                {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                        unreachable!();
-                    };
-                    state.scroll_page_to(0);
-                    state.page_reveal = None;
-                }
-                for direction in [1, -1] {
-                    let mut screens = vec![if direction > 0 { first.top } else { limit }];
-                    let start = screen_now(&runtime, instance, view, &cx).expect("a list").0;
-                    assert_eq!(
-                        start.top,
-                        if direction > 0 { 0 } else { limit },
-                        "{context}"
-                    );
-                    let mut seen = start.whole.clone();
-                    let mut before = start;
-                    loop {
-                        runtime
-                            .dispatch(instance, view, AppEvent::ScrollPage(direction))
-                            .unwrap();
-                        let (now, _) = screen_now(&runtime, instance, view, &cx).expect("a list");
-                        if now.place() == before.place() {
-                            break;
-                        }
-                        turned += 1;
-                        screens.push(now.top);
-                        let at_end = if direction > 0 {
-                            now.top == limit
-                        } else {
-                            now.place() == (0, 0)
-                        };
-                        if !at_end {
-                            let again: Vec<_> = now.whole.intersection(&before.whole).collect();
-                            if !again.is_empty() {
-                                faults.push(format!(
-                                    "{context}: Page {} from {} to {} shows {again:?} again \
-                                 (shown whole {:?} then {:?})",
-                                    if direction > 0 { "Down" } else { "Up" },
-                                    before.top,
-                                    now.top,
-                                    before.whole,
-                                    now.whole
-                                ));
-                            }
-                        }
-                        seen.extend(now.whole.iter().copied());
-                        before = now;
-                        if at_end || screens.len() > 4 * (limit + 2) {
-                            break;
-                        }
-                    }
-                    let skipped: Vec<_> = showable.difference(&seen).collect();
-                    if !skipped.is_empty() {
-                        faults.push(format!(
-                            "{context}: Page {} over {screens:?} skips {skipped:?}",
-                            if direction > 0 { "Down" } else { "Up" },
-                        ));
-                    }
-                }
+            }
+            seen.extend(now.whole.iter().copied());
+            before = now;
+            if at_end || screens.len() > 4 * (limit + 2) {
+                break;
             }
         }
+        let skipped: Vec<_> = showable.difference(&seen).collect();
+        if !skipped.is_empty() {
+            faults.push(format!(
+                "{context}: Page {} over {screens:?} skips {skipped:?}",
+                if direction > 0 { "Down" } else { "Up" },
+            ));
+        }
     }
-    assert!(
-        faults.is_empty(),
-        "{} faults:\n{}",
-        faults.len(),
-        faults.join("\n")
+    (turned, faults)
+}
+
+/// The page keys' walk of a list from its first render, the page as it opens: each screen set
+/// from the top to the last draws from the stop it was set to, then [`page_keys_turn`] over the
+/// stops they showed whole. A page that opens on a landing (Cursor Styles, Themes) is walked so,
+/// its first render drawing the landing. The turns made, and the faults told in `context`.
+fn page_keys_walk(
+    runtime: &mut NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    cx: &ViewCx<'_>,
+    context: &str,
+) -> (usize, Vec<String>) {
+    let Some((first, plan)) = screen_now(runtime, instance, view, cx) else {
+        return (0, Vec::new());
+    };
+    let limit = plan.limit();
+    if limit == 0 {
+        return (0, Vec::new());
+    }
+    let mut faults = Vec::new();
+    let mut showable = BTreeSet::new();
+    for top in 0..=limit {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.scroll_page_to(top);
+        state.page_reveal = None;
+        if let Some((screen, _)) = screen_now(runtime, instance, view, cx) {
+            if screen.top != top {
+                faults.push(format!(
+                    "{context}: screen {top} draws from stop {}",
+                    screen.top
+                ));
+            }
+            showable.extend(screen.whole);
+        }
+    }
+    let (turned, turn_faults) = page_keys_turn(
+        runtime,
+        instance,
+        view,
+        cx,
+        context,
+        (first.top, limit),
+        &showable,
     );
-    assert!(turned > 0, "the sweep turns pages");
+    faults.extend(turn_faults);
+    (turned, faults)
 }
 
 /// A STATUS'S BAR COMING OR GOING MOVES NO ROW, AND THE SCREEN UNDER IT ENDS ON THE NEXT
@@ -415,12 +433,19 @@ fn a_bar_coming_moves_no_row_and_the_screen_under_it_ends_on_a_peek() {
 /// (or short of the page's bottom), and no band that holds a shared note is a control's stop.
 /// The walk is made again with a status's bar up: the bar covers the strip kept for it, and a
 /// screen measured to the strip's foot ended on a whole card over a blank band in the room the
-/// bar left (Cursor & Motion at 102x29: 18pt).
+/// bar left (Cursor & Motion at 102x29: 18pt). Without a bar, at 444x292, 584x348, 738x418 and
+/// 1074x684, defaults and changed, each screen of the same walk draws from the stop it was set
+/// to, and from them Page Up and Page Down turn over exactly the stops a screen showed whole: no
+/// turn short of the list's end shows again a stop the screen before it showed whole, and Page
+/// Down from the top and Page Up from the end each show every stop some screen shows whole.
+/// Cursor Styles and Themes, which open on a landing, are walked for the page keys on their own,
+/// from the landing's first frame ([`page_keys_walk`]).
 #[test]
-fn no_screen_ends_on_blank_under_a_card_it_cuts() {
+fn no_screen_ends_on_blank_and_page_keys_turn_over_what_it_showed_whole() {
     let (mut cut_screens, mut whole_foot_screens) = (0usize, 0usize);
     let mut faults = Vec::new();
     let (mut notes, mut noted) = (0usize, Vec::new());
+    let (mut turned, mut page_faults) = (0usize, Vec::new());
     for (source, bar) in [("", false), (CHANGED, false), ("", true)] {
         for route in SettingsRoute::ALL {
             if route == SettingsRoute::Messages {
@@ -441,10 +466,35 @@ fn no_screen_ends_on_blank_under_a_card_it_cuts() {
                     };
                     state.show_transient_status_for_test("Cursor blink turned off");
                 }
+                // The page keys turn every window but 1193x516, with no bar; a page that opens
+                // on a landing is walked for them on its own.
+                let keyed = !bar && (width, height) != (1_193.0, 516.0);
+                let landing = matches!(route, SettingsRoute::CursorStyles | SettingsRoute::Themes);
+                let key_context = format!(
+                    "{route:?} {width}x{height}{}",
+                    if source.is_empty() { "" } else { " changed" }
+                );
+                let (mut showable, mut keyed_faults) = (BTreeSet::new(), Vec::new());
+                // The last top the walk sets, the list's limit.
+                let mut limit = 0;
                 each_screen_of(&mut runtime, instance, view, &cx, |state, compiled, top| {
+                    limit = top;
                     let Some(plan) = state.scroll_plan() else {
                         return;
                     };
+                    if keyed && !landing {
+                        let record_top = state
+                            .scroll_record
+                            .borrow()
+                            .as_ref()
+                            .map_or(0, |record| record.top());
+                        if record_top != top {
+                            keyed_faults.push(format!(
+                                "{key_context}: screen {top} draws from stop {record_top}"
+                            ));
+                        }
+                        showable.extend(shown_whole(compiled, &plan, record_top));
+                    }
                     let Some(list) = painted_list(compiled, &plan, top) else {
                         return;
                     };
@@ -547,27 +597,61 @@ fn no_screen_ends_on_blank_under_a_card_it_cuts() {
                         ));
                     }
                 });
+                if !keyed {
+                    continue;
+                }
+                // The page keys turn the list from where the walk left it, on its last top, as
+                // their own walk of every top left it; a landing page from its own walk.
+                let (turns, found) = if landing {
+                    let (mut runtime, instance, view) = paging_view(source, route);
+                    page_keys_walk(&mut runtime, instance, view, &cx, &key_context)
+                } else if limit > 0 && messages_view_state(&runtime, view).scroll_plan().is_some() {
+                    page_keys_turn(
+                        &mut runtime,
+                        instance,
+                        view,
+                        &cx,
+                        &key_context,
+                        (0, limit),
+                        &showable,
+                    )
+                } else {
+                    // A list that fits one screen (or none) is no list the page keys turn.
+                    keyed_faults.clear();
+                    (0, Vec::new())
+                };
+                turned += turns;
+                page_faults.extend(keyed_faults);
+                page_faults.extend(found);
             }
         }
     }
-    assert!(
-        faults.is_empty(),
-        "{} faults:\n{}",
-        faults.len(),
-        faults.join("\n")
-    );
+    let mut sections = Vec::new();
+    if !faults.is_empty() {
+        sections.push(format!("{} faults:\n{}", faults.len(), faults.join("\n")));
+    }
+    if !noted.is_empty() {
+        sections.push(format!(
+            "{} notes head a control:\n{}",
+            noted.len(),
+            noted.join("\n")
+        ));
+    }
+    if !page_faults.is_empty() {
+        sections.push(format!(
+            "page keys: {} faults:\n{}",
+            page_faults.len(),
+            page_faults.join("\n")
+        ));
+    }
+    assert!(sections.is_empty(), "{}", sections.join("\n\n"));
     assert!(cut_screens > 0, "the sweep holds screens that end on a cut");
     assert!(
         whole_foot_screens > 0,
         "the sweep holds screens of a list that ends on whole stops"
     );
-    assert!(
-        noted.is_empty(),
-        "{} notes head a control:\n{}",
-        noted.len(),
-        noted.join("\n")
-    );
     assert!(notes > 0, "the sweep paints shared notes");
+    assert!(turned > 0, "the sweep turns pages");
 }
 
 #[test]
@@ -1614,20 +1698,79 @@ fn walk_screens(
     walk
 }
 
+/// The aterm.toml sources a short window's page is walked under: the default, and a light theme.
+const SHORT_SOURCES: [&str; 2] = ["", "theme = \"GitHub Light\"\n"];
+
+/// The Settings window a short window's walk starts from: `route` under `source`, the Tabs page
+/// over the fleet fixture of [`super::narrow::every_page_runtime_over`].
+fn short_window_view(
+    source: &str,
+    route: SettingsRoute,
+) -> (
+    NativeRuntime,
+    crate::native_app::AppInstanceId,
+    crate::native_app::ViewId,
+) {
+    if route != SettingsRoute::Tabs {
+        return paging_view(source, route);
+    }
+    let (mut runtime, instance, view) = super::narrow::every_page_runtime_over(source);
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: route_action(route),
+                value: None,
+            }),
+        )
+        .unwrap();
+    (runtime, instance, view)
+}
+
+/// Everything each screen of `route` paints under `source` in a window wide enough that nothing
+/// cuts it: two sources that paint alike here build one tree for the page, which every short
+/// window then lays out and walks alike.
+fn widest_paint(source: &str, route: SettingsRoute) -> Vec<Vec<crate::native_ui::PaintNode>> {
+    let (mut runtime, instance, view) = short_window_view(source, route);
+    let mut screens = Vec::new();
+    each_screen(
+        &mut runtime,
+        instance,
+        view,
+        &view_cx_at(4_000.0, 2_400.0),
+        |compiled, _| screens.push(compiled.paint.clone()),
+    );
+    screens
+}
+
 #[test]
 fn every_stop_of_a_short_window_is_whole_by_page_and_by_wheel() {
     at_each_text_scale(&[1.0, 2.0], "short windows", |scale| {
         let report = std::sync::Mutex::new(Vec::new());
         let faults = std::sync::atomic::AtomicUsize::new(0);
-        let windows = ["", "theme = \"GitHub Light\"\n"]
+        // Each page under each source, but a source that paints the page as the first does (a
+        // theme no page of it reads): its every walk would repeat the first's screen for screen.
+        let pages: Vec<(&str, SettingsRoute)> = SettingsRoute::ALL
             .into_iter()
-            .flat_map(|source| {
-                SettingsRoute::ALL
-                    .into_iter()
-                    .filter(|route| *route != SettingsRoute::Messages)
-                    .flat_map(move |route| {
-                        SHORT_SIZES.map(|(width, height)| (source, route, width, height))
-                    })
+            .filter(|route| *route != SettingsRoute::Messages)
+            .flat_map(|route| {
+                let differs =
+                    widest_paint(SHORT_SOURCES[1], route) != widest_paint(SHORT_SOURCES[0], route);
+                SHORT_SOURCES[..1 + usize::from(differs)]
+                    .iter()
+                    .map(move |source| (*source, route))
+            })
+            .collect();
+        assert!(
+            pages.iter().any(|(source, _)| *source == SHORT_SOURCES[1]),
+            "some page paints differently under {:?}",
+            SHORT_SOURCES[1]
+        );
+        let windows = pages
+            .iter()
+            .flat_map(|&(source, route)| {
+                SHORT_SIZES.map(|(width, height)| (source, route, width, height))
             })
             .collect::<Vec<_>>();
         on_workers(
@@ -1639,23 +1782,7 @@ fn every_stop_of_a_short_window_is_whole_by_page_and_by_wheel() {
                     if source.is_empty() { "" } else { " light" }
                 );
                 let cx = view_cx_at(width, height);
-                let (mut runtime, instance, view) = if route == SettingsRoute::Tabs {
-                    let (mut runtime, instance, view) =
-                        super::narrow::every_page_runtime_over(source);
-                    runtime
-                        .dispatch(
-                            instance,
-                            view,
-                            AppEvent::Action(ActionInvocation {
-                                id: route_action(route),
-                                value: None,
-                            }),
-                        )
-                        .unwrap();
-                    (runtime, instance, view)
-                } else {
-                    paging_view(source, route)
-                };
+                let (mut runtime, instance, view) = short_window_view(source, route);
                 let _ = compile_settings_view(&runtime, instance, view, &cx);
                 let Some(plan) = messages_view_state(&runtime, view).scroll_plan() else {
                     return;
@@ -2249,8 +2376,7 @@ fn end_reaches_the_lists_end_before_a_render_has_measured_it() {
 
 #[test]
 fn no_page_down_only_moves_the_list() {
-    let mut turned = 0usize;
-    let mut faults = Vec::new();
+    let mut walks = Vec::new();
     for source in ["", "cursor_trail_style = \"beam\"\n", CHANGED] {
         for route in SettingsRoute::ALL {
             if route == SettingsRoute::Messages {
@@ -2260,52 +2386,74 @@ fn no_page_down_only_moves_the_list() {
                 .into_iter()
                 .chain([(444.0, 318.0), (444.0, 180.0)])
             {
-                let cx = view_cx_at(width, height);
-                let (mut runtime, instance, view) = paging_view(source, route);
-                let Some((mut before, plan)) = screen_now(&runtime, instance, view, &cx) else {
-                    continue;
-                };
-                if plan.limit() == 0 {
-                    continue;
-                }
-                let end_drawn = |runtime: &NativeRuntime| {
-                    let compiled = compile_settings_view(runtime, instance, view, &cx);
-                    let state = messages_view_state(runtime, view);
-                    let plan = state.scroll_plan()?;
-                    let top = state.page_scroll.min(plan.limit());
-                    let list = painted_list(&compiled, &plan, top)?;
-                    let band = plan.drawn_bands(top).pop()?;
-                    (band.stop + 1 == plan.len() && band.end <= list.height + 0.5).then_some(())
-                };
-                let mut end_before = end_drawn(&runtime);
-                for _ in 0..4 * (plan.limit() + 2) {
-                    runtime
-                        .dispatch(instance, view, AppEvent::ScrollPage(1))
-                        .unwrap();
-                    let (now, _) = screen_now(&runtime, instance, view, &cx).expect("a list");
-                    if now.place() == before.place() {
-                        break;
-                    }
-                    turned += 1;
-                    let end_now = end_drawn(&runtime);
-                    let new = now.whole.difference(&before.whole).count() > 0;
-                    if !new && !(end_now.is_some() && end_before.is_none()) {
-                        faults.push(format!(
-                            "{route:?} {width}x{height}{}: Page Down from {} to {} shows {:?} \
-                             after {:?}, nothing new",
-                            if source.is_empty() { "" } else { " (changed)" },
-                            before.top,
-                            now.top,
-                            now.whole,
-                            before.whole
-                        ));
-                    }
-                    before = now;
-                    end_before = end_now;
-                }
+                walks.push((source, route, width, height));
             }
         }
     }
+    // Each walk on a worker, from a runtime of its own: view_cx_at installs the UI faces it reads
+    // per thread within the walk, and on_n_workers gives each worker this thread's appearance.
+    let turned = std::sync::atomic::AtomicUsize::new(0);
+    let faults = std::sync::Mutex::new(Vec::new());
+    let workers = std::thread::available_parallelism().map_or(SWEEP_WORKERS, usize::from);
+    on_n_workers(
+        workers,
+        &walks,
+        "Page Down",
+        |&(source, route, width, height)| {
+            let cx = view_cx_at(width, height);
+            let (mut runtime, instance, view) = paging_view(source, route);
+            let Some((mut before, plan)) = screen_now(&runtime, instance, view, &cx) else {
+                return;
+            };
+            if plan.limit() == 0 {
+                return;
+            }
+            let end_drawn = |runtime: &NativeRuntime| {
+                let compiled = compile_settings_view(runtime, instance, view, &cx);
+                let state = messages_view_state(runtime, view);
+                let plan = state.scroll_plan()?;
+                let top = state.page_scroll.min(plan.limit());
+                let list = painted_list(&compiled, &plan, top)?;
+                let band = plan.drawn_bands(top).pop()?;
+                (band.stop + 1 == plan.len() && band.end <= list.height + 0.5).then_some(())
+            };
+            let mut end_before = end_drawn(&runtime);
+            for _ in 0..4 * (plan.limit() + 2) {
+                runtime
+                    .dispatch(instance, view, AppEvent::ScrollPage(1))
+                    .unwrap();
+                let (now, _) = screen_now(&runtime, instance, view, &cx).expect("a list");
+                if now.place() == before.place() {
+                    break;
+                }
+                turned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let end_now = end_drawn(&runtime);
+                let new = now.whole.difference(&before.whole).count() > 0;
+                if !new && !(end_now.is_some() && end_before.is_none()) {
+                    let fault = format!(
+                        "{route:?} {width}x{height}{}: Page Down from {} to {} shows {:?} \
+                     after {:?}, nothing new",
+                        if source.is_empty() { "" } else { " (changed)" },
+                        before.top,
+                        now.top,
+                        now.whole,
+                        before.whole
+                    );
+                    faults
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(fault);
+                }
+                before = now;
+                end_before = end_now;
+            }
+        },
+    );
+    let turned = turned.into_inner();
+    let mut faults = faults
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    faults.sort();
     assert!(
         faults.is_empty(),
         "{} faults:\n{}",
@@ -2542,146 +2690,6 @@ fn a_narrow_short_window_gives_its_list_the_room_and_no_more() {
     });
 }
 
-/// THE TOOLBAR SCROLLS AWAY WITH THE PAGE WHERE ITS ROW CUTS A CONTROL: in a 178x152 window at 1×,
-/// 1.5× and 2× text and in the window's least (164x98), on every page, every control no taller
-/// than the window is whole on some screen by the wheel; in the 178x152 window none is taller
-/// than the window and no stop is cut, but the Themes chooser's three-line names (168pt at 2×,
-/// on its grid), which the list steps through; the list's top draws the toolbar once, leading
-/// the page's list the window wide where it does not stand over the page, and over a taller
-/// window's page (178x348 at 2×) where the toolbar's row cuts nothing. Negative controls:
-/// with the toolbar kept over every page, Coding Agent Harness (130pt) under the 52pt toolbar of a
-/// 178x152 window at 2× was never whole, its screen drawing nothing; Packages' Check & Update Now
-/// and Install ALab Tools Now stood on four lines (163pt) beside 22pt card sides; and an empty
-/// Fleet document field set "ai-fleet.toml beside aterm.toml" on five lines (196pt).
-#[test]
-fn a_short_windows_toolbar_scrolls_away_where_its_row_cuts_a_control() {
-    at_each_text_scale(&[1.0, 1.5, 2.0], "listed toolbar", |scale| {
-        let mut faults = Vec::new();
-        for (width, height) in [(178.0_f32, 152.0_f32), (164.0, 98.0)] {
-            let cx = view_cx_at(width, height);
-            for route in SettingsRoute::ALL {
-                let context = format!("{route:?} {width}x{height} {scale}x");
-                let (mut runtime, instance, view) = if route == SettingsRoute::Messages {
-                    super::setup_with_messages()
-                } else {
-                    paging_view("", route)
-                };
-                // From the list's top, where a page that lands on a row of its own has one.
-                let _ = compile_settings_view(&runtime, instance, view, &cx);
-                runtime
-                    .dispatch(instance, view, AppEvent::ScrollLines(-10_000))
-                    .unwrap();
-                // Each control by its key: whether a screen drew it whole, and its height.
-                let mut controls = std::collections::BTreeMap::<String, (bool, f32)>::new();
-                let mut before = None;
-                for screen in 0..400 {
-                    let compiled = compile_settings_view(&runtime, instance, view, &cx);
-                    let toolbars: Vec<LogicalRect> = compiled
-                        .semantics
-                        .iter()
-                        .filter(|node| node.key.as_str() == "settings/compact-toolbar")
-                        .map(|node| node.rect)
-                        .collect();
-                    if screen == 0 && toolbars.len() != 1 {
-                        faults.push(format!("{context}: the list's top draws {toolbars:?}"));
-                    }
-                    // Listed, the toolbar spans the window as it does pinned. Negative control:
-                    // it stood in the list's column, inset 14pt a side by the page's margins.
-                    if screen == 0
-                        && messages_view_state(&runtime, view)
-                            .page_chrome
-                            .get()
-                            .toolbar_listed
-                        && toolbars
-                            .iter()
-                            .any(|bar| bar.x > 0.5 || bar.right() < width - 0.5)
-                    {
-                        faults.push(format!(
-                            "{context}: the listed toolbar {toolbars:?} is not the window wide"
-                        ));
-                    }
-                    // A control no screen draws (a list draws none it would cut): no stop of the
-                    // 178x152 window's lists is cut.
-                    if screen == 0
-                        && height > 150.0
-                        && route != SettingsRoute::Themes
-                        && let Some(plan) = messages_view_state(&runtime, view).scroll_plan()
-                        && plan.cut_stops() > 0
-                    {
-                        faults.push(format!("{context}: {} stops are cut", plan.cut_stops()));
-                    }
-                    for node in &compiled.paint {
-                        let key = node.key.as_str();
-                        if !matches!(
-                            node.content,
-                            UiContent::Button(_)
-                                | UiContent::Switch(_)
-                                | UiContent::Slider(_)
-                                | UiContent::TextField(_)
-                        ) || key.starts_with("settings/compact-")
-                            || key.starts_with("settings/search")
-                        {
-                            continue;
-                        }
-                        let whole = (node.clip.y - node.rect.y).abs() < 0.5
-                            && (node.clip.height - node.rect.height).abs() < 0.5;
-                        let seen = controls.entry(key.to_string()).or_default();
-                        seen.0 |= whole;
-                        seen.1 = seen.1.max(node.rect.height);
-                    }
-                    let state = messages_view_state(&runtime, view);
-                    let place = (list_place(state), compiled.paint.len());
-                    if before == Some(place) {
-                        break;
-                    }
-                    before = Some(place);
-                    runtime
-                        .dispatch(instance, view, AppEvent::ScrollLines(1))
-                        .unwrap();
-                }
-                for (key, (whole, tall)) in controls {
-                    // The chooser's grid rows, a row's height to a line ([`showcase_page`]).
-                    if route == SettingsRoute::Themes
-                        && (key.starts_with("settings/showcase/card/")
-                            || key == "settings/showcase/pack")
-                    {
-                        continue;
-                    }
-                    if tall > height + 0.5 {
-                        if height > 150.0 {
-                            faults.push(format!("{context}: {key} is {tall}pt"));
-                        }
-                    } else if !whole {
-                        faults.push(format!("{context}: {key} ({tall}pt) is never whole"));
-                    }
-                }
-            }
-        }
-        // Where the toolbar's row cuts nothing, the toolbar stays over the page, the window wide.
-        if scale > 1.5 {
-            let cx = view_cx_at(178.0, 348.0);
-            let (runtime, instance, view) = paging_view("", SettingsRoute::Tabs);
-            let compiled = compile_settings_view(&runtime, instance, view, &cx);
-            let toolbar = compiled
-                .semantic(&UiKey::new("settings/compact-toolbar"))
-                .map(|node| node.rect);
-            if toolbar.is_none_or(|rect| rect.x > 0.5 || rect.width < 177.5) {
-                faults.push(format!(
-                    "Tabs 178x348 2x: the toolbar {toolbar:?} is listed"
-                ));
-            }
-        }
-        faults.sort();
-        faults.dedup();
-        assert!(
-            faults.is_empty(),
-            "{} faults:\n{}",
-            faults.len(),
-            faults.join("\n")
-        );
-    });
-}
-
 /// What the screens of a walk drew of one control ([`LeastWalk::controls`]).
 #[derive(Default)]
 struct ControlSeen {
@@ -2707,42 +2715,14 @@ struct LeastWalk {
     screens: usize,
     /// Every node a screen drew in its list, some of it in view.
     drawn: BTreeSet<String>,
+    /// The page's scroll plan as the walk's last screen left it.
+    plan: Option<scroll::ScrollPlan>,
 }
 
-/// Walk `view`'s list by `event` from its top, as [`walk_screens`] does, keeping what each
-/// screen drew in its list ([`LeastWalk`]).
-fn least_window_walk(
-    runtime: &mut NativeRuntime,
-    instance: crate::native_app::AppInstanceId,
-    view: crate::native_app::ViewId,
-    cx: &ViewCx<'_>,
-    event: &AppEvent,
-) -> LeastWalk {
-    let mut walk = LeastWalk::default();
-    // From the list's top, where a page that lands on a row of its own (the theme in use, the
-    // cursor style) has one.
-    let _ = compile_settings_view(runtime, instance, view, cx);
-    runtime
-        .dispatch(instance, view, AppEvent::ScrollLines(-10_000))
-        .unwrap();
-    let mut before: Option<Vec<(String, i64)>> = None;
-    for screen in 0..400 {
-        let compiled = compile_settings_view(runtime, instance, view, cx);
-        let drawn: Vec<(String, i64)> = compiled
-            .paint
-            .iter()
-            .map(|node| {
-                (
-                    node.key.as_str().to_string(),
-                    (node.rect.y * 100.0).round() as i64,
-                )
-            })
-            .collect();
-        if before.as_ref() == Some(&drawn) {
-            break;
-        }
-        before = Some(drawn);
-        walk.screens += 1;
+impl LeastWalk {
+    /// Keep what `screen` drew in its list.
+    fn keep(&mut self, screen: usize, compiled: &crate::native_ui::CompiledUi) {
+        self.screens += 1;
         let lists: Vec<LogicalRect> = compiled
             .paint
             .iter()
@@ -2756,10 +2736,10 @@ fn least_window_walk(
             })
             .map(|node| node.clip)
             .collect();
-        walk.room = lists
+        self.room = lists
             .iter()
             .map(|list| list.height)
-            .fold(walk.room, f32::max);
+            .fold(self.room, f32::max);
         let inside = |node: &crate::native_ui::PaintNode| {
             let middle = node.clip.y + node.clip.height / 2.0;
             lists.iter().any(|list| {
@@ -2777,9 +2757,9 @@ fn least_window_walk(
                     && inside(node)
             })
         {
-            walk.blank.push(screen);
+            self.blank.push(screen);
         }
-        walk.drawn.extend(
+        self.drawn.extend(
             compiled
                 .paint
                 .iter()
@@ -2804,7 +2784,7 @@ fn least_window_walk(
             let whole = node.fade.is_none()
                 && (node.clip.y - node.rect.y).abs() < 0.5
                 && (node.clip.height - node.rect.height).abs() < 0.5;
-            let seen = walk.controls.entry(key.to_string()).or_default();
+            let seen = self.controls.entry(key.to_string()).or_default();
             seen.whole |= whole;
             seen.tall = seen.tall.max(node.rect.height);
             let from = node.clip.y - node.rect.y;
@@ -2825,7 +2805,63 @@ fn least_window_walk(
                 seen.dead.push(screen);
             }
         }
+    }
+}
+
+/// Walk `view`'s list by `event` from its top, as [`walk_screens`] does, keeping what each
+/// screen drew in its list ([`LeastWalk`]) up to the first screen that draws what the one before
+/// it drew, and the scroll plan that screen left. `inspect` sees every screen from the first
+/// (0), with the page's state as that screen's render left it, until it answers that it wants no
+/// more: the walk goes on while either does, so what each keeps comes from exactly the screens
+/// its own walk would have seen.
+fn least_window_walk(
+    runtime: &mut NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    cx: &ViewCx<'_>,
+    event: &AppEvent,
+    inspect: &mut dyn FnMut(usize, &crate::native_ui::CompiledUi, &SettingsViewState) -> bool,
+) -> LeastWalk {
+    let mut walk = LeastWalk::default();
+    // From the list's top, where a page that lands on a row of its own (the theme in use, the
+    // cursor style) has one.
+    let _ = compile_settings_view(runtime, instance, view, cx);
+    runtime
+        .dispatch(instance, view, AppEvent::ScrollLines(-10_000))
+        .unwrap();
+    let mut before: Option<Vec<(String, i64)>> = None;
+    let (mut keeping, mut inspecting) = (true, true);
+    for screen in 0..400 {
+        let compiled = compile_settings_view(runtime, instance, view, cx);
+        if keeping {
+            let drawn: Vec<(String, i64)> = compiled
+                .paint
+                .iter()
+                .map(|node| {
+                    (
+                        node.key.as_str().to_string(),
+                        (node.rect.y * 100.0).round() as i64,
+                    )
+                })
+                .collect();
+            if before.as_ref() == Some(&drawn) {
+                keeping = false;
+                walk.plan = messages_view_state(runtime, view).scroll_plan();
+            } else {
+                before = Some(drawn);
+                walk.keep(screen, &compiled);
+            }
+        }
+        if inspecting {
+            inspecting = inspect(screen, &compiled, messages_view_state(runtime, view));
+        }
+        if !keeping && !inspecting {
+            break;
+        }
         runtime.dispatch(instance, view, event.clone()).unwrap();
+    }
+    if keeping {
+        walk.plan = messages_view_state(runtime, view).scroll_plan();
     }
     walk
 }
@@ -2844,16 +2880,28 @@ fn bands_cover(bands: &[(f32, f32)], height: f32) -> bool {
     reach >= height - 1.0
 }
 
-/// The least windows at each text size, every page in each by the wheel and by Page Down, each
-/// walked from its list's top on a runtime of its own ([`least_window_walk`]): each walk's
-/// faults as `check` tells them, the walks that have any by name. With 178x152 and 164x98 goes
-/// 164x96, the view a headless aterm gives Settings in its least window, where Text & Fonts'
-/// Font family at 2x is a point taller than its list.
-fn least_window_faults(
-    scale: f32,
-    check: impl Fn(&NativeRuntime, crate::native_app::ViewId, &LeastWalk) -> Vec<String> + Sync,
-) -> Vec<String> {
-    let report = std::sync::Mutex::new(Vec::new());
+/// What the least windows' walks at one text size found ([`least_window_faults`]), each law's
+/// faults apart.
+#[derive(Default)]
+struct LeastFaults {
+    /// The walks with a screen that draws nothing, a line each.
+    blank: Vec<String>,
+    /// The walks that do not step through what is taller than their room, a line each.
+    step: Vec<String>,
+    /// The wheel's walks of 178x152 and 164x98: a control never whole, a stop cut, the list's
+    /// top's toolbar misdrawn.
+    toolbar: Vec<String>,
+}
+
+/// The least windows at `scale`, every page in each by the wheel and by Page Down, each walked
+/// from its list's top on a runtime of its own ([`least_window_walk`]), the walks that fault by
+/// name. With 178x152 and 164x98 goes 164x96, the view a headless aterm gives Settings in its
+/// least window, where Text & Fonts' Font family at 2x is a point taller than its list. The
+/// wheel's walks of 178x152 and 164x98 also judge each control against the window and the
+/// toolbar the list's top draws, over the screens up to the first that stands where the one
+/// before it stood.
+fn least_window_faults(scale: f32) -> LeastFaults {
+    let faults = std::sync::Mutex::new(LeastFaults::default());
     let walks = [(178.0_f32, 152.0_f32), (164.0, 98.0), (164.0, 96.0)]
         .into_iter()
         .flat_map(|(width, height)| {
@@ -2874,94 +2922,224 @@ fn least_window_faults(
         } else {
             paging_view("", route)
         };
-        let walk = least_window_walk(&mut runtime, instance, view, &cx, &event);
-        let faults = check(&runtime, view, &walk);
-        if !faults.is_empty() {
-            report
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(format!(
-                    "{route:?} {width}x{height} {scale}x {event:?}: {}",
-                    faults.join("; ")
-                ));
-        }
-    });
-    let mut report = report
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    report.sort();
-    report
-}
-
-/// NO SCREEN OF A LEAST WINDOW DRAWS NOTHING: in a 178x152 window and in the window's least
-/// (164x98), at 1×, 1.5× and 2× text, on every page, by the wheel and by Page Down, every screen
-/// of a list draws words, a control or a picture. Negative control: a row's Reset line kept
-/// empty, listed a part of its own, and a note's lines kept empty, listed a block of their own,
-/// were stops that drew nothing, a screen of empty card bottom (Home's, Harness's and Software
-/// Update's at 2x in 178x152; Text & Fonts' last screen; Terminal's at 164x98).
-#[test]
-fn no_screen_of_a_least_window_draws_nothing() {
-    at_each_text_scale(&[1.0, 1.5, 2.0], "blank screens", |scale| {
-        let report = least_window_faults(scale, |_, _, walk| {
-            (!walk.blank.is_empty())
-                .then(|| format!("screens {:?} of {} draw nothing", walk.blank, walk.screens))
-                .into_iter()
-                .collect()
-        });
-        assert!(
-            report.is_empty(),
-            "{} walks draw a blank screen at {scale}x:\n{}",
-            report.len(),
-            report.join("\n")
-        );
-    });
-}
-
-/// THE LEAST WINDOWS STEP THROUGH WHAT IS TALLER THAN THEIR ROOM: in a 178x152 window and in the
-/// window's least (164x98), at 1×, 1.5× and 2× text, on every page, by the wheel and by Page
-/// Down, no screen of a list draws nothing (a stop that is a row's empty Reset line, a control
-/// cut so it draws not at all), every control the room can hold is whole on some screen, and
-/// one taller than the room is drawn, live, band by band through all of it but a sliver under a
-/// peek at its end (a button's lower edge, which no step shows alone).
-#[test]
-fn the_least_windows_step_through_what_is_taller_than_their_room() {
-    at_each_text_scale(&[1.0, 1.5, 2.0], "least windows", |scale| {
-        let report = least_window_faults(scale, |runtime, view, walk| {
-            let mut faults = Vec::new();
-            if let Some(plan) = messages_view_state(runtime, view).scroll_plan() {
-                let never: Vec<&str> = plan
-                    .controls()
-                    .map(|(_, key)| key.as_str())
-                    .filter(|key| !walk.drawn.contains(*key))
+        let toolbar_walk = !page && [(178.0, 152.0), (164.0, 98.0)].contains(&(width, height));
+        let context = format!("{route:?} {width}x{height} {scale}x");
+        let mut toolbar_faults = Vec::new();
+        // Each control by its key: whether a screen drew it whole, and its height.
+        let mut controls = std::collections::BTreeMap::<String, (bool, f32)>::new();
+        let walk = {
+            let mut before = None;
+            let mut judge = |screen: usize,
+                             compiled: &crate::native_ui::CompiledUi,
+                             state: &SettingsViewState| {
+                let toolbars: Vec<LogicalRect> = compiled
+                    .semantics
+                    .iter()
+                    .filter(|node| node.key.as_str() == "settings/compact-toolbar")
+                    .map(|node| node.rect)
                     .collect();
-                if !never.is_empty() {
-                    faults.push(format!("never drawn: {never:?}"));
+                if screen == 0 && toolbars.len() != 1 {
+                    toolbar_faults.push(format!("{context}: the list's top draws {toolbars:?}"));
                 }
-            }
-            for (key, seen) in &walk.controls {
-                let tall = seen.tall;
-                if tall <= walk.room + 0.5 {
-                    if !seen.whole {
-                        faults.push(format!("{key} ({tall}pt) is never whole"));
-                    }
-                } else if !bands_cover(&seen.bands, tall - crate::native_ui::LIST_PEEK_MIN) {
-                    faults.push(format!(
-                        "{key} ({tall}pt) is never drawn through: {:?}",
-                        seen.bands
+                // Listed, the toolbar spans the window as it does pinned. Negative control:
+                // it stood in the list's column, inset 14pt a side by the page's margins.
+                if screen == 0
+                    && state.page_chrome.get().toolbar_listed
+                    && toolbars
+                        .iter()
+                        .any(|bar| bar.x > 0.5 || bar.right() < width - 0.5)
+                {
+                    toolbar_faults.push(format!(
+                        "{context}: the listed toolbar {toolbars:?} is not the window wide"
                     ));
                 }
-                if !seen.dead.is_empty() {
-                    faults.push(format!("{key} is drawn dead on screens {:?}", seen.dead));
+                // A control no screen draws (a list draws none it would cut): no stop of the
+                // 178x152 window's lists is cut.
+                if screen == 0
+                    && height > 150.0
+                    && route != SettingsRoute::Themes
+                    && let Some(plan) = state.scroll_plan()
+                    && plan.cut_stops() > 0
+                {
+                    toolbar_faults.push(format!("{context}: {} stops are cut", plan.cut_stops()));
+                }
+                for node in &compiled.paint {
+                    let key = node.key.as_str();
+                    if !matches!(
+                        node.content,
+                        UiContent::Button(_)
+                            | UiContent::Switch(_)
+                            | UiContent::Slider(_)
+                            | UiContent::TextField(_)
+                    ) || key.starts_with("settings/compact-")
+                        || key.starts_with("settings/search")
+                    {
+                        continue;
+                    }
+                    let whole = (node.clip.y - node.rect.y).abs() < 0.5
+                        && (node.clip.height - node.rect.height).abs() < 0.5;
+                    let seen = controls.entry(key.to_string()).or_default();
+                    seen.0 |= whole;
+                    seen.1 = seen.1.max(node.rect.height);
+                }
+                let place = (list_place(state), compiled.paint.len());
+                if before == Some(place) {
+                    return false;
+                }
+                before = Some(place);
+                true
+            };
+            let inspect: &mut dyn FnMut(
+                usize,
+                &crate::native_ui::CompiledUi,
+                &SettingsViewState,
+            ) -> bool = if toolbar_walk {
+                &mut judge
+            } else {
+                &mut |_, _, _| false
+            };
+            least_window_walk(&mut runtime, instance, view, &cx, &event, inspect)
+        };
+        if toolbar_walk {
+            for (key, (whole, tall)) in controls {
+                // The chooser's grid rows, a row's height to a line ([`showcase_page`]).
+                if route == SettingsRoute::Themes
+                    && (key.starts_with("settings/showcase/card/")
+                        || key == "settings/showcase/pack")
+                {
+                    continue;
+                }
+                if tall > height + 0.5 {
+                    if height > 150.0 {
+                        toolbar_faults.push(format!("{context}: {key} is {tall}pt"));
+                    }
+                } else if !whole {
+                    toolbar_faults.push(format!("{context}: {key} ({tall}pt) is never whole"));
                 }
             }
-            faults
-        });
-        assert!(
-            report.is_empty(),
-            "{} walks fault at {scale}x:\n{}",
-            report.len(),
-            report.join("\n")
-        );
+        }
+        let blank = (!walk.blank.is_empty())
+            .then(|| format!("screens {:?} of {} draw nothing", walk.blank, walk.screens))
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut step = Vec::new();
+        if let Some(plan) = &walk.plan {
+            let never: Vec<&str> = plan
+                .controls()
+                .map(|(_, key)| key.as_str())
+                .filter(|key| !walk.drawn.contains(*key))
+                .collect();
+            if !never.is_empty() {
+                step.push(format!("never drawn: {never:?}"));
+            }
+        }
+        for (key, seen) in &walk.controls {
+            let tall = seen.tall;
+            if tall <= walk.room + 0.5 {
+                if !seen.whole {
+                    step.push(format!("{key} ({tall}pt) is never whole"));
+                }
+            } else if !bands_cover(&seen.bands, tall - crate::native_ui::LIST_PEEK_MIN) {
+                step.push(format!(
+                    "{key} ({tall}pt) is never drawn through: {:?}",
+                    seen.bands
+                ));
+            }
+            if !seen.dead.is_empty() {
+                step.push(format!("{key} is drawn dead on screens {:?}", seen.dead));
+            }
+        }
+        let walk_line = |faults: Vec<String>| {
+            format!(
+                "{route:?} {width}x{height} {scale}x {event:?}: {}",
+                faults.join("; ")
+            )
+        };
+        let mut found = faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !blank.is_empty() {
+            found.blank.push(walk_line(blank));
+        }
+        if !step.is_empty() {
+            found.step.push(walk_line(step));
+        }
+        found.toolbar.extend(toolbar_faults);
+    });
+    let mut faults = faults
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    faults.blank.sort();
+    faults.step.sort();
+    faults
+}
+
+/// THE LEAST WINDOWS DRAW SOMETHING ON EVERY SCREEN, STEP THROUGH WHAT IS TALLER THAN THEIR ROOM,
+/// AND SCROLL THE TOOLBAR AWAY WHERE ITS ROW CUTS A CONTROL: in a 178x152 window, in the window's
+/// least (164x98) and in 164x96 (the view a headless aterm gives Settings in its least window,
+/// where Text & Fonts' Font family at 2x is a point taller than its list), at 1×, 1.5× and 2×
+/// text, on every page, by the wheel and by Page Down, each walk from its list's top: no screen
+/// of a list draws nothing (a stop that is a row's empty Reset line, a control cut so it draws
+/// not at all), every screen drawing words, a control or a picture; every control the room can
+/// hold is whole on some screen, and one taller than the room is drawn, live, band by band
+/// through all of it but a sliver under a peek at its end (a button's lower edge, which no step
+/// shows alone). By the wheel in 178x152 and 164x98, every control no taller than the window is
+/// whole on some screen; in the 178x152 window none is taller than the window and no stop is
+/// cut, but the Themes chooser's three-line names (168pt at 2×, on its grid), which the list
+/// steps through; and the list's top draws the toolbar once, leading the page's list the window
+/// wide where it does not stand over the page, and over a taller window's page (178x348 at 2×)
+/// where the toolbar's row cuts nothing. Negative controls: a row's Reset line kept empty, listed
+/// a part of its own, and a note's lines kept empty, listed a block of their own, were stops that
+/// drew nothing, a screen of empty card bottom (Home's, Harness's and Software Update's at 2x in
+/// 178x152; Text & Fonts' last screen; Terminal's at 164x98); with the toolbar kept over every
+/// page, Coding Agent Harness (130pt) under the 52pt toolbar of a 178x152 window at 2× was never
+/// whole, its screen drawing nothing; Packages' Check & Update Now and Install ALab Tools Now
+/// stood on four lines (163pt) beside 22pt card sides; an empty Fleet document field set
+/// "ai-fleet.toml beside aterm.toml" on five lines (196pt); and the listed toolbar stood in the
+/// list's column, inset 14pt a side by the page's margins.
+#[test]
+fn the_least_windows_draw_every_screen_step_through_what_is_taller_and_scroll_the_toolbar_away() {
+    at_each_text_scale(&[1.0, 1.5, 2.0], "least windows", |scale| {
+        let LeastFaults {
+            blank,
+            step,
+            mut toolbar,
+        } = least_window_faults(scale);
+        // Where the toolbar's row cuts nothing, the toolbar stays over the page, the window wide.
+        if scale > 1.5 {
+            let cx = view_cx_at(178.0, 348.0);
+            let (runtime, instance, view) = paging_view("", SettingsRoute::Tabs);
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let toolbar_rect = compiled
+                .semantic(&UiKey::new("settings/compact-toolbar"))
+                .map(|node| node.rect);
+            if toolbar_rect.is_none_or(|rect| rect.x > 0.5 || rect.width < 177.5) {
+                toolbar.push(format!(
+                    "Tabs 178x348 2x: the toolbar {toolbar_rect:?} is listed"
+                ));
+            }
+        }
+        toolbar.sort();
+        toolbar.dedup();
+        let mut sections = Vec::new();
+        if !blank.is_empty() {
+            sections.push(format!(
+                "{} walks draw a blank screen at {scale}x:\n{}",
+                blank.len(),
+                blank.join("\n")
+            ));
+        }
+        if !step.is_empty() {
+            sections.push(format!(
+                "{} walks fault at {scale}x:\n{}",
+                step.len(),
+                step.join("\n")
+            ));
+        }
+        if !toolbar.is_empty() {
+            sections.push(format!("{} faults:\n{}", toolbar.len(), toolbar.join("\n")));
+        }
+        assert!(sections.is_empty(), "{}", sections.join("\n\n"));
     });
 }
 
@@ -3480,7 +3658,10 @@ fn a_least_windows_messages_of_days_are_whole() {
             } else {
                 AppEvent::ScrollLines(1)
             };
-            let walk = least_window_walk(&mut runtime, instance, view, &cx, &event);
+            let walk =
+                least_window_walk(&mut runtime, instance, view, &cx, &event, &mut |_, _, _| {
+                    false
+                });
             let never: Vec<String> = log
                 .entries
                 .iter()

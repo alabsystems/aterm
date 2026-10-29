@@ -214,6 +214,7 @@ impl Look {
     #[inline]
     const fn at(&self, row: u16, col: u16) -> Presentation {
         let cfg = MomentumGlowConfig {
+            light: crate::cursor_glow::Light::OFF,
             enabled: true,
             intensity: self.intensity,
             tau_s: self.tau,
@@ -225,6 +226,7 @@ impl Look {
             theme_bg: if self.dark { 0x0010_1016 } else { 0x00FF_FFFF },
             block: self.block,
             glyph_span: Some((0, col as i32)),
+            light_vivid: false,
         };
         Presentation::of(Some((row, col)), &s0_geom(), &cfg)
     }

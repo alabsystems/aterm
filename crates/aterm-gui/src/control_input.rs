@@ -752,6 +752,7 @@ pub(crate) fn input_if_fenced_observed(
         InputEvent::KeySequence(bytes) => bytes.clone(),
         _ => return GuardedInput::Pressed(Delivery::BusyZero),
     };
+    let vim = crate::vim_custody::capture(&terminal, ctx, true);
     let foreground = fence.foreground.map(|_| {
         ctx.timeline
             .lock()
@@ -770,6 +771,19 @@ pub(crate) fn input_if_fenced_observed(
         return GuardedInput::Pressed(Delivery::Full);
     }
     let (outcome, accepted_order) = ctx.sink.try_write_frame_whole_with_receipt(&bytes);
+    if matches!(
+        outcome,
+        aterm_session::sink::ImmediateWrite::Full
+            | aterm_session::sink::ImmediateWrite::Queued { .. }
+    ) && let Some(key) = crate::control::control_vim_key(&ev)
+    {
+        match vim {
+            Some(frame) => {
+                ctx.licence.vim.key(frame, key);
+            }
+            None => ctx.licence.vim.invalidate(),
+        }
+    }
     drop(foreground);
     let delivery = match outcome {
         aterm_session::sink::ImmediateWrite::Full
@@ -1559,7 +1573,7 @@ pub(crate) fn parse_pointer(rest: &str) -> Result<crate::app_mouse::PointerActio
             }
             if row < 0 {
                 return match u16::try_from(row.unsigned_abs()) {
-                    Ok(up) if up <= MAX_CHROME_ROWS => Ok(PointerAction::MoveChrome { up, col }),
+                    Ok(up) => Ok(PointerAction::MoveChrome { up, col }),
                     _ => Err("ERR out of range\n".to_string()),
                 };
             }
@@ -1655,8 +1669,6 @@ fn parse_pointer_wheel<'a>(
 
 const POINTER_MOVE_USAGE: &str =
     "ERR usage: pointer move <r> <c> | move key=<ui-key> | move xy=<x>,<y>\n";
-
-const MAX_CHROME_ROWS: u16 = 16;
 
 /// `pointer [move <r> <c>|click|wheel dy=<n>|leave|status|mods <list>]` -> drive the front window's pointer and report its position or acknowledge dispatch when readback is unavailable.
 pub(crate) fn cmd_pointer(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
@@ -2730,14 +2742,14 @@ mod tests {
             Ok(PointerAction::MoveChrome { up: 1, col: 5 })
         );
         assert_eq!(
-            parse_pointer(&format!("move -{MAX_CHROME_ROWS} 0")),
+            parse_pointer(&format!("move -{} 0", u16::MAX)),
             Ok(PointerAction::MoveChrome {
-                up: MAX_CHROME_ROWS,
+                up: u16::MAX,
                 col: 0
             })
         );
         assert_eq!(
-            parse_pointer(&format!("move -{} 0", MAX_CHROME_ROWS + 1)),
+            parse_pointer(&format!("move -{} 0", u32::from(u16::MAX) + 1)),
             Err("ERR out of range\n".to_string())
         );
         assert_eq!(parse_pointer("click"), Ok(PointerAction::Click));

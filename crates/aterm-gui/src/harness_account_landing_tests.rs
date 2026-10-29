@@ -3,6 +3,52 @@
 
 use super::*;
 
+#[test]
+fn a_profile_changed_during_restart_cannot_publish_a_completed_move() {
+    let a = Accts::new();
+    let sid = "s-landing-identity";
+    let mut roster = accounts::Roster::load(&a.roster_path()).unwrap();
+    roster
+        .rows
+        .iter_mut()
+        .find(|row| row.label == "work-2")
+        .unwrap()
+        .email = Some("expected@example.test".into());
+    std::fs::write(
+        a.roster_path(),
+        accounts::append_rows_for(accounts::Cli::Claude, "", &roster.rows).unwrap(),
+    )
+    .unwrap();
+    let profile = PathBuf::from(a.login_dir("work-2")).join(".claude.json");
+    std::fs::write(
+        &profile,
+        br#"{"oauthAccount":{"emailAddress":"expected@example.test"}}"#,
+    )
+    .unwrap();
+    a.spawn(sid, ACCT_TALK_A, "main");
+    a.wall(ACCT_TALK_A, ACCT_NOW - 10);
+    let mut idle = a.worker(sid, &on());
+    let original = Arc::clone(&idle.hooks.acts.restart);
+    let changed = profile.clone();
+    let wrong = br#"{"oauthAccount":{"emailAddress":"another@example.test"}}"#;
+    idle.hooks.acts.restart = Arc::new(move |sid, grace, why, selected| {
+        let step = original(sid, grace, why, selected);
+        std::fs::write(&changed, wrong).unwrap();
+        step
+    });
+    assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
+    assert_eq!(
+        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        Some("wait:account-unverified")
+    );
+    let kept = idle.kept.lock().unwrap();
+    assert!(kept.account.flying.is_some());
+    assert!(kept.account.moved.is_none());
+    assert_eq!(a.state().sessions[sid].account, "main");
+    assert_eq!(a.ledger(), ["wall", "rotate"]);
+    assert_eq!(std::fs::read(profile).unwrap(), wrong);
+}
+
 pub(super) fn pending(same_login: bool) -> (Arc<Accts>, WorkerIdle) {
     let a = Accts::new();
     let sid = "s-landing-write";
@@ -19,6 +65,84 @@ pub(super) fn pending(same_login: bool) -> (Arc<Accts>, WorkerIdle) {
     a.readable();
     assert!(refresh_snapshot(sid, &idle.kept, &idle.hooks));
     (a, idle)
+}
+
+fn replaced_snapshot_before_writer(same_login: bool) {
+    let (a, idle) = pending(same_login);
+    let before = a.state();
+    let ledger = a.ledger();
+    let (flight, observed) = with_kept_of(&idle.kept, |k| {
+        (k.account.flying.clone(), k.snapshot.clone().unwrap())
+    });
+    let replacement = Arc::new(Mutex::new(None));
+    let captured = Arc::clone(&replacement);
+    let kept = Arc::clone(&idle.kept);
+    let hooks = idle.hooks.clone();
+    let sid = idle.sid.clone();
+    a.at_seat_read(2, move |a| {
+        a.spawn(&sid, ACCT_TALK_B, "main");
+        assert!(refresh_snapshot(&sid, &kept, &hooks));
+        *captured.lock().unwrap() = with_kept_of(&kept, |k| k.snapshot.clone());
+    });
+    let result = account_land(&idle.sid, &idle.kept, &idle.hooks, Landing::Carried);
+    let replacement = replacement.lock().unwrap().clone().unwrap();
+    assert!(!account_process_matches(&observed, &replacement));
+    assert_eq!(result, Applied::Unread, "the observed process was replaced");
+    assert_eq!(a.state(), before, "no stale completion or failure");
+    assert_eq!(a.ledger(), ledger);
+    let kept = idle.kept.lock().unwrap();
+    assert_eq!(kept.account.flying, flight);
+    assert!(kept.account.moved.is_none());
+    assert_eq!(kept.snapshot.as_ref(), Some(&replacement));
+    assert_eq!(a.asked("made:"), 0);
+}
+
+#[test]
+fn a_replaced_process_cannot_complete_an_observed_account_move() {
+    replaced_snapshot_before_writer(false);
+}
+
+#[test]
+fn a_replaced_process_cannot_fail_an_observed_account_move() {
+    replaced_snapshot_before_writer(true);
+}
+
+#[test]
+fn snapshot_enrichment_keeps_an_observed_account_landing_valid() {
+    for same_login in [false, true] {
+        let (a, idle) = pending(same_login);
+        let observed = with_kept_of(&idle.kept, |k| k.snapshot.clone().unwrap());
+        let replacement = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&replacement);
+        let kept = Arc::clone(&idle.kept);
+        let hooks = idle.hooks.clone();
+        let sid = idle.sid.clone();
+        a.at_seat_read(2, move |a| {
+            let mut snap = a.tabs.lock().unwrap().get(&sid).cloned().unwrap();
+            snap.version = Some("enriched".into());
+            snap.cwd = "updated-directory".into();
+            a.tabs.lock().unwrap().insert(sid.clone(), snap);
+            assert!(refresh_snapshot(&sid, &kept, &hooks));
+            *captured.lock().unwrap() = with_kept_of(&kept, |k| k.snapshot.clone());
+        });
+        let result = account_land(&idle.sid, &idle.kept, &idle.hooks, Landing::Carried);
+        let replacement = replacement.lock().unwrap().clone().unwrap();
+        assert_ne!(observed, replacement);
+        assert!(account_process_matches(&observed, &replacement));
+        assert_eq!(
+            result,
+            if same_login {
+                Applied::No
+            } else {
+                Applied::Yes
+            }
+        );
+        let kept = idle.kept.lock().unwrap();
+        assert!(kept.account.flying.is_none());
+        assert_eq!(kept.account.moved.is_some(), !same_login);
+        assert_eq!(kept.snapshot.as_ref(), Some(&replacement));
+        assert_eq!(a.asked("made:"), usize::from(!same_login));
+    }
 }
 
 #[test]

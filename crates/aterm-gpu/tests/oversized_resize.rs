@@ -21,34 +21,39 @@ fn oversized_grid_clamps_offscreen_instead_of_aborting() {
     let mut gpu = common::gpu(40.0, Theme::default());
     let (cw, _ch) = gpu.cell_size();
     assert!(cw >= 1, "cell width must be positive");
-
-    let mut win = WindowGpu::new();
+    let max = gpu.max_texture_dim() as usize;
 
     let rows = 2usize;
-    let cols_a = (50_000usize / cw).clamp(2, 4096);
-    let cols_b = (90_000usize / cw).clamp(2, 4096);
-    let req_a = cols_a * cw; // approx requested framebuffer width (ignoring pad)
-    let req_b = cols_b * cw;
+    let cols_a = (max / cw).saturating_add(1).min(4096);
+    let cols_b = cols_a.saturating_add(256).min(4096);
+    let (req_a, _) = gpu.frame_size(rows, cols_a);
+    let (req_b, _) = gpu.frame_size(rows, cols_b);
+    if req_a <= max || cols_a == cols_b {
+        aterm_spec::host::could_not_run(format!(
+            "device texture limit {max}px at cell_w={cw}px leaves no two distinct oversized \
+             grids under MAX_GRID_COLS=4096 (cols_a={cols_a}, cols_b={cols_b}, req_a={req_a}px)"
+        ));
+    }
 
+    let mut win = WindowGpu::new();
     let w_a = offscreen_width(&mut gpu, &mut win, rows, cols_a);
     let w_b = offscreen_width(&mut gpu, &mut win, rows, cols_b);
 
-    assert!(
-        w_a >= 1 && w_b >= 1,
-        "clamped widths must stay valid (>= 1)"
+    assert_eq!(
+        w_a, max,
+        "oversized grid A (requested {req_a}px) must clamp offscreen width to \
+         max_texture_dimension_2d ({max}px)"
     );
     assert_eq!(
-        w_a, w_b,
-        "two oversized grids (requested {req_a}px vs {req_b}px) must both clamp the offscreen \
-         to the SAME device max_texture_dimension_2d"
+        w_b, max,
+        "oversized grid B (requested {req_b}px) must clamp offscreen width to \
+         max_texture_dimension_2d ({max}px)"
     );
-    if cols_a != cols_b {
-        assert!(
-            w_a < req_a && w_a < req_b,
-            "offscreen width {w_a} must be clamped below the requested framebuffers \
-             ({req_a}px, {req_b}px)"
-        );
-    }
+    assert!(
+        w_a < req_a && req_a < req_b,
+        "distinct oversized grids ({req_a}px < {req_b}px) must both strictly exceed \
+         clamped width {w_a}px"
+    );
     eprintln!(
         "oversized grid clamped offscreen to {w_a}px (requested {req_a}px / {req_b}px, cell_w={cw}) — no abort"
     );

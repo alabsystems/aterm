@@ -271,3 +271,85 @@ fn kept_frames_and_verdicts_publish_what_judging_afresh_does() {
         "control: the guard cut light in {cut} of {scenes} scenes"
     );
 }
+
+/// The fold of every frame's guarded streams ([`guarded_fold`]) on main, captured at the parent
+/// of `docs/design/PRISM-GLASS.md` §15.2 1.9, which noted no light-owned range. At b11eed7965 it
+/// was `0x2f59_80aa_2780_cadd`. The trail/looks10 branch changes these styles' lights and the
+/// guard's cuts; this test, run on that branch's tip before it merged 1.9 (0088eabcf0), folded to
+/// the value below, and so did the merged tree: 1.9 still leaves the guard as its parent had it.
+const GUARDED_FOLD_AT_THE_PARENT: u64 = 0xc907_d12e_9b56_8217;
+
+/// FNV-1a over `words`, from `h`.
+fn fold_words(mut h: u64, words: impl IntoIterator<Item = u64>) -> u64 {
+    for w in words {
+        for b in w.to_le_bytes() {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3);
+        }
+    }
+    h
+}
+
+/// Every quad of a published stream as its words.
+fn quad_words(q: &GlowQuad) -> [u64; 3] {
+    [
+        u64::from(q.row) | u64::from(q.x) << 16 | u64::from(q.y) << 32 | u64::from(q.w) << 48,
+        u64::from(q.h) | u64::from(q.alpha) << 16 | u64::from(q.alpha2) << 24,
+        u64::from(q.color) | u64::from(q.color2) << 32,
+    ]
+}
+
+/// One fold of the guarded streams every frame publishes, over every style the guard reads and
+/// the dark, light and dim grounds, a coloured line beside the typed one: what
+/// `EffectsPipeline::apply` hands the renderer once the letter guard had its word.
+fn guarded_fold(guard: bool) -> u64 {
+    let mut ev = vec![(
+        200,
+        Ev::Out(b"\x1b[2J\x1b[3H\x1b[31mred\x1b[0m \x1b[34mblue\x1b[0m plain\x1b[5H$ ".to_vec()),
+    )];
+    ev.extend(typed("echo hello world", 1_000, 50));
+    let styles = [
+        "rainbow kitty pet",
+        "rainbow kitty",
+        "phaser",
+        "comet",
+        "fire",
+        "laser",
+        "sparkle",
+        "aurora",
+    ];
+    let mut h = 0xCBF2_9CE4_8422_2325_u64;
+    for style in styles {
+        for look in [DARK, LIGHT, DIM] {
+            let mut r = Replay::new(style, look, true);
+            r.fx.set_letter_guard(guard);
+            let (frames, _) = run(&mut r, &ev, 1_500);
+            for f in &frames {
+                h = fold_words(h, f.under.iter().flat_map(quad_words));
+                h = fold_words(h, [u64::MAX]);
+                h = fold_words(h, f.over.iter().flat_map(quad_words));
+                h = fold_words(h, [u64::MAX - 1]);
+                h = fold_words(h, f.halos.iter().flatten().copied());
+                h = fold_words(h, [u64::MAX - 2]);
+            }
+        }
+    }
+    h
+}
+
+/// The guard's output on main is its parent's (§15.2 1.9 "One owner"): with no light-owned range
+/// noted, as on every frame of these grounds, the streams every frame publishes fold to the
+/// constant captured at the parent. The negative control, the guard off, folds otherwise, so the
+/// fold weighed the guard's cuts.
+#[test]
+fn the_guarded_streams_fold_as_at_the_parent() {
+    let fold = guarded_fold(true);
+    assert_eq!(
+        fold, GUARDED_FOLD_AT_THE_PARENT,
+        "the guarded streams fold to {fold:#018x}"
+    );
+    assert_ne!(
+        guarded_fold(false),
+        fold,
+        "control: the streams with the guard off fold alike"
+    );
+}

@@ -40,6 +40,31 @@ fn land_reads_the_defense_table_as_labelled() {
         nudged.len(),
         nudged.join("\n")
     );
+    for report in [
+        "The negative control failed to fail.",
+        "The negative control fails to fail.",
+        "The negative control failed to detect the bug.",
+        "The negative control failed to run.",
+        "The mutant fails to fail.",
+        "The mutation run failed to start.",
+    ] {
+        let defense = format!("Nothing left: on main. {report}");
+        assert!(!clean_defense(Some(&defense)), "{defense:?}");
+        assert!(!land_open_words(Some(&defense)).is_empty(), "{defense:?}");
+    }
+    for report in [
+        "The negative control gave 5 FAIL on exactly the new rows.",
+        "Each of 8 mutants fails at least one test.",
+        "The regression test fails on the old rule and passes on the new one.",
+        "The regression test fails when the fix is reverted.",
+        "The negative control failed to pass.",
+        "The negative control failed to succeed.",
+        "The previously failed negative control is fixed.",
+        "The negative control failed to run and is now fixed.",
+    ] {
+        let defense = format!("Nothing left: on main. {report}");
+        assert!(clean_defense(Some(&defense)), "{defense:?}");
+    }
 }
 
 #[test]

@@ -10,17 +10,21 @@ use crate::host::{HostError, Replace};
 
 /// Check that the staging owner's token file exists and is non-empty before building.
 /// # Errors
-/// Returns a refusal naming the missing token file.
+/// Returns a refusal naming the missing or unusable token file.
 pub fn token_preflight(ctx: &Ctx) -> Result<()> {
-    if std::fs::metadata(&ctx.tokens.staging).is_ok_and(|m| m.len() > 0) {
-        return Ok(());
+    match ctx.usable_token(&ctx.tokens.staging) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(Error::refused(format!(
+            "--upload needs the staging owner's token at {} (every pack is uploaded to {} first, \
+             and a write never goes anonymously) — nothing built",
+            ctx.shown(&ctx.tokens.staging),
+            ctx.accounts.staging
+        ))),
+        Err(why) => Err(Error::refused(format!(
+            "--upload needs the staging owner's token at {}: {why} — nothing built",
+            ctx.shown(&ctx.tokens.staging),
+        ))),
     }
-    Err(Error::refused(format!(
-        "--upload needs the staging owner's token at {} (every pack is uploaded to {} first, \
-         and a write never goes anonymously) — nothing built",
-        ctx.shown(&ctx.tokens.staging),
-        ctx.accounts.staging
-    )))
 }
 
 /// Replace or add release assets on `<staging|public> <repo> <tag>`.

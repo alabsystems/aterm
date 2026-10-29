@@ -37,7 +37,7 @@ use crate::supervise::policy::reset::{
     ResetAsk, ResetEnd, ResetGo, ResetNo, ResetOutcome, ResetWord,
 };
 use crate::supervise::policy::turn_end::{
-    AccountAdvice, AccountBad, AccountPoint, HostTurn, Reach, Restart,
+    AccountAdvice, AccountBad, AccountPoint, AgentResumed, HostTurn, Reach, Restart,
 };
 use crate::supervise::policy::turn_end::{HeldBy, Ready, RosterWord, SignInNext};
 use crate::supervise::run::{
@@ -335,7 +335,8 @@ pub(crate) fn instant_at(origin: Instant, ns: i64) -> Result<Instant, CodecError
     .ok_or(bad("an instant this clock cannot hold"))
 }
 
-/// `wants_at`: the instant the host next wants a point, or none.
+/// `wants_at`: the instant the host next wants a point, or none; `reach_at`: the instant its
+/// next measure of the reach can land, or none.
 impl HostReply for Option<Instant> {
     fn put(&self, origin: Instant) -> Vec<u8> {
         json(&self.map(|at| offset_ns(origin, at)))
@@ -390,6 +391,7 @@ enum AdviceWire {
     Probe { otherwise: Option<Box<AdviceWire>> },
     Move { to: String },
     Wait { until: i64 },
+    Hold { until: i64 },
     Resume { cleared_at: i64 },
 }
 
@@ -403,6 +405,9 @@ impl AdviceWire {
             },
             AccountAdvice::Move { to } => AdviceWire::Move { to: to.clone() },
             AccountAdvice::Wait { until } => AdviceWire::Wait {
+                until: offset_ns(origin, *until),
+            },
+            AccountAdvice::Hold { until } => AdviceWire::Hold {
                 until: offset_ns(origin, *until),
             },
             AccountAdvice::Resume { cleared_at } => AdviceWire::Resume {
@@ -420,6 +425,9 @@ impl AdviceWire {
             },
             AdviceWire::Move { to } => AccountAdvice::Move { to },
             AdviceWire::Wait { until } => AccountAdvice::Wait {
+                until: instant_at(origin, until)?,
+            },
+            AdviceWire::Hold { until } => AccountAdvice::Hold {
                 until: instant_at(origin, until)?,
             },
             AdviceWire::Resume { cleared_at } => AccountAdvice::Resume { cleared_at },
@@ -801,6 +809,41 @@ impl TapeValue for Option<FactsReading> {
             as_of_ms: w.as_of_ms,
             no_progress: w.no_progress.into_iter().map(call_of).collect(),
         }))
+    }
+
+    fn absent() -> Option<Self> {
+        Some(None)
+    }
+}
+
+/// `agent_resumed`'s answer as a tape holds it ([`AgentResumed`]): numbers and a boolean.
+#[derive(Serialize, Deserialize)]
+struct AgentResumedWire {
+    pid: u32,
+    started: Option<i64>,
+    resumed: bool,
+}
+
+/// A DOOR NEWER THAN THE TAPE: a recording build with no `host.agent_resumed` asked nothing there,
+/// so its replay reads `None` ([`TapeValue::absent`]) — where the tape's header says that build
+/// lacked the door, and only there.
+impl TapeValue for Option<AgentResumed> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.map(|r| AgentResumedWire {
+            pid: r.pid,
+            started: r.started,
+            resumed: r.resumed,
+        }))
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        Ok(
+            of_json::<Option<AgentResumedWire>>(bytes)?.map(|w| AgentResumed {
+                pid: w.pid,
+                started: w.started,
+                resumed: w.resumed,
+            }),
+        )
     }
 
     fn absent() -> Option<Self> {

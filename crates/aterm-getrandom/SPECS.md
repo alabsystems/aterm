@@ -93,25 +93,20 @@ tests/fill.rs	getrandom_uninit_writes_every_byte_and_returns_the_same_memory	get
 
 ## 5. Suspicious specs
 
-1. **`os_codes_answer_as_upstream` pins std's unstable text.** It asserts that
-   `format!("{:?}", io.kind())` is `"Uncategorized"` for errno 5 and for `i32::MAX`. `Uncategorized` is
-   std's unstable internal `ErrorKind`. Its Debug text and the errno-to-kind mapping can change
-   between std versions. That pins std, not upstream getrandom. `error-os-format` instead compares
-   the converted error with `io::Error::from_raw_os_error(n)`.
-2. **`os_codes_answer_as_upstream` states a Darwin recording as a Unix fact.** The strerror strings
-   were recorded on aarch64-apple-darwin, and the test asserts them on every `cfg(unix)` target. The
-   module comment says Darwin and glibc share them. On musl and the BSDs, "Interrupted system call"
-   and "Input/output error" can read differently. `error-os-format` keeps the five literal rows as a
-   platform assumption, not a property of the crate.
-3. **`the_named_codes_are_upstreams` tests layout at run time.** `size_of::<Result<(), Error>>() == 4`
-   is a compiler niche-layout fact, not getrandom behaviour. A const assert in `src/error.rs` holds it;
-   it is not a Trust clause.
-4. **The `tests/fill.rs` module doc overstates its bound.** It says a missed position "misses all of
-   them with probability 2^-64". That holds only if all 8 rounds run. The loop correctly stops after
-   round 1 once every byte has been written, so the bound covers only the failure path. The "two
-   fills of 16 bytes or more must differ" check compares later rounds with round 0 only. Neither
-   point is a bug, but both make the check statistical. That is the CSPRNG assumption
-   `os-fill-writes-every-byte` cites, and no proof carries it over.
+1. *(Resolved)* **`os_codes_answer_as_upstream` no longer pins std's unstable `ErrorKind` Debug text.**
+   `Row` dropped its `io_kind` string column (`"Uncategorized"` etc.); `check` compares `io.kind()`
+   against `io::Error::from_raw_os_error(errno).kind()` for OS codes and `io::ErrorKind::Other` for
+   internal/custom codes.
+2. *(Resolved)* **`os_codes_answer_as_upstream` scopes literal `strerror` rows to Darwin and glibc.**
+   On every `cfg(unix)` target it checks the unknown-errno fallback (`2147483647`), `raw_os_error`,
+   `io::Error` conversion, and agreement with the host `io::Error::from_raw_os_error(errno)` text;
+   the five literal Darwin/glibc `strerror` rows (`OS_RECORDED`) are gated on
+   `cfg(any(target_vendor = "apple", all(target_os = "linux", target_env = "gnu")))`.
+3. *(Resolved)* **Layout assertions moved from `the_named_codes_are_upstreams` to `const` assertions
+   in `src/error.rs`** (`size_of::<Error>() == 4` and `size_of::<Result<(), Error>>() == 4`).
+4. *(Resolved)* **The `tests/fill.rs` module doc no longer claims a `2^-64` per-round bound**; it
+   states the `0..=4096` byte-fill test scope directly, while `os-fill-writes-every-byte` carries the
+   CSPRNG assumption.
 
 ## 6. Proof order (easiest high-value first)
 
@@ -120,8 +115,8 @@ carrier), so the order follows the smallest remaining gap set.
 
 1. **`error-code-table`** (gaps 1, 3). A `const fn` over a `NonZeroU32` newtype with u16→u32
    arithmetic, decidable by evaluating 13 constants plus a bound on `n: u16`. It retires
-   `the_named_codes_are_upstreams` once the layout row moves to a const assert. Do the const assert
-   now; it needs no proof.
+   `the_named_codes_are_upstreams` (the layout check already lives as a const assert in
+   `src/error.rs`).
 2. **`error-raw-os-error-partition`** (gaps 1, 3, 5). One u32 binder and a comparison with `IS`. It
    is the lemma both formatting specs stand on.
 3. **`from-io-errno-mapping`** (gaps 1, 3, 4). Needs a `raw_os_error` model of `std::io::Error`, then

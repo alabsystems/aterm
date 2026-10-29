@@ -44,11 +44,11 @@ impl Tokens {
 /// This machine's publishing identity, as files.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdentityPaths {
-    /// The secret PKCS#8 machine key (`~/.aterm/machine.key`).
+    /// The secret PKCS#8 machine key (`~/.aterm/release-ring/machine.key`).
     pub key: PathBuf,
-    /// Its public record (`~/.aterm/machine.toml`): the roster id and pubkey.
+    /// Its public record (`~/.aterm/release-ring/machine.toml`): the roster id and pubkey.
     pub record: PathBuf,
-    /// The machine's installed roster pair (`~/.aterm/roster/aterm-machines.toml`).
+    /// The machine's installed roster pair (`~/.aterm/release-ring/roster/aterm-machines.toml`).
     pub roster: PathBuf,
 }
 
@@ -100,7 +100,7 @@ impl Ctx {
             .ok_or_else(|| Error::cannot_run("the system clock reads before 1970"))?;
         let tokens = Tokens::under(&home);
         let hosts = Hosts {
-            staging: Arc::new(RestHost::new(token_if_present(&tokens.staging))),
+            staging: Arc::new(RestHost::new(Some(tokens.staging))),
             channel: Arc::new(RestHost::new(Some(tokens.channel))),
         };
         Ok(Self::new(
@@ -135,9 +135,9 @@ impl Ctx {
             },
             tokens: Tokens::under(home),
             identity: IdentityPaths {
-                key: home.join(".aterm/machine.key"),
-                record: home.join(".aterm/machine.toml"),
-                roster: home.join(".aterm/roster/aterm-machines.toml"),
+                key: home.join(atpkg_keys::provision::MACHINE_KEY_REL),
+                record: home.join(atpkg_keys::provision::MACHINE_PUB_REL),
+                roster: home.join(atpkg_keys::provision::RELEASE_ROSTER_REL),
             },
             anchor: aterm_update_core::pins::PAPER_MASTER_PUBKEYS
                 .iter()
@@ -175,17 +175,22 @@ impl Ctx {
             Err(_) => path.display().to_string(),
         }
     }
+
+    /// Whether `path` holds a usable GitHub token (`Ok(false)` when absent or whitespace-only).
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason (with `path` redacted through [`Self::shown`]) when `path` cannot be
+    /// read or holds a byte outside visible ASCII.
+    pub(crate) fn usable_token(&self, path: &Path) -> std::result::Result<bool, String> {
+        aterm_update_core::github_rest::Token::from_file(path)
+            .map(|token| token.is_some())
+            .map_err(|why| why.replace(&path.display().to_string(), &self.shown(path)))
+    }
 }
 
 fn non_empty_env(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-}
-
-fn token_if_present(path: &Path) -> Option<PathBuf> {
-    std::fs::metadata(path)
-        .ok()
-        .filter(|m| m.len() > 0)
-        .map(|_| path.to_path_buf())
 }

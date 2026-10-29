@@ -373,6 +373,12 @@ mod tests {
             "forgiven launches are not a loop"
         );
         assert_eq!(s.observe_launch(1235).unwrap(), 1);
+        assert_eq!(s.observe_launch(1235).unwrap(), 2);
+        assert_eq!(
+            s.forgive_launch(1235).unwrap(),
+            1,
+            "an unforgiven died candidate keeps its count"
+        );
         assert_eq!(s.forgive_launch(1235).unwrap(), 0);
         assert_eq!(s.forgive_launch(1235).unwrap(), 0, "floored at zero");
         assert_eq!(s.forgive_launch(9999).unwrap(), 0);
@@ -489,6 +495,78 @@ mod tests {
             !s.unreadable(),
             "a directory at the path is no marker that does not read"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn named_launches_and_forgive_launch_of_match_pid_start_time_and_cap_at_32() {
+        let (s, dir) = sentinel("named-launches");
+        assert!(s.named_launches(42).is_empty());
+        assert_eq!(s.forgive_launch_of(42, 10, None).unwrap(), None);
+
+        s.arm(42).unwrap();
+        let first = LaunchName {
+            pid: 100,
+            started: (10, 20),
+        };
+        let reused_pid = LaunchName {
+            pid: 100,
+            started: (30, 40),
+        };
+        assert_eq!(s.observe_launch_by(42, Some(first)).unwrap(), 1);
+        assert_eq!(s.observe_launch_by(42, Some(reused_pid)).unwrap(), 2);
+        assert_eq!(s.named_launches(42), vec![first, reused_pid]);
+        assert!(s.named_launches(99).is_empty(), "other build sees none");
+        assert_eq!(s.forgive_launch_of(99, 100, None).unwrap(), None);
+        assert_eq!(
+            s.forgive_launch_of(42, 100, Some((99, 99))).unwrap(),
+            None,
+            "wrong start time leaves count and names untouched"
+        );
+        assert_eq!(s.read_state(), Some((42, 2)));
+        assert_eq!(
+            s.forgive_launch_of(42, 100, Some((30, 40))).unwrap(),
+            Some(1),
+            "exact (pid, started) removes the matching entry"
+        );
+        assert_eq!(s.named_launches(42), vec![first]);
+        assert_eq!(
+            s.forgive_launch_of(42, 100, None).unwrap(),
+            Some(0),
+            "started = None matches remaining pid entry"
+        );
+        assert!(s.named_launches(42).is_empty());
+
+        // Malformed name tokens are ignored without corrupting the count or valid names.
+        std::fs::write(&s.path, "42 3 7:1:2 bad 8:9:10:extra 11:12:13").unwrap();
+        assert_eq!(s.read_state(), Some((42, 3)));
+        assert_eq!(
+            s.named_launches(42),
+            vec![
+                LaunchName {
+                    pid: 7,
+                    started: (1, 2),
+                },
+                LaunchName {
+                    pid: 11,
+                    started: (12, 13),
+                },
+            ]
+        );
+
+        // Exceeding MAX_NAMED_LAUNCHES (32) evicts the oldest launch names first.
+        s.arm(42).unwrap();
+        for idx in 0..35u32 {
+            let name = LaunchName {
+                pid: 1000 + idx,
+                started: (i64::from(idx), 0),
+            };
+            assert_eq!(s.observe_launch_by(42, Some(name)).unwrap(), idx + 1);
+        }
+        let kept = s.named_launches(42);
+        assert_eq!(kept.len(), MAX_NAMED_LAUNCHES);
+        assert_eq!(kept.first().map(|n| n.pid), Some(1003));
+        assert_eq!(kept.last().map(|n| n.pid), Some(1034));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

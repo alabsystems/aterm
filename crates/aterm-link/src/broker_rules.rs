@@ -11,7 +11,9 @@
 //! bridge says `link gap from=<a> to=<b> [records=<n>]`, and every session the node serves names
 //! it in `inbox` (`given_up=`) and marks it in its log (`mail-gap`). Read mail the cut took before
 //! its session handled it is told to that session when the bridge's own read of its lane meets the
-//! floor (its refill from `seen`, its deadline sweep): `link gap … sid=<sid>`.
+//! floor (its refill from `seen`, its deadline sweep): `link gap … sid=<sid>`. `aterm fabric`
+//! lists both under WARNINGS (the node's once per instance, from the count its `fabric status`
+//! keeps, `mail_gaps=`), and its `doctor` fix names these rules' bounds.
 
 use std::io;
 use std::time::Duration;

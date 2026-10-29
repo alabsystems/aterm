@@ -1,0 +1,10 @@
+# claude-code 2.1.312 · MEASURED 2026-10-27, `aterm ctl text` of aterm's jailed real-Claude lab (100x50, aterm 0.145.0 dev build e725d40263, Autopilot Cruise) running the real Claude Code 2.1.312 against a stub API: control: a plain launch with no notices at all; no cachedGrowthBookFeatures, no companyAnnouncements, no DISABLE_PROMPT_CACHING; the lab's settings.json alone
+ ▐▛███▛█   Claude Code v2.1.312
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.AyU2/proj
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                           ◐ medium · /effort

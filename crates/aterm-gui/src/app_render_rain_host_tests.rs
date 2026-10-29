@@ -93,56 +93,7 @@ fn translate_rain_into_pane_drops_u16_overflow() {
     assert!(quads.is_empty(), "overflowing quad drops whole");
 }
 
-fn shell_execute_edge_model() -> aterm_spec::derive::Model {
-    use aterm_spec::ty_model;
-    ty_model! {
-        ShellExecuteEdge {
-            const Buggy = 0;
-            var observed = 0;
-            var session = 0;
-            var executing = 0;
-            var pulse = 0;
-            var valid_edge = 0;
-            action ObserveIdle0 {
-                valid_edge = 0;
-                pulse = 0;
-                observed = 1;
-                session = 0;
-                executing = 0;
-            }
-            action ObserveExec0 {
-                valid_edge = if observed == 1 && session == 0 && executing == 0 { 1 } else { 0 };
-                pulse = if Buggy == 1 { 1 } else { if observed == 1 && session == 0 && executing == 0 { 1 } else { 0 } };
-                observed = 1;
-                session = 0;
-                executing = 1;
-            }
-            action ObserveIdle1 {
-                valid_edge = 0;
-                pulse = 0;
-                observed = 1;
-                session = 1;
-                executing = 0;
-            }
-            action ObserveExec1 {
-                valid_edge = if observed == 1 && session == 1 && executing == 0 { 1 } else { 0 };
-                pulse = if Buggy == 1 { 1 } else { if observed == 1 && session == 1 && executing == 0 { 1 } else { 0 } };
-                observed = 1;
-                session = 1;
-                executing = 1;
-            }
-            action Reset {
-                observed = 0;
-                session = 0;
-                executing = 0;
-                pulse = 0;
-                valid_edge = 0;
-            }
-            invariant BooleanBounds: observed <= 1 && session <= 1 && executing <= 1 && pulse <= 1 && valid_edge <= 1;
-            invariant PulseExactlyMatchesEdge: pulse == valid_edge;
-        }
-    }
-}
+use aterm_models_gui::shell_execute_edge_model;
 
 #[test]
 fn shell_execute_edge_model_proves_and_catches_level_refresh() {

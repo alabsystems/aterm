@@ -351,14 +351,6 @@ fn set_nonblocking_true_is_unsupported() {
     });
 }
 
-#[test]
-fn resolve_spawn_locale_is_an_empty_stub() {
-    run_with_deadline("resolve_spawn_locale_is_an_empty_stub", || {
-        assert!(aterm_pty::resolve_spawn_locale(Some("C"), None, Some("C")).is_empty());
-        assert!(aterm_pty::resolve_spawn_locale(None, None, None).is_empty());
-    });
-}
-
 /// Tiny test-local FFI to read a foreign process's priority class back from
 /// the KERNEL (the crate's ffi module is private by design; the smoke suite
 /// verifies through the public OS surface, in the crate's tiny-FFI house

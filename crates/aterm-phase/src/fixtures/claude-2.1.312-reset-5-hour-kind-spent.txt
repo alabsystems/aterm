@@ -1,0 +1,19 @@
+# claude-code 2.1.312 · COMPOSED 2026-10-28, never captured: the texts are the bundle's (byte offsets into the store's 2.1.312 binary, sha256 6b5ec691…: the five-hour wall `You've hit your ${e}${n}${d}` @225067709 with `Wce.five_hour` = `5-hour limit` @225060028; the spent line `{done} \xB7 your weekly reset day stays {week} \xB7 {kindResets} left` @228879389 with the 5-hour kind's `{done}` `$t()` @251662812, `5-hour limit reset`, and its count's noun `"five-hour reset"` @251662486), the frame is claude-2.1.294-session-limit-then-local-commands.txt's (measured 144x50; its wall row with `5-hour limit` for `session limit`, the armed auto-continue rows left out), the values are invented · OPEN: replace with a capture · a five-hour wall, then a 5-hour reset spent in /rate-limit-options: the kind's spent line, the last thing said, is no wall
+ ▐▛███▛█   Claude Code v2.1.312
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ a turn at the 5-hour limit
+  ⎿  You've hit your 5-hour limit · resets 5:11pm (America/Los_Angeles)
+
+✻ Cogitated for 0s · done 3:11 PM
+
+❯ /rate-limit-options
+  ⎿  5-hour limit reset · your weekly reset day stays Oct 9 at 5am · 1 five-hour reset left
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                                                 0 tokens
+                                                                                                                            ◐ medium · /effort

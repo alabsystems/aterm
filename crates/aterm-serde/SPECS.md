@@ -180,7 +180,7 @@ tests/de.rs	test_unit	de-std-shape
 tests/de.rs	test_unit_struct	derive-struct-de	
 tests/de.rs	test_generic_unit_struct	derive-struct-de	(runtime duplicate of test_unit_struct, §4)
 tests/de.rs	test_newtype_struct	derive-struct-de	
-tests/de.rs	test_tuple_struct	derive-struct-de	(3rd and 4th cases identical, §5.2)
+tests/de.rs	test_tuple_struct	derive-struct-de	
 tests/de.rs	test_vec	de-std-shape	
 tests/de.rs	test_array	de-std-shape	
 tests/de.rs	test_tuple	de-std-shape	
@@ -201,7 +201,7 @@ tests/de.rs	test_enum_map	derive-enum-external
 tests/de.rs	test_enum_unit_usize	derive-enum-external	
 tests/de.rs	test_enum_unit_bytes	derive-enum-external	
 tests/de.rs	test_box	de-std-shape	
-tests/de.rs	test_boxed_slice	de-std-shape	(mislabelled: samples Box<[i32;3]>, §5.1)
+tests/de.rs	test_boxed_array	de-std-shape	
 tests/de.rs	test_path_buf	de-std-shape	
 tests/de.rs	test_ignored_any	ignored-any-skips-one-value	
 tests/de_error.rs	test_i8	de-int-convert	
@@ -252,6 +252,7 @@ tests/derive_input.rs	discriminants_and_deprecated_variants	derive-input-parse	d
 tests/derive_input.rs	shifts_and_comparisons_in_a_discriminant_end_at_its_comma	derive-input-parse	derive-enum-external
 tests/derive_input.rs	a_packed_struct_is_read_by_copy	derive-input-parse	
 tests/derive_input.rs	lifetime_parameters_with_bounds	derive-input-parse	
+tests/derive_input.rs	self_inside_a_type_macro_remains_the_macros_input	derive-input-parse	
 tests/enum_internally_tagged.rs	unit	derive-enum-internal	
 tests/enum_internally_tagged.rs	newtype_unit	derive-enum-internal	
 tests/enum_internally_tagged.rs	newtype_unit_struct	derive-enum-internal	
@@ -304,7 +305,7 @@ tests/ser.rs	test_tuple_struct	derive-struct-ser
 tests/ser.rs	test_struct	derive-struct-ser	
 tests/ser.rs	test_enum	derive-enum-external	
 tests/ser.rs	test_box	ser-std-shape	
-tests/ser.rs	test_boxed_slice	ser-std-shape	(mislabelled: the array encoding, §5.1)
+tests/ser.rs	test_boxed_array	ser-std-shape	
 tests/ser.rs	test_path_buf	ser-std-shape	
 tests/ser.rs	test_cannot_serialize_paths	ser-std-shape	
 tests/ser.rs	test_integer128	ser-128-default-unsupported	
@@ -312,26 +313,25 @@ tests/text_keys.rs	a_buffered_text_key_reads_back_as_what_it_spells	buffered-tex
 tests/text_keys.rs	a_buffered_text_key_reads_back_only_from_its_one_spelling	buffered-text-key	de-int-convert, de-error-messages
 tests/untrusted.rs	a_second_tag_key_is_a_duplicate_field	derive-enum-internal	
 tests/untrusted.rs	a_huge_seq_hint_preallocates_at_most_the_cap	size-hint-cautious	
-tests/untrusted.rs	a_huge_map_hint_does_not_size_the_table	size-hint-cautious	(never checks capacity, §5.3)
-tests/untrusted.rs	a_huge_hint_into_the_untagged_buffer_preallocates_at_most_the_cap	size-hint-cautious	(never checks capacity, §5.3)
+tests/untrusted.rs	a_huge_map_hint_does_not_size_the_table	size-hint-cautious	
+tests/untrusted.rs	a_huge_hint_into_the_untagged_buffer_preallocates_at_most_the_cap	size-hint-cautious	
 tests/value.rs	test_u32_to_enum	derive-enum-external	
 tests/value.rs	test_map_access_to_enum	derive-enum-external	
 ```
 
 ## 3. Coverage
 
-- 190 tests mapped: 176 in the first recovery pass, the 12 in `derive_input.rs` read at merge, and
-  the 2 in `text_keys.rs`. All 190 map to one of the 22 specs, and none is a non-spec sample.
+- All 191 tests mapped to one of the 22 specs, and none is a non-spec sample.
 - The biggest collapses: `derive-struct-de` (23 primary), `de-int-convert` (22),
   `flatten-de-partition` (18), `ser-std-shape` (17), `derive-enum-internal` (17),
   `de-std-shape` (14), `derive-enum-external` (14), `de-std-invalid-type` (13),
-  `content-buffer-transparent` (13), `derive-input-parse` (12).
+  `content-buffer-transparent` (13), `derive-input-parse` (13).
 - `de-in-place-agrees` and `flat-map-take-entry` have no primary test. They are lemmas that every
   `de` test (respectively the two flatten alias/map_twice tests) samples. `flatten-ser-inline` has a
   single primary, but 16 other tests sample it.
 - 9 of the 22 specs are about code that `aterm-serde-derive` generates, which puts them behind
-  gap 9 (the proc-macro boundary) and gap 12 (citing a theorem across crates). Their primary tests number 96 of
-  the 190. Gap 9 is the single change that unblocks the most tests in this crate.
+  gap 9 (the proc-macro boundary) and gap 12 (citing a theorem across crates). Their primary tests number 97 of
+  the 191. Gap 9 is the single change that unblocks the most tests in this crate.
 
 ## 4. Tests that are not spec samples
 
@@ -340,8 +340,8 @@ None. Every test checks production code (`src/` or the derive) at sample points 
 | test | why it still needs a change | action |
 |---|---|---|
 | `tests/support/*` (harness, not tests) | Test-only code: a recording `Serializer` and a replaying `Deserializer`. | **delete with the last test that uses it**. No spec is stated about it. |
-| `ignored_any::test_deserialize_enum` (first half) | Its first half checks the file's own hand-written `Enum` Deserializer/EnumAccess, which is test-only scaffolding. | **drop the first half now**; keep the derived `Target` dispatch and `IgnoredAny::visit_enum` half until its specs are Certified. |
-| `de::test_boxed_slice`, `ser::test_boxed_slice` | Mislabelled duplicates of `test_box` + `test_array` (§5.1). | **delete as duplicates when `de-std-shape`/`ser-std-shape` are Certified**, or rename to `test_boxed_array` now. |
+| `ignored_any::test_deserialize_enum` | Exercises `Target` dispatch and `IgnoredAny::visit_enum` over a custom `EnumAccess`. | **delete when `derive-enum-external` and `ignored-any-skips-one-value` are Certified**. |
+| `de::test_boxed_array`, `ser::test_boxed_array` | Samples `Box<[i32; 3]>` (`Box<T>` + `[T; N]`). | **delete when `de-std-shape`/`ser-std-shape` are Certified**. |
 | `de::test_generic_unit_struct` | At runtime it duplicates `test_unit_struct`. The const-generic compile check is already asserted by building `serde_suite`. | **delete with `derive-struct-de`**. |
 
 Non-spec count by action: 0 to delete now, 0 to become a spec. The rows above are trims to spec
@@ -349,20 +349,15 @@ samples, not non-spec tests.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **`test_boxed_slice` tests no boxed slice.** `Box::new([0, 1, 2])` is `Box<[i32; 3]>`.
-   aterm-serde has no `Deserialize` for `Box<[T]>`, and `ser::test_boxed_slice` expects
-   `Tuple{len:3}`, the array encoding. A real `Box<[T]>` would serialize as `Seq`. Both tests only
-   re-sample `Box<T>` and `[T;N]`. The specs state the real encodings. If `Box<[T]>` should be
-   supported, that is a missing impl, not a spec.
-2. **`de::test_tuple_struct` repeats a case.** Its 3rd and 4th `test(...)` calls are byte-for-byte
-   identical (`TupleStruct{name,len:3} … TupleStructEnd`). One is a dead duplicate. Upstream probably
-   meant another carrier, such as `Tuple{len}`, which `derive-struct-de` says is accepted.
-3. **Two `untrusted.rs` names claim a check the test never makes.**
-   `a_huge_map_hint_does_not_size_the_table` asserts only content and length. It never inspects the
-   HashMap's capacity, so it catches only a capacity-overflow panic.
-   `a_huge_hint_into_the_untagged_buffer_preallocates_at_most_the_cap` likewise never inspects the
-   Content Vec's capacity (`private/de.rs:343`). `size-hint-cautious` states the real property, as a
-   bound on the argument to `with_capacity`. That is the only form of it a test cannot observe.
+1. **`test_boxed_slice` renamed to `test_boxed_array` (resolved 2026-10-27).** `Box::new([0, 1, 2])`
+   is `Box<[i32; 3]>`, and both `de.rs` and `ser.rs` now name it `test_boxed_array`.
+2. **`de::test_tuple_struct` duplicate replaced with `Tuple` carrier (resolved 2026-10-27).** Its
+   repeated `TupleStruct` call now exercises `Token::Tuple { len: 3 } … Token::TupleEnd` as stated
+   by `derive-struct-de`.
+3. **`untrusted.rs` capacity assertions added (resolved 2026-10-27).**
+   `a_huge_map_hint_does_not_size_the_table` now bounds `m.capacity()`, and
+   `a_huge_hint_into_the_untagged_buffer_preallocates_at_most_the_cap` bounds the decoded `Vec`'s
+   capacity; `size-hint-cautious` also covers the intermediate `Content` Vec's `with_capacity` call.
 4. **Untagged round trip is conditional.** `enum_untagged::newtype_unit_and_empty_map` depends on
    `Message::Unit(Unit)` rejecting an empty map so that the `Map` variant wins, and never asserts
    the reverse. `derive-enum-untagged` states the first-match side condition explicitly. An

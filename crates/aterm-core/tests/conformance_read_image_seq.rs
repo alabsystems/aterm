@@ -26,14 +26,14 @@ fn host_bumped_seq_is_the_run_ahead_stamp_the_engine_stamp_never_is() {
     let (rows, cols) = (6usize, 24usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"hello");
-    let mut snap = term.cell_frame(rows, cols);
+    let snap = term.cell_frame(rows, cols);
     let live = term.damage_epoch();
     assert_eq!(snap.snapshot_seq, live, "the engine stamps the live epoch");
     assert_eq!(snap.engine_fill_seq, snap.snapshot_seq);
 
-    snap.snapshot_seq = snap.snapshot_seq.wrapping_add(1);
+    let bumped_seq = snap.snapshot_seq.wrapping_add(1);
     assert!(
-        !m.check_invariant("SeqIsStaleOrCurrent", &seq_state(live, snap.snapshot_seq)),
+        !m.check_invariant("SeqIsStaleOrCurrent", &seq_state(live, bumped_seq)),
         "the host-bumped seq, read as the engine's stamp, IS the Buggy=1 capture"
     );
     assert!(m.check_invariant(
@@ -44,10 +44,9 @@ fn host_bumped_seq_is_the_run_ahead_stamp_the_engine_stamp_never_is() {
     term.take_damage();
     term.process(b"\r\nnewer output");
     let live_after = term.damage_epoch();
-    assert_eq!(live_after, snap.snapshot_seq, "the two clocks collide");
-    assert!(
-        live_after <= snap.snapshot_seq,
-        "read as the engine's stamp, the bumped seq passes a stale frame as current"
+    assert_eq!(
+        live_after, bumped_seq,
+        "read as the engine's stamp, the bumped seq collides with the newer epoch and passes a stale frame as current"
     );
     assert!(
         live_after > snap.engine_fill_seq,

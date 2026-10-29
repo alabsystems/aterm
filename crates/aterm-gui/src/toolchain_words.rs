@@ -175,8 +175,15 @@ pub(crate) fn fmt_bytes(n: u64) -> String {
 
 /// `done / total` bytes as a meter's stats, `done` right-aligned to the total's width, so the stats keep one width for the whole transfer.
 pub(crate) fn byte_stats(done: u64, total: u64) -> String {
+    let min_done_width = if total >= 99_500 {
+        6
+    } else if total >= 1_000 {
+        5
+    } else {
+        0
+    };
     let (done, total) = (fmt_bytes(done.min(total)), fmt_bytes(total));
-    let width = total.chars().count();
+    let width = total.chars().count().max(min_done_width);
     format!("{done:>width$} / {total}")
 }
 
@@ -2398,9 +2405,22 @@ mod tests {
 
     #[test]
     fn byte_stats_keep_one_width_for_the_life_of_a_transfer() {
-        for total in [200_000_000u64, 1_200_000_000, 74_000_000] {
+        for total in [
+            500u64,
+            1_000,
+            50_000,
+            99_500,
+            999_500,
+            74_000_000,
+            200_000_000,
+            1_200_000_000,
+        ] {
             let width = byte_stats(total, total).chars().count();
-            for done in (1_000_000..=total).step_by(997_000) {
+            for done in [0u64, 999, 1_000, 99_499, 99_500, 999_000, 999_499, 999_500]
+                .into_iter()
+                .filter(|&d| d <= total)
+                .chain((0..=total).step_by((total / 80).max(1) as usize))
+            {
                 assert_eq!(
                     byte_stats(done, total).chars().count(),
                     width,

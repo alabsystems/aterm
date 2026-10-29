@@ -870,6 +870,19 @@ mod tests {
 
     #[test]
     fn parse_path_roundtrips_the_asset_grammar() {
+        let render = |cmds: &[PathCmd]| -> String {
+            cmds.iter()
+                .map(|cmd| match *cmd {
+                    PathCmd::Move(x, y) => format!("M {x} {y}"),
+                    PathCmd::Line(x, y) => format!("L {x} {y}"),
+                    PathCmd::Cubic(x1, y1, x2, y2, x, y) => {
+                        format!("C {x1} {y1} {x2} {y2} {x} {y}")
+                    }
+                    PathCmd::Close => "Z".to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         let cmds = parse_path("M 0.1 0.2 C 0.3 0.4 0.5 0.6 0.7 0.8 L 0.9 1.0 Z").unwrap();
         assert_eq!(
             cmds,
@@ -880,6 +893,7 @@ mod tests {
                 PathCmd::Close,
             ]
         );
+        assert_eq!(parse_path(&render(&cmds)).as_ref(), Some(&cmds));
         let imp = parse_path("M0 0 1 0 C1 0 1 1 0 1 0 1 0 0 0 0Z").unwrap();
         assert_eq!(
             imp,
@@ -891,9 +905,15 @@ mod tests {
                 PathCmd::Close,
             ]
         );
+        assert_eq!(parse_path(&render(&imp)).as_ref(), Some(&imp));
+        let signed = vec![PathCmd::Move(-0.0, -12.375), PathCmd::Line(1e-6, 4096.0)];
+        assert_eq!(parse_path(&render(&signed)).as_ref(), Some(&signed));
         assert!(parse_path("M 0.1").is_none(), "dangling args");
         assert!(parse_path("Q 1 2 3 4").is_none(), "unsupported command");
-        assert!(parse_path("M x y").is_none(), "non-numeric");
+        assert!(parse_path("M x y").is_none(), "bare command before letter");
+        assert!(parse_path("M 1.2.3 4").is_none(), "malformed decimal");
+        assert!(parse_path("M 1e 2").is_none(), "malformed exponent");
+        assert!(parse_path("Z 1 2").is_none(), "numbers after close");
         assert!(parse_path("1 2 3").is_none(), "numbers before a command");
         assert_eq!(parse_path("").unwrap(), vec![]);
     }

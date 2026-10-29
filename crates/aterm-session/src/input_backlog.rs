@@ -42,32 +42,11 @@ impl Contention {
         Self { per_cpu_milli }
     }
 
-    /// Construct [`Contention`] directly from `per_cpu_milli` (`load / cpus * 1000`).
-    #[must_use]
-    #[inline]
-    pub const fn from_per_cpu_milli(per_cpu_milli: u32) -> Self {
-        Self { per_cpu_milli }
-    }
-
     /// Runnable threads per CPU, times 1000 (for a status or a log line).
     #[must_use]
     #[inline]
     pub const fn per_cpu_milli(self) -> u32 {
         self.per_cpu_milli
-    }
-
-    /// Whether runnable load exceeds 1.0 thread per CPU (`per_cpu_milli > 1000`).
-    #[must_use]
-    #[inline]
-    pub const fn is_oversubscribed(self) -> bool {
-        self.per_cpu_milli > 1000
-    }
-
-    /// Whether runnable load reaches or exceeds [`Self::MAX_STRETCH`].
-    #[must_use]
-    #[inline]
-    pub const fn is_at_max_stretch(self) -> bool {
-        self.per_cpu_milli >= Self::MAX_STRETCH.saturating_mul(1000)
     }
 
     /// The stretch factor, times 1000: `min(max(1, load/cpu), MAX_STRETCH)`.
@@ -91,18 +70,6 @@ impl Contention {
         base.saturating_mul(self.factor_milli()) / 1000
     }
 
-    /// Stretch a millisecond threshold by [`Self::factor_milli`], saturating on overflow.
-    #[must_use]
-    #[inline]
-    pub const fn stretch_millis(self, base_ms: u64) -> u64 {
-        let scaled = (base_ms as u128).saturating_mul(self.factor_milli() as u128) / 1000;
-        if scaled > (u64::MAX as u128) {
-            u64::MAX
-        } else {
-            scaled as u64
-        }
-    }
-
     /// The CPU time one runnable thread can expect across `wall_ns` of wall time, in nanoseconds.
     #[must_use]
     #[inline]
@@ -116,67 +83,6 @@ impl Contention {
             share as u64
         }
     }
-}
-
-/// Oldest unread byte offset in a FIFO queue where `accepted` bytes have been written.
-#[must_use]
-#[inline]
-pub const fn oldest_unread_offset(accepted: u64, unread: u64) -> u64 {
-    accepted.saturating_sub(unread)
-}
-
-/// Return `true` iff `unread <= accepted` (no external writer injected unrecorded bytes).
-#[must_use]
-#[inline]
-pub const fn unread_within_accepted(accepted: u64, unread: u64) -> bool {
-    unread <= accepted
-}
-
-/// Encode `(accepted, unread)` input-backlog watermarks into 16 little-endian bytes.
-#[must_use]
-#[inline]
-pub const fn encode_backlog_watermarks_le(accepted: u64, unread: u64) -> [u8; 16] {
-    [
-        (accepted & 0xFF) as u8,
-        ((accepted >> 8) & 0xFF) as u8,
-        ((accepted >> 16) & 0xFF) as u8,
-        ((accepted >> 24) & 0xFF) as u8,
-        ((accepted >> 32) & 0xFF) as u8,
-        ((accepted >> 40) & 0xFF) as u8,
-        ((accepted >> 48) & 0xFF) as u8,
-        ((accepted >> 56) & 0xFF) as u8,
-        (unread & 0xFF) as u8,
-        ((unread >> 8) & 0xFF) as u8,
-        ((unread >> 16) & 0xFF) as u8,
-        ((unread >> 24) & 0xFF) as u8,
-        ((unread >> 32) & 0xFF) as u8,
-        ((unread >> 40) & 0xFF) as u8,
-        ((unread >> 48) & 0xFF) as u8,
-        ((unread >> 56) & 0xFF) as u8,
-    ]
-}
-
-/// Decode 16 little-endian bytes into `(accepted, unread)` input-backlog watermarks.
-#[must_use]
-#[inline]
-pub const fn decode_backlog_watermarks_le(bytes: [u8; 16]) -> (u64, u64) {
-    let accepted = (bytes[0] as u64)
-        | ((bytes[1] as u64) << 8)
-        | ((bytes[2] as u64) << 16)
-        | ((bytes[3] as u64) << 24)
-        | ((bytes[4] as u64) << 32)
-        | ((bytes[5] as u64) << 40)
-        | ((bytes[6] as u64) << 48)
-        | ((bytes[7] as u64) << 56);
-    let unread = (bytes[8] as u64)
-        | ((bytes[9] as u64) << 8)
-        | ((bytes[10] as u64) << 16)
-        | ((bytes[11] as u64) << 24)
-        | ((bytes[12] as u64) << 32)
-        | ((bytes[13] as u64) << 40)
-        | ((bytes[14] as u64) << 48)
-        | ((bytes[15] as u64) << 56);
-    (accepted, unread)
 }
 
 /// What was seen of the program while its input waited.
@@ -872,10 +778,6 @@ mod tests {
             program_check: false,
             contention: Contention::default(),
         };
-        assert_eq!(
-            classify(Some(&at(12)), false, seen(false, false)),
-            W::Pending
-        );
         assert_eq!(
             classify(Some(&at(12)), false, seen(false, false)),
             W::Pending

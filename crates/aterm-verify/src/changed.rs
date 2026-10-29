@@ -325,7 +325,9 @@ fn parent_dir(path: &str) -> &str {
     }
 }
 
-/// Nearest ancestor workspace member owning repo-relative `path`.
+/// Nearest ancestor workspace member owning repo-relative `path`. The spec table at a
+/// manifest's own root (`<dir>/SPECS.md`) is owned by none, as `docs/*.md` is: no build,
+/// include or test reads it.
 #[must_use]
 pub fn owning_member<'a>(
     path: &str,
@@ -333,6 +335,9 @@ pub fn owning_member<'a>(
     members: &BTreeSet<String>,
 ) -> Option<&'a str> {
     let dir = owning_dir(path, manifests)?;
+    if path.strip_prefix(dir) == Some("/SPECS.md") {
+        return None;
+    }
     manifests.package_at(dir)?.filter(|n| members.contains(*n))
 }
 
@@ -1424,6 +1429,9 @@ checksum = "aaa"
                 Some("aterm-scrollback"),
             ),
             ("crates/aterm-render/src/lib.rs", Some("aterm-render")),
+            ("crates/aterm-render/SPECS.md", None),
+            ("crates/aterm-render/README.md", Some("aterm-render")),
+            ("crates/aterm-render/src/SPECS.md", Some("aterm-render")),
             (
                 "crates/aterm-render/tests/font_oracle/recorder/src/main.rs",
                 None,

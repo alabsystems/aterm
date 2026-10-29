@@ -34,25 +34,44 @@ pub(crate) struct Completion {
 
 /// UI-thread half of the Manual host-diagnostics lane.
 pub(crate) struct HostDiagnosticsLane {
-    request_tx: SyncSender<Request>,
+    request_tx: Option<SyncSender<Request>>,
+    proxy: Option<EventLoopProxy<Wake>>,
     pending: Option<Request>,
 }
 
 impl HostDiagnosticsLane {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "callers keep the fallible startup signature while the worker spawns on first demand"
+    )]
     pub(crate) fn spawn(proxy: EventLoopProxy<Wake>) -> Result<Self, String> {
-        let (request_tx, request_rx) = sync_channel(REQUEST_CAPACITY);
-        crate::qos::spawn_lane_thread(
-            "aterm-config-diagnostics",
-            crate::qos::Role::Background,
-            move || {
-                worker_loop(request_rx, proxy);
-            },
-        )
-        .map_err(|error| format!("could not start Manual diagnostics worker: {error}"))?;
         Ok(Self {
-            request_tx,
+            request_tx: None,
+            proxy: Some(proxy),
             pending: None,
         })
+    }
+
+    fn ensure_worker(&mut self) -> Option<&SyncSender<Request>> {
+        if self.request_tx.is_none() {
+            let proxy = self.proxy.take()?;
+            let (request_tx, request_rx) = sync_channel(REQUEST_CAPACITY);
+            match crate::qos::spawn_lane_thread(
+                "aterm-config-diagnostics",
+                crate::qos::Role::Background,
+                move || {
+                    worker_loop(request_rx, proxy);
+                },
+            ) {
+                Ok(_) => self.request_tx = Some(request_tx),
+                Err(error) => {
+                    crate::logging::stderr_line!(
+                        "aterm-gui: could not start Manual diagnostics worker: {error}"
+                    );
+                }
+            }
+        }
+        self.request_tx.as_ref()
     }
 
     /// Queue the exact immutable source revision. Oversized files already have
@@ -91,7 +110,10 @@ impl HostDiagnosticsLane {
         let Some(request) = self.pending.take() else {
             return;
         };
-        match self.request_tx.try_send(request) {
+        let Some(request_tx) = self.ensure_worker() else {
+            return;
+        };
+        match request_tx.try_send(request) {
             Ok(()) => {}
             Err(TrySendError::Full(request)) => self.pending = Some(request),
             Err(TrySendError::Disconnected(_)) => {
@@ -105,7 +127,8 @@ impl HostDiagnosticsLane {
         let (request_tx, request_rx) = sync_channel(REQUEST_CAPACITY);
         (
             Self {
-                request_tx,
+                request_tx: Some(request_tx),
+                proxy: None,
                 pending: None,
             },
             request_rx,

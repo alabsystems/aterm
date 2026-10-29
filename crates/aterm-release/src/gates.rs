@@ -140,9 +140,10 @@ pub const X86_SLICE_REMEDIES: &str = "rustup +stable target add x86_64-apple-dar
 /// How to build Trust from source, for every remedy that offers it.
 macro_rules! trust_from_source {
     () => {
-        "in a Trust checkout, python3 scripts/recreate_bootstrap.py --stage 2 --require-seed \
-         --fresh-seed --no-register (stage0 = the pinned Trust seed; it refuses rather than \
-         wrap a stock rustc), then seal it with scripts/promote-toolchain.sh"
+        concat!(
+            "in a Trust checkout, ",
+            atpkg::toolchain::trust_recreate_bootstrap_cmd!()
+        )
     };
 }
 
@@ -242,7 +243,9 @@ pub fn run_all(
 /// Refuse a release whose committed handoff policy (`publish/handoff-policy.toml`) the producers it is meant for could not follow, judged on the commit before anything is staged.
 ///
 /// # Errors
-/// The commit holds no policy, one producers could not follow, or one that drops what its predecessor sealed without retiring it.
+/// The commit holds no policy, or one producers could not follow; its ledger cannot be read or
+/// parsed, origin's tags cannot be listed, or none of the ledger's earlier versions shipped (no
+/// predecessor can be named); or the policy drops what its predecessor sealed without retiring it.
 pub fn handoff_policy_gate_at(
     git: &dyn GitRunner,
     commit: &str,
@@ -259,7 +262,7 @@ pub fn handoff_policy_gate_at(
         &format!("{SOURCE_PATH} at {}", short(commit)),
     )
     .map_err(refused)?;
-    let predecessor = predecessor_in(git, &tree, version)?;
+    let predecessor = predecessor_in(git, &tree, version).map_err(|e| refused(e.0))?;
     sealed_policy_kept(git, &tree, predecessor.as_deref(), policy, &text)
 }
 
@@ -527,8 +530,84 @@ pub fn publication_mappings_path() -> PathBuf {
 pub struct PublishedSource {
     /// Full dev sha — the `mappings.aterm.<sha>` key.
     pub commit: String,
-    /// The row's `verified_at`, verbatim (RFC 3339, so it sorts as text).
+    /// The row's `verified_at`, verbatim (RFC 3339).
     pub verified_at: String,
+}
+
+/// Parses an RFC 3339 timestamp into `(utc_seconds, nanoseconds)` so rows with mixed UTC
+/// offsets or fractional seconds compare chronologically rather than lexicographically.
+fn rfc3339_instant(s: &str) -> Option<(i64, u32)> {
+    let b = s.as_bytes();
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || !matches!(b[10], b'T' | b't' | b' ')
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let digits = |slice: &[u8]| -> Option<i64> {
+        let mut v = 0_i64;
+        for &d in slice {
+            if !d.is_ascii_digit() {
+                return None;
+            }
+            v = v * 10 + i64::from(d - b'0');
+        }
+        Some(v)
+    };
+    let (y, mo, d) = (digits(&b[0..4])?, digits(&b[5..7])?, digits(&b[8..10])?);
+    let (h, mi, se) = (
+        digits(&b[11..13])?,
+        digits(&b[14..16])?,
+        digits(&b[17..19])?,
+    );
+    let max_day = match mo {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=max_day).contains(&d) || h > 23 || mi > 59 || se > 60 {
+        return None;
+    }
+    let rest = &b[19..];
+    let (nanos, tz) = if let Some(after_dot) = rest.strip_prefix(b".") {
+        let n_digits = after_dot.iter().take_while(|c| c.is_ascii_digit()).count();
+        if n_digits == 0 {
+            return None;
+        }
+        let mut ns = 0_u32;
+        for i in 0..9 {
+            let digit = after_dot
+                .get(i)
+                .copied()
+                .filter(|_| i < n_digits)
+                .unwrap_or(b'0');
+            ns = ns * 10 + u32::from(digit - b'0');
+        }
+        (ns, &after_dot[n_digits..])
+    } else {
+        (0_u32, rest)
+    };
+    let offset_secs = match tz {
+        [b'Z' | b'z'] => 0_i64,
+        [sign @ (b'+' | b'-'), h0, h1, b':', m0, m1] => {
+            let (oh, om) = (digits(&[*h0, *h1])?, digits(&[*m0, *m1])?);
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let mag = oh * 3600 + om * 60;
+            if *sign == b'-' { -mag } else { mag }
+        }
+        _ => return None,
+    };
+    let civil_secs =
+        aterm_types::rfc3339::days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se.min(59);
+    let extra_leap = u32::from(se == 60) * 1_000_000_000;
+    Some((civil_secs - offset_secs, nanos.saturating_add(extra_leap)))
 }
 
 /// The newest `mappings.aterm` row by `verified_at` in the engine's ledger text.
@@ -553,7 +632,13 @@ pub fn newest_published_source(mappings_json: &str) -> Result<PublishedSource> {
                 .unwrap_or_default()
                 .to_string(),
         })
-        .max_by(|a, b| a.verified_at.cmp(&b.verified_at))
+        .max_by(|a, b| {
+            (rfc3339_instant(&a.verified_at), &a.verified_at, &a.commit).cmp(&(
+                rfc3339_instant(&b.verified_at),
+                &b.verified_at,
+                &b.commit,
+            ))
+        })
         .ok_or_else(|| Error::new("the publication ledger has no aterm row with a commit key"))
 }
 
@@ -2048,12 +2133,21 @@ fn handoff_fixture_gate_in(
     tree: &GateTree<'_>,
     version: &str,
 ) -> Result<Option<HandoffFixtures>> {
-    match predecessor_in(git, tree, version)? {
+    let predecessor = predecessor_in(git, tree, version)
+        .map_err(|e| Error::new(format!("handoff-fixture gate: {e}")))?;
+    match predecessor {
         Some(release) => handoff_fixtures_of(tree, &release).map(Some),
         None => Ok(None),
     }
 }
 
+/// The release the cut succeeds ([`predecessor_release`]), from `tree`'s ledger and origin's
+/// tags.
+///
+/// # Errors
+/// The ledger cannot be read or parsed, origin's tags cannot be listed, or none of the earlier
+/// versions shipped. The message names no gate: each caller says which of its gates asked
+/// (`handoff-fixture gate:`, `handoff-policy gate:`).
 fn predecessor_in(
     git: &dyn GitRunner,
     tree: &GateTree<'_>,
@@ -2062,8 +2156,8 @@ fn predecessor_in(
     let ledger_text = tree.text(crate::ledger::LEDGER_FILE)?;
     let listing = git_ok(git, &["ls-remote", "--tags", "origin"]).map_err(|e| {
         Error::new(format!(
-            "handoff gates: cannot list origin's tags, which is how they tell the \
-             releases that shipped from claims that were abandoned: {e}"
+            "cannot list origin's tags, which is how the gate tells the releases that shipped \
+             from claims that were abandoned: {e}"
         ))
     })?;
     let tags = tag_commits(&listing.stdout_utf8());
@@ -2096,7 +2190,11 @@ pub(crate) fn tag_commits(listing: &str) -> std::collections::BTreeMap<String, S
     tags
 }
 
-/// The newest release the ledger records before the one being cut.
+/// The newest release the ledger records before the one being cut that `shipped` says has a tag.
+///
+/// # Errors
+/// The ledger cannot be parsed, or names earlier versions none of which shipped. The message
+/// names no gate: each caller says which of its gates asked.
 pub fn predecessor_release(
     ledger_text: &str,
     version: &str,
@@ -2117,9 +2215,9 @@ pub fn predecessor_release(
     match passed_over.first() {
         None => Ok(None),
         Some(newest) => Err(Error::new(format!(
-            "handoff-fixture gate: none of the {} earlier versions in {} (newest {newest}) \
-             has its v<version> tag on origin, so there is no shipped release to say this \
-             cut succeeds — is origin the repository this ledger records?",
+            "none of the {} earlier versions in {} (newest {newest}) has its v<version> tag \
+             on origin, so no shipped release precedes this cut — is origin the repository \
+             this ledger records?",
             passed_over.len(),
             crate::ledger::LEDGER_FILE,
         ))),
@@ -3393,7 +3491,19 @@ mod handoff_fixture_gate_tests {
         scratch.desk("0.92.0", "history");
         scratch.pins(&[("v0.92.0", "history")]);
         let origin = Origin::with(&["v9.9.9"]);
-        refusal(&scratch, &origin, "0.93.0");
+        let refused = handoff_fixture_gate(&origin, scratch.0.path(), "0.93.0")
+            .expect_err("the cut must be refused before the claim")
+            .to_string();
+        let ledger = std::fs::read_to_string(scratch.0.path().join(crate::ledger::LEDGER_FILE))
+            .expect("the ledger");
+        let unshipped = predecessor_release(&ledger, "0.93.0", &|_| false)
+            .expect_err("no earlier version shipped")
+            .to_string();
+        assert_eq!(
+            refused,
+            format!("handoff-fixture gate: {unshipped}"),
+            "the gate that asked names itself"
+        );
     }
 
     #[test]
@@ -4153,6 +4263,21 @@ mod published_commit_tests {
             sha('b'),
             "another repo's row and a non-sha key never win"
         );
+        let mixed_offsets = format!(
+            r#"{{"schema":1,"mappings":{{"aterm":{{
+                "{}":{{"verified_at":"2026-09-23T00:15:00Z"}},
+                "{}":{{"verified_at":"2026-09-22T23:30:00.25-02:00"}},
+                "{}":{{"verified_at":"2026-09-23T00:45:00+00:00"}}
+            }}}}}}"#,
+            sha('a'),
+            sha('d'),
+            sha('e')
+        );
+        assert_eq!(
+            newest_published_source(&mixed_offsets).unwrap().commit,
+            sha('d'),
+            "2026-09-22T23:30:00.25-02:00 (01:30:00.25Z on 09-23) is newer by UTC instant than 00:45Z"
+        );
         assert!(newest_published_source(r#"{"mappings":{}}"#).is_err());
         assert!(newest_published_source("not json").is_err());
     }
@@ -4378,6 +4503,44 @@ mod published_commit_tests {
         assert!(!said.contains("RETIRES"), "{said}");
     }
 
+    /// A PREDECESSOR NO RELEASE SHIPPED IS REFUSED UNDER THE POLICY GATE'S NAME: with a ledger
+    /// none of whose earlier versions has its tag on origin, the handoff-policy gate refuses the
+    /// cut saying so, as `handoff-policy gate:`, never under the fixture gate's name. CONTROL:
+    /// once origin carries the newest one's tag, the same policy passes.
+    #[test]
+    fn a_predecessor_no_release_shipped_is_refused_by_the_policy_gate() {
+        use aterm_update_core::handoff_policy::SOURCE_PATH;
+        let repo = Repo::new("policy-unshipped");
+        repo.commit(
+            "two claims, neither shipped",
+            &[(
+                crate::ledger::LEDGER_FILE,
+                "# ledger\n1790563767 0.95.0\n1790585188 0.97.0\n",
+            )],
+        );
+        repo.publish_origin();
+        let judge = || {
+            let commit = repo.commit("the cut's policy", &[(SOURCE_PATH, "schema = 1\n")]);
+            handoff_policy_gate_at(&repo.git(), &commit, "0.98.0").map(|p| p.to_string())
+        };
+        let refused = judge().expect_err("no shipped predecessor").to_string();
+        let unshipped = predecessor_release(
+            "# ledger\n1790563767 0.95.0\n1790585188 0.97.0\n",
+            "0.98.0",
+            &|_| false,
+        )
+        .expect_err("no earlier version shipped")
+        .to_string();
+        assert_eq!(
+            refused,
+            format!("handoff-policy gate: {unshipped}"),
+            "the gate that asked names itself"
+        );
+        repo.run(&["tag", "v0.97.0"]);
+        repo.run(&["push", "-q", "origin", "v0.97.0"]);
+        judge().unwrap_or_else(|e| panic!("CONTROL: v0.97.0 shipped: {e}"));
+    }
+
     #[test]
     fn a_cut_that_drops_the_predecessors_producer_policy_is_refused() {
         use aterm_update_core::handoff_policy::SOURCE_PATH;
@@ -4481,28 +4644,5 @@ mod published_commit_tests {
         let r = not_run(Err(&none));
         assert!(r.why.contains(&none.why), "{r:?}");
         assert_eq!(r.remedy, none.fix);
-    }
-}
-
-#[cfg(test)]
-mod trust_from_source_tests {
-    use super::*;
-
-    #[test]
-    fn the_from_source_remedy_names_no_home_folder_and_is_atpkgs_command() {
-        for remedy in [TRUST_FROM_SOURCE, TRUST_TOOLCHAIN_REMEDIES] {
-            assert!(!remedy.contains('~'), "a home folder: {remedy}");
-            assert!(remedy.contains("in a Trust checkout"), "{remedy}");
-        }
-        let command = |remedy: &'static str| {
-            let at = remedy
-                .find("python3 scripts/recreate_bootstrap.py")
-                .unwrap_or_else(|| panic!("no recreator: {remedy}"));
-            &remedy[at..]
-        };
-        assert_eq!(
-            command(TRUST_FROM_SOURCE),
-            command(atpkg::toolchain::Toolchain::INSTALL_REMEDY)
-        );
     }
 }

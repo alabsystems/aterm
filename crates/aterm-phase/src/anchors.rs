@@ -622,6 +622,8 @@ pub const ANCHORS: &[Anchor] = &[
         "code.claude.com/docs/en/changelog for details",
         "2.1.282",
     ),
+    composed("notice.more", " more notice", "2.1.280"),
+    composed("notice.hidden", " hidden", "2.1.280"),
     lit(
         "notice.auto_mode",
         "Auto mode lets Claude handle permission prompts automatically",
@@ -636,7 +638,8 @@ pub const ANCHORS: &[Anchor] = &[
     lit("model.kept", "Kept model as ", "2.1.283"),
     lit("effort.set", "Set effort level to ", "2.1.283"),
     lit("effort.current", "Current effort level: ", "2.1.283"),
-    lit("effort.auto", "Effort level set to auto", "2.1.283"),
+    composed("effort.auto", "Effort level set to auto", "2.1.283"),
+    lit("effort.auto_head", "Effort level set to ", "2.1.283"),
     lit("effort.top_on", " on (this session only): ", "2.1.304"),
     lit("effort.top_off", " off. Effort stays ", "2.1.304"),
     lit("effort.stays", ". Effort stays ", "2.1.304"),
@@ -674,11 +677,7 @@ pub const ANCHORS: &[Anchor] = &[
     lit("reset.kind.fable", "Fable reset", "2.1.304"),
     lit("reset.kind.full", "full reset", "2.1.304"),
     lit("reset.kind.session_count", "five-hour reset", "2.1.304"),
-    lit(
-        "reset.weekly_row",
-        "Reset your session limit now",
-        "2.1.287",
-    ),
+    lit("reset.weekly_row", "Reset your 5-hour limit now", "2.1.312"),
     lit("reset.confirm.refills", "Refills your", "2.1.287"),
     lit(
         "reset.confirm.stays",
@@ -692,7 +691,7 @@ pub const ANCHORS: &[Anchor] = &[
     lit("reset.early.anyway", "anyway?", "2.1.304"),
     lit("reset.checking", "Checking for a reset", "2.1.287"),
     lit("reset.resetting", "Resetting your limits", "2.1.287"),
-    lit("reset.done.session", "Session limit reset", "2.1.304"),
+    lit("reset.done.session", "5-hour limit reset", "2.1.312"),
     lit("reset.done.weekly", "Weekly limits reset", "2.1.304"),
     lit(
         "reset.done.fable",
@@ -780,6 +779,11 @@ pub const ANCHORS: &[Anchor] = &[
     lit("wall.api_error", "API Error", "2.1.283"),
     lit("wall.goal_paused", "Goal paused", "2.1.280"),
     lit("wall.goal_still", "Goal still active", "2.1.283"),
+    lit(
+        "wall.goal_api_unavailable",
+        "the API was unavailable or the connection dropped",
+        "2.1.283",
+    ),
     lit(
         "wall.goal_cleared",
         "Goal cleared after an unrecoverable error",
@@ -1642,15 +1646,92 @@ pub const GROK_ANCHORS: &[Anchor] = &[
     ),
 ];
 
-/// Every string aterm guards on in Kimi Code's screen ([`crate::kimi`]), as 2.3.1 drew it.
+/// Every string aterm guards on in Kimi Code's screen ([`crate::kimi`]), as 2.3.1 drew it; the
+/// texts 2.3.3's binary carries for a login it lacks or lost (`kimi.auth.*` beside the screen's
+/// `kimi.auth.llm_not_set`; where kimi builds the sentence from a template, the fixed part), whose
+/// texts aterm-agent's Kimi Code login-ended words are read from; and its own quota classifier's
+/// patterns and code (`kimi.wall.*`, `KIMI_QUOTA_EXHAUSTED_MESSAGE_PATTERNS` and
+/// `KIMI_QUOTA_EXHAUSTED_ERROR_CODES`, as their source writes them), which its limit words are
+/// (`docs/measured/kimi-review-2026-10-27.md` §8).
 pub const KIMI_ANCHORS: &[Anchor] = &[
     lit("kimi.welcome", "Welcome to Kimi Code!", "2.3.1"),
     lit("kimi.footer.context", "context: ", "2.3.1"),
     lit("kimi.error", "Error: ", "2.3.1"),
     lit("kimi.auth.llm_not_set", "LLM not set", "2.3.1"),
+    lit(
+        "kimi.auth.no_model",
+        "No model configured. Run `kimi` and use /login to sign in, then retry; or set \
+         default_model in config.toml.",
+        "2.3.3",
+    ),
+    lit(
+        "kimi.auth.no_credential",
+        " has no credential configured",
+        "2.3.3",
+    ),
+    lit(
+        "kimi.auth.no_token",
+        "\". Run /login to authenticate.",
+        "2.3.3",
+    ),
+    lit(
+        "kimi.auth.rejected",
+        "\" was rejected; re-login required.",
+        "2.3.3",
+    ),
+    lit(
+        "kimi.auth.no_refresh_token",
+        "\" has no refresh_token; re-login required.",
+        "2.3.3",
+    ),
+    lit(
+        "kimi.auth.oauth",
+        "Run /login to authenticate with the OAuth provider.",
+        "2.3.3",
+    ),
+    lit(
+        "kimi.auth.relogin_notice",
+        "notice: run /login for: ",
+        "2.3.3",
+    ),
+    lit(
+        "kimi.auth.no_models",
+        "Run /login to sign in to Kimi, or /provider to add another provider from a model \
+         catalog.",
+        "2.3.3",
+    ),
+    lit(
+        "kimi.auth.logged_out",
+        "Run /login or /provider to get started.",
+        "2.3.3",
+    ),
+    lit(
+        "kimi.auth.model_not_set",
+        "not set, run /login or /provider",
+        "2.3.3",
+    ),
+    lit(
+        "kimi.wall.quota",
+        "exceeded your current (?:token )?quota",
+        "2.3.3",
+    ),
+    lit("kimi.wall.balance", "check your account balance", "2.3.3"),
+    lit("kimi.wall.insufficient", "insufficient balance", "2.3.3"),
+    lit(
+        "kimi.wall.recharge",
+        "recharge your account|please recharge",
+        "2.3.3",
+    ),
+    lit("kimi.wall.arrears", "account (?:is )?in arrears", "2.3.3"),
+    lit(
+        "kimi.wall.quota_code",
+        "exceeded_current_quota_error",
+        "2.3.3",
+    ),
 ];
 
-/// The keys of Claude Code's transcript rows the session log's step fold.
+/// The keys and closed words of Claude Code's transcript rows the session log's step fold reads:
+/// `lab claude-measure` refuses GONE when a build drops one the previous measured build showed.
 pub const TRANSCRIPT_KEYS: &[Anchor] = &[
     lit("transcript.tool_use", "tool_use", "2.1.294"),
     lit("transcript.tool_result", "tool_result", "2.1.294"),
@@ -1675,10 +1756,58 @@ pub const TRANSCRIPT_KEYS: &[Anchor] = &[
     lit("transcript.promptId", "promptId", "2.1.294"),
     lit("transcript.parentUuid", "parentUuid", "2.1.294"),
     lit("transcript.local_command", "local_command", "2.1.294"),
+    lit("transcript.version", "version", "2.1.303"),
+    lit("transcript.timestamp", "timestamp", "2.1.303"),
+    lit("transcript.type", "type", "2.1.303"),
+    lit("transcript.subtype", "subtype", "2.1.303"),
+    lit("transcript.message", "message", "2.1.303"),
+    lit("transcript.model", "model", "2.1.303"),
+    lit("transcript.usage", "usage", "2.1.303"),
+    lit("transcript.input_tokens", "input_tokens", "2.1.303"),
+    lit("transcript.output_tokens", "output_tokens", "2.1.303"),
+    lit(
+        "transcript.cache_creation_input_tokens",
+        "cache_creation_input_tokens",
+        "2.1.303",
+    ),
+    lit("transcript.cache_creation", "cache_creation", "2.1.303"),
+    lit(
+        "transcript.ephemeral_5m_input_tokens",
+        "ephemeral_5m_input_tokens",
+        "2.1.303",
+    ),
+    lit(
+        "transcript.ephemeral_1h_input_tokens",
+        "ephemeral_1h_input_tokens",
+        "2.1.303",
+    ),
+    lit(
+        "transcript.cache_read_input_tokens",
+        "cache_read_input_tokens",
+        "2.1.303",
+    ),
+    lit("transcript.id", "id", "2.1.303"),
+    lit("transcript.effort", "effort", "2.1.303"),
+    lit("transcript.content", "content", "2.1.303"),
+    lit("transcript.text", "text", "2.1.303"),
+    lit("transcript.name", "name", "2.1.303"),
+    lit("transcript.origin", "origin", "2.1.303"),
+    lit("transcript.kind", "kind", "2.1.303"),
+    lit("transcript.uuid", "uuid", "2.1.303"),
+    lit("transcript.turnOrigin", "turnOrigin", "2.1.303"),
+    lit("transcript.scheduledTaskId", "scheduledTaskId", "2.1.312"),
 ];
 
-/// The keys of Codex's rollout rows the session log's Codex step fold.
+/// The keys and closed words of Codex's rollout rows the session log's Codex step fold reads:
+/// `lab codex-measure` refuses GONE when a build drops one the previous measured build showed.
 pub const ROLLOUT_KEYS: &[Anchor] = &[
+    lit("rollout.timestamp", "timestamp", "0.163.0"),
+    lit("rollout.type", "type", "0.163.0"),
+    lit("rollout.payload", "payload", "0.163.0"),
+    lit("rollout.info", "info", "0.163.0"),
+    lit("rollout.input_tokens", "input_tokens", "0.163.0"),
+    lit("rollout.output_tokens", "output_tokens", "0.163.0"),
+    lit("rollout.total_tokens", "total_tokens", "0.163.0"),
     lit("rollout.session_meta", "session_meta", "0.163.0"),
     lit("rollout.turn_context", "turn_context", "0.163.0"),
     lit("rollout.event_msg", "event_msg", "0.163.0"),
@@ -1903,6 +2032,13 @@ mod tests {
             guard_regex("Run a (dynamic) x.y"),
             "Run.a.\\(dynamic\\).x\\.y"
         );
+        let meta = "a\\b.c+d*e?f(g)h|i[j]k{1}l^m$n o";
+        let re = aterm_regex::Regex::new(&format!("^{}$", guard_regex(meta)))
+            .expect("guard_regex compiles");
+        assert!(re.is_match(meta));
+        assert!(re.is_match(&meta.replace(' ', "\u{00a0}")));
+        assert!(!re.is_match("a\\bXc+d*e?f(g)h|i[j]k{1}l^m$n o"));
+        assert!(!re.is_match("a\\b.c+d*ef(g)h|i[j]k{1}l^m$n o"));
     }
 
     /// The canary's version is the store record's, read through a `current`
@@ -2252,6 +2388,34 @@ mod tests {
             )],
         )];
         assert_eq!(missing_templates(&bytes, &planted), ["planted"]);
+    }
+
+    /// The auto notice is whole in a build that draws it as one string (2.1.311) or in parts
+    /// (2.1.312, its word behind a flag compiled off), and in no build where the flag is on or the
+    /// word changed.
+    #[test]
+    fn the_auto_notice_is_held_whole_or_by_its_parts_and_its_flag_off() {
+        let templates = composed_templates();
+        let older = b"Wb={label:\"Effort level set to auto\",f:1}".as_slice();
+        assert!(missing_templates(older, &templates).is_empty());
+        let parts = "function Re(){return!1}function E1(){return Re()?\"adaptive\":\"auto\"}\
+                     function q(){return`Effort level set to ${E1()}${u}`}";
+        assert!(missing_templates(parts.as_bytes(), &templates).is_empty());
+        let on = parts.replace("return!1", "return!0");
+        assert_eq!(
+            missing_templates(on.as_bytes(), &templates),
+            ["effort auto word"]
+        );
+        let other = parts.replace("\"auto\"}", "\"automatic\"}");
+        assert_eq!(
+            missing_templates(other.as_bytes(), &templates),
+            ["effort auto word"]
+        );
+        let called = parts.replace("${E1()}", "${level}");
+        assert_eq!(
+            missing_templates(called.as_bytes(), &templates),
+            ["effort auto notice"]
+        );
     }
 
     /// `template` with its slots filled by `names` in turn, and where each fill stands.

@@ -178,6 +178,35 @@ pub enum Companion {
     Cat,
 }
 
+impl Companion {
+    /// `(lo, hi)` cell-height bounds in hundredths of a cell height, inclusive, on the isolating frames.
+    #[must_use]
+    pub const fn height_bounds(self) -> (usize, usize) {
+        match self {
+            Self::Pet => (PET_HEIGHT_MIN_PCT, PET_HEIGHT_MAX_PCT),
+            Self::Cat => (CAT_HEIGHT_MIN_PCT, CAT_HEIGHT_MAX_PCT),
+        }
+    }
+
+    /// Whether an isolated companion component `px` tall, at cell height `cell_h`, stands inside its bounds.
+    #[must_use]
+    pub const fn height_holds(self, px: usize, cell_h: usize) -> bool {
+        let (lo, hi) = self.height_bounds();
+        lo * cell_h <= 100 * px && 100 * px <= hi * cell_h
+    }
+}
+
+/// The least height of the resident pet on an isolated frame, in hundredths of a cell.
+pub const PET_HEIGHT_MIN_PCT: usize = 85;
+/// The greatest.
+pub const PET_HEIGHT_MAX_PCT: usize = 180;
+/// The least height of the flying head on an isolated still, in hundredths of a cell.
+pub const CAT_HEIGHT_MIN_PCT: usize = 95;
+/// The greatest.
+pub const CAT_HEIGHT_MAX_PCT: usize = 180;
+/// The fewest isolated frames a companion height verdict is decided on.
+pub const COMPANION_HEIGHT_MIN_FRAMES: usize = 3;
+
 /// A split before the scene runs, so every frame goes through the composed path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Split {
@@ -241,10 +270,11 @@ impl Reach {
 pub const TALL_REACH_MIN_PCT: usize = 55;
 /// The greatest.
 pub const TALL_REACH_MAX_PCT: usize = 100;
-/// The least height of the underline body's measured top above its row's bottom edge.
-pub const UNDERLINE_REACH_MIN_PCT: usize = 25;
-/// The greatest.
-pub const UNDERLINE_REACH_MAX_PCT: usize = 60;
+/// The underline profile reaches 0.20 cell above the spine; the pixel scanner sees its
+/// bright center rather than the translucent outer wash, usually 1–2 px in a 14 px row.
+pub const UNDERLINE_REACH_MIN_PCT: usize = 5;
+/// Allow the rasterized bright band up to 0.30 cell above the row edge.
+pub const UNDERLINE_REACH_MAX_PCT: usize = 30;
 
 /// The fewest measured frames a reach verdict is decided on.
 pub const REACH_MIN_FRAMES: usize = 6;
@@ -336,6 +366,11 @@ impl PaintRow {
             (_, Capture::PinnedVideo) => {
                 "the shipped binary does not paint its flagship effect: this window was FOCUSED and \
                  RECORDED, every excuse already granted"
+            }
+            (_, Capture::UnpinnedFocused) if self.companion.is_some() => {
+                "the engine and the captured pixels disagree about the trail or the companion, \
+                 the companion stood outside its cell-height bounds (companion_min_h:companion_max_h \
+                 against companion_height_bounds_pct of cell_h), or the rainbow has an interior blackout"
             }
             (_, Capture::UnpinnedFocused) => {
                 "the engine and the captured pixels disagree about the trail or the companion, or the \
@@ -447,6 +482,21 @@ pub fn reach_holds(reach: Reach, s: &ScanReport) -> bool {
     s.reach_frames >= REACH_MIN_FRAMES && s.reach_px.is_some_and(|px| reach.holds(px, s.cell.h))
 }
 
+/// Whether the take measured the companion's isolated height on enough frames, and its least,
+/// median and greatest isolated component heights all stand inside its cell-height bounds.
+#[must_use]
+pub fn companion_height_holds(companion: Companion, s: &ScanReport) -> bool {
+    let (Some(px), Some(lo), Some(hi)) =
+        (s.companion_height_px, s.companion_min_h, s.companion_max_h)
+    else {
+        return false;
+    };
+    s.companion_height_frames >= COMPANION_HEIGHT_MIN_FRAMES
+        && companion.height_holds(px, s.cell.h)
+        && companion.height_holds(lo, s.cell.h)
+        && companion.height_holds(hi, s.cell.h)
+}
+
 /// The row's expectation against the take, before the instrument's account.
 ///
 /// # Errors
@@ -492,6 +542,7 @@ pub fn judge(row: &PaintRow, ledger: &Ledger, s: &ScanReport) -> Result<ShapeVer
                 && s.base_comp.is_some()
                 && s.companion_stack == 0
                 && s.pet_final_run >= 3
+                && companion_height_holds(Companion::Pet, s)
         }
         Some(Companion::Cat) => {
             s.pet_claimed == 0
@@ -500,6 +551,7 @@ pub fn judge(row: &PaintRow, ledger: &Ledger, s: &ScanReport) -> Result<ShapeVer
                 && s.cat_final_run >= 3
                 && s.companion_stack == 0
                 && s.cat_last_present
+                && companion_height_holds(Companion::Cat, s)
         }
     };
     let reach_ok = row.reach.is_none_or(|reach| reach_holds(reach, s));
@@ -574,7 +626,9 @@ impl std::fmt::Display for PaintReport {
              status_frames={} ribbon_claimed={} ribbon_bound={} ribbon_dark={} \
              ribbon_window_hues={} pet_claimed={} pet_missing={} pet_missing_at={} \
              pet_final_run={} cat_claimed={} cat_missing={} cat_final_run={} companion_frames={} \
-             companion_stack={} fx_under_frames={} reach={} reach_frames={} reach_px={} \
+             companion_stack={} companion_height_frames={} companion_height_px={} \
+             companion_min_h={} companion_max_h={} companion_height_bounds_pct={} \
+             fx_under_frames={} reach={} reach_frames={} reach_px={} \
              reach_min_px={} reach_max_px={} reach_bounds_pct={} cell_h={} row_bottom={} \
              typed_gap_ms={:?} driven_ms={} alt_wait_ms={} wall_us={} sched_ticks={} \
              sched_late_max_us={} sched_window_ticks={} sched_window_late_max_us={} qos={:?} \
@@ -614,6 +668,17 @@ impl std::fmt::Display for PaintReport {
             s.cat_final_run,
             s.companion_frames,
             s.companion_stack,
+            s.companion_height_frames,
+            opt(s.companion_height_px),
+            opt(s.companion_min_h),
+            opt(s.companion_max_h),
+            r.companion.map_or_else(
+                || "none".to_string(),
+                |companion| {
+                    let (lo, hi) = companion.height_bounds();
+                    format!("{lo}:{hi}")
+                }
+            ),
             self.ledger.fx_under_frames,
             r.reach.map_or("none", Reach::name),
             s.reach_frames,

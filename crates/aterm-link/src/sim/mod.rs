@@ -241,6 +241,7 @@ impl Core {
             reader.generation,
             &reader.closer,
             self.now(),
+            std::time::Duration::ZERO,
         );
         if on {
             lock(&self.readers).push(reader);

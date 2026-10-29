@@ -1029,6 +1029,16 @@ impl Bridge {
                 .mutant(crate::sim::world::Mutant::TrustTheFloorThatReads);
         #[cfg(not(test))]
         let admitted = self.state.logfloor_admitted();
+        let proven = !admitted && self.state.admit_logfloor_by_its_proof();
+        if proven {
+            stderr_line!(
+                "aterm-link: mirror: the floor of the node's total is on the media at {}, this \
+                 open's first, as its proof ({}) shows: no flush",
+                m.floor,
+                crate::state::LOGFLOOR_PROOF
+            );
+        }
+        let admitted = admitted || proven;
         if need <= m.floor && admitted {
             if let Some(m) = self.mirror.as_deref_mut() {
                 m.floored = true;

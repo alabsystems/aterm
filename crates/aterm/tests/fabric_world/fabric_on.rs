@@ -964,25 +964,56 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
             "#!/bin/sh\n\
              d=${{0%/bin/launchctl}}\n\
              printf '%s\\n' \"$*\" >> \"$d/launchctl.calls\"\n\
+             start() {{\n\
+               rm -f \"$d/root/bus.sock\"\n\
+               nohup '{bin}' link broker \"$d/root/bus.sock\" \"$d/root/bus.log\" --secret-file \"$d/root/mint.secret\" --lifeline-fd 3 3<\"$d/lifeline\" >/dev/null 2>&1 &\n\
+               printf '%s' \"$!\" > \"$d/launchd.pid\"\n\
+             }}\n\
+             leaving=$(cat \"$d/launchd.leaving\" 2>/dev/null || echo 0)\n\
+             held() {{\n\
+               [ \"$leaving\" -gt 0 ] || {{ [ -f \"$d/launchd.exiting\" ] && kill -0 \"$(cat \"$d/launchd.exiting\")\" 2>/dev/null; }}\n\
+             }}\n\
              case \"$1\" in\n\
                print)\n\
                  [ -f \"$d/no-gui\" ] && exit 112\n\
-                 if [ -f \"$d/launchd.pid\" ] && kill -0 \"$(cat \"$d/launchd.pid\")\" 2>/dev/null \
-                    && [ \"${{2##*/}}\" = \"$(cat \"$d/launchd.label\")\" ]; then\n\
-                   printf '\\tstate = running\\n\\tpid = %s\\n' \"$(cat \"$d/launchd.pid\")\"\n\
+                 if held; then\n\
+                   [ \"$leaving\" -gt 0 ] && printf '%s' \"$((leaving - 1))\" > \"$d/launchd.leaving\"\n\
+                   printf '\\tstate = exiting\\n'\n\
+                   exit 0\n\
+                 fi\n\
+                 if [ -f \"$d/launchd.loaded\" ] && [ \"${{2##*/}}\" = \"$(cat \"$d/launchd.label\")\" ]; then\n\
+                   if [ -f \"$d/launchd.pid\" ] && kill -0 \"$(cat \"$d/launchd.pid\")\" 2>/dev/null; then\n\
+                     printf '\\tstate = running\\n\\tpid = %s\\n' \"$(cat \"$d/launchd.pid\")\"\n\
+                   else\n\
+                     printf '\\tstate = not running\\n'\n\
+                   fi\n\
                    exit 0\n\
                  fi\n\
                  exit 113 ;;\n\
                bootstrap)\n\
                  [ -f \"$d/no-gui\" ] && exit 125\n\
+                 if held || [ -f \"$d/launchd.loaded\" ]; then\n\
+                   echo 'Bootstrap failed: 5: Input/output error' >&2\n\
+                   exit 5\n\
+                 fi\n\
                  basename \"$3\" .plist > \"$d/launchd.label\"\n\
-                 rm -f \"$d/root/bus.sock\"\n\
-                 nohup '{bin}' link broker \"$d/root/bus.sock\" \"$d/root/bus.log\" --secret-file \"$d/root/mint.secret\" --lifeline-fd 3 3<\"$d/lifeline\" >/dev/null 2>&1 &\n\
-                 printf '%s' \"$!\" > \"$d/launchd.pid\"\n\
+                 : > \"$d/launchd.loaded\"\n\
+                 start\n\
+                 exit 0 ;;\n\
+               kickstart)\n\
+                 [ -f \"$d/launchd.loaded\" ] || exit 113\n\
+                 if [ -f \"$d/launchd.pid\" ]; then\n\
+                   old=$(cat \"$d/launchd.pid\"); kill -9 \"$old\" 2>/dev/null; n=0\n\
+                   while kill -0 \"$old\" 2>/dev/null && [ \"$n\" -lt 1200 ]; do sleep 0.05; n=$((n + 1)); done\n\
+                 fi\n\
+                 start\n\
                  exit 0 ;;\n\
                bootout)\n\
-                 if [ -f \"$d/launchd.pid\" ]; then kill \"$(cat \"$d/launchd.pid\")\" 2>/dev/null; rm -f \"$d/launchd.pid\"; exit 0; fi\n\
-                 exit 3 ;;\n\
+                 [ -f \"$d/launchd.loaded\" ] || exit 3\n\
+                 rm -f \"$d/launchd.loaded\"\n\
+                 printf 2 > \"$d/launchd.leaving\"\n\
+                 if [ -f \"$d/launchd.pid\" ]; then kill \"$(cat \"$d/launchd.pid\")\" 2>/dev/null; mv \"$d/launchd.pid\" \"$d/launchd.exiting\"; fi\n\
+                 exit 0 ;;\n\
              esac\n\
              exit 0\n"
         ),
@@ -1204,9 +1235,9 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     assert!(text.contains("<key>KeepAlive</key><true/>"), "{text}");
     let recorded = std::fs::read_to_string(&calls).expect("launchctl was called");
     assert!(
-        recorded.contains(&format!("bootout gui/{uid}/{label}\n"))
+        !recorded.contains("bootout")
             && recorded.contains(&format!("bootstrap gui/{uid} {}\n", plist.display())),
-        "{recorded}"
+        "a job launchd does not hold is loaded, with nothing to boot out: {recorded}"
     );
     assert!(
         !recorded.contains("systems.alab.astream-broker\n")
@@ -1245,6 +1276,95 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
         !recorded.contains("bootstrap") && !recorded.contains("bootout"),
         "a job that answers is left alone: {recorded}"
     );
+
+    // The broker of a job launchd still holds is gone: `on` restarts the job in place
+    // (`kickstart -k`), never unloading it.
+    let dead: i32 = managed_pid.parse().expect("pid");
+    // SAFETY: a signal to a pid this test's fake launchd started and still records.
+    assert_eq!(unsafe { libc::kill(dead, libc::SIGKILL) }, 0);
+    let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while harness::alive(dead) {
+        assert!(
+            std::time::Instant::now() < gone_by,
+            "the killed broker {dead} lingers"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    std::fs::remove_file(&calls).expect("reset");
+    let (code, out, err) = run(s
+        .fabric_cmd(&["on", "--service", "launchd"])
+        .env("PATH", &path)
+        .env("ATERM_TEST_LAUNCHCTL", &fake));
+    assert_eq!(code, 0, "{out}\n{err}");
+    let recorded = std::fs::read_to_string(&calls).expect("launchctl was called");
+    assert!(
+        recorded.contains(&format!("kickstart -k gui/{uid}/{label}\n"))
+            && !recorded.contains("bootstrap")
+            && !recorded.contains("bootout"),
+        "an unchanged job restarts in place: {recorded}"
+    );
+    assert!(
+        step(&out, "broker")
+            .iter()
+            .any(|l| l.contains("in place") && l.contains("loaded but not running")),
+        "{out}"
+    );
+    let managed_pid = std::fs::read_to_string(&pidfile)
+        .expect("the fake launchd restarted the broker")
+        .trim()
+        .to_string();
+    assert_ne!(managed_pid, dead.to_string(), "a new broker runs");
+
+    // A job whose plist changes is booted out, and bootstrapped only once launchd lets it go:
+    // this launchd holds a booted-out job until its broker exits and two more `print`s pass,
+    // and refuses a bootstrap of the label until then, as the measured Mac's did.
+    let installed = std::fs::read_to_string(&plist).expect("plist");
+    std::fs::write(
+        &plist,
+        installed.replace(
+            "<key>KeepAlive</key><true/>",
+            "<key>KeepAlive</key><false/>",
+        ),
+    )
+    .expect("an older plist");
+    std::fs::remove_file(&calls).expect("reset");
+    let (code, out, err) = run(s
+        .fabric_cmd(&["on", "--service", "launchd"])
+        .env("PATH", &path)
+        .env("ATERM_TEST_LAUNCHCTL", &fake));
+    assert_eq!(code, 0, "{out}\n{err}");
+    let recorded = std::fs::read_to_string(&calls).expect("launchctl was called");
+    let verbs: Vec<&str> = recorded
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    let bootout = verbs.iter().position(|v| *v == "bootout");
+    let bootstrap = verbs.iter().position(|v| *v == "bootstrap");
+    assert!(
+        matches!((bootout, bootstrap), (Some(out), Some(strap)) if out < strap)
+            && verbs.iter().filter(|v| **v == "bootstrap").count() == 1
+            && verbs[bootout.unwrap_or(0)..bootstrap.unwrap_or(0)]
+                .iter()
+                .filter(|v| **v == "print")
+                .count()
+                >= 3,
+        "one bootstrap, after the bootout and the looks that saw the job go: {recorded}"
+    );
+    assert!(
+        step(&out, "broker")
+            .iter()
+            .any(|l| l.contains("reloaded launchd") && l.contains("the job changed")),
+        "{out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&plist).expect("plist"),
+        installed,
+        "the plist `on` writes is the one loaded"
+    );
+    let managed_pid = std::fs::read_to_string(&pidfile)
+        .expect("the fake launchd started the broker again")
+        .trim()
+        .to_string();
 
     std::fs::remove_file(&calls).expect("reset");
     let (code, out, _) = run(s
@@ -1456,8 +1576,14 @@ fn off_then_on_for_another_fleet_mints_that_fleets_ring() {
     let _broker = Broker::spawn(&s);
     let (code, out, err) = s.fabric(&["on", "--fleet", "work", "--service", "none"]);
     assert_eq!(code, 0, "initial fleet:\n{out}{err}");
+    let record = s.root().join(aterm_link::enable::OFF_RECORD);
+    assert!(!record.exists(), "on writes no off record:\n{out}");
     let (code, out, err) = s.fabric(&["off", "--service", "none"]);
     assert_eq!(code, 0, "off:\n{out}{err}");
+    assert!(
+        record.exists(),
+        "off records the person's off, which the converge pass honours:\n{out}"
+    );
     let dry_cap = |fleet: &str| -> String {
         let (_, dry, _) = s.fabric(&["on", "--fleet", fleet, "--service", "none", "--dry-run"]);
         let cap = step(&dry, "cap").join("\n");
@@ -1472,8 +1598,21 @@ fn off_then_on_for_another_fleet_mints_that_fleets_ring() {
         !dry.contains("kept aside"),
         "a ring `on` mints again is not claimed kept:\n{dry}"
     );
+    assert!(record.exists(), "a dry run of on keeps the off record");
+    // As a turn-on the converge pass began and did not finish leaves it.
+    let by_default = s.root().join(aterm_link::enable::DEFAULT_RECORD);
+    std::fs::write(&by_default, b"").expect("the pass's record");
     let (code, out, err) = s.fabric(&["on", "--fleet", "other", "--service", "none"]);
     assert_eq!(code, 0, "the broker probe under the kept cap:\n{out}{err}");
+    assert!(
+        !record.exists(),
+        "a person's on removes the off record:\n{out}"
+    );
+    assert!(
+        !by_default.exists(),
+        "a person's on finishes the pass's turn-on, so a command cleared after reads as an \
+         off:\n{out}"
+    );
     let caps = aterm_link::bridge::read_cap_file(&s.path("root/node.cap")).unwrap();
     assert!(
         caps.len() == 8 && caps.iter().all(|c| c.grant.contains(":/f/other/")),

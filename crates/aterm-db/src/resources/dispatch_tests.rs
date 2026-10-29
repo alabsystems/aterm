@@ -626,20 +626,38 @@ pub(crate) fn dispatch_transition(
 fn invocation_lifecycle_conforms_and_duplicate_entry_is_detected() {
     let model = aterm_models_db::resource_dispatch_model();
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
-    for state in aterm_spec::interp::reachable_states(&model) {
-        for action in &model.actions {
-            if model.action_enabled(action.name, &state) {
-                let next = dispatch_transition(&state, action.name);
-                assert!(
-                    model.successors(action.name, &state).contains(&next),
-                    "{}: {state:?} -> {next:?}",
-                    action.name
-                );
-            }
-        }
-    }
-    let admitted = dispatch_transition(&model.init_state(), "Admit");
-    let mut duplicate = dispatch_transition(&admitted, "Complete");
+    let steps: Vec<_> = aterm_spec::interp::reachable_states(&model)
+        .iter()
+        .flat_map(|state| {
+            model
+                .actions
+                .iter()
+                .filter(|action| model.action_enabled(action.name, state))
+                .map(|action| (state.clone(), action.name))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    // Each step builds its own Lab in its own temporary home, so the steps share
+    // nothing and run on every core.
+    let reached =
+        aterm_spec::check::each_on(aterm_spec::fs_lane::PLACES, &steps, |(state, action)| {
+            let next = dispatch_transition(state, action);
+            assert!(
+                model.successors(action, state).contains(&next),
+                "{action}: {state:?} -> {next:?}"
+            );
+            next
+        });
+    let step = |from: &aterm_spec::interp::State, action: &str| {
+        steps
+            .iter()
+            .zip(&reached)
+            .find(|((state, name), _)| state == from && *name == action)
+            .map(|(_, next)| next.clone())
+            .expect("the step is enabled from a reachable state")
+    };
+    let admitted = step(&model.init_state(), "Admit");
+    let mut duplicate = step(&admitted, "Complete");
     duplicate.insert("entered", 2);
     assert!(!model.check_invariant("AtMostOneEntry", &duplicate));
 }

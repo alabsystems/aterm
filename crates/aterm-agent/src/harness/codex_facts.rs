@@ -166,8 +166,12 @@ impl CodexFactsFold {
                 if let Some(pct) = payload.get("info").and_then(ctx_left_pct) {
                     self.ctx_left_pct = Some(pct);
                 }
-                if let Some(limits) = payload.get("rate_limits").filter(|l| l.is_object()) {
-                    (self.usage_5h_pct, self.usage_7d_pct) = usage_windows(limits);
+                if let Some(windows) = payload
+                    .get("rate_limits")
+                    .filter(|l| l.is_object())
+                    .and_then(usage_windows)
+                {
+                    (self.usage_5h_pct, self.usage_7d_pct) = windows;
                 }
             }
             (Some("event_msg"), Some("task_started")) => {
@@ -324,11 +328,19 @@ fn ctx_left_pct(info: &Value) -> Option<u8> {
 
 /// A `token_count`'s rate limits as the plan's five-hour and seven-day windows used, rounded:
 /// each of `primary` and `secondary` names its window by `window_minutes`, and either may be
-/// `null` (a plan with a weekly window only names it `primary`).
-fn usage_windows(limits: &Value) -> (Option<u8>, Option<u8>) {
+/// `null` (a plan with a weekly window only names it `primary`). Only the `codex` limit family
+/// (or a legacy snapshot naming no `limit_id`) updates the plan's windows; auxiliary families
+/// (`codex_bengalfox`, `premium`) are ignored.
+fn usage_windows(limits: &Value) -> Option<(Option<u8>, Option<u8>)> {
+    use crate::ai::codex_limits::{Bucket, CODEX_FAMILY, Slot, Window};
+    match limits.get("limit_id") {
+        None => {}
+        Some(id) if id.as_str() == Some(CODEX_FAMILY) => {}
+        Some(_) => return None,
+    }
     let mut windows = (None, None);
-    for slot in ["primary", "secondary"] {
-        let Some(w) = limits.get(slot) else {
+    for (slot, key) in [(Slot::Primary, "primary"), (Slot::Secondary, "secondary")] {
+        let Some(w) = limits.get(key) else {
             continue;
         };
         let pct = w
@@ -337,13 +349,20 @@ fn usage_windows(limits: &Value) -> (Option<u8>, Option<u8>) {
             .filter(|p| p.is_finite() && (0.0..=100.0).contains(p));
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let pct = pct.map(|p| p.round() as u8);
-        match w.get("window_minutes").and_then(Value::as_u64) {
-            Some(300) => windows.0 = pct,
-            Some(10_080) => windows.1 = pct,
-            _ => {}
+        let bucket = Window {
+            slot,
+            used_percent: 0.0,
+            window_minutes: w.get("window_minutes").and_then(Value::as_u64),
+            resets_at: None,
+        }
+        .bucket();
+        match bucket {
+            Bucket::FiveHour => windows.0 = pct,
+            Bucket::Week => windows.1 = pct,
+            Bucket::Day | Bucket::Minutes(_) | Bucket::Unplaced(_) => {}
         }
     }
-    windows
+    Some(windows)
 }
 
 /// A rollout read for [`CodexFacts`]: its end first (at most [`TAIL_BYTES`]), then what it

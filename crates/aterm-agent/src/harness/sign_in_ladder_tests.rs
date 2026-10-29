@@ -2,11 +2,13 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use crate::harness::open_url::{Met, MetWord};
 
 fn bare() -> Read {
     Read {
         profile: Profile::None,
         mailbox: Mailbox::None,
+        mailbox_login: None,
         vault: None,
         browser: false,
         row_browser: false,
@@ -69,18 +71,46 @@ fn the_longest_words_fit_the_record_and_the_ledger_whole() {
         .unwrap();
     let mut reads = Vec::new();
     for profile in [Profile::Ready, Profile::WrongAccount, Profile::None] {
-        for mailbox in [Mailbox::Ready, Mailbox::WebmailOnly, Mailbox::None] {
-            reads.push(Read {
-                profile,
-                mailbox,
-                vault: Some(vault.clone()),
-                browser: false,
-                row_browser: true,
-                hosts: 99_999,
-            });
+        for mailbox in [
+            Mailbox::Ready,
+            Mailbox::WebmailOnly,
+            Mailbox::NoPassword,
+            Mailbox::SharedNoPassword,
+            Mailbox::None,
+        ] {
+            for browser in [true, false] {
+                reads.push(Read {
+                    profile,
+                    mailbox,
+                    mailbox_login: Some(super::super::mailbox_routes::mask_login(
+                        "\u{1F600}\u{1F600}@a-long-mail-domain.example.test",
+                    )),
+                    vault: Some(vault.clone()),
+                    browser,
+                    row_browser: true,
+                    hosts: 99_999,
+                });
+            }
         }
     }
-    let read = reads.into_iter().max_by_key(|r| r.words().len()).unwrap();
+    // A no-route record names any read; a failed run's, a read with the route it ran.
+    let longest_read = |routed: bool| {
+        reads
+            .iter()
+            .filter(|r| r.route().is_some() == routed)
+            .max_by_key(|r| r.words().len())
+            .unwrap()
+            .clone()
+    };
+    let (read, ran) = (longest_read(false), longest_read(true));
+    let host = "h".repeat(super::super::open_url::Met::HOST_MAX);
+    let mets: Vec<Option<Met>> = std::iter::once(None)
+        .chain(
+            [MetWord::BotCheck, MetWord::BlockPage, MetWord::Stall]
+                .into_iter()
+                .map(|word| Some(Met::new(word, Some(&host)))),
+        )
+        .collect();
     let how = longest(
         [
             Renewal::Renewed,
@@ -90,13 +120,17 @@ fn the_longest_words_fit_the_record_and_the_ledger_whole() {
             Renewal::NeedsPerson,
         ]
         .into_iter()
-        .map(|renewal| how_it_ended(renewal, Some(i32::MIN)))
+        .flat_map(|renewal| {
+            mets.iter()
+                .map(move |met| how_it_ended(renewal, Some(i32::MIN), met.as_ref()))
+        })
         .collect(),
     );
+    assert!(how.contains(&host), "the longest names its host: {how}");
     let records = [
         read.words(),
-        failed_words(Route::Mailbox, &how, &read),
-        failed_words(Route::Profile, &how, &read),
+        failed_words(Route::Mailbox, &how, &ran),
+        failed_words(Route::Profile, &how, &ran),
     ];
     for record in &records {
         assert!(
@@ -133,13 +167,115 @@ fn the_longest_words_fit_the_record_and_the_ledger_whole() {
 #[test]
 fn a_run_that_made_no_login_says_how_it_exited_and_claims_no_refusal() {
     use super::super::cli::Renewal;
-    let said = how_it_ended(Renewal::AuthFailed, Some(1));
+    let said = how_it_ended(Renewal::AuthFailed, Some(1), None);
     assert!(
         said.contains("exited 1") && said.contains("no login made"),
         "{said}"
     );
-    assert!(!how_it_ended(Renewal::AuthFailed, None).contains("refused"));
+    assert!(!how_it_ended(Renewal::AuthFailed, None, None).contains("refused"));
     assert!(!said.contains("refused"), "{said}");
+}
+
+/// A run whose opener met Cloudflare's bot check says so on record, after how the run exited,
+/// naming Cloudflare and the host and never a person; a block page and a page that reached no
+/// callback are named too, and a run that signed in names nothing it met. What a run met never
+/// enters the backoff key, which is what the ladder read before the run: the same read fails
+/// into the next step of the same backoff whatever the page met. CONTROL: a run with no outcome
+/// file says what it said before.
+#[test]
+fn a_run_that_met_a_bot_check_names_it_on_record_and_keeps_its_backoff_key() {
+    use super::super::cli::Renewal;
+    let bot = Met::new(MetWord::BotCheck, Some("claude.ai"));
+    let said = how_it_ended(Renewal::AuthFailed, Some(1), Some(&bot));
+    let after = |said: &str, what: &str| {
+        said.find(what)
+            .is_some_and(|at| said.find(&bot.words()).is_some_and(|met| at < met))
+    };
+    assert!(
+        after(&said, "exited 1"),
+        "how it exited, then what it met: {said}"
+    );
+    assert!(
+        said.contains("Cloudflare") && said.contains("claude.ai") && !said.contains("person"),
+        "{said}"
+    );
+    let unfinished = how_it_ended(Renewal::Failed, None, Some(&bot));
+    assert!(
+        unfinished.contains(&bot.words())
+            && unfinished.starts_with(&how_it_ended(Renewal::Failed, None, None)),
+        "{unfinished}"
+    );
+    for met in [
+        Met::new(MetWord::BlockPage, Some("claude.ai")),
+        Met::new(MetWord::Stall, Some("claude.com")),
+    ] {
+        let said = how_it_ended(Renewal::AuthFailed, Some(1), Some(&met));
+        assert!(
+            said.contains("exited 1") && said.ends_with(&met.words()),
+            "{said}"
+        );
+    }
+    assert_eq!(
+        how_it_ended(Renewal::Renewed, Some(0), Some(&bot)),
+        how_it_ended(Renewal::Renewed, Some(0), None),
+        "a run that signed in names nothing it met"
+    );
+    let before = how_it_ended(Renewal::AuthFailed, Some(1), None);
+    assert!(
+        before.contains("exited 1") && !before.contains("Cloudflare"),
+        "{before}"
+    );
+
+    let read = Read {
+        profile: Profile::Ready,
+        browser: true,
+        ..bare()
+    };
+    let record = failed_words(Route::Profile, &said, &read);
+    assert!(
+        record.starts_with("profile: claude auth login exited 1")
+            && record.contains(&bot.words())
+            && record.contains("headless-browser(installed)"),
+        "{record}"
+    );
+    let inputs = read.words();
+    assert!(!inputs.contains("Cloudflare"), "{inputs}");
+    let mut ladder = Ladder::default();
+    let t0 = Instant::now();
+    assert_eq!(ladder.failed("row", &inputs, t0), BACKOFF_FIRST);
+    assert_eq!(
+        ladder.failed("row", &read.words(), t0 + BACKOFF_FIRST),
+        BACKOFF_FIRST * 2,
+        "a run that met a stall after one that met a bot check steps the same backoff"
+    );
+}
+
+/// An installed headless browser that no route drives is named as not run, never as found;
+/// one a route drives is named installed. CONTROL: none installed says so.
+#[test]
+fn an_installed_browser_no_route_drives_is_named_not_run() {
+    let idle = Read {
+        browser: true,
+        ..bare()
+    };
+    assert_eq!(idle.route(), None);
+    assert!(
+        idle.words().contains("headless-browser(installed; not run"),
+        "{}",
+        idle.words()
+    );
+    let driven = Read {
+        profile: Profile::Ready,
+        ..idle.clone()
+    };
+    assert_eq!(driven.route(), Some(Route::Profile));
+    assert!(driven.words().contains("headless-browser(installed) "));
+    assert!(
+        bare().words().contains("headless-browser(none installed)"),
+        "{}",
+        bare().words()
+    );
+    assert!(!idle.words().contains("found") && !driven.words().contains("found"));
 }
 
 #[test]
@@ -220,14 +356,18 @@ fn a_failing_row_waits_until_its_backoff_ends_or_its_inputs_change() {
     assert!(!ladder.held("m2", "nothing", t0), "a row never tried runs");
     assert_eq!(ladder.failed("m2", "nothing", t0), BACKOFF_FIRST);
     assert!(ladder.held("m2", "nothing", t0 + Duration::from_secs(60)));
-    assert!(
-        !ladder.held("m2", "a mailbox", t0 + Duration::from_secs(60)),
-        "a change of what the ladder reads ends the wait at once"
-    );
     assert!(!ladder.held("m2-2", "nothing", t0), "each row has its own");
     let t1 = t0 + BACKOFF_FIRST;
     assert!(!ladder.held("m2", "nothing", t1), "the wait ends");
     assert_eq!(ladder.failed("m2", "nothing", t1), BACKOFF_FIRST * 2);
+    assert!(
+        !ladder.held("m2", "a mailbox", t1),
+        "a change of what the ladder reads ends the wait at once"
+    );
+    assert!(
+        !ladder.held("m2", "nothing", t1),
+        "returning to an earlier input cannot restore an obsolete wait"
+    );
     assert_eq!(
         ladder.failed("m2", "a mailbox", t1),
         BACKOFF_FIRST,
@@ -237,34 +377,88 @@ fn a_failing_row_waits_until_its_backoff_ends_or_its_inputs_change() {
     assert!(!ladder.held("m2", "a mailbox", t1));
 }
 
+/// A move of this machine's network (docs/DESIGN-fluid-swarm-2026-10-28.md F3c) ends the vault's
+/// wait, whose clock starts again from the first wait, and each row's backoff, which keeps its
+/// step; a refresh running then runs on.
+/// NEGATIVE CONTROL: a `moved` that leaves the waits (or the vault's doubled clock) as they were
+/// fails each assertion after it.
+#[test]
+fn a_move_ends_the_vault_wait_and_each_rows_backoff() {
+    let mut ladder = Ladder::default();
+    let t0 = Instant::now();
+    assert_eq!(ladder.vault_turn(Some([1; 32]), t0), VaultTurn::Due);
+    ladder.vault_done(Vault::Failed("the vault host did not answer".to_owned()));
+    let t1 = t0 + BACKOFF_FIRST;
+    assert_eq!(ladder.vault_turn(Some([1; 32]), t1), VaultTurn::Due);
+    ladder.vault_done(Vault::Failed("the vault host did not answer".to_owned()));
+    assert_eq!(ladder.failed("m2", "no-route", t1), BACKOFF_FIRST);
+    let away = t1 + Duration::from_secs(60);
+    assert!(ladder.held("m2", "no-route", away));
+    assert!(matches!(
+        ladder.vault_turn(Some([1; 32]), away),
+        VaultTurn::Seen(_)
+    ));
+    ladder.moved(away);
+    assert!(!ladder.held("m2", "no-route", away), "the row runs at once");
+    assert_eq!(
+        ladder.vault_turn(Some([1; 32]), away),
+        VaultTurn::Due,
+        "the vault is asked at once"
+    );
+    ladder.moved(away);
+    assert_eq!(
+        ladder.vault_turn(Some([1; 32]), away),
+        VaultTurn::Running,
+        "a running refresh runs on"
+    );
+    ladder.vault_done(Vault::Unchanged(51));
+    assert_eq!(
+        ladder.vault_result([1; 32], away),
+        None,
+        "the refresh that crossed the network move is not reusable"
+    );
+    assert_eq!(ladder.vault_turn(Some([1; 32]), away), VaultTurn::Due);
+    ladder.vault_done(Vault::Unchanged(51));
+    assert_eq!(
+        ladder.vault_turn(Some([1; 32]), away + BACKOFF_FIRST),
+        VaultTurn::Due,
+        "the vault's clock started again from the first wait"
+    );
+    assert_eq!(
+        ladder.failed("m2", "no-route", away),
+        BACKOFF_FIRST * 2,
+        "the row's step was kept"
+    );
+}
+
 #[test]
 fn the_vault_is_refreshed_once_per_wait_and_its_wait_doubles_while_it_brings_nothing() {
     let mut ladder = Ladder::default();
     let t0 = Instant::now();
-    assert_eq!(ladder.vault_turn(t0), VaultTurn::Due);
+    assert_eq!(ladder.vault_turn(Some([1; 32]), t0), VaultTurn::Due);
     assert_eq!(
-        ladder.vault_turn(t0),
+        ladder.vault_turn(Some([1; 32]), t0),
         VaultTurn::Running,
         "one refresh at a time"
     );
     ladder.vault_done(Vault::Unchanged(51));
     assert_eq!(
-        ladder.vault_turn(t0 + Duration::from_secs(60)),
+        ladder.vault_turn(Some([1; 32]), t0 + Duration::from_secs(60)),
         VaultTurn::Seen(Vault::Unchanged(51))
     );
     let t1 = t0 + BACKOFF_FIRST;
-    assert_eq!(ladder.vault_turn(t1), VaultTurn::Due);
+    assert_eq!(ladder.vault_turn(Some([1; 32]), t1), VaultTurn::Due);
     ladder.vault_done(Vault::Unchanged(51));
     assert_eq!(
-        ladder.vault_turn(t1 + BACKOFF_FIRST),
+        ladder.vault_turn(Some([1; 32]), t1 + BACKOFF_FIRST),
         VaultTurn::Seen(Vault::Unchanged(51)),
         "the second refresh that brought nothing doubled the wait"
     );
     let t2 = t1 + BACKOFF_FIRST * 2;
-    assert_eq!(ladder.vault_turn(t2), VaultTurn::Due);
+    assert_eq!(ladder.vault_turn(Some([1; 32]), t2), VaultTurn::Due);
     ladder.vault_done(Vault::Applied(52));
     assert_eq!(
-        ladder.vault_turn(t2 + BACKOFF_FIRST),
+        ladder.vault_turn(Some([1; 32]), t2 + BACKOFF_FIRST),
         VaultTurn::Due,
         "an applied vault sets the first wait again"
     );
@@ -331,6 +525,58 @@ fn a_sync_says_what_it_did_in_its_first_line() {
         Vault::of_sync("", None),
         Vault::Failed("no exit status".to_owned())
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn structured_sync_requires_known_evidence_and_agreeing_exit_status() {
+    use aterm_secrets::ErrorKind;
+    use aterm_secrets::sync_diagnostic::SyncDiagnostic;
+    for (record, expected) in [
+        (
+            SyncDiagnostic::Applied { seq: 4, failed: 0 },
+            Vault::Applied(4),
+        ),
+        (
+            SyncDiagnostic::Applied { seq: 4, failed: 2 },
+            Vault::AppliedPartly(4),
+        ),
+        (SyncDiagnostic::Unchanged(5), Vault::Unchanged(5)),
+        (SyncDiagnostic::PutBack(6), Vault::Unchanged(6)),
+        (SyncDiagnostic::NotIn, Vault::NotIn),
+        (
+            SyncDiagnostic::Failed(ErrorKind::JournalBusy),
+            Vault::Failed(
+                aterm_secrets::sync_diagnostic::failure_reason(ErrorKind::JournalBusy).to_owned(),
+            ),
+        ),
+    ] {
+        let code = if record.success() { 0 } else { 1 };
+        assert_eq!(Vault::of_sync(&record.line(), Some(code)), expected);
+        assert!(matches!(
+            Vault::of_sync(&record.line(), Some(1 - code)),
+            Vault::Failed(_)
+        ));
+        assert!(matches!(
+            Vault::of_sync(&record.line(), None),
+            Vault::Failed(_)
+        ));
+    }
+}
+
+#[test]
+fn malformed_sync_diagnostics_never_fall_back_to_successful_prose() {
+    for malformed in [
+        "aterm-secrets-sync-v1 unknown up to date at seq 99",
+        "aterm-secrets-sync-v2 up to date at seq 99",
+        "aterm-secrets-sync-v1 applied 7 0\napplied seq 99",
+        "aterm-secrets-sync-v1 failed /private/credential-value",
+    ] {
+        assert!(matches!(
+            Vault::of_sync(malformed, Some(0)),
+            Vault::Failed(_)
+        ));
+    }
 }
 
 /// A refresh that did not run to its end says which way: never started, ended at its deadline,

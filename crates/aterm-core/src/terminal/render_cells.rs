@@ -136,7 +136,8 @@ pub enum Script {
     /// The ordinary glyph.
     #[default]
     Normal,
-    /// Subscript: small.
+    /// Subscript: small. On a colour emoji (an emoji-presented cell), the emoji drawn small and
+    /// centred in its cell's rows ([`Script::small_emoji_rows`]), its nudge ignored.
     Sub {
         /// Sideways offset of the glyph, in [`Script::NUDGES_PER_CELL`]ths of a cell.
         nudge: i8,
@@ -146,6 +147,16 @@ pub enum Script {
 impl Script {
     /// The steps a cell is divided into for [`Script::Sub`]'s `nudge`.
     pub const NUDGES_PER_CELL: i8 = 16;
+
+    /// The rows a small colour emoji ([`Script::Sub`] on an emoji-presented cell) takes in a cell
+    /// `cell_h` rows tall, `(top, rows)`: seven tenths of the cell, rounded, centred on its
+    /// middle, where a rule's stroke runs (20 rows from row 4 in a 28-row cell). The renderer
+    /// draws the emoji inside them; chrome that rings it reads them too.
+    #[must_use]
+    pub const fn small_emoji_rows(cell_h: usize) -> (usize, usize) {
+        let rows = (cell_h / 10) * 7 + ((cell_h % 10) * 7 + 5) / 10;
+        ((cell_h - rows) / 2, rows)
+    }
 }
 
 /// A single render-ready terminal cell.
@@ -1107,11 +1118,13 @@ impl Terminal {
 
         scratch.snapshot_seq = self.damage_epoch();
         scratch.content_seq = self.content_seq();
+        scratch.drawn_at = self.drawn_at();
         scratch.process_sequence = self.transient.pipeline_timestamps.process_sequence;
 
         scratch.terminal_id = self.extract_identity;
         scratch.extract_gen = self.extract_gen;
         scratch.engine_alt = self.is_alternate_screen();
+        scratch.grid_instance = self.grid.instance();
         scratch.engine_fill_seq = scratch.snapshot_seq;
         scratch.row_shift = 0;
         scratch.shifted_fill_seq = scratch.snapshot_seq;
@@ -1233,6 +1246,17 @@ mod image_probe_meter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn small_emoji_rows_are_centred_and_bounded_even_at_the_largest_height() {
+        for height in [0, 1, 2, 14, 16, 28, usize::MAX] {
+            let (top, rows) = Script::small_emoji_rows(height);
+            assert!(rows <= height);
+            assert!(top <= height - rows);
+            assert!((height - rows - top).abs_diff(top) <= 1);
+        }
+        assert_eq!(Script::small_emoji_rows(28), (4, 20));
+    }
 
     #[test]
     fn a_logical_row_is_the_frames_row_and_says_when_the_frame_moves_it() {
@@ -1733,13 +1757,27 @@ mod tests {
     fn presentation_fingerprint_moves_with_every_resolver_input() {
         use crate::config::TerminalConfig;
         type Arm = (&'static str, fn(&mut Terminal, &mut TerminalConfig));
-        let mut tc = TerminalConfig {
+        let base_tc = TerminalConfig {
             allow_palette_reconfigure: true,
             ..TerminalConfig::default()
         };
+        let mut tc = base_tc.clone();
+        let mut twin_tc = base_tc.clone();
+        let seed = b"\x1b[1;33mB\x1b[0m \x1b[2mD\x1b[0m \x1b[31mR\x1b[0m \x1b[34;42mG\x1b[0m";
         let mut term = Terminal::new(2, 12);
+        let mut twin = Terminal::new(2, 12);
         term.apply_config(&tc);
-        term.process(b"\x1b[1;33mB\x1b[0m \x1b[2mD\x1b[0m \x1b[31mR\x1b[0m \x1b[34;42mG\x1b[0m");
+        twin.apply_config(&twin_tc);
+        term.process(seed);
+        twin.process(seed);
+        let (base_row, base_print) = (term.render_row(0), term.presentation_fingerprint());
+        assert_eq!(
+            (twin.render_row(0), twin.presentation_fingerprint()),
+            (base_row.clone(), base_print),
+            "sound converse (rc-presentation-fingerprint): equal inputs yield equal fingerprint and resolved rows"
+        );
+        // Each arm below is a concrete sensitivity witness showing the field is wired
+        // into presentation_fingerprint() (not a general collision-freedom claim on FxHash).
         let arms: &[Arm] = &[
             ("bold_is_bright (config reload)", |t, c| {
                 c.bold_is_bright = !c.bold_is_bright;
@@ -1767,6 +1805,12 @@ mod tests {
         for (name, arm) in arms {
             let (row, print) = (term.render_row(0), term.presentation_fingerprint());
             arm(&mut term, &mut tc);
+            arm(&mut twin, &mut twin_tc);
+            assert_eq!(
+                (twin.render_row(0), twin.presentation_fingerprint()),
+                (term.render_row(0), term.presentation_fingerprint()),
+                "{name}: equal resolver inputs determine both fingerprint and resolved cells"
+            );
             assert_ne!(
                 term.render_row(0),
                 row,
@@ -1775,7 +1819,7 @@ mod tests {
             assert_ne!(
                 term.presentation_fingerprint(),
                 print,
-                "{name}: re-coloured a resolved row under an unmoved fingerprint"
+                "{name}: sensitivity witness: resolver input was not hashed"
             );
         }
         let print = term.presentation_fingerprint();
@@ -1784,6 +1828,13 @@ mod tests {
             term.presentation_fingerprint(),
             print,
             "writing cells is content, not presentation"
+        );
+        term.apply_config(&base_tc);
+        term.process(b"\x1b]104\x1b\\\x1b]110\x1b\\\x1b]111\x1b\\\x1b[?5l");
+        assert_eq!(
+            (term.render_row(0), term.presentation_fingerprint()),
+            (base_row, base_print),
+            "restoring the initial resolver inputs restores both fingerprint and resolved cells"
         );
     }
 

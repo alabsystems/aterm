@@ -14,13 +14,14 @@ aterm-cap = { workspace = true }
 # aterm_spec_anchor::refines(…))]` expands in every test and debug build; release strips it.
 aterm-spec-anchor = { workspace = true }
 
-# POSIX-only: the setrlimit actuator (src/unix.rs). The Windows actuator is a
-# documented, capability-gated no-op (src/windows.rs) with zero FFI.
+# POSIX-only: the setrlimit actuator (src/unix.rs). On Windows `apply_limits` is a
+# capability-gated no-op, while `apply_to_job` binds kernel32 Job Object APIs (src/windows.rs).
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
 [dev-dependencies]
 aterm-models-core = { workspace = true }
+aterm-spec = { workspace = true }
 # Test-only: sandbox tests mint a root `Authority`; `launcher-mint` makes the sealed
 # mint nameable for this crate's own test build. The production `apply`/`restore`
 # seam receives a `Cap<Sandbox>` by argument and never mints.

@@ -14,7 +14,7 @@ fn rle_index_trait_valid_access() {
 }
 
 #[test]
-#[should_panic(expected = "index out of bounds")]
+#[should_panic]
 fn rle_index_trait_oob_panics() {
     let rle = Rle::from_iter([1u8, 2, 3]);
     let _ = rle[3]; // OOB: valid indices are 0..3

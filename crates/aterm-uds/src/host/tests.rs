@@ -262,8 +262,40 @@ fn the_refusal_names_its_provider() {
     );
     let gpu = tool("gpu").refusal();
     assert_eq!(gpu, "this host lacks a GPU adapter, and no command adds it");
-    for refusal in [fish, pwsh, lima, bindgen, vim, ty, python, zstd, cc, gpu] {
-        assert!(!refusal.contains("brew"), "no remedy says brew: {refusal}");
+}
+
+#[test]
+fn no_remedy_says_brew() {
+    // DESIGN-init-system §6.5: no remedy says `brew`, and abrew is not aterm's supply line: no
+    // remedy runs abrew, and only xcodebuild's names it, as the reason no Xcode is needed.
+    for row in TOOLS {
+        for platform in [
+            "macos-aarch64",
+            "macos-x86_64",
+            "linux-x86_64",
+            "linux-aarch64",
+            "windows-x86_64",
+        ] {
+            let refusal = row.refusal_on(platform);
+            let words: Vec<String> = refusal
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|word| !word.is_empty())
+                .map(str::to_ascii_lowercase)
+                .collect();
+            let brew = words
+                .iter()
+                .any(|word| word == "brew" || word == "homebrew");
+            let runs_abrew = refusal.contains("`abrew")
+                || words.windows(2).any(|pair| {
+                    pair[0] == "abrew"
+                        && ["install", "bundle", "tap", "shellenv"].contains(&pair[1].as_str())
+                });
+            let names_abrew = words.iter().any(|word| word == "abrew");
+            assert!(
+                !brew && !runs_abrew && (!names_abrew || row.name == "xcodebuild"),
+                "{platform}: {refusal}"
+            );
+        }
     }
 }
 
@@ -283,10 +315,7 @@ fn every_workspace_row_names_the_run_that_provides_it() {
         for (flag, wanted) in [("--linux", When::Linux), ("--record", When::Record)] {
             assert_eq!(refusal.contains(flag), when == wanted, "{refusal}");
         }
-        assert!(
-            !refusal.contains("init --develop") && !refusal.contains("brew"),
-            "{refusal}"
-        );
+        assert!(!refusal.contains("init --develop"), "{refusal}");
         assert_eq!(row.provided_by(), when.verb());
     }
     assert!(seen >= 8, "the pinned rows: {seen}");

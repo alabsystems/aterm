@@ -1863,6 +1863,9 @@ const LIST_SIZES: [(f32, f32); 6] = [
     (1_564.0, 854.0),
 ];
 
+/// The window sizes the page audit covers on every page, a subset of [`LIST_SIZES`].
+const AUDIT_SIZES: [(f32, f32); 3] = [(584.0, 348.0), (738.0, 418.0), (1_074.0, 684.0)];
+
 /// The list a compiled Settings page draws, its room and whether a peek follows the screen.
 fn compiled_list(
     compiled: &crate::native_ui::CompiledUi,
@@ -1891,140 +1894,134 @@ fn is_control(content: &UiContent) -> bool {
     )
 }
 
-#[test]
-fn every_screen_fills_its_list_and_every_control_its_room_shows_is_live() {
-    at_each_text_scale(&[1.0, 2.0], "the list edge sweep", |scale| {
-        list_edge_sweep(scale);
-    });
-}
-
-/// One text scale of [`every_screen_fills_its_list_and_every_control_its_room_shows_is_live`].
-fn list_edge_sweep(scale: f32) {
-    for route in LIST_ROUTES {
-        for (width, height) in LIST_SIZES {
-            let mut lab = Lab::new("");
-            lab.state_mut().navigate(route);
-            lab.each_screen(width, height, |state, compiled, top| {
-                let Some((plan, shown)) = state.scroll_shown() else {
-                    return;
-                };
-                let Some((list, room)) = compiled_list(compiled, &plan) else {
-                    return;
-                };
-                let context = format!("{route:?} {width}×{height} at {scale}× screen {top}");
-                assert_list_tops(compiled, list.y + room, &context);
-                let failures = compiled.fit_failures();
-                assert!(failures.is_empty(), "{context}: {failures:#?}");
-                for picture in &compiled.list_pictures {
-                    assert!(
-                        plan.stop_holding(&picture.key).is_some()
-                            || picture.key.as_str().starts_with("settings/nav/"),
-                        "{context}: a press on {:?} in the strip finds no stop",
-                        picture.key.as_str()
-                    );
-                }
-                let room_rect = LogicalRect::new(list.x, list.y, list.width, room);
-                for node in &compiled.paint {
-                    if !is_control(&node.content)
-                        || node.clip.is_empty()
-                        || node.rect.x < list.x - 0.5
-                        || node.rect.right() > list.right() + 0.5
-                        || node.clip.y < list.y - 0.5
-                        || node.clip.bottom() > list.bottom() + 0.5
-                    {
-                        continue;
-                    }
-                    let context = format!(
-                        "{context}: {} {:?} clip {:?}",
-                        node.key.as_str(),
-                        node.rect,
-                        node.clip
-                    );
-                    if node.fade.is_some_and(|(top, _)| top <= node.rect.y + 0.5) {
-                        assert!(
-                            compiled.semantic(&node.key).is_none(),
-                            "{context}: fading, live"
-                        );
-                        let enabled = match &node.content {
-                            UiContent::Button(control) => control.state.enabled,
-                            UiContent::Switch(control) => control.state.enabled,
-                            UiContent::Slider(control) => control.state.enabled,
-                            UiContent::TextField(control) => control.state.enabled,
-                            _ => true,
-                        };
-                        assert!(
-                            node.clip.height < 0.5
-                                || !enabled
-                                || compiled.list_pictures.iter().any(|picture| {
-                                    picture.key == node.key
-                                        && (picture.rect.y - node.clip.y).abs() <= 0.5
-                                        && (picture.rect.bottom() - node.clip.bottom()).abs() <= 0.5
-                                }),
-                            "{context}: fading, but a press on it is lost"
-                        );
-                        continue;
-                    }
-                    match node.clip.intersect(room_rect) {
-                        Some(live) if live.height > 0.5 => {
-                            let semantic = compiled
-                                .semantic(&node.key)
-                                .unwrap_or_else(|| panic!("{context}: shown in the room, dead"));
-                            assert!(
-                                (semantic.rect.y - live.y).abs() <= 0.5
-                                    && (semantic.rect.bottom() - live.bottom()).abs() <= 0.5,
-                                "{context}: live over {:?}, not what shows {live:?}",
-                                semantic.rect
-                            );
-                        }
-                        _ => {
-                            assert!(
-                                compiled.semantic(&node.key).is_none(),
-                                "{context}: in the strip, live"
-                            );
-                            assert!(
-                                shown.end >= plan.len() || node.fade.is_some(),
-                                "{context}: in the strip, not fading"
-                            );
-                        }
-                    }
-                }
-                let ends_on_cut = compiled.paint.iter().any(|node| {
-                    node.key.as_str() != "settings/list"
-                        && node.rect.x >= list.x - 0.5
-                        && node.rect.right() <= list.right() + 0.5
-                        && node.rect.y < list.bottom() - 0.5
-                        && node.rect.bottom() > list.bottom() + 0.5
-                });
-                if shown.end < plan.len() && shown.start < plan.limit() {
-                    assert!(
-                        list.height >= plan.room() + plan.overhang() - 0.5
-                            || (ends_on_cut && plan.overhang() <= 0.01),
-                        "{context}: the list {list:?} stops short of its room {} and strip {}",
-                        plan.room(),
-                        plan.overhang()
-                    );
-                }
-                let drawn_to = compiled
-                    .paint
-                    .iter()
-                    .filter(|node| {
-                        node.key != UiKey::new("settings/list")
-                            && node.rect.x >= list.x - 0.5
-                            && node.rect.right() <= list.right() + 0.5
-                            && !node.clip.is_empty()
-                            && node.clip.y >= list.y - 0.5
-                            && node.clip.bottom() <= list.bottom() + 0.5
-                    })
-                    .map(|node| node.clip.bottom())
-                    .fold(list.y, f32::max);
+/// The list-edge laws on one list screen, each fault named by `context`: (with `audited` false) its list tops and
+/// fit, a press in the strip finds a stop, a control fading from its top is a picture a press reaches, what the room
+/// shows is live over exactly what shows, the strip is dead and fades until the end, the list reaches its room and
+/// strip, and no band of blank ends it.
+fn list_edge_checks(
+    state: &SettingsViewState,
+    compiled: &crate::native_ui::CompiledUi,
+    context: &str,
+    audited: bool,
+) {
+    let Some((plan, shown)) = state.scroll_shown() else {
+        return;
+    };
+    let Some((list, room)) = compiled_list(compiled, &plan) else {
+        return;
+    };
+    if !audited {
+        assert_list_tops(compiled, list.y + room, context);
+        let failures = compiled.fit_failures();
+        assert!(failures.is_empty(), "{context}: {failures:#?}");
+    }
+    for picture in &compiled.list_pictures {
+        assert!(
+            plan.stop_holding(&picture.key).is_some()
+                || picture.key.as_str().starts_with("settings/nav/"),
+            "{context}: a press on {:?} in the strip finds no stop",
+            picture.key.as_str()
+        );
+    }
+    let room_rect = LogicalRect::new(list.x, list.y, list.width, room);
+    for node in &compiled.paint {
+        if !is_control(&node.content)
+            || node.clip.is_empty()
+            || node.rect.x < list.x - 0.5
+            || node.rect.right() > list.right() + 0.5
+            || node.clip.y < list.y - 0.5
+            || node.clip.bottom() > list.bottom() + 0.5
+        {
+            continue;
+        }
+        let context = format!(
+            "{context}: {} {:?} clip {:?}",
+            node.key.as_str(),
+            node.rect,
+            node.clip
+        );
+        if node.fade.is_some_and(|(top, _)| top <= node.rect.y + 0.5) {
+            assert!(
+                compiled.semantic(&node.key).is_none(),
+                "{context}: fading, live"
+            );
+            let enabled = match &node.content {
+                UiContent::Button(control) => control.state.enabled,
+                UiContent::Switch(control) => control.state.enabled,
+                UiContent::Slider(control) => control.state.enabled,
+                UiContent::TextField(control) => control.state.enabled,
+                _ => true,
+            };
+            assert!(
+                node.clip.height < 0.5
+                    || !enabled
+                    || compiled.list_pictures.iter().any(|picture| {
+                        picture.key == node.key
+                            && (picture.rect.y - node.clip.y).abs() <= 0.5
+                            && (picture.rect.bottom() - node.clip.bottom()).abs() <= 0.5
+                    }),
+                "{context}: fading, but a press on it is lost"
+            );
+            continue;
+        }
+        match node.clip.intersect(room_rect) {
+            Some(live) if live.height > 0.5 => {
+                let semantic = compiled
+                    .semantic(&node.key)
+                    .unwrap_or_else(|| panic!("{context}: shown in the room, dead"));
                 assert!(
-                    drawn_to >= (list.y + room).min(list.bottom()) - 0.5,
-                    "{context}: the screen ends on a band of blank: drawn to {drawn_to}, room to {}",
-                    list.y + room
+                    (semantic.rect.y - live.y).abs() <= 0.5
+                        && (semantic.rect.bottom() - live.bottom()).abs() <= 0.5,
+                    "{context}: live over {:?}, not what shows {live:?}",
+                    semantic.rect
                 );
-            });
+            }
+            _ => {
+                assert!(
+                    compiled.semantic(&node.key).is_none(),
+                    "{context}: in the strip, live"
+                );
+                assert!(
+                    shown.end >= plan.len() || node.fade.is_some(),
+                    "{context}: in the strip, not fading"
+                );
+            }
         }
     }
+    let ends_on_cut = compiled.paint.iter().any(|node| {
+        node.key.as_str() != "settings/list"
+            && node.rect.x >= list.x - 0.5
+            && node.rect.right() <= list.right() + 0.5
+            && node.rect.y < list.bottom() - 0.5
+            && node.rect.bottom() > list.bottom() + 0.5
+    });
+    if shown.end < plan.len() && shown.start < plan.limit() {
+        assert!(
+            list.height >= plan.room() + plan.overhang() - 0.5
+                || (ends_on_cut && plan.overhang() <= 0.01),
+            "{context}: the list {list:?} stops short of its room {} and strip {}",
+            plan.room(),
+            plan.overhang()
+        );
+    }
+    let drawn_to = compiled
+        .paint
+        .iter()
+        .filter(|node| {
+            node.key != UiKey::new("settings/list")
+                && node.rect.x >= list.x - 0.5
+                && node.rect.right() <= list.right() + 0.5
+                && !node.clip.is_empty()
+                && node.clip.y >= list.y - 0.5
+                && node.clip.bottom() <= list.bottom() + 0.5
+        })
+        .map(|node| node.clip.bottom())
+        .fold(list.y, f32::max);
+    assert!(
+        drawn_to >= (list.y + room).min(list.bottom()) - 0.5,
+        "{context}: the screen ends on a band of blank: drawn to {drawn_to}, room to {}",
+        list.y + room
+    );
 }
 
 #[test]
@@ -5055,11 +5052,33 @@ fn a_text_size_change_keeps_a_screen_that_starts_with_what_it_lists_otherwise() 
     assert!(faults.is_empty(), "{faults:#?}");
 }
 
+/// ONE WALK OF EVERY PAGE'S SCREENS, at 1× and 2× text, holds four laws.
+/// (1) NO SCREEN PAINTS A CUT OR OVERLAPPING MARK: on every page at 584×348, 738×418 and 1074×684, in the Default
+/// and GitHub Light themes, no line of words is cut through by a list's top edge, no row whole under a kept caption is
+/// excused from that audit, and everything fits (more than 100 screens).
+/// (2) EVERY SCREEN FILLS ITS LIST AND EVERY CONTROL ITS ROOM SHOWS IS LIVE: on each list page at each shipped and
+/// common size ([`LIST_ROUTES`] × [`LIST_SIZES`], Default theme), where (1)'s list tops and fit also hold:
+///   - a press on a picture in the strip finds a stop;
+///   - a control fading from its top is not live, and, enabled and showing, a press reaches its picture over what
+///     shows;
+///   - a control the room shows is live over exactly what shows;
+///   - one in the strip is not live, and it fades unless the screen ends the list;
+///   - a screen short of the end draws its list through its room and strip;
+///   - no screen ends on a band of blank.
+///
+/// (3) A CONTROL THE ROOM'S EDGE CUTS IS A PICTURE FROM ITS TOP: at 1×, on list pages at 584×348 and 738×418, on
+/// every screen before the last of a list whose foot is not whole, such a control fades from its top, with no
+/// semantics and no hit. Some screen draws such a control.
+/// (4) A CUT CONTROL IS DRAWN WITH ITS NAME OR NOT AT ALL: at 1×, on list pages at 584×348, 738×418 and 1074×684, a
+/// peek control drawn at all shows at least min(its height, PEEK_MIN), and a live cut setting control's first name
+/// line, when laid out, paints its words. Some screen draws a control an edge cuts.
 #[test]
-fn every_screen_of_every_page_paints_no_cut_or_overlapping_mark() {
+fn every_screen_of_every_page_paints_whole_marks_and_fills_its_live_list() {
     at_each_text_scale(&[1.0, 2.0], "the page audit", |scale| {
-        let mut failures = Vec::new();
-        let mut screens = 0;
+        let (mut failures, mut screens) = (Vec::new(), 0);
+        let (mut edge_faults, mut edge_cut) = (Vec::new(), 0);
+        let (mut name_faults, mut cut_drawn) = (Vec::new(), 0);
+        let rung_one = scale == 1.0;
         for (theme, source) in [
             ("Default", ""),
             (
@@ -5068,36 +5087,101 @@ fn every_screen_of_every_page_paints_no_cut_or_overlapping_mark() {
             ),
         ] {
             for route in SettingsRoute::ALL {
-                for (width, height) in [(584.0, 348.0), (738.0, 418.0), (1_074.0, 684.0)] {
+                let listed = theme == "Default" && LIST_ROUTES.contains(&route);
+                let sizes: &[(f32, f32)] = if listed { &LIST_SIZES } else { &AUDIT_SIZES };
+                for &(width, height) in sizes {
+                    let audited = AUDIT_SIZES.contains(&(width, height));
+                    let edge_cuts = listed
+                        && rung_one
+                        && [(584.0, 348.0), (738.0, 418.0)].contains(&(width, height));
+                    let names = listed && rung_one && audited;
                     let mut lab = Lab::new(source);
                     lab.state_mut().navigate(route);
-                    screens += lab.each_screen(width, height, |state, compiled, top| {
-                        let room_bottom = state
-                            .scroll_plan()
-                            .and_then(|plan| compiled_list(compiled, &plan))
-                            .map_or(height, |(list, room)| list.y + room);
-                        assert_list_tops(
-                            compiled,
-                            room_bottom,
-                            &format!("{route:?} {width}×{height} {theme} at {scale}× screen {top}"),
-                        );
-                        let found = compiled.fit_failures();
-                        if !found.is_empty() {
-                            failures.push(format!(
-                                "{route:?} {width}×{height} {theme} screen {top}: {found:#?}"
-                            ));
+                    let walked = lab.each_screen(width, height, |state, compiled, top| {
+                        if audited {
+                            let room_bottom = state
+                                .scroll_plan()
+                                .and_then(|plan| compiled_list(compiled, &plan))
+                                .map_or(height, |(list, room)| list.y + room);
+                            assert_list_tops(
+                                compiled,
+                                room_bottom,
+                                &format!(
+                                    "{route:?} {width}×{height} {theme} at {scale}× screen {top}"
+                                ),
+                            );
+                            let found = compiled.fit_failures();
+                            if !found.is_empty() {
+                                failures.push(format!(
+                                    "{route:?} {width}×{height} {theme} screen {top}: {found:#?}"
+                                ));
+                            }
+                        }
+                        if listed {
+                            list_edge_checks(
+                                state,
+                                compiled,
+                                &format!("{route:?} {width}×{height} at {scale}× screen {top}"),
+                                audited,
+                            );
+                        }
+                        if edge_cuts {
+                            edge_cut_checks(
+                                state,
+                                compiled,
+                                top,
+                                &format!("{route:?} {width}×{height}"),
+                                &mut edge_faults,
+                                &mut edge_cut,
+                            );
+                        }
+                        if names {
+                            cut_name_checks(
+                                compiled,
+                                &format!("{route:?} {width}×{height} screen {top}"),
+                                &mut name_faults,
+                                &mut cut_drawn,
+                            );
                         }
                     });
+                    if audited {
+                        screens += walked;
+                    }
                 }
             }
         }
         assert!(screens > 100, "{screens} screens");
-        assert!(
-            failures.is_empty(),
-            "at {scale}×, {} of {screens} screens:\n{}",
-            failures.len(),
-            failures.join("\n")
-        );
+        // One report, so no law's faults hide another's.
+        let mut report = Vec::new();
+        if !failures.is_empty() {
+            report.push(format!(
+                "{} of {screens} screens do not fit:\n{}",
+                failures.len(),
+                failures.join("\n")
+            ));
+        }
+        if !edge_faults.is_empty() {
+            report.push(format!(
+                "a control the room's edge cuts is not a picture from its top: {} faults:\n{}",
+                edge_faults.len(),
+                edge_faults.join("\n")
+            ));
+        }
+        if !name_faults.is_empty() {
+            report.push(format!(
+                "a cut control drawn without its name: {} faults:\n{}",
+                name_faults.len(),
+                name_faults.join("\n")
+            ));
+        }
+        assert!(report.is_empty(), "at {scale}×: {}", report.join("\n\n"));
+        if rung_one {
+            assert!(
+                edge_cut > 0,
+                "some screen draws a control over its room's edge"
+            );
+            assert!(cut_drawn > 0, "some screen draws a control an edge cuts");
+        }
     });
 }
 
@@ -6366,125 +6450,104 @@ fn a_stop_added_after_the_end_moves_no_row_on_the_last_screen() {
     }
 }
 
-#[test]
-fn a_control_the_rooms_edge_cuts_is_a_picture_from_its_top() {
-    let mut cut = 0;
-    let mut faults = Vec::new();
-    for route in LIST_ROUTES {
-        for (width, height) in [(584.0, 348.0), (738.0, 418.0)] {
-            let mut lab = Lab::new("");
-            lab.state_mut().navigate(route);
-            lab.each_screen(width, height, |state, compiled, top| {
-                let Some((plan, _)) = state.scroll_shown().filter(|(plan, _)| top < plan.limit())
-                else {
-                    return;
-                };
-                if plan.foot() == scroll::ListFoot::Whole {
-                    return;
-                }
-                let Some((list, room)) = compiled_list(compiled, &plan) else {
-                    return;
-                };
-                let edge = list.y + room;
-                for node in compiled.paint.iter().filter(|node| {
-                    is_control(&node.content)
-                        && node.rect.x >= list.x - 0.5
-                        && node.rect.right() <= list.right() + 0.5
-                        && node.rect.y < edge - 0.5
-                        && node.rect.bottom() > edge + 0.5
-                        && node.clip.y < edge - 0.5
-                }) {
-                    cut += 1;
-                    let picture = node.fade.is_some_and(|(top, _)| top <= node.rect.y + 0.5)
-                        && compiled.semantic(&node.key).is_none()
-                        && compiled.hits.iter().all(|hit| hit.key != node.key);
-                    if !picture {
-                        faults.push(format!(
-                            "{route:?} {width}×{height} screen {top}: {} {:?} over the edge at \
-                             {edge}: fade {:?}, live {:?}",
-                            node.key.as_str(),
-                            node.rect,
-                            node.fade,
-                            compiled.semantic(&node.key).map(|node| node.rect)
-                        ));
-                    }
-                }
-            });
+/// Whether a control the room's edge cuts on one screen before the last of a list whose foot is not whole is a
+/// picture from its top, with no semantics and no hit: each fault, named by `place` and `top`, goes to `faults`, and
+/// each such control drawn counts in `cut`.
+fn edge_cut_checks(
+    state: &SettingsViewState,
+    compiled: &crate::native_ui::CompiledUi,
+    top: usize,
+    place: &str,
+    faults: &mut Vec<String>,
+    cut: &mut usize,
+) {
+    let Some((plan, _)) = state.scroll_shown().filter(|(plan, _)| top < plan.limit()) else {
+        return;
+    };
+    if plan.foot() == scroll::ListFoot::Whole {
+        return;
+    }
+    let Some((list, room)) = compiled_list(compiled, &plan) else {
+        return;
+    };
+    let edge = list.y + room;
+    for node in compiled.paint.iter().filter(|node| {
+        is_control(&node.content)
+            && node.rect.x >= list.x - 0.5
+            && node.rect.right() <= list.right() + 0.5
+            && node.rect.y < edge - 0.5
+            && node.rect.bottom() > edge + 0.5
+            && node.clip.y < edge - 0.5
+    }) {
+        *cut += 1;
+        let picture = node.fade.is_some_and(|(top, _)| top <= node.rect.y + 0.5)
+            && compiled.semantic(&node.key).is_none()
+            && compiled.hits.iter().all(|hit| hit.key != node.key);
+        if !picture {
+            faults.push(format!(
+                "{place} screen {top}: {} {:?} over the edge at {edge}: fade {:?}, live {:?}",
+                node.key.as_str(),
+                node.rect,
+                node.fade,
+                compiled.semantic(&node.key).map(|node| node.rect)
+            ));
         }
     }
-    assert!(
-        faults.is_empty(),
-        "{} faults:\n{}",
-        faults.len(),
-        faults.join("\n")
-    );
-    assert!(cut > 0, "some screen draws a control over its room's edge");
 }
 
-#[test]
-fn a_cut_control_is_drawn_with_its_name_or_not_at_all() {
-    let mut faults = Vec::new();
-    let mut cut_drawn = 0;
-    for route in LIST_ROUTES {
-        for (width, height) in [(584.0, 348.0), (738.0, 418.0), (1_074.0, 684.0)] {
-            let mut lab = Lab::new("");
-            lab.state_mut().navigate(route);
-            lab.each_screen(width, height, |_, compiled, top| {
-                let context = format!("{route:?} {width}×{height} screen {top}");
-                for node in compiled
-                    .paint
-                    .iter()
-                    .filter(|node| is_control(&node.content) && node.peek)
-                {
-                    let shows = node.clip.height;
-                    if shows + 0.5 < node.rect.height.min(scroll::PEEK_MIN) && shows > 0.5 {
-                        faults.push(format!(
-                            "{context}: {} {:?} drawn {shows}pt",
-                            node.key.as_str(),
-                            node.rect
-                        ));
-                    }
-                    let live = compiled.semantic(&node.key).is_some();
-                    let cut = (node.clip.height - node.rect.height).abs() > 0.5;
-                    cut_drawn += usize::from(cut);
-                    let Some(setting) = node
-                        .key
-                        .as_str()
-                        .strip_prefix("settings/control/")
-                        .or_else(|| {
-                            node.key
-                                .as_str()
-                                .strip_prefix("settings/segment/")
-                                .and_then(|rest| rest.rsplit_once('/').map(|(key, _)| key))
-                        })
-                    else {
-                        continue;
-                    };
-                    if !(live && cut) {
-                        continue;
-                    }
-                    let line = UiKey::new(format!("settings/label/{setting}/visual/line-0"));
-                    if compiled.paint.iter().any(|paint| paint.key == line)
-                        && compiled.text_fit_audit_line(&line).is_none()
-                    {
-                        faults.push(format!(
-                            "{context}: {} cut {:?} of {:?}, live, its name not drawn",
-                            node.key.as_str(),
-                            node.clip,
-                            node.rect
-                        ));
-                    }
-                }
-            });
+/// Whether each cut control on one screen is drawn with its name or not at all: a peek control drawn at all shows at
+/// least min(its height, [`scroll::PEEK_MIN`]), and a live cut setting control's first name line, when laid out, paints
+/// its words. Each fault, named by `context`, goes to `faults`, and each cut control drawn counts in `cut_drawn`.
+fn cut_name_checks(
+    compiled: &crate::native_ui::CompiledUi,
+    context: &str,
+    faults: &mut Vec<String>,
+    cut_drawn: &mut usize,
+) {
+    for node in compiled
+        .paint
+        .iter()
+        .filter(|node| is_control(&node.content) && node.peek)
+    {
+        let shows = node.clip.height;
+        if shows + 0.5 < node.rect.height.min(scroll::PEEK_MIN) && shows > 0.5 {
+            faults.push(format!(
+                "{context}: {} {:?} drawn {shows}pt",
+                node.key.as_str(),
+                node.rect
+            ));
+        }
+        let live = compiled.semantic(&node.key).is_some();
+        let cut = (node.clip.height - node.rect.height).abs() > 0.5;
+        *cut_drawn += usize::from(cut);
+        let Some(setting) = node
+            .key
+            .as_str()
+            .strip_prefix("settings/control/")
+            .or_else(|| {
+                node.key
+                    .as_str()
+                    .strip_prefix("settings/segment/")
+                    .and_then(|rest| rest.rsplit_once('/').map(|(key, _)| key))
+            })
+        else {
+            continue;
+        };
+        if !(live && cut) {
+            continue;
+        }
+        let line = UiKey::new(format!("settings/label/{setting}/visual/line-0"));
+        if compiled.paint.iter().any(|paint| paint.key == line)
+            && compiled.text_fit_audit_line(&line).is_none()
+        {
+            faults.push(format!(
+                "{context}: {} cut {:?} of {:?}, live, its name not drawn",
+                node.key.as_str(),
+                node.clip,
+                node.rect
+            ));
         }
     }
-    assert!(
-        faults.is_empty(),
-        "{} faults:\n{}",
-        faults.len(),
-        faults.join("\n")
-    );
-    assert!(cut_drawn > 0, "some screen draws a control an edge cuts");
 }
 
 #[test]
@@ -7012,12 +7075,15 @@ fn no_row_keeps_a_blank_line_for_what_it_may_say() {
     // Color theme and Font family cards at 1074x900), and laid out by each word, "Changed ·
     // Applies after restart" took two lines where "Default · …" took one (Initial columns at
     // 234pt). Every screen of every page, narrow windows and the standard sizes, with nothing
-    // written and with every key written.
+    // written and with every key written: each page's walk on a worker of its rung, each screen
+    // the one its turn compiled.
     let written = every_key_written();
+    let workers = std::thread::available_parallelism()
+        .map_or(SWEEP_WORKERS, |n| n.get().div_ceil(2).max(SWEEP_WORKERS));
     at_each_text_scale(&[1.0, 2.0], "no blank line", |scale| {
-        let mut blank = Vec::new();
-        let mut rows = 0;
-        for ((width, height), source) in [
+        let blank = std::sync::Mutex::new(Vec::new());
+        let rows = std::sync::atomic::AtomicUsize::new(0);
+        let walks: Vec<((f32, f32), &str, SettingsRoute)> = [
             (584.0, 348.0),
             (584.0, 376.0),
             (744.0, 420.0),
@@ -7032,22 +7098,29 @@ fn no_row_keeps_a_blank_line_for_what_it_may_say() {
         ]
         .into_iter()
         .flat_map(|size| [(size, ""), (size, written.as_str())])
-        {
-            for route in SettingsRoute::ALL {
-                if matches!(route, SettingsRoute::Messages | SettingsRoute::Themes) {
-                    continue;
-                }
+        .flat_map(|(size, source)| {
+            SettingsRoute::ALL
+                .into_iter()
+                .filter(|route| !matches!(route, SettingsRoute::Messages | SettingsRoute::Themes))
+                .map(move |route| (size, source, route))
+        })
+        .collect();
+        on_n_workers(
+            workers,
+            &walks,
+            "no blank line",
+            |&((width, height), source, route)| {
                 let mut lab = Lab::new(source);
                 lab.state_mut().navigate(route);
+                let mut compiled = lab.compile(width, height);
                 for _ in 0..30 {
-                    let compiled = lab.compile(width, height);
                     for node in &compiled.paint {
                         let key = node.key.as_str();
                         let line = (key.starts_with("settings/detail/")
                             || key.starts_with("settings/note/")
                             || key.starts_with("settings/group-heading/"))
                             && key.contains("/line-");
-                        rows += usize::from(line);
+                        rows.fetch_add(usize::from(line), std::sync::atomic::Ordering::Relaxed);
                         let empty = match &node.content {
                             UiContent::Group(_) => true,
                             UiContent::Text(spec) => spec.text.trim().is_empty(),
@@ -7058,21 +7131,29 @@ fn no_row_keeps_a_blank_line_for_what_it_may_say() {
                             && node.clip.height > 1.0
                             && !one_word_alone(&compiled, key)
                         {
-                            blank.push(format!(
-                                "{scale}x {width}x{height} {route:?} {key}{}",
-                                if source.is_empty() { "" } else { " written" }
-                            ));
+                            blank
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(format!(
+                                    "{scale}x {width}x{height} {route:?} {key}{}",
+                                    if source.is_empty() { "" } else { " written" }
+                                ));
                         }
                     }
                     let at = lab.state().scroll_shown().map(|(_, view)| view);
                     lab.dispatch(AppEvent::ScrollPage(1));
-                    let _ = lab.compile(width, height);
+                    // The turn's screen, which the next page is.
+                    compiled = lab.compile(width, height);
                     if lab.state().scroll_shown().map(|(_, view)| view) == at {
                         break;
                     }
                 }
-            }
-        }
+            },
+        );
+        let mut blank = blank
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rows = rows.into_inner();
         blank.sort();
         blank.dedup();
         assert!(
@@ -7235,9 +7316,10 @@ fn a_status_bar_never_moves_or_covers_the_switch_pressed() {
     // was on both, whole, and no status's bar covers it, whichever side of the list it takes. Past
     // the first sweep the press is drawn again with no frame in flight too, so the side its
     // landed status takes is weighed from the press's screen.
+    let workers = std::thread::available_parallelism()
+        .map_or(SWEEP_WORKERS, |n| n.get().div_ceil(2).max(SWEEP_WORKERS));
     at_each_text_scale(&[1.0, 2.0], "a bar beside a pressed switch", |scale| {
-        let (mut pressed, mut over, mut held) = (0, 0, 0);
-        let mut faults = Vec::new();
+        let mut presses = Vec::new();
         for source in ["", "theme = \"GitHub Light\"\n"] {
             for ((width, height), in_flight) in [
                 (164.0, 348.0),
@@ -7274,97 +7356,122 @@ fn a_status_bar_never_moves_or_covers_the_switch_pressed() {
                     if matches!(route, SettingsRoute::Messages | SettingsRoute::Themes) {
                         continue;
                     }
-                    let mut lab = Lab::new(source);
-                    lab.state_mut().navigate(route);
-                    let mut found = None;
-                    for _ in 0..8 {
-                        let before = lab.compile(width, height);
-                        found = before
-                            .paint
-                            .iter()
-                            .rfind(|node| {
-                                matches!(node.content, UiContent::Switch(_))
-                                    && node.clip == node.rect
-                                    && before
-                                        .semantic(&node.key)
-                                        .is_some_and(|live| live.rect == node.rect)
-                            })
-                            .map(|node| (node.key.clone(), node.rect));
-                        let last = lab
-                            .state()
-                            .scroll_shown()
-                            .is_none_or(|(plan, shown)| shown.end >= plan.len());
-                        if found.is_some() || last {
-                            break;
-                        }
-                        lab.dispatch(AppEvent::ScrollPage(1));
-                    }
-                    let Some((key, was)) = found else {
-                        continue;
-                    };
-                    let compiled = lab.compile(width, height);
-                    let Some(crate::native_ui::SemanticValue::Bool(on)) =
-                        compiled.semantic(&key).map(|node| node.value.clone())
-                    else {
-                        continue;
-                    };
-                    let setting = key
-                        .as_str()
-                        .trim_start_matches("settings/control/")
-                        .to_string();
-                    lab.state_mut().common.last_focus = Some(key.clone());
-                    let Some((patch, operation)) = lab.invoke(
-                        &format!("settings/set/{setting}"),
-                        Some(SemanticInput::Bool(!on)),
-                    ) else {
-                        continue;
-                    };
-                    let context = format!(
-                        "{route:?} {width}x{height} at {scale}x{} {setting}",
-                        if source.is_empty() { "" } else { " light" }
-                    );
-                    let applying = in_flight.then(|| lab.compile(width, height));
-                    lab.carry(patch, operation);
-                    let landed = lab.compile(width, height);
-                    pressed += 1;
-                    let frames = applying
-                        .iter()
-                        .map(|applying| ("applying", applying))
-                        .chain([("landed", &landed)]);
-                    for (frame, after) in frames {
-                        let now = after
-                            .paint
-                            .iter()
-                            .find(|node| node.key == key)
-                            .map(|node| (node.rect, node.clip));
-                        let bar = after
-                            .semantic(&UiKey::new("settings/feedback"))
-                            .map(|node| node.rect);
-                        if now != Some((was, was)) {
-                            faults.push(format!(
-                                "{context} {frame}: moved from {was:?} to {now:?} beside the \
-                                 bar {bar:?}"
-                            ));
-                        } else if let Some(bar) = bar
-                            && bar.intersect(was).is_some_and(|both| both.height > 0.5)
-                        {
-                            faults
-                                .push(format!("{context} {frame}: the bar {bar:?} covers {was:?}"));
-                        }
-                    }
-                    if after_bar_over(&landed, was) {
-                        over += 1;
-                    }
-                    if landed
-                        .paint
-                        .iter()
-                        .any(|node| node.key.as_str() == "settings/status/visual/thumb")
-                    {
-                        held += 1;
-                    }
+                    presses.push((source, width, height, in_flight, route));
                 }
             }
         }
+        // Each press on a worker of its rung, on a lab of its own.
+        let [pressed, over, held] = [(); 3].map(|()| std::sync::atomic::AtomicUsize::new(0));
+        let faults = std::sync::Mutex::new(Vec::new());
+        let count = |n: &std::sync::atomic::AtomicUsize| {
+            n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        };
+        let fault = |line: String| {
+            faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(line);
+        };
+        on_n_workers(
+            workers,
+            &presses,
+            "a bar beside a pressed switch",
+            |&(source, width, height, in_flight, route)| {
+                let mut lab = Lab::new(source);
+                lab.state_mut().navigate(route);
+                let mut found = None;
+                for _ in 0..8 {
+                    let before = lab.compile(width, height);
+                    found = before
+                        .paint
+                        .iter()
+                        .rfind(|node| {
+                            matches!(node.content, UiContent::Switch(_))
+                                && node.clip == node.rect
+                                && before
+                                    .semantic(&node.key)
+                                    .is_some_and(|live| live.rect == node.rect)
+                        })
+                        .map(|node| (node.key.clone(), node.rect));
+                    let last = lab
+                        .state()
+                        .scroll_shown()
+                        .is_none_or(|(plan, shown)| shown.end >= plan.len());
+                    if found.is_some() || last {
+                        break;
+                    }
+                    lab.dispatch(AppEvent::ScrollPage(1));
+                }
+                let Some((key, was)) = found else {
+                    return;
+                };
+                let compiled = lab.compile(width, height);
+                let Some(crate::native_ui::SemanticValue::Bool(on)) =
+                    compiled.semantic(&key).map(|node| node.value.clone())
+                else {
+                    return;
+                };
+                let setting = key
+                    .as_str()
+                    .trim_start_matches("settings/control/")
+                    .to_string();
+                lab.state_mut().common.last_focus = Some(key.clone());
+                let Some((patch, operation)) = lab.invoke(
+                    &format!("settings/set/{setting}"),
+                    Some(SemanticInput::Bool(!on)),
+                ) else {
+                    return;
+                };
+                let context = format!(
+                    "{route:?} {width}x{height} at {scale}x{} {setting}",
+                    if source.is_empty() { "" } else { " light" }
+                );
+                let applying = in_flight.then(|| lab.compile(width, height));
+                lab.carry(patch, operation);
+                let landed = lab.compile(width, height);
+                count(&pressed);
+                let frames = applying
+                    .iter()
+                    .map(|applying| ("applying", applying))
+                    .chain([("landed", &landed)]);
+                for (frame, after) in frames {
+                    let now = after
+                        .paint
+                        .iter()
+                        .find(|node| node.key == key)
+                        .map(|node| (node.rect, node.clip));
+                    let bar = after
+                        .semantic(&UiKey::new("settings/feedback"))
+                        .map(|node| node.rect);
+                    if now != Some((was, was)) {
+                        fault(format!(
+                            "{context} {frame}: moved from {was:?} to {now:?} beside the \
+                         bar {bar:?}"
+                        ));
+                    } else if let Some(bar) = bar
+                        && bar.intersect(was).is_some_and(|both| both.height > 0.5)
+                    {
+                        fault(format!("{context} {frame}: the bar {bar:?} covers {was:?}"));
+                    }
+                }
+                if after_bar_over(&landed, was) {
+                    count(&over);
+                }
+                if landed
+                    .paint
+                    .iter()
+                    .any(|node| node.key.as_str() == "settings/status/visual/thumb")
+                {
+                    count(&held);
+                }
+            },
+        );
+        let [pressed, over, held] =
+            [pressed, over, held].map(std::sync::atomic::AtomicUsize::into_inner);
+        let mut faults = faults
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        faults.sort();
         assert!(
             faults.is_empty(),
             "{} faults:\n{}",

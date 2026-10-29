@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use super::{
     CARRYING_ON, Chain, DEFENSE_HEAD, NEED, NEED_A, NEED_B, NEED_C, Opening, Scenario, Seen, Tab,
-    Verdict, at, attention_text, needs_up, on, word,
+    Verdict, at, attention_text, needs_up, on, reading, reading_on, word,
 };
 use crate::door::Door;
 use crate::stop;
@@ -25,6 +25,13 @@ const IDLE_QUIET_BEFORE_MS: i64 = 10_000;
 
 /// How far before a tab's next due act the idle window closes.
 const IDLE_CLEAR_AFTER_MS: i64 = 15_000;
+
+/// How long after the idle window's `metrics reset` its opening `metrics` read comes, from which
+/// the window counts its timer wakes, arms and fires: eight times the status sweep's longest
+/// follow-up (250 ms after a write) and twenty the output-wake watch's latch (100 ms), so what a
+/// write just before the reset was owed fires before the count opens, not inside it beside no
+/// `Output` wake.
+const IDLE_SETTLE_MS: i64 = 2_000;
 
 /// The hang detector of the search for an idle window.
 const IDLE_SEARCH_MS: i64 = 8 * 60_000;
@@ -65,6 +72,9 @@ pub struct Window {
     pub looked: Vec<(i64, String)>,
     /// Front-sweep `autopilot` line read after capture.
     pub front: Option<(i64, String)>,
+    /// What that `chrome` read answered where it failed, the tab brought in front: no line stands
+    /// in [`Self::front`] for it.
+    pub front_failed: Option<String>,
     /// End-of-run resting summary line (L7).
     pub rest: Option<String>,
     /// The chip's title as its hover reads it (`chrome`'s ` title=`, a development build's), split
@@ -75,6 +85,9 @@ pub struct Window {
     /// before its first prompt unless the manager's spawn already supplied its task
     /// ([`opening_sweep`]).
     pub opening: Option<(i64, String)>,
+    /// What that `chrome` read answered where it failed: no line stands in [`Self::opening`] for
+    /// it, and the title before the first prompt goes unjudged ([`title_words`] fails).
+    pub opening_failed: Option<String>,
     /// Its row one level into its manager's submenu ([`worker_of`]): `-` where none names it.
     pub worker: Vec<(i64, String)>,
     /// A same-reply chain's looks in front past its hold ([`held::look_step`]): each its
@@ -212,10 +225,14 @@ impl Desk {
 pub struct Idle {
     pub from: i64,
     pub ms: i64,
-    /// `metrics` snapshot captured after the idle window.
+    /// What the idle window's two `metrics` reads say ([`idle_metrics_between`]).
     pub metrics: String,
-    /// `metrics percentiles` snapshot captured after the idle window.
+    /// What the idle window's two `metrics percentiles` reads say ([`idle_percentiles_between`]).
     pub percentiles: String,
+    /// What its `metrics` calls answered where one failed (the reset, or a read of the counts):
+    /// without the reset the counts run from before the window, and a failed read has none, so
+    /// END judges none of them.
+    pub metrics_failed: Option<String>,
     /// Tab journal lines or acts recorded during the idle window.
     pub moved: Vec<String>,
     /// Duplicate journal lines rewritten during the idle window.
@@ -1732,10 +1749,12 @@ fn l7_rows(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
             .and_then(|n| n.parse::<usize>().ok())
     });
     let mut unread = Vec::new();
-    match (counted, tabs) {
-        (_, None) => unread.push(UNREST.to_string()),
-        (Some(n), Some(k)) if n == k && k > 0 => {}
-        (n, Some(k)) => bad.push(format!(
+    match (counted, tabs, rest.and_then(totals_short)) {
+        (_, None, _) => unread.push(UNREST.to_string()),
+        (_, _, Some(Verdict::Fail(why))) => bad.push(why),
+        (_, _, Some(v)) => unread.push(v.why().to_string()),
+        (Some(n), Some(k), None) if n == k && k > 0 => {}
+        (n, Some(k), None) => bad.push(format!(
             "This Mac reads {} landed, {k} tab(s) said task=landed: {}",
             n.map_or_else(|| "no".to_string(), |n| n.to_string()),
             here.as_deref().unwrap_or("-")
@@ -1765,7 +1784,8 @@ pub fn held_at_rest(status: &str) -> Option<bool> {
 /// read, exactly, and a build whose This Mac calls a held tab `resting` fails. It never passes on
 /// `-` (§14.0 limit 7): UNOBSERVED where an open Land tab's `status` names no hold either way
 /// (`held_unread`), where no Land tab holds at rest, and where This Mac counts a wait, which
-/// counts first and which no `status` attributes to a tab.
+/// counts first and which no `status` attributes to a tab; a FAIL where END's `status` read of a
+/// tab failed, which no total counts ([`totals_short`]).
 fn l7_here(seen: &Seen, _cx: &Ctx<'_>) -> Verdict {
     let Some(rest) = seen.window.rest.as_deref() else {
         return Verdict::Unobserved(UNREST.into());
@@ -1776,6 +1796,9 @@ fn l7_here(seen: &Seen, _cx: &Ctx<'_>) -> Verdict {
     else {
         return Verdict::Unobserved(format!("the rest read lacks its counts: {rest}"));
     };
+    if let Some(v) = totals_short(rest) {
+        return v;
+    }
     let Some(counts) = quoted(rest, "here")
         .as_deref()
         .and_then(|h| h.strip_prefix("This Mac \u{2014} "))
@@ -1894,6 +1917,12 @@ pub fn title_says(t: &str, mode: &str) -> TitleSays {
 /// A tab whose chip is not drawn names no title (agy's bare footer under its off switch).
 fn title_words(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let w = &seen.window;
+    if let Some(e) = &w.opening_failed {
+        return Verdict::Fail(format!(
+            "{}'s opening line unread ({e}), so its title before the first prompt is unjudged",
+            w.label
+        ));
+    }
     let mode = cx.chain.autopilot();
     let spawned = cx.chain.opening() == Opening::Spawned;
     let mut reads: Vec<(i64, &str, Chip, Option<String>)> = Vec::new();
@@ -2248,7 +2277,23 @@ fn l7_did(seen: &Seen, _cx: &Ctx<'_>) -> Verdict {
 }
 
 /// Why a want of the window at rest is unread: END never read it.
-const UNREST: &str = "the window never read at rest (END not reached)";
+const UNREST: &str = "the window never read at rest (END not reached, or its idle window moved)";
+
+/// Where the rest read's tab totals (`landed_tabs`, `landing_tabs`, `held_*`) leave a tab out: a
+/// FAIL naming each tab whose `status` read END failed and what it answered (the line's
+/// `status_failed=`, `-` where every read answered); UNOBSERVED where the line lacks the key.
+/// `None` where every tab is counted.
+fn totals_short(rest: &str) -> Option<Verdict> {
+    match quoted(rest, "status_failed").as_deref() {
+        Some("-") => None,
+        Some(failed) => Some(Verdict::Fail(format!(
+            "END's status read failed, so the tab totals leave that tab out: {failed}"
+        ))),
+        None => Some(Verdict::Unobserved(format!(
+            "the rest read lacks its counts: {rest}"
+        ))),
+    }
+}
 
 /// L7 on the page (4c), at rest.
 fn l7_page(seen: &Seen, _cx: &Ctx<'_>) -> Verdict {
@@ -2261,6 +2306,9 @@ fn l7_page(seen: &Seen, _cx: &Ctx<'_>) -> Verdict {
     else {
         return Verdict::Unobserved(format!("the rest read lacks its counts: {rest}"));
     };
+    if let Some(v) = totals_short(rest) {
+        return v;
+    }
     let today = quoted(rest, "today").filter(|t| t != "-");
     let every = quoted(rest, "every").filter(|e| e != "-");
     let mut bad = Vec::new();
@@ -2780,6 +2828,12 @@ pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)], program: &str) -> Verdi
     let Some(idle) = &desk.idle else {
         return Verdict::Unobserved("END's idle window was never had".into());
     };
+    if let Some(e) = &idle.metrics_failed {
+        return Verdict::Fail(format!(
+            "END's idle window of {} s: a `metrics` call failed, so none of its counts is judged: {e}",
+            idle.ms / 1000
+        ));
+    }
     let m = &idle.metrics;
     let p = &idle.percentiles;
     let timer = metric(m, "timer_wakes");
@@ -2897,7 +2951,10 @@ pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)], program: &str) -> Verdi
     let mut swept = 0;
     for (chain, w) in tabs {
         let Some((_, l)) = &w.front else {
-            sweep.push(format!("{} never brought in front", chain.name()));
+            sweep.push(w.front_failed.as_ref().map_or_else(
+                || format!("{} never brought in front", chain.name()),
+                |e| format!("{}: its autopilot line unread in front ({e})", chain.name()),
+            ));
             continue;
         };
         swept += 1;
@@ -3013,17 +3070,23 @@ fn count_of(v: &str, owner: &str) -> u64 {
 }
 
 /// Captures the front tab and reads `chrome` and the Harness page into a [`Glance`].
-pub fn glance(door: &Door<'_>, desk: &Desk) -> Glance {
+///
+/// # Errors
+///
+/// What `chrome` answered where that read failed ([`reading`]): no glance is had of it, since its
+/// empty strip and menu would read as none drawn. A failed page read is a glance with no
+/// [`Glance::page_read`].
+pub fn glance(door: &Door<'_>, desk: &Desk) -> Result<Glance, String> {
     if !desk.front_sid.is_empty() {
         let _ = on(door, &desk.front_sid, &["image", FRONT_IMAGE]);
     }
-    let chrome = door.out(&["chrome"]);
+    let chrome = reading(door, &["chrome"])?;
     let page = if desk.page_view.is_empty() {
         String::new()
     } else {
         door.out(&["inspect", "app/v1", "view", &desk.page_view, "text"])
     };
-    Glance::of(now_ms(), &chrome, &page)
+    Ok(Glance::of(now_ms(), &chrome, &page))
 }
 
 /// The windows' ids in `inspect app/v1 tabs`.
@@ -3118,9 +3181,16 @@ pub fn window_of(ls: &str, sid: &str) -> Option<String> {
         .and_then(|l| word(l, "window"))
 }
 
+/// Tab `sid`'s `autopilot` line as `chrome` reads it now (title and all; `-` where it names
+/// none); `Err` with what `chrome` answered where that read failed, which no `-` stands in for.
+fn autopilot_line(door: &Door<'_>, sid: &str) -> Result<String, String> {
+    reading(door, &["chrome"]).map(|c| chip_of(&c, sid).unwrap_or_else(|| "-".into()))
+}
+
 /// Brings `tab` in front of the chains' window, captures it so its chip is drawn, and reads its
-/// `autopilot` line (title and all); `None` where its label is not in the front window's strip.
-fn in_front(door: &Door<'_>, tab: &Tab) -> Option<(String, String)> {
+/// `autopilot` line ([`autopilot_line`]); `None` where its label is not in the front window's
+/// strip.
+fn in_front(door: &Door<'_>, tab: &Tab) -> Option<(String, Result<String, String>)> {
     let label = &tab.seen.window.label;
     let i = strip_tabs(&door.out(&["chrome"]))
         .into_iter()
@@ -3129,19 +3199,20 @@ fn in_front(door: &Door<'_>, tab: &Tab) -> Option<(String, String)> {
         .to_string();
     let r = door.out(&["tab", &i]);
     let _ = on(door, &tab.sid, &["image", FRONT_IMAGE]);
-    let line = chip_of(&door.out(&["chrome"]), &tab.sid).unwrap_or_else(|| "-".into());
+    let line = autopilot_line(door, &tab.sid);
     Some((format!("tab {i}: {}", r.trim()), line))
 }
 
-/// [`in_front`], and where its chip was not drawn ([`undrawn`]) captured again until it is, the
-/// hang detector [`STEP_WAIT`].
-fn in_front_drawn(door: &Door<'_>, tab: &Tab) -> Option<(String, String)> {
+/// [`in_front`], and where its chip was not drawn ([`undrawn`]) or its line not read, captured
+/// and read again until it is, the hang detector [`STEP_WAIT`].
+fn in_front_drawn(door: &Door<'_>, tab: &Tab) -> Option<(String, Result<String, String>)> {
+    let drawn = |line: &Result<String, String>| line.as_deref().is_ok_and(|l| !undrawn(l));
     in_front(door, tab).map(|(said, mut line)| {
-        if undrawn(&line) {
+        if !drawn(&line) {
             let _ = wait_until(STEP_WAIT, || {
                 let _ = on(door, &tab.sid, &["image", FRONT_IMAGE]);
-                line = chip_of(&door.out(&["chrome"]), &tab.sid).unwrap_or_else(|| "-".into());
-                !undrawn(&line)
+                line = autopilot_line(door, &tab.sid);
+                drawn(&line)
             });
         }
         (said, line)
@@ -3176,9 +3247,16 @@ pub(super) fn opening_sweep(
             in_front(door, tab)
         };
         match read {
-            Some((said, line)) => {
+            Some((said, Ok(line))) => {
                 println!("  opening   {label} ({said}): {}", one_line(&line, 400));
                 tab.seen.window.opening = Some((now_ms(), line));
+            }
+            Some((said, Err(e))) => {
+                println!(
+                    "  opening   {label} ({said}): its line unread, none kept: {}",
+                    one_line(&e, 400)
+                );
+                tab.seen.window.opening_failed = Some(e);
             }
             None => println!("  opening   {label}: not in the front window's strip"),
         }
@@ -3379,7 +3457,96 @@ pub fn idle_percentiles(reply: &str) -> String {
     )
 }
 
-/// The end's idle window: once every tab's journal stood still [`IDLE_QUIET_BEFORE_MS`] and no tab's next act falls within it and [`IDLE_CLEAR_AFTER_MS`] after, `metrics reset`, [`IDLE_MS`] with no read, then `metrics` and `metrics percentiles`.
+/// What END keeps of the idle window's `metrics` replies ([`Idle::metrics`]): the effects
+/// (`timer_wakes`, `event_wakes`, `wake_heals`, each owner's arms and fires) counted from
+/// `opened`, read [`IDLE_SETTLE_MS`] after the reset, to `closed`, and the causes
+/// (`wakes_by_variant`'s writes, `output_wake_late`) and `deadline_owner` as `closed` reads them,
+/// from the reset. A write the window counts is owed its fires inside the count; one before the
+/// reset had its fires before `opened`.
+#[must_use]
+pub fn idle_metrics_between(opened: &str, closed: &str) -> String {
+    between(
+        &idle_metrics(closed),
+        opened,
+        &[
+            "timer_wakes",
+            "event_wakes",
+            "wake_heals",
+            "deadline_arms_by_owner",
+            "deadline_fires_by_owner",
+        ],
+    )
+}
+
+/// What END keeps of the idle window's `metrics percentiles` replies ([`Idle::percentiles`]):
+/// `n_render` and `n_input` counted from `opened` to `closed` ([`idle_metrics_between`]), the
+/// render times as `closed` reads them, from the reset.
+#[must_use]
+pub fn idle_percentiles_between(opened: &str, closed: &str) -> String {
+    between(&idle_percentiles(closed), opened, &["n_render", "n_input"])
+}
+
+/// `kept` (`key=value …`) with each of `counted` less its value in `opened`: a count, or an
+/// `owner:n` / `owner:n/m` list less each owner's counts there (an owner left at zero dropped,
+/// `none` once none is left). `-` where either side lacks it or does not parse.
+fn between(kept: &str, opened: &str, counted: &[&str]) -> String {
+    kept.split(' ')
+        .map(|kv| match kv.split_once('=') {
+            Some((key, closed)) if counted.contains(&key) => {
+                format!("{key}={}", counts_less(closed, &metric(opened, key)))
+            }
+            _ => kv.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `closed` less `opened`: two counts, or two `owner:n[/m]` lists ([`between`]).
+fn counts_less(closed: &str, opened: &str) -> String {
+    let parts = |v: &str| -> Option<Vec<u64>> { v.split('/').map(|n| n.parse().ok()).collect() };
+    let pairs = |v: &str| -> Option<Vec<(String, Vec<u64>)>> {
+        if v == "none" {
+            return Some(Vec::new());
+        }
+        v.split(',')
+            .map(|p| {
+                let (owner, n) = p.split_once(':')?;
+                Some((owner.to_string(), parts(n)?))
+            })
+            .collect()
+    };
+    if let (Ok(c), Ok(o)) = (closed.parse::<u64>(), opened.parse::<u64>()) {
+        return c.saturating_sub(o).to_string();
+    }
+    let (Some(c), Some(o)) = (pairs(closed), pairs(opened)) else {
+        return "-".into();
+    };
+    let left: Vec<String> = c
+        .into_iter()
+        .filter_map(|(owner, n)| {
+            let had = o
+                .iter()
+                .find(|(w, _)| *w == owner)
+                .map(|(_, m)| m.as_slice());
+            let n: Vec<u64> = n
+                .iter()
+                .enumerate()
+                .map(|(i, k)| k.saturating_sub(had.and_then(|m| m.get(i)).copied().unwrap_or(0)))
+                .collect();
+            n.iter().any(|k| *k != 0).then(|| {
+                let n: Vec<String> = n.iter().map(u64::to_string).collect();
+                format!("{owner}:{}", n.join("/"))
+            })
+        })
+        .collect();
+    if left.is_empty() {
+        "none".into()
+    } else {
+        left.join(",")
+    }
+}
+
+/// The end's idle window: once every tab's journal stood still [`IDLE_QUIET_BEFORE_MS`] and no tab's next act falls within it and [`IDLE_CLEAR_AFTER_MS`] after, `metrics reset`, [`IDLE_SETTLE_MS`], an opening `metrics` and `metrics percentiles`, [`IDLE_MS`] with no read, then `metrics` and `metrics percentiles` again ([`idle_metrics_between`]), each call that failed kept in [`Idle::metrics_failed`].
 fn idle_window(
     run: &crate::run::Run,
     door: &Door<'_>,
@@ -3396,7 +3563,8 @@ fn idle_window(
             let now = now_ms();
             let (due, last) = due_and_quiet(tabs, now);
             let quiet = now - last >= IDLE_QUIET_BEFORE_MS;
-            let clear = due.is_none_or(|d| d - now >= IDLE_MS + IDLE_CLEAR_AFTER_MS);
+            let clear =
+                due.is_none_or(|d| d - now >= IDLE_SETTLE_MS + IDLE_MS + IDLE_CLEAR_AFTER_MS);
             if quiet && clear {
                 break;
             }
@@ -3424,12 +3592,27 @@ fn idle_window(
             .collect();
         let holds = holds_of(tabs);
         let from = now_ms();
-        let _ = door.out(&["metrics", "reset"]);
+        // A failed call is kept in `metrics_failed`, beside which END judges none of the counts:
+        // the empty reply in its place is never read as one.
+        let mut failed = Vec::new();
+        let mut read = |args: &[&str]| {
+            reading(door, args).unwrap_or_else(|e| {
+                failed.push(e);
+                String::new()
+            })
+        };
+        let _ = read(&["metrics", "reset"]);
+        stop::sleep(Duration::from_millis(
+            u64::try_from(IDLE_SETTLE_MS).unwrap_or(2_000),
+        ))?;
+        let opened = read(&["metrics"]);
+        let opened_percentiles = read(&["metrics", "percentiles"]);
         stop::sleep(Duration::from_millis(
             u64::try_from(IDLE_MS).unwrap_or(20_000),
         ))?;
-        let metrics = door.out(&["metrics"]);
-        let percentiles = door.out(&["metrics", "percentiles"]);
+        let metrics = read(&["metrics"]);
+        let percentiles = read(&["metrics", "percentiles"]);
+        let metrics_failed = (!failed.is_empty()).then(|| failed.join("; "));
         let ms = now_ms() - from;
         let page_open = !desk.page_view.is_empty()
             && door
@@ -3446,8 +3629,9 @@ fn idle_window(
         let idle = Idle {
             from,
             ms,
-            metrics: idle_metrics(&metrics),
-            percentiles: idle_percentiles(&percentiles),
+            metrics: idle_metrics_between(&opened, &metrics),
+            percentiles: idle_percentiles_between(&opened_percentiles, &percentiles),
+            metrics_failed,
             moved,
             relogged,
             ends,
@@ -3533,10 +3717,13 @@ pub(super) fn end_steps(
     say(
         desk,
         format!(
-            "idle {} ms: {} {}{}",
+            "idle {} ms: {} {}{}{}",
             idle.ms,
             idle.metrics,
             idle.percentiles,
+            idle.metrics_failed
+                .as_ref()
+                .map_or_else(String::new, |e| format!(" metrics failed: {e}")),
             if idle.moved.is_empty() {
                 String::new()
             } else {
@@ -3554,6 +3741,7 @@ pub(super) fn end_steps(
             ),
         );
     }
+    let at_rest = idle.moved.is_empty();
     desk.idle = Some(idle);
     let g = Glance::of(now_ms(), &door.out(&["chrome"]), "");
     let here = g
@@ -3563,8 +3751,16 @@ pub(super) fn end_steps(
         .map_or_else(String::new, |r| r.label.clone());
     let (mut landed_tabs, mut landing_tabs) = (0, 0);
     let (mut held_landing, mut held_needs, mut held_unread) = (0, 0, 0);
+    let mut unread_status = Vec::new();
     for t in tabs.iter() {
-        let s = on(door, &t.sid, &["status"]);
+        // A tab whose read failed is in no total: the rest line's `status_failed=` names it.
+        let s = match reading_on(door, &t.sid, &["status"]) {
+            Ok(s) => s,
+            Err(e) => {
+                unread_status.push(format!("{}: {e}", t.chain.name()));
+                continue;
+            }
+        };
         if word(&s, "autopilot").as_deref() != Some("land") {
             continue;
         }
@@ -3625,15 +3821,26 @@ pub(super) fn end_steps(
         did
     };
     let rest = format!(
-        "here={} landed_tabs={landed_tabs} landing_tabs={landing_tabs} held_landing={held_landing} held_needs={held_needs} held_unread={held_unread} landings={landings} today={} every={} did={}",
+        "here={} landed_tabs={landed_tabs} landing_tabs={landing_tabs} held_landing={held_landing} held_needs={held_needs} held_unread={held_unread} landings={landings} today={} every={} did={} status_failed={}",
         q(&here),
         q(today.as_deref().unwrap_or("-")),
         q(every.as_deref().unwrap_or("-")),
-        q(did.as_deref().unwrap_or("-"))
+        q(did.as_deref().unwrap_or("-")),
+        q(&if unread_status.is_empty() {
+            "-".to_string()
+        } else {
+            unread_status.join("; ")
+        })
     );
-    say(desk, format!("at rest {rest}"));
-    for tab in tabs.iter_mut() {
-        tab.seen.window.rest = Some(rest.clone());
+    if at_rest {
+        say(desk, format!("at rest {rest}"));
+        for tab in tabs.iter_mut() {
+            tab.seen.window.rest = Some(rest.clone());
+        }
+    } else {
+        // Its idle window moved, so a tab's act can fall between the menu's read and the tabs'
+        // statuses, whose totals L7 holds equal: no tab keeps it.
+        say(desk, format!("not at rest {rest}"));
     }
     let index_of = |door: &Door<'_>, label: &str| {
         strip_tabs(&door.out(&["chrome"]))
@@ -3644,9 +3851,16 @@ pub(super) fn end_steps(
     for tab in tabs.iter_mut() {
         let label = tab.seen.window.label.clone();
         match in_front(door, tab) {
-            Some((said, line)) => {
+            Some((said, Ok(line))) => {
                 say(desk, format!("front {label} ({said}): {line}"));
                 tab.seen.window.front = Some((now_ms(), line));
+            }
+            Some((said, Err(e))) => {
+                say(
+                    desk,
+                    format!("front {label} ({said}): its line unread: {e}"),
+                );
+                tab.seen.window.front_failed = Some(e);
             }
             None => say(desk, format!("{label}: not in the front window's strip")),
         }

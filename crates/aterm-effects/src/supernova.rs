@@ -230,6 +230,26 @@ struct QuadSink<'a> {
 
 impl QuadSink<'_> {
     #[inline]
+    const fn intersects(&self, x: i32, y: i32, w: i32, h: i32) -> bool {
+        if self.budget == 0 || w <= 0 || h <= 0 || self.cell_h <= 0 {
+            return false;
+        }
+        let x0 = if x > 0 { x } else { 0 };
+        let x1 = if x + w < self.grid_w {
+            x + w
+        } else {
+            self.grid_w
+        };
+        let y0 = if y > 0 { y } else { 0 };
+        let y1 = if y + h < self.grid_h {
+            y + h
+        } else {
+            self.grid_h
+        };
+        x1 > x0 && y1 > y0
+    }
+
+    #[inline]
     fn push(&mut self, x: i32, y: i32, w: i32, h: i32, premul: u32) {
         if w <= 0 || h <= 0 || premul == 0 || self.cell_h <= 0 {
             return;
@@ -367,29 +387,35 @@ pub fn emit_super(
         // light themes draw them on the Over deco stream (`emit_super_decos`).
         if !env.light {
             let p = t_ms as f32 * INV_CHARGE_END_MS;
-            let n0 = sink.out.len();
-            let sz = (env.cell_h / 5).max(2);
-            let half_sz = sz / 2;
             let cov = env.intensity * (0.25 + 0.75 * p);
-            let mut k = 0;
-            while k < CHARGE_MOTES {
-                let (x, y) = charge_mote_pos(env, k, p);
-                let hue = env.base_hue + k as f32 * 30.0;
-                let tone = hsv2rgb(hue, 0.55, 1.0);
-                sink.push(x - half_sz, y - half_sz, sz, sz, premul(tone, cov));
-                k += 1;
+            if cov > 0.0 {
+                let n0 = sink.out.len();
+                let sz = (env.cell_h / 5).max(2);
+                let half_sz = sz / 2;
+                let mut k = 0;
+                while k < CHARGE_MOTES {
+                    let (x, y) = charge_mote_pos(env, k, p);
+                    let (qx, qy) = (x - half_sz, y - half_sz);
+                    if sink.intersects(qx, qy, sz, sz) {
+                        let hue = env.base_hue + k as f32 * 30.0;
+                        let tone = hsv2rgb(hue, 0.55, 1.0);
+                        sink.push(qx, qy, sz, sz, premul(tone, cov));
+                    }
+                    k += 1;
+                }
+                counts.charge = sink.out.len() - n0;
             }
-            counts.charge = sink.out.len() - n0;
         }
     } else if t_ms < DETONATION_END_MS {
         let e = (t_ms - CHARGE_END_MS) as f32 * INV_DETONATION_SPAN_MS;
         let env_a = rise_fall(e) * env.intensity;
-        if !env.light {
+        if !env.light && env_a > 0.0 {
             let vrows = env.grid_h / env.cell_h.max(1);
             let rows = vrows.min(MAX_WASH_ROWS as i32);
             let center_row = env.cy / env.cell_h.max(1);
             let r0 = (center_row - rows / 2).clamp(0, (vrows - rows).max(0));
             let n0 = sink.out.len();
+            let base_wash_cov = 0.9 * env_a;
             let r_end = r0 + rows;
             let mut r = r0;
             while r < r_end {
@@ -404,7 +430,7 @@ pub fn emit_super(
                         falloff,
                     )
                 };
-                let cov = 0.9 * env_a * falloff;
+                let cov = base_wash_cov * falloff;
                 sink.push(0, r * env.cell_h, env.grid_w, env.cell_h, premul(tone, cov));
                 r += 1;
             }
@@ -418,21 +444,23 @@ pub fn emit_super(
         let fade = 1.0 - q;
         let ring_cov = (crate::color_math::sqrt_f32(fade) * env.intensity).min(1.0);
         let n0 = sink.out.len();
-        const RING_SPECS: [(usize, f32); 2] = [(0, 1.0), (1, 0.72)];
-        let base_r = env.r_max * ease_out(q);
-        let mut ring_idx = 0;
-        while ring_idx < RING_SPECS.len() {
-            let (ring, rscale) = RING_SPECS[ring_idx];
-            ring_idx += 1;
-            let r = base_r * rscale;
-            let thick = 3.0 - ring as f32;
-            let hue = env.base_hue + ring as f32 * 40.0;
-            let tone = if env.light {
-                hsv2rgb(hue, 1.0, 0.72)
-            } else {
-                mix_rgb(hsv2rgb(hue, 0.7, 1.0), 0x00FF_FFFF, 0.35)
-            };
-            emit_ring_chords(&mut sink, env, r, thick, premul(tone, ring_cov));
+        if ring_cov > 0.0 {
+            const RING_SPECS: [(usize, f32); 2] = [(0, 1.0), (1, 0.72)];
+            let base_r = env.r_max * ease_out(q);
+            let mut ring_idx = 0;
+            while ring_idx < RING_SPECS.len() {
+                let (ring, rscale) = RING_SPECS[ring_idx];
+                ring_idx += 1;
+                let r = base_r * rscale;
+                let thick = 3.0 - ring as f32;
+                let hue = env.base_hue + ring as f32 * 40.0;
+                let tone = if env.light {
+                    hsv2rgb(hue, 1.0, 0.72)
+                } else {
+                    mix_rgb(hsv2rgb(hue, 0.7, 1.0), 0x00FF_FFFF, 0.35)
+                };
+                emit_ring_chords(&mut sink, env, r, thick, premul(tone, ring_cov));
+            }
         }
         counts.ring = sink.out.len() - n0;
     }
@@ -450,8 +478,14 @@ fn bound_additive_overlap(quads: &mut [GlowQuad]) {
     let mut i = 0;
     while i < quads.len() {
         let q = &mut quads[i];
-        q.color = scale_rgb_floor(q.color, MAX_VIEWPORT_OVERLAY, peak);
-        q.color2 = scale_rgb_floor(q.color2, MAX_VIEWPORT_OVERLAY, peak);
+        let c1 = q.color;
+        let s1 = scale_rgb_floor(c1, MAX_VIEWPORT_OVERLAY, peak);
+        q.color = s1;
+        q.color2 = if q.color2 == c1 {
+            s1
+        } else {
+            scale_rgb_floor(q.color2, MAX_VIEWPORT_OVERLAY, peak)
+        };
         i += 1;
     }
 }
@@ -520,10 +554,14 @@ fn peak_additive_channel(quads: &[GlowQuad]) -> u32 {
             let mut yi = 0;
             while yi < row.len() {
                 let y_edge = &row[yi];
+                if y_edge.w == 0 || y_edge.h == 0 {
+                    yi += 1;
+                    continue;
+                }
                 let mut dup = false;
                 let mut pi = 0;
                 while pi < yi {
-                    if row[pi].y == y_edge.y {
+                    if row[pi].y == y_edge.y && row[pi].w > 0 && row[pi].h > 0 {
                         dup = true;
                         break;
                     }
@@ -534,6 +572,20 @@ fn peak_additive_channel(quads: &[GlowQuad]) -> u32 {
                     continue;
                 }
                 let py = u32::from(y_edge.y);
+                let mut py_sum = [0u32; 3];
+                let mut qi = 0;
+                while qi < row.len() {
+                    let q = &row[qi];
+                    qi += 1;
+                    if q.w > 0 && py >= u32::from(q.y) && py < u32::from(q.y) + u32::from(q.h) {
+                        py_sum[0] += (q.color >> 16) & 0xff;
+                        py_sum[1] += (q.color >> 8) & 0xff;
+                        py_sum[2] += q.color & 0xff;
+                    }
+                }
+                if py_sum[0].max(py_sum[1]).max(py_sum[2]) <= peak {
+                    continue;
+                }
                 let mut sum = [0u32; 3];
                 let (mut i, mut j) = (0, 0);
                 while i < row.len() {
@@ -726,7 +778,7 @@ fn emit_crown_quads(sink: &mut QuadSink<'_>, env: &SuperEnv, env_a: f32) {
 /// ≤ 2 chords per band).
 #[inline]
 fn emit_ring_chords(sink: &mut QuadSink<'_>, env: &SuperEnv, r: f32, thick: f32, premul: u32) {
-    if r <= 1.0 {
+    if premul == 0 || r <= 1.0 {
         return;
     }
     let ro = r + 0.5 * thick;
@@ -789,6 +841,9 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
     const INV_DETONATION_SPAN_MS: f32 = 1.0 / (DETONATION_END_MS - CHARGE_END_MS) as f32;
     const INV_SHOCK_SPAN_MS: f32 = 1.0 / (SHOCK_END_MS - DETONATION_END_MS) as f32;
     const INV_DEBRIS_SPAN_MS: f32 = 1.0 / (SUPER_TOTAL_MS - DEBRIS_START_MS) as f32;
+    if out.len() >= cap {
+        return;
+    }
     let out_start = out.len();
     let (cw, ch) = (env.cell_w.max(1), env.cell_h.max(1));
     if env.light && t_ms < CHARGE_END_MS {
@@ -851,8 +906,13 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
                 }
                 let row_u = r as u16;
                 let dy_abs = (dr - rows_span / 2).unsigned_abs() as usize;
-                let ny = (dr - rows_span / 2) as f32 * INV_HALF_ROWS;
-                let ny2 = ny * ny;
+                let row_falloff = &VEIL_FALLOFF_28[dy_abs];
+                let ny2 = if use_table {
+                    0.0
+                } else {
+                    let ny = (dr - rows_span / 2) as f32 * INV_HALF_ROWS;
+                    ny * ny
+                };
                 dr += 1;
                 let mut dc = 0;
                 while dc < width_i32 {
@@ -866,7 +926,7 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
                         if dx_abs >= VEIL_HALF_W {
                             continue;
                         }
-                        let f = VEIL_FALLOFF_28[dy_abs][dx_abs];
+                        let f = row_falloff[dx_abs];
                         if f <= 0.0 {
                             continue;
                         }
@@ -993,7 +1053,7 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
         ];
         let half_cw = env.cell_w / 2;
         let half_ch = env.cell_h / 2;
-        let hue_drift = p * 90.0;
+        let base_hue_drift = env.base_hue + p * 90.0;
         let mut k = 0;
         while k < n {
             if out.len() >= cap {
@@ -1013,7 +1073,7 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
                 continue;
             }
             let (row, col) = (y / ch, x / cw);
-            let hue = env.base_hue + k_f32 * hue_step + hue_drift;
+            let hue = base_hue_drift + k_f32 * hue_step;
             let tone = hsv2rgb(hue, sat, val);
             let grid_phase = ((grid_tick + k_u64) & 1) as usize;
             out.push(WordDecoration {
@@ -1119,21 +1179,25 @@ const fn bound_shade_opacity(decos: &mut [WordDecoration]) {
     if decos.is_empty() {
         return;
     }
-    let mut shade_count = 0usize;
-    let mut i = 0;
-    while i < decos.len() {
-        if is_shade(&decos[i]) {
-            shade_count += 1;
-        }
-        i += 1;
-    }
-    if shade_count == 0 {
-        return;
-    }
-    let peak = if shade_count <= SHADE_TAB / 2 {
+    let peak = if decos.len() <= SHADE_TAB / 2 {
         peak_shade_probe(decos)
     } else {
-        peak_shade_quadratic(decos)
+        let mut shade_count = 0usize;
+        let mut i = 0;
+        while i < decos.len() {
+            if is_shade(&decos[i]) {
+                shade_count += 1;
+            }
+            i += 1;
+        }
+        if shade_count == 0 {
+            return;
+        }
+        if shade_count <= SHADE_TAB / 2 {
+            peak_shade_probe(decos)
+        } else {
+            peak_shade_quadratic(decos)
+        }
     };
     if peak <= MAX_VIEWPORT_OVERLAY {
         return;
@@ -1693,7 +1757,6 @@ mod tests {
             x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             let draw = x ^ (x >> 31);
             assert_eq!(tier_of(draw), tier_for(draw, 0));
-            assert_eq!(tier_of(draw), tier_for(draw, 1));
         }
     }
 

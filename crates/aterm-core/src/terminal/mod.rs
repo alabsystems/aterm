@@ -53,7 +53,6 @@ mod holder_fence;
 #[cfg(test)]
 mod holder_fence_conformance;
 mod host_journal;
-pub(crate) mod host_traits;
 pub(crate) mod hyperlink_auth;
 mod image_reflow;
 mod keyboard_mode;
@@ -137,7 +136,11 @@ pub use builder::{TIERED_RING_CAP_DEFAULT, TerminalBuilder};
 #[cfg(feature = "serde")]
 pub use checkpoint::{CHECKPOINT_META_REQUIRED_KEYS, CheckpointMeta};
 pub use checkpoint::{
-    DcsQueryCarry, DcsQueryKind, GridCursorRepr, PaneStepCarry, ReplayCarry, ShellIntegrationNonce,
+    DcsQueryCarry, DcsQueryKind, GridCursorRepr, KittyFloatParentCarry, KittyFloatingCarry,
+    KittyFrameCarry, KittyImageCarry, KittyLayoutCarry, KittyParentCarry, KittyPlayStateCarry,
+    KittyRelationCarry, KittyVariantCarry, KittyVariantSourceCarry, KittyVirtualCarry,
+    KittyVirtualImageCarry, LooseImageCarry, PANE_HISTORY_IMAGE_LINES, PaneStepCarry,
+    PlacedGridCarry, PlacedImageSourceCarry, PlacedSpanCarry, ReplayCarry, ShellIntegrationNonce,
     ShellIntegrationPosture, StyleRepr, TerminalCheckpoint,
 };
 pub use checkpoint_canon::{

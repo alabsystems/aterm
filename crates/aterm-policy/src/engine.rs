@@ -191,11 +191,12 @@ impl PolicyEngine {
         self.limiters.try_consume_slot(slot, amount, clock)
     }
 
-    /// Look up a [`RateLimit`] configuration by id.
+    /// Look up a [`RateLimit`] configuration by id (last-wins on duplicate ids,
+    /// matching [`RateLimiterSet::from_policy`](crate::limits::RateLimiterSet::from_policy)).
     #[must_use]
     #[inline]
     pub fn rate_limit_config(&self, id: &str) -> Option<&RateLimit> {
-        self.policy.rate_limits.iter().find(|cfg| cfg.id == id)
+        self.policy.rate_limits.iter().rfind(|cfg| cfg.id == id)
     }
 
     /// Snapshot every declared rate-limit bucket in first-declaration order.
@@ -339,5 +340,30 @@ mod tests {
         let d = eng.evaluate(&osc(9, &["ping"]), OriginTag::Pty);
         assert_eq!(d.response, Response::Warn);
         assert_eq!(d.matched_rule, Some(1));
+    }
+
+    #[test]
+    fn rate_limit_config_matches_last_wins_duplicate_id() {
+        let mut p = profiles::standard();
+        p.rate_limits = vec![
+            RateLimit {
+                id: "dup".to_owned(),
+                capacity_bytes: 100,
+                refill_per_second: 1,
+                per_sequence_max: 10,
+            },
+            RateLimit {
+                id: "dup".to_owned(),
+                capacity_bytes: 250,
+                refill_per_second: 5,
+                per_sequence_max: 50,
+            },
+        ];
+        let eng = PolicyEngine::new(p);
+        let cfg = eng.rate_limit_config("dup").expect("declared");
+        assert_eq!(cfg.capacity_bytes, 250);
+        assert_eq!(cfg.refill_per_second, 5);
+        assert_eq!(cfg.per_sequence_max, 50);
+        assert!(eng.rate_limit_config("missing").is_none());
     }
 }

@@ -45,7 +45,7 @@
 
 use std::borrow::Cow;
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Log severity level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -170,7 +170,7 @@ pub enum LevelFilter {
 }
 
 impl LevelFilter {
-    /// Parse an `ATERM_LOG`-style level name (`off`, `error`, `warn`, `info`, `debug`, `trace`), ASCII case-insensitively, ignoring surrounding whitespace.
+    /// Parse an `ATERM_LOG`-style level name (`off`, `error`, `warn`, `info`, `debug`, `trace`), ASCII case-insensitively, ignoring surrounding Unicode whitespace.
     ///
     /// ```rust
     /// use aterm_log::LevelFilter;
@@ -276,6 +276,7 @@ pub const fn record_cap(level: Level) -> usize {
 }
 
 /// Sanitize one formatted record body for a line-oriented log file.
+/// Control characters map to U+FFFD, and a trailing `…` is appended only when the sanitized body exceeds [`MAX_RECORD_BYTES`].
 #[inline]
 #[must_use]
 pub fn sanitize_record(msg: &str) -> Cow<'_, str> {
@@ -405,10 +406,24 @@ pub trait Log: Send + Sync {
 
 static MAX_LEVEL: AtomicUsize = AtomicUsize::new(0);
 static LOGGER: std::sync::OnceLock<&'static dyn Log> = std::sync::OnceLock::new();
+/// Held while [`wait_for_logger`] reads whether a logger takes records, and while
+/// [`set_logger`], [`set_max_level`] or [`settle_logger`] wakes it ([`READY`]), so no change
+/// goes unseen.
+static READY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static READY: std::sync::Condvar = std::sync::Condvar::new();
+/// Set by [`settle_logger`]: the process has set up its logging, with a logger or without one.
+static SETTLED: AtomicBool = AtomicBool::new(false);
+/// How often a [`wait_for_logger`] parked on [`READY`], and how often one woke at its deadline,
+/// for the test that must see one woken.
+#[cfg(test)]
+static PARKS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Set the global maximum log level.
 pub fn set_max_level(level: LevelFilter) {
     MAX_LEVEL.store(level as usize, Ordering::Relaxed);
+    announce();
 }
 
 /// Install a global logger.
@@ -416,8 +431,84 @@ pub fn set_max_level(level: LevelFilter) {
 /// Returns `SetLoggerError` if a logger has already been set.
 pub fn set_logger(logger: &'static dyn Log) -> Result<(), SetLoggerError> {
     match LOGGER.set(logger) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            announce();
+            Ok(())
+        }
         Err(_) => Err(SetLoggerError(())),
+    }
+}
+
+/// Say this process has set up its logging, whether or not it installed a logger: each
+/// [`wait_for_logger`] then answers at once, so a process that installs none, or sets the level
+/// to `Off`, holds no waiter to its deadline.
+pub fn settle_logger() {
+    SETTLED.store(true, Ordering::Relaxed);
+    announce();
+}
+
+/// Wake every [`wait_for_logger`]: a logger, the maximum level or [`SETTLED`] changed.
+fn announce() {
+    let _held = READY_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    READY.notify_all();
+}
+
+/// Whether a logger is installed and the maximum level lets a record reach it.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn takes_records() -> bool {
+    LOGGER.get().is_some() && MAX_LEVEL.load(Ordering::Relaxed) > LevelFilter::Off as usize
+}
+
+/// Wait up to `within` until a logger is installed ([`set_logger`]) and the maximum level lets
+/// records reach it ([`set_max_level`]), or until the process has set up its logging without
+/// that ([`settle_logger`]); whether records reach a logger. A record made before both is
+/// dropped, so a thread that starts before its process installs its logger can wait here first.
+/// Absent on wasm32-unknown-unknown, which has no threads to wait for and no std clock.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[cfg_attr(trust_verify, trust::skip)]
+#[must_use]
+pub fn wait_for_logger(within: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now().checked_add(within);
+    let mut held = READY_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        if takes_records() {
+            return true;
+        }
+        if SETTLED.load(Ordering::Relaxed) {
+            return false;
+        }
+        let left = match deadline {
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                Some(left)
+            }
+            None => None,
+        };
+        #[cfg(test)]
+        PARKS.fetch_add(1, Ordering::SeqCst);
+        held = match left {
+            Some(left) => {
+                let (held, waited) = READY
+                    .wait_timeout(held, left)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                #[cfg(test)]
+                if waited.timed_out() {
+                    TIMEOUTS.fetch_add(1, Ordering::SeqCst);
+                }
+                let _ = waited;
+                held
+            }
+            None => READY
+                .wait(held)
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        };
     }
 }
 
@@ -532,6 +623,8 @@ macro_rules! trace {
     };
 }
 
+pub mod words;
+
 /// Process-global environment mutation serialized through a single lock.
 pub mod env {
     use std::ffi::{OsStr, OsString};
@@ -639,18 +732,98 @@ pub mod env {
         };
         body()
     }
-
-    #[cfg(test)]
-    #[must_use]
-    pub(super) fn read(key: impl AsRef<OsStr>) -> Option<OsString> {
-        let _guard = env_lock();
-        std::env::var_os(key.as_ref())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one test in this binary that installs a logger. A short wait ends. A parked waiter
+    /// answers true once a logger is installed and the level lets records through, and not
+    /// before: woken by the level and then by the logger, and woken by the level once the logger
+    /// is in. Settling the logging with the level `Off` wakes a parked waiter at once, which
+    /// answers false. This binary cannot settle with no logger once it has installed one.
+    #[test]
+    fn a_waiter_wakes_once_a_logger_takes_records() {
+        struct Quiet;
+        impl Log for Quiet {
+            fn enabled(&self, _: &Metadata) -> bool {
+                false
+            }
+            fn log(&self, _: &Record<'_>) {}
+            fn flush(&self) {}
+        }
+        static QUIET: Quiet = Quiet;
+        let hang = std::time::Duration::from_secs(60);
+        let parked = |times: usize| {
+            let since = std::time::Instant::now();
+            while PARKS.load(Ordering::SeqCst) < times {
+                assert!(since.elapsed() < hang, "the waiter never parked");
+                std::thread::yield_now();
+            }
+        };
+        let answer = |waiter: std::thread::JoinHandle<bool>| {
+            let since = std::time::Instant::now();
+            while !waiter.is_finished() {
+                assert!(since.elapsed() < hang, "the wait never ended");
+                std::thread::yield_now();
+            }
+            waiter.join().expect("the waiter")
+        };
+        let now = std::time::Duration::ZERO;
+        assert!(!wait_for_logger(now), "no logger yet");
+        let short = std::thread::spawn(|| wait_for_logger(std::time::Duration::from_millis(1)));
+        assert!(!answer(short), "no logger within a short wait");
+        let parks = PARKS.load(Ordering::SeqCst);
+        let timeouts = TIMEOUTS.load(Ordering::SeqCst);
+
+        let waiter = std::thread::spawn(move || wait_for_logger(hang));
+        parked(parks + 1);
+        set_max_level(LevelFilter::Error);
+        assert!(
+            !wait_for_logger(now),
+            "a level with no logger takes no record"
+        );
+        parked(parks + 2);
+        set_logger(&QUIET).expect("the first logger");
+        assert!(answer(waiter), "a logger at Error takes records");
+        assert_eq!(
+            TIMEOUTS.load(Ordering::SeqCst),
+            timeouts,
+            "woken, not timed out"
+        );
+
+        set_max_level(LevelFilter::Off);
+        assert!(
+            !wait_for_logger(now),
+            "a logger the level lets nothing reach takes none"
+        );
+        let waiter = std::thread::spawn(move || wait_for_logger(hang));
+        parked(parks + 3);
+        set_max_level(LevelFilter::Error);
+        assert!(answer(waiter), "the level let records reach the logger");
+        assert_eq!(
+            TIMEOUTS.load(Ordering::SeqCst),
+            timeouts,
+            "the level woke it"
+        );
+
+        set_max_level(LevelFilter::Off);
+        let waiter = std::thread::spawn(move || wait_for_logger(hang));
+        parked(parks + 4);
+        settle_logger();
+        assert!(!answer(waiter), "settled with the level Off");
+        assert_eq!(
+            TIMEOUTS.load(Ordering::SeqCst),
+            timeouts,
+            "settling woke it"
+        );
+        set_max_level(LevelFilter::Error);
+        assert!(
+            wait_for_logger(now),
+            "settled, a logger at Error takes records"
+        );
+    }
 
     /// Severity order is what `enabled` compares: a filter admits a level at
     /// or below it, and `Off` admits nothing.
@@ -687,6 +860,7 @@ mod tests {
             ("trace", Some(LevelFilter::Trace)),
             ("INFO", Some(LevelFilter::Info)),
             ("  Warn\n", Some(LevelFilter::Warn)),
+            ("\u{3000}Warn\u{3000}", Some(LevelFilter::Warn)),
             ("OfF", Some(LevelFilter::Off)),
             ("", None),
             ("verbose", None),
@@ -698,13 +872,16 @@ mod tests {
     }
 
     #[test]
-    fn test_warn_and_error_keep_the_longer_cap() {
+    fn record_cap_matches_alert_and_standard_thresholds() {
         assert_eq!(record_cap(Level::Error), MAX_ALERT_RECORD_BYTES);
         assert_eq!(record_cap(Level::Warn), MAX_ALERT_RECORD_BYTES);
         assert_eq!(record_cap(Level::Info), MAX_RECORD_BYTES);
         assert_eq!(record_cap(Level::Debug), MAX_RECORD_BYTES);
         assert_eq!(record_cap(Level::Trace), MAX_RECORD_BYTES);
+    }
 
+    #[test]
+    fn test_warn_and_error_keep_the_longer_cap() {
         let long = "w".repeat(MAX_ALERT_RECORD_BYTES * 2);
         let warn = sanitize_record_for(Level::Warn, &long);
         assert!(warn.len() > MAX_RECORD_BYTES + '…'.len_utf8());
@@ -715,7 +892,21 @@ mod tests {
         assert!(info.len() <= MAX_RECORD_BYTES + '…'.len_utf8());
 
         let mid = "m".repeat(MAX_RECORD_BYTES + 100);
-        assert!(matches!(sanitize_record_for(Level::Warn, &mid), Cow::Borrowed(m) if m == mid));
+        assert!(matches!(
+            sanitize_record_for(Level::Warn, &mid),
+            Cow::Borrowed(m) if std::ptr::eq(m.as_ptr(), mid.as_ptr()) && m == mid
+        ));
+        assert!(matches!(
+            sanitize_record_for(Level::Info, &mid),
+            Cow::Owned(ref s) if s.ends_with('…')
+        ));
+
+        let mid_ctl = "m".repeat(MAX_RECORD_BYTES + 97) + "\n";
+        let sanitized_ctl = sanitize_record_for(Level::Warn, &mid_ctl);
+        assert!(matches!(
+            sanitized_ctl,
+            Cow::Owned(ref s) if !s.ends_with('…') && !s.chars().any(char::is_control)
+        ));
     }
 
     #[test]
@@ -746,8 +937,29 @@ mod tests {
         ] {
             let msg = "a".repeat(cap - 1) + "\u{01}" + "a";
             let out = sanitize_record_for(level, &msg);
-            assert!(out.len() <= cap + '…'.len_utf8(), "{level}");
-            assert!(!out.chars().any(char::is_control), "{level}");
+            let Cow::Owned(s) = out else {
+                panic!("{level}: control char must allocate Owned");
+            };
+            assert_eq!(
+                s.capacity(),
+                MAX_ALERT_RECORD_BYTES + 4,
+                "{level}: reservation must not reallocate"
+            );
+            assert!(s.len() <= cap + '…'.len_utf8(), "{level}");
+            assert!(s.ends_with('…'), "{level}");
+            assert!(!s.chars().any(char::is_control), "{level}");
+
+            // Input with a 1-byte control char that expands to 3-byte U+FFFD and fits cap
+            // exactly produces Owned with no ellipsis and no reallocation.
+            let fits = "a".repeat(cap - 3) + "\u{01}";
+            let exact = sanitize_record_for(level, &fits);
+            let Cow::Owned(exact_s) = exact else {
+                panic!("{level}: control char within cap must allocate Owned");
+            };
+            assert_eq!(exact_s.capacity(), MAX_ALERT_RECORD_BYTES + 4, "{level}");
+            assert_eq!(exact_s.len(), cap, "{level}");
+            assert!(!exact_s.ends_with('…'), "{level}");
+            assert!(!exact_s.chars().any(char::is_control), "{level}");
         }
     }
 }
@@ -760,10 +972,10 @@ mod env_tests {
     fn take_reads_and_removes_in_one_step() {
         const KEY: &str = "ATERM_LOG_TEST_TAKE";
         super::env::set(KEY, "authority");
-        assert_eq!(super::env::read(KEY).as_deref(), Some("authority".as_ref()));
+        assert_eq!(std::env::var_os(KEY).as_deref(), Some("authority".as_ref()));
         assert_eq!(super::env::take(KEY).as_deref(), Some("authority".as_ref()));
         assert_eq!(super::env::take(KEY), None);
-        assert_eq!(super::env::read(KEY), None);
+        assert_eq!(std::env::var_os(KEY), None);
     }
 
     #[test]
@@ -777,7 +989,7 @@ mod env_tests {
             "body sees the override"
         );
         assert_eq!(
-            super::env::read(KEY).as_deref(),
+            std::env::var_os(KEY).as_deref(),
             Some("outer".as_ref()),
             "and the previous value is back"
         );
@@ -786,7 +998,7 @@ mod env_tests {
         let seen = super::env::scoped(KEY, "inner", || std::env::var_os(KEY));
         assert_eq!(seen.as_deref(), Some("inner".as_ref()));
         assert_eq!(
-            super::env::read(KEY),
+            std::env::var_os(KEY),
             None,
             "restoring an absent key means REMOVING it, not setting it empty"
         );
@@ -798,7 +1010,7 @@ mod env_tests {
         super::env::set(KEY, "present");
         let seen = super::env::scoped_unset(KEY, || std::env::var_os(KEY));
         assert_eq!(seen, None, "the body sees the key as absent");
-        assert_eq!(super::env::read(KEY).as_deref(), Some("present".as_ref()));
+        assert_eq!(std::env::var_os(KEY).as_deref(), Some("present".as_ref()));
         super::env::unset(KEY);
     }
 
@@ -813,7 +1025,7 @@ mod env_tests {
         });
         assert!(caught.is_err(), "the panic propagates to the caller");
         assert_eq!(
-            super::env::read(KEY).as_deref(),
+            std::env::var_os(KEY).as_deref(),
             Some("outer".as_ref()),
             "and the override did not leak past it"
         );

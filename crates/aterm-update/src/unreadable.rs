@@ -146,17 +146,4 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
-
-    #[test]
-    fn the_explanation_survives_status_reconciliation_into_update_status() {
-        let explanation = String::from(
-            "aterm cannot read its release channel github.com/o/r: this machine stays on \
-             its current version until the channel is fixed",
-        );
-        let reconciled = crate::reconcile_status_outcome(1234, 1234, None, explanation.clone());
-        assert_eq!(
-            reconciled.outcome,
-            crate::ReconciledStatusOutcome::Preserved(explanation),
-        );
-    }
 }

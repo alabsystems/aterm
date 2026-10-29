@@ -21,6 +21,7 @@ const EVICTS: &[&str] = &[
     "EvictOldDetail",
     "EvictTurnDetail",
     "EvictClosedOpen",
+    "EvictClosedOpenRider",
     "EvictClose",
     "EvictTurnClose",
     "EvictCurrent",
@@ -74,6 +75,9 @@ struct World {
     cpath: i64,
     moved: bool,
     clock: u64,
+    /// The open run, once an amend named it (`AmendRun`), and the closed runs that were named.
+    named: Option<Node>,
+    named_closed: std::collections::BTreeSet<Node>,
 }
 
 impl World {
@@ -100,6 +104,8 @@ impl World {
             cpath: 0,
             moved: false,
             clock: 0,
+            named: None,
+            named_closed: std::collections::BTreeSet::new(),
         }
     }
 
@@ -141,12 +147,32 @@ fn project_with(w: &World, fold_turn: bool, fold_turns: u32) -> State {
     };
     let pinned = |lvl: Lvl| {
         log.window()
-            .filter(|r| r.node.lvl == lvl && log.class_of(r) == EvictClass::Pinned)
+            .filter(|r| {
+                r.node.lvl == lvl
+                    && r.op == aterm_slog::Op::Open
+                    && log.class_of(r) == EvictClass::Pinned
+            })
             .count() as i64
     };
     let (mut dturn, mut dout, mut tdet, mut dold, mut ocl, mut cls) = (0, 0, 0, 0, 0, 0);
+    let (mut rid, mut orid, mut onamed) = (0, 0, 0);
     for r in log.window() {
-        match log.class_of(r) {
+        let class = log.class_of(r);
+        if aterm_slog::rides_open(r) && matches!(class, EvictClass::Pinned | EvictClass::ClosedOpen)
+        {
+            match class {
+                EvictClass::Pinned => rid += 1,
+                _ => orid += 1,
+            }
+            continue;
+        }
+        if r.op == aterm_slog::Op::Open
+            && class == EvictClass::ClosedOpen
+            && w.named_closed.contains(&r.node)
+        {
+            onamed += 1;
+        }
+        match class {
             EvictClass::OpenDetail => {
                 if w.turn.is_some_and(|t| under(log, r, t)) {
                     dturn += 1;
@@ -223,6 +249,10 @@ fn project_with(w: &World, fold_turn: bool, fold_turns: u32) -> State {
         ("ocl", ocl),
         ("cls", cls),
         ("tcl", i64::from(tcl.is_some())),
+        ("rid", rid),
+        ("named", i64::from(w.named.is_some())),
+        ("orid", orid),
+        ("onamed", onamed),
         ("nw", nw),
         ("ev", 0),
     ]
@@ -391,6 +421,7 @@ fn perform(w: &mut World, action: &'static str) {
         }
         "CloseRun" | "CloseRunCascade" => {
             let run = w.run.take().expect("a run is open");
+            w.named_closed.extend(w.named.take());
             let had_turn = w.turn.take();
             (w.step, w.orphan_open) = (None, None);
             let (seq, open_before) = (w.log.last_seq(), w.log.open_nodes().len() as u64);
@@ -410,6 +441,18 @@ fn perform(w: &mut World, action: &'static str) {
                 w.log.open_nodes().is_empty(),
                 "the cascade closed everything"
             );
+        }
+        "AmendRun" => {
+            let run = w.run.expect("a run is open");
+            let f = Fields::new().tok(Key::Detail, "claude").expect("a detail");
+            w.log
+                .amend(
+                    run,
+                    Amend::new(Kind::Agent, Src::Status, Conf::Strong, f),
+                    stamp,
+                )
+                .expect("the open run is named");
+            w.named = Some(run);
         }
         "Mark" | "Amend" => {
             if action == "Mark" {
@@ -469,6 +512,7 @@ fn perform(w: &mut World, action: &'static str) {
             w.log = Log::after_handoff(w.log.ep() + 1, w.limits, ids, ceil + 1, stamp);
             (w.run, w.turn, w.step, w.orphan_open) = (None, None, None, None);
             (w.current_turn, w.closed_turn, w.turns, w.tclose) = (None, None, 0, 0);
+            (w.named, w.named_closed) = (None, std::collections::BTreeSet::new());
             w.updated = true;
             w.hseq = ceil + 1;
         }
@@ -478,6 +522,7 @@ fn perform(w: &mut World, action: &'static str) {
             w.log.gap(GapWhy::Crash, 0, stamp);
             (w.run, w.turn, w.step, w.orphan_open) = (None, None, None, None);
             (w.current_turn, w.closed_turn, w.turns, w.tclose) = (None, None, 0, 0);
+            (w.named, w.named_closed) = (None, std::collections::BTreeSet::new());
             (w.ceil, w.hi, w.hseq, w.updated) = (None, 0, 1, true);
         }
         "HandoffCarried" => {
@@ -532,6 +577,7 @@ const ACTIONS: &[&str] = &[
     "CloseRunCascade",
     "Mark",
     "Amend",
+    "AmendRun",
     "MarkOutside",
     "Gap",
     "Human",
@@ -766,6 +812,33 @@ fn slog_ring_conformance_rejects_what_the_ring_never_does() {
     taken.insert("dturn", honest["dturn"] + 1);
     assert!(!m.check_invariant("OpenPathRetained", &taken));
     assert!(!after_batch(&m, "Mark", &before).contains(&taken));
+
+    let mut g = World::new();
+    for action in ["OpenRun", "AmendRun", "OpenTurn"] {
+        perform(&mut g, action);
+    }
+    let before = g.project();
+    perform(&mut g, "CloseTurn");
+    let honest = g.project();
+    admitted(&m, "CloseTurn", &before, &honest);
+    assert_eq!(
+        (
+            honest["prun"],
+            honest["rid"],
+            honest["named"],
+            honest["lost"]
+        ),
+        (1, 1, 1, 1),
+        "the named run keeps its name; the closed turn's open went"
+    );
+    let mut unnamed = honest.clone();
+    unnamed.insert("rid", 0);
+    unnamed.insert("lost", honest["lost"] + 1);
+    assert!(!m.check_invariant("RiderLivesWithItsOpen", &unnamed));
+    assert!(
+        !after_batch(&m, "CloseTurn", &before).contains(&unnamed),
+        "the name evicted as detail beneath the open run is not the model's"
+    );
 
     let mut refold = Fold::new(w.log.ep());
     for r in w.log.window() {

@@ -81,8 +81,8 @@ fn present(term: &Terminal, now: Instant, gl: Glass<'_>) {
     };
     let (anchor, glyph) = motion_print_anchor(term);
     gl.glow.0.cursor_step(
-        &CursorStep {
-            input: CursorFxInput {
+        &CursorStep::new(
+            CursorFxInput {
                 now,
                 cur,
                 live_viewport: term.grid().display_offset() == 0,
@@ -101,8 +101,8 @@ fn present(term: &Terminal, now: Instant, gl: Glass<'_>) {
                 user_tinted: false,
                 accent_pinned: false,
             },
-            glow: gl.cfg,
-            trail: TrailConfig {
+            gl.cfg,
+            TrailConfig {
                 enabled: false,
                 duration: gl.cfg.duration,
                 max_len: gl.cfg.length,
@@ -110,15 +110,11 @@ fn present(term: &Terminal, now: Instant, gl: Glass<'_>) {
                 intensity: gl.cfg.intensity,
                 warmth: 0.0,
             },
-            animate: true,
-            row_probe: probe,
-            pending_keys: 0,
-            print_anchor: anchor,
-            print_anchor_glyph: glyph,
-            caret_drawn: visible,
-            frame_cells: None,
-            frame_cells_at: (0, 0),
-        },
+        )
+        .with_row_probe(probe)
+        .with_print_anchor(anchor)
+        .with_print_anchor_glyph(glyph)
+        .with_caret_drawn(visible),
         std::iter::empty(),
     );
 }

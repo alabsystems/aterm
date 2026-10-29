@@ -142,7 +142,7 @@ impl Lab {
         }
         let sequence = envelope::next_seq(admin.seq).unwrap();
         let admissions = admin.admissions.retained(&doc).unwrap();
-        let bytes = seal_with_admissions(
+        let bytes = seal_with_admissions_and_parents(
             &admin.config.name,
             sequence,
             &admin.seed,
@@ -150,6 +150,7 @@ impl Lab {
             true,
             &doc,
             &admin.handoff,
+            &admin.opened_heads,
             &admissions,
         )
         .unwrap();
@@ -906,4 +907,134 @@ fn a_vault_without_commons_control_revokes_vault_only_and_keeps_its_root() {
     std::fs::write(lab.paths[0].dir.join("commons.claim"), b"").unwrap();
     assert_eq!(revoke(&lab).1.unwrap(), None);
     assert!(gone(&lab));
+}
+
+#[test]
+fn the_roster_gate_knows_its_local_version_without_hearing_itself() {
+    use crate::commons::hearing::{Hold, LIFTED, Ledger, Said, Version};
+    let lab = Lab::new(true, Custody::Founded);
+    let owner = lab.bootstrap(0);
+    let admin = admin_cached(&lab.paths[0]).unwrap();
+    let mut journal = Journal::open_existing(owner.journal_dir(), owner.trust()).unwrap();
+    let access = owner.access_in(&journal).unwrap().unwrap();
+    let local = access.local().binding().actor();
+    let peer = access
+        .members()
+        .iter()
+        .find(|member| member.binding().actor() != local)
+        .unwrap()
+        .binding()
+        .actor();
+    let now = aterm_time::unix_millis().unwrap();
+    let mut ledger = Ledger::new(owner.trust());
+    assert!(
+        admin
+            .refresh_commons_roster(&owner, &mut journal, &mut ledger, now)
+            .unwrap()
+            .is_none()
+    );
+    let held = |ledger: &Ledger| {
+        ledger.holding(access.members().iter().map(|member| member.binding()), now)
+    };
+    assert_eq!(held(&ledger), vec![(peer, Hold::Older(None))]);
+    // Knowing this running build is not an authenticated peer contact or a version report.
+    assert!(!ledger.watch(now));
+    assert_eq!(ledger.entry(&local).unwrap().version, None);
+    assert!(!ledger.lifted_within(&local, now, crate::commons::hearing::RECENT));
+    // An older or unreported remote reader still holds the first larger roster back.
+    ledger.record(peer, now, Said::Version(Version(0, 145, 0)));
+    assert_eq!(
+        held(&ledger),
+        vec![(peer, Hold::Older(Some(Version(0, 145, 0))))]
+    );
+    ledger.record(peer, now, Said::Nothing);
+    assert_eq!(held(&ledger), vec![(peer, Hold::Older(None))]);
+    ledger.record(peer, now, Said::Version(LIFTED));
+    assert!(held(&ledger).is_empty());
+    // Enrollment and retirement reopen this ledger rather than refreshing it first.
+    ledger.write(&owner).unwrap();
+    let mut reopened = Ledger::read(&owner);
+    assert!(held(&reopened).is_empty());
+    assert!(
+        !reopened.watch(now + 1),
+        "a reopen needs a real peer contact"
+    );
+}
+
+#[test]
+fn a_member_silent_for_30_days_leaves_the_roster_and_returns_when_heard() {
+    use crate::commons::hearing::{Ledger, SILENT, Said, Version};
+    let lab = Lab::new(true, Custody::Founded);
+    let owner = lab.bootstrap(0);
+    let peer = lab.bootstrap(1);
+    let silent = peer.request().unwrap().binding().clone();
+    let admin = admin_cached(&lab.paths[0]).unwrap();
+    let mut journal = Journal::open_existing(owner.journal_dir(), owner.trust()).unwrap();
+    let members = |journal: &Journal| {
+        owner
+            .access_in(journal)
+            .unwrap()
+            .unwrap()
+            .members()
+            .iter()
+            .map(|member| member.binding().clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(members(&journal).len(), 2);
+    let now = aterm_time::unix_millis().unwrap();
+    // Negative control: a watch a day short of 30 days names nobody silent.
+    let mut short = Ledger::watched(owner.trust(), now - SILENT + 86_400_000, now);
+    assert!(
+        admin
+            .refresh_commons_roster(&owner, &mut journal, &mut short, now)
+            .unwrap()
+            .is_none()
+    );
+    // A member never heard is noted on the roster first, which starts its 30 days: without
+    // the note it would read as silent through this watch.
+    let mut unheard = Ledger::watched(owner.trust(), now - SILENT - 1000, now);
+    assert!(unheard.silent(&silent.actor(), now));
+    assert!(
+        admin
+            .refresh_commons_roster(&owner, &mut journal, &mut unheard, now)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!unheard.silent(&silent.actor(), now));
+    assert_eq!(members(&journal).len(), 2);
+    // m2 unheard for 30 days through a 30-day watch leaves the roster; this Mac, never heard
+    // by itself, stays.
+    let mut ledger = Ledger::watched(owner.trust(), now - SILENT - 1000, now);
+    ledger.record(
+        silent.actor(),
+        now - SILENT - 1,
+        Said::Version(Version::own()),
+    );
+    admin
+        .refresh_commons_roster(&owner, &mut journal, &mut ledger, now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        members(&journal),
+        vec![owner.request().unwrap().binding().clone()]
+    );
+    assert!(!matches!(peer.access_in(&journal), Ok(Some(_))));
+    // Retired from the roster, not from Commons or the vault: its binding is still good.
+    let constraints = journal.constraints().unwrap();
+    assert!(constraints.check_recorded_device(&silent).is_ok());
+    assert!(!constraints.recipient_retired(&silent.recipient()).unwrap());
+    assert!(
+        admin
+            .refresh_commons_roster(&owner, &mut journal, &mut ledger, now)
+            .unwrap()
+            .is_none()
+    );
+    // Heard again, it returns.
+    ledger.record(silent.actor(), now, Said::Unknown);
+    admin
+        .refresh_commons_roster(&owner, &mut journal, &mut ledger, now)
+        .unwrap()
+        .unwrap();
+    assert!(members(&journal).contains(&silent));
+    assert!(matches!(peer.access_in(&journal), Ok(Some(_))));
 }

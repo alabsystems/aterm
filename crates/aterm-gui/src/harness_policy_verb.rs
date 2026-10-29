@@ -174,7 +174,7 @@ pub(crate) fn cmd(
     fetch: impl FnOnce() -> Result<PolicyFacts, String>,
 ) -> String {
     if rest.split_whitespace().collect::<Vec<_>>() != ["policy"] {
-        return "ERR usage: harness policy\n".to_string();
+        return crate::harness_recovery_verb::USAGE.to_string();
     }
     match fetch() {
         Ok(facts) => {
@@ -657,7 +657,7 @@ mod tests {
         for rest in ["", "policy now", "show"] {
             assert_eq!(
                 cmd(rest, true, || Ok(f.clone())),
-                "ERR usage: harness policy\n",
+                crate::harness_recovery_verb::USAGE,
                 "{rest:?}"
             );
         }

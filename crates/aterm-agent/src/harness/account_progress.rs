@@ -87,10 +87,9 @@ pub fn enrich_inventory(
             .filter(|(_, result)| result.is_ok())
             .count()
     });
+    // The current account may need sign-in too; evidence is independent of
+    // whether the candidate selector can switch to it.
     for row in &roster.rows {
-        if Some(row.label.as_str()) == me.label() {
-            continue;
-        }
         if !accounts::needs_sign_in(
             row,
             state,
@@ -103,6 +102,7 @@ pub fn enrich_inventory(
         let Some(binding) = logins.get(&row.label) else {
             continue;
         };
+        let before = progress.details.len();
         let label = &row.label;
         if let Some(task) = binding.sign_in_task {
             let action = match task.action {
@@ -114,19 +114,32 @@ pub fn enrich_inventory(
                 .details
                 .push(task.action.next_step(accounts::Cli::Claude, label));
         }
-        let Some(attempt) = &binding.sign_in_attempt else {
-            continue;
-        };
-        let outcome = match attempt.outcome {
-            accounts::AttemptOutcome::NoRoute => "no usable sign-in route",
-            accounts::AttemptOutcome::Failed => "sign-in route failed",
-            accounts::AttemptOutcome::SignedIn => continue,
-        };
-        progress.details.push(format!(
-            "{label}: {outcome}; first recorded {}: {}",
-            super::usage::rfc3339_utc(attempt.since),
-            attempt.routes
-        ));
+        if let Some(attempt) = &binding.sign_in_attempt {
+            let outcome = match attempt.outcome {
+                accounts::AttemptOutcome::NoRoute => Some("no usable sign-in route"),
+                accounts::AttemptOutcome::Failed => Some("sign-in route failed"),
+                accounts::AttemptOutcome::SignedIn => None,
+            };
+            if let Some(outcome) = outcome {
+                progress.details.push(format!(
+                    "{label}: {outcome}; first recorded {}: {}",
+                    super::usage::rfc3339_utc(attempt.since),
+                    attempt.routes
+                ));
+            }
+        }
+        if Some(label.as_str()) == me.label()
+            && progress.eligible == Some(0)
+            && matches!(
+                progress.phase,
+                ProgressPhase::Waiting | ProgressPhase::Limited
+            )
+        {
+            // Keep this account's notes together, ahead of generic waiting
+            // reasons, without disturbing an active recovery action.
+            let added = progress.details.len() - before;
+            progress.details.rotate_right(added);
+        }
     }
     for (label, result) in candidates.into_iter().flatten() {
         if let Err(why) = result {
@@ -134,6 +147,10 @@ pub fn enrich_inventory(
                 accounts::WhyNot::Me => continue,
                 accounts::WhyNot::Limited { until } => format!(
                     "{label}: limited until {}",
+                    super::usage::rfc3339_utc(until)
+                ),
+                accounts::WhyNot::LeasedElsewhere { until } => format!(
+                    "{label}: leased elsewhere until {}",
                     super::usage::rfc3339_utc(until)
                 ),
                 other => format!("{label}: {}", other.as_str()),
@@ -145,6 +162,178 @@ pub fn enrich_inventory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_blocker_leads_only_when_recovery_has_no_eligible_alternate() {
+        let roster = Roster {
+            rows: ["current", "alternate"]
+                .map(|label| accounts::Row {
+                    label: label.into(),
+                    dir: Some(format!("/synthetic/{label}")),
+                    ..Default::default()
+                })
+                .into(),
+        };
+        let mut state = State::default();
+        let mut logins = Logins::default();
+        accounts::note_login_end(&mut state, &mut logins, "current", 80);
+        accounts::note_sign_in_task(&mut logins, "current", accounts::SignInAction::Login, 90);
+        let point = Point::Wall {
+            window: "seven_day".into(),
+            at: Some(90),
+        };
+        let me = Me {
+            account: Some("current"),
+            left: None,
+            default_home: true,
+            stored_login: true,
+        };
+        let generic = "synthetic supervisor reason";
+        for (phase, judged, alternate_ready, prefer) in [
+            (ProgressPhase::Waiting, true, false, true),
+            (ProgressPhase::Limited, true, false, true),
+            (ProgressPhase::Waiting, true, true, false),
+            (ProgressPhase::Waiting, false, false, false),
+            (
+                ProgressPhase::SigningIn {
+                    label: "alternate".into(),
+                    route: None,
+                },
+                true,
+                false,
+                false,
+            ),
+            (
+                ProgressPhase::Switching {
+                    to: "alternate".into(),
+                },
+                true,
+                false,
+                false,
+            ),
+            (
+                ProgressPhase::Verifying {
+                    to: "alternate".into(),
+                },
+                true,
+                false,
+                false,
+            ),
+            (ProgressPhase::Ready, true, false, false),
+            (ProgressPhase::Probing, true, false, false),
+            (ProgressPhase::Watching, true, false, false),
+            (ProgressPhase::Disabled, true, false, false),
+            (ProgressPhase::Unknown, true, false, false),
+        ] {
+            let mut progress = AccountProgress::unknown(100);
+            progress.phase = phase.clone();
+            progress.wall = Some("weekly".into());
+            progress.next_at = Some(160);
+            progress.details.push(generic.into());
+            let mut enrolled = BTreeSet::from(["current".into()]);
+            if alternate_ready {
+                enrolled.insert("alternate".into());
+            }
+            enrich_inventory(
+                &mut progress,
+                &roster,
+                &state,
+                &logins,
+                &enrolled,
+                &me,
+                judged.then_some(&point),
+            );
+            assert_eq!(progress.phase, phase);
+            assert_eq!(progress.known, Some(2));
+            assert_eq!(
+                progress.eligible,
+                judged.then_some(usize::from(alternate_ready))
+            );
+            assert_eq!(progress.next_at, Some(160));
+            assert_eq!(progress.wall.as_deref(), Some("weekly"));
+            assert!(progress.details.iter().any(|line| line == generic));
+            if prefer {
+                assert!(progress.details[0].starts_with("current:"));
+                for narrow in [false, true] {
+                    assert!(
+                        super::super::footer::account_progress_text(&progress, narrow)
+                            .contains(&progress.details[0])
+                    );
+                }
+            } else {
+                assert_eq!(progress.details[0], generic);
+            }
+        }
+    }
+
+    #[test]
+    fn current_login_failure_is_visible_without_becoming_a_rotation_candidate() {
+        let roster = Roster {
+            rows: vec![
+                accounts::Row {
+                    label: "current".into(),
+                    dir: Some("/synthetic/current".into()),
+                    ..Default::default()
+                },
+                accounts::Row {
+                    label: "alternate".into(),
+                    ..Default::default()
+                },
+            ],
+        };
+        let mut state = State::default();
+        let mut logins = Logins::default();
+        accounts::note_login_end(&mut state, &mut logins, "current", 80);
+        accounts::note_sign_in_task(&mut logins, "current", accounts::SignInAction::Login, 85);
+        accounts::note_sign_in_attempt(
+            &mut logins,
+            "current",
+            accounts::AttemptOutcome::NoRoute,
+            "profile(none)",
+            90,
+        );
+        // `alternate`, the default login, is signed in here as `accounts::enrolled_for` holds it.
+        let enrolled = BTreeSet::from(["current".into(), "alternate".into()]);
+        let project = |state: &State| {
+            let mut progress = AccountProgress::unknown(100);
+            progress.phase = ProgressPhase::Waiting;
+            enrich_inventory(
+                &mut progress,
+                &roster,
+                state,
+                &logins,
+                &enrolled,
+                &Me {
+                    account: Some("current"),
+                    left: None,
+                    default_home: true,
+                    stored_login: true,
+                },
+                Some(&Point::Wall {
+                    window: "seven_day".into(),
+                    at: Some(90),
+                }),
+            );
+            progress
+        };
+        let failed = project(&state);
+        assert_eq!((failed.known, failed.eligible), (Some(2), Some(1)));
+        assert_eq!(failed.phase, ProgressPhase::Waiting);
+        assert!(
+            failed.details.contains(
+                &accounts::SignInAction::Login.next_step(accounts::Cli::Claude, "current")
+            )
+        );
+        assert!(
+            failed
+                .details
+                .iter()
+                .any(|line| { line.starts_with("current:") && line.contains("profile(none)") })
+        );
+        let recovered = project(&State::default());
+        assert_eq!(recovered.eligible, failed.eligible);
+        assert!(recovered.details.is_empty());
+    }
 
     #[test]
     fn pending_human_steps_are_visible_only_while_sign_in_is_needed() {

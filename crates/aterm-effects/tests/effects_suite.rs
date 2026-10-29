@@ -48,6 +48,7 @@ mod kitty_activation_conformance;
 mod letter_guard_reuse;
 mod licensed_insert_band;
 mod licensed_typed_parity;
+mod light_latch_conformance;
 mod midline_insert_band;
 mod midline_insert_colour_seam;
 mod moved_again_without_a_key;

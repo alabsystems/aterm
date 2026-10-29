@@ -75,6 +75,7 @@ pub mod fx;
 mod fx_damage;
 mod fx_raster;
 pub mod glow_ramps;
+pub mod glyph_ink;
 pub mod hdr;
 #[cfg(any(
     all(unix, not(target_os = "macos")),
@@ -114,6 +115,7 @@ pub use fx_raster::{
     for_each_drawn_sprite, fx_bloom_quads, knock_rects, slice_layers,
 };
 pub use glow_ramps::{BeamRows, RampCost, RampSink};
+pub use glyph_ink::{GlyphCoverage, GlyphInk};
 pub use spill::SpillBand;
 
 pub use deco::{
@@ -453,6 +455,8 @@ mod named_instance_tests;
 #[cfg(test)]
 mod raster_tests;
 #[cfg(test)]
+mod ribbon_wedge_tests;
+#[cfg(test)]
 mod styled_instance_tests;
 #[cfg(test)]
 mod theme_from_scheme_tests {
@@ -781,6 +785,26 @@ pub const CHROME_ICON_SPILL_BIT: u32 = 1 << 8;
 
 /// Where a sub-script key ([`StyleBits::SUB`]) carries its cell's sideways nudge ([`Script::Sub`](aterm_core::terminal::Script::Sub)) in [`GlyphKey::ch_or_id`].
 pub const SUB_NUDGE_SHIFT: u32 = 24;
+
+/// An emoji-presented cell's colour key under its `script`: a [`Script::Sub`](aterm_core::terminal::Script::Sub) one carries [`StyleBits::SUB`], which draws the emoji small in the rows [`Script::small_emoji_rows`](aterm_core::terminal::Script::small_emoji_rows) names (its nudge ignored); a key the colour face does not draw is left as it is.
+#[inline]
+#[must_use]
+pub const fn small_emoji_keyed(key: GlyphKey, script: aterm_core::terminal::Script) -> GlyphKey {
+    match script {
+        aterm_core::terminal::Script::Sub { .. }
+            if matches!(
+                key.glyph_class,
+                GlyphClass::Rgba | GlyphClass::RgbaGid | GlyphClass::RgbaCluster
+            ) =>
+        {
+            GlyphKey {
+                style: StyleBits(key.style.0 | StyleBits::SUB.0),
+                ..key
+            }
+        }
+        _ => key,
+    }
+}
 
 /// Fold a [`Script::Sub`](aterm_core::terminal::Script::Sub) cell's sideways nudge into its glyph key, so each nudge is its own raster.
 #[inline]
@@ -1507,6 +1531,10 @@ pub struct Renderer {
     chrome_bleed: Option<ChromeBleed>,
     chrome_room_memo: Option<(usize, i32, (usize, usize))>,
     chrome_room: (usize, usize),
+    /// [`Self::glyph_ink`]'s last measure, keyed by the face, the rasters, the size and the blend.
+    glyph_ink_memo: Option<glyph_ink::GlyphInkMemo>,
+    /// Bumped each time the glyph rasters are dropped ([`Self::clear_glyph_images`]).
+    glyph_generation: u64,
     baseline: i32,
     theme: Theme,
     stem_lut: [u8; 256],
@@ -2083,15 +2111,6 @@ pub fn display_face_ids_for_family(family: &str) -> Option<Vec<&'static str>> {
         seen.push(id);
     }
     (!seen.is_empty()).then_some(seen)
-}
-
-/// [`display_face_ids_for_family`] as the faces' embedded bytes.
-#[must_use]
-pub fn display_face_mix_for_family(family: &str) -> Option<Vec<&'static [u8]>> {
-    display_face_ids_for_family(family)?
-        .into_iter()
-        .map(display_face_bytes)
-        .collect()
 }
 
 /// The display-layer ids for a set of requested ids (a `display_font` value's parts, any spelling).
@@ -6470,10 +6489,10 @@ fn font_files() -> Vec<std::path::PathBuf> {
     font_catalog::system_font_files()
 }
 
-fn normalize_family(s: &str) -> String {
+pub(crate) fn normalize_family(s: &str) -> String {
     s.chars()
-        .filter(|c| !c.is_ascii_whitespace() && *c != '-' && *c != '_')
-        .map(|c| c.to_ascii_lowercase())
+        .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
+        .flat_map(char::to_lowercase)
         .collect()
 }
 
@@ -6486,9 +6505,9 @@ pub struct FaceInfo {
     pub index: u32,
     /// Advance width of `'M'` in px at [`Self::PROBE_PX`] (a cell width for a monospace face; just one glyph's advance for a proportional one).
     pub cell_width: usize,
-    /// Cell height in px at [`Self::PROBE_PX`] (line height from font metrics).
+    /// Cell height in px at [`Self::PROBE_PX`], matching [`Renderer::cell_size`].
     pub cell_height: usize,
-    /// Baseline offset in px (ascent) at [`Self::PROBE_PX`].
+    /// Baseline offset in px at [`Self::PROBE_PX`], matching [`Renderer::baseline`].
     pub baseline: i32,
     /// Number of glyphs in the face (from the font's glyph table).
     pub glyph_count: usize,
@@ -6655,29 +6674,30 @@ fn deco_tables(bytes: &[u8], index: u32) -> Option<deco::DecoTables> {
 /// Resolve a font `family` to its [`FaceInfo`] (path, cell metrics at [`FaceInfo::PROBE_PX`], glyph count), or `None` if it does not resolve or parse.
 #[must_use]
 pub fn face_info(family: &str) -> Option<FaceInfo> {
-    let FaceRef { path, index, .. } = resolve_family_or_bundled(family, FaceTarget::REGULAR)?;
+    let FaceRef {
+        path,
+        index,
+        instance,
+    } = resolve_family_or_bundled(family, FaceTarget::REGULAR)?;
     let bytes = read_resolved_font(&path).ok()?;
-    let font = crate::font::Font::from_bytes(
-        &bytes[..],
-        crate::font::FontSettings {
-            collection_index: index,
-        },
+    let renderer = Renderer::from_named_face(
+        &bytes,
+        index,
+        instance,
+        FaceInfo::PROBE_PX,
+        Theme::default(),
     )
     .ok()?;
-    let lm = font.horizontal_line_metrics(FaceInfo::PROBE_PX)?;
-    let adv = font.metrics('M', FaceInfo::PROBE_PX).advance_width;
+    let (cell_width, cell_height) = renderer.cell_size();
     let glyph_count = aterm_font::Face::parse(&bytes, index)
         .map(|f| f.number_of_glyphs() as usize)
         .unwrap_or(0);
-    let deeper = bundled::letter_descent_floor(&bytes).map_or(0.0, |letter| {
-        lm.descent - letter_floored_descent(lm.descent, letter, FaceInfo::PROBE_PX)
-    });
     Some(FaceInfo {
         path,
         index,
-        cell_width: cell_w_from_advance(adv),
-        cell_height: (lm.new_line_size + deeper).ceil().max(1.0) as usize,
-        baseline: lm.ascent.round() as i32,
+        cell_width,
+        cell_height,
+        baseline: renderer.baseline(),
         glyph_count,
     })
 }
@@ -6685,6 +6705,22 @@ pub fn face_info(family: &str) -> Option<FaceInfo> {
 #[cfg(test)]
 mod font_enum_tests {
     use super::face_info;
+
+    #[test]
+    fn face_info_matches_live_renderer_geometry() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/jetbrains-mono.ttf"
+        );
+        let bytes = std::fs::read(path).expect("committed JetBrains Mono fixture");
+        let live =
+            super::Renderer::from_bytes(&bytes, super::FaceInfo::PROBE_PX, super::Theme::default())
+                .expect("fixture builds a renderer");
+        let info = face_info(path).expect("face_info resolves explicit fixture path");
+        assert_eq!((info.cell_width, info.cell_height), live.cell_size());
+        assert_eq!(info.baseline, live.baseline());
+        assert_eq!((info.cell_width, info.cell_height), (10, 21));
+    }
 
     #[cfg(unix)]
     #[test]
@@ -6918,6 +6954,8 @@ impl Renderer {
             chrome_bleed: None,
             chrome_room_memo: None,
             chrome_room: (0, 0),
+            glyph_ink_memo: None,
+            glyph_generation: 0,
             baseline,
             theme,
             stem_lut: build_stem_lut(DEFAULT_STEM_GAMMA),
@@ -9561,6 +9599,13 @@ impl Renderer {
         checked_cell_h_baseline(asc, desc, gap, self.line_height_scale, self.baseline_adjust)
     }
 
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn debug_geometry_metrics(&self) -> Option<(f32, f32, f32)> {
+        self.geometry_metrics(self.px)
+    }
+
     /// Baseline escape hatch (config `adjust_baseline`).
     pub fn set_adjust_baseline(&mut self, px: i32) {
         let px = px.clamp(-64, 64);
@@ -11149,6 +11194,7 @@ impl Renderer {
 
     fn clear_glyph_images(&mut self) {
         self.glyphs.clear();
+        self.glyph_generation = self.glyph_generation.wrapping_add(1);
         #[cfg(all(unix, not(target_os = "macos")))]
         self.subpx_glyphs.clear();
         self.glyph_bytes = 0;
@@ -11321,7 +11367,7 @@ impl Renderer {
             };
         }
         let bytes =
-            ligature_shaping::extract_cell_slice(&pbytes, pw, ph, pxmin, cell_w, k as usize);
+            ligature_shaping::extract_cell_slice(&pbytes, pw, ph, pxmin, cell_w, i64::from(k));
         GlyphImage::Mono {
             width: cell_w,
             height: ph,
@@ -11332,7 +11378,56 @@ impl Renderer {
         }
     }
 
+    /// A small colour emoji ([`small_emoji_keyed`]): its full raster resampled to the rows
+    /// [`Script::small_emoji_rows`](aterm_core::terminal::Script::small_emoji_rows) names, by the
+    /// share of the cell they are, and centred in the same two-cell box. Its key keeps the colour
+    /// face's index where a script key keeps its nudge, so no nudge is read from it.
+    fn rasterize_small_emoji(&mut self, key: GlyphKey) -> GlyphImage {
+        let twin = GlyphKey {
+            style: key.style.without_script(),
+            ..key
+        };
+        let (baseline, cell_h) = (self.baseline, self.cell_h);
+        let (box_w, _) = self.color_emoji_box();
+        let (top, rows) = aterm_core::terminal::Script::small_emoji_rows(cell_h);
+        let full = self.glyph_image(twin).clone();
+        let GlyphImage::Rgba {
+            width,
+            height,
+            ymin,
+            advance,
+            ref bytes,
+            ..
+        } = full
+        else {
+            return full;
+        };
+        if width == 0 || height == 0 || cell_h == 0 || rows == 0 {
+            return full;
+        }
+        let k = rows as f32 / cell_h as f32;
+        let dw = ((width as f32 * k).round() as usize).max(1);
+        let dh = ((height as f32 * k).round() as usize).clamp(1, rows);
+        // The full raster's top below the cell's, scaled into the small rows.
+        let inset = (baseline - ymin - height as i32).max(0) as f32;
+        let at = (top as i32 + (inset * k).round() as i32).min((top + rows - dh) as i32);
+        GlyphImage::Rgba {
+            width: dw,
+            height: dh,
+            xmin: (box_w.saturating_sub(dw) / 2) as i32,
+            ymin: baseline - dh as i32 - at,
+            advance,
+            bytes: resample_rgba(bytes, width, height, dw, dh),
+        }
+    }
+
     fn rasterize_script(&mut self, key: GlyphKey) -> GlyphImage {
+        if matches!(
+            key.glyph_class,
+            GlyphClass::Rgba | GlyphClass::RgbaGid | GlyphClass::RgbaCluster
+        ) {
+            return self.rasterize_small_emoji(key);
+        }
         let nudge = ((key.ch_or_id >> SUB_NUDGE_SHIFT) as u8).cast_signed();
         let twin = GlyphKey {
             style: key.style.without_script(),
@@ -14987,14 +15082,14 @@ impl Renderer {
         }
         if let Some(cl) = cluster {
             if let Some(k) = self.glyph_key_cluster(cl) {
-                return k;
+                return small_emoji_keyed(k, cell.script);
             }
             if let Some(k) = regional_pair_key(cl, cell_style(cell), self.px_q) {
-                return k;
+                return small_emoji_keyed(k, cell.script);
             }
         }
         if cell.emoji_presentation {
-            self.glyph_key_emoji(cell.ch)
+            small_emoji_keyed(self.glyph_key_emoji(cell.ch), cell.script)
         } else {
             let key = self.glyph_key_styled(cell.ch, cell_style(cell));
             sub_nudged(key, cell.script)
@@ -16268,6 +16363,7 @@ fn clone_input_stamped_inner(dst: &mut RenderInput, src: &RenderInput, drop_effe
         shifted_fill_seq,
         row_shift,
         engine_alt,
+        grid_instance,
         engine_row_order,
         absolute_row_revision,
         row_rev_lane,
@@ -16280,6 +16376,7 @@ fn clone_input_stamped_inner(dst: &mut RenderInput, src: &RenderInput, drop_effe
         default_fg,
         implicit_blank,
         content_seq,
+        drawn_at,
         process_sequence,
         input_hot,
         terminal_id,
@@ -16408,6 +16505,7 @@ fn clone_input_stamped_inner(dst: &mut RenderInput, src: &RenderInput, drop_effe
     dst.shifted_fill_seq = *shifted_fill_seq;
     dst.row_shift = *row_shift;
     dst.engine_alt = *engine_alt;
+    dst.grid_instance = *grid_instance;
     dst.engine_row_order = *engine_row_order;
     dst.absolute_row_revision = *absolute_row_revision;
     dst.row_rev_lane = *row_rev_lane;
@@ -16420,6 +16518,7 @@ fn clone_input_stamped_inner(dst: &mut RenderInput, src: &RenderInput, drop_effe
     dst.default_fg = *default_fg;
     dst.implicit_blank = *implicit_blank;
     dst.content_seq = *content_seq;
+    dst.drawn_at = *drawn_at;
     dst.process_sequence = *process_sequence;
     dst.input_hot = *input_hot;
     dst.terminal_id = *terminal_id;
@@ -19318,6 +19417,15 @@ pub struct BeamScratch {
 }
 
 impl BeamScratch {
+    /// No buffers yet, for an owner built in a `const fn`.
+    pub const EMPTY: Self = Self {
+        styles: Vec::new(),
+        keep: Vec::new(),
+        stack: Vec::new(),
+        kept: Vec::new(),
+        verts: Vec::new(),
+    };
+
     fn simplify(&mut self, run: &[CometSample], straighten: f32) {
         if straighten > 0.0 && run.len() > 2 {
             rdp_keep_indices_into(
@@ -19331,6 +19439,21 @@ impl BeamScratch {
             self.kept.clear();
             self.kept.extend(0..run.len());
         }
+    }
+
+    /// The vertices of `run` a layered beam laid with `straighten` keeps
+    /// ([`comet_glow_quads`]; every one at 0), into `out`: the line it draws,
+    /// for a caller that cuts it finer before laying it unstraightened.
+    #[inline]
+    pub fn straighten_into(
+        &mut self,
+        run: &[CometSample],
+        straighten: f32,
+        out: &mut Vec<CometSample>,
+    ) {
+        self.simplify(run, straighten);
+        out.clear();
+        out.extend(self.kept.iter().map(|&i| run[i]));
     }
 }
 
@@ -19486,6 +19609,47 @@ pub fn ribbon_profile(d: f32, core: f32, reach: f32, shoulder: f32) -> f32 {
     }
     let bump = smoothstep01((core - d) / core.max(f32::MIN_POSITIVE));
     melt * (shoulder + (1.0 - shoulder) * bump)
+}
+
+/// The glass's transverse profile (`docs/design/PRISM-GLASS.md` §2.2, §15.2 1.7): whole light
+/// from the spine to within `melt` px of the `reach`, melting to nothing over those px
+/// (`smoothstep01((reach - d) / melt)`), and nothing at or past the reach. A `melt` that is not
+/// a positive number is a hard edge. [`ribbon_profile`] cannot draw it: its core keeps at least
+/// half of every reach for its falloff ([`RIBBON_CORE_SHARE`]).
+#[inline]
+#[must_use]
+pub fn glass_profile(d: f32, reach: f32, melt: f32) -> f32 {
+    if reach.is_nan() || reach <= 0.0 {
+        return 0.0;
+    }
+    let d = d.abs();
+    if d.is_nan() || d >= reach {
+        return 0.0;
+    }
+    if melt.is_nan() || melt <= 0.0 {
+        return 1.0;
+    }
+    smoothstep01((reach - d) / melt)
+}
+
+/// How a ribbon's light falls off above its spine: [`ribbon_profile`] at a shoulder, or the
+/// glass's [`glass_profile`] at a melt, px. Below the spine every ribbon is
+/// [`ribbon_profile`] at shoulder `1`.
+#[derive(Clone, Copy, Debug)]
+enum Across {
+    Shoulder(f32),
+    Melt(f32),
+}
+
+impl Across {
+    /// The light `d` px above the spine of a reach `reach` whose core is `core`.
+    #[inline]
+    fn above(self, d: f32, core: f32, reach: f32) -> f32 {
+        match self {
+            Self::Shoulder(shoulder) => ribbon_profile(d, core, reach, shoulder),
+            Self::Melt(melt) => glass_profile(d, reach, melt),
+        }
+    }
 }
 
 /// The 4x4 ordered (Bayer) dither, normalized to `0..1` and offset by half a step so its mean is exactly 0.5.
@@ -19693,6 +19857,532 @@ fn ribbon_beam_ordered<S: BeamRows>(
             if i + 1 < slabs {
                 p += advance;
             }
+        }
+    }
+    true
+}
+
+/// [`ribbon_beam_into`] with each slab's slope drawn per device row
+/// (`docs/design/PRISM-GLASS.md` §2.2, the wedge): a slab whose top or
+/// bottom edge stands more than `edge_px` higher at one of its pixel edges
+/// than at the other is a wedge, and every other slab is laid exactly as
+/// [`ribbon_beam_into`] lays it, at its centre. A wedge's row is laid as
+/// the runs between the pixel edges where the row meets the profile's
+/// lines ([`RibbonAt::lines`]) and where a run's chord would stray from
+/// the row's own light ([`WEDGE_LEVEL_SLACK`]), each run's ends the row's
+/// level at its pixel edges under the segment's own lerp: a run whose ends
+/// stand at one level is flat, and another a ramp whose ends carry the segment's
+/// colours at its pixel edges premultiplied by their own opacities, so a
+/// zero-opacity end carries no colour; a run dark at both ends lays
+/// nothing. The dither keeps the slab's screen ordinal, and the clip, the
+/// bands, the budget and the head-first retry are [`ribbon_beam_into`]'s.
+#[allow(clippy::too_many_arguments)]
+pub fn ribbon_wedge_into<S: BeamRows>(
+    out: &mut S,
+    clip: BeamClip,
+    verts: &[RibbonVertex],
+    shoulder: f32,
+    step: usize,
+    max_quads: usize,
+    blend: GlowBlend,
+    edge_px: f32,
+) -> bool {
+    ribbon_wedge_walk(
+        out,
+        clip,
+        verts,
+        (Across::Shoulder(shoulder), step, max_quads, blend, edge_px),
+    )
+}
+
+/// The edge step the light glass lays its slabs by ([`ribbon_wedge_into`]'s and
+/// [`ribbon_glass_into`]'s `edge_px`, `docs/design/PRISM-GLASS.md` §15.2 1.7): a slab whose
+/// top climbs more than half a pixel across it is a wedge.
+pub const WEDGE_EDGE_PX: f32 = 0.5;
+
+/// The light glass's body (`docs/design/PRISM-GLASS.md` §2.2, §15.2 1.7): [`ribbon_wedge_into`]
+/// source-over, each vertex's light above its spine the glass's [`glass_profile`] at `melt`
+/// px (its top edge) in place of [`ribbon_profile`], and below it [`ribbon_profile`]'s at
+/// shoulder `1` (the glass lays its vertices with no reach below). The walk, the wedges at
+/// `edge_px`, the clip, the bands, the budget and the head-first retry are
+/// [`ribbon_wedge_into`]'s.
+#[inline]
+pub fn ribbon_glass_into<S: BeamRows>(
+    out: &mut S,
+    clip: BeamClip,
+    verts: &[RibbonVertex],
+    step: usize,
+    max_quads: usize,
+    edge_px: f32,
+    melt: f32,
+) -> bool {
+    ribbon_wedge_walk(
+        out,
+        clip,
+        verts,
+        (
+            Across::Melt(melt),
+            step,
+            max_quads,
+            GlowBlend::Over,
+            edge_px,
+        ),
+    )
+}
+
+/// [`ribbon_wedge_into`]'s walk, and its head-first retry where the budget ran out.
+#[inline]
+fn ribbon_wedge_walk<S: BeamRows>(
+    out: &mut S,
+    clip: BeamClip,
+    verts: &[RibbonVertex],
+    walk: (Across, usize, usize, GlowBlend, f32),
+) -> bool {
+    let start = out.mark();
+    if ribbon_wedge_ordered(out, clip, verts, walk, false) {
+        return true;
+    }
+    if !verts.windows(2).any(|w| w[1].x < w[0].x) {
+        return false;
+    }
+    out.truncate(start);
+    ribbon_wedge_ordered(out, clip, verts, walk, true)
+}
+
+/// [`ribbon_beam_ordered`]'s walk, each slab laid as a wedge where its
+/// edges slope ([`ribbon_wedge_into`]).
+fn ribbon_wedge_ordered<S: BeamRows>(
+    out: &mut S,
+    clip: BeamClip,
+    verts: &[RibbonVertex],
+    (across, step, max_quads, blend, edge_px): (Across, usize, usize, GlowBlend, f32),
+    head_first_reversed: bool,
+) -> bool {
+    if verts.len() < 2 || clip.cell_h <= 0 {
+        return true;
+    }
+    let step = step.clamp(1, i32::MAX as usize) as i32;
+    for w in verts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let span = b.x - a.x;
+        if !span.is_finite() || span.abs() < 1e-3 {
+            continue;
+        }
+        let (start, end) = (a.x.min(b.x).ceil() as i32, a.x.max(b.x).ceil() as i32);
+        let width = end - start;
+        if width <= 0 {
+            continue;
+        }
+        let slabs = (width - 1) / step + 1;
+        let reverse = head_first_reversed && span < 0.0;
+        let mut p = start + if reverse { (slabs - 1) * step } else { 0 };
+        let advance = if reverse { -step } else { step };
+        for i in 0..slabs {
+            let len = step.min(end - p).max(1);
+            let rect = (p.max(clip.x0), (p + len).min(clip.x1));
+            let at = |x: i32| RibbonAt::lerp(&a, &b, ((x as f32 - a.x) / span).clamp(0.0, 1.0));
+            let (e0, e1) = (at(rect.0), at(rect.1));
+            let edges = [e0.top(), e1.top(), e0.bot(), e1.bot()];
+            let wedge = rect.1 > rect.0
+                && edges.iter().all(|v| v.is_finite())
+                && ((edges[1] - edges[0]).abs() > edge_px || (edges[3] - edges[2]).abs() > edge_px);
+            #[cfg(any(test, debug_assertions))]
+            if matches!(across, Across::Melt(_)) {
+                crate::test_counters::count_glass_slab();
+            }
+            let laid = if wedge {
+                ribbon_wedge_rows(
+                    out,
+                    clip,
+                    (&a, &b),
+                    p.div_euclid(step),
+                    rect,
+                    across,
+                    max_quads,
+                    blend,
+                )
+            } else {
+                ribbon_slab_rows(
+                    out,
+                    clip,
+                    (&a, &b),
+                    (p, len, step),
+                    across,
+                    max_quads,
+                    blend,
+                )
+            };
+            if !laid {
+                return false;
+            }
+            if i + 1 < slabs {
+                p += advance;
+            }
+        }
+    }
+    true
+}
+
+/// The ribbon's geometry at one point of a segment, each field its
+/// vertices' lerp there.
+#[derive(Clone, Copy, Debug)]
+struct RibbonAt {
+    spine: f32,
+    up: f32,
+    dn: f32,
+    core_up: f32,
+    core_dn: f32,
+    cov: f32,
+    lift: f32,
+    lift_span: f32,
+}
+
+impl RibbonAt {
+    /// The geometry `t` of the way along `a → b`.
+    #[inline]
+    fn lerp(a: &RibbonVertex, b: &RibbonVertex, t: f32) -> Self {
+        let lerp = |u: f32, v: f32| u + (v - u) * t;
+        Self {
+            spine: lerp(a.spine, b.spine),
+            up: lerp(a.up, b.up),
+            dn: lerp(a.dn, b.dn),
+            core_up: lerp(a.core_up, b.core_up),
+            core_dn: lerp(a.core_dn, b.core_dn),
+            cov: lerp(a.cov, b.cov),
+            lift: lerp(a.lift, b.lift).max(0.0),
+            lift_span: lerp(a.lift_span, b.lift_span),
+        }
+    }
+
+    /// The mark's top.
+    #[inline]
+    fn top(&self) -> f32 {
+        self.spine - self.up
+    }
+
+    /// The mark's bottom.
+    #[inline]
+    fn bot(&self) -> f32 {
+        self.spine + self.dn
+    }
+
+    /// The lines a row's level turns at, top to bottom: the mark's top, its
+    /// core's top, the spine, its core's bottom and its bottom, each core as
+    /// [`ribbon_profile`] clamps it; under a glass's melt the second is where
+    /// the melt ends ([`glass_profile`]), the melt's px below the top and no
+    /// lower than the spine.
+    #[inline]
+    fn lines(&self, across: Across) -> [f32; 5] {
+        let core = |core: f32, reach: f32| {
+            if core.is_finite() && reach > 0.0 {
+                core.clamp(0.0, reach * RIBBON_CORE_SHARE)
+            } else {
+                0.0
+            }
+        };
+        let solid = match across {
+            Across::Shoulder(_) => core(self.core_up, self.up),
+            Across::Melt(melt) if melt > 0.0 && self.up > 0.0 => (self.up - melt).max(0.0),
+            Across::Melt(_) => self.up.max(0.0),
+        };
+        [
+            self.top(),
+            self.spine - solid,
+            self.spine,
+            self.spine + core(self.core_dn, self.dn),
+            self.bot(),
+        ]
+    }
+
+    /// Row `y`'s light here before its dither: [`ribbon_beam_ordered`]'s
+    /// row at this geometry, which adds the dither and truncates.
+    #[inline]
+    fn light(&self, y: i32, across: Across) -> f32 {
+        let (top, bot) = (self.top(), self.bot());
+        if top.is_nan() || bot.is_nan() || bot <= top || self.cov.is_nan() || self.cov < 1.0 {
+            return 0.0;
+        }
+        let lo = (y as f32).max(top);
+        let hi = ((y + 1) as f32).min(bot);
+        let cover = hi - lo;
+        if cover <= 0.0 {
+            return 0.0;
+        }
+        let d = (lo + hi) * 0.5 - self.spine;
+        let shape = if d < 0.0 {
+            across.above(d, self.core_up, self.up)
+        } else {
+            ribbon_profile(d, self.core_dn, self.dn, 1.0)
+        };
+        let level = if self.lift == 0.0 {
+            self.cov * shape
+        } else {
+            self.cov * shape + self.lift * ribbon_lift_profile(d, self.lift_span, self.dn)
+        };
+        level * cover
+    }
+}
+
+/// Lay the slab `(p, len)` of `a → b` as [`ribbon_beam_ordered`] lays it, at
+/// its centre; `false` where the budget ran out.
+#[inline]
+fn ribbon_slab_rows<S: BeamRows>(
+    out: &mut S,
+    clip: BeamClip,
+    (a, b): (&RibbonVertex, &RibbonVertex),
+    (p, len, step): (i32, i32, i32),
+    across: Across,
+    max_quads: usize,
+    blend: GlowBlend,
+) -> bool {
+    let span = b.x - a.x;
+    let t = ((p as f32 + len as f32 * 0.5 - a.x) / span).clamp(0.0, 1.0);
+    let lerp = |u: f32, v: f32| u + (v - u) * t;
+    let spine = lerp(a.spine, b.spine);
+    let up = lerp(a.up, b.up);
+    let dn = lerp(a.dn, b.dn);
+    let core_up = lerp(a.core_up, b.core_up);
+    let core_dn = lerp(a.core_dn, b.core_dn);
+    let cov = lerp(a.cov, b.cov);
+    let lift = lerp(a.lift, b.lift).max(0.0);
+    let lift_span = lerp(a.lift_span, b.lift_span);
+    let top = spine - up;
+    let bot = spine + dn;
+    if !top.is_nan() && !bot.is_nan() && bot > top && cov >= 1.0 {
+        let y0 = top.floor() as i32;
+        let y1 = bot.ceil() as i32;
+        let dither_x = p.div_euclid(step).rem_euclid(4) as usize;
+        let rect_x0 = p.max(clip.x0);
+        let rect_x1 = (p + len).min(clip.x1);
+        let t0 = ((rect_x0 as f32 - a.x) / span).clamp(0.0, 1.0);
+        let t1 = ((rect_x1 as f32 - a.x) / span).clamp(0.0, 1.0);
+        let col0 = lerp_rgb_f(a.color, b.color, t0);
+        let col1 = lerp_rgb_f(a.color, b.color, t1);
+        let mut row_rel = (y0 - clip.origin_y).div_euclid(clip.cell_h);
+        let mut band_end = clip.origin_y + (row_rel + 1) * clip.cell_h;
+        out.slab();
+        for y in y0..y1 {
+            if out.laid() + 2 > max_quads {
+                return false;
+            }
+            if y >= band_end {
+                row_rel += 1;
+                band_end += clip.cell_h;
+            }
+            let lo = (y as f32).max(top);
+            let hi = ((y + 1) as f32).min(bot);
+            let cover = hi - lo;
+            if cover <= 0.0 {
+                continue;
+            }
+            let d = (lo + hi) * 0.5 - spine;
+            let shape = if d < 0.0 {
+                across.above(d, core_up, up)
+            } else {
+                ribbon_profile(d, core_dn, dn, 1.0)
+            };
+            let level = if lift == 0.0 {
+                cov * shape
+            } else {
+                cov * shape + lift * ribbon_lift_profile(d, lift_span, dn)
+            };
+            let c = (level * cover + BAYER4[y.rem_euclid(4) as usize][dither_x]) as u8;
+            if c > 0 {
+                let premul0 = premul_rgb(col0, c);
+                let premul1 = if col0 == col1 {
+                    premul0
+                } else {
+                    premul_rgb(col1, c)
+                };
+                if (premul0 != 0 || premul1 != 0)
+                    && rect_x1 > rect_x0
+                    && y >= clip.y0
+                    && y < clip.y1
+                {
+                    let alpha = match blend {
+                        GlowBlend::Add => 0,
+                        GlowBlend::Over => c,
+                    };
+                    out.row(
+                        row_rel,
+                        row_rel.max(0) as u16,
+                        (rect_x0 as u16, y as u16, (rect_x1 - rect_x0) as u16),
+                        (premul0, alpha),
+                        (premul1, alpha),
+                    );
+                }
+            }
+        }
+    }
+    true
+}
+
+/// The most pixel edges a wedge's row turns at: its slab's two, where it
+/// meets each of the profile's lines ([`RibbonAt::lines`], seven), and
+/// where its runs are split ([`WEDGE_LEVEL_SLACK`]).
+const WEDGE_KNOTS: usize = 24;
+
+/// How many levels a wedge row's run may stray from the row's own light
+/// at a quarter of its way before it is split there: a run of a profile's
+/// short edge stays one ramp, and a long melt is laid as the chords that
+/// follow it.
+const WEDGE_LEVEL_SLACK: f32 = 4.0;
+
+/// Lay the wedge over the columns `x0..x1` of `a → b`, the slab `ordinal`
+/// steps from the screen's left ([`ribbon_wedge_into`]); `false` where the
+/// budget ran out.
+#[allow(clippy::too_many_arguments)]
+fn ribbon_wedge_rows<S: BeamRows>(
+    out: &mut S,
+    clip: BeamClip,
+    (a, b): (&RibbonVertex, &RibbonVertex),
+    ordinal: i32,
+    (x0, x1): (i32, i32),
+    across: Across,
+    max_quads: usize,
+    blend: GlowBlend,
+) -> bool {
+    #[cfg(any(test, debug_assertions))]
+    crate::test_counters::count_wedge_slab();
+    let span = b.x - a.x;
+    let t = |x: i32| ((x as f32 - a.x) / span).clamp(0.0, 1.0);
+    let (e0, e1) = (RibbonAt::lerp(a, b, t(x0)), RibbonAt::lerp(a, b, t(x1)));
+    // The lines run on past the segment's ends, so a slab overhanging its
+    // vertex still meets them where the segment does.
+    let line = |x: i32| RibbonAt::lerp(a, b, (x as f32 - a.x) / span).lines(across);
+    let (l0, l1) = (line(x0), line(x1));
+    let y0 = e0.top().min(e1.top()).floor().max(clip.y0 as f32) as i32;
+    let y1 = e0.bot().max(e1.bot()).ceil().min(clip.y1 as f32) as i32;
+    let dither_x = ordinal.rem_euclid(4) as usize;
+    let alpha = |c: u8| match blend {
+        GlowBlend::Add => 0,
+        GlowBlend::Over => c,
+    };
+    out.slab();
+    for y in y0..y1 {
+        let row_rel = (y - clip.origin_y).div_euclid(clip.cell_h);
+        let dither = BAYER4[y.rem_euclid(4) as usize][dither_x];
+        let light = |x: i32| RibbonAt::lerp(a, b, t(x)).light(y, across);
+        // The pixel edges, between the slab's own, where the row's centre
+        // meets each line, the nearest, and where its bottom meets the
+        // mark's top and its top the mark's bottom, the first beyond them
+        // on the dark side: the row's light is near linear between them, and
+        // nothing beyond the last two. `Some(above)`: the row is dark where
+        // the line stands at or above (`true`) or at or below the meeting.
+        let centre = y as f32 + 0.5;
+        let meets = [
+            (0, (y + 1) as f32, Some(true)),
+            (0, centre, None),
+            (1, centre, None),
+            (2, centre, None),
+            (3, centre, None),
+            (4, centre, None),
+            (4, y as f32, Some(false)),
+        ];
+        let mut knots = [(x0, 0.0f32); WEDGE_KNOTS];
+        knots[1].0 = x1;
+        let mut n = 2;
+        for (line, at, dark) in meets {
+            let (f0, f1) = (l0[line], l1[line]);
+            let u = (at - f0) / (f1 - f0);
+            if u > 0.0 && u < 1.0 {
+                let meet = x0 as f32 + u * (x1 - x0) as f32;
+                let k = match dark {
+                    None => meet.round() as i32,
+                    Some(above) => {
+                        // The first pixel edge past the meeting the row is
+                        // dark at, under the segment's own clamped lerp.
+                        let toward = if (f1 > f0) == above { 1 } else { -1 };
+                        let mut k = if toward > 0 {
+                            meet.ceil()
+                        } else {
+                            meet.floor()
+                        } as i32;
+                        while k > x0 && k < x1 && light(k) > 0.0 {
+                            k += toward;
+                        }
+                        k
+                    }
+                };
+                if k > x0 && k < x1 {
+                    knots[n].0 = k;
+                    n += 1;
+                }
+            }
+        }
+        knots[..n].sort_unstable_by_key(|k| k.0);
+        for k in &mut knots[..n] {
+            k.1 = light(k.0);
+        }
+        // A run whose chord strays from the row's own light at a quarter of
+        // its way (where a smoothstep's chord strays most) by more than
+        // WEDGE_LEVEL_SLACK is split there, before the dither, so the screen's
+        // dither never moves a knot.
+        let mut i = 0;
+        while i + 1 < n {
+            let ((k0, c0), (k1, c1)) = (knots[i], knots[i + 1]);
+            let width = k1 - k0;
+            if width >= 4 && n < WEDGE_KNOTS {
+                let stray = |k: i32| {
+                    let c = light(k);
+                    let chord = c0 + (c1 - c0) * (k - k0) as f32 / width as f32;
+                    ((c - chord).abs(), k, c)
+                };
+                let (early, late) = (stray(k0 + width / 4), stray(k1 - width / 4));
+                let worst = if late.0 > early.0 { late } else { early };
+                if worst.0 > WEDGE_LEVEL_SLACK {
+                    knots.copy_within(i + 1..n, i + 2);
+                    knots[i + 1] = (worst.1, worst.2);
+                    n += 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        // The run being laid, `(from, its level, to, its level)`: a flat
+        // run grows over the next while that one stands at its level too.
+        let mut run: Option<(i32, u8, i32, u8)> = None;
+        let mut lay = |(from, c0, to, c1): (i32, u8, i32, u8)| {
+            let premul0 = premul_rgb(lerp_rgb_f(a.color, b.color, t(from)), c0);
+            let premul1 = premul_rgb(lerp_rgb_f(a.color, b.color, t(to)), c1);
+            if premul0 == 0 && premul1 == 0 {
+                return true;
+            }
+            if out.laid() + 2 > max_quads {
+                return false;
+            }
+            out.row(
+                row_rel,
+                row_rel.max(0) as u16,
+                (from as u16, y as u16, (to - from) as u16),
+                (premul0, alpha(c0)),
+                (premul1, alpha(c1)),
+            );
+            true
+        };
+        let level = |(k, v): (i32, f32)| (k, (v + dither) as u8);
+        let mut from = level(knots[0]);
+        for &knot in &knots[1..n] {
+            let (to, c) = level(knot);
+            if to == from.0 {
+                continue;
+            }
+            run = match run {
+                Some((x, c0, _, c1)) if c0 == c1 && c == c1 => Some((x, c0, to, c)),
+                Some(done) => {
+                    if !lay(done) {
+                        return false;
+                    }
+                    Some((from.0, from.1, to, c))
+                }
+                None => Some((from.0, from.1, to, c)),
+            };
+            from = (to, c);
+        }
+        if let Some(done) = run
+            && !lay(done)
+        {
+            return false;
         }
     }
     true
@@ -26278,6 +26968,134 @@ mod tests {
         );
     }
 
+    /// A SUB-SCRIPTED EMOJI IS DRAWN SMALL ON THE CELL'S MIDDLE: an emoji-presented `⬆` cell in
+    /// [`Script::Sub`](aterm_core::terminal::Script::Sub) resolves to its colour key with the
+    /// script bit, and its raster is seven tenths of the full one, every inked row inside
+    /// [`Script::small_emoji_rows`](aterm_core::terminal::Script::small_emoji_rows), centred in
+    /// the two-cell box, its colours the full raster's. CONTROL: the normal cell's emoji fills
+    /// rows outside them.
+    #[test]
+    fn a_sub_scripted_emoji_is_drawn_small_on_the_cells_middle() {
+        use aterm_core::terminal::Script;
+        require_host_colour_emoji();
+        let mut r = renderer();
+        r.debug_block_on_lazy_fallbacks();
+        let arrow = '\u{2B06}';
+        assert!(r.color_font_has(arrow), "the host's colour face maps ⬆️");
+        let cell = |script| RenderCell {
+            ch: arrow,
+            emoji_presentation: true,
+            script,
+            ..RenderCell::default()
+        };
+        let full_key = r.resolve_cell_key(None, &cell(Script::Normal));
+        let small_key = r.resolve_cell_key(None, &cell(Script::Sub { nudge: 3 }));
+        assert!(matches!(full_key.glyph_class, GlyphClass::Rgba));
+        assert_eq!(
+            small_key,
+            GlyphKey {
+                style: StyleBits(full_key.style.0 | StyleBits::SUB.0),
+                ..full_key
+            },
+            "the colour key with the script bit, its nudge ignored"
+        );
+        let (baseline, cell_h, box_w) = (r.baseline, r.cell_h, 2 * r.cell_w);
+        let rows_of = |img: &GlyphImage| {
+            let top = baseline - img.ymin() - img.height() as i32;
+            let inked: Vec<i32> = (0..img.height())
+                .filter(|&y| {
+                    (0..img.width()).any(|x| img.bytes()[(y * img.width() + x) * 4 + 3] > 0)
+                })
+                .map(|y| top + y as i32)
+                .collect();
+            (inked.first().copied(), inked.last().copied())
+        };
+        let full = r.glyph_image(full_key).clone();
+        let small = r.glyph_image(small_key).clone();
+        let (top, rows) = Script::small_emoji_rows(cell_h);
+        let (lo, hi) = rows_of(&small);
+        let (lo, hi) = (lo.expect("inked"), hi.expect("inked"));
+        assert!(
+            lo >= top as i32 && hi < (top + rows) as i32,
+            "inked rows {lo}..={hi} inside {top}..{}",
+            top + rows
+        );
+        let k = rows as f32 / cell_h as f32;
+        assert_eq!(small.height(), (full.height() as f32 * k).round() as usize);
+        assert_eq!(small.width(), (full.width() as f32 * k).round() as usize);
+        assert_eq!(
+            small.xmin(),
+            ((box_w - small.width()) / 2) as i32,
+            "centred"
+        );
+        assert!(
+            matches!(small, GlyphImage::Rgba { .. }),
+            "still drawn in colour"
+        );
+        let (flo, fhi) = rows_of(&full);
+        assert!(
+            flo.is_some_and(|f| f < top as i32) || fhi.is_some_and(|f| f >= (top + rows) as i32),
+            "CONTROL: the full emoji reaches past them: {flo:?}..={fhi:?}"
+        );
+    }
+
+    #[test]
+    fn subscript_scales_both_ligated_and_composite_colour_clusters() {
+        use aterm_core::terminal::Script;
+        require_host_colour_emoji();
+        let mut r = renderer();
+        r.debug_block_on_lazy_fallbacks();
+        for (cluster, class) in [
+            ("1\u{FE0F}\u{20E3}", GlyphClass::RgbaGid),
+            ("\u{1F680}\u{200D}\u{1F355}", GlyphClass::RgbaCluster),
+        ] {
+            let cell = |script| RenderCell {
+                ch: cluster.chars().next().unwrap(),
+                emoji_presentation: true,
+                script,
+                ..RenderCell::default()
+            };
+            let full_key = r.resolve_cell_key(Some(cluster), &cell(Script::Normal));
+            let small_key = r.resolve_cell_key(Some(cluster), &cell(Script::Sub { nudge: -5 }));
+            assert_eq!(full_key.glyph_class, class);
+            assert_eq!(
+                small_key,
+                small_emoji_keyed(full_key, Script::Sub { nudge: 0 })
+            );
+            assert_eq!(small_key.style.script(), StyleBits::SUB);
+            let full = r.glyph_image(full_key).clone();
+            let small = r.glyph_image(small_key).clone();
+            let (top, rows) = Script::small_emoji_rows(r.cell_h);
+            let k = rows as f32 / r.cell_h as f32;
+            assert_eq!(small.height(), (full.height() as f32 * k).round() as usize);
+            assert_eq!(small.width(), (full.width() as f32 * k).round() as usize);
+            assert!(
+                small.height() < full.height(),
+                "CONTROL: normal cluster is full size"
+            );
+            assert_eq!(small.xmin(), ((2 * r.cell_w - small.width()) / 2) as i32);
+            let y0 = r.baseline - small.ymin() - small.height() as i32;
+            let inked: Vec<_> = (0..small.height())
+                .filter(|&y| {
+                    (0..small.width()).any(|x| small.bytes()[(y * small.width() + x) * 4 + 3] > 0)
+                })
+                .map(|y| y0 + y as i32)
+                .collect();
+            assert!(!inked.is_empty(), "{cluster}: colour raster has ink");
+            assert!(
+                inked
+                    .iter()
+                    .all(|&y| y >= top as i32 && y < (top + rows) as i32)
+            );
+        }
+        let fallback = regional_pair_key("\u{1F1FA}\u{1F1F8}", StyleBits::REGULAR, r.px_q).unwrap();
+        assert_eq!(
+            small_emoji_keyed(fallback, Script::Sub { nudge: 3 }),
+            fallback,
+            "a procedural monochrome flag keeps its ordinary key"
+        );
+    }
+
     #[test]
     fn an_unligated_emoji_cluster_draws_every_member_in_its_two_cells() {
         const ROCKET_PIZZA: &str = "\u{1F680}\u{200D}\u{1F355}";
@@ -29910,9 +30728,14 @@ mod tests {
             "JetBrainsMono",
             "jetbrains-mono",
             "Jet_Brains Mono",
+            "JetBrains\u{00A0}Mono",
         ] {
             assert_eq!(normalize_family(spelling), "jetbrainsmono", "{spelling:?}");
         }
+        assert_eq!(
+            normalize_family("M\u{00DC}NCHEN\u{00A0}Mono"),
+            "m\u{00FC}nchenmono"
+        );
         for miss in ["", "   ", "NoSuchFamilyXYZ123"] {
             assert_eq!(
                 resolve_font_family(miss, FaceTarget::REGULAR),

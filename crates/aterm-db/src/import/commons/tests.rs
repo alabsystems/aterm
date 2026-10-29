@@ -240,6 +240,39 @@ fn import_is_one_atomic_retryable_inert_source_document() {
 }
 
 #[test]
+fn import_snapshot_reads_beside_control_catalog_and_application_writers() {
+    let lab = Lab::new(&[Role::Writer]);
+    let path = lab._home.path().join("accounts.csv");
+    std::fs::write(&path, "email,google\nreader@example.test,1\n").unwrap();
+    let db = Imports::at(lab.paths[0].clone());
+    let imported = db.apply(&path, [7; 16]).unwrap();
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    let directory = crate::catalog::Directory::new(&lab.paths[0], bootstrap.trust());
+    let catalog_scope = directory.catalog_scope();
+    let catalog_path = directory.path(catalog_scope).unwrap();
+    let catalog = Store::open(&session, &catalog_path, catalog_scope).unwrap();
+    let scope = descriptor(&bootstrap).unwrap().scope;
+    let table_path = directory.path(scope).unwrap();
+    let table = Store::open(&session, &table_path, scope).unwrap();
+    let before = std::fs::read(table_path.join("table.astream")).unwrap();
+    let snapshot = db.snapshot().unwrap();
+    assert_eq!(snapshot.operations.len(), 1);
+    assert_eq!(snapshot.retained, 1);
+    assert_eq!(snapshot.withheld, 0);
+    assert_eq!(
+        snapshot.operations[0].header.id,
+        decode_hex::<32>(imported["operation"].as_str().unwrap()).unwrap()
+    );
+    assert_eq!(
+        std::fs::read(table_path.join("table.astream")).unwrap(),
+        before
+    );
+    assert_eq!(catalog.scope(), catalog_scope);
+    assert_eq!(table.scope(), scope);
+}
+
+#[test]
 fn invalid_and_oversize_documents_are_refused_before_table_publication() {
     let lab = Lab::new(&[Role::Writer]);
     let path = lab._home.path().join("accounts.csv");

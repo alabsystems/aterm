@@ -68,6 +68,14 @@ fn from_headers_needs_limit_remaining_and_reset() {
     let defaults = RateSnapshot::from_headers(&common::headers(&all[..3])).expect("a snapshot");
     assert_eq!(defaults.resource, "core");
     assert_eq!(defaults.used, 13);
+    let mut blank_resource = all.to_vec();
+    blank_resource[3] = ("X-RateLimit-Resource", "   ");
+    assert_eq!(
+        RateSnapshot::from_headers(&common::headers(&blank_resource))
+            .expect("blank resource defaults to core")
+            .resource,
+        "core"
+    );
 }
 
 #[test]

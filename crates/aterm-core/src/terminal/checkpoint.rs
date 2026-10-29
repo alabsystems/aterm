@@ -360,6 +360,7 @@ pub struct ReplayCarry(Option<CapturedCarry>);
 
 impl ReplayCarry {
     /// Earliest live timestamp held by this carry (`sync_start`, fallback response limiter, or policy buckets).
+    /// Shown-since timestamps of carried Kitty animations are included as well.
     #[must_use]
     pub fn earliest_instant(&self) -> Option<aterm_time::Instant> {
         let c = self.0.as_ref()?;
@@ -370,7 +371,75 @@ impl ReplayCarry {
         ]
         .into_iter()
         .flatten()
+        .chain(c.kitty_frames.values().map(|animation| animation.shown_at))
         .min()
+    }
+
+    /// Distinct Kitty image and in-flight chunk payload bytes retained by this carry.
+    #[must_use]
+    pub fn retained_image_bytes(&self) -> usize {
+        use aterm_types::ImageData;
+        use std::sync::Arc;
+        let Some(c) = self.0.as_ref() else {
+            return 0;
+        };
+        let mut seen: Vec<usize> = Vec::new();
+        let mut total = c
+            .kitty_pending
+            .as_ref()
+            .map_or(0, |cmd| cmd.payload.capacity());
+        let mut visit = |img: &Arc<ImageData>| {
+            let ptr = Arc::as_ptr(img) as usize;
+            if let Err(pos) = seen.binary_search(&ptr) {
+                seen.insert(pos, ptr);
+                total = total.saturating_add(img.payload_bytes());
+            }
+        };
+        for img in c.kitty_images.values() {
+            visit(img);
+        }
+        for anim in c.kitty_frames.values() {
+            for frame in &anim.frames {
+                visit(&frame.image);
+            }
+        }
+        for variants in c.kitty_variants.values() {
+            for variant in variants {
+                visit(&variant.source);
+                visit(&variant.image);
+            }
+        }
+        for placements in c.kitty_virtual.values() {
+            for placement in placements {
+                visit(&placement.image);
+            }
+        }
+        for floating in &c.kitty_floating {
+            visit(&floating.image);
+        }
+        for (_, spans) in &c.active_images.visible {
+            for span in spans {
+                visit(&span.image);
+            }
+        }
+        for (_, spans) in &c.active_images.history_rev {
+            for span in spans {
+                visit(&span.image);
+            }
+        }
+        if let Some(inactive) = &c.inactive_images {
+            for (_, spans) in &inactive.visible {
+                for span in spans {
+                    visit(&span.image);
+                }
+            }
+            for (_, spans) in &inactive.history_rev {
+                for span in spans {
+                    visit(&span.image);
+                }
+            }
+        }
+        total
     }
 
     /// Host alternate-scroll baseline captured with this keyframe, if non-empty.
@@ -408,6 +477,12 @@ impl ReplayCarry {
                 .collect()
         })
     }
+
+    /// Whether non-direct Kitty graphics media (`t=f`, `t=t`, `t=s`) were admitted when this keyframe was captured.
+    #[must_use]
+    pub const fn kitty_media_admitted(&self) -> bool {
+        matches!(&self.0, Some(c) if c.kitty_media_admitted)
+    }
 }
 
 /// Kind of hooked DCS query carried across pane replay slices ([`DcsQueryCarry`]).
@@ -442,6 +517,340 @@ pub struct DcsQueryCarry {
     pub sequence_bytes: u32,
     /// Parser state inside the hooked DCS string (`DcsPassthrough`, or `Escape` with ST pending).
     pub parser: HookedDcsCarry,
+}
+
+/// Playback state of a carried Kitty animation (`s=`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KittyPlayStateCarry {
+    /// `s=1` (and a fresh image): frames change only when `c=` selects one.
+    Stopped,
+    /// `s=2`: runs, and at the last frame waits for more instead of looping.
+    Loading,
+    /// `s=3`: runs, looping back to the first frame after the last.
+    Running,
+}
+
+impl KittyPlayStateCarry {
+    const fn from_play_state(state: super::transient_state::KittyPlayState) -> Self {
+        match state {
+            super::transient_state::KittyPlayState::Stopped => Self::Stopped,
+            super::transient_state::KittyPlayState::Loading => Self::Loading,
+            super::transient_state::KittyPlayState::Running => Self::Running,
+        }
+    }
+
+    const fn into_play_state(self) -> super::transient_state::KittyPlayState {
+        match self {
+            Self::Stopped => super::transient_state::KittyPlayState::Stopped,
+            Self::Loading => super::transient_state::KittyPlayState::Loading,
+            Self::Running => super::transient_state::KittyPlayState::Running,
+        }
+    }
+}
+
+/// Footprint, stacking and crop parameters of a stored Kitty image or variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KittyLayoutCarry {
+    /// Footprint width in cells (`1..=MAX_GRID_COLS`).
+    pub cols: u16,
+    /// Footprint height in cells (`1..=MAX_GRID_ROWS`).
+    pub rows: u16,
+    /// Stacking order (`< 0` behind cell text, `>= 0` over it).
+    pub z_index: i32,
+    /// Sub-cell top-left offset `(x, y)` in device pixels inside the first cell.
+    pub cell_offset_px: (u16, u16),
+    /// How the source raster maps onto the cell footprint.
+    pub scaling: aterm_types::ImageScaling,
+    /// Optional non-empty sub-rectangle of the source raster to display.
+    pub source_rect: Option<aterm_types::SourceRect>,
+}
+
+impl KittyLayoutCarry {
+    #[inline]
+    pub(super) const fn of(image: &aterm_types::ImageData) -> Self {
+        Self {
+            cols: image.cols,
+            rows: image.rows,
+            z_index: image.z_index,
+            cell_offset_px: image.cell_offset_px,
+            scaling: image.scaling,
+            source_rect: image.source_rect,
+        }
+    }
+
+    #[inline]
+    pub(super) fn into_image(
+        self,
+        mut bytes: Vec<u8>,
+        format: aterm_types::ImageFormat,
+    ) -> aterm_types::ImageData {
+        bytes.shrink_to_fit();
+        aterm_types::ImageData {
+            bytes,
+            format,
+            cols: self.cols,
+            rows: self.rows,
+            z_index: self.z_index,
+            band_lift_px: 0,
+            cell_offset_px: self.cell_offset_px,
+            scaling: self.scaling,
+            source_rect: self.source_rect,
+        }
+    }
+}
+
+/// One frame of a carried Kitty image or animation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KittyFrameCarry {
+    /// Raw payload bytes (`Png` or packed `RawRgba8`, `<= MAX_KITTY_IMAGE_BYTES`).
+    pub bytes: Vec<u8>,
+    /// Encoding format (`Png` or `RawRgba8`).
+    pub format: aterm_types::ImageFormat,
+    /// Root layout parameters of this frame.
+    pub layout: KittyLayoutCarry,
+    /// Frame display gap in milliseconds (`0` = gapless).
+    pub gap_ms: u32,
+}
+
+/// Source raster of a cached Kitty layout variant ([`KittyVariantCarry`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KittyVariantSourceCarry {
+    /// Derived from `frames[idx]` (`idx < frames.len()`).
+    Frame(u8),
+    /// Orphaned when its source frame was later edited or deleted.
+    Orphan {
+        /// Retained variant payload bytes.
+        bytes: Vec<u8>,
+        /// Encoding format of `bytes`.
+        format: aterm_types::ImageFormat,
+    },
+}
+
+/// One cached placement layout variant of a carried Kitty image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KittyVariantCarry {
+    /// Source frame index or orphaned raster payload.
+    pub source: KittyVariantSourceCarry,
+    /// Variant placement layout.
+    pub layout: KittyLayoutCarry,
+}
+
+/// Target image slot displayed by a carried Kitty virtual placement ([`KittyVirtualCarry`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KittyVirtualImageCarry {
+    /// Displays `frames[idx]` directly (`idx < frames.len()`).
+    Frame(u8),
+    /// Displays `variants[idx]` (`idx < variants.len()`).
+    Variant(u8),
+}
+
+/// One carried Kitty virtual placement (`U=1`) referenced by Unicode placeholders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KittyVirtualCarry {
+    /// Client placement ID (`p=`), or `0` when unnamed.
+    pub placement_id: u32,
+    /// Transmission serial carried on this virtual placement's tag.
+    pub image_serial: core::num::NonZeroU32,
+    /// Unique placement serial of this virtual placement.
+    pub serial: core::num::NonZeroU32,
+    /// Frame or variant slot displayed by this virtual placement.
+    pub image: KittyVirtualImageCarry,
+}
+
+/// Canonicalizable state of one stored Kitty image (`kitty_images`, `kitty_frames`, `kitty_variants`, `kitty_virtual`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KittyImageCarry {
+    /// Non-zero Kitty image ID (`>= 1`).
+    pub id: u32,
+    /// Monotonic transmission serial assigned when this ID was first stored.
+    pub image_serial: core::num::NonZeroU32,
+    /// Zero-based index into `frames` currently installed in `kitty_images` (`< frames.len()`).
+    pub shown_frame: u8,
+    /// Animation playback state (`s=`).
+    pub state: KittyPlayStateCarry,
+    /// Loop limit (`v=` minus 1; `0` = infinite).
+    pub max_loops: u32,
+    /// Completed loop count since `state` was last set.
+    pub loops: u32,
+    /// Nanosecond offset from the schema origin when `shown_frame` went up.
+    pub shown_at_ns: u64,
+    /// Animation frames (`1..=MAX_KITTY_FRAMES`), root transmit first.
+    pub frames: Vec<KittyFrameCarry>,
+    /// Cached layout variants (`<= MAX_KITTY_VARIANTS`), oldest first.
+    pub variants: Vec<KittyVariantCarry>,
+    /// Active virtual placements (`<= MAX_KITTY_VIRTUALS`), oldest first.
+    pub virtuals: Vec<KittyVirtualCarry>,
+}
+
+/// Uncompressed primary-grid scrollback horizon whose inline-image spans [`PaneStepCarry`] carries (`restore_grid`'s 1000-line ring plus `Scrollback::with_defaults()`'s 1000-line hot tier, matching `image-retention-horizon`).
+pub const PANE_HISTORY_IMAGE_LINES: usize = 2000;
+
+/// Source raster displayed by a carried inline or floating placement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlacedImageSourceCarry {
+    /// Displays `frames[frame]` of stored Kitty image `image_id`.
+    KittyFrame {
+        /// Stored Kitty image ID (`>= 1`).
+        image_id: u32,
+        /// Zero-based frame index (`< frames.len()`).
+        frame: u8,
+    },
+    /// Displays `variants[variant]` of stored Kitty image `image_id`.
+    KittyVariant {
+        /// Stored Kitty image ID (`>= 1`).
+        image_id: u32,
+        /// Zero-based variant index (`< variants.len()`).
+        variant: u8,
+    },
+    /// Displays `loose_images[idx]` (iTerm2 OSC 1337, Sixel, `i=0` Kitty, or a placement whose store entry was freed).
+    Loose(u32),
+}
+
+/// One loose raster payload referenced by inline or floating placements outside the Kitty store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LooseImageCarry {
+    /// Raw payload bytes (`Png` `<= MAX_IMAGE_BYTES` or packed `RawRgba8`).
+    pub bytes: Vec<u8>,
+    /// Encoding format (`Png` or `RawRgba8`).
+    pub format: aterm_types::ImageFormat,
+    /// Placement layout parameters.
+    pub layout: KittyLayoutCarry,
+}
+
+/// Parent placement identity referenced by a carried Kitty relative or floating placement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KittyParentCarry {
+    /// Named parent `(image_id, placement_id)` (`placement_id >= 1`).
+    Named {
+        /// Parent image ID (`0` when unnamed).
+        image_id: u32,
+        /// Non-zero parent placement ID (`p=`).
+        placement_id: core::num::NonZeroU32,
+    },
+    /// Unnamed one-off parent `(image_id, serial)`.
+    Serial {
+        /// Parent image ID (`0` when unnamed).
+        image_id: u32,
+        /// Parent placement serial.
+        serial: core::num::NonZeroU32,
+    },
+}
+
+impl KittyParentCarry {
+    pub(super) fn from_parent(p: super::transient_state::KittyParent) -> Option<Self> {
+        match p {
+            super::transient_state::KittyParent::Named {
+                image_id,
+                placement_id,
+            } => Some(Self::Named {
+                image_id,
+                placement_id: core::num::NonZeroU32::new(placement_id)?,
+            }),
+            super::transient_state::KittyParent::Serial { image_id, serial } => {
+                Some(Self::Serial { image_id, serial })
+            }
+        }
+    }
+
+    pub(super) const fn into_parent(self) -> super::transient_state::KittyParent {
+        match self {
+            Self::Named {
+                image_id,
+                placement_id,
+            } => super::transient_state::KittyParent::Named {
+                image_id,
+                placement_id: placement_id.get(),
+            },
+            Self::Serial { image_id, serial } => {
+                super::transient_state::KittyParent::Serial { image_id, serial }
+            }
+        }
+    }
+}
+
+/// Ancestor kind of a carried Kitty floating placement ([`KittyFloatingCarry`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KittyFloatParentCarry {
+    /// Relative to a virtual placement (`U=1`).
+    Virtual(KittyParentCarry),
+    /// Relative to another floating placement.
+    Floating(KittyParentCarry),
+}
+
+impl KittyFloatParentCarry {
+    pub(super) fn from_float_parent(p: super::transient_state::KittyFloatParent) -> Option<Self> {
+        match p {
+            super::transient_state::KittyFloatParent::Virtual(parent) => {
+                Some(Self::Virtual(KittyParentCarry::from_parent(parent)?))
+            }
+            super::transient_state::KittyFloatParent::Floating(parent) => {
+                Some(Self::Floating(KittyParentCarry::from_parent(parent)?))
+            }
+        }
+    }
+
+    pub(super) const fn into_float_parent(self) -> super::transient_state::KittyFloatParent {
+        match self {
+            Self::Virtual(p) => super::transient_state::KittyFloatParent::Virtual(p.into_parent()),
+            Self::Floating(p) => {
+                super::transient_state::KittyFloatParent::Floating(p.into_parent())
+            }
+        }
+    }
+}
+
+/// One carried Kitty placement relative to a virtual or floating placement (`kitty_floating`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KittyFloatingCarry {
+    /// Placement identity (`image_id >= 1`).
+    pub tag: aterm_grid::KittyPlacementTag,
+    /// Displayed frame, variant, or loose raster slot.
+    pub image: PlacedImageSourceCarry,
+    /// Virtual or floating parent placement.
+    pub parent: KittyFloatParentCarry,
+    /// Horizontal offset in columns (`H=`).
+    pub dx: i32,
+    /// Vertical offset in rows (`V=`).
+    pub dy: i32,
+}
+
+/// One carried Kitty cell-relative placement relation (`kitty_relations`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KittyRelationCarry {
+    /// Child placement identity (`image_id >= 1`).
+    pub child: aterm_grid::KittyPlacementTag,
+    /// Parent placement identity.
+    pub parent: KittyParentCarry,
+    /// Horizontal offset in columns (`H=`).
+    pub dx: i32,
+    /// Vertical offset in rows (`V=`).
+    pub dy: i32,
+}
+
+/// One coalesced inline-image span on a visible or history row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlacedSpanCarry {
+    /// Inclusive start column (`< end_col`).
+    pub start_col: u16,
+    /// Exclusive end column (`<= MAX_GRID_COLS`).
+    pub end_col: u16,
+    /// Zero-based footprint row (`< layout.rows`).
+    pub image_row: u16,
+    /// Zero-based footprint column painted at `start_col`.
+    pub first_cell_col: u16,
+    /// Displayed frame, variant, or loose raster slot.
+    pub image: PlacedImageSourceCarry,
+    /// Kitty placement tag for layer ordering, or `None` for non-Kitty formats.
+    pub kitty: Option<aterm_grid::KittyPlacementTag>,
+}
+
+/// Carried inline-image spans of one grid (visible screen plus newest uncompressed history rows).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlacedGridCarry {
+    /// Non-empty visible-row span lists `(row, spans)` sorted ascending by `row`.
+    pub visible: Vec<(u16, Vec<PlacedSpanCarry>)>,
+    /// Non-empty history-row span lists `(rev_idx, spans)` sorted ascending by `rev_idx` (`0` = newest).
+    pub history_rev: Vec<(u32, Vec<PlacedSpanCarry>)>,
 }
 
 /// Canonicalizable per-slice transient engine state paired with a [`TerminalCheckpoint`] in a pane replay state (`aterm-aos-pane`).
@@ -497,6 +906,22 @@ pub struct PaneStepCarry {
     pub inactive_handback: Option<aterm_grid::GridHandbackCarry>,
     /// Open hooked `DECRQSS` or `XTGETTCAP` query state, when the slice ended mid-query.
     pub dcs_query: Option<DcsQueryCarry>,
+    /// Stored Kitty images, animation frames, variants and virtual placements, sorted ascending by `id`.
+    pub kitty_store: Vec<KittyImageCarry>,
+    /// Kitty image number table `(number, id)`, sorted ascending by `number`.
+    pub kitty_numbers: Vec<(u32, u32)>,
+    /// In-flight chunked Kitty transmission (`m=1`), when any.
+    pub kitty_pending: Option<super::kitty_graphics::KittyCommand>,
+    /// Loose inline/floating raster payloads outside `kitty_store`, in canonical first-appearance order.
+    pub loose_images: Vec<LooseImageCarry>,
+    /// Kitty placements relative to a virtual or floating placement (`kitty_floating`), oldest first.
+    pub kitty_floating: Vec<KittyFloatingCarry>,
+    /// Kitty cell-relative placement relations (`kitty_relations`), oldest first.
+    pub kitty_relations: Vec<KittyRelationCarry>,
+    /// Active-grid inline-image spans (visible screen plus up to [`PANE_HISTORY_IMAGE_LINES`] primary history rows).
+    pub active_images: PlacedGridCarry,
+    /// Inactive-grid inline-image spans (`Some` iff an inactive grid exists).
+    pub inactive_images: Option<PlacedGridCarry>,
 }
 
 fn canonical_f64_bits(v: f64) -> u64 {
@@ -594,6 +1019,17 @@ impl PaneStepCarry {
                 )
             }),
             dcs_query: None,
+            kitty_store: Vec::new(),
+            kitty_numbers: Vec::new(),
+            kitty_pending: None,
+            loose_images: Vec::new(),
+            kitty_floating: Vec::new(),
+            kitty_relations: Vec::new(),
+            active_images: PlacedGridCarry::default(),
+            inactive_images: checkpoint
+                .alt_cursor
+                .as_ref()
+                .map(|_| PlacedGridCarry::default()),
         }
     }
 
@@ -614,24 +1050,41 @@ impl PaneStepCarry {
         });
         let (awaiting_shell_nonce, typed_rekey_prior) =
             term.shell_integration_auth.awaiting_carry();
-        let dcs_query = match (term.hooked_dcs(), term.parser.hooked_dcs_carry()) {
-            (Some(HookedDcs::Query), Some(parser)) => {
-                let kind = match term.dcs.dcs_type {
-                    super::DcsType::Xtgettcap => DcsQueryKind::Xtgettcap,
-                    super::DcsType::Decrqss
-                    | super::DcsType::None
-                    | super::DcsType::Sixel
-                    | super::DcsType::Unknown => DcsQueryKind::Decrqss,
-                };
-                Some(DcsQueryCarry {
-                    kind,
-                    data: term.dcs.data.clone(),
-                    sequence_bytes: u32::try_from(term.dcs.sequence_bytes).unwrap_or(u32::MAX),
-                    parser,
-                })
-            }
-            _ => None,
+        let dcs_query = capture_dcs_query(term);
+        let (kitty_store, kitty_numbers) = capture_kitty_carry(
+            &t.kitty_images,
+            &t.kitty_frames,
+            &t.kitty_variants,
+            &t.kitty_virtual,
+            &t.kitty_numbers,
+            origin,
+        );
+        let on_alt = term.modes.alternate_screen;
+        let active_img_cap = if on_alt {
+            0
+        } else {
+            max_history.min(PANE_HISTORY_IMAGE_LINES)
         };
+        let inactive_img_cap = if on_alt {
+            max_history.min(PANE_HISTORY_IMAGE_LINES)
+        } else {
+            0
+        };
+        let raw_active_images = term.grid.capture_image_carry(active_img_cap);
+        let raw_inactive_images = term
+            .alt_grid
+            .as_ref()
+            .map(|g| g.capture_image_carry(inactive_img_cap));
+        let (loose_images, kitty_floating, kitty_relations, active_images, inactive_images) =
+            capture_placed_carry(
+                &t.kitty_images,
+                &t.kitty_frames,
+                &t.kitty_variants,
+                &t.kitty_floating,
+                &t.kitty_relations,
+                &raw_active_images,
+                raw_inactive_images.as_ref(),
+            );
         Self {
             sync_start_ns: t.sync_start.map(|at| offset_ns_from(origin, at)),
             sync_timeout_ns: duration_to_ns_saturating(term.sync_timeout_duration),
@@ -673,6 +1126,14 @@ impl PaneStepCarry {
             active_handback: term.grid.capture_handback_carry().bounded(active_cap),
             inactive_handback,
             dcs_query,
+            kitty_store,
+            kitty_numbers,
+            kitty_pending: t.kitty_pending.clone(),
+            loose_images,
+            kitty_floating,
+            kitty_relations,
+            active_images,
+            inactive_images,
         }
     }
 
@@ -705,6 +1166,34 @@ impl PaneStepCarry {
         } else {
             0
         };
+        let (kitty_store, kitty_numbers) = capture_kitty_carry(
+            &c.kitty_images,
+            &c.kitty_frames,
+            &c.kitty_variants,
+            &c.kitty_virtual,
+            &c.kitty_numbers,
+            origin,
+        );
+        let (active_img_cap, inactive_img_cap) = if checkpoint.modes.alternate_screen {
+            (0, inactive_cap.min(PANE_HISTORY_IMAGE_LINES))
+        } else {
+            (active_cap.min(PANE_HISTORY_IMAGE_LINES), 0)
+        };
+        let bounded_active = c.active_images.bounded(active_img_cap);
+        let bounded_inactive = c
+            .inactive_images
+            .as_ref()
+            .map(|g| g.bounded(inactive_img_cap));
+        let (loose_images, kitty_floating, kitty_relations, active_images, inactive_images) =
+            capture_placed_carry(
+                &c.kitty_images,
+                &c.kitty_frames,
+                &c.kitty_variants,
+                &c.kitty_floating,
+                &c.kitty_relations,
+                &bounded_active,
+                bounded_inactive.as_ref(),
+            );
         Self {
             sync_start_ns: c.sync_start.map(|at| offset_ns_from(origin, at)),
             sync_timeout_ns: duration_to_ns_saturating(c.sync_timeout_duration),
@@ -746,8 +1235,502 @@ impl PaneStepCarry {
             active_handback: c.active_handback.bounded(active_cap),
             inactive_handback: c.inactive_handback.map(|h| h.bounded(inactive_cap)),
             dcs_query: None,
+            kitty_store,
+            kitty_numbers,
+            kitty_pending: c.kitty_pending.clone(),
+            loose_images,
+            kitty_floating,
+            kitty_relations,
+            active_images,
+            inactive_images,
         }
     }
+}
+
+fn capture_dcs_query(term: &Terminal) -> Option<DcsQueryCarry> {
+    match (term.hooked_dcs(), term.parser.hooked_dcs_carry()) {
+        (Some(HookedDcs::Query), Some(parser)) => {
+            let kind = match term.dcs.dcs_type {
+                super::DcsType::Xtgettcap => DcsQueryKind::Xtgettcap,
+                super::DcsType::Decrqss
+                | super::DcsType::None
+                | super::DcsType::Sixel
+                | super::DcsType::Decrsps { .. }
+                | super::DcsType::Unknown => DcsQueryKind::Decrqss,
+            };
+            Some(DcsQueryCarry {
+                kind,
+                data: term.dcs.data.clone(),
+                sequence_bytes: u32::try_from(term.dcs.sequence_bytes).unwrap_or(u32::MAX),
+                parser,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn capture_kitty_carry(
+    kitty_images: &std::collections::HashMap<u32, std::sync::Arc<aterm_types::ImageData>>,
+    kitty_frames: &std::collections::HashMap<u32, super::transient_state::KittyAnimation>,
+    kitty_variants: &std::collections::HashMap<u32, Vec<super::transient_state::KittyVariant>>,
+    kitty_virtual: &std::collections::HashMap<u32, Vec<super::transient_state::KittyVirtual>>,
+    kitty_numbers: &std::collections::HashMap<u32, u32>,
+    origin: aterm_time::Instant,
+) -> (Vec<KittyImageCarry>, Vec<(u32, u32)>) {
+    let mut ids: Vec<u32> = kitty_frames
+        .keys()
+        .copied()
+        .filter(|&id| id != 0 && kitty_images.contains_key(&id))
+        .collect();
+    ids.sort_unstable();
+    let store = ids
+        .into_iter()
+        .filter_map(|id| {
+            capture_kitty_entry(
+                id,
+                kitty_images.get(&id)?,
+                kitty_frames.get(&id)?,
+                kitty_variants.get(&id).map_or(&[][..], Vec::as_slice),
+                kitty_virtual.get(&id).map_or(&[][..], Vec::as_slice),
+                origin,
+            )
+        })
+        .collect();
+    let mut numbers: Vec<(u32, u32)> = kitty_numbers
+        .iter()
+        .filter(|&(&num, &id)| {
+            num != 0 && id != 0 && kitty_images.contains_key(&id) && kitty_frames.contains_key(&id)
+        })
+        .map(|(&num, &id)| (num, id))
+        .collect();
+    numbers.sort_unstable_by_key(|&(num, _)| num);
+    (store, numbers)
+}
+
+fn capture_kitty_entry(
+    id: u32,
+    shown_img: &std::sync::Arc<aterm_types::ImageData>,
+    anim: &super::transient_state::KittyAnimation,
+    raw_variants: &[super::transient_state::KittyVariant],
+    raw_virtuals: &[super::transient_state::KittyVirtual],
+    origin: aterm_time::Instant,
+) -> Option<KittyImageCarry> {
+    use std::sync::Arc;
+    if anim.frames.is_empty() {
+        return None;
+    }
+    let shown_idx = anim
+        .frames
+        .iter()
+        .position(|f| Arc::ptr_eq(&f.image, shown_img))
+        .unwrap_or(0);
+    let frames: Vec<KittyFrameCarry> = anim
+        .frames
+        .iter()
+        .map(|f| KittyFrameCarry {
+            bytes: f.image.bytes.clone(),
+            format: f.image.format,
+            layout: KittyLayoutCarry::of(&f.image),
+            gap_ms: f.gap_ms,
+        })
+        .collect();
+    let variants: Vec<KittyVariantCarry> = raw_variants
+        .iter()
+        .map(|v| {
+            let source = match anim
+                .frames
+                .iter()
+                .position(|f| Arc::ptr_eq(&f.image, &v.source))
+            {
+                Some(idx) => KittyVariantSourceCarry::Frame(u8::try_from(idx).unwrap_or(0)),
+                None => KittyVariantSourceCarry::Orphan {
+                    bytes: v.image.bytes.clone(),
+                    format: v.image.format,
+                },
+            };
+            KittyVariantCarry {
+                source,
+                layout: KittyLayoutCarry::of(&v.image),
+            }
+        })
+        .collect();
+    let virtuals: Vec<KittyVirtualCarry> = raw_virtuals
+        .iter()
+        .map(|virt| {
+            let image = if let Some(idx) = anim
+                .frames
+                .iter()
+                .position(|f| Arc::ptr_eq(&f.image, &virt.image))
+            {
+                KittyVirtualImageCarry::Frame(u8::try_from(idx).unwrap_or(0))
+            } else if let Some(idx) = raw_variants
+                .iter()
+                .position(|v| Arc::ptr_eq(&v.image, &virt.image))
+            {
+                KittyVirtualImageCarry::Variant(u8::try_from(idx).unwrap_or(0))
+            } else {
+                KittyVirtualImageCarry::Frame(u8::try_from(shown_idx).unwrap_or(0))
+            };
+            KittyVirtualCarry {
+                placement_id: virt.tag.placement_id,
+                image_serial: virt.tag.image_serial,
+                serial: virt.tag.serial,
+                image,
+            }
+        })
+        .collect();
+    Some(KittyImageCarry {
+        id,
+        image_serial: anim.image_serial,
+        shown_frame: u8::try_from(shown_idx).unwrap_or(0),
+        state: KittyPlayStateCarry::from_play_state(anim.state),
+        max_loops: anim.max_loops,
+        loops: anim.loops,
+        shown_at_ns: offset_ns_from(origin, anim.shown_at),
+        frames,
+        variants,
+        virtuals,
+    })
+}
+
+fn apply_kitty_carry(
+    to: &mut super::TransientState,
+    carry: &PaneStepCarry,
+    origin: aterm_time::Instant,
+) {
+    use super::transient_state::{KittyAnimation, KittyFrame, KittyVariant, KittyVirtual};
+    use std::sync::Arc;
+    to.kitty_images.clear();
+    to.kitty_frames.clear();
+    to.kitty_variants.clear();
+    to.kitty_virtual.clear();
+    to.kitty_relations.clear();
+    to.kitty_floating.clear();
+    to.kitty_numbers.clear();
+    let mut total_bytes = 0usize;
+    for entry in &carry.kitty_store {
+        if entry.id == 0 || entry.frames.is_empty() {
+            continue;
+        }
+        let mut frames = Vec::with_capacity(entry.frames.len());
+        for fc in &entry.frames {
+            let img = Arc::new(fc.layout.into_image(fc.bytes.clone(), fc.format));
+            total_bytes = total_bytes.saturating_add(img.bytes.len());
+            frames.push(KittyFrame {
+                image: img,
+                gap_ms: fc.gap_ms,
+            });
+        }
+        let shown_idx = usize::from(entry.shown_frame).min(frames.len() - 1);
+        let shown_arc = Arc::clone(&frames[shown_idx].image);
+        total_bytes = total_bytes.saturating_add(shown_arc.bytes.len());
+        to.kitty_images.insert(entry.id, shown_arc);
+
+        let mut restored_variants = Vec::with_capacity(entry.variants.len());
+        for vc in &entry.variants {
+            let variant = match &vc.source {
+                KittyVariantSourceCarry::Frame(idx) => {
+                    let src_idx = usize::from(*idx).min(frames.len() - 1);
+                    let src_arc = Arc::clone(&frames[src_idx].image);
+                    let img = Arc::new(vc.layout.into_image(src_arc.bytes.clone(), src_arc.format));
+                    total_bytes = total_bytes.saturating_add(img.bytes.len());
+                    KittyVariant {
+                        source: src_arc,
+                        image: img,
+                    }
+                }
+                KittyVariantSourceCarry::Orphan { bytes, format } => {
+                    let dummy_source = Arc::new(vc.layout.into_image(Vec::new(), *format));
+                    let img = Arc::new(vc.layout.into_image(bytes.clone(), *format));
+                    total_bytes = total_bytes.saturating_add(img.bytes.len());
+                    KittyVariant {
+                        source: dummy_source,
+                        image: img,
+                    }
+                }
+            };
+            restored_variants.push(variant);
+        }
+
+        let mut restored_virtuals = Vec::with_capacity(entry.virtuals.len());
+        for virt in &entry.virtuals {
+            let maybe_img = match virt.image {
+                KittyVirtualImageCarry::Frame(idx) => {
+                    frames.get(usize::from(idx)).map(|f| Arc::clone(&f.image))
+                }
+                KittyVirtualImageCarry::Variant(idx) => restored_variants
+                    .get(usize::from(idx))
+                    .map(|v| Arc::clone(&v.image)),
+            };
+            if let Some(image) = maybe_img {
+                restored_virtuals.push(KittyVirtual {
+                    tag: aterm_grid::KittyPlacementTag {
+                        image_id: entry.id,
+                        placement_id: virt.placement_id,
+                        image_serial: virt.image_serial,
+                        serial: virt.serial,
+                    },
+                    image,
+                });
+            }
+        }
+        if !restored_variants.is_empty() {
+            to.kitty_variants.insert(entry.id, restored_variants);
+        }
+        if !restored_virtuals.is_empty() {
+            to.kitty_virtual.insert(entry.id, restored_virtuals);
+        }
+        to.kitty_frames.insert(
+            entry.id,
+            KittyAnimation {
+                frames,
+                state: entry.state.into_play_state(),
+                max_loops: entry.max_loops,
+                loops: entry.loops,
+                shown_at: instant_at_offset(origin, entry.shown_at_ns),
+                image_serial: entry.image_serial,
+            },
+        );
+    }
+    for &(num, id) in &carry.kitty_numbers {
+        if num != 0 && to.kitty_images.contains_key(&id) {
+            to.kitty_numbers.insert(num, id);
+        }
+    }
+    to.kitty_total_bytes = total_bytes;
+    to.kitty_pending.clone_from(&carry.kitty_pending);
+}
+
+fn capture_placed_carry(
+    kitty_images: &std::collections::HashMap<u32, std::sync::Arc<aterm_types::ImageData>>,
+    kitty_frames: &std::collections::HashMap<u32, super::transient_state::KittyAnimation>,
+    kitty_variants: &std::collections::HashMap<u32, Vec<super::transient_state::KittyVariant>>,
+    kitty_floating: &[super::transient_state::KittyFloating],
+    kitty_relations: &[super::transient_state::KittyRelation],
+    active_images: &aterm_grid::GridImageCarry,
+    inactive_images: Option<&aterm_grid::GridImageCarry>,
+) -> (
+    Vec<LooseImageCarry>,
+    Vec<KittyFloatingCarry>,
+    Vec<KittyRelationCarry>,
+    PlacedGridCarry,
+    Option<PlacedGridCarry>,
+) {
+    use std::sync::Arc;
+    if kitty_floating.is_empty()
+        && kitty_relations.is_empty()
+        && active_images.is_empty()
+        && inactive_images.is_none_or(aterm_grid::GridImageCarry::is_empty)
+    {
+        return (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            PlacedGridCarry::default(),
+            inactive_images.map(|_| PlacedGridCarry::default()),
+        );
+    }
+
+    let store_by_ptr = build_kitty_source_index(kitty_images, kitty_frames, kitty_variants);
+    let mut loose_by_ptr: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+    let mut loose_images: Vec<LooseImageCarry> = Vec::new();
+    let mut intern_source = |img: &Arc<aterm_types::ImageData>| -> PlacedImageSourceCarry {
+        let ptr = Arc::as_ptr(img) as usize;
+        if let Some(&src) = store_by_ptr.get(&ptr) {
+            return src;
+        }
+        if let Some(&idx) = loose_by_ptr.get(&ptr) {
+            return PlacedImageSourceCarry::Loose(idx);
+        }
+        let idx = u32::try_from(loose_images.len()).unwrap_or(u32::MAX);
+        loose_images.push(LooseImageCarry {
+            bytes: img.bytes.clone(),
+            format: img.format,
+            layout: KittyLayoutCarry::of(img),
+        });
+        loose_by_ptr.insert(ptr, idx);
+        PlacedImageSourceCarry::Loose(idx)
+    };
+
+    let floating: Vec<KittyFloatingCarry> = kitty_floating
+        .iter()
+        .filter_map(|fl| {
+            let parent = KittyFloatParentCarry::from_float_parent(fl.parent)?;
+            let image = intern_source(&fl.image);
+            Some(KittyFloatingCarry {
+                tag: fl.tag,
+                image,
+                parent,
+                dx: fl.dx,
+                dy: fl.dy,
+            })
+        })
+        .collect();
+
+    let relations: Vec<KittyRelationCarry> = kitty_relations
+        .iter()
+        .filter_map(|rel| {
+            let parent = KittyParentCarry::from_parent(rel.parent)?;
+            Some(KittyRelationCarry {
+                child: rel.child,
+                parent,
+                dx: rel.dx,
+                dy: rel.dy,
+            })
+        })
+        .collect();
+
+    let active_placed = map_placed_grid(active_images, &mut intern_source);
+    let inactive_placed = inactive_images.map(|g| map_placed_grid(g, &mut intern_source));
+
+    (
+        loose_images,
+        floating,
+        relations,
+        active_placed,
+        inactive_placed,
+    )
+}
+
+fn build_kitty_source_index(
+    kitty_images: &std::collections::HashMap<u32, std::sync::Arc<aterm_types::ImageData>>,
+    kitty_frames: &std::collections::HashMap<u32, super::transient_state::KittyAnimation>,
+    kitty_variants: &std::collections::HashMap<u32, Vec<super::transient_state::KittyVariant>>,
+) -> std::collections::HashMap<usize, PlacedImageSourceCarry> {
+    use std::sync::Arc;
+    let mut ids: Vec<u32> = kitty_frames
+        .keys()
+        .copied()
+        .filter(|&id| id != 0 && kitty_images.contains_key(&id))
+        .collect();
+    ids.sort_unstable();
+    let mut store_by_ptr = std::collections::HashMap::new();
+    for id in ids {
+        let Some(anim) = kitty_frames.get(&id) else {
+            continue;
+        };
+        if anim.frames.is_empty() {
+            continue;
+        }
+        for (f_idx, f) in anim.frames.iter().enumerate() {
+            if let Ok(frame) = u8::try_from(f_idx) {
+                store_by_ptr
+                    .entry(Arc::as_ptr(&f.image) as usize)
+                    .or_insert(PlacedImageSourceCarry::KittyFrame {
+                        image_id: id,
+                        frame,
+                    });
+            }
+        }
+        if let Some(variants) = kitty_variants.get(&id) {
+            for (v_idx, v) in variants.iter().enumerate() {
+                if let Ok(variant) = u8::try_from(v_idx) {
+                    store_by_ptr
+                        .entry(Arc::as_ptr(&v.image) as usize)
+                        .or_insert(PlacedImageSourceCarry::KittyVariant {
+                            image_id: id,
+                            variant,
+                        });
+                }
+            }
+        }
+    }
+    store_by_ptr
+}
+
+fn map_placed_grid(
+    grid: &aterm_grid::GridImageCarry,
+    intern: &mut dyn FnMut(&std::sync::Arc<aterm_types::ImageData>) -> PlacedImageSourceCarry,
+) -> PlacedGridCarry {
+    let mut map_spans = |spans: &[aterm_scrollback::ImageSpan]| -> Vec<PlacedSpanCarry> {
+        spans
+            .iter()
+            .map(|sp| PlacedSpanCarry {
+                start_col: sp.start_col,
+                end_col: sp.end_col,
+                image_row: sp.image_row,
+                first_cell_col: sp.first_cell_col,
+                image: intern(&sp.image),
+                kitty: sp.kitty,
+            })
+            .collect()
+    };
+    let visible = grid
+        .visible
+        .iter()
+        .map(|&(row, ref spans)| (row, map_spans(spans)))
+        .collect();
+    let history_rev = grid
+        .history_rev
+        .iter()
+        .map(|&(rev, ref spans)| (rev, map_spans(spans)))
+        .collect();
+    PlacedGridCarry {
+        visible,
+        history_rev,
+    }
+}
+
+fn resolve_placed_grid_carry(
+    grid: &PlacedGridCarry,
+    resolve: &dyn Fn(PlacedImageSourceCarry) -> Option<std::sync::Arc<aterm_types::ImageData>>,
+) -> aterm_grid::GridImageCarry {
+    let map_spans = |spans: &[PlacedSpanCarry]| -> Vec<aterm_scrollback::ImageSpan> {
+        spans
+            .iter()
+            .filter_map(|sp| {
+                let image = resolve(sp.image)?;
+                Some(aterm_scrollback::ImageSpan {
+                    image,
+                    start_col: sp.start_col,
+                    end_col: sp.end_col,
+                    image_row: sp.image_row,
+                    first_cell_col: sp.first_cell_col,
+                    kitty: sp.kitty,
+                })
+            })
+            .collect()
+    };
+    let visible = grid
+        .visible
+        .iter()
+        .filter_map(|&(row, ref spans)| {
+            let resolved = map_spans(spans);
+            (!resolved.is_empty()).then_some((row, resolved))
+        })
+        .collect();
+    let history_rev = grid
+        .history_rev
+        .iter()
+        .filter_map(|&(rev, ref spans)| {
+            let resolved = map_spans(spans);
+            (!resolved.is_empty()).then_some((rev, resolved))
+        })
+        .collect();
+    aterm_grid::GridImageCarry {
+        visible,
+        history_rev,
+    }
+}
+
+fn kitty_maps_total_bytes(
+    kitty_images: &std::collections::HashMap<u32, std::sync::Arc<aterm_types::ImageData>>,
+    kitty_frames: &std::collections::HashMap<u32, super::transient_state::KittyAnimation>,
+    kitty_variants: &std::collections::HashMap<u32, Vec<super::transient_state::KittyVariant>>,
+) -> usize {
+    let imgs = kitty_images
+        .values()
+        .fold(0usize, |sum, img| sum.saturating_add(img.bytes.len()));
+    let frms = kitty_frames.values().fold(0usize, |sum, anim| {
+        anim.frames
+            .iter()
+            .fold(sum, |acc, f| acc.saturating_add(f.image.bytes.len()))
+    });
+    let vars = kitty_variants.values().fold(0usize, |sum, vs| {
+        vs.iter()
+            .fold(sum, |acc, v| acc.saturating_add(v.image.bytes.len()))
+    });
+    imgs.saturating_add(frms).saturating_add(vars)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -770,6 +1753,7 @@ struct CapturedCarry {
     policy: super::policy_gates::PolicyState,
     hyperlink_auth: super::hyperlink_auth::HyperlinkAuth,
     clipboard_auth: super::clipboard_auth::ClipboardAuth,
+    kitty_media_admitted: bool,
     configured_modes: super::state::ConfiguredModes,
     default_cursor_style: aterm_types::CursorStyle,
     host_alternate_scroll: bool,
@@ -804,8 +1788,18 @@ struct CapturedCarry {
     kitty_serial: u32,
     live_image_charge: [usize; 2],
     last_osc_bel_terminated: bool,
+    kitty_images: std::collections::HashMap<u32, std::sync::Arc<aterm_types::ImageData>>,
+    kitty_frames: std::collections::HashMap<u32, super::transient_state::KittyAnimation>,
+    kitty_variants: std::collections::HashMap<u32, Vec<super::transient_state::KittyVariant>>,
+    kitty_virtual: std::collections::HashMap<u32, Vec<super::transient_state::KittyVirtual>>,
+    kitty_numbers: std::collections::HashMap<u32, u32>,
+    kitty_pending: Option<super::kitty_graphics::KittyCommand>,
+    kitty_floating: Vec<super::transient_state::KittyFloating>,
+    kitty_relations: Vec<super::transient_state::KittyRelation>,
     active_handback: aterm_grid::GridHandbackCarry,
     inactive_handback: Option<aterm_grid::GridHandbackCarry>,
+    active_images: aterm_grid::GridImageCarry,
+    inactive_images: Option<aterm_grid::GridImageCarry>,
 }
 
 fn osc_payload_is_shell_mark(osc: &[u8]) -> bool {
@@ -827,6 +1821,7 @@ enum HookedDcs {
     Nothing,
     Picture,
     Query,
+    Restore,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -890,7 +1885,10 @@ impl Terminal {
             true,
             MarksFrom::All,
         );
-        if self.hooked_dcs() == Some(HookedDcs::Query) {
+        if matches!(
+            self.hooked_dcs(),
+            Some(HookedDcs::Query | HookedDcs::Restore)
+        ) {
             c.parser = Some(self.parser.carry_unhooking());
             c.parser_ground = false;
         }
@@ -1019,6 +2017,7 @@ impl Terminal {
             super::DcsType::None | super::DcsType::Unknown => HookedDcs::Nothing,
             super::DcsType::Sixel => HookedDcs::Picture,
             super::DcsType::Decrqss | super::DcsType::Xtgettcap => HookedDcs::Query,
+            super::DcsType::Decrsps { .. } => HookedDcs::Restore,
         })
     }
 
@@ -1027,7 +2026,7 @@ impl Terminal {
         match self.hooked_dcs() {
             None => self.parser.carry(),
             Some(HookedDcs::Nothing | HookedDcs::Picture) => Some(self.parser.carry_unhooking()),
-            Some(HookedDcs::Query) => None,
+            Some(HookedDcs::Query | HookedDcs::Restore) => None,
         }
     }
 
@@ -1304,6 +2303,10 @@ impl Terminal {
         if let (Some(inactive), Some(handback)) = (&mut self.alt_grid, captured.inactive_handback) {
             inactive.apply_handback_carry(handback);
         }
+        self.grid.apply_image_carry(&captured.active_images);
+        if let (Some(inactive), Some(images)) = (&mut self.alt_grid, &captured.inactive_images) {
+            inactive.apply_image_carry(images);
+        }
     }
 
     /// Install a [`PaneStepCarry`] onto a checkpoint-restored engine whose host configuration and policy have already been applied, resolving offsets from `origin`.
@@ -1350,6 +2353,8 @@ impl Terminal {
             .live_image_charge
             .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
         to.last_osc_bel_terminated = carry.last_osc_bel_terminated;
+        apply_kitty_carry(to, carry, origin);
+        self.apply_placed_carry(carry);
         self.grid.apply_handback_carry(carry.active_handback);
         if let (Some(inactive), Some(handback)) = (&mut self.alt_grid, carry.inactive_handback) {
             inactive.apply_handback_carry(handback);
@@ -1379,6 +2384,85 @@ impl Terminal {
         self.refresh_mode_mirror();
     }
 
+    fn apply_placed_carry(&mut self, carry: &PaneStepCarry) {
+        use super::transient_state::{KittyFloating, KittyRelation};
+        use std::sync::Arc;
+        if carry.loose_images.is_empty()
+            && carry.kitty_floating.is_empty()
+            && carry.kitty_relations.is_empty()
+            && carry.active_images.visible.is_empty()
+            && carry.active_images.history_rev.is_empty()
+            && carry
+                .inactive_images
+                .as_ref()
+                .is_none_or(|g| g.visible.is_empty() && g.history_rev.is_empty())
+        {
+            return;
+        }
+        let loose_arcs: Vec<Arc<aterm_types::ImageData>> = carry
+            .loose_images
+            .iter()
+            .map(|lc| Arc::new(lc.layout.into_image(lc.bytes.clone(), lc.format)))
+            .collect();
+        let active_resolved;
+        let inactive_resolved;
+        {
+            let frames = &self.transient.kitty_frames;
+            let variants = &self.transient.kitty_variants;
+            let resolve = |src: PlacedImageSourceCarry| -> Option<Arc<aterm_types::ImageData>> {
+                match src {
+                    PlacedImageSourceCarry::KittyFrame { image_id, frame } => frames
+                        .get(&image_id)?
+                        .frames
+                        .get(usize::from(frame))
+                        .map(|f| Arc::clone(&f.image)),
+                    PlacedImageSourceCarry::KittyVariant { image_id, variant } => variants
+                        .get(&image_id)?
+                        .get(usize::from(variant))
+                        .map(|v| Arc::clone(&v.image)),
+                    PlacedImageSourceCarry::Loose(idx) => {
+                        loose_arcs.get(usize::try_from(idx).ok()?).cloned()
+                    }
+                }
+            };
+            let floating: Vec<KittyFloating> = carry
+                .kitty_floating
+                .iter()
+                .filter_map(|fc| {
+                    let image = resolve(fc.image)?;
+                    Some(KittyFloating {
+                        tag: fc.tag,
+                        image,
+                        parent: fc.parent.into_float_parent(),
+                        dx: fc.dx,
+                        dy: fc.dy,
+                    })
+                })
+                .collect();
+            let relations: Vec<KittyRelation> = carry
+                .kitty_relations
+                .iter()
+                .map(|rc| KittyRelation {
+                    child: rc.child,
+                    parent: rc.parent.into_parent(),
+                    dx: rc.dx,
+                    dy: rc.dy,
+                })
+                .collect();
+            active_resolved = resolve_placed_grid_carry(&carry.active_images, &resolve);
+            inactive_resolved = carry
+                .inactive_images
+                .as_ref()
+                .map(|g| resolve_placed_grid_carry(g, &resolve));
+            self.transient.kitty_floating = floating;
+            self.transient.kitty_relations = relations;
+        }
+        self.grid.apply_image_carry(&active_resolved);
+        if let (Some(inactive), Some(images)) = (&mut self.alt_grid, &inactive_resolved) {
+            inactive.apply_image_carry(images);
+        }
+    }
+
     fn captured_carry(&self) -> CapturedCarry {
         let t = &self.transient;
         let pending_restore = match self.holder_carried_at {
@@ -1394,6 +2478,7 @@ impl Terminal {
             policy: self.policy.clone(),
             hyperlink_auth: self.hyperlink_auth.clone(),
             clipboard_auth: self.clipboard_auth.clone(),
+            kitty_media_admitted: self.kitty_file_resolver_installed(),
             configured_modes: self.configured_modes,
             default_cursor_style: self.default_cursor_style,
             host_alternate_scroll: self.host_alternate_scroll,
@@ -1428,8 +2513,21 @@ impl Terminal {
             kitty_serial: t.kitty_serial,
             live_image_charge: t.live_image_charge,
             last_osc_bel_terminated: t.last_osc_bel_terminated,
+            kitty_images: t.kitty_images.clone(),
+            kitty_frames: t.kitty_frames.clone(),
+            kitty_variants: t.kitty_variants.clone(),
+            kitty_virtual: t.kitty_virtual.clone(),
+            kitty_numbers: t.kitty_numbers.clone(),
+            kitty_pending: t.kitty_pending.clone(),
+            kitty_floating: t.kitty_floating.clone(),
+            kitty_relations: t.kitty_relations.clone(),
             active_handback: self.grid.capture_handback_carry(),
             inactive_handback: self.alt_grid.as_ref().map(Grid::capture_handback_carry),
+            active_images: self.grid.capture_image_carry(usize::MAX),
+            inactive_images: self
+                .alt_grid
+                .as_ref()
+                .map(|g| g.capture_image_carry(usize::MAX)),
         }
     }
 
@@ -1442,6 +2540,11 @@ impl Terminal {
         self.policy.clone_from(&captured.policy);
         self.hyperlink_auth.clone_from(&captured.hyperlink_auth);
         self.clipboard_auth.clone_from(&captured.clipboard_auth);
+        if captured.kitty_media_admitted {
+            self.set_kitty_file_resolver(|_, _| None);
+        } else {
+            self.clear_kitty_file_resolver();
+        }
         self.configured_modes = captured.configured_modes;
         self.default_cursor_style = captured.default_cursor_style;
         self.host_alternate_scroll = captured.host_alternate_scroll;
@@ -1501,22 +2604,23 @@ impl Terminal {
         to.kitty_serial = captured.kitty_serial;
         to.live_image_charge = captured.live_image_charge;
         to.last_osc_bel_terminated = captured.last_osc_bel_terminated;
+        to.kitty_images.clone_from(&captured.kitty_images);
+        to.kitty_frames.clone_from(&captured.kitty_frames);
+        to.kitty_variants.clone_from(&captured.kitty_variants);
+        to.kitty_virtual.clone_from(&captured.kitty_virtual);
+        to.kitty_numbers.clone_from(&captured.kitty_numbers);
+        to.kitty_pending.clone_from(&captured.kitty_pending);
+        to.kitty_relations.clone_from(&captured.kitty_relations);
+        to.kitty_floating.clone_from(&captured.kitty_floating);
+        to.kitty_total_bytes =
+            kitty_maps_total_bytes(&to.kitty_images, &to.kitty_frames, &to.kitty_variants);
         self.refresh_mode_mirror();
     }
 
     /// A copy of this engine that continues as it does.
     #[must_use]
     pub fn replay_fork(&self) -> Option<Terminal> {
-        let t = &self.transient;
-        let kitty_idle = t.kitty_images.is_empty()
-            && t.kitty_frames.is_empty()
-            && t.kitty_variants.is_empty()
-            && t.kitty_virtual.is_empty()
-            && t.kitty_relations.is_empty()
-            && t.kitty_floating.is_empty()
-            && t.kitty_numbers.is_empty()
-            && t.kitty_pending.is_none();
-        if !self.parser_is_ground() || self.carried_parser().is_some() || !kitty_idle {
+        if !self.parser_is_ground() || self.carried_parser().is_some() {
             return None;
         }
         let active = self.grid.replay_fork()?;
@@ -1529,6 +2633,73 @@ impl Terminal {
         fork.holder_fence.clone_from(&self.holder_fence);
         fork.apply_captured_scalars(&self.captured_carry());
         Some(fork)
+    }
+
+    /// Distinct image and in-flight chunk payload bytes held in the Kitty store and visible cell layers that [`Grid::memory_used`] does not book (history [`aterm_scrollback::ImageSpan`]s already book their own row share inside [`Grid::memory_used`]).
+    #[must_use]
+    pub fn unbooked_image_bytes(&self) -> usize {
+        use aterm_types::ImageData;
+        use std::sync::Arc;
+        let t = &self.transient;
+        let active_has = self.grid.extras().any_image();
+        let inactive_has = self
+            .alt_grid
+            .as_ref()
+            .is_some_and(|g| g.extras().any_image());
+        if t.kitty_images.is_empty()
+            && t.kitty_frames.is_empty()
+            && t.kitty_variants.is_empty()
+            && t.kitty_floating.is_empty()
+            && t.kitty_pending.is_none()
+            && !active_has
+            && !inactive_has
+        {
+            return 0;
+        }
+        let mut seen: Vec<usize> = Vec::new();
+        let mut total = t
+            .kitty_pending
+            .as_ref()
+            .map_or(0, |cmd| cmd.payload.capacity());
+        let mut visit = |img: &Arc<ImageData>| {
+            let ptr = Arc::as_ptr(img) as usize;
+            if let Err(pos) = seen.binary_search(&ptr) {
+                seen.insert(pos, ptr);
+                total = total.saturating_add(img.payload_bytes());
+            }
+        };
+        for img in t.kitty_images.values() {
+            visit(img);
+        }
+        for anim in t.kitty_frames.values() {
+            for frame in &anim.frames {
+                visit(&frame.image);
+            }
+        }
+        for variants in t.kitty_variants.values() {
+            for variant in variants {
+                visit(&variant.image);
+                visit(&variant.source);
+            }
+        }
+        for floating in &t.kitty_floating {
+            visit(&floating.image);
+        }
+        if active_has {
+            for (_, extra) in self.grid.extras().iter() {
+                for layer in extra.images() {
+                    visit(&layer.image);
+                }
+            }
+        }
+        if inactive_has && let Some(alt) = &self.alt_grid {
+            for (_, extra) in alt.extras().iter() {
+                for layer in extra.images() {
+                    visit(&layer.image);
+                }
+            }
+        }
+        total
     }
 
     fn restored(c: &TerminalCheckpoint, active_grid: Grid, saved_grid: Option<Grid>) -> Terminal {
@@ -1578,6 +2749,7 @@ impl Terminal {
     /// Restore a checkpoint's buffer state into an already-configured live terminal (the seamless-update adopt path).
     pub fn restore_checkpoint(&mut self, c: &TerminalCheckpoint) {
         let configured_scrollback_limit = self.scrollback_line_limit();
+        let prior_pullback = self.deep_history_pullback_ordinal();
         self.release_search_index();
         let on_alt = c.modes.alternate_screen;
         self.grid = restore_grid(c.rows, c.cols, &c.grid, &c.cursor, on_alt, None);
@@ -1591,6 +2763,17 @@ impl Terminal {
             }
             _ => None,
         };
+        if on_alt {
+            if let Some(main) = self.alt_grid.as_mut() {
+                main.advance_deep_history_pullback_ordinal_by(prior_pullback);
+            } else {
+                self.grid
+                    .advance_deep_history_pullback_ordinal_by(prior_pullback);
+            }
+        } else {
+            self.grid
+                .advance_deep_history_pullback_ordinal_by(prior_pullback);
+        }
         self.modes = c.modes;
         self.set_scrollback_line_limit(configured_scrollback_limit);
         self.cursor_save.main = c.saved_cursor_main.map(SavedCursorRepr::into_saved);
@@ -2795,8 +3978,9 @@ mod tests {
 
     /// A CODEX AT A BOX STAYS AT IT ACROSS A HANDOFF: the program's own report standing (OSC
     /// 7501) is carried, through the carry's meta too, and the adopting engine holds the same
-    /// report, which begins no turn; codex's re-send of it is the same box (where it began is
-    /// kept). CONTROL: an engine with no report carries none.
+    /// report, which begins no turn and keeps no turn edges; codex's re-send of it is the same
+    /// box (where it began is kept). CONTROL: an engine with no report carries none, and the
+    /// live engine drew one turn.
     #[test]
     fn the_programs_own_report_is_carried() {
         let mut t = Terminal::new(4, 20);
@@ -2827,6 +4011,8 @@ mod tests {
             let report = restored.program_state();
             assert_eq!(report.state, t.program_state().state, "{at}");
             assert_eq!(report.turns, 0, "{at}: a carried report begins no turn");
+            assert_eq!(t.program_state().turn_edges().count(), 1, "CONTROL");
+            assert_eq!(report.turn_edges().count(), 0, "{at}: and carries no edge");
             assert_eq!(
                 report.restored_from,
                 Some(t.program_state().began),
@@ -3020,7 +4206,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hooked_dcs_rides_the_carry_unless_it_is_a_query() {
+    fn hooked_dcs_carries_consumed_strings_but_refuses_stateful_operations() {
         let consumed: [(&[u8], &[u8]); 3] = [
             (
                 b"\x1bP1000p%begin 1 1 0\n",
@@ -3091,16 +4277,24 @@ mod tests {
         query.process(b"\x1bP+q");
         assert_eq!(query.partial_sequence_uncarried(), Some("DcsPassthrough"));
         assert!(query.checkpoint_carry(0).is_none());
+        let mut restore = Terminal::new(4, 30);
+        restore.process(b"\x1bP1$t");
+        assert_eq!(restore.partial_sequence_uncarried(), Some("DcsPassthrough"));
+        assert!(restore.checkpoint_carry(0).is_none());
     }
 
     #[test]
-    fn a_hooked_dcs_at_the_escape_of_its_st_rides_the_carry_unless_it_is_a_query() {
-        for head in [&b"\x1bP$qm\x1b"[..], b"\x1bP+q544E\x1b"] {
-            let mut query = Terminal::new(4, 30);
-            query.process(head);
-            assert_eq!(query.take_response(), None, "{head:?}: not answered yet");
-            assert!(query.partial_sequence_uncarried().is_some(), "{head:?}");
-            assert!(query.checkpoint_carry(0).is_none(), "{head:?}");
+    fn hooked_dcs_escape_keeps_consumed_strings_but_refuses_stateful_operations() {
+        for head in [
+            &b"\x1bP$qm\x1b"[..],
+            b"\x1bP+q544E\x1b",
+            b"\x1bP1$t1;1;1;@;@;H;0;2;@;BBBB\x1b",
+        ] {
+            let mut operation = Terminal::new(4, 30);
+            operation.process(head);
+            assert_eq!(operation.take_response(), None, "{head:?}");
+            assert!(operation.partial_sequence_uncarried().is_some(), "{head:?}");
+            assert!(operation.checkpoint_carry(0).is_none(), "{head:?}");
         }
         for head in [&b"\x1bP1000p%end\x1b"[..], b"\x1bPq#0;2;0;0;0#0~\x1b"] {
             for tail in [&b"\\after"[..], b"]2;inner\x07after"] {

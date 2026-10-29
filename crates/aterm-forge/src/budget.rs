@@ -225,6 +225,25 @@ pub(crate) fn cell_metrics(s: &CellSurvey) -> [(&'static str, u64); 5] {
     ]
 }
 
+fn record_surveyed_cell(live: &mut Live, scope: &str, surveyed: Result<CellSurvey, String>) {
+    match surveyed {
+        Ok(s) => match s.unmeasured_source_reason() {
+            Some(why) => {
+                live.unavailable.insert(scope.to_string(), why);
+            }
+            None => {
+                for (metric, value) in cell_metrics(&s) {
+                    live.set(scope, metric, value);
+                }
+                live.detail.insert(scope.to_string(), detail(&s));
+            }
+        },
+        Err(e) => {
+            live.unavailable.insert(scope.to_string(), e);
+        }
+    }
+}
+
 fn measure(cargo: &crate::resolve::Cargo, root: &Path) -> Result<Live, String> {
     let mut live = Live::default();
 
@@ -240,17 +259,7 @@ fn measure(cargo: &crate::resolve::Cargo, root: &Path) -> Result<Live, String> {
                 .filter(|l| !l.trim().is_empty())
                 .map(|l| format!("{}: {}", cell.name, l.trim())),
         );
-        match surveyed {
-            Ok(s) => {
-                for (metric, value) in cell_metrics(&s) {
-                    live.set(&scope, metric, value);
-                }
-                live.detail.insert(scope.clone(), detail(&s));
-            }
-            Err(e) => {
-                live.unavailable.insert(scope.clone(), e);
-            }
-        }
+        record_surveyed_cell(&mut live, &scope, surveyed);
     }
 
     let lock = crate::policy::lock_entries(root)?;
@@ -959,5 +968,75 @@ mod tests {
             unratcheted(&rows, &live),
             [(scope.to_string(), "packages".to_string(), 400)]
         );
+    }
+
+    #[test]
+    fn an_unpacked_third_party_package_marks_the_scope_unavailable() {
+        use crate::model::{Graph, PkgFacts, PkgId};
+        let scope = "shipped.aarch64-apple-darwin";
+        let root_id = PkgId::new("aterm", "0.1.0");
+        let dep_id = PkgId::new("unpacked-macro", "0.3.1");
+        let mut graph = Graph {
+            root: root_id.clone(),
+            ..Graph::default()
+        };
+        graph.nodes.insert(root_id.clone());
+        graph.nodes.insert(dep_id.clone());
+        graph
+            .edges
+            .entry(root_id.clone())
+            .or_default()
+            .insert(dep_id.clone());
+        let mut facts = BTreeMap::new();
+        facts.insert(
+            root_id,
+            PkgFacts {
+                is_third_party: false,
+                root_dir: Some(std::path::PathBuf::from("/repo/crates/aterm")),
+                ..PkgFacts::default()
+            },
+        );
+        facts.insert(
+            dep_id,
+            PkgFacts {
+                is_third_party: true,
+                root_dir: None,
+                ..PkgFacts::default()
+            },
+        );
+        let survey = CellSurvey {
+            cell: Cell {
+                name: "mac-arm".to_string(),
+                triple: "aarch64-apple-darwin".to_string(),
+                package: "aterm".to_string(),
+            },
+            graph,
+            facts,
+        };
+
+        let mut live = Live::default();
+        live.scopes.push(scope.to_string());
+        record_surveyed_cell(&mut live, scope, Ok(survey));
+        assert!(live.get(scope, "proc_macros").is_none());
+        assert!(
+            live.unavailable[scope].contains("unpacked-macro@0.3.1"),
+            "{:?}",
+            live.unavailable
+        );
+
+        let rows = [row(scope, "proc_macros", 5)];
+        for update in [false, true] {
+            let p = plan(&rows, &live, update, None);
+            assert!(!p.ok, "unmeasured third-party source must fail closed");
+            assert!(
+                !p.changed,
+                "--update must not lower ceilings on unmeasured sources"
+            );
+            assert!(
+                p.problems[0].contains("unpacked-macro@0.3.1"),
+                "{:?}",
+                p.problems
+            );
+        }
     }
 }

@@ -20,7 +20,7 @@ pub fn phi_text(phi_milli: u64) -> String {
         let t = (phi_milli + 50) / 100;
         format!("{}.{}", t / 10, t % 10)
     } else {
-        return ((phi_milli + 500) / 1000).to_string();
+        return ((u128::from(phi_milli) + 500) / 1000).to_string();
     };
     let s = s.trim_end_matches('0').trim_end_matches('.');
     s.to_owned()
@@ -200,11 +200,11 @@ impl JobRow {
     #[must_use]
     pub fn gap(&self) -> Option<String> {
         let (q, mu) = (self.quiet_ms?, self.mu_ms?);
-        let times = (q + mu / 2) / mu.max(1);
+        let times = (u128::from(q) + u128::from(mu) / 2) / u128::from(mu.max(1));
         Some(format!(
             "silent {}, about {times}× its usual {} s gap",
             exact_age(q),
-            (mu + 500) / 1000
+            (u128::from(mu) + 500) / 1000
         ))
     }
 }

@@ -70,9 +70,7 @@ fn a_lease_taken_over_a_direct_connection_records_its_kernel_peer() {
 fn a_forged_holder_name_is_not_atermss_hand() {
     let me = std::process::id();
     let own = format!("aterm-harness@{me}");
-    let name_only = |holder: &str| holder == own;
     for (pid, want) in [(Some(me), true), (Some(me + 1), false), (None, false)] {
-        assert!(name_only(&own), "the old judgement trusts the name");
         assert_eq!(
             crate::presence::attested_aterms_holder(&own, pid, &own, me),
             want,

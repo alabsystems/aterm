@@ -41,6 +41,16 @@ pub(crate) trait ReleaseHost: Send + Sync {
     /// `publish/site.toml` exists and does not parse.
     fn site_key(&self) -> Result<Option<PathBuf>, String>;
 
+    /// Where the vault delivers the deployer's key: its catalog path under this account's
+    /// home (`aterm_secrets::need::Want::hold_path`).
+    fn catalog_site_key(&self) -> Option<PathBuf>;
+
+    /// This Mac's need for the deployer's key (docs/DESIGN-credential-requests-2026-10-27.md
+    /// §12.1), moved by `step`, as the need's line: `None` when there is none on file.
+    /// # Errors
+    /// The need ledger cannot be read or written.
+    fn site_key_need(&self, step: NeedStep) -> Result<Option<String>, String>;
+
     /// The program `name` as aterm's resolver finds it (`aterm_uds::host::find_tool`).
     fn find(&self, name: &str) -> Option<PathBuf>;
 
@@ -49,6 +59,17 @@ pub(crate) trait ReleaseHost: Send + Sync {
     /// # Errors
     /// The listing failed or did not finish: git's last line.
     fn reach(&self, url: &str) -> Result<(), String>;
+}
+
+/// What a provision does to the deployer key's need.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NeedStep {
+    /// Only read where it stands (`--check`, and every audit).
+    Read,
+    /// The key is missing at the catalog path: ask the lab for it.
+    Raise,
+    /// The deployer's check passed: the need, if any, is met.
+    Satisfied,
 }
 
 /// What one item probes, and its one remedy.
@@ -292,6 +313,15 @@ impl LayerItem {
         }
     }
 
+    /// Where the lab stands on the deployer key, for a row that lacks it: read only.
+    fn site_key_lab(&self) -> String {
+        match self.host.site_key_need(NeedStep::Read) {
+            Ok(Some(line)) => format!("; the lab: {line}"),
+            Ok(None) => String::new(),
+            Err(why) => format!("; the need ledger: {why}"),
+        }
+    }
+
     /// The deployer's key is a file this account can open: opened, never read, so the
     /// audit holds none of its bytes.
     fn probe_site_key(&self) -> Probe {
@@ -299,9 +329,11 @@ impl LayerItem {
             Err(why) => Probe::Unusable { why },
             Ok(None) => Probe::Person {
                 step: self.id.into(),
-                how: "no service-account key is named for the site deploy (FIREBASE_SA_KEY, or \
-                      publish/site.toml's firebase_sa_key)"
-                    .into(),
+                how: format!(
+                    "no service-account key is named for the site deploy (FIREBASE_SA_KEY, or \
+                     publish/site.toml's firebase_sa_key){}",
+                    self.site_key_lab()
+                ),
             },
             Ok(Some(key)) => {
                 let opened = std::fs::File::open(&key)
@@ -321,8 +353,9 @@ impl LayerItem {
                     Err(e) => Probe::Person {
                         step: self.id.into(),
                         how: format!(
-                            "the site's service-account key {} cannot be read: {e}",
-                            key.display()
+                            "the site's service-account key {} cannot be read: {e}{}",
+                            key.display(),
+                            self.site_key_lab()
                         ),
                     },
                 }
@@ -513,6 +546,53 @@ pub(crate) fn audit(host: &Arc<dyn ReleaseHost>) -> Vec<(&'static str, Check)> {
     }
 }
 
+/// Move the deployer key's need after a provision's audit (not `--check`): a key missing at
+/// the catalog path is asked of the lab, a key present meets the need, and a key named
+/// somewhere else, or named nowhere, is never asked for, since the vault delivers only to its
+/// catalog path and the deploy reads only the path it names. The line to show, if any.
+pub(crate) fn settle_site_key(host: &Arc<dyn ReleaseHost>) -> Option<String> {
+    let key = host.site_key().ok()?;
+    let present = key
+        .as_ref()
+        .is_some_and(|key| std::fs::metadata(key).is_ok_and(|meta| meta.is_file()));
+    let step = if present {
+        NeedStep::Satisfied
+    } else {
+        match (&key, host.catalog_site_key()) {
+            (Some(key), Some(catalog)) if *key == catalog => NeedStep::Raise,
+            (Some(key), Some(catalog)) => {
+                return Some(format!(
+                    "the deployer's key is named at {}, not at {}, where the vault delivers it: \
+                     the lab is not asked, so name {} in publish/site.toml's firebase_sa_key, or \
+                     put the key where it is named",
+                    key.display(),
+                    catalog.display(),
+                    catalog.display()
+                ));
+            }
+            (None, _) => {
+                return Some(
+                    "no key is named for the deploy (FIREBASE_SA_KEY, or publish/site.toml's \
+                     firebase_sa_key), so a key the vault delivers would go unread: the lab is \
+                     not asked"
+                        .to_owned(),
+                );
+            }
+            (Some(_), None) => {
+                return Some(
+                    "this account's home gives the deployer's key no catalog path, so the \
+                     vault cannot deliver it here: the lab is not asked"
+                        .to_owned(),
+                );
+            }
+        }
+    };
+    match host.site_key_need(step) {
+        Ok(line) => line,
+        Err(why) => Some(format!("the need ledger: {why}")),
+    }
+}
+
 /// This machine.
 #[cfg(unix)]
 pub(crate) struct System {
@@ -630,6 +710,29 @@ impl ReleaseHost for System {
         })
     }
 
+    fn catalog_site_key(&self) -> Option<PathBuf> {
+        aterm_secrets::need::Want::SiteDeployerKey.hold_path(&self.home)
+    }
+
+    fn site_key_need(&self, step: NeedStep) -> Result<Option<String>, String> {
+        use aterm_secrets::need::{self, Purpose, Want};
+        let paths = aterm_secrets::client::Paths::live().map_err(|e| e.to_string())?;
+        let want = Want::SiteDeployerKey;
+        let purpose = Purpose::ReleaseSiteKey;
+        let found = match step {
+            NeedStep::Raise => need::raise(&paths, want, purpose).map(Some),
+            NeedStep::Satisfied => need::satisfied(&paths, &want, purpose),
+            NeedStep::Read => need::peek(&paths).map(|needs| {
+                needs
+                    .into_iter()
+                    .find(|need| need.want == want && need.purpose == purpose)
+            }),
+        };
+        found
+            .map(|need| need.map(|need| need.line))
+            .map_err(|e| e.to_string())
+    }
+
     fn find(&self, name: &str) -> Option<PathBuf> {
         aterm_uds::host::find_tool(name)
     }
@@ -672,6 +775,7 @@ mod tests {
         site_key: Option<PathBuf>,
         tools: Vec<&'static str>,
         unreached: Vec<&'static str>,
+        needs: std::sync::Mutex<Vec<NeedStep>>,
     }
 
     impl ReleaseHost for Fake {
@@ -694,6 +798,20 @@ mod tests {
         }
         fn site_key(&self) -> Result<Option<PathBuf>, String> {
             Ok(self.site_key.clone())
+        }
+        fn catalog_site_key(&self) -> Option<PathBuf> {
+            Some(self.home.join("deployer.json"))
+        }
+        fn site_key_need(&self, step: NeedStep) -> Result<Option<String>, String> {
+            let mut needs = self.needs.lock().unwrap();
+            needs.push(step);
+            let raised = needs.contains(&NeedStep::Raise);
+            Ok(match step {
+                NeedStep::Raise => Some("posted to the lab".into()),
+                NeedStep::Read if raised => Some("posted to the lab".into()),
+                NeedStep::Satisfied if raised => Some("fulfilled".into()),
+                NeedStep::Read | NeedStep::Satisfied => None,
+            })
         }
         fn find(&self, name: &str) -> Option<PathBuf> {
             self.tools
@@ -835,7 +953,73 @@ mod tests {
             site_key: Some(home.join("deployer.json")),
             tools: vec!["gitleaks"],
             unreached: Vec::new(),
+            needs: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// A key missing at the catalog path is asked of the lab only by a provision run, never by
+    /// an audit; a key named elsewhere is never asked for; a key present meets the need.
+    #[test]
+    fn the_deployer_key_row_asks_the_lab_only_for_the_catalog_path_and_only_on_a_run() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let row = |host: &Arc<dyn ReleaseHost>| {
+            audit(host)
+                .into_iter()
+                .find(|(id, _)| *id == "release.site-key")
+                .map(|(_, check)| check)
+                .unwrap()
+        };
+        let fake = Arc::new(whole_keeping(home));
+        let host: Arc<dyn ReleaseHost> = fake.clone();
+        assert!(matches!(row(&host), Check::Fail { what, .. } if !what.contains("the lab")));
+        assert_eq!(
+            *fake.needs.lock().unwrap(),
+            [NeedStep::Read],
+            "an audit only reads"
+        );
+        assert_eq!(settle_site_key(&host).as_deref(), Some("posted to the lab"));
+        match row(&host) {
+            Check::Fail { what, .. } => assert!(what.contains("the lab: posted"), "{what}"),
+            other => panic!("{other:?}"),
+        }
+        std::fs::write(home.join("deployer.json"), "{}").unwrap();
+        assert_eq!(settle_site_key(&host).as_deref(), Some("fulfilled"));
+        assert_eq!(
+            *fake.needs.lock().unwrap(),
+            [
+                NeedStep::Read,
+                NeedStep::Raise,
+                NeedStep::Read,
+                NeedStep::Satisfied
+            ]
+        );
+
+        std::fs::remove_file(home.join("deployer.json")).unwrap();
+        let elsewhere = Arc::new(Fake {
+            site_key: Some(home.join("other.json")),
+            ..whole_keeping(home)
+        });
+        let host: Arc<dyn ReleaseHost> = elsewhere.clone();
+        let line = settle_site_key(&host).unwrap();
+        assert!(
+            line.contains("not at") && line.contains("is not asked"),
+            "{line}"
+        );
+        assert!(
+            elsewhere.needs.lock().unwrap().is_empty(),
+            "a key named away from the catalog path is never raised"
+        );
+        let unnamed = Arc::new(Fake {
+            site_key: None,
+            ..whole_keeping(home)
+        });
+        let host: Arc<dyn ReleaseHost> = unnamed.clone();
+        assert!(settle_site_key(&host).is_some(), "the row says why");
+        assert!(
+            unnamed.needs.lock().unwrap().is_empty(),
+            "a deploy that names no key is never raised for: nothing would read the delivery"
+        );
     }
 
     #[test]

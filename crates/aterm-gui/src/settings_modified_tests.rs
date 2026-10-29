@@ -2311,7 +2311,7 @@ fn a_reset_keeps_the_comment_under_a_tables_last_key_with_its_table() {
 
 #[test]
 fn a_written_setting_is_the_same_row_in_search_and_modified() {
-    let source = "gpu = false\nfocus_boost = false\ntemporal_recording = true\ncolumns = 96\nshow_build_badge = false\nstem_gamma = 1.2\nsparkle_words.enabled = false\n[matrix_rain]\nfps = 20\n";
+    let source = "gpu = false\nfocus_boost = false\ntemporal_recording = false\ncolumns = 96\nshow_build_badge = false\nstem_gamma = 1.2\nsparkle_words.enabled = false\n[matrix_rain]\nfps = 20\n";
     let controls = |compiled: &crate::native_ui::CompiledUi| {
         compiled
             .semantics

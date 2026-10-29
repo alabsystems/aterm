@@ -4304,7 +4304,7 @@ fn the_devtools_card_draws_what_it_measures() {
         line_budget: 400,
     };
     let (mut state_whole, mut state_floor) = (0_usize, 0_usize);
-    for facts in every_devtools_facts().into_iter().step_by(11) {
+    for facts in every_devtools_facts() {
         let access = devtools_access(facts, SpikeEvidence::UNMEASURED);
         let copy = devtools_card_copy(&access);
         {
@@ -5164,10 +5164,66 @@ fn at_each_text_scale(rungs: &[f32], what: &str, rung: impl Fn(f32) + Sync) {
 
 const SWEEP_WORKERS: usize = 3;
 
-fn on_workers<T: Sync + std::fmt::Debug>(items: &[T], what: &str, job: impl Fn(&T) + Sync) {
+pub(crate) fn on_workers<T: Sync + std::fmt::Debug>(
+    items: &[T],
+    what: &str,
+    job: impl Fn(&T) + Sync,
+) {
     on_n_workers(SWEEP_WORKERS, items, what, job);
 }
 
+/// Sweep jobs running now in this process, and the wake for a job waiting for a core ([`Core`]).
+static SWEEP_JOBS: (std::sync::Mutex<usize>, std::sync::Condvar) =
+    (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+thread_local! {
+    /// Whether this thread runs a sweep job on a [`Core`].
+    static ON_A_CORE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// A core a sweep job runs on: however many sweeps run, no more jobs run than there are cores.
+struct Core;
+
+impl Core {
+    fn take() -> Self {
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let (running, freed) = &SWEEP_JOBS;
+        let mut now = running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let asked = std::time::Instant::now();
+        while *now >= cores {
+            // Jobs end in well under a minute: none ending in one is a hang.
+            let left = std::time::Duration::from_secs(60).saturating_sub(asked.elapsed());
+            assert!(!left.is_zero(), "no sweep job freed a core in a minute");
+            now = freed
+                .wait_timeout(now, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        *now += 1;
+        ON_A_CORE.with(|on| on.set(true));
+        Self
+    }
+}
+
+impl Drop for Core {
+    fn drop(&mut self) {
+        ON_A_CORE.with(|on| on.set(false));
+        let (running, freed) = &SWEEP_JOBS;
+        *running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) -= 1;
+        freed.notify_one();
+    }
+}
+
+/// `job` on every item across `workers` scoped threads (8 MiB stacks), failing with each item that
+/// panicked. A worker carries only the caller's appearance ([`install_preferences`]); the rest of
+/// a test thread's state starts fresh on it: no injected text scale or system accent, an empty
+/// font store, and empty `thread_local!` memos (`RAIL_MEASURES`, `ANSWERS`, `CUTS`).
+///
+/// [`install_preferences`]: crate::native_appearance::install_preferences
 fn on_n_workers<T: Sync + std::fmt::Debug>(
     workers: usize,
     items: &[T],
@@ -5175,6 +5231,8 @@ fn on_n_workers<T: Sync + std::fmt::Debug>(
     job: impl Fn(&T) + Sync,
 ) {
     let preferences = crate::native_appearance::current_preferences();
+    // A sweep a job runs runs on that job's core.
+    let gated = !ON_A_CORE.with(Cell::get);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let failed = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
@@ -5190,6 +5248,7 @@ fn on_n_workers<T: Sync + std::fmt::Debug>(
                         let Some(item) = items.get(at) else {
                             return;
                         };
+                        let _core = gated.then(Core::take);
                         if let Err(payload) =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(item)))
                         {
@@ -9750,6 +9809,127 @@ fn packages_route_renders_status_actions_switches_and_programs() {
         .find(|command| command.id.as_str() == "packages/check")
         .expect("contextual packages/check command on the Packages route");
     assert!(check.enabled);
+}
+
+/// Settings ▸ Packages' LAN sharing switch ([`atpkg::peers::SERVE_SWITCH`]) shows on until the
+/// store holds the person's off (`units-off`); a person's flip runs atpkg's own
+/// `serve-units --off` or `--on`, a flip to where it stands runs nothing, an unread package
+/// detail never holds it, and while the verb runs the switch shows where it is going.
+#[test]
+fn packages_sharing_switch_shows_the_persons_off_and_a_flip_runs_atpkgs_own_verb() {
+    let sharing = |runtime: &mut NativeRuntime, instance, view| {
+        let mut seen = None;
+        each_screen(runtime, instance, view, &view_cx(), |compiled, _| {
+            if let Some(node) = compiled.semantic(&UiKey::new(PACKAGES_SHARING_ACTION)) {
+                seen.get_or_insert_with(|| (node.value.clone(), node.label.clone(), node.state));
+            }
+        });
+        seen.expect("the LAN sharing switch renders on the Packages page")
+    };
+    let flip = |runtime: &mut NativeRuntime, instance, view, value: Option<bool>| {
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(PACKAGES_SHARING_ACTION),
+                    value: value.map(SemanticInput::Bool),
+                }),
+            )
+            .unwrap()
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                AppEffect::Packages { request, .. } => Some(request.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let open = |state: PackagesState| {
+        let (mut runtime, instance, view) = setup();
+        {
+            let Some(AppViewState::Settings(view_state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            view_state.navigate(SettingsRoute::Packages);
+        }
+        assert!(runtime.replace_settings_packages(state, 2));
+        (runtime, instance, view)
+    };
+    for off in [false, true] {
+        let mut report = packages_report(&ay_status(), true);
+        report.units_off = off;
+        let (mut runtime, instance, view) = open(packages_service(report).state(true, true, true));
+        let (value, label, state) = sharing(&mut runtime, instance, view);
+        assert_eq!(value, SemanticValue::Bool(!off), "units-off={off}");
+        assert_eq!(label, atpkg::peers::SERVE_SWITCH);
+        assert!(
+            state.is_some_and(|state| state.enabled && !state.busy),
+            "{state:?}"
+        );
+        assert_eq!(
+            flip(&mut runtime, instance, view, Some(!off)),
+            Vec::new(),
+            "a flip to where it stands runs nothing (units-off={off})"
+        );
+        assert_eq!(
+            flip(&mut runtime, instance, view, None),
+            vec![PackagesRequest::ServeUnits { on: off }],
+            "units-off={off}"
+        );
+    }
+    // A package detail that could not be read holds the page's verbs, never the person's off,
+    // which reads none of it.
+    let mut report = packages_report(&ay_status(), true);
+    report.collection_error = Some("Could not read status.toml: expected `=`".to_string());
+    let (mut runtime, instance, view) = open(packages_service(report).state(true, true, true));
+    let (_, _, state) = sharing(&mut runtime, instance, view);
+    assert!(state.is_some_and(|state| state.enabled), "{state:?}");
+    assert_eq!(
+        flip(&mut runtime, instance, view, Some(false)),
+        vec![PackagesRequest::ServeUnits { on: false }],
+        "the off runs while a detail is unread"
+    );
+    // A failed flip says why under the switch.
+    let off = PackagesBusy::Sharing { on: false };
+    let mut service = packages_service(packages_report(&ay_status(), true));
+    let sequence = service.begin(Some(off)).unwrap();
+    assert!(service.finish(
+        sequence,
+        crate::packages_screen::PackagesWorkerCompletion::command(
+            packages_report(&ay_status(), true),
+            crate::packages_screen::PackagesCommandOutcome::Failed {
+                operation: off,
+                message: "could not write units-off".to_string(),
+            },
+        ),
+    ));
+    let (mut runtime, instance, view) = open(service.state(true, true, true));
+    let mut note = None;
+    each_screen(&mut runtime, instance, view, &view_cx(), |compiled, _| {
+        if let Some(node) = compiled.semantic(&UiKey::new(PACKAGES_SHARING_FAILED_KEY)) {
+            note.get_or_insert_with(|| node.label.clone());
+        }
+    });
+    assert_eq!(
+        note.as_deref(),
+        Some("LAN sharing not changed: could not write units-off")
+    );
+    let (mut runtime, instance, view) = open(live_packages_state(Some(PackagesBusy::Sharing {
+        on: false,
+    })));
+    let (value, _, state) = sharing(&mut runtime, instance, view);
+    assert_eq!(
+        value,
+        SemanticValue::Bool(false),
+        "where the running verb goes"
+    );
+    assert!(state.is_some_and(|state| state.busy), "{state:?}");
+    assert_eq!(
+        flip(&mut runtime, instance, view, Some(true)),
+        Vec::new(),
+        "one packages verb at a time"
+    );
 }
 
 #[test]
@@ -41219,6 +41399,39 @@ fn a_font_not_found_is_said_everywhere_in_the_same_frame() {
     assert!(header.starts_with(&format!("Font: {family}")), "{header}");
     assert!(!header.contains("Not found"), "{header}");
     assert_eq!(pill.as_deref(), Some("Loading font"));
+}
+
+/// Words set in a UI face before the fallback face they walk lands are set anew once it lands.
+#[test]
+fn words_wrapped_before_their_fallback_face_lands_are_wrapped_anew_after() {
+    let Some(_live) = crate::tray_raster::install_unparsed_cjk_chain_for_test() else {
+        aterm_spec::host::could_not_run("no CJK fallback chain could be installed here");
+    };
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Plain);
+    let text = "テーマを保存しました 日本語のテーマ 日本語のテーマ 日本語のテーマ 日本語のテーマ";
+    let width = 180.0;
+    let wrapped = || {
+        wrap_to_box(text, width, &|line| {
+            crate::tray_raster::ui_text_width_for(face, line, px)
+        })
+    };
+    let before = wrapped();
+    assert_eq!(ui_set_lines(text, (face, px), width), before);
+    assert!(
+        crate::tray_raster::strip_band_run_coverable_in(face, text),
+        "the UI's CJK face lands"
+    );
+    let after = wrapped();
+    assert_ne!(
+        after, before,
+        "CONTROL: the landed face sets the words otherwise"
+    );
+    assert_eq!(
+        ui_set_lines(text, (face, px), width),
+        after,
+        "the words set after the face lands are the landed face's"
+    );
+    crate::tray_raster::clear_ui_fonts_for_test();
 }
 
 /// THE LAST SCREEN DRAWS NO BAND OF BLANK OVER ITS ROWS: on the last screen of every list page,

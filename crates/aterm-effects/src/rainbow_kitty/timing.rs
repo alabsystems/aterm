@@ -312,8 +312,12 @@ pub const fn spring_whip(age_s: f32) -> f32 {
     if !age_s.is_finite() || age_s <= 0.0 {
         return 0.0;
     }
+    let damp = SPRING_WHIP_ZETA * SPRING_WHIP_OMEGA * age_s;
+    if damp >= 20.0 {
+        return 1.0;
+    }
     let (s, c) = crate::supernova::sin_cos_f32(SPRING_WHIP_WD * age_s);
-    let env = crate::color_math::exp_f32(-SPRING_WHIP_ZETA * SPRING_WHIP_OMEGA * age_s);
+    let env = crate::color_math::exp_f32(-damp);
     1.0 - env * (c + SPRING_WHIP_Z_OVER_ROOT * s)
 }
 

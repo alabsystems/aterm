@@ -382,25 +382,30 @@ const SPACE_STEP_HI_HZ: f32 = BASS_BASE_HZ * 4.0;
 #[inline]
 const fn indent_step_hz(chord: usize, root: f32, n: u32, key: i32) -> f32 {
     let lit = sky_bed_degrees(chord);
+    let base = [
+        penta(BASS_BASE_HZ, lit[0] + key),
+        penta(BASS_BASE_HZ, lit[1] + key),
+        penta(BASS_BASE_HZ, lit[2] + key),
+    ];
     #[inline]
-    const fn hz(lit: [i32; 3], k: usize, key: i32) -> f32 {
-        let m = lit.len();
-        penta(BASS_BASE_HZ, 5 * (k / m) as i32 + lit[k % m] + key)
+    const fn hz(base: [f32; 3], k: usize) -> f32 {
+        base[k % 3] * f32::from_bits(((127 + (k / 3)) as u32) << 23)
     }
+    let root_floor = root * 1.01;
     let mut k0 = 0usize;
     while k0 < 64 {
-        if hz(lit, k0, key) > root * 1.01 {
+        if hz(base, k0) > root_floor {
             break;
         }
         k0 += 1;
     }
     let mut cycle = 0usize;
-    while cycle < 64 && hz(lit, k0 + cycle, key) < SPACE_STEP_HI_HZ {
+    while cycle < 64 && hz(base, k0 + cycle) < SPACE_STEP_HI_HZ {
         cycle += 1;
     }
     let cycle = if cycle > 1 { cycle } else { 1 };
     let k = k0 + (n.saturating_sub(1) as usize) % cycle;
-    let mut f = hz(lit, k, key);
+    let mut f = hz(base, k);
     while f.is_finite() && f >= SPACE_STEP_HI_HZ {
         f *= 0.5;
     }
@@ -1035,14 +1040,15 @@ impl MelodyV2 {
     }
 
     #[inline]
-    const fn deg_is_lit(&self, deg: i32) -> bool {
+    const fn deg_is_lit_in(lit_mask: u8, deg: i32) -> bool {
         let pc = deg.rem_euclid(5) as u8;
-        CHORD_LOOP[self.text.chord as usize].lit & (1 << pc) != 0
+        lit_mask & (1 << pc) != 0
     }
 
+    #[cfg(test)]
     #[inline]
-    const fn lit(&self) -> bool {
-        self.deg_is_lit(self.text.walk as i32)
+    const fn deg_is_lit(&self, deg: i32) -> bool {
+        Self::deg_is_lit_in(CHORD_LOOP[self.text.chord as usize].lit, deg)
     }
 
     #[inline]
@@ -1054,18 +1060,19 @@ impl MelodyV2 {
         } else {
             deg
         };
-        if self.deg_is_lit(deg) {
+        let lit_mask = CHORD_LOOP[self.text.chord as usize].lit;
+        if Self::deg_is_lit_in(lit_mask, deg) {
             return deg;
         }
         let dir = if deg >= from { 1 } else { -1 };
         let mut k = 1;
         while k <= WORD_HEAD_SNAP_DEG {
             let c0 = deg + dir * k;
-            if c0 >= TUNE_DEG_LO && c0 <= TUNE_DEG_HI && self.deg_is_lit(c0) {
+            if c0 >= TUNE_DEG_LO && c0 <= TUNE_DEG_HI && Self::deg_is_lit_in(lit_mask, c0) {
                 return c0;
             }
             let c1 = deg - dir * k;
-            if c1 >= TUNE_DEG_LO && c1 <= TUNE_DEG_HI && self.deg_is_lit(c1) {
+            if c1 >= TUNE_DEG_LO && c1 <= TUNE_DEG_HI && Self::deg_is_lit_in(lit_mask, c1) {
                 return c1;
             }
             k += 1;
@@ -1245,6 +1252,7 @@ impl MelodyV2 {
             }
         }
 
+        let lit_mask = CHORD_LOOP[self.text.chord as usize].lit;
         let from = self.text.walk as i32;
         let mut deg = self.derive(rank, gap, first, word_head);
         if word_head {
@@ -1258,7 +1266,7 @@ impl MelodyV2 {
                 let mut k = 1;
                 while k <= WORD_HEAD_SNAP_DEG + 1 {
                     let c = from + away * k;
-                    if c >= TUNE_DEG_LO && c <= TUNE_DEG_HI && self.deg_is_lit(c) {
+                    if c >= TUNE_DEG_LO && c <= TUNE_DEG_HI && Self::deg_is_lit_in(lit_mask, c) {
                         deg = c;
                         break;
                     }
@@ -1269,12 +1277,18 @@ impl MelodyV2 {
                 let mut k = 1;
                 while k <= STEER_MAX_DEG {
                     let c_hi = from + k;
-                    if c_hi >= TUNE_DEG_LO && c_hi <= TUNE_DEG_HI && self.deg_is_lit(c_hi) {
+                    if c_hi >= TUNE_DEG_LO
+                        && c_hi <= TUNE_DEG_HI
+                        && Self::deg_is_lit_in(lit_mask, c_hi)
+                    {
                         deg = c_hi;
                         break;
                     }
                     let c_lo = from - k;
-                    if c_lo >= TUNE_DEG_LO && c_lo <= TUNE_DEG_HI && self.deg_is_lit(c_lo) {
+                    if c_lo >= TUNE_DEG_LO
+                        && c_lo <= TUNE_DEG_HI
+                        && Self::deg_is_lit_in(lit_mask, c_lo)
+                    {
                         deg = c_lo;
                         break;
                     }
@@ -1350,7 +1364,7 @@ impl MelodyV2 {
             };
             let mut c = deg;
             while c <= top {
-                if self.deg_is_lit(c) {
+                if Self::deg_is_lit_in(lit_mask, c) {
                     deg = c;
                     break;
                 }
@@ -1434,7 +1448,7 @@ impl MelodyV2 {
 
         self.ioi_ms = timing::ioi_next(self.ioi_ms, gap, first, rest);
 
-        let lit = self.lit() || self.take_verdict_lit(at);
+        let lit = Self::deg_is_lit_in(lit_mask, self.text.walk as i32) || self.take_verdict_lit(at);
         let step_level = if lit || shifted || steered {
             1.0
         } else {
@@ -1765,10 +1779,11 @@ impl MelodyV2 {
 
     #[inline]
     const fn answer_deg_above(&self, deg: i32) -> i32 {
+        let lit_mask = CHORD_LOOP[self.text.chord as usize].lit;
         let mut k = 1;
         while k <= 5 {
             let d = deg + k;
-            if self.deg_is_lit(d) {
+            if Self::deg_is_lit_in(lit_mask, d) {
                 return d;
             }
             k += 1;
@@ -1841,6 +1856,7 @@ const fn hue_arc(hue: f32) -> f32 {
 }
 
 const HUE_AIR_FLOOR: f32 = 0.80;
+const HUE_AIR_DEFAULT: f32 = hue_air(0.25);
 
 #[inline]
 const fn hue_air(hue: f32) -> f32 {
@@ -2662,7 +2678,7 @@ impl TrailSynth {
             let (air, spread) = if stops.hue {
                 (hue_air(ev.hue), BLOOM_SPREAD * (arc - 0.5))
             } else {
-                (hue_air(0.25), 0.0)
+                (HUE_AIR_DEFAULT, 0.0)
             };
             let bloom_gain =
                 ev.gain * KEY_TINE_TRIM * plan.level * g * vel * BLOOM_LEVEL * air * aside_gain;
@@ -2783,7 +2799,12 @@ impl TrailSynth {
         };
         let struck = step_touch && !plan.mallet_only;
         let ring_deg = deg + FLOW_ECHO_OCTAVE_DEG + CAP_RING_LIFT_DEG;
-        let rings = hammer.ring && !self.v2_live_ting_at(penta(TINE_BASE_HZ, ring_deg));
+        let ring_hz = if hammer.ring {
+            penta(TINE_BASE_HZ, ring_deg)
+        } else {
+            0.0
+        };
+        let rings = hammer.ring && !self.v2_live_ting_at(ring_hz);
         if ev.shifted && struck && !rings && !self.all_voices_on() {
             let mut r = 0;
             while r < 4 {
@@ -2793,19 +2814,12 @@ impl TrailSynth {
         }
         let echoes = flow > 0.0 && plan.lit && !plucked && !ev.shifted;
         if (echoes || rings) && struck {
-            let echo_deg = if rings {
-                ring_deg
+            let echo_hz = if rings {
+                ring_hz
             } else {
-                deg + FLOW_ECHO_OCTAVE_DEG
+                penta(TINE_BASE_HZ, deg + FLOW_ECHO_OCTAVE_DEG)
             };
-            let mut echo = tine(
-                penta(TINE_BASE_HZ, echo_deg),
-                Touch::Step,
-                tau,
-                roof,
-                false,
-                flow,
-            );
+            let mut echo = tine(echo_hz, Touch::Step, tau, roof, false, flow);
             echo.n_lvl = 0.0;
             if rings {
                 echo.p[2].lvl = 0.0;
@@ -2864,10 +2878,11 @@ impl TrailSynth {
         after: f32,
         shifted: bool,
     ) {
+        let mut base_tap = bloom(deg, roof, TAU_V_MAX_S);
+        base_tap.lp_cut = shifted_roof(base_tap.lp_cut, shifted);
         let mut k = 0;
         while k < AIR_TAP_DELAY_S.len() {
-            let mut tap = bloom(deg, roof, TAU_V_MAX_S);
-            tap.lp_cut = shifted_roof(tap.lp_cut, shifted);
+            let mut tap = base_tap;
             tap.delay = after + AIR_TAP_DELAY_S[k];
             let side = if k & 1 == 0 {
                 -AIR_TAP_PAN
@@ -2988,6 +3003,7 @@ impl TrailSynth {
         let base = (self.v2.text.walk as i32) + (self.song_key as i32);
         if head {
             let roof = roof_hz(cps, true, ev.heat, arc, Touch::Step);
+            let gain_base = ev.gain * KEY_TINE_TRIM;
             let mut k = 0;
             while k < CASCADE_DEGREES.len() {
                 let f = penta(TINE_BASE_HZ, base + CASCADE_DEGREES[k]);
@@ -2995,7 +3011,7 @@ impl TrailSynth {
                 voice.delay = CASCADE_DELAYS_S[k];
                 voice.lane = LANE_CASCADE;
                 let pan = if k & 1 == 0 { ev.pan } else { -ev.pan };
-                let gain = ev.gain * KEY_TINE_TRIM * CASCADE_LEVELS[k];
+                let gain = gain_base * CASCADE_LEVELS[k];
                 self.v2_spawn(voice, gain, pan);
                 k += 1;
             }
@@ -3025,13 +3041,14 @@ impl TrailSynth {
         let tau = tau_v_s(self.v2.ioi_ms * 0.001);
         let roof = self.v2_lit_roof(ev);
         let base = self.song_key as i32;
+        let gain_base = ev.gain * KEY_TINE_TRIM * STRUM_TRIM;
         let mut k = 0;
         while k < degrees.len() {
             let f = penta(TINE_BASE_HZ, base + degrees[k]);
             let mut voice = tine(f, Touch::Step, tau, roof, false, self.v2.flow);
             voice.delay = STRUM_DELAYS_S[k];
             voice.lane = LANE_CASCADE;
-            let gain = ev.gain * KEY_TINE_TRIM * STRUM_TRIM * STRUM_SHAPE[k];
+            let gain = gain_base * STRUM_SHAPE[k];
             self.v2_spawn(voice, gain, ev.pan);
             k += 1;
         }
@@ -3066,7 +3083,7 @@ impl TrailSynth {
             let air = if stops.hue {
                 hue_air(ev.hue)
             } else {
-                hue_air(0.25)
+                HUE_AIR_DEFAULT
             };
             let g = g_ioi(ioi_s);
             let bloom_gain = ev.gain * KEY_TINE_TRIM * g * BLOOM_LEVEL * air;
@@ -3479,10 +3496,12 @@ impl TrailSynth {
         self.v2.thump = self.v2_spawn(thump, g * MET_THUMP_LEVEL, 0.0);
 
         let step_s = timing::rain_spacing_ms(t * 1000.0) * 0.001;
+        let base_delay = t + MET_RAIN_LEAD_S;
+        let rain_gain = g * MET_RAIN_LEVEL;
         let mut k = 0;
         while k < timing::FAN_HERO_N {
             let glint = Voice {
-                delay: t + MET_RAIN_LEAD_S + k as f32 * step_s,
+                delay: base_delay + k as f32 * step_s,
                 dur: MET_RAIN_DUR_S,
                 attack: MET_RAIN_ATTACK_S,
                 decay: MET_RAIN_DECAY_S,
@@ -3493,7 +3512,7 @@ impl TrailSynth {
                 lane: LANE_RAIN,
                 ..Voice::DEFAULT
             };
-            self.v2_spawn(glint, g * MET_RAIN_LEVEL, ev.pan + MET_RAIN_PAN[k]);
+            self.v2_spawn(glint, rain_gain, ev.pan + MET_RAIN_PAN[k]);
             k += 1;
         }
     }

@@ -42,6 +42,11 @@ fn a_verdict_on_an_ask_acks_the_sender_once_and_a_note_acks_nothing() {
     assert!(note.ok(), "note: {}", note.header());
     let note_off = off_of(note.header());
 
+    let _first_id = until("the first ask to reach B", || id_at_off(&w, &b, off[0]));
+    assert!(w.verb(&format!("@{b} inbox --peek")).ok());
+    w.drained(&b);
+    assert_eq!(lane_len(&w, &ack_lane), 0, "inbox --peek earns no receipt");
+
     for (i, verdict) in ["handled", "refused", "deferred"].iter().enumerate() {
         let id = until("the ask to reach B", || id_at_off(&w, &b, off[i]));
         let seen = w.verb(&format!("@{b} inbox seen {id} {verdict}"));
@@ -96,7 +101,7 @@ fn a_verdict_on_an_ask_acks_the_sender_once_and_a_note_acks_nothing() {
 /// ack=handled msg=<row>`.
 #[test]
 fn post_wait_ack_returns_the_recipients_verdict() {
-    let w = World::boot_flags("r15waitack", &["--receipts"]);
+    let w = World::boot("r15waitack", &[]);
     w.wait_ready();
     let (a, b) = w.two_sessions();
 
@@ -104,30 +109,22 @@ fn post_wait_ack_returns_the_recipients_verdict() {
     let token = w.token.clone();
     let b_sid = b.clone();
     let acker = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        loop {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the ask never reached B"
-            );
+        let id = until("the ask to reach B", || {
             let mut ctl = harness::connect(&sock, &token).expect("connect");
             let listing = ctl
                 .request(&format!("@{b_sid} inbox --peek"))
                 .expect("inbox");
-            if let Some(id) = listing.rows().iter().rev().find_map(|r| {
+            listing.rows().iter().rev().find_map(|r| {
                 (kv(r, "kind") == Some("ask"))
                     .then(|| r.split_whitespace().nth(1)?.parse::<u64>().ok())
                     .flatten()
-            }) {
-                let mut ctl = harness::connect(&sock, &token).expect("connect");
-                let seen = ctl
-                    .request(&format!("@{b_sid} inbox seen {id} handled"))
-                    .expect("inbox seen");
-                assert!(seen.ok(), "inbox seen: {}", seen.header());
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+            })
+        });
+        let mut ctl = harness::connect(&sock, &token).expect("connect");
+        let seen = ctl
+            .request(&format!("@{b_sid} inbox seen {id} handled"))
+            .expect("inbox seen");
+        assert!(seen.ok(), "inbox seen: {}", seen.header());
     });
 
     let posted = w.verb(&format!(
@@ -261,9 +258,8 @@ fn inbox_get_at_an_offset_fetches_a_record_the_ring_dropped() {
     };
     let missing = w.verb(&format!("@{b} inbox get @{}", head + 10_000));
     assert!(
-        missing.header().starts_with("ERR no such record")
-            || missing.header().starts_with("ERR timeout"),
-        "an offset past the head is no record (or times out reading it): {}",
+        missing.header().starts_with("ERR no such record"),
+        "an offset past the head is no record: {}",
         missing.header()
     );
 }
@@ -274,7 +270,7 @@ fn inbox_get_at_an_offset_fetches_a_record_the_ring_dropped() {
 fn a_receipt_to_a_bare_session_sender_whose_exit_line_never_arrives_is_not_routed_to_its_face() {
     let w = World::boot_flags_with(
         "r15ackgone",
-        &["--receipts"],
+        &[],
         &[("ATERM_LINK_FAULT", "drop-session-exited-while-marked")],
     );
     w.wait_ready();

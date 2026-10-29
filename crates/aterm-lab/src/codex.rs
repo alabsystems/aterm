@@ -10,7 +10,7 @@ use crate::LAB;
 use crate::door::Door;
 use crate::pyjson::{COMPACT, J, Style};
 use crate::run::{Run, take_tag};
-use crate::util::shell_quote;
+use crate::util::{shell_prepend_path, shell_quote};
 use crate::{Fail, Res};
 
 /// The lab provider's `env_key` value.
@@ -281,14 +281,14 @@ pub fn names_no_daemon(bin: &Path) -> bool {
 pub fn launcher(run: &Run, tab: bool, mode: &str, envs: &[String], args: &[String]) -> String {
     let w = run.w.to_string_lossy();
     let shim = run.run.join("shim");
-    let px = &run.proxy;
+    let px = shell_quote(&run.proxy);
     let mut s = String::from("#!/bin/sh\n");
     if tab {
         s.push_str("clear\n");
     }
     s.push_str(&format!(
-        "exec env -u OPENAI_API_KEY -u CODEX_API_KEY -u OPENAI_BASE_URL PATH=\"{}:$PATH\" HOME={} CODEX_HOME={} \\\n",
-        shim.display(),
+        "exec env -u OPENAI_API_KEY -u CODEX_API_KEY -u OPENAI_BASE_URL PATH={} HOME={} CODEX_HOME={} \\\n",
+        shell_prepend_path(&shim.to_string_lossy()),
         shell_quote(&format!("{w}/home")),
         shell_quote(&format!("{w}/codex-home"))
     ));
@@ -303,8 +303,9 @@ pub fn launcher(run: &Run, tab: bool, mode: &str, envs: &[String], args: &[Strin
         shell_quote(&shim.join("open").to_string_lossy())
     ));
     s.push_str(&format!(
-        "  CODEX_REFRESH_TOKEN_URL_OVERRIDE=http://127.0.0.1:{0}/oauth/token CODEX_REVOKE_TOKEN_URL_OVERRIDE=http://127.0.0.1:{0}/oauth/revoke \\\n",
-        run.port
+        "  CODEX_REFRESH_TOKEN_URL_OVERRIDE={} CODEX_REVOKE_TOKEN_URL_OVERRIDE={} \\\n",
+        shell_quote(&format!("http://127.0.0.1:{}/oauth/token", run.port)),
+        shell_quote(&format!("http://127.0.0.1:{}/oauth/revoke", run.port))
     ));
     if mode == "lab" {
         s.push_str(&format!("  LAB_CODEX_KEY={LAB_CODEX_KEY} \\\n"));
@@ -833,6 +834,28 @@ mod tests {
         assert!(
             s.contains("  LAB_CODEX_KEY=lab-not-a-key \\\n  'K=v 1' \\\n"),
             "{s}"
+        );
+        let special = launcher(
+            &Run {
+                run: r#"/s/"a"$b`c`/t"#.into(),
+                w: "/s/w".into(),
+                port: "5;evil".into(),
+                proxy: "http://127.0.0.1:6 x".into(),
+                codex_bin: alab.clone(),
+                ..Run::default()
+            },
+            false,
+            "lab",
+            &[],
+            &[],
+        );
+        assert!(
+            special.contains(r#"PATH="/s/\"a\"\$b\`c\`/t/shim:$PATH""#)
+                && special.contains("HTTP_PROXY='http://127.0.0.1:6 x'")
+                && special.contains(
+                    "CODEX_REFRESH_TOKEN_URL_OVERRIDE='http://127.0.0.1:5;evil/oauth/token'"
+                ),
+            "{special}"
         );
         let takes = |bin: &str| {
             [(true, "lab"), (false, "chatgpt")].map(|(tab, mode)| {

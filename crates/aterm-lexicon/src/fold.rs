@@ -245,8 +245,7 @@ mod tests {
 
     #[test]
     fn keeps_indic_marks() {
-        let folded = fold("बिल्ली");
-        assert!(folded.contains('\u{093F}') || folded.chars().count() >= 4);
+        assert_eq!(fold("बिल्ली"), "बिल्ली");
     }
 
     #[test]

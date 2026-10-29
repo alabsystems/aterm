@@ -133,3 +133,63 @@ fn truncation_and_pressure_are_observable_out_of_band() {
         );
     }
 }
+
+#[test]
+fn pending_budget_share_shrink_wakes_needs_frame_and_agrees_with_render() {
+    let mut t = term();
+    feed_lines(&mut t, 3_000);
+    while t.drain_scrollback_backlog(0) > 0 {}
+    t.scroll_to_top();
+    t.render().expect("initial frame");
+    assert!(!t.needs_frame(), "settled after rendering scrolled history");
+    t.render().expect("gated frame");
+    assert!(t.last_render_skipped(), "settled frame gates");
+
+    // Simulate a non-evicting pending share update (as from raising the global budget).
+    t.budget_share.set_configured(128 * 1024 * 1024);
+    assert!(
+        !t.needs_frame(),
+        "a non-evicting pending share leaves damage_epoch untouched"
+    );
+    t.render().expect("still gated");
+    assert!(
+        t.last_render_skipped(),
+        "render agrees with needs_frame == false"
+    );
+
+    let before = t
+        .term
+        .scrollback()
+        .map_or(0, aterm_core::scrollback::ScrollbackStorage::line_count);
+    assert!(before > 0);
+
+    // Simulate an evicting pending share shrink (as from lowering the global budget).
+    t.budget_share.set_configured(4_096);
+    assert!(
+        t.needs_frame(),
+        "an evicting pending share enforces budget and reopens the frame gate"
+    );
+    let after = t
+        .term
+        .scrollback()
+        .map_or(0, aterm_core::scrollback::ScrollbackStorage::line_count);
+    assert!(
+        after < before,
+        "needs_frame applied the shrunk budget and evicted store lines ({before} -> {after})"
+    );
+    assert_eq!(
+        t.term
+            .scrollback()
+            .map(aterm_core::scrollback::ScrollbackStorage::memory_budget),
+        Some(4_096)
+    );
+    t.render().expect("eviction repaint");
+    assert!(
+        !t.last_render_skipped(),
+        "render agrees with needs_frame == true"
+    );
+    assert!(
+        !t.needs_frame(),
+        "re-settled after presenting the clamped view"
+    );
+}

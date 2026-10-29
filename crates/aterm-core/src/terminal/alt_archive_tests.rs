@@ -464,16 +464,32 @@ fn alt_archive_pool_conformance_real_archives_project_onto_model() {
 
 #[test]
 fn a_live_session_joins_the_process_budget_and_leaves_when_it_closes() {
-    let pool = AltArchiveBudget::process();
-    assert_eq!(pool.total(), ALT_ARCHIVE_TOTAL_BUDGET);
-    let base = pool.live();
+    let process_pool = AltArchiveBudget::process();
+    assert_eq!(process_pool.total(), ALT_ARCHIVE_TOTAL_BUDGET);
 
+    let mut process_session = Terminal::new(25, COLS);
+    process_session.set_alt_archive_enabled(true);
+    process_session.set_alt_archive_shared(true);
+    assert!(
+        process_session
+            .alt_archive()
+            .shared_budget()
+            .is_some_and(|p| Arc::ptr_eq(p, &process_pool)),
+        "set_alt_archive_shared(true) wires THE process pool"
+    );
+    process_session.set_alt_archive_shared(false);
+    assert!(process_session.alt_archive().shared_budget().is_none());
+    drop(process_session);
+
+    // Exact live-count and effective-budget invariants run on a private pool so
+    // concurrent tests touching AltArchiveBudget::process() cannot perturb them.
+    let pool = AltArchiveBudget::new(ALT_ARCHIVE_TOTAL_BUDGET, ALT_ARCHIVE_MIN_SHARE);
     let mut t = Terminal::new(25, COLS);
     t.set_alt_archive_enabled(true); // explicitly, whatever the default
-    t.set_alt_archive_shared(true);
+    t.set_alt_archive_pool(Some(Arc::clone(&pool)));
     assert_eq!(
         pool.live(),
-        base,
+        0,
         "a tab that has not entered the alt screen holds nothing, and a share \
          it does not need is a share taken from the tab that does"
     );
@@ -483,30 +499,46 @@ fn a_live_session_joins_the_process_budget_and_leaves_when_it_closes() {
         t.process(&sync_frame(&frame(s, 20)));
     }
     assert!(t.alt_archive().bytes() > 0, "the archive filled");
-    assert_eq!(pool.live(), base + 1);
+    assert_eq!(pool.live(), 1);
     assert!(
         t.alt_archive()
             .shared_budget()
             .is_some_and(|p| Arc::ptr_eq(p, &pool)),
-        "the session draws on THE process pool"
+        "the session draws on the joined pool"
     );
     assert_eq!(
         t.alt_archive().effective_budget(),
-        ALT_ARCHIVE_TOTAL_BUDGET / (base + 1),
-        "one total, divided by the sessions drawing on it"
+        ALT_ARCHIVE_TOTAL_BUDGET,
+        "one active session receives the full pool total"
     );
 
-    t.set_alt_archive_shared(false);
-    assert_eq!(pool.live(), base);
+    let mut t2 = Terminal::new(25, COLS);
+    t2.set_alt_archive_enabled(true);
+    t2.set_alt_archive_pool(Some(Arc::clone(&pool)));
+    t2.process(b"\x1b[?1049h");
+    for s in 0..=40 {
+        t2.process(&sync_frame(&frame(s, 20)));
+    }
+    assert_eq!(pool.live(), 2);
+    assert_eq!(
+        t.alt_archive().effective_budget(),
+        ALT_ARCHIVE_TOTAL_BUDGET / 2,
+        "one total, divided by the sessions drawing on it"
+    );
+    drop(t2);
+    assert_eq!(pool.live(), 1);
+
+    t.set_alt_archive_pool(None);
+    assert_eq!(pool.live(), 0);
     assert_eq!(
         t.alt_archive().effective_budget(),
         ALT_ARCHIVE_DEFAULT_BUDGET
     );
 
-    t.set_alt_archive_shared(true);
-    assert_eq!(pool.live(), base + 1);
+    t.set_alt_archive_pool(Some(Arc::clone(&pool)));
+    assert_eq!(pool.live(), 1);
     drop(t); // the tab closes: nothing else has to say so
-    assert_eq!(pool.live(), base);
+    assert_eq!(pool.live(), 0);
 }
 
 #[test]

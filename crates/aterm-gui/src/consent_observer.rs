@@ -1248,29 +1248,6 @@ impl ObserverState {
         }
     }
 
-    /// Returns all currently pending prompts attributed to `sessions` without marking them announced.
-    #[cfg(test)]
-    pub(crate) fn verdicts(
-        &self,
-        now: Instant,
-        sessions: &[(u64, i32)],
-        pgid_of: impl Fn(i32) -> Option<i32>,
-    ) -> Vec<(u64, String)> {
-        if !self.availability.is_live() {
-            return Vec::new();
-        }
-        let mut out: Vec<(u64, String)> = Vec::new();
-        for prompt in self.table.pending_prompts(now, PENDING_PROMPT_THRESHOLD) {
-            let pgid = pgid_of(prompt.accessing_pid);
-            if let Some(session) = owning_session(prompt.accessing_pid, pgid, sessions)
-                && !out.iter().any(|(existing, _)| *existing == session)
-            {
-                out.push((session, blocked_on_token(prompt.service)));
-            }
-        }
-        out
-    }
-
     /// Resolves which session in `sessions` owns `pid` using this instance's probe arm.
     pub(crate) fn session_for_pid(&self, pid: i32, sessions: &[(u64, i32)]) -> Option<u64> {
         session_of_pid(pid, sessions, self.probe.parent_of, self.probe.pgid_of)
@@ -2204,12 +2181,6 @@ mod tests {
             observer.availability(),
             ObserverAvailability::Unavailable(UnavailableReason::Inert)
         );
-        assert!(
-            observer
-                .verdicts(Instant::now(), &[(1, 100)], |_| None)
-                .is_empty(),
-            "an unavailable observer publishes nothing"
-        );
     }
 
     #[test]
@@ -2311,40 +2282,6 @@ mod tests {
     }
 
     #[test]
-    fn a_quiet_stream_publishes_nothing_and_stays_ok() {
-        let now = Instant::now();
-        let mut observer = ObserverState::inert();
-        observer.feed_for_test(ObserverEvent::Started, now);
-        assert_eq!(observer.availability(), ObserverAvailability::Ok);
-        assert!(observer.verdicts(now, &[(1, 4711)], |_| None).is_empty());
-        assert_eq!(observer.availability(), ObserverAvailability::Ok);
-    }
-
-    #[test]
-    fn an_observed_pending_prompt_publishes_blocked_on_for_its_session() {
-        let t0 = Instant::now();
-        let mut observer = ObserverState::inert();
-        observer.feed_for_test(ObserverEvent::Started, t0);
-        for line in [REC_CTX, REC_ATTRIBUTION, REC_SUBJECT] {
-            let event = parse_line(line).expect("recorded line parses");
-            observer.feed_for_test(ObserverEvent::Line(event), t0);
-        }
-        let later = t0 + PENDING_PROMPT_THRESHOLD + Duration::from_secs(1);
-        let verdicts = observer.verdicts(later, &[(4, 4711)], |pid| (pid == 18584).then_some(4711));
-        assert_eq!(
-            verdicts,
-            vec![(
-                4u64,
-                "macos-permission:SystemPolicyDocumentsFolder".to_owned()
-            )]
-        );
-        assert!(
-            observer.verdicts(later, &[(4, 9999)], |_| None).is_empty(),
-            "a prompt we cannot attribute is nobody's prompt"
-        );
-    }
-
-    #[test]
     fn the_instance_owns_its_process_attribution_probes() {
         fn parent(pid: i32) -> Option<i32> {
             match pid {
@@ -2427,7 +2364,6 @@ mod tests {
                 .is_empty(),
             "the same dialog never pages twice"
         );
-        assert_eq!(observer.verdicts(later, &sessions(), pgid).len(), 1);
 
         for line in [
             "tccd: AUTHREQ_CTX: msgID=378.999, service=kTCCServiceSystemPolicyDesktopFolder, \
@@ -2609,21 +2545,6 @@ mod tests {
     }
 
     #[test]
-    fn a_format_change_degrades_to_unavailable() {
-        let now = Instant::now();
-        let mut observer = ObserverState::inert();
-        observer.feed_for_test(ObserverEvent::Started, now);
-        for _ in 0..FORMAT_DRIFT_LIMIT {
-            observer.feed_for_test(ObserverEvent::Line(TccEvent::Unparsed), now);
-        }
-        assert_eq!(
-            observer.availability(),
-            ObserverAvailability::Unavailable(UnavailableReason::FormatUnrecognized)
-        );
-        assert!(observer.verdicts(now, &[(1, 4711)], |_| None).is_empty());
-    }
-
-    #[test]
     fn the_stream_header_lines_are_not_messages_and_never_count_as_drift() {
         let filtering = "Filtering the log data using \"process == \"tccd\" AND \
             composedMessage CONTAINS \"AUTHREQ_PROMPTING\"\"";
@@ -2632,18 +2553,6 @@ mod tests {
         assert_eq!(parse_line(filtering), None);
         assert_eq!(parse_line(columns), None);
         assert_eq!(parse_line("x CONTAINS \"AUTHREQ_PROMPTING\"\""), None);
-
-        let now = Instant::now();
-        let mut observer = ObserverState::inert();
-        observer.feed_for_test(ObserverEvent::Started, now);
-        for _ in 0..(FORMAT_DRIFT_LIMIT * 100) {
-            for header in [filtering, columns] {
-                if let Some(event) = parse_line(header) {
-                    observer.feed_for_test(ObserverEvent::Line(event), now);
-                }
-            }
-        }
-        assert_eq!(observer.availability(), ObserverAvailability::Ok);
     }
 
     #[test]
@@ -2862,9 +2771,15 @@ mod tests {
         let args = stream_args(ObserverMode::Sentinel);
         let at = args.iter().position(|a| a == "--timeout").unwrap();
         assert_eq!(args[at + 1], SENTINEL_TIMEOUT);
-        assert_eq!(SENTINEL_TIMEOUT, "15m");
-        assert!(ROTATION_MIN < Duration::from_secs(15 * 60));
-        assert!(ROTATION_MIN >= Duration::from_secs(14 * 60));
+        let mins: u64 = SENTINEL_TIMEOUT
+            .strip_suffix('m')
+            .expect("minute timeout suffix")
+            .parse()
+            .expect("positive integer minutes");
+        let timeout = Duration::from_secs(mins * 60);
+        assert!(timeout > Duration::ZERO);
+        assert!(ROTATION_MIN < timeout);
+        assert!(timeout <= ROTATION_MIN + Duration::from_secs(60));
         assert!(LOOKUP_TIMEOUT <= Duration::from_secs(5));
         assert!(lookup_args("69745.190").is_some());
         for hostile in ["", "1.2\" OR 1", "1.2,", "abc", "1.2 3"] {

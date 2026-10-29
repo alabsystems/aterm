@@ -294,14 +294,17 @@ fn progress(bed: &Bed) -> (bool, usize) {
             work();
             Ok(())
         },
+        quota_refresh: &|_, _, _, _| {},
         sync_cooldown: &cooldown,
         rediscovery: &rediscovery,
         renew_guard: &guard,
         find_browser: &|_| true,
         vault_sync: |_| panic!("no vault needed"),
         spawn_vault: &|_| panic!("no vault worker needed"),
-        mailbox: &|_, _, _| super::super::sign_in_ladder::Mailbox::None,
+        default_check: |_: &Path| crate::harness::cli::LoginCheck::CouldNotRun(String::new()),
+        mailbox: &|_, _, _| (super::super::sign_in_ladder::Mailbox::None, None),
         log: Arc::new(|_| {}),
+        shared: shared_renewal::Effects::default(),
         run_attempt: Some(Arc::new(move |_, _| {
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             super::super::cli::Renewal::AuthFailed

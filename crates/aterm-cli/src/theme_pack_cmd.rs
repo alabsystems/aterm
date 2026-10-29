@@ -94,11 +94,15 @@ fn parse_pack_args(args: &[OsString]) -> Result<Option<PackArgs>, String> {
         format: ThemeListFormat::Text,
         licences: false,
     };
+    let mut format_given = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let arg = arg
             .to_str()
             .ok_or_else(|| format!("unknown argument {:?}", arg.to_string_lossy()))?;
+        if matches!(arg, "--help" | "-h") {
+            return Ok(None);
+        }
         let (flag, inline) = match arg.split_once('=') {
             Some((flag, value)) if flag.starts_with("--") => (flag, Some(value)),
             _ => (arg, None),
@@ -106,17 +110,28 @@ fn parse_pack_args(args: &[OsString]) -> Result<Option<PackArgs>, String> {
         let mut value = |flag: &str| -> Result<String, String> {
             match inline {
                 Some(value) => Ok(value.to_string()),
-                None => iter
-                    .next()
-                    .and_then(|v| v.to_str())
-                    .map(str::to_string)
-                    .ok_or_else(|| format!("{flag} needs a value")),
+                None => {
+                    let raw = iter.next().ok_or_else(|| format!("{flag} needs a value"))?;
+                    raw.to_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| format!("argument {:?} is not UTF-8", raw.to_string_lossy()))
+                }
             }
         };
         match flag {
-            "--help" | "-h" => return Ok(None),
-            "--appearance" => parsed.appearance = Some(appearance_value(&value(flag)?)?),
-            "--format" => parsed.format = format_value(&value(flag)?)?,
+            "--appearance" => {
+                if parsed.appearance.is_some() {
+                    return Err("--appearance is given twice".to_string());
+                }
+                parsed.appearance = Some(appearance_value(&value(flag)?)?);
+            }
+            "--format" => {
+                if format_given {
+                    return Err("--format is given twice".to_string());
+                }
+                parsed.format = format_value(&value(flag)?)?;
+                format_given = true;
+            }
             "--licences" | "--licenses" if inline.is_none() => parsed.licences = true,
             "--licences" | "--licenses" => return Err(format!("pack: {flag} takes no value")),
             other if other.starts_with('-') && other.len() > 1 => {
@@ -126,8 +141,13 @@ fn parse_pack_args(args: &[OsString]) -> Result<Option<PackArgs>, String> {
             _ => parsed.id = Some(arg.to_string()),
         }
     }
-    if parsed.licences && (parsed.id.is_some() || parsed.appearance.is_some()) {
-        return Err("--licences takes no id or filter".to_string());
+    if parsed.licences && (parsed.id.is_some() || parsed.appearance.is_some() || format_given) {
+        return Err("--licences takes no id, filter or --format".to_string());
+    }
+    if parsed.id.is_some() && (parsed.appearance.is_some() || format_given) {
+        return Err(
+            "pack <id> prints that theme's file and takes no --appearance or --format".to_string(),
+        );
     }
     Ok(Some(parsed))
 }
@@ -489,10 +509,30 @@ mod tests {
             vec!["pack", "Nope"],
             vec!["pack", "a", "b"],
             vec!["pack", "--licences", "Ayu"],
+            vec!["pack", "--licences", "--format", "tsv"],
+            vec!["pack", "Kanagawa Wave", "--format", "tsv"],
+            vec!["pack", "Kanagawa Wave", "--appearance", "light"],
+            vec!["pack", "--appearance", "dark", "--appearance", "light"],
+            vec!["pack", "--format", "text", "--format", "tsv"],
+            vec!["pack", "--help=extra"],
             vec!["pack", "--appearance", "blue"],
             vec!["pack", "--bogus"],
         ] {
-            assert_eq!(theme(&argv, None).code, 2, "{argv:?}");
+            let out = theme(&argv, None);
+            assert_eq!(out.code, 2, "{argv:?}: {out:?}");
+            assert!(out.stdout.is_empty(), "{argv:?}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            let bad = OsString::from_vec(vec![0xff]);
+            let out = run(
+                &[OsString::from("pack"), OsString::from("--appearance"), bad],
+                None,
+                &NEVER_LISTS,
+            );
+            assert_eq!(out.code, 2);
+            assert!(out.stderr.contains("is not UTF-8"), "{}", out.stderr);
         }
         for flag in ["--licences", "--licenses"] {
             let out = theme(&["pack", flag], None);

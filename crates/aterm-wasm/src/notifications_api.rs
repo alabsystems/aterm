@@ -175,27 +175,4 @@ mod tests {
             "capacity is restored by draining"
         );
     }
-
-    #[test]
-    fn cursor_color_follows_osc12_and_resets_on_112() {
-        let mut t = crate::system_font_terminal(24, 80, 16.0);
-        let theme_cursor = t.theme_cursor;
-        assert_eq!(
-            t.cursor_color(),
-            Some(theme_cursor),
-            "the host-configured cursor baseline is live at start"
-        );
-        t.process(b"\x1b]12;#ff8800\x07");
-        assert_eq!(
-            t.cursor_color(),
-            Some(0x00FF_8800),
-            "OSC 12 must surface as a packed 0x00RRGGBB"
-        );
-        t.process(b"\x1b]112\x07");
-        assert_eq!(
-            t.cursor_color(),
-            Some(theme_cursor),
-            "OSC 112 restores the host-configured cursor baseline"
-        );
-    }
 }

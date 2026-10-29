@@ -25,7 +25,7 @@ fn capacity_never_evicts_a_live_lease_and_idle_eviction_is_oldest_first() {
     let mut next = Repair::default();
     drop(cache.acquire(actor(CAPACITY), &mut next).unwrap());
     let pool = cache.0.lock().unwrap();
-    assert!(pool.active.contains(&actor(0)));
+    assert!(pool.active.contains_key(&actor(0)));
     assert_eq!(pool.active.len() + pool.idle.len(), CAPACITY);
     assert!(!pool.idle.iter().any(|(id, _)| *id == actor(1)));
     drop(pool);
@@ -42,6 +42,78 @@ fn capacity_never_evicts_a_live_lease_and_idle_eviction_is_oldest_first() {
     assert_eq!(cache.0.lock().unwrap().active.len(), CAPACITY);
     drop(leases);
     assert_eq!(cache.0.lock().unwrap().idle.len(), CAPACITY);
+}
+
+#[test]
+fn a_lone_channel_in_either_direction_needs_no_preference_or_wait() {
+    let cache = Cache::default();
+    let mut repair = Repair::default();
+    for preferred in [false, true] {
+        drop(
+            cache
+                .acquire_on_with(actor(1), &mut repair, preferred, Instant::now(), || {
+                    panic!("a lone authenticated channel must not wait")
+                })
+                .unwrap(),
+        );
+    }
+}
+
+#[test]
+fn only_a_preferred_contender_waits_and_it_keeps_released_progress() {
+    use std::{sync::mpsc, thread, time::Duration};
+
+    let cache = Cache::default();
+    let mut active = Repair::default();
+    let mut held = cache
+        .acquire_on(actor(1), &mut active, false, Instant::now())
+        .unwrap();
+    held.cursor = Some([7; 32]);
+    let (waiting, observed) = mpsc::channel();
+    thread::scope(|scope| {
+        let winner = scope.spawn(|| {
+            let mut repair = Repair::default();
+            let mut waiting = Some(waiting);
+            let lease = cache
+                .acquire_on_with(
+                    actor(1),
+                    &mut repair,
+                    true,
+                    Instant::now() + Duration::from_secs(60),
+                    || {
+                        if let Some(waiting) = waiting.take() {
+                            waiting.send(()).unwrap();
+                        }
+                    },
+                )
+                .unwrap();
+            assert_eq!(lease.cursor, Some([7; 32]));
+        });
+        observed.recv_timeout(Duration::from_secs(60)).unwrap();
+        let pool = cache.0.lock().unwrap();
+        assert_eq!(pool.active.get(&actor(1)), Some(&false));
+        drop(pool);
+        let mut losing = Repair::default();
+        assert!(cache.acquire(actor(1), &mut losing).is_err());
+        drop(held);
+        winner.join().unwrap();
+    });
+    assert!(cache.0.lock().unwrap().active.is_empty());
+}
+
+#[test]
+fn a_preferred_collision_obeys_the_original_exchange_deadline() {
+    let cache = Cache::default();
+    let mut active = Repair::default();
+    let _held = cache.acquire(actor(1), &mut active).unwrap();
+    let mut repair = Repair::default();
+    let error = cache
+        .acquire_on_with(actor(1), &mut repair, true, Instant::now(), || {
+            panic!("an exhausted exchange must not enter a wait")
+        })
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("exchange deadline"));
 }
 
 #[test]

@@ -79,7 +79,8 @@ fn the_face_is_a_function_of_the_policys_memory_in_the_designs_order() {
 
 /// THE FACE MOVES WITH THE POLICY'S OWN POINTS, told once each
 /// ([`TurnEndState::face_moved`]): the land act's clean defense lands the
-/// task (and a person's quick turn after it is theirs).
+/// task; a person's quick turn after it opens it again, since Land carries every message but the
+/// session's opening one (owner ruling 2026-10-27), which is theirs.
 #[test]
 fn the_face_moves_at_the_points_that_end_a_task_and_is_told_once() {
     let mut now = t0();
@@ -102,7 +103,15 @@ fn the_face_moves_at_the_points_that_end_a_task_and_is_told_once() {
         ..idle("You're welcome!", Some(Duration::from_secs(5)))
     });
     at(&mut st, &thanks, now);
-    assert_eq!(st.face_moved(), Some(TaskFace::Theirs));
+    assert_eq!(st.face_moved(), Some(TaskFace::Open));
+    let mut st = TurnEndState::default();
+    assert_eq!(st.face_start(), TaskFace::Open);
+    at(&mut st, &thanks, t0());
+    assert_eq!(
+        st.face_moved(),
+        Some(TaskFace::Theirs),
+        "the opening message"
+    );
 
     let mut st = TurnEndState::default();
     st.face_start();
@@ -176,8 +185,8 @@ fn someone_elses_live_turn_opens_the_face_and_the_policys_own_does_not() {
     assert!(!st.other_turn(), "the point ends it");
     assert_eq!(st.face(), TaskFace::Open);
 
-    // The person's own exchange is theirs under Land; Cruise carries it, so it never shows
-    // `theirs` there (owner ruling 2026-10-26).
+    // The person's own exchange that opens the session is theirs under Land; Cruise carries it,
+    // so it never shows `theirs` there (owner rulings 2026-10-26 and 2026-10-27).
     let greeting = TurnEndReading {
         person: Some(Duration::from_secs(8)),
         ..idle(

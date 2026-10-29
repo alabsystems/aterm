@@ -114,24 +114,6 @@ fn dcs_passthrough_st_c1_byte_terminates_sequence() {
     let mut input = vec![0x1B, b'P', b'@']; // DCS hook
     input.extend_from_slice(b"data");
     input.push(0x9C); // ST via C1
-    input.push(b'X'); // should be printed as regular char
-
-    parser.advance_fast(&input, &mut sink);
-
-    assert_eq!(sink.dcs_hooks.len(), 1);
-    assert_eq!(sink.dcs_puts, b"data".to_vec());
-    assert_eq!(sink.prints, vec!['X']);
-    assert_eq!(parser.state(), State::Ground);
-}
-
-#[test]
-fn dcs_passthrough_st_c1_byte_terminates_sequence_advance_fast() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    let mut input = vec![0x1B, b'P', b'@']; // DCS hook
-    input.extend_from_slice(b"data");
-    input.push(0x9C); // ST via C1
     input.extend_from_slice(b"VISIBLE");
 
     parser.advance_fast(&input, &mut sink);

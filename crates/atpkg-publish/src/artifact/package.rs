@@ -65,7 +65,7 @@ pub struct PackageRequest {
     pub toolchain: Option<PathBuf>,
     /// Where `<program>/` is staged.
     pub out: PathBuf,
-    /// The signing key instead of the machine's (`~/.aterm/machine.key`).
+    /// The signing key instead of the machine's (`~/.aterm/release-ring/machine.key`).
     pub key: Option<PathBuf>,
     /// Upload to the staging owner.
     pub upload: bool,

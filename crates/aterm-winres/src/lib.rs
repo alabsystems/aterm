@@ -357,7 +357,8 @@ fn host_sdk_arch() -> &'static str {
     }
 }
 
-/// The `10.a.b.c` directory names, sorted numerically newest first.
+/// The four-component `10.a.b.c` directory names (each component parsed with
+/// `u64::from_str`), sorted numerically newest first with equal keys keeping input order.
 fn sdk_versions_newest_first<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
     let mut versions: Vec<([u64; 4], &str)> = Vec::new();
     for n in names {
@@ -383,7 +384,7 @@ fn sdk_versions_newest_first<'a>(names: impl IntoIterator<Item = &'a str>) -> Ve
             versions.push(([!v0, !v1, !v2, !v3], n));
         }
     }
-    versions.sort_unstable();
+    versions.sort_by_key(|a| a.0);
     let mut out = Vec::with_capacity(versions.len());
     for (_, n) in versions {
         out.push(n);
@@ -438,10 +439,19 @@ mod tests {
             "10.0.19041.0",
             "notes.txt",
             "10.0.1",
+            "10.0.18446744073709551616.0",
         ];
         assert_eq!(
             sdk_versions_newest_first(names),
             ["10.0.26100.0", "10.0.19041.0", "10.0.9600.0"]
+        );
+        assert_eq!(
+            sdk_versions_newest_first(["10.00.0.0", "10.0.0.0", "10.+0.1.2"]),
+            ["10.+0.1.2", "10.00.0.0", "10.0.0.0"]
+        );
+        assert_eq!(
+            sdk_versions_newest_first(["10.0.0.0", "10.00.0.0"]),
+            ["10.0.0.0", "10.00.0.0"]
         );
     }
 
@@ -459,6 +469,26 @@ mod tests {
             dialect_of(Path::new("x86_64-w64-mingw32-windres")),
             Dialect::Windres
         );
+        assert_eq!(dialect_of(Path::new("llvm-windres")), Dialect::Windres);
+        assert_eq!(dialect_of(Path::new("windres-llvm-rc")), Dialect::Windres);
+        assert_eq!(
+            dialect_of(Path::new("/opt/windres/llvm-rc")),
+            Dialect::LlvmRc,
+            "only the final path component decides"
+        );
+        assert_eq!(
+            dialect_of(Path::new("/opt/llvm-rc/custom-rc")),
+            Dialect::Rc,
+            "unrecognised names default to Rc"
+        );
+        assert_eq!(dialect_of(Path::new("")), Dialect::Rc);
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt as _;
+            let non_utf8 = Path::new(OsStr::from_bytes(b"windres-\xff"));
+            assert_eq!(dialect_of(non_utf8), Dialect::Rc);
+        }
     }
 
     #[test]
@@ -489,13 +519,35 @@ mod tests {
 
     #[test]
     fn outcome_display_names_the_state() {
-        assert!(Outcome::NotWindows.to_string().contains("not Windows"));
+        let linked = Outcome::Linked(PathBuf::from("out/a.res"));
+        let not_win = Outcome::NotWindows;
+        let no_comp = Outcome::NoCompiler("rc.exe on PATH".into());
+        let failed = Outcome::Failed("rc.exe exited with 1: syntax error".into());
+
+        assert!(linked.is_linked());
+        assert!(!not_win.is_linked());
+        assert!(!no_comp.is_linked());
+        assert!(!failed.is_linked());
+
+        assert!(linked.to_string().ends_with("out/a.res"));
+        assert!(!not_win.to_string().is_empty());
+        assert!(no_comp.to_string().ends_with(": rc.exe on PATH"));
         assert!(
-            Outcome::NoCompiler("x".into())
+            failed
                 .to_string()
-                .contains("no resource compiler")
+                .ends_with(": rc.exe exited with 1: syntax error")
         );
-        assert!(Outcome::Linked(PathBuf::from("a.res")).is_linked());
-        assert!(!Outcome::Failed("x".into()).is_linked());
+
+        let rendered = [
+            linked.to_string(),
+            not_win.to_string(),
+            no_comp.to_string(),
+            failed.to_string(),
+        ];
+        for i in 0..rendered.len() {
+            for j in (i + 1)..rendered.len() {
+                assert_ne!(rendered[i], rendered[j]);
+            }
+        }
     }
 }

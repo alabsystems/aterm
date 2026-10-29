@@ -263,25 +263,12 @@ fn warm_block_decompress_rejects_oversized_lz4_prefix() {
         err_msg.contains("exceeds"),
         "error should mention size limit: {err_msg}"
     );
-}
-
-#[test]
-fn warm_block_to_cold_rejects_oversized_lz4_prefix() {
-    let mut forged = Vec::new();
-    let huge_size: u32 = 128 * 1024 * 1024;
-    forged.extend_from_slice(&huge_size.to_le_bytes());
-    forged.extend_from_slice(&[0u8; 10]);
-
-    let block = WarmBlock {
-        compressed: forged,
-        line_count: 1,
-        decompress_failures: Cell::new(0),
-    };
-
-    let result = block.to_cold_compressed();
+    let cold_err = block
+        .to_cold_compressed()
+        .expect_err("to_cold_compressed should reject oversized LZ4 prefix");
     assert!(
-        result.is_err(),
-        "to_cold_compressed should reject oversized LZ4 prefix"
+        cold_err.to_string().contains("exceeds"),
+        "to_cold_compressed should name the size limit: {cold_err}"
     );
 }
 

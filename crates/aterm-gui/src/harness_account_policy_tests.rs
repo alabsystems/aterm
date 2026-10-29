@@ -3,6 +3,35 @@
 
 use super::*;
 
+#[test]
+fn a_target_profile_changed_after_advice_cannot_start_a_claude_rotation() {
+    let a = Accts::new();
+    let sid = "s-target-identity";
+    change_identity(&a, "work-2");
+    let profile = PathBuf::from(a.login_dir("work-2")).join(".claude.json");
+    std::fs::write(
+        &profile,
+        br#"{"oauthAccount":{"emailAddress":"replacement@example.test"}}"#,
+    )
+    .unwrap();
+    a.spawn(sid, ACCT_TALK_A, "main");
+    a.wall(ACCT_TALK_A, ACCT_NOW - 10);
+    let idle = a.worker(sid, &on());
+    assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
+    let wrong = br#"{"oauthAccount":{"emailAddress":"another@example.test"}}"#;
+    std::fs::write(&profile, wrong).unwrap();
+    let before = std::fs::read(a.store().state_file()).unwrap();
+    let ledger = a.ledger();
+    assert_eq!(
+        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        Some("wait:account-changed")
+    );
+    assert_eq!(a.asked("restart:"), 0);
+    assert_eq!(std::fs::read(a.store().state_file()).unwrap(), before);
+    assert_eq!(a.ledger(), ledger);
+    assert_eq!(std::fs::read(profile).unwrap(), wrong);
+}
+
 fn change_identity(a: &Accts, label: &str) {
     let text = std::fs::read_to_string(a.roster_path()).unwrap();
     let before = format!("label = \"{label}\"");

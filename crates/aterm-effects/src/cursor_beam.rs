@@ -79,6 +79,9 @@ pub struct BeamRodConfig {
     pub shimmer: bool,
     /// The ground is dark (the rod is light) or light.
     pub dark_theme: bool,
+    /// The frame's light (`docs/design/PRISM-GLASS.md` §15.2 1.3, `GlowConfig::light`): what a
+    /// light arm will read. Off on every dark ground; nothing reads it yet.
+    pub light: crate::cursor_glow::Light,
     /// The theme's text and paper, against which a light ground's ink is solved.
     pub theme_fg: u32,
     pub theme_bg: u32,
@@ -194,8 +197,6 @@ impl CursorBeamRod {
             rate
         };
         self.breathe = (self.breathe + dt * rate).fract();
-        let phase = self.breathe * std::f32::consts::TAU;
-        let breathe = 0.5 + 0.5 * crate::supernova::sin_cos_f32(phase).0;
 
         let fill = if cfg.bar {
             None
@@ -229,7 +230,10 @@ impl CursorBeamRod {
         if let Some((cr, cc)) = cur
             && (cr as usize) < geom.rows
             && (cc as usize) < geom.cols
+            && (cfg.dark_theme || cfg.bar)
         {
+            let phase = self.breathe * std::f32::consts::TAU;
+            let breathe = 0.5 + 0.5 * crate::supernova::sin_cos_f32(phase).0;
             match (cfg.dark_theme, cfg.bar) {
                 (true, true) => self.emit_rod(cr, cc, e, breathe, geom, cfg, out),
                 (true, false) => self.emit_aura(cr, cc, e, breathe, geom, cfg, out),
@@ -329,6 +333,9 @@ impl CursorBeamRod {
             * INV_COV_MAX
             * cfg.intensity.clamp(0.0, 1.0)
             * (0.90 + 0.10 * breathe);
+        if LIGHT_BODY_ALPHA_CAP * strength < 1.0 {
+            return;
+        }
         let key = (
             cfg.color & 0x00FF_FFFF,
             cfg.theme_fg & 0x00FF_FFFF,
@@ -409,6 +416,7 @@ impl CursorBeamRod {
         let band_y0 = i32::from(geom.origin_y) + i32::from(cr) * ch_i;
         let band_y1 = band_y0 + ch_i;
         let row_h = ((ch * INV_AURA_ROW_DIV) as i32).max(2);
+        let rgb_knot = (cfg.color, cfg.haze);
         let mut y = band_y0;
         while y < band_y1 {
             let h = row_h.min(band_y1 - y);
@@ -421,7 +429,6 @@ impl CursorBeamRod {
                     let span = half - hw;
                     let geom_knot = (cx, hw, span);
                     let falloff_knot = (inv_rx, v2, inv_f_edge, peak);
-                    let rgb_knot = (cfg.color, cfg.haze);
                     let mut prev = aura_knot(0, geom_knot, falloff_knot, rgb_knot);
                     let mut k = 1;
                     while k <= AURA_SEGMENTS {
@@ -452,7 +459,8 @@ const fn aura_knot(
     (inv_rx, v2, inv_f_edge, peak): (f32, f32, f32, f32),
     (color, haze): (u32, u32),
 ) -> (i32, i32, u8, u32) {
-    let t = k as f32 * (1.0 / AURA_SEGMENTS as f32);
+    const INV_AURA_SEGMENTS: f32 = 1.0 / AURA_SEGMENTS as f32;
+    let t = k as f32 * INV_AURA_SEGMENTS;
     let dx = hw + span * t;
     let (rx_i, lx_i) = ((cx + dx).round() as i32, (cx - dx).round() as i32);
     if k == AURA_SEGMENTS {
@@ -462,10 +470,10 @@ const fn aura_knot(
     let rho2 = u * u + v2;
     let f_1 = (1.0 - rho2).max(0.0);
     let f = f_1 * f_1 * inv_f_edge;
-    let cov = (peak * f).round().min(OVER_INK_COV_CAP) as u8;
-    if cov == 0 {
+    if peak * f < 0.5 {
         return (rx_i, lx_i, 0, 0);
     }
+    let cov = (peak * f).round().min(OVER_INK_COV_CAP) as u8;
     let rgb = lerp_rgb(color, haze, 0.75 * crate::color_math::sqrt_f32(rho2));
     (rx_i, lx_i, cov, premul_rgb(rgb, cov))
 }
@@ -491,6 +499,7 @@ mod tests {
 
     const fn cfg(bar: bool) -> BeamRodConfig {
         BeamRodConfig {
+            light: crate::cursor_glow::Light::OFF,
             enabled: true,
             intensity: 1.0,
             color: BEAM_DEFAULT_COLOR,
@@ -557,7 +566,7 @@ mod tests {
         }
     }
 
-    /// The rod lands inside the padded window's grid box (origin applied).
+    /// The rod lands inside the padded window's effects box (origin and head band applied).
     #[test]
     fn rod_lands_at_the_window_origin() {
         for bar in [true, false] {
@@ -581,13 +590,54 @@ mod tests {
             for q in &out {
                 assert!(
                     q.y >= g.origin_y,
-                    "bar={bar}: quad above the grid origin: y={}",
+                    "bar={bar}: quad above the grid origin below row 0: y={}",
                     q.y
                 );
                 assert!(
                     q.x >= g.origin_x.saturating_sub(g.cw as u16),
                     "bar={bar}: quad left of the grid origin: x={}",
                     q.x
+                );
+            }
+
+            let mut top_out = Vec::new();
+            let mut top_g = g;
+            top_g.head = 12;
+            rod.reset();
+            let f0 = rod.tick(
+                Some((0, 3)),
+                Instant::now(),
+                1.0,
+                top_g,
+                &cfg(bar),
+                &mut top_out,
+                &mut Vec::new(),
+            );
+            assert!(
+                f0.fp != 0 && !top_out.is_empty(),
+                "row-0 charged light must draw"
+            );
+            let min_y = if bar {
+                top_g.origin_y.saturating_sub(top_g.head)
+            } else {
+                top_g.origin_y
+            };
+            for q in &top_out {
+                assert!(
+                    q.y >= min_y,
+                    "bar={bar}: row-0 quad above the allowed top bound ({min_y}): y={}",
+                    q.y
+                );
+                assert!(
+                    q.x >= top_g.origin_x.saturating_sub(top_g.cw as u16),
+                    "bar={bar}: row-0 quad left of the grid origin: x={}",
+                    q.x
+                );
+            }
+            if bar {
+                assert!(
+                    top_out.iter().any(|q| q.y < top_g.origin_y),
+                    "row-0 bar rod overshoots into the head band"
                 );
             }
         }

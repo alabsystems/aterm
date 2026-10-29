@@ -5032,7 +5032,7 @@ fn land_e_passes_on_its_row_and_this_mac_counting_every_landed_tab() {
     };
     let rest = |here: &str, landed: usize, today: &str, every: &str| {
         format!(
-            "here=\"{here}\" landed_tabs={landed} landing_tabs=6 held_landing=6 held_needs=0 held_unread=0 landings=3 today=\"{today}\" every=\"{every}\" did=\"Landed: 3 today \u{b7} 3 in 7 days\""
+            "here=\"{here}\" landed_tabs={landed} landing_tabs=6 held_landing=6 held_needs=0 held_unread=0 landings=3 today=\"{today}\" every=\"{every}\" did=\"Landed: 3 today \u{b7} 3 in 7 days\" status_failed=\"-\""
         )
     };
     const TODAY: &str = "3 landed today · 2 kept going · 7 land prompts";
@@ -5112,6 +5112,25 @@ fn land_e_passes_on_its_row_and_this_mac_counting_every_landed_tab() {
     )
     .replace("landings=3", "landings=0");
     assert_eq!(l7(&seen(Some(&none))).0, "FAIL");
+    // CONTROL: a tab whose END status read failed is in no total, so rows short by that tab
+    // match the totals, which pass where every read answered; the failed read fails L7.
+    let counted = rest(
+        "This Mac — 6 landing · 2 landed · 2 shells",
+        2,
+        TODAY,
+        "Every session, 12 sessions: 2 cruising, 6 landing, 2 landed, 1 off",
+    );
+    let (w, why) = l7(&seen(Some(&counted)));
+    assert_eq!(w, "PASS", "{why}");
+    let short = counted.replace(
+        "status_failed=\"-\"",
+        "status_failed=\"land-b: `@s-2 status` answered 1: ERR busy\"",
+    );
+    let (w, why) = l7(&seen(Some(&short)));
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("ERR busy"), "{why}");
+    let (w, why) = l7(&seen(Some(&short.replace(" status_failed=", " no_key="))));
+    assert_eq!(w, "UNOBSERVED", "{why}");
 }
 
 fn rest_desk(metrics: &str, n_render: &str) -> surfaces::Desk {
@@ -5121,6 +5140,7 @@ fn rest_desk(metrics: &str, n_render: &str) -> surfaces::Desk {
             ms: 20_050,
             metrics: metrics.to_string(),
             percentiles: format!("n_render={n_render} render_p50_ms=0.00"),
+            metrics_failed: None,
             moved: Vec::new(),
             relogged: Vec::new(),
             ends: vec!["land-j".into(), "land-k".into()],
@@ -5150,6 +5170,30 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
         surfaces::judge_end(d, t, "claude").word()
     };
     assert_eq!(end(&rest_desk(REST, "0"), &tabs), "PASS");
+    // CONTROL: the same counts where a `metrics` call failed (the reset: counts from before the
+    // window) judge none of them, and an Off tab whose line in front went unread is no `-`.
+    let mut d = rest_desk(REST, "0");
+    if let Some(i) = d.idle.as_mut() {
+        i.metrics_failed = Some("`metrics reset` answered 1: ERR timeout".into());
+    }
+    let v = surfaces::judge_end(&d, &tabs, "claude");
+    assert_eq!(v.word(), "FAIL", "{}", v.why());
+    assert!(v.why().contains("ERR timeout"), "{}", v.why());
+    let unread_off = surfaces::Window {
+        front_failed: Some("`chrome` answered 1: ERR timeout".into()),
+        ..window("x")
+    };
+    let v = surfaces::judge_end(
+        &rest_desk(REST, "0"),
+        &[
+            (Chain::CruiseN, &n),
+            (Chain::LandJ, &j_),
+            (Chain::Off, &unread_off),
+        ],
+        "claude",
+    );
+    assert_eq!(v.word(), "FAIL", "{}", v.why());
+    assert!(v.why().contains("unread in front"), "{}", v.why());
     assert_eq!(
         end(
             &rest_desk(&REST.replace("timer_wakes=0", "timer_wakes=2"), "0"),
@@ -5456,6 +5500,52 @@ fn end_reads_the_wake_watchs_counts_from_the_metrics_reply() {
 }
 
 #[test]
+fn end_counts_fires_from_its_opening_read_so_a_write_before_the_reset_is_not_charged_to_it() {
+    // A write just before the reset: its status sweep armed and fired in the settle, before the
+    // opening read, and no write followed.
+    const OPENED: &str = "OK wake_heals=0 event_wakes=4 timer_wakes=1 deadline_owner=presence deadline_arms_by_owner=session_status:3/0,presence:2/0 deadline_fires_by_owner=session_status:1 wakes_by_variant=HostNote:1";
+    const CLOSED: &str = "OK wake_heals=0 output_wake_late=0 event_wakes=9 timer_wakes=1 deadline_owner=presence deadline_arms_by_owner=session_status:3/0,presence:9/0 deadline_fires_by_owner=session_status:1 wakes_by_variant=HostNote:2,HarnessFact:1";
+    let n = surfaces::Window {
+        front: Some((
+            T0,
+            "window=2 program=muse face=cruise drawn=\"∞\" spoken=\"x\"".to_string(),
+        )),
+        ..window("x")
+    };
+    let end = |opened: &str| {
+        let kept = surfaces::idle_metrics_between(opened, CLOSED);
+        let v = surfaces::judge_end(&rest_desk(&kept, "0"), &[(Chain::CruiseN, &n)], "muse");
+        (kept, v.word(), v.why().to_string())
+    };
+    let (kept, w, why) = end(OPENED);
+    assert_eq!(
+        kept,
+        "timer_wakes=0 event_wakes=5 deadline_owner=presence deadline_arms_by_owner=presence:7/0 deadline_fires_by_owner=none wakes_by_variant=HostNote:2,HarnessFact:1 wake_heals=0 output_wake_late=0"
+    );
+    assert_eq!(w, "PASS", "{why}");
+    // CONTROL: the same sweep firing after the opening read, beside no write, fails the window.
+    let (kept, w, why) = end(
+        "OK wake_heals=0 event_wakes=4 timer_wakes=0 deadline_arms_by_owner=presence:2/0 deadline_fires_by_owner=none",
+    );
+    assert!(
+        kept.contains("deadline_fires_by_owner=session_status:1 "),
+        "{kept}"
+    );
+    assert_eq!(w, "FAIL", "{why}");
+    // An opening read that lacks a count leaves it unread, never the closing count.
+    let (kept, w, _) = end("OK");
+    assert!(kept.contains("timer_wakes=- "), "{kept}");
+    assert_eq!(w, "FAIL");
+    assert_eq!(
+        surfaces::idle_percentiles_between(
+            "OK n_render=2 n_input=1 render_p50_ms=3.00",
+            "OK n_render=2 n_input=4 render_p50_ms=3.00 render_p95_ms=4.00 render_p99_ms=5.00",
+        ),
+        "n_render=0 render_p50_ms=3.00 render_p95_ms=4.00 render_p99_ms=5.00 n_input=3"
+    );
+}
+
+#[test]
 fn every_chain_and_scenario_of_the_pass_has_its_window_wants() {
     let wanted = |c: Chain, s: Scenario| {
         let mut seen = Seen::default();
@@ -5588,7 +5678,7 @@ fn the_tool_ended_turn_is_scripted_per_harness_on_its_prompts_rule_alone() {
         .collect();
     for (h, name) in [
         (Harness::Claude, "Read"),
-        (Harness::Agy, "view_file"),
+        (Harness::Agy, "read_file"),
         (Harness::Muse, "read_file"),
     ] {
         let sp = spec_on(&Chain::RESID, h, &dirs);
@@ -5606,11 +5696,7 @@ fn the_tool_ended_turn_is_scripted_per_harness_on_its_prompts_rule_alone() {
         match h {
             Harness::Muse => assert_eq!(path("path").as_deref(), Some("README.md")),
             Harness::Agy => {
-                assert_eq!(
-                    path("AbsolutePath").as_deref(),
-                    Some("/w/tool-end/README.md")
-                );
-                assert!(path("toolSummary").is_some() && path("toolAction").is_some());
+                assert_eq!(path("Path").as_deref(), Some("/w/tool-end/README.md"));
             }
             _ => assert_eq!(path("file_path").as_deref(), Some("/w/tool-end/README.md")),
         }
@@ -5668,12 +5754,12 @@ fn each_apis_reader_tells_a_request_carrying_a_tools_result_back() {
         r#"{"role": "user", "parts": [{"functionResponse": {"name": "read_file"}}]}"#
     )));
     assert!(gemini::results_answered(&g(
-        r#"{"role": "model", "parts": [{"functionResponse": {"name": "view_file"}}]}"#
+        r#"{"role": "model", "parts": [{"functionResponse": {"name": "read_file"}}]}"#
     )));
     assert!(!gemini::results_answered(&g(
         r#"{"role": "user", "parts": [{"text": "next"}]}"#
     )));
-    let retried = br#"{"contents": [{"role": "user", "parts": [{"text": "go"}]}, {"role": "model", "parts": [{"functionCall": {"name": "view_file"}}]}, {"role": "model", "parts": [{"functionResponse": {"name": "view_file"}}]}, {"role": "user", "parts": [{"text": "Error: model output error: model output must contain either output text or tool calls, these cannot both be empty, please try again"}]}]}"#;
+    let retried = br#"{"contents": [{"role": "user", "parts": [{"text": "go"}]}, {"role": "model", "parts": [{"functionCall": {"name": "read_file"}}]}, {"role": "model", "parts": [{"functionResponse": {"name": "read_file"}}]}, {"role": "user", "parts": [{"text": "Error: model output error: model output must contain either output text or tool calls, these cannot both be empty, please try again"}]}]}"#;
     assert!(gemini::results_answered(retried));
     let r = |tail: &str| {
         format!(
@@ -6649,6 +6735,23 @@ fn claude_codes_notice_is_gone_once_cancelled_and_scrolled_away() {
     assert!(!menu_offers(Harness::Claude, &menu, CLAUDE_HIDE_COMMAND));
     let other = scrolled.replace("❯\u{a0}\n", "❯\u{a0}/rename other\n");
     assert!(!menu_offers(Harness::Claude, &other, CLAUDE_HIDE_COMMAND));
+}
+
+/// A wall's turn line still above the composer keeps the notice drawn, in each build's name for
+/// the five-hour window: `session limit` through 2.1.311, `5-hour limit` from 2.1.312.
+#[test]
+fn a_wall_line_left_above_the_scroll_keeps_claude_codes_notice_drawn() {
+    let (_, _, scrolled) = claude_limit_screens();
+    assert!(notice_gone(Harness::Claude, &scrolled), "{scrolled}");
+    for window in ["session limit", "5-hour limit"] {
+        let kept = scrolled.replacen(
+            "✻ Brewed for 0s · done 3:58 PM\n",
+            &format!("  ⎿  You've hit your {window} · resets 4:13pm (America/Los_Angeles)\n"),
+            1,
+        );
+        assert_ne!(kept, scrolled);
+        assert!(!notice_gone(Harness::Claude, &kept), "{window}: {kept}");
+    }
 }
 
 #[path = "forever_walls_tests.rs"]

@@ -160,16 +160,20 @@ impl Companions {
             self.kitty_sing.note_keyed_enter(now, session);
         }
         let mut fired = TypedHit::NONE;
-        press.feed(
-            &mut self.kitty_summon,
-            TypedKittySummon::note_break,
-            |summon| summon.note_backspace(session),
-            |summon, c| {
-                if let Some((lexicon, opts)) = words {
+        if let Some((lexicon, opts)) = words {
+            press.feed(
+                &mut self.kitty_summon,
+                TypedKittySummon::note_break,
+                |summon| summon.note_backspace(session),
+                |summon, c| {
                     fired = fired.merge(summon.note_char(now, session, c, lexicon, opts));
-                }
-            },
-        );
+                },
+            );
+        } else if press.brk {
+            self.kitty_summon.note_break();
+        } else if press.backspace {
+            self.kitty_summon.note_backspace(session);
+        }
         fired
     }
 

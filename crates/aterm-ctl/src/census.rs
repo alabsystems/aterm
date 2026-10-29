@@ -563,7 +563,7 @@ fn socket_off(args: &[&str]) -> bool {
 }
 
 /// An age in the two largest units: `11d 22h`, `3h 05m`, `4m 12s`, `42s`.
-fn age_words(secs: u64) -> String {
+pub(crate) fn age_words(secs: u64) -> String {
     let (d, h, m, s) = (secs / 86_400, secs / 3_600 % 24, secs / 60 % 60, secs % 60);
     if d > 0 {
         format!("{d}d {h}h")

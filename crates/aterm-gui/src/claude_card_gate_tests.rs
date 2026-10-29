@@ -1313,6 +1313,7 @@ fn a_restore_re_derives_the_holder_from_the_kernel() {
         let adoption = crate::spawn::adopt_restored_holder(
             &term,
             &timeline,
+            &crate::command_ran::RanFeed::blind(std::sync::Arc::default(), SHELL_PGID),
             -1,
             SHELL_PGID,
             probe,
@@ -1381,14 +1382,59 @@ fn a_restore_re_derives_the_holder_from_the_kernel() {
             "registered session"
         );
     }
-    crate::spawn::adopt_restored_holder(&term, &timeline, -1, SHELL_PGID, in_front, claude, |_| {
-        Vec::new()
-    });
-    let timeline = timeline.lock().unwrap();
-    assert_eq!(timeline.card_gate().map(|g| g.token), Some(token));
+    let ran = std::sync::Arc::new(crate::command_ran::Ran::default());
+    crate::spawn::adopt_restored_holder(
+        &term,
+        &timeline,
+        &crate::command_ran::RanFeed::blind(std::sync::Arc::clone(&ran), SHELL_PGID),
+        -1,
+        SHELL_PGID,
+        in_front,
+        claude,
+        |_| Vec::new(),
+    );
+    {
+        let timeline = timeline.lock().unwrap();
+        assert_eq!(timeline.card_gate().map(|g| g.token), Some(token));
+        assert!(
+            timeline.slog().block_cursor().is_some(),
+            "the open log read its blocks"
+        );
+    }
+    // The restored command's program ran before this process heard anything: the in-front image
+    // the restore reads is noted, so the next sweep confirms the running block's detail; the
+    // shell in front is no command's. NEGATIVE CONTROL (scratch): a restore that notes nothing
+    // fails the first assertion.
+    let every = Some(crate::command_ran::Window { from: 0, to: None });
+    let noted = |ran: &crate::command_ran::Ran| -> Vec<(i32, Option<String>)> {
+        ran.within(every)
+            .into_iter()
+            .map(|e| (e.pgid, e.names.shown().map(str::to_owned)))
+            .collect()
+    };
+    let file = claude_image(PGID, VERSION, 1)
+        .exe
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
+    assert!(file.is_some(), "the image has a file");
+    assert_eq!(noted(&ran), [(PGID, file)], "the in-front image is noted");
+    fn shell_in_front_now(_: i32) -> i32 {
+        SHELL_PGID
+    }
+    let quiet = std::sync::Arc::new(crate::command_ran::Ran::default());
+    crate::spawn::adopt_restored_holder(
+        &term,
+        &timeline,
+        &crate::command_ran::RanFeed::blind(std::sync::Arc::clone(&quiet), SHELL_PGID),
+        -1,
+        SHELL_PGID,
+        shell_in_front_now,
+        claude,
+        |_| Vec::new(),
+    );
     assert!(
-        timeline.slog().block_cursor().is_some(),
-        "the open log read its blocks"
+        noted(&quiet).is_empty(),
+        "the shell in front is no command's"
     );
 }
 
@@ -1441,7 +1487,14 @@ fn a_restore_books_the_groups_its_carried_stopped_drawers_lead() {
         );
         let timeline = std::sync::Mutex::new(crate::session_timeline::SessionTimeline::default());
         crate::spawn::adopt_restored_holder(
-            &term, &timeline, -1, SHELL_PGID, in_front, claude, children,
+            &term,
+            &timeline,
+            &crate::command_ran::RanFeed::blind(std::sync::Arc::default(), SHELL_PGID),
+            -1,
+            SHELL_PGID,
+            in_front,
+            claude,
+            children,
         );
         let timeline = timeline.lock().unwrap();
         let groups = timeline.drawer_groups();

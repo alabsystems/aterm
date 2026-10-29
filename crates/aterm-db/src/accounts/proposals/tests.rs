@@ -818,8 +818,12 @@ pub(crate) fn evidence_transition(
 fn retained_request_evidence_conforms_through_withdrawal_and_quarantine() {
     let model = aterm_models_db::proposal_evidence_model();
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
-    for action in &model.actions {
-        let next = evidence_transition(&model.init_state(), action.name);
+    // Each action is its own two-machine lab: run them side by side.
+    let observed =
+        aterm_spec::check::each_on(aterm_spec::fs_lane::PLACES, &model.actions, |action| {
+            evidence_transition(&model.init_state(), action.name)
+        });
+    for (action, next) in model.actions.iter().zip(observed) {
         assert!(
             model
                 .successors(action.name, &model.init_state())

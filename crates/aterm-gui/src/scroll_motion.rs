@@ -52,8 +52,14 @@ pub(crate) fn glide_position(start_px: i64, target_px: i64, elapsed_ms: u64, dur
     let u = elapsed_ms as f64 / dur_ms as f64;
     let inv = 1.0 - u;
     let e = 1.0 - inv * inv * inv;
-    let delta = target_px - start_px;
-    start_px + (delta as f64 * e).round() as i64
+    let delta = i128::from(target_px) - i128::from(start_px);
+    let step = (delta as f64 * e).round();
+    let step_i128 = if step.is_finite() { step as i128 } else { 0 };
+    let (lo, hi) = (
+        i128::from(start_px.min(target_px)),
+        i128::from(start_px.max(target_px)),
+    );
+    (i128::from(start_px) + step_i128).clamp(lo, hi) as i64
 }
 
 /// A self-disarming wheel or tracked glide.
@@ -192,7 +198,7 @@ pub(crate) fn spring_displacement(x0_px: f64, omega: f64, t_s: f64) -> f64 {
 /// Map raw overscroll pixels past a history end to the resisted elastic displacement.
 #[must_use]
 pub(crate) const fn overscroll_resist(raw_px: i64) -> i64 {
-    raw_px.signum() * (raw_px.abs() * 3) / 10
+    (((raw_px as i128) * 3) / 10) as i64
 }
 
 /// A self-disarming elastic-overscroll bounce.
@@ -248,7 +254,17 @@ impl OverscrollSpring {
     /// Re-release from the current displacement plus `delta_px`, clamped to `±max_px`.
     pub(crate) fn add_impulse(&mut self, delta_px: f64, max_px: f64, now: Instant) {
         let (cur, _) = self.sample(now);
-        self.x0_px = (cur + delta_px).clamp(-max_px, max_px);
+        let limit = if max_px > 0.0 { max_px } else { 0.0 };
+        let next = cur + delta_px;
+        self.x0_px = if next.is_nan() {
+            if cur.is_nan() {
+                0.0
+            } else {
+                cur.clamp(-limit, limit)
+            }
+        } else {
+            next.clamp(-limit, limit)
+        };
         self.t0 = now;
     }
 
@@ -386,13 +402,15 @@ mod tests {
     /// pairs in both directions × step cadences.
     #[test]
     fn glide_converges_monotonically_and_exactly() {
-        let cases: [(i64, i64); 6] = [
+        let cases: [(i64, i64); 8] = [
             (0, 960),
             (960, 0),
             (0, 0),
             (-64, 128),
             (7, 8),
             (100_000, -3),
+            (i64::MIN, i64::MAX),
+            (i64::MAX, i64::MIN),
         ];
         for (start, target) in cases {
             for step_ms in [1u64, 7, 16, 33] {
@@ -643,6 +661,10 @@ mod tests {
             "impulse stacks, clamped to max"
         );
         assert!(after <= 8.0, "amplitude never exceeds the one-cell clamp");
+        sp.add_impulse(4.0, -1.0, mid);
+        assert_eq!(sp.sample(mid).0, 0.0);
+        sp.add_impulse(f64::NAN, f64::NAN, mid);
+        assert_eq!(sp.sample(mid).0, 0.0);
     }
 
     /// Overscroll resistance: odd, sign-preserving, monotone, and bounded by
@@ -659,6 +681,8 @@ mod tests {
             prev = r;
         }
         assert_eq!(overscroll_resist(100), 30, "non-vacuity: 0.3x is genuine");
+        assert_eq!(overscroll_resist(i64::MAX), -overscroll_resist(-i64::MAX));
+        assert!(overscroll_resist(i64::MIN) < overscroll_resist(i64::MIN + 10));
     }
 
     /// Pill geometry laws over a track × viewport × history × offset lattice:

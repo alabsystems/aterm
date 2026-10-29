@@ -60,8 +60,14 @@ fn spec_xref_closure() {
     std::hint::black_box(
         aterm_agent::harness::accounts_sync::account_provider_realm_environment as fn(),
     );
+    std::hint::black_box(
+        aterm_agent::harness::accounts_sync::account_alias_admission_environment as fn(),
+    );
     #[cfg(unix)]
     std::hint::black_box(aterm_db::replica::db_repair_policy_environment as fn());
+    #[cfg(unix)]
+    std::hint::black_box(aterm_db::accounts::claims::db_claim_ring_environment as fn());
+    std::hint::black_box(aterm_secrets::need::credential_request_environment as fn());
     std::hint::black_box(
         aterm_agent::harness::codex_app_login::codex_refresh_publication_environment as fn(),
     );
@@ -76,6 +82,12 @@ fn spec_xref_closure() {
     );
     std::hint::black_box(
         aterm_agent::harness::codex_app_login::codex_refresh_result_environment as fn(),
+    );
+    std::hint::black_box(
+        aterm_agent::harness::codex_app_login::codex_stored_identity_environment as fn(),
+    );
+    std::hint::black_box(
+        aterm_agent::harness::accounts_pool::account_pool_preparation_environment as fn(),
     );
     // aterm-vz's `VzLifecycle` anchors: one named item in each module that holds them.
     #[cfg(unix)]
@@ -179,6 +191,47 @@ fn spec_xref_closure() {
                 &aterm_secrets::commons::journal::Journal,
             ) -> aterm_secrets::commons::journal::State,
     );
+    #[cfg(unix)]
+    std::hint::black_box((
+        aterm_secrets::client::merge_diverged_heads
+            as fn(
+                &[aterm_secrets::client::ObservedHead],
+            ) -> aterm_secrets::Result<aterm_secrets::client::MergedHeads>,
+        aterm_secrets::client::read_server_heads
+            as fn(
+                &aterm_secrets::client::Paths,
+                &[String],
+            ) -> aterm_secrets::Result<Vec<aterm_secrets::client::ObservedHead>>,
+        aterm_secrets::client::publish_to_servers
+            as fn(
+                &aterm_secrets::client::Paths,
+                &[String],
+                &[u8],
+            ) -> aterm_secrets::Result<Vec<(String, aterm_secrets::Result<()>)>>,
+        aterm_secrets::client::verify_approved_in_served_head
+            as fn(
+                &aterm_secrets::client::Paths,
+                &aterm_secrets::client::Admin,
+                u64,
+                &[String],
+            ) -> aterm_secrets::Result<()>,
+        aterm_secrets::client::steward_ensure_lease
+            as fn(
+                &aterm_secrets::client::Paths,
+                Option<&str>,
+                u64,
+            ) -> aterm_secrets::Result<aterm_secrets::client::StewardLease>,
+        aterm_secrets::client::ledger_publish_environment as fn(),
+    ));
+    #[cfg(unix)]
+    {
+        use aterm_secrets::membership_log::{Inserted, Log, Membership, Record};
+        std::hint::black_box((
+            Log::insert as fn(&mut Log, Record) -> aterm_secrets::Result<Inserted>,
+            Log::membership as fn(&Log) -> Membership,
+            aterm_secrets::membership_log::membership_log_environment as fn(),
+        ));
+    }
     #[expect(
         clippy::disallowed_methods,
         reason = "a link root: the window's entry is named, never called"

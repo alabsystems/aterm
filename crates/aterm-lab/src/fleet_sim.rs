@@ -1418,6 +1418,8 @@ fn form_fleet(world: &World) -> Result<Joins, Fail> {
         world.insts.len() - 1
     );
     let mut joins = Joins::default();
+    // A join code names no member (F17): each join names the issuer to dial.
+    let issuer_at = format!("127.0.0.1:{}", issuer.port);
     for inst in &world.insts[1..] {
         let i = inst.i;
         let out = world.aterm_in(
@@ -1429,6 +1431,8 @@ fn form_fleet(world: &World) -> Result<Joins, Fail> {
                 "127.0.0.1",
                 "--port",
                 &inst.port.to_string(),
+                "--at",
+                &issuer_at,
                 "--allow",
                 "content",
             ],

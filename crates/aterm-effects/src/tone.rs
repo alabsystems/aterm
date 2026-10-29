@@ -102,12 +102,40 @@ pub fn for_each_ngram_bucket(text: &str, f: impl FnMut(usize)) -> usize {
     for_each_ngram_bucket_chars(text.chars(), f)
 }
 
-/// Feed every hashed n-gram bucket of `chars` to `f`; returns how many were emitted.
 #[inline]
-pub fn for_each_ngram_bucket_chars(
-    chars: impl IntoIterator<Item = char>,
-    mut f: impl FnMut(usize),
-) -> usize {
+const fn normalize_ngram_char(raw: char, last_was_space: &mut bool) -> Option<char> {
+    if raw.is_ascii() {
+        if matches!(raw, ' ' | '\t'..='\r') {
+            if *last_was_space {
+                return None; // collapse runs — indentation is not a mood
+            }
+            *last_was_space = true;
+            Some(' ')
+        } else {
+            *last_was_space = false;
+            Some(raw.to_ascii_lowercase())
+        }
+    } else if raw.is_whitespace() {
+        if *last_was_space {
+            return None;
+        }
+        *last_was_space = true;
+        Some(' ')
+    } else {
+        *last_was_space = false;
+        Some(raw)
+    }
+}
+
+#[inline]
+fn step_ngram_char(
+    raw: char,
+    last_was_space: &mut bool,
+    prev1: &mut Option<(u64, u64)>,
+    prev2_h3: &mut Option<u64>,
+    count: &mut usize,
+    f: &mut impl FnMut(usize),
+) {
     use aterm_hash::{FNV64_OFFSET, fnv1a_64_extend};
     /// Per-order salt (odd constant × order) so n-gram orders occupy distinct hash streams.
     const ORDER_SALT: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -124,45 +152,43 @@ pub fn for_each_ngram_bucket_chars(
         (h as usize) & (BUCKETS - 1)
     }
 
+    let Some(c) = normalize_ngram_char(raw, last_was_space) else {
+        return;
+    };
+    let cb = (c as u32).to_le_bytes();
+    f(bucket(fold(SEED_1, cb)));
+    *count += 1;
+    if let Some((h2_p1, h3_p1)) = *prev1 {
+        f(bucket(fold(h2_p1, cb)));
+        *count += 1;
+        if let Some(h3_p2_p1) = *prev2_h3 {
+            f(bucket(fold(h3_p2_p1, cb)));
+            *count += 1;
+        }
+        *prev2_h3 = Some(fold(h3_p1, cb));
+    }
+    *prev1 = Some((fold(SEED_2, cb), fold(SEED_3, cb)));
+}
+
+/// Feed every hashed n-gram bucket of `chars` to `f`; returns how many were emitted.
+#[inline]
+pub fn for_each_ngram_bucket_chars(
+    chars: impl IntoIterator<Item = char>,
+    mut f: impl FnMut(usize),
+) -> usize {
     let mut count = 0usize;
     let mut prev1: Option<(u64, u64)> = None;
     let mut prev2_h3: Option<u64> = None;
     let mut last_was_space = false;
     for raw in chars {
-        let c = if raw.is_ascii() {
-            if matches!(raw, ' ' | '\t'..='\r') {
-                if last_was_space {
-                    continue; // collapse runs — indentation is not a mood
-                }
-                last_was_space = true;
-                ' '
-            } else {
-                last_was_space = false;
-                raw.to_ascii_lowercase()
-            }
-        } else if raw.is_whitespace() {
-            if last_was_space {
-                continue;
-            }
-            last_was_space = true;
-            ' '
-        } else {
-            last_was_space = false;
-            raw
-        };
-        let cb = (c as u32).to_le_bytes();
-        f(bucket(fold(SEED_1, cb)));
-        count += 1;
-        if let Some((h2_p1, h3_p1)) = prev1 {
-            f(bucket(fold(h2_p1, cb)));
-            count += 1;
-            if let Some(h3_p2_p1) = prev2_h3 {
-                f(bucket(fold(h3_p2_p1, cb)));
-                count += 1;
-            }
-            prev2_h3 = Some(fold(h3_p1, cb));
-        }
-        prev1 = Some((fold(SEED_2, cb), fold(SEED_3, cb)));
+        step_ngram_char(
+            raw,
+            &mut last_was_space,
+            &mut prev1,
+            &mut prev2_h3,
+            &mut count,
+            &mut f,
+        );
     }
     count
 }
@@ -173,21 +199,6 @@ pub(crate) fn for_each_ngram_bucket_char_slices(
     slices: [&[char]; 2],
     mut f: impl FnMut(usize),
 ) -> usize {
-    use aterm_hash::{FNV64_OFFSET, fnv1a_64_extend};
-    const ORDER_SALT: u64 = 0x9e37_79b9_7f4a_7c15;
-    const SEED_1: u64 = FNV64_OFFSET ^ ORDER_SALT;
-    const SEED_2: u64 = FNV64_OFFSET ^ ORDER_SALT.wrapping_mul(2);
-    const SEED_3: u64 = FNV64_OFFSET ^ ORDER_SALT.wrapping_mul(3);
-
-    #[inline]
-    const fn fold(h: u64, cb: [u8; 4]) -> u64 {
-        fnv1a_64_extend(h, &cb)
-    }
-    #[inline]
-    const fn bucket(h: u64) -> usize {
-        (h as usize) & (BUCKETS - 1)
-    }
-
     let mut count = 0usize;
     let mut prev1: Option<(u64, u64)> = None;
     let mut prev2_h3: Option<u64> = None;
@@ -198,42 +209,15 @@ pub(crate) fn for_each_ngram_bucket_char_slices(
         si += 1;
         let mut ci = 0;
         while ci < slice.len() {
-            let raw = slice[ci];
+            step_ngram_char(
+                slice[ci],
+                &mut last_was_space,
+                &mut prev1,
+                &mut prev2_h3,
+                &mut count,
+                &mut f,
+            );
             ci += 1;
-            let c = if raw.is_ascii() {
-                if matches!(raw, ' ' | '\t'..='\r') {
-                    if last_was_space {
-                        continue;
-                    }
-                    last_was_space = true;
-                    ' '
-                } else {
-                    last_was_space = false;
-                    raw.to_ascii_lowercase()
-                }
-            } else if raw.is_whitespace() {
-                if last_was_space {
-                    continue;
-                }
-                last_was_space = true;
-                ' '
-            } else {
-                last_was_space = false;
-                raw
-            };
-            let cb = (c as u32).to_le_bytes();
-            f(bucket(fold(SEED_1, cb)));
-            count += 1;
-            if let Some((h2_p1, h3_p1)) = prev1 {
-                f(bucket(fold(h2_p1, cb)));
-                count += 1;
-                if let Some(h3_p2_p1) = prev2_h3 {
-                    f(bucket(fold(h3_p2_p1, cb)));
-                    count += 1;
-                }
-                prev2_h3 = Some(fold(h3_p1, cb));
-            }
-            prev1 = Some((fold(SEED_2, cb), fold(SEED_3, cb)));
         }
     }
     count
@@ -495,11 +479,7 @@ impl ToneModel {
         }
         let raw = raw(bytes)?;
         let mut emb = Vec::with_capacity(raw.emb.len());
-        let mut bi = 0;
-        while bi < raw.emb.len() {
-            emb.push(deq_row(raw.emb_scale, raw.emb[bi]));
-            bi += 1;
-        }
+        emb.extend(raw.emb.iter().map(|&b| deq_row(raw.emb_scale, b)));
         let mut w1 = [[0.0f32; HIDDEN]; EMBED];
         let mut r = 0;
         while r < EMBED {
@@ -572,6 +552,11 @@ impl ToneModel {
                 i += 1;
             }
         });
+        self.finish_pre_activations(n, s)
+    }
+
+    #[inline]
+    const fn finish_pre_activations(&self, n: usize, s: &mut ToneScratch) -> bool {
         if n < MIN_NGRAMS {
             return false;
         }
@@ -589,6 +574,19 @@ impl ToneModel {
             r += 1;
         }
         true
+    }
+
+    #[inline]
+    const fn argmax_tone(logits: &[f32; TONE_COUNT]) -> Tone {
+        let mut best = 0usize;
+        let mut i = 1;
+        while i < TONE_COUNT {
+            if logits[i] > logits[best] {
+                best = i;
+            }
+            i += 1;
+        }
+        Tone::from_index(best)
     }
 
     /// Apply tanh to `s.hid` in place and compute the output logits into `s.logits`.
@@ -672,15 +670,7 @@ impl ToneModel {
         if !self.compute_logits_chars(chars, s) {
             return None;
         }
-        let mut best = 0usize;
-        let mut i = 1;
-        while i < TONE_COUNT {
-            if s.logits[i] > s.logits[best] {
-                best = i;
-            }
-            i += 1;
-        }
-        Some(Tone::from_index(best))
+        Some(Self::argmax_tone(&s.logits))
     }
 
     /// [`ToneModel::classify_opt`] over two contiguous `char` slices (`VecDeque::as_slices`).
@@ -701,32 +691,11 @@ impl ToneModel {
                 i += 1;
             }
         });
-        if n < MIN_NGRAMS {
+        if !self.finish_pre_activations(n, s) {
             return None;
         }
-        let inv = 1.0 / n as f32;
-        s.hid = self.b1;
-        let mut r = 0;
-        while r < EMBED {
-            let row = &self.w1[r];
-            let e = s.sum[r] * inv;
-            let mut c = 0;
-            while c < HIDDEN {
-                s.hid[c] += e * row[c];
-                c += 1;
-            }
-            r += 1;
-        }
         self.logits_from_pre_activations(s);
-        let mut best = 0usize;
-        let mut i = 1;
-        while i < TONE_COUNT {
-            if s.logits[i] > s.logits[best] {
-                best = i;
-            }
-            i += 1;
-        }
-        Some(Tone::from_index(best))
+        Some(Self::argmax_tone(&s.logits))
     }
 
     /// The verdict: argmax tone, or the neutral [`Tone::Technical`] when the evidence is too thin.

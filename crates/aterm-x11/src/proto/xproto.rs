@@ -731,9 +731,16 @@ impl Reply for GetPropertyReply {
         let bytes_after = r.u32()?;
         let value_len = r.u32()?;
         r.skip(12)?;
+        let unit = match format {
+            0 if value_len == 0 => 0usize,
+            8 => 1,
+            16 => 2,
+            32 => 4,
+            _ => return Err(ParseError::Invalid),
+        };
         let len = usize::try_from(value_len)
             .ok()
-            .and_then(|n| n.checked_mul(usize::from(format / 8)))
+            .and_then(|n| n.checked_mul(unit))
             .ok_or(ParseError::Short)?;
         Ok(GetPropertyReply {
             format,

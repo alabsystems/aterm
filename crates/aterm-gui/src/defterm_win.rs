@@ -317,19 +317,6 @@ mod tests {
         }
     }
 
-    /// While no COM server can answer, `set_default_terminal` refuses rather than
-    /// register a CLSID that makes consoles fail to open.
-    #[test]
-    fn registration_refuses_while_no_handoff_server_can_answer() {
-        assert!(
-            !handoff_server_available(),
-            "no COM handoff server ships in this build yet"
-        );
-        let err = set_default_terminal()
-            .expect_err("registration must refuse while nothing can answer the handoff");
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-    }
-
     /// A refused registration leaves the live delegation as it was (the test only reads).
     #[test]
     fn a_refused_registration_changes_nothing() {
@@ -452,7 +439,9 @@ mod tests {
     }
 
     /// Against a scratch key: a foreign pair survives unset byte for byte, and only
-    /// aterm's own registration is removed.
+    /// aterm's own registration is removed, with or without a console value beside it.
+    /// Removal never consults the availability gate: it is the escape hatch from a
+    /// delegation nothing can answer.
     #[test]
     fn unset_spares_a_foreign_registration_and_removes_only_ours() {
         let wt_terminal = "{E12CFF52-A866-4C77-9A90-F570A7AA2C6B}";
@@ -495,14 +484,7 @@ mod tests {
             unset_delegation_at(&key.0).expect("unset must not error"),
             UnsetOutcome::NothingRegistered
         );
-    }
 
-    /// The removal path never consults the availability gate: it is the escape hatch
-    /// from a delegation nothing can answer.
-    #[test]
-    fn unset_is_not_gated_on_the_handoff_server() {
-        assert!(!handoff_server_available());
-        let key = ScratchKey::new("ungated");
         key.set(VALUE_TERMINAL, CLSID_ATERM_TERMINAL);
         assert_eq!(
             unset_delegation_at(&key.0).expect("unset must work while the gate is false"),

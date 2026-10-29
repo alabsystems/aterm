@@ -835,6 +835,11 @@ fn a_status_file_gives_anonymous_memory_resident_and_swapped() {
                   VmSwap:\t   20000 kB\n";
     assert_eq!(linux::status_footprint(status), Some(320_000 * 1024));
     assert_eq!(
+        linux::status_memory(status),
+        Some((320_000 * 1024, 300_000 * 1024)),
+        "resident: the anonymous pages in memory, not the swapped ones"
+    );
+    assert_eq!(
         linux::status_footprint("Name:\tx\nRssAnon:\t 4 kB\n"),
         Some(4096),
         "no VmSwap reads 0 swapped"
@@ -904,6 +909,21 @@ fn the_sweep_reads_a_fixture_proc() {
             (4300, 4242, "zsh", Some(100_000_000), Some(1000 * 1024)),
             (4400, 1, "old", Some(50_000_000), Some(250 * 4096)),
         ]
+    );
+    assert_eq!(
+        sweep
+            .procs
+            .iter()
+            .map(|p| (p.pid, p.resident))
+            .collect::<Vec<_>>(),
+        [
+            (1, Some(8000 * 1024)),
+            (2, None),
+            (4242, Some(2048 * 1024)),
+            (4300, Some(1000 * 1024)),
+            (4400, None),
+        ],
+        "RssAnon, the swapped pages left out; none read by statm"
     );
     let unit: Vec<(u32, RunState, bool, bool)> = sweep
         .procs

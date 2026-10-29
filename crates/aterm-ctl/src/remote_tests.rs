@@ -285,10 +285,9 @@ fn a_hold_off_after_a_leave_names_what_lifts_the_hold() {
     assert_eq!(
         off,
         "this machine is in no fleet; if this machine took s-a1 on lab-mini, that Mac lifts the \
-         hold when its person takes the tab (Take Over), runs `aterm fleet peers rm \
-         496e9154e57ae1d4bb20b01cf5d624cf` there, or lowers `aterm fleet allow` there (to content \
-         or facts), and `aterm ctl --host lab-mini hold s-a1 off` from here works once this \
-         machine is in that fleet again (a fleet it issued went with its leave)"
+         hold when its person takes the tab (Take Over) or lowers `aterm fleet allow` there (to \
+         content or facts), and `aterm ctl --host lab-mini hold s-a1 off` from here works once \
+         this machine is in that fleet again (a fleet it issued went with its leave)"
     );
     assert!(!off.contains("stands until"), "{off}");
     let at = run("lab-mini", &words("hold @s-a1 off"), None, &local)
@@ -317,10 +316,9 @@ fn a_hold_off_after_a_leave_names_what_lifts_the_hold() {
     assert_eq!(
         off,
         "`lab-mnii` is no Mac this machine's book records; if this machine took s-a1 on \
-         lab-mnii, that Mac lifts the hold when its person takes the tab (Take Over), runs \
-         `aterm fleet peers rm 496e9154e57ae1d4bb20b01cf5d624cf` there, or lowers `aterm fleet \
-         allow` there (to content or facts), and `aterm ctl --host lab-mnii hold s-a1 off` from \
-         here works once this machine's book records that Mac again"
+         lab-mnii, that Mac lifts the hold when its person takes the tab (Take Over) or lowers \
+         `aterm fleet allow` there (to content or facts), and `aterm ctl --host lab-mnii hold \
+         s-a1 off` from here works once this machine's book records that Mac again"
     );
     let on = run("lab-mnii", &words("hold s-a1 on"), None, &local)
         .expect_err("no such Mac in the book")
@@ -372,11 +370,11 @@ fn a_workers_task_crosses_only_after_go() {
     let head = format!("spawn agent=claude len={}", task.len());
     assert_eq!(
         spawn_exchange(link(go, &SEEN), &head, task, OWN).unwrap(),
-        ExitCode::SUCCESS
+        (ExitCode::SUCCESS, None)
     );
     assert_eq!(
         spawn_exchange(link(deny, &SEEN), &head, task, OWN).unwrap(),
-        ExitCode::FAILURE
+        (ExitCode::FAILURE, None)
     );
     let seen = SEEN.lock().unwrap();
     assert_eq!(*seen, [head.clone(), head]);
@@ -417,6 +415,27 @@ fn an_await_over_a_drive_waits_in_short_legs() {
         [
             "await task @s-a1 any timeout=0",
             "await task @s-a1:3 any timeout=20000"
+        ]
+    );
+    drop(seen);
+    SEEN.lock().unwrap().clear();
+    let local = LocalVerbs {
+        fleet_drive: Some(drive),
+        ..LocalVerbs::default()
+    };
+    let code = run(
+        "lab-mini",
+        &words("@s-a1:0 await task timeout=18446744073709551615"),
+        Some(Some(Duration::from_secs(u64::MAX))),
+        &local,
+    )
+    .unwrap();
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(
+        *SEEN.lock().unwrap(),
+        [
+            "await task @s-a1:0 any timeout=0",
+            "await task @s-a1:0 any timeout=20000"
         ]
     );
 }
@@ -727,4 +746,250 @@ fn an_await_over_a_drive_ends_within_ctls_own_timeout() {
     assert!(asked.iter().all(|within| *within <= five), "{asked:?}");
     let seen = SEEN.lock().unwrap();
     assert_eq!(*seen, ["await task @s-a1 any timeout=0"]);
+}
+
+/// The survey `--host any` reads in these tests: m1 lets this Mac drive it and has a weekly
+/// figure of 50%, m2 has the fleet's freshest account but grants no drive, and m3 lets this Mac
+/// drive it with 20%.
+fn any_fleet(ask: &survey::FleetAsk<'_>) -> Result<survey::FleetRead, survey::FleetRefused> {
+    assert_eq!(ask.host, None, "every member is read");
+    let peer = |n: u8, drive: bool, week: u8| survey::PeerSurvey {
+        label: format!("m{n}.local"),
+        answer: Ok(vec![
+            format!(
+                "instance pid=9 host=m{n}.local version=0.146.0 sessions=0 level=facts \
+                 at_ms=1793130000000 accounts=1{}",
+                if drive { " drive=1" } else { "" }
+            ),
+            format!(
+                "account pool=claude id=main condition=usable enrolled=1 pct5=1 pct7={week} \
+                 week_reset=- walled_until=- last_used=-"
+            ),
+        ]),
+        fault: survey::PeerFault::Other,
+        unproven: false,
+        node: Some(format!("{n:02x}").repeat(16)),
+        addr: Some(format!("192.168.1.{n}")),
+    };
+    Ok(survey::FleetRead {
+        peers: vec![peer(1, true, 50), peer(2, false, 0), peer(3, true, 20)],
+        note: None,
+        alone: None,
+    })
+}
+
+#[test]
+fn host_any_spawns_on_the_best_member_that_lets_this_mac_drive_it() {
+    fn never(_: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
+        panic!("dialled")
+    }
+    let local = LocalVerbs {
+        fleet_survey: Some(any_fleet),
+        fleet_drive: Some(never),
+        ..LocalVerbs::NONE
+    };
+    assert_eq!(
+        any_host_node(&words("agent=claude -"), None, &local).expect("a pick"),
+        "03".repeat(16),
+        "m3, never m2, which grants no drive"
+    );
+    let none = any_host_node(&words("agent=codex -"), None, &local)
+        .expect_err("no codex row")
+        .to_string();
+    assert!(
+        none.starts_with("--host any: no Mac can take agent=codex: 3 members answered, 2 of them"),
+        "{none}"
+    );
+}
+
+/// A `--host any` spawn is one of a Claude Code or Codex worker, refused before any survey, and
+/// a survey is never sent to whichever Mac.
+#[test]
+fn host_any_spawns_a_claude_or_codex_worker_alone() {
+    fn never(_: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
+        panic!("dialled")
+    }
+    fn unasked(_: &survey::FleetAsk<'_>) -> Result<survey::FleetRead, survey::FleetRefused> {
+        panic!("surveyed")
+    }
+    let local = LocalVerbs {
+        fleet_survey: Some(unasked),
+        fleet_drive: Some(never),
+        ..LocalVerbs::NONE
+    };
+    for (line, why) in [
+        ("survey", "run `aterm ctl survey --fleet`"),
+        ("@s-a1 spawn agent=claude -", "name no @<sel>"),
+        ("spawn agent=agy -", "a Claude Code or Codex worker"),
+        ("spawn -", "spawns a worker alone"),
+        ("spawn agent=claude", "end the request with -"),
+        ("spawn agent=claude cwd=rel -", "absolute path"),
+    ] {
+        let refusal = run(ANY_TEST, &words(line), None, &local)
+            .expect_err(line)
+            .to_string();
+        assert!(refusal.contains(why), "{line}: {refusal}");
+    }
+    let unlinked = run(
+        ANY_TEST,
+        &words("spawn agent=claude -"),
+        None,
+        &LocalVerbs::NONE,
+    )
+    .expect_err("no fleet client");
+    assert_eq!(unlinked.kind(), io::ErrorKind::Unsupported, "{unlinked}");
+}
+
+const ANY_TEST: &str = any_host::ANY;
+
+/// A worker `--host any` spawned is followed to its Mac by its sid: from the table the spawn
+/// recorded, else from the one live, proven member whose survey lists it.
+#[test]
+fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
+    static DIALLED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let any_table = tmp.path().join("driven-any-hosts.tsv");
+    ANY_HOSTS_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(any_table.clone()));
+
+    fn fleet_survey(_: &survey::FleetAsk<'_>) -> Result<survey::FleetRead, survey::FleetRefused> {
+        Ok(survey::FleetRead {
+            peers: vec![
+                // An unproven member's word for where a sid runs is never taken.
+                survey::PeerSurvey {
+                    label: "m-unproven".into(),
+                    answer: Ok(vec![
+                        "instance host=m-unproven drive=1 sessions=1".into(),
+                        "session sid=s-f00d agent=idle".into(),
+                    ]),
+                    fault: survey::PeerFault::Other,
+                    unproven: true,
+                    node: None,
+                    addr: None,
+                },
+                // An entry with no node (a peer named by hand) cannot be driven.
+                survey::PeerSurvey {
+                    label: "m-by-hand at 192.168.1.9".into(),
+                    answer: Ok(vec![
+                        "instance host=m-by-hand drive=1 sessions=1".into(),
+                        "session sid=s-f00d agent=idle".into(),
+                    ]),
+                    fault: survey::PeerFault::Other,
+                    unproven: false,
+                    node: None,
+                    addr: Some("192.168.1.9".into()),
+                },
+                survey::PeerSurvey {
+                    label: "m4.local at 192.168.1.4".into(),
+                    answer: Ok(vec![
+                        "instance host=m4 drive=1 sessions=1".into(),
+                        "session sid=s-f00d agent=idle".into(),
+                    ]),
+                    fault: survey::PeerFault::Other,
+                    unproven: false,
+                    node: Some("node-m4".into()),
+                    addr: Some("192.168.1.4".into()),
+                },
+            ],
+            note: None,
+            alone: None,
+        })
+    }
+
+    fn drive(host: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
+        let peer = host.to_owned();
+        struct PeerReply {
+            peer: String,
+            sent: Vec<u8>,
+            reply: Option<Cursor<Vec<u8>>>,
+        }
+        impl Read for PeerReply {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.reply.is_none() {
+                    let req = String::from_utf8_lossy(&self.sent).trim_end().to_owned();
+                    DIALLED
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push((self.peer.clone(), req.clone()));
+                    let text = if req.starts_with("await task") {
+                        "OK 1\n@s-c25a rev=2 state=done agent=idle attention=- result_bytes=5\n"
+                            .to_owned()
+                    } else if req.ends_with(" result") {
+                        "OK 1\nNothing left: verified.\n".to_owned()
+                    } else {
+                        "OK status\n".to_owned()
+                    };
+                    self.reply = Some(Cursor::new(text.into_bytes()));
+                }
+                self.reply.as_mut().map_or(Ok(0), |r| r.read(buf))
+            }
+        }
+        impl Write for PeerReply {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.sent.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        Ok(DriveLink {
+            stream: Box::new(PeerReply {
+                peer,
+                sent: Vec::new(),
+                reply: None,
+            }),
+            label: host.to_owned(),
+        })
+    }
+
+    // Record spawned sid -> m3 and verify `await task` and `@s-c25a result` follow m3, while an
+    // unrecorded sid `@s-f00d` falls back to `fleet_survey` and routes to `m4`.
+    record_any_sid_host("s-c25a", "m3");
+    let local = LocalVerbs {
+        fleet_drive: Some(drive),
+        fleet_survey: Some(fleet_survey),
+        ..LocalVerbs::NONE
+    };
+    assert_eq!(
+        run("any", &words("await task @s-c25a since=0"), None, &local).unwrap(),
+        ExitCode::SUCCESS
+    );
+    assert_eq!(
+        run("any", &words("@s-c25a result"), None, &local).unwrap(),
+        ExitCode::SUCCESS
+    );
+    assert_eq!(
+        run("any", &words("@s-f00d status"), None, &local).unwrap(),
+        ExitCode::SUCCESS
+    );
+
+    let dialled = DIALLED.lock().unwrap().clone();
+    assert_eq!(
+        dialled,
+        vec![
+            (
+                "m3".to_owned(),
+                "await task @s-c25a:0 any timeout=0".to_owned()
+            ),
+            ("m3".to_owned(), "@s-c25a result".to_owned()),
+            ("node-m4".to_owned(), "@s-f00d status".to_owned()),
+        ]
+    );
+
+    let no_survey = resolve_any_sid_hosts(&["s-dead"], None, None).expect_err("no survey_fn");
+    assert_eq!(no_survey.kind(), io::ErrorKind::Unsupported);
+
+    fn unserved_survey(
+        _: &survey::FleetAsk<'_>,
+    ) -> Result<survey::FleetRead, survey::FleetRefused> {
+        Err(survey::FleetRefused {
+            why: "issuer connected, but no fleet handshake within 3.0s".into(),
+            unserved: true,
+        })
+    }
+    let unserved_err =
+        resolve_any_sid_hosts(&["s-dead"], None, Some(unserved_survey)).expect_err("unserved");
+    assert_eq!(crate::exit_for(&unserved_err), ExitCode::from(2));
+
+    ANY_HOSTS_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
 }

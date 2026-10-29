@@ -959,42 +959,140 @@ fn check_aggregation(root: &Path, claim: &ScopeClaim, v: &mut Vec<String>) {
 mod tests {
     use super::*;
 
-    use crate::scan_set::test_fixtures::{Tree, repo_root, synth_tree};
+    use crate::scan_set::test_fixtures::{Tree, synth_tree};
 
-    fn claim_by_id(id: &str) -> &'static ScopeClaim {
-        SCOPE_CLAIMS
+    const SYNTH_CLAIMS: &[ScopeClaim] = &[
+        ScopeClaim {
+            id: "flash-limiter",
+            machine: Some("SynthLimiter"),
+            unmodelled_because: "",
+            scope: Scope::Window,
+            root: "WindowState",
+            chain: &[
+                Link {
+                    file: "crates/host/src/lib.rs",
+                    owner: "WindowState",
+                    decl: "fx: EffectsPipeline,",
+                },
+                Link {
+                    file: "crates/engine/src/pipeline.rs",
+                    owner: "EffectsPipeline",
+                    decl: "decos: WordDecorations,",
+                },
+                Link {
+                    file: "crates/engine/src/enforcer.rs",
+                    owner: "WordDecorations",
+                    decl: "ignitions: Vec<u32>,",
+                },
+            ],
+            closed_tokens: &["WordDecorations", "EffectsPipeline"],
+            replicas: &[],
+            aggregator: None,
+            rationale: "WCAG 2.3.1 charges 2 flash pairs per ignition on one window retina.",
+        },
+        ScopeClaim {
+            id: "supernova-burst-mutex",
+            machine: Some("SynthMutex"),
+            unmodelled_because: "",
+            scope: Scope::Window,
+            root: "WindowState",
+            chain: &[
+                Link {
+                    file: "crates/host/src/lib.rs",
+                    owner: "WindowState",
+                    decl: "fx: EffectsPipeline,",
+                },
+                Link {
+                    file: "crates/engine/src/pipeline.rs",
+                    owner: "EffectsPipeline",
+                    decl: "decos: WordDecorations,",
+                },
+                Link {
+                    file: "crates/engine/src/enforcer.rs",
+                    owner: "WordDecorations",
+                    decl: "persist: Vec<u32>,",
+                },
+            ],
+            closed_tokens: &[],
+            replicas: &[Replica {
+                file: "crates/engine/src/enforcer.rs",
+                owner: "ParkedPane",
+                decl: "persist: Vec<u32>,",
+                kind: ReplicaKind::Shard,
+                justification: "Parked pane shards share the window-wide burst mutex.",
+            }],
+            aggregator: Some(Aggregator {
+                symbol: "super_prepass",
+                file: "crates/engine/src/enforcer.rs",
+                reads: &["self.persist", "self.parked"],
+            }),
+            rationale: "MAX_ACTIVE_SUPERNOVAE = 1 spans active and parked shards.",
+        },
+    ];
+
+    fn synth_claim(id: &str) -> &'static ScopeClaim {
+        SYNTH_CLAIMS
             .iter()
             .find(|c| c.id == id)
-            .unwrap_or_else(|| panic!("no claim `{id}` in SCOPE_CLAIMS"))
+            .unwrap_or_else(|| panic!("no synthetic claim `{id}`"))
     }
 
-    fn claim_files(claim: &ScopeClaim) -> Vec<String> {
-        let repo = repo_root();
-        let mut files: Vec<String> = derive_model_sources(&repo)
-            .iter()
-            .filter_map(|path| path.strip_prefix(&repo).ok())
-            .map(|rel| rel.to_string_lossy().into_owned())
-            .collect();
-        files.extend(claim.chain.iter().map(|l| l.file.to_string()));
-        files.extend(claim.replicas.iter().map(|r| r.file.to_string()));
-        files.extend(claim.aggregator.iter().map(|a| a.file.to_string()));
-        files.sort();
-        files.dedup();
-        files
-    }
-
-    fn copy_root(name: &str, files: &[String]) -> Tree {
-        let src = repo_root();
-        let copied: Vec<(String, String)> = files
-            .iter()
-            .map(|rel| {
-                let from = src.join(rel);
-                let text = std::fs::read_to_string(&from)
-                    .unwrap_or_else(|e| panic!("read {}: {e}", from.display()));
-                (rel.clone(), text)
-            })
-            .collect();
-        synth_tree("aterm-scope-census", name, &copied)
+    fn base_root(name: &str) -> Tree {
+        synth_tree(
+            "aterm-scope-census",
+            name,
+            &[
+                (
+                    "crates/aterm-models-synth/src/lib.rs".to_string(),
+                    "SynthLimiter {\n}\nSynthMutex {\n}\n".to_string(),
+                ),
+                (
+                    "crates/host/src/lib.rs".to_string(),
+                    "pub struct WindowState {\n    fx: EffectsPipeline,\n}\n".to_string(),
+                ),
+                (
+                    "crates/engine/src/pipeline.rs".to_string(),
+                    "pub struct EffectsPipeline {\n\
+                     \x20   decos: WordDecorations,\n\
+                     }\n\
+                     impl EffectsPipeline {\n\
+                     \x20   pub fn for_window() -> Self {\n\
+                     \x20       Self {\n\
+                     \x20           decos: WordDecorations::default(),\n\
+                     \x20       }\n\
+                     \x20   }\n\
+                     }\n"
+                    .to_string(),
+                ),
+                (
+                    "crates/engine/src/enforcer.rs".to_string(),
+                    "pub struct WordDecorations {\n\
+                     \x20   ignitions: Vec<u32>,\n\
+                     \x20   persist: Vec<u32>,\n\
+                     \x20   parked: Vec<ParkedPane>,\n\
+                     }\n\
+                     impl WordDecorations {\n\
+                     \x20   pub fn default() -> Self {\n\
+                     \x20       Self {\n\
+                     \x20           ignitions: Vec::new(),\n\
+                     \x20           persist: Vec::new(),\n\
+                     \x20           parked: Vec::new(),\n\
+                     \x20       }\n\
+                     \x20   }\n\
+                     \x20   fn super_prepass(&self) {\n\
+                     \x20       let _ = &self.persist;\n\
+                     \x20       for p in &self.parked {\n\
+                     \x20           let _ = &p.persist;\n\
+                     \x20       }\n\
+                     \x20   }\n\
+                     }\n\
+                     pub struct ParkedPane {\n\
+                     \x20   persist: Vec<u32>,\n\
+                     }\n"
+                    .to_string(),
+                ),
+            ],
+        )
     }
 
     fn write_file(root: &Tree, rel: &str, contents: &str) {
@@ -1006,8 +1104,7 @@ mod tests {
         let after = before.replace(from, to);
         assert_ne!(
             before, after,
-            "the mutation no longer applies to {rel} (looking for `{from}`) — the pinned \
-             text is stale, so this demonstration proves nothing"
+            "the mutation did not match `{from}` in {rel}"
         );
         root.write(rel, &after);
     }
@@ -1016,32 +1113,23 @@ mod tests {
         run_scope_census_over(root, std::slice::from_ref(claim))
     }
 
-    fn all_claim_files() -> Vec<String> {
-        let mut files: Vec<String> = SCOPE_CLAIMS.iter().flat_map(claim_files).collect();
-        files.sort();
-        files.dedup();
-        files
-    }
-
     #[test]
     fn a_per_pane_word_decorations_map_fails_the_flash_limiter_chain() {
-        let claim = claim_by_id("flash-limiter");
-        let root = copy_root("per-pane-map", &claim_files(claim));
+        let claim = synth_claim("flash-limiter");
+        let root = base_root("per-pane-map");
 
         let before = run_one(&root, claim);
         assert!(
             before.ok,
-            "the unmutated real claim files must be GREEN, or the RED below proves \
-             nothing:\n{}",
+            "the unmutated synthetic claim tree must be GREEN:\n{}",
             before.log
         );
 
         mutate(
             &root,
-            "crates/aterm-gui/src/lib.rs",
-            "    fx: aterm_effects::pipeline::EffectsPipeline,\n",
-            "    fx: std::collections::HashMap<u64, \
-             aterm_effects::pipeline::EffectsPipeline>,\n",
+            "crates/host/src/lib.rs",
+            "    fx: EffectsPipeline,\n",
+            "    fx: std::collections::HashMap<u64, EffectsPipeline>,\n",
         );
         let after = run_one(&root, claim);
         assert!(
@@ -1063,16 +1151,14 @@ mod tests {
 
     #[test]
     fn a_new_per_pane_owner_fails_the_closure() {
-        let claim = claim_by_id("flash-limiter");
-        let root = copy_root("per-pane-owner", &claim_files(claim));
+        let claim = synth_claim("flash-limiter");
+        let root = base_root("per-pane-owner");
         assert!(run_one(&root, claim).ok);
 
         write_file(
             &root,
-            "crates/aterm-gui/src/pane_state.rs",
-            "use aterm_effects::word_decorations::WordDecorations;\n\
-             \n\
-             pub(crate) struct PaneState {\n\
+            "crates/host/src/pane_state.rs",
+            "pub(crate) struct PaneState {\n\
              \x20   pub(crate) decos: WordDecorations,\n\
              }\n",
         );
@@ -1088,12 +1174,12 @@ mod tests {
             out.log
         );
 
-        let root = copy_root("per-pane-pipeline", &claim_files(claim));
+        let root = base_root("per-pane-pipeline");
         write_file(
             &root,
-            "crates/aterm-gui/src/pane_fx.rs",
+            "crates/host/src/pane_fx.rs",
             "pub(crate) struct PaneFx {\n\
-             \x20   pub(crate) fx: aterm_effects::pipeline::EffectsPipeline,\n\
+             \x20   pub(crate) fx: EffectsPipeline,\n\
              }\n",
         );
         let out = run_one(&root, claim);
@@ -1106,16 +1192,14 @@ mod tests {
 
     #[test]
     fn a_per_pane_constructor_fails_the_closure() {
-        let claim = claim_by_id("flash-limiter");
-        let root = copy_root("per-pane-ctor", &claim_files(claim));
+        let claim = synth_claim("flash-limiter");
+        let root = base_root("per-pane-ctor");
         assert!(run_one(&root, claim).ok);
 
         write_file(
             &root,
-            "crates/aterm-gui/src/pane_engines.rs",
-            "use aterm_effects::word_decorations::WordDecorations;\n\
-             \n\
-             pub(crate) fn build_pane_engines(panes: usize) -> Vec<WordDecorations> {\n\
+            "crates/host/src/pane_engines.rs",
+            "pub(crate) fn build_pane_engines(panes: usize) -> Vec<WordDecorations> {\n\
              \x20   let mut out = Vec::new();\n\
              \x20   for _pane in 0..panes {\n\
              \x20       out.push(WordDecorations::default());\n\
@@ -1151,13 +1235,13 @@ mod tests {
                    impl EffectsPipeline {\n\
                    \x20   fn for_test() -> Self {\n        Self\n    }\n\
                    }\n";
-        let rel = "crates/aterm-effects/src/pipeline.rs";
+        let rel = "crates/engine/src/pipeline.rs";
         let root = synth_tree(
             "aterm-scope-census",
             "ctors",
             &[(rel.to_string(), src.to_string())],
         );
-        let ctors = closed_token_ctors(&[root.join(rel)], SCOPE_CLAIMS);
+        let ctors = closed_token_ctors(&[root.join(rel)], SYNTH_CLAIMS);
         let fx: Vec<&str> = ctors["EffectsPipeline"]
             .iter()
             .map(String::as_str)
@@ -1173,25 +1257,17 @@ mod tests {
 
     #[test]
     fn a_per_pane_named_constructor_fails_the_closure() {
-        let claim = claim_by_id("flash-limiter");
-        let mut files = claim_files(claim);
-        files.push("crates/aterm-effects/src/pipeline_native.rs".to_string());
-        let root = copy_root("per-pane-named-ctor", &files);
-        let native = crate::tree::read_to_string(&root.join(&files[files.len() - 1]))
-            .expect("read pipeline_native.rs");
-        assert!(
-            native.contains("pub fn for_window() -> Self {"),
-            "the window's constructor moved: re-pin this row, or it proves nothing"
-        );
+        let claim = synth_claim("flash-limiter");
+        let root = base_root("per-pane-named-ctor");
         assert!(run_one(&root, claim).ok);
 
         write_file(
             &root,
-            "crates/aterm-gui/src/pane_fx_probe.rs",
-            "pub(crate) fn pane_pipelines(n: usize) -> Vec<aterm_effects::pipeline::EffectsPipeline> {\n\
+            "crates/host/src/pane_fx_probe.rs",
+            "pub(crate) fn pane_pipelines(n: usize) -> Vec<EffectsPipeline> {\n\
              \x20   let mut v = Vec::new();\n\
              \x20   for _ in 0..n {\n\
-             \x20       v.push(aterm_effects::pipeline::EffectsPipeline::for_window());\n\
+             \x20       v.push(EffectsPipeline::for_window());\n\
              \x20   }\n\
              \x20   v\n\
              }\n",
@@ -1210,14 +1286,14 @@ mod tests {
 
     #[test]
     fn a_renamed_field_or_owner_fails_stale_rather_than_silently_passing() {
-        let claim = claim_by_id("flash-limiter");
+        let claim = synth_claim("flash-limiter");
 
-        let root = copy_root("renamed-field", &claim_files(claim));
+        let root = base_root("renamed-field");
         mutate(
             &root,
-            "crates/aterm-gui/src/lib.rs",
-            "    fx: aterm_effects::pipeline::EffectsPipeline,\n",
-            "    effects: aterm_effects::pipeline::EffectsPipeline,\n",
+            "crates/host/src/lib.rs",
+            "    fx: EffectsPipeline,\n",
+            "    effects: EffectsPipeline,\n",
         );
         let out = run_one(&root, claim);
         assert!(!out.ok, "a renamed claimed field must go RED:\n{}", out.log);
@@ -1227,10 +1303,10 @@ mod tests {
             out.log
         );
 
-        let root = copy_root("renamed-owner", &claim_files(claim));
+        let root = base_root("renamed-owner");
         mutate(
             &root,
-            "crates/aterm-gui/src/lib.rs",
+            "crates/host/src/lib.rs",
             "struct WindowState {",
             "struct WindowShell {",
         );
@@ -1261,15 +1337,15 @@ mod tests {
 
     #[test]
     fn enum_variants_and_fn_parameters_are_not_owners() {
-        let claim = claim_by_id("flash-limiter");
-        let root = copy_root("false-positives", &claim_files(claim));
+        let claim = synth_claim("flash-limiter");
+        let root = base_root("false-positives");
         write_file(
             &root,
-            "crates/aterm-effects/src/calibration.rs",
+            "crates/engine/src/calibration.rs",
             "pub enum Owner {\n    WordDecorations = 21,\n}\n\
              pub enum SeriousEffect {\n    WordDecorations,\n}\n\
              fn which() -> SeriousEffect {\n    SeriousEffect::WordDecorations\n}\n\
-             pub fn drain(decos: &mut crate::word_decorations::WordDecorations, n: u32) {}\n\
+             pub fn drain(decos: &mut crate::enforcer::WordDecorations, n: u32) {}\n\
              impl WordDecorations {\n    fn len(&self) -> usize {\n        0\n    }\n}\n",
         );
         let out = run_one(&root, claim);
@@ -1283,18 +1359,18 @@ mod tests {
 
     #[test]
     fn the_supernova_aggregator_regression_goes_red() {
-        let root = copy_root("supernova", &all_claim_files());
+        let root = base_root("supernova");
 
-        let out = run_scope_census_over(&root, SCOPE_CLAIMS);
+        let out = run_scope_census_over(&root, SYNTH_CLAIMS);
         assert!(out.ok, "the aggregator must pass as written:\n{}", out.log);
 
         mutate(
             &root,
-            "crates/aterm-effects/src/word_decorations.rs",
-            "        for p in self.parked.values() {",
+            "crates/engine/src/enforcer.rs",
+            "        for p in &self.parked {",
             "        for p in std::iter::empty::<&ParkedPane>() {",
         );
-        let out = run_scope_census_over(&root, SCOPE_CLAIMS);
+        let out = run_scope_census_over(&root, SYNTH_CLAIMS);
         assert!(
             !out.ok,
             "a per-bound-pane scan must fail OB-15:\n{}",

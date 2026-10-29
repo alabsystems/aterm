@@ -261,6 +261,18 @@ fn only_a_path_refused_for_its_short_names_is_short_spelled() {
             &[][..],
         ),
         (
+            r"\\?\unc\srv\share\LONGNA~2\x",
+            r"\\?\unc\srv\share\",
+            r"\\?\UNC\srv\share\LONGNA~2",
+            &["x"][..],
+        ),
+        (
+            r"\??\unc\srv\share\LONGNA~2",
+            r"\??\unc\srv\share\",
+            r"\\?\UNC\srv\share\LONGNA~2",
+            &[][..],
+        ),
+        (
             r"C:\a\\b\AB12CD~1\x",
             r"C:\a\\b\",
             r"\\?\C:\a\b\AB12CD~1",
@@ -330,10 +342,17 @@ fn plain_drops_only_a_verbatim_drive_or_unc_prefix() {
         plain_of(r"\\?\UNC\srv\share\x"),
         PathBuf::from(r"\\srv\share\x")
     );
+    assert_eq!(
+        plain_of(r"\\?\unc\srv\share\x"),
+        PathBuf::from(r"\\srv\share\x")
+    );
     for kept in [
         r"\\?\Volume{6140fc3b-044f-43d7-b060-cb98170c7a63}\x",
         r"\\?\C:\a/b",
         r"\\?\GLOBALROOT\Device\x",
+        r"\\?\UNC\",
+        r"\\?\UNC\srv",
+        r"\\?\UNC\\srv\share",
         r"C:\Users\x",
         "/home/x",
     ] {

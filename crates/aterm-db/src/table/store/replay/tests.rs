@@ -4,7 +4,10 @@
 use super::*;
 use crate::{
     crypto::Causal,
-    table::{store::Store, tests::Lab},
+    table::{
+        store::{Store, WITNESS_AT},
+        tests::Lab,
+    },
 };
 use aterm_secrets::{
     client,
@@ -18,6 +21,116 @@ use std::path::PathBuf;
 
 mod closure;
 mod conflict;
+
+#[test]
+fn a_changed_observation_refuses_reads_until_a_new_witness_is_verified() {
+    let lab = Lab::new(&[Role::Writer]);
+    let root = aterm_tempfile::tempdir().unwrap();
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    let path = root.path().join("table");
+    let mut writer = Store::create(&session, &path).unwrap();
+    let scope = writer.scope();
+    writer.commit_catalog(&session, b"one").unwrap();
+    let observer = Store::observe(&session, &path, scope).unwrap();
+    let claim_path = writer.claim_dir.join(&writer.claim_name);
+    let before = std::fs::read(&claim_path).unwrap();
+    writer.commit_catalog(&session, b"two").unwrap();
+    let current = std::fs::read(&claim_path).unwrap();
+    assert!(observer.inventory(&session).err().unwrap().is_busy());
+    let fresh = Store::observe(&session, &path, scope).unwrap();
+    assert_eq!(fresh.inventory(&session).unwrap().count(), 2);
+
+    std::fs::write(&claim_path, &before).unwrap();
+    assert!(!fresh.inventory(&session).err().unwrap().is_busy());
+    assert!(!writer.inventory(&session).err().unwrap().is_busy());
+    let mut damaged = current.clone();
+    damaged[WITNESS_AT + 8] ^= 1;
+    std::fs::write(&claim_path, &damaged).unwrap();
+    assert!(!fresh.inventory(&session).err().unwrap().is_busy());
+    damaged = current.clone();
+    damaged[WITNESS_AT] ^= 1;
+    std::fs::write(&claim_path, &damaged).unwrap();
+    // A changed count invalidates the old handle; reopening must verify it,
+    // and this invented extension is a hard failure, never accepted data.
+    assert!(fresh.inventory(&session).err().unwrap().is_busy());
+    assert!(
+        !Store::observe(&session, &path, scope)
+            .err()
+            .unwrap()
+            .is_busy()
+    );
+    assert!(!writer.inventory(&session).err().unwrap().is_busy());
+    damaged = current.clone();
+    damaged[5] ^= 1;
+    std::fs::write(&claim_path, &damaged).unwrap();
+    assert!(!observer.inventory(&session).err().unwrap().is_busy());
+    std::fs::write(&claim_path, &current).unwrap();
+    assert_eq!(fresh.inventory(&session).unwrap().count(), 2);
+}
+
+#[test]
+fn an_observer_cannot_append_or_recover_an_unwitnessed_tail() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let root = aterm_tempfile::tempdir().unwrap();
+    let a = lab.bootstrap(0);
+    let b = lab.bootstrap(1);
+    let session = Session::open(&a).unwrap();
+    let peer_session = Session::open(&b).unwrap();
+    let path = root.path().join("table");
+    let mut held = Store::create(&session, &path).unwrap();
+    let scope = held.scope();
+    held.commit_catalog(&session, b"witnessed").unwrap();
+    let mut peer = Store::join(&peer_session, &root.path().join("peer"), scope).unwrap();
+    let receipt = peer.commit_catalog(&peer_session, b"unwitnessed").unwrap();
+    let wire = peer
+        .wire(&peer_session, &receipt.id)
+        .unwrap()
+        .unwrap()
+        .to_vec();
+
+    let mut observer = Store::observe(&session, &path, scope).unwrap();
+    assert!(observer.ingest(&session, &wire).is_err());
+    assert!(observer.commit_catalog(&session, b"forbidden").is_err());
+    assert!(observer.commit_liability(&session, b"forbidden").is_err());
+    assert_eq!(observer.inventory(&session).unwrap().count(), 1);
+    let claim_path = held.claim_dir.join(&held.claim_name);
+    let before_claim = std::fs::read(&claim_path).unwrap();
+    let mut body = receipt.received_ms.to_le_bytes().to_vec();
+    body.extend_from_slice(&wire);
+    held.log.as_mut().unwrap().append(SUBJECT, body).unwrap();
+    let before_log = std::fs::read(path.join("table.astream")).unwrap();
+    let before_checkpoint = std::fs::read(path.join("table.checkpoint")).unwrap();
+
+    let observer = Store::observe(&session, &path, scope).unwrap();
+    assert_eq!(observer.inventory(&session).unwrap().count(), 1);
+    assert_eq!(observer.witness.count, 1);
+    assert_eq!(std::fs::read(&claim_path).unwrap(), before_claim);
+    assert_eq!(
+        std::fs::read(path.join("table.astream")).unwrap(),
+        before_log
+    );
+    assert_eq!(
+        std::fs::read(path.join("table.checkpoint")).unwrap(),
+        before_checkpoint
+    );
+    drop((observer, held));
+    let repaired = Store::open(&session, &path, scope).unwrap();
+    assert_eq!(repaired.inventory(&session).unwrap().count(), 2);
+    assert_eq!(repaired.witness.count, 2);
+    drop(repaired);
+    let acknowledged = std::fs::read(path.join("table.astream")).unwrap();
+    let mut torn = acknowledged.clone();
+    torn.extend_from_slice(b"unacknowledged physical tail");
+    std::fs::write(path.join("table.astream"), &torn).unwrap();
+    let observer = Store::observe(&session, &path, scope).unwrap();
+    assert_eq!(observer.inventory(&session).unwrap().count(), 2);
+    assert_eq!(std::fs::read(path.join("table.astream")).unwrap(), torn);
+    drop(observer);
+    torn[acknowledged.len() - 1] ^= 1;
+    std::fs::write(path.join("table.astream"), &torn).unwrap();
+    assert!(Store::observe(&session, &path, scope).is_err());
+}
 
 struct Fixture {
     lab: Lab,
@@ -68,7 +181,7 @@ impl Fixture {
             if tail {
                 let mut body = receipt.received_ms.to_le_bytes().to_vec();
                 body.extend_from_slice(&wire);
-                store.log.append(SUBJECT, body).unwrap();
+                store.log.as_mut().unwrap().append(SUBJECT, body).unwrap();
             } else {
                 store.ingest(&session, &wire).unwrap();
             }
@@ -195,7 +308,7 @@ fn quarantine_transition(
     let a = f.lab.bootstrap(0);
     let session = Session::open(&a).unwrap();
     if action == "ChangedWitness" {
-        let claim_dir = super::super::claims(&session).unwrap();
+        let claim_dir = super::super::claim_dir(&session).unwrap();
         let path = claim_dir.join(format!(
             "{}.claim",
             aterm_codec::hex::encode_lower(&f.scope.digest())
@@ -265,6 +378,13 @@ fn quarantine_transition(
         "complete",
         i64::from(store.liability_evidence(&session).is_ok()),
     );
+    if next["complete"] == 0 {
+        assert!(
+            store
+                .commit_liability(&session, b"must preserve liabilities")
+                .is_err()
+        );
+    }
     next.insert("visible", store.catalog(&session).unwrap().len() as i64);
     if action != "RemoteDiscarded" {
         let before = store.catalog(&session).unwrap();
@@ -464,6 +584,11 @@ fn discarded_source_never_launders_a_selected_fork() {
     assert!(store.catalog(&session).unwrap().is_empty());
     assert_eq!(store.replication_inventory(&session).unwrap().count(), 0);
     assert!(store.liability_evidence(&session).is_err());
+    assert!(
+        store
+            .commit_liability(&session, b"must retain the fork")
+            .is_err()
+    );
     assert!(
         store
             .commit_catalog(&session, b"cannot resolve a fork by filtering")

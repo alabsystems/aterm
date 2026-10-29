@@ -23,8 +23,10 @@ pub enum Item {
     Inbox(Record),
     /// A `/f/<F>/pub/*/*/say/>` broadcast record.
     Say(Record),
-    /// A source ended at EOF or on a transport error.
+    /// aterm's push lane ended at EOF or on a transport error ([`Mailbox::push_aterm_closed`]).
     Closed(Source),
+    /// A broker source's reader ended, and how its read ended ([`End`]).
+    Lost(Source, End),
     /// The broker answered a subscription with an `Error` frame.
     Refused(Source, &'static str),
     /// A paused broker source drained to low water and can resubscribe from this offset.
@@ -32,6 +34,46 @@ pub enum Item {
     /// A GAP NOTICE on a broker source (astream R4's addendum A9): retention gave up records
     /// of its filter below the tail, taken in its place among the source's records.
     Gap(Source, astream_broker::Gap),
+}
+
+/// HOW A BROKER SUBSCRIPTION'S READ ENDED ([`Item::Lost`]), as its reader saw it. Only an end
+/// of file is the broker's word that it ended the stream; a live read deadline that passed is
+/// this end hearing nothing for that long, whichever side went quiet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum End {
+    /// End of file: the broker closed the stream.
+    Eof,
+    /// The live read deadline passed with nothing read (astream's `recv_live_event`: the
+    /// broker's idle marks re-arm it, so none reached the reader for this long).
+    Silent(Duration),
+    /// The read failed with an error of this kind.
+    Failed(std::io::ErrorKind),
+}
+
+impl End {
+    /// The end of a read that failed with `e` under the live read `deadline`: a timeout is
+    /// [`End::Silent`], any other error [`End::Failed`].
+    #[must_use]
+    pub fn of(e: &std::io::Error, deadline: Duration) -> Self {
+        match e.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => Self::Silent(deadline),
+            kind => Self::Failed(kind),
+        }
+    }
+
+    /// What ended the `face` subscription, as a log line's subject: a deadline as
+    /// `bridge::span_of` writes one, exact (`30 s`, `250 ms`).
+    #[must_use]
+    pub fn said(self, face: &str) -> String {
+        match self {
+            Self::Eof => format!("the broker ended the {face} subscription (end of file)"),
+            Self::Silent(deadline) => format!(
+                "the {face} subscription read nothing for {}, its live read deadline",
+                crate::bridge::span_of(u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX))
+            ),
+            Self::Failed(kind) => format!("the {face} subscription's read failed ({kind})"),
+        }
+    }
 }
 
 /// Outcome of pushing a broker record.
@@ -214,7 +256,7 @@ struct Queues {
     events_pushed: u64,
     inbox: Face,
     say: Face,
-    /// Closure notices, in arrival order: `Item::Closed` and `Item::Refused` only.
+    /// Closure notices, in arrival order: `Item::Closed`, `Item::Lost` and `Item::Refused` only.
     closed: VecDeque<Item>,
     /// Paused faces whose queue has drained: `Item::Resume`'s.
     resume: VecDeque<(Source, u64)>,
@@ -474,7 +516,7 @@ impl Queues {
         }
         self.resume.retain(|(face, _)| *face != s);
         self.closed.retain(|item| match item {
-            Item::Closed(face) | Item::Refused(face, _) => *face != s,
+            Item::Closed(face) | Item::Lost(face, _) | Item::Refused(face, _) => *face != s,
             _ => true,
         });
     }
@@ -642,9 +684,9 @@ impl Mailbox {
             .0
     }
 
-    /// Report that a broker reader ended at EOF or on a transport error.
-    pub fn push_closed(&self, s: Source, generation: u64) {
-        self.push_end(s, generation, Item::Closed(s));
+    /// Report that a broker reader ended, and how its read ended ([`Item::Lost`]).
+    pub fn push_lost(&self, s: Source, generation: u64, end: End) {
+        self.push_end(s, generation, Item::Lost(s, end));
     }
 
     /// Report that the broker refused a reader's subscription.
@@ -827,11 +869,11 @@ mod tests {
         assert_eq!(mb.push(Source::Say, rec(7), 0, t0()), Pushed::Queued);
         assert_eq!(mb.push(Source::Inbox, rec(4), 0, t0()), Pushed::Queued);
         assert_eq!(mb.push(Source::Fleet, rec(1), 0, t0()), Pushed::Queued);
-        mb.push_closed(Source::Inbox, 0);
+        mb.push_lost(Source::Inbox, 0, End::Eof);
         let mut seen = Vec::new();
         while let Some(item) = mb.take(Duration::from_millis(0), t0()) {
             seen.push(match item {
-                Item::Closed(_) | Item::Refused(..) => "closed",
+                Item::Closed(_) | Item::Lost(..) | Item::Refused(..) => "closed",
                 Item::Fleet(_) => "fleet",
                 Item::Resume(..) => "resume",
                 Item::Event(_) => "event",
@@ -1576,7 +1618,7 @@ mod tests {
         let _ = mb.push(Source::Say, rec(7), 0, t0());
         let _ = mb.push(Source::Inbox, rec(4), 0, t0());
         mb.push_event("EVENT 1 post 1".into());
-        mb.push_closed(Source::Fleet, 0);
+        mb.push_lost(Source::Fleet, 0, End::Eof);
         mb.push_refused(Source::Say, 0, "subscribe");
         let _ = mb.push(Source::Fleet, rec(1), 0, t0());
         let _ = mb.push(Source::Fleet, rec(2), 0, t0());
@@ -1584,7 +1626,7 @@ mod tests {
         while let Some(item) = mb.take_urgent() {
             urgent.push(match item {
                 Item::Fleet((off, _, _)) => format!("fleet {off}"),
-                Item::Closed(s) => format!("closed {s:?}"),
+                Item::Lost(s, _) => format!("closed {s:?}"),
                 Item::Refused(s, why) => format!("refused {s:?} {why}"),
                 other => panic!("not urgent: {other:?}"),
             });
@@ -1659,7 +1701,7 @@ mod tests {
         let _ = mb.push(Source::Fleet, rec(1), 0, t0());
         let _ = mb.push(Source::Inbox, rec(3), 0, t0());
         mb.push_event("EVENT 1 post 1".into());
-        mb.push_closed(Source::Inbox, 0);
+        mb.push_lost(Source::Inbox, 0, End::Eof);
         mb.push_refused(Source::Fleet, 0, "subscribe");
         mb.push_aterm_closed();
         mb.reset_broker_sources();
@@ -1672,7 +1714,7 @@ mod tests {
         while let Some(item) = mb.take(Duration::from_millis(0), t0()) {
             seen.push(match item {
                 Item::Closed(Source::Aterm) => "closed-aterm",
-                Item::Closed(_) | Item::Refused(..) => "closed-broker",
+                Item::Closed(_) | Item::Lost(..) | Item::Refused(..) => "closed-broker",
                 Item::Fleet(_) => "fleet",
                 Item::Resume(..) => "resume",
                 Item::Event(_) => "event",
@@ -1696,7 +1738,7 @@ mod tests {
         let fresh = mb.broker_generation(Source::Fleet);
         assert_ne!(stale, fresh, "a reconnect moves the generation");
 
-        mb.push_closed(Source::Fleet, stale);
+        mb.push_lost(Source::Fleet, stale, End::Eof);
         mb.push_refused(Source::Inbox, stale, "subscribe");
         assert_eq!(mb.push(Source::Inbox, rec(2), stale, t0()), Pushed::Stale);
         assert_eq!(mb.push(Source::Fleet, rec(3), stale, t0()), Pushed::Stale);
@@ -1705,21 +1747,21 @@ mod tests {
             "nothing from the previous incarnation may reach the fresh loop"
         );
 
-        mb.push_closed(Source::Fleet, fresh);
+        mb.push_lost(Source::Fleet, fresh, End::Eof);
         assert!(matches!(
             mb.take(Duration::from_millis(0), t0()),
-            Some(Item::Closed(Source::Fleet))
+            Some(Item::Lost(Source::Fleet, End::Eof))
         ));
 
         let say = mb.broker_generation(Source::Say);
         let inbox = mb.broker_generation(Source::Inbox);
         assert_eq!(mb.push(Source::Say, rec(4), say, t0()), Pushed::Queued);
-        mb.push_closed(Source::Say, say);
+        mb.push_lost(Source::Say, say, End::Eof);
         mb.reset_source(Source::Say);
         assert_ne!(mb.broker_generation(Source::Say), say);
         assert_eq!(mb.broker_generation(Source::Inbox), inbox);
         assert_eq!(mb.push(Source::Say, rec(5), say, t0()), Pushed::Stale);
-        mb.push_closed(Source::Say, say);
+        mb.push_lost(Source::Say, say, End::Eof);
         assert_eq!(mb.push(Source::Inbox, rec(6), inbox, t0()), Pushed::Queued);
         assert!(matches!(
             mb.take(Duration::ZERO, t0()),

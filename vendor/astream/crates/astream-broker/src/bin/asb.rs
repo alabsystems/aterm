@@ -262,14 +262,14 @@ mod capfile;
 const USAGE: &str = "usage: asb serve  <endpoint> [log] [--tcp] [--key-env NAME | --key-file PATH] [--handshake]
                   [--secret-env NAME | --secret-file PATH] [--revocation-file PATH] [--unix SOCKET] [--allow-remote]
                   [--at-rest-key-env NAME | --at-rest-key-file PATH] [--anti-rollback | --anti-rollback-init]
-                  [--durability strict|ordered|relaxed] [--horizon-ms N] [--health-ms N]
+                  [--durability strict|ordered|relaxed] [--horizon-ms N] [--health-ms N] [--rate-limit SPEC]
                   [--retain-file PATH] [--retention-interval-ms N]
                   [--max-retained-records N] [--max-retained-bytes N]
        asb serve  [log] --listen <scheme>:<addr>... [--key-env NAME | --key-file PATH]
                   [--host-key-file PATH --allow-peer-file PATH...] [--allow-plaintext] [--allow-remote]
                   [--secret-env NAME | --secret-file PATH] [--revocation-file PATH]
                   [--at-rest-key-env NAME | --at-rest-key-file PATH] [--anti-rollback | --anti-rollback-init]
-                  [--durability strict|ordered|relaxed] [--horizon-ms N] [--health-ms N]
+                  [--durability strict|ordered|relaxed] [--horizon-ms N] [--health-ms N] [--rate-limit SPEC]
                   [--retain-file PATH] [--retention-interval-ms N]
                   [--max-retained-records N] [--max-retained-bytes N]
        asb pub    <endpoint> <subject> [--id N] [--seq M | --seq-file PATH] <transport> <cap>
@@ -311,6 +311,8 @@ const USAGE: &str = "usage: asb serve  <endpoint> [log] [--tcp] [--key-env NAME 
                                     exit 1 when no current snapshot exists
   --health-ms N:                    serve: rewrite the health sidecar `<log>.health` every N ms (default 2000), and
                                     at once when the log is poisoned
+  --rate-limit SPEC:                serve: per-principal / per-producer monotone token-bucket publish rate limit
+                                    (`<records_per_sec>[:<burst>][,<bytes_per_sec>[:<burst_bytes>]]`)
   --revocation-file PATH:           load revoked 64-hex Ed25519 keys or capability principals at `serve` startup
                                     and on Apple targets reload on `SIGHUP` (fail-closed on malformed edits)
   --key-env NAME / --key-file PATH: 64 hex chars (32-byte PSK) for the XChaCha20-Poly1305-sealed TCP transport
@@ -1102,6 +1104,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--durability",
     "--horizon-ms",
     "--health-ms",
+    "--rate-limit",
     "--max-retained-records",
     "--max-retained-bytes",
     "--retain-file",
@@ -2208,6 +2211,16 @@ fn serve_durability(cli: &Cli) -> Result<Durability, u8> {
     )))
 }
 
+fn serve_rate_limit(cli: &Cli) -> Result<Option<astream_broker::RateLimit>, u8> {
+    let Some(spec) = cli.kv.get("--rate-limit") else {
+        return Ok(None);
+    };
+    match astream_broker::RateLimit::parse(spec) {
+        Ok(lim) => Ok(Some(lim)),
+        Err(msg) => Err(usage_error(&format!("--rate-limit {spec:?}: {msg}"))),
+    }
+}
+
 /// A tier's name on the command line and in `serve`'s stderr.
 fn tier_word(tier: astream_broker::Tier) -> &'static str {
     match tier {
@@ -2898,6 +2911,7 @@ fn cmd_serve_multi(cli: &Cli) -> Result<(), AsbErr> {
         )));
     }
     let durability = serve_durability(cli)?;
+    let rate_limit = serve_rate_limit(cli)?;
     let (at_rest_src, anti_rollback) = validate_serve_at_rest(cli, durability)?;
     if has_unix && cfg!(not(unix)) {
         return Err(AsbErr::Exit(fail_exit(
@@ -3012,6 +3026,12 @@ fn cmd_serve_multi(cli: &Cli) -> Result<(), AsbErr> {
                 2,
                 &format!("--revocation-file {rev_path}: {e}"),
             )));
+        }
+    }
+    if let Some(lim) = rate_limit {
+        if let Err(e) = broker.set_rate_limit(Some(lim)) {
+            discard_created_log(&log, created_here, broker);
+            return Err(AsbErr::Exit(fail_exit(2, &format!("--rate-limit: {e}"))));
         }
     }
     let mut handles: Vec<BrokerHandle> = Vec::new();
@@ -3134,6 +3154,7 @@ fn cmd_serve(cli: &Cli) -> Result<(), AsbErr> {
             "--durability",
             "--horizon-ms",
             "--health-ms",
+            "--rate-limit",
             "--max-retained-records",
             "--max-retained-bytes",
             "--retain-file",
@@ -3220,6 +3241,7 @@ fn cmd_serve(cli: &Cli) -> Result<(), AsbErr> {
         )));
     }
     let durability = serve_durability(cli)?;
+    let rate_limit = serve_rate_limit(cli)?;
     let (at_rest_src, anti_rollback) = validate_serve_at_rest(cli, durability)?;
     if tcp {
         match is_loopback_endpoint(&ep) {
@@ -3292,6 +3314,12 @@ fn cmd_serve(cli: &Cli) -> Result<(), AsbErr> {
                 2,
                 &format!("--revocation-file {rev_path}: {e}"),
             )));
+        }
+    }
+    if let Some(lim) = rate_limit {
+        if let Err(e) = broker.set_rate_limit(Some(lim)) {
+            discard_created_log(&log, created_here, broker);
+            return Err(AsbErr::Exit(fail_exit(2, &format!("--rate-limit: {e}"))));
         }
     }
     let served = match transport {

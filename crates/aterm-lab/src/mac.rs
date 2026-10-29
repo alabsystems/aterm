@@ -68,6 +68,12 @@ pub(crate) const GUEST_AGENT: &str = "/opt/homebrew/bin/tart-guest-agent";
 /// event-post grants name.
 pub(crate) const PERSON_HELPER: &str = "/usr/local/libexec/aterm-lab-guest";
 
+/// The code identifier the guest helper is signed with (ad hoc), and the one thing a person base's
+/// grants require of it: each run puts its own build at [`PERSON_HELPER`] signed with it
+/// ([`person_install`]), so a new build keeps the base. A designated requirement would name the
+/// build's cdhash, which every checkout's build changes (its debug info names the build folder).
+pub(crate) const PERSON_ID: &str = "aterm-lab-guest";
+
 /// What a prepared base holds besides SIP on ([`prepared_base_with`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Prep {
@@ -77,22 +83,22 @@ pub(crate) struct Prep {
     /// `xcode-select -p` fails.
     pub no_clt: bool,
     /// The guest helper put at [`PERSON_HELPER`] and granted Accessibility and the event-post
-    /// grant: its file in the share, and the digest the base's name carries (a new helper makes a
-    /// new base).
-    pub person: Option<(String, String)>,
+    /// grant by its identifier ([`PERSON_ID`]): its file in the share.
+    pub person: Option<String>,
 }
 
 /// The name of the prepared base for `image` and `prep`: [`base_name`], then `-noclt` and
-/// `-person-<digest>` as `prep` asks.
+/// `-personid` (grants that require [`PERSON_ID`]) as `prep` asks. Not `-person-<…>`: a lab from
+/// before identifier grants named its base `-person-<digest>` and deletes every other base under
+/// that prefix when it prepares its own.
 #[must_use]
 pub(crate) fn prep_name(image: &str, prep: &Prep) -> String {
     let mut name = base_name(image, prep.fda);
     if prep.no_clt {
         name.push_str("-noclt");
     }
-    if let Some((_, digest)) = &prep.person {
-        name.push_str("-person-");
-        name.push_str(digest);
+    if prep.person.is_some() {
+        name.push_str("-personid");
     }
     name
 }
@@ -734,7 +740,7 @@ pub(crate) fn prepared_base_with(
             vm.sh(&fda_grant(), STEP)?;
             println!("mac: Full Disk Access granted to the guest agent");
         }
-        if let Some((helper, _)) = &prep.person {
+        if let Some(helper) = &prep.person {
             vm.sh(&person_grant(helper), STEP)?;
             println!(
                 "mac: the guest helper at {PERSON_HELPER} granted Accessibility and event posting"
@@ -979,28 +985,52 @@ pub(crate) fn desktop_read(vm: &Vm, tccd_log: &str) -> Result<bool, Fail> {
     Ok(ended.is_some_and(|status| status.success()))
 }
 
-/// The guest helper copied from the share's `helper` to [`PERSON_HELPER`] and granted, by its
-/// designated requirement, Accessibility (to read a dialog's controls) and event posting (to post
-/// the HID events that press them): rows in the TCC database, written while SIP is off.
-fn person_grant(helper: &str) -> String {
+/// The `sed -n` program that keeps the requirement from `codesign -d -r-`'s `designated => <req>`
+/// line, which macOS 27 prints as `# designated => cdhash H"…"` for an implicit one (an ad hoc or
+/// linker-signed binary's, as the guest helper and agent are).
+const DESIGNATED: &str = "s/^#* *designated => //p";
+
+/// Put the guest helper at `from` (a guest path) at [`PERSON_HELPER`], signed ad hoc with
+/// [`PERSON_ID`]: what a person base's grants require of it. The script runs as the image's
+/// administrator, whose `sudo` needs no password.
+#[must_use]
+pub(crate) fn person_install(from: &str) -> String {
     format!(
-        "set -e; sudo -n mkdir -p {dir}; sudo -n cp '{GUEST_SHARE}/{helper}' {PERSON_HELPER}; sudo -n chmod 755 {PERSON_HELPER}; \
-         codesign -d -r- {PERSON_HELPER} 2>&1 | sed -n 's/^designated => //p' | csreq -r- -b /tmp/person.csreq; \
-         hex=$(xxd -p /tmp/person.csreq | tr -d '\\n'); \
-         for s in kTCCServiceAccessibility kTCCServicePostEvent; do \
-         sudo -n sqlite3 '/Library/Application Support/com.apple.TCC/TCC.db' \
-         \"INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,csreq,flags) \
-         VALUES ('$s','{PERSON_HELPER}',1,2,4,1,X'$hex',0);\"; done",
+        "set -e; sudo -n mkdir -p {dir}; sudo -n cp '{from}' {PERSON_HELPER}; sudo -n chmod 755 {PERSON_HELPER}; \
+         sudo -n codesign --force --sign - --identifier {PERSON_ID} {PERSON_HELPER}",
         dir = PERSON_HELPER
             .rsplit_once('/')
             .map_or("/usr/local/libexec", |(d, _)| d),
     )
 }
 
+/// The code requirement a person base's grants name: the helper's identifier alone.
+fn person_requirement() -> String {
+    format!("identifier \"{PERSON_ID}\"")
+}
+
+/// The guest helper copied from the share's `helper` to [`PERSON_HELPER`] ([`person_install`])
+/// and granted, by its identifier ([`person_requirement`]), Accessibility (to read a dialog's
+/// controls) and event posting (to post the HID events that press them): rows in the TCC
+/// database, written while SIP is off.
+fn person_grant(helper: &str) -> String {
+    format!(
+        "{install}; \
+         echo '{requirement}' | csreq -r- -b /tmp/person.csreq; \
+         hex=$(xxd -p /tmp/person.csreq | tr -d '\\n'); \
+         for s in kTCCServiceAccessibility kTCCServicePostEvent; do \
+         sudo -n sqlite3 '/Library/Application Support/com.apple.TCC/TCC.db' \
+         \"INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,csreq,flags) \
+         VALUES ('$s','{PERSON_HELPER}',1,2,4,1,X'$hex',0);\"; done",
+        install = person_install(&format!("{GUEST_SHARE}/{helper}")),
+        requirement = person_requirement(),
+    )
+}
+
 fn fda_grant() -> String {
     format!(
         "set -e; a=$(readlink -f {GUEST_AGENT}); \
-         codesign -d -r- \"$a\" 2>&1 | sed -n 's/^designated => //p' | csreq -r- -b /tmp/agent.csreq; \
+         codesign -d -r- \"$a\" 2>&1 | sed -n '{DESIGNATED}' | csreq -r- -b /tmp/agent.csreq; \
          hex=$(xxd -p /tmp/agent.csreq | tr -d '\\n'); \
          sudo -n sqlite3 '/Library/Application Support/com.apple.TCC/TCC.db' \
          \"INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,csreq,flags) \
@@ -1219,6 +1249,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_grants_read_an_implicit_designated_requirement_too() {
+        use std::io::Write as _;
+        // codesign -d -r- on macOS 27: a linker-signed helper's line, then a Developer ID one's.
+        let shown = "Executable=/usr/local/libexec/aterm-lab-guest\n\
+                     # designated => cdhash H\"c5f7083cddd57a1d4bb8f57a1b55c34fc41b84a2\"\n\
+                     designated => identifier \"x\" and anchor apple generic\n";
+        let mut sed = aterm_uds::spawnfd::command("/usr/bin/sed")
+            .args(["-n", DESIGNATED])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        sed.stdin
+            .take()
+            .unwrap()
+            .write_all(shown.as_bytes())
+            .unwrap();
+        let out = sed.wait_with_output().unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "cdhash H\"c5f7083cddd57a1d4bb8f57a1b55c34fc41b84a2\"\n\
+             identifier \"x\" and anchor apple generic\n"
+        );
+    }
+
+    #[test]
+    fn every_build_of_the_helper_signed_with_its_identifier_meets_the_grants_requirement() {
+        // Two builds differ in their bytes, so in their cdhash; each, signed ad hoc with PERSON_ID
+        // as person_install signs it, meets the requirement the base's grants name. One signed with
+        // another identifier does not. Neither copy is ever run.
+        let tmp = aterm_tempfile::tempdir().expect("a scratch dir");
+        let meets = |build: &str, id: &str| {
+            let copy = tmp.path().join(format!("{id}-{}", build.replace('/', "-")));
+            std::fs::copy(build, &copy).unwrap();
+            let signed = aterm_uds::spawnfd::command("/usr/bin/codesign")
+                .args(["--force", "--sign", "-", "--identifier", id])
+                .arg(&copy)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(signed.status.success(), "{signed:?}");
+            aterm_uds::spawnfd::command("/usr/bin/codesign")
+                .args(["--verify", &format!("-R={}", person_requirement())])
+                .arg(&copy)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        assert!(meets("/usr/bin/true", PERSON_ID));
+        assert!(meets("/usr/bin/false", PERSON_ID));
+        assert!(!meets("/usr/bin/true", "aterm-lab-other"));
+    }
+
+    #[test]
     fn tart_is_the_named_one_alone_else_homebrews_else_the_fetched_one() {
         let none = |_: &str| false;
         let all = |_: &str| true;
@@ -1262,6 +1349,32 @@ mod tests {
             None
         );
         assert_eq!(signing_team("Identifier=x\n"), None);
+    }
+
+    #[test]
+    fn a_person_base_is_out_of_reach_of_an_older_labs_sweep() {
+        // A lab from before identifier grants deletes every `<kind>-person-…` base but its own when
+        // it prepares one; this lab's base must not be among them, or an older checkout's lab
+        // deletes it each time it prepares its own.
+        for no_clt in [false, true] {
+            let kind = prep_name(
+                IMAGE,
+                &Prep {
+                    no_clt,
+                    ..Prep::default()
+                },
+            );
+            let person = prep_name(
+                IMAGE,
+                &Prep {
+                    no_clt,
+                    person: Some("aterm-lab-guest".to_owned()),
+                    ..Prep::default()
+                },
+            );
+            assert!(person.starts_with(&kind), "{person}");
+            assert!(!person.starts_with(&format!("{kind}-person-")), "{person}");
+        }
     }
 
     #[test]

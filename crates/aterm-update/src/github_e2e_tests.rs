@@ -6,7 +6,7 @@
 use super::*;
 
 const PROBE_DIR: &str = "ATERM_TEST_CHECK_E2E_DIR";
-const PROBE: &str = "github::tests::e2e::probe_one_check_over_real_curl";
+const PROBE: &str = "github::tests::e2e::a_check_over_real_curl_stages_a_release_whose_container_transfer_goes_silent";
 
 const RUNNING: u64 = 10;
 const BUILD: u64 = 20;
@@ -42,10 +42,9 @@ fn e2e_staging(dir: &std::path::Path) -> Staging {
     }
 }
 
-#[test]
-fn probe_one_check_over_real_curl() {
+fn probe_one_check_over_real_curl_if_asked() -> bool {
     let Some(dir) = std::env::var_os(PROBE_DIR) else {
-        return;
+        return false;
     };
     let dir = std::path::PathBuf::from(dir);
     let installed_parent = dir.join("Applications");
@@ -67,6 +66,7 @@ fn probe_one_check_over_real_curl() {
     std::fs::write(&pending, said).unwrap();
     std::fs::rename(pending, dir.join("said")).unwrap();
     std::thread::sleep(HANG);
+    true
 }
 
 fn stand_in_app(dir: &std::path::Path) -> std::path::PathBuf {
@@ -265,8 +265,53 @@ fn serve(listener: std::net::TcpListener, assets: Vec<(String, Vec<u8>)>, seen: 
     });
 }
 
+fn assert_staged_and_seen(world: &std::path::Path, seen: &[(String, String, String)]) {
+    let staging = e2e_staging(world);
+    let ready = Ready::read_publishable(&staging).expect("the stage published its ready marker");
+    assert_eq!(ready.build_number, BUILD);
+    let plist = std::fs::read_to_string(staging.staged_app.join("Contents/Info.plist")).unwrap();
+    assert!(
+        plist.contains(&format!("<string>{BUILD}</string>")),
+        "the staged bundle is the release's: {plist}"
+    );
+    let status = std::fs::read_to_string(&staging.status).unwrap();
+    assert!(
+        status.contains(&format!("staged {VERSION} (build {BUILD})")),
+        "the ledger says what was staged: {status}"
+    );
+
+    let evergreen = "/alabsystems/aterm/releases/latest/download/aterm-appcast.toml";
+    assert_eq!(seen[0].0, "HEAD", "{seen:?}");
+    assert_eq!(seen[0].1, evergreen, "{seen:?}");
+    assert_eq!(
+        seen.iter().filter(|(_, path, _)| path == evergreen).count(),
+        1,
+        "{seen:?}"
+    );
+    let prefix = format!("/alabsystems/aterm/releases/download/{TAG}/");
+    assert!(
+        seen[1..]
+            .iter()
+            .all(|(_, path, _)| path.starts_with(&prefix)),
+        "{seen:?}"
+    );
+    let container: Vec<&str> = seen
+        .iter()
+        .filter(|(method, path, _)| method == "GET" && path.ends_with("-mac.zip"))
+        .map(|(_, _, range)| range.as_str())
+        .collect();
+    assert_eq!(
+        container,
+        ["none".to_string(), format!("bytes={HOLD_AT}-")],
+        "{seen:?}"
+    );
+}
+
 #[test]
 fn a_check_over_real_curl_stages_a_release_whose_container_transfer_goes_silent() {
+    if probe_one_check_over_real_curl_if_asked() {
+        return;
+    }
     use std::os::unix::fs::PermissionsExt as _;
     let dir = aterm_tempfile::tempdir().unwrap();
     let release = dir.path().join("release");
@@ -330,44 +375,5 @@ fn a_check_over_real_curl_stages_a_release_whose_container_transfer_goes_silent(
         format!("Ok(Some({VERSION:?}))"),
         "the check stages the release within the hang detector; the host saw {seen:?}"
     );
-
-    let staging = e2e_staging(&world);
-    let ready = Ready::read_publishable(&staging).expect("the stage published its ready marker");
-    assert_eq!(ready.build_number, BUILD);
-    let plist = std::fs::read_to_string(staging.staged_app.join("Contents/Info.plist")).unwrap();
-    assert!(
-        plist.contains(&format!("<string>{BUILD}</string>")),
-        "the staged bundle is the release's: {plist}"
-    );
-    let status = std::fs::read_to_string(&staging.status).unwrap();
-    assert!(
-        status.contains(&format!("staged {VERSION} (build {BUILD})")),
-        "the ledger says what was staged: {status}"
-    );
-
-    let evergreen = "/alabsystems/aterm/releases/latest/download/aterm-appcast.toml";
-    assert_eq!(seen[0].0, "HEAD", "{seen:?}");
-    assert_eq!(seen[0].1, evergreen, "{seen:?}");
-    assert_eq!(
-        seen.iter().filter(|(_, path, _)| path == evergreen).count(),
-        1,
-        "{seen:?}"
-    );
-    let prefix = format!("/alabsystems/aterm/releases/download/{TAG}/");
-    assert!(
-        seen[1..]
-            .iter()
-            .all(|(_, path, _)| path.starts_with(&prefix)),
-        "{seen:?}"
-    );
-    let container: Vec<&str> = seen
-        .iter()
-        .filter(|(method, path, _)| method == "GET" && path.ends_with("-mac.zip"))
-        .map(|(_, _, range)| range.as_str())
-        .collect();
-    assert_eq!(
-        container,
-        ["none".to_string(), format!("bytes={HOLD_AT}-")],
-        "{seen:?}"
-    );
+    assert_staged_and_seen(&world, &seen);
 }

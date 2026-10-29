@@ -31,27 +31,36 @@ pub struct JournalImage {
 }
 
 impl Log {
-    /// Returns the session's open record and each open node's open record, outermost first.
+    /// Returns the session's open record and each open node's open record, outermost first, each
+    /// followed by the amends that ride it ([`super::rides_open`]), oldest first: a snap restates
+    /// what the fold shows of each node it restates, never an open without it (fix unit H4).
     #[must_use]
     pub fn open_path_records(&self) -> Vec<Rec> {
-        let mut out: Vec<Rec> = self
+        let ride = self.riders();
+        let with_riders = |o: usize, out: &mut Vec<Rec>| {
+            let riders = self.ring.iter().zip(&ride).filter(|(_, r)| **r == Some(o));
+            out.extend(riders.map(|(e, _)| Rec::clone(&e.rec)));
+        };
+        let mut out: Vec<Rec> = Vec::new();
+        if let Some(i) = self
             .ring
             .iter()
-            .find(|e| e.rec.node == Node::SESSION && e.rec.op == Op::Open)
-            .map(|e| Rec::clone(&e.rec))
-            .into_iter()
-            .collect();
+            .position(|e| e.rec.node == Node::SESSION && e.rec.op == Op::Open)
+        {
+            out.extend(self.ring.get(i).map(|e| Rec::clone(&e.rec)));
+            with_riders(i, &mut out);
+        }
         if self.session_closed {
             return out;
         }
         for o in &self.open {
-            if let Some(e) = self
+            if let Some(i) = self
                 .ring
                 .iter()
-                .rev()
-                .find(|e| e.rec.node == o.node && e.rec.op == Op::Open)
+                .rposition(|e| e.rec.node == o.node && e.rec.op == Op::Open)
             {
-                out.push(Rec::clone(&e.rec));
+                out.extend(self.ring.get(i).map(|e| Rec::clone(&e.rec)));
+                with_riders(i, &mut out);
             }
         }
         out

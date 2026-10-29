@@ -118,14 +118,19 @@ The tests deleted since have no row.
 file	test	primary	also
 src/tests.rs	rle_set_single_element	rle-set	
 src/tests.rs	rle_set_range_cases	rle-set-range	
+src/tests.rs	local_compaction_observations_refine_the_derived_model	rle-set-range	rle-inv
 src/tests.rs	rle_run_structure_consistent_across_mutations	rle-inv	rle-find-run, rle-set, rle-set-range, rle-resize
+src/tests.rs	rle_const_helpers_invariants	rle-observers	rle-extend-clamped, rle-try-extend, rle-set, rle-set-range
 src/tests_exhaustive.rs	rle_index_trait_valid_access	rle-get-index	
-src/tests_exhaustive.rs	rle_index_trait_oob_panics	rle-get-index	(pins a std panic message, §5)
+src/tests_exhaustive.rs	rle_index_trait_oob_panics	rle-get-index	
 src/tests_exhaustive.rs	rle_exact_size_iter_after_partial_iteration	rle-iter	
+src/tests_exhaustive.rs	rle_set_range_exhaustive	rle-set-range	rle-inv
+src/tests_saturation.rs	extend_and_push_clamp_to_the_remaining_capacity	rle-extend-clamped	rle-observers, rle-inv
+src/tests_saturation.rs	try_forms_take_a_whole_request_or_change_nothing	rle-try-extend	rle-inv
 src/tests_saturation.rs	post_clamp_mutations_preserve_invariant	rle-inv	rle-set, rle-set-range, rle-resize, rle-no-panic
 src/tests_exhaustive.rs	rle_set_correctness_exhaustive	rle-set	rle-inv
 src/tests_performance.rs	rle_set_well_compressed_is_constant	rle-find-run-cost	
-src/tests_performance.rs	rle_set_range_linear_in_runs	NON-SPEC (ratio band)	
+src/tests_performance.rs	rle_set_range_linear_in_runs	rle-find-run-cost	
 tests/fuzz_rle.rs	fuzz_rle_mutators_never_panic	rle-no-panic	rle-inv
 ```
 
@@ -141,10 +146,8 @@ tests/fuzz_rle.rs	fuzz_rle_mutators_never_panic	rle-no-panic	rle-inv
 ## 4. Tests that are not spec samples
 
 > Status 2026-10-15: `rle_set_individual_cost_scales_with_run_count` deleted.
-
-| test | why | recommendation |
-|---|---|---|
-| tests_performance::rle_set_range_linear_in_runs | A ratio band: `2 < iters(4000 runs)/iters(1000 runs) < 8`. A growth-rate band, not a property. If a `set_range` cost spec is wanted, it is an exact count (find_run iterations + `end_run_idx − start_run_idx + 1` in `split_range_multi_run` + `runs.len() − 1` in `compact`), added to `rle-find-run-cost`. | **delete** |
+>
+> Status 2026-10-28: `tests_performance::rle_set_range_linear_in_runs` was rewritten (§5.2) to assert exact `count_run_iteration()` counts rather than a growth-rate ratio band, so 0 non-spec tests remain.
 
 Once `rle-find-run-cost` is proved over a ghost counter and its tests are deleted, the
 `#[cfg(test)]` `iteration_counter` module in `src/lib.rs` (and the `count_run_iteration()` calls in
@@ -152,20 +155,16 @@ Once `rle-find-run-cost` is proved over a ghost counter and its tests are delete
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **The fuzz checks less than it claims.** In `tests/fuzz_rle.rs::assert_invariant` (used by the
-   fuzz test) the comment says "No zero-length runs should accumulate", but the code under it checks
-   `remaining_capacity == MAX − len`, not `run.length > 0`. The fuzz never checks zero-length runs or
-   adjacent equal runs, so it samples only the sum part of `Inv`. The file header's "This fuzz proves
-   that invariant" overstates what a 120k-sample LCG run shows.
-2. **A module doc overclaims.** The `tests_performance` module doc calls its tests "Performance
-   scaling proofs", but ratio bands prove nothing.
-3. **A code comment cites a test as the proof.** `src/lib.rs::checked_run_length_sum` says the
-   invariant is "checked by tests/fuzz_rle.rs". That goes stale once `rle-inv` is proved and the fuzz
-   is deleted; it should cite the spec.
-4. **A test pins a std panic message.** `tests_exhaustive::rle_index_trait_oob_panics` uses
-   `should_panic(expected = "index out of bounds")`, which is the std slice-bounds message reached
-   through `runs[runs.len()]` (the `unwrap_or` fallback in `Index::index`), not an `Rle`-owned
-   message. The spec is "panics iff index ≥ len"; the message text is incidental.
+1. *(Resolved)* **`tests/fuzz_rle.rs::assert_invariant` now checks the full `Inv(r)` invariant**
+   (`run.length > 0`, `w[0].value != w[1].value`, `u64` sum `<= u32::MAX`, `rle.len() == sum`, and
+   `remaining_capacity == u32::MAX - len`).
+2. *(Resolved)* **`tests_performance` module doc and `rle_set_range_linear_in_runs` now check exact
+   `count_run_iteration()` counts** (`1` on a uniform run, `(start + 1) + end + (end - start)` across
+   unit-length runs via `compact_around`) rather than ratio bands.
+3. *(Resolved)* **`src/lib.rs::checked_run_length_sum` states the `total_length <= u32::MAX` invariant
+   directly** without citing a test file.
+4. *(Resolved)* **`tests_exhaustive::rle_index_trait_oob_panics` uses bare `#[should_panic]`** without
+   pinning `core::slice`'s panic message text.
 
 ## 6. The specs I would prove first (easiest, high value)
 

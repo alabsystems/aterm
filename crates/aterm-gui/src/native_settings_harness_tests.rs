@@ -489,6 +489,8 @@ fn the_harness_route_renders_its_cards_and_controls() {
         fact: fact.to_string(),
         path: None,
         version,
+        offers_fix: true,
+        mend: None,
     };
     observed.ai.reading = Some(crate::ai_screen::AiReading {
         as_of: 1_000_000,
@@ -2642,18 +2644,20 @@ fn tab_controls_summary_keeps_its_labels_whole_at_large_type() {
             id: "local".to_string(),
             name: "MacBook-Pro (this Mac)".to_string(),
             address: "local".to_string(),
-            os_version: "macos".to_string(),
+            os_version: Some("macos".to_string()),
             status: "online".to_string(),
             vitals: "CPU 14% \u{b7} GPU 6% \u{b7} RAM 38.2/128.0 GiB (30%) \u{b7} Disk 1.12/7.28 \
                      TiB (15%) \u{b7} up 5d 11h"
                 .to_string(),
-            instances: 1,
-            tabs: 2,
-            ai_clis: 1,
-            active_ai: 1,
+            instances: Some(1),
+            tabs: Some(2),
+            ai_clis: Some(1),
+            active_ai: Some(1),
+            session_scope: Default::default(),
         }],
         tabs: Vec::new(),
         fleet: crate::harness_screen::FleetScope::Account,
+        lan_waits: None,
     };
     at_each_text_scale(&[1.0, 2.0], "Tab Control's summary", |scale| {
         for (width, height) in [(504.0, 628.0), (924.0, 640.0)] {
@@ -3254,30 +3258,33 @@ fn tab_control_route_renders_computers_sessions_and_live_ai_cli_status() {
                 id: "local".to_string(),
                 name: "MacBook-Pro (this Mac)".to_string(),
                 address: "local".to_string(),
-                os_version: "macos".to_string(),
+                os_version: Some("macos".to_string()),
                 status: "online".to_string(),
                 vitals: "CPU 14% ▂▂▃▂ · GPU 6% ▁▁▂▁ · RAM 38.2/128.0 GiB (30%) · Disk 1.12/7.28 TiB (15%) · up 5d 11h".to_string(),
-                instances: 1,
-                tabs: 2,
-                ai_clis: 1,
-                active_ai: 1,
+                instances: Some(1),
+                tabs: Some(2),
+                ai_clis: Some(1),
+                active_ai: Some(1),
+                session_scope: Default::default(),
             },
             TabComputer {
                 id: "studio-m4".to_string(),
                 name: "studio-m4".to_string(),
                 address: "192.168.1.42".to_string(),
-                os_version: "macOS 15.4".to_string(),
+                os_version: Some("macOS 15.4".to_string()),
                 status: "online".to_string(),
                 vitals: String::new(),
-                instances: 1,
-                tabs: 1,
-                ai_clis: 1,
-                active_ai: 0,
+                instances: Some(1),
+                tabs: Some(1),
+                ai_clis: Some(1),
+                active_ai: Some(0),
+                session_scope: Default::default(),
             },
         ],
         tabs: vec![
             TabSpreadsheetRow {
                 key: "local/7".to_string(),
+                computer_id: "local".into(),
                 computer: "this Mac".to_string(),
                 instance: "this aterm (pid 1000)".to_string(),
                 place: "Tab 2".to_string(),
@@ -3286,14 +3293,17 @@ fn tab_control_route_renders_computers_sessions_and_live_ai_cli_status() {
                 state: "Running".to_string(),
                 program: "Claude Code".to_string(),
                 is_ai_cli: true,
+                active_ai: Some(true),
                 ai_status: "working: Bash · targo test (14s)".to_string(),
                 autopilot: "land (supervised)".to_string(),
                 human: "12s ago".to_string(),
                 vitals: "CPU 8.4% · RSS 142 MiB".to_string(),
                 show_local_id: Some(7),
+                cached_observation: None,
             },
             TabSpreadsheetRow {
                 key: "remote/studio-m4/4120/1".to_string(),
+                computer_id: "studio-m4".into(),
                 computer: "studio-m4".to_string(),
                 instance: "aterm-4120".to_string(),
                 place: "Tab 1*".to_string(),
@@ -3302,14 +3312,17 @@ fn tab_control_route_renders_computers_sessions_and_live_ai_cli_status() {
                 state: "Idle".to_string(),
                 program: "Codex".to_string(),
                 is_ai_cli: true,
+                active_ai: Some(false),
                 ai_status: "waiting for a person".to_string(),
                 autopilot: "cruise".to_string(),
                 human: "3m ago".to_string(),
                 vitals: String::new(),
                 show_local_id: None,
+                cached_observation: None,
             },
         ],
         fleet: crate::harness_screen::FleetScope::Account,
+        lan_waits: None,
     };
     let (mut runtime, instance, view) = setup();
     assert!(runtime.replace_settings_harness(state.clone(), 1));
@@ -3393,19 +3406,35 @@ fn tab_control_route_renders_computers_sessions_and_live_ai_cli_status() {
             assert_all_hits_material_and_contained(compiled, &context);
         }
     }
+    let mut duplicate_names = state.clone();
+    for computer in &mut duplicate_names.tabs.computers {
+        computer.name = "bench".into();
+    }
+    for tab in &mut duplicate_names.tabs.tabs {
+        tab.computer = "bench".into();
+        tab.instance = "aterm-4120".into();
+    }
+    assert!(runtime.replace_settings_harness(duplicate_names, 2));
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    assert_ne!(
+        node(&pages, "tabs/session/0").key,
+        node(&pages, "tabs/session/1").key,
+        "different computer identities retain separate instance headers under equal display names"
+    );
     state.tabs.computers.push(TabComputer {
         id: "lan/advertised-peer".to_string(),
         name: "advertised-peer".to_string(),
         address: "observed-peer.local".to_string(),
-        os_version: "OS version unknown".to_string(),
+        os_version: Some("OS version unknown".to_string()),
         status: "advertised (lan)".to_string(),
         vitals: String::new(),
-        instances: 0,
-        tabs: 0,
-        ai_clis: 0,
-        active_ai: 0,
+        instances: Some(0),
+        tabs: Some(0),
+        ai_clis: Some(0),
+        active_ai: Some(0),
+        session_scope: Default::default(),
     });
-    assert!(runtime.replace_settings_harness(state, 2));
+    assert!(runtime.replace_settings_harness(state, 3));
     let pages = every_page(&mut runtime, instance, view, &view_cx());
     assert_eq!(
         node(&pages, "tabs/computer/lan/advertised-peer").label,
@@ -3417,11 +3446,118 @@ fn tab_control_route_renders_computers_sessions_and_live_ai_cli_status() {
     );
     assert_eq!(
         node(&pages, "tabs/summary/row/sessions").label,
-        "Sessions: 2 aterm instances · 2 open tabs observed"
+        "Sessions: 2 observed aterm instances · 2 open tabs observed"
     );
     assert_eq!(
         node(&pages, "tabs/summary/row/ai-clis").label,
         "AI CLIs: 2 observed · 1 active"
+    );
+}
+
+#[test]
+fn tab_group_activity_uses_typed_observations() {
+    use crate::harness_screen::{TabControlState, TabSpreadsheetRow};
+    let mut state = fixture();
+    state.tabs = TabControlState {
+        tabs: [(Some(true), "idle"), (Some(false), "working")]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (active_ai, display))| TabSpreadsheetRow {
+                key: format!("local/{index}"),
+                computer_id: "local".into(),
+                computer: "local".into(),
+                instance: "aterm-7".into(),
+                program: "Claude Code".into(),
+                is_ai_cli: true,
+                active_ai,
+                ai_status: display.into(),
+                ..TabSpreadsheetRow::default()
+            })
+            .collect(),
+        ..TabControlState::default()
+    };
+    let (mut runtime, instance, view) = setup();
+    assert!(runtime.replace_settings_harness(state.clone(), 1));
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: route_action(SettingsRoute::Tabs),
+                value: None,
+            }),
+        )
+        .unwrap();
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    assert!(
+        node(&pages, "tabs/summary/row/ai-clis")
+            .label
+            .ends_with("1 active")
+    );
+    assert!(node(&pages, "tabs/session/0").label.contains("(1 active)"));
+
+    state.tabs.tabs[1].active_ai = None;
+    assert!(runtime.replace_settings_harness(state.clone(), 2));
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    assert!(
+        node(&pages, "tabs/summary/row/ai-clis")
+            .label
+            .ends_with("activity unobserved")
+    );
+    assert!(
+        node(&pages, "tabs/session/0")
+            .label
+            .contains("(activity unobserved)")
+    );
+
+    for row in &mut state.tabs.tabs {
+        row.active_ai = Some(false);
+    }
+    assert!(runtime.replace_settings_harness(state.clone(), 3));
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    assert!(
+        node(&pages, "tabs/summary/row/ai-clis")
+            .label
+            .ends_with("0 active")
+    );
+    assert!(node(&pages, "tabs/session/0").label.contains("(0 active)"));
+
+    let mut busy = state.tabs.tabs[0].clone();
+    busy.active_ai = Some(true);
+    let mut unknown = state.tabs.tabs[1].clone();
+    unknown.is_ai_cli = false;
+    unknown.cached_observation = Some(Default::default());
+    state.tabs.tabs = vec![unknown];
+    for (revision, add_busy) in [(4, false), (5, true)] {
+        if add_busy {
+            state.tabs.tabs.push(busy.clone());
+        }
+        assert!(runtime.replace_settings_harness(state.clone(), revision));
+        let pages = every_page(&mut runtime, instance, view, &view_cx());
+        assert!(
+            node(&pages, "tabs/summary/row/ai-clis")
+                .label
+                .contains("count unobserved")
+        );
+        assert!(
+            node(&pages, "tabs/session/0")
+                .label
+                .contains("AI CLIs unobserved (activity unobserved)")
+        );
+    }
+    state.tabs.tabs[0].cached_observation = None;
+    state.tabs.tabs[0].program = "sh".into();
+    assert!(runtime.replace_settings_harness(state, 6));
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    assert!(
+        node(&pages, "tabs/summary/row/ai-clis")
+            .label
+            .ends_with("1 active")
+    );
+    assert!(
+        node(&pages, "tabs/session/0")
+            .label
+            .contains("1 AI CLI (1 active)")
     );
 }
 
@@ -4080,13 +4216,14 @@ fn a_live_row_keeps_its_height_while_the_person_reads() {
         id: id.to_string(),
         name: id.to_string(),
         address: "192.168.1.90 \u{b7} m111.local".to_string(),
-        os_version: "Mac16,5 \u{b7} macOS (Darwin 26) \u{b7} OpenSSH_10.3".to_string(),
+        os_version: Some("Mac16,5 \u{b7} macOS (Darwin 26) \u{b7} OpenSSH_10.3".to_string()),
         status: "online".to_string(),
         vitals: vitals.to_string(),
-        instances: 1,
-        tabs: 1,
-        ai_clis: 0,
-        active_ai: 0,
+        instances: Some(1),
+        tabs: Some(1),
+        ai_clis: Some(0),
+        active_ai: Some(0),
+        session_scope: Default::default(),
     };
     let long = "CPU 79% \u{2595}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2591}\u{2591}\u{258f} \
                 \u{2586}\u{2586}\u{2586}\u{2587}\u{2587}\u{2587} (14c \u{b7} Performance:88% \
@@ -4100,6 +4237,7 @@ fn a_live_row_keeps_its_height_while_the_person_reads() {
             computers: vec![computer("local", vitals), computer("lan/m2", "")],
             tabs: Vec::new(),
             fleet: FleetScope::Account,
+            lan_waits: None,
         };
         state
     };
@@ -4171,6 +4309,7 @@ fn a_tabs_status_line_keeps_its_place_while_its_title_changes() {
     use crate::native_settings::tabs_page::TABS_REFRESH;
     let tab = |title: &str| TabSpreadsheetRow {
         key: "local/0".to_string(),
+        computer_id: "local".into(),
         computer: "m111".to_string(),
         instance: "this aterm (pid 7)".to_string(),
         place: "Tab 1 (80\u{d7}24)".to_string(),
@@ -4179,11 +4318,13 @@ fn a_tabs_status_line_keeps_its_place_while_its_title_changes() {
         state: "alive".to_string(),
         program: "claude".to_string(),
         is_ai_cli: true,
+        active_ai: Some(true),
         ai_status: "working".to_string(),
         autopilot: "land".to_string(),
         human: "3m ago".to_string(),
         vitals: "CPU 12% \u{b7} RAM 300 MiB".to_string(),
         show_local_id: None,
+        cached_observation: None,
     };
     let long = "\u{2733} Settings page audit and cursor styles, the lab isolation and tooling \
                 cluster, reviewed adversarially before it lands";
@@ -4194,6 +4335,7 @@ fn a_tabs_status_line_keeps_its_place_while_its_title_changes() {
             computers: Vec::new(),
             tabs: vec![tab(title)],
             fleet: FleetScope::Account,
+            lan_waits: None,
         };
         state
     };
@@ -4263,13 +4405,14 @@ fn a_computer_listed_above_the_screen_moves_nothing_on_it() {
         id: format!("lan/m{n}"),
         name: format!("m{n}-MacBook-Pro-M4-Max-36GB-1TB"),
         address: format!("192.168.1.{n} \u{b7} m{n}.local"),
-        os_version: "Mac16,5 \u{b7} Darwin 26 \u{b7} OpenSSH_10.3".to_string(),
+        os_version: Some("Mac16,5 \u{b7} Darwin 26 \u{b7} OpenSSH_10.3".to_string()),
         status: "advertised (lan)".to_string(),
         vitals: String::new(),
-        instances: 0,
-        tabs: 0,
-        ai_clis: 0,
-        active_ai: 0,
+        instances: Some(0),
+        tabs: Some(0),
+        ai_clis: Some(0),
+        active_ai: Some(0),
+        session_scope: Default::default(),
     };
     let with = |numbers: &[usize]| {
         let mut state = fixture();
@@ -4277,6 +4420,7 @@ fn a_computer_listed_above_the_screen_moves_nothing_on_it() {
             computers: numbers.iter().map(|n| computer(*n)).collect(),
             tabs: Vec::new(),
             fleet: FleetScope::Account,
+            lan_waits: None,
         };
         state
     };

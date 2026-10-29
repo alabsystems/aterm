@@ -46,6 +46,7 @@ impl GlowStyle {
     }
 
     /// Whether this style string explicitly requests the flying kitty head.
+    #[inline]
     #[must_use]
     #[cfg(test)]
     pub const fn style_names_flying_kitty(s: &str) -> bool {
@@ -187,6 +188,152 @@ pub struct GlowConfig {
     pub ribbon_flat: bool,
     /// Whether the classic wake uses the two-tone tracer (`true`) instead of a rolling spectrum (`false`).
     pub classic_mono: bool,
+    /// The light the frame draws its light arms by (`docs/design/PRISM-GLASS.md` §15.0.4): the
+    /// host's latched light scheme with the live phase level; [`Light::OFF`] on every dark ground,
+    /// and until a host latches one.
+    pub light: Light,
+}
+
+/// The Prism Glass phase levels, in the order they go live (§15.0.4): each phase's last commit
+/// raises [`crate::rainbow_kitty::prism_glass::LIVE`] one level, and a level draws every arm of
+/// the levels before it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Live {
+    /// No light arm draws: a latched light scheme keeps main's paper arm.
+    Off,
+    /// Phase 1: the glass body.
+    Glass,
+    /// Phase 2: the lip.
+    Lip,
+    /// Phase 3: the marks (stars, caret, cat).
+    Marks,
+    /// Phase 4: the vanish fixes.
+    Vanish,
+}
+
+impl Live {
+    /// The level's word, as the trail-diff dump's `live <level>` and `trail light` spell it.
+    #[inline]
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Glass => "glass",
+            Self::Lip => "lip",
+            Self::Marks => "marks",
+            Self::Vanish => "vanish",
+        }
+    }
+}
+
+/// What a frame's light arms read (§15.0.4): whether the host latched a light configured scheme
+/// (`on`, the spec's `light_on`) and which phases are live on it. Every light arm reads one of
+/// [`Self::glass`], [`Self::lip`], [`Self::marks`] or [`Self::vanish`], each false on
+/// [`Self::OFF`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Light(u8);
+
+impl Light {
+    /// No light scheme latched: main's frame.
+    pub const OFF: Self = Self(0);
+    const ON: u8 = 1;
+    const GLASS: u8 = 1 << 1;
+    const LIP: u8 = 1 << 2;
+    const MARKS: u8 = 1 << 3;
+    const VANISH: u8 = 1 << 4;
+    const SHEER: u8 = 1 << 5;
+
+    /// A latched light scheme at the live level `live`: the arms of every level up to `live`.
+    #[inline]
+    #[must_use]
+    pub const fn at(live: Live) -> Self {
+        Self(
+            Self::ON
+                | match live {
+                    Live::Off => 0,
+                    Live::Glass => Self::GLASS,
+                    Live::Lip => Self::GLASS | Self::LIP,
+                    Live::Marks => Self::GLASS | Self::LIP | Self::MARKS,
+                    Live::Vanish => Self::GLASS | Self::LIP | Self::MARKS | Self::VANISH,
+                },
+        )
+    }
+
+    /// The frame's light from its latch's verdict (§15.2 1.3): [`Self::at`] `live` when the latch
+    /// admitted the frame, [`Self::OFF`] when it did not.
+    #[inline]
+    #[must_use]
+    pub const fn admitted(on: bool, live: Live) -> Self {
+        if on { Self::at(live) } else { Self::OFF }
+    }
+
+    /// The bits, as the trail-diff dump prints them (`light=`).
+    #[inline]
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// A light configured scheme is latched (the spec's `light_on`), whatever is live on it.
+    #[inline]
+    #[must_use]
+    pub const fn on(self) -> bool {
+        self.0 & Self::ON != 0
+    }
+
+    #[inline]
+    const fn has(self, arm: u8) -> bool {
+        self.0 & (Self::ON | arm) == Self::ON | arm
+    }
+
+    /// This light on its page (§15.2 1.7, `host::PageFacts`): a latched light over a page that is
+    /// not `clear` (a translucent window, or a wallpaper or an image under the text) is sheer, and
+    /// a sheer light draws no glass, so the frame draws main's paper arm there. [`Self::OFF`]
+    /// stays [`Self::OFF`] on every page.
+    #[inline]
+    #[must_use]
+    pub const fn on_page(self, clear: bool) -> Self {
+        if self.on() && !clear {
+            Self(self.0 | Self::SHEER)
+        } else {
+            self
+        }
+    }
+
+    /// The light lies over a see-through page ([`Self::on_page`]).
+    #[inline]
+    #[must_use]
+    pub const fn sheer(self) -> bool {
+        self.0 & Self::SHEER != 0
+    }
+
+    /// The glass body draws (Phase 1): its level is live and the page is clear ([`Self::sheer`]).
+    #[inline]
+    #[must_use]
+    pub const fn glass(self) -> bool {
+        self.has(Self::GLASS) && !self.sheer()
+    }
+
+    /// The lip draws (Phase 2).
+    #[inline]
+    #[must_use]
+    pub const fn lip(self) -> bool {
+        self.has(Self::LIP)
+    }
+
+    /// The marks draw (Phase 3).
+    #[inline]
+    #[must_use]
+    pub const fn marks(self) -> bool {
+        self.has(Self::MARKS)
+    }
+
+    /// The vanish fixes draw (Phase 4).
+    #[inline]
+    #[must_use]
+    pub const fn vanish(self) -> bool {
+        self.has(Self::VANISH)
+    }
 }
 
 impl GlowConfig {
@@ -195,6 +342,7 @@ impl GlowConfig {
     /// literal has to name every field (the trail-diff closure's tests among them, §15.0.6).
     #[cfg(test)]
     #[doc(hidden)]
+    #[inline]
     #[must_use]
     pub const fn sample_for_test() -> Self {
         Self {
@@ -216,6 +364,37 @@ impl GlowConfig {
             ribbon_tall: true,
             ribbon_flat: false,
             classic_mono: false,
+            light: Light::OFF,
+        }
+    }
+}
+
+/// The shipped resolve: what a window with no config resolves on the cold dark ground (the
+/// shipped `rainbow kitty pet`, the default theme's cursor colour, every knob unset), so a test
+/// that names only the fields it is about takes the rest from here (§15.1 P0.1).
+impl Default for GlowConfig {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            style: GlowStyle::RainbowKitty,
+            color: 0x0050_FA7B,
+            accent: 0x0078_FFB8,
+            duration: Duration::from_millis(260),
+            length: GLOW_LENGTH_DEFAULT,
+            intensity: 1.0,
+            audible: false,
+            radius: 0.0,
+            ring: false,
+            dark_theme: true,
+            theme_fg: 0x00C8_D3F5,
+            theme_bg: 0x001A_1B26,
+            beam: false,
+            head_dx: 0.5,
+            ribbon_tall: true,
+            ribbon_flat: false,
+            classic_mono: false,
+            light: Light::OFF,
         }
     }
 }

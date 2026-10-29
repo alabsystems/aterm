@@ -138,17 +138,15 @@ fn real_share_registry_conforms_to_spec() {
     ] {
         run_lockstep(&m, &seq);
     }
+    assert_forged_over_cap_share_rejected(&m);
 }
 
-#[test]
-fn forged_over_cap_share_is_rejected() {
-    let _guard = SERIAL.lock().expect("serial");
-    let m = shared_budget_model();
+fn assert_forged_over_cap_share_rejected(m: &Model) {
     let (prev, next) =
-        run_lockstep(&m, &["Join", "Apply1", "Apply2"]).expect("feasible canonical sequence");
+        run_lockstep(m, &["Join", "Apply1", "Apply2"]).expect("feasible canonical sequence");
     let mut forged = next.clone();
     forged.insert("a1", CFG); // real applied share was Half — forge the full cfg
-    let (ok, _) = validate(&m, &prev, &forged, "Apply2");
+    let (ok, _) = validate(m, &prev, &forged, "Apply2");
     assert!(
         !ok,
         "spec must reject an over-cap applied share (binding is vacuous otherwise)"

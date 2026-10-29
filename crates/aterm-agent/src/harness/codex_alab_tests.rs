@@ -53,11 +53,13 @@ fn package_metadata_refuses_nonfiles_and_oversized_text() {
     let accepted = || {
         assert_eq!(package_version(&exe), Some(v("0.157.1")));
         assert_eq!(alab_build(&exe).as_deref(), Some("0.157.1"));
+        assert_eq!(product_version(&exe).as_deref(), Some("0.157.1"));
         assert!(alab_bytes(&exe));
     };
     let refused = || {
         assert_eq!(package_version(&exe), None);
         assert_eq!(alab_build(&exe), None);
+        assert_eq!(product_version(&exe), None);
         assert!(!alab_bytes(&exe));
     };
     let mut text = PACKAGE_0_157_1.to_string();
@@ -165,6 +167,48 @@ fn codex_alab_s_own_line_names_its_build_by_its_client_version() {
         record(&bad);
         assert_eq!(alab_build(&exe), None, "{bad}");
         assert!(alab_bytes(&exe), "still ALab bytes, but no build: {bad}");
+    }
+}
+
+#[test]
+fn product_and_client_versions_keep_their_distinct_cores_and_source_metadata() {
+    for (product, client) in [
+        (
+            "0.1.0-dev.13764+codex.0.164.0.g4b3a367a0",
+            "0.165.0-dev.13764+g4b3a367a0",
+        ),
+        (
+            "0.1.0-dev.13765+codex.0.164.0.g5c4b3a210",
+            "0.165.0-dev.13765+g5c4b3a210",
+        ),
+        (
+            "999999999.999999999.999999999-dev.999999999+codex.999999999.999999999.999999999.gfffffffff",
+            "999999999.999999999.999999999-dev.999999999+gfffffffff",
+        ),
+    ] {
+        let d = aterm_tempfile::tempdir().unwrap();
+        let root = d.path();
+        std::fs::create_dir(root.join("bin")).unwrap();
+        let exe = root.join("bin/codex");
+        std::fs::write(&exe, b"never executed").unwrap();
+        let manifest = PACKAGE_0_157_1.replace("0.157.1", product);
+        std::fs::write(root.join(PACKAGE_JSON), &manifest).unwrap();
+        std::fs::write(
+            root.join(ALAB_BUILD_JSON),
+            format!(r#"{{"version":"{product}","client_version":"{client}"}}"#),
+        )
+        .unwrap();
+        assert_eq!(product_version(&exe).as_deref(), Some(product));
+        assert_eq!(alab_build(&exe).as_deref(), Some(client));
+        assert_eq!(package_version(&exe), None);
+
+        std::fs::write(
+            root.join(PACKAGE_JSON),
+            manifest.replace("bin/codex", "bin/other"),
+        )
+        .unwrap();
+        assert_eq!(product_version(&exe), None);
+        assert_eq!(alab_build(&exe), None);
     }
 }
 
@@ -329,6 +373,30 @@ fn an_unknown_or_unresumable_launch_is_refused_not_guessed() {
             argv(&["codex", "app-server", "--listen", "unix://"]),
             ArgvRefusal::NotResumable("app-server".into()),
         ),
+        (
+            argv(&["codex", "tcp-tunnel"]),
+            ArgvRefusal::NotResumable("tcp-tunnel".into()),
+        ),
+        (
+            argv(&["codex", "execpolicy", "check"]),
+            ArgvRefusal::NotResumable("execpolicy".into()),
+        ),
+        (
+            argv(&["codex", "cloud-tasks"]),
+            ArgvRefusal::NotResumable("cloud-tasks".into()),
+        ),
+        (
+            argv(&["codex", "responses-api-proxy"]),
+            ArgvRefusal::NotResumable("responses-api-proxy".into()),
+        ),
+        (
+            argv(&["codex", "stdio-to-uds", "/tmp/codex.sock"]),
+            ArgvRefusal::NotResumable("stdio-to-uds".into()),
+        ),
+        (
+            argv(&["/tmp/.codex/apply_patch", "*** Begin Patch"]),
+            ArgvRefusal::NotResumable("apply_patch".into()),
+        ),
     ] {
         assert_eq!(rewrite_argv(&a, Some(T1)), Err(why), "{a:?}");
     }
@@ -339,13 +407,46 @@ fn only_an_interactive_tui_is_a_tui_never_the_daemon_or_its_updater() {
     for tui in [
         argv(&["/store/bin/codex"]),
         argv(&["codex", "--no-daemon", "-m", "x"]),
+        argv(&["codex", "-p", "work"]),
+        argv(&["codex", "-p", "exec"]),
         argv(&["codex", "resume", T1]),
         argv(&["codex", "-c", "exec=1", "fork"]),
         argv(&["codex", "--image", "a.png", "exec"]),
         argv(&["codex", "-i", "a.png", "b.png", "migrate-nfs-db"]),
         argv(&["codex", "fix the bug"]),
+        argv(&["codex", "--search", "--", "--help"]),
     ] {
         assert!(is_tui_argv(&tui), "{tui:?}");
+        let snap = crate::harness::relaunch::Snapshot {
+            tab: "s-1".into(),
+            pid: 4242,
+            start: "Mon Oct 27 00:00:00 2026".into(),
+            shell: 4241,
+            program: "/store/bin/codex".into(),
+            argv: tui.clone(),
+            session: Some(T1.into()),
+            cwd: "/work".into(),
+            version: Some("0.165.0".into()),
+            run: crate::harness::relaunch::AgentRun::Codex(crate::harness::relaunch::CodexRun {
+                home: "/Users//me/.codex".into(),
+                home_env: None,
+                self_claimed: None,
+            }),
+            dialect: None,
+            claude_dir: None,
+            login: None,
+            home: None,
+            stored_login: false,
+            profile: None,
+        };
+        assert_eq!(
+            crate::harness::relaunch::launch_ended(
+                &snap,
+                &crate::harness::relaunch::ExitRecord::Crashed
+            ),
+            None,
+            "{tui:?}"
+        );
     }
     for not in [
         argv(&[
@@ -361,8 +462,55 @@ fn only_an_interactive_tui_is_a_tui_never_the_daemon_or_its_updater() {
         argv(&["codex", "-ia.png", "exec", "hi"]),
         argv(&["codex", "-m", "x", "migrate-nfs-db"]),
         argv(&["codex", "-m", "x", "agents"]),
+        argv(&["codex", "tcp-tunnel"]),
+        argv(&["codex", "execpolicy", "check"]),
+        argv(&["codex", "cloud-tasks"]),
+        argv(&["codex", "responses-api-proxy"]),
+        argv(&["codex", "stdio-to-uds", "/tmp/codex.sock"]),
+        argv(&["codex", "-h"]),
+        argv(&["codex", "--help"]),
+        argv(&["codex", "-V"]),
+        argv(&["codex", "--version"]),
+        argv(&["codex", "resume", "--help"]),
+        argv(&["codex", "fork", "-h"]),
+        argv(&["/tmp/.codex/apply_patch", "*** Begin Patch"]),
+        argv(&["codex", "--codex-run-as-process-setup"]),
+        argv(&["codex", "--codex-run-as-apply-patch", "*** Begin Patch"]),
+        argv(&["codex", "--codex-run-as-arg0-exec-helper"]),
+        argv(&["codex", "--codex-run-as-fs-helper"]),
+        argv(&["codex", "-hfoo"]),
     ] {
         assert!(!is_tui_argv(&not), "{not:?}");
+        let snap = crate::harness::relaunch::Snapshot {
+            tab: "s-1".into(),
+            pid: 4242,
+            start: "Mon Oct 27 00:00:00 2026".into(),
+            shell: 4241,
+            program: "/store/bin/codex".into(),
+            argv: not.clone(),
+            session: Some(T1.into()),
+            cwd: "/work".into(),
+            version: Some("0.165.0".into()),
+            run: crate::harness::relaunch::AgentRun::Codex(crate::harness::relaunch::CodexRun {
+                home: "/Users//me/.codex".into(),
+                home_env: None,
+                self_claimed: None,
+            }),
+            dialect: None,
+            claude_dir: None,
+            login: None,
+            home: None,
+            stored_login: false,
+            profile: None,
+        };
+        assert_eq!(
+            crate::harness::relaunch::launch_ended(
+                &snap,
+                &crate::harness::relaunch::ExitRecord::Crashed
+            ),
+            Some("one-shot"),
+            "{not:?}"
+        );
     }
 }
 
@@ -413,10 +561,17 @@ fn the_relaunch_on_exit_reads_a_thread_and_its_instant() {
         Some(t.to_string()),
         "an attached image takes no following value"
     );
+    assert_eq!(
+        resumed_thread(&argv(&["codex", "resume", "--", t])),
+        Some(t.to_string()),
+        "a thread id after `--` in `codex resume` is still the resumed thread"
+    );
     for a in [
         &["codex"][..],
         &["codex", "resume", "--last"][..],
         &["codex", "resume"][..],
+        &["codex", "resume", t, "--help"][..],
+        &["/tmp/.codex/apply_patch", "resume", t][..],
         &["codex", "fork", t][..],
         &["codex", "--image", "a.png", "b.png", "resume", t][..],
         &["codex", "resume", "--image", "a.png", "b.png", t][..],
@@ -431,4 +586,203 @@ fn the_relaunch_on_exit_reads_a_thread_and_its_instant() {
         "v4"
     );
     assert_eq!(thread_created_ms("not-a-thread"), None);
+}
+
+/// A POOL ROW OF ITS OWN REACHES CODEX ONLY AS `CODEX_AUTH_PATH`, SO ONLY A BUILD THAT KEEPS
+/// ITS LOGIN ITS OWN MAY RUN ONE: codex-alab whose bytes hold [`AUTH_PATH_MARK`], itself or
+/// behind atpkg's launcher. A vendor package (no marker), a codex-alab that names the variable
+/// but predates the mark, a bare word, a relative path, a launcher that names no binary and a
+/// missing file are each refused, each for its own reason.
+#[test]
+fn only_a_codex_alab_that_holds_the_auth_path_mark_may_run_a_row_of_its_own() {
+    use AuthPathUnread::{Missing, Older, Unnamed, Vendor};
+    let d = aterm_tempfile::tempdir().expect("private package fixture");
+    let root = d.path().canonicalize().expect("canonical");
+    let reads = lay_package(&root.join("store/codex/new"), true);
+    let before = lay_package(&root.join("store/codex/old"), false);
+    let vendor = lay_package(&root.join("store/codex-old/vendor"), true);
+    std::fs::remove_file(root.join("store/codex-old/vendor").join(ALAB_BUILD_JSON))
+        .expect("an OpenAI package carries no marker");
+    let launcher = |name: &str, body: &str| {
+        let path = root.join(name);
+        std::fs::write(&path, body).expect("launcher");
+        path
+    };
+    let to = |exe: &Path| format!("#!/bin/sh\n# atpkg shim\nexec '{}' \"$@\"\n", exe.display());
+    assert_eq!(auth_path_unread(&reads), None);
+    assert_eq!(auth_path_unread(&launcher("twin-new", &to(&reads))), None);
+    assert_eq!(auth_path_unread(&before), Some(Older(before.clone())));
+    assert_eq!(
+        auth_path_unread(&launcher("twin-old", &to(&before))),
+        Some(Older(before.clone()))
+    );
+    assert_eq!(auth_path_unread(&vendor), Some(Vendor(vendor.clone())));
+    assert_eq!(
+        auth_path_unread(&launcher("twin-vendor", &to(&vendor))),
+        Some(Vendor(vendor.clone()))
+    );
+    for word in ["codex", "bin/codex"] {
+        assert_eq!(
+            auth_path_unread(Path::new(word)),
+            Some(Unnamed(PathBuf::from(word)))
+        );
+    }
+    let reroute = launcher(
+        "reroute",
+        "#!/bin/sh\n# atpkg reroute stub v1\nexec \"$__aterm_agents/$__aterm_name\" \"$@\"\n",
+    );
+    assert_eq!(auth_path_unread(&reroute), Some(Unnamed(reroute.clone())));
+    let non_utf8_script = root.join("non-utf8-script");
+    std::fs::write(
+        &non_utf8_script,
+        [
+            b"#!/bin/sh\n# \xff\nexec '".as_slice(),
+            reads.as_os_str().as_encoded_bytes(),
+            b"' \"$@\"\n",
+        ]
+        .concat(),
+    )
+    .expect("non-utf8 script");
+    assert_eq!(
+        auth_path_unread(&non_utf8_script),
+        Some(Unnamed(non_utf8_script))
+    );
+    let oversized_script = launcher(
+        "oversized-script",
+        &format!(
+            "#!/bin/sh\n#{}\nexec '{}' \"$@\"\n",
+            "x".repeat(LAUNCHER_MAX as usize),
+            reads.display()
+        ),
+    );
+    assert_eq!(
+        auth_path_unread(&oversized_script),
+        Some(Unnamed(oversized_script))
+    );
+    let absent = root.join("absent/bin/codex");
+    assert_eq!(auth_path_unread(&absent), Some(Missing(absent.clone())));
+    std::fs::write(&before, [b"\xcf\xfa ", AUTH_PATH_MARK.as_bytes()].concat())
+        .expect("the build replaced in place");
+    assert_eq!(
+        auth_path_unread(&before),
+        None,
+        "a build rewritten in place is read again"
+    );
+}
+
+/// The scan finds a mark that straddles two reads and misses one the file only nearly holds.
+#[test]
+fn a_mark_across_a_read_boundary_is_found_and_a_near_miss_is_not() {
+    let d = aterm_tempfile::tempdir().expect("scan fixture");
+    let needle = AUTH_PATH_MARK.as_bytes();
+    let file = d.path().join("blob");
+    let mut bytes = vec![b'C'; SCAN_CHUNK - 4];
+    bytes.extend_from_slice(needle);
+    std::fs::write(&file, &bytes).expect("straddling blob");
+    assert!(file_holds(&file, needle).expect("read"));
+    let mut near = vec![b'C'; SCAN_CHUNK - 4];
+    near.extend_from_slice(&needle[..needle.len() - 1]);
+    std::fs::write(&file, &near).expect("near-miss blob");
+    assert!(!file_holds(&file, needle).expect("read"));
+    std::fs::write(&file, b"").expect("empty");
+    assert!(!file_holds(&file, needle).expect("read"));
+    assert!(
+        file_holds(d.path(), needle).is_err(),
+        "a directory is no file"
+    );
+}
+
+/// UNDER THE OWNER'S PIN ON A ROW OF ITS OWN, THE ROW ON THIS MACHINE'S OWN LOGIN SERVES ONLY ONCE
+/// THAT PIN ENDS: walled, the refusal names its wall's end, the pin's end ([`UNPIN_FIX`]) and
+/// its own pin, made once that wall ends; signed out, its sign-in and then its pin. CONTROL: with
+/// no pin (the pool's pick, or the review's serving row), a walled row serves by itself once its
+/// wall ends and is offered no pin (the next usage read would undo one) and no pin's end, and a
+/// signed-out row only its sign-in.
+#[test]
+fn under_a_pin_the_default_row_serves_only_once_that_pin_ends() {
+    let why = AuthPathUnread::Older(PathBuf::from("/opt/codex-alab/bin/codex"));
+    let until = 1_800_003_750;
+    let walled = DefaultRow::Walled {
+        label: "main".into(),
+        window: "five_hour".into(),
+        reset: Some(1_800_003_600),
+        until,
+    };
+    let signed_out = DefaultRow::SignedOut {
+        label: "main".into(),
+        stored: true,
+    };
+    let pin = unread_fix(Some("main"));
+    let ends = crate::harness::usage::rfc3339_utc(until);
+    let words = only_default_pinned(&why, "work", &walled);
+    assert!(
+        words.contains(&pin) && words.contains(&ends) && words.contains(UNPIN_FIX),
+        "{words}"
+    );
+    let words = only_default_pinned(&why, "work", &signed_out);
+    assert!(
+        words.contains(&pin) && words.contains(DEFAULT_SIGN_IN),
+        "{words}"
+    );
+    for row in [None, Some("work")] {
+        let words = only_default(&why, row, &walled);
+        assert!(
+            words.contains(&ends) && !words.contains(&pin) && !words.contains(UNPIN_FIX),
+            "CONTROL {row:?}: {words}"
+        );
+        let words = only_default(&why, row, &signed_out);
+        assert!(
+            words.contains(DEFAULT_SIGN_IN) && !words.contains(&pin),
+            "CONTROL {row:?}: {words}"
+        );
+    }
+}
+
+/// A REFUSAL ON A CODEX THAT KEEPS NO ROW'S LOGIN ITS OWN STARTS NO CLAUSE AFTER "; " WITH A
+/// CAPITAL: for every condition of the row on this machine's own login, the pool's pick, the
+/// review's row, the owner's pin and a starter's row, rotation off or not, each clause joined
+/// after "; " (the way back [`unread_advice`] gives among them) starts lower-case.
+#[test]
+fn no_clause_of_a_refusal_starts_with_a_capital() {
+    let why = AuthPathUnread::Older(PathBuf::from("/opt/codex-alab/bin/codex"));
+    let defaults = [
+        DefaultRow::Unlisted,
+        DefaultRow::Moved("main".into()),
+        DefaultRow::Serves("main".into()),
+        DefaultRow::Walled {
+            label: "main".into(),
+            window: "five_hour".into(),
+            reset: Some(1_800_003_600),
+            until: 1_800_003_750,
+        },
+        DefaultRow::SignedOut {
+            label: "main".into(),
+            stored: true,
+        },
+        DefaultRow::SignedOut {
+            label: "main".into(),
+            stored: false,
+        },
+        DefaultRow::Other {
+            label: "main".into(),
+            why: "held for another Mac's warm set".into(),
+        },
+    ];
+    for default in &defaults {
+        let words = [
+            only_default(&why, None, default),
+            only_default(&why, Some("work"), default),
+            only_default_pinned(&why, "work", default),
+            only_default_carried(&why, "work", default, true),
+            only_default_carried(&why, "work", default, false),
+        ];
+        for said in words {
+            for clause in said.split("; ").skip(1) {
+                assert!(
+                    !clause.starts_with(char::is_uppercase),
+                    "{default:?}: `{clause}` in {said}"
+                );
+            }
+        }
+    }
 }

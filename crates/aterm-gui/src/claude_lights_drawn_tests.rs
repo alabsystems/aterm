@@ -336,12 +336,31 @@ fn a_co_viewed_session_names_each_window() {
     }
 }
 
-/// A FOOTERLESS AGENT'S CHIP LINE NAMES NO CHIP, AND THE RETIRED GEMINI CLI GETS NO LINE AT ALL:
-/// a tab running `gemini` is no agent (agy replaces it), so no chip line names it; the pane
-/// running Claude Code is drawn as its face; a codex-alab that proved its claim is an agent aterm
-/// admits whose program draws no footer, so its line reads `face=- drawn=- why=no-footer`.
+/// The slab bg of codex's composer in [`codex_slab`].
+const SLAB: [u8; 3] = [45, 47, 51];
+
+/// Codex's composer on the 24-row engine, `cols` wide: its slab's top pad on row 21, the prompt
+/// on row 22, the bottom pad on row 23 (`aterm_phase::codex::composer_pad`).
+fn codex_slab(app: &App, session: u64) {
+    let [r, g, b] = SLAB;
+    let on = format!("\x1b[48;2;{r};{g};{b}m");
+    let screen = format!(
+        "\x1b[2J\x1b[1;1H\u{256D}\u{2500}\u{256E}\x1b[21;1H{on}\x1b[K\x1b[0m\x1b[22;1H{on}\x1b[K\u{203A} \
+         \x1b[2mAsk Codex to do anything\x1b[22m\x1b[0m\x1b[23;1H{on}\x1b[K\x1b[0m\x1b[24;1H  ? for \
+         shortcuts\x1b[22;3H"
+    );
+    feed(app, session, screen.as_bytes());
+}
+
+/// A CODEX-ALAB PANE DRAWS ITS CHIP ON ITS SLAB PAD, AND THE RETIRED GEMINI CLI GETS NO LINE AT
+/// ALL: a tab running `gemini` is no agent (agy replaces it), so no chip line names it; the pane
+/// running Claude Code is drawn as its face; a vendor codex is no agent aterm admits; a
+/// codex-alab that proved its claim lays its chip on its composer's top pad
+/// (`claude_footer::ChipLine::TopLine`), so its line reads the face it drew there, and
+/// `why=not-drawn` where no pad is on screen; under an off master switch its line is the
+/// switch's alone.
 #[test]
-fn the_chip_line_names_no_chip_for_a_footerless_agent_and_none_for_the_retired_gemini_cli() {
+fn a_codex_alab_pane_draws_its_chip_on_its_slab_pad() {
     let (mut app, wid, session, _reader) = app();
     let _host = host(&mut app);
     for program in ["gemini", "gemini-cli"] {
@@ -357,7 +376,14 @@ fn the_chip_line_names_no_chip_for_a_footerless_agent_and_none_for_the_retired_g
     let line = line_of(&app, session);
     assert_eq!(token(&line, "face"), "cruise", "{line}");
 
-    set_program(&app, session, "codex");
+    {
+        // Codex in its own process group: Claude Code's facts are its group's alone.
+        let ctx = app.pool.get(session).expect("session").ctx.clone();
+        let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        timeline.note_foreground_group(PGID + 1);
+        timeline.set_program(PGID + 1, Some("codex".into()));
+    }
+    feed(&app, session, b"\x1b[2J");
     frame(&mut app, wid);
     assert!(
         lines_of(&app, session).is_empty(),
@@ -379,10 +405,54 @@ fn the_chip_line_names_no_chip_for_a_footerless_agent_and_none_for_the_retired_g
     assert_eq!(
         line,
         format!(
-            "autopilot sid={} window=0 program=codex face=- drawn=- why=no-footer spoken=- \
+            "autopilot sid={} window=0 program=codex face=cruise drawn=- why=not-drawn spoken=- \
              description=- title=-",
             ctx.self_id.as_str()
-        )
+        ),
+        "no pad on screen"
+    );
+    codex_slab(&app, session);
+    frame(&mut app, wid);
+    let line = line_of(&app, session);
+    assert_eq!(token(&line, "face"), "cruise", "{line}");
+    assert_eq!(drawn(&line).as_deref(), Some("\u{221E}"), "{line}");
+    assert_eq!(
+        drawn(&line),
+        on_glass(&app, wid, session),
+        "drawn= is the frame's cells: {line}"
+    );
+    assert_eq!(
+        quoted(&line, "spoken").as_deref(),
+        Some("Autopilot: cruise."),
+        "{line}"
+    );
+    let ws = &app.windows[&wid];
+    let pad = ws.input_scratch.cells.len() - usize::from(ws.rows) + 20;
+    assert!(
+        ws.claude_lights
+            .hits
+            .iter()
+            .filter(|h| h.session == session)
+            .all(|h| h.frame_row == pad && ws.input_scratch.cells[pad][h.col].bg == SLAB),
+        "on the slab's top pad"
+    );
+    set_word(&app, session, Autopilot::Land);
+    frame(&mut app, wid);
+    let line = line_of(&app, session);
+    assert_eq!(
+        (token(&line, "face"), drawn(&line).as_deref()),
+        ("land", Some("\u{2913} land")),
+        "{line}"
+    );
+    app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+        crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
+    );
+    frame(&mut app, wid);
+    let line = line_of(&app, session);
+    assert_eq!(
+        (token(&line, "face"), token(&line, "why")),
+        ("master-off", "switch-only"),
+        "{line}"
     );
 }
 
@@ -390,6 +460,7 @@ fn the_chip_line_names_no_chip_for_a_footerless_agent_and_none_for_the_retired_g
 fn a_footer_left_bare_under_an_off_switch_is_switch_only() {
     use crate::autopilot::{HarnessSwitch, SwitchOff};
     use aterm_phase::Program;
+    // A switch as the frame lays it, its session carried.
     let switch = |program, face, session| crate::claude_lights::BorderSwitch {
         frame_row: 7,
         term_row: 7,
@@ -403,6 +474,7 @@ fn a_footer_left_bare_under_an_off_switch_is_switch_only() {
             face,
             Some(aterm_phase::CliHarness::ClaudeCode),
         ),
+        chip_down: crate::claude_footer::chip_stands_down(Some(program), Some(face), true),
     };
     let read = |drew: &[crate::claude_lights::BorderSwitch], covered: Option<usize>| {
         let mut lights = WindowLights::default();
@@ -410,16 +482,18 @@ fn a_footer_left_bare_under_an_off_switch_is_switch_only() {
         lights.drawn_chip(3, 0, |row| Some(row) == covered)
     };
     let off = HarnessSwitch::Off(SwitchOff::Master);
-    for face in [
-        off,
-        HarnessSwitch::Off(SwitchOff::Agent(Program::Agy)),
-        HarnessSwitch::Turning,
-    ] {
-        assert_eq!(
-            read(&[switch(Program::Agy, face, 3)], None),
-            Drawn::SwitchOnly,
-            "{face:?}"
-        );
+    for program in [Program::Agy, Program::Codex] {
+        for face in [
+            off,
+            HarnessSwitch::Off(SwitchOff::Agent(program)),
+            HarnessSwitch::Turning,
+        ] {
+            assert_eq!(
+                read(&[switch(program, face, 3)], None),
+                Drawn::SwitchOnly,
+                "{program:?} {face:?}: agy's footer left bare, codex-alab's chip stood down"
+            );
+        }
     }
     assert_eq!(Drawn::SwitchOnly.why(), Some("switch-only"));
     assert_eq!(
@@ -427,11 +501,34 @@ fn a_footer_left_bare_under_an_off_switch_is_switch_only() {
         Drawn::NoRule,
         "no switch drawn: a tab behind"
     );
+    for program in [Program::Agy, Program::Codex] {
+        for face in [HarnessSwitch::On, HarnessSwitch::TurningOff] {
+            assert_eq!(
+                read(&[switch(program, face, 3)], None),
+                Drawn::NoRule,
+                "{program:?} {face:?}: a switch the harness is on under leaves no line bare"
+            );
+        }
+    }
     for face in [HarnessSwitch::On, HarnessSwitch::TurningOff] {
+        let uncarried = crate::claude_lights::BorderSwitch {
+            chip_down: crate::claude_footer::chip_stands_down(
+                Some(Program::Codex),
+                Some(face),
+                false,
+            ),
+            ..switch(Program::Codex, face, 3)
+        };
         assert_eq!(
-            read(&[switch(Program::Agy, face, 3)], None),
-            Drawn::NoRule,
-            "{face:?}: a switch the harness is on under leaves no footer bare"
+            read(&[uncarried], None),
+            Drawn::SwitchOnly,
+            "{face:?}: an uncarried codex-alab's chip stood down beside a lit switch"
+        );
+    }
+    for program in [Program::Claude, Program::Agy, Program::Muse] {
+        assert!(
+            !crate::claude_footer::chip_stands_down(Some(program), Some(HarnessSwitch::On), false),
+            "{program:?}: a footer's chip is no top line's to stand down"
         );
     }
     for program in [Program::Claude, Program::Muse] {

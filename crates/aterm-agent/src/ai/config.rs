@@ -310,18 +310,21 @@ fn machine_name(word: &str) -> bool {
 /// Reads `[ai]` out of `aterm.toml`'s text, leniently.
 #[must_use]
 pub fn read(text: &str) -> (Local, Vec<String>) {
-    let mut local = Local::default();
-    let mut notes = Vec::new();
-    let doc = match aterm_toml::from_str::<Value>(text) {
-        Ok(doc) => doc,
-        Err(e) => {
-            notes.push(format!(
+    match aterm_toml::from_str::<Value>(text) {
+        Ok(doc) => read_doc(&doc),
+        Err(e) => (
+            Local::default(),
+            vec![format!(
                 "aterm.toml is not TOML, so [ai] is read as empty: {}",
                 one(&e.to_string())
-            ));
-            return (local, notes);
-        }
-    };
+            )],
+        ),
+    }
+}
+
+fn read_doc(doc: &Value) -> (Local, Vec<String>) {
+    let mut local = Local::default();
+    let mut notes = Vec::new();
     let Some(ai) = doc.get(TABLE) else {
         return (local, notes);
     };
@@ -684,12 +687,39 @@ pub fn load_with(config: Option<&Path>, ai_dir: Option<&Path>, now: i64) -> Sett
             .ok()
             .flatten()
     });
-    let (local, notes) = read(text.as_deref().unwrap_or_default());
+    load_from_text(text.as_deref(), config, ai_dir, now).0
+}
+
+pub(crate) fn load_from_text(
+    text: Option<&str>,
+    config: Option<&Path>,
+    ai_dir: Option<&Path>,
+    now: i64,
+) -> (Settings, Option<Value>) {
+    let (parsed_doc, (local, notes)) = match text {
+        Some(text) => match aterm_toml::from_str::<Value>(text) {
+            Ok(doc) => {
+                let res = read_doc(&doc);
+                (Some(doc), res)
+            }
+            Err(e) => (
+                None,
+                (
+                    Local::default(),
+                    vec![format!(
+                        "aterm.toml is not TOML, so [ai] is read as empty: {}",
+                        one(&e.to_string())
+                    )],
+                ),
+            ),
+        },
+        None => (None, (Local::default(), Vec::new())),
+    };
     let source = fleet_source(&local, config);
     let fleet = source
         .as_ref()
         .map(|s| load_source(s, local.fleet_key.as_deref(), ai_dir, now));
-    resolve(&local, source.as_ref(), fleet, notes)
+    (resolve(&local, source.as_ref(), fleet, notes), parsed_doc)
 }
 
 /// [`load_with`] under aterm's own state directory, now.

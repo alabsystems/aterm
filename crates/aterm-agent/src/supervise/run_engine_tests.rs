@@ -298,7 +298,7 @@ fn err_halted_parks_until_the_hold_lifts_and_the_loop_goes_on() {
     assert!(rows[0].contains("\"decision\":\"deferred\""), "{rows:?}");
     assert!(rows[1].contains("\"decision\":\"approved\""), "{rows:?}");
     assert!(
-        rows[1].contains("\"rule_id\":\"read-only@classify-v9\""),
+        rows[1].contains("\"rule_id\":\"read-only@classify-v10\""),
         "{rows:?}"
     );
     let _ = std::fs::remove_dir_all(&jdir);
@@ -458,7 +458,7 @@ fn the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise() {
     let rows = ledger_rows(&ledger);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(
-        rows[0].contains("\"rule_id\":\"rm-breaker@v8\""),
+        rows[0].contains("\"rule_id\":\"rm-breaker@v9\""),
         "{rows:?}"
     );
     assert!(rows[0].contains("\"decision\":\"approved\""), "{rows:?}");
@@ -509,7 +509,7 @@ fn the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise() {
 }
 
 /// THE RM BREAKER'S TOO-MANY BOX OVER A PROVEN READ IS PRESSED AND LEDGERED UNDER
-/// `breaker-read-only@v9`, in a bypass session, under the safe rules alone: Claude Code 2.1.307
+/// `breaker-read-only@v10`, in a bypass session, under the safe rules alone: Claude Code 2.1.307
 /// draws that box over any command with more than 64 command substitutions, rm or none
 /// (MEASURED). The box is the MEASURED one with its command made thirteen barred lines of `echo`
 /// and five `$(true)`; the press is guarded by its first command row, and the one ledger row is
@@ -543,7 +543,7 @@ fn the_too_many_breaker_over_a_proven_read_is_ledgered_under_its_rule() {
     let rows = ledger_rows(&ledger);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(
-        rows[0].contains("\"rule_id\":\"breaker-read-only@v9\""),
+        rows[0].contains("\"rule_id\":\"breaker-read-only@v10\""),
         "{rows:?}"
     );
     assert!(rows[0].contains("\"decision\":\"approved\""), "{rows:?}");
@@ -604,7 +604,7 @@ fn breaker_run(
     (lines, m, rows, host.asks())
 }
 
-/// A TOO-MANY BOX READS NO TRANSCRIPT AND WAITS FOR NONE (`breaker-read-only@v9`): breaker-4's
+/// A TOO-MANY BOX READS NO TRANSCRIPT AND WAITS FOR NONE (`breaker-read-only@v10`): breaker-4's
 /// lane read the agent's transcript for every too-many box the screen did not prove, retried
 /// it while it named no call and waited a 1 s settle, and the call it found could only add a
 /// reading, so it decided nothing. Now the measured box (one line of `echo` and 65 `$(true)`,
@@ -653,7 +653,7 @@ fn a_too_many_box_reads_no_transcript_and_waits_for_none() {
     assert_eq!(m.presses().len(), 1, "{:?}", m.requests);
     assert!(out[0].starts_with("APPROVED seq=102 "), "{out:?}");
     assert!(
-        rows[0].contains("\"rule_id\":\"breaker-read-only@v9\""),
+        rows[0].contains("\"rule_id\":\"breaker-read-only@v10\""),
         "{rows:?}"
     );
     assert_eq!(asks, 0, "a proven box asks the transcript nothing");
@@ -11675,18 +11675,25 @@ fn tier1_the_resets_keys_go_only_where_the_model_allows() {
 
     const WEEKLY_ROW: &str = "Reset your session limit now";
     let weekly = [RESET_STOP, WEEKLY_ROW, RESET_WAIT, RESET_CREDITS];
-    let host = ResetHost::reading(ResetOutcome::Kept);
-    let mut m = reset_mock(vec![], &weekly, 0, &host);
-    let run = reset_watch(
-        "t1-reset-weekly",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        |_| {},
-    );
-    clean(&m, &host, &run);
-    assert_eq!(reset_world(&mut m).chosen, [RESET_WAIT]);
-    assert!(host.said("").is_empty(), "the host is never asked");
+    for row in [WEEKLY_ROW, "Reset your 5-hour limit now"] {
+        let host = ResetHost::reading(ResetOutcome::Kept);
+        let mut m = reset_mock(
+            vec![],
+            &[RESET_STOP, row, RESET_WAIT, RESET_CREDITS],
+            0,
+            &host,
+        );
+        let run = reset_watch(
+            "t1-reset-weekly",
+            &mut m,
+            reset_opts(&host, true, 120),
+            &fresh,
+            |_| {},
+        );
+        clean(&m, &host, &run);
+        assert_eq!(reset_world(&mut m).chosen, [RESET_WAIT], "{row}");
+        assert!(host.said("").is_empty(), "{row}: the host is never asked");
+    }
     let host = ResetHost::reading(ResetOutcome::Kept);
     let mut m = reset_mock(vec![], &weekly, 0, &host);
     assert!(m.call(&["text", "--json"]).expect("served").ok());
@@ -12441,23 +12448,6 @@ fn lane_run(
 }
 
 #[test]
-fn a_give_ups_release_goes_before_the_policys_continuation() {
-    let host = LaneHost::new(&["gave-up", "released:gave-up", "current"]);
-    let (lines, m, code) = lane_run("gave-up", &host, 6, true);
-    assert_ne!(code, EXIT_TIMEOUT, "ended by its budget: {lines:?}");
-    assert_eq!(host.said(), ["gave-up", "released:gave-up"], "{lines:?}");
-    let release = lines
-        .iter()
-        .position(|l| l.contains("HOST ") && l.ends_with("upgrade step=released:gave-up"));
-    assert!(release.is_some(), "the release is journaled: {lines:?}");
-    assert!(
-        !lines.iter().any(|l| l.starts_with("CONTINUED")),
-        "the policy typed nothing: {lines:?}"
-    );
-    assert_eq!(count(&m, "turn"), 0, "{lines:?}");
-}
-
-#[test]
 fn a_give_ups_release_gated_by_its_settle_goes_before_the_policys_continuation() {
     for (gate, released) in [
         ("wait:release:settling", true),
@@ -12530,6 +12520,7 @@ fn a_raced_wait_does_not_spend_the_give_ups_follow_up() {
             ][..],
             &["wait:failed", "wait:failed", "gave-up", "released:gave-up"][..],
         ),
+        // Unraced: the release goes before the policy's continuation.
         (
             &["gave-up", "released:gave-up", "current"][..],
             &["gave-up", "released:gave-up"][..],
@@ -13876,6 +13867,66 @@ fn a_retry_mark_read_measured_down_is_taken_up_and_handed_on_by_the_session() {
         let track = s.turn_end.retry_track().expect("the recorded retry track");
         assert_eq!((track.0, track.4), (kind, down));
         assert_eq!(s.carried().retry.map(|m| m.down), Some(down), "handed on");
+    }
+}
+
+/// A SESSION THAT WORKED UNDER A LOOP BEFORE THIS ONE IS SEEDED SO (owner ruling 2026-10-27): a
+/// point row its books recorded for it, or an act typed into it, marks the policy's state
+/// ([`TurnEndState::seed_worked`]), so under Land a person's message after the restart interrupts
+/// the work, never opens the session. A turn-ran row alone (the opening turn a restart cut, no
+/// point judged yet), another session's rows, or none, mark nothing.
+/// NEGATIVE CONTROLS: with the `seed_worked` call out of `seed_from_ledger_text`, the point and act
+/// cases fail; with any streak taken for work (`streak.is_some()`), the turn-ran case fails.
+#[test]
+fn a_session_that_worked_under_a_loop_before_is_seeded_as_worked() {
+    use crate::supervise::approvals::{
+        Carried, Outcome, RULE_POINT, RULE_TURN_RAN, Row, TURN_RAN, point_reason,
+    };
+    use crate::supervise::policy::turn_end::RULE_CONTINUE;
+    let dir = crate::supervise::ScratchDir::new("worked-before", "seed");
+    let path = dir.join("books.jsonl");
+    let now_ms = 1_790_000_000_000_i64;
+    let point = point_reason(Carried::streak(1), false);
+    let row = |rule_id, outcome, reason: &str, sid| {
+        Row {
+            rule_id,
+            outcome,
+            command: "",
+            reason,
+            box_seq: 1,
+        }
+        .to_json(now_ms - 1_000, Some(sid))
+    };
+    for (case, body, want) in [
+        (
+            "a point",
+            row(RULE_POINT, Outcome::Waiting, &point, "@s-9"),
+            true,
+        ),
+        (
+            "an act",
+            row(RULE_CONTINUE, Outcome::Typed, "", "@s-9"),
+            true,
+        ),
+        (
+            "a turn ran",
+            row(RULE_TURN_RAN, Outcome::Waiting, TURN_RAN, "@s-9"),
+            false,
+        ),
+        (
+            "another's",
+            row(RULE_POINT, Outcome::Waiting, &point, "@s-8"),
+            false,
+        ),
+        ("none", String::new(), false),
+    ] {
+        let mut ctl = Mock::new(vec![busy_screen()]);
+        let mut s = session(&mut ctl, Some("@s-9".to_string()));
+        assert!(
+            s.seed_from_ledger_text(&path, &body, now_ms, false)
+                .is_none()
+        );
+        assert_eq!(s.turn_end.worked_before(), want, "{case}: {body}");
     }
 }
 

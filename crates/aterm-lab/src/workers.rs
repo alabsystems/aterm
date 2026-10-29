@@ -1350,6 +1350,7 @@ mod tests {
         assert_eq!(iso_ms("2026-10-16T10:24:42.738Z"), Some(1_792_146_282_738));
         assert_eq!(iso_ms("2000-03-01T00:00:01Z"), Some(951_868_801_000));
         assert_eq!(iso_ms("2026-10-16 10:24:42"), None);
+        assert_eq!(iso_ms("2026-10-26 09:11:48Z"), None);
     }
 
     #[test]

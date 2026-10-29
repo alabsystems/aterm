@@ -194,6 +194,7 @@ fn charge_cursor_body(state: &mut WindowState, now: Instant) {
         true,
         geom,
         &crate::cursor_rainbow::RainbowConfig {
+            light: aterm_effects::cursor_glow::Light::OFF,
             enabled: true,
             intensity: 1.0,
             blinking: false,
@@ -223,6 +224,7 @@ fn charge_cursor_body(state: &mut WindowState, now: Instant) {
         1.0,
         geom,
         &crate::cursor_beam::BeamRodConfig {
+            light: aterm_effects::cursor_glow::Light::OFF,
             enabled: true,
             intensity: 1.0,
             color: 0x0050_FA7B,
@@ -243,6 +245,7 @@ fn charge_cursor_body(state: &mut WindowState, now: Instant) {
         1.0,
         geom,
         &crate::cursor_comet::CometConfig {
+            light: aterm_effects::cursor_glow::Light::OFF,
             enabled: true,
             intensity: 1.0,
             color: 0x0050_FA7B,

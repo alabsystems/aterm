@@ -2266,6 +2266,9 @@ fn reduce_verb(args: &[String], by: fn(&str, Program) -> Result<Reduction, Strin
     Ok(0)
 }
 
+#[path = "reduce_oracle.rs"]
+pub(crate) mod oracle;
+
 #[cfg(test)]
 #[path = "reduce_tests.rs"]
 mod tests;

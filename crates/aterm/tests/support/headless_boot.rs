@@ -636,81 +636,28 @@ pub fn ctl_ok(inst: &Instance, args: &[&str]) -> String {
     String::from_utf8(out.stdout).expect("utf-8")
 }
 
-/// Put the executable script `text` at `path`.
+/// Put the executable script `text` at `path` ([`aterm_tempfile::stand_in`]): on macOS, where
+/// this user's stand-in cache can be used, a symlink to the one file of `text` the user's
+/// stand-ins share, which no fixture's going removes a name of; off macOS, and where the cache
+/// cannot be used, a file of its own. `$0` in it is `path`, and a shell's PATH lookup names it by
+/// `path`; a program that resolves `path` reaches the shared file, outside the fixture, where
+/// there is one, and `path` itself where there is not. The file `path` runs is run once with
+/// `--version` before the test goes on ([`aterm_spec::wait::first_exec`]: once per file per
+/// process), so macOS's first assessment of it is not inside an instance's exec.
 /// # Panics
-/// When `path`'s directory cannot be made or the script cannot be written: a test without its fake
+/// When `path`'s directory cannot be made or the stand-in cannot be laid: a test without its fake
 /// decides nothing.
 pub fn standin(path: &Path, text: &str) {
-    use std::collections::BTreeMap;
-    use std::os::unix::fs::PermissionsExt;
-    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-    static SHARED: Mutex<BTreeMap<String, Arc<OnceLock<Option<PathBuf>>>>> =
-        Mutex::new(BTreeMap::new());
-
     CONFIGURED.with_borrow_mut(|configured| {
         if let Some(standins) = configured {
             standins.push(path.to_owned());
         }
     });
-    let once = Arc::clone(
-        SHARED
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(text.to_owned())
-            .or_default(),
-    );
-    let shared = once.get_or_init(|| {
-        let file = shared_file(text)?;
-        run_once(&file);
-        Some(file)
-    });
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).expect("mkdir");
     }
-    let _ = std::fs::remove_file(path);
-    if shared
-        .as_ref()
-        .is_some_and(|file| std::fs::hard_link(file, path).is_ok())
-    {
-        return;
-    }
-    std::fs::write(path, text).expect("write the fake");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    run_once(path);
-}
-
-fn shared_file(text: &str) -> Option<PathBuf> {
-    use std::hash::{Hash, Hasher};
-    use std::os::unix::fs::PermissionsExt;
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("aterm-live-standins");
-    std::fs::create_dir_all(&dir).ok()?;
-    let mut digest = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut digest);
-    let name = format!("{:016x}-{}", digest.finish(), text.len());
-    let file = dir.join(&name);
-    let whole = |file: &Path| {
-        std::fs::metadata(file)
-            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o777 == 0o555)
-            && std::fs::read(file).ok().as_deref() == Some(text.as_bytes())
-    };
-    if !whole(&file) {
-        let own = dir.join(format!(".{name}.{}", std::process::id()));
-        let _ = std::fs::remove_file(&own);
-        std::fs::write(&own, text).ok()?;
-        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o555)).ok()?;
-        let _ = std::fs::hard_link(&own, &file);
-        let _ = std::fs::remove_file(&own);
-    }
-    whole(&file).then_some(file)
-}
-
-fn run_once(file: &Path) {
-    let _ = Command::new(file)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    aterm_tempfile::stand_in(path, text).expect("lay the stand-in");
+    aterm_spec::wait::first_exec(path, &["--version"]);
 }
 
 /// `key=value` out of a status/sessions line.
@@ -718,6 +665,18 @@ pub fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let prefix = format!("{key}=");
     line.split_whitespace()
         .find_map(|t| t.strip_prefix(prefix.as_str()))
+}
+
+/// `who`'s `watchers=` for `sid`.
+pub fn watchers(inst: &Instance, sid: &str) -> usize {
+    let who = ctl_ok(inst, &["who"]);
+    let row = who
+        .lines()
+        .find(|l| l.split_whitespace().nth(1) == Some(sid))
+        .unwrap_or_else(|| panic!("no `who` row for {sid}: {who}"));
+    field(row, "watchers")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no watchers= in {row}"))
 }
 
 /// The boot session's `(local, sid)` from `sessions`.

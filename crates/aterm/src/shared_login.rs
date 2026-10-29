@@ -17,6 +17,37 @@ use std::{collections::BTreeMap, ffi::OsString, path::PathBuf, process::ExitCode
 
 const USAGE: &str = "aterm harness accounts shared-renew <local-label> --account <digest> --decision <digest> --request <nonce> [--config <aterm.toml>]\nRenews one existing local Claude OAuth row using an exact current root grant.\n";
 
+pub(super) fn install_automatic() {
+    aterm_agent::harness::accounts_sync::shared_renewal::install_authority(automatic_authority);
+}
+
+fn automatic_authority(
+    home: &std::path::Path,
+    source: accounts::shared::Source,
+    row: &accounts::Row,
+) -> Result<aterm_agent::harness::accounts_sync::shared_renewal::CheckedAuthority, String> {
+    let paths = Paths::for_home(home);
+    let expected = client::config(&paths)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "shared renewal requires an enrolled vault".to_owned())?;
+    let aterm_db::accounts::activations::State::Ready(decision) = Activations::at(paths.clone())
+        .state(source.account)
+        .map_err(|e| e.to_string())?
+    else {
+        return Err("shared renewal has no unique current root preparation".into());
+    };
+    let approved = Approved {
+        paths,
+        expected,
+        account: source.account,
+        decision,
+    };
+    if approved.read(row)?.source != source {
+        return Err("shared renewal belongs to a different retained network".into());
+    }
+    Ok(std::sync::Arc::new(approved))
+}
+
 struct Approved {
     paths: Paths,
     expected: Config,
@@ -336,6 +367,7 @@ mod tests {
             claude_pid: None,
             codex_thread: None,
             codex_home: None,
+            codex_login: None,
             agy_conversation: None,
             now: 1_700_000_000,
             sid: String::new(),
@@ -513,6 +545,25 @@ mod tests {
     }
 
     #[test]
+    fn automatic_upkeep_resolves_only_the_pinned_network_and_current_root_head() {
+        let (_home, approved, row) = fixture();
+        let grant = approved.prepare(&row).unwrap();
+        let automatic = automatic_authority(&approved.paths.home, grant.source, &row).unwrap();
+        assert_eq!(automatic.prepare(&row).unwrap(), grant);
+        let mut foreign = grant.source;
+        foreign.network[0] ^= 1;
+        assert!(automatic_authority(&approved.paths.home, foreign, &row).is_err());
+        let db = Activations::at(approved.paths.clone());
+        let admin = client::admin_open(&approved.paths).unwrap();
+        let stop = db
+            .stop_request(approved.account, vec![grant.decision])
+            .unwrap();
+        db.issue(&admin, [3; 16], stop).unwrap();
+        assert!(automatic.current(&grant, &row).is_err());
+        assert!(automatic_authority(&approved.paths.home, grant.source, &row).is_err());
+    }
+
+    #[test]
     fn root_adapter_refuses_an_unrecognized_required_detail() {
         let (_home, approved, row) = fixture_with_extra(None, true, None);
         let error = approved.prepare(&row).unwrap_err();
@@ -684,19 +735,6 @@ mod tests {
         );
         row.browser = Some("Other profile".into());
         assert!(approved.prepare(&row).is_err());
-    }
-
-    #[test]
-    fn a_stop_withholds_even_a_previously_matching_owned_configuration() {
-        let (_home, approved, row) = fixture();
-        let grant = approved.prepare(&row).unwrap();
-        let db = Activations::at(approved.paths.clone());
-        let admin = client::admin_open(&approved.paths).unwrap();
-        let stop = db
-            .stop_request(approved.account, vec![grant.decision])
-            .unwrap();
-        db.issue(&admin, [3; 16], stop).unwrap();
-        assert!(approved.current(&grant, &row).is_err());
     }
 
     #[test]

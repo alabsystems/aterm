@@ -27,11 +27,12 @@ pub const AUTO_FREE_PCT: u64 = 5;
 /// The warning threshold is at least this percent of the volume's size.
 pub const WARN_FREE_PCT: u64 = 8;
 
-/// The most the volume's share ([`AUTO_FREE_PCT`]) raises the automatic floor to.
-pub const AUTO_FREE_SHARE_MAX_GIB: u64 = 32;
+/// The most the volume's share ([`AUTO_FREE_PCT`]) raises the automatic floor to: enough room
+/// for concurrent builds on multi-terabyte volumes before their room history is warm.
+pub const AUTO_FREE_SHARE_MAX_GIB: u64 = 256;
 
 /// The most the volume's share ([`WARN_FREE_PCT`]) raises the warning to.
-pub const WARN_FREE_SHARE_MAX_GIB: u64 = 64;
+pub const WARN_FREE_SHARE_MAX_GIB: u64 = 512;
 
 /// The most the volume's share ([`EMERGENCY_FREE_PCT`]) raises the emergency line to.
 pub const EMERGENCY_FREE_SHARE_MAX_GIB: u64 = 8;

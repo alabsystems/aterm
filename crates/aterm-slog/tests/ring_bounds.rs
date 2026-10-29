@@ -1014,3 +1014,64 @@ fn an_open_under_a_closed_node_hangs_the_same_whatever_was_evicted() {
     assert!(small.node_view(first).is_none(), "evicted, forgotten");
     assert!(big.node_view(first).is_some(), "still indexed");
 }
+
+#[test]
+fn a_run_amended_again_and_again_pins_only_its_newest_identity() {
+    let mut log = Log::new(1);
+    let run = agent_session(&mut log, 0);
+    let mut ms = 10;
+    for i in 0..3_000u64 {
+        ms += 10;
+        let model = if i % 2 == 0 { "opus" } else { "sonnet" };
+        let mut f = Fields::new().tok(Key::Model, model).expect("a model");
+        if i == 0 {
+            f = f.tok(Key::Ver, "2.1.0").expect("a version");
+        }
+        log.amend(
+            run,
+            Amend::new(Kind::Agent, Src::Transcript, Conf::Exact, f),
+            at(ms),
+        )
+        .expect("the model amends");
+        if i == 0 {
+            assert_eq!(
+                log.pinned_bytes(),
+                log.bytes(),
+                "the session's open, the run's and the amend that rides it: all pinned"
+            );
+        }
+        let t = log
+            .open(
+                Open::new(Kind::Turn, Src::Screen, Conf::Strong).under(run),
+                at(ms + 1),
+            )
+            .expect("a turn");
+        log.close(
+            t,
+            Close::new(Out::Turn(TurnOut::Done), Src::Screen, Conf::Strong),
+            at(ms + 2),
+        )
+        .expect("the turn closes");
+        assert!(
+            log.len() <= MAX_RECORDS && log.bytes() <= MAX_BYTES,
+            "the ring keeps its bounds at {i}: {} records",
+            log.len()
+        );
+    }
+    assert!(log.lost() > 0, "PRECONDITION: the ring evicted");
+    let riders: Vec<Option<&str>> = log
+        .window()
+        .filter(|r| r.node == run && r.op == aterm_slog::Op::Amend)
+        .filter(|r| log.class_of(r) == EvictClass::Pinned)
+        .map(|r| r.f.get_str(Key::Ver))
+        .collect();
+    assert_eq!(
+        riders,
+        [Some("2.1.0"), None],
+        "the open run pins the amend that named its version and its newest model, no other"
+    );
+    assert_eq!(
+        log.state().run().and_then(|r| r.f.str(Key::Model)),
+        Some("sonnet")
+    );
+}

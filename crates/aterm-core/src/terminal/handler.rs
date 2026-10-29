@@ -19,11 +19,17 @@ mod handler_actions;
 mod handler_csi;
 #[path = "handler_dcs.rs"]
 mod handler_dcs;
+#[path = "handler_decrsps.rs"]
+pub(super) mod handler_decrsps;
 #[path = "handler_esc.rs"]
 mod handler_esc;
 #[path = "handler_write.rs"]
 mod handler_write;
 
+pub(crate) use handler_actions::{
+    MAX_KITTY_FRAMES, MAX_KITTY_IMAGE_BYTES, MAX_KITTY_IMAGES, MAX_KITTY_STORE_BYTES,
+    MAX_KITTY_VARIANTS, MAX_KITTY_VIRTUALS,
+};
 pub(crate) use handler_write::is_vs16_emoji_capable;
 
 /// Single-source mapping from `TerminalHandler` fields to `Terminal` borrow paths.

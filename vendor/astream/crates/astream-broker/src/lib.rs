@@ -124,6 +124,7 @@ mod compact;
 #[cfg(test)]
 mod crash_sim;
 mod escalation;
+pub mod federation;
 pub mod health;
 #[cfg(feature = "retention")]
 mod held;
@@ -149,9 +150,10 @@ pub use brecord::{
     MAX_RECORD_PAYLOAD, RETIRE_PRODUCER_SEQ,
 };
 pub use broker::{
-    broker_batch_clamp, broker_wake_attempts_within_cap, identity_principal, tail_skip_clamp,
-    tail_wake_head_advance, tail_wake_is_caught_up, Broker, BrokerHandle, BrokerStats,
-    FollowerTransport, IDLE_MARK, IDLE_MARK_DEADLINE, KEEPALIVE_DEADLINE, KEEPALIVE_INTERVAL,
+    broker_batch_clamp, broker_wake_attempts_within_cap, identity_principal, rate_clock_advance,
+    rate_tokens_clamp, rate_tokens_sufficient, tail_skip_clamp, tail_wake_head_advance,
+    tail_wake_is_caught_up, Broker, BrokerHandle, BrokerStats, FollowerTransport, IDLE_MARK,
+    IDLE_MARK_DEADLINE, KEEPALIVE_DEADLINE, KEEPALIVE_INTERVAL,
 };
 pub use client::{
     ack, acks_owed, broker_refusal, client_walk_page_advance, client_walk_within_limit, connect,
@@ -159,6 +161,11 @@ pub use client::{
     Client, Closer, CreditWindow, Event, Page, Pipelined, ProtocolMismatch, Record, StampedPage,
     StampedRecord, SubjectBudget, Subscription, SubscriptionCloser, Transport, Walk, ACK_SEQ_BASE,
     LAST_WALK_PAGES_MAX,
+};
+pub use federation::{
+    federation_cursor_advance, federation_hop_allowed, federation_seq_clamp, FederatedCut,
+    FederationBridge, FederationConfig, FederationEndpoint, FederationError, FederationLink,
+    FederationReport, FederationWire, SubjectRewrite,
 };
 
 /// Capability minting and principal derivation (`cap` feature), re-exported so
@@ -184,8 +191,9 @@ pub use logid::{
 };
 pub use proto::{
     AttachedProducerStats, FaceStats, Gap, HelloHealth, NonceExt, Request, Response, ServedInfo,
-    ServedReason, Tier, WireStats, ERR_RETIRE_REFUSED, HELLO_REASON_MAX, REQUEST_BROKER_TIMES,
-    REQUEST_GAP_NOTICES, REQUEST_RETIRE, REQUEST_STATS, REQUEST_TOLD_FETCH,
+    ServedReason, Tier, WireStats, ERR_RATE_LIMITED, ERR_RETIRE_REFUSED, HELLO_REASON_MAX,
+    RATE_LIMITED_PREFIX, REQUEST_BROKER_TIMES, REQUEST_GAP_NOTICES, REQUEST_RETIRE, REQUEST_STATS,
+    REQUEST_TOLD_FETCH,
 };
 pub use recover::{recover_keep_within_len, recover_unit_start_advance};
 #[cfg(feature = "retention")]
@@ -202,8 +210,8 @@ pub use store::{
     at_rest_version_advance, at_rest_version_is_bound, broker_bt_advance, incarnation_base,
     incarnation_of, is_hidden_record, on_boot_volume, store_ack_seq_in_reserved_half,
     store_head_advance, will_seq, Boot, BrokerLog, CheckedPublishError, Durability, FlushCounts,
-    InjectedFaults, LogStats, OpenOptions, Prepared, ToldPage, Volume, INC_MAX, ORDERED_HORIZON,
-    RETIRE_SUBJECT, WILL_SEQ_LOW,
+    InjectedFaults, LogStats, OpenOptions, Prepared, RateLimit, ToldPage, Volume, INC_MAX,
+    MAX_RATE_BUDGET, ORDERED_HORIZON, RETIRE_SUBJECT, WILL_SEQ_LOW,
 };
 
 #[cfg(test)]

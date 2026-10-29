@@ -9,7 +9,8 @@
 //! `aterm-models`' `non_vacuity`.
 
 use aterm_models_harness::{
-    wake_book_liveness, wake_book_model, wake_room_liveness, wake_room_model,
+    wake_book_left_liveness, wake_book_liveness, wake_book_model, wake_room_liveness,
+    wake_room_model,
 };
 use aterm_spec::derive::Model;
 use aterm_spec::interp;
@@ -23,7 +24,7 @@ const BOOK_CONFIGS: [Config; 4] = [&[], &[("Prompt", 0)], &[("Managed", 1)], &[(
 
 /// Each mutant of the book, its dial, the law it was written to break, and the configuration it
 /// breaks it under.
-const BOOK_MUTANTS: [(&str, i64, &str, Config); 15] = [
+const BOOK_MUTANTS: [(&str, i64, &str, Config); 17] = [
     ("ParkDeaf", 1, "NoDeafWaiter", &[]),
     ("DeclareFromOutside", 2, "OnlyItsOwnTree", &[]),
     ("AwaitFromAnyone", 3, "OnlyItsOwnTree", &[]),
@@ -49,6 +50,8 @@ const BOOK_MUTANTS: [(&str, i64, &str, Config); 15] = [
     ("ReleaseAfterTyped", 13, "OneTypedLine", &[]),
     ("RetellAfterHeard", 14, "NoTellAfterHeard", &[]),
     ("AnswerTwice", 15, "OneAnswer", &[]),
+    ("ReleaseOnLeft", 16, "OneTypedLine", &[]),
+    ("KeepOnClear", 1, "AClearedLineGivesItsClaimBack", &[]),
 ];
 
 /// Each mutant of the room, its dial and the law it was written to break.
@@ -148,6 +151,11 @@ fn each_mutant_breaks_its_own_law_alone() {
 fn each_liveness_mutant_has_an_invariant_twin() {
     for (model, live, twin) in [
         (wake_book_model(), wake_book_liveness(), "NoDeafWaiter"),
+        (
+            wake_book_model(),
+            wake_book_left_liveness(),
+            "AClearedLineGivesItsClaimBack",
+        ),
         (
             wake_room_model(),
             wake_room_liveness(),
@@ -309,6 +317,92 @@ fn a_crash_mid_write_retells_once() {
     );
     assert_eq!((twice["typed"], twice["midwrite"]), (2, 0));
     assert!(!wrong.check_invariant("OneTypedLine", &twice));
+}
+
+/// A claim's line left in the composer keeps the claim: no second claim, and no door writes over
+/// it; sent, the look tells it (one line typed, the person's or the policy's Enter); cleared
+/// unsent, the look gives the claim back; a successor keeps it. Given back at its write (every
+/// door before the slice-2 plan's 2.9b), the line goes out and a door tells the wake again; kept
+/// for good once cleared, the claim never comes back.
+#[test]
+fn a_left_line_keeps_its_claim_until_the_look() {
+    let m = book(&[]);
+    let left = walk(&m, &then(&["Break", "Claim", "WriteLeft"]));
+    assert_eq!(
+        (left["st"], left["lk"], left["comp"], left["typed"]),
+        (5, 1, 1, 0)
+    );
+    for teller in ["Claim", "Write", "Release", "Reconcile", "CrashMidWrite"] {
+        assert!(
+            !m.action_enabled(teller, &left),
+            "{teller} while the line stands"
+        );
+    }
+    let sent = walk(&m, &then(&["Break", "Claim", "WriteLeft", "SubmitLeft"]));
+    assert!(
+        !m.action_enabled("Release", &sent),
+        "a sent line is never given back"
+    );
+    let told = walk(
+        &m,
+        &then(&["Break", "Claim", "WriteLeft", "SubmitLeft", "Write"]),
+    );
+    assert_eq!((told["st"], told["typed"], told["lk"]), (6, 1, 0));
+    let cleared = walk(&m, &then(&["Break", "Claim", "WriteLeft", "ClearLeft"]));
+    assert!(
+        !m.action_enabled("Write", &cleared),
+        "a cleared line is never told"
+    );
+    let back = walk(
+        &m,
+        &then(&["Break", "Claim", "WriteLeft", "ClearLeft", "Release"]),
+    );
+    assert_eq!((back["st"], back["typed"], back["lk"]), (2, 0, 0));
+    assert!(m.action_enabled("Claim", &back), "{back:?}");
+    let kept = walk(&m, &then(&["Break", "Claim", "WriteLeft", "KeepLeft"]));
+    assert_eq!((kept["st"], kept["lk"], kept["comp"]), (5, 1, 1));
+    // The successor cannot weigh its predecessor's count: a clear composer is told, sent or not.
+    let unweighed = walk(
+        &m,
+        &then(&["Break", "Claim", "WriteLeft", "KeepLeft", "ClearLeft"]),
+    );
+    assert!(
+        !m.action_enabled("Release", &unweighed),
+        "a successor never gives back a line it cannot weigh"
+    );
+    let told = walk(
+        &m,
+        &then(&[
+            "Break",
+            "Claim",
+            "WriteLeft",
+            "KeepLeft",
+            "ClearLeft",
+            "Write",
+        ]),
+    );
+    assert_eq!((told["st"], told["typed"], told["lk"]), (6, 0, 0));
+    let old = interp::with_buggy(&m, 16);
+    let twice = walk(
+        &old,
+        &then(&[
+            "Break",
+            "Claim",
+            "ReleaseOnLeft",
+            "SubmitLeft",
+            "Claim",
+            "Write",
+        ]),
+    );
+    assert_eq!(twice["typed"], 2);
+    assert!(!old.check_invariant("OneTypedLine", &twice));
+    let stuck = interp::with_buggy(&m, 1);
+    let wrong = walk(
+        &stuck,
+        &then(&["Break", "Claim", "WriteLeft", "ClearLeft", "KeepOnClear"]),
+    );
+    assert!(!stuck.action_enabled("Release", &wrong), "{wrong:?}");
+    assert!(!stuck.check_invariant("AClearedLineGivesItsClaimBack", &wrong));
 }
 
 /// Under `observe` an await is still answered and no line is typed; a managed worker and an

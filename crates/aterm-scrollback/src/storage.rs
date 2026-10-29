@@ -100,6 +100,34 @@ impl ScrollbackStorage {
         }
     }
 
+    /// Inline-image spans on uncompressed line `idx` (`0` = oldest across all tiers), if any.
+    /// Compressed warm and cold lines carry no images and return `None` without decompressing.
+    #[must_use]
+    pub fn line_images(&self, idx: usize) -> Option<&[ImageSpan]> {
+        match self {
+            Self::Memory(sb) => {
+                let non_hot = sb.cold.line_count().saturating_add(sb.warm.line_count());
+                let hot_idx = idx.checked_sub(non_hot)?;
+                sb.hot.line_images(hot_idx)
+            }
+        }
+    }
+
+    /// Replaces inline-image spans on hot line `rev_idx` (`0` = newest in hot tier), reconciling byte counts.
+    /// Returns `false` when `rev_idx` falls in a compressed tier.
+    pub fn set_hot_line_images(&mut self, rev_idx: usize, spans: Vec<ImageSpan>) -> bool {
+        match self {
+            Self::Memory(sb) => {
+                let changed = sb.hot.set_line_images_rev(rev_idx, spans);
+                if changed {
+                    sb.sync_accounting();
+                    sb.assert_bytes_used_invariant();
+                }
+                changed
+            }
+        }
+    }
+
     /// Retains accepted image spans without changing history's text, order or retention horizon.
     /// Returns whether any image span was removed.
     pub fn retain_images(&mut self, keep: &mut dyn FnMut(&ImageSpan) -> bool) -> bool {

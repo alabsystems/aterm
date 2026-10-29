@@ -227,6 +227,11 @@ fn a_gateway_card_does_not_open_under_a_hold() {
             .is_some_and(|refusal| refusal.starts_with("ERR halted ")),
         "a fact's menu named by its fact"
     );
+    assert!(
+        open_halt_refusal(&store, "open", "autopilot-menu at=20,40 by=pointer")
+            .is_some_and(|refusal| refusal.starts_with("ERR halted ")),
+        "the Autopilot menu a program asks for at its own cell"
+    );
     for other in ["prefs", "about", "update", "", "app settings"] {
         assert!(
             open_halt_refusal(&store, "open", other).is_none(),

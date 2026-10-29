@@ -668,6 +668,12 @@ impl App {
 
     /// Drop the screen history `session` keeps, closing its Rewind view first; it records on from its screen now.
     pub(crate) fn forget_history(&mut self, session: u64) -> Result<(), String> {
+        self.forget_history_inner(session)?;
+        aterm_uds::process::release_free_memory();
+        Ok(())
+    }
+
+    fn forget_history_inner(&mut self, session: u64) -> Result<(), String> {
         if !self.session_records(session) {
             return Err(NOT_RECORDING.to_string());
         }
@@ -690,10 +696,14 @@ impl App {
             .into_iter()
             .filter(|&id| self.session_records(id))
             .collect();
-        sessions
+        let forgot = sessions
             .into_iter()
-            .filter(|&id| self.forget_history(id).is_ok())
-            .count()
+            .filter(|&id| self.forget_history_inner(id).is_ok())
+            .count();
+        if forgot > 0 {
+            aterm_uds::process::release_free_memory();
+        }
+        forgot
     }
 
     /// Tell the Rewind pool which pane is in front, so it sheds that pane's history last.

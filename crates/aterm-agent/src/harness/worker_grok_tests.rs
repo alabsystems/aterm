@@ -346,133 +346,151 @@ fn a_grok_worker_stays_refused_whatever_flips() {
     );
 }
 
-/// ONLY A ROW THE DEFAULT SET DOES NOT KEEP IS INSTALLED ON DEMAND: Grok Build's; the rows the
-/// default set keeps (Claude Code, Codex, agy, Muse Code) are its update pass's to install.
-#[test]
-fn only_a_row_outside_the_default_set_installs_on_demand() {
-    for cli in &WORKERS {
-        let want = atpkg::vendor_direct::spec(cli.word).is_some_and(|spec| !spec.default_set);
-        assert_eq!(cli.on_demand().is_some(), want, "{:?}", cli.agent);
-    }
-    assert_eq!(grok().on_demand(), Some(PROGRAM));
-    assert_eq!(
-        worker_cli(Program::Claude).and_then(super::super::WorkerCli::on_demand),
-        None
-    );
-}
-
-/// What a fake installer was asked, and what it does.
-struct FakeInstaller {
+/// What a fake atpkg store was asked, in order, and what it does: it holds a build once `lays`
+/// ran an install, and `fails` is the words of an install that failed.
+struct FakeStore {
     asked: RefCell<Vec<String>>,
+    present: RefCell<bool>,
+    held: Option<&'static str>,
     lays: bool,
     fails: Option<&'static str>,
-    installed: RefCell<bool>,
 }
 
-impl FakeInstaller {
-    fn new(lays: bool, fails: Option<&'static str>) -> Self {
+impl FakeStore {
+    fn new(
+        present: bool,
+        held: Option<&'static str>,
+        lays: bool,
+        fails: Option<&'static str>,
+    ) -> Self {
         Self {
             asked: RefCell::new(Vec::new()),
+            present: RefCell::new(present),
+            held,
             lays,
             fails,
-            installed: RefCell::new(false),
         }
     }
 
+    fn present(&self, program: &str) -> bool {
+        self.asked.borrow_mut().push(format!("present {program}"));
+        *self.present.borrow()
+    }
+
+    fn held(&self, program: &str) -> Option<String> {
+        self.asked.borrow_mut().push(format!("held {program}"));
+        self.held.map(str::to_string)
+    }
+
     fn install(&self, program: &str) -> Result<(), String> {
-        self.asked.borrow_mut().push(program.to_string());
+        self.asked.borrow_mut().push(format!("install {program}"));
         if let Some(why) = self.fails {
             return Err(why.to_string());
         }
         if self.lays {
-            *self.installed.borrow_mut() = true;
+            *self.present.borrow_mut() = true;
         }
         Ok(())
     }
-}
 
-/// `spawn agent=grok` INSTALLS GROK BUILD ON DEMAND, BEFORE ITS LINE: absent, atpkg's install
-/// runs once for `grok` and the worker goes on once it is there; present, nothing installs; a
-/// person's hold (`[packages] exclude`, a removal) installs nothing; a failed install, or one
-/// that leaves no `grok`, starts no worker and says why. A row the default set keeps never asks.
-#[test]
-fn spawn_agent_grok_installs_grok_on_demand_before_its_line() {
-    let fresh = FakeInstaller::new(true, None);
-    assert_eq!(
+    fn ensure(&self, cli: &super::super::WorkerCli) -> Result<Readiness, String> {
         ensure_program(
-            grok(),
-            |p| {
-                assert_eq!(p, "grok");
-                *fresh.installed.borrow()
-            },
-            |_| None,
-            |p| fresh.install(p),
-        ),
-        Ok(Readiness::Installed)
-    );
-    assert_eq!(*fresh.asked.borrow(), ["grok"], "installed once, by name");
+            cli,
+            |p| self.present(p),
+            |p| self.held(p),
+            |p| self.install(p),
+        )
+    }
 
-    let there = FakeInstaller::new(true, None);
-    *there.installed.borrow_mut() = true;
-    assert_eq!(
-        ensure_program(
-            grok(),
-            |_| *there.installed.borrow(),
-            |_| panic!("a present program is never held"),
-            |p| there.install(p),
-        ),
-        Ok(Readiness::Present)
-    );
-    assert!(there.asked.borrow().is_empty(), "nothing installed");
-
-    let held = FakeInstaller::new(true, None);
-    let err = ensure_program(
-        grok(),
-        |_| false,
-        |_| Some("`[packages] exclude` in aterm.toml names it".to_string()),
-        |p| held.install(p),
-    )
-    .expect_err("held back");
-    assert!(err.contains("exclude"), "{err}");
-    assert!(held.asked.borrow().is_empty(), "a person's hold stands");
-
-    let failing = FakeInstaller::new(true, Some("vendor unreachable: x.ai"));
-    let err = ensure_program(grok(), |_| false, |_| None, |p| failing.install(p))
-        .expect_err("a failed install");
-    assert!(err.contains("vendor unreachable: x.ai"), "{err}");
-
-    let empty = FakeInstaller::new(false, None);
-    let err = ensure_program(
-        grok(),
-        |_| *empty.installed.borrow(),
-        |_| None,
-        |p| empty.install(p),
-    )
-    .expect_err("nothing laid");
-    assert!(err.contains("left no grok installed"), "{err}");
-    assert_eq!(*empty.asked.borrow(), ["grok"]);
-
-    for cli in WORKERS.iter().filter(|c| c.on_demand().is_none()) {
-        assert_eq!(
-            ensure_program(
-                cli,
-                |_| panic!("{:?}: looked for", cli.agent),
-                |_| panic!("{:?}: held", cli.agent),
-                |_| panic!("{:?}: installed", cli.agent),
-            ),
-            Ok(Readiness::Kept),
-            "{:?}",
-            cli.agent
-        );
+    fn asked(&self) -> Vec<String> {
+        self.asked.borrow().clone()
     }
 }
 
-/// ADMISSION ASKS THE SIGN-IN BEFORE IT INSTALLS ANYTHING. Signed out, `spawn agent=grok` is
-/// refused as signed out and the store is never asked: installing would lay `agents/grok` on
-/// every shell's `PATH`, where an agent typing `grok` would open xAI's sign-in page. Signed in,
-/// an absent `grok` is installed once and the starter is admitted as installed; a present one
-/// is admitted as present. A row with no sign-in hazard and no on-demand program (Claude Code)
-/// is admitted without asking the store at all.
+/// A SPAWN INSTALLS ITS PROGRAM WHERE ATPKG'S STORE HOLDS NONE AND NOBODY KEEPS IT OFF, FOR EVERY
+/// ROW ATPKG SHIPS: every one is in atpkg's default set, but a spawn can come before its update
+/// pass lands it (a fresh Mac) or after its install failed, and the line must not type a program
+/// that is not there. Absent, atpkg's install runs once by name and the worker goes on once the
+/// build is there. CONTROLS: present, nothing installs; a person's hold (`[packages] exclude`, a
+/// removal) installs nothing and is said, carrying the hold's words, and the line runs any copy
+/// of the shell's own; a failed install, or one that leaves nothing, starts no worker and
+/// carries atpkg's words.
+#[test]
+fn a_spawn_installs_an_absent_program_unless_a_person_keeps_it_off() {
+    for cli in &WORKERS {
+        let Some(program) = cli.atpkg_program() else {
+            let untouched = FakeStore::new(false, None, true, None);
+            assert_eq!(untouched.ensure(cli), Ok(Readiness::Unshipped));
+            assert!(untouched.asked().is_empty(), "{:?}", cli.agent);
+            continue;
+        };
+        let absent = FakeStore::new(false, None, true, None);
+        assert_eq!(
+            absent.ensure(cli),
+            Ok(Readiness::Installed),
+            "{:?}",
+            cli.agent
+        );
+        assert_eq!(
+            absent.asked(),
+            [
+                format!("present {program}"),
+                format!("held {program}"),
+                format!("install {program}"),
+                format!("present {program}"),
+            ],
+            "{:?}: installed once, by name",
+            cli.agent
+        );
+
+        let there = FakeStore::new(true, Some("never asked"), true, None);
+        assert_eq!(there.ensure(cli), Ok(Readiness::Present), "{:?}", cli.agent);
+        assert_eq!(
+            there.asked(),
+            [format!("present {program}")],
+            "CONTROL: present"
+        );
+
+        for hold in [
+            "`[packages] exclude` in aterm.toml names it",
+            "a person removed it (`aterm pkg install x` brings it back)",
+        ] {
+            let held = FakeStore::new(false, Some(hold), true, None);
+            let readiness = held.ensure(cli).expect("a hold is no refusal");
+            let Readiness::KeptOff(said) = &readiness else {
+                panic!("{:?}: {readiness:?}", cli.agent);
+            };
+            assert!(said.contains(hold), "the hold's words are carried: {said}");
+            assert_eq!(
+                held.asked(),
+                [format!("present {program}"), format!("held {program}")],
+                "CONTROL: {:?} kept off installs nothing",
+                cli.agent
+            );
+        }
+
+        let failing = FakeStore::new(false, None, true, Some("vendor head unreachable"));
+        let err = failing.ensure(cli).expect_err("a failed install");
+        assert!(err.contains("vendor head unreachable"), "{err}");
+
+        let empty = FakeStore::new(false, None, false, None);
+        assert!(empty.ensure(cli).is_err(), "{:?}: nothing laid", cli.agent);
+        assert_eq!(empty.asked().len(), 4, "{:?}", cli.agent);
+    }
+    assert_eq!(
+        grok().atpkg_program(),
+        Some(PROGRAM),
+        "PRECONDITION: atpkg ships grok"
+    );
+}
+
+/// ADMISSION ASKS THE SIGN-IN BEFORE IT READS THE STORE OR INSTALLS ANYTHING. Signed out, `spawn
+/// agent=grok` is refused as signed out and the store is never asked: installing would lay
+/// `agents/grok` on every shell's `PATH` signed out, and its line would open xAI's sign-in page.
+/// Signed in, an absent `grok` is installed once and the starter is admitted as installed; a
+/// held one is admitted kept off, installing nothing; a present one is admitted as present; a
+/// failed install is refused as [`Refused::Program`]. A row with no sign-in hazard (Claude Code)
+/// is admitted on the store's word alone.
 #[test]
 fn admission_asks_the_sign_in_before_it_installs_anything() {
     let d = aterm_tempfile::Builder::new()
@@ -482,90 +500,69 @@ fn admission_asks_the_sign_in_before_it_installs_anything() {
     let user = d.path().join("home");
     let default_home = user.join(DEFAULT_HOME);
     std::fs::create_dir_all(&default_home).expect("~/.grok");
-    let asked = RefCell::new(Vec::<String>::new());
-    let ask = |what: &str| asked.borrow_mut().push(what.to_string());
+    let admit_on = |cli, store: &FakeStore| {
+        admit(
+            cli,
+            grok().plain(),
+            Some(&user),
+            |p| store.present(p),
+            |p| store.held(p),
+            |p| store.install(p),
+        )
+    };
 
-    let refused = admit(
-        grok(),
-        grok().plain(),
-        Some(&user),
-        |_| {
-            ask("present");
-            false
-        },
-        |_| {
-            ask("held");
-            None
-        },
-        |_| {
-            ask("install");
-            Ok(())
-        },
-    )
-    .expect_err("signed out: refused");
+    let signed_out = FakeStore::new(false, None, true, None);
+    let refused = admit_on(grok(), &signed_out).expect_err("signed out: refused");
     assert!(
         matches!(&refused, Refused::SignedOut(why) if why.contains("auth.json")),
         "{refused:?}"
     );
     assert!(
-        asked.borrow().is_empty(),
-        "nothing installed for a signed-out worker: {:?}",
-        asked.borrow()
+        signed_out.asked().is_empty(),
+        "nothing read or installed for a signed-out worker: {:?}",
+        signed_out.asked()
     );
 
     std::fs::write(default_home.join(AUTH_FILE), "{\"token\":\"t\"}").expect("a sign-in");
-    let installed = RefCell::new(false);
-    let admitted = admit(
-        grok(),
-        grok().plain(),
-        Some(&user),
-        |_| {
-            ask("present");
-            *installed.borrow()
-        },
-        |_| {
-            ask("held");
-            None
-        },
-        |p| {
-            ask(&format!("install {p}"));
-            *installed.borrow_mut() = true;
-            Ok(())
-        },
-    )
-    .expect("signed in: admitted");
-    assert_eq!(admitted.readiness(), Readiness::Installed);
+    let absent = FakeStore::new(false, None, true, None);
+    let admitted = admit_on(grok(), &absent).expect("signed in: admitted");
+    assert_eq!(admitted.readiness(), &Readiness::Installed);
+    assert_eq!(admitted.kept_off(), None);
     assert_eq!(admitted.starter(), &grok().plain());
     assert_eq!(
-        *asked.borrow(),
-        ["present", "held", "install grok", "present"],
+        absent.asked(),
+        ["present grok", "held grok", "install grok", "present grok"],
         "installed once, after the sign-in"
     );
-    asked.borrow_mut().clear();
 
-    let present = admit(
-        grok(),
-        grok().plain(),
-        Some(&user),
-        |_| true,
-        |_| panic!("a present program is never held"),
-        |_| panic!("a present program is never installed"),
-    )
-    .expect("present");
-    assert_eq!(present.readiness(), Readiness::Present);
-
-    let failing = admit(
-        grok(),
-        grok().plain(),
-        Some(&user),
-        |_| false,
-        |_| None,
-        |_| Err("vendor unreachable: x.ai".to_string()),
-    )
-    .expect_err("a failed install");
+    let held = FakeStore::new(
+        false,
+        Some("`[packages] exclude` in aterm.toml names it"),
+        true,
+        None,
+    );
+    let admitted = admit_on(grok(), &held).expect("held: admitted");
     assert!(
-        matches!(&failing, Refused::Program(why) if why.contains("vendor unreachable")),
-        "{failing:?}"
+        admitted
+            .kept_off()
+            .is_some_and(|said| said.contains("`[packages] exclude` in aterm.toml names it")),
+        "{admitted:?}"
+    );
+    assert_eq!(
+        held.asked(),
+        ["present grok", "held grok"],
+        "nothing installed"
+    );
+
+    let there = FakeStore::new(true, None, true, None);
+    let present = admit_on(grok(), &there).expect("present");
+    assert_eq!(present.readiness(), &Readiness::Present);
+
+    let failing = FakeStore::new(false, None, true, Some("vendor unreachable: x.ai"));
+    let refused = admit_on(grok(), &failing).expect_err("a failed install");
+    assert!(
+        matches!(&refused, Refused::Program(why) if why.contains("vendor unreachable: x.ai")),
+        "{refused:?}"
     );
 
     let claude = worker_cli(Program::Claude).expect("claude row");
@@ -573,10 +570,10 @@ fn admission_asks_the_sign_in_before_it_installs_anything() {
         claude,
         claude.plain(),
         None,
-        |_| panic!("looked for"),
+        |_| true,
         |_| panic!("held"),
         |_| panic!("installed"),
     )
-    .expect("a kept program");
-    assert_eq!(kept.readiness(), Readiness::Kept);
+    .expect("an installed program");
+    assert_eq!(kept.readiness(), &Readiness::Present);
 }

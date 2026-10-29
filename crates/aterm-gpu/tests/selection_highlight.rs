@@ -305,6 +305,24 @@ fn inactive_selection_bg_gpu_matches_cpu() {
             sel_px.len()
         );
     }
+
+    let same = input.default_bg;
+    assert_eq!(
+        aterm_render::derive_inactive_selection_bg(same, same),
+        same,
+        "selection_bg == default_bg is a fixed point of derive_inactive_selection_bg"
+    );
+    let mut same_input = input;
+    same_input.selection_bg = same;
+    cpu.set_selection_inactive(true);
+    gpu.set_selection_inactive(true);
+    let cpu_same = cpu.render_input(&same_input);
+    let gpu_same = gpu.render_input(&mut win, &same_input, None);
+    let delta_same = max_channel_delta(&cpu_same, &gpu_same);
+    assert!(
+        delta_same <= 8,
+        "selection_bg == default_bg inactive selection: GPU/CPU diverge, delta {delta_same} > 8"
+    );
 }
 
 #[test]

@@ -666,6 +666,22 @@ fn count(r: &str, key: &str) -> Option<u64> {
     field(r, key)?.parse().ok()
 }
 
+/// The content clock an `await match` reply names (`OK match <seq>`): the grid's when the text
+/// showed.
+fn matched_seq(reply: &str) -> Option<u64> {
+    let mut w = reply.split_whitespace();
+    if (w.next(), w.next()) != (Some("OK"), Some("match")) {
+        return None;
+    }
+    w.next()?.parse().ok()
+}
+
+/// Whether a `dims` reply says the window's last own present drew the grid at content clock `seq`
+/// or later (`presented_seq=`); `none`, no field and an earlier clock say it did not.
+fn presented_through(dims: &str, seq: u64) -> bool {
+    count(dims, "presented_seq").is_some_and(|drawn| drawn >= seq)
+}
+
 /// Formats `frames`, dropped presents, and the `dims` surface for a row's evidence.
 fn presents(s: &Session<'_>) -> String {
     let metrics = s.ctl(&["metrics"]).ok();
@@ -1384,22 +1400,31 @@ impl Run<'_> {
         ])?;
         s.ctl(&["key", "enter"])?;
         let echo = format!("{HELD_TAG}{}", during.cols);
-        s.await_text(&echo)
+        let matched = s
+            .await_text(&echo)
             .map_err(|e| format!("{e}; {}", Self::holds(s)))?;
-        let after = within("a frame presented after the echo", || {
-            let n = count(&s.ctl(&["metrics"])?, "frames").unwrap_or(0);
-            if n > frames {
-                Ok(n)
+        let seq =
+            matched_seq(&matched).ok_or_else(|| format!("`await match` answered {matched:?}"))?;
+        // A present that drew the echo, not merely one after the count was read: the typed line's
+        // render, a blink and the Enter's blink reset each present before the echo lands, and a
+        // frame filled before it carries an earlier content clock (KI-1028-5).
+        let drawn = within("a present that drew the echo", || {
+            let d = s.ctl(&["dims"])?;
+            let drawn = field(&d, "presented_seq").unwrap_or("?").to_string();
+            if presented_through(&d, seq) {
+                Ok(drawn)
             } else {
-                Err(format!("frames {n}"))
+                Err(format!("presented_seq {drawn}, the echo's {seq}"))
             }
         })?;
+        let after = count(&s.ctl(&["metrics"])?, "frames").unwrap_or(0);
         let held = self.and_held(s, "modal-resize", String::new())?;
         let w = in_loop().map_err(|e| format!("{e} after the echo, with the button held"))?;
         Ok(format!(
             "right edge pressed and dragged {HELD_DRAG} px right, the button held: the window's thread in \
              Windows' size loop (GUI_INMOVESIZE), grid {}x{} -> {}x{} and client {}x{} while held; PowerShell \
-             printed {echo} and aterm presented it in the loop (frames {frames} -> {after}){held}; {}",
+             printed {echo} at content seq {seq} and aterm presented it in the loop (presented_seq \
+             {drawn}; frames {frames} -> {after}){held}; {}",
             before.cols,
             before.rows,
             during.cols,
@@ -1966,6 +1991,32 @@ fn styles_of(s: Styles) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The modal-resize row's wait passes only on a present whose frame was filled at or after the
+    /// echo's content clock, never on `none`, an older frame or a reply that is not one.
+    #[test]
+    fn a_present_drew_the_echo_only_at_or_past_its_content_clock() {
+        assert_eq!(matched_seq("OK match 41\n"), Some(41));
+        assert_eq!(matched_seq("OK gone 41\n"), None);
+        assert_eq!(matched_seq("ERR timeout\n"), None);
+        let dims = |drawn: &str| {
+            format!("OK 30 120 960 480 session=0 geometry=window presented_seq={drawn}\n")
+        };
+        assert!(presented_through(&dims("41"), 41));
+        assert!(presented_through(&dims("42"), 41));
+        assert!(
+            !presented_through(&dims("40"), 41),
+            "a frame filled before the echo"
+        );
+        assert!(
+            !presented_through(&dims("none"), 41),
+            "no present of this grid"
+        );
+        assert!(
+            !presented_through("OK 30 120 960 480 session=0 geometry=window\n", 41),
+            "a build with no presented_seq never passes"
+        );
+    }
 
     /// A `w` x `h` RGBA frame whose pixels all differ, and the RGB readback of a window that shows it.
     fn frame_and_window(w: usize, h: usize) -> (Vec<u8>, Vec<u8>) {

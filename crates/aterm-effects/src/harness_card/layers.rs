@@ -763,11 +763,15 @@ fn kitty(cx: &Emit<'_>, arts: &CardArts, items: &mut Vec<FxItem>, palette: &mut 
     let (dw, dh) = (rw as u16, rh as u16);
     let inks = KittyInk::new(cx.scene.coat, cx.scene.eye, cx.scene.dark);
     let base = palette.len() as u32;
-    let mut ki = 1;
-    while ki < KITTY_PALETTE.len() {
-        palette.push(FxInk::over(inks.of(KITTY_PALETTE[ki]).unwrap_or(0), 255));
-        ki += 1;
-    }
+    palette.extend([
+        FxInk::over(inks.outline, 255),
+        FxInk::over(inks.coat, 255),
+        FxInk::over(inks.belly, 255),
+        FxInk::over(inks.pupil, 255),
+        FxInk::over(inks.eye, 255),
+        FxInk::over(inks.nose, 255),
+        FxInk::over(inks.glint, 255),
+    ]);
     items.push(FxItem::Sprite(FxSprite {
         x: r.x0 as i32,
         y: r.y0 as i32,
@@ -789,28 +793,29 @@ fn rim(cx: &Emit<'_>, arts: &CardArts, items: &mut Vec<FxItem>, palette: &mut Ve
         return;
     };
     let r0 = at.rect;
-    let centre = ((r0.x0 + r0.x1) as f32 * 0.5, (r0.y0 + r0.y1) as f32 * 0.5);
     let base = palette.len() as u32;
-    let mut mi = 0;
-    while mi < rim.mids.len() {
-        let (mx, my) = rim.mids[mi];
-        let mid = ((2 * r0.x0 + mx) as f32 * 0.5, (2 * r0.y0 + my) as f32 * 0.5);
-        palette.push(fx_ink(cx.rim_paint(mid, centre)));
-        mi += 1;
-    }
+    let (sx, sy) = ((r0.x0 + rim.origin.0) as i32, (r0.y0 + rim.origin.1) as i32);
+    let (dw, dh) = (rim.art.w(), rim.art.h());
     #[inline]
-    fn rim_sprite(r0: Rect, rim: &RimArt, base: u32, clip: Rect) -> FxItem {
+    fn rim_sprite(
+        (sx, sy): (i32, i32),
+        (dw, dh): (u16, u16),
+        rim: &RimArt,
+        base: u32,
+        clip: Rect,
+    ) -> FxItem {
         FxItem::Sprite(FxSprite {
-            x: (r0.x0 + rim.origin.0) as i32,
-            y: (r0.y0 + rim.origin.1) as i32,
-            dw: rim.art.w(),
-            dh: rim.art.h(),
+            x: sx,
+            y: sy,
+            dw,
+            dh,
             flip_x: false,
             art: Arc::clone(&rim.art),
             ink: base,
             clip: px_rect(clip),
         })
     }
+    let items_before = items.len();
     let clip = cx.geo.inner().meet(cx.geo.clip);
     let hole = cx.rim_hole();
     let mut ci = 0;
@@ -827,14 +832,25 @@ fn rim(cx: &Emit<'_>, arts: &CardArts, items: &mut Vec<FxItem>, palette: &mut Ve
         match hole {
             Some(hole) => {
                 lay_cut(part, 0, 0, &|_| hole, &mut |piece| {
-                    items.push(rim_sprite(r0, rim, base, piece));
+                    items.push(rim_sprite((sx, sy), (dw, dh), rim, base, piece));
                     true
                 });
             }
-            None if !part.is_empty() => items.push(rim_sprite(r0, rim, base, part)),
+            None if !part.is_empty() => {
+                items.push(rim_sprite((sx, sy), (dw, dh), rim, base, part));
+            }
             None => {}
         }
     }
+    if items.len() == items_before {
+        return;
+    }
+    let centre = ((r0.x0 + r0.x1) as f32 * 0.5, (r0.y0 + r0.y1) as f32 * 0.5);
+    let (two_x0, two_y0) = (2 * r0.x0, 2 * r0.y0);
+    palette.extend(rim.mids.iter().map(|&(mx, my)| {
+        let mid = ((two_x0 + mx) as f32 * 0.5, (two_y0 + my) as f32 * 0.5);
+        fx_ink(cx.rim_paint(mid, centre))
+    }));
 }
 
 /// A card rectangle as an fx one (card-local pixels fit in `i32`).
@@ -997,6 +1013,12 @@ fn tone_rects(b: Rect, covers: &[Rect], mut lay: impl FnMut(Rect, bool)) {
         }
     }
     let (lo, hi) = b.x_span(covers);
+    if lo >= hi {
+        if b.x0 < b.x1 {
+            lay(b, false);
+        }
+        return;
+    }
     let mut cols = [(0i64, 0i64, (0i64, 0i64)); 2 * MAX_TRAIL_SEGMENTS as usize + 1];
     let mut n = 0usize;
     let mut x = b.x0;

@@ -186,6 +186,525 @@ fn a_moved_default_login_leaves_the_row_it_wrote_over_signed_out_and_next_to_sig
     assert_eq!(displaced(&store).len(), 1, "CONTROL: one event per move");
 }
 
+/// m2's morning (2026-10-27): m2-2 was on record as signed out (its own login seen ended) with a
+/// failed automatic sign-in, and the default login held m2; a person's `/login` signed the
+/// default login in as m2-2's account. m2 is displaced, and m2-2 holds a login made now: Ok,
+/// served, not expired, no failed sign-in, no ended login on record, not a candidate of the
+/// sign-in ladder, and the sessions that ran on the default login are its. CONTROLS: m2-2's
+/// login then seen ended while the default login still names it stays signed out at the next
+/// sync (a login merely still matched is not one made now); a row moved onto the default login
+/// by a relabel of the same account keeps its sign-out.
+#[test]
+fn a_default_login_moved_onto_a_signed_out_row_makes_that_rows_login_now() {
+    let desk = Desk::new("m2");
+    let store = desk.store();
+    let fleet = fleet_of(&[
+        ("m2", "m2", "fb@example.test"),
+        ("m2-2", "m2", "proton.m2@example.test"),
+    ]);
+    let roster = sync(&desk, &fleet, "m2", "fb@example.test", NOW);
+    assert_eq!(roster.row_for_login(None).unwrap().label, "m2");
+    let own = PathBuf::from(roster.row("m2-2").unwrap().dir.clone().unwrap());
+    fs::write(own.join(".credentials.json"), "fixture login").unwrap();
+    let mut note = None;
+    store
+        .transact_logins(NOW + 10, &mut note, |state, logins| {
+            let mut events = accounts::note_session(state, "s-tab-1", "m2", None, NOW + 10);
+            events.extend(accounts::note_session(
+                state,
+                "s-tab-2",
+                "m2",
+                None,
+                NOW + 10,
+            ));
+            events.extend(accounts::note_session(
+                state,
+                "s-own",
+                "m2-2",
+                None,
+                NOW + 10,
+            ));
+            events.extend(accounts::note_login_end(state, logins, "m2-2", NOW + 20));
+            events.extend(accounts::note_sign_in_attempt(
+                logins,
+                "m2-2",
+                accounts::AttemptOutcome::NoRoute,
+                "profile(none) mailbox(none configured)",
+                NOW + 30,
+            ));
+            Ok(events)
+        })
+        .unwrap();
+    let (state, _) = store.load(NOW + 40).unwrap();
+    let (logins, _) = store.load_logins(NOW + 40).unwrap();
+    let before = Roster::load(&desk.roster()).unwrap();
+    assert_eq!(
+        accounts::login_state(before.row("m2-2").unwrap(), &logins, &state, NOW + 40),
+        accounts::LoginState::Expired,
+        "the incident's start: m2-2 expired on record"
+    );
+
+    let moved = sync(&desk, &fleet, "m2", "proton.m2@example.test", NOW + 60);
+    assert_eq!(moved.row_for_login(None).unwrap().label, "m2-2");
+    let (state, _) = store.load(NOW + 60).unwrap();
+    let (logins, _) = store.load_logins(NOW + 60).unwrap();
+    let row = moved.row("m2-2").unwrap();
+    assert_eq!(
+        state.account("m2").auth,
+        accounts::Auth::SignedOut,
+        "m2 displaced"
+    );
+    assert_eq!(displaced(&store).len(), 1);
+    assert_eq!(state.account("m2-2").auth, accounts::Auth::Ok);
+    assert_eq!(
+        accounts::login_state(row, &logins, &state, NOW + 60),
+        accounts::LoginState::Ok,
+        "not expired: a turn's login, served now"
+    );
+    let binding = logins.get("m2-2").unwrap();
+    assert_eq!(binding.served_at, Some(NOW + 60));
+    assert_eq!(
+        binding.ended_at, None,
+        "its earlier login's end is no news of this one"
+    );
+    assert!(
+        binding.sign_in_attempt.is_none(),
+        "{:?}",
+        binding.sign_in_attempt
+    );
+    assert!(
+        accounts::failing_sign_ins(&moved, &state, &logins, NOW + 60).is_empty(),
+        "no row shows a failed sign-in"
+    );
+    let next = auto_renew_candidates(&moved, &state, &logins, NOW + 60);
+    assert!(
+        next.iter().all(|row| row.label != "m2-2"),
+        "the ladder does not sign in a login made now: {next:?}"
+    );
+    assert!(
+        next.iter().any(|row| row.label == "m2"),
+        "the row written over is the ladder's: {next:?}"
+    );
+    assert_eq!(state.sessions["s-tab-1"].account, "m2-2");
+    assert_eq!(state.sessions["s-tab-2"].account, "m2-2");
+    assert_eq!(state.sessions["s-own"].account, "m2-2");
+    assert!(
+        !store
+            .tail(1000)
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == accounts::Kind::Move && e.t > NOW + 40),
+        "no session moved: the default login did"
+    );
+
+    // CONTROL: the default login still names m2-2 and its login is then seen ended.
+    let mut note = None;
+    store
+        .transact_logins(NOW + 70, &mut note, |state, logins| {
+            Ok(accounts::note_login_end(state, logins, "m2-2", NOW + 70))
+        })
+        .unwrap();
+    let again = sync(&desk, &fleet, "m2", "proton.m2@example.test", NOW + 90);
+    let (state, _) = store.load(NOW + 90).unwrap();
+    let (logins, _) = store.load_logins(NOW + 90).unwrap();
+    assert_eq!(
+        state.account("m2-2").auth,
+        accounts::Auth::SignedOut,
+        "CONTROL: a login still matched is not one made now"
+    );
+    assert_eq!(
+        accounts::login_state(again.row("m2-2").unwrap(), &logins, &state, NOW + 90),
+        accounts::LoginState::Expired
+    );
+}
+
+/// CONTROL of [`a_default_login_moved_onto_a_signed_out_row_makes_that_rows_login_now`]: a
+/// default row relabelled (the same account under a new label) holds the login it held, so its
+/// sign-out stands.
+#[test]
+fn a_relabelled_default_row_keeps_its_sign_out() {
+    let desk = Desk::new("m2");
+    let store = desk.store();
+    let roster = sync(
+        &desk,
+        &fleet_of(&[("m2", "m2", "fb@example.test")]),
+        "m2",
+        "fb@example.test",
+        NOW,
+    );
+    assert_eq!(roster.row_for_login(None).unwrap().label, "m2");
+    let mut note = None;
+    store
+        .transact_logins(NOW + 10, &mut note, |state, logins| {
+            Ok(accounts::note_login_end(state, logins, "m2", NOW + 10))
+        })
+        .unwrap();
+    let relabelled = sync(
+        &desk,
+        &fleet_of(&[("m2-main", "m2", "fb@example.test")]),
+        "m2",
+        "fb@example.test",
+        NOW + 60,
+    );
+    assert_eq!(relabelled.row_for_login(None).unwrap().label, "m2-main");
+    let (state, _) = store.load(NOW + 60).unwrap();
+    assert_eq!(
+        state.account("m2-main").auth,
+        accounts::Auth::SignedOut,
+        "CONTROL: the login it held, moved with its label"
+    );
+    assert!(displaced(&store).is_empty());
+}
+
+/// CONTROL of [`a_default_login_moved_onto_a_signed_out_row_makes_that_rows_login_now`]: a
+/// sign-out on record at or after the sync's own instant came after the default login was made
+/// (it was made before the sync saw it), so it is that login's news and stands.
+#[test]
+fn a_sign_out_on_record_at_the_syncs_instant_stands_on_a_newly_default_row() {
+    let desk = Desk::new("m2");
+    let store = desk.store();
+    let fleet = fleet_of(&[
+        ("m2", "m2", "fb@example.test"),
+        ("m2-2", "m2", "proton.m2@example.test"),
+    ]);
+    sync(&desk, &fleet, "m2", "fb@example.test", NOW);
+    let mut note = None;
+    store
+        .transact_logins(NOW + 60, &mut note, |state, logins| {
+            Ok(accounts::note_login_end(state, logins, "m2-2", NOW + 60))
+        })
+        .unwrap();
+    let moved = sync(&desk, &fleet, "m2", "proton.m2@example.test", NOW + 60);
+    assert_eq!(moved.row_for_login(None).unwrap().label, "m2-2");
+    let (state, _) = store.load(NOW + 60).unwrap();
+    let (logins, _) = store.load_logins(NOW + 60).unwrap();
+    assert_eq!(
+        state.account("m2-2").auth,
+        accounts::Auth::SignedOut,
+        "CONTROL: an end no earlier than the sync is the new login's"
+    );
+    assert_eq!(logins.get("m2-2").and_then(|b| b.ended_at), Some(NOW + 60));
+}
+
+/// This Mac on 2026-10-27, after the `/login` that moved the default login onto m2-2: the roster
+/// already names m2-2 as the default row (the sync that saw the move ran under an aterm without
+/// the repoint), but m2-2 still carries the sign-out its earlier login left on 10-25 and the
+/// sessions on the default login are still on record under m2. `sessions` are the default
+/// login's sessions on record under m2; the sign-out is written at `signed_out_at`.
+fn repointed_with_a_stale_sign_out(desk: &Desk, signed_out_at: i64) -> FleetRoster {
+    let store = desk.store();
+    let fleet = fleet_of(&[
+        ("m2", "m2", "fb@example.test"),
+        ("m2-2", "m2", "proton.m2@example.test"),
+    ]);
+    sync(desk, &fleet, "m2", "fb@example.test", NOW);
+    desk.default_login("proton.m2@example.test");
+    let moved = sync(desk, &fleet, "m2", "proton.m2@example.test", NOW + 60);
+    assert_eq!(moved.row_for_login(None).unwrap().label, "m2-2");
+    assert_eq!(displaced(&store).len(), 1);
+    let mut note = None;
+    store
+        .transact_logins(NOW + 61, &mut note, |state, logins| {
+            // What the older aterm left: the sign-out of m2-2's earlier login, its end on record,
+            // and the default login's sessions under the label the default login held before.
+            let account = state.accounts.entry("m2-2".to_owned()).or_default();
+            account.auth = accounts::Auth::SignedOut;
+            account.auth_at = Some(signed_out_at);
+            if let Some(binding) = logins.labels.get_mut("m2-2") {
+                binding.ended_at = Some(signed_out_at);
+            }
+            let mut events = accounts::note_session(state, "s-tab-1", "m2", None, NOW + 61);
+            events.extend(accounts::note_session(
+                state,
+                "s-tab-2",
+                "m2",
+                None,
+                NOW + 61,
+            ));
+            Ok(events)
+        })
+        .unwrap();
+    fleet
+}
+
+fn checks_signed_in(_: &Path) -> super::super::cli::LoginCheck {
+    super::super::cli::LoginCheck::SignedIn
+}
+
+fn checks_signed_out(_: &Path) -> super::super::cli::LoginCheck {
+    super::super::cli::LoginCheck::SignedOut
+}
+
+/// The idempotent heal of [`repointed_with_a_stale_sign_out`]: the sign-out on record is older
+/// than the move that put the default login on m2-2, so one read-only check of the default login
+/// is due; it answers signed in, and m2-2 holds the login the move made (Ok, served, not expired,
+/// its earlier end cleared), with the default login's sessions its. Once healed nothing is due,
+/// and a second sync checks nothing. CONTROL: the repoint the sync makes itself is not re-run by
+/// a sync whose roster already names m2-2 (the heal is what moves it).
+#[test]
+fn a_default_row_the_roster_already_named_is_healed_by_one_check() {
+    let desk = Desk::new("m2");
+    let store = desk.store();
+    let fleet = repointed_with_a_stale_sign_out(&desk, NOW + 20);
+    let roster = sync(&desk, &fleet, "m2", "proton.m2@example.test", NOW + 90);
+    let (state, _) = store.load(NOW + 90).unwrap();
+    let (logins, _) = store.load_logins(NOW + 90).unwrap();
+    assert_eq!(
+        accounts::login_state(roster.row("m2-2").unwrap(), &logins, &state, NOW + 90),
+        accounts::LoginState::Expired,
+        "CONTROL: a sync over a roster that already names m2-2 does not heal it"
+    );
+    assert_eq!(state.sessions["s-tab-1"].account, "m2");
+
+    let heal = default_login_heal_due(&desk.home, &store, &roster, NOW + 100)
+        .expect("the stale sign-out is due one check");
+    assert_eq!(
+        heal,
+        DefaultHeal {
+            label: "m2-2".to_owned(),
+            signed_out_at: NOW + 20,
+            was: Some("m2".to_owned()),
+        }
+    );
+    let (healed, line) = heal_default_login_now(
+        &desk.home,
+        &store,
+        &desk.roster(),
+        NOW + 100,
+        checks_signed_in,
+    )
+    .expect("the check ran");
+    assert!(healed, "{line}");
+    assert!(
+        line.contains("the default login checked signed in"),
+        "{line}"
+    );
+    let (state, _) = store.load(NOW + 100).unwrap();
+    let (logins, _) = store.load_logins(NOW + 100).unwrap();
+    assert_eq!(state.account("m2-2").auth, accounts::Auth::Ok);
+    assert_eq!(
+        accounts::login_state(roster.row("m2-2").unwrap(), &logins, &state, NOW + 100),
+        accounts::LoginState::Ok
+    );
+    assert_eq!(logins.get("m2-2").and_then(|b| b.ended_at), None);
+    assert_eq!(state.sessions["s-tab-1"].account, "m2-2");
+    assert_eq!(state.sessions["s-tab-2"].account, "m2-2");
+    assert_eq!(
+        state.account("m2").auth,
+        accounts::Auth::SignedOut,
+        "the row written over stays signed out"
+    );
+    assert_eq!(
+        heal_default_login_now(
+            &desk.home,
+            &store,
+            &desk.roster(),
+            NOW + 110,
+            checks_signed_in
+        ),
+        None,
+        "once healed nothing is due"
+    );
+}
+
+/// NEGATIVE of [`a_default_row_the_roster_already_named_is_healed_by_one_check`]: the check says
+/// signed out, so the sign-out stands and no session moves; in the window's upkeep the check runs
+/// once for that sign-out, whatever the number of passes.
+#[test]
+fn a_default_row_the_check_finds_signed_out_stays_signed_out_and_is_checked_once() {
+    static CHECKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    fn counted_signed_out(home: &Path) -> super::super::cli::LoginCheck {
+        CHECKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        checks_signed_out(home)
+    }
+    let desk = Desk::new("m2");
+    let store = desk.store();
+    repointed_with_a_stale_sign_out(&desk, NOW + 20);
+    let (healed, line) = heal_default_login_now(
+        &desk.home,
+        &store,
+        &desk.roster(),
+        NOW + 100,
+        checks_signed_out,
+    )
+    .expect("the check ran");
+    assert!(!healed);
+    assert!(line.contains("answered signed out"), "{line}");
+    let (state, _) = store.load(NOW + 100).unwrap();
+    assert_eq!(state.account("m2-2").auth, accounts::Auth::SignedOut);
+    assert_eq!(state.account("m2-2").auth_at, Some(NOW + 20));
+    assert_eq!(state.sessions["s-tab-1"].account, "m2");
+
+    let fetch = |_: &Env, source: &str| -> Result<String, String> {
+        Err(format!("no fetch in a test: {source}"))
+    };
+    let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
+    let inline = |work: Box<dyn FnOnce() + Send>| {
+        work();
+        Ok(())
+    };
+    let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
+    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let kept = Arc::clone(&lines);
+    let mut fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
+    fx.spawn_vault = &inline;
+    fx.default_check = counted_signed_out;
+    fx.log = Arc::new(move |line: &str| kept.lock().unwrap().push(line.to_owned()));
+    for at in [NOW + 200, NOW + 300, NOW + 400] {
+        heal_default_login_in_upkeep(&desk.home, &desk.state, &desk.roster(), at, &fx);
+    }
+    assert_eq!(CHECKS.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        lines.lock().unwrap().len(),
+        1,
+        "{:?}",
+        lines.lock().unwrap()
+    );
+    assert_eq!(
+        store.load(NOW + 400).unwrap().0.account("m2-2").auth,
+        accounts::Auth::SignedOut
+    );
+}
+
+/// CONTROL of [`a_default_row_the_roster_already_named_is_healed_by_one_check`]: a sign-out on
+/// record at or after the move that put the default login on m2-2 is that login's own news, so no
+/// check is due and it stands, whatever the check would say.
+#[test]
+fn a_sign_out_written_after_the_move_is_never_checked_away() {
+    let desk = Desk::new("m2");
+    let store = desk.store();
+    let roster = {
+        repointed_with_a_stale_sign_out(&desk, NOW + 60);
+        desk.rows()
+    };
+    assert_eq!(
+        default_login_heal_due(&desk.home, &store, &roster, NOW + 100),
+        None,
+        "a sign-out at the move's own instant"
+    );
+    let desk = Desk::new("m2");
+    let store = desk.store();
+    repointed_with_a_stale_sign_out(&desk, NOW + 70);
+    assert_eq!(
+        heal_default_login_now(
+            &desk.home,
+            &store,
+            &desk.roster(),
+            NOW + 100,
+            checks_signed_in
+        ),
+        None
+    );
+    assert_eq!(
+        store.load(NOW + 100).unwrap().0.account("m2-2").auth,
+        accounts::Auth::SignedOut
+    );
+}
+
+/// The default login's move takes `active` with it: m2 was the active account (pinned) when a
+/// `/login` moved the default login onto m2-2, which holds a login made now; `active` names m2-2,
+/// proven, with no canary and nothing to go back to, and the listing's `active` mark is m2-2's.
+/// CONTROL: an `active` that names a third row is left where it is.
+#[test]
+fn a_moved_default_login_takes_active_with_it() {
+    let desk = Desk::new("m2");
+    let store = desk.store();
+    let fleet = fleet_of(&[
+        ("m2", "m2", "fb@example.test"),
+        ("m2-2", "m2", "proton.m2@example.test"),
+        ("m2-3", "m2", "third@example.test"),
+    ]);
+    let roster = sync(&desk, &fleet, "m2", "fb@example.test", NOW);
+    let mut note = None;
+    store
+        .transact(NOW + 1, &mut note, |state| {
+            let enrolled = accounts::enrolled(&roster);
+            accounts::pin(state, &roster, &enrolled, "m2", NOW + 1).map(|e| vec![e])
+        })
+        .unwrap();
+    sync(&desk, &fleet, "m2", "proton.m2@example.test", NOW + 60);
+    let (state, _) = store.load(NOW + 60).unwrap();
+    assert_eq!(state.active.as_deref(), Some("m2-2"));
+    assert!(state.proven && state.canary.is_none() && !state.pinned && state.undo.is_empty());
+
+    // CONTROL: active on a third row stays there across the move back.
+    let mut note = None;
+    store
+        .transact(NOW + 61, &mut note, |state| {
+            state.active = Some("m2-3".to_owned());
+            Ok(Vec::new())
+        })
+        .unwrap();
+    sync(&desk, &fleet, "m2", "fb@example.test", NOW + 120);
+    let (state, _) = store.load(NOW + 120).unwrap();
+    assert_eq!(state.active.as_deref(), Some("m2-3"));
+}
+
+/// A row that becomes the default login while it holds a renewal directory bound to it keeps
+/// what is on record of it: it launches from that directory, whose login the vendor's sign-in on
+/// the default login never touched, so its sign-out stands (no heal is due either). The sessions
+/// that ran on the default login, and `active`, are its account's now. CONTROL: the same move onto
+/// an unbound row makes its login now.
+#[test]
+fn a_bound_row_the_default_login_moves_onto_keeps_its_record_and_takes_the_sessions() {
+    let desk = Desk::new("m2");
+    let store = desk.store();
+    let fleet = fleet_of(&[
+        ("m2", "m2", "fb@example.test"),
+        ("m2-2", "m2", "proton.m2@example.test"),
+    ]);
+    let roster = sync(&desk, &fleet, "m2", "fb@example.test", NOW);
+    let own = roster.row("m2-2").unwrap().dir.clone().unwrap();
+    let staging = store.claim_staging_dir("m2-2").unwrap();
+    fs::write(staging.join(".credentials.json"), "fixture login").unwrap();
+    let staging_text = staging.to_str().unwrap().to_owned();
+    let mut note = None;
+    store
+        .transact_logins(NOW + 10, &mut note, |state, logins| {
+            state.active = Some("m2".to_owned());
+            let mut events = accounts::note_renewed(
+                state,
+                logins,
+                "m2-2",
+                Some(&own),
+                &staging_text,
+                None,
+                NOW + 10,
+            );
+            events.extend(accounts::note_session(
+                state,
+                "s-tab-1",
+                "m2",
+                None,
+                NOW + 11,
+            ));
+            events.extend(accounts::note_login_end(state, logins, "m2-2", NOW + 20));
+            Ok(events)
+        })
+        .unwrap();
+    let moved = sync(&desk, &fleet, "m2", "proton.m2@example.test", NOW + 60);
+    assert_eq!(moved.row_for_login(None).unwrap().label, "m2-2");
+    let (state, _) = store.load(NOW + 60).unwrap();
+    let (logins, _) = store.load_logins(NOW + 60).unwrap();
+    assert_eq!(
+        logins.get("m2-2").and_then(|b| b.dir.as_deref()),
+        Some(staging_text.as_str())
+    );
+    assert_eq!(
+        state.account("m2-2").auth,
+        accounts::Auth::SignedOut,
+        "its bound login's end stands"
+    );
+    assert_eq!(state.sessions["s-tab-1"].account, "m2-2");
+    assert_eq!(state.active.as_deref(), Some("m2-2"));
+    assert_eq!(
+        default_login_heal_due(&desk.home, &store, &moved, NOW + 100),
+        None,
+        "no heal is due for a bound row"
+    );
+}
+
 /// The default login holds an account none of this machine's rows lists: it gets a row of its
 /// own (labelled as discovery labels, unique in the fleet), never the old default row's label;
 /// an account another machine's row lists is listed here by that row. The fleet a source wrote
@@ -372,15 +891,18 @@ pub(super) fn upkeep_effects<'a>(
     UpkeepEffects {
         fetch,
         spawn_renewal: spawn,
+        quota_refresh: &|_, _, _, _| {},
         sync_cooldown: cooldown,
         rediscovery,
         renew_guard: guard,
         find_browser: &|_: &Path| false,
         vault_sync: |_: &Path| crate::harness::sign_in_ladder::Vault::NotMember,
         spawn_vault: &|_work| Ok(()),
+        default_check: |_: &Path| crate::harness::cli::LoginCheck::CouldNotRun(String::new()),
         mailbox: &ladder_mailbox_files,
         log: Arc::new(|_: &str| {}),
         run_attempt: None,
+        shared: shared_renewal::Effects::default(),
     }
 }
 

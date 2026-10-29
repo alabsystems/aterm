@@ -1047,22 +1047,6 @@ fn fx_occluders_compose() {
 }
 
 #[test]
-fn band_of_names_the_band_holding_the_row() {
-    let mut rng = Rng(0xabcd_ef01_2345_6789);
-    for _ in 0..500 {
-        let f = frame(&mut rng);
-        for y in 0..f.h {
-            let b = f.band_of(y);
-            let (y0, y1) = f.band(b);
-            assert!(
-                b < f.rows && (y0..y1).contains(&y),
-                "{f:?}: row {y} → band {b}"
-            );
-        }
-    }
-}
-
-#[test]
 fn fx_extremes_never_panic() {
     let mut rng = Rng(0x1357_9bdf_2468_ace0);
     let f = FxFrame {

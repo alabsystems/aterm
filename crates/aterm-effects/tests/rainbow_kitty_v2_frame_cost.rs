@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::alloc_count::{SIZE_SLOTS, allocations_during, assert_counter_is_per_thread};
 use crate::common::Ground;
-use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle, SoundCue, band_pos};
+use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, SoundCue, band_pos};
 use aterm_effects::rainbow_kitty::{
     CaretSeam, Config, Dir, Engine, Event, Frame, Licence, TypedClass, witness::WITNESS_ROWS,
 };
@@ -49,24 +49,14 @@ pub(crate) fn grounds() -> [Ground; 2] {
 /// Shipped-default rainbow kitty configuration on `ground`.
 fn glow_config(ground: Ground) -> GlowConfig {
     ground.lay(GlowConfig {
-        classic_mono: false,
-        ribbon_tall: true,
-        ribbon_flat: false,
-        enabled: true,
-        dark_theme: true,
-        theme_fg: 0x00C8_D3F5,
-        theme_bg: 0x001A_1B26,
-        style: GlowStyle::RainbowKitty,
         color: 0x00d0_d0d0,
         accent: 0x0048_c9ff,
         duration: Duration::from_millis(650),
         length: usize::MAX,
-        intensity: 1.0,
         audible: true,
         radius: 0.4,
         ring: true,
-        beam: false,
-        head_dx: 0.5,
+        ..Default::default()
     })
 }
 

@@ -155,32 +155,6 @@ const FULLSCREEN: [&str; 3] = [
     LOGIN_PICKER_FULLSCREEN_AGAIN_AT_EXPIRED_2_1_310,
 ];
 
-fn captures(b: &Build) -> impl Iterator<Item = &'static str> + '_ {
-    b.pickers
-        .iter()
-        .map(|p| p.0)
-        .chain(b.moved.iter().map(|m| m.0))
-        .chain(b.interrupted.iter().map(|i| i.0))
-}
-
-/// Each table row is its build's own capture (its header's version), so no row of one build can
-/// stand in for the other's.
-#[test]
-fn each_builds_captures_are_its_own() {
-    for b in BUILDS {
-        let head = format!("# claude-code {} · MEASURED ", b.version);
-        for text in captures(b) {
-            assert!(text.starts_with(&head), "{}: {text}", b.version);
-        }
-    }
-    for (text, ..) in WALLS_2_1_310 {
-        assert!(
-            text.starts_with("# claude-code 2.1.310 · MEASURED "),
-            "{text}"
-        );
-    }
-}
-
 #[test]
 fn every_measured_login_screen_is_read_as_its_state() {
     let picker = |text| match login_screen(&screen(text)) {

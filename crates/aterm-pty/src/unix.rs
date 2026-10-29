@@ -398,7 +398,12 @@ fn exec_status_fifo_dir() -> &'static [u8] {
 
 #[cfg(target_os = "macos")]
 fn fifo_dir_in(tmpdir: Option<std::ffi::OsString>) -> Vec<u8> {
-    let mut dir = tmpdir.map_or_else(|| b"/tmp".to_vec(), |d| d.as_bytes().to_vec());
+    let mut dir = tmpdir
+        .filter(|d| !d.is_empty())
+        .map_or_else(|| b"/tmp".to_vec(), |d| d.as_bytes().to_vec());
+    while dir.len() > 1 && dir.last() == Some(&b'/') {
+        dir.pop();
+    }
     if dir.last() != Some(&b'/') {
         dir.push(b'/');
     }
@@ -1469,9 +1474,17 @@ fn reap_shell_scheduled(
             }
         }
         if Some(tick) == kill_at && identity.verify() {
-            // SAFETY: `killpg` posts `SIGKILL` to the verified shell's process group.
-            unsafe {
-                libc::killpg(pid, libc::SIGKILL);
+            if identity.own_child {
+                // Verified as this process's unreaped child, which pins the group id: the
+                // group is signalled until no member is left (a member's fork can dodge one
+                // signal on XNU).
+                let _ = aterm_uds::process::kill_group_until_empty(pid);
+            } else {
+                // SAFETY: `killpg` posts `SIGKILL` to the verified shell's process group. Not
+                // this process's child, its pid is not pinned, so it is signalled once.
+                unsafe {
+                    libc::killpg(pid, libc::SIGKILL);
+                }
             }
             #[cfg(test)]
             REAP_KILL_TICK.with(|t| t.set(Some(tick)));

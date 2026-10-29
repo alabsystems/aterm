@@ -1039,9 +1039,31 @@ fn cold_len(term: &Mutex<Terminal>) -> usize {
     /// the site to repair, and the acquire count sees every acquiring line.
     #[test]
     fn a_finding_is_the_line_of_the_work() {
-        let (hits, acquires) = scan_source(MUST_FIRE[14].1);
+        let (_, wrapped) = MUST_FIRE
+            .iter()
+            .find(|(why, _)| {
+                *why == "rustfmt breaks a long chain: receiver and work on different lines"
+            })
+            .expect("named wrapped-chain fixture");
+        let (hits, acquires) = scan_source(wrapped);
         assert_eq!(hits, vec![5], "the wrapped chain's `.resize(` line");
         assert_eq!(acquires, 1);
+
+        for (why, src) in MUST_FIRE {
+            let lines: Vec<&str> = src.lines().collect();
+            let (hits, acquires) = scan_source(src);
+            assert!(acquires >= 1, "{why}: expected at least one acquire");
+            for hit in hits {
+                let line = lines
+                    .get(hit.saturating_sub(1))
+                    .copied()
+                    .expect("1-based line within source");
+                assert!(
+                    has_blocked_work(line) || touches_cold_codec(line),
+                    "{why}: line {hit} ({line:?}) does not hold the work"
+                );
+            }
+        }
     }
 
     /// The walk fails closed: a part of the scan set it cannot read refuses

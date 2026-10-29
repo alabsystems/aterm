@@ -9,6 +9,22 @@ use crate::prompt::{PromptKind, PromptV2, is_panel_rule};
 
 const SEP: &str = " · ";
 
+/// The 5-hour kind's `{done}` builds before 2.1.312 drew (2.1.312 names the window `5-hour limit`,
+/// anchor `reset.done.session`).
+pub const SESSION_DONE_BEFORE_2_1_312: &str = "Session limit reset";
+
+/// The once-a-week session reset's row builds before 2.1.312 drew (anchor `reset.weekly_row`,
+/// 2.1.312's `Reset your 5-hour limit now`).
+pub const WEEKLY_ROW_BEFORE_2_1_312: &str = "Reset your session limit now";
+
+/// The five-hour window's name in the confirmation's `{limits}` (2.1.312's `ar()`:
+/// `case"five_hour":s.add("5-hour")`).
+const FIVE_HOUR_LIMIT: &str = "5-hour";
+
+/// The five-hour window's name in the confirmation's `{limits}` builds before 2.1.312 drew
+/// (2.1.312 draws `5-hour`).
+pub const FIVE_HOUR_LIMIT_BEFORE_2_1_312: &str = "session";
+
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
@@ -90,6 +106,13 @@ impl ResetKind {
             ResetKind::Fable => "reset.done.fable",
             ResetKind::Full => "reset.done.full",
         })
+    }
+
+    /// [`Self::done`] and the head the builds before 2.1.312 drew for this kind
+    /// ([`SESSION_DONE_BEFORE_2_1_312`]).
+    fn done_heads(self) -> impl Iterator<Item = &'static str> {
+        std::iter::once(self.done())
+            .chain((self == ResetKind::Session).then_some(SESSION_DONE_BEFORE_2_1_312))
     }
 
     /// Whether the step may take a reset of this kind (the spec's R2).
@@ -224,10 +247,12 @@ pub fn reset_row(prompt: &PromptV2, order: &[ResetKind]) -> Option<ResetRow> {
     })
 }
 
-/// Whether choosing an option labelled `label` spends a reset.
+/// Whether choosing an option labelled `label` spends a reset: the once-a-week row as any build
+/// draws it (anchor `reset.weekly_row`, [`WEEKLY_ROW_BEFORE_2_1_312`]), a grant row or a yes.
 #[must_use]
 pub fn spends_reset(label: &str) -> bool {
     opens(label, crate::anchor!("reset.weekly_row"))
+        || opens(label, WEEKLY_ROW_BEFORE_2_1_312)
         || ResetKind::ALL
             .into_iter()
             .any(|kind| opens(label, &kind.row_head()) || opens(label, &kind.yes()))
@@ -336,6 +361,20 @@ fn take_when(text: &str) -> Option<(&str, &str)> {
     Some((&text[..text.len() - rest.len()], rest))
 }
 
+/// The windows a grant clears that a takeable kind's `{limits}` names, each by
+/// [`reset_limit_names`] (`ar()`'s cases in 2.1.311 and 2.1.312). `ar()` also draws `Fable`, but
+/// only for a grant that gives back weekly use, which `qe()` makes a Fable reset before anything
+/// else; and it names no other window.
+const NAMED_WINDOWS: [&str; 5] = [
+    "five_hour",
+    "seven_day",
+    "seven_day_overage_included",
+    "seven_day_opus",
+    "seven_day_sonnet",
+];
+
+/// The names of a confirmation's `{limits}` as drawn, each one a build draws for a window of
+/// [`NAMED_WINDOWS`]; none for any other name (`Weekly`, `Fable`, `Session`) or join.
 fn limits_of(text: &str) -> Option<Vec<String>> {
     let names: Vec<&str> = match text.strip_suffix(" limit") {
         Some(one) => vec![one],
@@ -346,19 +385,59 @@ fn limits_of(text: &str) -> Option<Vec<String>> {
     };
     names
         .iter()
-        .all(|n| !n.is_empty() && n.chars().all(char::is_alphanumeric))
+        .all(|n| {
+            NAMED_WINDOWS
+                .iter()
+                .any(|window| reset_limit_names(window).contains(n))
+        })
         .then(|| names.iter().map(|n| (*n).to_string()).collect())
 }
 
-/// The name a walled window is drawn by in the confirmation's `{limits}`.
+/// Whether `names`, a confirmation's `{limits}` as read, are what a reset of `kind` refills, by the
+/// fallback of the vendor's reading of a grant's kind (`qe()`, read in 2.1.310 to 2.1.312: the
+/// five-hour limit alone is a 5-hour reset, no five-hour limit a weekly one, the five-hour limit and
+/// another a full one), held even where the server types the grant. `qe()` takes the grant's
+/// server-sent `type` before its clears, and its fallback also counts clears `ar()` names nowhere
+/// (`seven_day_cowork`), so a grant typed against its clears, or with such a clear beside the
+/// five-hour one, draws a confirmation this refuses: the reset is kept. The five-hour limit is
+/// named once, by one build's word ([`reset_limit_names`]), and no name twice (the vendor draws a
+/// set).
+fn refills(kind: ResetKind, names: &[String]) -> bool {
+    let five = names
+        .iter()
+        .filter(|n| reset_limit_names("five_hour").contains(&n.as_str()))
+        .count();
+    let others = names.len() - five;
+    let distinct = names
+        .iter()
+        .enumerate()
+        .all(|(k, n)| !names[..k].contains(n));
+    distinct
+        && match kind {
+            ResetKind::Session => five == 1 && others == 0,
+            ResetKind::Weekly => five == 0 && others >= 1,
+            ResetKind::Full => five == 1 && others >= 1,
+            ResetKind::Fable => false,
+        }
+}
+
+/// The name a walled window is drawn by in the confirmation's `{limits}`, as 2.1.312 draws it (the
+/// first of [`reset_limit_names`]).
 #[must_use]
 pub fn reset_limit_name(limit_type: &str) -> Option<&'static str> {
+    reset_limit_names(limit_type).first().copied()
+}
+
+/// Every name a walled window is drawn by in the confirmation's `{limits}`, 2.1.312's first, then
+/// the five-hour window's [`FIVE_HOUR_LIMIT_BEFORE_2_1_312`]; none for a window no grant clears.
+#[must_use]
+pub fn reset_limit_names(limit_type: &str) -> &'static [&'static str] {
     match limit_type {
-        "five_hour" => Some("session"),
-        "seven_day" | "seven_day_overage_included" => Some("weekly"),
-        "seven_day_opus" => Some("Opus"),
-        "seven_day_sonnet" => Some("Sonnet"),
-        _ => None,
+        "five_hour" => &[FIVE_HOUR_LIMIT, FIVE_HOUR_LIMIT_BEFORE_2_1_312],
+        "seven_day" | "seven_day_overage_included" => &["weekly"],
+        "seven_day_opus" => &["Opus"],
+        "seven_day_sonnet" => &["Sonnet"],
+        _ => &[],
     }
 }
 
@@ -509,7 +588,9 @@ fn confirm_text(
         .and_then(|rest| rest.split_once(&format!(" {now}")))
         .filter(|(_, rest)| rest.is_empty() || rest.starts_with(' '))
         .ok_or("body")?;
-    let limits = limits_of(limits).ok_or("body")?;
+    let limits = limits_of(limits)
+        .filter(|names| refills(kind, names))
+        .ok_or("body")?;
     let (week, rest) = rest
         .strip_prefix(&stays[now.len()..])
         .and_then(|rest| rest.strip_prefix(' '))
@@ -651,7 +732,9 @@ fn spent_line(text: &str) -> Option<(ResetKind, Option<u32>)> {
     let stays = crate::anchor!("reset.confirm.stays");
     let stays = stays.split(SEP).last().unwrap_or(stays);
     ResetKind::ALL.into_iter().find_map(|kind| {
-        let rest = text.strip_prefix(kind.done())?.strip_prefix(SEP)?;
+        let rest = kind
+            .done_heads()
+            .find_map(|done| text.strip_prefix(done)?.strip_prefix(SEP))?;
         let left = rest.split(SEP).find_map(|segment| left_of(segment, kind));
         let own = kind != ResetKind::Session
             || left.is_some()
@@ -708,9 +791,35 @@ pub mod fixtures {
         include_str!("fixtures/claude-2.1.304-reset-confirm-focus-no.txt");
     /// The weekly reset's yes taken.
     pub const RESETTING: &str = include_str!("fixtures/claude-2.1.304-reset-resetting.txt");
+    /// Claude Code 2.1.312 at a five-hour wall, then the weekly 5-hour reset's answer under
+    /// `/rate-limit-options` (`5-hour limit reset · next reset available …`).
+    pub const DONE_WEEKLY_ROW_2_1_312: &str =
+        include_str!("fixtures/claude-2.1.312-reset-5-hour-limit-done.txt");
+    /// The same wall, then a 5-hour reset's spent line (`5-hour limit reset · your weekly reset
+    /// day stays … · 1 five-hour reset left`).
+    pub const SPENT_SESSION_2_1_312: &str =
+        include_str!("fixtures/claude-2.1.312-reset-5-hour-kind-spent.txt");
+    /// NEGATIVE CONTROL: the worker's tool output, a diff and its reply quoting 2.1.312's reset
+    /// and wall words, none of it Claude Code's own notice.
+    pub const QUOTED_2_1_312: &str =
+        include_str!("fixtures/claude-2.1.312-reply-quotes-5-hour-reset-words.txt");
+    /// 2.1.312's dialog with its once-a-week row (`Reset your 5-hour limit now`) where the grant
+    /// rows go.
+    pub const DIALOG_WEEKLY_2_1_312: &str =
+        include_str!("fixtures/claude-2.1.312-reset-dialog-once-a-week.txt");
+    /// NEGATIVE CONTROL: 2.1.312's once-a-week row beside a 5-hour grant row, a menu no build
+    /// draws.
+    pub const DIALOG_WEEKLY_BESIDE_GRANT_2_1_312: &str =
+        include_str!("fixtures/claude-2.1.312-reset-dialog-once-a-week-beside-grant.txt");
+    /// 2.1.312's 5-hour reset's confirmation as it opens (`Refills your 5-hour limit now`).
+    pub const CONFIRM_SESSION_2_1_312: &str =
+        include_str!("fixtures/claude-2.1.312-reset-confirm-5-hour.txt");
+    /// 2.1.312's full reset's confirmation as it opens (`Refills your 5-hour and weekly limits`).
+    pub const CONFIRM_FULL_2_1_312: &str =
+        include_str!("fixtures/claude-2.1.312-reset-confirm-full.txt");
 
     /// Every fixture of the reset program, with its name.
-    pub const ALL: [(&str, &str); 14] = [
+    pub const ALL: [(&str, &str); 21] = [
         ("dialog-grant", DIALOG_GRANT),
         ("dialog-kinds", DIALOG_KINDS),
         ("dialog-fable", DIALOG_FABLE),
@@ -725,6 +834,16 @@ pub mod fixtures {
         ("confirm-early", CONFIRM_EARLY),
         ("confirm-focus-no", CONFIRM_FOCUS_NO),
         ("resetting", RESETTING),
+        ("done-weekly-row-2.1.312", DONE_WEEKLY_ROW_2_1_312),
+        ("spent-session-2.1.312", SPENT_SESSION_2_1_312),
+        ("quoted-2.1.312", QUOTED_2_1_312),
+        ("dialog-weekly-2.1.312", DIALOG_WEEKLY_2_1_312),
+        (
+            "dialog-weekly-beside-grant-2.1.312",
+            DIALOG_WEEKLY_BESIDE_GRANT_2_1_312,
+        ),
+        ("confirm-session-2.1.312", CONFIRM_SESSION_2_1_312),
+        ("confirm-full-2.1.312", CONFIRM_FULL_2_1_312),
     ];
 }
 
@@ -747,6 +866,7 @@ mod tests {
     const FABLE_AT_WEEK: &str =
         "Use a Fable reset (1 left, until Oct 5) · frees up only what Fable used this week";
     const WEEKLY: &str = "Reset your session limit now";
+    const WEEKLY_2_1_312: &str = "Reset your 5-hour limit now";
     const BODY: &str = "Refills your weekly limit now · your weekly reset day stays Oct 9 at 5am";
     const DETAIL: &str = "2 weekly resets left · use by Oct 5 at 3pm";
     const ASKS: &str = " · send a message to continue";
@@ -893,7 +1013,7 @@ mod tests {
                 "session",
                 "5-hour reset",
                 "5-hour reset",
-                "Session limit reset",
+                "5-hour limit reset",
                 "Use a 5-hour reset?",
                 "Yes, use my 5-hour reset",
             ),
@@ -1344,6 +1464,80 @@ mod tests {
         }
     }
 
+    /// 2.1.312's once-a-week row (`Reset your 5-hour limit now`) spends, as 2.1.311's does: it is
+    /// never the row taken, and a menu that holds either, alone or beside a grant row, gives no
+    /// row under any order.
+    #[test]
+    fn claude_2_1_312s_once_a_week_row_spends_and_is_never_taken() {
+        use ResetKind::{Full, Session, Weekly};
+        for row in [WEEKLY, WEEKLY_2_1_312] {
+            assert!(spends_reset(row), "{row}");
+            assert_eq!(grant_kind(row), None, "{row}");
+        }
+        assert_eq!(WEEKLY_ROW_BEFORE_2_1_312, WEEKLY);
+        assert_eq!(crate::anchor!("reset.weekly_row"), WEEKLY_2_1_312);
+        let orders: [&[ResetKind]; 4] = [&[], &[Session], &[Full, Weekly, Session], &[Weekly]];
+        for (name, fixture) in [
+            ("alone", fixtures::DIALOG_WEEKLY_2_1_312),
+            (
+                "beside a grant row",
+                fixtures::DIALOG_WEEKLY_BESIDE_GRANT_2_1_312,
+            ),
+        ] {
+            let dialog = boxed(&screen(fixture));
+            assert_eq!(dialog.kind, PromptKind::UsageLimit, "{name}");
+            assert!(
+                dialog.options.iter().any(|o| o.label == WEEKLY_2_1_312),
+                "{name}: {:?}",
+                dialog.options
+            );
+            for order in orders {
+                assert_eq!(reset_row(&dialog, order), None, "{name} under {order:?}");
+            }
+        }
+        let beside = boxed(&screen(fixtures::DIALOG_WEEKLY_BESIDE_GRANT_2_1_312));
+        assert_eq!(beside.options[1].label, SESSION);
+        let kept: Vec<&str> = beside
+            .options
+            .iter()
+            .map(|o| o.label.as_str())
+            .filter(|label| *label != WEEKLY_2_1_312)
+            .collect();
+        assert_eq!(
+            row_among(&kept).map(|r| (r.kind, r.label)),
+            Some((Session, SESSION.to_string())),
+            "the same menu with the once-a-week row cut: {kept:?}"
+        );
+        for weekly in [WEEKLY, WEEKLY_2_1_312] {
+            for labels in [
+                &[STOP, weekly, SESSION, WAIT][..],
+                &[STOP, SESSION, WAIT, weekly],
+                &[STOP, FULL, weekly, GRANT, WAIT],
+                &[STOP, weekly, WAIT],
+            ] {
+                let menu = boxed(&limit_options_panel(labels, 0, false));
+                for order in orders {
+                    assert_eq!(reset_row(&menu, order), None, "{labels:?} under {order:?}");
+                }
+            }
+        }
+        for (name, text) in fixtures::ALL {
+            let Some(p) = parse_prompt_v2(&screen(text)) else {
+                continue;
+            };
+            for order in orders {
+                if let Some(row) = reset_row(&p, order) {
+                    assert!(
+                        grant_kind(&row.label).is_some()
+                            && !opens(&row.label, WEEKLY)
+                            && !opens(&row.label, WEEKLY_2_1_312),
+                        "{name}: {row:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_label_that_spends_a_reset_is_told_by_its_opening_words() {
         for label in [
@@ -1358,6 +1552,9 @@ mod tests {
             "  Use a weekly reset (2 left, until Oct 5)",
             WEEKLY,
             "Reset your session limit now (1/week)",
+            WEEKLY_2_1_312,
+            "Reset your 5-hour limit now (1/week)",
+            "  reset your 5-hour limit now",
             "Yes, use my 5-hour reset",
             "Yes, use my weekly reset",
             "Yes, use my Fable reset",
@@ -1478,6 +1675,18 @@ mod tests {
                 &["session", "weekly"],
                 1,
             ),
+            (
+                fixtures::CONFIRM_SESSION_2_1_312,
+                ResetKind::Session,
+                &["5-hour"],
+                2,
+            ),
+            (
+                fixtures::CONFIRM_FULL_2_1_312,
+                ResetKind::Full,
+                &["5-hour", "weekly"],
+                1,
+            ),
         ] {
             let ConfirmRead::Exact(read) = confirm_read(&screen(fixture)) else {
                 panic!("{kind:?}: {:?}", confirm_read(&screen(fixture)));
@@ -1503,27 +1712,27 @@ mod tests {
         }
         for (body, detail, limits, week, left, deadline) in [
             (
-                "Refills your session limit now · your weekly reset day stays Oct 9 at 5:30am",
+                "Refills your weekly limit now · your weekly reset day stays Oct 9 at 5:30am",
                 "1 weekly reset left · use by Oct 5 at 12pm",
-                &["session"][..],
+                &["weekly"][..],
                 "Oct 9 at 5:30am",
                 1,
                 "Oct 5 at 12pm",
             ),
             (
-                "Refills your session and weekly limits now · your weekly reset day stays Jan 2, \
+                "Refills your weekly and Opus limits now · your weekly reset day stays Jan 2, \
                  2027 at 9am",
                 "12 weekly resets left · use by Dec 31 at 11:59pm",
-                &["session", "weekly"],
+                &["weekly", "Opus"],
                 "Jan 2, 2027 at 9am",
                 12,
                 "Dec 31 at 11:59pm",
             ),
             (
-                "Refills your session, weekly and Opus limits now · your weekly reset day stays \
+                "Refills your weekly, Opus and Sonnet limits now · your weekly reset day stays \
                  Oct 9 at 5am",
                 "2 weekly resets left · use by Jan 1, 2027 at 1am",
-                &["session", "weekly", "Opus"],
+                &["weekly", "Opus", "Sonnet"],
                 "Oct 9 at 5am",
                 2,
                 "Jan 1, 2027 at 1am",
@@ -1557,28 +1766,46 @@ mod tests {
         }
     }
 
+    /// The confirmation of a reset of `kind` with `body` over a detail counting `left` of it.
+    fn confirm_kind(kind: ResetKind, body: &str, left: u32) -> Vec<String> {
+        let detail = format!("{} left · use by Oct 5 at 3pm", kind.resets(left));
+        confirm_of(&kind.title(), &[body, &detail], &kind.yes(), "No, keep it")
+    }
+
+    fn refills_body(limits: &str) -> String {
+        format!("Refills your {limits} now · your weekly reset day stays Oct 9 at 5am")
+    }
+
     #[test]
     fn every_limit_type_maps_to_a_name_the_confirmation_reads_back() {
         let ConfirmRead::Exact(composed) = confirm_read(&screen(fixtures::CONFIRM)) else {
             panic!("the composed confirmation reads exactly");
         };
-        let read_back = |limits: &str| {
-            let body =
-                format!("Refills your {limits} now · your weekly reset day stays Oct 9 at 5am");
-            match confirm_read(&confirm_with(&[&body, DETAIL])) {
+        let read_back = |kind: ResetKind, limits: &str| {
+            let body = refills_body(limits);
+            match confirm_read(&confirm_kind(kind, &body, 2)) {
                 ConfirmRead::Exact(read) => read.limits,
-                other => panic!("{body}: {other:?}"),
+                other => panic!("{kind:?} {body}: {other:?}"),
             }
         };
         for (limit_type, drawn) in [
-            ("five_hour", "session limit"),
-            ("seven_day", "weekly limit"),
-            ("seven_day_overage_included", "weekly limit"),
-            ("seven_day_opus", "Opus limit"),
-            ("seven_day_sonnet", "Sonnet limit"),
+            ("five_hour", &["5-hour", "session"][..]),
+            ("seven_day", &["weekly"]),
+            ("seven_day_overage_included", &["weekly"]),
+            ("seven_day_opus", &["Opus"]),
+            ("seven_day_sonnet", &["Sonnet"]),
         ] {
-            let name = reset_limit_name(limit_type).unwrap_or_else(|| panic!("{limit_type}"));
-            assert_eq!(read_back(drawn), [name], "{limit_type}");
+            assert_eq!(reset_limit_names(limit_type), drawn, "{limit_type}");
+            assert_eq!(reset_limit_name(limit_type), drawn.first().copied());
+            let kind = if limit_type == "five_hour" {
+                ResetKind::Session
+            } else {
+                ResetKind::Weekly
+            };
+            for name in drawn {
+                let limits = format!("{name} limit");
+                assert_eq!(read_back(kind, &limits), [*name], "{limit_type}: {name}");
+            }
         }
         for limit_type in ["seven_day", "seven_day_overage_included"] {
             assert_eq!(
@@ -1587,12 +1814,137 @@ mod tests {
                 "{limit_type}"
             );
         }
-        for limit_type in ["limit", "overage", "", "seven_day_haiku"] {
+        for limit_type in ["limit", "overage", "", "seven_day_haiku", "Five_hour"] {
             assert_eq!(reset_limit_name(limit_type), None, "{limit_type:?}");
+            assert!(reset_limit_names(limit_type).is_empty(), "{limit_type:?}");
         }
+    }
 
-        assert_eq!(read_back("Weekly limit"), ["Weekly"]);
-        assert_ne!(read_back("Weekly limit"), read_back("weekly limit"));
+    /// A confirmation reads exactly only where its body names what its kind refills, by the
+    /// fallback of the vendor's reading of a grant's kind from its clears (`qe()`), on 2.1.311's
+    /// words (`session`) or 2.1.312's (`5-hour`), never both, each name one a build draws for a
+    /// window a takeable kind refills (`5-hour`, `session`, `weekly`, `Opus`, `Sonnet`); every near
+    /// miss reads `body`: another spelling, a name no build draws for such a window (`Fable`,
+    /// `Weekly`, `Session`), or both builds' words.
+    #[test]
+    fn a_confirmation_names_exactly_what_its_kind_refills_on_either_builds_words() {
+        use ResetKind::{Full, Session, Weekly};
+        let exact = |kind: ResetKind, limits: &str| match confirm_read(&confirm_kind(
+            kind,
+            &refills_body(limits),
+            1,
+        )) {
+            ConfirmRead::Exact(read) => Some(read.limits),
+            ConfirmRead::Inexact("body") => None,
+            other => panic!("{kind:?} {limits}: {other:?}"),
+        };
+        for (kind, limits, names) in [
+            (Session, "5-hour limit", &["5-hour"][..]),
+            (Session, "session limit", &["session"]),
+            (Full, "5-hour and weekly limits", &["5-hour", "weekly"]),
+            (Full, "session and weekly limits", &["session", "weekly"]),
+            (
+                Full,
+                "5-hour, weekly and Opus limits",
+                &["5-hour", "weekly", "Opus"],
+            ),
+            (
+                Full,
+                "session, weekly and Opus limits",
+                &["session", "weekly", "Opus"],
+            ),
+            (
+                Full,
+                "5-hour, weekly, Opus and Sonnet limits",
+                &["5-hour", "weekly", "Opus", "Sonnet"],
+            ),
+            (Weekly, "weekly limit", &["weekly"]),
+            (Weekly, "weekly and Opus limits", &["weekly", "Opus"]),
+            (Weekly, "Opus limit", &["Opus"]),
+            (Weekly, "Sonnet and weekly limits", &["Sonnet", "weekly"]),
+        ] {
+            assert_eq!(
+                exact(kind, limits),
+                Some(names.iter().map(|n| (*n).to_string()).collect()),
+                "{kind:?}: {limits}"
+            );
+        }
+        for (kind, limits) in [
+            (Session, "5-hour and weekly limits"),
+            (Session, "session and weekly limits"),
+            (Session, "5-hour and Opus limits"),
+            (Session, "weekly limit"),
+            (Session, "5-Hour limit"),
+            (Session, "five-hour limit"),
+            (Session, "5 hour limit"),
+            (Session, "5-hours limit"),
+            (Session, "5\u{2013}hour limit"),
+            (Session, "5-hour session limit"),
+            (Session, "session 5-hour limit"),
+            (Session, "session and 5-hour limits"),
+            (Session, "5-hour and session limits"),
+            (Session, "5-hour and 5-hour limits"),
+            (Session, "Session limit"),
+            (Full, "5-hour limit"),
+            (Full, "session limit"),
+            (Full, "weekly limit"),
+            (Full, "5-Hour and weekly limits"),
+            (Full, "five-hour and weekly limits"),
+            (Full, "5-hour, session and weekly limits"),
+            (Full, "session, 5-hour and weekly limits"),
+            (Full, "5-hour, weekly and weekly limits"),
+            (Full, "5-hour and Weekly limits"),
+            (Full, "session and Weekly limits"),
+            (Full, "5-hour and Fable limits"),
+            (Full, "Fable and 5-hour limits"),
+            (Full, "session and Fable limits"),
+            (Full, "5-hour and limit limits"),
+            (Full, "5-hour, Session and weekly limits"),
+            (Full, "5-hour and opus limits"),
+            (Weekly, "5-hour limit"),
+            (Weekly, "session limit"),
+            (Weekly, "5-hour and weekly limits"),
+            (Weekly, "session and weekly limits"),
+            (Weekly, "weekly and weekly limits"),
+            (Weekly, "Weekly limit"),
+            (Weekly, "Fable limit"),
+            (Weekly, "weekly and Fable limits"),
+            (Weekly, "weekly and Session limits"),
+            (Weekly, "weekly and sonnet limits"),
+            (Weekly, "usage credit limit"),
+        ] {
+            assert_eq!(exact(kind, limits), None, "{kind:?}: {limits}");
+        }
+        for (fixture, older) in [
+            (fixtures::CONFIRM_SESSION_2_1_312, fixtures::CONFIRM_SESSION),
+            (fixtures::CONFIRM_FULL_2_1_312, fixtures::CONFIRM_FULL),
+        ] {
+            let rows = screen(fixture);
+            let ConfirmRead::Exact(read) = confirm_read(&rows) else {
+                panic!("{:?}", confirm_read(&rows));
+            };
+            let as_older: Vec<String> = rows
+                .iter()
+                .map(|row| row.replace("your 5-hour", "your session"))
+                .collect();
+            assert_eq!(
+                as_older,
+                screen(older),
+                "the same screen in 2.1.311's words"
+            );
+            for near in ["5-Hour", "five-hour", "session 5-hour", "5-hour session"] {
+                let edited: Vec<String> = rows
+                    .iter()
+                    .map(|row| row.replacen("your 5-hour", &format!("your {near}"), 1))
+                    .collect();
+                assert_eq!(
+                    confirm_read(&edited),
+                    ConfirmRead::Inexact("body"),
+                    "{:?}: {near}",
+                    read.kind
+                );
+            }
+        }
     }
 
     #[test]
@@ -1944,6 +2296,8 @@ mod tests {
             fixtures::DIALOG_KINDS,
             fixtures::DIALOG_FABLE,
             fixtures::DIALOG_WEEKLY,
+            fixtures::DIALOG_WEEKLY_2_1_312,
+            fixtures::DIALOG_WEEKLY_BESIDE_GRANT_2_1_312,
         ] {
             assert_eq!(confirm_read(&screen(dialog)), ConfirmRead::Not);
         }
@@ -2209,6 +2563,21 @@ mod tests {
         "Your session limit is already being reset · one moment",
         "Couldn't reset your session limit with this login · run /login, then try again",
     ];
+    /// [`JUNIPER`] as 2.1.312 draws it (`OJ` @228882669, `5-hour limit` for `session limit`), with
+    /// the row, its notice and its pending line.
+    const JUNIPER_2_1_312: [&str; 10] = [
+        "5-hour limit reset · next reset available Oct 9 at 5am · your weekly limit still applies",
+        "5-hour limit reset · your weekly limit still applies",
+        "Couldn't reset your 5-hour limit right now · try again in a moment",
+        "A 5-hour limit reset isn't available right now.",
+        "Your 5-hour limit is already being reset · one moment",
+        "Couldn't reset your 5-hour limit with this login · run /login, then try again",
+        "Reset your 5-hour limit now",
+        "Reset your 5-hour limit now and keep working; once a week, still counts toward your weekly \
+         limit",
+        "/limit-reset to reset your 5-hour limit now · uses weekly limit · 1/week",
+        "Resetting your 5-hour limit… this usually takes a few seconds",
+    ];
 
     #[test]
     fn a_spent_line_is_read_by_its_kinds_head() {
@@ -2243,6 +2612,23 @@ mod tests {
                 "Session limit reset · 1 five-hour reset left",
                 ResetKind::Session,
                 1,
+            ),
+            (
+                "5-hour limit reset · your weekly reset day stays Oct 9 at 5am · 1 five-hour reset \
+                 left",
+                ResetKind::Session,
+                1,
+            ),
+            (
+                "5-hour limit reset · your weekly reset day stays Jan 2, 2027 at 5:30am · no \
+                 five-hour resets left",
+                ResetKind::Session,
+                0,
+            ),
+            (
+                "5-hour limit reset · 2 five-hour resets left",
+                ResetKind::Session,
+                2,
             ),
             (
                 "Weekly limits reset · no weekly resets left",
@@ -2306,6 +2692,11 @@ mod tests {
                 "Session limit reset · refilled · 2 five-hour resets left",
                 ResetKind::Session,
                 Some(2),
+            ),
+            (
+                "5-hour limit reset · your weekly reset day stays Oct 9 at 5am",
+                ResetKind::Session,
+                None,
             ),
             (
                 "Fable reset used · what Fable used is back in your weekly limit · enjoy",
@@ -2378,7 +2769,7 @@ mod tests {
             ResetLine::Login,
             "a typographic apostrophe"
         );
-        for line in FAILURES.iter().chain(&JUNIPER) {
+        for line in FAILURES.iter().chain(&JUNIPER).chain(&JUNIPER_2_1_312) {
             assert_eq!(reset_line(line), ResetLine::Other, "{line}");
             assert_eq!(reset_line(&asking(line)), ResetLine::Other, "{line}");
         }
@@ -2394,6 +2785,15 @@ mod tests {
             "Session limit reset · 1 5-hour reset left",
             "Session limit reset · send a message to continue",
             "Session limit reset · refilled",
+            "5-hour limit reset",
+            "5-hour limit reset · 1 weekly reset left",
+            "5-hour limit reset · 1 5-hour reset left",
+            "5-hour limit reset · send a message to continue",
+            "5-hour limit resets · 1 five-hour reset left",
+            "5-Hour limit reset · 1 five-hour reset left",
+            "5-hour limit reset: 1 five-hour reset left",
+            "The line was: 5-hour limit reset · 1 five-hour reset left",
+            "> 5-hour limit reset · your weekly reset day stays Oct 9 at 5am",
             "The line was: Weekly limits reset · 1 weekly reset left",
             "Fable reset used · 1 Fable reset left",
             "Fable reset used · you're still at your weekly limit · 1 Fable reset left",
@@ -2422,6 +2822,8 @@ mod tests {
             "Weekly limits reset · no weekly resets left",
             "Session limit reset · your weekly reset day stays Oct 9 at 5am · 1 five-hour reset left",
             "Session limit reset · 1 five-hour reset left",
+            "5-hour limit reset · your weekly reset day stays Oct 9 at 5am · 1 five-hour reset left",
+            "5-hour limit reset · 1 five-hour reset left",
             "Limits reset · your weekly reset day stays Oct 9 at 5am · 2 full resets left",
             "Fable reset used · what Fable used is back in your weekly limit · your weekly reset \
              day stays Oct 9 at 5am · 1 Fable reset left",
@@ -2491,7 +2893,11 @@ mod tests {
         let chooser = ["5-hour reset", "Weekly reset", "Full reset", "Fable reset"]
             .into_iter()
             .flat_map(|kind| reasons.map(|reason| format!("{kind}{SEP}{reason}")));
-        let lines = fixed.iter().chain(&FAILURES).chain(&JUNIPER);
+        let lines = fixed
+            .iter()
+            .chain(&FAILURES)
+            .chain(&JUNIPER)
+            .chain(&JUNIPER_2_1_312);
         for line in lines.map(|line| (*line).to_string()).chain(chooser) {
             for line in [format!("{line}{ASKS}"), line] {
                 assert_eq!(classify_wall(&line), None, "{line}");
@@ -2511,10 +2917,67 @@ mod tests {
         );
         for wall in [
             "You've hit your session limit · resets 3pm",
+            "You've hit your 5-hour limit · resets 3pm",
+            "You've hit your 5-hour limit · resets 3pm · progress saved",
+            "You’ve hit your 5-hour limit · resets 5:11pm (America/Los_Angeles)",
             "Session limit reached ∙ resets 5pm",
             "You've hit your limit · resets 7:30pm (America/Los_Angeles)",
         ] {
             assert_eq!(classify_wall(wall), Some(WallKind::UsageSession), "{wall}");
         }
+    }
+
+    #[test]
+    fn claude_2_1_312s_reset_answers_are_no_wall_and_its_wall_still_is() {
+        use crate::phase::{Phase, worker_phase};
+        use crate::wall::{WallKind, wall};
+        let session = ResetLine::Spent {
+            kind: ResetKind::Session,
+            left: Some(1),
+            asks: false,
+        };
+        for (name, text, read) in [
+            (
+                "weekly row",
+                fixtures::DONE_WEEKLY_ROW_2_1_312,
+                ResetLine::Other,
+            ),
+            ("5-hour kind", fixtures::SPENT_SESSION_2_1_312, session),
+        ] {
+            let rows = screen(text);
+            assert_eq!(wall(&rows), None, "{name}");
+            assert_eq!(worker_phase(&rows), Phase::Idle, "{name}");
+            let said = rows
+                .iter()
+                .rev()
+                .find_map(|row| row.trim_start().strip_prefix('⎿'))
+                .expect("the answer row");
+            assert_eq!(reset_line(said), read, "{name}");
+            let command = rows
+                .iter()
+                .position(|row| row == "❯ /rate-limit-options")
+                .expect("the command row");
+            let frame = rows
+                .iter()
+                .position(|row| is_rule(row))
+                .expect("the composer's rule");
+            let walled: Vec<String> = rows[..command]
+                .iter()
+                .chain(&rows[frame..])
+                .cloned()
+                .collect();
+            let w = wall(&walled).expect("the wall the answer came after");
+            assert_eq!(w.kind, WallKind::UsageSession, "{name}: {w:?}");
+            assert!(
+                w.message
+                    .starts_with("You've hit your 5-hour limit · resets 5:11pm"),
+                "{name}: {w:?}"
+            );
+        }
+        let quoted = screen(fixtures::QUOTED_2_1_312);
+        assert_eq!(wall(&quoted), None);
+        assert_eq!(worker_phase(&quoted), Phase::Idle);
+        assert_eq!(parse_prompt_v2(&quoted), None);
+        assert_eq!(reset_pending(&quoted), None);
     }
 }

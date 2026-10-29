@@ -184,11 +184,6 @@ fn content_gen_tracks_row_text_changes() {
             let gen_before = grid.content_gen();
             let text_before: Vec<Option<String>> =
                 (0..grid.rows()).map(|r| grid.row_text(r)).collect();
-            assert_eq!(
-                grid.content_gen(),
-                gen_before,
-                "scroll_to_bottom (viewport-only) must not advance content_gen"
-            );
 
             match next(6) {
                 0 => grid.write_char('A'),

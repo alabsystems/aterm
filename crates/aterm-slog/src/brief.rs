@@ -103,9 +103,13 @@ fn best<'a>(close: Option<&'a Rec>, amends: &[&'a Rec], key: Key) -> Option<&'a 
     for a in amends.iter().copied().filter(|a| a.f.get(key).is_some()) {
         let wins = match held {
             None => close.is_some(),
-            Some(h) if key == Key::Out => {
-                crate::fold::amend_refines_out(h.conf, h.seq, a.conf, a.seq)
-            }
+            Some(h) if key == Key::Out => crate::fold::amend_refines_out(
+                h.node.lvl,
+                h.out().unwrap_or_default(),
+                (h.conf, h.seq),
+                a.conf,
+                a.seq,
+            ),
             Some(h) => crate::fold::confidence_law(h.conf, h.seq, a.conf, a.seq),
         };
         if wins {

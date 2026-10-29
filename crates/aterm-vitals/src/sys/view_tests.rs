@@ -178,6 +178,43 @@ fn snapshot() -> Snapshot {
 }
 
 #[test]
+fn global_monitor_summaries_show_used_available_and_total_capacity() {
+    let mut s = snapshot();
+    s.volume = Some(VolumeSample {
+        total: 8_000_000_000_000,
+        free: 400_000_000_000,
+        available: 240_000_000_000,
+        mount: "/".into(),
+    });
+    let w = world();
+    let c = ctx(&w, Some(&s), true, true);
+    for view in [View::Overview, View::Global] {
+        let text = all_text(&render_text(&query(view, false), &c));
+        for figure in [
+            "7.60 TB used",
+            "240 GB available",
+            "8.00 TB total",
+            "17.0 GiB available",
+            "32 GiB total",
+        ] {
+            assert!(text.contains(figure), "{view:?} lacks {figure}: {text}");
+        }
+    }
+    let json = global_json(&s);
+    assert_eq!(json.get("disk_used_bytes"), Some(&Jv::u(7_600_000_000_000)));
+    assert_eq!(
+        json.get("disk_available_bytes"),
+        Some(&Jv::u(240_000_000_000))
+    );
+    assert_eq!(
+        json.get("disk_total_bytes"),
+        Some(&Jv::u(8_000_000_000_000))
+    );
+    assert_eq!(json.get("mem_available_bytes"), Some(&Jv::u(17 << 30)));
+    assert_eq!(json.get("mem_total_bytes"), Some(&Jv::u(32 << 30)));
+}
+
+#[test]
 fn scheduling_values_errors_and_active_executable_survive_rendering() {
     use crate::scheduling::Scheduling;
     let mut s = snapshot();
@@ -323,7 +360,13 @@ fn scheduling_held_core_is_unavailable_in_core_cluster_and_global_views() {
         global_json(&s).get("cpu_mc"),
         Some(&Jv::why("no_counter_delta"))
     );
+    assert_eq!(s.total_cores(), Some(4));
+    let capacity = words::monitor_capacity(crate::model::Resource::Cpu, &s);
+    assert!(capacity[0].contains("4 cores total"), "{capacity:?}");
+    assert!(capacity[0].contains("unavailable"), "{capacity:?}");
     let c = ctx(&w, Some(&s), true, true);
+    let overview = all_text(&render_text(&query(View::Overview, false), &c));
+    assert!(overview.contains("4 cores total"), "{overview}");
     let text = all_text(&render_text(&query(View::Cores, false), &c));
     assert!(text.contains("exact=unavailable(no_counter_delta)"));
     // This fixture is swapping, so bare `why` correctly prefers memory.
@@ -1668,8 +1711,15 @@ fn an_idle_measured_tab_waited_for_no_core() {
 #[test]
 fn a_first_sweeps_procs_are_warming_never_zero() {
     let first = Vitals::new().absorb(&sample(10, &[0, 0, 0, 0], 0));
+    assert_eq!(first.total_cores(), Some(4));
+    let capacity = words::monitor_capacity(crate::model::Resource::Cpu, &first);
+    assert!(capacity[0].contains("4 cores total"), "{capacity:?}");
+    assert!(capacity[0].contains("unavailable"), "{capacity:?}");
     let w = world();
     let c = ctx(&w, Some(&first), true, true);
+    assert_eq!(machine_json(&c, &first).get("cpus"), Some(&Jv::u(4)));
+    let overview = all_text(&render_text(&query(View::Overview, false), &c));
+    assert!(overview.contains("4 cores total"), "{overview}");
     let text = all_text(&render_text(&query(View::Procs, false), &c));
     assert!(
         text.starts_with("procs  tab 1 · unavailable(warming): one process sweep has no interval"),
@@ -1729,6 +1779,58 @@ fn gpu_snapshot() -> Snapshot {
 #[test]
 fn gpu_client_time_fills_the_lanes_slots_in_text_and_json() {
     let w = world();
+    let mut model = Vitals::new();
+    model.absorb(&sample(10, &[0; 4], 0));
+    let mut reading = sample(11, &[20, 30, 100, 90], 1);
+    reading.gpu.as_mut().unwrap().device_pct = None;
+    let unread = model.absorb(&reading);
+    assert!(unread.gpu.is_none(), "no utilization-bearing view was made");
+    let unread_ctx = ctx(&w, Some(&unread), true, true);
+    for view in [View::Overview, View::Global, View::Gpu] {
+        let text = all_text(&render_text(&query(view, false), &unread_ctx));
+        assert!(text.contains("Apple M5"), "{view:?}: {text}");
+        assert!(text.contains("10 cores"), "{view:?}: {text}");
+        assert!(
+            text.contains("unavailable(not_sampled:device_utilization)"),
+            "{view:?}: {text}"
+        );
+        let json = render_json(&query(view, true), &unread_ctx);
+        assert!(contract_violations(&json).is_empty(), "{json:?}");
+    }
+    assert_eq!(
+        machine_json(&unread_ctx, &unread).get("gpu_cores"),
+        Some(&Jv::u(10))
+    );
+    assert_eq!(
+        machine_json(&unread_ctx, &unread).get("gpu_name"),
+        Some(&Jv::s("Apple M5"))
+    );
+    assert_eq!(
+        global_json(&unread).get("gpu_pm"),
+        Some(&Jv::why("not_sampled:device_utilization"))
+    );
+    let gpu = gpu_json(&query(View::Gpu, true), &unread_ctx, &unread);
+    assert_eq!(
+        gpu.get("device_pm"),
+        Some(&Jv::why("not_sampled:device_utilization"))
+    );
+    assert_eq!(gpu.get("cores"), Some(&Jv::u(10)));
+    assert_eq!(gpu.get("name"), Some(&Jv::s("Apple M5")));
+
+    reading.at_ns += 1_000_000_000;
+    reading.gpu.as_mut().unwrap().device_pct = Some(0);
+    let zero = model.absorb(&reading);
+    assert_eq!(global_json(&zero).get("gpu_pm"), Some(&Jv::u(0)));
+    assert!(gpu_words(&zero).starts_with("0% busy"));
+    reading.at_ns += 1_000_000_000;
+    reading.gpu = None;
+    let missing = model.absorb(&reading);
+    let missing_ctx = ctx(&w, Some(&missing), true, true);
+    assert_eq!(gpu_words(&missing), unavailable("unsupported"));
+    assert_eq!(
+        gpu_json(&query(View::Gpu, true), &missing_ctx, &missing),
+        Jv::why("unsupported")
+    );
     let off = snapshot();
     let c = ctx(&w, Some(&off), true, true);
     let gpu = all_text(&render_text(&query(View::Gpu, false), &c));
@@ -2099,4 +2201,20 @@ fn a_pane_of_a_split_tab_reads_its_tabs_programs() {
     apart.target.window_sessions = vec![9];
     let text = all_text(&render_text(&q, &ctx(&apart, Some(&s), true, true)));
     assert!(!text.contains("program exe=cargo"), "{text}");
+}
+
+#[test]
+fn the_gpu_view_names_the_device_and_core_count_once() {
+    let s = snapshot();
+    let w = world();
+    let c = ctx(&w, Some(&s), true, true);
+    let reply = render_text(&query(View::Gpu, false), &c);
+    let gpu = &reply
+        .lines
+        .iter()
+        .find(|line| line.key == "gpu")
+        .expect("GPU line")
+        .text;
+    assert_eq!(gpu.matches("Apple M5").count(), 1, "{gpu}");
+    assert_eq!(gpu.matches("10 cores").count(), 1, "{gpu}");
 }

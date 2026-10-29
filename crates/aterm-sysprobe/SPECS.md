@@ -111,12 +111,11 @@
 > driver check. Its live test is `tests::the_gpu_driver_names_itself_on_this_host` (macOS on Apple
 > silicon). Its spec is not recovered here yet.
 
-Source: `crates/aterm-sysprobe`. Every `#[test]` is in `crates/aterm-sysprobe/src/tests.rs` (16 tests: 9 run
-on every host, 1 needs `unix`, 1 needs `macos` or `linux`, 5 need `macos`). Each was read together with the
-code it reaches in `src/lib.rs`, `src/linux.rs` and `src/macos.rs`. Nothing was compiled or run for this
-file. The claims come from reading the code.
+Source: `crates/aterm-sysprobe`. The recovered spec table below maps 44 `#[test]` functions across
+`src/tests.rs` (18), `src/jobs/tests.rs` (18) and `src/procargs_tests.rs` (8). Nothing was compiled
+or run for this file; the claims come from reading the code.
 
-Result: **17 specs**, covering **16 tests**. Every test is a spec sample (§4).
+Result: **28 specs**, covering **44 tests**. Every mapped test is a spec sample (§4).
 
 > 2026-10-20: `procargs-parse` (the workspace's one `KERN_PROCARGS2` reader and parser,
 > `procargs`, which `kproc`, atpkg, aterm-gui and aterm-uds' `process` read through; aterm-uds
@@ -140,6 +139,21 @@ Result: **17 specs**, covering **16 tests**. Every test is a spec sample (§4).
 > 2026-10-24: `socket-settled` and `socket-read-gate` (when the job probe, and the lab's `lsof -i`
 > each second, may read another process's sockets: `PROC_PIDFDSOCKETINFO` drains a socket its
 > holder closes meanwhile) join §1 with their six tests. The counts below were taken before.
+>
+> 2026-10-27: `group-usage-members` (`group_usage`, what each member of a process group used,
+> which aterm-verify's ceiling clock reads to leave out a check's wait for a core) and
+> `hid-idle-clock` (`hid_idle`, the time since the keyboard or mouse was last touched, which
+> decides whether verify clamps a compile to utility QoS) join §1 with a test each
+> (`docs/DESIGN-adaptive-build-2026-10-24.md`, CEILING-WAIT). The counts below were taken before.
+>
+> 2026-10-29: `group-usage-members` gains each member's footprint now and its lifetime peak
+> (`ri_phys_footprint`, `ri_lifetime_max_phys_footprint`, from the same `RUSAGE_INFO_V4` read),
+> which aterm-verify books into the stage's memory meter (VERIFY-MEM), and the macOS sweep reads
+> each process's resident size (`ri_resident_size`, `ProcessReading::resident`; the Linux sweep
+> reads its `RssAnon` there, `linux::status_memory`), which the capacity ledger credits a
+> claim's tree with where it is below the footprint (VERIFY-MEM's honest room).
+> `available-mib-of` is unchanged: the ledger reads its own room from `memory_detail`
+> (aterm-capacity's `claimable`).
 
 ## 0. Notation used in the statements
 
@@ -171,23 +185,25 @@ id	kind	functions	statement	subsumes	difficulty	blocking_gaps
 whole-lines-torn-tail-ignored	invariant	linux::whole_lines, linux::keyed, linux::meminfo, linux::swap_pages	∀ P ∈ {meminfo, swap_pages}, ∀ t that is empty or ends with '\n', ∀ s with no '\n': P(t ++ s) = P(t). Equivalently, P(x) depends only on WL(x). Corollary: when x is t cut at any byte c that does not fall right after a '\n', the line containing c is never parsed, so no number's prefix (e.g. `pswpout 34` of `pswpout 3400`) is ever read as a value.	(secondary only: T::every_proc_read_is_bounded_to_4_kib, torn vmstat part)	&str slicing at rfind, Iterator::lines/find_map with closures, Option	0,1,3,5,7,13
 meminfo-facts	contract	linux::meminfo, linux::keyed	∀ text: meminfo(text) = Some(MemInfo{total_kib: Key(text,"MemTotal"), available_kib: Key(text,"MemAvailable")}) when both are Some, otherwise None.	T::meminfo_gives_the_total_and_the_available	&str parsing via keyed (iterator, closures), Option `?`, Copy struct construction	0,1,3,5,7,13
 swap-pages-sum	contract	linux::swap_pages	∀ vmstat: swap_pages(vmstat) = Some(a sat+ b) when Key(vmstat,"pswpin") = Some(a) and Key(vmstat,"pswpout") = Some(b), otherwise None.	T::vmstat_sums_swap_in_and_out	&str, Option `?`, composition with keyed (the meminfo-facts Key lemma)	0,1,3,4,5,7,13
-auxv-lookup	contract	linux::auxv_value	∀ bytes: &[u8], key: u64, with W = size_of::<usize>(): split bytes into the full 2W-byte chunks P_0..P_{m−1}, with m = len div 2W; a trailing partial chunk is ignored. Let k_j = usize::from_ne_bytes(P_j[..W]) and v_j = usize::from_ne_bytes(P_j[W..]). auxv_value(bytes,key) = Some(v_j) for the least j with k_j = key, and None if no j matches. In particular a cut pair (len < 2W) gives None. The scan does not stop at AT_NULL (§5).	T::the_auxiliary_vector_gives_the_page_size	&[u8] as_chunks (const generic), copy_from_slice, from_ne_bytes, find_map closure	0,1,3,5,7,11,13
+auxv-lookup	contract	linux::auxv_value	∀ bytes: &[u8], key: u64, with W = size_of::<usize>(): split bytes into the full 2W-byte chunks P_0..P_{m−1}, with m = len div 2W; a trailing partial chunk is ignored. Let k_j = usize::from_ne_bytes(P_j[..W]) and v_j = usize::from_ne_bytes(P_j[W..]), and let n ≤ m be the least index with k_n = 0 (AT_NULL), or m if none is 0. auxv_value(bytes,key) = Some(v_j) for the least j < n with k_j = key, and None if no j < n matches (in particular key = 0 always gives None, and a cut pair len < 2W gives None).	T::the_auxiliary_vector_gives_the_page_size	&[u8] as_chunks (const generic), copy_from_slice, from_ne_bytes, take_while/find_map closures	0,1,3,5,7,11,13
 read-bounded-cap	contract	read_bounded, read_bounded_bytes	Effects(fs). ∀ path p: read_bounded_bytes(p) = Err(kind) when open fails, or when a read fails with any kind other than Interrupted (which is retried). Otherwise it is Ok(the first min(N, READ_CAP) bytes the file yields), where N is the bytes yielded before EOF. |result| ≤ READ_CAP for every file, including a device that never ends (exactly READ_CAP bytes). read_bounded(p) = read_bounded_bytes(p).ok().map(from_utf8_lossy). Pure core (provable modulo gaps 2 and 7): the loop invariant 0 ≤ n ≤ READ_CAP with buf[..n] equal to the concatenation of the reads.	T::every_proc_read_is_bounded_to_4_kib	fs::File, io::Read loop over &mut [u8; 4096], ErrorKind, Vec<u8>, String::from_utf8_lossy	0,1,2,7,8
 pressure-level-table	table-property	pressure_of	∀ level: i64: pressure_of(level) = {1 ↦ Normal, 2 ↦ Warn, 4 ↦ Critical, otherwise None}.	T::kernel_pressure_levels_map_to_memory_levels	literal match into an Option of a local enum	0,1,3
-used-mib-of	contract	used_mib_of	∀ internal, purgeable, wired, compressor, page: used_mib_of(...) = None if page = 0. Otherwise, with pages = (internal sat- purgeable) + wired + compressor, it is u32::try_from((pages sat* page) >> 20).ok(). requires (no panic): the two plain additions do not overflow u64 (§5). The result is not capped at physical memory.	T::memory_in_use_is_counted_from_the_vm_pages	u64 scalar arithmetic, saturating ops, unchecked add, u32::try_from; seal 150efe4a: E6 refuses (Option<u32> return, saturating calls, Assert)	0,1,3
+used-mib-of	contract	used_mib_of	∀ internal, purgeable, wired, compressor, page: used_mib_of(...) = None if page = 0. Otherwise, with pages = ((internal sat- purgeable) sat+ wired) sat+ compressor, it is u32::try_from((pages sat* page) >> 20).ok(). Total on all u64 inputs. The result is not capped at physical memory.	T::memory_in_use_is_counted_from_the_vm_pages	u64 scalar arithmetic, saturating ops, u32::try_from; seal 150efe4a: E6 refuses (Option<u32> return, saturating calls, Assert)	0,1,3
 available-mib-of	contract	available_mib_of	∀ free, inactive, purgeable, page, physical: available_mib_of(...) = None if page = 0. Otherwise it is Some(min(((free sat+ inactive sat+ purgeable) sat* page) >> 20, physical)), where the min applies only when physical is Some. Corollary: the result never exceeds physical when physical is known.	T::memory_available_is_free_inactive_and_purgeable_pages	u64 scalar arithmetic, Option<u64> map_or with a closure	0,1,3,13
 swap-meter-rate	refinement	SwapMeter::new, SwapMeter::observe	State (base: Option<(Instant,u64)>, rate: Option<u32>), with new() = (None, None). observe(at, kib): kib = None resets to (None, None) and returns None. With no base, it sets base = (at, kib) and returns None. Otherwise let span = at sat- base_at. If span > SWAP_SPAN_MAX, the state becomes (Some((at,kib)), None) and observe returns None. If span < SWAP_SPAN_MIN, the state is unchanged and observe returns rate. Otherwise r = min(u32::MAX, ((kib sat- base_kib) sat* 1000) div max(1, span_ms)), the state becomes (Some((at,kib)), Some(r)), and observe returns Some(r). Corollaries: a counter that went backwards gives rate 0; a second reader within SWAP_SPAN_MIN repeats the last rate; a rate is never taken over a span longer than SWAP_SPAN_MAX.	T::the_swap_meter_reads_a_rate_over_a_span_of_its_readings	&mut self two-state, Option<(Instant,u64)>, Duration comparison/as_millis (u128), try_from	0,1,2,3
 process-cwd-path-own	other	process_cwd, process_path, macos::process_cwd, macos::process_path, win_paths::process_path	Effects(proc_pidinfo/proc_pidpath, /proc/<pid>/{cwd,exe}, or QueryFullProcessImageNameW). ∀ pid: process_cwd(pid) = Some(p) ⇒ p is absolute and equals the OS's current-directory path for pid. process_path(pid) = Some(p) ⇒ p is absolute and equals the OS's executable path for pid (truncated to PATH_CAP bytes on macOS). process_cwd(0) = process_path(0) = None, and on macOS both are None for pid > i32::MAX (pid is filtered to 0 < pid ≤ i32::MAX). On Windows process_cwd reads the process environment block's CurrentDirectory (peb::cwd: Effects(OpenProcess, NtQueryInformationProcess, ReadProcessMemory)), spelled as the process's own GetCurrentDirectoryW answers it (no trailing separator but at a root), None for a process that refuses PROCESS_VM_READ or has exited (peb::tests::a_processs_working_directory_is_read_from_its_environment_block); process_path reads QueryFullProcessImageNameW through an OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) handle (with SYNCHRONIZE when granted, refusing an exited process), None when refused or exited. Every other platform answers None.	T::a_processs_working_directory_and_executable_are_its_own	FFI, unsafe zeroed structs, OsStr from bytes, PathBuf, fs::read_link	0,1,8
 group-memory-members	other	group_memory, macos::group_memory, macos::footprint_kib	Effects(libproc). ∀ pid: group_memory(pid) = None if pid = 0, if pid > i32::MAX, if the short info is unreadable, if pgid = 0, or if no member was measured. Otherwise it is Some{pgid = pbsi_pgid(pid), measured = the number of the first min(n, MAX_GROUP_PIDS) listed group members > 0 whose footprint_kib is Some, footprint_mib = (sat-sum of those footprint_kib)/1024}, where footprint_kib(m) = proc_pid_rusage(m, RUSAGE_INFO_V4).ri_phys_footprint / 1024 when the call succeeds. So a child that took its own process group is never counted in its parent's group. On every platform but macOS it is always None.	T::a_groups_memory_is_its_own_members_footprint	FFI proc_listpids into a fixed array, unsafe, loop with a saturating sum	0,7,8
-machine-memory-within-physical	other	physical_memory_mib, machine_memory, memory_pressure, macos::machine_memory, macos::physical_memory_mib, macos::memory_pressure	Effects(sysctl and HOST_VM_INFO64, or /proc/meminfo). machine_memory() = Some(m) ∧ physical_memory_mib() = Some(p) ⇒ m.available_mib ≤ p, and on Linux also m.used_mib ≤ p. On macOS used_mib ≤ p holds only empirically, because used_mib_of is not capped (§5). Pure cores: macOS uses available_mib_of(free, inactive, purgeable, page, physical) and used_mib_of(internal, purgeable, wire, compressor, page); Linux uses available = min(avail/1024, total/1024) and used = (total sat- avail)/1024 over meminfo-facts' (total, avail). physical_memory_mib is (hw.memsize >> 20).filter(> 0) on macOS and (total_kib ≥ 1024).then(total_kib/1024) on Linux. memory_pressure is kern.memorystatus_vm_pressure_level through pressure_of on macOS and None elsewhere.	T::the_machines_memory_and_pressure_are_read_on_this_host	FFI, OnceLock, composition of pure callees	0,4,8
+machine-memory-within-physical	other	physical_memory_mib, machine_memory, memory_pressure, clamp_physical_mib, macos::machine_memory, macos::physical_memory_mib, macos::memory_pressure	Effects(sysctl and HOST_VM_INFO64, or /proc/meminfo). machine_memory() = Some(m) ∧ physical_memory_mib() = Some(p) ⇒ m.available_mib ≤ p ∧ m.used_mib ≤ p on both macOS and Linux. Pure cores: macOS uses available_mib_of(free, inactive, purgeable, page, physical) and clamp_physical_mib(u64::from(used_mib_of(internal, purgeable, wire, compressor, page)), physical); Linux uses available = min(avail/1024, total/1024) and used = (total sat- avail)/1024 over meminfo-facts' (total, avail). physical_memory_mib is (hw.memsize >> 20).filter(> 0) on macOS and (total_kib ≥ 1024).then(total_kib/1024) on Linux. memory_pressure is kern.memorystatus_vm_pressure_level through pressure_of on macOS and None elsewhere.	T::the_machines_memory_and_pressure_are_read_on_this_host	FFI, OnceLock, composition of pure callees	0,4,8
 swapped-kib-counter	other	swapped_kib, macos::swapped_kib	Effects(HOST_VM_INFO64 and vm.pagesize, or /proc/vmstat and /proc/self/auxv). On macOS swapped_kib() = (swapins sat+ swapouts) sat* page_kib with page_kib = vm.pagesize div 1024, and None when that is 0 or unread or the kernel refuses the statistics. On Linux it is swap_pages(read_bounded(/proc/vmstat)) sat* page_kib, with page_kib = auxv_value(read_bounded_bytes(/proc/self/auxv), 6 = AT_PAGESZ) div 1024 when that is > 0, else 4, read once per process. Every other platform answers None. The kernel's counters only grow, so two reads k1 then k2 on one host satisfy k1 ≤ k2.	T::the_swap_counter_reads_on_this_host_and_never_runs_backwards	FFI, OnceLock, composition with swap-pages-sum and auxv-lookup	0,4,8
 stat-pgrp	contract	linux::stat_pgrp	∀ stat: stat_pgrp(stat) = the third whitespace token after the LAST ')' of stat, parsed as u32 (the pgrp field after state and ppid), or None when stat has no ')', fewer than three tokens follow it, or that token does not parse. So a command name holding spaces or ')' cannot move the field.	T::a_stat_line_gives_its_group_past_any_command_name	&str rsplit_once, iterator nth, u32 parse	0,1,3,5,7,13
 lone-group-leader	other	lone_group_leader, macos::lone_group_leader, macos::complete_lone_group, macos::short_info	Effects(libproc). macOS returns a nonempty kernel name only for a readable positive leader whose aligned, nonempty, nonfull listing contains exactly that one positive pid (zero padding permitted). Failed, empty, misaligned, full, overlong, absent-leader or extra-member listings return None. The pure complete_lone_group predicate enforces the listing rule and its test reads captured arrays only. Every non-macOS platform returns None: Linux direct children are not a complete group census. All observations are snapshots, without a process-lifetime guarantee.	T::only_a_complete_group_census_admits_its_leader	FFI proc_pidinfo and proc_listpids into fixed arrays; pure byte-count and membership adapter	0,7,8
 children-pids	contract	linux::children	∀ text: children(text) = the words w of text.split_inclusive(' ') that end in ' ' and whose w minus that space parses as u32, parsed, in order. So a pid cut at the 4 KiB cap (no closing space) is never read as a shorter pid, and a word that is not a pid is skipped.	T::a_children_text_names_only_the_pids_its_spaces_close	&str split_inclusive, strip_suffix, u32 parse, filter_map	0,1,3,5,7,13
 stdin-sharers	other	stdin_sharers, macos::stdin_sharers, macos::stdin_device, macos::short_info, linux_stdin_sharers	Effects(libproc, or /proc). macOS: stdin_sharers(l) = None if l = 0, l > i32::MAX, the short info is unreadable or names a group other than l, l's descriptor 0 is not a character device (proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO) answers other than the whole struct, or vst_mode is not S_IFCHR), or the group listing writes no bytes. Otherwise it is Some(the positive members ≠ l among the first min(n, MAX_GROUP_PIDS) listed whose descriptor 0 is a character device with l's (vst_dev, vst_ino)). Linux: the same over l's children read from /proc/l/task/*/children (children-pids) whose stat_pgrp is l and whose /proc/<pid>/fd/0 has l's (dev, ino), None when no children file was read. Every other platform answers None. A snapshot, without a process-lifetime guarantee.	T::a_leaders_input_is_shared_only_by_members_on_that_very_device	FFI proc_pidinfo, proc_listpids and proc_pidfdinfo into fixed arrays; the jobs::darwin::vnode decoder	0,7,8
+group-usage-members	other	group_usage, macos::group_usage, procs::imp::rusage, procs::ticks_to_ns	Effects(libproc). group_usage(g) = None if g = 0, g > i32::MAX, the listing fails, or off macOS. Otherwise it is Some(the positive pids proc_listpids(PROC_PGRP_ONLY, g) lists, at most MAX_GROUP_PIDS, each whose proc_pid_rusage(RUSAGE_INFO_V4) reads, as MemberUsage{pid, start = ri_proc_start_abstime, cpu_ns = ticks_to_ns(ri_user_time sat+ ri_system_time), runnable_ns = ticks_to_ns(ri_runnable_time), io_bytes = ri_diskio_bytesread sat+ ri_diskio_byteswritten sat+ ri_logical_writes, footprint = ri_phys_footprint, peak_footprint = ri_lifetime_max_phys_footprint}), in listing order; a group with no member left is Some([]). A member's counters are the kernel's as read, and they can fall while its (pid, start) lives: ri_system_time fell by 0.2-0.42 ms within 600 ms of a child's exec in 5 of 12 spawns on this Mac (2026-10-27), so a reader of their growth saturates it, as aterm-verify's used_between does. ri_runnable_time includes the time on a core, but the kernel books it apart, so it may trail cpu_ns slightly.	T::a_groups_usage_is_its_own_members_cpu_and_runnable_time	libproc FFI into a fixed array, a repr(C) struct read, saturating u64 sums, Mach timebase	0,1,3,8
+hid-idle-clock	other	hid_idle, macos::hid_idle	Effects(IOKit). On macOS hid_idle() = Some(Duration::from_nanos(n)) when the IOHIDSystem service matches and its HIDIdleTime property reads as an unsigned number n, read from the IORegistry with no WindowServer connection; else None. Off macOS it is None.	T::the_input_idle_clock_reads_on_a_mac_and_nowhere_else	IOKit FFI, CFNumber read, an io_object released on every path	0,8
 program-check-judge	contract	jobs::judge_start	∀ f: StartFacts: judge_start(f) = Started unless f.lone_zero ∧ ¬f.stopped ∧ ¬f.traced ∧ f.age_ms ≥ Some(PROGRAM_CHECK_AGE_MS = 20000) (None < Some, so an unread age is Started); otherwise Translating if f.translated, else Unstarted if f.local ≠ Some(true) (an unread mount proves nothing local), else Held. Corollaries: only Held for a lone unstarted thread past the bound, native and local; monotone in age past the bound.	src/jobs/tests.rs::the_program_check_judge_holds_only_an_old_lone_unstarted_thread	a struct of bools and Options, Option<u64> ordering, a fieldless enum return	0,1,3
 program-check-read	other	jobs::read_start, jobs::read_start_in, jobs::at_start, jobs::local_at, jobs::macos::{read_start,start_facts,thread_handles,translated}, JobsReader::read_all (start_facts), ProcFacts::program_check, tail_allowed	Effects(libproc, sysctl, getfsstat). read_start(pid, now) = read_start_in(pid, now, a fresh mount cell); read_start_in(pid, now, cell) = None for pid = 0, pid > i32::MAX, a refused or empty two-slot PROC_PIDLISTTHREADS, and, when the list is [0], a refused PROC_PIDTBSDINFO or (on an arm64 Mac) PROC_PIDARCHINFO; off macOS always None. A list other than [0] is Some(StartFacts::default()) with nothing more read. For [0]: stopped ⇔ pbi_status = SSTOP, traced ⇔ pbi_flags & PROC_FLAG_TRACED ≠ 0, translated ⇔ the host is arm64 ∧ p_cputype = CPU_TYPE_X86_64, age_ms = (now − pbi_start µs) div 1000 (None when the start is after now), local = local_at(proc_pidpath(pid), the cell's table, read into it at first need). local_at(path, t) = None when no mount of t holds path, None when t is cut (¬t.complete) and that mount is local, else Some(local ∧ ¬automounted ∧ fstype ≠ autofs); tail_allowed(path, t) needs local_at(path, t) = Some(true). No argument or environment is read. at_start(pid) = read_start(pid, now_us()).map(judge_start). JobsReader::read_all = read_all_at(now_us()), which sets start_facts to the same facts from the full thread list and the BSD record it reads (local from the executable path it already reads and its one mount cell), None for a zombie or a refused list, and None on the Linux arm; ProcFacts::program_check() = start_facts.map(judge_start).	src/jobs/tests.rs::a_start_suspended_child_reads_one_unstarted_thread_and_is_not_held, src/jobs/tests.rs::a_program_stopped_after_it_ran_keeps_its_thread_handles, src/jobs/tests.rs::a_member_reading_carries_its_program_check, src/jobs/tests.rs::an_arch_answer_gives_its_cpu_type, src/jobs/tests.rs::a_cut_mount_table_proves_no_volume_local	FFI proc_pidinfo into fixed buffers, OnceLock and OnceCell, composition with program-check-judge and volumes::mount_of	0,7,8
-procargs-parse	contract	procargs::{parse,ProcArgs2::whole,ProcArgs2::env}	∀ buf: parse(buf) = None iff |buf| < 4, argc = i32 ne(buf[..4]) < 0, or no NUL ends the exec path after it; else exec_path = the bytes up to that NUL, and after skipping every NUL that follows it (an empty argv[0] reads as padding, as ps reads it) argv = the first min(argc, k) NUL-terminated words, k the number the buffer holds. whole ⇔ |argv| = argc. env = the NUL-terminated strings after the words up to the first empty one, and none when not whole. Nothing is reserved past 1024 words for any argc. read(pid) answers the kernel's whole record from one read into a kern.argmax + 4 buffer (a buffer sized by a size query races an exec, measured 2026-10-20), and None for an answer that fills it: a record past kern.argmax is handed over as its tail, never its start.	src/procargs_tests.rs::a_whole_answer_gives_the_path_the_words_and_the_environment, src/procargs_tests.rs::the_padding_is_skipped_whatever_its_length, src/procargs_tests.rs::an_argc_of_zero_reads_no_words_and_the_environment, src/procargs_tests.rs::a_cut_buffer_answers_the_words_it_holds_and_no_environment, src/procargs_tests.rs::a_buffer_without_its_header_is_no_answer, src/procargs_tests.rs::this_process_reads_back_as_it_was_exec_d, src/procargs_tests.rs::a_record_past_what_the_kernel_hands_over_reads_as_nothing	&[u8] slicing with get, position scans, i32 from_ne_bytes, a bounded Vec, an iterator closure over a cursor. read is the sysctl FFI.	0,1,3,5,7
+procargs-parse	contract	procargs::{parse,read,read_into,ProcArgs2::whole,ProcArgs2::env}	∀ buf: parse(buf) = None iff |buf| < 4, argc = i32 ne(buf[..4]) < 0, or no NUL ends the exec path after it; else exec_path = the bytes up to that NUL, and after skipping every NUL that follows it (an empty argv[0] reads as padding, as ps reads it) argv = the first min(argc, k) NUL-terminated words, k the number the buffer holds. whole ⇔ |argv| = argc. env = the NUL-terminated strings after the words up to the first empty one, and none when not whole. Nothing is reserved past 1024 words for any argc. read(pid) and read_into(pid, buf) answer the kernel's whole record from one read (read into a kern.argmax + 4 buffer; a buffer sized by a size query races an exec, measured 2026-10-20), and None for an answer that fills the buffer: a record past the buffer is handed over as its tail, never its start.	src/procargs_tests.rs::a_whole_answer_gives_the_path_the_words_and_the_environment, src/procargs_tests.rs::the_padding_is_skipped_whatever_its_length, src/procargs_tests.rs::an_argc_of_zero_reads_no_words_and_the_environment, src/procargs_tests.rs::a_cut_buffer_answers_the_words_it_holds_and_no_environment, src/procargs_tests.rs::a_buffer_without_its_header_is_no_answer, src/procargs_tests.rs::this_process_reads_back_as_it_was_exec_d, src/procargs_tests.rs::a_record_past_what_the_kernel_hands_over_reads_as_nothing, src/procargs_tests.rs::a_reused_buffer_reads_a_record_whole_or_not_at_all	&[u8] slicing with get, position scans, i32 from_ne_bytes, a bounded Vec, an iterator closure over a cursor. read/read_into are the sysctl FFI.	0,1,3,5,7
 vnode-terminal	contract	jobs::terminal_path, jobs::darwin::{vnode,VnodeFd::char_device,VnodeFd::terminal,VnodeFd::controlling}, jobs::macos::vnode_kind, jobs::linux::parse_fd_link	terminal_path(p) ⇔ p starts with /dev/tty, /dev/pty, /dev/pts/ or /dev/cu., or p = /dev/ptmx or p = /dev/console. ∀ b with |b| ≥ VNODE_PATH_SIZE and v = vnode(b): v.terminal() ⇔ v.mode & S_IFMT = S_IFCHR ∧ terminal_path(v.path), v.path being the bytes at VNODE_PATH_AT up to the first NUL; vnode_kind's Device { tty, ctty } is (v.terminal(), v.controlling()), v.controlling() ⇔ v.mode & S_IFMT = S_IFCHR ∧ v.path = /dev/tty, and the Linux reader's ctty is its `fd/<n>` link = /dev/tty: a descriptor opened as the controlling terminal, never one inherited or duplicated from the terminal's own name. parse_fd_link(t) = Tty for every t that is no pipe, socket or anon inode and terminal_path(t); else Device for any other /dev/ path. So /dev/ttys003, /dev/tty, /dev/tty.usbserial-10, /dev/cu.usbserial-10, /dev/ptyp0, /dev/ptmx, /dev/pts/3 and /dev/console are terminals on both platforms; /dev/null, /dev/zero, /dev/consoles and /dev/ptmx0 are not, and no regular file is, whatever its path.	src/jobs/tests.rs::a_vnode_answer_gives_mode_size_identity_and_path, src/jobs/tests.rs::fd_links_and_fdinfo_parse	&[u8] starts_with, bit masks	0,1,3
 fresh-dylib	contract	jobs::fresh_dylib, jobs::darwin::vnode (mtime_s), jobs::macos::{vnode_kind,fds,read}	∀ path, mtime_s, start: fresh_dylib(path, mtime_s, start) ⇔ start = Some(s) ∧ mtime_s ≥ 0 ∧ path ends with ".dylib" ∧ mtime_s × 10⁶ + FRESH_DYLIB_US (3,600,000,000) ≥ s (saturating). vnode(b).mtime_s = i64 ne(b[VNODE_MTIME_AT = 64..]). A macOS member reading's FdKind::File.fresh_dylib = regular ∧ fresh_dylib(the descriptor's vip_path, its vst_mtime, the reading's start); the Linux arm's is false.	src/jobs/tests.rs::a_fresh_dylib_is_one_written_at_most_an_hour_before_its_holder_started; src/jobs/tests.rs::a_members_descriptors_name_a_fresh_dylib_it_holds_open	byte-slice suffix, saturating u64 arithmetic, an Option start	0,1,3
 unix-listener-decode	contract	jobs::darwin::unix_listeners	∀ t: unix_listeners(t) reads net.local.stream.pcblist_n's records from h = u32 ne(t[0..]) (its struct xunpgen head's length; the same 24-byte record ends the table) while more than h bytes remain (its tail), each a u32 length len and a u32 kind, the next at len rounded up to 8. None when t has no head, a record runs past the end or has len < 8, or an XSO_UNPCB (0x200) record's len ≠ XUNPCB_SIZE (588) or an XSO_SOCKET (1) record's ≠ XSOCKET_SIZE (104); a record of another kind is passed over. An XSO_UNPCB sets the bound path p to its bytes [XUNPCB_PATH_AT = 78 .. 78 + SUN_PATH_LEN (104)] up to the first NUL (all 104 with none), unset when that is empty; the next XSO_SOCKET takes p and, when u32 ne at XSOCKET_OPTIONS_AT (20) & SO_ACCEPTCONN (2) ≠ 0, yields {pid: u32 at XSOCKET_LAST_PID_AT (68), uid: u32 at XSOCKET_UID_AT (64), path: p}. So a stream a listener accepted, which carries its path, and an unbound listener yield no row, and a table with no stream is Some([]). The records' layout (xunpcb_n, xsocket_n) is macOS 27.0.1's private one, measured: no SDK header declares them (sys/unpcb.h declares only xunpgen), so its reader (aterm_uds::holders::scan_listener_holders) refuses a read that does not name a listener of its own.	src/jobs/tests.rs::the_unix_stream_table_names_each_bound_listener	&[u8] get, from_ne_bytes, checked offsets	0,1,3
@@ -196,30 +212,30 @@ socket-settled	contract	jobs::macos::settled	∀ flags, e, a: settled(flags, e, 
 socket-read-gate	other	jobs::macos::{fds,spawning,spawning_with,sockets_readable,read}, machine::owned_count, jobs::sockets_readable, JobsReader::read_all_at	Effects(libproc, sysctl). spawning(p, now) = true when p's PROC_PIDTBSDINFO is refused or its pbi_flags has PROC_FLAG_INEXIT; otherwise spawning_with(now, the MAX_CHILDREN (256) slots, n = proc_listchildpids(p), the errno it left, kinfo's start). spawning_with is true when the list is incomplete (machine::owned_count is None: n < 0, n ≥ the slots, or n = 0 with errno set) or a listed pid > 0 has a start that is unread (a child gone since the listing too), 0, or less than SETTLE_US before now (saturating, so a start after now counts); otherwise false. fds(p, …, now, s) reads PROC_PIDFDSOCKETINFO of none of p's descriptors unless s ∧ some socket lies within the detail budget (the first MAX_FD_DETAILS (128) vnode, pipe, socket and kqueue descriptors of the list, in order) ∧ ¬spawning(p, now), checked after the list and before any detail read; then it reads every socket within the budget before any other detail. Every other socket reads FdKind::Other. read(pid, fds = true, …, now, execd_then) passes s = settled(pbi_flags, execd_then(start, name), now − start) (socket-settled), false when the BSD record is unread. On macOS sockets_readable(pid) = settled(pbi_flags, true, now − start) at now_us() (a timed reader's gate: no spawning check, which cannot see a spawn that starts after it), false for pid 0, pid > i32::MAX or a refused BSD record; it is true on every other platform. Each is a snapshot: a process can start a spawn, exit or close a socket right after it.	src/jobs/tests.rs::a_programs_socket_reads_from_the_second_pass_that_finds_it_running, src/jobs/tests.rs::a_spawners_socket_reads_other_while_its_child_is_young, src/jobs/tests.rs::a_forks_socket_reads_once_it_kept_its_parents_program_long_enough, src/jobs/tests.rs::a_timed_readers_gate_passes_a_program_at_once_and_a_fork_once_it_is_settled, src/jobs/tests.rs::only_complete_child_observations_clear_the_spawn_guard	FFI proc_pidinfo, proc_listchildpids and proc_pidfdinfo into fixed buffers, sysctl(KERN_PROC_PID), composition with socket-settled	0,7,8
 ```
 
-### Kinds
+### Kinds (28)
 
 | kind | count | ids |
 |---|---|---|
-| contract | 8 | meminfo-facts, swap-pages-sum, auxv-lookup, read-bounded-cap, used-mib-of, available-mib-of, stat-pgrp, children-pids |
+| contract | 15 | meminfo-facts, swap-pages-sum, auxv-lookup, read-bounded-cap, used-mib-of, available-mib-of, stat-pgrp, children-pids, program-check-judge, procargs-parse, vnode-terminal, fresh-dylib, unix-listener-decode, net-unix-listening, socket-settled |
 | table-property | 1 | pressure-level-table |
 | invariant | 1 | whole-lines-torn-tail-ignored |
 | refinement | 1 | swap-meter-rate |
-| other (effectful host facts) | 6 | process-cwd-path-own, group-memory-members, machine-memory-within-physical, swapped-kib-counter, lone-group-leader, stdin-sharers |
+| other (effectful host facts) | 10 | process-cwd-path-own, group-memory-members, machine-memory-within-physical, swapped-kib-counter, lone-group-leader, stdin-sharers, group-usage-members, hid-idle-clock, program-check-read, socket-read-gate |
 
-Total: 8 + 1 + 1 + 1 + 6 = 17.
+Total: 15 + 1 + 1 + 1 + 10 = 28.
 
-### Gap histogram (number of the 17 specs each gap blocks)
+### Gap histogram (number of the 28 specs each gap blocks)
 
 | gap | specs blocked |
 |---|---|
-| 0 | 17 |
-| 1 | 12 |
+| 0 | 28 |
+| 1 | 20 |
 | 2 | 2 |
-| 3 | 10 |
+| 3 | 18 |
 | 4 | 3 |
-| 5 | 6 |
-| 7 | 10 |
-| 8 | 7 |
+| 5 | 7 |
+| 7 | 13 |
+| 8 | 11 |
 | 11 | 1 |
 | 13 | 7 |
 
@@ -250,6 +266,8 @@ src/tests.rs	a_stat_line_gives_its_group_past_any_command_name	stat-pgrp
 src/tests.rs	only_a_complete_group_census_admits_its_leader	lone-group-leader	
 src/tests.rs	a_children_text_names_only_the_pids_its_spaces_close	children-pids	
 src/tests.rs	a_leaders_input_is_shared_only_by_members_on_that_very_device	stdin-sharers	
+src/tests.rs	a_groups_usage_is_its_own_members_cpu_and_runnable_time	group-usage-members	
+src/tests.rs	the_input_idle_clock_reads_on_a_mac_and_nowhere_else	hid-idle-clock	
 src/jobs/tests.rs	the_program_check_judge_holds_only_an_old_lone_unstarted_thread	program-check-judge	
 src/jobs/tests.rs	a_start_suspended_child_reads_one_unstarted_thread_and_is_not_held	program-check-read	program-check-judge
 src/jobs/tests.rs	a_program_stopped_after_it_ran_keeps_its_thread_handles	program-check-read	
@@ -268,20 +286,31 @@ src/jobs/tests.rs	a_spawners_socket_reads_other_while_its_child_is_young	socket-
 src/jobs/tests.rs	a_forks_socket_reads_once_it_kept_its_parents_program_long_enough	socket-read-gate	socket-settled
 src/jobs/tests.rs	a_timed_readers_gate_passes_a_program_at_once_and_a_fork_once_it_is_settled	socket-read-gate	socket-settled
 src/jobs/tests.rs	only_complete_child_observations_clear_the_spawn_guard	socket-read-gate	
+src/procargs_tests.rs	a_whole_answer_gives_the_path_the_words_and_the_environment	procargs-parse	
+src/procargs_tests.rs	the_padding_is_skipped_whatever_its_length	procargs-parse	
+src/procargs_tests.rs	an_argc_of_zero_reads_no_words_and_the_environment	procargs-parse	
+src/procargs_tests.rs	a_cut_buffer_answers_the_words_it_holds_and_no_environment	procargs-parse	
+src/procargs_tests.rs	a_buffer_without_its_header_is_no_answer	procargs-parse	
+src/procargs_tests.rs	this_process_reads_back_as_it_was_exec_d	procargs-parse	
+src/procargs_tests.rs	a_record_past_what_the_kernel_hands_over_reads_as_nothing	procargs-parse	
+src/procargs_tests.rs	a_reused_buffer_reads_a_record_whole_or_not_at_all	procargs-parse	
 ```
 
 ## 3. Coverage
 
-- 16 tests read. All 16 map to one of the 17 specs.
+- 44 tests mapped across `src/tests.rs` (18), `src/jobs/tests.rs` (18) and `src/procargs_tests.rs` (8).
+  All 44 map to one of the 28 specs in §1.
 - One spec has no primary test of its own (`whole-lines-torn-tail-ignored`). It is sampled as a secondary
   part of `every_proc_read_is_bounded_to_4_kib`, whose primary spec is `read-bounded-cap`. That test is
   deleted only when both of its specs are proved.
-- Every spec has at most one primary test. The value of this crate's migration is the generalisation:
-  each test samples one or two inputs of a total function over all inputs.
-- Five tests (4 `macos` ones and the `macos`/`linux` one) read the live host, and
-  `every_proc_read_is_bounded_to_4_kib` reads `/dev/zero` and files of its own. Their specs are the six
-  `Effects(...)` rows. They retire only with a platform model (gap 8). Until then, the pure-core halves
-  can be proved and the host test can be cut down to the effectful part. The new lone-group test exercises
+- Additional unrecovered test suites live in `src/tests.rs`, `src/jobs/tests.rs`, `src/coalitions_tests.rs`,
+  `src/cpu_hardware.rs`, `src/cpu_hardware_macos.rs`, `src/cpu_policy.rs`, `src/identity_tests.rs`,
+  `src/iflist.rs`, `src/kproc_tests.rs`, `src/linux_tests.rs`, `src/macos.rs`, `src/paths_tests.rs`,
+  `src/peb.rs`, `src/power.rs`, `src/procs.rs`, `src/slots_tests.rs`, `src/timeline_tests.rs`,
+  `src/volumes_tests.rs`, `src/windows_tests.rs` and `tests/{iflist,iokit,proc_info}_sdk.rs`.
+- Ten specs in §1 are `Effects(...)` rows (plus `read-bounded-cap` and the live `read`/`read_into` part of
+  `procargs-parse`); they retire only with a platform model (gap 8). Until then, the pure-core halves
+  can be proved and the host test can be cut down to the effectful part. The lone-group test exercises
   its production pure census adapter, not libproc. The unsafe child-process fixture was removed because
   its cleanup did not run on assertion failure and could signal a recycled group id. The stdin-sharers test
   starts its `sleep`s through `spawnfd::command` and holds each in a guard that kills and reaps it by its
@@ -296,27 +325,24 @@ and the latency ceiling `a_reading_and_a_sweep_cost_milliseconds_not_more`) were
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **Unchecked arithmetic next to saturating neighbours.** This blocks an unconditional no-panic spec.
-   It needs a `requires` clause or a switch to saturating ops; the switch is the general fix.
-   `used_mib_of` (lib.rs): `internal.saturating_sub(purgeable) + wired + compressor` uses plain `+`,
-   while every neighbour saturates.
-2. **`used_mib_of` is not capped at physical memory**, unlike `available_mib_of`. So the claim of
-   `the_machines_memory_and_pressure_are_read_on_this_host` that used ≤ physical is only empirical on
-   macOS (`machine-memory-within-physical`).
-3. **`linux::auxv_value` disagrees with its doc.** The doc says the vector is "ended by AT_NULL", but the
-   code scans every full pair, past AT_NULL too. A search for key 0 returns AT_NULL's value, and bytes
-   after the terminator can match. `auxv-lookup` states the code's behaviour; either the doc or the code
-   should change.
-4. **Constant pinning.** `every_proc_read_is_bounded_to_4_kib` also asserts `READ_CAP == PATH_CAP == 4096`.
-   No spec stands behind those equalities. The bound worth keeping is |read_bounded_bytes| ≤ READ_CAP
-   (`read-bounded-cap`). Drop the equality asserts when the spec lands. The same test builds its files
-   under `std::env::temp_dir()` by pid instead of `aterm_tempfile`, and leaves them behind on panic.
-5. **A bare `Command::new` and a host heuristic.** `a_groups_memory_is_its_own_members_footprint` spawns
-   `/bin/sleep` with a bare `std::process::Command::new` (allowed by the crate-level test allow on
-   `disallowed_types`). AGENTS.md requires `aterm_uds::spawnfd::command`. Its +384 MiB-after-512 MiB
-   margin is a host-load heuristic, not a spec bound.
-6. **Host heuristic.** In `the_swap_counter_reads_on_this_host_and_never_runs_backwards`, the bound
-   "< 1 GiB swapped between two reads" is a heuristic. Only the monotone part is a spec.
+1. **Resolved — `used_mib_of` saturates every addition.** `used_mib_of` (lib.rs) uses
+   `internal.saturating_sub(purgeable).saturating_add(wired).saturating_add(compressor)`, pinned at
+   `u64::MAX` by `memory_in_use_is_counted_from_the_vm_pages`.
+2. **Resolved — `macos::machine_memory` caps `used_mib` at physical memory.** `used_mib_of` remains the
+   uncapped page-class sum (`used-mib-of`), and `macos::machine_memory` passes its result through
+   `clamp_physical_mib(u64::from(used_mib), physical)` alongside `available_mib_of`, so
+   `machine-memory-within-physical` (`used_mib ≤ physical` when `physical` is known) holds by construction on
+   macOS as well as Linux.
+3. **Resolved — `linux::auxv_value` stops at `AT_NULL` (`0`).** `auxv_value` terminates at the first
+   `k == 0` pair, so `auxv_value(bytes, 0)` is `None` and pairs past `AT_NULL` are unread.
+4. **Resolved — scratch directory uses `aterm_tempfile::TempDir`.** `every_proc_read_is_bounded_to_4_kib`
+   now holds an `aterm_tempfile::TempDir` so its scratch files are cleaned up on panic too.
+5. **Resolved — child spawns use `aterm_uds::spawnfd::command`.** `a_groups_memory_is_its_own_members_footprint`
+   and `a_groups_usage_is_its_own_members_cpu_and_runnable_time` build their children through
+   `aterm_uds::spawnfd::command`. The +384 MiB-after-512 MiB margin remains a host-load heuristic, not a
+   spec bound.
+6. **Resolved — swap counter test checks monotonicity only.** `the_swap_counter_reads_on_this_host_and_never_runs_backwards`
+   now asserts only `second >= first`, dropping the `< 1 GiB` host-load heuristic.
 
 ## 6. Proof order (easiest high-value first)
 

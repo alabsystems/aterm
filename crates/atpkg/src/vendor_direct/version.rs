@@ -247,13 +247,26 @@ impl BuildDate {
             }
             s.parse().ok()
         };
+        const fn days_in_month(year: u32, month: u32) -> u32 {
+            match month {
+                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                4 | 6 | 9 | 11 => 30,
+                2 if (year.is_multiple_of(4) && !year.is_multiple_of(100))
+                    || year.is_multiple_of(400) =>
+                {
+                    29
+                }
+                2 => 28,
+                _ => 0,
+            }
+        }
         let (year, month, day) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
         let (hour, minute, second) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
         if !(1..=12).contains(&month)
-            || !(1..=31).contains(&day)
+            || !(1..=days_in_month(year, month)).contains(&day)
             || hour > 23
             || minute > 59
-            || second > 60
+            || second > 59
         {
             return None;
         }
@@ -617,6 +630,8 @@ mod tests {
             "2026-09-21T20:55:27Z",
             "2026-09-21T20:55:27.5Z",
             "2026-09-21T20:55:27.123456789Z",
+            "2024-02-29T23:59:59Z",
+            "2000-02-29T00:00:00Z",
         ] {
             assert_eq!(BuildDate::parse(t).unwrap().to_string(), t);
         }
@@ -627,8 +642,13 @@ mod tests {
             "2026-09-21T20:55:27+00:00",
             "2026-13-21T20:55:27Z",
             "2026-09-00T20:55:27Z",
+            "2026-02-29T00:00:00Z",
+            "1900-02-29T00:00:00Z",
+            "2026-02-31T00:00:00Z",
+            "2026-04-31T00:00:00Z",
             "2026-09-21T24:00:00Z",
             "2026-09-21T20:60:00Z",
+            "2026-09-21T20:55:60Z",
             "2026-09-21 20:55:27Z",
             "2026-09-21T20:55:27.Z",
             "2026-09-21T20:55:27.1234567890Z",

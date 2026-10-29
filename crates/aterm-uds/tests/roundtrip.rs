@@ -21,7 +21,7 @@ fn test_dir(tag: &str) -> PathBuf {
 }
 
 #[test]
-fn roundtrip_auth_handshake_over_a_bound_socket() {
+fn bound_socket_accepts_and_streams_lines() {
     let dir = test_dir("roundtrip");
     let path = dir.join("aterm-1.sock");
     let token = "a".repeat(64);

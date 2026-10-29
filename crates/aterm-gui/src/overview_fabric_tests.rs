@@ -384,6 +384,21 @@ fn the_group_composes_each_need_in_the_clauses_words() {
 }
 
 #[test]
+fn a_future_fabric_read_keeps_its_needs_without_claiming_their_age_or_count() {
+    let snap = parse(CAPTURED, READ_AT).expect("the brief's object");
+    let chips = compose(&snap, READ_AT - 1);
+    assert_eq!(chips.len(), 3, "the historical needs remain visible");
+    assert!(
+        chips.iter().all(|c| c.older && c.age_s.is_none()),
+        "{chips:?}"
+    );
+    let mut card = OverviewState::new(WindowId(0), Vec::new(), Vec::new());
+    assert!(card.set_fabric(group(chips)));
+    assert!(!card.title().contains("need you"), "{}", card.title());
+    assert!(compose(&snap, READ_AT).iter().all(|c| !c.older));
+}
+
+#[test]
 fn the_card_lists_the_group_counts_the_fresh_and_acts_on_none() {
     let snap = parse(&captured_with_old_gone(), READ_AT).expect("the brief's object");
     let chips = compose(&snap, READ_AT + 30_000);

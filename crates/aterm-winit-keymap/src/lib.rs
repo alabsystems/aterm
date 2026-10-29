@@ -130,7 +130,8 @@ pub fn sided_modifier(key: Key, location: KeyLocation) -> Key {
     Key::Named(right)
 }
 
-/// The physical key on the OTHER side of a sided modifier, or `None` for any other key.
+/// The physical key on the OTHER side of a sided modifier (`Shift`, `Control`, `Alt`, or `Super`),
+/// or `None` for any other key (winit's [`KeyCode`] has no sided `Meta` or `Hyper` variants).
 #[inline]
 #[must_use]
 pub const fn physical_modifier_twin(physical: PhysicalKey) -> Option<PhysicalKey> {
@@ -151,6 +152,12 @@ pub const fn physical_modifier_twin(physical: PhysicalKey) -> Option<PhysicalKey
 }
 
 /// Map a keypad press (`KeyLocation::Numpad`) to the engine's `Numpad*` [`Key`].
+///
+/// Single-character keypad glyphs (`0`–`9`, `.`, `,`, `/`, `*`, `-`, `+`, `=`) and keypad
+/// navigation/editing keys map to their `NamedKey::Numpad*` counterparts; any other `Character`
+/// returns `None`. When `physical` is [`KeyCode::Numpad5`] and `logical` is `Unidentified`,
+/// `Dead`, or an unmapped `Named` key (`map_logical_key(logical).is_none()`), this rescues the
+/// NumLock-off centre key as [`NamedKey::NumpadBegin`].
 #[must_use]
 pub fn map_numpad_key(
     physical: PhysicalKey,
@@ -283,205 +290,39 @@ pub fn layout_letter_twin_for(logical: &WinitKey, physical: PhysicalKey) -> Opti
     aterm_types::keyboard::layout_letter_twin(c, base_layout_key_for(physical))
 }
 
-/// Return the shifted US-QWERTY ASCII character for an unshifted US-QWERTY character.
-#[inline]
-#[must_use]
-pub const fn us_qwerty_shifted_ascii(base: char) -> Option<char> {
-    if base >= 'a' && base <= 'z' {
-        return Some((base as u8 - 32) as char);
-    }
-    Some(match base {
-        '0' => ')',
-        '1' => '!',
-        '2' => '@',
-        '3' => '#',
-        '4' => '$',
-        '5' => '%',
-        '6' => '^',
-        '7' => '&',
-        '8' => '*',
-        '9' => '(',
-        '`' => '~',
-        '-' => '_',
-        '=' => '+',
-        '[' => '{',
-        ']' => '}',
-        '\\' => '|',
-        ';' => ':',
-        '\'' => '"',
-        ',' => '<',
-        '.' => '>',
-        '/' => '?',
-        _ => return None,
-    })
-}
-
-#[inline]
-const fn is_unicode_scalar(v: u32) -> bool {
-    v <= 0xD7FF || (v >= 0xE000 && v <= 0x10_FFFF)
-}
-
-/// Encodes a Kitty key event descriptor into a 14-byte little-endian wire frame.
-#[inline]
-#[must_use]
-pub const fn encode_kitty_key_wire_le(
-    unicode_key: u32,
-    shifted_key: u32,
-    base_layout_key: u32,
-    modifiers_mask: u8,
-    event_type: u8,
-) -> Option<[u8; 14]> {
-    if !is_unicode_scalar(unicode_key)
-        || !is_unicode_scalar(shifted_key)
-        || !is_unicode_scalar(base_layout_key)
-        || event_type == 0
-        || event_type > 3
-    {
-        return None;
-    }
-    Some([
-        unicode_key as u8,
-        (unicode_key >> 8) as u8,
-        (unicode_key >> 16) as u8,
-        (unicode_key >> 24) as u8,
-        shifted_key as u8,
-        (shifted_key >> 8) as u8,
-        (shifted_key >> 16) as u8,
-        (shifted_key >> 24) as u8,
-        base_layout_key as u8,
-        (base_layout_key >> 8) as u8,
-        (base_layout_key >> 16) as u8,
-        (base_layout_key >> 24) as u8,
-        modifiers_mask,
-        event_type,
-    ])
-}
-
-/// Decodes a 14-byte little-endian Kitty key event wire frame.
-#[inline]
-#[must_use]
-pub const fn decode_kitty_key_wire_le(wire: &[u8; 14]) -> Option<(char, char, char, u8, u8)> {
-    let u_raw = (wire[0] as u32)
-        | ((wire[1] as u32) << 8)
-        | ((wire[2] as u32) << 16)
-        | ((wire[3] as u32) << 24);
-    let s_raw = (wire[4] as u32)
-        | ((wire[5] as u32) << 8)
-        | ((wire[6] as u32) << 16)
-        | ((wire[7] as u32) << 24);
-    let b_raw = (wire[8] as u32)
-        | ((wire[9] as u32) << 8)
-        | ((wire[10] as u32) << 16)
-        | ((wire[11] as u32) << 24);
-    let modifiers_mask = wire[12];
-    let event_type = wire[13];
-    if event_type == 0 || event_type > 3 {
-        return None;
-    }
-    let Some(u) = char::from_u32(u_raw) else {
-        return None;
-    };
-    let Some(s) = char::from_u32(s_raw) else {
-        return None;
-    };
-    let Some(b) = char::from_u32(b_raw) else {
-        return None;
-    };
-    Some((u, s, b, modifiers_mask, event_type))
-}
-
-/// Encodes a Kitty key event descriptor into a 14-byte big-endian wire frame.
-#[inline]
-#[must_use]
-pub const fn encode_kitty_key_wire_be(
-    unicode_key: u32,
-    shifted_key: u32,
-    base_layout_key: u32,
-    modifiers_mask: u8,
-    event_type: u8,
-) -> Option<[u8; 14]> {
-    if !is_unicode_scalar(unicode_key)
-        || !is_unicode_scalar(shifted_key)
-        || !is_unicode_scalar(base_layout_key)
-        || event_type == 0
-        || event_type > 3
-    {
-        return None;
-    }
-    Some([
-        (unicode_key >> 24) as u8,
-        (unicode_key >> 16) as u8,
-        (unicode_key >> 8) as u8,
-        unicode_key as u8,
-        (shifted_key >> 24) as u8,
-        (shifted_key >> 16) as u8,
-        (shifted_key >> 8) as u8,
-        shifted_key as u8,
-        (base_layout_key >> 24) as u8,
-        (base_layout_key >> 16) as u8,
-        (base_layout_key >> 8) as u8,
-        base_layout_key as u8,
-        modifiers_mask,
-        event_type,
-    ])
-}
-
-/// Decode a 14-byte big-endian Kitty key event wire frame produced by [`encode_kitty_key_wire_be`].
-#[inline]
-#[must_use]
-pub const fn decode_kitty_key_wire_be(wire: &[u8; 14]) -> Option<(char, char, char, u8, u8)> {
-    let u_raw = ((wire[0] as u32) << 24)
-        | ((wire[1] as u32) << 16)
-        | ((wire[2] as u32) << 8)
-        | (wire[3] as u32);
-    let s_raw = ((wire[4] as u32) << 24)
-        | ((wire[5] as u32) << 16)
-        | ((wire[6] as u32) << 8)
-        | (wire[7] as u32);
-    let b_raw = ((wire[8] as u32) << 24)
-        | ((wire[9] as u32) << 16)
-        | ((wire[10] as u32) << 8)
-        | (wire[11] as u32);
-    let modifiers_mask = wire[12];
-    let event_type = wire[13];
-    if event_type == 0 || event_type > 3 {
-        return None;
-    }
-    let Some(u) = char::from_u32(u_raw) else {
-        return None;
-    };
-    let Some(s) = char::from_u32(s_raw) else {
-        return None;
-    };
-    let Some(b) = char::from_u32(b_raw) else {
-        return None;
-    };
-    Some((u, s, b, modifiers_mask, event_type))
-}
-
-/// Convert a 6-bit Kitty modifier mask into its 1-based CSI parameter (`1 +`).
-#[inline]
-#[must_use]
-pub const fn kitty_csi_modifier_param(modifiers_mask: u8) -> u8 {
-    1 + (modifiers_mask & 0x3f)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use aterm_window::keyboard::SmolStr;
 
     #[test]
-    fn maps_function_keys_past_f12_and_media_keys() {
+    fn named_key_table_maps_every_category_and_rejects_unmapped() {
         for (winit, want) in [
+            (WinitNamed::ArrowUp, NamedKey::ArrowUp),
+            (WinitNamed::PageDown, NamedKey::PageDown),
+            (WinitNamed::Backspace, NamedKey::Backspace),
+            (WinitNamed::Escape, NamedKey::Escape),
+            (WinitNamed::Space, NamedKey::Space),
+            (WinitNamed::CapsLock, NamedKey::CapsLock),
+            (WinitNamed::ContextMenu, NamedKey::ContextMenu),
+            (WinitNamed::F1, NamedKey::F1),
+            (WinitNamed::F12, NamedKey::F12),
             (WinitNamed::F13, NamedKey::F13),
             (WinitNamed::F24, NamedKey::F24),
             (WinitNamed::F35, NamedKey::F35),
             (WinitNamed::MediaPlayPause, NamedKey::MediaPlayPause),
             (WinitNamed::AudioVolumeMute, NamedKey::AudioVolumeMute),
+            (WinitNamed::Shift, NamedKey::ShiftLeft),
+            (WinitNamed::Control, NamedKey::ControlLeft),
+            (WinitNamed::Alt, NamedKey::AltLeft),
+            (WinitNamed::Super, NamedKey::SuperLeft),
+            (WinitNamed::Hyper, NamedKey::HyperLeft),
+            (WinitNamed::Meta, NamedKey::MetaLeft),
         ] {
             assert_eq!(map_named_key(winit), Some(want), "{winit:?}");
         }
+        assert_eq!(map_named_key(WinitNamed::Fn), None);
+        assert_eq!(map_named_key(WinitNamed::Copy), None);
     }
 
     fn ch(c: &str) -> WinitKey {
@@ -675,6 +516,8 @@ mod tests {
         assert_eq!(layout_letter_twin_for(&ch("é"), key(KeyCode::Digit2)), None);
         assert_eq!(layout_letter_twin_for(&ch("б"), key(KeyCode::Comma)), None);
         assert_eq!(layout_letter_twin_for(&ch("№"), key(KeyCode::Digit3)), None);
+        assert_eq!(layout_letter_twin_for(&ch("сб"), key(KeyCode::KeyC)), None);
+        assert_eq!(layout_letter_twin_for(&ch(""), key(KeyCode::KeyC)), None);
         assert_eq!(
             layout_letter_twin_for(&WinitKey::Named(WinitNamed::Enter), key(KeyCode::Enter)),
             None
@@ -731,22 +574,5 @@ mod tests {
         for other in [KeyCode::KeyA, KeyCode::CapsLock, KeyCode::Meta, KeyCode::Fn] {
             assert_eq!(physical_modifier_twin(PhysicalKey::Code(other)), None);
         }
-    }
-
-    #[test]
-    fn us_qwerty_shifted_and_kitty_wire_round_trip() {
-        assert_eq!(us_qwerty_shifted_ascii('a'), Some('A'));
-        assert_eq!(us_qwerty_shifted_ascii('1'), Some('!'));
-        assert_eq!(us_qwerty_shifted_ascii('/'), Some('?'));
-        assert_eq!(us_qwerty_shifted_ascii('A'), None);
-
-        let wire = encode_kitty_key_wire_le('a' as u32, 'A' as u32, 'a' as u32, 0b0010, 1)
-            .expect("valid kitty wire");
-        assert_eq!(
-            decode_kitty_key_wire_le(&wire),
-            Some(('a', 'A', 'a', 0b0010, 1))
-        );
-        assert!(encode_kitty_key_wire_le(0x11_0000, 0, 0, 0, 1).is_none());
-        assert!(encode_kitty_key_wire_le('a' as u32, 0, 0, 0, 0).is_none());
     }
 }

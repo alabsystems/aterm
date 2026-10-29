@@ -944,9 +944,9 @@ mod tests {
         s.kind = "app-bundle".into();
         s.payload = "dmg".into();
         s.entry = String::new();
-        s.links.insert("git".into(), "Emacs.app/git".into());
+        s.links.insert("ssh".into(), "Emacs.app/ssh".into());
         assert!(
-            refused(&s, &["git".to_string()]).contains("links key is not an admissible tool name")
+            refused(&s, &["ssh".to_string()]).contains("links key is not an admissible tool name")
         );
     }
 

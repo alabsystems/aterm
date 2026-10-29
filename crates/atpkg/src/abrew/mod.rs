@@ -51,6 +51,15 @@ pub(crate) fn valid_name(name: &str) -> bool {
     matches!(parts.len(), 1 | 3) && parts.into_iter().all(valid_component)
 }
 
+/// One non-empty path segment with no separator, NUL, `.` or `..`.
+pub(crate) fn single_normal_segment(s: &str) -> bool {
+    let mut parts = std::path::Path::new(s).components();
+    !s.is_empty()
+        && !s.contains(['/', '\\', '\0'])
+        && matches!(parts.next(), Some(std::path::Component::Normal(_)))
+        && parts.next().is_none()
+}
+
 /// `abrew` / `atpkg-abrew` argv0 and the dev binary.
 pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     let Ok(argv) = args
@@ -1283,21 +1292,19 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
             plan = match entry {
                 bundle::BrewfileEntry::Tap(_) => Ok(()),
                 bundle::BrewfileEntry::Brew(n) => {
-                    if prefix
-                        .installed_one(prefix::Kind::Formula, Formula::short_name(n))
-                        .is_some()
-                    {
+                    if bundle::entry_installed(prefix, entry) {
                         Ok(())
                     } else {
                         install::preflight_plan(&api0, prefix, n, &opts)
                     }
                 }
                 bundle::BrewfileEntry::Cask(n) => {
-                    if prefix
-                        .installed_one(prefix::Kind::Cask, api::canonical_cask_token(n))
-                        .is_some()
-                    {
+                    if bundle::entry_installed(prefix, entry) {
                         Ok(())
+                    } else if n.contains('/') && !n.starts_with("homebrew/cask/") {
+                        Err(InstallError::Unsupported(format!(
+                            "qualified cask {n} needs its tap recipe"
+                        )))
                     } else {
                         match api0.cask(n) {
                             Ok(c) => cask::preflight(prefix, &c, machine::Machine::this())
@@ -1858,11 +1865,6 @@ mod admission_tests {
         assert_eq!(brew_help_text("instal"), install);
         // Unknown topics fall back to the top-level message.
         assert_eq!(brew_help_text("frobnicate"), help_texts::TOP);
-        // Every builtin/developer command brew documents resolves
-        // to its own text or, like brew, the top-level message.
-        for name in command_names(false) {
-            let _ = brew_help_text(name);
-        }
     }
 
     #[test]

@@ -119,6 +119,7 @@ pub(crate) struct Read {
     pages: u64,
     pub(crate) opaque: u64,
     pub(crate) sessions: BTreeMap<(String, String), Session>,
+    /// The nodes whose own row is their will ([`crate::glance::is_will`]).
     nodes_gone: Vec<String>,
     /// Each live node's incarnation, from its own presence row.
     node_inc: BTreeMap<String, u64>,
@@ -166,7 +167,9 @@ impl Read {
     /// One roster row, as the last-value walk delivers it.
     pub(crate) fn presence(&mut self, node: &str, sid: &str, body: &[u8]) -> io::Result<()> {
         if sid == "node" {
-            let gone = state_of(body).as_deref() == Some("gone");
+            let gone = state_of(body)
+                .as_deref()
+                .is_some_and(crate::glance::is_will);
             let inc = inc_of(body);
             if gone || inc.is_some() {
                 let known =
@@ -262,7 +265,7 @@ fn inc_of(body: &[u8]) -> Option<u64> {
 
 fn read(cfg: &Config, opts: &BriefOpts) -> io::Result<Read> {
     let broker = safe(&cfg.broker, 256);
-    let (mut conn, _closer) = transport::connect(&cfg.broker, crate::fabric::IO_TIMEOUT)
+    let (mut conn, _closer) = transport::connect(&cfg.broker, crate::fabric::io_timeout())
         .map_err(|e| io::Error::new(e.kind(), format!("the broker at {broker}: {e}")))?;
     let caps = if opts.cap_files.is_empty() {
         &cfg.cap_files
@@ -335,8 +338,9 @@ fn gone_without_close(r: &Read, node: &str, s: &Session) -> Option<Gone> {
 }
 
 /// The half of [`gone_without_close`] that no later row of the session undoes
-/// on its own: the node's own row says it is gone, or the session's presence
-/// says it exited. A relaunch is left out: a bridge's attach writes its node's
+/// on its own: the node's own row is its will (`state=away`, or the legacy
+/// `gone`, [`crate::glance::is_will`]), or the session's presence says it
+/// exited. A relaunch is left out: a bridge's attach writes its node's
 /// row under the new incarnation before it republishes its sessions' rows, so
 /// for that moment every session it carries reads as gone (a brief judges one
 /// read; a follower that judged it would clear and page again every standing
@@ -345,18 +349,25 @@ pub(crate) fn gone_settled(r: &Read, node: &str, s: &Session) -> Option<Gone> {
     if r.nodes_gone.iter().any(|n| n == node) {
         return Some(Gone::NodeGone);
     }
-    (s.presence.as_deref() == Some("exited")).then_some(Gone::NoClose)
+    exited(s).then_some(Gone::NoClose)
 }
 
-/// Whether the node's own row says it is gone ([`gone_settled`]).
+/// Whether the session's own presence says it exited ([`gone_settled`]'s `no-close`).
+pub(crate) fn exited(s: &Session) -> bool {
+    s.presence.as_deref() == Some("exited")
+}
+
+/// Whether the node's own row is its will ([`gone_settled`]).
 pub(crate) fn node_gone(r: &Read, node: &str) -> bool {
     r.nodes_gone.iter().any(|n| n == node)
 }
 
 /// A session's newest seq space folded as the brief shows it: its epoch, the
 /// space, the fold and where the fold started ([`BusSpace::fold_seeded`]). The
-/// brief's lines and `--json` objects read it, and so does `aterm link notify
-/// --on need` (its need is [`aterm_slog::SessionState::top_observed_need`]).
+/// brief's lines and `--json` objects read it (the JSON `need` is
+/// [`aterm_slog::SessionState::top_observed_need`]), and so does `aterm link
+/// notify --on need`, which judges every observed need the fold names, not only
+/// the top one (`crate::notify_need`'s `named`).
 pub(crate) fn newest_fold(
     s: &Session,
 ) -> Option<(u32, &BusSpace, aterm_slog::Fold, aterm_slog::bus::Seed)> {

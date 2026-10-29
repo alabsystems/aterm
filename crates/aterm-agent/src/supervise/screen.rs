@@ -39,6 +39,11 @@ pub struct Screen {
     pub inputs_before: Option<u64>,
     /// Session input write count recorded after reading `rows`.
     pub inputs_after: Option<u64>,
+    /// The program's OSC 0/2 title (`"title"`), read in the hold that read `rows`: `Some("")` when the
+    /// program set none, `None` from a host (or a recorded tape) whose reply has no such string, so
+    /// neither says anything about the program. It is the last title set in the tab, which outlives
+    /// the program that set it, so it speaks only beside rows that program draws.
+    pub title: Option<String>,
 }
 
 /// Person-initiated launch witness metadata from `text --json`.
@@ -195,6 +200,7 @@ pub fn parse_text_json(body: &str) -> Result<Screen, String> {
         frame_open: v.get("frame").and_then(Json::as_str) == Some("open"),
         inputs_before: inputs.and_then(|i| i[0].as_u64()),
         inputs_after: inputs.and_then(|i| i[1].as_u64()),
+        title: v.get("title").and_then(Json::as_str).map(str::to_string),
     })
 }
 
@@ -615,6 +621,47 @@ mod tests {
         ] {
             assert_eq!(with(bad), None, "{bad:?}");
         }
+    }
+
+    /// `"title"`: a string is the program's title as sent, `""` included; NEGATIVE CONTROLS: an
+    /// older host's (or a tape's) reply without the key, and a key whose value is no string, say
+    /// nothing, and neither moves another field.
+    #[test]
+    fn the_title_is_read_and_its_absence_says_nothing() {
+        let with = |tail: &str| {
+            parse_text_json(&format!(
+                r#"OK 1
+{{"rows":["⏺ streaming"],"cursor":{{"row":0,"col":2}},"dims":{{"rows":2,"cols":2}},"seq":15,"gen":"2.15"{tail},"human_ms":null,"human_seq":3,"launch":null}}"#
+            ))
+            .expect("parses")
+        };
+        let sent = with(r#","title":"◐ Claude Code""#);
+        assert_eq!(sent.title.as_deref(), Some("◐ Claude Code"));
+        assert_eq!(
+            with(r#","title":"say \"hi\" \\ ✳""#).title.as_deref(),
+            Some(r#"say "hi" \ ✳"#),
+            "escapes decode"
+        );
+        assert_eq!(
+            with(r#","title":"""#).title.as_deref(),
+            Some(""),
+            "a host that sends the key with no title set"
+        );
+        let absent = with("");
+        assert_eq!(absent.title, None, "an older host sends no title");
+        for bad in [r#","title":null"#, r#","title":7"#, r#","title":["◐"]"#] {
+            let malformed = with(bad);
+            assert_eq!(malformed.title, None, "{bad:?}");
+            assert_eq!(malformed, absent, "{bad:?}: nothing else moves");
+        }
+        assert_eq!(
+            Screen {
+                title: None,
+                ..sent
+            },
+            absent,
+            "the title is the only field it adds"
+        );
     }
 
     /// `"human_ms"`: a number is its age, `null` is never, and absent or any other value is

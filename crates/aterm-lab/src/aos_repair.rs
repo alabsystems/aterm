@@ -1722,7 +1722,10 @@ fn fresh_phase(d: &mut Drive<'_>, f: &Fresh) -> Result<Vec<Gate>, Halt> {
         s.settling && s.query_at.is_some_and(|q| q > after_keys)
     })?;
     let moved = move_caret(d, last_key, &settling)?;
-    // From the move's present on, every present has no key and no move behind it.
+    // The first present booked after the move (the last reading when none came): the move's own
+    // when the lag line's present_carries_move holds, after which no present has a key or the move
+    // behind it; when it does not, it may be a tick composed before the echo, and the move's present
+    // then among those counted after it.
     let frames_settling = moved.frames_after;
     let cold = d.wait_for("the glow cools by itself", |s| !s.hot)?;
     let frames_cold = d.frames()?;
@@ -1812,11 +1815,13 @@ pub struct Moved {
     /// `frames` just before the move, and the first reading past it (the last reading when none was).
     pub frames_before: u64,
     pub frames_after: u64,
-    /// The first present after the move as `(lo, hi)` ns after the move's send (later than `lo`, no later than `hi`); `None` when none came within [`MOVE_WATCH`].
+    /// The first present booked past `frames_before` as `(lo, hi)` ns after the move's send (no later than `hi`, and later than `lo` when it showed the move); `None` when none came within [`MOVE_WATCH`]. It showed the moved caret when [`aos_phase::first_present_carries`] says so of [`Moved::barrier_lo`]; when it does not, it may be a glow tick composed before the echo reached the grid.
     pub present: Option<(u64, u64)>,
     /// The move's offset from the attach epoch: no earlier than `at_lo` (its send) and no later than `at_hi` (its reply).
     pub at_lo: i128,
     pub at_hi: i128,
+    /// No later than when the drive asked for `before` (ns from the attach epoch): every present booked past `frames_before` was composed at a glow tick from here on.
+    pub barrier_lo: i128,
     /// The move's send after the phase's last key's, on the drive's clock ([`MOVE_AFTER_LAST_KEY`] unless the settling reading came later).
     pub after_last_key: Duration,
     /// The glow's cold instant the settling reading named (ns from the attach epoch).
@@ -1848,8 +1853,11 @@ fn move_caret(d: &mut Drive<'_>, last_key: Instant, settling: &Status) -> Result
         opt(settling.cold_at)
     ));
     stop::sleep(wait)?;
-    let before = d.status()?;
     let cursor_before = parse_cursor(&d.ask("cursor")?);
+    // The main loop answers `aos status` between passes, so every present composed before its reply
+    // is booked in `frames_before`, read after it.
+    let barrier_asked = Instant::now();
+    let before = d.status()?;
     let frames_before = d.frames()?;
     let sent = Instant::now();
     let after_last_key = sent.saturating_duration_since(last_key);
@@ -1908,6 +1916,7 @@ fn move_caret(d: &mut Drive<'_>, last_key: Instant, settling: &Status) -> Result
         present,
         at_lo: d.offset_lower(sent),
         at_hi: d.offset_upper(answered),
+        barrier_lo: d.offset_lower(barrier_asked),
         after_last_key,
         cold_at: settling.cold_at,
         polls,
@@ -1948,7 +1957,8 @@ fn measure_phase(d: &mut Drive<'_>, f: &Fresh, file: &[u8], m: &Moved, presents:
     d.measure(format!(
         "lag settling_read_before_move={} deadline_read_before_move={} cold_at={} \
          move_at_ms={}..{} move_after_last_key_ms={} planned_ms={} move_before_cold_at_ms={} \
-         cursor={}->{} present_after_move_ms={} metrics_reads={} tick_before_move={} \
+         cursor={}->{} present_after_move_ms={} present_carries_move={} metrics_reads={} \
+         tick_before_move={} \
          next_tick_after_move_ms={} next_tick_cell={} carries_new_cell={} \
          next_tick_inside_move_bracket={} first_new_cell_tick_after_move_ms={} guard={}->{}",
         m.before.settling,
@@ -1968,6 +1978,12 @@ fn measure_phase(d: &mut Drive<'_>, f: &Fresh, file: &[u8], m: &Moved, presents:
             || "none".to_string(),
             |(lo, hi)| format!("{}..{}", ms(i128::from(lo)), ms(i128::from(hi)))
         ),
+        m.present.is_some()
+            && aos_phase::first_present_carries(
+                &replayed.steps,
+                m.barrier_lo,
+                m.cursor_after.unwrap_or((u16::MAX, u16::MAX)),
+            ),
         m.polls,
         ticks.before.map_or_else(
             || "none".to_string(),

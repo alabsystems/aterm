@@ -21,6 +21,7 @@ pub const MAGIC_SALT: u64 = 0x5EED_CA71_5EED_CA71;
 
 /// splitmix64 finalizer — decorrelates adjacent seeds and never returns 0.
 #[inline]
+#[must_use]
 pub const fn mix(seed: u64) -> u64 {
     let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -166,6 +167,9 @@ fn vote_token(
 /// token votes, `None` when silent.
 #[inline]
 fn token_vote_hash(tok_chars: &[char], tok: &mut String, folded: &mut String) -> Option<u64> {
+    if tok_chars.is_empty() || (tok_chars.len() == 1 && tok_chars[0].is_ascii()) {
+        return None;
+    }
     let mut h = aterm_hash::FNV64_OFFSET;
     let mut ascii_ok = true;
     let mut i = 0;
@@ -332,6 +336,7 @@ const fn csa(a: u64, b: u64, c: u64) -> (u64, u64) {
 
 /// Bit-sliced majority via the carry-save adder network.
 #[inline]
+#[must_use]
 pub const fn simhash_majority_bitsliced(v: &VoterSet) -> u64 {
     const fn h(v: &VoterSet, i: usize) -> u64 {
         if v.present & (1 << i) != 0 {
@@ -353,14 +358,11 @@ pub const fn simhash_majority_bitsliced(v: &VoterSet) -> u64 {
     let (s3, k16) = csa(p2_t2, p4_c, k8);
     let s4 = k16;
 
-    let mut w_total = 0i32;
-    let mut i = 0;
-    while i < SIMHASH_SLOT_WEIGHTS.len() {
-        if v.present & (1 << i) != 0 {
-            w_total += SIMHASH_SLOT_WEIGHTS[i];
-        }
-        i += 1;
-    }
+    let p = v.present;
+    let w_total = (p & 0b0_0000_0001).count_ones() as i32 * 3
+        + (p & 0b0_0010_0010).count_ones() as i32 * 4
+        + (p & 0b0_1100_1100).count_ones() as i32 * 2
+        + (p & 0b1_0001_0000).count_ones() as i32;
     let t = (w_total + 1) >> 1;
     let mut ge = !0u64;
     let planes = [s0, s1, s2, s3, s4];
@@ -440,6 +442,7 @@ pub fn simhash_ctx_bitsliced(
 
 /// §3.3 inverse-Gray decode, verbatim: `b_i = ⊕_{j ≥ i} g_j`.
 #[inline]
+#[must_use]
 pub const fn gray_decode(mut g: u64) -> u64 {
     g ^= g >> 1;
     g ^= g >> 2;
@@ -452,6 +455,7 @@ pub const fn gray_decode(mut g: u64) -> u64 {
 
 /// §3.3 field extractor, verbatim: the `n`-bit field of `gkey` at bit `lo`, inverse-Gray decoded.
 #[inline]
+#[must_use]
 pub const fn field(gkey: u64, lo: u32, n: u32) -> u64 {
     gray_decode((gkey >> lo) & ((1u64 << n) - 1))
 }
@@ -474,6 +478,7 @@ pub enum CatAge {
 impl CatAge {
     /// §3.4 body scale: 0.82 / 0.93 / 1.04 / 1.15.
     #[inline]
+    #[must_use]
     pub const fn scale(self) -> f32 {
         match self {
             CatAge::Kitten => 0.82,
@@ -516,6 +521,7 @@ pub struct NovaFeatures {
 
 /// §3.4 NOVA layout decode.
 #[inline]
+#[must_use]
 pub const fn nova_features(g: u64) -> NovaFeatures {
     NovaFeatures {
         palette: field(g, 0, 3) as u8,
@@ -532,24 +538,28 @@ pub const fn nova_features(g: u64) -> NovaFeatures {
 
 /// Single-field nova decodes for per-frame sites that read one feature of an episode's fixed genome, instead of the full [`nova_features`] decode.
 #[inline]
+#[must_use]
 pub const fn nova_duration_ms(g: u64) -> u32 {
     1000 + field(g, 9, 2) as u32 * 400 / 3
 }
 
 /// See [`nova_duration_ms`]: the `palette` row of [`nova_features`], alone.
 #[inline]
+#[must_use]
 pub const fn nova_palette(g: u64) -> u8 {
     field(g, 0, 3) as u8
 }
 
 /// See [`nova_duration_ms`]: the `radius` row of [`nova_features`], alone.
 #[inline]
+#[must_use]
 pub const fn nova_radius(g: u64) -> f32 {
     1.6 + field(g, 5, 2) as f32 * 0.2
 }
 
 /// The Gray-decoded ink-pair hue-nudge codes for a class.
 #[inline]
+#[must_use]
 pub const fn ink_pair_nudges(class: Class, gkey: u64) -> (u8, u8) {
     let lo = if matches!(class, Class::Profanity) {
         19
@@ -583,6 +593,7 @@ pub enum NovaMagic {
 
 /// §3.5 cat window.
 #[inline]
+#[must_use]
 pub const fn cat_magic(magic: u64) -> Option<CatMagic> {
     match magic % 4096 {
         0..=7 => Some(CatMagic::Fortune),
@@ -595,6 +606,7 @@ pub const fn cat_magic(magic: u64) -> Option<CatMagic> {
 
 /// §3.5 nova window (shifted 12 bits so it is independent of the cat window).
 #[inline]
+#[must_use]
 pub const fn nova_magic(magic: u64) -> Option<NovaMagic> {
     match (magic >> 12) % 4096 {
         0..=7 => Some(NovaMagic::Quasar),

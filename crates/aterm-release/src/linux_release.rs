@@ -2168,12 +2168,13 @@ mod tests {
         assert!(WORKER_SCRIPT.trim_end().ends_with("main \"$@\" </dev/null"));
         assert!(WORKER_SCRIPT.contains("umask 077"));
         assert!(WORKER_SCRIPT.contains("mktemp -d"));
-        if std::path::Path::new("/bin/bash").exists() {
-            let status = command("/bin/bash")
-                .args(["-n", "-c", WORKER_SCRIPT])
-                .status()
-                .unwrap();
-            assert!(status.success(), "bash -n rejects the worker script");
+        if !std::path::Path::new("/bin/bash").exists() {
+            aterm_spec::host::could_not_run("/bin/bash is not installed");
         }
+        let status = command("/bin/bash")
+            .args(["-n", "-c", WORKER_SCRIPT])
+            .status()
+            .unwrap();
+        assert!(status.success(), "bash -n rejects the worker script");
     }
 }

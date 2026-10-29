@@ -1,21 +1,19 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-time: spec recovery from its 14 unit tests
+# aterm-time: spec recovery from its 8 unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 2 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
+> Status 2026-10-28: the 2 tests deleted by the tests-and-gates audit and the 4 non-spec tests
+> formerly in §4 are gone from the crate and from §2, leaving 8 live `#[test]` fns.
 
 > Status 2026-10-16: this is the crate's migration worklist. Each spec in §1 is to be proved
 > through Trust/Clean about the compiled Rust function, and then the tests it subsumes are
-> deleted. The 4 tests in §4 sample no aterm spec and can be deleted now.
+> deleted.
 
-Source: `crates/aterm-time` (read only). I read every `#[test]`: `src/lib.rs` 5 and
-`src/shim.rs` 9, for 14 in all, and the code each one reaches. Nothing was compiled or run. The
-claims below come from reading the code.
+Source: `crates/aterm-time` (read only). Every live `#[test]` (`src/lib.rs` 1 and
+`src/shim.rs` 7, for 8 in all) and the code each one reaches are mapped below.
 
-Result: **9 specs**, covering **10 tests**. **4 tests are not spec samples** (§4).
+Result: **9 specs**, covering **8 tests**. **0 remaining non-spec tests** (§4).
 
 ## 0. Notation used in the statements
 
@@ -39,11 +37,9 @@ Result: **9 specs**, covering **10 tests**. **4 tests are not spec samples** (§
   - `F`: **an IEEE binary64 model in Trust/Clean.** That means `is_finite`, NaN/−0.0 comparison,
     `trunc`, `−`, `×` with rounding, and the saturating float→int `as` casts. The audit lists floats
     as refused (PLAN "Admissible bodies") but has no row for them. It should become a §7 row.
-  - `cfg`: **aterm-side.** `mod shim` is `#[cfg(any(all(target_arch = "wasm32", target_os = "unknown"), test))]`
-    (`src/lib.rs:76`). Trust builds no wasm32 std, so natively the shim exists only under
-    `cfg(test)`. A proof "about the compiled function" needs the shim compiled in the verify lane.
-    Either widen the cfg to a verify cfg, or verify the `test` build. The shim is not test-only
-    code, because it has a production caller on the wasm arm.
+  - `cfg` (**resolved 2026-10-27**): `mod shim` in `src/lib.rs` is now gated
+    `#[cfg(any(all(target_arch = "wasm32", target_os = "unknown"), trust_verify, test))]`, so
+    native Trust verify lanes compile `shim.rs` alongside `wasm32-unknown-unknown` and `test`.
 
 ## 1. Specs (TSV)
 
@@ -60,7 +56,7 @@ time-instant-difference	contract	shim::Instant::{duration_since,checked_duration
 time-instant-shift	contract	shim::Instant::{checked_add,checked_sub}, <shim::Instant as Add<Duration>>::add, <… as Sub<Duration>>::sub, <… as AddAssign<Duration>>::add_assign, <… as SubAssign<Duration>>::sub_assign	∀ a: Instant, d: D: a.checked_add(d) = (‖a.0‖ + ‖d‖ ≤ ‖D::MAX‖ ? Some(Ishim(a.0 + d)) : None). a.checked_sub(d) = (d ≤ a.0 ? Some(Ishim(a.0 − d)) : None). a + d panics ⇔ a.checked_add(d) = None, and otherwise a + d = a.checked_add(d).unwrap(); likewise a − d with checked_sub. `a += d` leaves a' = a + d and `a -= d` leaves a' = a − d, with the same panic condition. Round trip: a.checked_add(d) = Some(b) ⇒ b − d = a ∧ b − a = d ∧ (d > 0 ⇒ b > a).	shim::instant_arithmetic_round_trips_and_checks	EASY-MEDIUM: &mut self two-state a', Option::map, `expect` (panic as a precondition), operator traits, core Duration::checked_add/checked_sub. Same proof as time-systime-shift.	1, 2, 3, 4, 6, 12, cfg
 time-systime-duration-since	contract	shim::SystemTime::duration_since, shim::SystemTimeError::duration, <shim::SystemTimeError as Display>::fmt, shim::UNIX_EPOCH, shim::SystemTime::UNIX_EPOCH	∀ s, t: SystemTime: s.duration_since(t) = (s.0 ≥ t.0 ? Ok(s.0 − t.0) : Err(e) with e.duration() = t.0 − s.0 > 0), and it never panics. UNIX_EPOCH.0 = D::ZERO and SystemTime::UNIX_EPOCH = UNIX_EPOCH, so s.duration_since(UNIX_EPOCH) = Ok(s.0). ∀ e: SystemTimeError: e.to_string() = "second time provided was later than self" (std's message, the parity contract that callers may log). Corollary: s = t ⇒ t.duration_since(s) = Ok(D::ZERO).	shim::system_time_reports_backwards_steps	EASY-MEDIUM: a Result return built with an ok_or_else closure, &self, consts, and a Display impl through write! into a Formatter (the String content needs gap 1).	1, 2, 3, 4, 6, 12, 13, cfg
 time-systime-shift	contract	shim::SystemTime::{checked_add,checked_sub}, <shim::SystemTime as Add/Sub/AddAssign/SubAssign<Duration>>	time-instant-shift with Sshim for Ishim: ∀ s: SystemTime, d: D: checked_add is Some(Sshim(s.0 + d)) iff the Duration does not overflow, and None otherwise. checked_sub is Some(Sshim(s.0 − d)) iff d ≤ s.0, and None otherwise, so UNIX_EPOCH.checked_sub(d) = None for d > 0. `+`/`−` equal the unwrapped checked forms and panic exactly when those are None. `+=`/`−=` equal `+`/`−`. s.checked_add(d) = Some(u) ⇒ u − d = s.	shim::system_time_arithmetic_round_trips	as time-instant-shift	1, 2, 3, 4, 6, 12, cfg
-time-epoch-accessors	contract (effectful)	since_epoch, unix_secs, unix_millis	Effect model: each call does one now_w read with value w. since_epoch() = (w ≥ UNIX_EPOCH ? Some(w − UNIX_EPOCH) : None). unix_secs() = since_epoch'().map(as_secs). unix_millis() = since_epoch'().map(|d| min(d.as_millis(), u64::MAX) as u64), for that call's own read. None of them panics. So for reads w0 ≤ w ≤ w1, each accessor lies in [w0 − E, w1 − E] in its unit.	lib::the_epoch_accessors_read_the_wall_clock	MEDIUM: a platform clock effect with two arms (std re-export natively, the shim on wasm), Result::ok, Option::map with closures, and u128→u64 try_from().unwrap_or saturation. The pure part (the map from w to the three values) can be split out and proved first.	1, 3, 4, 8, 12, 13
+time-epoch-accessors	contract (effectful)	since_epoch, since_epoch_at, unix_secs, unix_secs_at, unix_millis, unix_millis_at	Pure per-reading core: since_epoch_at(w) = (w ≥ UNIX_EPOCH ? Some(w − UNIX_EPOCH) : None); unix_secs_at(w) = since_epoch_at(w).map(as_secs); unix_millis_at(w) = since_epoch_at(w).map(|d| min(d.as_millis(), u64::MAX) as u64). Effect model: each of since_epoch(), unix_secs(), unix_millis() does one now_w read with value w and returns the corresponding *_at(w). None of them panics. So for reads w0 ≤ w ≤ w1, each accessor lies in [w0 − E, w1 − E] in its unit.	lib::the_epoch_accessors_read_the_wall_clock	MEDIUM: a platform clock effect with two arms (std re-export natively, the shim on wasm), Result::ok, Option::map with closures, and u128→u64 try_from().unwrap_or saturation. The pure *_at(w) helpers can be proved first without effects.	1, 3, 4, 8, 12, 13
 ```
 
 ### Distribution by kind (9)
@@ -97,7 +93,7 @@ src/lib.rs	the_epoch_accessors_read_the_wall_clock	time-epoch-accessors
 
 ## 3. Coverage
 
-- 14 tests read. 10 map to one of the 9 specs, and 4 are not spec samples (§4).
+- 8 live tests; all 8 map to one of the 9 specs, and the 4 non-spec tests formerly in §4 are deleted.
 - Every spec but `time-from-js-millis` retires one primary test. `millisecond_conversion_is_total`
   also checks that a reading beyond `u64::MAX` milliseconds saturates, a clause of `time-conv-exact`.
   `time-from-js-millis` and `time-conv-exact` are also lemmas that the arithmetic tests use to build
@@ -121,20 +117,20 @@ src/lib.rs	the_epoch_accessors_read_the_wall_clock	time-epoch-accessors
    floors to zero") makes this deliberate. `time-conv-monotone-resolution` therefore quantifies over
    finite inputs only. If saturation is the intent for huge readings, `+∞` should saturate too.
    That is an owner call, and the spec is written for the code as it is.
-2. **The resolution test pins a loose number.** `resolution_survives_an_aged_time_origin` checks
-   ≥ 90_000 ns for a 0.1 ms step. The guarantee the code actually gives is an error under 1 ns per
-   reading (`time-conv-monotone-resolution`), which is much tighter. The doc comment's
-   "sub-microsecond" claim is the real property, and it is understated by the test.
-3. **The shim is compiled natively only under `cfg(test)`** (`src/lib.rs:76`). On the Trust
-   toolchain (no wasm32 std), its production code therefore exists only in test builds. Deleting the
-   shim tests without the `cfg` fix in §0 would leave the shim unbuilt and unproved on every native lane.
-4. **The bracketing test assumes a monotone wall clock.** `the_epoch_accessors_read_the_wall_clock`
-   brackets three separate wall-clock reads between two others. That assumes the wall clock does not
-   step backwards (an NTP correction) during the test, so the test can fail spuriously.
-   `time-epoch-accessors` makes a per-read statement that needs no such assumption.
-5. **Half of one assertion is a tautology.** In `system_time_reports_backwards_steps`, the
-   `Box<dyn Error>` assertion (`to_string` is non-empty) follows from the type system given the
-   `Display` impl. Only the exact-message half carries a spec.
+2. **Resolution test tightened (resolved 2026-10-27).** `resolution_survives_an_aged_time_origin`
+   now asserts `b - a >= Duration::from_nanos(99_998)` for a `0.1 ms` step at `3.6e6 ms`, matching
+   `time-conv-monotone-resolution`'s `< 2 ns` two-reading bound.
+3. **Shim compiled under `trust_verify` (resolved 2026-10-27).** `mod shim` in `src/lib.rs`
+   includes `trust_verify` in its `cfg` gate, so native Trust check/verify lanes build `shim.rs`
+   even without `cfg(test)`.
+4. **Per-read epoch accessors factored out of wall-clock bracketing (resolved 2026-10-28).**
+   `since_epoch_at`, `unix_secs_at` and `unix_millis_at` expose the pure per-reading conversion of
+   `time-epoch-accessors`, and `the_epoch_accessors_read_the_wall_clock` tests them on pre-epoch,
+   epoch, post-epoch and saturating inputs plus one captured `SystemTime::now()` without bracketing
+   separate syscalls against NTP steps.
+5. **Tautological `Box<dyn Error>` message check removed (resolved 2026-10-27).**
+   `system_time_reports_backwards_steps` checks `err.to_string()` directly and checks the
+   `core::error::Error` impl via a `const fn` trait bound instead of `!boxed.to_string().is_empty()`.
 6. **An unstated rounding fact.** The comment "`frac` is in `[0, 1)`, so the product is in
    `[0, 1e6)`" is true only because of rounding. For `f = 1 − 2^-53` the real product rounds to the
    float just below `10^6`, not to `10^6`, because `10^6` is not a power of two and its ulp is `2^-33`.
@@ -148,7 +144,7 @@ no effects first:
 
 1. **`time-instant-difference`**. A newtype over `Duration`, `checked_sub`/`saturating_sub` and derived
    order. Once Duration is modelled as `‖·‖ ∈ ℕ`, it is linear arithmetic. It is the template for the
-   other three arithmetic specs. Blocked by 1, 2, 3, 4, 6, 12 and `cfg`.
+   other three arithmetic specs. Blocked by 1, 2, 3, 4, 6 and 12.
 2. **`time-instant-shift`** and **`time-systime-shift`** together. They have the same proof, and they
    add the `&mut self` two-state form (gap 2) and the panic-as-precondition form of `+`/`−`.
 3. **`time-systime-duration-since`**. The same arithmetic, plus a `Result` and the `Display`
@@ -159,5 +155,3 @@ no effects first:
    change this crate surfaces, since 3 of its 9 specs depend on it.
 6. **`time-epoch-accessors`** last. It waits on effects (gap 8). Its pure map from `w` to the three
    values can be factored out and proved earlier.
-
-The `cfg` fix (§0, §5.3) is an aterm change, not a Trust change, and it comes before any shim proof.

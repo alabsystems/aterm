@@ -74,13 +74,16 @@ mod constructors {
                 return Err(BadIcon::ByteCountNotDivisibleBy4 { byte_count: rgba.len() });
             }
             let pixel_count = rgba.len() / PIXEL_SIZE;
-            if pixel_count != (width * height) as usize {
-                Err(BadIcon::DimensionsVsPixelCount {
+            let width_x_height = (width as usize).checked_mul(height as usize).ok_or(
+                BadIcon::DimensionsVsPixelCount {
                     width,
                     height,
-                    width_x_height: (width * height) as usize,
+                    width_x_height: usize::MAX,
                     pixel_count,
-                })
+                },
+            )?;
+            if pixel_count != width_x_height {
+                Err(BadIcon::DimensionsVsPixelCount { width, height, width_x_height, pixel_count })
             } else {
                 Ok(RgbaIcon { rgba, width, height })
             }
@@ -113,5 +116,33 @@ impl Icon {
         let _span = tracing::debug_span!("aterm_window::Icon::from_rgba", width, height).entered();
 
         Ok(Icon { inner: PlatformIcon::from_rgba(rgba, width, height)? })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rgba_icon_rejects_overflowing_or_mismatched_dimensions() {
+        assert!(matches!(
+            RgbaIcon::from_rgba(Vec::new(), 65_536, 65_536),
+            Err(BadIcon::DimensionsVsPixelCount {
+                width: 65_536,
+                height: 65_536,
+                pixel_count: 0,
+                ..
+            })
+        ));
+        assert!(matches!(
+            RgbaIcon::from_rgba(vec![0; 4], u32::MAX, u32::MAX),
+            Err(BadIcon::DimensionsVsPixelCount {
+                width: u32::MAX,
+                height: u32::MAX,
+                pixel_count: 1,
+                ..
+            })
+        ));
+        assert!(RgbaIcon::from_rgba(vec![0; 16], 2, 2).is_ok());
     }
 }

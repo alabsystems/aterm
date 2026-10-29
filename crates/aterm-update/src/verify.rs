@@ -976,7 +976,7 @@ mod tests {
     /// finishes is collected.
     #[cfg(unix)]
     #[test]
-    fn a_check_helper_past_its_limit_is_killed_and_reported_promptly() {
+    fn a_check_helper_past_its_limit_is_killed_and_reported() {
         let error = output_within(
             Command::new("/bin/sleep").arg("30"),
             "sleep",
@@ -1686,12 +1686,15 @@ mod tests {
         let premise = std::fs::read(&exe).is_err();
         let unread = team_id(&root.path().join("aterm.app"));
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        if premise {
-            let refusal = unread.expect_err("an unreadable bundle has no team id");
-            assert!(crate::is_passing_refusal(&refusal), "{refusal}");
-        }
         let refusal = team_id(&root.path().join("aterm.app")).expect_err("no team id");
         assert!(!crate::is_passing_refusal(&refusal), "{refusal}");
+        if !premise {
+            aterm_uds::host::could_not_run(
+                "a mode-0 executable read anyway: root, or a file system that ignores modes",
+            );
+        }
+        let refusal = unread.expect_err("an unreadable bundle has no team id");
+        assert!(crate::is_passing_refusal(&refusal), "{refusal}");
     }
 
     /// An ad-hoc-signed `aterm.app` under `root` whose Info.plist carries `plist`

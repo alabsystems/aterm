@@ -46,15 +46,18 @@ impl XConnection {
     pub fn get_xft_dpi(&self) -> Option<f64> {
         if let Some(xsettings_screen) = self.xsettings_screen() {
             match self.xsettings_dpi(xsettings_screen) {
-                Ok(Some(dpi)) => return Some(dpi),
-                Ok(None) => {},
+                Ok(Some(dpi)) if validate_scale_factor(dpi / 96.0) => return Some(dpi),
+                Ok(Some(_) | None) => {},
                 Err(_err) => {
                     tracing::warn!("failed to fetch XSettings: {_err}");
                 },
             }
         }
 
-        self.database().get_string("Xft.dpi", "").and_then(|s| f64::from_str(s).ok())
+        self.database()
+            .get_string("Xft.dpi", "")
+            .and_then(|s| f64::from_str(s).ok())
+            .filter(|&dpi| validate_scale_factor(dpi / 96.0))
     }
 
     pub fn get_output_info(&self, crtc: &randr::GetCrtcInfoReply) -> Option<(String, f64)> {

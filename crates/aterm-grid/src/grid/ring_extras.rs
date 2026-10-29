@@ -78,6 +78,50 @@ impl RingExtras {
         changed
     }
 
+    /// Replaces inline-image spans on ring history slot `idx` (`0` = oldest), reconciling retained bytes.
+    pub(crate) fn set_images(
+        &mut self,
+        idx: usize,
+        spans: Vec<aterm_scrollback::ImageSpan>,
+    ) -> bool {
+        let Some(slot) = self.slots.get_mut(idx) else {
+            return false;
+        };
+        if spans.is_empty() {
+            let Some(extras) = slot.as_deref_mut() else {
+                return false;
+            };
+            if extras.images.is_empty() {
+                return false;
+            }
+            let before = extras.retained_memory_used();
+            extras.images.clear();
+            let after = if extras.is_empty() {
+                *slot = None;
+                0
+            } else {
+                extras.retained_memory_used()
+            };
+            self.retained = self.retained.saturating_sub(before).saturating_add(after);
+            return true;
+        }
+        if let Some(extras) = slot.as_deref_mut() {
+            let before = extras.retained_memory_used();
+            extras.images = spans;
+            let after = extras.retained_memory_used();
+            self.retained = self.retained.saturating_sub(before).saturating_add(after);
+        } else {
+            let new_slot = Some(Box::new(ScrolledRowExtras {
+                images: spans,
+                ..ScrolledRowExtras::default()
+            }));
+            let (retained, _) = slot_bytes(&new_slot);
+            self.retained += retained;
+            *slot = new_slot;
+        }
+        true
+    }
+
     /// Creates an empty [`RingExtras`].
     #[inline]
     pub(crate) fn new() -> Self {

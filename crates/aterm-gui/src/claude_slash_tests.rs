@@ -1065,8 +1065,8 @@ fn a_click_on_half_a_frame_is_refused_as_claude_drawing() {
         "nothing typed on half a frame"
     );
     assert_eq!(
-        said(&app, wid, session).as_deref(),
-        Some("Claude was drawing; click again")
+        said(&app, wid, session),
+        Some(SlashRefusal::Moved.says("", None))
     );
     rest_of_frame(&app, session, "");
     app.press_slash(wid, session, Slash::TopEffort(true))

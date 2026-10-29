@@ -283,20 +283,20 @@ fn a_successor_paces_by_the_lines_typed_at_a_break_alone() {
 /// them reads as the hold's.
 #[test]
 fn a_successor_reads_the_wake_doors_rows_by_their_episode() {
-    use super::super::wakes_seen::wake_episode;
+    use super::super::wakes_seen::{WakeDoor, wake_episode};
     let episode = wake_episode(1_000, 1);
     let key = EpisodeKey {
         kind: FactKind::Wake,
         id: episode,
     };
     let rule = FactKind::Wake.rule();
-    let intent = wake_intent_reason(1, episode, 60_000);
+    let intent = wake_intent_reason(1, episode, 60_000, WakeDoor::Break);
     assert!(
         intent.starts_with(&format!("kind=wake episode={episode:016x} ord=1 ")),
         "{intent}"
     );
-    let typed = wake_outcome_reason(1, episode, 60_000, Told::Typed);
-    let skipped = wake_outcome_reason(1, episode, 60_000, Told::Skipped("unmet"));
+    let typed = wake_outcome_reason(1, episode, 60_000, WakeDoor::Break, Told::Typed);
+    let skipped = wake_outcome_reason(1, episode, 60_000, WakeDoor::Break, Told::Skipped("unmet"));
     assert!(skipped.ends_with(" door=break why=unmet"), "{skipped}");
     let nudged = outcome_reason(RuleId::WaitNudge, 0xab, 1_800_000, false, Told::Typed);
     let body = [
@@ -555,4 +555,142 @@ fn a_successor_seeds_from_the_doors_rows_of_its_session() {
         seed_rows_in(&body, Some("@s-2")),
         [(key(0xab), 3, SeedOutcome::Intent)]
     );
+}
+
+/// A LINE LEFT IN THE COMPOSER READS BACK WHOLE (the slice-2 plan's 2.9b): each door's `waiting
+/// … left` row ([`left_reason`]) seeds its episode as [`SeedOutcome::Left`] and comes back from
+/// [`left_rows_in`] as it was booked (its row, its line, its stamp, the submit count it was left
+/// at; a hold's start, this loop's alone, not carried). Its settle reads as its door's own rows
+/// read: told, `typed`; released, `skipped`, and neither is a line left. NEGATIVE CONTROLS:
+/// another session's left row, and a `waiting` row without the word `left`, read as nothing.
+#[test]
+fn a_left_lines_rows_read_back_whole_and_its_settle_as_its_doors() {
+    use super::super::wakes_seen::WakeDoor;
+    use crate::supervise::facts::{Left, Settled};
+    let hold = EpisodeKey {
+        kind: FactKind::Hold,
+        id: 0xab,
+    };
+    let wake = EpisodeKey {
+        kind: FactKind::Wake,
+        id: 0xcd,
+    };
+    let hung = EpisodeKey::no_progress(27098, 7);
+    let lefts = [
+        (
+            hold,
+            LeftRow::Hold {
+                rule: RuleId::WaitNudge,
+                held_ms: 1_800_000,
+                declared: true,
+                since_ms: None,
+            },
+        ),
+        (
+            wake,
+            LeftRow::Wake {
+                ord: 1,
+                held_ms: 60_000,
+                door: WakeDoor::Break,
+            },
+        ),
+        (
+            wake,
+            LeftRow::Wake {
+                ord: 1,
+                held_ms: 0,
+                door: WakeDoor::Point,
+            },
+        ),
+        (
+            hung,
+            LeftRow::Fact {
+                door: FactDoor::Break,
+            },
+        ),
+        (
+            hung,
+            LeftRow::Fact {
+                door: FactDoor::TurnEnd,
+            },
+        ),
+    ];
+    let booked = |sid: &str, ts: i64, key: EpisodeKey, outcome, reason: &str| {
+        Row {
+            rule_id: key.kind.rule(),
+            outcome,
+            command: "the line",
+            reason,
+            box_seq: 1,
+        }
+        .to_json(ts, Some(sid))
+    };
+    for (i, (key, left_row)) in lefts.into_iter().enumerate() {
+        let ts = i64::try_from(i).expect("small") + 1;
+        let left = left_reason(left_row, key, LeftSaid::Left { submits: Some(5) });
+        let unserved = left_reason(left_row, key, LeftSaid::Left { submits: None });
+        assert!(
+            left.ends_with(" left submits=5") && unserved.ends_with(" left"),
+            "{left} / {unserved}"
+        );
+        let body = [
+            booked(SID, ts, key, Outcome::Waiting, &left),
+            booked("@s-2", ts + 10, key, Outcome::Waiting, &left),
+            booked(
+                SID,
+                ts + 20,
+                key,
+                Outcome::Waiting,
+                "hold=open held_ms=600000",
+            ),
+        ]
+        .join("\n");
+        assert_eq!(
+            seed_rows_in(&body, Some(SID)),
+            [(key, ts, SeedOutcome::Left)],
+            "{left_row:?}"
+        );
+        assert_eq!(
+            left_rows_in(&body, Some(SID)),
+            [(
+                key,
+                Left {
+                    row: left_row,
+                    text: "the line".to_string(),
+                    at_ms: ts,
+                    submits: Some(5),
+                    ran: false,
+                    seeded: true,
+                    counted: false,
+                }
+            )],
+            "{left_row:?}: read back seeded, its count another loop's"
+        );
+        for (settled, outcome, seeded) in [
+            (
+                Settled::Told(crate::supervise::facts::SUBMITTED),
+                Outcome::Typed,
+                SeedOutcome::Typed,
+            ),
+            (
+                Settled::Told(crate::supervise::facts::UNCOUNTED),
+                Outcome::Typed,
+                SeedOutcome::Typed,
+            ),
+            (
+                Settled::Released(crate::supervise::facts::CLEARED),
+                Outcome::Skipped,
+                SeedOutcome::Skipped,
+            ),
+        ] {
+            let reason = left_reason(left_row, key, LeftSaid::Settled(settled));
+            let body = booked(SID, ts, key, outcome, &reason);
+            assert_eq!(
+                seed_rows_in(&body, Some(SID)),
+                [(key, ts, seeded)],
+                "{left_row:?}: {reason}"
+            );
+            assert!(left_rows_in(&body, Some(SID)).is_empty(), "{reason}");
+        }
+    }
 }

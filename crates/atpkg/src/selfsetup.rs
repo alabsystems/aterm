@@ -58,6 +58,8 @@ pub struct Places {
     pub xdg_data: PathBuf,
     /// `$XDG_CONFIG_HOME`, else `~/.config`.
     pub xdg_config: PathBuf,
+    /// `$ZDOTDIR`, else `$HOME`: the folder zsh reads its `.zshrc` from.
+    pub zdotdir: PathBuf,
     /// `ATERM_INSTALL_DIR`: the one app location of a scoped run.
     pub install_dir: Option<PathBuf>,
     /// `ATERM_BIN_DIR`, else `~/.local/bin`.
@@ -76,6 +78,7 @@ impl Places {
             home: home.to_path_buf(),
             xdg_data: xdg_data.map_or_else(|| home.join(".local/share"), Path::to_path_buf),
             xdg_config: xdg_config.map_or_else(|| home.join(".config"), Path::to_path_buf),
+            zdotdir: home.to_path_buf(),
             install_dir: None,
             bin_dir: home.join(".local/bin"),
             store_dir: home.join(".local/lib/aterm/bin"),
@@ -885,14 +888,214 @@ const SWEPT_DECLINE_TAG: &str = "# Recorded by aterm pkg self-uninstall for an a
 const CAFFEINE_LABEL_PREFIX: &str = "com.aterm.aterm.acaffiene";
 
 fn sweep_acaffiene(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) -> Vec<PathBuf> {
-    sweep_acaffiene_with(
+    let kept = sweep_acaffiene_with(
         s,
         p,
         app_dirs,
         aterm_uds::peer::our_uid(),
         || acaffiene_account(aterm_uds::peer::our_uid(), &p.home),
         run_quietly,
+    );
+    sweep_old_caffeine(
+        s,
+        p,
+        acaffiene_account(aterm_uds::peer::our_uid(), &p.home),
+        make_as_account,
+    );
+    kept
+}
+
+/// The copies of aterm under aCaffiene's name before 0.145.0, `aterm caffeine`.
+const OLD_CAFFEINE_CODE: &str = "caffeine-code.noindex";
+
+/// What the mug left in the support folder under its old name, besides its lock.
+const OLD_CAFFEINE_FILES: [&str; 4] = [
+    OLD_CAFFEINE_CODE,
+    "caffeine",
+    "caffeine.state",
+    "caffeine.bridge",
+];
+
+/// The old mug's lock, which stays as aCaffiene's does: an old build's mug may still take it.
+const OLD_CAFFEINE_LOCK: &str = "caffeine.lock";
+
+/// The old installed app's login job label; a dev build's adds `.dev.` and 8 lowercase hex
+/// digits (`aterm_acaffiene::legacy::is_label`).
+const OLD_CAFFEINE_LABEL: &str = "com.aterm.aterm.caffeine";
+
+fn old_caffeine_label(label: &str) -> bool {
+    label_of(label, OLD_CAFFEINE_LABEL)
+}
+
+/// Whether `label` is one an aCaffiene build makes (`aterm_acaffiene::launchd::is_label`): the
+/// installed app's, or a dev build's under the same grammar as [`OLD_CAFFEINE_LABEL`]'s.
+fn acaffiene_label(label: &str) -> bool {
+    label_of(label, CAFFEINE_LABEL_PREFIX)
+}
+
+/// Whether `label` is `installed`, or `installed`, `.dev.` and 8 lowercase hex digits.
+fn label_of(label: &str, installed: &str) -> bool {
+    label == installed
+        || label
+            .strip_prefix(installed)
+            .and_then(|rest| rest.strip_prefix(".dev."))
+            .is_some_and(|hash| {
+                hash.len() == 8
+                    && hash
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+}
+
+/// What the mug left under its old name, which no build since 0.145.0 has as a verb, so no helper
+/// here turns its login job off or quits it (an older aterm this sweep removes still has it, and
+/// its mug, if one runs, keeps its lock until it is quit from its menu or the login ends, so its
+/// files are left for the person to remove). Its login plists in `~/Library/LaunchAgents` go:
+/// each runs `<aterm> caffeine serve`, and one whose aterm is gone fails at every login. Its
+/// files go while its idle lock is held, as aCaffiene's do, and the lock stays. A sweep that
+/// leaves an aterm outside its scope leaves them all for it.
+fn sweep_old_caffeine(
+    s: &mut Sweep<'_>,
+    p: &Places,
+    account: Option<(u32, u32)>,
+    make: fn(&Path, u32) -> bool,
+) {
+    let support = p.support();
+    let listed = || -> Vec<PathBuf> {
+        OLD_CAFFEINE_FILES
+            .iter()
+            .map(|name| support.join(name))
+            .filter(|path| present(path))
+            .collect()
+    };
+    let plists: Vec<PathBuf> = sorted_entries(&p.home.join("Library/LaunchAgents"))
+        .into_iter()
+        .filter(|plist| {
+            plist
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".plist"))
+                .is_some_and(old_caffeine_label)
+                && std::fs::symlink_metadata(plist).is_ok_and(|meta| meta.is_file())
+        })
+        .collect();
+    for plist in &plists {
+        s.rm_shared(plist, "old Caffeine login item");
+    }
+    let lock = support.join(OLD_CAFFEINE_LOCK);
+    let files = listed();
+    if s.outsider.is_some() {
+        for path in files {
+            s.rm_shared(&path, "old Caffeine file");
+        }
+        return;
+    }
+    if !files.is_empty() {
+        if s.dry {
+            s.say(
+                "old Caffeine file removal requires an acquired idle lock; the lock itself stays",
+            );
+            if present(&lock) {
+                if !cleanup_lock_free(&lock, account) {
+                    s.skip(
+                        &lock.display().to_string(),
+                        &old_lock_kept(&support, "would be"),
+                    );
+                    return;
+                }
+                s.say(&format!(
+                    "would leave old Caffeine lock rendezvous: {}",
+                    lock.display()
+                ));
+                s.kept += 1;
+            } else if !would_make_lock(s, &lock, account, "old Caffeine") {
+                return;
+            }
+            for path in files {
+                if path == support.join(OLD_CAFFEINE_CODE) {
+                    sweep_acaffiene_code(s, &path, std::time::SystemTime::now());
+                } else {
+                    s.rm_shared(&path, "old Caffeine file");
+                }
+            }
+            return;
+        }
+        let Some(_hold) = acaffiene_cleanup_hold(&lock, account, make) else {
+            s.skip(&lock.display().to_string(), &old_lock_kept(&support, "are"));
+            return;
+        };
+        for path in listed() {
+            if path == support.join(OLD_CAFFEINE_CODE) {
+                sweep_acaffiene_code(s, &path, std::time::SystemTime::now());
+            } else {
+                s.rm_shared(&path, "old Caffeine file");
+            }
+        }
+    }
+    if present(&lock) {
+        s.say(&format!(
+            "{} old Caffeine lock rendezvous: {}",
+            if s.dry { "would leave" } else { "left" },
+            lock.display()
+        ));
+        s.kept += 1;
+    }
+}
+
+/// Why the old name's files in `support` are kept (`are`, or `would be` in a dry run) when its
+/// lock cannot be taken, and how to remove them once the old mug is quit.
+fn old_lock_kept(support: &Path, are: &str) -> String {
+    format!(
+        "an old Caffeine mug holds this lock, or it could not be acquired; its files {are} kept: \
+         once that mug is quit (Quit Caffeine in its menu, or a logout), remove {} and \
+         {OLD_CAFFEINE_LOCK} from {} by hand",
+        OLD_CAFFEINE_FILES.join(", "),
+        support.display()
     )
+}
+
+/// Whether a real run's [`acaffiene_cleanup_hold`] could take the lock at `lock`, which is there,
+/// for `account`: a regular file of the account's with one name, which no mug holds. A dry run's
+/// probe: it opens the file without making it, writes nothing and lets go at once.
+fn cleanup_lock_free(lock: &Path, account: Option<(u32, u32)>) -> bool {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let owner = account.map_or_else(aterm_uds::peer::our_uid, |(uid, _)| uid);
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(lock)
+    else {
+        return false;
+    };
+    file.metadata()
+        .is_ok_and(|meta| meta.is_file() && meta.uid() == owner && meta.nlink() == 1)
+        && crate::lock::Flock::try_lock(file).is_ok()
+}
+
+/// A dry run's word for the lock rendezvous at `lock` that a real run's
+/// [`acaffiene_cleanup_hold`] would make, `what`'s: made, as the account's under root, and left,
+/// counted kept; or, where that hold makes none (root for no account), a skip saying the files
+/// would be kept, and `false`.
+fn would_make_lock(
+    s: &mut Sweep<'_>,
+    lock: &Path,
+    account: Option<(u32, u32)>,
+    what: &str,
+) -> bool {
+    if account.is_none() && aterm_uds::peer::our_uid() == 0 {
+        s.skip(
+            &lock.display().to_string(),
+            &format!("{what} lock could not be made; its files would be kept"),
+        );
+        return false;
+    }
+    s.say(&format!(
+        "would make and leave {what} lock rendezvous: {}",
+        lock.display()
+    ));
+    s.kept += 1;
+    true
 }
 
 fn sweep_acaffiene_with(
@@ -904,6 +1107,10 @@ fn sweep_acaffiene_with(
     mut run: impl FnMut(&Path, &[OsString]) -> i32,
 ) -> Vec<PathBuf> {
     let support = p.support();
+    let agents = p.home.join("Library/LaunchAgents");
+    for (temp, what) in cut_short_saves(s, &support, &agents) {
+        s.rm_shared(&temp, what);
+    }
     let listed = || -> Vec<PathBuf> {
         CAFFEINE_FILES
             .iter()
@@ -977,6 +1184,7 @@ fn sweep_acaffiene_with(
         }
     }
     helpers.retain(|(_, aterm)| *aterm != stored || answers_as_aterm(aterm, run_as(aterm)));
+    let asked = !helpers.is_empty();
     for (app, aterm) in helpers {
         if s.dry {
             s.say(&format!(
@@ -1032,10 +1240,6 @@ fn sweep_acaffiene_with(
         }
         return failed;
     }
-    if s.dry {
-        s.say("aCaffiene file removal requires an acquired idle lock; the lock itself stays");
-        return failed;
-    }
     let files = listed();
     if files.is_empty() {
         return failed;
@@ -1044,11 +1248,51 @@ fn sweep_acaffiene_with(
     let lone_lock = (our_uid != 0 || account.is_some())
         && !login_plist
         && files.iter().all(|path| *path == lock);
-    if (!supported && !lone_lock) || !failed.is_empty() {
+    // A dry run asks no helper: what it lists follows a yes, and its line above says so.
+    let confirmed = if s.dry { asked } else { supported };
+    if (!confirmed && !lone_lock) || !failed.is_empty() {
         s.skip(
             &support.display().to_string(),
-            "aCaffiene stop was not confirmed; its files are kept",
+            if s.dry {
+                "aCaffiene stop would not be confirmed; its files would be kept"
+            } else {
+                "aCaffiene stop was not confirmed; its files are kept"
+            },
         );
+        return failed;
+    }
+    if s.dry {
+        s.say(if asked {
+            "aCaffiene file removal requires a helper above that stops aCaffiene and an acquired \
+             idle lock; the lock itself stays"
+        } else {
+            "aCaffiene file removal requires an acquired idle lock; the lock itself stays"
+        });
+        if files.contains(&lock) {
+            // A helper's quit would end the mug that holds it; with none, a held lock stays held.
+            if !asked && !cleanup_lock_free(&lock, account) {
+                s.skip(
+                    &lock.display().to_string(),
+                    "aCaffiene lock is busy or could not be acquired; its files would be kept",
+                );
+                return failed;
+            }
+        } else if !would_make_lock(s, &lock, account, "aCaffiene") {
+            return failed;
+        }
+        for path in files {
+            if path == lock {
+                s.say(&format!(
+                    "would leave aCaffiene lock rendezvous: {}",
+                    path.display()
+                ));
+                s.kept += 1;
+            } else if path == support.join(CAFFEINE_CODE) {
+                sweep_acaffiene_code(s, &path, std::time::SystemTime::now());
+            } else {
+                s.rm_shared(&path, "aCaffiene file");
+            }
+        }
         return failed;
     }
     let Some(_hold) = acaffiene_cleanup_hold(&lock, account, make_as_account) else {
@@ -1073,6 +1317,77 @@ fn sweep_acaffiene_with(
         }
     }
     failed
+}
+
+/// The files in `support` whose temporaries a window's launch sweeps
+/// (`aterm_acaffiene::state::sweep_temps`): aCaffiene's mode and its update bridge's pid file,
+/// under its name and the old one, each with what a temporary of it is.
+const WRITTEN_THROUGH_TEMPS: [(&str, &str); 4] = [
+    ("acaffiene.state", "aCaffiene save cut short"),
+    ("acaffiene.bridge", "aCaffiene save cut short"),
+    ("caffeine.state", "old Caffeine save cut short"),
+    ("caffeine.bridge", "old Caffeine save cut short"),
+];
+
+/// The temporaries that no write will rename
+/// ([`aterm_uds::atomic_file::abandoned_temps_beside`]) of [`WRITTEN_THROUGH_TEMPS`] in
+/// `support`, and of the login items in `agents` named for a label [`acaffiene_label`] or
+/// [`old_caffeine_label`] takes ([`aterm_uds::atomic_file::temp_target`]), each with what it is:
+/// an ordinary window's launch removes them too, but an uninstall may come first. Their writers
+/// are gone, so no mug's stop or lock is needed for them; the session plists' folders go whole
+/// with aCaffiene's other files. A `support` that is no folder holds none, and one that cannot
+/// be listed is one skip, after which none of them is removed. `agents` is read as the rest of
+/// the uninstall reads it ([`sorted_entries`]): one that is no folder, or that cannot be listed
+/// (a person may lock it against login items), holds none.
+fn cut_short_saves(
+    s: &mut Sweep<'_>,
+    support: &Path,
+    agents: &Path,
+) -> Vec<(PathBuf, &'static str)> {
+    let after = aterm_uds::atomic_file::ABANDONED_AFTER;
+    let mut found = Vec::new();
+    if support.is_dir() {
+        for (name, what) in WRITTEN_THROUGH_TEMPS {
+            match aterm_uds::atomic_file::abandoned_temps_beside(&support.join(name), after) {
+                Ok(temps) => found.extend(temps.into_iter().map(|temp| (temp, what))),
+                Err(e) => {
+                    s.skip(
+                        &support.display().to_string(),
+                        &format!("its aCaffiene saves cut short could not be listed: {e}"),
+                    );
+                    return Vec::new();
+                }
+            }
+        }
+    }
+    found.extend(login_items_cut_short(agents, after));
+    found
+}
+
+/// [`cut_short_saves`]'s temporaries of the login items in `agents`.
+fn login_items_cut_short(
+    agents: &Path,
+    after: std::time::Duration,
+) -> Vec<(PathBuf, &'static str)> {
+    let mut plists = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(agents).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let Some(plist) = aterm_uds::atomic_file::temp_target(&name) else {
+            continue;
+        };
+        let what = match plist.strip_suffix(".plist") {
+            Some(label) if acaffiene_label(label) => "aCaffiene login item cut short",
+            Some(label) if old_caffeine_label(label) => "old Caffeine login item cut short",
+            _ => continue,
+        };
+        plists.insert(agents.join(plist), what);
+    }
+    let mut found = Vec::new();
+    for (plist, what) in plists {
+        let temps = aterm_uds::atomic_file::abandoned_temps_beside(&plist, after);
+        found.extend(temps.into_iter().flatten().map(|temp| (temp, what)));
+    }
+    found
 }
 
 fn sweep_acaffiene_code(s: &mut Sweep<'_>, code: &Path, now: std::time::SystemTime) {
@@ -1852,6 +2167,7 @@ fn sweep_store(s: &mut Sweep<'_>, p: &Places, acaffiene_kept: &[PathBuf]) {
 fn sweep_path_blocks(s: &mut Sweep<'_>, p: &Places) {
     let mut rcs: Vec<PathBuf> = Vec::new();
     for rc in [
+        p.zdotdir.join(".zshrc"),
         p.home.join(".zshrc"),
         p.home.join(".bashrc"),
         p.home.join(".bash_profile"),
@@ -1925,10 +2241,11 @@ fn without_block(text: &str) -> Option<String> {
     (!dropping).then_some(out)
 }
 
-/// The profile the managed PATH block lands in for `env`'s shell ([`crate::hooks::login_rc`]).
+/// The profile the managed PATH block lands in for `env`'s shell, zsh's in [`Places::zdotdir`]
+/// ([`crate::hooks::login_rc`] asks it with `zdotdir` at `home`).
 pub(crate) fn rc_target(p: &Places, env: &ShellEnv) -> Option<PathBuf> {
     match env.shell_name() {
-        "zsh" => Some(p.home.join(".zshrc")),
+        "zsh" => Some(p.zdotdir.join(".zshrc")),
         "bash" if cfg!(target_os = "macos") => Some(
             [".bash_profile", ".bash_login", ".profile"]
                 .iter()
@@ -2024,8 +2341,11 @@ fn plan_path(p: &Places, env: &ShellEnv, coming: bool, out: &mut dyn Write) {
                 rc.display()
             )
         }
-        Some(_) if !(coming || hook_of(p, env.shell_name()).is_file()) => {
-            "PATH: no edit — no ALab toolset to put on PATH".to_string()
+        Some(_) if !(coming || hook_of(p, env.shell_name()).is_file() || !bin_on_path(p, env)) => {
+            format!(
+                "PATH: no edit — {} is on PATH and no ALab toolset is installed",
+                p.bin_dir.display()
+            )
         }
         Some(rc) => {
             let verb = if std::fs::read_to_string(&rc).is_ok_and(|t| t.contains(PATH_BLOCK_START)) {
@@ -2033,14 +2353,27 @@ fn plan_path(p: &Places, env: &ShellEnv, coming: bool, out: &mut dyn Write) {
             } else {
                 "appends ONE"
             };
+            let hook = if coming || hook_of(p, env.shell_name()).is_file() {
+                "the toolset hook + "
+            } else {
+                ""
+            };
             format!(
-                "PATH: {verb} marker-fenced block to {} — the toolset hook + {}",
+                "PATH: {verb} marker-fenced block to {} — {hook}{}",
                 rc.display(),
                 p.bin_dir.display()
             )
         }
     };
     let _ = writeln!(out, "atpkg: {line}");
+}
+
+/// Whether `env`'s PATH already names the bin dir (the managed block's one line besides the
+/// toolset hook).
+fn bin_on_path(p: &Places, env: &ShellEnv) -> bool {
+    env.path
+        .as_ref()
+        .is_some_and(|path| std::env::split_paths(path).any(|dir| dir == p.bin_dir))
 }
 
 fn path_block(p: &Places, env: &ShellEnv) -> String {
@@ -2118,8 +2451,12 @@ fn wire_path(
         return false;
     };
     let hook = hook_of(p, shell);
-    if !hook.is_file() && !coming {
-        let _ = writeln!(out, "atpkg: PATH: no edit — no ALab toolset to put on PATH");
+    if !hook.is_file() && !coming && bin_on_path(p, env) {
+        let _ = writeln!(
+            out,
+            "atpkg: PATH: no edit — {} is on PATH and no ALab toolset is installed",
+            p.bin_dir.display()
+        );
         return false;
     }
     let text = match std::fs::read_to_string(&rc) {
@@ -2138,15 +2475,25 @@ fn wire_path(
             return false;
         }
     };
+    let bin = p.bin_dir.display();
     if updated == text {
-        let _ = writeln!(
-            out,
-            "atpkg: ALab toolset already on PATH via {}",
-            rc.display()
-        );
+        // What the standing block puts on PATH, as the write below says it: the toolset only
+        // when its hook is laid (round 12: a --no-toolchain rerun said "ALab toolset already on
+        // PATH" with no toolset installed or coming).
+        let rc_s = rc.display();
+        let said = if hook.is_file() {
+            format!("ALab toolset already on PATH via {rc_s}")
+        } else if coming {
+            format!(
+                "{bin} already on PATH via {rc_s}; the ALab toolset joins it after aterm's first \
+                 launch"
+            )
+        } else {
+            format!("{bin} already on PATH via {rc_s}")
+        };
+        let _ = writeln!(out, "atpkg: {said}");
         return true;
     }
-    let bin = p.bin_dir.display();
     let destination = if rc.is_symlink() {
         match rc.canonicalize() {
             Ok(path) => path,
@@ -2190,11 +2537,13 @@ fn wire_path(
     let rc_s = rc.display();
     let said = if hook.is_file() {
         format!("added the ALab toolset and {bin} to PATH in {rc_s} — open a new shell")
-    } else {
+    } else if coming {
         format!(
             "added {bin} to PATH in {rc_s} — open a new shell; the ALab toolset joins it after \
              aterm's first launch"
         )
+    } else {
+        format!("added {bin} to PATH in {rc_s} — open a new shell")
     };
     let _ = writeln!(out, "atpkg: {said}");
     true
@@ -2340,7 +2689,8 @@ fn install_completions(
         .strip_prefix(&p.home)
         .map(|rest| format!("~/{}", rest.display()))
         .unwrap_or_default();
-    let zsh_loader = std::fs::read_to_string(p.home.join(".zshrc")).is_ok_and(|rc| {
+    let zshrc = p.zdotdir.join(".zshrc");
+    let zsh_loader = std::fs::read_to_string(&zshrc).is_ok_and(|rc| {
         rc.contains(&zsh_dir.display().to_string()) || (!tilde.is_empty() && rc.contains(&tilde))
     });
     let fish_loader = env.on_path("fish").is_some();
@@ -2412,10 +2762,11 @@ fn install_completions(
     }
     if wrote.1 && !zsh_loader {
         let z = zsh_dir.display();
+        let rc = zshrc.display();
         let _ = writeln!(
             err,
-            "atpkg: NOTE: zsh completions landed in {z}, which ~/.zshrc does not put on \
-             $fpath — add:\n  fpath=(\"{z}\" $fpath)\n  autoload -Uz compinit && compinit"
+            "atpkg: NOTE: zsh completions landed in {z}, which {rc} does not put on $fpath — \
+             add:\n  fpath=(\"{z}\" $fpath)\n  autoload -Uz compinit && compinit"
         );
     }
 }
@@ -2563,16 +2914,22 @@ fn install_desktop_entry(
 
 fn process_places() -> Option<Places> {
     let home = aterm_types::dirs::home_dir()?;
-    let env_dir = |name: &str| {
-        std::env::var_os(name)
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-    };
-    Some(Places::defaults(
-        &home,
+    Some(places_from(&home, |name| std::env::var_os(name)))
+}
+
+/// [`Places`] under `home` as the environment `var` reads them: an empty variable is unset,
+/// and `ZDOTDIR` counts only as an absolute path (a relative one names no fixed folder).
+fn places_from(home: &Path, var: impl Fn(&str) -> Option<OsString>) -> Places {
+    let env_dir = |name: &str| var(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let mut places = Places::defaults(
+        home,
         env_dir("XDG_DATA_HOME").as_deref(),
         env_dir("XDG_CONFIG_HOME").as_deref(),
-    ))
+    );
+    if let Some(zdotdir) = env_dir("ZDOTDIR").filter(|dir| dir.is_absolute()) {
+        places.zdotdir = zdotdir;
+    }
+    places
 }
 
 fn take_dir(

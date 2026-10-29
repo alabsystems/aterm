@@ -197,7 +197,7 @@ pub const CHECKS: [Spec; 19] = [
         reach: Reach::WholeTree,
         needs: &["targo", "gpu"],
         also: "",
-        runs: "targo test -p aterm-gpu --lib frame_record_tests: this host's arm against aterm's CPU twins of its frames, decided on any adapter, with the record of wgpu's frames a same-adapter signal (on the test run's build, after it; with test when aterm-gpu is selected)",
+        runs: "targo test -p aterm-gpu --lib frame_record_tests: this host's arm against aterm's CPU twins of its frames, decided on any adapter, with the record of wgpu's frames a same-adapter signal (on the test run's build, after it)",
     },
     Spec {
         check: Check::Appkit,
@@ -345,13 +345,10 @@ pub const GOLDEN: (&str, &str) = (
 );
 
 /// The checks that judge what some packages' own tests cannot, each with those packages.
-pub const PULLS: [(Check, &[&str]); 2] = [
-    (Check::GpuOracle, &[GOLDEN.0]),
-    (
-        Check::WasmSmoke,
-        &["aterm-wasm", "aterm-gpu-web", "aterm-wasm-abi"],
-    ),
-];
+pub const PULLS: [(Check, &[&str]); 1] = [(
+    Check::WasmSmoke,
+    &["aterm-wasm", "aterm-gpu-web", "aterm-wasm-abi"],
+)];
 
 /// The [`PULLS`] checks `wanted` lacks whose packages `holds` selects when `wanted` runs `test`.
 #[must_use]
@@ -536,10 +533,10 @@ pub fn list_table() -> String {
         "\nEvery check needs targo: without it verify runs none (COULD NOT RUN, exit 3).\n\
          \n\
          dev      fmt census lint test doc: the bare command, on the change cone\n\
-         \x20        any run with test (but release) adds gpu-oracle when its selection\n\
-         \x20        (the cone, -p or --all) holds aterm-gpu, and wasm-smoke when it holds\n\
-         \x20        aterm-wasm or aterm-gpu-web (on the cone: a change to any crate either\n\
-         \x20        builds on) or aterm-wasm-abi (their wasm32-only host boundary)\n\
+         \x20        any run with test (but release) adds wasm-smoke when its selection\n\
+         \x20        (the cone, -p or --all) holds aterm-wasm or aterm-gpu-web (on the cone:\n\
+         \x20        a change to any crate either builds on) or aterm-wasm-abi (their\n\
+         \x20        wasm32-only host boundary)\n\
          release  what `ship release` requires: --all implied, --app required, a skip is exit 3\n\
          perf     not a check: the performance lanes, `verify perf --list`\n",
     );
@@ -625,26 +622,6 @@ mod tests {
             assert_eq!(s.check.spec().name, s.name);
             assert!(!s.stages.is_empty(), "{}", s.name);
         }
-    }
-
-    #[test]
-    fn a_selection_holding_aterm_gpu_runs_its_oracle_with_its_tests() {
-        let gpu = |p: &str| p == "aterm-gpu";
-        assert_eq!(
-            with_pulled(&DEV, false, gpu),
-            [DEV.as_slice(), &[Check::GpuOracle]].concat()
-        );
-        assert_eq!(with_pulled(&DEV, false, |_| false), DEV);
-        assert_eq!(
-            with_pulled(&[Check::Lint], false, gpu),
-            [Check::Lint],
-            "only a run with the tests holds the frames to the record"
-        );
-        assert_eq!(
-            with_pulled(&RELEASE, true, |_| true),
-            RELEASE,
-            "release has it already, and runs its set and nothing more"
-        );
     }
 
     #[test]
@@ -767,10 +744,7 @@ mod tests {
         assert_eq!(with_pulled(&DEV, false, |p| narrow.includes_crate(p)), DEV);
         assert_eq!(
             pulled(&DEV, |p| p == "aterm-gpu" || p == "aterm-gpu-web"),
-            [
-                (Check::GpuOracle, "aterm-gpu"),
-                (Check::WasmSmoke, "aterm-gpu-web")
-            ]
+            [(Check::WasmSmoke, "aterm-gpu-web")]
         );
         assert_eq!(
             with_pulled(&RELEASE, true, |_| true),

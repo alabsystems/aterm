@@ -281,15 +281,40 @@ fn past_the_fence<T>(
     })
 }
 
+/// Whether the rollout leg's `log kinds=turn` lines hold what the tap's word says: on a measured
+/// build (`rollout=bound`) turns the rollout opened or closed; on one nobody measured
+/// (`rollout=partial`, its rows read strong) a turn the log opened, each opened by its OSC 7501
+/// claim (`src=engine conf=claim`) or by its rollout read strong (fix E1), a rollout row reaching a
+/// turn (`vref=` or `vdur_ms=` amending one, or a turn of its own) and none read exact, so a leg
+/// whose rollout reached no turn, the symptom of a build nobody measured before the partial read,
+/// fails. Which of the two opened a turn is not asked: a claim opens its turn at the status
+/// sample that shows its OSC 7501 `working`, or at the engine's edge where no sample did, and a
+/// rollout that opened the turn first keeps it (fix E1); the live first leg's two turns were both
+/// the rollout's on 2026-10-28. The claims' own turns are held to their rules by aterm-gui's
+/// `session_log_transcript_tests` and aterm-slog's `transcript_replays`, and the control leg
+/// reads a claim's `program` mark.
 fn rollout_holds(measured: bool, said: &TapSaid, turns: &[String]) -> bool {
-    let from_rollout = turns
-        .iter()
-        .filter(|l| l.contains(" src=transcript "))
-        .count();
+    let from_rollout = |l: &String| l.contains(" src=transcript ");
+    let moved = |l: &&String| from_rollout(l) && (l.contains(" open t") || l.contains(" close t"));
     if measured {
-        said.word == "bound" && from_rollout > 0
+        said.word == "bound" && turns.iter().any(|l| moved(&l))
     } else {
-        said.word == "unmeasured" && from_rollout == 0
+        let mut opens = turns.iter().filter(|l| l.contains(" open t")).peekable();
+        let opened = opens.peek().is_some();
+        let theirs = opens.all(|l| {
+            l.contains(" src=engine conf=claim ")
+                || (from_rollout(l) && l.contains(" conf=strong "))
+        });
+        let reached = turns.iter().any(|l| {
+            moved(&l)
+                || (from_rollout(l)
+                    && l.contains(" amend t")
+                    && (l.contains(" vref=") || l.contains(" vdur_ms=")))
+        });
+        let exact = turns
+            .iter()
+            .any(|l| from_rollout(l) && l.contains(" conf=exact "));
+        said.word == "partial" && opened && theirs && reached && !exact
     }
 }
 
@@ -329,8 +354,99 @@ fn tail(text: &str, n: usize) -> String {
     chars[chars.len().saturating_sub(n)..].iter().collect()
 }
 
+/// A ctl reply to `asked` as a reading: the reply when it answered (exit 0, its first line no
+/// `ERR`), else an `Err` saying what it answered instead (its exit code, stdout and stderr). A
+/// failed reply never stands in for a reading, as an empty timeline or a status line with no
+/// fields would.
+fn reading(asked: &str, r: instance::Reply) -> Result<instance::Reply, String> {
+    if r.code == 0 && !r.first().starts_with("ERR") {
+        return Ok(r);
+    }
+    let said = format!("{} {}", r.stdout.trim(), r.stderr.trim());
+    let said = crate::util::one_line(&said, 200);
+    Err(format!("`{asked}` answered {}: {said}", r.code))
+}
+
+/// A one-line reply to `asked` (`status`, `meta`) as a reading ([`reading`]): its first line, which
+/// a reply that printed none lacks.
+fn line_reading(asked: &str, r: instance::Reply) -> Result<String, String> {
+    let r = reading(asked, r)?;
+    match r.stdout.lines().next() {
+        Some(line) if !line.trim().is_empty() => Ok(line.to_string()),
+        _ => Err(format!("`{asked}` answered no line")),
+    }
+}
+
+/// What an absence check found ([`Proof::has_any`]): the acts its timeline holds, or why the
+/// timeline went unread.
+fn ends_said(ended: &Result<Vec<String>, String>) -> String {
+    match ended {
+        Ok(acts) => format!("{acts:?}"),
+        Err(why) => format!("unread: {why}"),
+    }
+}
+
 fn ms_of(d: Duration) -> i64 {
     i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// When the last commit on `main` in the repository at `proj` was made, in milliseconds since the
+/// epoch: the time `main`'s reflog was last written, which the commit appended to (a push or a
+/// fetch writes the remote's reflog, never this one). A commit's own date holds whole seconds,
+/// which reads a commit up to a second past a hold as inside it.
+fn committed_ms(proj: &Path) -> Option<i64> {
+    let at = std::fs::metadata(proj.join(".git/logs/refs/heads/main"))
+        .ok()?
+        .modified()
+        .ok()?;
+    i64::try_from(at.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis()).ok()
+}
+
+/// How long after a model's nudge at `asked_ms` the last commit in `proj` came
+/// ([`committed_ms`]), when that was past the model's `hold`.
+fn committed_past(asked_ms: i64, proj: &Path, hold: Duration) -> Option<i64> {
+    let came = committed_ms(proj)? - asked_ms;
+    (came >= ms_of(hold)).then_some(came)
+}
+
+/// A lab act a model's hold times: whether it came inside the hold, and the line saying when,
+/// counted from the model's nudge (`asked_ms`): when the lab came to act (`arrived_ms`) and when
+/// it acted (`acted_ms`). A lab that came already past the hold was held by an earlier leg of its
+/// own run, which says nothing of Land's repo logic; one that came inside it and acted past it
+/// names the act.
+fn hold_line(asked_ms: i64, arrived_ms: i64, acted_ms: i64, hold: Duration) -> (bool, String) {
+    let hold_ms = ms_of(hold);
+    let (came, into) = (arrived_ms - asked_ms, acted_ms - asked_ms);
+    let held = hold.as_secs();
+    if came >= hold_ms {
+        return (
+            false,
+            format!(
+                "{} into the model's {held} s hold: the lab came {} after the model's nudge, past its hold, held by an earlier leg of the lab's run (this is not Land's repo logic)",
+                secs(into),
+                secs(came)
+            ),
+        );
+    }
+    let at = if came > 0 {
+        format!("the lab came {} after the model's nudge", secs(came))
+    } else {
+        "the lab was waiting for the model's nudge".to_string()
+    };
+    if into >= hold_ms {
+        return (
+            false,
+            format!(
+                "{} into the model's {held} s hold: {at}, inside its hold, and the act itself took {} past it",
+                secs(into),
+                secs(into - hold_ms)
+            ),
+        );
+    }
+    (
+        true,
+        format!("{} into the model's {held} s hold ({at})", secs(into)),
+    )
 }
 
 fn str_of(row: &J, k: &str) -> String {
@@ -708,7 +824,7 @@ pub(crate) struct Proof {
     /// The checks that held.
     oks: usize,
     /// What the rollout leg expects of the package's build: `Some(true)` bound, `Some(false)`
-    /// unmeasured, `None` what the lab's compiled `CODEX_MEASURED_BUILDS` says
+    /// partial (a build nobody measured), `None` what the lab's compiled `CODEX_MEASURED_BUILDS` says
     /// (`--expect-rollout`; `codex-measure` passes it, since the lab measuring a build was
     /// compiled before the build was listed).
     expect: Option<bool>,
@@ -762,6 +878,22 @@ impl Proof {
         self.on(sid, &["status"]).first()
     }
 
+    /// `sid`'s one-line answer to `args` (`status`, `meta`) as a reading ([`line_reading`]), for a
+    /// check a failed reply must not pass: [`Proof::status`] reads a failed one as its error line.
+    fn read_line(&self, sid: &str, args: &[&str]) -> Result<String, String> {
+        line_reading(&format!("@{sid} {}", args.join(" ")), self.on(sid, args))
+    }
+
+    /// `sid`'s row in `sessions` (what `ls` prints), if it has one.
+    pub(crate) fn sessions_row(&self, sid: &str) -> Option<String> {
+        self.inst
+            .ctl(&["sessions"])
+            .stdout
+            .lines()
+            .find(|l| l.split(' ').nth(1) == Some(sid))
+            .map(str::to_string)
+    }
+
     pub(crate) fn proven_pid(&self, sid: &str) -> Option<i32> {
         let st = self.status(sid);
         if field(&st, "supervisor_proven").as_deref() != Some("1") {
@@ -773,13 +905,21 @@ impl Proof {
             .ok()
     }
 
+    /// `sid`'s harness acts, in order: none both when it has none and when its timeline could not
+    /// be read ([`Proof::read_acts`] tells the two apart, for a check that an act is absent).
     pub(crate) fn acts(&self, sid: &str) -> Vec<String> {
-        self.on(sid, &["timeline"])
+        self.read_acts(sid).unwrap_or_default()
+    }
+
+    /// `sid`'s harness acts, in order, from its timeline as a reading ([`reading`]).
+    fn read_acts(&self, sid: &str) -> Result<Vec<String>, String> {
+        let timeline = reading(&format!("@{sid} timeline"), self.on(sid, &["timeline"]))?;
+        Ok(timeline
             .stdout
             .lines()
             .filter(|l| l.contains("kind=harness-act"))
             .filter_map(|l| field(l, "act"))
-            .collect()
+            .collect())
     }
 
     fn requests(&self, leg: &str) -> Vec<J> {
@@ -1287,11 +1427,14 @@ impl Proof {
         })
     }
 
-    fn has_any(&self, leg: &Leg, acts: &[&str]) -> Vec<String> {
-        self.acts(&leg.sid)
+    /// Which of `acts` the leg's timeline holds, for a check that it holds none: a timeline that
+    /// could not be read is an `Err` saying what it answered, never an empty one.
+    fn has_any(&self, leg: &Leg, acts: &[&str]) -> Result<Vec<String>, String> {
+        Ok(self
+            .read_acts(&leg.sid)?
             .into_iter()
             .filter(|a| acts.contains(&a.as_str()))
-            .collect()
+            .collect())
     }
 
     fn await_tag(&self, leg: &Leg, step: &str, limit: Duration) -> Result<bool, Stopped> {
@@ -1342,17 +1485,29 @@ impl Proof {
 
     fn first_leg(&mut self, first: &Leg) -> Result<(), Stopped> {
         let defended = self.await_act(first, DEFEND, Duration::from_secs(240))?;
-        let parked = self
-            .host_lines(&first.sid)
-            .iter()
-            .any(|l| l.contains("WATCHING a proven self-claim supervises this session"));
+        // The loop's review line is read from its drive journal, the review's own store:
+        // aterm.log keeps only its words (`WATCHING text=<n>B`, `journal::log_words`).
+        let journal = aterm_agent::supervise::approvals::journal_beside(
+            &aterm_agent::supervise::approvals::ledger_under(
+                &self.h.join("Library/Application Support/aterm"),
+                Some(&first.sid),
+            ),
+        );
+        let parked =
+            aterm_agent::supervise::journal::read_journal(&journal).is_ok_and(|(rows, _)| {
+                rows.iter().any(|r| {
+                    r.line
+                        .starts_with("WATCHING a proven self-claim supervises this session")
+                })
+            });
         self.check("first: aterm's lane parked (its host watches only)", parked);
         let ended = self.has_any(first, &[FINISHED, LANDED]);
         self.check(
             &format!(
-                "first: the reply ending on the retired token alone is a done claim: Cruise's defend-and-find-more prompt ({DEFEND}), never {FINISHED} nor {LANDED} (ends: {ended:?})"
+                "first: the reply ending on the retired token alone is a done claim: Cruise's defend-and-find-more prompt ({DEFEND}), never {FINISHED} nor {LANDED} (ends: {})",
+                ends_said(&ended)
             ),
-            defended && ended.is_empty(),
+            defended && ended.as_ref().is_ok_and(Vec::is_empty),
         );
         let asked = self.await_tag(first, "defend", Duration::from_secs(60))?;
         let rows = self.requests("first");
@@ -1374,9 +1529,10 @@ impl Proof {
         let face = task_face(&self.status(&first.sid));
         self.check(
             &format!(
-                "first: a clean `Nothing left:` defense under Cruise lands nothing (15 s on: ends {ended:?}, status task={face})"
+                "first: a clean `Nothing left:` defense under Cruise lands nothing (15 s on: ends {}, status task={face})",
+                ends_said(&ended)
             ),
-            asked && ended.is_empty() && face != "landed",
+            asked && ended.as_ref().is_ok_and(Vec::is_empty) && face != "landed",
         );
         Ok(())
     }
@@ -1398,10 +1554,14 @@ impl Proof {
                 secs(seen_ms - t1)
             )
         });
-        let text = pct_decode(&field(&meta, "attention").unwrap_or_default());
+        // `meta attention=` is the newest entry, and codex-alab's own back-off wait
+        // (`owner=codex-alab-wait kind=wait`) lands after the need; the `sessions` row shows the
+        // newest ask before any wait, so the need's words are read there.
+        let row = self.sessions_row(&leg.sid).unwrap_or_default();
+        let text = pct_decode(&field(&row, "attention").unwrap_or_default());
         self.check(
             &format!(
-                "needs: the report's NEEDS YOU line raises attention owner=needs kind=ask at once (attention_kinds={} status needs={} attention={text:?}{after})",
+                "needs: the report's NEEDS YOU line raises attention owner=needs kind=ask at once (attention_kinds={} status needs={} sessions attention={text:?}{after})",
                 pct_decode(&field(&meta, "attention_kinds").unwrap_or_default()),
                 field(&status, "needs").unwrap_or_default()
             ),
@@ -1451,8 +1611,12 @@ impl Proof {
         })?;
         let mut meta = String::new();
         let cleared = Self::wait_for(Duration::from_secs(60), Duration::from_millis(250), || {
-            meta = self.on(&leg.sid, &["meta"]).first();
-            !needs_raised(&meta)
+            // A `meta` that could not be read holds no `attention_kinds=`, which is no reading
+            // of the need gone: poll again.
+            self.read_line(&leg.sid, &["meta"]).is_ok_and(|read| {
+                meta = read;
+                !needs_raised(&meta)
+            })
         })?;
         self.check(
             &format!(
@@ -1496,11 +1660,12 @@ impl Proof {
         let tags: Vec<String> = rows.iter().map(|r| str_of(r, "tag")).collect();
         self.check(
             &format!(
-                "continue: the continued turn's token ends nothing (ends {ended:?}; the model asked: {}; quiet window: {})",
+                "continue: the continued turn's token ends nothing (ends {}; the model asked: {}; quiet window: {})",
+                ends_said(&ended),
                 tags.join(" "),
                 quiet.as_ref().map_or_else(Clone::clone, |()| "quiet".to_string())
             ),
-            replied && ended.is_empty() && quiet.is_ok(),
+            replied && ended.as_ref().is_ok_and(Vec::is_empty) && quiet.is_ok(),
         );
         Ok(())
     }
@@ -1584,8 +1749,17 @@ impl Proof {
         let sent = self.on(&leg.sid, &["send", "y"]);
         let (mut after, mut row) = (String::new(), None);
         let cleared = Self::wait_for(minute, Duration::from_millis(250), || {
-            after = self.status(&leg.sid);
-            row = self.survey_of(&leg.sid);
+            // A survey that could not be read, or one without the leg's record, holds no field,
+            // which `said` reads as the `-` this wants; a status that could not be read is no
+            // reading either: poll again.
+            let (Ok(st), Ok(Some(record))) = (
+                self.read_line(&leg.sid, &["status"]),
+                self.read_survey(&leg.sid),
+            ) else {
+                return false;
+            };
+            after = st;
+            row = Some(record);
             !field(&after, "program_state").is_some_and(|s| s.starts_with("blocked"))
                 && field(&after, "needs").as_deref() == Some("-")
                 && said(&row, "needs") == "-"
@@ -1625,13 +1799,16 @@ impl Proof {
         );
         let land_answer = self.await_act(leg, "land-answer@v1", Duration::from_secs(240))?;
         let asked = self.await_tag(leg, "land-answer", Duration::from_secs(60))?;
-        let acts = self.acts(&leg.sid);
+        let acts = self.read_acts(&leg.sid);
+        let shown = match &acts {
+            Ok(acts) => acts.join(" "),
+            Err(why) => format!("unread: {why}"),
+        };
         self.check(
             &format!(
-                "question: under Land the question in prose after it gets Land's answer (land-answer@v1, aterm's LAND_ANSWER words), never a Cruise answer (acts: {})",
-                acts.join(" ")
+                "question: under Land the question in prose after it gets Land's answer (land-answer@v1, aterm's LAND_ANSWER words), never a Cruise answer (acts: {shown})"
             ),
-            land_answer && asked && !acts.iter().any(|a| a == "answer@v1"),
+            land_answer && asked && acts.is_ok_and(|acts| !acts.iter().any(|a| a == "answer@v1")),
         );
         Ok(())
     }
@@ -1652,16 +1829,27 @@ impl Proof {
         for leg in legs {
             let build = Self::rollout_build(leg);
             let measured = expects_bound(self.expect, build.as_deref(), CODEX_MEASURED_BUILDS);
-            let turns = || -> Vec<String> {
-                self.on(&leg.sid, &["log", "kinds=turn"])
-                    .stdout
+            let turns = || -> Result<Vec<String>, String> {
+                let asked = format!("@{} log kinds=turn", leg.sid);
+                let r = reading(&asked, self.on(&leg.sid, &["log", "kinds=turn"]))?;
+                Ok(r.stdout
                     .lines()
                     .filter(|l| l.starts_with(|c: char| c.is_ascii_digit()))
                     .map(str::to_string)
-                    .collect()
+                    .collect())
             };
+            let unread = std::cell::RefCell::new(None::<String>);
             let fenced = past_the_fence(
-                || tap_said(&self.status(&leg.sid)),
+                || match self.read_line(&leg.sid, &["status"]) {
+                    Ok(line) => {
+                        *unread.borrow_mut() = None;
+                        tap_said(&line)
+                    }
+                    Err(why) => {
+                        *unread.borrow_mut() = Some(why);
+                        None
+                    }
+                },
                 turns,
                 |ok| Self::wait_for(Duration::from_secs(60), Duration::from_millis(250), ok),
             )?;
@@ -1675,28 +1863,40 @@ impl Proof {
             let want = if measured {
                 "the tab's log holds turns from its rollout (src=transcript, rollout=bound)"
             } else {
-                "an unmeasured build's rollout steps no turn (rollout=unmeasured)"
+                "an unmeasured build's log opens a turn its rollout reaches, reading none exact \
+                 (rollout=partial)"
             };
             match fenced {
                 Fenced::Past { from, to, got } => {
-                    for line in &got {
-                        println!("    {line}");
-                    }
                     self.fences
                         .push(format!("{name} {}→{} {}", from.asks, to.asks, to.word));
-                    self.check(
-                        &format!(
-                            "{name}: past the tap's fence (rollout_asks {} to {}, rollout={}), {want}",
-                            from.asks, to.asks, to.word
-                        ),
-                        rollout_holds(measured, &to, &got),
+                    let fence = format!(
+                        "{name}: past the tap's fence (rollout_asks {} to {}, rollout={}), {want}",
+                        from.asks, to.asks, to.word
                     );
+                    match got {
+                        Ok(got) => {
+                            for line in &got {
+                                println!("    {line}");
+                            }
+                            self.check(&fence, rollout_holds(measured, &to, &got));
+                        }
+                        Err(why) => {
+                            self.check(&format!("{fence}: its log unread ({why})"), false);
+                        }
+                    }
                 }
                 Fenced::NoTap => {
-                    self.fences.push(format!("{name} no tap"));
+                    let unread = unread.borrow().clone();
+                    self.fences.push(match &unread {
+                        Some(_) => format!("{name} status unread"),
+                        None => format!("{name} no tap"),
+                    });
+                    let said =
+                        unread.map_or_else(String::new, |why| format!(" (status unread: {why})"));
                     self.check(
                         &format!(
-                            "{name}: status names the rollout tap's answer (rollout=), {want}"
+                            "{name}: status names the rollout tap's answer (rollout=){said}, {want}"
                         ),
                         false,
                     );
@@ -1706,9 +1906,12 @@ impl Proof {
                         "{name} {}→{} {} (stuck)",
                         from.asks, to.asks, to.word
                     ));
+                    let said = unread.borrow().as_ref().map_or_else(String::new, |why| {
+                        format!("; its last status unread: {why}")
+                    });
                     self.check(
                         &format!(
-                            "{name}: the rollout tap answers two asks past a look within a minute (rollout_asks {} to {}, rollout={}), {want}",
+                            "{name}: the rollout tap answers two asks past a look within a minute (rollout_asks {} to {}, rollout={}{said}), {want}",
                             from.asks, to.asks, to.word
                         ),
                         false,
@@ -1720,16 +1923,31 @@ impl Proof {
         Ok(())
     }
 
-    /// The leg's `survey` record, `--json`.
+    /// The leg's `survey` record, `--json`: none both when it has none and when the survey could
+    /// not be read ([`Proof::read_survey`] tells the two apart, for a check that a field has gone).
     fn survey_of(&self, sid: &str) -> Option<J> {
-        let reply = self.inst.ctl(&["survey", "--json", "--sid", sid]);
-        J::parse(&reply.stdout)
-            .ok()?
-            .as_arr()?
+        self.read_survey(sid).ok().flatten()
+    }
+
+    /// The leg's `survey` record, `--json`, as a reading ([`reading`]): `None` when the survey
+    /// answered without one, an `Err` saying what it answered when it failed or printed no JSON.
+    fn read_survey(&self, sid: &str) -> Result<Option<J>, String> {
+        let asked = format!("survey --json --sid {sid}");
+        let reply = reading(&asked, self.inst.ctl(&["survey", "--json", "--sid", sid]))?;
+        let all = match J::parse(&reply.stdout) {
+            Ok(all) => all,
+            Err(e) => {
+                let said = crate::util::one_line(&reply.stdout, 200);
+                return Err(format!("`{asked}` answered no JSON ({e}): {said}"));
+            }
+        };
+        Ok(all
+            .as_arr()
+            .unwrap_or_default()
             .iter()
             .flat_map(|i| i.get("sessions").and_then(J::as_arr).unwrap_or_default())
             .find(|s| s.get("sid").and_then(J::as_str) == Some(sid))
-            .cloned()
+            .cloned())
     }
 
     /// A codex-alab row says what codex-alab says of itself (OSC 7501) and what its rollout
@@ -1793,14 +2011,7 @@ impl Proof {
     /// reading (`unknown`: aterm reads no Codex screen), says the claim is proven, and ages the
     /// report (`status program_state_ms=`).
     fn roster_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
-        let row = |p: &Self| {
-            p.inst
-                .ctl(&["sessions"])
-                .stdout
-                .lines()
-                .find(|l| l.split(' ').nth(1) == Some(leg.sid.as_str()))
-                .map(str::to_string)
-        };
+        let row = |p: &Self| p.sessions_row(&leg.sid);
         let reported = |v: &str| {
             matches!(
                 v.split(':').next(),
@@ -2132,6 +2343,7 @@ impl Proof {
     }
 
     fn repo_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
+        let arrived = crate::util::now_ms();
         let land = self.await_act(leg, "land@v1", Duration::from_secs(300))?;
         let defended = self.await_tag(leg, "land", Duration::from_secs(60))?;
         self.check(
@@ -2147,10 +2359,14 @@ impl Proof {
         let (tag, text) = self.request_named("repo", "repo:nudge1");
         self.check(
             &format!(
-                "repo: the clean defense over a repository with an untracked file is NOT landed: a land-nudge@v1 follows naming the repository's work (ends {ended:?}; …{})",
+                "repo: the clean defense over a repository with an untracked file is NOT landed: a land-nudge@v1 follows naming the repository's work (ends {}; …{})",
+                ends_said(&ended),
                 tail(&text, 180)
             ),
-            nudged && ended.is_empty() && tag.ends_with("+repo") && text.contains(NOTES),
+            nudged
+                && ended.as_ref().is_ok_and(Vec::is_empty)
+                && tag.ends_with("+repo")
+                && text.contains(NOTES),
         );
         if !nudged {
             return Ok(());
@@ -2159,33 +2375,49 @@ impl Proof {
             .git(&leg.proj, &["add", NOTES])
             .and_then(|_| self.git(&leg.proj, &["commit", "-q", "-m", "lab: the release notes"]))
             .and_then(|_| self.git(&leg.proj, &["status", "--porcelain", "--branch"]));
-        let into = crate::util::now_ms() - asked;
-        let late = into >= ms_of(REPO_COMMIT_HOLD);
+        let (inside, timing) = hold_line(asked, arrived, crate::util::now_ms(), REPO_COMMIT_HOLD);
         self.check(
             &format!(
-                "repo: the lab committed {NOTES}, not pushing it, {} into the model's {} s hold ({})",
-                secs(into),
-                REPO_COMMIT_HOLD.as_secs(),
+                "repo: the lab committed {NOTES}, not pushing it, {timing} ({})",
                 committed
                     .as_ref()
                     .map_or_else(Clone::clone, |s| s.trim().replace('\n', " | "))
             ),
-            committed.as_ref().is_ok_and(|s| s.contains("ahead 1")) && !late,
+            committed.as_ref().is_ok_and(|s| s.contains("ahead 1")) && inside,
         );
         Ok(())
     }
 
+    /// How long after the model's first repo nudge the lab's commit came, when that was past the
+    /// model's commit hold ([`committed_ms`]).
+    fn committed_past_hold(&self, leg: &Leg) -> Option<i64> {
+        let asked = first_at(&self.requests("repo"), "repo:nudge1")?;
+        committed_past(asked, &leg.proj, REPO_COMMIT_HOLD)
+    }
+
     fn repo_pushed(&mut self, leg: &Leg) -> Result<(), Stopped> {
+        let arrived = crate::util::now_ms();
         let nudged = self.await_tag(leg, "nudge2", REPO_COMMIT_HOLD + Duration::from_secs(360))?;
         let ended = self.has_any(leg, &[LANDED]);
         let asked = first_at(&self.requests("repo"), "repo:nudge2").unwrap_or(0);
         let (tag, text) = self.request_named("repo", "repo:nudge2");
+        let why = self.committed_past_hold(leg).map_or_else(String::new, |came| {
+            format!(
+                "; the nudge names the untracked {NOTES} because the lab's commit came {} after the model's first nudge, past its {} s hold",
+                secs(came),
+                REPO_COMMIT_HOLD.as_secs()
+            )
+        });
         self.check(
             &format!(
-                "repo: committed but not pushed, the next clean defense is NOT landed either: a land-nudge@v1 names the commit the remote main lacks (ends {ended:?}; …{})",
+                "repo: committed but not pushed, the next clean defense is NOT landed either: a land-nudge@v1 names the commit the remote main lacks (ends {}; …{}){why}",
+                ends_said(&ended),
                 tail(&text, 180)
             ),
-            nudged && ended.is_empty() && tag.ends_with("+repo") && text.contains("not on origin/main"),
+            nudged
+                && ended.as_ref().is_ok_and(Vec::is_empty)
+                && tag.ends_with("+repo")
+                && text.contains("not on origin/main"),
         );
         if !nudged {
             return Ok(());
@@ -2193,18 +2425,15 @@ impl Proof {
         let pushed = self
             .git(&leg.proj, &["push", "-q", "origin", "main"])
             .and_then(|_| self.git(&leg.proj, &["status", "--porcelain", "--branch"]));
-        let into = crate::util::now_ms() - asked;
-        let late = into >= ms_of(REPO_PUSH_HOLD);
+        let (inside, timing) = hold_line(asked, arrived, crate::util::now_ms(), REPO_PUSH_HOLD);
         self.check(
             &format!(
-                "repo: the lab pushed it to the local bare origin {} into the model's {} s hold ({})",
-                secs(into),
-                REPO_PUSH_HOLD.as_secs(),
+                "repo: the lab pushed it to the local bare origin {timing} ({})",
                 pushed
                     .as_ref()
                     .map_or_else(Clone::clone, |s| s.trim().replace('\n', " | "))
             ),
-            pushed.is_ok() && !late,
+            pushed.is_ok() && inside,
         );
         let landed = self.await_act(leg, LANDED, Duration::from_secs(90))?;
         let mut face = String::new();
@@ -2252,17 +2481,24 @@ impl Proof {
     }
 
     fn cruise_rests_never(&mut self, cruise: &[&Leg]) {
-        let ended: Vec<String> = cruise
-            .iter()
-            .flat_map(|leg| {
-                self.has_any(leg, &[FINISHED, LANDED])
-                    .into_iter()
-                    .map(move |a| format!("{}:{a}", leg.name))
-            })
-            .collect();
+        let mut ended: Vec<String> = Vec::new();
+        let mut unread = Vec::new();
+        for leg in cruise {
+            match self.has_any(leg, &[FINISHED, LANDED]) {
+                Ok(acts) => ended.extend(acts.into_iter().map(|a| format!("{}:{a}", leg.name))),
+                Err(why) => unread.push(why),
+            }
+        }
         self.check(
-            &format!("cruise: no Cruise leg's timeline holds {FINISHED} or {LANDED} ({ended:?})"),
-            ended.is_empty(),
+            &format!(
+                "cruise: no Cruise leg's timeline holds {FINISHED} or {LANDED} ({ended:?}{})",
+                if unread.is_empty() {
+                    String::new()
+                } else {
+                    format!("; unread: {unread:?}")
+                }
+            ),
+            ended.is_empty() && unread.is_empty(),
         );
         let now = crate::util::now_ms();
         let mut met = 0;
@@ -2482,9 +2718,10 @@ impl Proof {
         let ended = self.has_any(leg, &[FINISHED, LANDED]);
         self.check(
             &format!(
-                "carry: the carried reply's done claim gets Cruise's defend prompt ({DEFEND}), never {FINISHED} (ends {ended:?})"
+                "carry: the carried reply's done claim gets Cruise's defend prompt ({DEFEND}), never {FINISHED} (ends {})",
+                ends_said(&ended)
             ),
-            defended && ended.is_empty(),
+            defended && ended.as_ref().is_ok_and(Vec::is_empty),
         );
         Ok(())
     }
@@ -2569,7 +2806,12 @@ impl Proof {
         let mut status = String::new();
         let released =
             Self::wait_for(Duration::from_secs(120), Duration::from_millis(500), || {
-                status = self.status(&leg.sid);
+                // A status that could not be read names no supervisor, which is no reading of
+                // the claim given back: poll again.
+                let Ok(st) = self.read_line(&leg.sid, &["status"]) else {
+                    return false;
+                };
+                status = st;
                 field(&status, "supervisor_proven").as_deref() != Some("1")
                     && !field(&status, "supervisor").is_some_and(|s| s.starts_with("codex-alab@"))
             })?;
@@ -2708,7 +2950,21 @@ impl Proof {
                 false,
             );
         };
-        let before = self.status(&leg.sid);
+        // Each `status` is a reading the stamps are judged from: one that could not be read ends
+        // the exchange, since `person_hand` would read it as no stamp (`human_seq` 0).
+        let status = |p: &mut Self, when: &str| match p.read_line(&leg.sid, &["status"]) {
+            Ok(st) => Some(st),
+            Err(why) => {
+                p.check(
+                    &format!("{name}: COULD NOT RUN: no `status` reading {when} ({why})"),
+                    false,
+                );
+                None
+            }
+        };
+        let Some(before) = status(self, "before the message was typed") else {
+            return Ok(None);
+        };
         let mut send = vec!["send"];
         send.extend_from_slice(seam);
         send.push(&text);
@@ -2738,7 +2994,9 @@ impl Proof {
             );
             return Ok(None);
         }
-        let drafted = self.status(&leg.sid);
+        let Some(drafted) = status(self, "with the draft in codex's composer") else {
+            return Ok(None);
+        };
         let mut key = vec!["key"];
         key.extend_from_slice(seam);
         key.push("enter");
@@ -2765,7 +3023,9 @@ impl Proof {
             );
             return Ok(None);
         };
-        let after = self.status(&leg.sid);
+        let Some(after) = status(self, "after its Enter") else {
+            return Ok(None);
+        };
         Ok(Some(Typed {
             pressed_ms,
             before,
@@ -2909,9 +3169,9 @@ impl Proof {
         let proven = self.proven_pid(&person.sid).is_some();
         self.check(
             &format!(
-                "exchange: after the person's own turn and the model's plain reply of real work \
-                 (successful reply write: {}), codex-alab types NOTHING, its claim still proven ({}; \
-                 proven: {proven})",
+                "exchange: under Land, after the person's own turn opening the session and the \
+                 model's plain reply of real work (successful reply write: {}), codex-alab types \
+                 NOTHING, its claim still proven ({}; proven: {proven})",
                 reply.map_or("not observed", |_| "observed"),
                 left.as_ref().unwrap_or_else(|why| why)
             ),
@@ -3207,7 +3467,7 @@ fn codex_config(port: u16, proj: &Path, home: &Path, extra: &str) -> String {
     )
 }
 
-/// `--expect-rollout`'s word `given`: `Some(true)` bound, `Some(false)` unmeasured, `None` (no
+/// `--expect-rollout`'s word `given`: `Some(true)` bound, `Some(false)` partial, `None` (no
 /// flag) what the lab's compiled list says ([`Proof::expect`]).
 /// # Errors
 /// Usage: another word.
@@ -3215,9 +3475,9 @@ pub(crate) fn expect_rollout(given: Option<&str>) -> Result<Option<bool>, Fail> 
     match given {
         None => Ok(None),
         Some("bound") => Ok(Some(true)),
-        Some("unmeasured") => Ok(Some(false)),
+        Some("partial") => Ok(Some(false)),
         Some(other) => Err(Fail::usage(format!(
-            "codex-alab-proof: --expect-rollout bound|unmeasured, not '{other}'"
+            "codex-alab-proof: --expect-rollout bound|partial, not '{other}'"
         ))),
     }
 }
@@ -3259,7 +3519,7 @@ pub(crate) fn proof_lock(path: &Path, limit: Duration) -> Result<crate::aos_lear
     })
 }
 
-/// `codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--keep] [--expect-rollout bound|unmeasured] [--policy-only|--upgrade-only|--raw-upgrade-only]`.
+/// `codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--keep] [--expect-rollout bound|partial] [--policy-only|--upgrade-only|--raw-upgrade-only]`.
 /// # Errors
 /// Usage, a run that could not start, or an interrupt.
 pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
@@ -3613,7 +3873,10 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
     )?;
     let usage = proof.spawn_leg("usage", "Start the task.", "", Folder::Scratch, None)?;
     let carry = proof.spawn_leg("carry", "Do the long task.", "", Folder::Scratch, None)?;
-    let exchange = proof.start_leg("exchange", None, "", Folder::Scratch, None)?;
+    // Cruise never parks (owner ruling 2026-10-26), and under Land a person's message is theirs
+    // only where it opens the session (2026-10-27): the person's exchange is this session's
+    // opening message under Land, and the control's, a control write, is Cruise's to go on with.
+    let exchange = proof.start_leg("exchange", None, "", Folder::Scratch, Some("land"))?;
     let control = proof.start_leg("control", None, "", Folder::Scratch, None)?;
     let worker = proof.spawn_worker()?;
     let all = [
@@ -3663,11 +3926,6 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
     let t = Instant::now();
     proof.first_leg(&first)?;
     timed(proof, "first", t);
-    if let Some(worker) = &worker {
-        let t = Instant::now();
-        proof.worker_leg(worker)?;
-        timed(proof, "worker", t);
-    }
     let t = Instant::now();
     proof.crash_leg(&first, pid_of("first"))?;
     timed(proof, "crash", t);
@@ -3726,10 +3984,22 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
     let t = Instant::now();
     proof.land_leg(&land)?;
     timed(proof, "land", t);
+    // The worker's `await task` waits up to 240 s on a worker that never lands (a package's
+    // defect), so it is checked here, after the legs whose lab act must land inside a model's
+    // hold (the repo leg's commit and push), and that defect reads as the worker's FAILs alone.
+    // The legs ahead of those acts can also wait long when a package stalls them; their lines
+    // then say the lab came past the hold, held by an earlier leg ([`hold_line`]). The worker
+    // was spawned and claimed at the start, so one that lands costs nothing here; and it is
+    // checked before `upgrade_leg` re-execs every codex-alab.
+    if let Some(worker) = &worker {
+        let t = Instant::now();
+        proof.worker_leg(worker)?;
+        timed(proof, "worker", t);
+    }
     proof.needs_cleared(&needs)?;
     proof.landed_stay_quiet(&[&land, &reland, &repo]);
     proof.cruise_rests_never(&[
-        &first, &needs, &cont, &approval, &hold, &off, &usage, &carry, &exchange, &control,
+        &first, &needs, &cont, &approval, &hold, &off, &usage, &carry, &control,
     ]);
     let exchange_was = proof.exchange_before_upgrade(&exchange);
     let landed_was = proof.landed_before_upgrade(&[&land, &reland, &repo])?;
@@ -4278,6 +4548,47 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
     }
 
     #[test]
+    fn a_failed_reply_is_no_reading() {
+        let reply = |code: i32, stdout: &str, stderr: &str| instance::Reply {
+            code,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+        };
+        let line = "OK hold=0 human_ms=40 human_seq=1 task=open";
+        assert_eq!(
+            line_reading("@s status", reply(0, &format!("{line}\n"), "")),
+            Ok(line.to_string())
+        );
+        for failed in [
+            reply(1, "", "aterm-ctl: ERR no session s"),
+            reply(0, "ERR no session s\n", ""),
+            reply(124, "", ""),
+            reply(0, "", ""),
+        ] {
+            assert!(
+                line_reading("@s status", failed.clone()).is_err(),
+                "a failed reply stood in for a status line: {failed:?}"
+            );
+            assert_eq!(
+                person_hand(&failed.first()),
+                (None, 0),
+                "which would read as no stamp"
+            );
+        }
+        let why = reading("@s timeline", reply(1, "", "ERR no session s"))
+            .err()
+            .unwrap_or_default();
+        assert!(
+            why.contains("ERR no session s"),
+            "the failed reply is said, not read: {why}"
+        );
+        assert!(
+            reading("@s timeline", reply(0, "", "")).is_ok(),
+            "a timeline with no rows is a reading"
+        );
+    }
+
+    #[test]
     fn no_land_leg_drops_out_of_the_past_upgrade_check() {
         let leg = |name: &'static str| Leg {
             name,
@@ -4395,6 +4706,24 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
     const LATE_TURN: &str =
         "12 open t1 turn par=r1 vref=turn-1 src=transcript conf=exact t=1760000001000";
 
+    /// A turn a partial rollout opened where no claim's turn ran (fix E1).
+    const MISSED_TURN: &str =
+        "11 open t2 turn par=r1 vref=turn-2 src=transcript conf=strong t=1760000005000";
+
+    /// A leg whose claims opened no turn, its partial rollout opening each (fix E1), as the live
+    /// first leg's two turns (39 ms and 8 ms) did.
+    const ROLLOUT_OPENED: [&str; 3] = [
+        "22 open t1 turn par=r2 vref=turn-1 src=transcript conf=strong t=1760000000000",
+        "24 close t1 turn out=done dur_ms=39 by=vendor src=transcript conf=strong t=1760000000039",
+        "25 amend t1 turn vdur_ms=132 tok_in=1 tok_out=1 by=vendor src=transcript conf=strong t=1760000000039",
+    ];
+
+    /// A turn a build nobody measured logs: its claim's, which its rollout names.
+    const CLAIMED: [&str; 2] = [
+        "9 open t1 turn par=r1 src=engine conf=claim t=1760000000000",
+        "10 amend t1 turn vref=turn-1 src=transcript conf=strong t=1760000000100",
+    ];
+
     impl Script {
         fn new(word: &'static str, late: Option<u64>) -> Script {
             Script {
@@ -4407,6 +4736,13 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
                     "9 open t1 turn par=r1 src=screen conf=strong t=1760000000000".to_string(),
                 ]),
             }
+        }
+
+        /// [`Script::new`] whose log holds the [`CLAIMED`] turn in place of the screen's.
+        fn claimed(word: &'static str, late: Option<u64>) -> Script {
+            let script = Script::new(word, late);
+            *script.log.borrow_mut() = CLAIMED.map(str::to_string).to_vec();
+            script
         }
 
         fn look(&self) -> Option<TapSaid> {
@@ -4448,14 +4784,67 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
             }
             Fenced::NoTap | Fenced::Stuck { .. } => None,
         };
-        assert_eq!(verdict(false, &Script::new("unmeasured", None)), Some(true));
-        let late = Script::new("unmeasured", Some(42));
+        assert_eq!(
+            verdict(false, &Script::claimed("partial", None)),
+            Some(true)
+        );
+        assert_eq!(
+            verdict(false, &Script::new("partial", None)),
+            Some(false),
+            "NEGATIVE CONTROL: a log the rollout reached no turn of is the gap, never a pass"
+        );
+        assert_eq!(
+            verdict(false, &Script::claimed("unmeasured", None)),
+            Some(false),
+            "an unmeasured build is read partial"
+        );
+        let late = Script::claimed("partial", Some(42));
         assert_eq!(verdict(false, &late), Some(false));
         assert!(late.read().iter().any(|l| l == LATE_TURN));
-        let at_once = Script::new("unmeasured", Some(42));
+        let said = |word: &str| TapSaid {
+            word: word.to_string(),
+            asks: 42,
+        };
+        let lines = |ls: &[&str]| ls.iter().map(|l| (*l).to_string()).collect::<Vec<_>>();
+        assert!(rollout_holds(false, &said("partial"), &lines(&CLAIMED)));
+        assert!(
+            !rollout_holds(false, &said("partial"), &lines(&CLAIMED[..1])),
+            "a claim's turn the rollout amends nothing of: the rollout reached no turn"
+        );
+        assert!(
+            !rollout_holds(false, &said("partial"), &lines(&CLAIMED[1..])),
+            "an amend of a turn the log never opened"
+        );
+        let screen = [
+            "9 open t1 turn par=r1 src=screen conf=strong t=1760000000000",
+            CLAIMED[1],
+        ];
+        assert!(
+            !rollout_holds(false, &said("partial"), &lines(&screen)),
+            "NEGATIVE CONTROL: a turn neither a claim nor the rollout opened, though the rollout \
+             names it"
+        );
+        assert!(
+            rollout_holds(false, &said("partial"), &lines(&ROLLOUT_OPENED)),
+            "a leg whose every turn the partial rollout opened, none its claims', is no gap"
+        );
+        assert!(
+            !rollout_holds(true, &said("bound"), &lines(&CLAIMED[1..])),
+            "an amend is no turn the rollout opened or closed"
+        );
+        let missed = [CLAIMED[0], CLAIMED[1], MISSED_TURN];
+        assert!(
+            rollout_holds(false, &said("partial"), &lines(&missed)),
+            "a turn the claims missed, the partial rollout's own (fix E1), is no exact read"
+        );
+        assert!(
+            !rollout_holds(false, &said("partial"), &lines(&[CLAIMED[0], LATE_TURN])),
+            "NEGATIVE CONTROL: a rollout turn read exact on a build nobody measured"
+        );
+        let at_once = Script::claimed("partial", Some(42));
         let first = at_once.look().expect("an answer");
         assert!(rollout_holds(false, &first, &at_once.read()));
-        let mut stuck = Script::new("unmeasured", None);
+        let mut stuck = Script::new("partial", None);
         stuck.stuck = true;
         let fenced = past_the_fence(|| stuck.look(), || stuck.read(), ten_looks).expect("ran");
         assert!(
@@ -4471,7 +4860,7 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
         assert_eq!(verdict(true, &Script::new("bound", Some(41))), Some(true));
         assert_eq!(verdict(true, &Script::new("bound", None)), Some(false));
         assert_eq!(
-            verdict(true, &Script::new("unmeasured", Some(41))),
+            verdict(true, &Script::new("partial", Some(41))),
             Some(false)
         );
     }
@@ -4493,10 +4882,7 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
         }
         assert!(matches!(expect_rollout(None), Ok(None)));
         assert!(matches!(expect_rollout(Some("bound")), Ok(Some(true))));
-        assert!(matches!(
-            expect_rollout(Some("unmeasured")),
-            Ok(Some(false))
-        ));
+        assert!(matches!(expect_rollout(Some("partial")), Ok(Some(false))));
         let f = expect_rollout(Some("measured")).expect_err("no such word");
         assert_eq!(f.code, 2);
         assert!(
@@ -4523,5 +4909,111 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
         );
         drop(first);
         proof_lock(&path, Duration::ZERO).expect("let go");
+    }
+
+    /// A LAB ACT A MODEL'S HOLD TIMES SAYS WHO WAS LATE: a lab that came and acted inside the hold
+    /// passes; one that came inside it and acted past it fails naming the act; one that came
+    /// already past it fails naming the lab's own earlier legs, never Land's repo logic.
+    #[test]
+    fn a_hold_timed_act_names_who_was_late() {
+        let (ok, line) = hold_line(1_000, 1_500, 1_800, REPO_COMMIT_HOLD);
+        assert!(ok, "{line}");
+        assert_eq!(
+            line,
+            "0.8 s into the model's 60 s hold (the lab came 0.5 s after the model's nudge)"
+        );
+        let (ok, line) = hold_line(1_000, 900, 1_300, REPO_PUSH_HOLD);
+        assert!(ok, "{line}");
+        assert!(
+            line.contains("the lab was waiting for the model's nudge"),
+            "{line}"
+        );
+
+        let (ok, line) = hold_line(0, 10_000, 61_000, REPO_COMMIT_HOLD);
+        assert!(!ok, "{line}");
+        assert!(
+            line.starts_with("61.0 s into the model's 60 s hold: the lab came 10.0 s after")
+                && line.contains("the act itself took 1.0 s past it")
+                && !line.contains("earlier leg")
+                && !line.contains("Land"),
+            "{line}"
+        );
+
+        let (ok, line) = hold_line(0, 182_000, 182_400, REPO_COMMIT_HOLD);
+        assert!(!ok, "{line}");
+        assert!(
+            line.starts_with("182.4 s into the model's 60 s hold: the lab came 182.0 s after")
+                && line.contains("held by an earlier leg of the lab's run")
+                && line.contains("not Land's repo logic")
+                && !line.contains("the act itself"),
+            "{line}"
+        );
+        let (ok, line) = hold_line(0, 20_000, 20_100, REPO_PUSH_HOLD);
+        assert!(!ok && line.contains("earlier leg"), "{line}");
+    }
+
+    /// THE LAB'S COMMIT IS TIMED TO THE MILLISECOND ([`committed_ms`]): one 60.4 s after the
+    /// model's nudge, whose own whole-second date reads 59.7 s, is past the 60 s hold, so
+    /// `repo_pushed`'s line can say why the next nudge names the untracked file; one 59.4 s after
+    /// is inside it. The commit's time is a hand-set stamp on `main`'s reflog.
+    #[test]
+    fn a_commit_under_a_second_past_the_hold_reads_past_it() {
+        const T: i64 = 1_700_000_000_000;
+        let root = aterm_tempfile::tempdir().unwrap();
+        let proj = root.path();
+        let git = |args: &[&str], date: Option<&str>| {
+            let mut cmd = aterm_uds::fixture_git::git();
+            cmd.args([
+                "-c",
+                "user.name=jsmith",
+                "-c",
+                "user.email=jsmith@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(proj)
+            .stdin(Stdio::null());
+            if let Some(date) = date {
+                cmd.env("GIT_AUTHOR_DATE", date)
+                    .env("GIT_COMMITTER_DATE", date);
+            }
+            let out = cmd.output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        git(&["init", "-q", "-b", "main"], None);
+        std::fs::write(proj.join(NOTES), "# release notes\n").unwrap();
+        git(&["add", NOTES], None);
+        git(
+            &["commit", "-q", "-m", "lab: the release notes"],
+            Some("@1700000060 +0000"),
+        );
+        let (asked, made) = (T + 300, T + 60_700);
+        std::fs::File::options()
+            .append(true)
+            .open(proj.join(".git/logs/refs/heads/main"))
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(made.unsigned_abs()))
+            .unwrap();
+        let own: i64 = git(&["log", "-1", "--format=%ct"], None)
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            own * 1000 - asked < ms_of(REPO_COMMIT_HOLD),
+            "the commit's own date reads inside the hold"
+        );
+        assert_eq!(committed_ms(proj), Some(made));
+        assert_eq!(committed_past(asked, proj, REPO_COMMIT_HOLD), Some(60_400));
+        assert_eq!(
+            committed_past(asked + 1_000, proj, REPO_COMMIT_HOLD),
+            None,
+            "59.4 s: inside"
+        );
     }
 }

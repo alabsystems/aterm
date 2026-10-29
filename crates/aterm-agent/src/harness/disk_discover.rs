@@ -1850,11 +1850,7 @@ pub(crate) fn platform_service(exe: Option<&Path>) -> bool {
     }
     #[cfg(not(windows))]
     {
-        exe.is_some_and(|p| {
-            ["/System/", "/usr/libexec/", "/usr/sbin/", "/sbin/"]
-                .iter()
-                .any(|root| p.starts_with(root))
-        })
+        aterm_uds::holders::unix_platform_service(exe)
     }
 }
 

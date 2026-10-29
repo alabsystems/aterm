@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Page-backed allocator with memory pooling and lazy zeroing; see [`PageStore`].
+//! Page-backed allocator with memory pooling; see [`PageStore`].
 
 use std::ptr::NonNull;
 
@@ -32,11 +32,10 @@ pub(crate) struct PoolStats {
 pub struct PageStore {
     recycled_cells: Vec<PageSlice<Cell>>,
     pages: Vec<Box<Page>>,
-    free_pages: Vec<(Box<Page>, usize)>,
+    free_pages: Vec<Box<Page>>,
     current_page: usize,
     next_offset: usize,
     stats: PoolStats,
-    page_used_bytes: Vec<usize>,
 }
 
 impl PageStore {
@@ -66,7 +65,7 @@ impl PageStore {
     pub(crate) fn preheat(&mut self, page_count: usize) {
         for _ in 0..page_count {
             let page = Page::new();
-            self.free_pages.push((page, 0));
+            self.free_pages.push(page);
             self.stats.pages_allocated += 1;
             self.stats.pages_free += 1;
         }
@@ -118,36 +117,8 @@ impl PageStore {
         self.free_pages.shrink_to_fit();
     }
 
-    /// Reset the page store, moving all active pages to the free list.
-    #[cfg(test)]
-    pub fn reset(&mut self) {
-        self.recycled_cells.clear();
-        let mut used_bytes_by_page = std::mem::take(&mut self.page_used_bytes);
-        if !self.pages.is_empty() {
-            used_bytes_by_page.push(self.next_offset);
-        }
-        debug_assert_eq!(used_bytes_by_page.len(), self.pages.len());
-
-        while let Some(page) = self.pages.pop() {
-            let used_bytes = used_bytes_by_page.pop().unwrap_or(PAGE_SIZE);
-            self.free_pages.push((page, used_bytes));
-            self.stats.pages_in_use -= 1;
-            self.stats.pages_free += 1;
-        }
-        self.current_page = 0;
-        self.next_offset = 0;
-    }
-
     fn alloc_page(&mut self) -> Box<Page> {
-        if let Some((page, used_bytes)) = self.free_pages.pop() {
-            if used_bytes > 0 {
-                // SAFETY: The page came from the free list, so we have exclusive access and no
-                // PageSlice references its data.
-                unsafe {
-                    let data = &mut *page.data.get();
-                    data[..used_bytes].fill(0);
-                }
-            }
+        if let Some(page) = self.free_pages.pop() {
             self.stats.pages_free -= 1;
             self.stats.reused += 1;
             page
@@ -211,9 +182,6 @@ impl PageStore {
         let mut offset = align_up(self.next_offset, align);
 
         if self.pages.is_empty() || offset + bytes > PAGE_SIZE {
-            if !self.pages.is_empty() {
-                self.page_used_bytes.push(self.next_offset);
-            }
             let page = self.alloc_page();
             self.pages.push(page);
             self.current_page = self.pages.len() - 1;

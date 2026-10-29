@@ -1953,3 +1953,78 @@ fn a_closed_sessions_last_counts_hold_its_tail_until_they_land() {
     tail.land(last.slots[0].at).expect("lands");
     assert!(tail.mirror_complete(), "the tail is whole once they landed");
 }
+
+/// Fix E3 (E2E-3): an escalation the harness raised on a box is that step's on the bus too. A
+/// snapshot taken while it stands names it on the step (`needs=…,escalated.p<n>.need.aterm.meta`),
+/// and a late reader seeded from it drops both needs with the box's close, before any clear, as
+/// the local fold does.
+#[test]
+fn a_step_escalation_crosses_with_its_node_and_ends_with_its_step() {
+    let mut log = Log::new(1);
+    let run = agent_session(&mut log, 0);
+    let turn = log
+        .open(
+            Open::new(Kind::Turn, Src::Screen, Conf::Strong).under(run),
+            at(10),
+        )
+        .expect("a turn");
+    let f = Fields::new().word(Key::Box, "bash").expect("box");
+    let appr = log
+        .open(
+            Open::new(Kind::Approval, Src::Screen, Conf::Strong)
+                .under(turn)
+                .fields(f),
+            at(20),
+        )
+        .expect("an approval");
+    log.open(
+        Open::new(Kind::Tool, Src::Transcript, Conf::Strong)
+            .under(turn)
+            .fields(Fields::new().word(Key::Cls, "shell").expect("cls")),
+        at(20),
+    )
+    .expect("the tool step beside it");
+    log.mark(
+        Mark::new(Kind::Need, Src::Meta, Conf::Strong)
+            .at(appr)
+            .by(Actor::Aterm)
+            .fields(Fields::new().word(Key::Word, "escalated").expect("word")),
+        at(25),
+    )
+    .expect("the escalation");
+    let take = log.bus_copy(64, at(40)).encode(Tier::WireMeta, &alias);
+    let snap = take
+        .slots
+        .iter()
+        .find(|s| s.kind == SlotKind::Snap)
+        .expect("the space's first take snapshots");
+    assert!(
+        snap.body
+            .contains(&format!(",escalated.{appr}.need.aterm.meta")),
+        "{}",
+        snap.body
+    );
+    let mut late = Fold::new(0);
+    assert!(late.seed_snap(&decode_bus(&snap.body).expect("decodes").rec));
+    assert_eq!(late.bus_facts(&same), log.fold().bus_facts(&alias));
+    log.land(take.slots.last().expect("slots").at)
+        .expect("lands");
+    log.close(
+        appr,
+        Close::new(Out::Step(StepOut::Passed), Src::Screen, Conf::Strong).by(Actor::Human),
+        at(50),
+    )
+    .expect("the person answered");
+    let after = log.bus_copy(64, at(60)).encode(Tier::WireMeta, &alias);
+    for s in &after.slots {
+        late.apply(&decode_bus(&s.body).expect("decodes").rec);
+    }
+    assert_eq!(late.bus_facts(&same), log.fold().bus_facts(&alias));
+    assert_eq!(
+        late.state().top_observed_need(),
+        None,
+        "{:?}",
+        late.state().needs
+    );
+    assert!(late.state().needs.iter().all(Option::is_none));
+}

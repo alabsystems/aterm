@@ -70,7 +70,7 @@ fn spawn_is_safe_here(console: Console) -> Result<(), String> {
         ));
     }
     let word = spawn::creation_flags(console, 0, oracle);
-    if shows_a_console_window(word, oracle) {
+    if spawn::shows_a_console_window(word, oracle) {
         return Err(format!(
             "creation_flags({console:?}) is {word:#x} in a process with{} a console: \
              refusing to start a child that would open a visible console",
@@ -78,11 +78,6 @@ fn spawn_is_safe_here(console: Console) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-fn shows_a_console_window(word: u32, has_console: bool) -> bool {
-    word & spawn::CREATE_NEW_CONSOLE != 0
-        || (!has_console && word & (spawn::CREATE_NO_WINDOW | spawn::DETACHED_PROCESS) == 0)
 }
 
 fn with_console(exe: &Path, console: Console) -> Command {

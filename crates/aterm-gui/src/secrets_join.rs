@@ -2,8 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! A configured Mac's secrets vault subscriber, mended at launch
-//! (docs/DESIGN-secrets-2026-10-20.md §7), and an admin Mac's vault server job whose program
-//! is gone (`mend_server`).
+//! (docs/DESIGN-secrets-2026-10-20.md §7), an admin Mac's vault server job whose program
+//! is gone (`mend_server`), and an admin Mac's approver and server held on an aterm that can
+//! no longer read the vault's admin locker, moved onto this one (`mend_held`, §9).
 //!
 //! Joining is System State's Secrets vault row's. On a launch whose setup is finished, or
 //! that runs none, and every [`MEND_EVERY`] after, a configured Mac's subscriber is read off
@@ -450,7 +451,9 @@ pub(crate) fn spawn_mend_lane(headless: bool, config_path: Option<PathBuf>) -> b
             crate::qos::Role::Background,
             move || {
                 let mut before: Option<Settled> = None;
+                let mut failed_moves = Vec::new();
                 loop {
+                    mend_held((reach.wanted)(), &mut failed_moves);
                     mend_server();
                     let settled = mend(&reach);
                     let line = settled.as_ref().map(settled_line);
@@ -504,6 +507,74 @@ fn mend_server() {
             aterm_log::warn!("secrets vault: the server's job could not be repaired: {error}");
         }
     }
+}
+
+/// The vault's server and approver, moved off a held program (an admin's `--program`
+/// snapshot) onto this aterm only where the hold can no longer do what it was for: the held
+/// program cannot read the vault's admin locker this Mac holds, this aterm (a release) does,
+/// and no person pinned the job (`aterm_secrets::client::mend_held`); the subscriber only while
+/// System State's plan keeps the vault in sync (`subscriber`). A job whose mend failed this
+/// launch (`failed`, [`held_pass`]) is not tried again until the next. A move is logged; nothing
+/// is asked or posted.
+#[cfg(target_os = "macos")]
+fn mend_held(subscriber: bool, failed: &mut Vec<aterm_secrets::service::Job>) {
+    use aterm_secrets::client::HeldMend;
+    use aterm_secrets::service::Job;
+    let Ok(paths) = Paths::live() else {
+        return;
+    };
+    let jobs: &[Job] = if subscriber {
+        &[Job::Server, Job::Subscriber]
+    } else {
+        &[Job::Server]
+    };
+    let mut mend = |job| aterm_secrets::client::mend_held(&paths, job).map_err(|e| e.to_string());
+    for (job, mended) in held_pass(jobs, failed, &mut mend) {
+        match mended {
+            Ok(HeldMend::Moved(line)) => aterm_log::info!(
+                "secrets vault: the {} job ran a held aterm that cannot read the vault's admin \
+                 locker; {line}",
+                job.label()
+            ),
+            Ok(HeldMend::NotHeld | HeldMend::Kept(_) | HeldMend::Unread(_)) => {}
+            Err(error) => aterm_log::warn!(
+                "secrets vault: the {} job's held aterm could not be moved onto this one: \
+                 {error}; this launch does not try it again",
+                job.label()
+            ),
+        }
+    }
+}
+
+/// What the window's mend did with one held job (`aterm_secrets::client::mend_held`), or why
+/// it failed.
+#[cfg(unix)]
+type HeldMended = Result<aterm_secrets::client::HeldMend, String>;
+
+/// One pass of [`mend_held`] over `jobs`, `mend` judging and moving one: a job in `failed` is
+/// left as it is, and one whose mend fails joins `failed`, so this launch never tries it again,
+/// as [`mends_again`] ends the subscriber's mend after a failure it would only repeat. A move
+/// that keeps failing (a bootstrap launchd keeps refusing) would otherwise boot the running job
+/// out at every [`MEND_EVERY`], cutting the server's long-polls each time; the next launch tries
+/// it again.
+#[cfg(unix)]
+fn held_pass(
+    jobs: &[aterm_secrets::service::Job],
+    failed: &mut Vec<aterm_secrets::service::Job>,
+    mend: &mut dyn FnMut(aterm_secrets::service::Job) -> HeldMended,
+) -> Vec<(aterm_secrets::service::Job, HeldMended)> {
+    let mut mended = Vec::new();
+    for &job in jobs {
+        if failed.contains(&job) {
+            continue;
+        }
+        let outcome = mend(job);
+        if outcome.is_err() {
+            failed.push(job);
+        }
+        mended.push((job, outcome));
+    }
+    mended
 }
 
 #[cfg(target_os = "macos")]
@@ -929,6 +1000,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A held job whose mend failed is not tried again this launch, so a move that keeps failing
+    /// boots the running job out once, not at every [`MEND_EVERY`]; the other job is still
+    /// mended each pass, and the next launch, whose memory starts empty, tries again.
+    /// NEGATIVE CONTROL: a [`held_pass`] that forgets the failure tries the failing move at
+    /// every pass.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_move_that_failed_is_tried_again_only_on_the_next_launch() {
+        use aterm_secrets::client::HeldMend;
+        use aterm_secrets::service::Job;
+        let jobs = [Job::Server, Job::Subscriber];
+        let mut tried = Vec::new();
+        let mut mend = |job: Job| {
+            tried.push(job);
+            match job {
+                Job::Server => Err("Bootstrap failed: 5: Input/output error".to_string()),
+                Job::Subscriber => Ok(HeldMend::NotHeld),
+            }
+        };
+        let mut failed = Vec::new();
+        let first = held_pass(&jobs, &mut failed, &mut mend);
+        assert_eq!(
+            first,
+            [
+                (
+                    Job::Server,
+                    Err("Bootstrap failed: 5: Input/output error".to_string())
+                ),
+                (Job::Subscriber, Ok(HeldMend::NotHeld)),
+            ]
+        );
+        let second = held_pass(&jobs, &mut failed, &mut mend);
+        assert_eq!(second, [(Job::Subscriber, Ok(HeldMend::NotHeld))]);
+        let mut next_launch = Vec::new();
+        held_pass(&jobs, &mut next_launch, &mut mend);
+        assert_eq!(
+            tried,
+            [
+                Job::Server,
+                Job::Subscriber,
+                Job::Subscriber,
+                Job::Server,
+                Job::Subscriber
+            ]
+        );
     }
 
     #[test]

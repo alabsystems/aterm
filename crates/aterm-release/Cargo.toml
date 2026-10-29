@@ -99,6 +99,10 @@ aterm-verify = { workspace = true }
 # aterm-converge items: one engine with `aterm init`, whose base report it reads back
 # from the installed aterm in the engine's own schema.
 aterm-converge = { workspace = true }
+# The release.site-key row asks the lab for a missing deployer key through the need ledger
+# (docs/DESIGN-credential-requests-2026-10-27.md §12.1). No cycle: aterm-secrets links no
+# release crate.
+aterm-secrets = { workspace = true }
 
 # `ship site` uploads each file of the site as one gzip member around the PNG encoder's
 # deterministic DEFLATE (no clock, name or host in a member), so its SHA-256 names the

@@ -2500,16 +2500,17 @@ mod tests {
         .unwrap_err();
 
         let dir = scratch_for("silent");
-        slice_drives_a_session(
+        let err = slice_drives_a_session(
             bin,
             SliceArch::X86_64,
             Renderer::Cpu,
             &dir,
             &mut |_| aterm_uds::spawnfd::command("/bin/sleep").arg("30").spawn(),
             &mut |_| panic!("no turn without a socket"),
-            std::time::Duration::from_millis(300),
+            std::time::Duration::ZERO,
         )
         .unwrap_err();
+        assert!(err.contains("opened no control socket"), "{err}");
         for name in [
             "pass",
             "refuse",

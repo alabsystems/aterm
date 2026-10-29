@@ -1056,6 +1056,7 @@ fn exact_composed_sample_distinguishes_grid_edges_from_blank_neighbors() {
     let top = focused_composed_cursor_fx_sample(
         session,
         &term,
+        None,
         true,
         v2_owns_frame,
         v2_owns_frame,
@@ -1079,6 +1080,7 @@ fn exact_composed_sample_distinguishes_grid_edges_from_blank_neighbors() {
     let bottom = focused_composed_cursor_fx_sample(
         session,
         &term,
+        None,
         true,
         v2_owns_frame,
         v2_owns_frame,
@@ -1445,6 +1447,7 @@ fn composed_far_witness_never_reads_rows_changed_after_cell_extraction() {
         let sample = focused_composed_cursor_fx_sample(
             session,
             &term_lock(&term),
+            None,
             true,
             app.windows[&wid].fx.cursor().glow.v2_owns_frame(),
             app.windows[&wid].fx.cursor().glow.reads_neighbor_rows(),
@@ -1534,6 +1537,7 @@ fn composed_neighbor_witness_uses_its_captured_change_after_later_pty_output() {
         let sample = focused_composed_cursor_fx_sample(
             session,
             &term_lock(&term),
+            None,
             true,
             app.windows[&wid].fx.cursor().glow.v2_owns_frame(),
             app.windows[&wid].fx.cursor().glow.v2_owns_frame(),
@@ -1579,6 +1583,7 @@ fn composed_witness_generation_model_matches_real_terminal_mutations() {
         let sample = focused_composed_cursor_fx_sample(
             session,
             &term_lock(&term),
+            None,
             true,
             app.windows[&wid].fx.cursor().glow.v2_owns_frame(),
             app.windows[&wid].fx.cursor().glow.v2_owns_frame(),

@@ -324,15 +324,22 @@ pub fn lab_socket_shape(sock: &str) -> bool {
         .is_some_and(|name| !name.is_empty() && !name.contains('/'))
 }
 
-/// A pattern as one whitespace-free wire token: white space and `=` escaped as `\xNN`.
+/// A pattern as one whitespace-free wire token: white space and `=` escaped as `\xNN`, folding a
+/// preceding unescaped `\` into the hex escape so `r"\ "` and `r"\="` keep their regex meaning.
 #[must_use]
 pub fn wire_pattern(pattern: &str) -> String {
     let mut out = String::with_capacity(pattern.len());
+    let mut escaped = false;
     for c in pattern.chars() {
         if c.is_ascii_whitespace() || c == '=' {
+            if escaped {
+                out.pop();
+            }
             out.push_str(&format!("\\x{:02x}", c as u32));
+            escaped = false;
         } else {
             out.push(c);
+            escaped = c == '\\' && !escaped;
         }
     }
     out
@@ -361,5 +368,23 @@ mod tests {
         );
         assert_eq!(wire_pattern("level=attention"), "level\\x3dattention");
         assert!(!wire_pattern("a b\tc").contains(char::is_whitespace));
+        assert_eq!(wire_pattern(r"a\ b\=c"), r"a\x20b\x3dc");
+        assert_eq!(wire_pattern(r"a\\ b\\\=c"), r"a\\\x20b\\\x3dc");
+        for (pat, sample, non_sample) in [
+            (r"a\ b", "a b", r"a\x20b"),
+            (r"a\\ b", r"a\ b", "a b"),
+            (r"[\ =]+", " = ", r"\x"),
+        ] {
+            let orig = aterm_regex::Regex::new(pat).unwrap();
+            let wired = aterm_regex::Regex::new(&wire_pattern(pat)).unwrap();
+            assert_eq!(orig.is_match(sample), wired.is_match(sample), "{pat}");
+            assert!(wired.is_match(sample), "{pat}");
+            assert_eq!(
+                orig.is_match(non_sample),
+                wired.is_match(non_sample),
+                "{pat}"
+            );
+            assert!(!wired.is_match(non_sample), "{pat}");
+        }
     }
 }

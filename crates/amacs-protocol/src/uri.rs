@@ -109,13 +109,14 @@ const fn nibble(byte: u8) -> Option<u8> {
 
 /// The `file://` URI of an absolute path, percent-encoded as a single whitespace-free wire token.
 pub fn path_to_file_uri(path: &Path) -> Result<String, UriError> {
-    let path = path.to_str().ok_or(UriError::InvalidEncoding)?;
+    let raw = path.to_str().ok_or(UriError::InvalidEncoding)?;
+    if raw.contains('\0') {
+        return Err(UriError::Malformed);
+    }
     let mut normalized = if cfg!(windows) {
-        path.strip_prefix(r"\\?\")
-            .unwrap_or(path)
-            .replace('\\', "/")
+        raw.strip_prefix(r"\\?\").unwrap_or(raw).replace('\\', "/")
     } else {
-        path.to_string()
+        raw.to_string()
     };
     if cfg!(windows)
         && (normalized.starts_with("//")
@@ -125,8 +126,15 @@ pub fn path_to_file_uri(path: &Path) -> Result<String, UriError> {
     {
         return Err(UriError::RemoteAuthority);
     }
+    if !path.is_absolute() {
+        return Err(UriError::NotAbsolute);
+    }
     if cfg!(windows) && !normalized.starts_with('/') {
         normalized.insert(0, '/');
+    }
+    #[cfg(windows)]
+    if !Path::new(&windows_drive_path_text(&normalized)?).is_absolute() {
+        return Err(UriError::NotAbsolute);
     }
     let mut uri = String::from("file://");
     for byte in normalized.bytes() {
@@ -278,6 +286,14 @@ mod tests {
         assert_eq!(
             file_uri_to_path("file:///tmp/%FF"),
             Err(UriError::InvalidEncoding)
+        );
+        assert_eq!(
+            path_to_file_uri(Path::new("relative/path.txt")),
+            Err(UriError::NotAbsolute)
+        );
+        assert_eq!(
+            path_to_file_uri(Path::new("/tmp/bad\0path")),
+            Err(UriError::Malformed)
         );
     }
 

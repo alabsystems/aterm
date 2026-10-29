@@ -1,0 +1,12 @@
+# claude-code 2.1.312 · MEASURED 2026-10-27, `aterm ctl text` of aterm's jailed real-Claude lab (100x50, aterm 0.145.0 dev build e725d40263, Autopilot Cruise) running the real Claude Code 2.1.312 against a stub API: two bar-off startup-announcement entries and nothing else: only the higher-priority entry shows, with no hidden-count row (a second entry is not a second notice); cachedGrowthBookFeatures.tengu_startup_announcements = [{id lab-two-hi, title, text, priority 100, accentBar false}, {id lab-two-lo, text, priority 1, accentBar false}]
+ ▐▛███▛█   Claude Code v2.1.312
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.AyU2/proj
+
+  Lab news title
+  The higher-priority entry, bar off.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                           ◐ medium · /effort

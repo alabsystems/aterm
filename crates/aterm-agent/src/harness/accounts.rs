@@ -88,8 +88,9 @@ pub const WORD_MAX: usize = 64;
 pub const WHY_MAX: usize = 200;
 
 /// The longest record of the routes an automatic sign-in tried ([`SignInAttempt::routes`]), in
-/// bytes: room for every route's words at their longest, so none is cut off.
-pub const ROUTES_MAX: usize = 400;
+/// bytes: room for every route's words at their longest (the mailbox's masked login among
+/// them), so none is cut off.
+pub const ROUTES_MAX: usize = 432;
 
 /// The longest reason a ledger row carries, in bytes: a [`Kind::SignIn`] row's `auto <outcome>:`
 /// and its [`ROUTES_MAX`] of routes ([`note_sign_in_attempt`]), every other row's [`WHY_MAX`].
@@ -223,6 +224,49 @@ pub const LOCK_LADDER: [std::time::Duration; 9] = {
 /// [`Recorded::lock_held`]).
 pub const LOCK_HELD: &str = "the accounts lock is held";
 
+#[cfg(test)]
+thread_local! {
+    static TEST_LADDER: std::cell::Cell<Option<&'static [std::time::Duration]>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The ladder [`Store::at`] and [`Store::at_for`] give a store: [`LOCK_LADDER`], or the one a
+/// test set on this thread ([`with_store_ladder`]).
+fn store_ladder() -> &'static [std::time::Duration] {
+    #[cfg(test)]
+    {
+        // A test takes its file system place as it opens a store, before it can hold the
+        // store's lock: a wait for a place under that lock would hold up each of the test's
+        // threads that takes it.
+        aterm_spec::fs_lane::join();
+        if let Some(ladder) = TEST_LADDER.get() {
+            return ladder;
+        }
+    }
+    &LOCK_LADDER
+}
+
+/// `f` with every store this thread opens by path ([`Store::at`], [`Store::at_for`]) bounded
+/// by `ladder` ([`Store::bounded_by`]), for a verb that opens its own store from an `Env`: at a
+/// take on the store's own ladder ([`Store::acquire_bounded`], [`Store::signin_within`],
+/// [`Store::recover_records`], [`Store::recover_state_records`], a renewal admission),
+/// a lock its test holds throughout is refused at once, not after the ladder's pauses. A take
+/// that names [`LOCK_LADDER`] itself still waits that ladder out.
+#[cfg(test)]
+pub(crate) fn with_store_ladder<T>(
+    ladder: &'static [std::time::Duration],
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<&'static [std::time::Duration]>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_LADDER.set(self.0);
+        }
+    }
+    let _restore = Restore(TEST_LADDER.replace(Some(ladder)));
+    f()
+}
+
 /// The window name a candidate that failed with no wall of its own is struck under
 /// ([`Strike::Failed`]).
 pub const STRUCK_WINDOW: &str = "struck";
@@ -322,6 +366,10 @@ pub struct Row {
     pub was: Vec<Option<String>>,
     /// Its vendor keys ([`RowKeys`]): none on a Claude Code row.
     pub vendor: Vendor,
+    /// When `ai-pool.toml` no longer names this Mac in the account's warm set, the current holder
+    /// (`"m22"` or `"pool"`). Non-warm rows stay in `accounts.toml` (`01e7d42708`) and stop being
+    /// candidates or sign-in targets until warmed here again (`DESIGN-alab-swarm` §6.5, C14).
+    pub held_by: Option<String>,
 }
 
 /// A roster row's vendor keys, each admitted only by the CLI that takes it ([`RowKeys`],
@@ -687,13 +735,15 @@ fn row_of(cli: Cli, item: &aterm_toml::Value, n: usize) -> Result<Row, String> {
         RowKeys::Flow(_) => Some("flow"),
     };
     if let Some(key) = table.keys().find(|k| {
-        !matches!(k.as_str(), "label" | "class" | "dir" | "email" | "browser")
-            && !(matches!(cli, Cli::Claude | Cli::Codex) && k.as_str() == "identity_email")
+        !matches!(
+            k.as_str(),
+            "label" | "class" | "dir" | "email" | "browser" | "held_by"
+        ) && !(matches!(cli, Cli::Claude | Cli::Codex) && k.as_str() == "identity_email")
             && Some(k.as_str()) != vendor_key
     }) {
         let holds = vendor_key.map_or_else(
-            || "email and browser".to_owned(),
-            |key| format!("email, browser and {key}"),
+            || "email, browser and held_by".to_owned(),
+            |key| format!("email, browser, held_by and {key}"),
         );
         let holds = if matches!(cli, Cli::Claude | Cli::Codex) {
             format!("{holds}, and identity_email")
@@ -785,6 +835,21 @@ fn row_of(cli: Cli, item: &aterm_toml::Value, n: usize) -> Result<Row, String> {
             ));
         }
     };
+    let held_by = match table.get("held_by") {
+        None => None,
+        Some(aterm_toml::Value::String(holder)) => {
+            if let Some(why) = label_refusal(holder) {
+                return Err(format!("{file}: row `{label}`: its held_by {why}"));
+            }
+            Some(holder.clone())
+        }
+        Some(other) => {
+            return Err(format!(
+                "{file}: row `{label}`: its held_by is a TOML {}, not a string",
+                other.type_str()
+            ));
+        }
+    };
     let word = |key: &str| match table.get(key) {
         None => Ok(None),
         Some(aterm_toml::Value::String(word)) => Ok(Some(word.as_str())),
@@ -839,6 +904,7 @@ fn row_of(cli: Cli, item: &aterm_toml::Value, n: usize) -> Result<Row, String> {
         browser,
         was: Vec::new(),
         vendor,
+        held_by,
     })
 }
 
@@ -881,21 +947,13 @@ fn row_refusal(row: &Row) -> Option<String> {
     if let Some(why) = row.identity_email.as_deref().and_then(email_refusal) {
         return Some(format!("row `{label}`: its identity_email {why}"));
     }
+    if let Some(why) = row.held_by.as_deref().and_then(label_refusal) {
+        return Some(format!("row `{label}`: its held_by {why}"));
+    }
     row.browser
         .as_deref()
         .and_then(browser_refusal)
         .map(|why| format!("row `{label}`: its browser {why}"))
-}
-
-/// Formats a single `[[account]]` TOML table, or `None` if `label` or `dir` is invalid.
-#[must_use]
-pub fn row_toml(label: &str, class: Class, dir: Option<&str>) -> Option<String> {
-    row_text(&Row {
-        label: label.to_owned(),
-        class,
-        dir: dir.map(str::to_owned),
-        ..Row::default()
-    })
 }
 
 /// Formats a complete [`Row`] (including login and identity emails) as an `[[account]]` TOML block.
@@ -918,6 +976,7 @@ pub fn row_text(row: &Row) -> Option<String> {
     put("email", row.email.as_deref());
     put("identity_email", row.identity_email.as_deref());
     put("browser", row.browser.as_deref());
+    put("held_by", row.held_by.as_deref());
     put("region", row.vendor.region.map(Region::as_str));
     put("flow", row.vendor.flow.map(Flow::as_str));
     Some(out)
@@ -965,6 +1024,12 @@ fn row_inline_of(row: &Row) -> Option<String> {
         out.push_str(&format!(
             ", browser = {}",
             aterm_toml::Value::from(browser.as_str())
+        ));
+    }
+    if let Some(held_by) = &row.held_by {
+        out.push_str(&format!(
+            ", held_by = {}",
+            aterm_toml::Value::from(held_by.as_str())
         ));
     }
     for (key, word) in [
@@ -1088,6 +1153,32 @@ pub fn enrolled_for(cli: Cli, roster: &Roster) -> BTreeSet<String> {
         .collect()
 }
 
+/// [`enrolled_for`] on the machine whose user home is `home`: a row of a CLI other than Claude
+/// Code with no directory of its own is the CLI's default login, enrolled only while the CLI's
+/// default home there holds its login file ([`default_login_made`]), as `aterm ai` reports it
+/// (`ai::facts`). Claude Code's default login is enrolled as [`enrolled`] says.
+#[must_use]
+pub fn enrolled_in(cli: Cli, roster: &Roster, home: &Path) -> BTreeSet<String> {
+    let mut enrolled = enrolled_for(cli, roster);
+    if cli != Cli::Claude && !default_login_made(cli, home) {
+        for row in roster.rows.iter().filter(|row| row.dir.is_none()) {
+            enrolled.remove(&row.label);
+        }
+    }
+    enrolled
+}
+
+/// Whether `cli`'s default home under the user home `home` holds the file the CLI keeps its
+/// login in ([`crate::ai::connector::Connector::stores`]).
+#[must_use]
+pub fn default_login_made(cli: Cli, home: &Path) -> bool {
+    let dir = home.join(cli.accounts().default_home);
+    cli.connector()
+        .stores
+        .iter()
+        .any(|file| dir.join(file).is_file())
+}
+
 /// Returns whether `dir` is a non-empty directory containing an initialized login.
 #[must_use]
 pub fn login_made(dir: &Path) -> bool {
@@ -1095,8 +1186,10 @@ pub fn login_made(dir: &Path) -> bool {
         .is_ok_and(|mut entries| entries.next().is_some_and(|entry| entry.is_ok()))
 }
 
+/// Whether `row`'s login is here: the enrolled set is the one answer, a default-home row
+/// included ([`enrolled`] and [`enrolled_for`] hold it; [`enrolled_in`] drops a missing one).
 fn is_enrolled(row: &Row, enrolled: &BTreeSet<String>) -> bool {
-    row.dir.is_none() || enrolled.contains(&row.label)
+    enrolled.contains(&row.label)
 }
 
 /// Recovers and reads the bound [`Roster`] used to attribute usage-tap readings at `now`.
@@ -1199,12 +1292,16 @@ pub struct ProcessLogin {
     pub stored_login: bool,
 }
 
-fn names_another_login(name: &str) -> bool {
-    use super::netwatch::{ROUTE_KEYS, ROUTE_PREFIXES};
+/// Whether a set variable `name = value` moves a Claude Code process off its stored login: a
+/// credential, profile or route variable ([`CREDENTIAL_KEYS`], [`PROFILE_KEYS`],
+/// [`super::netwatch::ROUTE_KEYS`] and its prefixes), whatever its value, but the lab stub's
+/// route its development seam admits ([`super::netwatch::lab_route`]; never in a shipped binary).
+fn names_another_login(name: &str, value: &str) -> bool {
+    use super::netwatch::{ROUTE_KEYS, ROUTE_PREFIXES, lab_route};
     CREDENTIAL_KEYS.contains(&name)
         || PROFILE_KEYS.contains(&name)
-        || ROUTE_KEYS.contains(&name)
-        || ROUTE_PREFIXES.iter().any(|p| name.starts_with(p))
+        || ((ROUTE_KEYS.contains(&name) || ROUTE_PREFIXES.iter().any(|p| name.starts_with(p)))
+            && !lab_route(name, value))
 }
 
 /// Returns the vendor profile store's `configs` directory for a process with environment `env`.
@@ -1265,7 +1362,11 @@ fn login_file_dir<'a>(value: &'a str, file: &str) -> Option<&'a Path> {
 }
 
 impl ProcessLogin {
-    /// Extracts [`ProcessLogin`] facts from `(name, value)` environment pairs.
+    /// Extracts [`ProcessLogin`] facts from `(name, value)` environment pairs: its login is the
+    /// first [`LOGIN_ENV`], its home the default without a non-empty [`HOME_ENV`], and it runs
+    /// on its stored login unless [`LOGIN_ENV`] is given twice differently or a credential,
+    /// profile or route variable is set non-empty, the lab stub's route its development seam
+    /// admits apart ([`super::netwatch::LAB_ROUTE_SEAM`]; never in a shipped binary).
     #[must_use]
     pub fn of_env<'a>(env: impl IntoIterator<Item = (&'a str, &'a str)>) -> ProcessLogin {
         let mut login: Option<&str> = None;
@@ -1288,7 +1389,7 @@ impl ProcessLogin {
             if name == HOME_ENV {
                 out.default_home = false;
             }
-            if names_another_login(name) {
+            if names_another_login(name, value) {
                 out.stored_login = false;
             }
         }
@@ -1392,7 +1493,10 @@ impl ProcessLogin {
             .then(|| ProcessLogin::of_env(env.iter().filter_map(|kv| kv.split_once('='))))
     }
 
-    /// Attaches settings-file credential overrides discovered for the process.
+    /// Attaches settings-file credential overrides discovered for the process: an unreadable or
+    /// unparseable document, an `apiKeyHelper`, or an `env` block naming [`LOGIN_ENV`] or setting
+    /// [`HOME_ENV`] or a credential, profile or route variable non-empty (the lab stub's route
+    /// its development seam admits apart, as in [`ProcessLogin::of_env`]) means no stored login.
     #[must_use]
     pub fn with_settings(mut self, settings: &[(String, super::netwatch::Source)]) -> ProcessLogin {
         use super::netwatch::{Source, settings_of};
@@ -1404,7 +1508,7 @@ impl ProcessLogin {
                     || read.env.iter().any(|(name, value)| {
                         name == LOGIN_ENV
                             || (!value.is_empty()
-                                && (name == HOME_ENV || names_another_login(name)))
+                                && (name == HOME_ENV || names_another_login(name, value)))
                     })
             }),
         };
@@ -1866,16 +1970,21 @@ impl SignInAction {
         }
     }
 
-    /// The next step for this action on `label` in `cli`'s pool.
+    /// The next step for this action on `label` in `cli`'s pool: a browser profile signed in
+    /// once is a step only where a renewal can then approve the page in it
+    /// ([`Cli::renews_headlessly`]), so a task of one stored for a CLI whose renewals stop for a
+    /// person names its sign-in on a terminal ([`Cli::sign_in_verb`]).
     #[must_use]
     pub fn next_step(self, cli: Cli, label: &str) -> String {
         let id = cli.id();
         match self {
-            Self::Browser => format!(
+            Self::Browser if cli.renews_headlessly() => format!(
                 "Run aterm harness accounts browser {label} --cli {id}, then aterm harness \
                  accounts renew {label} --cli {id}"
             ),
-            Self::Login => format!("Run aterm harness accounts login {label} --cli {id}"),
+            Self::Browser | Self::Login => {
+                format!("Run aterm harness accounts login {label} --cli {id}")
+            }
         }
     }
 }
@@ -2465,7 +2574,7 @@ pub fn renew_due(
     roster
         .rows
         .iter()
-        .filter(|row| row.email.is_some() && is_enrolled(row, enrolled))
+        .filter(|row| row.held_by.is_none() && row.email.is_some() && is_enrolled(row, enrolled))
         .filter(|row| {
             matches!(
                 login_state(row, logins, state, now),
@@ -2490,7 +2599,7 @@ pub fn none_working_within(
     let mut rows = roster
         .rows
         .iter()
-        .filter(|row| row.email.is_some() && is_enrolled(row, enrolled))
+        .filter(|row| row.held_by.is_none() && row.email.is_some() && is_enrolled(row, enrolled))
         .peekable();
     rows.peek().is_some()
         && rows.all(|row| match login_state(row, logins, state, now) {
@@ -2508,7 +2617,9 @@ pub fn wrong_accounts(roster: &Roster, logins: &Logins) -> Vec<String> {
     roster
         .rows
         .iter()
-        .filter(|row| logins.get(&row.label).is_some_and(|b| b.wrong_at.is_some()))
+        .filter(|row| {
+            row.held_by.is_none() && logins.get(&row.label).is_some_and(|b| b.wrong_at.is_some())
+        })
         .map(|row| row.label.clone())
         .collect()
 }
@@ -2769,8 +2880,9 @@ pub fn note_wrong_account(logins: &mut Logins, label: &str, at: i64) -> Vec<Even
 /// Records at `at` that the vendor's own sign-in on the default login replaced `label`'s account
 /// there with `now_default`'s, so `label` has no login on this machine: its auth word is signed
 /// out, a pin on it ends ([`Kind::Unpin`]), its binding's `served_at` (turns served under a login
-/// it no longer holds) is cleared, and one [`Kind::Displaced`] event says so. A later auth word
-/// already on record is kept.
+/// it no longer holds) is cleared, `active` where it named `label` names `now_default`
+/// ([`repoint_active`]), and one [`Kind::Displaced`] event says so. A later auth word already on
+/// record is kept.
 pub fn note_displaced(
     state: &mut State,
     logins: &mut Logins,
@@ -2790,9 +2902,78 @@ pub fn note_displaced(
             .with_to(now_default)
             .because(&format!("default login now {now_default}")),
     ];
-    end_pin(state, label, "displaced", at, &mut out);
+    out.extend(repoint_active(state, label, now_default, at));
     if let Some(binding) = logins.labels.get_mut(label) {
         binding.served_at = None;
+    }
+    out
+}
+
+/// The default login moved from `was` to `now` at `at`: where `active` (the one account this home
+/// runs on) named `was`, a pin on it ends ([`Kind::Unpin`], `displaced`) and it names `now`,
+/// proven, with no canary and no rotation left to go back from ([`Undo`]): no rotation chose it
+/// (the vendor's sign-in did, on the login the home's sessions already run on), so there is no
+/// canary for any session to answer, and an unproven `active` would hold its own tab's move ahead
+/// of a wall ([`StayWhy::Canary`]) with nothing ever to prove it. `previous` where it named
+/// `now`, which is `active` itself now, is cleared. Any other `active` is left as it is.
+pub fn repoint_active(state: &mut State, was: &str, now: &str, at: i64) -> Vec<Event> {
+    let mut out = Vec::new();
+    if was == now || state.active.as_deref() != Some(was) {
+        return out;
+    }
+    end_pin(state, was, "displaced", at, &mut out);
+    state.active = Some(now.to_owned());
+    state.proven = true;
+    state.canary = None;
+    state.undo.clear();
+    if state.previous.as_deref() == Some(now) {
+        state.previous = None;
+        state.previous_proven = false;
+    }
+    out
+}
+
+/// The sessions on record under `was`, each of which ran on the default login, are `label`'s
+/// at `at`: the default login holds `label`'s account now. `active`, where it named `was`,
+/// follows them ([`repoint_active`]).
+pub fn move_default_sessions(state: &mut State, label: &str, was: &str, at: i64) -> Vec<Event> {
+    if was == label {
+        return Vec::new();
+    }
+    for session in state.sessions.values_mut() {
+        if session.account == was {
+            label.clone_into(&mut session.account);
+        }
+    }
+    repoint_active(state, was, label, at)
+}
+
+/// Records at `at` that the vendor's own sign-in just made `label`'s login the machine's default
+/// login (the default login newly names its row, the row `was` held it before): that login is
+/// new, so `label`'s auth word is Ok and its binding served at `at`, with what its earlier login
+/// left on record cleared (the end it was seen to meet, the vendor's expiry notice, a renewal's
+/// remaining human step and a failed automatic sign-in), and every session on record under
+/// `was` (each ran on the default login, which `label` holds now) is `label`'s, `active` with
+/// them ([`move_default_sessions`]). A later auth word already on record is kept, as
+/// [`note_auth`] keeps it. A row whose default login merely still matches is not this: its login
+/// was not made now, and a sign-out on record stands.
+pub fn note_default_login_made(
+    state: &mut State,
+    logins: &mut Logins,
+    label: &str,
+    was: Option<&str>,
+    at: i64,
+) -> Vec<Event> {
+    let mut out = note_auth(state, label, Auth::Ok, at);
+    if let Some(binding) = logins.entry(label) {
+        binding.served_at = Some(binding.served_at.map_or(at, |held| held.max(at)));
+        binding.ended_at = None;
+        binding.notice_end = None;
+        binding.sign_in_task = None;
+        binding.clear_failed_sign_in();
+    }
+    if let Some(was) = was {
+        out.extend(move_default_sessions(state, label, was, at));
     }
     out
 }
@@ -2832,6 +3013,12 @@ pub fn move_account(
     }
     if let Some(record) = state.accounts.remove(from) {
         state.accounts.insert(to.to_owned(), record);
+    }
+    if let Some(lease) = state.leases.remove(from) {
+        state.leases.insert(to.to_owned(), lease);
+    }
+    if state.home_accounts.remove(from) {
+        state.home_accounts.insert(to.to_owned());
     }
     if let Some(binding) = logins.labels.remove(from) {
         logins.labels.insert(to.to_owned(), binding);
@@ -2896,6 +3083,8 @@ fn label_is_retained(state: &State, logins: &Logins, label: &str) -> bool {
 /// The login directory the label is bound to is kept: what it holds is checked where it is run.
 pub fn forget_account(state: &mut State, logins: &mut Logins, label: &str) {
     state.accounts.remove(label);
+    state.leases.remove(label);
+    state.home_accounts.remove(label);
     if let Some(binding) = logins.labels.get_mut(label) {
         binding.served_at = None;
     }
@@ -3599,6 +3788,19 @@ impl PinRequest {
     }
 }
 
+/// The Mac that holds a roster account, as the account claims settle it
+/// (`docs/DESIGN-fluid-swarm-2026-10-28.md` F19, `claims::settle`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountLease {
+    /// The holder's `m<N>` label, this Mac's own label or machine id for its own claim, or
+    /// `claim:<machine>` for another Mac with no label of its own.
+    pub holder: String,
+    /// When the holder's claim lapses (Unix seconds).
+    pub until: i64,
+    /// When the holder's uninterrupted claim began (Unix seconds), which ranks it.
+    pub at: i64,
+}
+
 /// Persisted accounts state (`state.json`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct State {
@@ -3633,6 +3835,23 @@ pub struct State {
     pub probe: Option<ProbeClaim>,
     /// Machine-local: the reset's claim.
     pub reset: Option<ResetClaim>,
+    /// Who holds each account, by label, as the account claims settle it
+    /// (`docs/DESIGN-fluid-swarm-2026-10-28.md` F19, `claims::settle`).
+    pub leases: BTreeMap<String, AccountLease>,
+    /// Account labels for which this Mac is the home Mac (`warm[0]` in `ai-pool.toml`).
+    pub home_accounts: BTreeSet<String>,
+    /// Canonical `m<N>` swarm label resolved for this Mac, when known.
+    pub swarm_label: Option<String>,
+    /// Legacy `m<N>` aliases resolved for this Mac from `aterm-swarm-roster`.
+    pub swarm_aliases: Vec<String>,
+    /// Machine-local: true while this Mac cannot record its account claims (no Commons writer, the
+    /// claims table full or unreadable; `docs/DESIGN-fluid-swarm-2026-10-28.md` F19): it keeps to
+    /// its home accounts and the claims it holds.
+    pub unrecorded: bool,
+    /// Machine-local: when this Mac last claimed each account, by label (a launch, or a running
+    /// session's usage tap), within `claims::IDLE_S`: its use, which keeps its claim
+    /// (`claims::in_use`).
+    pub claimed_at: BTreeMap<String, i64>,
 }
 
 impl Default for State {
@@ -3653,6 +3872,12 @@ impl Default for State {
             rotations: Vec::new(),
             probe: None,
             reset: None,
+            leases: BTreeMap::new(),
+            home_accounts: BTreeSet::new(),
+            swarm_label: None,
+            swarm_aliases: Vec::new(),
+            unrecorded: false,
+            claimed_at: BTreeMap::new(),
         }
     }
 }
@@ -4101,6 +4326,62 @@ impl State {
                 Value::Object(m)
             }),
         );
+        if !self.leases.is_empty() {
+            o.insert(
+                "leases".to_owned(),
+                Value::Object(
+                    self.leases
+                        .iter()
+                        .map(|(label, lease)| {
+                            let mut m = Map::new();
+                            m.insert("holder".to_owned(), Value::from(lease.holder.as_str()));
+                            m.insert("until".to_owned(), Value::from(lease.until));
+                            m.insert("at".to_owned(), Value::from(lease.at));
+                            (label.clone(), Value::Object(m))
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        if !self.home_accounts.is_empty() {
+            o.insert(
+                "home_accounts".to_owned(),
+                Value::Array(
+                    self.home_accounts
+                        .iter()
+                        .map(|l| Value::from(l.as_str()))
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(swarm_label) = &self.swarm_label {
+            o.insert("swarm_label".to_owned(), Value::from(swarm_label.as_str()));
+        }
+        if !self.swarm_aliases.is_empty() {
+            o.insert(
+                "swarm_aliases".to_owned(),
+                Value::Array(
+                    self.swarm_aliases
+                        .iter()
+                        .map(|a| Value::from(a.as_str()))
+                        .collect(),
+                ),
+            );
+        }
+        if self.unrecorded {
+            o.insert("claims_unrecorded".to_owned(), Value::from(true));
+        }
+        if !self.claimed_at.is_empty() {
+            o.insert(
+                "claimed_at".to_owned(),
+                Value::Object(
+                    self.claimed_at
+                        .iter()
+                        .map(|(label, at)| (label.clone(), Value::from(*at)))
+                        .collect(),
+                ),
+            );
+        }
         aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| String::from("{}"))
     }
 
@@ -4193,6 +4474,58 @@ impl State {
             .collect();
         let extra = undo.len().saturating_sub(MAX_UNDO);
         undo.drain(..extra);
+        let leases: BTreeMap<String, AccountLease> = doc
+            .get("leases")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter(|(k, v)| admissible_label(k) && v.is_object())
+            .take(MAX_ACCOUNTS)
+            .filter_map(|(k, v)| {
+                Some((
+                    k.clone(),
+                    AccountLease {
+                        holder: word(v.get("holder"), WORD_MAX)?,
+                        until: int(v.get("until"))?,
+                        at: int(v.get("at"))?,
+                    },
+                ))
+            })
+            .collect();
+        let home_accounts: BTreeSet<String> = doc
+            .get("home_accounts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|s| admissible_label(s))
+            .take(MAX_ACCOUNTS)
+            .map(str::to_owned)
+            .collect();
+        let swarm_label = word(doc.get("swarm_label"), WORD_MAX);
+        let mut swarm_aliases: Vec<String> = doc
+            .get("swarm_aliases")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| word(Some(v), WORD_MAX))
+            .take(MAX_ACCOUNTS)
+            .collect();
+        swarm_aliases.sort();
+        swarm_aliases.dedup();
+        let unrecorded = doc
+            .get("claims_unrecorded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let claimed_at: BTreeMap<String, i64> = doc
+            .get("claimed_at")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter(|(label, _)| admissible_label(label))
+            .filter_map(|(label, at)| Some((label.clone(), at.as_i64()?)))
+            .take(MAX_ACCOUNTS)
+            .collect();
         Ok(State {
             schema: SCHEMA,
             machine: doc
@@ -4224,7 +4557,85 @@ impl State {
             rotations,
             probe,
             reset,
+            leases,
+            home_accounts,
+            swarm_label,
+            swarm_aliases,
+            unrecorded,
+            claimed_at,
         })
+    }
+
+    /// True when `candidate` names this Mac's swarm label, one of its roster aliases, or its
+    /// local store `machine` id.
+    #[must_use]
+    pub fn owns_swarm_label(&self, candidate: &str) -> bool {
+        let trimmed = candidate.trim_ascii();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if !self.machine.is_empty() && trimmed == self.machine {
+            return true;
+        }
+        if let Some((_, canon)) = super::ai_pool::leading_m_label(trimmed) {
+            if self.swarm_label.as_deref() == Some(canon.as_str()) {
+                return true;
+            }
+            if self.swarm_aliases.iter().any(|a| a == &canon) {
+                return true;
+            }
+        }
+        self.swarm_label
+            .as_deref()
+            .is_some_and(|lbl| trimmed.eq_ignore_ascii_case(lbl))
+            || self
+                .swarm_aliases
+                .iter()
+                .any(|a| trimmed.eq_ignore_ascii_case(a))
+    }
+
+    /// Evaluates whether this Mac may use `label` at `now`, as the account claims settle it
+    /// (`docs/DESIGN-fluid-swarm-2026-10-28.md` F19).
+    ///
+    /// # Errors
+    ///
+    /// - [`WhyNot::LeasedElsewhere`] when another Mac's live claim on `label` is the senior one.
+    /// - [`WhyNot::Unclaimed`] when this Mac cannot record its claims (`self.unrecorded`) and
+    ///   neither holds a live claim on `label` nor is `label`'s home Mac (`warm[0]`).
+    pub fn lease_verdict(&self, label: &str, now: i64) -> Result<(), WhyNot> {
+        if let Some(lease) = self.leases.get(label)
+            && lease.until > now
+        {
+            return if self.owns_swarm_label(&lease.holder) {
+                Ok(())
+            } else {
+                Err(WhyNot::LeasedElsewhere { until: lease.until })
+            };
+        }
+        if self.unrecorded && !self.home_accounts.contains(label) {
+            return Err(WhyNot::Unclaimed);
+        }
+        Ok(())
+    }
+
+    /// Records or renews a lease on `label` held by `holder` until `until`.
+    pub fn note_lease(&mut self, label: &str, holder: &str, until: i64, at: i64) {
+        if !admissible_label(label) || holder.trim_ascii().is_empty() {
+            return;
+        }
+        self.leases.insert(
+            label.to_owned(),
+            AccountLease {
+                holder: holder.trim_ascii().to_owned(),
+                until,
+                at,
+            },
+        );
+    }
+
+    /// Removes any recorded lease for `label`.
+    pub fn clear_lease(&mut self, label: &str) {
+        self.leases.remove(label);
     }
 
     /// Returns the [`Account`] record for `label`, or a default empty record if unseen.
@@ -4588,7 +4999,9 @@ pub enum Advice {
         /// for [`CANARY_HOLD_S`] ([`take_canary`]).
         takes_canary: bool,
     },
-    /// No account is usable before this instant.
+    /// No account is usable before this instant: at a wall, the session's own is walled; at a
+    /// turn end, another Mac's senior live claim holds it (`docs/DESIGN-fluid-swarm-2026-10-28.md`
+    /// F19), and the turn end holds rather than go on using it.
     Wait {
         /// When to decide again.
         until: i64,
@@ -4642,6 +5055,8 @@ impl Rank {
 pub enum WhyNot {
     /// It is the session's own account.
     Me,
+    /// Assigned only to other Macs' warm sets in `ai-pool.toml` (`Row::held_by`).
+    HeldElsewhere,
     /// No login was made for it on this machine ([`login_made`]).
     NotEnrolled,
     /// Its login is known signed out.
@@ -4651,6 +5066,14 @@ pub enum WhyNot {
         /// Until this instant.
         until: i64,
     },
+    /// Another Mac's live claim on this account is the senior one
+    /// (`docs/DESIGN-fluid-swarm-2026-10-28.md` F19).
+    LeasedElsewhere {
+        /// When that claim lapses.
+        until: i64,
+    },
+    /// This Mac cannot record a claim, holds none on this account, and is not its home Mac.
+    Unclaimed,
     /// `low`, and the point is not a wall.
     LowAheadOfAWall,
     /// `low`, and an account becomes usable within [`LOW_ONLY_AFTER_S`].
@@ -4666,9 +5089,12 @@ impl WhyNot {
     pub const fn as_str(self) -> &'static str {
         match self {
             WhyNot::Me => "this session's own",
+            WhyNot::HeldElsewhere => "held-elsewhere",
             WhyNot::NotEnrolled => "not-enrolled",
             WhyNot::SignedOut => "signed-out",
             WhyNot::Limited { .. } => "limited",
+            WhyNot::LeasedElsewhere { .. } => "leased-elsewhere",
+            WhyNot::Unclaimed => "unclaimed",
             WhyNot::LowAheadOfAWall => "low: used only at a wall",
             WhyNot::LowWhileOneIsNear { .. } => "low: an account is usable within 15 minutes",
         }
@@ -4684,6 +5110,18 @@ fn usable_at(row: &Row, state: &State, cond: Condition, now: i64) -> Option<i64>
             .get(&row.label)
             .and_then(|a| a.low_until(now)),
         Condition::SignedOut | Condition::NotEnrolled => None,
+    }
+}
+
+fn effective_usable_at(row: &Row, state: &State, cond: Condition, now: i64) -> Option<i64> {
+    if row.held_by.is_some() {
+        return None;
+    }
+    let base = usable_at(row, state, cond, now)?;
+    match state.lease_verdict(&row.label, now) {
+        Ok(()) => Some(base),
+        Err(WhyNot::LeasedElsewhere { until }) => Some(base.max(until)),
+        Err(_) => None,
     }
 }
 
@@ -4704,7 +5142,7 @@ pub fn candidates(
         .collect();
     let near = conditions
         .iter()
-        .filter_map(|(row, c)| usable_at(row, state, *c, now))
+        .filter_map(|(row, c)| effective_usable_at(row, state, *c, now))
         .filter(|at| *at > now && at.saturating_sub(now) <= LOW_ONLY_AFTER_S)
         .min();
     let at_wall = matches!(
@@ -4724,17 +5162,24 @@ pub fn candidates(
             };
             let verdict = if me == Some(row.label.as_str()) {
                 Err(WhyNot::Me)
+            } else if row.held_by.is_some() {
+                Err(WhyNot::HeldElsewhere)
             } else {
                 match *cond {
                     Condition::NotEnrolled => Err(WhyNot::NotEnrolled),
                     Condition::SignedOut => Err(WhyNot::SignedOut),
                     Condition::Limited { until } => Err(WhyNot::Limited { until }),
-                    Condition::Low if !at_wall => Err(WhyNot::LowAheadOfAWall),
-                    Condition::Low => match near {
-                        Some(at) => Err(WhyNot::LowWhileOneIsNear { at }),
-                        None => Ok(rank(true)),
+                    Condition::Low => match state.lease_verdict(&row.label, now) {
+                        Err(why) => Err(why),
+                        Ok(()) if !at_wall => Err(WhyNot::LowAheadOfAWall),
+                        Ok(()) => match near {
+                            Some(at) => Err(WhyNot::LowWhileOneIsNear { at }),
+                            None => Ok(rank(true)),
+                        },
                     },
-                    Condition::Usable | Condition::Unseen => Ok(rank(false)),
+                    Condition::Usable | Condition::Unseen => {
+                        state.lease_verdict(&row.label, now).map(|()| rank(false))
+                    }
                 }
             };
             (row.label.clone(), verdict)
@@ -4806,7 +5251,7 @@ fn wait_instant(
         .iter()
         .filter_map(|r| {
             let cond = condition(r, state, is_enrolled(r, enrolled), now);
-            let at = usable_at(r, state, cond, now)?;
+            let at = effective_usable_at(r, state, cond, now)?;
             let counted = match which {
                 Instants::All => true,
                 Instants::WalledOn(walled) => walled != r.label || at > now,
@@ -4987,8 +5432,12 @@ pub fn launch_row<'a>(
     enrolled: &BTreeSet<String>,
     now: i64,
 ) -> Option<&'a Row> {
+    let available_here =
+        |row: &Row| row.held_by.is_none() && state.lease_verdict(&row.label, now).is_ok();
     let active = state.active.as_deref().and_then(|label| roster.row(label));
-    if let Some(row) = active {
+    if let Some(row) = active
+        && available_here(row)
+    {
         let cond = condition(row, state, is_enrolled(row, enrolled), now);
         let here = !matches!(cond, Condition::NotEnrolled | Condition::SignedOut);
         if (state.pinned && here) || cond.fresh() {
@@ -5005,7 +5454,9 @@ pub fn launch_row<'a>(
         .find(|(_, verdict)| verdict.is_ok())
         .and_then(|(label, _)| roster.row(&label))
         .or_else(|| {
-            active.filter(|row| condition(row, state, is_enrolled(row, enrolled), now).runs())
+            active.filter(|row| {
+                available_here(row) && condition(row, state, is_enrolled(row, enrolled), now).runs()
+            })
         })
 }
 
@@ -5067,9 +5518,12 @@ fn advise_with(
         takes_canary,
     };
 
+    let available_here =
+        |row: &Row| row.held_by.is_none() && state.lease_verdict(&row.label, now).is_ok();
     let mut low_active = None;
     if let Some(active) = state.active.as_deref().and_then(|l| roster.row(l))
         && active.label != mine.label
+        && available_here(active)
     {
         let theirs = cond(active);
         if theirs.runs() && !state.proven {
@@ -5092,6 +5546,7 @@ fn advise_with(
         window,
         at: Some(written),
     } = point
+        && available_here(mine)
         && let Some(record) = state.accounts.get(&mine.label)
         && let Some(cleared_at) = record.cleared_since(window, *written, now)
         && cond(mine).runs()
@@ -5102,6 +5557,7 @@ fn advise_with(
     }
 
     if let Point::LostLogin { seen } = *point
+        && available_here(mine)
         && cond(mine).runs()
         && state.accounts.get(&mine.label).is_some_and(|a| {
             a.auth == Auth::Ok && a.auth_at.is_some_and(|signed_in| signed_in > seen)
@@ -5120,7 +5576,20 @@ fn advise_with(
     }
 
     let breaker = breaker_until(state, roster, now);
-    let listed = candidates(roster, state, enrolled, Some(&mine.label), point, now);
+    // A session whose own account another Mac's senior live claim holds yields at this turn end
+    // in every mode that rotates (docs/DESIGN-fluid-swarm-2026-10-28.md F19, §3.5.3): its own
+    // row is as good as walled, so the rows rank as at a wall, a low one included.
+    let claimed_elsewhere = !at_wall
+        && matches!(
+            state.lease_verdict(&mine.label, now),
+            Err(WhyNot::LeasedElsewhere { .. })
+        );
+    let wall = Point::Wall {
+        window: String::new(),
+        at: None,
+    };
+    let ranked_at = if claimed_elsewhere { &wall } else { point };
+    let listed = candidates(roster, state, enrolled, Some(&mine.label), ranked_at, now);
     let low_active =
         low_active.filter(|a| listed.iter().any(|(l, rank)| *l == a.label && rank.is_ok()));
     let next = listed
@@ -5149,25 +5618,65 @@ fn advise_with(
         };
     }
 
+    if claimed_elsewhere {
+        // A move goes only where its rotation would be admitted ([`begin_rotation`]: not off an
+        // unanswered or pinned `active` that still runs); else the turn end waits, so the session
+        // stops using the account, until a row opens, the breaker has room, or the claims are
+        // read again, whichever comes first.
+        let admitted = |to: &str| {
+            let mover = Mover {
+                sid: "claim-yield",
+                account: &mine.label,
+            };
+            let active = state.active.as_deref();
+            begin_rotation(&mut state.clone(), roster, enrolled, active, mover, to, now).is_ok()
+        };
+        return match (next, low_active, breaker) {
+            (Some((_, rank)), Some(active), spent) if rank.low || spent.is_some() => {
+                onto_active(active, false)
+            }
+            (Some((to, _)), _, None) if admitted(&to) => Advice::Move {
+                to,
+                ahead: true,
+                rotates: true,
+                takes_canary: false,
+            },
+            _ => {
+                let look = now.saturating_add(super::claims::RECHECK_S);
+                let opening = wait_instant(roster, state, enrolled, Instants::Ahead, now);
+                let until = [opening, breaker]
+                    .into_iter()
+                    .flatten()
+                    .filter(|at| *at > now)
+                    .fold(look, i64::min);
+                Advice::Wait { until }
+            }
+        };
+    }
+
     if mode != Mode::Early {
         return Advice::Stay(StayWhy::NothingDue);
     }
     let account = state.account(&mine.label);
     let own = cond(mine);
+    let yielded = !available_here(mine);
     let limited = matches!(own, Condition::Limited { .. });
-    let leave = limited || (own == Condition::Low && account.leave_early(now));
-    if state.pinned {
+    let leave = yielded || limited || (own == Condition::Low && account.leave_early(now));
+    if state.pinned && !yielded {
         return Advice::Stay(if leave {
             StayWhy::Pinned
         } else {
             StayWhy::NothingDue
         });
     }
-    let unanswered =
-        !state.proven && state.active.as_deref() == Some(mine.label.as_str()) && own.runs();
+    let unanswered = !state.proven
+        && state.active.as_deref() == Some(mine.label.as_str())
+        && own.runs()
+        && !yielded;
     if probes
         && roster.rows.len() > 1
         && !limited
+        && !yielded
         && !unanswered
         && !probe_held(state, &mine.label, now)
         && probe_due(&account, now)
@@ -5177,7 +5686,7 @@ fn advise_with(
     if !leave {
         return Advice::Stay(StayWhy::NothingDue);
     }
-    if offer_expiring(&account, now) {
+    if !yielded && offer_expiring(&account, now) {
         return Advice::Stay(StayWhy::OfferExpiring);
     }
     match (next, breaker) {
@@ -5639,6 +6148,43 @@ pub fn sample_window(
             (held.whole() * 10, held.reset) != (f.pct_x10, f.reset) || f.at > held.at
         })
         .then_some(f)
+}
+
+/// Records an additional settled `/usage` window, such as Kimi Code's monthly total, which is
+/// distinct from the session and legacy weekly buckets in [`Sample`].
+pub fn note_panel_window(
+    state: &mut State,
+    account: &str,
+    bucket: &str,
+    pct: u32,
+    reset: Option<i64>,
+    at: i64,
+) -> Vec<Event> {
+    if pct > PCT_MAX || bucket.is_empty() {
+        return Vec::new();
+    }
+    let Some(reset) = reset else {
+        return Vec::new();
+    };
+    let by = state.machine.clone();
+    let Some(record) = account_mut(state, account) else {
+        return Vec::new();
+    };
+    if record.windows.get(bucket).is_some_and(|held| held.at >= at) {
+        return Vec::new();
+    }
+    record.windows.insert(
+        bucket.to_owned(),
+        WindowFig {
+            pct_x10: pct.saturating_mul(10),
+            reset,
+            at,
+            by,
+            source: SOURCE_SAMPLE.to_owned(),
+            epoch_at: None,
+        },
+    );
+    vec![Event::new(at, Kind::Sample, account).because(&format!("{bucket} {pct}% resets {reset}"))]
 }
 
 fn fig_news(f: Option<&WindowFig>) -> Option<(u32, i64, Option<i64>)> {
@@ -6926,7 +7472,7 @@ impl Store {
         Store {
             logins: dir.join("logins"),
             dir,
-            ladder: &LOCK_LADDER,
+            ladder: store_ladder(),
             cli: Cli::Claude,
         }
     }
@@ -6941,7 +7487,7 @@ impl Store {
             _ => Store {
                 dir: harness_state.join(cli.accounts().store_dir),
                 logins: user_home.join(".aterm").join("logins").join(cli.id()),
-                ladder: &LOCK_LADDER,
+                ladder: store_ladder(),
                 cli,
             },
         }
@@ -6957,11 +7503,27 @@ impl Store {
     /// (`<home>/.aterm/logins/<cli>`, [`Store::at_for`]); `None` for Claude Code's store.
     #[must_use]
     pub fn default_home(&self) -> Option<PathBuf> {
+        Some(self.user_home()?.join(self.cli.accounts().default_home))
+    }
+
+    /// The user home whose `.aterm/logins/<cli>` holds this store's logins ([`Store::at_for`]);
+    /// `None` for Claude Code's store.
+    fn user_home(&self) -> Option<&Path> {
         if self.cli == Cli::Claude {
             return None;
         }
-        let user_home = self.logins.parent()?.parent()?.parent()?;
-        Some(user_home.join(self.cli.accounts().default_home))
+        self.logins.parent()?.parent()?.parent()
+    }
+
+    /// The rows of `roster` whose login is made on this machine: [`enrolled_in`] in the user home
+    /// this store's logins are under, so a default row is enrolled only while the CLI's default
+    /// home there holds its login file; [`enrolled`] for Claude Code's store.
+    #[must_use]
+    pub fn enrolled_here(&self, roster: &Roster) -> BTreeSet<String> {
+        match self.user_home() {
+            Some(home) => enrolled_in(self.cli, roster, home),
+            None => enrolled_for(self.cli, roster),
+        }
     }
 
     /// Claude Code's store directory beside it (the same directory for Claude Code's own): the
@@ -7101,6 +7663,13 @@ impl Store {
             Err(std::fs::TryLockError::WouldBlock) => Ok(Err(file)),
             Err(std::fs::TryLockError::Error(e)) => Err(e),
         }
+    }
+
+    /// [`Store::acquire_within`] on this store's own ladder ([`Store::bounded_by`]).
+    /// # Errors
+    /// As [`Store::acquire`].
+    pub fn acquire_bounded(&self) -> io::Result<Option<Lock>> {
+        self.acquire_within(self.ladder)
     }
 
     /// Tries `accounts.lock` now and after each pause of `ladder`; `None` when it stayed held.
@@ -7488,20 +8057,33 @@ impl Store {
     /// As [`Self::load`] or [`Self::load_logins`], or a label remains referenced by
     /// either snapshot, including pending selections, claims and rollback state.
     pub(super) fn check_new_labels(&self, labels: &[&str], now: i64) -> Result<(), String> {
+        if let Some(label) = self.retained(labels, now)? {
+            return Err(format!(
+                "`{label}` still has retained local login or account state; choose an unused label; nothing was written"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The first of `labels` either snapshot still references ([`Self::check_new_labels`]),
+    /// read without the writer lock by a caller that only decides whether to sync.
+    /// # Errors
+    /// As [`Self::load`] or [`Self::load_logins`].
+    pub(super) fn retained<'a>(
+        &self,
+        labels: &[&'a str],
+        now: i64,
+    ) -> Result<Option<&'a str>, String> {
         let (state, _) = self
             .load(now)
             .map_err(|why| format!("{why} ({})", self.state_file().display()))?;
         let (logins, _) = self
             .load_logins(now)
             .map_err(|why| format!("{why} ({})", self.logins_file().display()))?;
-        for &label in labels {
-            if label_is_retained(&state, &logins, label) {
-                return Err(format!(
-                    "`{label}` still has retained local login or account state; choose an unused label; nothing was written"
-                ));
-            }
-        }
-        Ok(())
+        Ok(labels
+            .iter()
+            .copied()
+            .find(|label| label_is_retained(&state, &logins, label)))
     }
 
     /// Loads `logins.json` and returns `roster` with machine-local renewal bindings applied.
@@ -7970,7 +8552,7 @@ impl Store {
                     return Err("selected account configuration changed; nothing selected".into());
                 }
                 let roster = bound(raw, logins);
-                let enrolled = enrolled_for(cli, &roster);
+                let enrolled = self.enrolled_here(&roster);
                 match pin_refusal(state, &roster, &enrolled, label) {
                     None => pin(state, &roster, &enrolled, label, now).map(|event| vec![event]),
                     Some(why @ PinRefusal::NotListed) => Err(why.message(label)),
@@ -8027,7 +8609,7 @@ impl Store {
         now: i64,
     ) -> Result<bool, String> {
         let mut admitted = false;
-        self.transact_renewal_within(&LOCK_LADDER, now, &mut None, policy, |state, logins| {
+        self.transact_renewal_within(self.ladder, now, &mut None, policy, |state, logins| {
             if logins.shared.required(policy.row)?.is_some() {
                 return Err("this account requires a fresh root-authorized shared renewal".into());
             }
@@ -8071,7 +8653,7 @@ impl Store {
                     return Ok(Vec::new());
                 }
                 let roster = bound(raw, logins);
-                let enrolled = enrolled_for(self.cli, &roster);
+                let enrolled = self.enrolled_here(&roster);
                 if raw.row(request.label()) != expected.row(request.label())
                     || pin_refusal(state, &roster, &enrolled, request.label()).is_some()
                 {

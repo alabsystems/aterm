@@ -16,7 +16,7 @@ use super::{
 };
 use crate::companion::{CompanionFrame, CompanionOwner, GlowOwnership, PetFacts};
 use crate::cursor_glow::GlowStyle;
-use crate::host::{CaptureMode, FrameGeom, HostFrameInput, SingFacts, TerminalFacts, Visibility};
+use crate::host::{FrameGeom, HostFrameInput, TerminalFacts};
 use crate::pet_world::{PetPane, PetWorldFacts};
 use crate::word_decorations::{DecoConfig, WordDecorations};
 
@@ -212,39 +212,27 @@ impl Host {
         let _ = self
             .owner
             .observe_console(&input, &world, PetPane::full(&input), &[]);
-        let host = HostFrameInput {
-            now: self.now,
-            visibility: Visibility::Focused,
-            reduced_motion: false,
-            serious: false,
-            shed_envelope: 1.0,
-            shed_active: false,
-            pointer_px: None,
-            capture: CaptureMode::Present,
-            geometry: FrameGeom {
+        let host = HostFrameInput::new(
+            self.now,
+            FrameGeom {
                 rows: ROWS,
                 cols: COLS,
                 cell_w: 7,
                 cell_h: 14,
                 origin_px: (0, 0),
             },
-        };
+        );
         let stare_before = self.owner.brain().watch_t;
         let tick = self.owner.prepare(
-            PetFacts {
-                facts: &facts,
-                host: &host,
-                glow: GlowOwnership {
+            PetFacts::new(
+                &facts,
+                &host,
+                GlowOwnership {
                     enabled: true,
                     style: GlowStyle::RainbowKitty,
                     style_raw_names_pet: true,
                 },
-                sing: SingFacts::default(),
-                focused: true,
-                obscured: false,
-                pane: None,
-                room: None,
-            },
+            ),
             &mut self.decos,
         );
         let burst = tick.output_burst();

@@ -10,11 +10,7 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| {
-            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
-        });
+    let now = aterm_bootstrap_verify::unix_now_fail_closed(std::time::SystemTime::now());
     let said = aterm_bootstrap_verify::run(&args, now).and_then(|line| {
         let Some(line) = line else {
             return Ok(());

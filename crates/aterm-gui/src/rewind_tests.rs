@@ -16,6 +16,40 @@ use aterm_window::keyboard::{Key as WinitKey, ModifiersState, NamedKey};
 
 const WID: WindowId = WindowId(0);
 
+#[test]
+fn rewind_insert_pixels_cannot_authorize_current_input() {
+    let mut app = scripted_app();
+    let session = app.pool.get(0).unwrap();
+    let live = session.live_term().clone();
+    let context = session.ctx.clone();
+    {
+        let mut timeline = context.timeline.lock().unwrap();
+        timeline.note_foreground_group(300);
+        timeline.set_program(300, Some("claude".into()));
+    }
+    let rule = "─".repeat(30);
+    let bytes = format!(
+        "\x1b[?1049h\x1b[6;1H{rule}\x1b[7;1H❯ prompt\x1b[8;1H{rule}\x1b[9;1H-- INSERT --\x1b[7;3H"
+    );
+    term_lock(&live).process(bytes.as_bytes());
+    let live_frame = crate::vim_custody::capture(&term_lock(&live), &context, true).unwrap();
+    assert_eq!(live_frame.mode, crate::vim_custody::Mode::Insert);
+    assert!(app.vim_frame_is_current(WID, live_frame));
+    let past = Arc::new(Mutex::new(Terminal::new(24, 80)));
+    term_lock(&past).process(bytes.as_bytes());
+    let past_frame = crate::vim_custody::capture(&term_lock(&past), &context, true).unwrap();
+    for shown in [None, Some(live.clone()), Some(past)] {
+        let mut view = RewindView::new(0);
+        view.shown = shown;
+        app.pool.set_rewind(0, Some(view));
+        assert!(!app.vim_frame_is_current(WID, live_frame));
+        assert!(!app.vim_frame_is_current(WID, past_frame));
+    }
+    app.pool.set_rewind(0, None);
+    assert!(app.vim_frame_is_current(WID, live_frame));
+    assert!(!app.vim_frame_is_current(WID, past_frame));
+}
+
 fn t(us: u64) -> Ticks {
     Ticks(us)
 }
@@ -372,12 +406,15 @@ pub(crate) fn start_recording(app: &App) {
 
 fn start_recording_session(app: &App, session: u64) {
     let s = app.pool.get(session).expect("recorded session");
-    let (checkpoint, pre) = {
+    let (keyframe, pre) = {
         let term = term_lock(s.live_term());
-        (term.checkpoint(), SpinePre::take(&term))
+        (
+            crate::temporal::keyframe_of(&term, usize::MAX).expect("keyframe"),
+            SpinePre::take(&term),
+        )
     };
     let mut rec = s.ctx.temporal.lock().expect("recorder");
-    rec.record_keyframe(checkpoint);
+    rec.record_keyframe(keyframe);
     rec.spine_watermark().seed(pre);
 }
 
@@ -402,7 +439,14 @@ fn slice_clocked(app: &App, session: u64, bytes: &[u8], clock: ClockReading) -> 
         let mut term = term_lock(s.live_term());
         let pre = SpinePre::take(&term);
         term.process_at(bytes, clock);
-        mark.record(&tx, pre, &term, InputSlice::at(bytes, clock));
+        let (reports, response) = (term.take_reports(), term.take_response());
+        let reply = crate::temporal::reply_of(response.as_deref(), reports.as_deref());
+        mark.record(
+            &tx,
+            pre,
+            &term,
+            InputSlice::at(bytes, clock).replying(reply),
+        );
     }
     while let Some(msg) = rx.try_recv() {
         rec.apply_inline(msg);
@@ -4847,4 +4891,286 @@ fn the_check_line_sums_its_chains_and_names_the_first_that_failed() {
         ),
         "the first failing chain's law, index, cursor and digests"
     );
+}
+
+/// Rewind restores inline (OSC 1337), scrolled-history, and Kitty cell/relative/floating placements on `shown_term` even after the live screen cleared and deleted them across a keyframe.
+#[test]
+fn rewind_view_renders_past_inline_and_kitty_images_across_keyframes_and_scrollback() {
+    use crate::rewind_verb::Asked;
+    use aterm_aos::contract::Verdict;
+    use aterm_aos_pane::PaneCode;
+
+    let mut app = scripted_app();
+    term_lock(&live_term(&app)).set_cell_pixel_size(10, 20);
+    start_recording(&app);
+
+    let mut first =
+        b"\x1b]1337;File=inline=1;width=3;height=2;preserveAspectRatio=0:QUJDREVGRw==\x1b\\\
+                      \x1b[24;1H\r\n\
+                      \x1b_Ga=t,f=32,s=2,v=1,i=1;////AAAA//8=\x1b\\\
+                      \x1b[3;2H\x1b_Ga=p,i=1,p=10,c=2,r=1\x1b\\\
+                      \x1b_Ga=p,i=1,p=11,P=1,Q=10,H=3,V=0,c=1,r=1\x1b\\\
+                      \x1b_Ga=p,U=1,i=1,p=2,c=2,r=1\x1b\\"
+            .to_vec();
+    first.extend_from_slice(
+        "\x1b[4;2H\x1b[38;5;1;58;5;2m\u{10EEEE}\u{0305}\u{0305}\x1b[39;59m".as_bytes(),
+    );
+    first.extend_from_slice(b"\x1b_Ga=p,i=1,p=21,P=1,Q=2,H=1,V=0,c=1,r=1\x1b\\");
+    let past_img = slice(&app, &first);
+    witness(&app, &term_lock(&live_term(&app)));
+
+    // Mint a mid-session keyframe carrying the placed OSC 1337 + Kitty store/relations/floating.
+    {
+        let s = app.pool.get(0).expect("session 0");
+        let kf = {
+            let term = term_lock(s.live_term());
+            crate::temporal::keyframe_of(&term, usize::MAX).expect("keyframe")
+        };
+        assert!(kf.carry.retained_image_bytes() > 0);
+        s.ctx.temporal.lock().expect("recorder").record_keyframe(kf);
+    }
+
+    // Move parent p=10 after the keyframe (cascades to p=11), then wipe the live screen.
+    let moved = slice(&app, b"\x1b[3;7H\x1b_Ga=p,i=1,p=10,c=2,r=1\x1b\\");
+    witness(&app, &term_lock(&live_term(&app)));
+    let _ = slice(&app, b"\x1b[2J\x1b[H\x1b_Ga=d,d=A\x1b\\live text only");
+    witness(&app, &term_lock(&live_term(&app)));
+
+    assert!(
+        term_lock(&live_term(&app))
+            .grid()
+            .capture_image_carry(0)
+            .visible
+            .is_empty(),
+        "fixture: live screen cleared all visible images"
+    );
+
+    let open = ask(&mut app, Asked::Open(Target::At(moved))).expect("open at moved");
+    assert!(open.contains(" faithful=yes "), "{open}");
+    {
+        let shown_arc = app.pool.shown_term(0).expect("shown term");
+        let shown = term_lock(&shown_arc);
+        let img_carry = shown.grid().capture_image_carry(usize::MAX);
+        assert!(
+            !img_carry.visible.is_empty() && !img_carry.history_rev.is_empty(),
+            "shown_term carries both visible and scrolled-history images: {img_carry:?}"
+        );
+        // Moved parent p=10 at row 2 col 6 (1-based 3;7), cascaded child p=11 at row 2 col 9 (6 + H=3).
+        let row2 = &img_carry
+            .visible
+            .iter()
+            .find(|(r, _)| *r == 2)
+            .expect("row 2 has moved Kitty placements")
+            .1;
+        let cols: Vec<(u16, u16, u32)> = row2
+            .iter()
+            .map(|sp| (sp.start_col, sp.end_col, sp.kitty.unwrap().placement_id))
+            .collect();
+        // Moving p=10 mints a newer placement serial for p=10 while restamping p=11 with its
+        // original serial, so layer_order sorts p=11 before p=10.
+        assert_eq!(cols, vec![(9, 10, 11), (6, 8, 10)]);
+    }
+
+    let back = ask(&mut app, Asked::Open(Target::At(past_img))).expect("open at past_img");
+    assert!(back.contains(" faithful=yes "), "{back}");
+    {
+        let shown_arc = app.pool.shown_term(0).expect("shown term");
+        let shown = term_lock(&shown_arc);
+        let img_carry = shown.grid().capture_image_carry(usize::MAX);
+        let row2 = &img_carry
+            .visible
+            .iter()
+            .find(|(r, _)| *r == 2)
+            .expect("row 2 has pre-move Kitty placements")
+            .1;
+        let cols: Vec<(u16, u16, u32)> = row2
+            .iter()
+            .map(|sp| (sp.start_col, sp.end_col, sp.kitty.unwrap().placement_id))
+            .collect();
+        assert_eq!(cols, vec![(1, 3, 10), (4, 5, 11)]);
+    }
+
+    let chains = app
+        .pool
+        .get(0)
+        .expect("session 0")
+        .ctx
+        .temporal
+        .lock()
+        .expect("recorder")
+        .pane_chains()
+        .expect("pane chains");
+    assert_eq!(chains.len(), 2);
+    for (idx, chain) in chains.iter().enumerate() {
+        let check = chain.check(PaneCode::ThisBuild, "test");
+        assert_eq!(check.verdict, Verdict::Pass, "chain {idx}: {check:?}");
+    }
+}
+
+/// Autonomous Kitty animation frame steps record `HostOp::AdvanceKittyAnimations` as steppable
+/// Rewind instants, match live witnesses (`diverged == 0`), and pass `pane_chains` (`rewind check`).
+#[test]
+fn autonomous_kitty_animation_ticks_step_rewind_instants_and_pass_pane_chains() {
+    use crate::rewind_verb::Asked;
+    use aterm_aos::contract::Verdict;
+    use aterm_aos_pane::PaneCode;
+
+    let mut app = scripted_app();
+    let t0 = std::time::Instant::now();
+    let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
+    term_lock(&live_term(&app)).set_cell_pixel_size(10, 20);
+    start_recording(&app);
+
+    let spine = app
+        .pool
+        .get(0)
+        .expect("session 0")
+        .ctx
+        .temporal
+        .lock()
+        .expect("recorder")
+        .spine_watermark();
+    let (tx, rx) = crate::temporal::queue_on(spine, 64);
+    app.pool.set_temporal_tx_for_test(0, Some(tx));
+
+    let apc = |control: &str, payload: &[u8]| {
+        let mut seq = format!("\x1b_G{control}").into_bytes();
+        if !payload.is_empty() {
+            seq.push(b';');
+            seq.extend_from_slice(
+                aterm_codec::base64::encode(payload)
+                    .expect("encode")
+                    .as_bytes(),
+            );
+        }
+        seq.extend_from_slice(b"\x1b\\");
+        seq
+    };
+    let mut setup = Vec::new();
+    setup.extend_from_slice(&apc("a=t,f=32,s=10,v=20,i=7,q=2", &[10; 800]));
+    setup.extend_from_slice(&apc("a=f,f=32,s=10,v=20,i=7,z=30,q=2", &[20; 800]));
+    setup.extend_from_slice(&apc("a=a,i=7,r=1,z=30", b""));
+    setup.extend_from_slice(&apc("a=p,i=7,C=1,q=2", b""));
+    setup.extend_from_slice(&apc("a=a,i=7,s=3", b""));
+    let frame1_tick = slice_clocked(
+        &app,
+        0,
+        &setup,
+        ClockReading {
+            monotonic: t0,
+            wall_ms: None,
+        },
+    );
+    witness(&app, &term_lock(&live_term(&app)));
+
+    let drain_tick = |app: &mut App, at: std::time::Instant| -> Ticks {
+        advance_recording_clocks(app, &[0], 5);
+        app.service_kitty_animations(at);
+        let s = app.pool.get(0).expect("session 0");
+        let mut rec = s.ctx.temporal.lock().expect("recorder");
+        while let Some(msg) = rx.try_recv() {
+            rec.apply_inline(msg);
+        }
+        rec.latest_tick()
+    };
+
+    app.tick_kitty_animations(0, ms(10));
+    let frame2_tick = drain_tick(&mut app, ms(30));
+    witness(&app, &term_lock(&live_term(&app)));
+    let wrap_tick = drain_tick(&mut app, ms(60));
+    witness(&app, &term_lock(&live_term(&app)));
+
+    let shown_pixel = |app: &App| {
+        let shown_arc = app.pool.shown_term(0).expect("shown term");
+        let shown = term_lock(&shown_arc);
+        shown.images_row(0)[0].1.image.bytes[0]
+    };
+
+    for (tick, pixel) in [(frame1_tick, 10u8), (frame2_tick, 20u8), (wrap_tick, 10u8)] {
+        let reply = ask(&mut app, Asked::Open(Target::At(tick))).expect("open at tick");
+        assert!(reply.contains(" faithful=yes "), "{tick:?}: {reply}");
+        assert_eq!(
+            shown_pixel(&app),
+            pixel,
+            "wrong animation frame at {tick:?}"
+        );
+    }
+
+    let (diverged, chains) = {
+        let s = app.pool.get(0).expect("session 0");
+        let rec = s.ctx.temporal.lock().expect("recorder");
+        (rec.diverged(), rec.pane_chains().expect("chains"))
+    };
+    assert_eq!(diverged, 0);
+    for (idx, chain) in chains.iter().enumerate() {
+        let check = chain.check(PaneCode::ThisBuild, "test");
+        assert_eq!(check.verdict, Verdict::Pass, "chain {idx}: {check:?}");
+    }
+}
+
+fn zlib_zeros(len: usize) -> Vec<u8> {
+    let mut bits: Vec<u8> = Vec::new();
+    let mut field = |value: u32, n: u32| bits.extend((0..n).map(|i| ((value >> i) & 1) as u8));
+    let code = |code: u32, n: u32| (0..n).fold(0, |r, i| r | ((code >> i) & 1) << (n - 1 - i));
+    field(0b011, 3);
+    field(code(0x30, 8), 8);
+    let mut left = len - 1;
+    while left >= 258 {
+        field(code(0b1100_0101, 8), 8);
+        field(0, 5);
+        left -= 258;
+    }
+    for _ in 0..left {
+        field(code(0x30, 8), 8);
+    }
+    field(0, 7);
+    let mut out = vec![0x78, 0x01];
+    out.extend(bits.chunks(8).map(|byte| {
+        byte.iter()
+            .enumerate()
+            .fold(0u8, |acc, (i, &bit)| acc | (bit << i))
+    }));
+    let b = u32::try_from(len % 65521).expect("below 65521");
+    out.extend_from_slice(&((b << 16) | 1).to_be_bytes());
+    out
+}
+
+/// The fork cache books unbooked Kitty store and visible images alongside grid memory so image-heavy
+/// chains respect `MAX_FORK_BYTES` now that `replay_fork` carries the Kitty store.
+#[test]
+fn the_fork_cache_books_unbooked_kitty_and_visible_images_under_its_byte_cap() {
+    use crate::rewind_worker::{MAX_FORK_BYTES, MAX_FORKS, STORE_LINES, fork_bytes, kept_after};
+    use aterm_buffer::Seq;
+
+    let app = scripted_app();
+    start_recording(&app);
+    let _ = slice(&app, b"one screen");
+    let plan = app
+        .pool
+        .get(0)
+        .expect("session 0")
+        .ctx
+        .temporal
+        .lock()
+        .expect("recorder")
+        .replay_plan(None)
+        .expect("a replay");
+    let mut engine = plan.restore_bounded(STORE_LINES);
+    let side = 720usize;
+    let raw_bytes = side * side * 4; // ~2.07 MiB uncompressed RGBA per fork
+    let compressed = aterm_codec::base64::encode(&zlib_zeros(raw_bytes)).expect("encode");
+    let apc = format!("\x1b_Ga=t,f=32,s={side},v={side},o=z,i=9,q=2;{compressed}\x1b\\");
+    engine.process(apc.as_bytes());
+    assert!(engine.fork().is_some(), "fork succeeds with Kitty store");
+
+    let each = fork_bytes(&engine);
+    assert!(
+        each >= raw_bytes && each.saturating_mul(MAX_FORKS) > MAX_FORK_BYTES,
+        "fixture: each fork books its ~2 MiB Kitty store ({each} bytes)"
+    );
+    let seqs: Vec<Seq> = (0..40).map(|n| Seq(n * 10)).collect();
+    let (kept, booked, summed) = kept_after(&engine, &seqs, Seq(390));
+    assert!(kept.len() < MAX_FORKS, "the byte cap binds: {}", kept.len());
+    assert!(booked <= MAX_FORK_BYTES, "{booked}");
+    assert_eq!(booked, summed, "every eviction refunds its fork");
 }

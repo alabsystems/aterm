@@ -217,6 +217,22 @@ pub struct Seat {
     pub lift_rows: u16,
     /// Every yield was inked (or covered the caret cell), so the body draws over the words here, as the shipped seat does on a crowded line.
     pub over_ink: bool,
+    /// Pixels the body was lowered within its row (negative: raised) so its drawn box keeps off the lettered cells of the rows it reaches into ([`keep_off_rows_beside`]), already in [`Self::y`]; [`Self::lift`] carries it to a host's layout.
+    pub drop_px: i32,
+}
+
+impl Seat {
+    /// The rows a host's layout lifts the body by (`KittyCursorLayout::lift`) for cells `cell_h` px tall: the sky seat's whole rows less the drop that keeps the head off the rows beside its own.
+    #[inline]
+    #[must_use]
+    pub fn lift(&self, cell_h: u16) -> f32 {
+        let drop = if cell_h == 0 {
+            0.0
+        } else {
+            self.drop_px as f32 / f32::from(cell_h)
+        };
+        f32::from(self.lift_rows) - drop
+    }
 }
 
 /// One [`placement`] call's geometry.
@@ -232,10 +248,99 @@ pub struct SeatQuery {
     pub held_sky: bool,
 }
 
-/// The seat rule (§6.5 layer 13).
+/// The seat rule (§6.5 layer 13): the row and the side ([`seat_on_a_row`]), then the
+/// body's height within its row ([`keep_off_rows_beside`]).
 #[must_use]
 #[inline]
 pub fn placement<F>(caret: (u16, u16), query: &SeatQuery, ink: F) -> Seat
+where
+    F: Fn(u16, u16) -> Option<bool>,
+{
+    let seat = seat_on_a_row(caret, query, &ink);
+    #[cfg(any(test, debug_assertions))]
+    if ROWS_BESIDE_UNREAD.with(std::cell::Cell::get) {
+        return seat;
+    }
+    keep_off_rows_beside(seat, caret, query, &ink)
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// Tests' negative control over [`keep_off_rows_beside`]: on, the head keeps the seat's
+    /// height whatever letters the rows beside its own hold.
+    static ROWS_BESIDE_UNREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests' negative control over [`keep_off_rows_beside`] on this thread: `true` seats the head
+/// at its row's height whatever letters lie beside it, as before the law.
+#[cfg(any(test, debug_assertions))]
+pub fn set_rows_beside_unread(unread: bool) {
+    ROWS_BESIDE_UNREAD.with(|cell| cell.set(unread));
+}
+
+/// THE HEAD KEEPS OFF THE LETTERS OF THE ROWS IT REACHES INTO. The head is taller than its
+/// row (`WordDecorations::COMPANION_CELL_H`) and centred on it, so its ears reach into the row
+/// above and its chin into the row below, whose letters [`seat_on_a_row`] never reads: seated
+/// ahead of the caret under a written line, its ears lay on that line's letters (the settings
+/// card's `git c` at 1.25:1, looks9's settings round 2). Where its drawn box meets a lettered
+/// cell beside its row, the body moves within its row's band, its top to the row's top or its
+/// bottom to the row's bottom, whichever is nearer and leaves every cell it reaches beside its
+/// own row on the grid and blank; where neither does (letters above and below, the grid's
+/// edge, cells the host cannot read), or the seat already lies on ink or intrudes on the
+/// caret's cell (the margin's rise owns its height), it holds.
+fn keep_off_rows_beside<F>(mut seat: Seat, caret: (u16, u16), query: &SeatQuery, ink: &F) -> Seat
+where
+    F: Fn(u16, u16) -> Option<bool>,
+{
+    let geom = query.geom;
+    let ch = geom.ch.clamp(1, i32::MAX as usize) as i32;
+    let cw = geom.cw.clamp(1, i32::MAX as usize) as i32;
+    let cols = geom.cols.min(u16::MAX as usize) as u16;
+    let rows = geom.rows.min(u16::MAX as usize) as i32;
+    let (w, h) = (i32::from(seat.w), i32::from(seat.h));
+    if seat.over_ink || cols == 0 || rows == 0 || w <= 0 || h <= 0 {
+        return seat;
+    }
+    let row = i32::from(seat.row);
+    let (first, last) = cell_span(seat.x, w, cw, cols);
+    if seat.row == caret.0 && (first..=last).contains(&caret.1) {
+        return seat;
+    }
+    // The rows other than its own a box with its top at `y` reaches.
+    let beside = |y: i32| {
+        let (top, bottom) = (y.div_euclid(ch), (y + h - 1).div_euclid(ch));
+        (top..=bottom).filter(move |&r| r != row)
+    };
+    let lettered =
+        |r: i32| (0..rows).contains(&r) && (first..=last).any(|c| ink(r as u16, c) == Some(true));
+    if !beside(seat.y).any(lettered) {
+        return seat;
+    }
+    let blank =
+        |r: i32| (0..rows).contains(&r) && (first..=last).all(|c| ink(r as u16, c) == Some(false));
+    let (top_at_top, bottom_at_bottom) = (row * ch, (row + 1) * ch - h);
+    let moved = [top_at_top, bottom_at_bottom]
+        .into_iter()
+        .map(|y| {
+            if bottom_at_bottom >= top_at_top {
+                seat.y.clamp(top_at_top, bottom_at_bottom)
+            } else {
+                y
+            }
+        })
+        .filter(|&y| y >= 0 && beside(y).all(blank))
+        .min_by_key(|&y| (y - seat.y).abs());
+    if let Some(y) = moved {
+        seat.drop_px += y - seat.y;
+        seat.y = y;
+    }
+    seat
+}
+
+/// The seat's row and side ([`placement`]'s first step), the body at the height its row's
+/// footprint gives it.
+#[inline]
+fn seat_on_a_row<F>(caret: (u16, u16), query: &SeatQuery, ink: &F) -> Seat
 where
     F: Fn(u16, u16) -> Option<bool>,
 {
@@ -249,7 +354,7 @@ where
     let caret_left = i32::from(caret_col).saturating_mul(cw);
     let grid_w = i32::from(cols).saturating_mul(cw);
 
-    let ahead = census(rest.x, w, caret_row, caret, cols, cw, &ink);
+    let ahead = census(rest.x, w, caret_row, caret, cols, cw, ink);
     if ahead.clear() {
         return seat(query, rest.x, rest.y, caret_row, caret_left, 0, false);
     }
@@ -268,7 +373,7 @@ where
     }
     if caret_row > 0 && ahead.probe != Probe::Blind && (query.held_sky || written_before) {
         let sky_row = caret_row - 1;
-        let sky = census(rest.x, w, sky_row, caret, cols, cw, &ink);
+        let sky = census(rest.x, w, sky_row, caret, cols, cw, ink);
         if sky.clear() {
             return seat(
                 query,
@@ -297,7 +402,7 @@ where
         return seat(query, x, rest.y, caret_row, caret_left, 0, false);
     }
 
-    let behind = census(behind_x, w, caret_row, caret, cols, cw, &ink);
+    let behind = census(behind_x, w, caret_row, caret, cols, cw, ink);
     if behind.clear() {
         return seat(query, behind_x, rest.y, caret_row, caret_left, 0, false);
     }
@@ -307,7 +412,7 @@ where
         let sky_y = rest.y.saturating_sub(ch);
         let sky = match sky_census {
             Some(s) => s,
-            None => census(rest.x, w, sky_row, caret, cols, cw, &ink),
+            None => census(rest.x, w, sky_row, caret, cols, cw, ink),
         };
         return seat(query, rest.x, sky_y, sky_row, caret_left, 1, !sky.clear());
     }
@@ -464,6 +569,7 @@ const fn seat(
         side,
         lift_rows,
         over_ink,
+        drop_px: 0,
     }
 }
 
@@ -624,7 +730,7 @@ impl PetShade {
             border: i32,
             (x0, x1, y0, y1): (i32, i32, i32, i32),
         ) -> bool {
-            x + r >= x0 + border && x - r < x1 - border && y + r >= y0 && y - r < y1
+            y + r >= y0 && y - r < y1 && x + r >= x0 + border && x - r < x1 - border
         }
         let Some(last) = self.boxes[0] else {
             return false;
@@ -680,6 +786,11 @@ pub struct KeepOut {
     /// Those rows' boxes: a row among them has its feet known
     /// ([`Self::knows_feet`]).
     soles: Vec<(i32, i32, i32, i32)>,
+    /// The lettered cells' runs alone (a glyph, on any ground), when the
+    /// host named them ([`Self::letters_meet`]); a run of glyphs that keep
+    /// under the x-height begins where their ink may, a third of the cell
+    /// down, its cell's top blank leading.
+    letters: Option<Vec<(i32, i32, i32, i32)>>,
 }
 
 impl Default for KeepOut {
@@ -700,6 +811,7 @@ impl Clone for KeepOut {
             filled: self.filled.clone(),
             feet: self.feet.clone(),
             soles: self.soles.clone(),
+            letters: self.letters.clone(),
         }
     }
 
@@ -712,6 +824,7 @@ impl Clone for KeepOut {
         self.filled.clone_from(&source.filled);
         self.feet.clone_from(&source.feet);
         self.soles.clone_from(&source.soles);
+        self.letters.clone_from(&source.letters);
     }
 }
 
@@ -738,6 +851,7 @@ impl KeepOut {
         filled: Vec::new(),
         feet: Vec::new(),
         soles: Vec::new(),
+        letters: None,
     };
     /// This frame's boxes, window pixels, all of them lettered or filled
     /// cells ([`Self::set_split`] with no icon).
@@ -825,9 +939,12 @@ impl KeepOut {
     #[inline]
     #[must_use]
     pub const fn foot_share(&self, (x, y): (f32, f32), clear: f32, ease: f32) -> f32 {
-        let mut share = 1.0f32;
         let feet = self.feet.as_slice();
-        let inv_ease = 1.0 / ease.max(1.0);
+        if feet.is_empty() {
+            return 1.0;
+        }
+        let ease = ease.max(1.0);
+        let mut min_d = ease;
         let mut i = 0;
         while i < feet.len() {
             let (x0, x1, y0, y1) = feet[i];
@@ -839,10 +956,15 @@ impl KeepOut {
             if d <= 0.0 {
                 return 0.0;
             }
-            let k = (d * inv_ease).min(1.0);
-            share = share.min(k * k * (3.0 - 2.0 * k));
+            if d < min_d {
+                min_d = d;
+            }
         }
-        share
+        if min_d >= ease {
+            return 1.0;
+        }
+        let k = (min_d * (1.0 / ease)).min(1.0);
+        k * k * (3.0 - 2.0 * k)
     }
 
     /// Whether a filled cell's box meets the span `(x0, x1) × (y0, y1)`.
@@ -869,14 +991,7 @@ impl KeepOut {
         cells: &[(i32, i32, i32, i32)],
     ) {
         self.cells.clear();
-        let mut i = 0;
-        while i < cells.len() {
-            let b = cells[i];
-            if b.0 < b.1 && b.2 < b.3 {
-                self.cells.push(b);
-            }
-            i += 1;
-        }
+        push_real(&mut self.cells, cells);
         self.boxes.clear();
         let mut i = 0;
         while i < icons.len() {
@@ -895,6 +1010,35 @@ impl KeepOut {
     pub(crate) fn set_filled_slice(&mut self, filled: &[(i32, i32, i32, i32)]) {
         self.filled.clear();
         push_real(&mut self.filled, filled);
+    }
+
+    /// This frame's lettered cells' runs, window pixels
+    /// ([`Self::letters_meet`]).
+    #[inline]
+    pub(crate) fn set_letters_slice(&mut self, letters: &[(i32, i32, i32, i32)]) {
+        let to = self.letters.get_or_insert_with(Vec::new);
+        to.clear();
+        push_real(to, letters);
+    }
+
+    /// Whether a lettered cell's box meets the span `(x0, x1) × (y0, y1)`;
+    /// `None` when the host named no letters.
+    #[inline]
+    #[must_use]
+    pub const fn letters_meet(&self, (x0, x1): (i32, i32), (y0, y1): (i32, i32)) -> Option<bool> {
+        let Some(letters) = self.letters.as_ref() else {
+            return None;
+        };
+        let slice = letters.as_slice();
+        let mut i = 0;
+        while i < slice.len() {
+            let b = slice[i];
+            if b.0 < x1 && x0 < b.1 && b.2 < y1 && y0 < b.3 {
+                return Some(true);
+            }
+            i += 1;
+        }
+        Some(false)
     }
 
     /// [`Self::set_feet`] from slices.
@@ -939,14 +1083,7 @@ impl KeepOut {
     #[inline]
     pub(crate) fn set_rows_past_slice(&mut self, rows: &[(i32, i32, i32, i32)], past: i32) {
         self.rows.clear();
-        let mut i = 0;
-        while i < rows.len() {
-            let b = rows[i];
-            if b.0 < b.1 && b.2 < b.3 {
-                self.rows.push(b);
-            }
-            i += 1;
-        }
+        push_real(&mut self.rows, rows);
         self.past = past.max(0);
     }
 
@@ -992,17 +1129,13 @@ impl KeepOut {
             return 1.0;
         }
         let feather = feather.max(1.0);
+        let past_pad = past + pad;
         let inv_feather = 1.0 / feather;
-        let mut k = 1.0f32;
+        let mut max_d = 0.0f32;
         let mut i = 0;
         while i < rows.len() {
             let (x0, x1, y0, y1) = rows[i];
             i += 1;
-            let (x0, x1) = (x0 as f32 - pad, x1 as f32 + past + pad);
-            let dx = (x - x0).min(x1 - x);
-            if dx <= 0.0 {
-                continue;
-            }
             let ch = (y1 - y0) as f32;
             let b0 = y0 as f32 + band.0 * ch - pad;
             if y <= b0 {
@@ -1012,14 +1145,24 @@ impl KeepOut {
             if y >= b1 {
                 continue;
             }
+            let (x0, x1) = (x0 as f32 - pad, x1 as f32 + past_pad);
+            let dx = (x - x0).min(x1 - x);
+            if dx <= 0.0 {
+                continue;
+            }
             let d = dx.min(y - b0).min(b1 - y);
             if d >= feather {
                 return 0.0;
             }
-            let u = (d * inv_feather).min(1.0);
-            k = k.min(1.0 - u * u * (3.0 - 2.0 * u));
+            if d > max_d {
+                max_d = d;
+            }
         }
-        k
+        if max_d <= 0.0 {
+            return 1.0;
+        }
+        let u = (max_d * inv_feather).min(1.0);
+        1.0 - u * u * (3.0 - 2.0 * u)
     }
 
     /// The boxes, window pixels.
@@ -1035,11 +1178,12 @@ impl KeepOut {
     #[must_use]
     pub const fn covers(&self, (x, y): (i32, i32), reach: i32) -> bool {
         let r = if reach > 0 { reach } else { 0 };
+        let (x_lo, x_hi, y_lo, y_hi) = (x - r, x + r, y - r, y + r);
         let boxes = self.boxes.as_slice();
         let mut i = 0;
         while i < boxes.len() {
             let (x0, x1, y0, y1) = boxes[i];
-            if x + r >= x0 && x - r < x1 && y + r >= y0 && y - r < y1 {
+            if y_hi >= y0 && y_lo < y1 && x_hi >= x0 && x_lo < x1 {
                 return true;
             }
             i += 1;

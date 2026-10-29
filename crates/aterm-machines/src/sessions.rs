@@ -88,6 +88,7 @@ pub fn parse_aterm_roster_line(
             "agent" => s.agent = opt(),
             "agent_detail" => s.agent_detail = opt(),
             "agent_since_ms" if val != "-" => s.agent_since_ms = val.parse().ok(),
+            "program_state" => s.program_state = opt(),
             "human_ms" if val != "-" => s.human_ms = val.parse().ok(),
             "autopilot" => s.autopilot = opt(),
             "role" => s.role = opt(),
@@ -383,5 +384,27 @@ mod tests {
         assert_eq!(r.autopilot.as_deref(), Some("cruise"));
         assert_eq!(r.role.as_deref(), Some("operator"));
         assert_eq!(r.task.as_deref(), Some("build fleet"));
+        assert_eq!(r.program_state, None, "a line with no report carries none");
+    }
+
+    /// A codex's own report (`program_state=`) rides the fleet row, so another Mac's Settings can
+    /// read it where the codex reader says `unknown`.
+    #[test]
+    fn a_roster_line_carries_the_programs_own_report() {
+        let row = |state: &str| {
+            parse_aterm_roster_line(
+                7,
+                &format!(
+                    "2 s-cx - alive codex meta=1 program=codex agent=unknown program_state={state}"
+                ),
+            )
+            .expect("a row")
+            .program_state
+        };
+        assert_eq!(
+            row("blocked:permission").as_deref(),
+            Some("blocked:permission")
+        );
+        assert_eq!(row("-"), None);
     }
 }

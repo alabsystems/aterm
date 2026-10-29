@@ -479,19 +479,25 @@ impl TrickFlash {
         }
         let revoked_t = slot.revoked_at.map(|at| millis_since(at, loc.since));
         let tint = envelope(t, revoked_t) * loc.strength;
-        const DEG_PER_MS: f32 = 360.0 / FLASH_MS as f32;
         let n = usize::from(slot.len);
-        let hue0 = rainbow_base_hue(slot.hue_seed);
-        let steps = n.saturating_sub(1) as f32;
-        let span = RAINBOW_SPAN_DEG.min(100.0 * steps);
-        let span_per_step = span / steps.max(1.0);
-        let time_deg = t as f32 * DEG_PER_MS;
-        let mut search_from = 0usize;
         let has_tint = tint > 0.0;
+        let full_tint = tint >= 1.0;
+        let (base_hue, span_per_step) = if has_tint {
+            const DEG_PER_MS: f32 = 360.0 / FLASH_MS as f32;
+            let hue0 = rainbow_base_hue(slot.hue_seed);
+            let steps = n.saturating_sub(1) as f32;
+            let span = RAINBOW_SPAN_DEG.min(100.0 * steps);
+            let span_per_step = span / steps.max(1.0);
+            let time_deg = t as f32 * DEG_PER_MS;
+            (hue0 + time_deg, span_per_step)
+        } else {
+            (0.0, 0.0)
+        };
+        let mut search_from = 0usize;
         let mut i = 0;
         while i < n {
             let target = if has_tint {
-                let hue = hue0 + i as f32 * span_per_step + time_deg;
+                let hue = base_hue + i as f32 * span_per_step;
                 hsv2rgb(hue, loc.sat, loc.val)
             } else {
                 0
@@ -500,10 +506,17 @@ impl TrickFlash {
             let fg_i = loc.fg[i];
             i += 1;
             let cell = if !matches!(ink.last(), Some(c) if (c.row, c.col) >= (loc.row, col)) {
+                let color = if full_tint {
+                    u32_to_rgb3(target)
+                } else if has_tint {
+                    u32_to_rgb3(mix_rgb(rgb3_to_u32(fg_i), target, tint))
+                } else {
+                    fg_i
+                };
                 let cell = InkCell {
                     row: loc.row,
                     col,
-                    color: u32_to_rgb3(mix_rgb(rgb3_to_u32(fg_i), target, tint)),
+                    color,
                 };
                 ink.push(cell);
                 search_from = ink.len();
@@ -519,17 +532,28 @@ impl TrickFlash {
                     Ok(rel) => {
                         let j = search_from + rel;
                         search_from = j + 1;
-                        ink[j].color =
-                            u32_to_rgb3(mix_rgb(rgb3_to_u32(ink[j].color), target, tint));
+                        if full_tint {
+                            ink[j].color = u32_to_rgb3(target);
+                        } else if has_tint {
+                            ink[j].color =
+                                u32_to_rgb3(mix_rgb(rgb3_to_u32(ink[j].color), target, tint));
+                        }
                         ink[j]
                     }
                     Err(rel) => {
                         let j = search_from + rel;
                         search_from = j + 1;
+                        let color = if full_tint {
+                            u32_to_rgb3(target)
+                        } else if has_tint {
+                            u32_to_rgb3(mix_rgb(rgb3_to_u32(fg_i), target, tint))
+                        } else {
+                            fg_i
+                        };
                         let cell = InkCell {
                             row: loc.row,
                             col,
-                            color: u32_to_rgb3(mix_rgb(rgb3_to_u32(fg_i), target, tint)),
+                            color,
                         };
                         ink.insert(j, cell);
                         cell
@@ -636,12 +660,20 @@ const fn envelope(t: u64, revoked_t: Option<u64>) -> f32 {
     const INV_RAMP_MS: f32 = 1.0 / RAMP_MS as f32;
     const INV_FADE_MS: f32 = 1.0 / FADE_MS as f32;
     const INV_REVOKE_FADE_MS: f32 = 1.0 / REVOKE_FADE_MS as f32;
-    let t = t as f32;
-    let ramp = smoothstep(t * INV_RAMP_MS);
-    let fade = 1.0 - smoothstep((t - (FLASH_MS - FADE_MS) as f32) * INV_FADE_MS);
+    let tf = t as f32;
+    let ramp = if t >= RAMP_MS as u64 {
+        1.0
+    } else {
+        smoothstep(tf * INV_RAMP_MS)
+    };
+    let fade = if t <= (FLASH_MS - FADE_MS) as u64 {
+        1.0
+    } else {
+        1.0 - smoothstep((tf - (FLASH_MS - FADE_MS) as f32) * INV_FADE_MS)
+    };
     let revoke = match revoked_t {
-        Some(r) => 1.0 - smoothstep((t - r as f32) * INV_REVOKE_FADE_MS),
-        None => 1.0,
+        Some(r) if t > r => 1.0 - smoothstep((tf - r as f32) * INV_REVOKE_FADE_MS),
+        _ => 1.0,
     };
     ramp * fade * revoke
 }
@@ -657,54 +689,96 @@ fn flash_hue(hue0: f32, i: usize, n: usize, t: u64) -> f32 {
     (hue0 + u * span + 360.0 * (t as f32 / FLASH_MS as f32)).rem_euclid(360.0)
 }
 
-/// The rainbow colorway's theme rule: a light background takes deep candy
-/// tones that can clear the contrast bound on white.
 #[inline]
-const fn resolve_sat_val(bg: u32) -> (f32, f32) {
-    let table = crate::color_math::relative_luminance_table();
-    if crate::color_math::relative_luminance_with(table, bg) > 0.5 {
+const fn resolve_sat_val_from_lum(lum_bg: f32) -> (f32, f32) {
+    if lum_bg > 0.5 {
         (1.0, 0.62)
     } else {
         (RAINBOW_SAT, RAINBOW_VAL)
     }
 }
 
+/// The rainbow colorway's theme rule: a light background takes deep candy
+/// tones that can clear the contrast bound on white.
+#[cfg(test)]
+#[inline]
+const fn resolve_sat_val(bg: u32) -> (f32, f32) {
+    let table = crate::color_math::relative_luminance_table();
+    resolve_sat_val_from_lum(crate::color_math::relative_luminance_with(table, bg))
+}
+
 /// The legibility guard: the strongest tint, stepping down from
 /// [`FLASH_STRENGTH`] in eighths, at which the flash is legible at every hue it
 /// passes through.
+#[cfg(test)]
 #[inline]
 const fn legible_strength(fg: u32, bg: u32, sat: f32, val: f32) -> f32 {
     let table = crate::color_math::relative_luminance_table();
     let lum_bg = crate::color_math::relative_luminance_with(table, bg);
+    legible_strength_with(table, fg, lum_bg, sat, val)
+}
+
+#[inline]
+const fn legible_strength_with(
+    table: &crate::color_math::RelativeLuminanceTable,
+    fg: u32,
+    lum_bg: f32,
+    sat: f32,
+    val: f32,
+) -> f32 {
     let floor = MIN_INK_CONTRAST;
     let text_is_lighter = crate::color_math::relative_luminance_with(table, fg) >= lum_bg;
+    let bg_plus = lum_bg + 0.05;
     let c = val * sat;
     let m = val - c;
-    let hi = ((c + m).clamp(0.0, 1.0) * 255.0).round() as u32;
-    let lo = (m.clamp(0.0, 1.0) * 255.0).round() as u32;
-    let corners = [
-        (hi << 16) | (lo << 8) | lo,
-        (hi << 16) | (hi << 8) | lo,
-        (lo << 16) | (hi << 8) | lo,
-        (lo << 16) | (hi << 8) | hi,
-        (lo << 16) | (lo << 8) | hi,
-        (hi << 16) | (lo << 8) | hi,
-    ];
+    let hi = ((c + m).clamp(0.0, 1.0) * 255.0).round() as u32 as f32;
+    let lo = (m.clamp(0.0, 1.0) * 255.0).round() as u32 as f32;
+    let (fr, fg_c, fb) = (
+        ((fg >> 16) & 0xff) as f32,
+        ((fg >> 8) & 0xff) as f32,
+        (fg & 0xff) as f32,
+    );
+    #[inline]
+    const fn mix_byte(ca: f32, cb: f32, t: f32) -> usize {
+        (((ca + (cb - ca) * t) + 0.5) as u32 & 0xff) as usize
+    }
     let step = FLASH_STRENGTH * 0.125;
     let mut strength = FLASH_STRENGTH;
     'guard: while strength > 0.0 {
+        let t = strength.clamp(0.0, 1.0);
+        let (lr_hi, lr_lo) = (
+            table.red[mix_byte(fr, hi, t)],
+            table.red[mix_byte(fr, lo, t)],
+        );
+        let (lg_hi, lg_lo) = (
+            table.green[mix_byte(fg_c, hi, t)],
+            table.green[mix_byte(fg_c, lo, t)],
+        );
+        let (lb_hi, lb_lo) = (
+            table.blue[mix_byte(fb, hi, t)],
+            table.blue[mix_byte(fb, lo, t)],
+        );
+        let corner_lums = [
+            (lr_hi + lg_lo) + lb_lo,
+            (lr_hi + lg_hi) + lb_lo,
+            (lr_lo + lg_hi) + lb_lo,
+            (lr_lo + lg_hi) + lb_hi,
+            (lr_lo + lg_lo) + lb_hi,
+            (lr_hi + lg_lo) + lb_hi,
+        ];
         let mut idx = 0;
-        while idx < corners.len() {
-            let corner = corners[idx];
-            let lum =
-                crate::color_math::relative_luminance_with(table, mix_rgb(fg, corner, strength));
-            let (hi_lum, lo_lum) = if lum >= lum_bg {
-                (lum, lum_bg)
+        while idx < corner_lums.len() {
+            let lum = corner_lums[idx];
+            if (lum >= lum_bg) != text_is_lighter {
+                strength = (strength - step).max(0.0);
+                continue 'guard;
+            }
+            let (hi_lum, lo_lum) = if text_is_lighter {
+                (lum + 0.05, bg_plus)
             } else {
-                (lum_bg, lum)
+                (bg_plus, lum + 0.05)
             };
-            let contrast = (hi_lum + 0.05) / (lo_lum + 0.05);
-            if (lum >= lum_bg) != text_is_lighter || contrast < floor {
+            if hi_lum / lo_lum < floor {
                 strength = (strength - step).max(0.0);
                 continue 'guard;
             }
@@ -773,9 +847,10 @@ fn find_in_row(
     let three_plus_two_back = 3 + two_back;
     let reach = i64::from(TYPED_EDIT_REACH_COLS) + two_back + 2;
     let max_start = if caret + reach >= 0 {
+        let max_possible = (cells.len() + 1).saturating_sub(seq.len());
         ((caret + reach) as usize)
             .saturating_add(1)
-            .min(cells.len())
+            .min(max_possible)
     } else {
         0
     };
@@ -1055,8 +1130,10 @@ const fn capture(loc: &mut Located, n: usize, cells: &[RenderCell]) -> bool {
     }
     loc.bg = first.bg;
     let bg = rgb3_to_u32(first.bg);
-    (loc.sat, loc.val) = resolve_sat_val(bg);
-    loc.strength = legible_strength(rgb3_to_u32(first.fg), bg, loc.sat, loc.val);
+    let table = crate::color_math::relative_luminance_table();
+    let lum_bg = crate::color_math::relative_luminance_with(table, bg);
+    (loc.sat, loc.val) = resolve_sat_val_from_lum(lum_bg);
+    loc.strength = legible_strength_with(table, rgb3_to_u32(first.fg), lum_bg, loc.sat, loc.val);
     loc.strength > 0.0
 }
 

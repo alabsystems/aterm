@@ -1150,8 +1150,7 @@ impl AltArchive {
             .max(floor);
         let s = &mut self.scratch;
         s.tail_idx.clear();
-        for pos in lo..len {
-            let row = &self.rows[pos];
+        for (pos, row) in self.rows.iter().enumerate().skip(lo) {
             if row.anchor {
                 s.tail_idx.insert(row.hash, pos);
             }
@@ -2007,6 +2006,12 @@ impl Terminal {
         self.alt_archive
             .archive
             .share_budget(shared.then(AltArchiveBudget::process));
+    }
+
+    /// Attaches or detaches an isolated shared byte budget for unit tests.
+    #[cfg(test)]
+    pub(crate) fn set_alt_archive_pool(&mut self, pool: Option<Arc<AltArchiveBudget>>) {
+        self.alt_archive.archive.share_budget(pool);
     }
 
     /// Sets this session's archive byte budget (`0` disables and wipes it).

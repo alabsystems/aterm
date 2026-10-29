@@ -284,16 +284,101 @@ impl CliHarness {
 
 /// The running CLI's version as a harness label shows it: `raw` cut at its first `-` or `+`
 /// (`1.4.13-R6996.1` → `1.4.13`, `0.165.0-dev.4+g1a2b3c4d5` → `0.165.0`), without a leading `v`;
-/// `None` where nothing numeric is left.
+/// `None` where what is left is not dot-joined numbers (`2.1.`, `2..1`, `latest`).
 #[must_use]
 pub fn cli_version_core(raw: &str) -> Option<&str> {
     let raw = raw.trim();
     let raw = raw.strip_prefix('v').unwrap_or(raw);
     let core = raw.split(['-', '+']).next().unwrap_or("");
-    (!core.is_empty()
-        && core.starts_with(|c: char| c.is_ascii_digit())
-        && core.chars().all(|c| c.is_ascii_digit() || c == '.'))
-    .then_some(core)
+    core.split('.')
+        .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        .then_some(core)
+}
+
+/// What a CLI version names past its numbers ([`cli_version_core`]): its pre-release part, cut
+/// at its build metadata (`1.4.10-R6500.1` → `R6500.1`, `0.164.0-dev.12521+g1a2b3c4d5` →
+/// `dev.12521`); `None` where it has none.
+#[must_use]
+pub fn cli_version_build(raw: &str) -> Option<&str> {
+    cli_version_core(raw)?;
+    let raw = raw.trim();
+    let (_, rest) = raw.split_once('-')?;
+    if raw
+        .find('+')
+        .is_some_and(|plus| plus < raw.len() - rest.len())
+    {
+        return None;
+    }
+    let build = rest.split('+').next().unwrap_or("");
+    (!build.is_empty()).then_some(build)
+}
+
+/// Whether a move from CLI build `from` onto `to` is one a top rule's ⬆️ offers: a later core
+/// ([`cli_version_later`]), or the same core with a later build past it ([`cli_build_later`]: a
+/// later Muse revision, a later dev count); never an earlier core, an earlier build under the
+/// same core, the same build, or a side that is not a version. It allocates nothing.
+#[must_use]
+pub fn cli_version_offered(to: &str, from: &str) -> bool {
+    if cli_version_core(to).is_none() || cli_version_core(from).is_none() {
+        return false;
+    }
+    cli_version_later(to, from) || (!cli_version_later(from, to) && cli_build_later(to, from))
+}
+
+/// Whether CLI version `to`'s build past its core ([`cli_version_build`]) is later than
+/// `from`'s: the two are read as runs of digits and runs of other characters and compared run
+/// by run, digits as numbers and the others alike or not ordered at all, a build that goes on
+/// past the other's end the later (`R6500.1` after `R6427.1`, `R6427.1` after `R6427`,
+/// `dev.12521` after `dev.12365`); `false` for builds of other shapes (`R6500.1` against
+/// `dev.3`) and where either side has none. It allocates nothing.
+#[must_use]
+pub fn cli_build_later(to: &str, from: &str) -> bool {
+    let (Some(to), Some(from)) = (cli_version_build(to), cli_version_build(from)) else {
+        return false;
+    };
+    let (mut a, mut b) = (Runs(to.as_bytes()), Runs(from.as_bytes()));
+    let mut order = Ordering::Equal;
+    loop {
+        let (x, y) = match (a.next(), b.next()) {
+            (None, _) => return order == Ordering::Greater,
+            (Some(_), None) => return order != Ordering::Less,
+            (Some(x), Some(y)) => (x, y),
+        };
+        match (x[0].is_ascii_digit(), y[0].is_ascii_digit()) {
+            (true, true) => {
+                // A run of digits as a number of any size: its digits past the leading zeros,
+                // ordered by their count, then as text.
+                fn number(run: &[u8]) -> (usize, &[u8]) {
+                    let lead = run.iter().take_while(|&&d| d == b'0').count();
+                    let rest = &run[lead..];
+                    (rest.len(), rest)
+                }
+                if order == Ordering::Equal {
+                    order = number(x).cmp(&number(y));
+                }
+            }
+            (false, false) if x == y => {}
+            _ => return false,
+        }
+    }
+}
+
+/// A build's maximal runs of digits and of other bytes, in order ([`cli_build_later`]).
+struct Runs<'a>(&'a [u8]);
+
+impl<'a> Runs<'a> {
+    fn next(&mut self) -> Option<&'a [u8]> {
+        let first = *self.0.first()?;
+        let digit = first.is_ascii_digit();
+        let len = self
+            .0
+            .iter()
+            .take_while(|b| b.is_ascii_digit() == digit)
+            .count();
+        let (run, rest) = self.0.split_at(len);
+        self.0 = rest;
+        Some(run)
+    }
 }
 
 /// Whether CLI version `to` is numerically later than `from` (their [`cli_version_core`]s
@@ -455,9 +540,18 @@ mod tests {
             ("?", None),
             ("latest", None),
             ("-1", None),
+            ("2.1.", None),
+            ("2..1", None),
+            (".2.1", None),
+            ("2.1.305.", None),
+            ("v", None),
         ] {
             assert_eq!(cli_version_core(raw), core, "{raw:?}");
         }
+        assert!(
+            !cli_version_later("2.1.", "2.1.0") && !cli_version_later("2.1.0", "2.1."),
+            "a malformed core is no version on either side"
+        );
         assert!(cli_version_later("2.1.310", "2.1.305"));
         assert!(cli_version_later("2.1.310", "2.1.31"), "numeric, not text");
         assert!(cli_version_later("2.2", "2.1.999"));
@@ -467,5 +561,96 @@ mod tests {
         assert!(!cli_version_later("2.1.305.0", "2.1.305"));
         assert!(!cli_version_later("latest", "2.1.305"));
         assert!(!cli_version_later("2.1.310", ""));
+    }
+
+    /// A LATER REVISION OR DEV BUILD UNDER ONE CORE IS OFFERED, NEVER A STEP BACK: a later core,
+    /// a later Muse revision and a later dev count under the same core are moves the ⬆️ offers,
+    /// with the build past the core named; the same build, an earlier core, an earlier revision
+    /// or dev count under the same core, builds of other shapes and a side that is not a version
+    /// are not. CONTROL: `cli_version_later` alone refuses the revision.
+    #[test]
+    fn a_revision_or_dev_build_under_one_core_is_offered_never_a_step_back() {
+        for (to, from) in [
+            ("2.1.310", "2.1.305"),
+            ("1.4.10-R6500.1", "1.4.10-R6427.1"),
+            ("1.4.10-R6427.1", "1.4.10-R6427"),
+            ("1.4.10-R6427.10", "1.4.10-R6427.9"),
+            ("0.164.0-dev.12521+gabc", "0.164.0-dev.12365+gdef"),
+            (
+                "0.1.0-dev.13765+codex.0.164.0.g5d4c3b2a1",
+                "0.1.0-dev.13764+codex.0.164.0.g4b3a367a0",
+            ),
+            ("1.4.11-R6500.1", "1.4.10-R6427.1"),
+        ] {
+            assert!(cli_version_offered(to, from), "{from} -> {to}");
+        }
+        for (to, from) in [
+            ("2.1.305", "2.1.305"),
+            ("v2.1.305", "2.1.305"),
+            ("2.1.305", "2.1.310"),
+            ("1.4.9-R6999.1", "1.4.10-R6427.1"),
+            ("1.4.10-R6427.1", "1.4.10-R6500.1"),
+            ("1.4.10-R6427", "1.4.10-R6427.1"),
+            ("1.4.10-R06427.1", "1.4.10-R6427.1"),
+            ("0.164.0-dev.12365+gdef", "0.164.0-dev.12521+gabc"),
+            (
+                "0.1.0-dev.13764+codex.0.164.0.g4b3a367a0",
+                "0.1.0-dev.13765+codex.0.164.0.g5d4c3b2a1",
+            ),
+            (
+                "0.1.0-dev.13764+codex.0.165.0.g5d4c3b2a1",
+                "0.1.0-dev.13764+codex.0.164.0.g4b3a367a0",
+            ),
+            ("1.4.10-R6500.1", "1.4.10-dev.3"),
+            ("1.4.10-R6500.1", "1.4.10"),
+            ("latest", "2.1.305"),
+            ("2.1.310", ""),
+            ("2.1.", "2.1.0"),
+        ] {
+            assert!(!cli_version_offered(to, from), "{from} -> {to}");
+        }
+        assert!(
+            !cli_version_later("1.4.10-R6500.1", "1.4.10-R6427.1"),
+            "CONTROL: the cores alone are equal"
+        );
+        for (raw, build) in [
+            ("1.4.10-R6500.1", Some("R6500.1")),
+            ("0.164.0-dev.12521+g1a2b3c4d5", Some("dev.12521")),
+            ("0.1.0-dev.3+codex.0.165.0.g1a2", Some("dev.3")),
+            ("2.1.305", None),
+            ("2.1.305+gabc-1", None),
+            ("1.4.10-", None),
+            ("latest-1", None),
+        ] {
+            assert_eq!(cli_version_build(raw), build, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_numeric_build_difference_still_checks_the_remaining_paired_shape() {
+        for (to, from) in [
+            ("1.4.10-R6500.foo", "1.4.10-R6400.bar"),
+            ("1.4.10-R6500.2-extra", "1.4.10-R6400.1-other"),
+            ("0.1.0-dev.13765.alpha", "0.1.0-dev.13764.beta"),
+        ] {
+            assert!(
+                !cli_version_offered(to, from),
+                "different later shape: {from} -> {to}"
+            );
+            assert!(
+                !cli_version_offered(from, to),
+                "different earlier shape: {to} -> {from}"
+            );
+        }
+        for (to, from) in [
+            ("1.4.10-R6500.1", "1.4.10-R6427.9"),
+            ("1.4.10-R6500", "1.4.10-R6427.9"),
+        ] {
+            assert!(
+                cli_version_offered(to, from),
+                "compatible shape: {from} -> {to}"
+            );
+            assert!(!cli_version_offered(from, to), "CONTROL: reverse ordering");
+        }
     }
 }

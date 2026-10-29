@@ -3658,14 +3658,27 @@ mod tests {
         assert!(is_space(' ') && is_space('\u{00a0}') && !is_space('x'));
     }
 
-    /// Range tables are sorted, disjoint, and non-adjacent.
+    /// Range tables are sorted, disjoint, non-adjacent, and bounded by `U+10FFFF`.
     #[test]
     fn range_tables_are_well_formed() {
         for (name, table) in [("ND", ND), ("MARK", MARK), ("PC", PC)] {
+            assert!(!table.is_empty(), "{name}: table must not be empty");
+            for &(lo, hi) in table {
+                assert!(lo <= hi, "{name}: inverted range ({lo:#x}, {hi:#x})");
+                assert!(
+                    hi <= 0x10_FFFF,
+                    "{name}: range ({lo:#x}, {hi:#x}) exceeds U+10FFFF"
+                );
+            }
             for w in table.windows(2) {
-                assert!(w[0].0 <= w[0].1, "{name}: inverted range {:?}", w[0]);
                 assert!(w[0].1 + 1 < w[1].0, "{name}: {:?} touches {:?}", w[0], w[1]);
             }
+        }
+        for &(cp, next) in FOLD {
+            assert!(
+                cp <= 0x10_FFFF && next <= 0x10_FFFF,
+                "FOLD entry ({cp:#x}, {next:#x}) exceeds U+10FFFF"
+            );
         }
         for w in FOLD.windows(2) {
             assert!(w[0].0 < w[1].0, "FOLD is not sorted by code point");

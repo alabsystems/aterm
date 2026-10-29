@@ -6,7 +6,10 @@
 
 use super::harness_page::{metadata_cards, row_cards};
 use super::*;
-use crate::harness_screen::{TabComputer, TabControlProjection, TabSpreadsheetRow};
+use crate::harness_screen::{
+    TabComputer, TabControlProjection, TabSpreadsheetRow, active_ai_count, active_ai_words,
+    ai_cli_count,
+};
 use crate::native_app::HarnessRequest;
 
 /// Prefix for actions minted by the Tab Control page.
@@ -420,36 +423,7 @@ fn computer_row(comp: &TabComputer, inner: f32, held: &mut LiveRowHeights) -> (U
         "{} \u{b7} {} \u{b7} {}",
         comp.name, comp.status, comp.address
     );
-    let line2 = if comp.id.starts_with("lan/") {
-        format!("{} \u{b7} sessions unobserved", comp.os_version)
-    } else {
-        format!(
-            "{} \u{b7} {} aterm {} \u{b7} {} open {} \u{b7} {}",
-            comp.os_version,
-            comp.instances,
-            if comp.instances == 1 {
-                "instance"
-            } else {
-                "instances"
-            },
-            comp.tabs,
-            if comp.tabs == 1 { "tab" } else { "tabs" },
-            if comp.ai_clis == 0 {
-                "no AI CLI".to_string()
-            } else {
-                format!(
-                    "{} {} ({} active)",
-                    comp.ai_clis,
-                    if comp.ai_clis == 1 {
-                        "AI CLI"
-                    } else {
-                        "AI CLIs"
-                    },
-                    comp.active_ai
-                )
-            }
-        )
-    };
+    let line2 = computer_detail(comp);
     let has_vitals = !comp.vitals.is_empty();
     let full_label = if has_vitals {
         format!("{line1} \u{2014} {} \u{2014} {line2}", comp.vitals)
@@ -472,6 +446,58 @@ fn computer_row(comp: &TabComputer, inner: f32, held: &mut LiveRowHeights) -> (U
         )
         .children(parts.into_iter().map(|(node, _)| node).collect());
     (node, total_height)
+}
+
+/// Observed computer facts, keeping unreported counts distinct from measured zero.
+pub(crate) fn computer_detail(comp: &TabComputer) -> String {
+    let os = comp.os_version.as_deref().unwrap_or("OS unreported");
+    if comp.id.starts_with("lan/") {
+        return format!("{os} \u{b7} sessions unobserved");
+    }
+    let sessions = match (comp.instances, comp.tabs, comp.session_scope) {
+        #[cfg(unix)]
+        (_, Some(tabs), crate::harness_screen::TabSessionScope::OneInstanceHeartbeat) => {
+            format!("{tabs} sessions from one instance \u{b7} total instances unobserved")
+        }
+        (
+            Some(instances),
+            Some(tabs),
+            crate::harness_screen::TabSessionScope::CachedObservations,
+        ) => {
+            format!(
+                "{instances} observed aterm {} \u{b7} {tabs} observed {}",
+                if instances == 1 {
+                    "instance"
+                } else {
+                    "instances"
+                },
+                if tabs == 1 { "session" } else { "sessions" },
+            )
+        }
+        (Some(instances), Some(tabs), _) => format!(
+            "{instances} aterm {} \u{b7} {tabs} open {}",
+            if instances == 1 {
+                "instance"
+            } else {
+                "instances"
+            },
+            if tabs == 1 { "tab" } else { "tabs" },
+        ),
+        (None, Some(tabs), _) => format!("{tabs} reported sessions \u{b7} instances unobserved"),
+        _ => "sessions unobserved".to_owned(),
+    };
+    let ai = match comp.ai_clis {
+        None => "AI CLIs unobserved".to_owned(),
+        Some(0) => "no AI CLI".to_owned(),
+        Some(n) => {
+            let active = active_ai_words(comp.active_ai);
+            format!(
+                "{n} {} ({active})",
+                if n == 1 { "AI CLI" } else { "AI CLIs" }
+            )
+        }
+    };
+    format!("{os} \u{b7} {sessions} \u{b7} {ai}")
 }
 
 fn spreadsheet_rows(
@@ -505,17 +531,17 @@ fn spreadsheet_rows(
     for row in &tabs.tabs {
         if let Some(group) = groups
             .iter_mut()
-            .find(|(c, i, _)| c == &row.computer && i == &row.instance)
+            .find(|(c, i, _)| c == &row.computer_id && i == &row.instance)
         {
             group.2.push(row);
         } else {
-            groups.push((row.computer.clone(), row.instance.clone(), vec![row]));
+            groups.push((row.computer_id.clone(), row.instance.clone(), vec![row]));
         }
     }
-    for (group_idx, (computer, instance, group_rows)) in groups.into_iter().enumerate() {
+    for (group_idx, (_, instance, group_rows)) in groups.into_iter().enumerate() {
         rows.push(session_group_header_row(
             group_idx,
-            &computer,
+            &group_rows[0].computer,
             &instance,
             &group_rows,
             inner,
@@ -550,14 +576,11 @@ fn session_group_header_row(
         .map(|d| format!("{}{d} grid", crate::native_ui::FACT_SEPARATOR))
         .unwrap_or_default();
     let tab_count = group_rows.len();
-    let ai_count = group_rows.iter().filter(|r| r.is_ai_cli).count();
-    let active_ai = group_rows
-        .iter()
-        .filter(|r| {
-            r.is_ai_cli
-                && (r.ai_status.starts_with("working") || r.ai_status.starts_with("waiting"))
-        })
-        .count();
+    let ai_count = ai_cli_count(group_rows.iter().copied()).map_or_else(
+        || "AI CLIs unobserved".to_owned(),
+        |count| format!("{count} AI {}", if count == 1 { "CLI" } else { "CLIs" }),
+    );
+    let active_ai = active_ai_words(active_ai_count(group_rows.iter().copied()));
     let mut progs: Vec<String> = Vec::new();
     for r in group_rows {
         if !progs.contains(&r.program) {
@@ -565,14 +588,13 @@ fn session_group_header_row(
         }
     }
     let text = format!(
-        "\u{25b8} {} \u{b7} {}{} \u{2014} {} open {} \u{b7} {} AI {} ({} active) \u{b7} [{}]",
+        "\u{25b8} {} \u{b7} {}{} \u{2014} {} open {} \u{b7} {} ({}) \u{b7} [{}]",
         computer,
         instance,
         dims,
         tab_count,
         if tab_count == 1 { "tab" } else { "tabs" },
         ai_count,
-        if ai_count == 1 { "CLI" } else { "CLIs" },
         active_ai,
         progs.join(", ")
     );

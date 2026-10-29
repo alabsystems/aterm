@@ -6,10 +6,11 @@
 
 use super::super::{DcsType, MAX_DCS_GLOBAL_BUDGET};
 use super::TerminalHandler;
+use super::handler_decrsps::DATA_CAP as RESTORE_DATA_CAP;
 
 impl TerminalHandler<'_> {
     /// Begin a DCS sequence (`ESC P <params> <intermediates> <final> <data> ST`).
-    pub(super) fn dcs_hook_inner(&mut self, _params: &[u16], intermediates: &[u8], final_byte: u8) {
+    pub(super) fn dcs_hook_inner(&mut self, params: &[u16], intermediates: &[u8], final_byte: u8) {
         self.dcs.total_bytes = self.dcs.total_bytes.saturating_sub(self.dcs.sequence_bytes);
         self.dcs.data.clear();
         self.dcs.sequence_bytes = 0;
@@ -20,6 +21,8 @@ impl TerminalHandler<'_> {
 
         if intermediates == *b"$" && final_byte == b'q' {
             self.dcs.dcs_type = DcsType::Decrqss;
+        } else if params == [1] && intermediates == *b"$" && final_byte == b't' {
+            self.dcs.dcs_type = DcsType::Decrsps { discarded: false };
         } else if intermediates.is_empty() && final_byte == b'q' {
             self.dcs.dcs_type = DcsType::Sixel;
             self.sixel.decoder.hook();
@@ -33,6 +36,7 @@ impl TerminalHandler<'_> {
     /// Accumulate one DCS data byte for the type `dcs_hook` identified.
     pub(super) fn dcs_put_inner(&mut self, byte: u8) {
         if self.dcs.total_bytes >= MAX_DCS_GLOBAL_BUDGET {
+            self.discard_cursor_restore();
             return; // Global budget exceeded: drop the byte.
         }
 
@@ -68,6 +72,15 @@ impl TerminalHandler<'_> {
                     self.dcs.data.push(byte);
                 }
             }
+            DcsType::Decrsps { .. } => {
+                self.dcs.total_bytes += 1;
+                self.dcs.sequence_bytes += 1;
+                if self.dcs.data.len() < RESTORE_DATA_CAP {
+                    self.dcs.data.push(byte);
+                } else {
+                    self.discard_cursor_restore();
+                }
+            }
             DcsType::Unknown | DcsType::None => {
                 self.dcs.total_bytes += 1;
                 self.dcs.sequence_bytes += 1;
@@ -80,6 +93,9 @@ impl TerminalHandler<'_> {
         let countable = data
             .len()
             .min(MAX_DCS_GLOBAL_BUDGET.saturating_sub(self.dcs.total_bytes));
+        if countable < data.len() {
+            self.discard_cursor_restore();
+        }
         if countable == 0 {
             return;
         }
@@ -107,7 +123,20 @@ impl TerminalHandler<'_> {
                 }
             }
             DcsType::Xtgettcap => self.push_dcs_data_capped(data, 1024),
+            DcsType::Decrsps { .. } => {
+                if data.len() > RESTORE_DATA_CAP.saturating_sub(self.dcs.data.len()) {
+                    self.discard_cursor_restore();
+                }
+                self.push_dcs_data_capped(data, RESTORE_DATA_CAP);
+            }
             DcsType::Unknown | DcsType::None => {}
+        }
+    }
+
+    /// A mutating restore never accepts a retained prefix after any byte was dropped.
+    fn discard_cursor_restore(&mut self) {
+        if matches!(self.dcs.dcs_type, DcsType::Decrsps { .. }) {
+            self.dcs.dcs_type = DcsType::Decrsps { discarded: true };
         }
     }
 
@@ -120,7 +149,7 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Finish a DCS string at ST: answer DECRQSS or XTGETTCAP, or place the Sixel image.
+    /// Finish a DCS string at ST: answer a query, restore cursor presentation, or place Sixel.
     pub(super) fn dcs_unhook_inner(
         &mut self,
         cap: &super::super::response_capability::ResponseCapability,
@@ -141,7 +170,12 @@ impl TerminalHandler<'_> {
             DcsType::Xtgettcap if !canceled => {
                 self.handle_xtgettcap(cap);
             }
-            DcsType::Decrqss | DcsType::Xtgettcap | DcsType::Unknown | DcsType::None => {}
+            DcsType::Decrsps { discarded: false } if !canceled => self.handle_decrsps(),
+            DcsType::Decrqss
+            | DcsType::Xtgettcap
+            | DcsType::Decrsps { .. }
+            | DcsType::Unknown
+            | DcsType::None => {}
         }
 
         self.dcs.dcs_type = DcsType::None;

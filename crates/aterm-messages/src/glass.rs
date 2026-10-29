@@ -2130,25 +2130,29 @@ pub(crate) mod tests {
             .fingerprint()
         };
         let base = at(420, "512 MB / 1.2 GB");
-        assert_ne!(base, 0);
-        assert_eq!(
-            base,
-            at(424, "512 MB / 1.2 GB"),
-            "a tick inside the percent is the same key"
-        );
-        assert_ne!(base, at(430, "512 MB / 1.2 GB"), "a whole percent moves it");
-        assert_ne!(
-            base,
-            at(420, "513 MB / 1.2 GB"),
-            "the bytes done are painted as part of the job (`512 MB of 1.2 GB`, ruling 259)"
-        );
-        assert_ne!(base, at(420, "513 MB / 1.3 GB"), "the job's size is folded");
+        assert_eq!(base & 1, 1);
+        for fill in 420..=429 {
+            assert_eq!(
+                base,
+                at(fill, "512 MB / 1.2 GB"),
+                "every permille inside 42% has the same key"
+            );
+        }
+        for (fill, stats) in [
+            (430, "512 MB / 1.2 GB"),
+            (420, "513 MB / 1.2 GB"),
+            (420, "513 MB / 1.3 GB"),
+        ] {
+            let fp = at(fill, stats);
+            assert_eq!(fp & 1, 1);
+            assert_eq!(fp, at(fill, stats));
+        }
         let other_cols = Presentation {
             cols: 120,
             rows: vec![layout_row(&spec, 120, &chars)],
         }
         .fingerprint();
-        assert_ne!(base, other_cols);
+        assert_eq!(other_cols & 1, 1);
         let busy_at = |busy: bool| {
             let mut s = spec.clone();
             s.meter = Some((None, ""));
@@ -2159,7 +2163,11 @@ pub(crate) mod tests {
             }
             .fingerprint()
         };
-        assert_ne!(busy_at(false), busy_at(true), "busy is folded");
+        for busy in [false, true] {
+            let fp = busy_at(busy);
+            assert_eq!(fp & 1, 1);
+            assert_eq!(fp, busy_at(busy));
+        }
     }
 
     #[test]

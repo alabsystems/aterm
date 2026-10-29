@@ -39,6 +39,10 @@ pub(crate) enum Install {
     /// A shell is starting, with the latest request retained until it can land.
     /// Stop or a pass that no longer needs the tools can withdraw it meanwhile.
     Opening { wanted: Option<u64> },
+    /// A person pressed Install… while a macOS permission gesture held the dialog slot: queued
+    /// so the row explains why and the tab opens once the slot frees and the keyboard has been
+    /// quiet for 2.5 s.
+    PressedQueued { wanted: Option<u64> },
     /// A person's press of Install… started a shell, which lands once its own check passes
     /// ([`App::press_developer_tools_install`]), whatever run is admitted.
     Pressed,
@@ -60,6 +64,12 @@ impl Install {
                     _ => revision,
                 }),
             },
+            Self::PressedQueued { wanted } => Self::PressedQueued {
+                wanted: Some(match wanted {
+                    Some(previous) if previous > revision => previous,
+                    _ => revision,
+                }),
+            },
             other => other,
         }
     }
@@ -72,6 +82,9 @@ impl Install {
             Self::Opening {
                 wanted: Some(previous),
             } if revision >= previous => Self::Opening { wanted: None },
+            Self::PressedQueued {
+                wanted: Some(previous),
+            } if revision >= previous => Self::Unasked,
             other => other,
         }
     }
@@ -81,7 +94,7 @@ impl Install {
     #[must_use]
     pub(crate) const fn withdrawn(self) -> Self {
         match self {
-            Self::Wanted(_) => Self::Unasked,
+            Self::Wanted(_) | Self::PressedQueued { .. } => Self::Unasked,
             Self::Opening { .. } => Self::Opening { wanted: None },
             other => other,
         }
@@ -274,6 +287,7 @@ fn pressed_tab_then(line: String) -> crate::tab_spawn::TabSpawnThen {
                     Ok(sid) => {
                         app.workstation_setup.developer_tools_mark.note_opened();
                         app.start_developer_tools_install(&sid, &line);
+                        app.republish_system_state_developer_tools();
                         app.publish_system_state_front();
                     }
                     Err(why) => aterm_log::warn!(
@@ -402,7 +416,8 @@ impl App {
 
     /// Where an install of Apple's Command Line Tools stands for System State's page (design
     /// §3.3): a live installer, else the tab's installer child alive, asking for the password,
-    /// else neither.
+    /// else neither. When `Install…` was pressed while a permission gesture held the dialog slot,
+    /// reports [`ToolsInstall::Queued`] until it starts.
     pub(crate) fn developer_tools_install_step(&self) -> Option<ToolsInstall> {
         if self.developer_tools_installing() {
             Some(ToolsInstall::Installing)
@@ -415,6 +430,11 @@ impl App {
             Some(ToolsInstall::Recovered)
         } else if self.developer_tools_install_active() {
             Some(ToolsInstall::Password)
+        } else if matches!(
+            self.workstation_setup.developer_tools,
+            Install::PressedQueued { .. }
+        ) {
+            Some(ToolsInstall::Queued)
         } else {
             None
         }
@@ -430,19 +450,27 @@ impl App {
     /// A person's press of the GitHub repositories row's Install… (design §3.3): the tab opens
     /// now, whatever run is admitted and whether or not it opened on this Mac before, landing
     /// once System State is still the front view of its window and no macOS dialog this process
-    /// started is up. `true` when its shell started; `false` starts nothing: a headless
-    /// instance, an installer already running, a tab open or opening, a dialog up, or no front
-    /// page.
+    /// started is up. When a macOS permission gesture holds the dialog slot, queues the press so
+    /// the row explains why and opens the tab once the slot frees; a helper panel out of sight
+    /// holds no press, giving way first (`App::press_meets_unseen_panel`). `true` when its shell
+    /// started or queued, or the guard that panel freed started the run's own install tab;
+    /// `false` starts nothing: a headless instance, an installer already running, a tab open,
+    /// opening or queued, or no front page.
     pub(crate) fn press_developer_tools_install(&mut self) -> bool {
-        if self.headless
-            || self.developer_tools_install_active()
-            || matches!(
-                self.workstation_setup.developer_tools,
-                Install::Opening { .. } | Install::Pressed
-            )
-            || self.access_dialog_up()
-        {
+        if self.headless || self.developer_tools_install_active() {
             return false;
+        }
+        let wanted = matches!(self.workstation_setup.developer_tools, Install::Wanted(_));
+        // A helper panel out of sight never holds the press: it gives way first. The guard it
+        // frees can start the install the run wanted (`Self::tick_developer_tools_install`),
+        // whose tab is then this press's.
+        let _ = self.press_meets_unseen_panel(None, std::time::Instant::now());
+        match self.workstation_setup.developer_tools {
+            Install::Opening { .. } if wanted => return true,
+            Install::Opening { .. } | Install::Pressed | Install::PressedQueued { .. } => {
+                return false;
+            }
+            _ => {}
         }
         let Some(window) = self
             .windows
@@ -454,6 +482,18 @@ impl App {
         };
         if self.developer_tools_installing() {
             return false;
+        }
+        if self.access_dialog_up() {
+            let wanted = match self.workstation_setup.developer_tools {
+                Install::Wanted(revision) => Some(revision),
+                _ => None,
+            };
+            self.workstation_setup.developer_tools = Install::PressedQueued { wanted };
+            aterm_log::info!(
+                "System State: Install… queued while a macOS permission gesture holds the dialog slot"
+            );
+            self.republish_system_state_developer_tools();
+            return true;
         }
         #[cfg(not(windows))]
         let line = crate::ledger_key::own_front_door()
@@ -486,17 +526,22 @@ impl App {
 
     /// The landing check of a pressed tab: System State still the front view of `window`, no
     /// installer running and the dialog slot free, which the child holds through its lifetime.
-    /// A tab that cannot land opens nothing, and the button stays for another press.
+    /// A tab that cannot land opens nothing, and the button stays for another press; if only a
+    /// macOS permission gesture took the dialog slot since the press, the press stays queued.
     fn prepare_pressed_install_landing(&mut self, window: crate::WindowId) -> bool {
         if self.workstation_setup.developer_tools != Install::Pressed {
             return false;
         }
-        if self.system_state_frontmost_in(window)
-            && !self.access_dialog_up()
-            && !self.developer_tools_installing()
-            && self.reserve_access_dialog()
-        {
-            return true;
+        if self.system_state_frontmost_in(window) && !self.developer_tools_installing() {
+            if !self.access_dialog_up() && self.reserve_access_dialog() {
+                return true;
+            }
+            self.workstation_setup.developer_tools = Install::PressedQueued { wanted: None };
+            aterm_log::info!(
+                "System State: the Command Line Tools tab Install… asked for waits for the dialog slot"
+            );
+            self.republish_system_state_developer_tools();
+            return false;
         }
         self.workstation_setup.developer_tools = Install::Opened;
         aterm_log::info!(
@@ -510,6 +555,21 @@ impl App {
             .developer_tools_session
             .iter()
             .any(|terminal| !terminal.finished)
+    }
+
+    /// The installer terminal `session` landed, as a pressed tab's landing leaves it, with no
+    /// recovery receipt: it holds off other prompts until
+    /// [`Self::finish_developer_tools_install`].
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn land_install_session_for_test(&mut self, session: u64) {
+        self.workstation_setup
+            .developer_tools_session
+            .push(Terminal {
+                session,
+                finished: false,
+                recovered: false,
+                receipt: None,
+            });
     }
 
     /// Only the installer's own exit or final view detachment ends its prompt ownership.
@@ -659,6 +719,41 @@ impl App {
         crate::tab_spawn::SpawnAsk,
         crate::tab_spawn::TabSpawnThen,
     )> {
+        if matches!(
+            self.workstation_setup.developer_tools,
+            Install::PressedQueued { .. }
+        ) {
+            // A queued press is no longer this moment's, and its tab takes the window's keys:
+            // it also waits for 2.5 s of quiet keyboard, as the automatic tab does.
+            if self.developer_tools_install_active()
+                || self.access_dialog_up()
+                || self.developer_tools_installing()
+                || !crate::hands_off_keys(true, self.last_keystroke_at, std::time::Instant::now())
+            {
+                return None;
+            }
+            let window = self
+                .windows
+                .keys()
+                .find(|id| self.system_state_frontmost_in(**id))
+                .copied()?;
+            self.workstation_setup.developer_tools = Install::Opened;
+            let Some(line) = line() else {
+                aterm_log::warn!(
+                    "System State: this program's path has no line to type; Install… opens no tab"
+                );
+                self.republish_system_state_developer_tools();
+                return None;
+            };
+            self.workstation_setup.developer_tools = Install::Pressed;
+            self.republish_system_state_developer_tools();
+            let ask = crate::tab_spawn::SpawnAsk {
+                unasked: true,
+                exec_command: Some(waiting_shell_command()),
+                ..crate::tab_spawn::SpawnAsk::default()
+            };
+            return Some((window, ask, pressed_tab_then(line)));
+        }
         if !self.developer_tools_install_due(
             self.system_state_frontmost(),
             !self.system_state_host.latest_status().running.is_empty(),

@@ -287,8 +287,14 @@ fn stamped_hover() -> String {
 }
 
 fn live_desk() -> (App, String, Arc<crate::SessionCtx>) {
+    live(desk())
+}
+
+/// `desk`'s slot past its first sight: a refresh that moves nothing stamps no strip.
+fn live(
+    (mut app, sid, ctx): (App, String, Arc<crate::SessionCtx>),
+) -> (App, String, Arc<crate::SessionCtx>) {
     use crate::session_status::{ActivitySample, Evidence};
-    let (mut app, sid, ctx) = desk();
     let t0 = std::time::Instant::now();
     let reading = Evidence {
         shell: None,
@@ -451,5 +457,301 @@ fn the_chips_description_costs_no_more_for_nine_needs_than_for_two() {
     assert_eq!(
         nine_cost, two_cost,
         "the description's cost: {two:?} / {nine:?}"
+    );
+}
+
+/// The `owner=needs` entry codex-alab sets for [`CODEX_NEEDS`], as it sets it.
+const CODEX_ENTRY: &str = "Codex needs you: the release credential \
+                           (~/.aterm/release-credentials.toml) to sign 0.48.0 (+2 more) \u{2014} \
+                           carrying on";
+const NEED_D: &str = "rotate the deploy key";
+const CODEX_NEEDS: [&str; 3] = [NEED_B, NEED_C, NEED_D];
+
+/// Session 0 as a codex-alab tab: codex in front, read with no state of its own.
+fn codex_desk() -> (App, String, Arc<crate::SessionCtx>) {
+    let mut app = App::headless_for_test();
+    let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+    {
+        let mut tl = ctx.timeline.lock().unwrap();
+        tl.note_foreground_group(7);
+        tl.set_program(7, Some("codex".into()));
+    }
+    app.refresh_presence_session(0);
+    (app, ctx.self_id.as_str().to_string(), ctx)
+}
+
+/// `meta <rest>` on session 0 through the real dispatch, from connection 4 of the process
+/// [`crate::self_claim::stand_in`] proves, the window woken as its wakes say.
+fn self_meta(app: &mut App, rest: &str) -> String {
+    let session = app.pool.get(0).expect("session 0");
+    let (term, ctx) = (session.term.clone(), session.ctx.clone());
+    let (reply, wakes) = crate::control::meta_wakes_proving_for_test(
+        &app.store,
+        &term,
+        0,
+        &ctx,
+        rest,
+        Some(4),
+        &|_| Some(crate::self_claim::stand_in::running()),
+    );
+    for wake in wakes {
+        match wake {
+            crate::Wake::MetaChanged { session } => app.on_meta_changed(session),
+            crate::Wake::HarnessFact { sid, fact } => app.apply_harness_fact(&sid, fact),
+            other => panic!("a wake the meta lane sends: {other:?}"),
+        }
+    }
+    reply
+}
+
+/// `meta set harness_needs` for `needs` beside `entry`, each percent-encoded.
+fn needs_line(entry: &str, needs: &[&str]) -> String {
+    let pct = aterm_control::wire::pct_encode;
+    let needs: Vec<String> = needs
+        .iter()
+        .map(|need| format!("need={}", pct(need)))
+        .collect();
+    format!("set harness_needs entry={} {}", pct(entry), needs.join(" "))
+}
+
+/// A row one level in that says `need`, whoever's tab it names.
+fn one_in_any(line: &str, need: &str) -> bool {
+    line.strip_prefix(&format!("{need:?} enabled=yes checked=no tip=\""))
+        .is_some_and(|rest| rest.ends_with(" needs this too\" indent=1"))
+}
+
+fn status_field(app: &App, key: &str) -> Option<String> {
+    let line = app.session_status_record(0).expect("status");
+    let prefix = format!("{key}=");
+    line.split_whitespace()
+        .find_map(|w| w.strip_prefix(prefix.as_str()))
+        .map(str::to_owned)
+}
+
+/// A CODEX-ALAB'S OWN SET SHOWS EVERY NEED WHERE ATERM'S OWN LOOP'S DOES, WHILE ITS CLAIM STANDS
+/// (§14.3.4): three needs told on its proven claim (`meta set harness_needs`) beside the entry it
+/// set read whole on the menu bar, its first on the session's own row and the other two one level
+/// in, a hover line each, `status needs=ask needs_n=3 needs_told=3`, and the set told before its
+/// entry shows once the entry stands. NEGATIVE CONTROLS: the entry alone (no claim to tell it on,
+/// and the claim with nothing told) shows the first need and a count, as before, with no row one
+/// level in and `needs_told=-`; a set aterm's own loop left for the same entry is never shown
+/// under the claim, and once the claim ends the window reads aterm's own loop's set again.
+#[test]
+fn a_codex_alabs_own_set_shows_every_need_while_its_claim_stands() {
+    let (mut app, sid, ctx) = codex_desk();
+    let first_and_count = |app: &App, case: &str| {
+        let lines = needs_lines(app);
+        assert_eq!(lines.len(), 1, "{case}: {lines:#?}");
+        assert!(
+            lines[0].contains(" (+2 more)"),
+            "{case}: the entry's count: {lines:#?}"
+        );
+        let hover = hover(app);
+        assert!(
+            hover
+                .first()
+                .is_some_and(|l| l.starts_with("Needs you: ") && l.ends_with(" (+2 more)")),
+            "{case}: {hover:#?}"
+        );
+        assert!(
+            !hover.contains(&format!("Needs you: {NEED_C}")),
+            "{case}: {hover:#?}"
+        );
+        assert_eq!(
+            status_field(app, "needs_told").as_deref(),
+            Some("-"),
+            "{case}"
+        );
+    };
+    let every_need = |app: &App, needs: [&str; 3], case: &str| {
+        let lines = needs_lines(app);
+        assert_eq!(lines.len(), 3, "{case}: {lines:#?}");
+        assert!(
+            lines[0].contains(&format!(" \u{2014} {}", needs[0])) && !lines[0].contains("more)"),
+            "{case}: {lines:#?}"
+        );
+        assert!(
+            one_in_any(&lines[1], needs[1]) && one_in_any(&lines[2], needs[2]),
+            "{case}: {lines:#?}"
+        );
+        let hover = hover(app);
+        assert_eq!(
+            hover.get(..3),
+            Some(needs.map(|need| format!("Needs you: {need}")).as_slice()),
+            "{case}: {hover:#?}"
+        );
+        assert_eq!(
+            (
+                status_field(app, "needs").as_deref(),
+                status_field(app, "needs_n").as_deref(),
+                status_field(app, "needs_told").as_deref()
+            ),
+            (Some("ask"), Some("3"), Some("3")),
+            "{case}"
+        );
+    };
+    let entry_line = format!("set attention owner=needs kind=ask {CODEX_ENTRY}");
+    assert_eq!(
+        self_meta(&mut app, &needs_line(CODEX_ENTRY, &CODEX_NEEDS)),
+        "ERR denied\n",
+        "CONTROL: no claim to tell it on"
+    );
+    assert_eq!(self_meta(&mut app, &entry_line), "OK\n");
+    first_and_count(&app, "CONTROL: no claim");
+    let me = format!("codex-alab@{}", crate::self_claim::stand_in::pid());
+    assert_eq!(self_meta(&mut app, &format!("set supervisor {me}")), "OK\n");
+    first_and_count(&app, "CONTROL: claimed, nothing told");
+
+    assert_eq!(
+        self_meta(&mut app, &needs_line(CODEX_ENTRY, &CODEX_NEEDS)),
+        "OK\n"
+    );
+    every_need(&app, CODEX_NEEDS, "told on the claim");
+    tell(&mut app, &sid, &[NEED_D, NEED_C, NEED_B], CODEX_ENTRY);
+    every_need(
+        &app,
+        CODEX_NEEDS,
+        "aterm's own loop's set for the same entry is never read under the claim",
+    );
+
+    assert_eq!(self_meta(&mut app, "unset harness_needs"), "OK\n");
+    assert_eq!(self_meta(&mut app, "unset attention owner=needs"), "OK\n");
+    assert_eq!(needs_lines(&app), Vec::<String>::new(), "taken down");
+    assert_eq!(
+        self_meta(&mut app, &needs_line(CODEX_ENTRY, &CODEX_NEEDS)),
+        "OK\n",
+        "told before its entry stands"
+    );
+    assert_eq!(needs_lines(&app), Vec::<String>::new(), "no entry yet");
+    assert_eq!(self_meta(&mut app, &entry_line), "OK\n");
+    every_need(&app, CODEX_NEEDS, "the set told before its entry");
+
+    assert!(crate::session_timeline::release_supervisor(
+        &ctx,
+        Some(4),
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Aterm
+    ));
+    app.on_meta_changed(0);
+    every_need(
+        &app,
+        [NEED_D, NEED_C, NEED_B],
+        "CONTROL: the claim gone, aterm's own loop's set is read again",
+    );
+}
+
+/// A CODEX-ALAB'S SET CUT AT 32 COUNTS EVERY NEED ITS ENTRY COUNTS, WITHIN THE MENU'S CAPS
+/// (§14.3.4, §12.2.12): 41 needs stand, so codex-alab's entry counts `(+40 more)` and it tells the
+/// first 32 (`HARNESS_NEEDS_MAX`). The menu bar draws the first on the session's row and only
+/// `NEED_MORE_ROWS` (2) further rows one level in, the last counting the 38 past them; the hover
+/// gives each of the 32 told a `Needs you:` line, the last counting the 9 nobody told; `status
+/// needs_n=41`, `needs_told=32`. NEGATIVE CONTROL: the needs told are each read whole where a
+/// surface lists them.
+#[test]
+fn a_codex_alabs_set_cut_at_32_counts_every_need_its_entry_counts() {
+    // `control_session::HARNESS_NEEDS_MAX`, the most one line tells.
+    const TOLD: usize = 32;
+    let (mut app, _, _) = codex_desk();
+    let needs: Vec<String> = (1..=41).map(|i| format!("need number {i}")).collect();
+    let entry = "Codex needs you: need number 1 (+40 more) \u{2014} carrying on";
+    let me = format!("codex-alab@{}", crate::self_claim::stand_in::pid());
+    assert_eq!(self_meta(&mut app, &format!("set supervisor {me}")), "OK\n");
+    assert_eq!(
+        self_meta(
+            &mut app,
+            &format!("set attention owner=needs kind=ask {entry}")
+        ),
+        "OK\n"
+    );
+    let told: Vec<&str> = needs[..TOLD].iter().map(String::as_str).collect();
+    assert_eq!(self_meta(&mut app, &needs_line(entry, &told)), "OK\n");
+
+    let lines = needs_lines(&app);
+    assert_eq!(
+        lines.len(),
+        3,
+        "the session's row and two one level in: {lines:#?}"
+    );
+    assert!(
+        lines[0].contains(" \u{2014} need number 1 ") && !lines[0].contains("more)"),
+        "{lines:#?}"
+    );
+    assert!(
+        one_in_any(&lines[1], "need number 2") && one_in_any(&lines[2], "need number 3 (+38 more)"),
+        "{lines:#?}"
+    );
+    let hover = hover(&app);
+    assert_eq!(
+        hover.get(30..32),
+        Some(
+            [
+                "Needs you: need number 31".to_string(),
+                "Needs you: need number 32 (+9 more)".to_string()
+            ]
+            .as_slice()
+        ),
+        "{hover:#?}"
+    );
+    assert_eq!(
+        (
+            status_field(&app, "needs_n").as_deref(),
+            status_field(&app, "needs_told").as_deref()
+        ),
+        (Some("41"), Some("32"))
+    );
+}
+
+/// A CODEX-ALAB'S SET THAT MOVES UNDER ONE ENTRY RESTAMPS THE HOVER ONCE (§14.3.4, §12.2.12's
+/// stamp): its `meta set harness_needs` wakes the window with the needs fact aterm's own loop's
+/// tell sends, so `[b, c, d]` to `[b, a, d]` beside the same entry, which leaves the pill's words
+/// as they were, still moves the stamped hover, in one stamp. NEGATIVE CONTROL: the same set told
+/// again stamps nothing.
+#[test]
+fn the_stamped_hover_follows_a_codex_alabs_set_under_one_entry() {
+    let (mut app, _, _) = live(codex_desk());
+    let me = format!("codex-alab@{}", crate::self_claim::stand_in::pid());
+    assert_eq!(self_meta(&mut app, &format!("set supervisor {me}")), "OK\n");
+    assert_eq!(
+        self_meta(
+            &mut app,
+            &format!("set attention owner=needs kind=ask {CODEX_ENTRY}")
+        ),
+        "OK\n"
+    );
+    assert_eq!(
+        self_meta(&mut app, &needs_line(CODEX_ENTRY, &CODEX_NEEDS)),
+        "OK\n"
+    );
+    assert!(
+        stamped_hover().contains(&format!("Needs you: {NEED_C}")),
+        "PRECONDITION (c) stamped: {}",
+        stamped_hover()
+    );
+    let _ = crate::work_counts::take_tooltip_pushes();
+    assert_eq!(
+        self_meta(
+            &mut app,
+            &needs_line(CODEX_ENTRY, &[NEED_B, NEED_A, NEED_D])
+        ),
+        "OK\n"
+    );
+    let stamps = crate::work_counts::take_tooltip_pushes();
+    let now = stamped_hover();
+    assert!(
+        now.contains(&format!("Needs you: {NEED_A}")) && !now.contains(NEED_C),
+        "stamps={stamps}; the stamped hover: {now}"
+    );
+    assert_eq!(stamps, 1, "one stamp for the set's move: {now}");
+    assert_eq!(
+        self_meta(
+            &mut app,
+            &needs_line(CODEX_ENTRY, &[NEED_B, NEED_A, NEED_D])
+        ),
+        "OK\n"
+    );
+    assert_eq!(
+        crate::work_counts::take_tooltip_pushes(),
+        0,
+        "CONTROL: the standing set told again"
     );
 }

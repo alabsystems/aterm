@@ -10,10 +10,11 @@ use aterm_json::{Map, Value};
 use aterm_types::control_verbs::ScreenGen;
 
 use super::relaunch::{
-    Launch, NoPlan, Plan, PromptLook, PromptMark, Relaunch, RelaunchLineError, STALE_S,
+    Launch, NoPlan, Plan, PromptLook, PromptMark, Relaunch, RelaunchLineError, STALE_S, TAB_TAKEN,
     WAIT_HAND_LIFTS, await_new, carry_on, confirm, expired, fallback_carried, fallback_origin,
-    hand_waits_out, launched, pause, plan, recorded, relaunch, relaunch_of, resume_mode,
-    screen_mode, type_relaunch_line_with, unplanned, wait_now, wait_until,
+    hand_waits_out, launched, overtaken_by, overtaken_line, pause, plan, recorded, relaunch,
+    relaunch_of, resume_mode, screen_mode, tab_front, type_relaunch_line_with, unplanned, wait_now,
+    wait_until,
 };
 use super::upgrade::{self, Candidate, Facts, Phase, Request, SessionFile, Source, Step, Version};
 use super::upgrade_catalog::{self as catalog, Baked};
@@ -52,12 +53,13 @@ pub(crate) use upgrade_status::pin_awake_since;
 pub use upgrade_status::progress_projection;
 pub(super) use upgrade_status::runs_under;
 pub use upgrade_status::{
-    ATTENTION_OWNER, AUTOPILOT_OFF, Aside, Ask, Attention, CLAIMED, DIGEST_AFTER_S,
-    HUNG_EXIT_AFTER_S, HeldBy, LIMIT_GRACE_S, Level, MOVE_BUDGET_S, NEED_THEN_MAX, NEED_WHY_MAX,
-    NOT_FOREGROUND, NOW_QUIETS_S, Need, NeedSeverity, REFUSED_STOPPED, Remedy, Row,
-    STALLED_AFTER_S, SUSPENDED_AFTER_S, TELL_S, UNWATCHED_AFTER_S, View, WAKE_CATCH_UP_S,
-    WAKE_GRACE_S, ask, ask_for, awake_since, elapsed_words, refusal_sentence, refused_stopped,
-    rows, status_rows, system_awake_since, tab_row, tab_rows, unwatched_since, word_marker,
+    AGENT_OFF, ATTENTION_OWNER, AUTOPILOT_OFF, Aside, Ask, AskScope, Attention, CLAIMED,
+    DIGEST_AFTER_S, HUNG_EXIT_AFTER_S, HeldBy, LIMIT_GRACE_S, Level, MOVE_BUDGET_S, NEED_THEN_MAX,
+    NEED_WHY_MAX, NOT_FOREGROUND, NOW_QUIETS_S, Need, NeedSeverity, PRESS_CLAIMED, REFUSED_STOPPED,
+    Remedy, Row, STALLED_AFTER_S, SUSPENDED_AFTER_S, TELL_S, UNWATCHED_AFTER_S, View,
+    WAKE_CATCH_UP_S, WAKE_GRACE_S, ask, ask_for, ask_for_scope, awake_since, elapsed_words,
+    refusal_sentence, refused_stopped, rows, status_rows, system_awake_since, tab_row, tab_rows,
+    unwatched_since, word_marker,
 };
 #[cfg(all(test, unix))]
 use watch::watch_with;
@@ -342,6 +344,54 @@ pub fn ladder_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, 
         reason = "Buggy=1 negative control only; the restart over processes under the agent, where the real `gate_restart` waits `background`."
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeProgress",
+        action = "Press",
+        reason = "The owner's press of the top rule's ⬆️: the window's step (`upgrade_status::Ask::Press`, a Now that stamps `pressed_at` for the build it was shown). The Tier-1 binds build the standing press through `Facts::press` and the row's `pressed_at`/`pressed_to`."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeProgress",
+        action = "PressLapses",
+        reason = "The press's span running out (`upgrade::PRESS_S`), its Now cleared, or its build retargeted: the clock's and the record's step, which the reducer and the view only READ (`upgrade_status::press_stands`)."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeProgress",
+        action = "OwnerAsks",
+        reason = "The owner's Now from the tab menu, the band or `aterm harness upgrade --now` (`upgrade_status::Ask::Now`): the owner's step. The Tier-1 binds hand the reducer `Request::Now` exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeProgress",
+        action = "NowAsPress",
+        reason = "Buggy=1 negative control only; the owner's Now acting as a press, restarting over the agent's background work, where the real `requested_step` with no press standing waits `background`."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeProgress",
+        action = "PressPassesInput",
+        reason = "Buggy=1 negative control only; a press restarting over a held tab, a box or a draft, where the real `press_gate` waits `held`, `box` or `draft`."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeProgress",
+        action = "PressReadAsNow",
+        reason = "Buggy=1 negative control only; a standing press read as the plain Now it writes, so its lane waits for background work and the watch records the Now's word. The Tier-1 binds replay that read against the real one, and aterm-spec's liveness sweep breaks `APressMovesPastRunningWork` with it."
+    )
+)]
 #[doc(hidden)]
 pub fn progress_environment() {}
 
@@ -370,7 +420,20 @@ pub struct Opts {
     pub agents_off: Vec<aterm_phase::Program>,
     pub land: bool,
     pub timings: super::Timings,
+    /// The sweep is the lane of the owner's press of the ⬆️ ([`press`]): `None` for every other.
+    pub press: Option<PressOpts>,
 }
+
+/// What the lane of the owner's press of the ⬆️ is told ([`press`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PressOpts {
+    /// The tab's harness is off: the restart takes the quiet flow, typing only the relaunch line.
+    pub off: bool,
+}
+
+/// What [`press`] answers for a tab whose record holds no standing press
+/// ([`St::press_stands`]): the lane ends, and nothing is stepped for it.
+pub const PRESS_LAPSED: &str = "skip:no-press";
 
 /// Source of live `aterm` control sockets for a CLI upgrade sweep.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -543,12 +606,10 @@ pub(super) fn alive(pid: u32) -> bool {
     }
     #[cfg(unix)]
     {
-        let Ok(p) = libc::pid_t::try_from(pid) else {
+        let Ok(p) = i32::try_from(pid) else {
             return false;
         };
-        // SAFETY: signal 0 checks existence and permission; nothing is delivered.
-        let rc = unsafe { libc::kill(p, 0) };
-        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        aterm_uds::process::process_presence(p) == aterm_uds::process::ProcessPresence::Present
     }
     #[cfg(not(unix))]
     {
@@ -1244,7 +1305,7 @@ pub(super) fn lsof_holders(file: &Path, pids: &[u32]) -> Option<Vec<u32>> {
     lsof_holder_pids(&out)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "macos"))]
 fn lsof_holder_pids(out: &std::process::Output) -> Option<Vec<u32>> {
     if !out.stderr.is_empty() {
         return None;
@@ -1362,12 +1423,18 @@ pub(super) fn store_version(program: &Path) -> Option<String> {
     })
 }
 
+/// `twin` when it is a managed twin that execs `program`'s own build ([`catalog::twin_binary`]).
+/// It reads unix twins only (a `#!/bin/sh` body): the `.cmd` twin atpkg lays on Windows is never
+/// parsed here, so a Windows landing is not read, though the wake polls that twin there
+/// (`upgrade_wake::twin_under`).
 pub(super) fn twin_naming(twin: &Path, program: &str) -> Option<PathBuf> {
     let exe = catalog::twin_binary(&std::fs::read_to_string(twin).ok()?)?;
     (exe.file_name().and_then(|n| n.to_str()) == Some(program) && exe.is_file())
         .then(|| twin.to_path_buf())
 }
 
+/// `program`'s managed twin ([`twin_naming`]) at `agents/<program>`, the unix spelling: on
+/// Windows atpkg lays `agents\<program>.cmd`, which is not looked for.
 pub(super) fn managed_agent_twin(program: &str) -> Option<PathBuf> {
     twin_naming(&agents_dir()?.join(program), program)
 }
@@ -1426,8 +1493,8 @@ fn version_within(exe: &Path, limit: Duration) -> Probed {
     let kill_group = || {
         #[cfg(unix)]
         if let Some(group) = group {
-            // SAFETY: `process_group(0)` made this unreaped child's PID its private PGID.
-            unsafe { libc::kill(-group, libc::SIGKILL) };
+            // `process_group(0)` made this unreaped child's PID its private PGID.
+            let _ = aterm_uds::process::kill_group_until_empty(group);
         }
     };
     let Some(stdout) = child.stdout.take() else {
@@ -1511,6 +1578,10 @@ pub(super) fn native_root(home: &Path) -> PathBuf {
     home.join(".local/share/claude/versions")
 }
 
+/// `program`'s managed twin under `layout` at `agents/<program>`, the unix spelling. On Windows
+/// atpkg lays `agents\<program>.cmd` and [`catalog::twin_binary`] reads no `.cmd` body, as
+/// [`Targets::read_with`] reads the native `~/.local/bin/claude` link and not `claude.exe`: a
+/// Windows landing is not read.
 fn managed_twin(layout: &atpkg::store::Layout, program: &str) -> Option<PathBuf> {
     let twin = layout.agents_dir().join(program);
     if !atpkg::linkmode::is_linked(layout, program) {
@@ -1825,10 +1896,12 @@ pub(super) fn host_roster(c: &mut Client) -> Option<Vec<LiveTab>> {
 }
 
 fn parse_host_roster(head: &str, body: &str) -> Option<Vec<LiveTab>> {
-    if !crate::is_ok_reply(head) {
+    if head.split_whitespace().count() != 2 {
         return None;
     }
-    Some(roster_rows(body)?.into_iter().map(|(_, tab)| tab).collect())
+    let count = crate::reply_count(head).ok()??;
+    let rows = roster_rows(body)?;
+    (rows.len() == count).then(|| rows.into_iter().map(|(_, tab)| tab).collect())
 }
 
 pub(crate) fn roster_rows(body: &str) -> Option<Vec<(u64, LiveTab)>> {
@@ -1894,6 +1967,16 @@ pub(super) struct Screen {
     pub(super) first: usize,
     pub(super) generation: Option<String>,
     pub(super) human: HumanInput,
+    /// The program's title read with `rows` (`"title"`); `None` where the host sent no such string.
+    /// Only the unix test module reads it yet, so the expectation stands wherever that module is out.
+    #[cfg_attr(
+        not(all(test, unix)),
+        expect(
+            dead_code,
+            reason = "parsed ahead of the gate's title read, which waits on aterm-phase's title rule"
+        )
+    )]
+    pub(super) title: Option<String>,
 }
 
 pub(super) fn screen(c: &mut Client, sid: &str) -> Option<Screen> {
@@ -1953,6 +2036,7 @@ fn parse_screen(json: &str) -> Option<Screen> {
         first: usize::try_from(first).ok()?,
         generation,
         human,
+        title: v.get("title").and_then(Value::as_str).map(str::to_owned),
     })
 }
 
@@ -3384,6 +3468,10 @@ pub(super) struct St {
     pub(super) request: Request,
     pub(super) request_tab: String,
     pub(super) request_at: u64,
+    /// When the owner pressed the top rule's ⬆️ for this record (`0`: no press), and the build
+    /// that press was for ([`Self::press_stands`]).
+    pub(super) pressed_at: u64,
+    pub(super) pressed_to: String,
     pub(super) outcome: String,
     pub(super) done_at: u64,
     pub(super) agent: upgrade::Agent,
@@ -3540,6 +3628,22 @@ impl St {
     pub(super) fn relaunched(&mut self, at_s: u64) {
         self.phase = Phase::Relaunched { at_s };
         self.relaunched_at = at_s;
+        self.pressed_at = 0;
+    }
+
+    /// Whether the owner's press of the ⬆️ stands for tab `tab` at `now`: pressed within
+    /// [`upgrade::PRESS_S`], for the build this record still moves to, its Now still standing,
+    /// and the move not begun.
+    pub(super) fn press_stands(&self, tab: &str, now: u64) -> bool {
+        upgrade_status::press_stands(
+            self.agent,
+            self.pressed_at,
+            &self.pressed_to,
+            &self.to,
+            &self.request_for(tab),
+            &self.phase,
+            now,
+        )
     }
 
     pub(super) fn progress_key(&self) -> String {
@@ -3836,6 +3940,7 @@ impl St {
             {
                 st.to = to.version.to_string();
                 st.source = to.source.as_str().to_string();
+                st.pressed_at = 0;
                 if st.proc_start.is_empty() && !who.start.is_empty() {
                     st.proc_start = who.start.to_string();
                 }
@@ -3963,6 +4068,42 @@ impl St {
         }
     }
 
+    /// A saved word holding this actual managed move, before a quiet worker claims it. The
+    /// agent, tab, conversation, source and both validated versions must still be its own;
+    /// recovery after a signal and quota model rotations do not enter this path.
+    pub(super) fn held_managed_move(
+        &self,
+        agent: upgrade::Agent,
+        tab: &str,
+        thread: &str,
+        versions: (&str, &str),
+        now: u64,
+    ) -> Option<&'static str> {
+        if self.agent != agent
+            || self.tab != tab
+            || thread.is_empty()
+            || self.thread != thread
+            || self.source != "managed"
+            || !self.is_upgrade()
+            || !matches!(
+                self.phase,
+                Phase::Pending | Phase::Announced { .. } | Phase::Failed(_)
+            )
+            || !upgrade::same_build(agent, &self.from, versions.0)
+            || !upgrade::same_build(agent, &self.to, versions.1)
+        {
+            return None;
+        }
+        let request = self.request_for(tab);
+        request.holds_build_for(agent, versions.1, now).then_some(
+            if matches!(request, Request::Skip(_)) {
+                "skipped"
+            } else {
+                "deferred"
+            },
+        )
+    }
+
     fn word_onto(&self, to: &Candidate, now: u64, same: bool) -> (Request, String, u64) {
         match &self.request {
             Request::Skip(_) if !self.request.holds_build(&to.version.to_string(), now) => {
@@ -4047,6 +4188,7 @@ impl St {
         }
         self.refused = 0;
         self.refused_at = 0;
+        self.pressed_at = 0;
         self.salt = now.max(
             self.salt
                 .saturating_add(u64::from(upgrade::MAX_ASKS))
@@ -4083,15 +4225,21 @@ impl St {
             (self.still_since, self.still_at) = (0, 0);
             return 0;
         };
-        let run = self.still_since != 0
-            && self.still_print == print
-            && now.saturating_sub(self.still_at) <= IDLE_RUN_GAP_S;
-        if !run {
+        if !self.still_runs(&print, now) {
             self.still_print = print;
             self.still_since = now;
         }
         self.still_at = now;
         now.saturating_sub(self.still_since)
+    }
+
+    /// Whether a look at `print` at `now` goes on with the still run: the look before it (an idle one,
+    /// the only kind that has a print) read the same words above the composer, at most
+    /// [`IDLE_RUN_GAP_S`] before.
+    pub(super) fn still_runs(&self, print: &str, now: u64) -> bool {
+        self.still_since != 0
+            && self.still_print == print
+            && now.saturating_sub(self.still_at) <= IDLE_RUN_GAP_S
     }
 
     pub(super) fn note_wait(&mut self, word: &str, now: u64) {
@@ -4151,7 +4299,10 @@ impl St {
             }
             self.refused = self.refused.saturating_add(1);
         }
-        if let Some(why) = step
+        if step.strip_prefix("wait:") == Some(upgrade::PRESSED) {
+            // The press's lane records what holds the move: an automatic step that stood aside
+            // for it leaves that word.
+        } else if let Some(why) = step
             .strip_prefix("wait:")
             .or_else(|| step.strip_prefix("held-back:"))
         {
@@ -4247,6 +4398,7 @@ impl St {
             ("wait", &self.wait),
             ("request", &self.request.word()),
             ("request_tab", &self.request_tab),
+            ("pressed_to", &self.pressed_to),
             ("outcome", &self.outcome),
             ("agent", self.agent.word()),
             ("thread", &self.thread),
@@ -4342,6 +4494,7 @@ impl St {
             ("wait_seen", self.wait_seen),
             ("done_at", self.done_at),
             ("request_at", self.request_at),
+            ("pressed_at", self.pressed_at),
             ("exited_at", self.exited_at),
             ("hand_seen", self.hand_seen_s),
             ("idle_looks", u64::from(self.idle_looks)),
@@ -4548,9 +4701,11 @@ impl St {
             idle_looks: small("idle_looks"),
             idle_pid: small("idle_pid"),
             idle_at: n("idle_at"),
-            request: Request::parse(&s("request")).unwrap_or_default(),
+            request: Request::parse_for(agent, &s("request")).unwrap_or_default(),
             request_tab: s("request_tab"),
             request_at: n("request_at"),
+            pressed_at: n("pressed_at"),
+            pressed_to: s("pressed_to"),
             outcome: s("outcome"),
             done_at: n("done_at"),
             agent,
@@ -4708,11 +4863,11 @@ impl St {
     }
 
     pub(super) fn carried_through_hand(&mut self, now: u64) -> bool {
-        let claude = match self.agent {
-            upgrade::Agent::Claude => true,
-            upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => false,
+        let ends = match self.agent {
+            upgrade::Agent::Claude | upgrade::Agent::Muse | upgrade::Agent::Agy => true,
+            upgrade::Agent::Codex => false,
         };
-        if !claude
+        if !ends
             || !matches!(self.phase, Phase::Exiting { .. })
             || self.pid == 0
             || !super::upgrade_wake::wait_exit(self.pid, Duration::ZERO)
@@ -7252,6 +7407,21 @@ fn pick<'a>(reports: &'a [Report], tab: &str) -> Option<&'a Report> {
         .or_else(|| reports.iter().find(|r| r.step != "current"))
 }
 
+/// The lane of the owner's press of the ⬆️ for tab `opts.only_sid`: one [`step`] of Claude
+/// Code's lane alone that acts only on the press ([`upgrade::Press::Acting`]), restarting the
+/// agent once [`upgrade::press_gate`] lets it, whatever only defers an automatic move (its
+/// Autopilot or its agent switched off, its background work, a person's recent keys); a record
+/// with no press standing answers [`PRESS_LAPSED`] and is not stepped.
+#[must_use]
+pub fn press(opts: &Opts, off: bool) -> Report {
+    step(&Opts {
+        press: Some(PressOpts { off }),
+        human_grace_s: 0,
+        agents_off: Vec::new(),
+        ..opts.clone()
+    })
+}
+
 /// Whether tab `opts.only_sid` has an upgrade to take.
 #[must_use]
 pub fn due(opts: &Opts) -> Due {
@@ -8094,7 +8264,8 @@ fn drains(step: &str) -> bool {
 pub fn bounded_wait(step: &str) -> bool {
     matches!(
         step,
-        "wait:settling"
+        "wait:pressed"
+            | "wait:settling"
             | "wait:not-idle"
             | "wait:busy"
             | "wait:status-stale"
@@ -8177,6 +8348,22 @@ pub fn released_at_break(step: &str) -> bool {
 }
 
 fn sweep_with_roster(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> {
+    sweep_with_lanes(opts, live_tabs, &|agent| match agent {
+        upgrade::Agent::Codex => codex_alab_drive::sweep(opts, live_tabs),
+        upgrade::Agent::Claude => claude_pass(opts, live_tabs),
+        upgrade::Agent::Muse => muse::live::upgrade_pass(opts, live_tabs),
+        upgrade::Agent::Agy => agy::live::upgrade_pass(opts, live_tabs),
+    })
+}
+
+/// [`sweep_with_roster`] over each lane's pass `pass`, under the sweep lock: the confirmations
+/// are closed first and reported after the lanes' reports, so [`pick`] names a tab's live
+/// conversation's act before the closed look of a conversation whose agent ended.
+fn sweep_with_lanes(
+    opts: &Opts,
+    live_tabs: Option<&[LiveTab]>,
+    pass: &dyn Fn(upgrade::Agent) -> Vec<Report>,
+) -> Vec<Report> {
     let _held = match sweep_lock(opts) {
         Ok(lock) => lock,
         Err(why) => {
@@ -8190,19 +8377,15 @@ fn sweep_with_roster(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> 
             }];
         }
     };
-    let mut reports = if opts.background {
+    let confirmed = if opts.background || opts.press.is_some() {
         Vec::new()
     } else {
         confirmations(opts)
     };
     muse::sweep_prune(opts, live_tabs);
     agy::sweep_prune(opts, live_tabs);
-    reports.extend(lanes(opts, live_tabs, &|agent| match agent {
-        upgrade::Agent::Codex => codex_alab_drive::sweep(opts, live_tabs),
-        upgrade::Agent::Claude => claude_pass(opts, live_tabs),
-        upgrade::Agent::Muse => muse::live::upgrade_pass(opts, live_tabs),
-        upgrade::Agent::Agy => agy::live::upgrade_pass(opts, live_tabs),
-    }));
+    let mut reports = lanes(opts, live_tabs, pass);
+    reports.extend(confirmed);
     reports
 }
 
@@ -8220,6 +8403,7 @@ fn lanes(
     };
     let others: Vec<Report> = upgrade::Agent::others()
         .iter()
+        .filter(|_| opts.press.is_none())
         .flat_map(|&agent| swept(agent))
         .collect();
     let others_tab = opts
@@ -8505,6 +8689,38 @@ pub(super) fn sweep_lock(opts: &Opts) -> Result<Option<SweepLock>, &'static str>
     }
 }
 
+/// Retarget a pending managed record through the sweep's real transition and save path.
+///
+/// # Errors
+/// Returns an error if its lock, record, pending managed move, or version is unavailable.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn retarget_pending_for_test(
+    opts: &Opts,
+    session: &str,
+    running: &str,
+    proc_start: &str,
+) -> Result<(), &'static str> {
+    let _held = sweep_lock(opts)?;
+    let prior = load(opts, session).ok_or("no-record")?;
+    if prior.phase != Phase::Pending || prior.source != "managed" {
+        return Err("not-pending-managed");
+    }
+    let running = Version::parse(running).ok_or("invalid-running-build")?;
+    let target = Candidate {
+        exe: PathBuf::new(),
+        version: Version::parse(&prior.to).ok_or("invalid-target-build")?,
+        source: Source::Managed,
+    };
+    let who = Proc {
+        start: proc_start,
+        started_s: 0,
+    };
+    let (st, _) = St::retarget(Some(prior), &running, &target, None, who, now_s());
+    save(opts, session, &st);
+    Ok(())
+}
+
 pub(super) struct SweepLock(std::fs::File);
 
 impl Drop for SweepLock {
@@ -8735,6 +8951,13 @@ fn visit_models(
         return said(r, format!("wait:{why}"));
     }
     let mut prior = load(opts, &sf.session_id);
+    if opts.press.is_some()
+        && !prior
+            .as_ref()
+            .is_some_and(|st| st.in_flight() || st.press_stands(&tab, now_s()))
+    {
+        return said(r, PRESS_LAPSED);
+    }
     if let Some(st) = prior
         .as_mut()
         .filter(|st| matches!(st.phase, Phase::Announced { .. }) && !st.notice_belongs_to(sf, &tab))
@@ -9022,6 +9245,7 @@ fn visit_models(
             Ok(look) => look,
             Err(why) => return said(r, format!("wait:{why}")),
         };
+    facts.press = press_of(opts, &st, &tab, now);
     if let Some(r) = left_first(opts, &r, &mut st, &mut c, &tab, sf, now) {
         return r;
     }
@@ -9226,7 +9450,13 @@ fn visit_models(
         Step::Fresh if opts.dry_run => said(r, "would-restart:fresh"),
         Step::Terminate | Step::Fresh => {
             let fresh = step == Step::Fresh;
-            let unasked = !fresh && facts.quiet && asked_about == Phase::Pending;
+            // A press restarts in the quiet flow where nothing was asked, or where the tab's
+            // harness is off; one past an announced round carries on as the ask flow does.
+            let pressed = facts.press == upgrade::Press::Acting;
+            let unasked = !fresh
+                && ((facts.quiet && asked_about == Phase::Pending)
+                    || (pressed
+                        && (asked_about == Phase::Pending || opts.press.is_some_and(|p| p.off))));
             let owed_here = !st.release.is_empty() && st.notice_belongs_to(sf, &tab);
             let quiet = unasked && !owed_here;
             st.quiet = quiet;
@@ -9252,6 +9482,7 @@ fn visit_models(
                 ),
                 fresh,
                 quiet,
+                pressed,
                 lagging: !fresh
                     && facts.quiet
                     && request == Request::Now
@@ -9324,6 +9555,19 @@ pub(super) fn at_point(word: &str, held: &str) -> String {
     format!("{word}{AT_POINT}{held}")
 }
 
+/// What the owner's press of the ⬆️ is to this step ([`upgrade::Facts::press`]): its lane
+/// ([`press`]) and the watch's dry read act on a standing press, and every other step stands
+/// aside for it.
+fn press_of(opts: &Opts, st: &St, tab: &str, now: u64) -> upgrade::Press {
+    if !st.press_stands(tab, now) {
+        upgrade::Press::None
+    } else if opts.press.is_some() || opts.dry_run {
+        upgrade::Press::Acting
+    } else {
+        upgrade::Press::Stands
+    }
+}
+
 pub(super) fn ladder_look(
     st: &mut St,
     agent: &str,
@@ -9347,6 +9591,7 @@ pub(super) fn ladder_look(
         .as_ref()
         .filter(|_| idle_read)
         .map(|(caret, _)| upgrade::still_print(pid, &scr.rows, *caret));
+    let still_run = print.as_deref().is_some_and(|p| st.still_runs(p, now));
     LadderLook {
         rung: st.rung_at(now),
         attended: upgrade::attended_by(scr.human, grace_s),
@@ -9355,6 +9600,7 @@ pub(super) fn ladder_look(
             .within(upgrade::person_grace(upgrade::Rung::KeysOnly, grace_s))
             == Some(true),
         idle_read,
+        still_run,
         still_s: st.still(print, now),
     }
 }
@@ -9365,10 +9611,15 @@ pub(super) struct LadderLook {
     pub(super) attended: bool,
     pub(super) typing: bool,
     pub(super) idle_read: bool,
+    /// The look read the words above the composer the idle look before it read ([`St::still_runs`]).
+    pub(super) still_run: bool,
     pub(super) still_s: u64,
 }
 
-pub(super) fn busy_footer(rows: &[String]) -> bool {
+/// Whether Claude Code's screen shows its turn running: the interrupt hint on its status line,
+/// or on a row below its composer.
+#[must_use]
+pub fn busy_footer(rows: &[String]) -> bool {
     let Some((caret, draft)) = aterm_phase::phase::composer_draft(rows) else {
         return false;
     };
@@ -9480,9 +9731,15 @@ pub(super) fn look_facts(
                     st,
                 )),
         unnoticed: now.saturating_sub(st.behind_since()) < upgrade::quiet_s(),
+        press: upgrade::Press::None,
     };
     let idle_read = ladder.idle_read;
-    let in_a_row = st.idle_pid == sf.pid && now.saturating_sub(st.idle_at) <= IDLE_RUN_GAP_S;
+    // An idle look is in a row only over the words the one before it read. Under a status line a reply
+    // being drawn shows no busy row, so its looks read idle, but the words above its composer grow
+    // between them: two such looks are never the lag ([`upgrade::status_lags`]) `--now` ends a turn at.
+    let in_a_row = ladder.still_run
+        && st.idle_pid == sf.pid
+        && now.saturating_sub(st.idle_at) <= IDLE_RUN_GAP_S;
     st.idle_looks = match (idle_read, in_a_row) {
         (false, _) => 0,
         (true, true) => st.idle_looks.saturating_add(1),
@@ -9930,6 +10187,27 @@ fn orphans(opts: &Opts, files: &[SessionFile], live_tabs: Option<&[LiveTab]>) ->
         };
         if alive(st.pid) {
             note_stuck(opts, &r, &mut st, &session, now_s());
+            continue;
+        }
+        let front = tab_front(live_tabs, &st.tab, st.shell);
+        if let Some(sf) = overtaken_by(&st, &session, files, front) {
+            if opts.dry_run {
+                if opts.press.is_none() {
+                    out.push(said(r, format!("would-fail:{TAB_TAKEN}")));
+                }
+                continue;
+            }
+            let line = overtaken_line(sf.pid, &sf.session_id);
+            st.close_overtaken(TAB_TAKEN, now_s());
+            let r = said(r, format!("failed:{TAB_TAKEN}"));
+            ledger(opts, &r, &line);
+            save(opts, &session, &st);
+            if opts.press.is_none() {
+                out.push(r);
+            }
+            continue;
+        }
+        if opts.press.is_some() && !st.is_upgrade() {
             continue;
         }
         if hand_waits_out(opts, &mut st, &session, alive) {
@@ -10458,6 +10736,11 @@ fn turn_over_shown(read: &Screen, lagging: bool) -> bool {
     !lagging || (!busy_footer(&read.rows) && reads_idle(read))
 }
 
+/// Whether `read` lets a press's signal go: no turn running and no box open on it.
+fn press_lets_signal(read: &Screen) -> bool {
+    !busy_footer(&read.rows) && aterm_phase::prompt::prompt_box_span(&read.rows).is_none()
+}
+
 pub(super) fn composer_clear(c: &mut Client, tab: &str) -> bool {
     screen(c, tab).is_some_and(|scr| {
         aterm_phase::prompt::prompt_box_span(&scr.rows).is_none() && composer_empty(c, tab, &scr)
@@ -10537,6 +10820,9 @@ struct Restarting<'a> {
     grace: u32,
     fresh: bool,
     quiet: bool,
+    /// The owner's press moves the tab ([`upgrade::Press::Acting`]): the signal waits only for
+    /// what [`upgrade::press_gate`] waits for, read again on the screen before it is sent.
+    pressed: bool,
     lagging: bool,
     mode: Option<&'a str>,
     model: Option<&'a str>,
@@ -10572,6 +10858,7 @@ fn restart(
         grace,
         fresh,
         quiet,
+        pressed,
         lagging,
         mode: shown_mode,
         model: hand_model,
@@ -10582,7 +10869,16 @@ fn restart(
     } = *how;
     let records = Records::of_file(&opts.home, sf);
     let fresh = fresh || records.transcript_exists(&sf.session_id) == Some(false);
-    let status_holds = |a: &SessionFile| status_lets_signal(a, sf, lagging);
+    // A press restarts over the agent's own background work and a status that has not caught
+    // up with its turn's end; what it waits for, it reads off the screen.
+    let status_holds = |a: &SessionFile| pressed || status_lets_signal(a, sf, lagging);
+    let turn_over = |read: &Screen| {
+        if pressed {
+            press_lets_signal(read)
+        } else {
+            turn_over_shown(read, lagging)
+        }
+    };
     let ours = |st: &St, a: &SessionFile| {
         if fresh {
             records.tasked(
@@ -10690,8 +10986,8 @@ fn restart(
                 && ours(st, &a)
                 && k.process_start(sf.pid).as_deref() == Some(squash(&a.proc_start).as_str())
         }) && foreground_shell(k.job(sf.pid)) == Ok(shell)
-            && scr.is_some_and(|s| turn_over_shown(&s, lagging) && composer_empty(c, tab, &s))
-            && k.restart_background(sf.pid).is_empty()
+            && scr.is_some_and(|s| turn_over(&s) && composer_empty(c, tab, &s))
+            && (pressed || k.restart_background(sf.pid).is_empty())
             && !held(c, tab, grace)
             && host_claim.is_none_or(|claim| claim_still_live(c, sf.pid, claim));
         if !still {
@@ -10732,7 +11028,7 @@ fn restart(
             || foreground_shell(k.job(sf.pid)) != Ok(shell)
             || !owner.is_some_and(owned_by_aterm)
             || host_claim.is_some_and(|claim| !claim_still_live(c, sf.pid, claim))
-            || !typing_fence_read(c, tab).is_ok_and(|(_, read)| turn_over_shown(&read, lagging))
+            || !typing_fence_read(c, tab).is_ok_and(|(_, read)| turn_over(&read))
             || held(c, tab, grace)
         {
             st.unsent(back);
@@ -10764,6 +11060,11 @@ fn restart(
         &said(r.clone(), "terminated"),
         if fresh {
             "SIGTERM (no task: restarted afresh, nothing typed or resumed)"
+        } else if pressed && quiet {
+            "SIGTERM (the owner pressed the update arrow: resumed as it was, nothing typed but \
+             the relaunch line; any background shell ends with it)"
+        } else if pressed {
+            "SIGTERM (the owner pressed the update arrow: any background shell ends with it)"
         } else if quiet {
             "SIGTERM (idle: nothing asked or typed; resumed as it was)"
         } else {

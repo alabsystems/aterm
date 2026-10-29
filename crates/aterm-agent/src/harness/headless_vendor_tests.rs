@@ -41,6 +41,7 @@ fn page(url: &str, heading: &str, text: &str, buttons: &[&str], inputs: &[Field]
         text: text.to_owned(),
         buttons: buttons.iter().map(|b| (*b).to_owned()).collect(),
         inputs: inputs.to_vec(),
+        ..Page::default()
     }
 }
 
@@ -989,6 +990,7 @@ fn a_vendor_sign_in_presses_nothing_outside_the_flow_it_started() {
         text: "An app wants to access your OpenAI account".to_owned(),
         buttons: vec!["cancel".to_owned(), "allow".to_owned()],
         inputs: vec![],
+        ..Page::default()
     };
     assert!(matches!(
         vendor_step(&consent(lure), &gate),
@@ -1459,6 +1461,30 @@ fn a_bot_protection_block_page_stops_at_once_and_keeps_its_text_out_of_the_reaso
 /// A stand-in browser over the CDP pipes that serves `page` to every read, or, with
 /// `refuse_target`, answers `Target.createTarget` with an error.
 fn fake_cdp(page: Value, refuse_target: bool) -> (CdpClient, std::thread::JoinHandle<()>) {
+    fake_cdp_serving(refuse_target, move |_| page.clone())
+}
+
+/// A stand-in browser over the CDP pipes that serves `pages` to the page's reads
+/// ([`VENDOR_PAGE_JS`]) in turn, the last one to every read after it, and answers every press
+/// or fill done.
+fn fake_cdp_pages(pages: Vec<Value>) -> (CdpClient, std::thread::JoinHandle<()>) {
+    let mut reads = 0usize;
+    fake_cdp_serving(false, move |expression| {
+        if expression != VENDOR_PAGE_JS {
+            return json!({"ok": true});
+        }
+        let page = pages[reads.min(pages.len() - 1)].clone();
+        reads += 1;
+        page
+    })
+}
+
+/// A stand-in browser over the CDP pipes that answers each `Runtime.evaluate` of an expression
+/// with `serve`'s value, or, with `refuse_target`, answers `Target.createTarget` with an error.
+pub(in crate::harness) fn fake_cdp_serving(
+    refuse_target: bool,
+    mut serve: impl FnMut(&str) -> Value + Send + 'static,
+) -> (CdpClient, std::thread::JoinHandle<()>) {
     let (to_browser_r, to_browser_w) = std::io::pipe().expect("pipe");
     let (from_browser_r, mut from_browser_w) = std::io::pipe().expect("pipe");
     let browser = std::thread::spawn(move || {
@@ -1481,7 +1507,9 @@ fn fake_cdp(page: Value, refuse_target: bool) -> (CdpClient, std::thread::JoinHa
                     "Target.attachToTarget" => json!({"id": id, "result": {"sessionId": "s1"}}),
                     "Runtime.evaluate" => json!({
                         "id": id,
-                        "result": {"result": {"type": "object", "value": page.clone()}}
+                        "result": {"result": {"type": "object", "value": serve(
+                            msg.pointer("/params/expression").and_then(Value::as_str).unwrap_or("")
+                        )}}
                     }),
                     _ => json!({"id": id, "result": {}}),
                 };
@@ -1547,9 +1575,13 @@ fn the_window_and_the_headless_approver_open_one_profile_per_row() {
     assert_eq!(window, approver.profile_dir(Some(email)));
     assert!(window.starts_with(shared.join(VENDOR_PROFILES_DIR)));
     assert_eq!(
-        approver.sign_in_once,
-        "aterm harness accounts browser kimi-one --cli kimi"
+        approver.sign_in_once.as_deref(),
+        Some("aterm harness accounts browser kimi-one --cli kimi")
     );
+    // A Grok row's profile signed in gets no renewal past accounts.x.ai's block page, so a stop
+    // on its sign-in page names no window.
+    let grok = VendorApprover::new(Cli::Grok, "grok-one", Some(email), &shared, Some(&home));
+    assert_eq!(grok.sign_in_once, None);
     assert_eq!(
         row_browser_profile(
             Cli::Claude,
@@ -2874,4 +2906,514 @@ fn cjk_otp_extraction_webmail_plus_siblings_and_spa_submit_guards() {
         act_email.contains("isCodeField") && act_email.contains("disallowedSubmitLabel"),
         "vendor_act_js must exclude code fields when filling email and guard submitInput against third-party/cancel buttons"
     );
+}
+
+const OPENAI: &[&str] = &["auth.openai.com"];
+/// A synthetic, handwritten challenge URL: the token is made up.
+const CHALLENGE_URL: &str = "https://auth.openai.com/log-in?__cf_chl_rt_tk=made-up-token";
+
+fn loopback_gate() -> Gate<'static> {
+    Gate {
+        hosts: OPENAI,
+        completion: Completion::Loopback,
+        code: None,
+        email: Some("codex-one@example.com"),
+        senders: &["openai"],
+        ..device_gate()
+    }
+}
+
+/// Cloudflare's managed challenge as a handwritten page: its title and words, the Turnstile
+/// widget and the challenge host's script, and `buttons`.
+fn challenge_page(buttons: &[&str]) -> Page {
+    Page {
+        title: "just a moment...".to_owned(),
+        markers: vec![Marker::Turnstile, Marker::ChallengeHost],
+        ..page(
+            CHALLENGE_URL,
+            "auth.openai.com",
+            "auth.openai.com\nVerifying you are human. This may take a few seconds.\n\
+             Enable JavaScript and cookies to continue",
+            buttons,
+            &[],
+        )
+    }
+}
+
+/// [`challenge_page`] as the page reader answers it.
+fn challenge_json() -> Value {
+    json!({
+        "url": CHALLENGE_URL,
+        "heading": "auth.openai.com",
+        "title": "Just a moment...",
+        "text": "auth.openai.com\nVerifying you are human. This may take a few seconds.\n\
+                 Enable JavaScript and cookies to continue",
+        "buttons": ["verify you are human"],
+        "inputs": [],
+        "markers": ["cf-turnstile", "challenges.cloudflare.com"]
+    })
+}
+
+/// Cloudflare's managed challenge (its title or words AND one of its markers) is waited on, and
+/// nothing on it is pressed, even a `verify` or `continue` button. CONTROLS: the same words and
+/// button with no marker are a page like any other (its `continue` is pressed); a help page
+/// quoting "Just a moment..." is none; a sign-in form carrying a Turnstile widget without the
+/// words is none (its email is filled); and the block page still stops at once.
+#[test]
+fn a_cloudflare_challenge_is_waited_on_and_nothing_on_it_is_pressed() {
+    let gate = loopback_gate();
+    for buttons in [&["verify you are human"][..], &["continue"], &[]] {
+        let challenge = challenge_page(buttons);
+        assert!(bot_check(&challenge), "{buttons:?}");
+        assert_eq!(vendor_step(&challenge, &gate), Step::Wait, "{buttons:?}");
+    }
+    let by_title = Page {
+        text: "auth.openai.com".to_owned(),
+        markers: vec![Marker::ChallengeForm],
+        ..challenge_page(&["continue"])
+    };
+    assert!(bot_check(&by_title), "the title alone, beside a marker");
+    let by_words = Page {
+        title: "auth.openai.com".to_owned(),
+        markers: vec![Marker::ChallengeOptions],
+        ..challenge_page(&["continue"])
+    };
+    assert!(bot_check(&by_words), "the words alone, beside a marker");
+
+    let unmarked = Page {
+        markers: vec![],
+        ..challenge_page(&["continue"])
+    };
+    assert!(!bot_check(&unmarked), "words without a marker never count");
+    assert_eq!(vendor_step(&unmarked, &gate), Step::Press(0));
+    let docs = Page {
+        title: "troubleshooting sign-in".to_owned(),
+        ..page(
+            "https://auth.openai.com/help/sign-in",
+            "troubleshooting sign-in",
+            "If the page says \"Just a moment...\" for long, reload it.",
+            &[],
+            &[],
+        )
+    };
+    assert!(!bot_check(&docs));
+    let form = Page {
+        title: "log in".to_owned(),
+        markers: vec![Marker::Turnstile],
+        ..page(
+            "https://auth.openai.com/log-in",
+            "welcome back",
+            "Email address\nContinue",
+            &["continue"],
+            &[Field::Email],
+        )
+    };
+    assert!(
+        !bot_check(&form),
+        "a widget without the words is no challenge"
+    );
+    assert_eq!(vendor_step(&form, &gate), Step::FillEmail);
+    let blocked = Page {
+        title: "attention required! | cloudflare".to_owned(),
+        markers: vec![Marker::ChallengePlatform],
+        ..page(
+            "https://auth.openai.com/log-in",
+            "sorry, you have been blocked",
+            "Sorry, you have been blocked\nYou are unable to access this site\n\
+             Performance & security by Cloudflare",
+            &[],
+            &[],
+        )
+    };
+    assert!(matches!(vendor_step(&blocked, &gate), Step::Stop(_)));
+}
+
+/// A reason the drive ends with on Cloudflare's bot check names Cloudflare and the page's host
+/// and path, and never a person, the page's text or its query.
+fn names_the_bot_check(why: &str) {
+    assert!(
+        why.contains("Cloudflare") && why.contains("auth.openai.com/log-in"),
+        "{why}"
+    );
+    assert!(
+        !why.contains("person")
+            && !why.contains("made-up-token")
+            && !why.contains("Enable JavaScript"),
+        "{why}"
+    );
+}
+
+/// A bot check that has not cleared within the stall ends the drive naming Cloudflare and the
+/// page's host and path, however often it reloads itself, and never as a page waiting on a
+/// person. A reload read between its documents (its title and words, no marker yet) is a gap
+/// in the same wait. CONTROLS: a page between two reads with something to act on, a page on
+/// another host, or an idle gap of [`BOT_CHECK_GAP`] restarts its clock.
+#[test]
+fn a_bot_check_that_does_not_clear_ends_naming_cloudflare_never_a_person() {
+    let gate = loopback_gate();
+    let challenge = challenge_page(&["verify you are human"]);
+    let reloaded = Page {
+        url: "https://auth.openai.com/log-in?__cf_chl_rt_tk=another-made-up-token".to_owned(),
+        ..challenge.clone()
+    };
+    let half_parsed = Page {
+        markers: vec![],
+        buttons: vec![],
+        ..reloaded.clone()
+    };
+    assert!(!bot_check(&half_parsed));
+    assert_eq!(vendor_step(&half_parsed, &gate), Step::Wait);
+    let t0 = Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
+    let mut stall = PageStall::default();
+    assert_eq!(stall.note_bot_check(&challenge, &Step::Wait, t0), None);
+    assert_eq!(stall.note(&challenge, &Step::Wait, &gate, t0), None);
+    let mut t = 0;
+    while t + 5 < VENDOR_STALL.as_secs() {
+        assert_eq!(
+            stall.note_bot_check(&half_parsed, &Step::Wait, at(t + 2)),
+            None
+        );
+        assert_eq!(
+            stall.note_bot_check(&reloaded, &Step::Wait, at(t + 5)),
+            None
+        );
+        t += 5;
+    }
+    assert_eq!(
+        stall.note(&reloaded, &Step::Wait, &gate, t0 + 10 * VENDOR_STALL),
+        None,
+        "a bot check is never a page waiting on a person"
+    );
+    let why = stall
+        .note_bot_check(&reloaded, &Step::Wait, t0 + VENDOR_STALL)
+        .expect("a bot check that did not clear ends the drive");
+    names_the_bot_check(&why);
+    assert_eq!(
+        stall.bot_check_held(t0 + VENDOR_STALL).as_deref(),
+        Some(why.as_str())
+    );
+    // The deadline in a gap, too, ends as the bot check.
+    let mut stall = PageStall::default();
+    let _ = stall.note_bot_check(&challenge, &Step::Wait, t0);
+    let _ = stall.note_bot_check(&half_parsed, &Step::Wait, at(1));
+    names_the_bot_check(
+        &stall
+            .bot_check_held(at(1) + BOT_CHECK_GAP / 2)
+            .expect("held through the gap"),
+    );
+
+    let form = page(
+        "https://auth.openai.com/log-in",
+        "welcome back",
+        "Email address",
+        &["continue"],
+        &[Field::Email],
+    );
+    let elsewhere = page("https://example.com/", "", "", &[], &[]);
+    for (other, step) in [
+        (&form, vendor_step(&form, &gate)),
+        (&form, Step::Wait),
+        (&elsewhere, Step::Wait),
+    ] {
+        let mut stall = PageStall::default();
+        let _ = stall.note_bot_check(&challenge, &Step::Wait, t0);
+        assert_eq!(stall.note_bot_check(other, &step, at(1)), None);
+        assert_eq!(stall.bot_check_held(at(1)), None, "{other:?} {step:?}");
+        assert_eq!(
+            stall.note_bot_check(&challenge, &Step::Wait, t0 + VENDOR_STALL),
+            None,
+            "its clock restarted: {other:?} {step:?}"
+        );
+    }
+    let mut stall = PageStall::default();
+    let _ = stall.note_bot_check(&challenge, &Step::Wait, t0);
+    let _ = stall.note_bot_check(&half_parsed, &Step::Wait, at(1));
+    assert_eq!(
+        stall.bot_check_held(at(1) + BOT_CHECK_GAP),
+        None,
+        "a gap that outlasts BOT_CHECK_GAP ends the wait"
+    );
+    let _ = stall.note_bot_check(&half_parsed, &Step::Wait, at(1) + BOT_CHECK_GAP);
+    assert_eq!(
+        stall.note_bot_check(&challenge, &Step::Wait, t0 + VENDOR_STALL),
+        None,
+        "its clock restarted after the gap"
+    );
+}
+
+/// A bot check read again after its idle or unread gap expired starts a fresh wait even when
+/// no intervening read cleared the clock. CONTROL: a gap shorter than the limit stays in the
+/// original wait.
+#[test]
+fn a_bot_check_reappearing_after_its_gap_starts_a_new_wait() {
+    const URL: &str = "https://auth.openai.com/log-in";
+    let start = Instant::now();
+    let gap = start + Duration::from_secs(1);
+    for unread in [false, true] {
+        for elapsed in [BOT_CHECK_GAP, BOT_CHECK_GAP + Duration::from_secs(1)] {
+            let mut bot = BotCheckClock::default();
+            assert_eq!(bot.check(URL, start), Duration::ZERO);
+            if unread {
+                bot.unread(gap);
+            } else {
+                bot.other(URL, true, gap);
+            }
+            let again = gap + elapsed;
+            assert_eq!(bot.held(again), None, "the gap expired");
+            assert_eq!(bot.check(URL, again), Duration::ZERO, "unread={unread}");
+            assert_eq!(bot.held(again), Some((URL, Duration::ZERO)));
+        }
+    }
+
+    let mut bot = BotCheckClock::default();
+    let _ = bot.check(URL, start);
+    bot.other(URL, true, gap);
+    let again = gap + BOT_CHECK_GAP / 2;
+    assert_eq!(bot.check(URL, again), again.duration_since(start));
+}
+
+/// A bot check on another host starts a new wait, whether read directly or after a short gap.
+/// CONTROL: another path or spelling of the same HTTPS host keeps the original wait.
+#[test]
+fn a_bot_check_on_another_host_starts_a_new_wait() {
+    const URL: &str = "https://auth.openai.com/log-in";
+    const OTHER: &str = "https://claude.ai/login";
+    let start = Instant::now();
+    for gap in [false, true] {
+        let mut bot = BotCheckClock::default();
+        let _ = bot.check(URL, start);
+        if gap {
+            bot.other(URL, true, start + Duration::from_secs(1));
+        }
+        let again = start + Duration::from_secs(2);
+        assert_eq!(bot.check(OTHER, again), Duration::ZERO, "gap={gap}");
+        assert_eq!(bot.held(again), Some((OTHER, Duration::ZERO)));
+    }
+
+    let mut bot = BotCheckClock::default();
+    let _ = bot.check(URL, start);
+    bot.other(URL, true, start + Duration::from_secs(1));
+    let again = start + Duration::from_secs(2);
+    let reloaded = "https://AUTH.OPENAI.COM:443/another-path?__cf_chl_rt_tk=made-up";
+    assert_eq!(bot.check(reloaded, again), again.duration_since(start));
+}
+
+/// A drive whose deadline comes while a bot check stands (or in a gap of its reloads) ends
+/// `BotCheck` naming it; one whose deadline comes on any other page, or none, was not approved
+/// in time.
+#[test]
+fn a_deadline_during_a_bot_check_ends_as_it() {
+    use super::super::login_drive::Approval;
+    let challenge = challenge_page(&[]);
+    let t0 = Instant::now();
+    let mut stall = PageStall::default();
+    let _ = stall.note_bot_check(&challenge, &Step::Wait, t0);
+    match vendor_out_of_time(&stall, Some("`auth.openai.com/log-in`"), t0) {
+        Approval::BotCheck(why) => names_the_bot_check(&why),
+        other => panic!("{other:?}"),
+    }
+    let mut ended = PageStall::default();
+    let _ = ended.note_bot_check(&challenge, &Step::Wait, t0);
+    let _ = ended.note_bot_check(
+        &page("https://example.com/", "", "", &[], &[]),
+        &Step::Wait,
+        t0,
+    );
+    for stall in [&PageStall::default(), &ended] {
+        assert!(
+            matches!(
+                vendor_out_of_time(stall, Some("`auth.openai.com/log-in`"), t0),
+                Approval::NeedsYou(why) if why.contains("auth.openai.com/log-in")
+            ),
+            "{stall:?}"
+        );
+    }
+
+    let mut bot = BotCheckClock::default();
+    let _ = take_met();
+    assert!(oauth_out_of_time(&bot, Some("claude.ai"), t0).contains("timed out"));
+    assert_eq!(
+        take_met(),
+        Some(super::super::open_url::Met::new(
+            MetWord::Stall,
+            Some("claude.ai")
+        ))
+    );
+    let _ = bot.check("https://claude.ai/login", t0);
+    bot.unread(t0 + Duration::from_secs(1));
+    assert_eq!(
+        oauth_out_of_time(&bot, Some("claude.ai"), t0 + Duration::from_secs(2)),
+        BOT_CHECK_UNCLEARED
+    );
+    assert_eq!(
+        take_met(),
+        Some(super::super::open_url::Met::new(
+            MetWord::BotCheck,
+            Some("claude.ai")
+        ))
+    );
+}
+
+/// A drive that meets Cloudflare's bot check ends `BotCheck` once it has stood for the stall,
+/// however it reloads (a half-parsed read between two), naming Cloudflare and never a person.
+/// CONTROL: a check that clears after three reads goes on to the page behind it, here the
+/// sign-in's callback.
+#[test]
+fn a_drive_on_a_bot_check_ends_bot_check_and_one_that_clears_goes_on() {
+    use super::super::login_drive::Approval;
+    let gate = loopback_gate();
+    let no_mail = |_: &mut CdpClient, _: Option<&str>| Err("no mailbox in a test");
+    let run = |cdp: (CdpClient, std::thread::JoinHandle<()>), stall: Duration| {
+        let (mut cdp, browser) = cdp;
+        let got = drive_cdp_vendor_within(
+            &mut cdp,
+            "https://auth.openai.com/oauth/authorize?client_id=app_test",
+            gate,
+            (&|| false, Instant::now() + aterm_spec::wait::MUST_HAPPEN),
+            PageStall::within(stall),
+            no_mail,
+        );
+        drop(cdp);
+        browser.join().expect("stand-in browser");
+        got
+    };
+    let named = |got: Approval| match got {
+        Approval::BotCheck(why) => names_the_bot_check(&why),
+        other => panic!("{other:?}"),
+    };
+    let short = Duration::from_millis(500);
+    named(run(fake_cdp_pages(vec![challenge_json()]), short));
+    let mut reads = 0usize;
+    let reloading = fake_cdp_serving(false, move |expression| {
+        if expression != VENDOR_PAGE_JS {
+            return json!({"ok": true});
+        }
+        reads += 1;
+        if reads.is_multiple_of(2) {
+            // Its next document, read before its markers were parsed.
+            return json!({
+                "url": CHALLENGE_URL,
+                "heading": "auth.openai.com",
+                "title": "Just a moment...",
+                "text": "auth.openai.com",
+                "buttons": [],
+                "inputs": [],
+                "markers": []
+            });
+        }
+        challenge_json()
+    });
+    named(run(reloading, short));
+
+    let back = json!({
+        "url": "http://localhost:1455/auth/callback?code=made-up&state=made-up",
+        "heading": "",
+        "title": "",
+        "text": "",
+        "buttons": [],
+        "inputs": [],
+        "markers": []
+    });
+    assert_eq!(
+        run(
+            fake_cdp_pages(vec![
+                challenge_json(),
+                challenge_json(),
+                challenge_json(),
+                back
+            ]),
+            aterm_spec::wait::MUST_HAPPEN,
+        ),
+        Approval::Approved { page: false }
+    );
+}
+
+/// GOLDEN: the headless browser is launched as itself, with nothing that changes what a bot
+/// check sees: no `--user-agent`, no `AutomationControlled` switch, no
+/// `--disable-blink-features`. aterm never tries to pass a bot check.
+#[test]
+fn the_headless_launch_hides_nothing_from_a_bot_check() {
+    let profile = Path::new("/state/accounts/browsers/codex-one-at-example.com");
+    let tail = [
+        "--user-data-dir=/state/accounts/browsers/codex-one-at-example.com",
+        "--window-size=1280,900",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-background-networking",
+        "--disable-component-update",
+        "--disable-sync",
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+        "--disable-backgrounding-occluded-windows",
+        "--password-store=basic",
+        "--use-mock-keychain",
+        "--remote-debugging-pipe",
+        "about:blank",
+    ];
+    for (is_headless_shell, lead) in [(true, &[][..]), (false, &["--headless=new"][..])] {
+        let browser = HeadlessBrowser {
+            path: PathBuf::from("/opt/chrome-headless-shell"),
+            is_headless_shell,
+        };
+        // Linux's root alone adds `--no-sandbox`, which Chromium requires there.
+        let args: Vec<String> = headless_launch_args(&browser, profile)
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .filter(|a| a != "--no-sandbox")
+            .collect();
+        let want: Vec<&str> = lead.iter().chain(tail.iter()).copied().collect();
+        assert_eq!(args, want);
+        assert!(
+            !args.iter().any(|a| a.starts_with("--user-agent")
+                || a.contains("AutomationControlled")
+                || a.starts_with("--disable-blink-features")
+                || a.contains("stealth")),
+            "{args:?}"
+        );
+    }
+}
+
+/// Both page readers judge Cloudflare's pages by one helper whose lists are the Rust ones, read
+/// the closed marker list only, and the OAuth step reads a block page or bot check before it
+/// presses or fills anything.
+#[test]
+fn the_page_readers_share_one_bot_check_read_before_anything_is_pressed() {
+    for word in CHALLENGE_TITLES.iter().chain(CHALLENGE_WORDS) {
+        assert!(BOT_CHECK_JS.contains(&format!("\"{word}\"")), "{word}");
+    }
+    for marker in Marker::ALL {
+        assert!(
+            BOT_CHECK_JS.contains(&format!("found.push(\"{}\")", marker.word())),
+            "{marker:?}"
+        );
+        assert_eq!(Marker::of(marker.word()), Some(marker));
+    }
+    assert!(VENDOR_PAGE_JS.contains(BOT_CHECK_JS));
+    assert!(VENDOR_PAGE_JS.contains("markers: botCheckMarkers()"));
+    let read = page_of(&json!({
+        "url": CHALLENGE_URL,
+        "title": "just a moment...",
+        "text": "Enable JavaScript and cookies to continue",
+        "markers": ["cf-turnstile", "made-up-marker", 7]
+    }));
+    assert_eq!(read.markers, vec![Marker::Turnstile]);
+    assert!(bot_check(&read));
+
+    let step = oauth_step_js(Some("one@example.com"), Some("123456"), false, false);
+    assert!(step.contains(BOT_CHECK_JS));
+    let blocked = step
+        .find("state: \"block_page\"")
+        .expect("block page state");
+    let checked = step.find("state: \"bot_check\"").expect("bot check state");
+    for act in [
+        "switchBtn.click()",
+        "btn.click()",
+        "fillCodeInputs(otpInputs",
+        "setNativeValue(emailInput",
+        "approveForm.requestSubmit()",
+    ] {
+        let at = step.find(act).expect(act);
+        assert!(blocked < at && checked < at, "{act} before the bot check");
+    }
 }

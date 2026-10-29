@@ -21,7 +21,7 @@ pub const USAGE: &str = "ERR usage: await sys <predicate> [for=<n>(ms|s|m|h)] [s
                          swap <size>[/s], decompress <n>[/s], mem normal|warn|critical, \
                          throttle none|light|heavy|severe, thrash yes|no (= and != take a \
                          comma list; thrash takes no other <op>); \
-                         <volume> := free>=<size|room> | free><size|room> \
+                         <volume> := free>=<size|room> | free><size|room> | free<<size> | free<=<size> \
                          | disk=ok|low|short|emergency[,…], never with quiet, a <term>, for= or \
                          scope=; \
                          <size> := <n>(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB), a whole <n> for free\n";
@@ -457,6 +457,13 @@ pub enum VolumeTerm {
         /// What it needs.
         need: Need,
     },
+    /// Observe free space below an explicit byte threshold. Never a cleanup demand.
+    FreeBelow {
+        /// `<=` rather than `<`.
+        inclusive: bool,
+        /// Explicit bytes; `room` is reserved for upward admission.
+        bytes: u64,
+    },
     /// The volume at one of these levels.
     Disk(Vec<DiskWord>),
 }
@@ -505,6 +512,10 @@ fn volume_term(name: &str, op: Op, value: &str) -> Result<VolumeTerm, String> {
             } else {
                 Need::Bytes(whole_size(value).ok_or_else(usage)?)
             },
+        }),
+        ("free", Op::Lt | Op::Le) => Ok(VolumeTerm::FreeBelow {
+            inclusive: op == Op::Le,
+            bytes: whole_size(value).ok_or_else(usage)?,
         }),
         ("disk", Op::Eq) => {
             let words: Option<Vec<DiskWord>> = value
@@ -841,6 +852,15 @@ impl AwaitSys {
                 return Err(MIXED.to_owned());
             }
             if machine_words || volume.len() > 2 {
+                return Err(USAGE.to_owned());
+            }
+            // An observer must never acquire an admission demand by adding a
+            // second free term. Keep the two intentions explicit.
+            if volume
+                .iter()
+                .any(|t| matches!(t, VolumeTerm::FreeBelow { .. }))
+                && volume.iter().any(|t| matches!(t, VolumeTerm::Free { .. }))
+            {
                 return Err(USAGE.to_owned());
             }
             return Ok(Parsed::Volume(VolumeWait {
@@ -1356,16 +1376,18 @@ pub struct Latch {
 impl Latch {
     /// Feed one snapshot's verdict.
     pub fn step(&mut self, holds: bool, at_ns: u64, for_ms: u64) -> Option<u64> {
-        if self.last_ns == Some(at_ns) {
-            let since = self.since_ns?;
+        if !holds {
+            self.last_ns = Some(at_ns);
+            self.since_ns = None;
+            return None;
+        }
+        if self.last_ns == Some(at_ns)
+            && let Some(since) = self.since_ns
+        {
             let held = at_ns.saturating_sub(since) / 1_000_000;
             return (held >= for_ms).then_some(held);
         }
         self.last_ns = Some(at_ns);
-        if !holds {
-            self.since_ns = None;
-            return None;
-        }
         let since = *self.since_ns.get_or_insert(at_ns);
         let held = at_ns.saturating_sub(since) / 1_000_000;
         (held >= for_ms).then_some(held)
@@ -1768,7 +1790,10 @@ mod tests {
             "sys free>=5000",
             "sys free>=5gb",
             "sys free>=1.5GiB",
-            "sys free<5GiB",
+            "sys free<room",
+            "sys free<=room",
+            "sys free<5GiB and free>=1GiB",
+            "sys free>1GiB and free<=5GiB",
             "sys free=5GiB",
             "sys disk>=ok",
             "sys disk=ok,nope",
@@ -1794,6 +1819,47 @@ mod tests {
             assert_eq!(AwaitSys::parse(mixed), Err(MIXED.to_owned()), "{mixed}");
         }
         assert_eq!(AwaitSys::parse("sys cpu<50% vol=/x"), Err(USAGE.to_owned()));
+    }
+
+    #[test]
+    fn low_free_observers_keep_explicit_exact_bytes_and_volume() {
+        for (operator, inclusive) in [("<", false), ("<=", true)] {
+            for (size, bytes) in [
+                ("0B", 0),
+                ("68GiB", 68 << 30),
+                ("18446744073709551615B", u64::MAX),
+            ] {
+                let text =
+                    format!("sys free{operator}{size} and disk=short vol=/data timeout=600000");
+                assert_eq!(
+                    AwaitSys::parse(&text),
+                    Ok(Parsed::Volume(VolumeWait {
+                        terms: vec![
+                            VolumeTerm::FreeBelow { inclusive, bytes },
+                            VolumeTerm::Disk(vec![DiskWord::Short])
+                        ],
+                        vol: Some("/data".into()),
+                        timeout_ms: 600_000,
+                    }))
+                );
+            }
+        }
+        for text in [
+            "sys free<room",
+            "sys free<=room",
+            "sys free<68",
+            "sys free<=1.5GiB",
+            "sys free<18446744073709551616B",
+            "sys free<=18446744073709551615GiB",
+            "sys free<=5GiB and free>1GiB",
+            "sys free>=1GiB and free<5GiB",
+        ] {
+            assert_eq!(AwaitSys::parse(text), Err(USAGE.into()), "{text}");
+        }
+        assert_eq!(
+            AwaitSys::parse("sys free<68GiB and cpu<50%"),
+            Err(MIXED.into())
+        );
     }
 
     /// Each wait reads back from its canonical spelling as itself (a fixed point), two spellings
@@ -2023,6 +2089,13 @@ mod tests {
         );
         assert_eq!(l.step(true, 3 * s, 2_000), None);
         assert_eq!(l.step(true, 5 * s, 2_000), Some(2_000));
+        assert_eq!(
+            l.step(false, 5 * s, 2_000),
+            None,
+            "a falsified re-evaluation at the same stamp clears the hold"
+        );
+        assert_eq!(l.step(true, 5 * s, 2_000), None);
+        assert_eq!(l.step(true, 7 * s, 2_000), Some(2_000));
         assert_eq!(Latch::default().step(true, s, 0), Some(0));
     }
 

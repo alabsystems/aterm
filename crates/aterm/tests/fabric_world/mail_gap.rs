@@ -70,7 +70,12 @@ fn gap_marks(w: &World, sid: &str) -> Vec<String> {
 /// recipient is not known) name `given_up=@<cursor>..@<third mail>` and
 /// `given_up_count=2`, and mark it once: `mail-gap off=<cursor>
 /// floor=<third mail> lost=2`, by the bridge. NC (run): a bridge whose reader
-/// drops the notice leaves both unnamed and unmarked.
+/// drops the notice leaves both unnamed and unmarked. R5: the instance counts
+/// the range for the node (`fabric status`: `mail_gaps=1 mail_gap=<range>
+/// mail_gap_count=2`), and `aterm fabric status --json` warns of it once,
+/// though two sessions were told. NC (run): a `fabric_gap_facts` that says
+/// nothing fails the header; a `node_mail_given_up` that lists nothing fails
+/// the warning.
 #[test]
 fn unread_mail_the_broker_gave_up_is_named_by_inbox_and_marked_in_the_log() {
     let mut w = World::boot_flags_with("mgap", &["--log", "off"], &[]);
@@ -154,6 +159,53 @@ fn unread_mail_the_broker_gave_up_is_named_by_inbox_and_marked_in_the_log() {
         );
         assert!(mark.contains(" by=bridge src=fabric conf=exact "), "{mark}");
     }
+
+    // R5: the instance counts the node's range (`fabric status`), and `aterm
+    // fabric` lists it under WARNINGS once, not once per session told.
+    let fs = w.verb("fabric status").header().to_string();
+    assert_eq!(kv(&fs, "mail_gaps"), Some("1"), "{fs}");
+    assert_eq!(kv(&fs, "mail_gap"), Some(range.as_str()), "{fs}");
+    assert_eq!(kv(&fs, "mail_gap_count"), Some("2"), "{fs}");
+    let (report, text) = fabric_status_json(&w);
+    assert_eq!(
+        report["bridges"][0]["mail_gaps"].as_u64(),
+        Some(1),
+        "{text}"
+    );
+    let lost: Vec<&str> = report["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no warnings list: {text}"))
+        .iter()
+        .filter_map(aterm_json::Value::as_str)
+        .filter(|l| l.contains("the broker's retention gave up"))
+        .collect();
+    assert_eq!(lost.len(), 1, "one line for the node: {text}");
+    assert!(
+        lost[0].contains("this node's unread mail")
+            && lost[0].contains(&format!("{range} (2 records)")),
+        "{text}"
+    );
+}
+
+/// `aterm fabric status --json`, run as the world's bridge command names it,
+/// parsed, beside its text.
+fn fabric_status_json(w: &World) -> (aterm_json::Value, String) {
+    let command = std::fs::read_to_string(w.tmp.join("fabric.cmd")).expect("the fabric command");
+    let command = command.trim();
+    let bin = command
+        .split_whitespace()
+        .next()
+        .expect("the bridge binary");
+    let mut status = aterm_uds::spawnfd::command(bin);
+    scratch_spawnfd(&mut status, &w.tmp)
+        .args(["fabric", "status", "--json"])
+        .env("ATERM_FABRIC_COMMAND", command);
+    let out = aterm_uds::deadline::output_within(&mut status, DEADLINE)
+        .unwrap_or_else(|e| panic!("aterm fabric status: {e}"));
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let report: aterm_json::Value =
+        aterm_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"));
+    (report, text)
 }
 
 /// `aterm fabric status` LISTS AN ASK RETENTION HOLDS BELOW THE `in` LANES'
@@ -168,7 +220,8 @@ fn unread_mail_the_broker_gave_up_is_named_by_inbox_and_marked_in_the_log() {
 /// that floor, `transport::fetch_kept`, misses them). Back on the same
 /// broker, `aterm fabric status --json` lists the unanswered ask in `overdue`
 /// and names it in `warnings`, and leaves out the answered one: its answer is
-/// given up, so status cannot say it had none. Stamps are hand-set (`t=1`).
+/// given up, so status cannot say it had none, and counts it in
+/// `overdue_unjudged` (fix unit G3, finding BUS2-3). Stamps are hand-set (`t=1`).
 /// NEGATIVE CONTROLS (run): status's TRAFFIC, deadline scan and unhandled age
 /// all reading on at the floor leaves `overdue` empty (the deadline scan's
 /// alone does not fail it: TRAFFIC's told read has already asked for gap
@@ -262,21 +315,7 @@ fn status_lists_an_ask_retention_holds_below_the_in_lanes_oldest() {
             .then_some(())
     });
 
-    let command = std::fs::read_to_string(w.tmp.join("fabric.cmd")).expect("the fabric command");
-    let command = command.trim();
-    let bin = command
-        .split_whitespace()
-        .next()
-        .expect("the bridge binary");
-    let mut status = aterm_uds::spawnfd::command(bin);
-    scratch_spawnfd(&mut status, &w.tmp)
-        .args(["fabric", "status", "--json"])
-        .env("ATERM_FABRIC_COMMAND", command);
-    let out = aterm_uds::deadline::output_within(&mut status, DEADLINE)
-        .unwrap_or_else(|e| panic!("aterm fabric status: {e}"));
-    let text = String::from_utf8_lossy(&out.stdout);
-    let report: aterm_json::Value =
-        aterm_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"));
+    let (report, text) = fabric_status_json(&w);
     let overdue: Vec<u64> = report["overdue"]
         .as_array()
         .unwrap_or_else(|| panic!("no overdue list: {text}"))
@@ -292,4 +331,9 @@ fn status_lists_an_ask_retention_holds_below_the_in_lanes_oldest() {
         .collect();
     let names = |off: u64| warnings.iter().any(|l| l.contains(&format!(" off={off} ")));
     assert!(names(ask) && !names(answered), "{text}");
+    assert_eq!(
+        report["overdue_unjudged"].as_u64(),
+        Some(1),
+        "the answered ask is counted, not listed: {text}"
+    );
 }

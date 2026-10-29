@@ -1305,11 +1305,18 @@ fn global_excludes(
             .join("git")
             .join("ignore")
     });
-    if !path.is_absolute() || atpkg::protected::under_protected_root(home, &path) {
+    if !path.is_absolute()
+        || path.components().any(|c| c == Component::ParentDir)
+        || atpkg::protected::under_protected_root(home, &path)
+    {
         return None;
     }
-    let path = super::disk::idle::resolve_local(&path, table)?;
-    (!atpkg::protected::under_protected_root(home, &path) && path.is_file()).then_some(path)
+    let real = super::disk::idle::resolve_local(&path, table)?;
+    if atpkg::protected::under_protected_root(home, &real) {
+        return None;
+    }
+    let real_home = super::disk::idle::resolve_local(home, table)?;
+    canonical_outside(&real, &real_home).filter(|p| p.is_file())
 }
 
 fn main_ref(root: &Path, reads: &Reads<'_>) -> Option<String> {
@@ -1355,7 +1362,16 @@ fn unattended_dir(
     }
     let home = super::disk::idle::resolve_local(home, table)?;
     let dir = super::disk::idle::resolve_local(dir, table)?;
-    (!atpkg::protected::under_protected_root(&home, &dir)).then_some(dir)
+    if atpkg::protected::under_protected_root(&home, &dir) {
+        return None;
+    }
+    canonical_outside(&dir, &home)
+}
+
+fn canonical_outside(real: &Path, real_home: &Path) -> Option<PathBuf> {
+    let canon = std::fs::canonicalize(real).ok()?;
+    let canon_home = std::fs::canonicalize(real_home).ok()?;
+    (!atpkg::protected::under_protected_root(&canon_home, &canon)).then_some(canon)
 }
 
 fn git(dir: &Path, args: &[&str], reads: &Reads<'_>) -> Option<String> {
@@ -1479,6 +1495,14 @@ fn run_git(
         return None;
     }
     if !output.status.success() {
+        return None;
+    }
+    if output
+        .stderr
+        .split(|byte| *byte == b'\n')
+        .any(|line| line.starts_with(b"warning: could not open directory '"))
+    {
+        reads.cut.set(true);
         return None;
     }
     String::from_utf8(output.stdout).ok()

@@ -444,6 +444,9 @@ pub const REACH_MIN_CELLS: usize = 18;
 /// off the frame.
 #[must_use]
 pub fn band_top(w: usize, tinted: &BTreeSet<usize>, row: TypedRow, cell: Cell) -> Option<usize> {
+    if w == 0 {
+        return None;
+    }
     let top = row.bottom.checked_sub(REACH_WINDOW_CELLS * cell.h)?;
     let below = row.bottom + cell.h;
     if row.bottom == 0 || below > row.frame_h {
@@ -592,10 +595,14 @@ pub fn banded_row_span(w: usize, sat: &SatMap) -> f64 {
     best
 }
 
-/// The terminal backdrop: the majority colour of the four corners and the centre (ties go to the first in that order).
+/// The terminal backdrop: the majority colour of the four corners and the centre (ties go to the
+/// first in that order), or `[0, 0, 0]` on an empty frame.
 #[must_use]
 pub fn frame_background(frame: &Frame) -> Rgb {
     let (w, h) = (frame.width(), frame.height());
+    if w == 0 || h == 0 {
+        return [0, 0, 0];
+    }
     let points = [
         (0, 0),
         (w - 1, 0),
@@ -1000,12 +1007,18 @@ impl StatusRow {
 /// # Errors
 /// A row with a malformed `spawns`, or a present but malformed `speed`.
 pub fn driven_last_frame(statuses: &[StatusRow]) -> Result<Option<usize>, StatusError> {
+    driven_last_frame_indexed(statuses).map_err(|(_, error)| error)
+}
+
+fn driven_last_frame_indexed(
+    statuses: &[StatusRow],
+) -> Result<Option<usize>, (usize, StatusError)> {
     let mut last = None;
     let mut previous: Option<u64> = None;
     for (frame_no, status) in statuses.iter().enumerate() {
-        let spawns = status.uint("spawns")?;
+        let spawns = status.uint("spawns").map_err(|e| (frame_no, e))?;
         let speed = match status.value("speed") {
-            Some(_) => status.nonneg_float("speed")?,
+            Some(_) => status.nonneg_float("speed").map_err(|e| (frame_no, e))?,
             None => 0.0,
         };
         let fed = previous.is_some_and(|p| spawns > p);
@@ -1643,6 +1656,12 @@ pub struct ScanReport {
     pub companion_frames: usize,
     pub companion_stack: usize,
     pub companion_fused: usize,
+    /// Isolated companion frames ([`compact_pet_witness_frame`]) whose unfused component height was measured.
+    pub companion_height_frames: usize,
+    /// Their components' median, least and greatest height in px.
+    pub companion_height_px: Option<usize>,
+    pub companion_min_h: Option<usize>,
+    pub companion_max_h: Option<usize>,
     /// The companion found on frame 0.
     pub base_comp: Shape,
     /// The typed row a reach was measured above, as the take was handed it.
@@ -1797,8 +1816,8 @@ pub fn scan_frames(
         });
     }
     let driven_last: i64 = match statuses {
-        Some(rows) => driven_last_frame(rows)
-            .map_err(|error| ScanError::MalformedStatus { frame: 0, error })?
+        Some(rows) => driven_last_frame_indexed(rows)
+            .map_err(|(frame, error)| ScanError::MalformedStatus { frame, error })?
             .map_or(-1, |f| i64::try_from(f).unwrap_or(i64::MAX)),
         None => -1,
     };
@@ -1838,6 +1857,10 @@ pub fn scan_frames(
         companion_frames: 0,
         companion_stack: 0,
         companion_fused: 0,
+        companion_height_frames: 0,
+        companion_height_px: None,
+        companion_min_h: None,
+        companion_max_h: None,
         base_comp: Shape::NONE,
         typed_row: ctx.typed_row,
         reach_frames: 0,
@@ -1855,6 +1878,7 @@ pub fn scan_frames(
         });
     }
     let mut reaches = Vec::new();
+    let mut companion_heights = Vec::new();
     let mut union_hues = HueSet::default();
     let mut cyan_worst: Option<CyanSample> = None;
     let mut rainbow_flags = Vec::with_capacity(n);
@@ -2032,6 +2056,8 @@ pub fn scan_frames(
                         width: component.width,
                         limit: alone_max_w,
                     });
+                } else if isolating {
+                    companion_heights.push(component.height);
                 }
             } else {
                 r.pet_missing += usize::from(pet);
@@ -2098,6 +2124,11 @@ pub fn scan_frames(
     r.reach_px = reaches.get(reaches.len() / 2).copied();
     r.reach_min_px = reaches.first().copied();
     r.reach_max_px = reaches.last().copied();
+    companion_heights.sort_unstable();
+    r.companion_height_frames = companion_heights.len();
+    r.companion_height_px = companion_heights.get(companion_heights.len() / 2).copied();
+    r.companion_min_h = companion_heights.first().copied();
+    r.companion_max_h = companion_heights.last().copied();
     r.cat_gap = longest_interior_gap(&cat_visibility);
     r.cat_last_present = cat_visibility.last().copied().unwrap_or(false);
     r.cat_final_run = trailing_true_run(&cat_visibility);

@@ -25,34 +25,48 @@
 //!   [`super::login_drive::NO_DESK`], after [`super::login_drive::sandbox_refusal`]. Its browser
 //!   open fails there, and it still prints its page and code. A missing or refusing sandbox runs
 //!   nothing: there is no unsandboxed fallback.
-//! - **aterm approves the page itself first** ([`Auto`], [`Ladder`]): the page must be `https`
-//!   on auth.x.ai or accounts.x.ai, and before any person is asked it goes to the headless
-//!   browser ([`super::headless_oauth::VendorApprover`]) as the Grok row that signs the default
-//!   home in ([`pick_row`] over the renewal-bound roster: the default home's row, else the pool's
-//!   active row, else the default home's own key [`LEDGER_ACCOUNT`]), in that row's browser
-//!   profile, typing its email and reading the vendor's mailed code only where a mailbox is
-//!   configured for that email. That rung runs only where a headless browser is there and the
-//!   row has an email and, for it, a profile or a mailbox ([`Ladder::ready`]), under the
+//! - **Grok's page goes to the person, never to aterm's headless browser**: the page must be
+//!   `https` on auth.x.ai or accounts.x.ai, and accounts.x.ai answers aterm's headless browser
+//!   with Cloudflare's block page (design §5 (g); [`Cli::renews_headlessly`] is false for Grok,
+//!   [`Auto::page_answers`]), which aterm never works around. So the automatic rung below never
+//!   runs for it: [`run`] skips it ([`Skip::Blocked`], `headless(skipped: …)` in the record),
+//!   its ladder fetches no browser, and the person is asked at once, whatever the row has. Run,
+//!   the rung could only load xAI's page and fail, and a Cloudflare challenge there in place of
+//!   the block page would end the sign-in `bot-check` with no need (below), so the person's own
+//!   launch would never be shown its code.
+//! - **The automatic rung, kept for a vendor whose page answers that browser** ([`Auto`],
+//!   [`Ladder`]): before any person is asked the page goes to the headless browser
+//!   ([`super::headless_oauth::VendorApprover`]) as the Grok row that signs the default home in
+//!   ([`pick_row`] over the renewal-bound roster: the default home's row, else the pool's active
+//!   row, else the default home's own key [`LEDGER_ACCOUNT`]), in that row's browser profile,
+//!   typing its email and reading the vendor's mailed code only where a mailbox is configured for
+//!   that email. That rung runs only where [`Auto::page_answers`], a headless browser is there,
+//!   and the row has an email and, for it, a profile or a mailbox ([`Ladder::ready`]), under the
 //!   machine's one sign-in lock for every CLI ([`super::accounts::Store::signin_now`]), for at
-//!   most [`AUTO_WITHIN`] of the code's life; where it has one of them and no headless browser
-//!   is installed, the pinned chrome-headless-shell is fetched first, once grok can run (its
-//!   sandbox, program and staging home are there, [`preflight`]) and before it starts, held to
-//!   the browser lane's own pin ([`super::headless_fetch`], [`browser_rung`]). Its refusal
-//!   (another code, another account, or grok signing another account in than the row's email
-//!   once the rung ran) ends the sign-in fail-closed, with no need and no login placed; the
-//!   next sign-in a person launches then skips the rung once and asks them ([`Record::by`]), so
-//!   a refusing profile never leaves the machine without a way in. A stop for a person
-//!   (`needs-sign-in`, `needs-you`) or no route ready goes on to the person.
+//!   most [`AUTO_WITHIN`] of the code's life; where the page answers, the row has one of them and
+//!   no headless browser is installed, the pinned chrome-headless-shell is fetched first, once
+//!   grok can run (its sandbox, program and staging home are there, [`preflight`]) and before it
+//!   starts, held to the browser lane's own pin ([`super::headless_fetch`], [`browser_rung`]).
+//!   Its refusal (another code, another account, or grok signing another account in than the
+//!   row's email once the rung ran) ends the sign-in fail-closed, with no need and no login
+//!   placed; the next sign-in a person launches then skips the rung once and asks them
+//!   ([`Record::by`], [`Skip::Refused`]), so a refusing profile never leaves the machine without
+//!   a way in. A stop for a person (`needs-sign-in`, `needs-you`) or no route ready goes on to
+//!   the person. Cloudflare's bot check that did not clear ends the sign-in `bot-check`, naming
+//!   it, with no need: no person is asked to pass one (design R-13).
 //! - **A stop is heard on every rung**: the caller's Ctrl-C (or a hangup) ends the browser's
 //!   download ([`super::headless_fetch::run_stoppable`]), keeps grok from starting after it,
 //!   ends the automatic rung, and is seen before the need goes up.
 //! - **Then one owner need, and aterm opens no page**: the page and the code become one need
-//!   ([`NEED_OWNER`], [`need_words`]) that leads with the once-ever step that makes the next
-//!   sign-in automatic ([`Setup`]: one sign-in in aterm's browser window where one that opens a
-//!   window is installed or the pinned one can be fetched, else the row's mailbox in the vault)
-//!   and keeps the code and the page as the immediate alternative, short enough that the menu
-//!   row shows the code for the label `adopt-default` gives; printed in the caller's terminal as
-//!   a link and published on its session ([`Owner`]).
+//!   ([`NEED_OWNER`], [`need_words`]), short enough that the menu row shows the code for the
+//!   label `adopt-default` gives; printed in the caller's terminal as a link and published on its
+//!   session ([`Owner`]). Where a renewal can approve Grok's page headlessly
+//!   ([`Cli::renews_headlessly`]) it leads with the once-ever step that makes the next sign-in
+//!   automatic ([`Setup`]: one sign-in in aterm's browser window where one that opens a window is
+//!   installed or the pinned one can be fetched, else the row's mailbox in the vault) and keeps
+//!   the code and the page as the immediate alternative. While accounts.x.ai answers the
+//!   headless browser with its block page (design §5 (g)) no setup makes a sign-in automatic, so
+//!   the need is the code and the page alone.
 //! - **The login goes to the home grok reads**: once grok says `Signed in` and exits 0 with a
 //!   non-empty login file, the file is placed `0600` at [`target`], the need is taken down, and
 //!   the accounts ledger keeps the page's host, the flow, the outcome and each rung's result
@@ -261,17 +275,18 @@ pub fn mark_refused(file: &Path) -> io::Result<()> {
 /// Where this gate places a login: `auth.json` in the home grok reads (`GROK_HOME`, else
 /// `<home>/.grok`).
 /// # Errors
-/// [`LOGIN_FILE_ENV`] is set (a pooled login, which `aterm harness accounts renew --cli grok`
-/// signs in), `GROK_HOME` is relative, or no home is known.
+/// [`LOGIN_FILE_ENV`] is set (a pooled login, which `aterm harness accounts login <label> --cli
+/// grok` signs in: [`Cli::sign_in_verb`]), `GROK_HOME` is relative, or no home is known.
 pub fn target(
     var: &dyn Fn(&str) -> Option<OsString>,
     home: Option<&Path>,
 ) -> Result<PathBuf, String> {
     if let Some(file) = set(var, LOGIN_FILE_ENV) {
         return Err(format!(
-            "{LOGIN_FILE_ENV} names {}, a pooled login, which `aterm harness accounts renew \
+            "{LOGIN_FILE_ENV} names {}, a pooled login, which `aterm harness accounts {} <label> \
              --cli grok` signs in; this gate signs in only Grok Build's own home",
-            PathBuf::from(file).display()
+            PathBuf::from(file).display(),
+            Cli::Grok.sign_in_verb(true)
         ));
     }
     if set(var, HOME_ENV).is_some_and(|d| !Path::new(&d).is_absolute()) {
@@ -352,11 +367,12 @@ fn write_record(state: &Path, record: &Record) -> io::Result<()> {
 pub const ADOPT_LABEL: &str = super::cli::ACCOUNTS_OWN_LABEL;
 
 /// The once-ever step that makes every later Grok Build sign-in on this machine automatic: the
-/// need leads with it ([`need_words`], [`needs_you_line`]). It names only steps that work on this
-/// machine, in the order they run: `accounts browser` only where it opens a window here
-/// (`window`, [`super::browser_window::WindowRoute::reachable`]: a desk that opens one, and a
-/// Chromium that opens one installed, or the pinned Chrome for Testing fetched first where no
-/// fetch of it failed lately), else the mailbox first.
+/// need leads with it ([`need_words`], [`needs_you_line`]) where a renewal can approve Grok's
+/// page headlessly ([`Cli::renews_headlessly`], [`Ladder::need_setup`]). It names only steps
+/// that work on this machine, in the order they run: `accounts browser` only where it opens a
+/// window here (`window`, [`super::browser_window::WindowRoute::reachable`]: a desk that opens
+/// one, and a Chromium that opens one installed, or the pinned Chrome for Testing fetched first
+/// where no fetch of it failed lately), else the mailbox first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Setup {
     /// The row has an email and `accounts browser` opens a window here: one sign-in in aterm's
@@ -368,6 +384,14 @@ pub enum Setup {
     /// on, or none installed and the pinned one's fetch failed or cannot run): the row's mailbox
     /// in the vault, or such a browser installed first.
     Mailbox(String),
+    /// As [`Setup::Mailbox`], but the row's mailbox is in the vault already and its
+    /// `[[mailboxes]]` entry has no password yet: that password filled in.
+    MailboxPassword {
+        /// The row's label.
+        label: String,
+        /// The masked mailbox login ([`super::mailbox_routes::mask_login`]).
+        login: String,
+    },
     /// The row names no email, which the window and the mailbox both need: add it first, then the
     /// window where `window`, else the mailbox.
     Email {
@@ -394,6 +418,9 @@ impl Setup {
         match self {
             Setup::Window(label) => format!("once: sign {label} in at the desk"),
             Setup::Mailbox(label) => format!("once: {label}'s mailbox in the vault"),
+            Setup::MailboxPassword { login, .. } => {
+                format!("once: {login}'s password in the vault")
+            }
             Setup::Email { label, .. } => format!("once: an email on {label}'s grok row"),
             Setup::Adopt { label, .. } => format!("once: adopt the default home as {label}"),
         }
@@ -403,7 +430,7 @@ impl Setup {
     fn exact(&self) -> String {
         match self {
             Setup::Window(label) => format!("aterm harness accounts browser {label} --cli grok"),
-            Setup::Mailbox(_) => "ai-mailbox.toml".to_owned(),
+            Setup::Mailbox(_) | Setup::MailboxPassword { .. } => "ai-mailbox.toml".to_owned(),
             Setup::Email { .. } => "email = \"…\" in Grok Build's roster".to_owned(),
             Setup::Adopt { label, .. } => {
                 format!("aterm harness accounts adopt-default {label} --email <you> --cli grok")
@@ -441,6 +468,12 @@ impl Setup {
                  opens a window (Google Chrome for Testing or Chromium) and run `aterm harness \
                  accounts browser {label} --cli grok` at this machine's desk"
             ),
+            Setup::MailboxPassword { label, login } => format!(
+                "fill in the password of mailbox {login} (its [[mailboxes]] entry in the vault's \
+                 ai-mailbox.toml), or install a Chromium that opens a window (Google Chrome for \
+                 Testing or Chromium) and run `aterm harness accounts browser {label} --cli \
+                 grok` at this machine's desk"
+            ),
             Setup::Email { label, window } => format!(
                 "add `email = \"…\"` to {label}'s row in Grok Build's roster, {}",
                 then(label, *window)
@@ -466,21 +499,31 @@ fn cut(mut text: String, max: usize) -> String {
     text
 }
 
-/// The one need's words (`meta set attention owner=signin:grok kind=ask`): the once-ever setup
-/// first, in short words ([`Setup`]), then the code and the page as the immediate alternative,
-/// then the setup's exact command or file: `once: sign main in at the desk; or code WMRT-8KQZ at
-/// <page> (aterm harness accounts browser main --cli grok)`. Where that passes the attention cap
+/// The one need's words (`meta set attention owner=signin:grok kind=ask`). With a `setup`: the
+/// once-ever setup first, in short words ([`Setup`]), then the code and the page as the
+/// immediate alternative, then the setup's exact command or file: `once: sign main in at the
+/// desk; or code WMRT-8KQZ at <page> (aterm harness accounts browser main --cli grok)`. With
+/// none (no setup makes a sign-in automatic, [`Cli::renews_headlessly`]): `approve code
+/// WMRT-8KQZ at <page>`. Where that passes the attention cap
 /// ([`aterm_types::control_verbs::META_ATTENTION_KEYED_MAX`]), the page's host, then without
 /// the exact command. An admissible label (64 bytes at most) and a code the grammar admits (16
 /// at most) always fit the last; anything longer is cut.
 #[must_use]
-pub fn need_words(setup: &Setup, url: &str, code: Option<&str>) -> String {
+pub fn need_words(setup: Option<&Setup>, url: &str, code: Option<&str>) -> String {
     let cap = aterm_types::control_verbs::META_ATTENTION_KEYED_MAX;
     let code = code.unwrap_or("none");
     let host = format!(
         "https://{}",
         login_drive::https_host(url).unwrap_or_default()
     );
+    let Some(setup) = setup else {
+        let text = format!("approve code {code} at {url}");
+        return if text.len() <= cap {
+            text
+        } else {
+            cut(format!("approve code {code} at {host}"), cap)
+        };
+    };
     let (short, exact) = (setup.short(), setup.exact());
     for (page, with_exact) in [(url, true), (host.as_str(), true), (host.as_str(), false)] {
         let text = if with_exact {
@@ -496,15 +539,18 @@ pub fn need_words(setup: &Setup, url: &str, code: Option<&str>) -> String {
 }
 
 /// The terminal's line for the need, a report line aterm reads (`NEEDS YOU: …`): the once-ever
-/// setup first, then this sign-in's code and page.
+/// `setup` first where there is one, then this sign-in's code and page.
 #[must_use]
-pub fn needs_you_line(setup: &Setup, url: &str, code: Option<&str>) -> String {
-    format!(
-        "NEEDS YOU: once, so Grok Build signs in by itself from now on: {}; or approve this \
-         sign-in now: code {} at {url}",
-        setup.sentence(),
-        code.unwrap_or("none")
-    )
+pub fn needs_you_line(setup: Option<&Setup>, url: &str, code: Option<&str>) -> String {
+    let code = code.unwrap_or("none");
+    match setup {
+        Some(setup) => format!(
+            "NEEDS YOU: once, so Grok Build signs in by itself from now on: {}; or approve this \
+             sign-in now: code {code} at {url}",
+            setup.sentence()
+        ),
+        None => format!("NEEDS YOU: approve this Grok Build sign-in: code {code} at {url}"),
+    }
 }
 
 /// The label the once-ever setup adopts the default home under ([`Setup::Adopt`]): the first of
@@ -604,6 +650,10 @@ pub struct Ladder {
     pub profile: bool,
     /// The row has an email and a mailbox is configured for it.
     pub mailbox: bool,
+    /// Where none is because the `[[mailboxes]]` entry its email's codes arrive in has no
+    /// password yet, the masked login of that entry
+    /// ([`super::headless_oauth::VendorApprover::mailbox_unready`]).
+    pub mailbox_unready: Option<String>,
     /// The headless browser.
     pub browser: Browser,
     /// `accounts browser` opens a window here: this desk opens one, and a Chromium that opens
@@ -626,14 +676,16 @@ impl Ladder {
             email: None,
             profile: false,
             mailbox: false,
+            mailbox_unready: None,
             browser: Browser::Missing(why.to_owned()),
             window: false,
             adopt: ADOPT_LABEL.to_owned(),
         }
     }
 
-    /// Whether the automatic rung can run: a headless browser, and the row's email with its
-    /// profile or its mailbox. With no email no route can succeed: the page asks for one.
+    /// Whether this ladder lets the automatic rung run where no [`Skip`] holds: a headless
+    /// browser, and the row's email with its profile or its mailbox. With no email no route can
+    /// succeed: the page asks for one.
     #[must_use]
     pub fn ready(&self) -> bool {
         matches!(self.browser, Browser::Found | Browser::Fetched)
@@ -641,7 +693,15 @@ impl Ladder {
             && (self.profile || self.mailbox)
     }
 
-    /// The once-ever setup the need leads with.
+    /// The once-ever setup the need leads with, where one makes a sign-in automatic: none while
+    /// Grok's page answers the headless browser with a block page ([`Cli::renews_headlessly`]),
+    /// since no profile and no mailbox gets the automatic rung past it.
+    #[must_use]
+    pub fn need_setup(&self) -> Option<Setup> {
+        Cli::Grok.renews_headlessly().then(|| self.setup())
+    }
+
+    /// The once-ever setup for this ladder's row ([`Setup`]).
     #[must_use]
     pub fn setup(&self) -> Setup {
         match (&self.from, &self.email) {
@@ -654,13 +714,20 @@ impl Ladder {
                 window: self.window,
             },
             (_, Some(_)) if self.window => Setup::Window(self.label.clone()),
-            (_, Some(_)) => Setup::Mailbox(self.label.clone()),
+            (_, Some(_)) => match (&self.mailbox_unready, self.mailbox) {
+                (Some(login), false) => Setup::MailboxPassword {
+                    label: self.label.clone(),
+                    login: login.clone(),
+                },
+                _ => Setup::Mailbox(self.label.clone()),
+            },
         }
     }
 
     /// What it found, one line in the ladder's order (never the email):
     /// `row(main, the default home's) profile(none) mailbox(none configured)
-    /// headless-browser(none installed)`.
+    /// headless-browser(none installed)`; a mailbox whose entry has no password yet reads
+    /// `mailbox(ab…@… has no password yet)`.
     #[must_use]
     pub fn words(&self) -> String {
         format!(
@@ -677,10 +744,10 @@ impl Ladder {
                 ""
             },
             if self.profile { "ready" } else { "none" },
-            if self.mailbox {
-                "ready"
-            } else {
-                "none configured"
+            match (self.mailbox, &self.mailbox_unready) {
+                (true, _) => "ready".to_owned(),
+                (false, Some(login)) => format!("{login} has no password yet"),
+                (false, None) => "none configured".to_owned(),
             },
             match &self.browser {
                 Browser::Found => "found".to_owned(),
@@ -695,14 +762,56 @@ impl Ladder {
 /// home in, what this machine offers it, and the headless approver that takes it. A test's
 /// stand-in approves or stops as it is told; [`LiveAuto`] is the machine's.
 pub trait Auto {
+    /// Whether the vendor's sign-in page answers this rung's headless browser
+    /// ([`Cli::renews_headlessly`]). Where it does not (accounts.x.ai answers it with
+    /// Cloudflare's block page, design §5 (g)), no profile or mailbox gets the rung past it, so
+    /// [`run`] skips the rung ([`Skip::Blocked`]): its ladder fetches no browser, nothing is
+    /// approved, and the person is asked. [`LiveAuto`]'s is Grok Build's; a test's stand-in may
+    /// stand in for a vendor whose page answers.
+    fn page_answers(&self) -> bool;
     /// The ladder for this sign-in, read once the lock is held and grok can run; where `fetch`,
     /// it may fetch the pinned headless browser where a route waits on one alone
     /// ([`browser_rung`]), a download that ends once `stopped` says so.
     fn ladder(&mut self, fetch: bool, stopped: &dyn Fn() -> bool) -> Ladder;
     /// Approves `handoff`'s page as the ladder's row, or says why not; called only where
-    /// [`Ladder::ready`], with a deadline [`AUTO_WITHIN`] at most away and a `finished` that is
-    /// also true once the caller was asked to stop.
+    /// [`Ladder::ready`] and no [`Skip`] holds, with a deadline [`AUTO_WITHIN`] at most away and
+    /// a `finished` that is also true once the caller was asked to stop.
     fn approve(&mut self, handoff: &Handoff<'_>) -> Approval;
+}
+
+/// Why the automatic rung does not run for a sign-in, decided once before its ladder is read
+/// ([`run`]): its ladder then fetches no browser, it approves nothing, and the person is asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Skip {
+    /// The vendor's page answers the headless browser with a block page ([`Auto::page_answers`]:
+    /// accounts.x.ai's Cloudflare one), which the rung could never pass.
+    Blocked,
+    /// A person's own launch after the rung's refusal ([`Record::by`]): skipped once.
+    Refused,
+}
+
+impl Skip {
+    /// Its words in the record's `headless(…)` ([`ledger_line`]).
+    #[must_use]
+    pub fn words(self) -> &'static str {
+        match self {
+            Skip::Blocked => {
+                "skipped: accounts.x.ai answers the headless browser with its block page"
+            }
+            Skip::Refused => "skipped: the last automatic try was refused",
+        }
+    }
+
+    /// Its words on the caller's terminal, after the ladder's.
+    fn told(self) -> &'static str {
+        match self {
+            Skip::Blocked => {
+                "accounts.x.ai answers aterm's headless browser with its block page, so you will \
+                 be asked"
+            }
+            Skip::Refused => "the last automatic try was refused, so you will be asked",
+        }
+    }
 }
 
 /// The machine's automatic rung: Grok Build's renewal-bound roster and pool ([`pick_row`]),
@@ -730,6 +839,7 @@ struct RowRead {
     email: Option<String>,
     profile: bool,
     mailbox: bool,
+    mailbox_unready: Option<String>,
     adopt: String,
     approver: super::headless_oauth::VendorApprover,
 }
@@ -780,12 +890,17 @@ impl LiveAuto {
         let profile = email.is_some() && approver.profile_dir(email.as_deref()).is_dir();
         let mailbox = email.is_some() && approver.mailbox.is_some();
         approver.types_email &= mailbox;
+        let mailbox_unready = approver
+            .mailbox_unready_login
+            .clone()
+            .filter(|_| email.is_some() && !mailbox);
         Some(RowRead {
             label,
             from,
             email,
             profile,
             mailbox,
+            mailbox_unready,
             adopt: adopt_label(&roster),
             approver,
         })
@@ -793,6 +908,12 @@ impl LiveAuto {
 }
 
 impl Auto for LiveAuto {
+    /// Grok Build's own: false while accounts.x.ai answers the headless browser with its block
+    /// page.
+    fn page_answers(&self) -> bool {
+        Cli::Grok.renews_headlessly()
+    }
+
     fn ladder(&mut self, fetch: bool, stopped: &dyn Fn() -> bool) -> Ladder {
         let Some(read) = self.row() else {
             return Ladder::bare("no home is known");
@@ -821,6 +942,7 @@ impl Auto for LiveAuto {
             email: read.email,
             profile: read.profile,
             mailbox: read.mailbox,
+            mailbox_unready: read.mailbox_unready,
             browser,
             window: super::browser_window::window_route(home).reachable(),
             adopt: read.adopt,
@@ -1099,10 +1221,12 @@ pub fn running(state: &Path) -> bool {
 }
 
 /// Signs this machine in to Grok Build once ([`Gate`]): the page approved by `auto` where its
-/// ladder is ready, else the one need through `owner`; the end's ledger line through `ledger`
-/// ([`ledger_line`], never the page, the code or the email). A person's own launch after a
-/// sign-in the automatic rung refused ([`Record::by`]) skips that rung once and asks them, so a
-/// profile that keeps refusing never leaves the machine with no way in.
+/// vendor's page answers the headless browser ([`Auto::page_answers`]) and its ladder is ready,
+/// else the one need through `owner`; the end's ledger line through `ledger` ([`ledger_line`],
+/// never the page, the code or the email). While Grok's page answers that browser with its block
+/// page the rung never runs and its browser is never fetched ([`Skip::Blocked`]). A person's own
+/// launch after a sign-in the automatic rung refused ([`Record::by`]) skips that rung once and
+/// asks them, so a profile that keeps refusing never leaves the machine with no way in.
 pub fn run(
     gate: &Gate<'_>,
     auto: &mut dyn Auto,
@@ -1161,9 +1285,17 @@ pub fn run(
     }
     remove_stale_staging(gate.state);
     let leading = Leading::write(gate.state, now);
-    // After the automatic rung's refusal, a person's own launch asks the person: the rung skipped
-    // once, its browser neither looked for nor fetched.
-    let skip = gate.ack && last.by && last.outcome == "refused";
+    // The one place the automatic rung is gated. It never runs where the vendor's sign-in page
+    // meets the headless browser with a block page (Grok's, `Cli::renews_headlessly`), since it
+    // could only load that page and fail; and after its refusal, a person's own launch asks the
+    // person, the rung skipped once. Skipped, its browser is not fetched and nothing is approved.
+    let skip = if !auto.page_answers() {
+        Some(Skip::Blocked)
+    } else if gate.ack && last.by && last.outcome == "refused" {
+        Some(Skip::Refused)
+    } else {
+        None
+    };
     let led = lead(gate, &target, auto, owner, skip);
     drop(leading);
     owner.clear();
@@ -1242,7 +1374,10 @@ fn unsigned_why(outcome: &Outcome) -> String {
         Outcome::Exited(None) => "grok was ended by a signal".to_owned(),
         Outcome::SignedIn { .. } => "grok said it signed in but left no login file".to_owned(),
         Outcome::NotRun(why) => why.clone(),
-        Outcome::Refused(why) | Outcome::NeedsYou(why) | Outcome::NeedsSignIn(why) => why.clone(),
+        Outcome::Refused(why)
+        | Outcome::NeedsYou(why)
+        | Outcome::NeedsSignIn(why)
+        | Outcome::BotCheck(why) => why.clone(),
         Outcome::Failed => "grok said its sign-in failed".to_owned(),
     }
 }
@@ -1262,9 +1397,9 @@ fn wait_for(
         if !told && running(gate.state) {
             told = true;
             owner.say(
-                "another session is signing Grok Build in on this machine; waiting for it (aterm \
-                 approves its page itself where it can; what it needs from you, if anything, goes \
-                 on the menu bar and in that session's terminal)",
+                "another session is signing Grok Build in on this machine; waiting for it (what \
+                 it needs from you, if anything, goes on the menu bar and in that session's \
+                 terminal)",
             );
         }
         if (gate.stopped)() {
@@ -1361,13 +1496,14 @@ pub fn refused_way_out(label: &str, window: bool) -> String {
 }
 
 /// The last rung of the leader's sign-in: it approves nothing. It puts the one need up, the
-/// once-ever setup first ([`Setup`]), and waits until grok says it is done (or closes its
-/// output), the deadline passes, the caller is stopped, or a login made some other way appears.
-/// A caller stopped, or a grok already done, before it is reached raises no need.
+/// once-ever setup first where there is one ([`Ladder::need_setup`]), and waits until grok says
+/// it is done (or closes its output), the deadline passes, the caller is stopped, or a login
+/// made some other way appears. A caller stopped, or a grok already done, before it is reached
+/// raises no need.
 struct NeedApprover<'a, 'b> {
     owner: &'a mut dyn Owner,
     gate: &'a Gate<'b>,
-    setup: Setup,
+    setup: Option<Setup>,
     raised: bool,
     stopped: bool,
     elsewhere: Option<Signed>,
@@ -1388,8 +1524,8 @@ impl Approver for NeedApprover<'_, '_> {
         }
         self.raised = true;
         self.owner.need(
-            &need_words(&self.setup, handoff.url, handoff.code),
-            &needs_you_line(&self.setup, handoff.url, handoff.code),
+            &need_words(self.setup.as_ref(), handoff.url, handoff.code),
+            &needs_you_line(self.setup.as_ref(), handoff.url, handoff.code),
             handoff.url,
         );
         loop {
@@ -1410,9 +1546,11 @@ impl Approver for NeedApprover<'_, '_> {
 }
 
 /// The leader's approver, the gate's ladder: the automatic rung ([`Auto::approve`]) where
-/// [`Ladder::ready`], for at most [`AUTO_WITHIN`], then the person ([`NeedApprover`]) only where
-/// it stopped for one (`needs-sign-in`, `needs-you`) or no route was ready. Its refusal ends
-/// the sign-in: it never falls through to approving anything else.
+/// [`Ladder::ready`] and no [`Skip`] holds (`ready`), for at most [`AUTO_WITHIN`], then the
+/// person ([`NeedApprover`]) only where it stopped for one (`needs-sign-in`, `needs-you`), no
+/// route was ready, or the rung was skipped. Its refusal ends the sign-in: it never falls
+/// through to approving anything else. Cloudflare's bot check that did not clear
+/// ([`Approval::BotCheck`]) ends it too, with no need raised: nobody is asked to pass one.
 struct LadderApprover<'a, 'b> {
     auto: &'a mut dyn Auto,
     ready: bool,
@@ -1463,6 +1601,12 @@ impl Approver for LadderApprover<'_, '_> {
                 }
                 Approval::NeedsYou(said) => {
                     self.headless = Some(headless_words("needs you", &said));
+                }
+                // Cloudflare's bot check ends the sign-in as a failure on record: no person is
+                // asked to pass it (design R-13).
+                Approval::BotCheck(said) => {
+                    self.headless = Some(headless_words("bot check", &said));
+                    return Approval::BotCheck(said);
                 }
             }
         }
@@ -1571,17 +1715,17 @@ fn preflight(gate: &Gate<'_>) -> Result<Prepared, String> {
 }
 
 /// The leader's sign-in: once [`preflight`] says it can run, the ladder is read
-/// ([`Auto::ladder`], told to the person; with `skip`, after the automatic rung's refusal, no
-/// browser is fetched and the rung is skipped), and a stop heard meanwhile ends it before grok
-/// starts; then grok's device route runs in its private staging home under the no-desk
-/// sandbox, its page handed to the ladder (`auto` as the ladder's row, then the need), its login
-/// placed at `target`; with the rungs' results in the ladder's words.
+/// ([`Auto::ladder`], told to the person; with a `skip`, why the rung does not run, no browser
+/// is fetched and the rung is skipped), and a stop heard meanwhile ends it before grok starts;
+/// then grok's device route runs in its private staging home under the no-desk sandbox, its
+/// page handed to the ladder (`auto` as the ladder's row, then the need), its login placed at
+/// `target`; with the rungs' results in the ladder's words.
 fn lead(
     gate: &Gate<'_>,
     target: &Path,
     auto: &mut dyn Auto,
     owner: &mut dyn Owner,
-    skip: bool,
+    skip: Option<Skip>,
 ) -> Led {
     let prepared = match preflight(gate) {
         Ok(prepared) => prepared,
@@ -1595,16 +1739,12 @@ fn lead(
             };
         }
     };
-    let ladder = auto.ladder(!skip, gate.stopped);
-    let ready = ladder.ready() && !skip;
-    let skipped = || {
-        if skip {
-            "skipped: the last automatic try was refused"
-        } else if ladder.ready() {
-            "not reached"
-        } else {
-            "not ready"
-        }
+    let ladder = auto.ladder(skip.is_none(), gate.stopped);
+    let ready = ladder.ready() && skip.is_none();
+    let skipped = || match skip {
+        Some(skip) => skip.words(),
+        None if ladder.ready() => "not reached",
+        None => "not ready",
     };
     if (gate.stopped)() {
         return Led {
@@ -1618,12 +1758,10 @@ fn lead(
     owner.say(&format!(
         "Grok Build sign-in: {}; {}",
         ladder.words(),
-        if ready {
-            "aterm approves the page itself first"
-        } else if skip {
-            "the last automatic try was refused, so you will be asked"
-        } else {
-            "no automatic route is ready, so you will be asked"
+        match skip {
+            Some(skip) => skip.told(),
+            None if ready => "aterm approves the page itself first",
+            None => "no automatic route is ready, so you will be asked",
         }
     ));
     let mut approver = LadderApprover {
@@ -1632,7 +1770,7 @@ fn lead(
         need: NeedApprover {
             owner,
             gate,
-            setup: ladder.setup(),
+            setup: ladder.need_setup(),
             raised: false,
             stopped: false,
             elsewhere: None,

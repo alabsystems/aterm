@@ -65,6 +65,15 @@ const RIM_SPIN_TURNS_PER_S: f32 = 0.45;
 const RIM_LIGHT: f32 = 0.462;
 /// Reference grey of relative luminance [`RIM_LIGHT`] (sRGB byte `181`).
 const RIM_LIGHT_GREY: u32 = 0x00B5_B5B5;
+const _: () = assert!(
+    (crate::color_math::relative_luminance_with(
+        crate::color_math::relative_luminance_table(),
+        RIM_LIGHT_GREY,
+    ) - RIM_LIGHT)
+        .abs()
+        < 0.005,
+    "RIM_LIGHT_GREY is not the encode of RIM_LIGHT"
+);
 
 /// Energy threshold below which the cursor reports inactive.
 const SETTLED_ENERGY: f32 = 0.02;
@@ -193,6 +202,31 @@ pub struct RainbowConfig {
     pub ground: Option<u32>,
     /// Instant a v2 meteor's frame-0 flare fired.
     pub flare_at: Option<Instant>,
+    /// The frame's light (`docs/design/PRISM-GLASS.md` §15.2 1.3, `GlowConfig::light`), which
+    /// the settle probe latches with the rest of the config and the state words leave unhashed,
+    /// as they leave the glow config's. Off on every dark ground; nothing reads it yet.
+    pub light: crate::cursor_glow::Light,
+}
+
+/// The dormant config: off at no intensity, steady, with no base, head, paint, ground, flare or
+/// light.
+/// A test names the fields it is about and takes the rest from here, so a field added later
+/// takes its default here and no test literal has to name it (§15.0.6).
+impl Default for RainbowConfig {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            intensity: 0.0,
+            blinking: false,
+            base: None,
+            head_rgb: None,
+            paint: None,
+            ground: None,
+            flare_at: None,
+            light: crate::cursor_glow::Light::OFF,
+        }
+    }
 }
 
 /// Tick output: the block fill colour and a frame fingerprint (`0` when dormant).
@@ -263,6 +297,15 @@ impl Default for CursorRainbow {
 }
 
 impl CursorRainbow {
+    /// The light the settle probe latched with its config, `None` with no probe latched: for
+    /// the host's dark pin (§15.0.3). Debug and test builds only.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    #[must_use]
+    pub fn settle_light(&self) -> Option<crate::cursor_glow::Light> {
+        self.settle_probe.map(|probe| probe.cfg.light)
+    }
+
     /// Fresh dormant rainbow-cursor animation state.
     #[inline]
     #[must_use]
@@ -721,6 +764,15 @@ impl CursorRainbow {
             } else {
                 GROUND_LIGHT_THEME
             }) & 0x00FF_FFFF;
+            let page_rgb = (
+                ((page >> 16) & 0xff) as usize,
+                ((page >> 8) & 0xff) as usize,
+                (page & 0xff) as usize,
+            );
+            let table = crate::color_math::relative_luminance_table();
+            let base = crate::color_math::relative_luminance_rgb(
+                table, page_rgb.0, page_rgb.1, page_rgb.2,
+            );
             let rings_from = out.len();
             let mut rings = [(0usize, 0u8, 0u32, 0u32); HALO_LAYERS as usize];
             let mut gxy = [(0i32, 0i32); HALO_LAYERS as usize];
@@ -762,10 +814,20 @@ impl CursorRainbow {
                     }
                     match found {
                         Some(plight) => plight,
-                        None => ring_light_on_page(ring_arc, cov, page, 1.0),
+                        None => {
+                            let target = light_on_glass_with(
+                                table,
+                                page_rgb,
+                                premul_rgb(RIM_LIGHT_GREY, cov),
+                            ) - base;
+                            ring_light_on_page_with(table, page_rgb, base, ring_arc, cov, target)
+                        }
                     }
                 } else {
-                    ring_light_on_page(ring_arc, cov, page, 1.0)
+                    let target =
+                        light_on_glass_with(table, page_rgb, premul_rgb(RIM_LIGHT_GREY, cov))
+                            - base;
+                    ring_light_on_page_with(table, page_rgb, base, ring_arc, cov, target)
                 };
                 rings[n_rings] = (out.len() - rings_from, cov, ring_arc, ring_light);
                 gxy[n_rings] = (gx, gy);
@@ -1010,7 +1072,14 @@ impl CursorRainbow {
         if w == 0 || h == 0 || w * h > Self::CARET_RASTER_MAX {
             return (None, None);
         }
-        let base = crate::color_math::relative_luminance(page);
+        let table = crate::color_math::relative_luminance_table();
+        let page_rgb = (
+            ((page >> 16) & 0xff) as usize,
+            ((page >> 8) & 0xff) as usize,
+            (page & 0xff) as usize,
+        );
+        let base =
+            crate::color_math::relative_luminance_rgb(table, page_rgb.0, page_rgb.1, page_rgb.2);
         let mut scratch = std::mem::take(&mut self.rim_scratch);
         scratch.clear();
         scratch.resize(w * h, 0);
@@ -1088,6 +1157,7 @@ impl CursorRainbow {
         let rings_len = rings.len();
         #[inline]
         const fn rim_peak_of(
+            table: &crate::color_math::RelativeLuminanceTable,
             cols: &[u32; HALO_LAYERS as usize],
             buckets: &[(u32, u32)],
             rings_len: usize,
@@ -1100,8 +1170,8 @@ impl CursorRainbow {
                 let level = RAINBOW_FIELD_LEVEL.round() as u32;
                 (level << 16) | (level << 8) | level
             };
-            const FIELD_PEAK: f32 = crate::color_math::relative_luminance(FIELD) * 255.0;
-            let mut peak = FIELD_PEAK;
+            const FIELD_LUM: f32 = crate::color_math::relative_luminance(FIELD);
+            let mut peak_lum = FIELD_LUM;
             let mut bi = 0;
             while bi < buckets.len() {
                 let mask = buckets[bi].0;
@@ -1124,13 +1194,14 @@ impl CursorRainbow {
                     }
                 }
                 if px != FIELD {
-                    peak = peak.max(crate::color_math::relative_luminance(px) * 255.0);
+                    peak_lum = peak_lum.max(crate::color_math::relative_luminance_with(table, px));
                 }
             }
-            Some(peak)
+            Some(peak_lum * 255.0)
         }
         #[inline]
         const fn rim_pile_light(
+            table: &crate::color_math::RelativeLuminanceTable,
             cols: &[u32; HALO_LAYERS as usize],
             ring_pixels: &[u32; HALO_LAYERS as usize],
             buckets: &[(u32, u32)],
@@ -1141,7 +1212,8 @@ impl CursorRainbow {
             let mut aurora = 0.0f32;
             let mut i = 0;
             while i < rings_len {
-                aurora += ring_pixels[i] as f32 * crate::color_math::relative_luminance(cols[i]);
+                aurora += ring_pixels[i] as f32
+                    * crate::color_math::relative_luminance_with(table, cols[i]);
                 i += 1;
             }
             let mut sum = 0.0f32;
@@ -1167,23 +1239,33 @@ impl CursorRainbow {
                     }
                 }
                 if px != page {
-                    sum +=
-                        count as f32 * (crate::color_math::relative_luminance(px) - base).max(0.0);
+                    sum += count as f32
+                        * (crate::color_math::relative_luminance_with(table, px) - base).max(0.0);
                 }
             }
             sum + aterm_render::hdr::HDR_GLOW_BOOST * aurora
         }
         #[inline]
         const fn solve_rim_cols(
+            table: &crate::color_math::RelativeLuminanceTable,
+            page_rgb: (usize, usize, usize),
+            base: f32,
             rings: &[(usize, u8, u32, u32)],
-            page: u32,
+            unscaled_targets: &[f32; HALO_LAYERS as usize],
             scale: f32,
         ) -> [u32; HALO_LAYERS as usize] {
             let mut c = [0u32; HALO_LAYERS as usize];
             let mut i = 0;
             while i < rings.len() {
                 let (_, cov, arc, _) = rings[i];
-                c[i] = ring_light_on_page(arc, cov, page, scale);
+                c[i] = ring_light_on_page_with(
+                    table,
+                    page_rgb,
+                    base,
+                    arc,
+                    cov,
+                    unscaled_targets[i] * scale,
+                );
                 i += 1;
             }
             c
@@ -1191,17 +1273,36 @@ impl CursorRainbow {
         let buckets = &buckets[..n_buckets];
         let mut grey_rings = [0u32; HALO_LAYERS as usize];
         let mut init_cols = [0u32; HALO_LAYERS as usize];
+        let mut unscaled_targets = [0.0f32; HALO_LAYERS as usize];
         let mut i = 0;
         while i < rings_len {
             let (_, cov, _, light) = rings[i];
-            grey_rings[i] = premul_rgb(RIM_LIGHT_GREY, cov);
+            let grey = premul_rgb(RIM_LIGHT_GREY, cov);
+            grey_rings[i] = grey;
             init_cols[i] = light;
+            unscaled_targets[i] = light_on_glass_with(table, page_rgb, grey) - base;
             i += 1;
         }
-        let target = rim_pile_light(&grey_rings, &ring_pixels, buckets, rings_len, page, base);
-        let have = rim_pile_light(&init_cols, &ring_pixels, buckets, rings_len, page, base);
+        let target = rim_pile_light(
+            table,
+            &grey_rings,
+            &ring_pixels,
+            buckets,
+            rings_len,
+            page,
+            base,
+        );
+        let have = rim_pile_light(
+            table,
+            &init_cols,
+            &ring_pixels,
+            buckets,
+            rings_len,
+            page,
+            base,
+        );
         if target <= 0.0 || (have - target).abs() <= target * Self::RIM_LIGHT_SLACK {
-            let peak = rim_peak_of(&init_cols, buckets, rings_len, buckets_complete);
+            let peak = rim_peak_of(table, &init_cols, buckets, rings_len, buckets_complete);
             self.rim_scratch = scratch;
             return (None, peak);
         }
@@ -1217,7 +1318,7 @@ impl CursorRainbow {
         while iter < 8 {
             iter += 1;
             let mid = 0.5 * (lo + hi);
-            let c = solve_rim_cols(rings, page, mid);
+            let c = solve_rim_cols(table, page_rgb, base, rings, &unscaled_targets, mid);
             if matches!(lo_solved, Some((lc, _)) if lc == c) {
                 lo = mid;
                 continue;
@@ -1226,7 +1327,7 @@ impl CursorRainbow {
                 hi = mid;
                 continue;
             }
-            let l = rim_pile_light(&c, &ring_pixels, buckets, rings_len, page, base);
+            let l = rim_pile_light(table, &c, &ring_pixels, buckets, rings_len, page, base);
             if l < target {
                 lo = mid;
                 lo_solved = Some((c, l));
@@ -1243,16 +1344,16 @@ impl CursorRainbow {
         let (a, la) = match lo_solved {
             Some(pair) => pair,
             None => {
-                let a = solve_rim_cols(rings, page, lo);
-                let la = rim_pile_light(&a, &ring_pixels, buckets, rings_len, page, base);
+                let a = solve_rim_cols(table, page_rgb, base, rings, &unscaled_targets, lo);
+                let la = rim_pile_light(table, &a, &ring_pixels, buckets, rings_len, page, base);
                 (a, la)
             }
         };
         let (b, lb) = match hi_solved {
             Some(pair) => pair,
             None => {
-                let b = solve_rim_cols(rings, page, hi);
-                let lb = rim_pile_light(&b, &ring_pixels, buckets, rings_len, page, base);
+                let b = solve_rim_cols(table, page_rgb, base, rings, &unscaled_targets, hi);
+                let lb = rim_pile_light(table, &b, &ring_pixels, buckets, rings_len, page, base);
                 (b, lb)
             }
         };
@@ -1262,7 +1363,7 @@ impl CursorRainbow {
             b
         };
         Self::apply_equalised_rings(quads, rings, &best);
-        let peak = rim_peak_of(&best, buckets, rings_len, buckets_complete);
+        let peak = rim_peak_of(table, &best, buckets, rings_len, buckets_complete);
         self.rim_scratch = scratch;
         (Some(best), peak)
     }
@@ -1297,7 +1398,7 @@ impl CursorRainbow {
             let level = RAINBOW_FIELD_LEVEL.round() as u32;
             (level << 16) | (level << 8) | level
         };
-        const FIELD_PEAK: f32 = crate::color_math::relative_luminance(FIELD) * 255.0;
+        const FIELD_LUM: f32 = crate::color_math::relative_luminance(FIELD);
         let mut scratch = std::mem::take(&mut self.rim_scratch);
         scratch.clear();
         scratch.resize(w * h, FIELD);
@@ -1321,19 +1422,20 @@ impl CursorRainbow {
                 row_idx += 1;
             }
         }
+        let table = crate::color_math::relative_luminance_table();
         let mut last_px = FIELD;
-        let mut peak = FIELD_PEAK;
+        let mut peak_lum = FIELD_LUM;
         let mut si = 0;
         while si < scratch.len() {
             let px = scratch[si];
             si += 1;
             if px != FIELD && px != last_px {
                 last_px = px;
-                peak = peak.max(crate::color_math::relative_luminance(px) * 255.0);
+                peak_lum = peak_lum.max(crate::color_math::relative_luminance_with(table, px));
             }
         }
         self.rim_scratch = scratch;
-        peak
+        peak_lum * 255.0
     }
 
     /// Maximum pixel count [`Self::rim_light_peak`] rasterizes.
@@ -1498,21 +1600,14 @@ const fn light_on_glass_with(
 
 /// Solve one ring's premultiplied colour on `page` for [`RIM_LIGHT`].
 #[inline]
-const fn ring_light_on_page(arc: u32, cov: u8, page: u32, scale: f32) -> u32 {
-    let table = crate::color_math::relative_luminance_table();
-    debug_assert!(
-        (crate::color_math::relative_luminance_with(table, RIM_LIGHT_GREY) - RIM_LIGHT).abs()
-            < 0.005,
-        "RIM_LIGHT_GREY is not the encode of RIM_LIGHT"
-    );
-    let page_rgb = (
-        ((page >> 16) & 0xff) as usize,
-        ((page >> 8) & 0xff) as usize,
-        (page & 0xff) as usize,
-    );
-    let base = crate::color_math::relative_luminance_rgb(table, page_rgb.0, page_rgb.1, page_rgb.2);
-    let target =
-        (light_on_glass_with(table, page_rgb, premul_rgb(RIM_LIGHT_GREY, cov)) - base) * scale;
+const fn ring_light_on_page_with(
+    table: &crate::color_math::RelativeLuminanceTable,
+    page_rgb: (usize, usize, usize),
+    base: f32,
+    arc: u32,
+    cov: u8,
+    target: f32,
+) -> u32 {
     #[inline]
     const fn candidate(arc: u32, cov: u8, u: f32) -> u32 {
         if u < 0.0 {
@@ -1522,9 +1617,8 @@ const fn ring_light_on_page(arc: u32, cov: u8, page: u32, scale: f32) -> u32 {
         }
     }
     let (mut lo, mut hi) = (-1.0f32, 1.0f32);
-    let lo_c = candidate(arc, cov, lo);
-    let hi_c = candidate(arc, cov, hi);
-    let mut lo_eval = (lo_c, light_on_glass_with(table, page_rgb, lo_c) - base);
+    let hi_c = premul_rgb(0x00FF_FFFF, cov);
+    let mut lo_eval = (0u32, 0.0f32);
     let mut hi_eval = (hi_c, light_on_glass_with(table, page_rgb, hi_c) - base);
     let mut step = 0;
     while step < 22 {
@@ -1573,14 +1667,30 @@ const fn ring_light_on_page(arc: u32, cov: u8, page: u32, scale: f32) -> u32 {
     while dr <= 1 {
         let r = seed[0] + dr;
         if r >= 0 && r <= 255 {
+            let r_u = r as usize;
             let r_packed = (r as u32) << 16;
+            let r_sum = if page_rgb.0 + r_u < 255 {
+                page_rgb.0 + r_u
+            } else {
+                255
+            };
+            let r_sum_lum = table.red[r_sum];
+            let r_lum = table.red[r_u];
             let mut dg = -1;
             while dg <= 1 {
                 let g = seed[1] + dg;
                 if g >= 0 && g <= 255 {
                     let rg_sig = (r - g).signum();
                     if rg_sig == 0 || rg_sig == sector[0] {
+                        let g_u = g as usize;
                         let rg_packed = r_packed | ((g as u32) << 8);
+                        let g_sum = if page_rgb.1 + g_u < 255 {
+                            page_rgb.1 + g_u
+                        } else {
+                            255
+                        };
+                        let rg_sum_lum = r_sum_lum + table.green[g_sum];
+                        let rg_lum = r_lum + table.green[g_u];
                         let mut db = -1;
                         while db <= 1 {
                             if !(dr == 0 && dg == 0 && db == 0) {
@@ -1591,13 +1701,19 @@ const fn ring_light_on_page(arc: u32, cov: u8, page: u32, scale: f32) -> u32 {
                                     if (gb_sig == 0 || gb_sig == sector[1])
                                         && (rb_sig == 0 || rb_sig == sector[2])
                                     {
-                                        let packed = rg_packed | b as u32;
-                                        let e = (light_on_glass_with(table, page_rgb, packed)
-                                            - target_light)
-                                            .abs();
+                                        let b_u = b as usize;
+                                        let b_sum = if page_rgb.2 + b_u < 255 {
+                                            page_rgb.2 + b_u
+                                        } else {
+                                            255
+                                        };
+                                        let lum = (rg_sum_lum + table.blue[b_sum])
+                                            + aterm_render::hdr::HDR_GLOW_BOOST
+                                                * (rg_lum + table.blue[b_u]);
+                                        let e = (lum - target_light).abs();
                                         if e < best_err {
                                             best_err = e;
-                                            best = packed;
+                                            best = rg_packed | b as u32;
                                         }
                                     }
                                 }
@@ -1638,6 +1754,7 @@ mod tests {
     }
     const fn cfg() -> RainbowConfig {
         RainbowConfig {
+            light: crate::cursor_glow::Light::OFF,
             enabled: true,
             intensity: 1.0,
             blinking: false,
@@ -1647,6 +1764,41 @@ mod tests {
             ground: None,
             flare_at: None,
         }
+    }
+
+    /// The settle probe latches the frame's light with the rest of the config
+    /// (`docs/design/PRISM-GLASS.md` §15.2 1.3), and the light moves neither the frame nor the
+    /// rainbow's state words: nothing reads it yet.
+    #[test]
+    fn the_settle_probe_latches_the_frames_light() {
+        use crate::cursor_glow::{Light, Live};
+        let t0 = Instant::now();
+        let lit = RainbowConfig {
+            light: Light::at(Live::Glass),
+            ..cfg()
+        };
+        let run = |c: &RainbowConfig| {
+            let mut caret = CursorRainbow::new();
+            let mut out = Vec::new();
+            let frame = caret.tick(Some((2, 3)), t0, 1.0, false, false, geom(), c, &mut out);
+            let mut w = crate::state_words::StateWords::new(t0);
+            caret.state_words(&mut w);
+            (caret, frame.fp, out.len(), w.into_words())
+        };
+        let (glass, glass_fp, glass_quads, glass_words) = run(&lit);
+        let (dark, dark_fp, dark_quads, dark_words) = run(&cfg());
+        assert_eq!(
+            glass.settle_probe.map(|p| p.cfg.light),
+            Some(lit.light),
+            "the probe latches the light"
+        );
+        assert_eq!(dark.settle_probe.map(|p| p.cfg.light), Some(Light::OFF));
+        assert_eq!(
+            (glass_fp, glass_quads),
+            (dark_fp, dark_quads),
+            "the frame is main's"
+        );
+        assert_eq!(glass_words, dark_words, "the light is not hashed");
     }
 
     #[test]
@@ -1679,33 +1831,23 @@ mod tests {
 
     #[test]
     fn the_caret_settles_on_its_own_stop_without_a_pop() {
-        use crate::cursor_glow::{CursorGlow, GlowConfig, GlowStyle};
+        use crate::cursor_glow::{CursorGlow, GlowConfig};
         use crate::rainbow_kitty::ribbon::walk_arc;
         use crate::spectrum::spectrum;
 
         let g = geom();
         let glow_cfg = GlowConfig {
-            enabled: true,
-            classic_mono: false,
-            style: GlowStyle::RainbowKitty,
-            color: 0x0050_FA7B,
             accent: 0x007A_A2F7,
             duration: Duration::from_millis(240),
             length: 18,
-            intensity: 1.0,
             audible: true,
             radius: 0.6,
             ring: true,
-            dark_theme: true,
-            theme_fg: 0x00C8_D3F5,
-            theme_bg: 0x001A_1B26,
-            beam: false,
-            head_dx: 0.5,
-            ribbon_tall: true,
-            ribbon_flat: false,
+            ..Default::default()
         };
         fn host_cfg(glow: &CursorGlow, glow_cfg: &GlowConfig, now: Instant) -> RainbowConfig {
             RainbowConfig {
+                light: crate::cursor_glow::Light::OFF,
                 enabled: true,
                 intensity: 1.0,
                 blinking: false,
@@ -3351,28 +3493,17 @@ mod tests {
 
     #[test]
     fn caret_and_ribbon_share_one_live_clock_through_a_streaming_run() {
-        use crate::cursor_glow::{CursorGlow, GlowConfig, GlowStyle};
+        use crate::cursor_glow::{CursorGlow, GlowConfig};
 
         let g = geom();
         let glow_cfg = GlowConfig {
-            enabled: true,
-            classic_mono: false,
-            style: GlowStyle::RainbowKitty,
-            color: 0x0050_FA7B,
             accent: 0x007A_A2F7,
             duration: Duration::from_millis(240),
             length: 18,
-            intensity: 1.0,
             audible: true,
             radius: 0.6,
             ring: true,
-            dark_theme: true,
-            theme_fg: 0x00C8_D3F5,
-            theme_bg: 0x001A_1B26,
-            beam: false,
-            head_dx: 0.5,
-            ribbon_tall: true,
-            ribbon_flat: false,
+            ..Default::default()
         };
         let body_cfg = cfg();
         let t0 = Instant::now();
@@ -3498,6 +3629,7 @@ mod tests {
             let t0 = Instant::now();
             let cur = Some((2_u16, 5_u16));
             let cfg_at = |ms: u64| RainbowConfig {
+                light: crate::cursor_glow::Light::OFF,
                 enabled: true,
                 intensity: 1.0,
                 blinking,

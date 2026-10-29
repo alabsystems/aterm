@@ -92,6 +92,9 @@ mod publish;
 #[path = "../../src/release.rs"]
 #[allow(dead_code)]
 mod release;
+#[path = "../../src/release_keychain.rs"]
+#[allow(dead_code)]
+mod release_keychain;
 #[path = "../../src/release_steps.rs"]
 #[allow(dead_code)]
 mod release_steps;

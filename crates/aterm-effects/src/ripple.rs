@@ -96,8 +96,11 @@ const fn quantise(v: f32) -> f32 {
 #[inline]
 pub const fn claude_glint(d_cells: f32, ms: u64) -> f32 {
     let x = front(ms) - d_cells;
+    if x <= -2.5 || x >= 5.0 + GLINT_ECHO_CELLS {
+        return 0.0;
+    }
     let main = profile(x);
-    let level = if main >= GLINT_ECHO_GAIN {
+    let level = if main >= GLINT_ECHO_GAIN || x <= GLINT_ECHO_CELLS - 2.5 {
         main
     } else {
         main.max(GLINT_ECHO_GAIN * profile(x - GLINT_ECHO_CELLS))
@@ -119,7 +122,11 @@ const fn train(x: f32) -> f32 {
     }
     let k = (x * INV_LAP).ceil();
     let inner = x + (k - 1.0) * GLINT_LAP;
-    profile(inner).max(profile(inner + GLINT_LAP))
+    if inner > -2.5 {
+        profile(inner)
+    } else {
+        profile(inner + GLINT_LAP)
+    }
 }
 
 /// The harness's field: the glint (`0..=1`, in eighths) at `d` cells from the wand at `ms`.

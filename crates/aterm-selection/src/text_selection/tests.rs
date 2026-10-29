@@ -401,9 +401,9 @@ fn test_adjust_for_row_splice_clears_only_after_real_history_eviction() {
     assert!(!outside.has_selection());
 }
 
-/// The render loop's precomputed bounds (`normalized_bounds` +
-/// `selection_contains_linear`/`_block`) agree with `contains` on every cell,
-/// for a forward, a backward and a block selection.
+/// When normalized start is `Left` and normalized end is `Right` (or for `Block`),
+/// `normalized_bounds` equals `side_adjusted_bounds` and agrees with `contains` on every cell;
+/// a renderer caching arbitrary anchors must use `side_adjusted_bounds`.
 #[test]
 fn precomputed_bounds_equivalent_to_contains() {
     use aterm_types::selection::{selection_contains_block, selection_contains_linear};
@@ -858,7 +858,10 @@ fn test_adjust_for_rows_shrink_relabels_every_row_by_the_same_amount() {
     degenerate.start_selection(1, 0, SelectionSide::Left, SelectionType::Simple);
     degenerate.update_selection(1, 1, SelectionSide::Right);
     degenerate.complete_selection();
-    assert!(!degenerate.adjust_for_rows_shrink(0, 4, 50));
+    assert!(
+        !degenerate.adjust_for_rows_shrink(0, 4, 50),
+        "kept_rows = 0 clears the selection"
+    );
     assert!(!degenerate.has_selection());
 
     let mut empty = TextSelection::new();
@@ -998,6 +1001,23 @@ fn truncate_to_floor_over_every_small_span() {
                         } else {
                             assert_eq!(sel.state(), SelectionState::None, "{at}");
                         }
+                    }
+
+                    // Inverted `(oldest_abs > live_top_abs)` clamps `min_row` to `0`
+                    // cleanly in both debug and release builds: live spans (`lo >= 0`)
+                    // survive untouched and scrollback-touching spans (`lo < 0`) clear.
+                    let mut inv = TextSelection::new();
+                    inv.start_selection(r1, c1, SelectionSide::Left, kind);
+                    inv.update_selection(r2, c2, SelectionSide::Right);
+                    inv.complete_selection();
+                    let inv_survived = inv.truncate_to_floor(oldest_abs + 5, oldest_abs);
+                    let (lo, _) = (r1.min(r2), r1.max(r2));
+                    if lo >= 0 {
+                        assert!(inv_survived && !inv.truncated());
+                        assert_eq!((inv.start().row, inv.end().row), (r1, r2));
+                    } else {
+                        assert!(!inv_survived && !inv.truncated());
+                        assert_eq!(inv.state(), SelectionState::None);
                     }
                 }
             }

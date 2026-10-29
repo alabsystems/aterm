@@ -24,6 +24,9 @@ const MODEL_WIDE_END: &str = "Opus 5.5 \u{b7} Claude Ma\u{4E2D}";
 
 const GRAY: [u8; 3] = [130, 130, 130];
 
+const SITE_URL: &str = aterm_types::identity::SITE_URL;
+const SITE: &str = aterm_types::identity::SITE;
+
 fn banner() -> &'static str {
     aterm_phase::anchor!("launch.banner")
 }
@@ -437,8 +440,8 @@ fn menu_px(app: &App, wid: WindowId, rect: crate::tab_menu::MenuRect) -> PxRect 
     )
 }
 
-fn expected_line(view: AutopilotView, at: usize, cols: usize) -> String {
-    line_texts(view, LineEnd::Mode)
+fn expected_line(at: usize, cols: usize) -> String {
+    line_texts_for(3)
         .iter()
         .find(|t| at + LINE_LEAD + text_cells(t) < cols)
         .expect("a line fits")
@@ -502,9 +505,10 @@ fn the_wrapped_card_wears_its_border_kitty_stars_and_line() {
         "the border stands in the box's air"
     );
     let line_row = strip + top + 3;
-    let want = expected_line(AutopilotView::Cruise, text_col, 120);
-    assert!(
-        want.ends_with("\u{b7} autopilot \u{221e} cruise"),
+    let want = expected_line(text_col, 120);
+    assert_eq!(
+        want,
+        line_texts_for(3)[0],
         "the whole line fits at 120 columns: {want:?}"
     );
     let start = text_col + LINE_LEAD;
@@ -677,7 +681,7 @@ fn the_workspace_card_wears_the_card_at_its_own_text_column() {
     assert!(!under.is_empty(), "the border and the trail");
     assert!(over.iter().any(is_kitty), "the kitty: opaque art");
     let line_row = strip + top + 3;
-    let want = expected_line(AutopilotView::Cruise, text_col, 120);
+    let want = expected_line(text_col, 120);
     let start = text_col + LINE_LEAD;
     assert_eq!(
         glass_text(&app, wid, line_row, start..start + want.chars().count()),
@@ -843,7 +847,7 @@ fn a_held_card_goes_on_the_frame_its_banner_leaves() {
 }
 
 #[test]
-fn land_wears_the_sunset_and_says_land() {
+fn land_wears_the_sunset() {
     let (mut app, wid, session) = glass(120);
     let host = supervise(&mut app, session);
     let blue = |m: &Mark| {
@@ -869,143 +873,21 @@ fn land_wears_the_sunset_and_says_land() {
         "Land: a sunset, never bluer than red"
     );
     let strip = strip_rows(&app, wid);
-    let want = expected_line(AutopilotView::Land, 11, 120);
-    assert!(want.ends_with("\u{b7} autopilot \u{2913} land"), "{want:?}");
+    let want = expected_line(11, 120);
     assert_eq!(
         glass_text(&app, wid, strip + 4, 13..13 + want.chars().count()),
-        want
+        want,
+        "Land's card says what Cruise's does"
     );
+    assert!(!want.contains("autopilot"), "{want:?}");
     host.shutdown_and_join();
 }
 
-/// The glass's marks (`BandIcon::glass_mark`) the frame draws on frame row
-/// `row`.
-fn drawn_marks(app: &App, wid: WindowId, row: usize) -> Vec<aterm_core::render::ChromeIcon> {
-    app.windows[&wid]
-        .input_scratch
-        .chrome_rasters
-        .iter()
-        .filter(|raster| usize::from(raster.row) == row)
-        .flat_map(|raster| raster.icons.iter().copied())
-        .filter(|i| aterm_core::render::BandIcon::glass_mark(i.icon.ch()).is_some())
-        .collect()
-}
-
-/// THE CARD'S LINE DRAWS ITS MODE'S MARK AS THE GLASS'S OWN (the one map,
-/// `BandIcon::glass_mark`): Land's `· autopilot ⤓ land` (STIX Two Math's `⤓`
-/// stood 7 × 13 at 1×, over the capitals and below the baseline) and Off's
-/// `○ off` are drawn once at the line's cell that keeps the character, frame
-/// after frame. NEGATIVE CONTROL: Cruise's `∞`, a glyph of the face's own in
-/// the set's size, draws no icon on the line's row.
+/// THE CARD'S LINE NAMES NEITHER THE AUTOPILOT NOR A TASK'S END: Land's card says what Cruise's
+/// does, whatever face the task wears, and a face's move arms no episode.
 #[test]
-fn the_cards_line_draws_its_modes_mark_as_the_glasss() {
-    use aterm_core::render::{BandIcon, ChromeIcon};
-    let (mut app, wid, session) = glass(120);
-    let host = supervise(&mut app, session);
-    frame(&mut app, wid);
-    let row = strip_rows(&app, wid) + 4;
-    let line = glass_text(&app, wid, row, 0..120);
-    assert!(line.contains("autopilot \u{221e} cruise"), "{line:?}");
-    assert_eq!(drawn_marks(&app, wid, row), [], "control: Cruise's ∞");
-    for (mode, icon) in [
-        (Autopilot::Land, BandIcon::ToBar),
-        (Autopilot::Off, BandIcon::Ring),
-    ] {
-        assert!(app.set_session_autopilot(session, Some(mode), crate::autopilot::Surface::Chip));
-        for k in 0..3 {
-            frame(&mut app, wid);
-            let cells = &app.windows[&wid].input_scratch.cells[row];
-            let col = cells
-                .iter()
-                .position(|c| c.ch == icon.ch())
-                .unwrap_or_else(|| panic!("{mode:?}: the line keeps {:?}", icon.ch()));
-            let col = u16::try_from(col).expect("a column");
-            assert_eq!(
-                drawn_marks(&app, wid, row),
-                [ChromeIcon { col, icon }],
-                "{mode:?}, frame {k}: the line's mark, once"
-            );
-        }
-    }
-    host.shutdown_and_join();
-}
-
-#[test]
-fn a_landing_is_said_on_the_cards_line_under_land_alone() {
+fn the_cards_line_names_no_autopilot_and_no_task_end() {
     use aterm_agent::harness::acts::TaskFace;
-    for view in AutopilotView::ALL {
-        let faces = std::iter::once(None).chain(TaskFace::ALL.into_iter().map(Some));
-        for task in faces {
-            let want = match (view, task) {
-                (AutopilotView::Land, Some(TaskFace::Landed)) => LineEnd::Landed,
-                _ => LineEnd::Mode,
-            };
-            assert_eq!(LineEnd::of(view, task), want, "{view:?} {task:?}");
-        }
-    }
-    for (end, tail) in [
-        (LineEnd::Mode, "\u{2913} land"),
-        (LineEnd::Landed, "\u{2713} landed"),
-    ] {
-        let texts = line_texts(AutopilotView::Land, end);
-        assert!(
-            texts[0].ends_with(&format!("\u{b7} autopilot {tail}")),
-            "{texts:?}"
-        );
-        assert!(
-            std::ptr::eq(texts, line_texts(AutopilotView::Land, end)),
-            "made once"
-        );
-        let versioned = |texts: &[String]| -> Vec<String> {
-            texts[1..]
-                .iter()
-                .filter(|t| t.starts_with("enhanced by "))
-                .cloned()
-                .collect()
-        };
-        assert_eq!(
-            versioned(texts),
-            versioned(line_texts(AutopilotView::Land, LineEnd::Mode)),
-            "the narrower versioned rungs"
-        );
-        let glyph = tail.split(' ').next().expect("a glyph");
-        let short: Vec<&String> = texts
-            .iter()
-            .filter(|t| !t.starts_with("enhanced by "))
-            .collect();
-        assert_eq!(
-            short,
-            [
-                &format!("{HERO_WORD} claude harness \u{b7} {tail}"),
-                &format!("{HERO_WORD} \u{b7} {tail}"),
-                &format!("{HERO_WORD} {glyph}"),
-            ],
-            "the short rungs say the end too"
-        );
-        let cruise = line_texts(AutopilotView::Cruise, end);
-        assert!(
-            cruise[0].ends_with("\u{b7} autopilot \u{221e} cruise"),
-            "Cruise says its mode: {cruise:?}"
-        );
-        for view in [
-            AutopilotView::Cruise,
-            AutopilotView::Off,
-            AutopilotView::MasterOff,
-        ] {
-            assert_eq!(
-                line_texts(view, end),
-                line_texts(view, LineEnd::Mode),
-                "NEGATIVE CONTROL: {view:?} says no end"
-            );
-        }
-    }
-    let fits = |end: LineEnd| {
-        line_texts(AutopilotView::Land, end)
-            .iter()
-            .find(|t| 11 + LINE_LEAD + text_cells(t) < 120)
-            .expect("a line fits")
-            .clone()
-    };
     for word in [Autopilot::Land, Autopilot::Cruise] {
         let (mut app, wid, session) = glass(120);
         let host = supervise(&mut app, session);
@@ -1027,32 +909,29 @@ fn a_landing_is_said_on_the_cards_line_under_land_alone() {
         frame(&mut app, wid);
         assert!(intro_over(&app, wid), "the intro over");
         let strip = strip_rows(&app, wid);
-        for (face, end) in [
-            (Some(TaskFace::Landed), LineEnd::Landed),
-            (Some(TaskFace::Theirs), LineEnd::Mode),
-            (Some(TaskFace::Open), LineEnd::Mode),
-            (Some(TaskFace::Landed), LineEnd::Landed),
-            (None, LineEnd::Mode),
+        let want = expected_line(11, 120);
+        for face in [
+            Some(TaskFace::Landed),
+            Some(TaskFace::Theirs),
+            Some(TaskFace::Open),
+            None,
         ] {
             app.apply_harness_fact(&sid, crate::HarnessFact::Task(face));
+            let _ = crate::work_counts::take_card_layouts();
             frame(&mut app, wid);
-            let want = match (word, end) {
-                (Autopilot::Land, _) => fits(end),
-                _ => expected_line(AutopilotView::Cruise, 11, 120),
-            };
             assert_eq!(
                 glass_text(&app, wid, strip + 4, 13..13 + want.chars().count()),
                 want,
                 "{word:?}: {face:?}"
             );
+            assert_eq!(
+                crate::work_counts::take_card_layouts(),
+                0,
+                "{word:?}: {face:?}: the line kept its place"
+            );
             assert!(
                 intro_over(&app, wid),
                 "{word:?}: {face:?}: a face's move arms no episode"
-            );
-            assert_ne!(
-                app.claude_card_deadline(t),
-                Some(t + Duration::from_millis(FRAME_MS)),
-                "{word:?}: {face:?}: no intro frame wanted"
             );
         }
         set_now(None);
@@ -1060,159 +939,78 @@ fn a_landing_is_said_on_the_cards_line_under_land_alone() {
     }
 }
 
-fn six_pm(other_day: bool) -> crate::claude_lights::LandAtGlass {
-    crate::claude_lights::LandAtGlass {
-        clock: crate::claude_lights::Clock::of_minute(18 * 60),
-        other_day: other_day.then_some(crate::claude_lights::Weekday::Sat),
-    }
-}
-
+/// The card line's ladder, widest first, for each harness: `enhanced by alab <cli> harness
+/// v<version>`, then the harness and its version, then the harness, each with the site's name;
+/// then the site's name, then `alab`; never aterm's own build signature.
 #[test]
-fn the_cards_line_follows_an_armed_timer() {
-    let cruise = line_texts(AutopilotView::Cruise, LineEnd::Mode);
-    for (other_day, tail) in [(false, "\u{2913}18:00"), (true, "\u{2913}Sat 18:00")] {
-        let at = six_pm(other_day);
-        let end = LineEnd::Mode.timed(AutopilotView::Cruise, Some(at));
-        assert_eq!(end, LineEnd::CruiseUntil(at));
-        let texts = line_texts(AutopilotView::Cruise, end);
-        assert_eq!(
-            texts[0],
-            format!("{} {tail}", cruise[0]),
-            "the timer's time after Cruise's words"
-        );
-        assert!(
-            texts[0].ends_with(&format!("\u{b7} autopilot \u{221e} cruise {tail}")),
-            "{texts:?}"
-        );
-        assert_eq!(texts[1..], cruise[..], "then Cruise's own rungs");
-        assert!(
-            std::ptr::eq(texts, line_texts(AutopilotView::Cruise, end)),
-            "made once"
-        );
-        assert_eq!(
-            line_texts(AutopilotView::Land, end),
-            make_line_texts(AutopilotView::Land, LineEnd::Mode),
-            "the timer is Cruise's"
-        );
-    }
-    assert_ne!(
-        line_texts(AutopilotView::Cruise, LineEnd::CruiseUntil(six_pm(false)))[0],
-        line_texts(AutopilotView::Cruise, LineEnd::CruiseUntil(six_pm(true)))[0],
-        "another face, other words"
-    );
-    let at = Some(six_pm(false));
-    assert_eq!(
-        LineEnd::Mode.timed(AutopilotView::Cruise, None),
-        LineEnd::Mode,
-        "CONTROL: no timer"
-    );
-    for (end, view) in [
-        (LineEnd::Mode, AutopilotView::Land),
-        (LineEnd::Landed, AutopilotView::Land),
-        (LineEnd::Mode, AutopilotView::Off),
-    ] {
-        assert_eq!(end.timed(view, at), end, "CONTROL: {view:?} {end:?}");
-    }
-
-    for (rows_kind, agent, timed_first) in [
-        (4, aterm_phase::CliHarness::Agy, false),
-        (1, aterm_phase::CliHarness::Muse, true),
-    ] {
-        let first = timed_first.then(|| {
-            line_texts_for(
-                rows_kind,
-                AutopilotView::Cruise,
-                LineEnd::CruiseUntil(six_pm(false)),
-            )
-        });
-        let cruise = line_texts_for(rows_kind, AutopilotView::Cruise, LineEnd::Mode);
-        let head = format!(
-            "enhanced by {HERO_WORD} {} harness v{}",
-            agent.cli(),
-            agent.version_str()
-        );
-        if agent == aterm_phase::CliHarness::Agy {
-            assert_eq!(cruise[0], head, "{cruise:?}");
-        } else {
-            assert!(
-                cruise[0].starts_with(&format!("{head} \u{b7} autopilot")),
-                "{cruise:?}"
-            );
-        }
-        assert!(
-            !cruise[0].contains('\u{2913}'),
-            "an untimed line stays untimed"
-        );
-        let mut timed = Vec::new();
-        for (other_day, tail) in [(false, "\u{2913}18:00"), (true, "\u{2913}Sat 18:00")] {
-            let end = LineEnd::CruiseUntil(six_pm(other_day));
-            let texts = line_texts_for(rows_kind, AutopilotView::Cruise, end);
-            assert_eq!(texts[0], format!("{} {tail}", cruise[0]));
-            assert_eq!(texts[1..], cruise[..], "then the untimed rungs");
-            assert!(std::ptr::eq(
-                texts,
-                line_texts_for(rows_kind, AutopilotView::Cruise, end),
-            ));
-            assert_eq!(
-                line_texts_for(rows_kind, AutopilotView::Land, end),
-                make_line_texts_for(agent, AutopilotView::Land, LineEnd::Mode),
-                "the timer is Cruise's",
-            );
-            timed.push(texts);
-        }
-        assert_ne!(timed[0][0], timed[1][0], "each face keeps its own words");
-        if let Some(first) = first {
-            assert!(
-                std::ptr::eq(first, timed[0]),
-                "the timed-first face is reused"
-            );
-        }
-        assert!(std::ptr::eq(
-            cruise,
-            line_texts_for(rows_kind, AutopilotView::Cruise, LineEnd::Mode),
-        ));
-        assert!(
-            !cruise[0].contains('\u{2913}'),
-            "cleared timer, untimed words"
-        );
-    }
+fn the_cards_line_ladder_names_the_harness_and_the_site() {
+    use aterm_phase::CliHarness;
+    let site = aterm_types::identity::SITE;
+    assert_eq!(site, "alab.systems");
     let build = crate::menu::version_signature(
         crate::menu::VersionFacts::this_build(),
         crate::menu::VersionRung::Full,
     )
     .expect("aterm's build signature");
-    for harness in aterm_phase::CliHarness::ALL {
+    for (rows_kind, harness, cli) in [
+        (3, CliHarness::ClaudeCode, "claude"),
+        (4, CliHarness::Agy, "agy"),
+        (1, CliHarness::Muse, "muse"),
+    ] {
+        assert_eq!(harness.cli(), cli, "the brand names {harness:?}");
         let ver = harness.version_str();
-        let texts = make_line_texts_for(harness, AutopilotView::Cruise, LineEnd::Mode);
-        let named = format!("enhanced by {HERO_WORD} {} harness v{ver}", harness.cli());
-        assert!(
-            texts[0].starts_with(&named),
-            "{harness:?}: its own version beside the word harness: {texts:?}"
+        let brand = format!("alab {cli} harness");
+        let texts = line_texts_for(rows_kind);
+        assert_eq!(
+            texts,
+            [
+                format!("enhanced by {brand} v{ver} \u{b7} alab.systems"),
+                format!("{brand} v{ver} \u{b7} alab.systems"),
+                format!("{brand} \u{b7} alab.systems"),
+                "alab.systems".to_owned(),
+                "alab".to_owned(),
+            ],
+            "{harness:?}"
         );
+        assert!(std::ptr::eq(texts, line_texts_for(rows_kind)), "made once");
+        assert_eq!(texts, make_line_texts_for(harness));
         for text in texts {
-            let versions = text
-                .match_indices(" v")
-                .filter(|&(at, _)| text[at + 2..].starts_with(|c: char| c.is_ascii_digit()))
-                .count();
-            assert!(versions <= 1, "{harness:?}: one version: {text:?}");
+            assert!(!text.contains("autopilot"), "{text:?}");
             assert!(
                 !text.contains(&build),
-                "{harness:?}: never aterm's build ({build}): {text:?}"
+                "never aterm's build ({build}): {text:?}"
             );
+            let link = line_link(text);
+            match text.strip_suffix(site) {
+                Some(lead) => {
+                    let start = text_cells(lead);
+                    assert_eq!(link, Some(start..start + 12), "{text:?}");
+                }
+                None => assert_eq!(link, None, "{text:?}: no link"),
+            }
         }
     }
     assert_eq!(
-        make_line_texts(AutopilotView::Cruise, LineEnd::Mode)[0],
-        format!(
-            "enhanced by {HERO_WORD} claude harness v{} \u{b7} autopilot \u{221e} cruise",
-            aterm_phase::CliHarness::ClaudeCode.version_str()
-        ),
-        "Claude Code's line: its harness's version, then the autopilot"
+        line_link("alab.systems"),
+        Some(0..12),
+        "the bare site is all link"
+    );
+    assert_eq!(
+        line_link("alab alab.systems"),
+        None,
+        "NEGATIVE CONTROL: no separator"
+    );
+    assert_eq!(
+        line_link("alab \u{b7} alab.systemsx"),
+        None,
+        "NEGATIVE CONTROL"
     );
 }
 
+/// AN ARMED TIMER LEAVES THE CARD'S LINE ALONE: the same words, nothing laid out or inked anew,
+/// and the settled frame replayed.
 #[test]
-fn a_cruise_cards_line_says_its_armed_timer() {
+fn an_armed_timer_leaves_the_cards_line_alone() {
     let (mut app, wid, session) = glass(120);
     let host = supervise(&mut app, session);
     app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
@@ -1225,13 +1023,13 @@ fn a_cruise_cards_line_says_its_armed_timer() {
     hold(&mut app, wid);
     assert_eq!(app.claude_card_deadline(t), None, "settled");
     let line_row = strip_rows(&app, wid) + 4;
+    let row: Vec<RenderCell> = app.windows[&wid].input_scratch.cells[line_row].clone();
+    let plain = expected_line(11, 120);
     let start = 11 + LINE_LEAD;
-    let read = |app: &App, words: &str| {
-        glass_text(app, wid, line_row, start..start + words.chars().count())
-    };
-    let plain = expected_line(AutopilotView::Cruise, 11, 120);
-    assert_eq!(read(&app, &plain), plain, "CONTROL: no timer, no time");
-    assert!(!glass_text(&app, wid, line_row, 0..120).contains('\u{2913}'));
+    assert_eq!(
+        glass_text(&app, wid, line_row, start..start + plain.chars().count()),
+        plain
+    );
     let day_ms = 20_000 * 86_400_000_i64;
     let wall = day_ms + 12 * 3_600_000;
     let utc = |_: i64| Some(0);
@@ -1239,35 +1037,17 @@ fn a_cruise_cards_line_says_its_armed_timer() {
         app.autopilot_timers
             .arm(session, day_ms + 18 * 3_600_000, t, wall, &utc, None)
     );
-    let timed = format!("{plain} \u{2913}18:00");
-    assert!(
-        11 + LINE_LEAD + text_cells(&timed) < 120,
-        "the timed line fits at 120 columns: {timed:?}"
-    );
-    let _ = crate::work_counts::take_card_layouts();
-    frame(&mut app, wid);
-    assert_eq!(read(&app, &timed), timed, "the timer's time on the line");
-    assert_eq!(crate::work_counts::take_card_layouts(), 1, "laid out once");
-    assert_eq!(
-        app.claude_card_deadline(t),
-        None,
-        "a timer's move arms no episode"
-    );
     let layers = card_layers(&app, wid);
-    let row: Vec<RenderCell> = app.windows[&wid].input_scratch.cells[line_row].clone();
+    let _ = crate::work_counts::take_card_layouts();
     let _ = crate::work_counts::take_card_line_inks();
     let _ = crate::work_counts::take_card_ticks();
     for i in 0..20u64 {
         set_now(Some(t + Duration::from_millis(1 + i * 7)));
         frame(&mut app, wid);
-        assert_eq!(
-            card_layers(&app, wid),
-            layers,
-            "the same contents, replayed: frame {i}"
-        );
+        assert_eq!(card_layers(&app, wid), layers, "frame {i}");
         assert_eq!(
             app.windows[&wid].input_scratch.cells[line_row], row,
-            "frame {i}"
+            "frame {i}: the line's cells"
         );
     }
     assert_eq!(
@@ -1283,12 +1063,9 @@ fn a_cruise_cards_line_says_its_armed_timer() {
     assert_eq!(
         crate::work_counts::take_card_ticks(),
         0,
-        "the settled frame, replayed"
+        "the settled frame"
     );
-    assert!(app.autopilot_timers.forget(session));
-    frame(&mut app, wid);
-    assert_eq!(read(&app, &plain), plain, "the timer gone");
-    assert!(!glass_text(&app, wid, line_row, 0..120).contains('\u{2913}'));
+    assert_eq!(app.claude_card_deadline(t), None, "no episode armed");
     set_now(None);
     host.shutdown_and_join();
 }
@@ -1409,8 +1186,8 @@ fn off_wears_the_white_card_without_a_claim() {
     let strip = strip_rows(&app, wid);
     let line = glass_text(&app, wid, strip + 4, 0..120);
     assert!(
-        line.contains("enhanced by alab claude harness") && line.contains("autopilot \u{25cb} off"),
-        "the line says Off: {line:?}"
+        line.contains(&line_texts_for(3)[0]),
+        "Off's card wears the line: {line:?}"
     );
     let entry = app.windows[&wid]
         .claude_card
@@ -1835,13 +1612,9 @@ fn a_light_theme_card_is_ink() {
         let (la, lb) = (relative_luminance(a), relative_luminance(b));
         (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
     };
-    let modes = [
-        (Autopilot::Cruise, "\u{221e} cruise"),
-        (Autopilot::Land, "\u{2913} land"),
-        (Autopilot::Off, "\u{25cb} off"),
-    ];
+    let modes = [Autopilot::Cruise, Autopilot::Land, Autopilot::Off];
     let grounds = [("ff/ff/ff", 0x00FF_FFFF), ("fb/f1/c7", 0x00FB_F1C7)];
-    for ((mode, word), (rgb, bg)) in modes.into_iter().flat_map(|m| grounds.map(|g| (m, g))) {
+    for (mode, (rgb, bg)) in modes.into_iter().flat_map(|m| grounds.map(|g| (m, g))) {
         let osc = &format!("{mode:?} {rgb}");
         let (mut app, wid, session) = glass(120);
         {
@@ -1904,11 +1677,21 @@ fn a_light_theme_card_is_ink() {
             "{osc}: CONTROL: the last frame is the flow's"
         );
         let line_row = strip_rows(&app, wid) + 4;
+        let view = match mode {
+            Autopilot::Land => AutopilotView::Land,
+            Autopilot::Off => AutopilotView::Off,
+            _ => AutopilotView::Cruise,
+        };
+        assert_eq!(
+            app.session_autopilot(session).1,
+            view,
+            "{osc}: CONTROL: the card wears {mode:?}"
+        );
         assert!(
             glass_text(&app, wid, line_row, 0..120)
                 .trim_end()
-                .ends_with(&format!("autopilot {word}")),
-            "{osc}: CONTROL: the card wears {mode:?}"
+                .ends_with(aterm_types::identity::SITE),
+            "{osc}: CONTROL: the whole line"
         );
         let start = 11 + LINE_LEAD;
         let scratch = &app.windows[&wid].input_scratch;
@@ -2022,7 +1805,7 @@ fn a_narrow_pane_drops_the_kitty_and_keeps_the_border_and_line() {
         assert!(!under.is_empty(), "{cols}: the border");
         assert_eq!(!over.is_empty(), kitty, "{cols}: the kitty and its stars");
         let strip = strip_rows(&app, wid);
-        let want = expected_line(AutopilotView::Cruise, 11, cols);
+        let want = expected_line(11, cols);
         assert_eq!(
             glass_text(&app, wid, strip + 4, 13..13 + want.chars().count()),
             want,
@@ -2473,7 +2256,7 @@ fn every_recorded_card_stands_the_kitty_tall_only_beside_a_blank_path_row() {
         .collect();
     paths.sort();
     let kc = usize::from(kitty_cols(9, 18));
-    let texts = line_texts(AutopilotView::Cruise, LineEnd::Mode);
+    let texts = line_texts_for(3);
     let lay = |rows: &[String], cols: usize| {
         let s = scratch_of(rows, cols);
         let place = aterm_phase::launch_card_place(rows)?;
@@ -2751,7 +2534,7 @@ fn serious_mode_keeps_a_still_border_only() {
     assert!(!under.is_empty(), "the border");
     assert!(over.is_empty(), "no kitty, no stars");
     let (cw, _) = app.win_cell_size(wid);
-    let line = expected_line(AutopilotView::Cruise, 11, 120);
+    let line = expected_line(11, 120);
     let line_end = 11 + LINE_LEAD + text_cells(&line);
     assert_eq!(
         right(&app),
@@ -4216,7 +3999,7 @@ fn layout_cells_read(app: &App, wid: WindowId, key: &LaidKey) -> usize {
         &pane_cells(scratch, key),
         &key.place,
         kitty_width(key),
-        line_texts(key.view, key.end),
+        line_texts_for(3),
         &mut Seen::default(),
     );
     assert!(laid.is_some(), "the card is laid out");
@@ -4334,7 +4117,7 @@ fn card_glass(app: &App, wid: WindowId) -> CardGlass {
             .collect(),
         notices: app.windows[&wid]
             .claude_card
-            .notice_edits()
+            .banner_edits()
             .map(|(row, col, cells, _)| (row, col, cells.to_vec()))
             .collect(),
     }
@@ -4873,7 +4656,7 @@ fn an_episode_cut_off_by_lost_focus_rests_at_no_cost() {
 }
 
 #[test]
-fn a_timer_weekday_change_moves_the_footer_key_with_its_card_words() {
+fn a_timer_weekday_change_moves_the_footer_key() {
     use crate::autopilot_timers::AutopilotTimers;
     use crate::claude_lights::{ChipGlass, WindowLights};
 
@@ -4896,29 +4679,19 @@ fn a_timer_weekday_change_moves_the_footer_key_with_its_card_words() {
             },
         )
     };
-    let words = |glass| {
-        line_texts(
-            AutopilotView::Cruise,
-            LineEnd::Mode.timed(AutopilotView::Cruise, glass),
-        )
-    };
 
     assert!(timers.arm(session, at, now, wall, &west, None));
     let before = timers.glass(session).expect("armed face");
     let before_key = term(Some(before));
-    let before_words = words(Some(before));
     assert_ne!(before_key, term(None), "CONTROL: arming moves the key");
-    assert_ne!(before_words, words(None), "CONTROL: armed timer words");
     assert!(timers.rederive(now, wall, &west).is_empty());
     assert_eq!(term(timers.glass(session)), before_key);
-    assert_eq!(words(timers.glass(session)), before_words);
 
     assert_eq!(timers.rederive(now, wall, &east), vec![session]);
     let after = timers.glass(session).expect("re-derived face");
     assert_eq!(before.clock, after.clock, "the same HH:MM");
     assert!(before.other_day.is_some() && after.other_day.is_some());
     assert_ne!(before.other_day, after.other_day);
-    assert_ne!(words(Some(after)), before_words, "the card's words moved");
     assert_ne!(
         term(Some(after)),
         before_key,
@@ -5359,40 +5132,30 @@ fn the_shimmer_locks_the_flows_steps() {
 
 #[test]
 fn every_rung_of_the_line_names_alab() {
-    let ends = [
-        LineEnd::Mode,
-        LineEnd::Landed,
-        LineEnd::CruiseUntil(six_pm(false)),
-        LineEnd::CruiseUntil(six_pm(true)),
-    ];
     let mut rungs = 0;
-    for view in AutopilotView::ALL {
-        for end in ends {
-            for rows_kind in [3, 4, 1] {
-                let texts = line_texts_for(rows_kind, view, end);
-                for (i, text) in texts.iter().enumerate() {
-                    let short = i + 3 >= texts.len();
-                    assert_eq!(!text.starts_with("enhanced by "), short, "{text:?}");
-                    let at = if short { 0 } else { 12 };
-                    let len = HERO_WORD.len() as u16;
-                    assert_eq!(hero_cells(text), Some(at..at + len), "{text:?}");
-                    let word: String = text
-                        .chars()
-                        .skip(usize::from(at))
-                        .take(HERO_WORD.len())
-                        .collect();
-                    assert_eq!(word, HERO_WORD, "{text:?}");
-                    rungs += 1;
-                }
-                let widths: Vec<usize> = texts.iter().map(|t| text_cells(t)).collect();
-                assert!(
-                    widths.windows(2).all(|w| w[0] > w[1]),
-                    "widest first: {texts:?}"
-                );
-            }
+    for rows_kind in [3, 4, 1] {
+        let texts = line_texts_for(rows_kind);
+        for (i, text) in texts.iter().enumerate() {
+            let short = i > 0;
+            assert_eq!(!text.starts_with("enhanced by "), short, "{text:?}");
+            let at = if short { 0 } else { 12 };
+            let len = HERO_WORD.len() as u16;
+            assert_eq!(hero_cells(text), Some(at..at + len), "{text:?}");
+            let word: String = text
+                .chars()
+                .skip(usize::from(at))
+                .take(HERO_WORD.len())
+                .collect();
+            assert_eq!(word, HERO_WORD, "{text:?}");
+            rungs += 1;
         }
+        let widths: Vec<usize> = texts.iter().map(|t| text_cells(t)).collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] > w[1]),
+            "widest first: {texts:?}"
+        );
     }
-    assert!(rungs > 100, "CONTROL: the rungs were walked ({rungs})");
+    assert_eq!(rungs, 15, "CONTROL: the rungs were walked");
     assert_eq!(
         hero_cells("enhanced by malab claude harness"),
         None,
@@ -5708,13 +5471,13 @@ fn capture_bare(app: &App, wid: WindowId, c: &NoticeCapture) -> bool {
 
 fn capture_banner(app: &App, wid: WindowId, c: &NoticeCapture) -> bool {
     let strip = strip_rows(app, wid);
-    let words = text_cells(NOTICE.text);
+    let words = text_cells(SITE_URL);
     let at = 2 + LINE_LEAD;
     let blank = |r: usize, from: usize| {
         glass_text(app, wid, strip + r, from..c.end) == " ".repeat(c.end - from)
     };
     glass_text(app, wid, strip + c.top, 0..at) == " ".repeat(at)
-        && glass_text(app, wid, strip + c.top, at..at + words) == NOTICE.text
+        && glass_text(app, wid, strip + c.top, at..at + words) == SITE_URL
         && blank(c.top, at + words)
         && c.notice().skip(1).all(|r| blank(r, 0))
 }
@@ -5774,7 +5537,7 @@ fn the_update_notice_wears_the_harness_notice_on_the_glass_only() {
             "{name}: the card's line: {line:?}"
         );
         let lead = line.chars().take_while(|&ch| ch == ' ').count();
-        let rung = line_texts(AutopilotView::Cruise, LineEnd::Mode)
+        let rung = line_texts_for(3)
             .iter()
             .find(|t| lead + text_cells(t) < c.cols)
             .expect("a rung fits");
@@ -5792,7 +5555,7 @@ fn the_update_notice_wears_the_harness_notice_on_the_glass_only() {
                 .all(|(col, cell)| cell.bold == (hero..hero + HERO_WORD.len()).contains(&col)),
             "{name}: bold on the hero word alone, on every rung"
         );
-        let (row, at, words) = (chrome + c.top, 2 + LINE_LEAD, text_cells(NOTICE.text));
+        let (row, at, words) = (chrome + c.top, 2 + LINE_LEAD, text_cells(SITE_URL));
         let scratch = &app.windows[&wid].input_scratch;
         let blank = scratch.implicit_blank;
         assert_eq!(
@@ -5849,7 +5612,7 @@ fn the_update_notice_wears_the_harness_notice_on_the_glass_only() {
             (2, DecoGlyph::Star4, DecoBlend::Add, pack(first.color)),
             "{name}: the star leads the words in the first letter's colour"
         );
-        let hits = &app.windows[&wid].claude_card.notice_hits;
+        let hits = &app.windows[&wid].claude_card.glass_hits;
         let mut want = vec![
             (session, row, 2..at + words, Some(NOTICE.url)),
             (session, row, 2..c.end, None),
@@ -5857,6 +5620,7 @@ fn the_update_notice_wears_the_harness_notice_on_the_glass_only() {
         want.extend(hidden.iter().map(|&r| (session, r, 2..c.end, None)));
         assert_eq!(
             hits.iter()
+                .filter(|h| h.link == GlassLink::Notice)
                 .map(|h| (h.session, h.frame_row, h.cols.clone(), h.url))
                 .collect::<Vec<_>>(),
             want,
@@ -5892,22 +5656,20 @@ fn the_update_notice_wears_the_harness_notice_on_the_glass_only() {
     );
     assert_eq!(NOTICE.url, "https://alab.systems");
     assert_eq!(
-        NOTICE.text, NOTICE.url,
+        NOTICE.rungs.iter().map(|w| w.lead).collect::<Vec<_>>(),
+        ["", ""],
         "the banner reads as the link it opens"
     );
-    assert_eq!(NOTICE.short, "alab.systems");
-    let url = text_cells(NOTICE.text);
+    assert_eq!((SITE_URL, SITE), ("https://alab.systems", "alab.systems"));
+    let url = text_cells(SITE_URL);
+    let link = |room: usize| NOTICE.words_within(room).map(|w| w.link);
+    assert_eq!(link(url), Some(SITE_URL), "the link whole");
     assert_eq!(
-        NOTICE.words_within(url),
-        Some(NOTICE.text),
-        "the link whole"
-    );
-    assert_eq!(
-        NOTICE.words_within(url - 1),
-        Some(NOTICE.short),
+        link(url - 1),
+        Some(SITE),
         "where the link cannot fit, the site's name"
     );
-    assert_eq!(NOTICE.words_within(text_cells(NOTICE.short) - 1), None);
+    assert_eq!(NOTICE.words_within(text_cells(SITE) - 1), None);
 }
 
 #[test]
@@ -6011,8 +5773,12 @@ fn the_vendors_notice_stays_bare_where_the_banner_may_not_go() {
         );
         assert!(!banner_shown(&app, wid), "{what}: no banner");
         assert!(
-            app.windows[&wid].claude_card.notice_hits.is_empty(),
-            "{what}: nothing to press"
+            !app.windows[&wid]
+                .claude_card
+                .glass_hits
+                .iter()
+                .any(|h| h.link == GlassLink::Notice),
+            "{what}: no banner to press"
         );
         assert_eq!(
             glass_text(&app, wid, strip + WIDE.card + 3, 0..120).contains("alab claude harness"),
@@ -6452,10 +6218,10 @@ fn a_press_on_the_notice_in_a_mixed_tab_is_the_banners() {
         app.splice_claude_footer(wid, &plan, crate::VisibleContentRoute::Heterogeneous);
     };
     mixed_frame(&mut app);
-    let hits = app.windows[&wid].claude_card.notice_hits.clone();
+    let hits = app.windows[&wid].claude_card.glass_hits.clone();
     let words = hits
         .iter()
-        .find(|h| h.url.is_some())
+        .find(|h| h.link == GlassLink::Notice && h.url.is_some())
         .map(|h| (h.frame_row, h.cols.end - 1))
         .expect("the banner on the mixed tab's glass");
     let hidden = hits
@@ -6574,9 +6340,9 @@ fn a_press_on_an_unfocused_panes_banner_focuses_the_pane() {
     frame(&mut app, wid);
     let words = app.windows[&wid]
         .claude_card
-        .notice_hits
+        .glass_hits
         .iter()
-        .find(|h| h.url.is_some())
+        .find(|h| h.link == GlassLink::Notice && h.url.is_some())
         .map(|h| (h.frame_row, h.cols.end - 1))
         .expect("the banner on the unfocused pane");
     let hand = |app: &mut App| {
@@ -6648,9 +6414,9 @@ fn a_press_on_the_banners_link_settles_a_tab_name_being_edited() {
         );
         let words = app.windows[&wid]
             .claude_card
-            .notice_hits
+            .glass_hits
             .iter()
-            .find(|h| h.url.is_some())
+            .find(|h| h.link == GlassLink::Notice && h.url.is_some())
             .map(|h| (h.frame_row, h.cols.end - 1))
             .expect("the banner's link");
         let tab = app.windows[&wid].tab_set.active_id().expect("Claude's tab");
@@ -6721,12 +6487,13 @@ fn a_notice_too_narrow_for_the_url_draws_the_sites_name_inside_its_end() {
             end: place.text_col + LINE_LEAD + room,
             ..place
         };
-        let mut notice = NoticeGlass::default();
-        make_notice(
+        let mut notice = BannerGlass::default();
+        make_banner(
             &mut notice,
+            NOTICE,
+            BannerPlace::notice(&place),
             card,
-            &place,
-            read,
+            Some(read),
             pane,
             RenderCell::default(),
             &ws.input_scratch,
@@ -6736,13 +6503,9 @@ fn a_notice_too_narrow_for_the_url_draws_the_sites_name_inside_its_end() {
         );
         (notice, place)
     };
-    let (url, short) = (text_cells(NOTICE.text), text_cells(NOTICE.short));
+    let (url, short) = (text_cells(SITE_URL), text_cells(SITE));
     for room in short..=url + 1 {
-        let want = if room >= url {
-            NOTICE.text
-        } else {
-            NOTICE.short
-        };
+        let want = if room >= url { SITE_URL } else { SITE };
         let words = text_cells(want);
         let (notice, place) = drawn(room);
         assert!(notice.on, "{room}: a banner");
@@ -6871,11 +6634,11 @@ fn the_banner_stays_while_the_card_scrolls_off() {
         let term = app.pool.get(session).expect("session").term.clone();
         crate::term_lock(&term).process(out.as_bytes());
     };
-    let words = text_cells(NOTICE.text);
+    let words = text_cells(SITE_URL);
     let at = 2 + LINE_LEAD;
     let banner_on = |app: &App, wid: WindowId, top: usize| {
         let strip = strip_rows(app, wid);
-        glass_text(app, wid, strip + top, at..at + words) == NOTICE.text
+        glass_text(app, wid, strip + top, at..at + words) == SITE_URL
             && glass_text(app, wid, strip + top + 1, 0..74)
                 .trim()
                 .is_empty()
@@ -7163,3 +6926,6 @@ mod a11y_tests;
 
 #[path = "claude_card_gate_tests.rs"]
 mod gate;
+
+#[path = "claude_card_banner_tests.rs"]
+mod banner;

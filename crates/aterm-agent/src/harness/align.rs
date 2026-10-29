@@ -304,16 +304,11 @@ pub(super) fn read_capture_pipe(
 /// Stop the child and descendants that inherited its stdout, then reap the
 /// direct child.
 fn kill_capture_child(child: &mut Child, observer: &CaptureObserver) {
+    // `process_group(0)` made the child's PID its private PGID before exec, and the unreaped
+    // Child still reserves it, so the group id cannot have been reused by an unrelated process.
     #[cfg(unix)]
-    if let Ok(pgid) = libc::pid_t::try_from(child.id())
-        && pgid > 1
-    {
-        // SAFETY: `process_group(0)` made this child's PID its private PGID
-        // before exec. The unreaped Child still reserves the PID, so the
-        // negative group id cannot have been reused by an unrelated process.
-        unsafe {
-            libc::kill(-pgid, libc::SIGKILL);
-        }
+    if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
+        let _ = aterm_uds::process::kill_group_until_empty(pgid);
     }
     let _ = child.kill();
     if child.wait().is_ok() {

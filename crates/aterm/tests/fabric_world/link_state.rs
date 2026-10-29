@@ -199,10 +199,11 @@ fn a_broker_that_accepts_but_never_acks_is_stalled_no_ack() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("stub dir");
     let stub = format!("{dir}/s.sock");
-    let listener = UnixListener::bind(&stub).expect("bind the stub");
+    let listener = harness::kept(UnixListener::bind(&stub).expect("bind the stub"));
     std::thread::spawn(move || {
         for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { return };
+            let Ok(stream) = stream else { return };
+            let mut stream = harness::kept(stream);
             std::thread::spawn(move || {
                 let mut sink = [0u8; 4096];
                 while stream.read(&mut sink).is_ok_and(|n| n > 0) {}

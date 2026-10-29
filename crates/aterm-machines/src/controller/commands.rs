@@ -629,151 +629,6 @@ fn resolve_ipv4_banner_and_rtt(
     (ipv4, banner, rtt_us)
 }
 
-/// Parses batched SSH vitals probe output from Linux or macOS.
-#[must_use]
-pub fn parse_ssh_vitals_output(
-    out: &str,
-    rtt_us: Option<u64>,
-) -> Option<crate::protocol::HostVitals> {
-    if !out.contains("__OS__") {
-        return None;
-    }
-    let mut cpu_cores = 0u32;
-    let mut load_avg_100 = None;
-    let mut uptime_secs = None;
-    let mut disk_total_bytes = 0u64;
-    let mut disk_used_bytes = 0u64;
-    let mut disk_avail_bytes = 0u64;
-    let mut mem_total_kb = 0u64;
-    let mut mem_avail_kb = 0u64;
-    let mut swap_total_kb = 0u64;
-    let mut swap_free_kb = 0u64;
-    let mut hw_mem_bytes = 0u64;
-    let mut gpu_name = None;
-    let mut gpu_busy_pct = None;
-    let mut gpu_temp_c = None;
-    let mut gpu_power_deciwatts = None;
-
-    for line in out.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("__CORES__") {
-            cpu_cores = rest.trim().parse::<u32>().unwrap_or(0);
-        } else if let Some(rest) = line.strip_prefix("__LOAD__") {
-            load_avg_100 = crate::facts::parse_loadavg(rest);
-        } else if let Some(rest) = line.strip_prefix("__UPTIME__") {
-            let trimmed = rest.trim();
-            if trimmed.contains("sec =") {
-                if let Some(boot) = crate::facts::parse_boottime(trimmed) {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    if now > boot {
-                        uptime_secs = Some(now - boot);
-                    }
-                }
-            } else if let Some(val) = trimmed
-                .split_whitespace()
-                .next()
-                .and_then(|s| s.parse::<f64>().ok())
-                && val > 0.0
-            {
-                uptime_secs = Some(val.round() as u64);
-            }
-        } else if let Some(rest) = line.strip_prefix("__DF__") {
-            if let Some((tot, used, avail)) = crate::facts::parse_df_k(&format!("Header\n{rest}")) {
-                disk_total_bytes = tot;
-                disk_used_bytes = used;
-                disk_avail_bytes = avail;
-            }
-        } else if let Some(rest) = line.strip_prefix("MemTotal:") {
-            mem_total_kb = rest
-                .split_whitespace()
-                .next()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
-        } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            mem_avail_kb = rest
-                .split_whitespace()
-                .next()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
-        } else if let Some(rest) = line.strip_prefix("SwapTotal:") {
-            swap_total_kb = rest
-                .split_whitespace()
-                .next()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
-        } else if let Some(rest) = line.strip_prefix("SwapFree:") {
-            swap_free_kb = rest
-                .split_whitespace()
-                .next()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
-        } else if let Some(rest) = line.strip_prefix("__HW_MEM__") {
-            hw_mem_bytes = rest.trim().parse::<u64>().unwrap_or(0);
-        } else if let Some(rest) = line.strip_prefix("__NVGPU__") {
-            let parts: Vec<&str> = rest.split(',').map(str::trim).collect();
-            if let Some(&name) = parts.first().filter(|n| !n.is_empty()) {
-                gpu_name = Some(name.to_owned());
-            }
-            if let Some(pct) = parts.get(1).and_then(|s| s.parse::<u8>().ok()) {
-                gpu_busy_pct = Some(pct.min(100));
-            }
-            if let Some(temp) = parts.get(2).and_then(|s| s.parse::<u16>().ok()) {
-                gpu_temp_c = Some(temp);
-            }
-            if let Some(watts) = parts.get(3).and_then(|s| s.parse::<f64>().ok())
-                && watts >= 0.0
-            {
-                gpu_power_deciwatts = Some((watts * 10.0).round() as u32);
-            }
-        }
-    }
-
-    let (mem_total_bytes, mem_used_bytes, mem_wired_bytes, mem_compressed_bytes) =
-        if mem_total_kb > 0 {
-            let tot = mem_total_kb.saturating_mul(1024);
-            let avail = mem_avail_kb.saturating_mul(1024).min(tot);
-            (tot, tot.saturating_sub(avail), None, None)
-        } else if let Some((used, wired, comp)) = crate::facts::parse_vm_stat(out) {
-            (
-                hw_mem_bytes.max(used),
-                used.min(hw_mem_bytes.max(used)),
-                Some(wired),
-                Some(comp),
-            )
-        } else {
-            (hw_mem_bytes, 0, None, None)
-        };
-    let swap_used_bytes =
-        (swap_total_kb > swap_free_kb).then(|| (swap_total_kb - swap_free_kb).saturating_mul(1024));
-    let cpu_busy_pct = load_avg_100.and_then(|[l1, _, _]| {
-        (cpu_cores > 0).then(|| (l1.saturating_mul(100) / (cpu_cores * 100)).min(100) as u8)
-    });
-
-    Some(crate::protocol::HostVitals {
-        cpu_cores,
-        cpu_busy_pct,
-        load_avg_100,
-        gpu_name,
-        gpu_busy_pct,
-        gpu_temp_c,
-        gpu_power_deciwatts,
-        mem_total_bytes,
-        mem_used_bytes,
-        mem_wired_bytes,
-        mem_compressed_bytes,
-        swap_used_bytes,
-        mem_pressure: Some("normal".to_owned()),
-        disk_total_bytes,
-        disk_used_bytes,
-        disk_avail_bytes,
-        uptime_secs,
-        rtt_us,
-    })
-}
-
 fn open_native_monitor_tab_in_aterm() -> Option<String> {
     #[cfg(unix)]
     {
@@ -6051,7 +5906,13 @@ mod tests {
              keeping a Mac\n# awake and editing a file, aterm has its own `aterm acaffiene` and \
              `aterm edit`.\n\n";
         assert!(templates::DEFAULT_BASELINE.contains(pointer));
-        let previous = templates::DEFAULT_BASELINE.replace(pointer, HOMEBREW_AND_APPS);
+        let before_vault_daemon = templates::DEFAULT_BASELINE.replace("vault_server = true\n", "");
+        assert!(
+            templates::EARLIER_DEFAULT_BASELINES
+                .contains(&text_sha256(&before_vault_daemon).as_str()),
+            "the digest is of the starter before vault_server = true"
+        );
+        let previous = before_vault_daemon.replace(pointer, HOMEBREW_AND_APPS);
         assert!(
             templates::EARLIER_DEFAULT_BASELINES.contains(&text_sha256(&previous).as_str()),
             "the digest is of the starter as a6c1342e82 wrote it"
@@ -6261,6 +6122,7 @@ mod tests {
             agent: Some("working".into()),
             agent_detail: Some("thinking".into()),
             agent_since_ms: Some(12_000),
+            program_state: None,
             human_ms: Some(45_000),
             autopilot: Some("cruise".into()),
             role: Some("operator".into()),
@@ -6339,26 +6201,13 @@ mod tests {
         assert_eq!(banner(b"SSH-2.0-\xff\r\n", false), None);
         assert_eq!(banner(b"SSH-2.0-observed_peer\r\n", true), None);
 
-        let dgx_out = "__OS__ Linux\n\
-__CORES__ 20\n\
-__LOAD__ 1.10 1.59 1.22 2/1383 3612429\n\
-__UPTIME__ 3108837.87\n\
-__DF__ /dev/nvme0n1p2 3937374564 2929223648 808111020 79% /\n\
-MemTotal:       127600528 kB\n\
-MemAvailable:   114306188 kB\n\
-SwapTotal:      16777212 kB\n\
-SwapFree:       16448040 kB\n\
-__NVGPU__ NVIDIA GB10, 12, 45, 3.40\n";
-        let vitals = parse_ssh_vitals_output(dgx_out, Some(2_100)).unwrap();
-        assert_eq!(vitals.cpu_cores, 20);
-        assert_eq!(vitals.load_avg_100, Some([110, 159, 122]));
-        assert_eq!(vitals.gpu_name.as_deref(), Some("NVIDIA GB10"));
-        assert_eq!(vitals.gpu_busy_pct, Some(12));
-        assert_eq!(vitals.gpu_temp_c, Some(45));
-        assert_eq!(vitals.gpu_power_deciwatts, Some(34));
-        assert_eq!(vitals.uptime_secs, Some(3_108_838));
-        assert_eq!(vitals.rtt_us, Some(2_100));
-        let summary = vitals.format_summary_line();
+        let summary = crate::protocol::HostVitals {
+            gpu_name: Some("NVIDIA GB10".into()),
+            gpu_temp_c: Some(45),
+            rtt_us: Some(2_100),
+            ..Default::default()
+        }
+        .format_summary_line();
         assert!(summary.contains("NVIDIA GB10"), "{summary}");
         assert!(summary.contains("45°C"), "{summary}");
         assert!(summary.contains("RTT 2.1 ms"), "{summary}");

@@ -9,10 +9,30 @@
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct XtermKeyboardState {
     /// modifyOtherKeys value (Pp=4 for XTMODKEYS).
+    #[cfg_attr(
+        feature = "serde",
+        serde(deserialize_with = "deserialize_modify_other_keys")
+    )]
     modify_other_keys: Option<u8>,
 
     /// formatOtherKeys value (Pp=4 for XTFMTKEYS).
+    #[cfg_attr(
+        feature = "serde",
+        serde(deserialize_with = "deserialize_format_other_keys")
+    )]
     format_other_keys: u8,
+}
+
+#[cfg(feature = "serde")]
+fn deserialize_modify_other_keys<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<u8>, D::Error> {
+    Ok(<Option<u8> as serde::Deserialize>::deserialize(d)?.map(|v| v.min(2)))
+}
+
+#[cfg(feature = "serde")]
+fn deserialize_format_other_keys<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
+    Ok(<u8 as serde::Deserialize>::deserialize(d)?.min(1))
 }
 
 impl XtermKeyboardState {
@@ -113,6 +133,7 @@ mod tests {
         let default = XtermKeyboardState::default();
         let new = XtermKeyboardState::new();
         assert_eq!(default.modify_other_keys(), None);
+        assert_eq!(default.format_other_keys(), 0);
         assert_eq!(new.modify_other_keys(), Some(0));
         assert_eq!(new.format_other_keys(), 0);
         assert_eq!(default.query_modify_other_keys_response(), "\x1b[>4m");
@@ -125,7 +146,6 @@ mod tests {
 
         state.set_modify_other_keys(1);
         assert_eq!(state.modify_other_keys(), Some(1));
-        assert!(matches!(state.modify_other_keys(), Some(v) if v > 0));
 
         state.set_modify_other_keys(2);
         assert_eq!(state.modify_other_keys(), Some(2));
@@ -135,7 +155,6 @@ mod tests {
 
         state.set_modify_other_keys(0);
         assert_eq!(state.modify_other_keys(), Some(0));
-        assert!(!matches!(state.modify_other_keys(), Some(v) if v > 0));
     }
 
     #[test]
@@ -145,7 +164,6 @@ mod tests {
 
         state.reset_modify_other_keys();
         assert_eq!(state.modify_other_keys(), Some(0));
-        assert!(!matches!(state.modify_other_keys(), Some(v) if v > 0));
     }
 
     #[test]
@@ -155,7 +173,6 @@ mod tests {
 
         state.disable_modify_other_keys();
         assert_eq!(state.modify_other_keys(), None);
-        assert!(!matches!(state.modify_other_keys(), Some(v) if v > 0));
     }
 
     #[test]
@@ -194,5 +211,21 @@ mod tests {
         state.reset();
         assert_eq!(state.modify_other_keys(), Some(0));
         assert_eq!(state.format_other_keys(), 0);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_deserialize_clamps_invariants() {
+        let clamped: XtermKeyboardState =
+            aterm_json::from_str(r#"{"modify_other_keys":99,"format_other_keys":7}"#)
+                .expect("deserializes");
+        assert_eq!(clamped.modify_other_keys(), Some(2));
+        assert_eq!(clamped.format_other_keys(), 1);
+
+        let disabled: XtermKeyboardState =
+            aterm_json::from_str(r#"{"modify_other_keys":null,"format_other_keys":0}"#)
+                .expect("deserializes");
+        assert_eq!(disabled.modify_other_keys(), None);
+        assert_eq!(disabled.format_other_keys(), 0);
     }
 }

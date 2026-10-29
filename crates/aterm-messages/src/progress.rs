@@ -311,20 +311,6 @@ impl ProgressTrack {
         self.stall_at().filter(|at| *at > now)
     }
 
-    /// Estimated rate in units per minute over the active sample window.
-    #[must_use]
-    #[cfg(test)]
-    pub(crate) fn rate_per_min(&self) -> Option<u64> {
-        let newest = self.newest?;
-        let (oldest, count) = self.window(newest.at)?;
-        let span = ms_between(newest.at, oldest.at);
-        if span < ms(RATE_MIN_SPAN) || count < 3 || newest.done <= oldest.done {
-            return None;
-        }
-        let per_min = u128::from(newest.done - oldest.done) * 60_000 / u128::from(span);
-        u64::try_from(per_min).ok()
-    }
-
     /// Series identifier currently tracked.
     #[inline]
     #[must_use]
@@ -467,11 +453,14 @@ fn ran_words(e: Duration, short: bool) -> String {
     }
 }
 
-/// Duration until [`elapsed_words`] next changes as `e` grows.
+/// Duration until [`elapsed_words`] next changes as `e` grows, or `None` once capped at `999 h`.
 #[must_use]
-pub(crate) fn elapsed_word_change(e: Duration) -> Duration {
+pub(crate) fn elapsed_word_change(e: Duration) -> Option<Duration> {
     if e < ELAPSED_AFTER {
-        return ELAPSED_AFTER.saturating_sub(e);
+        return Some(ELAPSED_AFTER.saturating_sub(e));
+    }
+    if e.as_secs() >= 999 * 3600 {
+        return None;
     }
     let e_ms = ms(e);
     let step = if e_ms < 60_000 {
@@ -481,7 +470,7 @@ pub(crate) fn elapsed_word_change(e: Duration) -> Duration {
     } else {
         3_600_000
     };
-    Duration::from_millis(step - e_ms % step)
+    Some(Duration::from_millis(step - e_ms % step))
 }
 
 /// Format elapsed time `e` for screen-reader announcement (`None` below [`ELAPSED_AFTER`]).
@@ -555,21 +544,6 @@ mod tests {
             total,
             unit: Unit::Bytes,
         }
-    }
-
-    /// 10 MB/s observed at 10 Hz: the rate is the secant across the window —
-    /// 600 MB a minute — and there is none before three seconds of samples.
-    #[test]
-    fn rate_is_the_window_secant_and_needs_three_seconds() {
-        let base = t0();
-        let mut t = ProgressTrack::default();
-        for k in 0..=100u64 {
-            t.observe(at(base, k * 100), bytes(k * 1_000_000, 10_000_000_000));
-            if k * 100 < 3000 {
-                assert_eq!(t.rate_per_min(), None, "{k}: under three seconds");
-            }
-        }
-        assert_eq!(t.rate_per_min(), Some(600_000_000));
     }
 
     /// A steady rate latches at 5 s (the first valid rate is at 3 s, and three
@@ -964,7 +938,7 @@ mod tests {
             .chain((35_000_000..=37_000_000u64).step_by(5_000))
         {
             let e = Duration::from_millis(e_ms);
-            let d = elapsed_word_change(e);
+            let d = elapsed_word_change(e).expect("below 999 h");
             assert!(d > Duration::ZERO, "{e_ms}");
             for sh in [false, true] {
                 assert_ne!(
@@ -987,6 +961,21 @@ mod tests {
                 assert!(!clock(&words), "{words}");
             }
         }
+        let just_below_cap = Duration::from_millis(999 * 3_600_000 - 1);
+        assert_eq!(
+            elapsed_word_change(just_below_cap),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
+            elapsed_words(just_below_cap, false).as_deref(),
+            Some("for 998 h")
+        );
+        assert_eq!(
+            elapsed_words(Duration::from_secs(999 * 3600), false).as_deref(),
+            Some("for 999 h")
+        );
+        assert_eq!(elapsed_word_change(Duration::from_secs(999 * 3600)), None);
+        assert_eq!(elapsed_word_change(Duration::from_secs(1000 * 3600)), None);
         assert_eq!(elapsed_spoken(Duration::from_secs(3)), None);
         assert_eq!(clock_spoken(Duration::from_millis(900)), None);
     }

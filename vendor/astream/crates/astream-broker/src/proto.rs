@@ -22,6 +22,8 @@
 //! | 8    | [`ERR_UNAUTHORIZED`]   | is refused again on this connection's grants   |
 //! | 9    | [`ERR_PROTOCOL`]       | is refused again: another protocol; it closes  |
 //! | 10   | [`ERR_SUBJECT_BOUND`]  | lands only once the subject enters the index   |
+//! | 11   | [`ERR_RETIRE_REFUSED`] | lands once the retire guard condition lifts    |
+//! | 12   | [`ERR_RATE_LIMITED`]   | lands once the producer's token bucket refills |
 //!
 //! Codes 2, 3, 7, 8 and 9 are PERMANENT for the request that drew them: sent again,
 //! unchanged, on the same connection, it is refused again, so a retry is a loop.
@@ -251,6 +253,22 @@ pub const RETIRE_LOG_PREFIX: &str = "log: ";
 /// Fixed prefix for a [`ERR_RECORD_REFUSED`] refusal when a retire is offered to a log
 /// that prefix retention has cut (`base > 0`).
 pub const RETIRE_CUT_PREFIX: &str = "cut: ";
+
+/// A publish or `ProcessAndProduce` was refused because the producer's (or bound
+/// capability principal's) monotone token bucket has insufficient record or byte tokens
+/// ([`crate::RateLimit`], `DESIGN-aterm-fabric` T9 & T17). Nothing was appended or queued
+/// to the writer thread.
+///
+/// NOT permanent: the identical request lands once the bucket refills (see
+/// [`BrokerRefusal::is_rate_limited`](crate::client::BrokerRefusal::is_rate_limited) and
+/// [`BrokerRefusal::retry_after_ms`](crate::client::BrokerRefusal::retry_after_ms)). An
+/// older client that does not know code 12 reads it as non-permanent (`!is_permanent()`).
+pub const ERR_RATE_LIMITED: u8 = 12;
+
+/// Fixed prefix for every [`ERR_RATE_LIMITED`] refusal, followed immediately by the
+/// minimum millisecond wait `<ms>` (`>= 1`) before the bucket refills enough to admit
+/// the request (or, if a single record exceeds `burst_bytes`, the burst-deficit hint).
+pub const RATE_LIMITED_PREFIX: &str = "rate limited: retry-after-ms=";
 
 /// How a `Fetch` below the OLDEST offset of its filter is refused, word for word: an
 /// [`ERR_RECORD_REFUSED`] whose message starts `retained-from=<off>`, the offset at and

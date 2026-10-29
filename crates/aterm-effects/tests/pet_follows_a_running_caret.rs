@@ -9,9 +9,7 @@ use aterm_core::render::RenderInput;
 use aterm_core::terminal::{ClockReading, Terminal};
 use aterm_effects::companion::{CompanionOwner, GlowOwnership, PetFacts};
 use aterm_effects::cursor_glow::GlowStyle;
-use aterm_effects::host::{
-    CaptureMode, FrameGeom, HostFrameInput, SingFacts, TerminalFacts, Visibility,
-};
+use aterm_effects::host::{FrameGeom, HostFrameInput, TerminalFacts};
 use aterm_effects::kitty_pet::{PetAction, PetFrame, PetInputKind};
 use aterm_effects::pet_world::{PetPane, PetReserve, PetWorldFacts};
 use aterm_effects::word_decorations::{DecoConfig, WordDecorations};
@@ -93,38 +91,26 @@ impl Host {
         self.owner
             .observe_console_reserved(input, &world, PetPane::full(input), reserve);
         let facts = TerminalFacts::read(&self.term, 7, false);
-        let host = HostFrameInput {
-            now: self.now,
-            visibility: Visibility::Focused,
-            reduced_motion: false,
-            serious: false,
-            shed_envelope: 1.0,
-            shed_active: false,
-            pointer_px: None,
-            capture: CaptureMode::Present,
-            geometry: FrameGeom {
+        let host = HostFrameInput::new(
+            self.now,
+            FrameGeom {
                 rows: ROWS,
                 cols: COLS,
                 cell_w: 15,
                 cell_h: 28,
                 origin_px: (0, 0),
             },
-        };
+        );
         let tick = self.owner.prepare(
-            PetFacts {
-                facts: &facts,
-                host: &host,
-                glow: GlowOwnership {
+            PetFacts::new(
+                &facts,
+                &host,
+                GlowOwnership {
                     enabled: true,
                     style: GlowStyle::RainbowKitty,
                     style_raw_names_pet: true,
                 },
-                sing: SingFacts::default(),
-                focused: true,
-                obscured: false,
-                pane: None,
-                room: None,
-            },
+            ),
             &mut self.decos,
         );
         let frame = self.owner.tick(tick).pet;
@@ -304,22 +290,70 @@ fn held_delete(row0: u16, len: usize, dels: usize, gap: u64) -> Seen {
 }
 
 fn held_delete_paced(row0: u16, len: usize, dels: usize, gaps: [u64; 2]) -> Seen {
+    held_delete_from(row0, len, dels, gaps).0
+}
+
+/// [`held_delete_paced`], and whether the cat stood on the row over the caret's as the deletes
+/// began: the line's top, where the writing's approach to the margin sent it (THE CAT AT THE
+/// MARGIN RIDES THE LINE).
+fn held_delete_from(row0: u16, len: usize, dels: usize, gaps: [u64; 2]) -> (Seen, bool) {
     let mut keys = typed(len, 60);
     keys.push((1_500, Key::Type(b' ')));
     let from = 300 + keys.iter().map(|k| k.0).sum::<u64>();
     keys.extend((0..dels).map(|i| (gaps[i % 2], Key::Delete)));
     let h = Host::replay(line_editor(row0, &keys));
-    seen(&h.shots, from)
+    let on_top =
+        h.shots.iter().find(|s| s.ms >= from).is_some_and(|s| {
+            s.caret.0 > 0 && (s.frame.row - (f32::from(s.caret.0) - 1.0)).abs() < 0.5
+        });
+    // A cat on the line's top is followed on its paws from the moment it is down on the
+    // caret's row.
+    let down = if on_top {
+        h.shots
+            .iter()
+            .find(|s| {
+                s.ms >= from
+                    && s.frame.action != PetAction::Leap
+                    && (s.frame.row - f32::from(s.caret.0)).abs() < 0.5
+            })
+            .map_or(u64::MAX, |s| s.ms)
+    } else {
+        from
+    };
+    let legs = seen(&h.shots, down);
+    let all = seen(&h.shots, from);
+    (
+        Seen {
+            flights: all.flights,
+            legs: legs.legs,
+            presents: legs.presents,
+        },
+        on_top,
+    )
 }
 
+/// A HELD DELETE ON ONE ROW IS FOLLOWED ON THE PAWS: no flight while the caret runs back along
+/// its row, and the cat on its legs for most of it. A cat the writing's approach to the margin
+/// had sent onto the line's top (THE CAT AT THE MARGIN RIDES THE LINE, looks9 round 2) comes
+/// down once, onto the caret's row, as the deletes take the caret off the margin, and is on its
+/// legs for most of what follows.
 #[test]
 fn a_held_delete_on_one_row_is_followed_on_the_paws() {
     for gaps in [[32u64, 32], [48, 48], [64, 64], [10, 56], [12, 42]] {
-        let s = held_delete_paced(12, 70, 60, gaps);
+        let (s, on_top) = held_delete_from(12, 70, 60, gaps);
+        let allowed = usize::from(on_top);
         assert!(
-            s.flights.is_empty(),
-            "deletes {gaps:?} ms apart: flights {:?}",
+            s.flights.len() <= allowed
+                && s.flights
+                    .iter()
+                    .all(|&(_, (_, row), caret)| (row - f32::from(caret.0)).abs() < 0.5),
+            "deletes {gaps:?} ms apart (on the line's top: {on_top}): flights {:?}",
             s.flights
+        );
+        assert!(
+            s.presents >= 60,
+            "deletes {gaps:?} ms apart: fixture: {} presents on the caret's row",
+            s.presents
         );
         assert!(
             s.legs * 20 >= s.presents * 9,
@@ -356,6 +390,20 @@ fn a_held_delete_across_a_wrap_is_one_bound_onto_the_carets_row() {
     }
 }
 
+/// Whether a flight that came down on `row` with the caret at `caret` is the margin's climb onto
+/// the line ([`aterm_effects::kitty_pet::OldPath::WallUnderTheWriting`]): down on the row over
+/// the caret's, before the wrap took the caret off that line.
+fn is_climb(row: f32, caret: (u16, u16)) -> bool {
+    caret.0 > 0 && (row - (f32::from(caret.0) - 1.0)).abs() < 0.5
+}
+
+/// A HELD KEY RUNS, AND EACH WRAP TYPED THROUGH IS ONE FLIGHT, down on the caret's new row. The
+/// line's first row, with a clear row over it, may cost one flight more, before its wrap: the
+/// cat's climb onto the line as the writing comes to the margin (THE CAT AT THE MARGIN RIDES THE
+/// LINE, looks9 round 2), which comes down on the row over the caret's while the caret is still
+/// on it. A wrap whose row has letters over it (the wrapped line's later rows) costs only its
+/// crossing; so does writing too fast to land the climb before its wrap (33 keys a second). Each
+/// crossing is in the air no longer than the brisk bound's longest shape (850 ms).
 #[test]
 fn a_held_key_runs_and_each_wrap_typed_through_is_one_flight() {
     let takes: [(&str, Vec<(u64, Key)>); 3] = [
@@ -372,16 +420,32 @@ fn a_held_key_runs_and_each_wrap_typed_through_is_one_flight() {
                 .find(|s| s.caret.1 >= 12 && s.frame.action != PetAction::Leap)
                 .map_or(0, |s| s.ms);
             let s = seen(&h.shots, from);
+            let aloft = airtimes(&h.shots, from);
+            assert!(
+                !aloft.is_empty() && aloft.iter().all(|&(_, a)| a <= 850),
+                "{name}, the prompt on row {row0}: crossings (ms, ms aloft) {aloft:?}"
+            );
             let label = format!("{name}, the prompt on row {row0}");
+            let climbs: Vec<_> = s
+                .flights
+                .iter()
+                .filter(|&&(_, (_, row), caret)| is_climb(row, caret))
+                .collect();
             assert_eq!(
-                s.flights.len(),
+                s.flights.len() - climbs.len(),
                 3,
                 "{label}: three wraps, flights {:?}",
                 s.flights
             );
+            assert!(
+                climbs.len() <= 1 && climbs.iter().all(|c| c.0 < s.flights[climbs.len()].0),
+                "{label}: more than the one climb onto the line before its first wrap, flights \
+                 {:?}",
+                s.flights
+            );
             for &(ms, (_, row), caret) in &s.flights {
                 assert!(
-                    (row - f32::from(caret.0)).abs() < 0.5,
+                    (row - f32::from(caret.0)).abs() < 0.5 || is_climb(row, caret),
                     "{label}: the flight at {ms} ms came down on row {row}, the caret on {caret:?}"
                 );
             }
@@ -407,17 +471,19 @@ fn airtimes(shots: &[Shot], from: u64) -> Vec<(u64, u64)> {
         .collect()
 }
 
-/// A take of the wrap law: `(label, the prompt's row, the keys, ms the judged span starts at or
-/// 0 for the first key past column 12)`.
+/// A take of the wrap law: `(label, the prompt's row, the keys, ms the judged span starts at)`.
 type WrapTake = (String, u16, Vec<(u64, Key)>, u64);
 
 /// THE WRITING'S WRAP IS A BRISK BOUND, AT THE SHELL TOO. A line typed past the margin wraps
 /// onto the next line (mid-screen) or onto the line the screen scrolls up (the prompt on the
 /// last row), and the cat crosses after the wrap; a held delete takes the caret back across a
 /// wrap, and the cat crosses after it. Each crossing is the animal's own pace on its arc, in the
-/// air no longer than the big bound's longest shape (850 ms): typed at 33 and 20 keys a second
-/// and by hand, typed on after a pause at the margin, and deleted back across one and two wraps,
-/// from mid-screen and from the last row.
+/// air no longer than the big bound's longest shape (850 ms). Judged here: a held delete taking
+/// the caret back across one and two wraps, from mid-screen and from the last row. The crossings
+/// typed at 33 and 20 keys a second and by hand are judged by
+/// [`a_held_key_runs_and_each_wrap_typed_through_is_one_flight`], and those typed on after a
+/// pause at the margin by [`a_pause_at_the_margin_never_keeps_the_cat_in_the_air`] (with
+/// [`typing_on_after_a_pause_at_the_margin_costs_only_the_wraps_flight`]).
 ///
 /// NEGATIVE CONTROL (as run on main before the fix): every crossing 0.99 to 1.17 s in the air,
 /// paced as a quiet crossing, 0.74 of the pane a second. With the wrap the writing's only while
@@ -428,39 +494,6 @@ type WrapTake = (String, u16, Vec<(u64, Key)>, u64);
 #[test]
 fn each_wrap_typed_through_is_a_brisk_bound() {
     let mut takes: Vec<WrapTake> = Vec::new();
-    for (name, keys) in [
-        ("33 keys a second", typed(240, 30)),
-        ("20 keys a second", typed(240, 50)),
-        ("by hand", by_hand(240)),
-    ] {
-        takes.push((
-            format!("{name}, the prompt on the last row"),
-            23,
-            keys.clone(),
-            0,
-        ));
-        takes.push((format!("{name}, the prompt mid-screen"), 12, keys, 0));
-    }
-    // Typed on after a pause at the margin: the wrap comes two or three keys after the pause,
-    // short of the writing's rhythm opening again, or as the cat comes down from a hop.
-    for (n0, gap0, pause, n1, gap1) in [
-        (75usize, 150u64, 800u64, 9usize, 130u64),
-        (75, 100, 1_500, 9, 120),
-        (70, 100, 1_500, 14, 120),
-        (76, 90, 2_500, 8, 150),
-    ] {
-        for row0 in [12u16, 23] {
-            takes.push((
-                format!(
-                    "{n0} keys {gap0} ms apart, a {pause} ms pause, {n1} keys {gap1} ms apart, \
-                     the prompt on row {row0}"
-                ),
-                row0,
-                paused(n0, gap0, pause, n1, gap1),
-                0,
-            ));
-        }
-    }
     for row0 in [12u16, 23] {
         for (len, dels) in [(130usize, 110usize), (220, 200)] {
             let mut keys = typed(len, 60);
@@ -477,15 +510,7 @@ fn each_wrap_typed_through_is_a_brisk_bound() {
     }
     for (label, row0, keys, from) in &takes {
         let h = Host::replay(line_editor(*row0, keys));
-        let start = if *from > 0 {
-            *from
-        } else {
-            h.shots
-                .iter()
-                .find(|s| s.caret.1 >= 12 && s.frame.action != PetAction::Leap)
-                .map_or(0, |s| s.ms)
-        };
-        let flights = airtimes(&h.shots, start);
+        let flights = airtimes(&h.shots, *from);
         assert!(
             !flights.is_empty(),
             "{label}: fixture — the wraps are flown"
@@ -833,9 +858,11 @@ fn a_pause_at_the_margin_never_keeps_the_cat_in_the_air() {
 
 /// TYPING ON AFTER A PAUSE AT THE MARGIN COSTS ONLY THE WRAP'S FLIGHT. Once the hand types on
 /// after a pause at the margin, on the top row, mid-screen and on the last row, the line end
-/// costs the cat one flight, the wrap's crossing, down on the caret's row; and where the cat's
-/// stand at the wall covers no letter while the hand is paused, the pause costs none either.
-/// Every take of [`MARGIN_PAUSES`] that types on.
+/// costs the cat one flight, the wrap's crossing, down on the caret's row, and at most the climb
+/// onto the line before it ([`is_climb`]) as the writing comes to the margin, the line's only
+/// climb, whether it came before the pause or in it (the writing's pace brought the caret within
+/// the climb's lead of the wall seat as the hand stopped). Every take of [`MARGIN_PAUSES`] that
+/// types on.
 ///
 /// NEGATIVE CONTROL (as run before the fix): the keys typed after the pause, short of the
 /// writing's rhythm, found the margin untaken: the cat hopped up a row (the wall side crossed to
@@ -857,7 +884,15 @@ fn typing_on_after_a_pause_at_the_margin_costs_only_the_wraps_flight() {
         let label = format!("{n0} keys {gap0} ms apart, {pause} ms, {n1} keys, row {row0}");
         let mut faults = Vec::new();
         let resumed = flights_from(&h.shots, at[n0]);
-        if resumed.len() != 1 {
+        let crossings = |flights: &[Aloft]| {
+            let climbs = flights
+                .iter()
+                .filter(|&&(_, (_, row), _, caret, _)| is_climb(row, caret))
+                .count();
+            (flights.len() - climbs, climbs)
+        };
+        let (crossed, climbed) = crossings(&resumed);
+        if crossed != 1 || climbed > 1 {
             faults.push(format!(
                 "{label}: {} flights after the typing resumed (ms, landing, ms aloft, caret): \
                  {resumed:?}",
@@ -865,17 +900,18 @@ fn typing_on_after_a_pause_at_the_margin_costs_only_the_wraps_flight() {
             ));
         }
         for &(ms, (_, row), _, caret, _) in &resumed {
-            if (row - f32::from(caret.0)).abs() >= 0.5 {
+            if (row - f32::from(caret.0)).abs() >= 0.5 && !is_climb(row, caret) {
                 faults.push(format!(
                     "{label}: the flight at {ms} ms came down on row {row}, the caret on {caret:?}"
                 ));
             }
         }
         // The prompt takes two cells; the wall seat (74.77 of 80) covers no letter while the
-        // caret stands at 75 or short of it.
+        // caret stands at 75 or short of it, so the pause costs no flight but the climb.
         if n0 + 2 <= 75 {
             let line_end = flights_from(&h.shots, at[n0 - 1]);
-            if line_end.len() != 1 {
+            let (crossed, climbed) = crossings(&line_end);
+            if crossed != 1 || climbed > 1 {
                 faults.push(format!(
                     "{label}: {} flights from the pause on: {line_end:?}",
                     line_end.len()

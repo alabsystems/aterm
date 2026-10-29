@@ -3,7 +3,7 @@
 
 //! Detached process spawning, child reaping, and jail process-tree inspection.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -154,17 +154,26 @@ pub fn descendants_in(table: &[(i32, i32)], root: i32) -> Vec<i32> {
     for &(pid, ppid) in table {
         kids.entry(ppid).or_default().push(pid);
     }
+    let mut visited = BTreeSet::from([root]);
+    let mut stack = vec![(root, 0usize, false)];
     let mut out = Vec::new();
-    fn walk(p: i32, kids: &BTreeMap<i32, Vec<i32>>, out: &mut Vec<i32>, depth: u32) {
-        if depth > 64 {
-            return;
+    while let Some((node, idx, _)) = stack.last_mut() {
+        let p = *node;
+        let children = kids.get(&p).map_or(&[][..], Vec::as_slice);
+        let mut pushed = false;
+        while *idx < children.len() {
+            let c = children[*idx];
+            *idx += 1;
+            if visited.insert(c) {
+                stack.push((c, 0, true));
+                pushed = true;
+                break;
+            }
         }
-        for &c in kids.get(&p).map(Vec::as_slice).unwrap_or_default() {
-            walk(c, kids, out, depth + 1);
-            out.push(c);
+        if !pushed && let Some((done, _, true)) = stack.pop() {
+            out.push(done);
         }
     }
-    walk(root, &kids, &mut out, 0);
     out
 }
 
@@ -285,6 +294,16 @@ pub fn record_jailed(run_dir: &Path, pid: i32) {
     }
 }
 
+/// Keeps a long-lived child started in the lab's jail ([`keep_forked`]) and records it as a
+/// jailed root ([`record_jailed`]), so the sweeps that fall back to the process tree when the
+/// sandbox gives no answer ([`jail_members`], the sampler's members) still see it and its
+/// children: one in a session of its own is no descendant of anything the lab names by pid.
+pub fn keep_jailed(run_dir: &Path, child: std::process::Child) -> i32 {
+    let pid = keep_forked(child);
+    record_jailed(run_dir, pid);
+    pid
+}
+
 /// Reads jailed root PIDs from [`jailed_file`] (`all` includes exited PIDs).
 #[must_use]
 pub fn jailed_roots(run_dir: &Path, all: bool) -> Vec<i32> {
@@ -397,6 +416,25 @@ pub fn jailed(
     argv: &[&str],
     out: JailOut,
 ) -> Result<(i32, String), String> {
+    let o = jailed_output(run, dir, vars, argv, out)?;
+    let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&o.stderr));
+    Ok((o.status.code().unwrap_or(1), text))
+}
+
+/// [`jailed`]'s run, its status and its two streams apart (a mint's capability on stdout, its
+/// refusal on stderr: [`crate::bus::lay`]).
+///
+/// # Errors
+/// The witness is not running, the program could not start, or waiting for it
+/// failed.
+pub fn jailed_output(
+    run: &crate::run::Run,
+    dir: &Path,
+    vars: &[(&str, &str)],
+    argv: &[&str],
+    out: JailOut,
+) -> Result<std::process::Output, String> {
     need_witness(run)?;
     let mut cmd = aterm_uds::spawnfd::command("/usr/bin/sandbox-exec");
     cmd.arg("-f").arg(run.run.join("jail.sb")).args([
@@ -430,10 +468,7 @@ pub fn jailed(
         )
     })?;
     record_jailed(&run.run, i32::try_from(child.id()).unwrap_or(0));
-    let o = child.wait_with_output().map_err(|e| e.to_string())?;
-    let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&o.stderr));
-    Ok((o.status.code().unwrap_or(1), text))
+    child.wait_with_output().map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -446,6 +481,15 @@ mod tests {
         assert_eq!(descendants_in(&t, 10), vec![12, 11, 13]);
         assert!(descendants_in(&t, 1).is_empty());
         assert!(descendants_in(&t, 0).is_empty());
+        let deep: Vec<(i32, i32)> = (11..=90).map(|pid| (pid, pid - 1)).collect();
+        let got = descendants_in(&deep, 10);
+        let want: Vec<i32> = (11..=90).rev().collect();
+        assert_eq!(
+            got, want,
+            "deep process chains past 64 levels are not truncated"
+        );
+        let cyclic = [(11, 10), (12, 11), (10, 12), (11, 12)];
+        assert_eq!(descendants_in(&cyclic, 10), vec![12, 11]);
     }
 
     #[test]
@@ -479,6 +523,39 @@ mod tests {
         );
     }
 
+    /// A jailed child in a session of its own kept by [`keep_jailed`] (the lab's broker) is one
+    /// the sweeps see when the sandbox gives no answer: [`jail_members`] of a run with no mark
+    /// takes only the process tree, and no pid the run records is the child's parent.
+    #[test]
+    fn a_kept_jailed_child_is_swept_without_a_sandbox_answer() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let run = crate::run::Run {
+            run: root.path().to_path_buf(),
+            ..crate::run::Run::default()
+        };
+        #[expect(
+            clippy::disallowed_types,
+            reason = "the shape of the lab's jailed launch: a std Child in a session of its own"
+        )]
+        let mut cmd = std::process::Command::new("/bin/sleep");
+        cmd.arg("600")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        crate::sys::in_own_session(&mut cmd);
+        let pid = keep_jailed(&run.run, cmd.spawn().unwrap());
+        let seen = jail_members(&run);
+        let roots = jailed_roots(&run.run, false);
+        crate::sys::kill(pid, libc::SIGKILL).unwrap();
+        assert!(ended_within(pid, Duration::from_secs(60)), "reaped");
+        assert_eq!(roots, vec![pid], "recorded as a jailed root");
+        assert!(seen.contains(&pid), "swept: {seen:?} lacks {pid}");
+        assert!(
+            !jail_members(&run).contains(&pid),
+            "an ended root is no member"
+        );
+    }
+
     /// AN EXIT THE WATCH SAW IS WAITED ON UNTIL THE CHILD IS REAPED
     /// ([`settled`]): told its exit came while the child still runs (as the
     /// kernel's event can come before the child is a zombie its parent can
@@ -504,7 +581,8 @@ mod tests {
 
     /// A child's paths ([`open_paths`]) are its working directory, its executable and each file
     /// it holds through a descriptor, in descriptor order, a PTY master as `/dev/ptmx`; its table
-    /// counts those descriptors ([`crate::sys::fd_count`]).
+    /// counts those descriptors ([`crate::sys::fd_count`]). Past its stdin, stdout and stderr the
+    /// child may hold files it opened itself (dyld opens `/dev/dtracehelper` while it starts).
     #[test]
     fn a_childs_paths_and_descriptors_are_read_in_process() {
         let dir = std::env::temp_dir()
@@ -543,7 +621,12 @@ mod tests {
         .into();
         let paths = paths.expect("its paths");
         assert!(paths.complete);
-        assert_eq!(paths.paths, want);
+        assert_eq!(
+            paths.paths.get(..want.len()),
+            Some(&want[..]),
+            "{:?}",
+            paths.paths
+        );
         assert!(
             count.is_some_and(|count| count >= 3),
             "stdin, stdout and stderr are counted; the child can open more"

@@ -151,9 +151,7 @@ fn every_repair_step_is_one_item_of_its_class() {
     let scratch = Scratch::new("classes");
     let doctor = scratch.ground(Pass::Doctor, None);
     let ids: Vec<String> = super::items(&doctor).iter().map(|i| i.id()).collect();
-    assert_eq!(ids, super::IDS);
-    let class = |ground: &Arc<Ground>, id| item(ground, id).class();
-    for (id, want) in [
+    let classes = [
         (super::COPIED_COMMANDS, Class::Asked),
         (super::LINKS, Class::Relay),
         (super::HOOKS, Class::Relay),
@@ -165,7 +163,10 @@ fn every_repair_step_is_one_item_of_its_class() {
         (super::SHIMS, Class::Relay),
         (super::EXEC_ROOTS, Class::Relay),
         (super::STORE, Class::Install),
-    ] {
+    ];
+    assert_eq!(ids, classes.map(|(id, _)| id), "every item, in run order");
+    let class = |ground: &Arc<Ground>, id| item(ground, id).class();
+    for (id, want) in classes {
         assert_eq!(class(&doctor, id), want, "{id}");
     }
     let repair = scratch.ground(Pass::Repair, None);
@@ -1127,21 +1128,24 @@ fn a_relay_says_the_exec_root_it_laid_in_its_row() {
 }
 
 const RELAY_PROBE_ENV: &str = "ATPKG_RELAY_PROBE_PREFIX";
-const RELAY_PROBE: &str = "converge::repair::tests::relay_prints_nothing_probe";
+const RELAY_PROBE: &str = "converge::repair::tests::a_relay_writes_nothing_to_stdout";
 
-#[test]
-fn relay_prints_nothing_probe() {
+fn relay_prints_nothing_probe_if_asked() -> bool {
     let Some(prefix) = std::env::var_os(RELAY_PROBE_ENV) else {
-        return;
+        return false;
     };
     let relaid = super::relay(&Layout {
         prefix: PathBuf::from(prefix),
     });
     assert!(relaid.failed.is_empty(), "{:?}", relaid.failed);
+    true
 }
 
 #[test]
 fn a_relay_writes_nothing_to_stdout() {
+    if relay_prints_nothing_probe_if_asked() {
+        return;
+    }
     let scratch = Scratch::new("relay-quiet");
     trust_needing_a_root(&scratch.layout);
     break_the_tippy_shim(&scratch.layout);

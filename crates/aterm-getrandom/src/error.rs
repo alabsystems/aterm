@@ -17,6 +17,11 @@ use core::num::NonZeroU32;
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct Error(NonZeroU32);
 
+const _: () = {
+    assert!(core::mem::size_of::<Error>() == 4);
+    assert!(core::mem::size_of::<Result<(), Error>>() == 4);
+};
+
 #[inline]
 const fn internal_error(n: u16) -> Error {
     match NonZeroU32::new(Error::INTERNAL_START + n as u32) {

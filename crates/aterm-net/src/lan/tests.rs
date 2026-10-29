@@ -474,3 +474,43 @@ fn the_loopback_guard_refuses_a_lan_dial_listen_and_join_and_keeps_the_loopback(
             .expect("a loopback listener under the guard");
     });
 }
+
+/// A failed bind says whether it reached its socket ([`BindFailure`]): one its checks refused
+/// (an address on no attachment of this machine's) made none, so an OS that asks at an app's
+/// first LAN use asked nothing; one that failed once its socket was made (the port another
+/// socket holds, as an attachment that changed before the re-check fails after its syscall)
+/// may have. A bind that went through is no failure.
+#[test]
+fn a_failed_bind_says_whether_it_reached_its_socket() {
+    use std::net::{Ipv4Addr, TcpListener, UdpSocket};
+    const GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 31, 84);
+    let documentation = Ipv4Addr::new(192, 0, 2, 1);
+    let checked = Listener::try_bind((documentation, 0).into(), Scope::Lan)
+        .err()
+        .expect("no LAN at 192.0.2.1");
+    assert!(!checked.reached, "listener: {}", checked.error);
+    let checked = Multicast::try_bind(documentation, GROUP, 0, Scope::Lan)
+        .err()
+        .expect("no LAN at 192.0.2.1");
+    assert!(!checked.reached, "multicast: {}", checked.error);
+
+    let held = TcpListener::bind("127.0.0.1:0").unwrap();
+    let late = Listener::try_bind(held.local_addr().unwrap(), Scope::Loopback)
+        .err()
+        .expect("the port is held");
+    assert!(late.reached, "listener: {}", late.error);
+    // A socket with no address reuse holds the group's port for every source.
+    let held = UdpSocket::bind("0.0.0.0:0").unwrap();
+    let late = Multicast::try_bind(
+        Ipv4Addr::LOCALHOST,
+        GROUP,
+        held.local_addr().unwrap().port(),
+        Scope::Loopback,
+    )
+    .err()
+    .expect("the port is held");
+    assert!(late.reached, "multicast: {}", late.error);
+
+    assert!(Listener::try_bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).is_ok());
+    assert!(Multicast::try_bind(Ipv4Addr::LOCALHOST, GROUP, 0, Scope::Loopback).is_ok());
+}

@@ -1179,8 +1179,15 @@ fn chunk_line<R: Read>(reader: &mut R, budget: &mut usize) -> io::Result<String>
         }
         raw.push(byte[0]);
     }
-    if raw.last() == Some(&b'\r') {
-        raw.pop();
+    if raw.pop() != Some(b'\r') {
+        return Err(bad_framing(
+            "chunk framing line not terminated by CRLF".to_owned(),
+        ));
+    }
+    if !valid_header_bytes(&raw) {
+        return Err(bad_framing(
+            "chunk framing line contains a control character".to_owned(),
+        ));
     }
     String::from_utf8(raw).map_err(|_| bad_framing("chunk framing line is not UTF-8".to_owned()))
 }
@@ -1288,16 +1295,25 @@ fn read_status_line<R: Read>(reader: &mut R, consumed: &mut usize) -> Result<u16
     let version = parts
         .next()
         .ok_or_else(|| Error::Protocol("empty status line".to_owned()))?;
-    if !version.starts_with("HTTP/1.") {
+    if !matches!(
+        version.as_bytes(),
+        [b'H', b'T', b'T', b'P', b'/', b'1', b'.', b'0'..=b'9']
+    ) {
         return Err(Error::Protocol(format!("unsupported version {version:?}")));
     }
-    parts
+    let code = parts
         .next()
         .filter(|code| code.len() == 3)
         .and_then(|code| parse_http_number(code, 10))
         .and_then(|code| u16::try_from(code).ok())
         .filter(|code| (100..=599).contains(code))
-        .ok_or_else(|| Error::Protocol(format!("unparseable status line {line:?}")))
+        .ok_or_else(|| Error::Protocol(format!("unparseable status line {line:?}")))?;
+    if !parts.next().is_none_or(valid_header_value) {
+        return Err(Error::Protocol(
+            "status line reason phrase contains a control character".to_owned(),
+        ));
+    }
+    Ok(code)
 }
 
 fn read_header_fields<R: Read>(
@@ -1797,6 +1813,8 @@ mod tests {
                 ("Content-Length", "5"),
             ],
             vec![("Content-Length", "+5")],
+            // Direct unit precondition on `decide_framing`: callers must pass OWS-trimmed
+            // field values; on the wire `read_header_fields` trims SP/HTAB first (checked below).
             vec![("Content-Length", "5 ")],
             vec![("Content-Length", "")],
         ] {
@@ -1808,6 +1826,13 @@ mod tests {
                 "{ambiguous:?} must be refused"
             );
         }
+        assert_eq!(
+            parse(b"HTTP/1.1 200 OK\r\nContent-Length: 5 \r\n\r\nhello", 1024)
+                .unwrap()
+                .body(),
+            b"hello",
+            "wire parser trims trailing OWS before calling decide_framing"
+        );
         let message = |value: &str| match decide_framing(
             Method::Get,
             200,
@@ -1843,16 +1868,6 @@ mod tests {
     }
 
     #[test]
-    fn content_length_framing() {
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 13\r\n\r\n{\"a\":\"hello\"}";
-        let response = parse(raw, 1024).unwrap();
-        assert_eq!(response.status(), 200);
-        assert!(response.is_success());
-        assert_eq!(response.header("content-type").unwrap(), "application/json");
-        assert_eq!(response.body(), b"{\"a\":\"hello\"}");
-    }
-
-    #[test]
     fn chunked_framing_reassembles_and_skips_extensions_and_trailers() {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
 5;name=v\r\nhello\r\n6\r\n world\r\n0\r\nX-Trailer: t\r\n\r\n";
@@ -1874,19 +1889,23 @@ mod tests {
         let spaced_extension =
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2 ;name=v\r\nhi\r\n0\r\n\r\n";
         assert_eq!(parse(spaced_extension, 1024).unwrap().body(), b"hi");
+        for bad_framing_raw in [
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\nhi\r\n0\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\n0\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2;ext=\x00\r\nhi\r\n0\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\nX-Trailer: \x7f\r\n\r\n"[..],
+        ] {
+            assert!(
+                matches!(parse(bad_framing_raw, 1024), Err(Error::Protocol(_))),
+                "bad chunk framing {bad_framing_raw:?} must be refused"
+            );
+        }
     }
 
     #[test]
     fn eof_framing_when_no_length_is_given() {
         let raw = b"HTTP/1.1 200 OK\r\n\r\nbare body";
         assert_eq!(parse(raw, 1024).unwrap().body(), b"bare body");
-    }
-
-    #[test]
-    fn both_framings_together_is_refused_as_smuggling() {
-        let raw =
-            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
-        assert!(matches!(parse(raw, 1024), Err(Error::Protocol(_))));
     }
 
     #[test]
@@ -1915,7 +1934,12 @@ mod tests {
         for raw in [
             &b"garbage\r\n\r\n"[..],
             &b"HTTP/2 200 OK\r\n\r\n"[..],
+            &b"HTTP/1. 200 OK\r\n\r\n"[..],
+            &b"HTTP/1.10 200 OK\r\n\r\n"[..],
+            &b"HTTP/1.x 200 OK\r\n\r\n"[..],
             &b"HTTP/1.1 notanumber OK\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\x00\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\x7f\r\n\r\n"[..],
         ] {
             assert!(parse(raw, 1024).is_err(), "{raw:?} must not parse");
         }

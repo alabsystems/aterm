@@ -178,11 +178,16 @@ fn every_covered_scenario_is_a_run_of_the_model() {
     let all: Vec<Scenario> = scenarios::all();
     let covered: Vec<&Scenario> = all.iter().filter(|s| s.model).collect();
     assert!(covered.len() >= 40, "{} scenarios projected", covered.len());
-    for s in covered {
-        let t = scenarios::run(s, None);
-        if let Err(e) = replay(&m, &t, &mut fired) {
-            bad.push(format!("{}: {e}", s.name));
-        }
+    // Each covered scenario is a world of its own, so they run and replay on every core: the
+    // refusals come back in scenario order, and the actions each fired join one set.
+    let replayed = aterm_spec::check::each(&covered, |s| {
+        let mut fired = BTreeSet::new();
+        let refused = replay(&m, &scenarios::run(s, None), &mut fired).err();
+        (refused.map(|e| format!("{}: {e}", s.name)), fired)
+    });
+    for (refused, more) in replayed {
+        bad.extend(refused);
+        fired.extend(more);
     }
     assert!(
         bad.is_empty(),

@@ -227,6 +227,51 @@ fn an_uninstalled_roster_tool_names_the_install_not_an_unknown_command() {
     }
 }
 
+/// `caffeine`, aCaffiene's name before 0.145.0, is no verb, but an old login job runs `aterm
+/// caffeine serve` at every login and again whenever it fails. `serve` exits 0, which launchd's
+/// KeepAlive leaves alone, without reaching the window path (whose unknown argument exits 2);
+/// under a scratch HOME it retires nothing (`legacy`'s tests reach the retirement). Every other command line names the new verb and
+/// exits 2, and `help caffeine` still says no, so an old mug whose aterm is replaced ends.
+#[test]
+fn the_old_caffeine_serve_exits_0_and_every_other_word_names_the_new_verb() {
+    let root = private_root();
+    let run = |args: &[&str]| {
+        let out = isolated(&mut aterm_cmd(), root.path())
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run the aterm binary");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (code, stdout, stderr) = run(&["caffeine", "serve"]);
+    assert_eq!((code, stdout.as_str()), (Some(0), ""), "{stderr}");
+    assert!(
+        stderr.starts_with(&format!("{}\n", aterm_acaffiene::legacy::RETIRED)),
+        "{stderr}"
+    );
+    #[cfg(target_os = "macos")]
+    assert!(
+        stderr.contains("not this login's home"),
+        "a scratch HOME retires nothing: {stderr}"
+    );
+    for args in [
+        &["caffeine"][..],
+        &["caffeine", "status"],
+        &["caffeine", "--help"],
+        &["caffeine", "serve", "now"],
+    ] {
+        let (code, stdout, stderr) = run(args);
+        assert_eq!((code, stdout.as_str()), (Some(2), ""), "{args:?}: {stderr}");
+        assert_eq!(stderr, format!("{}\n", aterm_acaffiene::legacy::RENAMED));
+    }
+    let (code, _, stderr) = run(&["help", "caffeine"]);
+    assert!(code.is_some_and(|code| code != 0), "{code:?}: {stderr}");
+}
+
 #[test]
 fn an_answer_into_a_closed_pipe_exits_cleanly() {
     let root = private_root();

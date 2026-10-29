@@ -95,7 +95,7 @@ pub const MAX_ROWS_PER_CLASS: usize = 64;
 /// The most directory entries one size walk visits before it stops and marks the figure partial.
 pub const MAX_WALK_ENTRIES: usize = 200_000;
 
-/// The most build directories one survey measures: the named ones first, then what discovery found ([`discover::MAX_FOUND`]).
+/// The most build directories one survey assesses for removal: the named ones first, then what discovery found ([`discover::MAX_FOUND`]).
 pub const MAX_TARGETS: usize = discover::MAX_FOUND;
 
 /// The most entries of the report's list of the largest build directories it cannot reclaim ([`Report::hogs`]).
@@ -512,6 +512,9 @@ pub struct Survey {
     pub volume_device: Option<u64>,
     /// Candidate build directories.
     pub targets: Vec<TargetDir>,
+    /// Current registered caches measured outside broad discovery's budget. These are
+    /// diagnostic holders only, never additional targets or removal witnesses.
+    pub registered_holders: Vec<Hog>,
     /// Vendor version directories.
     pub versions: Vec<VersionDir>,
     /// The live version, when the launcher named one ([`versions::live_of`]).
@@ -553,6 +556,7 @@ impl Survey {
             free_bytes: None,
             volume_device: None,
             targets: Vec::new(),
+            registered_holders: Vec::new(),
             versions: Vec::new(),
             live_version: None,
             live_copy: None,
@@ -1299,6 +1303,21 @@ pub fn report(survey: &Survey, config: Config) -> Report {
     pressure_rows(survey, config, &whole, &mut rows, &mut notes);
     idle_whole_rows(survey, config, &mut rows, &mut notes);
     notes.extend(survey.notes.iter().cloned());
+    for holder in &survey.registered_holders {
+        if !measured_target_covers(survey, &holder.path) {
+            notes.push(format!(
+                "cargo-targets: {} — {}{} held; {}",
+                holder.path.display(),
+                if holder.bytes_partial {
+                    "at least "
+                } else {
+                    ""
+                },
+                human_bytes(holder.bytes),
+                holder.why,
+            ));
+        }
+    }
 
     if survey.purge_available {
         let d = Delegate::ClaudeProjectPurge;
@@ -1534,6 +1553,12 @@ fn row_dir(r: &Row) -> Option<&Path> {
     }
 }
 
+fn measured_target_covers(survey: &Survey, path: &Path) -> bool {
+    survey.targets.iter().take(MAX_TARGETS).any(|target| {
+        target.total.is_some_and(|(_, partial)| !partial) && path.starts_with(&target.path)
+    })
+}
+
 fn hogs(
     survey: &Survey,
     config: Config,
@@ -1548,11 +1573,13 @@ fn hogs(
         .filter(|t| t.total.is_some() && there(&t.path))
         .collect();
     let mut by: BTreeMap<PathBuf, Hog> = BTreeMap::new();
+    let mut groups = BTreeMap::new();
     for t in &sized {
-        if sized
-            .iter()
-            .any(|o| o.path != t.path && t.path.starts_with(&o.path))
-        {
+        if sized.iter().any(|o| {
+            o.path != t.path
+                && t.path.starts_with(&o.path)
+                && o.total.is_some_and(|(_, partial)| !partial)
+        }) {
             continue;
         }
         let Some((total, partial)) = t.total else {
@@ -1567,29 +1594,99 @@ fn hogs(
             })
             .fold(0u64, |a, r| a.saturating_add(r.bytes));
         let left = total.saturating_sub(freed);
-        if left == 0 {
+        if left == 0 && !partial {
             continue;
         }
         let (path, why) = hog_of(t, config, survey, notes);
-        let h = by.entry(path.clone()).or_insert(Hog {
-            path,
+        groups.insert(t.path.clone(), path);
+        let h = by.entry(t.path.clone()).or_insert(Hog {
+            path: t.path.clone(),
             bytes: 0,
             bytes_partial: false,
             why,
             serves: serves_of(&t.origin, &t.path),
             built_s_ago: None,
         });
-        h.bytes = h.bytes.saturating_add(left);
+        h.bytes = h.bytes.max(left);
         h.bytes_partial |= partial;
         if let Some(newest) = t.profiles.iter().filter_map(|p| p.last_used).max() {
             let ago = survey.now.saturating_sub(newest).max(0);
             h.built_s_ago = Some(h.built_s_ago.map_or(ago, |held| held.min(ago)));
         }
     }
-    let mut out: Vec<Hog> = by.into_values().collect();
+    for holder in survey.registered_holders.iter().filter(|h| there(&h.path)) {
+        let mut holder = holder.clone();
+        let freed = rows
+            .iter()
+            .filter(|r| {
+                r.class == Class::CargoTargets
+                    && r.removable
+                    && row_dir(r).is_some_and(|d| d.starts_with(&holder.path))
+            })
+            .fold(0u64, |a, r| a.saturating_add(r.bytes));
+        holder.bytes = holder.bytes.saturating_sub(freed);
+        if holder.bytes > 0 || holder.bytes_partial {
+            by.entry(holder.path.clone())
+                .and_modify(|known| {
+                    if holder.bytes > known.bytes {
+                        known.bytes = holder.bytes;
+                        known.bytes_partial = true;
+                    }
+                })
+                .or_insert(holder);
+        }
+    }
+    // Collapse physical overlap before grouping disjoint bootstrap targets under build/.
+    let mut grouped: BTreeMap<PathBuf, Hog> = BTreeMap::new();
+    for mut holder in collapse_nested_holders(by) {
+        if let Some(group) = groups.get(&holder.path) {
+            holder.path.clone_from(group);
+        }
+        if let Some(known) = grouped.get_mut(&holder.path) {
+            known.bytes = known.bytes.saturating_add(holder.bytes);
+            known.bytes_partial |= holder.bytes_partial;
+            if let Some(ago) = holder.built_s_ago {
+                known.built_s_ago = Some(known.built_s_ago.map_or(ago, |held| held.min(ago)));
+            }
+        } else {
+            grouped.insert(holder.path.clone(), holder);
+        }
+    }
+    let mut out: Vec<_> = grouped.into_values().collect();
     out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
     out.truncate(MAX_HOGS);
     out
+}
+
+/// A partial parent's size is a lower bound, as are its disjoint children's sizes. Their
+/// maximum is still a lower bound for the parent; adding the parent would count bytes twice.
+fn collapse_nested_holders(mut holders: BTreeMap<PathBuf, Hog>) -> Vec<Hog> {
+    let mut paths: Vec<_> = holders.keys().cloned().collect();
+    paths.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    let mut children: BTreeMap<PathBuf, u64> = BTreeMap::new();
+    let mut roots = Vec::new();
+    for path in &paths {
+        let Some(mut holder) = holders.remove(path) else {
+            continue;
+        };
+        if let Some(bytes) = children.remove(path)
+            && bytes > holder.bytes
+        {
+            holder.bytes = bytes;
+            holder.bytes_partial = true;
+        }
+        let parent = paths
+            .iter()
+            .filter(|parent| *parent != path && path.starts_with(parent))
+            .max_by_key(|parent| parent.components().count());
+        if let Some(parent) = parent {
+            let bytes = children.entry(parent.clone()).or_default();
+            *bytes = bytes.saturating_add(holder.bytes);
+        } else {
+            roots.push(holder);
+        }
+    }
+    roots
 }
 
 /// The largest build directories a pass left: [`Report::hogs`] given what [`apply_auto`] did (`done`).
@@ -2498,6 +2595,14 @@ pub fn sweep_words(why: atpkg::build_cache::Unused) -> String {
              build held its locks",
             span(after)
         ),
+        Unused::Stayed { stayed, freed } => format!(
+            "a removal took {} of it, and {stayed} entr{} of it would not go even once made \
+             removable (another user's, on another volume, or still refusing once the ACLs and \
+             missing owner bits aterm's own tools leave were cleared); it stays staged, and the \
+             next sweep tries again",
+            human_bytes(freed),
+            if stayed == 1 { "y" } else { "ies" }
+        ),
     }
 }
 
@@ -2520,6 +2625,10 @@ pub fn sweep_reason(why: atpkg::build_cache::Unused) -> String {
             "{incremental} incremental folder(s) and {units} old-compiler unit(s) unwritten {}",
             sweep_span(after)
         ),
+        Unused::Stayed { stayed, .. } => format!(
+            "{stayed} entr{} stayed, the rest went",
+            if stayed == 1 { "y" } else { "ies" }
+        ),
     }
 }
 
@@ -2534,7 +2643,9 @@ fn sweep_span(d: std::time::Duration) -> String {
     }
 }
 
-/// One `build-cache-sweep` row of the disk ledger: a build directory of aterm's Rust build cache.
+/// One `build-cache-sweep` row of the disk ledger: a build directory of aterm's Rust build cache,
+/// or what stayed of a stage a removal could not finish, named as it stands now
+/// (`atpkg::build_cache::remove::stayed_words`).
 #[must_use]
 pub fn sweep_row(
     now: i64,
@@ -2555,14 +2666,17 @@ pub fn sweep_row(
     o.insert("bytes".to_owned(), Value::from(bytes));
     let what = match why {
         atpkg::build_cache::Unused::Stale { .. } => "part of a build cache",
+        atpkg::build_cache::Unused::Stayed { .. } => "part of a stage",
         atpkg::build_cache::Unused::Tooling { .. } => "a pinned tool, whole",
         atpkg::build_cache::Unused::GivenUp => "a tooling scratch, whole",
         _ => "a build cache, whole",
     };
-    o.insert(
-        "text".to_owned(),
-        Value::from(format!("{what}: {}", sweep_words(why))),
-    );
+    let mut text = format!("{what}: {}", sweep_words(why));
+    if let atpkg::build_cache::Unused::Stayed { stayed, .. } = why {
+        text.push_str("; ");
+        text.push_str(&atpkg::build_cache::remove::stayed_words(path, stayed));
+    }
+    o.insert("text".to_owned(), Value::from(text));
     aterm_json::to_string(&Value::Object(o))
         .unwrap_or_else(|_| "{\"kind\":\"build-cache-sweep\"}".to_owned())
 }
@@ -3239,6 +3353,7 @@ pub fn scan_with(
     if roots.idle_whole {
         assess_idle_whole(&mut s, roots, config, now, processes);
     }
+    observe_registered_holders(&mut s);
     if let Some(why) = &roots.claude_unread
         && s.targets
             .iter()
@@ -3249,6 +3364,47 @@ pub fn scan_with(
         ));
     }
     s
+}
+
+fn observe_registered_holders(survey: &mut Survey) {
+    let Some(home) = survey.home.as_deref() else {
+        return;
+    };
+    // One deadline for every indexed cache, independent of the broad search's result cap.
+    // The registry validates ownership before a root is walked, and again after sizing.
+    let deadline = std::time::Instant::now() + discover::Budget::SHIPPED.wall;
+    for cache in atpkg::build_cache::registered::roots(home) {
+        if !cache.is_current(home)
+            || survey
+                .volume_device
+                .is_some_and(|device| target::dev_of(&cache.root) != Some(device))
+            || survey
+                .registered_holders
+                .iter()
+                .any(|h| h.path == cache.root)
+            || measured_target_covers(survey, &cache.root)
+        {
+            continue;
+        }
+        let (bytes, bytes_partial) = target::total_bytes_until(&cache.root, deadline);
+        if !cache.is_current(home) {
+            continue;
+        }
+        let serves = cache
+            .owners
+            .first()
+            .filter(|_| !cache.owners_unknown && cache.owners.len() == 1)
+            .cloned();
+        survey.registered_holders.push(Hog {
+            path: cache.root,
+            bytes,
+            bytes_partial,
+            why: "registered Rust build cache; managed by aterm's cache sweep".into(),
+            serves,
+            built_s_ago: None,
+        });
+        beat::beat();
+    }
 }
 
 fn assess_idle_whole(
@@ -3438,7 +3594,8 @@ fn walk_bytes_until(
         for entry in rd.flatten() {
             seen += 1;
             beat::tick(1);
-            if seen > MAX_WALK_ENTRIES {
+            if seen > MAX_WALK_ENTRIES || deadline.is_some_and(|at| std::time::Instant::now() >= at)
+            {
                 return (total, true);
             }
             let Ok(meta) = entry.metadata() else {

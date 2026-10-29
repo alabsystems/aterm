@@ -3,7 +3,7 @@
 
 //! Keyboard macros: recording and replaying the last macro.
 
-use super::command::{EditorCommand, PrefixArgument};
+use super::command::{CommandAuthority, EditorCommand, PrefixArgument};
 use super::view::EditorBufferView;
 use super::workspace::{EditorEffect, EditorError, EditorWorkspace, Recorded};
 use crate::store::DocumentStore;
@@ -15,17 +15,47 @@ pub(super) enum MacroStep {
     Text(String),
 }
 
+/// One input's keyboard macros: the one it is recording, and the last it defined.
+#[derive(Debug, Default)]
+pub(super) struct KbdMacros {
+    pub(super) recording: Option<Vec<MacroStep>>,
+    pub(super) last: Vec<MacroStep>,
+}
+
 impl EditorWorkspace {
+    /// The macros input that carries `granted` records and replays: the person's
+    /// ([`EditorWorkspace::macros`]) for input with [`CommandAuthority::Clipboard`], as for their
+    /// kill ring ([`EditorWorkspace::kills`]), else [`EditorWorkspace::guest_macros`]. A macro
+    /// keeps the text typed while it was recorded, so input without that authority (in aterm, a
+    /// control client's) never replays the person's, and its keys never join it.
+    pub(super) fn macros_for(&self, granted: &[CommandAuthority]) -> &KbdMacros {
+        if granted.contains(&CommandAuthority::Clipboard) {
+            &self.macros
+        } else {
+            &self.guest_macros
+        }
+    }
+
+    /// [`Self::macros_for`] the input being reduced, to change.
+    pub(super) fn macros_mut(&mut self) -> &mut KbdMacros {
+        if self.granted.contains(&CommandAuthority::Clipboard) {
+            &mut self.macros
+        } else {
+            &mut self.guest_macros
+        }
+    }
+
     /// `start-kbd-macro` (`C-x (`): record what follows as the next macro.
     pub(super) fn start_kbd_macro(&mut self) -> Vec<EditorEffect> {
-        self.recording = Some(Vec::new());
+        self.macros_mut().recording = Some(Vec::new());
         vec![EditorEffect::Status("Defining keyboard macro…".into())]
     }
 
     /// `end-kbd-macro` (C-x )): keep what was recorded as the last macro.
     pub(super) fn end_kbd_macro(&mut self) -> Vec<EditorEffect> {
-        if let Some(recording) = self.recording.take() {
-            self.last_macro = recording;
+        let macros = self.macros_mut();
+        if let Some(recording) = macros.recording.take() {
+            macros.last = recording;
         }
         vec![EditorEffect::Status("Keyboard macro defined".into())]
     }
@@ -40,7 +70,7 @@ impl EditorWorkspace {
             return Err(EditorError::MacroRecursion);
         }
         self.playing_macro = true;
-        let steps = self.last_macro.clone();
+        let steps = self.macros_for(&self.granted).last.clone();
         let result = (|| {
             let mut effects = Vec::new();
             for step in steps {
@@ -67,8 +97,67 @@ impl EditorWorkspace {
 mod tests {
     use super::*;
     use crate::editor::projection::byte_of_line;
-    use crate::editor::{EditorWorkspace, Invocation, KeyChord, Selection, editor};
+    use crate::editor::{
+        CommandAuthority, EditorWorkspace, Invocation, KeyChord, Selection, editor,
+    };
     use crate::store::DocumentStore;
+
+    /// A KEYBOARD MACRO IS REPLAYED ONLY BY THE INPUT THAT RECORDED IT: the person's macro keeps
+    /// what they typed while recording it (a password, say), as private as their kills, so input
+    /// without clipboard authority (in aterm, a control client's) records and replays a macro of
+    /// its own. Its C-x e never replays the person's text into a document it reads; its keys
+    /// while the person records never join the person's macro, to run later with the person's
+    /// authority; its own macro never replaces theirs; and the person's C-x e replays their own.
+    /// NEGATIVE CONTROL: against main's code at this leaf (`147b22abdc`), one macro served both:
+    /// the guest's C-x e replayed the person's `pass` and the guest's own `G` typed mid-recording
+    /// (`passGpassG`); so it did again with `macros_for` and `macros_mut` mutated to pick the
+    /// person's macros for every input.
+    #[test]
+    fn a_keyboard_macro_is_replayed_only_by_the_input_that_recorded_it() {
+        fn press(
+            store: &mut DocumentStore,
+            workspace: &mut EditorWorkspace,
+            view: &mut EditorBufferView,
+            keys: &str,
+        ) {
+            for key in keys.split_whitespace() {
+                workspace
+                    .handle_chord(store, view, KeyChord::parse(key).unwrap())
+                    .unwrap();
+            }
+        }
+        let guest = || {
+            vec![
+                CommandAuthority::Read,
+                CommandAuthority::Edit,
+                CommandAuthority::Save,
+            ]
+        };
+        let (mut store, mut workspace, mut view, document) = editor("");
+        let text = |store: &DocumentStore| store.snapshot(document).unwrap().text.to_string();
+
+        press(&mut store, &mut workspace, &mut view, "C-x (");
+        workspace
+            .insert_text(&mut store, &mut view, "pass")
+            .unwrap();
+        workspace.granted = guest();
+        workspace.insert_text(&mut store, &mut view, "G").unwrap();
+        workspace.granted = CommandAuthority::ALL.to_vec();
+        press(&mut store, &mut workspace, &mut view, "C-x )");
+        assert_eq!(text(&store), "passG", "PRECONDITION: both typed");
+
+        workspace.granted = guest();
+        press(&mut store, &mut workspace, &mut view, "C-x e");
+        assert_eq!(text(&store), "passG", "the guest's C-x e");
+        press(&mut store, &mut workspace, &mut view, "C-x (");
+        workspace.insert_text(&mut store, &mut view, "x").unwrap();
+        press(&mut store, &mut workspace, &mut view, "C-x ) C-x e");
+        assert_eq!(text(&store), "passGxx", "the guest's own macro");
+
+        workspace.granted = CommandAuthority::ALL.to_vec();
+        press(&mut store, &mut workspace, &mut view, "C-x e");
+        assert_eq!(text(&store), "passGxxpass", "the person's C-x e");
+    }
 
     #[test]
     fn macro_publication_rebases_siblings_through_every_recorded_edit() {

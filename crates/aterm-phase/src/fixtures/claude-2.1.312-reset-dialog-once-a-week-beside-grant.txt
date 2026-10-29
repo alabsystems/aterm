@@ -1,0 +1,13 @@
+# claude-code 2.1.312 · COMPOSED 2026-10-28, never captured · NEGATIVE CONTROL: no build draws this menu (2.1.312 draws the once-a-week row only where it draws no grant row, `F=!Me&&!ji&&ps` @262873250, `Me=z!=="[]"`): the texts are the bundle's (byte offsets into the store's 2.1.312 binary, sha256 6b5ec691…, scratchpad phase-drift-2312/build/wording.md: the once-a-week row `OJ.label` @228882669, the grant row `fh.label` `Use a {kind} ({left} left, until {date})` @228878687 with the kind `5-hour reset`), the frame is the wall dialog's hand-built one (claude-2.1.287-usage-limit-dialog-fullscreen-panel.txt, as the 2.1.304 reset screens), the values are invented · OPEN: replace with a capture (SPEC §6) · 2.1.312's once-a-week row beside a 5-hour grant row: the menu is refused whole
+⏺ Suites are running; I'll report the number when it lands.
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   What do you want to do?
+
+   ❯ 1. Stop and wait for limit to reset
+     2. Use a 5-hour reset (2 left, until Oct 5)
+     3. Reset your 5-hour limit now
+     4. Wait here, then continue automatically at 3pm
+     5. Switch to usage credits
+
+   Enter to confirm · Esc to cancel

@@ -528,4 +528,10 @@ impl PlanView {
     fn gap(&self) -> Option<Duration> {
         self.forecast?.checked_duration_since(self.stamp?)
     }
+
+    #[inline]
+    #[must_use]
+    pub(crate) const fn cold_at(&self) -> Option<Instant> {
+        self.cold_at
+    }
 }

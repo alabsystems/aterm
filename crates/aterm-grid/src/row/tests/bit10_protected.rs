@@ -272,3 +272,20 @@ fn fixup_wide_boundary_suppressed_still_clears_dangling_wide_heads() {
         "dangling wide head at right must still be cleared in suppressed mode"
     );
 }
+
+#[test]
+fn display_and_debug_preserve_decsca_protected_glyphs_and_skip_wide_spacers() {
+    use crate::PackedColors;
+    let colors = PackedColors::DEFAULT;
+    let (_p, mut row) = make_row(10);
+    row.write_char_packed(0, 'P', colors, CellFlags::PROTECTED);
+    row.write_wide_char_packed(1, '中', colors, CellFlags::PROTECTED);
+    row.write_char_packed(3, 'Q', colors, CellFlags::PROTECTED);
+    row.write_char_packed(4, '!', colors, CellFlags::empty());
+
+    assert_eq!(row.to_string(), "P中Q!");
+    assert!(
+        format!("{row:?}").contains("\"P中Q!\""),
+        "Debug must include DECSCA-protected characters in content"
+    );
+}

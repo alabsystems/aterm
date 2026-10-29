@@ -4707,6 +4707,61 @@ fn app_route_denies_an_edge_before_it_looks() {
     );
 }
 
+/// The session an `@<sid>` resolves to is the one `open autopilot-menu at=…` opens the program's
+/// menu for: the line's selector, through [`app_route`], to [`open_route`]. NEGATIVE CONTROLS:
+/// the same words with no selector, or `@.` (this connection's own), are unaimed and answer the
+/// aimed form's usage; the bare form routes as before, aimed or not.
+#[test]
+fn open_routes_the_menu_a_program_asks_for_to_the_session_it_aims_at() {
+    use crate::control::control_media::OpenRoute;
+    let handle = crate::session_store::test_handle(7);
+    let hosted: Target = (
+        handle.term.clone(),
+        handle.master,
+        handle.local_id,
+        handle.ctx.clone(),
+    );
+    let routed = |line: &str| {
+        let Head { selector, rest, .. } = control_request::head(line);
+        let aim = app_route(NativeControlPrincipal::Owner, selector.as_ref(), |_| {
+            Resolution::Hosted(hosted.clone())
+        })
+        .expect("the Owner's line routes");
+        open_route(&aim, rest)
+    };
+    assert_eq!(
+        routed("@7 open autopilot-menu at=20,40 by=keys"),
+        OpenRoute::ProgramMenu(crate::autopilot_menu::ProgramMenu {
+            session: 7,
+            cell: (20, 40),
+            keyboard: true,
+        })
+    );
+    for unaimed in [
+        "open autopilot-menu at=20,40 by=keys",
+        "@. open autopilot-menu at=20,40 by=keys",
+    ] {
+        assert!(
+            matches!(
+                routed(unaimed),
+                OpenRoute::Refused(refusal)
+                    if refusal.starts_with("ERR usage: @<sid> open autopilot-menu at=")
+            ),
+            "{unaimed:?}"
+        );
+    }
+    for bare in ["@7 open autopilot-menu", "open autopilot-menu"] {
+        assert_eq!(
+            routed(bare),
+            OpenRoute::Aux {
+                target: crate::app_introspect::AuxTarget::AutopilotMenu,
+                close: false,
+            },
+            "{bare:?}"
+        );
+    }
+}
+
 /// A `pipe(2)` with both ends close-on-exec as early as the platform allows.
 #[cfg(unix)]
 fn cloexec_pipe() -> (i32, i32) {
@@ -5670,6 +5725,8 @@ fn escalated_op_fences_argument_dependent_seams() {
         ("open", "menu close", owner),
         ("open", "palette close", owner),
         ("open", "update close", owner),
+        ("open", "autopilot-menu", owner),
+        ("open", "autopilot-menu at=20,40 by=keys", owner),
         ("spawn", "connected=controller of=s-abc", owner),
         (
             "spawn",
@@ -6695,6 +6752,7 @@ fn registered_session(local_id: u64, master: i32, seed: &[u8]) -> SessionHandle 
         bells: Default::default(),
         screen_moves: Default::default(),
         job_feed: Default::default(),
+        ran: Default::default(),
         box_banner: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
@@ -8321,13 +8379,15 @@ fn cursor_dims_blocks_json_schemas() {
             && dt.contains("band_left=0")
             && dt.contains("crop_right=0")
             && dt.contains("present_retry_state=ready")
-            && dt.contains("present_retry_in_ms=none"),
+            && dt.contains("present_retry_in_ms=none")
+            && dt.ends_with(" presented_seq=none\n"),
         "{dt}"
     );
     assert!(
         dbody.contains("\"present_retry_state\":\"ready\"")
             && dbody.contains("\"present_retry_count\":0")
-            && dbody.contains("\"present_retry_in_ms\":null"),
+            && dbody.contains("\"present_retry_in_ms\":null")
+            && dbody.contains("\"presented_seq\":null"),
         "{dbody}"
     );
 
@@ -9720,6 +9780,60 @@ fn cross_session_input_reports_a_dead_peer_as_write_failed() {
 
 #[test]
 #[cfg(unix)]
+fn queued_background_escape_rejects_stale_insert_mode_until_normal_is_observed() {
+    let _route = crate::app_input::paste_order::force_conpty_route_for_test();
+    let _wait = super::queued_input_waits_for_test(aterm_spec::wait::MUST_HAPPEN);
+    let (h, rx) = pipe_session(74);
+    // SAFETY: pipe_session returned this write descriptor; no other owner closes it.
+    let _write_end = unsafe { std::os::fd::OwnedFd::from_raw_fd(h.master) };
+    {
+        let mut timeline = h.ctx.timeline.lock().unwrap();
+        timeline.note_root_group(100);
+        assert!(timeline.note_foreground_group(300));
+        assert!(timeline.set_program(300, Some("claude".into())));
+    }
+    let paint = |footer: &str| {
+        let rule = "─".repeat(30);
+        crate::term_lock(&h.term).process(
+            format!("\x1b[2J\x1b[H{rule}\r\n❯ prompt\r\n{rule}\r\n{footer}\x1b[2;3H").as_bytes(),
+        );
+    };
+    let frame = || {
+        crate::vim_custody::capture(&crate::term_lock(&h.term), &h.ctx, true)
+            .expect("owned Claude frame")
+    };
+    paint("-- INSERT -- ⏵⏵ auto mode on");
+    assert_eq!(frame().mode, crate::vim_custody::Mode::Insert);
+    h.ctx.licence.vim.frame(frame());
+    paint("-- INSERT -- ⏵⏵ auto mode on");
+    assert!(h.ctx.licence.vim.frame(frame()));
+    let before = h.ctx.licence.vim.epoch();
+    let submitted = crate::app_input::paste_order::submitted_on_this_thread_for_test();
+    assert_eq!(
+        background("key", &h.term, &h.ctx, parse_key("escape").unwrap()),
+        Ok(InputOutcome::Ok)
+    );
+    assert!(crate::app_input::paste_order::submitted_on_this_thread_for_test() > submitted);
+    assert_eq!(drain_pipe(&rx), b"\x1b");
+    assert!(h.ctx.licence.vim.epoch() > before);
+    assert!(!h.ctx.licence.vim.frame(frame()));
+    assert_eq!(
+        background("key", &h.term, &h.ctx, parse_key("h").unwrap()),
+        Ok(InputOutcome::Ok)
+    );
+    assert_eq!(drain_pipe(&rx), b"h");
+    assert!(!h.ctx.licence.vim.frame(frame()));
+    paint("-- INSERT -- ⏵⏵ auto mode on");
+    assert!(!h.ctx.licence.vim.frame(frame()));
+    paint("⏵⏵ auto mode on");
+    assert_eq!(frame().mode, crate::vim_custody::Mode::Normal);
+    assert!(!h.ctx.licence.vim.frame(frame()));
+    paint("-- INSERT -- ⏵⏵ auto mode on");
+    assert!(h.ctx.licence.vim.frame(frame()));
+}
+
+#[test]
+#[cfg(unix)]
 fn queued_background_input_into_a_dead_peer_is_a_failed_write() {
     let _route = crate::app_input::paste_order::force_conpty_route_for_test();
     let _wait = super::queued_input_waits_for_test(aterm_spec::wait::MUST_HAPPEN);
@@ -9987,10 +10101,24 @@ struct MidWriteClose {
     spill_empty: bool,
 }
 
-/// Build a wedged pipe with an older interactive frame in its spill.
+/// Build a wedged stream with an older interactive frame in its spill, then kill the peer in
+/// the kernel mid-paste so descriptor inheritance across concurrent `fork`s cannot keep it alive.
 #[cfg(unix)]
 fn paste_while_the_peer_closes_mid_write() -> MidWriteClose {
-    let (handle, reader) = pipe_session(73);
+    use std::os::fd::FromRawFd as _;
+    let mut pair = [-1i32; 2];
+    assert_eq!(
+        // SAFETY: `socketpair` fills the two-element array this frame owns.
+        unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) },
+        0,
+        "socketpair(2)"
+    );
+    for fd in pair {
+        aterm_pty::set_cloexec(fd, true).expect("socket end cloexec");
+    }
+    // SAFETY: `pair[0]` is a fresh descriptor owned exclusively by `reader`.
+    let reader = unsafe { std::fs::File::from_raw_fd(pair[0]) };
+    let handle = registered_session(73, pair[1], b"");
     aterm_pty::set_nonblocking(handle.master, true).expect("nonblocking test master");
     handle.ctx.sink.note_master_nonblocking(true);
 
@@ -9999,10 +10127,10 @@ fn paste_while_the_peer_closes_mid_write() -> MidWriteClose {
         match aterm_pty::write_some(handle.master, &[b'.'; 4096]) {
             Ok(n) if n > 0 => filled += n,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-            other => panic!("unexpected pipe fill result: {other:?}"),
+            other => panic!("unexpected socket fill result: {other:?}"),
         }
     }
-    assert!(filled > 0, "pipe reached real backpressure");
+    assert!(filled > 0, "socket reached real backpressure");
     assert_eq!(
         handle
             .ctx
@@ -10018,11 +10146,20 @@ fn paste_while_the_peer_closes_mid_write() -> MidWriteClose {
 
     let older = handle.ctx.sink.spilled_bytes();
     let sink = Arc::clone(&handle.ctx.sink);
+    let master = handle.master;
     let closer = std::thread::spawn(move || {
         aterm_spec::wait::until_within(
             aterm_spec::wait::MUST_HAPPEN,
             "the paste is in flight behind the older frame",
             || (sink.spilled_bytes() > older).then_some(()),
+        );
+        // SAFETY: `master` is owned by `handle`, which outlives `closer.join()` below;
+        // `shutdown(SHUT_WR)` terminates the kernel socket's write side even if a concurrent
+        // child inherited a descriptor.
+        assert_eq!(
+            unsafe { libc::shutdown(master, libc::SHUT_WR) },
+            0,
+            "shutdown(SHUT_WR)"
         );
         drop(reader);
     });
@@ -10049,29 +10186,21 @@ fn paste_while_the_peer_closes_mid_write() -> MidWriteClose {
 #[test]
 #[cfg(unix)]
 fn cross_session_paste_reports_a_dead_spill_peer_as_write_failed() {
-    const ATTEMPTS: usize = 3;
-    for attempt in 1..=ATTEMPTS {
-        let run = paste_while_the_peer_closes_mid_write();
-        if !run.peer_observed_dead {
-            eprintln!(
-                "attempt {attempt}: a stranger still held the read end (reply {:?}); \
-                 the run is void, not a verdict",
-                run.reply
-            );
-            continue;
-        }
-        assert_eq!(run.reply, "ERR write failed\n");
-        assert!(
-            !run.reached_kernel,
-            "empty-after-peer-death remains a sticky completion failure",
-        );
-        assert!(
-            run.spill_empty,
-            "nothing process-local remains: the handoff's polling fence is settled",
-        );
-        return;
-    }
-    panic!("every one of {ATTEMPTS} runs had a stranger on the read end");
+    let run = paste_while_the_peer_closes_mid_write();
+    assert!(
+        run.peer_observed_dead,
+        "shutdown(SHUT_WR) kills the socket write side deterministically (reply {:?})",
+        run.reply
+    );
+    assert_eq!(run.reply, "ERR write failed\n");
+    assert!(
+        !run.reached_kernel,
+        "empty-after-peer-death remains a sticky completion failure",
+    );
+    assert!(
+        run.spill_empty,
+        "nothing process-local remains: the handoff's polling fence is settled",
+    );
 }
 
 /// Run `write` on its own thread and return its answer, failing at the hang detector if it parks.
@@ -10796,22 +10925,23 @@ fn rainbow_kitty_window() -> (crate::App, crate::WindowId, std::fs::File) {
 
 #[test]
 #[cfg(unix)]
-fn an_agent_s_typed_turn_lays_ribbon_and_a_pasted_turn_does_not() {
+fn an_agent_s_typed_turn_lays_keyed_ribbon_and_a_pasted_turn_one_insert() {
     use std::cell::{Cell, RefCell};
     use std::time::{Duration, Instant};
 
+    use aterm_effects::cursor_glow::AdmissionRecord;
     use aterm_grapheme::GraphemeClusters;
 
+    use crate::app_input::typed_kitty_summon_tests::{delivery_edge, observing_frame};
     use crate::app_render::CursorFxInputs;
     use crate::input::{InputEvent, Source};
 
-    let drive = |line: &str| -> (String, usize) {
+    let drive = |line: &str| -> (String, usize, Vec<&'static str>) {
         let (app, wid, _rx) = rainbow_kitty_window();
         let app = RefCell::new(app);
         let col = Cell::new(0u16);
-        let echo = |a: &mut crate::App, cells: u16| {
+        let echo = |a: &mut crate::App, cells: u16, now: Instant| {
             col.set(col.get() + cells);
-            let now = Instant::now() + Duration::from_millis(4);
             a.cursor_frame(
                 wid,
                 CursorFxInputs {
@@ -10823,8 +10953,13 @@ fn an_agent_s_typed_turn_lays_ribbon_and_a_pasted_turn_does_not() {
         };
         let key = |ev: InputEvent| {
             let mut a = app.borrow_mut();
+            // The press and its echo's frame 4 ms apart on the input clock, however long the
+            // test thread is stalled between them.
+            let at = Instant::now();
+            crate::app_input::pin_input_clock(Some(at));
             let _ = a.input(wid, ev, Source::Controller);
-            echo(&mut a, 1);
+            crate::app_input::pin_input_clock(None);
+            echo(&mut a, 1, at + Duration::from_millis(4));
             true
         };
         let paste = |text: &str| {
@@ -10835,7 +10970,18 @@ fn an_agent_s_typed_turn_lays_ribbon_and_a_pasted_turn_does_not() {
                 InputEvent::Paste(text.to_string(), crate::input::PasteFraming::AtDrain),
                 Source::Controller,
             );
-            echo(&mut a, cells);
+            // A program echoes a paste only once its bytes are on the wire, so the echo's frame
+            // follows the egress writer's receipt, as on a PTY: the first frame after the
+            // receipt's edge, never later, so a stalled test thread cannot age the delivery.
+            let session = a
+                .front_terminal(wid)
+                .expect("the fixture's terminal")
+                .session;
+            crate::app_input::paste_order::await_drain_for_test(
+                &a.pool.get(session).expect("the fixture's session").ctx.sink,
+            );
+            let edge = delivery_edge(&a, wid, 1);
+            echo(&mut a, cells, observing_frame(edge, 1));
             true
         };
         let press = |_: &str| true;
@@ -10863,33 +11009,38 @@ fn an_agent_s_typed_turn_lays_ribbon_and_a_pasted_turn_does_not() {
                 refused: &|| None,
             },
         );
-        let laid = app.borrow().windows[&wid]
-            .fx
-            .cursor()
-            .glow
-            .ribbon_segments();
-        (out.lines().next().unwrap_or("").to_string(), laid)
+        let a = app.borrow();
+        let glow = &a.windows[&wid].fx.cursor().glow;
+        let licences = glow.admission_log().map(|r| r.licence).collect();
+        let first = out.lines().next().unwrap_or("").to_string();
+        (first, glow.ribbon_segments(), licences)
     };
 
-    let (verdict, laid) = drive("typed=1 cadence=1 submit=none idle=20 timeout=60000 hello world");
+    let (verdict, laid, licences) =
+        drive("typed=1 cadence=1 submit=none idle=20 timeout=60000 hello world");
     assert!(
         verdict.starts_with("OK 24 turn submitted=0 status=settled")
             && verdict.ends_with(" typed=11 pasted=0"),
         "a typed turn presses every grapheme and says so: {verdict}"
     );
     assert!(
-        laid > 0,
-        "eleven keys through the seam lay a ribbon: segments={laid}"
+        laid > 0
+            && licences.contains(&AdmissionRecord::LICENCE_KEY)
+            && !licences.contains(&AdmissionRecord::LICENCE_INSERT),
+        "eleven keys through the seam lay a ribbon under the key licence, never an insert: \
+         {licences:?} segments={laid}"
     );
 
-    let (verdict, laid) = drive("submit=none idle=20 timeout=60000 hello world");
+    let (verdict, laid, licences) = drive("submit=none idle=20 timeout=60000 hello world");
     assert!(
         verdict.starts_with("OK 24 turn submitted=0 status=settled") && !verdict.contains("typed="),
         "a plain turn's verdict is byte-identical to before: {verdict}"
     );
-    assert_eq!(
-        laid, 0,
-        "a paste has no keystroke behind any cell: no ribbon"
+    assert!(
+        licences.contains(&AdmissionRecord::LICENCE_INSERT)
+            && !licences.contains(&AdmissionRecord::LICENCE_KEY),
+        "a paste has no keystroke behind any cell: its delivered echo is one insert \
+         (RAINBOW-KITTY-V2 §27), never a key: {licences:?} segments={laid}"
     );
 }
 
@@ -12813,7 +12964,7 @@ fn turn_into_claude_code_verifies_its_submit_by_the_composer_not_a_repaint() {
         "settle=submitted presses=1 submit_window=60000 timeout=60000 carry on",
     );
     assert!(
-        verdict.contains("submitted=1 status=submitted"),
+        verdict.contains("submitted=1 status=submitted") && verdict.contains(" submit_by=composer"),
         "{verdict}"
     );
     let (verdict, presses) = run(
@@ -12852,9 +13003,199 @@ fn turn_into_claude_code_verifies_its_submit_by_the_composer_not_a_repaint() {
         "settle=submitted presses=1 submit_window=60000 timeout=60000 carry on",
     );
     assert!(
-        verdict.contains("submitted=1 status=submitted"),
+        verdict.contains("submitted=1 status=submitted") && verdict.contains(" submit_by=screen"),
         "{verdict}"
     );
+}
+
+/// A PROVEN CODEX-ALAB'S SUBMIT IS ITS OWN CLAIM, NOT A REDRAW: `turn settle=submitted` into a
+/// codex-alab between turns whose report begins a turn after the Enter answers `submitted=1 …
+/// submit_by=claim` on one press, though the redraw came first, and reopens its done task; a
+/// redraw with no such report (a popup that took the Enter) answers `submitted=0 … pressed=1`
+/// once the window closes, presses no more and leaves the task done; and a press that shows
+/// neither presses again and names its Enters. A press while codex's report stands in a turn is
+/// the screen's to judge (`submit_by=screen`), whatever turn codex begins meanwhile.
+/// NEGATIVE CONTROLS: the same report on a codex tab with no proven claim is only the screen's
+/// word, and a `working` re-sent mid-turn begins no turn.
+#[test]
+fn turn_into_a_proven_codex_alab_verifies_its_submit_by_its_claim_not_a_redraw() {
+    use crate::task_record::{TaskMark, TaskState, mark_session_task};
+    use std::cell::Cell;
+    const WORKING: &[u8] = b"\x1b]7501;state=working:app=codex\x1b\\";
+    const DONE: &[u8] = b"\x1b]7501;state=done:app=codex\x1b\\";
+    #[derive(Clone, Copy)]
+    enum App {
+        /// A redraw at the Enter, then codex's `working` from another thread.
+        Claims,
+        /// A popup's redraw and no report.
+        Redraws,
+        /// The same `working` sent again, under a redraw.
+        Resends,
+        /// The running turn ends and codex begins the next (a line it queued before), under a
+        /// redraw.
+        Requeues,
+        /// Nothing at all.
+        Ignores,
+    }
+    let run = |seed: &[u8], app: App, proven: bool, options: &str| {
+        let store = session_store::new_store();
+        let h = registered_session(0, -1, seed);
+        store.write().unwrap().register(h.clone());
+        h.ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .set_program(4242, Some("codex".to_string()));
+        if proven {
+            crate::session_timeline::claim_supervisor_as(
+                &h.ctx,
+                &format!("codex-alab@{}", std::process::id()),
+                Some(1),
+                None,
+                Some(crate::self_claim::stand_in::running()),
+                crate::metrics::now_us(),
+                aterm_slog::Actor::Ctl,
+            )
+            .expect("the proven claim");
+        }
+        assert_eq!(
+            crate::harness_host::admitted(&h.ctx),
+            proven.then_some(aterm_phase::Program::Codex),
+            "PRECONDITION: a codex-alab only where proven"
+        );
+        mark_session_task(&h.ctx, 0, &TaskMark::new(TaskState::Done)).expect("unfenced");
+        let term = &h.term;
+        let reporter: Cell<Option<std::thread::JoinHandle<()>>> = Cell::new(None);
+        let presses = Cell::new(0u32);
+        let paste = |text: &str| {
+            term.lock()
+                .unwrap()
+                .process(format!("\x1b[22;1H\x1b[2K\u{203a} {text}").as_bytes());
+            true
+        };
+        let press = |_: &str| {
+            presses.set(presses.get() + 1);
+            let redraw =
+                "\x1b[20;1H\x1b[J\u{2022} Working (0s \x1b[1mesc\x1b[0m to interrupt)".as_bytes();
+            match app {
+                App::Claims => {
+                    term.lock().unwrap().process(redraw);
+                    let (term_t, watchers_t) = (term.clone(), h.ctx.watchers.clone());
+                    reporter.set(Some(std::thread::spawn(move || {
+                        crate::term_lock(&term_t).process(WORKING);
+                        watchers_t.ring_watchers();
+                    })));
+                }
+                App::Redraws => term
+                    .lock()
+                    .unwrap()
+                    .process("\x1b[18;1H\x1b[J  /model  choose what model to use".as_bytes()),
+                App::Resends => term.lock().unwrap().process(&[redraw, WORKING].concat()),
+                App::Requeues => term
+                    .lock()
+                    .unwrap()
+                    .process(&[redraw, DONE, WORKING].concat()),
+                App::Ignores => {}
+            }
+            true
+        };
+        let out = cmd_turn(
+            term,
+            &store,
+            0,
+            options,
+            &h.ctx,
+            &TurnIo {
+                paste: &paste,
+                press: &press,
+                ..TurnIo::paste_only()
+            },
+        );
+        if let Some(j) = reporter.take() {
+            j.join().unwrap();
+        }
+        let task = h.ctx.timeline.lock().unwrap().task().map(|r| r.state);
+        (
+            out.lines().next().unwrap_or("").to_string(),
+            presses.get(),
+            task,
+        )
+    };
+    let (verdict, presses, task) = run(
+        b"",
+        App::Claims,
+        true,
+        "settle=submitted presses=2 submit_window=60000 timeout=60000 carry on",
+    );
+    assert!(
+        verdict.contains("submitted=1 status=submitted") && verdict.contains(" submit_by=claim"),
+        "{verdict}"
+    );
+    assert_eq!(presses, 1, "the claim verified the first Enter");
+    assert_eq!(
+        task,
+        Some(TaskState::Working),
+        "control: the claim reopens the task"
+    );
+    let (verdict, presses, task) = run(
+        b"",
+        App::Redraws,
+        true,
+        "settle=submitted presses=2 submit_window=200 timeout=60000 /mo",
+    );
+    assert!(
+        verdict.contains("submitted=0 status=timeout")
+            && verdict.contains(" pressed=1")
+            && !verdict.contains("submit_by="),
+        "a redraw is no turn codex began: {verdict}"
+    );
+    assert_eq!(presses, 1, "the screen moved: no second Enter");
+    assert_eq!(task, Some(TaskState::Done), "no turn: the task stays done");
+    let (verdict, presses, _) = run(
+        WORKING,
+        App::Requeues,
+        true,
+        "settle=submitted presses=2 submit_window=60000 timeout=60000 and then",
+    );
+    assert!(
+        verdict.contains("submitted=1 status=submitted") && verdict.contains(" submit_by=screen"),
+        "a turn begun while one ran is no claim of this Enter: {verdict}"
+    );
+    assert_eq!(presses, 1);
+    let (verdict, _, _) = run(
+        WORKING,
+        App::Resends,
+        true,
+        "settle=submitted presses=2 submit_window=200 timeout=60000 and then",
+    );
+    assert!(
+        verdict.contains("submitted=1 status=submitted") && verdict.contains(" submit_by=screen"),
+        "control: a re-sent `working` begins no turn: {verdict}"
+    );
+    let (verdict, presses, _) = run(
+        b"",
+        App::Ignores,
+        true,
+        "settle=submitted presses=2 submit_window=60 timeout=60000 carry on",
+    );
+    assert!(
+        verdict.contains("submitted=0 status=timeout")
+            && verdict.contains(" pressed=2")
+            && !verdict.contains("submit_by="),
+        "{verdict}"
+    );
+    assert_eq!(presses, 2, "no evidence: pressed again");
+    let (verdict, presses, _) = run(
+        b"",
+        App::Claims,
+        false,
+        "settle=submitted presses=2 submit_window=60000 timeout=60000 carry on",
+    );
+    assert!(
+        verdict.contains("submitted=1 status=submitted") && verdict.contains(" submit_by=screen"),
+        "control: no proven claim, no claim read: {verdict}"
+    );
+    assert_eq!(presses, 1);
 }
 
 #[test]
@@ -13383,11 +13724,18 @@ fn cooperative_lease_blocks_turn_but_not_raw_writes() {
 
 #[test]
 fn a_hard_lease_holds_every_other_connection_and_its_own_types_through() {
+    struct Serving;
+    impl Drop for Serving {
+        fn drop(&mut self) {
+            SERVING_CONNECTION.with(|s| s.set(None));
+        }
+    }
     let store = session_store::new_store();
     let h = registered_session(0, -1, b"");
     store.write().unwrap().register(h.clone());
     let term = &h.term;
     let on = |conn: u64| SERVING_CONNECTION.with(|s| s.set(Some(conn)));
+    let _serving = Serving;
     on(7);
     let got = cmd_lease(&h.ctx, "acquire holder=aterm-harness@1 ttl=60000 hard");
     assert!(got.ends_with(" hard=1\n"), "{got}");
@@ -13453,7 +13801,6 @@ fn a_hard_lease_holds_every_other_connection_and_its_own_types_through() {
         "lapsed reads as none"
     );
     assert!(cmd_lease(&h.ctx, "acquire holder=fresh").starts_with("OK lease acquired"));
-    SERVING_CONNECTION.with(|s| s.set(None));
 }
 
 /// The holder's own turn holds the slot in its hand's place, and the hand's connection, waiting
@@ -15910,6 +16257,25 @@ fn guarded_pipe_session(local_id: u64) -> (crate::session_store::SessionHandle, 
     aterm_pty::set_nonblocking(h.master, true).expect("nonblocking test master");
     h.ctx.sink.note_master_nonblocking(true);
     (h, rx)
+}
+
+#[test]
+#[cfg(unix)]
+fn refused_guarded_escape_leaves_vim_custody_unchanged() {
+    let (h, rx) = guarded_pipe_session(1);
+    // SAFETY: this is the new pipe's write descriptor; no other owner closes it.
+    let _write_end = unsafe { std::os::fd::OwnedFd::from_raw_fd(h.master) };
+    let guard = control_input::compile_guard(Some("ready"))
+        .unwrap()
+        .unwrap();
+    let before = h.ctx.licence.vim.epoch();
+    let _ = control_input::cmd_key_guarded(&h.term, &h.ctx, guard.as_ref(), "escape");
+    assert_eq!(h.ctx.licence.vim.epoch(), before);
+    assert!(drain_pipe(&rx).is_empty());
+    crate::term_lock(&h.term).process(b"ready");
+    let _ = control_input::cmd_key_guarded(&h.term, &h.ctx, guard.as_ref(), "escape");
+    assert_ne!(h.ctx.licence.vim.epoch(), before);
+    assert_eq!(drain_pipe(&rx), b"\x1b");
 }
 
 #[test]
@@ -20000,8 +20366,8 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         format!("hold {W}"),
         "await inbox".to_owned(),
         format!("@{W} await task"),
-        "await task @s-00000000000000cc".to_owned(),
         "await task @1".to_owned(),
+        format!("await task @{W},@1"),
     ] {
         let refused = gate(&line);
         assert!(
@@ -20043,6 +20409,18 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
                  on|off [reason=<pct>]"
             ),
             "{line}: the form a hold takes"
+        );
+    }
+    for line in [
+        "await task @s-00000000000000cc".to_owned(),
+        format!("await task @{W}:3,@s-00000000000000cc all timeout=20000"),
+    ] {
+        assert_eq!(
+            gate(&line),
+            Ok(DriveLine::Answer(
+                "ERR no such session @s-00000000000000cc\n".to_owned()
+            )),
+            "{line}: a worker it hosts no more, as on one Mac"
         );
     }
     let unhosted = gate("@s-00000000000000cc status").err();
@@ -20113,6 +20491,15 @@ fn only_a_drive_scope_on_a_drivers_thread_passes_the_drive_gate() {
             &store,
         );
         assert!(refused.is_err_and(|why| why.starts_with("ERR denied: ")));
+        let gone = drive_admission(
+            Request::parse("await task @s-00000000000000c0".to_owned()),
+            drive,
+            &store,
+        );
+        assert_eq!(
+            gone.err().as_deref(),
+            Some("ERR no such session @s-00000000000000c0\n")
+        );
         let typing = format!("@{} send hi", sid.as_str());
         let (_, scope, write) = drive_admission(Request::parse(typing), drive, &store).unwrap();
         assert_eq!(scope, Scope::Owner);

@@ -16,11 +16,20 @@ use aterm_update_core::roster::{Roster, RosterReject};
 /// Default relative path for the roster and its detached master signature.
 pub const DEFAULT_ROSTER: &str = "dist/aterm-machines.toml";
 
+/// Release ring directory path relative to `$HOME`.
+pub const RELEASE_RING_REL: &str = ".aterm/release-ring";
+
 /// Machine secret key path relative to `$HOME`.
-pub const MACHINE_KEY_REL: &str = ".aterm/machine.key";
+pub const MACHINE_KEY_REL: &str = ".aterm/release-ring/machine.key";
 
 /// Machine public record path relative to `$HOME`.
-pub const MACHINE_PUB_REL: &str = ".aterm/machine.toml";
+pub const MACHINE_PUB_REL: &str = ".aterm/release-ring/machine.toml";
+
+/// Release-credentials profile path relative to `$HOME`.
+pub const RELEASE_CREDENTIALS_REL: &str = ".aterm/release-ring/release-credentials.toml";
+
+/// Installed release roster path relative to `$HOME`.
+pub const RELEASE_ROSTER_REL: &str = ".aterm/release-ring/roster/aterm-machines.toml";
 
 /// Anchor file path relative to the workspace root.
 pub const PINS_REL: &str = "crates/aterm-update-core/src/pins.rs";
@@ -687,32 +696,6 @@ pub fn lock_roster_read_only(path: &str) -> Result<RosterLock, String> {
         path: path.to_string(),
         _guard: guard,
     })
-}
-
-/// Lock, read the pair, and publish in one call. Test-only: a real mutation holds one lock
-/// across its own read, edit, sign and publish ([`publish_roster_locked`]); this states the
-/// transaction layer's properties without the whole provisioning pipeline.
-#[cfg(test)]
-fn publish_roster(path: &str, bytes: &[u8], sig: &[u8]) -> Result<(), String> {
-    let lock = lock_roster(path)?;
-    let sig_path = concat(&[path, ".sig"]);
-    let expected = match (read_bytes(path), read_bytes(&sig_path)) {
-        (Ok(raw), Ok(sig)) => Some(RosterSnapshot { raw, sig }),
-        (Err(body), Err(signature))
-            if body.kind() == std::io::ErrorKind::NotFound
-                && signature.kind() == std::io::ErrorKind::NotFound =>
-        {
-            None
-        }
-        _ => {
-            return Err(concat(&[
-                "the roster pair at ",
-                path,
-                " is missing one half or unreadable; restore both files before publishing",
-            ]));
-        }
-    };
-    publish_roster_locked(&lock, path, expected.as_ref(), bytes, sig)
 }
 
 /// A roster transaction committed to the redo directory.
@@ -1703,11 +1686,25 @@ mod tests {
         let sig_path = concat(&[&paths.roster, ".sig"]);
         let old_body = std::fs::read(&paths.roster).unwrap();
         let old_sig = std::fs::read(&sig_path).unwrap();
+        let snapshot = RosterSnapshot {
+            raw: old_body.clone(),
+            sig: old_sig.clone(),
+        };
 
         std::fs::remove_file(&sig_path).unwrap();
         std::fs::create_dir(&sig_path).unwrap();
-        let err = publish_roster(&paths.roster, b"NEW BODY", b"NEW SIG").unwrap_err();
-        assert!(err.contains("missing one half or unreadable"), "{err}");
+        let lock = lock_roster(&paths.roster).unwrap();
+        let err = publish_roster_locked(
+            &lock,
+            &paths.roster,
+            Some(&snapshot),
+            b"NEW BODY",
+            b"NEW SIG",
+        )
+        .unwrap_err();
+        assert!(err.contains("CHANGED ON DISK"), "{err}");
+        assert!(!std::path::Path::new(&roster_txn_path(&paths.roster)).exists());
+        drop(lock);
         assert_eq!(
             std::fs::read(&paths.roster).unwrap(),
             old_body,
@@ -1736,15 +1733,20 @@ mod tests {
             .to_string();
         let fresh_sig = concat(&[&fresh_roster, ".sig"]);
         std::fs::create_dir(&fresh_sig).unwrap();
-        let err = publish_roster(&fresh_roster, b"BODY", b"SIG").unwrap_err();
-        assert!(err.contains("missing one half or unreadable"), "{err}");
+        let fresh_lock = lock_roster(&fresh_roster).unwrap();
+        let err =
+            publish_roster_locked(&fresh_lock, &fresh_roster, None, b"BODY", b"SIG").unwrap_err();
+        assert!(err.contains("APPEARED"), "{err}");
+        assert!(!std::path::Path::new(&roster_txn_path(&fresh_roster)).exists());
         assert!(
             !std::path::Path::new(&fresh_roster).exists(),
             "a first publish that failed leaves nothing, not a signatureless document"
         );
 
         std::fs::remove_dir(&fresh_sig).unwrap();
-        publish_roster(&fresh_roster, b"BODY", b"SIG").expect("publish with nothing in the way");
+        publish_roster_locked(&fresh_lock, &fresh_roster, None, b"BODY", b"SIG")
+            .expect("publish with nothing in the way");
+        drop(fresh_lock);
         assert_eq!(std::fs::read(&fresh_roster).unwrap(), b"BODY");
         assert_eq!(std::fs::read(&fresh_sig).unwrap(), b"SIG");
 
@@ -2019,12 +2021,12 @@ mod tests {
                 .unwrap()
                 .to_string(),
             key: dir
-                .join("home/.aterm/machine.key")
+                .join("home/.aterm/release-ring/machine.key")
                 .to_str()
                 .unwrap()
                 .to_string(),
             machine_pub: dir
-                .join("home/.aterm/machine.toml")
+                .join("home/.aterm/release-ring/machine.toml")
                 .to_str()
                 .unwrap()
                 .to_string(),
@@ -2465,7 +2467,7 @@ mod tests {
         write_pins(&planned).expect("the ordinary write verifies");
 
         std::fs::write(&paths.pins, PINS_FIXTURE).unwrap();
-        let planned2 = {
+        let mut no_write = {
             let pre = preflight(
                 Verb::Setup,
                 "m3-b",
@@ -2477,14 +2479,10 @@ mod tests {
             .unwrap();
             plan(pre, &seed, NOW).unwrap()
         };
-        write_pins(&planned2).expect("write");
-        std::fs::write(&paths.pins, PINS_FIXTURE).unwrap();
-        let mut no_write = planned2;
         no_write.pins_text = None;
         let err = write_pins(&no_write).unwrap_err();
         assert!(
-            err.message.contains("holds 0 keys but 1 were intended")
-                || err.message.contains("holds 1 keys but 2 were intended"),
+            err.message.contains("holds 0 keys but 1 were intended"),
             "{err}"
         );
         assert!(!err.landed, "a run with nothing to write wrote nothing");

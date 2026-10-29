@@ -105,6 +105,8 @@ fn a_record_parses_as_python_writes_it_and_nothing_else() {
         (br#"{"pid": 5}"#, RecordRead::Bad),
         (br#"{"pid": 5, "started": NaN}"#, RecordRead::Bad),
         (br#"{"pid": 5, "started": -1}"#, RecordRead::Bad),
+        (br#"{"pid": 5, "started": 1e20}"#, RecordRead::Bad),
+        (br#"{"pid": 5, "started": 1e308}"#, RecordRead::Bad),
         (br#"{"pid": 5, "started": "1"}"#, RecordRead::Bad),
         (br#"{"pid": 5, "started": 1, "v": 2}"#, RecordRead::Bad),
         (

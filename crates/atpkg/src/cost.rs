@@ -50,7 +50,7 @@ pub fn human_bytes_apart(a: u64, b: u64) -> (String, String) {
 /// Whether `required` bytes fit in `available` while leaving `free_floor` free afterward.
 #[must_use]
 pub const fn disk_ok(required: u64, available: u64, free_floor: u64) -> bool {
-    available >= required.saturating_add(free_floor)
+    (available as u128) >= (required as u128) + (free_floor as u128)
 }
 
 /// Bytes to leave free after an install, so a multi-GB toolchain never fills the volume.
@@ -93,6 +93,8 @@ mod tests {
         assert!(disk_ok(3 * gib, 10 * gib, gib));
         assert!(!disk_ok(3 * gib, 7 * gib / 2, gib));
         assert!(!disk_ok(u64::MAX, 1000, 1));
+        assert!(!disk_ok(u64::MAX, u64::MAX, 1));
+        assert!(disk_ok(u64::MAX, u64::MAX, 0));
         assert!(disk_ok(3 * gib, 4 * gib, gib));
     }
 }

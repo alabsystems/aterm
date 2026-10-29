@@ -340,116 +340,14 @@ fn describe(p: &Program) -> String {
     )
 }
 
-/// Which aterm clients may read the signed index, as far as an ALab harness
-/// (`atpkg::harness`) goes. The index is the only thing a client reads, so whether a pinned
-/// harness installs unasked is up to the oldest client that still reads it, not the newest.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Readers {
-    /// Some reader installs every program the index lists: aterm through v0.135.0, whose
-    /// `wanted_programs` is `Index::installable` and whose `auto_install` defaults on. A
-    /// harness pin installs that harness, unasked, on every such client.
-    SomeInstallEveryProgram,
-    /// Every reader keeps a harness out of its default set (`atpkg::harness::in_default_set`,
-    /// `Index::default_set`) and installs one only when a person names it.
-    AllKeepHarnessesOut,
-}
-
-/// The readers of the signed index today. v0.136.0 is the first release whose client carries
-/// the harness rule, and a client through v0.135.0 may still read the index, so some reader
-/// installs every program the index lists. This becomes [`Readers::AllKeepHarnessesOut`] only
-/// in a reviewed change that records how the oldest client still reading the index was
-/// measured to carry `atpkg::harness` (`docs/DESIGN-harness-repos-2026-10-24.md` §11 D24).
-pub const READERS: Readers = Readers::SomeInstallEveryProgram;
-
-/// Refuse every harness in `pin` while `readers` include a client that would install it unasked
-/// (§11 D24): it is pinned once every reader keeps it out, or once the client's own default set
-/// holds it (the contract-v3 flip of D17, after which every client installs it alike). A pin the
-/// delta names is refused for what it would do; one carried from the head is refused with the
-/// retirement that ends it.
-fn admit_harness_pins(
-    readers: Readers,
-    pin: &BTreeMap<String, Build>,
-    delta: &Delta,
-) -> Result<()> {
-    if readers == Readers::AllKeepHarnessesOut {
-        return Ok(());
-    }
-    let unasked = pin
-        .iter()
-        .find(|(p, _)| atpkg::harness::is_harness(p) && !atpkg::harness::in_default_set(p));
-    let Some((p, b)) = unasked else {
-        return Ok(());
-    };
-    let what = if delta.pins.contains_key(p) {
-        format!("REFUSING --pin {p}={b}")
-    } else {
-        format!(
-            "REFUSING to carry the head's pin {p}={b} (retire it with --retire {p} in this \
-             publish)"
-        )
-    };
-    Err(Error::refused(format!(
-        "{what}: {p} is an ALab harness, which a client installs only when a person names it — \
-         but every aterm through v0.135.0 installs every program the index lists (its default \
-         set is the installable set; atpkg::harness reaches clients from v0.136.0 on), so this \
-         index would install {p}, unasked, on each of them that still reads it. A harness is pinned once \
-         every client still reading the index keeps it out (channel::index::READERS, moved by \
-         a reviewed change that records how that was measured) or once the client's default \
-         set holds it (contract v3) — docs/DESIGN-harness-repos-2026-10-24.md §11 D17, D24. Its \
-         signed pack may be staged meanwhile (`pack {p} --upload`): nothing installs a pack \
-         the index does not pin"
-    )))
-}
-
-/// The index `delta` makes of `base`, signed by `machine_id` under `roster_seq`, valid until `valid_until` (already held to the clock), for today's [`READERS`].
+/// The index `delta` makes of `base`, signed by `machine_id` under `roster_seq`, valid until `valid_until` (already held to the clock).
+///
+/// An ALab harness (`atpkg::harness`) pins like any table row: every client installs every
+/// program the index lists, a harness included (owner ruling 2026-10-27,
+/// `docs/DESIGN-harness-repos-2026-10-24.md` §11 D45), so no reader is left to keep one out.
 /// # Errors
-/// A refusal for a downgrade, a repo switch under a build not above the head's pin or the head's cell on a target it keeps, an unknown or vendor-direct program, a harness pin some reader would install unasked, an overlay naming an unpinned program, a yank of an unpinned program that is not vendor-direct, a lift of an absent yank, a lowered floor not asked for, or a roster older than the head's.
+/// A refusal for a downgrade, a repo switch under a build not above the head's pin or the head's cell on a target it keeps, an unknown or vendor-direct program, an overlay naming an unpinned program, a yank of an unpinned program that is not vendor-direct, a lift of an absent yank, a lowered floor not asked for, or a roster older than the head's.
 pub fn plan(
-    base: &Base,
-    delta: &Delta,
-    machine_id: &str,
-    roster_seq: u64,
-    valid_until: &str,
-    log: &mut Log,
-) -> Result<Plan> {
-    plan_reading(
-        READERS,
-        base,
-        delta,
-        machine_id,
-        roster_seq,
-        valid_until,
-        log,
-    )
-}
-
-/// [`plan`] for the index's `readers` other than [`READERS`]: the seam a test drives with
-/// every reader keeping a harness out, a state no released client is in yet.
-/// # Errors
-/// As [`plan`]'s.
-#[cfg(any(test, debug_assertions))]
-pub fn plan_for(
-    readers: Readers,
-    base: &Base,
-    delta: &Delta,
-    machine_id: &str,
-    roster_seq: u64,
-    valid_until: &str,
-    log: &mut Log,
-) -> Result<Plan> {
-    plan_reading(
-        readers,
-        base,
-        delta,
-        machine_id,
-        roster_seq,
-        valid_until,
-        log,
-    )
-}
-
-fn plan_reading(
-    readers: Readers,
     base: &Base,
     delta: &Delta,
     machine_id: &str,
@@ -522,7 +420,6 @@ fn plan_reading(
         }
         pin.insert(p.clone(), b);
     }
-    admit_harness_pins(readers, &pin, delta)?;
     let carried: Vec<(String, Build)> = pin
         .iter()
         .filter(|(p, b)| head.pin.get(*p) == Some(b))
@@ -1143,14 +1040,22 @@ pub fn publish_with(ctx: &Ctx, request: &IndexRequest, log: &mut Log) -> Result<
         ));
     }
     if request.upload {
-        let ok = std::fs::metadata(&ctx.tokens.channel).is_ok_and(|m| m.len() > 0);
-        if !ok {
-            return Err(Error::refused(format!(
-                "--upload needs the public owner's token at {} — the index and the packs it \
-                 pins are published to {}",
-                ctx.shown(&ctx.tokens.channel),
-                ctx.accounts.public
-            )));
+        match ctx.usable_token(&ctx.tokens.channel) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(Error::refused(format!(
+                    "--upload needs the public owner's token at {} — the index and the packs it \
+                     pins are published to {}",
+                    ctx.shown(&ctx.tokens.channel),
+                    ctx.accounts.public
+                )));
+            }
+            Err(why) => {
+                return Err(Error::refused(format!(
+                    "--upload needs the public owner's token at {}: {why}",
+                    ctx.shown(&ctx.tokens.channel),
+                )));
+            }
         }
     }
     let head_dir = Scratch::new("head")?;

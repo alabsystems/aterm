@@ -664,6 +664,7 @@ fn a_light_water_drop_is_clear_blue() {
             hue: 0.8,
             cov_scale: 1.0,
             born: at,
+            edge_cut: false,
         });
         let (mut out, mut halos, mut under) = (Vec::new(), Vec::new(), Vec::new());
         glow.emit_particles(
@@ -707,6 +708,74 @@ fn a_light_water_drop_is_clear_blue() {
     assert!(
         lit.iter().all(|q| q.alpha == 0) && !light.is_empty(),
         "control: the dark drop is light"
+    );
+}
+
+/// A drop the effects box's edge cut is left out for the rest of its life: thrown down past
+/// the box's bottom edge and back up into it, it is drawn until the edge would cut it and never
+/// again, rather than vanish and come back (a blink: a grain whose glint swelled to the edge at
+/// each twinkle went out and in at the twinkle's rate). Judged afresh each frame (the negative
+/// control), it came back once it rose off the edge.
+#[test]
+fn a_drop_the_edge_cut_stays_out_for_its_life() {
+    let g = tall_geom();
+    let at = Instant::now();
+    let mut c = cfg(GlowStyle::Water, true);
+    c.intensity = 1.0;
+    let shown = |each_frame: bool| -> Vec<bool> {
+        let mut glow = CursorGlow::default();
+        glow.set_edge_cut_each_frame(each_frame);
+        let (x, _) = g.cell_center(4, 20);
+        let bottom = g.fx_bot() as f32;
+        // Down 30 px from 24 px over the edge, at its lowest 0.5 s on, and back by 1 s.
+        glow.particles.push(Particle {
+            x0: x,
+            y0: bottom - 24.0,
+            vx: 0.0,
+            vy: 120.0,
+            gy: -240.0,
+            life: 3.0,
+            hue: 0.8,
+            cov_scale: 1.0,
+            born: at,
+            edge_cut: false,
+        });
+        (0..=60_u64)
+            .map(|frame| {
+                let now = at + std::time::Duration::from_millis(frame * 16);
+                let (mut out, mut halos, mut under) = (Vec::new(), Vec::new(), Vec::new());
+                glow.emit_particles(
+                    now,
+                    &c,
+                    g,
+                    &mut out,
+                    &mut halos,
+                    &mut crate::cursor_glow::glow_sink(
+                        &mut under,
+                        &mut aterm_render::GlowRamps::default(),
+                        true,
+                    ),
+                    CursorGlow::MAX_QUADS,
+                );
+                out.iter().any(|q| q.alpha > 0) || !halos.is_empty()
+            })
+            .collect()
+    };
+    let latched = shown(false);
+    let first_out = latched.iter().position(|&on| !on);
+    assert!(
+        latched[0] && first_out.is_some(),
+        "fixture: the drop is drawn, then the edge cuts it: {latched:?}"
+    );
+    assert!(
+        latched[first_out.unwrap_or(0)..].iter().all(|&on| !on),
+        "the drop the edge cut came back: {latched:?}"
+    );
+    let judged = shown(true);
+    assert!(
+        judged.windows(2).skip_while(|w| w[0] || !w[1]).count() > 0
+            && judged.iter().rposition(|&on| on) > judged.iter().position(|&on| !on),
+        "negative control: judged afresh each frame, the drop comes back: {judged:?}"
     );
 }
 

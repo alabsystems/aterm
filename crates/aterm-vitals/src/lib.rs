@@ -31,15 +31,15 @@ pub use model::{
     AccountIx, COMMIT_NEAR_PCT, CapBasis, ClusterSpec, ClusterView, CommitSample, CoreView,
     CpuView, DiskFacts, DiskLevel, GpuSample, GpuView, HeatCell, HeatSlot, Hog, LinkKind,
     LinkRates, LinkSample, LinkView, MemCounters, MemRates, MemSample, MemView, NetState, NetView,
-    NoFigure, PlanFact, PlanRun, Pressure, ProcLimits, ProcSample, ProcState, ProcView, Resource,
+    NoFigure, PlanFact, Pressure, ProcLimits, ProcSample, ProcState, ProcView, Resource,
     ResourceView, RowFacts, RowScope, Sample, SavedStrip, ScopeFig, ScopeView, Series, Snapshot,
     Split, State, StripEvent, StripEventKind, TabRoot, TabTokens, TabView, TcpCounts, Thermal,
-    Throttle, Ticks, Vitals, VolumeSample, WeekFact, Writer,
+    Throttle, Ticks, Vitals, VolumeSample, Writer,
 };
-pub use peaks::{DailyMax, PeakRow, Peaks, PlanDay, PlanWeek};
+pub use peaks::{DailyMax, PeakRow, Peaks};
 pub use ring::{
-    AxisTick, Bucket, BucketRing, Cell, GapKind, MultiScaleSpec, ProgSlot, Reading, SavedBucket,
-    SavedReading, SavedRing, ScaleBand, ScaleCell, SlotGrid, TickAnchor, Tiers, TimeGap,
+    Bucket, BucketRing, Cell, GapKind, MultiScaleSpec, ProgSlot, Reading, SavedBucket,
+    SavedReading, SavedRing, ScaleBand, ScaleCell, SlotGrid, Tiers, TimeGap,
 };
 pub use strain::Strain;
 pub use trend::{History, Motion, Trend, TrendView};

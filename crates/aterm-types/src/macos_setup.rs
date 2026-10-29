@@ -6,6 +6,9 @@
 /// The default ALab vault on the local network, advertised through mDNS.
 pub const DEFAULT_VAULT_URL: &str = "http://alab-secrets.local:7484/v1/alab";
 
+/// Every compiled-in ALab vault URL a client probes and joins across ([`DEFAULT_VAULT_URL`] first).
+pub const DEFAULT_VAULT_URLS: &[&str] = &[DEFAULT_VAULT_URL];
+
 /// Report row name for setup's Secrets stage.
 pub const SECRETS_VAULT_ROW: &str = "Secrets vault";
 
@@ -500,6 +503,11 @@ pub const COMMAND_LINE_TOOLS_MISSING: &str = "Install Apple's Command Line Tools
 /// no chip saying it will change, until Restore, turning its group off and on, or Set up now.
 pub const CHANGED_BY_YOU: &str = "Changed by you";
 
+/// The Secrets vault row's value on a member Mac whose sync the person turned off, which is
+/// also what the row wants then (design §4: an explicit opt-out is the row's wanted state), so
+/// its quiet Turn On Sync turns it back on.
+pub const SYNC_OFF: &str = "Sync off";
+
 /// The placeholder that makes `softwareupdate -l` list Apple's Command Line Tools: an install
 /// through `softwareupdate` keeps it while it runs. It can outlive a crashed installer, so
 /// System State also requires a live installer process before saying Installing (design §3.3).
@@ -742,6 +750,21 @@ impl Selection {
         }
     }
 }
+
+/// The base plan every Mac sets up where nobody chose one
+/// (`docs/DESIGN-init-on-by-default-2026-10-25.md` §8.1): aterm's own Permissions, the Secrets
+/// vault lane (discovery and the Sync rows ride it) and Rust in Spotlight, which changes this
+/// login's own rustup (its profile set to minimal, each toolchain's `rust-docs` set aside and
+/// removed) and keeps aterm's build caches out of Spotlight. The rest is the ALab profile (the
+/// workstation preferences, Dock, Repositories and the Messages and FaceTime sign-outs), which
+/// aterm admits by itself only on an ALab Mac.
+pub const BASE_PLAN: Selection = {
+    let mut selection = Selection::none();
+    selection.set(Setting::Permissions, true);
+    selection.set(Setting::Secrets, true);
+    selection.set(Setting::Spotlight, true);
+    selection
+};
 
 /// Persisted first-launch setup plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1008,6 +1031,98 @@ pub mod opt_out {
 /// own for a later pass: a hang detector (`MacosDialog::when_none_up`).
 pub const DIALOG_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long macOS's Local Network question counts as up once aterm raised it. macOS reports
+/// neither the alert nor its answer, so this is a bound, not a reading: the next step waits this
+/// long, and an alert still unanswered after it may have System Settings beside it. System
+/// State's Local Network step holds the window's dialog slot for it, and so does the Commons
+/// runtime when it asks by itself (`docs/DESIGN-system-state-2026-10-21.md` §6).
+pub const LOCAL_NETWORK_QUESTION_HOLD: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether this process's LAN was handed to the Commons runtime. System State's Local Network
+/// step hands it over at its trigger, the moment it asked macOS the question under the window's
+/// dialog slot (`docs/DESIGN-system-state-2026-10-21.md` §6): Commons opens no LAN socket before
+/// that, unless other evidence says macOS asked aterm already or the step will not run.
+pub mod lan_first_use {
+    static HANDED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+    /// This process's reader of whether System State's Local Network step is still to come for
+    /// it ([`install_step_to_come`]).
+    type StepToCome = Box<dyn Fn() -> bool + Send + Sync>;
+
+    static STEP_TO_COME: std::sync::OnceLock<StepToCome> = std::sync::OnceLock::new();
+
+    /// Hand this process's LAN to the Commons runtime: the step of approved revision `revision`
+    /// asked macOS. The first hand-over wins; a later one changes nothing.
+    pub fn hand_over(revision: u64) {
+        let _ = HANDED.set(revision);
+    }
+
+    /// The revision whose Local Network step handed this process's LAN over, if one did.
+    #[must_use]
+    pub fn handed() -> Option<u64> {
+        HANDED.get().copied()
+    }
+
+    /// Install this process's reader of whether System State's Local Network step is still to
+    /// come for it: true while the step is meant to raise macOS's question first and has not
+    /// yet, by the rule the Commons runtime's own gate waits on. A window that runs first-run
+    /// setup installs it, since its System State runs the step. The first reader installed wins.
+    pub fn install_step_to_come(reader: impl Fn() -> bool + Send + Sync + 'static) {
+        let _ = STEP_TO_COME.set(Box::new(reader));
+    }
+
+    /// Whether a use of the LAN by this process (a probe, a sweep, a join) may go now without
+    /// putting macOS's Local Network question on screen ahead of System State's step: the step
+    /// handed the LAN over, or the installed reader says the step is not still to come. In a
+    /// process that installed no reader (a command, a background job), nothing waits on a step.
+    #[must_use]
+    pub fn may_use() -> bool {
+        may_use_with(
+            handed(),
+            STEP_TO_COME
+                .get()
+                .map(|reader| &**reader as &dyn Fn() -> bool),
+        )
+    }
+
+    /// [`may_use`] of what it read (pure): `handed`, and the reader, if one was installed.
+    fn may_use_with(handed: Option<u64>, step_to_come: Option<&dyn Fn() -> bool>) -> bool {
+        handed.is_some() || !step_to_come.is_some_and(|to_come| to_come())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        /// One test: the hand-over is process-wide, so a second test could see this one's.
+        #[test]
+        fn lan_first_use_the_first_hand_over_wins() {
+            assert_eq!(super::handed(), None, "nothing handed over yet");
+            super::hand_over(8_401);
+            assert_eq!(super::handed(), Some(8_401));
+            super::hand_over(8_402);
+            assert_eq!(super::handed(), Some(8_401), "the first hand-over wins");
+        }
+
+        /// A LAN use waits only while an installed reader says System State's Local Network step
+        /// is still to come and the step has not handed the LAN over: a process with no reader
+        /// waits on nothing, and the hand-over opens it whatever the reader says.
+        #[test]
+        fn lan_first_use_waits_only_for_a_step_still_to_come() {
+            let to_come = || true;
+            let not_to_come = || false;
+            assert!(super::may_use_with(None, None), "no reader: no step waits");
+            assert!(
+                !super::may_use_with(None, Some(&to_come)),
+                "the step is still to come and asks first"
+            );
+            assert!(super::may_use_with(None, Some(&not_to_come)));
+            assert!(
+                super::may_use_with(Some(8_401), Some(&to_come)),
+                "the step handed the LAN over"
+            );
+        }
+    }
+}
+
 impl Drop for MacosDialog {
     fn drop(&mut self) {
         if MACOS_DIALOGS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
@@ -1185,12 +1300,19 @@ pub mod access_record {
         revision: u64,
     ) -> impl DoubleEndedIterator<Item = (Access, AccessOutcome)> + '_ {
         text.lines().filter_map(move |line| {
-            let mut words = line.split_whitespace();
-            let at = words.next()?.parse::<u64>().ok()?;
-            let access = Access::parse(words.next()?)?;
-            let outcome = AccessOutcome::parse(words.next()?)?;
-            (at == revision && words.next().is_none()).then_some((access, outcome))
+            let (at, access, outcome) = parse_line(line)?;
+            (at == revision).then_some((access, outcome))
         })
+    }
+
+    /// One `<revision> <row> <outcome>` line; `None` for a line this build does not know (an
+    /// unknown row or outcome, or a longer line a newer aterm wrote), which every reader skips.
+    fn parse_line(line: &str) -> Option<(u64, Access, AccessOutcome)> {
+        let mut words = line.split_whitespace();
+        let at = words.next()?.parse::<u64>().ok()?;
+        let access = Access::parse(words.next()?)?;
+        let outcome = AccessOutcome::parse(words.next()?)?;
+        words.next().is_none().then_some((at, access, outcome))
     }
 
     /// The latest outcome recorded for `access` in `revision`.
@@ -1200,6 +1322,18 @@ pub mod access_record {
             .into_iter()
             .rev()
             .find_map(|(row, outcome)| (row == access).then_some(outcome))
+    }
+
+    /// The last outcome the record holds for `access` in any revision, revision 0 included: the
+    /// file's last line for that row. Read like [`read`], so a line this build does not know (an
+    /// unknown row or outcome, a newer aterm's longer line) is skipped.
+    #[must_use]
+    pub fn latest_of_any_revision(dir: &Path, access: Access) -> Option<AccessOutcome> {
+        let text = std::fs::read_to_string(dir.join(FILE)).unwrap_or_default();
+        text.lines().rev().find_map(|line| {
+            let (_, row, outcome) = parse_line(line)?;
+            (row == access).then_some(outcome)
+        })
     }
 
     #[cfg(test)]
@@ -1425,6 +1559,49 @@ pub mod access_record {
             assert_eq!(
                 read(root, other_revision),
                 [(Access::FullDiskAccess, AccessOutcome::Granted)]
+            );
+        }
+
+        /// The Commons runtime asks whether macOS ever asked aterm about Local Network: the row's
+        /// last line in any revision, revision 0 (an older aterm's legacy run) included, past every
+        /// line this build does not know.
+        #[test]
+        fn access_record_the_latest_of_any_revision_reads_every_revision_and_skips_unknown_lines() {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let root = dir.path();
+            assert_eq!(latest_of_any_revision(root, Access::LocalNetwork), None);
+            std::fs::write(root.join(FILE), "0 local-network triggered\n").unwrap();
+            assert_eq!(
+                latest_of_any_revision(root, Access::LocalNetwork),
+                Some(AccessOutcome::Triggered),
+                "revision 0"
+            );
+            std::fs::write(
+                root.join(FILE),
+                "0 local-network triggered\n\
+                 7 local-network granted\n\
+                 9 full-disk-access handed\n\
+                 12 local-network asked-twice\n\
+                 13 bluetooth triggered\n\
+                 14 local-network declined later\n\
+                 not-a-revision local-network declined\n",
+            )
+            .unwrap();
+            assert_eq!(
+                latest_of_any_revision(root, Access::LocalNetwork),
+                Some(AccessOutcome::Granted),
+                "an older revision's line, past another row's and every unknown or newer line"
+            );
+            assert_eq!(
+                latest_of_any_revision(root, Access::FullDiskAccess),
+                Some(AccessOutcome::Handed)
+            );
+            assert_eq!(latest_of_any_revision(root, Access::Debugger), None);
+            append(root, 3, Access::LocalNetwork, AccessOutcome::Triggered).unwrap();
+            assert_eq!(
+                latest_of_any_revision(root, Access::LocalNetwork),
+                Some(AccessOutcome::Triggered),
+                "the file's last line for the row, whatever its revision"
             );
         }
     }

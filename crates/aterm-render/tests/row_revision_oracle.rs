@@ -3,9 +3,12 @@
 
 //! Differential oracle pinning the per-row revision lane of `compute_dirty_rows` against the brute-force whole-grid comparison.
 
-use aterm_core::render::RenderInput;
+use aterm_core::render::{InkCell, RenderInput};
 use aterm_core::terminal::Terminal;
-use aterm_render::{DirtyDecision, compute_dirty_rows, row_revisions_comparable};
+use aterm_render::{
+    DecoBlend, DecoGlyph, DirtyDecision, WordDecoration, compute_dirty_rows,
+    row_revisions_comparable,
+};
 use std::collections::BTreeMap;
 
 const ROWS: usize = 12;
@@ -29,7 +32,23 @@ fn host_prediction_ghost(input: &mut RenderInput) {
 }
 
 fn host_sparkle(input: &mut RenderInput) {
+    input.ink.clear();
+    input.ink.push(InkCell {
+        row: 1,
+        col: 0,
+        color: [0xFF, 0xD8, 0x60],
+    });
     input.word_decorations.clear();
+    input.word_decorations.push(WordDecoration {
+        row: 4,
+        col: 2,
+        dx: 0,
+        dy: 0,
+        glyph: DecoGlyph::Star4,
+        blend: DecoBlend::Add,
+        color: 0x0060_5030,
+        alpha: 220,
+    });
 }
 
 fn host_preedit(input: &mut RenderInput) {
@@ -328,16 +347,21 @@ fn stamped_dirty_rows_match_the_brute_force_oracle_over_a_mutation_corpus() {
                     if stamped_dirty.iter().any(|d| *d) {
                         stamp_lane_nonempty += 1;
                     }
-                    let extra = stamped_dirty
-                        .iter()
-                        .zip(&reference_dirty)
-                        .filter(|(g, w)| **g && !**w)
-                        .count();
-                    assert!(
-                        extra <= rows,
-                        "pass {pass} step {}: {extra} over-reported rows",
-                        step.name
-                    );
+                    if matches!(
+                        step.name,
+                        "idle"
+                            | "type_one_char"
+                            | "type_again_same_row"
+                            | "sgr_colour_run"
+                            | "wide_and_combining"
+                            | "host_sparkle"
+                    ) {
+                        assert_eq!(
+                            stamped_dirty, reference_dirty,
+                            "pass {pass} step {}: revision lane over-reported rows on an exact step",
+                            step.name
+                        );
+                    }
                 }
             }
             *armed.entry(step.name).or_default() += 1;

@@ -105,6 +105,33 @@ fn tmp() -> aterm_tempfile::TempDir {
         .unwrap()
 }
 
+#[test]
+fn control_writer_contention_is_busy_and_release_preserves_the_journal() {
+    let fixture = Fixture::new();
+    let dir = tmp();
+    let mut owner = Journal::open(dir.path(), fixture.trust).unwrap();
+    owner.ingest(fixture.nodes[0].bytes()).unwrap();
+    let error = Journal::open_existing(dir.path(), fixture.trust)
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), crate::ErrorKind::JournalBusy);
+    assert!(owner.node(&fixture.nodes[0].id()).is_some());
+    drop(owner);
+    let successor = Journal::open_existing(dir.path(), fixture.trust).unwrap();
+    assert!(successor.node(&fixture.nodes[0].id()).is_some());
+    drop(successor);
+    let mut wrong = fixture.trust;
+    wrong.network[0] ^= 1;
+    let error = Journal::open_existing(dir.path(), wrong).err().unwrap();
+    assert_eq!(error.kind(), crate::ErrorKind::Other);
+}
+
+#[test]
+fn unrelated_would_block_is_not_control_journal_contention() {
+    let error = crate::Error::from(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+    assert_eq!(error.kind(), crate::ErrorKind::Other);
+}
+
 /// Actual signed, durably appended transition projector used by the model's
 /// source anchors. Reopen also checks replay, independent of the live index.
 fn journal_transition(
@@ -648,7 +675,7 @@ fn capacity_refusal_keeps_acknowledged_history_and_the_same_bytes_are_retryable(
     let fixture = Fixture::new();
     let root = tmp();
     let mut journal = Journal::open(root.path(), fixture.trust).unwrap();
-    journal.index = Index::new(1);
+    Arc::make_mut(&mut journal.view).index = Index::new(1);
     let receipt = journal.ingest(fixture.nodes[0].bytes()).unwrap();
     assert!(journal.ingest(fixture.nodes[1].bytes()).is_err());
     assert_eq!(journal.ingest(fixture.nodes[0].bytes()).unwrap(), receipt);
@@ -954,4 +981,321 @@ fn exhausted_suffix_archive_refuses_repair_without_discarding_bytes() {
     let before = std::fs::read(&path).unwrap();
     assert!(Journal::open(root.path(), fixture.trust).is_err());
     assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+thread_local! {
+    /// Nodes this thread authenticated through [`verify`].
+    pub(super) static VERIFIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+fn verified() -> usize {
+    VERIFIED.with(std::cell::Cell::get)
+}
+
+#[test]
+fn a_reader_succeeds_while_another_handle_holds_the_writer() {
+    let fixture = Fixture::new();
+    let dir = tmp();
+    let mut owner = Journal::open(dir.path(), fixture.trust).unwrap();
+    owner.ingest(fixture.nodes[0].bytes()).unwrap();
+    owner.ingest(fixture.nodes[1].bytes()).unwrap();
+    let busy = Journal::open_existing(dir.path(), fixture.trust)
+        .err()
+        .unwrap();
+    assert_eq!(busy.kind(), crate::ErrorKind::JournalBusy);
+    let mut reader = Journal::read_existing(dir.path(), fixture.trust).unwrap();
+    assert!(owner.is_writer() && !reader.is_writer());
+    assert!(reader.inventory().eq(owner.inventory()));
+    assert_eq!(reader.state(), owner.state());
+    for node in &fixture.nodes[..2] {
+        assert_eq!(reader.receipt(&node.id()), owner.receipt(&node.id()));
+    }
+    assert!(reader.ingest(fixture.nodes[2].bytes()).is_err());
+    owner.ingest(fixture.nodes[2].bytes()).unwrap();
+    let reader = Journal::read_existing(dir.path(), fixture.trust).unwrap();
+    assert!(reader.inventory().eq(owner.inventory()));
+    assert_eq!(
+        reader.receipt(&fixture.nodes[2].id()),
+        owner.receipt(&fixture.nodes[2].id())
+    );
+    let mut foreign = fixture.trust;
+    foreign.network[0] ^= 1;
+    assert!(Journal::read_existing(dir.path(), foreign).is_err());
+}
+
+#[test]
+fn a_kept_view_verifies_each_record_once_across_reads_and_writer_opens() {
+    let fixture = Fixture::new();
+    let dir = tmp();
+    let mut writer = Journal::open(dir.path(), fixture.trust).unwrap();
+    writer.ingest(fixture.nodes[0].bytes()).unwrap();
+    writer.ingest(fixture.nodes[1].bytes()).unwrap();
+    drop(writer);
+    let start = verified();
+    let first = Journal::read_existing(dir.path(), fixture.trust).unwrap();
+    assert_eq!(
+        verified() - start,
+        2,
+        "the first read verifies every record"
+    );
+    for _ in 0..3 {
+        let again = Journal::read_existing(dir.path(), fixture.trust).unwrap();
+        assert!(again.inventory().eq(first.inventory()));
+    }
+    let mut writer = Journal::open_existing(dir.path(), fixture.trust).unwrap();
+    assert_eq!(writer.state(), first.state());
+    assert_eq!(verified() - start, 2, "unchanged prefixes verify nothing");
+    writer.ingest(fixture.nodes[2].bytes()).unwrap();
+    drop(writer);
+    assert_eq!(verified() - start, 3);
+    let grown = Journal::read_existing(dir.path(), fixture.trust).unwrap();
+    assert_eq!(grown.inventory().count(), 3);
+    assert_eq!(
+        verified() - start,
+        4,
+        "an extension verifies only its new record, never skipping it"
+    );
+    drop(Journal::open_existing(dir.path(), fixture.trust).unwrap());
+    drop(Journal::read_existing(dir.path(), fixture.trust).unwrap());
+    assert_eq!(verified() - start, 4);
+}
+
+#[test]
+fn a_replaced_or_shortened_journal_rebuilds_its_view() {
+    let fixture = Fixture::new();
+    let dir = tmp();
+    let mut writer = Journal::open(dir.path(), fixture.trust).unwrap();
+    writer.ingest(fixture.nodes[0].bytes()).unwrap();
+    let astream = dir.path().join("control.astream");
+    let old = (
+        std::fs::read(&astream).unwrap(),
+        std::fs::read(dir.path().join("control.checkpoint")).unwrap(),
+    );
+    writer.ingest(fixture.nodes[1].bytes()).unwrap();
+    drop(writer);
+    assert_eq!(
+        Journal::read_existing(dir.path(), fixture.trust)
+            .unwrap()
+            .inventory()
+            .count(),
+        2
+    );
+
+    // An older copy restored in place: the acknowledged prefix shrank.
+    OpenOptions::new()
+        .write(true)
+        .open(&astream)
+        .unwrap()
+        .set_len(old.0.len() as u64)
+        .unwrap();
+    private_file::write_private(dir.path(), "control.checkpoint", &old.1).unwrap();
+    let start = verified();
+    let shorter = Journal::read_existing(dir.path(), fixture.trust).unwrap();
+    assert_eq!(verified() - start, 1);
+    assert!(
+        shorter
+            .inventory()
+            .eq(std::iter::once(&fixture.nodes[0].id()))
+    );
+
+    // The same bytes under another inode are another file, verified afresh.
+    let bytes = std::fs::read(&astream).unwrap();
+    private_file::write_private(dir.path(), "control.astream", &bytes).unwrap();
+    let replaced = Journal::read_existing(dir.path(), fixture.trust).unwrap();
+    assert_eq!(verified() - start, 2);
+    assert!(replaced.inventory().eq(shorter.inventory()));
+}
+
+#[test]
+fn a_tampered_record_in_an_extension_is_refused_and_never_kept() {
+    let fixture = Fixture::new();
+    let dir = tmp();
+    let mut writer = Journal::open(dir.path(), fixture.trust).unwrap();
+    writer.ingest(fixture.nodes[0].bytes()).unwrap();
+    drop(writer);
+    drop(Journal::read_existing(dir.path(), fixture.trust).unwrap());
+    attest_tampered(&fixture, dir.path());
+    let start = verified();
+    assert!(Journal::read_existing(dir.path(), fixture.trust).is_err());
+    assert_eq!(
+        verified() - start,
+        1,
+        "only the extension was authenticated"
+    );
+    assert!(
+        Journal::read_existing(dir.path(), fixture.trust).is_err(),
+        "the refused record never entered the kept view"
+    );
+    assert_eq!(
+        verified() - start,
+        2,
+        "the kept view still ends before the refused record"
+    );
+    assert!(Journal::open_existing(dir.path(), fixture.trust).is_err());
+}
+
+/// Whoever can write the directory can acknowledge any bytes: append a record
+/// whose node no longer authenticates, under a valid checkpoint.
+fn attest_tampered(fixture: &Fixture, dir: &Path) {
+    let mut tampered = fixture.nodes[1].bytes().to_vec();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 1;
+    assert!(verify(fixture.trust, &tampered).is_err());
+    let mut raw = Log::open(dir, NAME, &fixture.trust.bytes(), true, LIMITS).unwrap();
+    raw.finish_open().unwrap();
+    let mut body = 7u64.to_le_bytes().to_vec();
+    body.extend_from_slice(&tampered);
+    raw.append(SUBJECT, body).unwrap();
+}
+
+#[test]
+fn a_tampered_record_read_with_no_kept_view_is_refused_by_reader_and_writer() {
+    let fixture = Fixture::new();
+    let dir = tmp();
+    let mut writer = Journal::open(dir.path(), fixture.trust).unwrap();
+    writer.ingest(fixture.nodes[0].bytes()).unwrap();
+    drop(writer);
+    attest_tampered(&fixture, dir.path());
+    let start = verified();
+    assert!(Journal::read_existing(dir.path(), fixture.trust).is_err());
+    assert_eq!(
+        verified() - start,
+        2,
+        "a cold read replays from offset zero"
+    );
+    assert!(Journal::open_existing(dir.path(), fixture.trust).is_err());
+    assert!(Journal::read_existing(dir.path(), fixture.trust).is_err());
+}
+
+#[test]
+fn the_view_cache_keeps_the_most_recently_read_journals() {
+    let fixture = Fixture::new();
+    let dirs = [tmp(), tmp(), tmp()];
+    for dir in &dirs {
+        let mut writer = Journal::open(dir.path(), fixture.trust).unwrap();
+        writer.ingest(fixture.nodes[0].bytes()).unwrap();
+    }
+    let views = Views::new(2);
+    let read = |at: usize| {
+        let start = verified();
+        let (view, _) = views.read(dirs[at].path(), fixture.trust).unwrap();
+        assert!(view.nodes.contains_key(&fixture.nodes[0].id()));
+        verified() - start
+    };
+    assert_eq!((read(0), read(1)), (1, 1), "a first read verifies");
+    assert_eq!(read(0), 0, "each directory keeps its own view");
+    assert_eq!(read(2), 1);
+    assert_eq!(read(0), 0, "reading a view keeps it");
+    assert_eq!(read(1), 1, "the least recently read view went first");
+    assert_eq!(read(2), 1);
+}
+
+thread_local! {
+    /// Pause one read after it acquired its cache entry.
+    static BEFORE_VIEW: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Run once, when a writer open has read its view and not yet taken the lock.
+    static BEFORE_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+pub(super) fn before_view() {
+    let hook = BEFORE_VIEW.with(|hook| hook.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[test]
+fn journal_reads_do_not_wait_for_unrelated_views() {
+    use std::{sync::mpsc, thread, time::Duration};
+
+    let fixture = Fixture::new();
+    let dirs = [tmp(), tmp()];
+    for dir in &dirs {
+        let mut writer = Journal::open(dir.path(), fixture.trust).unwrap();
+        writer.ingest(fixture.nodes[0].bytes()).unwrap();
+    }
+    let views = Views::new(2);
+    let trust = fixture.trust;
+    thread::scope(|scope| {
+        let views = &views;
+        let first = dirs[0].path();
+        let second = dirs[1].path();
+        let (started, observed) = mpsc::channel();
+        let (release, blocked) = mpsc::channel::<()>();
+        let first_read = scope.spawn(move || {
+            BEFORE_VIEW.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    started.send(()).unwrap();
+                    let _ = blocked.recv();
+                }));
+            });
+            views.read(first, trust)
+        });
+        observed.recv_timeout(Duration::from_secs(60)).unwrap();
+        let (completed, completion) = mpsc::channel();
+        let second_read = scope.spawn(move || {
+            completed
+                .send(views.read(second, trust).map(|(view, _)| view.nodes.len()))
+                .unwrap();
+        });
+        let result = completion.recv_timeout(Duration::from_secs(60));
+        // Release the paused read before asserting, including the negative
+        // control where a global cache lock prevents the second read.
+        drop(release);
+        assert_eq!(first_read.join().unwrap().unwrap().0.nodes.len(), 1);
+        second_read.join().unwrap();
+        assert_eq!(
+            result
+                .expect("another journal read could not finish")
+                .unwrap(),
+            1
+        );
+    });
+}
+
+pub(super) fn before_lock() {
+    let hook = BEFORE_LOCK.with(|hook| hook.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[test]
+fn a_writer_never_keeps_a_view_another_writer_extended_before_its_lock() {
+    let fixture = Fixture::new();
+    let dir = tmp();
+    let mut writer = Journal::open(dir.path(), fixture.trust).unwrap();
+    writer.ingest(fixture.nodes[0].bytes()).unwrap();
+    drop(writer);
+    drop(Journal::read_existing(dir.path(), fixture.trust).unwrap());
+    // Another writer lands a record after this open read its view and before
+    // it takes the lock.
+    let landed = std::rc::Rc::new(std::cell::Cell::new(None));
+    let receipt = std::rc::Rc::clone(&landed);
+    let (path, trust, wire) = (
+        dir.path().to_path_buf(),
+        fixture.trust,
+        fixture.nodes[1].bytes().to_vec(),
+    );
+    BEFORE_LOCK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let mut other = Journal::open_existing(&path, trust).unwrap();
+            receipt.set(Some(other.ingest(&wire).unwrap()));
+        }));
+    });
+    let mut outer = Journal::open_existing(dir.path(), fixture.trust).unwrap();
+    let landed = landed.get().expect("the other writer appended first");
+    assert_eq!(outer.receipt(&fixture.nodes[1].id()), Some(landed));
+    assert_eq!(outer.inventory().count(), 2);
+    let bytes = std::fs::metadata(dir.path().join("control.astream"))
+        .unwrap()
+        .len();
+    assert_eq!(outer.ingest(fixture.nodes[1].bytes()).unwrap(), landed);
+    assert_eq!(
+        std::fs::metadata(dir.path().join("control.astream"))
+            .unwrap()
+            .len(),
+        bytes,
+        "a record the other writer landed is never appended twice"
+    );
 }

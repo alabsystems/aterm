@@ -4,8 +4,9 @@
 //! The glow's state words (`crate::state_words`): its typed-input custody (the held park, the
 //! type and gesture hints, the press ledger, the recent typed run, the hand's row and the print
 //! anchor), the sound cues it owes, every stored [`GlowConfig`] (through
-//! [`crate::state_words::glow_cfg_words`]), then the ink ledger's and the v2 engine's words. The
-//! other styles' particle pools and the frame's output buffers are not hashed.
+//! [`crate::state_words::glow_cfg_words`]), then the ink ledger's account and the v2 engine's
+//! words. The ink ledger's per-frame products are its ledger words ([`CursorGlow::ledger_words`]),
+//! not state. The other styles' particle pools and the frame's output buffers are not hashed.
 
 use super::{CursorGlow, GlowConfig, HeldPark, OutgoingFade, RecentTypedRun};
 use crate::rainbow_kitty as rk;
@@ -25,9 +26,13 @@ impl CursorGlow {
                 f.opt(
                     "slot",
                     slot,
-                    |f, (at, cells, glyph): (Instant, u8, Option<char>)| {
+                    |f, (at, cells, glyph, wide): (Instant, u8, Option<char>, Option<char>)| {
                         f.at("at", at);
                         f.put("cells", u64::from(cells));
+                        f.put(
+                            "wide_glyph",
+                            wide.map_or(u64::MAX, |c| u64::from(u32::from(c))),
+                        );
                         f.put(
                             "glyph",
                             match glyph {
@@ -63,6 +68,7 @@ impl CursorGlow {
             f.put("anchor_seq", t.anchor_seq.unwrap_or(u64::MAX));
             f.flag("anchor_seq.some", t.anchor_seq.is_some());
             f.flag("printed_off_row", t.printed_off_row);
+            f.flag("keyed", t.keyed);
         });
         w.opt(
             "glow.recent_typed_run",
@@ -249,6 +255,13 @@ impl CursorGlow {
 
         self.ink_ledger.state_words(w);
         self.v2.state_words(w);
+    }
+
+    /// The ink ledger's per-frame products: the rails it noted off the under stream, its dims and
+    /// the print of its cuts (`docs/design/PRISM-GLASS.md` §15.9's preamble).
+    #[inline]
+    pub(crate) fn ledger_words(&self, w: &mut impl Words) {
+        self.ink_ledger.ledger_words(w);
     }
 
     /// The bed's ink table the v2 ribbon draws by ([`rk::ribbon::Ribbon::bed_ink_lut`]).

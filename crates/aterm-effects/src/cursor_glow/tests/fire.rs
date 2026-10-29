@@ -233,6 +233,86 @@ fn fire_identity_at_origin_without_head() {
     }
 }
 
+/// FIRE KEEPS UNDER THE BOX'S TOP: on a grid with no head band over it (the Settings card's,
+/// a pane under a chrome strip) a blaze on the second row rises past the grid's top, and its
+/// gold cores (dark) and paper tongues (light) are laid shorter inside the effects box, each
+/// tip tapering out under [`RISE_CLEAR_PX`], so no light stands on the box's top pixel row.
+/// The negative control (`set_rise_cut`): cut by the box's clip, both stood flat on that row
+/// (settings round 2's three-row card, 2 to 6 px a frame).
+#[test]
+fn a_blaze_under_the_grids_top_keeps_inside_the_box() {
+    let g = Geom {
+        cw: 9,
+        ch: 16,
+        rows: 3,
+        cols: 48,
+        origin_x: 0,
+        origin_y: 0,
+        win_w: 432,
+        win_h: 48,
+        head: 0,
+    };
+    let on_top_row = |dark: bool, cut: bool| {
+        let mut c = cfg(GlowStyle::Fire, true);
+        c.intensity = 1.0;
+        c.dark_theme = dark;
+        (c.theme_fg, c.theme_bg) = if dark {
+            DARK_PAIR
+        } else {
+            (0x001F_2328, 0x00FF_FFFF)
+        };
+        let mut glow = CursorGlow::default();
+        glow.set_rise_cut(cut);
+        let (mut out, mut text, blank) = (Vec::new(), vec![' '; g.cols], vec![' '; g.cols]);
+        let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
+        let page = aterm_core::terminal::RenderCell {
+            fg: rgb(c.theme_fg),
+            bg: rgb(c.theme_bg),
+            ..aterm_core::terminal::RenderCell::default()
+        };
+        let mut cells = vec![vec![page; g.cols]; g.rows];
+        let mut t = Instant::now();
+        glow.tick(Some((1, 2)), t, &c, g, &mut out);
+        let (mut drawn, mut on_top) = (0, 0);
+        for i in 1..=30u16 {
+            t += Duration::from_millis(45);
+            text[usize::from(1 + i)] = 'm';
+            cells[1][usize::from(1 + i)].ch = 'm';
+            glow.observe_row(1, 2 + i, &text, t);
+            glow.observe_neighbor_rows(Some(&blank), Some(&blank));
+            glow.observe_frame_text(Some((1, 2 + i)), &cells, t);
+            glow.note_synthetic_typed(t, 1);
+            glow.tick(Some((1, 2 + i)), t, &c, g, &mut out);
+            // Additive quads (opacity 0) light by their colour alone.
+            let lit = glow
+                .under_quads()
+                .iter()
+                .filter(|q| q.color | q.color2 != 0 || q.alpha > 0 || q.alpha2 > 0);
+            for q in lit {
+                drawn += 1;
+                if f32::from(q.y) < g.rise_ceiling() {
+                    on_top += 1;
+                }
+            }
+        }
+        (drawn, on_top)
+    };
+    for dark in [true, false] {
+        let side = if dark { "dark" } else { "light" };
+        let (drawn, on_top) = on_top_row(dark, false);
+        assert!(drawn > 0, "{side}: the blaze draws");
+        assert_eq!(
+            on_top, 0,
+            "{side}: {on_top} quads of the blaze on the box's top row"
+        );
+        let (_, cut) = on_top_row(dark, true);
+        assert!(
+            cut > 0,
+            "negative control ({side}): the box's clip cuts the blaze's top"
+        );
+    }
+}
+
 fn emberforge_thermal_model() -> aterm_spec::derive::Model {
     use aterm_spec::ty_model;
     ty_model! {
@@ -1006,6 +1086,7 @@ fn fire_embers_keep_off_probed_glyph_cells() {
             hue: 0.6,
             cov_scale: 1.0,
             born: at,
+            edge_cut: false,
         });
         let (mut out, mut halos) = (Vec::new(), Vec::new());
         glow.emit_particles(
@@ -1526,6 +1607,8 @@ struct FireHost {
     rows: Option<Vec<Vec<aterm_core::terminal::RenderCell>>>,
     /// The letters a key types, column by column (none: `m`).
     typed: Vec<char>,
+    /// The frames' grid ([`tall_geom`] unless a test sets another).
+    geom: Geom,
 }
 
 impl FireHost {
@@ -1548,11 +1631,12 @@ impl FireHost {
             text: vec![' '; tall_geom().cols],
             rows: None,
             typed: Vec::new(),
+            geom: tall_geom(),
         }
     }
 
     fn frame(&mut self, now: Instant, cur: (u16, u16), key: bool) {
-        let g = tall_geom();
+        let g = self.geom;
         self.fx.begin(true, true);
         if key {
             self.fx.cadence.on_keystroke(now);
@@ -2603,6 +2687,7 @@ fn the_light_fire_stands_up_out_of_the_line_and_its_embers_are_beads() {
         hue: 0.8,
         cov_scale: 1.0,
         born: at,
+        edge_cut: false,
     });
     let (mut out, mut halos) = (Vec::new(), Vec::new());
     glow.emit_particles(
@@ -3384,6 +3469,57 @@ fn the_kept_flames_cores_burn_gold_in_the_gaps() {
     }
 }
 
+/// looks10 L2, A DENSE ROW BURNS A FLAME: kept in its row under a line of
+/// text (the trail gallery's `context`), the dark fire led at the air's lead
+/// and stood a spark by the ember caret, and the row read as no fire. The
+/// cell past the caret stands a low flame: lit 12 px or more of the row's
+/// height and burning gold (4 px or more), with no olive round the row (nor
+/// in the dark fire's olive census, `the_dark_fire_is_never_olive`, which a
+/// lead past 0.75 of the head's root breaks at the lead tongue's root by a
+/// pixel or three). Negative control: at
+/// the air's lead (`fire_kept_lead_air`) it stands 6 px rows shorter or more.
+#[test]
+fn a_dense_row_burns_a_flame_past_the_caret() {
+    let g = tall_geom();
+    let (row, cw, ch) = (4i32, g.cw as i32, g.ch as i32);
+    let gold = |p: u32| {
+        let (h, s, v) = crate::color_math::rgb2hsv(p & 0x00FF_FFFF);
+        (38.0..58.0).contains(&h) && s > 0.4 && v >= 0.6
+    };
+    for gap_ms in [57u64, 90] {
+        let stand = |air_lead: bool| {
+            let (glass, _, caret, _) = kept_phrase(gap_ms, &|glow| {
+                glow.fire_kept_lead_air = air_lead;
+            });
+            let x0 = i32::from(caret + 1) * cw;
+            let top = row * ch;
+            let lit_rows = (top..top + ch)
+                .filter(|&y| (x0..x0 + cw).any(|x| dark_lift(glass.at(y, x)) >= 120.0))
+                .count();
+            let golden = (top..top + ch)
+                .flat_map(|y| (x0..x0 + cw).map(move |x| (y, x)))
+                .filter(|&(y, x)| gold(glass.at(y, x)))
+                .count();
+            (
+                lit_rows,
+                golden,
+                olive_px(&glass, g, top - 3 * ch..top + ch),
+            )
+        };
+        let (tall, golden, olive) = stand(false);
+        assert!(
+            tall >= 12 && golden >= 4,
+            "{gap_ms} ms apart: the cell past the caret lights {tall} px rows, {golden} gold"
+        );
+        assert_eq!(olive, 0, "{gap_ms} ms apart: {olive} pixels read olive");
+        let (spark, ..) = stand(true);
+        assert!(
+            spark + 6 <= tall,
+            "control, {gap_ms} ms apart: at the air's lead it lights {spark} px rows of {tall}"
+        );
+    }
+}
+
 /// looks7 M6: kept in its row under a line of text, the dark flame stood a
 /// short gold tongue in each word's gap between the burning letters, a
 /// brown flank round it, and in the gallery's `context` it read as a comma
@@ -4150,6 +4286,356 @@ fn a_sparkle_keeps_off_a_filled_row_above() {
     }
 }
 
+/// looks9 Q8: in the gallery's `context` on Solarized Dark Water's drops
+/// stood on the prompt's powerline bar above the typed row as specks.
+/// Typed under a filled row, on the reference dark, on Solarized Dark and
+/// on paper, no drop lifts the bar outside the caret's own bloom. Negative
+/// control: the drops laid as they were lift it. (Typing's Laser sparks fall
+/// short of the bar: Laser's spark is
+/// [`a_laser_spark_s_whole_dash_keeps_off_a_filled_row`]'s, its crackle
+/// [`a_laser_crackle_keeps_off_a_filled_row_above`]'s.)
+#[test]
+fn a_water_drop_keeps_off_a_filled_row_above() {
+    let g = tall_geom();
+    let (row, ch, cw) = (4u16, g.ch as i32, g.cw as i32);
+    let lift = |style: GlowStyle, pair: (u32, u32), bar: u32, on_bars: bool| -> usize {
+        let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+        let filled = |_: usize| aterm_core::terminal::RenderCell {
+            ch: ' ',
+            fg: rgb(pair.0),
+            bg: rgb(bar),
+            ..Default::default()
+        };
+        let mut lit = 0;
+        for (keys, gap) in [(8u16, 60u64), (16, 55), (28, 50), (24, 40)] {
+            let (glow, out) = style_burst_on(
+                style,
+                pair,
+                (keys, gap),
+                (Some(&filled), None),
+                true,
+                &|glow| {
+                    glow.particles_on_bars = on_bars;
+                },
+            );
+            let mut glass = Glass::new(g, pair.1);
+            let bar_rows = (i32::from(row) - 1) * ch..i32::from(row) * ch;
+            for y in bar_rows.clone() {
+                for x in 0..i32::from(g.win_w) {
+                    glass.px[y as usize * glass.w + x as usize] = bar;
+                }
+            }
+            glass.add_quads(glow.under_quads());
+            glass.add_quads(&out);
+            glass.add_halos(glow.halos());
+            // The caret's own bloom feathers a few pixels into the bar's
+            // foot over the caret; the rest of the bar stays bare.
+            let caret_x = (2 + i32::from(keys)) * cw;
+            for y in bar_rows.clone() {
+                for x in 0..i32::from(g.win_w) {
+                    if y >= bar_rows.end - 8 && (x - caret_x).abs() <= 2 * cw {
+                        continue;
+                    }
+                    let p = glass.at(y, x);
+                    let moved = [16u32, 8, 0]
+                        .iter()
+                        .map(|&sh| (((p >> sh) & 0xff) as i32 - ((bar >> sh) & 0xff) as i32).abs())
+                        .max()
+                        .unwrap_or(0);
+                    if moved > 12 {
+                        lit += 1;
+                    }
+                }
+            }
+        }
+        lit
+    };
+    for (pair, bar) in [
+        (DARK_PAIR, 0x0030_3030u32),
+        (SOLARIZED_PAIR, 0x0030_3030),
+        ((0x001F_2328, 0x00FF_FFFF), 0x0033_3333),
+    ] {
+        let held = lift(GlowStyle::Water, pair, bar, false);
+        assert_eq!(
+            held, 0,
+            "{held} px of the bar above lit by Water's drops ({pair:06x?})"
+        );
+        let laid = lift(GlowStyle::Water, pair, bar, true);
+        assert!(
+            laid > 0,
+            "control ({pair:06x?}): laid as they were, the drops leave the bar bare"
+        );
+    }
+}
+
+/// looks9 round 3's review of Q8: A LASER SPARK'S WHOLE DASH KEEPS OFF A
+/// FILLED ROW. A Laser spark is a dash from its head back along its live
+/// velocity; standing on a prompt's powerline bar it was a lone violet dash
+/// apart from its bolt (Solarized Dark's `context`). Typing's sparks rarely
+/// reach the bar above, so these are laid by hand on the reference dark, a
+/// bar on row 3 and the caret resting on row 4 well clear of them: one on
+/// the bar, and one falling out of it, its head a pixel past the cull's
+/// reach below the bar and its dash's trail inside it. Neither lights a
+/// pixel of the bar. Negative controls: laid as they were
+/// (`particles_on_bars`), the first lights the bar; read by its head alone
+/// (`laser_spark_head_only`), the second's dash does.
+#[test]
+fn a_laser_spark_s_whole_dash_keeps_off_a_filled_row() {
+    let g = tall_geom();
+    let (pair, bar) = (DARK_PAIR, 0x0030_3030u32);
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let (ch, cw) = (g.ch as f32, g.cw as f32);
+    let (bar_row, row, col) = (3u16, 4u16, 34u16);
+    let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+    for (r, line) in rows.iter_mut().enumerate() {
+        for cell in line.iter_mut() {
+            let ground = if r == usize::from(bar_row) {
+                bar
+            } else {
+                pair.1
+            };
+            (cell.fg, cell.bg) = (rgb(pair.0), rgb(ground));
+        }
+    }
+    let bar_bottom = f32::from(g.origin_y) + f32::from(bar_row + 1) * ch;
+    // `(x, y, vx, vy)`: flying along the bar; and falling out of it at six
+    // rows a second, its head a pixel past the cull's margin (0.14 of a row)
+    // below the bar, its dash reaching 0.05 s back (0.3 of a row) into it.
+    let standing = (10.5 * cw, bar_bottom - 0.5 * ch, 8.0 * ch, 0.0);
+    let falling = (20.5 * cw, bar_bottom + 0.14 * ch + 1.0, 0.0, 6.0 * ch);
+    // The bar's pixels the sparks change, laid at rest beside the caret.
+    let lit = |sparks: &[(f32, f32, f32, f32)], setup: &dyn Fn(&mut CursorGlow)| -> usize {
+        let frame = |with: bool| -> Glass {
+            let mut c = cfg(GlowStyle::Laser, true);
+            c.intensity = 1.0;
+            c.dark_theme = true;
+            (c.theme_fg, c.theme_bg) = pair;
+            let mut glow = CursorGlow::default();
+            setup(&mut glow);
+            let mut out = Vec::new();
+            let t0 = Instant::now();
+            glow.observe_frame_text(Some((row, col)), &rows, t0);
+            glow.tick(Some((row, col)), t0, &c, g, &mut out);
+            let t1 = t0 + Duration::from_millis(16);
+            if with {
+                for &(x0, y0, vx, vy) in sparks {
+                    glow.particles.push(Particle {
+                        x0,
+                        y0,
+                        vx,
+                        vy,
+                        gy: 0.0,
+                        life: 0.4,
+                        hue: 0.3,
+                        cov_scale: 1.0,
+                        born: t1,
+                        edge_cut: false,
+                    });
+                }
+            }
+            out.clear();
+            glow.observe_frame_text(Some((row, col)), &rows, t1);
+            glow.tick(Some((row, col)), t1, &c, g, &mut out);
+            let mut glass = Glass::new(g, pair.1);
+            glass.add_quads(glow.under_quads());
+            glass.add_quads(&out);
+            glass.add_halos(glow.halos());
+            glass
+        };
+        let (on, off) = (frame(true), frame(false));
+        let ys = i32::from(bar_row) * g.ch as i32..i32::from(bar_row + 1) * g.ch as i32;
+        ys.flat_map(|y| (0..i32::from(g.win_w)).map(move |x| (y, x)))
+            .filter(|&(y, x)| {
+                let (a, b) = (on.at(y, x), off.at(y, x));
+                [16u32, 8, 0]
+                    .iter()
+                    .any(|&sh| (((a >> sh) & 0xff) as i32 - ((b >> sh) & 0xff) as i32).abs() > 12)
+            })
+            .count()
+    };
+    let held = lit(&[standing, falling], &|_| {});
+    assert_eq!(held, 0, "{held} px of the bar lit by Laser's sparks");
+    let laid = lit(&[standing], &|glow| glow.particles_on_bars = true);
+    assert!(
+        laid > 0,
+        "control: laid as it was, the spark on the bar leaves it bare"
+    );
+    let headed = lit(&[falling], &|glow| glow.laser_spark_head_only = true);
+    assert!(
+        headed > 0,
+        "control: read by its head alone, the falling spark's dash leaves the bar bare"
+    );
+}
+
+/// looks9 Q8: Laser's crackle, laid at a random angle from a typed cell,
+/// rose onto Solarized Dark's powerline bar above the typed line as a
+/// violet arc apart from the bolt (the gallery's `context`), and one
+/// crossing a pane's edge is cut there to a lone fragment. Swept round every
+/// angle at three lengths from a cell under a filled row, and from a cell
+/// of the grid's top row, no kept crackle's corona meets the bar or leaves
+/// the grid, and a third or more of them are kept (a crackle that meets
+/// one is dropped: [`a_laser_crackle_that_meets_an_edge_is_dropped`]).
+/// Negative control: laid as they were, the crackles aimed up meet it.
+#[test]
+fn a_laser_crackle_keeps_off_a_filled_row_above() {
+    let g = tall_geom();
+    let (pair, bar) = (SOLARIZED_PAIR, 0x0030_3030u32);
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let ch = g.ch as f32;
+    let half = ch * 0.15;
+    // `(row, barred)`: under a filled row, or on the grid's top row.
+    let sweep = |(row, barred): (u16, bool), kept: bool| -> (usize, usize, usize) {
+        let col = 20u16;
+        let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+        for (r, line) in rows.iter_mut().enumerate() {
+            for cell in line.iter_mut() {
+                let ground = if barred && r + 1 == usize::from(row) {
+                    bar
+                } else {
+                    pair.1
+                };
+                (cell.fg, cell.bg) = (rgb(pair.0), rgb(ground));
+            }
+        }
+        for cell in &mut rows[usize::from(row)][2..usize::from(col)] {
+            cell.ch = 'm';
+        }
+        // The bar's foot, or the grid's top edge: the root row's top.
+        let ceiling = f32::from(g.origin_y) + f32::from(row) * ch;
+        let (x0, y0) = g.cell_center(row, col - 3);
+        let mut glow = CursorGlow::default();
+        glow.observe_frame_text(Some((row, col)), &rows, Instant::now());
+        glow.particles_on_bars = !kept;
+        let (mut laid, mut touched, mut dropped) = (0, 0, 0);
+        for i in 0..72 {
+            let (sin_a, cos_a) = (i as f32 * 5f32.to_radians()).sin_cos();
+            for len in [1.6f32, 3.0, 4.4] {
+                glow.bolts.clear();
+                glow.spawn_bolt(
+                    (x0, y0),
+                    (x0 + cos_a * len * ch, y0 + sin_a * len * ch),
+                    ch,
+                    false,
+                    Instant::now(),
+                );
+                if kept {
+                    glow.keep_crackle_off_bars(g, pair.1, row, y0);
+                }
+                let Some(b) = glow.bolts.last() else {
+                    dropped += 1;
+                    continue;
+                };
+                laid += 1;
+                let top = b
+                    .pts
+                    .as_slice()
+                    .windows(2)
+                    .flat_map(|w| (0..=8).map(move |k| w[0].1 + (w[1].1 - w[0].1) * k as f32 / 8.0))
+                    .fold(f32::INFINITY, f32::min);
+                touched += usize::from(top - half < ceiling);
+            }
+        }
+        (laid, touched, dropped)
+    };
+    for fixture in [(4u16, true), (0, false)] {
+        let (laid, touched, dropped) = sweep(fixture, true);
+        assert!(
+            laid * 3 >= laid + dropped,
+            "{fixture:?}: only {laid} crackles kept of {}",
+            laid + dropped
+        );
+        assert_eq!(
+            touched, 0,
+            "{fixture:?}: {touched} of {laid} crackles meet the bar or the edge"
+        );
+        let (old, old_touched, _) = sweep(fixture, false);
+        assert!(
+            old_touched * 4 >= old,
+            "control {fixture:?}: laid as they were, only {old_touched} of {old} crackles meet it"
+        );
+    }
+}
+
+/// looks9 round 3's Q8: A LASER CRACKLE THAT MEETS AN EDGE IS DROPPED, NOT
+/// TURNED. Turned about its root's row to aim away from the pane's bottom
+/// edge (round 2), the crackle a typed cell on a pane's next-to-last row
+/// threw down rose two rows into the air over the typed line, its root
+/// hidden among the letters: a lone violet zigzag beside the cat's word
+/// icon, apart from the caret's bolt (the gallery's `split` at `b0`). Swept
+/// round every angle at three lengths from a cell of the pane's
+/// next-to-last row, every crackle kept is the one laid, and none aimed down
+/// reaches above its row. Negative control: turned (`crackle_turned`), a
+/// tenth or more of the crackles aimed down rise over the row's top by half
+/// a row and more.
+#[test]
+fn a_laser_crackle_that_meets_an_edge_is_dropped() {
+    let g = tall_geom();
+    let pair = SOLARIZED_PAIR;
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let ch = g.ch as f32;
+    let row = (g.rows - 2) as u16;
+    let col = 20u16;
+    let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+    for line in &mut rows {
+        for cell in line.iter_mut() {
+            (cell.fg, cell.bg) = (rgb(pair.0), rgb(pair.1));
+        }
+    }
+    for cell in &mut rows[usize::from(row)][2..usize::from(col)] {
+        cell.ch = 'm';
+    }
+    let row_top = f32::from(g.origin_y) + f32::from(row) * ch;
+    let (x0, y0) = g.cell_center(row, col - 3);
+    // `(down, risen, changed)`: the crackles laid aiming down, those kept
+    // that rise half a row over the row's top, and those kept not as laid.
+    let sweep = |turned: bool| {
+        let mut glow = CursorGlow::default();
+        glow.observe_frame_text(Some((row, col)), &rows, Instant::now());
+        glow.crackle_turned = turned;
+        let (mut down, mut risen, mut changed) = (0usize, 0usize, 0usize);
+        for i in 0..72 {
+            let (sin_a, cos_a) = (i as f32 * 5f32.to_radians()).sin_cos();
+            for len in [1.6f32, 3.0, 4.4] {
+                glow.bolts.clear();
+                glow.spawn_bolt(
+                    (x0, y0),
+                    (x0 + cos_a * len * ch, y0 + sin_a * len * ch),
+                    ch,
+                    false,
+                    Instant::now(),
+                );
+                let laid = glow.bolts.last().map(|b| b.pts);
+                glow.keep_crackle_off_bars(g, pair.1, row, y0);
+                down += usize::from(sin_a > 0.2);
+                let Some(b) = glow.bolts.last() else {
+                    continue;
+                };
+                changed += usize::from(laid.is_some_and(|l| l.as_slice() != b.pts.as_slice()));
+                let top = b
+                    .pts
+                    .as_slice()
+                    .iter()
+                    .map(|p| p.1)
+                    .fold(f32::INFINITY, f32::min);
+                risen += usize::from(sin_a > 0.2 && top < row_top - 0.5 * ch);
+            }
+        }
+        (down, risen, changed)
+    };
+    let (down, risen, changed) = sweep(false);
+    assert!(down >= 60, "fixture: {down} crackles aimed down");
+    assert_eq!(changed, 0, "{changed} kept crackles are not as laid");
+    assert_eq!(
+        risen, 0,
+        "{risen} of {down} crackles aimed down rise over the typed row"
+    );
+    let (_, old_risen, _) = sweep(true);
+    assert!(
+        old_risen * 10 >= down,
+        "control: turned, only {old_risen} of {down} crackles aimed down rise over the row"
+    );
+}
+
 #[test]
 fn a_paper_fire_keeps_its_tongues_and_embers_off_a_filled_row_above() {
     // Under a prompt's dark powerline bar the bar stops paper fire's tongues and embers as a
@@ -4761,6 +5247,63 @@ fn sparkles_bloom_reads_gold_on_a_tinted_page() {
     );
 }
 
+fn sparkle_tail_on_solarized(matched: bool) -> (usize, usize) {
+    let g = tall_geom();
+    let (row, start) = (3u16, 2u16);
+    let mut host = FireHost::styled(GlowStyle::Sparkle, SOLARIZED_PAIR, true, false);
+    host.cfg.color = crate::cursor_glow::style::SPARKLE_DEFAULT_COLOR;
+    host.fx.glow.rail_unmatched = !matched;
+    let mut t = Instant::now();
+    host.frame(t, (row, start), false);
+    let (mut lit, mut green) = (0usize, 0usize);
+    let mut judge = |host: &FireHost, caret: u16| {
+        let ink: Vec<(u16, u16)> = (start..caret).map(|col| (row, col)).collect();
+        let (l, gr) = green_fire_pixels(
+            &host.fx.glow,
+            &host.fx.glow_scratch,
+            g,
+            SOLARIZED_PAIR,
+            &ink,
+        );
+        lit += l;
+        green += gr;
+    };
+    let keys = 24u16;
+    for k in 1..=keys {
+        t += Duration::from_millis(70);
+        host.frame(t, (row, start + k), true);
+        if k % 4 == 0 {
+            judge(&host, start + k);
+        }
+    }
+    for dt in [60u64, 160, 320] {
+        host.frame(t + Duration::from_millis(dt), (row, start + keys), false);
+        judge(&host, start + keys);
+    }
+    (lit, green)
+}
+
+/// SPARKLE'S TAIL FADES IN ITS GOLD ON A TINTED PAGE (looks10 L11): on Solarized Dark the
+/// rail under the typed line is laid page-matched ([`crate::cursor_glow::page_matched`]), so as
+/// its opacity fades along the tail it reads as it fades on the reference dark page, dark
+/// amber, and no pixel of the frame reads sage. Negative control: laid straight over the teal
+/// (every other light still on its night ground), the rail's amber faded by its opacity let the
+/// page's green and blue through (`#2c3c2d`, hue 124, under the trail gallery's typed line).
+#[test]
+fn sparkles_tail_fades_in_gold_on_a_tinted_page() {
+    let (lit, green) = sparkle_tail_on_solarized(true);
+    assert!(lit > 500, "fixture: the tail lights the page ({lit} px)");
+    assert_eq!(
+        green, 0,
+        "{green} of {lit} tail pixels read sage on Solarized Dark"
+    );
+    let (bare_lit, bare_green) = sparkle_tail_on_solarized(false);
+    assert!(
+        bare_green > 100,
+        "control: on the bare teal only {bare_green} of {bare_lit} tail pixels read sage"
+    );
+}
+
 /// The pixels Water lifts by a 24th or more of full scale over Solarized
 /// Dark's page behind the caret, the gallery's measure, as it types a line:
 /// the frame just after its last key.
@@ -4922,6 +5465,286 @@ fn the_rail_keeps_off_a_selection_and_the_letters() {
     );
 }
 
+/// The rainbow kitty typing `echo the quick brown fox` on a dark page in a
+/// short row (8 x 16 px, a 13 px font at 1x: the Settings card's cursor
+/// demo), the frame's text handed in, the frame 300 ms after its last key:
+/// how far its bed lifts the page (the sum over the pixels of each one's
+/// greatest channel lift) in the typed span's cells but the last four, above
+/// their baseline band, with the letter guard on and with it off. With `rounded` the rail's hairline is rounded alone
+/// (a pixel on this row, inside the judge's ring).
+fn ribbon_bed_on_a_short_row(rounded: bool) -> (usize, usize) {
+    let g = geom();
+    let (row, start) = (2u16, 2u16);
+    let word = "echo the quick brown fox";
+    let bed = |guarded: bool| {
+        let mut host = FireHost::styled(GlowStyle::RainbowKitty, DARK_PAIR, true, false);
+        host.geom = g;
+        host.text = vec![' '; g.cols];
+        host.fx.glow.v2.ribbon_mut().rail_gap_rounded = rounded;
+        host.fx.glow.set_letter_guard(guarded);
+        let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+        let mut page = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+        for cell in page.iter_mut().flatten() {
+            (cell.fg, cell.bg) = (rgb(DARK_PAIR.0), rgb(DARK_PAIR.1));
+        }
+        host.rows = Some(page);
+        let mut typed = vec![' '; g.cols];
+        for (k, c) in word.chars().enumerate() {
+            typed[usize::from(start) + k] = c;
+        }
+        host.typed = typed;
+        let mut t = Instant::now();
+        host.frame(t, (row, start), false);
+        let keys = word.len() as u16;
+        for k in 1..=keys {
+            t += Duration::from_millis(60);
+            host.frame(t, (row, start + k), true);
+        }
+        host.frame(t + Duration::from_millis(300), (row, start + keys), false);
+        let mut lit = Glass::new(g, DARK_PAIR.1);
+        lit.add_quads(host.fx.glow.under_quads());
+        lit.add_quads(&host.fx.glow_scratch);
+        lit.add_halos(host.fx.glow.halos());
+        let page = DARK_PAIR.1;
+        let ch = |c: u32, sh: u32| ((c >> sh) & 0xFF) as i32;
+        let (cw, chi) = (g.cw as i32, g.ch as i32);
+        let x_of = |col: u16| i32::from(g.origin_x) + i32::from(col) * cw;
+        let y0 = i32::from(g.origin_y) + i32::from(row) * chi;
+        (y0..y0 + chi - 4)
+            .flat_map(|y| (x_of(start)..x_of(start + keys - 4)).map(move |x| (y, x)))
+            .map(|(y, x)| {
+                let p = lit.at(y, x) & 0x00FF_FFFF;
+                [16, 8, 0]
+                    .iter()
+                    .map(|&sh| (ch(p, sh) - ch(page, sh)).max(0))
+                    .max()
+                    .unwrap_or(0) as usize
+            })
+            .sum::<usize>()
+    };
+    (bed(true), bed(false))
+}
+
+/// THE RIBBON KEEPS ITS BED OVER LETTERS ON A SHORT ROW (the Settings cursor
+/// demo's dark ribbon, settings round 2): on a 16 px row the rail's hairline
+/// is the judge's ring ([`crate::rainbow_kitty::ribbon::rail_gap_px`]), so the
+/// rail lies clear of its row's ring and the letter guard, which reads a
+/// lettered cell's whole box as ink, weighs none of it for the letters above:
+/// a row whose letters read whole keeps its bed. Negative control: the
+/// hairline rounded alone, a pixel, the guard weighed the rail's vivid ink as
+/// every cell's brightest ground and cut the row's bed with it.
+#[test]
+fn the_ribbon_keeps_its_bed_over_letters_on_a_short_row() {
+    let (bed, uncut) = ribbon_bed_on_a_short_row(false);
+    let (rounded_bed, rounded_uncut) = ribbon_bed_on_a_short_row(true);
+    assert!(
+        uncut >= 10_000,
+        "premise: the bed lifts the page by {uncut} uncut"
+    );
+    assert!(
+        bed * 10 >= uncut * 9,
+        "the guarded bed lifts the page by {bed} of the {uncut} it lifts uncut"
+    );
+    assert!(
+        rounded_bed * 10 < rounded_uncut * 8,
+        "control: with a pixel's hairline the guarded bed lifts the page by {rounded_bed} of \
+         {rounded_uncut}"
+    );
+}
+
+/// What the rainbow kitty's in-row rail lights round the `q` of `quick`
+/// ([`rail_dip`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RailDip {
+    /// The pixel columns of the typed span's rail band (its foot band and
+    /// the selection's top below it) the rail leaves dark.
+    gaps: usize,
+    /// The pixels it lifts in the foot band within the judge's ring of the
+    /// `q`'s cell.
+    at_foot: usize,
+    /// The pixels it lifts in that band on the selection's lettered cells
+    /// beside the `q` whose glyphs may reach their cell's top.
+    on_tall: usize,
+    /// The pixels it lifts on the selection's short glyphs beside the `q`
+    /// within the judge's ring of where their ink may begin
+    /// (`emit::SHORT_GLYPH_TOP_CH`).
+    on_short: usize,
+}
+
+/// The rainbow kitty typing `echo the quick brown fox` on Solarized Dark
+/// over a selection whose cells hold `below(col, q)` (`' '` blank; `q` the
+/// `q`'s column), `tune` setting its controls, the frame 300 ms after its
+/// last key ([`RailDip`]).
+fn rail_dip(below: impl Fn(usize, usize) -> char, tune: impl FnOnce(&mut CursorGlow)) -> RailDip {
+    let g = tall_geom();
+    let (row, start) = (3u16, 9u16);
+    let mut host = FireHost::styled(GlowStyle::RainbowKitty, SOLARIZED_PAIR, true, false);
+    tune(&mut host.fx.glow);
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let word = "echo the quick brown fox";
+    let q = start + word.find('q').expect("the line has a q") as u16;
+    let mut page = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+    for cell in page.iter_mut().flatten() {
+        (cell.fg, cell.bg) = (rgb(SOLARIZED_PAIR.0), rgb(SOLARIZED_PAIR.1));
+    }
+    let glyph_at = |col: usize| below(col, usize::from(q));
+    for (col, cell) in page[usize::from(row + 1)].iter_mut().enumerate() {
+        cell.bg = rgb(0x0033_415E);
+        cell.ch = glyph_at(col);
+    }
+    host.rows = Some(page);
+    let mut typed = vec![' '; g.cols];
+    for (k, c) in word.chars().enumerate() {
+        typed[usize::from(start) + k] = c;
+    }
+    host.typed = typed;
+    let mut t = Instant::now();
+    host.frame(t, (row, start), false);
+    let keys = word.len() as u16;
+    for k in 1..=keys {
+        t += Duration::from_millis(60);
+        host.frame(t, (row, start + k), true);
+    }
+    host.frame(t + Duration::from_millis(300), (row, start + keys), false);
+    let mut lit = Glass::new(g, SOLARIZED_PAIR.1);
+    lit.add_quads(host.fx.glow.under_quads());
+    lit.add_quads(&host.fx.glow_scratch);
+    lit.add_halos(host.fx.glow.halos());
+    let page = SOLARIZED_PAIR.1;
+    let ch = |c: u32, sh: u32| ((c >> sh) & 0xFF) as i32;
+    let (cw, chi) = (g.cw as i32, g.ch as i32);
+    let x_of = |col: u16| i32::from(g.origin_x) + i32::from(col) * cw;
+    let yb = i32::from(g.origin_y) + (i32::from(row) + 1) * chi;
+    let lifted = |y: i32, x: i32| {
+        let p = lit.at(y, x) & 0x00FF_FFFF;
+        [16, 8, 0].iter().any(|&sh| ch(p, sh) - ch(page, sh) >= 8)
+    };
+    let ring = crate::cursor_glow::LETTER_GUARD_RING;
+    let short_top = (super::super::emit::SHORT_GLYPH_TOP_CH * chi as f32).floor() as i32;
+    let col_of = |x: i32| ((x - i32::from(g.origin_x)) / cw) as usize;
+    // The rail's band: its own row's foot band and the dip below it.
+    let band = yb - 3..yb + ring + 4;
+    let gaps = (x_of(start)..x_of(start + keys - 1))
+        .filter(|&x| !band.clone().any(|y| lifted(y, x)))
+        .count();
+    let at_foot = (yb - 3..yb)
+        .flat_map(|y| (x_of(q) - ring..x_of(q + 1) + ring).map(move |x| (y, x)))
+        .filter(|&(y, x)| lifted(y, x))
+        .count();
+    let short = super::super::emit::is_short_glyph;
+    let beside = || (x_of(q - 3)..x_of(q + 4)).filter(|&x| glyph_at(col_of(x)) != ' ');
+    let on_tall = band
+        .clone()
+        .filter(|&y| y >= yb)
+        .flat_map(|y| beside().map(move |x| (y, x)))
+        .filter(|&(_, x)| !short(glyph_at(col_of(x))))
+        .filter(|&(y, x)| lifted(y, x))
+        .count();
+    let on_short = (yb + short_top - ring..yb + short_top + 4)
+        .flat_map(|y| beside().map(move |x| (y, x)))
+        .filter(|&(_, x)| short(glyph_at(col_of(x))))
+        .filter(|&(y, x)| lifted(y, x))
+        .count();
+    RailDip {
+        gaps,
+        at_foot,
+        on_tall,
+        on_short,
+    }
+}
+
+/// [`rail_dip`] over a selection whose letters leave blank the cells under
+/// the `q` and a cell each side (`s` on the rest), parted or not: `(gaps,
+/// at_foot, on_letters)`, the last the pixels lifted on the selection's
+/// lettered cells beside the `q`.
+fn rail_under_a_descender(parted: bool) -> (usize, usize, usize) {
+    let r = rail_dip(
+        |col, q| {
+            if (q - 1..=q + 1).contains(&col) {
+                ' '
+            } else {
+                's'
+            }
+        },
+        |glow| glow.v2.ribbon_mut().row_rail_parted = parted,
+    );
+    (r.gaps, r.at_foot, r.on_tall + r.on_short)
+}
+
+/// The gallery `context`'s selection line, `src/trail.rs:412  a selected
+/// line under the prompt`, laid with its `2` two cells before the `q` above
+/// it: the cells under the `q` and the one before it blank, the `a` under
+/// the cell after it.
+fn gallery_selection(col: usize, q: usize) -> char {
+    const LINE: &str = "src/trail.rs:412  a selected line under the prompt";
+    let two = LINE.find('2').expect("the line has a 2");
+    (col + two + 2)
+        .checked_sub(q)
+        .and_then(|i| LINE.chars().nth(i))
+        .unwrap_or(' ')
+}
+
+/// THE ROW RAIL DIPS UNDER A DESCENDER (looks9 Q9): over Solarized Dark's
+/// selection in the gallery's `context` the rainbow kitty's in-row rail
+/// parted round the `q` of `quick` and broke there. Where the selection's
+/// cells under the `q` are blank it dips under the row into their top and
+/// stays one rail: no pixel column of the typed span's rail band is dark,
+/// it lifts nothing in the foot band within the judge's ring of the `q`, and
+/// it adds no light on the selection's lettered cells beside the dip.
+/// Negative control: parted as it was, the rail breaks.
+#[test]
+fn the_row_rail_dips_under_a_descender() {
+    let (gaps, at_foot, on_letters) = rail_under_a_descender(false);
+    let (parted_gaps, _, parted_letters) = rail_under_a_descender(true);
+    assert_eq!(
+        gaps, 0,
+        "the rail leaves {gaps} px columns of its band dark"
+    );
+    assert_eq!(
+        at_foot, 0,
+        "the rail lifts {at_foot} px within the q's ring"
+    );
+    // The row's own glow feathers into the selection's top either way.
+    assert_eq!(
+        on_letters, parted_letters,
+        "the dip lifts {on_letters} px on the selection's letters ({parted_letters} parted)"
+    );
+    assert!(
+        parted_gaps >= 10,
+        "control: parted round the q, the rail leaves only {parted_gaps} columns dark"
+    );
+}
+
+/// looks9 Q9, round 2: THE ROW RAIL DIPS PAST A SHORT GLYPH BELOW. In the
+/// gallery's `context` on Solarized Dark the selection holds `412  a` under
+/// `quick`: the `a` lies under the cell after the `q`'s, and the dip, which
+/// kept off every lettered cell below whole, ended at the `q`'s stem and
+/// left a 10 px gap past it. Over that selection the rail is one rail (no
+/// pixel column of the typed span's rail band dark), lifts nothing within
+/// the judge's ring of the `q`'s cell in the foot band, nor within the ring
+/// of where a short glyph's ink may begin below, and lights the tall glyphs'
+/// cells below (the `2`) no more than parted. Negative control: with every
+/// lettered cell kept whole, the dip stops at the `a` and the rail breaks.
+#[test]
+fn the_row_rail_dips_past_a_short_glyph_below() {
+    let dip = rail_dip(gallery_selection, |_| {});
+    let parted = rail_dip(gallery_selection, |glow| {
+        glow.v2.ribbon_mut().row_rail_parted = true;
+    });
+    assert_eq!(dip.gaps, 0, "the rail breaks: {dip:?}");
+    assert_eq!(dip.at_foot, 0, "the rail lights the q's ring: {dip:?}");
+    assert_eq!(
+        (dip.on_tall, dip.on_short),
+        (parted.on_tall, parted.on_short),
+        "the dip lights the letters below: {dip:?}, parted {parted:?}"
+    );
+    let whole = rail_dip(gallery_selection, |glow| glow.letters_whole_cells = true);
+    assert!(
+        whole.gaps >= 8,
+        "control: with every lettered cell whole the rail reads {whole:?}"
+    );
+}
+
 /// The glass after `keys` keys typed at 60 ms from column 2 of row 3 by a
 /// [`FireHost`] of `style` on `pair`, `tune` setting its controls, and the
 /// frame 16 ms after the last key; `enter` then moves the caret to the next
@@ -4983,8 +5806,10 @@ fn lifted_px(
 /// rail in the air below the typed line was a straight cyan bar, Beam's tube
 /// in another hue; its spine now falls and rises below the row as the crest
 /// swells, never into it. Read down each column of the rail's band under
-/// the line's last five cells, the brightest pixel's row wanders over three
-/// pixels or more. Negative control: the straight rail's stays within a pixel.
+/// the line's last five cells (two cells' columns of it at least: the foam
+/// breaks where it will, looks9 round 2's Q3), the brightest pixel's row
+/// wanders over three pixels or more. Negative control: the straight rail's
+/// stays within a pixel.
 #[test]
 fn water_s_lit_rail_swells() {
     let g = tall_geom();
@@ -5008,7 +5833,7 @@ fn water_s_lit_rail_swells() {
             }
         }
         assert!(
-            peaks.len() >= 3 * cw as usize,
+            peaks.len() >= 2 * cw as usize,
             "fixture: the rail lies under the line ({} columns)",
             peaks.len()
         );
@@ -5027,12 +5852,14 @@ fn water_s_lit_rail_swells() {
 /// its last word, detached from the caret on the row below. The frame after
 /// the Enter lights none of the band under the typed line's last two cells
 /// (the Enter's own leap lights the air further back, as Beam's does).
-/// Negative control: laid under every row, the dash is there.
+/// Negative control: laid under every row, the dash is there. The line is 22
+/// keys long, a crest of the foam under its last two cells (under 24 keys'
+/// round 2's foam breaks, looks9 round 2's Q3).
 #[test]
 fn water_s_lit_rail_leaves_with_the_caret() {
     let g = tall_geom();
     let dash = |any_row: bool| {
-        let lit = typed_glass(GlowStyle::Water, SOLARIZED_PAIR, 24, true, |glow| {
+        let lit = typed_glass(GlowStyle::Water, SOLARIZED_PAIR, 22, true, |glow| {
             glow.water_rail_any_row = any_row;
         });
         let (cw, ch) = (g.cw as i32, g.ch as i32);
@@ -5040,7 +5867,7 @@ fn water_s_lit_rail_leaves_with_the_caret() {
             &lit,
             SOLARIZED_PAIR.1,
             4 * ch..4 * ch + ch / 3,
-            24 * cw..26 * cw,
+            22 * cw..24 * cw,
             0,
             60,
         )
@@ -5048,12 +5875,428 @@ fn water_s_lit_rail_leaves_with_the_caret() {
     };
     let (left, kept) = (dash(false), dash(true));
     assert!(
-        kept >= 40,
+        kept >= 30,
         "control: laid under every row, the typed line's rail lights {kept} px"
     );
     assert!(
         left <= 2,
         "after the Enter the typed line's rail lights {left} px of {kept}"
+    );
+}
+
+/// Water's lit rail under the typed line's last five cells, typed 24 keys
+/// on Solarized Dark (`crisp`: looks8's rail, [`CursorGlow::water_rail_crisp`]; `pale`:
+/// looks9's sea foam, [`CursorGlow::water_foam_pale`]),
+/// read in the air below the row as each pixel's lift over the page:
+/// `(chroma, steepest, runs, drops)`, the most chroma any well-lit pixel's
+/// lift carries for its brightness, the steepest one-pixel rise of any
+/// column's light as a share of its peak, the runs of lit columns, and the
+/// droplets (lit blobs of a few pixels standing alone).
+fn water_rail_reading(crisp: bool, pale: bool) -> (f32, f32, usize, usize) {
+    let g = tall_geom();
+    let lit = typed_glass(GlowStyle::Water, SOLARIZED_PAIR, 24, false, |glow| {
+        glow.water_rail_crisp = crisp;
+        glow.water_foam_pale = pale;
+    });
+    let (cw, ch) = (g.cw as i32, g.ch as i32);
+    let page = SOLARIZED_PAIR.1;
+    let lift = |y: i32, x: i32| {
+        let p = lit.at(y, x);
+        let l = |sh: u32| (((p >> sh) & 0xFF) as i32 - ((page >> sh) & 0xFF) as i32).max(0);
+        [l(16), l(8), l(0)]
+    };
+    let bright = |y: i32, x: i32| lift(y, x).into_iter().max().unwrap_or(0);
+    let (xs, ys) = (21 * cw..26 * cw, 4 * ch..4 * ch + ch * 3 / 4);
+    let (w, h) = (xs.len(), ys.len());
+    let at = |i: usize| (ys.start + (i / w) as i32, xs.start + (i % w) as i32);
+    // Lit blobs, 4-connected: a droplet is one of a few pixels.
+    let on: Vec<bool> = (0..w * h).map(|i| bright(at(i).0, at(i).1) >= 20).collect();
+    let mut blob = vec![usize::MAX; on.len()];
+    let mut sizes = Vec::new();
+    for first in 0..on.len() {
+        if !on[first] || blob[first] != usize::MAX {
+            continue;
+        }
+        let id = sizes.len();
+        let (mut stack, mut size) = (vec![first], 0usize);
+        blob[first] = id;
+        while let Some(i) = stack.pop() {
+            size += 1;
+            let (r, c) = (i / w, i % w);
+            let near = [
+                (r > 0).then(|| i - w),
+                (r + 1 < h).then(|| i + w),
+                (c > 0).then(|| i - 1),
+                (c + 1 < w).then(|| i + 1),
+            ];
+            for j in near.into_iter().flatten() {
+                if on[j] && blob[j] == usize::MAX {
+                    blob[j] = id;
+                    stack.push(j);
+                }
+            }
+        }
+        sizes.push(size);
+    }
+    let drop = |i: usize| blob[i] != usize::MAX && sizes[blob[i]] <= 24;
+    let drops = sizes.iter().filter(|&&n| n <= 24).count();
+    // The crest: every pixel but the droplets'.
+    let (mut chroma, mut steepest) = (0.0f32, 0.0f32);
+    let mut lit_cols = Vec::with_capacity(w);
+    for c in 0..w {
+        let col: Vec<i32> = (0..h)
+            .map(|r| r * w + c)
+            .map(|i| if drop(i) { 0 } else { bright(at(i).0, at(i).1) })
+            .collect();
+        let peak = col.iter().copied().max().unwrap_or(0);
+        lit_cols.push(peak >= 20);
+        if peak >= 60 {
+            let step = col
+                .windows(2)
+                .map(|v| (v[1] - v[0]).abs())
+                .max()
+                .unwrap_or(0);
+            steepest = steepest.max(step as f32 / peak as f32);
+        }
+        for i in (0..h).map(|r| r * w + c).filter(|&i| !drop(i)) {
+            let l = lift(at(i).0, at(i).1);
+            let (hi, lo) = (
+                l.into_iter().max().unwrap_or(0),
+                l.into_iter().min().unwrap_or(0),
+            );
+            if hi >= 40 {
+                chroma = chroma.max((hi - lo) as f32 / hi as f32);
+            }
+        }
+    }
+    let runs = lit_cols.windows(2).filter(|v| v[1] && !v[0]).count() + usize::from(lit_cols[0]);
+    (chroma, steepest, runs, drops)
+}
+
+/// WATER'S LIT RAIL IS FOAM (looks9 Q3), WATERY CYAN AND SOFT (looks10 L5): on Solarized
+/// Dark its rail under the typed line was a crisp saturated 2-3 px cyan sine that read as a
+/// spell-check squiggle (`solarized-dark/water-dark.t0`); looks9 made it a pale sea-foam aqua
+/// whose crests rose from the page in two pixels, near-white hard-topped arcs (`#83d5db`). It
+/// is foam on a body of water in watery cyan: the most chroma a well-lit pixel's lift carries
+/// is between 0.45 and 0.75 of its brightness (its hue held, never the squiggle's whole
+/// chroma), and soft (no column's light rises by three tenths of its peak in one pixel), and
+/// its body keeps the rail whole (one run of lit columns; broken into runs with a droplet in
+/// each break, looks9 round 2's foam was a dash-dot rule,
+/// [`water_s_foam_rides_one_body_of_water`]; its crests break as
+/// [`water_s_foam_never_keeps_one_pitch`] reads). Negative controls: looks8's rail is
+/// saturated and steep, and looks9's sea foam pale and steeper.
+#[test]
+fn water_s_lit_rail_is_foam() {
+    let (chroma, steepest, runs, ..) = water_rail_reading(false, false);
+    let crisp = water_rail_reading(true, false);
+    let pale = water_rail_reading(false, true);
+    assert!(
+        (0.45..=0.75).contains(&chroma),
+        "the foam's light carries chroma {chroma:.2} of its brightness"
+    );
+    assert!(
+        steepest <= 0.3,
+        "the foam's light rises {steepest:.2} of its peak in one pixel"
+    );
+    assert_eq!(runs, 1, "the foam's body breaks into {runs} runs");
+    assert!(
+        crisp.0 >= 0.9 && crisp.1 >= 0.6,
+        "control: looks8's rail (chroma, steepest, runs, drops) reads {crisp:?}"
+    );
+    assert!(
+        pale.0 < 0.45 && pale.1 > 0.3,
+        "control: looks9's sea foam (chroma, steepest, runs, drops) reads {pale:?}"
+    );
+}
+
+/// Water's foam laid on a flat rail 60 cells long at the tall cell (13 x 26
+/// px), its swell as the gallery's (`even`: looks9 round 1's foam,
+/// [`crate::cursor_glow::bed::BedScratch::foam_even`]): `(pitch, heights,
+/// sizes, bare)`, the longest over the shortest distance between successive
+/// troughs of its spine, the spread in px of its crests' heights, the
+/// largest over the smallest droplet, and the share of its open breaks (a
+/// trough whose light the foam takes) that shed no droplet. The rail's last
+/// three cells, where it feathers in to the caret, are left out.
+fn foam_on_a_flat_rail(even: bool) -> (f32, f32, f32, f32) {
+    use crate::cursor_glow::bed::{FOAM_SWELL_VARY, foam_rail, swell_rail};
+    let g = tall_geom();
+    let (cw, ch) = (g.cw as f32, g.ch as f32);
+    let vert = |x: f32| aterm_render::RibbonVertex {
+        x,
+        spine: 0.0,
+        up: 2.0,
+        dn: 2.0,
+        core_up: 1.0,
+        core_dn: 1.0,
+        color: 0x0000_c9d7,
+        cov: 1.0,
+        lift: 0.0,
+        lift_span: 0.0,
+    };
+    let mut verts = vec![vert(0.0), vert(60.0 * cw)];
+    let wave = (0.14 * ch, 1.8 / cw, 0.0);
+    let vary = if even { 0.0 } else { FOAM_SWELL_VARY };
+    swell_rail(&mut verts, wave, cw, vary);
+    let spines: Vec<f32> = verts.iter().map(|v| v.spine).collect();
+    let mut drops = Vec::new();
+    foam_rail(&mut verts, wave, (ch, cw), (even, false), &mut drops);
+    let reach = 57.0 * cw;
+    let (mut troughs, mut crests) = (Vec::new(), Vec::new());
+    for i in 1..verts.len() - 1 {
+        if verts[i].x > reach {
+            break;
+        }
+        let (a, v, b) = (spines[i - 1], spines[i], spines[i + 1]);
+        if v > a && v >= b {
+            troughs.push(i);
+        }
+        if v < a && v <= b {
+            crests.push(v);
+        }
+    }
+    let pitches: Vec<f32> = troughs
+        .windows(2)
+        .map(|w| verts[w[1]].x - verts[w[0]].x)
+        .collect();
+    let spread = |v: &[f32]| {
+        let (lo, hi) = v
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), &p| (lo.min(p), hi.max(p)));
+        (lo, hi)
+    };
+    let (short, long) = spread(&pitches);
+    let (low, high) = spread(&crests);
+    let sizes: Vec<f32> = drops.iter().filter(|d| d.0 <= reach).map(|d| d.2).collect();
+    let (least, most) = spread(&sizes);
+    let open: Vec<f32> = troughs
+        .iter()
+        .filter(|&&i| verts[i].cov < 0.5)
+        .map(|&i| verts[i].x)
+        .collect();
+    let bare = open
+        .iter()
+        .filter(|&&x| !drops.iter().any(|d| (d.0 - x).abs() < 0.5 * cw))
+        .count();
+    (
+        long / short,
+        high - low,
+        most / least,
+        bare as f32 / open.len().max(1) as f32,
+    )
+}
+
+/// looks9 round 2's Q3: WATER'S FOAM NEVER KEEPS ONE PITCH. On Solarized
+/// Dark round 1's foam broke at every trough a like arc's length apart, a
+/// like droplet under each, its crests of one height: a dash-dot rule. On a
+/// flat rail 60 cells long its troughs fall closer and farther apart (the
+/// longest pitch 1.4 times the shortest or more), its crests stand a pixel
+/// or more apart in height, its droplets run from small to large (the
+/// largest 1.5 times the smallest or more) and one in ten or more of its
+/// open breaks sheds none. Negative control: round 1's even foam keeps one pitch
+/// (within 1.2, the quarter-cell vertices'), one height (within 0.3 px), one
+/// droplet and sheds one under every break.
+#[test]
+fn water_s_foam_never_keeps_one_pitch() {
+    let (pitch, heights, sizes, bare) = foam_on_a_flat_rail(false);
+    let even = foam_on_a_flat_rail(true);
+    assert!(pitch >= 1.4, "the foam's pitch varies {pitch:.2} times");
+    assert!(
+        heights >= 1.0,
+        "the foam's crests stand {heights:.2} px apart"
+    );
+    assert!(sizes >= 1.5, "the foam's droplets vary {sizes:.2} times");
+    assert!(bare >= 0.1, "{bare:.2} of the foam's breaks shed nothing");
+    assert!(
+        even.0 <= 1.2 && even.1 <= 0.3 && even.2 <= 1.0 && even.3 == 0.0,
+        "control: round 1's foam (pitch, heights, sizes, bare) reads {even:?}"
+    );
+}
+
+/// The longest run of unlit columns (lifted under 10 over the page) in the
+/// air below the typed row from six cells behind the caret to a cell and a
+/// half behind it, Water typed `keys` keys on Solarized Dark (`bodiless`:
+/// its crests and droplets alone, [`CursorGlow::water_foam_bodiless`]).
+fn foam_longest_gap(keys: u16, bodiless: bool) -> i32 {
+    let g = tall_geom();
+    let (cw, ch) = (g.cw as i32, g.ch as i32);
+    let page = SOLARIZED_PAIR.1;
+    let lit = typed_glass(GlowStyle::Water, SOLARIZED_PAIR, keys, false, |glow| {
+        glow.water_foam_bodiless = bodiless;
+    });
+    let caret = 2 + i32::from(keys);
+    let lift = |x: i32| {
+        (4 * ch..4 * ch + ch * 3 / 4)
+            .map(|y| {
+                let p = lit.at(y, x);
+                [16u32, 8, 0]
+                    .map(|sh| (((p >> sh) & 0xFF) as i32 - ((page >> sh) & 0xFF) as i32).max(0))
+                    .into_iter()
+                    .max()
+                    .unwrap_or(0)
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    let (mut run, mut longest) = (0, 0);
+    for x in (caret - 6) * cw..caret * cw - cw * 3 / 2 {
+        run = if lift(x) < 10 { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    longest
+}
+
+/// looks9 round 3's Q3: WATER'S FOAM RIDES ONE BODY OF WATER. On Solarized
+/// Dark round 2's foam was still pale crests broken over the troughs, a
+/// droplet between them at one height under the row: a dash-dot rule at
+/// 1x. Its crests now ride a soft swell of water, whole along the rail and
+/// fading downward ([`super::bed::FOAM_BODY`]): typed 20 to 36 keys, no
+/// column of the rail's light from six cells behind the caret to a cell and
+/// a half behind it is unlit (none lifted under 10 over the page). Negative
+/// control: the crests and droplets alone (`water_foam_bodiless`) leave a
+/// gap of four columns or more on every key.
+#[test]
+fn water_s_foam_rides_one_body_of_water() {
+    for keys in (20u16..=36).step_by(4) {
+        let (gap, bare) = (foam_longest_gap(keys, false), foam_longest_gap(keys, true));
+        assert_eq!(gap, 0, "{keys} keys: the foam leaves {gap} columns unlit");
+        assert!(
+            bare >= 4,
+            "{keys} keys: control: the crests alone leave only {bare} columns unlit"
+        );
+    }
+}
+
+/// How deep below the typed row Water's light reaches (the deepest pixel
+/// lifted 10 or more over its ground), from six cells behind the caret to a
+/// cell and a half behind it, typed 24 keys on Solarized Dark with the row
+/// under the typed one bare of letters, on the page's ground or `filled`
+/// with a ground apart from the page's (Solarized's `base01`, a selection or
+/// a bar; `text_only`: the body reads the row's letters alone,
+/// [`CursorGlow::water_body_text_only`]). The rail lies under the row, as
+/// it does where the frame names no feet for its row: laid in its own row
+/// over a filled one ([`super::bed::BedShape::row_rail`]), it keeps its body
+/// off the fill whatever depth the body takes.
+fn water_body_depth(filled: bool, text_only: bool) -> i32 {
+    let g = tall_geom();
+    let (row, start, keys) = (3u16, 2u16, 24u16);
+    let pair = SOLARIZED_PAIR;
+    let fill = 0x0058_6E75u32;
+    let mut host = FireHost::styled(GlowStyle::Water, pair, true, false);
+    host.fx.glow.water_body_text_only = text_only;
+    host.fx.glow.set_bed_row_rails(false);
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let mut page = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+    for (r, line) in page.iter_mut().enumerate() {
+        for cell in line.iter_mut() {
+            let ground = if filled && r == usize::from(row + 1) {
+                fill
+            } else {
+                pair.1
+            };
+            (cell.fg, cell.bg) = (rgb(pair.0), rgb(ground));
+        }
+    }
+    host.rows = Some(page);
+    let mut t = Instant::now();
+    host.frame(t, (row, start), false);
+    for k in 1..=keys {
+        t += Duration::from_millis(60);
+        host.frame(t, (row, start + k), true);
+    }
+    t += Duration::from_millis(16);
+    host.frame(t, (row, start + keys), false);
+    let ground = if filled { fill } else { pair.1 };
+    let mut lit = Glass::new(g, ground);
+    lit.add_quads(host.fx.glow.under_quads());
+    let (cw, ch) = (g.cw as i32, g.ch as i32);
+    let caret = i32::from(start + keys);
+    let bottom = i32::from(row + 1) * ch;
+    let xs = (caret - 6) * cw..caret * cw - cw * 3 / 2;
+    (bottom..bottom + ch)
+        .filter(|&y| !lifted_px(&lit, ground, y..y + 1, xs.clone(), 8, 10).is_empty())
+        .map(|y| y - bottom + 1)
+        .max()
+        .unwrap_or(0)
+}
+
+/// looks9 round 3's Q3: WATER'S BODY TAKES ITS DEPTH ONLY OVER AIR. Under a
+/// row bare of letters on the page's ground the body of water fades out a
+/// half row down ([`super::bed::FOAM_BODY`]); under a filled row (a
+/// selection, a bar) bare of letters it keeps to the rail's own depth, four
+/// pixels or more shallower. Negative control: read by its letters alone
+/// (`water_body_text_only`), the filled row takes the body as deep as air.
+#[test]
+fn water_s_body_takes_its_depth_only_over_air() {
+    let (air, filled) = (
+        water_body_depth(false, false),
+        water_body_depth(true, false),
+    );
+    assert!(
+        filled + 4 <= air,
+        "over a filled row the body reaches {filled} px, over air {air} px"
+    );
+    let old = water_body_depth(true, true);
+    assert!(
+        old + 1 >= air,
+        "control: read by its letters alone the filled row takes {old} px of {air}"
+    );
+}
+
+/// The light of Water's foam at the caret, typed `keys` keys on Solarized
+/// Dark (`head_cut`: round 1's foam, its last arc whole into the caret,
+/// [`CursorGlow::water_foam_head_cut`]): the brightest lift over the page in
+/// the last four columns of the caret's cell, in the air below the row, as
+/// a share of the brightest anywhere there between the caret and twelve
+/// cells behind it.
+fn foam_light_at_the_caret(keys: u16, head_cut: bool) -> f32 {
+    let g = tall_geom();
+    let lit = typed_glass(GlowStyle::Water, SOLARIZED_PAIR, keys, false, |glow| {
+        glow.water_foam_head_cut = head_cut;
+    });
+    let (cw, ch) = (g.cw as i32, g.ch as i32);
+    let caret = 2 + i32::from(keys);
+    let page = SOLARIZED_PAIR.1;
+    let bright = |x: i32| {
+        (4 * ch..4 * ch + ch * 3 / 4)
+            .map(|y| {
+                let p = lit.at(y, x);
+                [16u32, 8, 0]
+                    .map(|sh| (((p >> sh) & 0xFF) as i32 - ((page >> sh) & 0xFF) as i32).max(0))
+                    .into_iter()
+                    .max()
+                    .unwrap_or(0)
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    let end = (caret + 1) * cw;
+    let head = (end - 4..end).map(bright).max().unwrap_or(0);
+    let all = ((caret - 12) * cw..end).map(bright).max().unwrap_or(0);
+    head as f32 / all.max(1) as f32
+}
+
+/// looks9 round 2's Q3: WATER'S FOAM FEATHERS IN TO THE CARET. On Solarized
+/// Dark round 1's foam ran its last arc at full light to the caret cell's
+/// edge and stopped there, cut flat. Typed 20 to 36 keys, the foam's light
+/// in the last four columns of the caret's cell is never over half the
+/// brightest behind it. Negative control: round 1's whole last arc
+/// (`water_foam_head_cut`) brings 0.85 of it there or more on some key.
+#[test]
+fn water_s_foam_feathers_in_to_the_caret() {
+    let worst = |cut: bool| {
+        (20u16..=36)
+            .step_by(2)
+            .map(|k| foam_light_at_the_caret(k, cut))
+            .fold(0.0f32, f32::max)
+    };
+    let (feathered, cut) = (worst(false), worst(true));
+    assert!(
+        feathered <= 0.5,
+        "the foam brings {feathered:.2} of its light to the caret's edge"
+    );
+    assert!(
+        cut >= 0.85,
+        "control: round 1's last arc brings {cut:.2} of its light there"
     );
 }
 
@@ -5087,6 +6330,104 @@ fn comet_reads_on_the_reference_dark() {
         icy >= 2 * old.max(20),
         "the icy tail lights {icy} px, the old rail {old}"
     );
+}
+
+/// looks9 Q2, round 2: COMET'S ICY TAIL TAKES ITS DEPTH OVER A BARE ROW. Held
+/// to the leading over the next row's letters even where that row is bare,
+/// the tail under the typed line was a 2 px hairline on the reference dark.
+/// Over a bare row, under the typed line's last four cells, the tail lights
+/// a band at least 6 px deep (blue lifted 40 or more), twice what the leading
+/// allows. Negative control: held to the leading (`comet_tail_hairline`), it
+/// lights 3 px or less.
+#[test]
+fn comet_s_icy_tail_takes_its_depth_over_a_bare_row() {
+    let g = tall_geom();
+    let depth = |hairline: bool| {
+        let lit = typed_glass(GlowStyle::Comet, DARK_PAIR, 16, false, |glow| {
+            glow.comet_tail_hairline = hairline;
+        });
+        let (cw, ch) = (g.cw as i32, g.ch as i32);
+        (14 * cw..18 * cw)
+            .map(|x| lifted_px(&lit, DARK_PAIR.1, 4 * ch..4 * ch + ch / 2, x..x + 1, 0, 40).len())
+            .max()
+            .unwrap_or(0)
+    };
+    let (deep, hairline) = (depth(false), depth(true));
+    assert!(deep >= 6, "the icy tail lights a band {deep} px deep");
+    assert!(
+        hairline <= 3,
+        "control: held to the leading the tail lights {hairline} px"
+    );
+}
+
+/// How deep below the typed row Comet's icy tail reaches on the reference
+/// dark (the deepest pixel row of its bed and rail, laid on the page, under
+/// the typed line's last four cells lifted 40 or more in blue), typed 16 keys with the row under the
+/// typed one bare of letters, on the page's ground or on `fill` (a
+/// selection's or a powerline bar's; `text_only`: the tail reads that row's
+/// letters alone, [`CursorGlow::comet_tail_text_only`]).
+fn comet_tail_depth(fill: Option<u32>, text_only: bool) -> i32 {
+    let g = tall_geom();
+    let (row, start, keys) = (3u16, 2u16, 16u16);
+    let pair = DARK_PAIR;
+    let mut host = FireHost::styled(GlowStyle::Comet, pair, true, false);
+    host.fx.glow.comet_tail_text_only = text_only;
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let mut page = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+    for (r, line) in page.iter_mut().enumerate() {
+        for cell in line.iter_mut() {
+            let ground = match fill {
+                Some(f) if r == usize::from(row + 1) => f,
+                _ => pair.1,
+            };
+            (cell.fg, cell.bg) = (rgb(pair.0), rgb(ground));
+        }
+    }
+    host.rows = Some(page);
+    let mut t = Instant::now();
+    host.frame(t, (row, start), false);
+    for k in 1..=keys {
+        t += Duration::from_millis(60);
+        host.frame(t, (row, start + k), true);
+    }
+    t += Duration::from_millis(16);
+    host.frame(t, (row, start + keys), false);
+    let mut lit = Glass::new(g, pair.1);
+    lit.add_quads(host.fx.glow.under_quads());
+    let (cw, ch) = (g.cw as i32, g.ch as i32);
+    let bottom = i32::from(row + 1) * ch;
+    let xs = 14 * cw..18 * cw;
+    (bottom..bottom + ch / 2)
+        .filter(|&y| !lifted_px(&lit, pair.1, y..y + 1, xs.clone(), 0, 40).is_empty())
+        .map(|y| y - bottom + 1)
+        .max()
+        .unwrap_or(0)
+}
+
+/// looks9 round 3's review: COMET'S ICY TAIL TAKES ITS DEPTH ONLY OVER AIR.
+/// Over a row bare of letters on the page's ground the tail grows to its
+/// whole depth ([`super::bed::ICY_AIR_RAIL_GROW`]); under a filled row bare
+/// of letters, a selection's (`#264f78`) or a powerline bar's (`#303030`),
+/// it keeps to the leading's depth, as over letters, two pixels or more
+/// shallower than over air, and Water's body (since looks9 round 3's Q3)
+/// does the same. Negative control: read by its letters alone
+/// (`comet_tail_text_only`), the filled row takes the tail as deep as air.
+#[test]
+fn comet_s_icy_tail_takes_its_depth_only_over_air() {
+    let air = comet_tail_depth(None, false);
+    assert!(air >= 6, "over air the tail reaches only {air} px");
+    for fill in [0x0026_4F78u32, 0x0030_3030] {
+        let filled = comet_tail_depth(Some(fill), false);
+        assert!(
+            filled + 2 <= air,
+            "over a filled row ({fill:06x}) the tail reaches {filled} px, over air {air} px"
+        );
+        let old = comet_tail_depth(Some(fill), true);
+        assert!(
+            old + 1 >= air,
+            "control ({fill:06x}): read by its letters alone the filled row takes {old} px of {air}"
+        );
+    }
 }
 
 /// WATER'S DROPS BEAD ON A DARK PAGE (looks8 round 2's K4): on the
@@ -5126,7 +6467,9 @@ fn water_s_drops_bead_on_a_dark_page() {
 /// `echo quick fox`, then jumps back onto the `q` (an arrow key, a vim motion) and rests.
 /// Punched, every one of the 12 frames after the move differed from v0.28's (the review of
 /// looks8 round 3). Negative control: on paper, where Classic is guarded, the punch cuts the
-/// caret's letter out of its light.
+/// caret's letter out of its landing ring's rim laid over the letters as it was
+/// ([`crate::classic_wake::ClassicWake::ring_cut`]; whole and off the letters, looks10 L12,
+/// the rim is not drawn inside the word).
 #[test]
 fn classic_s_dark_spectrum_keeps_its_bytes_with_the_caret_on_a_letter() {
     use crate::cursor_glow::CaretLetterLaw;
@@ -5137,6 +6480,7 @@ fn classic_s_dark_spectrum_keeps_its_bytes_with_the_caret_on_a_letter() {
         host.fx
             .glow
             .set_caret_letter_law(CaretLetterLaw::LightOff, law_on);
+        host.fx.glow.classic.ring_cut = pair == PAPER;
         let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
         let mut page = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
         for cell in page.iter_mut().flatten() {
@@ -5282,4 +6626,892 @@ fn the_frame_s_night_grounds_lie_under_the_ramps_light_too() {
             "{style:?}: the ramped frame composites off the quads' in {differ} px"
         );
     }
+}
+
+/// The light Comet typing 20 keys on GitHub Light at `gap` ms a key
+/// (`short`: its wedge as looks8 laid it), the frame after the last key:
+/// `(reach, worst)`, the cells behind the caret whose counters its tail
+/// darkens by 24 or more, and the least contrast of the typed letters.
+fn paper_comet_tail(gap: u64, short: bool) -> (usize, f32) {
+    let g = tall_geom();
+    let pair = (0x001F_2328u32, 0x00FF_FFFFu32);
+    let (row, start, keys) = (4u16, 2u16, 20u16);
+    let (glow, out) = style_burst_on(
+        GlowStyle::Comet,
+        pair,
+        (keys, gap),
+        (None, None),
+        true,
+        &|glow| {
+            glow.comet_light_tail_short = short;
+        },
+    );
+    let mut glass = Glass::new(g, pair.1);
+    glass.add_quads(glow.under_quads());
+    let caret = start + keys;
+    for col in start..caret {
+        for (y, x) in glyph(g, row, col).0 {
+            glass.px[y as usize * glass.w + x as usize] = pair.0;
+        }
+    }
+    glass.add_quads(&out);
+    glass.add_halos(glow.halos());
+    let (cw, ch) = (g.cw as i32, g.ch as i32);
+    let yc = i32::from(row) * ch + ch / 2;
+    // A cell's counters (between its strokes) at the row's middle.
+    let dark = |back: u16| {
+        let x0 = i32::from(caret - back) * cw;
+        [4, 8]
+            .iter()
+            .map(|&dx| {
+                let p = glass.at(yc + 1, x0 + dx);
+                [16u32, 8, 0]
+                    .iter()
+                    .map(|&sh| 255 - ((p >> sh) & 0xff) as i32)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .min()
+            .unwrap_or(0)
+    };
+    let reach = (1..keys).take_while(|&back| dark(back) >= 24).count();
+    let worst = (start..caret)
+        .map(|col| {
+            let (i, c) = glyph(g, row, col);
+            ratio(&glass, &i, &c)
+        })
+        .fold(f32::INFINITY, f32::min);
+    (reach, worst)
+}
+
+/// THE PAPER COMET'S TAIL HAS PRESENCE (looks9 Q2): on paper Comet was
+/// mostly a soft blue blob, its tail's light gone two cells behind the
+/// caret (`comet-light.t0`). Typing on GitHub Light, its tail darkens the
+/// counters of five cells or more behind the caret, and every typed letter
+/// keeps 4.5:1. Negative control: the wedge as looks8 laid it reaches three
+/// or fewer.
+#[test]
+fn the_paper_comet_s_tail_has_presence() {
+    for gap in [60u64, 120] {
+        let (reach, worst) = paper_comet_tail(gap, false);
+        let (short, _) = paper_comet_tail(gap, true);
+        assert!(reach >= 5, "{gap} ms: the tail reaches {reach} cells");
+        assert!(
+            worst >= 4.5,
+            "{gap} ms: a letter in the tail reads {worst:.2}:1"
+        );
+        assert!(
+            short <= 3,
+            "{gap} ms: control: looks8's tail reaches {short} cells"
+        );
+    }
+}
+
+/// The light Comet (`tube`: laid as looks9 laid it) typing 20 keys on GitHub Light, the
+/// frame after the last key, lights alone on the page: for the cells one and four behind the
+/// caret, the rows its tail lights in the cell's middle column and the hue of its spine there.
+fn paper_comet_girth(tube: bool) -> [(usize, f32); 2] {
+    let g = tall_geom();
+    let pair = (0x001F_2328u32, 0x00FF_FFFFu32);
+    let (row, start, keys) = (4u16, 2u16, 20u16);
+    let (glow, out) = style_burst_on(
+        GlowStyle::Comet,
+        pair,
+        (keys, 60),
+        (None, None),
+        true,
+        &|glow| {
+            glow.comet_light_tube = tube;
+        },
+    );
+    let mut glass = Glass::new(g, pair.1);
+    glass.add_quads(glow.under_quads());
+    glass.add_quads(&out);
+    let (cw, ch) = (g.cw as i32, g.ch as i32);
+    let caret = i32::from(start + keys);
+    [1, 4].map(|back| {
+        let x = (caret - back) * cw + cw / 2;
+        let rows: Vec<i32> = (i32::from(row) * ch..(i32::from(row) + 1) * ch)
+            .filter(|&y| {
+                let p = glass.at(y, x);
+                [16u32, 8, 0]
+                    .iter()
+                    .any(|&sh| 255 - ((p >> sh) & 0xff) >= 16)
+            })
+            .collect();
+        let spine = rows
+            .iter()
+            .copied()
+            .min_by_key(|&y| {
+                let p = glass.at(y, x);
+                [16u32, 8, 0]
+                    .iter()
+                    .map(|&sh| (p >> sh) & 0xff)
+                    .sum::<u32>()
+            })
+            .unwrap_or(i32::from(row) * ch + ch / 2);
+        (rows.len(), crate::color_math::rgb2hsv(glass.at(spine, x)).0)
+    })
+}
+
+/// looks10 L4, THE PAPER COMET IS A COMET, NOT BEAM'S TUBE: on paper Comet's tail laid an
+/// even wedge in its colour alone, and beside Beam's tube it read as the same light with a
+/// ring. Its tail is now a needle of ice: four cells behind the caret it lights under a third
+/// of the rows it lights one cell behind, and its spine there reads its colour turned toward
+/// ice ([`CursorGlow::comet_paper_ice`]), six degrees or more toward its cyan. Negative
+/// control: laid as looks9 laid it, the tail four cells back is a third of its head's girth or
+/// more, in the head's own hue.
+#[test]
+fn the_paper_comet_s_tail_is_a_needle_of_ice() {
+    let [(head_rows, head_hue), (tail_rows, tail_hue)] = paper_comet_girth(false);
+    let toward_ice = |h: f32| {
+        let d = (h - CursorGlow::COMET_LIGHT_ICE_HUE).abs();
+        d.min(360.0 - d)
+    };
+    assert!(tail_rows > 0, "fixture: the tail lights four cells back");
+    assert!(
+        tail_rows * 3 < head_rows,
+        "four cells back the tail lights {tail_rows} rows, one back {head_rows}"
+    );
+    assert!(
+        toward_ice(head_hue) - toward_ice(tail_hue) >= 6.0,
+        "the tail's spine reads hue {tail_hue:.1}, its head's {head_hue:.1}"
+    );
+    let [(tube_head, tube_head_hue), (tube_tail, tube_tail_hue)] = paper_comet_girth(true);
+    assert!(
+        tube_tail * 3 >= tube_head
+            && (toward_ice(tube_head_hue) - toward_ice(tube_tail_hue)).abs() < 3.0,
+        "control: looks9's wedge lights {tube_tail} rows of {tube_head} four cells back, hue {tube_tail_hue:.1} of {tube_head_hue:.1}"
+    );
+}
+
+/// looks9 round 2's Q8: A LASER STRIKE STAYS IN ITS PANE. On paper a jump's
+/// strike threw a fork at the pane's bottom edge, cut there by the divider
+/// to a lone violet fragment (the gallery's `split`, `b0`). Forged 400 times
+/// along jumps on the grid's last rows, under a filled bar of a row above
+/// that the jump does not cross, no fork and no channel of a strike reaches,
+/// its corona's girth and all, past the grid's edge or onto the bar.
+/// Negative control: laid as forged (`strike_forks_cut`), a tenth or more
+/// of the strikes throw a fork past the edge.
+#[test]
+fn a_laser_strike_stays_in_its_pane() {
+    let g = tall_geom();
+    let ch = g.ch as f32;
+    let half = ch * 0.15;
+    let (pair, bar) = (SOLARIZED_PAIR, 0x0030_3030u32);
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let (row, bar_row) = ((g.rows - 2) as u16, (g.rows - 4) as u16);
+    let mut page = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+    for (r, line) in page.iter_mut().enumerate() {
+        for cell in line.iter_mut() {
+            let ground = if r == usize::from(bar_row) {
+                bar
+            } else {
+                pair.1
+            };
+            (cell.fg, cell.bg) = (rgb(pair.0), rgb(ground));
+        }
+    }
+    let (top, bot) = (
+        f32::from(g.origin_y),
+        f32::from(g.origin_y) + g.rows as f32 * ch,
+    );
+    let (left, right) = (
+        f32::from(g.origin_x),
+        f32::from(g.origin_x) + (g.cols * g.cw) as f32,
+    );
+    let (bar_top, bar_bot) = (
+        top + f32::from(bar_row) * ch,
+        top + f32::from(bar_row + 1) * ch,
+    );
+    let strikes = |cut: bool| {
+        let mut glow = CursorGlow::default();
+        glow.observe_frame_text(Some((row, 4)), &page, Instant::now());
+        glow.strike_forks_cut = cut;
+        let (mut out, mut forks) = (0usize, 0usize);
+        for i in 0..400u32 {
+            let (r0, r1) = (row + (i % 2) as u16, row + ((i / 2) % 2) as u16);
+            let from = g.cell_center(r0, 2 + (i % 7) as u16);
+            let to = g.cell_center(r1, 9 + (i % 29) as u16);
+            let now = Instant::now();
+            glow.bolts.clear();
+            glow.rng = i.wrapping_mul(2_654_435_761) | 1;
+            glow.spawn_bolt(from, to, ch, true, now);
+            glow.keep_strike_in_grid(g, pair.1, (r0, r1), now);
+            forks += glow.bolts.iter().filter(|b| b.branch).count();
+            let past = glow.bolts.iter().any(|b| {
+                b.pts.as_slice().windows(2).any(|w| {
+                    (0..=8).any(|k| {
+                        let f = k as f32 / 8.0;
+                        let (x, y) = (
+                            w[0].0 + (w[1].0 - w[0].0) * f,
+                            w[0].1 + (w[1].1 - w[0].1) * f,
+                        );
+                        y + half > bot
+                            || y - half < top
+                            || x < left
+                            || x > right
+                            || (y + half > bar_top && y - half < bar_bot)
+                    })
+                })
+            });
+            out += usize::from(past);
+        }
+        (out, forks)
+    };
+    let (kept, forks) = strikes(false);
+    let (cut, _) = strikes(true);
+    assert_eq!(
+        kept, 0,
+        "{kept} of 400 strikes leave the pane or meet the bar"
+    );
+    assert!(forks >= 400, "fixture: the strikes keep {forks} forks");
+    assert!(
+        cut >= 40,
+        "control: laid as forged, only {cut} of 400 strikes leave the pane"
+    );
+}
+
+/// looks9 round 3's review: A LASER STRIKE AND CRACKLE STAY IN A SPLIT'S
+/// PANE. In a split the caret's pane has its edge inside the window's grid,
+/// where the GUI clips the glow to the pane; the keepers read the window's
+/// edge alone, so a fork or crackle that crossed the divider was cut there to
+/// a fragment. The window here is 16 rows by 48 columns and the caret's pane
+/// its top-left 8 rows by 24 columns (the frame hands the pane's cells at
+/// its offset, as the GUI's split does). Forged 400 times along jumps on the
+/// pane's last rows, no strike reaches past the pane's right edge, or, its
+/// corona's girth and all, past its bottom edge; swept round every angle at three lengths
+/// from the pane's next-to-last row, no kept crackle does. Negative control:
+/// the pane's edge unread (`bolt_window_edge`), a tenth or more of the
+/// strikes and of the crackles aimed down cross it.
+#[test]
+fn a_laser_strike_and_crackle_stay_in_a_split_s_pane() {
+    let pane_g = tall_geom();
+    let g = Geom {
+        rows: pane_g.rows * 2,
+        win_h: pane_g.win_h * 2,
+        ..pane_g
+    };
+    let ch = g.ch as f32;
+    let half = ch * 0.15;
+    let pair = SOLARIZED_PAIR;
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let pane_cols = pane_g.cols / 2;
+    let mut pane = vec![vec![aterm_core::terminal::RenderCell::default(); pane_cols]; pane_g.rows];
+    for line in &mut pane {
+        for cell in line.iter_mut() {
+            (cell.fg, cell.bg) = (rgb(pair.0), rgb(pair.1));
+        }
+    }
+    let (bot, right) = (
+        f32::from(g.origin_y) + pane_g.rows as f32 * ch,
+        f32::from(g.origin_x) + (pane_cols * g.cw) as f32,
+    );
+    let crosses = |b: &Bolt| {
+        b.pts.as_slice().windows(2).any(|w| {
+            (0..=8).any(|k| {
+                let f = k as f32 / 8.0;
+                let (x, y) = (
+                    w[0].0 + (w[1].0 - w[0].0) * f,
+                    w[0].1 + (w[1].1 - w[0].1) * f,
+                );
+                y + half > bot || x > right
+            })
+        })
+    };
+    let row = (pane_g.rows - 2) as u16;
+    let strikes = |window_edge: bool| {
+        let mut glow = CursorGlow::default();
+        glow.observe_frame_text_at(Some((row, 4)), &pane, ((0, 0), pane_cols), Instant::now());
+        glow.bolt_window_edge = window_edge;
+        let mut out = 0usize;
+        for i in 0..400u32 {
+            let (r0, r1) = (row + (i % 2) as u16, row + ((i / 2) % 2) as u16);
+            let from = g.cell_center(r0, 2 + (i % 7) as u16);
+            let to = g.cell_center(r1, 9 + (i % 13) as u16);
+            let now = Instant::now();
+            glow.bolts.clear();
+            glow.rng = i.wrapping_mul(2_654_435_761) | 1;
+            glow.spawn_bolt(from, to, ch, true, now);
+            glow.keep_strike_in_grid(g, pair.1, (r0, r1), now);
+            out += usize::from(glow.bolts.iter().any(crosses));
+        }
+        out
+    };
+    let crackles = |window_edge: bool| {
+        let mut glow = CursorGlow::default();
+        glow.observe_frame_text_at(Some((row, 20)), &pane, ((0, 0), pane_cols), Instant::now());
+        glow.bolt_window_edge = window_edge;
+        let (x0, y0) = g.cell_center(row, 17);
+        let (mut down, mut out) = (0usize, 0usize);
+        for i in 0..72 {
+            let (sin_a, cos_a) = (i as f32 * 5f32.to_radians()).sin_cos();
+            for len in [1.6f32, 3.0, 4.4] {
+                glow.bolts.clear();
+                glow.spawn_bolt(
+                    (x0, y0),
+                    (x0 + cos_a * len * ch, y0 + sin_a * len * ch),
+                    ch,
+                    false,
+                    Instant::now(),
+                );
+                glow.keep_crackle_off_bars(g, pair.1, row, y0);
+                down += usize::from(sin_a > 0.2);
+                out += usize::from(glow.bolts.last().is_some_and(crosses));
+            }
+        }
+        (down, out)
+    };
+    let kept = strikes(false);
+    assert_eq!(kept, 0, "{kept} of 400 strikes cross the pane's edge");
+    let cut = strikes(true);
+    assert!(
+        cut >= 40,
+        "control: the pane's edge unread, only {cut} of 400 strikes cross it"
+    );
+    let (down, kept) = crackles(false);
+    assert!(down >= 60, "fixture: {down} crackles aimed down");
+    assert_eq!(kept, 0, "{kept} kept crackles cross the pane's edge");
+    let (_, cut) = crackles(true);
+    assert!(
+        cut * 10 >= down,
+        "control: the pane's edge unread, only {cut} of {down} crackles aimed down cross it"
+    );
+}
+
+/// A colour's CIELAB chroma C*ab (sRGB, D65 white), as the lab's `trail-hue`
+/// judge reads it.
+fn cielab_chroma(c: u32) -> f64 {
+    let lin = |v: u32| {
+        let v = f64::from(v) / 255.0;
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let (r, g, b) = (lin((c >> 16) & 0xff), lin((c >> 8) & 0xff), lin(c & 0xff));
+    let x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047;
+    let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    let z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883;
+    let f = |t: f64| {
+        if t > 0.008856 {
+            t.cbrt()
+        } else {
+            7.787 * t + 16.0 / 116.0
+        }
+    };
+    let (a, bb) = (500.0 * (f(x) - f(y)), 200.0 * (f(y) - f(z)));
+    a.hypot(bb)
+}
+
+/// The burst's first keys (`$ echo the quick`, a key per 50 ms) typed on
+/// Solarized Dark's teal under a blank row, at seven phases of the flames'
+/// flicker and ten frames a key: the pixels the fire moves off the bare page,
+/// and those of them that read olive (hue 66..180° at a saturation of 0.2 and
+/// a value of 0.12, as the lab's `trail-hue` names green, at a CIELAB chroma
+/// of 15 or more: five under its visibility floor of 20, for the rounding of
+/// the GPU's blend).
+fn burst_olive_on_solarized(guarded: bool) -> (usize, usize) {
+    use aterm_core::terminal::RenderCell;
+    let g = tall_geom();
+    let (row, start) = (4u16, 2u16);
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let (mut lit_px, mut olive) = (0usize, 0usize);
+    for phase_ms in [0u64, 7, 13, 21, 29, 37, 43] {
+        let mut host = FireHost::styled(GlowStyle::Fire, SOLARIZED_PAIR, true, false);
+        host.fx.glow.flame_grounds_guarded = guarded;
+        host.text[0] = '$';
+        host.typed = std::iter::repeat_n(' ', 2)
+            .chain("echo the quick".chars())
+            .collect();
+        let mut rows = vec![vec![RenderCell::default(); g.cols]; g.rows];
+        for line in &mut rows {
+            for cell in line.iter_mut() {
+                (cell.fg, cell.bg) = (rgb(SOLARIZED_PAIR.0), rgb(SOLARIZED_PAIR.1));
+            }
+        }
+        host.rows = Some(rows);
+        let mut t = Instant::now() + Duration::from_millis(phase_ms);
+        host.frame(t, (row, start), false);
+        for k in 1..=14u16 {
+            let caret = start + k;
+            for sub in 0..10u64 {
+                host.frame(t + Duration::from_millis(5 * sub), (row, caret), sub == 0);
+                let mut lit = Glass::new(g, SOLARIZED_PAIR.1);
+                lit.add_quads(host.fx.glow.under_quads());
+                lit.add_fire_patches(host.fx.glow.patches());
+                let mut bare = Glass::new(g, SOLARIZED_PAIR.1);
+                for col in std::iter::once(0).chain(start..caret) {
+                    for (y, x) in glyph(g, row, col).0 {
+                        lit.px[y as usize * lit.w + x as usize] = SOLARIZED_PAIR.0;
+                        bare.px[y as usize * bare.w + x as usize] = SOLARIZED_PAIR.0;
+                    }
+                }
+                lit.add_quads(&host.fx.glow_scratch);
+                lit.add_halos(host.fx.glow.halos());
+                for (&p, &q) in lit.px.iter().zip(&bare.px) {
+                    let (p, q) = (p & 0x00FF_FFFF, q & 0x00FF_FFFF);
+                    if p == q {
+                        continue;
+                    }
+                    lit_px += 1;
+                    let (h, s, v) = crate::color_math::rgb2hsv(p);
+                    if s >= 0.2
+                        && v >= 0.12
+                        && (66.0..180.0).contains(&h)
+                        && cielab_chroma(p) >= 15.0
+                    {
+                        olive += 1;
+                    }
+                }
+            }
+            t += Duration::from_millis(50);
+        }
+    }
+    (lit_px, olive)
+}
+
+/// FIRE IS NEVER GREEN, OVER A LETTER'S RING INCLUDED (looks10 round 2,
+/// WIDEN): the flames' night grounds are laid after the letter guard
+/// ([`CursorGlow::ground_the_frame`]), which cuts no flame, so the burst's
+/// flames over `echo` on Solarized Dark's teal burn over their whole ground
+/// and no pixel of them reads olive. Negative control: the grounds join the
+/// under stream before the guard, which cuts them to a fifth over the
+/// letters' ring, and the foot of a flame over the `o` reads olive on the
+/// teal (`#575d3a` in the round's `burst` key3 frame).
+#[test]
+fn a_flame_s_ground_is_not_cut_by_the_letter_guard() {
+    let (lit, olive) = burst_olive_on_solarized(false);
+    assert!(lit > 10_000, "fixture: the fire lights the page ({lit} px)");
+    assert_eq!(
+        olive, 0,
+        "{olive} of {lit} fire pixels read olive on Solarized Dark"
+    );
+    let (lit_cut, olive_cut) = burst_olive_on_solarized(true);
+    assert!(
+        olive_cut >= 40,
+        "control: with its grounds cut by the guard only {olive_cut} of {lit_cut} fire pixels read olive"
+    );
+}
+
+/// What a dark fire leaves on a ` aterm ` powerline bar beside the caret
+/// ([`bar_beside_the_burst`]).
+struct BarRead {
+    /// The bar letters' worst reading: an ink pixel against a ground pixel of
+    /// its row within two of it (the lab's `RING_REACH`).
+    worst: f32,
+    /// The same on the bare bar.
+    bare: f32,
+    /// Pixels of the bar the fire lit to a hue the lab's `trail-hue` names
+    /// green, as it reads one: a channel more than 24 off the bare bar,
+    /// 66..180° at a saturation of 0.2 and a value of 0.12, not within 12° of
+    /// the cyan's own hue, at a CIELAB chroma of 15 or more (five under its
+    /// visibility floor, for the rounding of the GPU's blend).
+    green: usize,
+    /// The same on the page past the bar.
+    page_green: usize,
+    /// Pixels of the row and the bar the fire lit (a channel more than 24
+    /// off the bare one).
+    lit: usize,
+}
+
+/// The burst's first keys (`echo the quick`, a key per 50 ms) typed on the
+/// dark page `pair` after a ` aterm ` powerline bar (black on cyan) under a
+/// filled powerline row, as the render suite's context scene lays them, at
+/// seven phases of the flames' flicker and ten frames a key. `on_bar`: the
+/// trail burns back onto the bar ([`CursorGlow::fire_burns_on_filled`]);
+/// `grounds_unguarded`: the flames' grounds on the bar pass the letter guard
+/// ([`CursorGlow::flame_bar_grounds_unguarded`]); `cores_ungrounded`: the
+/// flames' gold cores lay no night ground
+/// ([`CursorGlow::fire_cores_ungrounded`]).
+fn bar_beside_the_burst(
+    pair: (u32, u32),
+    (on_bar, grounds_unguarded, cores_ungrounded): (bool, bool, bool),
+) -> BarRead {
+    use aterm_core::terminal::RenderCell;
+    const BAR_INK: u32 = 0x0000_0000;
+    const BAR_GROUND: u32 = 0x0000_CDCD;
+    // The prompt's own powerline above, filled to the row's end: the
+    // flames keep to the caret's row.
+    const ABOVE_GROUND: u32 = 0x0030_3030;
+    let g = tall_geom();
+    let (row, start) = (4u16, 8u16);
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let bar = 0..7u16;
+    let letters = 1..6u16;
+    let worst_ring = |glass: &Glass, col: u16| {
+        let ink = glyph(g, row, col).0;
+        let mut worst = f32::INFINITY;
+        for &(y, x) in &ink {
+            for dx in -2..=2 {
+                if !ink.contains(&(y, x + dx)) {
+                    worst = worst.min(ratio(glass, &[(y, x)], &[(y, x + dx)]));
+                }
+            }
+        }
+        worst
+    };
+    let (x_bar, y_row) = (
+        i32::from(g.origin_x) + i32::from(bar.end) * g.cw as i32,
+        i32::from(g.origin_y) + i32::from(row) * g.ch as i32,
+    );
+    let mut read = BarRead {
+        worst: f32::INFINITY,
+        bare: f32::INFINITY,
+        green: 0,
+        page_green: 0,
+        lit: 0,
+    };
+    for phase_ms in [0u64, 7, 13, 21, 29, 37, 43] {
+        let mut host = FireHost::styled(GlowStyle::Fire, pair, true, false);
+        host.fx.glow.fire_burns_on_filled = on_bar;
+        host.fx.glow.flame_bar_grounds_unguarded = grounds_unguarded;
+        host.fx.glow.fire_cores_ungrounded = cores_ungrounded;
+        for (col, ch) in (1usize..).zip("aterm".chars()) {
+            host.text[col] = ch;
+        }
+        host.typed = std::iter::repeat_n(' ', usize::from(start))
+            .chain("echo the quick".chars())
+            .collect();
+        let mut rows = vec![vec![RenderCell::default(); g.cols]; g.rows];
+        for line in &mut rows {
+            for cell in line.iter_mut() {
+                (cell.fg, cell.bg) = (rgb(pair.0), rgb(pair.1));
+            }
+        }
+        for col in bar.clone() {
+            let cell = &mut rows[usize::from(row)][usize::from(col)];
+            (cell.fg, cell.bg) = (rgb(BAR_INK), rgb(BAR_GROUND));
+        }
+        for cell in &mut rows[usize::from(row) - 1] {
+            (cell.fg, cell.bg) = (rgb(0x00FF_FFFF), rgb(ABOVE_GROUND));
+        }
+        host.rows = Some(rows);
+        let mut t = Instant::now() + Duration::from_millis(phase_ms);
+        // The prompt lands: the caret leaves the row's head for the cell
+        // after the bar and rests there, then the keys come.
+        host.frame(t, (row, 0), false);
+        for rest in 1..=50u64 {
+            host.frame(t + Duration::from_millis(16 * rest), (row, start), false);
+        }
+        t += Duration::from_millis(800);
+        for k in 1..=14u16 {
+            let caret = start + k;
+            for sub in 0..10u64 {
+                host.frame(t + Duration::from_millis(5 * sub), (row, caret), sub == 0);
+                let mut lit = Glass::new(g, pair.1);
+                let mut bare = Glass::new(g, pair.1);
+                for glass in [&mut lit, &mut bare] {
+                    for y in y_row..y_row + g.ch as i32 {
+                        for x in i32::from(g.origin_x)..x_bar {
+                            glass.px[y as usize * glass.w + x as usize] = BAR_GROUND;
+                        }
+                    }
+                }
+                lit.add_quads(host.fx.glow.under_quads());
+                lit.add_fire_patches(host.fx.glow.patches());
+                for col in letters.clone() {
+                    for (y, x) in glyph(g, row, col).0 {
+                        lit.px[y as usize * lit.w + x as usize] = BAR_INK;
+                        bare.px[y as usize * bare.w + x as usize] = BAR_INK;
+                    }
+                }
+                lit.add_quads(&host.fx.glow_scratch);
+                lit.add_halos(host.fx.glow.halos());
+                for col in letters.clone() {
+                    read.worst = read.worst.min(worst_ring(&lit, col));
+                    read.bare = read.bare.min(worst_ring(&bare, col));
+                }
+                for y in y_row..y_row + g.ch as i32 {
+                    for x in i32::from(g.origin_x)..i32::from(g.win_w) {
+                        let (p, q) = (lit.at(y, x) & 0x00FF_FFFF, bare.at(y, x) & 0x00FF_FFFF);
+                        if (0..3)
+                            .all(|i| ((p >> (8 * i)) & 0xff).abs_diff((q >> (8 * i)) & 0xff) <= 24)
+                        {
+                            continue;
+                        }
+                        read.lit += 1;
+                        let (h, s, v) = crate::color_math::rgb2hsv(p);
+                        let (hq, sq, vq) = crate::color_math::rgb2hsv(q);
+                        let own_hue = sq >= 0.2 && vq >= 0.12 && {
+                            let d = (h - hq).abs() % 360.0;
+                            d.min(360.0 - d) <= 12.0
+                        };
+                        if s >= 0.2
+                            && v >= 0.12
+                            && (66.0..180.0).contains(&h)
+                            && cielab_chroma(p) >= 15.0
+                            && !own_hue
+                        {
+                            if x < x_bar {
+                                read.green += 1;
+                            } else {
+                                read.page_green += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            t += Duration::from_millis(50);
+        }
+    }
+    read
+}
+
+/// FIRE IS NEVER GREEN, BESIDE A BAR (looks10 round 2): a dark flame's trail
+/// burns back over its head's own ground and stops at another
+/// ([`CursorGlow::flame_cell_off_ground`]), so the burst's first keys after a
+/// ` aterm ` bar on dark and on Solarized Dark leave no flame on the bar's
+/// cyan, which its additive light would turn mint, and every bar letter
+/// keeps its bare reading. Negative control: the trail burns back onto the
+/// bar, and its flame over the cyan reads green (1736 px on dark, 7364 on
+/// Solarized Dark; `#4afed3` and `#a5fda8` in the render suite's context
+/// scene at its first key).
+#[test]
+fn a_dark_flame_s_trail_keeps_off_a_bar_beside_it() {
+    for (name, pair) in [("dark", DARK_PAIR), ("solarized", SOLARIZED_PAIR)] {
+        let kept = bar_beside_the_burst(pair, (false, false, false));
+        assert!(
+            kept.lit > 5_000,
+            "fixture: {name}: the fire lights the row ({} px)",
+            kept.lit
+        );
+        assert_eq!(
+            kept.green, 0,
+            "{name}: {} of {} fire pixels read green on the bar",
+            kept.green, kept.lit
+        );
+        assert!(
+            kept.worst >= 4.5,
+            "{name}: a bar letter reads {:.2} (bare {:.2})",
+            kept.worst,
+            kept.bare
+        );
+        let on_bar = bar_beside_the_burst(pair, (true, false, false));
+        assert!(
+            on_bar.green >= 40,
+            "control: {name}: burning onto the bar, only {} of {} fire pixels read green there",
+            on_bar.green,
+            on_bar.lit
+        );
+    }
+}
+
+/// A FLAME'S GROUND ON A BAR IS THE LETTER GUARD'S (looks10 round 2): a
+/// flame's night ground keeps the page's lightness, so it passes the letter
+/// guard on the page ([`a_flame_s_ground_is_not_cut_by_the_letter_guard`]);
+/// on a filled cell it would darken the bar round the letters, and there it
+/// joins the under stream for the guard to cut. The trail held onto a
+/// ` aterm ` bar on Solarized Dark (`fire_burns_on_filled`, as a flame lies
+/// on a filled cell a caret typed on), every bar letter keeps the bar
+/// (6.14:1 at worst, 10.61 bare). Negative control: the ground on the bar
+/// passes the guard too, and the cyan round the `m` under the burst's first
+/// flame darkens to 1.67:1 (the render suite's context scene read 2.75:1
+/// there).
+#[test]
+fn a_flame_s_ground_on_a_bar_is_cut_over_its_letters() {
+    let kept = bar_beside_the_burst(SOLARIZED_PAIR, (true, false, false));
+    assert!(
+        kept.bare >= 7.0,
+        "fixture: the bare bar's letters read {:.2}",
+        kept.bare
+    );
+    assert!(
+        kept.worst >= 4.5,
+        "a bar letter under the burst reads {:.2} (bare {:.2})",
+        kept.worst,
+        kept.bare
+    );
+    let cut = bar_beside_the_burst(SOLARIZED_PAIR, (true, true, false));
+    assert!(
+        cut.worst < 4.5,
+        "control: with the bar's grounds past the guard its worst letter still reads {:.2}",
+        cut.worst
+    );
+}
+
+/// FIRE IS NEVER GREEN, A CORE INCLUDED (looks10 round 2): a dark flame's
+/// gold core lays its night ground as the flame's slices do, so at the
+/// burst's first keys after a ` aterm ` bar on Solarized Dark no pixel of the
+/// fire on the page reads green. Negative control: the cores lay no ground,
+/// and where the slice under a core is held to nothing (the tongue's foot
+/// beside the first letter) its dim gold lies on the bare teal and reads
+/// olive: 1337 pixels (`#5b7e49`, hue 100, C* 34, in the render suite's
+/// context scene).
+#[test]
+fn a_dark_flame_s_core_lays_its_night_ground() {
+    let kept = bar_beside_the_burst(SOLARIZED_PAIR, (false, false, false));
+    assert!(
+        kept.lit > 5_000,
+        "fixture: the fire lights the row ({} px)",
+        kept.lit
+    );
+    assert_eq!(
+        kept.page_green, 0,
+        "{} of {} fire pixels read green on the page",
+        kept.page_green, kept.lit
+    );
+    let bare = bar_beside_the_burst(SOLARIZED_PAIR, (false, false, true));
+    assert!(
+        bare.page_green >= 40,
+        "control: with ungrounded cores only {} of {} fire pixels read green on the page",
+        bare.page_green,
+        bare.lit
+    );
+}
+
+/// CIELAB chroma (C*ab, D65) of `0x00RRGGBB`: how colourful it reads, the
+/// trail gallery's `trail-hue` visibility measure.
+fn lab_chroma(p: u32) -> f32 {
+    let lin = |v: u32| {
+        let c = v as f32 / 255.0;
+        if c <= 0.040_45 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let (r, g, b) = (lin((p >> 16) & 0xff), lin((p >> 8) & 0xff), lin(p & 0xff));
+    let x = (0.412_4 * r + 0.357_6 * g + 0.180_5 * b) / 0.950_47;
+    let y = 0.212_6 * r + 0.715_2 * g + 0.072_2 * b;
+    let z = (0.019_3 * r + 0.119_2 * g + 0.950_5 * b) / 1.088_83;
+    let f = |t: f32| {
+        if t > 0.008_856 {
+            t.cbrt()
+        } else {
+            7.787 * t + 16.0 / 116.0
+        }
+    };
+    let (fx, fy, fz) = (f(x), f(y), f(z));
+    (500.0 * (fx - fy)).hypot(200.0 * (fy - fz))
+}
+
+/// Sparkle typing the trail gallery's `echo the quick brown fox` on Solarized
+/// Dark on its grid (14 x 26 px cells), then left to fade, a frame every 5 ms
+/// to 600 ms after the last key: `(frames lit, lit px, off-gold px, frames
+/// with any)`. A pixel is off gold as `trail-hue` reads it (a channel off the
+/// bare page's by more than 24, HSV saturation 0.2 and value 0.12 or more, a
+/// hue outside 20..66 degrees, not within 12 degrees of the page's own hue,
+/// outside the caret's cell), at a chroma floor of
+/// 10 (`trail-hue`'s is 20: the CPU glass composes the fade a little greyer
+/// than the GPU, and the gallery's rust read 19 to 21 there). With `held`
+/// off, the page-matched rail is laid at the least opacity whatever its hue.
+fn sparkle_rail_fade_on_solarized(held: bool) -> (usize, usize, usize, usize) {
+    let g = Geom {
+        cw: 14,
+        ch: 26,
+        rows: 8,
+        cols: 48,
+        origin_x: 0,
+        origin_y: 0,
+        win_w: 672,
+        win_h: 208,
+        head: 0,
+    };
+    let (row, start) = (3u16, 2u16);
+    let mut host = FireHost::styled(GlowStyle::Sparkle, SOLARIZED_PAIR, true, false);
+    host.geom = g;
+    host.text = vec![' '; g.cols];
+    host.cfg.color = crate::cursor_glow::style::SPARKLE_DEFAULT_COLOR;
+    host.fx.glow.rail_hue_free = !held;
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let mut page = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+    for cell in page.iter_mut().flatten() {
+        (cell.fg, cell.bg) = (rgb(SOLARIZED_PAIR.0), rgb(SOLARIZED_PAIR.1));
+    }
+    host.rows = Some(page);
+    let word = "echo the quick brown fox";
+    let mut typed = vec![' '; g.cols];
+    for (k, c) in word.chars().enumerate() {
+        typed[usize::from(start) + k] = c;
+    }
+    host.typed = typed.clone();
+    let mut t = Instant::now();
+    host.frame(t, (row, start), false);
+    let keys = word.len() as u16;
+    for k in 1..=keys {
+        t += Duration::from_millis(60);
+        host.frame(t, (row, start + k), true);
+    }
+    let caret = start + keys;
+    let ink: Vec<(u16, u16)> = (start..caret)
+        .filter(|&c| typed[usize::from(c)] != ' ')
+        .map(|c| (row, c))
+        .collect();
+    let (cx, cy) = (
+        usize::from(caret) * g.cw..usize::from(caret + 1) * g.cw,
+        usize::from(row) * g.ch..usize::from(row + 1) * g.ch,
+    );
+    let (mut frames, mut lit_px, mut off_px, mut off_frames) = (0, 0, 0, 0);
+    for dt in (0u64..=600).step_by(5) {
+        host.frame(t + Duration::from_millis(dt), (row, caret), false);
+        let mut lit = Glass::new(g, SOLARIZED_PAIR.1);
+        lit.add_quads(host.fx.glow.under_quads());
+        let mut bare = Glass::new(g, SOLARIZED_PAIR.1);
+        for &(r, c) in &ink {
+            for (y, x) in glyph(g, r, c).0 {
+                lit.px[y as usize * lit.w + x as usize] = SOLARIZED_PAIR.0;
+                bare.px[y as usize * bare.w + x as usize] = SOLARIZED_PAIR.0;
+            }
+        }
+        lit.add_quads(&host.fx.glow_scratch);
+        lit.add_halos(host.fx.glow.halos());
+        let (mut n, mut off) = (0, 0);
+        for (i, (&p, &q)) in lit.px.iter().zip(&bare.px).enumerate() {
+            let (x, y) = (i % lit.w, i / lit.w);
+            if cx.contains(&x) && cy.contains(&y) {
+                continue;
+            }
+            let (p, q) = (p & 0x00FF_FFFF, q & 0x00FF_FFFF);
+            let ch = |c: u32, sh: u32| ((c >> sh) & 0xff) as i32;
+            if ![16, 8, 0]
+                .iter()
+                .any(|&sh| (ch(p, sh) - ch(q, sh)).abs() > 24)
+            {
+                continue;
+            }
+            n += 1;
+            let (h, s, v) = crate::color_math::rgb2hsv(p);
+            let (hq, sq, vq) = crate::color_math::rgb2hsv(q);
+            let gap = (h - hq).abs().min(360.0 - (h - hq).abs());
+            let own = sq >= 0.2 && vq >= 0.12 && gap <= 12.0;
+            if s >= 0.2 && v >= 0.12 && !own && !(20.0..66.0).contains(&h) && lab_chroma(p) >= 10.0
+            {
+                off += 1;
+            }
+        }
+        frames += usize::from(n > 0);
+        lit_px += n;
+        off_px += off;
+        off_frames += usize::from(off > 0);
+    }
+    (frames, lit_px, off_px, off_frames)
+}
+
+/// SPARKLE'S RAIL FADES BY ITS LIGHT, IN GOLD, TO ITS LAST FRAME ON A TINTED
+/// PAGE (looks10 round 3's hue ruling): every 5 ms of the fade after a typed
+/// line on Solarized Dark, no pixel the trail lights reads a hue outside the
+/// gold family. Negative control: each of the page-matched rail's lights laid
+/// at the least opacity that reaches its reading over the page
+/// ([`crate::cursor_glow::raster::page_matched`]) carried the teal's missing
+/// red, and over the bed under the rail its last frames read rust (the
+/// gallery's `#774f42`, hue 14, under the caret 197 ms after the last key).
+#[test]
+fn sparkles_rail_fades_in_gold_to_its_last_frame_on_a_tinted_page() {
+    let (frames, lit, off, off_frames) = sparkle_rail_fade_on_solarized(true);
+    assert!(
+        frames > 100 && lit > 50_000,
+        "fixture: the fade lights {frames} frames, {lit} px"
+    );
+    assert_eq!(
+        (off, off_frames),
+        (0, 0),
+        "Sparkle's fade on Solarized Dark lit {off} px off gold in {off_frames} of {frames} frames"
+    );
+    let (_, bare_lit, bare_off, bare_frames) = sparkle_rail_fade_on_solarized(false);
+    assert!(
+        bare_off >= 40 && bare_frames >= 3,
+        "control: at the least opacity only {bare_off} of {bare_lit} px in {bare_frames} frames read off gold"
+    );
 }

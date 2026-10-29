@@ -157,7 +157,7 @@ impl Account {
 
 fn per_mille(part: i64, whole: i64) -> Option<u16> {
     (whole > 0).then(|| {
-        let pm = (part.max(0) * 1000 + whole / 2) / whole;
+        let pm = (i128::from(part.max(0)) * 1000 + i128::from(whole) / 2) / i128::from(whole);
         u16::try_from(pm.min(1000)).unwrap_or(1000)
     })
 }
@@ -416,8 +416,8 @@ fn mem_you(panes: &[u64], snap: &Snapshot) -> You {
     } else {
         beside.iter().all(Option::is_some).then_some(true)
     };
-    let above =
-        u64::try_from(fig).is_ok_and(|b| b >= MEM_FLOOR_BYTES) && fig * 1000 >= whole * FLOOR_PM;
+    let above = u64::try_from(fig).is_ok_and(|b| b >= MEM_FLOOR_BYTES)
+        && i128::from(fig) * 1000 >= i128::from(whole) * i128::from(FLOOR_PM);
     let (mut role, mut calm) = you_role(fig, whole, largest.unwrap_or(false), above);
     if largest.is_none() && you_role(fig, whole, true, above).0 != role {
         let lane = snap.why.as_deref().map_or(snap.coal_lane, |f| f.lane);

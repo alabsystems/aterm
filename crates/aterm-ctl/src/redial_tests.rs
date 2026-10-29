@@ -534,25 +534,29 @@ fn a_refused_pin_is_asked_again_only_of_a_fresh_successor() {
     );
 }
 
-/// A child successor's argv: this test binary, running only
-/// [`serve_as_a_child_successor`].
+/// A child successor's argv: this test binary, entering through
+/// [`a_fallen_back_stream_asks_the_next_successor_for_its_new_sessions_anchors_only`]
+/// to [`serve_as_a_child_successor_if_asked`].
 #[cfg(unix)]
-const CHILD: [&str; 2] = ["redial::tests::serve_as_a_child_successor", "--exact"];
+const CHILD: [&str; 2] = [
+    "redial::tests::a_fallen_back_stream_asks_the_next_successor_for_its_new_sessions_anchors_only",
+    "--exact",
+];
 
-/// What tells [`serve_as_a_child_successor`] how to serve, one per line: its
-/// role, the socket path it binds, the path it unlinks when it goes, the file
-/// it appends each request to, the file whose creation says it is listening,
-/// and the file whose existence tells it to go.
+/// What tells [`serve_as_a_child_successor_if_asked`] how to serve, one per
+/// line: its role, the socket path it binds, the path it unlinks when it goes,
+/// the file it appends each request to, the file whose creation says it is
+/// listening, and the file whose existence tells it to go.
 #[cfg(unix)]
 const CHILD_ENV: &str = "ATERM_CTL_REDIAL_TEST_CHILD";
 
 /// A fake successor process for relay tests: its own pid, so the relay takes it
-/// for the successor of an in-process server (or the reverse).
+/// for the successor of an in-process server (or the reverse). Returns `false`
+/// in an ordinary test run when [`CHILD_ENV`] is unset.
 #[cfg(unix)]
-#[test]
-fn serve_as_a_child_successor() {
+fn serve_as_a_child_successor_if_asked() -> bool {
     let Some(spec) = std::env::var_os(CHILD_ENV) else {
-        return;
+        return false;
     };
     let spec = spec.into_string().expect("a UTF-8 spec");
     let parts: Vec<&str> = spec.split('\n').collect();
@@ -579,7 +583,7 @@ fn serve_as_a_child_successor() {
     };
     loop {
         let Ok((conn, _)) = listener.accept() else {
-            return;
+            return true;
         };
         if role == "mute" {
             let mut head = [0u8; 32];
@@ -595,7 +599,7 @@ fn serve_as_a_child_successor() {
             }
             record(&[&head[..], b"\n"].concat());
             leave_when_told();
-            return;
+            return true;
         }
         let mut reader = std::io::BufReader::new(&conn);
         let mut request = String::new();
@@ -618,7 +622,7 @@ fn serve_as_a_child_successor() {
             "carrier" => {
                 let _ = (&conn).write_all(b"OK subscribe 1\nsub 5 s-old\n");
                 leave_when_told();
-                return;
+                return true;
             }
             "refuses" if request.contains("@s-old") => {
                 let _ = (&conn).write_all(b"ERR no such session\n");
@@ -626,14 +630,14 @@ fn serve_as_a_child_successor() {
             _ => {
                 let _ = (&conn).write_all(b"OK subscribe 1\nsub 5 s-new\nEVENT 5 exited\n");
                 let _ = std::fs::remove_file(leave);
-                return;
+                return true;
             }
         }
     }
 }
 
-/// A [`serve_as_a_child_successor`] process, listening, with the files it
-/// shares with its test (all in that test's scratch dir).
+/// A [`serve_as_a_child_successor_if_asked`] process, listening, with the files
+/// it shares with its test (all in that test's scratch dir).
 #[cfg(unix)]
 struct ChildSuccessor {
     /// Where it listens until the test renames its socket into place.
@@ -803,6 +807,9 @@ impl Drop for Orphan {
 #[cfg(unix)]
 #[test]
 fn a_fallen_back_stream_asks_the_next_successor_for_its_new_sessions_anchors_only() {
+    if serve_as_a_child_successor_if_asked() {
+        return;
+    }
     let (dir, sock) = scratch_sock("rd-two");
     let path = sock.to_str().unwrap().to_string();
     let second = ChildSuccessor::spawn(dir.path(), "second", &sock);

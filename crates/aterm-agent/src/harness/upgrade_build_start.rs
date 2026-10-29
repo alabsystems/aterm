@@ -571,8 +571,8 @@ pub(super) fn probe_within(exe: &Path, limit: Duration) -> Probe {
             _ => {
                 #[cfg(unix)]
                 if let Some(group) = group {
-                    // SAFETY: the group this spawn made (`process_group(0)`: pgid is the child's pid), signalled before the child is reaped, so the id is still its.
-                    unsafe { libc::kill(-group, libc::SIGKILL) };
+                    // The group this spawn made (`process_group(0)`: pgid is the child's pid), signalled before the child is reaped, so the id is still its.
+                    let _ = aterm_uds::process::kill_group_until_empty(group);
                 }
                 let _ = child.kill();
                 let _ = child.wait();

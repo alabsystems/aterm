@@ -53,6 +53,9 @@ pub fn sock_fits(sock: &Path) -> bool {
 pub const SYSTEM_PRESSURE: &str = "ATERM_DEBUG_SYSTEM_PRESSURE";
 
 /// Config disabling automatic update, package, and agent supervisor lanes ([`HARNESS_OFF`]).
+/// Its `[packages] enabled = false` is also atpkg's no to unattended installs
+/// (`atpkg::adoption::unattended_install_off`), so a worker spawned in a world built on it runs the
+/// test's stand-in and never installs its agent CLI from the network.
 pub const CONFIG_OFF: &str = "[update]\nenabled = false\nauto_apply = false\n\
                               [packages]\nenabled = false\n\
                               [machine]\nuniversal_control = \"leave\"\n\

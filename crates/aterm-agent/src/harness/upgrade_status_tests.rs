@@ -27,6 +27,7 @@ fn opts(dir: &std::path::Path) -> Opts {
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
         land: false,
+        press: None,
         timings: crate::harness::Timings::FAST,
     }
 }
@@ -127,6 +128,51 @@ fn only_an_upgrade_that_will_not_move_on_its_own_is_stalled() {
         Some("overdue"),
         "a skip of another version holds nothing"
     );
+    assert!(
+        skipped.word_in_force(NOW),
+        "CONTROL: a skip of this build holds"
+    );
+    let revision = Row {
+        agent: upgrade::Agent::Muse,
+        from: "1.4.10-R6427.1".to_string(),
+        to: "1.4.11-R6500.1".to_string(),
+        request: Request::Skip("1.4.9-R6297.1".to_string()),
+        ..old.clone()
+    };
+    assert!(
+        !revision.word_in_force(NOW),
+        "two revisions are not the same build"
+    );
+    let same_revision = Row {
+        agent: upgrade::Agent::Muse,
+        from: "1.4.10-R6427.1".to_string(),
+        to: "1.4.10-R6500.1".to_string(),
+        request: Request::Skip("1.4.10-R6500.1".to_string()),
+        ..old.clone()
+    };
+    assert!(
+        same_revision.word_in_force(NOW),
+        "a skip of this very revision holds it"
+    );
+    assert_eq!(
+        same_revision.stall(NOW),
+        None,
+        "a held revision is no stall"
+    );
+    for (a, b, same) in [
+        ("1.4.10-R6500.1", "v1.4.10-R6500.1", true),
+        ("1.4.10-R6500.1", "1.4.10-R6500.2", false),
+        ("2.1.310", "2.1.310.0", true),
+        ("0.165.0-dev.4+gabc", "0.165.0-dev.4+gabc", false),
+        ("0.165.0-dev.4+gabc", "0.165.0-dev.5+gabc", false),
+        ("", "", false),
+    ] {
+        assert_eq!(
+            upgrade::same_build(upgrade::Agent::Muse, a, b),
+            same,
+            "{a:?} {b:?}"
+        );
+    }
     let deferred = Row {
         request: Request::DeferUntil(NOW + 60),
         ..old.clone()
@@ -515,6 +561,136 @@ fn a_word_for_a_target_that_moved_on_lands_on_nothing() {
         Request::Now,
         "written"
     );
+}
+
+#[test]
+fn a_queued_word_requires_the_displayed_source_scope_before_writing() {
+    let shown = St {
+        phase: Phase::Pending,
+        from: "2.1.281".to_string(),
+        to: "2.1.283".to_string(),
+        source: "managed".to_string(),
+        tab: TAB.to_string(),
+        proc_start: "A".to_string(),
+        salt: 5,
+        ..St::default()
+    };
+    let scope = AskScope::from(&Row::of("aaa", &shown, NOW));
+    for current in [
+        St {
+            from: "2.1.282".to_string(),
+            ..shown.clone()
+        },
+        St {
+            source: "native".to_string(),
+            ..shown.clone()
+        },
+        St {
+            agent: upgrade::Agent::Muse,
+            ..shown.clone()
+        },
+        St {
+            proc_start: "B".to_string(),
+            ..shown.clone()
+        },
+        St {
+            proc_start: String::new(),
+            ..shown.clone()
+        },
+    ] {
+        for what in [Ask::Now, Ask::Press, Ask::Defer(24 * 3_600), Ask::Skip] {
+            let dir = ScratchDir::new("upgrade-status", "queued-scope");
+            let o = opts(&dir);
+            save(&o, "aaa", &current);
+            let file = state_dir(&o).join("aaa.json");
+            let before = std::fs::read(&file).expect("fresh record");
+            let result = ask_for_scope(&o, TAB, what, "2.1.283", "aaa", &scope);
+            assert!(result.is_err(), "{what:?}: {current:?}: {result:?}");
+            assert_eq!(
+                std::fs::read(&file).expect("fresh record after refusal"),
+                before,
+                "{what:?}: nothing written to the changed scope"
+            );
+            assert!(!super::super::ledger_path(&o).exists(), "no word ledgered");
+            assert!(!word_marker(&o.state).exists(), "no word announced");
+        }
+    }
+}
+
+#[test]
+fn a_queued_word_accepts_the_same_scope_and_compatible_identity_evidence() {
+    for (shown_from, current_from, shown_birth, current_birth, session) in [
+        ("2.1.281", "2.1.281", "A", "A", "aaa"),
+        ("2.1.281.0", "v2.1.281", "A", "A", "aaa"),
+        ("opaque-source", "opaque-source", "A", "A", "aaa"),
+        ("-", "-", "", "", "aaa"),
+        ("2.1.281", "2.1.281", "", "B", "aaa"),
+        ("2.1.281", "2.1.281", "A", "A", "missing"),
+    ] {
+        for what in [Ask::Now, Ask::Press, Ask::Defer(24 * 3_600), Ask::Skip] {
+            let dir = ScratchDir::new("upgrade-status", "queued-same-scope");
+            let o = opts(&dir);
+            let current = St {
+                phase: Phase::Pending,
+                from: current_from.to_string(),
+                to: "2.1.283".to_string(),
+                source: "managed".to_string(),
+                tab: TAB.to_string(),
+                proc_start: current_birth.to_string(),
+                salt: 5,
+                ..St::default()
+            };
+            let scope = AskScope {
+                from: shown_from.to_string(),
+                proc_start: shown_birth.to_string(),
+                ..AskScope::from(&Row::of("aaa", &current, NOW))
+            };
+            save(&o, "aaa", &current);
+            let row = ask_for_scope(&o, TAB, what, "2.1.283.0", session, &scope)
+                .expect("the same displayed scope accepts the word");
+            assert_eq!(row.session, "aaa", "missing conversation keeps tab ranking");
+            match what {
+                Ask::Now | Ask::Press => assert_eq!(row.request, Request::Now),
+                Ask::Defer(_) => assert!(matches!(row.request, Request::DeferUntil(_))),
+                Ask::Skip => assert_eq!(row.request, Request::Skip("2.1.283".to_string())),
+            }
+            let written = load(&o, "aaa").expect("accepted word saved");
+            assert_eq!(written.request, row.request);
+            assert_eq!(written.request_tab, TAB);
+            assert!(
+                super::super::ledger_path(&o).exists(),
+                "accepted word ledgered"
+            );
+            assert!(word_marker(&o.state).exists(), "accepted word announced");
+        }
+    }
+}
+
+#[test]
+fn an_unknown_probe_keeps_the_birth_a_queued_word_captured() {
+    for what in [Ask::Now, Ask::Press, Ask::Defer(24 * 3_600), Ask::Skip] {
+        let dir = ScratchDir::new("upgrade-status", "queued-known-birth");
+        let o = opts(&dir);
+        let st = St {
+            phase: Phase::Pending,
+            from: "2.1.281".to_string(),
+            to: "2.1.283".to_string(),
+            source: "managed".to_string(),
+            tab: TAB.to_string(),
+            proc_start: "A".to_string(),
+            ..St::default()
+        };
+        let scope = AskScope::from(&Row::of("aaa", &st, NOW));
+        save(&o, "aaa", &st);
+        super::super::retarget_pending_for_test(&o, "aaa", "2.1.281", "")
+            .expect("the real pending retarget with an unreadable later birth");
+        let current = load(&o, "aaa").expect("retargeted record");
+        assert_eq!(current.proc_start, "A", "known birth is retained");
+        assert_eq!(current.request, Request::None);
+        let row = ask_for_scope(&o, TAB, what, "2.1.283", "aaa", &scope)
+            .expect("the retained birth still names the displayed run");
+        assert_ne!(row.request, Request::None, "the word was written");
+    }
 }
 
 #[test]
@@ -1438,13 +1614,177 @@ fn an_agent_the_upgrade_ended_is_said_down_in_a_tab_set_aside_too() {
     }
 }
 
-/// THE PERSON'S NOW PASSES THE OFF ASIDES: a row the person asked to move now (the top rule's
-/// ⬆️, the tab menu's Upgrade Now) is not set aside for its tab's Autopilot Off or its agent
-/// switched off, in the window's rows and in `--status`'s. NEGATIVE CONTROL: with no Now, the
-/// same row goes aside for each.
+/// THE PERSON'S NOW KEEPS THE OFF ASIDES: no worker steps a tab its Autopilot Off or its agent's
+/// switch holds off, so a row the person asked to move now (the tab menu's Upgrade Now) is set
+/// aside for each exactly as one with no word is, in the window's rows and in `--status`'s, and
+/// its wait names the true reason. NEGATIVE CONTROL: with neither held off, neither row is aside.
+/// A STANDING PRESS PASSES THE OFF ASIDES, ONCE: the owner's press of the ⬆️ moves the tab by
+/// its own lane, so while it stands an Autopilot Off or an agent switched off sets the row aside
+/// no longer, in the window's rows and in `--status`'s; a tab another supervisor holds stays
+/// aside. NEGATIVE CONTROL: a press that lapsed, or one for another build, keeps the off asides.
 #[cfg(unix)]
 #[test]
-fn the_persons_now_passes_the_off_asides() {
+fn a_standing_press_passes_the_off_asides_once() {
+    let dir = ScratchDir::new("upgrade-status", "press-aside");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(7),
+    }];
+    let strings = |tabs: &[&str]| tabs.iter().map(|t| (*t).to_string()).collect::<Vec<_>>();
+    let read = |off: &[&str], agent_off: &[&str], claimed: &[&str]| {
+        let held = behind_in(TAB);
+        let mut view = View::default();
+        view.set_off(&strings(off));
+        view.set_agent_off(&strings(agent_off));
+        let mut sent: Vec<Row> = Vec::new();
+        let _ = view.refresh_with(&o, &tabs, now_s(), &held, &mut |rows| sent = rows.to_vec());
+        let aside = Aside {
+            off: off.iter().map(|t| (*t).to_string()).collect(),
+            agent_off: agent_off.iter().map(|t| (*t).to_string()).collect(),
+            claimed: claimed.iter().map(|t| (*t).to_string()).collect(),
+        };
+        let (cli, vetted) = status_rows_with(&o, now_s(), &held, &|| aside.clone());
+        assert!(vetted);
+        (sent, cli)
+    };
+    for (press, pressed_at, pressed_to, passes) in [
+        ("a standing press", now_s() - 60, "2.1.282", true),
+        (
+            "CONTROL: a lapsed press",
+            now_s() - upgrade::PRESS_S - 60,
+            "2.1.282",
+            false,
+        ),
+        (
+            "CONTROL: a press for another build",
+            now_s() - 60,
+            "2.1.281",
+            false,
+        ),
+    ] {
+        let pressed = St {
+            phase: Phase::Pending,
+            from: "2.1.281".to_string(),
+            to: "2.1.282".to_string(),
+            tab: TAB.to_string(),
+            pending_since: now_s() - 7 * 3_600,
+            looked_at: now_s() - 3 * 3_600,
+            request: Request::Now,
+            request_tab: TAB.to_string(),
+            request_at: pressed_at,
+            pressed_at,
+            pressed_to: pressed_to.to_string(),
+            ..St::default()
+        };
+        super::super::save_at(&o, "aaa", &pressed, now_s() - 7 * 3_600);
+        for (how, off, agent_off, word) in [
+            ("its Autopilot Off", &[TAB][..], &[][..], AUTOPILOT_OFF),
+            ("its agent switched off", &[][..], &[TAB][..], AGENT_OFF),
+        ] {
+            let (window, cli) = read(off, agent_off, &[]);
+            for (reader, rows) in [("the window", &window), ("--status", &cli)] {
+                assert_eq!(rows.len(), 1, "{press}, {how}, {reader}: {rows:?}");
+                assert_eq!(
+                    rows[0].aside,
+                    if passes { "" } else { word },
+                    "{press}, {how}, {reader}"
+                );
+                assert_eq!(rows[0].press_stands(now_s()), passes, "{press}");
+            }
+        }
+        let (_, cli) = read(&[TAB], &[], &[TAB]);
+        assert_eq!(cli[0].aside, CLAIMED, "{press}: a claimed tab stays aside");
+    }
+}
+
+/// A row a press's answer brings keeps the shown row's aside ([`Row::keep_aside`]) but an
+/// Autopilot or an agent switched off while its press stands, which the press passes; a claimed
+/// tab stays aside. NEGATIVE CONTROL: with no press standing, every aside is kept.
+#[test]
+fn a_standing_press_keeps_no_off_aside() {
+    let now = now_s();
+    let row = |pressed_at: u64| Row {
+        tab: TAB.to_string(),
+        session: "aaa".to_string(),
+        to: "2.1.282".to_string(),
+        phase: Phase::Pending,
+        request: Request::Now,
+        pressed_at,
+        pressed_to: "2.1.282".to_string(),
+        ..Row::default()
+    };
+    for (aside, kept_when_pressed) in [(AUTOPILOT_OFF, false), (AGENT_OFF, false), (CLAIMED, true)]
+    {
+        let shown = Row {
+            aside: aside.to_string(),
+            ..row(0)
+        };
+        let mut pressed = row(now - 60);
+        pressed.keep_aside(&shown, now);
+        assert_eq!(
+            pressed.aside,
+            if kept_when_pressed { aside } else { "" },
+            "{aside}"
+        );
+        let mut unpressed = row(0);
+        unpressed.keep_aside(&shown, now);
+        assert_eq!(unpressed.aside, aside, "CONTROL: {aside}");
+    }
+}
+
+/// A PRESS ON A CLAIMED TAB IS REFUSED: no lane of aterm's moves a tab another supervisor holds,
+/// so the press writes nothing and says why. NEGATIVE CONTROL: on a tab nobody else holds, the
+/// press writes the Now and stamps the press for the build shown.
+#[cfg(unix)]
+#[test]
+fn a_press_on_a_claimed_tab_is_refused() {
+    let dir = ScratchDir::new("upgrade-status", "press-claimed");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let st = St {
+        phase: Phase::Pending,
+        from: "2.1.281".to_string(),
+        to: "2.1.283".to_string(),
+        source: "managed".to_string(),
+        tab: TAB.to_string(),
+        salt: 5,
+        ..St::default()
+    };
+    save(&o, "aaa", &st);
+    let file = state_dir(&o).join("aaa.json");
+    let before = std::fs::read_to_string(&file).expect("state file");
+    let claimed = Aside {
+        claimed: BTreeSet::from([TAB.to_string()]),
+        ..Aside::default()
+    };
+    let e = ask_for_aside(&o, TAB, Ask::Press, "2.1.283", "", &|| claimed.clone())
+        .expect_err("claimed");
+    assert_eq!(e, PRESS_CLAIMED);
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("state file"),
+        before,
+        "nothing written"
+    );
+    let row = ask_for_aside(&o, TAB, Ask::Press, "2.1.283", "", &Aside::default)
+        .expect("CONTROL: an unclaimed tab");
+    assert_eq!(row.request, Request::Now);
+    assert!(row.press_stands(now_s()), "{row:?}");
+    let saved = load(&o, "aaa").expect("state");
+    assert_eq!(saved.pressed_to, "2.1.283");
+    assert!(saved.pressed_at != 0);
+    let now = ask_for_aside(&o, TAB, Ask::Now, "2.1.283", "", &|| claimed.clone())
+        .expect("the Now reads no claim");
+    assert!(
+        !now.press_stands(now_s()),
+        "the owner's Now after a press is no press: {now:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_persons_now_keeps_the_off_asides() {
     let dir = ScratchDir::new("upgrade-status", "now-aside");
     let o = opts(&dir);
     std::fs::create_dir_all(state_dir(&o)).expect("state");
@@ -1469,10 +1809,7 @@ fn the_persons_now_passes_the_off_asides() {
         assert!(vetted);
         (sent, cli)
     };
-    for (request, words) in [
-        (Request::Now, ["", ""]),
-        (Request::None, [AUTOPILOT_OFF, AGENT_OFF]),
-    ] {
+    for request in [Request::Now, Request::None] {
         let owed = St {
             phase: Phase::Pending,
             from: "2.1.281".to_string(),
@@ -1486,17 +1823,21 @@ fn the_persons_now_passes_the_off_asides() {
             ..St::default()
         };
         super::super::save_at(&o, "aaa", &owed, now_s() - 7 * 3_600);
-        for ((how, off, agent_off), word) in [
-            ("its Autopilot Off", &[TAB][..], &[][..]),
-            ("its agent switched off", &[][..], &[TAB][..]),
-        ]
-        .into_iter()
-        .zip(words)
-        {
+        for (how, off, agent_off, word) in [
+            ("its Autopilot Off", &[TAB][..], &[][..], AUTOPILOT_OFF),
+            ("its agent switched off", &[][..], &[TAB][..], AGENT_OFF),
+            ("CONTROL: neither", &[][..], &[][..], ""),
+        ] {
             let (window, cli) = read(off, agent_off);
             for (reader, rows) in [("the window", &window), ("--status", &cli)] {
                 assert_eq!(rows.len(), 1, "{request:?}, {how}, {reader}: {rows:?}");
                 assert_eq!(rows[0].aside, word, "{request:?}, {how}, {reader}");
+                if !word.is_empty() {
+                    assert_eq!(
+                        rows[0].wait, word,
+                        "{request:?}, {how}, {reader}: the reason"
+                    );
+                }
             }
         }
     }
@@ -1751,6 +2092,91 @@ fn a_restarts_agent_the_process_table_says_gone_is_never_said_still_shutting_dow
                     "{reader}, off={off}, pid {pid}"
                 );
                 assert!(quiet, "{reader}, off={off}, pid {pid}");
+            }
+        }
+    }
+}
+
+/// A press on a tab whose restart in flight another conversation overtook (its agent gone, the
+/// tab's live agent on another conversation) closes that restart (`tab-taken`) and lands on the
+/// live conversation's row; while the restart's agent lives, or while the holder read in front is
+/// a process that did not write its registry (its recorded birth another's: a crashed agent's
+/// file whose number another program took), the press is refused as before.
+#[cfg(unix)]
+#[test]
+fn a_press_closes_a_restart_its_tab_overtook_and_lands() {
+    const A: &str = "aaaaaaaa-1111-2222-3333-444455556666";
+    const B: &str = "bbbbbbbb-1111-2222-3333-444455556666";
+    let dead = {
+        let mut child = aterm_uds::spawnfd::command("true").spawn().expect("spawn");
+        let pid = child.id();
+        child.wait().expect("reap");
+        pid
+    };
+    let (me, other) = (std::process::id(), std::os::unix::process::parent_id());
+    let born = super::super::kernel_start(me).expect("this process's start");
+    let leftover = "Mon Jan  1 00:00:00 2001";
+    assert_ne!(
+        born,
+        super::super::squash(leftover),
+        "precondition: another process's birth"
+    );
+    for cause in ["", crate::harness::relaunch::CAUSE_EXIT] {
+        for (why, pid, start, closes) in [
+            ("its agent gone", dead, born.as_str(), true),
+            ("its agent alive", other, born.as_str(), false),
+            ("its holder a leftover file's", dead, leftover, false),
+        ] {
+            let dir = ScratchDir::new("upgrade-status", "press-overtaken");
+            let o = opts(&dir);
+            std::fs::create_dir_all(state_dir(&o)).expect("state");
+            let now = now_s();
+            let moving = |phase: Phase, pid: u32, cause: &str| St {
+                phase,
+                pid,
+                shell: other,
+                from: "2.1.281".to_string(),
+                to: "2.1.282".to_string(),
+                source: "managed".to_string(),
+                tab: TAB.to_string(),
+                pending_since: now - 60,
+                cause: cause.to_string(),
+                ..St::default()
+            };
+            save(&o, A, &moving(Phase::Exiting { at_s: now - 5 }, pid, cause));
+            save(&o, B, &moving(Phase::Pending, me, ""));
+            let held = |vet: &BTreeSet<String>| -> Option<Vec<Holder>> {
+                assert!(vet.contains(A) && vet.contains(B), "{vet:?}");
+                Some(vec![Holder {
+                    pid: me,
+                    proc_start: start.to_string(),
+                    ..holder(B, "2.1.281", Some(TAB))
+                }])
+            };
+            let got = ask_within(&o, TAB, Ask::Press, None, ASK_LOCK_WAIT, &held);
+            let a = load(&o, A).expect("A kept");
+            let b = load(&o, B).expect("B kept");
+            if closes {
+                let (row, _) = got.expect("the press lands");
+                assert_eq!(row.session, B, "{why} (cause={cause})");
+                assert_eq!(
+                    (a.phase, a.exited_at),
+                    (Phase::Failed("tab-taken".to_string()), 0),
+                    "{why} (cause={cause})"
+                );
+                assert_eq!(b.request, Request::Now, "{why} (cause={cause})");
+            } else {
+                let e = got.expect_err("refused");
+                assert!(
+                    e.contains("is already under way"),
+                    "{why} (cause={cause}): {e}"
+                );
+                assert_eq!(
+                    a.phase,
+                    Phase::Exiting { at_s: now - 5 },
+                    "{why} (cause={cause})"
+                );
+                assert_eq!(b.request, Request::None, "{why} (cause={cause})");
             }
         }
     }
@@ -2091,6 +2517,260 @@ fn the_host_sends_its_tabs_rows_only_when_they_change() {
     assert!(sent[2].is_empty(), "standing down hands over no rows");
     view.stand_down(&mut |rows| sent.push(rows.to_vec()));
     assert_eq!(sent.len(), 3, "said once");
+}
+
+#[test]
+fn a_completed_read_reoffers_unchanged_rows_when_the_publication_source_changes() {
+    let dir = ScratchDir::new("upgrade-status", "reoffer");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    save(
+        &o,
+        "aaa",
+        &St {
+            phase: Phase::Pending,
+            from: "2.1.281".into(),
+            to: "2.1.282".into(),
+            tab: TAB.into(),
+            pending_since: NOW - 60,
+            ..St::default()
+        },
+    );
+    let tabs = [LiveTab {
+        sid: TAB.into(),
+        fgpgid: Some(7),
+    }];
+    let mut view = View::default();
+    let mut sent = Vec::new();
+    let held = behind_in(TAB);
+    view.refresh_with(&o, &tabs, NOW, &held, &mut |rows| sent.push(rows.to_vec()));
+    assert_eq!(sent.len(), 1);
+    view.reoffer_after_read();
+    view.refresh_with(&o, &tabs, NOW, &|_| None, &mut |rows| {
+        sent.push(rows.to_vec())
+    });
+    assert_eq!(
+        sent.len(),
+        1,
+        "a failed holder read cannot re-stamp cached rows"
+    );
+    view.refresh(&o, &mut |rows| sent.push(rows.to_vec()));
+    assert_eq!(
+        sent.len(),
+        1,
+        "a failed roster read cannot re-stamp cached rows"
+    );
+    view.refresh_with(&o, &tabs, NOW, &held, &mut |rows| sent.push(rows.to_vec()));
+    assert_eq!(
+        sent.len(),
+        2,
+        "the next completed read reoffers the unchanged row"
+    );
+    assert_eq!(sent[0], sent[1]);
+    view.refresh_with(&o, &tabs, NOW, &held, &mut |rows| sent.push(rows.to_vec()));
+    assert_eq!(sent.len(), 2, "the new source is deduplicated again");
+    view.reoffer_after_read();
+    view.stand_down(&mut |rows| sent.push(rows.to_vec()));
+    assert_eq!(
+        sent.len(),
+        3,
+        "a pending reoffer must not lose the stand-down clear"
+    );
+    assert!(sent[2].is_empty());
+    view.stand_down(&mut |rows| sent.push(rows.to_vec()));
+    assert_eq!(
+        sent.len(),
+        3,
+        "an unchanged stood-down source says nothing again"
+    );
+    view.reoffer_after_read();
+    view.stand_down(&mut |rows| sent.push(rows.to_vec()));
+    assert_eq!(
+        sent.len(),
+        4,
+        "a changed source forces a new clear after sent was reset"
+    );
+    assert!(sent[3].is_empty());
+    view.stand_down(&mut |rows| sent.push(rows.to_vec()));
+    assert_eq!(sent.len(), 4, "that fresh clear is deduplicated again");
+}
+
+#[test]
+fn pending_rows_keep_the_records_run_identity_without_a_recorded_pid() {
+    use super::super::Proc;
+
+    let from = Version::parse("2.1.281").unwrap();
+    let to = upgrade::Candidate {
+        exe: "/candidate/claude".into(),
+        version: Version::parse("2.1.282").unwrap(),
+        source: upgrade::Source::Managed,
+    };
+    let old = St::fresh(
+        &from,
+        &to,
+        Proc {
+            start: "Mon Oct 26 12:00:00 2026",
+            started_s: NOW,
+        },
+        NOW,
+    );
+    let new = St::fresh(
+        &from,
+        &to,
+        Proc {
+            start: "Mon Oct 26 12:01:00 2026",
+            started_s: NOW,
+        },
+        NOW,
+    );
+    assert_eq!((old.pid, new.pid), (0, 0));
+    let before = Row::of("same-conversation", &old, NOW);
+    let after = Row::of("same-conversation", &new, NOW);
+    assert_eq!(before.proc_start, old.proc_start);
+    assert_eq!(after.proc_start, new.proc_start);
+    assert_ne!(
+        before, after,
+        "the real St::fresh producer distinguishes same-build runs"
+    );
+    assert_eq!(
+        Row {
+            proc_start: before.proc_start.clone(),
+            ..after
+        },
+        before,
+        "the birth field is the distinction, without inventing a PID"
+    );
+}
+
+#[test]
+fn a_first_holder_names_the_pending_records_run() {
+    const A: &str = "Mon Oct 26 12:00:00 2026";
+    const B: &str = "Mon Oct 26 12:01:00 2026";
+    for phase in [
+        Phase::Pending,
+        Phase::Announced { at_s: NOW, asks: 1 },
+        Phase::Failed(upgrade::GAVE_UP.into()),
+    ] {
+        for (record, current, stands) in [
+            (A, A, true),
+            (B, B, true),
+            ("", B, true),
+            (A, "", true),
+            ("", "", true),
+            (A, "Mon  Oct 26 12:00:00 2026", true),
+            (A, B, false),
+        ] {
+            let (cli, window) = first_holder_rows(record, current, phase.clone(), 0);
+            assert_eq!(
+                cli.len(),
+                usize::from(stands),
+                "CLI: record={record:?}, current={current:?}"
+            );
+            assert_eq!(
+                window.len(),
+                usize::from(stands),
+                "window: record={record:?}, current={current:?}"
+            );
+            for row in cli.iter().chain(&window) {
+                assert_eq!(row.pid, 0, "real pending St::fresh records no PID");
+                assert_eq!(
+                    row.proc_start, record,
+                    "a current holder cannot rewrite the record's birth"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_first_holder_can_answer_a_down_record_from_the_previous_run() {
+    const A: &str = "Mon Oct 26 12:00:00 2026";
+    const B: &str = "Mon Oct 26 12:01:00 2026";
+    for phase in [
+        Phase::Exiting { at_s: NOW },
+        Phase::Failed("no-resume".into()),
+    ] {
+        let (cli, window) = first_holder_rows(A, B, phase.clone(), NOW);
+        assert_eq!(
+            (cli.len(), window.len()),
+            (1, 1),
+            "{phase:?}: a live resumption answers the ended run"
+        );
+        assert!(
+            cli.iter().chain(&window).all(|row| !row.down_after_exit()),
+            "{phase:?}: intentional held-again semantics remain"
+        );
+    }
+}
+
+/// The actual first publication: mint and save the pending record, project the current
+/// SessionFile through holder_of, then run both CLI and window status paths from empty views.
+fn first_holder_rows(
+    record: &str,
+    current: &str,
+    phase: Phase,
+    exited_at: u64,
+) -> (Vec<Row>, Vec<Row>) {
+    use super::super::Proc;
+    let dir = ScratchDir::new("upgrade-status", "first-holder");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("private records");
+    let from = Version::parse("2.1.281").unwrap();
+    let target = upgrade::Candidate {
+        exe: "/candidate/claude".into(),
+        version: Version::parse("2.1.282").unwrap(),
+        source: upgrade::Source::Managed,
+    };
+    let mut st = St::fresh(
+        &from,
+        &target,
+        Proc {
+            start: record,
+            started_s: NOW,
+        },
+        NOW,
+    );
+    st.tab = TAB.into();
+    st.phase = phase;
+    st.exited_at = exited_at;
+    save(&o, "same-conversation", &st);
+    let saved = load(&o, "same-conversation").expect("the actual saved record");
+    assert_eq!(saved.proc_start, record);
+    assert_eq!(saved.pid, 0);
+    let session = upgrade::SessionFile {
+        pid: std::process::id(),
+        session_id: "same-conversation".into(),
+        cwd: "/".into(),
+        version: from.to_string(),
+        status: "idle".into(),
+        status_updated_at_ms: NOW * 1_000,
+        proc_start: current.into(),
+        kind: "interactive".into(),
+        entrypoint: "cli".into(),
+        claude_dir: None,
+        profile: None,
+    };
+    let mut holder = holder_of(&session, None);
+    // The private roster supplies the tab/foreground proof; holder_of supplies the record data.
+    holder.tab = Some(TAB.into());
+    holder.led = true;
+    holder.aside = false;
+    let held = |_: &BTreeSet<String>| Some(vec![holder.clone()]);
+    let (cli, whole) = status_rows_with(&o, NOW, &held, &Aside::default);
+    assert!(whole);
+    let mut view = View::default();
+    let mut window = None;
+    let tabs = [LiveTab {
+        sid: TAB.into(),
+        fgpgid: Some(i64::from(holder.pid)),
+    }];
+    view.refresh_with(&o, &tabs, NOW, &held, &mut |rows| {
+        window = Some(rows.to_vec())
+    });
+    (
+        cli,
+        window.expect("the first coherent view always publishes"),
+    )
 }
 
 #[test]
@@ -3397,15 +4077,25 @@ fn a_move_that_failed_after_its_exit_stands_with_no_holder() {
     assert_eq!(sent.last().map(Vec::len), Some(0));
     let dir = ScratchDir::new("upgrade-status", "cl-failed-resumed");
     let o = opts(&dir);
-    moved_state(
+    let resumed = moved_state(
         &o,
         Claude,
         Phase::Failed("stale-exit".to_string()),
         now_s() - 60,
     );
+    let mut old = load(&o, &resumed).unwrap();
+    old.proc_start = "Mon Oct 26 12:00:00 2026".into();
+    save(&o, &resumed, &old);
     let held_on = |version: &'static str| {
         move |s: &BTreeSet<String>| -> Option<Vec<Holder>> {
-            Some(s.iter().map(|s| holder(s, version, Some(TAB))).collect())
+            Some(
+                s.iter()
+                    .map(|s| Holder {
+                        proc_start: "Mon Oct 26 12:01:00 2026".into(),
+                        ..holder(s, version, Some(TAB))
+                    })
+                    .collect(),
+            )
         }
     };
     let mut view = View::default();
@@ -6883,29 +7573,22 @@ fn a_quiet_give_up_its_own_work_held_is_a_wait_the_owners_now_does_not_move() {
 
 #[test]
 fn a_token_word_reads_as_the_cut_reads_it() {
-    let cut = |s: &str| {
-        let w: String = s
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '(' | ')'))
-            .take(64)
-            .collect();
-        if w.is_empty() { "-".to_string() } else { w }
-    };
     let long = "a".repeat(64);
     let longer = "b".repeat(65);
-    for s in [
-        "claude",
-        "wait:own-work(3)",
-        "0.158.0_x",
-        long.as_str(),
-        longer.as_str(),
-        "",
-        "two words",
-        "\u{e9}",
-        "tab\t",
-        "!!",
+    let longer_capped = "b".repeat(64);
+    for (s, want) in [
+        ("claude", "claude"),
+        ("wait:own-work(3)", "wait:own-work(3)"),
+        ("0.158.0_x", "0.158.0_x"),
+        (long.as_str(), long.as_str()),
+        (longer.as_str(), longer_capped.as_str()),
+        ("", "-"),
+        ("two words", "twowords"),
+        ("\u{e9}", "-"),
+        ("tab\t", "tab"),
+        ("!!", "-"),
     ] {
-        assert_eq!(word(s), cut(s), "{s:?}");
+        assert_eq!(word(s), want, "{s:?}");
     }
 }
 
@@ -7291,6 +7974,7 @@ fn the_owners_word_lands_on_the_row_the_window_shows() {
         let shown = Shown {
             to: "2.1.282",
             session,
+            scope: None,
         };
         let shown = (!session.is_empty()).then_some(shown);
         let (row, _) = ask_within(&o, TAB, Ask::Skip, shown, ASK_LOCK_WAIT, held).expect("lands");
@@ -7320,6 +8004,7 @@ fn the_owners_word_lands_on_the_row_the_window_shows() {
     let shown = Shown {
         to: "2.1.283",
         session: &down,
+        scope: None,
     };
     let (row, _) = ask_within(&o, TAB, Ask::Skip, Some(shown), ASK_LOCK_WAIT, &back)
         .expect("the move's record takes it");
@@ -8177,6 +8862,7 @@ fn an_answered_down_record_stays_answered_across_an_unread_look() {
         from: "2.1.281".to_string(),
         to: "2.1.282".to_string(),
         source: "managed".to_string(),
+        proc_start: "Mon Oct 26 12:00:00 2026".into(),
         exited_at: exited,
         ..St::default()
     };
@@ -8190,6 +8876,7 @@ fn an_answered_down_record_stays_answered_across_an_unread_look() {
     let owner_back = |_: &BTreeSet<String>| {
         Some(vec![Holder {
             led: true,
+            proc_start: "Mon Oct 26 12:01:00 2026".into(),
             ..holder(NEW, "2.1.283", Some(TAB))
         }])
     };

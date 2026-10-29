@@ -110,9 +110,32 @@ pub fn cmd_blocks(host: &impl SessionHost, sid: u64, rest: &str) -> String {
     .unwrap_or_else(|| NO_SESSION.to_string())
 }
 
+fn parse_ascii_u64(token: &str) -> Option<u64> {
+    (!token.is_empty() && token.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| token.parse::<u64>().ok())
+        .flatten()
+}
+
+fn parse_ascii_u16(token: &str) -> Option<u16> {
+    (!token.is_empty() && token.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| token.parse::<u16>().ok())
+        .flatten()
+}
+
+fn parse_row_i32(token: &str) -> Option<i32> {
+    let digits = token.strip_prefix('-').unwrap_or(token);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if token.starts_with('-') && digits.bytes().all(|b| b == b'0') {
+        return None;
+    }
+    token.parse::<i32>().ok()
+}
+
 /// `blocktext <id>`: return the output text of command block `<id>`.
 pub fn cmd_blocktext(host: &impl SessionHost, sid: u64, rest: &str) -> String {
-    let Ok(id) = rest.trim().parse::<u64>() else {
+    let Some(id) = parse_ascii_u64(rest.trim()) else {
         return "ERR usage: blocktext <id>\n".to_string();
     };
     blocktext(host, sid, id, false)
@@ -317,64 +340,113 @@ pub fn select_line(t: &mut Terminal, row: i32) -> (i32, i32) {
     (first, last)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectCmd {
+    Clear,
+    Word(i32, u16),
+    Line(i32),
+    Block(i32, u16, i32, u16),
+    Extend(i32, u16),
+    Range(i32, u16, i32, u16),
+}
+
+impl SelectCmd {
+    fn parse(rest: &str) -> Result<Self, &'static str> {
+        const USAGE: &str = "ERR usage: select <r1> <c1> <r2> <c2> | select word <r> <c> | \
+                             select line <r> | select block <r1> <c1> <r2> <c2> | \
+                             select extend <r> <c> | select clear\n";
+        let mut it = rest.split_whitespace();
+        match it.next() {
+            None => Err(USAGE),
+            Some("clear") => match it.next() {
+                None => Ok(Self::Clear),
+                Some(_) => Err(USAGE),
+            },
+            Some("word") => {
+                let (Some(r), Some(c), None) = (
+                    it.next().and_then(parse_row_i32),
+                    it.next().and_then(parse_ascii_u16),
+                    it.next(),
+                ) else {
+                    return Err("ERR usage: select word <r> <c>\n");
+                };
+                Ok(Self::Word(r, c))
+            }
+            Some("line") => {
+                let (Some(r), None) = (it.next().and_then(parse_row_i32), it.next()) else {
+                    return Err("ERR usage: select line <r>\n");
+                };
+                Ok(Self::Line(r))
+            }
+            Some("block") => {
+                let (Some(r1), Some(c1), Some(r2), Some(c2), None) = (
+                    it.next().and_then(parse_row_i32),
+                    it.next().and_then(parse_ascii_u16),
+                    it.next().and_then(parse_row_i32),
+                    it.next().and_then(parse_ascii_u16),
+                    it.next(),
+                ) else {
+                    return Err("ERR usage: select block <r1> <c1> <r2> <c2>\n");
+                };
+                Ok(Self::Block(r1, c1, r2, c2))
+            }
+            Some("extend") => {
+                let (Some(r), Some(c), None) = (
+                    it.next().and_then(parse_row_i32),
+                    it.next().and_then(parse_ascii_u16),
+                    it.next(),
+                ) else {
+                    return Err("ERR usage: select extend <r> <c>\n");
+                };
+                Ok(Self::Extend(r, c))
+            }
+            Some(r1s) => {
+                let (Some(c1s), Some(r2s), Some(c2s), None) =
+                    (it.next(), it.next(), it.next(), it.next())
+                else {
+                    return Err(USAGE);
+                };
+                let (Some(r1), Some(c1), Some(r2), Some(c2)) = (
+                    parse_row_i32(r1s),
+                    parse_ascii_u16(c1s),
+                    parse_row_i32(r2s),
+                    parse_ascii_u16(c2s),
+                ) else {
+                    return Err("ERR bad args\n");
+                };
+                Ok(Self::Range(r1, c1, r2, c2))
+            }
+        }
+    }
+}
+
 /// `select ...`: drive the engine's text selection.
 pub fn cmd_select(host: &impl SessionHost, sid: u64, rest: &str) -> String {
-    const USAGE: &str = "ERR usage: select <r1> <c1> <r2> <c2> | select word <r> <c> | \
-                         select line <r> | select block <r1> <c1> <r2> <c2> | \
-                         select extend <r> <c> | select clear\n";
-    let rest = rest.trim();
-    let mut it = rest.split_whitespace();
-    let open = match it.next() {
-        Some("clear") if rest == "clear" => host.with_terminal_mut(sid, |t| {
+    let cmd = match SelectCmd::parse(rest) {
+        Ok(cmd) => cmd,
+        Err(usage) => return usage.to_string(),
+    };
+    let open = match cmd {
+        SelectCmd::Clear => host.with_terminal_mut(sid, |t| {
             t.text_selection_mut().clear();
             frame_open(t)
         }),
-        None => return USAGE.to_string(),
-        Some("word") => {
-            let (Some(Ok(r)), Some(Ok(c))) = (
-                it.next().map(str::parse::<i32>),
-                it.next().map(str::parse::<u16>),
-            ) else {
-                return "ERR usage: select word <r> <c>\n".to_string();
-            };
-            host.with_terminal_mut(sid, |t| {
-                select_word(t, r, c);
-                frame_open(t)
-            })
-        }
-        Some("line") => {
-            let Some(Ok(r)) = it.next().map(str::parse::<i32>) else {
-                return "ERR usage: select line <r>\n".to_string();
-            };
-            host.with_terminal_mut(sid, |t| {
-                select_line(t, r);
-                frame_open(t)
-            })
-        }
-        Some("block") => {
-            let (Some(Ok(r1)), Some(Ok(c1)), Some(Ok(r2)), Some(Ok(c2))) = (
-                it.next().map(str::parse::<i32>),
-                it.next().map(str::parse::<u16>),
-                it.next().map(str::parse::<i32>),
-                it.next().map(str::parse::<u16>),
-            ) else {
-                return "ERR usage: select block <r1> <c1> <r2> <c2>\n".to_string();
-            };
-            host.with_terminal_mut(sid, |t| {
-                let sel = t.text_selection_mut();
-                sel.start_selection(r1, c1, SelectionSide::Left, SelectionType::Block);
-                sel.update_selection(r2, c2, SelectionSide::Right);
-                sel.complete_selection();
-                frame_open(t)
-            })
-        }
-        Some("extend") => {
-            let (Some(Ok(r)), Some(Ok(c))) = (
-                it.next().map(str::parse::<i32>),
-                it.next().map(str::parse::<u16>),
-            ) else {
-                return "ERR usage: select extend <r> <c>\n".to_string();
-            };
+        SelectCmd::Word(r, c) => host.with_terminal_mut(sid, |t| {
+            select_word(t, r, c);
+            frame_open(t)
+        }),
+        SelectCmd::Line(r) => host.with_terminal_mut(sid, |t| {
+            select_line(t, r);
+            frame_open(t)
+        }),
+        SelectCmd::Block(r1, c1, r2, c2) => host.with_terminal_mut(sid, |t| {
+            let sel = t.text_selection_mut();
+            sel.start_selection(r1, c1, SelectionSide::Left, SelectionType::Block);
+            sel.update_selection(r2, c2, SelectionSide::Right);
+            sel.complete_selection();
+            frame_open(t)
+        }),
+        SelectCmd::Extend(r, c) => {
             let extended = host.with_terminal_mut(sid, |t| {
                 let sel = t.text_selection_mut();
                 if !sel.has_selection() || sel.is_empty() {
@@ -395,18 +467,7 @@ pub fn cmd_select(host: &impl SessionHost, sid: u64, rest: &str) -> String {
                 extended => extended.flatten(),
             }
         }
-        Some(r1s) => {
-            let (Some(c1s), Some(r2s), Some(c2s)) = (it.next(), it.next(), it.next()) else {
-                return USAGE.to_string();
-            };
-            let (Ok(r1), Ok(c1), Ok(r2), Ok(c2)) = (
-                r1s.parse::<i32>(),
-                c1s.parse::<u16>(),
-                r2s.parse::<i32>(),
-                c2s.parse::<u16>(),
-            ) else {
-                return "ERR bad args\n".to_string();
-            };
+        SelectCmd::Range(r1, c1, r2, c2) => {
             let ((sr, sc), (er, ec)) = if (r2, c2) < (r1, c1) {
                 ((r2, c2), (r1, c1))
             } else {

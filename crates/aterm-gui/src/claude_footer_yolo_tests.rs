@@ -71,6 +71,11 @@ fn feed(app: &App, session: u64, bytes: &[u8]) {
 }
 
 fn claude(app: &App, session: u64) {
+    claude_at(app, session, Some("xhigh"));
+}
+
+/// [`claude`], its facts naming `effort` (`None`: no effort said yet, as after a relaunch).
+fn claude_at(app: &App, session: u64, effort: Option<&str>) {
     let entry = app.pool.get(session).expect("session");
     let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
     timeline.note_foreground_group(PGID);
@@ -80,7 +85,7 @@ fn claude(app: &App, session: u64) {
         None,
         Some(FooterFacts {
             model: Some("Opus 5.5".into()),
-            effort: Some("xhigh".into()),
+            effort: effort.map(str::to_owned),
             path: Some("~/aterm".into()),
             branch: Some("main".into()),
             ..FooterFacts::default()
@@ -246,6 +251,83 @@ fn the_mode_row_reads_claudes_jobs_and_the_grid_keeps_claudes_row() {
             0,
             "the map went with it"
         );
+    }
+}
+
+/// CLAUDE'S INKS READ ON A LIGHT PAGE: on a tab themed Default Light, a kept item Claude drew in
+/// its dark-theme cyan (`#00cccc`, under 2:1 on that page) is laid at the words' floor, 4.5:1 on
+/// its ground, its hue kept and nothing else of the cell changed. CONTROL: on the dark default
+/// the item's cells are Claude's, byte for byte.
+#[test]
+fn claudes_inks_read_on_a_light_page() {
+    use aterm_effects::cli_marks::NAME_CONTRAST;
+    use aterm_effects::color_math::contrast_ratio;
+    let pack = |c: [u8; 3]| u32::from_be_bytes([0, c[0], c[1], c[2]]);
+    let reads = |a: [u8; 3], b: [u8; 3]| contrast_ratio(pack(a), pack(b));
+    let shells = "14 shells";
+    for light in [true, false] {
+        let (mut app, wid, session, _reader, _host) = app();
+        if light {
+            app.set_session_theme(
+                session,
+                Some(crate::session_theme::SessionTheme {
+                    selector: "Default Light".into(),
+                    origin: crate::session_theme::SessionThemeOrigin::Ctl,
+                }),
+            );
+        }
+        draw(&app, session, BYPASS);
+        let at = col_of(BYPASS, shells);
+        feed(
+            &app,
+            session,
+            format!(
+                "\x1b7\x1b[24;{}H\x1b[38;2;0;204;204m{shells}\x1b[0m\x1b8",
+                at + 1
+            )
+            .as_bytes(),
+        );
+        frame(&mut app, wid);
+        let row = mode_row(&app, wid);
+        let vendor = app.windows[&wid].input_scratch.cells[row].clone();
+        claude(&app, session);
+        frame(&mut app, wid);
+        let glass = glass_of(&app, wid, row);
+        assert!(
+            glass.starts_with(JOBS),
+            "light {light}: the rewrite holds: {glass:?}"
+        );
+        let cells = &app.windows[&wid].input_scratch.cells[row];
+        for k in 0..shells.len() {
+            let (cell, claude) = (cells[k], vendor[at + k]);
+            if !light || claude.ch == ' ' {
+                assert_eq!(cell, claude, "light {light}: Claude's cell {k}");
+                continue;
+            }
+            assert_eq!(claude.fg, [0, 204, 204], "Claude's cyan");
+            assert!(
+                reads(claude.fg, claude.bg) < NAME_CONTRAST,
+                "CONTROL: Claude's ink at {:.2}:1 on the light page",
+                reads(claude.fg, claude.bg)
+            );
+            let floor = reads(cell.fg, cell.bg);
+            assert!(floor >= NAME_CONTRAST, "{:?} at {floor:.2}:1", cell.ch);
+            let [r, g, b] = cell.fg;
+            assert!(
+                r < g && g.abs_diff(b) <= 1,
+                "{:?}: the cyan's hue kept: {:?}",
+                cell.ch,
+                cell.fg
+            );
+            assert_eq!(
+                RenderCell {
+                    fg: claude.fg,
+                    ..cell
+                },
+                claude,
+                "only the ink moves"
+            );
+        }
     }
 }
 
@@ -528,68 +610,168 @@ fn the_wrapped_effort_hint_is_blanked_with_the_row() {
     );
 }
 
+/// THE EFFORT HINT STAYS WHILE THE RULE NAMES NO EFFORT: with no effort in the bottom rule's
+/// `◆` (right after a relaunch, before the transcript says one), the level of Claude's
+/// `◐ medium · /effort` follows the jobs on the rewritten row in Claude's own cells (`◐ medium`,
+/// its `/effort` key hint dropped), and a hint wrapped to the row under stands there as drawn.
+/// CONTROL: once `◆` names an effort, the hint goes from both.
+#[test]
+fn the_effort_hint_stays_while_the_rule_names_no_effort() {
+    const HINT: &str = "\u{25D0} medium \u{B7} /effort";
+    const LEVEL: &str = "\u{25D0} medium";
+    for wrapped in [false, true] {
+        for named in [false, true] {
+            let (mut app, wid, session, _reader, _host) = app();
+            let rule = "\u{2500}".repeat(COLS);
+            let mode = "  \u{23F5}\u{23F5} bypass permissions on \u{B7} 1 shell";
+            let (row23, row24) = if wrapped {
+                (mode.to_owned(), format!("{HINT:>w$}", w = COLS - 2))
+            } else {
+                (format!("{mode}  {HINT}"), String::new())
+            };
+            feed(
+                &app,
+                session,
+                format!(
+                    "\x1b[?2004h\x1b[2J\x1b[18;1H\u{25CF} done\x1b[20;1H{rule}\x1b[21;1H\u{276F} \
+                     \x1b[22;1H{rule}\x1b[23;1H{row23}\x1b[24;1H{row24}\x1b[21;3H"
+                )
+                .as_bytes(),
+            );
+            frame(&mut app, wid);
+            let (at, under) = (strip(&app, wid) + 22, strip(&app, wid) + 23);
+            let vendor = app.windows[&wid].input_scratch.cells[at].clone();
+            claude_at(&app, session, named.then_some("medium"));
+            frame(&mut app, wid);
+            let what = format!("wrapped={wrapped} named={named}");
+            let glass = glass_of(&app, wid, at);
+            let below = glass_of(&app, wid, under);
+            match (wrapped, named) {
+                (false, false) => {
+                    assert_eq!(
+                        glass.trim_end(),
+                        format!("1 shell \u{B7} {LEVEL}"),
+                        "{what}"
+                    );
+                    let from = col_of(&read_glass(&vendor), HINT);
+                    let n = LEVEL.chars().count();
+                    let cells = &app.windows[&wid].input_scratch.cells[at];
+                    assert_eq!(cells[10..10 + n], vendor[from..from + n], "Claude's cells");
+                }
+                (true, false) => {
+                    assert_eq!(glass.trim_end(), "1 shell", "{what}");
+                    assert_eq!(below.trim(), HINT, "{what}: the wrapped hint stands");
+                }
+                (_, true) => {
+                    assert_eq!(glass.trim_end(), "1 shell", "CONTROL: {what}");
+                    assert_eq!(below.trim(), "", "CONTROL: {what}");
+                }
+            }
+        }
+    }
+}
+
 /// THE PET HOLDS THE REWRITE'S WORDS AND STANDS ON THE BLANK AFTER THEM: the resident pet reads
 /// Claude Code's cells, before the glass lays its rewrite over them, so the footer hands it
 /// what the glass shows there. The words the rewrite lays (`1 shell`) are the host's chrome;
 /// the rest of the mode row it blanks, out to the end of Claude's own words, and the row the
 /// effort hint wrapped to are blank glass ([`crate::pet_chrome::PetChrome::held_blanked`]), never
 /// chrome: Claude's letters under them are hidden, and the cat may rest there by the words.
+/// With facts naming no effort the rewrite keeps Claude's hint's level: on the mode row it is
+/// among the words the pet holds (`1 shell · ◐ medium`), and wrapped to the row under it is
+/// Claude's own row, neither held nor blanked.
 /// NEGATIVE CONTROL (as run with every write held as painted): the mode row was held from the
 /// words out to Claude's last letter (columns 7 to 35) and the effort row whole, and nothing
 /// was blanked; the pet read Claude's hidden letters as ink and the blank as chrome, and rested
 /// out past them (aterm-effects' `the_cat_rests_by_the_words_the_footer_shows`).
 #[test]
 fn the_pet_holds_the_rewrites_words_and_stands_on_the_blank_after_them() {
-    let (mut app, wid, session, _reader, _host) = app();
-    let rule = "\u{2500}".repeat(COLS);
-    let row = "  \u{23F5}\u{23F5} bypass permissions on \u{B7} 1 shell";
-    let hint = format!("{:>w$}", "\u{25D0} medium \u{B7} /effort", w = COLS - 2);
-    feed(
-        &app,
-        session,
-        format!(
-            "\x1b[?2004h\x1b[2J\x1b[18;1H\u{25CF} done\x1b[20;1H{rule}\x1b[21;1H\u{276F} \
-             \x1b[22;1H{rule}\x1b[23;1H{row}\x1b[24;1H{hint}\x1b[21;3H"
-        )
-        .as_bytes(),
-    );
-    claude(&app, session);
-    frame(&mut app, wid);
-    // The pass's chrome is the pet's once the menu's splice commits it.
-    app.splice_autopilot_menu(wid);
-    let (mode, under) = (strip(&app, wid) + 22, strip(&app, wid) + 23);
-    assert_eq!(glass_of(&app, wid, mode).trim_end(), "1 shell", "fixture");
-    assert_eq!(
-        glass_of(&app, wid, under).trim(),
-        "",
-        "fixture: the hint blanked"
-    );
-    let (words, end, hint_end) = (7, row.chars().count(), COLS - 2);
-    let chrome = &app.windows[&wid].pet_chrome;
-    let held = |row: usize, col: usize| {
-        let (r, c) = (row as f32 + 0.5, col as f32 + 0.5);
-        chrome.held().iter().any(|rect| {
-            rect.row <= r && r < rect.row + rect.rows && rect.col <= c && c < rect.col + rect.cols
-        })
-    };
-    let wrong: Vec<(usize, usize)> = (0..COLS)
-        .map(|c| (22, c))
-        .chain((0..COLS).map(|c| (23, c)))
-        .filter(|&(r, c)| held(r, c) != (r == 22 && c < words))
-        .collect();
-    assert!(
-        wrong.is_empty(),
-        "the rewrite's words are held, and nothing else on its rows: {wrong:?} (held {:?})",
-        chrome.held()
-    );
-    assert_eq!(
-        chrome.held_blanked(),
-        [
-            aterm_effects::pet_world::PetRect::new(22.0, words as f32, 1.0, (end - words) as f32),
-            aterm_effects::pet_world::PetRect::new(23.0, 0.0, 1.0, hint_end as f32),
-        ],
-        "the blank after the words, out to Claude's last letter, and the hint's row"
-    );
+    const HINT: &str = "\u{25D0} medium \u{B7} /effort";
+    let jobs = "  \u{23F5}\u{23F5} bypass permissions on \u{B7} 1 shell";
+    let hint_end = COLS - 2;
+    for (wrapped, effort) in [(true, Some("xhigh")), (true, None), (false, None)] {
+        let what = format!("wrapped={wrapped} effort={effort:?}");
+        let (mut app, wid, session, _reader, _host) = app();
+        let rule = "\u{2500}".repeat(COLS);
+        let (row, under) = if wrapped {
+            (jobs.to_owned(), format!("{HINT:>hint_end$}"))
+        } else {
+            (format!("{jobs}  {HINT}"), String::new())
+        };
+        feed(
+            &app,
+            session,
+            format!(
+                "\x1b[?2004h\x1b[2J\x1b[18;1H\u{25CF} done\x1b[20;1H{rule}\x1b[21;1H\u{276F} \
+                 \x1b[22;1H{rule}\x1b[23;1H{row}\x1b[24;1H{under}\x1b[21;3H"
+            )
+            .as_bytes(),
+        );
+        claude_at(&app, session, effort);
+        frame(&mut app, wid);
+        // The pass's chrome is the pet's once the menu's splice commits it.
+        app.splice_autopilot_menu(wid);
+        let (mode_at, under_at) = (strip(&app, wid) + 22, strip(&app, wid) + 23);
+        let shown = match (wrapped, effort) {
+            (false, None) => "1 shell \u{B7} \u{25D0} medium".to_owned(),
+            _ => "1 shell".to_owned(),
+        };
+        assert_eq!(
+            glass_of(&app, wid, mode_at).trim_end(),
+            shown,
+            "fixture: {what}"
+        );
+        let below = match (wrapped, effort) {
+            (true, None) => HINT,
+            _ => "",
+        };
+        assert_eq!(
+            glass_of(&app, wid, under_at).trim(),
+            below,
+            "fixture: {what}: the hint blanked, or Claude's own"
+        );
+        let (words, end) = (shown.chars().count(), row.chars().count());
+        let chrome = &app.windows[&wid].pet_chrome;
+        let held = |row: usize, col: usize| {
+            let (r, c) = (row as f32 + 0.5, col as f32 + 0.5);
+            chrome.held().iter().any(|rect| {
+                rect.row <= r
+                    && r < rect.row + rect.rows
+                    && rect.col <= c
+                    && c < rect.col + rect.cols
+            })
+        };
+        let wrong: Vec<(usize, usize)> = (0..COLS)
+            .map(|c| (22, c))
+            .chain((0..COLS).map(|c| (23, c)))
+            .filter(|&(r, c)| held(r, c) != (r == 22 && c < words))
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "{what}: the rewrite's words are held, and nothing else on its rows: {wrong:?} \
+             (held {:?})",
+            chrome.held()
+        );
+        let mut blanked = vec![aterm_effects::pet_world::PetRect::new(
+            22.0,
+            words as f32,
+            1.0,
+            (end - words) as f32,
+        )];
+        if wrapped && effort.is_some() {
+            blanked.push(aterm_effects::pet_world::PetRect::new(
+                23.0,
+                0.0,
+                1.0,
+                hint_end as f32,
+            ));
+        }
+        assert_eq!(
+            chrome.held_blanked(),
+            blanked,
+            "{what}: the blank after the words, out to Claude's last letter, and a blanked hint's row"
+        );
+    }
 }
 
 #[test]

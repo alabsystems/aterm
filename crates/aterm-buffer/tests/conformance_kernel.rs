@@ -206,10 +206,10 @@ fn real_append_at_spine_conforms_to_kernel_model() {
         "the spill seam fired once per event past the cap"
     );
     assert_eq!(log.total(), spine.count);
+    assert_gapped_append_rejected();
 }
 
-#[test]
-fn a_gapped_append_is_the_buggy_step_the_bind_rejects() {
+fn assert_gapped_append_rejected() {
     let m = kernel_model();
     let mut s = Surface::new();
     s.apply(&write_cap(), Edit::AppendLine("x".into()));

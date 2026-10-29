@@ -309,15 +309,6 @@ pub fn is_session_uuid(s: &str) -> bool {
     s.len() == 36 && super::codex_rollout::is_thread_id(s)
 }
 
-/// Extract the Unix millisecond creation timestamp from a UUIDv7 session ID.
-#[must_use]
-pub fn session_created_ms(session: &str) -> Option<u64> {
-    if !is_session_uuid(session) {
-        return None;
-    }
-    super::codex_rollout::thread_created_ms(session)
-}
-
 /// Classification of how a Muse Code process exited ([`exit_kind`], [`log_verdict`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExitKind {

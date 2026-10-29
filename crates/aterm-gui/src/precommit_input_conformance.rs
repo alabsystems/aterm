@@ -104,7 +104,7 @@ impl Rig {
             .app
             .handoff_deferred_input
             .iter()
-            .any(|(id, _)| *id == self.winit);
+            .any(|(id, ..)| *id == self.winit);
         if self.settled.is_none() {
             assert_eq!(
                 queued_for_window, self.typed,

@@ -35,6 +35,7 @@ aterm-models-release.workspace = true
 aterm-models-render.workspace = true
 aterm-models-session.workspace = true
 aterm-models-setup.workspace = true
+aterm-models-swarm.workspace = true
 aterm-models-update.workspace = true
 
 [dev-dependencies]

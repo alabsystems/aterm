@@ -977,7 +977,7 @@ fn due_renews_only_what_is_due_and_says_when_nothing_is() {
     let mut quiet = RenewHost::new();
     quiet.tty = false;
     let (code, out, _) = acc(renew(&["main"], false, None), &env, &quiet);
-    assert_eq!(code, exit(0));
+    assert_eq!(code, exit(1), "a named row left as it was is no renewal");
     assert_eq!(out, "due here: main\n");
     assert!(quiet.flows.borrow().is_empty());
 

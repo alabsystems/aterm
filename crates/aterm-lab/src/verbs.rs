@@ -175,21 +175,7 @@ pub fn cmd_limit(args: &[String]) -> Res {
         ));
     };
     let reset = now_secs() + n;
-    let plan_part = if plan.is_empty() {
-        String::new()
-    } else {
-        format!(":{plan}")
-    };
-    let answer = control(
-        &run.port,
-        &format!("/__mode?m=limit:{claim}:{reset}{plan_part}"),
-    )
-    .map_err(|e| {
-        Fail::die(format!(
-            "limit: the stub of lab '{}' did not take the limit ({e})",
-            run.tag
-        ))
-    })?;
+    let answer = set_limit(&run, &claim, reset, &plan)?;
     println!("{answer}");
     println!(
         "limit: {claim}, resets at {} ({reset}){}; the stub answers ok from then on",
@@ -201,6 +187,28 @@ pub fn cmd_limit(args: &[String]) -> Res {
         }
     );
     Ok(0)
+}
+
+/// Set the stub's temporary subscription usage limit: the window `claim` (`five_hour`,
+/// `seven_day`, …) resetting at `reset` (epoch seconds), `plan` Codex's `plan_type` or empty.
+/// # Errors
+/// The stub did not take it.
+pub fn set_limit(run: &Run, claim: &str, reset: i64, plan: &str) -> Result<String, Fail> {
+    let plan_part = if plan.is_empty() {
+        String::new()
+    } else {
+        format!(":{plan}")
+    };
+    control(
+        &run.port,
+        &format!("/__mode?m=limit:{claim}:{reset}{plan_part}"),
+    )
+    .map_err(|e| {
+        Fail::die(format!(
+            "limit: the stub of lab '{}' did not take the limit ({e})",
+            run.tag
+        ))
+    })
 }
 
 /// `tool [tag] '<json>'`: the tool mode's script, and switch the stub to that mode.
@@ -274,6 +282,94 @@ pub fn cmd_headers(args: &[String]) -> Res {
     let (run, a) = lab(args)?;
     let j = rate_blocks(a.first().map(String::as_str)).map_err(Fail::die)?;
     write_headers(&run.w, j.clone(), true)?;
+    println!("{}", j.py());
+    Ok(0)
+}
+
+/// The stub's `--auth-modes-file` in the scratch: each credential's mode by its label.
+pub const AUTH_MODES: &str = "auth-modes.json";
+
+/// Whether `label` is one the stub names a credential by ([`crate::stub::auth_label`]): 1–40
+/// characters of `[a-z0-9_:+()-]`.
+fn credential_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 40
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_:+()-".contains(&b))
+}
+
+/// Answer the credential `label`'s `/v1/messages` turns in `mode` (`off`: in the stub's own
+/// mode again), every other credential's as they were ([`crate::stub::auth_mode`]); the file's
+/// new text.
+/// # Errors
+/// `label` is no credential's label, `mode` is empty, or the file could not be written.
+pub fn set_auth_mode(run: &Run, label: &str, mode: &str) -> Result<String, Fail> {
+    if !credential_label(label) {
+        return Err(Fail::die(format!(
+            "mode-for: '{label}' is no credential's label (oat:lab-a, key, …)"
+        )));
+    }
+    let clean = crate::stub::clean_mode(mode);
+    if mode.trim().is_empty() {
+        return Err(Fail::die("mode-for: need a MODE (or off)"));
+    }
+    let p = run.w.join(AUTH_MODES);
+    let mut modes = match J::parse(&scratch_text(&p)) {
+        Ok(j @ J::Obj(_)) => j,
+        _ => J::Obj(Vec::new()),
+    };
+    if mode == "off" {
+        modes.remove(label);
+    } else {
+        modes.set(label, J::s(clean));
+    }
+    let text = modes.py();
+    atomic_write(&p, text.as_bytes()).map_err(|e| Fail::die(e.to_string()))?;
+    Ok(text)
+}
+
+/// `mode-for [tag] LABEL MODE|off`: answer one credential's turns in their own mode.
+pub fn cmd_mode_for(args: &[String]) -> Res {
+    let (run, a) = lab(args)?;
+    let (Some(label), Some(mode)) = (a.first(), a.get(1)) else {
+        return Err(Fail::usage(format!(
+            "mode-for: need LABEL and MODE ({LAB} help)"
+        )));
+    };
+    println!("{}", set_auth_mode(&run, label, mode)?);
+    Ok(0)
+}
+
+/// Set the credential `label`'s own `/v1/messages` header blocks (`{"on200":{…},"on429":{…}}`,
+/// `{}` clears them) in `scratch/headers.json`, keeping every other entry
+/// ([`crate::stub::headers_file_for`]).
+/// # Errors
+/// `label` is no credential's label, or the file could not be written.
+pub fn write_headers_for(w: &Path, label: &str, blocks: J) -> Result<(), Fail> {
+    if !credential_label(label) {
+        return Err(Fail::die(format!(
+            "headers-for: '{label}' is no credential's label (oat:lab-a, key, …)"
+        )));
+    }
+    let p = w.join("headers.json");
+    let h = crate::stub::headers_file_for(&scratch_text(&p), label, blocks);
+    let text = h.dump(Style {
+        indent: Some(1),
+        compact: false,
+        ascii: true,
+    });
+    atomic_write(&p, text.as_bytes()).map_err(|e| Fail::die(e.to_string()))
+}
+
+/// `headers-for [tag] LABEL ['<json>']`: one credential's own extra headers on `/v1/messages`.
+pub fn cmd_headers_for(args: &[String]) -> Res {
+    let (run, a) = lab(args)?;
+    let label = a
+        .first()
+        .ok_or_else(|| Fail::usage(format!("headers-for: need LABEL ({LAB} help)")))?;
+    let j = rate_blocks(a.get(1).map(String::as_str)).map_err(Fail::die)?;
+    write_headers_for(&run.w, label, j.clone())?;
     println!("{}", j.py());
     Ok(0)
 }
@@ -1420,11 +1516,31 @@ pub fn cmd_capture(args: &[String]) -> Res {
 }
 
 fn semver_like(v: &str) -> bool {
-    let p: Vec<&str> = v.split('.').collect();
-    p.len() >= 3
-        && p[..3]
-            .iter()
-            .all(|x| !x.is_empty() && x.chars().next().is_some_and(|c| c.is_ascii_digit()))
+    let mut parts = v.splitn(3, '.');
+    let (Some(major), Some(minor), Some(rest)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(major) || !digits(minor) {
+        return false;
+    }
+    let patch_end = rest
+        .bytes()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if patch_end == 0 {
+        return false;
+    }
+    match &rest[patch_end..] {
+        "" => true,
+        tail => {
+            (tail.starts_with('-') || tail.starts_with('+'))
+                && tail.len() > 1
+                && tail[1..]
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+        }
+    }
 }
 
 /// The leading numbers of a version, for ordering.
@@ -1432,7 +1548,13 @@ fn semver_like(v: &str) -> bool {
 pub fn version_key(v: &str) -> Vec<u64> {
     v.split('.')
         .take(3)
-        .filter_map(|x| x.parse().ok())
+        .map_while(|x| {
+            let end = x
+                .bytes()
+                .position(|b| !b.is_ascii_digit())
+                .unwrap_or(x.len());
+            x[..end].parse().ok()
+        })
         .collect()
 }
 
@@ -1949,7 +2071,19 @@ mod tests {
     #[test]
     fn versions_order_by_their_numbers() {
         assert!(version_key("2.1.300") > version_key("2.1.299"));
+        assert!(version_key("2.1.300-rc.1") > version_key("2.1.299"));
+        assert_eq!(version_key("x.99.0"), Vec::<u64>::new());
         assert!(version_key("99.0.0") > version_key("2.1.300"));
-        assert!(semver_like("2.1.999") && !semver_like("x.1.2") && !semver_like("2.1"));
+        assert!(
+            semver_like("2.1.999")
+                && semver_like("2.1.300-rc.1")
+                && semver_like("2.1.300+build.5")
+                && !semver_like("2.1.3x")
+                && !semver_like("2.1.3-")
+                && !semver_like("2.1.3+")
+                && !semver_like("2.1a.3")
+                && !semver_like("x.1.2")
+                && !semver_like("2.1")
+        );
     }
 }

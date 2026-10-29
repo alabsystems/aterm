@@ -103,7 +103,12 @@ aterm-time = { workspace = true }
 # `aterm_spec::host::could_not_run`: a test this host cannot run (as root, no
 # zsh, no font) ends COULD NOT RUN, never a silent pass; and
 # `wait::past_text_busy`: the shim tests exec files they just wrote while sibling
-# test threads fork (Linux's ETXTBSY).
+# test threads fork (Linux's ETXTBSY); and `fs_lane::join`: the doctor's lock and
+# record tests run three at a time, not on every libtest thread at once.
 aterm-spec = { workspace = true }
 # The setup ledger's model, which its conformance test holds the ledger to.
 aterm-models-setup = { workspace = true }
+# `aterm help fabric`'s THE SESSION LOG ON THE BUS is held to the session log's own
+# vocabulary and encoder: `Rec::is_bus_class` over `Kind::ALL`, `Op::ALL`, and the bodies
+# `encode_mirror`, `cover_body` and a take's snapshot write.
+aterm-slog = { workspace = true }

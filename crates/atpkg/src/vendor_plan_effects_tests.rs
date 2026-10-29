@@ -140,16 +140,16 @@ fn yanked_plans_preserve_their_primary_and_twin(codex_has_previous: bool) {
     }
     vendors.publish_codex_default("0.157.1");
     install(&layout, &vendors, &trust, "codex");
-    let channel = crate::manifest::Channel {
-        name: "stable".into(),
-        channel_build: 1,
-        min_build: 0,
-        min_build_by_program: Default::default(),
-        yanked: vec!["claude@2.1.282".into(), "codex@0.157.1".into()],
-        pin: Default::default(),
-        pin_by_target: Default::default(),
-    };
-    YankLatch::update_from_fresh_index(&layout, 1, &channel, world_now()).unwrap();
+    let index_body = format!(
+        "schema = 2\nindex_build = 1\nvalid_until = \"2099-01-01T00:00:00Z\"\n\
+         machine_id = \"{}\"\nroster_seq = {}\n\
+         [[channels]]\nname = \"stable\"\nyanked = [\"claude@2.1.282\", \"codex@0.157.1\"]\n",
+        crate::sig::testkit::MACHINE_ID,
+        crate::sig::testkit::SEQ,
+    );
+    let signed_index =
+        crate::sig::testkit::trusted_index_at(crate::sig::testkit::SEQ, index_body.into_bytes());
+    YankLatch::update_from_index(&layout, &signed_index, world_now()).unwrap();
     let installed = crate::active_builds(&layout);
     let interleave = Arc::new(Interleave::default());
     let at_checkpoint = interleave.clone();

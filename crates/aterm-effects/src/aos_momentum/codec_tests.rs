@@ -85,6 +85,7 @@ fn extreme_tick() -> MomentumEvent {
             theme_bg: 1,
             block: true,
             glyph_span: Some((i32::MIN, i32::MAX)),
+            light_vivid: true,
         },
     }
 }
@@ -219,10 +220,11 @@ fn a_bool_or_option_byte_no_encoding_writes_is_refused_naming_its_field() {
             },
         )
     };
-    let bools: [(&str, Flip); 3] = [
+    let bools: [(&str, Flip); 4] = [
         ("cfg.enabled", |c| c.enabled = false),
         ("cfg.dark_theme", |c| c.dark_theme = false),
         ("cfg.block", |c| c.block = false),
+        ("cfg.light_vivid", |c| c.light_vivid = true),
     ];
     let base = tick(|_| {}, None);
     for (field, flip) in bools {
@@ -245,7 +247,7 @@ fn a_bool_or_option_byte_no_encoding_writes_is_refused_naming_its_field() {
     );
     let spanned = tick(|c| c.glyph_span = Some((1, 2)), None);
     let mut bad = spanned.clone();
-    let span_tag = spanned.len() - 9;
+    let span_tag = spanned.len() - 10;
     assert_eq!(spanned[span_tag], 1, "fixture: the glyph span's tag");
     bad[span_tag] = 2;
     assert_eq!(
@@ -499,7 +501,7 @@ fn the_artifacts_name_their_kinds_and_bind_what_they_declare() {
     let schema = schema_artifact();
     assert_eq!(
         (schema.kind, schema.name.as_str(), schema.version),
-        (ArtifactKind::Schema, SCHEMA_NAME, 1)
+        (ArtifactKind::Schema, SCHEMA_NAME, 2)
     );
     assert_eq!(MomentumSchema::new(Instant::now()).id(), &schema);
     let contract = NoStrandedLight::artifact();

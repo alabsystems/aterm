@@ -47,7 +47,7 @@ fn progress_phase(advice: Option<&AccountAdvice>, point: AccountPoint) -> Progre
     match advice {
         Some(AccountAdvice::Probe { .. }) => ProgressPhase::Watching,
         Some(AccountAdvice::Move { .. } | AccountAdvice::Resume { .. }) => ProgressPhase::Ready,
-        Some(AccountAdvice::Wait { .. }) => ProgressPhase::Waiting,
+        Some(AccountAdvice::Wait { .. } | AccountAdvice::Hold { .. }) => ProgressPhase::Waiting,
         Some(_) => ProgressPhase::Unknown,
         None if matches!(point, AccountPoint::Wall { kind } if kind.reads_limited()) => {
             ProgressPhase::Limited
@@ -95,6 +95,12 @@ fn reason(word: &str) -> String {
         "no-candidate" | "no-fresh" => "No eligible alternate account",
         "breaker" => "Waiting for the account-switch limit to reset",
         "pinned" => "The selected account is pinned",
+        "offer-expiring" => "Keeping an expiring reset offer",
+        "nothing-due" => "No account switch is due",
+        "probe: due" => "An account usage check is due",
+        "jobs" => "Waiting until restart is safe",
+        "person" => "Restart held or signal refused",
+        "line" => "Account restart was refused",
         "unmeasured" => "Automatic switching has not been verified for this CLI build",
         "other-supervisor" => "Another supervisor owns account switching",
         "keyring-store" => "The CLI uses its own OS credential store",
@@ -102,6 +108,57 @@ fn reason(word: &str) -> String {
         other => other,
     }
     .to_owned()
+}
+
+/// Do not round a positive remaining wait down into the current displayed second.
+fn wait_deadline(now: i64, wait: Duration) -> Option<i64> {
+    let seconds = wait
+        .as_secs()
+        .checked_add(u64::from(wait.subsec_nanos() != 0))?;
+    now.checked_add(i64::try_from(seconds).ok()?)
+}
+
+/// Keep retained blockers first and append the process-local activity's own
+/// timestamp, never turning a fresh UI read into evidence of a new attempt.
+fn apply_login_activity(
+    value: &mut AccountProgress,
+    labels: &BTreeSet<String>,
+    activity: Vec<aterm_agent::harness::accounts_sync::LoginActivity>,
+    now: i64,
+) {
+    for entry in activity
+        .into_iter()
+        .filter(|entry| labels.contains(&entry.label))
+    {
+        if entry.observed_at > 0 && entry.observed_at <= now {
+            value
+                .details
+                .push(format!("Local sign-in activity: {}", entry.label));
+            value.details.push(format!(
+                "Activity at {}",
+                aterm_agent::harness::usage::rfc3339_utc(entry.observed_at),
+            ));
+        }
+        if entry.active
+            && !matches!(
+                value.phase,
+                ProgressPhase::Switching { .. } | ProgressPhase::Verifying { .. }
+            )
+        {
+            value.phase = ProgressPhase::SigningIn {
+                label: entry.label,
+                route: entry.route,
+            };
+        }
+        if let Some(next) = entry.next_at.filter(|next| *next > now) {
+            value.next_at = Some(
+                value
+                    .next_at
+                    .filter(|old| *old > now)
+                    .map_or(next, |old| old.min(next)),
+            );
+        }
+    }
 }
 
 impl WorkerIdle {
@@ -127,11 +184,8 @@ impl WorkerIdle {
         if self.switches.accounts() == accounts::Mode::Off {
             value.phase = ProgressPhase::Disabled;
         }
-        if let Some(AccountAdvice::Wait { until }) = advice {
-            value.next_at =
-                i64::try_from(until.saturating_duration_since(Instant::now()).as_secs())
-                    .ok()
-                    .and_then(|wait| now.checked_add(wait));
+        if let Some(AccountAdvice::Wait { until } | AccountAdvice::Hold { until }) = advice {
+            value.next_at = wait_deadline(now, until.saturating_duration_since(Instant::now()));
         }
         if let Some(AccountAdvice::Move { to }) = advice {
             value.details.push(format!("Selected alternate: {to}"));
@@ -282,40 +336,20 @@ impl HostHandle {
         let state = bound.state.clone();
         let labels = bound.labels.clone();
         drop(kept);
+        let now = aterm_time::unix_secs()
+            .and_then(|v| i64::try_from(v).ok())
+            .unwrap_or(value.observed_at);
+        // A retained decision can outlive its wait. Preserve its observation
+        // time and phase, but never present a past deadline as the next event.
+        value.next_at = value.next_at.filter(|at| *at > now);
         if let Some(state) = state {
-            let now = aterm_time::unix_secs()
-                .and_then(|v| i64::try_from(v).ok())
-                .unwrap_or(value.observed_at);
             let activity = aterm_agent::harness::accounts_sync::login_activity(
                 &accounts::Store::at(&state),
                 accounts::Cli::Claude,
                 now,
             )
             .ok_or(())?;
-            for entry in activity
-                .into_iter()
-                .filter(|entry| labels.contains(&entry.label))
-            {
-                if entry.active
-                    && !matches!(
-                        value.phase,
-                        ProgressPhase::Switching { .. } | ProgressPhase::Verifying { .. }
-                    )
-                {
-                    value.phase = ProgressPhase::SigningIn {
-                        label: entry.label,
-                        route: entry.route,
-                    };
-                }
-                if let Some(next) = entry.next_at.filter(|next| *next > now) {
-                    value.next_at = Some(
-                        value
-                            .next_at
-                            .filter(|old| *old > now)
-                            .map_or(next, |old| old.min(next)),
-                    );
-                }
-            }
+            apply_login_activity(&mut value, &labels, activity, now);
         }
         if self.shared.switches.accounts() == accounts::Mode::Off
             && !matches!(

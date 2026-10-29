@@ -388,10 +388,10 @@ mod tests {
                 "{}::run_returns_the_shells_status_not_an_older_zombie_childs",
                 module_path!().split_once("::").map_or("", |(_, rest)| rest)
             );
-            let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            let out = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
                 .args(["--exact", &name, "--nocapture", "--test-threads=1"])
                 .env(CHILD, "1")
-                .stdin(std::process::Stdio::null())
+                .stdin(aterm_uds::spawnfd::Stdio::null())
                 .output()
                 .expect("re-exec the test binary");
             let text = format!(
@@ -406,7 +406,7 @@ mod tests {
             );
             return;
         }
-        let decoy = std::process::Command::new("/bin/sh")
+        let decoy = aterm_uds::spawnfd::command("/bin/sh")
             .args(["-c", "exit 7"])
             .spawn()
             .expect("decoy");
@@ -476,10 +476,10 @@ mod tests {
                 "{}::the_shells_first_output_runs_the_hook_once",
                 module_path!().split_once("::").map_or("", |(_, rest)| rest)
             );
-            let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            let out = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
                 .args(["--exact", &name, "--nocapture", "--test-threads=1"])
                 .env(CHILD, "1")
-                .stdin(std::process::Stdio::null())
+                .stdin(aterm_uds::spawnfd::Stdio::null())
                 .output()
                 .expect("re-exec the test binary");
             let text = format!(
@@ -1038,7 +1038,7 @@ mod tests {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            assert_eq!(unsafe { libc::poll(&mut event, 1, 10_000) }, 1);
+            assert_eq!(unsafe { libc::poll(&mut event, 1, 60_000) }, 1);
             assert!(
                 poll_must_read(event.revents),
                 "revents={:#x}",

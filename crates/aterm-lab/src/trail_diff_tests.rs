@@ -160,6 +160,63 @@ fn any_state_difference_fails_on_every_frame_arms_or_none() {
 }
 
 #[test]
+fn the_ledger_compares_as_a_stream_where_no_arm_touched_the_under_stream() {
+    let ledgered = |arms: &str, ledger: &str| {
+        frame(&[
+            ("light=0 arms=-", arms),
+            (
+                "  light n=0",
+                &format!("  ledger n=4 {ledger}\n  light n=0"),
+            ),
+        ])
+    };
+    let plain = "light=0 arms=-";
+    let r = report(
+        &dump(&[ledgered(plain, "ink=dddd")]),
+        &dump(&[ledgered(plain, "ink=dddd")]),
+    );
+    assert!(!r.differs(), "equal ledgers: {r:?}");
+    let r = report(
+        &dump(&[ledgered(plain, "ink=dddd")]),
+        &dump(&[ledgered(plain, "ink=ddde")]),
+    );
+    assert_eq!(
+        (r.differing_compared, r.state_differing),
+        (1, 0),
+        "with no arm the ledger is compared, as a stream: {r:?}"
+    );
+    assert_eq!(
+        r.firsts,
+        ["differs dark/typing.trail S - F0 t=0.000: ledger.ink head=dddd base=ddde"]
+    );
+    for under in [
+        "light=1 arms=glass:glow_under",
+        "light=1 arms=yield:glow_under_ramps",
+    ] {
+        let r = report(
+            &dump(&[ledgered(under, "ink=dddd")]),
+            &dump(&[ledgered(under, "ink=ddde")]),
+        );
+        assert!(
+            !r.differs(),
+            "{under}: an arm on the under stream exempts it: {r:?}"
+        );
+    }
+    let over = "light=1 arms=lip:glow_halo";
+    let r = report(
+        &dump(&[ledgered(over, "ink=dddd")]),
+        &dump(&[ledgered(over, "ink=ddde")]),
+    );
+    assert_eq!(
+        r.differing_compared, 1,
+        "an arm on another stream does not: {r:?}"
+    );
+    let r = report(&dump(&[ledgered(plain, "ink=dddd")]), &dump(&[frame(&[])]));
+    assert_eq!(r.differing_compared, 1, "a ledger one side lacks: {r:?}");
+    assert!(r.firsts[0].ends_with("ledger.n head=4 base=-; ledger.ink head=dddd base=-"));
+}
+
+#[test]
 fn a_frame_one_build_holds_or_lacks_differs_as_its_shape() {
     let held = "F 0 t=0.000 held\n".to_string();
     let r = report(
@@ -264,22 +321,18 @@ fn a_run_or_script_one_build_lacks_differs() {
 
 #[test]
 fn a_dump_line_the_format_does_not_have_is_an_error() {
-    assert!(parse_dump("  px 1x1:0\n").unwrap_err().contains("line 1"));
-    assert!(
-        parse_dump("P a\nF 0 t=0.000 light=0 arms=-\n")
-            .unwrap_err()
-            .contains("a frame before its run")
-    );
-    assert!(
-        parse_dump("P a\nS -\nF 0 t=0.000 light=0\n")
-            .unwrap_err()
-            .contains("not a frame line")
-    );
-    assert!(
-        parse_dump("P a\nS -\nbogus\n")
-            .unwrap_err()
-            .contains("not a dump line")
-    );
+    for (text, line) in [
+        ("  px 1x1:0\n", 1),
+        ("P a\nF 0 t=0.000 light=0 arms=-\n", 2),
+        ("P a\nS -\nF 0 t=0.000 light=0\n", 3),
+        ("P a\nS -\nbogus\n", 3),
+    ] {
+        let err = parse_dump(text).expect_err(text);
+        assert!(
+            err.starts_with(&format!("line {line}:")),
+            "{text:?} fails at its line {line}: {err}"
+        );
+    }
     let full =
         format!("P a\nS -\n{FRAME}  W glow_under[0] Quad {{ .. }}\n  W state ribbon.x 0001\n");
     let parsed = parse_dump(&full).expect("the full detail parses");
@@ -287,6 +340,52 @@ fn a_dump_line_the_format_does_not_have_is_an_error() {
         parsed[0].runs[0].frames[0],
         parse_dump(&dump(&[frame(&[])])).expect("a dump")[0].runs[0].frames[0]
     );
+}
+
+/// A `git diff -U0` that only declares a closure file's module, as a parent module adds it.
+const DECLARES_STATE_WORDS: &str = "diff --git a/crates/x/src/lib.rs b/crates/x/src/lib.rs
+index 1111111..2222222 100644
+--- a/crates/x/src/lib.rs
++++ b/crates/x/src/lib.rs
+@@ -12,0 +13,3 @@ mod engine;
++
++#[cfg(any(test, debug_assertions))]
++mod state_words;
+";
+
+/// The exception to the closure split (§15.0.6): a file whose diff only adds a closure file's
+/// `mod state_words;` (any visibility), blank lines and attributes declares it; one that also
+/// changes a line, removes one, or declares another module changes itself.
+#[test]
+fn a_file_that_only_declares_a_closure_module_is_its_h_commits() {
+    assert!(only_declares_a_closure_module(DECLARES_STATE_WORDS));
+    for public in ["pub mod state_words;", "pub(crate) mod state_words;"] {
+        let diff = DECLARES_STATE_WORDS.replace("+mod state_words;", &format!("+{public}"));
+        assert!(only_declares_a_closure_module(&diff), "{public}");
+    }
+    let no_eol = format!("{DECLARES_STATE_WORDS}\\ No newline at end of file\n");
+    assert!(only_declares_a_closure_module(&no_eol));
+    for (what, diff) in [
+        (
+            "a changed line beside it",
+            format!("{DECLARES_STATE_WORDS}@@ -40 +43 @@\n-    let x = 1;\n+    let x = 2;\n"),
+        ),
+        (
+            "another module",
+            DECLARES_STATE_WORDS.replace("mod state_words;", "mod words;"),
+        ),
+        (
+            "code after the declaration",
+            format!("{DECLARES_STATE_WORDS}+fn more() {{}}\n"),
+        ),
+        (
+            "only an attribute",
+            DECLARES_STATE_WORDS.replace("+mod state_words;\n", ""),
+        ),
+        ("no hunk", String::new()),
+    ] {
+        assert!(!only_declares_a_closure_module(&diff), "{what}: {diff}");
+    }
 }
 
 #[test]
@@ -344,8 +443,49 @@ fn the_closure_is_the_dump_its_support_the_rig_every_state_words_and_the_profile
         ["[profile.trail-diff]"]
     );
 
-    let refusal = closure_refusal(&closure_differs(changed, "", toml, &changed_level));
-    assert_eq!(refusal.code, 3, "a closure that differs is NOT RUN");
+    let no_diff = |_: &str| None;
+    assert_eq!(
+        beside_closure(changed, untracked, toml, toml, no_diff),
+        6,
+        "the five changed files outside the closure and the untracked notes.txt"
+    );
+    assert_eq!(
+        beside_closure("Cargo.toml\0", "", toml, &changed_level, no_diff),
+        0,
+        "a Cargo.toml whose only change is the profile changes only the closure"
+    );
+    assert_eq!(
+        beside_closure(
+            "Cargo.toml\0",
+            "",
+            toml,
+            &changed_level.replace("x = 1", "x = 2"),
+            no_diff
+        ),
+        1,
+        "a Cargo.toml changed beside the profile too is beside the closure"
+    );
+    let declaring = |path: &str| {
+        (path == "crates/aterm-gui/src/lib.rs").then(|| DECLARES_STATE_WORDS.to_string())
+    };
+    assert_eq!(
+        beside_closure(changed, untracked, toml, toml, declaring),
+        5,
+        "a file that only declares a closure file's module is not beside it"
+    );
+
+    let members = closure_differs(changed, "", toml, &changed_level);
+    let mixed = closure_refusal(&members, 6);
+    let refusal = closure_refusal(&members, 0);
+    assert_eq!(
+        (refusal.code, mixed.code),
+        (3, 3),
+        "a closure that differs is NOT RUN"
+    );
+    assert_ne!(
+        mixed.msg, refusal.msg,
+        "a head that changes files beside its closure is asked to split them off"
+    );
     let msg = refusal.msg.unwrap_or_default();
     assert!(
         msg.contains("crates/aterm-gui/examples/trail_dump.rs")
@@ -439,4 +579,80 @@ fn frame_numbers_print_as_ranges() {
     assert_eq!(f(&["3", "4", "5", "9", "11", "12"]), "F3-F5 F9 F11-F12");
     assert_eq!(f(&["0"]), "F0");
     assert_eq!(f(&[]), "");
+}
+
+/// A kept base follows `vendor/astream` to a pin its own store has not fetched (the trail-diff
+/// `--keep` defect: under `submodule.recurse` the kept tree's checkout recursed into the submodule
+/// and failed, "failed to unpack tree object", before the update could fetch the pin).
+#[cfg(unix)]
+#[test]
+fn a_kept_base_follows_a_submodule_pin_its_store_has_not_fetched() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let (lib, app, base) = (
+        tmp.path().join("lib"),
+        tmp.path().join("app"),
+        tmp.path().join("base"),
+    );
+    // Local repositories: a file URL's clone and fetch are allowed for the scratch submodule.
+    let run = |dir: &Path, args: &[&str]| {
+        let mut all = vec![
+            "-c",
+            "user.name=Andrew Yates",
+            "-c",
+            "user.email=lab@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "protocol.file.allow=always",
+        ];
+        all.extend_from_slice(args);
+        git(dir, &all).unwrap_or_else(|e| panic!("{e}"))
+    };
+    let committed = |dir: &Path, file: &str, text: &str| {
+        std::fs::write(dir.join(file), text).expect("write");
+        run(dir, &["add", file]);
+        run(dir, &["commit", "-q", "-m", file]);
+        commit(dir, "HEAD").expect("a commit")
+    };
+    for dir in [&lib, &app] {
+        std::fs::create_dir_all(dir).expect("dir");
+        run(dir, &["init", "-q", "-b", "main"]);
+    }
+    committed(&lib, "a", "one\n");
+    committed(&app, "f", "x\n");
+    let url = lib.to_string_lossy().into_owned();
+    run(&app, &["submodule", "add", "-q", &url, "vendor/astream"]);
+    run(&app, &["commit", "-q", "-m", "astream"]);
+    run(&app, &["config", "submodule.recurse", "true"]);
+    let first = commit(&app, "HEAD").expect("first");
+    // What a first `--keep` run left: the base worktree with its own submodule store, which
+    // later fetches its pins by file here.
+    let wt = base.to_string_lossy().into_owned();
+    run(&app, &["worktree", "add", "-q", "--detach", &wt, &first]);
+    run(
+        &base,
+        &["submodule", "update", "-q", "--init", "vendor/astream"],
+    );
+    run(
+        &base.join("vendor/astream"),
+        &["config", "protocol.file.allow", "always"],
+    );
+
+    let pin = committed(&lib, "b", "two\n");
+    let sub = app.join("vendor/astream");
+    run(&sub, &["fetch", "-q", "origin"]);
+    run(&sub, &["checkout", "-q", &pin]);
+    run(&app, &["commit", "-q", "-am", "bump"]);
+    let second = commit(&app, "HEAD").expect("second");
+
+    let tree = BaseTree::stand(&app, &base, &second, true)
+        .unwrap_or_else(|f| panic!("the kept base stands: {:?}", f.msg));
+    assert_eq!(commit(&base, "HEAD").expect("the base"), second);
+    assert_eq!(
+        commit(&base.join("vendor/astream"), "HEAD").expect("its submodule"),
+        pin,
+        "the kept base's submodule is at the base's pin"
+    );
+    drop(tree);
+    assert!(base.is_dir(), "a kept base stays");
 }

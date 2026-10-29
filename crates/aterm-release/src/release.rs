@@ -255,7 +255,7 @@ pub struct ReleaseOptions {
     /// `--commit <rev>`: release this commit of origin/main.
     pub commit: Option<String>,
     pub linux: LinuxDecl,
-    /// `--release-credentials <path>`; default `~/.aterm/release-credentials.toml`.
+    /// `--release-credentials <path>`; default `~/.aterm/release-ring/release-credentials.toml`.
     pub release_credentials: Option<PathBuf>,
     /// `--engine <path>`; default `$PUBLICATION_ENGINE`, else `~/publication`.
     pub engine: Option<PathBuf>,
@@ -589,6 +589,7 @@ impl RunClaim {
 }
 
 /// `<state>/steps.tsv`: `epoch\tversion\tstep\tsecs`, a line per step that ran.
+/// Returns the upper median (`sorted[len / 2]`) of the last ≤ 5 valid durations per step.
 #[must_use]
 pub fn estimates(tsv: &str) -> BTreeMap<String, u64> {
     let mut runs: BTreeMap<String, Vec<u64>> = BTreeMap::new();
@@ -604,8 +605,8 @@ pub fn estimates(tsv: &str) -> BTreeMap<String, u64> {
         .map(|(step, all)| {
             let mut last: Vec<u64> = all[all.len().saturating_sub(5)..].to_vec();
             last.sort_unstable();
-            let median = last[last.len() / 2];
-            (step, median)
+            let upper_median = last[last.len() / 2];
+            (step, upper_median)
         })
         .collect()
 }
@@ -821,7 +822,11 @@ pub trait Backend {
         reserved: &Reservation,
         prover: &Prover,
     ) -> Result<String, Refusal>;
-    fn audit(&mut self, machine_id: &str) -> Vec<Finding>;
+    /// What this machine lacks to cut. A dry run's audit writes nothing; a real run's may
+    /// re-assert what the cut it gates writes anyway (the release keychain's partition list),
+    /// so its test signature runs before the publish. An explicitly selected credentials
+    /// profile is the one audited and authorized against the current roster.
+    fn audit(&mut self, machine_id: &str, profile: Option<&Path>, dry: bool) -> Vec<Finding>;
     fn ask(&mut self, words: &AskWords) -> Result<String, String>;
     fn resolve(&mut self, key: &str) -> Result<String, String>;
     fn withdraw(&mut self, key: &str) -> Result<String, String>;
@@ -940,7 +945,7 @@ pub fn run_with(b: &mut dyn Backend, opts: &ReleaseOptions, home: &Path) -> Outc
     let creds = opts
         .release_credentials
         .clone()
-        .unwrap_or_else(|| home.join(".aterm/release-credentials.toml"));
+        .unwrap_or_else(|| home.join(atpkg_keys::provision::RELEASE_CREDENTIALS_REL));
     let mut run = Run {
         b,
         opts: opts.clone(),
@@ -3052,7 +3057,9 @@ impl Run<'_> {
             let found = match (&self.dry_audit, self.dry) {
                 (Some(found), true) => found.clone(),
                 _ => {
-                    let found = self.b.audit(&id);
+                    let found =
+                        self.b
+                            .audit(&id, self.opts.release_credentials.as_deref(), self.dry);
                     if self.dry {
                         self.dry_audit = Some(found.clone());
                     }
@@ -3872,4 +3879,43 @@ fn newer(a: &str, b: &str) -> bool {
         (p.next().unwrap_or(0), p.next().unwrap_or(0))
     };
     key(a) > key(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn estimates_takes_upper_median_of_last_five_and_formats_durations() {
+        let tsv = "\
+1\t0.1.0\teven\t10\n\
+2\t0.1.0\teven\t40\n\
+malformed\trow\n\
+3\t0.1.0\teven\tnan\n\
+4\t0.1.0\twindow\t1000\n\
+5\t0.1.0\twindow\t5\n\
+6\t0.1.0\twindow\t30\n\
+7\t0.1.0\twindow\t10\n\
+8\t0.1.0\twindow\t20\n\
+9\t0.1.0\twindow\t40\n";
+        let got = estimates(tsv);
+        assert_eq!(
+            got.get("even"),
+            Some(&40),
+            "sorted[2 / 2] is the upper median"
+        );
+        assert_eq!(
+            got.get("window"),
+            Some(&20),
+            "only the last five runs (5, 30, 10, 20, 40) participate"
+        );
+        assert_eq!(got.len(), 2);
+
+        assert_eq!(fmt_dur(0), "0s");
+        assert_eq!(fmt_dur(59), "59s");
+        assert_eq!(fmt_dur(60), "1m00s");
+        assert_eq!(fmt_dur(185), "3m05s");
+        assert_eq!(fmt_dur(3600), "1h00m");
+        assert_eq!(fmt_dur(9480), "2h38m");
+    }
 }

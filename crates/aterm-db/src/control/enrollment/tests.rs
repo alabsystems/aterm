@@ -353,3 +353,39 @@ fn enrollment_publication_conforms_to_real_network_retries_and_refusals() {
     assert!(!model.check_invariant("RetryKeepsEpoch", &mutant));
     assert!(!model.successors("LostReply", &initial).contains(&mutant));
 }
+
+#[test]
+fn enrollment_serve_clears_cached_peer_round_before_checking_enrollment() {
+    let lab = Lab::new(false);
+    let owner = lab.endpoint(0);
+    let pending = lab.pending();
+    let peer_actor = pending.actor;
+    let proof = NodeProof {
+        node: pending.identity.node().into(),
+        key: pending.identity.key(),
+    };
+    let mut saved = Repair::default();
+    saved.prepare(owner.trust, peer_actor);
+    saved.cursor = Some([9; 32]);
+    saved.application = Some(crate::replica::Report::default());
+    saved.phase = Phase::Complete;
+    drop(owner.peers.acquire(peer_actor, &mut saved).unwrap());
+
+    let mut bytes = (pending.hello.len() as u32).to_le_bytes().to_vec();
+    bytes.extend_from_slice(&pending.hello);
+    let mut stream = std::io::Cursor::new(bytes);
+    let mut repair = Repair::default();
+    assert!(
+        owner
+            .connected(&mut stream, Some(&proof), Side::Responder, &mut repair)
+            .is_err()
+    );
+    assert_eq!(
+        repair.authenticated_actor(),
+        None,
+        "a failed enrollment after a cached peer round must not report the cached round's authentication"
+    );
+    assert_eq!(repair.phase(), Phase::Membership);
+    assert!(repair.application().is_none());
+    assert_eq!(repair.cursor, Some([9; 32]));
+}

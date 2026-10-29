@@ -170,6 +170,7 @@ impl Grid {
             self.reuse_scrolled_rows(rows_to_reuse, cols);
         }
         self.enforce_history_link_budget();
+        self.storage.note_history_pushed(n);
 
         debug_assert!(
             self.storage.rows.len()
@@ -212,9 +213,7 @@ impl Grid {
         }
         self.storage.total_lines += rows_to_add;
         self.storage.absolute_row_counter += rows_to_add as u64;
-        self.storage
-            .extras
-            .shift_rows_up_by(0, row_u16(rows_to_add));
+        self.storage.extras.shift_rows_up_by(row_u16(rows_to_add));
         let vis = self.storage.visible_rows;
         self.fill_bce_rgb_rows(vis.saturating_sub(row_u16(rows_to_add))..vis);
     }
@@ -255,9 +254,7 @@ impl Grid {
             }
         }
 
-        self.storage
-            .extras
-            .shift_rows_up_by(0, row_u16(rows_to_reuse));
+        self.storage.extras.shift_rows_up_by(row_u16(rows_to_reuse));
         let vis = self.storage.visible_rows;
         self.fill_bce_rgb_rows(vis.saturating_sub(row_u16(rows_to_reuse))..vis);
         self.storage.absolute_row_counter += rows_to_reuse as u64;
@@ -365,7 +362,7 @@ impl Grid {
         self.storage.ring_head = (self.storage.ring_head + 1) % row_count;
     }
 
-    const DETACHED_LAZY_CAP: usize = 50_000;
+    pub(crate) const DETACHED_LAZY_CAP: usize = 50_000;
 
     fn bound_detached_lazy_buffer(&mut self) {
         let len = self.storage.lazy_buffer.len();

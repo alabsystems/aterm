@@ -69,7 +69,7 @@ impl From<&str> for TextRope {
             let mut iter = leaves.into_iter();
             while let Some(left) = iter.next() {
                 next.push(match iter.next() {
-                    Some(right) => branch(left, right),
+                    Some(right) => concat(left, right),
                     None => left,
                 });
             }
@@ -230,22 +230,101 @@ verify_island! {
     }
 }
 
-fn concat(left: Arc<Node>, right: Arc<Node>) -> Arc<Node> {
+fn join_leaf_texts(left: &str, right: &str) -> Arc<Node> {
+    let mut joined = String::with_capacity(left.len() + right.len());
+    joined.push_str(left);
+    joined.push_str(right);
+    leaf(&joined)
+}
+
+fn leftmost_leaf_bytes(node: &Node) -> usize {
+    let mut cur = node;
+    while let Node::Branch { left, .. } = cur {
+        cur = left;
+    }
+    bytes(cur)
+}
+
+fn rightmost_leaf_bytes(node: &Node) -> usize {
+    let mut cur = node;
+    while let Node::Branch { right, .. } = cur {
+        cur = right;
+    }
+    bytes(cur)
+}
+
+fn take_leftmost_leaf(node: Arc<Node>) -> (Arc<str>, Arc<Node>) {
+    match &*node {
+        Node::Empty => (Arc::from(""), empty()),
+        Node::Leaf { text, .. } => (Arc::clone(text), empty()),
+        Node::Branch { left, right, .. } => {
+            let (first, rest_left) = take_leftmost_leaf(Arc::clone(left));
+            (first, concat_balanced(rest_left, Arc::clone(right)))
+        }
+    }
+}
+
+fn append_to_rightmost_leaf(node: Arc<Node>, suffix: &str) -> Arc<Node> {
+    if suffix.is_empty() {
+        return node;
+    }
+    match &*node {
+        Node::Empty => leaf(suffix),
+        Node::Leaf { text, .. } => join_leaf_texts(text, suffix),
+        Node::Branch { left, right, .. } => branch(
+            Arc::clone(left),
+            append_to_rightmost_leaf(Arc::clone(right), suffix),
+        ),
+    }
+}
+
+fn concat_balanced(left: Arc<Node>, right: Arc<Node>) -> Arc<Node> {
     if bytes(&left) == 0 {
         return right;
     }
     if bytes(&right) == 0 {
         return left;
     }
-    if let (Node::Leaf { text: a, .. }, Node::Leaf { text: b, .. }) = (&*left, &*right)
-        && a.len().saturating_add(b.len()) <= CHUNK_MERGE_MAX
+    let left_h = height(&left);
+    let right_h = height(&right);
+    if left_h > right_h.saturating_add(1)
+        && let Node::Branch {
+            left: left_left,
+            right: left_right,
+            ..
+        } = &*left
     {
-        let mut joined = String::with_capacity(a.len() + b.len());
-        joined.push_str(a);
-        joined.push_str(b);
-        return leaf(&joined);
+        return balance(branch(
+            Arc::clone(left_left),
+            concat_balanced(Arc::clone(left_right), right),
+        ));
     }
-    balance(branch(left, right))
+    if right_h > left_h.saturating_add(1)
+        && let Node::Branch {
+            left: right_left,
+            right: right_right,
+            ..
+        } = &*right
+    {
+        return balance(branch(
+            concat_balanced(left, Arc::clone(right_left)),
+            Arc::clone(right_right),
+        ));
+    }
+    branch(left, right)
+}
+
+fn concat(mut left: Arc<Node>, mut right: Arc<Node>) -> Arc<Node> {
+    while bytes(&left) > 0
+        && bytes(&right) > 0
+        && rightmost_leaf_bytes(&left).saturating_add(leftmost_leaf_bytes(&right))
+            <= CHUNK_MERGE_MAX
+    {
+        let (first, rest_right) = take_leftmost_leaf(right);
+        left = append_to_rightmost_leaf(left, &first);
+        right = rest_right;
+    }
+    concat_balanced(left, right)
 }
 
 fn balance(node: Arc<Node>) -> Arc<Node> {
@@ -450,16 +529,116 @@ mod tests {
         }
     }
 
+    fn collect_leaf_lengths(node: &Node, out: &mut Vec<usize>) {
+        match node {
+            Node::Empty => {}
+            Node::Leaf { text, newlines } => {
+                assert!(!text.is_empty());
+                assert!(text.len() <= CHUNK_MERGE_MAX);
+                assert_eq!(*newlines, text.bytes().filter(|&b| b == b'\n').count());
+                out.push(text.len());
+            }
+            Node::Branch {
+                left,
+                right,
+                bytes: b,
+                newlines: nl,
+                height: h,
+            } => {
+                assert!(bytes(left) > 0 && bytes(right) > 0);
+                assert_eq!(*b, bytes(left) + bytes(right));
+                assert_eq!(*nl, newlines(left) + newlines(right));
+                assert_eq!(*h, taller_child(height(left), height(right)) + 1);
+                let factor = i16::from(height(left)) - i16::from(height(right));
+                assert!(
+                    (-1..=1).contains(&factor),
+                    "strict AVL violated: left={} right={}",
+                    height(left),
+                    height(right),
+                );
+                collect_leaf_lengths(left, out);
+                collect_leaf_lengths(right, out);
+            }
+        }
+    }
+
+    fn assert_rope_invariants(rope: &TextRope) {
+        let mut leaves = Vec::new();
+        collect_leaf_lengths(&rope.root, &mut leaves);
+        assert_eq!(leaves.len(), rope.chunk_count());
+        for pair in leaves.windows(2) {
+            assert!(
+                pair[0] + pair[1] > CHUNK_MERGE_MAX,
+                "adjacent leaves {} + {} <= CHUNK_MERGE_MAX ({CHUNK_MERGE_MAX})",
+                pair[0],
+                pair[1],
+            );
+        }
+        if !leaves.is_empty() {
+            let max_h = 2 * (leaves.len().ilog2() as usize + 1);
+            assert!(
+                usize::from(rope.height()) <= max_h,
+                "height {} exceeds {max_h} for {} chunks",
+                rope.height(),
+                leaves.len(),
+            );
+        }
+    }
+
     #[test]
     fn large_text_is_chunked_balanced_and_round_trips() {
         let source = (0..5_000)
             .map(|index| format!("line {index} — 🦀\n"))
             .collect::<String>();
         let rope = TextRope::from(source.as_str());
+        assert_rope_invariants(&rope);
         assert!(rope.chunk_count() > 2);
         assert!(usize::from(rope.height()) <= rope.chunk_count().ilog2() as usize + 2);
         assert_eq!(rope.to_flat_string(), source);
         assert_eq!(rope.line_count(), 5_001);
+
+        for chunks in [1usize, 2, 3, 5, 9, 17, 33] {
+            let sample = "x".repeat(chunks * CHUNK_TARGET + 1);
+            let built = TextRope::from(sample.as_str());
+            assert_rope_invariants(&built);
+            assert_eq!(built.to_flat_string(), sample);
+        }
+    }
+
+    #[test]
+    fn repeated_edits_preserve_strict_avl_balance_and_coalesce_small_leaves() {
+        let mut expected = "abcd\n".repeat(40_960);
+        let mut rope = TextRope::from(expected.as_str());
+        assert_rope_invariants(&rope);
+
+        for step in 0..300usize {
+            let at = 4_097 + step;
+            let ch = if step % 2 == 0 { "x" } else { "\n" };
+            expected.replace_range(at..at, ch);
+            rope = rope.replace(at..at, ch).unwrap();
+            if step % 50 == 49 {
+                assert_rope_invariants(&rope);
+            }
+        }
+        for step in 0..300usize {
+            let at = expected.len() - 13;
+            let ch = if step % 3 == 0 { "y" } else { "z" };
+            expected.replace_range(at..at, ch);
+            rope = rope.replace(at..at, ch).unwrap();
+            if step % 50 == 49 {
+                assert_rope_invariants(&rope);
+            }
+        }
+        assert_rope_invariants(&rope);
+        assert_eq!(rope.to_flat_string(), expected);
+
+        for step in 0..400usize {
+            let at = 8_200 + (step * 37) % 60_000;
+            expected.replace_range(at..at + 1, "q");
+            rope = rope.replace(at..at + 1, "q").unwrap();
+        }
+        assert_rope_invariants(&rope);
+        assert_eq!(rope.to_flat_string(), expected);
     }
 
     #[test]

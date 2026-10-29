@@ -222,7 +222,10 @@ fn an_untold_move_remains_with_its_origin() {
     let look = idle.account_look(&a.roster()).unwrap();
     let mut foreign = a.seat();
     foreign.state = a.tmp.path().join("foreign");
-    assert_eq!(idle.account_untold(&foreign, &look, true), None);
+    assert_eq!(
+        idle.account_untold(&foreign, &look, usage_wall(), true),
+        None
+    );
     assert!(
         idle.kept
             .lock()
@@ -235,10 +238,14 @@ fn an_untold_move_remains_with_its_origin() {
     );
     let gate = Arc::clone(&idle.kept.lock().unwrap().account.landing);
     let held = gate.lock().unwrap();
-    assert_eq!(idle.account_untold(&a.seat(), &look, true), None);
+    assert_eq!(
+        idle.account_untold(&a.seat(), &look, usage_wall(), true),
+        None
+    );
     drop(held);
     assert_eq!(
-        idle.account_untold(&a.seat(), &look, true).as_deref(),
+        idle.account_untold(&a.seat(), &look, usage_wall(), true)
+            .as_deref(),
         Some("work-2")
     );
 }

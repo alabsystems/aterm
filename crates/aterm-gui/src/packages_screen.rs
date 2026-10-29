@@ -16,6 +16,9 @@ pub(crate) enum PackagesBusy {
     Uninstall,
     /// `atpkg machine apply`.
     MachineApply,
+    /// `atpkg serve-units --on` (`on`) or `--off`: a person's flip of Settings ▸ Packages ▸
+    /// [`atpkg::peers::SERVE_SWITCH`].
+    Sharing { on: bool },
 }
 
 impl PackagesBusy {
@@ -24,12 +27,26 @@ impl PackagesBusy {
         matches!(self, Self::Check | Self::Install | Self::MachineApply)
     }
 
+    /// The page hero's headline while this verb runs; `None` for a LAN sharing flip, which only
+    /// its switch shows.
+    const fn running_headline(self) -> Option<&'static str> {
+        match self {
+            Self::Check => Some("Checking for package updates…"),
+            Self::Install => Some("Installing ALab tools…"),
+            Self::Uninstall => Some("Removing ALab tools…"),
+            Self::MachineApply => Some("Applying the machine settings…"),
+            Self::Sharing { .. } => None,
+        }
+    }
+
     const fn completed_headline(self) -> &'static str {
         match self {
             Self::Check => "Package check completed",
             Self::Install => "ALab tools install completed",
             Self::Uninstall => "ALab tools removed",
             Self::MachineApply => "Machine settings applied",
+            Self::Sharing { on: true } => "LAN sharing turned on",
+            Self::Sharing { on: false } => "LAN sharing turned off",
         }
     }
 
@@ -39,6 +56,7 @@ impl PackagesBusy {
             Self::Install => "ALab tools install failed",
             Self::Uninstall => "ALab tools removal failed",
             Self::MachineApply => "Machine settings not applied",
+            Self::Sharing { .. } => "LAN sharing not changed",
         }
     }
 }
@@ -260,6 +278,8 @@ pub(crate) fn plain_state(kind: &ProgramStateKind, state: &str) -> Option<String
         ProgramStateKind::Shadowed { path, .. } => format!("another copy runs first: {path}"),
         ProgramStateKind::System { path, .. } => format!("uses the copy at {path}"),
         ProgramStateKind::AgentInstalling => "installing\u{2026}".to_string(),
+        ProgramStateKind::DevLinked => "development link".to_string(),
+        ProgramStateKind::DevLinkUnavailable => "development link unavailable".to_string(),
         ProgramStateKind::Unavailable => "not available for this Mac".to_string(),
         ProgramStateKind::Other => return held_words(state),
     })
@@ -479,6 +499,10 @@ pub(crate) enum ProgramStateKind {
     },
     /// An agent program the pass has not installed yet.
     AgentInstalling,
+    /// The current command comes from a checked development link, outside the signed store.
+    DevLinked,
+    /// A recorded development link could not be resolved to all of its executable tools.
+    DevLinkUnavailable,
     Unavailable,
     Other,
 }
@@ -948,6 +972,9 @@ pub(crate) struct PackagesStatusReport {
     pub(crate) collection_error: Option<String>,
     /// The store carries atpkg's declined marker (`aterm pkg uninstall --all`).
     pub(crate) declined: bool,
+    /// The store carries the person's off of LAN sharing (`aterm pkg serve-units --off`,
+    /// [`atpkg::peers::turned_off`]); unread, sharing is on.
+    pub(crate) units_off: bool,
     /// `status.toml`'s `last_success_at` (RFC 3339, empty when never).
     pub(crate) last_success_at: String,
     /// The package log's newest events.
@@ -978,6 +1005,7 @@ impl PackagesStatusReport {
             programs: Vec::new(),
             collection_error: None,
             declined: false,
+            units_off: false,
             last_success_at: String::new(),
             ignored_prefix: None,
             cc_prereq: None,
@@ -1012,20 +1040,34 @@ impl PackagesStatusReport {
                 }
                 None => "dev-link".to_string(),
             });
+            let linked = target.is_some();
+            let overlay = PackagesProgramRow {
+                name: name.clone(),
+                installed_build: None,
+                state: if linked {
+                    "linked"
+                } else {
+                    "development link unavailable"
+                }
+                .to_string(),
+                kind: if linked {
+                    ProgramStateKind::DevLinked
+                } else {
+                    ProgramStateKind::DevLinkUnavailable
+                },
+                facts: atpkg::stub::describe(name).map(VendorFacts::parse),
+                annotation,
+                upstream: None,
+                update: ProgramUpdate {
+                    source: "development checkout".to_string(),
+                    ..ProgramUpdate::default()
+                },
+                words: None,
+            };
             if let Some(row) = programs.iter_mut().find(|row| row.name == *name) {
-                row.annotation = annotation;
+                *row = overlay;
             } else {
-                programs.push(PackagesProgramRow {
-                    name: name.clone(),
-                    installed_build: None,
-                    state: "linked".to_string(),
-                    kind: ProgramStateKind::Other,
-                    facts: None,
-                    annotation,
-                    upstream: None,
-                    update: ProgramUpdate::default(),
-                    words: None,
-                });
+                programs.push(overlay);
             }
         }
         if let Some(status) = status {
@@ -1063,6 +1105,7 @@ impl PackagesStatusReport {
             programs,
             collection_error: None,
             declined: false,
+            units_off: false,
             last_success_at: status
                 .map(|s| s.last_success_at.clone())
                 .unwrap_or_default(),
@@ -1081,6 +1124,18 @@ impl PackagesStatusReport {
         pins: Option<&std::collections::BTreeMap<String, u64>>,
     ) {
         for row in &mut self.programs {
+            if matches!(
+                row.kind,
+                ProgramStateKind::DevLinked | ProgramStateKind::DevLinkUnavailable
+            ) {
+                if row.kind == ProgramStateKind::DevLinked {
+                    row.update.version = aterm_agent::harness::codex_alab::linked_package_versions(
+                        layout, &row.name,
+                    )
+                    .map(|(product, client)| format!("{product} (client {client}; dev-linked)"));
+                }
+                continue;
+            }
             let Some(build) = row.installed_build else {
                 continue;
             };
@@ -1194,17 +1249,25 @@ fn collect_packages_status_from_layout(
         .map(|layout| match atpkg::linked_programs_checked(layout) {
             Ok(names) => names
                 .into_iter()
-                .filter_map(|name| match atpkg::linked_checkout_checked(layout, &name) {
-                    Ok(Some(target)) => Some((name, Some(target))),
-                    Ok(None) => {
-                        record_error(format!("Link marker {name:?} disappeared while reading"));
-                        None
-                    }
-                    Err(error) => {
-                        record_error(format!("Could not read link marker {name:?}: {error}"));
-                        None
-                    }
-                })
+                .filter_map(
+                    |name| match atpkg::linkmode::live_linked_checkout(layout, &name) {
+                        Ok(Some(target)) => Some((name, Some(target))),
+                        Ok(None) => {
+                            record_error(format!("Link marker {name:?} disappeared while reading"));
+                            Some((name, None))
+                        }
+                        Err(error) => {
+                            record_error(format!("Could not read link marker {name:?}: {error}"));
+                            let selected_store = atpkg::active_builds(layout).get(&name).copied();
+                            let runs_store = atpkg::which(layout, &name).is_some_and(|target| {
+                                selected_store.is_some_and(|build| {
+                                    target.starts_with(layout.build_dir(&name, build))
+                                })
+                            });
+                            (!runs_store).then_some((name, None))
+                        }
+                    },
+                )
                 .collect(),
             Err(error) => {
                 record_error(format!("Could not enumerate package links: {error}"));
@@ -1229,6 +1292,7 @@ fn collect_packages_status_from_layout(
                 atpkg::alab::program_upstream(layout, &row.name).map(|upstream| upstream.words());
         }
         report.declined = layout.declined().is_file();
+        report.units_off = atpkg::peers::turned_off(layout);
         let pins = atpkg::cli::latest_known_pins(layout, &atpkg::config::load());
         report.attach_store_facts(layout, pins.as_ref().map(|(_, pins)| pins));
     }
@@ -1245,6 +1309,9 @@ pub(crate) struct PackagesService {
     busy: Option<PackagesBusy>,
     report: Option<PackagesStatusReport>,
     last_command: Option<PackagesCommandOutcome>,
+    /// The last flip of Settings ▸ Packages' LAN sharing switch ([`PackagesBusy::Sharing`]), kept
+    /// apart from `last_command`: the switch shows it, and the page's hero never does.
+    sharing: Option<PackagesCommandOutcome>,
     /// What bare `atpkg machine` last measured, plus this launch's memory of what changed.
     machine: MachinePosture,
     /// The last background toolchain pass's trouble.
@@ -1313,6 +1380,7 @@ impl PackagesService {
             busy: None,
             report: None,
             last_command: None,
+            sharing: None,
             machine: MachinePosture::default(),
             pass_trouble: None,
             updated: 0,
@@ -1511,6 +1579,7 @@ impl PackagesService {
             (_, Some(PackagesBusy::Install)) => 3,
             (_, Some(PackagesBusy::Uninstall)) => 4,
             (_, Some(PackagesBusy::MachineApply)) => 5,
+            (_, Some(PackagesBusy::Sharing { .. })) => 6,
         };
         let (last_operation, last_result) = match self.last_command.as_ref() {
             None => (0, 0),
@@ -1520,6 +1589,7 @@ impl PackagesService {
                     PackagesBusy::Install => 3,
                     PackagesBusy::Uninstall => 4,
                     PackagesBusy::MachineApply => 5,
+                    PackagesBusy::Sharing { .. } => 6,
                 },
                 1,
             ),
@@ -1529,6 +1599,7 @@ impl PackagesService {
                     PackagesBusy::Install => 3,
                     PackagesBusy::Uninstall => 4,
                     PackagesBusy::MachineApply => 5,
+                    PackagesBusy::Sharing { .. } => 6,
                 },
                 2,
             ),
@@ -1546,7 +1617,8 @@ impl PackagesService {
         }
     }
 
-    /// Begin one worker pass (`busy = None` ⇒ a silent status refresh).
+    /// Begin one worker pass (`busy = None` ⇒ a silent status refresh). A verb clears the
+    /// result it replaces: a LAN sharing flip the last flip's, any other the last verb's.
     pub(crate) fn begin(&mut self, busy: Option<PackagesBusy>) -> Option<u64> {
         if self.inflight {
             return None;
@@ -1554,9 +1626,13 @@ impl PackagesService {
         self.sequence = self.sequence.saturating_add(1);
         self.inflight = true;
         self.busy = busy;
-        if busy.is_some() {
-            self.last_command = None;
-            self.updated = 0;
+        match busy {
+            Some(PackagesBusy::Sharing { .. }) => self.sharing = None,
+            Some(_) => {
+                self.last_command = None;
+                self.updated = 0;
+            }
+            None => {}
         }
         self.revision = self.revision.saturating_add(1);
         Some(self.sequence)
@@ -1590,8 +1666,12 @@ impl PackagesService {
             manager_enabled: completion.report.manager_enabled,
         });
         self.report = Some(completion.report);
-        if completion.command.is_some() {
-            self.last_command = completion.command;
+        match completion.command {
+            Some(command) if matches!(command.operation(), PackagesBusy::Sharing { .. }) => {
+                self.sharing = Some(command);
+            }
+            Some(command) => self.last_command = Some(command),
+            None => {}
         }
         if let Some(state) = completion.machine_state {
             self.note_machine_record(state);
@@ -1643,6 +1723,7 @@ impl PackagesService {
             busy: self.busy,
             inflight: self.inflight,
             last_command: self.last_command.clone(),
+            sharing: self.sharing.clone(),
             master_enabled,
             auto_install,
             loop_running,
@@ -1680,8 +1761,11 @@ pub(crate) struct PackagesState {
     busy: Option<PackagesBusy>,
     /// Any worker is inflight, the silent status refresh (`busy` `None`) included.
     inflight: bool,
-    /// Final result of the most recent UI-initiated verb, preserved across silent refreshes.
+    /// Final result of the most recent UI-initiated verb, preserved across silent refreshes; a
+    /// LAN sharing flip's is `sharing` instead.
     last_command: Option<PackagesCommandOutcome>,
+    /// The last LAN sharing flip's result ([`PackagesService`]'s), which only the switch shows.
+    sharing: Option<PackagesCommandOutcome>,
     /// Resolved `[packages]` flags.
     master_enabled: bool,
     auto_install: bool,
@@ -1734,6 +1818,7 @@ impl PackagesState {
             busy: None,
             inflight: false,
             last_command: None,
+            sharing: None,
             master_enabled: true,
             auto_install: true,
             loop_running: false,
@@ -1754,11 +1839,9 @@ impl PackagesState {
     /// [`Self::projection`] with the clock injected.
     pub(crate) fn projection_at(&self, now: std::time::SystemTime) -> PackagesProjection {
         let report = &self.report;
-        let actions_enabled = self.observed
-            && report.available
-            && report.manager_enabled
-            && report.collection_error.is_none()
-            && !self.inflight;
+        let sharing_enabled =
+            self.observed && report.available && report.manager_enabled && !self.inflight;
+        let actions_enabled = sharing_enabled && report.collection_error.is_none();
         let attention = attention_items(
             &report.programs,
             report.declined,
@@ -1773,13 +1856,8 @@ impl PackagesState {
                 .any(|row| atpkg::state::is_unserved_toolset(&row.state));
         let headline = if !self.observed {
             "Reading package status…".to_string()
-        } else if let Some(busy) = self.busy {
-            match busy {
-                PackagesBusy::Check => "Checking for package updates…".to_string(),
-                PackagesBusy::Install => "Installing ALab tools…".to_string(),
-                PackagesBusy::Uninstall => "Removing ALab tools…".to_string(),
-                PackagesBusy::MachineApply => "Applying the machine settings…".to_string(),
-            }
+        } else if let Some(line) = self.busy.and_then(PackagesBusy::running_headline) {
+            line.to_string()
         } else if let Some(command) = self.last_command.as_ref() {
             command.headline().to_string()
         } else if !report.available {
@@ -1850,7 +1928,7 @@ impl PackagesState {
         };
         let mut detail = if !self.observed {
             None
-        } else if let Some(busy) = self.busy {
+        } else if let Some(busy) = self.busy.filter(|busy| busy.running_headline().is_some()) {
             (busy != PackagesBusy::MachineApply).then(|| BUSY_DETAIL.to_string())
         } else if let Some(PackagesCommandOutcome::Succeeded { operation }) =
             self.last_command.as_ref().filter(|c| {
@@ -2013,6 +2091,12 @@ impl PackagesState {
             loop_running: self.loop_running,
             loop_status,
             retired_switch_note: self.retired_switch_note.clone(),
+            serves_units: !report.units_off,
+            sharing_enabled,
+            sharing_failed: match self.sharing.as_ref() {
+                Some(failed @ PackagesCommandOutcome::Failed { .. }) => Some(failed.feedback()),
+                _ => None,
+            },
             actions_enabled,
             headline,
             detail,
@@ -2257,6 +2341,16 @@ pub(crate) struct PackagesProjection {
     pub(crate) loop_status: String,
     /// Wrapped sentence for a retired `[packages] auto_update = false`.
     pub(crate) retired_switch_note: Option<String>,
+    /// LAN sharing ([`atpkg::peers::SERVE_SWITCH`]): on until the store carries the person's off
+    /// ([`PackagesStatusReport::units_off`]), so on before the first read too.
+    pub(crate) serves_units: bool,
+    /// The LAN sharing switch takes a flip: observed, available, enabled and idle. Unlike
+    /// `actions_enabled` it holds while some package details could not be read, which
+    /// `serve-units --off|--on` reads none of.
+    pub(crate) sharing_enabled: bool,
+    /// Why the last flip of the LAN sharing switch failed (`LAN sharing not changed: …`), until
+    /// the next flip; a sharing flip's result never takes the page's headline.
+    pub(crate) sharing_failed: Option<String>,
     /// Both action buttons: observed, available, enabled, read without error, and idle.
     pub(crate) actions_enabled: bool,
     pub(crate) headline: String,
@@ -2672,6 +2766,75 @@ mod tests {
         service.state(true, true, true).projection()
     }
 
+    /// A LAN SHARING FLIP NEVER TAKES THE PAGE'S HERO: the switch runs through the packages verb
+    /// path, but its result is kept apart from the last verb's, so a failed check's headline and
+    /// detail stand through a flip, its run and a refresh after it. Only the switch's row says a
+    /// flip failed, until the next flip.
+    #[test]
+    fn a_sharing_flip_leaves_the_hero_to_the_last_verb() {
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        let hero = |service: &PackagesService| {
+            let p = service.state(true, true, true).projection_at(at);
+            (p.headline, p.detail, p.sharing_failed)
+        };
+        let report = report_with(&[("ay", "active".to_string())]);
+        let mut service = PackagesService::new();
+        observe(&mut service, report.clone());
+        let check = service.begin(Some(PackagesBusy::Check)).expect("idle");
+        assert!(service.finish(
+            check,
+            PackagesWorkerCompletion::command(
+                report.clone(),
+                PackagesCommandOutcome::Failed {
+                    operation: PackagesBusy::Check,
+                    message: "atpkg update exited with status 7".to_string(),
+                },
+            ),
+        ));
+        let (headline, detail, failed) = hero(&service);
+        assert_eq!(headline, "Package check failed");
+        assert_eq!(failed, None);
+        let stands = (headline, detail, None);
+
+        let off = PackagesBusy::Sharing { on: false };
+        let flip = service.begin(Some(off)).expect("idle");
+        assert_eq!(
+            projection(&service).busy,
+            Some(off),
+            "the switch shows it running"
+        );
+        assert_eq!(hero(&service), stands, "while the flip runs");
+        assert!(service.finish(
+            flip,
+            PackagesWorkerCompletion::command(
+                report.clone(),
+                PackagesCommandOutcome::Failed {
+                    operation: off,
+                    message: "could not write units-off".to_string(),
+                },
+            ),
+        ));
+        let said = Some("LAN sharing not changed: could not write units-off".to_string());
+        let after = (stands.0.clone(), stands.1.clone(), said);
+        assert_eq!(
+            hero(&service),
+            after,
+            "a failed flip says so on its row alone"
+        );
+        observe(&mut service, report.clone());
+        assert_eq!(hero(&service), after, "a refresh keeps both");
+
+        let on = PackagesBusy::Sharing { on: true };
+        let flip = service.begin(Some(on)).expect("idle");
+        assert_eq!(
+            hero(&service),
+            stands,
+            "the next flip clears the last one's failure"
+        );
+        assert!(service.finish(flip, succeeded(report, on)));
+        assert_eq!(hero(&service), stands, "and its success takes no headline");
+    }
+
     #[test]
     fn attention_is_the_doctors_faults_and_an_unreached_vendor() {
         let item = |name: &str, state: &str| attention_item(name, state);
@@ -3062,7 +3225,11 @@ mod tests {
             PackagesStatusReport::from_parts(true, true, "fp".into(), Some(&status("ok")), &links);
         assert_eq!(report.programs.len(), 2);
         let ay = report.programs.iter().find(|row| row.name == "ay").unwrap();
-        assert_eq!(ay.installed_build, Some(1971), "status row kept");
+        assert_eq!(
+            ay.installed_build, None,
+            "the current link shadows the historical store build"
+        );
+        assert_eq!(ay.kind, ProgramStateKind::DevLinked);
         assert!(
             ay.annotation
                 .as_deref()
@@ -3073,9 +3240,103 @@ mod tests {
             .iter()
             .find(|row| row.name == "orc")
             .unwrap();
-        assert_eq!(orc.state, "linked");
+        assert_eq!(orc.kind, ProgramStateKind::DevLinkUnavailable);
         assert_eq!(orc.installed_build, None);
         assert!(report.programs.windows(2).all(|w| w[0].name <= w[1].name));
+    }
+
+    #[test]
+    fn a_current_dev_link_overlays_stale_installing_and_keeps_pass_history() {
+        const OWN: &str = "0.1.0-dev.13917+codex.0.165.0.g1aef4a3bf";
+        const CLIENT: &str = "0.166.0-dev.13917+g1aef4a3bf";
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let layout = atpkg::Layout {
+            prefix: temp.path().join("pkg"),
+        };
+        let checkout = temp.path().join("codex");
+        let rel =
+            std::path::PathBuf::from("bin").join(format!("codex{}", std::env::consts::EXE_SUFFIX));
+        let exe = checkout.join(&rel);
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"package bytes, never executed").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(
+            checkout.join("codex-package.json"),
+            format!(
+                r#"{{"layoutVersion":1,"entrypoint":"{}","version":"{OWN}"}}"#,
+                rel.to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            checkout.join("alab-build.json"),
+            format!(r#"{{"version":"{OWN}","client_version":"{CLIENT}"}}"#),
+        )
+        .unwrap();
+        atpkg::link(&layout, "codex", &checkout, &[rel]).unwrap();
+        let mut prior = status("previous pass completed");
+        prior.last_success_at = "2026-10-28T07:03:52Z".into();
+        prior.programs.insert(
+            "codex".into(),
+            atpkg::ProgramStatus {
+                state: atpkg::state::agent_installing(),
+                ..Default::default()
+            },
+        );
+        atpkg::status::write(&layout, &prior).unwrap();
+        let project = |target| {
+            let mut report = PackagesStatusReport::from_parts(
+                true,
+                true,
+                "fixture".into(),
+                Some(&prior),
+                &[("codex".into(), target)],
+            );
+            report.attach_store_facts(&layout, None);
+            report
+        };
+        let report = project(atpkg::linkmode::live_linked_checkout(&layout, "codex").unwrap());
+        let row = report
+            .programs
+            .iter()
+            .find(|row| row.name == "codex")
+            .unwrap();
+        assert_eq!(row.kind, ProgramStateKind::DevLinked);
+        assert_eq!(
+            row.update.version,
+            Some(format!("{OWN} (client {CLIENT}; dev-linked)"))
+        );
+        assert_eq!(
+            row.update.latest_known, None,
+            "a signed index pin does not own the link"
+        );
+        assert_eq!(report.outcome, prior.outcome);
+        assert_eq!(report.last_success_at, prior.last_success_at);
+        assert_eq!(atpkg::status::read(&layout).unwrap(), prior);
+
+        std::fs::write(checkout.join("alab-build.json"), "not JSON").unwrap();
+        let unknown = project(atpkg::linkmode::live_linked_checkout(&layout, "codex").unwrap());
+        let row = unknown
+            .programs
+            .iter()
+            .find(|row| row.name == "codex")
+            .unwrap();
+        assert_eq!(row.kind, ProgramStateKind::DevLinked);
+        assert_eq!(row.update.version, None, "invalid metadata stays unknown");
+        std::fs::remove_file(&exe).unwrap();
+        assert!(atpkg::linkmode::live_linked_checkout(&layout, "codex").is_err());
+        let broken = project(None);
+        let row = broken
+            .programs
+            .iter()
+            .find(|row| row.name == "codex")
+            .unwrap();
+        assert_eq!(row.kind, ProgramStateKind::DevLinkUnavailable);
+        assert_eq!(row.update.version, None);
     }
 
     /// Shadowed is read.

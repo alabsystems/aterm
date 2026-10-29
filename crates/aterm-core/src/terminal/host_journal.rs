@@ -45,6 +45,8 @@ pub enum HostOp {
     WithdrawShellRekey([u8; 32]),
     /// Typed shell-integration re-key settled ([`Terminal::settle_shell_integration_rekey`]).
     SettleShellRekey([u8; 32]),
+    /// Autonomous Kitty animation frame step ([`Terminal::advance_kitty_animations`]).
+    AdvanceKittyAnimations,
 }
 
 impl core::fmt::Debug for HostOp {
@@ -71,6 +73,7 @@ impl core::fmt::Debug for HostOp {
             Self::AuthorizeShellRekey(_) => f.write_str("AuthorizeShellRekey(..)"),
             Self::WithdrawShellRekey(_) => f.write_str("WithdrawShellRekey(..)"),
             Self::SettleShellRekey(_) => f.write_str("SettleShellRekey(..)"),
+            Self::AdvanceKittyAnimations => f.write_str("AdvanceKittyAnimations"),
         }
     }
 }
@@ -93,7 +96,10 @@ impl HostOp {
     pub const fn is_screen_cut(&self) -> bool {
         matches!(
             self,
-            Self::LeaveAlternateScreen | Self::ClearScrollback | Self::Reset
+            Self::LeaveAlternateScreen
+                | Self::ClearScrollback
+                | Self::Reset
+                | Self::AdvanceKittyAnimations
         )
     }
 }
@@ -106,6 +112,7 @@ pub struct HostReport {
     /// The mutation applied.
     pub op: HostOp,
     /// Clock reading at which the mutation ran, when time-sensitive (`LeaveAlternateScreen`).
+    /// `AdvanceKittyAnimations` carries its monotonic frame reading as well.
     pub clock: Option<ClockReading>,
 }
 
@@ -234,6 +241,9 @@ impl Terminal {
             }
             HostOp::SettleShellRekey(nonce) => {
                 let _ = self.settle_shell_integration_rekey(&nonce);
+            }
+            HostOp::AdvanceKittyAnimations => {
+                let _ = self.advance_kitty_animations(clock.monotonic);
             }
         }
     }

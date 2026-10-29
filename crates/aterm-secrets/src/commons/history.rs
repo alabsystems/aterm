@@ -275,12 +275,30 @@ impl Handoff {
         }
         // The recipient was already admitted at issuance and can open this
         // roster natively. No recursive trust in another handoff is necessary.
-        let issuance = access.historical(journal, identity, self.issued_under)?;
-        if !journal.selected_ancestor(self.source, self.issued_under) {
-            return Err(Error::new(
-                "history source is not an ancestor of its issuance",
-            ));
-        }
+        let issuance = if let Some(from_log) =
+            access.historical_from_log(journal, identity, self.issued_under)?
+        {
+            let source_valid =
+                if let crate::commons::journal::State::Ready { head, .. } = journal.state() {
+                    journal.selected_ancestor(self.source, head)
+                } else {
+                    journal.retained_payload_node(self.source)
+                };
+            if !source_valid {
+                return Err(Error::new(
+                    "history source is not an ancestor of its issuance",
+                ));
+            }
+            from_log
+        } else {
+            let past = access.historical(journal, identity, self.issued_under)?;
+            if !journal.selected_ancestor(self.source, self.issued_under) {
+                return Err(Error::new(
+                    "history source is not an ancestor of its issuance",
+                ));
+            }
+            past
+        };
         if ![&self.issuer, &self.recipient]
             .iter()
             .all(|binding| issuance.members().iter().any(|m| m.binding() == *binding))

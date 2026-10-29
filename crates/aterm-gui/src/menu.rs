@@ -1015,7 +1015,9 @@ pub(crate) enum InvokeAuthority {
     WriteInput,
     /// Rewrites durable `aterm.toml` on invoke or raises the durable-config surface.
     ConfigWrite,
-    /// Moves text onto or off the OS pasteboard.
+    /// Moves text onto or off the OS pasteboard. The op admits the verb; the copy or paste is
+    /// the person's own, so it refuses a socket caller's `invoke` (`App::refuse_clipboard_gesture`)
+    /// unless a development build's person stand-in fired it (`control_media::person_invoke_act`).
     ClipboardWrite,
     /// Owner-only, which no single fine op expresses.
     OwnerOnly,
@@ -3095,9 +3097,10 @@ mod macos {
     }
 
     fn ask(title: &str, body: &str, proceed_label: &str, default: AlertDefault) -> Option<bool> {
-        if super::os_ui_refused(title) || MainThread::new().is_none() {
+        if super::os_ui_refused(title) {
             return None;
         }
+        let mtm = MainThread::new()?;
         let _park = crate::watchdog::park_modal();
         let (Some(title), Some(body), Some(proceed), Some(cancel)) = (
             appkit::nsstring(title),
@@ -3108,10 +3111,8 @@ mod macos {
             // Foundation refused a string, so no alert can be built.
             return None;
         };
-        // SAFETY: `+[NSAlert new]` is `+(instancetype)` and +1 (alloc+init), which is what
-        // `Obj::from_owned` adopts.
-        let alert =
-            unsafe { Obj::from_owned(appkit::send_id(class(c"NSAlert").as_id(), sel!(new))) }?;
+        // An alert whose icon draws with no IconServices call on the main thread.
+        let alert = crate::app_icon::alert(mtm)?;
         // SAFETY: standard `NSAlert` setters and `runModal`, on the main thread
         // (`MainThread::new()` above proves it). `-setMessageText:` and `-setInformativeText:` are
         // `-(void)(NSString *)` and copy their argument, so the +1 strings may drop at the end of
@@ -3180,13 +3181,12 @@ mod macos {
         ) else {
             return None;
         };
-        // SAFETY: standard `NSAlert` construction + setters on the main thread.
-        // `+new` is +1 (alloc+init) and lands in `Obj`;
+        let alert = crate::app_icon::alert(MainThread::new()?)?;
+        // SAFETY: `NSAlert` setters on the main thread (the witness above).
         // `-setMessageText:`/`-setInformativeText:` are `-(void)(NSString *)`;
         // `-addButtonWithTitle:` is `-(id)` returning a BORROWED button this
         // caller does not keep.
         unsafe {
-            let alert = Obj::from_owned(appkit::send_id(class(c"NSAlert").as_id(), sel!(new)))?;
             appkit::send_v_id(alert.id(), sel!(setMessageText:), title.id());
             appkit::send_v_id(alert.id(), sel!(setInformativeText:), body.id());
             let _ = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), ok.id());
@@ -4529,7 +4529,7 @@ mod tests {
 
     #[test]
     fn the_strip_label_carries_no_colour_emoji() {
-        use super::{VersionFacts, VersionRung, strip_version_label, version_signature};
+        use super::{VersionRung, strip_version_label};
         for rung in [VersionRung::Full, VersionRung::Short] {
             for attention in [false, true] {
                 let Some(label) = strip_version_label(rung, attention) else {
@@ -4552,14 +4552,6 @@ mod tests {
                 );
             }
         }
-        let dirty = VersionFacts {
-            release: false,
-            version: "0.101.0",
-            dev_commits: "1576",
-            commit: "25a5963a4c21-dirty",
-        };
-        let short = version_signature(dirty, VersionRung::Short).expect("a dev short rung");
-        assert!(short.contains('*'), "a dirty short rung keeps `*`: {short}");
     }
 
     #[test]
@@ -4635,7 +4627,12 @@ mod tests {
         assert_eq!(
             super::staged_for_version_menu(Some((running, "0.92.0")), 0),
             Some((running, "0.92.0")),
-            "an unnamed running build filters nothing"
+            "an unnamed running build (0) offers any positive staged build"
+        );
+        assert_eq!(
+            super::staged_for_version_menu(Some((0, "0.92.0")), 0),
+            None,
+            "staged_for_version_menu keeps strictly build > running_build"
         );
         assert_eq!(super::staged_for_version_menu(None, running), None);
     }

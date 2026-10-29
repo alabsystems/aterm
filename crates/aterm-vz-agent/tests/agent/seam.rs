@@ -10,7 +10,7 @@ use std::sync::mpsc;
 
 use aterm_vz_agent::wire::{Exit, Frame, PROTO};
 
-use super::{Conn, HANG, agent_exe};
+use super::{Conn, HANG, agent_exe, until};
 
 /// The seam bin, killed by its pid however the test ends: a failed assertion must not
 /// leave it serving, holding the test's output open.
@@ -63,13 +63,11 @@ fn the_seam_bin_says_hello_with_its_key_and_its_own_sha256_and_serves_a_command(
         aterm_vz_agent::sha256_of(&exe).unwrap(),
         "the hello's hash is the binary's"
     );
-    let ready = loop {
-        match host.frame() {
-            Some(Frame::Booting(_)) => {}
-            Some(Frame::Ready(r)) => break r,
-            other => panic!("{other:?}"),
-        }
-    };
+    let ready = until("Ready", || match host.frame() {
+        Some(Frame::Booting(_)) => None,
+        Some(Frame::Ready(r)) => Some(r),
+        other => panic!("{other:?}"),
+    });
     assert_eq!(ready.state, "running");
 
     // `Ready` implies the command socket is bound: the bin binds it before it dials.

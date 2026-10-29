@@ -1243,7 +1243,7 @@ impl VideoTap {
         }
     }
 
-    /// The `fps=` gate on `(self, now_us)`: accepts every frame when uncapped, or once per `1_000_000 / n` µs.
+    /// The `fps=` gate on `(self, now_us)`: accepts every frame when uncapped, or once per `1_000_000 / max(1, n)` µs.
     fn should_capture(&mut self, now_us: u64) -> bool {
         let Some(fps) = self.fps_cap else {
             return true;
@@ -1252,7 +1252,8 @@ impl VideoTap {
             self.decimated += 1;
             return false;
         }
-        self.next_capture_us = now_us + 1_000_000 / u64::from(fps);
+        let interval_us = 1_000_000 / u64::from(fps.max(1));
+        self.next_capture_us = now_us.saturating_add(interval_us);
         true
     }
 
@@ -2433,6 +2434,18 @@ mod tests {
             assert!(tap.should_capture(t));
         }
         assert_eq!(tap.decimated, 0);
+    }
+
+    /// Zero fps_cap clamps to 1 fps and near-`u64::MAX` timestamps saturate without panicking.
+    #[test]
+    fn should_capture_zero_fps_and_max_timestamp_never_panic() {
+        let mut tap = test_tap(usize::MAX, Some(0));
+        assert!(tap.should_capture(0));
+        assert!(!tap.should_capture(999_999));
+        assert!(tap.should_capture(1_000_000));
+        assert!(tap.should_capture(u64::MAX - 10));
+        assert!(!tap.should_capture(u64::MAX - 1));
+        assert!(tap.should_capture(u64::MAX));
     }
 
     /// Device-free format contract: both byte-order variants retain source alpha while BGRA swizzles RGB.

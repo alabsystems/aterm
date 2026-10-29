@@ -220,9 +220,6 @@ fn the_exit_table_is_muse_codes_own() {
     ] {
         assert_eq!(exit_kind(status), kind, "{status}");
     }
-    let signals_only_crash = |status: i64| !matches!(status, 0 | 129 | 130 | 143);
-    assert!(!signals_only_crash(129) && exit_kind(129) == ExitKind::Crashed);
-    assert!(signals_only_crash(1) && exit_kind(1) == ExitKind::Refused);
     for (status, kind) in [
         (126, ExitKind::Refused),
         (127, ExitKind::Refused),
@@ -468,9 +465,4 @@ fn a_session_id_is_a_uuid() {
     assert!(is_session_uuid("0badbeef-0000-4000-8000-000000000000"));
     assert!(!is_session_uuid("my-session-name"));
     assert!(!is_session_uuid(&format!("{S1}0")));
-    assert!(session_created_ms(S1).is_some());
-    assert_eq!(
-        session_created_ms("0badbeef-0000-4000-8000-000000000000"),
-        None
-    );
 }

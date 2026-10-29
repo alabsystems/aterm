@@ -6,8 +6,8 @@
 use aterm_uds::spawnfd::{Child, Command, Stdio};
 use std::io;
 use std::process::{ExitStatus, Output};
-use std::sync::{Condvar, Mutex, MutexGuard};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 #[derive(Default)]
 struct State {
@@ -19,9 +19,20 @@ struct State {
 pub(super) struct Scope {
     state: Mutex<State>,
     drained: Condvar,
+    /// The meter of the stage whose walk this scope runs ([`crate::memory::current`] where the
+    /// walk began), which each child it owns books into, whichever thread runs it.
+    meter: Option<Arc<crate::memory::Meter>>,
 }
 
 impl Scope {
+    /// A scope whose owned children book into `meter`.
+    pub(super) fn metered(meter: Option<Arc<crate::memory::Meter>>) -> Scope {
+        Scope {
+            meter,
+            ..Scope::default()
+        }
+    }
+
     fn state(&self) -> MutexGuard<'_, State> {
         self.state
             .lock()
@@ -89,6 +100,8 @@ fn cancelled() -> io::Error {
 
 struct OwnedChild {
     child: Option<Child>,
+    /// The stage meter its reads of its process group book into, and that group.
+    meter: Option<(Arc<crate::memory::Meter>, u32)>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     /// The group's place on the interrupt list, while the child is owned.
     live: super::group::Live,
@@ -120,7 +133,11 @@ impl OwnedChild {
             #[cfg(unix)]
             command.process_group(0);
             let child = command.spawn()?;
+            if let Some(m) = &scope.meter {
+                m.started();
+            }
             let mut owned = Self {
+                meter: scope.meter.clone().map(|m| (m, child.id())),
                 #[cfg(unix)]
                 live: super::group::Live::enter(child.id()),
                 child: Some(child),
@@ -128,6 +145,8 @@ impl OwnedChild {
             #[cfg(unix)]
             drop(spawning);
             let mut nap = Duration::from_millis(1);
+            let begun = Instant::now();
+            let mut read_at: Option<Instant> = None;
             loop {
                 if scope.closed() {
                     return Err(cancelled());
@@ -135,9 +154,25 @@ impl OwnedChild {
                 if let Some(status) = owned.poll()? {
                     return Ok(status);
                 }
+                let now = Instant::now();
+                if super::meter_due(begun, read_at, now) {
+                    owned.read_usage();
+                    read_at = Some(now);
+                }
                 std::thread::sleep(nap);
                 nap = (nap * 2).min(Duration::from_millis(25));
             }
+        }
+    }
+
+    /// Book what its process group holds into its stage's meter, as often as
+    /// [`super::meter_due`] says: as it starts, often through its first half second, and every
+    /// [`super::READ_USAGE_EVERY`] after, as [`crate::exec::run`]'s clock reads its children.
+    fn read_usage(&self) {
+        if let Some((meter, pgid)) = &self.meter
+            && let Some(members) = aterm_sysprobe::group_usage(*pgid)
+        {
+            meter.book(*pgid, &members);
         }
     }
 
@@ -170,6 +205,9 @@ impl OwnedChild {
 
 impl Drop for OwnedChild {
     fn drop(&mut self) {
+        if let Some((meter, pgid)) = &self.meter {
+            meter.ended(*pgid);
+        }
         let Some(mut child) = self.child.take() else {
             return;
         };

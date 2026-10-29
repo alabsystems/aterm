@@ -20,6 +20,7 @@ fn config() -> Config {
         theme_fg: 0x00e6_e6e6,
         theme_bg: 0x001c_1c1c,
         reduced_motion: false,
+        light: aterm_effects::cursor_glow::Light::OFF,
     }
 }
 

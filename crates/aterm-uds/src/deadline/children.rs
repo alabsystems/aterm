@@ -97,16 +97,13 @@ pub(super) fn exit_reported(fd: &OwnedFd, timeout: Duration) -> io::Result<bool>
     poll(&mut fds, timeout)
 }
 
-/// `SIGKILL` the process group `child` leads, and the child itself.
+/// `SIGKILL` the process group `child` leads until no member is left
+/// ([`crate::process::kill_group_until_empty`]: a member's fork can dodge one signal on XNU), and
+/// the child itself. The child is not yet reaped, so its pid, and with it the group id it leads,
+/// cannot have been reused.
 pub(super) fn kill_group(child: &mut Child) {
     if let Ok(pid) = i32::try_from(child.id()) {
-        unsafe extern "C" {
-            fn kill(pid: i32, sig: i32) -> i32;
-        }
-        const SIGKILL: i32 = 9;
-        // SAFETY: a plain syscall. The child is not yet reaped, so its pid — and with it the group
-        // id it leads — cannot have been reused.
-        unsafe { kill(-pid, SIGKILL) };
+        let _ = crate::process::kill_group_until_empty(pid);
     }
     let _ = child.kill();
 }

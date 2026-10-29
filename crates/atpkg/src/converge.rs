@@ -80,6 +80,8 @@ ids! {
     PRIVATE = "base.shell.private";
     /// Disk headroom.
     DISK = "base.pkg.disk";
+    /// LAN sharing of toolset archives ([`crate::peers::Sharing`]).
+    LAN_SHARING = "base.pkg.lan-sharing";
     /// The Developer Tools list.
     DEVTOOLS = "base.privacy.devtools";
     /// Universal Control.

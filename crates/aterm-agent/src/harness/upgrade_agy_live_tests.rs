@@ -89,6 +89,18 @@ fn spawned(id: &str, at: &str) -> String {
     )
 }
 
+/// The row agy 1.4.10 writes for one subagent: its singular template.
+fn spawned_one(id: &str, at: &str) -> String {
+    row(
+        "GENERIC",
+        "DONE",
+        at,
+        &format!(
+            "Created At: 2026-10-29T06:59:38Z\nCompleted At: 2026-10-29T06:59:38Z\nCreated the following subagent:\n{{\n  \"conversationId\":  \"{id}\",\n  \"workspaceUris\":  [\n    \"file:///p\"\n  ]\n}}\nThe subagent will send you a message when it has completed its task or requires guidance. There is no need to poll for its response."
+        ),
+    )
+}
+
 fn idled(id: &str, at: &str) -> String {
     message(
         "system",
@@ -264,6 +276,23 @@ fn a_subagent_holds_the_restart_until_idle_or_killed() {
         killed_subagents(AT),
     ]);
     assert_eq!(open_work(&all, read_from()), Ok(()));
+}
+
+#[test]
+fn the_row_agy_writes_for_one_subagent_holds_the_restart_too() {
+    let spawn = spawned_one(SUB, AT);
+    assert_eq!(
+        open_work(&log(std::slice::from_ref(&spawn)), read_from()),
+        Err(Open::Subagent)
+    );
+    assert_eq!(
+        open_work(&log(&[spawn.clone(), idled(SUB, AT)]), read_from()),
+        Ok(())
+    );
+    assert_eq!(
+        open_work(&log(&[spawn, idled(SUB2, AT)]), read_from()),
+        Err(Open::Subagent)
+    );
 }
 
 #[test]

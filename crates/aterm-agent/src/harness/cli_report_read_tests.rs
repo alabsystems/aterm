@@ -325,7 +325,7 @@ fn a_captured_report_does_not_reread_changed_policy_or_discard_its_refusal() {
     let (mut out, mut err) = (Vec::new(), Vec::new());
     assert_eq!(
         run_accounts_report_snapshot(
-            Cli::Codex,
+            (Cli::Codex, Launch::default()),
             &f.env,
             true,
             &f.roster,
@@ -344,7 +344,7 @@ fn a_captured_report_does_not_reread_changed_policy_or_discard_its_refusal() {
     err.clear();
     assert_eq!(
         run_accounts_report_snapshot(
-            Cli::Codex,
+            (Cli::Codex, Launch::default()),
             &f.env,
             true,
             &f.roster,
@@ -422,7 +422,7 @@ fn empty_report_text_uses_captured_roster_presence() {
         let (mut out, mut err) = (Vec::new(), Vec::new());
         assert_eq!(
             run_accounts_report_snapshot(
-                Cli::Codex,
+                (Cli::Codex, Launch::default()),
                 &f.env,
                 false,
                 &f.roster,
@@ -452,7 +452,7 @@ fn missing_report_paths_and_provider_homes_have_json_refusals() {
         env.config = None;
         let (mut out, mut err) = (Vec::new(), Vec::new());
         assert_eq!(
-            run_accounts_report(cli, &env, true, &mut out, &mut err),
+            run_accounts_report((cli, Launch::default()), &env, true, &mut out, &mut err),
             ExitCode::from(1)
         );
         let doc: Value = aterm_json::from_slice(&out).unwrap();
@@ -474,7 +474,7 @@ fn missing_report_paths_and_provider_homes_have_json_refusals() {
         out.clear();
         err.clear();
         assert_eq!(
-            run_accounts_report(cli, &env, true, &mut out, &mut err),
+            run_accounts_report((cli, Launch::default()), &env, true, &mut out, &mut err),
             ExitCode::from(1)
         );
         let doc: Value = aterm_json::from_slice(&out).unwrap();

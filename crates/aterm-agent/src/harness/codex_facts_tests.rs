@@ -203,11 +203,34 @@ fn the_plans_windows_are_read_by_their_minutes() {
     );
     let facts = facts_of(&[both.clone(), weekly]);
     assert_eq!((facts.usage_5h_pct, facts.usage_7d_pct), (None, Some(1)));
-    let facts = facts_of(&[both, tokens(135_200, 258_400)]);
+    let facts = facts_of(&[both.clone(), tokens(135_200, 258_400)]);
     assert_eq!(
         (facts.usage_5h_pct, facts.usage_7d_pct),
         (Some(7), Some(1)),
         "a count with no limits keeps the last"
+    );
+    let bengalfox = limits(
+        "{\"limit_id\":\"codex_bengalfox\",\"primary\":{\"used_percent\":3.0,\"window_minutes\":300,\
+         \"resets_at\":3},\"secondary\":null}",
+    );
+    let premium = limits("{\"limit_id\":\"premium\",\"primary\":null,\"secondary\":null}");
+    let null_family =
+        limits("{\"limit_id\":null,\"primary\":{\"used_percent\":99.0,\"window_minutes\":300}}");
+    let facts = facts_of(&[both, bengalfox, premium, null_family]);
+    assert_eq!(
+        (facts.usage_5h_pct, facts.usage_7d_pct),
+        (Some(7), Some(1)),
+        "auxiliary and untagged limit_id snapshots never clobber the codex plan windows"
+    );
+    let near_bounds = limits(
+        "{\"limit_id\":\"codex\",\"primary\":{\"used_percent\":12.4,\"window_minutes\":299},\
+         \"secondary\":{\"used_percent\":44.6,\"window_minutes\":10079}}",
+    );
+    let facts = facts_of(&[near_bounds]);
+    assert_eq!(
+        (facts.usage_5h_pct, facts.usage_7d_pct),
+        (Some(12), Some(45)),
+        "5% window_minutes tolerance matches codex_limits::Bucket"
     );
     let odd = limits("{\"primary\":{\"used_percent\":140,\"window_minutes\":300}}");
     assert_eq!(

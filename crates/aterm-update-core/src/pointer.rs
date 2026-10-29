@@ -106,6 +106,9 @@ pub fn parse_location(
     accept_tag: &dyn Fn(&str) -> bool,
 ) -> Result<Pointer, PointerError> {
     let refused = |why: &'static str| PointerError::Refused { why };
+    if !path_segment_safe(owner) || !path_segment_safe(repo) || !path_segment_safe(name) {
+        return Err(refused("the release source is not URL-safe"));
+    }
     let mut prefix = String::from("https://github.com/");
     prefix.push_str(owner);
     prefix.push('/');
@@ -317,6 +320,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.tag, "atpkg-index-41");
+        assert!(matches!(
+            parse_location(
+                "bad/owner",
+                REPO,
+                NAME,
+                "https://github.com/bad/owner/aterm/releases/download/not-a-tag/aterm-appcast.toml",
+                &canonical_app_tag,
+            ),
+            Err(PointerError::Refused { .. })
+        ));
     }
 
     #[test]

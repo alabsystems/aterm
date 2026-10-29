@@ -72,8 +72,8 @@ must handle)`, `blocking_gaps` (audit §7 numbers, plus `N1`, the new gap in §0
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
-cfgif-first-match-selection	equivalence	cfg_if::cfg_if! (entry rule, @__arms, @__group)	∀ chain C (any n≥1, any predicates p_i, any bodies T_i, with or without T_e), in every syntactic position the macro accepts (item, statement, tail expression): E(C) is token-for-token T_{sel(C)}. When sel(C)=none, E(C) is empty: no item, no statement, no `()` and no `;`. Equivalently, in expression position E(C) behaves like `if cfg!(p_1) {T_1} else if cfg!(p_2) {T_2} … else {T_e}`. Core lemma: the guards g_i are pairwise mutually exclusive, and g_i holds ⇔ cfg(p_i) ∧ ∀j<i ¬cfg(p_j). So when several p_i hold, the FIRST one wins.	differential::real_macro_matches_rustc_on_every_chain, differential::no_arm_matches_expands_to_nothing, differential::tail_expression_produces_the_selected_arms_value	EASY propositional core (the guard algebra is a Lean lemma by induction on i). MEDIUM binding: induction over the @__arms accumulator, cfg evaluation of all/not/any, and statement/expression-position splicing with the caller's hygiene. The per-instance corollaries (const fns returning &'static str or u32) need only gap 0, but they are samples.	0, 10, N1
-cfgif-dead-arm-fully-absent	invariant	cfg_if::cfg_if! (@__arms guard, @__group splice)	∀ chain C, ∀ arm i ≠ sel(C): NO token of T_i survives cfg-stripping, whatever the number of items in T_i (k≥1). The guard g_i attaches to the single `@__group` macro-call item that carries all of T_i, never only to T_i's first item (upstream cfg-if issue #90). Corollary: a name defined only in a dead arm may be redefined beside the macro without a duplicate-definition error.	-	EASY once N1 models attribute binding: one structural fact about which node the cfg attribute covers, and no induction over T_i is needed.	0, 10, N1
+cfgif-first-match-selection	equivalence	cfg_if::cfg_if! (entry rule, @__arms, @__group)	∀ chain C (any n≥1, any predicates p_i, any bodies T_i, with or without T_e), in every syntactic position the macro accepts (item, statement, tail expression): E(C) is token-for-token T_{sel(C)} in the caller's syntax context (so a `let` bound in the selected arm is visible after the invocation). When sel(C)=none, E(C) is empty: no item, no statement, no `()` and no `;`. Equivalently, in expression position E(C) behaves like `if cfg!(p_1) {T_1} else if cfg!(p_2) {T_2} … else {T_e}`. Core lemma: the guards g_i are pairwise mutually exclusive, and g_i holds ⇔ cfg(p_i) ∧ ∀j<i ¬cfg(p_j). So when several p_i hold, the FIRST one wins.	differential::real_macro_matches_rustc_on_every_chain, differential::no_arm_matches_expands_to_nothing, differential::tail_expression_produces_the_selected_arms_value, differential::statement_arm_preserves_caller_hygiene_for_let_bindings, differential::cfg_if_expansion_conformance_and_tripwire_negative_controls	EASY propositional core (`CfgIfExpansion` in aterm-models-core proves FirstMatchSelected and DeadArmFullyAbsent across all predicate valuations and catches both tripwire mutants). MEDIUM binding: induction over the @__arms accumulator, cfg evaluation of all/not/any, and statement/expression-position splicing with the caller's hygiene.	0, 10, N1
+cfgif-dead-arm-fully-absent	invariant	cfg_if::cfg_if! (@__arms guard, @__group splice)	∀ chain C, ∀ arm i ≠ sel(C): NO token of T_i is expanded or survives cfg-stripping, whatever the number of items in T_i (k≥1). The guard g_i attaches to the single `@__group` macro-call item that carries all of T_i, never only to T_i's first item (upstream cfg-if issue #90). Corollary: a name defined only in a dead arm may be redefined beside the macro without a duplicate-definition error, and `compile_error!` in a dead arm does not fire.	differential::a_dead_arm_contributes_none_of_its_items, differential::cfg_if_expansion_conformance_and_tripwire_negative_controls	EASY once N1 models attribute binding: one structural fact about which node the cfg attribute covers (`DeadArmFullyAbsent` in `CfgIfExpansion`, caught by `Buggy = 2`).	0, 10, N1
 cfgif-linear-recursion-depth	other	cfg_if::cfg_if!	∀ chain C with m arms (m = n, plus 1 if T_e is present): depth(C) ≤ m + c for a small constant c (one @__arms level per arm and the base case, plus the entry and @__group levels). So any chain with m + c ≤ 128 (the default recursion_limit) expands with no #![recursion_limit]. This covers getrandom's backend chain and the 40-arm sample.	differential::forty_arms_stay_inside_the_default_recursion_limit	MEDIUM: a bound on expansion depth by induction over the arm list. N1 must model rustc's recursion counter, which counts nesting depth and not the total number of expansions.	0, 10, N1
 ```
 
@@ -99,9 +99,12 @@ nothing from any other arm. `cfgif-linear-recursion-depth` reuses the same induc
 ```tsv
 file	test	primary	also
 tests/differential.rs	real_macro_matches_rustc_on_every_chain	cfgif-first-match-selection	cfgif-dead-arm-fully-absent
+tests/differential.rs	a_dead_arm_contributes_none_of_its_items	cfgif-dead-arm-fully-absent	
 tests/differential.rs	no_arm_matches_expands_to_nothing	cfgif-first-match-selection	
 tests/differential.rs	tail_expression_produces_the_selected_arms_value	cfgif-first-match-selection	
 tests/differential.rs	forty_arms_stay_inside_the_default_recursion_limit	cfgif-linear-recursion-depth	cfgif-first-match-selection
+tests/differential.rs	statement_arm_preserves_caller_hygiene_for_let_bindings	cfgif-first-match-selection	
+tests/differential.rs	cfg_if_expansion_conformance_and_tripwire_negative_controls	cfgif-first-match-selection	cfgif-dead-arm-fully-absent, cfgif-linear-recursion-depth
 ```
 
 `real_macro_matches_rustc_on_every_chain` samples `cfgif-dead-arm-fully-absent` only weakly.
@@ -118,17 +121,17 @@ duplicate-definition compile error.
   STRONGER form of `cfgif-dead-arm-fully-absent`: a dead arm is never *expanded*, not only
   stripped afterwards. The N1 model should state that form, so that this doctest is subsumed as
   well. The `compile_fail` control is the negative control for the third and goes with it.
-- **The crate docs claim a property that nothing tests.** Hygiene is the caller's: a `let` bound
-  in an arm is visible after the invocation (`naga`'s `error.rs:114`). It belongs in the statement
-  of `cfgif-first-match-selection` ("token-for-token, in the caller's syntax context"), and the N1
-  model must carry it.
+- **Caller hygiene is stated and sampled (resolved 2026-10-28).** Hygiene is the caller's: a `let`
+  bound in an arm is visible after the invocation (`naga`'s `error.rs:114`). `cfgif-first-match-selection`
+  now states caller-context splicing explicitly and `statement_arm_preserves_caller_hygiene_for_let_bindings`
+  tests it directly.
 
 ## 4. Tests that are not spec samples
 
-Status 2026-10-16: the one test here, the last-match-wins tripwire, was deleted together with both
-deliberately wrong tripwire macros, and the leak test kept only its real-macro half (§5.2). The N1
-conformance test must carry its own negative control (`crates/aterm-spec/src/derive.rs`); the two
-tripwire mutations (last match wins, un-grouped arms) are the natural mutants for it.
+Status 2026-10-28: `CfgIfExpansion` (`aterm_models_core::cfg_if_expansion_model`) and
+`cfg_if_expansion_conformance_and_tripwire_negative_controls` in `tests/differential.rs` now carry
+the N1 route (a) `ty_model!` and both negative-control tripwire mutations (`Buggy = 1` last-match-wins
+and `Buggy = 2` un-grouped multi-item arms).
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -143,22 +146,20 @@ tripwire mutations (last match wins, un-grouped arms) are the natural mutants fo
    they are named for (on Linux both of the first two arms hold) is exercised only on Linux and
    Android cells. Only the `all()`/`any()` chains are host-independent first-match samples. The
    spec quantifies over all predicate valuations, which closes this.
-4. **The getrandom arm count disagrees with itself.** `src/lib.rs` says "twenty-eight
-   `mod X; pub use X::*;` pairs in `getrandom`'s backend chain" in the crate docs, and "`getrandom`'s
-   27-arm chain" in the comment on `@__group`. The difference does not matter to the depth bound
-   (both are far below 128), but one of the two is wrong, and the spec should cite neither.
-5. **The `@__group` comment is in the wrong place.** The comment "One recursion level per arm …" is
-   attached to the `@__group` rule, but the per-arm level is spent by `@__arms`. `@__group` adds
-   one constant level. This matters for stating `cfgif-linear-recursion-depth` correctly.
+4. **Resolved — conflicting `getrandom` arm counts removed.** `src/lib.rs` no longer cites a
+   specific `getrandom` backend arm count in its docs or macro rules.
+5. **Resolved — misplaced `@__group` recursion-depth comment removed.** `src/lib.rs` no longer
+   attaches the per-arm recursion-depth comment to `@__group`; §0 states the exact accounting
+   (one `@__arms` level per arm plus the entry and `@__group` levels).
 6. **The gap table has no row for these specs.** None of the 3 specs is blocked by any audit §7
    row as written; `macro_rules!` expansion semantics is missing from the table. This file cites
    gap 10 as the nearest row and adds N1 (§0).
 
 ## 6. Proof order (easiest high-value first)
 
-None of the 3 specs is blocked only by gap 0; all 3 wait on gap 10 and N1. So the first step is N1 route (a):
-a `ty_model!`/Clean model of the three rules, with a conformance test whose negative controls are
-the two tripwire mutations (last match wins, un-grouped arms).
+None of the 3 specs is blocked only by gap 0; all 3 wait on gap 10 and N1. The N1 route (a) `ty_model!`
+(`aterm_models_core::cfg_if_expansion_model`) and its conformance test with both tripwire negative
+controls (`cfg_if_expansion_conformance_and_tripwire_negative_controls`) are now authored and checked.
 
 1. **`cfgif-first-match-selection`**. It has the highest value: it retires 3 tests and covers the whole
    wrong-platform-code risk that `parking_lot_core`, `wgpu-hal` and `half` rely on. Its propositional core (the guards are

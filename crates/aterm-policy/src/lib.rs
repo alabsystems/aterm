@@ -20,7 +20,6 @@
 #[cfg(feature = "toml")]
 use serde::{Deserialize, Serialize};
 
-pub mod aliases;
 pub mod engine;
 pub mod limits;
 pub mod profiles;

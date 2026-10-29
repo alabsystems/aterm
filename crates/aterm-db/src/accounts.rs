@@ -11,6 +11,8 @@ use aterm_json::Value;
 #[cfg(unix)]
 pub mod activations;
 #[cfg(unix)]
+pub mod claims;
+#[cfg(unix)]
 mod plans;
 #[cfg(unix)]
 pub mod proposals;

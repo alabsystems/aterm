@@ -77,6 +77,7 @@ fn read(rows: Vec<String>, seq: u64, human: HumanInput) -> Screen {
         first: 0,
         generation: None,
         human,
+        title: None,
     }
 }
 
@@ -133,6 +134,7 @@ fn opts() -> Opts {
         usage_credits: false,
         usage_tap: None,
         instances: Instances::Listed(Vec::new()),
+        press: None,
         timings: crate::harness::Timings::FAST,
         agents_off: Vec::new(),
         land: false,
@@ -362,4 +364,84 @@ fn the_still_run_counts_claude_looks_at_the_same_words_and_not_repaints() {
         ),
         0
     );
+}
+
+/// A Claude Code screen under a command status line (aterm's usage tap is one), CONSTRUCTED in the
+/// shape of 2.1.311's tapped mid-reply capture: the reply's rows drawn so far and no spinner or
+/// `esc to interrupt` anywhere, `status` the line the status line prints under the composer.
+fn tapped(reply: &[&str], status: &str) -> Vec<String> {
+    let rule = "─".repeat(40);
+    let mut rows = vec!["❯ write the landing report".to_string(), String::new()];
+    rows.extend(reply.iter().map(|r| (*r).to_string()));
+    rows.extend([
+        String::new(),
+        rule.clone(),
+        "❯ ".to_string(),
+        rule,
+        format!("  {status}"),
+        "  ⏵⏵ auto mode on (shift+tab to cycle)".to_string(),
+    ]);
+    rows
+}
+
+/// The print guard in [`look_facts`]: a reply still being drawn under a status line reads idle at
+/// every look, but the words above its composer grow, so no two of its looks are in a row and the
+/// `busy` status left over it never lags ([`upgrade::status_lags`]) for `--now` to end the turn on.
+/// NEGATIVE CONTROL: the same session at one still transcript collects two looks and lags, a
+/// status line's refresh below the composer moving nothing.
+#[test]
+fn a_reply_still_being_drawn_never_collects_two_lag_looks() {
+    let reply = [
+        "⏺ Nothing left: the report is written and the branch is on main.",
+        "  - Checkout: clean, nothing unpushed.",
+        "  - Worktree: removed, its branch merged.",
+        "  - Fixtures: three, each named for the frame it holds.",
+        "  NEEDS YOU: nothing",
+    ];
+    let status = "OK schema=1 agent=idle agent_since_ms=600000 hold=0 hand=-";
+    let t0 = NOW;
+    let sf = SessionFile {
+        pid: PID,
+        session_id: "01a0dc36-1dc1-7ee2-be91-11bc323e377c".to_string(),
+        cwd: "/".to_string(),
+        version: "2.1.311".to_string(),
+        status: "busy".to_string(),
+        status_updated_at_ms: (t0 - 600) * 1_000,
+        proc_start: String::new(),
+        kind: "interactive".to_string(),
+        entrypoint: "cli".to_string(),
+        claude_dir: None,
+        profile: None,
+    };
+    let mut st = St::default();
+    let mut t = t0;
+    for drawn in 1..=reply.len() {
+        let rows = tapped(&reply[..drawn], "lab status line");
+        let scr = read(
+            rows,
+            u64::try_from(drawn).expect("a seq"),
+            HumanInput::Never,
+        );
+        let probe = ladder_look(&mut st.clone(), "claude", &scr, PID, GRACE, t);
+        assert!(
+            probe.idle_read,
+            "PRECONDITION: the screen alone reads a drawing reply idle: {:?}",
+            scr.rows
+        );
+        let f = look_at(&mut st, &sf, &scr, status, t);
+        assert_eq!(
+            f.idle_looks, 1,
+            "{drawn} rows drawn: each look the first of a run"
+        );
+        assert!(!upgrade::status_lags(&f), "{drawn} rows drawn: no lag");
+        t += upgrade::QUIET_S;
+    }
+    let done = |line: &str| read(tapped(&reply, line), 9, HumanInput::Never);
+    let f = look_at(&mut st, &sf, &done("lab status line"), status, t);
+    assert_eq!(f.idle_looks, 2, "the same words again: in a row");
+    assert!(upgrade::status_lags(&f), "and the status lags");
+    t += upgrade::QUIET_S;
+    let f = look_at(&mut st, &sf, &done("lab status line 2"), status, t);
+    assert_eq!(f.idle_looks, 3, "the status line's refresh is no new word");
+    assert!(upgrade::status_lags(&f));
 }

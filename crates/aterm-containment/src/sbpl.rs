@@ -150,8 +150,10 @@ pub const SECRET_SUBDIRS: &[&str] = &[
     ".docker",
     ".config/gcloud",
     ".azure",
-    // The release signing identity the secrets vault fills on every Mac (Developer ID key).
+    // The release signing identity the secrets vault fills on every Mac (Developer ID key
+    // and the shared release ring).
     ".aterm/apple",
+    ".aterm/release-ring",
 ];
 
 /// Credential files under `$HOME` denied as `literal` paths for read and write, with their
@@ -1006,20 +1008,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn private_data_is_gated_on_the_fs_capability_not_network() {
-        let home = home_dir().unwrap_or_else(|| {
-            aterm_spec::host::could_not_run("no HOME: no private-data gate check")
-        });
-        let canon = std::fs::canonicalize(&home).unwrap_or_else(|e| {
-            aterm_spec::host::could_not_run(format!(
-                "HOME {home} does not resolve ({e}): no private-data gate check"
-            ))
-        });
+        let scratch = aterm_tempfile::tempdir().expect("scratch HOME");
+        let canon = std::fs::canonicalize(scratch.path()).expect("canonicalize scratch HOME");
+        let home = scratch.path().to_str().expect("utf8 scratch HOME");
         let private_marker = format!("(subpath \"{}\")", sbpl_str(&canon.join("Documents")));
         let secret_marker = format!("(subpath \"{}\")", sbpl_str(&canon.join(".ssh")));
 
         let base = ContainmentPolicy::capabilities(ContainmentMode::Containment);
 
-        let full = profile_for(&base).expect("Containment yields a profile");
+        let (full, full_scoped) =
+            profile_for_scoped(base, Some(home)).expect("Containment yields a profile");
+        assert!(full_scoped);
         assert!(
             full.contains(&secret_marker),
             "secret must be denied; got {full}"
@@ -1031,7 +1030,9 @@ mod tests {
 
         let mut broadened = base;
         broadened.fs = FsCapability::HomeReadWrite;
-        let prof = profile_for(&broadened).expect("network None still yields a profile");
+        let (prof, prof_scoped) =
+            profile_for_scoped(broadened, Some(home)).expect("network None still yields a profile");
+        assert!(prof_scoped);
         assert!(
             prof.contains(&secret_marker),
             "network-denied spawn must still deny credentials; got {prof}"

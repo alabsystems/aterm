@@ -4,8 +4,8 @@
 //! Vibrancy alpha policy: `background_opacity` scales only background-quad alpha
 //! and engages the WCAG-AA contrast floor.
 
-/// Background-quad alpha under `opacity`: `round(clamp01(opacity) * 255)`, or `255` when
-/// non-finite or `>= 1.0`.
+/// Background-quad alpha under `opacity`: `round(clamp01(opacity) * 255)` capped at `254` below
+/// `1.0`, or `255` when non-finite or `>= 1.0`.
 #[must_use]
 #[inline]
 pub const fn bg_quad_alpha(opacity: f32) -> u8 {
@@ -15,7 +15,8 @@ pub const fn bg_quad_alpha(opacity: f32) -> u8 {
     if opacity <= 0.0 {
         return 0;
     }
-    (opacity * 255.0 + 0.5) as u8
+    let rounded = (opacity * 255.0 + 0.5) as u8;
+    if rounded == 255 { 254 } else { rounded }
 }
 
 /// Whether `opacity` describes a translucent window (`opacity.is_finite() && opacity < 1.0`).

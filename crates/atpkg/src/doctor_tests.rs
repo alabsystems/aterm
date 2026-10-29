@@ -142,13 +142,150 @@ fn the_suppressed_compiler_tuple_is_reported() {
     );
 }
 
+/// NO CACHED INDEX JUDGES THE VENDOR HALF ALONE: before an index is read, the toolset row of a
+/// machine that took the default set on still weighs the set's vendor rows, which the vendor
+/// lane installs without an index, and invents no index program (ay counts for nothing either
+/// way); one that never took the set on owes nothing yet.
 #[test]
-fn no_cached_index_invents_no_missing_programs() {
+fn no_cached_index_judges_the_vendor_half_alone() {
     let l = layout("no-index");
-    let (unexplained, on_purpose, dev_linked) =
-        missing_against_index(&l, &builds(&["ay"]), &names(&[]));
-    assert!(unexplained.is_empty() && on_purpose.is_empty() && dev_linked.is_empty());
+    let installed = builds(&["ay", "claude"]);
+    assert_eq!(
+        missing_against_index(&l, &installed, &names(&[])),
+        Missing::default(),
+        "not taken on: nothing is owed"
+    );
+    std::fs::create_dir_all(&l.prefix).unwrap();
+    std::fs::write(l.adopted(), "").unwrap();
+    assert_eq!(
+        missing_against_index(&l, &installed, &names(&[])),
+        missing_from_set(
+            None,
+            crate::config::cached(),
+            crate::cli::current_triple(),
+            &installed,
+            &names(&[]),
+            &names(&[]),
+        ),
+        "taken on: with no index file the toolset row reads the vendor half"
+    );
     let _ = std::fs::remove_dir_all(&l.prefix);
+    let cfg = crate::config::PackagesConfig {
+        exclude: Some(vec!["muse".into()]),
+        ..Default::default()
+    };
+    assert_eq!(
+        missing_from_set(
+            None,
+            &cfg,
+            "aarch64-apple-darwin",
+            &installed,
+            &names(&["agy"]),
+            &names(&[]),
+        ),
+        Missing {
+            present: 1,
+            unexplained: vec![
+                "codex".into(),
+                "codex-old".into(),
+                "grok".into(),
+                "kimi".into()
+            ],
+            on_purpose: vec!["agy".into()],
+            excluded: vec!["muse".into()],
+        }
+    );
+}
+
+fn index_naming(programs: &[&str]) -> crate::manifest::Index {
+    crate::manifest::Index {
+        schema: 2,
+        index_build: 1,
+        generated_at: String::new(),
+        valid_until: String::new(),
+        machine_id: None,
+        roster_seq: None,
+        programs: programs
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_string(),
+                    crate::manifest::Program {
+                        repo: (*name).to_string(),
+                        policy: String::new(),
+                        coherence_group: None,
+                        system: None,
+                        unavailable_hint: None,
+                        requires: vec![],
+                    },
+                )
+            })
+            .collect(),
+        channels: vec![],
+    }
+}
+
+/// A MISSING VENDOR CLI LEAVES THE TOOLSET INCOMPLETE, AND AN EXCLUDED ONE IS ONLY SAID: the
+/// toolset row weighs the one default set (the index's programs and the vendor rows that serve
+/// this machine), so a machine without claude is missing it although every index program is
+/// installed; one a person uninstalled is removed on purpose; one `[packages].exclude` leaves
+/// out is named as left out, never as missing; and only members of the set count as present
+/// (grok and kimi are members, as every vendor row is; `nn`, which this index does not name,
+/// is not).
+#[test]
+fn a_missing_vendor_cli_is_missing_and_an_excluded_one_is_only_said() {
+    let darwin = "aarch64-apple-darwin";
+    let index = index_naming(&["ay", "trust"]);
+    let cfg = crate::config::PackagesConfig {
+        exclude: Some(vec!["muse".into()]),
+        ..Default::default()
+    };
+    let installed = builds(&["ay", "trust", "codex", "codex-old", "grok", "kimi", "nn"]);
+    let missing = missing_from_set(
+        Some(&index),
+        &cfg,
+        darwin,
+        &installed,
+        &names(&["agy"]),
+        &names(&[]),
+    );
+    assert_eq!(
+        missing,
+        Missing {
+            present: 6,
+            unexplained: vec!["claude".into()],
+            on_purpose: vec!["agy".into()],
+            excluded: vec!["muse".into()],
+        }
+    );
+    assert!(excluded_clause(&missing.excluded).contains("muse"));
+    assert!(excluded_clause(&[]).is_empty());
+    let complete = missing_from_set(
+        Some(&index),
+        &crate::config::PackagesConfig::default(),
+        darwin,
+        &builds(&[
+            "ay",
+            "trust",
+            "claude",
+            "codex",
+            "codex-old",
+            "agy",
+            "muse",
+            "grok",
+            "kimi",
+        ]),
+        &names(&[]),
+        &names(&[]),
+    );
+    assert_eq!(
+        complete,
+        Missing {
+            present: 9,
+            ..Missing::default()
+        },
+        "nothing missing, nothing left out"
+    );
 }
 
 #[cfg(unix)]
@@ -3476,6 +3613,37 @@ fn the_next_act_is_the_first_failing_row_s_door_in_the_order_of_acts() {
         )])
         .is_empty()
     );
+}
+
+/// `aterm init`'s `base.pkg.toolset` READS THE REPORT'S OWN TOOLSET ROW: [`toolset_row`] over
+/// a store is the row the whole report holds, on an empty store (no ALab programs: planned) and
+/// once a program is installed (ok), its time on the row aside.
+#[cfg(unix)]
+#[test]
+fn init_reads_the_reports_own_toolset_row() {
+    let l = layout("toolset-row");
+    let home = synthetic_home("toolset-row");
+    let path = on_bin(&l);
+    let timeless = |row: Option<ItemReport>| {
+        row.map(|row| ItemReport {
+            elapsed_ms: None,
+            ..row
+        })
+    };
+    let reported = || {
+        timeless(
+            report_with(&l, Some(&home), Some(&path), 0, None, &Probes::default())
+                .into_iter()
+                .find(|row| row.id == crate::converge::TOOLSET),
+        )
+    };
+    let empty = timeless(toolset_row(&l)).expect("a toolset row");
+    assert_eq!(empty.outcome, Outcome::Planned, "{empty:?}");
+    assert_eq!(Some(empty), reported());
+    install(&l, "ay", 18);
+    let one = timeless(toolset_row(&l)).expect("a toolset row");
+    assert_eq!(one.outcome, Outcome::Ok, "{one:?}");
+    assert_eq!(Some(one), reported());
 }
 
 #[cfg(unix)]

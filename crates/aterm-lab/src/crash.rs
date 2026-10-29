@@ -77,6 +77,9 @@ pub(crate) trait Ops {
     fn witness(&mut self, run: &Run) -> Result<(), String>;
     /// Whether `pid` is a live process of the lab ([`crate::lab::names_this_lab`]).
     fn names_lab(&mut self, run: &Run, pid: i32) -> bool;
+    /// Whether `pid` may be a window's keeper (`aterm-lab keeper`, which holds its aterm's
+    /// lifeline): its command line says so, or could not be read.
+    fn keeper(&mut self, pid: i32) -> bool;
     /// The Claude Code registered under the instance: its pid and conversation.
     fn agent(&mut self, run: &Run) -> Option<(i64, String)>;
     /// Whether a quit layout or crash journal of the lab names conversation `conv`.
@@ -158,18 +161,19 @@ fn require_instance(run: &Run, pid: i32, ops: &mut impl Ops) -> Result<(), Fail>
 /// running), the instance did not end, interrupted, or the relaunch did not
 /// come up.
 fn crash(run: &mut Run, a: &Asked, ops: &mut impl Ops) -> Result<Crashed, Fail> {
-    // A WINDOWED LAB (`forever --window`) is not crashed: the pid it records
-    // may be the keeper that holds its window's lifeline, whose SIGKILL would
-    // leave the window's aterm running beside the relaunch.
-    if crate::lab::windowed(run) {
+    // A WINDOWED LAB WHOSE RECORDED PID IS ITS KEEPER (an armed lab's, which
+    // holds its window's lifeline) is not crashed: the keeper's SIGKILL would
+    // leave the window's aterm running beside the relaunch. One whose recorded
+    // pid is its aterm (`up --window`) is, and its relaunch opens a window.
+    let old = run.instance_pid;
+    require_instance(run, old, ops)?;
+    if crate::lab::windowed(run) && ops.keeper(old) {
         return Err(Fail::usage(format!(
-            "crash: lab '{}' runs its instance in a window (forever --window), whose recorded pid may be its keeper's: \
-             nothing killed (crash a headless lab)",
+            "crash: lab '{}' runs its instance in a window whose recorded pid {old} may be its keeper's: \
+             nothing killed (crash a headless lab, or one brought up with `up --window`)",
             run.tag
         )));
     }
-    let old = run.instance_pid;
-    require_instance(run, old, ops)?;
     ops.witness(run)
         .map_err(|e| Fail::die(format!("crash: {e}: nothing killed")))?;
     match ops.agent(run) {
@@ -266,6 +270,13 @@ fn after_kill(
     })
 }
 
+/// Whether a process whose `ps` command line is `line` may be a window's keeper
+/// (`<run>/bin/aterm-lab keeper -- <aterm> …`, the lab's path spaces and all): it
+/// names the keeper, or it could not be read.
+fn may_be_keeper(line: &str) -> bool {
+    line.is_empty() || line.contains("aterm-lab keeper -- ")
+}
+
 /// The process operations of a real crash.
 struct Live;
 
@@ -276,6 +287,10 @@ impl Ops for Live {
 
     fn names_lab(&mut self, run: &Run, pid: i32) -> bool {
         crate::lab::names_this_lab(run, pid)
+    }
+
+    fn keeper(&mut self, pid: i32) -> bool {
+        may_be_keeper(&crate::procs::command_line(pid))
     }
 
     fn agent(&mut self, run: &Run) -> Option<(i64, String)> {
@@ -371,6 +386,8 @@ mod tests {
     struct Fake {
         /// `names_lab`'s answer for the recorded pid.
         ours: bool,
+        /// `keeper`'s answer.
+        keeper: bool,
         /// Custody can end while the existing journal wait runs.
         ours_until: Option<i64>,
         /// The process can also end during the captured tree read.
@@ -401,6 +418,7 @@ mod tests {
     fn fake() -> Fake {
         Fake {
             ours: true,
+            keeper: false,
             ours_until: None,
             lose_in_tree: false,
             tree_asked: 0,
@@ -448,6 +466,9 @@ mod tests {
                 && self.ours_until.is_none_or(|until| self.clock < until)
                 && pid == run.instance_pid
                 && pid > 1
+        }
+        fn keeper(&mut self, _pid: i32) -> bool {
+            self.keeper
         }
         fn agent(&mut self, _run: &Run) -> Option<(i64, String)> {
             self.agent.clone()
@@ -597,28 +618,51 @@ mod tests {
         assert_eq!((did.up, run.instance_pid), (NEXT, NEXT));
     }
 
-    /// A WINDOWED LAB IS NEVER CRASHED: its recorded pid may be its window's
-    /// keeper, whose SIGKILL leaves the aterm running.
+    /// A keeper is read from its command line wherever the lab is, and a line
+    /// that could not be read is taken for one.
     #[test]
-    fn a_windowed_lab_is_never_crashed() {
+    fn a_keeper_is_known_by_its_command_line() {
+        for line in [
+            "/private/tmp/at.lab-501/x/runs/t/bin/aterm-lab keeper -- /b/aterm --control-sock /tmp/at.a/a.sock",
+            "/private/tmp/lab state/runs/t/bin/aterm-lab keeper -- /b/aterm --no-reroute",
+            "",
+        ] {
+            assert!(may_be_keeper(line), "{line:?}");
+        }
+        assert!(!may_be_keeper(
+            "/w/target/debug/aterm --no-reroute --control-sock /tmp/at.a/a.sock -d /tmp/at.a/proj"
+        ));
+    }
+
+    /// A WINDOWED LAB WHOSE RECORDED PID MAY BE ITS KEEPER IS NEVER CRASHED:
+    /// the keeper's SIGKILL leaves the aterm running. One whose recorded pid is
+    /// its aterm is crashed and relaunched, as a headless one is, and a
+    /// headless lab is crashed whatever `keeper` says.
+    #[test]
+    fn a_windowed_lab_is_crashed_only_where_its_pid_is_its_aterm() {
         let keep = Asked::default();
-        let mut f = fake();
-        let mut windowed = Run {
+        let windowed = || Run {
             window: "1".into(),
             ..lab()
         };
-        let e = crash(&mut windowed, &keep, &mut f).unwrap_err();
+        let mut f = Fake {
+            keeper: true,
+            ..fake()
+        };
+        let e = crash(&mut windowed(), &keep, &mut f).unwrap_err();
         assert_eq!(e.code, 2);
         assert!(e.msg.unwrap_or_default().contains("in a window"));
         assert!(f.ev.is_empty(), "{:?}", f.ev);
-        let mut f = fake();
-        let mut headless = Run {
-            window: "0".into(),
-            ..lab()
-        };
-        assert!(crash(&mut headless, &keep, &mut f).is_ok());
-        assert_eq!(f.kills().first(), Some(&INSTANCE));
-        assert_eq!(f.relaunches().len(), 1);
+        for (window, keeper) in [("1", false), ("0", true)] {
+            let mut f = Fake { keeper, ..fake() };
+            let mut run = Run {
+                window: window.into(),
+                ..lab()
+            };
+            assert!(crash(&mut run, &keep, &mut f).is_ok(), "window {window}");
+            assert_eq!(f.kills().first(), Some(&INSTANCE));
+            assert_eq!(f.relaunches().len(), 1);
+        }
     }
 
     /// A RECORDED PID THAT IS NOT THE LAB'S IS NEVER SIGNALLED: the instance

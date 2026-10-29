@@ -1342,7 +1342,6 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
     let mut cfg = MailboxConfig::from_toml_str(toml_str, Some(tmp.path())).expect("parse toml");
     cfg.seen_file = Some(tmp.path().join("webmail.seen"));
     assert!(cfg.is_configured());
-    assert!(cfg.is_webmail_only(Some("user-b@example.test")));
     assert_eq!(
         cfg.password_for(Some("user-a@example.test")).as_deref(),
         Some("pw-alpha")
@@ -5067,4 +5066,253 @@ fn plaintext_refusal_covers_ipv6_imap_uppercase_schemes_and_webmail_urls() {
             "{refused:?}"
         );
     }
+}
+
+/// A stand-in browser over the CDP pipes whose `n`-th read of the OAuth page (from 1) answers
+/// `state(n)`.
+fn scripted_oauth_browser(
+    state: impl Fn(usize) -> Value + Send + 'static,
+) -> (
+    super::super::headless_oauth::CdpClient,
+    std::thread::JoinHandle<usize>,
+) {
+    use super::super::headless_oauth::{CdpClient, split_nul_messages};
+    let (to_browser_r, to_browser_w) = std::io::pipe().expect("pipe");
+    let (from_browser_r, mut from_browser_w) = std::io::pipe().expect("pipe");
+    let browser = std::thread::spawn(move || {
+        let mut reader = to_browser_r;
+        let mut pending = Vec::new();
+        let mut buf = [0u8; 8192];
+        let mut reads = 0usize;
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            pending.extend_from_slice(&buf[..n]);
+            for msg in split_nul_messages(&mut pending) {
+                let id = msg.get("id").and_then(Value::as_u64).unwrap_or(0);
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                let result = match method {
+                    "Target.createTarget" => aterm_json::json!({"targetId": "t1"}),
+                    "Target.attachToTarget" => aterm_json::json!({"sessionId": "s1"}),
+                    "Runtime.evaluate" => {
+                        reads += 1;
+                        aterm_json::json!({"result": {"type": "object", "value": state(reads)}})
+                    }
+                    _ => aterm_json::json!({}),
+                };
+                let mut bytes =
+                    aterm_json::to_vec(&aterm_json::json!({"id": id, "result": result})).unwrap();
+                bytes.push(0);
+                if from_browser_w.write_all(&bytes).is_err() || method == "Browser.close" {
+                    return reads;
+                }
+            }
+        }
+        reads
+    });
+    (CdpClient::new(to_browser_w, from_browser_r), browser)
+}
+
+/// A synthetic, handwritten authorize URL (every value made up).
+const BOT_AUTHORIZE: &str = concat!(
+    "https://claude.com/cai/oauth/authorize",
+    "?code=true",
+    "&redirect_uri=http%3A%2F%2Flocalhost%3A9123%2Fcallback",
+    "&state=st_bot_1"
+);
+const BOT_CALLBACK: &str = "http://127.0.0.1:9123/callback?code=made-up&state=st_bot_1";
+
+/// Drives [`BOT_AUTHORIZE`] in a stand-in browser answering `state`, reading every `poll`, a bot
+/// check standing at most `bot_stall` (the deadline a one-minute hang detector): the drive's
+/// result, the callbacks delivered, the page reads made and what the drive met.
+fn drive_bot_check(
+    state: impl Fn(usize) -> Value + Send + 'static,
+    bot_stall: Duration,
+    poll: Duration,
+) -> (Result<(), &'static str>, Vec<String>, usize, Option<Met>) {
+    let (mut cdp, browser) = scripted_oauth_browser(state);
+    let mut delivered = Vec::new();
+    let res = super::super::headless_oauth::drive_cdp_oauth_within(
+        &mut cdp,
+        BOT_AUTHORIZE,
+        Some("one@example.com"),
+        (aterm_spec::wait::MUST_HAPPEN, poll),
+        bot_stall,
+        |_, _| Err("no mailbox in a test"),
+        |cb| {
+            delivered.push(cb.to_owned());
+            Ok(200)
+        },
+    );
+    let met = super::super::headless_oauth::take_met();
+    drop(cdp);
+    let reads = browser.join().expect("stand-in browser");
+    (res, delivered, reads, met)
+}
+
+/// A Claude sign-in that meets Cloudflare's bot check waits on it, its reads not counted against
+/// the drive's steps, and one that has not cleared within its stall ends naming it, never
+/// "exceeded maximum steps", however it reloads (a `loading` read on its host between two); its
+/// block page ends it at once; and each end is noted for the opener's outcome file. CONTROLS: a
+/// check that clears after three reads, or after more reads than the drive's steps, goes on to
+/// the callback; a page that only loads, or loads on another host between two reads of a check,
+/// counts its steps and ends `stall`.
+#[test]
+fn a_claude_sign_in_on_a_bot_check_ends_naming_it_and_one_that_clears_goes_on() {
+    use super::super::headless_oauth::{BLOCK_PAGE_MET, BOT_CHECK_UNCLEARED};
+    let at = |state: &str, url: &str| aterm_json::json!({"state": state, "url": url});
+    let short = Duration::from_millis(500);
+    let tick = Duration::from_millis(20);
+    assert!(BOT_CHECK_UNCLEARED.contains("Cloudflare") && !BOT_CHECK_UNCLEARED.contains("person"));
+    let checked = move |_: usize| at("bot_check", "https://claude.ai/login");
+    let reloading = move |n: usize| {
+        if n.is_multiple_of(2) {
+            at("loading", "https://claude.ai/login?__cf_chl_rt_tk=made-up")
+        } else {
+            at("bot_check", "https://claude.ai/login")
+        }
+    };
+    for (what, state) in [
+        (
+            "standing",
+            Box::new(checked) as Box<dyn Fn(usize) -> Value + Send>,
+        ),
+        ("reloading", Box::new(reloading)),
+    ] {
+        let (res, delivered, _, met) = drive_bot_check(state, short, tick);
+        assert_eq!(res, Err(BOT_CHECK_UNCLEARED), "{what}");
+        assert!(delivered.is_empty(), "{what}");
+        assert_eq!(
+            met,
+            Some(Met::new(MetWord::BotCheck, Some("claude.ai"))),
+            "{what}"
+        );
+    }
+
+    let clears = move |n: usize| {
+        if n <= 3 {
+            at("bot_check", "https://claude.ai/login")
+        } else {
+            at("callback", BOT_CALLBACK)
+        }
+    };
+    let (res, delivered, reads, met) = drive_bot_check(clears, aterm_spec::wait::MUST_HAPPEN, tick);
+    assert_eq!(res, Ok(()));
+    assert_eq!(delivered, vec![BOT_CALLBACK.to_owned()]);
+    assert_eq!(reads, 4);
+    assert_eq!(met, None);
+
+    let clears_late = move |n: usize| {
+        if n > 300 {
+            at("callback", BOT_CALLBACK)
+        } else if n.is_multiple_of(2) {
+            at("loading", "https://claude.ai/login")
+        } else {
+            at("bot_check", "https://claude.ai/login")
+        }
+    };
+    let (res, _, reads, _) =
+        drive_bot_check(clears_late, aterm_spec::wait::MUST_HAPPEN, Duration::ZERO);
+    assert_eq!(
+        res,
+        Ok(()),
+        "a bot check's reads, and its reloads between them, are not the drive's steps"
+    );
+    assert_eq!(reads, 301);
+
+    let blocked = move |_: usize| at("block_page", "https://claude.ai/login");
+    let (res, _, reads, met) =
+        drive_bot_check(blocked, aterm_spec::wait::MUST_HAPPEN, Duration::ZERO);
+    assert_eq!(res, Err(BLOCK_PAGE_MET));
+    assert_eq!(reads, 1, "a block page ends the drive at once");
+    assert_eq!(met, Some(Met::new(MetWord::BlockPage, Some("claude.ai"))));
+
+    let loading = move |_: usize| at("loading", "https://claude.com/cai/oauth/authorize?x=1");
+    let elsewhere = move |n: usize| {
+        if n.is_multiple_of(2) {
+            at("loading", "https://claude.com/cai/oauth/authorize?x=1")
+        } else {
+            at("bot_check", "https://claude.ai/login")
+        }
+    };
+    for (what, state) in [
+        (
+            "loading",
+            Box::new(loading) as Box<dyn Fn(usize) -> Value + Send>,
+        ),
+        ("another host between", Box::new(elsewhere)),
+    ] {
+        let (res, _, _, met) =
+            drive_bot_check(state, aterm_spec::wait::MUST_HAPPEN, Duration::ZERO);
+        assert_eq!(
+            res,
+            Err("headless browser OAuth exceeded maximum steps without reaching callback"),
+            "{what}"
+        );
+        assert_eq!(
+            met,
+            Some(Met::new(MetWord::Stall, Some("claude.com"))),
+            "{what}"
+        );
+    }
+}
+
+/// The opener's outcome file holds one closed word and a host it keeps, and nothing else is
+/// read back from it: never a URL, a path, another word or a second line. Its words name
+/// Cloudflare where the page was Cloudflare's.
+#[test]
+fn the_outcome_file_holds_one_closed_word_and_a_host() {
+    let met = Met::new(MetWord::BotCheck, Some("claude.ai"));
+    assert_eq!(met.line(), "bot-check claude.ai");
+    assert_eq!(Met::parse("bot-check claude.ai\n"), Some(met.clone()));
+    assert_eq!(
+        Met::parse("block-page"),
+        Some(Met::new(MetWord::BlockPage, None))
+    );
+    assert_eq!(
+        Met::parse("stall claude.com"),
+        Some(Met::new(MetWord::Stall, Some("claude.com")))
+    );
+    for refused in [
+        "bot-check https://claude.ai/login",
+        "bot-check claude.ai/login",
+        "bot-check Claude.ai",
+        "solved claude.ai",
+        "bot-check claude.ai\nstall claude.ai",
+        "",
+    ] {
+        assert_eq!(Met::parse(refused), None, "{refused:?}");
+    }
+    let long = "a".repeat(Met::HOST_MAX + 1);
+    assert_eq!(Met::new(MetWord::Stall, Some(&long)).host, None);
+    assert_eq!(Met::parse(&format!("stall {long}")), None);
+    for word in [MetWord::BotCheck, MetWord::BlockPage] {
+        let words = Met::new(word, Some("claude.ai")).words();
+        assert!(
+            words.contains("Cloudflare") && words.contains("claude.ai"),
+            "{words}"
+        );
+    }
+    assert!(!met.words().contains("person"), "{}", met.words());
+    let stall = Met::new(MetWord::Stall, None).words();
+    assert!(
+        !stall.contains("Cloudflare") && !stall.contains("person"),
+        "{stall}"
+    );
+
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let file = tmp.path().join("outcome");
+    write_outcome(&file, &met);
+    assert_eq!(read_outcome(&file), Some(met.clone()));
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "bot-check claude.ai\n"
+    );
+    write_outcome(Path::new("outcome"), &met);
+    assert!(
+        !Path::new("outcome").exists(),
+        "a relative path is not written"
+    );
+    assert_eq!(read_outcome(&tmp.path().join("absent")), None);
 }

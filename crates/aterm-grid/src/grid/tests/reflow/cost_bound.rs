@@ -273,32 +273,57 @@ fn offload_window_scroll_to_bottom_not_clobbered() {
 #[test]
 fn offload_window_lazy_buffer_is_bounded() {
     let (rows, cols) = (10u16, 80u16);
+    let ring_cap = 64usize;
+    let window_writes = 55_000usize;
     let sb: ScrollbackStorage = Scrollback::new(64, 512, 64_000_000).into();
-    let mut grid = Grid::with_tiered_scrollback(rows, cols, 64, sb);
+    let mut grid = Grid::with_tiered_scrollback(rows, cols, ring_cap, sb);
     for i in 0..500 {
         short_line(&mut grid, rows, &format!("H{i}"));
     }
-    let before = grid.scrollback_lines();
+    let trunc_before = grid.truncated_lines();
 
     let pending = grid
         .resize_offloading_scrollback(rows, cols / 2)
         .expect("offload job");
-    for i in 0..55_000 {
+    let held_at_detach = grid.ring_buffer_scrollback();
+    for i in 0..window_writes {
         short_line(&mut grid, rows, &format!("W{i}"));
     }
+    let reflowed_len = pending.lines_total();
     let reflowed = pending.reflow();
     grid.reattach_reflowed_scrollback(reflowed);
 
     let after = grid.scrollback_lines();
-    assert!(
-        after < before + 52_000,
-        "the lazy buffer must be bounded during the window (before={before}, \
-         after={after}) — keeping all 55k window lines means the cap did not engage"
+    let dropped = (grid.truncated_lines() - trunc_before) as usize;
+    // `DETACHED_LAZY_CAP` bounds `lazy_buffer.len()`, which reserves 1 slot for the
+    // flood-cut marker row alongside `DETACHED_LAZY_CAP - 1` content rows.
+    let kept_window_rows = Grid::DETACHED_LAZY_CAP + ring_cap;
+    let kept_content = (Grid::DETACHED_LAZY_CAP - 1) + ring_cap;
+    assert_eq!(
+        dropped,
+        held_at_detach + window_writes - kept_content,
+        "every content row evicted past (DETACHED_LAZY_CAP - 1) + ring_cap must be counted in truncated_lines"
     );
-    assert!(
-        after > before + 45_000,
-        "the cap must keep ~50k window lines, not drop the whole buffer \
-         (before={before}, after={after})"
+    assert_eq!(
+        after,
+        reflowed_len + kept_window_rows,
+        "reattached history must equal reflowed prefix + flood marker + surviving window content"
+    );
+    let newest_scrolled_w = window_writes - usize::from(rows);
+    let first_kept_w = newest_scrolled_w + 1 - kept_content;
+    assert_eq!(
+        grid.get_history_line(reflowed_len + 1)
+            .and_then(|l| l.as_str().map(str::to_string))
+            .as_deref(),
+        Some(format!("W{first_kept_w}").as_str()),
+        "oldest surviving window content row (after the flood marker) must be W{first_kept_w}"
+    );
+    assert_eq!(
+        grid.get_history_line(after - 1)
+            .and_then(|l| l.as_str().map(str::to_string))
+            .as_deref(),
+        Some(format!("W{newest_scrolled_w}").as_str()),
+        "newest history line must be W{newest_scrolled_w}"
     );
     grid.assert_invariants();
 }

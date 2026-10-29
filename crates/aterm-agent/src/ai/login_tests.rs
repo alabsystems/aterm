@@ -20,6 +20,7 @@ fn facts(c: &'static Connector, shim: PathBuf) -> Facts {
         }),
         foreign: None,
         home: Ok(PathBuf::from("/home/me/.x")),
+        home_var: None,
         home_exists: true,
         login_file: None,
         hidden_store: false,
@@ -41,6 +42,8 @@ fn row(c: &'static Connector, state: State) -> Row {
         mark: Mark::Fail,
         fact: String::new(),
         fix: None,
+        mend: None,
+        actor: None,
         version: None,
         plan: None,
         used: None,
@@ -52,6 +55,8 @@ fn row(c: &'static Connector, state: State) -> Row {
 struct Rig {
     vars: Vec<(String, String)>,
     no_desk: Option<PathBuf>,
+    /// Whether stdin is a terminal: a person is here unless an agent's marker is set too.
+    tty: bool,
 }
 
 impl Rig {
@@ -70,7 +75,14 @@ impl Rig {
         Rig {
             vars,
             no_desk: Some(PathBuf::from(crate::harness::login_drive::SANDBOX_EXEC)),
+            tty: true,
         }
+    }
+
+    /// The same rig with no terminal on stdin.
+    fn no_tty(mut self) -> Rig {
+        self.tty = false;
+        self
     }
 
     /// The same rig with `sandbox` as its no-desk sandbox ([`Host::no_desk`]).
@@ -106,13 +118,16 @@ impl Rig {
             now: &now,
             ask: &ask,
             no_desk: self.no_desk.as_deref(),
+            attended: self.tty && agent_marker(&var).is_none(),
         };
         sign_in(&host, f, r, &mut Vec::new())
     }
 }
 
+/// AN AGENT NEVER STARTS A PERSON'S SIGN-IN: a CLI's own login (Codex's here) is refused under
+/// every agent's marker and nothing runs.
 #[test]
-fn an_agent_never_starts_a_sign_in() {
+fn an_agent_never_starts_a_clis_own_sign_in() {
     let b = machine(&["codex"]);
     let store = Store::at(&b.state);
     let runner = FakeRunner::quiet();
@@ -127,6 +142,71 @@ fn an_agent_never_starts_a_sign_in() {
         assert!(matches!(done, Done::Refused(_)), "{marker}: {done:?}");
     }
     assert!(runner.calls().is_empty(), "nothing ran under an agent");
+}
+
+/// UNDER AN AGENT ATERM'S OWN SIGN-INS RUN (owner ruling R-13): accounts v2's renewal of a
+/// Claude row with an email and a route, and a pool's renewal of its next row, are aterm's, so
+/// each runs under every agent's marker, with stdin closed (never on the terminal, where a
+/// renewal may open a browser for a person); what only a person gives, the email Claude's
+/// adoption of the default login asks, is refused and asks nothing.
+#[test]
+fn under_an_agent_aterms_own_renewals_run_and_claudes_adoption_does_not() {
+    use crate::ai::connector::KIMI;
+    let b = machine(&["claude", "kimi"]);
+    let store = Store::at(&b.state);
+    for marker in AGENT_MARKERS {
+        let rig = Rig::new(&[(marker, "1")]);
+        let mut renewing = facts(&CLAUDE, b.pkg.agents_dir().join("claude"));
+        renewing.accounts = Some(listed_view(true, None));
+        let runner = FakeRunner::quiet();
+        let done = rig.sign_in(
+            &runner,
+            &store,
+            &renewing,
+            &row(&CLAUDE, State::SignedOut),
+            &[],
+        );
+        assert_eq!(done, Done::SignedIn(None), "{marker}");
+        assert_eq!(
+            runner
+                .calls()
+                .iter()
+                .map(|c| (c.terminal, c.args.join(" ")))
+                .collect::<Vec<_>>(),
+            [(false, "harness accounts renew work".to_string())],
+            "{marker}"
+        );
+
+        let mut pooled = facts(&KIMI, b.pkg.agents_dir().join("kimi"));
+        pooled.pool = Some(crate::ai::facts::CliAccounts {
+            roster: PathBuf::from("/home/me/.config/aterm/accounts-kimi.toml"),
+            next: Some("kimi-one".to_string()),
+            ..crate::ai::facts::CliAccounts::default()
+        });
+        let runner = FakeRunner::quiet();
+        let done = rig.sign_in(&runner, &store, &pooled, &row(&KIMI, State::SignedOut), &[]);
+        assert_eq!(done, Done::SignedIn(None), "{marker}");
+        assert_eq!(
+            runner.calls()[0].args,
+            ["harness", "accounts", "renew", "kimi-one", "--cli", "kimi"],
+            "{marker}"
+        );
+        assert!(!runner.calls()[0].terminal, "{marker}");
+
+        let runner = FakeRunner::quiet();
+        let done = rig.sign_in(
+            &runner,
+            &store,
+            &facts(&CLAUDE, b.pkg.agents_dir().join("claude")),
+            &row(&CLAUDE, State::SignedOut),
+            &["me@example.com"],
+        );
+        assert!(
+            matches!(done, Done::Refused(ref why) if why.contains("email")),
+            "{marker}: {done:?}"
+        );
+        assert!(runner.calls().is_empty(), "{marker}: the adoption ran");
+    }
 }
 
 #[test]
@@ -260,6 +340,7 @@ fn claude_signs_in_only_through_accounts_v2s_renewal() {
         label: "m7".into(),
         listed: false,
         refused: None,
+        unread: None,
         renews: true,
         login: None,
         made: true,
@@ -268,7 +349,11 @@ fn claude_signs_in_only_through_accounts_v2s_renewal() {
         limited_until: None,
         served_at: None,
         renewed_at: None,
+        signed_out_at: None,
         next_sign_in: None,
+        tried: None,
+        unattended: true,
+        off: None,
     });
     let runner = FakeRunner::quiet();
     assert_eq!(
@@ -300,6 +385,7 @@ fn listed_view(renews: bool, refused: Option<&str>) -> ClaudeAccounts {
         label: "work".into(),
         listed: true,
         refused: refused.map(str::to_string),
+        unread: None,
         renews,
         login: None,
         made: false,
@@ -308,7 +394,11 @@ fn listed_view(renews: bool, refused: Option<&str>) -> ClaudeAccounts {
         limited_until: None,
         served_at: None,
         renewed_at: None,
+        signed_out_at: None,
         next_sign_in: None,
+        tried: None,
+        unattended: true,
+        off: None,
     }
 }
 
@@ -429,10 +519,12 @@ fn claude_under_a_home_of_its_own_is_never_signed_in_here() {
     let store = Store::at(&b.state);
     let runner = FakeRunner::quiet();
     let rig = Rig::new(&[("CLAUDE_CONFIG_DIR", "/me/.config/claude")]);
+    let mut f = facts(&CLAUDE, b.pkg.agents_dir().join("claude"));
+    f.home_var = Some("/me/.config/claude".to_string());
     let done = rig.sign_in(
         &runner,
         &store,
-        &facts(&CLAUDE, b.pkg.agents_dir().join("claude")),
+        &f,
         &row(&CLAUDE, State::SignedOut),
         &["me@example.com"],
     );
@@ -454,6 +546,7 @@ fn claude_limited_with_next_sign_in_renews_the_successor_account() {
         label: "m27-3".into(),
         listed: true,
         refused: None,
+        unread: None,
         renews: true,
         login: None,
         made: true,
@@ -462,7 +555,11 @@ fn claude_limited_with_next_sign_in_renews_the_successor_account() {
         limited_until: Some(1_800_086_400),
         served_at: None,
         renewed_at: None,
+        signed_out_at: None,
         next_sign_in: Some("m27".into()),
+        tried: None,
+        unattended: true,
+        off: None,
     });
     let runner = FakeRunner::quiet();
     assert_eq!(
@@ -545,11 +642,366 @@ fn a_cli_with_its_own_roster_signs_in_through_its_renewal_and_one_without_runs_i
     assert!(calls[0].terminal && calls[0].program == "kimi" && calls[0].args == ["login"]);
 }
 
+/// ON A CODEX BUILD THAT KEEPS NO ROW'S LOGIN ITS OWN, `aterm ai login codex` SIGNS THE ROW ON
+/// THIS MACHINE'S OWN LOGIN IN BY CODEX'S OWN LOGIN IN THE DEFAULT HOME, never by the pool's
+/// staged sign-in, which would bind it to a login of its own that build never runs. With `main`
+/// signed out and `work` listed with no login made here yet (as `accounts add` leaves it), the
+/// facts name `main` next, `codex login` runs, the pool records `main` signed in again, and
+/// `main` keeps no `dir` and serves the next launch on that build. With `main`'s login working
+/// but its renewal due, it runs nothing and says why (Codex's own login revokes the login it
+/// replaces), offering no fix, also where `main` is the roster's only row. CONTROL: a build that
+/// keeps the row's login signs `work` in through the pool.
+#[test]
+fn a_codex_default_row_on_a_build_that_ignores_codex_auth_path_signs_in_by_codex_login() {
+    use crate::ai::facts::{Machine, gather};
+    use crate::ai::store::Records;
+    use crate::harness::accounts::{self, Cli};
+    use crate::harness::codex_app_login::Usage;
+    let b = machine(&["codex"]);
+    let launcher = b.pkg.agents_dir().join("codex");
+    let lay = |reads: bool| {
+        let exe = crate::harness::codex_alab::lay_package(
+            &b.dir
+                .path()
+                .join(if reads { "store/new" } else { "store/old" }),
+            reads,
+        );
+        std::fs::write(
+            &launcher,
+            format!("#!/bin/sh\nexec '{}' \"$@\"\n", exe.display()),
+        )
+        .expect("launcher");
+    };
+    lay(false);
+    let now = 1_800_000_000_i64;
+    let config = b.dir.path().join("config");
+    std::fs::create_dir_all(&config).expect("config");
+    std::fs::create_dir_all(b.home.join(".codex")).expect("default home");
+    std::fs::write(b.home.join(".codex/auth.json"), "{}").expect("default login");
+    let work = b.home.join(".aterm/logins/codex/work");
+    std::fs::create_dir_all(&work).expect("work's empty login folder");
+    let main_row =
+        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\nemail = \"own@example.com\"\n";
+    let both = format!(
+        "{main_row}\n[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = {:?}\n\
+         email = \"work@example.com\"\n",
+        work.display().to_string()
+    );
+    let roster = config.join("accounts-codex.toml");
+    std::fs::write(&roster, &both).expect("codex roster");
+    let pool_store = accounts::Store::at_for(&b.state, Cli::Codex, &b.home);
+    pool_store
+        .transact_logins(now, &mut None, |state, _| {
+            Ok(accounts::note_auth(
+                state,
+                "main",
+                accounts::Auth::SignedOut,
+                now,
+            ))
+        })
+        .expect("sign `main` out");
+    let home = b.home.display().to_string();
+    let var = |k: &str| (k == "HOME").then(|| home.clone());
+    let at = |now: i64| Machine {
+        now,
+        home: Some(b.home.clone()),
+        var: &var,
+        pkg: Some(b.pkg.clone()),
+        exclude: Vec::new(),
+        records: Records::default(),
+        harness_state: Some(b.state.clone()),
+        roster: Some(config.join("accounts.toml")),
+        accounts_mode: None,
+        config: None,
+    };
+    let store = Store::at(&b.state);
+    let rig = Rig::new(&[]);
+
+    let f = gather(&at(now), &CODEX);
+    let pool = f.pool.as_ref().expect("codex pool");
+    assert!(pool.unread && pool.default_only, "{pool:?}");
+    assert_eq!(pool.next.as_deref(), Some("main"), "never `work`");
+    let r = crate::ai::state::assess(&f, true, now);
+    assert_eq!(r.state, State::SignedOut, "{}", r.fact);
+    assert_eq!(r.fix.as_deref(), Some("aterm ai login codex"), "{}", r.fact);
+    assert_eq!(pool.due, ["main"], "a signed-out row is due");
+    assert!(r.fact.contains("signs that login in again"), "{}", r.fact);
+    assert!(
+        !r.fact.contains("once that login has ended"),
+        "its login has ended already: {}",
+        r.fact
+    );
+    let runner = FakeRunner::with(|call| {
+        Ok(if call.args == ["login", "status"] {
+            ran(0, "", "Logged in using ChatGPT\n")
+        } else {
+            ran(0, "", "")
+        })
+    });
+    assert_eq!(
+        rig.sign_in(&runner, &store, &f, &r, &[]),
+        Done::SignedIn(Some("chatgpt"))
+    );
+    let calls = runner.calls();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert!(calls[0].terminal && calls[0].args == ["login"], "{calls:?}");
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.args.first().map(String::as_str) != Some("harness")),
+        "no pool sign-in: {calls:?}"
+    );
+    let (state, _) = pool_store.load(now).expect("pool state");
+    assert_ne!(
+        state.accounts.get("main").map(|a| a.auth),
+        Some(accounts::Auth::SignedOut),
+        "the pool records `main` signed in again"
+    );
+    let (logins, _) = pool_store.load_logins(now).expect("pool logins");
+    assert_eq!(logins.get("main").and_then(|b| b.dir.clone()), None);
+    let seat = crate::harness::accounts_pool::Seat {
+        config_dir: &config,
+        state: &b.state,
+        home: &b.home,
+        now: now + 1,
+    };
+    let read = |_: Cli, _: &Path, _: Option<&str>, at: i64| -> Option<Usage> {
+        Some(Usage {
+            sample: accounts::Sample {
+                session_pct: Some(0),
+                at,
+                ..accounts::Sample::default()
+            },
+            walls: Vec::new(),
+        })
+    };
+    let pick =
+        crate::harness::accounts_pool::launch_env_for(&seat, Cli::Codex, &read, Some(&launcher))
+            .expect("the launch serves")
+            .map(|pick| (pick.label, pick.value));
+    assert_eq!(
+        pick,
+        Some(("main".to_string(), None)),
+        "`main` on the default login"
+    );
+
+    // Its login works, and its renewal is due: nothing runs.
+    pool_store
+        .transact_logins(now + 2, &mut None, |_, logins| {
+            accounts::note_login_notice(logins, "main", 2, now + 2);
+            Ok(Vec::new())
+        })
+        .expect("a notice that `main`'s login ends in two days");
+    let f = gather(&at(now + 3), &CODEX);
+    let pool = f.pool.as_ref().expect("codex pool");
+    assert_eq!(pool.due, ["main"]);
+    assert_eq!(pool.next, None);
+    let r = crate::ai::state::assess(&f, true, now + 3);
+    assert!(
+        matches!(r.state, State::Due(_)),
+        "{:?}: {}",
+        r.state,
+        r.fact
+    );
+    assert_eq!(r.fix, None, "no fix that would refuse: {}", r.fact);
+    assert!(r.fact.contains("once that login has ended"), "{}", r.fact);
+    let runner = FakeRunner::quiet();
+    let done = rig.sign_in(&runner, &store, &f, &r, &[]);
+    assert!(
+        matches!(&done, Done::Refused(why) if why.contains("once that login has ended")),
+        "{done:?}"
+    );
+    assert!(runner.calls().is_empty());
+    // With `main` the roster's only row, that build serves it without serving it "alone", and
+    // its renewal there is still Codex's own: nothing runs.
+    std::fs::write(&roster, main_row).expect("a roster of `main` alone");
+    let f = gather(&at(now + 3), &CODEX);
+    let pool = f.pool.as_ref().expect("codex pool");
+    assert!(pool.unread && !pool.default_only, "{pool:?}");
+    assert_eq!(
+        (pool.due.as_slice(), pool.next.as_deref()),
+        (&["main".to_string()][..], None)
+    );
+    let r = crate::ai::state::assess(&f, true, now + 3);
+    assert!(
+        matches!(r.state, State::Due(_)),
+        "{:?}: {}",
+        r.state,
+        r.fact
+    );
+    assert_eq!(r.fix, None, "no fix that would refuse: {}", r.fact);
+    let runner = FakeRunner::quiet();
+    let done = rig.sign_in(&runner, &store, &f, &r, &[]);
+    assert!(
+        matches!(&done, Done::Refused(why) if why.contains("once that login has ended")),
+        "{done:?}"
+    );
+    assert!(runner.calls().is_empty());
+    std::fs::write(&roster, &both).expect("codex roster");
+
+    lay(true);
+    let f = gather(&at(now + 3), &CODEX);
+    let pool = f.pool.as_ref().expect("codex pool");
+    assert!(!pool.unread, "CONTROL");
+    assert_eq!(pool.next.as_deref(), Some("work"));
+    let runner = FakeRunner::quiet();
+    let r = crate::ai::state::assess(&f, true, now + 3);
+    assert_eq!(
+        rig.sign_in(&runner, &store, &f, &r, &[]),
+        Done::SignedIn(None)
+    );
+    assert_eq!(
+        runner.calls()[0].args,
+        ["harness", "accounts", "renew", "work", "--cli", "codex"]
+    );
+}
+
+/// ON A CODEX BUILD THAT SERVES THIS MACHINE'S OWN LOGIN'S ROW ALONE, `aterm ai login` SIGNS IN
+/// NOTHING WHILE THAT ROW CAN SERVE, never the pool's next row (`work`), which that build would
+/// not run.
+#[test]
+fn a_codex_pool_that_serves_the_default_row_alone_signs_in_nothing_while_it_serves() {
+    use crate::harness::codex_alab::DefaultRow;
+    let b = machine(&["codex"]);
+    let store = Store::at(&b.state);
+    let rig = Rig::new(&[]);
+    let mut pooled = facts(&CODEX, b.pkg.agents_dir().join("codex"));
+    pooled.pool = Some(crate::ai::facts::CliAccounts {
+        roster: PathBuf::from("/home/me/.config/aterm/accounts-codex.toml"),
+        next: None,
+        default_label: Some("main".to_string()),
+        default_row: Some(DefaultRow::Serves("main".to_string())),
+        unread: true,
+        default_only: true,
+        ..crate::ai::facts::CliAccounts::default()
+    });
+    let runner = FakeRunner::quiet();
+    let done = rig.sign_in(
+        &runner,
+        &store,
+        &pooled,
+        &row(&CODEX, State::SignedOut),
+        &[],
+    );
+    let refused = |why: &str| why.contains("`main`") && why.contains("needs no sign-in");
+    assert!(
+        matches!(&done, Done::Refused(why) if refused(why)),
+        "{done:?}"
+    );
+    assert!(runner.calls().is_empty());
+}
+
+/// ON SUCH A BUILD A SIGNED-OUT ROW ON THIS MACHINE'S OWN LOGIN THAT ANOTHER MAC'S WARM SET HOLDS
+/// IS NO SIGN-IN TARGET HERE: the pool names no row next, the row offers no fix, its fact says
+/// why and never that Codex's own sign-in runs "once that login has ended" (it has), and
+/// `aterm ai login codex` runs nothing, neither the pool's sign-in of `main` (which
+/// `sign_in_plan` refuses on that build) nor Codex's own. CONTROL: with no `held_by` the same
+/// row is named next and Codex's own sign-in is its fix.
+#[test]
+fn a_held_signed_out_default_row_on_a_build_that_ignores_codex_auth_path_signs_in_nothing() {
+    use crate::ai::facts::{Machine, gather};
+    use crate::ai::store::Records;
+    use crate::harness::accounts::{self, Cli};
+    use crate::harness::codex_alab::DefaultRow;
+    let b = machine(&["codex"]);
+    let launcher = b.pkg.agents_dir().join("codex");
+    let exe = crate::harness::codex_alab::lay_package(&b.dir.path().join("store/old"), false);
+    std::fs::write(
+        &launcher,
+        format!("#!/bin/sh\nexec '{}' \"$@\"\n", exe.display()),
+    )
+    .expect("launcher");
+    let config = b.dir.path().join("config");
+    std::fs::create_dir_all(&config).expect("config");
+    std::fs::create_dir_all(b.home.join(".codex")).expect("default home");
+    std::fs::write(b.home.join(".codex/auth.json"), "{}").expect("default login");
+    let work = b.home.join(".aterm/logins/codex/work");
+    std::fs::create_dir_all(&work).expect("work");
+    std::fs::write(work.join("auth.json"), "{}").expect("work login");
+    let roster = |held: &str| {
+        format!(
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\nemail = \"own@example.com\"\n\
+             {held}\n[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = {:?}\n\
+             email = \"work@example.com\"\n",
+            work.display().to_string()
+        )
+    };
+    let roster_file = config.join("accounts-codex.toml");
+    std::fs::write(&roster_file, roster("held_by = \"m2\"\n")).expect("codex roster");
+    let now = 1_800_000_000_i64;
+    let pool_store = accounts::Store::at_for(&b.state, Cli::Codex, &b.home);
+    pool_store
+        .transact_logins(now, &mut None, |state, _| {
+            Ok(accounts::note_auth(
+                state,
+                "main",
+                accounts::Auth::SignedOut,
+                now,
+            ))
+        })
+        .expect("sign `main` out");
+    let home = b.home.display().to_string();
+    let var = |k: &str| (k == "HOME").then(|| home.clone());
+    let m = Machine {
+        now,
+        home: Some(b.home.clone()),
+        var: &var,
+        pkg: Some(b.pkg.clone()),
+        exclude: Vec::new(),
+        records: Records::default(),
+        harness_state: Some(b.state.clone()),
+        roster: Some(config.join("accounts.toml")),
+        accounts_mode: None,
+        config: None,
+    };
+    let store = Store::at(&b.state);
+    let rig = Rig::new(&[]);
+
+    let f = gather(&m, &CODEX);
+    let pool = f.pool.as_ref().expect("codex pool");
+    assert!(pool.unread && pool.default_only, "{pool:?}");
+    assert!(
+        matches!(&pool.default_row, Some(DefaultRow::Other { label, why })
+            if label == "main" && why.contains("held for another Mac's warm set")),
+        "{:?}",
+        pool.default_row
+    );
+    assert_eq!(pool.next, None, "neither `main` nor `work`");
+    assert!(!default_home_sign_in(pool));
+    let r = crate::ai::state::assess(&f, true, now);
+    assert_eq!(r.state, State::SignedOut, "{}", r.fact);
+    assert_eq!(r.fix, None, "no fix that would refuse: {}", r.fact);
+    assert!(
+        r.fact.contains("held for another Mac's warm set"),
+        "{}",
+        r.fact
+    );
+    assert!(!r.fact.contains("once that login has ended"), "{}", r.fact);
+    let runner = FakeRunner::quiet();
+    let done = rig.sign_in(&runner, &store, &f, &r, &[]);
+    assert!(
+        matches!(&done, Done::Refused(why) if why.contains("held for another Mac's warm set")),
+        "{done:?}"
+    );
+    assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+
+    std::fs::write(&roster_file, roster("")).expect("CONTROL: `main` warm here");
+    let f = gather(&m, &CODEX);
+    let pool = f.pool.as_ref().expect("codex pool");
+    assert_eq!(pool.next.as_deref(), Some("main"), "CONTROL");
+    assert!(default_home_sign_in(pool), "CONTROL");
+    let r = crate::ai::state::assess(&f, true, now);
+    assert_eq!(r.fix.as_deref(), Some("aterm ai login codex"), "CONTROL");
+}
+
 /// GROK BUILD'S SIGN-IN IS A PERSON'S, AT THIS TERMINAL OR THROUGH ITS POOL: under an agent's
-/// marker nothing runs; off as an opt-in nobody installed, it is refused with that fact; with no
+/// marker nothing runs; off as excluded, it is refused with that fact; with no
 /// roster its own `grok login` runs on this terminal, with neither a carried login nor its home's
-/// override dropped; with a roster it is the pool's renewal of the next row (`aterm harness
-/// accounts renew <label> --cli grok`). Over SSH it is `grok login --device-auth`, kept off this
+/// override dropped; with a roster it is the pool's sign-in of the next row on this terminal
+/// (`aterm harness accounts login <label> --cli grok`), never its headless renewal, which stops
+/// at accounts.x.ai's block page (CONTROL: Kimi's pool renews, in
+/// `a_cli_with_its_own_roster_signs_in_through_its_renewal_and_one_without_runs_its_login`).
+/// Over SSH it is `grok login --device-auth`, kept off this
 /// machine's desk ([`sign_in_over_ssh_opens_no_browser_on_this_machines_desk`]). The connection
 /// is the one `aterm ai login grok` names ([`crate::ai::connector::connector`]).
 #[test]
@@ -571,12 +1023,12 @@ fn grok_signs_in_on_this_terminal_or_through_its_pool_and_never_for_an_agent() {
         assert!(runner.calls().is_empty(), "{marker}: nothing ran");
     }
     let mut off = row(grok, State::Off);
-    off.fact = "not installed: an opt-in program".to_string();
+    off.fact = "[packages] exclude names it".to_string();
     let runner = FakeRunner::quiet();
     let done = Rig::new(&[]).sign_in(&runner, &store, &facts(grok, shim.clone()), &off, &[]);
     assert_eq!(
         done,
-        Done::Refused("not installed: an opt-in program".to_string())
+        Done::Refused("[packages] exclude names it".to_string())
     );
     assert!(runner.calls().is_empty());
     let runner = FakeRunner::quiet();
@@ -644,8 +1096,90 @@ fn grok_signs_in_on_this_terminal_or_through_its_pool_and_never_for_an_agent() {
     );
     assert_eq!(
         calls[0].args,
-        ["harness", "accounts", "renew", "grok-two", "--cli", "grok"]
+        ["harness", "accounts", "login", "grok-two", "--cli", "grok"]
     );
+    // A Grok roster with no row to sign in asks for a row, never an email `accounts login`
+    // does not need.
+    let mut empty = pooled.clone();
+    empty.pool = Some(crate::ai::facts::CliAccounts {
+        next: None,
+        ..pooled.pool.clone().expect("pool")
+    });
+    let runner = FakeRunner::quiet();
+    let done = Rig::new(&[]).sign_in(&runner, &store, &empty, &row(grok, State::SignedOut), &[]);
+    let refused = |why: &str| why.contains("lists no row") && !why.contains("--email");
+    assert!(
+        matches!(done, Done::Refused(ref why) if refused(why)),
+        "{done:?}"
+    );
+    assert!(runner.calls().is_empty());
+    // The pool's `accounts login` is the person's approval too: under an agent's marker it is
+    // refused and nothing runs.
+    for marker in AGENT_MARKERS {
+        let runner = FakeRunner::quiet();
+        let done = Rig::new(&[(marker, "1")]).sign_in(
+            &runner,
+            &store,
+            &pooled,
+            &row(grok, State::SignedOut),
+            &[],
+        );
+        assert!(
+            matches!(done, Done::Refused(ref why) if why.contains("accounts login grok-two")),
+            "{marker}: {done:?}"
+        );
+        assert!(runner.calls().is_empty(), "{marker}: nothing ran");
+    }
+}
+
+/// KIMI CODE IS A CONNECTION WHOSE OWN SIGN-IN OVER SSH IS PLAIN `kimi login` WITH THE
+/// OPENER-FREE `PATH`: its device login prints the URL and code for the person to open where
+/// they are (2.3.3's lines, `docs/measured/kimi-review-2026-10-27.md` §6) and opens a browser
+/// only through an opener on `PATH`, so no sandbox holds it (its sign-in's `no_desk` is empty)
+/// and only `PATH` changes. CONTROL: at the desk it runs with this process's `PATH`.
+#[test]
+fn kimi_signs_in_over_ssh_with_its_own_login_and_no_opener_on_its_path() {
+    let kimi = crate::ai::connector::connector("kimi").expect("Kimi Code is a connection");
+    let b = machine(&["kimi"]);
+    let store = Store::at(&b.state);
+    let shim = b.pkg.agents_dir().join("kimi");
+    let ssh = ("SSH_CONNECTION", "10.0.0.2 52000 10.0.0.3 22");
+    for (rig, over_ssh) in [(Rig::new(&[ssh]), true), (Rig::new(&[]), false)] {
+        let runner = FakeRunner::quiet();
+        let done = rig.sign_in(
+            &runner,
+            &store,
+            &facts(kimi, shim.clone()),
+            &row(kimi, State::SignedOut),
+            &[],
+        );
+        assert_eq!(done, Done::NotChecked, "kimi has no status read");
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(
+            calls[0].terminal && calls[0].program == "kimi" && calls[0].args == ["login"],
+            "over SSH {over_ssh}: {:?}",
+            calls[0]
+        );
+        let path = calls[0]
+            .env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| PathBuf::from(v))
+            .expect("a PATH");
+        if over_ssh {
+            assert!(
+                path.starts_with(store.dir()),
+                "the opener-free PATH, not this process's: {path:?}"
+            );
+        } else {
+            assert_eq!(
+                path,
+                Path::new("/usr/bin:/bin"),
+                "CONTROL: this process's PATH"
+            );
+        }
+    }
 }
 
 /// The terminal call a signed-out `c` makes from `rig`, and what the sign-in came to.
@@ -749,4 +1283,144 @@ fn sign_in_over_ssh_opens_no_browser_on_this_machines_desk() {
             c.id
         );
     }
+}
+
+/// An edit a case makes to the listed accounts view.
+type EditView<'a> = &'a dyn Fn(&mut ClaudeAccounts);
+
+/// WITH NOBODY AT THIS RUN ATERM STARTS ONLY A SIGN-IN THAT RUNS UNATTENDED (findings of
+/// 2026-10-28 on the m2 state): a Claude row no route signs in unattended is refused, naming
+/// the step only a person gives, and nothing runs, under an agent's marker with a terminal and
+/// with no terminal alike; so is a row while a switch keeps aterm's sign-ins off, and a row the
+/// window's upkeep holds after a failed sign-in on record. A renewal that ran and exited non-zero
+/// (as `accounts renew <label>` does when it ran nothing) is a failure, never a sign-in.
+/// CONTROL: a person at the terminal runs the renewal there.
+#[test]
+fn with_nobody_here_aterm_starts_only_a_sign_in_that_runs_unattended() {
+    let b = machine(&["claude"]);
+    let store = Store::at(&b.state);
+    let shim = b.pkg.agents_dir().join("claude");
+    let with = |edit: &dyn Fn(&mut ClaudeAccounts)| {
+        let mut f = facts(&CLAUDE, shim.clone());
+        let mut view = listed_view(true, None);
+        edit(&mut view);
+        f.accounts = Some(view);
+        f
+    };
+    let nobody = [Rig::new(&[("CLAUDECODE", "1")]), Rig::new(&[]).no_tty()];
+    let cases: [(&str, EditView<'_>, &str); 3] = [
+        (
+            "no route",
+            &|v| v.unattended = false,
+            "aterm harness accounts browser work",
+        ),
+        (
+            "sign-ins off",
+            &|v| v.off = Some("`[harness] logins = \"off\"`"),
+            "aterm ai login claude",
+        ),
+        (
+            "held",
+            &|v| {
+                v.tried = Some(crate::ai::facts::Tried {
+                    outcome: "failed",
+                    routes: "profile: the sign-in did not finish; profile(ready)".into(),
+                    since: 1_800_000_000 - 600,
+                });
+            },
+            "upkeep",
+        ),
+    ];
+    for (case, edit, names) in cases {
+        let f = with(edit);
+        for rig in &nobody {
+            let runner = FakeRunner::quiet();
+            let done = rig.sign_in(&runner, &store, &f, &row(&CLAUDE, State::SignedOut), &[]);
+            assert!(
+                matches!(&done, Done::Refused(why) if why.contains(names)),
+                "{case}: {done:?}"
+            );
+            assert!(runner.calls().is_empty(), "{case}: {:?}", runner.calls());
+        }
+        let runner = FakeRunner::quiet();
+        let done = Rig::new(&[]).sign_in(&runner, &store, &f, &row(&CLAUDE, State::SignedOut), &[]);
+        assert_eq!(done, Done::SignedIn(None), "CONTROL {case}");
+        assert!(
+            runner.calls().iter().all(|c| c.terminal),
+            "CONTROL {case}: {:?}",
+            runner.calls()
+        );
+    }
+
+    let ran_nothing = FakeRunner::with(|_| Ok(ran(1, "due here: work\n", "not run\n")));
+    let done = Rig::new(&[]).no_tty().sign_in(
+        &ran_nothing,
+        &store,
+        &with(&|_| {}),
+        &row(&CLAUDE, State::SignedOut),
+        &[],
+    );
+    assert!(matches!(done, Done::Failed(_)), "{done:?}");
+    let ran_nothing = FakeRunner::quiet().exiting(|_| 1);
+    let done = Rig::new(&[]).sign_in(
+        &ran_nothing,
+        &store,
+        &with(&|_| {}),
+        &row(&CLAUDE, State::SignedOut),
+        &[],
+    );
+    assert!(matches!(done, Done::Failed(_)), "{done:?}");
+}
+
+/// WITH NOBODY AT THIS RUN A POOL'S RENEWAL WAITS ON WHAT HOLDS IT: Cloudflare's bot check on
+/// record within the upkeep's hold, or a stop for a person (whose step the refusal names);
+/// nothing runs. CONTROL: past the hold, the renewal runs with stdin closed.
+#[test]
+fn with_nobody_here_a_pools_renewal_waits_on_a_bot_check_or_a_persons_step() {
+    use crate::ai::connector::KIMI;
+    let b = machine(&["kimi"]);
+    let store = Store::at(&b.state);
+    let hold = crate::harness::accounts_sync::PERSON_BACKOFF_SECS;
+    let mut pooled = facts(&KIMI, b.pkg.agents_dir().join("kimi"));
+    let pool = crate::ai::facts::CliAccounts {
+        roster: PathBuf::from("/home/me/.config/aterm/accounts-kimi.toml"),
+        next: Some("kimi-one".to_string()),
+        ..crate::ai::facts::CliAccounts::default()
+    };
+    let agent = Rig::new(&[("CODEX_THREAD_ID", "t")]);
+    for (case, edit, names) in [
+        (
+            "bot check",
+            crate::ai::facts::CliAccounts {
+                bot_check_at: Some(1_800_000_000 - 60),
+                ..pool.clone()
+            },
+            "bot check",
+        ),
+        (
+            "a person's step",
+            crate::ai::facts::CliAccounts {
+                person_task: Some(crate::harness::accounts::SignInAction::Browser),
+                ..pool.clone()
+            },
+            "aterm harness accounts browser kimi-one --cli kimi",
+        ),
+    ] {
+        pooled.pool = Some(edit);
+        let runner = FakeRunner::quiet();
+        let done = agent.sign_in(&runner, &store, &pooled, &row(&KIMI, State::SignedOut), &[]);
+        assert!(
+            matches!(&done, Done::Refused(why) if why.contains(names)),
+            "{case}: {done:?}"
+        );
+        assert!(runner.calls().is_empty(), "{case}");
+    }
+    pooled.pool = Some(crate::ai::facts::CliAccounts {
+        bot_check_at: Some(1_800_000_000 - hold),
+        ..pool
+    });
+    let runner = FakeRunner::quiet();
+    let done = agent.sign_in(&runner, &store, &pooled, &row(&KIMI, State::SignedOut), &[]);
+    assert_eq!(done, Done::SignedIn(None), "CONTROL");
+    assert!(!runner.calls()[0].terminal, "CONTROL");
 }

@@ -1292,15 +1292,13 @@ fn unjoined_alab_row(
     })
 }
 
-/// Whether the Secrets stage's `rows` leave the ALab vault off this network: every row not in
-/// place is a vault nobody answered ([`UNREACHED`]) or a server there holding none ([`WAITING`]
-/// on [`scope::NO_VAULT`] or [`aterm_machines::init_secrets::NO_VAULT_NOW`]). The Repositories
-/// stage then runs on this Mac's own GitHub credentials in the same pass instead of waiting for
-/// a vault this network may never have, and waits for the vault's token only when this Mac has
-/// none to sign in with; a join waiting for an admin, or a vault still syncing, keeps them
-/// waiting for its token.
-fn vault_not_here(rows: &[Row]) -> bool {
-    rows.iter().any(|row| !row_ready(row))
+/// What the Secrets stage's `rows` heard of the ALab vault where they leave it off this network:
+/// every row not in place is a vault nobody answered ([`UNREACHED`], read as
+/// [`scope::VaultHere::Unreached`]) or a server there holding none ([`WAITING`] on
+/// [`scope::NO_VAULT`] or [`aterm_machines::init_secrets::NO_VAULT_NOW`], read as
+/// [`scope::VaultHere::Absent`] where no row went unanswered). `None` for any other rows.
+fn off_network(rows: &[Row]) -> Option<scope::VaultHere> {
+    let off = rows.iter().any(|row| !row_ready(row))
         && rows.iter().all(|row| {
             row_ready(row)
                 || row.status == UNREACHED
@@ -1309,7 +1307,28 @@ fn vault_not_here(rows: &[Row]) -> bool {
                         || row
                             .detail
                             .starts_with(aterm_machines::init_secrets::NO_VAULT_NOW)))
-        })
+        });
+    off.then(|| {
+        if rows.iter().any(|row| row.status == UNREACHED) {
+            scope::VaultHere::Unreached
+        } else {
+            scope::VaultHere::Absent
+        }
+    })
+}
+
+/// Whether the Secrets stage's `rows` leave the ALab vault off this network ([`off_network`]).
+/// The Repositories stage then runs on this Mac's own GitHub credentials in the same pass instead
+/// of waiting for a vault this network may never have, and waits for the vault's token only when
+/// this Mac has none to sign in with; a join waiting for an admin, or a vault still syncing, keeps
+/// them waiting for its token. An explicitly disabled swarm also leaves repositories on local
+/// credentials.
+fn vault_not_here(rows: &[Row]) -> bool {
+    (!rows.is_empty()
+        && rows
+            .iter()
+            .all(|row| row.detail == aterm_secrets::swarm::SWARM_OFF))
+        || off_network(rows).is_some()
 }
 
 /// The Repositories row while they wait for the selected vault's token: [`WAITING`] while the
@@ -1457,6 +1476,33 @@ fn keeps_vault_sync(records: &Records) -> bool {
         && records.decision != Decision::Stopped(Stop::Cancelled)
         && records.stop_request != Some(StopRequest::Unreadable)
         && !records.stopped_run()
+}
+
+/// Whether a run System State admitted still owes its Secrets stage while the plan in force
+/// keeps this Mac's vault in sync ([`initial_setup_keeps_vault_sync`]): the run is admitted, not
+/// completed and not stopped, and its Secrets stage is not done. That stage joins the vault, so
+/// the converge pass's `sync.peers` leaves the join to it (a run waiting on a person before its
+/// Secrets stage included) and joins only once the stage ran without one. Reads aterm's setup
+/// records only.
+pub fn initial_setup_owes_secrets_stage() -> Result<bool, String> {
+    owes_secrets_stage_at(&state_root()?)
+}
+
+fn owes_secrets_stage_at(root: &Path) -> Result<bool, String> {
+    let records = observation_at(root)
+        .map_err(|error| error.to_string())?
+        .records;
+    Ok(owes_secrets_stage(&records))
+}
+
+fn owes_secrets_stage(records: &Records) -> bool {
+    keeps_vault_sync(records)
+        && records.progress.as_ref().is_some_and(|progress| {
+            progress.admitted
+                && !progress.completed
+                && !progress.stopped
+                && progress.done & Stage::Secrets.bit() == 0
+        })
 }
 
 /// Run a local subscriber repair only while the current setup keeps the vault in sync.
@@ -3186,12 +3232,13 @@ pub fn initial_setup_access_step(
 }
 
 /// Check again's look at the LAN (System State design §3.3): the Local Network row then reads
-/// what macOS answers now, not an answer kept from long ago. It looks only once macOS has asked
-/// aterm already ([`access::lan_asked_before`]), so it never puts the question on screen, and
-/// it waits for the look on the caller's thread.
+/// what macOS answers now, not an answer kept from long ago, and the Secrets vault row what this
+/// look heard at the ALab vault's address ([`scope::look_again`]). It looks only once macOS has
+/// asked aterm already ([`access::lan_asked_before`]), so it never puts the question on screen,
+/// and it waits for the look on the caller's thread.
 pub fn probe_local_network_again() {
     if ensure_person_scope().is_ok() && access::lan_asked_before() {
-        scope::probe_lan();
+        scope::look_again();
     }
 }
 
@@ -3241,6 +3288,68 @@ pub fn local_network_heard() -> LocalNetworkHeard {
         Some(access::LanAnswer::Asked) => LocalNetworkHeard::Asked,
         Some(access::LanAnswer::Reached) => LocalNetworkHeard::On,
         Some(access::LanAnswer::Refused) => LocalNetworkHeard::Off,
+    }
+}
+
+/// Who may make this process's first use of the LAN, which is when macOS puts its Local Network
+/// question on screen, as the Commons runtime reads it before its own (design §6: System State's
+/// Local Network step is the one meant to raise that question, in its order).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalNetworkFirstUse {
+    /// macOS answered aterm's question before: a look reached the LAN or was refused, or the
+    /// window recorded the grant, in any revision.
+    Answered,
+    /// macOS asked aterm before and no answer was heard since: a kept `asked`, or the window's
+    /// step recorded `triggered`, in any revision (an older aterm's revision 0 included).
+    Asked,
+    /// System State's Local Network step is still to come, and raises the question.
+    StepToCome,
+    /// The step will not run, for this reason: the first LAN use asks by itself.
+    NoStep(&'static str),
+}
+
+/// [`LocalNetworkFirstUse`] now, from aterm's own records only: the last answer a LAN look or the
+/// window's step heard ([`local_network_heard`]'s), the access record's Local Network row in any
+/// revision, and the setup records' [`PermissionSteps`]. `step_off` says why System State's
+/// Local Network step will not run in a window here (a `[privacy]` switch off, `[swarm]` off);
+/// `None` while it may.
+#[must_use]
+pub fn local_network_first_use(step_off: Option<&'static str>) -> LocalNetworkFirstUse {
+    use aterm_types::macos_setup::{Access, access_record};
+    first_use(
+        access::last_answer(),
+        aterm_types::dirs::state_dir()
+            .and_then(|dir| access_record::latest_of_any_revision(&dir, Access::LocalNetwork)),
+        initial_setup_permission_steps(),
+        step_off,
+    )
+}
+
+/// [`local_network_first_use`] of what it read (pure). Evidence that macOS already asked aterm
+/// comes first, whatever the steps say; a records read that failed (a newer aterm's included)
+/// leaves the step to come.
+fn first_use(
+    last: Option<access::LanAnswer>,
+    recorded: Option<aterm_types::macos_setup::AccessOutcome>,
+    steps: Result<PermissionSteps, String>,
+    step_off: Option<&'static str>,
+) -> LocalNetworkFirstUse {
+    use access::LanAnswer;
+    use aterm_types::macos_setup::AccessOutcome;
+    if matches!(last, Some(LanAnswer::Reached | LanAnswer::Refused))
+        || recorded == Some(AccessOutcome::Granted)
+    {
+        LocalNetworkFirstUse::Answered
+    } else if last == Some(LanAnswer::Asked) || recorded == Some(AccessOutcome::Triggered) {
+        LocalNetworkFirstUse::Asked
+    } else if let Some(why) = step_off {
+        LocalNetworkFirstUse::NoStep(why)
+    } else if steps == Ok(PermissionSteps::Off) {
+        LocalNetworkFirstUse::NoStep(
+            "System State's plan leaves Permissions out, or a person's Cancel or Stop holds it",
+        )
+    } else {
+        LocalNetworkFirstUse::StepToCome
     }
 }
 
@@ -3345,6 +3454,9 @@ pub struct InitialSetupSnapshot {
     /// change to another group hands nothing to macOS again (design §6).
     pub access_revision: u64,
     pub permissions_allowed: bool,
+    /// Whether System State's access steps run, wait for an admission still to come, or are held
+    /// by a person's choice ([`PermissionSteps`]); `permissions_allowed` is its `Allowed`.
+    pub access_steps: PermissionSteps,
     /// The plan in force is one aterm chose by itself (design §3.5), which a look that finds
     /// the ALab signal widens: System State then sends every group press, even one that
     /// leaves the plan as it is, so the plan becomes the person's and is never widened.
@@ -4200,6 +4312,89 @@ fn snapshot_with(
     ))
 }
 
+/// Whether System State's access steps (the window's Permissions lanes, its Local Network step
+/// first) run for the setup records in force (design §6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionSteps {
+    /// They run: an admitted run whose plan selects Permissions, the run a Restore ended (a
+    /// Restore never withdraws aterm's own permissions), or an older aterm's verified setup.
+    Allowed,
+    /// Not yet: no plan or no admitted run yet. They may still come with nobody's choice.
+    NotYet,
+    /// Held until a person chooses again: their Cancel or Stop holds them (a Restore's record a
+    /// Cancel holds among them), or the admitted run's plan leaves Permissions out.
+    Off,
+}
+
+/// [`PermissionSteps`] of `records`, with `progress` their run's progress when it belongs to the
+/// saved plan and `plan` the plan every reader presents as in force ([`Records::present`]).
+/// `Allowed` is exactly the snapshot's `permissions_allowed`.
+fn permission_steps(records: &Records, progress: Option<Progress>, plan: &Plan) -> PermissionSteps {
+    let cancelled = records.decision == Decision::Stopped(Stop::Cancelled);
+    let run_stopped = progress.is_some_and(|progress| progress.stopped_by(records.stop_request));
+    let admitted = records.plan.is_some()
+        && progress.is_some_and(|progress| progress.admitted)
+        && matches!(
+            records.decision,
+            Decision::Pending | Decision::Applied(true) | Decision::Stopped(Stop::Restored)
+        );
+    let selected = plan.selection.contains(Setting::Permissions);
+    // A Restore puts back Mac preferences and never withdraws aterm's own permissions: the
+    // run it ends stays admitted ([`leave_restored_as_is`]), so the access steps go on by
+    // themselves. Only a person's Cancel or Stop holds them.
+    let allowed = !cancelled
+        && !run_stopped
+        && match records.progress {
+            Some(_) => admitted && selected,
+            None => {
+                !records.plan.as_ref().is_some_and(|(_, modern)| *modern)
+                    && records.decision == Decision::Applied(true)
+            }
+        };
+    let held_restore = records.decision == Decision::Stopped(Stop::Restored)
+        && records.restored.is_some_and(|restored| restored.held);
+    if allowed {
+        PermissionSteps::Allowed
+    } else if cancelled
+        || run_stopped
+        || held_restore
+        || (records.progress.is_some() && admitted && !selected)
+    {
+        PermissionSteps::Off
+    } else {
+        PermissionSteps::NotYet
+    }
+}
+
+/// [`PermissionSteps`] of this Mac's setup records now, for a process that shows no System State
+/// (the Commons runtime asks it every 2 s while it waits for the Local Network step). It reads the
+/// records alone: no vault, no ledger.
+///
+/// # Errors
+///
+/// The state root cannot be resolved, or the records cannot be read ([`setup_is_newer`] says
+/// whether a newer aterm saved them).
+pub fn initial_setup_permission_steps() -> Result<PermissionSteps, String> {
+    permission_steps_at(&state_root()?)
+}
+
+fn permission_steps_at(root: &Path) -> Result<PermissionSteps, String> {
+    let records = observation_at(root)
+        .map_err(|error| error.to_string())?
+        .records;
+    // With no saved plan the fallback never decides the answer: the progress branch needs a
+    // saved plan, and the legacy branch reads only the decision.
+    let raw_plan = records
+        .plan
+        .as_ref()
+        .map_or_else(Plan::default, |(plan, _)| plan.clone());
+    let progress = records
+        .progress
+        .filter(|progress| progress.belongs_to(&raw_plan));
+    let plan = records.present(raw_plan);
+    Ok(permission_steps(&records, progress, &plan))
+}
+
 fn snapshot_from_observation(
     fallback: Plan,
     live: ledger::Live,
@@ -4234,28 +4429,8 @@ fn snapshot_from_observation(
             records.decision,
             Decision::Pending | Decision::Applied(true) | Decision::Stopped(Stop::Restored)
         );
-    // A Restore puts back Mac preferences and never withdraws aterm's own permissions: the
-    // run it ends stays admitted ([`leave_restored_as_is`]), so the access steps go on by
-    // themselves. Only a person's Cancel or Stop holds them.
-    let permissions_allowed = stopped != Some(Stop::Cancelled)
-        && !run_stopped
-        && match records.progress {
-            Some(_) => {
-                records.plan.is_some()
-                    && progress.is_some_and(|progress| progress.admitted)
-                    && matches!(
-                        records.decision,
-                        Decision::Pending
-                            | Decision::Applied(true)
-                            | Decision::Stopped(Stop::Restored)
-                    )
-                    && plan.selection.contains(Setting::Permissions)
-            }
-            None => {
-                !records.plan.as_ref().is_some_and(|(_, modern)| *modern)
-                    && records.decision == Decision::Applied(true)
-            }
-        };
+    let access_steps = permission_steps(records, progress, &plan);
+    let permissions_allowed = access_steps == PermissionSteps::Allowed;
     let rows =
         Stage::ALL
             .iter()
@@ -4317,6 +4492,7 @@ fn snapshot_from_observation(
         run_allowed,
         access_revision: progress.map_or(0, Progress::access_revision),
         permissions_allowed,
+        access_steps,
         provisional: records.plan.is_some() && records.provisional && records.cancelled.is_none(),
         cancelled: records.cancelled.is_some(),
         recovered: false,
@@ -4331,6 +4507,10 @@ fn status_at(root: &Path, fallback: Plan) -> Result<(Plan, bool, Vec<Row>), Stri
 }
 
 trait InitialHost {
+    /// The automatic swarm master switch, read before the setup lane reaches the vault.
+    fn swarm_enabled(&mut self) -> Result<bool, String> {
+        Ok(true)
+    }
     /// A legacy plan's one pass: its original workstation rows, sign-outs included.
     fn legacy(&mut self, root: &Path) -> Result<Option<Report>, String>;
     /// The Workstation stage: the plan's preferences without the sign-outs, or `only` these
@@ -4351,6 +4531,13 @@ trait InitialHost {
         password: &mut Option<SecretBytes>,
     ) -> Result<Vec<Row>, String>;
     fn secrets_pace(&mut self) -> Option<Pace>;
+    /// Whether the Secrets stage's join ([`Self::secrets`]: the look for the ALab vault on this
+    /// network, the join's look at its vault) waits for System State's Local Network step: those
+    /// use the LAN, which would put macOS's Local Network question on screen ahead of the step
+    /// while it is still to come (`aterm_types::macos_setup::lan_first_use::may_use`, design §6).
+    fn secrets_wait_for_local_network(&mut self) -> bool {
+        false
+    }
     fn configured_vault(&mut self) -> Result<Option<ConfiguredVault>, String>;
     fn current_vault(&mut self, plan: &Plan) -> Result<Vec<Row>, String>;
     fn repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String>;
@@ -4389,6 +4576,30 @@ trait InitialHost {
         ledger::boot_session()
     }
     /// Now, in seconds since the epoch, which the run's ledger stamps each begin with.
+    fn now_secs(&mut self) -> u64 {
+        ledger::now_secs()
+    }
+    /// Concurrent Secrets lane that starts on Local Network `Granted` beside
+    /// [`Stage::Workstation`], when this host supports parallel execution.
+    fn secrets_lane(&mut self) -> Option<Box<dyn SecretsLane>> {
+        None
+    }
+}
+
+/// Self-contained Secrets stage runner spawned in a lane beside [`Stage::Workstation`].
+trait SecretsLane: Send {
+    fn swarm_enabled(&mut self) -> Result<bool, String> {
+        Ok(true)
+    }
+    fn secrets(
+        &mut self,
+        plan: &Plan,
+        replaces: Replaces,
+        password: &mut Option<SecretBytes>,
+    ) -> Result<Vec<Row>, String>;
+    fn secrets_pace(&mut self) -> Option<Pace>;
+    fn configured_vault(&mut self) -> Result<Option<ConfiguredVault>, String>;
+    fn current_vault(&mut self, plan: &Plan) -> Result<Vec<Row>, String>;
     fn now_secs(&mut self) -> u64 {
         ledger::now_secs()
     }
@@ -4505,6 +4716,7 @@ pub struct InitialSetupParkMark {
     materialization: Option<aterm_secrets::client::MaterializationMark>,
     subscriber_run: Option<u64>,
     subscriber: Option<bool>,
+    local_network: Option<access::LanAnswer>,
     interfaces: Option<Vec<aterm_secrets::network::InterfaceAddress>>,
     /// The run whose Repositories stage is unfinished: the Command Line Tools arriving may end
     /// its wait ([`InitialSetupParkMark::facts_changed_since`]).
@@ -4549,7 +4761,8 @@ impl InitialSetupParkMark {
                 && changed(&self.materialization, &before.materialization))
             || (self.subscriber_run.is_some()
                 && self.subscriber_run == before.subscriber_run
-                && changed(&self.subscriber, &before.subscriber))
+                && (changed(&self.subscriber, &before.subscriber)
+                    || changed(&self.local_network, &before.local_network)))
             // The tools' install (the tab the window opened, or a person's own `aterm init`)
             // finishing during the pass ends the Repositories stage's wait on them.
             || (self.developer_tools_run.is_some()
@@ -4749,6 +4962,9 @@ fn initial_setup_park_mark_reading(
         materialization: materialization_run.and_then(|_| materialization()),
         subscriber_run: unfinished_secrets.map(|(_, progress, _, _, _, _)| progress.revision),
         subscriber: unfinished_secrets.and_then(|_| subscriber()),
+        local_network: unfinished_secrets.and_then(|(root, progress, _, _, _, _)| {
+            access::answer_at(root, progress.access_revision())
+        }),
         interfaces: unfinished_network.and_then(|_| interfaces()),
         developer_tools_run: pending
             .filter(|(_, progress, _, repositories, _, _)| {
@@ -5264,6 +5480,7 @@ mod parked_secrets_route_tests {
             marks: Some("same-network".into()),
             inputs: None,
             materialization: None,
+            network: None,
             now,
         };
         let rows = |status: &str| {
@@ -5426,6 +5643,9 @@ fn item_rows(rows: Vec<aterm_machines::model::ItemReport>) -> Vec<Row> {
 }
 
 impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
+    fn swarm_enabled(&mut self) -> Result<bool, String> {
+        aterm_secrets::swarm::enabled_live().map_err(|why| why.to_string())
+    }
     fn legacy(&mut self, root: &Path) -> Result<Option<Report>, String> {
         apply_on_first_run_at(root)
     }
@@ -5462,53 +5682,21 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
         replaces: Replaces,
         password: &mut Option<SecretBytes>,
     ) -> Result<Vec<Row>, String> {
-        let sys = aterm_machines::port::Live::new();
-        let ctx = self.context()?;
-        // A join's first request to the LAN can raise macOS's Local Network alert: only one
-        // macOS dialog this process started is up at a time (System State design §6).
-        let Some(_dialog) = aterm_types::macos_setup::MacosDialog::when_none_up(
-            aterm_types::macos_setup::DIALOG_WAIT,
-        ) else {
-            return Ok(vec![readiness_row(
-                Stage::Secrets.name(),
-                false,
-                "another macOS dialog is still up; the join waits for it".into(),
-            )]);
-        };
-        // The ALab vault's own address, not joined yet: the probe's answer decides whether the
-        // join goes ahead ([`unjoined_alab_row`]).
-        let mut unanswered = false;
-        if plan.vault_url == aterm_types::macos_setup::DEFAULT_VAULT_URL
-            && !in_plan_vault(plan, live_configured_vault())
-        {
-            let here = scope::probe_vault();
-            if let Some(row) =
-                unjoined_alab_row(here, access::last_answer(), &UNANSWERED_PROBE_JOINED)
-            {
-                return Ok(vec![row]);
-            }
-            unanswered = here == scope::VaultHere::Unreached;
-        }
-        let ops = aterm_machines::init_secrets::unattended(&ctx)?;
-        aterm_machines::init::run_initial_secrets(
-            &sys,
-            &ctx,
-            ops,
-            &plan.vault_url,
-            replaces,
-            password,
-            APPROVAL_WAIT,
-        )
-        .map(|reports| {
-            if !unanswered {
-                return secrets_rows(reports);
-            }
-            unanswered_join(reports, access::lan_answered)
-        })
+        run_live_secrets(plan, replaces, password)
+    }
+
+    fn secrets_lane(&mut self) -> Option<Box<dyn SecretsLane>> {
+        self.reads
+            .boxed_clone()
+            .map(|reads| Box::new(LiveSecretsLane { reads }) as Box<dyn SecretsLane>)
     }
 
     fn secrets_pace(&mut self) -> Option<Pace> {
         Some(secrets_retry::pace(&self.reads))
+    }
+
+    fn secrets_wait_for_local_network(&mut self) -> bool {
+        !aterm_types::macos_setup::lan_first_use::may_use()
     }
 
     fn configured_vault(&mut self) -> Result<Option<ConfiguredVault>, String> {
@@ -5557,7 +5745,166 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
     }
 }
 
+struct LiveSecretsLane {
+    reads: Box<dyn secrets_retry::Reads + Send>,
+}
+
+impl SecretsLane for LiveSecretsLane {
+    fn swarm_enabled(&mut self) -> Result<bool, String> {
+        aterm_secrets::swarm::enabled_live().map_err(|why| why.to_string())
+    }
+    fn secrets(
+        &mut self,
+        plan: &Plan,
+        replaces: Replaces,
+        password: &mut Option<SecretBytes>,
+    ) -> Result<Vec<Row>, String> {
+        run_live_secrets(plan, replaces, password)
+    }
+
+    fn secrets_pace(&mut self) -> Option<Pace> {
+        Some(secrets_retry::pace(self.reads.as_ref()))
+    }
+
+    fn configured_vault(&mut self) -> Result<Option<ConfiguredVault>, String> {
+        live_configured_vault()
+    }
+
+    fn current_vault(&mut self, plan: &Plan) -> Result<Vec<Row>, String> {
+        check::current_vault_rows(plan)
+    }
+}
+
+fn run_live_secrets(
+    plan: &Plan,
+    replaces: Replaces,
+    password: &mut Option<SecretBytes>,
+) -> Result<Vec<Row>, String> {
+    if let Some(rows) =
+        automatic_secrets_rows(aterm_secrets::swarm::enabled_live().map_err(|why| why.to_string()))
+    {
+        return Ok(rows);
+    }
+    let sys = aterm_machines::port::Live::new();
+    let ctx = aterm_machines::init::initial_setup_context(&sys)?;
+    let mut dialog = match join_dialog_slot(access::heard_here(), access::last_answer(), || {
+        aterm_types::macos_setup::MacosDialog::when_none_up(aterm_types::macos_setup::DIALOG_WAIT)
+    }) {
+        Ok(dialog) => dialog,
+        Err(row) => return Ok(vec![row]),
+    };
+    if let Some(rows) =
+        automatic_secrets_rows(aterm_secrets::swarm::enabled_live().map_err(|why| why.to_string()))
+    {
+        return Ok(rows);
+    }
+    // The ALab vault's own address, not joined yet: the probe's answer decides whether the
+    // join goes ahead ([`unjoined_alab_row`]).
+    let mut unanswered = false;
+    if plan.vault_url == aterm_types::macos_setup::DEFAULT_VAULT_URL
+        && !in_plan_vault(plan, live_configured_vault())
+    {
+        let here = scope::probe_vault();
+        if let Some(row) = unjoined_alab_row(here, access::last_answer(), &UNANSWERED_PROBE_JOINED)
+        {
+            return Ok(vec![row]);
+        }
+        unanswered = here == scope::VaultHere::Unreached;
+        // A probe that heard macOS's answer settled the question, so the join's own LAN use
+        // raises none: the slot goes now rather than through APPROVAL_WAIT and the fetch.
+        if !join_needs_slot(access::heard_here(), access::last_answer()) {
+            drop(dialog.take());
+        }
+    }
+    if let Some(rows) =
+        automatic_secrets_rows(aterm_secrets::swarm::enabled_live().map_err(|why| why.to_string()))
+    {
+        return Ok(rows);
+    }
+    let ops = aterm_machines::init_secrets::unattended(&ctx)?;
+    aterm_machines::init::run_initial_secrets(
+        &sys,
+        &ctx,
+        ops,
+        &plan.vault_url,
+        replaces,
+        password,
+        APPROVAL_WAIT,
+    )
+    .map(|reports| {
+        if !unanswered {
+            return secrets_rows(reports);
+        }
+        unanswered_join(reports, access::lan_answered)
+    })
+}
+
 const APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The Secrets stage's row while its join waits for System State's Local Network step
+/// ([`InitialHost::secrets_wait_for_local_network`]). The step's record wakes the parked run.
+const SECRETS_WAIT_LOCAL_NETWORK: &str = "waits for System State's Local Network question: the \
+    join looks for the vault on this Mac's network, which would put macOS's question up before \
+    System State asks it";
+
+/// The join's hold on this process's one macOS dialog slot (System State design §6), taken by
+/// `take` (`None` once its wait ends with another dialog still up) while [`join_needs_slot`] says
+/// the join's LAN use could still raise macOS's Local Network question (`heard` and `last` as it
+/// reads them): the join then holds the slot, waits behind another dialog this process put up,
+/// and stops at a row that says so. Once the question is settled, the join takes no slot (`take`
+/// is never called), so it neither waits behind the window's Full Disk Access or Developer Tools
+/// step nor holds those steps off while it waits for an admin Mac's approval.
+fn join_dialog_slot<G>(
+    heard: Option<access::LanAnswer>,
+    last: Option<access::LanAnswer>,
+    take: impl FnOnce() -> Option<G>,
+) -> Result<Option<G>, Row> {
+    if !join_needs_slot(heard, last) {
+        return Ok(None);
+    }
+    take().map(Some).ok_or_else(|| {
+        readiness_row(
+            Stage::Secrets.name(),
+            false,
+            "another macOS dialog is still up; the join waits for it".into(),
+        )
+    })
+}
+
+/// Whether the vault join's LAN use could still raise macOS's Local Network question, so the
+/// join must hold the dialog slot (pure). `heard` is this process's last answer
+/// ([`access::heard_here`]); `last` is the later of it and the one an earlier launch kept
+/// ([`access::last_answer`]). The question is settled once macOS answered (`last` is `Reached`
+/// or `Refused`), or once this process's own Local Network step raised it (`heard` is `Asked`:
+/// the window's step runs in the process the setup worker runs in). An `Asked` known only from
+/// an earlier launch's record is not settled: that launch may have quit, crashed or relaunched
+/// with macOS's alert unanswered, and the window's step runs once per revision, so nothing
+/// raises the question again in order; the join takes the slot then, as the Commons gate does.
+fn join_needs_slot(heard: Option<access::LanAnswer>, last: Option<access::LanAnswer>) -> bool {
+    use access::LanAnswer;
+    let answered = matches!(last, Some(LanAnswer::Reached | LanAnswer::Refused));
+    let asked_here = heard == Some(LanAnswer::Asked);
+    !(answered || asked_here)
+}
+
+/// Automatic setup leaves explicit manual joins alone. A disabled or unreadable master
+/// switch reaches neither vault discovery nor the dialog/join path.
+fn automatic_secrets_rows(enabled: Result<bool, String>) -> Option<Vec<Row>> {
+    match enabled {
+        Ok(true) => None,
+        Ok(false) => Some(vec![readiness_row(
+            Stage::Secrets.name(),
+            true,
+            aterm_secrets::swarm::SWARM_OFF.into(),
+        )]),
+        Err(why) => Some(vec![Row {
+            name: Stage::Secrets.name().into(),
+            status: "error".into(),
+            detail: format!("cannot read swarm configuration: {why}"),
+            elapsed_ms: None,
+        }]),
+    }
+}
 
 fn readiness_row(name: &str, ready: bool, detail: String) -> Row {
     Row {
@@ -5623,15 +5970,190 @@ fn secrets_try(
     plan: &Plan,
     admitted: AdmittedVault,
 ) -> Result<SecretsTry, String> {
+    secrets_try_with(|| host.configured_vault(), plan, admitted)
+}
+
+fn secrets_try_with(
+    configured_vault: impl FnOnce() -> Result<Option<ConfiguredVault>, String>,
+    plan: &Plan,
+    admitted: AdmittedVault,
+) -> Result<SecretsTry, String> {
     if admitted == AdmittedVault::Unknown {
         return Ok(SecretsTry::RunItem(Replaces::Any));
     }
-    let configured = host
-        .configured_vault()
-        .map_err(|error| format!("{VAULT_CONFIG_UNREAD}: {error}"))?;
+    let configured =
+        configured_vault().map_err(|error| format!("{VAULT_CONFIG_UNREAD}: {error}"))?;
     Ok(match configured {
         Some(vault) if admitted.stands_in(plan, &vault) => SecretsTry::LeaveInPlace(vault),
         configured => SecretsTry::RunItem(Replaces::Read(configured.map(|vault| vault.config))),
+    })
+}
+
+enum SecretsLaneFinish {
+    NotRun {
+        password: Option<SecretBytes>,
+    },
+    Ran {
+        ready: bool,
+        rows: Vec<Row>,
+        page: Option<PassPage>,
+        password: Option<SecretBytes>,
+    },
+}
+
+struct WakeLaneOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for WakeLaneOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+        access::notify_local_network_waiters();
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "lane runner binds the scoped pass revision, ledger context, and hooks explicitly"
+)]
+fn run_secrets_lane(
+    lane: &mut dyn SecretsLane,
+    root: &Path,
+    plan: &Plan,
+    revision: u64,
+    access_revision: u64,
+    admitted_vault: AdmittedVault,
+    initial_done: u16,
+    boot: Option<u128>,
+    mut password: Option<SecretBytes>,
+    hooks: SetupHooks,
+    reached_secrets: &std::sync::atomic::AtomicBool,
+    stop_lane: &std::sync::atomic::AtomicBool,
+) -> Result<SecretsLaneFinish, String> {
+    use std::sync::atomic::Ordering;
+    if let Some(rows) = automatic_secrets_rows(lane.swarm_enabled()) {
+        return Ok(SecretsLaneFinish::Ran {
+            ready: rows_ready(&rows),
+            rows,
+            page: None,
+            password,
+        });
+    }
+    if plan.vault_url != aterm_types::macos_setup::DEFAULT_VAULT_URL
+        || in_plan_vault(plan, lane.configured_vault())
+    {
+        return Ok(SecretsLaneFinish::NotRun { password });
+    }
+    let lan = access::wait_for_local_network_grant(root, access_revision, || {
+        stop_lane.load(Ordering::Acquire)
+            || reached_secrets.load(Ordering::Acquire)
+            || (hooks.stop)(revision)
+            || stopped_at(root).ok().flatten().is_some()
+    });
+    if lan != Some(access::LanAnswer::Reached)
+        || stop_lane.load(Ordering::Acquire)
+        || (hooks.stop)(revision)
+        || stopped_at(root)?.is_some()
+    {
+        return Ok(SecretsLaneFinish::NotRun { password });
+    }
+    if let Some(rows) = automatic_secrets_rows(lane.swarm_enabled()) {
+        return Ok(SecretsLaneFinish::Ran {
+            ready: rows_ready(&rows),
+            rows,
+            page: None,
+            password,
+        });
+    }
+    let paced = lane.secrets_pace();
+    if paced
+        .as_ref()
+        .and_then(|pace| secrets_retry::paused(root, revision, pace))
+        .is_some()
+    {
+        return Ok(SecretsLaneFinish::NotRun { password });
+    }
+    let admitted = ledger::update(root, revision, |ledger| {
+        ledger.begin(Stage::Secrets, initial_done, boot, lane.now_secs())
+    })?;
+    if admitted != ledger::Admit::Run {
+        return Ok(SecretsLaneFinish::NotRun { password });
+    }
+    let begun = ledger::Begun::new(root, revision, Stage::Secrets);
+    let settings = [Setting::Secrets];
+    let subjects = [Subject::Setting(Setting::Secrets)];
+    (hooks.stage)(StageEvent {
+        settings: &settings,
+        subjects: &subjects,
+        running: true,
+    });
+    let started = std::time::Instant::now();
+    let result = match secrets_try_with(|| lane.configured_vault(), plan, admitted_vault) {
+        Ok(SecretsTry::LeaveInPlace(vault)) => {
+            let mut rows = vec![readiness_row(
+                Stage::Secrets.name(),
+                true,
+                vault.left_in_place(plan),
+            )];
+            match lane.current_vault(&vault.present(plan.clone())) {
+                Ok(read) => rows.extend(read),
+                Err(detail) => rows.push(Row {
+                    name: Stage::Secrets.name().into(),
+                    status: "unverified".into(),
+                    detail,
+                    elapsed_ms: None,
+                }),
+            }
+            Ok(rows)
+        }
+        Ok(SecretsTry::RunItem(replaces)) => lane.secrets(plan, replaces, &mut password),
+        Err(detail) => Ok(vec![Row {
+            name: Stage::Secrets.name().into(),
+            status: "unverified".into(),
+            detail,
+            elapsed_ms: None,
+        }]),
+    };
+    let mut page;
+    let (ready, mut rows) = match result {
+        Ok(rows) => {
+            page = items_page(Stage::Secrets, &rows);
+            (rows_ready(&rows), rows)
+        }
+        Err(detail) => {
+            let row = Row {
+                name: Stage::Secrets.name().into(),
+                status: "error".into(),
+                detail,
+                elapsed_ms: None,
+            };
+            page = Some(step_page(&row, Stage::Secrets.page_rows(&subjects)));
+            (false, vec![row])
+        }
+    };
+    let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    for row in &mut rows {
+        row.elapsed_ms.get_or_insert(elapsed);
+    }
+    begun.ended()?;
+    if let Some(before) = paced.as_ref()
+        && let Some(mut after) = lane.secrets_pace()
+    {
+        after.retain_known_from(before);
+        secrets_retry::record(root, revision, &after, ready, &mut rows)?;
+    }
+    page = page.or_else(|| Some(secrets_page(root, &rows)));
+    if ready || rows.iter().all(|row| row.status != "error") {
+        page = Some(secrets_page(root, &rows));
+    }
+    (hooks.stage)(StageEvent {
+        settings: &settings,
+        subjects: &subjects,
+        running: false,
+    });
+    Ok(SecretsLaneFinish::Ran {
+        ready,
+        rows,
+        page,
+        password,
     })
 }
 
@@ -5704,275 +6226,393 @@ fn execute_pass(
     // window hears an ask once the pass is over, a withdrawal at once
     // ([`SetupHooks::developer_tools`]).
     let mut developer_tools = None;
-    for stage in Stage::ALL {
-        clock.lap(&mut report.rows);
-        if !stage.selected(&plan) || progress.done & stage.bit() != 0 {
-            continue;
-        }
-        if stop_at_boundary(root, &mut progress, hooks)? {
-            report.rows.push(Row {
-                name: "System State".into(),
-                status: "stopped".into(),
-                detail: "stopped before this step; nothing more runs until the plan changes".into(),
-                elapsed_ms: None,
-            });
-            clock.lap(&mut report.rows);
-            if developer_tools == Some(true) {
-                (hooks.developer_tools)(progress.revision, false);
-            }
-            return Ok(Some((paged(report, pages), SetupNext::Done)));
-        }
-        let mut repository_vault = None;
-        if stage == Stage::Repositories && Stage::Secrets.selected(&plan) {
-            if progress.done & Stage::Secrets.bit() != 0 {
-                let current = secrets_try(host, &plan, progress.admitted_vault).and_then(|read| {
-                    let selected = match read {
-                        SecretsTry::LeaveInPlace(vault) => vault.present(plan.clone()),
-                        SecretsTry::RunItem(_) => plan.clone(),
-                    };
-                    let current = host.current_vault(&selected);
-                    repository_vault = Some(selected);
-                    current
-                });
-                if !current.as_ref().is_ok_and(|rows| rows_ready(rows)) {
-                    progress.done &= !Stage::Secrets.bit();
-                    progress.running = None;
-                    save_progress(root, progress)?;
-                    let rows = current.unwrap_or_else(|detail| {
-                        vec![Row {
-                            name: Stage::Secrets.name().into(),
-                            status: "unverified".into(),
-                            detail,
-                            elapsed_ms: None,
-                        }]
-                    });
-                    let at = report.rows.len();
-                    pages.push((at..at + rows.len(), secrets_page(root, &rows)));
-                    report.rows.extend(rows);
-                }
-            }
-            if progress.done & Stage::Secrets.bit() == 0 && !not_here {
-                let rows = vec![vault_token_wait(vault)];
-                next = next.and(SetupNext::of(&rows));
-                report.rows.extend(rows);
-                continue;
-            }
-        }
-        let paced = if stage == Stage::Secrets {
-            host.secrets_pace()
-        } else {
-            None
-        };
-        if let Some(rows) = paced
-            .as_ref()
-            .and_then(|pace| secrets_retry::paused(root, progress.revision, pace))
-        {
-            vault = SetupNext::of(&rows);
-            not_here = vault_not_here(&rows);
-            next = next.and(vault);
-            let at = report.rows.len();
-            pages.push((at..at + rows.len(), secrets_page(root, &rows)));
-            report.rows.extend(rows);
-            continue;
-        }
-        let settings: Vec<Setting> = stage
-            .settings()
-            .iter()
-            .copied()
-            .filter(|setting| {
-                plan.selection.contains(*setting)
-                    && (stage != Stage::Workstation
-                        || progress.only.is_none_or(|only| only.contains(*setting)))
-            })
-            .collect();
-        let subjects: Vec<Subject> = stage
-            .subjects()
-            .iter()
-            .copied()
-            .filter(|subject| match subject {
-                Subject::Setting(setting) => settings.contains(setting),
-                Subject::Access(_) => true,
-                // A Sync row is no stage's subject; it rides the Secrets row only.
-                Subject::Sync(_) => false,
-            })
-            .collect();
-        // A stage aterm stopped in twice, or one that ran past the hang limit, waits for Check
-        // again while the others go on.
-        let admitted = ledger::update(root, progress.revision, |ledger| {
-            ledger.begin(stage, progress.done, boot, host.now_secs())
-        })?;
-        match admitted {
-            ledger::Admit::Run => {}
-            ledger::Admit::Done => continue,
-            ledger::Admit::Parked(park) => {
-                let rows = vec![Row {
-                    name: stage.name().into(),
-                    status: WAITING.into(),
-                    detail: ledger::parked_words(stage, park),
-                    elapsed_ms: None,
-                }];
-                next = next.and(SetupNext::of(&rows));
-                if stage == Stage::Secrets {
-                    vault = SetupNext::Park;
-                }
-                report.rows.extend(rows);
-                continue;
-            }
-        }
-        let begun = ledger::Begun::new(root, progress.revision, stage);
-        progress.running = Some(stage);
-        save_progress(root, progress)?;
-        (hooks.stage)(StageEvent {
-            settings: &settings,
-            subjects: &subjects,
-            running: true,
+    let secrets_lane = (Stage::Secrets.selected(&plan)
+        && progress.done & Stage::Secrets.bit() == 0
+        && Stage::Workstation.selected(&plan)
+        && progress.done & Stage::Workstation.bit() == 0)
+        .then(|| host.secrets_lane())
+        .flatten();
+    let reached_secrets = std::sync::atomic::AtomicBool::new(false);
+    let stop_lane = std::sync::atomic::AtomicBool::new(false);
+    let initial_done = progress.done;
+    let pass_revision = progress.revision;
+    let pass_access_revision = progress.access_revision();
+    let pass_admitted_vault = progress.admitted_vault;
+    if std::thread::scope(|scope| -> Result<bool, String> {
+        let _wake_on_drop = WakeLaneOnDrop(&stop_lane);
+        let mut lane_handle = secrets_lane.map(|mut lane| {
+            let lane_password = password.take();
+            let lane_plan = &plan;
+            let reached_ref = &reached_secrets;
+            let stop_ref = &stop_lane;
+            std::thread::Builder::new()
+                .name("aterm-setup-secrets-lane".into())
+                .spawn_scoped(scope, move || {
+                    run_secrets_lane(
+                        lane.as_mut(),
+                        root,
+                        lane_plan,
+                        pass_revision,
+                        pass_access_revision,
+                        pass_admitted_vault,
+                        initial_done,
+                        boot,
+                        lane_password,
+                        hooks,
+                        reached_ref,
+                        stop_ref,
+                    )
+                })
         });
-        // The page's words for the stage's rows, where its report has them.
-        let mut page = None;
-        let result = match stage {
-            Stage::Workstation => match host.workstation(root, progress.only) {
-                Ok(Some(result)) => {
-                    page = result.page;
-                    Ok(result.rows)
+        for stage in Stage::ALL {
+            clock.lap(&mut report.rows);
+            if !stage.selected(&plan) || progress.done & stage.bit() != 0 {
+                continue;
+            }
+            if stage == Stage::Secrets {
+                reached_secrets.store(true, std::sync::atomic::Ordering::Release);
+                access::notify_local_network_waiters();
+                if let Some(spawned) = lane_handle.take() {
+                    let finished = spawned
+                        .map_err(|why| format!("secrets setup lane did not start: {why}"))?
+                        .join()
+                        .map_err(|_| "secrets setup lane panicked".to_owned())??;
+                    match finished {
+                        SecretsLaneFinish::NotRun {
+                            password: unspent_password,
+                        } => {
+                            *password = unspent_password;
+                        }
+                        SecretsLaneFinish::Ran {
+                            ready,
+                            rows,
+                            page,
+                            password: left_password,
+                        } => {
+                            *password = left_password;
+                            let left = SetupNext::of(&rows);
+                            if ready {
+                                progress.done |= Stage::Secrets.bit();
+                                save_progress(root, progress)?;
+                            }
+                            vault = left;
+                            not_here = vault_not_here(&rows);
+                            next = next.and(left);
+                            let at = report.rows.len();
+                            report.rows.extend(rows);
+                            if let Some(page) = page {
+                                pages.push((at..report.rows.len(), page));
+                            }
+                            clock.lap(&mut report.rows);
+                            continue;
+                        }
+                    }
                 }
-                Ok(None) if first_run_complete(root)? => Ok(vec![readiness_row(
-                    stage.name(),
-                    true,
-                    "selected Mac settings already verified".into(),
-                )]),
-                Ok(None) => Ok(vec![readiness_row(
-                    stage.name(),
-                    false,
-                    "waiting for the next automatic Mac settings retry".into(),
-                )]),
-                Err(error) => Err(error),
-            },
-            Stage::Spotlight => host.spotlight(),
-            Stage::Permissions => host.permissions(&plan, progress.access_revision()),
-            Stage::Secrets => match secrets_try(host, &plan, progress.admitted_vault) {
-                Ok(SecretsTry::LeaveInPlace(vault)) => {
-                    let mut rows = vec![readiness_row(
+            }
+            if stop_at_boundary(root, &mut progress, hooks)? {
+                stop_lane.store(true, std::sync::atomic::Ordering::Release);
+                access::notify_local_network_waiters();
+                if let Some(Ok(handle)) = lane_handle.take()
+                    && let Ok(Ok(
+                        SecretsLaneFinish::NotRun { password: left }
+                        | SecretsLaneFinish::Ran { password: left, .. },
+                    )) = handle.join()
+                {
+                    *password = left;
+                }
+                report.rows.push(Row {
+                    name: "System State".into(),
+                    status: "stopped".into(),
+                    detail: "stopped before this step; nothing more runs until the plan changes"
+                        .into(),
+                    elapsed_ms: None,
+                });
+                clock.lap(&mut report.rows);
+                if developer_tools == Some(true) {
+                    (hooks.developer_tools)(progress.revision, false);
+                }
+                return Ok(true);
+            }
+            let mut repository_vault = None;
+            if stage == Stage::Repositories
+                && Stage::Secrets.selected(&plan)
+                && host.swarm_enabled().unwrap_or(false)
+            {
+                if progress.done & Stage::Secrets.bit() != 0 {
+                    let current =
+                        secrets_try(host, &plan, progress.admitted_vault).and_then(|read| {
+                            let selected = match read {
+                                SecretsTry::LeaveInPlace(vault) => vault.present(plan.clone()),
+                                SecretsTry::RunItem(_) => plan.clone(),
+                            };
+                            let current = host.current_vault(&selected);
+                            repository_vault = Some(selected);
+                            current
+                        });
+                    if !current.as_ref().is_ok_and(|rows| rows_ready(rows)) {
+                        progress.done &= !Stage::Secrets.bit();
+                        progress.running = None;
+                        save_progress(root, progress)?;
+                        let rows = current.unwrap_or_else(|detail| {
+                            vec![Row {
+                                name: Stage::Secrets.name().into(),
+                                status: "unverified".into(),
+                                detail,
+                                elapsed_ms: None,
+                            }]
+                        });
+                        let at = report.rows.len();
+                        pages.push((at..at + rows.len(), secrets_page(root, &rows)));
+                        report.rows.extend(rows);
+                    }
+                }
+                if progress.done & Stage::Secrets.bit() == 0 && !not_here {
+                    let rows = vec![vault_token_wait(vault)];
+                    next = next.and(SetupNext::of(&rows));
+                    report.rows.extend(rows);
+                    continue;
+                }
+            }
+            let suppressed_secrets = (stage == Stage::Secrets)
+                .then(|| automatic_secrets_rows(host.swarm_enabled()))
+                .flatten();
+            let paced = if stage == Stage::Secrets && suppressed_secrets.is_none() {
+                host.secrets_pace()
+            } else {
+                None
+            };
+            if let Some(rows) = paced
+                .as_ref()
+                .and_then(|pace| secrets_retry::paused(root, progress.revision, pace))
+            {
+                vault = SetupNext::of(&rows);
+                not_here = vault_not_here(&rows);
+                next = next.and(vault);
+                let at = report.rows.len();
+                pages.push((at..at + rows.len(), secrets_page(root, &rows)));
+                report.rows.extend(rows);
+                continue;
+            }
+            let settings: Vec<Setting> = stage
+                .settings()
+                .iter()
+                .copied()
+                .filter(|setting| {
+                    plan.selection.contains(*setting)
+                        && (stage != Stage::Workstation
+                            || progress.only.is_none_or(|only| only.contains(*setting)))
+                })
+                .collect();
+            let subjects: Vec<Subject> = stage
+                .subjects()
+                .iter()
+                .copied()
+                .filter(|subject| match subject {
+                    Subject::Setting(setting) => settings.contains(setting),
+                    Subject::Access(_) => true,
+                    // A Sync row is no stage's subject; it rides the Secrets row only.
+                    Subject::Sync(_) => false,
+                })
+                .collect();
+            // A stage aterm stopped in twice, or one that ran past the hang limit, waits for Check
+            // again while the others go on.
+            let admitted = ledger::update(root, progress.revision, |ledger| {
+                ledger.begin(stage, progress.done, boot, host.now_secs())
+            })?;
+            match admitted {
+                ledger::Admit::Run => {}
+                ledger::Admit::Done => continue,
+                ledger::Admit::Parked(park) => {
+                    let rows = vec![Row {
+                        name: stage.name().into(),
+                        status: WAITING.into(),
+                        detail: ledger::parked_words(stage, park),
+                        elapsed_ms: None,
+                    }];
+                    next = next.and(SetupNext::of(&rows));
+                    if stage == Stage::Secrets {
+                        vault = SetupNext::Park;
+                    }
+                    report.rows.extend(rows);
+                    continue;
+                }
+            }
+            let begun = ledger::Begun::new(root, progress.revision, stage);
+            progress.running = Some(stage);
+            save_progress(root, progress)?;
+            (hooks.stage)(StageEvent {
+                settings: &settings,
+                subjects: &subjects,
+                running: true,
+            });
+            // The page's words for the stage's rows, where its report has them.
+            let mut page = None;
+            // The Secrets stage's join waited for System State's Local Network step, so it tried
+            // nothing: no try is kept, and no retry pause holds the join once the step asked.
+            let mut waits_for_local_network = false;
+            let result = match stage {
+                Stage::Workstation => match host.workstation(root, progress.only) {
+                    Ok(Some(result)) => {
+                        page = result.page;
+                        Ok(result.rows)
+                    }
+                    Ok(None) if first_run_complete(root)? => Ok(vec![readiness_row(
                         stage.name(),
                         true,
-                        vault.left_in_place(&plan),
-                    )];
-                    match host.current_vault(&vault.present(plan.clone())) {
-                        Ok(read) => rows.extend(read),
-                        Err(detail) => rows.push(Row {
+                        "selected Mac settings already verified".into(),
+                    )]),
+                    Ok(None) => Ok(vec![readiness_row(
+                        stage.name(),
+                        false,
+                        "waiting for the next automatic Mac settings retry".into(),
+                    )]),
+                    Err(error) => Err(error),
+                },
+                Stage::Spotlight => host.spotlight(),
+                Stage::Permissions => host.permissions(&plan, progress.access_revision()),
+                Stage::Secrets => match suppressed_secrets {
+                    Some(rows) => Ok(rows),
+                    None => match secrets_try(host, &plan, progress.admitted_vault) {
+                        Ok(SecretsTry::LeaveInPlace(vault)) => {
+                            let mut rows = vec![readiness_row(
+                                stage.name(),
+                                true,
+                                vault.left_in_place(&plan),
+                            )];
+                            match host.current_vault(&vault.present(plan.clone())) {
+                                Ok(read) => rows.extend(read),
+                                Err(detail) => rows.push(Row {
+                                    name: stage.name().into(),
+                                    status: "unverified".into(),
+                                    detail,
+                                    elapsed_ms: None,
+                                }),
+                            }
+                            Ok(rows)
+                        }
+                        Ok(SecretsTry::RunItem(_)) if host.secrets_wait_for_local_network() => {
+                            waits_for_local_network = true;
+                            Ok(vec![Row {
+                                name: stage.name().into(),
+                                status: WAITING.into(),
+                                detail: SECRETS_WAIT_LOCAL_NETWORK.into(),
+                                elapsed_ms: None,
+                            }])
+                        }
+                        Ok(SecretsTry::RunItem(replaces)) => {
+                            host.secrets(&plan, replaces, password)
+                        }
+                        Err(detail) => Ok(vec![Row {
                             name: stage.name().into(),
                             status: "unverified".into(),
                             detail,
                             elapsed_ms: None,
-                        }),
+                        }]),
+                    },
+                },
+                Stage::Repositories => host.repositories(repository_vault.as_ref()),
+                Stage::Accounts => match host.accounts(root, (hooks.on_screen)()) {
+                    Ok(Some(result)) => {
+                        page = result.page;
+                        Ok(result.rows)
                     }
-                    Ok(rows)
+                    Ok(None) => Ok(vec![readiness_row(
+                        stage.name(),
+                        false,
+                        "waiting for the next automatic sign-out retry".into(),
+                    )]),
+                    Err(error) => Err(error),
+                },
+            };
+            let (ready, mut rows) = match result {
+                Ok(rows) => {
+                    page = page.or_else(|| items_page(stage, &rows));
+                    (rows_ready(&rows), rows)
                 }
-                Ok(SecretsTry::RunItem(replaces)) => host.secrets(&plan, replaces, password),
-                Err(detail) => Ok(vec![Row {
-                    name: stage.name().into(),
-                    status: "unverified".into(),
-                    detail,
-                    elapsed_ms: None,
-                }]),
-            },
-            Stage::Repositories => host.repositories(repository_vault.as_ref()),
-            Stage::Accounts => match host.accounts(root, (hooks.on_screen)()) {
-                Ok(Some(result)) => {
-                    page = result.page;
-                    Ok(result.rows)
+                Err(detail) => {
+                    // `aterm doctor` names the stage; the page names the rows it covers.
+                    let row = Row {
+                        name: stage.name().into(),
+                        status: "error".into(),
+                        detail,
+                        elapsed_ms: None,
+                    };
+                    page = Some(step_page(&row, stage.page_rows(&subjects)));
+                    (false, vec![row])
                 }
-                Ok(None) => Ok(vec![readiness_row(
-                    stage.name(),
-                    false,
-                    "waiting for the next automatic sign-out retry".into(),
-                )]),
-                Err(error) => Err(error),
-            },
-        };
-        let (ready, mut rows) = match result {
-            Ok(rows) => {
-                page = page.or_else(|| items_page(stage, &rows));
-                (rows_ready(&rows), rows)
+            };
+            if stage == Stage::Repositories {
+                // Run on this Mac's own credentials while the vault is not on this network
+                // ([`vault_not_here`]): with no token of its own to sign in with, they wait for the
+                // vault's as they would have, rather than ask the person for one the vault keeps.
+                let waits_for_vault = not_here && host.repositories_want_token();
+                if waits_for_vault {
+                    rows = vec![vault_token_wait(vault)];
+                    page = items_page(stage, &rows);
+                }
+                // A failed part's reason, where its step decided one, is the row's words on the page.
+                if !waits_for_vault
+                    && let Some(reason) = host.repositories_failure()
+                    && let Some(page) = page.as_mut()
+                {
+                    page.failed_because(Setting::Repositories, reason);
+                }
+                let wanted = host.repositories_want_developer_tools();
+                // A stage that no longer waits on the tools withdraws at once, so a pass that fails
+                // after it leaves no want standing; an ask waits for the pass's end.
+                if !wanted {
+                    (hooks.developer_tools)(progress.revision, false);
+                }
+                developer_tools = Some(wanted);
             }
-            Err(detail) => {
-                // `aterm doctor` names the stage; the page names the rows it covers.
-                let row = Row {
-                    name: stage.name().into(),
-                    status: "error".into(),
-                    detail,
-                    elapsed_ms: None,
-                };
-                page = Some(step_page(&row, stage.page_rows(&subjects)));
-                (false, vec![row])
+            let left = SetupNext::of(&rows);
+            if ready {
+                progress.done |= stage.bit();
             }
-        };
-        if stage == Stage::Repositories {
-            // Run on this Mac's own credentials while the vault is not on this network
-            // ([`vault_not_here`]): with no token of its own to sign in with, they wait for the
-            // vault's as they would have, rather than ask the person for one the vault keeps.
-            let waits_for_vault = not_here && host.repositories_want_token();
-            if waits_for_vault {
-                rows = vec![vault_token_wait(vault)];
-                page = items_page(stage, &rows);
+            if matches!(stage, Stage::Workstation | Stage::Accounts) {
+                // The inner pass can checkpoint verified effects before a later
+                // summary or held-item write fails. Keep that exact run's evidence
+                // when publishing this stage's result, including its error result.
+                let recorded = self::progress(root)?
+                    .filter(|recorded| {
+                        recorded.revision == progress.revision && recorded.belongs_to(&plan)
+                    })
+                    .ok_or("setup progress changed while the Mac settings step ran")?;
+                progress.done |= recorded.done & (Stage::Workstation.bit() | Stage::Accounts.bit());
             }
-            // A failed part's reason, where its step decided one, is the row's words on the page.
-            if !waits_for_vault
-                && let Some(reason) = host.repositories_failure()
-                && let Some(page) = page.as_mut()
+            if stage == Stage::Secrets {
+                vault = left;
+                not_here = vault_not_here(&rows);
+            }
+            next = next.and(left);
+            progress.running = None;
+            save_progress(root, progress)?;
+            begun.ended()?;
+            if let Some(before) = paced.as_ref()
+                && !waits_for_local_network
+                && let Some(mut after) = host.secrets_pace()
             {
-                page.failed_because(Setting::Repositories, reason);
+                after.retain_known_from(before);
+                secrets_retry::record(root, progress.revision, &after, ready, &mut rows)?;
             }
-            let wanted = host.repositories_want_developer_tools();
-            // A stage that no longer waits on the tools withdraws at once, so a pass that fails
-            // after it leaves no want standing; an ask waits for the pass's end.
-            if !wanted {
-                (hooks.developer_tools)(progress.revision, false);
+            if stage == Stage::Secrets {
+                // The vault's rows carry the retry pause's words, which the page says its own way.
+                page = Some(secrets_page(root, &rows));
             }
-            developer_tools = Some(wanted);
+            let at = report.rows.len();
+            report.rows.extend(rows);
+            if let Some(page) = page {
+                pages.push((at..report.rows.len(), page));
+            }
+            (hooks.stage)(StageEvent {
+                settings: &settings,
+                subjects: &subjects,
+                running: false,
+            });
         }
-        let left = SetupNext::of(&rows);
-        if ready {
-            progress.done |= stage.bit();
-        }
-        if matches!(stage, Stage::Workstation | Stage::Accounts) {
-            // The inner pass can checkpoint verified effects before a later
-            // summary or held-item write fails. Keep that exact run's evidence
-            // when publishing this stage's result, including its error result.
-            let recorded = self::progress(root)?
-                .filter(|recorded| {
-                    recorded.revision == progress.revision && recorded.belongs_to(&plan)
-                })
-                .ok_or("setup progress changed while the Mac settings step ran")?;
-            progress.done |= recorded.done & (Stage::Workstation.bit() | Stage::Accounts.bit());
-        }
-        if stage == Stage::Secrets {
-            vault = left;
-            not_here = vault_not_here(&rows);
-        }
-        next = next.and(left);
-        progress.running = None;
-        save_progress(root, progress)?;
-        begun.ended()?;
-        if let Some(before) = paced.as_ref()
-            && let Some(mut after) = host.secrets_pace()
-        {
-            after.retain_known_from(before);
-            secrets_retry::record(root, progress.revision, &after, ready, &mut rows)?;
-        }
-        if stage == Stage::Secrets {
-            // The vault's rows carry the retry pause's words, which the page says its own way.
-            page = Some(secrets_page(root, &rows));
-        }
-        let at = report.rows.len();
-        report.rows.extend(rows);
-        if let Some(page) = page {
-            pages.push((at..report.rows.len(), page));
-        }
-        (hooks.stage)(StageEvent {
-            settings: &settings,
-            subjects: &subjects,
-            running: false,
-        });
+        Ok(false)
+    })? {
+        return Ok(Some((paged(report, pages), SetupNext::Done)));
     }
     clock.lap(&mut report.rows);
     let stages_finished = Stage::ALL
@@ -6205,7 +6845,14 @@ fn execute_initial_for_revision(
     if revision_at(root)? != expected_revision {
         return Ok(None);
     }
-    execute_pass(host, root, password, hooks)
+    // System State's vault row waits for a vault nobody answered only while a run holds a join
+    // password the person typed for a try ([`scope::join_typed`]): this one notes whether it holds
+    // one as the pass begins, and as it ends, once the Secrets stage or its lane handed it back or
+    // a try spent it.
+    scope::holding_join_password(root, expected_revision, password.is_some());
+    let pass = execute_pass(host, root, password, hooks);
+    scope::holding_join_password(root, expected_revision, password.is_some());
+    pass
 }
 
 #[cfg(test)]
@@ -6268,6 +6915,9 @@ mod tests {
         wedged_rows: Vec<Vec<Row>>,
         /// The Secrets stage's rows, in place of the injected outcome.
         secrets_rows: Option<Vec<Row>>,
+        /// System State's Local Network step is still to come, so the join waits for it
+        /// ([`InitialHost::secrets_wait_for_local_network`]).
+        lan_waits: bool,
         /// Whether each Repositories stage was handed the plan's vault.
         repositories_vault: Vec<bool>,
     }
@@ -6437,6 +7087,9 @@ mod tests {
         }
         fn secrets_pace(&mut self) -> Option<Pace> {
             self.pace.clone()
+        }
+        fn secrets_wait_for_local_network(&mut self) -> bool {
+            self.lan_waits
         }
         fn configured_vault(&mut self) -> Result<Option<ConfiguredVault>, String> {
             if self.configured_unreadable {
@@ -7682,6 +8335,226 @@ mod tests {
         assert!(selected.revision > unchecked.revision);
     }
 
+    /// Whether System State's access steps run, wait or are held by a person's choice, as the
+    /// page's snapshot and the Commons runtime's light read both say: a Mac with no records waits
+    /// for its first admission; an admitted run runs them when its plan selects Permissions and
+    /// holds them when it leaves Permissions out; a Cancel or a Stop holds them (a Restore's record
+    /// a Cancel holds among them); a Restore keeps them running.
+    #[test]
+    fn permission_steps_split_what_waits_from_what_a_person_holds() {
+        let with = selected(&[Setting::Permissions, Setting::Secrets]);
+        let without = selected(&[Setting::Secrets]);
+        // Each case's records, written into a fresh state root.
+        type SetUp<'a> = &'a dyn Fn(&Path);
+        let cases: [(&str, SetUp<'_>, PermissionSteps); 8] = [
+            ("no records", &|_| {}, PermissionSteps::NotYet),
+            (
+                "a saved plan no run admitted",
+                &|root| save_plan(root, &with).unwrap(),
+                PermissionSteps::NotYet,
+            ),
+            (
+                "admitted with Permissions",
+                &|root| {
+                    authorize_at(root, &with).unwrap();
+                },
+                PermissionSteps::Allowed,
+            ),
+            (
+                "admitted without Permissions",
+                &|root| {
+                    authorize_at(root, &without).unwrap();
+                },
+                PermissionSteps::Off,
+            ),
+            (
+                "the review's Cancel",
+                &|root| save_cancelled_decision(root, &Plan::default()).unwrap(),
+                PermissionSteps::Off,
+            ),
+            (
+                "a Restore a Cancel holds",
+                &|root| {
+                    save_cancelled_decision(root, &Plan::default()).unwrap();
+                    save_restore(root).unwrap();
+                    leave_restored_as_is(root).unwrap();
+                },
+                PermissionSteps::Off,
+            ),
+            (
+                "a Stop",
+                &|root| {
+                    let revision = authorize_at(root, &with).unwrap().unwrap();
+                    request_stop_at(root, revision).unwrap();
+                },
+                PermissionSteps::Off,
+            ),
+            (
+                "a Restore",
+                &|root| {
+                    authorize_at(root, &with).unwrap();
+                    write_json(
+                        &root.join("first-run.json"),
+                        &json!({"profile":PROFILE,"state":"restored"}),
+                    )
+                    .unwrap();
+                },
+                PermissionSteps::Allowed,
+            ),
+        ];
+        for (case, set_up, expected) in cases {
+            let root = aterm_tempfile::tempdir().unwrap();
+            set_up(root.path());
+            let snapshot = snapshot_at(root.path(), Plan::default()).unwrap();
+            assert_eq!(snapshot.access_steps, expected, "{case}");
+            assert_eq!(
+                permission_steps_at(root.path()),
+                Ok(expected),
+                "{case}: the light read agrees with the page"
+            );
+            assert_eq!(
+                snapshot.permissions_allowed,
+                expected == PermissionSteps::Allowed,
+                "{case}"
+            );
+        }
+    }
+
+    /// Who makes this process's first LAN use, so macOS's Local Network question comes from
+    /// System State's step in its order: evidence that macOS asked aterm before opens the LAN
+    /// whatever else holds; with none, the step is to come unless it will not run.
+    #[test]
+    fn the_first_lan_use_waits_for_the_step_unless_macos_asked_or_no_step_runs() {
+        use access::LanAnswer;
+        use aterm_types::macos_setup::AccessOutcome;
+        const PRIVACY: &str = "a [privacy] switch is off";
+        let no_step = LocalNetworkFirstUse::NoStep(
+            "System State's plan leaves Permissions out, or a person's Cancel or Stop holds it",
+        );
+        let off = || Ok(PermissionSteps::Off);
+        let to_come = || Ok(PermissionSteps::NotYet);
+        let cases: [(_, _, Result<PermissionSteps, String>, _, _); 14] = [
+            (
+                Some(LanAnswer::Reached),
+                None,
+                to_come(),
+                None,
+                LocalNetworkFirstUse::Answered,
+            ),
+            (
+                Some(LanAnswer::Refused),
+                None,
+                to_come(),
+                None,
+                LocalNetworkFirstUse::Answered,
+            ),
+            (
+                None,
+                Some(AccessOutcome::Granted),
+                to_come(),
+                None,
+                LocalNetworkFirstUse::Answered,
+            ),
+            (
+                Some(LanAnswer::Asked),
+                None,
+                to_come(),
+                None,
+                LocalNetworkFirstUse::Asked,
+            ),
+            (
+                None,
+                Some(AccessOutcome::Triggered),
+                to_come(),
+                None,
+                LocalNetworkFirstUse::Asked,
+            ),
+            (
+                Some(LanAnswer::Asked),
+                Some(AccessOutcome::Granted),
+                to_come(),
+                None,
+                LocalNetworkFirstUse::Answered,
+            ),
+            (
+                None,
+                None,
+                to_come(),
+                Some(PRIVACY),
+                LocalNetworkFirstUse::NoStep(PRIVACY),
+            ),
+            (None, None, off(), None, no_step),
+            (
+                None,
+                None,
+                to_come(),
+                None,
+                LocalNetworkFirstUse::StepToCome,
+            ),
+            (
+                None,
+                None,
+                Ok(PermissionSteps::Allowed),
+                None,
+                LocalNetworkFirstUse::StepToCome,
+            ),
+            (
+                None,
+                None,
+                Err(NEWER_SETUP.into()),
+                None,
+                LocalNetworkFirstUse::StepToCome,
+            ),
+            (
+                None,
+                Some(AccessOutcome::Handed),
+                to_come(),
+                None,
+                LocalNetworkFirstUse::StepToCome,
+            ),
+            (
+                Some(LanAnswer::Reached),
+                None,
+                off(),
+                Some(PRIVACY),
+                LocalNetworkFirstUse::Answered,
+            ),
+            (
+                None,
+                Some(AccessOutcome::Triggered),
+                off(),
+                None,
+                LocalNetworkFirstUse::Asked,
+            ),
+        ];
+        for (n, (last, recorded, steps, step_off, expected)) in cases.into_iter().enumerate() {
+            assert_eq!(
+                first_use(last, recorded, steps, step_off),
+                expected,
+                "case {n}"
+            );
+        }
+
+        // The access record read in any revision: an older revision's step is evidence.
+        let state = aterm_tempfile::tempdir().unwrap();
+        aterm_types::macos_setup::access_record::append(
+            state.path(),
+            3,
+            aterm_types::macos_setup::Access::LocalNetwork,
+            AccessOutcome::Triggered,
+        )
+        .unwrap();
+        let recorded = aterm_types::macos_setup::access_record::latest_of_any_revision(
+            state.path(),
+            aterm_types::macos_setup::Access::LocalNetwork,
+        );
+        assert_eq!(
+            first_use(None, recorded, off(), None),
+            LocalNetworkFirstUse::Asked,
+            "an older revision's step"
+        );
+    }
+
     /// The launch's startup as `prepare_setup` reads the records: nothing when setup is finished,
     /// the run already admitted, else the offer answered as the page answers it, admitted.
     fn launch_startup(root: &Path) -> Option<u64> {
@@ -8626,7 +9499,7 @@ mod tests {
             (
                 row(
                     WAITING,
-                    "waiting for an admin: approve this Mac on an admin Mac",
+                    "waiting to be let in: press Allow on any Mac in ALab",
                 ),
                 false,
             ),
@@ -13333,7 +14206,10 @@ mod tests {
             assert!(finished_at(root.path()).unwrap());
             assert!(!root.path().join(secrets_retry::RECORD).exists());
             assert!(
-                rows[1].status == WAITING && rows[1].detail.contains("aterm secrets approve"),
+                rows[1].status == WAITING
+                    && rows[1]
+                        .detail
+                        .contains(aterm_machines::init_secrets::LET_IN),
                 "{rows:?}"
             );
             assert_eq!(
@@ -13985,6 +14861,70 @@ mod tests {
         }
     }
 
+    /// The vault join takes this process's macOS dialog slot until macOS's Local Network question
+    /// is settled (0.145's website run: a join that always took it waited on the window's Full
+    /// Disk Access and Developer Tools steps, credentials at +621 s). Settled is macOS's answer,
+    /// `Reached` or `Refused` as the last answer heard here or kept, or this process's own step
+    /// having asked (`Asked` heard here). An `Asked` kept only from an earlier launch is not
+    /// settled (that launch may have left macOS's alert unanswered, and no step raises it again in
+    /// order), nor is one heard here that a later `Asked` kept outranks. Taking the slot, the join
+    /// holds it when it is free and stops at the "still up" row when another dialog holds it.
+    /// Negative controls: reading any answer as settled (`last.is_some()`) fails the kept-`Asked`
+    /// case; dropping the asked-here half fails the case where this process asked.
+    #[test]
+    fn the_vault_join_takes_the_dialog_slot_until_macos_local_network_question_is_settled() {
+        use access::LanAnswer::{Asked, Reached, Refused};
+        use std::cell::Cell;
+        for (heard, last, why) in [
+            (None, None, "never asked"),
+            (None, Some(Asked), "asked in an earlier launch"),
+            (Some(Reached), Some(Asked), "ask kept after Reached"),
+            (Some(Refused), Some(Asked), "ask kept after Refused"),
+        ] {
+            assert!(join_needs_slot(heard, last), "{why}: takes the slot");
+        }
+        for (heard, last, why) in [
+            (Some(Asked), Some(Asked), "asked here"),
+            (None, Some(Reached), "Reached, kept"),
+            (None, Some(Refused), "Refused, kept"),
+            (Some(Reached), Some(Reached), "Reached here"),
+            (Some(Refused), Some(Refused), "Refused here"),
+            (Some(Asked), Some(Reached), "Reached since asked here"),
+            (Some(Asked), Some(Refused), "Refused since asked here"),
+        ] {
+            assert!(!join_needs_slot(heard, last), "{why}: takes no slot");
+        }
+
+        let takes = Cell::new(0_u32);
+        // Another macOS dialog of this process holds the slot: `take` waits it out to `None`.
+        let held = || {
+            takes.set(takes.get() + 1);
+            None::<&str>
+        };
+        assert!(
+            matches!(join_dialog_slot(Some(Asked), Some(Asked), held), Ok(None)),
+            "settled: the join goes on"
+        );
+        assert_eq!(takes.get(), 0, "settled: the join takes no slot");
+
+        let row = join_dialog_slot(None, Some(Asked), held).expect_err("unsettled: the join waits");
+        assert_eq!(takes.get(), 1);
+        assert_eq!(
+            (row.name.as_str(), row.status.as_str(), row.detail.as_str()),
+            (
+                Stage::Secrets.name(),
+                "blocked",
+                "another macOS dialog is still up; the join waits for it",
+            )
+        );
+
+        // Unsettled, and the slot is free: the join holds it while its LAN use may ask.
+        assert!(matches!(
+            join_dialog_slot(None, None, || Some("slot")),
+            Ok(Some("slot"))
+        ));
+    }
+
     /// The join a probe nobody answered let through parks as the probe's own row would have:
     /// a row stood aside because the vault did not answer is unreached, and one whose look heard
     /// a server with no vault waits, each with the look's words, so the pass parks; any other row
@@ -14284,6 +15224,65 @@ mod tests {
         assert!(page.outcome.unfinished.is_empty());
     }
 
+    /// The Secrets stage's join looks on this Mac's network, so while System State's Local
+    /// Network step is still to come it waits: a row that names the step's question, a park the
+    /// step's record wakes, no join and no try kept, since a kept try's retry pause would hold
+    /// the join past the step's ask. Once the step asked, or never will, the next pass joins.
+    #[test]
+    fn the_secrets_join_waits_for_the_local_network_step_and_keeps_no_try() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        authorize_at(root.path(), &selected(&[Setting::Secrets])).unwrap();
+        let mut host = Fake {
+            lan_waits: true,
+            pace: Some(Pace {
+                build: "1.0.0+gtest".into(),
+                marks: Some("unchanged".into()),
+                inputs: None,
+                materialization: None,
+                network: None,
+                now: vault::START,
+            }),
+            ..Fake::default()
+        };
+        let (report, next) = execute_pass(&mut host, root.path(), &mut None, SetupHooks::NONE)
+            .unwrap()
+            .unwrap();
+        assert!(
+            host.calls.is_empty(),
+            "no look and no join: {:?}",
+            host.calls
+        );
+        let [row] = report.rows.as_slice() else {
+            panic!("{:?}", report.rows)
+        };
+        assert_eq!(
+            (row.name.as_str(), row.status.as_str(), row.detail.as_str()),
+            (Stage::Secrets.name(), WAITING, SECRETS_WAIT_LOCAL_NETWORK)
+        );
+        assert_eq!(next, SetupNext::Park, "the step's record wakes the park");
+        assert!(
+            !root.path().join(secrets_retry::RECORD).exists(),
+            "no try kept, so no retry pause holds the join once the step asked"
+        );
+        assert!(!finished_at(root.path()).unwrap());
+
+        host.lan_waits = false;
+        let (report, next) = execute_pass(&mut host, root.path(), &mut None, SetupHooks::NONE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            host.calls,
+            [Stage::Secrets],
+            "the step asked: the join runs"
+        );
+        assert!(
+            report.rows.iter().all(|row| row.status == "ok"),
+            "{:?}",
+            report.rows
+        );
+        assert_eq!(next, SetupNext::Done);
+    }
+
     #[test]
     fn an_unreadable_vault_configuration_joins_nothing_and_counts_no_failure() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -14295,6 +15294,7 @@ mod tests {
                 marks: Some("unreadable".into()),
                 inputs: None,
                 materialization: None,
+                network: None,
                 now: vault::START,
             }),
             ..Fake::default()
@@ -17993,5 +18993,415 @@ mod tests {
             admitted.result.unwrap().expect("the answer is admitted");
             assert_eq!(set_aside::shown(root), !person, "person: {person}");
         }
+    }
+
+    #[test]
+    fn secrets_join_starts_on_local_network_granted_in_a_lane_beside_the_workstation_pass() {
+        use aterm_types::macos_setup::AccessOutcome;
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::{Duration, Instant};
+
+        #[derive(Default)]
+        struct LaneTimings {
+            events: Vec<&'static str>,
+            secrets_finished: bool,
+            lane_checked: bool,
+            post_off_checked: bool,
+            swarm_off: bool,
+            joined: bool,
+            repositories_saw_joined: bool,
+        }
+
+        struct LaneFixture {
+            parallel: bool,
+            swarm: bool,
+            turn_off_on_grant: bool,
+            state: Arc<(Mutex<LaneTimings>, Condvar)>,
+        }
+
+        struct ConcurrentSecrets {
+            swarm: bool,
+            state: Arc<(Mutex<LaneTimings>, Condvar)>,
+        }
+
+        impl SecretsLane for ConcurrentSecrets {
+            fn swarm_enabled(&mut self) -> Result<bool, String> {
+                let mut state = self.state.0.lock().unwrap();
+                if state.swarm_off {
+                    state.post_off_checked = true;
+                    self.state.1.notify_all();
+                }
+                Ok(self.swarm && !state.swarm_off)
+            }
+            fn secrets(
+                &mut self,
+                _plan: &Plan,
+                _replaces: Replaces,
+                _password: &mut Option<SecretBytes>,
+            ) -> Result<Vec<Row>, String> {
+                assert!(
+                    self.swarm && !self.state.0.lock().unwrap().swarm_off,
+                    "master-Off must never reach a join"
+                );
+                let (lock, cvar) = &*self.state;
+                {
+                    let mut st = lock.lock().unwrap();
+                    st.events.push("secrets-started");
+                    st.joined = true;
+                    st.events.push("secrets-finished");
+                    st.secrets_finished = true;
+                }
+                cvar.notify_all();
+                Ok(vec![readiness_row(
+                    Stage::Secrets.name(),
+                    true,
+                    "joined in parallel lane".into(),
+                )])
+            }
+
+            fn secrets_pace(&mut self) -> Option<Pace> {
+                None
+            }
+
+            fn configured_vault(&mut self) -> Result<Option<ConfiguredVault>, String> {
+                assert!(
+                    self.swarm && !self.state.0.lock().unwrap().swarm_off,
+                    "master-Off must not read the vault"
+                );
+                let joined = {
+                    let mut state = self.state.0.lock().unwrap();
+                    state.lane_checked = true;
+                    self.state.1.notify_all();
+                    state.joined
+                };
+                Ok(joined.then(|| ConfiguredVault {
+                    config: aterm_secrets::client::Config {
+                        source: aterm_secrets::transport::Source::Url(
+                            aterm_types::macos_setup::DEFAULT_VAULT_URL.into(),
+                        ),
+                        name: "alab".into(),
+                        signer: Some([7; 32]),
+                        followed: Vec::new(),
+                        host: "m99".into(),
+                    },
+                    home: PathBuf::from("/tmp/c3-lane-home"),
+                }))
+            }
+
+            fn current_vault(&mut self, _plan: &Plan) -> Result<Vec<Row>, String> {
+                Ok(vec![readiness_row(
+                    Stage::Secrets.name(),
+                    true,
+                    "vault verified".into(),
+                )])
+            }
+        }
+
+        impl InitialHost for LaneFixture {
+            fn swarm_enabled(&mut self) -> Result<bool, String> {
+                Ok(self.swarm && !self.state.0.lock().unwrap().swarm_off)
+            }
+            fn legacy(&mut self, _root: &Path) -> Result<Option<Report>, String> {
+                unreachable!("modern plan")
+            }
+
+            fn workstation(
+                &mut self,
+                root: &Path,
+                _only: Option<Selection>,
+            ) -> Result<Option<Report>, String> {
+                let revision = access_revision_at(root)?;
+                access::record_step_isolated_at(root, revision, AccessOutcome::Triggered);
+                if self.turn_off_on_grant {
+                    let (lock, cvar) = &*self.state;
+                    let mut state = lock.lock().unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(60);
+                    while !state.lane_checked {
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        assert!(!left.is_zero(), "lane never checked the master switch");
+                        state = cvar.wait_timeout(state, left).unwrap().0;
+                    }
+                    state.swarm_off = true;
+                }
+                // A synthetic grant releases the lane while Workstation is still active.
+                self.state.0.lock().unwrap().events.push("grant");
+                access::record_step_isolated_at(root, revision, AccessOutcome::Granted);
+                if self.turn_off_on_grant {
+                    let (lock, cvar) = &*self.state;
+                    let mut state = lock.lock().unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(60);
+                    while !state.post_off_checked {
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        assert!(
+                            !left.is_zero(),
+                            "lane never rechecked master-Off after the grant"
+                        );
+                        state = cvar.wait_timeout(state, left).unwrap().0;
+                    }
+                }
+
+                if self.parallel && self.swarm && !self.turn_off_on_grant {
+                    let (lock, cvar) = &*self.state;
+                    let mut guard = lock.lock().unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(60);
+                    while !guard.secrets_finished {
+                        let wait = deadline.saturating_duration_since(Instant::now());
+                        assert!(!wait.is_zero(), "parallel Secrets lane did not finish");
+                        let (next, _) = cvar.wait_timeout(guard, wait).unwrap();
+                        guard = next;
+                    }
+                }
+
+                // Checkpoint Workstation's progress mid-stage just as `apply_preferences_at`
+                // does, verifying zero clobber with the concurrent Secrets lane.
+                let mut saved = progress(root)?.expect("progress");
+                saved.done |= Stage::Workstation.bit();
+                save_progress(root, saved)?;
+
+                self.state
+                    .0
+                    .lock()
+                    .unwrap()
+                    .events
+                    .push("workstation-finished");
+                Ok(Some(Report {
+                    action: Action::Apply,
+                    rows: vec![readiness_row(
+                        Stage::Workstation.name(),
+                        true,
+                        "workstation preferences applied".into(),
+                    )],
+                    manual_steps: Vec::new(),
+                    backup: root.join("original-preferences.json"),
+                    restore: None,
+                    page: None,
+                }))
+            }
+
+            fn spotlight(&mut self) -> Result<Vec<Row>, String> {
+                Ok(vec![readiness_row(
+                    Stage::Spotlight.name(),
+                    true,
+                    "spotlight verified".into(),
+                )])
+            }
+
+            fn permissions(&mut self, _plan: &Plan, _revision: u64) -> Result<Vec<Row>, String> {
+                Ok(vec![readiness_row(
+                    Stage::Permissions.name(),
+                    true,
+                    "permissions verified".into(),
+                )])
+            }
+
+            fn secrets(
+                &mut self,
+                plan: &Plan,
+                replaces: Replaces,
+                password: &mut Option<SecretBytes>,
+            ) -> Result<Vec<Row>, String> {
+                ConcurrentSecrets {
+                    swarm: self.swarm,
+                    state: Arc::clone(&self.state),
+                }
+                .secrets(plan, replaces, password)
+            }
+
+            fn secrets_pace(&mut self) -> Option<Pace> {
+                None
+            }
+
+            fn configured_vault(&mut self) -> Result<Option<ConfiguredVault>, String> {
+                ConcurrentSecrets {
+                    swarm: self.swarm,
+                    state: Arc::clone(&self.state),
+                }
+                .configured_vault()
+            }
+
+            fn current_vault(&mut self, plan: &Plan) -> Result<Vec<Row>, String> {
+                ConcurrentSecrets {
+                    swarm: self.swarm,
+                    state: Arc::clone(&self.state),
+                }
+                .current_vault(plan)
+            }
+
+            fn repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String> {
+                let joined = self.state.0.lock().unwrap().joined && vault.is_some();
+                let master_on = self.swarm && !self.state.0.lock().unwrap().swarm_off;
+                self.state.0.lock().unwrap().repositories_saw_joined = joined;
+                Ok(vec![readiness_row(
+                    Stage::Repositories.name(),
+                    joined || !master_on,
+                    "repositories checked".into(),
+                )])
+            }
+
+            fn accounts(
+                &mut self,
+                _root: &Path,
+                _on_screen: bool,
+            ) -> Result<Option<Report>, String> {
+                unreachable!("accounts unselected")
+            }
+
+            fn withheld(&mut self, _root: &Path) -> Result<Option<Report>, String> {
+                Ok(None)
+            }
+
+            fn secrets_lane(&mut self) -> Option<Box<dyn SecretsLane>> {
+                self.parallel.then(|| {
+                    Box::new(ConcurrentSecrets {
+                        swarm: self.swarm,
+                        state: Arc::clone(&self.state),
+                    }) as Box<dyn SecretsLane>
+                })
+            }
+        }
+
+        let chosen = selected(&[
+            Setting::Dock,
+            Setting::Permissions,
+            Setting::Secrets,
+            Setting::Repositories,
+        ]);
+
+        // Workstation's condition variable waits for Secrets completion, proving ordering
+        // without assigning a latency budget to the machine running the test.
+        let parallel_root = aterm_tempfile::tempdir().unwrap();
+        authorize_at(parallel_root.path(), &chosen)
+            .unwrap()
+            .unwrap();
+        let parallel_state = Arc::new((Mutex::new(LaneTimings::default()), Condvar::new()));
+        let mut parallel_host = LaneFixture {
+            parallel: true,
+            swarm: true,
+            turn_off_on_grant: false,
+            state: Arc::clone(&parallel_state),
+        };
+        let (_, next) = execute_pass(
+            &mut parallel_host,
+            parallel_root.path(),
+            &mut None,
+            SetupHooks::NONE,
+        )
+        .unwrap()
+        .expect("pass ran");
+        assert_eq!(next, SetupNext::Done);
+        let saved = progress(parallel_root.path()).unwrap().unwrap();
+        assert_ne!(saved.done & Stage::Workstation.bit(), 0);
+        assert_ne!(saved.done & Stage::Secrets.bit(), 0);
+        assert_ne!(saved.done & Stage::Repositories.bit(), 0);
+        let parallel_timings = parallel_state.0.lock().unwrap();
+        assert_eq!(
+            parallel_timings.events,
+            [
+                "grant",
+                "secrets-started",
+                "secrets-finished",
+                "workstation-finished"
+            ]
+        );
+        assert!(parallel_timings.repositories_saw_joined);
+        drop(parallel_timings);
+
+        // Negative control: a sequential host finishes Workstation before starting Secrets.
+        let queued_root = aterm_tempfile::tempdir().unwrap();
+        authorize_at(queued_root.path(), &chosen).unwrap().unwrap();
+        let queued_state = Arc::new((Mutex::new(LaneTimings::default()), Condvar::new()));
+        let mut queued_host = LaneFixture {
+            parallel: false,
+            swarm: true,
+            turn_off_on_grant: false,
+            state: Arc::clone(&queued_state),
+        };
+        execute_pass(
+            &mut queued_host,
+            queued_root.path(),
+            &mut None,
+            SetupHooks::NONE,
+        )
+        .unwrap()
+        .expect("queued control ran");
+        let queued_timings = queued_state.0.lock().unwrap();
+        assert_eq!(
+            queued_timings.events,
+            [
+                "grant",
+                "workstation-finished",
+                "secrets-started",
+                "secrets-finished"
+            ]
+        );
+        drop(queued_timings);
+
+        // Both automatic paths respect master-Off before any vault read or join. Repositories
+        // can still use local credentials; explicit manual join APIs were not changed.
+        for (parallel, swarm, turn_off_on_grant) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let off_root = aterm_tempfile::tempdir().unwrap();
+            authorize_at(off_root.path(), &chosen).unwrap().unwrap();
+            let state = Arc::new((Mutex::new(LaneTimings::default()), Condvar::new()));
+            let mut host = LaneFixture {
+                parallel,
+                swarm,
+                turn_off_on_grant,
+                state: Arc::clone(&state),
+            };
+            let (report, next) =
+                execute_pass(&mut host, off_root.path(), &mut None, SetupHooks::NONE)
+                    .unwrap()
+                    .expect("Off pass ran");
+            assert_eq!(next, SetupNext::Done);
+            assert!(
+                report
+                    .rows
+                    .iter()
+                    .any(|row| row.detail == aterm_secrets::swarm::SWARM_OFF)
+            );
+            let recorded = state.0.lock().unwrap();
+            assert!(!recorded.joined);
+            assert_eq!(recorded.events, ["grant", "workstation-finished"]);
+        }
+    }
+
+    #[test]
+    fn parked_secrets_wakes_when_local_network_transitions_from_asked_to_granted() {
+        use aterm_secrets::client::{Membership, Status};
+        use aterm_types::macos_setup::AccessOutcome;
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = selected(&[Setting::Permissions, Setting::Secrets]);
+        let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+        let sample = || {
+            initial_setup_park_mark_with(
+                Some(root.path()),
+                Some(Status {
+                    config: None,
+                    machine: None,
+                    membership: Membership::Unconfigured,
+                    names: Vec::new(),
+                }),
+                1_000,
+                || None,
+            )
+        };
+        access::record_step_isolated_at(root.path(), revision, AccessOutcome::Triggered);
+        let asked = sample();
+        assert!(
+            !sample().facts_changed_since(&asked),
+            "Asked -> Asked stays parked"
+        );
+
+        access::record_step_isolated_at(root.path(), revision, AccessOutcome::Granted);
+        let granted = sample();
+        assert!(
+            granted.facts_changed_since(&asked),
+            "Asked -> Granted wakes a parked Secrets run"
+        );
     }
 }

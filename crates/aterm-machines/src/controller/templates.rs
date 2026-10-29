@@ -93,6 +93,7 @@ command_line_tools = true
 # toolset is the ALab compilers and provers (about 3.2 GB per user, from github.com).
 [aterm]
 toolset = true
+vault_server = true
 
 # Other software is yours to add: a [homebrew] table installs Homebrew and its formulae,
 # an [[app]] row one signed app (docs/DESIGN-machines-2026-10-16.md §8). For keeping a Mac
@@ -120,4 +121,5 @@ pub const EARLIER_DEFAULT_BASELINES: &[&str] = &[
     "e38407721722b11a0faac79954f4906f57eb92d4760bae3f092a00737380a11a",
     "80dbe78ab51b8dcf737a52074e4c1122c16bcdfa1310077001f2ca6a470ecb52",
     "afbb8d95fe3570f560676006cc83f9276a6a21fb4d7c5c652ff6e28458d296d1",
+    "a3141ec1470123d648d960961a9cdffa553b5a593d62c1babb6d3d99c13ea9a4",
 ];

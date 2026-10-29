@@ -125,6 +125,7 @@ impl Grid {
             if let Some(row) = self.row_mut(row_idx) {
                 row.clear();
                 row.set_wrapped(line.is_wrapped());
+                self.storage.extras.clear_row(row_idx);
             }
             return;
         };
@@ -138,6 +139,7 @@ impl Grid {
             row.set_wrapped(line.is_wrapped());
             result
         };
+        self.storage.extras.clear_row(row_idx);
 
         let deferred_cols: aterm_alloc::SmallVec<u16, 4> = deferred
             .iter()
@@ -235,42 +237,52 @@ impl Grid {
         }
 
         if let Some(spans) = line.images() {
-            let mut any_image = false;
-            let mut budget = usize::from(cols) * crate::extra::MAX_IMAGE_LAYERS;
-            'img_fill: for span in spans {
+            self.stamp_row_image_spans(row_idx, spans, cols);
+        }
+
+        self.mirror_wide_spacer_extras(row_idx);
+    }
+
+    pub(super) fn stamp_row_image_spans(
+        &mut self,
+        row_idx: u16,
+        spans: &[aterm_scrollback::ImageSpan],
+        cols: u16,
+    ) {
+        let mut any_image = false;
+        let max_ops = usize::from(cols) * crate::extra::MAX_IMAGE_LAYERS;
+        let mut budget = max_ops;
+        'img_fill: for span in spans {
+            for icol in span.start_col..span.end_col.min(cols) {
+                if budget == 0 {
+                    break 'img_fill;
+                }
+                if let Some(image) = super::scroll_materialize::span_layer_at(span, icol) {
+                    self.storage
+                        .extras
+                        .stack_image(CellCoord::new(row_idx, icol), image);
+                    any_image = true;
+                }
+                budget -= 1;
+            }
+        }
+        if any_image
+            && let Some(idx) = self.storage.row_index(row_idx)
+            && let Some(r) = self.storage.rows.get_mut(idx)
+        {
+            let mut budget = max_ops;
+            'img_flag: for span in spans {
                 for icol in span.start_col..span.end_col.min(cols) {
                     if budget == 0 {
-                        break 'img_fill;
+                        break 'img_flag;
                     }
-                    if let Some(image) = super::scroll_materialize::span_layer_at(span, icol) {
-                        self.storage
-                            .extras
-                            .stack_image(CellCoord::new(row_idx, icol), image);
-                        any_image = true;
+                    if let Some(cell) = r.get_mut(icol) {
+                        cell.set_has_extras(true);
                     }
                     budget -= 1;
                 }
             }
-            if any_image
-                && let Some(idx) = self.storage.row_index(row_idx)
-                && let Some(r) = self.storage.rows.get_mut(idx)
-            {
-                let mut budget = cols;
-                'img_flag: for span in spans {
-                    for icol in span.start_col..span.end_col.min(cols) {
-                        if budget == 0 {
-                            break 'img_flag;
-                        }
-                        if let Some(cell) = r.get_mut(icol) {
-                            cell.set_has_extras(true);
-                        }
-                        budget -= 1;
-                    }
-                }
-            }
         }
-
-        self.mirror_wide_spacer_extras(row_idx);
     }
 
     fn mirror_wide_spacer_extras(&mut self, row_idx: u16) {

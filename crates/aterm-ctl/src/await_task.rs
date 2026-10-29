@@ -10,9 +10,9 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use super::{
-    EXIT_TIMEOUT, StdoutSink, TargetOrigin, connect_served, read_bounded_line, read_status_line,
-    redial, same_socket_path, self_instance_sock_in, send_served, socket_dir, stderr_line,
-    stdout_handle, stream_count,
+    EXIT_TIMEOUT, StdoutSink, TargetOrigin, connect_served, instant_after, read_bounded_line,
+    read_status_line, redial, same_socket_path, self_instance_sock_in, send_served, socket_dir,
+    stderr_line, stdout_handle, stream_count,
 };
 
 /// The whole wait when neither the verb's `timeout=` nor `--timeout` names one.
@@ -269,6 +269,11 @@ enum Leg {
     /// ctl's own `--timeout` ran out before a leg over a drive was asked: the wait's end as the
     /// legs before it left it.
     Spent(io::Error),
+    /// A leg over a drive the peer refused this Mac at its admission, no grant there admitting
+    /// it: its fleet level below drive (`lowered`), or its
+    /// [`aterm_types::control_verbs::DRIVE_UNGRANTED`]. Past the baseline, which it served, the
+    /// wait's end with the rows read; before it, the run's end.
+    Ungranted { why: io::Error, lowered: bool },
 }
 
 type LegFn = dyn Fn(&str, &str, Duration) -> Leg + Send + Sync;
@@ -282,7 +287,11 @@ struct Legs {
 }
 
 fn socket_leg(sock: &str, request: &str, wait: Duration) -> Leg {
-    let stream = match connect_served(sock, TargetOrigin::Pinned, Some(wait + LEG_SLACK)) {
+    let stream = match connect_served(
+        sock,
+        TargetOrigin::Pinned,
+        Some(wait.saturating_add(LEG_SLACK)),
+    ) {
         Ok(Ok(stream)) => stream,
         Ok(Err(code)) => return Leg::Code(code),
         Err(e) => return Leg::Failed(e),
@@ -331,7 +340,7 @@ fn driven_leg(
 ) -> Leg {
     use crate::remote::{Longer, Within};
     use io::ErrorKind::{TimedOut, WouldBlock};
-    let own = wait + DRIVEN_SLACK;
+    let own = wait.saturating_add(DRIVEN_SLACK);
     let left = cut.map(|(at, flag)| (at.saturating_duration_since(Instant::now()), flag));
     let (within, said) = match left {
         Some((left, flag)) if left < own => (
@@ -343,7 +352,7 @@ fn driven_leg(
     if within.is_zero() {
         return Leg::Spent(crate::remote::closed(host, request, said, TimedOut.into()));
     }
-    let ends = Instant::now() + within;
+    let ends = instant_after(Instant::now(), within);
     match driven_exchange(drive, (host, request), within, said) {
         Leg::Failed(e) | Leg::Again(e) | Leg::Silent(e)
             if matches!(said, Within::Timeout(..))
@@ -364,6 +373,12 @@ fn driven_exchange(
 ) -> Leg {
     let mut link = match drive(host, within) {
         Ok(link) => link,
+        Err(refused) if refused.ungranted => {
+            return Leg::Ungranted {
+                why: io::Error::other(refused),
+                lowered: true,
+            };
+        }
         Err(refused) if refused.again => return Leg::Again(io::Error::other(refused)),
         Err(refused) if refused.silent => return Leg::Silent(io::Error::other(refused)),
         Err(refused) => return Leg::Failed(io::Error::other(refused)),
@@ -389,6 +404,15 @@ fn driven_exchange(
         },
     );
     match leg {
+        Leg::Failed(e)
+            if e.to_string()
+                .starts_with(aterm_types::control_verbs::DRIVE_UNGRANTED) =>
+        {
+            Leg::Ungranted {
+                why: e,
+                lowered: false,
+            }
+        }
         Leg::Failed(e) => unanswered_or_failed(crate::remote::closed(&label, request, cut, e)),
         leg => leg,
     }
@@ -570,6 +594,12 @@ enum End {
         why: io::Error,
     },
     Failed(io::Error),
+    /// Past the baseline, its peer refused this Mac's drive ([`Leg::Ungranted`]).
+    Ungranted {
+        rows: Vec<String>,
+        why: io::Error,
+        lowered: bool,
+    },
     Code(ExitCode),
 }
 
@@ -630,6 +660,14 @@ fn run_group(
                 continue;
             }
             Leg::Code(code) => return End::Code(code),
+            Leg::Ungranted { why, lowered } if baseline_read => {
+                return End::Ungranted {
+                    rows: rows.into_iter().flatten().collect(),
+                    why,
+                    lowered,
+                };
+            }
+            Leg::Ungranted { why, .. } => return End::Failed(why),
             Leg::Cut(e) => {
                 let since = *unserved_since.get_or_insert(asked);
                 return ran_out(baseline_read, rows, (Some(since), e));
@@ -758,9 +796,17 @@ enum Waited {
     },
     /// A wait over a drive that ended as [`End::Unanswered`].
     Unanswered {
+        at: String,
         rows: Vec<String>,
         since: Instant,
         why: io::Error,
+    },
+    /// A wait over a drive that ended as [`End::Ungranted`].
+    Ungranted {
+        at: String,
+        rows: Vec<String>,
+        why: io::Error,
+        lowered: bool,
     },
     Code(ExitCode),
 }
@@ -775,6 +821,7 @@ fn wait_task_groups(
 ) -> io::Result<Waited> {
     let (tx, rx) = mpsc::channel();
     let count = groups.len();
+    let group_socks: Vec<String> = groups.iter().map(|g| g.sock.clone()).collect();
     for (index, group) in groups.into_iter().enumerate() {
         let (tx, follow, legs) = (tx.clone(), follow.clone(), legs.clone());
         std::thread::Builder::new()
@@ -789,6 +836,7 @@ fn wait_task_groups(
     let mut ended = vec![false; count];
     let mut answered = vec![false; count];
     let mut unanswered = None;
+    let mut ungranted = None;
     let done = |answered: &[bool]| match combine {
         Combine::Any => answered.iter().any(|a| *a),
         Combine::All => answered.iter().all(|a| *a),
@@ -810,7 +858,15 @@ fn wait_task_groups(
                         why,
                     } => {
                         rows[index] = latest;
-                        unanswered = Some((since, why));
+                        unanswered = Some((group_socks[index].clone(), since, why));
+                    }
+                    End::Ungranted {
+                        rows: latest,
+                        why,
+                        lowered,
+                    } => {
+                        rows[index] = latest;
+                        ungranted = Some((group_socks[index].clone(), why, lowered));
                     }
                     End::Failed(e) => return Err(e),
                     End::Code(code) => return Ok(Waited::Code(code)),
@@ -822,11 +878,26 @@ fn wait_task_groups(
         }
     }
     let rows = rows.into_iter().flatten().collect();
-    Ok(match unanswered {
-        Some((since, why)) if !done(&answered) => Waited::Unanswered { rows, since, why },
-        _ => Waited::Rows {
+    Ok(match (ungranted, unanswered) {
+        _ if done(&answered) => Waited::Rows {
             rows,
-            answered: done(&answered),
+            answered: true,
+        },
+        (Some((at, why, lowered)), _) => Waited::Ungranted {
+            at,
+            rows,
+            why,
+            lowered,
+        },
+        (None, Some((at, since, why))) => Waited::Unanswered {
+            at,
+            rows,
+            since,
+            why,
+        },
+        (None, None) => Waited::Rows {
+            rows,
+            answered: false,
         },
     })
 }
@@ -845,7 +916,7 @@ pub(crate) fn run_await_task(
         (None, Some(flag)) => flag,
         (None, None) => Some(DEFAULT_TOTAL),
     };
-    let until = total.map(|t| Instant::now() + t);
+    let until = total.map(|t| instant_after(Instant::now(), t));
     let dir = socket_dir();
     let targets = request
         .targets
@@ -878,6 +949,102 @@ pub(crate) fn run_driven(
     print_waited(driven_wait(parts, total, host, drive)?, host)
 }
 
+/// `await task …` under `--host any`, resolving each `@s-<hex>` target to the peer hosting it.
+pub(crate) fn run_driven_any(
+    parts: &[String],
+    total: Option<Option<Duration>>,
+    drive: crate::FleetDriveFn,
+    survey: Option<crate::FleetSurveyFn>,
+) -> io::Result<ExitCode> {
+    let (waited, at) = driven_wait_any(parts, total, drive, survey)?;
+    print_waited(waited, &at)
+}
+
+fn driven_wait_any(
+    parts: &[String],
+    total: Option<Option<Duration>>,
+    drive: crate::FleetDriveFn,
+    survey: Option<crate::FleetSurveyFn>,
+) -> io::Result<(Waited, String)> {
+    let request = parse(parts)?;
+    if let Some(local) = request
+        .targets
+        .iter()
+        .find(|t| global_sid(&t.selector).is_none())
+    {
+        let named = if local.selector == "." {
+            "no target, or `@.`, names this Mac's active tab instead".to_owned()
+        } else {
+            format!("`@{}` is not one", local.selector)
+        };
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "await task over the fleet names each worker by its sid (@s-…, as `aterm ctl \
+                 survey --host <h>` shows it); {named}"
+            ),
+        ));
+    }
+    let sids: Vec<&str> = request
+        .targets
+        .iter()
+        .map(|t| global_sid(&t.selector).expect("checked global_sid"))
+        .collect();
+    let start = Instant::now();
+    let hosts = crate::remote::resolve_any_sid_hosts(&sids, total, survey)?;
+    let cut = total
+        .flatten()
+        .map(|flag| (instant_after(start, flag), flag));
+    let total = match (request.timeout, total) {
+        (Some(verb), _) => Some(verb),
+        (None, Some(flag)) => flag,
+        (None, None) => Some(DEFAULT_TOTAL),
+    };
+    let inside = cut.map(|(_, flag)| flag.saturating_sub(cut_reserve(flag)));
+    let until = total.map(|t| instant_after(start, inside.map_or(t, |inside| t.min(inside))));
+    let longer = inside
+        .filter(|&inside| total.is_some_and(|t| inside < t))
+        .map(|_| crate::remote::Longer::Wait(request.timeout));
+
+    let mut groups: Vec<Group> = Vec::new();
+    for (t, host) in request.targets.iter().zip(hosts.iter()) {
+        let target = Target {
+            selector: t.selector.clone(),
+            since: t.since.or(request.since),
+            fact_since: t.fact_since.or(request.fact_since),
+        };
+        if let Some(existing) = groups.iter_mut().find(|g| g.sock == *host) {
+            existing.targets.push(target);
+        } else {
+            groups.push(Group {
+                sock: host.clone(),
+                targets: vec![target],
+            });
+        }
+    }
+    let at = if groups.len() == 1 {
+        groups[0].sock.clone()
+    } else {
+        "any".to_owned()
+    };
+    let legs = Legs {
+        max: DRIVEN_LEG_MAX,
+        send: Arc::new(move |peer_host: &str, req: &str, wait: Duration| {
+            driven_leg(drive, (peer_host, req), wait, (cut, longer))
+        }),
+        again: (AGAIN_AFTER, AGAIN_FOR),
+    };
+    let waited = wait_task_groups(
+        groups,
+        request.combine,
+        request.facts,
+        until,
+        &redial::Redial::none(),
+        &legs,
+    )?;
+    Ok((waited, at))
+}
+
 fn driven_wait(
     parts: &[String],
     total: Option<Option<Duration>>,
@@ -905,7 +1072,9 @@ fn driven_wait(
     }
     let start = Instant::now();
     // ctl's own `--timeout` is one deadline over every leg: their dials, handshakes and replies.
-    let cut = total.flatten().map(|flag| (start + flag, flag));
+    let cut = total
+        .flatten()
+        .map(|flag| (instant_after(start, flag), flag));
     let total = match (request.timeout, total) {
         (Some(verb), _) => Some(verb),
         (None, Some(flag)) => flag,
@@ -913,7 +1082,7 @@ fn driven_wait(
     };
     // Its last leg asks for a wait that ends inside it, so the rows it reads are the peer's.
     let inside = cut.map(|(_, flag)| flag.saturating_sub(cut_reserve(flag)));
-    let until = total.map(|t| start + inside.map_or(t, |inside| t.min(inside)));
+    let until = total.map(|t| instant_after(start, inside.map_or(t, |inside| t.min(inside))));
     // A longer `--timeout` waits longer than a leg's own deadline only where it ends the wait.
     let longer = inside
         .filter(|&inside| total.is_some_and(|t| inside < t))
@@ -930,13 +1099,13 @@ fn driven_wait(
     let host = host.to_owned();
     let legs = Legs {
         max: DRIVEN_LEG_MAX,
-        send: Arc::new(move |_: &str, request: &str, wait: Duration| {
-            driven_leg(drive, (&host, request), wait, (cut, longer))
+        send: Arc::new(move |peer_host: &str, request: &str, wait: Duration| {
+            driven_leg(drive, (peer_host, request), wait, (cut, longer))
         }),
         again: (AGAIN_AFTER, AGAIN_FOR),
     };
     let groups = vec![Group {
-        sock: String::new(),
+        sock: host,
         targets,
     }];
     wait_task_groups(
@@ -949,8 +1118,8 @@ fn driven_wait(
     )
 }
 
-/// The rows on stdout, then `OK timeout` (124), or [`unanswered`] at `at` (75, as a blocking
-/// read whose instance went away).
+/// The rows on stdout, then `OK timeout` (124), [`unanswered`] at `at` (75, as a blocking read
+/// whose instance went away), or [`ungranted`] at `at` (1, as a denial).
 fn print_waited(waited: Waited, at: &str) -> io::Result<ExitCode> {
     let (rows, end) = match waited {
         Waited::Rows {
@@ -958,10 +1127,27 @@ fn print_waited(waited: Waited, at: &str) -> io::Result<ExitCode> {
             answered: true,
         } => (rows, None),
         Waited::Rows { rows, .. } => (rows, Some(("OK timeout".to_owned(), EXIT_TIMEOUT))),
-        Waited::Unanswered { rows, since, why } => (
+        Waited::Unanswered {
+            at: group_at,
             rows,
-            Some((unanswered(at, since, &why), redial::EXIT_REPLACED)),
-        ),
+            since,
+            why,
+        } => {
+            let target = if group_at.is_empty() { at } else { &group_at };
+            (
+                rows,
+                Some((unanswered(target, since, &why), redial::EXIT_REPLACED)),
+            )
+        }
+        Waited::Ungranted {
+            at: group_at,
+            rows,
+            why,
+            lowered,
+        } => {
+            let target = if group_at.is_empty() { at } else { &group_at };
+            (rows, Some((ungranted(target, &why, lowered), 1)))
+        }
         Waited::Code(code) => return Ok(code),
     };
     let stdout = stdout_handle();
@@ -978,6 +1164,26 @@ fn print_waited(waited: Waited, at: &str) -> io::Result<ExitCode> {
             Ok(ExitCode::from(code))
         }
     }
+}
+
+/// Why a wait over a drive ended with the rows it read before: `at`, which served its baseline,
+/// refused this Mac's drive since (`why`), its fleet level below drive now where `lowered`.
+fn ungranted(at: &str, why: &io::Error, lowered: bool) -> String {
+    let cause = if lowered {
+        "its person took back this Mac's grant: its [fleet] allow is below drive now (`aterm fleet \
+         allow content` or `facts` there)"
+            .to_owned()
+    } else {
+        format!(
+            "its person took back this Mac's grant, or its books bind this Mac's node no more: {}",
+            why.to_string()
+                .trim_start_matches(aterm_types::control_verbs::DRIVE_UNGRANTED)
+        )
+    };
+    format!(
+        "{at} served this wait's baseline and refuses this Mac's drive since ({cause}), so the \
+         rows are the last it read there"
+    )
 }
 
 /// Why a wait over a drive ended with the rows it read before: nothing answered at `at` since
@@ -1120,6 +1326,16 @@ mod tests {
         assert!(is_await_task(&parts("await task @s-a")));
         assert!(!is_await_task(&parts("await agent idle")));
         assert!(!is_await_task(&parts("@s-a await")));
+        assert!(
+            run_await_task(
+                &parts("await task timeout=18446744073709551615"),
+                true,
+                "/no/such/aterm-ctl-test.sock",
+                &redial::Redial::none(),
+                Some(Some(Duration::from_secs(u64::MAX))),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1310,6 +1526,7 @@ mod tests {
             Ok(Waited::Rows { rows, answered }) => (rows, answered),
             Ok(Waited::Unanswered { why, .. }) => panic!("unanswered: {why}"),
             Ok(Waited::Code(code)) => panic!("an exit code: {code:?}"),
+            Ok(Waited::Ungranted { why, .. }) => panic!("refused: {why}"),
             Err(e) => panic!("{e}"),
         }
     }
@@ -1882,6 +2099,31 @@ mod tests {
         })
     }
 
+    struct Answers(io::Cursor<Vec<u8>>);
+
+    impl io::Read for Answers {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl io::Write for Answers {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn answers(line: &str) -> crate::DriveLink {
+        crate::DriveLink {
+            stream: Box::new(Answers(io::Cursor::new(format!("{line}\n").into_bytes()))),
+            label: "lab-mini".to_owned(),
+        }
+    }
+
     #[test]
     fn a_wait_its_own_timeout_ends_reads_the_peers_rows_of_its_last_leg() {
         let second = Some(Some(Duration::from_secs(1)));
@@ -1891,6 +2133,7 @@ mod tests {
             }
             Ok(Waited::Unanswered { why, .. }) => panic!("unanswered: {why}"),
             Ok(Waited::Code(code)) => panic!("an exit code: {code:?}"),
+            Ok(Waited::Ungranted { why, .. }) => panic!("refused: {why}"),
             Err(e) => panic!("{e}"),
         }
     }
@@ -1967,6 +2210,7 @@ mod tests {
                     panic!("{rows:?} answered={answered}: the cause is dropped")
                 }
                 Ok(Waited::Code(code)) => panic!("an exit code: {code:?}"),
+                Ok(Waited::Ungranted { why, .. }) => panic!("refused: {why}"),
                 Err(e) => panic!("ended before its timeout: {e}"),
             }
         }
@@ -2005,6 +2249,7 @@ mod tests {
             }
             Ok(Waited::Rows { rows, answered }) => panic!("{rows:?} answered={answered}"),
             Ok(Waited::Code(code)) => panic!("asked again without bound: {code:?}"),
+            Ok(Waited::Ungranted { why, .. }) => panic!("refused: {why}"),
             Err(e) => panic!("{e}"),
         }
     }
@@ -2081,10 +2326,12 @@ mod tests {
                     panic!("{cause}: {rows:?} answered={answered}, the cause dropped")
                 }
                 Ok(Waited::Code(code)) => panic!("{cause}: an exit code: {code:?}"),
+                Ok(Waited::Ungranted { why, .. }) => panic!("refused: {why}"),
                 Err(e) => panic!("{cause}: ended before its timeout: {e}"),
             }
         }
         let unanswered = Waited::Unanswered {
+            at: "lab-mini".to_owned(),
             rows: Vec::new(),
             since: Instant::now(),
             why: io::Error::other(GONE),
@@ -2094,6 +2341,142 @@ mod tests {
             ExitCode::from(redial::EXIT_REPLACED)
         );
     }
+    #[test]
+    fn a_driven_wait_whose_peer_took_its_grant_back_ends_with_its_rows_and_says_so() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        const LOWERED: &str = "127.0.0.1:7100 lets no one drive it: its person runs `aterm fleet \
+                               allow drive --from <this Mac>` there";
+        const DENIED: &str = "node ab12cd34 is not one the dialled Mac lets drive it";
+        fn lowered_now() -> Result<crate::DriveLink, crate::DriveRefused> {
+            Err(crate::DriveRefused {
+                ungranted: true,
+                ..crate::DriveRefused::once(LOWERED.to_owned())
+            })
+        }
+        fn lowered(host: &str, within: Duration) -> Result<crate::DriveLink, crate::DriveRefused> {
+            static DIALS: AtomicUsize = AtomicUsize::new(0);
+            if DIALS.fetch_add(1, Relaxed) == 0 {
+                return peer(host, within);
+            }
+            lowered_now()
+        }
+        fn denied(host: &str, within: Duration) -> Result<crate::DriveLink, crate::DriveRefused> {
+            static DIALS: AtomicUsize = AtomicUsize::new(0);
+            if DIALS.fetch_add(1, Relaxed) == 0 {
+                return peer(host, within);
+            }
+            Ok(answers(&format!(
+                "{}{DENIED}",
+                aterm_types::control_verbs::DRIVE_UNGRANTED
+            )))
+        }
+        for (drive, was_lowered, says) in [
+            (
+                lowered as crate::FleetDriveFn,
+                true,
+                "its [fleet] allow is below drive now",
+            ),
+            (denied, false, DENIED),
+        ] {
+            let waited = driven_wait(
+                &parts("await task @s-a1 timeout=15000"),
+                None,
+                "lab-mini",
+                drive,
+            );
+            match waited {
+                Ok(Waited::Ungranted {
+                    at,
+                    rows,
+                    why,
+                    lowered,
+                }) => {
+                    assert_eq!(at, "lab-mini");
+                    assert_eq!((rows, lowered), (vec![BUSY.to_owned()], was_lowered));
+                    let said = ungranted(&at, &why, lowered);
+                    assert!(
+                        said.starts_with(
+                            "lab-mini served this wait's baseline and refuses this Mac's drive \
+                             since (its person took back this Mac's grant"
+                        ) && said.contains(says)
+                            && !said.contains("--from <this Mac>"),
+                        "{said}"
+                    );
+                }
+                Ok(Waited::Unanswered { why, .. }) => panic!("asked again: {why}"),
+                Ok(Waited::Rows { rows, answered }) => panic!("{rows:?} answered={answered}"),
+                Ok(Waited::Code(code)) => panic!("an exit code: {code:?}"),
+                Err(e) => panic!("the rows it read are dropped: {e}"),
+            }
+        }
+        fn lowered_first(_: &str, _: Duration) -> Result<crate::DriveLink, crate::DriveRefused> {
+            lowered_now()
+        }
+        match driven_wait(&parts("await task @s-a1"), None, "lab-mini", lowered_first) {
+            Err(e) => assert_eq!(e.to_string(), LOWERED, "before the baseline, its own words"),
+            Ok(_) => panic!("a wait no leg of which was served"),
+        }
+        let refused = Waited::Ungranted {
+            at: "lab-mini".to_owned(),
+            rows: Vec::new(),
+            why: io::Error::other(LOWERED),
+            lowered: true,
+        };
+        assert_eq!(
+            print_waited(refused, "lab-mini").unwrap(),
+            ExitCode::FAILURE
+        );
+    }
+
+    #[test]
+    fn a_driven_wait_past_its_baseline_closes_a_gone_worker_and_ends_any_other_denial_as_said() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        const UNCHECKED: &str = "ERR denied: node ab12cd34 is bound on the dialled Mac only by \
+                                 its copy of its issuer's book, which is over 60 s old, and it \
+                                 could not read that book again to check it (timed out): it \
+                                 drives again once the dialled Mac reaches its issuer";
+        const GATE: &str = "ERR denied: a drive names a session the driven Mac hosts by its sid \
+                            (`survey --host` lists them)";
+        static DIALS: AtomicUsize = AtomicUsize::new(0);
+        static LATER: Mutex<&str> = Mutex::new("");
+        fn then(host: &str, within: Duration) -> Result<crate::DriveLink, crate::DriveRefused> {
+            if DIALS.fetch_add(1, Relaxed) == 0 {
+                return peer(host, within);
+            }
+            Ok(answers(&LATER.lock().unwrap()))
+        }
+        let wait = |later: &'static str| {
+            DIALS.store(0, Relaxed);
+            *LATER.lock().unwrap() = later;
+            driven_wait(
+                &parts("await task @s-a1 timeout=15000"),
+                None,
+                "lab-mini",
+                then,
+            )
+        };
+        match wait("ERR no such session @s-a1") {
+            Ok(Waited::Rows { rows, answered }) => assert_eq!(
+                (rows, answered),
+                (vec![BUSY.replace("state=working", "state=closed")], true)
+            ),
+            Ok(Waited::Ungranted { why, .. }) => panic!("a gone worker read as a grant: {why}"),
+            Ok(Waited::Unanswered { why, .. }) => panic!("unanswered: {why}"),
+            Ok(Waited::Code(code)) => panic!("an exit code: {code:?}"),
+            Err(e) => panic!("{e}"),
+        }
+        for denial in [UNCHECKED, GATE] {
+            match wait(denial) {
+                Err(e) => assert_eq!(e.to_string(), denial),
+                Ok(Waited::Ungranted { why, .. }) => panic!("read as a grant taken back: {why}"),
+                Ok(Waited::Rows { rows, answered }) => panic!("{rows:?} answered={answered}"),
+                Ok(Waited::Unanswered { why, .. }) => panic!("unanswered: {why}"),
+                Ok(Waited::Code(code)) => panic!("an exit code: {code:?}"),
+            }
+        }
+    }
+
     #[test]
     fn a_driven_wait_ctls_timeout_cuts_ends_as_unanswered_where_its_peer_froze_past_its_baseline() {
         use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
@@ -2185,6 +2568,7 @@ mod tests {
                     panic!("{rows:?} answered={answered}: a frozen peer is said as one that served")
                 }
                 Ok(Waited::Code(code)) => panic!("an exit code: {code:?}"),
+                Ok(Waited::Ungranted { why, .. }) => panic!("refused: {why}"),
                 Err(e) => panic!("ended before its timeout: {e}"),
             }
         }

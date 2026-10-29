@@ -723,7 +723,7 @@ impl Real {
         })
     }
 
-    /// The export guards, `ship check --export`: the engine's own dry run, `pub stage aterm --dry-run --no-check --commit R --repo-path <scratch clone>`, every export guard `pub stage` runs (forbidden content, private references, gitleaks, the cargo metadata closure, README versions, dead links) in one pass, over a scratch clone of R (never this checkout's `publish/.out`, where a real stage's attestation waits for `pub publish`) and a [`Real::scratch_engine`] copy.
+    /// The export guards, `ship check --export`: the engine's own dry run, `pub stage aterm --dry-run --no-check --commit R --repo-path <scratch clone>`, every export guard `pub stage` runs (forbidden content, private references, gitleaks, the cargo metadata closure, README versions, dead links) in one pass, over a scratch clone of R (never this checkout's `publish/.out`, where a real stage's attestation waits for `pub publish`) and a [`Real::scratch_engine`] copy. The engine reads the public tier as the public does ([`public_reads`]), so those reads need no SSH key.
     pub(crate) fn export_gate(&mut self, scratch: &Scratch, r: &str) -> (Outcome, Option<PathBuf>) {
         let not_run = |why: Refusal| (Outcome::CouldNotRun(why), None);
         if !self.is_ancestor(r, "refs/remotes/origin/main") {
@@ -736,6 +736,21 @@ impl Real {
                 "push it (or `git fetch origin`, when it is there already), then run it again",
             ));
         }
+        let parent_count = std::env::var_os("GIT_CONFIG_COUNT");
+        let parent_parameters = std::env::var_os("GIT_CONFIG_PARAMETERS");
+        // Validate the count before asking git to interpret the inherited command config.
+        if let Err(why) = public_reads(parent_count.as_deref(), &[], parent_parameters.as_deref()) {
+            return not_run(why);
+        }
+        let keys = match public_header_keys(public_config_git(&self.repo)) {
+            Ok(keys) => keys,
+            Err(why) => return not_run(why),
+        };
+        let reads = match public_reads(parent_count.as_deref(), &keys, parent_parameters.as_deref())
+        {
+            Ok(reads) => reads,
+            Err(why) => return not_run(why),
+        };
         let engine = match self.scratch_engine(scratch) {
             Ok(engine) => engine,
             Err(why) => return not_run(why),
@@ -757,26 +772,7 @@ impl Real {
         }
         let toolchain = self.metadata_toolchain();
         let pubbin = engine.join("bin/pub");
-        let mut stage = self.scrubbed(&pubbin);
-        stage
-            .env("PUBLICATION_ENGINE", &engine)
-            .env(
-                "PATH",
-                rustup_dir().map_or_else(
-                    |_| std::env::var_os("PATH").unwrap_or_default(),
-                    |dir| path_with(&dir),
-                ),
-            )
-            .args([
-                "stage",
-                "aterm",
-                "--dry-run",
-                "--no-check",
-                "--commit",
-                r,
-                "--repo-path",
-            ])
-            .arg(&root);
+        let mut stage = self.dry_run_command(&engine, r, &root, &reads);
         let (code, text) = match self.output_forwarded(&mut stage) {
             Ok(o) => (
                 o.status.code().unwrap_or(-1),
@@ -806,6 +802,38 @@ impl Real {
             export_outcome(&run, r, toolchain.as_ref(), &log, &reports),
             left,
         )
+    }
+
+    /// The engine's dry run of `r` over the clone at `root`, `pub stage aterm --dry-run --no-check --commit R --repo-path <root>` from the scratch `engine`: [`Real::scrubbed`], with this rustup's directory first on PATH and `reads` ([`public_reads`]) in its environment.
+    fn dry_run_command(
+        &self,
+        engine: &Path,
+        r: &str,
+        root: &Path,
+        reads: &[(String, std::ffi::OsString)],
+    ) -> Command {
+        let mut stage = self.scrubbed(engine.join("bin/pub"));
+        stage
+            .env("PUBLICATION_ENGINE", engine)
+            .env(
+                "PATH",
+                rustup_dir().map_or_else(
+                    |_| std::env::var_os("PATH").unwrap_or_default(),
+                    |dir| path_with(&dir),
+                ),
+            )
+            .envs(reads.iter().map(|(key, value)| (key, value)))
+            .args([
+                "stage",
+                "aterm",
+                "--dry-run",
+                "--no-check",
+                "--commit",
+                r,
+                "--repo-path",
+            ])
+            .arg(root);
+        stage
     }
 
     fn dry_clone(&self, base: &Path, root: &Path, r: &str) -> Result<(), String> {
@@ -1748,6 +1776,207 @@ fn rustup_dir() -> Result<PathBuf, aterm_uds::host::Absent> {
     Ok(rustup.parent().map_or_else(PathBuf::new, Path::to_path_buf))
 }
 
+/// Git config for the export engine's public reads, as `(key, value)`. Only the engine's
+/// `git@github.com:alabsystems/<name>.git` release URLs are rewritten to HTTPS; private origins
+/// retain their transport. An empty public credential helper clears inherited helpers, and the
+/// following `quit=1` helper refuses helper/askpass credentials. An owner-scoped empty HTTP
+/// header clears broad inherited headers; [`public_reads`] also clears exact more-specific
+/// public header keys discovered by [`public_header_keys`]. Private headers retain their values.
+/// The run is `pub stage --dry-run`; its staging push remains in the engine's non-dry branch.
+const PUBLIC_READS: [(&str, &str); 4] = [
+    (
+        "url.https://github.com/alabsystems/.insteadOf",
+        "git@github.com:alabsystems/",
+    ),
+    ("credential.https://github.com/alabsystems.helper", ""),
+    (
+        "credential.https://github.com/alabsystems.helper",
+        "!f() { echo quit=1; }; f",
+    ),
+    ("http.https://github.com/alabsystems/.extraHeader", ""),
+];
+
+/// Git's config context for the export run. Tests default to the existing hermetic fixture
+/// command, so an export stub cannot inspect the person's config; a config fixture injects its
+/// owned context directly into [`public_header_keys`].
+fn public_config_git(repo: &Path) -> Command {
+    #[cfg(not(test))]
+    let mut git = command(aterm_uds::os_path!("git"));
+    #[cfg(test)]
+    let mut git = crate::ledger::testing::git();
+    git.arg("-C").arg(repo);
+    git
+}
+
+/// Discover header key names, never values, in this exact Git command's config context.
+/// Conditional includes can add headers when the engine changes repositories, so their
+/// directives refuse discovery even when their condition is inactive here.
+/// # Errors
+/// Git cannot read the config, does not finish within the hang detector, emits non-UTF-8 key
+/// names, fills the bounded key-list capture, or a conditional include makes future
+/// scratch-repository config context-dependent.
+/// Diagnostics contain neither Git's output nor a config key that could hold userinfo.
+fn public_header_keys(mut git: Command) -> Result<Vec<String>, Refusal> {
+    let refused = || {
+        Refusal::new(
+            "git could not list HTTP header key names for the anonymous public export read",
+            "fix the Git configuration in this checkout, then run the export check again",
+        )
+    };
+    git.args([
+        "config",
+        "--null",
+        "--name-only",
+        "--get-regexp",
+        "^(http(\\..*)?\\.extraheader|includeif\\..*\\.path)$",
+    ])
+    .stdin(Stdio::null());
+    let out = aterm_uds::deadline::output_within(&mut git, std::time::Duration::from_secs(60))
+        .map_err(|_| refused())?;
+    if out.status.code() == Some(1) && out.stdout.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !out.status.success() || out.stdout.len() >= aterm_uds::deadline::OUTPUT_KEEP {
+        return Err(refused());
+    }
+    let keys = std::str::from_utf8(&out.stdout).map_err(|_| refused())?;
+    let keys: Vec<String> = keys
+        .split('\0')
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if keys
+        .iter()
+        .any(|key| key.starts_with("includeif.") && key.ends_with(".path"))
+    {
+        return Err(Refusal::new(
+            "Git configuration has a conditional include, so anonymous export reads cannot prove the settings of future scratch repositories",
+            "run the export check with a Git configuration context that has no conditional includes; ordinary unconditional includes remain supported",
+        ));
+    }
+    Ok(keys)
+}
+
+/// Select exact ordinary public URL header keys for an override. The owner-wide reset covers
+/// broad headers; more-specific public scopes need their own reset. Git normalizes more URL
+/// syntax than this bounded selector proves, so an ambiguous GitHub scope refuses the check.
+/// # Errors
+/// An HTTPS host uses wildcard or escaped syntax, a GitHub port is noncanonical, or a GitHub
+/// path uses percent escapes, dot segments, repeated separators, a query, fragment or backslash.
+/// No key or credential is echoed.
+fn public_header_key(key: &str) -> Result<Option<&str>, Refusal> {
+    let Some(scope) = key
+        .strip_prefix("http.")
+        .and_then(|key| key.strip_suffix(".extraheader"))
+    else {
+        return Ok(None);
+    };
+    let Some((scheme, rest)) = scope.split_once("://") else {
+        return Ok(None);
+    };
+    if !scheme.eq_ignore_ascii_case("https") {
+        return Ok(None);
+    }
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = host.strip_suffix(":443").unwrap_or(host);
+    let ambiguous = || {
+        Refusal::new(
+            "a GitHub HTTP header scope uses URL syntax this anonymous-read guard cannot prove",
+            "use ordinary HTTPS GitHub header scopes without wildcards, escapes or dot segments, then run the export check again",
+        )
+    };
+    if host.contains(['*', '?', '[', '%']) {
+        return Err(ambiguous());
+    }
+    if let Some((name, port)) = host.rsplit_once(':')
+        && name.eq_ignore_ascii_case("github.com")
+        && (port.is_empty() || port.starts_with('0') || !port.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err(ambiguous());
+    }
+    if !host.eq_ignore_ascii_case("github.com") {
+        return Ok(None);
+    }
+    if path.contains(['%', '?', '#', '\\'])
+        || path.contains("//")
+        || path.split('/').any(|part| matches!(part, "." | ".."))
+    {
+        return Err(ambiguous());
+    }
+    Ok((path == "alabsystems" || path.starts_with("alabsystems/")).then_some(key))
+}
+
+/// The environment that carries [`PUBLIC_READS`] to the engine: each as `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>`, numbered after the caller's own `parent_count` entries (its `GIT_CONFIG_COUNT`, which git reads as 0 when empty), so those still apply; the `GIT_CONFIG_COUNT` that covers both; and `GIT_TERMINAL_PROMPT=0`, so a credential no helper gives fails at once instead of waiting on a terminal. Git reads `GIT_CONFIG_PARAMETERS` after numbered entries, so its inherited bytes are preserved and the policy appended as Git-quoted `key=value` arguments there too. This keeps private caller config while ensuring the public policy follows it at both command-config precedences.
+/// # Errors
+/// `parent_count` is not plain decimal digits, adding the entries would overflow it, or an
+/// inherited header scope uses URL syntax [`public_header_key`] cannot prove. Git refuses most
+/// malformed counts (`bogus count in GIT_CONFIG_COUNT`); signs and leading blanks are refused
+/// too, so no entry is numbered by a guess. More-specific public header keys get an exact empty
+/// override after the base policy; global and private header keys retain their values.
+fn public_reads(
+    parent_count: Option<&std::ffi::OsStr>,
+    header_keys: &[String],
+    parent_parameters: Option<&std::ffi::OsStr>,
+) -> Result<Vec<(String, std::ffi::OsString)>, Refusal> {
+    let text = parent_count.map(std::ffi::OsStr::to_string_lossy);
+    let base = match text.as_deref() {
+        None | Some("") => Some(0),
+        Some(n) if n.bytes().all(|b| b.is_ascii_digit()) => n.parse::<usize>().ok(),
+        Some(_) => None,
+    };
+    let mut policy: Vec<(String, String)> = PUBLIC_READS
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+        .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    for key in header_keys {
+        if let Some(key) = public_header_key(key)?
+            && seen.insert(key)
+        {
+            policy.push((key.to_owned(), String::new()));
+        }
+    }
+    let Some((base, count)) = base.and_then(|base| Some((base, base.checked_add(policy.len())?)))
+    else {
+        return Err(Refusal::new(
+            format!(
+                "this environment's GIT_CONFIG_COUNT is {:?}, not a plain count of \
+                 GIT_CONFIG_KEY_<n> entries — the engine's dry run reads the public tier through \
+                 entries numbered after the caller's own",
+                text.as_deref().unwrap_or_default()
+            ),
+            "unset GIT_CONFIG_COUNT, or set it to the number of GIT_CONFIG_KEY_<n> entries, \
+             then run it again",
+        ));
+    };
+    let mut parameters = parent_parameters.unwrap_or_default().to_os_string();
+    for (key, value) in &policy {
+        if !parameters.is_empty() {
+            parameters.push(" ");
+        }
+        parameters.push("'");
+        parameters.push(format!("{key}={value}").replace('\'', "'\\''"));
+        parameters.push("'");
+    }
+    let mut env: Vec<(String, std::ffi::OsString)> = policy
+        .into_iter()
+        .zip(base..)
+        .flat_map(|((key, value), n)| {
+            [
+                (format!("GIT_CONFIG_KEY_{n}"), key.into()),
+                (format!("GIT_CONFIG_VALUE_{n}"), value.into()),
+            ]
+        })
+        .collect();
+    env.push(("GIT_CONFIG_COUNT".to_string(), count.to_string().into()));
+    env.push(("GIT_CONFIG_PARAMETERS".to_string(), parameters));
+    env.push(("GIT_TERMINAL_PROMPT".to_string(), "0".into()));
+    Ok(env)
+}
+
 /// `dir`, then this process's PATH without it.
 fn path_with(dir: &Path) -> std::ffi::OsString {
     let path = std::env::var_os("PATH").unwrap_or_default();
@@ -1903,7 +2132,8 @@ impl EngineCause {
                 "run `gitleaks version` to see why it cannot scan, then run it again".into()
             }
             Self::Network => "check the network and access to the remote it names (ssh for a \
-                              git@ remote), then run it again"
+                              git@ remote; an alabsystems one is read anonymously over HTTPS, \
+                              so it must be public), then run it again"
                 .into(),
             Self::Engine => {
                 "fix the publication engine's checkout or records it names, then run it again"
@@ -2474,7 +2704,7 @@ impl Backend for Real {
             out.push(Refusal::new(
                 format!("--release-credentials {} is not a file", creds.display()),
                 "name the signing profile ship provision wrote (docs/RELEASE-KEYS.md), or \
-                 drop the flag for ~/.aterm/release-credentials.toml",
+                 drop the flag for ~/.aterm/release-ring/release-credentials.toml",
             ));
         }
         let field = |path: &Path, key: &str| {
@@ -2485,9 +2715,12 @@ impl Backend for Real {
                 })
             })
         };
-        let id = field(&self.home.join(".aterm/machine.toml"), "id")
-            .or_else(|| field(creds, "machine_id"))
-            .unwrap_or_default();
+        let id = field(
+            &self.home.join(atpkg_keys::provision::MACHINE_PUB_REL),
+            "id",
+        )
+        .or_else(|| field(creds, "machine_id"))
+        .unwrap_or_default();
         if let (Some(free), _) = self.disk()
             && free < crate::gates::MIN_FREE_DISK_GIB
         {
@@ -3135,8 +3368,8 @@ impl Backend for Real {
         Ok(words.join("; "))
     }
 
-    fn audit(&mut self, machine_id: &str) -> Vec<Finding> {
-        crate::provision::audit(&self.repo, machine_id)
+    fn audit(&mut self, machine_id: &str, profile: Option<&Path>, dry: bool) -> Vec<Finding> {
+        crate::provision::audit(&self.repo, machine_id, profile, dry)
     }
 
     fn ask(&mut self, words: &AskWords) -> Result<String, String> {
@@ -3630,6 +3863,10 @@ pub const EXPORT_GATE: &str = "export guards";
 pub const WASM32_GATE: &str = "wasm32 engine";
 
 #[cfg(test)]
+#[path = "release_steps_public_reads_http_tests.rs"]
+mod public_reads_http_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -4093,6 +4330,23 @@ mod tests {
                 &["remote", "add", "origin", &remote.display().to_string()],
             );
         }
+        // The engine's GIT_* environment, as the gate hands it on from this process's own.
+        let reads = public_reads(
+            std::env::var_os("GIT_CONFIG_COUNT").as_deref(),
+            &[],
+            std::env::var_os("GIT_CONFIG_PARAMETERS").as_deref(),
+        )
+        .unwrap();
+        let seen = root.join("seen-env");
+        let dump: String = reads
+            .iter()
+            .map(|(key, _)| {
+                format!(
+                    "printf '%s=%s\\n' {key} \"${key}\" >> '{}'\n",
+                    seen.display()
+                )
+            })
+            .collect();
         let stub = |say: &str, code: i32| {
             std::fs::create_dir_all(engine.join("bin")).unwrap();
             let pubbin = engine.join("bin/pub");
@@ -4101,7 +4355,7 @@ mod tests {
                 format!(
                     "#!/bin/sh\nhere=$(cd \"$(dirname \"$0\")/..\" && pwd)\necho '{{\"row\":1}}' \
                      >> \"$here/verification-log.jsonl\"\n[ \"$1 $2 $3 $4\" = 'stage aterm \
-                     --dry-run --no-check' ] || exit 9\nprintf '%s' '{say}'\nexit {code}\n"
+                     --dry-run --no-check' ] || exit 9\n{dump}printf '%s' '{say}'\nexit {code}\n"
                 ),
             )
             .unwrap();
@@ -4139,6 +4393,11 @@ mod tests {
         let (outcome, code) = export("HEAD");
         assert!(matches!(outcome, Outcome::Pass(_)), "{outcome:?}");
         assert_eq!(code, 0);
+        let want: String = reads
+            .iter()
+            .map(|(k, v)| format!("{k}={}\n", v.to_string_lossy()))
+            .collect();
+        assert_eq!(std::fs::read_to_string(&seen).unwrap(), want);
         assert_eq!(
             std::fs::read_to_string(engine.join("verification-log.jsonl")).unwrap(),
             ""
@@ -4169,6 +4428,159 @@ mod tests {
             Some(Outcome::CouldNotRun(_))
         ));
         assert!(checked(&repo, &opts("no-such-commit", &engine)).is_err());
+    }
+
+    /// [`PUBLIC_READS`] numbered from `base`, the way [`public_reads`] hands them to the engine.
+    fn public_reads_at(base: usize) -> Vec<(String, std::ffi::OsString)> {
+        let pair = |key: String, value: &str| (key, value.into());
+        vec![
+            pair(
+                format!("GIT_CONFIG_KEY_{base}"),
+                "url.https://github.com/alabsystems/.insteadOf",
+            ),
+            pair(
+                format!("GIT_CONFIG_VALUE_{base}"),
+                "git@github.com:alabsystems/",
+            ),
+            pair(
+                format!("GIT_CONFIG_KEY_{}", base + 1),
+                "credential.https://github.com/alabsystems.helper",
+            ),
+            pair(format!("GIT_CONFIG_VALUE_{}", base + 1), ""),
+            pair(
+                format!("GIT_CONFIG_KEY_{}", base + 2),
+                "credential.https://github.com/alabsystems.helper",
+            ),
+            pair(
+                format!("GIT_CONFIG_VALUE_{}", base + 2),
+                "!f() { echo quit=1; }; f",
+            ),
+            pair(
+                format!("GIT_CONFIG_KEY_{}", base + 3),
+                "http.https://github.com/alabsystems/.extraHeader",
+            ),
+            pair(format!("GIT_CONFIG_VALUE_{}", base + 3), ""),
+            pair("GIT_CONFIG_COUNT".to_string(), &(base + 4).to_string()),
+            pair(
+                "GIT_CONFIG_PARAMETERS".to_string(),
+                concat!(
+                    "'url.https://github.com/alabsystems/.insteadOf=git@github.com:alabsystems/' ",
+                    "'credential.https://github.com/alabsystems.helper=' ",
+                    "'credential.https://github.com/alabsystems.helper=!f() { echo quit=1; }; f' ",
+                    "'http.https://github.com/alabsystems/.extraHeader='",
+                ),
+            ),
+            pair("GIT_TERMINAL_PROMPT".to_string(), "0"),
+        ]
+    }
+
+    /// The engine's dry run reads alabsystems as the public does, whatever this host's SSH keys: each `git@github.com:alabsystems/` URL over HTTPS, with no credential for `https://github.com/alabsystems` from a helper or an askpass program, numbered after the caller's own `GIT_CONFIG_*` entries, which still apply, while every other GitHub URL keeps its transport and its helper.
+    #[test]
+    fn the_engines_dry_run_reads_the_public_tier_anonymously_after_the_callers_git_config() {
+        let reads = |count: Option<&str>| public_reads(count.map(std::ffi::OsStr::new), &[], None);
+        assert_eq!(reads(None).unwrap(), public_reads_at(0));
+        assert_eq!(reads(Some("")).unwrap(), public_reads_at(0));
+        assert_eq!(reads(Some("3")).unwrap(), public_reads_at(3));
+        for bogus in ["two", "-1", " 1", "1 ", &usize::MAX.to_string()] {
+            let why = reads(Some(bogus)).unwrap_err();
+            assert!(
+                why.why.contains("GIT_CONFIG_COUNT") && why.why.contains(bogus),
+                "{why:?}"
+            );
+        }
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let real = Real::new(&root, Some(&root), true, false).unwrap();
+        let stage = real.dry_run_command(
+            &root.join("engine"),
+            "c0ffee",
+            &root.join("clone"),
+            &reads(Some("1")).unwrap(),
+        );
+        let mut sent: Vec<(String, std::ffi::OsString)> = stage
+            .get_envs()
+            .filter_map(|(key, value)| {
+                let key = key.to_str().filter(|k| k.starts_with("GIT_"))?;
+                let value = value.map_or_else(|| "<removed>".into(), |v| v.to_os_string());
+                Some((key.to_string(), value))
+            })
+            .collect();
+        sent.sort();
+        let mut want = public_reads_at(1);
+        want.sort();
+        assert_eq!(sent, want, "the engine's GIT_* environment");
+
+        // What git makes of it, under a caller's own entry 0, a helper for every GitHub URL and
+        // an askpass program that answers any prompt.
+        let config = root.join("gitconfig");
+        std::fs::write(
+            &config,
+            "[credential \"https://github.com\"]\n\thelper = \"!f() { echo username=fixture; \
+             echo password=fixture-pass; }; f\"\n",
+        )
+        .unwrap();
+        let askpass = root.join("askpass");
+        std::fs::write(&askpass, "#!/bin/sh\necho askpass-pass\n").unwrap();
+        let mut perms = std::fs::metadata(&askpass).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&askpass, perms).unwrap();
+        let git = |args: &[&str], input: Option<&str>| {
+            let mut git = crate::ledger::testing::git();
+            git.current_dir(&root)
+                .env("GIT_CONFIG_GLOBAL", &config)
+                .env("GIT_ASKPASS", &askpass)
+                .env_remove("SSH_ASKPASS")
+                .env(
+                    "GIT_CONFIG_KEY_0",
+                    "url.https://example.invalid/mirror/.insteadOf",
+                )
+                .env("GIT_CONFIG_VALUE_0", "fixture:")
+                .envs(sent.iter().map(|(key, value)| (key, value)))
+                .args(args)
+                .stdin(if input.is_some() {
+                    Stdio::piped()
+                } else {
+                    Stdio::null()
+                })
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = git.spawn().unwrap();
+            if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+                stdin.write_all(input.as_bytes()).unwrap();
+            }
+            let out = child.wait_with_output().unwrap();
+            let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+            (out.status.success(), text(&out.stdout), text(&out.stderr))
+        };
+        let url = |from: &str| git(&["ls-remote", "--get-url", from], None).1;
+        assert_eq!(
+            url("git@github.com:alabsystems/a3d.git").trim(),
+            "https://github.com/alabsystems/a3d.git"
+        );
+        assert_eq!(
+            url("git@github.com:alabsystems/publication.git").trim(),
+            "git@github.com:alabsystems/publication.git",
+            "a private address keeps this host's transport"
+        );
+        assert_eq!(
+            url("fixture:x").trim(),
+            "https://example.invalid/mirror/x",
+            "the caller's own entry still applies"
+        );
+        let fill = |url: &str| git(&["credential", "fill"], Some(&format!("url={url}\n\n")));
+        let (ok, out, err) = fill("https://github.com/alabsystems/publication.git");
+        assert!(ok && out.contains("password=fixture-pass"), "{out}{err}");
+        for public in [
+            "https://github.com/alabsystems/a3d.git",
+            "https://alabsystems@github.com/alabsystems/aterm.git",
+        ] {
+            let (ok, out, err) = fill(public);
+            assert!(
+                !ok && !out.contains("password=") && err.contains("told us to quit"),
+                "{public}: {out}{err}"
+            );
+        }
     }
 
     #[test]
@@ -4266,68 +4678,74 @@ mod tests {
 
     const CRLF_PROBE_ENV: &str = "ATERM_RELEASE_CRLF_PROBE_DIR";
     const CRLF_PROBE: &str =
-        "release_steps::tests::probe_every_tree_the_release_writes_under_a_crlf_config";
+        "release_steps::tests::every_tree_the_release_writes_is_the_commits_bytes";
 
-    #[test]
-    fn probe_every_tree_the_release_writes_under_a_crlf_config() {
+    fn run_crlf_git(at: &Path, args: &[&str]) -> String {
+        let out = crate::ledger::testing::git()
+            .arg("-C")
+            .arg(at)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn write_crlf_fixture_file(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn setup_crlf_fixture_repos(root: &Path) -> (PathBuf, String) {
         use crate::ledger::testing;
-        use std::fs;
-        let Some(root) = std::env::var_os(CRLF_PROBE_ENV).map(PathBuf::from) else {
-            return;
-        };
         let ident = [
             ("user.name", "t"),
             ("user.email", "t@example.invalid"),
             ("commit.gpgsign", "false"),
         ];
-        let git = |at: &Path, args: &[&str]| -> String {
-            let out = testing::git()
-                .arg("-C")
-                .arg(at)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        let write = |path: &Path, body: &str| {
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, body).unwrap();
-        };
         let sub = root.join("sub");
         testing::init(&sub, &ident);
-        write(&sub.join("s.sh"), "#!/bin/sh\n");
-        git(&sub, &["add", "-A"]);
-        git(&sub, &["commit", "-q", "-m", "s"]);
+        write_crlf_fixture_file(&sub.join("s.sh"), "#!/bin/sh\n");
+        run_crlf_git(&sub, &["add", "-A"]);
+        run_crlf_git(&sub, &["commit", "-q", "-m", "s"]);
         let (repo, origin) = (root.join("aterm"), root.join("aterm.git"));
         testing::init(&repo, &ident);
-        write(&repo.join(".gitattributes"), "*.txt text\n");
-        write(&repo.join("bin/pub"), "#!/bin/sh\n");
-        write(&repo.join("notes.txt"), "one\n");
-        write(&repo.join("RELEASES.ledger"), "1783354739 0.25.0\n");
-        write(
+        write_crlf_fixture_file(&repo.join(".gitattributes"), "*.txt text\n");
+        write_crlf_fixture_file(&repo.join("bin/pub"), "#!/bin/sh\n");
+        write_crlf_fixture_file(&repo.join("notes.txt"), "one\n");
+        write_crlf_fixture_file(&repo.join("RELEASES.ledger"), "1783354739 0.25.0\n");
+        write_crlf_fixture_file(
             &repo.join("CHANGELOG.md"),
             "## [Unreleased]\n\n### Added\n- An entry.\n",
         );
         let sub_s = sub.display().to_string();
         let add_sub = ["submodule", "add", "-q", &sub_s, "vendor/sub"];
-        git(
+        run_crlf_git(
             &repo,
             &[&["-c", "protocol.file.allow=always"][..], &add_sub].concat(),
         );
-        git(&repo, &["add", "-A"]);
-        git(&repo, &["commit", "-q", "-m", "r"]);
-        git(&root, &["init", "-q", "--bare", "-b", "main", "aterm.git"]);
-        git(
+        run_crlf_git(&repo, &["add", "-A"]);
+        run_crlf_git(&repo, &["commit", "-q", "-m", "r"]);
+        run_crlf_git(root, &["init", "-q", "--bare", "-b", "main", "aterm.git"]);
+        run_crlf_git(
             &repo,
             &["remote", "add", "origin", &origin.display().to_string()],
         );
-        git(&repo, &["push", "-q", "origin", "main"]);
-        let r = git(&repo, &["rev-parse", "HEAD"]);
+        run_crlf_git(&repo, &["push", "-q", "origin", "main"]);
+        let head = run_crlf_git(&repo, &["rev-parse", "HEAD"]);
+        (repo, head)
+    }
+
+    fn probe_every_tree_the_release_writes_under_a_crlf_config_if_asked() -> bool {
+        use std::fs;
+        let Some(root) = std::env::var_os(CRLF_PROBE_ENV).map(PathBuf::from) else {
+            return false;
+        };
+        let (repo, r) = setup_crlf_fixture_repos(&root);
         let lf = |tree: &Path, notes: &str, with_sub: bool| {
             let read = |rel: &str| fs::read_to_string(tree.join(rel)).unwrap();
             assert_eq!(read("bin/pub"), "#!/bin/sh\n", "{}", tree.display());
@@ -4358,10 +4776,10 @@ mod tests {
             crate::gates::place_published(&GitCli::new(&repo), &repo, &source).unwrap()
         };
         lf(&place(&r).tree, "one\n", true);
-        write(&repo.join("notes.txt"), "one\ntwo\n");
-        git(&repo, &["commit", "-q", "-am", "two"]);
-        git(&repo, &["push", "-q", "origin", "main"]);
-        let source = git(&repo, &["rev-parse", "HEAD"]);
+        write_crlf_fixture_file(&repo.join("notes.txt"), "one\ntwo\n");
+        run_crlf_git(&repo, &["commit", "-q", "-am", "two"]);
+        run_crlf_git(&repo, &["push", "-q", "origin", "main"]);
+        let source = run_crlf_git(&repo, &["rev-parse", "HEAD"]);
         let moved = place(&source);
         assert!(moved.moved);
         lf(&moved.tree, "one\ntwo\n", true);
@@ -4383,6 +4801,7 @@ mod tests {
             rolled.contains("## [0.26.0]") && !rolled.contains('\r'),
             "{rolled:?}"
         );
+        true
     }
 
     /// Every entry under `root` and its bytes, symlinks not followed: what a probe writes grows it.
@@ -4403,6 +4822,9 @@ mod tests {
 
     #[test]
     fn every_tree_the_release_writes_is_the_commits_bytes() {
+        if probe_every_tree_the_release_writes_under_a_crlf_config_if_asked() {
+            return;
+        }
         let dir = aterm_tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let config = root.join("gitconfig");

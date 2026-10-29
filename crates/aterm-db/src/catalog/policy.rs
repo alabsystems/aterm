@@ -28,8 +28,13 @@ impl Policy {
             std::str::from_utf8(&bytes).map_err(|_| Error::new("invalid Commons configuration"))?;
         let value: aterm_toml::Value =
             aterm_toml::from_str(text).map_err(|_| Error::new("invalid Commons configuration"))?;
+        let swarm =
+            aterm_secrets::swarm::enabled_in_value(&value).map_err(|why| Error(why.to_string()))?;
         let Some(commons) = value.get("commons") else {
-            return Ok(Self::default());
+            return Ok(Self {
+                enabled: swarm,
+                excluded: BTreeSet::new(),
+            });
         };
         if !matches!(commons, aterm_toml::Value::Table(_)) {
             return Err(Error::new("invalid Commons configuration section"));
@@ -63,6 +68,9 @@ impl Policy {
                 }
             }
         }
-        Ok(Self { enabled, excluded })
+        Ok(Self {
+            enabled: swarm && enabled,
+            excluded,
+        })
     }
 }

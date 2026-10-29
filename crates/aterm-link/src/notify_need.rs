@@ -7,8 +7,9 @@
 //! The watch keeps the brief's own read ([`crate::fabric_brief::Read`], built by
 //! [`Read::following`]) and folds a session's newest seq space with the brief's
 //! [`crate::fabric_brief::newest_fold`] after each of its `ev` records: there is no second parser
-//! of `ev` bodies and no second fold. What the notifier does with the need it names (fire on a
-//! rise, stand on a repeat) is [`crate::notify`]'s standing rule, the one `attention` follows.
+//! of `ev` bodies and no second fold. Each need the fold names is a [`Pair`], its word and the
+//! record that raised it; what the notifier does with them (page a pair it has not paged, keep
+//! the pairs standing that the fold still holds) is [`crate::notify`]'s standing rule.
 
 use aterm_slog::bus::BusSpace;
 use aterm_slog::{BusRec, Key};
@@ -32,42 +33,184 @@ pub const SPACE_MAX: usize = 2 * aterm_slog::MAX_RECORDS;
 /// [`fabric_brief::WINDOW_DEFAULT`]).
 pub const WARM_WINDOW: u64 = fabric_brief::WINDOW_DEFAULT;
 
-/// The need a session's fold names: its word (one of [`aterm_slog::vocab::NEED_WORDS`]) and the
-/// detail the brief shows beside it (a wall's reset, a failure's exit code).
-pub type Folded = (&'static str, Option<String>);
+/// When a need a session's fold names was raised, as far as the watch can tell: with the need's
+/// word, the pair a `need` selector's standing rule is keyed by ([`Pair`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Raised {
+    /// By the record at `seq` of seq space `ep`, which the watch holds.
+    At { ep: u32, seq: u64 },
+    /// At or before `seq` of space `ep`: the snapshot there seeded it, and the watch holds no
+    /// record that raised it.
+    By { ep: u32, seq: u64 },
+    /// Not known: a store written before the pairs, which named the word alone.
+    Unknown,
+}
+
+/// One need: its word ([`aterm_slog::observed_need_words`]) and when it was raised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pair {
+    pub word: &'static str,
+    pub raised: Raised,
+}
+
+impl Pair {
+    /// Whether `self` and `other` can be the same need: the same word, raised by the same
+    /// record of one space, or one of them seeded by a snapshot of that space at or after the
+    /// other's record (a seq space is one process's numbering, so a pair of another space is
+    /// another need), or one of them [`Raised::Unknown`].
+    #[must_use]
+    pub fn same(&self, other: &Pair) -> bool {
+        if self.word != other.word {
+            return false;
+        }
+        match (self.raised, other.raised) {
+            (Raised::Unknown, _) | (_, Raised::Unknown) => true,
+            (Raised::At { ep, seq }, Raised::At { ep: e, seq: s }) => ep == e && seq == s,
+            (Raised::At { ep, seq }, Raised::By { ep: e, seq: upto })
+            | (Raised::By { ep: e, seq: upto }, Raised::At { ep, seq }) => ep == e && seq <= upto,
+            (Raised::By { ep, .. }, Raised::By { ep: e, .. }) => ep == e,
+        }
+    }
+
+    /// The pair as the standing store spells it: `<word>/<ep>/<seq>` ([`Raised::At`]),
+    /// `<word>/<ep>/~<seq>` ([`Raised::By`]) or the word alone ([`Raised::Unknown`]).
+    #[must_use]
+    pub fn token(&self) -> String {
+        match self.raised {
+            Raised::At { ep, seq } => format!("{}/{ep}/{seq}", self.word),
+            Raised::By { ep, seq } => format!("{}/{ep}/~{seq}", self.word),
+            Raised::Unknown => self.word.to_string(),
+        }
+    }
+
+    /// A [`Pair::token`] read back; a word that is no need word of the log's is no pair.
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Pair> {
+        let mut it = token.split('/');
+        let word = aterm_slog::vocab::lookup(aterm_slog::vocab::NEED_WORDS, it.next()?)?;
+        let raised = match (it.next(), it.next(), it.next()) {
+            (None, None, None) => Raised::Unknown,
+            (Some(ep), Some(seq), None) => {
+                let ep = ep.parse().ok()?;
+                match seq.strip_prefix('~') {
+                    Some(upto) => Raised::By {
+                        ep,
+                        seq: upto.parse().ok()?,
+                    },
+                    None => Raised::At {
+                        ep,
+                        seq: seq.parse().ok()?,
+                    },
+                }
+            }
+            _ => return None,
+        };
+        Some(Pair { word, raised })
+    }
+}
+
+/// One observed need a session's fold names ([`aterm_slog::Need::observed`]), most urgent
+/// first: its pair, the detail the brief shows beside it (a wall's reset, a failure's exit
+/// code), and whether the watch saw it rise: it holds the record that raised it, and the fold
+/// is whole or lost nothing after that record (a need a snapshot seeded did not rise where the
+/// watch could see it, so it never pages).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Named {
+    pub pair: Pair,
+    pub detail: Option<String>,
+    pub rose: bool,
+}
 
 /// What one record did to the needs a [`NeedWatch`] holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
-    /// Not a face the watch reads, or a body it could not place.
+    /// Not a face the watch reads, a body it could not place, a node's row, or a record of a
+    /// session whose node left its will (`state=away`, or the legacy `gone`) and whose close
+    /// the fold does not hold: nothing there answers its need, and a reattach restores it, so
+    /// the record pages and drops nothing.
     Nothing,
-    /// One of the session's `ev` records: its face (the `ev` subject, which the standing rule is
-    /// keyed by), its node and sid, and the need its fold names now (`None`: none, or the
-    /// session is gone without its close, [`gone_unclosed`]).
+    /// One of the session's `ev` records: its face (the `ev` subject, which the standing rule
+    /// is keyed by), its node and sid, the needs its fold names now, and whether that fold is
+    /// whole: not partial ([`aterm_slog::bus::Seed::partial`]: the watch holds neither the
+    /// session's start nor a snapshot that seeds every need, or it lost records no snapshot
+    /// folds past), or it holds the session's close. A need a whole fold does not name is no
+    /// longer standing; a partial fold may lack a need raised before what it holds.
     Folded {
         face: String,
         node: String,
         sid: String,
-        need: Option<Folded>,
+        needs: Vec<Named>,
+        whole: bool,
     },
-    /// One of the session's `ev` records whose fold is partial ([`aterm_slog::bus::Seed::partial`]:
-    /// the watch holds neither the session's start nor a snapshot that seeds every need, or it
-    /// lost records no snapshot folds past) and holds no close of the session: the watch does
-    /// not know the session's need, so the record neither pages nor clears one. Its face.
-    Partial(String),
-    /// A presence row says these sessions are gone without their close: each one's face.
-    Gone(Vec<String>),
+    /// The session's own row says it exited, and the fold holds no close of it: its face, every
+    /// need of which is over.
+    Gone(String),
 }
 
-/// Whether the session is gone although its newest fold holds no close of it: its node's row
-/// says it is gone, or its own row says it exited, before its close reached the bus
-/// ([`fabric_brief::gone_settled`], the brief's `partial` words for the same case). Nobody
-/// there can answer its need. A session whose close the fold holds is not: its close raised
-/// `exited` (§7.1) and dropped every other need, whichever of its close and its presence row
-/// the bus carried first.
-fn gone_unclosed(read: &Read, node: &str, s: &fabric_brief::Session) -> bool {
-    fabric_brief::gone_settled(read, node, s).is_some()
+/// Whether the session's own row says it exited although its newest fold holds no close of it
+/// ([`fabric_brief::gone_settled`]'s `no-close`): nobody there can answer its need, and none
+/// comes back. A session whose close the fold holds is not: its close raised `exited` (§7.1)
+/// and dropped every other need, whichever of its close and its row the bus carried first.
+fn exited_unclosed(s: &fabric_brief::Session) -> bool {
+    fabric_brief::exited(s)
         && fabric_brief::newest_fold(s).is_none_or(|(_, _, fold, _)| fold.state().closed.is_none())
+}
+
+/// The observed needs of a session's newest fold ([`Named`]), and whether the fold is whole
+/// ([`Step::Folded`]).
+fn named(s: &fabric_brief::Session) -> Option<(Vec<Named>, bool)> {
+    let (ep, space, fold, seed) = fabric_brief::newest_fold(s)?;
+    let st = fold.state();
+    let whole = !seed.partial() || st.closed.is_some();
+    let seeded = matches!(
+        seed,
+        aterm_slog::bus::Seed::Snap | aterm_slog::bus::Seed::SnapPartial
+    )
+    .then(|| space.snap().map(|snap| snap.seq))
+    .flatten();
+    let needs = st
+        .needs
+        .iter()
+        .flatten()
+        .filter(|n| n.observed())
+        .map(|n| {
+            let raised = match seeded {
+                Some(upto) if n.since_seq <= upto => Raised::By { ep, seq: upto },
+                _ => Raised::At {
+                    ep,
+                    seq: n.since_seq,
+                },
+            };
+            let rose = matches!(raised, Raised::At { .. })
+                && (whole || nothing_lost_from(space, n.since_seq));
+            Named {
+                pair: Pair {
+                    word: n.word,
+                    raised,
+                },
+                detail: n.detail.clone(),
+                rose,
+            }
+        })
+        .collect();
+    Some((needs, whole))
+}
+
+/// Whether `space` holds the record at `seq` and lost nothing from it on: no cover reaches it
+/// or past it, and no record of the bus class is missing between it and the newest held.
+fn nothing_lost_from(space: &BusSpace, seq: u64) -> bool {
+    let Some(ms) = space
+        .records_ms()
+        .find(|(_, r)| r.seq == seq)
+        .map(|(ms, _)| ms)
+    else {
+        return false;
+    };
+    space
+        .covers()
+        .iter()
+        .all(|(lo, n, _)| lo.saturating_add(n.saturating_sub(1)) < ms)
+        && space.holes_from(ms).is_empty()
 }
 
 /// The sessions a `need` selector follows.
@@ -101,9 +244,44 @@ impl NeedWatch {
         })
     }
 
+    /// Whether the watch holds a fold of the session whose `ev` face is `face`: one whose
+    /// standing needs a bound must not drop, since the fold may name them again and a need it
+    /// names without a pair standing pages ([`crate::fabric_brief::SESSIONS_MAX`] at most).
+    #[must_use]
+    pub fn holds(&self, face: &str) -> bool {
+        self.face(face).is_some_and(|(node, sid, leaf)| {
+            leaf == "ev"
+                && self
+                    .read
+                    .sessions
+                    .contains_key(&(node.to_string(), sid.to_string()))
+        })
+    }
+
     /// One record read before the cursor: folded, and judged by nothing.
     pub fn warm(&mut self, off: u64, subject: &str, body: &[u8]) {
         let _ = self.take(off, subject, body);
+    }
+
+    /// Every session's face and the needs its newest fold names, as a warm-up leaves them: a
+    /// need raised below the cursor stands ([`Step::Gone`]'s sessions name none).
+    #[must_use]
+    pub fn standing(&self) -> Vec<(String, Vec<Pair>)> {
+        self.read
+            .sessions
+            .iter()
+            .filter(|((_, sid), s)| sid != "node" && !exited_unclosed(s))
+            .filter_map(|((node, sid), s)| {
+                let (needs, _) = named(s)?;
+                let pairs: Vec<Pair> = needs.into_iter().map(|n| n.pair).collect();
+                (!pairs.is_empty()).then(|| {
+                    (
+                        crate::subject::session_face(&self.fleet, node, sid, "ev"),
+                        pairs,
+                    )
+                })
+            })
+            .collect()
     }
 
     /// One record past the cursor, in read order: what it did to the needs.
@@ -111,54 +289,35 @@ impl NeedWatch {
         let Some((node, sid, leaf)) = self.take(off, subject, body) else {
             return Step::Nothing;
         };
-        let face = crate::subject::session_face(&self.fleet, &node, &sid, "ev");
-        if leaf == "presence" {
-            if sid == "node" {
-                if !fabric_brief::node_gone(&self.read, &node) {
-                    return Step::Nothing;
-                }
-                let faces = self
-                    .read
-                    .sessions
-                    .iter()
-                    .filter(|((n, s), sess)| {
-                        *n == node && s != "node" && gone_unclosed(&self.read, n, sess)
-                    })
-                    .map(|((n, s), _)| crate::subject::session_face(&self.fleet, n, s, "ev"))
-                    .collect();
-                return Step::Gone(faces);
-            }
-            let key = (node, sid);
-            return match self.read.sessions.get(&key) {
-                Some(s) if gone_unclosed(&self.read, &key.0, s) => Step::Gone(vec![face]),
-                _ => Step::Nothing,
-            };
-        }
         if sid == "node" {
             return Step::Nothing;
         }
+        let face = crate::subject::session_face(&self.fleet, &node, &sid, "ev");
         let key = (node, sid);
         let Some(s) = self.read.sessions.get(&key) else {
             return Step::Nothing;
         };
-        let Some((_, _, fold, seed)) = fabric_brief::newest_fold(s) else {
+        if exited_unclosed(s) {
+            return Step::Gone(face);
+        }
+        if leaf == "presence" {
+            return Step::Nothing;
+        }
+        let Some((needs, whole)) = named(s) else {
             return Step::Nothing;
         };
-        let st = fold.state();
-        let unclosed = st.closed.is_none();
-        let need = if unclosed && fabric_brief::gone_settled(&self.read, &key.0, s).is_some() {
-            None
-        } else if unclosed && seed.partial() {
-            return Step::Partial(face);
-        } else {
-            st.top_observed_need().map(|n| (n.word, n.detail.clone()))
-        };
+        if fabric_brief::node_gone(&self.read, &key.0)
+            && fabric_brief::newest_fold(s).is_some_and(|(_, _, f, _)| f.state().closed.is_none())
+        {
+            return Step::Nothing;
+        }
         let (node, sid) = key;
         Step::Folded {
             face,
             node,
             sid,
-            need,
+            needs,
+            whole,
         }
     }
 
@@ -213,8 +372,9 @@ impl NeedWatch {
 /// Keep a space within [`SPACE_KEEP`] records: past it, the newest snapshot and the records
 /// after it, which fold to the same needs (a snapshot is a late reader's seed, §5.5), unless
 /// that snapshot seeds fewer needs than its session held (the brief's `snapshot-needs`) where
-/// the space it would replace folds whole: a partial fold judges nothing ([`Step::Partial`]),
-/// so the watch keeps the whole view until [`SPACE_MAX`]. Past [`SPACE_MAX`], the newest
+/// the space it would replace folds whole: a partial fold drops no standing need and pages
+/// only a need whose raise it holds with nothing lost after it ([`Step::Folded`]), so the
+/// watch keeps the whole view until [`SPACE_MAX`]. Past [`SPACE_MAX`], the newest
 /// snapshot on whatever it seeds, when what it keeps is within [`SPACE_MAX`]; else the newest
 /// [`SPACE_KEEP`] records.
 fn bound(space: &mut BusSpace) {
@@ -372,14 +532,21 @@ mod tests {
         let mut check = |log: &mut Log, watch: &mut NeedWatch, whole: &mut BusSpace| {
             for body in mirrored(log) {
                 off += 1;
-                let Step::Folded { need, .. } = watch.step(off, FACE, body.as_bytes()) else {
+                let Step::Folded {
+                    needs, whole: held, ..
+                } = watch.step(off, FACE, body.as_bytes())
+                else {
                     panic!("an ev record of the session folds: {body}");
                 };
+                assert!(
+                    held,
+                    "@{off}: a watch that holds the session's start folds it whole"
+                );
                 whole.offer(aterm_slog::decode_bus(&body).expect("a mirror body"));
                 let unbounded = whole.fold_seeded().0;
                 let want = unbounded.state().top_observed_need().map(|n| n.word);
                 assert_eq!(
-                    need.map(|(w, _)| w),
+                    needs.first().map(|n| n.pair.word),
                     want,
                     "@{off}: the bounded fold names the need the whole space folds to"
                 );
@@ -452,7 +619,8 @@ mod tests {
     }
 
     #[test]
-    fn a_partial_fold_judges_nothing_and_the_bound_keeps_a_whole_view_over_a_short_snapshot() {
+    fn a_partial_fold_pages_no_seeded_need_and_the_bound_keeps_a_whole_view_over_a_short_snapshot()
+    {
         let mut log = Log::new(1);
         let mut ms = 0;
         let mut at = || {
@@ -508,11 +676,13 @@ mod tests {
             off += 1;
             seen_snap |= body.contains(" op=snap ");
             let step = late.step(off, FACE, body.as_bytes());
-            assert_eq!(
-                step,
-                Step::Partial(FACE.to_string()),
+            let Step::Folded { needs, whole, .. } = &step else {
+                panic!("@{off}: an ev record of the session folds: {step:?}");
+            };
+            assert!(
+                !whole && needs.iter().all(|n| !n.rose),
                 "@{off}, after a snapshot {seen_snap}: a watch that joined the session late \
-                 holds no start and only short snapshots, so it judges nothing"
+                 holds no start and only short snapshots, so it sees no need rise: {step:?}"
             );
         }
 
@@ -522,11 +692,14 @@ mod tests {
             off += 1;
             failed |= body.contains("out=fail");
             let step = whole.step(off, FACE, body.as_bytes());
-            let Step::Folded { need, .. } = step else {
+            let Step::Folded {
+                needs, whole: true, ..
+            } = step
+            else {
                 panic!("@{off}: a watch that holds the session's start judges it: {step:?}");
             };
             assert_eq!(
-                need.map(|(w, _)| w),
+                needs.first().map(|n| n.pair.word),
                 failed.then_some("failure"),
                 "@{off}: the session's failure, from its run's close on"
             );
@@ -550,14 +723,15 @@ mod tests {
         let mut exited = None;
         for body in mirrored(&mut log2) {
             off += 1;
-            if let Step::Folded { need, .. } = late.step(off, FACE, body.as_bytes()) {
-                exited = need.map(|(w, _)| w);
+            if let Step::Folded { needs, whole, .. } = late.step(off, FACE, body.as_bytes()) {
+                assert!(whole, "a fold that holds the session's close is whole");
+                exited = needs.first().filter(|n| n.rose).map(|n| n.pair.word);
             }
         }
         assert_eq!(
             exited,
             Some("exited"),
-            "a partial fold that holds the session's close knows its one need"
+            "a partial fold that holds the session's close knows its one need, and saw it rise"
         );
     }
 
@@ -660,6 +834,70 @@ mod tests {
         assert!(
             snaps > 1 && longest > SPACE_MAX,
             "PRECONDITION: one snapshot held, and the space outgrew the cap ({longest})"
+        );
+    }
+
+    #[test]
+    fn a_pair_spells_and_matches_as_the_standing_store_reads_it() {
+        let at = |seq| Pair {
+            word: "failure",
+            raised: Raised::At { ep: 3, seq },
+        };
+        let by = |seq| Pair {
+            word: "failure",
+            raised: Raised::By { ep: 3, seq },
+        };
+        let other_space = Pair {
+            word: "failure",
+            raised: Raised::At { ep: 4, seq: 5 },
+        };
+        let old = Pair {
+            word: "failure",
+            raised: Raised::Unknown,
+        };
+        for p in [at(5), by(70), other_space.clone(), old.clone()] {
+            assert_eq!(Pair::parse(&p.token()), Some(p.clone()), "{}", p.token());
+        }
+        assert_eq!(at(5).token(), "failure/3/5");
+        assert_eq!(by(70).token(), "failure/3/~70");
+        assert_eq!(old.token(), "failure");
+        for bad in [
+            "nope/3/5",
+            "failure/3",
+            "failure/x/5",
+            "failure/3/~",
+            "failure/3/5/6",
+            "",
+        ] {
+            assert_eq!(Pair::parse(bad), None, "{bad}");
+        }
+        assert!(
+            at(5).same(&at(5)) && !at(5).same(&at(9)),
+            "one record, one need"
+        );
+        assert!(
+            at(5).same(&by(70)) && by(70).same(&at(5)) && !at(71).same(&by(70)),
+            "a snapshot's need is any the space raised at or before it"
+        );
+        assert!(
+            by(70).same(&by(130)),
+            "two snapshots of one space name one need"
+        );
+        assert!(
+            !other_space.same(&at(5)) && !other_space.same(&by(70)),
+            "another space's need is another need"
+        );
+        assert!(
+            old.same(&at(9)) && by(1).same(&old),
+            "an old store's word is any of its word"
+        );
+        let question = Pair {
+            word: "question",
+            raised: Raised::At { ep: 3, seq: 5 },
+        };
+        assert!(
+            !question.same(&at(5)) && !question.same(&old),
+            "words differ"
         );
     }
 

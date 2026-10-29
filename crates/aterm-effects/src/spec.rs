@@ -196,8 +196,17 @@ impl SpecTable {
     #[inline]
     pub fn consumer_capabilities(&self) -> SpecConsumerCapabilities {
         let mut capabilities = SpecConsumerCapabilities::default();
-        for id in self.overrides.values() {
-            let Some(spec) = self.specs.get(usize::from(*id)) else {
+        let mut seen = 0u128;
+        for &id in self.overrides.values() {
+            let idx = usize::from(id);
+            if idx < 128 {
+                let bit = 1u128 << idx;
+                if seen & bit != 0 {
+                    continue;
+                }
+                seen |= bit;
+            }
+            let Some(spec) = self.specs.get(idx) else {
                 continue;
             };
             let (rainbow, twotone) = match spec.ink {

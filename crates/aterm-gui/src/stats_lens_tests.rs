@@ -679,6 +679,7 @@ fn each_lens_shows_its_sections() {
         names(Instrument::Memory),
         [
             "Now",
+            "Capacity",
             "Where it is",
             "Used, last hour",
             "Biggest now",
@@ -787,6 +788,60 @@ fn each_lens_shows_its_sections() {
     assert!(well(&net, "Open sockets").contains("no per-app network figure"));
     let now = well(&net, "Now");
     assert!(!now.is_empty(), "{now}");
+}
+
+#[test]
+fn memory_capacity_stays_first_and_gpu_names_measured_allocations_without_a_vram_total() {
+    let mut snap = lens_scene(Scene::Calm);
+    let m = FaceMetrics::helvetica_neue();
+    let memory = snap.mem.as_mut().expect("fixture memory");
+    memory.sample.total = 128 * (1_u64 << 30);
+    memory.sample.app = 80 * (1_u64 << 30);
+    memory.sample.wired = 12 * (1_u64 << 30);
+    memory.sample.compressed = Some(4 * (1_u64 << 30));
+    memory.sample.cached = 24 * (1_u64 << 30);
+    memory.sample.free = 8 * (1_u64 << 30);
+    let doc = memory_doc(two_columns(&snap, &m));
+    assert!(doc.keeps_first, "capacity must survive a short panel");
+    let first = &doc.sections[0];
+    assert_eq!(first.name, "Capacity");
+    let capacity = first.words.join(" ");
+    for fact in ["96.0 GiB used", "32.0 GiB available", "128 GiB total"] {
+        assert!(capacity.contains(fact), "missing {fact}: {capacity}");
+    }
+    drop(doc);
+
+    let gpu = snap.facts.gpu.as_mut().expect("fixture GPU");
+    gpu.name = Some("Apple M5 Max".into());
+    gpu.cores = Some(40);
+    gpu.in_use_bytes = Some(6 * (1_u64 << 30));
+    gpu.alloc_bytes = Some(8 * (1_u64 << 30));
+    let doc = text_well(two_columns(&snap, &m), Instrument::Gpu);
+    assert!(
+        doc.sources
+            .iter()
+            .any(|s| s.contains("Apple M5 Max") && s.contains("40 cores"))
+    );
+    let details = doc
+        .sections
+        .iter()
+        .flat_map(|s| &s.words)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(details.contains("6.0 GiB GPU memory in use"), "{details}");
+    assert!(
+        details.contains("8.0 GiB GPU memory allocated"),
+        "{details}"
+    );
+    assert!(
+        details.contains("GPU memory total not reported"),
+        "{details}"
+    );
+    assert!(
+        !details.contains("128 GiB GPU"),
+        "system RAM is not a dedicated VRAM total: {details}"
+    );
 }
 
 #[test]
@@ -1383,7 +1438,7 @@ fn sections_take_the_largest_form_that_leaves_room() {
         sec(&[13.0]),
     ];
     let forms = |bottom: f64| -> Vec<usize> {
-        lens_body(526.0, 0.0, bottom, &sections, (&[], false))
+        lens_body(columns(526.0), 0.0, bottom, &sections, (&[], false))
             .iter()
             .map(|p| p.form)
             .collect()
@@ -1400,7 +1455,7 @@ fn sections_take_the_largest_form_that_leaves_room() {
         sec(&[13.0]),
     ];
     let forms = |bottom: f64, keeps: bool| -> Vec<usize> {
-        lens_body(526.0, 0.0, bottom, &kept, (&[], keeps))
+        lens_body(columns(526.0), 0.0, bottom, &kept, (&[], keeps))
             .iter()
             .map(|p| p.form)
             .collect()

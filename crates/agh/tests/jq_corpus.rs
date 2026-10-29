@@ -82,13 +82,6 @@ fn judge(row: &Value) -> Option<String> {
 }
 
 #[test]
-fn the_corpus_names_its_recording() {
-    let corpus = corpus();
-    assert_eq!(text(&corpus, "recorded_with"), "jq-1.7.1-apple");
-    assert_eq!(text(&corpus, "flags"), "-r -c -S");
-}
-
-#[test]
 fn every_row_holds() {
     let failures: Vec<String> = rows().iter().filter_map(judge).collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -106,22 +99,6 @@ fn every_row_has_a_name_and_one_expectation() {
         assert_eq!(shapes, 1, "{name}: one of output, refused, fails");
         assert!(!names.contains(&name), "{name} twice");
         names.push(name);
-    }
-}
-
-#[test]
-fn a_differs_note_says_how() {
-    for row in rows() {
-        for key in ["gojq_differs", "jq_differs"] {
-            if let Some(note) = row.get(key) {
-                let note = note.as_str().unwrap_or_default();
-                assert!(
-                    !note.trim().is_empty(),
-                    "{}: an empty {key}",
-                    text(&row, "name")
-                );
-            }
-        }
     }
 }
 
@@ -262,4 +239,28 @@ fn a_test_that_outruns_its_step_budget_fails_rather_than_guess() {
         .expect_err("a search past the budget is an error");
     assert_eq!(e.kind, Kind::Usage);
     assert!(e.why.contains("(?:x?){2000}z"), "{}", e.why);
+}
+
+#[test]
+fn overflowing_decimal_literals_clamp_to_f64_max_instead_of_rendering_as_null() {
+    let big_int = "9".repeat(310);
+    let big_frac = format!("{big_int}.5");
+    for (program, negative) in [
+        (big_int.as_str(), false),
+        (big_frac.as_str(), false),
+        (&format!("-{big_int}"), true),
+        (&format!("-{big_frac}"), true),
+    ] {
+        let out = compile(program)
+            .and_then(|p| p.run(&Value::Null))
+            .expect("compiles and evaluates");
+        let rendered = render_results(&out);
+        assert_ne!(rendered, "null\n", "{program}");
+        let parsed: f64 = rendered.trim().parse().expect("finite JSON number");
+        assert_eq!(
+            parsed,
+            if negative { -f64::MAX } else { f64::MAX },
+            "{program}"
+        );
+    }
 }

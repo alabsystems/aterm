@@ -144,6 +144,7 @@ struct Seen {
     waiting: AtomicUsize,
     texts: Mutex<Vec<String>>,
     lines: Mutex<Vec<String>>,
+    said: Mutex<Vec<String>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -182,6 +183,7 @@ impl Owner for Counted<'_> {
     }
 
     fn say(&mut self, line: &str) {
+        self.seen.said.lock().unwrap().push(line.to_owned());
         if line.starts_with("another session is signing Grok Build in") {
             self.seen.waiting.fetch_add(1, Ordering::SeqCst);
         }
@@ -215,6 +217,14 @@ enum Act {
 #[derive(Clone)]
 struct Rung {
     ladder: Ladder,
+    /// Its [`Auto::page_answers`]: Grok Build's own ([`Cli::renews_headlessly`], false while
+    /// accounts.x.ai answers the headless browser with its block page) for [`Rung::bare`], and a
+    /// vendor whose page answers for [`Rung::ready`].
+    answers: bool,
+    /// The pinned browser fetches here: where its ladder's browser is missing, the ladder runs
+    /// the browser rung ([`browser_rung`]) with a fetch that succeeds, counted in `fetched`.
+    fetchable: bool,
+    fetched: usize,
     said: Approval,
     act: Act,
     approve: Option<PathBuf>,
@@ -239,6 +249,9 @@ impl Rung {
     fn bare() -> Rung {
         Rung {
             ladder: Ladder::bare("none installed"),
+            answers: Cli::Grok.renews_headlessly(),
+            fetchable: false,
+            fetched: 0,
             said: Approval::NeedsYou("a bare machine's rung was asked".to_owned()),
             act: Act::Say,
             approve: None,
@@ -255,7 +268,10 @@ impl Rung {
 
     /// The roster's default-home row `main` (`grok-one@example.com` unless `email` says
     /// otherwise), its profile made, a headless browser found and a window browser installed,
-    /// answering `said`; an approval presses the stand-in vendor's `approve` in `root`.
+    /// answering `said`; an approval presses the stand-in vendor's `approve` in `root`. It stands
+    /// in for a vendor whose sign-in page answers the headless browser (`answers`), the only one
+    /// whose rung the gate runs: Grok Build's page does not, and its rung is skipped
+    /// (`grok_s_block_page_skips_the_rung_and_its_fetch_and_asks_the_person`).
     fn ready(root: &Path, email: &str, said: Approval) -> Rung {
         Rung {
             ladder: Ladder {
@@ -264,10 +280,12 @@ impl Rung {
                 email: Some(email.to_owned()),
                 profile: true,
                 mailbox: false,
+                mailbox_unready: None,
                 browser: Browser::Found,
                 window: true,
                 adopt: ADOPT_LABEL.to_owned(),
             },
+            answers: true,
             said,
             approve: Some(root.join("approve")),
             ..Rung::bare()
@@ -277,6 +295,10 @@ impl Rung {
 
 #[cfg(target_os = "macos")]
 impl Auto for Rung {
+    fn page_answers(&self) -> bool {
+        self.answers
+    }
+
     fn ladder(&mut self, fetch: bool, _stopped: &dyn Fn() -> bool) -> Ladder {
         self.read += 1;
         self.fetch = Some(fetch);
@@ -284,7 +306,16 @@ impl Auto for Rung {
             // The person's Ctrl-C while the pinned browser downloads.
             self.stop.store(true, Ordering::SeqCst);
         }
-        self.ladder.clone()
+        let mut ladder = self.ladder.clone();
+        if self.fetchable && matches!(ladder.browser, Browser::Missing(_)) {
+            let wanted = fetch && ladder.email.is_some() && (ladder.profile || ladder.mailbox);
+            let fetched = &mut self.fetched;
+            ladder.browser = browser_rung(false, wanted, || {
+                *fetched += 1;
+                Ok(PathBuf::from("/fetched/chrome-headless-shell"))
+            });
+        }
+        ladder
     }
 
     fn approve(&mut self, handoff: &Handoff<'_>) -> Approval {
@@ -572,27 +603,20 @@ fn under_the_gate_the_vendors_browser_open_is_stopped_and_its_page_and_code_are_
         !bed.root().join("opened").exists(),
         "the sandboxed vendor could not run `open`"
     );
-    // No row, no browser here: the need leads with the once-ever setup (adopting the default
-    // home's row), then this sign-in's code and page.
+    // No row, no browser here: the need is this sign-in's code and page alone. accounts.x.ai
+    // answers the headless browser with its block page (design §5 (g)), so no once-ever setup
+    // would make the next sign-in automatic, and none leads it.
     let url = "https://accounts.x.ai/oauth2/device?user_code=WMRT-8KQZ";
-    let adopt = Setup::Adopt {
-        label: ADOPT_LABEL.to_owned(),
-        window: false,
-    };
+    assert!(!Cli::Grok.renews_headlessly());
     assert_eq!(
         *seen.texts.lock().unwrap(),
-        [need_words(&adopt, url, Some("WMRT-8KQZ"))]
+        [format!("approve code WMRT-8KQZ at {url}")]
     );
     assert_eq!(
         *seen.lines.lock().unwrap(),
-        [needs_you_line(&adopt, url, Some("WMRT-8KQZ"))]
-    );
-    assert!(
-        seen.texts.lock().unwrap()[0]
-            .starts_with("once: adopt the default home as main; or code WMRT-8KQZ at ")
-            && seen.lines.lock().unwrap()[0].ends_with(&format!("code WMRT-8KQZ at {url}")),
-        "{:?}",
-        seen.lines.lock().unwrap()
+        [format!(
+            "NEEDS YOU: approve this Grok Build sign-in: code WMRT-8KQZ at {url}"
+        )]
     );
     assert_eq!(seen.clears.load(Ordering::SeqCst), 1, "the need came down");
     assert_eq!(
@@ -604,12 +628,13 @@ fn under_the_gate_the_vendors_browser_open_is_stopped_and_its_page_and_code_are_
         let mode = std::fs::metadata(bed.login()).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }
+    // Grok's rung is skipped whatever the row has: its page answers no headless browser.
     assert_eq!(
         ledger,
         [
             "accounts.x.ai device signed-in; row(default-home, no grok row) profile(none) \
-             mailbox(none configured) headless-browser(none installed) headless(not ready) \
-             person(asked)"
+             mailbox(none configured) headless-browser(none installed) headless(skipped: \
+             accounts.x.ai answers the headless browser with its block page) person(asked)"
         ]
     );
     assert!(!ledger[0].contains("WMRT") && !ledger[0].contains("https://"));
@@ -772,7 +797,14 @@ fn a_caller_that_does_not_wait_is_busy_while_another_signs_in() {
 /// Every setup for `label`, each with and without a window `accounts browser` opens here.
 fn every_setup(label: &str) -> Vec<Setup> {
     let label = label.to_owned();
-    let mut all = vec![Setup::Window(label.clone()), Setup::Mailbox(label.clone())];
+    let mut all = vec![
+        Setup::Window(label.clone()),
+        Setup::Mailbox(label.clone()),
+        Setup::MailboxPassword {
+            label: label.clone(),
+            login: super::super::mailbox_routes::mask_login("\u{1F600}\u{1F600}@example.test"),
+        },
+    ];
     for window in [true, false] {
         all.push(Setup::Email {
             label: label.clone(),
@@ -799,10 +831,10 @@ fn the_setup_names_accounts_browser_only_where_it_opens_a_window() {
     let adopt = "run `aterm harness accounts adopt-default main --email <your x.ai email> --cli \
                  grok`, ";
     let window = needs_you_line(
-        &Setup::Adopt {
+        Some(&Setup::Adopt {
             label: "main".to_owned(),
             window: true,
-        },
+        }),
         url,
         Some("WMRT-8KQZ"),
     );
@@ -816,10 +848,10 @@ fn the_setup_names_accounts_browser_only_where_it_opens_a_window() {
         )
     );
     let none = needs_you_line(
-        &Setup::Adopt {
+        Some(&Setup::Adopt {
             label: "main".to_owned(),
             window: false,
-        },
+        }),
         url,
         Some("WMRT-8KQZ"),
     );
@@ -850,10 +882,10 @@ fn the_setup_names_accounts_browser_only_where_it_opens_a_window() {
     );
     for window in [true, false] {
         let email = needs_you_line(
-            &Setup::Email {
+            Some(&Setup::Email {
                 label: "work".to_owned(),
                 window,
-            },
+            }),
             url,
             Some("WMRT-8KQZ"),
         );
@@ -889,14 +921,14 @@ fn the_need_leads_with_the_setup_and_fits_the_attention_cap() {
     let url = "https://accounts.x.ai/oauth2/device?user_code=WMRT-8KQZ";
     let window = Setup::Window("main".to_owned());
     assert_eq!(
-        need_words(&window, url, Some("WMRT-8KQZ")),
+        need_words(Some(&window), url, Some("WMRT-8KQZ")),
         format!(
             "once: sign main in at the desk; or code WMRT-8KQZ at {url} (aterm harness accounts \
              browser main --cli grok)"
         )
     );
     assert_eq!(
-        needs_you_line(&window, url, Some("WMRT-8KQZ")),
+        needs_you_line(Some(&window), url, Some("WMRT-8KQZ")),
         format!(
             "NEEDS YOU: once, so Grok Build signs in by itself from now on: run `aterm harness \
              accounts browser main --cli grok` at this machine's desk and sign in there, or put \
@@ -906,21 +938,21 @@ fn the_need_leads_with_the_setup_and_fits_the_attention_cap() {
     );
     let mailbox = Setup::Mailbox("main".to_owned());
     assert_eq!(
-        need_words(&mailbox, url, Some("WMRT-8KQZ")),
+        need_words(Some(&mailbox), url, Some("WMRT-8KQZ")),
         format!("once: main's mailbox in the vault; or code WMRT-8KQZ at {url} (ai-mailbox.toml)")
     );
     assert!(
-        needs_you_line(&mailbox, url, Some("WMRT-8KQZ")).starts_with(
+        needs_you_line(Some(&mailbox), url, Some("WMRT-8KQZ")).starts_with(
             "NEEDS YOU: once, so Grok Build signs in by itself from now on: put main's mailbox in \
              the vault (ai-mailbox.toml), or install a Chromium that opens a window"
         )
     );
     assert!(
         need_words(
-            &Setup::Email {
+            Some(&Setup::Email {
                 label: "work".to_owned(),
                 window: true
-            },
+            }),
             url,
             Some("WMRT-8KQZ")
         )
@@ -931,13 +963,13 @@ fn the_need_leads_with_the_setup_and_fits_the_attention_cap() {
         window: true,
     };
     assert!(
-        need_words(&adopt, url, Some("WMRT-8KQZ")).ends_with(
+        need_words(Some(&adopt), url, Some("WMRT-8KQZ")).ends_with(
             "(aterm harness accounts adopt-default default-home --email <you> --cli grok)"
-        ) && needs_you_line(&adopt, url, Some("WMRT-8KQZ"))
+        ) && needs_you_line(Some(&adopt), url, Some("WMRT-8KQZ"))
             .contains("run `aterm harness accounts adopt-default default-home --email")
     );
     for setup in every_setup(ADOPT_LABEL) {
-        let text = need_words(&setup, url, Some("WMRT-8KQZ"));
+        let text = need_words(Some(&setup), url, Some("WMRT-8KQZ"));
         let at = text.find("WMRT-8KQZ").expect("the code");
         assert!(at + "WMRT-8KQZ".len() <= 69, "{setup:?}: {text}");
         assert!(text.starts_with("once: ") && text.len() <= cap, "{text}");
@@ -946,7 +978,7 @@ fn the_need_leads_with_the_setup_and_fits_the_attention_cap() {
         "https://accounts.x.ai/oauth2/device?user_code=WMRT-8KQZ&{}",
         "x".repeat(300)
     );
-    let text = need_words(&window, &long, Some("WMRT-8KQZ"));
+    let text = need_words(Some(&window), &long, Some("WMRT-8KQZ"));
     assert_eq!(
         text,
         "once: sign main in at the desk; or code WMRT-8KQZ at https://accounts.x.ai (aterm \
@@ -956,13 +988,28 @@ fn the_need_leads_with_the_setup_and_fits_the_attention_cap() {
     assert!(super::super::accounts::admissible_label(&widest));
     let code = "ABCD-EFGH-IJKL-M";
     for setup in every_setup(&widest) {
-        let text = need_words(&setup, &long, Some(code));
+        let text = need_words(Some(&setup), &long, Some(code));
         assert!(
             text.len() <= cap && text.contains(&format!("code {code} at https://accounts.x.ai")),
             "{text}"
         );
         assert!(text.starts_with("once: "), "{text}");
     }
+    // With no setup (no profile or mailbox gets the rung past Grok's block page): the code and
+    // the page alone, the code within the menu row, and the page's host where the page passes
+    // the cap.
+    assert_eq!(
+        need_words(None, url, Some("WMRT-8KQZ")),
+        format!("approve code WMRT-8KQZ at {url}")
+    );
+    assert_eq!(
+        needs_you_line(None, url, Some("WMRT-8KQZ")),
+        format!("NEEDS YOU: approve this Grok Build sign-in: code WMRT-8KQZ at {url}")
+    );
+    assert_eq!(
+        need_words(None, &long, Some(code)),
+        format!("approve code {code} at https://accounts.x.ai")
+    );
     assert_eq!(
         cut("ab\u{e9}".to_owned(), 3),
         "ab",
@@ -987,9 +1034,9 @@ fn the_need_leads_with_the_setup_and_fits_the_attention_cap() {
 }
 
 /// The ledger's line keeps every rung whole within a sign-in row's bound: at the longest label,
-/// a failed fetch's longest reason, or the automatic rung's longest one, and the longest outcome,
-/// the person's rung still ends it. A rung's reason is bounded on its own, so a long one never
-/// pushes the person's rung off the line.
+/// a failed fetch's longest reason, a rung skipped for Grok's block page, or the automatic
+/// rung's longest reason, and the longest outcome, the person's rung still ends it. A rung's
+/// reason is bounded on its own, so a long one never pushes the person's rung off the line.
 #[test]
 fn the_ledger_line_keeps_every_rung_within_a_sign_in_row() {
     let cap = super::super::accounts::LEDGER_WHY_MAX;
@@ -1002,13 +1049,14 @@ fn the_ledger_line_keeps_every_rung_within_a_sign_in_row() {
     ladder.email = Some("main@example.com".to_owned());
     ladder.profile = true;
     let fetch_failed = rungs_line(&ladder, "not ready", true);
+    let blocked = rungs_line(&ladder, Skip::Blocked.words(), true);
     ladder.browser = Browser::Found;
     let rung_stopped = rungs_line(
         &ladder,
         &headless_words("needs sign-in", &"z".repeat(300)),
         true,
     );
-    for rungs in [fetch_failed, rung_stopped] {
+    for rungs in [fetch_failed, blocked, rung_stopped] {
         let line = ledger_line(Some("accounts.x.ai"), "signed-in-elsewhere", &rungs);
         assert!(
             line.len() <= cap && line.ends_with(" person(asked)"),
@@ -1333,6 +1381,10 @@ fn the_default_home_s_row_is_its_rosters_row_else_the_active_one() {
     );
     ladder.window = true;
     assert_eq!(ladder.setup(), Setup::Window("work".to_owned()));
+    // The need leads with none of them while Grok's page answers the headless browser with its
+    // block page: no profile or mailbox gets the automatic rung past it.
+    assert!(!Cli::Grok.renews_headlessly());
+    assert_eq!(ladder.need_setup(), None);
     // Ready only with a browser beside a profile or a mailbox.
     ladder.profile = true;
     assert!(!ladder.ready(), "a profile with no browser");
@@ -1356,6 +1408,8 @@ fn the_default_home_s_row_is_its_rosters_row_else_the_active_one() {
 /// deadline cut to AUTO_WITHIN of a sign-in whose own hang detector is longer, so the person
 /// keeps the rest of the code's life), grok's login is placed in the default home, and no person
 /// is asked: no need, and the ledger says so.
+/// The rung stands in for a vendor whose page answers the headless browser ([`Rung::ready`]), the
+/// only one whose rung the gate runs: Grok Build's is skipped.
 #[cfg(target_os = "macos")]
 #[test]
 fn an_automatic_approval_signs_in_and_asks_nobody() {
@@ -1414,6 +1468,8 @@ fn an_automatic_approval_signs_in_and_asks_nobody() {
 /// out, and the next background caller backs off. A person's own launch after it skips the rung
 /// once and asks them, so a refusing profile never leaves the machine with no way in; the launch
 /// after that asks the rung again. CONTROL: a rung that approves signs in with no need.
+/// The rung stands in for a vendor whose page answers the headless browser ([`Rung::ready`]), the
+/// only one whose rung the gate runs: Grok Build's is skipped.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_refused_automatic_approval_ends_fail_closed() {
@@ -1511,6 +1567,8 @@ fn a_refused_automatic_approval_ends_fail_closed() {
 /// NEGATIVE CONTROL: a page aterm approved by itself that grok then signs ANOTHER account in on
 /// (its report names another email than the row's) is refused: nothing is placed and no need
 /// goes up.
+/// The rung stands in for a vendor whose page answers the headless browser ([`Rung::ready`]), the
+/// only one whose rung the gate runs: Grok Build's is skipped.
 #[cfg(target_os = "macos")]
 #[test]
 fn grok_signing_another_account_in_after_an_automatic_approval_is_refused() {
@@ -1556,6 +1614,8 @@ fn grok_signing_another_account_in_after_an_automatic_approval_is_refused() {
 /// another account in than the row's is refused and nothing is placed, whoever the record says
 /// was asked. CONTROL: where the rung never ran (no route ready), the person's own approval is
 /// theirs, and the same report is placed.
+/// The rung stands in for a vendor whose page answers the headless browser ([`Rung::ready`]), the
+/// only one whose rung the gate runs: Grok Build's is skipped.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_rung_that_pressed_and_then_stopped_is_still_held_to_the_rows_account() {
@@ -1609,6 +1669,8 @@ fn a_rung_that_pressed_and_then_stopped_is_still_held_to_the_rows_account() {
 /// downloads starts no grok; one while the automatic rung runs ends it (its `finished` comes
 /// true) with nothing placed; one just before the need goes up raises none. Each ends
 /// `stopped`, asks nobody and places nothing. CONTROL: unstopped, the same gate runs grok.
+/// The rung stands in for a vendor whose page answers the headless browser ([`Rung::ready`]), the
+/// only one whose rung the gate runs: Grok Build's is skipped.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_stop_ends_every_rung_and_nothing_runs_after_it() {
@@ -1713,19 +1775,22 @@ fn a_stop_ends_every_rung_and_nothing_runs_after_it() {
 }
 
 /// A stop for a person (the row's profile signed out of x.ai, or a page only a person can pass)
-/// goes on to the one need, which leads with the once-ever setup for that row, and the person's
-/// approval of the same code signs the machine in; the ledger names both rungs.
+/// goes on to the one need, this sign-in's code and page with no once-ever setup ahead of it
+/// (Grok's need leads with none, `Ladder::need_setup`), and the person's approval of the same
+/// code signs the machine in; the ledger names both rungs.
+/// The rung stands in for a vendor whose page answers the headless browser ([`Rung::ready`]), the
+/// only one whose rung the gate runs: Grok Build's is skipped.
 #[cfg(target_os = "macos")]
 #[test]
-fn a_stop_for_a_person_goes_on_to_the_need_with_the_setup_first() {
+fn a_stop_for_a_person_goes_on_to_the_need_with_the_same_code() {
     for (said, word) in [
         (
             Approval::NeedsSignIn("the vendor's sign-in page waited on a person".to_owned()),
             "headless(needs sign-in: the vendor's sign-in page waited on a person)",
         ),
         (
-            Approval::NeedsYou("a Cloudflare check".to_owned()),
-            "headless(needs you: a Cloudflare check)",
+            Approval::NeedsYou("a passkey prompt".to_owned()),
+            "headless(needs you: a passkey prompt)",
         ),
     ] {
         let bed = Bed::new("sign");
@@ -1746,16 +1811,14 @@ fn a_stop_for_a_person_goes_on_to_the_need_with_the_setup_first() {
         let text = seen.texts.lock().unwrap()[0].clone();
         let line = seen.lines.lock().unwrap()[0].clone();
         assert!(
-            text.starts_with("once: sign main in at the desk; or code WMRT-8KQZ at ")
-                && text.ends_with("(aterm harness accounts browser main --cli grok)"),
+            text.starts_with("approve code WMRT-8KQZ at https://accounts.x.ai/"),
             "{word}: {text}"
         );
         assert!(
             line.starts_with(
-                "NEEDS YOU: once, so Grok Build signs in by itself from now on: run `aterm \
-                 harness accounts browser main --cli grok`"
-            ) && line
-                .contains("or approve this sign-in now: code WMRT-8KQZ at https://accounts.x.ai/"),
+                "NEEDS YOU: approve this Grok Build sign-in: code WMRT-8KQZ at \
+                 https://accounts.x.ai/"
+            ),
             "{word}: {line}"
         );
         assert!(
@@ -1766,12 +1829,54 @@ fn a_stop_for_a_person_goes_on_to_the_need_with_the_setup_first() {
     }
 }
 
-/// With no headless browser, or neither a profile nor a mailbox, the automatic rung is never
-/// asked and the need goes up at once, leading with the setup. CONTROL: the same row with both
-/// asks the rung first.
+/// Cloudflare's bot check that did not clear ends the sign-in `bot-check` with no need: nobody
+/// is asked to pass it (design R-13), nothing is placed, and the ledger names it, with the
+/// person not asked. CONTROL: a stop for a person on the same gate raises the one need
+/// ([`a_stop_for_a_person_goes_on_to_the_need_with_the_same_code`]).
+/// The rung stands in for a vendor whose page answers the headless browser ([`Rung::ready`]), the
+/// only one whose rung the gate runs: Grok Build's is skipped.
 #[cfg(target_os = "macos")]
 #[test]
-fn with_no_route_ready_the_rung_is_skipped_and_the_need_leads_with_the_setup() {
+fn a_bot_check_ends_the_sign_in_on_record_and_asks_nobody() {
+    let sandbox = Some(Path::new(login_drive::SANDBOX_EXEC));
+    let bed = Bed::new("sign");
+    let seen = Seen::default();
+    let mut owner = Counted::new(&seen, Some(bed.root().join("approve")));
+    let said = "Cloudflare's bot check on `accounts.x.ai/sign-in` did not clear in 90 s; aterm \
+                never tries to pass it";
+    let mut rung = Rung::ready(
+        bed.root(),
+        "grok-one@example.com",
+        Approval::BotCheck(said.to_owned()),
+    );
+    let (ended, ledger) = gate_run_with(&bed, sandbox, (true, true), vec![], &mut rung, &mut owner);
+    assert!(
+        matches!(&ended, Ended::Unsigned { word, why } if word == "bot-check"
+            && why.contains("Cloudflare") && !why.contains("person")),
+        "{ended:?}"
+    );
+    assert_eq!(rung.asked, 1);
+    assert_eq!(seen.needs.load(Ordering::SeqCst), 0, "no need goes up");
+    assert!(seen.lines.lock().unwrap().is_empty(), "no NEEDS YOU line");
+    assert!(!bed.login().exists(), "nothing is placed");
+    assert!(
+        ledger[0].starts_with("accounts.x.ai device bot-check; ")
+            && ledger[0].contains("headless(bot check: Cloudflare")
+            && ledger[0].ends_with("person(not asked)"),
+        "{ledger:?}"
+    );
+    assert_eq!(read_record(&bed.state()).outcome, "bot-check");
+    assert!(!read_record(&bed.state()).by, "not the rung's refusal");
+}
+
+/// With no headless browser, or neither a profile nor a mailbox, the automatic rung is never
+/// asked and the need goes up at once, with this sign-in's code. CONTROL: the same row with both
+/// asks the rung first.
+/// The rung stands in for a vendor whose page answers the headless browser ([`Rung::ready`]), the
+/// only one whose rung the gate runs: Grok Build's is skipped.
+#[cfg(target_os = "macos")]
+#[test]
+fn with_no_route_ready_the_rung_is_skipped_and_the_need_goes_up_at_once() {
     let unready = |root: &Path, ladder: fn(&mut Ladder)| {
         let mut rung = Rung::ready(
             root,
@@ -1811,7 +1916,7 @@ fn with_no_route_ready_the_rung_is_skipped_and_the_need_leads_with_the_setup() {
         assert_eq!(rung.asked, 0, "{what}: the rung was never asked");
         assert_eq!(seen.needs.load(Ordering::SeqCst), 1, "{what}");
         assert!(
-            seen.texts.lock().unwrap()[0].starts_with("once: sign main in at the desk; "),
+            seen.texts.lock().unwrap()[0].starts_with("approve code WMRT-8KQZ at "),
             "{what}"
         );
         assert!(
@@ -1844,6 +1949,139 @@ fn with_no_route_ready_the_rung_is_skipped_and_the_need_leads_with_the_setup() {
         (rung.asked, seen.needs.load(Ordering::SeqCst)),
         (1, 0),
         "CONTROL"
+    );
+}
+
+/// accounts.x.ai answers aterm's headless browser with Cloudflare's block page (design §5 (g);
+/// `Cli::renews_headlessly` is false for Grok, and the machine's rung, [`LiveAuto`], says its
+/// page does not answer), so the automatic rung could only load xAI's page and fail. A Grok
+/// sign-in whose row has an email, a profile and a mailbox, with no headless browser installed,
+/// asks the rung for no approval and lets its ladder fetch no browser; the person's need goes up
+/// at once with this sign-in's code and page (no once-ever setup), and their approval signs the
+/// machine in. The terminal and the record say why the rung did not run. With a headless browser
+/// installed, where the rung's ladder is ready, the rung still approves nothing and the person is
+/// asked. CONTROL: the same row for a vendor whose page answers (the stand-in's `answers`)
+/// fetches the pinned browser and asks the rung first, which approves, and nobody is asked.
+#[cfg(target_os = "macos")]
+#[test]
+fn grok_s_block_page_skips_the_rung_and_its_fetch_and_asks_the_person() {
+    assert!(!Cli::Grok.renews_headlessly(), "accounts.x.ai's block page");
+    assert!(
+        !LiveAuto::new(None, None, None, 0).page_answers(),
+        "the machine's rung is Grok Build's"
+    );
+    let sandbox = Some(Path::new(login_drive::SANDBOX_EXEC));
+    let row = |root: &Path, answers: bool| {
+        let mut rung = Rung {
+            answers,
+            fetchable: true,
+            ..Rung::ready(
+                root,
+                "grok-one@example.com",
+                Approval::Approved { page: true },
+            )
+        };
+        rung.ladder.mailbox = true;
+        rung.ladder.browser = Browser::Missing("none installed".to_owned());
+        rung
+    };
+    let bed = Bed::new("sign");
+    let seen = Seen::default();
+    let mut owner = Counted::new(&seen, Some(bed.root().join("approve")));
+    let mut rung = row(bed.root(), Cli::Grok.renews_headlessly());
+    let (ended, ledger) = gate_run_with(&bed, sandbox, (true, true), vec![], &mut rung, &mut owner);
+    assert_eq!(
+        ended,
+        Ended::SignedIn {
+            file: bed.login(),
+            email: Some("grok-one@example.com".to_owned()),
+        }
+    );
+    assert_eq!(rung.asked, 0, "the rung approved nothing");
+    assert_eq!(
+        (rung.fetch, rung.fetched),
+        (Some(false), 0),
+        "no browser was fetched for it"
+    );
+    assert_eq!(seen.needs.load(Ordering::SeqCst), 1, "the person was asked");
+    let url = "https://accounts.x.ai/oauth2/device?user_code=WMRT-8KQZ";
+    assert_eq!(
+        *seen.texts.lock().unwrap(),
+        [format!("approve code WMRT-8KQZ at {url}")]
+    );
+    assert_eq!(
+        *seen.lines.lock().unwrap(),
+        [format!(
+            "NEEDS YOU: approve this Grok Build sign-in: code WMRT-8KQZ at {url}"
+        )]
+    );
+    assert_eq!(
+        ledger,
+        [
+            "accounts.x.ai device signed-in; row(main, the default home's) profile(ready) \
+             mailbox(ready) headless-browser(none installed) headless(skipped: accounts.x.ai \
+             answers the headless browser with its block page) person(asked)"
+        ]
+    );
+    assert!(
+        seen.said
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.ends_with(Skip::Blocked.told())),
+        "{:?}",
+        seen.said.lock().unwrap()
+    );
+    assert_eq!(bed.runs(), 1);
+    // The same row on a machine whose headless browser is installed: its ladder is ready, and
+    // the gate alone keeps the rung from approving.
+    let bed = Bed::new("sign");
+    let seen = Seen::default();
+    let mut owner = Counted::new(&seen, Some(bed.root().join("approve")));
+    let mut rung = row(bed.root(), Cli::Grok.renews_headlessly());
+    rung.ladder.browser = Browser::Found;
+    assert!(rung.ladder.ready(), "the rung's own routes are all there");
+    let (ended, ledger) = gate_run_with(&bed, sandbox, (true, true), vec![], &mut rung, &mut owner);
+    assert!(matches!(ended, Ended::SignedIn { .. }), "{ended:?}");
+    assert_eq!(rung.asked, 0, "the rung approved nothing");
+    assert_eq!(
+        (rung.fetch, rung.fetched),
+        (Some(false), 0),
+        "no browser was fetched for it"
+    );
+    assert_eq!(seen.needs.load(Ordering::SeqCst), 1, "the person was asked");
+    assert_eq!(
+        *seen.texts.lock().unwrap(),
+        [format!("approve code WMRT-8KQZ at {url}")]
+    );
+    assert!(
+        ledger[0].ends_with(
+            "headless-browser(found) headless(skipped: accounts.x.ai answers the headless browser \
+             with its block page) person(asked)"
+        ),
+        "{ledger:?}"
+    );
+    // CONTROL: a vendor whose page answers fetches the pinned browser and runs the rung.
+    let bed = Bed::new("sign");
+    let seen = Seen::default();
+    let mut owner = Counted::new(&seen, None);
+    let mut rung = row(bed.root(), true);
+    let (ended, ledger) = gate_run_with(&bed, sandbox, (true, true), vec![], &mut rung, &mut owner);
+    assert!(
+        matches!(ended, Ended::SignedIn { .. }),
+        "CONTROL: {ended:?}"
+    );
+    assert_eq!(
+        (rung.fetch, rung.fetched, rung.asked),
+        (Some(true), 1, 1),
+        "CONTROL"
+    );
+    assert_eq!(seen.needs.load(Ordering::SeqCst), 0, "CONTROL");
+    assert!(
+        ledger[0].ends_with(
+            "headless-browser(fetched the pinned one) headless(approved) person(not asked)"
+        ),
+        "CONTROL: {ledger:?}"
     );
 }
 
@@ -2079,6 +2317,8 @@ fn the_live_rung_waits_for_the_machines_sign_in_lock() {
 /// returns because grok finished, where grok then exits without a login (an expired code), is
 /// named `grok ended while it ran`. CONTROL: one whose approval signs in is `approved`
 /// (`an_automatic_approval_signs_in_and_asks_nobody`).
+/// The rung stands in for a vendor whose page answers the headless browser ([`Rung::ready`]), the
+/// only one whose rung the gate runs: Grok Build's is skipped.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_rung_that_ended_with_grok_is_not_named_approved() {
@@ -2140,4 +2380,41 @@ fn the_refusals_way_out_names_accounts_browser_only_where_it_opens_a_window() {
         ),
         "{none}"
     );
+}
+
+/// A row whose `[[mailboxes]]` entry has no password yet names that entry, never "none
+/// configured": its words say `mailbox(ab…@… has no password yet)`, and its setup asks for that
+/// password, not for a mailbox the vault already holds. NEGATIVE CONTROL: reading `mailbox`
+/// alone (the branch's first form) says `none configured`, and this fails.
+#[test]
+fn a_mailbox_with_no_password_yet_is_named_not_called_missing() {
+    let mut ladder = Ladder::bare("none installed");
+    ladder.label = "main".to_owned();
+    ladder.from = RowFrom::Default;
+    ladder.email = Some("grok-one@example.test".to_owned());
+    ladder.mailbox_unready = Some("ow…@…".to_owned());
+    let words = ladder.words();
+    assert!(
+        words.contains("mailbox(ow…@… has no password yet)"),
+        "{words}"
+    );
+    assert_eq!(
+        ladder.setup(),
+        Setup::MailboxPassword {
+            label: "main".to_owned(),
+            login: "ow…@…".to_owned(),
+        }
+    );
+    let line = needs_you_line(
+        Some(&ladder.setup()),
+        "https://accounts.x.ai/oauth2/device?user_code=WMRT-8KQZ",
+        Some("WMRT-8KQZ"),
+    );
+    assert!(
+        line.contains("fill in the password of mailbox ow…@…"),
+        "{line}"
+    );
+    ladder.mailbox_unready = None;
+    assert!(ladder.words().contains("mailbox(none configured)"));
+    assert_eq!(ladder.setup(), Setup::Mailbox("main".to_owned()));
 }

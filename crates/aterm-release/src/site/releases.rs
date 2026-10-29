@@ -115,10 +115,11 @@ pub fn linux_raw_name(version: &str, arch: &str) -> String {
 pub fn size_label(size: Option<u64>) -> Option<String> {
     #[allow(clippy::cast_precision_loss)] // a byte count far below 2^52
     let mb = size? as f64 / 1e6;
-    Some(if mb >= 1000.0 {
+    let rounded_mb = mb.round_ties_even();
+    Some(if rounded_mb >= 1000.0 {
         format!("{:.2} GB", mb / 1000.0)
     } else {
-        format!("{} MB", mb.round_ties_even())
+        format!("{rounded_mb} MB")
     })
 }
 
@@ -653,6 +654,9 @@ mod tests {
         assert_eq!(label(1_067_044_990), "1.07 GB");
         assert_eq!(label(28_219_832), "28 MB");
         assert_eq!(label(999_400_000), "999 MB");
+        assert_eq!(label(999_499_999), "999 MB");
+        assert_eq!(label(999_500_000), "1.00 GB");
+        assert_eq!(label(999_999_999), "1.00 GB");
         assert_eq!(label(1_000_000_000), "1.00 GB");
         assert_eq!(label(12_345_678_901), "12.35 GB");
         assert_eq!(size_label(None), None);

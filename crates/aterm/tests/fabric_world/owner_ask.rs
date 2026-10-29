@@ -235,6 +235,14 @@ impl Inst {
                 harness::STALE_HORIZON.0,
                 harness::STALE_HORIZON.1.as_millis().to_string(),
             )
+            .env(
+                harness::ACK_WAIT.0,
+                harness::ACK_WAIT.1.as_millis().to_string(),
+            )
+            .env(
+                harness::LIVE_WAIT.0,
+                harness::LIVE_WAIT.1.as_millis().to_string(),
+            )
             .env(harness::FAST_TIMERS.0, harness::FAST_TIMERS.1)
             .stdin(OwnedStdio::null())
             .stdout(out)
@@ -337,9 +345,9 @@ fn sids(inst: &Inst) -> Vec<String> {
 }
 
 /// A script `name` under `root` that writes one whole shell-integration block in one write, A to
-/// D;0, its command line `line` (OSC 633;E, with no `;` or backslash) and its output `ran-42`,
-/// each mark signed with the tab's nonce when the shell was handed one. Nothing runs `line`: the
-/// shell's marks report it, as a shell runs it.
+/// D;0, its command line `line` (OSC 633;E, a `;` spelled `\\x3b` as the integrations escape it,
+/// no other backslash) and its output `ran-42`, each mark signed with the tab's nonce when the
+/// shell was handed one. Nothing runs `line`: the shell's marks report it, as a shell runs it.
 fn marked_command(root: &Path, name: &str, line: &str) -> PathBuf {
     let script = format!(
         "#!/bin/sh\n\
@@ -352,6 +360,83 @@ fn marked_command(root: &Path, name: &str, line: &str) -> PathBuf {
     path
 }
 
+/// [`marked_command`]'s block, its run real: after C the script `exec`s `/usr/bin/env`, which
+/// `exec`s `/bin/sh` to write the output and D;0. The session's process watch hears both images
+/// in the block's window, so a detail that names `env` names a program the kernel saw run, while
+/// `line`'s own program never runs.
+fn ran_command(root: &Path, name: &str, line: &str) -> PathBuf {
+    let script = format!(
+        "#!/bin/sh\n\
+         n=\"${{ATERM_SHELL_NONCE:+;id=$ATERM_SHELL_NONCE}}\"\n\
+         printf '\\033]133;A%s\\007$ \\033]133;B%s\\007\\033]633;E;{line}%s\\007\\r\\n\\033]133;C%s\\007' \
+         \"$n\" \"$n\" \"$n\" \"$n\"\n\
+         exec /usr/bin/env /bin/sh -c 'printf \"ran-%s\\r\\n\\033]133;D;0%s\\007\" \"$((40+2))\" \"$1\"' sh \"$n\"\n"
+    );
+    let path = root.join(name);
+    std::fs::write(&path, script).expect("write the run command");
+    path
+}
+
+/// [`marked_command`]'s block, the script sourced (`.`) so the session's shell writes its marks and
+/// then starts `chain` as the block's job, as a shell's integration writes C before it starts a
+/// job; `chain`'s last program is a shell that sleeps a second in a child and writes the output
+/// and D;0: the session's process watch hears each of the job's own images, all after the block's
+/// C, however late its drain. (A job that wrote C itself would have run the typed `sh`, and the
+/// `bash` macOS's `sh` runs, before it: a drain that heard that `exec` after C would place it in
+/// the block.)
+fn exec_in_block(root: &Path, name: &str, line: &str, chain: &str) -> PathBuf {
+    let script = format!(
+        "#!/bin/sh\n\
+         n=\"${{ATERM_SHELL_NONCE:+;id=$ATERM_SHELL_NONCE}}\"\n\
+         printf '\\033]133;A%s\\007$ \\033]133;B%s\\007\\033]633;E;{line}%s\\007\\r\\n\\033]133;C%s\\007' \
+         \"$n\" \"$n\" \"$n\" \"$n\"\n\
+         {chain} -c '/bin/sleep 1; printf \"ran-%s\\r\\n\\033]133;D;0%s\\007\" \"$((40+2))\" \"$1\"' qz \"$n\"\n"
+    );
+    let path = root.join(name);
+    std::fs::write(&path, script).expect("write the block's chain");
+    path
+}
+
+/// How a privacy plant's block runs: its marks alone ([`marked_command`]), its `env` chain
+/// ([`ran_command`]), or a chain the shell starts as its job ([`exec_in_block`]). A program a child of the
+/// job forks is heard by no watch (it hears the shell's children and their own `exec`s), so a
+/// plant whose programs ran there could not fail for a detail that confirms by what they ran.
+enum PlantRun {
+    Marks,
+    Env,
+    Execs(String),
+}
+
+/// Each `cmd` run of a `log kinds=cmd` read, in the order the runs opened: the `detail=` values
+/// its open and its amends wrote, in order.
+fn cmd_details(cmds: &str) -> Vec<Vec<String>> {
+    let mut runs: Vec<(String, Vec<String>)> = Vec::new();
+    for line in cmds.lines() {
+        let mut words = line.split(' ');
+        let (Some(_), Some(op), Some(run), Some("cmd")) =
+            (words.next(), words.next(), words.next(), words.next())
+        else {
+            continue;
+        };
+        let detail = line
+            .split(' ')
+            .find_map(|w| w.strip_prefix("detail="))
+            .map(str::to_owned);
+        match op {
+            "open" => runs.push((run.to_owned(), detail.into_iter().collect())),
+            "amend" => {
+                if let (Some((_, details)), Some(d)) =
+                    (runs.iter_mut().find(|(r, _)| r == run), detail)
+                {
+                    details.push(d);
+                }
+            }
+            _ => {}
+        }
+    }
+    runs.into_iter().map(|(_, details)| details).collect()
+}
+
 const BOX_TOUCH: &str =
     include_str!("../../../aterm-phase/src/fixtures/claude-2.1.280-box-bash-touch.txt");
 const SPINNER: &str = include_str!("../../../aterm-phase/src/fixtures/spinner-tempering.txt");
@@ -362,6 +447,7 @@ const AFTER_TURN_283: &str =
     include_str!("../../../aterm-phase/src/fixtures/claude-2.1.283-footer-after-turn.txt");
 const OFFER: &str =
     include_str!("../../../aterm-phase/src/fixtures/hand-built-offer-end-of-turn.txt");
+const ASK_ONE: &str = include_str!("../../../aterm-phase/src/fixtures/claude-2.1.281-ask-one.txt");
 
 /// A fixture's screen: the text after its provenance line.
 fn body(fixture: &str) -> String {
@@ -1011,15 +1097,13 @@ fn the_owners_ask_over_the_stream() {
             .any(|l| l.contains(" label ") && l.contains(" by=harness ")),
         "a harness label under the wall: {under_wall}"
     );
-    let ov = until("B's Overview to drop the approval chip", || {
-        let ov = overview(&b);
-        (!ov.contains("need=approval:bash")).then_some(ov)
-    });
-    assert!(
-        ov.contains(&format!(
-            "overview fabric chip node={NODE_A} sid={s} need=wall:usage-weekly"
-        )),
-        "{ov}"
+    let wall_chip = format!("overview fabric chip node={NODE_A} sid={s} need=wall:usage-weekly");
+    until(
+        "B's Overview to replace the approval chip with the wall chip",
+        || {
+            let ov = overview(&b);
+            (!ov.contains("need=approval:bash") && ov.contains(&wall_chip)).then_some(ov)
+        },
     );
     let json = brief_json(&b);
     assert_eq!(
@@ -1112,7 +1196,8 @@ fn the_owners_ask_over_the_stream() {
 /// harness that answers no box (`approve = "none"`): it escalates the box to the person, and that
 /// ask is the need the person is shown (`need=ask sev=decide`), a `shown` mark. The person's
 /// approval closes the box and the harness lifts its ask: a later `shown` mark with no need.
-/// `brief` counts them.
+/// `brief` counts them. The harness's escalate act is in the log before the person answers, and
+/// it and the escalation are the box's, so a fold through the box's close names no need (fix E3).
 #[test]
 fn each_move_of_the_printed_need_is_a_shown_mark() {
     let (_owner, a) = live_world();
@@ -1137,11 +1222,67 @@ fn each_move_of_the_printed_need_is_a_shown_mark() {
         (Some("ask"), Some("decide")),
         "{asked}"
     );
+    // Fix E3 (E2E-3): the harness's escalate act is in the log while the box waits for the
+    // person, and both it and the escalation are the box's.
+    await_log(&a, &s, "kind=act", &at);
+    let recs = || -> Vec<aterm_slog::Rec> {
+        let r = a.verb(&format!("@{s} log n=2000"));
+        assert!(r.ok(), "log: {}", r.header());
+        r.rows()
+            .iter()
+            .filter_map(|l| aterm_slog::decode(l).ok())
+            .collect()
+    };
+    let word = |r: &aterm_slog::Rec| r.f.get_word(aterm_slog::Key::Word);
+    let before = until_on(&a, &s, DEADLINE, "the escalate act", || {
+        let all = recs();
+        all.iter()
+            .any(|r| r.k == aterm_slog::Kind::Act && word(r) == Some("escalate"))
+            .then_some(all)
+    });
+    let the_box = before
+        .iter()
+        .rev()
+        .find(|r| r.op == aterm_slog::Op::Open && r.k == aterm_slog::Kind::Approval)
+        .map(|r| r.node)
+        .expect("the box's step");
+    let on = |kind: aterm_slog::Kind, w: &str| {
+        before
+            .iter()
+            .find(|r| r.op == aterm_slog::Op::Mark && r.k == kind && word(r) == Some(w))
+            .map(|r| r.node)
+    };
+    assert_eq!(
+        (
+            on(aterm_slog::Kind::Act, "escalate"),
+            on(aterm_slog::Kind::Need, "escalated")
+        ),
+        (Some(the_box), Some(the_box)),
+        "the act and the escalation are the box's"
+    );
     let r = a.verb(&format!("@{s} key act=approve 1"));
     assert!(r.ok(), "key act=approve: {}", r.header());
     until("the stand-in to read the approval", || {
         (keys_read(&a, "k1") == ["1"]).then_some(())
     });
+    // The box's close ends its escalation in the same record: a fold of the log through the
+    // close names no need, whenever the harness's clear comes after it.
+    let through_close = until_on(&a, &s, DEADLINE, "the box's close", || {
+        let all = recs();
+        let at = all
+            .iter()
+            .position(|r| r.op == aterm_slog::Op::Close && r.node == the_box)?;
+        Some(all[..=at].to_vec())
+    });
+    let mut fold = aterm_slog::Fold::new(at.1.parse().expect("log_ep"));
+    for r in &through_close {
+        fold.apply(r);
+    }
+    assert_eq!(
+        fold.state().top_observed_need().map(|n| n.word),
+        None,
+        "a fold through the box's close names no need"
+    );
     let rows = until_on(
         &a,
         &s,
@@ -1204,6 +1345,20 @@ fn journals(inst: &Inst) -> Vec<(PathBuf, Vec<u8>)> {
 
 fn holds(bytes: &[u8], needle: &str) -> bool {
     bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
+}
+
+/// Whether `log` (a `@<sid> log` reply) opens a `cmd` run whose fields after its parent begin
+/// with `fields`, whatever run id and parent it was given.
+fn opens_cmd(log: &str, fields: &str) -> bool {
+    let want: Vec<&str> = fields.split_whitespace().collect();
+    log.lines().any(|l| {
+        let w: Vec<&str> = l.split_whitespace().collect();
+        matches!(
+            w.as_slice(),
+            [_, "open", id, "cmd", par, rest @ ..]
+                if id.starts_with('r') && par.starts_with("par=") && rest.starts_with(&want)
+        )
+    })
 }
 
 /// **LEG 1 (D3, 6A-2, 6C-4, U47): THE JOURNAL ACROSS A QUIT AND A KILL.** On the default config
@@ -1274,8 +1429,10 @@ fn the_journal_across_a_quit_and_a_kill() {
     a.launch();
     a.wait_ready(&owner);
     let shell_then = a.text(&format!("@{shell} log"));
+    // The sweep numbers the runs: under load it names the `sh` group in front before the
+    // script prints its OSC 133 C, so a `prog` run can open first and take `r1`.
     assert!(
-        shell_then.contains(" open r1 cmd par=- blk=0 detail=echo ")
+        opens_cmd(&shell_then, "blk=0 detail=echo")
             && shell_then.contains(" close - spawn out=app-quit "),
         "{shell_then}"
     );
@@ -1397,7 +1554,7 @@ fn edge_token(inst: &Inst, dst: &str, src: &str) -> String {
 /// One request over an edge: a connection of its own whose one line presents the edge's token
 /// (`TOKEN <token> <line>`).
 fn edge_request(inst: &Inst, token: &str, line: &str) -> Reply {
-    let stream = std::os::unix::net::UnixStream::connect(&inst.sock).expect("connect to aterm");
+    let stream = aterm_link::ctl::dial(&inst.sock).expect("connect to aterm");
     stream
         .set_read_timeout(Some(DEADLINE))
         .expect("bound the reply's read");
@@ -1979,9 +2136,18 @@ fn restore_store(rel: &Path) -> bool {
 /// records: the presence row's attention (the supervisor's while it stands, the person's), and
 /// the mail's own record, its body and hop (never the post's key, which stays on the node); the
 /// test's own inputs hold what it wrote. Each is recorded with its reason in DESIGN-session-log
-/// §10 (Phase 6, the end to end).
+/// §10 (Phase 6, the end to end). The harness keeps the review it acted on, screen text included
+/// (a reply's last line, a box's command), in its own store, the drive folder (`astate/drive`:
+/// the approval ledger and the loop journal, each 0600 in a 0700 folder, local, never published;
+/// DESIGN §3.6 "Outside the session log", §10 unit E4), and aterm.log keeps only each review
+/// line's words; LEG 7H's stand-in draws its sentinels from its own scene files (`sc/`). An
+/// aterm.toml that stops parsing (LEG 7T, 24, unit E7) is kept where the person wrote it, in the
+/// Messages store's lane row and on stderr, which say the line; aterm.log names only its position
+/// (`aterm_toml::Error::log_words`), as it names the refused `font_family` (7) by its length.
 fn kept_on_disk(rel: &Path) -> Vec<u8> {
-    if rel.starts_with("astate/logs/session-log") {
+    if rel.starts_with("astate/drive") || rel.starts_with("sc") {
+        HARNESS_REVIEW.to_vec()
+    } else if rel.starts_with("astate/logs/session-log") {
         vec![8, 9]
     } else if restore_store(rel) {
         vec![2, 5, 10]
@@ -1997,11 +2163,27 @@ fn kept_on_disk(rel: &Path) -> Vec<u8> {
     .iter()
     .any(|p| rel == Path::new(p))
     {
-        vec![7]
+        vec![7, UNPARSED_TOML]
     } else if rel == Path::new("marked.sh") {
         vec![1]
     } else if rel == Path::new("wrapped.sh") {
         vec![11]
+    } else if rel == Path::new("array.sh") {
+        vec![12]
+    } else if rel == Path::new("comment.sh") {
+        vec![13]
+    } else if rel == Path::new("autocd.sh") {
+        vec![14]
+    } else if rel == Path::new("autocd_made.sh") {
+        vec![15]
+    } else if rel == Path::new("autocd_hook.sh") {
+        vec![16]
+    } else if rel == Path::new("handed.sh") {
+        vec![17]
+    } else if rel == Path::new("alias.sh") {
+        vec![18]
+    } else if rel == Path::new("standin.sh") {
+        vec![19]
     } else if rel == Path::new("title.sh") {
         vec![2]
     } else if rel == Path::new("b.log") {
@@ -2015,7 +2197,7 @@ fn kept_on_disk(rel: &Path) -> Vec<u8> {
 /// from `from` until a `LOG` frame reaches `upto`, each read within the hang detector.
 fn log_frames(inst: &Inst, sid: &str, from: &(String, String), upto: u64) -> String {
     use std::io::{BufRead as _, Write as _};
-    let mut stream = std::os::unix::net::UnixStream::connect(&inst.sock).expect("connect");
+    let mut stream = aterm_link::ctl::dial(&inst.sock).expect("connect");
     stream
         .set_read_timeout(Some(DEADLINE))
         .expect("a read bound");
@@ -2087,7 +2269,7 @@ fn the_privacy_sweep_finds_each_sentinel_only_where_the_design_keeps_it() {
         "a",
         NODE_A,
         Opts {
-            top: "font_family_italic = \"QZP6SECRET7\"\n".into(),
+            top: "font_family = \"QZP6SECRET7\"\nfont_family_italic = \"QZP6SECRET7\"\n".into(),
             config: HARNESS_HANDS_OVER.into(),
             ..Opts::default()
         },
@@ -2100,18 +2282,128 @@ fn the_privacy_sweep_finds_each_sentinel_only_where_the_design_keeps_it() {
     let start = cursor(&a, &x);
 
     // The plants: a command's later word (1); a wrapper's flag value (11), which a program-name
-    // reader without the wrapper's grammar keeps as the program (PRIV-1); a title (2).
-    for (name, line, detail) in [
-        ("marked.sh", "echo QZP6SECRET1 42", "detail=echo"),
-        ("wrapped.sh", "env -C /tmp/QZP6SECRET11 make", "detail=make"),
-    ] {
-        let script = marked_command(&a.root, name, line);
-        type_line(&a, &x, &format!("sh {}", script.display()));
+    // reader without the wrapper's grammar keeps as the program (PRIV-1), its run real so the
+    // kernel can confirm the `env` that ran (its `make` never does); an array's element (12); a
+    // comment's text (13); a lone directory, the line zsh reports when AUTO_CD runs it as `cd` (14:
+    // this world's shell has no AUTO_CD, so its marks report the line); a title (2). A detail names
+    // only a builtin (`echo`, `true`), a program whose file ran, or a program the command's own job
+    // ran standing in for a word that is no program file (H2 rule 2). Which image of a chain the
+    // kernel's merged `exec` notes leave heard depends on when the gather drains them, so the
+    // wrapper's run reads `env`, the `sh` it ran, or none. The directory's path names no file, so
+    // it reads none, and no stand-in: the `sh` that ran the script writing the marks ran before the
+    // block's C. Each later plant's job is programs that are their own images, started once the
+    // block's C is written, which this world's process watch hears ([`exec_in_block`]), each handed
+    // the plant's sentinel path as an argument (`--rcfile`, which a `-c` bash never reads), as a
+    // zoxide-shaped hook or `mkdir` and `cat` are: AUTO_CD into a directory the line made (15) or a
+    // lone one (16) reads none, never the directory, nor its job's program (no program of the
+    // command's own ran); a path handed to a program and then typed (17: `x` a data file) reads
+    // none or the job's program `qzcat` standing in, never `x`; an alias whose expansion runs
+    // `true` handed the sentinel (18) reads none or the `true` that ran (H5 is not built: only a
+    // stand-in names it); one whose expansion is an `env` handed the sentinel (19) that runs
+    // `qzrun` reads `qzrun`, the stand-in, every time: the wrapper never stands in, the job's own
+    // image is heard, and `qzrun` outlives the read (a stand-in is an image read by its file). A
+    // reader confirming a path word by a path an exec was handed (G1's script words, before H1)
+    // reads 15, 16 and 17 by their sentinel's name.
+    let root = a.root.display().to_string();
+    for dir in ["QZP6SECRET15", "QZP6SECRET16", "QZP6SECRET17"] {
+        std::fs::create_dir(a.root.join(dir)).expect("a plant's directory");
+    }
+    std::fs::write(a.root.join("QZP6SECRET17").join("x"), "data\n").expect("a data file");
+    let handed_to = |name: &str, path: &str| {
+        format!(
+            "{} --rcfile {path}",
+            harness::own_image(&a.root, name, "/bin/bash").display()
+        )
+    };
+    let plants: Vec<(&str, String, PlantRun, &[Option<&str>])> = vec![
+        (
+            "marked.sh",
+            "echo QZP6SECRET1 42".into(),
+            PlantRun::Marks,
+            &[Some("echo")],
+        ),
+        (
+            "wrapped.sh",
+            "env -C /tmp/QZP6SECRET11 make".into(),
+            PlantRun::Env,
+            &[None, Some("env"), Some("sh")],
+        ),
+        (
+            "array.sh",
+            "arr=(a QZP6SECRET12 b)".into(),
+            PlantRun::Marks,
+            &[None],
+        ),
+        (
+            "comment.sh",
+            "true # x\\\\x3b QZP6SECRET13 y".into(),
+            PlantRun::Marks,
+            &[Some("true")],
+        ),
+        (
+            "autocd.sh",
+            "~/QZP6SECRET14".into(),
+            PlantRun::Marks,
+            &[None],
+        ),
+        (
+            "autocd_made.sh",
+            format!("mkdir {root}/QZP6SECRET15 && {root}/QZP6SECRET15"),
+            PlantRun::Execs(handed_to("qzmk", &format!("{root}/QZP6SECRET15"))),
+            &[None],
+        ),
+        (
+            "autocd_hook.sh",
+            format!("{root}/QZP6SECRET16"),
+            PlantRun::Execs(handed_to("qzcd", &format!("{root}/QZP6SECRET16"))),
+            &[None],
+        ),
+        (
+            "handed.sh",
+            format!("cat {root}/QZP6SECRET17/x\\\\x3b {root}/QZP6SECRET17/x"),
+            PlantRun::Execs(handed_to("qzcat", &format!("{root}/QZP6SECRET17/x"))),
+            &[None, Some("qzcat")],
+        ),
+        (
+            "alias.sh",
+            "qza".into(),
+            PlantRun::Execs(handed_to("true", &format!("{root}/QZP6SECRET18"))),
+            &[None, Some("true")],
+        ),
+        (
+            "standin.sh",
+            "qzs".into(),
+            PlantRun::Execs(format!(
+                "/usr/bin/env QZP6SECRET19=1 {}",
+                harness::own_image(&a.root, "qzrun", "/bin/bash").display()
+            )),
+            &[Some("qzrun")],
+        ),
+    ];
+    for (i, (name, line, ran, _)) in plants.iter().enumerate() {
+        let (run, script) = match ran {
+            PlantRun::Marks => ("sh", marked_command(&a.root, name, line)),
+            PlantRun::Env => ("sh", ran_command(&a.root, name, line)),
+            PlantRun::Execs(chain) => (".", exec_in_block(&a.root, name, line, chain)),
+        };
+        type_line(&a, &x, &format!("{run} {}", script.display()));
         until_on(&a, &x, DEADLINE, &format!("the run of {name}"), || {
-            a.text(&format!("@{x} log tier=host"))
-                .contains(detail)
-                .then_some(())
+            let cmds = a.text(&format!("@{x} log tier=host kinds=cmd n=400"));
+            let closed = cmds.lines().filter(|l| l.contains(" close ")).count();
+            (closed > i).then_some(())
         });
+    }
+    let cmds = a.text(&format!("@{x} log tier=host kinds=cmd n=400"));
+    let runs = cmd_details(&cmds);
+    assert_eq!(runs.len(), plants.len(), "one run per plant: {cmds}");
+    let mut written: Vec<String> = Vec::new();
+    for ((name, .., allowed), details) in plants.iter().zip(&runs) {
+        let last = details.last().map(String::as_str);
+        assert!(
+            details.iter().all(|d| allowed.contains(&Some(d.as_str()))) && allowed.contains(&last),
+            "{name}: detail {details:?}, not one of {allowed:?}: {cmds}"
+        );
+        written.extend(details.iter().map(|d| format!("detail={d}")));
     }
     let title = a.root.join("title.sh");
     std::fs::write(&title, "printf '\\033]0;QZP6SECRET2\\007'\n").expect("the title script");
@@ -2372,7 +2664,7 @@ fn the_privacy_sweep_finds_each_sentinel_only_where_the_design_keeps_it() {
     });
     eprintln!("found:\n{}", sweep.found.join("\n"));
     let journals = journals(&a);
-    for detail in ["detail=echo", "detail=make"] {
+    for detail in &written {
         assert!(
             journals.iter().any(|(_, bytes)| holds(bytes, detail)),
             "the command's program is kept: {detail}"
@@ -2383,4 +2675,191 @@ fn the_privacy_sweep_finds_each_sentinel_only_where_the_design_keeps_it() {
         "sentinels where the design keeps none:\n{}",
         sweep.leaks.join("\n")
     );
+}
+
+/// LEG 7T's sentinel: the value on an aterm.toml line that does not parse.
+const UNPARSED_TOML: u8 = 24;
+
+/// **LEG 7T (unit E7): AN aterm.toml THAT STOPS PARSING REACHES aterm.log ONLY AS ITS POSITION.**
+/// A's aterm.toml is rewritten while it runs with an unterminated string holding 24 (a value the
+/// person wrote): the config lane refuses it and says so (`native config: Config observation was
+/// not valid TOML: … TOML error at line L, column C`), and after the quit every file under A's
+/// root holds 24 only where the design keeps it: the file itself, the Messages store and stderr.
+#[test]
+fn an_unparsed_aterm_toml_reaches_aterm_log_only_as_its_position() {
+    let owner = Owner::boot();
+    let mut a = Inst::boot(&owner, "a", NODE_A, Opts::default());
+    a.wait_ready(&owner);
+    let x = sids(&a)[0].clone();
+    let config = a.root.join("cfg/aterm/aterm.toml");
+    let text = std::fs::read_to_string(&config).expect("A's config");
+    let refused = "native config: Config observation was not valid TOML: ";
+    assert!(
+        !host_log(&a).contains(refused),
+        "PRECONDITION: A's config parsed at launch"
+    );
+    std::fs::write(
+        &config,
+        format!("{text}font_family = \"QZP6SECRET{UNPARSED_TOML} Mono\n"),
+    )
+    .expect("the rewrite");
+    let line = until_on(&a, &x, DEADLINE, "the lane refuses the rewrite", || {
+        host_log(&a)
+            .lines()
+            .find(|l| l.contains(refused))
+            .map(str::to_string)
+    });
+    quit(&mut a);
+    let mut sweep = Sweep::default();
+    sweep.files("A", &a.root, &kept_on_disk);
+    eprintln!("found:\n{}", sweep.found.join("\n"));
+    assert!(
+        sweep.leaks.is_empty(),
+        "sentinels where the design keeps none:\n{}",
+        sweep.leaks.join("\n")
+    );
+    assert!(
+        line.contains("TOML error at line "),
+        "CONTROL: aterm.log names the position: {line}"
+    );
+    let file = format!("A/cfg/aterm/aterm.toml: [{UNPARSED_TOML}]");
+    assert!(
+        sweep.found.contains(&file),
+        "CONTROL: the file keeps the line ({file}): {:#?}",
+        sweep.found
+    );
+}
+
+/// LEG 7H's sentinels: the reply's last line (21), the box's command (22) and the question and
+/// its options (23).
+const HARNESS_REVIEW: [u8; 3] = [21, 22, 23];
+
+/// LEG 7H's harness: it answers no box and types no continuation, so each scene stays the screen
+/// it reviews, and it answers the question, as the real run's harness did (its `APPROVED` line
+/// names the answer it typed). Its Autopilot stays the default: no host supervises an Off session
+/// (`HarnessHosting::hosts`), so an Off harness would review nothing.
+const HARNESS_REVIEWS_ONLY: &str = "[harness]\napprove = \"none\"\ncontinue = false\n";
+
+/// **LEG 7H (unit E4, E2E-11): THE HARNESS'S REVIEW REACHES aterm.log ONLY AS WORDS.** A
+/// harness-hosted stand-in draws three scenes of its own, each with a sentinel where a real
+/// Claude Code run had one: an idle screen whose reply's last line holds 21, a question whose
+/// words and options hold 23, and a Bash box whose command holds 22. Each scene's review reaches
+/// the loop journal in the drive store with its sentinel (the review's own store, by design) and
+/// aterm.log as its lines' words (`harness @<s>: EVENT idle seq=<n> text=<n>B`, `APPROVED`,
+/// `EVENT prompt`); after the quit, every file under A's root holds a sentinel only where the
+/// design keeps one.
+#[test]
+fn the_harness_review_reaches_aterm_log_only_as_words() {
+    let owner = Owner::boot();
+    let mut a = Inst::boot(
+        &owner,
+        "a",
+        NODE_A,
+        Opts {
+            config: HARNESS_REVIEWS_ONLY.into(),
+            ..Opts::default()
+        },
+    );
+    a.wait_ready(&owner);
+    write_fake(&a, "resets in 1m");
+    let idle = aterm_agent::supervise::prompt::fixtures::screen(AFTER_TURN_283);
+    let reply: Vec<String> = idle
+        .iter()
+        .flat_map(|row| {
+            let said = row
+                .starts_with("✻ Worked for")
+                .then(|| "⏺ QZP6SECRET21 is the reply's last line".to_string());
+            said.into_iter().chain([row.clone()])
+        })
+        .collect();
+    let ask = body(ASK_ONE)
+        .replace("Which tea would you prefer?", "QZP6SECRET23 which tea?")
+        .replace("❯ 1. Green", "❯ 1. QZP6SECRET23 green")
+        .replace("  2. Black", "  2. QZP6SECRET23 black");
+    let box22 = body(BOX_TOUCH)
+        .replace("  ⎿  $ touch x\n", "  ⎿  $ touch QZP6SECRET22\n")
+        .replace("\n   touch x\n", "\n   touch QZP6SECRET22\n");
+    let sc = a.root.join("sc");
+    // Each scene holds its sentinel where the screen does: the reply row; the question and its
+    // options; the box's tool row and its command row.
+    for (name, text, plant, rows) in [
+        ("reply.gate", reply.join("\n") + "\n", "QZP6SECRET21", 1),
+        ("ask.gate", ask, "QZP6SECRET23", 3),
+        ("box22.gate", box22, "QZP6SECRET22", 2),
+    ] {
+        assert_eq!(text.matches(plant).count(), rows, "{name}: {text}");
+        std::fs::write(sc.join(name), text).expect("a scene");
+    }
+    let s = spawn_tab(&a);
+    start_fake(
+        &a,
+        &s,
+        "k7h",
+        &["busy.gate", "reply.gate", "ask.gate", "box22.gate"],
+    );
+    program_is(&a, &s, "claude");
+    until_on(&a, &s, DEADLINE, "the host attached", || {
+        kv(&status_of(&a, &s), "supervisor")
+            .is_some_and(|v| v.starts_with("aterm-harness"))
+            .then_some(())
+    });
+    // Each scene's review: its sentinel in the journal and one more line of its kind in aterm.log
+    // (the question is a box the harness answers: `APPROVED seq=<n> <the answer it typed>`).
+    let journal = a.root.join(format!("astate/drive/{s}.journal.jsonl"));
+    let logged_as = |head: &str| {
+        let line = format!("harness @{s}: {head}");
+        host_log(&a).lines().filter(|l| l.contains(&line)).count()
+    };
+    for (gate, plant, head) in [
+        (1, 21, "EVENT idle seq="),
+        (2, 23, "APPROVED seq="),
+        (3, 22, "EVENT prompt seq="),
+    ] {
+        let before = logged_as(head);
+        release(&a, "k7h", gate);
+        until_on(
+            &a,
+            &s,
+            DEADLINE,
+            &format!(
+                "the review of scene {} in the journal and aterm.log",
+                gate + 1
+            ),
+            || {
+                let journaled = sentinels(&std::fs::read(&journal).unwrap_or_default());
+                (journaled.contains(&plant) && logged_as(head) > before).then_some(())
+            },
+        );
+    }
+    quit(&mut a);
+    let mut sweep = Sweep::default();
+    sweep.files("A", &a.root, &kept_on_disk);
+    eprintln!("found:\n{}", sweep.found.join("\n"));
+    assert!(
+        sweep.leaks.is_empty(),
+        "sentinels where the design keeps none:\n{}",
+        sweep.leaks.join("\n")
+    );
+    let drive = format!("A/astate/drive/{s}.journal.jsonl: {HARNESS_REVIEW:?}");
+    assert!(
+        sweep.found.contains(&drive),
+        "CONTROL: the loop journal keeps the review it acted on ({drive}): {:#?}",
+        sweep.found
+    );
+    let logged = host_log(&a);
+    for event in ["EVENT idle seq=", "APPROVED seq=", "EVENT prompt seq="] {
+        let words = logged
+            .lines()
+            .find_map(|l| {
+                l.split_once(&format!("harness @{s}: {event}"))
+                    .map(|(_, w)| w)
+            })
+            .unwrap_or_else(|| panic!("CONTROL: aterm.log names {event}"));
+        assert!(
+            words
+                .split_whitespace()
+                .any(|w| w.starts_with("text=") && w.ends_with('B')),
+            "CONTROL: {event} is logged with its text's length: {words}"
+        );
+    }
 }

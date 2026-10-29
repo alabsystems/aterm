@@ -3,8 +3,9 @@
 
 //! THE REMAINING §4.1 MARKS (plan §3.2).
 
+use aterm_core::terminal::program_state::{ProgramState, ProgramStateWord};
 use aterm_slog::{
-    Amend, BoundedText, BoundedToken, Conf, Fields, Key, Kind, Mark, Node, Src, Stamp, Val,
+    Amend, BoundedText, BoundedToken, Claimed, Conf, Fields, Key, Kind, Mark, Node, Src, Stamp, Val,
 };
 
 use super::{SessionLog, name_fp, tok, with};
@@ -17,6 +18,41 @@ pub(crate) const PROGRAM_BURST: u64 = 20;
 /// Past the burst, a program's run earns one program mark this often (monotonic ms).
 pub(crate) const PROGRAM_REFILL_MS: u64 = 1_000;
 const PROGRAM_FULL_MILLI: u64 = PROGRAM_BURST * 1_000;
+
+/// WHAT THE SUPERVISOR'S ATTENTION ESCALATES ([`SessionLog::observe_meta`], fix E3): read from
+/// the owners map's effective entry, its owner and the kind its writer named, never its text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Escalated {
+    /// The supervisor holds no effective entry: nothing is escalated.
+    Off,
+    /// The supervisor's effective entry asks the person (`kind=ask`, or no `kind=`, which the need
+    /// classifier reads as an ask and which the harness's box and question asks name): the
+    /// escalation is the open approval or question step's while one is open, else the session's.
+    Ask,
+    /// The supervisor waits something out by itself (`kind=wait`): the session's escalation.
+    Wait,
+}
+
+impl Escalated {
+    /// Whether the supervisor holds the effective entry (`supervisor`), whose writer named `kind`.
+    #[must_use]
+    pub(crate) const fn of(
+        supervisor: bool,
+        kind: Option<aterm_types::needs::AttentionKind>,
+    ) -> Self {
+        match (supervisor, kind) {
+            (false, _) => Escalated::Off,
+            (true, Some(aterm_types::needs::AttentionKind::Wait)) => Escalated::Wait,
+            (true, _) => Escalated::Ask,
+        }
+    }
+
+    /// Whether anything is escalated.
+    #[must_use]
+    pub(crate) const fn on(self) -> bool {
+        !matches!(self, Escalated::Off)
+    }
+}
 
 /// A THROTTLED MARK CLASS'S BUCKET.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,21 +93,36 @@ impl MarkBucket {
 pub(crate) struct ProgramWords {
     pub(crate) state: &'static str,
     pub(crate) ask: Option<&'static str>,
+    /// What it claims of its turn (`None`: no report shown), which a codex-alab's turns follow
+    /// ([`SessionLog::claim_turn`]).
+    pub(crate) claimed: Option<Claimed>,
 }
 
 impl ProgramWords {
     /// The words of the shown report `shown` (`None`: none shown).
-    pub(crate) fn of(shown: Option<aterm_core::terminal::program_state::ProgramState>) -> Self {
+    pub(crate) fn of(shown: Option<ProgramState>) -> Self {
         shown.map_or(
             ProgramWords {
                 state: "none",
                 ask: None,
+                claimed: None,
             },
             |s| ProgramWords {
                 state: s.state.as_str(),
                 ask: s.kind.map(|k| k.as_str()),
+                claimed: Some(claimed_of(s.state)),
             },
         )
+    }
+}
+
+/// What a report of `word` claims of its turn: `working` and `blocked` that one runs, `idle` and
+/// `done` that it rested, `error` that it failed.
+const fn claimed_of(word: ProgramStateWord) -> Claimed {
+    match word {
+        ProgramStateWord::Working | ProgramStateWord::Blocked => Claimed::Working,
+        ProgramStateWord::Idle | ProgramStateWord::Done => Claimed::Rested,
+        ProgramStateWord::Error => Claimed::Failed,
     }
 }
 
@@ -205,6 +256,11 @@ pub(crate) struct Observed {
     title: Option<u64>,
     /// Whether the effective attention owner was the supervisor's when a meta write last said.
     escalated: Option<bool>,
+    /// The approval or question step the supervisor's ask was last raised on
+    /// ([`SessionLog::observe_meta`], [`SessionLog::carry_escalation`]): `None` once the ask is
+    /// lifted, a wait, or raised on `-`. Never carried: a successor's restore starts it unset, so
+    /// it carries no ask across an update until the supervisor's next write.
+    esc_step: Option<Node>,
     /// Each meta field's value as the log last said it.
     meta: Vec<(String, u64)>,
     /// The program marks' bucket.
@@ -374,6 +430,24 @@ impl SessionLog {
             .unwrap_or(Node::SESSION)
     }
 
+    fn codex_run(&self) -> Option<Node> {
+        self.agent
+            .as_ref()
+            .filter(|a| {
+                self.log.is_open(a.node)
+                    && match a.who {
+                        aterm_phase::Program::Codex => true,
+                        aterm_phase::Program::Claude
+                        | aterm_phase::Program::Grok
+                        | aterm_phase::Program::Kimi
+                        | aterm_phase::Program::Agy
+                        | aterm_phase::Program::Muse
+                        | aterm_phase::Program::Generic => false,
+                    }
+            })
+            .map(|a| a.node)
+    }
+
     fn claude_run(&self) -> Option<Node> {
         self.agent
             .as_ref()
@@ -453,14 +527,23 @@ impl SessionLog {
         }
     }
 
-    /// `mark <run> program state= [ask=] [coalesced=]`.
-    pub(crate) fn observe_program(
-        &mut self,
-        shown: Option<aterm_core::terminal::program_state::ProgramState>,
-        at: Stamp,
-    ) {
+    /// `mark <run> program state= [ask=] [coalesced=]`, and a codex-alab's turn by each one
+    /// written ([`Self::claim_turn`]).
+    pub(crate) fn observe_program(&mut self, shown: Option<ProgramState>, at: Stamp) {
         let words = ProgramWords::of(shown);
         let run = self.front_run();
+        self.enter_program_run(run, at);
+        let p = &mut self.observed.program;
+        p.pending = Some(match p.pending {
+            Some((_, replaced)) => (words, replaced.saturating_add(1)),
+            None => (words, 0),
+        });
+        self.write_program(at, false);
+    }
+
+    /// The program bucket's run is `run` from now: a new one first writes the last run's pending
+    /// state, then starts full with none pending.
+    fn enter_program_run(&mut self, run: Node, at: Stamp) {
         if self.observed.program.run != Some(run) {
             self.write_program(at, true);
             self.observed.program = ProgramMarks {
@@ -469,12 +552,71 @@ impl SessionLog {
                 pending: None,
             };
         }
-        let p = &mut self.observed.program;
-        p.pending = Some(match p.pending {
-            Some((_, replaced)) => (words, replaced.saturating_add(1)),
-            None => (words, 0),
-        });
-        self.write_program(at, false);
+    }
+
+    /// THE EDGES NO SHOWN MOVE CLAIMS ([`crate::program_state::ProgramStateGate::observe_fed`]),
+    /// oldest first, at `at`'s sweep: each moves the codex run's claimed turns ([`Self::claim_turn`])
+    /// through `aterm_slog::TurnTracker::claim_edge`, dated at its parse batch's wall clock
+    /// ([`super::stamp_at_wall`]; the sweep's stamp where the batch read none), and a beginning
+    /// that would open a turn pays one token of the run's program bucket for it, opening none on a
+    /// refusal. It writes no mark. Nothing moves unless the run in front is a codex's. Answers
+    /// whether a record was written.
+    pub(crate) fn observe_program_edges(
+        &mut self,
+        fed: &[crate::program_state::FedEdge],
+        at: Stamp,
+    ) -> bool {
+        let run = self.front_run();
+        if self.codex_run() != Some(run) {
+            return false;
+        }
+        self.enter_program_run(run, at);
+        self.reconcile_person(at);
+        self.resync();
+        let seq0 = self.log.last_seq();
+        let Self {
+            log,
+            agent,
+            observed,
+            ..
+        } = self;
+        if let Some(a) = agent.as_mut() {
+            for edge in fed {
+                let (claimed, wall_ms) = match *edge {
+                    crate::program_state::FedEdge::Began(ms) => (Claimed::Working, ms),
+                    crate::program_state::FedEdge::Ended(word, ms) => (claimed_of(word), ms),
+                };
+                let edge_at = super::stamp_at_wall(at, wall_ms.unwrap_or(at.wall_ms));
+                let _ = a.tracker.claim_edge(log, claimed, edge_at, &mut || {
+                    observed.program.bucket.spend(at.mono_ms, false)
+                });
+            }
+        }
+        log.last_seq() != seq0
+    }
+
+    /// THE CLAIM'S TURNS: a codex-alab's screen opens no turn, so its run's turns follow the
+    /// program marks written on it: `working` (or `blocked` in one) opens one and `idle`, `done`
+    /// or `error` closes it, at `src=engine conf=claim` (`aterm_slog::TurnTracker::claim`), each
+    /// with its duration whatever its rollout tap binds; while a rollout is read `state=on` it
+    /// opens its own turns and the claim stands aside, one read `state=partial` adds to the
+    /// claim's and opens a turn only where none runs (fix E1), which the next `working` takes as
+    /// the turn running. A shown move's turn moves with its written mark, and an edge no shown
+    /// move claims moves it through [`Self::observe_program_edges`]; the run's bucket bounds both,
+    /// so a program flapping faster than the bucket opens no more turns than the bucket pays for.
+    /// Past the bucket's burst a rest and the next `working` inside one refill coalesce into the
+    /// newest mark: the rest's edge still ends its turn, but the next turn opens only once its
+    /// `working` is written, so one whose rest replaced that `working` first is no claimed turn.
+    fn claim_turn(&mut self, run: Node, claimed: Claimed, at: Stamp) {
+        if self.codex_run() != Some(run) {
+            return;
+        }
+        self.reconcile_person(at);
+        self.resync();
+        let Self { log, agent, .. } = self;
+        if let Some(a) = agent.as_mut() {
+            let _ = a.tracker.claim(log, claimed, at);
+        }
     }
 
     /// THE PROGRAM BUCKET'S TICK.
@@ -516,6 +658,9 @@ impl SessionLog {
             (replaced > 0).then_some(Val::U(replaced)),
         );
         self.put(Kind::Program, Src::Engine, Conf::Claim, node, f, at);
+        if let Some(claimed) = words.claimed {
+            self.claim_turn(node, claimed, at);
+        }
     }
 
     /// `mark - shown [need= sev=] [held=] [coalesced=]`.
@@ -596,15 +741,53 @@ impl SessionLog {
         let Some(run) = self.claude_run() else {
             return;
         };
-        if let Some(pct) = ctx_pct {
+        let strong = (Src::Screen, Conf::Strong);
+        self.mark_ctx_and_goal(
+            run,
+            ctx_pct.map(|pct| (pct, strong)),
+            goal.map(|goal| (goal, strong)),
+            at,
+        );
+    }
+
+    /// CODEX'S OWN COUNTS, marked as Claude Code's screen facts are ([`Self::observe_screen_facts`]):
+    /// the context its rollout says is left (`pct`, read off the record: exact) and the goal
+    /// codex-alab's session record names (its claim), on the codex run.
+    pub(crate) fn observe_codex_facts(
+        &mut self,
+        ctx_pct: Option<u8>,
+        goal: Option<bool>,
+        at: Stamp,
+    ) {
+        let Some(run) = self.codex_run() else {
+            return;
+        };
+        self.mark_ctx_and_goal(
+            run,
+            ctx_pct.map(|pct| (pct, (Src::Transcript, Conf::Exact))),
+            goal.map(|goal| (goal, (Src::Meta, Conf::Claim))),
+            at,
+        );
+    }
+
+    /// The context left at each tenth it crosses and the goal as it goes on and off (a first
+    /// reading of no goal says nothing), each with its source and confidence.
+    fn mark_ctx_and_goal(
+        &mut self,
+        run: Node,
+        ctx: Option<(u8, (Src, Conf))>,
+        goal: Option<(bool, (Src, Conf))>,
+        at: Stamp,
+    ) {
+        if let Some((pct, (src, conf))) = ctx {
             let tenth = pct.min(100) / 10;
             if self.observed.ctx != Some(tenth) {
                 self.observed.ctx = Some(tenth);
                 let f = with(Fields::new(), Key::Pct, Some(Val::U(u64::from(pct))));
-                self.put(Kind::Ctx, Src::Screen, Conf::Strong, run, f, at);
+                self.put(Kind::Ctx, src, conf, run, f, at);
             }
         }
-        if let Some(goal) = goal
+        if let Some((goal, (src, conf))) = goal
             && self.observed.goal != Some(goal)
         {
             let first = self.observed.goal.is_none();
@@ -612,7 +795,7 @@ impl SessionLog {
             if goal || !first {
                 let word = if goal { "on" } else { "off" };
                 let f = with(Fields::new(), Key::State, Some(Val::Word(word)));
-                self.put(Kind::Goal, Src::Screen, Conf::Strong, run, f, at);
+                self.put(Kind::Goal, src, conf, run, f, at);
             }
         }
     }
@@ -983,11 +1166,17 @@ impl SessionLog {
     }
 
     /// `mark - meta field=<f> value=<v>` from
-    /// [`crate::session_timeline::SessionTimeline::record_meta_change`].
+    /// [`crate::session_timeline::SessionTimeline::record_meta_change`], and the escalation the
+    /// supervisor's attention raises or lifts ([`Escalated`], fix E3): `mark <step> need
+    /// word=escalated` on the open approval or question step for an ask
+    /// ([`aterm_slog::Log::open_decision_step`]), so the step's close ends it, else on `-`; the
+    /// lift is `mark - clear word=escalated`. An ask the supervisor moves to another box's words
+    /// with no unset between, once the fold holds no escalation (the first box's close ended
+    /// it), is raised again by the same rule.
     pub(crate) fn observe_meta(
         &mut self,
         change: crate::session_timeline::MetaChange<'_>,
-        escalated: bool,
+        escalated: Escalated,
         at: Stamp,
     ) {
         let land_at = change.land_at.map(|ms| ms.div_euclid(1000));
@@ -995,6 +1184,7 @@ impl SessionLog {
             None => name_fp(change.value),
             Some(s) => name_fp(Some(&format!("{}\u{0}{s}", change.value.unwrap_or("")))),
         };
+        let known = self.observed.meta.iter().any(|(f, _)| f == change.field);
         let moved = self.observed.meta_moved(change.field, fp);
         let mut f = Fields::new();
         if let Some(t) = BoundedToken::new(Key::Field, change.field) {
@@ -1022,21 +1212,101 @@ impl SessionLog {
                 .fields(f),
             at,
         );
-        let was = self.observed.escalated.replace(escalated).unwrap_or(false);
-        if was == escalated {
+        let on = escalated.on();
+        if escalated != Escalated::Ask {
+            self.observed.esc_step = None;
+        }
+        let was = self.observed.escalated.replace(on).unwrap_or(false);
+        let raised_again = was
+            && on
+            && known
+            && moved
+            && change.field == crate::session_timeline::MetaField::Attention.wire_name()
+            && !self.holds_escalation();
+        if was == on && !raised_again {
             return;
         }
-        let kind = if escalated { Kind::Need } else { Kind::Clear };
+        let (kind, node) = if on {
+            let step = match escalated {
+                Escalated::Ask => self.log.open_decision_step(),
+                Escalated::Off | Escalated::Wait => None,
+            };
+            (Kind::Need, step.unwrap_or(Node::SESSION))
+        } else {
+            (Kind::Clear, Node::SESSION)
+        };
+        self.write_escalation(kind, node, at);
+    }
+
+    /// `mark <node> need|clear word=escalated src=meta`, noting the step a raise names
+    /// ([`Observed::esc_step`]).
+    fn write_escalation(&mut self, kind: Kind, node: Node, at: Stamp) {
         let f = Fields::new()
             .word(Key::Word, "escalated")
             .unwrap_or_default();
-        let _ = self.log.mark(
+        let wrote = self.log.mark(
             Mark::new(kind, Src::Meta, Conf::Strong)
-                .at(Node::SESSION)
+                .at(node)
                 .by(aterm_slog::Actor::Aterm)
                 .fields(f),
             at,
         );
+        self.observed.esc_step =
+            (wrote.is_ok() && kind == Kind::Need && node != Node::SESSION).then_some(node);
+    }
+
+    /// THE ASK A BOX'S CLOSE DID NOT ANSWER (fix E3 review), after each move of the agent verdict
+    /// ([`crate::session_timeline::SessionTimeline`]'s one verdict writer): the supervisor's ask
+    /// raised on an approval or question step ends with that step's close, but a close no input
+    /// dismissed (`out=passed` with no `by=`: the verdict flickered off the box, or an input stall
+    /// stood over it) answered nothing, and the supervisor's ask still stands over the box. When
+    /// the next approval or question step opens in the same turn with that ask standing and the
+    /// fold holding no escalation, the ask is raised again on it, by the rule
+    /// [`Self::observe_meta`] raises it, so the reopened box's close ends it. A close an input
+    /// dismissed (`by=human`, `by=ctl`, …) was the answer: the next box's escalation is the
+    /// supervisor's to raise at its next look, never carried. While no such step is open (the
+    /// stall itself) nothing is written: the stall's own need stands, and the escalation comes
+    /// back with the box.
+    pub(crate) fn carry_escalation(&mut self, at: Stamp) {
+        let Some(was) = self.observed.esc_step else {
+            return;
+        };
+        if self.log.is_open(was) {
+            return;
+        }
+        let Some(step) = self.log.open_decision_step() else {
+            return;
+        };
+        self.observed.esc_step = None;
+        if self.observed.escalated != Some(true)
+            || self.holds_escalation()
+            || !self.closed_unanswered(was)
+            || self.log.parent_of(was).is_none()
+            || self.log.parent_of(was) != self.log.parent_of(step)
+        {
+            return;
+        }
+        self.write_escalation(Kind::Need, step, at);
+    }
+
+    /// Whether `step`'s close, still in the window, dismissed nothing: `out=passed` with no
+    /// input bound to it (`by=` nobody, the turn tracker's attribution, §2.5).
+    fn closed_unanswered(&self, step: Node) -> bool {
+        self.log
+            .window()
+            .rev()
+            .find(|r| r.op == aterm_slog::Op::Close && r.node == step)
+            .is_some_and(|r| r.by == aterm_slog::Actor::Nobody && r.out() == Some("passed"))
+    }
+
+    /// Whether the fold holds an escalation the supervisor's attention raised (`src=meta`).
+    fn holds_escalation(&self) -> bool {
+        self.log
+            .state()
+            .needs
+            .iter()
+            .flatten()
+            .any(|n| n.word == "escalated" && n.src == Src::Meta)
     }
 
     /// A WORKER'S TASK MOVED.

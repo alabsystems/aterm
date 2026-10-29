@@ -7,12 +7,11 @@ use crate::explain::{Context, deck_cause};
 use crate::history::Filling;
 use crate::jobs::Verdict;
 use crate::model::{
-    CapBasis, DiskLevel, HeatCell, LinkKind, NetState, NoFigure, Pressure, ProcScope, Resource,
-    ResourceView, RowFacts, ScopeFig, Snapshot, State, TabView, VolumeSample,
+    CapBasis, DiskLevel, HeatCell, LinkKind, MemSample, NetState, NoFigure, Pressure, ProcScope,
+    Resource, ResourceView, RowFacts, ScopeFig, Snapshot, State, VolumeSample,
 };
 use crate::peaks::{NET_LEARN_S, TOKENS_LEARN_S};
 use crate::ring::BUCKET_MS;
-use crate::trend::Motion;
 
 /// Noise gate for CPU core-count motion (`0.1` cores).
 pub const CORES_GATE: f32 = 0.1;
@@ -85,114 +84,6 @@ pub fn disk(bytes: u64) -> String {
     } else {
         format!("{:.0} MB", b / 1e6)
     }
-}
-
-fn motion_suffix(m: Motion) -> String {
-    m.word().map(|w| format!(", {w}")).unwrap_or_default()
-}
-
-/// Format the Global scope summary sentence.
-#[must_use]
-pub fn global_sentence(s: &Snapshot) -> String {
-    let mut parts = Vec::new();
-    if let Some(cpu) = s.cpu.as_ref() {
-        parts.push(format!(
-            "{} of {} cores busy{}",
-            cores(cpu.busy.level),
-            cpu.total(),
-            motion_suffix(cpu.busy.motion(CORES_GATE))
-        ));
-    }
-    if let Some(g) = s.gpu.as_ref() {
-        parts.push(format!("GPU {:.0}%", (g.load.raw * 100.0).round()));
-    }
-    if let Some(m) = s.mem.as_ref() {
-        let used = m.sample.used();
-        let mut w = format!(
-            "memory {} of {} GiB used",
-            gib_figure(used),
-            gib_total(m.sample.total)
-        );
-        if m.sample.pressure != Pressure::Unknown {
-            w.push_str(&format!(", pressure {}", m.sample.pressure.word()));
-        }
-        parts.push(w);
-        if m.sample.swap_used == 0 {
-            parts.push("swap 0".into());
-        } else {
-            parts.push(format!("swap {}", mem(m.sample.swap_used)));
-        }
-    }
-    if let Some(v) = s.volume.as_ref() {
-        parts.push(format!("disk {} free", disk(v.available)));
-    }
-    if parts.is_empty() {
-        return "Global: not read yet.".into();
-    }
-    format!("Global: {}.", parts.join("; "))
-}
-
-/// Format the `aterm` scope summary sentence.
-#[must_use]
-pub fn aterm_sentence(s: &Snapshot) -> String {
-    let Some(a) = s.aterm.as_ref() else {
-        return "aterm: measuring.".into();
-    };
-    let mut first = format!("{} cores", cores(a.cores.level));
-    if let Some(busy) = s.cpu.as_ref().map(|c| c.busy.level).filter(|b| *b > 0.05) {
-        let share = (a.cores.level / busy * 100.0).round().clamp(0.0, 100.0);
-        first.push_str(&format!(", {share:.0}% of busy"));
-    }
-    let mut parts = vec![first];
-    if let Some(f) = a.footprint {
-        parts.push(format!(
-            "{}{}",
-            mem(f),
-            motion_suffix(a.footprint_gib.motion(FOOTPRINT_GATE_GIB))
-        ));
-    }
-    parts.push(format!(
-        "{} process{}",
-        a.procs,
-        if a.procs == 1 { "" } else { "es" }
-    ));
-    format!("aterm: {}.", parts.join("; "))
-}
-
-/// Format a single tab's summary sentence.
-#[must_use]
-pub fn tab_sentence(t: &TabView) -> String {
-    let mut parts = Vec::new();
-    if !t.program.is_empty() {
-        parts.push(t.program.clone());
-    }
-    parts.push(format!(
-        "{} cores{}",
-        cores(t.scope.cores.level),
-        motion_suffix(t.scope.cores.motion(CORES_GATE))
-    ));
-    if let Some(f) = t.scope.footprint {
-        parts.push(mem(f));
-    }
-    if let Some((name, c)) = t.scope.top.as_ref().filter(|(_, c)| *c >= 0.1)
-        && *name != t.program
-    {
-        parts.push(format!("busiest {name} {}c", cores(*c)));
-    }
-    format!("{}: {}.", t.label, parts.join("; "))
-}
-
-/// Format the compact Deck CPU figure (`3.1c/10▴`).
-#[must_use]
-pub fn cores_figure(level: f32, total: Option<usize>, motion: Motion) -> String {
-    let mut s = format!("{}c", cores(level));
-    if let Some(n) = total {
-        s.push_str(&format!("/{n}"));
-    }
-    if let Some(g) = motion.glyph() {
-        s.push(g);
-    }
-    s
 }
 
 const GIB: f64 = 1_073_741_824.0;
@@ -635,12 +526,6 @@ pub fn up_words(age_ms: Option<u64>, partial: bool) -> Option<String> {
     ))
 }
 
-/// A program group's age in words at `at_unix_ms` ([`up_words`]).
-#[must_use]
-pub fn program_age(g: &crate::model::ProgramGroup, at_unix_ms: i64) -> Option<String> {
-    up_words(g.age_ms(at_unix_ms), g.unborn > 0)
-}
-
 /// Format a `[0.0, 1.0]` share for the `%` column (`0%`, `<1%`, `12%`).
 #[must_use]
 pub fn pct(share: Option<f32>) -> String {
@@ -790,7 +675,7 @@ fn freed_today(facts: &RowFacts) -> Option<u64> {
 
 fn disk_shapes(view: &ResourceView) -> Option<(Option<(String, String)>, String)> {
     let used = view.now?.max(0.0) as u64;
-    let alone = format!("{} used", bytes_dec(used));
+    let alone = format!("{} unavailable", bytes_dec(used));
     let both = view
         .capacity
         .map(|c| c as u64)
@@ -799,8 +684,8 @@ fn disk_shapes(view: &ResourceView) -> Option<(Option<(String, String)>, String)
             let p = parts_of(total, &[used, total.saturating_sub(used)]);
             let (u, t, unit) = (&p.parts[0], &p.whole, p.unit);
             (
-                format!("{u} of {t} {unit} used"),
-                format!("{u}/{t} {unit} used"),
+                format!("{u} of {t} {unit} unavailable"),
+                format!("{u}/{t} {unit} unavailable"),
             )
         });
     Some((both, alone))
@@ -1891,16 +1776,213 @@ pub fn disk_wrong(snap: &Snapshot, loc: &Locale) -> Option<String> {
     Some(format!("Yes. {fact}{action}"))
 }
 
-/// Format the Disk lens used/free/total volume space line.
+/// Format used, writable available and total volume bytes, each in a readable decimal unit.
 #[must_use]
 pub fn disk_space_line(v: &VolumeSample) -> String {
-    let free = v.available.min(v.total);
-    let p = parts_of(v.total, &[v.total - free, free]);
-    let u = p.unit;
     format!(
-        "{} {u} used · {} {u} free · {} {u}",
-        p.parts[0], p.parts[1], p.whole
+        "{} used · {} available · {} total",
+        bytes_dec(v.occupied()),
+        bytes_dec(v.available.min(v.total)),
+        bytes_dec(v.total)
     )
+}
+
+/// Format used, available (free plus reclaimable file cache) and total physical memory.
+#[must_use]
+pub fn memory_space_line(m: &MemSample) -> String {
+    let available = m.available().map_or_else(
+        || "available not reported".into(),
+        |bytes| format!("{} GiB available", gib_figure(bytes)),
+    );
+    format!(
+        "{} GiB used · {available} · {} GiB total",
+        gib_figure(m.used()),
+        gib_total(m.total)
+    )
+}
+
+/// Capacity and hardware facts kept visible in the monitor, with compact forms for narrow rows.
+#[must_use]
+pub fn monitor_capacity(res: Resource, snap: &Snapshot) -> Vec<String> {
+    match res {
+        Resource::Cpu => {
+            let Some(total) = snap.total_cores() else {
+                return Vec::new();
+            };
+            let Some(busy) = snap.cpu.as_ref().and_then(|cpu| cpu.current_busy()) else {
+                return vec![
+                    format!("{total} cores total · utilization unavailable"),
+                    format!("{total} cores · usage unavailable"),
+                ];
+            };
+            let idle = (total as f32 - busy).max(0.0);
+            vec![
+                format!(
+                    "{} cores busy · {} idle · {} total",
+                    cores(busy),
+                    cores(idle),
+                    total
+                ),
+                format!(
+                    "{}/{} cores busy · {} idle",
+                    cores(busy),
+                    total,
+                    cores(idle)
+                ),
+            ]
+        }
+        Resource::Memory => snap
+            .mem
+            .as_ref()
+            .filter(|m| m.sample.total > 0)
+            .map_or_else(Vec::new, |m| {
+                let s = &m.sample;
+                let available = s.available().map_or_else(
+                    || "avail not reported".into(),
+                    |bytes| format!("{}GiB avail", gib_total(bytes)),
+                );
+                let compact = format!(
+                    "{}/{}GiB used · {available}",
+                    gib_total(s.used()),
+                    gib_total(s.total),
+                );
+                vec![
+                    memory_space_line(s),
+                    format!(
+                        "{}/{} GiB used · {}",
+                        gib_total(s.used()),
+                        gib_total(s.total),
+                        available.replace("GiB", " GiB")
+                    ),
+                    compact,
+                    format!(
+                        "{}/{}GiB used · {available}",
+                        gib_total(s.used()),
+                        gib_total(s.total)
+                    ),
+                ]
+            }),
+        Resource::Disk => snap
+            .volume
+            .as_ref()
+            .filter(|v| v.total > 0)
+            .map_or_else(Vec::new, |v| {
+                let p = parts_of(
+                    v.total,
+                    &[v.occupied(), v.total.saturating_sub(v.occupied())],
+                );
+                let compact = format!(
+                    "{}/{}{} used · {} avail",
+                    p.parts[0],
+                    p.whole,
+                    p.unit,
+                    bytes_dec(v.available.min(v.total)).replace(' ', "")
+                );
+                vec![
+                    disk_space_line(v),
+                    format!(
+                        "{}/{} {} used · {} avail",
+                        p.parts[0],
+                        p.whole,
+                        p.unit,
+                        bytes_dec(v.available.min(v.total))
+                    ),
+                    compact,
+                    format!(
+                        "{}/{}{} used · {} avail",
+                        p.parts[0],
+                        if p.whole.contains('.') {
+                            p.whole.trim_end_matches('0').trim_end_matches('.')
+                        } else {
+                            &p.whole
+                        },
+                        p.unit,
+                        bytes_dec(v.available.min(v.total)).replace(' ', "")
+                    ),
+                ]
+            }),
+        Resource::Gpu => {
+            let Some(g) = snap.gpu_sample() else {
+                return Vec::new();
+            };
+            let name = g
+                .name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+                .unwrap_or("GPU");
+            if name == "GPU" && g.cores.is_none() && g.in_use_bytes.is_none() {
+                return Vec::new();
+            }
+            let cores = g.cores.map(|n| format!(" · {n} cores")).unwrap_or_default();
+            let memory = g
+                .in_use_bytes
+                .map(|n| format!(" · {} in use", mem(n)))
+                .unwrap_or_default();
+            let short = compact_cpu_brand(name);
+            let mut forms = vec![
+                format!("{name}{cores}{memory}"),
+                format!("{short}{cores}{memory}"),
+                format!("{short}{cores}"),
+            ];
+            forms.dedup();
+            forms
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The monitor's physical used/total amount, separate from a ResourceView's binding amount.
+/// In particular, a volume's occupied blocks are `used`; its unavailable bytes also include
+/// free blocks this user cannot write, so the generic disk amount keeps its own label.
+#[must_use]
+pub fn monitor_amount(res: Resource, snap: &Snapshot) -> Vec<String> {
+    let (used, total, unit) = match res {
+        Resource::Memory => {
+            let Some(m) = snap.mem.as_ref().filter(|m| m.sample.total > 0) else {
+                return Vec::new();
+            };
+            (gib_total(m.sample.used()), gib_total(m.sample.total), "GiB")
+        }
+        Resource::Disk => {
+            let Some(v) = snap.volume.as_ref().filter(|v| v.total > 0) else {
+                return Vec::new();
+            };
+            let p = parts_of(
+                v.total,
+                &[v.occupied(), v.total.saturating_sub(v.occupied())],
+            );
+            (p.parts[0].clone(), p.whole, p.unit)
+        }
+        _ => return Vec::new(),
+    };
+    vec![
+        format!("{used} of {total} {unit} used"),
+        format!("{used}/{total} {unit} used"),
+    ]
+}
+
+/// Available space for the monitor's history caption when its amount column already says
+/// used and total. Unknown memory availability stays explicit rather than becoming zero.
+#[must_use]
+pub fn monitor_available(res: Resource, snap: &Snapshot) -> Vec<String> {
+    let amount = match res {
+        Resource::Memory => snap.mem.as_ref().filter(|m| m.sample.total > 0).map(|m| {
+            m.sample
+                .available()
+                .map(|bytes| format!("{} GiB", gib_total(bytes)))
+        }),
+        Resource::Disk => snap
+            .volume
+            .as_ref()
+            .filter(|v| v.total > 0)
+            .map(|v| Some(bytes_dec(v.available.min(v.total)))),
+        _ => None,
+    };
+    match amount {
+        Some(Some(amount)) => vec![format!("{amount} available"), format!("{amount} avail")],
+        Some(None) => vec!["available not reported".into(), "avail not reported".into()],
+        None => Vec::new(),
+    }
 }
 
 const SPOKEN_UNITS: [(&str, &str, &str); 13] = [
@@ -2690,7 +2772,7 @@ fn glance_processes_details(snap: &Snapshot) -> Vec<Clause> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CpuView, GpuView, MemSample, MemView, ScopeView};
+    use crate::model::{CpuView, GpuView, MemSample, MemView, ScopeView, TabView};
     use crate::trend::TrendView;
 
     fn scenario_a() -> Snapshot {
@@ -2738,70 +2820,6 @@ mod tests {
     }
 
     #[test]
-    fn the_global_sentence_reads_like_the_design() {
-        assert_eq!(
-            global_sentence(&scenario_a()),
-            "Global: 3.1 of 10 cores busy; GPU 4%; memory 17.7 of 32 GiB used, pressure normal; \
-             swap 0; disk 1.81 TB free."
-        );
-    }
-
-    #[test]
-    fn a_rising_figure_says_so() {
-        let mut s = scenario_a();
-        s.cpu.as_mut().unwrap().busy = TrendView {
-            raw: 4.0,
-            level: 3.1,
-            slow: 2.0,
-            mad: 0.0,
-        };
-        assert!(global_sentence(&s).contains("3.1 of 10 cores busy, rising;"));
-    }
-
-    #[test]
-    fn the_aterm_sentence_gives_its_share_of_busy() {
-        assert_eq!(
-            aterm_sentence(&scenario_a()),
-            "aterm: 1.6 cores, 52% of busy; 2.3 GiB; 17 processes."
-        );
-        assert_eq!(aterm_sentence(&Snapshot::default()), "aterm: measuring.");
-    }
-
-    #[test]
-    fn a_tab_sentence_names_its_program_and_busiest_helper() {
-        let t = TabView {
-            key: 1,
-            tab: 1,
-            label: "Tab 2".into(),
-            program: "claude".into(),
-            shell_pid: 0,
-            scope: ScopeView {
-                cores: TrendView::flat(0.9),
-                footprint: Some(310 << 20),
-                top: Some(("cargo".into(), 0.7)),
-                ..ScopeView::default()
-            },
-        };
-        assert_eq!(
-            tab_sentence(&t),
-            "Tab 2: claude; 0.9 cores; 310 MiB; busiest cargo 0.7c."
-        );
-    }
-
-    #[test]
-    fn an_unread_figure_is_left_out_never_zero() {
-        assert_eq!(
-            global_sentence(&Snapshot::default()),
-            "Global: not read yet."
-        );
-        let mut s = scenario_a();
-        s.gpu = None;
-        s.volume = None;
-        let w = global_sentence(&s);
-        assert!(!w.contains("GPU") && !w.contains("disk"), "{w}");
-    }
-
-    #[test]
     fn units_follow_the_platform_conventions() {
         assert_eq!(mem(310 << 20), "310 MiB");
         assert_eq!(mem(2_469_606_195), "2.3 GiB");
@@ -2818,11 +2836,6 @@ mod tests {
         assert_eq!(disk(9_400_000_000), "9.4 GB");
         assert_eq!(gib_total(32 << 30), "32");
         assert_eq!(cores(-0.2), "0.0");
-        assert_eq!(
-            cores_figure(3.06, Some(10), Motion::Rising),
-            "3.1c/10\u{25B4}"
-        );
-        assert_eq!(cores_figure(0.9, None, Motion::Steady), "0.9c");
     }
 
     use crate::explain::{ActivityId, CoalLane, DeckCause, WhyFacts};
@@ -3087,18 +3100,18 @@ mod tests {
                     vec!["42.1/128 GiB"],
                 ],
                 (Resource::Disk, _) => [
-                    vec!["1.11 of 2.00 TB used"],
+                    vec!["1.11 of 2.00 TB unavailable"],
                     vec![
-                        "1.11 of 2.00 TB used · freed 41 GB",
-                        "1.11/2.00 TB used · freed 41 GB",
-                        "1.11 TB used · freed 41 GB",
-                        "1.11 of 2.00 TB used",
-                        "1.11/2.00 TB used",
+                        "1.11 of 2.00 TB unavailable · freed 41 GB",
+                        "1.11/2.00 TB unavailable · freed 41 GB",
+                        "1.11 TB unavailable · freed 41 GB",
+                        "1.11 of 2.00 TB unavailable",
+                        "1.11/2.00 TB unavailable",
                     ],
                     vec![
-                        "1.11/2.00 TB used · freed 41 GB",
-                        "1.11 TB used · freed 41 GB",
-                        "1.11/2.00 TB used",
+                        "1.11/2.00 TB unavailable · freed 41 GB",
+                        "1.11 TB unavailable · freed 41 GB",
+                        "1.11/2.00 TB unavailable",
                     ],
                 ],
                 (Resource::Network, _) => [
@@ -3139,7 +3152,7 @@ mod tests {
             Resource::Cpu => form.contains("cores"),
             Resource::Gpu => form.contains("busy") && form.contains('%'),
             Resource::Memory => form.contains("GiB"),
-            Resource::Disk => form.contains(" used"),
+            Resource::Disk => form.contains(" unavailable"),
             Resource::Network => {
                 form.contains("MB/s") && (form.contains("peak") || form.contains("link"))
             }
@@ -3168,17 +3181,17 @@ mod tests {
         let calm = RowFacts::default();
         assert_eq!(
             amount_forms(Resource::Disk, &disk, &calm, Cols, &MAC),
-            strings(&["1.11 of 2.00 TB used", "1.11/2.00 TB used"])
+            strings(&["1.11 of 2.00 TB unavailable", "1.11/2.00 TB unavailable"])
         );
         let mut off = freed_facts();
         off.disk.as_mut().expect("facts").watch = false;
         assert_eq!(
             amount_forms(Resource::Disk, &disk, &off, NoCols, &MAC),
-            strings(&["1.11/2.00 TB used"])
+            strings(&["1.11/2.00 TB unavailable"])
         );
         assert_eq!(
             amount_forms(Resource::Disk, &row(512e9, 994e9), &calm, Det, &MAC),
-            strings(&["512 of 994 GB used"])
+            strings(&["512 of 994 GB unavailable"])
         );
 
         let mut link = row(2.1e6, 22.9e6);
@@ -3263,11 +3276,11 @@ mod tests {
         };
         assert_eq!(
             disk_space_line(&vol(2_000_000_000_000, 890_000_000_000)),
-            "1.11 TB used · 0.89 TB free · 2.00 TB"
+            "1.11 TB used · 890 GB available · 2.00 TB total"
         );
         assert_eq!(
             disk_space_line(&vol(2_000_000_000_000, 44_800_000_000)),
-            "1.96 TB used · 0.04 TB free · 2.00 TB"
+            "1.96 TB used · 44.8 GB available · 2.00 TB total"
         );
         assert_eq!(
             amount_forms(
@@ -3277,7 +3290,7 @@ mod tests {
                 Ladder::NoCols,
                 &MAC
             ),
-            strings(&["1.96/2.00 TB used"])
+            strings(&["1.96/2.00 TB unavailable"])
         );
         let quanta = |s: &str| s.replace('.', "").parse::<u64>().expect("a figure");
         for whole in [
@@ -3413,22 +3426,6 @@ mod tests {
             speak(&up_words(Some(47 * MIN), true).expect("long")),
             "up at least 47 minutes"
         );
-        let at = 1_790_000_000_000;
-        let g = crate::model::ProgramGroup {
-            name: "rustc".into(),
-            scope: ProcScope::Tab(3),
-            n: 9,
-            cores: 5.9,
-            footprint: None,
-            born_ms: Some(at - 47 * 60_000),
-            unborn: 0,
-        };
-        assert_eq!(program_age(&g, at).as_deref(), Some("up 47 min"));
-        let partly = crate::model::ProgramGroup {
-            unborn: 1,
-            ..g.clone()
-        };
-        assert_eq!(program_age(&partly, at).as_deref(), Some("up ≥ 47 min"));
     }
 
     #[test]
@@ -3561,7 +3558,7 @@ mod tests {
                 clauses: strings(&["full in ~34 min, filling 1.2 GB/min", "full in ~34 min"]),
                 word: "full ~34 min".into(),
                 label: "Disk full ~34 min".into(),
-                amount_forms: strings(&["1.96/2.00 TB used", "1.96 TB used"]),
+                amount_forms: strings(&["1.96/2.00 TB unavailable", "1.96 TB unavailable"]),
                 mark: Mark::Low,
                 ink: InkKind::Warn,
             }
@@ -4151,7 +4148,7 @@ mod tests {
 
         assert_eq!(
             row_sentence(Resource::Disk, &disk_trouble(), &[2], &MAC),
-            "Disk 98 percent of capacity: 1.96 of 2.00 terabytes used. aterm writes 38 \
+            "Disk 98 percent of capacity: 1.96 of 2.00 terabytes unavailable. aterm writes 38 \
              megabytes per second, Tab 2 writes 0.2 megabytes per second. Steady near 98 \
              percent. Disk full in about 34 minutes, filling 1.2 gigabytes per minute. Disk low, \
              45 gigabytes free. 2 sessions stuck on a full disk. aterm freed 41 gigabytes \
@@ -4616,6 +4613,97 @@ mod tests {
                 "18 cores \u{b7} 128 GiB".to_owned(),
                 "18c \u{b7} 128G".to_owned()
             ]
+        );
+    }
+
+    #[test]
+    fn capacity_readings_keep_available_space_distinct_from_total_and_reserved_free() {
+        let volume = VolumeSample {
+            total: 8_000_000_000_000,
+            free: 400_000_000_000,
+            available: 240_000_000_000,
+            mount: "/".into(),
+        };
+        let line = disk_space_line(&volume);
+        assert!(line.contains("7.60 TB used"), "{line}");
+        assert!(line.contains("240 GB available"), "{line}");
+        assert!(line.contains("8.00 TB total"), "{line}");
+        assert!(
+            !line.contains("400 GB"),
+            "reserved blocks are not writable: {line}"
+        );
+
+        let mut s = Snapshot {
+            volume: Some(volume.clone()),
+            ..Snapshot::default()
+        };
+        let disk = monitor_capacity(Resource::Disk, &s);
+        assert!(disk[0].contains("240 GB available"), "{disk:?}");
+        assert_eq!(monitor_available(Resource::Disk, &s)[0], "240 GB available");
+        assert_eq!(
+            monitor_amount(Resource::Disk, &s)[0],
+            "7.60 of 8.00 TB used"
+        );
+        assert_eq!(
+            amount_forms(
+                Resource::Disk,
+                &row(7.76e12, 8e12),
+                &s.facts,
+                Ladder::Det,
+                &MAC
+            )[0],
+            "7.76 of 8.00 TB unavailable"
+        );
+        assert!(
+            amount_forms(
+                Resource::Disk,
+                &row(7.76e12, 8e12),
+                &s.facts,
+                Ladder::Det,
+                &MAC
+            )
+            .iter()
+            .all(|form| form.contains("unavailable"))
+        );
+        s.mem = Some(MemView {
+            sample: MemSample {
+                total: 128 << 30,
+                app: 80 << 30,
+                wired: 12 << 30,
+                compressed: Some(4 << 30),
+                cached: 24 << 30,
+                free: 8 << 30,
+                ..MemSample::default()
+            },
+            ..MemView::default()
+        });
+        let memory = monitor_capacity(Resource::Memory, &s);
+        assert!(memory[0].contains("32.0 GiB available"), "{memory:?}");
+        assert!(memory[0].contains("128 GiB"), "{memory:?}");
+        let unread = glance_run(Resource::Memory, &ResourceView::default(), &s, &MAC);
+        assert!(
+            unread.is_empty(),
+            "unread capacity must not become zero: {unread:?}"
+        );
+        let m = &mut s.mem.as_mut().unwrap().sample;
+        m.app = 64 << 30;
+        m.cached = 16 << 30;
+        let memory = monitor_capacity(Resource::Memory, &s);
+        assert!(
+            memory[0].contains("24.0 GiB available"),
+            "unclassified remainder is not available: {memory:?}"
+        );
+        let sample = &mut s.mem.as_mut().unwrap().sample;
+        sample.free = 0;
+        sample.cached = 0;
+        assert_eq!(
+            monitor_available(Resource::Memory, &s)[0],
+            "available not reported"
+        );
+        let sparse = memory_space_line(&s.mem.as_ref().unwrap().sample);
+        assert!(
+            sparse.contains("available not reported"),
+            "sparse memory classes must not become invented free bytes: {sparse}"
         );
     }
 }

@@ -102,9 +102,12 @@ impl Diagnostic {
         })
     }
 
-    /// Whether `ident` appears as a whole identifier in the message, a label, or a snippet.
+    /// Whether `ident` appears as a whole non-empty identifier in the message, a label, or a snippet.
     #[must_use]
     pub fn names(&self, ident: &str) -> bool {
+        if ident.is_empty() {
+            return false;
+        }
         std::iter::once(&self.message)
             .chain(&self.labels)
             .chain(&self.snippets)
@@ -241,18 +244,8 @@ impl Outcome {
     /// Compiler errors, failed test output, or the tail of cargo's stderr.
     #[must_use]
     pub fn detail(&self) -> String {
-        const SHOWN: usize = 5;
         if !self.errors.is_empty() {
-            let mut out: Vec<String> = self
-                .errors
-                .iter()
-                .take(SHOWN)
-                .map(|d| d.rendered.trim_end().to_string())
-                .collect();
-            if self.errors.len() > SHOWN {
-                out.push(format!("… and {} more errors", self.errors.len() - SHOWN));
-            }
-            return out.join("\n");
+            return error_list(self.errors.iter());
         }
         if !self.failed.is_empty() {
             return self
@@ -264,6 +257,24 @@ impl Outcome {
         }
         tail(&self.stderr, 30)
     }
+}
+
+/// Renders up to five compiler errors, plus an `… and N more errors` line when truncated.
+#[must_use]
+pub fn error_list<'a, I>(errors: I) -> String
+where
+    I: ExactSizeIterator<Item = &'a Diagnostic>,
+{
+    const SHOWN: usize = 5;
+    let total = errors.len();
+    let mut out: Vec<String> = errors
+        .take(SHOWN)
+        .map(|d| d.rendered.trim_end().to_string())
+        .collect();
+    if total > SHOWN {
+        out.push(format!("… and {} more errors", total - SHOWN));
+    }
+    out.join("\n")
 }
 
 impl fmt::Display for Outcome {
@@ -493,6 +504,7 @@ mod tests {
         assert!(error.names("siginfo_t"), "in the snippet");
         assert!(error.names("private"), "in the label");
         assert!(!error.names("si_stat"), "a prefix is not a name");
+        assert!(!error.names(""), "empty string is not an identifier");
     }
 
     #[test]

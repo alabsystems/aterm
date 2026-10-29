@@ -8,6 +8,7 @@
 //! aterm's models of the terminal core, the keeper and the selection.
 
 mod models_alt_screen;
+mod models_content_scroll_band_history;
 mod models_core;
 mod models_engine_corpus;
 mod models_holder_fence;
@@ -23,6 +24,7 @@ mod models_screen_generation;
 mod models_text_selection_lifecycle;
 
 pub use models_alt_screen::alt_screen_model;
+pub use models_content_scroll_band_history::content_scroll_band_history_model;
 pub use models_core::*;
 pub use models_engine_corpus::*;
 pub use models_holder_fence::holder_fence_model;
@@ -30,7 +32,10 @@ pub use models_keeper::{
     keeper_companion_custody_model, keeper_death_judgement_model, keeper_relaunch_brake_model,
     pty_keeper_custody_model,
 };
-pub use models_kernels::{ascii_grapheme_fast_path_model, rle_local_compact_model};
+pub use models_kernels::{
+    ascii_grapheme_fast_path_model, cfg_if_expansion_model, once_cell_gate_protocol_model,
+    rle_local_compact_model,
+};
 pub use models_resize_row_reuse::resize_row_reuse_model;
 pub use models_run_loop_waker::run_loop_waker_model;
 pub use models_sandbox::sandbox_model;

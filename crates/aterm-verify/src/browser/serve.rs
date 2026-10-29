@@ -1,20 +1,84 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Loopback HTTP server for browser lane site files and [`Server::answer`] POSTs.
+//! Loopback HTTP server for browser lane site files, [`Server::answer`] POSTs and the pages'
+//! beats ([`Beats`]).
 
 use std::io::{BufRead, BufReader, Read, Take, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+use crate::browser::cdp::HANG_DETECTOR;
 
 const MAX_HEAD: usize = 16 << 10;
 
 const MAX_ANSWER: usize = 64 << 20;
+
+/// The target a page's beat POSTs to.
+const BEAT: &str = "/beat";
+
+/// When a page last said it is still at work: `lane.mjs` POSTs [`BEAT`] at most once a second
+/// from each step and each frame it waits for, so a page that is slow (SwiftShader's readbacks
+/// on a busy machine) is told from one that stopped ([`hang_at`]).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Beats(Arc<Mutex<Option<Instant>>>);
+
+impl Beats {
+    fn beat(&self) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+    }
+
+    /// The last beat, if any came.
+    pub(crate) fn last(&self) -> Option<Instant> {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// When a wait that began at `t0` calls its page hung: [`HANG_DETECTOR`] after `t0`, or after the
+/// page's `last` beat where that came later. A minute with no answer and no beat is a hang; a
+/// page that keeps beating is waited for however long its work takes.
+pub(crate) fn hang_at(t0: Instant, last: Option<Instant>) -> Instant {
+    last.map_or(t0, |beat| beat.max(t0)) + HANG_DETECTOR
+}
+
+/// The words a wait that `beaten` (a beat came after it began) or not ends with: what it went
+/// without for [`HANG_DETECTOR`].
+pub(crate) fn hang_words(what: &str, beaten: bool) -> String {
+    let since = if beaten {
+        " of the page's last beat"
+    } else {
+        ""
+    };
+    format!(
+        "no {what} within {} s{since} (a hang detector, not a budget)",
+        HANG_DETECTOR.as_secs()
+    )
+}
+
+/// How often a wait looks again for a beat that moved its end.
+const BEAT_POLL: Duration = Duration::from_millis(200);
+
+/// One look, at `now`, of a wait for `what` that began at `t0`, its page's last beat `last`: how
+/// long to wait for the next message (at most [`BEAT_POLL`], so a later beat is seen), or, once
+/// [`hang_at`] has passed, the words the wait ends with ([`hang_words`]).
+pub(crate) fn wait_step(
+    t0: Instant,
+    last: Option<Instant>,
+    now: Instant,
+    what: &str,
+) -> Result<Duration, String> {
+    let last = last.filter(|beat| *beat > t0);
+    let left = hang_at(t0, last).saturating_duration_since(now);
+    if left.is_zero() {
+        return Err(hang_words(what, last.is_some()));
+    }
+    Ok(left.min(BEAT_POLL))
+}
 
 /// A running server.
 pub(crate) struct Server {
@@ -25,6 +89,7 @@ pub(crate) struct Server {
     answers: Receiver<(String, Vec<u8>)>,
     /// Answers that came before the one being waited for, oldest first.
     early: Vec<(String, Vec<u8>)>,
+    beats: Beats,
 }
 
 impl Server {
@@ -47,16 +112,28 @@ impl Server {
         let stop = Arc::new(AtomicBool::new(false));
         let served = Arc::new(AtomicUsize::new(0));
         let (posted, answers) = channel();
-        let (root, stop2, served2) = (root.to_path_buf(), stop.clone(), served.clone());
+        let beats = Beats::default();
+        let (root, stop2, served2, beats2) = (
+            root.to_path_buf(),
+            stop.clone(),
+            served.clone(),
+            beats.clone(),
+        );
         let accept = std::thread::spawn(move || {
             for stream in listener.incoming() {
                 if stop2.load(Ordering::SeqCst) {
                     return;
                 }
                 let Ok(stream) = stream else { continue };
-                let (root, served, posted) = (root.clone(), served2.clone(), posted.clone());
+                let (root, served, posted, beats) = (
+                    root.clone(),
+                    served2.clone(),
+                    posted.clone(),
+                    beats2.clone(),
+                );
                 std::thread::spawn(move || {
-                    if answer(stream, &root, &posted, isolated).is_ok() {
+                    if answer(stream, &root, &posted, &beats, isolated).is_ok_and(|counted| counted)
+                    {
                         served.fetch_add(1, Ordering::SeqCst);
                     }
                 });
@@ -69,10 +146,17 @@ impl Server {
             accept: Some(accept),
             answers,
             early: Vec::new(),
+            beats,
         })
     }
 
-    /// The body a page POSTed to `/answer/<kind>`.
+    /// The pages' beats, for a wait over another channel ([`crate::browser::cdp::Cdp`]).
+    pub(crate) fn beats(&self) -> &Beats {
+        &self.beats
+    }
+
+    /// The body a page POSTed to `/answer/<kind>`, waited for until it comes or a minute passes
+    /// with no answer and no beat ([`hang_at`]).
     pub(crate) fn answer(
         &mut self,
         kind: &str,
@@ -81,23 +165,13 @@ impl Server {
         if let Some(i) = self.early.iter().position(|(k, _)| k == kind) {
             return Ok(self.early.remove(i).1);
         }
-        let hang = crate::browser::cdp::HANG_DETECTOR;
         let t0 = Instant::now();
+        let what = format!("answer from the {kind} page");
         loop {
-            let left = hang.saturating_sub(t0.elapsed());
-            match self
-                .answers
-                .recv_timeout(left.min(Duration::from_millis(200)))
-            {
+            let wait = wait_step(t0, self.beats.last(), Instant::now(), &what)?;
+            match self.answers.recv_timeout(wait) {
                 Ok((k, body)) if k == kind => return Ok(body),
                 Ok(other) => self.early.push(other),
-                Err(RecvTimeoutError::Timeout) if left.is_zero() => {
-                    return Err(format!(
-                        "no answer from the {kind} page within {} s (a hang detector, not a \
-                         budget)",
-                        hang.as_secs()
-                    ));
-                }
                 Err(RecvTimeoutError::Timeout) if !alive() => {
                     return Err(format!("the browser ended before the {kind} page answered"));
                 }
@@ -116,7 +190,7 @@ impl Server {
         format!("http://{}", self.addr)
     }
 
-    /// Requests answered so far.
+    /// Requests answered so far, the pages' beats not counted.
     pub(crate) fn served(&self) -> usize {
         self.served.load(Ordering::SeqCst)
     }
@@ -251,14 +325,17 @@ fn request_body<R: Read>(
 const ISOLATED: &str = "Cross-Origin-Opener-Policy: same-origin\r\n\
                         Cross-Origin-Embedder-Policy: require-corp\r\n";
 
+/// Answer one request: a site file, a posted answer, or a beat. Whether it counts as served (a
+/// beat does not).
 fn answer(
     mut stream: TcpStream,
     root: &Path,
     posted: &Sender<(String, Vec<u8>)>,
+    beats: &Beats,
     isolated: bool,
-) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(crate::browser::cdp::HANG_DETECTOR))?;
-    stream.set_write_timeout(Some(crate::browser::cdp::HANG_DETECTOR))?;
+) -> std::io::Result<bool> {
+    stream.set_read_timeout(Some(HANG_DETECTOR))?;
+    stream.set_write_timeout(Some(HANG_DETECTOR))?;
     let mut reader = BufReader::new((&stream).take(MAX_HEAD as u64 + 1));
     let head = match request_head(&mut reader) {
         Ok(head) => head,
@@ -268,7 +345,7 @@ fn answer(
                 std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
             ) =>
         {
-            return empty_response(&mut stream, "400 Bad Request");
+            return empty_response(&mut stream, "400 Bad Request").map(|()| true);
         }
         Err(e) => return Err(e),
     };
@@ -284,7 +361,15 @@ fn answer(
         };
         drop(reader);
         empty_response(&mut stream, status)?;
-        return stream.flush();
+        stream.flush()?;
+        return Ok(true);
+    }
+    if method == "POST" && target == BEAT {
+        beats.beat();
+        drop(reader);
+        empty_response(&mut stream, "204 No Content")?;
+        stream.flush()?;
+        return Ok(false);
     }
     drop(reader);
     let file = (method == "GET")
@@ -313,7 +398,8 @@ fn answer(
             empty_response(&mut out, status)?;
         }
     }
-    out.flush()
+    out.flush()?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -543,5 +629,74 @@ mod tests {
         );
         assert!(server.served() >= 1);
         drop(server);
+    }
+
+    /// A WAIT IS HUNG A MINUTE AFTER ITS START OR ITS PAGE'S LAST BEAT, WHICHEVER IS LATER: a beat
+    /// after the start moves the end out; one from before it (an earlier page's) does not, and
+    /// the words say which minute ran out.
+    #[test]
+    fn a_wait_ends_a_minute_after_its_start_or_its_last_beat() {
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let what = "answer from the gpu page";
+        assert_eq!(hang_at(t0, None), at(60));
+        assert_eq!(hang_at(t0, Some(at(45))), at(105));
+
+        assert_eq!(wait_step(t0, None, t0, what), Ok(BEAT_POLL));
+        assert_eq!(
+            wait_step(t0, None, at(60) - Duration::from_millis(50), what),
+            Ok(Duration::from_millis(50)),
+            "the last look waits only what is left"
+        );
+        let unbeaten = Err(hang_words(what, false));
+        assert_eq!(wait_step(t0, None, at(60), what), unbeaten);
+
+        let beat = Some(at(45));
+        assert_eq!(wait_step(t0, beat, at(100), what), Ok(BEAT_POLL));
+        let beaten = wait_step(t0, beat, at(105), what);
+        assert_eq!(beaten, Err(hang_words(what, true)));
+        assert_ne!(beaten, unbeaten, "the words say a beat came");
+
+        let before = t0
+            .checked_sub(Duration::from_secs(5))
+            .expect("a clock five seconds old");
+        assert_eq!(
+            wait_step(t0, Some(before), at(60), what),
+            unbeaten,
+            "NEGATIVE CONTROL: an earlier page's beat moves nothing"
+        );
+    }
+
+    /// A PAGE'S BEAT IS HEARD AND NOT SERVED: `POST /beat` answers 204 and moves the beat clock,
+    /// and is not counted among the requests served; a GET of it is no file, and a POST anywhere
+    /// else moves nothing.
+    #[test]
+    fn a_beat_moves_the_clock_and_is_not_a_request_served() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("atv-beat-")
+            .tempdir()
+            .expect("scratch");
+        let server = Server::start(dir.path()).expect("start");
+        assert_eq!(server.beats().last(), None, "CONTROL: no beat yet");
+        let post = |target: &str| {
+            request(
+                &server.origin(),
+                &format!("POST {target} HTTP/1.1\r\nContent-Length: 0\r\n\r\n"),
+            )
+        };
+        let before = Instant::now();
+        assert!(post(BEAT).starts_with("HTTP/1.1 204"));
+        let first = server.beats().last().expect("the beat");
+        assert!(first >= before);
+        assert!(post(BEAT).starts_with("HTTP/1.1 204"));
+        assert!(server.beats().last().expect("the beat") > first);
+        assert_eq!(server.served(), 0, "a beat is not a request served");
+        let last = server.beats().last();
+        assert!(
+            post("/beats").starts_with("HTTP/1.1 405"),
+            "NEGATIVE CONTROL"
+        );
+        assert!(get(&server.origin(), BEAT).starts_with("HTTP/1.1 404"));
+        assert_eq!(server.beats().last(), last, "another request moves nothing");
     }
 }

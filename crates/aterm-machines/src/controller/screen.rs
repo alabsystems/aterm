@@ -2838,7 +2838,10 @@ mod tests {
     fn a_read_that_needs_a_session_or_a_variable_cannot_travel_as_exec() {
         let user = admin();
         let plain = exec_of(&person::tcc_open_cmd()).unwrap();
-        assert_eq!(plain.argv[0], "/usr/bin/sqlite3");
+        assert_eq!(
+            plain.argv,
+            [crate::protocol::AGENT_EXE, "machines", "agent", "tcc"]
+        );
         assert_eq!(plain.user, None);
         let as_user = exec_of(&Cmd::new("/bin/cat").arg("/x").as_user(&user)).unwrap();
         assert_eq!(as_user.user.as_deref(), Some("admin"));

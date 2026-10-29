@@ -6,7 +6,9 @@
 //! outside the tree. The model's one wake is the book's wake #1, and at every state the book is
 //! probed on copies, so a claim is granted, an `await wake` answered and a park taken exactly
 //! where the model says. The need, `unless=` at the tell, a heard turn and the loop's guards at a
-//! claim are the model's environment.
+//! claim are the model's environment, and so are a line a door left in the composer and what
+//! the person or the policy does with it: the book keeps the claim (a successor too, from the
+//! left row), and the look that settles the line tells it (`Write`) or gives it back (`Release`).
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
@@ -15,7 +17,8 @@ use aterm_agent::supervise::occupancy::WakeDoor;
 use aterm_agent::supervise::occupancy::declarer::{AgentId, ProcLink, prove};
 use aterm_agent::supervise::occupancy::fault::{self, Fault};
 use aterm_agent::supervise::occupancy::wakes::{
-    DeclaredWake, Levels, ParkBook, ParkRefusal, SourceAtom, SysWait, UNHEARD_MS, WakeBook, WakeReq,
+    DeclaredWake, Levels, ParkBook, ParkRefusal, Reconciled, SourceAtom, SysWait, UNHEARD_MS,
+    WakeBook, WakeReq,
 };
 use aterm_agent::supervise::occupancy::wakes_seen::{Declarer, WakeState};
 use aterm_models_harness::wake_book_model;
@@ -97,7 +100,7 @@ const FOREIGN: [&[ProcLink]; 3] = [
 ];
 
 /// The model's mutants, which no real step mirrors.
-const MUTANTS: [&str; 15] = [
+const MUTANTS: [&str; 17] = [
     "ParkDeaf",
     "DeclareFromOutside",
     "AwaitFromAnyone",
@@ -113,10 +116,12 @@ const MUTANTS: [&str; 15] = [
     "ReleaseAfterTyped",
     "RetellAfterHeard",
     "AnswerTwice",
+    "ReleaseOnLeft",
+    "KeepOnClear",
 ];
 
 /// The steps the code performs, each on its anchored function.
-const ANCHORED: [&str; 20] = [
+const ANCHORED: [&str; 21] = [
     "Answer",
     "Claim",
     "CrashMidWrite",
@@ -127,6 +132,7 @@ const ANCHORED: [&str; 20] = [
     "ForeignAwait",
     "ForeignTake",
     "Heard",
+    "KeepLeft",
     "Park",
     "Reconcile",
     "RefuseSecond",
@@ -140,22 +146,35 @@ const ANCHORED: [&str; 20] = [
 ];
 
 /// The steps of the loop, the levels and the agent's turns, which the book only sees.
-const ENVIRONMENT: [&str; 11] = [
+const ENVIRONMENT: [&str; 14] = [
     "Blip",
     "BrakeOff",
     "BrakeOn",
     "Break",
+    "ClearLeft",
     "Fails",
     "Holds",
     "Leave",
     "NeedFails",
     "NeedHolds",
+    "SubmitLeft",
     "TurnRuns",
     "UnlessHolds",
+    "WriteLeft",
 ];
 
 /// The steps only a loop's door under `prompt`, in a hosted session with no manager, takes.
-const DOOR_STEPS: [&str; 5] = ["Claim", "Write", "Release", "Reconcile", "CrashMidWrite"];
+const DOOR_STEPS: [&str; 9] = [
+    "Claim",
+    "Write",
+    "Release",
+    "Reconcile",
+    "CrashMidWrite",
+    "WriteLeft",
+    "SubmitLeft",
+    "ClearLeft",
+    "KeepLeft",
+];
 
 /// The wake: a file to appear, slots to tell it, and a lock whose going ends it untold.
 fn req() -> WakeReq {
@@ -370,7 +389,13 @@ fn mirror(action: &'static str, st: &State, r: &mut Real, run: Run, ev: &mut Ev)
             true
         }
         "Blip" | "NeedHolds" | "NeedFails" | "Break" | "Leave" | "BrakeOn" | "BrakeOff"
-        | "TurnRuns" => true,
+        | "TurnRuns" | "SubmitLeft" | "ClearLeft" => true,
+        // The door's write left its line: its left row, and no call of the book's.
+        "WriteLeft" => {
+            let ep = r.episode();
+            r.rows.push((ep, SeedOutcome::Left));
+            true
+        }
         "Edge" => {
             let lv = r.lv;
             if st["blip"] == 1 || st["unl"] == 1 || !run.variant.is_multiple_of(2) {
@@ -456,6 +481,11 @@ fn mirror(action: &'static str, st: &State, r: &mut Real, run: Run, ev: &mut Ev)
         "CrashMidWrite" => {
             let rows = r.rows.clone();
             ev.step(action, || r.book.reconcile(&rows, now)).len() == 1
+        }
+        // The loop left its line and ended before a look settled it: a successor keeps the claim.
+        "KeepLeft" => {
+            let rows = r.rows.clone();
+            ev.step(action, || r.book.reconcile(&rows, now)) == [(1, Reconciled::Left)]
         }
         other => panic!("no real step for `{other}`"),
     }
@@ -581,7 +611,7 @@ type Shows = fn(&State) -> bool;
 
 #[test]
 fn tier1_each_planted_defect_disagrees_where_the_model_says() {
-    let controls: [(Fault, Shows, Option<Shows>); 6] = [
+    let controls: [(Fault, Shows, Option<Shows>); 7] = [
         // An edge between two looks is lost: the model's edge lands, the book stays pending.
         (
             Fault::LevelOnly,
@@ -604,6 +634,12 @@ fn tier1_each_planted_defect_disagrees_where_the_model_says() {
         ),
         // A successor releases a claim whose line was typed.
         (Fault::ReleaseAfterTyped, |st| st["st"] == 6, None),
+        // A successor gives back a claim whose line stands left: the model keeps it.
+        (
+            Fault::ReleaseOnLeft,
+            |st| st["st"] == 5 && st["lk"] == 1,
+            None,
+        ),
         // A peer outside the tree declares, parks and takes.
         (
             Fault::AwaitFromAnyone,

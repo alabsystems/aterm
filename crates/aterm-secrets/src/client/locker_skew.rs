@@ -5,7 +5,8 @@
 //! Mac runs can read it. An approver that cannot open the locker lets no machine join, and the
 //! locker never returns to its old format, so the check comes before anything is published or
 //! retired. It reads this Mac alone: an approver another admin Mac runs is not checked, so every
-//! admin Mac's subscriber is updated before any admin publishes with a newer build.
+//! admin Mac's subscriber is updated before any admin publishes with a newer build. A founding of
+//! Commons by default reads the same approvers ([`approvers`]) before it publishes.
 
 use super::{Error, Paths};
 use crate::service::{self, Job};
@@ -53,7 +54,7 @@ pub(super) fn version_answer(stdout: &str) -> Option<Version> {
     version(stdout.lines().next()?.strip_prefix("aterm ")?.trim())
 }
 
-fn dotted((major, minor, patch): Version) -> String {
+pub(super) fn dotted((major, minor, patch): Version) -> String {
     format!("{major}.{minor}.{patch}")
 }
 
@@ -98,26 +99,20 @@ pub(super) fn judge(from: &str, to: &str, own: &Own, running: &Running) -> crate
 
 /// The programs a subscriber job in `state` approves with: the one running now
 /// (`running_program` of its pid), and the one its unit starts next (`unit_program`) where that
-/// differs. Refuses when the job's state is unknown, or an installed job's program cannot be
-/// named at all: an unchecked approver is the one this check exists for.
+/// differs. Why none are named where the job's state is unknown, or an installed job's program
+/// cannot be named at all: an unchecked approver is the one each reader of this exists for.
 pub(super) fn programs(
     state: crate::Result<service::State>,
     running_program: &dyn Fn(u32) -> Option<PathBuf>,
     unit_program: &dyn Fn(&Path) -> Option<PathBuf>,
-) -> crate::Result<Vec<(Option<u32>, PathBuf)>> {
-    let refuse = |why: String| {
-        Error::new(format!(
-            "refusing to publish: it would rewrite the vault's admin locker into a newer format, \
-             which an older approver cannot read, and {why}"
-        ))
-    };
+) -> Result<Vec<(Option<u32>, PathBuf)>, String> {
     let (pid, unit) = match state {
         Ok(service::State::Absent) => return Ok(Vec::new()),
         Ok(service::State::Installed { pid, unit }) => (pid, unit),
         Err(error) => {
-            return Err(refuse(format!(
+            return Err(format!(
                 "whether this Mac's subscriber runs is unknown ({error})"
-            )));
+            ));
         }
     };
     let mut programs = Vec::new();
@@ -129,10 +124,10 @@ pub(super) fn programs(
             programs.push((None, next));
         }
         None if programs.is_empty() => {
-            return Err(refuse(format!(
+            return Err(format!(
                 "the program {} starts cannot be named",
                 unit.display()
-            )));
+            ));
         }
         _ => {}
     }
@@ -141,13 +136,13 @@ pub(super) fn programs(
 
 #[cfg(test)]
 thread_local! {
-    /// The approvers [`check`] reads on this thread, in place of the service's.
+    /// The approvers [`approvers`] reads on this thread, in place of the service's.
     pub(super) static PLAYED: std::cell::RefCell<Option<Vec<Running>>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// This build, as [`judge`] compares it.
-fn own() -> crate::Result<Own> {
+pub(super) fn own() -> crate::Result<Own> {
     Ok(Own {
         version: version(env!("CARGO_PKG_VERSION"))
             .ok_or_else(|| Error::new("this aterm's release number is unreadable"))?,
@@ -160,15 +155,28 @@ fn own() -> crate::Result<Own> {
 /// while this Mac's subscriber runs, or would start, an older program than this one.
 pub(super) fn check(paths: &Paths, from: &str, to: &str) -> crate::Result<()> {
     let own = own()?;
+    let running = approvers(paths, &own).map_err(|why| {
+        Error::new(format!(
+            "refusing to publish: it would rewrite the vault's admin locker into a newer format, \
+             which an older approver cannot read, and {why}"
+        ))
+    })?;
+    verdict(from, to, &own, &running)
+}
+
+/// This Mac's approvers: each program its subscriber runs or starts next ([`programs`]), with
+/// the release its `--version` names, `own`'s where it is this program. Why they cannot be read
+/// where [`programs`] says.
+pub(super) fn approvers(paths: &Paths, own: &Own) -> Result<Vec<Running>, String> {
     #[cfg(test)]
     if let Some(played) = PLAYED.with(|played| played.borrow().clone()) {
-        return verdict(from, to, &own, &played);
+        return Ok(played);
     }
     let state = service::state(&paths.home, Job::Subscriber);
     let found = programs(state, &|pid| program_of(pid).map(canonical), &|unit| {
         service::unit_program(unit).map(canonical)
     })?;
-    let running: Vec<Running> = found
+    Ok(found
         .into_iter()
         .map(|(pid, program)| {
             let version = if own.program.as_ref() == Some(&program) {
@@ -182,8 +190,7 @@ pub(super) fn check(paths: &Paths, from: &str, to: &str) -> crate::Result<()> {
                 version,
             }
         })
-        .collect();
-    verdict(from, to, &own, &running)
+        .collect())
 }
 
 /// [`judge`] over each of the subscriber's programs. A running program refused while the one its
@@ -267,7 +274,7 @@ fn program_of(pid: u32) -> Option<PathBuf> {
 }
 
 /// The release `program --version` names.
-fn version_of(program: &Path) -> Result<Version, String> {
+pub(super) fn version_of(program: &Path) -> Result<Version, String> {
     let mut command = aterm_uds::spawnfd::command(program);
     command.arg("--version");
     let out = aterm_uds::deadline::output_within(&mut command, Duration::from_secs(30))
@@ -491,15 +498,13 @@ mod tests {
         );
         // Nothing nameable, or an unreadable state, refuses rather than passes.
         let refused = programs(installed(None), &|_| None, &nothing)
-            .expect_err("an installed job of no nameable program refuses")
-            .to_string();
+            .expect_err("an installed job of no nameable program refuses");
         assert!(
             refused.contains("systems.alab.aterm-secrets.plist starts cannot be named"),
             "{refused}"
         );
         let refused = programs(Err(Error::new("launchctl hung")), &|_| at(HERE), &snapshot)
-            .expect_err("an unknown state refuses")
-            .to_string();
+            .expect_err("an unknown state refuses");
         assert!(
             refused.contains("runs is unknown (launchctl hung)"),
             "{refused}"

@@ -53,10 +53,10 @@ const AGY: Screens = Screens {
 
 /// The `tool` scripts of agy's four boxes: shell, write, edit, question.
 const SCRIPTS: [&str; 4] = [
-    r#"{"name":"run_command","input":{"CommandLine":"touch lab-probe.txt","Cwd":"@PROJ@","WaitMsBeforeAsync":2000,"toolSummary":"Lab probe file","toolAction":"Creating the lab probe file"}}"#,
-    r#"{"name":"write_to_file","input":{"TargetFile":"@PROJ@/lab-write.txt","Overwrite":true,"CodeContent":"written by the lab stub\nsecond line\n","Description":"Writes the lab probe file.","toolSummary":"Lab probe write","toolAction":"Writing the lab probe file"}}"#,
-    r#"{"name":"replace_file_content","input":{"TargetFile":"@PROJ@/lab-write.txt","Instruction":"Change the first line.","Description":"Edits the lab probe file.","AllowMultiple":false,"TargetContent":"written by the lab stub","ReplacementContent":"edited by the lab stub","StartLine":1,"EndLine":1,"toolSummary":"Lab probe edit","toolAction":"Editing the lab probe file"}}"#,
-    r#"{"name":"ask_question","input":{"questions":[{"question":"Which colour should the lab probe use?","options":["Red","Green","Blue"],"is_multi_select":false}],"toolSummary":"Colour preference","toolAction":"Asking for a colour"}}"#,
+    r#"{"name":"run_command","input":{"CommandLine":"touch lab-probe.txt","WaitMsBeforeAsync":2000,"toolSummary":"Lab probe file"}}"#,
+    r#"{"name":"write_file","input":{"Path":"@PROJ@/lab-write.txt","Overwrite":true,"Content":"written by the lab stub\nsecond line\n"}}"#,
+    r#"{"name":"edit_file","input":{"Path":"@PROJ@/lab-write.txt","Target":"written by the lab stub","Replacement":"edited by the lab stub"}}"#,
+    r#"{"name":"ask_question","input":{"questions":[{"question":"Which colour should the lab probe use?","options":["Red","Green","Blue"],"is_multi_select":false}]}}"#,
 ];
 
 /// agy's feedback survey, drawn unasked at the end of a turn.
@@ -662,12 +662,7 @@ mod tests {
             .collect();
         assert_eq!(
             got,
-            [
-                "run_command",
-                "write_to_file",
-                "replace_file_content",
-                "ask_question",
-            ]
+            ["run_command", "write_file", "edit_file", "ask_question",]
         );
         assert!(
             calls
@@ -676,7 +671,7 @@ mod tests {
         );
         let file = |c: &J| {
             let i = c.get("input").unwrap();
-            i.get("TargetFile").and_then(J::as_str).map(str::to_string)
+            i.get("Path").and_then(J::as_str).map(str::to_string)
         };
         assert_eq!(file(&calls[1]), file(&calls[2]));
         assert_eq!(file(&calls[1]).as_deref(), Some("@PROJ@/lab-write.txt"));

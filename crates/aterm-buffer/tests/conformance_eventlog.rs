@@ -9,7 +9,7 @@ use aterm_models_core::ring_model;
 use aterm_spec::verify;
 use std::collections::BTreeMap;
 
-const CAP: u64 = 1 << 16;
+const CAP: u64 = aterm_buffer::MAX_LOG_EVENTS as u64;
 
 fn project(s: &Surface) -> (u64, u64) {
     let seq = s.seq().0;

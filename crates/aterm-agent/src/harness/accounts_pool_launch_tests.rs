@@ -55,14 +55,14 @@ pub(crate) fn launch_transition(
     let store = world.seat().store(cli);
     let before = (case == 10).then(|| std::fs::read(store.state_file()).unwrap());
     let _held = (case == 10).then(|| store.acquire().unwrap());
-    let read = |_: Cli, _: &Path, _: i64| {
+    let read = |_: Cli, _: &Path, _: Option<&str>, _: i64| {
         assert!(
             !matches!(case, 3 | 4 | 7 | 8 | 9),
             "unreadable records must not probe usage"
         );
         (case == 10).then(|| Usage {
             sample: near_wall(),
-            wall: Some(("five_hour", Some(NOW + HOUR))),
+            walls: vec![("five_hour", Some(NOW + HOUR))],
         })
     };
     let outcome = match super::super::launch_env(&world.seat(), cli, &read) {
@@ -97,8 +97,9 @@ fn a_lost_binding_snapshot_holds_launch_before_usage_is_read() {
     let store = world.seat().store(Cli::Codex);
     store.save_logins(&accounts::Logins::default()).unwrap();
     std::fs::rename(store.logins_file(), world.root.join("kept-bindings.json")).unwrap();
-    let no_read =
-        |_: Cli, _: &Path, _: i64| -> Option<Usage> { panic!("unknown binding usage read") };
+    let no_read = |_: Cli, _: &Path, _: Option<&str>, _: i64| -> Option<Usage> {
+        panic!("unknown binding usage read")
+    };
     let why = super::super::launch_env(&world.seat(), Cli::Codex, &no_read).unwrap_err();
     assert!(why.contains("logins.seen"), "{why}");
     assert!(!store.logins_file().exists());
@@ -106,7 +107,9 @@ fn a_lost_binding_snapshot_holds_launch_before_usage_is_read() {
 
 #[test]
 fn intentional_unmanaged_launches_are_successful_no_ops() {
-    let no_read = |_: Cli, _: &Path, _: i64| -> Option<Usage> { panic!("unmanaged usage read") };
+    let no_read = |_: Cli, _: &Path, _: Option<&str>, _: i64| -> Option<Usage> {
+        panic!("unmanaged usage read")
+    };
     let off = World::new("launch-off-result");
     off.two(Cli::Codex);
     off.on_main(Cli::Codex, &[]);
@@ -169,8 +172,9 @@ fn pins_refuse_bad_rows_and_new_walls_release_the_override() {
                 format!("[harness]\naccounts='{mode}'\n"),
             )
             .unwrap();
-            let no_read =
-                |_: Cli, _: &Path, _: i64| -> Option<Usage> { panic!("invalid pin usage read") };
+            let no_read = |_: Cli, _: &Path, _: Option<&str>, _: i64| -> Option<Usage> {
+                panic!("invalid pin usage read")
+            };
             assert!(super::super::launch_env(&world.seat(), Cli::Codex, &no_read).is_err());
         }
         let world = World::new("launch-limit-pin");
@@ -250,7 +254,7 @@ fn a_failed_state_reload_after_usage_cannot_return_a_login() {
     world.two(Cli::Codex);
     world.on_main(Cli::Codex, &[]);
     let path = world.seat().store(Cli::Codex).state_file();
-    let read = |_: Cli, _: &Path, _: i64| {
+    let read = |_: Cli, _: &Path, _: Option<&str>, _: i64| {
         std::fs::write(&path, b"unreadable after usage").unwrap();
         None
     };

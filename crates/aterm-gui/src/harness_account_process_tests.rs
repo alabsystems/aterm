@@ -5,7 +5,7 @@ use super::*;
 
 fn applied(idle: &WorkerIdle, roster: &accounts::Roster, to: &str, snap: &Snapshot) -> Applied {
     match observed_account(&idle.hooks, roster, snap) {
-        Ok(Some(label)) if label == to => Applied::Yes,
+        Ok(observed) if observed.label.as_deref() == Some(to) => Applied::Yes,
         Ok(_) => Applied::No,
         Err(()) => Applied::Unread,
     }

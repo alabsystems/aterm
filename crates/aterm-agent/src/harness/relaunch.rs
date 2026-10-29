@@ -693,6 +693,132 @@ pub(super) fn expired(st: &St, now: u64) -> Option<(&'static str, String)> {
     }
 }
 
+/// The word a Claude restart in flight stops with once another conversation holds its tab
+/// ([`overtaken`]).
+pub const TAB_TAKEN: &str = "tab-taken";
+
+/// Whether a Claude restart in flight can be overtaken: it has no live agent of its own (it is
+/// exiting, or relaunched with no relaunched agent or one that is gone) and its agent is gone.
+/// Once relaunched afresh ([`starts_afresh`]) it never is: the agent its line started holds a new
+/// conversation from a launch that resumes none, which [`overtaken`] cannot tell from another
+/// conversation's agent, so its held wait ([`await_new`]) adopts that agent (`done:fresh`).
+pub(super) fn overtakable(st: &St, alive: impl Fn(u32) -> bool) -> bool {
+    let unheld = match st.phase {
+        upgrade::Phase::Exiting { .. } => true,
+        upgrade::Phase::Relaunched { .. } if starts_afresh(&st.cause) => false,
+        upgrade::Phase::Relaunched { .. } => st.relaunched_pid == 0 || st.relaunched_gone(&alive),
+        _ => false,
+    };
+    // The tab's holder is read from Claude Code's own session files.
+    let claude = match st.agent {
+        upgrade::Agent::Claude => true,
+        upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => false,
+    };
+    claude && unheld && (st.exited_at != 0 || !alive(st.pid))
+}
+
+/// Whether process `pid`, holding conversation `held` in the foreground of the tab of the restart
+/// in flight of conversation `session` by the registry that records its birth as `born`, overtook
+/// that restart: the restart is [`overtakable`] and `pid` is another live process, the one that
+/// wrote that registry ([`wrote_registry`]), on another conversation, whose launch did not resume
+/// `session`. [`STALE_S`] stays the backstop of a restart nothing overtook.
+pub(super) fn overtaken(
+    st: &St,
+    session: &str,
+    pid: u32,
+    born: &str,
+    held: &str,
+    alive: impl Fn(u32) -> bool,
+) -> bool {
+    overtakable(st, &alive)
+        && pid != 0
+        && pid != st.pid
+        && pid != st.relaunched_pid
+        && held != session
+        && upgrade::is_session_id(held)
+        && alive(pid)
+        && wrote_registry(pid, born)
+        && !launched_to_resume(pid, session)
+}
+
+/// Whether live process `pid` is the one that wrote the registry recording its birth as `born`:
+/// the kernel reads its start as `born` does. A crashed agent's session file stays while any
+/// process holds its number, so a program that took that number in front of the tab is no agent.
+fn wrote_registry(pid: u32, born: &str) -> bool {
+    kernel_start(pid).as_deref() == Some(squash(born).as_str())
+}
+
+/// Whether process `pid`'s launch resumes `session`, or its arguments could not be read.
+fn launched_to_resume(pid: u32, session: &str) -> bool {
+    atpkg::caller_shell::process_args(pid)
+        .is_none_or(|args| upgrade::launch_resume(&args.argv).flatten().as_deref() == Some(session))
+}
+
+/// Tab `tab`'s foreground process group: the host roster's (`tabs`), or with no roster the group
+/// in front of `shell`'s terminal when it is not the shell's own.
+pub(super) fn tab_front(
+    tabs: Option<&[super::upgrade_drive::LiveTab]>,
+    tab: &str,
+    shell: u32,
+) -> Option<i64> {
+    match tabs {
+        Some(tabs) => tabs.iter().find(|t| t.sid == tab).and_then(|t| t.fgpgid),
+        None if shell == NO_SHELL => None,
+        None => {
+            ids(shell).and_then(|(_, group, front)| (front > 0 && front != group).then_some(front))
+        }
+    }
+}
+
+/// The process in `files` that leads `front`, its tab's foreground group, and overtook the restart
+/// in flight `st` of conversation `session` ([`overtaken`]).
+pub(super) fn overtaken_by<'a>(
+    st: &St,
+    session: &str,
+    files: &'a [SessionFile],
+    front: Option<i64>,
+) -> Option<&'a SessionFile> {
+    let front = front.filter(|&group| group > 0)?;
+    files
+        .iter()
+        .filter(|sf| i64::from(sf.pid) == front && sf.kind == "interactive")
+        .find(|sf| overtaken(st, session, sf.pid, &sf.proc_start, &sf.session_id, alive))
+}
+
+/// The ledger line of a restart [`overtaken`] by process `pid` on conversation `held`.
+pub(super) fn overtaken_line(pid: u32, held: &str) -> String {
+    format!(
+        "claude (pid {pid}) holds conversation {held} in its tab since the agent's end: nothing \
+         typed"
+    )
+}
+
+/// Close the restart in flight `st` of conversation `session` as [`TAB_TAKEN`] when the agent in
+/// front of its tab `tab` overtook it ([`overtaken_by`]), the tab's group read from its host's
+/// roster on `c` (or else from its shell's terminal) and the agent from the record's own registry.
+fn close_if_taken(
+    opts: &Opts,
+    r: &Report,
+    st: &mut St,
+    session: &str,
+    c: &mut Client,
+    tab: &str,
+) -> Option<Report> {
+    if !overtakable(st, alive) {
+        return None;
+    }
+    let files = st.agent_records(&opts.home).session_files()?;
+    let tabs = host_roster(c);
+    let front = tab_front(tabs.as_deref(), tab, st.shell);
+    let sf = overtaken_by(st, session, &files, front)?;
+    let line = overtaken_line(sf.pid, &sf.session_id);
+    st.close_overtaken(TAB_TAKEN, now_s());
+    let r = said(r.clone(), format!("failed:{TAB_TAKEN}"));
+    ledger(opts, &r, &line);
+    save(opts, session, st);
+    Some(r)
+}
+
 /// What a new process holding the conversation of a relaunch in flight is to that relaunch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Relaunch {
@@ -2080,7 +2206,8 @@ pub(super) fn confirm(opts: &Opts, r: &Report, st: &mut St, key: &str, now: u64)
         });
     }
     let after = resumed_model(&st.agent_records(&opts.home), key, st.mark, &st.resumed_on);
-    if after.is_none() && st.mark != 0 && now < st.confirm_by {
+    let agent_alive = st.resumed_pid == 0 || alive(st.resumed_pid);
+    if after.is_none() && st.mark != 0 && now < st.confirm_by && agent_alive {
         return None;
     }
     let r = said(
@@ -2120,7 +2247,7 @@ const RESTORE_LOST: &str =
 
 /// The one look after a quiet restart or a carry-on that typed nothing, open [`RESTORE_LOOK`]: if
 /// the resumed agent warned that something did not come back, a tasked agent is told to restore
-/// what it relies on.
+/// what it relies on. A look whose resumed agent is gone closes at once.
 pub(super) fn restore_look(
     opts: &Opts,
     r: &Report,
@@ -2131,6 +2258,24 @@ pub(super) fn restore_look(
     mut tab_probe: impl FnMut(&mut Client, u32, &str) -> bool,
 ) -> Option<Report> {
     let records = st.agent_records(&opts.home);
+    if !alive(st.resumed_pid) {
+        // The look is its resumed agent's, and that agent is gone: a look that warned is lost
+        // now, and one that did not closes saying nothing, since `done:resumed` was said when
+        // the restart resumed it ([`done_quietly`]). While the look is open its agent ended
+        // before the look; once `confirm_by` passed, no idle point came during it to say so.
+        if look_warned(&records, key, st) {
+            let why = if now < st.confirm_by {
+                "its agent ended before the look"
+            } else {
+                "no idle point came to say so at"
+            };
+            return Some(restore_lost(opts, r, st, key, why));
+        }
+        st.confirm_by = 0;
+        st.look_word.clear();
+        save(opts, key, st);
+        return None;
+    }
     if !look_warned(&records, key, st) {
         if now < st.confirm_by {
             return None;
@@ -2899,8 +3044,9 @@ pub fn resume_argv(cli: accounts::Cli, id: &str) -> [String; 2] {
 /// `codex resume [OPTIONS] [SESSION_ID]`. Its flags are those [`super::codex_alab::kept_flags`]
 /// keeps, which drops `-i`/`--image` (a value list ahead of the thread would read it as a file)
 /// and every word that is not a flag. Every other CLI's resume pair follows the flags. Nothing
-/// types a pooled Codex line yet: [`super::accounts_pool::session_move`] is its one caller, and
-/// the host does not take that advice.
+/// types a pooled Codex line yet: [`super::accounts_pool::session_plan`] prepares it, and
+/// the host asks it of no Codex session (aterm-gui's `harness_host` supervises no Codex: its
+/// worker only watches) and keeps no line it returns.
 ///
 /// # Errors
 ///
@@ -4039,7 +4185,8 @@ impl ExitRecord {
 #[must_use]
 pub fn launch_ended(snap: &Snapshot, left: &ExitRecord) -> Option<&'static str> {
     let one_shot = match &snap.run {
-        AgentRun::Claude | AgentRun::Codex(_) => upgrade::one_shot(&snap.argv),
+        AgentRun::Claude => upgrade::one_shot(&snap.argv),
+        AgentRun::Codex(_) => !super::codex_alab::is_tui_argv(&snap.argv),
         AgentRun::Muse(_) => !super::upgrade_muse::is_tui_argv(&snap.argv),
         AgentRun::Agy(_) => !super::upgrade_agy::is_tui_argv(&snap.argv),
     };
@@ -4564,6 +4711,9 @@ fn carry_in_flight(opts: &Opts, r: Report, mut st: St, session: &str, tab: &str)
     let Ok(mut c) = connect(opts, tab) else {
         return said(r, "wait:no-socket");
     };
+    if let Some(r) = close_if_taken(opts, &r, &mut st, session, &mut c, tab) {
+        return r;
+    }
     let r = match st.phase {
         upgrade::Phase::Exiting { .. } => relaunch(opts, r, &mut st, &mut c, session, &Live),
         _ => await_new(opts, r, &mut st, &mut c, session, &Live),
@@ -4728,7 +4878,7 @@ pub fn carry_restart(
     } else {
         st.seen_gone(now_s())
     };
-    if carried_here(st.agent) && stamped && !opts.dry_run {
+    if stamped && !opts.dry_run {
         save(opts, &session, &st);
     }
     let r = Report {
@@ -4968,10 +5118,117 @@ fn owed_record(opts: &Opts, only: Option<upgrade::Agent>) -> Option<(String, St)
         }
         let session = path.file_stem()?.to_string_lossy().into_owned();
         let st = load(opts, &session)?;
-        let due = matches!(st.phase, upgrade::Phase::Relaunched { .. }) || st.confirming();
+        // A look is its resumed agent's: once that agent is gone, whatever runs next in the tab
+        // is owed nothing of it, and a sweep's confirmations close it ([`restore_look`]).
+        let due = matches!(st.phase, upgrade::Phase::Relaunched { .. })
+            || (st.confirming() && st.resumed_pid != 0 && alive(st.resumed_pid));
         let its = only.is_none_or(|agent| st.agent == agent);
         (st.tab == tab && due && its).then_some((session, st))
     })
+}
+
+/// Whether `snap` is a foreground agent that aterm's own relaunch resumed on its conversation in
+/// tab `snap.tab` (and `opts.only_sid` when set), rather than a program started afresh.
+#[must_use]
+pub fn agent_resumed(opts: &Opts, snap: &Snapshot) -> bool {
+    if snap.pid == 0 {
+        return false;
+    }
+    let tab = opts.only_sid.as_deref().unwrap_or(&snap.tab);
+    if snap.tab != tab {
+        return false;
+    }
+    let snap_start = squash(&snap.start);
+    let snap_began = super::upgrade_models::parse_lstart(&snap_start);
+    let Ok(dir) = std::fs::read_dir(state_dir(opts)) else {
+        return false;
+    };
+    dir.flatten().any(|e| {
+        let path = e.path();
+        if path.extension().is_none_or(|x| x != "json") {
+            return false;
+        }
+        let Some(session) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+            return false;
+        };
+        let Some(st) = load(opts, &session) else {
+            return false;
+        };
+        record_resumed_snapshot(snap, &snap_start, snap_began, &session, &st)
+    })
+}
+
+fn record_resumed_snapshot(
+    snap: &Snapshot,
+    snap_start: &str,
+    snap_began: Option<u64>,
+    session: &str,
+    st: &St,
+) -> bool {
+    if st.tab != snap.tab
+        || st.agent != snap.agent()
+        || starts_afresh(&st.cause)
+        || st.relaunched_at == 0
+    {
+        return false;
+    }
+    if snap.pid == st.pid
+        && !(st.cause == CAUSE_HOST
+            && !snap_start.is_empty()
+            && snap_start != squash(&st.proc_start)
+            && snap_began.is_some_and(|began| began.saturating_add(2) >= st.relaunched_at))
+    {
+        return false;
+    }
+    snap_resumes_record(snap, session, st)
+        && snap_matches_relaunch(snap.pid, snap_start, snap_began, st)
+}
+
+fn snap_resumes_record(snap: &Snapshot, session: &str, st: &St) -> bool {
+    match snap.agent() {
+        upgrade::Agent::Claude => {
+            upgrade::launch_resume(&snap.argv).flatten().as_deref() == Some(session)
+                && snap.session.as_deref().is_none_or(|cur| cur == session)
+        }
+        upgrade::Agent::Codex => {
+            !st.thread.is_empty()
+                && (super::codex_alab::resumed_thread(&snap.argv).as_deref()
+                    == Some(st.thread.as_str())
+                    || (!st.resume_argv.is_empty() && snap.argv == st.resume_argv))
+                && snap.session.as_deref().is_none_or(|cur| cur == st.thread)
+        }
+        upgrade::Agent::Muse => {
+            !st.thread.is_empty()
+                && super::upgrade_muse::resumed_ref(&snap.argv).as_deref()
+                    == Some(st.thread.as_str())
+                && snap.session.as_deref().is_none_or(|cur| cur == st.thread)
+        }
+        upgrade::Agent::Agy => {
+            !st.thread.is_empty()
+                && super::upgrade_agy::resumed_conversation(&snap.argv).as_deref()
+                    == Some(st.thread.as_str())
+                && snap.session.as_deref().is_none_or(|cur| cur == st.thread)
+        }
+    }
+}
+
+fn snap_matches_relaunch(pid: u32, snap_start: &str, snap_began: Option<u64>, st: &St) -> bool {
+    if snap_began.is_some_and(|began| began.saturating_add(2) < st.relaunched_at) {
+        return false;
+    }
+    if st.relaunched_pid == pid || st.resumed_pid == pid {
+        if !st.relaunched_start.is_empty() && !snap_start.is_empty() {
+            snap_start == squash(&st.relaunched_start)
+        } else if st.done_at != 0 {
+            snap_began.is_none_or(|began| began <= st.done_at.saturating_add(5))
+        } else {
+            true
+        }
+    } else {
+        st.relaunched_pid == 0
+            && st.resumed_pid == 0
+            && matches!(st.phase, upgrade::Phase::Relaunched { .. })
+    }
 }
 
 /// Carry on the relaunched agent at its loop's idle point, where the loop parked for an [`owed`] continuation.
@@ -5152,9 +5409,15 @@ pub fn settles_again(step: &str) -> bool {
         || (step.starts_with("done:") && step != "done:lost")
 }
 
-fn settle_look(opts: &Opts, r: &Report, st: &mut St, key: &str, now: u64) -> Option<Report> {
+pub(super) fn settle_look(
+    opts: &Opts,
+    r: &Report,
+    st: &mut St,
+    key: &str,
+    now: u64,
+) -> Option<Report> {
     let records = st.agent_records(&opts.home);
-    if look_warned(&records, key, st) {
+    if alive(st.resumed_pid) && look_warned(&records, key, st) {
         return Some(match told_nothing(opts, &records, key, st) {
             Some(why) => restore_lost(opts, r, st, key, why),
             None => said(r.clone(), "wait:owed"),

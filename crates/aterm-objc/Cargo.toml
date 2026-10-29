@@ -14,7 +14,9 @@ description = "aterm's first-party Objective-C runtime layer: typed message send
 # defeat the whole point. Everything below is std plus `libobjc`, `Foundation`
 # and `CoreFoundation`, which ship with the OS and are already loaded in every
 # aterm process. CoreGraphics is `aterm-cg`'s, so no feature here can make a
-# binary that reaches this crate load a GUI framework.
+# binary that reaches this crate load a GUI framework. Network.framework is not
+# linked either: `src/path_monitor.rs` opens it with `dlopen` at the first
+# monitor's start, so a process that never starts one loads nothing more.
 #
 # The integration files that only READ the runtime are modules of one binary,
 # `tests/objc_static_suite.rs`; the files whose subject is a process death (a

@@ -56,7 +56,7 @@ fn a_reader_hears_claudes_words_under_the_glass() {
     );
     let presented = presented.value();
     assert!(
-        presented.contains(NOTICE.text)
+        presented.contains(aterm_types::identity::SITE_URL)
             && !presented.contains("bypass permissions on")
             && presented.contains(LOGO),
         "NEGATIVE CONTROL: the presented frame holds the glass's words and the rule's lockup: {presented}"
@@ -69,7 +69,7 @@ fn a_reader_hears_claudes_words_under_the_glass() {
             && heard
                 .value()
                 .contains(aterm_phase::anchor!("notice.updated_details"))
-            && !heard.value().contains(NOTICE.short)
+            && !heard.value().contains(aterm_types::identity::SITE)
             && !heard.value().contains("yolo")
             && !heard.value().contains(LOGO),
         "{}",
@@ -126,23 +126,38 @@ fn a_reader_hears_claudes_words_under_the_glass() {
             )
         })
         .collect();
+    let link = |at| crate::a11y_tree::HarnessChip::Link(at);
     assert_eq!(
         links,
-        vec![(
-            Some((session, crate::a11y_tree::HarnessChip::Link)),
-            Some(NOTICE.text.to_owned()),
-            true
-        )],
-        "the banner's link is a link a reader can press, named by its words"
+        vec![
+            (
+                Some((session, link(GlassLink::Line))),
+                Some(aterm_types::identity::SITE.to_owned()),
+                true
+            ),
+            (
+                Some((session, link(GlassLink::Notice))),
+                Some(aterm_types::identity::SITE_URL.to_owned()),
+                true
+            ),
+        ],
+        "the line's link and the banner's are links a reader can press, named by their words"
     );
-    let _ = crate::platform::take_opened_urls();
-    app.press_claude_chip_for_reader(wid, session, crate::a11y_tree::HarnessChip::Link);
-    assert_eq!(
-        crate::platform::take_opened_urls(),
-        vec![NOTICE.url.to_string()],
-        "the reader's press opens it"
+    for at in [GlassLink::Notice, GlassLink::Line] {
+        let _ = crate::platform::take_opened_urls();
+        app.press_claude_chip_for_reader(wid, session, link(at));
+        assert_eq!(
+            crate::platform::take_opened_urls(),
+            vec![aterm_types::identity::SITE_URL.to_string()],
+            "{at:?}: the reader's press opens it"
+        );
+    }
+    app.press_claude_chip_for_reader(wid, session, link(GlassLink::Announcement));
+    assert!(
+        crate::platform::take_opened_urls().is_empty(),
+        "CONTROL: no announcement on this screen, nothing opened"
     );
-    app.press_claude_chip_for_reader(wid, session + 1, crate::a11y_tree::HarnessChip::Link);
+    app.press_claude_chip_for_reader(wid, session + 1, link(GlassLink::Notice));
     assert!(
         crate::platform::take_opened_urls().is_empty(),
         "CONTROL: no banner, nothing opened"

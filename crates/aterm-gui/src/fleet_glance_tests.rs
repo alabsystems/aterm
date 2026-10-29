@@ -379,8 +379,9 @@ fn a_content_peer_says_what_its_need_is_and_a_freeze_dates_only_an_agent() {
     );
 }
 
-/// WHAT THE BOOK SAYS OF THIS MAC (`read_book`): no fleet key is no fleet; a
-/// book with peers that joined it is the issuer's; a member whose book holds
+/// WHAT THE BOOK SAYS OF THIS MAC (`read_book`): no fleet key is no fleet; the
+/// code file identifies the Mac that minted it, and peers that joined
+/// it no longer establish that local fact (F17); a member whose book holds
 /// only its issuer, and no copy of that issuer's book (an older issuer, or no
 /// read yet), knows only it, and names it.
 #[cfg(unix)]
@@ -408,6 +409,7 @@ fn the_book_says_whether_this_mac_knows_only_its_issuer() {
         seen_ms: None,
         via,
         fleet: None,
+        signed: None,
     };
     let book = |peers: Vec<Peer>| {
         update_peers(&dir, |book| {
@@ -421,7 +423,7 @@ fn the_book_says_whether_this_mac_knows_only_its_issuer() {
     assert_eq!(
         (
             member.in_fleet,
-            member.issuer,
+            member.minted,
             member.issuer_label.as_deref()
         ),
         (true, false, Some("m7"))
@@ -439,15 +441,25 @@ fn the_book_says_whether_this_mac_knows_only_its_issuer() {
         (Some("m7"), None),
         "its issuer's key is bound"
     );
-    let issuer = book(vec![peer("mac-1", Via::Joined)]);
-    assert!(issuer.issuer && issuer.issuer_label.is_none());
-    assert_eq!(
-        issuer.unbound_issuer, None,
-        "the issuer binds none to itself"
+    let joined = book(vec![peer("mac-1", Via::Joined)]);
+    assert!(
+        !joined.minted && joined.issuer_label.is_none(),
+        "peers that joined it say no more that this Mac founded the fleet"
     );
+    assert_eq!(
+        joined.unbound_issuer, None,
+        "a peer that joined is no issuer"
+    );
+    let code = dir.join(aterm_net::fleet_member::CODE_FILE);
+    std::fs::write(&code, b"code\n").unwrap();
+    assert!(
+        read_book(&dir).minted,
+        "the code file identifies where the code was minted"
+    );
+    std::fs::remove_file(&code).unwrap();
     let more = book(vec![peer("m7", Via::Issuer), peer("mac-9", Via::Manual)]);
     assert_eq!(
-        (more.issuer, more.issuer_label),
+        (more.minted, more.issuer_label),
         (false, None),
         "a peer named by hand is read too"
     );
@@ -574,20 +586,20 @@ fn all_no_route_is_one_line_and_one_entry() {
 fn should_poll_reads_on_the_minute_or_at_the_menu() {
     let member = BookFacts {
         in_fleet: true,
-        issuer: false,
+        minted: false,
         issuer_label: Some("m7".to_string()),
         unbound_issuer: None,
     };
     let issuer = BookFacts {
         in_fleet: true,
-        issuer: true,
+        minted: true,
         issuer_label: None,
         unbound_issuer: None,
     };
     let none = BookFacts::default();
     let at = |s: u64| s * 1000;
     type Case<'a> = (&'a BookFacts, bool, Option<u64>, u64, bool, bool);
-    let cases: [Case<'_>; 12] = [
+    let cases: [Case<'_>; 15] = [
         (&none, true, None, at(100), true, false),
         (&member, false, None, at(100), false, false),
         (&member, false, None, at(100), true, true),
@@ -596,14 +608,113 @@ fn should_poll_reads_on_the_minute_or_at_the_menu() {
         (&member, false, Some(at(0)), at(100), false, false),
         (&member, true, Some(at(0)), at(59), false, false),
         (&member, true, Some(at(0)), at(60), false, true),
-        (&issuer, false, None, at(1), false, true),
+        (&issuer, false, None, at(1), false, false),
         (&issuer, false, Some(at(10)), at(50), false, false),
-        (&issuer, false, Some(at(10)), at(70), false, true),
+        (&issuer, false, Some(at(10)), at(70), false, false),
         (&issuer, false, Some(at(95)), at(100), true, false),
+        (&issuer, false, Some(at(0)), at(100), true, true),
+        (&issuer, true, None, at(1), false, true),
+        (&issuer, true, Some(at(10)), at(70), false, true),
     ];
     for (n, (book, watch, last, now, menu, want)) in cases.into_iter().enumerate() {
-        assert_eq!(should_poll(book, watch, last, now, menu), want, "case {n}");
+        assert_eq!(
+            should_poll(book, watch, last, now, menu, POLL_EVERY),
+            want,
+            "case {n}"
+        );
     }
+}
+
+/// A read where every peer the book names was dark.
+struct Nobody {
+    runs: Sender<()>,
+}
+
+impl FleetRunner for Nobody {
+    fn run(&mut self) -> ReadAnswer {
+        let _ = self.runs.send(());
+        Ok((
+            r#"[{"fleet":true,"label":"m7.local at 192.168.1.7:7100","error":"did not answer in time"}]"#
+                .to_string(),
+            String::new(),
+        ))
+    }
+}
+
+/// THE ISSUER'S GLANCE BACKS OFF WHILE IT REACHES NOBODY (docs/DESIGN-fluid-swarm-2026-10-28.md
+/// F4): after a read that reached no peer the next waits twice as long, up to 30 minutes; a move
+/// of this Mac's network reads at once and starts the wait again from the minute; a read that
+/// reached a peer starts it again too.
+/// NEGATIVE CONTROL: a constant 60 s wait (no `Quiet`) reads again at the minute, failing the
+/// first "no read" look; a `Kick::Moved` that ends no backoff fails the move's read.
+#[test]
+fn a_glance_that_reached_nobody_backs_off_and_a_move_resets_it() {
+    use std::sync::atomic::AtomicU64;
+    let hang = aterm_spec::wait::MUST_HAPPEN;
+    let start = 1_000_000;
+    let clock = Arc::new(AtomicU64::new(start));
+    let (runs_tx, runs) = std::sync::mpsc::channel();
+    let (looks_tx, looks) = std::sync::mpsc::channel();
+    let (posts_tx, _posts) = std::sync::mpsc::channel();
+    let now = Arc::clone(&clock);
+    let glance = spawn(
+        Box::new(Nobody { runs: runs_tx }),
+        ReaderSeams {
+            tick: Duration::from_millis(20),
+            now_ms: Box::new(move || {
+                let _ = looks_tx.send(());
+                now.load(Ordering::SeqCst)
+            }),
+            ..seams(true, posts_tx)
+        },
+    )
+    .expect("the thread starts");
+    // Until the read just made is over and dated `at_ms`: the reader dates a read by the clock
+    // after it, so the clock moves only once it has.
+    let read_over = |at_ms: u64| {
+        while glance.copy().tried_ms != Some(at_ms) {
+            looks.recv_timeout(hang).expect("the read ends");
+        }
+    };
+    runs.recv_timeout(hang).expect("the issuer reads at once");
+    read_over(start);
+    // Whether the reader, looking three times at `at` seconds past the start (its decision is the
+    // first or second look, and a read it makes runs before the third), read.
+    let read_at = |at: u64| {
+        let now = start + at * 1000;
+        clock.store(now, Ordering::SeqCst);
+        while looks.try_recv().is_ok() {}
+        for _ in 0..3 {
+            looks.recv_timeout(hang).expect("the reader looks again");
+        }
+        let read = runs.try_recv().is_ok();
+        if read {
+            read_over(now);
+        }
+        read
+    };
+    assert!(!read_at(60), "reached nobody: not again at the minute");
+    assert!(read_at(120), "but at two");
+    assert!(!read_at(120 + 239), "then four");
+    assert!(read_at(120 + 240));
+    let mut at = 120 + 240;
+    let mut wait = 480;
+    while wait < QUIET_MAX.as_secs() {
+        assert!(!read_at(at + wait - 1), "wait {wait}");
+        assert!(read_at(at + wait), "wait {wait}");
+        at += wait;
+        wait *= 2;
+    }
+    assert!(!read_at(at + QUIET_MAX.as_secs() - 1), "never past 30 min");
+    assert!(read_at(at + QUIET_MAX.as_secs()));
+    // The move comes a second after that read, so its own read is dated apart from it.
+    at += QUIET_MAX.as_secs() + 1;
+    clock.store(start + at * 1000, Ordering::SeqCst);
+    glance.kick(Kick::Moved);
+    runs.recv_timeout(hang).expect("a move reads at once");
+    read_over(start + at * 1000);
+    assert!(!read_at(at + 119), "the move started the wait again");
+    assert!(read_at(at + 120));
 }
 
 struct Gated {
@@ -621,19 +732,20 @@ impl FleetRunner for Gated {
     }
 }
 
-fn seams(issuer: bool, posts: Sender<()>) -> ReaderSeams {
+fn seams(minted: bool, posts: Sender<()>) -> ReaderSeams {
     ReaderSeams {
         book: Box::new(move || BookFacts {
             in_fleet: true,
-            issuer,
+            minted,
             issuer_label: None,
             unbound_issuer: None,
         }),
-        watch: Arc::new(AtomicBool::new(false)),
+        watch: Arc::new(AtomicBool::new(minted)),
         own_node: None,
         now_ms: Box::new(|| aterm_time::unix_millis().unwrap_or(0)),
         post: Box::new(move || posts.send(()).is_ok()),
         tick: Duration::from_secs(3600),
+        moved: None,
     }
 }
 
@@ -727,6 +839,22 @@ fn the_app_is_told_when_the_last_read_stops_counting() {
         looks.recv_timeout(hang).expect("the reader looks again");
     }
     assert!(posts.try_recv().is_err(), "a fresh read owes no post");
+    clock.store(read_at - 1_000, Ordering::SeqCst);
+    posts
+        .recv_timeout(hang)
+        .expect("the clock rollback is told");
+    let rewound = glance.copy();
+    assert!(!rewound.snapshot.expect("kept").fresh(read_at - 1_000));
+    assert_eq!(rewound.generation, 1, "the rollback makes no new read");
+    assert!(!rewound.reading, "disabled polling stays disabled");
+    clock.store(read_at, Ordering::SeqCst);
+    posts
+        .recv_timeout(hang)
+        .expect("the clock catch-up is told");
+    let caught_up = glance.copy();
+    assert!(caught_up.snapshot.expect("kept").fresh(read_at));
+    assert_eq!(caught_up.generation, 1, "catch-up makes no new read");
+    assert!(!caught_up.reading, "polling remains disabled");
     clock.store(read_at + millis(COUNT_FRESH) + 1_000, Ordering::SeqCst);
     posts.recv_timeout(hang).expect("the lapse is told");
     let slot = glance.copy();
@@ -823,6 +951,7 @@ fn inert_seams() -> ReaderSeams {
         now_ms: Box::new(|| aterm_time::unix_millis().unwrap_or(0)),
         post: Box::new(|| true),
         tick: Duration::from_secs(3600),
+        moved: None,
     }
 }
 
@@ -886,7 +1015,7 @@ fn read_slot(read_at_ms: u64, dark: bool) -> FleetSlot {
         })),
         book: BookFacts {
             in_fleet: true,
-            issuer: true,
+            minted: true,
             issuer_label: None,
             unbound_issuer: None,
         },
@@ -948,6 +1077,13 @@ fn a_fleet_read_states_its_digest_entry_and_heralds_its_needs() {
     stale.fleet_glance = Some(glance_over(read_slot(old, false)));
     stale.on_fleet_read();
     assert!(take_posts().is_empty(), "a stale read heralds nothing");
+    let glance = stale.status_glance();
+    assert_eq!((glance.needs.len(), glance.need_count()), (1, 0));
+
+    let future = now + 86_400_000;
+    stale.fleet_glance = Some(glance_over(read_slot(future, false)));
+    stale.on_fleet_read();
+    assert!(take_posts().is_empty(), "a future read heralds nothing");
     let glance = stale.status_glance();
     assert_eq!((glance.needs.len(), glance.need_count()), (1, 0));
 }
@@ -1138,7 +1274,7 @@ fn slot_of(read_at_ms: u64, macs: Vec<FleetMac>, unanswered: Vec<Unanswered>) ->
         })),
         book: BookFacts {
             in_fleet: true,
-            issuer: true,
+            minted: true,
             issuer_label: None,
             unbound_issuer: None,
         },
@@ -1171,13 +1307,71 @@ fn a_read_carries_a_silent_mac_while_its_rows_count() {
     let m17 = &carried.macs[1];
     assert!(m17.carried && m17.read_at_ms == t0 && m17.needs.len() == 1);
     assert_eq!((carried.answered(), carried.unanswered.len()), (1, 1));
-    assert_eq!(carried.next_lapse(t0 + 60_000), Some(t0 + fresh + 1));
+    assert_eq!(
+        carried.next_freshness_change(t0 + 60_000),
+        Some(t0 + fresh + 1)
+    );
     let again = carry(Some(&carried), next(t0 + 120_000), t0 + 120_000);
     assert_eq!(again.macs.len(), 2, "carried through a second miss");
     assert_eq!(again.macs[1].read_at_ms, t0);
     let lapsed = carry(Some(&again), next(t0 + fresh + 1), t0 + fresh + 1);
     assert_eq!(lapsed.macs.len(), 1, "past its own read's freshness");
     assert_eq!(carry(None, next(t0), t0).macs.len(), 1);
+}
+
+#[test]
+fn future_fleet_reads_are_uncounted_and_repolled_after_a_clock_rollback() {
+    let now = 1_000_000;
+    let at = now + 60_000;
+    let previous = FleetSnapshot {
+        read_at_ms: at,
+        macs: vec![mac17(at, true)],
+        ..FleetSnapshot::default()
+    };
+    assert!(!previous.fresh(now), "a future read is not fresh");
+    assert!(!previous.macs[0].fresh(now), "neither are its peer rows");
+    assert_eq!(previous.next_freshness_change(now), Some(at));
+    assert_eq!(
+        previous.next_freshness_change(at),
+        Some(at + millis(COUNT_FRESH) + 1)
+    );
+    let next = FleetSnapshot {
+        read_at_ms: now,
+        unanswered: vec![silent("mac-17.local")],
+        ..FleetSnapshot::default()
+    };
+    assert!(carry(Some(&previous), next, now).macs.is_empty());
+
+    let slot = slot_of(at, previous.macs.clone(), Vec::new());
+    assert!(should_poll(
+        &slot.book,
+        true,
+        Some(at),
+        now,
+        false,
+        POLL_EVERY
+    ));
+    assert!(should_poll(
+        &slot.book,
+        false,
+        Some(at),
+        now,
+        true,
+        POLL_EVERY
+    ));
+    assert!(!should_poll(
+        &slot.book,
+        false,
+        Some(at),
+        now,
+        false,
+        POLL_EVERY
+    ));
+
+    let fresh = millis(COUNT_FRESH);
+    assert!(previous.fresh(at));
+    assert!(previous.fresh(at + fresh));
+    assert!(!previous.fresh(at + fresh + 1));
 }
 
 fn take_posts() -> Vec<crate::status_item::HeraldNotice> {

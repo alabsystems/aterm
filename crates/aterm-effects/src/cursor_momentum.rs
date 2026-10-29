@@ -115,6 +115,9 @@ pub struct MomentumGlowConfig {
     pub base: u32,
     /// The page the light lands on is dark: additive halo.
     pub dark_theme: bool,
+    /// The frame's light (`docs/design/PRISM-GLASS.md` §15.2 1.3, `GlowConfig::light`): what a
+    /// light arm will read. Off on every dark ground; nothing reads it yet.
+    pub light: crate::cursor_glow::Light,
     /// The hue a light page's glow wears, `0x00RRGGBB`.
     pub hue: u32,
     /// The theme's text and paper, which a light ground's glow solves its ink against.
@@ -125,6 +128,9 @@ pub struct MomentumGlowConfig {
     /// The caret row's letters as columns `first..end` (a blank between two glyphs counts, as it
     /// reads as part of the line), or `None` for a blank row.
     pub glyph_span: Option<(i32, i32)>,
+    /// Whether the light-page glow wears its hue's vivid ink (Sparkle's paper gold) rather than
+    /// the walk toward white every other glow keeps ([`light_glow_ink`]).
+    pub light_vivid: bool,
 }
 
 /// One tick's outputs.
@@ -169,8 +175,6 @@ pub struct MomentumGlow {
     tau: f32,
     /// Cached `(ink, text_alpha)` for the light-page glow.
     light_ink_memo: Option<LightInkMemo>,
-    /// The light-page glow wears its hue's vivid ink ([`Self::set_light_vivid`]).
-    light_vivid: bool,
 }
 
 impl MomentumGlow {
@@ -186,15 +190,7 @@ impl MomentumGlow {
         stamp: None,
         tau: 0.0,
         light_ink_memo: None,
-        light_vivid: false,
     };
-
-    /// Whether the light-page glow wears its hue's vivid ink (Sparkle's paper gold) rather than
-    /// the walk toward white every other glow keeps ([`light_glow_ink`]). Off by default.
-    #[inline]
-    pub const fn set_light_vivid(&mut self, vivid: bool) {
-        self.light_vivid = vivid;
-    }
 
     /// One printable key.
     #[inline]
@@ -212,7 +208,11 @@ impl MomentumGlow {
     /// Back to rest (layout/space resets only).
     #[inline]
     pub const fn reset(&mut self) {
-        *self = Self::DEFAULT;
+        let light_ink_memo = self.light_ink_memo;
+        *self = Self {
+            light_ink_memo,
+            ..Self::DEFAULT
+        };
     }
 
     /// Frame cadence: the light is hot and its last two frames differed (the rainbow body's
@@ -346,29 +346,25 @@ impl MomentumGlow {
         let q = (a * 255.0) as u8;
         let a = f32::from(q) / 255.0;
         let s = smoothstep(a);
-        let tint = ramp(a, cfg.dark_theme);
-        let fill = if cfg.block {
-            Some(if cfg.dark_theme {
-                mix_rgb(cfg.base, tint, 0.55 * s)
-            } else {
-                crate::color_math::light_charge_in_hue(cfg.base, s)
-            })
-        } else {
-            None
-        };
-        if cfg.dark_theme {
+        let fill = if cfg.dark_theme {
+            let tint = ramp(a, true);
             emit_halo((cr, cc), a, s, tint, geom, cfg, out);
+            if cfg.block {
+                Some(mix_rgb(cfg.base, tint, 0.55 * s))
+            } else {
+                None
+            }
         } else {
             let key = (
                 cfg.hue & 0x00FF_FFFF,
                 cfg.theme_fg & 0x00FF_FFFF,
                 cfg.theme_bg & 0x00FF_FFFF,
-                self.light_vivid,
+                cfg.light_vivid,
             );
             let light_ink = match self.light_ink_memo {
                 Some(memo) if memo.key == key => (memo.ink, memo.text_alpha),
                 _ => {
-                    let ink = light_glow_ink(cfg.hue, cfg.theme_fg, cfg.theme_bg, self.light_vivid);
+                    let ink = light_glow_ink(cfg.hue, cfg.theme_fg, cfg.theme_bg, cfg.light_vivid);
                     let text_alpha = light_glow_text_alpha(ink, cfg.theme_fg, cfg.theme_bg);
                     self.light_ink_memo = Some(LightInkMemo {
                         key,
@@ -379,7 +375,12 @@ impl MomentumGlow {
                 }
             };
             emit_light_halo((cr, cc), a, s, light_ink, geom, cfg, under);
-        }
+            if cfg.block {
+                Some(crate::color_math::light_charge_in_hue(cfg.base, s))
+            } else {
+                None
+            }
+        };
 
         let fp = u64::from(q)
             .wrapping_mul(1_000_003)
@@ -392,7 +393,10 @@ impl MomentumGlow {
                     Some((first, end)) => (u64::from(first as u32) << 20) ^ u64::from(end as u32),
                     None => 0,
                 };
-                (u64::from(cfg.hue & 0x00FF_FFFF) << 16 | 1 << 63) ^ span.rotate_left(37)
+                (u64::from(cfg.hue & 0x00FF_FFFF) << 16
+                    | 1 << 63
+                    | u64::from(cfg.light_vivid) << 62)
+                    ^ span.rotate_left(37)
             })
             | 1;
         self.fp_prev = self.fp_last;
@@ -437,12 +441,14 @@ fn emit_halo(
     let cell_y0 = i32::from(geom.origin_y) + i32::from(cr) * geom.ch as i32;
     let top = (cy - ry).floor() as i32;
     let bot = (cy + ry).ceil() as i32;
+    let inv_ry = 1.0 / ry;
     let mut y = cell_y0 - (cell_y0 - top + row_h - 1).div_euclid(row_h) * row_h;
     while y < bot {
-        let v = (y as f32 + half_row_h - cy) / ry;
+        let y_center = y as f32 + half_row_h;
+        let v = (y_center - cy) * inv_ry;
         let v2 = v * v;
         let w2 = 1.0 - v2;
-        let fade_y = crate::effect_util::fx_fade_y(geom, y as f32 + half_row_h);
+        let fade_y = crate::effect_util::fx_fade_y(geom, y_center);
         if w2 > 0.0 && fade_y > 0.0 {
             let half = rx * crate::color_math::sqrt_f32(w2);
             let slice = (cx, half, v2, w2, peak, fade_y);
@@ -494,8 +500,15 @@ const fn halo_knot(
     let (rx_i, lx_i) = ((cx + dx).round() as i32, (cx - dx).round() as i32);
     let rho2 = v2 + w2 * t * t;
     let f = (1.0 - rho2).max(0.0);
+    if peak * f * f * fade_y < 0.5 {
+        return (rx_i, lx_i, 0, (0, 0), 0, (0, 0));
+    }
     let colour = halo_colour(tint, a, crate::color_math::sqrt_f32(rho2));
     let env = (peak, f, fade_y);
+    if k == 0 {
+        let (cov, end) = halo_end(geom, cx, env, colour);
+        return (rx_i, lx_i, cov, end, cov, end);
+    }
     let ((cov_r, right), (cov_l, left)) = (
         halo_end(geom, cx + dx, env, colour),
         halo_end(geom, cx - dx, env, colour),
@@ -528,19 +541,31 @@ pub const fn warm_halo(quads: &mut [GlowQuad], hue: u32, share: f32) {
     if top == 0 || share <= 0.0 {
         return;
     }
-    let top_f = top as f32;
+    let inv_top = 1.0 / (top as f32);
+    let hue_scale = [
+        r_h as f32 * inv_top,
+        g_h as f32 * inv_top,
+        b_h as f32 * inv_top,
+    ];
     let mut i = 0;
     while i < quads.len() {
-        if quads[i].alpha == 0 {
-            quads[i].color = warm_premul_rgb(quads[i].color, hue, top_f, share);
-            quads[i].color2 = warm_premul_rgb(quads[i].color2, hue, top_f, share);
+        let q = &mut quads[i];
+        if q.alpha == 0 {
+            let c1 = q.color;
+            let w1 = warm_premul_rgb(c1, hue_scale, share);
+            q.color = w1;
+            q.color2 = if q.color2 == c1 {
+                w1
+            } else {
+                warm_premul_rgb(q.color2, hue_scale, share)
+            };
         }
         i += 1;
     }
 }
 
 #[inline]
-const fn warm_premul_rgb(c: u32, hue: u32, top_f: f32, share: f32) -> u32 {
+const fn warm_premul_rgb(c: u32, hue_scale: [f32; 3], share: f32) -> u32 {
     let r_c = (c >> 16) & 0xff;
     let g_c = (c >> 8) & 0xff;
     let b_c = c & 0xff;
@@ -556,17 +581,17 @@ const fn warm_premul_rgb(c: u32, hue: u32, top_f: f32, share: f32) -> u32 {
     }
     let m_f = m as f32;
     let r_own = r_c as f32;
-    let r_lit = ((hue >> 16) & 0xff) as f32 * m_f / top_f;
+    let r_lit = hue_scale[0] * m_f;
     let r_w = (r_own + (r_lit - r_own) * share).round() as u32;
     let r_out = if r_w < m { r_w } else { m };
 
     let g_own = g_c as f32;
-    let g_lit = ((hue >> 8) & 0xff) as f32 * m_f / top_f;
+    let g_lit = hue_scale[1] * m_f;
     let g_w = (g_own + (g_lit - g_own) * share).round() as u32;
     let g_out = if g_w < m { g_w } else { m };
 
     let b_own = b_c as f32;
-    let b_lit = (hue & 0xff) as f32 * m_f / top_f;
+    let b_lit = hue_scale[2] * m_f;
     let b_w = (b_own + (b_lit - b_own) * share).round() as u32;
     let b_out = if b_w < m { b_w } else { m };
 
@@ -577,7 +602,8 @@ const fn warm_premul_rgb(c: u32, hue: u32, top_f: f32, share: f32) -> u32 {
 /// up to [`HALO_WARMTH`] hotter toward the core.
 #[inline]
 const fn halo_colour(tint: u32, a: f32, rho: f32) -> u32 {
-    let warm = (HALO_WARMTH * (1.0 - rho) / (1.0 - HALO_WARM_CORE)).clamp(0.0, HALO_WARMTH);
+    const WARM_SCALE: f32 = HALO_WARMTH / (1.0 - HALO_WARM_CORE);
+    let warm = ((1.0 - rho) * WARM_SCALE).clamp(0.0, HALO_WARMTH);
     mix_rgb(tint, ramp((a + warm).min(1.0), true), 0.5)
 }
 
@@ -604,6 +630,24 @@ const fn light_glow_ink(hue: u32, theme_fg: u32, theme_bg: u32, vivid: bool) -> 
     if vivid == walked {
         return walked;
     }
+    const SPECTRUM_BODIES: [u32; 36] = {
+        let mut out = [0u32; 36];
+        let mut k = 0;
+        while k < 36 {
+            out[k] = crate::color_math::hsv2rgb(k as f32 * 10.0, 1.0, 1.0);
+            k += 1;
+        }
+        out
+    };
+    const STACK_ALPHAS: [u8; 17] = {
+        let mut out = [0u8; 17];
+        let mut k = 1;
+        while k <= 17 {
+            out[k - 1] = (LIGHT_GLOW_PEAK * k as f32 / 17.0).min(LIGHT_GLOW_PEAK) as u8;
+            k += 1;
+        }
+        out
+    };
     #[inline]
     const fn lay(ground: u32, rgb: u32, alpha: f32) -> u32 {
         let alpha = alpha as u8;
@@ -612,10 +656,9 @@ const fn light_glow_ink(hue: u32, theme_fg: u32, theme_bg: u32, vivid: bool) -> 
     let mut bodies = [0u32; 36];
     let mut k = 0;
     while k < 36 {
-        let body = crate::color_math::hsv2rgb(k as f32 * 10.0, 1.0, 1.0);
         bodies[k] = lay(
             bg,
-            light_body_ink(body, fg, bg, LIGHT_BODY_ALPHA_CAP as u8),
+            light_body_ink(SPECTRUM_BODIES[k], fg, bg, LIGHT_BODY_ALPHA_CAP as u8),
             LIGHT_BODY_ALPHA_CAP,
         );
         k += 1;
@@ -628,18 +671,25 @@ const fn light_glow_ink(hue: u32, theme_fg: u32, theme_bg: u32, vivid: bool) -> 
         ink: u32,
     ) -> bool {
         const BAR: f32 = BODY_CONTRAST_BAR + LIGHT_GLOW_STACK_GUARD;
+        let mut lays = [(0u32, 0u8); 17];
+        let mut k = 0;
+        while k < 17 {
+            let a = STACK_ALPHAS[k];
+            lays[k] = (premul_rgb(ink, a), a);
+            k += 1;
+        }
         let mut i = 0;
         while i < 36 {
             let under = bodies[i];
-            let mut k = 1;
-            while k <= 17 {
-                let alpha = (LIGHT_GLOW_PEAK * k as f32 / 17.0).min(LIGHT_GLOW_PEAK);
-                let l_bg =
-                    crate::color_math::relative_luminance_with(table, lay(under, ink, alpha));
+            let mut k = 17;
+            while k > 0 {
+                k -= 1;
+                let (premul, a) = lays[k];
+                let comp = aterm_render::over_premul(under, premul, a) & 0x00FF_FFFF;
+                let l_bg = crate::color_math::relative_luminance_with(table, comp);
                 if (l_fg.max(l_bg) + 0.05) < BAR * (l_fg.min(l_bg) + 0.05) {
                     return false;
                 }
-                k += 1;
             }
             i += 1;
         }
@@ -661,17 +711,28 @@ const fn light_glow_ink(hue: u32, theme_fg: u32, theme_bg: u32, vivid: bool) -> 
         ch(walked, vivid, t, 16) | ch(walked, vivid, t, 8) | ch(walked, vivid, t, 0)
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    let (mut lo_rgb, mut hi_rgb) = (walked, vivid);
     let mut step = 0;
     while step < 10 {
         let mid = 0.5 * (lo + hi);
-        if stacks(table, &bodies, l_fg, mix(walked, vivid, mid)) {
+        let mid_rgb = mix(walked, vivid, mid);
+        let passes = if mid_rgb == lo_rgb {
+            true
+        } else if mid_rgb == hi_rgb {
+            false
+        } else {
+            stacks(table, &bodies, l_fg, mid_rgb)
+        };
+        if passes {
             lo = mid;
+            lo_rgb = mid_rgb;
         } else {
             hi = mid;
+            hi_rgb = mid_rgb;
         }
         step += 1;
     }
-    mix(walked, vivid, lo)
+    lo_rgb
 }
 
 /// The margin past the body bar [`light_glow_ink`]'s vivid lift keeps when stacked, for the
@@ -779,11 +840,11 @@ pub const fn ramp(a: f32, dark_theme: bool) -> u32 {
     let a = a.clamp(0.0, 1.0);
     let top = if dark_theme { WHITE } else { DEEP_ORANGE };
     if a < 0.35 {
-        mix_rgb(AMBER, GOLD, a / 0.35)
+        mix_rgb(AMBER, GOLD, a * (1.0 / 0.35))
     } else if a < 0.75 {
-        mix_rgb(GOLD, WARM_WHITE, (a - 0.35) / 0.40)
+        mix_rgb(GOLD, WARM_WHITE, (a - 0.35) * (1.0 / 0.40))
     } else {
-        mix_rgb(WARM_WHITE, top, (a - 0.75) / 0.25)
+        mix_rgb(WARM_WHITE, top, (a - 0.75) * (1.0 / 0.25))
     }
 }
 
@@ -810,6 +871,7 @@ mod tests {
 
     fn on(base: u32, dark: bool) -> MomentumGlowConfig {
         MomentumGlowConfig {
+            light: crate::cursor_glow::Light::OFF,
             enabled: true,
             intensity: 1.0,
             tau_s: TAU,
@@ -821,6 +883,7 @@ mod tests {
             theme_bg: if dark { 0x0010_1016 } else { 0x00FF_FFFF },
             block: true,
             glyph_span: None,
+            light_vivid: false,
         }
     }
 
@@ -1724,6 +1787,43 @@ mod tests {
                 }
             }
         }
+
+        let t0 = Instant::now();
+        let mut light = MomentumGlow::default();
+        light.on_key(t0, TAU);
+        let white = on(0x00D8_8B18, false);
+        let vivid = MomentumGlowConfig {
+            light_vivid: true,
+            ..white
+        };
+        let f0 = light.tick(
+            Some((4, 10)),
+            t0,
+            geom(),
+            &white,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        let f1 = light.tick(
+            Some((4, 10)),
+            t0,
+            geom(),
+            &white,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert_eq!(f0.fp, f1.fp);
+        assert!(!light.is_active() && light.settling());
+        let f2 = light.tick(
+            Some((4, 10)),
+            t0,
+            geom(),
+            &vivid,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert_ne!(f2.fp, f1.fp, "switching light_vivid moves the fingerprint");
+        assert!(light.is_active() && !light.settling());
     }
 
     #[test]

@@ -914,6 +914,16 @@ fn bar_tables(form: DeckForm, w: f64, m: &FaceMetrics) -> Vec<BarTable> {
     }
 }
 
+/// Capacity occupies the history/amount span only for RAM/Disk without an amount column.
+/// Those rows keep their scope bar under the percentage; GPU keeps its ordinary scope bar.
+fn capacity_under(form: DeckForm, w: f64, table: usize, res: Resource, m: &FaceMetrics) -> bool {
+    matches!(res, Resource::Memory | Resource::Disk)
+        && match form {
+            DeckForm::Full => plan::plan_full(w, m).meter.run.is_none(),
+            DeckForm::Folded => plan::plan_folded(w, m).blocks[table].meter.run.is_none(),
+        }
+}
+
 /// Where a row prints a % and draws no three-scope bar
 /// (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §5): in the column right of its strip where
 /// one fits, else under the figure, as drawn: the % column's width on whole device px, its top
@@ -922,9 +932,18 @@ fn bar_tables(form: DeckForm, w: f64, m: &FaceMetrics) -> Vec<BarTable> {
 fn bar_faults(d: &Swept<'_>) -> Vec<String> {
     let mut why = Vec::new();
     let boxes = &d.laid.boxes;
-    for (rows, pct, bar, under) in bar_tables(d.form, d.w, d.m) {
+    for (ti, (rows, pct, bar, under)) in bar_tables(d.form, d.w, d.m).into_iter().enumerate() {
         let Some(pct) = pct else { continue };
         for r in 0..rows.count {
+            let first = if d.form == DeckForm::Full { 0 } else { ti * 4 };
+            let Some(&res) = DECK_RESOURCES.get(first + r as usize) else {
+                continue;
+            };
+            let (bar, under) = if capacity_under(d.form, d.w, ti, res, d.m) {
+                (None, Some(pct))
+            } else {
+                (bar, under)
+            };
             let base = rows.top(r) + rows.baseline;
             let Some(figure) = boxes.iter().find(|b| {
                 b.kind == BoxKind::Text
@@ -982,31 +1001,47 @@ fn every_row_with_a_percent_draws_its_bar() {
     let failed = swept(Check::Bars);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
     let m = FaceMetrics::helvetica_neue();
-    for (form, w, under) in [
-        (DeckForm::Folded, 1119.0, false),
-        (DeckForm::Folded, 650.0, false),
-        (DeckForm::Folded, 600.0, true),
-        (DeckForm::Folded, 350.0, true),
-        (DeckForm::Full, 580.0, false),
-        (DeckForm::Full, 400.0, false),
-        (DeckForm::Full, 350.0, true),
-        (DeckForm::Full, 210.0, true),
+    for (form, w) in [
+        (DeckForm::Folded, 1119.0),
+        (DeckForm::Folded, 650.0),
+        (DeckForm::Folded, 600.0),
+        (DeckForm::Folded, 350.0),
+        (DeckForm::Full, 580.0),
+        (DeckForm::Full, 400.0),
+        (DeckForm::Full, 350.0),
+        (DeckForm::Full, 210.0),
     ] {
         let tables = bar_tables(form, w, &m);
         let laid = laid(Scene::Calm, w, 2.0, form, &m, false);
         let (rows, pct, bar, bar_under) = tables[0];
-        let col = if under { bar_under } else { bar }.expect("CONTROL: the column");
-        let y = rows.top(0);
-        let bars = laid
-            .boxes
-            .iter()
-            // The bar under the % notes the rect it draws, on the device px at 2×.
-            .filter(|b| b.kind == BoxKind::Bar && (b.r[0] - col.x).abs() <= 0.25 && b.r[1] > y)
-            .count();
         assert!(
-            bars >= 4 && pct.is_some(),
-            "CONTROL {form:?} {w} pt: {bars} bars at {col:?}"
+            pct.is_some(),
+            "CONTROL {form:?} {w} pt: percentages present"
         );
+        for (r, &res) in DECK_RESOURCES.iter().take(rows.count as usize).enumerate() {
+            let r = r as u32;
+            let col = if capacity_under(form, w, 0, res, &m) {
+                pct
+            } else {
+                bar.or(bar_under)
+            }
+            .expect("CONTROL: the resource's bar column");
+            let bars = laid
+                .boxes
+                .iter()
+                // Under-percent bars note the whole device-pixel rect they actually draw.
+                .filter(|b| {
+                    b.kind == BoxKind::Bar
+                        && (b.r[0] - col.x).abs() <= 0.25
+                        && b.r[1] >= rows.top(r)
+                        && b.r[1] < rows.top(r + 1)
+                })
+                .count();
+            assert_eq!(
+                bars, 1,
+                "CONTROL {form:?} {w} pt {res:?}: its bar at {col:?}"
+            );
+        }
     }
 }
 
@@ -1029,10 +1064,12 @@ fn panels_at(prims: &[DrawPrim], x: f32, (y0, y1): (f32, f32)) -> Vec<(Rect, [u8
 }
 
 /// The bar under a % figure, as drawn (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §5):
-/// the % column's width on whole device px, [`plan::UNDER_H`] tall (1 px at 1× in Full, whose
-/// rows on a half point hold no more), its top [`plan::UNDER_GAP`] or more below the digits'
+/// the % column's width on whole device px, up to [`plan::UNDER_H`] tall, its top
+/// [`plan::UNDER_GAP`] or more below the digits'
 /// baseline as it falls on the device px, so it never meets their overshoot, and its foot a
-/// device px or more short of the next row's top, so it never meets that row's cells or digits; every fill nested from its left edge, a scope above zero at
+/// device px or more short of the next row's top and clear of its ink, so it never meets that
+/// row's cells or digits;
+/// every fill nested from its left edge, a scope above zero at
 /// least a device px; the column bar's own inks in both themes and under Increase Contrast; and
 /// a click anywhere on it opens its row's lens, as the bar's column does, though its foot stands
 /// past the row's band.
@@ -1073,8 +1110,7 @@ fn the_bar_under_the_percent_is_the_bars_on_whole_pixels() {
                     let wide_tables = bar_tables(form, wide, &m);
                     for (ti, &(rows, _, _, under)) in tables.iter().enumerate() {
                         let col = under.unwrap_or_else(|| panic!("CONTROL {at}: bars under the %"));
-                        let (_, _, wide_bar, _) = wide_tables[ti];
-                        let wide_bar = wide_bar.expect("CONTROL: the wide deck's column");
+                        let (wide_rows, wide_pct, wide_bar, wide_under) = wide_tables[ti];
                         let first = if form == DeckForm::Full { 0 } else { ti * 4 };
                         for r in 0..rows.count {
                             let Some(&res) = DECK_RESOURCES.get(first + r as usize) else {
@@ -1091,22 +1127,21 @@ fn the_bar_under_the_percent_is_the_bars_on_whole_pixels() {
                             let Some(&((x, y, tw, h), _)) = drawn.first() else {
                                 panic!("{at}: no bar under the %");
                             };
-                            // 2 pt, but Full's 10.5 pt pitch leaves half a point past the line,
-                            // no device px at 1× on the rows whose top is on a half point, and
-                            // every row draws the same line.
-                            let line_h = if form == DeckForm::Full && s == 1.0 {
-                                1.0
-                            } else {
-                                px(plan::UNDER_H, s)
-                            };
                             assert_eq!(
-                                (x, tw, h),
-                                (px(col.x, s), px(col.end(), s) - px(col.x, s), line_h),
+                                (x, tw),
+                                (px(col.x, s), px(col.end(), s) - px(col.x, s)),
                                 "{at}: the track"
                             );
                             assert!(
-                                y + h <= next - 1.0,
-                                "{at}: {y} + {h} meets the next row at {next}"
+                                (1.0..=px(plan::UNDER_H, s)).contains(&h),
+                                "{at}: positive bounded line height {h}"
+                            );
+                            let next_ink =
+                                ((rows.top(r + 1) + rows.baseline - ASCENT_EM * rows.name_pt) * s)
+                                    .floor() as f32;
+                            assert!(
+                                y + h <= next - 1.0 && y + h <= next_ink,
+                                "{at}: {y} + {h} meets the next row at {next}, ink at {next_ink}"
                             );
                             let mut fills = Vec::new();
                             for &((fx, fy, fw, fh), fill) in &drawn {
@@ -1126,14 +1161,28 @@ fn the_bar_under_the_percent_is_the_bars_on_whole_pixels() {
                                 "{at}: {fills:?}"
                             );
                             nested += usize::from(fills.len() == 4);
-                            // The same inks as the bar's column.
-                            let wide_rows = wide_tables[ti].0;
-                            let band = (
-                                px(wide_rows.top(r), s),
-                                px(wide_rows.top(r) + wide_rows.cell, s),
-                            );
+                            // The same inks in the wide layout, including a capacity row
+                            // whose wide layout also keeps its bar under the percentage.
+                            let wide_moved = capacity_under(form, wide, ti, res, &m);
+                            let wide_col = if wide_moved {
+                                wide_pct
+                            } else {
+                                wide_bar.or(wide_under)
+                            }
+                            .expect("CONTROL: the wide resource's bar");
+                            let band = if wide_moved || wide_bar.is_none() {
+                                (
+                                    px(wide_rows.top(r) + wide_rows.baseline + plan::UNDER_GAP, s),
+                                    px(wide_rows.top(r + 1), s),
+                                )
+                            } else {
+                                (
+                                    px(wide_rows.top(r), s),
+                                    px(wide_rows.top(r) + wide_rows.cell, s),
+                                )
+                            };
                             let mut theirs: Vec<[u8; 4]> =
-                                panels_at(&column.prims, px(wide_bar.x, s), band)
+                                panels_at(&column.prims, px(wide_col.x, s), band)
                                     .into_iter()
                                     .map(|(_, fill)| fill)
                                     .filter(|f| bar_inks.contains(f))
@@ -1146,11 +1195,20 @@ fn the_bar_under_the_percent_is_the_bars_on_whole_pixels() {
                             // opens the row's lens; past it the next row's band takes over.
                             let mid = x + tw / 2.0;
                             for py in [y + 0.5, y + h - 0.5] {
-                                assert_eq!(
-                                    hit_at(&narrow.hits, f64::from(mid) / s, f64::from(py) / s, s),
-                                    row_hit(res, Bar::Global),
-                                    "{at}: a click at {py} px"
-                                );
+                                let hit =
+                                    hit_at(&narrow.hits, f64::from(mid) / s, f64::from(py) / s, s);
+                                if capacity_under(form, w, ti, res, &m) {
+                                    assert!(
+                                        matches!(hit, Some(HitKind::Row(inst, _)) if inst == Instrument::of(res)),
+                                        "{at}: a click at {py} px names its resource: {hit:?}"
+                                    );
+                                } else {
+                                    assert_eq!(
+                                        hit,
+                                        row_hit(res, Bar::Global),
+                                        "{at}: a click at {py} px"
+                                    );
+                                }
                             }
                         }
                     }
@@ -1553,7 +1611,7 @@ fn core_squares_never_touch() {
     assert!(squares > 10_000, "CONTROL: {squares} squares drawn");
 }
 
-/// The disk's run is its used space with the maximum (`1.11 of 2.00 TB`), where a run stands;
+/// The disk's run is its used space with the maximum (`1.11 of 2.00 TB used`), where a run stands;
 /// freed is a standing fact the lens keeps, never the deck.
 #[test]
 fn freed_stays_out_of_the_deck() {
@@ -1572,9 +1630,13 @@ fn freed_stays_out_of_the_deck() {
                     .iter()
                     .any(|b| b.kind == BoxKind::Text && b.text == t)
             };
-            assert_eq!(said("1.11 of 2.00 TB"), run, "{form:?} {w} pt at {s}×");
+            assert_eq!(
+                said("1.11 of 2.00 TB used") || said("1.11/2.00 TB used"),
+                run,
+                "{form:?} {w} pt at {s}×"
+            );
             assert!(
-                !said("1.11 TB"),
+                !said("1.11 TB used"),
                 "{form:?} {w} pt at {s}×: a run without its maximum"
             );
             let freed = laid.boxes.iter().any(|b| b.text.contains("freed"));
@@ -1664,7 +1726,9 @@ fn a_gap_is_never_drawn_as_step_zero() {
         for (strip, rows, at) in strips(w, form, &m) {
             let rects = multi_scale_slot_rects(&strip, s, 0.0);
             for (r, res) in at {
-                if words::strip_words(res, snap).is_some() {
+                if words::strip_words(res, snap).is_some()
+                    || matches!(res, Resource::Gpu | Resource::Memory | Resource::Disk)
+                {
                     continue;
                 }
                 let view = &snap.resources[res.index()];
@@ -1730,6 +1794,234 @@ fn a_gap_is_never_drawn_as_step_zero() {
     );
 }
 
+/// The scale-band gridlines (`docs/DESIGN-stats-deck-owner-2026-10-26.md` §4: the gridline in the
+/// gap before each band's first box marks every size's start): on each preset, at the narrowest
+/// width each form lays it, at 1× and 2×, one 1 px column in the grid ink stands in the gap
+/// before every band's first box past the live box, the live box's own edge included, at that
+/// box's left edge less the gap, down every history surface with caption holes left clear, and
+/// none stands elsewhere on the strip.
+/// The bands come from the spec, so neighbouring bands whose boxes share a width keep theirs:
+/// the 6 h preset's 10 s and 1 min blocks, the 4 h one's 1 s, 10 s and 1 min blocks and its
+/// 10 min and 1 h ones, and the 6 min one's 1 s and 10 s blocks.
+#[test]
+fn a_gridline_stands_before_every_bands_first_box() {
+    let m = FaceMetrics::helvetica_neue();
+    let snap = scene(Scene::Calm);
+    assert!(
+        DECK_RESOURCES
+            .iter()
+            .all(|&res| words::strip_words(res, &snap).is_none()),
+        "CONTROL: every Calm row draws its history"
+    );
+    let grid = rgba(super::tests::dark_inks().grid, 0xFF);
+    let presets = [
+        MultiScaleSpec::FULL_6H,
+        MultiScaleSpec::FOLD_4H,
+        MultiScaleSpec::COMPACT_6M,
+        MultiScaleSpec::MINI_1M,
+    ];
+    let size = |ms: i64| match ms {
+        ms if ms >= 3_600_000 => format!("{} h", ms / 3_600_000),
+        ms if ms >= 60_000 => format!("{} min", ms / 60_000),
+        ms => format!("{} s", ms / 1_000),
+    };
+    let (mut failed, mut columns, mut laid_presets) = (Vec::new(), [0_usize; 4], [false; 4]);
+    for form in [DeckForm::Full, DeckForm::Folded] {
+        let mut seen = [false; 4];
+        for w in sweep_widths() {
+            let (ground_only, spec) = match form {
+                DeckForm::Full => {
+                    let p = plan::plan_full(w, &m);
+                    (p.ground_only, p.strip.spec)
+                }
+                DeckForm::Folded => {
+                    let p = plan::plan_folded(w, &m);
+                    (p.ground_only, p.blocks[0].strip.spec)
+                }
+            };
+            let Some(pi) = presets.iter().position(|&p| p == spec) else {
+                continue;
+            };
+            if ground_only || seen[pi] {
+                continue;
+            }
+            seen[pi] = true;
+            laid_presets[pi] = true;
+            for s in [1.0, 2.0] {
+                let input = scene_input(&snap, form);
+                let words = DeckWords::new(&input, &m);
+                let laid = lay(&geom(w, s, form), &input, &words, &m, true);
+                for (bi, (strip, rows, at)) in strips(w, form, &m).into_iter().enumerate() {
+                    let at_str = format!(
+                        "{form:?} {w} pt at {s}×, strip {bi} ({} back)",
+                        size(strip.spec.horizon_ms())
+                    );
+                    let (x0, x1) = (px(strip.x, s), px(strip.end(), s));
+                    // Read the rendered history surfaces, not the old full-height row boxes:
+                    // capacity captions retain a thin history below their words. An ordinary
+                    // strip's note can include an overflow cap above the row's history.
+                    let histories: Vec<_> = at
+                        .iter()
+                        .map(|&(r, res)| {
+                            let surfaces: Vec<_> = laid
+                                .boxes
+                                .iter()
+                                .filter(|b| {
+                                    b.kind == BoxKind::Strip
+                                        && b.r[0] == strip.x
+                                        && b.r[2] == strip.end()
+                                        && b.r[3] > rows.top(r)
+                                        && b.r[3] <= rows.top(r + 1)
+                                })
+                                .collect();
+                            assert_eq!(
+                                surfaces.len(),
+                                1,
+                                "CONTROL {at_str}: {res:?} has its whole time axis"
+                            );
+                            let surface = surfaces[0];
+                            let top = surface.r[1].max(rows.top(r));
+                            assert!(
+                                px(surface.r[3], s) > px(top, s),
+                                "CONTROL {at_str}: {res:?} has positive history height"
+                            );
+                            (r, top, surface.r[3])
+                        })
+                        .collect();
+                    let y0 = px(rows.top(0), s);
+                    let y1 = px(histories.last().expect("resource rows").2, s);
+                    let mut coverage = vec![1_usize; (y1 - y0) as usize];
+                    // The caption clearance is half the planned gap in either form. Keep its
+                    // whole band clear, including space between words and the thin history.
+                    let clearance = (rows.pitch - rows.cell) / 2.0;
+                    for (i, &(r, top, _)) in histories.iter().enumerate() {
+                        if top > rows.top(r) {
+                            let previous_foot =
+                                i.checked_sub(1).map_or(y0, |i| px(histories[i].2, s));
+                            let a = px(rows.top(r) - clearance, s).max(previous_foot);
+                            let b = px(top, s);
+                            coverage[(a - y0) as usize..(b - y0) as usize].fill(0);
+                        }
+                    }
+                    for &(r, top, foot) in &histories {
+                        assert!(
+                            coverage[(px(top, s) - y0) as usize..(px(foot, s) - y0) as usize]
+                                .iter()
+                                .all(|&n| n == 1),
+                            "CONTROL {at_str}: row {r}'s history remains covered"
+                        );
+                    }
+                    let gap = px(1.0, s).max(1.0);
+                    let rects = multi_scale_slot_rects(&strip, s, 0.0);
+                    let slots = strip.spec.slots();
+                    let left = |ix: usize| rects.iter().find(|r| r.0 == ix).map(|r| (r.1, r.2));
+                    // Each band's first box past the live box, read off the spec's bands.
+                    let mut want = Vec::new();
+                    let mut first = 0;
+                    for band in strip.spec.bands {
+                        let ix = first;
+                        first += usize::from(band.slots);
+                        if band.live_now || band.slots == 0 {
+                            continue;
+                        }
+                        let slot = slots[ix];
+                        assert!(
+                            !slot.is_live_now && slot.age_hi_ms - slot.age_lo_ms == band.period_ms,
+                            "CONTROL {at_str}: slot {ix} is the {} band's first",
+                            size(band.period_ms)
+                        );
+                        let (Some((bx, _)), Some((prev_x, prev_w))) =
+                            (left(ix), ix.checked_sub(1).and_then(left))
+                        else {
+                            panic!("CONTROL {at_str}: slots {ix} and the one before it are laid");
+                        };
+                        let gx = bx - gap;
+                        assert!(
+                            prev_x + prev_w <= gx && gx + 1.0 <= bx,
+                            "CONTROL {at_str}: {gx} px is in the gap before slot {ix}"
+                        );
+                        want.push((gx, band.period_ms));
+                    }
+                    columns[pi] += want.len();
+                    let mut drawn: Vec<(f32, f32, f32)> = laid
+                        .prims
+                        .iter()
+                        .filter_map(|p| match *p {
+                            DrawPrim::Panel {
+                                x, y, w, h, fill, ..
+                            } if fill == grid
+                                && w == 1.0
+                                && (x0..x1).contains(&x)
+                                && y < y1
+                                && y + h > y0 =>
+                            {
+                                Some((x, y, h))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    for (gx, period) in want {
+                        let mut actual = vec![0_usize; coverage.len()];
+                        let mut found = false;
+                        drawn.retain(|&(x, y, h)| {
+                            if x != gx {
+                                return true;
+                            }
+                            found = true;
+                            if y < y0
+                                || y + h > y1
+                                || h <= 0.0
+                                || y.fract() != 0.0
+                                || h.fract() != 0.0
+                            {
+                                failed.push(format!(
+                                    "{at_str}: gridline at {gx} px has invalid span {y}..{}",
+                                    y + h
+                                ));
+                            } else {
+                                for n in &mut actual[(y - y0) as usize..(y + h - y0) as usize] {
+                                    *n += 1;
+                                }
+                            }
+                            false
+                        });
+                        if !found {
+                            failed.push(format!(
+                                "{at_str}: no gridline at {gx} px, before the {} band's first box",
+                                size(period)
+                            ));
+                            continue;
+                        }
+                        if actual != coverage {
+                            failed.push(format!(
+                                "{at_str}: gridline at {gx} px does not cover every history \
+                                 exactly once while leaving caption holes clear: \
+                                 actual {actual:?}, wanted {coverage:?}, rows {y0}..{y1}"
+                            ));
+                        }
+                    }
+                    failed.extend(drawn.into_iter().map(|(x, ..)| {
+                        format!("{at_str}: a gridline at {x} px, before no band's first box")
+                    }));
+                }
+            }
+            if seen.iter().all(|&s| s) {
+                break;
+            }
+        }
+    }
+    assert!(
+        laid_presets.iter().all(|&p| p),
+        "CONTROL: some form lays every preset ({laid_presets:?})"
+    );
+    assert!(
+        failed.is_empty(),
+        "{} faults over {columns:?} band starts (6 h, 4 h, 6 min, 1 min):\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+}
+
 fn full_width(kind: FullKind, m: &FaceMetrics) -> f64 {
     let ws: Vec<f64> = sweep_widths()
         .filter(|&w| {
@@ -1782,7 +2074,10 @@ fn rule_s(
     };
     let run = meter.run.unwrap_or_else(|| panic!("{at}: a figure run"));
     let pt = rows.amount_pt;
-    let forms = words::glance_run(res, &snap.resources[res.index()], snap, &MAC);
+    let mut forms = words::monitor_amount(res, snap);
+    if forms.is_empty() {
+        forms = words::glance_run(res, &snap.resources[res.index()], snap, &MAC);
+    }
     let top = rows.top(r);
     let drawn = texts_in(laid, run, top - 1.0, top + rows.cell + 1.0);
     let mut says: Vec<&str> = st.clauses.iter().map(String::as_str).collect();
@@ -2443,17 +2738,20 @@ fn scope_bars_nest_every_scope_and_the_run_says_each_rows_maximum() {
             1,
             "{at}: the legend: {texts:?}"
         );
-        for said in [
-            "of 18 cores",
-            "of 128 GiB",
-            "of 2.00 TB",
-            "\u{2193}12.4M \u{2191}1.8M/s",
-        ] {
+        for said in ["of 18 cores", "\u{2193}12.4M \u{2191}1.8M/s"] {
             assert_eq!(
                 texts.iter().any(|t| t.contains(said)),
                 run,
                 "{at}: {said:?} in {texts:?}"
             );
+        }
+        if run {
+            for said in ["128 GiB used", "2.00 TB used"] {
+                assert!(
+                    texts.iter().any(|t| t.contains(said)),
+                    "{at}: physical used/total reading {said:?} in {texts:?}"
+                );
+            }
         }
         // aterm's disk writes, which lost their column, are in Full's Details.
         if form == DeckForm::Full {
@@ -2470,49 +2768,76 @@ fn scope_bars_nest_every_scope_and_the_run_says_each_rows_maximum() {
             "{at}: Folded's Cores row names the chip, Full's dial none: {texts:?}"
         );
 
-        // As painted: each bar's scopes share its left edge, each inset in the one it is part of.
-        let bar_cols: Vec<Col> = match form {
-            DeckForm::Full => plan::plan_full(w, &m).meter.bar.into_iter().collect(),
-            DeckForm::Folded => plan::plan_folded(w, &m)
-                .blocks
-                .into_iter()
-                .filter_map(|b| b.meter.bar)
-                .collect(),
-        };
-        assert!(!bar_cols.is_empty(), "{at}: bar columns present");
+        // As painted: all five resources keep three visible nested scopes, including
+        // capacity rows that move their bar under the percentage.
         let [machine_c, aterm_c, tab_c] =
             [inks.machine, inks.aterm, inks.tab].map(|c| rgba(c, 0xFF));
         let mut nested = 0;
-        for col in bar_cols {
-            let bx = px(col.x, s);
-            let panel = |fill: [u8; 4], inside: Option<(f32, f32)>| {
-                laid.prims.iter().filter_map(move |p| match *p {
-                    DrawPrim::Panel {
-                        x,
-                        y,
-                        w,
-                        h,
-                        fill: f,
-                        ..
-                    } if (x - bx).abs() < 0.01
-                        && f == fill
-                        && inside.is_none_or(|(gy, gh)| y > gy && y + h < gy + gh) =>
-                    {
-                        Some((y, w, h))
-                    }
-                    _ => None,
-                })
-            };
-            for (gy, gw, gh) in panel(machine_c, None).filter(|g| g.2 >= 6.0) {
-                let aterm = panel(aterm_c, Some((gy, gh))).next();
-                let tab = panel(tab_c, Some((gy, gh))).next();
-                if let (Some((_, aw, ah)), Some((_, tw, th))) = (aterm, tab) {
-                    assert!(
-                        gw >= aw && aw >= tw && tw > 0.0 && gh > ah && ah > th,
-                        "{form:?}: nested bar geometry {gw}x{gh} >= {aw}x{ah} >= {tw}x{th}"
-                    );
-                    nested += 1;
+        for (ti, (rows, pct, bar, under)) in bar_tables(form, w, &m).into_iter().enumerate() {
+            let first = if form == DeckForm::Full { 0 } else { ti * 4 };
+            for r in 0..rows.count {
+                let Some(&res) = DECK_RESOURCES.get(first + r as usize) else {
+                    continue;
+                };
+                if res == Resource::Gpu {
+                    continue;
                 }
+                let moved = capacity_under(form, w, ti, res, &m);
+                let horizontal = moved || bar.is_none();
+                let col =
+                    if moved { pct } else { bar.or(under) }.expect("CONTROL: scoped resource bar");
+                let band = if horizontal {
+                    (
+                        px(rows.top(r) + rows.baseline + plan::UNDER_GAP, s),
+                        px(rows.top(r + 1), s),
+                    )
+                } else {
+                    (px(rows.top(r), s), px(rows.top(r + 1), s))
+                };
+                let panels = panels_at(&laid.prims, px(col.x, s), band);
+                let scope = |ink| {
+                    let matches: Vec<Rect> = panels
+                        .iter()
+                        .filter_map(|&(rect, fill)| (fill == ink).then_some(rect))
+                        .collect();
+                    assert_eq!(matches.len(), 1, "{at} {res:?}: one {ink:?} scope");
+                    matches[0]
+                };
+                let (gx, gy, gw, gh) = scope(machine_c);
+                let (ax, ay, aw, ah) = scope(aterm_c);
+                let (tx, ty, tw, th) = scope(tab_c);
+                assert!(
+                    [gx, gy, gw, gh, ax, ay, aw, ah, tx, ty, tw, th]
+                        .iter()
+                        .all(|v| v.fract() == 0.0),
+                    "{at} {res:?}: all scope edges fall on whole device pixels"
+                );
+                assert_eq!((gx, ax), (tx, tx), "{at} {res:?}: shared left edge");
+                if horizontal {
+                    assert_eq!(
+                        (gy, gh, ay, ah),
+                        (ty, th, ty, th),
+                        "{at} {res:?}: scopes share the line"
+                    );
+                    assert!(
+                        gw >= aw + 1.0 && aw >= tw + 1.0 && tw >= 1.0 && gh >= 1.0,
+                        "{at} {res:?}: each scope retains visible ink: {gw} >= {aw} >= {tw}"
+                    );
+                } else {
+                    assert!(
+                        gw >= aw
+                            && aw >= tw
+                            && tw > 0.0
+                            && gh > ah
+                            && ah > th
+                            && ay > gy
+                            && ay + ah < gy + gh
+                            && ty > ay
+                            && ty + th < ay + ah,
+                        "{at} {res:?}: nested bar geometry {gw}x{gh} >= {aw}x{ah} >= {tw}x{th}"
+                    );
+                }
+                nested += 1;
             }
         }
         assert_eq!(
@@ -2576,8 +2901,8 @@ fn scope_bars_nest_every_scope_and_the_run_says_each_rows_maximum() {
 #[test]
 fn no_column_of_figures_stands_after_the_strip() {
     let m = FaceMetrics::helvetica_neue();
-    let mut runs = 0;
     for sc in [Scene::Calm, Scene::Trouble, Scene::FirstRun, Scene::Worst] {
+        let mut runs_by_form = [0, 0];
         for (form, w) in [
             (DeckForm::Full, 1039.0),
             (DeckForm::Full, 700.0),
@@ -2601,6 +2926,10 @@ fn no_column_of_figures_stands_after_the_strip() {
                         .collect()
                 }
             };
+            assert!(
+                !tables.is_empty(),
+                "CONTROL: {sc:?} {form:?} {w} pt has tables"
+            );
             for (strip, rows, meter, details, end) in tables {
                 let at = format!("{sc:?} {form:?} {w} pt");
                 // A table with no run: an empty one at its bar's end, which no word stands in.
@@ -2610,7 +2939,7 @@ fn no_column_of_figures_stands_after_the_strip() {
                 });
                 let faults = column_faults(&laid.boxes, (strip, rows, run, details, end));
                 assert!(faults.is_empty(), "{at}: {faults:?}");
-                runs += laid
+                runs_by_form[usize::from(form == DeckForm::Folded)] += laid
                     .boxes
                     .iter()
                     .filter(|b| b.kind == BoxKind::Text && b.room == Some((run.x, run.end())))
@@ -2631,8 +2960,11 @@ fn no_column_of_figures_stands_after_the_strip() {
                 );
             }
         }
+        assert!(
+            runs_by_form.iter().all(|&n| n > 0),
+            "CONTROL: {sc:?} reads actual runs in both forms: {runs_by_form:?}"
+        );
     }
-    assert!(runs >= 60, "CONTROL: {runs} runs read");
 }
 
 /// What a table `(strip, rows, run, details, end)` of `boxes` says right of its strip and short of

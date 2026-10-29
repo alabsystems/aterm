@@ -660,9 +660,10 @@ impl SessionLog {
     /// proven self-claim's holder told with `meta set harness_act <act>`, as
     /// the log's `mark <node> act word=<w> rule=<act> holder=<h>
     /// harness_act=<act> by=<a> src=mark conf=claim` — the word
-    /// [`aterm_agent::harness::acts::self_claim_act`] gives, on the deepest
-    /// open node (the approval's step while one is open; `-` only when
-    /// nothing is), as the loop's own act marks land.
+    /// [`aterm_agent::harness::acts::self_claim_act`] gives, on the open
+    /// approval or question step while one is open (even with a tool open
+    /// beside it), else on the deepest open node (`-` only when nothing is),
+    /// as the loop's own act marks land ([`aterm_slog::Log::mark`], fix E3).
     pub(crate) fn self_claim_act(
         &mut self,
         act: &str,

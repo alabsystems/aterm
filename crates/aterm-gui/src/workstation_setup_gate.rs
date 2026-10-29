@@ -249,6 +249,16 @@ impl PermissionGate {
         };
     }
 
+    /// Whether the plan the status names (Permissions admitted, nothing held) is the window's own
+    /// admission: what [`Self::admitted`] reads with no row press, as a fact that spends nothing.
+    pub(super) fn own_admission_stands(&self) -> bool {
+        self.allowed()
+            && self
+                .policy
+                .zip(self.own)
+                .is_some_and(|(policy, (_, revision))| revision == policy.revision)
+    }
+
     /// The standing yes, while the plan the status names (Permissions admitted, nothing held) is
     /// the window's own admission; or, for `person_press` (a person's press on a row's own
     /// button), while that plan stands at all. The one door that makes an [`AdmittedAccess`].

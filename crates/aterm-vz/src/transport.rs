@@ -90,12 +90,21 @@ impl Channel {
         Ok(())
     }
 
-    /// Send `reply`, with `fd` when it carries one.
+    /// Send `reply`, with `fd` when and only when it carries one.
     ///
     /// # Errors
-    /// It does not encode, or the socket failed.
+    /// It does not encode, `fd` is missing for `Connected` or supplied for another reply, or the
+    /// socket failed.
     pub fn send_reply(&self, reply: &Reply, fd: Option<BorrowedFd<'_>>) -> Result<(), ProtoError> {
-        send(&self.stream, &reply.encode()?, fd)?;
+        let bytes = reply.encode()?;
+        match (Reply::carries_descriptor(bytes[0]), fd.is_some()) {
+            (true, false) => return Err(ProtoError::NoDescriptor),
+            (false, true) => {
+                return Err(ProtoError::Malformed("unexpected descriptor for reply"));
+            }
+            (true, true) | (false, false) => {}
+        }
+        send(&self.stream, &bytes, fd)?;
         Ok(())
     }
 
@@ -135,9 +144,15 @@ impl Channel {
     /// The next request, or `None` at EOF.
     ///
     /// # Errors
-    /// The socket failed, or the message is not a request.
+    /// The socket failed, a descriptor arrived on the request stream, or the message is not a
+    /// request.
     pub fn recv_request(&mut self) -> Result<Option<Request>, ProtoError> {
-        match self.next()? {
+        let next = self.next()?;
+        if !self.fds.is_empty() {
+            self.fds.clear();
+            return Err(ProtoError::Malformed("unexpected descriptor on request"));
+        }
+        match next {
             Some((kind, payload)) => Request::decode(kind, &payload).map(Some),
             None => Ok(None),
         }
@@ -239,11 +254,38 @@ mod tests {
     #[test]
     fn a_connected_without_its_descriptor_is_refused() {
         let (a, b) = UnixStream::pair().unwrap();
-        (&a).write_all(&Reply::Connected { id: 9, port: 1 }.encode().unwrap())
+        let sender = Channel::new(a);
+        assert!(matches!(
+            sender.send_reply(&Reply::Connected { id: 9, port: 1 }, None),
+            Err(ProtoError::NoDescriptor)
+        ));
+        let (extra, _extra_far) = UnixStream::pair().unwrap();
+        assert!(matches!(
+            sender.send_reply(&Reply::Started, Some(extra.as_fd())),
+            Err(ProtoError::Malformed("unexpected descriptor for reply"))
+        ));
+
+        let (raw_a, raw_b) = UnixStream::pair().unwrap();
+        (&raw_a)
+            .write_all(&Reply::Connected { id: 9, port: 1 }.encode().unwrap())
             .unwrap();
-        drop(a);
-        let mut r = Channel::new(b);
+        drop(raw_a);
+        let mut r = Channel::new(raw_b);
         assert!(matches!(r.recv_reply(), Err(ProtoError::NoDescriptor)));
+
+        let (req_a, req_b) = UnixStream::pair().unwrap();
+        send(
+            &req_a,
+            &Request::State.encode().unwrap(),
+            Some(extra.as_fd()),
+        )
+        .unwrap();
+        drop((req_a, b, extra));
+        let mut req_r = Channel::new(req_b);
+        assert!(matches!(
+            req_r.recv_request(),
+            Err(ProtoError::Malformed("unexpected descriptor on request"))
+        ));
     }
 
     #[test]

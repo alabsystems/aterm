@@ -14,7 +14,6 @@ use aterm_agent::supervise::policy::turn_end::{
 };
 
 use super::*;
-use crate::claude_card::LineEnd;
 use crate::claude_lights::ChipFace;
 
 fn idle_host() -> crate::harness_host::HostHandle {
@@ -137,6 +136,7 @@ fn a_restarted_landing_is_restated_with_its_first_time_and_recorded_once() {
     for restart in 0..3 {
         tell(&mut app, &sid, None);
         assert_eq!(face_at(), None, "{restart}: unknown");
+        assert_eq!(app.chip_glass(0).task, None, "{restart}");
         tell(&mut app, &sid, Some(TaskFace::Landed));
         assert_eq!(
             landing_records(&app, &sid).len(),
@@ -144,6 +144,7 @@ fn a_restarted_landing_is_restated_with_its_first_time_and_recorded_once() {
             "{restart}: restated, not recorded again"
         );
         assert_eq!(face_at(), Some((TaskFace::Landed, old)), "{restart}");
+        assert_eq!(app.chip_glass(0).task, Some(TaskFace::Landed), "{restart}");
         assert_eq!(
             app.chip_glass(0).task_at,
             crate::harness_glass::Stamp::at(old.div_euclid(1000)),
@@ -160,65 +161,25 @@ fn a_restarted_landing_is_restated_with_its_first_time_and_recorded_once() {
     tell(&mut app, &sid, Some(TaskFace::Landed));
     assert_eq!(landing_records(&app, &sid).len(), 2, "a new landing");
     assert_ne!(face_at().map(|(_, at)| at), Some(old), "its own time");
-    tell(&mut app, &sid, None);
-    tell(&mut app, &sid, Some(TaskFace::Open));
-    tell(&mut app, &sid, Some(TaskFace::Landed));
-    assert_eq!(landing_records(&app, &sid).len(), 3, "a new landing");
-    host.shutdown_and_join();
-}
-
-#[test]
-fn a_restarted_landing_keeps_its_first_time() {
-    let host = idle_host();
-    let mut app = App::headless_for_test();
-    app.harness = Some(host.clone());
-    let sid = under(&mut app, "land");
-    tell(&mut app, &sid, Some(TaskFace::Open));
-    tell(&mut app, &sid, Some(TaskFace::Landed));
-    assert_eq!(landing_records(&app, &sid).len(), 1);
-    let ctx = app.pool.get(0).unwrap().ctx.clone();
-    let now = aterm_agent::supervise::journal::unix_ms();
-    let old = now - 3 * 3_600_000;
     {
         let mut tl = ctx.timeline.lock().unwrap();
         tl.set_task_face(Some(TaskFace::Open), old);
         tl.set_task_face(Some(TaskFace::Landed), old);
     }
-    let face_at = || ctx.timeline.lock().unwrap().task_face();
-    let held = crate::harness_glass::Stamp::at(old.div_euclid(1000));
-    for restart in 0..3 {
-        tell(&mut app, &sid, None);
-        assert_eq!(face_at(), None, "{restart}: unknown");
-        assert_eq!(app.chip_glass(0).task, None, "{restart}");
-        tell(&mut app, &sid, Some(TaskFace::Landed));
-        assert_eq!(
-            face_at(),
-            Some((TaskFace::Landed, old)),
-            "{restart}: the held time"
-        );
-        let glass = app.chip_glass(0);
-        assert_eq!(glass.task, Some(TaskFace::Landed), "{restart}");
-        assert_eq!(
-            glass.task_at, held,
-            "{restart}: the chip's, the title's and the page's clock"
-        );
-    }
-    assert_eq!(
-        landing_records(&app, &sid).len(),
-        1,
-        "a restated landing is no new record"
-    );
     tell(&mut app, &sid, None);
     tell(&mut app, &sid, Some(TaskFace::Open));
     tell(&mut app, &sid, Some(TaskFace::Landed));
     let (face, at) = face_at().unwrap();
     assert_eq!(face, TaskFace::Landed);
     assert!(
-        (now - at).abs() < 60_000,
-        "a new landing, at its own time: {at} against {now}"
+        (aterm_agent::supervise::journal::unix_ms() - at).abs() < 60_000,
+        "a new landing after unknown, at its own time: {at}"
     );
-    assert_ne!(app.chip_glass(0).task_at, held);
-    assert_eq!(landing_records(&app, &sid).len(), 2, "a new landing");
+    assert_ne!(
+        app.chip_glass(0).task_at,
+        crate::harness_glass::Stamp::at(old.div_euclid(1000))
+    );
+    assert_eq!(landing_records(&app, &sid).len(), 3, "a new landing");
     host.shutdown_and_join();
 }
 
@@ -598,25 +559,21 @@ fn the_faces_show_under_land_and_none_under_cruise_or_off() {
         app.harness = Some(host.clone());
         let sid = under(&mut app, word);
         assert_eq!(app.session_autopilot(0).1, view, "{word}");
-        for (face, chip, end) in [
-            (Some(TaskFace::Open), ChipFace::Land, LineEnd::Mode),
-            (Some(TaskFace::Landed), ChipFace::Landed, LineEnd::Landed),
-            (Some(TaskFace::Theirs), ChipFace::Theirs, LineEnd::Mode),
-            (None, ChipFace::Land, LineEnd::Mode),
+        for (face, chip) in [
+            (Some(TaskFace::Open), ChipFace::Land),
+            (Some(TaskFace::Landed), ChipFace::Landed),
+            (Some(TaskFace::Theirs), ChipFace::Theirs),
+            (None, ChipFace::Land),
         ] {
             app.apply_harness_fact(&sid, crate::HarnessFact::Task(face));
             let glass = app.chip_glass(0);
             assert_eq!(glass.task, face, "{word}: the glass holds what was told");
             let want = match (view, face) {
-                (AutopilotView::Land, _) => (chip, end),
-                (AutopilotView::Cruise, _) => (ChipFace::Cruise, LineEnd::Mode),
-                _ => (ChipFace::Off, LineEnd::Mode),
+                (AutopilotView::Land, _) => chip,
+                (AutopilotView::Cruise, _) => ChipFace::Cruise,
+                _ => ChipFace::Off,
             };
-            assert_eq!(
-                (ChipFace::of(view, &glass), LineEnd::of(view, glass.task)),
-                want,
-                "{word}: {face:?}"
-            );
+            assert_eq!(ChipFace::of(view, &glass), want, "{word}: {face:?}");
         }
     }
     host.shutdown_and_join();
@@ -645,6 +602,7 @@ fn reading(said: &str, worked: Option<Duration>, person: Option<Duration>) -> Tu
         worked,
         rules: None,
         fact: None,
+        wake: None,
         pending_input: false,
         interrupted: false,
         restartable: true,
@@ -691,8 +649,13 @@ fn reading(said: &str, worked: Option<Duration>, person: Option<Duration>) -> Tu
     }
 }
 
+/// A KEY TYPED INTO THE APP IS THE PERSON'S TURN THE TASK FACE READS, under Land's rule that a
+/// person's exchange is theirs only where it opens the session (owner ruling 2026-10-27, aterm
+/// 791977cae8): the session's opening message, typed in the app, reads `task=theirs`; a person's
+/// message after a landing is a turn end Land carries on from, so the task reads `open`.
+/// NEGATIVE CONTROL: with no key typed, the opening reply is no person's and never reads theirs.
 #[test]
-fn a_persons_own_exchange_typed_into_the_app_after_a_landing_reads_task_theirs() {
+fn a_persons_own_exchange_typed_into_the_app_reads_task_theirs_only_where_it_opens_the_session() {
     use crate::input::InputEvent;
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
     let field = |app: &App, key: &str| {
@@ -703,7 +666,7 @@ fn a_persons_own_exchange_typed_into_the_app_after_a_landing_reads_task_theirs()
             .unwrap_or_else(|| panic!("{key} in {record}"))
             .to_string()
     };
-    let run = |type_a_key: bool| {
+    let run = |landed_first: bool, type_a_key: bool| {
         let mut app = App::headless_for_test();
         let host = idle_host();
         app.harness = Some(host.clone());
@@ -720,23 +683,25 @@ fn a_persons_own_exchange_typed_into_the_app_after_a_landing_reads_task_theirs()
         let back = Instant::now() - Duration::from_secs(600);
         let mut st = TurnEndState::default();
         st.face_start();
-        let first = reading("Stage 1 landed.", Some(Duration::from_secs(180)), None);
-        st.observe(&first, back);
-        let act = decide_turn_end(&st, &first, &SupervisorConfig::default(), back);
-        st.acted(&act, &first, back);
-        let done = back + Duration::from_secs(120);
-        st.observe(
-            &reading(
-                "Nothing left: committed, merged and pushed it all to origin/main.",
-                Some(Duration::from_secs(120)),
-                None,
-            ),
-            done,
-        );
-        let told = st.face_moved();
-        assert_eq!(told, Some(TaskFace::Landed));
-        app.apply_harness_fact(&sid, crate::HarnessFact::Task(told));
-        assert_eq!(field(&app, "task="), "landed");
+        if landed_first {
+            let first = reading("Stage 1 landed.", Some(Duration::from_secs(180)), None);
+            st.observe(&first, back);
+            let act = decide_turn_end(&st, &first, &SupervisorConfig::default(), back);
+            st.acted(&act, &first, back);
+            let done = back + Duration::from_secs(120);
+            st.observe(
+                &reading(
+                    "Nothing left: committed, merged and pushed it all to origin/main.",
+                    Some(Duration::from_secs(120)),
+                    None,
+                ),
+                done,
+            );
+            let told = st.face_moved();
+            assert_eq!(told, Some(TaskFace::Landed));
+            app.apply_harness_fact(&sid, crate::HarnessFact::Task(told));
+            assert_eq!(field(&app, "task="), "landed");
+        }
         assert_eq!(field(&app, "human_ms="), "-", "no person yet");
         if type_a_key {
             let key = InputEvent::Key {
@@ -764,8 +729,18 @@ fn a_persons_own_exchange_typed_into_the_app_after_a_landing_reads_task_theirs()
         host.shutdown_and_join();
         task
     };
-    assert_eq!(run(true), "theirs");
-    assert_eq!(run(false), "open");
+    assert_eq!(run(false, true), "theirs", "the session's opening message");
+    assert_ne!(
+        run(false, false),
+        "theirs",
+        "NEGATIVE CONTROL: no key, no person"
+    );
+    assert_eq!(
+        run(true, true),
+        "open",
+        "a person's message after a landing"
+    );
+    assert_eq!(run(true, false), "open");
 }
 
 #[test]

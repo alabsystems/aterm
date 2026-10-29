@@ -276,3 +276,26 @@ fn the_registry_lists_each_slot_once_in_order_with_its_timeline_rows() {
         "detached why=secure_input"
     );
 }
+
+#[test]
+fn zero_capacity_attach_breaks_without_reanchoring_or_evicting_retired_segments() {
+    let mut b = boundary_over(Variant::Good, ToyState::default(), 4);
+    b.attach(1, 2).unwrap();
+    feed(&mut b, &adds(&[1, 2, 3]));
+    assert_eq!(b.retired_len(), 1);
+    assert_eq!(b.stats().reanchors, 1);
+
+    b.attach(10, 0).unwrap();
+    feed(&mut b, &adds(&[4, 5, 6]));
+    assert!(b.log().unwrap().broken().is_some());
+    assert_eq!(
+        b.stats().reanchors,
+        1,
+        "zero-capacity recording must not spin reanchors on each input"
+    );
+    assert_eq!(
+        b.retired_len(),
+        1,
+        "earlier retired segment must not be evicted by empty zero-cap segments"
+    );
+}

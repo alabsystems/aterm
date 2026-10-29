@@ -491,6 +491,50 @@ fn run_one(h: &Host<'_>, f: &Facts, ask: &Ask<'_>) -> (Answer, Option<Outcome>) 
         .home
         .var
         .is_none_or(|v| (h.var)(v).is_none_or(|s| s.is_empty()));
+    // The Codex this review runs (`managed.path`) must keep the serving row's login its own too.
+    if default_home
+        && !f.hidden_store
+        && c.accounts
+            .is_some_and(|a| a.seam.var() == crate::harness::codex_alab::AUTH_PATH_ENV)
+        && let Some(pool) = f.pool.as_ref()
+        && let Some((_, Some(_))) = pool.serving_login.as_ref()
+        && let Some(why) = crate::harness::codex_alab::auth_path_unread(&managed.path)
+    {
+        use crate::harness::codex_alab::{
+            DEFAULT_SIGN_IN, DefaultRow, only_default, only_default_pinned, unread_fix,
+        };
+        let default = pool.default_row.clone().unwrap_or(DefaultRow::Unlisted);
+        // The owner's pin holds the review to its serving row whatever the default row does.
+        let words = match pool.serving_label.as_deref() {
+            Some(own) if pool.pinned.as_deref() == Some(own) => {
+                only_default_pinned(&why, own, &default)
+            }
+            serving => only_default(&why, serving, &default),
+        };
+        answer.why = Some(format!("{words}; nothing was run"));
+        answer.fix = match &default {
+            DefaultRow::Serves(label) => Some(unread_fix(Some(label))),
+            DefaultRow::Unlisted => Some(unread_fix(None)),
+            DefaultRow::SignedOut { .. } => Some(DEFAULT_SIGN_IN.to_string()),
+            DefaultRow::Moved(_) | DefaultRow::Walled { .. } | DefaultRow::Other { .. } => None,
+        };
+        return (answer, None);
+    }
+    // A review runs under the row a launch aterm makes takes, and where that launch is refused
+    // (a pin on a row not signed in here, no usable row, …) under none: it never runs on the
+    // default login in a launch's place.
+    if default_home
+        && !f.hidden_store
+        && let Some(why) = f.pool.as_ref().and_then(|p| p.launch_refused.as_deref())
+    {
+        let why = why
+            .strip_suffix(crate::harness::accounts_pool::NO_WORKER)
+            .unwrap_or(why);
+        answer.why = Some(format!(
+            "a launch of it now is refused: {why}; nothing was run"
+        ));
+        return (answer, None);
+    }
     if default_home
         && !f.hidden_store
         && let Some(seam @ super::connector::Seam::Overlay { .. }) = c.accounts.map(|a| a.seam)
@@ -607,6 +651,17 @@ pub fn candidates<'r>(
         .collect()
 }
 
+/// Why `c` sits out a review at `level`: its one-shot mode runs at one level whatever it is
+/// given ([`connector::Review::only_at`]), and `level` is another, which nothing would hold it to.
+fn level_skip(c: &Connector, level: Level) -> Option<String> {
+    let only = c.review.only_at.filter(|only| *only != level)?;
+    Some(format!(
+        "its one-shot mode runs at {} alone, and this review is at {}",
+        only.word(),
+        level.word()
+    ))
+}
+
 /// What one review asks of its reviewers.
 #[derive(Debug, Clone, Copy)]
 pub struct Ask<'a> {
@@ -626,7 +681,9 @@ pub struct Ask<'a> {
 
 /// Runs the review: `ask.count` reviewers from `cands` in order, in parallel, trying the next
 /// in place of one that failed to authenticate, hit its limit or failed (not one that timed
-/// out), and records each outcome on its default login.
+/// out), and records each outcome on its default login. A candidate whose one-shot mode runs at
+/// another level than `ask.level` ([`level_skip`]) is skipped, as an unusable one is, and takes
+/// no reviewer's place.
 pub fn run_review(
     h: &Host<'_>,
     cands: &[(&Row, Option<String>)],
@@ -636,7 +693,10 @@ pub fn run_review(
     let mut answers: Vec<Answer> = Vec::new();
     let mut queue: Vec<&Facts> = Vec::new();
     for (row, skip) in cands {
-        match skip {
+        match skip
+            .clone()
+            .or_else(|| level_skip(row.connector, ask.level))
+        {
             Some(why) => answers.push(Answer {
                 id: row.connector.id,
                 product: row.connector.product,
@@ -644,8 +704,8 @@ pub fn run_review(
                 verdict: Verdict::Skipped,
                 secs: 0,
                 text: None,
-                why: Some(why.clone()),
-                fix: row.fix.clone(),
+                why: Some(why),
+                fix: row.fix.clone().or_else(|| row.mend.clone()),
             }),
             None => {
                 if let Some(f) = facts.iter().find(|f| f.connector.id == row.connector.id) {

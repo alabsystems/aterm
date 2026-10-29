@@ -16,6 +16,10 @@ pub(crate) use letter_guard::{
 /// Per-band RGB lift per unit coverage for a streak sample ([`InkLedger::admit_axis`]).
 pub(super) type BandLifts = [[f32; 3]; InkLedger::BANDS];
 
+/// A `[from, to)` span of light-owned lights of the under stream
+/// ([`InkLedger::note_light_owned_laid`]).
+pub(crate) type OwnedSpan = (u32, u32);
+
 /// Per-frame over-ink contrast account reset by [`CursorGlow::begin_ink_ledger`].
 pub(crate) struct InkLedger {
     /// Whether this frame keeps the account; an idle ledger admits everything.
@@ -103,6 +107,15 @@ pub(crate) struct InkLedger {
     /// The same rails' ramps, as `[from, to)` spans of the under stream's
     /// ramps ([`Self::note_rail_laid`]), each marked as its quads are.
     rail_ramps: Vec<(u32, u32, bool)>,
+    /// The frame's light-owned lights (§15.2 1.9: the light glass), as
+    /// `[from, to)` spans of the under stream's quads, ascending
+    /// ([`Self::note_light_owned_laid`]): the letter guard neither weighs
+    /// nor cuts them, the yield owning their cuts. Empty unless a light arm
+    /// drew; kept apart from [`Self::rails`], which the state words hash.
+    light_owned: Vec<OwnedSpan>,
+    /// The same lights' ramps, as `[from, to)` spans of the under stream's
+    /// ramps.
+    light_owned_ramps: Vec<OwnedSpan>,
     /// A test's negative control: the letter guard feathers its cuts into a
     /// rail laid clear of the ring as into any light (looks7 round 3).
     #[cfg(any(test, debug_assertions))]
@@ -111,6 +124,16 @@ pub(crate) struct InkLedger {
     /// in its row's foot band as any light at a letter (looks8 K9).
     #[cfg(any(test, debug_assertions))]
     pub(crate) foot_rails_weighed: bool,
+    /// Whether the frame's letter guard judged its lights against its letters, past
+    /// [`CursorGlow::guard_letters`]' early outs (`guard_judges`): on a frame the glass drew, its
+    /// cuts of every stream are the glass frame's own, Prism Glass's `guard` arm
+    /// (`EffectsPipeline::light_arms`). Forgotten with the rails. Debug and test builds only.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) guard_judged: bool,
+    /// How many light-owned spans [`Self::note_light_owned_laid`] was ever handed, never
+    /// forgotten: the host's dark pin reads it as none. Debug and test builds only.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) light_owned_noted: u64,
 }
 
 impl Default for InkLedger {
@@ -167,10 +190,16 @@ impl InkLedger {
         print: 0,
         rails: Vec::new(),
         rail_ramps: Vec::new(),
+        light_owned: Vec::new(),
+        light_owned_ramps: Vec::new(),
         #[cfg(any(test, debug_assertions))]
         rails_feathered: false,
         #[cfg(any(test, debug_assertions))]
         foot_rails_weighed: false,
+        #[cfg(any(test, debug_assertions))]
+        guard_judged: false,
+        #[cfg(any(test, debug_assertions))]
+        light_owned_noted: 0,
     };
     /// Minimum contrast floor for the reference stroke ([`CursorGlow::STREAK_INK_FLOOR`]).
     pub(super) const FLOOR: f32 = CursorGlow::STREAK_INK_FLOOR;
@@ -369,6 +398,25 @@ impl InkLedger {
         self.push_rail_laid(from, to, true);
     }
 
+    /// Note a shade laid through an [`aterm_render::RampSink`] from the
+    /// under stream's mark `from` to `to` under a dim page's light letters,
+    /// in a colour at or under the page's own luminance
+    /// ([`crate::cursor_glow::page_lit_ink`]): kept whole, neither weighed
+    /// nor cut, as a foot rail is ([`Self::note_foot_rail_laid`]). It can
+    /// only darken the ground of a letter lighter than the page, so no share
+    /// of it ever lifts a letter's reading, and weighed with the lights in
+    /// its cells it was cut with them to a quarter of its hue, a trace
+    /// nothing showed at 1x (Classic pink's move up Solarized Dark, looks10
+    /// round 2).
+    #[inline]
+    pub(crate) fn note_page_shade_laid(
+        &mut self,
+        from: (usize, aterm_render::RampMark),
+        to: (usize, aterm_render::RampMark),
+    ) {
+        self.push_rail_laid(from, to, true);
+    }
+
     #[inline]
     fn push_rail_laid(
         &mut self,
@@ -387,6 +435,69 @@ impl InkLedger {
         }
     }
 
+    /// Note the under stream's lights laid from the stream's mark `from` to
+    /// `to` (its quads and its ramps) as light-owned (§15.2 1.9): the light
+    /// glass, whose cuts are the yield's (`glass_yield`), never the letter
+    /// guard's. The guard leaves them out of its judging as well as its
+    /// masks: weighed, the glass's cells would read as dimmed, and each dim
+    /// would cut every other light in its reach.
+    #[inline]
+    pub(crate) fn note_light_owned_laid(
+        &mut self,
+        from: (usize, aterm_render::RampMark),
+        to: (usize, aterm_render::RampMark),
+    ) {
+        let span =
+            |a: usize, b: usize| (b > a && b <= u32::MAX as usize).then_some((a as u32, b as u32));
+        if let Some(q) = span(from.0, to.0) {
+            self.light_owned.push(q);
+            #[cfg(any(test, debug_assertions))]
+            {
+                self.light_owned_noted += 1;
+            }
+        }
+        if let Some(r) = span(from.1.items(), to.1.items()) {
+            self.light_owned_ramps.push(r);
+            #[cfg(any(test, debug_assertions))]
+            {
+                self.light_owned_noted += 1;
+            }
+        }
+    }
+
+    /// The frame's light-owned spans: of the under stream's quads, and of
+    /// its ramps ([`Self::note_light_owned_laid`]).
+    #[inline]
+    #[must_use]
+    pub(crate) const fn light_owned(&self) -> (&[OwnedSpan], &[OwnedSpan]) {
+        (
+            self.light_owned.as_slice(),
+            self.light_owned_ramps.as_slice(),
+        )
+    }
+
+    /// Whether under-stream quad `k` is light-owned, walking the ascending
+    /// spans from `*at` for ascending `k`.
+    #[inline]
+    pub(crate) const fn in_light_owned(&self, k: usize, at: &mut usize) -> bool {
+        Self::in_owned_span(self.light_owned.as_slice(), k, at)
+    }
+
+    /// Whether under-stream ramp `k` is light-owned, walking the ascending
+    /// spans from `*at` for ascending `k`.
+    #[inline]
+    pub(crate) const fn in_light_owned_ramp(&self, k: usize, at: &mut usize) -> bool {
+        Self::in_owned_span(self.light_owned_ramps.as_slice(), k, at)
+    }
+
+    #[inline]
+    const fn in_owned_span(spans: &[OwnedSpan], k: usize, at: &mut usize) -> bool {
+        while *at < spans.len() && spans[*at].1 as usize <= k {
+            *at += 1;
+        }
+        *at < spans.len() && spans[*at].0 as usize <= k
+    }
+
     /// The frame's rails re-read as spans of the under stream's quads alone,
     /// its `ramps` about to be folded into its `quads` quads
     /// ([`aterm_render::GlowRamps::flatten_into`], a test's read of the
@@ -396,8 +507,14 @@ impl InkLedger {
     /// moved it past them, so the guard cut the rail and spared the light
     /// after it.
     #[cfg(any(test, debug_assertions))]
+    #[inline]
     pub(crate) fn fold_rails(&mut self, ramps: &aterm_render::GlowRamps, quads: usize) {
-        if ramps.items.is_empty() || (self.rails.is_empty() && self.rail_ramps.is_empty()) {
+        if ramps.items.is_empty()
+            || (self.rails.is_empty()
+                && self.rail_ramps.is_empty()
+                && self.light_owned.is_empty()
+                && self.light_owned_ramps.is_empty())
+        {
             return;
         }
         let mut quad_at = Vec::with_capacity(quads + 1);
@@ -445,13 +562,48 @@ impl InkLedger {
         }
         self.rails = folded;
         self.rail_ramps.clear();
+        // The light-owned spans fold as the rails do, quads and ramps into
+        // the quads they unfold to, in draw order.
+        let mut owned: Vec<OwnedSpan> =
+            Vec::with_capacity(self.light_owned.len() + self.light_owned_ramps.len());
+        for &(from, to) in &self.light_owned {
+            let (from, to) = (from as usize, to as usize);
+            if to > from && to <= quad_at.len() {
+                owned.push((quad_at[from] as u32, (quad_at[to - 1] + 1) as u32));
+            }
+        }
+        for &(from, to) in &self.light_owned_ramps {
+            let (from, to) = (from as usize, to as usize);
+            if to > from && to <= ramp_at.len() && ramp_at[to - 1].1 > ramp_at[from].0 {
+                owned.push((ramp_at[from].0 as u32, ramp_at[to - 1].1 as u32));
+            }
+        }
+        owned.sort_unstable();
+        // Merged where they touch: a span of quads and the ramps among them.
+        let mut merged: Vec<OwnedSpan> = Vec::with_capacity(owned.len());
+        for span in owned {
+            match merged.last_mut() {
+                Some(last) if span.0 <= last.1 => last.1 = last.1.max(span.1),
+                _ => merged.push(span),
+            }
+        }
+        self.light_owned = merged;
+        self.light_owned_ramps.clear();
     }
 
-    /// Forget the frame's rails ([`Self::note_rail`], [`Self::note_rail_laid`]).
+    /// Forget the frame's rails ([`Self::note_rail`], [`Self::note_rail_laid`])
+    /// and its light-owned spans ([`Self::note_light_owned_laid`]), and that
+    /// its guard judged ([`Self::guard_judged`]).
     #[inline]
     pub(crate) fn clear_rails(&mut self) {
         self.rails.clear();
         self.rail_ramps.clear();
+        self.light_owned.clear();
+        self.light_owned_ramps.clear();
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.guard_judged = false;
+        }
     }
 
     /// Fold one cut into the frame's print.
@@ -464,6 +616,7 @@ impl InkLedger {
     }
 
     /// Record composite bed colour `rgb` under text cell `(row, col)`.
+    #[inline]
     pub(super) const fn lay_under(&mut self, (row, col): (i32, i32), rgb: u32) {
         if !self.on {
             return;
@@ -472,6 +625,9 @@ impl InkLedger {
             return;
         };
         let under = self.under.as_mut_slice();
+        if (under[cell] & 0x00FF_FFFF) == (rgb & 0x00FF_FFFF) {
+            return;
+        }
         let table = crate::color_math::relative_luminance_table();
         if crate::color_math::relative_luminance_with(table, rgb)
             > crate::color_math::relative_luminance_with(table, under[cell])
@@ -483,6 +639,7 @@ impl InkLedger {
     /// The brightest light laid so far on any band of text cell `(row, col)`,
     /// per channel in `add_sat` levels: `None` for an idle ledger or a cell
     /// it does not hold (off every line, or the caret's own).
+    #[inline]
     pub(super) const fn laid_peak(&self, (row, col): (i32, i32)) -> Option<[f32; 3]> {
         if !self.on {
             return None;
@@ -505,6 +662,7 @@ impl InkLedger {
     /// text cell `(row, col)`, over what already lies there: a light that
     /// burns beneath the ink (the dark flame kept in its row), so every
     /// later light over that letter spends from what it left.
+    #[inline]
     pub(super) const fn add_under(&mut self, (row, col): (i32, i32), light: u32) {
         if !self.on {
             return;
@@ -536,7 +694,13 @@ impl InkLedger {
     /// with ink and ground lifted together and clipped at 255 as `add_sat`
     /// does.
     #[inline]
-    const fn reads_with(ink: [f32; 3], ground: [f32; 3], lift: [f32; 3], floor: f32) -> bool {
+    const fn reads_with(
+        table: &crate::color_math::RelativeLuminanceTable,
+        ink: [f32; 3],
+        ground: [f32; 3],
+        lift: [f32; 3],
+        floor: f32,
+    ) -> bool {
         #[inline]
         const fn lum(
             table: &crate::color_math::RelativeLuminanceTable,
@@ -548,7 +712,6 @@ impl InkLedger {
             let b = (base[2] + lift[2]).min(255.0) as usize;
             crate::color_math::relative_luminance_rgb(table, r, g, b)
         }
-        let table = crate::color_math::relative_luminance_table();
         let (ink, ground) = (lum(table, ink, lift), lum(table, ground, lift));
         ink.max(ground) + 0.05 >= floor * (ink.min(ground) + 0.05)
     }
@@ -584,6 +747,7 @@ impl InkLedger {
     #[inline]
     const fn room_with(
         &self,
+        table: &crate::color_math::RelativeLuminanceTable,
         at: usize,
         add: [f32; 3],
         (ink, ground, floor): ([f32; 3], [f32; 3], f32),
@@ -600,17 +764,17 @@ impl InkLedger {
                 laid[2] + s * add[2],
             ]
         }
-        if Self::reads_with(ink, ground, with(laid, add, 1.0), floor) {
+        if Self::reads_with(table, ink, ground, with(laid, add, 1.0), floor) {
             return 1.0;
         }
-        if !Self::reads_with(ink, ground, with(laid, add, 0.0), floor) {
+        if !Self::reads_with(table, ink, ground, with(laid, add, 0.0), floor) {
             return 0.0;
         }
         let (mut lo, mut hi) = (0.0f32, 1.0f32);
         let mut i = 0;
         while i < 8 {
             let mid = 0.5 * (lo + hi);
-            if Self::reads_with(ink, ground, with(laid, add, mid), floor) {
+            if Self::reads_with(table, ink, ground, with(laid, add, mid), floor) {
                 lo = mid;
             } else {
                 hi = mid;
@@ -621,6 +785,7 @@ impl InkLedger {
     }
 
     /// Admit a streak sample of coverage `cov` on `(row, col)` with per-band `lifts` down to `floor`.
+    #[inline]
     pub(super) fn admit_axis(
         &mut self,
         (row, col): (u16, u16),
@@ -633,6 +798,7 @@ impl InkLedger {
         let Some(base) = self.slot(i32::from(row), i32::from(col)) else {
             return cov;
         };
+        let table = crate::color_math::relative_luminance_table();
         let ctx = self.cell_room_ctx(base / Self::BANDS, Self::STEADY_FLOOR);
         let mut share = 1.0f32;
         let mut b = 0;
@@ -640,25 +806,26 @@ impl InkLedger {
             let lift = lifts[b];
             if lift != [0.0; 3] {
                 let add = [lift[0] * cov, lift[1] * cov, lift[2] * cov];
-                share = share.min(self.room_with(base + b, add, ctx));
+                share = share.min(self.room_with(table, base + b, add, ctx));
                 if share <= 0.0 {
                     return 0.0;
                 }
             }
             b += 1;
         }
+        let sc = share * cov;
         let mut b = 0;
         while b < Self::BANDS {
             let lift = lifts[b];
             if lift != [0.0; 3] {
                 let dst = &mut self.laid[base + b];
-                dst[0] += share * lift[0] * cov;
-                dst[1] += share * lift[1] * cov;
-                dst[2] += share * lift[2] * cov;
+                dst[0] += sc * lift[0];
+                dst[1] += sc * lift[1];
+                dst[2] += sc * lift[2];
             }
             b += 1;
         }
-        cov * share
+        sc
     }
 
     #[inline]
@@ -731,6 +898,7 @@ impl InkLedger {
     }
 
     /// Admit an additive radial halo at `(cx, cy)` with radii `(rx, ry)` down to `floor`.
+    #[inline]
     pub(super) fn admit_halo(
         &mut self,
         (cx, cy): (f32, f32),
@@ -749,6 +917,7 @@ impl InkLedger {
         let (ox, oy, cw, ch) = self.grid;
         let bh = ch * (1.0 / Self::BANDS as f32);
         let (inv_cw, inv_rx, inv_ry) = (1.0 / cw, 1.0 / rx, 1.0 / ry);
+        let table = crate::color_math::relative_luminance_table();
         let mut row_spans: [(i32, i32, i32, [f32; Self::BANDS]); 3] = [
             (0, 0, 0, [0.0; Self::BANDS]),
             (0, 0, 0, [0.0; Self::BANDS]),
@@ -785,7 +954,7 @@ impl InkLedger {
                 while band < Self::BANDS {
                     if let Some(w) = w_bands[band] {
                         let add = [peak[0] * w, peak[1] * w, peak[2] * w];
-                        share = share.min(self.room_with(base + band, add, ctx));
+                        share = share.min(self.room_with(table, base + band, add, ctx));
                         if share <= 0.0 {
                             break 'probe;
                         }
@@ -798,6 +967,7 @@ impl InkLedger {
         if share <= 0.0 {
             return 0.0;
         }
+        let scaled_peak = [share * peak[0], share * peak[1], share * peak[2]];
         let mut si = 0;
         while si < n_spans {
             let (row, c0, c1, dy2) = &row_spans[si];
@@ -810,9 +980,9 @@ impl InkLedger {
                     while band < Self::BANDS {
                         if let Some(w) = w_bands[band] {
                             let dst = &mut self.laid[base + band];
-                            dst[0] += share * peak[0] * w;
-                            dst[1] += share * peak[1] * w;
-                            dst[2] += share * peak[2] * w;
+                            dst[0] += scaled_peak[0] * w;
+                            dst[1] += scaled_peak[1] * w;
+                            dst[2] += scaled_peak[2] * w;
                         }
                         band += 1;
                     }
@@ -824,6 +994,7 @@ impl InkLedger {
         share
     }
 
+    #[inline]
     fn quad_peaks(&mut self, quads: &[GlowQuad]) -> bool {
         let (ox, oy, cw, ch) = self.grid;
         let (cwi, chi) = (cw as i32, ch as i32);
@@ -859,6 +1030,8 @@ impl InkLedger {
         } else {
             i32::MAX
         };
+        let mut lit_quad: Option<&GlowQuad> = None;
+        let mut lit_count = 0usize;
         let mut qi = 0;
         while qi < quads.len() {
             let q = &quads[qi];
@@ -866,6 +1039,8 @@ impl InkLedger {
             if !is_lit_additive(q) {
                 continue;
             }
+            lit_quad = Some(q);
+            lit_count += 1;
             let (col_first, col_last) = span(f32::from(q.x), q.w.max(1), ox, inv_cw);
             let (row_first, row_last) = span(f32::from(q.y), q.h.max(1), oy, inv_ch);
             let mut row = row_first;
@@ -890,6 +1065,68 @@ impl InkLedger {
         if reached.is_empty() {
             self.reached = reached;
             return false;
+        }
+        let chi_u = chi as usize;
+        let mut band_ys = [(0usize, 0usize); Self::BANDS];
+        let mut b = 0;
+        while b < Self::BANDS {
+            band_ys[b] = (b * chi_u / Self::BANDS, (b + 1) * chi_u / Self::BANDS);
+            b += 1;
+        }
+        if lit_count == 1
+            && let Some(q) = lit_quad
+        {
+            let (qx0, qy0) = (i32::from(q.x), i32::from(q.y));
+            let (qx1, qy1) = (qx0 + i32::from(q.w), qy0 + i32::from(q.h));
+            let w = i32::from(q.w).max(1);
+            let inv_denom = 1.0 / (2 * w) as f32;
+            let flat = q.color == q.color2;
+            let ends = color_ends(q.color, q.color2);
+            let flat_c = [ends[0].0, ends[1].0, ends[2].0];
+            let mut k = 0;
+            while k < reached.len() {
+                let cell = reached[k];
+                let (cx0, cy0) = self.cell_origin(cell);
+                let (x0, x1) = (qx0.max(cx0), qx1.min(cx0 + cwi));
+                let (y0, y1) = (qy0.max(cy0), qy1.min(cy0 + chi));
+                if x0 < x1 && y0 < y1 {
+                    let x_peak = if flat {
+                        flat_c
+                    } else {
+                        let mut m_px = [0.0f32; 3];
+                        let mut x = x0;
+                        while x < x1 {
+                            let m = (2 * (x - qx0) + 1) as f32;
+                            let t = m * inv_denom;
+                            m_px[0] = m_px[0].max(ends[0].0 + ends[0].1 * t);
+                            m_px[1] = m_px[1].max(ends[1].0 + ends[1].1 * t);
+                            m_px[2] = m_px[2].max(ends[2].0 + ends[2].1 * t);
+                            x += 1;
+                        }
+                        m_px
+                    };
+                    let (ry0, ry1) = ((y0 - cy0) as usize, (y1 - cy0) as usize);
+                    let mut b = 0;
+                    while b < Self::BANDS {
+                        let (by0, by1) = band_ys[b];
+                        if ry0.max(by0) < ry1.min(by1) {
+                            self.peaks.push(x_peak);
+                        } else {
+                            self.peaks.push([0.0; 3]);
+                        }
+                        b += 1;
+                    }
+                } else {
+                    let mut b = 0;
+                    while b < Self::BANDS {
+                        self.peaks.push([0.0; 3]);
+                        b += 1;
+                    }
+                }
+                k += 1;
+            }
+            self.reached = reached;
+            return true;
         }
         let area = (cwi * chi) as usize;
         let cwi_u = cwi as usize;
@@ -959,13 +1196,6 @@ impl InkLedger {
                 k += 1;
             }
         }
-        let chi_u = chi as usize;
-        let mut band_ys = [(0usize, 0usize); Self::BANDS];
-        let mut b = 0;
-        while b < Self::BANDS {
-            band_ys[b] = (b * chi_u / Self::BANDS, (b + 1) * chi_u / Self::BANDS);
-            b += 1;
-        }
         let mut k = 0;
         while k < reached.len() {
             let cell_base = k * area;
@@ -1007,20 +1237,24 @@ impl InkLedger {
     }
 
     /// Admit a group of additive quads uniformly down to `floor`.
+    #[inline]
     pub(super) fn admit_quads(&mut self, quads: &[GlowQuad], floor: f32) -> f32 {
         if !self.on || !self.quad_peaks(quads) {
             return 1.0;
         }
+        let table = crate::color_math::relative_luminance_table();
         let mut share = 1.0f32;
         let mut k = 0;
         'probe: while k < self.reached.len() {
             let cell = self.reached[k];
             let ctx = self.cell_room_ctx(cell, floor);
+            let cell_base = cell * Self::BANDS;
+            let peak_base = k * Self::BANDS;
             let mut band = 0;
             while band < Self::BANDS {
-                let add = self.peaks[k * Self::BANDS + band];
+                let add = self.peaks[peak_base + band];
                 if add != [0.0; 3] {
-                    share = share.min(self.room_with(cell * Self::BANDS + band, add, ctx));
+                    share = share.min(self.room_with(table, cell_base + band, add, ctx));
                     if share <= 0.0 {
                         break 'probe;
                     }
@@ -1032,11 +1266,12 @@ impl InkLedger {
         if share > 0.0 {
             let mut k = 0;
             while k < self.reached.len() {
-                let cell = self.reached[k];
+                let cell_base = self.reached[k] * Self::BANDS;
+                let peak_base = k * Self::BANDS;
                 let mut band = 0;
                 while band < Self::BANDS {
-                    let add = self.peaks[k * Self::BANDS + band];
-                    let dst = &mut self.laid[cell * Self::BANDS + band];
+                    let add = self.peaks[peak_base + band];
+                    let dst = &mut self.laid[cell_base + band];
                     dst[0] += share * add[0];
                     dst[1] += share * add[1];
                     dst[2] += share * add[2];
@@ -1049,6 +1284,7 @@ impl InkLedger {
     }
 
     /// Admit additive quads in `quads[range]` cell by cell down to `floor`, slicing around dimmed cells.
+    #[inline]
     pub(crate) fn admit_masked(
         &mut self,
         quads: &mut Vec<GlowQuad>,
@@ -1065,17 +1301,20 @@ impl InkLedger {
             return share;
         }
         self.dims.clear();
+        let table = crate::color_math::relative_luminance_table();
         let mut least = 1.0f32;
         let mut k = 0;
         while k < self.reached.len() {
             let cell = self.reached[k];
             let ctx = self.cell_room_ctx(cell, floor);
+            let cell_base = cell * Self::BANDS;
+            let peak_base = k * Self::BANDS;
             let mut share = 1.0f32;
             let mut band = 0;
             while band < Self::BANDS {
-                let add = self.peaks[k * Self::BANDS + band];
+                let add = self.peaks[peak_base + band];
                 if add != [0.0; 3] {
-                    share = share.min(self.room_with(cell * Self::BANDS + band, add, ctx));
+                    share = share.min(self.room_with(table, cell_base + band, add, ctx));
                     if share <= 0.0 {
                         break;
                     }
@@ -1085,8 +1324,8 @@ impl InkLedger {
             if share > 0.0 {
                 let mut band = 0;
                 while band < Self::BANDS {
-                    let add = self.peaks[k * Self::BANDS + band];
-                    let dst = &mut self.laid[cell * Self::BANDS + band];
+                    let add = self.peaks[peak_base + band];
+                    let dst = &mut self.laid[cell_base + band];
                     dst[0] += share * add[0];
                     dst[1] += share * add[1];
                     dst[2] += share * add[2];
@@ -1162,6 +1401,7 @@ impl InkLedger {
     #[inline]
     pub(super) const fn mask_at_with(&self, x: f32, y: f32, (fx, fy): (f32, f32)) -> f32 {
         let dims = self.near.as_slice();
+        let (inv_fx, inv_fy) = (1.0 / fx, 1.0 / fy);
         let mut m = 1.0f32;
         let mut i = 0;
         while i < dims.len() {
@@ -1182,7 +1422,7 @@ impl InkLedger {
                 m = d.share;
                 continue;
             }
-            let (dx, dy) = (dx / fx, dy / fy);
+            let (dx, dy) = (dx * inv_fx, dy * inv_fy);
             let d2 = dx * dx + dy * dy;
             if d2 >= 1.0 {
                 continue;
@@ -1194,6 +1434,7 @@ impl InkLedger {
         m
     }
 
+    #[inline]
     const fn dims_bounds(&self) -> (i32, i32, i32, i32) {
         let (_, _, cw, ch) = self.grid;
         let (fx, fy) = (
@@ -1226,6 +1467,7 @@ impl InkLedger {
         (min_x, min_y, max_x, max_y)
     }
 
+    #[inline]
     fn knots(&mut self, (x0, y0, x1, y1): (i32, i32, i32, i32)) -> bool {
         #[inline]
         fn push_in(k: &mut Vec<i32>, v: i32, lo: i32, hi: i32) {
@@ -1342,6 +1584,7 @@ impl InkLedger {
         true
     }
 
+    #[inline]
     fn mask_quad(&mut self, q: GlowQuad, out: &mut Vec<GlowQuad>) {
         let (x0, y0) = (i32::from(q.x), i32::from(q.y));
         let (x1, y1) = (x0 + i32::from(q.w), y0 + i32::from(q.h));
@@ -1358,6 +1601,9 @@ impl InkLedger {
             dc: [f32; 3],
             m: f32,
         ) -> u32 {
+            if m <= 0.0 {
+                return 0;
+            }
             let t = (x - x0) as f32 * inv_w;
             let r = ((c0[0] + dc[0] * t) * m).round() as u32;
             let g = ((c0[1] + dc[1] * t) * m).round() as u32;
@@ -1430,6 +1676,7 @@ impl InkLedger {
     }
 
     /// Admit additive radial halos in `halos[from..]` down to `floor`, slicing around dimmed cells.
+    #[inline]
     pub(crate) fn admit_halos_masked(
         &mut self,
         halos: &mut Vec<RainHalo>,
@@ -1501,6 +1748,9 @@ impl InkLedger {
                         let (xa, xb) = (self.knots_x[xi], self.knots_x[xi + 1]);
                         xi += 1;
                         let m = self.mask_at_with(0.5 * (xa + xb) as f32, ym, feather);
+                        if m <= 0.0 {
+                            continue;
+                        }
                         let color = scale_rgb(h.color, m);
                         if color & 0x00FF_FFFF == 0 {
                             continue;
@@ -1524,6 +1774,7 @@ impl InkLedger {
         self.halo_pieces = pieces;
     }
 
+    #[inline]
     fn halo_dims(&mut self, (cx, cy): (f32, f32), (rx, ry): (f32, f32), premul: u32, floor: f32) {
         if rx <= 0.0 || ry <= 0.0 {
             return;
@@ -1536,6 +1787,7 @@ impl InkLedger {
         let (ox, oy, cw, ch) = self.grid;
         let bh = ch * (1.0 / Self::BANDS as f32);
         let (inv_cw, inv_rx, inv_ry) = (1.0 / cw, 1.0 / rx, 1.0 / ry);
+        let table = crate::color_math::relative_luminance_table();
         let lines = self.lines;
         let mut li = 0;
         while li < lines.len() {
@@ -1566,7 +1818,7 @@ impl InkLedger {
                 while band < Self::BANDS {
                     if let Some(w) = weights[band] {
                         let add = [peak[0] * w, peak[1] * w, peak[2] * w];
-                        share = share.min(self.room_with(base + band, add, ctx));
+                        share = share.min(self.room_with(table, base + band, add, ctx));
                         if share <= 0.0 {
                             break;
                         }
@@ -1574,13 +1826,14 @@ impl InkLedger {
                     band += 1;
                 }
                 if share > 0.0 {
+                    let scaled_peak = [share * peak[0], share * peak[1], share * peak[2]];
                     let mut band = 0;
                     while band < Self::BANDS {
                         if let Some(w) = weights[band] {
                             let dst = &mut self.laid[base + band];
-                            dst[0] += share * peak[0] * w;
-                            dst[1] += share * peak[1] * w;
-                            dst[2] += share * peak[2] * w;
+                            dst[0] += scaled_peak[0] * w;
+                            dst[1] += scaled_peak[1] * w;
+                            dst[2] += scaled_peak[2] * w;
                         }
                         band += 1;
                     }
@@ -1597,6 +1850,7 @@ impl InkLedger {
 
 impl InkLedger {
     /// Admit each additive quad in `quads` independently down to `floor`.
+    #[inline]
     pub(super) fn admit_each_quad(&mut self, quads: &mut [GlowQuad], floor: f32) {
         if !self.on {
             return;
@@ -1647,6 +1901,7 @@ pub(super) const fn scale_additive(quads: &mut [GlowQuad], share: f32) {
 
 impl CursorGlow {
     /// Initialize this frame's [`InkLedger`] from the active style, theme, and text lines.
+    #[inline]
     pub(super) fn begin_ink_ledger(
         &mut self,
         cfg: &GlowConfig,
@@ -1868,6 +2123,7 @@ impl CursorGlow {
     /// row piece around them (looks6 N8: the dark fire's bloom round the
     /// caret lifted the bar and the segment over it). A piece keeps its
     /// centre and falloff, so what is left of it lies where it lay.
+    #[inline]
     pub(super) fn hold_halos_off_filled(
         &mut self,
         halos: &mut Vec<RainHalo>,
@@ -2011,6 +2267,7 @@ impl CursorGlow {
     }
 
     /// Attenuate additive caret quads near inked neighbour rows and return the cut print.
+    #[inline]
     pub fn hold_off_neighbour_ink(
         &self,
         quads: &mut [GlowQuad],
@@ -2074,13 +2331,16 @@ impl CursorGlow {
             } else {
                 (bot - ym, cr + 1)
             };
+            let hold = smooth((inside + fy) * inv_ease);
+            if hold >= 1.0 {
+                continue;
+            }
             let row = if inside < 0.0 {
                 ((ym - oy) * inv_ch).floor() as i32
             } else {
                 across
             };
-            let hold = smooth((inside + fy) * inv_ease);
-            if hold >= 1.0 || row < 0 || !view.knows_row(row) {
+            if row < 0 || !view.knows_row(row) {
                 continue;
             }
             let (x0, x1) = (f32::from(q.x), f32::from(q.x) + f32::from(q.w));

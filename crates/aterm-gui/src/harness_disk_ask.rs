@@ -147,6 +147,7 @@ impl crate::App {
                 .and_then(crate::spawn_folder::canonical_folder),
             fact_line: false,
             autopilot: aterm_agent::supervise::Autopilot::Land,
+            chrome: false,
         };
         let booking = crate::control::control_media::SpawnBooking {
             cwd: folder.to_str().map(str::to_string),
@@ -187,6 +188,19 @@ impl crate::App {
     /// The disk worker `sid` ran out of its time ([`ask::WORKER_MS`]): its Autopilot goes Off,
     /// written by aterm, so Land types nothing more into it.
     pub(crate) fn disk_worker_expired(&mut self, sid: &str) {
+        if self.worker_autopilot_off(sid) {
+            aterm_log::info!(
+                "harness disk watch: the disk worker @{sid} ran out of its time; its Autopilot is \
+                 Off"
+            );
+        }
+    }
+
+    /// Session `sid`'s Autopilot turned Off, written by aterm, where `sid` is a live session of
+    /// this process: whether it was. A worker of aterm's that ran out of its time stops so (the
+    /// disk worker's, [`Self::disk_worker_expired`]; a credit claim worker's,
+    /// [`Self::credit_claim_expired`]).
+    pub(crate) fn worker_autopilot_off(&mut self, sid: &str) -> bool {
         let local = {
             let store = self.store.read().unwrap_or_else(PoisonError::into_inner);
             store
@@ -195,16 +209,14 @@ impl crate::App {
                 .map(|h| h.local_id)
         };
         let Some(local) = local else {
-            return;
+            return false;
         };
         self.write_autopilot_batch(
             &[(local, Some(aterm_agent::supervise::Autopilot::Off), None)],
             aterm_slog::Actor::Aterm,
             None,
         );
-        aterm_log::info!(
-            "harness disk watch: the disk worker @{sid} ran out of its time; its Autopilot is Off"
-        );
+        true
     }
 }
 
@@ -1146,6 +1158,16 @@ fn draft_on(t: &aterm_core::terminal::Terminal) -> (Draft, bool) {
         },
     );
     (draft, aterm_phase::turn_over_background(&rows))
+}
+
+/// Whether `t`'s live screen holds a draft in its composer, read as the fenced write reads it
+/// ([`draft_on`]); `None` while it is scrolled back or mid-frame.
+pub(crate) fn draft_shown(t: &aterm_core::terminal::Terminal) -> Option<bool> {
+    match draft_on(t).0 {
+        Draft::Unread => None,
+        Draft::Clear => Some(false),
+        Draft::Text(_) => Some(true),
+    }
 }
 
 /// Whether the composer's first glyph is dim, `flags(col)` the composer row's cell flags at

@@ -45,7 +45,11 @@ impl Parser {
                 MAX_INTERMEDIATES
             );
 
-            let _ = self.current_param;
+            assert!(
+                self.param_started || self.current_param == 0,
+                "TLA+ CurrentParamConsistent violated: current_param={} when param_started=false",
+                self.current_param
+            );
 
             assert!(
                 self.utf8_len <= 4,
@@ -66,17 +70,13 @@ impl Parser {
                 self.utf8_expected
             );
 
-            if self.params.len() < 32 {
-                let valid_bits = (1u32 << self.params.len()) - 1;
-                let meaningful_mask = self.subparam_mask & !1;
-                assert_eq!(
-                    meaningful_mask & !valid_bits,
-                    0,
-                    "TLA+ SubparamMaskValid violated: subparam_mask has bits set beyond params.len() (mask={:#010x}, params.len()={})",
-                    self.subparam_mask,
-                    self.params.len()
-                );
-            }
+            assert_eq!(
+                self.subparam_mask >> self.params.len(),
+                0,
+                "TLA+ SubparamMaskValid violated: subparam_mask has bits set at or beyond params.len() (mask={:#010x}, params.len()={})",
+                self.subparam_mask,
+                self.params.len()
+            );
 
             assert!(
                 !(self.dcs_active && self.apc_active),

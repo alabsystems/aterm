@@ -633,7 +633,12 @@ impl AtermTerminal {
     }
 
     /// Whether the next [`Self::render`] call has work to draw.
+    ///
+    /// Applies any pending global scrollback-budget share before reading `damage_epoch`;
+    /// only when scrolled into history with staged lines still unpromoted can `render`'s
+    /// bounded backlog trickle clamp `display_offset` and open a frame afterwards.
     pub fn needs_frame(&mut self) -> bool {
+        self.apply_pending_scrollback_budget();
         let cell_h = self.renderer.cell_size().1;
         let key = FrameGateKey {
             damage_epoch: self.term.damage_epoch(),

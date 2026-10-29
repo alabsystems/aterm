@@ -52,6 +52,9 @@ const FUNCTION_CALL: &str = aterm_phase::anchor!("rollout.function_call");
 const FUNCTION_OUTPUT: &str = aterm_phase::anchor!("rollout.function_call_output");
 const CUSTOM_CALL: &str = aterm_phase::anchor!("rollout.custom_tool_call");
 const CUSTOM_OUTPUT: &str = aterm_phase::anchor!("rollout.custom_tool_call_output");
+const KEY_TIMESTAMP: &str = aterm_phase::anchor!("rollout.timestamp");
+const KEY_TYPE: &str = aterm_phase::anchor!("rollout.type");
+const KEY_PAYLOAD: &str = aterm_phase::anchor!("rollout.payload");
 const KEY_ID: &str = aterm_phase::anchor!("rollout.id");
 const KEY_FORKED_FROM: &str = aterm_phase::anchor!("rollout.forked_from_id");
 const KEY_CLI_VERSION: &str = aterm_phase::anchor!("rollout.cli_version");
@@ -216,11 +219,12 @@ impl CodexStepFold {
         self.floor_ms = self.floor_ms.max(floor_ms);
     }
 
-    /// Record the `build` that the process writing the rollout runs now (`super::codex_alab::alab_build`).
-    pub fn set_writer(&mut self, build: &str) {
+    /// Record the `build` that the process writing the rollout runs now (`super::codex_alab::alab_build`;
+    /// `None`: its reader names none, so its rows are read [`StepState::Partial`]).
+    pub fn set_writer(&mut self, build: Option<&str>) {
         let writer = (
-            state_for(CODEX_MEASURED_BUILDS, Some(build)),
-            log_build(build),
+            state_for(CODEX_MEASURED_BUILDS, build),
+            build.and_then(log_build),
         );
         if self.writer.is_some_and(|w| w != writer) {
             self.model = None;
@@ -228,13 +232,13 @@ impl CodexStepFold {
         self.writer = Some(writer);
     }
 
-    /// The reader stops reading the bound rollout at `end`, the end of the last line it pushed (its writer runs a build nobody measured).
-    pub fn stop(&mut self, end: u64) {
-        if let Some((fp, id)) = self.bound
-            && !self.broken
-        {
-            self.latch_as(fp, id, end, "unmeasured");
-        }
+    /// THE STATE ITS ROWS ARE READ AT NOW: [`StepState::On`] only while the rollout's own build and
+    /// its writer's are both builds [`CODEX_MEASURED_BUILDS`] names, else [`StepState::Partial`]
+    /// (Claude Code's unmeasured builds' rule: strong; it adds, opens a turn none runs and ends
+    /// only its own, fix E1).
+    #[must_use]
+    pub const fn reads_at(&self) -> StepState {
+        self.state()
     }
 
     /// Whether the fold latched off.
@@ -286,7 +290,7 @@ impl CodexStepFold {
             return;
         };
         let stamp = v
-            .get("timestamp")
+            .get(KEY_TIMESTAMP)
             .and_then(Value::as_str)
             .and_then(stamp_ms);
         if !self.past_copy(&v, stamp) {
@@ -318,9 +322,9 @@ impl CodexStepFold {
     /// the thread's own and is read on, `false` when it steps nothing (a
     /// copied row, the first row, the line that ends a copy).
     fn past_copy(&mut self, v: &Value, stamp: Option<i64>) -> bool {
-        let kind = v.get("type").and_then(Value::as_str);
-        let payload = v.get("payload");
-        let ptype = word(payload, "type");
+        let kind = v.get(KEY_TYPE).and_then(Value::as_str);
+        let payload = v.get(KEY_PAYLOAD);
+        let ptype = word(payload, KEY_TYPE);
         match self.prefix {
             Prefix::Own => return true,
             Prefix::Start => {
@@ -373,9 +377,9 @@ impl CodexStepFold {
     /// The steps of one of the thread's own rows, into `out`; `true` when a
     /// key it reads has the wrong shape.
     fn row(&mut self, v: &Value, fresh: bool, live: bool, out: &mut Vec<StepEvent>) -> bool {
-        let kind = v.get("type").and_then(Value::as_str);
-        let payload = v.get("payload");
-        let ptype = word(payload, "type");
+        let kind = v.get(KEY_TYPE).and_then(Value::as_str);
+        let payload = v.get(KEY_PAYLOAD);
+        let ptype = word(payload, KEY_TYPE);
         match (kind, ptype) {
             (Some(TURN_CONTEXT), _) => {
                 let Some(turn) = word(payload, KEY_TURN_ID) else {
@@ -489,10 +493,6 @@ impl CodexStepFold {
     }
 
     fn latch(&mut self, fp: u64, id: Option<(u64, u64)>, end: u64) {
-        self.latch_as(fp, id, end, "unknown");
-    }
-
-    fn latch_as(&mut self, fp: u64, id: Option<(u64, u64)>, end: u64, why: &'static str) {
         self.broken = true;
         let at_ms = self.floor_ms;
         self.enqueue(
@@ -502,7 +502,7 @@ impl CodexStepFold {
                 off: end,
                 at_ms,
             },
-            StepEvent::Off { why },
+            StepEvent::Off { why: "unknown" },
         );
     }
 

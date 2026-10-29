@@ -281,6 +281,63 @@ fn datetimes_round_trip_through_serde() {
         aterm_toml::from_str::<Stamps>(&printed).expect("reparse"),
         parsed
     );
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct FlattenedStamps {
+        #[serde(flatten)]
+        stamps: Stamps,
+        #[serde(flatten)]
+        rest: BTreeMap<String, aterm_toml::Value>,
+    }
+    let with_extra = format!("{text}extra = 1979-05-27\n");
+    let flat: FlattenedStamps = aterm_toml::from_str(&with_extra).expect("flattened parse");
+    assert_eq!(flat.stamps, parsed);
+    assert_eq!(
+        flat.rest.get("extra"),
+        Some(&aterm_toml::Value::Datetime(parsed.date))
+    );
+
+    #[derive(Debug, Deserialize)]
+    struct AsMap {
+        #[allow(dead_code)]
+        when: BTreeMap<String, String>,
+    }
+    #[derive(Debug, Deserialize)]
+    struct AsStruct {
+        #[serde(default)]
+        #[allow(dead_code)]
+        x: i64,
+    }
+    #[derive(Debug, Deserialize)]
+    struct HoldsStruct {
+        #[allow(dead_code)]
+        when: AsStruct,
+    }
+    let map_err =
+        aterm_toml::from_str::<AsMap>("when = 1979-05-27\n").expect_err("a datetime is not a map");
+    assert!(
+        map_err
+            .to_string()
+            .contains("invalid type: datetime, expected a table"),
+        "{map_err}"
+    );
+    let struct_err = aterm_toml::from_str::<HoldsStruct>("when = 1979-05-27\n")
+        .expect_err("a datetime is not a struct");
+    assert!(
+        struct_err
+            .to_string()
+            .contains("invalid type: datetime, expected a table"),
+        "{struct_err}"
+    );
+    let value_err =
+        BTreeMap::<String, String>::deserialize(aterm_toml::Value::Datetime(parsed.date))
+            .expect_err("Value::Datetime is not a map");
+    assert!(
+        value_err
+            .to_string()
+            .contains("invalid type: datetime, expected a table"),
+        "{value_err}"
+    );
 }
 
 #[test]
@@ -306,6 +363,20 @@ paths = [\"M0 0\"]
     assert_eq!(ours["anchor"]["eye_y"].as_float(), Some(7.5));
     assert_eq!(ours["layer"][0]["role"].as_str(), Some("body"));
     assert_eq!(ours["layer"][0]["paths"][0].as_str(), Some("M0 0"));
+
+    for probe in [
+        "\"$__aterm_toml_private_datetime\" = \"1979-05-27\"\n",
+        "\"$__aterm_toml_private_datetime\" = 1\n",
+        "\"$__aterm_toml_private_datetime\" = \"not-a-date\"\n",
+    ] {
+        let table: aterm_toml::Table = probe.parse().expect("valid TOML table");
+        let value: aterm_toml::Value = probe.parse().expect("valid TOML value");
+        assert_eq!(value, aterm_toml::Value::Table(table.clone()), "{probe}");
+        assert!(
+            table.get("$__aterm_toml_private_datetime").is_some(),
+            "{probe}"
+        );
+    }
 
     let bad = "a = ";
     assert!(bad.parse::<aterm_toml::Table>().is_err());

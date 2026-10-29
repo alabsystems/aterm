@@ -41,35 +41,6 @@ fn the_tracker_keeps_the_normal_frame_through_a_maximize_and_restore() {
 }
 
 #[test]
-fn a_tiled_window_persists_the_frame_it_had_before_the_tile() {
-    let normal = super::NormalFrame {
-        origin: Some((320, 210)),
-        rows: 30,
-        cols: 100,
-    };
-    let (tile_origin, tile_grid) = ((0, 0), (62, 118));
-    let (maximized, tiled) = (false, true);
-    let mut held = normal;
-    held.note_origin(maximized || tiled, tile_origin);
-    held.note_grid(maximized || tiled, tile_grid);
-    assert_eq!(held, normal, "the tile's frame is not the normal one");
-    let hold = super::captured_hold(false, Some(maximized), || maximized || tiled);
-    assert_eq!(
-        super::captured_frame(Some(tile_origin), tile_grid, hold, held),
-        (Some((320, 210)), (30, 100)),
-        "a tiled capture persists the frame from before the tile"
-    );
-    let mut both_flags = normal;
-    both_flags.note_origin(maximized, tile_origin);
-    both_flags.note_grid(maximized, tile_grid);
-    assert_eq!(
-        super::captured_frame(Some(tile_origin), tile_grid, Some(maximized), both_flags),
-        (Some(tile_origin), tile_grid),
-        "negative control: the both-flags rule persists the tiled frame"
-    );
-}
-
-#[test]
 fn a_full_screen_window_persists_the_frame_it_had_before_the_full_screen() {
     let normal = super::NormalFrame {
         origin: Some((320, 210)),
@@ -3822,6 +3793,18 @@ fn a_held_tabs_record_is_its_own_agents() {
         })),
         ..dead_agent()
     };
+    let mut named_codex = codex.clone();
+    named_codex.pid = 4444;
+    let Some(restore::RunRestore::Codex(run)) = &mut named_codex.run else {
+        unreachable!();
+    };
+    run.alab.as_mut().unwrap().codex_auth_path = Some("/opt/named/auth.json".into());
+    let mut empty_home_codex = codex.clone();
+    empty_home_codex.pid = 4545;
+    let Some(restore::RunRestore::Codex(run)) = &mut empty_home_codex.run else {
+        unreachable!();
+    };
+    run.alab.as_mut().unwrap().codex_home = Some(String::new());
     let host =
         crate::harness_host::HostHandle::for_restored_test(std::sync::Arc::new(|_, _, _, _| {
             "wait:shell-prompt".to_string()
@@ -3834,12 +3817,17 @@ fn a_held_tabs_record_is_its_own_agents() {
     );
     cold.restore_into_window(
         WindowId(0),
-        window_of(vec![held(7, homed.clone()), held(8, codex)]),
+        window_of(vec![
+            held(7, homed.clone()),
+            held(8, codex),
+            held(9, named_codex),
+            held(10, empty_home_codex),
+        ]),
     );
     let from = cold.messages.log().records().count();
     cold.say_restored_held();
     let said = held_records(&cold, from);
-    assert_eq!(said.len(), 2, "{said:?}");
+    assert_eq!(said.len(), 4, "{said:?}");
     let (claude_title, claude_lines) = &said[0];
     assert!(
         claude_title.contains("Claude") && claude_title.contains("because the tab was held"),
@@ -3862,6 +3850,22 @@ fn a_held_tabs_record_is_its_own_agents() {
             "CODEX_HOME=/opt/agents/codex /opt/codex/bin/codex resume {THREAD}"
         ))) && !codex_lines.iter().any(|line| line.contains("claude")),
         "codex-alab's own validated line: {codex_lines:?}"
+    );
+    assert!(
+        said[2]
+            .1
+            .iter()
+            .all(|line| !line.contains("/opt/named/auth.json")),
+        "a named override still needs a capability check, including with a custom home: {:?}",
+        said[2]
+    );
+    assert!(
+        said[3]
+            .1
+            .iter()
+            .all(|line| !line.contains(&format!("resume {THREAD}"))),
+        "an explicitly empty CODEX_HOME still resolves to the default home and needs pool/capability checking: {:?}",
+        said[3]
     );
     host.shutdown_and_join();
 

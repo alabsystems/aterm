@@ -244,10 +244,11 @@ fn a_pass_end_quotes_the_outcome_this_pass_wrote_and_no_other() {
 fn the_defer_busy_flip_flag_is_stripped_and_picks_the_policy() {
     let argv = |parts: &[&str]| parts.iter().map(ToString::to_string).collect::<Vec<_>>();
     let mut args = argv(&["update", "--wait-lock", "1800", "--defer-busy-flip"]);
-    assert!(super::take_flag(&mut args, super::DEFER_BUSY_FLIP_FLAG));
+    assert!(super::apply_defer_busy_flip_flag(&mut args));
     assert_eq!(args, argv(&["update", "--wait-lock", "1800"]));
+    assert_eq!(super::flip_policy(), crate::quiet::FlipPolicy::WhenQuiet);
     let mut args = argv(&["update"]);
-    assert!(!super::take_flag(&mut args, super::DEFER_BUSY_FLIP_FLAG));
+    assert!(!super::apply_defer_busy_flip_flag(&mut args));
     assert_eq!(args, argv(&["update"]), "absent: untouched");
     assert_eq!(super::flip_policy(), crate::quiet::FlipPolicy::Now);
 }
@@ -4653,31 +4654,147 @@ fn a_wanted_vendor_program_serves_the_seed_without_the_index() {
         &all_but_muse,
         &none
     ));
-    let opt_in = ["grok", "kimi"];
-    let only_opt_in = excluding(
-        programs()
-            .filter(|p| !opt_in.contains(&p.as_str()))
-            .collect(),
-    );
-    for triple in [darwin, "x86_64-unknown-linux-gnu"] {
+    for program in programs().chain(["ay".to_string()]) {
         assert!(
-            !vendor_set_wanted_on(triple, &only_opt_in, &none),
-            "grok and kimi land only when a person installs them ({triple})"
+            vendor_wanted(&crate::config::PackagesConfig::default(), &none, &program),
+            "every row is in the default set: {program}"
         );
     }
-    for program in opt_in {
+    for program in ["grok", "kimi"] {
+        let only = excluding(programs().filter(|p| p != program).collect());
+        for triple in [darwin, "x86_64-unknown-linux-gnu"] {
+            let served =
+                crate::vendor_direct::spec(program).is_some_and(|spec| spec.serves(triple));
+            assert_eq!(
+                vendor_set_wanted_on(triple, &only, &none),
+                served,
+                "{program} alone completes the set wherever it is served ({triple})"
+            );
+        }
+        assert!(
+            vendor_set_wanted_on(darwin, &only, &none),
+            "PRECONDITION: {program} is served on {darwin}"
+        );
+        let removed = std::collections::BTreeSet::from([program.to_string()]);
+        assert!(
+            !vendor_set_wanted_on(darwin, &only, &removed),
+            "CONTROL: {program} removed on purpose stays out"
+        );
+        assert!(
+            !vendor_wanted(&excluding(vec![program.to_string()]), &none, program),
+            "CONTROL: {program} excluded stays out"
+        );
         assert!(!vendor_wanted(
             &crate::config::PackagesConfig::default(),
-            &none,
+            &removed,
             program
         ));
     }
-    for program in ["claude", "codex", "codex-old", "agy", "muse", "ay"] {
+}
+
+/// ONE DEFAULT SET: what `install --default-set`, the update pass after `seed` and doctor's
+/// toolset row complete is every program the index lists (a harness included) and every
+/// vendor row that serves the machine, so a first run installs claude, codex, codex-old, agy
+/// and muse beside the index's programs; `[packages].exclude` narrows both halves alike.
+#[test]
+fn the_default_set_holds_the_index_programs_and_every_vendor_row_serving_here() {
+    let darwin = "aarch64-apple-darwin";
+    let none = std::collections::BTreeSet::new();
+    let unnarrowed = crate::config::PackagesConfig::default();
+    let index = index_of(&[("ay", None), ("trust", None), ("muse-alab", None)]);
+    let set = default_set_here(&index, darwin);
+    for program in [
+        "ay",
+        "trust",
+        "muse-alab",
+        "claude",
+        "codex",
+        "codex-old",
+        "agy",
+        "muse",
+    ] {
         assert!(
-            vendor_wanted(&crate::config::PackagesConfig::default(), &none, program),
-            "{program}"
+            set.contains(program),
+            "{program} is in the default set here (a harness too, owner ruling 2026-10-27)"
         );
     }
+    for spec in crate::vendor_direct::VENDORS {
+        assert_eq!(
+            set.contains(spec.program),
+            spec.serves(darwin) && vendor_wanted(&unnarrowed, &none, spec.program),
+            "{}: a vendor row is in it exactly when it serves here and is wanted",
+            spec.program
+        );
+    }
+    let cfg = crate::config::PackagesConfig {
+        exclude: Some(vec!["muse".into(), "ay".into()]),
+        ..Default::default()
+    };
+    let wanted = wanted_programs(&index, &cfg, darwin);
+    assert_eq!(
+        set.difference(&wanted).cloned().collect::<Vec<_>>(),
+        ["ay", "muse"],
+        "exclude narrows an index program and a vendor row alike, and nothing else"
+    );
+}
+
+/// THE VENDOR LANE COMPLETES THE DEFAULT SET'S VENDOR HALF: a pass that completes the set,
+/// with no index, asks after exactly the vendor rows `vendor_wanted` admits (an excluded and a
+/// removed one left out), and those that serve this machine are the vendor members of the set
+/// doctor's toolset row judges; a row no build serves here is answered without asking a host.
+#[test]
+fn the_vendor_lane_completes_the_vendor_half_of_the_default_set() {
+    use crate::vendor_direct::lane::world::{self, Fake};
+    let layout = world::layout("vendor-half");
+    std::fs::create_dir_all(layout.removed().parent().unwrap()).unwrap();
+    std::fs::write(layout.removed(), "agy\n").unwrap();
+    let removed = removed_programs(&layout);
+    let f = Fake::default();
+    f.offline.set(true);
+    let cfg = crate::config::PackagesConfig {
+        exclude: Some(vec!["muse".into()]),
+        ..Default::default()
+    };
+    let trust = world::trust();
+    let seams = world_seams(&trust);
+    let pass = vendor_pass(
+        &layout,
+        &f,
+        &cfg,
+        &std::collections::BTreeMap::new(),
+        VendorLanes {
+            update_installed: true,
+            complete_the_set: true,
+        },
+        Consent::Explicit,
+        None,
+        &seams,
+    );
+    let wanted: std::collections::BTreeSet<String> = crate::vendor_direct::VENDORS
+        .iter()
+        .filter(|spec| vendor_wanted(&cfg, &removed, spec.program))
+        .map(|spec| spec.program.to_owned())
+        .collect();
+    assert_eq!(pass.ran, wanted, "the lane asks after every wanted row");
+    let triple = current_triple();
+    let served: std::collections::BTreeSet<String> = pass
+        .ran
+        .iter()
+        .filter(|program| crate::vendor_direct::spec(program).is_some_and(|s| s.serves(triple)))
+        .cloned()
+        .collect();
+    let index = index_of(&[("ay", None)]);
+    let set_vendors: std::collections::BTreeSet<String> = wanted_programs(&index, &cfg, triple)
+        .into_iter()
+        .filter(|program| crate::vendor_direct::is_vendor(program) && !removed.contains(program))
+        .collect();
+    assert_eq!(
+        served, set_vendors,
+        "what it can land is the set's vendor half"
+    );
+    assert_eq!(served, vendor_set_here(triple, &cfg, &removed));
+    assert!(!pass.ran.contains("muse") && !pass.ran.contains("agy"));
+    let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
 #[test]
@@ -5062,26 +5179,47 @@ fn a_signed_sum_is_poisoned_by_one_undeclared_entry() {
 
 #[test]
 fn set_completion_honours_every_opt_out_over_the_one_consent() {
-    assert!(should_complete_set(true, true, false, true, false, false));
-    assert!(!should_complete_set(true, false, false, true, false, false));
+    assert!(should_complete_set(true, true, false));
+    assert!(!should_complete_set(true, false, false));
     assert!(
-        should_complete_set(true, false, true, true, false, false),
+        should_complete_set(true, false, true),
         "a written `auto_install = true` stands in for adoption"
     );
-    assert!(!should_complete_set(false, true, false, true, false, false));
     assert!(
-        !should_complete_set(true, true, true, false, false, false),
+        !should_complete_set(false, true, true),
+        "an off wins over both"
+    );
+    let layout = temp_layout("complete-set");
+    std::fs::create_dir_all(&layout.prefix).unwrap();
+    record_adoption(&layout);
+    let parsed = crate::config::parse_packages;
+    assert!(
+        completes_the_set(&layout, &parsed("[packages]\nenabled = true\n")),
+        "CONTROL: an adopted store under the default consent"
+    );
+    assert!(
+        !completes_the_set(&layout, &parsed("[packages]\nenabled = false\n")),
         "enabled = false always wins over the install consent"
     );
+    assert!(!completes_the_set(
+        &layout,
+        &parsed("[packages]\nauto_install = false\n")
+    ));
     assert!(
-        !should_complete_set(true, true, true, true, true, false),
-        "declining outranks the install consent — it is the later, more specific act"
-    );
-    assert!(
-        !should_complete_set(true, true, true, true, false, true),
+        !completes_the_set(&layout, &parsed("[packages]\nenabled = [\n")),
         "the set waits for the config to be readable before it is completed from an \
          exclude list nobody could read"
     );
+    record_decline(&layout);
+    assert!(
+        !completes_the_set(&layout, &parsed("[packages]\nauto_install = true\n")),
+        "declining outranks the install consent — it is the later, more specific act"
+    );
+}
+
+/// Whether `uninstall --all` recorded a decline on `layout`.
+fn declined(layout: &crate::store::Layout) -> bool {
+    layout.declined().is_file()
 }
 
 #[test]
@@ -6131,48 +6269,30 @@ fn write_registry_with_harness(dir: &Path, index_build: u64, harness_build: u64)
     write_pkg(dir, "muse-alab", harness_build);
 }
 
-/// A HARNESS LANDS ONLY WHEN A PERSON NAMES IT, AND IS KEPT CURRENT ONCE IT HAS: the pass
-/// that completes the default set installs `ay` and leaves the pinned `muse-alab` alone (no
-/// build, no stub, no failure), a typed install lands it, and the next update pass moves it
-/// to the index's newer pin.
+/// A HARNESS IS ON BY DEFAULT LIKE EVERY PROGRAM, AND A PERSON'S OFF STAYS (owner ruling
+/// 2026-10-27): the pass that completes the default set installs the pinned `muse-alab` beside
+/// `ay` unasked, the next update pass moves it to the index's newer pin, and neither a person's
+/// uninstall nor a `[packages].exclude` naming it is undone by the set pass.
 #[cfg(unix)]
 #[test]
-fn a_harness_installs_only_when_named_and_is_kept_current_once_installed() {
-    let dir = scratch("harness-opt-in");
+fn a_harness_installs_with_the_default_set_and_a_persons_off_keeps_it_out() {
+    let dir = scratch("harness-default");
     write_registry_with_harness(&dir, 41, 4);
-    let layout = temp_layout("harness-opt-in");
+    let layout = temp_layout("harness-default");
     let cfg = crate::config::PackagesConfig::default();
     let fetcher = crate::DirFetcher::new(dir.clone());
     let out = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
     assert_eq!(out.failures, 0);
     let active = crate::active_builds(&layout);
     assert_eq!(active.get("ay").copied(), Some(18), "the default set lands");
-    assert!(
-        !active.contains_key("muse-alab"),
-        "a harness is never installed by the set: {active:?}"
-    );
-    assert!(
-        !crate::stub::pending_stub_exists(&layout, "muse-alab"),
-        "and no stub promises it"
-    );
-
-    crate::flow::install(
-        &fetcher,
-        &layout,
-        &test_anchor(),
-        &crate::InstallRequest {
-            channel: "stable",
-            program: "muse-alab",
-            triple: current_triple(),
-            installed: None,
-        },
-        build_floor(&layout),
-        0,
-    )
-    .expect("a typed install lands the harness");
     assert_eq!(
-        crate::active_builds(&layout).get("muse-alab").copied(),
-        Some(4)
+        active.get("muse-alab").copied(),
+        Some(4),
+        "the set installs a harness unasked: {active:?}"
+    );
+    assert!(
+        crate::which(&layout, "muse-alab").is_some(),
+        "and its shim resolves"
     );
 
     write_registry_with_harness(&dir, 42, 5);
@@ -6183,6 +6303,30 @@ fn a_harness_installs_only_when_named_and_is_kept_current_once_installed() {
         Some(5),
         "an installed harness follows its pin"
     );
+
+    uninstall_and_retire(&layout, "muse-alab").expect("a person uninstalls the harness");
+    let out = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
+    assert_eq!(out.failures, 0);
+    assert!(
+        !crate::active_builds(&layout).contains_key("muse-alab"),
+        "a person's uninstall is never undone by the set"
+    );
+    assert!(crate::which(&layout, "muse-alab").is_none());
+
+    let excluded = temp_layout("harness-excluded");
+    let narrowed = crate::config::PackagesConfig {
+        exclude: Some(vec!["muse-alab".into()]),
+        ..Default::default()
+    };
+    let out = install_default_set(&excluded, &fetcher, &test_anchor(), &narrowed, 0);
+    assert_eq!(out.failures, 0);
+    let active = crate::active_builds(&excluded);
+    assert_eq!(active.get("ay").copied(), Some(18));
+    assert!(
+        !active.contains_key("muse-alab"),
+        "[packages].exclude keeps a harness out: {active:?}"
+    );
+    let _ = std::fs::remove_dir_all(&excluded.prefix);
     let _ = std::fs::remove_dir_all(&layout.prefix);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -7465,6 +7609,58 @@ fn a_command_stub_reports_and_waits_for_its_program() {
     );
     assert_eq!(bump_contents(&l), "trust unattended\n", "{lines:?}");
     let _ = std::fs::remove_dir_all(&l.prefix);
+}
+
+/// ONCE A PENDING grok LANDS, ITS LAUNCH IS HANDED TO ITS GATED bin/ SHIM, NEVER cmd_run:
+/// `gated_shim` names `bin/grok`, the shim the stub stood in for, whose sign-in block
+/// (`the_signin_block_gates_a_signed_out_interactive_grok_on_aterm`) stops a signed-out
+/// interactive launch under aterm. CONTROL: a row with no sign-in gate (claude) keeps
+/// `cmd_run`'s path.
+#[cfg(unix)]
+#[test]
+fn a_landed_grok_runs_through_its_gated_shim_after_a_pending_wait() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let l = temp_layout("pend-gated");
+    let exe = |path: &std::path::Path, body: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let grok = crate::store::ToolName::new("grok").unwrap();
+    crate::stub::write_pending_stub(&l, &grok).unwrap();
+    assert_eq!(
+        crate::stub::pending_stub_exists(&l, "grok"),
+        crate::vendor_direct::served_here("grok"),
+        "PRECONDITION: grok's pending stub stands wherever grok is served"
+    );
+    let store = l.prefix.join("store/grok/1/bin/grok");
+    exe(&store, "#!/bin/sh\nprintf '<%s>' \"$@\"\n");
+    let prelude = crate::platform::twin_prelude(
+        "grok",
+        &l.prefix,
+        None,
+        crate::selfupdate::verbs_of("grok"),
+        &crate::yolo::policy_of("grok"),
+    );
+    exe(
+        &l.shim(&grok),
+        &crate::platform::sh_shim_content_twin(
+            &store,
+            &crate::shim_env::ShimEnv::NONE,
+            None,
+            &prelude,
+        ),
+    );
+    assert!(!crate::stub::pending_stub_exists(&l, "grok"), "grok landed");
+    assert_eq!(
+        gated_shim(&l, "grok"),
+        Some(l.shim(&grok)),
+        "the shim the stub stood in for"
+    );
+    assert!(
+        gated_shim(&l, "claude").is_none(),
+        "CONTROL: a row with no sign-in gate keeps cmd_run's path"
+    );
 }
 
 #[test]
@@ -12220,6 +12416,17 @@ fn the_fresh_landing_terminal_fails_only_on_a_failure() {
         both.starts_with(&format!("atpkg: {SEED_DONE_MARKER}")),
         "every landing deferred: the positive terminal, never a failure: {both}"
     );
+    assert_eq!(
+        left_for_next_pass(&format!("atpkg: {NET_STARTING_MARKER}2 programs\n{both}\n")),
+        [both],
+        "the terminal leaves them for the next pass"
+    );
+    for terminal in [
+        fresh_landing_terminal(&["claude"], &["codex"], 2),
+        fresh_landing_terminal(&[], &["codex"], 2),
+    ] {
+        assert!(left_for_next_pass(&terminal.unwrap()).is_empty());
+    }
 }
 
 #[test]
@@ -13156,4 +13363,70 @@ fn clt_install_aliases_are_recognized_by_atpkg_install() {
             assert!(line.starts_with(&format!("{alias} → ")), "{line}");
         }
     }
+}
+
+/// A summary drawn from the cached index says so and why, whether the index host was never
+/// reached or answered with no index (a refusal such as a rate limit, or a source that listed
+/// none); one from an index the pass reached is the bare line, which is the control (round 12:
+/// an offline pass said only "all 11 ALab tools are up to date").
+#[test]
+fn a_summary_from_the_cached_index_says_so() {
+    let row = |reached: bool, answered: bool, why: Option<&str>| crate::flow::ResolveProvenance {
+        reached,
+        why: why.map(String::from),
+        answered,
+    };
+    let tools: Vec<String> = (1..=11).map(|n| format!("tool{n}")).collect();
+    let all = "all 11 ALab tools are up to date";
+    let rows = [
+        (
+            Some(row(
+                false,
+                false,
+                Some("could not reach github.com (curl exit 7)\nsecond line"),
+            )),
+            format!("{all} (by the cached index: could not reach github.com (curl exit 7))"),
+        ),
+        (
+            Some(row(false, true, Some("HTTP 403: rate limit exceeded"))),
+            format!("{all} (by the cached index: HTTP 403: rate limit exceeded)"),
+        ),
+        (
+            Some(row(false, true, Some("the source listed no index"))),
+            format!("{all} (by the cached index: the source listed no index)"),
+        ),
+        (
+            Some(row(false, false, None)),
+            format!("{all} (by the cached index: the index was not reached)"),
+        ),
+        (Some(row(true, true, None)), all.to_string()),
+        (None, all.to_string()),
+    ];
+    for (resolve, want) in &rows {
+        assert_eq!(
+            channel_apply_summary(&tools, &[], false, true, resolve.as_ref()).as_deref(),
+            Some(want.as_str()),
+            "{resolve:?}"
+        );
+    }
+    let cached = row(false, true, Some("the source listed no index"));
+    assert_eq!(
+        channel_apply_summary(
+            &tools[..1],
+            &[("tool12".into(), Some(3), 4)],
+            false,
+            true,
+            Some(&cached),
+        )
+        .as_deref(),
+        Some(
+            "updated tool12 3 \u{2192} 4; the rest are up to date (by the cached index: the \
+             source listed no index)"
+        )
+    );
+    assert_eq!(
+        channel_apply_summary(&[], &[], false, true, Some(&cached)),
+        None,
+        "nothing current or moved says nothing"
+    );
 }

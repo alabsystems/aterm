@@ -416,7 +416,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_real_parent_shell_is_named_over_the_login_shell() {
-        if std::env::var_os(PROBE_ENV).is_some() {
+        if probe_prints_the_invoking_shell_if_asked() {
             return;
         }
         let scratch = aterm_tempfile::tempdir().expect("a scratch home");
@@ -434,7 +434,7 @@ mod tests {
             let script = format!(
                 "'{}' --exact --nocapture --quiet {}; true",
                 exe.display(),
-                "caller_shell::tests::probe_prints_the_invoking_shell_when_asked"
+                "caller_shell::tests::a_real_parent_shell_is_named_over_the_login_shell"
             );
             let out = aterm_spec::host::shell_command(shell.to_string(), scratch.path())
                 .arg("-c")
@@ -467,15 +467,15 @@ mod tests {
     const PROBE_ENV: &str = "ATPKG_CALLER_SHELL_PROBE";
 
     #[cfg(unix)]
-    #[test]
-    fn probe_prints_the_invoking_shell_when_asked() {
+    fn probe_prints_the_invoking_shell_if_asked() -> bool {
         if std::env::var_os(PROBE_ENV).is_none() {
-            return;
+            return false;
         }
         println!(
             "invoking_shell={}",
             invoking_shell().unwrap_or_else(|| "-".into())
         );
+        true
     }
 
     #[test]

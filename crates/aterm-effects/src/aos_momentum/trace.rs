@@ -337,18 +337,24 @@ impl MomentumTrace {
     #[inline]
     #[must_use]
     pub fn identity_mismatch(&self, build: &str) -> Option<IdentityMismatch> {
-        let ours = |c: MomentumCode| momentum_identity(&PrebuiltMomentum::new(c, build));
-        let mut i = 0;
-        while i < MomentumCode::ALL.len() {
-            if ours(MomentumCode::ALL[i]) == self.identity {
-                return None;
-            }
-            i += 1;
+        let shipped = momentum_identity(&PrebuiltMomentum::new(MomentumCode::Shipped, build));
+        if shipped == self.identity {
+            return None;
         }
-        Some(
-            IdentityMismatch::first(&self.identity, &ours(MomentumCode::Shipped))
-                .unwrap_or(IdentityMismatch::Code),
-        )
+        if shipped.task == self.identity.task
+            && shipped.contract == self.identity.contract
+            && shipped.schema == self.identity.schema
+            && shipped.profile == self.identity.profile
+        {
+            let mut i = 1;
+            while i < MomentumCode::ALL.len() {
+                if MomentumCode::ALL[i].artifact(build) == self.identity.code {
+                    return None;
+                }
+                i += 1;
+            }
+        }
+        Some(IdentityMismatch::first(&self.identity, &shipped).unwrap_or(IdentityMismatch::Code))
     }
 
     /// Refuses a trace whose identity this build does not run ([`TraceFault::Identity`]) or whose log holds more inputs than one host log epoch ([`MOMENTUM_HOST_MAX_EVENTS`]), then replays it as [`Self::replay`] does and judges the run by the identity's contract.

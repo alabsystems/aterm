@@ -1135,7 +1135,7 @@ fn the_switch_is_a_switch_a_screen_reader_can_press() {
 }
 
 /// THE SWITCH NAMES THE HARNESS IT SWITCHES: lit, or held off by the master switch, the `Switch`
-/// names the harness by its label and no product (`alab claude harness v0.4 on`), since a press
+/// names the harness by its label and no product (`alab claude harness v0.5 on`), since a press
 /// there turns every agent's harness. NEGATIVE CONTROL: under the agent's own switch off it names
 /// the agent's harness.
 #[cfg(a11y_tree)]
@@ -1559,26 +1559,41 @@ fn the_facts_words_read_on_a_tab_theme_of_its_own() {
     );
     let row = &app.windows[&wid].input_scratch.cells[at];
     let marks = ['\u{25C6}', '\u{2302}', '\u{2387}'];
+    let branch = app.windows[&wid]
+        .claude_lights
+        .fact_hits
+        .iter()
+        .find(|h| h.fact == super::Fact::Branch)
+        .copied()
+        .expect("the branch's stub is on the glass");
+    assert_eq!(branch.frame_row, at, "the stub is on the facts' row");
     let words: Vec<_> = row
         .iter()
-        .filter(|c| {
+        .enumerate()
+        .filter(|(_, c)| {
             c.ch != ' '
                 && !marks.contains(&c.ch)
                 && matches!(c.script, aterm_core::terminal::Script::Sub { .. })
         })
         .collect();
+    assert!(
+        words.iter().all(|(_, c)| c.bold),
+        "on the light paper every word at the values' weight, the stub quieter by its ink: \
+         {text:?}"
+    );
+    let stub = |col: usize| (branch.cols.0..branch.cols.1).contains(&col);
     let values: Vec<f32> = words
         .iter()
-        .filter(|c| c.bold)
-        .map(|c| reads(c.fg, ground))
+        .filter(|&&(col, _)| !stub(col))
+        .map(|(_, c)| reads(c.fg, ground))
         .collect();
     let stubs: Vec<(char, f32)> = words
         .iter()
-        .filter(|c| !c.bold)
-        .map(|c| (c.ch, reads(c.fg, ground)))
+        .filter(|&&(col, _)| stub(col))
+        .map(|(_, c)| (c.ch, reads(c.fg, ground)))
         .collect();
     assert!(
-        words.iter().all(|c| c.bg == ground),
+        words.iter().all(|(_, c)| c.bg == ground),
         "the tab's own paper is the facts' ground"
     );
     let quietest = values.iter().copied().fold(f32::INFINITY, f32::min);

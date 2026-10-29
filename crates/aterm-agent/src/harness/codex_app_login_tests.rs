@@ -13,6 +13,12 @@ use std::time::{Duration, Instant};
 
 use super::*;
 
+#[path = "codex_stored_identity_tests.rs"]
+mod stored_identity_tests;
+
+#[path = "codex_row_identity_tests.rs"]
+mod row_identity_tests;
+
 const HOSTS: &[&str] = &["auth.openai.com"];
 
 pub(crate) fn make_jwt(claims: &Value) -> String {
@@ -333,15 +339,19 @@ fn native_pkce_login_verifies_s256_writes_private_auth_json_and_reads_account() 
         read_account_email(&home).as_deref(),
         Some("codex-one@example.com")
     );
-    let entries: Vec<_> = std::fs::read_dir(&home)
+    let mut entries: Vec<_> = std::fs::read_dir(&home)
         .expect("read_dir")
         .filter_map(Result::ok)
         .map(|e| e.file_name())
         .collect();
+    entries.sort();
     assert_eq!(
         entries,
-        [std::ffi::OsString::from("auth.json")],
-        "no SQLite or sidecar files created in login directory"
+        [
+            std::ffi::OsString::from("auth.json"),
+            std::ffi::OsString::from("auth.json.lock"),
+        ],
+        "no SQLite files created in login directory"
     );
 
     // Passing a direct `CODEX_AUTH_PATH` `.json` file path before it exists writes the file
@@ -967,7 +977,7 @@ fn native_wham_usage_reads_windows_walls_and_refreshes_expired_or_unauthorized_t
     assert_eq!(usage.sample.week_pct, Some(31));
     assert_eq!(usage.sample.week_reset, Some(1_790_259_200));
     assert_eq!(usage.sample.at, now);
-    assert_eq!(usage.wall, None);
+    assert!(usage.walls.is_empty());
 
     // Case B: Near-expiry access token -> proactive POST /oauth/token + GET /wham/usage, updating auth.json.
     let home_expiring = tmp.path().join("expiring");
@@ -1076,19 +1086,19 @@ fn native_wham_usage_reads_windows_walls_and_refreshes_expired_or_unauthorized_t
         usage_of(&r, now).expect("usage")
     };
     let full = with("\"usedPercent\":94.2", "\"usedPercent\":100.0");
-    assert_eq!(full.wall, Some((SESSION_LIMIT, Some(1_790_010_800))));
+    assert_eq!(full.walls, [(SESSION_LIMIT, Some(1_790_010_800))]);
     let week = with("\"usedPercent\":31", "\"usedPercent\":100");
-    assert_eq!(week.wall, Some((WEEK_LIMIT, Some(1_790_259_200))));
+    assert_eq!(week.walls, [(WEEK_LIMIT, Some(1_790_259_200))]);
     let refused = with(
         "\"ordinaryUsageAllowed\":true",
         "\"ordinaryUsageAllowed\":false",
     );
-    assert_eq!(refused.wall, Some((SESSION_LIMIT, Some(1_790_010_800))));
+    assert_eq!(refused.walls, [(SESSION_LIMIT, Some(1_790_010_800))]);
     let reached = with(
         "\"rateLimitReachedType\":null",
         "\"rateLimitReachedType\":\"workspace_member_credits_depleted\"",
     );
-    assert!(reached.wall.is_some());
+    assert!(!reached.walls.is_empty());
     assert_eq!(usage_of(&json!({"accountId": "x"}), now), None);
     assert_eq!(usage_from_backend(&json!({"unexpected": true}), now), None);
 
@@ -1108,7 +1118,7 @@ fn native_wham_usage_reads_windows_walls_and_refreshes_expired_or_unauthorized_t
         now,
     )
     .expect("spend wall");
-    assert_eq!(spend_wall.wall, Some((SESSION_LIMIT, Some(1_790_010_800))));
+    assert_eq!(spend_wall.walls, [(SESSION_LIMIT, Some(1_790_010_800))]);
 
     let week_only = usage_of(
         &json!({
@@ -1130,9 +1140,9 @@ fn native_wham_usage_reads_windows_walls_and_refreshes_expired_or_unauthorized_t
         (
             week_only.sample.session_pct,
             week_only.sample.week_pct,
-            week_only.wall
+            week_only.walls
         ),
-        (None, Some(0), None)
+        (None, Some(0), Vec::new())
     );
 
     // `reset_after_seconds` fallback computes `resetsAt = now + secs` when `reset_at` is absent.
@@ -1538,6 +1548,7 @@ fn refresh_case(case: i64, early: bool) -> [(&'static str, i64); 6] {
         &format!("http://127.0.0.1:{port}/oauth/token"),
         Duration::from_secs(60),
         now,
+        None,
     );
     let _ = TcpStream::connect(("127.0.0.1", port));
     let kept = server.join().unwrap();
@@ -1677,6 +1688,7 @@ fn separately_bounded_responses_retain_large_tokens_across_fresh_file_reads() {
             &format!("http://127.0.0.1:{port}/oauth/token"),
             Duration::from_secs(60),
             1_790_000_000 + round,
+            None,
         )
         .expect("refresh from the saved replacement");
         let reloaded = load_stored_auth(tmp.path()).expect("reload published auth");
@@ -1748,12 +1760,13 @@ fn result_case(case: i64) -> [(&'static str, i64); 6] {
     let published = RefCell::new(None);
     let later = RefCell::new(std::fs::read(tmp.path().join(AUTH_FILE)).ok());
     let written = std::cell::Cell::new(false);
-    let result = refresh_stored_auth_with_publish(
+    let result = refresh_admitted(
         tmp.path(),
         &prior,
         &format!("http://127.0.0.1:{port}/oauth/token"),
         Duration::from_secs(60),
         now,
+        |_| true,
         |home, doc| {
             if case == 9 {
                 return Err(std::io::Error::other("injected publication failure"));
@@ -1831,7 +1844,8 @@ fn result_case(case: i64) -> [(&'static str, i64); 6] {
             later.replace(std::fs::read(home.join(AUTH_FILE)).ok());
             Ok(())
         },
-    );
+    )
+    .done();
     server.join().unwrap();
     let bound = result.as_ref().is_none_or(|result| {
         published
@@ -1958,7 +1972,14 @@ fn identity_case(case: i64) -> [(&'static str, i64); 5] {
         }
     }
     write_auth_doc(&home, &initial).unwrap();
-    let before = load_stored_auth(&home).unwrap();
+    let before = if case == 14 {
+        // The disk reader now refuses this input before refresh. Exercise the
+        // refresh boundary's independent guard with the structural fixture too.
+        assert!(load_stored_auth(&home).is_none());
+        stored_auth_from_doc(initial.clone()).unwrap()
+    } else {
+        load_stored_auth(&home).unwrap()
+    };
     let is_reload = matches!(case, 2..=7 | 13 | 15..=17);
     let (observed, result, posted, kept) = if is_reload {
         let mut changed = initial.clone();
@@ -2016,6 +2037,10 @@ fn identity_case(case: i64) -> [(&'static str, i64); 5] {
         write_auth_doc(&home, &changed).unwrap();
         let evidence = std::fs::read(home.join(AUTH_FILE)).unwrap();
         let observed = reload_updated_disk_auth(&home, &before);
+        if case == 7 {
+            assert!(load_stored_auth(&home).is_none());
+            assert!(updated_disk_auth(&before, stored_auth_from_doc(changed).unwrap()).is_none());
+        }
         let result = if observed.is_some() { 2 } else { 0 };
         let kept = std::fs::read(home.join(AUTH_FILE)).unwrap() == evidence;
         (observed, result, false, kept)
@@ -2054,6 +2079,7 @@ fn identity_case(case: i64) -> [(&'static str, i64); 5] {
             &format!("http://127.0.0.1:{port}/oauth/token"),
             Duration::from_secs(60),
             now,
+            None,
         );
         let _ = TcpStream::connect(("127.0.0.1", port));
         server.join().unwrap();
@@ -2236,7 +2262,14 @@ fn authority_case(case: i64) -> [(&'static str, i64); 6] {
     } else {
         format!("http://127.0.0.1:{port}/fallback")
     };
-    let result = refresh_stored_auth(tmp.path(), &before, &fallback, Duration::from_secs(60), now);
+    let result = refresh_stored_auth(
+        tmp.path(),
+        &before,
+        &fallback,
+        Duration::from_secs(60),
+        now,
+        None,
+    );
     let _ = TcpStream::connect(("127.0.0.1", port));
     let request = server.join().unwrap();
     let target = request.as_ref().is_none_or(|request| {
@@ -2518,4 +2551,581 @@ fn auth_reads_are_bounded_regular_non_symlink_files_and_expired_or_portless_logi
         portless.outcome
     );
     assert!(seen.handed.borrow().is_empty());
+}
+
+/// A mock provider on `127.0.0.1:0` answering each request with `answer(method, target)` until
+/// an empty connection ends it; the requests it saw come back from the join.
+fn provider(
+    answer: impl Fn(&str, &str) -> (&'static str, Value) + Send + 'static,
+) -> (u16, std::thread::JoinHandle<Vec<RecordedHttp>>) {
+    provider_by_request(move |request| answer(&request.method, &request.target))
+}
+
+/// A [`provider`] whose `answer` reads the whole request, its headers included.
+fn provider_by_request(
+    answer: impl Fn(&RecordedHttp) -> (&'static str, Value) + Send + 'static,
+) -> (u16, std::thread::JoinHandle<Vec<RecordedHttp>>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock provider");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        while let Ok((mut stream, _)) = listener.accept() {
+            let Some(request) = read_http_request(&mut stream) else {
+                break;
+            };
+            let (status, body) = answer(&request);
+            send_http_json(&mut stream, status, &body);
+            seen.push(request);
+        }
+        seen
+    });
+    (port, server)
+}
+
+/// Ends a [`provider`] and returns what it saw.
+fn provider_seen(port: u16, server: std::thread::JoinHandle<Vec<RecordedHttp>>) -> Vec<String> {
+    let _ = TcpStream::connect(("127.0.0.1", port));
+    server
+        .join()
+        .expect("provider")
+        .into_iter()
+        .map(|request| format!("{} {}", request.method, request.target))
+        .collect()
+}
+
+/// A login in `home` whose access token is good for an hour, with `refresh` as its refresh token.
+fn hour_login(home: &Path, now: i64, refresh: Option<&str>) -> StoredAuth {
+    let access = make_chatgpt_jwt(Some("owner@example.test"), "pro", now + 3600);
+    write_auth_doc(
+        home,
+        &json!({"auth_mode":"chatgpt", "tokens":{
+            "id_token":access, "access_token":access, "refresh_token":refresh,
+            "account_id":"acct_native_test"
+        }}),
+    )
+    .expect("login");
+    load_stored_auth(home).expect("stored login")
+}
+
+#[test]
+fn a_login_the_provider_refused_reads_signed_out_and_a_failed_refresh_reads_nothing() {
+    let now = 1_790_000_000;
+    for (token_status, token_body, refresh, want) in [
+        (
+            "400 Bad Request",
+            json!({"error":"invalid_grant"}),
+            Some("spent"),
+            Reading::SignedOut,
+        ),
+        (
+            "401 Unauthorized",
+            json!({"error":{"code":"refresh_token_expired"}}),
+            Some("spent"),
+            Reading::SignedOut,
+        ),
+        (
+            "400 Bad Request",
+            json!({"code":"refresh_token_reused"}),
+            Some("spent"),
+            Reading::SignedOut,
+        ),
+        // No refresh token: the refused access token is the whole login, and nothing is posted.
+        (
+            "500 Internal Server Error",
+            json!({}),
+            None,
+            Reading::SignedOut,
+        ),
+        // CONTROL: an outage or another refusal says nothing of the login.
+        (
+            "500 Internal Server Error",
+            json!({"error":"server_error"}),
+            Some("kept"),
+            Reading::Unread,
+        ),
+        (
+            "400 Bad Request",
+            json!({"error":"invalid_request"}),
+            Some("kept"),
+            Reading::Unread,
+        ),
+    ] {
+        let tmp = aterm_tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("login");
+        hour_login(&home, now, refresh);
+        let (port, server) = provider(move |_, target| match target {
+            "/oauth/token" => (token_status, token_body.clone()),
+            _ => ("401 Unauthorized", json!({"error":"unauthorized"})),
+        });
+        let got = read_login_with(
+            &home,
+            &format!("http://127.0.0.1:{port}/backend-api/wham/usage"),
+            &format!("http://127.0.0.1:{port}/oauth/token"),
+            aterm_spec::wait::MUST_HAPPEN,
+            now,
+            None,
+        );
+        let seen = provider_seen(port, server);
+        assert_eq!(got, want, "{token_status} {refresh:?}: {seen:?}");
+        assert_eq!(
+            seen.iter().filter(|r| r.starts_with("POST")).count(),
+            usize::from(refresh.is_some()),
+            "{seen:?}"
+        );
+        // A login is signed out only on a second refusal, asked after a look for another
+        // writer's rotation; an outage asks once.
+        assert_eq!(
+            seen.iter().filter(|r| r.starts_with("GET")).count(),
+            if want == Reading::SignedOut { 2 } else { 1 },
+            "{seen:?}"
+        );
+    }
+}
+
+/// codex-alab spent the single-use refresh token first (it takes no lock on `auth.json`): aterm's
+/// refresh is refused as reused, and the rotated login codex-alab writes is the login, not a
+/// sign-out that would end the owner's pin. The rotation lands only after aterm has read the
+/// refusal, while it looks for one, and the provider serves the usage to the rotated access
+/// token alone, as the real one does: the refused token still reads `401`. Its usage is read
+/// with the rotation, and the spent token is not sent again.
+#[test]
+fn a_refresh_refused_as_reused_reads_the_rotation_another_program_wrote() {
+    let now = 1_790_000_000;
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("login");
+    hour_login(&home, now, Some("spent-by-codex-alab"));
+    let fresh = make_chatgpt_jwt(Some("owner@example.test"), "pro", now + 7200);
+    let (posted, refresh_sent) = std::sync::mpsc::channel::<()>();
+    // codex-alab's write: once aterm's refresh request reached the provider, it waits for the
+    // lock aterm holds until it has read the refusal, then writes the rotation, so the rotation
+    // lands after the refusal and inside the look for one.
+    let writer = std::thread::spawn({
+        let (home, fresh) = (home.clone(), fresh.clone());
+        move || {
+            refresh_sent
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("aterm's refresh request");
+            let _after_refusal =
+                AuthLock::within(&home, Instant::now() + aterm_spec::wait::MUST_HAPPEN)
+                    .expect("aterm's refresh has its answer");
+            write_auth_doc(
+                &home,
+                &json!({"auth_mode":"chatgpt", "tokens":{
+                    "id_token":fresh, "access_token":fresh,
+                    "refresh_token":"rotated-by-codex-alab",
+                    "account_id":"acct_native_test"
+                }}),
+            )
+            .expect("codex-alab's rotation");
+        }
+    });
+    let rotated_bearer = format!("Bearer {fresh}");
+    let (port, server) = provider_by_request(move |request| {
+        let bearer = request
+            .headers
+            .iter()
+            .find(|(key, _)| key == "authorization")
+            .map(|(_, value)| value.as_str());
+        match request.target.as_str() {
+            "/oauth/token" => {
+                let _ = posted.send(());
+                ("400 Bad Request", json!({"code":"refresh_token_reused"}))
+            }
+            _ if bearer == Some(rotated_bearer.as_str()) => (
+                "200 OK",
+                json!({"plan_type":"pro", "rate_limit":{"allowed":true, "primary_window":{
+                    "used_percent":42.0, "limit_window_seconds":18_000, "reset_at":1_790_010_800
+                }}}),
+            ),
+            _ => ("401 Unauthorized", json!({"error":"unauthorized"})),
+        }
+    });
+    let got = read_login_with(
+        &home,
+        &format!("http://127.0.0.1:{port}/backend-api/wham/usage"),
+        &format!("http://127.0.0.1:{port}/oauth/token"),
+        aterm_spec::wait::MUST_HAPPEN,
+        now,
+        None,
+    );
+    let seen = provider_seen(port, server);
+    writer.join().expect("codex-alab's write");
+    let Reading::Usage(usage) = got else {
+        panic!("the rotated login is read, not signed out: {got:?} {seen:?}");
+    };
+    assert_eq!(usage.sample.session_pct, Some(42), "{seen:?}");
+    assert_eq!(
+        seen.iter().filter(|r| r.starts_with("POST")).count(),
+        1,
+        "the spent refresh token is not sent again: {seen:?}"
+    );
+}
+
+/// ONE REFUSAL IS NOT A SIGN-OUT: the usage was refused and the refresh answered as reused, but
+/// the second ask, after the look for a rotation, is served. The login reads its usage, so the
+/// owner's pin on it stands; the spent refresh token is not sent again.
+#[test]
+fn a_refusal_the_second_ask_does_not_repeat_leaves_the_login_signed_in() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let now = 1_790_000_000;
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("login");
+    hour_login(&home, now, Some("spent"));
+    let asks = Arc::new(AtomicUsize::new(0));
+    let (port, server) = provider({
+        let asks = Arc::clone(&asks);
+        move |_, target| match target {
+            "/oauth/token" => ("400 Bad Request", json!({"code":"refresh_token_reused"})),
+            _ if asks.fetch_add(1, Ordering::SeqCst) == 0 => {
+                ("401 Unauthorized", json!({"error":"unauthorized"}))
+            }
+            _ => (
+                "200 OK",
+                json!({"plan_type":"pro", "rate_limit":{"allowed":true, "primary_window":{
+                    "used_percent":42.0, "limit_window_seconds":18_000, "reset_at":1_790_010_800
+                }}}),
+            ),
+        }
+    });
+    let got = read_login_with(
+        &home,
+        &format!("http://127.0.0.1:{port}/backend-api/wham/usage"),
+        &format!("http://127.0.0.1:{port}/oauth/token"),
+        aterm_spec::wait::MUST_HAPPEN,
+        now,
+        None,
+    );
+    let seen = provider_seen(port, server);
+    let Reading::Usage(usage) = got else {
+        panic!("one refusal does not sign the login out: {got:?} {seen:?}");
+    };
+    assert_eq!(usage.sample.session_pct, Some(42), "{seen:?}");
+    assert_eq!(
+        seen.iter().filter(|r| r.starts_with("POST")).count(),
+        1,
+        "{seen:?}"
+    );
+}
+
+#[test]
+fn a_refresh_with_too_little_time_left_sends_nothing() {
+    let now = 1_790_000_000;
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("login");
+    let stored = hour_login(&home, now, Some("single-use"));
+    let token = |answer: &str| json!({"access_token": answer, "refresh_token": "next"});
+    let (port, server) = provider(move |_, _| ("200 OK", token("unused")));
+    let got = refresh_outcome(
+        &home,
+        &stored,
+        &format!("http://127.0.0.1:{port}/oauth/token"),
+        MIN_REFRESH_BUDGET - Duration::from_millis(1),
+        now,
+        None,
+    );
+    assert!(matches!(got, Refreshed::Failed), "{got:?}");
+    assert_eq!(
+        provider_seen(port, server),
+        Vec::<String>::new(),
+        "a request whose answer could be cut off never spends the refresh token"
+    );
+    // CONTROL: with the budget the request goes out.
+    let (port, server) = provider(|_, _| ("500 Internal Server Error", json!({})));
+    let _ = refresh_outcome(
+        &home,
+        &stored,
+        &format!("http://127.0.0.1:{port}/oauth/token"),
+        aterm_spec::wait::MUST_HAPPEN,
+        now,
+        None,
+    );
+    assert_eq!(provider_seen(port, server), ["POST /oauth/token"]);
+}
+
+/// Another refresh holds the login's lock for the whole of this one's budget, which is more than
+/// [`MIN_REFRESH_BUDGET`], so only the lock keeps this refresh from sending its request: the
+/// refresh token the other refresh is spending is not sent twice.
+#[test]
+fn a_refresh_sends_nothing_while_another_holds_the_logins_lock() {
+    let now = 1_790_000_000;
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("login");
+    let stored = hour_login(&home, now, Some("single-use"));
+    let (port, server) = provider(|_, _| ("200 OK", json!({})));
+    // Held until this refresh has returned, so held past its whole budget.
+    let held = AuthLock::within(&home, Instant::now() + aterm_spec::wait::MUST_HAPPEN)
+        .expect("the other refresh's lock");
+    let got = refresh_outcome(
+        &home,
+        &stored,
+        &format!("http://127.0.0.1:{port}/oauth/token"),
+        MIN_REFRESH_BUDGET + Duration::from_secs(1),
+        now,
+        None,
+    );
+    drop(held);
+    assert!(matches!(got, Refreshed::Failed), "{got:?}");
+    assert_eq!(
+        provider_seen(port, server),
+        Vec::<String>::new(),
+        "the refresh token another refresh holds is not spent twice"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(beside_auth(&home, LOCK_SUFFIX))
+            .expect("the lock file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "{mode:o}");
+    }
+}
+
+#[test]
+fn a_refresh_response_a_failed_publication_left_is_published_by_the_next_read() {
+    let now = 1_790_000_000;
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("login");
+    let stored = hour_login(&home, now, Some("spent-refresh"));
+    let before = std::fs::read(home.join(AUTH_FILE)).expect("auth");
+    let fresh = make_chatgpt_jwt(Some("owner@example.test"), "pro", now + 7200);
+    let answer = json!({"id_token":fresh, "access_token":fresh, "refresh_token":"rotated-refresh"});
+    let (port, server) = provider(move |_, _| ("200 OK", answer.clone()));
+    let got = refresh_admitted(
+        &home,
+        &stored,
+        &format!("http://127.0.0.1:{port}/oauth/token"),
+        aterm_spec::wait::MUST_HAPPEN,
+        now,
+        |_| true,
+        |_, _| Err(std::io::Error::other("injected publication failure")),
+    );
+    assert_eq!(provider_seen(port, server), ["POST /oauth/token"]);
+    assert!(matches!(got, Refreshed::Failed), "{got:?}");
+    assert_eq!(std::fs::read(home.join(AUTH_FILE)).expect("auth"), before);
+    let journal = RefreshJournal::read(&home)
+        .flatten()
+        .expect("the response is kept beside the login");
+    assert_eq!(
+        journal.tokens.refresh_token.as_deref(),
+        Some("rotated-refresh")
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(beside_auth(&home, JOURNAL_SUFFIX))
+            .expect("journal")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "{mode:o}");
+    }
+
+    // A file that cannot be read now keeps the journal for a later read.
+    std::fs::write(home.join(AUTH_FILE), b"half-written").expect("garbage");
+    recover_journal(&home, Instant::now() + aterm_spec::wait::MUST_HAPPEN);
+    assert!(RefreshJournal::read(&home).flatten().is_some());
+    std::fs::write(home.join(AUTH_FILE), &before).expect("restore");
+
+    // The next read publishes it onto the login it was refreshed from.
+    recover_journal(&home, Instant::now() + aterm_spec::wait::MUST_HAPPEN);
+    let now_stored = load_stored_auth(&home).expect("published");
+    assert_eq!(now_stored.refresh_token.as_deref(), Some("rotated-refresh"));
+    assert_eq!(now_stored.access_token, fresh);
+    assert!(
+        RefreshJournal::read(&home).is_none(),
+        "spent once published"
+    );
+
+    // CONTROL: a journal refreshed from another login is dropped, never published over this one.
+    let published = std::fs::read(home.join(AUTH_FILE)).expect("auth");
+    RefreshJournal {
+        base: "another-login".to_owned(),
+        tokens: journal.tokens,
+    }
+    .write(&home)
+    .expect("a stale journal");
+    recover_journal(&home, Instant::now() + aterm_spec::wait::MUST_HAPPEN);
+    assert_eq!(
+        std::fs::read(home.join(AUTH_FILE)).expect("auth"),
+        published
+    );
+    assert!(RefreshJournal::read(&home).is_none());
+
+    // A response naming another account than the row expects is neither kept nor published.
+    let stored = hour_login(&home, now, Some("spent-refresh"));
+    let before = std::fs::read(home.join(AUTH_FILE)).expect("auth");
+    let other = make_chatgpt_jwt(Some("intruder@example.test"), "pro", now + 7200);
+    let answer = json!({"id_token":other, "access_token":other, "refresh_token":"theirs"});
+    let (port, server) = provider(move |_, _| ("200 OK", answer.clone()));
+    let got = refresh_outcome(
+        &home,
+        &stored,
+        &format!("http://127.0.0.1:{port}/oauth/token"),
+        aterm_spec::wait::MUST_HAPPEN,
+        now,
+        Some("owner@example.test"),
+    );
+    assert_eq!(provider_seen(port, server), ["POST /oauth/token"]);
+    assert!(matches!(got, Refreshed::Failed), "{got:?}");
+    assert!(
+        RefreshJournal::read(&home).is_none(),
+        "another account's answer is not kept"
+    );
+    assert_eq!(std::fs::read(home.join(AUTH_FILE)).expect("auth"), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn auth_lock_coordinates_refresh_reloads_rotated_tokens_and_refuses_symlinks() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    assert_eq!(
+        lock_path(Path::new("/home/a/.codex/auth.json")),
+        PathBuf::from("/home/a/.codex/auth.json.lock")
+    );
+    assert_eq!(
+        lock_path(Path::new("/pool/acct-b.json")),
+        PathBuf::from("/pool/acct-b.json.lock")
+    );
+
+    let now = 1_790_000_000;
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("locked-login");
+    let initial_jwt = make_chatgpt_jwt(Some("lock@example.com"), "pro", now + 60);
+    let rotated_jwt = make_chatgpt_jwt(Some("lock@example.com"), "pro", now + 7200);
+    let server_jwt = make_chatgpt_jwt(Some("lock@example.com"), "pro", now + 5400);
+    write_auth_doc(
+        &home,
+        &json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "id_token": initial_jwt,
+                "access_token": initial_jwt,
+                "refresh_token": "rt_initial",
+                "account_id": "acct_native_test"
+            }
+        }),
+    )
+    .expect("seed initial auth");
+    let auth_file = auth_path_in_home(&home);
+    let prior = load_stored_auth(&home).expect("load initial");
+
+    // 1. Holding `auth.json.lock` from another open file description (as codex-alab does),
+    //    rotating `auth.json` on disk, and releasing the lock causes `refresh_stored_auth` to
+    //    wait for the lock, reload the rotated credentials under the lock, and send 0 requests.
+    let holder = AuthLock::try_take(&auth_file)
+        .expect("open lock")
+        .expect("lock free");
+    let mode = std::fs::metadata(lock_path(&auth_file))
+        .expect("lock metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "auth.json.lock must be created 0600");
+    assert!(
+        AuthLock::try_take(&auth_file).expect("probe").is_none(),
+        "second open sees lock held"
+    );
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock token server");
+    let port = listener.local_addr().expect("addr").port();
+    let token_url = format!("http://127.0.0.1:{port}/oauth/token");
+    let home_rot = home.clone();
+    let rotated_for_thread = rotated_jwt.clone();
+    let rotator = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(80));
+        write_auth_doc(
+            &home_rot,
+            &json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": rotated_for_thread,
+                    "access_token": rotated_for_thread,
+                    "refresh_token": "rt_from_codex_alab",
+                    "account_id": "acct_native_test"
+                }
+            }),
+        )
+        .expect("codex-alab rotates auth.json under lock");
+        drop(holder);
+    });
+
+    let reloaded = refresh_stored_auth(
+        &home,
+        &prior,
+        &token_url,
+        aterm_spec::wait::MUST_HAPPEN,
+        now,
+        Some("lock@example.com"),
+    )
+    .expect("reloaded rotated credentials after lock release");
+    rotator.join().expect("rotator thread");
+    assert_eq!(
+        reloaded.refresh_token.as_deref(),
+        Some("rt_from_codex_alab")
+    );
+    assert_eq!(reloaded.access_token, rotated_jwt);
+
+    // 2. When `refresh_stored_auth` sends a refresh request, it holds `auth.json.lock` across
+    //    the HTTP request and publication, releasing it on return.
+    let saw_held_at_request = Arc::new(AtomicBool::new(false));
+    let saw_for_server = Arc::clone(&saw_held_at_request);
+    let auth_for_server = auth_file.clone();
+    let server_jwt_clone = server_jwt.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept refresh");
+        let _req = read_http_request(&mut stream).expect("read refresh");
+        let probe = AuthLock::try_take(&auth_for_server).expect("probe lock at request");
+        saw_for_server.store(probe.is_none(), Ordering::SeqCst);
+        send_http_json(
+            &mut stream,
+            "200 OK",
+            &json!({
+                "id_token": server_jwt_clone,
+                "access_token": server_jwt_clone,
+                "refresh_token": "rt_from_aterm"
+            }),
+        );
+    });
+    let refreshed = refresh_stored_auth(
+        &home,
+        &reloaded,
+        &token_url,
+        aterm_spec::wait::MUST_HAPPEN,
+        now,
+        Some("lock@example.com"),
+    )
+    .expect("refresh under lock");
+    server.join().expect("server thread");
+    assert!(
+        saw_held_at_request.load(Ordering::SeqCst),
+        "auth.json.lock must be held while the refresh HTTP request is in flight"
+    );
+    assert_eq!(refreshed.refresh_token.as_deref(), Some("rt_from_aterm"));
+    assert!(
+        AuthLock::try_take(&auth_file)
+            .expect("probe after refresh")
+            .is_some(),
+        "auth.json.lock must be unlocked once refresh_stored_auth returns"
+    );
+
+    // 3. A symlinked `auth.json.lock` is refused without following the link or creating its target.
+    std::fs::remove_file(lock_path(&auth_file)).expect("remove lock");
+    let elsewhere = tmp.path().join("elsewhere.lock");
+    std::os::unix::fs::symlink(&elsewhere, lock_path(&auth_file)).expect("symlink lock");
+    assert!(AuthLock::try_take(&auth_file).is_err());
+    assert!(!elsewhere.exists());
+    assert!(
+        refresh_stored_auth(
+            &home,
+            &refreshed,
+            &token_url,
+            Duration::from_secs(5),
+            now,
+            None,
+        )
+        .is_none(),
+        "symlinked lock must refuse refresh before any request"
+    );
+    assert!(!elsewhere.exists());
 }

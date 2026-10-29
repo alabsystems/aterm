@@ -23,6 +23,18 @@ const MAX_LINE_BYTES: u64 = 64 * 1024;
 /// Reply line-count cap: a header claiming more is REFUSED (not clamped — a
 /// clamp would leave unread lines desyncing every later reply).
 const MAX_SESSIONS_PER_PEER: usize = 1024;
+/// The lines a reply's facts carry beside its sessions, at most: an `account`
+/// line for each row of every pooled CLI's roster, full, and the
+/// `server_heard` lines of a vault it serves.
+const MAX_FACTS_LINES: usize = aterm_agent::harness::accounts::Cli::ALL.len()
+    * aterm_agent::harness::accounts::MAX_ACCOUNTS
+    + MAX_HEARD_LINES;
+/// The `server_heard` lines of one vault ([`MAX_FACTS_LINES`]).
+#[cfg(unix)]
+const MAX_HEARD_LINES: usize = aterm_secrets::server::MAX_HEARD;
+/// No vault is served off unix.
+#[cfg(not(unix))]
+const MAX_HEARD_LINES: usize = 0;
 
 /// One scan at a time: menu-open spam coalesces onto the in-flight scan (its
 /// result is at most a menu-track old, and the NEXT open kicks a fresh one).
@@ -270,7 +282,7 @@ fn summarize_peer(pid: u32, sock: &str) -> Option<SiblingInstance> {
     let mut reader = BufReader::new(&stream);
     let header = read_bounded_line(&stream, &mut reader, deadline)?;
     let count: usize = header.trim_end().strip_prefix("OK ")?.parse().ok()?;
-    if count > MAX_SESSIONS_PER_PEER + 1 {
+    if count > MAX_SESSIONS_PER_PEER + 1 + MAX_FACTS_LINES {
         // Refuse, never clamp: reading fewer lines than the peer sent would
         // leave the leftovers desyncing every later reply on this stream.
         return None;

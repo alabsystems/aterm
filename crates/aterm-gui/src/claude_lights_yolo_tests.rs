@@ -80,8 +80,9 @@ fn mode_glass(app: &App, wid: WindowId) -> String {
 /// in one run of cells, at every width the whole row is drawn, pushing neither Autopilot nor
 /// the model off, and its last cell is still the click that asks for the next mode. Bypass, an
 /// expected mode no light shows at rest on Claude's own row, reads `yolo` alone there. A row
-/// Claude cut stands as drawn, the light naming `manual`. CONTROL: unhosted, Claude's row and
-/// the light's own word.
+/// Claude cut where only a key hint can be cut (`? for shor…`) is rewritten as the whole one; a
+/// row cut where a job may be stands as drawn, the light naming `manual`. CONTROL: unhosted,
+/// Claude's row and the light's own word.
 #[test]
 fn the_mode_light_is_the_modes_one_home_on_a_rewritten_row() {
     for cols in [120_u16, 80, 50] {
@@ -140,13 +141,22 @@ fn the_mode_light_is_the_modes_one_home_on_a_rewritten_row() {
             "bypass at rest, rewrite={rewrite}"
         );
     }
-    let (mut app, wid, session, _reader, _host) = claude_app(33, true);
-    let cut = mode_row_in(MANUAL, 33);
-    assert!(cut.ends_with('\u{2026}'), "Claude's own cut: {cut:?}");
-    draw_claude(&app, session, &cut);
-    frame(&mut app, wid);
-    assert_eq!(mode_glass(&app, wid).trim_end(), cut, "a cut row stands");
-    assert_eq!(light_cells(&app, wid).1, "\u{23F8} manual");
+    let jobs = "  \u{23F8} manual mode on \u{00B7} 2 monitors \u{00B7} 1 shell";
+    for (mode, rewritten) in [(MANUAL, true), (jobs, false)] {
+        let (mut app, wid, session, _reader, _host) = claude_app(33, true);
+        let cut = mode_row_in(mode, 33);
+        assert!(cut.ends_with('\u{2026}'), "Claude's own cut: {cut:?}");
+        draw_claude(&app, session, &cut);
+        frame(&mut app, wid);
+        let glass = mode_glass(&app, wid);
+        if rewritten {
+            assert!(glass.trim().is_empty(), "a cut key hint goes: {glass:?}");
+            assert_eq!(light_cells(&app, wid).1, "\u{23F8} nag mode", "{cut:?}");
+        } else {
+            assert_eq!(glass.trim_end(), cut, "a cut row stands");
+            assert_eq!(light_cells(&app, wid).1, "\u{23F8} manual", "{cut:?}");
+        }
+    }
 }
 
 /// THE MODE LIGHT'S TITLES NAME BYPASS AND MANUAL AS THE LIGHT DOES: where the row is rewritten

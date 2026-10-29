@@ -191,20 +191,42 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Pars
         }
     }
 
+    let no_operands = |ops: Vec<String>| -> Result<(), ParseError> {
+        if let Some(extra) = ops.into_iter().next() {
+            return Err(ParseError::UnexpectedArg(extra));
+        }
+        Ok(())
+    };
     let cmd = match verb.as_str() {
-        "survey" => Cmd::Survey { cells, top },
-        "blame" => Cmd::Blame {
-            pkg: operands
-                .pop()
-                .ok_or(ParseError::MissingOperand("a package name"))?,
-            cells,
-        },
-        "budget" => Cmd::Budget {
-            update,
-            allow_regress,
-        },
-        "attest" => Cmd::Attest,
-        "check" => Cmd::Check { cells },
+        "survey" => {
+            no_operands(operands)?;
+            Cmd::Survey { cells, top }
+        }
+        "blame" => {
+            let mut ops = operands.into_iter();
+            let pkg = ops
+                .next()
+                .ok_or(ParseError::MissingOperand("a package name"))?;
+            if let Some(extra) = ops.next() {
+                return Err(ParseError::UnexpectedArg(extra));
+            }
+            Cmd::Blame { pkg, cells }
+        }
+        "budget" => {
+            no_operands(operands)?;
+            Cmd::Budget {
+                update,
+                allow_regress,
+            }
+        }
+        "attest" => {
+            no_operands(operands)?;
+            Cmd::Attest
+        }
+        "check" => {
+            no_operands(operands)?;
+            Cmd::Check { cells }
+        }
         "serde-attrs" => Cmd::SerdeAttrs {
             paths: operands.into_iter().map(PathBuf::from).collect(),
         },
@@ -296,6 +318,16 @@ mod tests {
                 paths: vec!["crates/aterm-serde".into(), "crates/x".into()]
             }
         );
+        assert_eq!(
+            p(&["blame", "pkg1", "pkg2"]),
+            Err(ParseError::UnexpectedArg("pkg2".into()))
+        );
+        for verb in ["survey", "budget", "attest", "check"] {
+            assert_eq!(
+                p(&[verb, "stray"]),
+                Err(ParseError::UnexpectedArg("stray".into()))
+            );
+        }
     }
 
     #[test]

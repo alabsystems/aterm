@@ -35,6 +35,26 @@ pub(crate) struct RenderPassDesc<'a> {
     pub(crate) scissor: Option<MtlScissorRect>,
 }
 
+/// Test-only census of the blit encoders this thread opened ([`CommandBuffer::copy_texture_sub_rect`] and the readback copy): a present that only composes and draws opens none.
+#[cfg(test)]
+pub(crate) mod blit_census {
+    use std::cell::Cell;
+
+    thread_local! {
+        static OPENED: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// One `blitCommandEncoder` about to open on this thread.
+    pub(crate) fn note() {
+        OPENED.with(|opened| opened.set(opened.get() + 1));
+    }
+
+    /// How many this thread has opened so far.
+    pub(crate) fn opened() -> u64 {
+        OPENED.with(Cell::get)
+    }
+}
+
 /// Test-only census of the FFI calls a device-loss refusal must precede: the `commandBuffer` mints in [`EncodeSession::begin`] and `Frame::present`, and the swapchain's `nextDrawable`.
 #[cfg(test)]
 pub(crate) mod queue_ffi_census {
@@ -313,6 +333,8 @@ impl<'s> CommandBuffer<'s> {
                  module models (identical formats or a Unorm/sRGB alias pair)"
             ));
         }
+        #[cfg(test)]
+        blit_census::note();
         let _pool = AutoreleasePool::new();
         // SAFETY: `blitCommandEncoder` returns an autoreleased encoder owned by
         // the pool through `endEncoding`. The rects were validated above.
@@ -409,6 +431,8 @@ toTexture:destinationSlice:destinationLevel:destinationOrigin:",
                 "readback buffer holds {have} bytes, needs {need} ({bytes_per_row} x {height})"
             ));
         }
+        #[cfg(test)]
+        blit_census::note();
         let _pool = AutoreleasePool::new();
         // SAFETY: as `copy_texture_sub_rect` — pooled autoreleased blit encoder; the copy's stride/extent/length were validated above.
         unsafe {

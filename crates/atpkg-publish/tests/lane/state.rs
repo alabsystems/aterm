@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use atpkg_publish::lane::LaneKind;
 use atpkg_publish::lane::hold::{Holds, of_members};
 use atpkg_publish::lane::report::{self, Recorded, Transcript};
-use atpkg_publish::lane::state::{LaneState, Lock};
+use atpkg_publish::lane::state::{LaneState, Lock, PRUNE_AFTER_SECS};
 use atpkg_publish::testkit::NOW;
 use atpkg_publish::triple::{
     AARCH64_APPLE_DARWIN, AARCH64_UNKNOWN_LINUX_GNU, X86_64_APPLE_DARWIN, X86_64_UNKNOWN_LINUX_GNU,
@@ -78,6 +78,16 @@ fn the_pins_floor_refuses_a_fallen_pin_and_warns_of_a_vanished_one() {
         tx.text()
             .contains("atpkg-pins-seen was not recorded for x86_64-unknown-linux-gnu")
     );
+    for malformed in [
+        "# pins-resolved-for x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu\nay\n",
+        "# pins-resolved-for x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu\nay 10 extra\n",
+    ] {
+        std::fs::write(&s.pins_seen, malformed).expect("write malformed pins_seen");
+        let err = s
+            .check_pins(&targets, &pins(&[("ay", 11)]), 8, &tx)
+            .expect_err("truncated or trailing-token pin line must refuse");
+        assert!(err.to_string().contains("unreadable line"), "{err}");
+    }
 }
 
 #[test]
@@ -118,21 +128,27 @@ fn attempts_count_up_clear_on_success_and_age_out() {
     s.clear_attempts("ay", 4);
     assert_eq!(s.bump_attempts("ay", 4), 1);
     let file = s.attempts_file("ay", 4);
-    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
-    std::fs::File::options()
-        .write(true)
-        .open(&file)
-        .and_then(|f| f.set_modified(old))
-        .expect("age the counter");
-    let now = i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_secs(),
-    )
-    .expect("i64");
-    s.prune(now);
-    assert!(!file.exists());
+    let set_mtime = |unix_secs: i64| {
+        let stamp = std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(u64::try_from(unix_secs).expect("non-negative"));
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .and_then(|f| f.set_modified(stamp))
+            .expect("age the counter");
+    };
+    set_mtime(NOW - PRUNE_AFTER_SECS);
+    s.prune(NOW);
+    assert!(
+        file.exists(),
+        "an entry aged exactly PRUNE_AFTER_SECS survives"
+    );
+    set_mtime(NOW - PRUNE_AFTER_SECS - 1);
+    s.prune(NOW);
+    assert!(
+        !file.exists(),
+        "an entry one second past PRUNE_AFTER_SECS is pruned"
+    );
 }
 
 #[test]

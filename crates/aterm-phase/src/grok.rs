@@ -43,7 +43,7 @@ use crate::wall::{Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 4, "0.4");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 5, "0.5");
 
 /// How many of the screen's last drawn rows a wall row may stand in ([`crate::live_zone_start`]):
 /// the notice a turn ended on, with room for a composer and key rows under it.

@@ -705,6 +705,16 @@ pub fn move_ticks(steps: &[Step], from_ns: i128, cell: (u16, u16)) -> MoveTicks 
     m
 }
 
+/// Whether the first tick at or after `barrier_ns` carries `cell`, which proves that the first present booked after a main-loop read asked no earlier than `barrier_ns` showed the caret moved to `cell` after that read.
+///
+/// The main loop answers between passes, so every present composed before the reply is booked by then; each present after it is composed at a glow tick (the hosted glow logs one per frame) from `barrier_ns` on, and with no further move every tick after one that carries the moved cell carries it too. `false` proves nothing: the first tick may be one composed before the echo reached the grid, whose present can be the first after the read, or one composed before the reply, already booked by it.
+#[must_use]
+pub fn first_present_carries(steps: &[Step], barrier_ns: i128, cell: (u16, u16)) -> bool {
+    move_ticks(steps, barrier_ns, cell)
+        .next
+        .is_some_and(|(_, cur)| cur == Some(cell))
+}
+
 /// The keys of the log a measured phase holds: the drive's fresh keys, the log's last.
 #[must_use]
 pub fn phase_keys() -> usize {
@@ -1286,6 +1296,25 @@ mod tests {
         assert_eq!(m.next, Some((110_000_000, Some((1, 1)))));
         assert_eq!(m.at_cell, Some(170_000_000));
         assert_eq!(move_ticks(&steps, 1_000_000_000, (1, 2)).next, None);
+    }
+
+    /// The first tick from a main-loop read on proves that the first present after the read showed a moved caret when it carries the moved cell; a first tick on the old cell, or none, proves nothing.
+    #[test]
+    fn a_first_tick_on_the_moved_cell_proves_the_present_after_the_read_showed_it() {
+        let steps = log();
+        assert!(first_present_carries(&steps, 115_000_000, (1, 2)));
+        assert!(
+            !first_present_carries(&steps, 110_000_000, (1, 2)),
+            "a tick at the read's instant counts as after it"
+        );
+        assert!(
+            !first_present_carries(&steps, 100_000_000, (1, 2)),
+            "the tick at 110 ms, still on (1, 1), came after the read"
+        );
+        assert!(
+            !first_present_carries(&steps, 1_000_000_000, (1, 2)),
+            "no tick after it"
+        );
     }
 
     /// The lane's slot rounding, in order: `t − w` for the tick after each tick that armed a settle wake at `w`.

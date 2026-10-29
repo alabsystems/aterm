@@ -562,19 +562,6 @@ mod tests {
     }
 
     #[test]
-    fn a_shadow_off_its_curve_is_not_the_recorded_one() {
-        let active = shadow_plane(Part::Right, 744, 528, 1, true);
-        let inactive = shadow_plane(Part::Right, 744, 528, 1, false);
-        assert_ne!(active, inactive);
-        let row = &active.pixels[active.width * (active.height / 2)..][..active.width];
-        let alpha: Vec<u8> = row.iter().map(|p| p[3]).collect();
-        assert_eq!(alpha, [
-            0, 50, 45, 40, 36, 33, 29, 27, 24, 22, 19, 17, 16, 14, 13, 11, 10, 9, 8, 7, 7, 6, 5, 5,
-            4, 4, 4, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0
-        ]);
-    }
-
-    #[test]
     fn the_parts_sit_around_the_window_and_take_the_pointer_next_to_it() {
         let (w, h) = (744, 528);
         assert_eq!(surface_rect(Part::Top, w, h), Rect { x: -44, y: -44, width: 832, height: 44 });

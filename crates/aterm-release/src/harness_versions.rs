@@ -295,7 +295,12 @@ pub fn bump(root: &Path, git: &dyn GitRunner, released: (&str, &str)) -> Result<
 #[must_use]
 pub fn with_unreleased_entry(text: &str, entry: &str) -> Option<String> {
     let head = "## [Unreleased]";
-    let at = text.find(head)?;
+    let mut offset = 0;
+    let at = text.split_inclusive('\n').find_map(|line| {
+        let start = offset;
+        offset += line.len();
+        (line.trim_end() == head).then_some(start)
+    })?;
     let body_start = at + head.len();
     let body_end = text[body_start..]
         .find("\n## [")
@@ -335,7 +340,9 @@ pub fn previous_release(
 ) -> Result<Option<(String, String)>> {
     let tags = crate::gates::tag_commits(tags);
     let shipped = |v: &str| tags.contains_key(&format!("v{v}"));
-    let Some(release) = crate::gates::predecessor_release(ledger_text, version, &shipped)? else {
+    let Some(release) = crate::gates::predecessor_release(ledger_text, version, &shipped)
+        .map_err(|e| Error::new(format!("harness versions: {e}")))?
+    else {
         return Ok(None);
     };
     let commit = tags
@@ -520,6 +527,17 @@ fn read() {}
         assert_eq!(with_unreleased_entry("# Changelog\n", "- x"), None);
     }
 
+    #[test]
+    fn heading_examples_in_the_preamble_are_not_sections() {
+        let preamble = "# Changelog\n\nWrite under `## [Unreleased]`, in `### Changed`.\n\n";
+        assert_eq!(with_unreleased_entry(preamble, "- new"), None);
+        let log = format!("{preamble}## [Unreleased]\n\n### Changed\n\n- old\n");
+        assert_eq!(
+            with_unreleased_entry(&log, "- new").unwrap(),
+            format!("{preamble}## [Unreleased]\n\n### Changed\n\n- new\n\n- old\n")
+        );
+    }
+
     /// A scratch history: a release tag, then a change to the shared lane.
     fn history(dir: &Path, bump_too: bool) -> (String, String) {
         init(dir, &[("user.name", "t"), ("user.email", "t@example.com")]);
@@ -613,6 +631,26 @@ fn read() {}
         run(&["commit", "-qam", "bump"]);
         let head = crate::ledger::rev_parse(&git, "HEAD").unwrap();
         assert!(gate(&git, ("0.1.0", &released), &head).is_ok());
+    }
+
+    /// A LEDGER NONE OF WHOSE RELEASES SHIPPED IS REFUSED BY THIS GATE, BY NAME: its error says
+    /// `harness versions:`, never another gate's name. CONTROL: a tag for the newest earlier
+    /// release is the window's start.
+    #[test]
+    fn a_ledger_none_of_whose_releases_shipped_is_refused_by_this_gate() {
+        let ledger = "# seed\n1 0.1.0\n2 0.2.0\n";
+        let refused = previous_release(ledger, "0.3.0", "")
+            .unwrap_err()
+            .to_string();
+        let unshipped = crate::gates::predecessor_release(ledger, "0.3.0", &|_| false)
+            .expect_err("no earlier version shipped")
+            .to_string();
+        assert_eq!(refused, format!("harness versions: {unshipped}"));
+        assert_eq!(
+            previous_release(ledger, "0.3.0", "abc123\trefs/tags/v0.2.0\n").unwrap(),
+            Some(("0.2.0".to_owned(), "abc123".to_owned())),
+            "CONTROL"
+        );
     }
 
     fn git_cmd(dir: &Path, args: &[&str]) -> std::process::Output {

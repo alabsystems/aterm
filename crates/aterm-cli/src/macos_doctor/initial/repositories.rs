@@ -35,7 +35,7 @@ pub(super) fn run_reading(
     vault: Option<&Plan>,
     mode: Mode,
 ) -> Result<Ran, String> {
-    Ok(match items(sys, ctx, vault, mode)? {
+    Ok(match items(sys, ctx, vault, mode, false)? {
         Some(rows) => Ran {
             developer_tools: want_developer_tools(&rows),
             failure: failure_note(&rows),
@@ -80,13 +80,18 @@ pub(super) fn want_token(rows: &[aterm_machines::model::ItemReport]) -> bool {
         .any(|row| Reading::of(row) == Some(Reading::Waits(Wait::Token)))
 }
 
+/// The GitHub repositories row, read as [`run`] reads them for `vault`. Where the ALab vault is off
+/// this network (`not_here`) and this Mac is not in `vault`, they are read on this Mac's own GitHub
+/// credentials, as their stage then runs them, and wait for the vault's token, as the stage does,
+/// only where this Mac has none to sign in with.
 pub(super) fn observe(
     sys: &dyn System,
     ctx: &Ctx,
     vault: Option<&Plan>,
+    not_here: bool,
 ) -> Result<aterm_types::macos_setup::Observation, String> {
     use aterm_types::macos_setup::{Observation, Setting, Standing, Subject};
-    Ok(match items(sys, ctx, vault, Mode::Plan)? {
+    Ok(match items(sys, ctx, vault, Mode::Plan, not_here)? {
         Some(rows) => aterm_machines::init_observe::observation(
             Setting::Repositories,
             &rows.iter().collect::<Vec<_>>(),
@@ -99,11 +104,16 @@ pub(super) fn observe(
     })
 }
 
+/// The repositories' item rows, read through `vault` where one is given, else on this Mac's own
+/// GitHub credentials: `None` while that vault is not this Mac's, changed, or is still syncing.
+/// Where it is not this Mac's and the Mac signs in on its own credentials instead (`own`), they are
+/// read with those, `None` where it has no token to sign in with ([`want_token`]).
 fn items(
     sys: &dyn System,
     ctx: &Ctx,
     vault: Option<&Plan>,
     mode: Mode,
+    own: bool,
 ) -> Result<Option<Vec<aterm_machines::model::ItemReport>>, String> {
     let Some(vault) = vault else {
         return aterm_machines::init_github::run_initial_repositories(sys, ctx, mode).map(Some);
@@ -119,7 +129,11 @@ fn items(
         configured.as_ref(),
     )?;
     let Some(expected) = selected else {
-        return Ok(None);
+        if !own {
+            return Ok(None);
+        }
+        return aterm_machines::init_github::run_initial_repositories(sys, ctx, mode)
+            .map(|rows| (!want_token(&rows)).then_some(rows));
     };
     let captured = aterm_secrets::client::with_materialization_ready(&paths, expected, || {
         aterm_machines::init_github::InitialRepositoryInputs::capture(sys, ctx)
@@ -321,7 +335,7 @@ mod tests {
                 _ => unreachable!(),
             };
             sys.stat_fails(missing.to_str().unwrap(), std::io::ErrorKind::NotFound);
-            let seen = observe(&sys, &ctx, Some(&plan)).unwrap();
+            let seen = observe(&sys, &ctx, Some(&plan), false).unwrap();
             // Each needs a person (a token in the vault, Apple's tools): never a wait the run
             // retries (System State design §3.6).
             assert_eq!(seen.standing, Standing::NeedsYou, "{wait:?}");
@@ -351,7 +365,7 @@ mod tests {
         let (sys, ctx) = fake(&home);
         sys.fail_github_api(&ctx.users[0], "/user", GithubFailure::Unauthenticated);
         // GitHub signs the token in once, then refuses it: it expired between two reads.
-        let first = observe(&sys, &ctx, None).unwrap();
+        let first = observe(&sys, &ctx, None, false).unwrap();
         assert_ne!(first.standing, Standing::NeedsYou, "{first:?}");
         assert!(
             sys.calls()
@@ -360,7 +374,7 @@ mod tests {
             "{:?}",
             sys.calls()
         );
-        let seen = observe(&sys, &ctx, None).unwrap();
+        let seen = observe(&sys, &ctx, None, false).unwrap();
         assert_eq!(
             (seen.standing, seen.now.as_deref(), seen.note.as_deref()),
             (
@@ -406,7 +420,7 @@ mod tests {
         for vault in [None, Some(&plan)] {
             let why = run(&sys, &ctx, vault, Mode::Apply).unwrap_err();
             assert!(why.contains("exactly one"), "{why}");
-            assert!(observe(&sys, &ctx, vault).is_err());
+            assert!(observe(&sys, &ctx, vault, false).is_err());
         }
         assert!(
             sys.calls().iter().all(|call| !call.contains(" agh ")),

@@ -1715,3 +1715,90 @@ fn slice_twos_doors_are_taped_and_the_book_absent_only_where_the_build_lacked_it
     let d = core.diverged().expect("latched");
     assert_eq!(d.door.as_deref(), Some("host.wake_claim"), "{d:?}");
 }
+
+#[test]
+fn agent_resumed_door_round_trips_and_answers_none_on_older_tapes() {
+    use std::sync::Mutex;
+
+    use astream_effects::EffectRecord;
+
+    use crate::supervise::IdleHost;
+    use crate::supervise::fx::ClockSource;
+    use crate::supervise::tape::header::VERBATIM;
+    use crate::supervise::tape::replay::ReplayCore;
+    use crate::supervise::tape::testing::{MemoryTape, TAPE_ID};
+
+    for value in [
+        None,
+        Some(AgentResumed {
+            pid: 4242,
+            started: Some(1_793_000_010),
+            resumed: true,
+        }),
+        Some(AgentResumed {
+            pid: 99,
+            started: None,
+            resumed: false,
+        }),
+    ] {
+        same(value);
+    }
+
+    #[derive(Debug)]
+    struct ResumedStub(Mutex<Option<AgentResumed>>);
+    impl IdleHost for ResumedStub {
+        fn wants(&self) -> bool {
+            false
+        }
+        fn at_idle(&self) -> Option<HostStep> {
+            None
+        }
+        fn owns_turn_end(&self) -> bool {
+            false
+        }
+        fn agent_resumed(&self) -> Option<AgentResumed> {
+            *self.0.lock().expect("stub")
+        }
+    }
+
+    let stub = Arc::new(ResumedStub(Mutex::new(Some(AgentResumed {
+        pid: 4242,
+        started: Some(1_793_000_010),
+        resumed: true,
+    }))));
+    let tape = MemoryTape::over(&Fx::over(ClockSource::Scripted(Arc::default())));
+    let rec = TapedHost::new(Arc::clone(&stub) as Arc<dyn IdleHost>, tape.fx.clone());
+    let first = rec.agent_resumed();
+    *stub.0.lock().expect("stub") = None;
+    let second = rec.agent_resumed();
+    let read = tape.finish("done");
+    let records: Vec<EffectRecord> = read
+        .items
+        .iter()
+        .filter_map(|i| i.record().cloned())
+        .collect();
+
+    let core = ReplayCore::start(records, VERBATIM, VERBATIM, TAPE_ID, None);
+    let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+    assert_eq!(replay.agent_resumed(), first);
+    assert_eq!(replay.agent_resumed(), second);
+    assert_eq!(core.left(), 0);
+    assert!(core.diverged().is_none());
+
+    // Older tape whose header lacked `host.agent_resumed` reads `None` without diverging.
+    for doors in [vec!["host.wants".to_string()], Vec::new()] {
+        let core = ReplayCore::start(Vec::new(), VERBATIM, VERBATIM, TAPE_ID, None);
+        core.recorded_doors(doors);
+        let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+        assert_eq!(replay.agent_resumed(), None);
+        assert!(core.diverged().is_none());
+    }
+
+    // NEGATIVE CONTROL: a header naming `host.agent_resumed` over a tape that never asked diverges.
+    let core = ReplayCore::start(Vec::new(), VERBATIM, VERBATIM, TAPE_ID, None);
+    core.recorded_doors(vec!["host.agent_resumed".to_string()]);
+    let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+    let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| replay.agent_resumed()));
+    assert!(asked.is_err(), "the replay halts: the tape never asked");
+    assert!(core.diverged().is_some());
+}

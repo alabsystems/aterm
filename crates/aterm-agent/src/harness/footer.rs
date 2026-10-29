@@ -1705,7 +1705,7 @@ impl Said {
 pub struct TailFacts {
     /// The model: the newest of an answer's `message.model` and a model result's name (`Opus 5.5`), as the footer shows it.
     pub model: Said,
-    /// The effort: the newest of an answer's `effort`, an `/effort` result and a model result's `with … effort`.
+    /// The effort: the newest of a main-thread row's `effort`, an `/effort` result and a model result's `with … effort`.
     pub effort: Said,
     /// A model switch that named no effort while the effort was open, and the
     /// model switched to.
@@ -2817,6 +2817,9 @@ pub enum ModeItem {
     Remote,
     /// An item this build does not know, kept as drawn.
     Unknown,
+    /// Claude's effort hint (`◐ medium · /effort`), kept only where the session's facts name no
+    /// effort ([`ModeRow::keeping_effort`]).
+    Effort,
 }
 
 /// One item a rewritten mode row keeps: its pane columns `start..end` in the row Claude drew.
@@ -2846,7 +2849,8 @@ impl Kept {
 /// the items this build does not know, each as Claude drew it, flush at column 0 and joined by
 /// [`MODE_ROW_SEP`], blanks after. The pill, its cycle hint, the key hints, the `⧉` items, the
 /// effort hint and the auto-compact reading are dropped: the mode is the lights block's, the
-/// effort the top rule's, the context its fact's.
+/// effort the bottom rule's `◆` where the session's facts name one (else the hint is kept,
+/// [`ModeRow::keeping_effort`]), the context its fact's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModeRow {
     /// The mode row.
@@ -2860,6 +2864,10 @@ pub struct ModeRow {
     /// The row under it where Claude's effort hint wrapped to, alone (its drawn cells
     /// `0..effort.1`), blanked with the row.
     pub effort: Option<(usize, usize)>,
+    /// Claude's effort hint on the row itself, dropped unless [`Self::keeping_effort`] keeps it.
+    hint: Option<Kept>,
+    /// The level Claude's effort hint names and the row it is drawn on ([`Self::effort_said`]).
+    said: Option<(usize, &'static str)>,
     kept: [Kept; MODE_ROW_ITEMS],
     len: usize,
 }
@@ -2871,10 +2879,37 @@ impl ModeRow {
         &self.kept[..self.len]
     }
 
+    /// The effort Claude's own hint names (`medium` for `◐ medium · /effort`) and the row it is
+    /// drawn on: this row, or the one under it the hint wrapped to. Kept or dropped, the hint says
+    /// the effort the running Claude Code is at; `None` with no hint, or one that names no level
+    /// ([`effort_level`]).
+    #[must_use]
+    pub const fn effort_said(&self) -> Option<(usize, &'static str)> {
+        self.said
+    }
+
     /// Whether an item this build does not know was kept.
     #[must_use]
     pub fn unknown(&self) -> bool {
         self.kept().iter().any(|k| k.item == ModeItem::Unknown)
+    }
+
+    /// Claude's running jobs in `text`, the row this was read off, as its job counts say them,
+    /// ` · `-joined: `1 shell`, `2 shells · 1 monitor`. A returned count's `← ` is dropped (a
+    /// count of finished jobs, `← 2 done`, is a key hint the row drops, [`mode_item`]); empty
+    /// where no job runs.
+    #[must_use]
+    pub fn job_words(&self, text: &str) -> String {
+        let mut words = String::new();
+        for k in self.kept().iter().filter(|k| k.item == ModeItem::Job) {
+            let item: String = text.chars().skip(k.start).take(k.len()).collect();
+            let item = item.strip_prefix("\u{2190} ").unwrap_or(&item);
+            if !words.is_empty() {
+                words.push_str(MODE_ROW_SEP);
+            }
+            words.push_str(item);
+        }
+        words
     }
 
     /// The glass columns kept item `i` takes.
@@ -2911,6 +2946,21 @@ impl ModeRow {
         })
     }
 
+    /// This row with Claude's effort hint kept, for a session whose facts name no effort (the
+    /// bottom rule's `◆` has none to show, as right after a relaunch, before the transcript says
+    /// one): the hint's level on the row as one item after the others (`◐ medium`, its
+    /// ` · /effort` key hint dropped), in Claude's own cells; a hint wrapped to the row under it
+    /// left there as drawn. `None` where the row keeps [`MODE_ROW_ITEMS`] items already:
+    /// the row then stands as Claude drew it.
+    #[must_use]
+    pub fn keeping_effort(mut self) -> Option<Self> {
+        self.effort = None;
+        if let Some(hint) = self.hint.take() {
+            self.keep(hint)?;
+        }
+        Some(self)
+    }
+
     fn keep(&mut self, kept: Kept) -> Option<()> {
         *self.kept.get_mut(self.len)? = kept;
         self.len += 1;
@@ -2918,22 +2968,29 @@ impl ModeRow {
     }
 }
 
-/// What one item of Claude's mode row is, `None` for one the rewrite drops.
+/// The key hints of Claude's mode row the rewrite drops ([`mode_item`]).
+const DROPPED_HINTS: [&str; 6] = [
+    "busy.interrupt",
+    "footer.shortcuts",
+    "footer.clear",
+    "mode.manage",
+    "mode.for_agents",
+    "mode.tasks",
+];
+
+/// What one item of Claude's mode row is, `None` for one the rewrite drops: a key hint, a
+/// `⧉` item, the auto-compact reading, and a count of finished jobs (`← 2 done`, the way to the
+/// tasks Claude finished, no job that runs).
 fn mode_item(text: &str) -> Option<ModeItem> {
-    let dropped = [
-        "busy.interrupt",
-        "footer.shortcuts",
-        "footer.clear",
-        "mode.manage",
-        "mode.for_agents",
-        "mode.tasks",
-    ]
-    .into_iter()
-    .any(|id| text == aterm_phase::anchor(id));
-    if dropped || text.starts_with('\u{29c9}') || is_effort_hint(text) || auto_compact(text) {
+    let dropped = DROPPED_HINTS
+        .into_iter()
+        .any(|id| text == aterm_phase::anchor(id));
+    if dropped || text.starts_with('\u{29c9}') || auto_compact(text) || jobs_done(text) {
         return None;
     }
-    Some(if text == aterm_phase::anchor!("mode.remote") {
+    Some(if is_effort_hint(text) {
+        ModeItem::Effort
+    } else if text == aterm_phase::anchor!("mode.remote") {
         ModeItem::Remote
     } else if is_job(text) {
         ModeItem::Job
@@ -2948,6 +3005,25 @@ fn auto_compact(text: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// The nouns of Claude's job counts ([`is_job`]).
+const JOB_NOUNS: [&str; 7] = [
+    "jobs.shell",
+    "jobs.shells",
+    "jobs.monitor",
+    "jobs.monitors",
+    "jobs.agent",
+    "jobs.agents",
+    "jobs.done",
+];
+
+/// Whether `text` counts Claude's finished jobs: `← 2 done`.
+fn jobs_done(text: &str) -> bool {
+    is_job(text)
+        && text
+            .rsplit_once(' ')
+            .is_some_and(|(_, noun)| noun == aterm_phase::anchor!("jobs.done"))
+}
+
 /// Whether `text` counts Claude's jobs: `1 shell`, `2 monitors`, `← 2 agents`, `← 2 done`.
 fn is_job(text: &str) -> bool {
     let text = text.strip_prefix("\u{2190} ").unwrap_or(text);
@@ -2956,22 +3032,51 @@ fn is_job(text: &str) -> bool {
     };
     !n.is_empty()
         && n.bytes().all(|b| b.is_ascii_digit())
-        && [
-            "jobs.shell",
-            "jobs.shells",
-            "jobs.monitor",
-            "jobs.monitors",
-            "jobs.agent",
-            "jobs.agents",
-            "jobs.done",
-        ]
+        && JOB_NOUNS
+            .into_iter()
+            .any(|id| noun == aterm_phase::anchor(id))
+}
+
+/// Whether `cut`, what a cut item still shows (`← for ag` of `← for ag…`), begins only an item
+/// the rewrite drops anyway: a key hint, a `⧉` item or the auto-compact reading, and no job
+/// count or live state it keeps (`←` may begin `← 2 agents`, `/` `/rc active`).
+fn begins_dropped_only(cut: &str) -> bool {
+    let dropped = DROPPED_HINTS
         .into_iter()
-        .any(|id| noun == aterm_phase::anchor(id))
+        .any(|id| aterm_phase::anchor(id).starts_with(cut))
+        || cut.starts_with('\u{29c9}')
+        || cut
+            .find(|c: char| !c.is_ascii_digit())
+            .filter(|&n| n > 0)
+            .is_some_and(|n| aterm_phase::anchor!("mode.auto_compact").starts_with(&cut[n..]));
+    dropped && !aterm_phase::anchor!("mode.remote").starts_with(cut) && !begins_job(cut)
+}
+
+/// Whether `cut` could begin one of Claude's job counts ([`is_job`]).
+fn begins_job(cut: &str) -> bool {
+    let text = match cut.strip_prefix('\u{2190}') {
+        Some("") => return true,
+        Some(rest) => match rest.strip_prefix(' ') {
+            Some(rest) => rest,
+            None => return false,
+        },
+        None => cut,
+    };
+    let noun = text.trim_start_matches(|c: char| c.is_ascii_digit());
+    if noun.len() == text.len() {
+        return text.is_empty();
+    }
+    noun.strip_prefix(' ').map_or(noun.is_empty(), |noun| {
+        JOB_NOUNS
+            .into_iter()
+            .any(|id| aterm_phase::anchor(id).starts_with(noun))
+    })
 }
 
 /// Claude Code's mode row under the composer bottom rule `bottom`, read for the glass to rewrite
 /// ([`ModeRow`]): `None` where the row is not one this build reads whole, a cut or unknown pill,
-/// a cut item or hint, or more items than [`MODE_ROW_ITEMS`].
+/// a cut item or hint, or more items than [`MODE_ROW_ITEMS`]. A cut last item whose shown text
+/// can only begin an item the rewrite drops (`← for ag…`) is dropped as that item.
 #[must_use]
 pub fn mode_row_rewrite_under(rows: &[String], bottom: usize) -> Option<ModeRow> {
     let row = pill_row_under(rows, bottom)?;
@@ -3005,6 +3110,8 @@ pub fn mode_row_rewrite_under(rows: &[String], bottom: usize) -> Option<ModeRow>
         mode,
         sep: text.find(MODE_ROW_SEP).map(|b| col(b) + 1),
         effort: None,
+        hint: None,
+        said: None,
         kept: [Kept::default(); MODE_ROW_ITEMS],
         len: 0,
     };
@@ -3050,6 +3157,15 @@ pub fn mode_row_rewrite_under(rows: &[String], bottom: usize) -> Option<ModeRow>
     let mut kinds = [None; 2 * MODE_ROW_ITEMS];
     for (k, &(s, e)) in items[..n].iter().enumerate() {
         let item = &text[s..e].trim_end();
+        // A narrow pane cuts the row's last item (`· ← for ag…` at 80 columns right after a
+        // launch): one that can only be an item the rewrite drops is dropped with it.
+        if k + 1 == n
+            && let Some(shown) = item.strip_suffix('\u{2026}')
+            && !shown.trim_end().is_empty()
+            && begins_dropped_only(shown.trim_end())
+        {
+            continue;
+        }
         let cut = item.ends_with('\u{2026}')
             || *item == "\u{b7}"
             || item.starts_with("\u{b7} ")
@@ -3070,12 +3186,43 @@ pub fn mode_row_rewrite_under(rows: &[String], bottom: usize) -> Option<ModeRow>
             }
         }
     }
+    let hint = items[..n]
+        .iter()
+        .zip(kinds)
+        .find(|(_, kind)| *kind == Some(ModeItem::Effort))
+        .map(|(&(s, e), _)| (s, e));
+    // A kept hint keeps its level alone (`◐ medium`): its ` · /effort` is a key hint.
+    m.hint = hint.map(|(s, e)| {
+        let shown = text[s..e].trim_end();
+        let level = shown
+            .strip_suffix(aterm_phase::anchor!("effort.hint_tail"))
+            .map_or(shown, str::trim_end);
+        Kept {
+            start: col(s),
+            end: col(s + level.len()),
+            item: ModeItem::Effort,
+        }
+    });
     m.effort = rows.get(row + 1).and_then(|under| {
         let t = under.trim();
         (under.starts_with("  ") && is_effort_hint(t))
             .then(|| (row + 1, under.trim_end().chars().count()))
     });
+    m.said = match (hint, m.effort) {
+        (Some((s, e)), _) => hint_effort(text[s..e].trim_end()).map(|level| (row, level)),
+        (None, Some((under, _))) => hint_effort(rows[under].trim()).map(|level| (under, level)),
+        (None, None) => None,
+    };
     Some(m)
+}
+
+/// The effort Claude's effort hint `text` names: the first of its words that is a level
+/// ([`effort_level`]), `medium` in `◐ medium · /effort`, `xhigh` in `✦ workspace · xhigh +
+/// workflows · /effort`; `None` for text that is no hint, or names no level.
+fn hint_effort(text: &str) -> Option<&'static str> {
+    text.strip_suffix(aterm_phase::anchor!("effort.hint_tail"))?
+        .split_whitespace()
+        .find_map(effort_level)
 }
 
 const FOOTER_ROWS_MAX: usize = 4;
@@ -3217,6 +3364,16 @@ pub fn account_progress_text(
     progress: &super::account_progress::AccountProgress,
     narrow: bool,
 ) -> String {
+    account_progress_line(progress, narrow, true)
+}
+
+/// A fitted line may omit the deadline; the underlying observation and the
+/// full disclosure still retain it.
+fn account_progress_line(
+    progress: &super::account_progress::AccountProgress,
+    narrow: bool,
+    with_next: bool,
+) -> String {
     if progress.phase == super::account_progress::ProgressPhase::Watching && progress.wall.is_none()
     {
         return if progress.known.is_none() && progress.eligible.is_none() {
@@ -3244,10 +3401,12 @@ pub fn account_progress_text(
     if let Some(detail) = progress.details.first() {
         parts.push(progress_excerpt(detail));
     }
-    parts.push(match progress.next_at {
-        Some(at) => format!("Next {}", super::usage::rfc3339_utc(at)),
-        None => "Next unknown".into(),
-    });
+    if with_next {
+        parts.push(match progress.next_at {
+            Some(at) => format!("Next {}", super::usage::rfc3339_utc(at)),
+            None => "Next unknown".into(),
+        });
+    }
     parts.join(" · ")
 }
 
@@ -3357,6 +3516,22 @@ impl FooterFacts {
         }
         Some(view)
     }
+
+    /// [`Self::account_progress_view`] as the rule shows it: none for a watch that knows no limit
+    /// and no inventory (`Accounts unknown`), which the person at the tab can do nothing with, as
+    /// after every relaunch; the account's hover title and the Accounts menu still say it.
+    #[must_use]
+    pub fn account_progress_on_rule(
+        &self,
+    ) -> Option<std::borrow::Cow<'_, super::account_progress::AccountProgress>> {
+        use super::account_progress::ProgressPhase;
+        self.account_progress_view().filter(|progress| {
+            progress.phase != ProgressPhase::Watching
+                || progress.wall.is_some()
+                || progress.known.is_some()
+                || progress.eligible.is_some()
+        })
+    }
 }
 
 fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
@@ -3400,7 +3575,7 @@ fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
         plain(
             WALL_MARK,
             facts
-                .account_progress_view()
+                .account_progress_on_rule()
                 .map(|progress| account_progress_text(&progress, false))
                 .or_else(|| {
                     usage
@@ -3903,7 +4078,7 @@ fn email_name(text: &str) -> Option<&str> {
 }
 
 fn plain_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
-    if let Some(progress) = facts.account_progress_view() {
+    if let Some(progress) = facts.account_progress_on_rule() {
         let mut rung = fact_segments(facts, true);
         let mut out = vec![rung.clone()];
         for mark in [
@@ -3920,16 +4095,18 @@ fn plain_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
                 out.push(rung.clone());
             }
         }
-        out.push(vec![Segment::plain(
-            WALL_MARK,
-            account_progress_text(&progress, true),
-        )]);
+        let mut push_recovery = |text| {
+            let rung = vec![Segment::plain(WALL_MARK, text)];
+            if !out.contains(&rung) {
+                out.push(rung);
+            }
+        };
+        push_recovery(account_progress_line(&progress, true, true));
+        push_recovery(account_progress_line(&progress, true, false));
         let mut minimal = progress.into_owned();
         minimal.details.clear();
-        out.push(vec![Segment::plain(
-            WALL_MARK,
-            account_progress_text(&minimal, true),
-        )]);
+        push_recovery(account_progress_line(&minimal, true, true));
+        push_recovery(account_progress_line(&minimal, true, false));
         return out;
     }
     let mut out = vec![fact_segments(facts, true)];
@@ -4157,7 +4334,7 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
         .map(|rung| (rung.as_slice(), TitleFit::None, chips));
     let recovery = ladder
         .iter()
-        .filter(|_| facts.account_progress.is_some())
+        .filter(|_| facts.account_progress_on_rule().is_some())
         .map(|rung| (rung.as_slice(), TitleFit::None, false));
     let last = if facts.subscription.is_some() {
         [(&[][..], true), (model.as_slice(), false)]
@@ -4184,7 +4361,7 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
 /// The most cells the chips may take in a rule of `room` cells.
 #[must_use]
 pub fn chips_room(facts: &FooterFacts, room: usize) -> usize {
-    let reserved = if let Some(progress) = facts.account_progress_view() {
+    let reserved = if let Some(progress) = facts.account_progress_on_rule() {
         rule_width(
             &[Segment::plain(
                 WALL_MARK,

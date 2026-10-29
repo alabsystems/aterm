@@ -9,6 +9,13 @@
 //! word ending in [`SUFFIX`], so the name alone says what a program is and no list has to
 //! be kept. codex-alab is not one of them here: its program is `codex`, which ALab builds
 //! from source (repo `codex-alab`, [`crate::alab::ALAB_AGENTS`]).
+//!
+//! A harness is in the default set like every program the index lists
+//! ([`crate::manifest::Index::installable`]): the passes install it unasked and keep it current,
+//! and only `[packages].exclude` or a person's uninstall keeps it out (owner ruling 2026-10-27,
+//! "everything must be ON BY DEFAULT in atpkg!!!", that page's §11 D45). The name still decides
+//! two things: no `alab-<tool>` alias is laid for a harness (D13), and only the harness
+//! [`twin_harness`] names runs a vendor's sessions.
 
 /// The suffix the one-word rule gives every harness program.
 pub const SUFFIX: &str = "-alab";
@@ -30,21 +37,6 @@ pub const fn is_harness(program: &str) -> bool {
         i += 1;
     }
     true
-}
-
-/// Whether the default set holds index program `program`: every program but a harness.
-///
-/// A harness installs only when a person names it (`aterm pkg install <program>`) and is
-/// kept current once installed, as a vendor row outside the default set is
-/// ([`crate::vendor_direct::VendorSpec::default_set`]). Nothing runs one until aterm serves
-/// harness contract v3, so a harness joins the default set in that aterm change, once it
-/// has a signed release (`docs/DESIGN-harness-repos-2026-10-24.md` §11 D17). This rule binds
-/// only the clients built with it: an aterm through v0.135.0 installs every program the index
-/// lists, so the producer pins no harness while one may read the index, unless this holds the
-/// harness, after which every client installs it alike (atpkg-publish `channel::index`, D24).
-#[must_use]
-pub const fn in_default_set(program: &str) -> bool {
-    !is_harness(program)
 }
 
 /// The harness a vendor program's `agents/` twin hands its session to once that harness is
@@ -78,7 +70,6 @@ mod tests {
             "kimi-alab",
         ] {
             assert!(is_harness(h), "{h}");
-            assert!(!in_default_set(h), "{h} installs only when named");
         }
         for p in [
             "claude",
@@ -98,7 +89,6 @@ mod tests {
             "",
         ] {
             assert!(!is_harness(p), "{p:?}");
-            assert!(in_default_set(p), "{p:?} stays in the default set");
         }
         const _: () = assert!(is_harness("x-alab") && !is_harness("-alab"));
     }

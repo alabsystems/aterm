@@ -563,30 +563,79 @@ mod tests {
         }
     }
 
+    /// Under `cell_h >= 40` (`aa = max(cell_h / 4, 3) >= 10 px` and root lift
+    /// `1536 / cell_h <= 38.4`), vertical steps stay within `0.6 * cov_cap`.
     #[test]
-    fn aa_law_no_hard_silhouette_edges() {
+    fn aa_law_no_hard_silhouette_edges_at_40px_and_above() {
         let mut worst = 0i32;
-        for temp in [51, 128, 230] {
-            for phase in [0u32, 8192, 1 << 20] {
-                let p = params(temp, -50, phase);
-                let bound = (p.cov_cap * 3) / 5; // 120 at cap 200
-                for px in 0..200 {
-                    let mut prev = 0i32;
-                    for py in 40..=200 {
-                        let c = core_at(px, py, &p);
-                        let cov = fire_cov_add(&c, &p).max(fire_alpha_over(&c, &p));
-                        let delta = (cov - prev).abs();
-                        assert!(
-                            delta <= bound,
-                            "cov step {delta} > {bound} at ({px},{py}) temp={temp} phase={phase}"
-                        );
-                        worst = worst.max(delta);
-                        prev = cov;
+        for cell_h in [40, 56] {
+            for temp in [51, 128, 230] {
+                for phase in [0u32, 8192, 1 << 20] {
+                    let mut p = params(temp, -50, phase);
+                    p.cell_h = cell_h;
+                    p.peak_h = 3 * cell_h;
+                    p.base_y = 5 * cell_h;
+                    let bound = (p.cov_cap * 3) / 5; // 120 at cap 200
+                    let top_y = p.base_y - 4 * cell_h;
+                    for px in 0..200 {
+                        let mut prev = 0i32;
+                        for py in top_y..=p.base_y {
+                            let c = core_at(px, py, &p);
+                            let cov = fire_cov_add(&c, &p).max(fire_alpha_over(&c, &p));
+                            let delta = (cov - prev).abs();
+                            assert!(
+                                delta <= bound,
+                                "cov step {delta} > {bound} at ({px},{py}) cell_h={cell_h} temp={temp} phase={phase}"
+                            );
+                            worst = worst.max(delta);
+                            prev = cov;
+                        }
                     }
                 }
             }
         }
         eprintln!("aa law: worst adjacent cov/alpha step = {worst} (bound 120, cap 200)");
+    }
+
+    #[test]
+    fn fire_row_matches_stateless_vnoise_and_stitches_seams() {
+        let p = params(180, -37, (1 << 24) - 256);
+        let pc = fire_precomp(&p);
+
+        for py in [90, 145, 200, 204] {
+            let mut full_row = FireRow::new(py, -32, &p, &pc);
+            let mut left_half = FireRow::new(py, -32, &p, &pc);
+            let mut right_half = FireRow::new(py, 64, &p, &pc);
+            for px in -32..160 {
+                let full = full_row.core(px);
+                let fresh = core_at(px, py, &p);
+                assert_eq!(full, fresh, "stateless equality at ({px},{py})");
+                let stitched = if px < 64 {
+                    left_half.core(px)
+                } else {
+                    right_half.core(px)
+                };
+                assert_eq!(stitched, full, "patch seam equality at ({px},{py})");
+            }
+
+            let mut sparse = FireRow::new(py, -32, &p, &pc);
+            for px in [-32, -31, 0, 19, 63, 64, 159, 512] {
+                assert_eq!(
+                    sparse.core(px),
+                    core_at(px, py, &p),
+                    "multi-cell jump equality at ({px},{py})"
+                );
+            }
+        }
+
+        let mut oct = FireOctave::new(0x3FFF << 8 | 137, 0x3FFF, FIRE_SEED_R0, 12);
+        for x in [12u32, 13, 255, 256, 777, 4096] {
+            assert_eq!(
+                oct.sample(x),
+                fire_vnoise(x, 0x3FFF << 8 | 137, 0x3FFF, FIRE_SEED_R0),
+                "FireOctave::sample refines fire_vnoise at x={x}"
+            );
+        }
     }
 
     #[test]

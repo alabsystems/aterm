@@ -7,7 +7,8 @@ use std::path::Path;
 
 use super::connector::{self, Connector};
 
-/// A permission level every AI CLI can express.
+/// A permission level an AI CLI's flags express; one whose one-shot mode runs at a single level
+/// whatever it is given (Kimi Code's `-p`) names it ([`connector::Review::only_at`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
     /// No approvals and no sandbox.

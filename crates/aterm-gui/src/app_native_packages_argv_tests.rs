@@ -21,6 +21,16 @@ fn packages_argv_is_pinned_per_request() {
         s(&["machine", "apply"]),
         "no --wait-lock: the verb takes no store lock"
     );
+    assert_eq!(
+        packages_argv(&PackagesRequest::ServeUnits { on: false }),
+        s(&["serve-units", "--off"]),
+        "atpkg's own turn_off writes the person's off"
+    );
+    assert_eq!(
+        packages_argv(&PackagesRequest::ServeUnits { on: true }),
+        s(&["serve-units", "--on"]),
+        "atpkg's own turn_on lifts it"
+    );
 }
 
 /// The offline code reads as what it is, never as a bare exit status.
@@ -249,7 +259,7 @@ fn a_check_behind_a_cached_index_pass_names_the_cause_regression_2026_09_26() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `packages_busy` marks `applies_machine_settings` for `update`, `install`, and `machine apply`, but not `uninstall --all`.
+/// `packages_busy` marks `applies_machine_settings` for `update`, `install`, and `machine apply`, but not `uninstall --all` or `serve-units`.
 #[test]
 fn a_pass_that_applies_the_machine_settings_rereads_the_record() {
     let requests = [
@@ -257,6 +267,7 @@ fn a_pass_that_applies_the_machine_settings_rereads_the_record() {
         PackagesRequest::InstallDefaultSet,
         PackagesRequest::UninstallAll,
         PackagesRequest::MachineApply,
+        PackagesRequest::ServeUnits { on: false },
     ];
     let mut rereads = 0;
     for request in requests {
@@ -283,6 +294,8 @@ fn packages_requests_are_admitted_by_platform() {
         PackagesRequest::CheckUpdate,
         PackagesRequest::InstallDefaultSet,
         PackagesRequest::UninstallAll,
+        PackagesRequest::ServeUnits { on: false },
+        PackagesRequest::ServeUnits { on: true },
     ] {
         assert!(packages_request_admissible(&request).is_ok(), "{request:?}");
     }

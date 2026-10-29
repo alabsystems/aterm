@@ -172,6 +172,7 @@ impl RainBaker {
             }
         }
 
+        let glyph_rows = &rom.rows()[tile * MASTER_H..(tile + 1) * MASTER_H];
         let mut rgba = [255u8, 255, 255, 0].repeat(cw * ch);
         let mut y = 0;
         while y < ch {
@@ -184,7 +185,7 @@ impl RainBaker {
             let mut any_lit = false;
             let mut my = my0;
             while my <= my_end {
-                let mut row = rom.row(tile, my);
+                let mut row = glyph_rows[my];
                 if row != 0 {
                     any_lit = true;
                     let wy = (b.min((my + 1) * ch) - a.max(my * ch)) as u32;

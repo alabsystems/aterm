@@ -815,10 +815,14 @@ fn cell_words(term: &Terminal, (row, col): (u16, u16)) -> Option<CellWords> {
 }
 
 /// The memory `engine` holds: both grids and their stores.
+/// Unbooked Kitty store and visible-cell image payloads are added on top.
 fn engine_bytes(engine: &ReplayEngine) -> usize {
     let term = engine.terminal();
-    term.grid().memory_used().saturating_add(
-        term.inactive_grid()
-            .map_or(0, aterm_core::grid::Grid::memory_used),
-    )
+    term.grid()
+        .memory_used()
+        .saturating_add(
+            term.inactive_grid()
+                .map_or(0, aterm_core::grid::Grid::memory_used),
+        )
+        .saturating_add(term.unbooked_image_bytes())
 }

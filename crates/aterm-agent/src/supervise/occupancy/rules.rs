@@ -658,6 +658,33 @@ pub fn decide(
     verdicts
 }
 
+/// THE WAKE AT AN IDLE POINT (the slice-2 plan's 2.9, D3): `wake@v1`'s verdict as [`decide`] gives
+/// it with no hold judged (the hold rules are a break's alone, and a point that acts closes the
+/// hold), with the book's head it opens ([`wake_opens`]): the fact the point's act may carry.
+/// Nothing is read for it.
+#[must_use]
+pub fn at_point<'a>(
+    books: &Books,
+    g: &Guards,
+    now_ms: i64,
+    wakes: &WakeSight<'a>,
+) -> (Verdict, Option<&'a WakeSeen>) {
+    let verdicts = decide(
+        &OccupancyReading::default(),
+        None,
+        books,
+        g,
+        i64::MAX,
+        now_ms,
+        wakes,
+    );
+    let verdict = verdicts
+        .into_iter()
+        .find_map(|(rule, verdict)| (rule == RuleId::Wake).then_some(verdict))
+        .unwrap_or(Verdict::Quiet);
+    (verdict, wake_opens(wakes, books))
+}
+
 /// A wake's line as the decider books it: its ordinal, class and kinds; the clock and the slots
 /// are filled in by the write (`Session::wake_line`), from the figures the host's claim judged.
 fn wake_line(wake: &WakeSeen) -> FactLine {

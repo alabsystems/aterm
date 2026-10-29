@@ -426,6 +426,9 @@ fn a_refused_save_says_why_in_the_save_words() {
 #[cfg(unix)]
 #[test]
 fn a_refused_open_says_why_in_the_save_words() {
+    use amacs_files::host::DocumentHostError;
+    use amacs_files::io::AtomicSaveStage;
+    use amacs_files::save_words::{Failure, Speaker, words};
     use std::os::unix::ffi::OsStrExt as _;
 
     let dir = aterm_tempfile::tempdir().expect("a scratch directory");
@@ -436,30 +439,41 @@ fn a_refused_open_says_why_in_the_save_words() {
             .err()
             .unwrap_or_else(|| panic!("{} opened", path.display()))
     };
+    let said = |path: &Path, error: DocumentHostError| {
+        format!(
+            "{}: {}",
+            path.display(),
+            words(Speaker::Amacs, path, &Failure::Open(&error))
+        )
+    };
     let link = folder.join("notes.md");
     std::os::unix::fs::symlink(folder.join("nowhere.md"), &link).expect("a link to nothing");
     assert_eq!(
         refused(&link),
-        format!(
-            "{}: notes.md is a link to a file that isn\u{2019}t there",
-            link.display()
+        said(
+            &link,
+            DocumentHostError::SymlinkComponent {
+                path: link.clone(),
+                dangling: true,
+            }
         )
     );
     let unnamed = folder.join(std::ffi::OsStr::from_bytes(b"notes-\xff.md"));
     assert_eq!(
         refused(&unnamed),
-        format!(
-            "{}: amacs can\u{2019}t open a file whose name isn\u{2019}t UTF-8",
-            unnamed.display()
-        )
+        said(&unnamed, DocumentHostError::InvalidEncoding)
     );
-    let lost = folder.join("no such folder").join("notes.md");
+    let missing = folder.join("no such folder");
+    let lost = missing.join("notes.md");
     assert_eq!(
         refused(&lost),
-        format!(
-            "{}: {} doesn\u{2019}t exist",
-            lost.display(),
-            folder.join("no such folder").display()
+        said(
+            &lost,
+            DocumentHostError::Io {
+                stage: AtomicSaveStage::Preflight,
+                message: format!("{} does not exist", missing.display()),
+                kind: Some(std::io::ErrorKind::NotFound),
+            }
         )
     );
 }

@@ -29,7 +29,9 @@ pub(crate) struct ServeContext {
     pub origin: PathBuf,
     /// The app version the about row prints.
     pub version: String,
-    /// End with [`crate::launchd::EXIT_RESTART`] when the origin's code changes.
+    /// Runs as its launchd job, which starts it again after [`crate::launchd::EXIT_RESTART`]: it
+    /// ends with that when the origin's code changes, or when a writer's on overtakes the
+    /// person's Quit.
     pub restart_on_update: bool,
     /// This process's hold on the one-mug lock, kept until it returns.
     pub instance: Instance,

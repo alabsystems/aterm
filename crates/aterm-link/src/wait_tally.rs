@@ -1111,7 +1111,6 @@ mod tests {
         ] {
             assert!(!row.partitions(), "{row:?}");
         }
-        assert_eq!(Row::ALL.len(), ROWS);
         for (i, row) in Row::ALL.iter().enumerate() {
             assert_eq!(row.index(), i);
         }

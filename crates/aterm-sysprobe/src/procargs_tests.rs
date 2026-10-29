@@ -187,3 +187,30 @@ fn a_record_past_what_the_kernel_hands_over_reads_as_nothing() {
     );
     println!("{DONE}");
 }
+
+/// A reused buffer holds a record whole or reads nothing: a buffer the record fits answers the
+/// same bytes [`read`] does, and one it overflows (the kernel then hands over the record's tail)
+/// is refused, never parsed. NEGATIVE CONTROL (scratch): accepting a full buffer fails the short
+/// read's assertion with the tail.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_reused_buffer_reads_a_record_whole_or_not_at_all() {
+    let whole = read(std::process::id()).expect("this process's own answer");
+    let mut roomy = vec![0u8; whole.len() + 64];
+    let len = read_into(std::process::id(), &mut roomy).expect("it fits");
+    assert_eq!(&roomy[..len], whole.as_slice());
+    let mut short = vec![0u8; whole.len() / 2];
+    assert_eq!(
+        read_into(std::process::id(), &mut short),
+        None,
+        "a {}-byte record in a {}-byte buffer",
+        whole.len(),
+        short.len()
+    );
+    assert_eq!(
+        read_into(std::process::id(), &mut []),
+        None,
+        "no room at all"
+    );
+    assert_eq!(read_into(0, &mut roomy), None, "pid 0");
+}

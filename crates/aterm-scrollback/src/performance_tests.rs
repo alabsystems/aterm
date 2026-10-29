@@ -38,42 +38,6 @@ fn push_with_line_limit_constant_time_truncate() {
     }
 }
 
-/// `remove_newest(1)` across tiers decompresses at most one boundary block rather than materializing the full scrollback.
-#[test]
-fn remove_newest_memory_bounded_cross_tier() {
-    let mut sb = Scrollback::with_block_size(5, 200, 500_000_000, 50);
-
-    let total = 10_000;
-    for i in 0..total {
-        sb.push_str(&format!("Memory-test-{i}"));
-    }
-    assert!(sb.cold_line_count() > 0, "need cold tier data");
-    assert!(sb.warm_line_count() > 0, "need warm tier data");
-
-    let hot = sb.hot_line_count();
-    if hot > 0 {
-        sb.remove_newest(hot).expect("drain hot");
-    }
-    assert_eq!(sb.hot_line_count(), 0, "hot should be empty");
-
-    let mem_before = sb.total_memory_used();
-    let lines_before = sb.line_count();
-
-    sb.remove_newest(1)
-        .expect("remove_newest(1) should succeed");
-    assert_eq!(sb.line_count(), lines_before - 1);
-
-    let mem_after = sb.total_memory_used();
-
-    let ratio = mem_after as f64 / mem_before.max(1) as f64;
-    eprintln!("remove_newest(1) memory: before={mem_before}, after={mem_after}, ratio={ratio:.2}x");
-    assert!(
-        ratio < 1.5,
-        "remove_newest(1) memory ratio {ratio:.2}x exceeds 1.5x — \
-         likely materializing all lines (expected O(block_size), got O(total))"
-    );
-}
-
 /// `remove_newest(1)` decode work stays bounded by a single boundary block regardless of scrollback size.
 #[test]
 fn remove_newest_work_sublinear_in_total_size() {

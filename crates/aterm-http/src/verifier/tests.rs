@@ -486,23 +486,14 @@ fn extra_anchors_add_to_the_system_set_rather_than_replacing_it() {
 #[test]
 fn a_parse_failure_is_reported_as_one_and_never_as_a_trust_verdict() {
     let mine = mine();
+    let name = ServerName::try_from(HOST).unwrap();
+    let at = UnixTime::since_unix_epoch(std::time::Duration::from_secs(T26));
     for (what, bytes) in [
         ("nine bytes of garbage", MALFORMED),
         ("no bytes at all", &[] as &[u8]),
     ] {
-        let case = Case {
-            what,
-            chain: &[MALFORMED],
-            server: HOST,
-            now: T26,
-            apple: Outcome::BadEncoding,
-            webpki: Outcome::BadEncoding,
-            windows: Outcome::BadEncoding,
-        };
-        let chain = [CertificateDer::from(bytes.to_vec())];
-        let name = ServerName::try_from(HOST).unwrap();
-        let at = UnixTime::since_unix_epoch(std::time::Duration::from_secs(case.now));
-        let got = reduce(&mine.verify_server_cert(&chain[0], &[], &name, &[], at));
+        let cert = CertificateDer::from(bytes.to_vec());
+        let got = reduce(&mine.verify_server_cert(&cert, &[], &name, &[], at));
         assert_eq!(got, Outcome::BadEncoding, "{what} must be a PARSE failure");
     }
 }

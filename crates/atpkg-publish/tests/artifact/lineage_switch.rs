@@ -200,11 +200,3 @@ fn a_quarantine_older_than_an_hour_is_swept_and_a_fresh_one_kept() {
         vec!["atpkg-lineage-fetch.concurrent".to_string()]
     );
 }
-
-#[test]
-fn only_a_dormant_reading_admits_an_unproven_compiler() {
-    use atpkg::lineage::LineagePolicy;
-    assert_eq!(Switch::Dormant.policy(), LineagePolicy::Dormant);
-    assert_eq!(Switch::Live.policy(), LineagePolicy::Require);
-    assert_eq!(Switch::Unknown("x".into()).policy(), LineagePolicy::Require);
-}

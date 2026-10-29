@@ -1489,7 +1489,12 @@ mod tests {
             None,
             "a box replaces the frame: no composer"
         );
-        assert!(claude.busy_guard().is_some());
+        let guard = claude.busy_guard().expect("claude busy guard");
+        let re = aterm_regex::Regex::new(&guard).expect("busy_guard compiles as regex");
+        assert!(re.is_match("  esc to interrupt"));
+        assert!(re.is_match("  esc\u{00a0}to\u{00a0}interrupt"));
+        assert!(idle.iter().all(|row| !re.is_match(row)));
+        assert!(!re.is_match("  esc to "));
         let g = GenericReader;
         assert_eq!(
             (g.caret(), g.busy_guard(), g.paste_guard()),

@@ -114,7 +114,7 @@ fn known(clone: &Path, pin_commit: Option<PinCommit>) -> Reading {
     let days = pin_commit
         .as_ref()
         .and_then(|p| p.date.as_deref())
-        .and_then(|d| Some((day_unix(&main_date)? - day_unix(d)?) / 86_400));
+        .and_then(|d| Some(day_unix(&main_date)?.checked_sub(day_unix(d)?)? / 86_400));
     let full = pin_commit.as_ref().and_then(|p| {
         git::run(
             clone,
@@ -176,7 +176,7 @@ fn day_unix(day: &str) -> Option<i64> {
 }
 
 fn short(sha: &str, n: usize) -> &str {
-    &sha[..sha.len().min(n)]
+    &sha[..sha.floor_char_boundary(n)]
 }
 
 impl MainGap {

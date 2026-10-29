@@ -192,12 +192,8 @@ impl App {
             return refuse(reply, "could not build the sheet handler");
         };
 
-        let _: MainThread = mtm;
-
-        // SAFETY: `+[NSAlert new]` is +1, adopted by `Obj::from_owned`.
-        let Some(alert) =
-            (unsafe { Obj::from_owned(appkit::send_id(class(c"NSAlert").as_id(), sel!(new))) })
-        else {
+        // An alert whose icon draws with no IconServices call on the main thread.
+        let Some(alert) = crate::app_icon::alert(mtm) else {
             return refuse(reply, "could not create the alert");
         };
         // SAFETY: `+[NSSecureTextField alloc]` then `-initWithFrame:` is +1.

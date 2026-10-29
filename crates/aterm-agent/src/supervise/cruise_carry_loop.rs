@@ -8,19 +8,53 @@ use std::time::{Duration, Instant};
 
 use super::super::config::{Autopilot, SupervisorConfig};
 use super::super::policy::cruise_carry::{BackgroundCarries, RULE_BACKGROUND, carry_words};
+use super::super::policy::turn_end::TurnEndTiming;
 use super::approvals::Outcome;
 use super::turn_end_loop::Written;
 use super::*;
+use crate::harness::upgrade::HARNESS_MARK;
 
 /// Cruise's carries at breaks: their pacing books and what the journal last said of them.
 #[derive(Debug, Default)]
 pub(super) struct CarryWatch {
     /// When the last carry went and the streak it set ([`BackgroundCarries`]).
     books: BackgroundCarries,
-    /// A live turn has been read since the last break or point: the next live read is no edge.
-    live: bool,
+    /// The turn read live since the last settled break or point, which the next settled break
+    /// judges ([`Self::at_break`]).
+    opened: Option<Opened>,
+    /// When the last carry was typed, until a settled break judges a turn: the turn it opens is
+    /// its answer, its work counted from the typing.
+    carried: Option<Instant>,
+    /// The person's count (`human_seq`, the `if-human=` fence) the last carry was typed under.
+    count: Option<u64>,
+    /// The session's submissions (`submits`) where the last turn was judged or the last carry
+    /// typed, whichever came later: a submission past them but the harness's own line's is
+    /// someone else's message.
+    submits: Option<u64>,
     /// What the journal last said of a carry not typed: once a change.
     said: Option<CarrySaid>,
+    /// When the last carry of a loop before this one was typed ([`Self::seed`]), until this loop's
+    /// first busy read: the counts that carry was typed under were that loop's.
+    owed: Option<Instant>,
+}
+
+/// A turn read live since the last settled break or point.
+#[derive(Debug, Clone, Copy)]
+struct Opened {
+    /// The harness's own line opened it (`TurnEndState::typed_untaken`).
+    ours: bool,
+    /// A read of it drew someone else's prompt row newest ([`newest_prompt_ours`]): a message no
+    /// key in this window typed (Claude Code's Remote Control, another driver) or a person's.
+    theirs: bool,
+    /// Its live stretches' busy time so far, each from its live edge (the carry's typing, for the
+    /// carry's answer) to the start of the break it reached.
+    busy: Duration,
+    /// When the stretch running now began: `None` while the turn stands at a break short of its
+    /// settle, which is no work.
+    since: Option<Instant>,
+    /// A break read as begun before the stretch then running (the loop stepped no break while it
+    /// ran: under Off): where that stretch ended went unread, so its work is unknown.
+    unread: bool,
 }
 
 /// Why a due carry was not typed, as the journal says it.
@@ -35,28 +69,161 @@ enum CarrySaid {
 }
 
 impl CarryWatch {
-    /// A read of a live turn (`Session::took`): someone else's (`ours` false: a person's, the
-    /// program's own wake) starts the books again, once a turn.
-    pub(super) fn live(&mut self, ours: bool) {
-        if std::mem::replace(&mut self.live, true) {
-            return;
-        }
-        if !ours {
-            self.books.reset();
+    /// A read of a live turn (`Session::took`): the first since the last settled break or point
+    /// opens a turn (`ours` when the harness's own line opened it), the first after a pause
+    /// inside it starts its next stretch, each at `at` (read only then), and the settled break
+    /// that ends it judges it ([`Self::at_break`]).
+    pub(super) fn live(&mut self, ours: bool, at: impl FnOnce() -> Instant) {
+        match self.opened.as_mut() {
+            None => {
+                self.opened = Some(Opened {
+                    ours,
+                    theirs: false,
+                    busy: Duration::ZERO,
+                    since: Some(self.carried.unwrap_or_else(at)),
+                    unread: false,
+                });
+            }
+            Some(opened) if opened.since.is_none() => opened.since = Some(at()),
+            Some(_) => {}
         }
     }
 
-    /// A read of a break of the agent's own background work: the next live read is an edge.
-    pub(super) const fn at_break(&mut self) {
-        self.live = false;
+    /// A LOOP BEFORE THIS ONE'S LADDER: its last carry typed `ago` before `now`, the `streak`-th
+    /// in a row. The counts it was typed under were that loop's, so this loop's first busy read
+    /// stands for them ([`Self::read`]): the next turn is judged by its busy time unless someone
+    /// else's message lands in it after that read, never as a person's for counts this loop never
+    /// saw.
+    pub(super) fn seed(&mut self, ago: Duration, streak: u32, now: Instant) {
+        let Some(last) = now.checked_sub(ago) else {
+            return;
+        };
+        self.books = BackgroundCarries::carried(last, streak);
+        self.owed = Some(last);
+    }
+
+    /// A busy read on `screen`, at `at` (read only for the first after a seed): an open turn whose
+    /// newest prompt row is not the harness's has someone else's message in it. The first after a
+    /// seed stands for the counts the last carry was typed under, but not where the person's last
+    /// gesture the host reports came after that carry: the seeded books start again even if
+    /// their turn already reached its break before the restart, so no live edge was read. The
+    /// counts stay unknown and a live turn not the harness's is a person's ([`Self::at_break`]).
+    pub(super) fn read(
+        &mut self,
+        reader: &dyn ScreenReader,
+        screen: &Screen,
+        at: impl FnOnce() -> Instant,
+    ) {
+        if let Some(last) = self.owed.take() {
+            let touched = match screen.human {
+                HumanInput::Ago(ms) => {
+                    Duration::from_millis(ms) < at().saturating_duration_since(last)
+                }
+                HumanInput::Unknown | HumanInput::Never | HumanInput::NeverFor(_) => false,
+            };
+            if touched {
+                self.books.reset();
+            } else {
+                self.count = screen.human_seq;
+                self.submits = screen.submits;
+            }
+        }
+        if let Some(opened) = self.opened.as_mut()
+            && !opened.theirs
+        {
+            opened.theirs = newest_prompt_ours(reader, &screen.rows) == Some(false);
+        }
+    }
+
+    /// A TURN ENDS ONLY AT A SETTLED BREAK: a read on `screen` of a break of the agent's own
+    /// background work that began at `began` ends the open turn's stretch there. Unsettled, it is
+    /// a pause inside the turn (a reply's text drawn between tool calls under a status line), and
+    /// the pause is no work. Settled ([`background_settle`]), it ends the turn, which is judged:
+    /// - SOMEONE ELSE'S MESSAGE starts the books again, whoever opened the turn: a submission
+    ///   since the last judged turn or carry that is not the harness's own line (a person's
+    ///   Enter, another driver's `send`), or a prompt row not the harness's ([`Opened::theirs`]:
+    ///   Remote Control's). A scroll, a click or a key that submits nothing is no message. Where
+    ///   a submission count is unknown, the person's count (any gesture) moved since the last
+    ///   carry, or unknown on a turn not the harness's, is a person's turn.
+    /// - A turn whose stretch's end went unread starts them again: unsure.
+    /// - THE PROGRAM'S OWN WAKE keeps them, as the harness's own line does: REAL WORK IS BUSY
+    ///   TIME, the turn's stretches summed, and a turn of real work starts them again while a
+    ///   short one leaves them ([`BackgroundCarries::ended`]).
+    pub(super) fn at_break(
+        &mut self,
+        timing: &TurnEndTiming,
+        screen: &Screen,
+        began: Instant,
+        settled: bool,
+    ) {
+        let Some(mut turn) = self.opened.take() else {
+            return;
+        };
+        if let Some(since) = turn.since.take() {
+            turn.unread |= began < since;
+            turn.busy = turn
+                .busy
+                .saturating_add(began.saturating_duration_since(since));
+        }
+        if !settled {
+            self.opened = Some(turn);
+            return;
+        }
+        let carried = self.carried.take().is_some();
+        let own = u64::from(turn.ours || carried);
+        let someone = turn.theirs
+            || match (screen.submits, self.submits, screen.human_seq, self.count) {
+                (Some(now), Some(then), ..) => now > then.saturating_add(own),
+                (.., Some(now), Some(then)) => now != then,
+                _ => !turn.ours,
+            };
+        self.submits = screen.submits;
+        if someone || turn.unread {
+            self.books.reset();
+            return;
+        }
+        self.books.ended(timing, turn.busy);
     }
 
     /// A judged point: the policy carries the session from here, and the next break is carried
     /// at its settle again.
     pub(super) fn point(&mut self) {
-        self.live = false;
+        self.opened = None;
+        self.carried = None;
         self.books.reset();
         self.said = None;
+    }
+
+    /// The carry was typed at `now` at a break read on `screen`.
+    fn typed(&mut self, now: Instant, screen: &Screen) {
+        self.books.typed(now);
+        self.carried = Some(now);
+        self.count = screen.human_seq;
+        self.submits = screen.submits;
+        self.said = None;
+    }
+}
+
+/// Whether the newest prompt row of Claude Code's transcript on `rows` (`❯ ` at its left edge,
+/// above the live zone) is a line of the harness's: `None` for another program, or with none in
+/// view. A wake draws no prompt row of its own (`⏺ Background command "…" completed`), so the
+/// newest one stays the carry's.
+fn newest_prompt_ours(reader: &dyn ScreenReader, rows: &[String]) -> Option<bool> {
+    match reader.program() {
+        Program::Claude => {
+            let end = reader.transcript_end(rows).min(rows.len());
+            rows[..end].iter().rev().find_map(|row| {
+                let said = row.strip_prefix('❯')?;
+                said.starts_with(char::is_whitespace)
+                    .then(|| said.trim_start().starts_with(HARNESS_MARK))
+            })
+        }
+        Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Muse
+        | Program::Generic => None,
     }
 }
 
@@ -153,10 +320,7 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(false);
         }
         let typed_at = self.fx.mono();
-        self.cruise_carry
-            .books
-            .typed(&self.turn_end.timing, at, typed_at);
-        self.cruise_carry.said = None;
+        self.cruise_carry.typed(typed_at, screen);
         self.turn_end.background_carried(typed_at);
         let typed_ms = self.hold_ms(typed_at);
         self.break_lined(typed_ms);

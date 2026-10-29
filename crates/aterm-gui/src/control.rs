@@ -32,6 +32,8 @@ pub(crate) use control_query::rows_hash;
 pub(crate) use control_query::screen_stamp;
 #[cfg(test)]
 pub(crate) use control_query::search_full_history;
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use control_query::serve_ask_walk;
 #[cfg(test)]
 pub(crate) use control_query::styled_frame_payload;
 pub(crate) use control_query::{
@@ -47,6 +49,8 @@ pub(crate) use control_query::{
 #[path = "control_input.rs"]
 mod control_input;
 use control_input::INPUT_QUEUE_FULL;
+#[cfg(all(test, unix))]
+pub(crate) use control_input::cmd_key_guarded;
 pub(crate) use control_input::compile_guard;
 pub(crate) use control_input::signal_verb;
 pub(crate) use control_input::{GuardedInput, InputFence, input_if_fenced_observed};
@@ -186,6 +190,9 @@ pub(crate) struct DimsSnapshot {
     pub(crate) present_retry_remaining: u32,
     pub(crate) present_retry_in_ms: Option<u64>,
     pub(crate) layer_presentation: Option<(String, f64, bool)>,
+    /// The session grid's content clock in the frame its window's last own present drew, while
+    /// that grid is still the session's active one (`none` otherwise).
+    pub(crate) presented_seq: Option<u64>,
 }
 
 fn resolve_active(active: &ActiveHandle) -> Option<Target> {
@@ -242,7 +249,7 @@ fn fleet_survey(verb: &str, rest: &str, scope: Scope, store: &Store) -> Option<S
             aterm_net::fleet::REPLY_MAX,
             &crate::survey::Here {
                 drive,
-                ..crate::survey::Here::now()
+                ..crate::survey::Here::cached_for_listener()
             },
         ));
     }
@@ -413,6 +420,12 @@ fn app_route(
         Resolution::Missing => Err("ERR no such session\n".to_string()),
         Resolution::Ambiguous(refusal) => Err(refusal),
     }
+}
+
+/// `open`'s words `rest` under `aim`: the session an `@<sid>` names is the one whose program
+/// asks for its Autopilot menu at its own cell ([`control_media::open_route`]).
+fn open_route(aim: &AppAim, rest: &str) -> control_media::OpenRoute {
+    control_media::open_route(aim.session(), rest)
 }
 
 /// What a connection is authorized to do, resolved at handshake.
@@ -3279,6 +3292,8 @@ pub(crate) fn spawn(
             });
             lanes.publish(worker_context.clone());
             let _ = BRIDGE_CONTEXT.set(worker_context.clone());
+            #[cfg(unix)]
+            crate::fleet_listen::node_serve::start_window_fleet_relay(&sock_dir);
             if workers != CONTROL_WORKERS {
                 aterm_log::warn!(
                     "control socket started with {workers}/{CONTROL_WORKERS} connection workers"
@@ -3334,7 +3349,7 @@ pub(crate) fn spawn(
             }
             #[cfg(unix)]
             crate::fabric_launch::spawn_supervisor(&startup_config);
-            crate::fleet_listen::start_fleet_listener(startup_config.fleet.as_ref());
+            crate::fleet_listen::start_fleet_listener(startup_config.effective_fleet());
             let admit = move |stream: CtlStream| {
                 // Peer credential gate: refuse other uids before spending a lane (Unix:
                 // unverifiable also refuses; Windows: the peer pid's token user where
@@ -3678,7 +3693,7 @@ fn dispatch_app_verb(
         "panes" => control_media::cmd_panes(proxy, aim.session()),
         "controls" => control_media::cmd_controls(proxy, rest),
         "inspect" => control_media::cmd_inspect(proxy, rest),
-        "open" => control_media::cmd_open(proxy, rest),
+        "open" => control_media::cmd_open(proxy, open_route(aim, rest)),
         "edit" => crate::control_edit::cmd_edit(proxy, scope, aim.session(), rest),
         "doc" => crate::control_doc::cmd_doc(proxy, rest),
         "act" => control_media::cmd_act(proxy, rest),
@@ -3727,7 +3742,7 @@ fn retired_verb_error(verb: &str) -> Option<String> {
             "ERR verb {verb} was removed with the network drive: a fleet replaced it (`aterm \
              fleet init` on one machine, `aterm fleet join` on each other; `aterm ctl survey \
              --fleet` reads them, and `aterm ctl --host <h> …` drives one that ran `aterm fleet \
-             allow drive --from <node>`)\n"
+             allow drive --all` or `--from <node>`)\n"
         )),
         _ => None,
     }
@@ -3924,6 +3939,15 @@ fn serve_meta(
                     rest,
                 )
             })
+            .or_else(|| {
+                control_session::cmd_meta_harness_held(ctx, serving_connection(), prove, rest)
+            })
+            .or_else(|| {
+                control_session::cmd_meta_harness_land(ctx, serving_connection(), prove, rest)
+            })
+            .or_else(|| {
+                control_session::cmd_meta_harness_needs(ctx, serving_connection(), prove, rest)
+            })
             .or_else(|| control_session::meta_questions_denied(scope, rest))
             .unwrap_or_else(|| {
                 let by = control_session::log_actor(scope, ctx);
@@ -3959,11 +3983,25 @@ fn serve_meta_wired(
 }
 
 fn meta_change_wakes(session: u64, sid: &str, rest: &str) -> Vec<Wake> {
+    // A self-claim's NEEDS YOU set is a needs fact, as aterm's own loop's tell is: the need
+    // published again, and the hover stamped where the pill's words did not move.
+    if control_session::is_harness_needs(rest) {
+        return vec![Wake::HarnessFact {
+            sid: sid.to_string(),
+            fact: crate::HarnessFact::Needs,
+        }];
+    }
     let mut wakes = vec![Wake::MetaChanged { session }];
     if let Some(face) = control_session::harness_act_face(rest) {
         wakes.push(Wake::HarnessFact {
             sid: sid.to_string(),
             fact: crate::HarnessFact::SelfTask(face),
+        });
+    }
+    if control_session::is_harness_act_set(rest) {
+        wakes.push(Wake::HarnessFact {
+            sid: sid.to_string(),
+            fact: crate::HarnessFact::SelfAct,
         });
     }
     wakes
@@ -4331,9 +4369,11 @@ fn fabric_status_line() -> String {
     let (lane, bridge_build, faults) = crate::fabric::fabric_bridge_facts();
     let n = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |n| n.to_string());
     let mirror = crate::fabric::fabric_mirror_facts();
+    let gaps = crate::fabric::fabric_gap_facts();
     format!(
         "OK state={state} supervised={} command={command} reason={reason} rtt_ms={} \
-         link_age_ms={} build={} bridge_lane={} bridge_build={} lane_faults={faults}{mirror}\n",
+         link_age_ms={} build={} bridge_lane={} bridge_build={} lane_faults={faults}{gaps}\
+         {mirror}\n",
         u8::from(supervised),
         n(rtt),
         n(age),
@@ -4701,6 +4741,8 @@ fn dispatch_owner(
         "raise" => control_session::cmd_raise(proxy, store, scope, rest),
         "appnotice" => control_query::cmd_appnotice(proxy, rest),
         "notice" => control_query::cmd_notice(proxy, rest),
+        #[cfg(unix)]
+        "members" => control_query::cmd_members(proxy, rest),
         "devtools" => control_query::cmd_devtools(proxy, rest),
         "permissions" => control_query::cmd_permissions(proxy, rest),
         "person" => control_media::cmd_person(proxy, rest),
@@ -5884,7 +5926,9 @@ fn release_connection_claims(store: &Store, proxy: Option<&EventLoopProxy<Wake>>
     for handle in handles {
         control_session::release_connection_lease(&handle.ctx, conn);
         let by = aterm_slog::Actor::Aterm;
-        if !crate::session_timeline::release_supervisor(&handle.ctx, Some(conn), now, by) {
+        let released =
+            crate::session_timeline::release_supervisor(&handle.ctx, Some(conn), now, by);
+        if !(crate::session_timeline::close_claim_connection(&handle.ctx, conn, now) || released) {
             continue;
         }
         if let Some(proxy) = proxy {
@@ -6099,6 +6143,9 @@ enum DriveLine {
         line: String,
         write: Option<DriveAct>,
     },
+    /// The handler's own answer, given without it: `ERR no such session @<sid>` for an `await
+    /// task` of an `s-` sid this instance hosts no more, as on one Mac.
+    Answer(String),
 }
 
 fn drive_admission(
@@ -6120,6 +6167,7 @@ fn drive_admission(
         let spawned = |sid: &SessionId| drive_spawned_by(sid).as_deref() == Some(&*driver.node);
         return match drive_gate(request.line(), &hosts, &spawned) {
             Ok(DriveLine::Fleet) => Ok((request, scope, None)),
+            Ok(DriveLine::Answer(reply)) => Err(reply),
             Ok(DriveLine::Act { line, mut write }) => {
                 if let Some(DriveAct {
                     sid: Some(sid),
@@ -6233,9 +6281,16 @@ fn drive_gate(
                 let args = crate::task_record::parse_await_task(&words, true)
                     .map_err(|usage| usage.trim_end().trim_start_matches("ERR ").to_owned())?;
                 for target in &args.targets {
-                    if hosted(&target.selector).is_none() {
+                    if hosted(&target.selector).is_some() {
+                        continue;
+                    }
+                    if !matches!(Selector::parse(&target.selector), Selector::Sid(_)) {
                         return Err(SID.to_owned());
                     }
+                    return Ok(DriveLine::Answer(format!(
+                        "ERR no such session @{}\n",
+                        target.selector
+                    )));
                 }
                 Ok(read())
             }
@@ -8255,6 +8310,81 @@ const PASTE_RECEIPT_WAIT: std::time::Duration =
 const PASTE_UNREAD: &str =
     "ERR in-doubt paste-unread: queued, the program has not read it yet (signal drops it)\n";
 
+/// A control press carries no physical text classification. Only printable,
+/// unmodified text may retain editing custody; control/navigation input is a boundary.
+pub(crate) fn control_vim_key(event: &InputEvent) -> Option<crate::vim_custody::Key> {
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
+    let text = match event {
+        InputEvent::Key {
+            event_type: KeyEventType::Release,
+            ..
+        } => return None,
+        InputEvent::Key {
+            key: Key::Character(c),
+            mods,
+            ..
+        } => {
+            !c.is_control() && !mods.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
+        }
+        InputEvent::Key { .. } => false,
+        InputEvent::Text(text) => !text.chars().any(char::is_control),
+        InputEvent::KeySequence(bytes) => {
+            std::str::from_utf8(bytes).is_ok_and(|text| !text.chars().any(char::is_control))
+        }
+        _ => return None,
+    };
+    Some(crate::vim_custody::key(event, text))
+}
+
+/// Mode evidence for an unseamed control write. No lock is held while writing.
+#[derive(Clone)]
+pub(crate) struct ControlVim {
+    licence: Arc<crate::licence_fence::LicenceFence>,
+    timeline: Arc<Mutex<crate::session_timeline::SessionTimeline>>,
+}
+
+impl ControlVim {
+    fn new(ctx: &SessionCtx) -> Self {
+        Self {
+            licence: ctx.licence.clone(),
+            timeline: ctx.timeline.clone(),
+        }
+    }
+
+    pub(crate) fn capture(&self, term: &Mutex<Terminal>) -> Option<crate::vim_custody::Frame> {
+        let terminal = term.try_lock().ok()?;
+        crate::vim_custody::capture_parts(&terminal, &self.licence, &self.timeline, true)
+    }
+
+    pub(crate) fn accepted(
+        &self,
+        frame: Option<crate::vim_custody::Frame>,
+        event: &InputEvent,
+        receipt: crate::input::EgressReceipt,
+    ) {
+        if !receipt.fully_accepted_nonempty() {
+            return;
+        }
+        let Some(key) = control_vim_key(event) else {
+            return;
+        };
+        let Some(frame) = frame else {
+            self.licence.vim.invalidate();
+            return;
+        };
+        if self.licence.vim.epoch() == frame.epoch
+            && self
+                .timeline
+                .try_lock()
+                .ok()
+                .and_then(|timeline| timeline.foreground_stamp())
+                == Some(frame.owner.foreground)
+        {
+            self.licence.vim.key(frame, key);
+        }
+    }
+}
+
 #[cfg(test)]
 fn background_input(
     term: &Arc<Mutex<Terminal>>,
@@ -8282,6 +8412,7 @@ fn background_input_observed(
         &ctx.output_echo,
         ev,
         completion,
+        Some(ControlVim::new(ctx)),
     );
     let receipt = match written {
         None => receipt,
@@ -9353,6 +9484,15 @@ fn serve_session_verb(
                 let _ = proxy.send_event(Wake::Vitals);
             }
             reply
+        }
+        "harness" if rest.split_whitespace().next() == Some("recovery") => {
+            crate::harness_recovery_verb::cmd(rest, scope.is_owner_class(), || {
+                let timeline = ctx
+                    .timeline
+                    .try_lock()
+                    .map_err(|_| "recovery observation busy".to_string())?;
+                Ok(crate::harness_recovery_verb::snapshot(&timeline))
+            })
         }
         "harness" => crate::harness_policy_verb::cmd(rest, scope.is_owner_class(), || {
             control_media::call_main(proxy, |tx| Wake::ReadHarnessPolicy { session, reply: tx })

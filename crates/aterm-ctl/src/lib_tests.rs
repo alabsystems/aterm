@@ -883,13 +883,27 @@ fn a_worker_task_is_refused_empty_or_past_the_cap() {
 
 #[test]
 fn resolve_target_pins_every_named_socket() {
-    let (path, origin) = resolve_target(None, Some(42), None).expect("per-user dir");
-    let want = format!("{}aterm-42.sock", std::path::MAIN_SEPARATOR);
-    assert!(path.ends_with(&want), "got {path}");
-    assert_eq!(origin, TargetOrigin::Pinned);
+    let dir = PathBuf::from("/custom/run/aterm");
+    let expected = dir.join("aterm-42.sock").to_string_lossy().into_owned();
     assert_eq!(
-        resolve_target(Some("/tmp/a.sock".into()), None, None).unwrap(),
+        resolve_target_in(Some(dir.clone()), None, Some(42), None).expect("injected dir"),
+        (expected, TargetOrigin::Pinned)
+    );
+    assert_eq!(
+        resolve_target_in(None, None, Some(42), None)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+    assert_eq!(
+        resolve_target_in(None, Some("/tmp/a.sock".into()), None, None).unwrap(),
         ("/tmp/a.sock".to_string(), TargetOrigin::Pinned)
+    );
+    assert_eq!(
+        resolve_target_in(Some(dir), Some("/tmp/a.sock".into()), Some(7), None)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
     );
     let err = resolve_path(Some("/tmp/a.sock".into()), Some(7), None).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
@@ -1427,6 +1441,19 @@ fn parse_timeout_zero_disables_positive_is_seconds() {
             "{bad:?} should error"
         );
     }
+    let start = std::time::Instant::now();
+    let max_secs = parse_timeout("18446744073709551615")
+        .unwrap()
+        .expect("positive seconds");
+    let clamped = instant_after(start, max_secs);
+    assert!(
+        clamped.duration_since(start) >= std::time::Duration::from_secs(3600 * 24 * 365),
+        "saturates to a distant representable Instant without panicking"
+    );
+    assert_eq!(
+        instant_after(start, std::time::Duration::from_secs(5)),
+        start + std::time::Duration::from_secs(5)
+    );
 }
 
 #[test]
@@ -1649,6 +1676,28 @@ fn expand_self_selector_expands_env_and_errors_when_unset() {
             Some("subscribe @s-x,@1,@s-x screen"),
         ),
         ("subscribe @self screen", None, None),
+        (
+            "await task @self",
+            Some("s-live"),
+            Some("await task @s-live"),
+        ),
+        (
+            "await task @self:0,@s-xyz:4,@env:2:1 facts=1",
+            Some("s-x"),
+            Some("await task @s-x:0,@s-xyz:4,@s-x:2:1 facts=1"),
+        ),
+        (
+            "@self:7 await task",
+            Some("s-live"),
+            Some("@s-live:7 await task"),
+        ),
+        (
+            "await task timeout 5000 @self:3",
+            Some("s-live"),
+            Some("await task timeout 5000 @s-live:3"),
+        ),
+        ("await task @self:0", None, None),
+        ("@self:0 text", None, Some("@self:0 text")),
     ] {
         let mut parts = p(request);
         let got = expand_self_selector(&mut parts, env.map(String::from));
@@ -1676,6 +1725,10 @@ fn an_empty_selector_is_refused_in_the_selector_position_only() {
         p("subscribe @ screen"),
         p("subscribe @s-a,@ screen"),
         p("subscribe @,@self events"),
+        p("await task @"),
+        p("await task @:5"),
+        p("await task @s-a,@:0"),
+        p("@:5 await task"),
     ] {
         let e = refuse_empty_selectors(&refused).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{refused:?}");
@@ -1692,6 +1745,8 @@ fn an_empty_selector_is_refused_in_the_selector_position_only() {
         p("@3 close"),
         p("subscribe @s-a,@self screen"),
         p("subscribe screen"),
+        p("await task @s-a:5,@self:0"),
+        p("@self:5 await task"),
         p("send @"),
         p("status"),
     ] {
@@ -3204,6 +3259,15 @@ fn implicit_self_targeting_is_exactly_the_flagless_at_self_and_at_dot_shapes() {
         ("@self send hi", sock, Some(42), true),
         ("@env send hi", sock, Some(42), true),
         ("subscribe @self,@1 screen", None, None, true),
+        ("await task @s-abc", None, None, false),
+        ("await task @s-abc:0,@s-def:2", None, None, false),
+        ("await task @self", sock, Some(42), true),
+        ("await task @self:0", sock, Some(42), true),
+        ("@self:5 await task", sock, Some(42), true),
+        ("await task @.:0", None, None, true),
+        ("await task @.:0", None, Some(7), false),
+        ("await task", None, None, true),
+        ("await task", None, Some(7), false),
         ("@. text", None, None, true),
         ("@. text", None, Some(7), false),
         ("@s-abc text", None, None, false),

@@ -110,40 +110,6 @@ pub fn line_cells_tail(
     }
 }
 
-/// Appends the same-row cells from `from_col` (exclusive) to `to_col` (inclusive) into `out`.
-#[cfg(test)]
-pub fn row_sweep_cells(out: &mut Vec<(i32, i32)>, row: i32, from_col: i32, to_col: i32) {
-    if to_col > from_col {
-        out.extend((from_col + 1..=to_col).map(|c| (row, c)));
-    } else {
-        out.extend((to_col..from_col).rev().map(|c| (row, c)));
-    }
-}
-
-/// Writes the typewriter-wrap cell sweep from `prev` across `cols` to `cur` into `out`.
-#[cfg(test)]
-pub fn wrap_fold_cells(out: &mut Vec<(i32, i32)>, prev: (i32, i32), cur: (i32, i32), cols: i32) {
-    wrap_fold_cells_in_pane(out, prev, cur, 0, cols);
-}
-
-/// Writes the typewriter-wrap cell sweep within a pane starting at `col0` of width `cols` into
-/// `out`.
-#[cfg(test)]
-pub fn wrap_fold_cells_in_pane(
-    out: &mut Vec<(i32, i32)>,
-    prev: (i32, i32),
-    cur: (i32, i32),
-    col0: i32,
-    cols: i32,
-) {
-    out.clear();
-    let (pr, pc) = prev;
-    let (cr, cc) = cur;
-    let col1 = col0.saturating_add(cols.max(0));
-    out.extend((pc + 1..col1).map(|c| (pr, c)));
-    out.extend((col0..=cc).map(|c| (cr, c)));
-}
-
 /// Returns whether `prev` to `cur` is a physical margin wrap from the last pane column to `col0` on
 /// the next row.
 #[inline]
@@ -162,21 +128,6 @@ pub const fn physical_margin_fold(prev: (u16, u16), cur: (u16, u16), col0: u16, 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn assert_adjacent(path: &[(i32, i32)], allow_fold_at: Option<usize>) {
-        for (i, w) in path.windows(2).enumerate() {
-            if allow_fold_at == Some(i) {
-                continue;
-            }
-            let ((r0, c0), (r1, c1)) = (w[0], w[1]);
-            assert!(
-                (r1 - r0).abs() <= 1 && (c1 - c0).abs() <= 1,
-                "gap between {:?} and {:?} in {path:?}",
-                w[0],
-                w[1]
-            );
-        }
-    }
 
     #[test]
     fn bounded_tail_matches_forward_bresenham_exhaustively() {
@@ -237,17 +188,7 @@ mod tests {
     }
 
     #[test]
-    fn wrap_fold_finishes_old_row_and_starts_new() {
-        let mut out = Vec::new();
-        wrap_fold_cells(&mut out, (5, 38), (6, 1), 40);
-        assert_eq!(out, vec![(5, 39), (6, 0), (6, 1)]);
-        let seam = out.iter().position(|&(r, _)| r == 6).unwrap() - 1;
-        assert_adjacent(&out, Some(seam));
-        wrap_fold_cells(&mut out, (5, 39), (6, 0), 40);
-        assert_eq!(out, vec![(6, 0)]);
-
-        wrap_fold_cells_in_pane(&mut out, (5, 51), (6, 12), 12, 40);
-        assert_eq!(out, vec![(6, 12)]);
+    fn a_physical_margin_fold_runs_from_the_panes_last_column_to_its_first() {
         assert!(physical_margin_fold((5, 51), (6, 12), 12, 40));
         assert!(
             !physical_margin_fold((5, 51), (6, 11), 12, 40),

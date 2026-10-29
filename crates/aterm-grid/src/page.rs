@@ -29,9 +29,8 @@ pub(crate) struct Page {
 unsafe impl Send for Page {}
 
 // SAFETY: `Page` is `Sync`: its bytes are reached only through `PageSlice`s over disjoint ranges
-// (`as_slice` under `&self`, `as_mut_slice` under `&mut self`), `alloc_page`'s zeroing under `&mut
-// PageStore`, and test code's raw `data_ptr` accesses, whose callers guarantee exclusivity; no byte
-// range is mutated concurrently.
+// (`as_slice` under `&self`, `as_mut_slice` under `&mut self`) and test code's raw `data_ptr`
+// accesses, whose callers guarantee exclusivity; no byte range is mutated concurrently.
 unsafe impl Sync for Page {}
 
 const fn _assert_send<T: Send>() {}

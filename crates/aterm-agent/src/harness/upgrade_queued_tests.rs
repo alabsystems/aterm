@@ -18,8 +18,8 @@ const OWNERS_SALT: u64 = 1_790_373_039;
 
 const OWNERS_STATE: &str = r#"{"agent":"","asks":0,"at":0,"cause":"","codex_home":"","confirm_by":0,"cwd":"","done_at":0,"exited_at":0,"from":"2.1.280","hold_seen":1790539070,"hold_since":1790539070,"last_seq":4735,"launch_model":"","left_at":0,"left_typed":"","line":"","mark":0,"marker":"ATERM-UPGRADE-READY-6a57ff7a","mode":"","model_before":"","model_list":"","noted":"","notice_pid":6099,"notice_start":"Thu Sep 24 02:03:13 2026","outcome":"","pending_since":0,"phase":"failed","pid":0,"prompt":"","ready_since":0,"release":"","request":"-","request_at":0,"request_tab":"","resumed_on":"","resumed_pid":0,"salt":1790373039,"seq_since":1790539070,"shell":0,"source":"managed","tab":"s-c543f4e0edd3439e5791","thread":"","to":"2.1.283","twin":"","wait":"failed","wait_since":1790539070,"why":"unanswered"}"#;
 
-fn limit_row(ts: &str, session: &str) -> String {
-    limit_row_until(ts, session, 1_791_046_800_u64.max(now_s() + 86_400))
+fn limit_row(ts: &str, session: &str, now: u64) -> String {
+    limit_row_until(ts, session, now + 86_400)
 }
 
 fn limit_row_until(ts: &str, session: &str, resets: u64) -> String {
@@ -65,7 +65,7 @@ fn owners_rows(now: u64, asked: &[&str], went_on: Option<(u64, &str)>) -> String
     for (k, marker) in asked.iter().enumerate() {
         let at = first + REASK_S * u64::try_from(k).expect("k");
         rows.push(typed_row(&ts(at), OWNERS_SESSION, &notice(marker), "typed"));
-        rows.push(limit_row(&ts(at + 1), OWNERS_SESSION));
+        rows.push(limit_row(&ts(at + 1), OWNERS_SESSION, now));
         rows.push(duration_row(&ts(at + 1), OWNERS_SESSION, 760));
     }
     if let Some((ago, said)) = went_on {

@@ -43,7 +43,7 @@ USAGE
                            journaled, so a bare re-run keeps it
         --release-credentials <profile.toml>
                            the cut's signing profile (default
-                           ~/.aterm/release-credentials.toml)
+                           ~/.aterm/release-ring/release-credentials.toml)
         --engine DIRECTORY the publication engine (default
                            $PUBLICATION_ENGINE, else ~/publication)
         --dry-run          the plan, the ETA, and every refusal a real run would
@@ -134,7 +134,7 @@ USAGE
         --release-credentials <profile.toml>
                            the signing profile: a rostered, unrevoked machine key
                            and its notary credential (`provision` writes
-                           ~/.aterm/release-credentials.toml). Without one the
+                           ~/.aterm/release-ring/release-credentials.toml). Without one the
                            cut refuses before it claims
 
   targo --unverified ship provision --id <machine-id> [--check] [--cert-dir <folder>]

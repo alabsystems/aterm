@@ -1117,6 +1117,7 @@ mod tests {
             cell_px: None,
             security_policy: None,
             hyperlink_schemes: Vec::new(),
+            kitty_media_admitted: false,
         };
         let start = PaneState::new(
             project(&Terminal::new(4, 20)).expect("a blank screen projects"),

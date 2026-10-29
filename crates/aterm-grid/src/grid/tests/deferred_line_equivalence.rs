@@ -32,7 +32,7 @@ fn assert_lines_equivalent(
         "{ctx}: hyperlink_count mismatch"
     );
     let text = eager.to_string();
-    for (i, _) in text.char_indices() {
+    for i in 0..text.chars().count() {
         let ea = eager.get_attr(i);
         let la = lazy.get_attr(i);
         assert_eq!(ea.fg, la.fg, "{ctx}: fg mismatch at char index {i}");

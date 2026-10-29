@@ -6,7 +6,7 @@
 use super::*;
 
 #[test]
-fn the_commit_stop_is_reserved_whole_and_defers_cleanup_until_claim_guards_drop() {
+fn reserved_commit_stop_waits_outside_claim_guards_and_leaves_unwritten_misses_clean() {
     let app = crate::App::headless_for_test();
     let ctx = app.pool.get(0).expect("session 0").ctx.clone();
     let world = Arc::new(World::default());
@@ -59,57 +59,45 @@ fn the_commit_stop_is_reserved_whole_and_defers_cleanup_until_claim_guards_drop(
         host.shared.lock().stops.push(worker);
     }
 
-    let unchanged = || {
-        assert!(
-            !host.suspended(),
-            "a failed reservation changed no host state"
-        );
-        for (word, stop, left, kept, left_at_commit) in &handles {
-            assert_eq!(stop.load(Ordering::SeqCst), *word == Word::Stopped);
-            assert_eq!(left.read(), *word);
-            assert!(matches!(kept.lock().unwrap().commit, Committed::No));
-            assert!(!left_at_commit.load(Ordering::SeqCst));
-        }
-        assert_eq!(cuts.load(Ordering::SeqCst), 0);
-    };
-    {
-        let state = host.shared.lock();
-        let mut wrote = false;
-        assert_eq!(host.with_suspended_at_commit(|| wrote = true), None);
-        assert!(!wrote, "a busy host is not waited on and permits no write");
-        drop(state);
-        unchanged();
+    // An aborted inner claim check drops the reservation without mutating host or worker state.
+    let missed: Option<()> = host.with_commit_stop_reserved(|_stop| None);
+    assert_eq!(missed, None);
+    assert!(
+        !host.suspended(),
+        "a missed reservation changed no host state"
+    );
+    for (word, stop, left, kept, left_at_commit) in &handles {
+        assert_eq!(stop.load(Ordering::SeqCst), *word == Word::Stopped);
+        assert_eq!(left.read(), *word);
+        assert!(matches!(kept.lock().unwrap().commit, Committed::No));
+        assert!(!left_at_commit.load(Ordering::SeqCst));
     }
-    {
-        let kept = handles[1].3.lock().unwrap();
-        let mut wrote = false;
-        assert_eq!(host.with_suspended_at_commit(|| wrote = true), None);
-        assert!(!wrote, "one busy kept state refuses the whole reservation");
-        drop(kept);
-        unchanged();
-    }
+    assert_eq!(cuts.load(Ordering::SeqCst), 0);
 
-    let meta = ctx.meta.lock().unwrap();
-    let timeline = ctx.timeline.lock().unwrap();
-    let written = host.with_suspended_at_commit(|| {
-        assert!(matches!(
-            host.shared.state.try_lock(),
-            Err(std::sync::TryLockError::WouldBlock)
-        ));
-        for (_, stop, left, kept, _) in &handles {
-            assert!(stop.load(Ordering::SeqCst), "the write sees a stop flag");
-            assert_eq!(left.read(), Word::Stopped);
+    // Stops are marked inside the claim guards with no callback run.
+    let written = host.with_commit_stop_reserved(|stop| {
+        let _meta = ctx.meta.try_lock().expect("claim meta lock");
+        let _timeline = ctx.timeline.try_lock().expect("claim timeline lock");
+        Some(stop.write(|| {
             assert!(matches!(
-                kept.try_lock(),
+                host.shared.state.try_lock(),
                 Err(std::sync::TryLockError::WouldBlock)
             ));
-        }
-        assert_eq!(
-            cuts.load(Ordering::SeqCst),
-            0,
-            "no cleanup ran before the write"
-        );
-        Err::<(), _>("fixture Commit failure")
+            for (_, stop, left, kept, _) in &handles {
+                assert!(stop.load(Ordering::SeqCst), "the write sees a stop flag");
+                assert_eq!(left.read(), Word::Stopped);
+                assert!(matches!(
+                    kept.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+            }
+            assert_eq!(
+                cuts.load(Ordering::SeqCst),
+                0,
+                "no cleanup ran before the write"
+            );
+            Err::<(), _>("fixture Commit failure")
+        }))
     });
     assert_eq!(written, Some(Err("fixture Commit failure")));
     assert!(host.suspended());
@@ -132,8 +120,6 @@ fn the_commit_stop_is_reserved_whole_and_defers_cleanup_until_claim_guards_drop(
         0,
         "the stop invoked no cleanup callback"
     );
-    drop(timeline);
-    drop(meta);
     host.suspend();
     assert_eq!(cuts.load(Ordering::SeqCst), handles.len());
     host.shutdown_and_join();

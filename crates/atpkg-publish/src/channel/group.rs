@@ -623,20 +623,30 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
                 ctx.shown(&ctx.identity.key)
             ));
         }
-        if !std::fs::metadata(&ctx.tokens.channel).is_ok_and(|m| m.len() > 0) {
-            pf.problems.push(format!(
+        match ctx.usable_token(&ctx.tokens.channel) {
+            Ok(true) => {}
+            Ok(false) => pf.problems.push(format!(
                 "--upload needs the public owner's token at {} (the packs and the index are \
                  published there)",
                 ctx.shown(&ctx.tokens.channel)
-            ));
+            )),
+            Err(why) => pf.problems.push(format!(
+                "--upload needs the public owner's token at {}: {why}",
+                ctx.shown(&ctx.tokens.channel)
+            )),
         }
-        if !std::fs::metadata(&ctx.tokens.staging).is_ok_and(|m| m.len() > 0) {
-            pf.problems.push(format!(
+        match ctx.usable_token(&ctx.tokens.staging) {
+            Ok(true) => {}
+            Ok(false) => pf.problems.push(format!(
                 "--upload needs the staging owner's token at {} (every pack is uploaded to {} \
                  first, and a write never goes anonymously)",
                 ctx.shown(&ctx.tokens.staging),
                 ctx.accounts.staging
-            ));
+            )),
+            Err(why) => pf.problems.push(format!(
+                "--upload needs the staging owner's token at {}: {why}",
+                ctx.shown(&ctx.tokens.staging)
+            )),
         }
     } else if !pf.have_key {
         pf.notes.push(format!(

@@ -501,6 +501,9 @@ pub(crate) const EDIT_TRAIL_SOUND_VOLUME: &str = "trail_sound_volume";
 pub(crate) const EDIT_SHELL: &str = "shell";
 /// Extra shell argv (`Config::shell_args`) — a [`LIST_KEYS`] row.
 pub(crate) const EDIT_SHELL_ARGS: &str = "shell_args";
+/// amacs as the default `EDITOR` in tabs (`[amacs] default_editor`, default on), read by
+/// `amacs::config` (docs/DESIGN-amacs-2026-10-19.md §8.4).
+pub(crate) const EDIT_AMACS_DEFAULT_EDITOR: &str = "amacs.default_editor";
 /// GPU-present colour-space tag (`window_colorspace`: srgb | display-p3).
 pub(crate) const EDIT_WINDOW_COLORSPACE: &str = "window_colorspace";
 /// Session restore at launch (`restore_session`, default ON).
@@ -561,6 +564,11 @@ pub(crate) struct NestedLeaf {
 
 /// Every registered nested scalar leaf.
 pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
+    NestedLeaf {
+        key: EDIT_AMACS_DEFAULT_EDITOR,
+        label: "Use amacs as the default editor (EDITOR)",
+        kind: EditKind::Bool,
+    },
     NestedLeaf {
         key: EDIT_KEEPER_ENABLED,
         label: "Keep shells running after an aterm crash",
@@ -709,6 +717,11 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
     NestedLeaf {
         key: "ai.grok.use",
         label: "Use Grok Build on this machine",
+        kind: EditKind::Bool,
+    },
+    NestedLeaf {
+        key: "ai.kimi.use",
+        label: "Use Kimi Code CLI on this machine",
         kind: EditKind::Bool,
     },
     NestedLeaf {
@@ -1212,11 +1225,14 @@ pub(crate) enum ThemeMode {
 /// The mode a configured `theme` value (`None` when unset) is in, by the one selector grammar ([`aterm_types::scheme::ThemeSelector::parse`]).
 pub(crate) fn theme_mode(raw: Option<&str>) -> ThemeMode {
     use aterm_types::scheme::ThemeSelector;
-    match raw
-        .filter(|_| !theme_is_unset(raw))
-        .map(ThemeSelector::parse)
-    {
-        Some((ThemeSelector::Split { .. }, _)) => ThemeMode::FollowSystem,
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return ThemeMode::Always;
+    };
+    // Parsed once: the selector that says whether it names a theme says how.
+    match ThemeSelector::parse(raw).0 {
+        selector @ ThemeSelector::Split { .. } if !selector_unset(&selector) => {
+            ThemeMode::FollowSystem
+        }
         _ => ThemeMode::Always,
     }
 }
@@ -1360,7 +1376,11 @@ pub(crate) fn theme_is_unset(raw: Option<&str>) -> bool {
     let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
         return true;
     };
-    let (selector, _) = aterm_types::scheme::ThemeSelector::parse(raw);
+    selector_unset(&aterm_types::scheme::ThemeSelector::parse(raw).0)
+}
+
+/// Whether `selector` names no theme for either side.
+fn selector_unset(selector: &aterm_types::scheme::ThemeSelector) -> bool {
     selector.name_for(aterm_types::Appearance::Dark).is_none()
         && selector.name_for(aterm_types::Appearance::Light).is_none()
 }
@@ -2109,14 +2129,18 @@ pub(crate) fn retired_authored_keys(text: &str) -> std::collections::BTreeSet<&'
             .fold(first, |item, part| item.and_then(|item| item.get(part)))
             .is_some()
     };
+    // A config that holds no retired spelling is parsed no further.
+    let held: Vec<_> = retired_successor_pairs()
+        .filter(|(retired, _)| holds(&doc, retired))
+        .collect();
+    if held.is_empty() {
+        return authored;
+    }
     let Ok(with) = Config::parse(text) else {
         return authored;
     };
     let fields_with = editable_fields(&with);
-    for (retired, successor) in retired_successor_pairs() {
-        if !holds(&doc, retired) {
-            continue;
-        }
+    for (retired, successor) in held {
         let mut without = doc.clone();
         without.remove_path_pruning(&retired.split('.').collect::<Vec<_>>());
         let Ok(without) = Config::parse(&without.to_string()) else {
@@ -2651,6 +2675,7 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
         (configured_str(v), ph.to_string())
     }
     match key {
+        EDIT_AMACS_DEFAULT_EDITOR => boolean(Some(cfg.amacs.config.default_editor), true),
         EDIT_KEEPER_ENABLED => boolean(Some(cfg.keeper_enabled()), false),
         EDIT_SESSION_LOG_JOURNAL => boolean(Some(cfg.session_log_journal()), true),
         EDIT_SESSION_LOG_CLAUSE => boolean(Some(cfg.session_log_clause()), true),
@@ -2936,7 +2961,7 @@ pub(crate) fn section_of(key: &str) -> Section {
         | EDIT_MOTION
         | EDIT_SERIOUS_MODE
         | EDIT_LOAD_ADAPTIVE_MOTION => Section::Cursor,
-        EDIT_SHELL | EDIT_SHELL_ARGS => Section::Terminal,
+        EDIT_SHELL | EDIT_SHELL_ARGS | EDIT_AMACS_DEFAULT_EDITOR => Section::Terminal,
         EDIT_FONT_PX
         | EDIT_FONT_FAMILY
         | EDIT_DISPLAY_FONT
@@ -3093,7 +3118,7 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         }
         EDIT_SCROLLBACK | EDIT_SEARCH_HISTORY_LINES => ("Scrollback", 0),
         EDIT_BIDI | EDIT_AMBIGUOUS_WIDTH => ("Text direction & width", 1),
-        EDIT_SHELL | EDIT_SHELL_ARGS => ("Shell", 2),
+        EDIT_SHELL | EDIT_SHELL_ARGS | EDIT_AMACS_DEFAULT_EDITOR => ("Shell", 2),
         _ => ("General", u8::MAX),
     }
 }
@@ -3175,6 +3200,11 @@ pub(crate) fn footnote_of(key: &str) -> Option<&'static str> {
         return Some(note);
     }
     Some(match key {
+        EDIT_AMACS_DEFAULT_EDITOR => {
+            "New tabs set EDITOR to amacs, aterm's own editor, so git commit and an agent's \
+             Ctrl-G open their file in an aterm tab. An EDITOR or VISUAL you set yourself always \
+             wins."
+        }
         EDIT_KEEPER_ENABLED => {
             "Requires the PTY keeper service (`aterm keeper start`); this switch alone does not start it. Reopening a saved layout alone starts new shells."
         }
@@ -3437,9 +3467,11 @@ pub(crate) fn application_timing(key: &str) -> Option<ApplicationTiming> {
         | EDIT_UPDATE_ENABLED
         | EDIT_KEEPER_ENABLED
         | EDIT_SESSION_LOG_JOURNAL => T::AfterRestart,
-        EDIT_ALLOW_KITTY_FILE_TRANSFER | EDIT_TEMPORAL_RECORDING | EDIT_SHELL | EDIT_SHELL_ARGS => {
-            T::NewSessions
-        }
+        EDIT_ALLOW_KITTY_FILE_TRANSFER
+        | EDIT_TEMPORAL_RECORDING
+        | EDIT_SHELL
+        | EDIT_SHELL_ARGS
+        | EDIT_AMACS_DEFAULT_EDITOR => T::NewSessions,
         EDIT_HDR_GLOW => T::EnablingNeedsNewWindow,
         EDIT_RESTORE_SESSION => T::WhenAtermClosesOrRestarts,
         EDIT_REROUTE_ANNOUNCE => T::NextCargoRun,
@@ -3483,6 +3515,10 @@ pub(crate) fn environment_precedence(key: &str) -> Option<&'static str> {
         EDIT_FONT_FAMILY => "a launch --font overrides this value",
         EDIT_SHELL => "a launch --shell overrides this value; -e / --command bypasses the shell",
         EDIT_SHELL_ARGS => "a launch -e / --command bypasses shell_args",
+        EDIT_AMACS_DEFAULT_EDITOR => {
+            "an EDITOR or VISUAL set in your shell startup files or aterm's environment wins; \
+             a shell aterm has no integration for gets no default"
+        }
         _ => return None,
     })
 }
@@ -3886,6 +3922,9 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         EDIT_GPU => &["gpu", "renderer", "metal", "vulkan", "cpu", "restart"],
         EDIT_PALETTE => &["palette", "ansi", "colors", "colours", "indexed"],
         EDIT_SHELL | EDIT_SHELL_ARGS => SHELL_KEYWORDS,
+        EDIT_AMACS_DEFAULT_EDITOR => &[
+            "editor", "amacs", "visual", "git", "commit", "ctrl-g", "emacs", "vim",
+        ],
         EDIT_WINDOW_COLORSPACE => &["colorspace", "srgb", "p3", "gamut", "color"],
         EDIT_RESTORE_SESSION => &["restore", "session", "reopen", "launch", "windows"],
         EDIT_KEEPER_ENABLED => &["keeper", "recovery", "crash", "shell", "session"],
@@ -5224,14 +5263,14 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: String::new(),
         },
         EditField {
-            label: "Keep ALab tools up to date",
+            label: atpkg::adoption::UPDATES_SWITCH,
             key: EDIT_PACKAGES_ENABLED,
             kind: EditKind::Bool,
             seed: Some(cfg.packages_enabled().to_string()),
             placeholder: String::new(),
         },
         EditField {
-            label: "Install ALab tools",
+            label: atpkg::adoption::INSTALLS_SWITCH,
             key: EDIT_PACKAGES_AUTO_INSTALL,
             kind: EditKind::Bool,
             seed: Some(cfg.packages_auto_install().to_string()),
@@ -6102,18 +6141,6 @@ mod edit_tests {
 
     fn set(v: &str) -> Option<String> {
         Some(v.to_string())
-    }
-
-    #[test]
-    fn dotted_matrix_rain_key_types_as_bool() {
-        assert_eq!(
-            super::edit_kind(super::EDIT_MATRIX_RAIN_ENABLED),
-            EditKind::Bool
-        );
-        assert!(matches!(
-            apply_prefs_edits("", &[(super::EDIT_MATRIX_RAIN_ENABLED, set("yes"))]),
-            Err(PrefsEditError::BadValue { .. })
-        ));
     }
 
     #[test]

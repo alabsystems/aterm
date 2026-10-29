@@ -120,7 +120,8 @@ pub fn session_bus() -> Result<Vec<Address>> {
 ///
 /// # Errors
 /// [`Error::Unsupported`] for another transport or a unix address without `path=`
-/// (or, on Linux, `abstract=`); [`Error::Timeout`] once `deadline` passes (on Linux a full
+/// (or, on Linux, `abstract=`); [`Error::Invalid`] when a unix address names more than one
+/// location key or an empty socket name; [`Error::Timeout`] once `deadline` passes (on Linux a full
 /// backlog holds the connect); [`Error::Io`] when the connect fails.
 #[cfg(unix)]
 pub fn connect(
@@ -130,18 +131,37 @@ pub fn connect(
     if address.transport != "unix" {
         return Err(Error::Unsupported("a transport other than unix"));
     }
+    let keys = u8::from(address.get("path").is_some())
+        + u8::from(address.get("abstract").is_some())
+        + u8::from(address.get("tmpdir").is_some())
+        + u8::from(address.get("dir").is_some())
+        + u8::from(address.get("runtime").is_some());
+    if keys > 1 {
+        return Err(Error::Invalid(
+            "unix address names more than one socket key",
+        ));
+    }
     #[cfg(target_os = "linux")]
     if let Some(path) = address.get("path") {
+        if path.is_empty() {
+            return Err(Error::Invalid("empty unix socket address"));
+        }
         return connect_until(path.as_bytes(), false, deadline);
     }
     #[cfg(not(target_os = "linux"))]
     if let Some(path) = address.get("path") {
+        if path.is_empty() {
+            return Err(Error::Invalid("empty unix socket address"));
+        }
         // Darwin refuses a full backlog at once; only a spent deadline is left to check.
         crate::conn::time_left(deadline)?;
         return Ok(aterm_uds::CtlStream::connect(path)?);
     }
     #[cfg(target_os = "linux")]
     if let Some(name) = address.get("abstract") {
+        if name.is_empty() {
+            return Err(Error::Invalid("empty unix socket address"));
+        }
         return connect_until(name.as_bytes(), true, deadline);
     }
     Err(Error::Unsupported(
@@ -285,6 +305,17 @@ mod tests {
             assert!(
                 matches!(connect(address, None), Err(Error::Unsupported(_))),
                 "{listen_only}"
+            );
+        }
+        for invalid in [
+            "unix:path=/a,abstract=b",
+            "unix:path=/a,tmpdir=/tmp",
+            "unix:path=",
+        ] {
+            let address = &parse(invalid).unwrap()[0];
+            assert!(
+                matches!(connect(address, None), Err(Error::Invalid(_))),
+                "{invalid}"
             );
         }
     }

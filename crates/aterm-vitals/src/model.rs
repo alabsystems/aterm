@@ -7,11 +7,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::history::{self, Filling, FreeHistory, Rates};
-use crate::peaks::{DailyMax, NET_LEARN_S, PEAK_DAYS, Peaks, PlanDay, PlanWeek, TOKENS_LEARN_S};
+use crate::peaks::{DailyMax, NET_LEARN_S, Peaks, TOKENS_LEARN_S};
 use crate::ring::{
     BUCKET_MS, BucketRing, Cell, GapKind, MultiScaleSpec, NOW_WINDOW_MS, ProgSlot, Reading, Recent,
     SLOT_GUARD_MS, SLOT_MS, ScaleCell, SlotGrid, Tiers, TimeGap, columns_of, multi_scale_cells,
-    slots_of,
 };
 use crate::trend::{History, Trend, TrendView};
 
@@ -336,6 +335,20 @@ impl MemSample {
             .saturating_add(self.compressed.unwrap_or(0))
             .min(self.total)
     }
+
+    /// Free memory plus reclaimable file cache, bounded by the physical bytes not in use.
+    /// Sparse samples that omit both classes leave this unread; unclassified bytes are excluded.
+    #[must_use]
+    pub fn available(&self) -> Option<u64> {
+        if self.total == 0 || (self.free == 0 && self.cached == 0 && self.used() < self.total) {
+            return None;
+        }
+        Some(
+            self.free
+                .saturating_add(self.cached)
+                .min(self.total.saturating_sub(self.used())),
+        )
+    }
 }
 
 /// The GPU, device-wide.
@@ -373,7 +386,13 @@ pub struct VolumeSample {
 }
 
 impl VolumeSample {
-    /// Bytes in use: capacity less what this user could still write.
+    /// Bytes in occupied blocks, excluding free blocks reserved from this user.
+    #[must_use]
+    pub fn occupied(&self) -> u64 {
+        self.total.saturating_sub(self.free)
+    }
+
+    /// Bytes unavailable to this user's writes: capacity less writable available blocks.
     #[must_use]
     pub fn used(&self) -> u64 {
         self.total.saturating_sub(self.available)
@@ -782,17 +801,6 @@ pub struct PlanFact {
     pub account: AccountIx,
 }
 
-/// One account a tab's footer read: its weekly plan figure, where it has one.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct WeekFact {
-    /// The account's key (`c-<12 hex>`).
-    pub account: String,
-    /// Whether a pane of the front tab runs under it.
-    pub front: bool,
-    /// The footer's weekly figure, on the local day it was read.
-    pub reading: Option<PlanDay>,
-}
-
 /// One sample of everything, from the host's probe thread.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Sample {
@@ -850,10 +858,6 @@ pub struct Sample {
     pub tokens: Vec<TabTokens>,
     /// The front tab's account's plan usage, while current.
     pub plan: Option<PlanFact>,
-    /// Every account the tabs' footers read, each once.
-    pub weeks: Vec<WeekFact>,
-    /// The day of [`Self::at_unix_ms`], unix days in the local zone.
-    pub local_day: u32,
     /// The thermal state, where read.
     pub thermal: Option<Thermal>,
     /// The 1, 5 and 15 minute load averages, where read.
@@ -977,9 +981,6 @@ pub struct MemView {
     pub used_gib: TrendView,
     /// Used GiB over the last two minutes.
     pub history: Vec<Option<f32>>,
-    /// The pressure over the same seconds as `history`, second for second: the worst level read
-    /// in each (a short silence filled as `history` fills it), `None` where none was read.
-    pub pressure_history: Vec<Option<Pressure>>,
     /// Paging per second; `None` until two readings with counters exist.
     pub rates: Option<MemRates>,
 }
@@ -1370,18 +1371,6 @@ impl Resource {
     pub const fn index(self) -> usize {
         self as usize
     }
-
-    /// Whether a scope's figure is in the row's own unit, and so a share of the row's capacity:
-    /// busy cores, memory, tokens per minute and processes. A scope's Disk figure is a write rate
-    /// beside the volume's used bytes, Network keeps no figure per scope, and GPU keeps one only
-    /// while client reads are held.
-    #[must_use]
-    pub const fn scope_shares_capacity(self) -> bool {
-        match self {
-            Self::Cpu | Self::Memory | Self::Tokens | Self::Processes => true,
-            Self::Gpu | Self::Disk | Self::Network => false,
-        }
-    }
 }
 
 /// Severity state of a resource row, ordered least to most severe.
@@ -1555,7 +1544,7 @@ pub struct Series {
     /// Six hours of ten-minute cells, oldest first; the last is the open one
     /// [`ResourceView::long_k`].
     pub long: Arc<[Cell]>,
-    /// Its last minute of readings, oldest first ([`ResourceView::heat_slots`]).
+    /// Its last minute of readings, oldest first ([`ResourceView::heat_multi_scale`]).
     pub recent: Arc<[Reading]>,
     /// Whether this series binds now (its share of capacity is the row's).
     pub binds: bool,
@@ -1582,10 +1571,10 @@ pub struct ResourceView {
     pub long: Arc<[Cell]>,
     /// Bucket index of the last cell in `long` (Unix seconds `[600 * long_k, 600 * long_k + 600)`).
     pub long_k: i64,
-    /// The first series' last minute of readings, oldest first ([`Self::heat_slots`]).
+    /// The first series' last minute of readings, oldest first ([`Self::heat_multi_scale`]).
     pub recent: Arc<[Reading]>,
     /// Memory's pressure, cell for cell with `ring`: the worst level read in each bucket, `None`
-    /// (hollow) where none was read; empty on every other row ([`Self::pressure_columns`]).
+    /// (hollow) where none was read; empty on every other row ([`crate::strain`]'s hour).
     pub pressure: Arc<[Option<Pressure>]>,
     /// aterm's figure.
     pub aterm: ScopeFig,
@@ -1628,33 +1617,6 @@ impl ResourceView {
         columns_of(&self.ring, self.ring_k, per_s, ncols, now_unix_ms)
     }
 
-    /// Memory's pressure in [`Self::columns`]' columns, column for column: the worst level read
-    /// in each column's buckets, `None` (hollow) where none was read or the row keeps none.
-    #[must_use]
-    pub fn pressure_columns(
-        &self,
-        per_s: u32,
-        ncols: usize,
-        now_unix_ms: i64,
-    ) -> Vec<Option<Pressure>> {
-        let cells: Vec<Cell> = self
-            .pressure
-            .iter()
-            .map(|p| {
-                let r = p.and_then(Pressure::rank).map(f64::from);
-                Cell {
-                    mean: r,
-                    max: r,
-                    over: false,
-                }
-            })
-            .collect();
-        columns_of(&cells, self.ring_k, per_s, ncols, now_unix_ms)
-            .into_iter()
-            .map(|c| c.max.map(Pressure::of_rank))
-            .collect()
-    }
-
     /// Resample the 1-hour ring into `ncols` heat columns at `per_s` seconds per column.
     #[must_use]
     pub fn heat_columns(&self, per_s: u32, ncols: usize, now_unix_ms: i64) -> Vec<HeatCell> {
@@ -1663,26 +1625,6 @@ impl ResourceView {
                 columns_of(&s.ring, self.ring_k, per_s, ncols, now_unix_ms),
                 s.capacity,
             )
-        };
-        let mut out = cells(&self.first());
-        if let Some(second) = self.second.as_ref() {
-            for (a, b) in out.iter_mut().zip(cells(second)) {
-                a.heat = larger(a.heat, b.heat);
-                a.max = larger(a.max, b.max);
-                a.over |= b.over;
-            }
-        }
-        out
-    }
-
-    /// The last `n` slots of `grid` as heat, ending at the one holding `at_ms` ([`slots_of`]
-    /// over each series' readings, an empty slot spoken for by a reading at most `cover_ms` after
-    /// the one before it), the second series merged in as in [`Self::heat_columns`]: a strip
-    /// drawn reading by reading, on the snapshot's [`Snapshot::slot_grid`].
-    #[must_use]
-    pub fn heat_slots(&self, grid: SlotGrid, n: usize, at_ms: i64, cover_ms: i64) -> Vec<HeatCell> {
-        let cells = |s: &Series| {
-            self.heat_of_columns(slots_of(&s.recent, at_ms, grid, n, cover_ms), s.capacity)
         };
         let mut out = cells(&self.first());
         if let Some(second) = self.second.as_ref() {
@@ -1881,25 +1823,10 @@ pub struct RowFacts {
     pub tokens_read_s: u32,
     /// Tokens: the plan's usage, while current.
     pub plan: Option<PlanFact>,
-    /// Tokens: the weekly plan figure's run, where an account's week is kept.
-    pub plan_week: Option<PlanRun>,
     /// Processes: running on the machine and as this user.
     pub pid_counts: (Option<u64>, Option<u64>),
     /// Processes: the limits.
     pub proc_limits: ProcLimits,
-}
-
-/// One account's weekly plan figure over the [`PEAK_DAYS`] days ending today, a point a day:
-/// the front tab's account's where a pane of it runs under one, else the account read most
-/// recently. A day with no row was not read; the day the week reset has two rows.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PlanRun {
-    /// The account's rows of those days ([`PlanWeek`]).
-    pub week: PlanWeek,
-    /// Whether it is the front tab's account.
-    pub front: bool,
-    /// Today, unix days in the local zone: the run's right end.
-    pub today: u32,
 }
 
 /// Validated build-slot occupancy from the host's slot reader.
@@ -2045,9 +1972,11 @@ pub struct Snapshot {
     /// window's alert for them was dismissed, folded or answered, so a reply offers no restart
     /// for them until a new process takes their place.
     pub services_filed: Vec<String>,
-    /// Discontinuous wall-clock intervals (sleep, crash, sampling pauses) in the last hour.
+    /// Discontinuous wall-clock intervals (sleep, crash, sampling pauses) in the last six hours
+    /// ([`STRIP_HORIZON_MS`]).
     pub time_gaps: Vec<TimeGap>,
-    /// Vertical event markers (crashes, restarts, sleep/wake, pressure spikes) in the last hour.
+    /// Vertical event markers (crashes, restarts, sleep/wake, pressure spikes) in the last six
+    /// hours ([`STRIP_HORIZON_MS`]).
     pub strip_events: Vec<StripEvent>,
 }
 
@@ -2095,27 +2024,6 @@ impl Snapshot {
             v.tab = ScopeFig::sum(&figs, &v.aterm);
         }
         v
-    }
-
-    /// Resample `fig`, a scope's figure in row `res`, into heat columns against the row's
-    /// binding capacity, the basis of the scope's share of the row; `None` where a scope's figure
-    /// is no share of the row's capacity ([`Resource::scope_shares_capacity`]).
-    #[must_use]
-    pub fn scope_heat_columns(
-        &self,
-        res: Resource,
-        fig: &ScopeFig,
-        per_s: u32,
-        ncols: usize,
-        now_unix_ms: i64,
-    ) -> Option<Vec<HeatCell>> {
-        let view = &self.resources[res.index()];
-        res.scope_shares_capacity().then(|| {
-            view.heat_of_columns(
-                fig.columns(per_s, ncols, now_unix_ms),
-                view.binding().capacity,
-            )
-        })
     }
 
     /// Normalized `[global, aterm, tab]` shares (`0.0..=1.0`, `tab <= aterm <= global`) for the
@@ -2242,12 +2150,16 @@ impl Snapshot {
             jobs.as_deref().and_then(State::of_jobs);
         if let Some(view) = jobs.as_deref() {
             for row in &view.rows {
+                if row.verdict != crate::jobs::Verdict::Exited {
+                    continue;
+                }
                 if let Some(sig_word) = row.exit.and_then(fatal_crash_signal_word) {
                     let label = format!("{} ({sig_word})", row.exe);
                     let dup = self.strip_events.iter().any(|e| {
                         e.kind == StripEventKind::Crash
                             && e.label == label
-                            && (self.at_unix_ms - e.at_unix_ms).abs() <= 60_000
+                            && awake_wall_span_ms(e.at_unix_ms, self.at_unix_ms, &self.time_gaps)
+                                <= crate::jobs::EXITED_KEEP_MS
                     });
                     if !dup {
                         self.strip_events.push(StripEvent {
@@ -2265,11 +2177,32 @@ impl Snapshot {
     /// Logical cores, where known.
     #[must_use]
     pub fn total_cores(&self) -> Option<usize> {
-        self.cpu.as_ref().map(CpuView::total)
+        self.cpu
+            .as_ref()
+            .map(CpuView::total)
+            .filter(|n| *n > 0)
+            .or_else(|| {
+                self.cpu_counter_sample
+                    .as_ref()
+                    .map(Vec::len)
+                    .filter(|n| *n > 0)
+            })
+    }
+
+    /// Current GPU hardware and counters, even when utilization was not read.
+    #[must_use]
+    pub fn gpu_sample(&self) -> Option<&GpuSample> {
+        self.facts
+            .gpu
+            .as_ref()
+            .or_else(|| self.gpu.as_ref().map(|g| &g.sample))
     }
 }
 
 fn fatal_crash_signal_word(exit: i32) -> Option<&'static str> {
+    if exit <= 128 {
+        return None;
+    }
     match exit - 128 {
         4 => Some("SIGILL"),
         5 => Some("SIGTRAP"),
@@ -2280,6 +2213,39 @@ fn fatal_crash_signal_word(exit: i32) -> Option<&'static str> {
         11 => Some("SIGSEGV"),
         _ => None,
     }
+}
+
+/// Wall-clock distance between `a` and `b` in milliseconds excluding [`GapKind::Sleep`] spans
+/// (during which monotonic job-retention clocks pause).
+fn awake_wall_span_ms<'a>(a: i64, b: i64, gaps: impl IntoIterator<Item = &'a TimeGap>) -> u64 {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let total = lo.abs_diff(hi);
+    let mut sleeps: Vec<(i64, i64)> = gaps
+        .into_iter()
+        .filter(|g| g.kind == GapKind::Sleep)
+        .filter_map(|g| {
+            let s = g.start_ms.max(lo);
+            let e = g.end_ms.min(hi);
+            (e > s).then_some((s, e))
+        })
+        .collect();
+    if sleeps.is_empty() {
+        return total;
+    }
+    sleeps.sort_unstable();
+    let mut asleep = 0_u64;
+    let (mut cur_s, mut cur_e) = sleeps[0];
+    for &(s, e) in &sleeps[1..] {
+        if s <= cur_e {
+            cur_e = cur_e.max(e);
+        } else {
+            asleep = asleep.saturating_add(cur_s.abs_diff(cur_e));
+            cur_s = s;
+            cur_e = e;
+        }
+    }
+    asleep = asleep.saturating_add(cur_s.abs_diff(cur_e));
+    total.saturating_sub(asleep)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2599,8 +2565,6 @@ pub struct Vitals {
     gpu_history: History,
     mem: Trend,
     mem_history: History,
-    /// The pressure's rank each second, beside `mem_history` ([`History::push_worst_at`]).
-    pressure_history: History,
     last_counters: Option<(u64, MemCounters)>,
     last_sweep_at: Option<u64>,
     last_cpu: HashMap<u32, (Option<u64>, u64)>,
@@ -2629,7 +2593,7 @@ pub struct Vitals {
 const SLOT_TIMES: usize = 8;
 const STRIP_HISTORY_CAP: usize = 128;
 /// How far back the strip's gaps and events are kept, ms: the Full deck's six hours.
-const STRIP_HORIZON_MS: i64 = 6 * 3_600_000;
+pub const STRIP_HORIZON_MS: i64 = 6 * 3_600_000;
 
 /// Persisted strip state across restarts and crashes (`vitals-strip.json`): an hour of 10 s
 /// buckets and six of ten-minute ones.
@@ -2641,19 +2605,19 @@ pub struct SavedStrip {
     pub clean_stop: bool,
     /// Fixed capacities learned for each [`Resource`] row.
     pub caps: [Option<f64>; 7],
-    /// Global 1-hour rings in [`Resource::ALL`] order.
+    /// Global multi-scale rings (1-hour 10 s and 6-hour 10-minute) in [`Resource::ALL`] order.
     pub rings: [crate::ring::SavedRing; 7],
-    /// Network transmit 1-hour ring.
+    /// Network transmit multi-scale ring (1-hour 10 s and 6-hour 10-minute).
     pub net_tx: crate::ring::SavedRing,
-    /// User-owned process count 1-hour ring.
+    /// User-owned process count multi-scale ring (1-hour 10 s and 6-hour 10-minute).
     pub yours: crate::ring::SavedRing,
-    /// Memory pressure rank 1-hour ring.
+    /// Memory pressure rank multi-scale ring (1-hour 10 s and 6-hour 10-minute).
     pub pressure: crate::ring::SavedRing,
-    /// aterm-scope 1-hour rings in [`Resource::ALL`] order.
+    /// aterm-scope multi-scale rings (1-hour 10 s and 6-hour 10-minute) in [`Resource::ALL`] order.
     pub aterm: [crate::ring::SavedRing; 7],
-    /// Discontinuous wall-clock intervals in the last hour.
+    /// Discontinuous wall-clock intervals in the last six hours ([`STRIP_HORIZON_MS`]).
     pub time_gaps: Vec<TimeGap>,
-    /// Vertical event markers in the last hour.
+    /// Vertical event markers in the last six hours ([`STRIP_HORIZON_MS`]).
     pub strip_events: Vec<StripEvent>,
 }
 
@@ -2705,23 +2669,44 @@ impl Vitals {
     /// with the kernel's `waketime` stamp) inside the same discontinuity span.
     pub fn record_strip_event(&mut self, event: StripEvent) {
         if event.kind == StripEventKind::Crash {
-            let same_crash_span = |a: i64, b: i64| {
-                (a - b).abs() <= 15_000
-                    || self.time_gaps.iter().any(|g| {
-                        g.kind == GapKind::Crash
-                            && a >= g.start_ms.saturating_sub(2_000)
-                            && a <= g.end_ms.saturating_add(2_000)
-                            && b >= g.start_ms.saturating_sub(2_000)
-                            && b <= g.end_ms.saturating_add(2_000)
-                    })
+            let gap_covering = |t: i64| {
+                self.time_gaps.iter().find(|g| {
+                    g.kind == GapKind::Crash
+                        && t >= g.start_ms.saturating_sub(2_000)
+                        && t < g.end_ms
+                })
             };
-            if let Some(existing) = self.strip_events.iter_mut().find(|e| {
-                e.kind == StripEventKind::Crash && same_crash_span(e.at_unix_ms, event.at_unix_ms)
-            }) {
-                if event.at_unix_ms > existing.at_unix_ms {
-                    existing.at_unix_ms = event.at_unix_ms;
+            let is_host_crash_detail =
+                |s: &str| !s.is_empty() && s != "aterm crash" && !s.contains(" (SIG");
+            let coalesces_checkpoint = |existing: &StripEvent| {
+                if existing.kind != StripEventKind::Crash
+                    || !((existing.label == "aterm crash" && is_host_crash_detail(&event.label))
+                        || (is_host_crash_detail(&existing.label) && event.label == "aterm crash"))
+                {
+                    return false;
                 }
-                if existing.label == "aterm crash" && !event.label.is_empty() {
+                let (lo, hi) = (
+                    existing.at_unix_ms.min(event.at_unix_ms),
+                    existing.at_unix_ms.max(event.at_unix_ms),
+                );
+                if self.strip_events.iter().any(|r| {
+                    r.kind == StripEventKind::Restart && r.at_unix_ms > lo && r.at_unix_ms <= hi
+                }) {
+                    return false;
+                }
+                match (
+                    gap_covering(existing.at_unix_ms),
+                    gap_covering(event.at_unix_ms),
+                ) {
+                    (Some(ga), Some(gb)) => ga == gb,
+                    (None, None) => existing.at_unix_ms.abs_diff(event.at_unix_ms) <= 15_000,
+                    (Some(_), None) | (None, Some(_)) => false,
+                }
+            };
+            if let Some(idx) = self.strip_events.iter().position(coalesces_checkpoint) {
+                let existing = &mut self.strip_events[idx];
+                if existing.label == "aterm crash" {
+                    existing.at_unix_ms = event.at_unix_ms;
                     existing.label = event.label;
                 }
                 self.strip_events
@@ -2732,7 +2717,7 @@ impl Vitals {
         }
         if event.kind == StripEventKind::SleepWake {
             let same_wake_span = |a: i64, b: i64| {
-                (a - b).abs() <= 15_000
+                a.abs_diff(b) <= 15_000
                     || self.time_gaps.iter().any(|g| {
                         g.kind == GapKind::Sleep
                             && a >= g.start_ms.saturating_sub(2_000)
@@ -2754,14 +2739,14 @@ impl Vitals {
                 return;
             }
         }
-        let tol_ms = if event.kind == StripEventKind::Restart {
+        let tol_ms: u64 = if event.kind == StripEventKind::Restart {
             5_000
         } else {
             1_500
         };
         let dup = self.strip_events.iter().any(|e| {
             e.kind == event.kind
-                && (e.at_unix_ms - event.at_unix_ms).abs() <= tol_ms
+                && e.at_unix_ms.abs_diff(event.at_unix_ms) <= tol_ms
                 && e.label == event.label
         });
         if dup {
@@ -3084,8 +3069,6 @@ impl Vitals {
             self.mem.push(used, mem_dt_s);
             self.last_mem_at = Some(s.at_ns);
             self.mem_history.push_at(Some(used), s.at_ns);
-            self.pressure_history
-                .push_worst_at(m.pressure.rank().map(f32::from), s.at_ns);
             let rates = m.counters.and_then(|now| {
                 let before = self.last_counters.replace((s.at_ns, now));
                 let (then_ns, then) = before?;
@@ -3098,17 +3081,10 @@ impl Vitals {
                 sample: m,
                 used_gib: self.mem.view(),
                 history: self.mem_history.to_vec(),
-                pressure_history: self
-                    .pressure_history
-                    .to_vec()
-                    .into_iter()
-                    .map(|r| r.map(|r| Pressure::of_rank(f64::from(r))))
-                    .collect(),
                 rates,
             })
         } else {
             self.mem_history.push_at(None, s.at_ns);
-            self.pressure_history.push_worst_at(None, s.at_ns);
             None
         };
 
@@ -3829,13 +3805,6 @@ impl Rows {
         );
         note_peak(&self.net_tx, closed_tx, &mut self.peaks.net_tx);
 
-        for week in &s.weeks {
-            if let Some(reading) = week.reading {
-                self.peaks.note_plan(&week.account, reading);
-            }
-        }
-        facts.plan_week = plan_run(&self.peaks, &s.weeks, s.local_day);
-
         let tokens = self.absorb_tokens(&s.tokens, stamp);
         let closed = self.rings[Tokens.index()].push(now, tokens.out, false);
         note_peak(&self.rings[Tokens.index()], closed, &mut self.peaks.tokens);
@@ -4293,32 +4262,6 @@ fn net_capacity(
         _ if learned => (CapBasis::Peak, None, None),
         _ => (CapBasis::Learning, None, None),
     }
-}
-
-/// The [`PlanRun`] of `peaks`' weeks on `today`.
-fn plan_run(peaks: &Peaks, weeks: &[WeekFact], today: u32) -> Option<PlanRun> {
-    let front = weeks
-        .iter()
-        .filter(|w| w.front)
-        .find_map(|w| peaks.plan.iter().find(|kept| kept.account == w.account));
-    let (week, front) = match front {
-        Some(week) => (week, true),
-        None => (peaks.plan.iter().max_by_key(|week| week.read_at())?, false),
-    };
-    let days: Vec<PlanDay> = week
-        .days
-        .iter()
-        .filter(|d| today.checked_sub(d.day).is_some_and(|age| age < PEAK_DAYS))
-        .copied()
-        .collect();
-    (!days.is_empty()).then(|| PlanRun {
-        week: PlanWeek {
-            account: week.account.clone(),
-            days,
-        },
-        front,
-        today,
-    })
 }
 
 fn disk_state(facts: Option<&DiskFacts>, filling: Option<&Filling>) -> Option<State> {
@@ -5332,11 +5275,40 @@ mod tests {
             ..MemSample::default()
         };
         assert_eq!(m.used(), 10);
+        assert_eq!(m.available(), Some(0));
         let unread = MemSample {
             compressed: None,
             ..m
         };
         assert_eq!(unread.used(), 9);
+        assert_eq!(
+            unread.available(),
+            None,
+            "sparse samples do not report free or cache"
+        );
+        let known = MemSample {
+            total: 100,
+            app: 30,
+            wired: 10,
+            compressed: Some(10),
+            free: 5,
+            cached: 15,
+            ..MemSample::default()
+        };
+        assert_eq!(
+            known.available(),
+            Some(20),
+            "the unclassified remainder is excluded"
+        );
+        let overlapping = MemSample {
+            free: u64::MAX,
+            ..known
+        };
+        assert_eq!(
+            overlapping.available(),
+            Some(50),
+            "available cannot overlap used bytes"
+        );
         assert_eq!(gib(1 << 30), 1.0);
     }
 
@@ -5587,7 +5559,6 @@ mod tests {
             net_rx: learned(50e6, NET_LEARN_S),
             net_tx: learned(1e6, NET_LEARN_S),
             tokens: learned(72_000.0, TOKENS_LEARN_S),
-            ..Peaks::default()
         });
         let mut s = Snapshot::default();
         for t in 0..6 {
@@ -5808,98 +5779,6 @@ mod tests {
     }
 
     #[test]
-    fn memory_pressure_keeps_two_minutes_second_for_second_beside_used() {
-        use Pressure::{Critical, Normal, Unknown};
-        let mut v = Vitals::new();
-        let mut s = Snapshot::default();
-        for i in 0..40u64 {
-            let p = match i {
-                5 => Some(Critical),
-                8 | 9 => Some(Unknown),
-                12..32 | 34 | 35 => None,
-                _ => Some(Normal),
-            };
-            s = v.absorb(&pressed(i * 500, 500, p.map(|p| (8, p))));
-        }
-        let m = s.mem.as_ref().expect("memory read last");
-        assert_eq!(
-            m.pressure_history.len(),
-            m.history.len(),
-            "the same seconds"
-        );
-        assert_eq!(m.pressure_history.len(), 20);
-        assert_eq!(
-            m.pressure_history[2],
-            Some(Critical),
-            "a second keeps its worst"
-        );
-        assert_eq!(
-            m.pressure_history[4], None,
-            "memory but no pressure is hollow"
-        );
-        assert!(
-            m.pressure_history[6..16].iter().all(Option::is_none),
-            "a long silence is hollow, never normal"
-        );
-        assert_eq!(
-            (m.history[17], m.pressure_history[17]),
-            (None, None),
-            "a second read without memory between two normal ones is hollow, not filled"
-        );
-        assert_eq!(m.pressure_history[19], Some(Normal));
-    }
-
-    #[test]
-    fn memory_pressure_columns_align_with_the_runs_columns() {
-        use Pressure::{Critical, Normal, Warn};
-        let level = |t: u64| match t / 10 {
-            7 => Critical,
-            18 | 19 => Warn,
-            _ => Normal,
-        };
-        // Used memory rises with the level, so the largest reading in a run's column names the
-        // worst level its buckets read: a column-for-column oracle that knows no column edge.
-        let used = |p: Pressure| match p {
-            Critical => 16,
-            Warn => 12,
-            _ => 8,
-        };
-        let worst_of = |max: Option<f64>| {
-            max.map(|b| {
-                [Critical, Warn, Normal]
-                    .into_iter()
-                    .find(|&p| b >= (used(p) << 30) as f64)
-                    .unwrap_or(Normal)
-            })
-        };
-        let mut v = Vitals::new();
-        let mut s = Snapshot::default();
-        for t in (0..400u64).filter(|t| !(250..275).contains(t)) {
-            s = v.absorb(&pressed(t * 1000, 1000, Some((used(level(t)), level(t)))));
-        }
-        let mem = &s.resources[Memory.index()];
-        assert_eq!(mem.pressure.len(), mem.ring.len(), "one level per run cell");
-        assert_eq!(mem.ring.len(), 40);
-        for (i, (cell, p)) in mem.ring.iter().zip(mem.pressure.iter()).enumerate() {
-            assert_eq!(*p, worst_of(cell.max), "cell {i}");
-        }
-        for (per, n) in [(10, 60), (20, 30), (30, 20), (60, 10), (60, 60)] {
-            let cols = mem.columns(per, n, s.at_unix_ms);
-            let worst = mem.pressure_columns(per, n, s.at_unix_ms);
-            let want: Vec<_> = cols.iter().map(|c| worst_of(c.max)).collect();
-            assert_eq!(worst, want, "{per} s columns");
-            for p in [Some(Critical), Some(Warn), Some(Normal), None] {
-                assert!(worst.contains(&p), "{per} s: {p:?} drawn");
-            }
-        }
-        assert_eq!(
-            mem.pressure_columns(10, 60, s.at_unix_ms)[45..47],
-            [None, None],
-            "250-269 s read nothing"
-        );
-    }
-
-    #[test]
     fn without_a_pressure_reading_the_pressure_run_is_hollow_never_normal() {
         let mut v = Vitals::new();
         let mut s = Snapshot::default();
@@ -5910,18 +5789,9 @@ mod tests {
         assert!(mem.ring.iter().all(|c| c.mean.is_some()), "memory is read");
         assert_eq!(mem.pressure.len(), mem.ring.len());
         assert!(mem.pressure.iter().all(Option::is_none));
-        let m = s.mem.as_ref().expect("memory");
-        assert_eq!(m.pressure_history.len(), m.history.len());
-        assert!(m.pressure_history.iter().all(Option::is_none));
         for res in Resource::ALL {
             let r = &s.resources[res.index()];
             assert!(res == Memory || r.pressure.is_empty(), "{res:?} keeps none");
-            assert!(
-                r.pressure_columns(10, 60, s.at_unix_ms)
-                    .iter()
-                    .all(Option::is_none),
-                "{res:?}"
-            );
         }
     }
 
@@ -6497,7 +6367,7 @@ mod tests {
     }
 
     #[test]
-    fn a_scope_run_and_its_share_agree() {
+    fn the_per_user_limit_binds_processes_and_a_writes_run_is_carried_raw() {
         let mut v = Vitals::new();
         let mut s = Snapshot::default();
         for i in 0..12 {
@@ -6510,14 +6380,6 @@ mod tests {
             Some(1_000.0),
             "the per-user limit binds, not the first series' system limit"
         );
-        for res in [Disk, Gpu, Network] {
-            let r = s.resource(res, &[7]);
-            assert_eq!(
-                s.scope_heat_columns(res, &r.tab, 10, 60, s.at_unix_ms),
-                None,
-                "{res:?}: a scope's figure is no share of this row"
-            );
-        }
         assert!(
             s.resource(Disk, &[7])
                 .tab
@@ -6526,20 +6388,6 @@ mod tests {
                 .any(|c| c.mean > Some(0.0)),
             "the writes run itself is carried raw"
         );
-        for res in [Cpu, Memory, Processes] {
-            let r = s.resource(res, &[7]);
-            let cap = r.binding().capacity.expect("a capacity");
-            for fig in [&r.aterm, &r.tab] {
-                let cols = s
-                    .scope_heat_columns(res, fig, 10, 60, s.at_unix_ms)
-                    .expect("a share of the row");
-                assert_eq!(cols.len(), 60);
-                let share = fig.now.expect("read") / cap;
-                let last = cols.last().and_then(|c| c.heat).map(f64::from);
-                assert!(close(last, share), "{res:?}: {last:?} vs {share}");
-                assert!(cols[..48].iter().all(|c| c.heat.is_none()), "{res:?}");
-            }
-        }
     }
 
     #[test]
@@ -6944,107 +6792,6 @@ mod tests {
         assert_eq!(read(t, vec![wired(e + 10_000_000)]).0, "en7");
     }
 
-    #[test]
-    fn the_plan_week_survives_a_restart() {
-        const DAY: u32 = 20_740;
-        let at_s = |day: u32, hour: i64| i64::from(day) * 86_400 + hour * 3_600;
-        let reading = |day: u32, hour: i64, used_x10: u16| {
-            Some(PlanDay {
-                day,
-                used_x10,
-                resets_at: at_s(DAY + 4, 0),
-                at: at_s(day, hour),
-            })
-        };
-        let week = |account: &str, front: bool, reading: Option<PlanDay>| WeekFact {
-            account: account.into(),
-            front,
-            reading,
-        };
-        let sample = |i: i64, today: u32, weeks: Vec<WeekFact>| Sample {
-            at_unix_ms: T0 + i * 1000,
-            mono_ms: u64::try_from(i).expect("a reading") * 1000,
-            cadence_ms: 1000,
-            local_day: today,
-            weeks,
-            ..Sample::default()
-        };
-        let used = |run: &PlanRun| -> (String, bool, Vec<u16>) {
-            let used = run.week.days.iter().map(|d| d.used_x10).collect();
-            (run.week.account.clone(), run.front, used)
-        };
-
-        let mut a = Vitals::new();
-        let first = a.absorb(&sample(
-            0,
-            DAY,
-            vec![week("c-b", false, reading(DAY, 10, 500))],
-        ));
-        assert_eq!(
-            first.facts.plan_week.as_ref().map(used),
-            Some(("c-b".into(), false, vec![500])),
-            "no front account: the one read last"
-        );
-        let _ = a.absorb(&sample(
-            1,
-            DAY,
-            vec![
-                week("c-a", true, reading(DAY, 11, 100)),
-                week("c-b", false, reading(DAY, 10, 500)),
-            ],
-        ));
-        let s = a.absorb(&sample(
-            2,
-            DAY + 1,
-            vec![
-                week("c-b", false, reading(DAY + 1, 10, 600)),
-                week("c-a", true, reading(DAY + 1, 11, 150)),
-            ],
-        ));
-        let run = s.facts.plan_week.expect("a run");
-        assert_eq!(used(&run), ("c-a".into(), true, vec![100, 150]));
-        assert_eq!(run.today, DAY + 1);
-        let held = a.peaks().clone();
-        let _ = a.absorb(&sample(
-            3,
-            DAY + 1,
-            vec![week("c-a", true, reading(DAY + 1, 11, 150))],
-        ));
-        assert_eq!(
-            *a.peaks(),
-            held,
-            "the same figure again leaves nothing to write"
-        );
-
-        let mut b = Vitals::new();
-        b.restore_peaks(a.peaks().clone());
-        let s = b.absorb(&sample(0, DAY + 1, Vec::new()));
-        assert_eq!(
-            s.facts.plan_week.as_ref().map(used),
-            Some(("c-a".into(), false, vec![100, 150])),
-            "after a restart, the kept week of the account read last"
-        );
-        let s = b.absorb(&sample(
-            1,
-            DAY + 1,
-            vec![week("c-a", false, None), week("c-b", true, None)],
-        ));
-        assert_eq!(
-            s.facts.plan_week.as_ref().map(used),
-            Some(("c-b".into(), true, vec![500, 600])),
-            "the front tab's account, though its footer has no figure now"
-        );
-        let s = b.absorb(&sample(2, DAY + 7, vec![week("c-b", true, None)]));
-        assert_eq!(
-            s.facts.plan_week.as_ref().map(used),
-            Some(("c-b".into(), true, vec![600])),
-            "the run is the 7 days ending today"
-        );
-        let s = b.absorb(&sample(3, DAY + 8, vec![week("c-b", true, None)]));
-        assert_eq!(s.facts.plan_week, None, "nothing read in the last 7 days");
-        assert_eq!(*b.peaks(), held, "a reading with no figure keeps nothing");
-    }
-
     /// A process of tab 7's `cargo` (pid 201), own user's, with its own start.
     fn child(pid: u32, start: u64, name: &str, written: u64) -> ProcSample {
         ProcSample {
@@ -7425,11 +7172,10 @@ mod tests {
         }
     }
 
-    /// A strip drawn reading by reading reads the snapshot's last minute of readings: each 1 s
-    /// slot holds its second's reading, the second series merges in as in the bucketed strip,
-    /// and a series not read at the snapshot's moment leaves its last slot unread.
+    /// A snapshot carries each row's last minute of readings, a reading a second in order: the
+    /// strip's finest boxes read them ([`ResourceView::heat_multi_scale`]).
     #[test]
-    fn a_snapshot_carries_its_readings_for_a_strip_slot_by_slot() {
+    fn a_snapshot_carries_its_last_minute_of_readings_in_order() {
         let mut v = Vitals::new();
         let mut s = Snapshot::default();
         for t in 0..12 {
@@ -7438,31 +7184,6 @@ mod tests {
         let gpu = &s.resources[Gpu.index()];
         assert_eq!(gpu.recent.len(), 12, "a reading a second, all kept");
         assert!(gpu.recent.windows(2).all(|w| w[0].at_ms < w[1].at_ms));
-        let slots = gpu.heat_slots(s.slot_grid, 5, s.at_unix_ms, 15_000);
-        assert!(
-            slots
-                .iter()
-                .all(|c| c.heat.is_some_and(|h| (h - 0.12).abs() < 1e-6)),
-            "{slots:?}"
-        );
-        // Network: the larger of receive and send, slot by slot, as the bucketed strip says.
-        let net = &s.resources[Network.index()];
-        let by_slot = net.heat_slots(s.slot_grid, 3, s.at_unix_ms, 15_000);
-        let by_col = net.heat_columns(10, 1, s.at_unix_ms);
-        let last = by_slot.last().and_then(|c| c.heat);
-        assert!(
-            last.zip(by_col[0].heat)
-                .is_some_and(|(a, b)| (a - b).abs() < 1e-6),
-            "{by_slot:?} {by_col:?}"
-        );
-        // The GPU unread at the next reading: its last slot is unread, never zero; the slots
-        // before it keep their readings.
-        let mut blind = at(12_000, 1000);
-        blind.gpu = None;
-        let s = v.absorb(&blind);
-        let slots = s.resources[Gpu.index()].heat_slots(s.slot_grid, 3, s.at_unix_ms, 15_000);
-        assert_eq!(slots[2].heat, None, "{slots:?}");
-        assert!(slots[..2].iter().all(|c| c.heat.is_some()), "{slots:?}");
     }
 
     #[test]
@@ -7839,5 +7560,253 @@ mod tests {
             crate::words::compact_cpu_brand("1st Gen Intel(R) Core(TM) Ultra 9 185H"),
             "Core Ultra 9 185H"
         );
+    }
+
+    #[test]
+    fn distinct_and_sleep_spanning_crashes_preserve_timestamps_and_deduplicate() {
+        use crate::jobs::{Class, Consumer, JobKind, JobRow, JobsView, Tick, Verdict};
+
+        let job_row = |id: &str, exe: &str, verdict: Verdict, exit: Option<i32>| JobRow {
+            id: id.into(),
+            tab: 1,
+            kind: JobKind::Shell,
+            consumer: Consumer::PersonFg,
+            promoted_ms: None,
+            task: None,
+            pgid: 100,
+            leader: (100, Some(1)),
+            exe: exe.into(),
+            members: 0,
+            class: Class::Exited,
+            wait: None,
+            named: None,
+            stop: None,
+            input: None,
+            cpu_mc: None,
+            zombies: None,
+            standing: None,
+            quiet_ms: None,
+            phi_milli: None,
+            mu_ms: None,
+            mu_from: None,
+            verdict,
+            no_progress: false,
+            working_descendant: None,
+            episode: 0,
+            exit,
+            tick: Tick::default(),
+        };
+
+        let apply_host_jobs = |v: &mut Vitals, snap: &mut Snapshot, rows: Vec<JobRow>| {
+            let prev = snap.strip_events.len();
+            snap.set_jobs(Some(Arc::new(JobsView {
+                rows,
+                ..JobsView::default()
+            })));
+            let added: Vec<StripEvent> = snap.strip_events[prev..].to_vec();
+            for ev in added {
+                v.record_strip_event(ev);
+            }
+        };
+
+        // 1. Two distinct crashed jobs within 15s keep both labels and exact timestamps across
+        //    the 60s retention window; non-Exited rows and negative/non-crash exit codes emit none.
+        let mut v = Vitals::new();
+        let mut s1 = v.absorb(&Sample {
+            at_unix_ms: T0 + 100_000,
+            mono_ms: 1_000,
+            cadence_ms: 1_000,
+            ..Sample::default()
+        });
+        apply_host_jobs(
+            &mut v,
+            &mut s1,
+            vec![
+                job_row("j1", "cargo", Verdict::Exited, Some(139)),
+                job_row("jlive", "live", Verdict::Fine, Some(139)),
+                job_row("jneg", "neg", Verdict::Exited, Some(i32::MIN)),
+                job_row("jzero", "zero", Verdict::Exited, Some(128)),
+            ],
+        );
+        let mut s2 = v.absorb(&Sample {
+            at_unix_ms: T0 + 103_000,
+            mono_ms: 4_000,
+            cadence_ms: 1_000,
+            ..Sample::default()
+        });
+        apply_host_jobs(
+            &mut v,
+            &mut s2,
+            vec![
+                job_row("j1", "cargo", Verdict::Exited, Some(139)),
+                job_row("j2", "node", Verdict::Exited, Some(134)),
+            ],
+        );
+        for step in 5..=60_u64 {
+            let mut st = v.absorb(&Sample {
+                at_unix_ms: T0 + 99_000 + i64::try_from(step * 1_000).unwrap(),
+                mono_ms: step * 1_000,
+                cadence_ms: 1_000,
+                ..Sample::default()
+            });
+            apply_host_jobs(
+                &mut v,
+                &mut st,
+                vec![
+                    job_row("j1", "cargo", Verdict::Exited, Some(139)),
+                    job_row("j2", "node", Verdict::Exited, Some(134)),
+                ],
+            );
+            assert_eq!(
+                st.strip_events,
+                vec![
+                    StripEvent {
+                        at_unix_ms: T0 + 100_000,
+                        kind: StripEventKind::Crash,
+                        label: "cargo (SIGSEGV)".into(),
+                    },
+                    StripEvent {
+                        at_unix_ms: T0 + 103_000,
+                        kind: StripEventKind::Crash,
+                        label: "node (SIGABRT)".into(),
+                    },
+                ],
+                "tick {step} must neither drop the second crash nor drag the first timestamp"
+            );
+        }
+
+        // 2. System sleep >60s while an exited crashed job is still <60s old monotonically does
+        //    not emit a duplicate marker on wake, until awake elapsed time passes 60s.
+        let mut v_sleep = Vitals::new();
+        let mut pre_sleep = v_sleep.absorb(&Sample {
+            at_unix_ms: T0 + 100_000,
+            mono_ms: 10_000,
+            cadence_ms: 1_000,
+            ..Sample::default()
+        });
+        apply_host_jobs(
+            &mut v_sleep,
+            &mut pre_sleep,
+            vec![job_row("j2", "node", Verdict::Exited, Some(134))],
+        );
+        let mut before_sleep = v_sleep.absorb(&Sample {
+            at_unix_ms: T0 + 140_000,
+            mono_ms: 50_000,
+            cadence_ms: 1_000,
+            ..Sample::default()
+        });
+        apply_host_jobs(
+            &mut v_sleep,
+            &mut before_sleep,
+            vec![job_row("j2", "node", Verdict::Exited, Some(134))],
+        );
+        let mut woke_sample = Sample {
+            at_unix_ms: T0 + 745_000,
+            mono_ms: 55_000,
+            cadence_ms: 1_000,
+            ..Sample::default()
+        };
+        woke_sample.timeline = Some(crate::explain::TimelineSample {
+            boot_ms: T0,
+            sleep_ms: Some(T0 + 140_000),
+            wake_ms: Some(T0 + 740_000),
+            wake_reason: None,
+        });
+        let mut s_woke = v_sleep.absorb(&woke_sample);
+        apply_host_jobs(
+            &mut v_sleep,
+            &mut s_woke,
+            vec![job_row("j2", "node", Verdict::Exited, Some(134))],
+        );
+        let node_crashes: Vec<i64> = s_woke
+            .strip_events
+            .iter()
+            .filter(|e| e.label == "node (SIGABRT)")
+            .map(|e| e.at_unix_ms)
+            .collect();
+        assert_eq!(
+            node_crashes,
+            vec![T0 + 100_000],
+            "40s of awake time across a 10m sleep must not re-emit the retained exited crash"
+        );
+        let mut s_later = v_sleep.absorb(&Sample {
+            at_unix_ms: T0 + 766_000,
+            mono_ms: 76_000,
+            cadence_ms: 1_000,
+            ..Sample::default()
+        });
+        apply_host_jobs(
+            &mut v_sleep,
+            &mut s_later,
+            vec![job_row("j3", "node", Verdict::Exited, Some(134))],
+        );
+        let node_crashes_later: Vec<i64> = s_later
+            .strip_events
+            .iter()
+            .filter(|e| e.label == "node (SIGABRT)")
+            .map(|e| e.at_unix_ms)
+            .collect();
+        assert_eq!(
+            node_crashes_later,
+            vec![T0 + 100_000, T0 + 766_000],
+            "a second crash after >60s of awake time must be recorded"
+        );
+
+        // 3. Post-relaunch job crash and rapid crash loop never overwrite a prior run's
+        //    `"aterm crash"`, and extreme i64 timestamps never overflow.
+        let mut v_relaunch = Vitals::new();
+        let _ = v_relaunch.absorb(&Sample {
+            at_unix_ms: T0 + 100_000,
+            mono_ms: 1_000,
+            cadence_ms: 1_000,
+            ..Sample::default()
+        });
+        let dirty1 = v_relaunch.saved_strip(false);
+        let mut run2 = Vitals::new();
+        run2.restore_strip_history(dirty1, T0 + 105_000);
+        run2.record_strip_event(StripEvent {
+            at_unix_ms: T0 + 105_500,
+            kind: StripEventKind::Crash,
+            label: "cargo (SIGSEGV)".into(),
+        });
+        let crash_labels: Vec<(&str, i64)> = run2
+            .strip_events
+            .iter()
+            .filter(|e| e.kind == StripEventKind::Crash)
+            .map(|e| (e.label.as_str(), e.at_unix_ms))
+            .collect();
+        assert_eq!(
+            crash_labels,
+            vec![
+                ("aterm crash", T0 + 100_000),
+                ("cargo (SIGSEGV)", T0 + 105_500),
+            ],
+            "post-relaunch job crash must not overwrite prior run's checkpoint crash"
+        );
+        let dirty2 = run2.saved_strip(false);
+        let mut run3 = Vitals::new();
+        run3.restore_strip_history(dirty2, T0 + 112_000);
+        let loop_crashes: Vec<(&str, i64)> = run3
+            .strip_events
+            .iter()
+            .filter(|e| e.kind == StripEventKind::Crash && e.label == "aterm crash")
+            .map(|e| (e.label.as_str(), e.at_unix_ms))
+            .collect();
+        assert_eq!(
+            loop_crashes,
+            vec![("aterm crash", T0 + 100_000), ("aterm crash", T0 + 105_000)],
+            "rapid crash loop across disjoint Crash gaps must keep both checkpoint crashes"
+        );
+
+        run3.record_strip_event(StripEvent {
+            at_unix_ms: i64::MIN,
+            kind: StripEventKind::Crash,
+            label: "extreme (SIGSEGV)".into(),
+        });
+        run3.record_strip_event(StripEvent {
+            at_unix_ms: i64::MAX,
+            kind: StripEventKind::Crash,
+            label: "extreme (SIGSEGV)".into(),
+        });
     }
 }

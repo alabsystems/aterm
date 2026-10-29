@@ -241,7 +241,8 @@ enum Until {
 }
 
 /// Wait until `hit` answers (the guest epoch ms of what the row waits for), setup is done, setup
-/// stood still a minute, or [`WATCH`] passed.
+/// stood still a minute with nothing new from the person or in the app's processes, or [`WATCH`]
+/// passed.
 fn wait_for(g: &Guest, mut hit: impl FnMut() -> Result<Option<u64>, Fail>) -> Result<Until, Fail> {
     let mut stall = Stall::new(STALL_MS);
     let started = Instant::now();

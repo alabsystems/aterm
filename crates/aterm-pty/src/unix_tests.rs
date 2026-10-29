@@ -1137,9 +1137,9 @@ fn wait_readable_briefly_wakes_when_a_fifos_last_writer_closes() {
     );
 }
 
-/// With `$TMPDIR` unset the status FIFO goes in `/tmp`, not where `std::env::temp_dir`
-/// would put it (std asks `confstr`, which [`exec_status_fifo_dir`] avoids); a set one
-/// is used as given, ending in one `/`.
+/// With `$TMPDIR` unset or empty the status FIFO goes in `/tmp/`, not where
+/// `std::env::temp_dir` would put it (std asks `confstr`, which [`exec_status_fifo_dir`]
+/// avoids); a non-empty one is normalized to end in exactly one `/`.
 #[cfg(target_os = "macos")]
 #[test]
 fn an_unset_tmpdir_puts_the_status_fifo_in_tmp() {
@@ -1147,9 +1147,11 @@ fn an_unset_tmpdir_puts_the_status_fifo_in_tmp() {
         String::from_utf8(fifo_dir_in(tmpdir.map(Into::into))).expect("UTF-8 in, UTF-8 out")
     };
     assert_eq!(dir(None), "/tmp/");
+    assert_eq!(dir(Some("")), "/tmp/");
     assert_eq!(dir(Some("/var/x")), "/var/x/");
     assert_eq!(dir(Some("/var/x/")), "/var/x/");
-    assert_eq!(dir(Some("")), "/");
+    assert_eq!(dir(Some("/var/x///")), "/var/x/");
+    assert_eq!(dir(Some("///")), "/");
 }
 
 #[test]
@@ -1643,88 +1645,145 @@ fn is_utf8_locale_classifies_codeset() {
     }
 }
 
-#[test]
-fn spawn_locale_conformance_child_always_utf8_ctype() {
+fn child_effective_ctype_utf8(env: &[(std::ffi::OsString, std::ffi::OsString)]) -> bool {
+    let get = |k: &str| {
+        env.iter()
+            .find(|(ek, _)| ek.to_str() == Some(k))
+            .map(|(_, v)| v.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+    };
+    get("LC_ALL")
+        .or_else(|| get("LC_CTYPE"))
+        .or_else(|| get("LANG"))
+        .is_some_and(|loc| {
+            let base = loc.split('@').next().unwrap_or("").to_ascii_lowercase();
+            base.ends_with(".utf-8") || base.ends_with(".utf8")
+        })
+}
+
+fn spawn_locale_state(
+    present: i64,
+    eff_utf8: i64,
+    ctype: i64,
+    resolved: i64,
+) -> aterm_spec::interp::State {
+    aterm_spec::interp::State::from([
+        ("present", present),
+        ("eff_utf8", eff_utf8),
+        ("ctype", ctype),
+        ("resolved", resolved),
+    ])
+}
+
+fn assert_spawn_locale_negative_control(model: &aterm_spec::derive::Model) {
+    use aterm_spec::verify::validate_transition_tiered;
     use std::ffi::OsString;
 
-    #[derive(Clone, Copy)]
-    enum Cls {
-        Unset,
-        Empty,
-        NonUtf8,
-        Utf8,
-    }
-    let val = |c: Cls| match c {
-        Cls::Unset => None,
-        Cls::Empty => Some(""),
-        Cls::NonUtf8 => Some("C"),
-        Cls::Utf8 => Some("en_US.UTF-8"),
-    };
-    let looks_utf8 = |s: &str| {
-        let lo = s.to_ascii_lowercase();
-        lo.ends_with(".utf-8") || lo.ends_with(".utf8")
-    };
-    let child_ctype_utf8 = |env: &[(OsString, OsString)]| -> bool {
-        let get = |k: &str| {
-            env.iter()
-                .find(|(ek, _)| ek.to_str() == Some(k))
-                .map(|(_, v)| v.to_string_lossy().into_owned())
-                .filter(|s| !s.is_empty())
-        };
-        match get("LC_ALL")
-            .or_else(|| get("LC_CTYPE"))
-            .or_else(|| get("LANG"))
-        {
-            None => false,
-            Some(loc) => looks_utf8(&loc),
-        }
-    };
+    // Negative control: unpatched LC_CTYPE=C leaves child non-UTF-8; the committed model rejects it while Buggy=1 accepts it.
+    let bad_child = build_child_env(
+        [(OsString::from("LC_CTYPE"), OsString::from("C"))].into_iter(),
+        &[],
+    );
+    let bad_post = spawn_locale_state(1, 0, i64::from(child_effective_ctype_utf8(&bad_child)), 1);
+    let non_utf8_obs = spawn_locale_state(1, 0, 0, 0);
+    let (bad_ok, _) = validate_transition_tiered(
+        model,
+        &[],
+        &non_utf8_obs,
+        &bad_post,
+        Some("Resolve"),
+        "spawn locale negative",
+    );
+    assert!(!bad_ok);
+    let (buggy_ok, why) = validate_transition_tiered(
+        model,
+        &[("Buggy", 1)],
+        &non_utf8_obs,
+        &bad_post,
+        Some("Resolve"),
+        "spawn locale buggy",
+    );
+    assert!(buggy_ok, "{why}");
+    assert!(!model.check_invariant("ChildHasUtf8Ctype", &bad_post));
+}
 
-    let classes = [Cls::Unset, Cls::Empty, Cls::NonUtf8, Cls::Utf8];
-    for &a in &classes {
-        for &c in &classes {
-            for &l in &classes {
-                let mut inherited: Vec<(OsString, OsString)> =
-                    vec![(OsString::from("PATH"), OsString::from("/usr/bin"))];
-                for (k, cl) in [("LC_ALL", a), ("LC_CTYPE", c), ("LANG", l)] {
-                    if let Some(v) = val(cl) {
-                        inherited.push((OsString::from(k), OsString::from(v)));
+#[test]
+fn spawn_locale_conformance_child_always_utf8_ctype() {
+    use aterm_spec::interp::State;
+    use aterm_spec::verify::validate_transition_tiered;
+    use std::collections::BTreeSet;
+    use std::ffi::OsString;
+
+    let vals: [Option<&'static str>; 5] = [
+        None,
+        Some(""),
+        Some("C"),
+        Some("en_US.UTF-8"),
+        Some("de_DE.UTF-8@euro"),
+    ];
+    let looks_utf8 = |s: &str| {
+        let base = s.split('@').next().unwrap_or("").to_ascii_lowercase();
+        base.ends_with(".utf-8") || base.ends_with(".utf8")
+    };
+    let model = aterm_models_session::spawn_locale_model();
+    let init = spawn_locale_state(0, 0, 0, 0);
+    let mut steps: BTreeSet<(State, &'static str, State)> = BTreeSet::new();
+    for a in vals {
+        for c in vals {
+            for l in vals {
+                let mut inherited = vec![(OsString::from("PATH"), OsString::from("/usr/bin"))];
+                for (k, v) in [("LC_ALL", a), ("LC_CTYPE", c), ("LANG", l)] {
+                    if let Some(s) = v {
+                        inherited.push((OsString::from(k), OsString::from(s)));
                     }
                 }
-
-                let overrides = resolve_spawn_locale(val(a), val(c), val(l));
-
-                let ne = |cl: Cls| val(cl).filter(|s| !s.is_empty());
-                let orig_utf8 = ne(a).or(ne(c)).or(ne(l)).map(looks_utf8).unwrap_or(false);
-
-                assert_eq!(
-                    overrides.is_empty(),
-                    orig_utf8,
-                    "overrides emptiness must track already-UTF-8 for (LC_ALL,LC_CTYPE,LANG)=({:?},{:?},{:?})",
-                    val(a),
-                    val(c),
-                    val(l)
-                );
-
-                if matches!(a, Cls::NonUtf8) {
-                    assert!(
-                        overrides.iter().any(|(k, v)| k == "LC_ALL" && v.is_empty()),
-                        "non-UTF-8 LC_ALL must be neutralized; got {overrides:?}"
-                    );
+                let overrides = resolve_spawn_locale(a, c, l);
+                let ne = |v: Option<&'static str>| v.filter(|s| !s.is_empty());
+                let eff = ne(a).or(ne(c)).or(ne(l));
+                let orig_utf8 = eff.is_some_and(looks_utf8);
+                assert_eq!(overrides.is_empty(), orig_utf8);
+                if a == Some("C") {
+                    assert!(overrides.iter().any(|(k, v)| k == "LC_ALL" && v.is_empty()));
                 }
-
                 let child = build_child_env(inherited.into_iter(), &overrides);
-                assert!(
-                    child_ctype_utf8(&child),
-                    "child LC_CTYPE NOT UTF-8 for inherited (LC_ALL,LC_CTYPE,LANG)=({:?},{:?},{:?}); env={:?}",
-                    val(a),
-                    val(c),
-                    val(l),
-                    child
+                let ok = child_effective_ctype_utf8(&child);
+                assert!(ok, "child env={child:?}");
+                let obs = match eff {
+                    None => init.clone(),
+                    Some(_) if orig_utf8 => {
+                        let s1 = spawn_locale_state(1, 1, 0, 0);
+                        steps.insert((init.clone(), "ObserveUtf8", s1.clone()));
+                        s1
+                    }
+                    Some(_) => {
+                        let s1 = spawn_locale_state(1, 0, 0, 0);
+                        steps.insert((init.clone(), "ObserveNonUtf8", s1.clone()));
+                        s1
+                    }
+                };
+                let post = spawn_locale_state(
+                    i64::from(eff.is_some()),
+                    i64::from(orig_utf8),
+                    i64::from(ok),
+                    1,
                 );
+                steps.insert((obs, "Resolve", post.clone()));
+                assert!(model.check_invariant("ChildHasUtf8Ctype", &post));
             }
         }
     }
+    for (before, action, after) in &steps {
+        let (ok, why) = validate_transition_tiered(
+            &model,
+            &[],
+            before,
+            after,
+            Some(action),
+            "spawn locale conformance",
+        );
+        assert!(ok, "{action}: {why}");
+    }
+    assert_spawn_locale_negative_control(&model);
 }
 
 #[test]

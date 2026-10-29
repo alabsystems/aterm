@@ -124,8 +124,10 @@ impl Record {
     }
 }
 
-/// A current, secrets-backed membership observation and its journal lock. Verified
-/// historical handles live only for this locked session; no raw keys are saved.
+/// A current, secrets-backed membership observation. [`Session::open`] holds the
+/// control journal's writer lock for the session, so no control change lands
+/// mid-batch; [`Session::observe`] reads without it and grants no table writing.
+/// Verified historical handles live only for this session; no raw keys are saved.
 pub struct Session<'a> {
     bootstrap: &'a Bootstrap,
     journal: Journal,
@@ -133,7 +135,40 @@ pub struct Session<'a> {
     history: std::cell::RefCell<std::collections::BTreeMap<Digest, Historical>>,
 }
 impl<'a> Session<'a> {
+    pub(crate) fn has_control_writer(&self) -> bool {
+        self.journal.is_writer()
+    }
+
+    pub(crate) const fn is_log_backed(&self) -> bool {
+        self.access.is_log_backed()
+    }
+
+    pub(crate) fn historical_writer_in(&self, roster: &Digest, actor: &Actor) -> bool {
+        if !self.history.borrow().contains_key(roster) {
+            let Ok(history) = self
+                .bootstrap
+                .historical(&self.journal, &self.access, *roster)
+            else {
+                return false;
+            };
+            self.history.borrow_mut().insert(*roster, history);
+        }
+        self.history.borrow()[roster]
+            .members()
+            .iter()
+            .any(|m| m.binding().actor() == *actor && m.role() == Role::Writer)
+    }
+
     pub(crate) fn observation(&self) -> Result<[u8; 64]> {
+        if self.access.is_log_backed() {
+            if !self.access.is_current(&self.journal) {
+                return Err(Error::new("table repair needs current Commons membership"));
+            }
+            let mut observation = [0; 64];
+            observation[..32].copy_from_slice(self.access.head());
+            observation[32..].copy_from_slice(self.access.basis());
+            return Ok(observation);
+        }
         let aterm_secrets::commons::journal::State::Ready { head, .. } = self.journal.state()
         else {
             return Err(Error::new("table repair needs complete control history"));
@@ -142,6 +177,26 @@ impl<'a> Session<'a> {
         observation[..32].copy_from_slice(&head);
         observation[32..].copy_from_slice(self.access.basis());
         Ok(observation)
+    }
+
+    /// Every current member's binding, for an application that names who has answered.
+    pub(crate) fn members(&self) -> Vec<aterm_secrets::commons::binding::Binding> {
+        self.access
+            .members()
+            .iter()
+            .map(|member| member.binding().clone())
+            .collect()
+    }
+
+    /// Share this batch's validated control context with a detached endpoint
+    /// constructor. A caller must release the session before network I/O.
+    pub(crate) fn control_context(&self) -> Result<(&Bootstrap, &Journal)> {
+        if !self.access.is_current(&self.journal) {
+            return Err(Error::new(
+                "Commons membership changed during endpoint setup",
+            ));
+        }
+        Ok((self.bootstrap, &self.journal))
     }
 
     /// Current peer membership for an already channel-authenticated actor.
@@ -164,26 +219,35 @@ impl<'a> Session<'a> {
         after: Option<Digest>,
         limit: usize,
     ) -> Result<(Vec<Digest>, Option<Digest>)> {
-        let aterm_secrets::commons::journal::State::Ready { head, .. } = self.journal.state()
-        else {
-            return Err(Error::new("table repair needs complete control history"));
-        };
-        let mut selected = std::collections::BTreeSet::new();
-        let mut cursor = Some(head);
-        for _ in 0..aterm_secrets::commons::journal::MAX_NODES {
-            let Some(id) = cursor else { break };
-            let node = self
-                .journal
-                .node(&id)
-                .ok_or_else(|| Error::new("selected control node is missing"))?;
-            if node.has_payload() {
-                selected.insert(id);
-            }
-            cursor = node.selected().or_else(|| node.parents().first().copied());
-        }
-        if cursor.is_some() {
-            return Err(Error::new("selected history exceeds its bound"));
-        }
+        let selected: std::collections::BTreeSet<Digest> =
+            if let aterm_secrets::commons::journal::State::Ready { head, .. } = self.journal.state()
+            {
+                let mut set = std::collections::BTreeSet::new();
+                let mut cursor = Some(head);
+                for _ in 0..aterm_secrets::commons::journal::MAX_NODES {
+                    let Some(id) = cursor else { break };
+                    let node = self
+                        .journal
+                        .node(&id)
+                        .ok_or_else(|| Error::new("selected control node is missing"))?;
+                    if node.has_payload() {
+                        set.insert(id);
+                    }
+                    cursor = node.selected().or_else(|| node.parents().first().copied());
+                }
+                if cursor.is_some() {
+                    return Err(Error::new("selected history exceeds its bound"));
+                }
+                set
+            } else if self.access.is_log_backed() {
+                self.journal
+                    .inventory()
+                    .copied()
+                    .filter(|id| self.journal.retained_payload_node(*id))
+                    .collect()
+            } else {
+                return Err(Error::new("table repair needs complete control history"));
+            };
         let window: Vec<_> = selected
             .iter()
             .filter(|id| after.is_none_or(|after| **id > after))
@@ -234,6 +298,57 @@ impl<'a> Session<'a> {
     pub fn open(bootstrap: &'a Bootstrap) -> Result<Self> {
         let journal =
             Journal::open_existing(bootstrap.journal_dir(), bootstrap.trust()).map_err(failure)?;
+        Self::from_admitted_journal(bootstrap, journal)
+    }
+
+    /// Open a fresh, locked authorization batch, allowing another local writer
+    /// to finish until `deadline`. Replay and current membership checks run only
+    /// after acquiring the lock. Share the deadline with bootstrap admission.
+    pub fn open_until(bootstrap: &'a Bootstrap, deadline: std::time::Instant) -> Result<Self> {
+        let journal =
+            Journal::open_existing_until(bootstrap.journal_dir(), bootstrap.trust(), deadline)
+                .map_err(failure)?;
+        Self::from_admitted_journal(bootstrap, journal)
+    }
+
+    /// Authorize a local batch using the fresh, exclusively locked journal from
+    /// [`Bootstrap::cached_with_journal_until`]. This consumes that same lock
+    /// without another open or replay, rechecks the exact source and immutable
+    /// custody, and derives current membership from the admitted history.
+    /// A journal from another custody directory is refused even with equal trust.
+    /// Drop this session before network I/O.
+    pub fn from_admitted_journal(bootstrap: &'a Bootstrap, journal: Journal) -> Result<Self> {
+        if journal.directory() != bootstrap.journal_dir() {
+            return Err(Error::new(
+                "Commons session journal belongs to another custody directory",
+            ));
+        }
+        if !journal.is_writer() {
+            return Err(Error::new(
+                "Commons admitted session requires its exclusive writer",
+            ));
+        }
+        bootstrap.revalidate_custody().map_err(failure)?;
+        Self::from_journal(bootstrap, journal)
+    }
+
+    /// Observe existing custody through a read-only control view, so another
+    /// journal writer is no obstacle. The same authorization checks run on the
+    /// acknowledged prefix. Stores opened through this session refuse mutations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when existing control history, authenticated custody or
+    /// current membership cannot be validated, including missing or unready
+    /// local membership.
+    pub fn observe(bootstrap: &'a Bootstrap) -> Result<Self> {
+        let journal =
+            Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust()).map_err(failure)?;
+        bootstrap.revalidate_custody().map_err(failure)?;
+        Self::from_journal(bootstrap, journal)
+    }
+
+    fn from_journal(bootstrap: &'a Bootstrap, journal: Journal) -> Result<Self> {
         let access = bootstrap
             .access_in(&journal)
             .map_err(failure)?
@@ -269,11 +384,22 @@ impl<'a> Session<'a> {
         let Action::Prepare(preparation) = &decision.request().action else {
             return Err(Error::new("account is stopped"));
         };
+        let control_valid = if self.access.is_log_backed() {
+            decision.control() == *self.access.head()
+                || decision.control() == *self.access.basis()
+                || self.historical_writer_in(&decision.control(), &preparation.device.actor())
+                || matches!(
+                    self.journal.state(),
+                    aterm_secrets::commons::journal::State::Ready { head, .. }
+                        if self.journal.selected_ancestor(decision.control(), head)
+                )
+        } else {
+            self.journal
+                .selected_ancestor(decision.control(), *self.access.head())
+        };
         if decision.trust() != self.journal.trust()
             || preparation.device != *self.access.local().binding()
-            || !self
-                .journal
-                .selected_ancestor(decision.control(), *self.access.head())
+            || !control_valid
         {
             return Err(Error::new(
                 "account preparation has stale control or another device",
@@ -296,8 +422,21 @@ impl<'a> Session<'a> {
         }
         Ok(())
     }
-    pub(crate) fn writer(&self) -> Result<()> {
+    /// Whether the current membership grants this device table writing: [`Self::writer`]'s role
+    /// and currency, without the journal writer lock a read does not hold.
+    pub(crate) fn may_write(&self) -> Result<()> {
         if self.access.local().role() != Role::Writer || !self.access.is_current(&self.journal) {
+            return Err(Error::new(
+                "current Commons membership does not grant table writing",
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn writer(&self) -> Result<()> {
+        if !self.journal.is_writer()
+            || self.access.local().role() != Role::Writer
+            || !self.access.is_current(&self.journal)
+        {
             return Err(Error::new(
                 "current Commons membership does not grant table writing",
             ));
@@ -655,6 +794,14 @@ impl<'w> Envelope<'w> {
             body,
         })
     }
+}
+
+pub(crate) fn envelope_roster(wire: &[u8]) -> Option<Digest> {
+    if wire.get(..5) != Some(b"ACTO1") {
+        return None;
+    }
+    wire.get(5 + SCOPE_LEN..37 + SCOPE_LEN)
+        .and_then(|s| s.try_into().ok())
 }
 
 fn check_shape(header: Header) -> Result<()> {

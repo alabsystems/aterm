@@ -207,10 +207,12 @@ __aterm_body_check() {
 
 # Permanent PROMPT_COMMAND entry point. Captures `$?`, `$_`, and `$-` while
 # silencing xtrace/verbose, raises `__aterm_in_prompt_cmd` before checking for
-# a body reload so the DEBUG trap ignores sourced body lines, and restores flags.
+# a body reload so the DEBUG trap ignores sourced body lines, ends the command
+# (its D, before the body check can run a program), and restores flags.
 __aterm_prompt_command() {
     { local __aterm_status=$? __aterm_lastarg=$_ __aterm_flags=$-; set +xv; } 2>/dev/null
     __aterm_in_prompt_cmd=1
+    ! declare -F __aterm_end_command >/dev/null || __aterm_end_command "$__aterm_status"
     __aterm_body_check
     __aterm_body_prompt_command "$__aterm_status" "$__aterm_flags" "$__aterm_lastarg"
     case $__aterm_flags in *v*) set -v ;; esac
@@ -298,15 +300,25 @@ __aterm_path_front() {
 # `__aterm_managed_reroute_on`) so the per-prompt hot path avoids `-d` stats in
 # the steady state.
 __aterm_managed_want=""
+__aterm_managed_bin_on=0
 __aterm_managed_agents_on=0
 __aterm_managed_reroute_on=0
 __aterm_reroute_path_front() {
     __aterm_managed_want=""
+    __aterm_managed_bin_on=0
     __aterm_managed_agents_on=0
     __aterm_managed_reroute_on=0
+    local __aterm_bin_dir="${ATPKG_BIN:-}" __aterm_ag_dir="${ATPKG_AGENTS:-}"
+    __aterm_bin_dir="${__aterm_bin_dir%/}"
+    __aterm_ag_dir="${__aterm_ag_dir%/}"
+    if [[ -n "$__aterm_ag_dir" && -n "$__aterm_bin_dir" && "${__aterm_bin_dir%/*}" == "${__aterm_ag_dir%/*}" && -d "$ATPKG_BIN" ]]; then
+        __aterm_path_front "$ATPKG_BIN"
+        __aterm_managed_want="$ATPKG_BIN"
+        __aterm_managed_bin_on=1
+    fi
     if [[ -n "${ATPKG_AGENTS:-}" && -d "$ATPKG_AGENTS" ]]; then
         __aterm_path_front "$ATPKG_AGENTS"
-        __aterm_managed_want="$ATPKG_AGENTS"
+        __aterm_managed_want="$ATPKG_AGENTS${__aterm_managed_want:+:$__aterm_managed_want}"
         __aterm_managed_agents_on=1
     fi
     if [[ -n "${ATERM_REROUTE_DIR:-}" && -d "$ATERM_REROUTE_DIR" ]]; then
@@ -316,6 +328,18 @@ __aterm_reroute_path_front() {
     fi
 }
 __aterm_reroute_path_front
+
+# Export `EDITOR=$ATERM_DEFAULT_EDITOR` (aterm's own editor, amacs) only when
+# neither `EDITOR` nor `VISUAL` is set once the startup files have run and the
+# word names a program on PATH; drop the hint either way, so no child inherits
+# it. The loader wiring calls it once, on a fresh load.
+__aterm_default_editor() {
+    local __aterm_word="${ATERM_DEFAULT_EDITOR-}"
+    unset ATERM_DEFAULT_EDITOR
+    [[ -n "$__aterm_word" && -z "${EDITOR-}" && -z "${VISUAL-}" ]] || return 0
+    type -P "$__aterm_word" >/dev/null 2>&1 || return 0
+    export EDITOR="$__aterm_word"
+}
 
 # ─── Live managed PATH updates ───
 #
@@ -390,7 +414,12 @@ __aterm_managed_path_live() {
         fi
     fi
     # 2. Re-probe any managed dir that was previously absent.
-    local __aterm_refront=0
+    local __aterm_refront=0 __aterm_bin_dir="${ATPKG_BIN:-}" __aterm_ag_dir="${ATPKG_AGENTS:-}"
+    __aterm_bin_dir="${__aterm_bin_dir%/}"
+    __aterm_ag_dir="${__aterm_ag_dir%/}"
+    if (( ! __aterm_managed_bin_on )) && [[ -n "$__aterm_ag_dir" && -n "$__aterm_bin_dir" && "${__aterm_bin_dir%/*}" == "${__aterm_ag_dir%/*}" && -d "$ATPKG_BIN" ]]; then
+        __aterm_refront=1
+    fi
     if (( ! __aterm_managed_agents_on )) && [[ -n "${ATPKG_AGENTS:-}" && -d "$ATPKG_AGENTS" ]]; then
         __aterm_refront=1
     fi
@@ -417,8 +446,8 @@ __aterm_managed_path_live() {
         esac
     fi
     # 4. Evict cached paths for managed agent binaries so new twins resolve immediately.
-    if (( __aterm_managed_agents_on )); then
-        hash -d claude codex codex-old agy muse grok kimi 2>/dev/null || :
+    if (( __aterm_managed_agents_on || __aterm_managed_bin_on )); then
+        hash -d claude codex codex-old agy muse grok kimi git gh 2>/dev/null || :
     fi
     return 0
 }
@@ -451,15 +480,23 @@ __aterm_osc() {
     fi
 }
 
-# Check for a new nonce written to `$__aterm_rekey_path`.
-__aterm_rekey_check() {
+# Take a new nonce written to `$__aterm_rekey_path` with builtins alone, leaving
+# the file: a command's D, signed with it, comes before any program runs.
+__aterm_rekey_take() {
     [[ -n "$__aterm_rekey_path" && -f "$__aterm_rekey_path" ]] || return 0
     local key=""
     { IFS= read -r key < "$__aterm_rekey_path"; } 2>/dev/null
-    command rm -f -- "$__aterm_rekey_path"
     [[ ${#key} -eq 64 && "$key" != *[!0-9a-f]* ]] || return 0
     __aterm_shell_nonce="$key"
     __aterm_id_suffix_str=";id=${key}"
+}
+
+# Check for a new nonce written to `$__aterm_rekey_path`, then remove the file
+# (a program: only once the command's D is written).
+__aterm_rekey_check() {
+    [[ -n "$__aterm_rekey_path" && -f "$__aterm_rekey_path" ]] || return 0
+    __aterm_rekey_take
+    command rm -f -- "$__aterm_rekey_path"
 }
 
 # Capability-nonce suffix helper for external callers; internal emitters use
@@ -618,6 +655,64 @@ __aterm_prompt_end_last() {
     PROMPT_COMMAND+=(__aterm_prompt_end)
 }
 
+# Keep aterm's trampoline the first thing PROMPT_COMMAND runs, as the shell's
+# start made it, so a command's D comes before every user prompt hook's program
+# (zsh's `__aterm_hooks_order` does the same for `precmd_functions`). A hook put
+# ahead of it after the integration loaded (`PROMPT_COMMAND="hook;$PROMPT_COMMAND"`,
+# as zoxide's and direnv's init write it, which a re-sourced ~/.bashrc runs
+# again, or an array element before it on bash 5.1+) moves behind it from the
+# next prompt on, keeping its order among the user's hooks: into the chained
+# command for a scalar PROMPT_COMMAND, into the elements after the trampoline for
+# an array. Called once this prompt ran its hooks, so none runs twice. Text that
+# is not whole commands by itself (no `;` or newline between it and the
+# trampoline's name, or a side bash cannot parse alone) is left where it is.
+__aterm_pc_first() {
+    [[ "${PROMPT_COMMAND-}" != __aterm_prompt_command* ]] || return 0
+    local __aterm_e=${PROMPT_COMMAND-} __aterm_pre __aterm_post __aterm_i __aterm_k= __aterm_nb=0
+    local __aterm_before __aterm_after
+    if __aterm_pc_more; then
+        __aterm_before=()
+        __aterm_after=()
+        for __aterm_i in "${!PROMPT_COMMAND[@]}"; do
+            if [[ -n "$__aterm_k" ]]; then
+                __aterm_after+=("${PROMPT_COMMAND[__aterm_i]}")
+            elif [[ "${PROMPT_COMMAND[__aterm_i]}" == *__aterm_prompt_command* ]]; then
+                __aterm_k=$__aterm_i
+                __aterm_e=${PROMPT_COMMAND[__aterm_i]}
+            else
+                __aterm_before+=("${PROMPT_COMMAND[__aterm_i]}")
+                __aterm_nb=1
+            fi
+        done
+        [[ -n "$__aterm_k" ]] || return 0
+    elif (( ${__aterm_prompt_cmd_is_array:-0} )) || [[ "$__aterm_e" != *__aterm_prompt_command* ]]; then
+        return 0
+    fi
+    __aterm_pre=${__aterm_e%%__aterm_prompt_command*}
+    __aterm_post=${__aterm_e#*__aterm_prompt_command}
+    __aterm_e=$__aterm_pre
+    while [[ "$__aterm_e" == *[[:blank:]] ]]; do __aterm_e=${__aterm_e%?}; done
+    [[ -n "$__aterm_e" ]] || (( __aterm_nb )) || return 0
+    [[ -z "$__aterm_e" || "$__aterm_e" == *[\;$'\n'] ]] || return 0
+    while [[ "$__aterm_post" == [[:blank:]]* ]]; do __aterm_post=${__aterm_post#?}; done
+    [[ -z "$__aterm_post" || "$__aterm_post" == [\;$'\n']* ]] || return 0
+    # Each side must be whole commands by itself (`{ hook; __aterm_prompt_command; }` is
+    # not): bash parses each, never running it, as a function's body.
+    local __aterm_nl=$'\n'
+    eval "__aterm_pc_probe() { ${__aterm_pre}:${__aterm_nl}}" 2>/dev/null &&
+        eval "__aterm_pc_probe() { :${__aterm_nl}${__aterm_post#?}${__aterm_nl}}" 2>/dev/null ||
+        return 0
+    unset -f __aterm_pc_probe
+    if [[ -n "$__aterm_k" ]]; then
+        [[ -z "$__aterm_e" ]] || __aterm_before+=("$__aterm_pre")
+        [[ -z "${__aterm_post#?}" ]] || __aterm_before+=("${__aterm_post#?}")
+        PROMPT_COMMAND=("__aterm_prompt_command" "${__aterm_before[@]}" "${__aterm_after[@]}")
+    else
+        __aterm_original_prompt_command="${__aterm_pre}${__aterm_original_prompt_command-}"
+        PROMPT_COMMAND="__aterm_prompt_command${__aterm_post}"
+    fi
+}
+
 # Convert POSIX path `$1` to its Windows form in `__aterm_win_cwd_to` (cached by
 # `__aterm_win_cwd_from`).
 __aterm_win_cwd() {
@@ -679,6 +774,19 @@ __aterm_mark_exec_start() {
 __aterm_mark_exec_finish() {
     __aterm_osc "133;D;${1}${__aterm_id_suffix_str}"
     __aterm_last_command=""
+}
+
+# End the running command once: take a pending re-key (builtins alone), then
+# write its D. A command's D must come before anything of aterm's or the user's
+# can run a program (the re-key file's and body pointer's `rm`, the tty repair's
+# `stty`, the user's PROMPT_COMMAND), for a program heard after D is never the
+# command's. The permanent trampoline calls this before its body check; the
+# body's PROMPT_COMMAND handler calls it for a trampoline that predates it. Only
+# the first call writes.
+__aterm_end_command() {
+    [[ -n "$__aterm_last_command" ]] || return 0
+    __aterm_rekey_take
+    __aterm_mark_exec_finish "$1"
 }
 
 # Backslash-hex encode semicolons, backslashes, and bytes <= 0x20 for OSC 633;E
@@ -885,6 +993,8 @@ __aterm_body_prompt_command() {
     __aterm_hist_seen=
     __aterm_prompt_end_armed=0
 
+    __aterm_end_command "$last_status"
+
     if [[ -n "${__aterm_start_pending:-}" ]]; then
         unset __aterm_start_pending
         if [[ "${__aterm_spare_mode:-}" == warm ]]; then
@@ -900,10 +1010,6 @@ __aterm_body_prompt_command() {
     __aterm_line_t0=
 
     __aterm_managed_path_live
-
-    if [[ -n "$__aterm_last_command" ]]; then
-        __aterm_mark_exec_finish $last_status
-    fi
 
     __aterm_report_cwd
 
@@ -978,6 +1084,7 @@ __aterm_body_prompt_command() {
     elif [[ "${PROMPT_COMMAND-}" == __aterm_prompt_command ]]; then
         __aterm_hist_mark_take
     fi
+    __aterm_pc_first
     (( __aterm_prompt_end_armed )) || __aterm_in_prompt_cmd=0
     [[ -n ${2+x} ]] || __aterm_flags_put "$__aterm_flags"
 }
@@ -1080,6 +1187,12 @@ fi
 
 if (( __aterm_fresh_load )); then
     __aterm_setup_keybindings 2>/dev/null
+fi
+
+# bash reads this file after ~/.bashrc (or the profile chain), so a person's own
+# EDITOR or VISUAL is already set by now.
+if (( __aterm_fresh_load )); then
+    __aterm_default_editor
 fi
 
 # Capture the DEBUG trap set by user startup files for chaining.

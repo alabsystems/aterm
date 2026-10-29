@@ -15,8 +15,8 @@ use aterm_net::fleet::{
     FleetError, FleetOp, FleetScope, FleetSecret, KEY_FILE, NodeIdentity, NodeKey, client_handshake,
 };
 use aterm_net::fleet_member::{
-    BookRead, BookUnread, Keyring, Registration, Target, Unregistered, Via, dial, fetch_book,
-    read_node_identity, read_peers, read_whole, register_by,
+    BookRead, BookUnread, DEFAULT_PORT, Keyring, Registration, Target, Unregistered, Via, dial,
+    fetch_book, read_node_identity, read_peers, read_whole, register_by,
 };
 
 use crate::headless_boot::{self, Instance, POLL_GAP, boot_session, ctl, ctl_ok, field, status};
@@ -52,6 +52,24 @@ fn fleet_table(port: u16, allow: &str) -> String {
 
 const RETRY_MS: &str = "100";
 
+// The dev seams that set how long a verb's read of its issuer's book, a local `hold off`'s proof
+// of a holder, each listener's TLS and proofs, a `peers` read whose every listener must answer
+// ([`peers_answered`]) and a survey whose every peer must answer ([`survey_answered`]) wait. Each
+// issuer a verb here reads and each dialer of a listener is an aterm (or this test) on this
+// machine that serves, each holder a `hold off` proves serves or is refused at once, and so do
+// each listener a [`peers_answered`] read dials (with the aterm here whose status it asks, which
+// answers or runs nowhere) and each peer a [`survey_answered`] read dials, so each answer comes or
+// ends however loaded the machine is: each is given the hang detector (a survey's peer read twice
+// it, [`survey_answered`]), not the 3 s a person's verb or a listener allows nor the 10 s a
+// survey's `--timeout` allows at most. The peers here that answer nothing (a held silent port, a
+// stopped aterm) are read under each verb's own wait (its `--timeout`, or the one it keeps), which
+// these seams do not reach: no [`peers_answered`] or [`survey_answered`] read meets one.
+const ISSUER_WITHIN_SEAM: &str = "ATERM_DEBUG_FLEET_ISSUER_WITHIN_MS";
+const PEER_WITHIN_SEAM: &str = "ATERM_DEBUG_FLEET_PEER_WITHIN_MS";
+const SURVEY_WITHIN_SEAM: &str = "ATERM_DEBUG_FLEET_SURVEY_WITHIN_MS";
+const HOLDER_SEAM: &str = "ATERM_DEBUG_FLEET_HOLDER_WITHIN_MS";
+const HANDSHAKE_SEAM: &str = "ATERM_DEBUG_FLEET_HANDSHAKE_MS";
+
 #[expect(
     clippy::disallowed_types,
     reason = "headless_boot::boot_with's hook, on the binary under test it isolates"
@@ -64,7 +82,11 @@ fn boot_world(
     headless_boot::boot_with(
         prefix,
         |tmp, cmd| {
-            cmd.env(aterm_net::loopback::SEAM, "1");
+            let hang = HANG.as_millis().to_string();
+            cmd.env(aterm_net::loopback::SEAM, "1")
+                .env(ISSUER_WITHIN_SEAM, &hang)
+                .env(HOLDER_SEAM, &hang)
+                .env(HANDSHAKE_SEAM, &hang);
             configure(tmp, cmd);
         },
         ready,
@@ -363,6 +385,10 @@ impl Drop for World {
 }
 
 fn fleet(root: &Path, args: &[&str], stdin: Option<&str>) -> Output {
+    fleet_with(root, args, stdin, &[])
+}
+
+fn fleet_with(root: &Path, args: &[&str], stdin: Option<&str>, env: &[(&str, &str)]) -> Output {
     let aterm = crate::launch_isolation::aterm_executable();
     #[expect(
         clippy::disallowed_types,
@@ -380,7 +406,9 @@ fn fleet(root: &Path, args: &[&str], stdin: Option<&str>) -> Output {
         .stderr(Stdio::piped());
     crate::launch_isolation::apply(&mut cmd, root);
     cmd.env("ATERM_STATE_HOME", root.join("state"))
-        .env(aterm_net::loopback::SEAM, "1");
+        .env(aterm_net::loopback::SEAM, "1")
+        .env(ISSUER_WITHIN_SEAM, HANG.as_millis().to_string())
+        .envs(env.iter().copied());
     let mut child = cmd.spawn().expect("spawn aterm fleet");
     if let Some(text) = stdin {
         let mut pipe = child.stdin.take().expect("its stdin");
@@ -395,6 +423,19 @@ fn ctl_in(root: &Path, args: &[&str]) -> Output {
 }
 
 fn ctl_fed(root: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
+    ctl_with(root, args, stdin, &[])
+}
+
+/// `aterm ctl survey` (`args`) where every peer the survey dials serves or refuses at once, so
+/// each answers or ends: each peer's read waits twice the hang detector
+/// ([`SURVEY_WITHIN_SEAM`]), so a `--host` read's copy of the issuer's book, which takes half the
+/// survey's bound, waits the detector, and the command's own wait ([`HANG`]) is the one bound.
+fn survey_answered(root: &Path, args: &[&str]) -> Output {
+    let twice = (2 * HANG).as_millis().to_string();
+    ctl_with(root, args, None, &[(SURVEY_WITHIN_SEAM, &twice)])
+}
+
+fn ctl_with(root: &Path, args: &[&str], stdin: Option<&[u8]>, env: &[(&str, &str)]) -> Output {
     headless_boot::until_served(|| {
         let aterm = crate::launch_isolation::aterm_executable();
         #[expect(
@@ -409,7 +450,9 @@ fn ctl_fed(root: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
             .stderr(Stdio::piped());
         crate::launch_isolation::apply(&mut cmd, root);
         cmd.env("ATERM_STATE_HOME", root.join("state"))
-            .env(aterm_net::loopback::SEAM, "1");
+            .env(aterm_net::loopback::SEAM, "1")
+            .env(ISSUER_WITHIN_SEAM, HANG.as_millis().to_string())
+            .envs(env.iter().copied());
         let mut child = cmd.spawn().expect("spawn aterm ctl");
         if let Some(bytes) = stdin {
             let mut pipe = child.stdin.take().expect("its stdin");
@@ -420,8 +463,33 @@ fn ctl_fed(root: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
     })
 }
 
+/// Where the aterm under `root` listens (its `[fleet] listen`): the member a join names with
+/// `--at`, since a join code names none (`docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1, F17).
+fn listen_of(root: &Path) -> String {
+    let cfg = std::fs::read_to_string(root.join("cfg/aterm/aterm.toml")).expect("its config");
+    cfg.lines()
+        .find_map(|line| line.trim().strip_prefix("listen = \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect("a [fleet] listen")
+        .to_owned()
+}
+
 fn fleet_ok(root: &Path, args: &[&str], stdin: Option<&str>) -> String {
-    let out = fleet(root, args, stdin);
+    succeeded(args, fleet(root, args, stdin))
+}
+
+/// `aterm fleet peers` where every listener the read dials serves or refuses at once, and the
+/// aterm here (whose `status` `peers` asks within the same bound) answers or runs nowhere, so each
+/// answers or ends: the read waits the hang detector ([`PEER_WITHIN_SEAM`]), not the 3 s it keeps.
+fn peers_answered(root: &Path) -> String {
+    let hang = HANG.as_millis().to_string();
+    succeeded(
+        &["peers"],
+        fleet_with(root, &["peers"], None, &[(PEER_WITHIN_SEAM, &hang)]),
+    )
+}
+
+fn succeeded(args: &[&str], out: Output) -> String {
     assert!(
         out.status.success(),
         "aterm fleet {args:?} failed: stdout={:?} stderr={:?}",
@@ -429,6 +497,16 @@ fn fleet_ok(root: &Path, args: &[&str], stdin: Option<&str>) -> String {
         String::from_utf8_lossy(&out.stderr),
     );
     String::from_utf8(out.stdout).expect("utf-8")
+}
+
+/// The binary is no Cargo test binary, so a host named with no port is at [`DEFAULT_PORT`], where
+/// another Mac's fleet listens unless told otherwise: only a test binary holds a port in its place.
+#[test]
+fn the_binary_places_a_host_named_with_no_port_at_the_default_port() {
+    let world = World(headless_boot::scratch_root("afdp"));
+    let added = fleet_ok(&world.0, &["peers", "add", "lab-maxi"], None);
+    let want = format!("aterm fleet peers: added lab-maxi:{DEFAULT_PORT} to ");
+    assert!(added.starts_with(&want), "{added}");
 }
 
 #[test]
@@ -485,7 +563,15 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
     let member_port = member_port.to_string();
     fleet_ok(
         &member.0,
-        &["join", "--host", "127.0.0.1", "--port", &member_port],
+        &[
+            "join",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &member_port,
+            "--at",
+            &listen_of(&inst.tmp),
+        ],
         Some(&code),
     );
     let node = std::fs::read_to_string(member.0.join("state/fleet-node")).expect("a node id");
@@ -533,7 +619,7 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
         unreached.contains(&format!("127.0.0.1:{member_port}")),
         "{issuer_view}"
     );
-    let member_view = fleet_ok(&member.0, &["peers", "--timeout", "10"], None);
+    let member_view = peers_answered(&member.0);
     let row = member_view
         .lines()
         .find(|line| line.split_whitespace().nth(1) == Some("issuer"))
@@ -554,7 +640,15 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
         |tmp, cmd| {
             fleet_ok(
                 tmp,
-                &["join", "--port", &other_port_word, "--host", "127.0.0.1"],
+                &[
+                    "join",
+                    "--port",
+                    &other_port_word,
+                    "--host",
+                    "127.0.0.1",
+                    "--at",
+                    &listen_of(&inst.tmp),
+                ],
                 Some(&code),
             );
             cmd.env("ATERM_STATE_HOME", tmp.join("state")).args([
@@ -635,6 +729,7 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
             port: 7100,
             version: "0.106.0".to_owned(),
             key: Some(taker.key()),
+            signed: None,
         },
         Instant::now() + HANG,
     );
@@ -651,8 +746,13 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
     );
     let members = book_of(other_port, other_node, Some(other_key));
     assert!(
-        matches!(&members, Err(BookUnread::NoBook { node: Some(said), .. }) if said == other_node),
-        "{members:?}"
+        matches!(&members, Ok(book) if book.node == other_node && book.proven
+            && book.peers.iter().any(|peer| peer.node.as_deref() == Some(other_node)
+                && peer.key == Some(other_key) && peer.signature_holds())
+            && book.peers.iter().any(|peer| peer.node.as_deref() == Some(issuer_node)
+                && peer.key == Some(issuer_key))),
+        "a member serves its book as the issuer does (F17): its own signed entry, and the \
+         issuer it joined through: {members:?}"
     );
 
     let own_book = read_peers(&member.0.join("state")).expect("the member's book");
@@ -700,7 +800,7 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
         );
     };
     add(closed_port);
-    let read = ctl_in(&member.0, &["survey", "--fleet", "--timeout", "10"]);
+    let read = survey_answered(&member.0, &["survey", "--fleet"]);
     let text = String::from_utf8_lossy(&read.stdout);
     assert!(read.status.success(), "{read:?}");
     let rows: Vec<&str> = text.lines().filter(|l| l.starts_with("== ")).collect();
@@ -752,7 +852,9 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
         copy.lines()
             .any(|line| line.contains(&format!("node={other_node}"))
                 && line.contains(&format!("port={other_port}"))
-                && line.ends_with(" via=issuer-book")),
+                && line
+                    .split_whitespace()
+                    .any(|word| word == "via=issuer-book")),
         "the member keeps a copy of the issuer's entry: {copy}"
     );
     let book =
@@ -774,7 +876,8 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
     let text = String::from_utf8_lossy(&read.stdout);
     assert_ne!(refused, reason(&text, silent_port), "{text}");
 
-    let ambiguous = ctl_in(&member.0, &["survey", "--host", "127.0.0.1"]);
+    // The issuer's book says which members the word names, and the issuer serves: it must answer.
+    let ambiguous = survey_answered(&member.0, &["survey", "--host", "127.0.0.1"]);
     assert_eq!(ambiguous.status.code(), Some(1), "{ambiguous:?}");
     assert!(ambiguous.stdout.is_empty(), "{ambiguous:?}");
     let named = String::from_utf8_lossy(&ambiguous.stderr);
@@ -789,15 +892,9 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
             "each peer the word names, a hand entry among them: {ambiguous:?}"
         );
     }
-    let one = ctl_in(
+    let one = survey_answered(
         &member.0,
-        &[
-            "survey",
-            "--host",
-            &format!("127.0.0.1:{port}"),
-            "--timeout",
-            "10",
-        ],
+        &["survey", "--host", &format!("127.0.0.1:{port}")],
     );
     let text = String::from_utf8_lossy(&one.stdout);
     assert!(one.status.success(), "{one:?}");
@@ -913,6 +1010,8 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
             "127.0.0.1",
             "--port",
             &stranger_port.to_string(),
+            "--at",
+            &listen_of(&issuer.tmp),
         ],
         Some(&code),
     );
@@ -926,7 +1025,15 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
         |tmp, cmd| {
             fleet_ok(
                 tmp,
-                &["join", "--host", "127.0.0.1", "--port", &member_port_word],
+                &[
+                    "join",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    &member_port_word,
+                    "--at",
+                    &listen_of(&issuer.tmp),
+                ],
                 Some(&code),
             );
             allowed = fleet_ok(tmp, &["allow", "drive", "--from", &issuer_node], None);
@@ -1104,12 +1211,14 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
         "the driving Mac reads the driven Mac's refusal: {grok:?}"
     );
 
-    fleet_ok(&stranger.0, &["peers", "--timeout", "10"], None);
-    fleet_ok(&member.tmp, &["peers", "--timeout", "10"], None);
+    peers_answered(&stranger.0);
+    peers_answered(&member.tmp);
     let refused = drive_refused(&stranger.0, &target, &[&at, "status"]);
     assert!(
-        refused.contains("ERR denied: node ")
-            && refused.contains("is not one the dialled Mac lets drive it"),
+        refused.contains(&format!(
+            "{}node ",
+            aterm_types::control_verbs::DRIVE_UNGRANTED
+        )) && refused.contains("is not one the dialled Mac lets drive it"),
         "{refused}"
     );
 
@@ -1124,18 +1233,27 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
         "{local:?}"
     );
     drive_ok(&issuer.tmp, &target, &[&at, "send", "x"]);
-    let holds_read = || {
-        let read = ctl_in(
-            &issuer.tmp,
-            &["survey", "--fleet", "--json", "--timeout", "10"],
-        );
-        let text: String = String::from_utf8_lossy(&read.stdout)
-            .split_whitespace()
-            .collect();
-        text.contains(&format!("\"held_from\":\"{issuer_node}\""))
+    // The worker's `held_from` word in the issuer's survey: the member's row must answer and list
+    // the worker, so a row that did not answer fails here rather than reading as no hold.
+    let held_from = || {
+        let read = survey_answered(&issuer.tmp, &["survey", "--fleet", "--json"]);
+        assert!(read.status.success(), "{read:?}");
+        let text = String::from_utf8_lossy(&read.stdout);
+        let hosts: aterm_json::Value =
+            aterm_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"));
+        hosts
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|host| host.get("sessions")?.as_array())
+            .flatten()
+            .find(|row| row.get("sid").and_then(aterm_json::Value::as_str) == Some(worker.as_str()))
+            .and_then(|row| row.get("held_from")?.as_str().map(str::to_owned))
+            .unwrap_or_else(|| panic!("the member's row lists the worker: {text}"))
     };
-    assert!(
-        holds_read(),
+    assert_eq!(
+        held_from(),
+        issuer_node,
         "the member's row names the node that holds it"
     );
 
@@ -1152,8 +1270,9 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
     ctl_ok(&member, &["invoke", "HandBack"]);
     let free = status(&member, &worker);
     assert_eq!(field(&free, "hold_by"), Some("-"), "{free}");
-    assert!(
-        !holds_read(),
+    assert_eq!(
+        held_from(),
+        "-",
         "a hold the person took is no longer the issuer's"
     );
     ctl_ok(&member, &[&at, "send", "y"]);
@@ -1174,6 +1293,9 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
 }
 
 const NEVER_MS: &str = "600000";
+
+/// A member's heartbeat period where a test waits on what one brings.
+const BEAT_MS: &str = "1000";
 
 const UNLOADABLE: &str = "font_px = \"not a number\"\n";
 
@@ -1197,6 +1319,15 @@ fn hold_ends(inst: &Instance, sid: &str) {
 }
 
 fn driven_pair(tags: (&str, &str)) -> (Instance, Instance, String, String) {
+    driven_pair_beating(tags, None)
+}
+
+/// [`driven_pair`], the member's heartbeat every `beat_ms` (`ATERM_DEBUG_FLEET_HEARTBEAT_MS`)
+/// where one is named.
+fn driven_pair_beating(
+    tags: (&str, &str),
+    beat_ms: Option<&str>,
+) -> (Instance, Instance, String, String) {
     let (holder, port) = hold_a_port();
     drop(holder);
     let port_word = port.to_string();
@@ -1231,7 +1362,15 @@ fn driven_pair(tags: (&str, &str)) -> (Instance, Instance, String, String) {
         |tmp, cmd| {
             fleet_ok(
                 tmp,
-                &["join", "--host", "127.0.0.1", "--port", &member_port_word],
+                &[
+                    "join",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    &member_port_word,
+                    "--at",
+                    &listen_of(&issuer.tmp),
+                ],
                 Some(&code),
             );
             fleet_ok(tmp, &["allow", "drive", "--from", &issuer_node], None);
@@ -1239,6 +1378,9 @@ fn driven_pair(tags: (&str, &str)) -> (Instance, Instance, String, String) {
                 .env("ATERM_DEBUG_FLEET_RETRY_MS", RETRY_MS)
                 .env("ATERM_DEBUG_FLEET_LIFETIME_MS", NEVER_MS)
                 .args(["--lines", "24", "--columns", "80"]);
+            if let Some(ms) = beat_ms {
+                cmd.env("ATERM_DEBUG_FLEET_HEARTBEAT_MS", ms);
+            }
         },
         |_| true,
     );
@@ -1293,6 +1435,8 @@ fn a_grant_written_while_a_drive_is_open_cuts_it_only_once_it_takes_its_grant_aw
             "127.0.0.1",
             "--port",
             &third_port.to_string(),
+            "--at",
+            &listen_of(&issuer.tmp),
         ],
         Some(&code),
     );
@@ -1348,7 +1492,7 @@ fn a_grant_written_while_a_drive_is_open_cuts_it_only_once_it_takes_its_grant_aw
 
 #[test]
 fn an_all_member_grant_lets_every_member_drive_and_keeps_the_holds_they_take() {
-    let (issuer, member, worker, target) = driven_pair(("afai", "afam"));
+    let (issuer, member, worker, target) = driven_pair_beating(("afai", "afam"), Some(BEAT_MS));
     let code = std::fs::read_to_string(issuer.tmp.join("state/fleet-join-code")).expect("a code");
     let third = World(headless_boot::scratch_root("afat"));
     let (holder, third_port) = hold_a_port();
@@ -1361,8 +1505,24 @@ fn an_all_member_grant_lets_every_member_drive_and_keeps_the_holds_they_take() {
             "127.0.0.1",
             "--port",
             &third_port.to_string(),
+            "--at",
+            &listen_of(&issuer.tmp),
         ],
         Some(&code),
+    );
+    let third_node =
+        std::fs::read_to_string(third.0.join("state/fleet-node")).expect("its node id");
+    let third_node = third_node.trim().to_owned();
+    // No drive reads the issuer's book again (F17): the member binds the third Mac once its
+    // heartbeat makes the issuer's answer its copy of that book.
+    let bound = aterm_spec::wait::within(HANG, POLL_GAP, || {
+        Keyring::read(&member.tmp.join("state"))
+            .bound(&third_node)
+            .map(|_| ())
+    });
+    assert!(
+        bound.is_some(),
+        "the member's heartbeat never bound the third Mac"
     );
     fleet_ok(&member.tmp, &["allow", "content"], None);
     let all = fleet_ok(&member.tmp, &["allow", "drive", "--all"], None);
@@ -1387,6 +1547,40 @@ fn an_all_member_grant_lets_every_member_drive_and_keeps_the_holds_they_take() {
     );
     let (off, _) = drive_ok(&issuer.tmp, &target, &["hold", &worker, "off"]);
     assert_eq!(off.trim(), "OK hold=0", "{off}");
+
+    let (took, _) = drive_ok(&third.0, &target, &["hold", &worker, "on"]);
+    assert_eq!(took.trim(), "OK hold=1", "{took}");
+    let local = ctl(&member, &[&at, "send", "x"]);
+    let said = String::from_utf8_lossy(&local.stderr);
+    assert!(
+        local.status.code() == Some(1)
+            && said.contains(&format!(
+                "`aterm fleet peers rm {third_node}` on the fleet's issuer"
+            ))
+            && !said.contains(&format!("`aterm fleet peers rm {third_node}` there")),
+        "under the \"*\" grant the refusal names only the issuer's rm: {said}"
+    );
+    fleet_ok(&issuer.tmp, &["peers", "rm", &third_node], None);
+    peers_answered(&member.tmp);
+    // F17 also records signed entries learned from a member's book in this Mac's own book.
+    // Removing it at the issuer clears the copy, but this Mac must remove its local binding.
+    fleet_ok(&member.tmp, &["peers", "rm", &third_node], None);
+    let member_state = member.tmp.join("state");
+    let issuer_node =
+        std::fs::read_to_string(issuer.tmp.join("state/fleet-node")).expect("the issuer node id");
+    let own_has_third = read_peers(&member_state)
+        .expect("the member's book")
+        .iter()
+        .any(|peer| peer.node.as_deref() == Some(third_node.as_str()));
+    let copy_has_third =
+        aterm_net::fleet_member::read_issuer_book(&member_state, issuer_node.trim())
+            .iter()
+            .any(|peer| peer.node.as_deref() == Some(third_node.as_str()));
+    assert!(
+        !own_has_third && !copy_has_third,
+        "removal from both books must leave no member binding: own={own_has_third} copy={copy_has_third}"
+    );
+    hold_ends(&member, &worker);
 }
 
 #[test]
@@ -1464,7 +1658,15 @@ fn a_local_hold_off_keeps_a_hold_its_node_may_still_drive_and_lifts_one_it_may_n
         |tmp, cmd| {
             fleet_ok(
                 tmp,
-                &["join", "--host", "127.0.0.1", "--port", &member_port_word],
+                &[
+                    "join",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    &member_port_word,
+                    "--at",
+                    &listen_of(&held.tmp),
+                ],
                 Some(&code),
             );
             cmd.env("ATERM_STATE_HOME", tmp.join("state"))
@@ -1608,7 +1810,7 @@ fn nothing_listening_here_is_told_as_the_aterm_here_stands() {
 
     fleet_reads(&inst, &sid, "off");
     let head = |listed: String| listed.lines().next().unwrap_or_default().to_owned();
-    let off = head(fleet_ok(&inst.tmp, &["peers"], None));
+    let off = head(peers_answered(&inst.tmp));
     assert!(
         off.contains(&format!(
             "([fleet] listen is {place} and allow is facts, but nothing listens on {place} just \
@@ -1626,7 +1828,7 @@ fn nothing_listening_here_is_told_as_the_aterm_here_stands() {
     std::fs::write(inst.tmp.join("cfg-here/aterm/aterm.toml"), &bogus)
         .expect("write the aterm's own config");
     fleet_reads(&inst, &sid, "refused:allow");
-    let refused = head(fleet_ok(&inst.tmp, &["peers"], None));
+    let refused = head(peers_answered(&inst.tmp));
     assert!(
         refused.contains(&format!(
             "([fleet] listen is {place} and allow is facts, but nothing listens on {place} just \
@@ -1641,7 +1843,7 @@ fn nothing_listening_here_is_told_as_the_aterm_here_stands() {
         .expect("write the aterm's own config");
     fleet_reads(&inst, &sid, "listening");
     std::fs::write(&config, &bogus).expect("write the verbs' config");
-    let proved = head(fleet_ok(&inst.tmp, &["peers"], None));
+    let proved = head(peers_answered(&inst.tmp));
     std::fs::write(&config, &valid).expect("write the verbs' config");
     assert!(
         proved.contains(&format!(

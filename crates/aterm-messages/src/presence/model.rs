@@ -259,6 +259,9 @@ pub struct Facts<V: Host> {
     pub shell: Option<(&'static str, Instant)>,
     /// The program's own state report (OSC 7501) the host honours now.
     pub program: Option<(&'static str, Instant)>,
+    /// The context the program in front has left, in per cent, as it counts it itself (codex's
+    /// rollout), shown beside [`Self::program`] where its reader names no phase.
+    pub program_ctx_left: Option<u8>,
     /// The sequence number of the host's agent reading.
     pub agent_seq: u64,
     /// The agent reading at `agent_seq`.
@@ -299,6 +302,7 @@ impl<V: Host> Default for Facts<V> {
             attention: None,
             shell: None,
             program: None,
+            program_ctx_left: None,
             agent_seq: 0,
             agent: None,
             hand: Hand::None,
@@ -392,6 +396,8 @@ pub struct Slot<V: Host> {
     pub shell: Option<(&'static str, Instant)>,
     /// [`Facts::program`].
     pub program: Option<(&'static str, Instant)>,
+    /// [`Facts::program_ctx_left`].
+    pub program_ctx_left: Option<u8>,
     /// [`Facts::agent`].
     pub agent: Option<AgentReading<V>>,
     /// When the agent phase word last changed.
@@ -449,6 +455,7 @@ impl<V: Host> Slot<V> {
             attention: None,
             shell: None,
             program: None,
+            program_ctx_left: None,
             agent: None,
             agent_since: now,
             hand: Hand::None,
@@ -544,6 +551,10 @@ impl<V: Host> Slot<V> {
             changed = true;
         }
         self.program = facts.program;
+        if self.program_ctx_left != facts.program_ctx_left {
+            self.program_ctx_left = facts.program_ctx_left;
+            changed = true;
+        }
         if facts.agent_seq > self.agent_seq_seen.unwrap_or(0) {
             self.agent_seq_seen = Some(facts.agent_seq);
             let agent = facts.agent;

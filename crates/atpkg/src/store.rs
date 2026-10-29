@@ -242,6 +242,22 @@ impl Layout {
         self.prefix.join("declined")
     }
 
+    /// `units-off`: the durable "this machine shares no toolset archive on the LAN" marker
+    /// `aterm pkg serve-units --off` writes and `--on` removes ([`crate::peers`]).
+    #[inline]
+    #[must_use]
+    pub fn units_off(&self) -> PathBuf {
+        self.prefix.join("units-off")
+    }
+
+    /// `units-serving`: where a server of this store's units listens, and its pid, while it
+    /// serves ([`crate::peers::serving`]).
+    #[inline]
+    #[must_use]
+    pub fn units_serving(&self) -> PathBuf {
+        self.prefix.join("units-serving")
+    }
+
     /// `retired/`: per-program retirement markers.
     #[inline]
     #[must_use]
@@ -1616,13 +1632,21 @@ pub fn vet_prefix(configured: Option<&Path>, home: &Path) -> PathBuf {
             return default;
         }
         if !caller_can_use_prefix(p) {
-            crate::notice::say_once(&format!(
-                "configured prefix {} is not writable by this user — using the default {} \
-                 instead (set [packages].prefix only for a shared multi-user store this user \
-                 can write)",
-                p.display(),
-                default.display()
-            ));
+            // A host's log keeps the configured path by its length: it is the person's
+            // aterm.toml (`[packages].prefix`).
+            let said = p.display().to_string();
+            let notice = |prefix: &dyn std::fmt::Display| {
+                format!(
+                    "configured prefix {prefix} is not writable by this user — using the default \
+                     {} instead (set [packages].prefix only for a shared multi-user store this \
+                     user can write)",
+                    default.display()
+                )
+            };
+            crate::notice::say_once_with_log(
+                &notice(&said),
+                &notice(&aterm_log::words::Len(&said)),
+            );
             return default;
         }
         return p.to_path_buf();
@@ -1716,7 +1740,6 @@ const SENSITIVE_SHIMS: &[&str] = &[
     "ssh",
     "scp",
     "sshd",
-    "git",
     "env",
     "sudo_askpass",
     "doas",
@@ -1915,6 +1938,21 @@ pub fn append_bin_to_path(inherited: Option<&OsStr>, bin_dir: &Path) -> OsString
     };
     if !dirs.iter().any(|d| d == bin_dir) {
         dirs.push(bin_dir.to_path_buf());
+    }
+    std::env::join_paths(&dirs)
+        .unwrap_or_else(|_| inherited.map(OsStr::to_os_string).unwrap_or_default())
+}
+
+/// Move `bin_dir` to the front of `inherited` `PATH`, appearing once so managed tools (`git`,
+/// `gh`) resolve ahead of `/usr/bin` inside an `aterm` session even when an outer shell appended
+/// `bin_dir` last.
+#[must_use]
+pub fn prepend_bin_to_path(inherited: Option<&OsStr>, bin_dir: &Path) -> OsString {
+    let mut dirs = vec![bin_dir.to_path_buf()];
+    if let Some(p) = inherited
+        && !p.is_empty()
+    {
+        dirs.extend(std::env::split_paths(p).filter(|d| d != bin_dir));
     }
     std::env::join_paths(&dirs)
         .unwrap_or_else(|_| inherited.map(OsStr::to_os_string).unwrap_or_default())
@@ -2403,6 +2441,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// A configured prefix aterm cannot write is said whole on stderr and logged by its length
+    /// in a host's aterm.log: the path is the person's aterm.toml (DESIGN §3.6).
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_prefix_reaches_a_hosts_log_by_its_length() {
+        use std::os::unix::fs::MetadataExt as _;
+        let home = temp_home("unwritable-log");
+        let Ok(meta) = std::fs::symlink_metadata("/usr/lib") else {
+            aterm_uds::host::could_not_run("no /usr/lib here to stand in as a system chain");
+        };
+        let prefix = Path::new("/usr/lib/QZP7E7J6-prefix");
+        if meta.uid() != 0 || meta.mode() & 0o022 != 0 || caller_can_use_prefix(prefix) {
+            aterm_uds::host::could_not_run(
+                "/usr/lib here is not a root-owned chain this user cannot write",
+            );
+        }
+        let len = prefix.as_os_str().len();
+        let host = crate::notice::heard::while_running(crate::notice::Sink::HostLog, || {
+            assert_eq!(vet_prefix(Some(prefix), &home), default_prefix(&home));
+        });
+        assert!(host.stderr.is_empty(), "a host's notice reached stderr");
+        assert!(
+            host.log
+                .iter()
+                .any(|line| line.starts_with(&format!("configured prefix {len}B is not writable"))),
+            "the line is logged with the path's length: {} lines",
+            host.log.len()
+        );
+        assert!(
+            !host.log.iter().any(|line| line.contains("QZP7E7J")),
+            "a host's log keeps the configured path"
+        );
+        // CONTROL: a verb's stderr still says the path whole (said once per process, so a path
+        // of its own).
+        let other = Path::new("/usr/lib/QZP7E7J7-prefix");
+        let verb = crate::notice::heard::while_running(crate::notice::Sink::Stderr, || {
+            assert_eq!(vet_prefix(Some(other), &home), default_prefix(&home));
+        });
+        assert!(
+            verb.stderr.contains("QZP7E7J7-prefix"),
+            "stderr says the path"
+        );
+        assert!(verb.log.is_empty(), "a verb's notice is not logged");
+    }
+
     #[cfg(unix)]
     #[test]
     fn world_writable_system_ancestor_is_refused() {
@@ -2468,13 +2551,12 @@ mod tests {
     const OPEN_UMASK_ENV: &str = "ATPKG_STORE_OPEN_UMASK_HOME";
     #[cfg(unix)]
     const OPEN_UMASK_PROBE: &str =
-        "store::tests::probe_a_prefix_made_under_an_open_umask_has_no_shared_ancestor";
+        "store::tests::a_prefix_made_under_an_open_umask_has_no_shared_ancestor";
 
     #[cfg(unix)]
-    #[test]
-    fn probe_a_prefix_made_under_an_open_umask_has_no_shared_ancestor() {
+    fn probe_a_prefix_made_under_an_open_umask_has_no_shared_ancestor_if_asked() -> bool {
         let Some(home) = std::env::var_os(OPEN_UMASK_ENV) else {
-            return;
+            return false;
         };
         let home = PathBuf::from(home);
         // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail; this
@@ -2514,11 +2596,15 @@ mod tests {
             assert_eq!(mode(made), "755", "{made}: made under umask 002");
         }
         assert_eq!(mode("opt/aterm/pkg"), "755", "the system prefix");
+        true
     }
 
     #[cfg(unix)]
     #[test]
     fn a_prefix_made_under_an_open_umask_has_no_shared_ancestor() {
+        if probe_a_prefix_made_under_an_open_umask_has_no_shared_ancestor_if_asked() {
+            return;
+        }
         let home = temp_home("open-umask");
         let out = aterm_uds::spawnfd::command(std::env::current_exe().unwrap())
             .args(["--exact", "--nocapture", OPEN_UMASK_PROBE])
@@ -2596,7 +2682,7 @@ mod tests {
 
     #[test]
     fn shim_names_collision_and_shape_policy() {
-        for bad in ["sudo", "SSH", "git", "sh", "env", "rustc", "Codesign"] {
+        for bad in ["sudo", "SSH", "scp", "sh", "env", "rustc", "Codesign"] {
             assert!(!shim_allowed(bad), "{bad} must be refused a shim");
         }
         for shell in SHELLS {
@@ -2653,25 +2739,25 @@ mod tests {
         for bad in ["", ".", "..", "a/b", "x\0y"] {
             assert!(!shim_allowed(bad), "{bad:?} is not a valid shim name");
         }
-        for ok in ["ay", "ny", "trust-mc", "clean-certify"] {
+        for ok in ["ay", "ny", "git", "gh", "trust-mc", "clean-certify"] {
             assert!(shim_allowed(ok), "{ok} should be allowed");
         }
     }
 
     #[test]
     fn alias_names_admit_on_their_base_and_refuse_sensitive_bases() {
-        for ok in ["alab-ay", "alab-trust", "alab-trust-cg"] {
+        for ok in ["alab-ay", "alab-git", "alab-trust", "alab-trust-cg"] {
             assert!(shim_allowed(ok), "{ok} should be allowed");
         }
         for bad in [
             "alab-sudo",
             "alab-SSH",
-            "alab-git",
+            "alab-scp",
             "alab-cargo",
-            "alab-",
+            "alab-..",
             "alab-alab-ay",
             "alab-a/b",
-            "alab-..",
+            "alab-",
         ] {
             assert!(!shim_allowed(bad), "{bad:?} must be refused a shim");
         }
@@ -2692,7 +2778,7 @@ mod tests {
             format!("alab-trust-cg{}", crate::platform::SHIM_SUFFIX)
         );
         assert_eq!(ToolName::new("alab-sudo"), None);
-        assert_eq!(ToolName::from_shim_file("alab-git"), None);
+        assert_eq!(ToolName::from_shim_file("alab-scp"), None);
     }
 
     #[test]
@@ -3142,5 +3228,21 @@ mod tests {
         assert_eq!(append_bin_to_path(Some(&bin_first), bin), bin_first);
         let bin_last = std::env::join_paths([Path::new("/usr/bin"), Path::new("/p/bin")]).unwrap();
         assert_eq!(append_bin_to_path(Some(&bin_last), bin), bin_last);
+    }
+
+    #[test]
+    fn prepend_bin_to_path_moves_to_front_once_and_is_idempotent() {
+        let bin = Path::new("/p/bin");
+        let inherited =
+            std::env::join_paths([Path::new("/usr/bin"), Path::new("/bin"), bin]).unwrap();
+        let expected =
+            std::env::join_paths([bin, Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        assert_eq!(prepend_bin_to_path(Some(&inherited), bin), expected);
+        assert_eq!(prepend_bin_to_path(Some(&expected), bin), expected);
+        assert_eq!(prepend_bin_to_path(None, bin), OsString::from("/p/bin"));
+        assert_eq!(
+            prepend_bin_to_path(Some(OsStr::new("")), bin),
+            OsString::from("/p/bin")
+        );
     }
 }

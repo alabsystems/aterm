@@ -24,6 +24,23 @@ pub trait Journal {
         to: &str,
         revert: Option<&str>,
     ) -> Result<(), String>;
+
+    /// Record that `id` ended failed in an apply run, and why: its row's why. A journal that keeps
+    /// changes alone records nothing.
+    /// # Errors
+    /// One line; the row ends failed whether or not it was recorded.
+    fn failed(&mut self, id: &str, why: &str) -> Result<(), String> {
+        let _ = (id, why);
+        Ok(())
+    }
+}
+
+/// Record `row` in `journal` where it ended failed. A record the journal refuses is let go: the
+/// row, the run's report and its record say the failure all the same.
+fn journal_failure(journal: &mut dyn Journal, row: &ItemReport) {
+    if row.outcome == Outcome::Failed {
+        let _ = journal.failed(&row.id, row.why.as_deref().unwrap_or("no reason given"));
+    }
 }
 
 /// A journal that keeps nothing: tests, which change nothing real.
@@ -265,6 +282,9 @@ pub fn run_scoped(
                 }
             };
         row.elapsed_ms = Some(millis(started.elapsed()));
+        if item_mode == Mode::Apply {
+            journal_failure(journal, &row);
+        }
         if awaits && let Some(activation) = activation {
             awaiting.push((activation.id(), rows.len(), index));
         } else if item_mode == Mode::Apply
@@ -347,6 +367,7 @@ fn settle(
             if invoked {
                 let last = read_back_as(item, row, Outcome::Ok, "rechecked after activation");
                 finish(item, row, &last);
+                journal_failure(journal, row);
             }
             add_elapsed(row, started.elapsed());
             on_row(row);
@@ -373,6 +394,7 @@ fn settle(
             }
         };
         finish(item, row, &last);
+        journal_failure(journal, row);
         add_elapsed(
             row,
             started

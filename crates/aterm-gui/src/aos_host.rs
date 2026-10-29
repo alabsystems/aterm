@@ -211,8 +211,6 @@ pub(crate) enum AosRefusal {
     SecureEntry,
     /// No kept fault has this id.
     NoKept(u64),
-    /// The glow wears its vivid light-page ink, which a recording cannot hold.
-    VividInk,
 }
 
 impl std::fmt::Display for AosRefusal {
@@ -237,9 +235,6 @@ impl std::fmt::Display for AosRefusal {
                 "Secure Keyboard Entry is on, so the glow is not recorded (turn it off to attach)",
             ),
             AosRefusal::NoKept(id) => write!(f, "no kept fault {id} in the front window"),
-            AosRefusal::VividInk => f.write_str(
-                "the glow wears Sparkle's paper gold on a light theme, which a recording cannot hold yet (pin the cursor colour or pick another glow style to attach)",
-            ),
         }
     }
 }
@@ -339,9 +334,6 @@ impl App {
         }
         let build = aterm_types::version::build_id();
         let ws = self.windows.get_mut(&id).ok_or(AosRefusal::NoWindow)?;
-        if ws.fx.cursor().momentum.light_vivid() {
-            return Err(AosRefusal::VividInk);
-        }
         if std::mem::take(&mut ws.aos.tainted) {
             ws.fx.cursor_mut().momentum.reset();
         }

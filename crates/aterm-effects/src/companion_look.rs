@@ -10,7 +10,9 @@ use aterm_core::terminal::{BlockState, OutputBlock};
 
 use crate::companion::CompanionRung;
 use crate::kitty_pet::PetArrival;
-use crate::kitty_registry::{KittyLook, SHELL_APP_ID, app_basename, canonical_app_id};
+use crate::kitty_registry::{
+    KittyLook, SHELL_APP_ID, app_basename_slice, canonical_app_id, is_shell_basename,
+};
 
 /// How long a program must hold the focused pane, unbroken, before its cat takes the cursor, so quick commands finish first.
 pub const TENURE: Duration = Duration::from_secs(5);
@@ -94,7 +96,11 @@ fn derive_identity(block: &OutputBlock) -> Option<AppIdentity> {
     match block.state {
         BlockState::Executing => {
             let cmd = block.commandline.as_deref()?;
-            let basename = app_basename(cmd)?;
+            let raw_base = app_basename_slice(cmd)?;
+            if is_shell_basename(raw_base) {
+                return None;
+            }
+            let basename = raw_base.to_ascii_lowercase();
             let id = canonical_app_id(&basename);
             if id == SHELL_APP_ID {
                 return None;
@@ -164,12 +170,14 @@ impl KittyTenure {
 
     /// The claim on glass (`None` = the base cat), without advancing the gate.
     #[inline]
+    #[must_use]
     pub const fn worn(&self) -> Option<&AppIdentity> {
         self.worn.as_ref()
     }
 
     /// When the pending candidate earns its tenure, for the host's wake deadline; `None` while nothing is pending, so the gate never pins the event loop.
     #[inline]
+    #[must_use]
     pub fn deadline(&self) -> Option<Instant> {
         self.candidate
             .as_ref()
@@ -179,19 +187,19 @@ impl KittyTenure {
     /// Called by the host's wake handler when [`Self::deadline`] is due, present or not: lands the pending candidate and disarms, returning whether the look moved.
     #[inline]
     pub fn poll(&mut self, now: Instant) -> bool {
-        match self.candidate.take() {
-            Some((cand, since))
-                if now.saturating_duration_since(since) >= dwell_for(cand.as_ref()) =>
-            {
-                let moved = cand != self.worn;
-                self.land(cand, now);
-                moved
-            }
-            other => {
-                self.candidate = other;
-                false
-            }
+        let is_due = matches!(
+            &self.candidate,
+            Some((cand, since)) if now.saturating_duration_since(*since) >= dwell_for(cand.as_ref())
+        );
+        if !is_due {
+            return false;
         }
+        let Some((cand, _)) = self.candidate.take() else {
+            return false;
+        };
+        let moved = cand != self.worn;
+        self.land(cand, now);
+        moved
     }
 
     /// The one place a due candidate becomes `worn`; also rules the [`PetArrival`]
@@ -206,25 +214,17 @@ impl KittyTenure {
             self.arrival = PetArrival::Quiet;
             return;
         };
-        let mut i = 0;
-        while i < HOMECOMING_SLOTS {
-            if let Some(h) = self.roster[i].as_ref()
-                && h.greeted
-                && h.id != id.id
-                && now.saturating_duration_since(h.at) >= HOMECOMING
-            {
-                self.roster[i] = None;
-            }
-            i += 1;
-        }
         let mut hit = None;
         let mut i = 0;
         while i < HOMECOMING_SLOTS {
-            if let Some(h) = &self.roster[i]
-                && h.id == id.id
-            {
-                hit = Some(i);
-                break;
+            if let Some(h) = self.roster[i].as_ref() {
+                if h.id == id.id {
+                    if hit.is_none() {
+                        hit = Some(i);
+                    }
+                } else if h.greeted && now.saturating_duration_since(h.at) >= HOMECOMING {
+                    self.roster[i] = None;
+                }
             }
             i += 1;
         }
@@ -266,6 +266,7 @@ impl KittyTenure {
 
     /// How loudly the most recent landing arrived; read, never advanced.
     #[inline]
+    #[must_use]
     pub const fn arrival(&self) -> PetArrival {
         self.arrival
     }
@@ -320,11 +321,18 @@ fn insert_lru(roster: &mut [Option<Homecoming>; HOMECOMING_SLOTS], id: &str, now
     }
     match slot {
         Some(i) => {
-            roster[i] = Some(Homecoming {
-                id: id.to_owned(),
-                at: now,
-                greeted: false,
-            });
+            if let Some(h) = &mut roster[i] {
+                h.id.clear();
+                h.id.push_str(id);
+                h.at = now;
+                h.greeted = false;
+            } else {
+                roster[i] = Some(Homecoming {
+                    id: id.to_owned(),
+                    at: now,
+                    greeted: false,
+                });
+            }
             true
         }
         None => false,

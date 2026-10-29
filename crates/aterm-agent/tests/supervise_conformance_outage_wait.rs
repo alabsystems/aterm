@@ -39,6 +39,10 @@ const ENOTFOUND: &str =
 const OVERLOADED: &str = "API Error: 529 Overloaded. This is a server-side issue, usually \
                           temporary — try again in a moment. If it persists, check \
                           https://status.claude.com.";
+const GOAL_UNAVAILABLE: &str = "Goal still active · the API was unavailable or the connection \
+                                dropped · retrying in 5 min (2/3) · send a message to retry now";
+const GOAL_GAVE_UP: &str = "Goal paused after 3 automatic retries · the API was unavailable or \
+                            the connection dropped · send a message to continue";
 
 /// The real ladder, scaled so one model tick is one minute: `First` and `Cap` as the real
 /// `outage_first` and `outage_cap`.
@@ -164,6 +168,7 @@ fn reading(st: &State, worked: Option<Duration>, real: &Real) -> TurnEndReading 
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::Clean,
         fact: None,
+        wake: None,
     }
 }
 
@@ -543,7 +548,10 @@ fn each_buggy_dial_breaks_its_law_along_a_path_the_model_keeps_it_on() {
 }
 
 /// The words this bind hands the decider read as the walls the model stands for: a server never
-/// reached, and an overload.
+/// reached, and an overload. The `/goal` echo that the API was unavailable, read alone (retrying
+/// or past its retries), is a generic API error, a wall the model's blind arm stands for as it
+/// does the overload: Claude Code gives that reason an overload and a server error too, so no
+/// measure of the route clears it.
 #[test]
 fn the_models_words_read_as_the_walls_they_stand_for() {
     assert_eq!(
@@ -554,6 +562,17 @@ fn the_models_words_read_as_the_walls_they_stand_for() {
             cause: ApiCause::Unreachable,
         })
     );
+    for echo in [GOAL_UNAVAILABLE, GOAL_GAVE_UP] {
+        assert_eq!(
+            aterm_phase::classify_wall(echo),
+            Some(WallKind::ApiError {
+                code: None,
+                retryable: true,
+                cause: ApiCause::Server,
+            }),
+            "the /goal echo read alone: {echo}"
+        );
+    }
     assert_eq!(
         aterm_phase::classify_wall(OVERLOADED),
         Some(WallKind::Overloaded)

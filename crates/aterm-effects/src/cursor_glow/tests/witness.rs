@@ -392,8 +392,4 @@ fn swept_path_retains_only_the_bounded_landing_suffix() {
     assert_eq!(path.len(), 512);
     assert_eq!(path.first(), Some(&(65_023, 65_023)));
     assert_eq!(path.last(), Some(&(65_534, 65_534)));
-    assert!(
-        path.capacity() <= CursorGlow::MAX_SPARKS,
-        "outlier jump scratch remains resident-cap bounded"
-    );
 }

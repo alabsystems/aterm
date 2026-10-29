@@ -2257,6 +2257,7 @@ struct FabricLink {
     link: Mutex<LinkReport>,
     log: Mutex<Option<LogClock>>,
     log_transition: Mutex<()>,
+    node_gaps: Mutex<NodeGaps>,
     #[cfg(any(unix, test, debug_assertions))]
     hold_on_loss: AtomicBool,
 }
@@ -2270,6 +2271,10 @@ static LINK: FabricLink = FabricLink {
     hold_on_loss: AtomicBool::new(false),
     log: Mutex::new(None),
     log_transition: Mutex::new(()),
+    node_gaps: Mutex::new(NodeGaps {
+        ranges: 0,
+        newest: None,
+    }),
     link: Mutex::new(LinkReport {
         up: false,
         reason: String::new(),
@@ -3004,6 +3009,12 @@ fn cmd_link_gap<'a>(
         (Some(_), Some(t)) => GapScope::Topic(t),
     };
     let owed = with_current_bridge(generation, || {
+        if matches!(scope, GapScope::Node) {
+            LINK.node_gaps
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .note(gap);
+        }
         let told: Vec<_> = {
             let g = store.read().unwrap_or_else(|p| p.into_inner());
             match sid {
@@ -3026,6 +3037,90 @@ fn cmd_link_gap<'a>(
         wake(sid);
     }
     "OK\n".to_string()
+}
+
+/// What `link gap` told this instance of the node's unread mail (no `sid=`: astream's gap notice
+/// on the node's inbox group, 6E-1d) since the instance started: how many ranges, and the newest
+/// with the broker's count while its offsets name the bridge's log. `fabric status` names it
+/// ([`fabric_gap_facts`]), so `aterm fabric` lists the node's loss under WARNINGS even when no
+/// session was there to be told, or the sessions told have gone. A new bridge resets
+/// `lane_faults` and not this: what retention gave up stays gone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct NodeGaps {
+    /// Ranges told, a range told again over one it overlaps counted once ([`Self::note`]).
+    ranges: u64,
+    /// The newest range, while its offsets name the bridge's log: the log it was told on, or one
+    /// continuing it past the range's end ([`Self::log_moved`]).
+    newest: Option<GivenUp>,
+}
+
+impl NodeGaps {
+    /// Count `gap`. A range that overlaps the newest is that range told again, as a new
+    /// subscription from a cursor below its end tells it (astream counts a range's records once
+    /// per stream, so the new stream's count is of the whole of its range), on the log it was
+    /// told on or on one continuing it past its end: the newest widens to cover both and keeps
+    /// the count of whichever range covers the other (the newer's when they are one range and it
+    /// has one), none when neither does. An empty range is no loss.
+    fn note(&mut self, gap: GivenUp) {
+        if gap.from >= gap.to {
+            return;
+        }
+        if let Some(told) = self.newest
+            && gap.from < told.to
+            && told.from < gap.to
+        {
+            let (from, to) = (gap.from.min(told.from), gap.to.max(told.to));
+            let records = match (
+                (gap.from, gap.to) == (from, to),
+                (told.from, told.to) == (from, to),
+            ) {
+                (true, true) => gap.records.or(told.records),
+                (true, false) => gap.records,
+                (false, true) => told.records,
+                (false, false) => None,
+            };
+            self.newest = Some(GivenUp { from, to, records });
+            return;
+        }
+        self.ranges = self.ranges.saturating_add(1);
+        self.newest = Some(gap);
+    }
+
+    /// The bridge's log moved from `was` to `clock` ([`cmd_link_log`]). The newest range stays
+    /// where `clock` continues `was` past its end, exactly as each session's `given_up=` does
+    /// ([`Inbox::forget_bus_offsets`]), so that range told again on the new log is a repeat to
+    /// both; any other move forgets it, as its offsets name records of a log since replaced, and
+    /// keeps the count.
+    fn log_moved(&mut self, was: Option<LogIdentity>, clock: LogClock) {
+        if was == Some(clock.ident) {
+            return;
+        }
+        let fork = clock.keep_below(was);
+        self.newest = self
+            .newest
+            .filter(|gap| fork.is_some_and(|fork| gap.to <= fork));
+    }
+}
+
+/// The words `fabric status` adds for [`NodeGaps`] once a range was told: ` mail_gaps=<k>`, then
+/// the newest range while its offsets name the bridge's log (the log it was told on, or one
+/// continuing it past the range's end): ` mail_gap=@<a>..@<b>`, and ` mail_gap_count=<n>` where
+/// the broker counted its records.
+#[must_use]
+pub fn fabric_gap_facts() -> String {
+    use std::fmt::Write as _;
+    let gaps = *LINK.node_gaps.lock().unwrap_or_else(|p| p.into_inner());
+    if gaps.ranges == 0 {
+        return String::new();
+    }
+    let mut out = format!(" mail_gaps={}", gaps.ranges);
+    if let Some(gap) = gaps.newest {
+        let _ = write!(out, " mail_gap=@{}..@{}", gap.from, gap.to);
+        if let Some(n) = gap.records {
+            let _ = write!(out, " mail_gap_count={n}");
+        }
+    }
+    out
 }
 
 /// Whose records a `link gap` names ([`cmd_link_gap`]).
@@ -3351,6 +3446,10 @@ fn cmd_link_log(
         drop(inbox);
         ctx.fabric().changed.notify_all();
     }
+    LINK.node_gaps
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .log_moved(previous.map(|p| p.ident), clock);
     *LINK.log.lock().unwrap_or_else(|p| p.into_inner()) = Some(clock);
     if changed {
         on_forgot();
@@ -3558,6 +3657,45 @@ fn standing_refusal(ctx: &dyn FabricSession) -> Option<(String, String)> {
     Some((halted(ctx, &holds, &hold, None), hold.origin))
 }
 
+/// Whose `peers rm` of a remote hold's node ends what lets it drive this session's Mac
+/// ([`on_rm_lifts`]), which the hold's refusal names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RmLifts {
+    /// This Mac's own: a grant here names the node, or this Mac's own book binds it.
+    Here,
+    /// Only the fleet's issuer's: the `"*"` grant here admits the node, which this Mac's copy of
+    /// the issuer's book binds, so it follows that `peers rm` once it reads that book again.
+    Issuer,
+}
+
+static RM_LIFTS: std::sync::OnceLock<fn(&str) -> RmLifts> = std::sync::OnceLock::new();
+
+/// Have each remote hold's refusal ask `hook` whose `peers rm` of its node lifts it.
+pub fn on_rm_lifts(hook: fn(&str) -> RmLifts) {
+    let _ = RM_LIFTS.set(hook);
+}
+
+/// What lifts the remote hold of `node` (shown as `host`) on session `sid`, `rm` naming whose
+/// `peers rm` of the node does once it left the fleet. The node is named whole, as a member's
+/// `peers rm` takes the issuer it can no longer read.
+fn remote_lifts(sid: &str, host: &str, node: &str, rm: RmLifts) -> String {
+    let off = format!("`aterm ctl --host <this session's Mac> hold {sid} off` run on {host}");
+    match rm {
+        RmLifts::Here => format!(
+            "{off}, or the person at this session's Mac (Take Over, a lower `aterm fleet allow` \
+             there, or `aterm fleet peers rm {node}` there once that node left the fleet), lifts \
+             it"
+        ),
+        RmLifts::Issuer => format!(
+            "{off}, or the person at this session's Mac (Take Over, or a lower `aterm fleet allow` \
+             there), lifts it; once that node left the fleet, so does `aterm fleet peers rm \
+             {node}` on the fleet's issuer (the \"*\" grant there lets every member the issuer's \
+             book binds drive), once this session's Mac reads that book again (`aterm fleet \
+             peers` there reads it now)"
+        ),
+    }
+}
+
 /// The `ERR halted` line of `hold`, one of `holds`: a remote one names who holds it and what
 /// lifts it, by what a local `hold off` found of its node where one met it (`found`).
 fn halted(ctx: &dyn FabricSession, holds: &Holds, hold: &Hold, found: Option<&Holder>) -> String {
@@ -3565,13 +3703,8 @@ fn halted(ctx: &dyn FabricSession, holds: &Holds, hold: &Hold, found: Option<&Ho
         Some(remote) => {
             let (host, sid) = (&remote.host, ctx.self_id().as_str());
             let (node, short) = (&remote.node, remote.node.get(..8).unwrap_or(&remote.node));
-            // The node is named whole, as a member's `peers rm` takes the issuer it can no longer
-            // read.
-            let lifts = format!(
-                "`aterm ctl --host <this session's Mac> hold {sid} off` run on {host}, or the \
-                 person at this session's Mac (Take Over, or `aterm fleet peers rm {node}` there \
-                 once that node left the fleet), lifts it"
-            );
+            let rm = RM_LIFTS.get().map_or(RmLifts::Here, |hook| hook(node));
+            let lifts = remote_lifts(sid, host, node, rm);
             match found {
                 Some(Holder::Drives) => format!(
                     " (held by {host} over the fleet, which still drives this session's Mac: \
@@ -3991,6 +4124,7 @@ pub fn with_link_reset<T>(f: impl FnOnce() -> T) -> T {
         LINK.hold_on_loss.store(false, Ordering::Relaxed);
         *LINK.generation.lock().unwrap_or_else(|p| p.into_inner()) = 0;
         *LINK.log.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *LINK.node_gaps.lock().unwrap_or_else(|p| p.into_inner()) = NodeGaps::default();
         {
             let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
             link.up = false;
@@ -7844,6 +7978,204 @@ mod inbox_hold {
         });
     }
 
+    /// R5: the node's own count of what retention gave up of its unread mail, which `fabric
+    /// status` names (`mail_gaps=`, [`fabric_gap_facts`]) for `aterm fabric`'s WARNINGS. Every
+    /// node range the current bridge tells counts once: a repeat, and a range told again over the
+    /// newest it overlaps (a new subscription's notice, its count the whole range's) widen the
+    /// newest and count nothing; a lane's or a topic's range and a stale bridge's count nothing;
+    /// a range with no session to tell still counts, and a new bridge keeps the count. The newest
+    /// range is named while its offsets name the bridge's log (that log, or one continuing it
+    /// past the range's end), its count where the broker gave one; a replaced log hides it and
+    /// keeps the count. NC (run): a `NodeGaps::note` that counts every tell fails the repeat; one
+    /// that returns at once fails the first tell; a `NodeGaps::log_moved` that keeps the newest
+    /// over any move fails the replaced log.
+    #[test]
+    fn the_nodes_given_up_mail_is_counted_once_per_range_for_fabric_status() {
+        with_link(|| {
+            let store = new_store();
+            let (sa, a) = registered_as(&store, 1);
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let log = format!("{}.0", "c".repeat(32));
+            let tell = |line: &str| cmd_link(&store, line, Some(generation));
+            assert_eq!(tell(&format!("log {log}")), "OK\n");
+            assert_eq!(fabric_gap_facts(), "", "nothing told, nothing said");
+
+            assert_eq!(tell("gap from=10 to=42 records=3"), "OK\n");
+            let first = " mail_gaps=1 mail_gap=@10..@42 mail_gap_count=3";
+            assert_eq!(fabric_gap_facts(), first);
+            for repeat in ["gap from=10 to=42", "gap to=42 from=10 records=3"] {
+                assert_eq!(tell(repeat), "OK\n", "{repeat}");
+                assert_eq!(fabric_gap_facts(), first, "a repeat: {repeat}");
+            }
+            assert_eq!(a.fabric.topic_add("news", "@0", &a.timeline), Ok(true));
+            for scoped in [
+                format!("gap from=50 to=60 sid={sa}"),
+                format!("gap from=50 to=60 sid={sa} topic=news"),
+            ] {
+                assert_eq!(tell(&scoped), "OK\n", "{scoped}");
+                assert_eq!(fabric_gap_facts(), first, "a session's own: {scoped}");
+            }
+            let ghost = next_bridge_generation();
+            assert_eq!(
+                cmd_link(&store, "gap from=70 to=80", Some(ghost)),
+                "OK stale=1\n"
+            );
+            assert_eq!(fabric_gap_facts(), first, "a stale bridge's range");
+
+            assert_eq!(tell("gap from=8 to=50 records=5"), "OK\n");
+            assert_eq!(
+                fabric_gap_facts(),
+                " mail_gaps=1 mail_gap=@8..@50 mail_gap_count=5",
+                "a new subscription's range over the newest is the same range, widened"
+            );
+            assert_eq!(tell("gap from=20 to=60"), "OK\n");
+            assert_eq!(
+                fabric_gap_facts(),
+                " mail_gaps=1 mail_gap=@8..@60",
+                "one that covers neither: no count"
+            );
+
+            let nobody = new_store();
+            assert_eq!(
+                cmd_link(&nobody, "gap from=70 to=75 records=1", Some(generation)),
+                "OK\n"
+            );
+            assert_eq!(
+                fabric_gap_facts(),
+                " mail_gaps=2 mail_gap=@70..@75 mail_gap_count=1",
+                "a range no session was there to be told of"
+            );
+            assert_eq!(tell("gap from=75 to=75"), "OK\n");
+            assert_eq!(
+                fabric_gap_facts(),
+                " mail_gaps=2 mail_gap=@70..@75 mail_gap_count=1"
+            );
+
+            let next = next_bridge_generation();
+            attach_up(&store, next);
+            assert_eq!(
+                fabric_gap_facts(),
+                " mail_gaps=2 mail_gap=@70..@75 mail_gap_count=1",
+                "a new bridge keeps the count"
+            );
+            let moved = format!("{}.1", "c".repeat(32));
+            assert_eq!(
+                cmd_link(
+                    &store,
+                    &format!("log {moved} continues=75 was={log}"),
+                    Some(next)
+                ),
+                "OK forgot=1\n"
+            );
+            assert_eq!(
+                fabric_gap_facts(),
+                " mail_gaps=2 mail_gap=@70..@75 mail_gap_count=1",
+                "a log continuing past the range still names it"
+            );
+            let other = format!("{}.0", "d".repeat(32));
+            assert_eq!(
+                cmd_link(&store, &format!("log {other}"), Some(next)),
+                "OK forgot=1\n"
+            );
+            assert_eq!(
+                fabric_gap_facts(),
+                " mail_gaps=2",
+                "a replaced log does not"
+            );
+            assert_eq!(cmd_link(&store, "gap from=70 to=75", Some(next)), "OK\n");
+            assert_eq!(
+                fabric_gap_facts(),
+                " mail_gaps=3 mail_gap=@70..@75",
+                "the same offsets on another log are another range"
+            );
+        });
+    }
+
+    /// R5 review: the node's count keeps its newest range across a move of the bus log exactly
+    /// as each session keeps its `given_up=` ([`Inbox::forget_bus_offsets`]): a generation that
+    /// continues the log past the range's end keeps it, through any number of such moves, so a
+    /// new bridge's subscription telling it again, with no count, after a broker restart moved
+    /// the log, is that range told again ([`GivenUp::repeated_by`]): one range, its count kept,
+    /// one `mail-gap` mark. A move whose fork falls inside the range forgets it in both, and the
+    /// range told after it is a new one in both. NC (run): a `NodeGaps` whose newest stays tied
+    /// to the log it was told on (the branch's first shape), and one whose `log_moved` forgets
+    /// it at every move, each count the re-tell after the first move again and drop its count;
+    /// a `log_moved` that keeps it over any move fails the fork inside the range.
+    #[test]
+    fn a_node_range_told_again_on_a_log_continuing_past_it_is_the_same_range() {
+        with_link(|| {
+            let store = new_store();
+            let (_, a) = registered_as(&store, 1);
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let tell = |line: &str| cmd_link(&store, line, Some(generation));
+            let header = || {
+                let out = cmd_inbox(&*a, "--peek --meta");
+                out.lines().next().unwrap_or_default().to_string()
+            };
+            let marks = || {
+                let tl = a.timeline.lock().unwrap();
+                tl.facts
+                    .iter()
+                    .filter(|f| f.starts_with("inbox-gap: "))
+                    .count()
+            };
+            let log = |g: u32| format!("{}.{g}", "c".repeat(32));
+            let moved = |g: u32, fork: u64| {
+                assert_eq!(
+                    tell(&format!(
+                        "log {} continues={fork} was={}",
+                        log(g),
+                        log(g - 1)
+                    )),
+                    "OK forgot=1\n",
+                    "the move to {}",
+                    log(g)
+                );
+            };
+            assert_eq!(tell(&format!("log {}", log(0))), "OK\n");
+            assert_eq!(tell("gap from=70 to=75 records=1"), "OK\n");
+            let once = " mail_gaps=1 mail_gap=@70..@75 mail_gap_count=1";
+            let held = " given_up=@70..@75 given_up_count=1";
+            assert_eq!(fabric_gap_facts(), once);
+
+            moved(1, 100);
+            assert_eq!(tell("gap from=70 to=75"), "OK\n");
+            assert_eq!(
+                fabric_gap_facts(),
+                once,
+                "told again on a log continuing past it"
+            );
+            assert!(header().ends_with(held), "{}", header());
+            assert_eq!(marks(), 1);
+
+            moved(2, 110);
+            moved(3, 120);
+            assert_eq!(fabric_gap_facts(), once, "two moves past it, nothing told");
+            assert!(header().ends_with(held), "{}", header());
+            assert_eq!(tell("gap from=70 to=75"), "OK\n");
+            assert_eq!(fabric_gap_facts(), once, "and told again after them");
+            assert_eq!(marks(), 1);
+
+            moved(4, 72);
+            assert_eq!(
+                fabric_gap_facts(),
+                " mail_gaps=1",
+                "a fork inside the range"
+            );
+            assert!(!header().contains(" given_up="), "{}", header());
+            assert_eq!(tell("gap from=70 to=75"), "OK\n");
+            assert_eq!(
+                fabric_gap_facts(),
+                " mail_gaps=2 mail_gap=@70..@75",
+                "told after a fork inside it: a new range"
+            );
+            assert!(header().ends_with(" given_up=@70..@75"), "{}", header());
+            assert_eq!(marks(), 2);
+        });
+    }
+
     /// B12 review: a node's give-up (`link gap`, no `sid=`) and one session's lane give-up
     /// (`… sid=<sid>`) are kept apart, so each range is marked once however the two interleave:
     /// astream tells the node's range again on every new inbox-group subscription until a record
@@ -8975,11 +9307,12 @@ mod inbox_hold {
                         )
                     })
                 };
-                for spin in 0.. {
-                    assert!(spin < 5_000_000, "the post never reached the outbox");
-                    if cmd_inbox(&ctx, "--peek").contains("post 1 ") {
-                        break;
-                    }
+                let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+                while !cmd_inbox(&ctx, "--peek").contains("post 1 ") {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the post never reached the outbox"
+                    );
                     std::thread::yield_now();
                 }
                 assert_eq!(
@@ -12275,11 +12608,12 @@ mod inbox_hold {
                     )
                 })
             };
-            for spin in 0.. {
-                assert!(spin < 5_000_000, "the post never reached the outbox");
-                if cmd_inbox(&ctx, "--peek").contains("post 1 ") {
-                    break;
-                }
+            let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+            while !cmd_inbox(&ctx, "--peek").contains("post 1 ") {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the post never reached the outbox"
+                );
                 std::thread::yield_now();
             }
             bridge_lost(&store, generation);

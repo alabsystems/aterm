@@ -549,8 +549,11 @@ impl DemoTape {
 
 thread_local! {
     /// Separate from the Appearance specimen's memo, so the two pages never
-    /// evict each other.
-    static TAPE: std::cell::RefCell<Option<DemoTape>> = const { std::cell::RefCell::new(None) };
+    /// evict each other. Boxed: a thread-local's value is part of the image's
+    /// TLS template, which every thread allocates whole, and a `DemoTape`
+    /// inline was 12.7 KB of each.
+    static TAPE: std::cell::RefCell<Option<Box<DemoTape>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The key a frame is memoized under.
@@ -596,7 +599,7 @@ pub(crate) fn demo_frame(
             {
                 tape
             }
-            _ => slot.insert(DemoTape::new(colors, rows, cols)),
+            _ => slot.insert(Box::new(DemoTape::new(colors, rows, cols))),
         };
         let fingerprint_colors = colors.fingerprint();
         if tape.colors != fingerprint_colors {

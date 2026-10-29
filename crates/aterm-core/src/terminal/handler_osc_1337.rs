@@ -25,7 +25,7 @@ pub(super) enum PlacementCursor {
 /// Maximum decoded image payload accepted (bytes). A single sequence must not be
 /// able to pin an unbounded buffer; 16 MiB comfortably covers a full-screen PNG
 /// while bounding the worst case.
-const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+pub(super) const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Maximum footprint in cells along either axis. Caps the per-image cell-stamp
 /// work regardless of the requested dimensions; the footprint's height is held

@@ -117,28 +117,6 @@ fn log_off_mirrors_nothing_and_writes_nothing() {
 }
 
 #[test]
-fn the_default_mirrors_turns() {
-    let w = World::boot("lm-default", &[]);
-    w.wait_ready();
-    let (a, _b) = w.two_sessions();
-    claims(&w, &a, 4);
-    let m = until("the session's mirror to be quiescent and complete", || {
-        complete(&w, &a)
-    });
-    assert!(
-        m.raw.values().all(|n| *n == 1),
-        "a duplicate on the bus: {:?}",
-        m.raw
-    );
-    let fs = w.verb("fabric status");
-    assert!(
-        fs.header().contains(" bridge_log=turns mirror=on"),
-        "{}",
-        fs.header()
-    );
-}
-
-#[test]
 fn the_default_over_an_unretaining_broker_mirrors_nothing_and_says_so() {
     let w = World::without_retention("lm-unret");
     w.wait_ready();
@@ -151,9 +129,12 @@ fn the_default_over_an_unretaining_broker_mirrors_nothing_and_says_so() {
     );
 }
 
+/// The default world (no `--log`): over a retaining broker the mirror resolves to turns, and every
+/// turn of two sessions lands once with its ms dense.
 #[test]
 fn turns_land_once_with_ms_dense() {
-    let w = turns("lm-on", &[]);
+    let w = World::boot("lm-on", &[]);
+    w.wait_ready();
     let (a, b) = w.two_sessions();
     claims(&w, &a, 6);
     claims(&w, &b, 4);

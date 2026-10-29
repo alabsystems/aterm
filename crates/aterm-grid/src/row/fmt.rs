@@ -4,12 +4,15 @@
 
 use std::fmt::Write;
 
-use super::Row;
+use super::{Row, u16_from_usize};
 
 impl std::fmt::Display for Row {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for cell in &self.as_slice()[..self.len() as usize] {
-            if !cell.is_wide_continuation() {
+        for (col, cell) in self.as_slice()[..usize::from(self.len())]
+            .iter()
+            .enumerate()
+        {
+            if !self.is_cell_wide_continuation(u16_from_usize(col)) {
                 // NUL (empty cell) → space, as push_cell_text() does, so
                 // scrollback text matches visible-row text.
                 let ch = cell.char();

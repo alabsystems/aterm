@@ -69,6 +69,15 @@ aterm-grapheme = { workspace = true }
 # `fleet-sim` dials a member's fleet port as a reader does (the mutual proof,
 # the key file) and speaks the wire for the reflected-tag conformance probe.
 aterm-net = { workspace = true }
+# `swarm partition` reads each lab Mac's vault state and its servers' heads, seeds island B's
+# server, and runs each Mac's subscriber and approver (`client::watch`). Not a new edge in the
+# build graph: aterm-agent depends on it.
+aterm-secrets = { workspace = true }
+# `swarm partition`'s Allow runs the members desk, whose clock is aterm-time's. Not a new edge
+# in the build graph: aterm-secrets depends on it.
+aterm-time = { workspace = true }
+# `swarm partition`'s Commons plane drives the repair exchange on each lab Mac's own custody.
+aterm-db = { workspace = true }
 # The survey text's `tty::one_line` escaping judged, and the fixture's
 # transcript written with the one JSON escape.
 aterm-codec = { workspace = true }

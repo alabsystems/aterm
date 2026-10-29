@@ -482,6 +482,8 @@ struct DepEdge {
 struct Manifest {
     name: String,
     proc_macro: bool,
+    lib_name: Option<String>,
+    lib_path: Option<String>,
     features: BTreeMap<String, Vec<String>>,
     deps: Vec<DepEdge>,
     ws_deps: BTreeMap<String, WsSpec>,
@@ -658,6 +660,8 @@ fn load_manifest(root: &Path, dir: &str) -> Result<Manifest, String> {
     let mut m = Manifest {
         name: String::new(),
         proc_macro: false,
+        lib_name: None,
+        lib_path: None,
         features: BTreeMap::new(),
         deps: Vec::new(),
         ws_deps: BTreeMap::new(),
@@ -698,6 +702,13 @@ fn load_manifest(root: &Path, dir: &str) -> Result<Manifest, String> {
                 for (k, v) in entries {
                     if k == "proc-macro" && matches!(v, Value::Bool(true)) {
                         m.proc_macro = true;
+                    }
+                    if let Value::Str(value) = v {
+                        if k == "name" {
+                            m.lib_name = Some(value.clone());
+                        } else if k == "path" {
+                            m.lib_path = Some(value.clone());
+                        }
                     }
                 }
             }
@@ -754,6 +765,95 @@ pub(crate) fn external_dependency_names(root: &Path, dir: &str) -> Result<Vec<St
         })
         .map(|edge| edge.package.unwrap_or(edge.key))
         .collect())
+}
+
+/// Normal dependency aliases with a proved default library source in another workspace member.
+/// Multiple cfg-selected destinations remain a set; callers must not choose one arbitrarily.
+pub(crate) fn member_dependency_aliases(
+    root: &Path,
+    dir: &str,
+) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
+    let manifest = load_manifest(root, dir)?;
+    let mut aliases: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for edge in &manifest.deps {
+        let destinations = aliases.entry(edge.key.replace('-', "_")).or_default();
+        let child = if edge.workspace {
+            manifest
+                .ws_deps
+                .get(&edge.key)
+                .and_then(|dep| dep.dir.clone())
+        } else {
+            edge.path
+                .as_deref()
+                .map(|path| normalize_rel(dir, path))
+                .transpose()?
+        };
+        let Some(child) = child.filter(|path| path.starts_with("crates/")) else {
+            destinations.insert(String::new());
+            continue;
+        };
+        let target = load_manifest(root, &child)?;
+        if target.proc_macro || target.lib_name.is_some() || target.lib_path.is_some() {
+            destinations.insert(String::new());
+            continue;
+        }
+        destinations.insert(child);
+    }
+    Ok(aliases)
+}
+
+/// One manifest's Cargo targets as its text declares them.
+pub(crate) struct ManifestTargets {
+    /// It has a `[package]`: a virtual manifest declares no target.
+    pub(crate) package: bool,
+    /// The package's `name`.
+    pub(crate) name: Option<String>,
+    /// The kinds (`lib`, `bin`, `test`, `bench`, `example`) whose discovery `[package]` turns
+    /// off (`autotests = false`).
+    pub(crate) undiscovered: Vec<&'static str>,
+    /// Each target table (`[lib]`, `[[bin]]`, `[[test]]`, `[[bench]]`, `[[example]]`) as its
+    /// kind, its `name` and its `path`.
+    pub(crate) declared: Vec<(&'static str, Option<String>, Option<String>)>,
+}
+
+/// The target tables of the manifest `text` (at `file`, for errors).
+pub(crate) fn manifest_targets(text: &str, file: &str) -> Result<ManifestTargets, String> {
+    const KINDS: [(&str, &str); 5] = [
+        ("lib", "autolib"),
+        ("bin", "autobins"),
+        ("test", "autotests"),
+        ("bench", "autobenches"),
+        ("example", "autoexamples"),
+    ];
+    let mut out = ManifestTargets {
+        package: false,
+        name: None,
+        undiscovered: Vec::new(),
+        declared: Vec::new(),
+    };
+    for (header, entries) in parse_doc(text, file)?.sections {
+        let string = |key: &str| {
+            entries.iter().find_map(|(k, v)| match v {
+                Value::Str(s) if k == key => Some(s.clone()),
+                _ => None,
+            })
+        };
+        if header == "package" {
+            out.package = true;
+            out.name = string("name");
+            for (kind, auto) in KINDS {
+                if entries
+                    .iter()
+                    .any(|(k, v)| k == auto && matches!(v, Value::Bool(false)))
+                {
+                    out.undiscovered.push(kind);
+                }
+            }
+        } else if let Some(&(kind, _)) = KINDS.iter().find(|(kind, _)| header == *kind) {
+            out.declared.push((kind, string("name"), string("path")));
+        }
+    }
+    Ok(out)
 }
 
 /// Computes the transitive closure of workspace members reachable from `dir`.
@@ -870,6 +970,19 @@ pub(crate) fn read_lock(root: &Path) -> Result<Vec<LockPackage>, String> {
     Ok(out)
 }
 
+fn dep_targets_pkg(edge: &DepEdge, dep: &str) -> bool {
+    match edge.package.as_deref() {
+        Some(pkg) => pkg == dep,
+        None => {
+            edge.key == dep
+                || edge
+                    .path
+                    .as_deref()
+                    .is_some_and(|p| p == dep || p.ends_with(&format!("/{dep}")))
+        }
+    }
+}
+
 /// Finds manifest lines in `text` that enable `dep`'s `feature` in a shipped build.
 pub(crate) fn shipped_feature_enablers(
     text: &str,
@@ -878,7 +991,7 @@ pub(crate) fn shipped_feature_enablers(
     feature: &str,
 ) -> Result<Vec<String>, String> {
     let doc = parse_doc(text, file)?;
-    let forwards = [format!("{dep}/{feature}"), format!("{dep}?/{feature}")];
+    let mut aliases = BTreeSet::from([dep.to_string()]);
     let mut out = Vec::new();
     for (header, entries) in &doc.sections {
         if header.is_empty() {
@@ -887,28 +1000,44 @@ pub(crate) fn shipped_feature_enablers(
         match classify_section(header, file)? {
             SectionKind::NormalDeps | SectionKind::WorkspaceDeps => {
                 for (k, v) in entries {
-                    if k != dep {
+                    let edge = dep_edge(k, v, file)?;
+                    if !dep_targets_pkg(&edge, dep) {
                         continue;
                     }
-                    if dep_edge(k, v, file)?.features.iter().any(|f| f == feature) {
-                        out.push(format!(
-                            "[{header}] {dep} = {{ features = [\"{feature}\"] }}"
-                        ));
+                    aliases.insert(edge.key);
+                    if edge.features.iter().any(|f| f == feature) {
+                        out.push(format!("[{header}] {k} = {{ features = [\"{feature}\"] }}"));
                     }
                 }
             }
-            SectionKind::Features => {
-                for (k, v) in entries {
-                    let Value::Array(items) = v else { continue };
-                    if items
-                        .iter()
-                        .any(|it| matches!(it, Value::Str(s) if forwards.contains(s)))
-                    {
-                        out.push(format!("[{header}] {k} forwards {dep}/{feature}"));
+            SectionKind::NormalDep(name) => {
+                let edge = dep_edge(&name, &Value::Table(entries.clone()), file)?;
+                if dep_targets_pkg(&edge, dep) {
+                    aliases.insert(edge.key);
+                    if edge.features.iter().any(|f| f == feature) {
+                        out.push(format!("[{header}] features = [\"{feature}\"]"));
                     }
                 }
             }
             _ => {}
+        }
+    }
+    let forwards: BTreeSet<String> = aliases
+        .iter()
+        .flat_map(|a| [format!("{a}/{feature}"), format!("{a}?/{feature}")])
+        .collect();
+    for (header, entries) in &doc.sections {
+        if header.is_empty() || !matches!(classify_section(header, file)?, SectionKind::Features) {
+            continue;
+        }
+        for (k, v) in entries {
+            let Value::Array(items) = v else { continue };
+            if items
+                .iter()
+                .any(|it| matches!(it, Value::Str(s) if forwards.contains(s)))
+            {
+                out.push(format!("[{header}] {k} forwards {dep}/{feature}"));
+            }
         }
     }
     Ok(out)

@@ -729,6 +729,7 @@ impl Stub {
             }
             match script.and_then(|s| tool_turn(body, &s)) {
                 Some(ToolTurn::Call(name, input, step)) => {
+                    let note = super::misfit_note(body, &[(&name, &input)]);
                     let call = J::obj([
                         (
                             "functionCall",
@@ -736,7 +737,7 @@ impl Stub {
                         ),
                         ("thoughtSignature", J::s(SIGNATURE)),
                     ]);
-                    let s = format!("{summary} tool:{name} step {step}");
+                    let s = format!("{summary} tool:{name} step {step}{note}");
                     return self.gemini_answer(t, &s, vec![(0.0, vec![call])], &[], out);
                 }
                 Some(ToolTurn::Done) => {
@@ -750,6 +751,7 @@ impl Stub {
         if let Some(spec) = self.take_custom(&mode, Some(label)) {
             let spec = super::with_reply(spec, &gemini_users(body));
             if let Some((name, input)) = super::scripted_call(&spec, results_answered(body)) {
+                let note = super::misfit_note(body, &[(&name, &input)]);
                 let call = J::obj([
                     (
                         "functionCall",
@@ -757,7 +759,7 @@ impl Stub {
                     ),
                     ("thoughtSignature", J::s(SIGNATURE)),
                 ]);
-                let s = format!("{summary} custom tool:{name}");
+                let s = format!("{summary} custom tool:{name}{note}");
                 let t = (method, path, blen, mode.as_str(), model, verb, in_tok);
                 return self.gemini_answer(t, &s, vec![(0.0, vec![call])], &[], out);
             }

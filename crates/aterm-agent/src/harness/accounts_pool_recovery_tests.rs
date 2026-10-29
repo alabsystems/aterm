@@ -110,7 +110,7 @@ fn observe_read(cli: Cli, case: i64, policy_only: bool) -> (i64, [bool; 4]) {
     let _held = (case == 4).then(|| store.acquire().unwrap());
     let reads = AtomicUsize::new(0);
     let injected = AtomicBool::new(false);
-    let read = |_: Cli, _: &Path, _: i64| {
+    let read = |_: Cli, _: &Path, _: Option<&str>, _: i64| {
         reads.fetch_add(1, Ordering::SeqCst);
         if case == 8 && !injected.swap(true, Ordering::SeqCst) {
             pending_renewal(&world, cli, &staging, false);
@@ -145,10 +145,10 @@ fn observe_read(cli: Cli, case: i64, policy_only: bool) -> (i64, [bool; 4]) {
                     snapshot.roster.row("work").unwrap().dir.as_deref(),
                     staging.to_str()
                 );
-                super::super::launch_env_using(&world.seat(), cli, &read, prepare)
+                super::super::launch_env_using(&world.seat(), cli, &read, None, prepare)
             })
         } else {
-            super::super::launch_env_using(&world.seat(), cli, &read, prepare)
+            super::super::launch_env_using(&world.seat(), cli, &read, None, prepare)
         };
         match result {
             Ok(Some(env)) => {
@@ -268,7 +268,7 @@ fn bound_roster_recovers_policy_without_reading_unrelated_budget() {
             "a policy read never repairs unrelated malformed budget bytes"
         );
         let reads = AtomicUsize::new(0);
-        let read = |_: Cli, _: &Path, _: i64| {
+        let read = |_: Cli, _: &Path, _: Option<&str>, _: i64| {
             reads.fetch_add(1, Ordering::SeqCst);
             None
         };
@@ -299,7 +299,7 @@ fn session_move_recovers_a_commit_and_discards_the_stale_prepared_line() {
         Path::new("/opt/provider"),
     );
     let mut prepared = false;
-    let result = super::super::session_move_using(&world.seat(), &s, |row| {
+    let result = super::session_move_using(&world.seat(), &s, |row| {
         let env = login_env(cli, row, &world.home).unwrap();
         let line = relaunch::pool_line(&s.relaunch, cli, &env).unwrap();
         pending_renewal(&world, cli, &staging, false);

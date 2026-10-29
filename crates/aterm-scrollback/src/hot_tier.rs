@@ -63,6 +63,35 @@ impl HotTier {
         })
     }
 
+    /// Inline-image spans on hot line `idx` (`0` = oldest in hot tier), if any.
+    #[must_use]
+    #[cfg_attr(trust_verify, trust::skip)]
+    #[inline]
+    pub(crate) fn line_images(&self, idx: usize) -> Option<&[ImageSpan]> {
+        self.lines.get(idx)?.images()
+    }
+
+    /// Replace inline-image spans on hot line `rev_idx` (`0` = newest in hot tier) and reconcile byte counts.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub(crate) fn set_line_images_rev(&mut self, rev_idx: usize, spans: Vec<ImageSpan>) -> bool {
+        if rev_idx >= self.lines.len() {
+            return false;
+        }
+        let hot_idx = self.lines.len().saturating_sub(1).saturating_sub(rev_idx);
+        let Some(line) = self.lines.get_mut(hot_idx) else {
+            return false;
+        };
+        let before = line.memory_used();
+        line.set_images(spans);
+        let after = line.memory_used();
+        self.bytes_used = self.bytes_used.saturating_sub(before).saturating_add(after);
+        self.budgeted_bytes = self
+            .budgeted_bytes
+            .saturating_sub(before)
+            .saturating_add(after);
+        before != after || line.has_images()
+    }
+
     /// Retain selected image spans and reconcile both running byte counts.
     pub(crate) fn retain_images(&mut self, keep: &mut dyn FnMut(&ImageSpan) -> bool) -> bool {
         let mut changed = false;

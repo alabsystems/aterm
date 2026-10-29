@@ -98,14 +98,18 @@ impl Record {
             .and_then(Value::as_u64)
             .filter(|p| (2..=i32::MAX as u64).contains(p))
             .and_then(|p| u32::try_from(p).ok());
-        let started = v
+        // 2^64 is exact in IEEE-754 binary64; any microsecond value >= 2^64 would saturate
+        // `as u64` to `u64::MAX`.
+        let started_us = v
             .get("started")
             .and_then(Value::as_f64)
-            .filter(|s| s.is_finite() && *s >= 0.0);
-        match (pid, started) {
-            (Some(pid), Some(started)) if version_known && strings => RecordRead::Rec(Self {
+            .map(|s| s * 1e6)
+            .filter(|us| us.is_finite() && (0.0..18_446_744_073_709_551_616.0).contains(us))
+            .map(|us| us as u64);
+        match (pid, started_us) {
+            (Some(pid), Some(started_us)) if version_known && strings => RecordRead::Rec(Self {
                 pid,
-                started_us: (started * 1e6) as u64,
+                started_us,
                 cwd: v.get("cwd").and_then(Value::as_str).map(PathBuf::from),
             }),
             _ => RecordRead::Bad,

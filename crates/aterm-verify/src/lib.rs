@@ -23,6 +23,7 @@ pub mod findings;
 pub mod fmt;
 pub mod ladder;
 pub mod libtest;
+pub mod memory;
 pub mod perf;
 pub mod plan;
 #[cfg(unix)]
@@ -336,7 +337,8 @@ pub struct Ctx {
     /// HEAD, in full, when the run's selection was read ([`report::moved_checkout`]); unset, the
     /// run reads it as it begins.
     pub head_at_start: Option<String>,
-    /// The ceiling on one stage child's work, its waits for admission or a lock left out ([`exec::ExecEnv::child_ceiling`]).
+    /// The ceiling on one stage child's work, its waits for admission, a lock or a core left out
+    /// ([`exec::ExecEnv::child_ceiling`]).
     pub child_ceiling: Option<Duration>,
     /// `--no-windows`.
     pub no_windows: bool,
@@ -355,6 +357,9 @@ pub struct Ctx {
     pub quiet: Option<aterm_capacity::Admit>,
     /// This run's record of its stage groups ([`runs::Runs`]), when it keeps one.
     pub runs: Option<runs::Runs>,
+    /// Where the run keeps what each stage's memory peaked at, and the machine it claims on
+    /// ([`memory::Book`], VERIFY-MEM); `None` measures nothing and keeps nothing.
+    pub memory: Option<memory::Book>,
 }
 
 /// A `CARGO_BUILD_JOBS` value as a job count.
@@ -449,6 +454,7 @@ impl Ctx {
             test_recorder: std::env::current_exe().ok(),
             quiet: None,
             runs: None,
+            memory: None,
         };
         ctx.refresh_test_threads();
         ctx
@@ -642,6 +648,13 @@ impl Ctx {
         self
     }
 
+    /// Measure each stage's memory and keep its peak in `book` ([`Ctx::memory`]).
+    #[must_use]
+    pub fn with_memory(mut self, book: memory::Book) -> Self {
+        self.memory = Some(book);
+        self
+    }
+
     /// Take the quiet machine around the timing stages, admitted as `mode` says ([`Ctx::quiet`]).
     #[must_use]
     pub const fn with_quiet(mut self, mode: Option<aterm_capacity::Admit>) -> Self {
@@ -660,6 +673,7 @@ impl Ctx {
             remove_env: &self.child_env_remove,
             add_env: &self.child_env_add,
             stage_groups: self.runs.as_ref().map(|r| r as &dyn exec::StageGroupEnd),
+            host: &exec::LIVE_HOST,
         }
     }
 
@@ -696,25 +710,72 @@ impl Ctx {
     }
 }
 
-/// How a timed stage's quiet claim is admitted: [`aterm_capacity::admit`], or a test's.
-type AdmitQuiet = fn(
+/// How a claim in this user's capacity ledger is admitted, a timed stage's quiet claim or a
+/// stage's memory claim: [`aterm_capacity::admit`], or a test's.
+type Admitter = fn(
     aterm_capacity::Need,
     aterm_capacity::Admit,
 ) -> Result<aterm_capacity::Claim, aterm_capacity::Error>;
 
-/// What runs a stage and admits the run's quiet machine: the live ones ([`LIVE`]), or a test's
-/// stand-ins.
+/// What runs a stage, admits the run's quiet machine and admits each stage's memory: the live
+/// ones ([`LIVE`]), or a test's stand-ins.
 #[derive(Clone, Copy)]
 struct Seams {
     stage: fn(&Ctx, &plan::StageSpec) -> Report,
-    admit_quiet: AdmitQuiet,
+    admit_quiet: Admitter,
+    admit_memory: Admitter,
 }
 
 /// The stages themselves, and the per-user capacity ledger on the live machine.
 const LIVE: Seams = Seams {
     stage: stages::run_stage,
-    admit_quiet: aterm_capacity::admit,
+    admit_quiet: admit_live,
+    admit_memory: admit_live,
 };
+
+/// Admit `need` in this user's ledger on the live machine ([`admit_in`]), saying on stderr what
+/// it waits for.
+///
+/// # Errors
+/// As [`admit_in`]; [`aterm_capacity::Error::Ledger`] with no home to keep the ledger under.
+fn admit_live(
+    need: aterm_capacity::Need,
+    mode: aterm_capacity::Admit,
+) -> Result<aterm_capacity::Claim, aterm_capacity::Error> {
+    let ledger = aterm_capacity::Ledger::user().ok_or_else(|| {
+        aterm_capacity::Error::Ledger(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no home directory to keep the ledger under",
+        ))
+    })?;
+    admit_in(
+        &ledger,
+        &aterm_capacity::Live,
+        aterm_capacity::Pace::default(),
+        need,
+        mode,
+        &mut |line| eprintln!("{line}"),
+    )
+}
+
+/// Admit `need` in `ledger` on `machine` as [`aterm_capacity::admit_with`] does, saying through
+/// `say` what it waits for, its wait ended by the run's end too ([`stopping`]): one interrupt
+/// reaches one of the run's waits (`aterm_toolchain::interrupt::Watch::take`), which ends the run
+/// (`exec::group::stop_run`), and every other wait of its stages, a quiet claim's or another
+/// stage's memory claim's, ends at its next look.
+///
+/// # Errors
+/// As [`aterm_capacity::admit_until`]: [`aterm_capacity::Error::Stopped`] once the run ends.
+fn admit_in(
+    ledger: &aterm_capacity::Ledger,
+    machine: &dyn aterm_capacity::Machine,
+    pace: aterm_capacity::Pace,
+    need: aterm_capacity::Need,
+    mode: aterm_capacity::Admit,
+    say: &mut dyn FnMut(&str),
+) -> Result<aterm_capacity::Claim, aterm_capacity::Error> {
+    aterm_capacity::admit_until(ledger, machine, need, mode, pace, say, &stopping)
+}
 
 /// The run's quiet machine ([`Ctx::quiet`]): one claim, admitted before the run's first timed
 /// stage and let go when its last ends, so another run's timed stages wait for all of this run's
@@ -725,12 +786,12 @@ struct Quiet {
     /// The run's timed stages still to end ([`takes_quiet`]).
     left: usize,
     /// How the claim is admitted.
-    admit: AdmitQuiet,
+    admit: Admitter,
 }
 
 impl Quiet {
     /// Room for the timed stages of `stages` that `ctx` runs, admitted by `admit`.
-    fn of(ctx: &Ctx, stages: &[plan::StageSpec], admit: AdmitQuiet) -> Mutex<Quiet> {
+    fn of(ctx: &Ctx, stages: &[plan::StageSpec], admit: Admitter) -> Mutex<Quiet> {
         Mutex::new(Quiet {
             claim: None,
             left: stages.iter().filter(|s| takes_quiet(ctx, s.id)).count(),
@@ -863,7 +924,8 @@ fn quietly<T>(
 }
 
 /// The ` time ` line under a stage in the log: how long it ran, when it started, and `machine`,
-/// what the machine did meanwhile ([`aterm_capacity::between`]) and how a timed stage was admitted.
+/// what the machine did meanwhile ([`aterm_capacity::between`]), how a timed stage was admitted
+/// and what memory the stage waited for and peaked at.
 #[must_use]
 pub fn time_line(begun: Duration, ran: Duration, machine: &str) -> String {
     let mut line = format!(
@@ -880,51 +942,265 @@ pub fn time_line(begun: Duration, ran: Duration, machine: &str) -> String {
 }
 
 /// Whether stage `id` runs on the quiet machine: a timed stage ([`plan::TIMED`]) that runs, not
-/// one that is a named skip before it starts anything (a windowed stage under `--no-windows`, a
-/// measuring one with no `--app`).
+/// a named skip before it starts anything ([`plan::named_skip`]: a windowed stage under
+/// `--no-windows`, a measuring one with no `--app`).
 fn takes_quiet(ctx: &Ctx, id: plan::StageId) -> bool {
-    let needs_app = matches!(id, plan::StageId::MeasuringTests | plan::StageId::GuiSmoke);
-    id.timed()
-        && !(ctx.no_windows && id.no_windows_skip().is_some())
-        && !(needs_app && ctx.measure_artifact.is_none())
+    id.timed() && !plan::named_skip(ctx, id)
 }
 
-/// One stage, run by `stage` on the run's quiet machine when it is timed ([`quietly`]), with the
-/// machine read as it starts and as it ends: the report, when it started (after any admission
-/// wait) and what the machine did meanwhile. A stage the run's end keeps from starting
-/// ([`stopping`]), or whose quiet claim an interrupt ended, is COULD NOT RUN.
+/// What stage `spec`'s memory did, for its time line, what it held read off `meter`
+/// ([`memory::Meter::held`]: 0 when it started no child) kept in the run's book
+/// ([`memory::Book::keep`]) when it is what the stage takes: only when a row of it passed and
+/// none failed, since a stage that failed or could not run may have stopped short of its peak (a
+/// compile error in its fifth crate) and one whose every row was skipped did none of its work;
+/// and a 0 only when no row was skipped either, since the skipped row may be the one that starts
+/// a child. A figure not kept is said. `None` when nothing was measured: no book, a stage that is
+/// not metered, or children no read booked.
+fn measured(
+    ctx: &Ctx,
+    spec: &plan::StageSpec,
+    report: &Report,
+    meter: Option<&memory::Meter>,
+) -> Option<String> {
+    let book = ctx.memory.as_ref()?;
+    let meter = meter?;
+    let peak = meter.held()?;
+    let size = meter.peak().map_or_else(
+        || "nothing: it started no child".to_owned(),
+        aterm_capacity::size,
+    );
+    let rows: Vec<Outcome> = report.outcomes().map(|(o, _)| o).collect();
+    let not_kept = if rows.iter().any(|o| matches!(o, Outcome::Fail(_))) {
+        Some("a stage that did not pass may have stopped short of its peak")
+    } else if !rows.contains(&Outcome::Ok) {
+        Some("no row of it passed, so it did none of its work")
+    } else if peak == 0 && rows.contains(&Outcome::Skip) {
+        Some("it skipped a row, which may be the one that starts a child")
+    } else {
+        None
+    };
+    if let Some(why) = not_kept {
+        return Some(format!("memory: peaked {size}, not kept: {why}"));
+    }
+    let key = memory::Key::of_run(spec.id, ctx);
+    Some(match book.keep(spec, &key, peak) {
+        Ok(()) => format!("memory: peaked {size}"),
+        Err(e) => format!("memory: peaked {size}, not kept: {e}"),
+    })
+}
+
+/// What the run's memory budget of `budget` bytes held stage `i` of `stages` back for
+/// ([`sched::Held`]), for its time line: `memory: held 41.2s for room behind tippy lint (-p
+/// aterm-gui): it claims 12 GiB of the run's 21.5 GiB`; `None` when it was not held.
+fn held_note(
+    stages: &[plan::StageSpec],
+    i: usize,
+    held: &sched::Held,
+    budget: u64,
+) -> Option<String> {
+    if held.behind.is_empty() {
+        return None;
+    }
+    let behind: Vec<&str> = held
+        .behind
+        .iter()
+        .filter_map(|&j| stages.get(j).map(|s| s.title.as_str()))
+        .collect();
+    Some(format!(
+        "memory: held {:.1}s for room behind {}: it claims {} of the run's {}",
+        held.waited.as_secs_f64(),
+        behind.join(", "),
+        aterm_capacity::size(stages.get(i).map_or(0, |s| s.mem)),
+        aterm_capacity::size(budget),
+    ))
+}
+
+/// A stage's memory claim in this user's capacity ledger ([`claim_memory`]), held until the
+/// stage ends, and what it did for the stage's time line.
+struct MemoryClaim {
+    /// The claim; `None` where the ledger could not be used and the stage runs unadmitted.
+    _claim: Option<aterm_capacity::Claim>,
+    /// What it claimed, why, and how it was admitted.
+    said: String,
+}
+
+/// How `claim`, admitted as `mode` says, came to be admitted, for its stage's time line: by
+/// `--admit now`; after how long a wait for what (behind which claims, for the memory pressure to
+/// ease, or for memory no claim holds); and alone ([`aterm_capacity::Alone`]). Empty for a claim
+/// admitted beside the others at its first look.
+fn admitted_how(claim: &aterm_capacity::Claim, mode: aterm_capacity::Admit) -> String {
+    let mut how = match mode {
+        aterm_capacity::Admit::Now => ", admitted by --admit now".to_owned(),
+        aterm_capacity::Admit::Wait if claim.waited() >= Duration::from_secs(1) => {
+            let what = match claim.waited_for() {
+                Some(short) if !short.holders.is_empty() => format!(
+                    "behind {}",
+                    short
+                        .holders
+                        .iter()
+                        .map(|h| format!("pid {} ({:?})", h.pid, h.what))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Some(short) if short.shorts.contains(&aterm_capacity::Short::Pressure) => {
+                    "for the memory pressure to ease".to_owned()
+                }
+                _ => "for memory no claim holds".to_owned(),
+            };
+            format!(
+                ", after {} waiting {what}",
+                aterm_capacity::span(claim.waited())
+            )
+        }
+        aterm_capacity::Admit::Wait => String::new(),
+    };
+    if let Some(alone) = claim.alone() {
+        how.push_str(", ");
+        how.push_str(&alone.to_string());
+    }
+    how
+}
+
+/// Claim stage `spec`'s memory ([`plan::StageSpec::mem`]) in this user's capacity ledger before
+/// it starts, admitted by `admit` as `--admit` says ([`Ctx::quiet`], wait unless it says now):
+/// waiting, with no deadline, while other runs' claims and what is available leave no room for
+/// it, and saying once a minute what it waits for; at once under `--admit now`. Short only of
+/// memory no claim holds (other work on the machine), it is admitted alone, as the ledger's ALONE
+/// rule says, and no other memory claim is admitted while it runs. A stage that claims more than
+/// can ever be available here ([`memory::Book::budget`]), which the ledger would refuse, asks to
+/// run alone ([`aterm_capacity::Need::alone`]): it waits for every other memory claim to end and
+/// then runs with none beside it, in this run ([`sched::memory_holders`]) or another. One the
+/// ledger refuses at its look though the run's budget held it (the machine read now has more
+/// wired) asks again, alone. A ledger that cannot be used is said, and the stage runs
+/// unadmitted. `Ok(None)` for a stage that claims nothing, or a run with no book.
+///
+/// # Errors
+/// Why the stage never ran: an interrupt ended the wait, which ends the run
+/// (`exec::group::stop_run`, as a quiet claim's does in [`quietly`]); or the run was already
+/// ending ([`stopping`]), and no wait begins.
+fn claim_memory(
+    ctx: &Ctx,
+    spec: &plan::StageSpec,
+    admit: Admitter,
+) -> Result<Option<MemoryClaim>, String> {
+    let Some(book) = ctx.memory.as_ref().filter(|_| spec.mem > 0) else {
+        return Ok(None);
+    };
+    if stopping() {
+        return Err(ENDING.to_owned());
+    }
+    let mode = ctx.quiet.unwrap_or(aterm_capacity::Admit::Wait);
+    let budget = book.budget();
+    let need = book.need(spec, &memory::Key::of_run(spec.id, ctx));
+    let why = if need.bytes == spec.mem {
+        need.to_string()
+    } else {
+        aterm_capacity::size(spec.mem)
+    };
+    let title = &spec.title;
+    let ask = |alone: bool| {
+        let need = aterm_capacity::Need::new(format!("verify {title}")).mem(spec.mem);
+        if alone { need.alone() } else { need }
+    };
+    let beyond = spec.mem >= budget;
+    let mut admitted = admit(ask(beyond), mode);
+    if !beyond && matches!(admitted, Err(aterm_capacity::Error::Never(_))) {
+        admitted = admit(ask(true), mode);
+    }
+    let what = if beyond {
+        format!(
+            "claimed {why}: more than the {} that can ever be available here, so it asks to run \
+             alone",
+            aterm_capacity::size(budget)
+        )
+    } else {
+        format!("claimed {why}")
+    };
+    match admitted {
+        Ok(claim) => {
+            let how = admitted_how(&claim, mode);
+            Ok(Some(MemoryClaim {
+                _claim: Some(claim),
+                said: format!("memory: {what}{how}"),
+            }))
+        }
+        Err(e @ aterm_capacity::Error::Stopped { .. }) => {
+            eprintln!(
+                "verify: {title}: its memory claim was {e}; the run ends, and what it did not \
+                 decide COULD NOT RUN"
+            );
+            #[cfg(unix)]
+            exec::group::stop_run();
+            Err(format!(
+                "its memory claim was {e}; it started nothing, and the run ends"
+            ))
+        }
+        Err(e) => {
+            eprintln!("verify: {e}; {title} runs unadmitted");
+            Ok(Some(MemoryClaim {
+                _claim: None,
+                said: format!("memory: {what}, unadmitted: {e}"),
+            }))
+        }
+    }
+}
+
+/// One stage, run by `seams.stage` once its memory is claimed ([`claim_memory`]), on the run's
+/// quiet machine when it is timed ([`quietly`]), with the machine read as it starts and as it
+/// ends and its memory metered ([`memory::Meter`]): the report, when it started (after any
+/// admission wait) and what the machine did meanwhile, with `held`, what the run's memory budget
+/// held it back for ([`held_note`]), and what its claim did. A timed stage claims its memory
+/// only once it holds the quiet machine: a run holds that across all of its timed stages, so a
+/// timed stage of another run that held memory while it waited for it could keep this run's next
+/// timed stage waiting for that memory, and neither would ever start. A stage holds its memory
+/// claim until it ends, and waits for nothing while it holds one. A stage the run's end keeps
+/// from starting ([`stopping`]), or whose memory or quiet claim an interrupt ended, is COULD NOT
+/// RUN.
 fn staged(
     ctx: &Ctx,
     quiet: &Mutex<Quiet>,
     spec: &plan::StageSpec,
-    stage: fn(&Ctx, &plan::StageSpec) -> Report,
+    held: Option<String>,
+    seams: Seams,
 ) -> (Report, Instant, String) {
+    let stage = seams.stage;
+    let could_not_run = |why: String, held: Option<String>| {
+        let mut report = Report::new(spec.title.clone());
+        report.cannot_run(format!("{} — {why}", spec.title));
+        (report, Instant::now(), held.unwrap_or_default())
+    };
+    let meter = (ctx.memory.is_some() && memory::metered(spec)).then(memory::Meter::new);
     let run = || {
+        let claim = claim_memory(ctx, spec, seams.admit_memory)?;
+        if stopping() {
+            return Err(ENDING.to_owned());
+        }
+        let _metering = memory::metering(meter.clone());
         let begun = Instant::now();
         let from = aterm_capacity::Live.read(None);
         let report = stage(ctx, spec);
         let to = aterm_capacity::Live.read(None);
-        (report, begun, aterm_capacity::between(&from, &to))
+        Ok((report, begun, aterm_capacity::between(&from, &to), claim))
     };
     let ran = if takes_quiet(ctx, spec.id) {
-        quietly(ctx, quiet, &spec.title, run)
-    } else if stopping() {
-        Err(ENDING.to_owned())
+        quietly(ctx, quiet, &spec.title, run).and_then(|(ran, admitted)| Ok((ran?, admitted)))
     } else {
-        Ok((run(), None))
+        run().map(|ran| (ran, None))
     };
-    let ((report, begun, mut machine), admitted) = match ran {
+    let ((report, begun, mut machine, claim), admitted) = match ran {
         Ok(ran) => ran,
-        Err(why) => {
-            let mut report = Report::new(spec.title.clone());
-            report.cannot_run(format!("{} — {why}", spec.title));
-            return (report, Instant::now(), String::new());
-        }
+        Err(why) => return could_not_run(why, held),
     };
-    if let Some(said) = admitted {
+    let claimed = claim.as_ref().map(|c| c.said.clone());
+    for said in held.into_iter().chain(claimed).chain(admitted) {
         machine.push_str("; ");
         machine.push_str(&said);
     }
+    if let Some(said) = measured(ctx, spec, &report, meter.as_deref()) {
+        machine.push_str("; ");
+        machine.push_str(&said);
+    }
+    drop(claim);
     (report, begun, machine)
 }
 
@@ -1007,7 +1283,7 @@ pub fn run(
     run_with(ctx, out, log, show, LIVE)
 }
 
-/// [`run`], its stages run and its quiet machine admitted by `seams`.
+/// [`run`], its stages run, and its quiet machine and its stages' memory admitted, by `seams`.
 fn run_with(
     ctx: &Ctx,
     out: &mut (dyn Write + Send),
@@ -1056,16 +1332,19 @@ fn run_with(
     let clocks: Mutex<Vec<Option<Clock>>> = Mutex::new(vec![None; stages.len()]);
     let quiet = Quiet::of(ctx, &stages, seams.admit_quiet);
     let mut log_err = None;
+    let budget = ctx.memory.as_ref().map_or(u64::MAX, memory::Book::budget);
 
     sched::run_stages(
         &stages,
-        |spec| {
+        budget,
+        |spec, held| {
             let i = stages
                 .iter()
                 .position(|s| std::ptr::eq(s, spec))
                 .unwrap_or_default();
             let owner = owners[i].and_then(|c| ctx.checks.iter().position(|k| *k == c));
-            let (report, begun_at, machine) = staged(ctx, &quiet, spec, seams.stage);
+            let held = held_note(&stages, i, held, budget);
+            let (report, begun_at, machine) = staged(ctx, &quiet, spec, held, seams);
             if let Some(k) = owner
                 && let Ok(mut p) = progress[k].lock()
             {
@@ -1466,6 +1745,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         .with_test_jobs(parsed.test_jobs)
         .with_test_threads(parsed.test_threads)
         .with_quiet(Some(parsed.admit))
+        .with_memory(memory::Book::live())
         .with_toolchain_lease(lease_said)
         .with_quiet_tmpdir(&std::env::temp_dir())
         .with_head_at_start(head_at_start);
@@ -1555,37 +1835,27 @@ pub fn mktemp_dir(tag: &str) -> std::io::Result<PathBuf> {
 
 /// Put an executable `#!/bin/sh` stand-in running `body` at `path`, replacing whatever is there.
 ///
+/// `path` is a symlink to its text's one read-only file in this user's stand-in cache: one file
+/// per text to a process, the one a later process finds whole, though first writers that raced
+/// may each run a slot of their own ([`aterm_tempfile::shared_stand_in`] says why that file has
+/// one name and no fixture holds one); where that cache cannot be used, the stand-in is written
+/// at `path` itself and runs no file of the cache.
+///
 /// # Panics
 /// When `path`'s directory cannot be made or the stand-in cannot be written.
 #[cfg(unix)]
 #[doc(hidden)]
 pub fn standin(path: &Path, body: &str) {
-    use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{OnceLock, PoisonError};
-    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
-    static SHARED: Mutex<BTreeMap<String, PathBuf>> = Mutex::new(BTreeMap::new());
 
     let text = format!("#!/bin/sh\n{body}\n");
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).expect("mkdir");
     }
     let _ = std::fs::remove_file(path);
-    let shared = DIR
-        .get_or_init(|| mktemp_dir("atv-standins").ok())
-        .as_ref()
-        .and_then(|dir| {
-            let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(file) = shared.get(&text) {
-                return Some(file.clone());
-            }
-            let file = dir.join(shared.len().to_string());
-            std::fs::write(&file, &text).ok()?;
-            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o555)).ok()?;
-            shared.insert(text.clone(), file.clone());
-            Some(file)
-        });
-    if shared.is_some_and(|file| std::fs::hard_link(file, path).is_ok()) {
+    if aterm_tempfile::shared_stand_in(&text)
+        .is_some_and(|file| std::os::unix::fs::symlink(file, path).is_ok())
+    {
         return;
     }
     std::fs::write(path, &text).expect("write");
@@ -1640,9 +1910,45 @@ pub use aterm_uds::host::{host_user_cache, user_cache};
 #[cfg(all(test, unix))]
 mod quiet_interrupt_tests;
 
+#[cfg(all(test, unix))]
+mod memory_claim_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fixture going removes no name of the file another fixture's stand-in of the same text
+    /// runs ([`standin`]): that file has one name, outside every fixture, and the stand-in
+    /// still reads its body beside its own path.
+    #[cfg(unix)]
+    #[test]
+    fn a_fixture_going_leaves_the_file_another_standin_runs_its_one_name() {
+        use std::os::unix::fs::MetadataExt as _;
+        let gone = mktemp_dir("atv-standin-gone").expect("mktemp");
+        let kept = mktemp_dir("atv-standin-kept").expect("mktemp");
+        standin_body(&gone.join("tool"), "exit 6");
+        standin_body(&kept.join("tool"), "exit 7");
+        std::fs::remove_dir_all(&gone).expect("the first fixture goes");
+        let ran = aterm_uds::spawnfd::command(kept.join("tool"))
+            .status()
+            .map(|s| s.code());
+        let runs = std::fs::canonicalize(kept.join("tool")).expect("the stand-in resolves");
+        let fixture = std::fs::canonicalize(&kept).expect("the fixture resolves");
+        let names = std::fs::metadata(&runs).map(|m| m.nlink());
+        std::fs::remove_dir_all(&kept).expect("the second fixture goes");
+        assert_eq!(ran.ok(), Some(Some(7)), "the stand-in ran its own body");
+        assert!(
+            !runs.starts_with(&fixture),
+            "{} runs from inside its fixture",
+            runs.display()
+        );
+        assert_eq!(
+            names.ok(),
+            Some(1),
+            "{} has names a fixture removes",
+            runs.display()
+        );
+    }
 
     #[test]
     fn a_borrowed_tools_build_is_held_for_the_run() {
@@ -1781,7 +2087,9 @@ mod tests {
         assert!(has(&threaded, "RUST_TEST_THREADS", "3"));
     }
 
-    /// A run's children get the temp directory's quiet folder as `TMPDIR` on macOS.
+    /// A run's children get the temp directory's quiet folder as `TMPDIR` on macOS. The loud
+    /// directory is a private scratch one, not `/tmp`, whose shared quiet folder another program
+    /// or user may have made in a form this one refuses (verify passes `std::env::temp_dir()`).
     /// NEGATIVE CONTROL: a temp directory quiet already, and any off macOS, is left as it is.
     #[test]
     fn stage_children_get_a_quiet_tmpdir() {
@@ -1801,11 +2109,14 @@ mod tests {
         };
         let scratch = aterm_tempfile::tempdir().expect("scratch");
         assert_eq!(tmpdir(&ctx().with_quiet_tmpdir(scratch.path())), None);
-        let loud = PathBuf::from("/tmp");
-        let got = tmpdir(&ctx().with_quiet_tmpdir(&loud));
+        let loud = aterm_tempfile::Builder::new()
+            .heard()
+            .tempdir()
+            .expect("a loud scratch directory");
+        let got = tmpdir(&ctx().with_quiet_tmpdir(loud.path()));
         if cfg!(target_os = "macos") {
             let got = got.expect("a quiet TMPDIR");
-            assert_eq!(got, loud.join(".ubd"));
+            assert_eq!(got, loud.path().join(".ubd"));
             assert!(got.as_os_str().to_string_lossy().ends_with("/.ubd/"));
             assert!(aterm_tempfile::is_quiet(scratch.path()), "{scratch:?}");
         } else {
@@ -2089,14 +2400,10 @@ mod tests {
             header(&ctx, Some("the cone"))
         };
         assert_eq!(head(&["aterm-gui"]), "verify: dev — the cone");
-        assert_eq!(
-            head(&["aterm-gpu"]),
-            "verify: dev + gpu-oracle (the selection holds aterm-gpu) — the cone"
-        );
+        assert_eq!(head(&["aterm-gpu"]), "verify: dev — the cone");
         assert_eq!(
             head(&["aterm-core", "aterm-gpu", "aterm-gpu-web", "aterm-wasm"]),
-            "verify: dev + gpu-oracle + wasm-smoke (the selection holds aterm-gpu, aterm-wasm) \
-             — the cone"
+            "verify: dev + wasm-smoke (the selection holds aterm-wasm) — the cone"
         );
         let pulled = |crates: &[&str]| {
             let scope = Scope::changed(
@@ -2124,9 +2431,8 @@ mod tests {
             "verify: dev + cells (each other OS's cell that builds a selected crate) — the cone"
         );
         assert_eq!(
-            pulled(&["aterm-gpu"]),
-            "verify: dev + gpu-oracle (the selection holds aterm-gpu) + cells (each other OS's \
-             cell that builds a selected crate) — the cone"
+            pulled(&["aterm-wasm"]),
+            "verify: dev + wasm-smoke (the selection holds aterm-wasm) + cells (each other OS's cell that builds a selected crate) — the cone"
         );
     }
 
@@ -2194,6 +2500,7 @@ mod tests {
                 Seams {
                     stage,
                     admit_quiet: LIVE.admit_quiet,
+                    admit_memory: LIVE.admit_memory,
                 },
             )
             .expect("the result written");
@@ -2207,5 +2514,32 @@ mod tests {
         assert_eq!(code, exit::COULD_NOT_RUN, "{out}");
         assert!(out.contains("the checkout moved from"), "{out}");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A stage the run's memory budget held back says so on its time line, naming for how long,
+    /// behind which stages, and what it claims of the budget; one never held says nothing.
+    /// NEGATIVE CONTROL: the same stage, not held, has no note.
+    #[test]
+    fn a_stage_held_for_memory_says_how_long_and_behind_what() {
+        const GIB: u64 = 1 << 30;
+        let stages: Vec<plan::StageSpec> = plan::declared(&Scope::crate_only("aterm-gui"))
+            .into_iter()
+            .filter(|s| matches!(s.id, plan::StageId::TestCompile | plan::StageId::Tippy))
+            .map(|s| plan::StageSpec { mem: 12 * GIB, ..s })
+            .collect();
+        let held = sched::Held {
+            waited: Duration::from_millis(41_250),
+            behind: vec![0],
+        };
+        let note = held_note(&stages, 1, &held, 43 * GIB / 2).expect("held");
+        assert_eq!(
+            note,
+            "memory: held 41.2s for room behind test compile (-p aterm-gui): it claims 12 GiB of \
+             the run's 21.5 GiB"
+        );
+        assert_eq!(
+            held_note(&stages, 1, &sched::Held::default(), 43 * GIB / 2),
+            None
+        );
     }
 }

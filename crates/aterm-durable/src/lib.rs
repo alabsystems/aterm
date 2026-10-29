@@ -17,27 +17,6 @@ pub enum Flush {
 }
 
 impl Flush {
-    /// Canonical 1-byte wire tag (`1` = `Durable`, `2` = `Ordered`).
-    #[inline]
-    #[must_use]
-    pub const fn as_u8(self) -> u8 {
-        match self {
-            Self::Durable => 1,
-            Self::Ordered => 2,
-        }
-    }
-
-    /// Decode a 1-byte wire tag (`1` = `Durable`, `2` = `Ordered`).
-    #[inline]
-    #[must_use]
-    pub const fn from_u8(tag: u8) -> Option<Self> {
-        match tag {
-            1 => Some(Self::Durable),
-            2 => Some(Self::Ordered),
-            _ => None,
-        }
-    }
-
     /// Whether this flush is [`Flush::Durable`].
     #[inline]
     #[must_use]
@@ -50,73 +29,6 @@ impl Flush {
     #[must_use]
     pub const fn is_ordered(self) -> bool {
         matches!(self, Self::Ordered)
-    }
-
-    /// [`Flush::Ordered`] when `written_dev == later_dev`, else [`Flush::Durable`].
-    #[inline]
-    #[must_use]
-    pub const fn for_devices(written_dev: u64, later_dev: u64) -> Self {
-        if written_dev == later_dev {
-            Self::Ordered
-        } else {
-            Self::Durable
-        }
-    }
-
-    /// Encode a 17-byte device-pair decision record.
-    #[inline]
-    #[must_use]
-    pub const fn encode_device_pair(written_dev: u64, later_dev: u64) -> [u8; 17] {
-        let tag = Self::for_devices(written_dev, later_dev).as_u8();
-        [
-            tag,
-            (written_dev & 0xFF) as u8,
-            ((written_dev >> 8) & 0xFF) as u8,
-            ((written_dev >> 16) & 0xFF) as u8,
-            ((written_dev >> 24) & 0xFF) as u8,
-            ((written_dev >> 32) & 0xFF) as u8,
-            ((written_dev >> 40) & 0xFF) as u8,
-            ((written_dev >> 48) & 0xFF) as u8,
-            ((written_dev >> 56) & 0xFF) as u8,
-            (later_dev & 0xFF) as u8,
-            ((later_dev >> 8) & 0xFF) as u8,
-            ((later_dev >> 16) & 0xFF) as u8,
-            ((later_dev >> 24) & 0xFF) as u8,
-            ((later_dev >> 32) & 0xFF) as u8,
-            ((later_dev >> 40) & 0xFF) as u8,
-            ((later_dev >> 48) & 0xFF) as u8,
-            ((later_dev >> 56) & 0xFF) as u8,
-        ]
-    }
-
-    /// Decode a 17-byte device-pair decision record `(Flush, written_dev, later_dev)`.
-    #[inline]
-    #[must_use]
-    pub const fn decode_device_pair(bytes: &[u8; 17]) -> Option<(Self, u64, u64)> {
-        let Some(flush) = Self::from_u8(bytes[0]) else {
-            return None;
-        };
-        let written_dev = (bytes[1] as u64)
-            | ((bytes[2] as u64) << 8)
-            | ((bytes[3] as u64) << 16)
-            | ((bytes[4] as u64) << 24)
-            | ((bytes[5] as u64) << 32)
-            | ((bytes[6] as u64) << 40)
-            | ((bytes[7] as u64) << 48)
-            | ((bytes[8] as u64) << 56);
-        let later_dev = (bytes[9] as u64)
-            | ((bytes[10] as u64) << 8)
-            | ((bytes[11] as u64) << 16)
-            | ((bytes[12] as u64) << 24)
-            | ((bytes[13] as u64) << 32)
-            | ((bytes[14] as u64) << 40)
-            | ((bytes[15] as u64) << 48)
-            | ((bytes[16] as u64) << 56);
-        let expected = Self::for_devices(written_dev, later_dev);
-        if flush.as_u8() != expected.as_u8() {
-            return None;
-        }
-        Some((flush, written_dev, later_dev))
     }
 
     /// Finish a write to `file` with this flush.
@@ -684,27 +596,6 @@ mod tests {
                 Flush::Durable
             ]
         );
-    }
-
-    #[test]
-    fn flush_device_pair_codec_round_trips_and_rejects_mismatched_tags() {
-        let same = Flush::encode_device_pair(42, 42);
-        assert_eq!(
-            Flush::decode_device_pair(&same),
-            Some((Flush::Ordered, 42, 42))
-        );
-        assert!(Flush::Ordered.is_ordered() && !Flush::Ordered.is_durable());
-        let diff = Flush::encode_device_pair(42, 99);
-        assert_eq!(
-            Flush::decode_device_pair(&diff),
-            Some((Flush::Durable, 42, 99))
-        );
-        assert!(Flush::Durable.is_durable() && !Flush::Durable.is_ordered());
-        let mut bad = same;
-        bad[0] = Flush::Durable.as_u8();
-        assert_eq!(Flush::decode_device_pair(&bad), None);
-        bad[0] = 0;
-        assert_eq!(Flush::decode_device_pair(&bad), None);
     }
 
     #[test]

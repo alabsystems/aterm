@@ -175,8 +175,50 @@ impl Recipient {
 }
 
 /// True when `point` is a low-order u-coordinate, one whose X25519 with every scalar is all zero.
+/// Those are [`LOW_ORDER`]'s seven with bit 255 either way, which X25519 ignores, so a parse
+/// compares them and never runs a ladder for this.
 fn low_order(point: &[u8; 32]) -> bool {
-    x25519::x25519(&[0x55; 32], point) == [0u8; 32]
+    let mut u = *point;
+    u[31] &= 0x7f;
+    LOW_ORDER.contains(&u)
+}
+
+/// Every u-coordinate below 2^255 of a point of order dividing 8 on the curve or its twist,
+/// little-endian (libsodium's `has_small_order` list): 0 (order 2), 1 and p - 1 (order 4, one
+/// on the curve and one on its twist), the two u-coordinates of points of order 8, and p and
+/// p + 1 (0 and 1 unreduced). A clamped scalar is a multiple of 8 and of neither prime order,
+/// so its X25519 is all zero for these alone.
+const LOW_ORDER: [[u8; 32]; 7] = [
+    small(0),
+    small(1),
+    [
+        0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4,
+        0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49,
+        0xb8, 0x00,
+    ],
+    [
+        0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef,
+        0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f,
+        0x11, 0x57,
+    ],
+    near_2_255(0xec),
+    near_2_255(0xed),
+    near_2_255(0xee),
+];
+
+/// The u-coordinate `low`.
+const fn small(low: u8) -> [u8; 32] {
+    let mut u = [0u8; 32];
+    u[0] = low;
+    u
+}
+
+/// 2^255 - 256 + `low`: p - 1, p and p + 1 for 0xec, 0xed and 0xee.
+const fn near_2_255(low: u8) -> [u8; 32] {
+    let mut u = [0xffu8; 32];
+    u[0] = low;
+    u[31] = 0x7f;
+    u
 }
 
 /// Encrypt `plaintext` to every recipient ([`MAX_FILE`], [`MAX_HEADER`], [`decrypt`]).
@@ -933,18 +975,9 @@ mod tests {
         assert_eq!(decrypt(&[b], &file).err(), Some(AgeError::NoMatch));
     }
 
-    #[test]
-    fn encrypt_refuses_no_recipient_and_a_low_order_one() {
-        assert!(encrypt(&[], b"x").is_err());
-        assert!(encrypt(&[Recipient([0u8; 32])], b"x").is_err());
-        let mut one = [0u8; 32];
-        one[0] = 1;
-        assert!(encrypt(&[identity(1).recipient(), Recipient(one)], b"x").is_err());
-    }
-
     /// The low-order u-coordinates, made at run time: 0 (order 2), 1 and p - 1 (order 4,
-    /// one on the curve and one on its twist), the two points of order 8, and p and p + 1
-    /// (0 and 1 again, unreduced); each also with the top bit set, which X25519 ignores.
+    /// one on the curve and one on its twist), the two u-coordinates of points of order 8, and p
+    /// and p + 1 (0 and 1 again, unreduced); each also with the top bit set, which X25519 ignores.
     fn low_order_points() -> Vec<[u8; 32]> {
         let unreduced = |low: u8| {
             let mut u = [0xffu8; 32];
@@ -982,6 +1015,7 @@ mod tests {
 
     #[test]
     fn a_low_order_recipient_is_refused_by_parse_and_by_encrypt() {
+        assert!(encrypt(&[], b"x").is_err(), "no recipient");
         let points = low_order_points();
         assert_eq!(points.len(), 14);
         for point in &points {
@@ -1005,6 +1039,33 @@ mod tests {
                 Ok(Recipient(u))
             );
         }
+    }
+
+    /// `low_order`'s table answers as the ladder it replaced does, X25519 by a clamped scalar
+    /// being all zero: on the 14 spellings, on each with one bit of its first or last byte
+    /// flipped, on small coordinates, on the 256 coordinates just below 2^255 (p - 1, p, p + 1
+    /// and their neighbours) and on real keys.
+    #[test]
+    fn low_order_agrees_with_the_ladder() {
+        let ladder = |u: &[u8; 32]| x25519::x25519(&[0x55; 32], u) == [0u8; 32];
+        let spellings = low_order_points();
+        let mut inputs = spellings.clone();
+        for point in &spellings {
+            for bit in (0..8).chain(248..256) {
+                let mut u = *point;
+                u[bit / 8] ^= 1 << (bit % 8);
+                inputs.push(u);
+            }
+        }
+        for low in 0..=u8::MAX {
+            inputs.push(small(low));
+            inputs.push(near_2_255(low));
+        }
+        inputs.extend((1..=64).map(|seed| identity(seed).recipient().0));
+        for u in &inputs {
+            assert_eq!(low_order(u), ladder(u), "{u:02x?}");
+        }
+        assert!(spellings.iter().all(low_order));
     }
 
     #[test]
@@ -1129,19 +1190,5 @@ mod tests {
             decrypt(&ids, &file).expect("decrypt").as_slice(),
             data.as_slice()
         );
-    }
-
-    #[test]
-    fn errors_name_no_value() {
-        for error in [
-            AgeError::NoMatch,
-            AgeError::Header,
-            AgeError::Hmac,
-            AgeError::Payload,
-            AgeError::Armor,
-            AgeError::Key,
-        ] {
-            assert!(error.to_string().starts_with("age: "));
-        }
     }
 }

@@ -22,7 +22,7 @@ use aterm_aos::{ArtifactId, Digest};
 use super::corpus::{CorpusSplit, ItemKind, Stratum};
 use super::fidelity::{LaneFidelity, ORACLE};
 use super::lane::LANE_MODEL;
-use super::m4::{Compared, Evaluator, Sums, sums};
+use super::m4::{Compared, Evaluator, Serial, Spread, Sums, sums};
 use super::plan::{PLAN_INTERPRETER, SchedulePlan};
 use super::policy::{MAX_DISTINCT, MAX_ROUNDS, Replace, Totals};
 use super::search::{GridProposer, Mode, Proposer, ProposerId, SearchStats};
@@ -936,11 +936,23 @@ impl CandidateBundle {
         Digest::of(BUNDLE_DOMAIN, &[&self.encode()])
     }
 
-    /// `bytes` decoded and checked against `evaluator`'s pinned policy.
+    /// `bytes` decoded and checked against `evaluator`'s pinned policy, on this thread
+    /// ([`Self::verify_spread`] over [`Serial`]).
     /// # Errors
     /// Any [`UncheckedBundle::decode`] refusal, then the first [`BundleRefusal::Forged`].
-    #[inline]
     pub fn verify(bytes: &[u8], evaluator: &Evaluator) -> Result<CandidateBundle, BundleRefusal> {
+        Self::verify_spread(bytes, evaluator, &Serial)
+    }
+
+    /// [`Self::verify`], with the grid search that a bundle crediting the grid is checked against
+    /// judged over `spread`, when `evaluator` has not run it yet: a spread changes only speed.
+    /// # Errors
+    /// Any [`UncheckedBundle::decode`] refusal, then the first [`BundleRefusal::Forged`].
+    pub fn verify_spread(
+        bytes: &[u8],
+        evaluator: &Evaluator,
+        spread: &dyn Spread,
+    ) -> Result<CandidateBundle, BundleRefusal> {
         let b = UncheckedBundle::decode(bytes)?;
         check_identities(&b, evaluator)?;
         let Ok(plan) = SchedulePlan::decode(&b.plan) else {
@@ -952,7 +964,7 @@ impl CandidateBundle {
         check_proposer(&b)?;
         check_rows(&b, evaluator, plan)?;
         check_selection(&b, evaluator)?;
-        check_grid(&b, evaluator, plan)?;
+        check_grid(&b, evaluator, plan, spread)?;
         let mut ti = 0;
         while ti < b.timings.len() {
             if b.timings[ti].label.is_empty() {
@@ -1073,11 +1085,12 @@ fn check_grid(
     b: &UncheckedBundle,
     ev: &Evaluator,
     plan: SchedulePlan,
+    spread: &dyn Spread,
 ) -> Result<(), BundleRefusal> {
     if !credits_the_grid(b) {
         return Ok(());
     }
-    match ev.grid_selection() {
+    match ev.grid_selection(spread) {
         Some(g) if g.plan == plan && g.round == b.round && g.index == b.index => {
             if g.stats == b.selection.stats {
                 Ok(())

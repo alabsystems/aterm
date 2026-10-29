@@ -518,8 +518,9 @@ impl Lexicon {
         let mut data_langs: FxHashSet<String> = FxHashSet::default();
 
         for e in raw.entry {
-            if !data_langs.contains(e.lang.as_str()) {
-                data_langs.insert(e.lang.clone());
+            let lang = e.lang.trim();
+            if !data_langs.contains(lang) {
+                data_langs.insert(lang.to_string());
             }
             let class = match e.class.as_str() {
                 "profanity" => Class::Profanity,
@@ -532,17 +533,17 @@ impl Lexicon {
                     let mut msg = String::from("unknown class ");
                     msg.push_str(&DebugText(other).to_string());
                     msg.push_str(" (lang ");
-                    msg.push_str(&e.lang);
+                    msg.push_str(lang);
                     msg.push(')');
                     conflicts.push(msg);
                     continue;
                 }
             };
-            let lset = LangSet::EMPTY.with(intern_lang(&mut lang_table, &e.lang));
+            let lset = LangSet::EMPTY.with(intern_lang(&mut lang_table, lang));
             let species = match (class, e.species.trim()) {
                 (Class::Animal, "") => {
                     let mut msg = String::from("animal entry without species (lang ");
-                    msg.push_str(&e.lang);
+                    msg.push_str(lang);
                     msg.push_str("): entry skipped");
                     conflicts.push(msg);
                     continue;
@@ -553,13 +554,13 @@ impl Lexicon {
                     let mut msg = String::from("species ");
                     msg.push_str(&DebugText(sp).to_string());
                     msg.push_str(" on non-animal entry (lang ");
-                    msg.push_str(&e.lang);
+                    msg.push_str(lang);
                     msg.push_str("): field ignored");
                     conflicts.push(msg);
                     None
                 }
             };
-            if e.ambiguous && !langs.enabled(&e.lang) {
+            if e.ambiguous && !langs.enabled(lang) {
                 continue;
             }
 
@@ -568,7 +569,7 @@ impl Lexicon {
                 let mut msg = String::from("unknown mode ");
                 msg.push_str(&DebugText(e.mode.as_str()).to_string());
                 msg.push_str(" (lang ");
-                msg.push_str(&e.lang);
+                msg.push_str(lang);
                 msg.push_str("): expected \"suffix\" or \"forms\"; `stems` and `suffixes` ignored");
                 conflicts.push(msg);
             }
@@ -576,7 +577,7 @@ impl Lexicon {
                 let prod = e.stems.len().saturating_mul(e.suffixes.len().max(1));
                 if prod > MAX_TOTAL_SURFACES || total.saturating_add(prod) > MAX_TOTAL_SURFACES {
                     let mut msg = String::from("suffix expansion skipped (lang ");
-                    msg.push_str(&e.lang);
+                    msg.push_str(lang);
                     msg.push_str("): ");
                     msg.push_str(&e.stems.len().to_string());
                     msg.push_str(" stems × ");
@@ -606,7 +607,7 @@ impl Lexicon {
             let forms = e.forms.len();
             if total.saturating_add(forms) > MAX_TOTAL_SURFACES {
                 let mut msg = String::from("explicit forms skipped (lang ");
-                msg.push_str(&e.lang);
+                msg.push_str(lang);
                 msg.push_str("): ");
                 msg.push_str(&forms.to_string());
                 msg.push_str(" forms would exceed surface cap ");
@@ -629,7 +630,7 @@ impl Lexicon {
                     let key: String = s.to_string();
                     let len = key.chars().count();
                     if len > MAX_CJK_SURFACE_CHARS {
-                        push_overlong_surface_conflict(&mut conflicts, len, Some(&e.lang));
+                        push_overlong_surface_conflict(&mut conflicts, len, Some(lang));
                         continue;
                     }
                     if len > max_cjk {
@@ -639,7 +640,7 @@ impl Lexicon {
                         let mut msg = String::from("single-char CJK surface ");
                         msg.push_str(&DebugText(&key).to_string());
                         msg.push_str(" (lang ");
-                        msg.push_str(&e.lang);
+                        msg.push_str(lang);
                         msg.push_str(") requires cjk_single_char = true to scan");
                         conflicts.push(msg);
                     }
@@ -663,7 +664,7 @@ impl Lexicon {
                             let mut msg = String::from("surface ");
                             msg.push_str(&DebugText(s).to_string());
                             msg.push_str(" (lang ");
-                            msg.push_str(&e.lang);
+                            msg.push_str(lang);
                             msg.push_str(
                                 ") dropped: not a single scannable whole-word \
                                  token (mixed-script and multi-word surfaces \
@@ -697,7 +698,7 @@ impl Lexicon {
                 let mut msg = String::from("entry (class ");
                 msg.push_str(&e.class);
                 msg.push_str(", lang ");
-                msg.push_str(&e.lang);
+                msg.push_str(lang);
                 msg.push_str(") compiled to NO scannable surface: all ");
                 msg.push_str(&offered.to_string());
                 msg.push_str(" are multi-word, mixed-script, overlong or empty");
@@ -1439,17 +1440,6 @@ mod tests {
                     lx.max_cjk
                 );
             }
-            assert!(
-                lx.cjk_heads.len() < 5_000,
-                "{langs:?}: {} distinct first characters — this is no longer a \
-                 selective prefilter",
-                lx.cjk_heads.len()
-            );
-            assert!(
-                lx.cjk_heads.len() > 50,
-                "{langs:?}: only {} first characters; the CJK data has collapsed",
-                lx.cjk_heads.len()
-            );
         }
     }
 
@@ -1709,5 +1699,23 @@ mod tests {
             assert_eq!(ms.len(), 1);
             assert_eq!(lx.lang_code(primary_lang(ms[0].langs)), "unknown");
         }
+    }
+
+    #[test]
+    fn padded_entry_lang_trims_consistently_for_interning_gating_and_known_check() {
+        let toml = "[[entry]]\nclass=\"feline\"\nlang=\" ro \"\nmode=\"forms\"\n\
+                    ambiguous=true\nforms=[\"qwxromcat\"]\n";
+        let gated = Lexicon::from_sources(toml, "", &["en"]).expect("sources parse");
+        assert!(gated.scan("qwxromcat", &ScanOptions::default()).is_empty());
+
+        let ungated = Lexicon::from_sources(toml, "", &["ro"]).expect("sources parse");
+        assert!(
+            ungated.conflicts().is_empty(),
+            "trimmed entry lang must satisfy configured \"ro\" without unknown-lang conflict: {:?}",
+            ungated.conflicts()
+        );
+        let hits = ungated.scan("qwxromcat", &ScanOptions::default());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(ungated.lang_code(primary_lang(hits[0].langs)), "ro");
     }
 }

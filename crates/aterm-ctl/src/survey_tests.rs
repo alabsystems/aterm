@@ -1736,6 +1736,7 @@ fn one_cause_that_refused_every_peer_is_said_once() {
         fault,
         unproven: false,
         node: None,
+        addr: None,
     };
     use PeerFault::{NoNetwork, NoRoute, NotDialled, NotPermitted, Other};
     let note =
@@ -1860,7 +1861,7 @@ fn a_peer_row_cannot_forge_a_header_or_the_you_mark() {
 
 const STUB_NOTE: &str = "stub-note-0d6b: the read's closing line";
 
-fn stub_fleet(_: &FleetAsk<'_>) -> Result<FleetRead, String> {
+fn stub_fleet(_: &FleetAsk<'_>) -> Result<FleetRead, FleetRefused> {
     Ok(FleetRead {
         peers: vec![PeerSurvey {
             label: "lab-01".to_owned(),
@@ -1868,6 +1869,7 @@ fn stub_fleet(_: &FleetAsk<'_>) -> Result<FleetRead, String> {
             fault: PeerFault::Other,
             unproven: false,
             node: None,
+            addr: None,
         }],
         note: Some(STUB_NOTE.to_owned()),
         alone: None,
@@ -1876,7 +1878,7 @@ fn stub_fleet(_: &FleetAsk<'_>) -> Result<FleetRead, String> {
 
 const ALONE: &str = "survey --fleet read no other machine: stub-alone-5c1e";
 
-fn no_peer(_: &FleetAsk<'_>) -> Result<FleetRead, String> {
+fn no_peer(_: &FleetAsk<'_>) -> Result<FleetRead, FleetRefused> {
     Ok(FleetRead {
         peers: Vec::new(),
         note: None,
@@ -1963,18 +1965,30 @@ fn silent_peer(fault: PeerFault) -> FleetRead {
             fault,
             unproven: false,
             node: None,
+            addr: None,
         }],
         note: None,
         alone: None,
     }
 }
 
-fn frozen_peer(_: &FleetAsk<'_>) -> Result<FleetRead, String> {
+fn frozen_peer(_: &FleetAsk<'_>) -> Result<FleetRead, FleetRefused> {
     Ok(silent_peer(PeerFault::Unserved))
 }
 
-fn refusing_peer(_: &FleetAsk<'_>) -> Result<FleetRead, String> {
+fn refusing_peer(_: &FleetAsk<'_>) -> Result<FleetRead, FleetRefused> {
     Ok(silent_peer(PeerFault::Other))
+}
+
+fn frozen_issuer(_: &FleetAsk<'_>) -> Result<FleetRead, FleetRefused> {
+    Err(FleetRefused {
+        why: "stub-issuer-silent-3e1d".to_owned(),
+        unserved: true,
+    })
+}
+
+fn refusing_word(_: &FleetAsk<'_>) -> Result<FleetRead, FleetRefused> {
+    Err("stub-no-such-peer-62b0".to_owned().into())
 }
 
 #[test]
@@ -1982,8 +1996,11 @@ fn a_fleet_read_no_aterm_served_exits_2_as_a_drive_of_it_does() {
     let parts = |a: &[&str]| -> Vec<String> { a.iter().map(|s| (*s).to_string()).collect() };
     let sid = format!("s-{:04x}{:016x}", 1, 3);
     let none_here = || Err(("stub-none-here-91c0".to_owned(), 2));
-    let reads: [(&[&str], FleetSurveyFn, u8); 6] = [
+    let reads: [(&[&str], FleetSurveyFn, u8); 9] = [
         (&["survey", "--host", "lab-01"], frozen_peer, 2),
+        (&["survey", "--host", "lab-01"], frozen_issuer, 2),
+        (&["survey", "--host", "lab-01"], refusing_word, 1),
+        (&["survey", "--fleet"], frozen_issuer, 1),
         (&["survey", "--host", "lab-01", "--json"], frozen_peer, 2),
         (
             &["survey", "--host", "lab-01", "--sid", &sid],
@@ -2299,7 +2316,7 @@ fn an_agents_active_goal_is_quoted_under_its_line_before_what_it_was_asked() {
 
 static ASKED_WITHIN: std::sync::Mutex<Vec<Duration>> = std::sync::Mutex::new(Vec::new());
 
-fn asked_within(ask: &FleetAsk<'_>) -> Result<FleetRead, String> {
+fn asked_within(ask: &FleetAsk<'_>) -> Result<FleetRead, FleetRefused> {
     ASKED_WITHIN
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -2344,4 +2361,172 @@ fn ctls_own_timeout_bounds_a_fleet_survey_where_it_is_shorter() {
         [secs(1)],
         "--timeout 1 --host m7 survey"
     );
+}
+
+fn account_row(fields: &[(&str, &str)]) -> String {
+    wire_row(fields).replacen("session", "account", 1)
+}
+
+fn accounts_reply(remote: bool, head: &str, rows: Vec<String>) -> HostReply {
+    let mut lines = vec![format!(
+        "instance pid=1 host=m7.local version=0.146.0 sessions=0 level=facts \
+         at_ms=1793130000000{head}"
+    )];
+    lines.extend(rows);
+    HostReply {
+        label: if remote { "m7.local" } else { "pid 1" }.to_owned(),
+        remote,
+        unproven: false,
+        node: None,
+        answer: parse_reply(&lines),
+    }
+}
+
+/// An instance's account rows parse when its header counts them, print as one line under its
+/// header, each pool it could not read named last, and go whole into `--json`; an older aterm's
+/// say nothing, which is no row.
+#[test]
+fn an_instances_account_rows_parse_and_print_on_one_line() {
+    let rows = vec![
+        account_row(&[
+            ("pool", "claude"),
+            ("id", "main"),
+            ("condition", "usable"),
+            ("enrolled", "1"),
+            ("pct5", "10"),
+            ("pct7", "42"),
+            ("walled_until", "-"),
+        ]),
+        account_row(&[
+            ("pool", "claude"),
+            ("id", "work-2"),
+            ("condition", "limited"),
+            ("enrolled", "1"),
+            ("walled_until", "1793140800"),
+        ]),
+        account_row(&[
+            ("pool", "claude"),
+            ("id", "b"),
+            ("condition", "unseen"),
+            ("enrolled", "1"),
+        ]),
+        account_row(&[
+            ("pool", "claude"),
+            ("id", "c"),
+            ("condition", "limited"),
+            ("enrolled", "1"),
+            ("walled_until", "1793130000"),
+        ]),
+        account_row(&[
+            ("pool", "codex"),
+            ("id", "codex-1"),
+            ("condition", "not-enrolled"),
+            ("enrolled", "0"),
+        ]),
+    ];
+    let one = rows[0].clone();
+    let reply = accounts_reply(false, " accounts=5 accounts_unread=-", rows);
+    let survey = reply.answer.as_ref().expect("a survey");
+    assert_eq!(survey.accounts.as_ref().map(Vec::len), Some(5));
+    assert!(survey.unread.is_empty());
+    let text = render_full(std::slice::from_ref(&reply), None);
+    assert!(
+        text.contains(
+            "trust=screen\n  accounts: claude main 7d 42% 5h 10%, work-2 walled 3h, b unseen, c wall \
+             ended \u{b7} codex codex-1 not enrolled\n"
+        ),
+        "{text}"
+    );
+    assert_line_caps(&text);
+    let json = render_json(std::slice::from_ref(&reply));
+    assert!(
+        json.contains(
+            "\"accounts\":[{\"pool\":\"claude\",\"id\":\"main\",\"condition\":\"usable\""
+        ),
+        "{json}"
+    );
+    let grok = accounts_reply(false, " accounts=1 accounts_unread=grok", vec![one]);
+    assert_eq!(grok.answer.as_ref().unwrap().unread, ["grok"]);
+    let text = render_full(std::slice::from_ref(&grok), None);
+    assert!(
+        text.contains("\n  accounts: claude main 7d 42% 5h 10% \u{b7} grok unread\n"),
+        "a pool it could not read comes last: {text}"
+    );
+    assert!(
+        render_json(&[grok]).contains("\"accounts_unread\":\"grok\""),
+        "its header carries it"
+    );
+
+    let none = accounts_reply(false, " accounts=0 accounts_unread=-", Vec::new());
+    assert_eq!(none.answer.as_ref().unwrap().accounts, Some(Vec::new()));
+    assert!(render_json(std::slice::from_ref(&none)).contains("\"accounts\":[]"));
+    let unread = accounts_reply(
+        false,
+        " accounts=0 accounts_unread=claude,codex",
+        Vec::new(),
+    );
+    assert!(
+        render_full(&[unread], None).contains("\n  accounts: claude unread \u{b7} codex unread\n")
+    );
+    let unknown = accounts_reply(false, "", Vec::new());
+    assert_eq!(unknown.answer.as_ref().unwrap().accounts, None);
+    assert!(render_json(std::slice::from_ref(&unknown)).contains("\"accounts\":null"));
+    assert!(!render_full(&[unknown], None).contains("accounts:"));
+    assert!(!render_full(&[none], None).contains("accounts:"));
+}
+
+/// A peer's label that is an email is masked, and any other that is no plain word shows as `?`.
+#[test]
+fn a_peers_account_label_is_never_an_email_on_screen() {
+    let rows = vec![
+        account_row(&[
+            ("pool", "claude"),
+            ("id", "abcdef@example.com"),
+            ("condition", "usable"),
+            ("enrolled", "1"),
+            ("pct7", "5"),
+        ]),
+        account_row(&[
+            ("pool", "claude"),
+            ("id", "x\u{1b}[2J"),
+            ("condition", "unseen"),
+            ("enrolled", "1"),
+        ]),
+    ];
+    let mut reply = accounts_reply(true, " accounts=2", rows);
+    let session = Fields::of(
+        "session local=1 sid=s-a1 state=running program=claude program_kind=agent agent=busy \
+         account=abcdef%40example.com",
+    );
+    reply
+        .answer
+        .as_mut()
+        .expect("parsed")
+        .sessions
+        .push(session);
+    let replies = [reply];
+    let text = render_full(&replies, None);
+    assert!(
+        text.contains("  accounts: claude ab\u{2026}@\u{2026} 7d 5%, ? unseen\n"),
+        "{text}"
+    );
+    let json = render_json(&replies);
+    assert!(json.contains("\"id\":\"ab\u{2026}@\u{2026}\""), "{json}");
+    assert!(
+        json.contains("\"account\":\"ab\u{2026}@\u{2026}\""),
+        "{json}"
+    );
+    let sid = render_sid(&replies, "s-a1", None).expect("its session");
+    assert!(sid.contains("  account: ab\u{2026}@\u{2026}\n"), "{sid}");
+    for shown in [text, json, sid] {
+        assert!(!shown.contains("example"), "{shown}");
+    }
+}
+
+#[test]
+fn an_email_label_is_masked_and_any_other_kept() {
+    assert_eq!(masked_label("main"), "main");
+    assert_eq!(masked_label("abcdef@example.com"), "ab\u{2026}@\u{2026}");
+    assert_eq!(masked_label("a@example.com"), "a\u{2026}@\u{2026}");
+    assert_eq!(masked_label("@example.com"), "\u{2026}@\u{2026}");
 }

@@ -179,6 +179,25 @@ fn a_merge_onto_a_foreign_or_conflicting_base_is_refused() {
     same_asset.asset = pkgdoc::asset_name("ay", 9, AARCH64_APPLE_DARWIN);
     refused(base.clone(), &header(), &same_asset, "already names asset");
     refused(b"schema = = 1".to_vec(), &header(), &x86, "does not parse");
+    let mixed_exposes = String::from_utf8(base.clone()).expect("utf8").replace(
+        "exposes = [\"ay\", \"ay-lsp\"]",
+        "exposes = [\"ay\", \"ay-lsp\", 42]",
+    );
+    refused(
+        mixed_exposes.into_bytes(),
+        &header(),
+        &x86,
+        "exposes is not an array of strings",
+    );
+    let empty_exposes = String::from_utf8(base.clone())
+        .expect("utf8")
+        .replace("exposes = [\"ay\", \"ay-lsp\"]", "exposes = []");
+    refused(
+        empty_exposes.into_bytes(),
+        &with(&|h| h.exposes.clear()),
+        &x86,
+        "exposes nothing",
+    );
     let reordered = with(&|h| h.exposes.reverse());
     pkgdoc::merge(base, &reordered, &x86).expect("the same set, another order");
 }

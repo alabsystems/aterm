@@ -47,7 +47,9 @@ dirs, a private control socket, a lifeline; ended by its process group, never by
 Per instance <name> = <style-slug>-<theme>[-<scenario>] (typing has no suffix): <name>.<frame>.png and its
 .clean.png, .cursor.txt and .text.txt; <name>.frames.tsv (frame, ms since the instance came up, @event rows);
 <name>.dims.txt, .status.txt, .status-end.txt (`trail status`), .admissions.txt (`trail 40`), .gui.log; and
-gallery.pids. Each terminal frame also keeps its .status.txt and image metadata. The open `redraw-stall`
+gallery.pids. Each terminal frame also keeps its .status.txt and image metadata. A settings frame keeps its
+cursor scene card's (`settings card`): .dims.txt (the card's grid in the window), .cursor.txt, .text.txt,
+.status.txt (its companion's pet_body) and, the card with no light drawn, .clean.png. The open `redraw-stall`
 frame has .read-notes.txt instead of cursor/text reads, which would wait for the very frame the fixture
 has not yet closed. Its restored frame judges the final instance configuration (including --extra):
 a requested rainbow that becomes unavailable is inconclusive, not a skip. Deliberately disabled
@@ -874,6 +876,100 @@ fn relay_reply<S: std::io::Read + std::io::Write>(
     })
 }
 
+/// The sidecars a `settings card` reply's lines name, as `(suffix, contents)`: `dims.txt` (its `dims OK …` line, the
+/// card's grid in the window), `cursor.txt` (`cursor OK …`), `status.txt` (`status …`, its companion's `pet_body`)
+/// and `text.txt` (each `text <row>`, a row a line). Any other line (a client run's `OK <n>` head) is passed over.
+/// # Errors
+/// A reply that lacks the dims, cursor or status line.
+pub(crate) fn card_sidecars(body: &str) -> Result<Vec<(&'static str, String)>, String> {
+    let (mut dims, mut cursor, mut status) = (None, None, None);
+    let mut text = Vec::new();
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("dims ") {
+            dims = Some(format!("{rest}\n"));
+        } else if let Some(rest) = line.strip_prefix("cursor ") {
+            cursor = Some(format!("{rest}\n"));
+        } else if let Some(rest) = line.strip_prefix("status ") {
+            status = Some(format!("{rest}\n"));
+        } else if line == "text" {
+            text.push(String::new());
+        } else if let Some(rest) = line.strip_prefix("text ") {
+            text.push(rest.to_string());
+        }
+    }
+    let missing = |what: &str| format!("the card reply has no {what} line");
+    Ok(vec![
+        ("dims.txt", dims.ok_or_else(|| missing("dims"))?),
+        ("cursor.txt", cursor.ok_or_else(|| missing("cursor"))?),
+        ("status.txt", status.ok_or_else(|| missing("status"))?),
+        ("text.txt", text.join("\n") + "\n"),
+    ])
+}
+
+/// The clean twin of the settings frame `lit` (PNG bytes): the frame with the card a `settings card clean` reply
+/// carries (`clean <x> <y> <w> <h> <bytes> <base64 PNG>`, the card rendered with no light drawn) laid over it at its
+/// place, as `image clean` keeps a terminal frame's.
+/// # Errors
+/// A reply that is not one such line, a PNG that does not decode, or a card that does not lie inside the frame.
+pub(crate) fn card_clean_twin(lit: &[u8], body: &str) -> Result<Vec<u8>, String> {
+    const MAX_SIDE: u32 = 16_384;
+    let line = body
+        .lines()
+        .find_map(|line| line.strip_prefix("clean "))
+        .ok_or("the card clean reply has no clean line")?;
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let [x, y, w, h, bytes, encoded] = words.as_slice() else {
+        return Err(format!(
+            "not a card clean line: {}",
+            line.chars().take(60).collect::<String>()
+        ));
+    };
+    let number = |v: &str| {
+        v.parse::<usize>()
+            .map_err(|_| format!("not a card clean line: {v}"))
+    };
+    let (x, y, w, h, bytes) = (
+        number(x)?,
+        number(y)?,
+        number(w)?,
+        number(h)?,
+        number(bytes)?,
+    );
+    let png = aterm_codec::base64::decode(encoded).map_err(|e| format!("card base64: {e}"))?;
+    if png.len() != bytes {
+        return Err("the card's byte length does not match its declaration".into());
+    }
+    let (card, cw, ch) =
+        aterm_png::decode_rgba8(&png, MAX_SIDE).ok_or("the card PNG does not decode")?;
+    let (mut frame, fw, fh) =
+        aterm_png::decode_rgba8(lit, MAX_SIDE).ok_or("the frame PNG does not decode")?;
+    if (cw, ch) != (w, h) || x + w > fw || y + h > fh {
+        return Err(format!(
+            "a {cw}x{ch} card at {x},{y} does not lie inside the {fw}x{fh} frame"
+        ));
+    }
+    for row in 0..h {
+        let from = row * w * 4;
+        let to = ((y + row) * fw + x) * 4;
+        frame[to..to + w * 4].copy_from_slice(&card[from..from + w * 4]);
+    }
+    let (Ok(fw), Ok(fh)) = (u32::try_from(fw), u32::try_from(fh)) else {
+        return Err("the frame is too large to encode".into());
+    };
+    let mut out = Vec::new();
+    let mut encoder = aterm_png::Encoder::new(&mut out, fw, fh);
+    encoder.set_color(aterm_png::ColorType::Rgba);
+    encoder.set_depth(aterm_png::BitDepth::Eight);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|e| format!("PNG header: {e}"))?;
+    writer
+        .write_image_data(&frame)
+        .map_err(|e| format!("PNG pixels: {e}"))?;
+    writer.finish().map_err(|e| format!("PNG end: {e}"))?;
+    Ok(out)
+}
+
 /// The counted `image --meta --bytes` body; unlike a filename reply, it needs no artifact ACK.
 fn image_bytes(body: &str) -> Result<(Vec<u8>, &str), String> {
     let limit = aterm_types::control_verbs::MAX_CONTROL_REPLY_LINE_BYTES;
@@ -1195,22 +1291,22 @@ impl Shot<'_> {
         saved.is_ok()
     }
 
-    /// A kept frame, its row in frames.tsv, and its sidecars.
-    fn snap(&mut self, frame: &str) {
-        self.snap_phase(frame, FrameRead::Whole);
+    /// A kept frame, its row in frames.tsv, and its sidecars; whether it was kept.
+    fn snap(&mut self, frame: &str) -> bool {
+        self.snap_phase(frame, FrameRead::Whole)
     }
 
-    fn snap_phase(&mut self, frame: &str, phase: FrameRead) {
+    fn snap_phase(&mut self, frame: &str, phase: FrameRead) -> bool {
         let t = Instant::now();
         let dest = self.path(&format!("{frame}.png"));
         if !self.grab(false, &dest) {
-            return;
+            return false;
         }
         self.frames += 1;
         let ms = self.since_start(t);
         self.row(&format!("{frame}\t{ms}"));
         if !self.terminal {
-            return;
+            return true;
         }
         let evidence = frame_evidence(phase, |request, shape| self.request(request, shape));
         self.keep(&format!("{frame}.status.txt"), &evidence.status);
@@ -1254,6 +1350,51 @@ impl Shot<'_> {
         if self.clean {
             let dest = self.path(&format!("{frame}.clean.png"));
             self.grab(true, &dest);
+        }
+        true
+    }
+
+    /// The cursor scene card the settings frame just kept painted (`settings card`), kept beside it as a
+    /// terminal frame's sidecars are ([`card_sidecars`]), and with `clean` its twin: the frame with the card
+    /// rendered with no light drawn ([`card_clean_twin`]).
+    fn card_sidecars(&mut self, frame: &str) {
+        let reply = self.request(&["settings", "card"], ReplyShape::Counted);
+        let kept = if reply.code == 0 {
+            card_sidecars(&reply.stdout)
+        } else {
+            Err(reply_text(&reply).trim_end().to_string())
+        };
+        match kept {
+            Ok(files) => {
+                for (suffix, body) in files {
+                    let _ = std::fs::write(self.path(&format!("{frame}.{suffix}")), body);
+                }
+            }
+            Err(error) => {
+                self.note(&format!("settings card: {error}"));
+                self.fails += 1;
+                return;
+            }
+        }
+        if !self.clean {
+            return;
+        }
+        let reply = self.request(&["settings", "card", "clean"], ReplyShape::Counted);
+        let twin = if reply.code == 0 {
+            std::fs::read(self.path(&format!("{frame}.png")))
+                .map_err(|e| e.to_string())
+                .and_then(|lit| card_clean_twin(&lit, &reply.stdout))
+        } else {
+            Err(reply_text(&reply).trim_end().to_string())
+        };
+        match twin {
+            Ok(png) => {
+                let _ = std::fs::write(self.path(&format!("{frame}.clean.png")), png);
+            }
+            Err(error) => {
+                self.note(&format!("settings card clean: {error}"));
+                self.fails += 1;
+            }
         }
     }
 
@@ -1309,7 +1450,9 @@ impl Shot<'_> {
             self.press(k);
             stop::sleep(Duration::from_millis(every.min(60) / 2))?;
             match keep.iter().find(|(at, _)| *at == i) {
-                Some((_, frame)) => self.snap(frame),
+                Some((_, frame)) => {
+                    self.snap(frame);
+                }
                 None => self.tick(),
             }
         }
@@ -1388,7 +1531,10 @@ impl Shot<'_> {
         self.mark(&format!("open-{label}"));
         for &ms in at {
             self.tick_until(ms, Duration::from_millis(100))?;
-            self.snap(&format!("{label}-{ms:04}"));
+            let frame = format!("{label}-{ms:04}");
+            if self.snap(&frame) {
+                self.card_sidecars(&frame);
+            }
         }
         let prefs = self.inst.ctl(&["controls", "prefs"]);
         self.keep(&format!("{label}.controls.txt"), &prefs);

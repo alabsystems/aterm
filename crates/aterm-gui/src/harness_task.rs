@@ -338,7 +338,7 @@ impl Drop for LandingSlot {
     }
 }
 
-/// A PROVEN SELF-CLAIM'S LANDING, ON THE TASK RECORD of session `local` ([`App::reconcile_self_claim_task`]): unless a thread already marks one for the session, the report the claim's rollout holds is snapshotted under `<state>/tasks/` (`result::snapshot_rollout`, once its newest turn has ended or [`result::SETTLE_WITHIN`] ran out) on a thread of its own, and the record marked `done why=landed` with it, if, read together under the mark's lock, the record is still open in the state it `entered`, since before the landing, and the face still shows this `landing`.
+/// A PROVEN SELF-CLAIM'S LANDING, ON THE TASK RECORD of session `local` ([`App::reconcile_self_claim_task`]): unless a thread already marks one for the session, the report the claim's rollout holds is snapshotted under `<state>/tasks/` (`result::snapshot_rollout`, once its newest turn has ended or [`result::SETTLE_WITHIN`] ran out, with the claim's `$CODEX_HOME` and the landing's time, by which a later `result` reads a report the landing missed again: `result::reread`) on a thread of its own, and the record marked `done why=landed` with it, if, read together under the mark's lock, the record is still open in the state it `entered`, since before the landing, and the face still shows this `landing`.
 fn land_self_claim_task(ctx: &Arc<crate::SessionCtx>, local: u64, landing: Landing) {
     let sid = ctx.self_id.as_str().to_string();
     {
@@ -371,6 +371,8 @@ fn land_self_claim_task(ctx: &Arc<crate::SessionCtx>, local: u64, landing: Landi
                 &stem,
                 rollout.as_ref().map(|(path, tail)| (path.as_path(), tail.as_str())),
                 thread,
+                target.as_ref().map(|t| t.home.as_path()),
+                landing.at_ms,
                 result::DoneBy::Turn,
             );
             if snap.is_ok() {

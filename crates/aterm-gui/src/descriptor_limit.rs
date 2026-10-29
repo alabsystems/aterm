@@ -140,13 +140,24 @@ pub(crate) fn carry_launcher_limit(
     }
 }
 
-/// Removes stray carried descriptor-limit env vars on non-update launches.
-pub(crate) fn forget_stray_limits(env: &mut crate::handoff_env::HandoffEnv, update_launch: bool) {
+/// Removes stray carried descriptor-limit env vars on non-update launches; whether it removed
+/// any, for [`note_forgotten_stray_limits`] to say once the window's logger is up.
+#[must_use]
+pub(crate) fn forget_stray_limits(
+    env: &mut crate::handoff_env::HandoffEnv,
+    update_launch: bool,
+) -> bool {
     if update_launch || !(env.present(ENV_LAUNCHER_NOFILE) || env.present(ENV_PARK_RAISED_FROM)) {
-        return;
+        return false;
     }
     env.remove(ENV_LAUNCHER_NOFILE);
     env.remove(ENV_PARK_RAISED_FROM);
+    true
+}
+
+/// Log that [`forget_stray_limits`] removed a stray: that runs before the window installs its
+/// logger, which drops a line logged before that, so the window calls this once it has.
+pub(crate) fn note_forgotten_stray_limits() {
     aterm_log::info!(
         "descriptor limit: this launch is no update's, so the launcher's limit in its \
          environment is a stray an older successor left in a shell; new shells get what this \
@@ -155,10 +166,11 @@ pub(crate) fn forget_stray_limits(env: &mut crate::handoff_env::HandoffEnv, upda
 }
 
 fn carried_launcher_limit(carried: Option<&str>, soft: u64) -> Option<u64> {
-    carried?
-        .parse::<u64>()
-        .ok()
-        .filter(|carried| *carried > 0 && *carried <= soft)
+    let s = carried?;
+    if s.is_empty() || s.starts_with('0') || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<u64>().ok().filter(|carried| *carried <= soft)
 }
 
 /// Record the launcher limit a fork-lane parent carried ([`ENV_LAUNCHER_NOFILE`]).
@@ -438,6 +450,9 @@ pub(crate) mod tests {
             "never raised by it"
         );
         assert_eq!(carried_launcher_limit(Some("0"), 4096), None);
+        assert_eq!(carried_launcher_limit(Some("00"), 4096), None);
+        assert_eq!(carried_launcher_limit(Some("0256"), 4096), None);
+        assert_eq!(carried_launcher_limit(Some("+256"), 4096), None);
         assert_eq!(carried_launcher_limit(Some("-1"), 4096), None);
         assert_eq!(carried_launcher_limit(Some("lots"), 4096), None);
         assert_eq!(carried_launcher_limit(None, 4096), None, "an older parent");
@@ -773,9 +788,11 @@ pub(crate) mod tests {
     fn only_an_updates_launch_adopts_a_carried_launcher_limit() {
         const ROLE: &str = "ATERM_TEST_STRAY_LIMIT_ROLE";
         const BUILD: u64 = 7;
-        fn launch() -> crate::handoff_env::HandoffEnv {
+        fn launch(strays: bool) -> crate::handoff_env::HandoffEnv {
             let mut env = crate::handoff_env::HandoffEnv::capture();
-            forget_stray_limits(&mut env, std::env::var_os("ATERM_UPDATED_FROM").is_some());
+            let forgot =
+                forget_stray_limits(&mut env, std::env::var_os("ATERM_UPDATED_FROM").is_some());
+            assert_eq!(forgot, strays, "whether this launch forgot a stray");
             settle_incoming_descriptor_limit(&env);
             env
         }
@@ -787,14 +804,14 @@ pub(crate) mod tests {
                     .env(ROLE, "window")
                     .env_remove("ATERM_UPDATED_FROM");
                 window.spawn().passed();
-                launch();
+                launch(false);
                 let launcher = launcher_soft_descriptor_limit().expect("the update's word");
                 assert!(launcher < soft_nofile(), "below the raise it inherited");
                 assert_eq!(park_raised_from(), Some(launcher));
                 return;
             }
             Ok("window") => {
-                let env = launch();
+                let env = launch(true);
                 assert_eq!(
                     launcher_soft_descriptor_limit(),
                     None,
@@ -811,7 +828,7 @@ pub(crate) mod tests {
                 return;
             }
             Ok("boot re-exec") => {
-                launch();
+                launch(false);
                 assert_eq!(
                     launcher_soft_descriptor_limit(),
                     None,
@@ -821,6 +838,20 @@ pub(crate) mod tests {
                 return;
             }
             _ => {}
+        }
+        let mut plain = crate::handoff_env::HandoffEnv::default();
+        assert!(
+            !forget_stray_limits(&mut plain, false),
+            "a plain launch forgets none"
+        );
+        for stray in [ENV_LAUNCHER_NOFILE, ENV_PARK_RAISED_FROM] {
+            let mut one = crate::handoff_env::HandoffEnv::default();
+            one.set(stray, "256");
+            assert!(
+                forget_stray_limits(&mut one, false),
+                "one stray name is a stray"
+            );
+            assert!(!one.present(stray), "and it goes");
         }
         if !crate::control_auth::enter_low_nofile_test_child(64) {
             return;

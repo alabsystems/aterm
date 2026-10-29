@@ -1508,3 +1508,109 @@ fn a_closed_summary_whose_fold_holds_a_node_open_is_refused() {
         ),
     }
 }
+
+#[test]
+fn a_carry_sheds_a_cmd_detail_amend_with_its_open() {
+    let mut log = Log::new(1);
+    log.open_session(
+        Kind::Spawn,
+        Src::Aterm,
+        Conf::Exact,
+        Actor::Aterm,
+        Fields::new(),
+        at(0),
+    )
+    .expect("the session opens");
+    // A `cmd` run as the host writes one whose program it confirms after the open (G1).
+    let confirmed = |log: &mut Log, name: &str, ms: u64| {
+        let blk = Fields::new().u(Key::Blk, ms).expect("a block");
+        let node = log
+            .open(
+                Open::new(Kind::Cmd, Src::Shell, Conf::Strong).fields(blk),
+                at(ms),
+            )
+            .expect("the cmd opens");
+        let f = Fields::new().tok(Key::Detail, name).expect("a detail");
+        log.amend(
+            node,
+            aterm_slog::Amend::new(Kind::Cmd, Src::Status, Conf::Strong, f),
+            at(ms + 1),
+        )
+        .expect("the detail amends");
+        node
+    };
+    let mut ms = 10;
+    let mut cmds = Vec::new();
+    for _ in 0..120 {
+        ms += 10;
+        let c = confirmed(&mut log, "make", ms);
+        log.mark(Mark::new(Kind::Bell, Src::Engine, Conf::Exact), at(ms + 2))
+            .expect("a mark");
+        log.close(
+            c,
+            Close::new(Out::Run(RunOut::Ok), Src::Shell, Conf::Exact),
+            at(ms + 3),
+        )
+        .expect("the command ends");
+        cmds.push(c);
+    }
+    let claude = confirmed(&mut log, "claude", ms + 10);
+    cmds.push(claude);
+    for i in 0..40 {
+        ms += 20;
+        let t = log
+            .open(
+                Open::new(Kind::Turn, Src::Screen, Conf::Strong).under(claude),
+                at(ms + i),
+            )
+            .expect("a turn");
+        log.mark(
+            Mark::new(Kind::Bell, Src::Engine, Conf::Exact),
+            at(ms + i + 1),
+        )
+        .expect("detail");
+        log.close(
+            t,
+            Close::new(Out::Turn(TurnOut::Done), Src::Screen, Conf::Strong),
+            at(ms + i + 2),
+        )
+        .expect("the turn closes");
+    }
+    let all = log.carry(CarryBudget::SESSION, &[]).expect("carried");
+    assert_eq!(all.shed, 0, "PRECONDITION: room for everything");
+    let held = |new: &Log, node: Node, detail: bool| {
+        new.window().any(|r| {
+            r.node == node
+                && if detail {
+                    r.op == aterm_slog::Op::Amend && r.f.get_str(Key::Detail).is_some()
+                } else {
+                    r.op == aterm_slog::Op::Open
+                }
+        })
+    };
+    let (mut some, mut none) = (false, false);
+    for records in (all.carried as usize / 4..all.carried as usize).step_by(5) {
+        let tight = CarryBudget {
+            records,
+            ..CarryBudget::SESSION
+        };
+        let cut = log.carry(tight, &[]).expect("carried");
+        assert!(cut.shed > 0, "PRECONDITION: the cut shed at {records}");
+        let (new, _, _) = Log::from_carry(&cut.lines, adopt_at(&log, 99_000)).expect("reads");
+        for &c in &cmds {
+            let open = held(&new, c, false);
+            assert_eq!(
+                open,
+                held(&new, c, true),
+                "{c}: its open and its detail cross together, within {records} records"
+            );
+            some |= open;
+            none |= !open;
+        }
+        assert!(held(&new, claude, true), "the open run's detail crosses");
+    }
+    assert!(
+        some && none,
+        "PRECONDITION: the cuts carried some commands' opens and shed others"
+    );
+}

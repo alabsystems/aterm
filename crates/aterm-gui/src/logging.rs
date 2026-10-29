@@ -222,10 +222,7 @@ fn is_accessibility_backend_panic(_location_file: &str, _thread_name: Option<&st
 /// build with no accessibility tree.
 #[cfg(a11y_tree)]
 fn report_accessibility_failure(payload: &str, location_file: &str) {
-    crate::a11y_backend::report_failure(
-        crate::a11y_backend::reason_from_payload(payload),
-        location_file,
-    );
+    crate::a11y_backend::report_failure(payload, location_file);
 }
 
 #[cfg(not(a11y_tree))]

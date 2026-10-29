@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Headless boot login-shell `PATH` pinning tests for test stand-ins.
+//! Headless boot login-shell `PATH` pinning tests for test stand-ins, and how they are laid.
 
 #![cfg(unix)]
 
@@ -25,6 +25,11 @@ const RECORDER: &str = "#!/bin/sh\n\
 
 /// The decoy: whatever it is asked, it leaves `<marks>/decoy-<its name>`.
 const DECOY: &str = "#!/bin/sh\n: > \"${LIVE_STANDIN_MARKS:?}/decoy-${0##*/}\"\n";
+
+/// A stand-in that says what it ran as and its first word: `--version` answers at once.
+const ECHOES: &str = "#!/bin/sh\n\
+    case \"$1\" in --version) exit 0 ;; esac\n\
+    printf '%s %s\\n' \"$0\" \"$1\"\n";
 
 /// The one name no machine has: a negative control's stand-in.
 const NOBODYS: &str = "aterm-test-standin-x";
@@ -258,4 +263,54 @@ fn a_login_profile_that_puts_the_system_first_again_ends_the_boot_could_not_run(
         "the refusal names the system's uptime: {said}"
     );
     assert_eq!(ran(marks.path()), Vec::<String>::new(), "nothing ran");
+}
+
+/// A stand-in outlives another fixture's of the same text going. While both fixtures are there,
+/// the kept stand-in resolves to a regular file of one name, mode 0555, link count 1, and that
+/// name is not in the going fixture, so the going takes no name of the file it runs; once it has
+/// gone, the kept path still runs that text as itself (`$0` its own path). NEGATIVE CONTROL: laid
+/// by hard link to one file per text, as the helper this replaced laid them, the kept stand-in's
+/// file has a name in each fixture and one in the shared folder (link count 3); hard-linked to
+/// the first fixture's file, the going fixture's name as well (link count 2); a symlink to that
+/// file resolves into the going fixture.
+#[test]
+fn a_stand_in_outlives_another_fixture_of_its_text_going() {
+    use std::os::unix::fs::MetadataExt as _;
+    let fixture = || {
+        aterm_tempfile::Builder::new()
+            .prefix("atsp-fixture-")
+            .tempdir()
+            .expect("a fixture")
+    };
+    let (gone, kept) = (fixture(), fixture());
+    let tool = kept.path().join("tool");
+    headless_boot::standin(&gone.path().join("tool"), ECHOES);
+    headless_boot::standin(&tool, ECHOES);
+    let file = std::fs::canonicalize(&tool).expect("the stand-in resolves");
+    let meta = std::fs::symlink_metadata(&file).expect("its file");
+    assert!(meta.is_file(), "{} is no file", file.display());
+    assert_eq!(meta.mode() & 0o7777, 0o555, "{}", file.display());
+    assert_eq!(
+        meta.nlink(),
+        1,
+        "{} has a name besides its own, which a fixture's going can remove",
+        file.display()
+    );
+    let going = std::fs::canonicalize(gone.path()).expect("the going fixture resolves");
+    assert!(
+        !file.starts_with(&going),
+        "{} is in the fixture that goes",
+        file.display()
+    );
+    drop(gone);
+    let out = aterm_uds::deadline::output_within(
+        aterm_uds::spawnfd::command(&tool).arg("kept"),
+        aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap_or_else(|e| panic!("{} did not run: {e}", tool.display()));
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{} kept\n", tool.display())
+    );
 }

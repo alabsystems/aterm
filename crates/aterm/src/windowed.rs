@@ -2,6 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm-windowed`: the Windows GUI-subsystem front-door binary (`aterm-gui.exe`).
+//!
+//! STOCK EXCEPTION: its work is Windows only, and Trust has no Windows std, so only stock Rust
+//! builds it (the Windows lane's guest pins its version: `aterm-lab/src/windows_guest.rs`).
 
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 

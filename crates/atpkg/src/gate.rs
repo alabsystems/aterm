@@ -18,13 +18,13 @@ pub enum ApplyDecision {
     NotPinned,
 }
 
-/// Whether `build` of `program` is on the channel's `yanked` list.
+/// Whether `build` of `program` is on the channel's `yanked` list (`program@<canonical-build>`).
 #[must_use]
 pub fn is_yanked(channel: &Channel, program: &str, build: u64) -> bool {
     channel.yanked.iter().any(|entry| {
         entry
             .split_once('@')
-            .is_some_and(|(p, b)| p == program && b.parse::<u64>() == Ok(build))
+            .is_some_and(|(p, b)| p == program && crate::store::parse_build_name(b) == Some(build))
     })
 }
 
@@ -86,11 +86,26 @@ mod tests {
 
     #[test]
     fn is_yanked_matches_program_at_build() {
-        let ch = channel(0, &[], &["trust@4790", "ay@17", "garbage", "ny@notanum"]);
+        let ch = channel(
+            0,
+            &[],
+            &[
+                "trust@4790",
+                "ay@17",
+                "zero@0",
+                "plus@+4790",
+                "pad@04790",
+                "garbage",
+                "ny@notanum",
+            ],
+        );
         assert!(is_yanked(&ch, "trust", 4790));
         assert!(is_yanked(&ch, "ay", 17));
+        assert!(is_yanked(&ch, "zero", 0));
         assert!(!is_yanked(&ch, "trust", 4791));
         assert!(!is_yanked(&ch, "ay", 18));
+        assert!(!is_yanked(&ch, "plus", 4790)); // non-canonical "+4790" rejected
+        assert!(!is_yanked(&ch, "pad", 4790)); // non-canonical leading-zero "04790" rejected
         assert!(!is_yanked(&ch, "ny", 0)); // malformed "ny@notanum" never matches
     }
 

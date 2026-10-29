@@ -458,29 +458,13 @@ mod tests {
             "compaction amortizes against consumed bytes"
         );
         assert_encoding(&bm, &(STEPS..STEPS + WINDOW).collect::<Vec<_>>());
-
-        let mut old = SparseBitmap::from_sorted(&seed);
-        let mut decoded_values = 0usize;
-        let mut encoded_gaps = 0usize;
-        for step in 0..STEPS {
-            let values = old.to_vec();
-            decoded_values += values.len();
-            let cut = values.partition_point(|&v| v < step + 1);
-            let retained = &values[cut..];
-            encoded_gaps += retained.len().saturating_sub(1);
-            old.rebuild_from_sorted(retained);
-            old.insert(step + WINDOW);
-        }
-        assert_eq!(old.to_vec(), bm.to_vec());
-        assert!(decoded_values + encoded_gaps > 1000 * (consumed + moved));
         #[cfg(target_pointer_width = "64")]
         assert_eq!(
             std::mem::size_of::<SparseBitmap>(),
             std::mem::size_of::<(Vec<u8>, u32, u32, u32)>()
         );
         eprintln!(
-            "posting_eviction: rows={WINDOW} steps={STEPS} old_decoded_values={decoded_values} \
-             old_reencoded_gaps={encoded_gaps} prefix_bytes={consumed} moved_bytes={moved} \
+            "posting_eviction: rows={WINDOW} steps={STEPS} prefix_bytes={consumed} moved_bytes={moved} \
              retained_capacity={} initial_capacity={initial_capacity} bitmap_bytes={}",
             bm.deltas.capacity(),
             std::mem::size_of::<SparseBitmap>()

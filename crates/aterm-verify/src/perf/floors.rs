@@ -379,9 +379,9 @@ effects_keys! {
         "episode_encode_per_ginsn",
         // Half the flowing card's frames are its steps' draws and half the replays of the keys
         // between them, so its median frame is its costliest replay, one frame's outlier: its
-        // emit is rated by all its frames over all their instructions.
+        // emit and its raster are rated by all its frames over all their instructions.
         "flowing_emit_mean_per_ginsn",
-        "flowing_raster_per_ginsn",
+        "flowing_raster_mean_per_ginsn",
         "flowing_encode_per_ginsn",
         "settled_raster_per_ginsn",
         "settled_encode_per_ginsn",

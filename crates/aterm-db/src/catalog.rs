@@ -19,12 +19,13 @@ use std::{
 pub(crate) mod command;
 mod descriptor;
 pub(crate) mod policy;
+pub(crate) mod ring;
 pub use descriptor::Descriptor;
 use policy::Policy;
 
 /// The catalog has its own slot; applications cannot displace it.
 pub(crate) const MAX_TABLES: usize = 63;
-const PER_CREATOR: usize = 8;
+pub(crate) const PER_CREATOR: usize = 8;
 pub(crate) const RECORDS_PER_CREATOR: usize = 64;
 pub(crate) const MAX_PAYLOAD: usize = 4096;
 pub(crate) fn scope(trust: Trust) -> Scope {
@@ -78,6 +79,10 @@ impl Directory {
     }
     pub fn catalog_scope(&self) -> Scope {
         scope(self.trust)
+    }
+    /// The lab this directory's tables belong to.
+    pub(crate) const fn trust(&self) -> Trust {
+        self.trust
     }
     pub fn path(&self, scope: Scope) -> Result<PathBuf> {
         if scope.trust() != self.trust {
@@ -222,9 +227,117 @@ impl Directory {
     pub fn snapshot_with_config(&self, session: &Session<'_>, config: &Path) -> Result<Snapshot> {
         self.project(self.discovery_records(session)?, &Policy::read(config)?)
     }
+
+    /// Read locally retained declarations without enrolling or repairing storage.
+    /// A genuinely absent catalog is empty; partial or damaged custody is refused.
+    pub fn observe_with_config(&self, session: &Session<'_>, config: &Path) -> Result<Snapshot> {
+        let policy = Policy::read(config)?;
+        let root_exists = match aterm_uds::private_file::check_private_dir(&self.root) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        let scope = self.catalog_scope();
+        let Some(catalog) = Store::observe_if_exists(session, &self.path(scope)?, scope)? else {
+            if root_exists && self.retained()?.1 != 0 {
+                return Err(Error::new(
+                    "catalog is absent beside retained table storage",
+                ));
+            }
+            return Ok(Snapshot::default());
+        };
+        self.project(self.discovery_records_from(session, &catalog)?, &policy)
+    }
+
+    /// Read the catalog this Mac holds with default local projection policy, without enrolling
+    /// it: an absent catalog reads as empty.
+    pub(crate) fn snapshot_if_exists(&self, session: &Session<'_>) -> Result<Snapshot> {
+        let scope = self.catalog_scope();
+        match Store::observe_if_exists(session, &self.path(scope)?, scope)? {
+            None => Ok(Snapshot::default()),
+            Some(catalog) => self.project(
+                self.discovery_records_from(session, &catalog)?,
+                &Policy::default(),
+            ),
+        }
+    }
+
+    /// Retire `retired`, a table an earlier build declares, by declaring its next version once:
+    /// its declarations then conflict, so a build that knows only `retired` neither reads nor
+    /// writes it again. Only where this Mac's catalog declares `retired` and nothing else at its
+    /// identity; the creator budgets hold as for [`Self::publish`], and nothing is enrolled.
+    /// Whether a declaration was written.
+    ///
+    /// # Errors
+    /// Not a current writer, a foreign or catalog identity, unreadable catalog storage, or this
+    /// Mac's creator budget is spent.
+    pub(crate) fn seal(&self, session: &Session<'_>, retired: &Descriptor) -> Result<bool> {
+        session.writer()?;
+        if retired.scope.trust() != self.trust || retired.scope == self.catalog_scope() {
+            return Err(Error::new(
+                "invalid declaration network or catalog identity",
+            ));
+        }
+        let twin = Descriptor {
+            version: retired
+                .version
+                .checked_add(1)
+                .ok_or_else(|| Error::new("table schema version is exhausted"))?,
+            ..retired.clone()
+        };
+        let payload = twin.encode()?;
+        let scope = self.catalog_scope();
+        let claim =
+            crate::table::store::claim_dir(session)?.join(crate::table::store::claim_name(scope));
+        if !claim.try_exists()? {
+            return Ok(false);
+        }
+        let mut catalog = Store::open(session, &self.path(scope)?, scope)?;
+        let snapshot = self.project(catalog.catalog(session)?, &Policy::default())?;
+        let Some(entry) = snapshot.entries.get(&retired.scope.digest()) else {
+            return Ok(false);
+        };
+        if entry.declarations.iter().any(|d| d.descriptor != *retired) {
+            return Ok(false);
+        }
+        let mine = |entry: &Entry| {
+            entry
+                .declarations
+                .iter()
+                .any(|d| d.actor == session.actor())
+        };
+        if !mine(entry) && snapshot.entries.values().filter(|e| mine(e)).count() >= PER_CREATOR {
+            return Err(Error::new("table creator subscription limit reached"));
+        }
+        if catalog.retained_by(session, session.actor())? >= RECORDS_PER_CREATOR {
+            return Err(Error::new("catalog author history limit reached"));
+        }
+        catalog.commit_catalog(session, &payload)?;
+        Ok(true)
+    }
+
+    /// Read an existing catalog with default local projection policy. Missing
+    /// or damaged established storage is never replaced by an empty enrollment.
+    pub fn snapshot_existing(&self, session: &Session<'_>) -> Result<Snapshot> {
+        let catalog = Store::open(
+            session,
+            &self.path(self.catalog_scope())?,
+            self.catalog_scope(),
+        )?;
+        self.project(
+            self.discovery_records_from(session, &catalog)?,
+            &Policy::default(),
+        )
+    }
     /// Observe an already enrolled catalog without falling back to enrollment
     /// when its claim or journal is absent or incomplete.
-    pub(crate) fn snapshot_existing_with_config(
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when existing catalog custody or storage cannot be
+    /// validated, retained storage exceeds its bound, or the sharing
+    /// configuration is unavailable or invalid.
+    pub fn snapshot_existing_with_config(
         &self,
         session: &Session<'_>,
         config: &Path,
@@ -239,16 +352,22 @@ impl Directory {
             &Policy::read(config)?,
         )
     }
+    /// Whether `id` may be repaired now (`now`, seconds since the Unix epoch, places the ring
+    /// windows): the catalog, a ring table of the current window, or a subscribed declaration.
     pub(crate) fn permits(
         &self,
         session: &Session<'_>,
         policy: &Policy,
         id: Digest,
+        now: u64,
     ) -> Result<bool> {
         if !policy.enabled || policy.excluded.contains(&self.catalog_scope().digest()) {
             return Ok(false);
         }
         if id == self.catalog_scope().digest() {
+            return Ok(true);
+        }
+        if !policy.excluded.contains(&id) && self.ring_permits(session, id, now)? {
             return Ok(true);
         }
         Ok(self
@@ -257,6 +376,39 @@ impl Directory {
             .get(&id)
             .is_some_and(|entry| entry.state == State::Subscribed))
     }
+    /// Observe settled subscriptions without enrolling or reserving a slot.
+    /// None asks the caller to acquire a writer for first-time setup.
+    pub(crate) fn existing_subscriptions(
+        &self,
+        session: &Session<'_>,
+        policy: &Policy,
+    ) -> Result<Option<BTreeMap<Digest, (Scope, PathBuf)>>> {
+        let scope = self.catalog_scope();
+        if !policy.enabled || policy.excluded.contains(&scope.digest()) {
+            return Ok(Some(BTreeMap::new()));
+        }
+        let Some(catalog) = Store::observe_if_exists(session, &self.path(scope)?, scope)? else {
+            return Ok(None);
+        };
+        let snapshot = self.project(self.discovery_records_from(session, &catalog)?, policy)?;
+        let mut tables = BTreeMap::from([(scope.digest(), (scope, self.path(scope)?))]);
+        for entry in snapshot
+            .entries
+            .values()
+            .filter(|entry| entry.state == State::Subscribed)
+        {
+            let path = self.path(entry.scope)?;
+            if !path.try_exists()? {
+                return Ok(None);
+            }
+            tables.insert(entry.scope.digest(), (entry.scope, path));
+        }
+        // Also seal a reservation whose earlier parent barrier failed. A
+        // barrier creates no slot and needs no control-journal writer.
+        aterm_durable::durable_dir(&self.root)?;
+        Ok(Some(tables))
+    }
+
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -348,7 +500,15 @@ impl Directory {
     /// declarations only retain existing slots, never admit a new table. Local
     /// exclusion and descriptor-conflict checks still run in `project`.
     fn discovery_records(&self, session: &Session<'_>) -> Result<Vec<crate::table::Record>> {
-        let catalog = self.catalog(session)?;
+        let catalog = if session.has_control_writer() {
+            self.catalog(session)?
+        } else {
+            Store::observe(
+                session,
+                &self.path(self.catalog_scope())?,
+                self.catalog_scope(),
+            )?
+        };
         self.discovery_records_from(session, &catalog)
     }
     fn discovery_records_from(

@@ -105,16 +105,19 @@ fn a_transparent_spawn_fails_as_std_fails() {
     assert!(command.get_args().eq(["a", "b", "c"]));
 }
 
-/// Stage name for [`a_transparent_run_is_the_std_run_it_replaces`] and [`transparent_mask_probe_stage`].
+/// Stage name for [`a_transparent_run_is_the_std_run_it_replaces`].
 const SIGNALS_STAGE: &str = "transparent-signals";
 
-/// Prints the process's initial signal mask as `MASK=<signals>` when [`STAGE_ENV`] is [`SIGNALS_STAGE`].
-#[test]
-fn transparent_mask_probe_stage() {
-    if std::env::var(STAGE_ENV).as_deref() != Ok(SIGNALS_STAGE) {
-        return;
+/// Stage name for the mask-probe child spawned inside [`staged_signals`].
+const MASK_PROBE_STAGE: &str = "transparent-mask-probe";
+
+/// Prints the process's initial signal mask as `MASK=<signals>` when [`STAGE_ENV`] is [`MASK_PROBE_STAGE`].
+fn transparent_mask_probe_stage_if_asked() -> bool {
+    if std::env::var(STAGE_ENV).as_deref() != Ok(MASK_PROBE_STAGE) {
+        return false;
     }
     println!("\nMASK={}", blocked());
+    true
 }
 
 /// `sigset_t`: a 32-bit mask on Darwin, 1024 bits on Linux.
@@ -249,7 +252,8 @@ fn staged_signals() {
         (
             "the signal mask: the spawning thread's",
             format!(
-                "exec '{exe}' --exact spawnfd::transparent_tests::transparent_mask_probe_stage \
+                "{STAGE_ENV}={MASK_PROBE_STAGE} exec '{exe}' \
+                 --exact spawnfd::transparent_tests::a_transparent_run_is_the_std_run_it_replaces \
                  --nocapture --test-threads=1 >\"$1\""
             ),
         ),
@@ -295,6 +299,9 @@ fn staged_signals() {
 #[test]
 fn a_transparent_run_is_the_std_run_it_replaces() {
     const NAME: &str = "spawnfd::transparent_tests::a_transparent_run_is_the_std_run_it_replaces";
+    if transparent_mask_probe_stage_if_asked() {
+        return;
+    }
     if std::env::var(STAGE_ENV).is_ok() {
         staged_signals();
         return;

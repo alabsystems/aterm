@@ -5,11 +5,26 @@
 
 use std::time::Instant;
 
-use aterm_core::terminal::program_state::{ProgramApp, ProgramState, ProgramStateReport};
+use aterm_core::terminal::program_state::{
+    ProgramApp, ProgramState, ProgramStateReport, ProgramStateWord,
+};
+
+/// One edge of a codex's turn that no shown move claims ([`ProgramStateGate::observe_fed`]), with
+/// the wall clock of the parse batch it arrived in (epoch ms; `None` where that batch read none).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FedEdge {
+    /// A turn began.
+    Began(Option<u64>),
+    /// A turn ended at this rest (`idle`, `done` or `error`).
+    Ended(ProgramStateWord, Option<u64>),
+}
 
 /// One session's gate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProgramStateGate {
+    /// A sweep has read the engine; the first reading is a baseline ([`Self::observe_fed`] feeds
+    /// none of the edges it finds).
+    read: bool,
     /// The engine sequence the last sweep saw.
     seen_seq: u64,
     /// Reports at or below this sequence were already seen before the latest
@@ -38,6 +53,9 @@ pub(crate) struct ProgramStateGate {
     /// The engine's count of turns begun (`ProgramStateReport::turns`) at the
     /// last sweep's reading, honoured or not.
     turns: u64,
+    /// How many times the report shown moved ([`Self::observe`] returning true): what the tab
+    /// hover's cached activity line keys on (`App::session_status_revision`).
+    moves: u64,
 }
 
 impl ProgramStateGate {
@@ -49,6 +67,7 @@ impl ProgramStateGate {
         group_moved: bool,
         now: Instant,
     ) -> bool {
+        self.read = true;
         self.turns = report.turns;
         if group_moved {
             // Discard reports already seen under the previous group. An
@@ -85,7 +104,58 @@ impl ProgramStateGate {
         self.shown = next.map(|state| (state, now));
         self.shown_began = next.map(|_| report.began);
         self.shown_continuous_ms = next.and_then(|_| aterm_uds::process::continuous_ms());
+        self.moves += 1;
         true
+    }
+
+    /// Fold one sweep's reading as [`Self::observe`] does, and answer with it the edges of a
+    /// codex's turns the engine kept (`ProgramStateReport::turn_edges`) that no shown move claims,
+    /// oldest first: each beginning and end past the last reading, an end only for a turn begun
+    /// after the latest foreground move (one begun at or before it, or one kept with no beginning
+    /// once a move was seen, is the run's that left), and not the beginning this reading's own
+    /// move shows, which its program mark claims. None is fed
+    /// on the first reading (a baseline), on a foreground move's reading (unseen output then is
+    /// not attributable to its writer), with no codex in front (`codex_front`), or from a report
+    /// whose sequence went back.
+    pub(crate) fn observe_fed(
+        &mut self,
+        report: ProgramStateReport,
+        honoured: bool,
+        codex_front: bool,
+        group_moved: bool,
+        now: Instant,
+    ) -> (bool, Vec<FedEdge>) {
+        let mut edges = Vec::new();
+        // An edge's sequence is at most its report's, so a report whose sequence went back (another
+        // engine) has none past the last reading.
+        if self.read && !group_moved && codex_front {
+            for turn in report.turn_edges().filter(|t| t.app == ProgramApp::Codex) {
+                if let Some(began) = turn.began.filter(|b| b.seq > self.seen_seq) {
+                    edges.push(FedEdge::Began(began.wall_ms));
+                }
+                let after_move = turn
+                    .began
+                    .map_or(self.floor_seq == 0, |b| b.seq > self.floor_seq);
+                if let Some((word, ended)) = turn.ended.filter(|(_, e)| e.seq > self.seen_seq)
+                    && after_move
+                {
+                    edges.push(FedEdge::Ended(word, ended.wall_ms));
+                }
+            }
+        }
+        let starts = self.turn_starts;
+        let moved = self.observe(report, honoured, group_moved, now);
+        // The beginning this move shows is its mark's. Only the running turn's beginning comes
+        // last: an end's sequence is above its beginning's.
+        if self.turn_starts > starts && matches!(edges.last(), Some(FedEdge::Began(_))) {
+            edges.pop();
+        }
+        (moved, edges)
+    }
+
+    /// How many times the report shown has moved.
+    pub(crate) const fn moves(&self) -> u64 {
+        self.moves
     }
 
     /// How long the report shown has stood (`status program_state_ms=`), counted through sleep
@@ -227,14 +297,42 @@ pub(crate) const fn row_word(state: ProgramState) -> &'static str {
 /// (`agent=unknown`): `working` is `busy`; `blocked` is `question` on a question, `wall:auth` on a
 /// login and `prompt` otherwise; `idle`, `done` and `error` (a turn that ended) are `idle`.
 pub(crate) const fn survey_word(state: ProgramState) -> &'static str {
+    survey_word_of(state.state, state.kind)
+}
+
+const fn survey_word_of(
+    state: aterm_core::terminal::program_state::ProgramStateWord,
+    kind: Option<aterm_core::terminal::program_state::ProgramBlockedKind>,
+) -> &'static str {
     use aterm_core::terminal::program_state::{ProgramBlockedKind as K, ProgramStateWord as W};
-    match (state.state, state.kind) {
+    match (state, kind) {
         (W::Working, _) => "busy",
         (W::Blocked, Some(K::Question)) => "question",
         (W::Blocked, Some(K::Auth)) => "wall:auth",
         (W::Blocked, Some(K::Permission) | None) => "prompt",
         (W::Idle | W::Done | W::Error, _) => "idle",
     }
+}
+
+/// [`survey_word`] of a `program_state=` column (`<state>[:<kind>]`, [`ProgramState::wire`]), as
+/// another aterm's `sessions` line carries it: `None` for `-` or a word this build does not know.
+pub(crate) fn survey_word_of_wire(wire: &str) -> Option<&'static str> {
+    use aterm_core::terminal::program_state::{ProgramBlockedKind as K, ProgramStateWord as W};
+    let (state, kind) = wire
+        .split_once(':')
+        .map_or((wire, None), |(state, kind)| (state, Some(kind)));
+    let state = [W::Idle, W::Working, W::Blocked, W::Done, W::Error]
+        .into_iter()
+        .find(|word| word.as_str() == state)?;
+    let kind = match kind {
+        Some(kind) => Some(
+            [K::Permission, K::Question, K::Auth]
+                .into_iter()
+                .find(|word| word.as_str() == kind)?,
+        ),
+        None => None,
+    };
+    Some(survey_word_of(state, kind))
 }
 
 #[cfg(test)]
@@ -372,6 +470,174 @@ mod tests {
         assert_eq!(shown(&gate).as_deref(), Some("blocked:permission"));
         assert_eq!((gate.turn_starts(), gate.turn_ends()), turns);
         assert!(!gate.observe(term.program_state(), true, false, t0));
+    }
+
+    const DONE: &[u8] = b"\x1b]7501;state=done:app=codex\x1b\\";
+    /// The wall clock the edge tests' parse batches read, `ms` into the test.
+    const WALL0: u64 = 1_760_000_000_000;
+
+    /// `bytes` into `term` in one parse batch whose wall clock reads `ms` into the test.
+    fn says_at(term: &mut Terminal, bytes: &[u8], ms: u64) {
+        term.process_at(
+            bytes,
+            aterm_core::terminal::ClockReading {
+                wall_ms: Some(WALL0 + ms),
+                ..aterm_core::terminal::ClockReading::now()
+            },
+        );
+    }
+
+    /// One codex in front's reading, honoured as the sweep judges it (`honoured_for` of the report
+    /// standing), with no foreground move.
+    fn fed(gate: &mut ProgramStateGate, term: &Terminal, t: Instant) -> (bool, Vec<FedEdge>) {
+        let report = term.program_state();
+        let honoured = honoured_for(Some("codex"), report.state.map(|s| s.app));
+        gate.observe_fed(report, honoured, true, false, t)
+    }
+
+    /// A TURN BETWEEN TWO READINGS IS FED AND SHOWS NOTHING: a codex `working` at 10 ms and its
+    /// `done` at 27 ms, both after a reading of `done`, are fed as that turn's beginning and end at
+    /// their batches' wall clocks, while the gate shows no move and counts no turn (the turn
+    /// counts are the shown moves'); the next reading feeds them no more. The first reading is a
+    /// baseline: the turn before it is fed by none.
+    #[test]
+    fn a_turn_between_two_readings_is_fed_and_shows_nothing() {
+        let mut term = Terminal::new(24, 80);
+        let mut gate = ProgramStateGate::default();
+        let t0 = Instant::now();
+        says_at(&mut term, WORKING, 0);
+        says_at(&mut term, DONE, 5);
+        assert_eq!(
+            fed(&mut gate, &term, t0),
+            (true, vec![]),
+            "the first reading is a baseline"
+        );
+        says_at(&mut term, WORKING, 10);
+        says_at(&mut term, DONE, 27);
+        assert_eq!(
+            fed(&mut gate, &term, t0),
+            (
+                false,
+                vec![
+                    FedEdge::Began(Some(WALL0 + 10)),
+                    FedEdge::Ended(ProgramStateWord::Done, Some(WALL0 + 27)),
+                ]
+            )
+        );
+        assert_eq!((gate.turn_starts(), gate.turn_ends()), (0, 0));
+        assert_eq!(fed(&mut gate, &term, t0), (false, vec![]), "fed once");
+    }
+
+    /// THE BEGINNING A SHOWN MOVE STARTS IS ITS MARK'S: a `working` shown after `done` feeds
+    /// nothing (its mark claims the turn); a `done` and the next `working` read together under a
+    /// shown `working` feed the end and that beginning, the gate showing no move; and a turn whole
+    /// and the next `working` read together under a shown `done` feed the whole turn, not the
+    /// beginning the move shows. Every end is fed, the one a move shows too.
+    #[test]
+    fn the_begin_a_shown_move_starts_is_the_marks() {
+        let mut term = Terminal::new(24, 80);
+        let mut gate = ProgramStateGate::default();
+        let t0 = Instant::now();
+        says_at(&mut term, DONE, 0);
+        assert_eq!(fed(&mut gate, &term, t0), (true, vec![]));
+        says_at(&mut term, WORKING, 10);
+        assert_eq!(fed(&mut gate, &term, t0), (true, vec![]), "the mark's");
+        assert_eq!(gate.turn_starts(), 1);
+        says_at(&mut term, DONE, 20);
+        says_at(&mut term, WORKING, 30);
+        assert_eq!(
+            fed(&mut gate, &term, t0),
+            (
+                false,
+                vec![
+                    FedEdge::Ended(ProgramStateWord::Done, Some(WALL0 + 20)),
+                    FedEdge::Began(Some(WALL0 + 30)),
+                ]
+            ),
+            "no move shows the beginning"
+        );
+        says_at(&mut term, DONE, 40);
+        assert_eq!(
+            fed(&mut gate, &term, t0),
+            (
+                true,
+                vec![FedEdge::Ended(ProgramStateWord::Done, Some(WALL0 + 40))]
+            ),
+            "a shown end is fed too"
+        );
+        says_at(&mut term, WORKING, 50);
+        says_at(&mut term, DONE, 60);
+        says_at(&mut term, WORKING, 70);
+        assert_eq!(
+            fed(&mut gate, &term, t0),
+            (
+                true,
+                vec![
+                    FedEdge::Began(Some(WALL0 + 50)),
+                    FedEdge::Ended(ProgramStateWord::Done, Some(WALL0 + 60)),
+                ]
+            )
+        );
+        assert_eq!(gate.turn_starts(), 2);
+    }
+
+    /// NONE IS FED ON A MOVE, A FIRST READING, FOR A TURN BEGUN BEFORE A MOVE, OR WITH NO CODEX
+    /// IN FRONT: a whole turn read on the gate's first reading or on a foreground move's reading
+    /// feeds nothing (unseen output then is not attributable to its writer); after a move, the end
+    /// of the turn that was running at it is the run's that left, while a turn begun after the move
+    /// is fed; a reading with no codex in front, a Grok Build's own turn under a codex, and a
+    /// report whose sequence went back (another engine) feed nothing.
+    #[test]
+    fn a_move_a_first_reading_and_a_turn_begun_before_a_move_feed_nothing() {
+        let t0 = Instant::now();
+        let none: Vec<FedEdge> = Vec::new();
+        let mut term = Terminal::new(24, 80);
+        let mut gate = ProgramStateGate::default();
+        says_at(&mut term, WORKING, 0);
+        says_at(&mut term, DONE, 5);
+        assert_eq!(fed(&mut gate, &term, t0).1, none, "a first reading");
+        says_at(&mut term, WORKING, 10);
+        says_at(&mut term, DONE, 20);
+        let (_, edges) = gate.observe_fed(term.program_state(), true, true, true, t0);
+        assert_eq!(edges, none, "a move's reading");
+
+        let mut term = Terminal::new(24, 80);
+        let mut gate = ProgramStateGate::default();
+        says_at(&mut term, WORKING, 0);
+        fed(&mut gate, &term, t0);
+        let (_, edges) = gate.observe_fed(term.program_state(), true, true, true, t0);
+        assert_eq!(edges, none);
+        says_at(&mut term, DONE, 30);
+        assert_eq!(
+            fed(&mut gate, &term, t0).1,
+            none,
+            "the turn running at the move is the run's that left"
+        );
+        says_at(&mut term, WORKING, 40);
+        says_at(&mut term, DONE, 50);
+        assert_eq!(
+            fed(&mut gate, &term, t0).1,
+            [
+                FedEdge::Began(Some(WALL0 + 40)),
+                FedEdge::Ended(ProgramStateWord::Done, Some(WALL0 + 50)),
+            ],
+            "CONTROL: a turn begun after the move"
+        );
+        says_at(&mut term, WORKING, 60);
+        says_at(&mut term, DONE, 70);
+        let (_, edges) = gate.observe_fed(term.program_state(), false, false, false, t0);
+        assert_eq!(edges, none, "no codex in front");
+        says_at(
+            &mut term,
+            b"\x1b]7501;state=working:app=grok-build\x1b\\",
+            80,
+        );
+        says_at(&mut term, b"\x1b]7501;state=done:app=grok-build\x1b\\", 90);
+        assert_eq!(fed(&mut gate, &term, t0).1, none, "a Grok Build's turn");
+        let mut other = Terminal::new(24, 80);
+        says_at(&mut other, WORKING, 100);
+        says_at(&mut other, DONE, 110);
+        assert_eq!(fed(&mut gate, &other, t0).1, none, "a sequence gone back");
     }
 
     /// A turn end is `working` then `done`|`idle` as the gate showed them:

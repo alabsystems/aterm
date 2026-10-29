@@ -3,9 +3,12 @@
 
 //! A RUN'S DISK FOOTPRINT (`docs/DESIGN-adaptive-build-2026-10-24.md`, DISK-ADMIT): what one
 //! kind of run writes, measured on its own directories while it runs ([`Meter`]) and kept beside
-//! them ([`Footprints`]), so the next run of that kind claims what the last ones wrote
+//! them ([`Footprints`]), each run tagged with the directories it measured ([`Footprint::dirs`]),
+//! so the next run of that kind on those directories claims what the last ones there wrote
 //! ([`Footprints::need`]). A kind never measured here claims its cold budget, less what its
-//! directories already hold.
+//! directories already hold, and no run claims more than that budget for writing again what its
+//! directories held at a peak: a peak further above what they hold now held more than one run
+//! writes.
 
 use std::fmt;
 use std::io::{self, Write as _};
@@ -84,6 +87,20 @@ pub struct Footprint {
     pub grew: u64,
     /// When it ended, unix ms.
     pub at_ms: u64,
+    /// The directories it measured, by their tag (a stable digest of their canonical paths,
+    /// `atpkg::admit_disk::dirs_tag`): [`Footprints::need`] counts no run measured on other
+    /// directories than the next run's, such as before they were re-pointed (the build cache's
+    /// move). `None` for a run kept before runs were tagged, which counts wherever it was
+    /// measured.
+    pub dirs: Option<u64>,
+}
+
+impl Footprint {
+    /// Whether this run was measured on the directories tagged `dirs`, or kept untagged.
+    #[must_use]
+    pub fn measured_on(&self, dirs: u64) -> bool {
+        self.dirs.is_none_or(|d| d == dirs)
+    }
 }
 
 /// What a run claims, and why.
@@ -91,12 +108,16 @@ pub struct Footprint {
 pub struct Estimate {
     /// Bytes.
     pub bytes: u64,
-    /// The runs it was read from; `0`: the cold budget less what the directories hold.
+    /// The runs it was read from, those measured on the run's own directories
+    /// ([`Footprint::measured_on`]); `0`: the cold budget less what the directories hold.
     pub runs: usize,
     /// What the run's directories hold now.
     pub holds: u64,
     /// What a run of its kind writes into empty directories.
     pub cold: u64,
+    /// Whether [`Self::cold`] is the figure because it capped a kept run's peak beyond what the
+    /// directories hold now: they held more than one run writes then ([`Footprints::need`]).
+    pub capped: bool,
 }
 
 impl fmt::Display for Estimate {
@@ -114,6 +135,18 @@ impl fmt::Display for Estimate {
                  here",
                 size(self.bytes),
                 size(self.cold),
+                size(self.holds)
+            )
+        } else if self.capped {
+            write!(
+                f,
+                "{}, the cold budget, what a run of it writes into empty directories: a run among \
+                 the last {} held more than that at its peak beyond what its directories hold now \
+                 ({}), so they held more than one run writes then (what earlier runs left, or \
+                 other directories before they were re-pointed), and it claims the budget while \
+                 one of the last {KEPT} does",
+                size(self.bytes),
+                self.runs,
                 size(self.holds)
             )
         } else {
@@ -159,29 +192,43 @@ impl Footprints {
         self.runs.drain(..over);
     }
 
-    /// What the next run claims when its directories hold `holds` bytes: for each run kept, what
-    /// it grew them by, or what they held at its peak less what they hold now (a build directory
-    /// reclaimed since is written again whole), and the most of those. Where none is kept,
-    /// `cold`, what a run writes into EMPTY directories, less what they hold already: nothing
-    /// where they hold it all (a warm build directory, a VM already on disk), and that first run
-    /// then measures what it really writes for the next.
+    /// What the next run claims when its directories, tagged `dirs` ([`Footprint::dirs`]), hold
+    /// `holds` bytes: for each run kept that was measured on them ([`Footprint::measured_on`]: a
+    /// run tagged with other directories was not measured here, and one kept untagged counts as it
+    /// always did), what it grew them by, or what they held at its peak less what they hold now (a
+    /// build directory reclaimed since is written again whole) but no more than `cold`, and the
+    /// most of those. `cold` is what a run writes into EMPTY directories, so it is the most one
+    /// writes again into directories emptied since: a peak further above what they hold now
+    /// measured directories holding more than one run writes (what earlier runs left: the stale
+    /// files of many builds, a VM disk grown over its runs; or, for a run kept untagged, other
+    /// directories before they were re-pointed, as the build cache's move did), and claims `cold`
+    /// ([`Estimate::capped`]). The next run's whole write, what it writes again with what it grows
+    /// them by, is held to `cold`, the tightest bound while `cold` holds: after a run that grew
+    /// warm directories past `cold`, emptied directories claim `cold`, not that run's peak. What a
+    /// run grew them by is not capped: a run that wrote more than `cold` measured it, and its
+    /// growth from emptied directories corrects a `cold` too low. Where none is kept, `cold` less
+    /// what they hold already: nothing where they hold it all (a warm build directory, a VM already
+    /// on disk), and that first run then measures what it really writes for the next. So where
+    /// every run kept was measured on other directories, it claims as where none is kept.
     #[must_use]
-    pub fn need(&self, holds: u64, cold: u64) -> Estimate {
-        let bytes = self
-            .runs
-            .iter()
-            .map(|r| r.grew.max(r.peak.saturating_sub(holds)))
+    pub fn need(&self, holds: u64, cold: u64, dirs: u64) -> Estimate {
+        let here = || self.runs.iter().filter(|r| r.measured_on(dirs));
+        let rewrite = |r: &Footprint| r.peak.saturating_sub(holds);
+        let bytes = here()
+            .map(|r| r.grew.max(rewrite(r).min(cold)))
             .max()
             .unwrap_or_else(|| cold.saturating_sub(holds));
         Estimate {
             bytes,
-            runs: self.runs.len(),
+            runs: here().count(),
             holds,
             cold,
+            capped: bytes == cold && here().any(|r| rewrite(r) > cold),
         }
     }
 
-    /// The runs as the file holds them.
+    /// The runs as the file holds them: schema 1, each run's `dirs` key only where it is tagged,
+    /// which a build that does not know the key ignores.
     #[must_use]
     pub fn encode(&self) -> String {
         let runs = self
@@ -192,6 +239,9 @@ impl Footprints {
                 o.insert("peak".to_owned(), Value::from(r.peak));
                 o.insert("grew".to_owned(), Value::from(r.grew));
                 o.insert("at_ms".to_owned(), Value::from(r.at_ms));
+                if let Some(dirs) = r.dirs {
+                    o.insert("dirs".to_owned(), Value::from(dirs));
+                }
                 Value::Object(o)
             })
             .collect();
@@ -201,7 +251,8 @@ impl Footprints {
         aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| "{}".to_owned())
     }
 
-    /// The runs `text` holds; none for text that is not [`Self::encode`]'s.
+    /// The runs `text` holds; none for text that is not [`Self::encode`]'s. A run without a
+    /// `dirs` key is untagged ([`Footprint::dirs`] `None`); keys it does not know are ignored.
     #[must_use]
     pub fn decode(text: &str) -> Footprints {
         let Ok(v) = aterm_json::from_str::<Value>(text) else {
@@ -220,7 +271,12 @@ impl Footprints {
             let num = |k: &str| r.get(k).and_then(Value::as_u64);
             if let (Some(peak), Some(grew), Some(at_ms)) = (num("peak"), num("grew"), num("at_ms"))
             {
-                out.push(Footprint { peak, grew, at_ms });
+                out.push(Footprint {
+                    peak,
+                    grew,
+                    at_ms,
+                    dirs: num("dirs"),
+                });
             }
         }
         out
@@ -263,6 +319,8 @@ struct Shared {
 /// returns as the run's [`Footprint`].
 pub struct Meter {
     start: u64,
+    /// The tag of the directories it measures ([`Footprint::dirs`]).
+    dirs: Option<u64>,
     shared: Arc<Mutex<Shared>>,
     stop: Option<mpsc::Sender<()>>,
     thread: Option<JoinHandle<u64>>,
@@ -270,19 +328,26 @@ pub struct Meter {
 
 impl fmt::Debug for Meter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Meter").field("start", &self.start).finish()
+        f.debug_struct("Meter")
+            .field("start", &self.start)
+            .field("dirs", &self.dirs)
+            .finish()
     }
 }
 
 impl Meter {
     /// Measure `dirs` ([`allocated`]) every [`EVERY`] from `start`, the bytes they held when the
-    /// run began, holding `claim` for the run.
+    /// run began, holding `claim` for the run; `tag` names them in the run's [`Footprint`]
+    /// ([`Footprint::dirs`]).
     #[must_use]
-    pub fn start(dirs: Vec<PathBuf>, start: u64, claim: Option<Claim>) -> Meter {
-        Meter::start_with(start, Box::new(move || allocated(&dirs)), claim, EVERY)
+    pub fn start(dirs: Vec<PathBuf>, tag: u64, start: u64, claim: Option<Claim>) -> Meter {
+        let mut meter = Meter::start_with(start, Box::new(move || allocated(&dirs)), claim, EVERY);
+        meter.dirs = Some(tag);
+        meter
     }
 
-    /// [`Self::start`] with its measure and its pace given.
+    /// [`Self::start`] with its measure and its pace given, and no tag: its run is kept
+    /// untagged.
     #[must_use]
     pub fn start_with(
         start: u64,
@@ -317,6 +382,7 @@ impl Meter {
             .ok();
         Meter {
             start,
+            dirs: None,
             shared,
             stop: Some(stop),
             thread,
@@ -329,7 +395,8 @@ impl Meter {
         self.start
     }
 
-    /// End the run: measure once more, let its claim go, and return what it took.
+    /// End the run: measure once more, let its claim go, and return what it took, tagged with
+    /// the directories it measured.
     #[must_use]
     pub fn finish(mut self) -> Footprint {
         let peak = self.halt();
@@ -337,6 +404,7 @@ impl Meter {
             peak,
             grew: peak.saturating_sub(self.start),
             at_ms: aterm_time::unix_millis().unwrap_or(0),
+            dirs: self.dirs,
         }
     }
 

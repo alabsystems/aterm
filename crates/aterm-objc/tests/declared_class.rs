@@ -376,3 +376,113 @@ fn the_conformance_claim_is_readable_and_is_the_classs_own() {
     };
     assert!(conforms.as_bool());
 }
+
+static SUBSTITUTE_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+struct SubstituteCounter;
+
+impl Drop for SubstituteCounter {
+    fn drop(&mut self) {
+        SUBSTITUTE_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+declare_class! {
+    struct Substitute: NSObject {
+        const NAME: &str = "ATermObjcSubstitute";
+        type Ivars = SubstituteCounter;
+    }
+}
+
+declare_class! {
+    struct ClusterChild: ATermSubstitutingClusterBase {
+        const NAME: &str = "ATermClusterChild";
+        type Ivars = Ivars;
+
+        @sel(readCount)
+        fn read_count(&self) -> i64 {
+            self.ivars().calls.get()
+        }
+    }
+}
+
+unsafe extern "C" fn substituting_init(this: Id, _cmd: Sel) -> Id {
+    // Release the allocated subclass instance (dropping its ivars) and return a +1
+    // sibling `Substitute` instance, as a class-cluster superclass `-init` does.
+    // SAFETY: `this` is the +1 uninitialised instance from `+alloc`.
+    drop(unsafe { aterm_objc::Obj::from_owned(this) });
+    Substitute::alloc_init(mtm(), SubstituteCounter)
+        .expect("substitute allocates")
+        .into_raw()
+}
+
+fn register_substituting_base() -> &'static AtomicUsize {
+    static REGISTERED: std::sync::Once = std::sync::Once::new();
+    REGISTERED.call_once(|| {
+        let mut b = aterm_objc::begin(c"NSObject", c"ATermSubstitutingClusterBase");
+        b.add_rust_ivar::<()>();
+        let imp: unsafe extern "C" fn(Id, Sel) -> Id = substituting_init;
+        // SAFETY: `substituting_init` matches `-(id)init` (`@@:`) and cannot unwind.
+        unsafe {
+            b.add_method(
+                sel!(init),
+                imp as *const std::ffi::c_void,
+                &aterm_objc::method_encoding!(Id),
+            );
+        }
+        let _ = b.register();
+    });
+    &SUBSTITUTE_DROPS
+}
+
+#[test]
+fn substituting_initializer_and_foreign_ivars_receiver_are_refused() {
+    let sub_drops = register_substituting_base();
+    sub_drops.store(0, Ordering::SeqCst);
+
+    let child_drops = Arc::new(AtomicUsize::new(0));
+    let panic_err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = ClusterChild::alloc_init(
+            mtm(),
+            Ivars {
+                calls: Cell::new(9),
+                drops: Arc::clone(&child_drops),
+            },
+        );
+    }))
+    .expect_err("substituting -init must be refused before wrapping in Retained<ClusterChild>");
+    let msg_text = panic_err
+        .downcast_ref::<String>()
+        .map_or("", String::as_str);
+    assert!(
+        msg_text.contains("ATermClusterChild") && msg_text.contains("ATermObjcSubstitute"),
+        "unexpected panic message: {msg_text}"
+    );
+    assert_eq!(
+        child_drops.load(Ordering::SeqCst),
+        1,
+        "original child ivars dropped once"
+    );
+    assert_eq!(
+        sub_drops.load(Ordering::SeqCst),
+        1,
+        "substituted +1 object released without leak"
+    );
+
+    let foreign_drops = Arc::new(AtomicUsize::new(0));
+    let foreign = probe(&foreign_drops);
+    let foreign_ref_err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: `ClusterChild` is zero-sized and `foreign` is a live Objective-C object; this
+        // exercises `ivars()`'s runtime class-chain guard directly against a foreign cast.
+        let bogus: &ClusterChild = unsafe { &*foreign.as_id().cast::<ClusterChild>().cast_const() };
+        let _ = bogus.ivars();
+    }))
+    .expect_err("ivars() on a sibling class instance must panic rather than read foreign bytes");
+    let foreign_msg = foreign_ref_err
+        .downcast_ref::<String>()
+        .map_or("", String::as_str);
+    assert!(
+        foreign_msg.contains("ATermClusterChild") && foreign_msg.contains("ATermObjcProbe"),
+        "unexpected ivars() guard message: {foreign_msg}"
+    );
+}

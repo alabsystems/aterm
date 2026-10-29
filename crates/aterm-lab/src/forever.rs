@@ -266,10 +266,12 @@ pub const AGY_WALL_WORDS: [&str; 2] = ["exceeded your current quota", "Error ID:
 /// on 2.1.307).
 pub const CLAUDE_HIDE_COMMAND: &str = "/rename forever-w2";
 /// The words of Claude Code's usage limit: the turn's `⎿  You've hit your session limit · resets
-/// …`, its `⏺ Usage limit reached · continuing automatically at …` row, and the footer's `⚠ Usage
-/// limit reached · limit resets …` banner.
-pub const CLAUDE_WALL_WORDS: [&str; 4] = [
+/// …` (`5-hour limit` from 2.1.312, which renamed the five-hour window), its `⏺ Usage limit
+/// reached · continuing automatically at …` row, and the footer's `⚠ Usage limit reached · limit
+/// resets …` banner.
+pub const CLAUDE_WALL_WORDS: [&str; 5] = [
     "session limit",
+    "5-hour limit",
     "Usage limit",
     "usage limit",
     "limit resets",
@@ -355,22 +357,16 @@ fn minutes_scaled(minutes: &[i64], n: u32, scale: f64) -> i64 {
 }
 
 /// F3's tool call on harness `h`: a read of the chain's own `README.md` (`file`, its physical
-/// path), which each CLI runs with no confirm in the lab's jail: Claude Code's `Read`, agy's
-/// `view_file`, Muse Code's `read_file` (with a path relative to its workspace
-/// root: its file policy allows an absolute one only in some places).
+/// path), which Claude Code (`Read`) and Muse Code (`read_file`, with a path relative to its
+/// workspace root: its file policy allows an absolute one only in some places) run with no
+/// confirm in the lab's jail. agy's is `read_file` as agy 1.4.10 declares it, but no lab runs
+/// it: F3 is out of agy's reach ([`tool_end_out_of_reach`]).
 #[must_use]
 pub fn read_call(h: Harness, file: &Path) -> J {
     let abs = file.to_string_lossy().into_owned();
     let (name, input) = match h {
         Harness::Claude => ("Read", J::obj([("file_path", J::s(abs))])),
-        Harness::Agy => (
-            "view_file",
-            J::obj([
-                ("AbsolutePath", J::s(abs)),
-                ("toolSummary", J::s("README read")),
-                ("toolAction", J::s("Reading the README")),
-            ]),
-        ),
+        Harness::Agy => ("read_file", J::obj([("Path", J::s(abs))])),
         Harness::Muse => ("read_file", J::obj([("path", J::s("README.md"))])),
     };
     J::obj([("name", J::s(name)), ("input", input)])
@@ -1974,14 +1970,15 @@ pub struct StubSeen {
 }
 
 /// What one tab's records said, each with its time (ms), in order: the journal's lines, the
-/// ledger's rows, and the `status`, `meta` and `task` words at each change.
+/// ledger's rows, and the `status`, `meta` and `task` words at each change, of reads that
+/// answered (a failed reply is no reading: `look` records nothing of it).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Seen {
     pub journal: Vec<(i64, String)>,
     pub ledger: Vec<Row>,
     /// `task=… needs=… autopilot=… supervisor=…` of `status`.
     pub status: Vec<(i64, String)>,
-    /// Actual status reads, even where the recorded words did not change.
+    /// Actual status reads that answered, even where the recorded words did not change.
     pub status_reads: Vec<i64>,
     /// `attention_owners=… attention_kinds=… attention=…` of `meta`, the attention decoded.
     pub meta: Vec<(i64, String)>,
@@ -2004,7 +2001,7 @@ pub struct Seen {
     /// the watch is over ([`lift_witness`]); `None` where it was not lifted.
     pub lift_stub: Option<usize>,
     /// A same-reply chain's resume ask as `ctl messages tag=harness` printed it at each change
-    /// ([`surfaces::held::band_rows`]), and every read of it.
+    /// ([`surfaces::held::band_rows`]), and every read of it that answered.
     pub band: Vec<(i64, String)>,
     pub band_reads: Vec<i64>,
     /// When same-land's person began typing their turn into its held tab
@@ -2179,7 +2176,7 @@ pub struct Scrolled {
     /// takes the wheel (it scrolls its own view) or the tab's viewport moves.
     pub modes: String,
     /// The tab's history above its screen before the first notch, as `lines` answered (`OK <rows>
-    /// …`): the rows a viewport can scroll back.
+    /// …`; `unread (…)` where that read failed): the rows a viewport can scroll back.
     pub history: String,
     /// Whether the opener (the chain's token) was on the screen before the first notch.
     pub before: bool,
@@ -2188,11 +2185,13 @@ pub struct Scrolled {
     pub after: bool,
     /// Where the agent takes no wheel (`mouse_mode=none`): the tab's viewport after the last
     /// notch, as `scroll` answered it (`OK <offset> <max>`), with where the opener and the live
-    /// screen were (`search`).
+    /// screen were (`search`), and the live screen's read after it where that failed.
     pub viewport: Option<String>,
-    /// Whether the live screen (the one the harness reads) changed under the wheel at all.
+    /// Whether the live screen (the one the harness reads) changed under the wheel at all, by
+    /// the last read of it that answered: `false` where none after the wheel did (where the
+    /// agent takes no wheel, [`Self::viewport`] names that read's failure).
     pub moved: bool,
-    /// The screen's rows after the last notch, blank rows left out.
+    /// The screen's rows after the last notch, blank rows left out: the last read that answered.
     pub rows: Vec<String>,
     /// Whether the opener was still on the screen [`SCROLL_HELD_MS`] after the last notch; `None`
     /// before that read.
@@ -3046,15 +3045,9 @@ fn judge_landed<'a>(
             bad.push(format!("the nudge that landed it says \"{w}\""));
         }
     }
-    let records: Vec<&str> = seen
-        .task
-        .iter()
-        .map(|(_, r)| r.trim())
-        .filter(|r| *r != "OK task -")
-        .collect();
-    if let Some(r) = records.first() {
-        bad.push(format!("a task record where none was given: {r}"));
-    }
+    let invented = bad.len();
+    let unread = cover::invented_record(seen, &mut bad);
+    let invented = bad.len() > invented;
     let cleared = seen
         .journal
         .iter()
@@ -3073,15 +3066,18 @@ fn judge_landed<'a>(
         } else {
             "NOT cleared"
         },
-        if seen.task.is_empty() {
+        if unread.is_some() {
             "not read"
-        } else if records.is_empty() {
-            "OK task - throughout"
-        } else {
+        } else if invented {
             "INVENTED"
+        } else {
+            "OK task - throughout"
         }
     );
-    landed_verdict(bad, said, seen, done.0, window)
+    match unread {
+        Some(why) if bad.is_empty() => Verdict::Unobserved(format!("{said}: {why}")),
+        _ => landed_verdict(bad, said, seen, done.0, window),
+    }
 }
 
 fn landed_verdict(bad: Vec<String>, said: String, seen: &Seen, t3: i64, window: i64) -> Verdict {
@@ -4387,6 +4383,40 @@ pub(crate) fn on(door: &Door<'_>, sid: &str, args: &[&str]) -> String {
     door.out(&v)
 }
 
+/// `aterm ctl <args>`'s standard output where it answered, for a read a judge counts from: a
+/// failed reply is no reading, and [`Door::out`]'s empty string for one cannot be told from a line
+/// or a screen that names nothing.
+/// # Errors
+/// What it said instead where it did not answer: the client could not start, it exited non-zero,
+/// or it said `ERR`.
+pub(crate) fn reading(door: &Door<'_>, args: &[&str]) -> Result<String, String> {
+    let asked = args.join(" ");
+    let r = door.ctl(args).map_err(|e| format!("`{asked}`: {e}"))?;
+    let refused = r
+        .stdout
+        .lines()
+        .next()
+        .is_some_and(|l| l == "ERR" || l.starts_with("ERR "));
+    if r.code == 0 && !refused {
+        return Ok(r.stdout);
+    }
+    Err(format!(
+        "`{asked}` answered {}: {}",
+        r.code,
+        crate::util::one_line(&format!("{} {}", r.stdout.trim(), r.stderr.trim()), 200)
+    ))
+}
+
+/// [`reading`] of tab `sid` (`@<sid> <args>`).
+/// # Errors
+/// As [`reading`].
+pub(crate) fn reading_on(door: &Door<'_>, sid: &str, args: &[&str]) -> Result<String, String> {
+    let at = format!("@{sid}");
+    let mut v = vec![at.as_str()];
+    v.extend_from_slice(args);
+    reading(door, &v)
+}
+
 fn at_composer(door: &Door<'_>, sid: &str, agent: &str) -> Option<String> {
     crate::screen::composer_row(agent, &on(door, sid, &["text"]))
 }
@@ -4880,12 +4910,14 @@ fn resize_step(door: &Door<'_>, tab: &mut Tab, now: i64) -> Result<(), Fail> {
     Ok(())
 }
 
-fn shown_rows(door: &Door<'_>, sid: &str) -> Vec<String> {
-    on(door, sid, &["text"])
+/// `sid`'s screen rows, blank rows left out, each cut to 150 characters; `Err` where the `text`
+/// read failed ([`reading`]), which no empty screen stands in for.
+fn shown_rows(door: &Door<'_>, sid: &str) -> Result<Vec<String>, String> {
+    Ok(reading_on(door, sid, &["text"])?
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| l.chars().take(150).collect())
-        .collect()
+        .collect())
 }
 
 fn scroll_step(door: &Door<'_>, tab: &mut Tab, now: i64) -> Result<(), Fail> {
@@ -4895,8 +4927,11 @@ fn scroll_step(door: &Door<'_>, tab: &mut Tab, now: i64) -> Result<(), Fail> {
     let token = tab.chain.token();
     let in_sight = |rows: &[String]| rows.iter().any(|r| r.contains(token.as_str()));
     if let Some(sc) = tab.seen.cover.scrolled.as_mut() {
-        if sc.viewport.is_none() && sc.held.is_none() && now - sc.at >= SCROLL_HELD_MS {
-            let rows = shown_rows(door, &tab.sid);
+        if sc.viewport.is_none()
+            && sc.held.is_none()
+            && now - sc.at >= SCROLL_HELD_MS
+            && let Ok(rows) = shown_rows(door, &tab.sid)
+        {
             sc.held = Some(in_sight(&rows));
             println!(
                 "  [{}] +{} scroll  {} s after the last notch: the opener {}",
@@ -4924,14 +4959,33 @@ fn scroll_step(door: &Door<'_>, tab: &mut Tab, now: i64) -> Result<(), Fail> {
         return Ok(());
     }
     let who = format!("@{}", tab.sid);
-    let modes: Vec<String> = on(door, &tab.sid, &["modes"])
+    // What the verdict counts from (whether the agent takes the wheel, whether the opener was in
+    // sight before it) is read before any notch: where a read failed, no notch is turned and the
+    // next look reads again.
+    let base = reading_on(door, &tab.sid, &["modes"]).and_then(|m| {
+        let history =
+            reading_on(door, &tab.sid, &["lines"]).unwrap_or_else(|e| format!("unread ({e})"));
+        Ok((m, history, shown_rows(door, &tab.sid)?))
+    });
+    let (modes, history, first) = match base {
+        Ok(b) => b,
+        Err(e) => {
+            println!(
+                "  [{}] +{} scroll  no notch turned, what it counts from unread: {}",
+                tab.chain.name(),
+                at(tab.t0, now_ms()),
+                crate::util::one_line(&e, 220)
+            );
+            return Ok(());
+        }
+    };
+    let modes: Vec<String> = modes
         .lines()
         .filter(|l| l.starts_with("alt_screen=") || l.starts_with("mouse_mode="))
         .map(str::to_string)
         .collect();
     let tracks = !modes.iter().any(|m| m == "mouse_mode=none");
-    let history = crate::util::one_line(on(door, &tab.sid, &["lines"]).trim(), 80);
-    let first = shown_rows(door, &tab.sid);
+    let history = crate::util::one_line(history.trim(), 80);
     let before = in_sight(&first);
     let mut rows = first.clone();
     let (mut notches, mut still, mut refused) = (0, 0, None);
@@ -4954,7 +5008,10 @@ fn scroll_step(door: &Door<'_>, tab: &mut Tab, now: i64) -> Result<(), Fail> {
             if !wheel(&mut notches)? {
                 break;
             }
-            let next = shown_rows(door, &tab.sid);
+            // A failed read leaves the last screen read standing: the next notch reads again.
+            let Ok(next) = shown_rows(door, &tab.sid) else {
+                continue;
+            };
             still = if next == rows { still + 1 } else { 0 };
             rows = next;
         }
@@ -4972,9 +5029,15 @@ fn scroll_step(door: &Door<'_>, tab: &mut Tab, now: i64) -> Result<(), Fail> {
             let top = screen_first.saturating_sub(off);
             let shown = opener.is_some_and(|r| r >= top && r < top + height);
             if shown || off >= max || notches >= SCROLL_NOTCHES || !wheel(&mut notches)? {
-                rows = shown_rows(door, &tab.sid);
+                let unread = match shown_rows(door, &tab.sid) {
+                    Ok(r) => {
+                        rows = r;
+                        String::new()
+                    }
+                    Err(e) => format!("; the live screen unread after it ({e})"),
+                };
                 let said = format!(
-                    "scroll {}; the opener {}, the viewport rows {top}..{}, the live screen's {screen_first}..{}",
+                    "scroll {}; the opener {}, the viewport rows {top}..{}, the live screen's {screen_first}..{}{unread}",
                     crate::util::one_line(place.trim(), 40),
                     opener.map_or_else(|| "found nowhere".to_string(), |r| format!("at row {r}")),
                     top + height,
@@ -5127,9 +5190,11 @@ fn records(run: &Run, sid: &str) -> (Vec<(i64, String)>, Vec<Row>) {
     (journal, ledger)
 }
 
-fn status_words(door: &Door<'_>, sid: &str) -> String {
-    let s = on(door, sid, &["status"]);
-    [
+/// The words of `sid`'s `status` the judges read (`?` for one it does not name); `None` where the
+/// read failed ([`reading`]).
+fn status_words(door: &Door<'_>, sid: &str) -> Option<String> {
+    let s = reading_on(door, sid, &["status"]).ok()?;
+    let words = [
         "task",
         "needs",
         "needs_n",
@@ -5148,18 +5213,21 @@ fn status_words(door: &Door<'_>, sid: &str) -> String {
     .iter()
     .map(|k| format!("{k}={}", word(&s, k).unwrap_or_else(|| "?".into())))
     .collect::<Vec<_>>()
-    .join(" ")
+    .join(" ");
+    Some(words)
 }
 
-fn meta_words(door: &Door<'_>, sid: &str) -> String {
-    let m = on(door, sid, &["meta"]);
+/// `sid`'s `meta` attention words, decoded (`?` for one it does not name); `None` where the read
+/// failed ([`reading`]).
+fn meta_words(door: &Door<'_>, sid: &str) -> Option<String> {
+    let m = reading_on(door, sid, &["meta"]).ok()?;
     let w = |k: &str| word(&m, k).unwrap_or_else(|| "?".into());
-    format!(
+    Some(format!(
         "attention_owners={} attention_kinds={} attention={}",
         pct_decode(&w("attention_owners")),
         pct_decode(&w("attention_kinds")),
         pct_decode(&w("attention"))
-    )
+    ))
 }
 
 const MARK: &str = "[aterm harness]";
@@ -6172,17 +6240,21 @@ fn look(run: &Run, door: &Door<'_>, tab: &mut Tab) {
             list.push((now, v));
         }
     };
-    let status = status_words(door, &tab.sid);
-    tab.seen.status_reads.push(now);
-    put(&mut tab.seen.status, "status", status);
-    put(&mut tab.seen.meta, "meta", meta_words(door, &tab.sid));
-    put(
-        &mut tab.seen.task,
-        "task",
-        on(door, &tab.sid, &["task"]).trim().to_string(),
-    );
-    if tab.chain.same_reply() {
-        let band = surfaces::held::band_rows(&door.out(&["messages", "tag=harness"]), &tab.sid);
+    // A read whose reply failed records nothing, its time included: the next look reads again.
+    if let Some(status) = status_words(door, &tab.sid) {
+        tab.seen.status_reads.push(now);
+        put(&mut tab.seen.status, "status", status);
+    }
+    if let Some(meta) = meta_words(door, &tab.sid) {
+        put(&mut tab.seen.meta, "meta", meta);
+    }
+    if let Ok(task) = reading_on(door, &tab.sid, &["task"]) {
+        put(&mut tab.seen.task, "task", task.trim().to_string());
+    }
+    if tab.chain.same_reply()
+        && let Ok(messages) = reading(door, &["messages", "tag=harness"])
+    {
+        let band = surfaces::held::band_rows(&messages, &tab.sid);
         tab.seen.band_reads.push(now);
         put(&mut tab.seen.band, "band", band);
     }
@@ -6693,27 +6765,41 @@ fn run_check(
     let watch0 = now_ms();
     loop {
         let now = now_ms();
-        let glance = desk.as_mut().map(|d| {
-            let g = surfaces::glance(&door, d);
-            for (what, v) in d.note(&g) {
-                println!(
-                    "  [desk] +{} {what:<8} {}",
-                    at(watch0, g.t),
-                    crate::util::one_line(&v, 240)
-                );
+        // Under the surfaces, this pass's glance: none inside where its `chrome` read failed,
+        // which notes nothing of any tab (no empty strip or menu stands in for it); the surfaces'
+        // steps run all the same.
+        let glance = desk.as_mut().map(|d| match surfaces::glance(&door, d) {
+            Ok(g) => {
+                for (what, v) in d.note(&g) {
+                    println!(
+                        "  [desk] +{} {what:<8} {}",
+                        at(watch0, g.t),
+                        crate::util::one_line(&v, 240)
+                    );
+                }
+                Some(g)
             }
-            g
+            Err(e) => {
+                println!(
+                    "  [desk] +{} chrome   unread, nothing noted: {}",
+                    at(watch0, now_ms()),
+                    crate::util::one_line(&e, 240)
+                );
+                None
+            }
         });
         for tab in tabs.iter_mut().filter(|t| !t.over) {
             look(&run, &door, tab);
             if let Some(g) = &glance {
-                for (what, v) in tab.seen.window.note(g, &tab.sid) {
-                    println!(
-                        "  [{}] +{} {what:<7} {}",
-                        tab.chain.name(),
-                        at(tab.t0, g.t),
-                        crate::util::one_line(&v, 240)
-                    );
+                if let Some(g) = g {
+                    for (what, v) in tab.seen.window.note(g, &tab.sid) {
+                        println!(
+                            "  [{}] +{} {what:<7} {}",
+                            tab.chain.name(),
+                            at(tab.t0, g.t),
+                            crate::util::one_line(&v, 240)
+                        );
+                    }
                 }
                 surfaces::held::look_step(&door, tab, front_label.as_deref());
                 surfaces::stopped::ask_step(&door, tab, ask_sid.as_deref());

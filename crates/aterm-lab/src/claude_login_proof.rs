@@ -67,7 +67,7 @@ const PROMPT_A: &str = "Write one sentence about lighthouses, then stop.";
 /// What S2 types.
 const PROMPT_B: &str = "Write one sentence about harbours, then stop.";
 /// A wait for something that must happen: a minute in which nothing it watches moved.
-const HANG: Duration = Duration::from_secs(60);
+pub(crate) const HANG: Duration = Duration::from_secs(60);
 /// The longest any one wait runs however much moves (Claude Code's spinner moves forever).
 const WAIT_CAP: Duration = Duration::from_secs(300);
 /// How often the host looks at the roster's bytes by itself (aterm-gui's `WAKE_FALLBACK`, the
@@ -87,12 +87,12 @@ pub const ROSTER_LOOK: &str = "harness: the accounts' roster changed: news of th
 /// What S3b watches past the supervisor's grace ([`s3b_grace`]).
 const S3B_MARGIN: Duration = Duration::from_secs(15);
 /// The word the process watcher's control carries ([`Watcher`]).
-const PROC_CONTROL: &str = "lab-login-proof-control";
+pub(crate) const PROC_CONTROL: &str = "lab-login-proof-control";
 /// The dead stored login every launch reads: no token, expired at the epoch.
-const DEAD_LOGIN: &str = "{\"claudeAiOauth\":{\"accessToken\":\"\",\"refreshToken\":\"\",\"expiresAt\":0,\
+pub(crate) const DEAD_LOGIN: &str = "{\"claudeAiOauth\":{\"accessToken\":\"\",\"refreshToken\":\"\",\"expiresAt\":0,\
                           \"scopes\":[\"user:inference\",\"user:profile\"],\"subscriptionType\":null}}\n";
 /// The empty composer's row, as the loop's own fence names it.
-const EMPTY_COMPOSER: &str = r"if=^❯\s*$";
+pub(crate) const EMPTY_COMPOSER: &str = r"if=^❯\s*$";
 /// The composer's row holding `/login` (Claude Code draws a no-break space after `❯`).
 const LOGIN_COMPOSER: &str = r"if=^❯\x{A0}/login\s*$";
 /// A row of Claude Code's `/login` method picker, which the lab waits for and never presses.
@@ -246,7 +246,7 @@ pub fn messages_of(text: &str) -> Vec<Message> {
 }
 
 /// Whether one of `messages` went `kind` within `from..=to`, titled as the notice `title` is.
-fn told(messages: &[Message], kind: &str, title: &str, (from, to): (i64, i64)) -> bool {
+pub(crate) fn told(messages: &[Message], kind: &str, title: &str, (from, to): (i64, i64)) -> bool {
     messages
         .iter()
         .any(|m| m.kind == kind && (from..=to).contains(&m.t_ms) && m.title.starts_with(title))
@@ -294,7 +294,7 @@ pub struct Judged {
 }
 
 impl Judged {
-    fn of(missing: &[String], held: String) -> Self {
+    pub(crate) fn of(missing: &[String], held: String) -> Self {
         if missing.is_empty() {
             Self {
                 verdict: Verdict::Ok,
@@ -308,7 +308,7 @@ impl Judged {
         }
     }
 
-    fn not_reached(why: &str) -> Self {
+    pub(crate) fn not_reached(why: &str) -> Self {
         Self {
             verdict: Verdict::Fail,
             evidence: format!("not reached: {why}"),
@@ -324,7 +324,7 @@ pub fn names(line: &str, label: &str) -> bool {
 }
 
 /// `line` cut to `n` characters for the table.
-fn clip(line: &str, n: usize) -> String {
+pub(crate) fn clip(line: &str, n: usize) -> String {
     let mut out: String = line.chars().take(n).collect();
     if line.chars().count() > n {
         out.push('…');
@@ -343,7 +343,7 @@ pub fn is_input(line: &str) -> bool {
 }
 
 /// The acts of `acts` that type into the tab ([`is_input`]).
-fn inputs(acts: &[Act]) -> Vec<Act> {
+pub(crate) fn inputs(acts: &[Act]) -> Vec<Act> {
     acts.iter().filter(|a| is_input(&a.line)).cloned().collect()
 }
 
@@ -354,12 +354,15 @@ pub fn is_login_send(line: &str) -> bool {
 }
 
 /// Whether the act is the loop's Enter, fenced on the composer row that holds `/login`.
+///
+/// The act log spaces its fields with ASCII spaces alone, so a fence that holds Claude Code's
+/// no-break space after `❯` (raw, or escaped `\x{A0}`) stays one field.
 #[must_use]
 pub fn is_login_enter(line: &str) -> bool {
     line.starts_with("key ")
         && line.ends_with(" enter")
         && line
-            .split_whitespace()
+            .split(' ')
             .any(|w| w.starts_with("if=") && w.contains("/login"))
 }
 
@@ -371,7 +374,7 @@ pub fn is_fenced_esc(line: &str) -> bool {
         && line.split_whitespace().any(|w| w.starts_with("if-human="))
 }
 
-fn within<T>(items: &[T], at: impl Fn(&T) -> i64, from: i64, to: i64) -> Vec<&T> {
+pub(crate) fn within<T>(items: &[T], at: impl Fn(&T) -> i64, from: i64, to: i64) -> Vec<&T> {
     items
         .iter()
         .filter(|i| (from..=to).contains(&at(i)))
@@ -817,23 +820,23 @@ pub fn add_wait(aterm_log: &str, now: i64) -> Option<Duration> {
 
 /// What the watcher saw.
 #[derive(Debug, Default, Clone)]
-struct Seen {
-    sightings: Vec<String>,
-    control: bool,
-    looks: u64,
+pub(crate) struct Seen {
+    pub(crate) sightings: Vec<String>,
+    pub(crate) control: bool,
+    pub(crate) looks: u64,
 }
 
 /// Looks at every process every 200 ms for the run's whole length: a lab process (one naming
 /// the run's directory, a descendant of its instance, or one in its jail; the instance itself
 /// apart) carrying `auth login`, or one that is a browser or `open`, is a sighting.
-struct Watcher {
+pub(crate) struct Watcher {
     stop: Arc<AtomicBool>,
     seen: Arc<Mutex<Seen>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 /// What a process's command line is suspected of: `auth login`, or a browser or `open` launch.
-fn suspect(command: &str) -> Option<&'static str> {
+pub(crate) fn suspect(command: &str) -> Option<&'static str> {
     let argv0 = command.split_whitespace().next().unwrap_or("");
     let base = argv0.rsplit('/').next().unwrap_or(argv0);
     if command.contains(" auth login") {
@@ -846,7 +849,7 @@ fn suspect(command: &str) -> Option<&'static str> {
 }
 
 impl Watcher {
-    fn start(run: &Run) -> Watcher {
+    pub(crate) fn start(run: &Run) -> Watcher {
         let stop = Arc::new(AtomicBool::new(false));
         let seen = Arc::new(Mutex::new(Seen::default()));
         let (instance, mark) = (run.instance_pid, run.mark.clone());
@@ -889,7 +892,7 @@ impl Watcher {
         }
     }
 
-    fn finish(mut self) -> Seen {
+    pub(crate) fn finish(mut self) -> Seen {
         self.halt();
         self.seen
             .lock()
@@ -912,7 +915,7 @@ impl Drop for Watcher {
 }
 
 /// `ps -axww -o pid=,ppid=,command=`: every process, its parent and its whole command line.
-fn ps_rows() -> Vec<(i32, i32, String)> {
+pub(crate) fn ps_rows() -> Vec<(i32, i32, String)> {
     let Ok(out) = aterm_uds::spawnfd::command("/bin/ps")
         .args(["-axww", "-o", "pid=,ppid=,command="])
         .output()
@@ -972,15 +975,10 @@ fn die(what: &str, e: impl std::fmt::Display) -> Fail {
     Fail::die(format!("claude-login-proof: {what}: {e}"))
 }
 
-/// Lay the default route's dead-login world in the lab's scratch, nowhere else: settings with
-/// no `apiKeyHelper` and no route of the stub's, a HOME `.claude.json` with no `oauthAccount`,
-/// a dead `.credentials.json` in each login directory, and the roster naming `lab-a` alone.
-fn lay_world(run: &Run, world: &World) -> Result<(), Fail> {
-    for p in [&world.roster, &world.config, &world.login_a, &world.login_b] {
-        if !p.starts_with(&run.w) {
-            return Err(die("refusing to write outside the scratch", p.display()));
-        }
-    }
+/// Refuse a scratch that configures a mailbox anywhere a sign-in could reach one.
+/// # Errors
+/// One is there.
+pub(crate) fn no_mailbox(run: &Run) -> Result<(), Fail> {
     let home = run.w.join("home");
     for mailbox in [
         home.join(".secrets").join(MAILBOX_TOML_FILE),
@@ -995,6 +993,20 @@ fn lay_world(run: &Run, world: &World) -> Result<(), Fail> {
             ));
         }
     }
+    Ok(())
+}
+
+/// Lay the default route's dead-login world in the lab's scratch, nowhere else: settings with
+/// no `apiKeyHelper` and no route of the stub's, a HOME `.claude.json` with no `oauthAccount`,
+/// a dead `.credentials.json` in each login directory, and the roster naming `lab-a` alone.
+fn lay_world(run: &Run, world: &World) -> Result<(), Fail> {
+    for p in [&world.roster, &world.config, &world.login_a, &world.login_b] {
+        if !p.starts_with(&run.w) {
+            return Err(die("refusing to write outside the scratch", p.display()));
+        }
+    }
+    let home = run.w.join("home");
+    no_mailbox(run)?;
     let mut env = J::Obj(Vec::new());
     for k in [
         "ANTHROPIC_BASE_URL",
@@ -1042,9 +1054,9 @@ fn launcher(run: &Run, login: &Path) -> String {
     let w = &run.w;
     format!(
         "#!/bin/sh\nclear\nexec env -u CLAUDE_CONFIG_DIR -u ANTHROPIC_BASE_URL -u HTTP_PROXY -u HTTPS_PROXY \
-         -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \\\n  PATH=\"{}:$PATH\" {LOGIN_ENV}={} \
+         -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \\\n  PATH={} {LOGIN_ENV}={} \
          DISABLE_AUTOUPDATER=1 \\\n  LAB_SECURITY_LOG={} LAB_OPEN_LOG={} BROWSER={} \\\n  {}\n",
-        run.run.join("shim").display(),
+        crate::util::shell_prepend_path(&run.run.join("shim").to_string_lossy()),
         q(login),
         q(&w.join("security.log")),
         q(&w.join("open.log")),
@@ -1054,7 +1066,7 @@ fn launcher(run: &Run, login: &Path) -> String {
 }
 
 /// `@sid <args>` against the lab.
-fn on(door: &Door<'_>, sid: &str, args: &[&str]) -> Result<crate::door::Reply, Fail> {
+pub(crate) fn on(door: &Door<'_>, sid: &str, args: &[&str]) -> Result<crate::door::Reply, Fail> {
     let at = format!("@{sid}");
     let mut v = vec![at.as_str()];
     v.extend_from_slice(args);
@@ -1062,7 +1074,7 @@ fn on(door: &Door<'_>, sid: &str, args: &[&str]) -> Result<crate::door::Reply, F
 }
 
 /// Whether a fenced input went in: `OK`, not `OK skipped` (its fence's row did not stand).
-fn went(r: &crate::door::Reply) -> bool {
+pub(crate) fn went(r: &crate::door::Reply) -> bool {
     r.code == 0 && r.stdout.starts_with("OK") && !r.stdout.contains("skipped")
 }
 
@@ -1107,7 +1119,7 @@ fn start_tab(
 /// composer's own row (the empty one, then the one holding `prompt`), so neither lands anywhere
 /// else (in a `/login` picker Claude Code drew, say): a fence whose row does not stand skips its
 /// key, and nothing is pressed again. `Err`: why the prompt was not sent.
-fn first_prompt(
+pub(crate) fn first_prompt(
     run: &Run,
     door: &Door<'_>,
     sid: &str,
@@ -1160,22 +1172,22 @@ fn row_by_hand(world: &World) -> Result<(), Fail> {
         .map_err(|e| die(&world.roster.display().to_string(), e))
 }
 
-fn journal_path(run: &Run, sid: &str) -> PathBuf {
+pub(crate) fn journal_path(run: &Run, sid: &str) -> PathBuf {
     run.state()
         .join("drive")
         .join(format!("{sid}.journal.jsonl"))
 }
 
 /// The instance's own log (`state/logs/aterm.log`).
-fn aterm_log(run: &Run) -> PathBuf {
+pub(crate) fn aterm_log(run: &Run) -> PathBuf {
     run.state().join("logs").join("aterm.log")
 }
 
-fn read_journal(run: &Run, sid: &str) -> Vec<Said> {
+pub(crate) fn read_journal(run: &Run, sid: &str) -> Vec<Said> {
     journal_of(&scratch_text(&journal_path(run, sid)))
 }
 
-fn read_decisions(run: &Run, sid: &str) -> Vec<Decided> {
+pub(crate) fn read_decisions(run: &Run, sid: &str) -> Vec<Decided> {
     decisions_of(&scratch_text(
         &run.state().join("drive").join(format!("{sid}.jsonl")),
     ))
@@ -1184,11 +1196,24 @@ fn read_decisions(run: &Run, sid: &str) -> Vec<Decided> {
 /// Wait until `found` holds, watching tab `sid`'s screen and journal and the instance's
 /// aterm.log: a minute in which none of them moved ([`HANG`]), or [`WAIT_CAP`] in all, is a
 /// hang, said as `Err`.
-fn hang_wait<T>(
+pub(crate) fn hang_wait<T>(
     run: &Run,
     door: &Door<'_>,
     sid: &str,
     what: &str,
+    found: impl FnMut() -> Option<T>,
+) -> Result<Result<T, String>, Fail> {
+    hang_wait_capped(run, door, sid, what, WAIT_CAP, found)
+}
+
+/// [`hang_wait`] with a cap of its own, `cap` in all however much moves, for a wait whose end
+/// is known (a scheduled wait: its instant and a minute more), the hang detector the same.
+pub(crate) fn hang_wait_capped<T>(
+    run: &Run,
+    door: &Door<'_>,
+    sid: &str,
+    what: &str,
+    cap: Duration,
     mut found: impl FnMut() -> Option<T>,
 ) -> Result<Result<T, String>, Fail> {
     let start = Instant::now();
@@ -1208,7 +1233,7 @@ fn hang_wait<T>(
         if now != last {
             (moved, last) = (Instant::now(), now);
         }
-        if moved.elapsed() >= HANG || start.elapsed() >= WAIT_CAP {
+        if moved.elapsed() >= HANG || start.elapsed() >= cap {
             return Ok(Err(format!(
                 "{what}: not seen ({} s, the last {} s with nothing moving)",
                 start.elapsed().as_secs(),
@@ -1435,7 +1460,7 @@ fn scenarios(
 }
 
 /// The acts on every tape of tab `sid` under `drive`, as [`act_line`]s.
-fn tape_acts(drive: &Path, sid: &str) -> String {
+pub(crate) fn tape_acts(drive: &Path, sid: &str) -> String {
     let dir = drive.join("tapes").join(sid);
     let mut tapes: Vec<PathBuf> = fs::read_dir(&dir)
         .map(|rd| {

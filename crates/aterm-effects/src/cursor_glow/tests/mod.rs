@@ -25,6 +25,7 @@ mod momentum;
 mod park;
 mod particles;
 mod phaser;
+mod prism_light;
 mod rainbow;
 mod reanchor;
 mod resident_cap;
@@ -111,12 +112,7 @@ fn geom() -> Geom {
 fn cfg(style: GlowStyle, enabled: bool) -> GlowConfig {
     GlowConfig {
         enabled,
-        classic_mono: false,
-        dark_theme: true,
-        theme_fg: 0x00C8_D3F5,
-        theme_bg: 0x001A_1B26,
         style,
-        color: 0x0050_FA7B,
         accent: 0x007A_A2F7,
         duration: Duration::from_millis(240),
         length: 18,
@@ -125,9 +121,7 @@ fn cfg(style: GlowStyle, enabled: bool) -> GlowConfig {
         radius: 0.6,
         ring: true,
         beam: !matches!(style, GlowStyle::Water | GlowStyle::RainbowKitty),
-        head_dx: 0.5,
-        ribbon_tall: true,
-        ribbon_flat: false,
+        ..Default::default()
     }
 }
 

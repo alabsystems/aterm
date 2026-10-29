@@ -423,6 +423,7 @@ const CODEX_STEPS: Shape = Shape::Object(&[
             ("id", Shape::Scalar),
             ("forked_from_id", Shape::Scalar),
             ("cli_version", Shape::Scalar),
+            ("history_mode", Shape::Scalar),
             ("thread_id", Shape::Scalar),
             ("turn_id", Shape::Scalar),
             ("call_id", Shape::Scalar),

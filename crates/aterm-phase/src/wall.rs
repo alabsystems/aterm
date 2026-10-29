@@ -190,6 +190,10 @@ pub const PHRASES: &[(&str, Tag)] = &[
     ("reset your session limit", Tag::NotAWall),
     ("resetting your session limit", Tag::NotAWall),
     ("session limit is already being reset", Tag::NotAWall),
+    ("5-hour limit reset", Tag::NotAWall),
+    ("reset your 5-hour limit", Tag::NotAWall),
+    ("resetting your 5-hour limit", Tag::NotAWall),
+    ("5-hour limit is already being reset", Tag::NotAWall),
     ("weekly limits reset", Tag::NotAWall),
     ("context limit reached", Tag::Context),
     ("prompt is too long", Tag::Context),
@@ -274,6 +278,13 @@ pub const PHRASES: &[(&str, Tag)] = &[
 pub fn classify_wall(text: &str) -> Option<WallKind> {
     let text = text.trim_start_matches(|c: char| !c.is_alphanumeric());
     let lower = text.replace('’', "'").to_lowercase();
+    if goal_echo_of_an_unavailable_api(&lower) {
+        return Some(WallKind::ApiError {
+            code: None,
+            retryable: true,
+            cause: ApiCause::Server,
+        });
+    }
     let lower = match lower.strip_prefix("goal paused") {
         Some(rest) => rest
             .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '·' | '∙' | '.'))
@@ -374,6 +385,28 @@ pub fn named_by_status_alone(text: &str) -> bool {
     ) && !PHRASES.iter().any(|&(phrase, tag)| {
         opening.opens_with(phrase) || (tag == Tag::Refused && lower.contains(phrase))
     })
+}
+
+/// Whether `lower` (a notice as it opens, lowercased) is Claude Code's `/goal` echo of a request
+/// the API did not answer: it OPENS with `Goal still active` or `Goal paused` (`Goal paused after
+/// 3 automatic retries` among them) and names `the API was unavailable or the connection
+/// dropped`, the reason Claude Code 2.1.310 gives a transient error, an overload or a server
+/// error. Read alone, with no error row above it to read it through to, that echo is a generic
+/// API error ([`ApiCause::Server`]), never an unreachable route: its reason covers an overload
+/// and a server error too, so it is waited out blind and no measured Up of the route clears it;
+/// only the error row it reads through to (`Can't reach the API server … (ENOTFOUND)`, the
+/// owner's outage) names an unreachable route. The guard is on the opening, never a bare
+/// `contains`: a message read through to its error row (`API Error: 529 Overloaded … — Goal
+/// still active · the API was unavailable …`, as aterm-agent keeps and re-reads it) opens with
+/// that row and is read by it.
+fn goal_echo_of_an_unavailable_api(lower: &str) -> bool {
+    let opens = [
+        crate::anchor!("wall.goal_still"),
+        crate::anchor!("wall.goal_paused"),
+    ]
+    .iter()
+    .any(|echo| strip_ci(lower, echo).is_some());
+    opens && lower.contains(&crate::anchor!("wall.goal_api_unavailable").to_ascii_lowercase())
 }
 
 fn notice_head(text: &str) -> &str {
@@ -580,7 +613,7 @@ pub(crate) fn is_unreachable(text: &str) -> bool {
 /// The wall the worker's last turn ended on, if any: Claude Code's critical-memory banner first ([`memory_wall`]), then [`classify_wall`] over the rows [`crate::phase::limit_notice`] reads, every kind.
 #[must_use]
 pub fn wall(rows: &[String]) -> Option<Wall> {
-    memory_wall(rows).or_else(|| crate::phase::notice(rows, &classify_wall))
+    memory_wall(rows).or_else(|| crate::phase::notice(rows))
 }
 
 /// Whether the screen says the login is back: the last thing said is the vendor's own word that a `/login` finished — `⎿  Login successful`, or `⎿  Login successful · account or organization changed` — hanging from the `❯ /login` a person typed.
@@ -842,10 +875,8 @@ fn newest_limit(rows: &[String]) -> Option<Newest> {
                             placement: Placement::ErrorRow,
                             under_call: false,
                         },
-                        &classify_wall,
                     );
-                    let generic = generic_limit(item)
-                        && turns_notice(rows, i, width, &classify_wall).is_none();
+                    let generic = generic_limit(item) && turns_notice(rows, i, width).is_none();
                     return Some(Newest {
                         since: SinceLimit {
                             kind: found.kind,
@@ -901,11 +932,7 @@ fn reset_clock_words(reset: &str) -> String {
 }
 
 /// The wall a generic banner stands for: `found` is the notice the reader placed (`crate::phase::notice`'s placement: the footer, a banner) and, where it is the generic `Usage limit reached` ([`generic_limit`]), the kind is the turn's own notice's — the newest limit notice above the composer that names its limit, read as [`since_limit`] reads one (each row as the line it opens, across the rows Ink wrapped it onto), up through local commands (`❯ /rate-limit-options`, which Claude Code types itself to open its dialog) but no person's prompt, and naming the same reset as `found` (the zone aside): the notice of this limit, never an older one a `/resume`d history redraws.
-pub(crate) fn named_by_the_turn(
-    rows: &[String],
-    found: Wall,
-    classify: &dyn Fn(&str) -> Option<WallKind>,
-) -> Wall {
+pub(crate) fn named_by_the_turn(rows: &[String], found: Wall) -> Wall {
     if !generic_limit(&found.message) {
         return found;
     }
@@ -917,7 +944,7 @@ pub(crate) fn named_by_the_turn(
     };
     let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
     let top = frame.top.min(found.row);
-    let named = turns_notice(rows, top, width, classify)
+    let named = turns_notice(rows, top, width)
         .and_then(|(kind, notice)| names_the_reset(&notice, kind, &said, found.kind));
     match named {
         Some((kind, words)) => Wall {
@@ -929,12 +956,7 @@ pub(crate) fn named_by_the_turn(
     }
 }
 
-fn turns_notice(
-    rows: &[String],
-    top: usize,
-    width: usize,
-    classify: &dyn Fn(&str) -> Option<WallKind>,
-) -> Option<(WallKind, String)> {
+fn turns_notice(rows: &[String], top: usize, width: usize) -> Option<(WallKind, String)> {
     use crate::phase::line_at;
     for (i, row) in rows[..top].iter().enumerate().rev() {
         let column0 = crate::phase::leading_spaces(row) == 0;
@@ -948,7 +970,7 @@ fn turns_notice(
         let (_, line) = line_at(rows, i, top, width);
         let Some((kind, item)) = gapped_items(&line)
             .find_map(|item| {
-                classify(item)
+                classify_wall(item)
                     .filter(|k| {
                         k.reads_limited()
                             && !generic_limit(item)
@@ -1326,10 +1348,22 @@ mod tests {
             ),
             (
                 "Goal still active · the API was unavailable or the connection dropped · retrying in 5 min (2/3) · send a message to retry now",
-                None,
+                Some(WallKind::ApiError {
+                    code: None,
+                    retryable: true,
+                    cause: ApiCause::Server,
+                }),
             ),
             (
                 "Goal paused after 3 automatic retries · the API was unavailable or the connection dropped · send a message to continue",
+                Some(WallKind::ApiError {
+                    code: None,
+                    retryable: true,
+                    cause: ApiCause::Server,
+                }),
+            ),
+            (
+                "Goal still active · the API returned an unexpected response · retrying in 1 min (1/3) · send a message to retry now",
                 None,
             ),
             (
@@ -3659,6 +3693,91 @@ mod tests {
             assert_eq!(limit_notice(r), None);
             assert_eq!(worker_phase(r), Phase::Idle);
         }
+        const WEEKLY: &str =
+            "You've hit your weekly limit · resets Oct 30 at 7pm (America/Los_Angeles)";
+        const AUTH: &str = "Not logged in · Please run /login";
+        const MEMORY: &str =
+            "Critical memory usage (140.4GB) \u{2014} restart and resume with claude --continue";
+        for (name, higher, kind) in [
+            (
+                "footer context over gutter limit",
+                CONTEXT,
+                WallKind::Context,
+            ),
+            ("footer auth over gutter limit", AUTH, WallKind::Auth),
+        ] {
+            let r = framed(
+                &[
+                    "⏺ Summarising the run.",
+                    &format!("  ⎿  {WEEKLY}"),
+                    "",
+                    "✻ Worked for 4s · done 5:47 AM",
+                    "",
+                ],
+                &crate::prompt::fixtures::right_aligned(FOOTER, higher),
+            );
+            let w = wall(&r).expect(name);
+            assert_eq!((w.kind, w.placement), (kind, Placement::Footer), "{name}");
+            assert_eq!(limit_notice(&r), None, "{name}");
+            assert_eq!(worker_phase(&r), Phase::Idle, "{name}");
+            let reading = crate::reader::read(Some("claude"), &r, None);
+            assert_eq!(reading.phase, Phase::Idle, "{name}");
+            assert_eq!(reading.wall.map(|w| w.kind), Some(kind), "{name}");
+        }
+        let mut with_memory = framed(
+            &[
+                "⏺ Summarising the run.",
+                &format!("  ⎿  {WEEKLY}"),
+                "",
+                "✻ Worked for 4s · done 5:47 AM",
+                "",
+            ],
+            FOOTER,
+        );
+        let top = with_memory
+            .iter()
+            .position(|row| row.starts_with('─') || row.starts_with('╭'))
+            .expect("the top rule");
+        let rule_width = with_memory[top].chars().count();
+        with_memory.insert(top, format!("{MEMORY:>w$}", w = rule_width - 1));
+        assert_eq!(wall(&with_memory).map(|w| w.kind), Some(WallKind::Memory));
+        assert_eq!(limit_notice(&with_memory), None);
+        assert_eq!(worker_phase(&with_memory), Phase::Idle);
+        let mut with_shell = with_memory.clone();
+        let mode_row = with_shell
+            .iter()
+            .rposition(|row| row.contains("bypass permissions"))
+            .expect("the footer mode row");
+        with_shell[mode_row].push_str(" · 1 shell running");
+        let shell_reading = crate::reader::read(Some("claude"), &with_shell, None);
+        assert_eq!(shell_reading.phase, Phase::Idle);
+        assert_eq!(shell_reading.wall.map(|w| w.kind), Some(WallKind::Memory));
+        let limit_over_context = framed(
+            &[
+                "⏺ Summarising the run.",
+                &format!("  ⎿  {CONTEXT}"),
+                "",
+                "✻ Worked for 4s · done 5:47 AM",
+                "",
+            ],
+            &crate::prompt::fixtures::right_aligned(FOOTER, WEEKLY),
+        );
+        let w = wall(&limit_over_context).expect("footer limit over gutter context");
+        assert_eq!(
+            (w.kind, w.placement),
+            (WallKind::UsageWeekly, Placement::Footer)
+        );
+        assert_eq!(
+            limit_notice(&limit_over_context),
+            Some((w.message.clone(), w.reset.clone()))
+        );
+        assert_eq!(
+            worker_phase(&limit_over_context),
+            Phase::Limited {
+                message: w.message,
+                reset: w.reset,
+            }
+        );
         for quota in [
             "Concurrent subagent limit reached. You can run 5 subagents at once. Do not retry.",
             "Budget limit reached ($5.01 spent of the $5.00 maximum). New agents cannot be started.",

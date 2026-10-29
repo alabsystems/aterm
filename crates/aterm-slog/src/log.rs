@@ -107,18 +107,43 @@ pub const fn closes_over_half(count: usize, bytes: usize, l: Limits) -> bool {
 }
 
 /// Eviction priority class, ordered from first evicted (`ClosedDetail`) to never evicted (`Pinned`).
+/// An amend that rides its node's open ([`rides_open`]) is classed as that open and goes with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EvictClass {
     /// Detail of closed structure: marks, amends, gaps and step records under a closed turn (or a closed run, or a node gone from the index), and detail hanging from an open run or the session that is older than the newest run or turn closed beneath it.
     ClosedDetail,
-    /// The open record of a closed run or turn: its close carries the rollup.
+    /// The open record of a closed run or turn (its close carries the rollup), and the amends that ride it.
     ClosedOpen,
     /// The close record of a run or turn (taken before current detail only while the closes pass half the budget, [`closes_over_half`]).
     CloseRecord,
     /// Current detail: under an open turn, or hanging from an open run or the session and newer than every run or turn closed beneath it.
     OpenDetail,
-    /// Never evicted: the open record of an open node, the session's own open and close.
+    /// Never evicted: the open record of an open node, the session's own open and close, and the amends that ride them.
     Pinned,
+}
+
+/// THE AMEND THAT RIDES ITS OPEN (fix unit H4, finding GATE3-7): an amend that writes what its
+/// node is, a field the node's open carries when it knows it at the start ([`names_the_node`]: a
+/// `cmd`'s `detail=` once its program is confirmed, an agent's `prog=` or `model=`, a restored
+/// session's `prev=` and `lineage=`). While its node's open is live and it holds, for some such
+/// field, the value the fold keeps under the confidence law ([`crate::confidence_law`]: the highest
+/// confidence, then the newest), it is classed as that open ([`Log::class_of`]) and is evicted,
+/// carried and restated in a journal snap with it, so no read shows the open without what the fold
+/// shows of the node. A node has at most one such amend per identity key, so the ones an open node
+/// pins stay bounded.
+#[must_use]
+pub fn rides_open(r: &Rec) -> bool {
+    r.op == Op::Amend && r.f.iter().any(|(k, _)| names_the_node(r.node, *k))
+}
+
+/// Whether `k` says what `node` is, a field its open carries when it knows it at the start: a
+/// run's program or model identifier ([`Tier::WireMeta`]), and the session's restore lineage.
+fn names_the_node(node: Node, k: Key) -> bool {
+    match node.lvl {
+        Lvl::Run => k.tier() == Tier::WireMeta,
+        Lvl::Session => node == Node::SESSION && matches!(k, Key::Prev | Key::Lineage),
+        Lvl::Instance | Lvl::Turn | Lvl::Step => false,
+    }
 }
 
 /// Indexed node metadata used by [`evict_class`].
@@ -913,6 +938,15 @@ pub const fn natural_parent(parent: Lvl, child: Lvl) -> bool {
     }
 }
 
+/// Whether a step of `kind` is a DECISION STEP (fix E3, finding E2E-3): an approval box or a
+/// question dialog, the steps an input's act dismisses and a person is asked about. What an act
+/// or the harness's escalation is about is the decision step it was raised on
+/// ([`Log::open_decision_step`]).
+#[must_use]
+pub const fn is_decision_step(kind: Kind) -> bool {
+    matches!(kind, Kind::Approval | Kind::Question)
+}
+
 impl Log {
     /// An empty session log of epoch `ep` at the session bounds.
     #[must_use]
@@ -1156,15 +1190,26 @@ impl Log {
         }
     }
 
-    /// The encoded bytes of the records no eviction takes: the open records of open nodes and the session's own open and close.
+    /// The encoded bytes of the records no eviction takes: the open records of open nodes, the session's own open and close, and the amends that ride a pinned open ([`rides_open`]).
     #[must_use]
     pub fn pinned_bytes(&self) -> usize {
+        let riding: usize = self
+            .riders()
+            .iter()
+            .zip(&self.ring)
+            .filter(|(open, _)| {
+                open.and_then(|o| self.ring.get(o))
+                    .is_some_and(|o| evict_class(&o.rec, |n| self.view(n)) == EvictClass::Pinned)
+            })
+            .map(|(_, e)| e.bytes)
+            .sum();
         self.nodes
             .values()
             .filter(|n| n.open)
             .map(|n| n.open_bytes)
             .sum::<usize>()
             .saturating_add(self.session_bytes)
+            .saturating_add(riding)
     }
 
     /// Set the byte budget (clamped between `MAX_RECORD_BYTES` and `limits.bytes`) and evict if needed.
@@ -1225,10 +1270,56 @@ impl Log {
         self.view(n)
     }
 
-    /// The eviction class of the live record `r` as the log stands now.
+    /// The eviction class of the live record `r` as the log stands now: an amend that rides its node's open ([`rides_open`]) has the open's.
     #[must_use]
     pub fn class_of(&self, r: &Rec) -> EvictClass {
-        evict_class(r, |n| self.view(n))
+        let i = self.ring.partition_point(|e| e.rec.seq < r.seq);
+        let open = rides_open(r)
+            .then(|| self.riders().get(i).copied().flatten())
+            .flatten()
+            .filter(|_| self.ring.get(i).is_some_and(|e| e.rec.seq == r.seq));
+        match open {
+            Some(o) => evict_class(&self.ring[o].rec, |n| self.view(n)),
+            None => evict_class(r, |n| self.view(n)),
+        }
+    }
+
+    /// THE RIDERS ([`rides_open`]), by ring position: for each live record, the ring position of
+    /// the open it rides with. An amend rides while its node's open is live and, for some identity
+    /// field it writes, it is the amend the fold keeps under the confidence law
+    /// ([`crate::confidence_law`], as `NodeFields::offer` keeps it): the highest confidence, then
+    /// the newest seq.
+    fn riders(&self) -> Vec<Option<usize>> {
+        let mut out = vec![None; self.ring.len()];
+        if !self.ring.iter().any(|e| rides_open(&e.rec)) {
+            return out;
+        }
+        let opens: BTreeMap<Node, usize> = self
+            .ring
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                e.rec.op == Op::Open && (e.rec.node.lvl == Lvl::Run || e.rec.node == Node::SESSION)
+            })
+            .map(|(i, e)| (e.rec.node, i))
+            .collect();
+        let mut kept: BTreeMap<(Node, Key), (Conf, u64, usize)> = BTreeMap::new();
+        for (i, e) in self.ring.iter().enumerate() {
+            if !rides_open(&e.rec) {
+                continue;
+            }
+            let r = &e.rec;
+            for (k, _) in r.f.iter().filter(|(k, _)| names_the_node(r.node, *k)) {
+                let held = kept.entry((r.node, *k)).or_insert((r.conf, r.seq, i));
+                if crate::fold::confidence_law(held.0, held.1, r.conf, r.seq) {
+                    *held = (r.conf, r.seq, i);
+                }
+            }
+        }
+        for ((node, _), (_, _, i)) in kept {
+            out[i] = opens.get(&node).copied();
+        }
+        out
     }
 
     /// How many seqs in `(lo, hi` this log held: the seqs it accounts for (`Log::first_seq` on), less the ones it never held (its holes).
@@ -1350,6 +1441,18 @@ impl Log {
             .iter()
             .rev()
             .find(|e| e.node.lvl == lvl)
+            .map(|e| e.node)
+    }
+
+    /// The newest open DECISION STEP ([`is_decision_step`]): the approval box or question the
+    /// person is asked about now, which a node-less act ([`Log::mark`]) and the harness's
+    /// escalation of its ask attach to, whatever step the transcript opened beside it.
+    #[must_use]
+    pub fn open_decision_step(&self) -> Option<Node> {
+        self.open
+            .iter()
+            .rev()
+            .find(|e| is_decision_step(e.kind))
             .map(|e| e.node)
     }
 
@@ -1609,7 +1712,10 @@ impl Log {
         self.close(Node::SESSION, c, at)
     }
 
-    /// Attach a point fact (§2.1: to the deepest open node unless `m.at` names an open one).
+    /// Attach a point fact (§2.1: to the deepest open node unless `m.at` names an open one). An
+    /// [`Kind::Act`] with no open `at` is the act of deciding the open approval or question step
+    /// when one is open ([`Log::open_decision_step`]), even with a tool open beside it (fix E3,
+    /// finding E2E-3): the harness's escalate act lands on the box it escalated.
     /// # Errors
     /// [`Refused::KindDoesNotFit`] for a kind that is no mark's, [`Refused::SessionClosed`], or an encoding refusal.
     pub fn mark(&mut self, m: Mark, at: Stamp) -> Result<u64, Refused> {
@@ -1622,6 +1728,10 @@ impl Log {
         refuse_owned(Op::Mark, &m.f)?;
         let node = match m.at {
             Some(n) if self.is_open(n) => n,
+            _ if m.kind == Kind::Act => self
+                .open_decision_step()
+                .or_else(|| self.open.last().map(|e| e.node))
+                .unwrap_or(Node::SESSION),
             _ => self.open.last().map_or(Node::SESSION, |e| e.node),
         };
         let is_mail = m.kind == Kind::Mail;
@@ -2172,9 +2282,11 @@ impl Log {
         let newest = self.ring.back().map(|e| e.rec.node);
         let shelter: Vec<Node> = newest.map(|nd| self.chain(nd)).unwrap_or_default();
         let frozen = self.read_fence().unwrap_or(0);
+        let ride = self.riders();
+        let newest_rides = ride.last().copied().flatten();
         let mut buckets: [Vec<usize>; 4] = Default::default();
         for (i, e) in self.ring.iter().enumerate().take(n - 1) {
-            if e.rec.seq <= frozen {
+            if e.rec.seq <= frozen || ride[i].is_some() || newest_rides == Some(i) {
                 continue;
             }
             let class = evict_class(&e.rec, |nd| self.view(nd));
@@ -2190,14 +2302,26 @@ impl Log {
         let mut victim = vec![false; n];
         let (mut len, mut bytes) = (n, self.bytes);
         let (mut closes, mut close_bytes) = (self.close_count, self.close_bytes);
-        let entry_bytes: Vec<usize> = self.ring.iter().map(|e| e.bytes).collect();
-        let seqs: Vec<u64> = self.ring.iter().map(|e| e.rec.seq).collect();
+        let mut entry_bytes: Vec<usize> = self.ring.iter().map(|e| e.bytes).collect();
+        let mut seqs: Vec<u64> = self.ring.iter().map(|e| e.rec.seq).collect();
+        let mut members = vec![1usize; n];
         let reached = |len: usize, bytes: usize| !over_limits(len, bytes, low);
         let tiers: &[Option<u64>] = match self.journaled() {
             Some(j) => &[Some(j), None],
             None => &[None],
         };
-        let floor = self.row_floor_members();
+        let mut floor = self.row_floor_members();
+        // A rider ([`rides_open`]) is never a victim alone: it goes with its open, whose take
+        // counts its bytes, waits for the journal to hold it too, and keeps it from a pass of the
+        // row floor it belongs to.
+        for (j, o) in ride.iter().enumerate() {
+            if let Some(o) = *o {
+                entry_bytes[o] = entry_bytes[o].saturating_add(entry_bytes[j]);
+                seqs[o] = seqs[o].max(seqs[j]);
+                floor[o] |= floor[j];
+                members[o] += 1;
+            }
+        }
         let floors: &[bool] = if floor.contains(&true) {
             &[false, true]
         } else {
@@ -2217,7 +2341,7 @@ impl Log {
                     }
                     if open(i, &victim) {
                         victim[i] = true;
-                        len -= 1;
+                        len -= members[i];
                         bytes = bytes.saturating_sub(entry_bytes[i]);
                     }
                 }
@@ -2241,10 +2365,15 @@ impl Log {
                     }
                     if open(i, &victim) {
                         victim[i] = true;
-                        len -= 1;
+                        len -= members[i];
                         bytes = bytes.saturating_sub(entry_bytes[i]);
                     }
                 }
+            }
+        }
+        for (j, o) in ride.iter().enumerate() {
+            if o.is_some_and(|o| victim[o]) {
+                victim[j] = true;
             }
         }
         if !victim.iter().any(|v| *v) {

@@ -104,7 +104,8 @@ impl Episodes {
                 return true;
             }
             e.held = 0;
-            e.opened.is_some() && mono_ms - *e.failing_since.get_or_insert(mono_ms) < CLOSE_MS
+            e.opened.is_some()
+                && mono_ms.saturating_sub(*e.failing_since.get_or_insert(mono_ms)) < CLOSE_MS
         });
         let mut open: Vec<OpenCause> = self
             .episodes
@@ -182,7 +183,7 @@ impl ClauseHold {
         }
         let ready = self
             .candidate
-            .filter(|(_, since)| mono_ms - since >= CLAUSE_IN_MS)
+            .filter(|(_, since)| mono_ms.saturating_sub(*since) >= CLAUSE_IN_MS)
             .map(|(c, _)| c);
         match self.shown {
             Some(shown) if now == Some(shown) => self.failing_since = None,
@@ -191,7 +192,9 @@ impl ClauseHold {
                 self.failing_since = None;
             }
             Some(_) => {
-                if mono_ms - *self.failing_since.get_or_insert(mono_ms) >= CLAUSE_OUT_MS {
+                if mono_ms.saturating_sub(*self.failing_since.get_or_insert(mono_ms))
+                    >= CLAUSE_OUT_MS
+                {
                     self.shown = None;
                     self.failing_since = None;
                 }
@@ -213,16 +216,19 @@ fn candidate(open: &[OpenCause], split: &CoalSplit) -> Option<DeckCause> {
     let CauseId::Activity(activity) = o.id else {
         return None;
     };
-    let outside = split.others_mc + split.services_mc + split.unaccounted_mc.max(0);
-    (o.covers_mc >= CLAUSE_MC && o.covers_mc * 1000 >= outside * CLAUSE_PM).then(|| DeckCause {
-        activity,
-        word: activity.activity().word,
-        context: o
-            .contexts
-            .iter()
-            .copied()
-            .find(|c| matches!(c, Context::Startup | Context::Wake)),
-    })
+    let outside = i128::from(split.others_mc)
+        + i128::from(split.services_mc)
+        + i128::from(split.unaccounted_mc.max(0));
+    (o.covers_mc >= CLAUSE_MC && i128::from(o.covers_mc) * 1000 >= outside * i128::from(CLAUSE_PM))
+        .then(|| DeckCause {
+            activity,
+            word: activity.activity().word,
+            context: o
+                .contexts
+                .iter()
+                .copied()
+                .find(|c| matches!(c, Context::Startup | Context::Wake)),
+        })
 }
 
 /// The clause snapshot `snap` shows: its facts', unless they are older than [`CLAUSE_STALE_MS`].

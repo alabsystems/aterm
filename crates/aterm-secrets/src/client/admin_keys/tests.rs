@@ -300,7 +300,7 @@ pub(crate) fn custody_transition(state: &State, action: &str) -> State {
                 assert!(client::admin_publish(&lab.paths, &admin, &doc).is_err());
                 // Older clients could publish a missing entry. Reading that
                 // signed snapshot must still retain the bound custody guard.
-                let bytes = client::seal(
+                let bytes = client::seal_with_admissions_and_parents(
                     &admin.config.name,
                     admin.seq() + 1,
                     &admin.seed,
@@ -308,6 +308,10 @@ pub(crate) fn custody_transition(state: &State, action: &str) -> State {
                     admin.commons_bound,
                     &doc,
                     &admin.handoff,
+                    &admin.opened_heads,
+                    &crate::client::admission::Ledger::default()
+                        .retained(&doc)
+                        .unwrap(),
                 )
                 .unwrap();
                 transport::publish(&admin.config.source, &bytes).unwrap();

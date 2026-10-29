@@ -17,6 +17,7 @@ fn here() -> Here {
         host: Some("m7.local".to_owned()),
         instances: 1,
         drive: false,
+        facts: None,
     }
 }
 
@@ -363,10 +364,9 @@ fn fleet_codes_and_credentials_are_redacted() {
     {
         let code = aterm_net::fleet_member::JoinCode {
             secret: [0x5a; aterm_net::fleet_member::SECRET_LEN],
-            host: "m7.local".to_owned(),
-            port: 7100,
+            hint: None,
         }
-        .text();
+        .text_at(("m7.local", 7100));
         let body = &code["atf1-".len()..];
         let groups = body.split('@').next().unwrap();
         for (typed, want) in [
@@ -768,6 +768,7 @@ fn each_level_emits_exactly_its_fields() {
         "ctx_left_pct",
         "usage_5h_pct",
         "usage_7d_pct",
+        "account",
         "detail",
         "doing",
         "role",
@@ -1094,6 +1095,7 @@ fn the_header_names_this_machine_and_its_instances() {
         host: Some("Andrews-MacBook-Pro.local".to_owned()),
         instances: 2,
         drive: false,
+        facts: None,
     };
     let out = survey_rows(&store, SurveyLevel::Facts, usize::MAX, &two);
     let head = fields(out.lines().nth(1).unwrap());
@@ -1103,6 +1105,7 @@ fn the_header_names_this_machine_and_its_instances() {
         host: None,
         instances: 1,
         drive: false,
+        facts: None,
     };
     let out = survey_rows(&store, SurveyLevel::Facts, usize::MAX, &none);
     let head = fields(out.lines().nth(1).unwrap());
@@ -1476,4 +1479,274 @@ fn a_row_names_the_agents_active_goal() {
         ["-", "1", "1"],
         "facts flag a goal, never its words"
     );
+}
+
+/// An instance's facts list each account row of its pools after its sessions, the header counting
+/// them and naming each pool it could not read, with no email on the wire; each agent's row names
+/// the account it runs on.
+#[test]
+fn an_instance_lists_its_account_rows_and_each_session_its_account() {
+    use aterm_agent::survey_facts::{SurveyAccountFact, SwarmSurveyFacts};
+    let row = |pool: &str, id: &str, condition: &str| SurveyAccountFact {
+        pool: pool.to_owned(),
+        id: id.to_owned(),
+        condition: condition.to_owned(),
+        enrolled: condition != "not-enrolled",
+        usage_5h_pct: None,
+        usage_7d_pct: None,
+        week_reset: None,
+        walled_until: None,
+        last_used: None,
+    };
+    let store = crate::session_store::new_store();
+    let claude = crate::session_store::test_handle(5);
+    claude_session(&claude);
+    {
+        let mut tl = claude.ctx.timeline.lock().unwrap();
+        let mut facts = tl.claude_footer().cloned().expect("the footer facts");
+        facts.account = Some("work-2".into());
+        assert!(tl.set_claude_footer(4242, None, Some(facts)));
+    }
+    let codex = crate::session_store::test_handle(6);
+    codex_session(&codex);
+    for h in [&claude, &codex] {
+        store.write().unwrap().register(h.clone());
+    }
+    let facts = SwarmSurveyFacts {
+        node: None,
+        label: None,
+        version: "0.146.0".to_owned(),
+        window: true,
+        window_last: None,
+        sessions: 2,
+        ssh_host_key: None,
+        accounts: vec![
+            SurveyAccountFact {
+                usage_5h_pct: Some(10),
+                usage_7d_pct: Some(42),
+                last_used: Some(1_793_130_000),
+                ..row("claude", "main", "usable")
+            },
+            SurveyAccountFact {
+                walled_until: Some(1_793_140_000),
+                ..row("claude", "work-2", "limited")
+            },
+            row("claude", "abcdef@example.com", "unseen"),
+            row("codex", "codex-1", "not-enrolled"),
+        ],
+        accounts_unread: vec!["grok".to_owned()],
+        session_accounts: std::collections::BTreeMap::from([(
+            ("codex".to_owned(), codex.sid.as_str().to_owned()),
+            "codex-1".to_owned(),
+        )]),
+        server_heard: Vec::new(),
+    };
+    let listing = Here {
+        facts: Some(facts),
+        ..here()
+    };
+    for level in [SurveyLevel::Facts, SurveyLevel::Content] {
+        let out = survey_rows(&store, level, usize::MAX, &listing);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "OK 7", "a header, 2 sessions and 4 rows: {out}");
+        let head = fields(lines[1]);
+        assert_eq!([&head["accounts"], &head["accounts_unread"]], ["4", "grok"]);
+        let rows: Vec<_> = lines[4..].iter().map(|line| fields(line)).collect();
+        assert!(lines[4..].iter().all(|line| line.starts_with("account ")));
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row["pool"].as_str(), row["id"].as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("claude", "main"),
+                ("claude", "work-2"),
+                ("claude", "ab\u{2026}@\u{2026}"),
+                ("codex", "codex-1"),
+            ]
+        );
+        for (key, want) in [
+            ("enrolled", "1"),
+            ("condition", "usable"),
+            ("pct5", "10"),
+            ("pct7", "42"),
+            ("walled_until", "-"),
+            ("last_used", "1793130000"),
+        ] {
+            assert_eq!(rows[0][key], want, "{key}: {}", lines[4]);
+        }
+        assert_eq!(
+            [&rows[1]["condition"], &rows[1]["walled_until"]],
+            ["limited", "1793140000"]
+        );
+        assert_eq!(
+            [&rows[3]["enrolled"], &rows[3]["condition"]],
+            ["0", "not-enrolled"]
+        );
+        assert!(
+            !out.contains("example") && !out.contains("abcdef"),
+            "no email on the wire: {out}"
+        );
+        let sessions: Vec<_> = lines[2..4].iter().map(|line| fields(line)).collect();
+        assert_eq!(sessions[0]["account"], "work-2", "the footer's: {out}");
+        assert_eq!(sessions[1]["account"], "codex-1", "its pool's record");
+    }
+
+    // A reply with no facts says nothing of its accounts, and lists no row.
+    let out = survey_rows(&store, SurveyLevel::Facts, usize::MAX, &here());
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines[0], "OK 3", "{out}");
+    assert!(!fields(lines[1]).contains_key("accounts"), "{out}");
+    assert!(!out.contains("\naccount "), "{out}");
+}
+
+/// H2 RULE 5 (GATE3-1): a seamless update's restore notes the holder it finds in front as the
+/// running block's job's exec with the identity of its image's file and the steers its kernel
+/// record shows (here its `PATH`), before any read, so `claude` typed through its versions link
+/// reads `detail=claude` in the survey and the sessions roster (and in `ctl status`, which reads
+/// the same [`crate::session_status::executing_detail`]) right after the update. A note by the
+/// image's canonical name alone confirms no typed word: the image stands in, never as `claude`.
+/// NEGATIVE CONTROL (scratch): the restore noting `ExecNames::of_path` alone (as before H1/H2)
+/// fails the first assertion with `2.1.271`.
+#[cfg(unix)]
+#[test]
+fn a_restored_holder_typed_through_a_link_reads_its_typed_name() {
+    use crate::command_ran::{ExecNames, Ran, RanFeed, Steering, Table, test_id};
+    use crate::holder_image::HolderImage;
+    const SHELL: i32 = 4000;
+    const HOLDER: i32 = 4242;
+    const VERSIONS: &str = "/u/jsmith/.local/share/claude/versions/2.1.271";
+    fn in_front(_: i32) -> i32 {
+        HOLDER
+    }
+    fn holder(pgid: i32, _: Option<&HolderImage>) -> HolderImage {
+        HolderImage::of(
+            pgid,
+            Some(1),
+            Some(VERSIONS.into()),
+            atpkg::image::ImageBuild::unknown(None),
+            0,
+        )
+    }
+    fn kernel(_: i32, _: Steering<'_>) -> ExecNames {
+        ExecNames {
+            image: Some("2.1.271".into()),
+            file: Some(test_id("2.1.271")),
+            env_path: Some("/u/jsmith/.local/bin:/usr/bin".into()),
+            ..ExecNames::default()
+        }
+    }
+    fn unread(_: i32, _: Steering<'_>) -> ExecNames {
+        ExecNames::default()
+    }
+    let restored = |read: fn(i32, Steering<'_>) -> ExecNames| {
+        let ran = std::sync::Arc::new(Ran::with_files(
+            Box::new(
+                Table::default()
+                    .program("/u/jsmith/.local/bin/claude", "2.1.271")
+                    .program(VERSIONS, "2.1.271"),
+            ),
+            Some(std::path::Path::new("/u/jsmith").into()),
+        ));
+        let mut before = aterm_core::terminal::Terminal::new(24, 80);
+        before.process(
+            b"\x1b]7;file://localhost/w\x07\x1b]133;A\x07$ \x1b]133;B\x07claude --resume \
+              QZP9WORD8\r\n\x1b]133;C\x07",
+        );
+        let term = std::sync::Arc::new(std::sync::Mutex::new(
+            aterm_core::terminal::Terminal::from_checkpoint(&before.checkpoint()),
+        ));
+        let h = crate::session_store::test_handle_ran(7, term, std::sync::Arc::clone(&ran));
+        crate::spawn::adopt_restored_holder(
+            &h.term,
+            &h.ctx.timeline,
+            &RanFeed::reading(ran, SHELL, read),
+            -1,
+            SHELL,
+            in_front,
+            holder,
+            |_| Vec::new(),
+        );
+        let status = crate::session_status::executing_detail(&h.term.lock().unwrap(), &h.ctx.ran);
+        let store = crate::session_store::new_store();
+        store.write().unwrap().register(h);
+        let survey = survey_rows(&store, SurveyLevel::Facts, usize::MAX, &here());
+        let row = survey.lines().nth(2).map(fields).unwrap_or_default();
+        let roster = crate::control::cmd_sessions_store(&store, None);
+        (status, row.get("detail").cloned(), roster)
+    };
+    let (status, survey, roster) = restored(kernel);
+    assert_eq!(status.as_deref(), Some("claude"), "status: the typed word");
+    assert_eq!(survey.as_deref(), Some("claude"), "survey");
+    assert!(roster.contains(" detail=claude "), "sessions: {roster}");
+    let (status, survey, roster) = restored(unread);
+    assert_eq!(
+        (status.as_deref(), survey.as_deref()),
+        (Some("2.1.271"), Some("2.1.271")),
+        "the canonical name alone confirms nothing typed; the image stands in"
+    );
+    for text in [roster.as_str(), survey.as_deref().unwrap_or_default()] {
+        assert!(!text.contains("QZP9"), "no argument anywhere: {text}");
+    }
+}
+
+#[test]
+fn survey_rows_emits_c16_facts_and_round_trips_with_drive_isolation() {
+    use aterm_agent::survey_facts::{ServerHeardFact, SurveyAccountFact, SwarmSurveyFacts};
+
+    let store = crate::session_store::new_store();
+    let shell = crate::session_store::test_handle(3);
+    store.write().unwrap().register(shell);
+
+    let facts = SwarmSurveyFacts {
+        node: Some("0123456789abcdef0123456789abcdef".to_owned()),
+        label: Some("m22".to_owned()),
+        version: "0.146.0".to_owned(),
+        window: true,
+        window_last: Some(1_793_160_000),
+        sessions: 1,
+        ssh_host_key: Some("SHA256:abc123xyz".to_owned()),
+        accounts: vec![SurveyAccountFact {
+            pool: "claude".to_owned(),
+            id: "c01".to_owned(),
+            condition: "usable".to_owned(),
+            enrolled: true,
+            usage_5h_pct: Some(25),
+            usage_7d_pct: Some(50),
+            week_reset: Some(1_793_500_000),
+            walled_until: None,
+            last_used: Some(1_793_159_000),
+        }],
+        accounts_unread: Vec::new(),
+        session_accounts: std::collections::BTreeMap::new(),
+        server_heard: vec![ServerHeardFact {
+            vault: "alab".to_owned(),
+            subject: "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p".to_owned(),
+            at: 1_793_159_999,
+        }],
+    };
+    let non_drive = Here {
+        host: Some("m22.local".to_owned()),
+        instances: 1,
+        drive: false,
+        facts: Some(facts.clone()),
+    };
+    let reply = survey_rows(&store, SurveyLevel::Facts, usize::MAX, &non_drive);
+    assert!(
+        reply.starts_with("OK 4\ninstance "),
+        "1 instance + 1 session + 1 account + 1 server_heard = 4 lines: {reply}"
+    );
+    assert!(!reply.lines().nth(1).unwrap().contains(" drive=1"));
+    let parsed = SwarmSurveyFacts::from_survey_reply(&reply).expect("round-trip C16 survey facts");
+    assert_eq!(parsed, facts);
+
+    // Negative control for caller scope isolation: sharing the cached `facts` for a `drive=true`
+    // caller emits `drive=1` on that reply without mutating `non_drive`.
+    let with_drive = Here {
+        drive: true,
+        ..non_drive.clone()
+    };
+    let drive_reply = survey_rows(&store, SurveyLevel::Facts, usize::MAX, &with_drive);
+    assert!(drive_reply.lines().nth(1).unwrap().contains(" drive=1"));
+    let again = survey_rows(&store, SurveyLevel::Facts, usize::MAX, &non_drive);
+    assert!(!again.lines().nth(1).unwrap().contains(" drive=1"));
 }

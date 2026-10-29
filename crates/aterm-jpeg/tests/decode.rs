@@ -238,3 +238,61 @@ fn a_file_cut_short_decodes_as_far_as_it_goes() {
         aterm_jpeg::decode_rgba8(&jpeg[..jpeg.len() - 200], 8192).expect("partial decode");
     assert_eq!((width, height), (33, 21));
 }
+
+#[test]
+fn malformed_marker_segments_are_refused() {
+    let base = fixture("b420.jpg");
+
+    // DRI segment whose payload is 3 bytes instead of 2 (total segment length 5).
+    let mut bad_dri = base[..2].to_vec();
+    bad_dri.extend_from_slice(&[0xFF, 0xDD, 0x00, 0x05, 0x00, 0x04, 0x00]);
+    bad_dri.extend_from_slice(&base[2..]);
+    assert!(aterm_jpeg::decode_rgba8(&bad_dri, 8192).is_none());
+
+    // DQT table with precision nibble > 1.
+    let mut bad_dqt = base.clone();
+    let dqt = bad_dqt
+        .windows(2)
+        .position(|pair| pair == [0xFF, 0xDB])
+        .expect("DQT");
+    bad_dqt[dqt + 4] = (2 << 4) | (bad_dqt[dqt + 4] & 0x0F);
+    assert!(aterm_jpeg::decode_rgba8(&bad_dqt, 8192).is_none());
+
+    // SOF0 with duplicate component IDs.
+    let mut dup_sof = base.clone();
+    let sof = dup_sof
+        .windows(2)
+        .position(|pair| pair == [0xFF, 0xC0])
+        .expect("SOF0");
+    dup_sof[sof + 13] = dup_sof[sof + 10];
+    assert!(aterm_jpeg::decode_rgba8(&dup_sof, 8192).is_none());
+
+    // SOF0 with trailing garbage byte inside the declared segment length.
+    let sof_len = u16::from_be_bytes([base[sof + 2], base[sof + 3]]) as usize;
+    let mut long_sof = base[..sof + 2].to_vec();
+    long_sof.extend_from_slice(&((sof_len + 1) as u16).to_be_bytes());
+    long_sof.extend_from_slice(&base[sof + 4..sof + 2 + sof_len]);
+    long_sof.push(0);
+    long_sof.extend_from_slice(&base[sof + 2 + sof_len..]);
+    assert!(aterm_jpeg::decode_rgba8(&long_sof, 8192).is_none());
+
+    // SOS with duplicate scan component selector.
+    let mut dup_sos = base.clone();
+    let sos = dup_sos
+        .windows(2)
+        .position(|pair| pair == [0xFF, 0xDA])
+        .expect("SOS");
+    dup_sos[sos + 7] = dup_sos[sos + 5];
+    assert!(aterm_jpeg::decode_rgba8(&dup_sos, 8192).is_none());
+
+    // Progressive SOS with invalid successive approximation (Ah = 3, Al = 1 -> Ah != Al + 1).
+    let prog = fixture("p420.jpg");
+    let psos = prog
+        .windows(2)
+        .position(|pair| pair == [0xFF, 0xDA])
+        .expect("progressive SOS");
+    let psos_len = u16::from_be_bytes([prog[psos + 2], prog[psos + 3]]) as usize;
+    let mut bad_approx = prog.clone();
+    bad_approx[psos + 2 + psos_len - 1] = 0x31;
+    assert!(aterm_jpeg::decode_rgba8(&bad_approx, 8192).is_none());
+}

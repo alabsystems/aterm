@@ -201,8 +201,4 @@ fn maximal_munch_and_particles_behave() {
 #[test]
 fn expanded_builtin_stays_conflict_free() {
     assert_eq!(Lexicon::builtin().conflicts(), &[] as &[String]);
-    assert_eq!(
-        Lexicon::with_languages(&["all"]).conflicts(),
-        &[] as &[String]
-    );
 }

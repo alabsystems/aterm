@@ -835,7 +835,7 @@ fn report_lines(gathered: &Gathered, rows: &[ItemReport], sections: &[Section]) 
 /// (`aterm doctor && aterm`), so `aterm doctor | less` and a captured stdout read it; only a
 /// refusal goes to stderr. The hand-over follows the report and never holds it back; its
 /// lines go to stderr.
-#[must_use]
+#[must_use = "return the doctor's exit status from the front door"]
 pub fn answer(
     text: &str,
     code: u8,

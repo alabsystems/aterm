@@ -25,21 +25,23 @@ use super::trace::{NoTrace, Outcome, Trace, note};
 use crate::harness::disk::fence;
 use crate::harness::lights::Mode;
 use crate::supervise::classify::{
-    brace_expansion, classify_command_except, classify_command_with, classify_except_rm,
-    command_words, glob_match, path_operands_except, plain_zsh_line, program, runs, unquoted_glob,
+    QUOTED_SUBSTITUTION, SUBSTITUTION, brace_expansion, classify_command_except,
+    classify_command_with, classify_except_rm, command_words, command_words_globbed,
+    expanded_parameters, git_subcommand, glob_match, path_operands_except, plain_zsh_line, program,
+    runs, unquoted_glob,
 };
 
 /// Rule identifier for the read-only Bash classifier approval rule.
-pub const RULE_READ_ONLY: &str = "read-only@classify-v9";
+pub const RULE_READ_ONLY: &str = "read-only@classify-v10";
 /// [`RULE_READ_ONLY`]'s proof over a Bash box whose one note is Claude Code's no-rule note
 /// (`This command requires approval`).
-pub const RULE_NO_RULE_READ_ONLY: &str = "no-rule-read-only@v4";
+pub const RULE_NO_RULE_READ_ONLY: &str = "no-rule-read-only@v5";
 /// The rm circuit-breaker rule's id; it does not run [`proof_gaps_clear`], whose assignments the
 /// rm resolver follows.
-pub const RULE_RM_BREAKER: &str = "rm-breaker@v8";
+pub const RULE_RM_BREAKER: &str = "rm-breaker@v9";
 /// The rm circuit breaker's too-many box ([`RmBreakerKind::TooManySubstitutions`]) over a
 /// command that names no rm.
-pub const RULE_BREAKER_READ_ONLY: &str = "breaker-read-only@v9";
+pub const RULE_BREAKER_READ_ONLY: &str = "breaker-read-only@v10";
 /// The rm circuit breaker the safe rules could not prove, approved with a warning under
 /// `approve = "safe"` ([`rm_breaker_warn`]).
 pub const RULE_RM_BREAKER_WARN: &str = "rm-breaker-warn@v1";
@@ -81,7 +83,7 @@ pub const RULE_AUTO_MODE_SETUP: &str = "auto-mode-setup@v1";
 /// `aterm harness disk` ([`crate::harness::disk::fence::runs_harness_disk`]) is approved under
 /// it, and every other permission box the worker raises is declined under it, with
 /// [`DISK_WORKER_DECLINE`] or, for such a Bash box that a proof did not hold for, why not.
-pub const RULE_DISK_WORKER: &str = "disk-worker@v1";
+pub const RULE_DISK_WORKER: &str = "disk-worker@v2";
 
 /// What [`RULE_DISK_WORKER`] types into a disk-free worker's refusal of a command that is not a
 /// read nor `aterm harness disk` or a System State read, and of every other tool's box.
@@ -124,6 +126,26 @@ const READ_RULES: &[&str] = &[
     RULE_BREAKER_READ_ONLY,
     RULE_READ_OUTSIDE_CWD,
 ];
+
+/// A credit-claim worker's fence ([`ApprovalCtx::claim_worker`],
+/// [`crate::harness::credit_offers`]): its questions go to a person whatever `answer_questions`
+/// says; a Claude in Chrome action keeps the rules' approval only where it presses the box's
+/// one-shot allow (never the site-wide grant for the session) on a page
+/// [`crate::harness::credit_offers::claim_page`] admits; a Claude in Chrome tool's own Tool box
+/// ([`crate::harness::credit_offers::CHROME_TOOL`]) is decided as for every session; every other
+/// tool box is declined ([`CLAIM_WORKER_TOOLS`]). Under `approve = "none"` every permission box
+/// stays the owner's.
+pub const RULE_CLAIM_WORKER: &str = "claim-worker@v1";
+
+/// Why [`RULE_CLAIM_WORKER`] declines a claim worker's box of a tool other than Claude in
+/// Chrome's.
+pub const CLAIM_WORKER_TOOLS: &str = "aterm's credit-claim worker uses only its Claude in Chrome \
+                                      tools, on the vendor's claim pages";
+
+/// What [`RULE_CLAIM_WORKER`]'s refusal tells the worker to do, of a tool's box and a page off
+/// its claim alike.
+pub const CLAIM_WORKER_FIX: &str = "Go on without it on the claim page, or end with one reply \
+                                    starting `Nothing left: NOT CLAIMED:` and why";
 
 /// A question dialog answered under the priority word `long-term` ([`QuestionPriority::LongTerm`]).
 pub const RULE_ANSWER_LONG_TERM: &str = "answer-long-term@v1";
@@ -449,6 +471,10 @@ pub struct ApprovalCtx {
     /// folder ([`crate::harness::disk::fence::is_worker_folder`]), so its boxes are decided under
     /// [`RULE_DISK_WORKER`]'s fence.
     pub disk_worker: bool,
+    /// The session is aterm's credit-claim worker: its task record's trusted folder is the claim
+    /// folder ([`crate::harness::credit_offers::is_claim_folder`]), so its boxes are decided under
+    /// [`RULE_CLAIM_WORKER`]'s fence.
+    pub claim_worker: bool,
     pub worker_agent: Option<Program>,
     pub read_roots: Vec<ScratchRoot>,
     pub scratch_roots: Vec<ScratchRoot>,
@@ -517,6 +543,7 @@ impl ApprovalCtx {
             trust_roots: Vec::new(),
             trusted_cwd: None,
             disk_worker: false,
+            claim_worker: false,
             worker_agent: None,
             read_roots: Vec::new(),
             scratch_roots,
@@ -547,6 +574,14 @@ impl ApprovalCtx {
         for sys in ["/usr", "/etc", "/private/etc", "/opt/homebrew"] {
             self.read_roots.extend(ScratchRoot::dir(Path::new(sys)));
         }
+    }
+
+    /// The directories the session's command may start in: its cwd, then where its Bash tool
+    /// stands ([`Self::shell_cwds`]).
+    fn shell_dirs(&self) -> Vec<PathBuf> {
+        let mut cwds = vec![self.cwd.clone()];
+        cwds.extend(self.shell_cwds.iter().filter(|d| **d != self.cwd).cloned());
+        cwds
     }
 }
 
@@ -699,14 +734,7 @@ fn kept_or_bought(p: &PromptV2, decision: &Decision) -> Option<String> {
     if p.kind == PromptKind::Question || *rule_id == RULE_LIMIT_RESET {
         return None;
     }
-    let o = match choice {
-        Choice::Digit(n) => p.options.iter().find(|o| o.n == Some(*n)),
-        Choice::FocusKey { key: "esc", .. } => None,
-        Choice::Focus { label, .. } | Choice::FocusKey { label, .. } => {
-            p.options.iter().find(|o| o.label == *label)
-        }
-        Choice::Answer(_) | Choice::Note { .. } => None,
-    }?;
+    let o = chosen_option(p, choice)?;
     let what = if kept_for_good(o) {
         "keeps its answer for every later ask"
     } else if buys(o) {
@@ -718,6 +746,19 @@ fn kept_or_bought(p: &PromptV2, decision: &Decision) -> Option<String> {
         "`{}` {what}: no automatic press chooses a standing answer or a purchase",
         o.label
     ))
+}
+
+/// The option of `p` that `choice` presses: by its digit, or the label the focus moves to; `None`
+/// for an Esc, a question's answer or a typed note.
+fn chosen_option<'p>(p: &'p PromptV2, choice: &Choice) -> Option<&'p Opt> {
+    match choice {
+        Choice::Digit(n) => p.options.iter().find(|o| o.n == Some(*n)),
+        Choice::FocusKey { key: "esc", .. } => None,
+        Choice::Focus { label, .. } | Choice::FocusKey { label, .. } => {
+            p.options.iter().find(|o| o.label == *label)
+        }
+        Choice::Answer(_) | Choice::Note { .. } => None,
+    }
 }
 
 fn never_spends(reading: &Reading, rows: &[String], decided: Decision) -> Decision {
@@ -806,16 +847,123 @@ fn decide_box(
     trace: &mut dyn Trace,
 ) -> Decision {
     let decided = decide_unfenced(reading, rows, ctx, trace);
-    if !ctx.disk_worker {
+    let (check, fenced) = if ctx.disk_worker {
+        (
+            "disk-worker",
+            disk_fence(reading, rows, ctx, decided.clone()),
+        )
+    } else if ctx.claim_worker {
+        ("claim-worker", claim_fence(reading, ctx, decided.clone()))
+    } else {
         return decided;
-    }
-    let fenced = disk_fence(reading, rows, ctx, decided.clone());
+    };
     if fenced != decided {
-        note(trace, "disk-worker", fenced.rule_id(), || {
+        note(trace, check, fenced.rule_id(), || {
             Outcome::Overruled(said(&fenced))
         });
     }
     fenced
+}
+
+/// [`RULE_CLAIM_WORKER`]'s fence over `decided`, what the rules made of a credit-claim worker's
+/// box. A question is handed to a person, never answered, whatever `answer_questions` and
+/// `approve` say: the worker's task asks none, and nobody chose for the person what one asks.
+/// Of a tool box ([`fenced`]) under `approve = "none"`, the owner's decision stands. A Claude in
+/// Chrome action ([`PromptKind::Browser`]) keeps an approval only where it presses the box's
+/// one-shot allow on a page [`crate::harness::credit_offers::claim_page`] admits
+/// ([`claim_action`]); a refusal pressed or a hand-off the rules made stands. A Claude in Chrome
+/// tool's Tool box ([`crate::harness::credit_offers::CHROME_TOOL`]: its reads and navigation; its
+/// site actions raise the browser box) is decided as for every session. Every other tool box is
+/// declined on its `No`. A box with no `No` to amend (Claude in Chrome's own has `Deny` and no
+/// amend), or one the reader does not vouch for, is handed to a person, as nothing is pressed on
+/// it ([`disk_fence`]'s rule).
+fn claim_fence(reading: &Reading, ctx: &ApprovalCtx, decided: Decision) -> Decision {
+    use crate::harness::credit_offers;
+    let Some(p) = reading.prompt.as_ref() else {
+        return decided;
+    };
+    if p.kind == PromptKind::Question {
+        return match decided {
+            Decision::Escalate { .. } => decided,
+            answered => Decision::escalate(format!(
+                "a credit-claim worker's question is the person's to answer: its fence \
+                 ({RULE_CLAIM_WORKER}) answers none ({})",
+                said(&answered)
+            )),
+        };
+    }
+    if !fenced(p.kind) || ctx.approve == Approve::None {
+        return decided;
+    }
+    let refused = |what: &str, why: &str| {
+        let not_declined = |not: &str| {
+            Decision::escalate(format!(
+                "a credit-claim worker's box, which its fence ({RULE_CLAIM_WORKER}) declines \
+                 ({why}), was not declined: {not} ({})",
+                said(&decided)
+            ))
+        };
+        if !draws_claude_boxes(reading.program)
+            || reading.phase != Phase::Prompt
+            || !reading.phase_authoritative
+        {
+            return not_declined("no box the reader vouches for");
+        }
+        let shown = if p.command.is_empty() {
+            p.title.as_str()
+        } else {
+            p.command.as_str()
+        };
+        decline(
+            RULE_CLAIM_WORKER,
+            p,
+            decline_text(what, why, CLAIM_WORKER_FIX),
+            format!("{} box: {shown}", p.kind.name()),
+        )
+        .unwrap_or_else(|not| not_declined(&not))
+    };
+    match p.kind {
+        PromptKind::Browser => {
+            let Decision::Approve { choice, .. } = &decided else {
+                return decided;
+            };
+            match claim_action(p, choice) {
+                Ok(()) => decided,
+                Err(why) => refused("this Chrome action", &why),
+            }
+        }
+        PromptKind::Tool if p.command.starts_with(credit_offers::CHROME_TOOL) => decided,
+        _ => refused("this tool call", CLAIM_WORKER_TOOLS),
+    }
+}
+
+/// Why the Claude in Chrome box `p`, approved with `choice`, is no action of a claim worker's
+/// [`RULE_CLAIM_WORKER`] keeps; `Ok` where the choice presses `p`'s refusal (a decline the rules
+/// made), or its one-shot allow on a page [`crate::harness::credit_offers::claim_page`] admits
+/// whose title names a vendor host, where it names one (`… wants to click on <host>`).
+fn claim_action(p: &PromptV2, choice: &Choice) -> Result<(), String> {
+    use crate::harness::credit_offers;
+    let Some(o) = chosen_option(p, choice) else {
+        return Err("its press is no option of the box".to_owned());
+    };
+    if o.role == Role::Deny {
+        return Ok(());
+    }
+    if o.role != Role::Once {
+        return Err(format!(
+            "`{}` is not the box's one-shot allow",
+            clip(&o.label, 60)
+        ));
+    }
+    credit_offers::claim_page(&p.command)?;
+    let title = p.base_title().unwrap_or_else(|| p.title.clone());
+    match title.rsplit_once(" on ") {
+        Some((_, host)) if !credit_offers::vendor_host(host.trim()) => Err(format!(
+            "its box names {} as the site",
+            clip(host.trim(), 60)
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// The tool boxes an agent raises for a call it makes: the boxes a disk-free worker's fence
@@ -1780,7 +1928,7 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
         .and_then(|()| shell_models_hold(&readings, runs_on.as_deref(), ctx))
         .and_then(|()| plain_under_zsh(&readings, ctx))
         .and_then(|()| git_reads_clear(&readings, runs_on.as_deref(), ctx))
-        .and_then(|()| secrets_free(&readings, &ctx.secrets, ctx.home.as_deref()))
+        .and_then(|()| secrets_unreached_in(&readings, ctx, &|_| false))
         .and_then(|()| once_choice(prompt));
     match proven {
         Ok(choice) => Decision::Approve {
@@ -1838,12 +1986,11 @@ fn disk_verbs(
         disk_words(prompt, rows, ctx).map_err(NotDiskVerb::Fenced)?;
     blanks_shown(&readings)
         .and_then(|()| proof_gaps_clear(&readings))
+        .and_then(|()| environment_unread(&readings))
         .and_then(|()| shell_models_hold(&readings, None, ctx))
         .and_then(|()| plain_under_zsh(&readings, ctx))
         .and_then(|()| git_reads_clear(&readings, None, ctx))
-        .and_then(|()| {
-            secrets_free_except(&readings, &ctx.secrets, ctx.home.as_deref(), &disk_passed)
-        })
+        .and_then(|()| secrets_unreached_in(&readings, ctx, &disk_passed))
         .map_err(NotDiskVerb::Unproven)?;
     Ok(Decision::Approve {
         rule_id: RULE_DISK_WORKER,
@@ -1944,8 +2091,10 @@ const GLOB_SAFE: &[&str] = &[
 ];
 
 /// `Ok` when no reading holds a form the classifier cannot vet: an assignment, `env`, `export` or
-/// `xargs` on the walk to a program, a loop variable, or an unquoted glob beside a program off
-/// [`GLOB_SAFE`].
+/// `xargs` on the walk to a program, a loop variable, or an unquoted glob in the words of a program
+/// off [`GLOB_SAFE`] ([`command_words_globbed`]: its own command's words or a substitution's among
+/// them, never another command's, so `ls /etc/*.conf | sort` holds no glob of sort's; a glob the
+/// line holds where no command's words do counts against every command).
 fn proof_gaps_clear(readings: &[String]) -> Result<(), String> {
     let assignment = |w: &str| {
         w.split_once('=').is_some_and(|(name, _)| {
@@ -1958,9 +2107,10 @@ fn proof_gaps_clear(readings: &[String]) -> Result<(), String> {
     for line in readings {
         let name = reading_name(line);
         let segments =
-            command_words(line).map_err(|why| format!("not read-only ({name}): {why}"))?;
-        let glob = unquoted_glob(line);
-        for seg in &segments {
+            command_words_globbed(line).map_err(|why| format!("not read-only ({name}): {why}"))?;
+        let stray = unquoted_glob(line).filter(|_| segments.iter().all(|(_, g)| g.is_none()));
+        for (seg, own) in &segments {
+            let glob = own.or(stray);
             let run = runs(seg).map_err(|why| format!("not read-only ({name}): {why}"))?;
             let at = run.as_ref().map_or(seg.len(), |r| r.at);
             if let Some(w) = seg[..at].iter().find(|w| assignment(w)) {
@@ -2014,8 +2164,7 @@ fn git_reads_clear(
     ctx: &ApprovalCtx,
 ) -> Result<(), String> {
     let mut seen: Vec<(PathBuf, GitView)> = Vec::new();
-    let mut cwds = vec![ctx.cwd.clone()];
-    cwds.extend(ctx.shell_cwds.iter().filter(|d| **d != ctx.cwd).cloned());
+    let cwds = ctx.shell_dirs();
     for line in readings {
         let Some(reads) = git_reads(line, &cwds, ctx.home.as_deref())? else {
             continue;
@@ -2150,11 +2299,144 @@ fn brace_free(readings: &[String]) -> Result<(), String> {
 }
 
 /// `Ok` when every reading of a Bash box's command classifies read-only, reads no socket, holds
-/// no brace expansion, turns on no blank the screen cannot show, and holds no proof gap.
+/// no brace expansion, turns on no blank the screen cannot show, holds no proof gap, and prints
+/// no value of the environment ([`environment_unread`]).
 pub(crate) fn readings_proven(readings: &[String], python_allow: &[String]) -> Result<(), String> {
     read_only_every_reading(readings, python_allow)?;
     blanks_shown(readings)?;
-    proof_gaps_clear(readings)
+    proof_gaps_clear(readings)?;
+    environment_unread(readings)
+}
+
+/// The filter jq's `args` give it: its first operand past the options and their values; `None`
+/// when it reads one from a file (`-f`, `--from-file`), `Some("")` when it has none.
+fn jq_filter(args: &[String]) -> Option<&str> {
+    let mut k = 0;
+    while let Some(a) = args.get(k).map(String::as_str) {
+        match a {
+            "-f" | "--from-file" => return None,
+            "--arg" | "--argjson" | "--slurpfile" | "--rawfile" => k += 3,
+            "--indent" | "-L" => k += 2,
+            _ if a.starts_with('-') => k += 1,
+            _ => return Some(a),
+        }
+    }
+    Some("")
+}
+
+/// The parameters a read may expand, whose values name the session's own places (Windows' home
+/// as `USERPROFILE`) and the shell's counters, never a credential.
+const PLAIN_PARAMETERS: &[&str] = &[
+    "HOME",
+    "USERPROFILE",
+    "PWD",
+    "OLDPWD",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "PATH",
+    "TMPDIR",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "HOSTNAME",
+    "UID",
+    "EUID",
+    "PPID",
+    "SHLVL",
+    "RANDOM",
+    "SECONDS",
+    "LINENO",
+    "COLUMNS",
+    "LINES",
+    "BASH_VERSION",
+    "ZSH_VERSION",
+];
+
+/// `Ok` when no reading prints a value of the environment, where a token lives as a file's
+/// secret does: no parameter expansion outside single quotes ([`expanded_parameters`]) of a name
+/// off [`PLAIN_PARAMETERS`] (its value prints as any word does, in an error too: `cat $TOKEN`),
+/// no indirection (`${!x}`), no `ps` that shows processes' environments (`-E` in a dashed cluster,
+/// or `e` in a dashless one that is no option's value: MEASURED on macOS 27.0.1, where `ps -e`
+/// lists every process instead), no jq filter naming `env` (a key, `.env`, is none) or `$ENV` (nor
+/// one jq reads from a file, unseen), no awk program naming `ENVIRON`, and no word naming a file
+/// `environ` (Linux's `/proc/<pid>/environ`).
+///
+/// # Errors
+///
+/// The first reading that prints one, named.
+fn environment_unread(readings: &[String]) -> Result<(), String> {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let names_env = |w: &str| {
+        w.contains("$ENV")
+            || w.match_indices("env").any(|(k, _)| {
+                !w[..k].ends_with(|c: char| ident(c) || c == '$' || c == '.')
+                    && !w[k + 3..].starts_with(ident)
+            })
+    };
+    for line in readings {
+        let name = reading_name(line);
+        let not_read = |why: String| format!("not read-only ({name}): {why}");
+        for p in expanded_parameters(line).map_err(not_read)? {
+            if p.starts_with('!') {
+                return Err(format!(
+                    "expands ${{{p}}} ({name}), an indirection whose value may be a secret"
+                ));
+            }
+            let var: String = p
+                .trim_start_matches('#')
+                .chars()
+                .take_while(|c| ident(*c))
+                .collect();
+            if !var.is_empty()
+                && !var.chars().all(|c| c.is_ascii_digit())
+                && !PLAIN_PARAMETERS.contains(&var.as_str())
+            {
+                return Err(format!(
+                    "expands ${var} ({name}), a variable whose value may be a secret"
+                ));
+            }
+        }
+        for seg in &command_words(line).map_err(not_read)? {
+            if seg
+                .iter()
+                .any(|w| w.rsplit(['/', '\\']).next() == Some("environ"))
+            {
+                return Err(format!("names a process's environment ({name})"));
+            }
+            let Ok(Some(run)) = runs(seg) else {
+                continue;
+            };
+            let args = &seg[run.at + 1..];
+            let shown = match program(&seg[run.at]) {
+                "ps" => args
+                    .iter()
+                    .enumerate()
+                    .any(|(k, a)| match a.strip_prefix('-') {
+                        Some(cluster) => !cluster.starts_with('-') && cluster.contains('E'),
+                        None => {
+                            a.chars().all(|c| c.is_ascii_alphabetic())
+                                && a.contains('e')
+                                && !matches!(
+                                    k.checked_sub(1).map(|j| args[j].as_str()),
+                                    Some("-o" | "-O" | "-p" | "-U" | "-u" | "-G" | "-g" | "-t")
+                                )
+                        }
+                    }),
+                "jq" => jq_filter(args).is_none_or(names_env),
+                "awk" => args.iter().any(|a| a.contains("ENVIRON")),
+                _ => false,
+            };
+            if shown {
+                return Err(format!(
+                    "{} prints the environment ({name}), whose values may be secrets",
+                    program(&seg[run.at])
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// [`readings_proven`], then the default secret list under this process's `HOME`: the advisory
@@ -2164,22 +2446,41 @@ pub(crate) fn readings_proven(readings: &[String], python_allow: &[String]) -> R
 ///
 /// The first reading that is not read-only, else the first that holds a
 /// form the shell may read otherwise than drawn or the classifier cannot
-/// vet, else the first that reads a secret, named.
+/// vet, else the first that prints a value of the environment, else the
+/// first that may read a secret, named.
 pub fn readings_read_only(readings: &[String], python_allow: &[String]) -> Result<(), String> {
-    readings_proven(readings, python_allow)?;
-    let home = advisory_home();
-    secrets_free(readings, &default_secrets(home.as_deref()), home.as_deref())
+    readings_read_only_at(readings, python_allow, advisory_home().as_deref())
 }
 
-/// `Ok` unless `line` reads a path the default secret list names under `home`:
-/// `aterm drive classify`'s secret half.
+/// [`readings_read_only`] with the secret list resolved under `home`.
+fn readings_read_only_at(
+    readings: &[String],
+    python_allow: &[String],
+    home: Option<&Path>,
+) -> Result<(), String> {
+    readings_proven(readings, python_allow)?;
+    secrets_unreached(
+        readings,
+        &default_secrets(home),
+        home,
+        Start::Unconsulted,
+        &|_| false,
+    )
+}
+
+/// The advisory word's verdict ([`readings_read_only`]) on `line`, a shell command line as typed,
+/// with the default secret list under `home`: `aterm drive classify`'s verdict after the
+/// classifier's, so the verb and the word agree on every line.
 ///
 /// # Errors
 ///
-/// `a read of a secret (<rule>) (space reading): <path>`, or the
-/// classifier's refusal of a line it cannot read.
-pub fn command_reads_no_secret(line: &str, home: Option<&Path>) -> Result<(), String> {
-    secrets_free(&[line.to_string()], &default_secrets(home), home)
+/// The first refusal, named as [`readings_read_only`] names it.
+pub fn command_read_only_at(
+    line: &str,
+    python_allow: &[String],
+    home: Option<&Path>,
+) -> Result<(), String> {
+    readings_read_only_at(&[line.to_string()], python_allow, home)
 }
 
 /// The home the advisory word resolves `~` and the secret list against.
@@ -2233,7 +2534,7 @@ fn breaker_read_only(
         .and_then(|()| shell_models_hold(&readings, runs_on.as_deref(), ctx))
         .and_then(|()| plain_under_zsh(&readings, ctx))
         .and_then(|()| git_reads_clear(&readings, runs_on.as_deref(), ctx))
-        .and_then(|()| secrets_free(&readings, &ctx.secrets, ctx.home.as_deref()));
+        .and_then(|()| secrets_unreached_in(&readings, ctx, &|_| false));
     if let Err(why) = proven {
         return refused(why);
     }
@@ -2747,27 +3048,20 @@ fn operand_comps(op: &str, home: Option<&Path>) -> Vec<Vec<String>> {
     texts.iter().flat_map(|t| path_readings(t)).collect()
 }
 
+/// The secret check on the words as written: each operand ([`path_operands_except`]) read by
+/// [`operand_comps`] and held to the rules by [`secret_hit`]. Only the rm circuit breaker's arm
+/// keeps it ([`RULE_RM_BREAKER`] answers in a bypass session alone, where every other command
+/// runs unasked); a read rule holds a line to [`secrets_unreached`].
 fn secrets_free(
     readings: &[String],
     secrets: &[SecretRule],
     home: Option<&Path>,
 ) -> Result<(), String> {
-    secrets_free_except(readings, secrets, home, &|_| false)
-}
-
-/// [`secrets_free`], the words of a command `passed` holds read as naming no file it reads
-/// ([`path_operands_except`]).
-fn secrets_free_except(
-    readings: &[String],
-    secrets: &[SecretRule],
-    home: Option<&Path>,
-    passed: &dyn Fn(&[String]) -> bool,
-) -> Result<(), String> {
     if secrets.is_empty() {
         return Ok(());
     }
     for line in readings {
-        let operands = path_operands_except(line, passed)
+        let operands = path_operands_except(line, &|_| false)
             .map_err(|why| format!("not read-only ({}): {why}", reading_name(line)))?;
         for op in &operands {
             let hit = operand_comps(op, home)
@@ -2782,6 +3076,464 @@ fn secrets_free_except(
         }
     }
     Ok(())
+}
+
+/// Where a line's relative paths start, for [`secrets_unreached`].
+#[derive(Clone, Copy)]
+enum Start<'a> {
+    /// The directories the session's command may run in: its cwd and where its Bash tool stands.
+    Known(&'a [PathBuf]),
+    /// The session's cwd is unknown (meta `cwd=-`): a relative path may name any file.
+    Unknown,
+    /// Not consulted (the advisory word and `aterm drive classify`, which know no session's
+    /// cwd): a relative path is read against the directories the line itself names.
+    Unconsulted,
+}
+
+impl Start<'_> {
+    /// The directories it names, and why a relative path may name any file.
+    fn bases(self) -> (Vec<String>, Option<String>) {
+        match self {
+            Self::Known(dirs) => (
+                dirs.iter()
+                    .map(|d| d.to_string_lossy().into_owned())
+                    .collect(),
+                None,
+            ),
+            Self::Unknown => (
+                Vec::new(),
+                Some("with the session's cwd unknown (meta cwd=-)".to_string()),
+            ),
+            Self::Unconsulted => (Vec::new(), None),
+        }
+    }
+}
+
+/// [`secrets_unreached`] for the session `ctx` describes: its relative paths start in its cwd
+/// and where its Bash tool stands, or anywhere when its cwd is unknown.
+fn secrets_unreached_in(
+    readings: &[String],
+    ctx: &ApprovalCtx,
+    passed: &dyn Fn(&[String]) -> bool,
+) -> Result<(), String> {
+    let dirs = ctx.shell_dirs();
+    let start = if ctx.cwd_known {
+        Start::Known(&dirs)
+    } else {
+        Start::Unknown
+    };
+    secrets_unreached(readings, &ctx.secrets, ctx.home.as_deref(), start, passed)
+}
+
+/// `Ok` when no path a reading's commands may read lies under a secret rule, as the shell
+/// resolves it: each operand ([`path_operands_except`], the words of a command `passed` holds
+/// read as naming no file) read by [`operand_comps`], a relative one also against every
+/// directory the line may run it in ([`line_bases`]); a glob held to the rules by what it may
+/// expand to ([`secret_reach`]); and every tree a recursive reader descends ([`descends`]) held
+/// to the home-rooted rules above it.
+///
+/// # Errors
+///
+/// The first read of a secret, named; else the first path this check cannot hold to the rules:
+/// one the shell builds at run time (an expansion or a substitution), or a relative one after a
+/// move it cannot follow or with the session's cwd unknown.
+fn secrets_unreached(
+    readings: &[String],
+    secrets: &[SecretRule],
+    home: Option<&Path>,
+    start: Start<'_>,
+    passed: &dyn Fn(&[String]) -> bool,
+) -> Result<(), String> {
+    if secrets.is_empty() {
+        return Ok(());
+    }
+    let mut doubt = None;
+    for line in readings {
+        let name = reading_name(line);
+        let not_read = |why: String| format!("not read-only ({name}): {why}");
+        let operands = path_operands_except(line, passed).map_err(not_read)?;
+        let segments = command_words(line).map_err(not_read)?;
+        let bases = line_bases(&segments, start, home);
+        for op in &operands {
+            let (comps, unsure) = operand_reach(op, home, &bases, true);
+            if let Some(rule) = comps.iter().find_map(|c| secret_reach(c, secrets, false)) {
+                return Err(format!("a read of a secret ({rule:?}) ({name}): {op}"));
+            }
+            if doubt.is_none() {
+                doubt = unsure.map(|u| format!("{u} ({name}): {op}"));
+            }
+        }
+        for seg in &segments {
+            let Ok(Some(run)) = runs(seg) else {
+                continue;
+            };
+            for root in descends(seg, run.at) {
+                let (comps, unsure) = operand_reach(root, home, &bases, false);
+                if let Some(rule) = comps.iter().find_map(|c| secret_reach(c, secrets, true)) {
+                    return Err(format!(
+                        "a read of a secret ({rule:?}) ({name}): {} descends from {root}",
+                        program(&seg[run.at])
+                    ));
+                }
+                if doubt.is_none() {
+                    doubt = unsure.map(|u| format!("{u} ({name}): {root}, where it descends"));
+                }
+            }
+        }
+    }
+    doubt.map_or(Ok(()), Err)
+}
+
+/// The directories a line's commands may run in, as written, and the first move after which
+/// a relative path may name any file ([`Start::Unknown`]'s, or a move this check cannot follow).
+struct Bases {
+    dirs: Vec<String>,
+    lost: Option<String>,
+}
+
+/// [`Bases`] of a line of `segments`: `start`'s, and every `cd` target and `git -C` directory
+/// the line names, a relative one joined to every directory before it, in any order the line
+/// may run them. A move it cannot follow: `cd -`, a directory-stack entry, `popd`, a target
+/// built at run time or globbed, another user's home, a second operand (zsh's `cd old new`
+/// edits `PWD`), or a relative target a loop may repeat.
+fn line_bases(segments: &[Vec<String>], start: Start<'_>, home: Option<&Path>) -> Bases {
+    let (dirs, lost) = start.bases();
+    let mut b = Bases { dirs, lost };
+    let looped = segments.iter().any(|seg| {
+        seg.iter()
+            .find(|w| w.as_str() != "!")
+            .is_some_and(|w| matches!(w.as_str(), "for" | "while" | "until" | "select"))
+    });
+    for seg in segments {
+        let Ok(Some(run)) = runs(seg) else {
+            continue;
+        };
+        let at = run.at;
+        let moves: Vec<Result<Option<&str>, ()>> = match program(&seg[at]) {
+            "cd" | "pushd" => vec![cd_operand(&seg[at + 1..])],
+            "popd" => vec![Err(())],
+            "git" => git_dirs(seg, at).into_iter().map(|d| Ok(Some(d))).collect(),
+            _ => continue,
+        };
+        for m in moves {
+            let moved = match m {
+                Ok(None) => home
+                    .map(|h| vec![h.to_string_lossy().into_owned()])
+                    .ok_or_else(|| "`cd` with no home".to_string()),
+                Ok(Some(t)) => cd_moves(t, &b.dirs, home, looped),
+                Err(()) => Err(format!(
+                    "`{}`, a move this check cannot follow",
+                    seg[at..].join(" ")
+                )),
+            };
+            match moved {
+                Ok(dirs) => b.dirs.extend(dirs),
+                Err(why) => {
+                    b.lost.get_or_insert(format!("after {why}"));
+                }
+            }
+        }
+    }
+    b
+}
+
+/// The operand of `cd` with `args`: `None` for the home, else its one operand; `Err` when it
+/// takes an option other than `-L`, `-P`, `-e`, `-@`, `-q` or `-s` (zsh's `-N` reads the
+/// directory stack), names `-` (`OLDPWD`) or a stack entry (`+N`), or takes two operands.
+fn cd_operand(args: &[String]) -> Result<Option<&str>, ()> {
+    let mut k = 0;
+    while let Some(w) = args.get(k).filter(|w| w.len() > 1 && w.starts_with('-')) {
+        k += 1;
+        if w == "--" {
+            break;
+        }
+        if !w[1..]
+            .chars()
+            .all(|c| matches!(c, 'L' | 'P' | 'e' | '@' | 'q' | 's'))
+        {
+            return Err(());
+        }
+    }
+    match args.get(k..).unwrap_or(&[]) {
+        [] => Ok(None),
+        [t] if t != "-" && !t.starts_with('+') => Ok(Some(t)),
+        _ => Err(()),
+    }
+}
+
+/// The directories git's `-C` options before its subcommand name, in order.
+fn git_dirs(seg: &[String], at: usize) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut j = at + 1;
+    while let Some(t) = seg.get(j).map(String::as_str) {
+        if t == "-C" {
+            out.extend(seg.get(j + 1).map(String::as_str));
+            j += 2;
+        } else if matches!(t, "-c" | "--namespace" | "--git-dir" | "--work-tree") {
+            j += 2;
+        } else if t.starts_with('-') {
+            j += 1;
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// Whether `t` names a path from the root: `/…`, `\…`, or a drive path (`C:\…`, `C:/…`).
+fn rooted(t: &str) -> bool {
+    let b = t.as_bytes();
+    t.starts_with(['/', '\\'])
+        || (b.len() > 2
+            && b[0].is_ascii_alphabetic()
+            && b[1] == b':'
+            && matches!(b[2], b'/' | b'\\'))
+}
+
+/// The directories `cd t` may move to from any of `dirs`; `Err` naming a target this check
+/// cannot follow ([`line_bases`]).
+fn cd_moves(
+    t: &str,
+    dirs: &[String],
+    home: Option<&Path>,
+    looped: bool,
+) -> Result<Vec<String>, String> {
+    if t.contains('$') || t.contains(['*', '?', '[']) {
+        return Err(format!(
+            "`cd {t}`, a directory the shell expands at run time"
+        ));
+    }
+    if let Some(rest) = t.strip_prefix('~') {
+        let home = home.filter(|_| rest.is_empty() || rest.starts_with('/'));
+        let Some(h) = home else {
+            return Err(format!("`cd {t}`, a home this check does not know"));
+        };
+        return Ok(vec![format!(
+            "{}{rest}",
+            h.to_string_lossy().trim_end_matches('/')
+        )]);
+    }
+    if rooted(t) {
+        return Ok(vec![t.to_string()]);
+    }
+    if looped {
+        return Err(format!("`cd {t}`, a relative move a loop may repeat"));
+    }
+    Ok(dirs
+        .iter()
+        .map(|d| format!("{}/{t}", d.trim_end_matches('/')))
+        .collect())
+}
+
+/// Every component list `op` may name: [`operand_comps`]' readings (a relative `op`'s, its words
+/// as written, only with `literal`), `~user/…` read under the home when `user` is its owner's
+/// name, and a relative `op` (and `~+/…`) joined to each of `bases`' directories; and why it may
+/// name another file this check cannot see (a path the shell builds at run time, `~-`, or a
+/// relative one after `bases`' lost move).
+fn operand_reach(
+    op: &str,
+    home: Option<&Path>,
+    bases: &Bases,
+    literal: bool,
+) -> (Vec<Vec<String>>, Option<String>) {
+    let as_written = literal || rooted(op) || op.starts_with(['~', '$']);
+    let mut comps = if as_written {
+        operand_comps(op, home)
+    } else {
+        Vec::new()
+    };
+    if op.contains(SUBSTITUTION) || op.contains(QUOTED_SUBSTITUTION) {
+        return (
+            comps,
+            Some("a read of a path the shell builds at run time, which may name a secret".into()),
+        );
+    }
+    let mut relative = (!rooted(op) && !op.starts_with('~')).then_some(op);
+    if let Some(rest) = op
+        .strip_prefix('~')
+        .filter(|r| !r.is_empty() && !r.starts_with('/'))
+    {
+        let (user, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        match user {
+            "+" => relative = Some(tail),
+            "-" => {
+                return (
+                    comps,
+                    Some("a read under `~-` (OLDPWD), which this check cannot resolve".into()),
+                );
+            }
+            _ => {
+                let owner = home.and_then(Path::file_name).map(|n| n.to_string_lossy());
+                if let Some(h) =
+                    home.filter(|_| owner.is_some_and(|o| o.eq_ignore_ascii_case(user)))
+                {
+                    let h = h.to_string_lossy();
+                    comps.extend(path_readings(&format!(
+                        "{}/{tail}",
+                        h.trim_end_matches('/')
+                    )));
+                }
+            }
+        }
+    }
+    let Some(rel) = relative else {
+        return (comps, None);
+    };
+    for d in &bases.dirs {
+        comps.extend(path_readings(&format!("{}/{rel}", d.trim_end_matches('/'))));
+    }
+    let unsure = bases
+        .lost
+        .as_ref()
+        .map(|lost| format!("a read of a relative path {lost}"));
+    (comps, unsure)
+}
+
+/// The rule a path `comps` names may fall under, its components globs the shell may expand: an
+/// [`SecretRule::Under`] directory some expansion names or lies under, a [`SecretRule::Component`]
+/// some component may expand to, or a [`SecretRule::Basename`] the last component matches as
+/// written (a glob that may expand to a secret's basename is not held to it: `cat src/*` may read
+/// `src/a.pem`). With `recursive` (a tree a reader descends, whose root the operand check holds
+/// to every rule), the `Under` rules alone, a directory above one reaching it too.
+fn secret_reach<'a>(
+    comps: &[String],
+    secrets: &'a [SecretRule],
+    recursive: bool,
+) -> Option<&'a SecretRule> {
+    secrets.iter().find(|rule| match rule {
+        SecretRule::Under(dir) => path_readings(&dir.to_string_lossy())
+            .iter()
+            .any(|d| reaches(comps, d, recursive)),
+        SecretRule::Component(_) | SecretRule::Basename(_) if recursive => false,
+        SecretRule::Component(name) => comps.iter().any(|c| component_meets(c, name)),
+        SecretRule::Basename(glob) => comps
+            .last()
+            .is_some_and(|c| glob_match(&glob.to_ascii_lowercase(), &c.to_ascii_lowercase())),
+    })
+}
+
+/// Whether some expansion of `comps` names `dir` or a path under it, or, with `recursive`, a
+/// directory above it: each component compared by [`component_meets`], a whole `**` (zsh's, and
+/// bash's under `globstar`) taking any run of components.
+fn reaches(comps: &[String], dir: &[String], recursive: bool) -> bool {
+    let (n, m) = (comps.len(), dir.len());
+    let mut ok = vec![vec![false; m + 1]; n + 1];
+    for i in (0..=n).rev() {
+        for j in (0..=m).rev() {
+            ok[i][j] = if j == m {
+                true
+            } else if i == n {
+                recursive
+            } else if matches!(comps[i].as_str(), "**" | "***") {
+                ok[i + 1][j] || ok[i][j + 1]
+            } else {
+                component_meets(&comps[i], &dir[j]) && ok[i + 1][j + 1]
+            };
+        }
+    }
+    ok[0][0]
+}
+
+/// Whether the shell may expand `pattern`, one path component of a word, to `name`, ignoring
+/// case as the default volume does: `*` any run of characters (a leading dot too, as under
+/// `dotglob` or zsh's `GLOB_DOTS`), `?` and a bracket expression any one, and a component
+/// holding an extended-glob group (`(…|…)`) any name.
+fn component_meets(pattern: &str, name: &str) -> bool {
+    #[derive(Clone, Copy)]
+    enum Tok {
+        Star,
+        One,
+        Lit(char),
+    }
+    if pattern.contains(['(', '|']) {
+        return true;
+    }
+    let cs: Vec<char> = pattern.chars().collect();
+    let mut toks = Vec::new();
+    let mut i = 0;
+    while i < cs.len() {
+        match cs[i] {
+            '*' => toks.push(Tok::Star),
+            '?' => toks.push(Tok::One),
+            '[' if cs.iter().skip(i + 2).any(|c| *c == ']') => {
+                toks.push(Tok::One);
+                i += 2 + cs[i + 2..].iter().position(|c| *c == ']').unwrap_or(0);
+            }
+            c => toks.extend(c.to_lowercase().map(Tok::Lit)),
+        }
+        i += 1;
+    }
+    let name: Vec<char> = name.chars().flat_map(char::to_lowercase).collect();
+    let (n, m) = (toks.len(), name.len());
+    let mut ok = vec![vec![false; m + 1]; n + 1];
+    ok[n][m] = true;
+    for i in (0..n).rev() {
+        for j in (0..=m).rev() {
+            ok[i][j] = match toks[i] {
+                Tok::Star => ok[i + 1][j] || (j < m && ok[i][j + 1]),
+                Tok::One => j < m && ok[i + 1][j + 1],
+                Tok::Lit(c) => j < m && name[j] == c && ok[i + 1][j + 1],
+            };
+        }
+    }
+    ok[0][0]
+}
+
+/// The trees the command at `seg[at]` reads every file below, as written: for `grep -r` (and
+/// `-R`, `--recursive`, `-d recurse`), `rg`, `find` that runs `-exec`, `-execdir`, `-ok` or
+/// `-okdir`, and `git grep`, every word after the program that is no option (its operands among
+/// them) and `.`, where each starts with none named; for `diff -r` and `git diff --no-index`, its
+/// words. A word built at run time is left to the operand check, which refuses it.
+fn descends(seg: &[String], at: usize) -> Vec<&str> {
+    fn words(seg: &[String], from: usize, here: bool) -> Vec<&str> {
+        seg.get(from..)
+            .unwrap_or(&[])
+            .iter()
+            .map(String::as_str)
+            .filter(|w| !w.starts_with('-'))
+            .filter(|w| !w.contains(SUBSTITUTION) && !w.contains(QUOTED_SUBSTITUTION))
+            .chain(here.then_some("."))
+            .collect()
+    }
+    let args = &seg[at + 1..];
+    let short = |letters: &[char]| {
+        args.iter().any(|a| {
+            a.len() > 1 && a.starts_with('-') && !a.starts_with("--") && a[1..].contains(letters)
+        })
+    };
+    let long = |names: &[&str]| {
+        args.iter().any(|a| {
+            a.strip_prefix("--")
+                .map(|l| l.split('=').next().unwrap_or(""))
+                .is_some_and(|l| !l.is_empty() && names.iter().any(|n| n.starts_with(l)))
+        })
+    };
+    match program(&seg[at]) {
+        "grep" | "egrep" | "fgrep"
+            if short(&['r', 'R'])
+                || long(&["recursive", "dereference-recursive", "directories"])
+                || args.iter().any(|a| a.contains("recurse")) =>
+        {
+            words(seg, at + 1, true)
+        }
+        "rg" => words(seg, at + 1, true),
+        "find"
+            if args
+                .iter()
+                .any(|a| matches!(a.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir")) =>
+        {
+            words(seg, at + 1, true)
+        }
+        "diff" if short(&['r']) || long(&["recursive"]) => words(seg, at + 1, false),
+        "git" => match git_subcommand(seg, at) {
+            Some((sub, "grep")) => words(seg, sub + 1, true),
+            Some((sub, "diff")) if args.iter().any(|a| a == "--no-index") => {
+                words(seg, sub + 1, false)
+            }
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
 }
 
 fn trust_dialog(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
@@ -3012,7 +3764,12 @@ const PURCHASE: &[&str] = &[
     "set monthly spend limit",
 ];
 
-const RESET_SPEND: &[&str] = &["use my reset", "use your reset", "reset your session limit"];
+const RESET_SPEND: &[&str] = &[
+    "use my reset",
+    "use your reset",
+    "reset your session limit",
+    "reset your 5-hour limit",
+];
 
 fn opens_with(label: &str, words: &[&str]) -> bool {
     let l = label.trim().to_lowercase();

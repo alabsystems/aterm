@@ -6,9 +6,8 @@
 use crate::presence::{
     AgentPhase, AgentReading, ChipLevel, Facts, Hand, HoldFact, Host, Level, Link, MailFacts,
     MailLast, NeedFact, NeedSeverity, Pill, PillAct, PillHit, PillKind, PresenceTones, Rim, Slot,
-    StopCause, StoryVerb, TurnFact, View, WallAnswer, chip_of_attention, fmt_dur, pill_age,
-    pill_age_room, pill_due, pill_layout, pill_text, pill_words, sanitize_token, short_sid,
-    state_line,
+    StopCause, TurnFact, View, WallAnswer, chip_of_attention, fmt_dur, pill_age, pill_age_room,
+    pill_due, pill_layout, pill_text, pill_words, sanitize_token, short_sid, state_line,
 };
 use crate::{Duration, Instant};
 
@@ -1180,21 +1179,50 @@ fn the_programs_own_report_is_named_only_where_the_reader_names_no_phase() {
     );
 }
 
+/// A PROGRAM THAT NAMES NO PHASE SAYS ITS CONTEXT BESIDE ITS OWN REPORT (codex's rollout figure):
+/// the hover reads `codex working · ctx 40% left`, warned at the agent's threshold, as a Claude
+/// tab's figure is, and a figure that moves alone redraws it. NEGATIVE CONTROLS: a report with no
+/// figure says the report alone; a reader that names a phase says its own figure, never the
+/// program's; no report says no figure.
 #[test]
-fn only_chose_is_a_told_story_word() {
-    assert_eq!(StoryVerb::TOLD_WORDS, ["chose"]);
-    assert_eq!(StoryVerb::parse_told("chose"), Some(StoryVerb::Chose));
-    for gone in [
-        "approved",
-        "dismissed",
-        "reconnected",
-        "timeout",
-        "exit",
-        "compacted",
-        "warned",
-    ] {
-        assert_eq!(StoryVerb::parse_told(gone), None, "{gone}");
-    }
+fn a_programs_own_context_figure_follows_its_report() {
+    let now = Instant::now();
+    let facts = |phase: Option<AgentPhase<TestHost>>, ctx: Option<u8>| TFacts {
+        agent_seq: 1,
+        agent: phase.map(|phase| AgentReading {
+            phase,
+            context_pct: None,
+        }),
+        shell: Some(("running", now)),
+        program: Some(("codex working", now)),
+        program_ctx_left: ctx,
+        ..TFacts::default()
+    };
+    let line = |facts: TFacts| state_line(&slot_of(facts, now), Some("codex"));
+    assert_eq!(
+        line(facts(None, Some(40))).as_deref(),
+        Some("codex working \u{b7} ctx 40% left")
+    );
+    assert_eq!(
+        line(facts(Some(AgentPhase::Unknown), Some(15))).as_deref(),
+        Some("codex working \u{b7} ctx 15% left \u{26a0}")
+    );
+    assert_eq!(line(facts(None, None)).as_deref(), Some("codex working"));
+    assert_eq!(
+        line(facts(Some(AgentPhase::Busy), Some(40))).as_deref(),
+        Some("codex \u{b7} busy")
+    );
+    assert_eq!(
+        line(TFacts {
+            program: None,
+            ..facts(None, Some(40))
+        })
+        .as_deref(),
+        Some("codex \u{b7} running")
+    );
+    let mut slot = slot_of(facts(None, Some(40)), now);
+    assert!(slot.absorb(facts(None, Some(30)), now), "the figure moved");
+    assert!(!slot.absorb(facts(None, Some(30)), now), "nothing moved");
 }
 
 #[test]

@@ -24,6 +24,14 @@ pub enum Console {
     Detached,
 }
 
+/// Returns `true` when `word` (`dwCreationFlags`) opens a visible console window in a
+/// process whose `have_console` state is `have_console`.
+#[must_use]
+pub const fn shows_a_console_window(word: u32, have_console: bool) -> bool {
+    word & CREATE_NEW_CONSOLE != 0
+        || (!have_console && word & (CREATE_NO_WINDOW | DETACHED_PROCESS) == 0)
+}
+
 /// Computes `dwCreationFlags` for `console`, `extra`, and `have_console`.
 #[must_use]
 pub const fn creation_flags(console: Console, extra: u32, have_console: bool) -> u32 {
@@ -84,7 +92,7 @@ fn set_console(cmd: &mut StdCommand, console: Console, extra: u32) -> &mut StdCo
 mod tests {
     use super::{
         CONSOLE_BITS, CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, Console,
-        DETACHED_PROCESS, creation_flags,
+        DETACHED_PROCESS, creation_flags, shows_a_console_window,
     };
 
     /// A quiet child is windowless only when this process has no console, the explicit
@@ -111,11 +119,22 @@ mod tests {
                 DETACHED_PROCESS | group,
             ),
         ] {
+            let got = creation_flags(console, extra, have);
             assert_eq!(
-                creation_flags(console, extra, have),
-                want,
+                got, want,
                 "{console:?} extra {extra:#x} have_console {have}"
             );
+            assert!(
+                !shows_a_console_window(got, have),
+                "{console:?} extra {extra:#x} have_console {have} must never show a window"
+            );
         }
+        assert!(shows_a_console_window(0, false));
+        assert!(!shows_a_console_window(0, true));
+        assert!(shows_a_console_window(CREATE_NEW_CONSOLE, true));
+        assert!(shows_a_console_window(
+            CREATE_NEW_CONSOLE | CREATE_NO_WINDOW,
+            false
+        ));
     }
 }

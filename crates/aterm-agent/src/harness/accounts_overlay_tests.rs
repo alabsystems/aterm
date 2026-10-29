@@ -321,3 +321,43 @@ fn a_present_link_is_removed_once_the_default_home_has_none_and_a_foreign_one_is
         elsewhere
     );
 }
+
+#[test]
+fn feedback_survey_opt_out_preserves_the_config_and_is_idempotent() {
+    let (_tmp, home, _) = homes();
+    let original = "# the person's settings\ntheme = \"auto\"\nauto_session_title = false\n";
+    let path = home.join("tui.toml");
+    std::fs::write(&path, original).expect("config");
+    disable_feedback_survey(&home).expect("opt out");
+    let edited = std::fs::read_to_string(&path).expect("edited");
+    assert!(
+        edited.contains("disable_feedback_survey = true"),
+        "{edited}"
+    );
+    assert!(edited.contains("# the person's settings"), "{edited}");
+    assert!(edited.contains("theme = \"auto\""), "{edited}");
+    assert!(edited.contains("auto_session_title = false"), "{edited}");
+    disable_feedback_survey(&home).expect("already off");
+    assert_eq!(std::fs::read_to_string(&path).expect("again"), edited);
+
+    let invalid = "disable_feedback_survey = [\n";
+    std::fs::write(&path, invalid).expect("invalid fixture");
+    assert!(disable_feedback_survey(&home).is_err());
+    assert_eq!(std::fs::read_to_string(&path).expect("preserved"), invalid);
+}
+
+#[test]
+fn feedback_survey_opt_out_follows_the_overlay_link() {
+    let (_tmp, default_home, overlay) = homes();
+    ensure(Cli::Kimi.accounts().seam, &overlay, &default_home).expect("overlay");
+    disable_feedback_survey(&overlay).expect("opt out");
+    assert_eq!(
+        std::fs::read_link(overlay.join("tui.toml")).expect("link kept"),
+        default_home.join("tui.toml")
+    );
+    assert!(
+        std::fs::read_to_string(default_home.join("tui.toml"))
+            .expect("default config")
+            .contains("disable_feedback_survey = true")
+    );
+}

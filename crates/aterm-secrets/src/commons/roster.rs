@@ -6,10 +6,11 @@
 
 use super::{
     binding::{BINDING_LEN, Binding, Possession},
-    constraints::{Constraints, Fact, key_commitment},
+    constraints::{Constraints, Fact, LEGACY_MAX_FACTS, MAX_FACTS, key_commitment},
+    hearing::Gate,
     journal::{Current, Journal, State, Trust},
     membership::{Certificate, Eligibility},
-    node::{Edit, Node},
+    node::{Edit, MAX_NODE, MAX_PAYLOAD, Node},
 };
 use crate::{
     Error, Result, SecretBytes,
@@ -22,12 +23,42 @@ use ring::{
 use std::collections::BTreeSet;
 use zeroize::Zeroizing;
 
-/// One fact per member plus the epoch fact fits the control node's 64-fact cap.
-pub const MAX_MEMBERS: usize = 63;
-const MAX_CAPSULE: usize = 2048;
+/// One fact per member plus the epoch fact fills a control node's [`MAX_FACTS`]; the roster
+/// fits [`MAX_PAYLOAD`] and its node [`MAX_NODE`] with room to spare (checked below).
+pub const MAX_MEMBERS: usize = MAX_FACTS - 1;
+/// The roster bound of 0.145 and earlier. A larger roster is written only through [`Gate`].
+pub const LEGACY_MAX_MEMBERS: usize = LEGACY_MAX_FACTS - 1;
+/// Binary age's version line and MAC line, and one X25519 stanza (a 54-byte share line and a
+/// 44-byte body line).
+const AGE_LINES: usize = 22 + 48;
+const AGE_STANZA: usize = 98;
+/// A capsule is binary age to one recipient: its header, the payload nonce, the plaintext and
+/// one tag. Every capsule written so far has exactly this size
+/// (`tests::one_recipient_capsule_is_measured`).
+const MAX_CAPSULE: usize = AGE_LINES + AGE_STANZA + 16 + CAPSULE_PLAIN + 16;
 const HEADER: usize = 4 + 16 + 32 + 8 + 32 + 2;
 const CAPSULE_PLAIN: usize = 4 + 32 + BINDING_LEN + 1 + 8 + 32;
 const MAX_ROSTER: usize = HEADER + MAX_MEMBERS * (BINDING_LEN + 1 + 2 + MAX_CAPSULE);
+/// The largest roster node: its fixed fields and signature, every fact a binding, and the
+/// largest roster sealed to every member in 64 KiB chunks.
+const MAX_ROSTER_NODE: usize = 4
+    + 16
+    + 32
+    + 2
+    + 32
+    + 32
+    + 8
+    + 2
+    + 4
+    + 64
+    + MAX_FACTS * (1 + BINDING_LEN)
+    + AGE_LINES
+    + MAX_MEMBERS * AGE_STANZA
+    + 16
+    + MAX_ROSTER
+    + MAX_ROSTER.div_ceil(64 * 1024) * 16;
+const _: () = assert!(MAX_ROSTER <= MAX_PAYLOAD && MAX_ROSTER_NODE <= MAX_NODE);
+const _: () = assert!(MAX_MEMBERS >= 128 && MAX_MEMBERS <= u16::MAX as usize);
 
 /// Data privileges only; the root authority and terminal-drive grants are separate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -287,6 +318,8 @@ pub struct Access {
     members: Vec<Member>,
     local: usize,
     key: SecretBytes,
+    log_paths: Option<crate::client::Paths>,
+    log_heads_digest: Option<[u8; 32]>,
 }
 impl Access {
     pub const fn head(&self) -> &[u8; 32] {
@@ -298,6 +331,10 @@ impl Access {
     }
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+    /// Whether this observation derives from the peer-synced membership log (`F18`).
+    pub const fn is_log_backed(&self) -> bool {
+        self.log_paths.is_some()
     }
     pub fn members(&self) -> &[Member] {
         &self.members
@@ -325,12 +362,34 @@ impl Access {
         )
     )]
     pub fn is_current(&self, journal: &Journal) -> bool {
-        let current = journal.trust() == self.trust
-            && journal.state()
-                == (State::Ready {
-                    head: self.head,
-                    basis: self.basis,
-                });
+        let current = if let Some(paths) = &self.log_paths {
+            journal.trust() == self.trust
+                && crate::client::read_identity(paths)
+                    .ok()
+                    .flatten()
+                    .filter(|id| id.recipient() == self.local().binding.recipient())
+                    .and_then(|id| {
+                        let (log, heads_digest) =
+                            crate::client::trusted_commons_log(paths, self.trust)
+                                .ok()
+                                .flatten()?;
+                        if self.log_heads_digest == Some(heads_digest) {
+                            return Some(true);
+                        }
+                        current_from_loaded_log(paths, self.trust, &id, &log, heads_digest)
+                            .ok()
+                            .flatten()
+                            .map(|fresh| fresh.head == self.head && fresh.basis == self.basis)
+                    })
+                    .unwrap_or(false)
+        } else {
+            journal.trust() == self.trust
+                && journal.state()
+                    == (State::Ready {
+                        head: self.head,
+                        basis: self.basis,
+                    })
+        };
         aterm_db_core::roster_access(current, true, true)
     }
     /// Refuse a stale observation, a fork, missing history or failed durability
@@ -346,6 +405,95 @@ impl Access {
             ));
         }
         Ok(use_key(self.key.as_slice().try_into().unwrap()))
+    }
+
+    pub(super) fn historical_from_log(
+        &self,
+        journal: &Journal,
+        identity: &Identity,
+        basis: [u8; 32],
+    ) -> Result<Option<Historical>> {
+        type HistoricalCacheKey = (Trust, [u8; 32], [u8; 32], [u8; 32]);
+        type HistoricalCacheVal = Option<(u64, Vec<Member>, [u8; 32])>;
+        static HISTORICAL_CACHE: std::sync::Mutex<
+            std::collections::VecDeque<(HistoricalCacheKey, HistoricalCacheVal)>,
+        > = std::sync::Mutex::new(std::collections::VecDeque::new());
+
+        let Some(paths) = &self.log_paths else {
+            return Ok(None);
+        };
+        if !self.is_current(journal) || self.local().binding.recipient() != identity.recipient() {
+            return Err(Error::new(
+                "historical access requires the current local membership",
+            ));
+        }
+        let Some((log, heads_digest)) = crate::client::trusted_commons_log(paths, self.trust)?
+        else {
+            return Err(Error::new("Commons membership log is unavailable"));
+        };
+        let cache_key = (self.trust, identity.recipient().0, heads_digest, basis);
+        if let Ok(cache) = HISTORICAL_CACHE.lock()
+            && let Some((_, cached)) = cache.iter().find(|(k, _)| *k == cache_key)
+        {
+            return Ok(cached
+                .as_ref()
+                .map(|(generation, members, key_bytes)| Historical {
+                    trust: self.trust,
+                    head: self.head,
+                    basis: self.basis,
+                    source: basis,
+                    generation: *generation,
+                    members: members.clone(),
+                    key: SecretBytes::from(key_bytes.as_slice()),
+                    log_paths: Some(paths.clone()),
+                    log_heads_digest: Some(heads_digest),
+                    local_recipient: Some(self.local().binding.recipient()),
+                }));
+        }
+        let Some((generation, bindings)) = log.historical_commons_writers(&basis) else {
+            if let Ok(mut cache) = HISTORICAL_CACHE.lock() {
+                if cache.len() >= 16 {
+                    cache.pop_front();
+                }
+                cache.push_back((cache_key, None));
+            }
+            return Ok(None);
+        };
+        let Some(key) = log.unwrap_commons_epoch(&basis, identity)? else {
+            return Err(Error::new(
+                "historical Commons epoch is not wrapped to this device",
+            ));
+        };
+        let mut members: Vec<Member> = bindings
+            .into_iter()
+            .filter(|b| {
+                *b.network() == self.trust.network && *b.authority() == self.trust.authority
+            })
+            .map(|binding| Member {
+                binding,
+                role: Role::Writer,
+            })
+            .collect();
+        members.sort_by(|a, b| a.binding.cmp(&b.binding));
+        members.dedup_by(|a, b| a.binding.actor() == b.binding.actor());
+        if let Ok(mut cache) = HISTORICAL_CACHE.lock() {
+            if cache.len() >= 16 {
+                cache.pop_front();
+            }
+            cache.push_back((cache_key, Some((generation, members.clone(), *key))));
+        }
+        Ok(Some(Historical {
+            trust: self.trust,
+            head: self.head,
+            basis: self.basis,
+            source: basis,
+            generation,
+            members,
+            key: SecretBytes::from(key.as_slice()),
+            log_paths: Some(paths.clone()),
+            log_heads_digest: Some(heads_digest),
+            local_recipient: Some(self.local().binding.recipient()),
+        }))
     }
 
     /// Open an older selected roster using the same recipient. This validates
@@ -434,7 +582,11 @@ impl Access {
                 "historical access requires the current local membership",
             ));
         }
-        let snapshot = journal.historical(basis, identity)?;
+        let snapshot = if self.is_log_backed() {
+            journal.retained_historical(basis, identity)?
+        } else {
+            journal.historical(basis, identity)?
+        };
         let past = validate(journal, identity, snapshot, false)?;
         Ok(Historical {
             trust: self.trust,
@@ -444,6 +596,9 @@ impl Access {
             generation: past.generation,
             members: past.members,
             key: past.key,
+            log_paths: self.log_paths.clone(),
+            log_heads_digest: self.log_heads_digest,
+            local_recipient: Some(self.local().binding.recipient()),
         })
     }
 
@@ -460,7 +615,11 @@ impl Access {
                 "history handoff requires current local membership",
             ));
         }
-        let snapshot = journal.historical_with_key(basis, file_key)?;
+        let snapshot = if self.is_log_backed() {
+            journal.retained_historical_with_key(basis, file_key)?
+        } else {
+            journal.historical_with_key(basis, file_key)?
+        };
         let roster = decode(snapshot.payload.as_slice())?;
         validate_evidence(journal, &snapshot, &roster, key, false)?;
         Ok(Historical {
@@ -471,6 +630,9 @@ impl Access {
             generation: roster.generation,
             members: roster.capsules.into_iter().map(|c| c.member).collect(),
             key: SecretBytes::from(key.as_slice()),
+            log_paths: self.log_paths.clone(),
+            log_heads_digest: self.log_heads_digest,
+            local_recipient: Some(self.local().binding.recipient()),
         })
     }
 }
@@ -487,6 +649,9 @@ pub struct Historical {
     generation: u64,
     members: Vec<Member>,
     key: SecretBytes,
+    log_paths: Option<crate::client::Paths>,
+    log_heads_digest: Option<[u8; 32]>,
+    local_recipient: Option<crate::age::Recipient>,
 }
 impl Historical {
     pub const fn source(&self) -> &[u8; 32] {
@@ -504,19 +669,151 @@ impl Historical {
         journal: &Journal,
         use_key: impl FnOnce(&[u8; 32]) -> T,
     ) -> Result<T> {
-        if journal.trust() != self.trust
-            || journal.state()
-                != (State::Ready {
-                    head: self.head,
-                    basis: self.basis,
-                })
-        {
+        let current = if let Some(paths) = &self.log_paths {
+            journal.trust() == self.trust
+                && crate::client::read_identity(paths)
+                    .ok()
+                    .flatten()
+                    .filter(|id| {
+                        self.local_recipient
+                            .is_none_or(|expected| id.recipient() == expected)
+                    })
+                    .and_then(|id| {
+                        let (log, heads_digest) =
+                            crate::client::trusted_commons_log(paths, self.trust)
+                                .ok()
+                                .flatten()?;
+                        if self.log_heads_digest == Some(heads_digest) {
+                            return Some(true);
+                        }
+                        current_from_loaded_log(paths, self.trust, &id, &log, heads_digest)
+                            .ok()
+                            .flatten()
+                            .map(|fresh| fresh.head == self.head && fresh.basis == self.basis)
+                    })
+                    .unwrap_or(false)
+        } else {
+            journal.trust() == self.trust
+                && journal.state()
+                    == (State::Ready {
+                        head: self.head,
+                        basis: self.basis,
+                    })
+        };
+        if !current {
             return Err(Error::new(
                 "historical key observation is no longer current",
             ));
         }
         Ok(use_key(self.key.as_slice().try_into().unwrap()))
     }
+}
+
+/// Observe current Commons membership and network key from the peer-synced membership log (`F18`).
+pub(super) fn current_from_loaded_log(
+    paths: &crate::client::Paths,
+    trust: Trust,
+    identity: &Identity,
+    log: &crate::membership_log::Log,
+    heads_digest: [u8; 32],
+) -> Result<Option<Access>> {
+    type AccessCacheKey = (Trust, [u8; 32], [u8; 32]);
+    type AccessCacheVal = Option<([u8; 32], [u8; 32], u64, Vec<Member>, usize, [u8; 32])>;
+    static ACCESS_CACHE: std::sync::Mutex<
+        std::collections::VecDeque<(AccessCacheKey, AccessCacheVal)>,
+    > = std::sync::Mutex::new(std::collections::VecDeque::new());
+
+    let cache_key = (trust, identity.recipient().0, heads_digest);
+    if let Ok(cache) = ACCESS_CACHE.lock()
+        && let Some((_, cached)) = cache.iter().find(|(k, _)| *k == cache_key)
+    {
+        return Ok(cached
+            .as_ref()
+            .map(
+                |(head, basis, generation, members, local, key_bytes)| Access {
+                    trust,
+                    head: *head,
+                    basis: *basis,
+                    generation: *generation,
+                    members: members.clone(),
+                    local: *local,
+                    key: SecretBytes::from(key_bytes.as_slice()),
+                    log_paths: Some(paths.clone()),
+                    log_heads_digest: Some(heads_digest),
+                },
+            ));
+    }
+    let Some(view) = log.commons_epoch_view(identity)? else {
+        if let Ok(mut cache) = ACCESS_CACHE.lock() {
+            if cache.len() >= 16 {
+                cache.pop_front();
+            }
+            cache.push_back((cache_key, None));
+        }
+        return Ok(None);
+    };
+    let mut members: Vec<Member> = log
+        .membership()
+        .members()
+        .iter()
+        .filter(|(actor, _)| {
+            !log.audience_left_out(&crate::membership_log::EpochAudience::Commons, actor)
+                && !log.audience_left_out(&crate::membership_log::EpochAudience::Everyone, actor)
+        })
+        .map(|(_, m)| Member {
+            binding: m.binding.clone(),
+            role: Role::Writer,
+        })
+        .collect();
+    if members.is_empty() {
+        return Ok(None);
+    }
+    members.sort_by(|a, b| a.binding.cmp(&b.binding));
+    validate_members(trust.network, trust.authority, &members)?;
+    let Some(local) = members
+        .iter()
+        .position(|m| m.binding.recipient() == identity.recipient())
+    else {
+        if let Ok(mut cache) = ACCESS_CACHE.lock() {
+            if cache.len() >= 16 {
+                cache.pop_front();
+            }
+            cache.push_back((cache_key, None));
+        }
+        return Ok(None);
+    };
+    let mut hash = aterm_digest::Sha256::new();
+    hash.update(b"ALCO2");
+    hash.update(heads_digest);
+    hash.update(view.basis);
+    let head = hash.finalize();
+    if let Ok(mut cache) = ACCESS_CACHE.lock() {
+        if cache.len() >= 16 {
+            cache.pop_front();
+        }
+        cache.push_back((
+            cache_key,
+            Some((
+                head,
+                view.basis,
+                view.generation,
+                members.clone(),
+                local,
+                *view.key,
+            )),
+        ));
+    }
+    Ok(Some(Access {
+        trust,
+        head,
+        basis: view.basis,
+        generation: view.generation,
+        members,
+        local,
+        key: SecretBytes::from(view.key.as_slice()),
+        log_paths: Some(paths.clone()),
+        log_heads_digest: Some(heads_digest),
+    }))
 }
 
 /// Release a member-specific key only after validating the whole current roster,
@@ -654,6 +951,8 @@ fn validate(
         members,
         local,
         key: SecretBytes::from(key.as_slice()),
+        log_paths: None,
+        log_heads_digest: None,
     })
 }
 
@@ -797,15 +1096,12 @@ fn prepare(
 ) -> Result<(Node, Zeroizing<[u8; 32]>)> {
     let root = authority(seed)?;
     validate_members(network, root, &members)?;
-    if retirements.len() > super::constraints::MAX_FACTS
-        || retired_recipients.len() > super::constraints::MAX_FACTS
-    {
+    if retirements.len() > MAX_FACTS || retired_recipients.len() > MAX_FACTS {
         return Err(Error::new("Commons retirement count is out of bounds"));
     }
     let retired: BTreeSet<_> = retirements.iter().copied().collect();
     let retired_recipients: BTreeSet<_> = retired_recipients.iter().copied().collect();
-    if members.len() + 1 + retired.len() + retired_recipients.len() > super::constraints::MAX_FACTS
-    {
+    if members.len() + 1 + retired.len() + retired_recipients.len() > MAX_FACTS {
         return Err(Error::new(
             "Commons retirement and roster exceed the fact bound",
         ));
@@ -877,13 +1173,15 @@ fn prepare(
     ))
 }
 
+/// A genesis stays within what 0.145 reads: before it there is no ledger to open [`Gate`]
+/// with, and the roster grows past [`LEGACY_MAX_MEMBERS`] by enrollment.
 pub(crate) fn create(
     seed: &[u8; 32],
     eligibility: &Eligibility,
     network: [u8; 16],
     enrollments: Vec<Enrollment>,
 ) -> Result<Node> {
-    if enrollments.is_empty() || enrollments.len() > MAX_MEMBERS {
+    if enrollments.is_empty() || enrollments.len() > LEGACY_MAX_MEMBERS {
         return Err(Error::new("Commons enrollment count is out of bounds"));
     }
     let root = authority(seed)?;
@@ -927,6 +1225,37 @@ pub(crate) fn rotate_retiring_recipients(
     grants: Vec<Grant>,
     retirements: &[astream_wire::sync::Actor],
     retired_recipients: &[crate::age::Recipient],
+) -> Result<Node> {
+    rotate_gated(
+        seed,
+        eligibility,
+        journal,
+        grants,
+        retirements,
+        retired_recipients,
+        None,
+    )
+}
+
+/// Whether this control history already holds a node 0.145 refuses. A ready journal has one
+/// head, so every retained node is its ancestor.
+pub(crate) fn crossed(journal: &Journal) -> bool {
+    journal
+        .inventory()
+        .filter_map(|id| journal.node(id))
+        .any(|node| node.facts().len() > LEGACY_MAX_FACTS)
+}
+
+/// [`rotate_retiring_recipients`] that may write a node past the 0.145 caps when `gate` admits
+/// it ([`Gate::admit`]); without `gate` such a node is refused until the history holds one.
+pub(crate) fn rotate_gated(
+    seed: &[u8; 32],
+    eligibility: &Eligibility,
+    journal: &Journal,
+    grants: Vec<Grant>,
+    retirements: &[astream_wire::sync::Actor],
+    retired_recipients: &[crate::age::Recipient],
+    gate: Option<&Gate<'_>>,
 ) -> Result<Node> {
     if grants.is_empty() || grants.len() > MAX_MEMBERS {
         return Err(Error::new("Commons grant count is out of bounds"));
@@ -977,6 +1306,29 @@ pub(crate) fn rotate_retiring_recipients(
         Some(constraints.head()),
         retirements,
         retired_recipients,
+    )?;
+    let State::Ready { basis, .. } = journal.state() else {
+        return Err(Error::new(
+            "roster publication requires a ready control journal",
+        ));
+    };
+    // Every device that reads either roster: the current members, and those this one adds.
+    let mut readers = std::collections::BTreeMap::new();
+    for fact in journal
+        .node(&basis)
+        .into_iter()
+        .flat_map(Node::facts)
+        .chain(node.facts())
+    {
+        if let Fact::Bind { binding } = fact {
+            readers.insert(binding.actor(), binding);
+        }
+    }
+    Gate::admit(
+        gate,
+        node.facts().len(),
+        crossed(journal),
+        readers.into_values(),
     )?;
     let prospective = journal.prospective(&node)?;
     prospective.check_key(generation, &key)?;

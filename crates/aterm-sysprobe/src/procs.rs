@@ -53,6 +53,12 @@ pub struct ProcessReading {
     pub child_cpu_ns: Option<u64>,
     /// Its memory in bytes: macOS `ri_phys_footprint`, Linux `RssAnon + VmSwap`, Windows its private commit; `None` where refused.
     pub footprint: Option<u64>,
+    /// Its pages in physical memory now, bytes: macOS `ri_resident_size`, below its footprint by
+    /// what the kernel compressed or swapped of it and above by the file-backed pages it maps;
+    /// Linux `RssAnon`, its anonymous pages, below its footprint by what was swapped. `None`
+    /// where refused, for an unreaped zombie, for a Linux process read only by `statm`, and
+    /// elsewhere.
+    pub resident: Option<u64>,
     /// Bytes it has read from disk since it started (macOS `ri_diskio_bytesread`: storage reads,
     /// not page-cache hits); `None` where refused, and off macOS.
     pub disk_read: Option<u64>,
@@ -212,21 +218,30 @@ pub fn timebase_of_frequency(hz: u64) -> Option<(u32, u32)> {
     ))
 }
 
-/// The kernel's own Mach timebase `(numer, denom)`: what turns the tick counts the kernel records for a task (`proc_pid_rusage`'s CPU and runnable times, `PROC_PIDTASKINFO`'s `pti_total_*`) into nanoseconds.
+/// The sysctl that answers the kernel's Mach tick rate in hertz (24,000,000 on Apple silicon, natively and under Rosetta 2).
+#[cfg(target_os = "macos")]
+const TICK_FREQUENCY: &std::ffi::CStr = c"hw.tbfrequency";
+
+/// The timebase the kernel counts in, chosen from its two readings: the tick rate `hz` (what `hw.tbfrequency` answered), reduced, when it is a frequency; otherwise `mach()`, this process's `mach_timebase_info`, which is called only then. The tick rate comes first because under Rosetta 2 `mach_timebase_info` reads 1/1 while the kernel still records 24 MHz ticks (docs/measured/rosetta-mac-2026-10-20.md §1).
+#[cfg(any(target_os = "macos", test))]
+fn timebase_from(hz: Option<i64>, mach: impl FnOnce() -> Option<(u32, u32)>) -> Option<(u32, u32)> {
+    hz.and_then(|hz| u64::try_from(hz).ok())
+        .and_then(timebase_of_frequency)
+        .or_else(mach)
+}
+
+/// The kernel's own Mach timebase `(numer, denom)`: what turns the tick counts the kernel records for a task (`proc_pid_rusage`'s CPU and runnable times, `PROC_PIDTASKINFO`'s `pti_total_*`) into nanoseconds. Read once: `hw.tbfrequency`'s tick rate, reduced, or this process's `mach_timebase_info` when that sysctl answers no frequency.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn kernel_timebase() -> Option<(u32, u32)> {
     static TB: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
     *TB.get_or_init(|| {
-        crate::macos::sysctl_int(c"hw.tbfrequency")
-            .and_then(|hz| u64::try_from(hz).ok())
-            .and_then(timebase_of_frequency)
-            .or_else(|| {
-                let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
-                // SAFETY: `info` is a writable `mach_timebase_info`.
-                let rc = unsafe { libc::mach_timebase_info(&raw mut info) };
-                (rc == 0 && info.denom != 0).then_some((info.numer, info.denom))
-            })
+        timebase_from(crate::macos::sysctl_int(TICK_FREQUENCY), || {
+            let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
+            // SAFETY: `info` is a writable `mach_timebase_info`.
+            let rc = unsafe { libc::mach_timebase_info(&raw mut info) };
+            (rc == 0 && info.denom != 0).then_some((info.numer, info.denom))
+        })
     })
 }
 
@@ -477,6 +492,7 @@ pub(crate) mod imp {
                 cpu_ns: usage.map(|u| cpu_of(u, numer, denom)),
                 child_cpu_ns: usage.map(|u| child_cpu_of(u, numer, denom)),
                 footprint: usage.map(|u| u.ri_phys_footprint),
+                resident: usage.map(|u| u.ri_resident_size),
                 disk_read: usage.map(|u| u.ri_diskio_bytesread),
                 disk_written: usage.map(|u| u.ri_diskio_byteswritten),
                 name: String::from_utf8_lossy(&info.comm[..end]).into_owned(),
@@ -625,100 +641,15 @@ mod imp {
 /// Test support (macOS): a CPU-time reader checked against the kernel's own account of the same CPU, for the sweep's tests here and the job probe's (`jobs/tests.rs`).
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) mod stopped_spinner {
-    use std::time::{Duration, Instant};
+    use aterm_spec::wait::MUST_HAPPEN;
 
-    /// `struct rusage` (`<sys/resource.h>`): the two times, then fourteen `long` counters these tests do not read; 144 bytes on Darwin.
-    #[repr(C)]
-    struct Rusage {
-        utime: libc::timeval,
-        stime: libc::timeval,
-        _counters: [libc::c_long; 14],
-    }
-    const _: () = assert!(std::mem::size_of::<Rusage>() == 144);
-    unsafe extern "C" {
-        /// Declared here: aterm-libc does not export it.
-        fn wait4(
-            pid: libc::pid_t,
-            status: *mut libc::c_int,
-            options: libc::c_int,
-            usage: *mut Rusage,
-        ) -> libc::pid_t;
-    }
-
-    /// Keeps the spinner owned until a successful manual reap.
-    struct OwnedSpinner(Option<aterm_uds::spawnfd::Child>);
-
-    impl OwnedSpinner {
-        fn forget_reaped(&mut self) {
-            if let Some(child) = self.0.take() {
-                std::mem::forget(child);
-            }
-        }
-    }
-
-    impl Drop for OwnedSpinner {
-        fn drop(&mut self) {
-            if let Some(child) = self.0.as_mut()
-                && matches!(child.try_wait(), Ok(None))
-                && child.kill().is_ok()
-            {
-                let _ = child.wait();
-            }
-        }
-    }
-
-    /// Spins a `/bin/sh` child until `ready(pid)`, stops it, hands its pid to `read` while it is stopped, then kills it and reaps it with `wait4`.
+    /// [`aterm_uds::deadline::spin_stopped`] under [`MUST_HAPPEN`]: spins a child until `cpu_ns(pid)` reads at least `min_ns`, failing by name with the last reading if it does not, stops it, hands its pid to `read` while it is stopped, then kills and reaps it, answering `read`'s value and the CPU time, in nanoseconds, that the reap's `wait4` rusage counts for it.
     pub(crate) fn read<T>(
-        mut ready: impl FnMut(u32) -> bool,
+        min_ns: u64,
+        cpu_ns: impl FnMut(u32) -> Option<u64>,
         read: impl FnOnce(u32) -> T,
     ) -> (T, u64) {
-        let micros = |t: libc::timeval| {
-            u64::try_from(t.tv_sec).expect("non-negative") * 1_000_000
-                + u64::try_from(t.tv_usec).expect("non-negative")
-        };
-        let child = aterm_uds::spawnfd::command("/bin/sh")
-            .args(["-c", "while :; do :; done"])
-            .spawn()
-            .expect("spawn a spinning shell");
-        let id = child.id();
-        let mut child = OwnedSpinner(Some(child));
-        let pid = libc::pid_t::try_from(id).expect("pid");
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while !ready(id) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        // SAFETY: `kill` takes no pointers; `pid` is this test's unreaped child.
-        let stop = unsafe { libc::kill(pid, libc::SIGSTOP) };
-        let mut stopped: libc::c_int = 0;
-        // SAFETY: `stopped` is a live out-param; `pid` is this test's own child, and nothing else in this process waits on it.
-        let waited = unsafe { libc::waitpid(pid, &mut stopped, libc::WUNTRACED) };
-        if waited == pid && (libc::WIFEXITED(stopped) || libc::WIFSIGNALED(stopped)) {
-            child.forget_reaped();
-        }
-        assert!(
-            libc::WIFSTOPPED(stopped),
-            "read while stopped: {stopped:#x}"
-        );
-        let answer = read(id);
-        // SAFETY: as above; a stopped child is still this test's to kill.
-        let kill = unsafe { libc::kill(pid, libc::SIGKILL) };
-        let mut status: libc::c_int = 0;
-        let mut usage = std::mem::MaybeUninit::<Rusage>::zeroed();
-        // SAFETY: live out-params of the declared layouts; a successful reap disarms the handle below before any assertion or drop.
-        let reaped = unsafe { wait4(pid, &mut status, 0, usage.as_mut_ptr()) };
-        if reaped == pid {
-            child.forget_reaped();
-        }
-        assert_eq!(
-            (stop, waited, kill, reaped),
-            (0, pid, 0, pid),
-            "stop, wait for the stop, kill, reap"
-        );
-        // SAFETY: zeroed, then filled by the successful `wait4` above; every field is a plain integer.
-        let usage = unsafe { usage.assume_init() };
-        let kernel = (micros(usage.utime) + micros(usage.stime)) * 1_000;
-        assert!(kernel > 0, "the child ran");
-        (answer, kernel)
+        aterm_uds::deadline::spin_stopped(min_ns, cpu_ns, read, MUST_HAPPEN)
     }
 
     /// Whether `read` is within 2x of `kernel`, either way: far inside a Mach tick factor (125/3 on Apple silicon).
@@ -739,6 +670,9 @@ mod tests {
         assert_eq!(priority_result(-1, 3), Err(3));
     }
 
+    /// This process's own reading has its scheduling, its CPU classes scaled by the timebase,
+    /// and the pages it holds in physical memory now (`ri_resident_size`), which a live process
+    /// running this test has. NEGATIVE CONTROL: a reading that left `resident` unread is `None`.
     #[cfg(target_os = "macos")]
     #[test]
     fn own_scheduling_is_read_and_cpu_classes_are_scaled() {
@@ -748,6 +682,11 @@ mod tests {
             .into_iter()
             .find(|p| p.pid == std::process::id())
             .unwrap();
+        assert!(
+            mine.resident.is_some_and(|r| r > 0),
+            "a live process has pages in memory: {:?}",
+            mine.resident
+        );
         let s = mine
             .scheduling
             .expect("a live Darwin process has scheduling readings");
@@ -758,7 +697,15 @@ mod tests {
             .expect("kernel timebase")
             .expect("own rusage classes");
         assert!(ns.iter().any(|n| *n > 0));
-        assert!(ns.iter().copied().sum::<u64>() <= mine.cpu_ns.unwrap());
+        // The kernel charges the QoS classes on its own clock, apart from user plus system
+        // time: a binary started outside cargo books its first millisecond to `default` and
+        // its classes sum a few percent over its CPU time. Both go through the same timebase,
+        // so a dropped or doubled scaling (125/3 on Apple silicon) shows as a factor of ~40.
+        let (classes, cpu) = (ns.iter().copied().sum::<u64>(), mine.cpu_ns.unwrap());
+        assert!(
+            classes <= cpu * 4 && cpu <= classes * 4,
+            "classes {classes} ns, cpu {cpu} ns"
+        );
     }
 
     #[test]
@@ -878,6 +825,34 @@ mod tests {
         assert_eq!(timebase_of_frequency(u64::MAX), None, "terms past u32");
     }
 
+    /// The timebase is the tick rate's whenever `hw.tbfrequency` answers a frequency, and this process's `mach_timebase_info` only when it does not. The inputs are Rosetta 2's, as measured on this Mac (docs/measured/rosetta-mac-2026-10-20.md §1): `hw.tbfrequency` says 24,000,000 and `mach_timebase_info` 1/1, while the kernel's CPU times are in 24 MHz ticks, so a choice of mach's 1/1 reads them 3/125 of the truth (§3 (b)). Natively the two readings agree, so a live reading cannot tell the order apart; these inputs do, on any host.
+    #[test]
+    fn the_tick_rate_chooses_the_timebase_before_mach_timebase_info() {
+        let rosetta = || Some((1, 1));
+        assert_eq!(timebase_from(Some(24_000_000), rosetta), Some((125, 3)));
+        assert_eq!(timebase_from(None, rosetta), Some((1, 1)), "no answer");
+        assert_eq!(
+            timebase_from(Some(0), rosetta),
+            Some((1, 1)),
+            "no frequency"
+        );
+    }
+
+    /// The sysctl [`kernel_timebase`] reads answers a frequency on macOS (natively and under Rosetta 2, docs/measured/rosetta-mac-2026-10-20.md §1). A misspelt name would answer nothing, and the timebase would fall back to `mach_timebase_info` unseen: right natively, 125/3 too small under Rosetta.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_tick_rate_sysctl_answers_a_frequency() {
+        let hz = crate::macos::sysctl_integer_result(TICK_FREQUENCY)
+            .unwrap_or_else(|errno| panic!("{TICK_FREQUENCY:?} answers (errno {errno})"));
+        assert!(
+            u64::try_from(hz)
+                .ok()
+                .and_then(timebase_of_frequency)
+                .is_some(),
+            "{TICK_FREQUENCY:?} answers a frequency: {hz}"
+        );
+    }
+
     /// The sweep's CPU time is the kernel's, in nanoseconds, natively or under Rosetta: a stopped
     /// spinning child reads within 2x of what `wait4` reports for it.
     #[cfg(target_os = "macos")]
@@ -889,7 +864,7 @@ mod tests {
                 .and_then(|s| s.procs.into_iter().find(|p| p.pid == pid))
                 .and_then(|p| p.cpu_ns)
         };
-        let (swept_ns, kernel) = read(|pid| swept(pid).is_some_and(|ns| ns >= 50_000_000), swept);
+        let (swept_ns, kernel) = read(50_000_000, swept, swept);
         let swept_ns = swept_ns.expect("the sweep reads its own child");
         assert!(
             within_2x(swept_ns, kernel),

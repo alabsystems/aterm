@@ -39,6 +39,7 @@ mod caret_letter;
 mod companion;
 mod custody;
 mod emit;
+pub mod glass_yield;
 mod icon_shade;
 mod ink_ledger;
 mod light_body;
@@ -63,6 +64,7 @@ pub use caret_letter::CaretLetterLaw;
 pub(crate) use caret_letter::caret_letter_min_contrast;
 pub use companion::*;
 pub use custody::*;
+pub(crate) use emit::drop_cut_particle;
 use ink_ledger::BandLifts;
 pub(crate) use ink_ledger::InkLedger;
 pub use ink_ledger::OverInkTier;
@@ -114,6 +116,26 @@ struct Particle {
     hue: f32,
     cov_scale: f32,
     born: Instant,
+    /// The effects box's edge cut it once, so it is left out whole for the
+    /// rest of its life ([`CursorGlow::emit_particles`]). Carried by the
+    /// particle, the latch moves with it through a scroll, which rewrites
+    /// `y0`, and holds out no sibling born beside it: keyed on its birth and
+    /// origin, a drop the edge cut came back after an Enter on the last row
+    /// scrolled it, and Water's spray and Laser's sparks, born at one point,
+    /// went out together when one of them met the edge (settings demo round
+    /// 3's review).
+    edge_cut: bool,
+}
+
+impl Particle {
+    /// Where the particle set out, its birth and origin: the key the edge's
+    /// latch was held by, kept for a test's negative control
+    /// ([`CursorGlow::set_edge_cut_by_origin`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    fn origin(&self) -> (Instant, u32, u32) {
+        (self.born, self.x0.to_bits(), self.y0.to_bits())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -257,6 +279,18 @@ struct Bolt {
     crackle: bool,
 }
 
+/// How a point of a bolt's channel is laid ([`CursorGlow::emit_bolts`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BoltLay {
+    /// In the air, at the bolt's light.
+    Air,
+    /// Over the letters, held to the over-ink ceiling.
+    Over,
+    /// Not lit: a stretch of a strike's channel in the air between two runs
+    /// over the letters on a dim page, whose letters take none of its light.
+    Unlit,
+}
+
 struct OutgoingFade {
     engine: Box<CursorGlow>,
     cfg: GlowConfig,
@@ -334,6 +368,24 @@ pub struct CursorGlow {
     /// ([`Self::set_dark_rim_fragments`]).
     #[cfg(any(test, debug_assertions))]
     dark_rim_fragments: bool,
+    /// A test's negative control: a particle the effects box cuts is drawn
+    /// cut ([`Self::set_motes_cut`]).
+    #[cfg(any(test, debug_assertions))]
+    motes_cut: bool,
+    /// A test's negative control: the edge's latch is held by each cut
+    /// particle's birth and origin ([`Particle::origin`]), not by the particle
+    /// ([`Self::set_edge_cut_by_origin`]).
+    #[cfg(any(test, debug_assertions))]
+    edge_cut_by_origin: Option<Vec<(Instant, u32, u32)>>,
+    /// A test's negative control: a particle the edge cut is judged afresh
+    /// each frame ([`Self::set_edge_cut_each_frame`]).
+    #[cfg(any(test, debug_assertions))]
+    edge_cut_each_frame: bool,
+    /// A test's negative control: a light that rises past the effects box's
+    /// top is cut flat there by the box's clip, as it was, not laid shorter
+    /// inside it ([`Self::set_rise_cut`], [`RISE_CLEAR_PX`]).
+    #[cfg(any(test, debug_assertions))]
+    rise_cut: bool,
     /// The birth of the dark landing ring whose rim has kept too little of
     /// its whole light to be drawn ([`RIM_SHOWN_SHARE`]): hidden once, that
     /// ring's rim stays hidden for the rest of its life.
@@ -361,6 +413,9 @@ pub struct CursorGlow {
     last_licensed_row: Option<(u16, Instant)>,
     hand_row: Option<HandRow>,
     unowned_caret: Option<UnownedCaret>,
+    composer_insert_frame: bool,
+    composer_entry_at: Option<Instant>,
+    composer_boundary: Option<Instant>,
     newline_hint: Option<Instant>,
     reflow_hint: Option<Instant>,
     kill_hint: Option<Instant>,
@@ -409,7 +464,7 @@ pub struct CursorGlow {
     water_seen: Vec<u64>,
     water_run: Vec<BeamVertex>,
     bolt_verts: Vec<BeamVertex>,
-    bolt_channel: Vec<(f32, f32, f32, bool)>,
+    bolt_channel: Vec<(f32, f32, f32, BoltLay)>,
     beam_scratch: BeamScratch,
     ink_ledger: InkLedger,
     /// The frame's last word on legibility ([`Self::guard_letters`]).
@@ -454,6 +509,16 @@ pub struct CursorGlow {
     /// page ([`push_night_ground`]; looks8 K5/K6's negative control).
     #[cfg(test)]
     night_ground_off: bool,
+    /// Test-only: a night-grounded page's rail is laid straight over the
+    /// page, not page-matched ([`bed::BedScratch::rail_page`]; looks10 L11's
+    /// negative control).
+    #[cfg(test)]
+    rail_unmatched: bool,
+    /// Test-only: the page-matched rail's lights are laid at the least
+    /// opacity whatever their colour's hue ([`raster::page_matched_held`];
+    /// looks10 round 3's hue ruling's negative control).
+    #[cfg(test)]
+    rail_hue_free: bool,
     /// Test-only: Water lays no bed on a lit page ([`bed::BedShape::WATER_LIT`];
     /// looks8 K4's negative control).
     #[cfg(test)]
@@ -465,6 +530,34 @@ pub struct CursorGlow {
     /// has left (looks8 round 2's K4).
     #[cfg(test)]
     water_rail_any_row: bool,
+    /// A test's negative control: Water's lit rail a whole crisp sine in the
+    /// rail's saturated ink, as looks8 laid it (looks9 Q3,
+    /// [`bed::BedShape::foamless`]).
+    #[cfg(test)]
+    water_rail_crisp: bool,
+    /// A test's negative control: Water's foam the pale sea-foam aqua with
+    /// a steep top looks9 laid ([`bed::BedShape::sea_foam`]; looks10 L5).
+    #[cfg(test)]
+    water_foam_pale: bool,
+    /// A test's negative control: Water's foam as looks9 round 1 laid it, a
+    /// dash-dot rule (looks9 round 2's Q3; [`bed::BedScratch::foam_even`]).
+    #[cfg(test)]
+    water_foam_even: bool,
+    /// A test's negative control: Water's foam's last arc whole into the
+    /// caret, cut flat at its edge, as looks9 round 1 laid it (looks9 round
+    /// 2's Q3; [`bed::BedScratch::foam_head_cut`]).
+    #[cfg(test)]
+    water_foam_head_cut: bool,
+    /// A test's negative control: Water's foam without its body of water,
+    /// its crests and droplets alone, as looks9 round 2 laid it (looks9
+    /// round 3's Q3; [`bed::BedScratch::foam_bodiless`]).
+    #[cfg(test)]
+    water_foam_bodiless: bool,
+    /// A test's negative control: Water's body of water takes its whole
+    /// depth under a row bare of letters whatever its ground, a filled row
+    /// (a selection, a bar) too ([`bed::BedScratch::foam_air`]).
+    #[cfg(test)]
+    water_body_text_only: bool,
     /// A test's negative control: Water's drops the faint foam they were on
     /// a dark page (looks8 round 2's K4).
     #[cfg(test)]
@@ -474,9 +567,160 @@ pub struct CursorGlow {
     /// [`Self::COMET_DARK_DUST_AIR`], round 3's).
     #[cfg(test)]
     comet_dust_grey: bool,
+    /// A test's negative control: Comet's dark dust seated at one depth a
+    /// side, floating into a row with no letter near, as looks8 laid it
+    /// (looks9 Q1 and Q2).
+    #[cfg(test)]
+    comet_dust_regimented: bool,
+    /// A test's negative control: Comet's dark plume as looks9 round 1 laid
+    /// it, an even band a side, every grain drawn to the end of its life at
+    /// one size, no deeper than the row beside it (looks9 round 2's Q2).
+    #[cfg(test)]
+    comet_plume_even: bool,
+    /// A test's negative control: Comet's dark plume as looks9 round 2 laid
+    /// it, every fresh grain at the near edge of its air and spread only by
+    /// its drift ([`Self::COMET_DARK_SEED`], looks9 round 3's comet split).
+    #[cfg(test)]
+    comet_plume_unseeded: bool,
+    /// A test's negative control: Comet's dark plume in one row of air as
+    /// looks9 round 3 first laid it, each grain seeded but drifting on to
+    /// the air's end, beneath the tail by the largest grain's reach (looks9
+    /// round 3's comet split; [`Self::comet_plume_unseeded`]'s successor).
+    #[cfg(test)]
+    comet_plume_drifting: bool,
+    /// A test's negative control: every lettered cell of the companion's
+    /// keep-out a whole cell tall, a short glyph's blank top too (looks9 round
+    /// 2's Q9; [`super::emit::SHORT_GLYPH_TOP_CH`]).
+    #[cfg(test)]
+    letters_whole_cells: bool,
+    /// A test's negative control: Comet's icy tail held to the leading under
+    /// a bare row too ([`bed::BedScratch::rail_air_room`], looks9 round 2's Q2).
+    #[cfg(test)]
+    comet_tail_hairline: bool,
+    /// A test's negative control: Comet's icy tail takes its whole depth
+    /// over a row bare of letters whatever its ground, a selection's or a
+    /// powerline bar's too, as looks9 round 2 read it
+    /// ([`bed::BedScratch::rail_air_text_only`]).
+    #[cfg(test)]
+    comet_tail_text_only: bool,
+    /// A test's negative control: Sparkle's dark shower drawn round the
+    /// colour wheel, as it was (looks9 Q7; [`Self::sparkle_shower`]).
+    #[cfg(test)]
+    sparkle_wheel: bool,
+    /// A test's negative control: Sparkle's dark shower brought to the
+    /// gold's chroma under a pinned trail colour too, as looks9 Q7 laid it
+    /// ([`Self::shower_gold`]).
+    #[cfg(test)]
+    sparkle_pin_saturated: bool,
+    /// A test's negative control: Laser's sparks and crackles and Water's
+    /// drops laid on a filled row other than the caret's, as they were
+    /// (looks9 Q8, [`Self::keep_crackle_off_bars`]).
+    #[cfg(test)]
+    particles_on_bars: bool,
+    /// A test's negative control: a Laser spark kept off a filled row by its
+    /// head alone, its dash's trail unread (looks9 Q8,
+    /// [`Self::emit_particles`]).
+    #[cfg(test)]
+    laser_spark_head_only: bool,
+    /// A test's negative control: a Laser strike's forks and channel laid
+    /// as forged, a fork cut at its pane's edge to a fragment (looks9 round
+    /// 2's Q8, [`Self::keep_strike_in_grid`]).
+    #[cfg(test)]
+    strike_forks_cut: bool,
+    /// A test's negative control: a Laser crackle that meets a bar or its
+    /// pane's edge turned about its root's row (or flattened into it), as
+    /// looks9 round 2 laid it, not dropped (looks9 round 3's Q8,
+    /// [`Self::keep_crackle_off_bars`]).
+    #[cfg(test)]
+    crackle_turned: bool,
+    /// A test's negative control: a Laser crackle burns from its root out
+    /// to its tip, as a strike does, leaving its tip alone in the air
+    /// (looks10 L8, [`Self::emit_bolts`]).
+    #[cfg(test)]
+    crackle_burns_outward: bool,
+    /// A test's negative control: a Laser crackle burns back from its tip
+    /// into its root, as looks10 round 1 burnt it, its root's last stub a
+    /// lone dash under the line (round 2's L8, [`Self::emit_bolts`]).
+    #[cfg(test)]
+    crackle_burns_back: bool,
+    /// A test's negative control: a Laser crackle forged in two rounds of
+    /// midpoint displacement whatever its length, as it was until looks10,
+    /// four straight spans that read as a bent wire, not lightning
+    /// ([`Self::spawn_bolt`]).
+    #[cfg(test)]
+    crackle_two_rounds: bool,
+    /// A test's negative control: a Laser crackle rooted at its typed cell's
+    /// centre at any angle, as it was until looks10 round 2, its root hidden
+    /// among the letters ([`Self::spawn_lightning`]).
+    #[cfg(test)]
+    crackle_rooted_in_letters: bool,
+    /// A test's negative control: a Laser crackle's knots kicked by any
+    /// amount either way, the kick halving each round, as a strike's are and
+    /// as a crackle's were until looks10 round 2: a smooth arc, a bent wire
+    /// in the air ([`Self::spawn_bolt`]).
+    #[cfg(test)]
+    crackle_smooth_kicks: bool,
+    /// A test's negative control: a Laser strike's fork drawn wherever it
+    /// lies, over the letters too, as it was until looks10 round 3: the
+    /// guard cut its run over them and left its tip alone in the air
+    /// ([`Self::emit_bolts`]).
+    #[cfg(test)]
+    strike_forks_on_letters: bool,
+    /// A test's negative control: a stretch of a Laser strike's channel in
+    /// the air between two runs over the letters lit whole, as it was until
+    /// looks10 round 3: a piece apart from both carets ([`Self::emit_bolts`]).
+    #[cfg(test)]
+    strike_islands_lit: bool,
+    /// A test's negative control: a Laser strike's channel kept inside its
+    /// grid by a fork's girth, as it was until looks10 round 3: its corona,
+    /// twice as thick, stood cut at the grid's bottom edge
+    /// ([`Self::keep_strike_in_grid`]).
+    #[cfg(test)]
+    strike_channel_fork_girth: bool,
+    /// A test's negative control: a Laser strike or crackle kept inside the
+    /// window's grid alone, a split pane's edge inside it unread, as looks9
+    /// round 3 kept it ([`Self::keep_strike_in_grid`]).
+    #[cfg(test)]
+    bolt_window_edge: bool,
+    /// A test's negative control: the light Comet's typing wedge as short as
+    /// looks8 laid it (looks9 Q2, [`Self::COMET_LIGHT_WEDGE_CELLS`]).
+    #[cfg(test)]
+    comet_light_tail_short: bool,
+    /// Test-only: the paper comet's tail an even wedge in its colour alone,
+    /// as looks9 laid it (looks10 L4's negative control).
+    #[cfg(test)]
+    comet_light_tube: bool,
+    /// Test-only: the paper comet's dust seated in its own lettered row's
+    /// leading (as looks9's crosses were), not in the blank row beside it
+    /// (looks10 L4's negative control).
+    #[cfg(test)]
+    comet_dust_in_row: bool,
     /// The frame's night grounds ([`push_night_ground`]), laid first under
     /// the letters.
     night_out: Vec<GlowQuad>,
+    /// The flames' night grounds the tick laid ([`push_night_ground`]),
+    /// held out of the under stream until the frame is grounded
+    /// ([`Self::ground_the_frame`]), after the letter guard.
+    flame_night: Vec<GlowQuad>,
+    /// Test-only: the flames' night grounds join the under stream in the
+    /// tick, before the letter guard, which cuts them over a letter's ring
+    /// (looks10 round 2 WIDEN's negative control).
+    #[cfg(test)]
+    flame_grounds_guarded: bool,
+    /// Test-only: a flame's night ground on a filled cell (a powerline bar)
+    /// is laid past the letter guard too, uncut over the cell's letters
+    /// (looks10 round 2's bar-ground negative control).
+    #[cfg(test)]
+    flame_bar_grounds_unguarded: bool,
+    /// Test-only: a dark flame's trail burns back onto a filled cell (a
+    /// powerline bar) as onto the row's own (looks10 round 2's FIRE IS NEVER
+    /// GREEN negative control).
+    #[cfg(test)]
+    fire_burns_on_filled: bool,
+    /// Test-only: a dark flame's gold cores lay no night ground (looks10
+    /// round 2's negative control for the cores' grounds).
+    #[cfg(test)]
+    fire_cores_ungrounded: bool,
     /// The page, style and colour [`night_ground`] was last solved for, and
     /// its answer.
     night_memo: Option<((u32, GlowStyle, u32), Option<NightGround>)>,
@@ -518,6 +762,49 @@ pub struct CursorGlow {
     /// letters, as it stood (looks7 M6's negative control).
     #[cfg(test)]
     fire_gap_tongues: bool,
+    /// Test-only: a row kept to itself leads at the air's lead
+    /// ([`Self::FIRE_DARK_AIR_LEAD`]), as looks9 led it (looks10 L2's
+    /// negative control).
+    #[cfg(test)]
+    fire_kept_lead_air: bool,
+    /// Test-only: Sparkle's and Fire's dark particles beside no air fly as
+    /// they do over air, into the filled rows that drop them, as looks9 let
+    /// them (looks10 L2's negative control, [`Self::DENSE_SEAT_CELLS`]).
+    #[cfg(test)]
+    dense_seats_off: bool,
+    /// Test-only: a dense row's seat read every frame at the caret's column
+    /// rather than at each particle's birth, as looks10 round 3 read it: a
+    /// caret stepping past a gap in the rows beside it unseated, then
+    /// reseated, every particle the row had seated (the review's negative
+    /// control, [`Self::DENSE_SEAT_CELLS`]).
+    #[cfg(test)]
+    dense_seat_at_caret: bool,
+    /// Test-only: a dense row's seated embers at a random depth, level
+    /// across the row as round 2 laid them (round 3's negative control,
+    /// [`Self::DENSE_EMBER_CLIMB`]).
+    #[cfg(test)]
+    dense_embers_level: bool,
+    /// Test-only: Comet's tail in its own row's foot band as faint as round
+    /// 1 laid it (looks10 L2's negative control,
+    /// [`bed::BedScratch::row_tail_faint`]).
+    #[cfg(test)]
+    comet_row_tail_faint: bool,
+    /// Test-only: Comet's icy tail over air runs whole under its nucleus to
+    /// the caret's far edge, the hard white bar looks9 laid (looks10's
+    /// negative control, [`bed::BedScratch::nucleus_bar`]).
+    #[cfg(test)]
+    comet_nucleus_bar: bool,
+    /// Test-only: a dense row seats no Comet in the air past the caret, as
+    /// round 1 laid it (looks10 round 2's L2 negative control,
+    /// [`Self::COMET_SEAT_CELLS`]).
+    #[cfg(test)]
+    comet_seat_off: bool,
+    /// Test-only: the dense row's Comet seated as round 2 laid it, a needle
+    /// wisp swelling to a small head a third of a cell off the caret, the
+    /// pin (`—•`) round 3's judges saw apart from the caret (round 3's
+    /// negative control, [`Self::COMET_SEAT_TAIL_HALF`]).
+    #[cfg(test)]
+    comet_seat_pinned: bool,
     #[cfg(test)]
     fire_meteor_joined: bool,
     #[cfg(test)]
@@ -530,6 +817,10 @@ pub struct CursorGlow {
     air_runs: Vec<Vec<CometSample>>,
     wedge_runs: Vec<Vec<CometSample>>,
     frame_text: FrameText,
+    /// What the host's face draws of each glyph ([`Self::set_glyph_ink`]): the letter guard
+    /// reads a letter's ink as its raster lays it, not as its colour whole. `None` (no host
+    /// said): every glyph's ink is judged solid.
+    glyph_ink: Option<std::sync::Arc<aterm_render::GlyphInk>>,
     #[cfg(test)]
     light_body_unsolved: bool,
     #[cfg(test)]
@@ -538,12 +829,20 @@ pub struct CursorGlow {
     /// negative control of the root's feather.
     #[cfg(test)]
     fire_light_root_coarse: bool,
-    #[cfg(test)]
-    light_glints: Vec<(f32, f32)>,
     fading: Vec<OutgoingFade>,
     fade_scratch: Vec<GlowQuad>,
     ramp_in_at: Option<Instant>,
     last_cfg: Option<GlowConfig>,
+    /// The frame's light as this tick began (§15.2 1.3): the light a held park's flush draws by,
+    /// in place of the light its stale config arrived with.
+    tick_light: Light,
+    /// The light the Rainbow Kitty's config was last built with (`rk::Config::from_glow`), for
+    /// the host's dark pin. Debug and test builds only.
+    #[cfg(any(test, debug_assertions))]
+    v2_light: Light,
+    /// The light the last flushed park was judged under, for the test that pins it.
+    #[cfg(test)]
+    park_flush_light: Option<Light>,
     dark_settled: bool,
     v2: rk::Engine,
     v2_beams: Vec<BeamVertex>,
@@ -569,6 +868,9 @@ pub struct CursorGlow {
     /// A test's stand-in pet's body box ([`Self::pin_pet_body`]).
     #[cfg(any(test, debug_assertions))]
     pet_body_pinned: Option<(i32, i32, i32, i32)>,
+    /// The flying head's drawn body box this frame, grid pixels
+    /// `(x0, x1, y0, y1)` ([`Self::note_head_body`]).
+    head_body: Option<(i32, i32, i32, i32)>,
     /// A test's negative control: no page veil under the pet's letters.
     #[cfg(any(test, debug_assertions))]
     pet_veil_off: bool,
@@ -627,11 +929,25 @@ pub struct CursorGlow {
     keep_rows_scratch: Vec<(i32, i32, i32, i32)>,
     /// This frame's filled cells' runs, window pixels ([`Self::keep_out_boxes`]).
     keep_filled_scratch: Vec<(i32, i32, i32, i32)>,
+    /// This frame's lettered cells' runs, window pixels ([`Self::keep_out_boxes`]).
+    keep_letters_scratch: Vec<(i32, i32, i32, i32)>,
     /// This frame's probed rows' feet, window pixels ([`Self::foot_boxes`]).
     keep_feet_scratch: Vec<(i32, i32, i32, i32)>,
     /// The grid origin and cell width the last keep-out was laid by, for the
     /// word icons' shade ([`Self::shade_word_icons`]).
     keep_geom: Option<(i32, i32, i32)>,
+    /// The glass this frame laid, as the guard left it (§15.2 1.9,
+    /// [`glass_yield::GlassLaid`]), light only: what the yield cuts.
+    glass_laid: glass_yield::GlassLaid,
+    /// The yield's scratch and caps ([`glass_yield::GlassYield`]), light only.
+    glass_yield: glass_yield::GlassYield,
+    /// The step instant and the report of the last yield that cut
+    /// ([`Self::yield_glass`]), light only.
+    yielded: Option<(Instant, glass_yield::YieldReport)>,
+    /// The step instant whose glass a word publish has yielded ([`Self::yield_glass`]): each
+    /// step's glass is cut once, so a later publish before the next step leaves its input as it
+    /// is. Light only.
+    yield_spent: Option<Instant>,
     /// The word icons' sprite sources, one per [`Self::word_icons`] entry
     /// ([`Self::note_word_icon_sprites`]; empty: each icon is its box).
     word_icon_src: Vec<icon_shade::IconSrc>,
@@ -670,6 +986,16 @@ impl ColourPins {
     };
 }
 
+/// How far inside the effects box's top a rising light's soft top is held, px
+/// ([`Geom::rise_ceiling`]). A light that rises over its row (the rainbow
+/// ribbon's body, Fire's gold cores and its paper tongues) and would reach past
+/// the box, as on the grid's top row with no head band over it (the Settings
+/// card's grid, a pane under a chrome strip), is laid shorter inside the box,
+/// its tapered top whole, where the box's clip cut it flat along the edge;
+/// the box's own top pixel row stays unlit. Its height is geometry, held for
+/// as long as the light stands on that row, so nothing shows and hides with it.
+pub(crate) const RISE_CLEAR_PX: f32 = 1.0;
+
 /// Window-space geometry the host passes in (pixels).
 #[derive(Clone, Copy)]
 pub struct Geom {
@@ -706,6 +1032,13 @@ impl Geom {
     #[inline]
     pub(crate) const fn fx_bot(&self) -> i32 {
         self.origin_y as i32 + (self.rows * self.ch) as i32
+    }
+
+    /// The highest window y a rising light's soft top reaches: [`RISE_CLEAR_PX`]
+    /// inside the effects box's top.
+    #[inline]
+    pub(crate) const fn rise_ceiling(&self) -> f32 {
+        self.fx_top() as f32 + RISE_CLEAR_PX
     }
 
     /// Returns the window-pixel centre of `(row, col)`.
@@ -825,16 +1158,16 @@ impl FrameFingerprint {
             Some(h) => h,
             None => FNV64_OFFSET,
         };
-        let mut qi = 0;
-        while qi < quads.len() {
-            let quad_words = quads[qi].damage_words();
-            let words = quad_words.as_slice();
+        let mut i = 0;
+        while i < quads.len() {
+            let words_buf = quads[i].damage_words();
+            let words = words_buf.as_slice();
             let mut wi = 0;
             while wi < words.len() {
                 hash = fnv_mix_u64(hash, words[wi]);
                 wi += 1;
             }
-            qi += 1;
+            i += 1;
         }
         self.0 = Some(hash);
     }
@@ -983,7 +1316,8 @@ impl FrameFingerprint {
 }
 
 impl CursorGlow {
-    const MAX_QUADS: usize = 16384;
+    /// Maximum quads retained in any cursor-glow stream on one frame.
+    pub const MAX_QUADS: usize = 16384;
     const MAX_SPARKS: usize = 512;
     const WATER_OWNER_SLOTS: usize = Self::MAX_SPARKS * 2;
     const MAX_PARTICLES: usize = 512;
@@ -1081,6 +1415,11 @@ impl CursorGlow {
     const FIRE_SUBCOLS: i32 = 6;
     const FIRE_SLICE_PX: i32 = 2;
     const FRAME_TEXT_RISE: i32 = 3;
+    /// The rows past the lowest a frame's sparks reach that it reads too:
+    /// Comet's dark plume fans into the second row below its typed row where
+    /// that row is bare ([`Self::COMET_DARK_FAN`]), and an unread row is
+    /// never air.
+    const FRAME_TEXT_FALL: i32 = 1;
     const FIRE_DARK_AIR_CAP_COLD: f32 = 96.0;
     const FIRE_DARK_AIR_CAP_HEAT: f32 = 64.0;
     const FIRE_DARK_AIR_RANKS: [f32; 6] = [1.0, 0.92, 0.82, 0.68, 0.5, 0.32];
@@ -1138,6 +1477,14 @@ impl CursorGlow {
     const FIRE_DARK_AIR_CORE_COV: f32 = 255.0;
     const FIRE_DARK_AIR_CORE_TAPER: f32 = 1.1;
     const FIRE_DARK_AIR_LEAD: f32 = 0.45;
+    /// A row kept to itself (its row above inked) stands a low flame in the
+    /// caret's cell and the one past it at this share of the square root of
+    /// the head's strength: at the air's lead ([`Self::FIRE_DARK_AIR_LEAD`])
+    /// the one past the caret stood a spark by the ember caret in the trail
+    /// gallery's `context` (looks10 L2). Past three quarters, the lead
+    /// tongue's gold heart stood wider than its flame at its root, and its
+    /// edge pixel read olive on the dark page.
+    const FIRE_DARK_KEPT_LEAD: f32 = 0.73;
     const FIRE_DARK_ROW_ROOT: f32 = 0.98;
     const FIRE_DARK_ROW_HEADROOM: f32 = 0.06;
     const FIRE_DARK_ROW_TOP_FADE: f32 = 0.28;
@@ -1206,19 +1553,50 @@ impl CursorGlow {
     const MOON_DUST_RATIO: f32 = 2.0;
     const SPARKLE_DARK_LIFT: f32 = 1.35;
     const SPARKLE_DARK_GROW: f32 = 1.3;
-    const COMET_LIGHT_GLINTS: [(f32, bool); 3] = [(1.5, true), (2.3, false), (3.1, true)];
     const LIGHT_BAND_TAIL_CELLS: f32 = 1.5;
-    /// The cells a light Comet's typing wedge reaches back behind its head.
-    const COMET_LIGHT_WEDGE_CELLS: f32 = 3.5;
+    /// The cells a light Comet's typing wedge reaches back behind its head:
+    /// at 3.5 its light was gone two cells behind the caret, a soft blue blob
+    /// with a weak tail on paper (`comet-light.t0`, looks9 Q2). Its light
+    /// stays under the body's cap ([`LIGHT_BODY_ALPHA_CAP`]), so its letters
+    /// read as the head's do.
+    const COMET_LIGHT_WEDGE_CELLS: f32 = 6.0;
+    /// Test-only: the light Comet's typing wedge as looks8 laid it.
+    #[cfg(test)]
+    const COMET_LIGHT_WEDGE_CELLS_LOOKS8: f32 = 3.5;
     /// The most Trail length grows Sparkle's dark bed under a jump: its wedge scales with Length
     /// from the default up to this many times its own.
     const SPARKLE_LEAP_WEDGE_GROWTH: f32 = 4.0;
     const LIGHT_BAND_HEAD_KNOTS: usize = 6;
-    const COMET_LIGHT_GLINT_ARM: f32 = 0.19;
     const COMET_LIGHT_COMA_R: f32 = 0.5;
+    /// How far a paper comet's tail turns its colour's hue toward ice
+    /// ([`Self::COMET_LIGHT_ICE_HUE`]) at its far end, and the share of the
+    /// colour's saturation it keeps there ([`Self::comet_paper_ice`]).
+    const COMET_LIGHT_ICE_TURN: f32 = 0.55;
+    const COMET_LIGHT_ICE_SAT: f32 = 0.55;
+    /// The hue of a paper comet's ice, degrees: the dark comet's icy tail's
+    /// ([`bed::ICY_TAIL`]'s cyan side).
+    const COMET_LIGHT_ICE_HUE: f32 = 196.0;
+    /// A paper comet's tail at its far end and at its nucleus, as a share of
+    /// the cell height (its half-height, the nucleus's round cap aside): a
+    /// needle swelling to the head, where Beam's tube is even.
+    const COMET_LIGHT_NEEDLE: (f32, f32) = (0.04, 0.46);
     const COMET_LIGHT_COMA_RIM: f32 = 0.11;
-    const COMET_LIGHT_GLINT_RISE: (f32, f32) = (0.072, 0.10);
-    const COMET_LIGHT_GLINT_HIGH: f32 = 0.075;
+    /// A paper comet's dust behind its head: each mote's seat, in cells
+    /// behind the head, its depth into the blank row beside the typed one
+    /// (a share of the cell height from the shared edge), its share of the
+    /// nucleus's peak and its size, a share of [`Self::COMET_PAPER_DUST_R`].
+    /// Its looks9 crosses read as a grey `+`; with none, the paper comet was
+    /// a needle with no dust (looks10 L4). Three like motes at like depths
+    /// and spacing read as an ellipsis under the word (looks10 round 2): they
+    /// shrink away from the head, at uneven spacing and depths.
+    const COMET_PAPER_DUST: [(f32, f32, f32, f32); 3] = [
+        (1.3, 0.16, 1.0, 1.0),
+        (2.0, 0.44, 0.8, 0.78),
+        (3.0, 0.27, 0.66, 0.64),
+    ];
+    /// A paper comet's dust mote's radius, a share of the cell height: round
+    /// specks a 1x frame shows as dust, not a pixel.
+    const COMET_PAPER_DUST_R: f32 = 0.12;
     const GLYPH_BAND: (f32, f32) = (0.12, 0.86);
     const COMET_DARK_DUST_HIGH: f32 = 0.02;
     const COMET_DARK_DUST_LOW: f32 = 0.95;
@@ -1240,7 +1618,73 @@ impl CursorGlow {
     /// least beneath the icy tail ([`bed::icy_rail_floor`]).
     const COMET_DARK_DUST_AIR: f32 = 0.24;
     const COMET_DARK_DUST_AIR_SPREAD: f32 = 0.28;
-    const COMET_LIGHT_GLINT_LOW: f32 = 0.885;
+    /// The share of Comet's seated dark dust that sheds above the typed row;
+    /// the rest sheds below it, along the icy tail. At 0.4, the plume lay in
+    /// two even bands, one a side (looks9 round 2's Q2); the dust above is a
+    /// spray at the head ([`Self::COMET_DARK_ABOVE_LIFE`]), the fan below.
+    const COMET_DARK_DUST_ABOVE: f32 = 0.25;
+    /// The share of its life a grain of Comet's dark dust shed above the row
+    /// shows: a spray beside the nucleus, not a rule along the line.
+    const COMET_DARK_ABOVE_LIFE: f32 = 0.4;
+    /// The share of Comet's dark plume gone by the end of its life, each
+    /// grain at its own age (as the square of its age): the dust thins with
+    /// its distance behind the head.
+    const COMET_DARK_DUST_THIN: f32 = 0.8;
+    /// A grain of Comet's dark plume's size over the dust's, from its least
+    /// (most grains) to its greatest (a few), by the square of its seed.
+    const COMET_DARK_GRAIN_SIZES: (f32, f32) = (0.55, 1.5);
+    /// How far past the row's edge a fresh grain of Comet's dark dust floats
+    /// into a bare row, a share of the cell height (below the row, at least
+    /// beneath the icy tail).
+    const COMET_DARK_DUST_NEAR: f32 = 0.10;
+    /// How much farther out a grain drifts over its life, a share of the cell
+    /// height at its fastest ([`Self::COMET_DARK_DUST_NEAR`]): each grain at
+    /// its own rate, so the dust behind the head widens and scatters. As
+    /// looks9 round 1 laid it (the `comet_plume_even` control's).
+    const COMET_DARK_DUST_DRIFT: f32 = 0.46;
+    /// How deep into its air a fresh grain of Comet's dark plume may be shed
+    /// past its near seat, a share of the cell height (never past the air's
+    /// end), each grain at its own depth: shed at the near seat alone, a
+    /// young plume spread only as far as its grains had drifted, and with one
+    /// row of air (a pane's last row under the typed line) the dust under
+    /// the line lay in one dotted rule above the pane's divider (the
+    /// gallery's `split`, looks9 round 3).
+    const COMET_DARK_SEED: f32 = 0.42;
+    /// The plume's fan: how far past its nearest seat the fastest grain
+    /// drifts by the end of its life, a share of the air it may float in (a
+    /// bare row beside the typed one, and the next row too where that is
+    /// bare): the dust behind the head spreads into a fan as wide as the air.
+    const COMET_DARK_FAN: f32 = 0.95;
+    /// The share of its life a grain of Comet's dark dust beside a filled or
+    /// lettered row keeps its seat in the leading: a spray at the head.
+    const COMET_DARK_SEAT_LIFE: f32 = 0.35;
+    /// THE DENSE ROW'S SEATS: where the caret's row has no air above or
+    /// below it (a powerline bar over it, a selection under it), Sparkle's
+    /// and Fire's dark particles, which fly out of the row into the filled
+    /// rows that drop them, are seated in the blank air past the caret in its
+    /// own row instead: up to this many cells past its reach, a share
+    /// ([`Self::DENSE_SEAT_SHARE`]) of them, each where it was born, so they
+    /// do not slide with the caret. In the gallery's `context` the two drew
+    /// a bare glowing caret with no star, moon or ember (looks10 L2).
+    pub(super) const DENSE_SEAT_CELLS: f32 = 2.6;
+    /// The share of Sparkle's and Fire's particles a dense row seats
+    /// ([`Self::DENSE_SEAT_CELLS`]); the rest are not drawn there.
+    const DENSE_SEAT_SHARE: f32 = 0.45;
+    /// How far a seated ember rises through its row over its life, a share
+    /// of the band it is seated in ([`Self::DENSE_SEAT_CELLS`]).
+    const DENSE_EMBER_RISE: f32 = 0.2;
+    /// How far a seated ember sits higher for being seated farther past the
+    /// caret's reach, a share of its band, reached
+    /// [`Self::DENSE_EMBER_CLIMB_CELLS`] out: the embers climb away from the
+    /// flame.
+    pub(super) const DENSE_EMBER_CLIMB: f32 = 0.85;
+    /// How many cells past the caret's reach a seated ember has climbed
+    /// [`Self::DENSE_EMBER_CLIMB`] (most seated embers lie inside it).
+    const DENSE_EMBER_CLIMB_CELLS: f32 = 1.6;
+    /// How far a seated ember's height scatters, a share of its band.
+    const DENSE_EMBER_SCATTER: f32 = 0.1;
+    /// How long a fresh grain of Comet's dark dust takes to brighten, s.
+    const COMET_DARK_DUST_RISE_S: f32 = 0.12;
     const WATER_LINE_DY: f32 = 0.10;
     /// The swell of Water's lit rail below the row, a share of the cell
     /// height ([`super::bed::BedScratch::rail_wave`]).
@@ -1272,6 +1716,32 @@ impl CursorGlow {
     /// radius, a share of the cell height, and its peak coverage.
     const COMET_NUCLEUS_R: f32 = 0.30;
     const COMET_NUCLEUS_COV: f32 = 230.0;
+    /// COMET'S SEAT IN A DENSE ROW ([`Self::push_comet_seat`]): where the
+    /// row under the caret is no air (a selection, a lettered row, the
+    /// pane's floor), its nucleus has no room under the caret and its tail
+    /// lies in the row's foot band, and in the gallery's `context` it read
+    /// as a dim Beam rail, a 2 px underline with no head (looks10 round 2's
+    /// L2). There it flies in its own row's blank air past the caret: a
+    /// round head this many cells past the caret's far edge (its far rim),
+    /// an ice tail from the caret's far edge into it. Round 3: a needle
+    /// wisp swelling to the head, kept a third of a cell off the caret, read
+    /// as a pin (`—•`) apart from the caret (round 2's judges); the tail
+    /// now leaves the caret's edge broad and faint and narrows into the
+    /// head, a comet flying off the caret.
+    pub(super) const COMET_SEAT_CELLS: f32 = 2.6;
+    /// The seated head's radius, a share of the cell height: the head and
+    /// its soft rim stay inside the row.
+    const COMET_SEAT_R: f32 = 0.22;
+    /// The gap the seated tail keeps from the caret's far edge, a share of
+    /// the cell width: none, so the comet leaves the caret.
+    const COMET_SEAT_GAP: f32 = 0.0;
+    /// The seated tail's light at the caret's edge and at the head, shares
+    /// of the head's peak.
+    const COMET_SEAT_WISP: (f32, f32) = (0.22, 0.75);
+    /// The seated tail's half-width at the caret's edge and at the head,
+    /// shares of the head's radius: broad where it leaves the caret,
+    /// narrowing into the head.
+    const COMET_SEAT_TAIL_HALF: (f32, f32) = (1.2, 0.85);
     const WATER_SWELL: (f32, f32) = (0.08, 0.12);
     const WATER_KNOTS: usize = 4;
     const LIGHT_WATER_DROP_INKS: (u32, u32) = (0x0010_6EB4, 0x0036_A8E2);
@@ -1312,6 +1782,34 @@ impl CursorGlow {
     #[must_use]
     pub const fn last_cfg(&self) -> Option<&GlowConfig> {
         self.last_cfg.as_ref()
+    }
+
+    /// The light the last tick began under ([`Self::tick`]), which a held park's flush draws by:
+    /// for the host's dark pin (§15.0.3). Debug and test builds only.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    #[must_use]
+    pub const fn tick_light(&self) -> Light {
+        self.tick_light
+    }
+
+    /// The light the Rainbow Kitty's config was last built with (`rk::Config::light`): for the
+    /// host's dark pin (§15.0.3). Debug and test builds only.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    #[must_use]
+    pub const fn v2_light(&self) -> Light {
+        self.v2_light
+    }
+
+    /// How many light-owned spans the ink ledger was ever handed
+    /// (`InkLedger::note_light_owned_laid`), read from the ledger itself: for the host's dark pin
+    /// (§15.0.3). Debug and test builds only.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    #[must_use]
+    pub const fn light_owned_noted(&self) -> u64 {
+        self.ink_ledger.light_owned_noted
     }
 
     #[inline]
@@ -1454,6 +1952,7 @@ impl CursorGlow {
     }
 
     /// Returns the deadline for the next visible change, or `None` when idle.
+    #[inline]
     #[must_use]
     pub fn next_change_deadline(&self, now: Instant, frame_interval: Duration) -> Option<Instant> {
         let v1_due = if self.needs_frame_cadence() {
@@ -1560,6 +2059,7 @@ impl CursorGlow {
         self.under_ramps.clear();
         self.out_ramps.clear();
         self.ink_ledger.clear_rails();
+        self.glass_laid.clear();
         self.char_out.clear();
         self.fire_halo_out.clear();
         self.v2_beams.clear();
@@ -1679,6 +2179,10 @@ impl CursorGlow {
         geom: Geom,
         out: &mut Vec<GlowQuad>,
     ) -> u64 {
+        self.tick_light = cfg.light;
+        if std::mem::take(&mut self.composer_insert_frame) {
+            self.confirm_composer_echo(cur, now);
+        }
         let print_seq = self.print_anchor_seq();
         self.print_in_tick = print_seq.is_some() && print_seq != self.print_anchor_tick_seq;
         self.print_anchor_tick_seq = print_seq;
@@ -1702,13 +2206,19 @@ impl CursorGlow {
         self.fire_halo_out.clear();
         self.ink_ledger.close();
         self.ink_ledger.clear_rails();
+        self.glass_laid.clear();
         if self.frame_text.at != Some(now) {
             self.frame_text.rows.clear();
             self.frame_text.pairs.clear();
+            self.frame_text.short.clear();
+            self.frame_text.glyph.clear();
+            self.frame_text.pane = None;
         }
         if self.pet_text.at != Some(now) {
             self.pet_text.rows.clear();
             self.pet_text.pairs.clear();
+            self.pet_text.short.clear();
+            self.pet_text.glyph.clear();
         }
         self.momentum_pulse = None;
         let valid_canvas =
@@ -1833,6 +2343,19 @@ impl CursorGlow {
             self.begin_ink_ledger(cfg, geom, cur);
             let spans = self.probed_text_spans();
             let cost = self.rows_cost();
+            // The one-colour bed's rail may lie in its own row's foot band
+            // ([`bed::BedShape::row_rail`]), parted round the probed rows'
+            // feet; the caret's own cell is no foot. A test's control
+            // ([`Self::set_bed_row_rails`]) names no row's feet.
+            let mut feet = std::mem::take(&mut self.bed_scratch.feet);
+            let mut soles = [None; 2];
+            feet.clear();
+            if cfg.classic_mono && cfg.dark_theme && !self.bed_scratch.row_rail_off {
+                self.foot_boxes(geom, &mut feet, &mut soles);
+                if let Some((r, c)) = cur {
+                    bed::carve_cell(&mut feet, geom, (i32::from(r), i32::from(c)));
+                }
+            }
             let fp = self.classic.tick(
                 cur,
                 now,
@@ -1844,8 +2367,10 @@ impl CursorGlow {
                 crate::classic_wake::WakeInk {
                     text: TextView::new(spans, Some(&self.frame_text)),
                     ledger: &mut self.ink_ledger,
+                    feet: (feet.as_slice(), soles),
                 },
             );
+            self.bed_scratch.feet = feet;
             if let Some((from, to)) = self.classic.take_spawn() {
                 self.spawns += 1;
                 self.log_licensed_as(now, from, to, AdmissionRecord::LICENCE_MOTION);
@@ -2191,22 +2716,24 @@ impl CursorGlow {
         let mut halo_cells = std::mem::take(&mut self.fire_halo_out);
         let mut engulf = std::mem::take(&mut self.engulf_scratch);
         let mut bolt_verts = std::mem::take(&mut self.bolt_verts);
-        let mut bolt_channel = std::mem::take(&mut self.bolt_channel);
-        let mut bolt_out = if cfg.dark_theme {
-            self.ramp_sink(out, &mut out_ramps)
-        } else {
-            self.ramp_sink(&mut under, &mut under_ramps)
-        };
-        self.emit_bolts(
-            now,
-            cfg,
-            geom,
-            &mut bolt_out,
-            &mut bolt_verts,
-            &mut bolt_channel,
-        );
-        drop(bolt_out);
-        self.bolt_channel = bolt_channel;
+        if matches!(cfg.style, GlowStyle::Laser) && !self.bolts.is_empty() {
+            let mut bolt_channel = std::mem::take(&mut self.bolt_channel);
+            let mut bolt_out = if cfg.dark_theme {
+                self.ramp_sink(out, &mut out_ramps)
+            } else {
+                self.ramp_sink(&mut under, &mut under_ramps)
+            };
+            self.emit_bolts(
+                now,
+                cfg,
+                geom,
+                &mut bolt_out,
+                &mut bolt_verts,
+                &mut bolt_channel,
+            );
+            drop(bolt_out);
+            self.bolt_channel = bolt_channel;
+        }
         self.begin_ink_ledger(cfg, geom, cur);
         let mut out_sink = self.ramp_sink(out, &mut out_ramps);
         let mut under_sink = self.ramp_sink(&mut under, &mut under_ramps);
@@ -2238,14 +2765,16 @@ impl CursorGlow {
             &mut ledger,
         );
         self.ink_ledger = ledger;
-        if cfg.dark_theme {
-            if out_ramps.laid(out.len()) < Self::MAX_QUADS {
-                let mut out_sink = self.ramp_sink(out, &mut out_ramps);
-                self.emit_fire_meteors(now, cfg, geom, &mut out_sink);
+        if matches!(cfg.style, GlowStyle::Fire) && !self.fire_meteors.is_empty() {
+            if cfg.dark_theme {
+                if out_ramps.laid(out.len()) < Self::MAX_QUADS {
+                    let mut out_sink = self.ramp_sink(out, &mut out_ramps);
+                    self.emit_fire_meteors(now, cfg, geom, &mut out_sink);
+                }
+            } else if under_ramps.laid(under.len()) < Self::MAX_QUADS {
+                let mut under_sink = self.ramp_sink(&mut under, &mut under_ramps);
+                self.emit_fire_meteors(now, cfg, geom, &mut under_sink);
             }
-        } else if under_ramps.laid(under.len()) < Self::MAX_QUADS {
-            let mut under_sink = self.ramp_sink(&mut under, &mut under_ramps);
-            self.emit_fire_meteors(now, cfg, geom, &mut under_sink);
         }
         if under_ramps.laid(under.len()) < Self::MAX_QUADS {
             self.emit_water(now, cfg, geom, cur, (&mut under, &mut under_ramps));
@@ -2259,6 +2788,10 @@ impl CursorGlow {
                 self.v2_cues.reserve(Self::V2_CUE_SCRATCH);
             }
             let v2_cfg = rk::Config::from_glow(cfg, self.reduced_motion);
+            #[cfg(any(test, debug_assertions))]
+            {
+                self.v2_light = v2_cfg.light;
+            }
             let witness_rows = std::mem::take(&mut self.witness_rows);
             let witness = if witness_n > 0 {
                 Some(witness_samples(&witness_rows, witness_n))
@@ -2327,12 +2860,18 @@ impl CursorGlow {
                 }
                 ri += 1;
             }
+            // The glass is light-owned: the yield cuts it, never the guard (§15.2 1.9). Only
+            // this step's: a step that emitted nothing left an earlier frame's span.
+            let ribbon = self.v2.ribbon();
+            if ribbon.glass_drew_at(now)
+                && let Some((from, to)) = ribbon.glass_span()
+            {
+                self.ink_ledger.note_light_owned_laid(from, to);
+            }
             self.read_fresh_run_origin(now);
             let mut ci = 0;
-            while ci < self.v2_cues.len() {
-                if self.sound_cues.len() < Self::MAX_SOUND_CUES {
-                    self.sound_cues.push(self.v2_cues[ci]);
-                }
+            while ci < self.v2_cues.len() && self.sound_cues.len() < Self::MAX_SOUND_CUES {
+                self.sound_cues.push(self.v2_cues[ci]);
                 ci += 1;
             }
             self.v2_cues.clear();
@@ -2354,7 +2893,7 @@ impl CursorGlow {
             self.emit_forge_cursor(cfg, geom, cur, out, &mut halos);
         }
         let flying = !matches!(cfg.style, GlowStyle::Fire);
-        if out_ramps.laid(out.len()) < Self::MAX_QUADS {
+        if out_ramps.laid(out.len()) < Self::MAX_QUADS && self.ring.is_some() {
             let (q0, h0) = (out.len(), halos.len());
             if let Some(ring) = &mut self.ring
                 && let Some((r, c)) = cur
@@ -2417,13 +2956,17 @@ impl CursorGlow {
             }
             if flying {
                 let to = out.len();
-                self.ink_ledger
-                    .admit_masked(out, q0..to, InkLedger::FLYING_FLOOR);
-                self.ink_ledger
-                    .admit_halos_masked(&mut halos, h0, InkLedger::FLYING_FLOOR);
+                if to > q0 {
+                    self.ink_ledger
+                        .admit_masked(out, q0..to, InkLedger::FLYING_FLOOR);
+                }
+                if halos.len() > h0 {
+                    self.ink_ledger
+                        .admit_halos_masked(&mut halos, h0, InkLedger::FLYING_FLOOR);
+                }
             }
         }
-        if out_ramps.laid(out.len()) < Self::MAX_QUADS {
+        if out_ramps.laid(out.len()) < Self::MAX_QUADS && !self.particles.is_empty() {
             let (q0, h0) = (out.len(), halos.len());
             let mut under_sink = self.ramp_sink(&mut under, &mut under_ramps);
             // The room the stream's ramp lights leave its quads.
@@ -2431,14 +2974,18 @@ impl CursorGlow {
             self.emit_particles(now, cfg, geom, out, &mut halos, &mut under_sink, cap);
             drop(under_sink);
             if flying {
-                self.ink_ledger
-                    .admit_each_quad(&mut out[q0..], InkLedger::FLYING_FLOOR);
-                self.ink_ledger
-                    .admit_halos_masked(&mut halos, h0, InkLedger::FLYING_FLOOR);
+                if out.len() > q0 {
+                    self.ink_ledger
+                        .admit_each_quad(&mut out[q0..], InkLedger::FLYING_FLOOR);
+                }
+                if halos.len() > h0 {
+                    self.ink_ledger
+                        .admit_halos_masked(&mut halos, h0, InkLedger::FLYING_FLOOR);
+                }
             }
         }
         self.emit_vapor(now, cfg, geom, &mut halos);
-        if matches!(cfg.style, GlowStyle::Fire) && cfg.dark_theme {
+        if matches!(cfg.style, GlowStyle::Fire) && cfg.dark_theme && !halos.is_empty() {
             self.hold_halos_off_filled(&mut halos, cur, geom, cfg.theme_bg);
         }
         self.bolt_verts = bolt_verts;
@@ -2453,10 +3000,37 @@ impl CursorGlow {
 
         self.tick_fades(now, geom, (out, &mut out_ramps));
         // The flames' night grounds lie under every other mark under the
-        // letters ([`push_night_ground`]); the frame's other lights lay
-        // theirs once every light is in ([`Self::ground_the_frame`]). The
-        // under stream's ramps stand before the same quads they stood
-        // before, moved past the grounds.
+        // letters ([`push_night_ground`]), laid with the frame's other
+        // lights' grounds once every light is in and the letter guard has cut
+        // them ([`Self::ground_the_frame`]). The guard cuts no flame (a
+        // flame holds its own flank off the letters), and laid before it, a
+        // ground the guard cut to a fifth over a letter's ring left the flame
+        // over it on the bare page: on Solarized Dark's teal the foot of a
+        // flame over `echo` read olive (`#575d3a`, hue 70, looks10 round 2's
+        // WIDEN). The ground keeps the page's own lightness, so a letter on
+        // the page keeps its contrast under it; on a filled cell (a powerline
+        // bar, a selected row) it would not, and a ground touching one joins
+        // the under stream here, for the guard to cut over that cell's
+        // letters as it cuts every light: laid past the guard, the ground of
+        // the flame beside the trail gallery's ` aterm ` bar darkened the
+        // cyan round its `m` to a local 2.75:1 on Solarized Dark (looks10
+        // round 2).
+        #[cfg(test)]
+        let (guarded, bars_unguarded) =
+            (self.flame_grounds_guarded, self.flame_bar_grounds_unguarded);
+        #[cfg(not(test))]
+        let (guarded, bars_unguarded) = (false, false);
+        self.flame_night.clear();
+        if !guarded {
+            let (frame_text, page, held) = (&self.frame_text, cfg.theme_bg, &mut self.flame_night);
+            night.retain(|q| {
+                let past = bars_unguarded || emit::ground_lies_on_page(frame_text, geom, page, q);
+                if past {
+                    held.push(*q);
+                }
+                !past
+            });
+        }
         if !night.is_empty() {
             let moved = night.len().min(u32::MAX as usize) as u32;
             let items = self.under_ramps.items.as_mut_slice();
@@ -2468,6 +3042,7 @@ impl CursorGlow {
             night.extend_from_slice(&self.under_out);
             std::mem::swap(&mut self.under_out, &mut night);
         }
+        night.clear();
         self.night_out = night;
 
         out_ramps.truncate_laid(out, Self::MAX_QUADS);
@@ -2483,6 +3058,7 @@ impl CursorGlow {
         fp.glow_ramps(FrameFingerprint::GLOW_UNDER, &self.under_ramps);
         self.out_ramps = out_ramps;
         self.fold_for_tests(out);
+        self.record_glass(now, cfg, geom, cur);
         fp.chars(&self.char_out);
         fp.fire_halos(&self.fire_halo_out);
         fp.rain_halos(&self.halo_out);
@@ -2510,6 +3086,8 @@ impl CursorGlow {
         let Some(mut cfg) = self.last_cfg else {
             return;
         };
+        // The outgoing style fades by main's arm: no light arm draws in a fade (§15.2 1.1).
+        cfg.light = Light::OFF;
         let crown_until = self.crown_until.take();
         let last_smoke = self.last_smoke.take();
         let has_crown = !matches!(cfg.style, GlowStyle::RainbowKitty)

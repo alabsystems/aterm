@@ -14,12 +14,20 @@ pub use verified_entry::verified_entry_model;
 
 mod dispatch;
 pub use dispatch::resource_dispatch_model;
+mod resource_retirement;
+pub use resource_retirement::resource_retirement_model;
 mod discovery;
 pub use discovery::discovery_replacement_model;
 mod enrollment_gate;
 pub use enrollment_gate::enrollment_gate_model;
 mod repair_policy;
 pub use repair_policy::repair_policy_model;
+mod credential_request;
+pub use credential_request::{credential_request_liveness, credential_request_model};
+mod claim_publication;
+pub use claim_publication::claim_publication_model;
+mod claim_ring;
+pub use claim_ring::claim_ring_model;
 
 /// Bounded executions of the durable fixed-share reservation API. Initial pins
 /// are assumed coherent across consumers; this model grants no provider access.
@@ -62,6 +70,14 @@ pub fn resource_reservation_model() -> Model {
             }
             action NoPin when (scenario == 0) {
                 scenario = 10; accepted = if Buggy == 12 {1} else {0};
+            }
+            action LostCustody when (scenario == 0) {
+                scenario = 11; accepted = if Buggy == 13 {1} else {0};
+                used = if Buggy == 13 {4} else {3};
+            }
+            action Reenrolled when (scenario == 0) {
+                scenario = 12; accepted = if Buggy == 14 {1} else {0};
+                used = if Buggy == 14 {4} else {3};
             }
             invariant DurableReceipt: accepted == 0 || durable == 1;
             invariant RetryIsNotFresh: 2 > scenario || scenario > 2 || fresh == 0;

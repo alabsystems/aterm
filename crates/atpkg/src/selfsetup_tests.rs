@@ -341,13 +341,13 @@ fn shell_setup_selects_the_cli_before_an_inherited_bundle_and_preserves_the_prof
         assert_eq!(
             String::from_utf8(output.stdout).unwrap(),
             format!(
-                "release\nselected\n{}:{}:{}:{}:/usr/bin:{}:/bin:{}\nkept\n",
+                "release\nselected\n{}:{}:{}:{}:{}:/usr/bin:{}:/bin\nkept\n",
                 reroute.display(),
                 agents.display(),
+                package.display(),
                 bin.display(),
                 release.display(),
                 if is_fish { "." } else { "" },
-                package.display()
             )
         );
         let incomplete = format!("{prefix}{PATH_BLOCK_START}\n# interrupted old setup\n");
@@ -380,22 +380,76 @@ fn the_path_block_is_written_once_and_swept_exactly() {
         );
         out
     };
-    assert_eq!(
-        plan(&path),
-        "atpkg: PATH: no edit — no ALab toolset to put on PATH\n"
+    let bin = a.places.bin_dir.display().to_string();
+    let on_path = zsh(&format!("{bin}:/usr/bin:/bin"));
+    let (_, planned, _) = a.setup(
+        &on_path,
+        exe,
+        &Setup {
+            dry_run: true,
+            ..path.clone()
+        },
     );
-    let (ok, out, _) = a.setup(&env, exe, &path);
-    assert!(!ok, "no hook and none coming: no block stands: {out}");
+    assert_eq!(
+        planned,
+        format!("atpkg: PATH: no edit — {bin} is on PATH and no ALab toolset is installed\n")
+    );
+    let (ok, out, _) = a.setup(&on_path, exe, &path);
+    assert!(
+        !ok,
+        "no hook, none coming, the bin dir on PATH: no block: {out}"
+    );
     assert_eq!(
         std::fs::read_to_string(&rc).expect("rc"),
         "export EDITOR=vi\n"
     );
 
+    // --no-toolchain's install: no hook and none coming, and the bin dir is off PATH, so the
+    // block still carries it (round 12: no block left `aterm` off PATH behind a hand edit).
+    assert_eq!(
+        plan(&path),
+        format!(
+            "atpkg: PATH: appends ONE marker-fenced block to {} — {bin}\n",
+            rc.display()
+        )
+    );
+    let (ok, out, _) = a.setup(&env, exe, &path);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        format!(
+            "atpkg: added {bin} to PATH in {} — open a new shell\n",
+            rc.display()
+        )
+    );
+    let toolless = std::fs::read_to_string(&rc).expect("rc");
+    assert_eq!(toolless.matches(PATH_BLOCK_START).count(), 1, "{toolless}");
+    assert!(
+        toolless.contains(&format!("__aterm_cli_bin=\"{bin}\"")),
+        "{toolless}"
+    );
+    // A rerun names what the standing block carries, the bin dir alone (round 12: it said "ALab
+    // toolset already on PATH" with none installed or coming); the hook's case below is the
+    // control.
+    let (ok, out, _) = a.setup(&env, exe, &path);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        format!("atpkg: {bin} already on PATH via {}\n", rc.display())
+    );
+    assert_eq!(std::fs::read_to_string(&rc).expect("rc"), toolless);
+    let (ok, _, _) = a.sweep(None, false);
+    assert!(ok);
+    assert_eq!(
+        std::fs::read_to_string(&rc).expect("rc"),
+        "export EDITOR=vi\n\n"
+    );
+    write(&rc, "export EDITOR=vi\n");
+
     let coming = Setup {
         toolset_coming: true,
         ..path.clone()
     };
-    let bin = a.places.bin_dir.display().to_string();
     assert_eq!(
         plan(&coming),
         format!(
@@ -414,13 +468,32 @@ fn the_path_block_is_written_once_and_swept_exactly() {
         "{text}"
     );
     let (ok, out, _) = a.setup(&env, exe, &coming);
-    assert!(ok && out.contains("already on PATH via"), "{out}");
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        format!(
+            "atpkg: {bin} already on PATH via {}; the ALab toolset joins it after aterm's first \
+             launch\n",
+            rc.display()
+        )
+    );
     assert_eq!(
         std::fs::read_to_string(&rc).expect("rc"),
         text,
         "written once"
     );
     assert!(plan(&coming).contains("already wired"));
+    // The control for the reruns above: with the toolset's hook laid, the standing block puts
+    // the toolset on PATH, and the rerun says so.
+    let hook = hook_of(&a.places, "zsh");
+    write(&hook, "# the toolset hook\n");
+    let (ok, out, _) = a.setup(&env, exe, &path);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        format!("atpkg: ALab toolset already on PATH via {}\n", rc.display())
+    );
+    std::fs::remove_file(&hook).expect("rm hook");
 
     let (ok, out, err) = a.sweep(None, false);
     assert!(ok, "{out}{err}");
@@ -444,6 +517,79 @@ fn the_path_block_is_written_once_and_swept_exactly() {
         },
     );
     assert!(out.contains("unrecognised shell (/bin/tcsh)"), "{out}");
+}
+
+/// zsh reads `$ZDOTDIR/.zshrc` and never `~/.zshrc` when `ZDOTDIR` is set, so the block goes
+/// there and the sweep finds it there (round 12: it went to `~/.zshrc`, and a new zsh had no
+/// `aterm` on PATH).
+#[test]
+fn a_zdotdir_zshrc_takes_the_path_block_and_the_sweep_finds_it() {
+    let mut a = Account::new("zdotdir");
+    let zdot = a.home().join(".config/zsh");
+    let env = zsh("/usr/bin:/bin");
+    let coming = Setup {
+        path: true,
+        toolset_coming: true,
+        ..Setup::default()
+    };
+    let exe = Path::new("/nonexistent/aterm");
+
+    // The control: with no ZDOTDIR the block lands in ~/.zshrc.
+    let (ok, out, _) = a.setup(&env, exe, &coming);
+    assert!(ok, "{out}");
+    assert!(
+        std::fs::read_to_string(a.home().join(".zshrc"))
+            .expect("~/.zshrc")
+            .contains(PATH_BLOCK_START)
+    );
+    assert!(a.sweep(None, false).0);
+    std::fs::remove_file(a.home().join(".zshrc")).expect("rm ~/.zshrc");
+
+    a.places = places_from(a.home(), |name| {
+        (name == "ZDOTDIR").then(|| zdot.clone().into_os_string())
+    });
+    a.places.install_dir = Some(a.home().join("Applications"));
+    let (ok, out, _) = a.setup(&env, exe, &coming);
+    assert!(ok, "{out}");
+    let rc = zdot.join(".zshrc");
+    assert!(out.contains(&rc.display().to_string()), "{out}");
+    let text = std::fs::read_to_string(&rc).expect("$ZDOTDIR/.zshrc");
+    assert_eq!(text.matches(PATH_BLOCK_START).count(), 1, "{text}");
+    assert!(
+        !a.home().join(".zshrc").exists(),
+        "~/.zshrc is not zsh's here"
+    );
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains(&format!("removed PATH block: {}", rc.display())),
+        "{out}"
+    );
+    assert!(
+        !std::fs::read_to_string(&rc)
+            .expect("$ZDOTDIR/.zshrc")
+            .contains(PATH_BLOCK_START)
+    );
+}
+
+/// `ZDOTDIR` names zsh's folder only as an absolute path; empty or relative, `~` is it.
+#[test]
+fn only_an_absolute_zdotdir_moves_the_zshrc() {
+    let home = Path::new("/h");
+    for (value, want) in [
+        (None, "/h"),
+        (Some(""), "/h"),
+        (Some("dots"), "/h"),
+        (Some("/h/.config/zsh"), "/h/.config/zsh"),
+    ] {
+        let places = places_from(home, |name| {
+            (name == "ZDOTDIR")
+                .then_some(value)
+                .flatten()
+                .map(OsString::from)
+        });
+        assert_eq!(places.zdotdir, Path::new(want), "{value:?}");
+    }
 }
 
 #[test]
@@ -537,6 +683,56 @@ fn completions_come_from_the_binary_and_are_swept() {
             .is_file()
     );
     assert!(!a.places.xdg_data.join("zsh/site-functions/_aterm").exists());
+}
+
+/// Under a `ZDOTDIR`, the zsh-completions NOTE asks `$ZDOTDIR/.zshrc` for the `fpath` line and
+/// names it, since zsh never reads `~/.zshrc` there: the loader in `$ZDOTDIR/.zshrc` quiets the
+/// NOTE, and one only in `~/.zshrc` does not (the control: with no `ZDOTDIR`, that one does).
+#[test]
+fn the_completions_note_reads_the_zshrc_zsh_reads() {
+    let mut a = Account::new("compzdot");
+    let stand_in = a.dir.join("bin/aterm");
+    exe(
+        &stand_in,
+        "#!/bin/sh\nif [ \"$1\" = ctl ]; then echo \"# ctl $3\"; exit 0; fi\n\
+         if [ \"$1\" = --completions ]; then echo \"#compdef aterm ($2)\"; exit 0; fi\nexit 2\n",
+    );
+    aterm_spec::wait::first_exec(&stand_in, &["--completions", "zsh"]);
+    let setup = Setup {
+        completions: true,
+        ..Setup::default()
+    };
+    let loader = format!(
+        "fpath=(\"{}\" $fpath)\n",
+        a.places.xdg_data.join("zsh/site-functions").display()
+    );
+    let home_rc = a.home().join(".zshrc");
+    let zdot = a.home().join(".config/zsh");
+    let zdot_rc = zdot.join(".zshrc");
+    let note = |a: &Account| {
+        let (ok, out, err) = a.setup(&zsh("/usr/bin"), &stand_in, &setup);
+        assert!(ok, "{out}{err}");
+        assert!(a.sweep(None, false).0);
+        err.lines()
+            .find(|l| l.contains("NOTE: zsh completions"))
+            .map(String::from)
+    };
+
+    write(&home_rc, &loader);
+    assert_eq!(note(&a), None, "no ZDOTDIR: ~/.zshrc's loader counts");
+
+    a.places = places_from(a.home(), |name| {
+        (name == "ZDOTDIR").then(|| zdot.clone().into_os_string())
+    });
+    a.places.install_dir = Some(a.home().join("Applications"));
+    let said = note(&a).expect("~/.zshrc's loader is not zsh's under a ZDOTDIR");
+    assert!(
+        said.contains(&format!("which {} does not put", zdot_rc.display())),
+        "{said}"
+    );
+    std::fs::remove_file(&home_rc).expect("rm ~/.zshrc");
+    write(&zdot_rc, &loader);
+    assert_eq!(note(&a), None, "$ZDOTDIR/.zshrc's loader counts");
 }
 
 #[test]
@@ -871,12 +1067,11 @@ fn a_failed_setup_publish_cleans_only_its_own_stage() {
 
 const OPEN_UMASK_ENV: &str = "ATPKG_SELFSETUP_OPEN_UMASK_DIR";
 const OPEN_UMASK_PROBE: &str =
-    "selfsetup::tests::probe_shell_setup_under_an_open_umask_shares_no_directory";
+    "selfsetup::tests::shell_setup_under_an_open_umask_shares_no_directory";
 
-#[test]
-fn probe_shell_setup_under_an_open_umask_shares_no_directory() {
+fn probe_shell_setup_under_an_open_umask_shares_no_directory_if_asked() -> bool {
     let Some(dir) = std::env::var_os(OPEN_UMASK_ENV) else {
-        return;
+        return false;
     };
     // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail; this
     // process runs this one test (`--exact`), so no other create sees the mask.
@@ -927,10 +1122,14 @@ fn probe_shell_setup_under_an_open_umask_shares_no_directory() {
         .filter(|row| !row.ends_with(" 755"))
         .collect();
     assert!(shared.is_empty(), "made other than 755: {shared:?}");
+    true
 }
 
 #[test]
 fn shell_setup_under_an_open_umask_shares_no_directory() {
+    if probe_shell_setup_under_an_open_umask_shares_no_directory_if_asked() {
+        return;
+    }
     let scratch = crate::testdir::dir("atpkg-selfsetup-umask-");
     let out = aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"))
         .args(["--exact", "--nocapture", OPEN_UMASK_PROBE])
@@ -997,6 +1196,25 @@ fn an_uninstall_quits_the_acaffiene_mug_and_removes_its_files() {
             "{out}"
         );
     }
+    for name in [
+        "acaffiene-code.noindex",
+        "acaffiene",
+        "acaffiene.state",
+        "acaffiene.bridge",
+    ] {
+        let path = support.join(name);
+        assert!(
+            out.contains(&format!("would remove aCaffiene file: {}", path.display())),
+            "the dry run names what the real one removes: {out}"
+        );
+    }
+    assert!(
+        out.contains(&format!(
+            "would leave aCaffiene lock rendezvous: {}",
+            support.join("acaffiene.lock").display()
+        )),
+        "{out}"
+    );
     assert!(
         support.join("acaffiene.state").exists(),
         "a dry run keeps it"
@@ -1169,6 +1387,515 @@ fn an_uninstall_quits_the_acaffiene_mug_and_removes_its_files() {
     assert!(app.is_dir(), "the actual caller kept the helper's bundle");
     assert_eq!(std::fs::read(aterm).expect("kept helper"), image);
     assert_eq!(std::fs::read_to_string(state).expect("state"), "mode=on\n");
+}
+
+/// An uninstall removes acaffiene.state's temporaries whose writer is gone and that are over
+/// an hour old, first and whatever else it does, and nothing a writer may still rename.
+#[test]
+fn an_uninstall_removes_saves_cut_short_and_nothing_a_writer_may_rename() {
+    let a = Account::new("acaffiene-cut-short");
+    let support = a.home().join("Library/Application Support/aterm");
+    let ago = std::time::SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+    let date = |file: &Path| {
+        std::fs::File::options()
+            .write(true)
+            .open(file)
+            .expect("open")
+            .set_modified(ago)
+            .expect("date");
+    };
+    let cut_short = support.join(".acaffiene.state.tmp.4294967295.0123abcd");
+    write(&cut_short, "mode=forever\n");
+    date(&cut_short);
+    let young = support.join(".acaffiene.state.tmp.4294967295.89abcdef");
+    write(&young, "");
+    let saving = support.join(format!(
+        ".acaffiene.state.tmp.{}.0123abcd",
+        std::process::id()
+    ));
+    write(&saving, "");
+    date(&saving);
+    let bridged = support.join(".acaffiene.bridge.tmp.4294967295.0123abcd");
+    let old = [
+        support.join(".caffeine.state.tmp.4294967295.0123abcd"),
+        support.join(".caffeine.bridge.tmp.4294967295.0123abcd"),
+    ];
+    let agents = a.home().join("Library/LaunchAgents");
+    let items = [
+        agents.join(".com.aterm.aterm.acaffiene.plist.tmp.4294967295.0123abcd"),
+        agents.join(".com.aterm.aterm.acaffiene.plist.tmp.4294967295.fedcba98"),
+        agents.join(".com.aterm.aterm.acaffiene.dev.0123abcd.plist.tmp.4294967295.0123abcd"),
+        agents.join(".com.aterm.aterm.caffeine.dev.0123abcd.plist.tmp.4294967295.0123abcd"),
+    ];
+    let others = [
+        agents.join(".com.example.other.plist.tmp.4294967295.0123abcd"),
+        agents.join(".com.aterm.aterm.acaffiene.dev.4567CDEF.plist.tmp.4294967295.0123abcd"),
+        agents.join(format!(
+            ".com.aterm.aterm.acaffiene.plist.tmp.{}.0123abcd",
+            std::process::id()
+        )),
+    ];
+    for temp in old.iter().chain([&bridged]).chain(&items).chain(&others) {
+        write(temp, "");
+        date(temp);
+    }
+    let young_item = agents.join(".com.aterm.aterm.acaffiene.plist.tmp.4294967295.89abcdef");
+    write(&young_item, "");
+    let (ok, out, err) = a.sweep(None, true);
+    assert!(ok, "{out}{err}");
+    for (temp, what) in [
+        (&cut_short, "aCaffiene save"),
+        (&bridged, "aCaffiene save"),
+        (&old[0], "old Caffeine save"),
+        (&old[1], "old Caffeine save"),
+        (&items[0], "aCaffiene login item"),
+        (&items[1], "aCaffiene login item"),
+        (&items[2], "aCaffiene login item"),
+        (&items[3], "old Caffeine login item"),
+    ] {
+        let line = format!("would remove {what} cut short: {}", temp.display());
+        assert_eq!(out.matches(&line).count(), 1, "{line}: {out}");
+        assert!(temp.is_file(), "a dry run keeps it");
+    }
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(ok, "{out}{err}");
+    for temp in [&cut_short, &bridged, &old[0], &old[1]]
+        .into_iter()
+        .chain(&items)
+    {
+        assert!(!temp.exists(), "{}: {out}", temp.display());
+    }
+    for temp in &others {
+        assert!(
+            temp.is_file(),
+            "another label's, or a live writer's: {}",
+            temp.display()
+        );
+    }
+    assert!(young_item.is_file(), "written within the hour");
+    assert!(young.is_file(), "written within the hour");
+    assert!(saving.is_file(), "a live writer's is its own to rename");
+    for lock in ["acaffiene.lock", "caffeine.lock"] {
+        assert!(
+            !support.join(lock).exists(),
+            "with no other aCaffiene file there, no hold was taken: {out}"
+        );
+    }
+
+    let a = Account::new("acaffiene-cut-short-held");
+    let app = a.home().join("Applications/aterm.app");
+    bundle(&app, None);
+    exe(&app.join("Contents/MacOS/aterm"), "#!/bin/sh\nexit 0\n");
+    let support = a.home().join("Library/Application Support/aterm");
+    let lock = support.join("acaffiene.lock");
+    write(&lock, "");
+    write(&support.join("acaffiene.state"), "mode=off\n");
+    let cut_short = support.join(".acaffiene.state.tmp.4294967295.0123abcd");
+    write(&cut_short, "");
+    date(&cut_short);
+    let held =
+        crate::lock::Flock::try_lock(std::fs::File::open(&lock).expect("open")).expect("hold");
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(!ok, "a held lock keeps the mug's files: {out}{err}");
+    assert!(err.contains("aCaffiene lock is busy"), "{err}");
+    assert!(support.join("acaffiene.state").is_file());
+    assert!(
+        !cut_short.exists(),
+        "its writer is gone, mug or no mug: {out}"
+    );
+    drop(held);
+
+    let a = Account::new("acaffiene-cut-short-unlistable");
+    let support = a.home().join("Library/Application Support/aterm");
+    let cut_short = support.join(".caffeine.bridge.tmp.4294967295.0123abcd");
+    write(&cut_short, "");
+    date(&cut_short);
+    let mode = |bits| {
+        std::fs::set_permissions(&support, std::fs::Permissions::from_mode(bits)).expect("chmod");
+    };
+    let item = a
+        .home()
+        .join("Library/LaunchAgents/.com.aterm.aterm.acaffiene.plist.tmp.4294967295.0123abcd");
+    write(&item, "");
+    date(&item);
+    mode(0o300);
+    let (_, out, err) = a.sweep(None, false);
+    mode(0o700);
+    assert_eq!(
+        err.matches("its aCaffiene saves cut short could not be listed")
+            .count(),
+        1,
+        "{out}{err}"
+    );
+    assert!(cut_short.is_file(), "{out}{err}");
+    assert!(item.is_file(), "none goes after the skip: {out}{err}");
+
+    let a = Account::new("acaffiene-cut-short-locked-agents");
+    let support = a.home().join("Library/Application Support/aterm");
+    let cut_short = support.join(".acaffiene.state.tmp.4294967295.0123abcd");
+    write(&cut_short, "");
+    date(&cut_short);
+    let agents = a.home().join("Library/LaunchAgents");
+    write(
+        &agents.join(".com.aterm.aterm.acaffiene.plist.tmp.4294967295.0123abcd"),
+        "",
+    );
+    let lock = |bits| {
+        std::fs::set_permissions(&agents, std::fs::Permissions::from_mode(bits)).expect("chmod");
+    };
+    lock(0o300);
+    let (ok, out, err) = a.sweep(None, false);
+    lock(0o700);
+    assert!(
+        ok,
+        "a LaunchAgents locked against login items holds none: {out}{err}"
+    );
+    assert!(!cut_short.exists(), "the support folder's still go: {out}");
+
+    let a = Account::new("acaffiene-cut-short-no-folder");
+    let support = a.home().join("Library/Application Support/aterm");
+    write(&support, "");
+    write(&a.home().join("Library/LaunchAgents"), "");
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(
+        ok,
+        "a support or LaunchAgents path that is no folder holds none: {out}{err}"
+    );
+}
+
+/// A dry run says what the real one does with the mug's files, under both names: with no aterm
+/// here to stop the mug it removes none, it names the lock rendezvous the real run makes, it
+/// keeps a copy macOS may still be assessing, and a lock a mug holds keeps them all.
+#[test]
+fn a_dry_run_of_the_mugs_files_says_what_the_real_one_does() {
+    let young = |code: &Path| {
+        let copy = code.join("l/1-3");
+        write(&copy.join("aterm.app/Contents/Info.plist"), "<plist/>");
+        copy
+    };
+    let removes = |out: &str, path: &Path| {
+        let tail = format!(": {}", path.display());
+        out.lines()
+            .any(|line| line.starts_with("atpkg: would remove") && line.ends_with(&tail))
+    };
+    let hold = |lock: &Path| {
+        crate::lock::Flock::try_lock(std::fs::File::open(lock).expect("open")).expect("hold")
+    };
+
+    let a = Account::new("acaffiene-unasked");
+    let support = a.home().join("Library/Application Support/aterm");
+    write(&support.join("acaffiene.state"), "mode=off\n");
+    write(&support.join("acaffiene.lock"), "");
+    let (ok, out, err) = a.sweep(None, true);
+    assert!(!ok, "{out}{err}");
+    assert!(
+        err.contains("aCaffiene stop would not be confirmed; its files would be kept"),
+        "no aterm here to stop the mug: {err}"
+    );
+    assert!(!out.contains("would remove aCaffiene file"), "{out}");
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains("aCaffiene stop was not confirmed"), "{err}");
+    assert!(support.join("acaffiene.state").is_file(), "{out}");
+    std::fs::remove_file(support.join("acaffiene.state")).expect("rm");
+    let held = hold(&support.join("acaffiene.lock"));
+    let (ok, out, err) = a.sweep(None, true);
+    assert!(
+        !ok,
+        "a lone lock a mug holds, with no aterm to quit it: {out}{err}"
+    );
+    assert!(
+        err.contains("aCaffiene lock is busy or could not be acquired; its files would be kept"),
+        "{err}"
+    );
+    assert!(!out.contains("would leave aCaffiene lock"), "{out}");
+    let (ok, _, err) = a.sweep(None, false);
+    assert!(!ok && err.contains("aCaffiene lock is busy"), "{err}");
+    drop(held);
+
+    let a = Account::new("acaffiene-unlocked");
+    let home = a.home().to_path_buf();
+    let app = home.join("Applications/aterm.app");
+    bundle(&app, None);
+    exe(&app.join("Contents/MacOS/aterm"), "#!/bin/sh\nexit 0\n");
+    let support = home.join("Library/Application Support/aterm");
+    let (lock, state) = (
+        support.join("acaffiene.lock"),
+        support.join("acaffiene.state"),
+    );
+    write(&state, "mode=off\n");
+    let code = support.join("acaffiene-code.noindex");
+    let copy = young(&code);
+    let (ok, out, err) = a.sweep(None, true);
+    assert!(
+        !ok,
+        "a copy macOS may still be assessing is kept: {out}{err}"
+    );
+    assert!(
+        out.contains(&format!(
+            "would make and leave aCaffiene lock rendezvous: {}",
+            lock.display()
+        )),
+        "{out}"
+    );
+    assert!(!present(&lock), "a dry run makes none");
+    assert!(err.contains("macOS may still be assessing"), "{err}");
+    assert!(!removes(&out, &code), "{out}");
+    assert!(
+        out.contains(&format!("would remove aCaffiene file: {}", state.display())),
+        "{out}"
+    );
+    assert!(
+        out.contains("requires a helper above that stops aCaffiene"),
+        "a removal that hangs on the helper's answer says so: {out}"
+    );
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(!ok, "{out}{err}");
+    assert!(out.contains("left aCaffiene lock rendezvous"), "{out}");
+    assert!(
+        lock.is_file() && copy.is_dir() && !present(&state),
+        "{out}{err}"
+    );
+
+    let a = Account::new("acaffiene-held-asked");
+    let app = a.home().join("Applications/aterm.app");
+    bundle(&app, None);
+    exe(&app.join("Contents/MacOS/aterm"), "#!/bin/sh\nexit 0\n");
+    let support = a.home().join("Library/Application Support/aterm");
+    let (lock, state) = (
+        support.join("acaffiene.lock"),
+        support.join("acaffiene.state"),
+    );
+    write(&state, "mode=on\n");
+    write(&lock, "");
+    let held = hold(&lock);
+    let (ok, out, err) = a.sweep(None, true);
+    assert!(
+        ok,
+        "the helper's quit ends the mug that holds the lock: {out}{err}"
+    );
+    assert!(removes(&out, &state), "{out}");
+    drop(held);
+
+    let a = Account::new("old-caffeine-unlocked");
+    let support = a.home().join("Library/Application Support/aterm");
+    let (lock, state) = (
+        support.join("caffeine.lock"),
+        support.join("caffeine.state"),
+    );
+    write(&state, "mode=on\n");
+    let code = support.join("caffeine-code.noindex");
+    let copy = young(&code);
+    let (ok, out, err) = a.sweep(None, true);
+    assert!(!ok, "{out}{err}");
+    assert!(
+        out.contains(&format!(
+            "would make and leave old Caffeine lock rendezvous: {}",
+            lock.display()
+        )),
+        "{out}"
+    );
+    assert!(!present(&lock), "a dry run makes none");
+    assert!(err.contains("macOS may still be assessing"), "{err}");
+    assert!(!removes(&out, &code), "{out}");
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(!ok, "{out}{err}");
+    assert!(out.contains("left old Caffeine lock rendezvous"), "{out}");
+    assert!(
+        lock.is_file() && copy.is_dir() && !present(&state),
+        "{out}{err}"
+    );
+
+    write(&state, "mode=on\n");
+    let held = hold(&lock);
+    let (ok, out, err) = a.sweep(None, true);
+    assert!(!ok, "an old mug holds its lock: {out}{err}");
+    assert!(
+        err.contains(
+            "an old Caffeine mug holds this lock, or it could not be acquired; its files would \
+             be kept"
+        ),
+        "{err}"
+    );
+    assert!(!removes(&out, &state), "{out}");
+    let (ok, _, err) = a.sweep(None, false);
+    assert!(!ok && err.contains("its files are kept"), "{err}");
+    assert!(state.is_file());
+    drop(held);
+
+    std::fs::remove_file(&state).expect("rm");
+    std::fs::remove_dir_all(&code).expect("rm");
+    let (ok, out, err) = a.sweep(None, true);
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains(&format!(
+            "would leave old Caffeine lock rendezvous: {}",
+            lock.display()
+        )),
+        "a lone lock: {out}"
+    );
+    assert!(!out.contains("left old Caffeine lock"), "{out}");
+}
+
+#[test]
+fn an_uninstall_removes_what_the_mug_left_under_its_old_name() {
+    let a = Account::new("old-caffeine");
+    let home = a.home().to_path_buf();
+    let support = home.join("Library/Application Support/aterm");
+    let agents = home.join("Library/LaunchAgents");
+    let jobs = [
+        agents.join("com.aterm.aterm.caffeine.plist"),
+        agents.join("com.aterm.aterm.caffeine.dev.0123abcd.plist"),
+    ];
+    let others = [
+        agents.join("com.aterm.aterm.caffeine.dev.0123abc.plist"),
+        agents.join("com.example.caffeine.plist"),
+    ];
+    for plist in jobs.iter().chain(&others) {
+        write(plist, "<plist/>");
+    }
+    let linked = agents.join("com.aterm.aterm.caffeine.dev.0000000a.plist");
+    symlink(&others[1], &linked).expect("symlink");
+    let lock = support.join("caffeine.lock");
+    let plant = || {
+        write(&support.join("caffeine.state"), "mode=on\n");
+        write(&support.join("caffeine.bridge"), "4242\n");
+        write(
+            &support.join("caffeine/com.aterm.aterm.caffeine.plist"),
+            "<plist/>",
+        );
+        write(
+            &support.join("caffeine-code.noindex/l/1-2/aterm.app/Contents/Info.plist"),
+            "<plist/>",
+        );
+        write(
+            &support
+                .join("caffeine-code.noindex/l/1-2")
+                .join(aterm_uds::deadline::RAN),
+            "",
+        );
+    };
+    plant();
+    write(&lock, "");
+    let files = [
+        "caffeine-code.noindex",
+        "caffeine",
+        "caffeine.state",
+        "caffeine.bridge",
+    ]
+    .map(|name| support.join(name));
+
+    let (ok, out, err) = a.sweep(None, true);
+    assert!(ok, "{out}{err}");
+    for plist in &jobs {
+        assert!(
+            out.contains(&format!(
+                "would remove old Caffeine login item: {}",
+                plist.display()
+            )),
+            "{out}"
+        );
+    }
+    assert!(
+        out.contains("old Caffeine file removal requires an acquired idle lock"),
+        "{out}"
+    );
+    for path in &files {
+        let what = if path.ends_with("caffeine-code.noindex") {
+            "aCaffiene file"
+        } else {
+            "old Caffeine file"
+        };
+        assert!(
+            out.contains(&format!("would remove {what}: {}", path.display())),
+            "the dry run names what the real one removes: {out}"
+        );
+    }
+    assert!(
+        out.contains(&format!(
+            "would leave old Caffeine lock rendezvous: {}",
+            lock.display()
+        )),
+        "{out}"
+    );
+    assert!(
+        jobs.iter().chain(&files).all(|path| present(path)),
+        "a dry run keeps them"
+    );
+
+    let held =
+        crate::lock::Flock::try_lock(std::fs::File::open(&lock).expect("open")).expect("hold");
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(!ok, "an old mug holds its lock: {out}{err}");
+    assert!(err.contains("an old Caffeine mug holds this lock"), "{err}");
+    assert!(
+        err.contains(&format!("from {} by hand", support.display())),
+        "it names where the files it kept are: {err}"
+    );
+    assert!(jobs.iter().all(|plist| !present(plist)), "{out}");
+    assert!(files.iter().all(|path| present(path)), "{out}");
+    drop(held);
+
+    let young = support.join("caffeine-code.noindex/l/1-3");
+    write(&young.join("aterm.app/Contents/Info.plist"), "<plist/>");
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(
+        !ok,
+        "a copy macOS may still be assessing is kept: {out}{err}"
+    );
+    assert!(err.contains("macOS may still be assessing"), "{err}");
+    assert!(young.is_dir(), "{out}");
+    assert!(
+        !present(&support.join("caffeine-code.noindex/l/1-2")),
+        "a copy a mug ran from goes: {out}"
+    );
+    assert!(!present(&support.join("caffeine.state")), "{out}");
+    write(&young.join(aterm_uds::deadline::RAN), "");
+
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(ok, "{out}{err}");
+    for path in &files {
+        assert!(!present(path), "{}: {out}", path.display());
+    }
+    assert!(others.iter().all(|plist| plist.is_file()), "{out}");
+    assert!(present(&linked), "a link is no job's plist: {out}");
+    assert!(lock.is_file(), "the rendezvous stays");
+    assert!(
+        out.contains(&format!(
+            "left old Caffeine lock rendezvous: {}",
+            lock.display()
+        )),
+        "{out}"
+    );
+
+    plant();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let mut s = Sweep {
+        dry: false,
+        as_root: None,
+        removed: 0,
+        skipped: 0,
+        kept: 0,
+        shared_kept: 0,
+        outsider: Some(home.join("Applications/aterm.app")),
+        out: &mut out,
+        err: &mut err,
+    };
+    write(&jobs[0], "<plist/>");
+    let held =
+        crate::lock::Flock::try_lock(std::fs::File::open(&lock).expect("open")).expect("hold");
+    sweep_old_caffeine(&mut s, &a.places, None, make_as_account);
+    drop(held);
+    assert_eq!(
+        (s.removed, s.skipped, s.shared_kept),
+        (0, 0, 5),
+        "an outsider sweep leaves them without asking for the lock"
+    );
+    assert!(
+        jobs[0].is_file() && files.iter().all(|path| present(path)),
+        "an aterm left outside the sweep keeps them: {}",
+        String::from_utf8_lossy(&out)
+    );
 }
 
 #[test]
@@ -1396,6 +2123,56 @@ fn the_acaffiene_cleanup_holds_only_the_accounts_lock() {
     std::fs::remove_file(&lock).expect("unlink");
     assert!(acaffiene_cleanup_hold(&lock, None, refuse).is_some());
     assert!(lock.is_file(), "this process's own sweep makes it");
+}
+
+/// A dry run's probe of a lock that is there answers as the real run's hold would, and leaves the
+/// lock as it found it.
+#[test]
+fn a_dry_runs_lock_probe_answers_as_the_cleanup_hold_does() {
+    fn refuse(_: &Path, _: u32) -> bool {
+        panic!("a lock that is there is never made")
+    }
+    let dir = crate::testdir::dir("atpkg-acaffiene-probe-");
+    let lock = dir.join("acaffiene.lock");
+    let me = aterm_uds::peer::our_uid();
+    let gid = std::fs::metadata(&dir).expect("dir").gid();
+    let agree = |account: Option<(u32, u32)>| {
+        let probed = cleanup_lock_free(&lock, account);
+        let held = acaffiene_cleanup_hold(&lock, account, refuse).is_some();
+        assert_eq!(probed, held, "{account:?}");
+        probed
+    };
+    assert!(
+        !cleanup_lock_free(&lock, None),
+        "no lock: the real run makes one"
+    );
+    assert!(!lock.exists(), "a probe makes none");
+    write(&lock, "");
+    assert!(agree(None) && agree(Some((me, gid))));
+    assert!(!agree(Some((me + 1, gid))), "another account's");
+    let held = crate::lock::Flock::try_lock(std::fs::File::open(&lock).expect("open"))
+        .expect("held by a mug");
+    assert!(!agree(None), "a mug holds it");
+    drop(held);
+    assert!(cleanup_lock_free(&lock, None), "the probe let go of it");
+    let second = dir.join("second-name");
+    std::fs::hard_link(&lock, &second).expect("link");
+    assert!(!agree(None), "two names");
+    std::fs::remove_file(&lock).expect("unlink");
+    symlink(&second, &lock).expect("symlink");
+    assert!(!agree(None), "a symlink");
+    std::fs::remove_file(&lock).expect("unlink");
+    let fifo = std::ffi::CString::new(lock.as_os_str().as_encoded_bytes()).expect("path");
+    // SAFETY: `fifo` is a NUL-terminated path that lives across the call.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+    assert!(
+        !cleanup_lock_free(&lock, None),
+        "a FIFO, opened without waiting for a writer"
+    );
+    assert!(
+        std::fs::read(&second).expect("kept").is_empty(),
+        "nothing written"
+    );
 }
 
 #[test]
@@ -2150,12 +2927,20 @@ fn an_uninstall_removes_a_bundle_whose_program_the_kernel_will_not_start() {
 
 #[test]
 fn an_uninstall_asks_an_atpkg_whose_run_a_signal_ended() {
-    let hang = Duration::from_millis(100);
     let hangs = format!("exec sleep {}", aterm_spec::wait::PARKED_SECS);
-    for (run, rc, answer, removed) in [
-        ("kill -KILL $$", 137, hangs.as_str(), false),
-        ("kill -KILL $$", 137, "exit 0", true),
-        ("exit 126", 126, hangs.as_str(), true),
+    // The parked answer's wait is short (its timeout is the subject, and the run that exits
+    // 126 is proven, so no ask may happen); the answer that must arrive gets a hang detector.
+    let short = Duration::from_millis(100);
+    for (run, rc, answer, removed, within) in [
+        ("kill -KILL $$", 137, hangs.as_str(), false, short),
+        (
+            "kill -KILL $$",
+            137,
+            "exit 0",
+            true,
+            aterm_spec::wait::MUST_HAPPEN,
+        ),
+        ("exit 126", 126, hangs.as_str(), true, short),
     ] {
         let a = Account::new("atpkg-run");
         let app = a.home().join("Applications/aterm.app");
@@ -2168,7 +2953,7 @@ fn an_uninstall_asks_an_atpkg_whose_run_a_signal_ended() {
         );
         let atpkg = app.join("Contents/MacOS/atpkg");
         aterm_spec::wait::first_exec(&atpkg, &[]);
-        let (ok, out, err) = a.sweep_within(hang);
+        let (ok, out, err) = a.sweep_within(within);
         assert!(!ok, "the store's removal did not finish: {out}{err}");
         assert!(
             err.contains(&format!(
@@ -2180,7 +2965,7 @@ fn an_uninstall_asks_an_atpkg_whose_run_a_signal_ended() {
         assert_eq!(app.is_dir(), !removed, "{run}, then {answer}: {out}{err}");
         assert_eq!(
             err.contains(&format!(
-                "SKIPPED {} — kept: `{} --version` did not answer within {hang:?}",
+                "SKIPPED {} — kept: `{} --version` did not answer within {within:?}",
                 app.display(),
                 atpkg.display()
             )),

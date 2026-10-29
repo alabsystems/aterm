@@ -167,8 +167,8 @@ fn resolution_prefers_the_flag_then_machine_state_then_none() {
         .expect("an unprovisioned machine resolves clean");
     assert!(none.is_none(), "no flag + no machine key = no credentials");
 
-    let aterm = home.join(".aterm");
-    std::fs::create_dir_all(&aterm).unwrap();
+    let ring = home.join(atpkg_keys::provision::RELEASE_RING_REL);
+    std::fs::create_dir_all(&ring).unwrap();
     let rng = ring::rand::SystemRandom::new();
     let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
     let expected = {
@@ -176,7 +176,7 @@ fn resolution_prefers_the_flag_then_machine_state_then_none() {
         let kp = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
         aterm_codec::base64::encode(kp.public_key().as_ref()).expect("32-byte key")
     };
-    let key_path = aterm.join("machine.key");
+    let key_path = ring.join("machine.key");
     std::fs::write(&key_path, pkcs8.as_ref()).unwrap();
     std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
     let machine = sign::ReleaseCredentials::resolve_with(None, &repo, home.to_str())
@@ -222,11 +222,11 @@ fn a_present_but_unsafe_machine_key_is_an_error_not_a_fallthrough() {
     use std::os::unix::fs::PermissionsExt as _;
     let home = tempdir("resolve-badperm");
     let repo = tempdir("resolve-badperm-repo");
-    let aterm = home.join(".aterm");
-    std::fs::create_dir_all(&aterm).unwrap();
+    let ring = home.join(atpkg_keys::provision::RELEASE_RING_REL);
+    std::fs::create_dir_all(&ring).unwrap();
     let rng = ring::rand::SystemRandom::new();
     let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
-    let key_path = aterm.join("machine.key");
+    let key_path = ring.join("machine.key");
     std::fs::write(&key_path, pkcs8.as_ref()).unwrap();
     std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
     let err = sign::ReleaseCredentials::resolve_with(None, &repo, home.to_str())

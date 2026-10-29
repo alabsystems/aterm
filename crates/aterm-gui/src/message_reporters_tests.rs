@@ -613,8 +613,8 @@ fn a_tab_held_aside_is_said_by_whose_hand_holds_it() {
         (
             AUTOPILOT_OFF,
             "its autopilot is off",
-            "it moves once its autopilot is cruise or land again; Skip version keeps it on \
-             2.1.281",
+            "it moves once its autopilot is cruise or land again, or at once on a press of its \
+             update arrow; Skip version keeps it on 2.1.281",
         ),
     ] {
         let msg = super::agent_upgrade_stalled(&row(aside), NOW, "in tab 2");
@@ -1002,8 +1002,13 @@ fn every_reporter_message() -> Vec<Message> {
     }
     all.push(hold_refused(true, "no session"));
     all.push(hold_refused(false, "no session"));
-    all.push(stop_worker_failed("bench", "no foreground process group"));
+    all.push(stop_worker_failed(
+        2,
+        "bench",
+        "no foreground process group",
+    ));
     all.push(stop_worker_nothing(
+        2,
         "bench",
         "its task is not running: nothing was stopped",
     ));
@@ -1253,11 +1258,21 @@ fn every_reporter_message() -> Vec<Message> {
     all.push(agent_upgrade_worded(
         &upgrade,
         aterm_messages::UpgradeWord::Now,
+        false,
         "in tab 2",
         true,
     ));
+    all.push(agent_upgrade_worded(
+        &upgrade,
+        aterm_messages::UpgradeWord::Now,
+        true,
+        "in tab 2",
+        false,
+    ));
     for word in aterm_messages::UpgradeWord::ALL {
-        all.push(agent_upgrade_worded(&upgrade, word, "in tab 2", false));
+        all.push(agent_upgrade_worded(
+            &upgrade, word, false, "in tab 2", false,
+        ));
         for why in [
             "busy:another-sweep",
             "stale:2.1.283",
@@ -2224,10 +2239,10 @@ fn a_failed_worker_gesture_is_a_row_and_one_that_found_nothing_a_record() {
         hold_refused(false, "x").title,
         "the two presses are titled apart"
     );
-    let failed = stop_worker_failed("bench", "no foreground process group");
+    let failed = stop_worker_failed(2, "bench", "no foreground process group");
     assert_eq!(failed.hold, Hold::For(HOLD_GESTURE));
     assert_eq!(failed.severity, Severity::Warn);
-    let nothing = stop_worker_nothing("bench", "its task is not running");
+    let nothing = stop_worker_nothing(2, "bench", "its task is not running");
     assert_eq!(nothing.hold, Hold::LogOnly, "asked for what already is");
     assert_eq!(nothing.severity, Severity::Info);
     assert!(nothing.actions.is_empty(), "no step");
@@ -2746,6 +2761,48 @@ fn a_quiet_round_its_own_work_gave_up_on_offers_no_upgrade_now() {
 }
 
 #[test]
+fn a_skipped_vendor_revision_offers_no_more_update_actions() {
+    use aterm_agent::harness::upgrade::{Agent, Phase, Request};
+    use aterm_agent::harness::upgrade_drive::Row;
+    use aterm_messages::UpgradeWord;
+    const NOW: u64 = 1_790_311_076;
+    for agent in [Agent::Muse, Agent::Agy] {
+        let row = Row {
+            agent,
+            tab: "s-revision".into(),
+            from: "1.4.10-R6427.1".into(),
+            to: "1.4.10-R6500.1".into(),
+            source: "managed".into(),
+            phase: Phase::Pending,
+            request: Request::Skip("v1.4.10-R6500.1".into()),
+            ..Row::default()
+        };
+        assert!(row.word_in_force(NOW));
+        assert!(super::agent_upgrade_words(&row, NOW).is_empty());
+        assert!(super::agent_upgrade_capsules(&row, NOW).is_empty());
+        let stale = Row {
+            request: Request::Skip("1.4.10-R6500.2".into()),
+            ..row.clone()
+        };
+        assert!(!stale.word_in_force(NOW));
+        assert!(
+            super::agent_upgrade_words(&stale, NOW).contains(&UpgradeWord::Skip),
+            "CONTROL: another revision still offers actions"
+        );
+        let invalid = Row {
+            to: "latest".into(),
+            request: Request::Skip("latest".into()),
+            ..row
+        };
+        assert!(!invalid.word_in_force(NOW));
+        assert!(
+            super::agent_upgrade_words(&invalid, NOW).contains(&UpgradeWord::Skip),
+            "CONTROL: identical unvalidated strings cannot suppress actions"
+        );
+    }
+}
+
+#[test]
 fn the_login_lifecycle_entries_are_showable() {
     let labels = |names: &[&str]| -> Vec<String> { names.iter().map(|n| n.to_string()).collect() };
     let due = super::accounts_due_entry(&labels(&["m7-a", "pool-1"]))
@@ -2917,6 +2974,60 @@ fn no_claude_accounts_fact_asks_a_person_to_sign_in() {
     assert!(
         asks_a_sign_in(&shown(stopped)),
         "the control: a sign-in stopped for a person"
+    );
+}
+
+/// A GROK LOGIN DUE FOR RENEWAL ASKS FOR ITS SIGN-IN: Grok Build's renewals stop at
+/// accounts.x.ai's block page (`Cli::renews_headlessly`), so its due entry names each row's
+/// `accounts login` on a terminal, the first as its step, under the key its pool clears, and
+/// never a renewal; a Grok row that signed in another account names that sign-in too, never a
+/// promise that aterm signs it in by itself. CONTROL: Kimi's due and wrong-account entries,
+/// whose rows the upkeep renews, ask no one.
+#[test]
+fn a_grok_login_due_for_renewal_asks_for_its_sign_in() {
+    use aterm_agent::harness::accounts::Cli;
+    let labels = vec!["grok-1".to_string(), "grok-2".to_string()];
+    let entry = super::accounts_due_entry_for(Cli::Grok, &labels).expect("an entry");
+    assert_eq!(entry.key(), super::pool_notice_key(Cli::Grok, "due"));
+    let msg = entry.message().expect("a valid entry");
+    assert!(asks_a_sign_in(&msg), "{msg:?}");
+    assert_eq!(
+        msg.detail[1], "Run aterm harness accounts login grok-1 --cli grok",
+        "{:?}",
+        msg.detail
+    );
+    assert!(
+        msg.detail
+            .iter()
+            .any(|l| l == "grok-2: Run aterm harness accounts login grok-2 --cli grok")
+            && !format!("{msg:?}").contains("accounts renew"),
+        "{:?}",
+        msg.detail
+    );
+    let kimi = super::accounts_due_entry_for(Cli::Kimi, &labels)
+        .expect("an entry")
+        .message()
+        .expect("a valid entry");
+    assert!(!asks_a_sign_in(&kimi), "CONTROL: {kimi:?}");
+
+    let wrong = |cli| {
+        super::accounts_wrong_entry_for(cli, &labels[..1])
+            .expect("an entry")
+            .message()
+            .expect("a valid entry")
+    };
+    let grok = wrong(Cli::Grok);
+    assert!(asks_a_sign_in(&grok), "{grok:?}");
+    assert!(
+        format!("{grok:?}").contains("accounts login grok-1 --cli grok")
+            && !format!("{grok:?}").contains("signs the row in again by itself"),
+        "{grok:?}"
+    );
+    let kimi = wrong(Cli::Kimi);
+    assert!(!asks_a_sign_in(&kimi), "CONTROL: {kimi:?}");
+    assert!(
+        format!("{kimi:?}").contains("signs the row in again by itself"),
+        "CONTROL: {kimi:?}"
     );
 }
 

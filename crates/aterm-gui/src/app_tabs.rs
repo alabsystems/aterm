@@ -2661,19 +2661,17 @@ impl App {
             .and_then(crate::harness_glass::SessionGlass::end);
         let landed = self.chip_face_landed(h.local_id);
         let hold = self.shown_hold(h.local_id);
-        let held_tip = hold.and_then(|hold| {
-            crate::harness_glass::hold_words(&hold, None, crate::harness_glass::HoldForm::Tip, None)
-        });
-        let stop_tip = self
-            .shown_stop(h.local_id)
-            .map(|arm| crate::harness_glass::stop_words(arm, crate::harness_glass::HoldForm::Tip));
+        let stop = self.shown_stop(h.local_id);
+        let held_tip =
+            hold.and_then(|hold| hold.words(None, crate::harness_glass::HoldForm::Tip, None, stop));
+        let stop_tip = stop.map(|stop| stop.words(crate::harness_glass::HoldForm::Tip));
         let landing_tip = match (stop_tip, held_tip) {
             (Some(stop), Some(held)) => {
                 Some(format!("{stop}{}{held}", crate::native_ui::FACT_SEPARATOR))
             }
             (stop, held) => stop.or(held),
         };
-        let need_alone = hold.is_some_and(crate::harness_glass::HeldGlass::need_alone);
+        let need_alone = hold.is_some_and(|hold| hold.hold.need_alone());
         let (verdict, agent, program, task, told) = {
             let tl = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             (
@@ -3422,7 +3420,12 @@ impl App {
                 self.request_document_tab_in_window(wid, crate::native_app::AppKind::Markdown, &uri)
             });
         if let Err(e) = opened {
-            aterm_log::info!("status item: {}'s result did not open: {e}", result.label);
+            // The row's label can be the program's own title (DESIGN §3.6): the log names the
+            // session.
+            aterm_log::info!(
+                "status item: session {}'s result did not open: {e}",
+                result.session
+            );
             return;
         }
         self.raise_window(wid);
@@ -4742,6 +4745,10 @@ impl App {
         scope: crate::native_app::CloseScope,
         visibility: ClosePreflightVisibility,
     ) -> Result<bool, String> {
+        // An open grid cell commits first; a refused commit keeps the view open.
+        if !self.commit_grid_draft_before_close(view) {
+            return Ok(false);
+        }
         let (readiness, effects) = self
             .native_runtime
             .prepare_close(
@@ -4856,13 +4863,20 @@ impl App {
                     crate::native_app::CloseScope::AppQuit,
                     ClosePreflightVisibility::Quiet,
                 )? {
-                    let title = self
+                    // The leaf's title names the document it holds: the log names the tab by its
+                    // place and its app's kind.
+                    let place = self
+                        .windows
+                        .get(&wid)
+                        .and_then(|window| window.tab_set.tabs().iter().position(|t| t.id == tab));
+                    let kind = self
                         .native_runtime
-                        .presentation(native.instance, view)
-                        .map_or_else(|_| "a tab".to_string(), |p| p.title);
+                        .app(native.instance)
+                        .map_or("unknown", |app| app.kind().as_str());
                     aterm_log::warn!(
-                        "quit: {title} held unsaved work nobody could save or discard ({cause}); \
-                         it ends with this aterm"
+                        "quit: tab {} ({kind}) held unsaved work nobody could save or discard \
+                         ({cause}); it ends with this aterm",
+                        place.map_or_else(|| "?".to_string(), |at| (at + 1).to_string())
                     );
                 }
             }
@@ -6508,6 +6522,7 @@ impl App {
         if let Some(stable) = stable {
             self.resume_stories.remove(stable.as_str());
             crate::occupancy_wakes::forget(stable.as_str());
+            crate::self_claim::forget_read(stable.as_str());
             self.end_occupancy_lines_of(stable.as_str());
             if tasked {
                 crate::task_launch::retire_task_file(&stable);

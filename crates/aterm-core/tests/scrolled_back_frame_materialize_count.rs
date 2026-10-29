@@ -41,6 +41,31 @@ fn frame(term: &mut Terminal, scratch: &mut RenderInput) {
     term.cell_frame_into(scratch, usize::from(ROWS), usize::from(COLS));
 }
 
+fn frame_row_trimmed(scratch: &RenderInput, row: usize) -> String {
+    scratch.cells[row]
+        .iter()
+        .filter(|cell| !cell.wide)
+        .map(|cell| cell.ch)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
+fn assert_frame_matches_display(term: &Terminal, scratch: &RenderInput) {
+    for row in 0..usize::from(ROWS) {
+        let expected = term
+            .display_row_text(row)
+            .expect("in-bounds display row")
+            .trim_end()
+            .to_string();
+        assert_eq!(
+            frame_row_trimmed(scratch, row),
+            expected,
+            "viewport row {row} diverged from display_row_text"
+        );
+    }
+}
+
 #[test]
 fn a_stationary_scrolled_back_repaint_materializes_no_history_rows() {
     let mut term = filled_terminal();
@@ -122,6 +147,7 @@ fn output_arriving_while_scrolled_back_reopens_the_bill() {
         "content changed under a scrolled-back viewport and the memo served the \
          old rows anyway — that is a stale glyph on screen, not a saving"
     );
+    assert_frame_matches_display(&term, &scratch);
 }
 
 #[test]
@@ -133,6 +159,7 @@ fn a_kitty_unscroll_renumbers_history_and_reopens_the_bill() {
     let _ = take_viewport_row_materialize();
     frame(&mut term, &mut scratch);
     assert_eq!(take_viewport_row_materialize(), 0, "parked and warm");
+    let before_top = frame_row_trimmed(&scratch, 0);
 
     let lines_before = term.grid().scrollback_lines();
     let gen_before = term.grid().content_gen();
@@ -182,5 +209,11 @@ fn a_kitty_unscroll_renumbers_history_and_reopens_the_bill() {
          `content_gen` does not move here, so nothing else in this file sees it. \
          (In a debug build the memo's own stale-hit net fires first, from \
          `visible_row_view.rs`; this assertion is the release-build half.)"
+    );
+    assert_frame_matches_display(&term, &scratch);
+    assert_ne!(
+        frame_row_trimmed(&scratch, 0),
+        before_top,
+        "renumbered viewport must render shifted history rows rather than the cached pre-unscroll top row"
     );
 }

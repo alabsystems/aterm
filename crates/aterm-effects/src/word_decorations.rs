@@ -21,7 +21,9 @@ use crate::animal_baker::{AnimalBakeKey, AnimalBaker};
 use crate::animal_glyphs_gen::{ANIMAL_GLYPHS, AnimalGlyphId, animal_glyph_from_key};
 use crate::cat_baker::{BakeKeyV4, CatBaker, CatColorKey, CatTile, EyesFrame, PATCH_STRIP};
 use crate::cat_glyphs_gen::{CatGlyphId, GLYPHS, GlyphDef};
-use crate::color_math::{hsv2rgb, hue_nudge, relative_luminance};
+#[cfg(test)]
+use crate::color_math::relative_luminance;
+use crate::color_math::{hsv2rgb, hue_nudge};
 use crate::effect_util::lerp_rgb as mix_rgb;
 use crate::genome::{
     self, CatAge, Genome, NovaFeatures, NovaMagic, VoteScratch, accessory_variant_v4, cat_age_v4,
@@ -339,6 +341,25 @@ pub struct CatFootprint {
     pub h: u16,
 }
 
+/// The least air the flying head keeps round the caret's cell, on every side,
+/// as a share of its lead ([`KittyCursorPlacement::keep_off_letters`]): half
+/// the shipped ¾-cell lead, so a head the follower trails into the caret is
+/// pushed off with air between them, not glued to its side, and a head lifted
+/// over the caret flies above it instead of perching on its top.
+pub const HEAD_CARET_GAP_DEN: i32 = 2;
+
+#[cfg(test)]
+thread_local! {
+    /// The negative control of [`KittyCursorPlacement::keep_off_letters`]: the
+    /// head is drawn where the follower put it.
+    pub static HEAD_KEEPS_OFF_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of the caret's ring of air (looks10 round 3): only a
+    /// head over the caret's cell itself is kept off, as round 2 kept it, so a
+    /// head flush beside the caret stays there and a lifted one sits a pixel
+    /// over its top.
+    pub static HEAD_CARET_RING_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// One cursor-kitty placement resolved once for palette sampling and sprite emission.
 #[derive(Clone, Copy, Debug)]
 pub struct KittyCursorPlacement {
@@ -374,6 +395,166 @@ impl KittyCursorPlacement {
         match self.drawn {
             Some(draw) => Some(draw.rect),
             None => None,
+        }
+    }
+
+    /// Keep the prepared head off the caret's cell and every lettered cell
+    /// (looks10 L10, looks8's companion law): the follower's glide trails the
+    /// caret through a burst, and a seat change at the right margin glides
+    /// up out of the caret's row, both through the caret and the last
+    /// letters. The head keeps a ring of air round the caret's cell,
+    /// [`HEAD_CARET_GAP_DEN`] of its lead on every side: a head flush beside
+    /// the caret laid its whiskers on it, and one lifted flush over its top
+    /// read as perched on it (round 3). The head is pushed off on the side its
+    /// centre is on, out of that ring, and failing that lifted clear of what
+    /// it would cover; the follower carries on from where it was drawn. A head
+    /// nothing clears (a crowded page) keeps the shipped over-ink seat rather
+    /// than vanishing (a dip reads as blinking).
+    /// `ink` is the seat law's probe ([`crate::rainbow_kitty::companion::cell_ink`]).
+    #[inline]
+    pub fn keep_off_letters<F>(&mut self, geom: EffectGeom, caret: (u16, u16), ink: F)
+    where
+        F: Fn(u16, u16) -> Option<bool>,
+    {
+        let Some(draw) = self.drawn.as_mut() else {
+            return;
+        };
+        let (cw, ch) = (i32::from(geom.cell_w), i32::from(geom.cell_h));
+        if cw <= 0 || ch <= 0 {
+            return;
+        }
+        let (rows, cols) = (i32::from(geom.rows), i32::from(geom.cols));
+        let grid_w = cols.saturating_mul(cw);
+        let (w, h) = (i32::from(draw.rect.w), i32::from(draw.rect.h));
+        let gap = (WordDecorations::kitty_cursor_lead_px(geom.cell_w) / HEAD_CARET_GAP_DEN).max(1);
+        #[cfg(test)]
+        let ring = if HEAD_CARET_RING_OFF.with(std::cell::Cell::get) {
+            0
+        } else {
+            gap
+        };
+        #[cfg(not(test))]
+        let ring = gap;
+        // The caret's cell and the ring of air round it.
+        let caret_box = (
+            i32::from(caret.1) * cw,
+            (i32::from(caret.1) + 1) * cw,
+            i32::from(caret.0) * ch,
+            (i32::from(caret.0) + 1) * ch,
+        );
+        let kept = (
+            caret_box.0 - ring,
+            caret_box.1 + ring,
+            caret_box.2 - ring,
+            caret_box.3 + ring,
+        );
+        // The top of the highest lettered cell the head at (x, y) would
+        // cover, or `None` when it covers no letter.
+        let inked = |x: i32, y: i32| -> Option<i32> {
+            let mut top = None::<i32>;
+            let (r0, r1) = ((y.max(0)) / ch, ((y + h - 1).max(0)) / ch);
+            let (c0, c1) = ((x.max(0)) / cw, ((x + w - 1).max(0)) / cw);
+            let mut r = r0;
+            while r <= r1.min(rows - 1) {
+                let mut c = c0;
+                while c <= c1.min(cols - 1) {
+                    if ink(r as u16, c as u16) == Some(true) {
+                        let t = r * ch;
+                        top = Some(top.map_or(t, |p| p.min(t)));
+                        break;
+                    }
+                    c += 1;
+                }
+                r += 1;
+            }
+            top
+        };
+        // The same, with the caret's ring's top for the caret's ring: `None`
+        // when the head covers neither the ring nor a letter.
+        let blocked = |x: i32, y: i32| -> Option<i32> {
+            let ringed =
+                (x < kept.1 && x + w > kept.0 && y < kept.3 && y + h > kept.2).then_some(kept.2);
+            match (ringed, inked(x, y)) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            }
+        };
+        let (x, y) = (draw.rect.x, draw.rect.y);
+        if blocked(x, y).is_none() {
+            return;
+        }
+        #[cfg(test)]
+        if HEAD_KEEPS_OFF_OFF.with(std::cell::Cell::get) {
+            return;
+        }
+        // A head in the ring, off the caret's cell and the letters, steps out
+        // of the ring by the least move that clears it, so a bob or a glide
+        // that grazes the ring is nudged a few pixels, never thrown across
+        // the caret.
+        let in_cell =
+            x < caret_box.1 && x + w > caret_box.0 && y < caret_box.3 && y + h > caret_box.2;
+        let grid_h = rows.saturating_mul(ch);
+        let nudged = if in_cell || inked(x, y).is_some() {
+            None
+        } else {
+            [
+                (x >= caret_box.1, (kept.1, y)),
+                (x + w <= caret_box.0, (kept.0 - w, y)),
+                (y + h <= caret_box.2, (x, kept.2 - h - 1)),
+                (y >= caret_box.3, (x, kept.3)),
+            ]
+            .into_iter()
+            .filter(|&(side, (nx, ny))| {
+                side && nx >= 0
+                    && nx + w <= grid_w
+                    && ny >= 0
+                    && ny + h <= grid_h
+                    && blocked(nx, ny).is_none()
+            })
+            .map(|(_, at)| at)
+            .min_by_key(|&(nx, ny)| (nx - x).abs() + (ny - y).abs())
+        };
+        let ahead = x + w / 2 > (caret_box.0 + caret_box.1) / 2;
+        let pushed = if ahead {
+            let px = x.max(caret_box.1 + gap);
+            (px + w <= grid_w).then_some(px)
+        } else {
+            let px = x.min(caret_box.0 - gap - w);
+            (px >= 0).then_some(px)
+        };
+        let to = match (nudged, pushed) {
+            (Some(at), _) => Some(at),
+            (None, Some(px)) if blocked(px, y).is_none() => Some((px, y)),
+            _ => {
+                // Lift clear of each cell it would cover, a row at a time.
+                let mut ly = y;
+                let mut found = None;
+                let mut tries = 0;
+                while tries <= rows {
+                    match blocked(x, ly) {
+                        None => {
+                            found = Some((x, ly));
+                            break;
+                        }
+                        Some(top) => ly = top - h - 1,
+                    }
+                    if ly < 0 {
+                        break;
+                    }
+                    tries += 1;
+                }
+                found
+            }
+        };
+        let Some((nx, ny)) = to else {
+            return;
+        };
+        let (dx, dy) = (nx - x, ny - y);
+        draw.rect.x = nx;
+        draw.rect.y = ny;
+        if let Some((sx, sy)) = draw.settle.as_mut() {
+            *sx += dx as f32;
+            *sy += dy as f32;
         }
     }
 
@@ -617,6 +798,7 @@ pub(crate) const fn rainbow_base_hue(gkey: u64) -> f32 {
 }
 
 impl Default for DecoConfig {
+    #[inline]
     fn default() -> Self {
         DecoConfig {
             profanity: true,
@@ -2365,9 +2547,11 @@ impl WordDecorations {
         let clearance = i32::from(dest_w)
             .max(i32::from(nat_w))
             .saturating_add(i32::from(geom.cell_w).saturating_mul(2));
+        #[inline]
         const fn lift(cell_h: u16, q: f32) -> i32 {
             (0.18 * (cell_h as f32) * 4.0 * q * (1.0 - q)).round() as i32
         }
+        #[inline]
         const fn lerp_px(a: i32, b: i32, q: f32) -> i32 {
             ((a as f64) + ((b as f64) - (a as f64)) * (q as f64))
                 .round()
@@ -2796,6 +2980,10 @@ impl WordDecorations {
             None
         };
 
+        let mut fp = FNV64_OFFSET;
+        if let Some(s) = &sprite {
+            fp = fold_free(fp, s);
+        }
         let mut mote_sprites: [Option<FreeSprite>; crate::kitty_pet::PET_MOTES_MAX] =
             [const { None }; crate::kitty_pet::PET_MOTES_MAX];
         let mut mote_len = 0usize;
@@ -2804,6 +2992,7 @@ impl WordDecorations {
             let pet_alpha_scale = f32::from(pet.alpha) * INV_255;
             let cell_dims = (geom.cell_w, geom.cell_h);
             let grid_dims = (geom.cols, geom.rows);
+            let mut page_lum = None;
             let mut side = 0u16;
             let mut mi = 0;
             while mi < pet.motes.len() {
@@ -2849,51 +3038,44 @@ impl WordDecorations {
                     Some(rgb) => rgb,
                     None => Self::pet_mote_tint(m.kind, colors),
                 };
-                mote_sprites[mote_len] = Some(FreeSprite {
+                let tint = if matches!(
+                    m.kind,
+                    crate::kitty_pet::PetMoteKind::Note | crate::kitty_pet::PetMoteKind::Heart
+                ) && let Some(bg) = page
+                {
+                    let lum = *page_lum.get_or_insert_with(|| {
+                        let table = crate::color_math::relative_luminance_table();
+                        (table, crate::color_math::relative_luminance_with(table, bg))
+                    });
+                    Self::pet_mote_on_page(m.kind, raw_tint, Some(lum))
+                } else {
+                    raw_tint
+                };
+                let mote_sprite = FreeSprite {
                     x,
                     y,
                     w: dest,
                     h: dest,
                     art: tile.art,
                     clip: PxRect::EVERYWHERE,
-                    tint: Self::pet_mote_on_page(m.kind, raw_tint, page),
+                    tint,
                     alpha,
                     flip_x: false,
                     z: FreeZ::OverText,
-                });
+                };
+                fp = fold_free(fp, &mote_sprite);
+                mote_sprites[mote_len] = Some(mote_sprite);
                 mote_len += 1;
             }
         }
-        let mut depart_sprites: [Option<FreeSprite>; crate::kitty_pet::PET_DEPARTURES_MAX] =
-            [const { None }; crate::kitty_pet::PET_DEPARTURES_MAX];
-        let mut depart_len = 0usize;
         let mut di = 0;
         while di < pet.departures.len() {
             if let Some(d) = pet.departures[di]
                 && !d.own_glass
                 && let Some(sp) = self.pet_departure_sprite(d, &pet, geom, colors, (nat_w, nat_h))
             {
-                depart_sprites[depart_len] = Some(sp);
-                depart_len += 1;
-            }
-            di += 1;
-        }
-        let mut fp = FNV64_OFFSET;
-        if let Some(s) = &sprite {
-            fp = fold_free(fp, s);
-        }
-        let mut mi = 0;
-        while mi < mote_len {
-            if let Some(m) = &mote_sprites[mi] {
-                fp = fold_free(fp, m);
-            }
-            mi += 1;
-        }
-        let mut di = 0;
-        while di < depart_len {
-            if let Some(g) = depart_sprites[di].take() {
-                fp = fold_free(fp, &g);
-                free.push(g);
+                fp = fold_free(fp, &sp);
+                free.push(sp);
             }
             di += 1;
         }
@@ -2921,6 +3103,7 @@ impl WordDecorations {
         (art, host): (&Arc<FxArt>, u64),
         live: &[Option<crate::kitty_pet::PetDepartureSprite>],
     ) {
+        #[inline]
         const fn departure_owned(
             held: u32,
             live: &[Option<crate::kitty_pet::PetDepartureSprite>],
@@ -3191,13 +3374,13 @@ impl WordDecorations {
     const fn pet_mote_on_page(
         kind: crate::kitty_pet::PetMoteKind,
         tint: u32,
-        page: Option<u32>,
+        page_lum: Option<(&crate::color_math::RelativeLuminanceTable, f32)>,
     ) -> u32 {
-        match (kind, page) {
+        match (kind, page_lum) {
             (
                 crate::kitty_pet::PetMoteKind::Note | crate::kitty_pet::PetMoteKind::Heart,
-                Some(bg),
-            ) => crate::rainbow_kitty::ribbon::paper_mark_ink(tint, bg),
+                Some((table, y_bg)),
+            ) => crate::rainbow_kitty::ribbon::paper_mark_ink_with_bg_lum(table, tint, y_bg),
             _ => tint,
         }
     }
@@ -3678,7 +3861,7 @@ impl WordDecorations {
         if let Some(cell) = cursor {
             self.last_caret = Some(cell);
         }
-        let mut out = self.rescan_begin();
+        let mut out = self.rescan_begin(rows);
         let mut ink_full = false;
         let mut row_cells = std::mem::take(&mut self.scan_cells);
         let mut start_row = 0usize;
@@ -3823,7 +4006,8 @@ impl WordDecorations {
         }
         let opts = cfg.scan_opts();
         self.scan_memo.fit(rows, scan_inputs_fp(lexicon, &opts));
-        let mut out = self.rescan_begin();
+        let pass_end = rows.min(cells.len());
+        let mut out = self.rescan_begin(pass_end);
         let mut ink_full = false;
         let mut row_cells = std::mem::take(&mut self.scan_cells);
         let mut start_row = 0usize;
@@ -3831,7 +4015,6 @@ impl WordDecorations {
             Some((geom, default_bg)) => (Some(cells), Some(geom), Some(default_bg)),
             None => (None, None, None),
         };
-        let pass_end = rows.min(cells.len());
         'pass: loop {
             let mut r = start_row;
             while r < pass_end {
@@ -3932,12 +4115,14 @@ impl WordDecorations {
     }
 
     #[inline]
-    fn rescan_begin(&mut self) -> Vec<Occurrence> {
+    fn rescan_begin(&mut self, rows: usize) -> Vec<Occurrence> {
         self.seed_ordinals.clear();
         self.rescan_seq = self.rescan_seq.wrapping_add(1);
         self.pending.clear();
         self.scan_row_occupied.clear();
+        self.scan_row_occupied.resize(rows, false);
         self.pet_ink_spans.clear();
+        self.pet_ink_spans.resize(rows, (0, 0));
         let mut out = std::mem::take(&mut self.occ);
         out.clear();
         self.ink_base_fg.clear();
@@ -4760,11 +4945,20 @@ impl WordDecorations {
                         || (group_class == Class::Profanity && group_has_live_caret_completion))
                 {
                     let old_key = old_ident ^ ep.ctx_fp;
-                    if group_class == Class::Feline
-                        && !typed_keys[..typed_keys_len].contains(&old_key)
-                    {
-                        self.insert_persist_bounded(old_ident, ep, PersistAdmission::Grace);
-                        continue;
+                    if group_class == Class::Feline {
+                        let mut typed = false;
+                        let mut ti = 0;
+                        while ti < typed_keys_len {
+                            if typed_keys[ti] == old_key {
+                                typed = true;
+                                break;
+                            }
+                            ti += 1;
+                        }
+                        if !typed {
+                            self.insert_persist_bounded(old_ident, ep, PersistAdmission::Grace);
+                            continue;
+                        }
                     }
                     self.done_marks.remove(old_key);
                     continue;
@@ -4831,7 +5025,12 @@ impl WordDecorations {
             (None, _) => self.companion_claim = None,
             (Some(_), None) => {}
             (_, Some(cell)) => {
+                let fallback_id = match self.caret_word {
+                    Some((id, at)) if at.0 == cell.0 && at.1 <= cell.1 => Some(id),
+                    _ => None,
+                };
                 let mut live = None;
+                let mut fallback_live = None;
                 let mut oi = 0;
                 while oi < self.occ.len() {
                     let occ = &self.occ[oi];
@@ -4839,22 +5038,12 @@ impl WordDecorations {
                         live = Some(occ.ident);
                         break;
                     }
+                    if fallback_live.is_none() && fallback_id == Some(occ.ident) {
+                        fallback_live = Some(occ.ident);
+                    }
                     oi += 1;
                 }
-                if live.is_none()
-                    && let Some((id, at)) = self.caret_word
-                    && at.0 == cell.0
-                    && at.1 <= cell.1
-                {
-                    let mut oi = 0;
-                    while oi < self.occ.len() {
-                        if self.occ[oi].ident == id {
-                            live = Some(id);
-                            break;
-                        }
-                        oi += 1;
-                    }
-                }
+                let live = live.or(fallback_live);
                 if live.is_some() {
                     self.companion_claim = live;
                 }
@@ -4938,6 +5127,7 @@ impl WordDecorations {
         };
         let mut cats = 0usize;
         let mut animals = 0usize;
+        let table = crate::color_math::relative_luminance_table();
 
         let mut oi = 0;
         while oi < self.occ.len() {
@@ -4957,7 +5147,11 @@ impl WordDecorations {
                         colorway: Colorway::Rainbow { .. } | Colorway::TwoTone { .. },
                         ..
                     })
-                ) {
+                )
+                && (matches!(occ.spec.burst, Some(b) if b.kind == BurstKind::Nova)
+                    || !self.supers.is_empty()
+                    || !self.coupling.is_empty())
+            {
                 ink_fx(
                     cur_oi,
                     occ,
@@ -4968,11 +5162,13 @@ impl WordDecorations {
                     &self.supers,
                     &self.coupling,
                     ep,
+                    table,
                 )
             } else {
                 INK_FX_NONE
             };
             emit_ink(
+                table,
                 occ,
                 cfg,
                 now,
@@ -5125,6 +5321,7 @@ impl WordDecorations {
                 }
                 BurstKind::SuperNova => {
                     emit_super_axis(
+                        table,
                         occ,
                         cur_oi,
                         cfg,
@@ -5151,6 +5348,7 @@ impl WordDecorations {
                     let t = now.saturating_duration_since(occ.appeared).as_millis() as u64;
                     if t < GLOW_BURST_MS && out.len() < MAX_DECORATIONS {
                         const INV_GLOW_BURST_MS: f32 = 1.0 / GLOW_BURST_MS as f32;
+                        const STAR_RGB: u32 = crate::effect_util::twinkle_rgb(true);
                         let until = occ.appeared + Duration::from_millis(GLOW_BURST_MS);
                         arm_until(&mut active_until, until);
                         let e = crate::supernova::sin_cos_f32(
@@ -5166,7 +5364,7 @@ impl WordDecorations {
                             dy: -((i32::from(geom.cell_h) / 3).min(127) as i8),
                             glyph: DecoGlyph::Star4,
                             blend: DecoBlend::Add,
-                            color: crate::effect_util::twinkle_rgb(true),
+                            color: STAR_RGB,
                             alpha: scale_u8(cfg.intensity * 0.8 * e),
                         };
                         fp = fold_deco(fp, &d) ^ frame.wrapping_mul(0x9E37_79B1);
@@ -5401,26 +5599,36 @@ impl WordDecorations {
                     _ => {}
                 }
             }
+            let mut appeared_ms: Option<u64> = None;
             if cfg.ink_enabled && occ.ink_cells > 0 && occ.spec.ink.is_some() {
                 ep.sweep_started = true;
-                let t = now.saturating_duration_since(ep.appeared).as_millis() as u64;
-                let (win, once) = match occ.spec.ink {
-                    Some(InkSpec {
-                        colorway: Colorway::SelfGlow { window_ms, .. },
-                        ..
-                    }) => (u64::from(window_ms), true),
-                    Some(InkSpec {
-                        colorway: Colorway::Rainbow { drift_ms, .. },
-                        ..
-                    }) => (u64::from(drift_ms), true),
-                    Some(s) => (u64::from(cfg.ink_sweep_ms) + INK_FADE_MS, s.sweep_once),
-                    None => (0, true),
-                };
-                if once && t >= win {
-                    ep.sweep_done = true;
+                if !ep.sweep_done {
+                    let t = now.saturating_duration_since(ep.appeared).as_millis() as u64;
+                    appeared_ms = Some(t);
+                    let (win, once) = match occ.spec.ink {
+                        Some(InkSpec {
+                            colorway: Colorway::SelfGlow { window_ms, .. },
+                            ..
+                        }) => (u64::from(window_ms), true),
+                        Some(InkSpec {
+                            colorway: Colorway::Rainbow { drift_ms, .. },
+                            ..
+                        }) => (u64::from(drift_ms), true),
+                        Some(s) => (u64::from(cfg.ink_sweep_ms) + INK_FADE_MS, s.sweep_once),
+                        None => (0, true),
+                    };
+                    if once && t >= win {
+                        ep.sweep_done = true;
+                    }
                 }
             }
-            if let Some(g) = occ.spec.graphic {
+            if let Some(g) = occ.spec.graphic
+                && !(ep.peek_done
+                    && matches!(
+                        ep.shown_as,
+                        Some(KittyShownAs::Cat | KittyShownAs::PawStyle)
+                    ))
+            {
                 {
                     let is_animal = g.collection == Collection::Animals;
                     let drawable = if is_animal {
@@ -5509,9 +5717,11 @@ impl WordDecorations {
                 Some(BurstSpec {
                     kind: BurstKind::Sparkle | BurstKind::Starburst,
                     ..
-                }) if !cfg.reduced_motion && ep.burst_roll => {
+                }) if !cfg.reduced_motion && ep.burst_roll && !ep.burst_done => {
                     ep.burst_started = true;
-                    let t = now.saturating_duration_since(ep.appeared).as_millis() as u64;
+                    let t = appeared_ms.unwrap_or_else(|| {
+                        now.saturating_duration_since(ep.appeared).as_millis() as u64
+                    });
                     if t >= cfg.anim_ms + RESIDUAL_FADE_MS {
                         ep.burst_done = true;
                     }
@@ -5519,9 +5729,11 @@ impl WordDecorations {
                 Some(BurstSpec {
                     kind: BurstKind::Glow,
                     ..
-                }) if !cfg.reduced_motion && ep.burst_roll => {
+                }) if !cfg.reduced_motion && ep.burst_roll && !ep.burst_done => {
                     ep.burst_started = true;
-                    let t = now.saturating_duration_since(ep.appeared).as_millis() as u64;
+                    let t = appeared_ms.unwrap_or_else(|| {
+                        now.saturating_duration_since(ep.appeared).as_millis() as u64
+                    });
                     if t >= GLOW_BURST_MS {
                         ep.burst_done = true;
                     }
@@ -5676,7 +5888,7 @@ impl WordDecorations {
                 i += 1;
                 continue;
             }
-            let (cx, cy) = burst_center(occ, geom);
+            let mut center_px = None;
             if ep.nova_start.is_none() {
                 // Deferred while selected (§3.2 safety) or while another
                 // supernova holds the mutex (MAX_ACTIVE_SUPERNOVAE = 1).
@@ -5686,6 +5898,8 @@ impl WordDecorations {
                     i += 1;
                     continue;
                 }
+                let c = burst_center(occ, geom);
+                center_px = Some(c);
                 if !grant_burst(
                     &mut self.ignitions,
                     scope,
@@ -5693,7 +5907,7 @@ impl WordDecorations {
                     occ,
                     ep,
                     now,
-                    (cx, cy),
+                    c,
                     r_max,
                     &mut self.burst_hint,
                     &mut self.curse_cues,
@@ -5724,7 +5938,7 @@ impl WordDecorations {
                 self.supers.push(SuperLive {
                     idx: i as u16,
                     start,
-                    center_px: (cx, cy),
+                    center_px: center_px.unwrap_or_else(|| burst_center(occ, geom)),
                     r_max,
                 });
             }
@@ -5769,8 +5983,7 @@ impl WordDecorations {
                 i += 1;
                 continue;
             }
-            let (cx, cy) = burst_center(occ, geom);
-            let r_max = nova_radius(occ.genome.gkey) * ch_f;
+            let mut center_r_max = None;
             if ep.nova_start.is_none() {
                 // `chance_pct`: a rolled-off burst never ignites (episodes with
                 // a pre-granted `nova_start` are past the roll).
@@ -5790,6 +6003,9 @@ impl WordDecorations {
                     i += 1;
                     continue;
                 }
+                let c = burst_center(occ, geom);
+                let r_max = nova_radius(occ.genome.gkey) * ch_f;
+                center_r_max = Some((c, r_max));
                 if !grant_burst(
                     &mut self.ignitions,
                     scope,
@@ -5797,7 +6013,7 @@ impl WordDecorations {
                     occ,
                     ep,
                     now,
-                    (cx, cy),
+                    c,
                     r_max,
                     &mut self.burst_hint,
                     &mut self.curse_cues,
@@ -5827,10 +6043,12 @@ impl WordDecorations {
                 i += 1;
                 continue;
             }
+            let (center_px, r_max) = center_r_max
+                .unwrap_or_else(|| (burst_center(occ, geom), nova_radius(occ.genome.gkey) * ch_f));
             self.novas.push(NovaLive {
                 idx: i as u16,
                 start,
-                center_px: (cx, cy),
+                center_px,
                 r_max,
                 feats: nova_features(occ.genome.gkey),
                 magic: if cfg.profanity_magic {
@@ -5854,8 +6072,12 @@ impl WordDecorations {
                 }
                 i += 1;
             }
-            self.dist_scratch.sort_unstable();
             let take_n = self.dist_scratch.len().min(nova::MAX_COUPLING_WORDS);
+            if self.dist_scratch.len() > nova::MAX_COUPLING_WORDS {
+                self.dist_scratch
+                    .select_nth_unstable(nova::MAX_COUPLING_WORDS - 1);
+            }
+            self.dist_scratch[..take_n].sort_unstable();
             let mut di = 0;
             while di < take_n {
                 self.coupling.push((self.dist_scratch[di].1, ni as u8));
@@ -6073,17 +6295,19 @@ fn emit_nova_axis(
                 let q = nova[r];
                 let ccol = ((i32::from(q.x) + i32::from(q.w) / 2) / cw).max(0) as u16;
                 if !sv.cell_selected(q.row, ccol) {
+                    *fp = fold_glow(*fp, &q);
                     nova[w] = q;
                     w += 1;
                 }
                 r += 1;
             }
             nova.truncate(w);
-        }
-        let mut qi = n0;
-        while qi < nova.len() {
-            *fp = fold_glow(*fp, &nova[qi]);
-            qi += 1;
+        } else {
+            let mut qi = n0;
+            while qi < nova.len() {
+                *fp = fold_glow(*fp, &nova[qi]);
+                qi += 1;
+            }
         }
         let d0 = out.len();
         nova::emit_debris(t, &env, out, MAX_DECORATIONS);
@@ -6168,6 +6392,7 @@ fn emit_nova_axis(
 )]
 #[inline]
 fn emit_super_axis(
+    table: &crate::color_math::RelativeLuminanceTable,
     occ: &Occurrence,
     oi: usize,
     cfg: &DecoConfig,
@@ -6205,7 +6430,12 @@ fn emit_super_axis(
         let until = sv.start + Duration::from_millis(supernova::total_ms(tier));
         arm_until(active_until, until);
         *fp = fnv_mix_u64(*fp, frame.wrapping_mul(0x9E37_79B1));
-        let light = relative_luminance(rgb3_to_u32(occ.ink_bg)) > 0.5;
+        let light = crate::color_math::relative_luminance_rgb(
+            table,
+            occ.ink_bg[0] as usize,
+            occ.ink_bg[1] as usize,
+            occ.ink_bg[2] as usize,
+        ) > 0.5;
         let advance = i32::from(geom.cell_w) * if occ.dec_line { 2 } else { 1 };
         let env = SuperEnv {
             grid_w: i32::from(geom.cols) * i32::from(geom.cell_w),
@@ -6251,17 +6481,19 @@ fn emit_super_axis(
             while r < out.len() {
                 let dq = out[r];
                 if !(matches!(dq.blend, DecoBlend::Over) && sv_sel.cell_selected(dq.row, dq.col)) {
+                    *fp = fold_deco(*fp, &dq);
                     out[w] = dq;
                     w += 1;
                 }
                 r += 1;
             }
             out.truncate(w);
-        }
-        let mut di = d0;
-        while di < out.len() {
-            *fp = fold_deco(*fp, &out[di]);
-            di += 1;
+        } else {
+            let mut di = d0;
+            while di < out.len() {
+                *fp = fold_deco(*fp, &out[di]);
+                di += 1;
+            }
         }
     } else if !cfg.reduced_motion
         && let Some(ep) = ep
@@ -6273,6 +6505,7 @@ fn emit_super_axis(
             let t = now.saturating_duration_since(end).as_millis() as u64;
             if t < RESIDUAL_FADE_MS {
                 const INV_RESIDUAL_FADE_MS: f32 = 1.0 / RESIDUAL_FADE_MS as f32;
+                const STAR_RGB: u32 = crate::effect_util::twinkle_rgb(true);
                 let f = 1.0 - t as f32 * INV_RESIDUAL_FADE_MS;
                 let until = end + Duration::from_millis(RESIDUAL_FADE_MS);
                 arm_until(active_until, until);
@@ -6283,7 +6516,7 @@ fn emit_super_axis(
                     dy: -((i32::from(geom.cell_h) / 3).min(127) as i8),
                     glyph: DecoGlyph::Star4,
                     blend: DecoBlend::Add,
-                    color: crate::effect_util::twinkle_rgb(true),
+                    color: STAR_RGB,
                     alpha: scale_u8(cfg.intensity * 0.30 * f),
                 };
                 *fp = fold_deco(*fp, &d);
@@ -6366,11 +6599,33 @@ const fn span_dist2(occ: &Occurrence, center: (i32, i32), geom: EffectGeom) -> u
     ((dx as i64) * (dx as i64) + (dy as i64) * (dy as i64)) as u64
 }
 
+const NUDGED_NOVA_TABLE: [([u32; 16], [u32; 16]); 8] = {
+    let mut out = [([0u32; 16], [0u32; 16]); 8];
+    let mut pi = 0;
+    while pi < 8 {
+        let (core, fringe) = nova::palette(pi as u8);
+        let mut n = 0;
+        while n < 16 {
+            out[pi].0[n] = hue_nudge(core, n as u8);
+            out[pi].1[n] = hue_nudge(fringe, n as u8);
+            n += 1;
+        }
+        pi += 1;
+    }
+    out
+};
+
+#[inline]
+const fn nudged_nova_pair(palette: u8, gkey: u64) -> (u32, u32) {
+    let (n0, n1) = genome::ink_pair_nudges(Class::Profanity, gkey);
+    let (cores, fringes) = &NUDGED_NOVA_TABLE[(palette as usize) & 7];
+    (cores[(n0 & 0xF) as usize], fringes[(n1 & 0xF) as usize])
+}
+
 #[inline]
 const fn nova_env(occ: &Occurrence, nv: &NovaLive, geom: EffectGeom, cfg: &DecoConfig) -> NovaEnv {
     let advance = (geom.cell_w as i32) * if occ.dec_line { 2 } else { 1 };
-    let (core, fringe) = nova::palette(nv.feats.palette);
-    let (n0, n1) = genome::ink_pair_nudges(Class::Profanity, occ.genome.gkey);
+    let (core, fringe) = nudged_nova_pair(nv.feats.palette, occ.genome.gkey);
     let cell_w = if advance > 1 { advance } else { 1 };
     let ch = geom.cell_h as i32;
     let cell_h = if ch > 1 { ch } else { 1 };
@@ -6384,8 +6639,8 @@ const fn nova_env(occ: &Occurrence, nv: &NovaLive, geom: EffectGeom, cfg: &DecoC
         r_max: nv.r_max,
         feats: nv.feats,
         magic: nv.magic,
-        core: hue_nudge(core, n0),
-        fringe: hue_nudge(fringe, n1),
+        core,
+        fringe,
         intensity: cfg.intensity,
         seed: occ.seed,
     }
@@ -6422,6 +6677,7 @@ fn ink_fx(
     supers: &[SuperLive],
     coupling: &[(u16, u8)],
     ep: Option<&Episode>,
+    lum_table: &crate::color_math::RelativeLuminanceTable,
 ) -> InkFx {
     let mut fx = INK_FX_NONE;
     let mut si = 0;
@@ -6451,19 +6707,17 @@ fn ink_fx(
         break;
     }
     if matches!(occ.spec.burst, Some(b) if b.kind == BurstKind::Nova) {
-        let magic = if cfg.profanity_magic {
-            nova_magic(occ.genome.magic)
-        } else {
-            None
-        };
-        let (core, fringe) = nova::palette(nova_palette(occ.genome.gkey));
-        let (n0, n1) = genome::ink_pair_nudges(Class::Profanity, occ.genome.gkey);
-        let pair = (hue_nudge(core, n0), hue_nudge(fringe, n1));
+        let pair = nudged_nova_pair(nova_palette(occ.genome.gkey), occ.genome.gkey);
         let done = match ep {
             Some(e) => e.nova_done,
             None => true,
         };
         if cfg.reduced_motion || done {
+            let magic = if cfg.profanity_magic {
+                nova_magic(occ.genome.magic)
+            } else {
+                None
+            };
             fx.pair = Some(nova::ember_pair(pair, magic));
         } else {
             fx.pair = Some(pair);
@@ -6514,8 +6768,8 @@ fn ink_fx(
                     (amp, amp)
                 };
                 fx.pair = Some((
-                    nova::pulse_color(c0, fringe, a0),
-                    nova::pulse_color(c1, fringe, a1),
+                    nova::pulse_color_with(lum_table, c0, fringe, a0),
+                    nova::pulse_color_with(lum_table, c1, fringe, a1),
                 ));
                 fx.frame_live = true;
             }
@@ -6885,6 +7139,71 @@ struct PeekView {
     unlogged: bool,
 }
 
+#[derive(Clone, Copy)]
+struct PeekTiming {
+    t: u64,
+    dwell_end: u64,
+    antic: u64,
+    in_rise: bool,
+    in_dwell: bool,
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "pure per-occurrence timing resolution over tick-local accumulators"
+)]
+#[inline]
+fn resolve_peek_timing(
+    occ: &Occurrence,
+    cfg: &DecoConfig,
+    now: Instant,
+    frame: u64,
+    peek: PeekView,
+    magical: bool,
+    fp: &mut u64,
+    active_until: &mut Option<Instant>,
+) -> Option<PeekTiming> {
+    if peek.peek_done {
+        return None;
+    }
+    let ps = peek.start?;
+    let dwell_range = match occ.spec.graphic {
+        Some(g) => g.dwell_ms,
+        None => (2200, 3598),
+    };
+    let dwell = peek_dwell_ms(occ.ident, occ.genome.gkey, magical, dwell_range);
+    let antic = anticipation_ms(occ.genome.gkey);
+    let total = CAT_RISE_MS + dwell + antic + CAT_DESCEND_MS;
+    let dwell_end = CAT_RISE_MS + dwell;
+
+    let (t, in_rise, in_dwell) = if cfg.reduced_motion {
+        // A completed peek stays done under reduced motion (unfocused windows
+        // are demoted to it). The clock latched at birth, so the pose shows
+        // from the first presented frame and the flags never advance while
+        // reduced. An unlatched clock (defensive) shows nothing.
+        (CAT_RISE_MS, false, true)
+    } else {
+        if now < ps {
+            arm_until(active_until, ps + Duration::from_millis(total));
+            *fp = fnv_mix_u64(*fp, frame.wrapping_mul(0x9E37_79B1));
+            return None;
+        }
+        let t = now.saturating_duration_since(ps).as_millis() as u64;
+        if t >= total {
+            return None;
+        }
+        arm_until(active_until, ps + Duration::from_millis(total));
+        (t, t < CAT_RISE_MS, t >= CAT_RISE_MS && t < dwell_end)
+    };
+    Some(PeekTiming {
+        t,
+        dwell_end,
+        antic,
+        in_rise,
+        in_dwell,
+    })
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "pure per-occurrence emission over tick-local accumulators, exactly like emit_ink; a carrier struct would rename the list, not shrink it"
@@ -6907,6 +7226,11 @@ fn emit_cat(
     } else {
         None
     };
+    let magical = magic.is_some() || has_accessory(occ.genome.magic);
+    let Some(timing) = resolve_peek_timing(occ, cfg, now, frame, peek, magical, fp, active_until)
+    else {
+        return;
+    };
     let special = if cfg.feline_magic {
         special_variant_v4(occ.genome.magic)
     } else {
@@ -6924,16 +7248,6 @@ fn emit_cat(
     let age = cat_age_v4(occ.genome.gkey);
     let g = cat_geometry(occ, geom, variant);
     let (coat, iris) = cat_fills_v4(occ.genome.gkey);
-    let key = BakeKeyV4 {
-        variant,
-        accessory,
-        coat,
-        iris,
-        colors: occ.cat_colors,
-        w: g.w,
-        h: g.hart,
-        eyes: EyesFrame::Open,
-    };
     let Some((top, bottom)) = emit_peek(
         ctx,
         occ,
@@ -6941,11 +7255,22 @@ fn emit_cat(
         geom,
         now,
         frame,
-        peek,
+        timing,
         g,
-        magic.is_some() || has_accessory(occ.genome.magic),
         age == CatAge::Kitten,
-        |ctx| ctx.baker.get_v4(&key),
+        |ctx| {
+            let key = BakeKeyV4 {
+                variant,
+                accessory,
+                coat,
+                iris,
+                colors: occ.cat_colors,
+                w: g.w,
+                h: g.hart,
+                eyes: EyesFrame::Open,
+            };
+            ctx.baker.get_v4(&key)
+        },
         free,
         fp,
         active_until,
@@ -7003,13 +7328,11 @@ fn emit_animal(
     fp: &mut u64,
     active_until: &mut Option<Instant>,
 ) {
-    let g = animal_geometry(occ, geom, species);
-    let key = AnimalBakeKey {
-        species,
-        colors: occ.cat_colors,
-        w: g.w,
-        h: g.hart,
+    let Some(timing) = resolve_peek_timing(occ, cfg, now, frame, peek, false, fp, active_until)
+    else {
+        return;
     };
+    let g = animal_geometry(occ, geom, species);
     emit_peek(
         ctx,
         occ,
@@ -7017,11 +7340,16 @@ fn emit_animal(
         geom,
         now,
         frame,
-        peek,
+        timing,
         g,
         false,
-        false,
         |ctx| {
+            let key = AnimalBakeKey {
+                species,
+                colors: occ.cat_colors,
+                w: g.w,
+                h: g.hart,
+            };
             let host = key.host_id();
             match ctx.animal_baker.tile(&key) {
                 Some(rgba) => match ctx.baker.host_tile(host, key.w, key.h, rgba) {
@@ -7049,49 +7377,23 @@ fn emit_peek<'a>(
     geom: EffectGeom,
     now: Instant,
     frame: u64,
-    peek: PeekView,
+    timing: PeekTiming,
     g: CatGeom,
-    magical: bool,
     kitten: bool,
     bake: impl FnOnce(&mut CatTick<'a>) -> Option<CatTile>,
     free: &mut Vec<FreeSprite>,
     fp: &mut u64,
     active_until: &mut Option<Instant>,
 ) -> Option<(i32, i32)> {
-    if peek.peek_done {
-        return None;
-    }
-    let ps = peek.start?;
+    let PeekTiming {
+        t,
+        dwell_end,
+        antic,
+        in_rise,
+        in_dwell,
+    } = timing;
     let ch = i32::from(geom.cell_h);
     let rest = i32::from(cat_rest_reveal(g.hart));
-    let dwell_range = match occ.spec.graphic {
-        Some(g) => g.dwell_ms,
-        None => (2200, 3598),
-    };
-    let dwell = peek_dwell_ms(occ.ident, occ.genome.gkey, magical, dwell_range);
-    let antic = anticipation_ms(occ.genome.gkey);
-    let total = CAT_RISE_MS + dwell + antic + CAT_DESCEND_MS;
-    let dwell_end = CAT_RISE_MS + dwell;
-
-    let (t, in_rise, in_dwell) = if cfg.reduced_motion {
-        // A completed peek stays done under reduced motion (unfocused windows
-        // are demoted to it). The clock latched at birth, so the pose shows
-        // from the first presented frame and the flags never advance while
-        // reduced. An unlatched clock (defensive) shows nothing.
-        (CAT_RISE_MS, false, true)
-    } else {
-        if now < ps {
-            arm_until(active_until, ps + Duration::from_millis(total));
-            *fp = fnv_mix_u64(*fp, frame.wrapping_mul(0x9E37_79B1));
-            return None;
-        }
-        let t = now.saturating_duration_since(ps).as_millis() as u64;
-        if t >= total {
-            return None;
-        }
-        arm_until(active_until, ps + Duration::from_millis(total));
-        (t, t < CAT_RISE_MS, t >= CAT_RISE_MS && t < dwell_end)
-    };
     let td = t.saturating_sub(CAT_RISE_MS);
     if !cfg.reduced_motion {
         *fp = fnv_mix_u64(*fp, frame.wrapping_mul(0x9E37_79B1));
@@ -7186,29 +7488,45 @@ fn emit_peek<'a>(
     }
 }
 
-#[inline]
-const fn ink_pair(class: Class) -> Option<(u32, u32)> {
-    match class {
-        Class::Emphasis => Some((0x007C_C8FF, 0x00C8_9AFF)),
-        Class::Profanity => Some((0x00FF_D447, 0x00FF_7CE5)),
-        Class::Feline => Some((0x00F7_A8B8, 0x00FF_D9C2)),
-        Class::Animal => Some((0x00FF_C98A, 0x00B9_E8A3)),
-        Class::Canine => None,
+const NUDGED_INK_TABLE: [([u32; 16], [u32; 16]); 4] = {
+    const PAIRS: [(u32, u32); 4] = [
+        (0x007C_C8FF, 0x00C8_9AFF),
+        (0x00FF_D447, 0x00FF_7CE5),
+        (0x00F7_A8B8, 0x00FF_D9C2),
+        (0x00FF_C98A, 0x00B9_E8A3),
+    ];
+    let mut out = [([0u32; 16], [0u32; 16]); 4];
+    let mut ci = 0;
+    while ci < 4 {
+        let (c0, c1) = PAIRS[ci];
+        let mut n = 0;
+        while n < 16 {
+            out[ci].0[n] = hue_nudge(c0, n as u8);
+            out[ci].1[n] = hue_nudge(c1, n as u8);
+            n += 1;
+        }
+        ci += 1;
     }
-}
+    out
+};
 
 #[inline]
 const fn nudged_ink_pair(class: Class, gkey: u64) -> Option<(u32, u32)> {
-    let Some((c0, c1)) = ink_pair(class) else {
-        return None;
+    let idx = match class {
+        Class::Emphasis => 0,
+        Class::Profanity => 1,
+        Class::Feline => 2,
+        Class::Animal => 3,
+        Class::Canine => return None,
     };
     let (n0, n1) = genome::ink_pair_nudges(class, gkey);
-    Some((hue_nudge(c0, n0), hue_nudge(c1, n1)))
+    let (t0, t1) = &NUDGED_INK_TABLE[idx];
+    Some((t0[(n0 & 0xF) as usize], t1[(n1 & 0xF) as usize]))
 }
 
 #[inline]
 const fn feline_glow_env(t_ms: u64, window_ms: u64, amp: f32) -> f32 {
-    if t_ms >= window_ms {
+    if t_ms == 0 || t_ms >= window_ms {
         return 0.0;
     }
     let p = t_ms as f32 / window_ms as f32;
@@ -7298,6 +7616,7 @@ const fn spec_lobe(u: f32, center: f32) -> f32 {
 )]
 #[inline]
 fn emit_ink(
+    table: &crate::color_math::RelativeLuminanceTable,
     occ: &Occurrence,
     cfg: &DecoConfig,
     now: Instant,
@@ -7332,14 +7651,18 @@ fn emit_ink(
             let until = occ.appeared + Duration::from_millis(window);
             arm_until(active_until, until);
             let glow = feline_glow_env(t, window, amp);
-            if glow <= 0.0 {
+            if glow <= 0.0 || occ.ink_cells == 0 {
                 return;
             }
             let frame_term = frame.wrapping_mul(0x9E37_79B1);
             let cols = &base_cols[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
             let fgs = &base_fg[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
-            let table = crate::color_math::relative_luminance_table();
-            let lum_bg = crate::color_math::relative_luminance_with(table, rgb3_to_u32(occ.ink_bg));
+            let lum_bg = crate::color_math::relative_luminance_rgb(
+                table,
+                occ.ink_bg[0] as usize,
+                occ.ink_bg[1] as usize,
+                occ.ink_bg[2] as usize,
+            );
             let mut memo: Option<([u8; 3], [u8; 3])> = None;
             let mut i = 0;
             while i < cols.len() {
@@ -7378,6 +7701,7 @@ fn emit_ink(
             drift_ms,
         } => {
             emit_rainbow_ink(
+                table,
                 occ,
                 cfg,
                 now,
@@ -7424,20 +7748,30 @@ fn emit_ink(
     } else {
         (0.0, 0.0)
     };
-    let mid_base = mix_rgb(c0, c1, 0.5);
-    let mid_raw = if glare > 0.0 {
-        mix_rgb(mid_base, 0x00FF_FFFF, glare * spec_lobe(0.5, center))
+    let base_same = c0 == c1;
+    let has_glare = glare > 0.0;
+    let strength = if cfg.ink_strength <= 0.0 {
+        0.0
     } else {
-        mid_base
+        let mid_base = if base_same { c0 } else { mix_rgb(c0, c1, 0.5) };
+        let mid_raw = if has_glare {
+            mix_rgb(mid_base, 0x00FF_FFFF, glare * spec_lobe(0.5, center))
+        } else {
+            mid_base
+        };
+        legible_strength(
+            table,
+            cfg.ink_strength,
+            rgb3_to_u32(base_fg[occ.ink_base]),
+            &[mid_raw],
+            crate::color_math::relative_luminance_rgb(
+                table,
+                occ.ink_bg[0] as usize,
+                occ.ink_bg[1] as usize,
+                occ.ink_bg[2] as usize,
+            ),
+        )
     };
-    let table = crate::color_math::relative_luminance_table();
-    let strength = legible_strength(
-        table,
-        cfg.ink_strength,
-        rgb3_to_u32(base_fg[occ.ink_base]),
-        &[mid_raw],
-        crate::color_math::relative_luminance_with(table, rgb3_to_u32(occ.ink_bg)),
-    );
     let inv_span = 1.0 / f32::from(occ.end_col.saturating_sub(occ.start_col)).max(1.0);
     let fold_frame = animating || fx.frame_live;
     let frame_term = frame.wrapping_mul(0x9E37_79B1);
@@ -7445,38 +7779,51 @@ fn emit_ink(
     let fgs = &base_fg[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
     let start_col = occ.start_col;
     let row = occ.row;
-    let has_glare = glare > 0.0;
     let has_strength = strength > 0.0;
+    let uniform_cell_color = !has_strength || (!has_glare && base_same);
     let dim = fx.dim;
     let has_dim = dim < 1.0;
+    let mut cached_color: Option<([u8; 3], [u8; 3])> = None;
     let mut i = 0;
     while i < cols.len() {
         let col = cols[i];
         let fg_rgb = fgs[i];
-        let mut color = if has_strength {
-            let u = f32::from(col.saturating_sub(start_col)) * inv_span;
-            let base = mix_rgb(c0, c1, u);
-            let raw = if has_glare {
-                let lobe = glare * spec_lobe(u, center);
-                if lobe > 0.0 {
-                    mix_rgb(base, 0x00FF_FFFF, lobe)
+        let cell_color = if uniform_cell_color
+            && let Some((prev_fg, prev_out)) = cached_color
+            && prev_fg == fg_rgb
+        {
+            prev_out
+        } else {
+            let mut color = if has_strength {
+                let u = f32::from(col.saturating_sub(start_col)) * inv_span;
+                let base = if base_same { c0 } else { mix_rgb(c0, c1, u) };
+                let raw = if has_glare {
+                    let lobe = glare * spec_lobe(u, center);
+                    if lobe > 0.0 {
+                        mix_rgb(base, 0x00FF_FFFF, lobe)
+                    } else {
+                        base
+                    }
                 } else {
                     base
-                }
+                };
+                mix_rgb(rgb3_to_u32(fg_rgb), raw, strength)
             } else {
-                base
+                rgb3_to_u32(fg_rgb)
             };
-            mix_rgb(rgb3_to_u32(fg_rgb), raw, strength)
-        } else {
-            rgb3_to_u32(fg_rgb)
+            if has_dim {
+                color = dim_rgb(color, dim);
+            }
+            let out = u32_to_rgb3(color);
+            if uniform_cell_color {
+                cached_color = Some((fg_rgb, out));
+            }
+            out
         };
-        if has_dim {
-            color = dim_rgb(color, dim);
-        }
         let cell = InkCell {
             row,
             col,
-            color: u32_to_rgb3(color),
+            color: cell_color,
         };
         *fp = fold_ink(*fp, cell);
         if fold_frame {
@@ -7517,8 +7864,11 @@ const fn legible_strength(
             lum_bg_plus / (la + 0.05)
         }
     }
-    let lum_bg_plus = lum_bg + 0.05;
     let mut strength = ink_strength.clamp(0.0, 1.0);
+    if strength <= 0.0 {
+        return 0.0;
+    }
+    let lum_bg_plus = lum_bg + 0.05;
     let step = strength * 0.125;
     'guard: while strength > 0.0 {
         let mut idx = 0;
@@ -7546,6 +7896,7 @@ const fn legible_strength(
 )]
 #[inline]
 fn emit_rainbow_ink(
+    table: &crate::color_math::RelativeLuminanceTable,
     occ: &Occurrence,
     cfg: &DecoConfig,
     now: Instant,
@@ -7558,8 +7909,12 @@ fn emit_rainbow_ink(
     fp: &mut u64,
     active_until: &mut Option<Instant>,
 ) {
-    let table = crate::color_math::relative_luminance_table();
-    let lum_bg = crate::color_math::relative_luminance_with(table, rgb3_to_u32(occ.ink_bg));
+    let lum_bg = crate::color_math::relative_luminance_rgb(
+        table,
+        occ.ink_bg[0] as usize,
+        occ.ink_bg[1] as usize,
+        occ.ink_bg[2] as usize,
+    );
     let (sat, val) = if lum_bg > 0.5 {
         (1.0, 0.62)
     } else {
@@ -7576,27 +7931,32 @@ fn emit_rainbow_ink(
         } else {
             0.0
         };
-    let h0 = hsv2rgb(start_hue, sat, val);
-    let (guard_hues, guard_len) = if span_used == 0.0 {
-        ([h0; 4], 1)
+    let (guard_hues, strength) = if cfg.ink_strength <= 0.0 {
+        ([0; 4], 0.0)
     } else {
-        (
-            [
-                h0,
-                hsv2rgb(start_hue + (1.0 / 3.0) * span_used, sat, val),
-                hsv2rgb(start_hue + (2.0 / 3.0) * span_used, sat, val),
-                hsv2rgb(start_hue + span_used, sat, val),
-            ],
-            4,
-        )
+        let h0 = hsv2rgb(start_hue, sat, val);
+        let (guard_hues, guard_len) = if span_used == 0.0 {
+            ([h0; 4], 1)
+        } else {
+            (
+                [
+                    h0,
+                    hsv2rgb(start_hue + (1.0 / 3.0) * span_used, sat, val),
+                    hsv2rgb(start_hue + (2.0 / 3.0) * span_used, sat, val),
+                    hsv2rgb(start_hue + span_used, sat, val),
+                ],
+                4,
+            )
+        };
+        let strength = legible_strength(
+            table,
+            cfg.ink_strength,
+            rgb3_to_u32(base_fg[occ.ink_base]),
+            &guard_hues[..guard_len],
+            lum_bg,
+        );
+        (guard_hues, strength)
     };
-    let strength = legible_strength(
-        table,
-        cfg.ink_strength,
-        rgb3_to_u32(base_fg[occ.ink_base]),
-        &guard_hues[..guard_len],
-        lum_bg,
-    );
     let inv_denom = 1.0 / f32::from(occ.ink_cells.saturating_sub(1)).max(1.0);
     let lift_target = if lum_bg > 0.5 {
         0x000A_0A10
@@ -7611,37 +7971,51 @@ fn emit_rainbow_ink(
     let cols_len = cols.len();
     let row = occ.row;
     let has_strength = strength > 0.0;
+    let uniform_cell_color = !has_strength || span_used == 0.0;
     let has_lift = fx.lift > 0.0;
     let dim = fx.dim;
     let has_dim = dim < 1.0;
+    let mut cached_color: Option<([u8; 3], [u8; 3])> = None;
     let mut i = 0;
     while i < cols_len {
         let col = cols[i];
         let fg_rgb = fgs[i];
-        let mut color = if has_strength {
-            let target = if span_used == 0.0 || i == 0 {
-                guard_hues[0]
-            } else if cols_len == 4 {
-                guard_hues[i]
-            } else if i + 1 == cols_len {
-                guard_hues[3]
-            } else {
-                hsv2rgb(start_hue + (i as f32 * inv_denom) * span_used, sat, val)
-            };
-            mix_rgb(rgb3_to_u32(fg_rgb), target, strength)
+        let cell_color = if uniform_cell_color
+            && let Some((prev_fg, prev_out)) = cached_color
+            && prev_fg == fg_rgb
+        {
+            prev_out
         } else {
-            rgb3_to_u32(fg_rgb)
+            let mut color = if has_strength {
+                let target = if span_used == 0.0 || i == 0 {
+                    guard_hues[0]
+                } else if cols_len == 4 {
+                    guard_hues[i]
+                } else if i + 1 == cols_len {
+                    guard_hues[3]
+                } else {
+                    hsv2rgb(start_hue + (i as f32 * inv_denom) * span_used, sat, val)
+                };
+                mix_rgb(rgb3_to_u32(fg_rgb), target, strength)
+            } else {
+                rgb3_to_u32(fg_rgb)
+            };
+            if has_lift {
+                color = mix_rgb(color, lift_target, lift_t);
+            }
+            if has_dim {
+                color = dim_rgb(color, dim);
+            }
+            let out = u32_to_rgb3(color);
+            if uniform_cell_color {
+                cached_color = Some((fg_rgb, out));
+            }
+            out
         };
-        if has_lift {
-            color = mix_rgb(color, lift_target, lift_t);
-        }
-        if has_dim {
-            color = dim_rgb(color, dim);
-        }
         let cell = InkCell {
             row,
             col,
-            color: u32_to_rgb3(color),
+            color: cell_color,
         };
         *fp = fold_ink(*fp, cell);
         if fold_frame {
@@ -7692,7 +8066,7 @@ fn emit_rainbow_sparkles(
     let seed_phase = (occ.seed & 0xff) as f32 * 0.013;
     let width_f = f32::from(width);
     let env_intensity = cfg.intensity * envelope;
-    let hue_drift = 45.0 * p;
+    let start_hue = base_hue + 45.0 * p;
     let mut i = 0;
     while i < count {
         let u = i as f32 * inv_denom;
@@ -7710,7 +8084,7 @@ fn emit_rainbow_sparkles(
                 DecoGlyph::Star4
             },
             blend: DecoBlend::Add,
-            color: hsv2rgb(base_hue + 120.0 * i as f32 + hue_drift, 0.72, 1.0),
+            color: hsv2rgb(start_hue + 120.0 * i as f32, 0.72, 1.0),
             alpha: scale_u8(env_intensity * shimmer * 0.82),
         };
         *fp = fold_deco(*fp, &d);
@@ -7735,6 +8109,7 @@ pub(crate) const fn fold_ink(mut h: u64, c: InkCell) -> u64 {
 #[inline]
 const fn dim_rgb(c: u32, f: f32) -> u32 {
     let f = f.clamp(0.0, 1.0);
+    #[inline]
     const fn m(c: u32, f: f32, sh: u32) -> u32 {
         ((((c >> sh) & 0xff) as f32) * f).round() as u32
     }
@@ -7912,9 +8287,10 @@ const fn cat_color_context_footprint(
     let mut visible = 0u32;
     let mut min_background_band = 3u8;
     let mut max_background_band = 0u8;
+    let table = crate::color_math::relative_luminance_table();
     let fallback_bg = u32_to_rgb3(default_bg);
-    let fallback_band = CatColorKey::background_band(default_bg);
-    let mut last_bg = (fallback_bg, fallback_band);
+    let mut fallback_band_opt: Option<u8> = None;
+    let mut last_bg: Option<([u8; 3], u8)> = None;
     let mut r = r0;
     'rows: while r <= r1 {
         let line = if r < cells.len() {
@@ -7922,27 +8298,20 @@ const fn cat_color_context_footprint(
         } else {
             &[]
         };
+        let in_end = if c1 < line.len() { c1 + 1 } else { line.len() };
         let mut col = c0;
-        while col <= c1 {
-            let cell = if col < line.len() {
-                Some(&line[col])
+        while col < in_end {
+            let cell = &line[col];
+            let (background, band) = if let Some((prev_bg, prev_band)) = last_bg
+                && cell.bg[0] == prev_bg[0]
+                && cell.bg[1] == prev_bg[1]
+                && cell.bg[2] == prev_bg[2]
+            {
+                (cell.bg, prev_band)
             } else {
-                None
-            };
-            let (background, band) = match cell {
-                Some(cell)
-                    if cell.bg[0] == last_bg.0[0]
-                        && cell.bg[1] == last_bg.0[1]
-                        && cell.bg[2] == last_bg.0[2] =>
-                {
-                    (cell.bg, last_bg.1)
-                }
-                Some(cell) => {
-                    let b = CatColorKey::background_band(rgb3_to_u32(cell.bg));
-                    last_bg = (cell.bg, b);
-                    (cell.bg, b)
-                }
-                None => (fallback_bg, fallback_band),
+                let b = CatColorKey::background_band_with(table, rgb3_to_u32(cell.bg));
+                last_bg = Some((cell.bg, b));
+                (cell.bg, b)
             };
             if band < min_background_band {
                 min_background_band = band;
@@ -7954,10 +8323,7 @@ const fn cat_color_context_footprint(
             bg_sum[1] += background[1] as u32;
             bg_sum[2] += background[2] as u32;
             sampled += 1;
-            if let Some(cell) = cell
-                && !cell.wide
-                && is_ink_char(cell.ch)
-            {
+            if !cell.wide && is_ink_char(cell.ch) {
                 fg_sum[0] += cell.fg[0] as u32;
                 fg_sum[1] += cell.fg[1] as u32;
                 fg_sum[2] += cell.fg[2] as u32;
@@ -7966,10 +8332,37 @@ const fn cat_color_context_footprint(
             if sampled == MAX_SAMPLES {
                 break 'rows;
             }
-            if col == usize::MAX {
-                break;
-            }
             col += 1;
+        }
+        if col <= c1 {
+            let fallback_band = match fallback_band_opt {
+                Some(b) => b,
+                None => {
+                    let b = CatColorKey::background_band_with(table, default_bg);
+                    fallback_band_opt = Some(b);
+                    b
+                }
+            };
+            let rem_cols = (c1 - col).saturating_add(1);
+            let rem_cap = (MAX_SAMPLES - sampled) as usize;
+            let n_oob = (if rem_cols < rem_cap {
+                rem_cols
+            } else {
+                rem_cap
+            }) as u32;
+            if fallback_band < min_background_band {
+                min_background_band = fallback_band;
+            }
+            if fallback_band > max_background_band {
+                max_background_band = fallback_band;
+            }
+            bg_sum[0] += fallback_bg[0] as u32 * n_oob;
+            bg_sum[1] += fallback_bg[1] as u32 * n_oob;
+            bg_sum[2] += fallback_bg[2] as u32 * n_oob;
+            sampled += n_oob;
+            if sampled == MAX_SAMPLES {
+                break 'rows;
+            }
         }
         if r == usize::MAX {
             break;
@@ -7985,7 +8378,8 @@ const fn cat_color_context_footprint(
     } else {
         avg_rgb(fg_sum, visible)
     };
-    CatColorKey::from_rgb_span(
+    CatColorKey::from_rgb_span_with(
+        table,
         rgb3_to_u32(background),
         rgb3_to_u32(principal.fg),
         rgb3_to_u32(surrounding),
@@ -8020,12 +8414,12 @@ const fn clear_band_occupancy(
     if total == 0 || total > MAX_SAMPLES {
         return None;
     }
+    let end_cand = c1.saturating_add(1);
     let mut occupied = 0u32;
     let mut r = r0;
     while r <= r1 {
         if r < cells.len() {
             let line = cells[r].as_slice();
-            let end_cand = c1.saturating_add(1);
             let end = if end_cand < line.len() {
                 end_cand
             } else {
@@ -8073,41 +8467,37 @@ const fn band_occupancy(
     if width.saturating_mul(height) > MAX_SAMPLES {
         return None;
     }
-    let skip_per_row = match &skip_cols {
+    let (skip_per_row, skip_span) = match &skip_cols {
         Some(s) => {
             let s0 = if *s.start() > c0 { *s.start() } else { c0 };
             let s1 = if *s.end() < c1 { *s.end() } else { c1 };
-            if s1 >= s0 { s1 - s0 + 1 } else { 0 }
+            if s1 >= s0 {
+                (s1 - s0 + 1, Some((s0, s1.saturating_add(1))))
+            } else {
+                (0, None)
+            }
         }
-        None => 0,
+        None => (0, None),
     };
     let sampled = (width - skip_per_row) * height;
     if sampled == 0 {
         return None;
     }
+    let end_cand = c1.saturating_add(1);
     let mut occupied = 0u32;
     let mut r = r0;
     while r <= r1 {
         if r < cells.len() {
             let line = cells[r].as_slice();
-            let end_cand = c1.saturating_add(1);
             let end = if end_cand < line.len() {
                 end_cand
             } else {
                 line.len()
             };
             if end > c0 {
-                match &skip_cols {
-                    Some(s) if *s.start() <= c1 && *s.end() >= c0 => {
-                        let start_col = *s.start();
-                        let s0 = if start_col < c0 {
-                            c0
-                        } else if start_col > end {
-                            end
-                        } else {
-                            start_col
-                        };
-                        let end_col = s.end().saturating_add(1);
+                match skip_span {
+                    Some((start_col, end_col)) => {
+                        let s0 = if start_col > end { end } else { start_col };
                         let s1 = if end_col < s0 {
                             s0
                         } else if end_col > end {
@@ -8132,7 +8522,7 @@ const fn band_occupancy(
                             c += 1;
                         }
                     }
-                    _ => {
+                    None => {
                         let mut c = c0;
                         while c < end {
                             let cell = &line[c];
@@ -15684,13 +16074,13 @@ mod tests {
         let g = geom20();
         let grid_w = i32::from(g.cols) * i32::from(g.cell_w);
         let rgba: Arc<[u8]> = Arc::from(vec![0xff; 4 * 2 * 4]);
+        let mut out = Vec::new();
         for (w, h) in [(0, usize::MAX), (usize::MAX, 0)] {
-            assert!(crate::kitty_cursor::resample_nearest(&rgba, 4, 2, w, h).is_empty());
+            crate::kitty_cursor::resample_nearest_into(&rgba, 4, 2, w, h, &mut out);
+            assert!(out.is_empty());
         }
-        assert_eq!(
-            crate::kitty_cursor::resample_nearest(&rgba, 4, 2, 4, 2),
-            rgba.as_ref()
-        );
+        crate::kitty_cursor::resample_nearest_into(&rgba, 4, 2, 4, 2, &mut out);
+        assert_eq!(out, rgba.as_ref());
         let mut wd = WordDecorations::default();
         wd.set_kitty_sprite_source(KittySpriteSource::Custom {
             source_fp: 0x101,
@@ -16665,6 +17055,224 @@ mod tests {
                 .is_none()
         );
         assert!(free.is_empty());
+    }
+
+    /// looks10 L10: the flying head's follower trails the caret through a
+    /// burst (it glides with `PLACE_TAU`), and at the right margin its seat
+    /// glides up out of the caret's row; either way the drawn head is kept
+    /// off the caret's cell and every lettered cell, pushed ahead with air
+    /// between it and the caret or lifted clear, and the follower carries on
+    /// from where it was drawn. Control: `HEAD_KEEPS_OFF_OFF` draws it where
+    /// the follower put it, over the caret.
+    #[test]
+    fn the_flying_head_keeps_off_the_caret_and_the_letters() {
+        let g = geom20();
+        let (cw, ch) = (i32::from(g.cell_w), i32::from(g.cell_h));
+        let t0 = Instant::now();
+        // Row 3 is lettered from column 0 up to the caret.
+        let ink_to = |end: u16| move |row: u16, col: u16| Some(row == 3 && col < end);
+        let over = |rect: CatFootprint, caret: (u16, u16), end: u16| -> Vec<(i32, i32)> {
+            let mut hits = Vec::new();
+            let (x0, x1) = (rect.x, rect.x + i32::from(rect.w));
+            let (y0, y1) = (rect.y, rect.y + i32::from(rect.h));
+            for r in 0..i32::from(g.rows) {
+                for c in 0..i32::from(g.cols) {
+                    let lettered = r == 3 && c < i32::from(end);
+                    let is_caret = (r, c) == (i32::from(caret.0), i32::from(caret.1));
+                    if (lettered || is_caret)
+                        && x0 < (c + 1) * cw
+                        && x1 > c * cw
+                        && y0 < (r + 1) * ch
+                        && y1 > r * ch
+                    {
+                        hits.push((r, c));
+                    }
+                }
+            }
+            hits
+        };
+        let run = |keep: bool| {
+            HEAD_KEEPS_OFF_OFF.with(|c| c.set(!keep));
+            let mut wd = WordDecorations::default();
+            // A burst: the caret steps a cell every 16 ms from column 4 to 9.
+            let mut worst = Vec::new();
+            let mut gaps = Vec::new();
+            for (i, col) in (4..=9_u16).enumerate() {
+                let at = t0 + Duration::from_millis(16 * i as u64);
+                let caret = (3, col);
+                let mut placement = wd
+                    .prepare_kitty_cursor_placement(
+                        still_layout(g, caret),
+                        settled_at(at),
+                        crate::kitty_cursor::CatPose::STILL,
+                    )
+                    .expect("placeable companion");
+                placement.keep_off_letters(g, caret, ink_to(col));
+                let mut free = Vec::new();
+                wd.kitty_cursor_at_placement(still_frame(g, caret), placement, &mut free)
+                    .expect("companion emitted");
+                let body = free.last().expect("body").clone();
+                let rect = CatFootprint {
+                    x: body.x,
+                    y: body.y,
+                    w: body.w,
+                    h: body.h,
+                };
+                assert_eq!(placement.drawn_footprint(), Some(rect));
+                worst.extend(over(rect, caret, col));
+                gaps.push(rect.x - (i32::from(col) + 1) * cw);
+            }
+            HEAD_KEEPS_OFF_OFF.with(|c| c.set(false));
+            (worst, gaps)
+        };
+        let (kept, gaps) = run(true);
+        assert!(kept.is_empty(), "the head lay on {kept:?}");
+        let gap = WordDecorations::kitty_cursor_lead_px(g.cell_w) / HEAD_CARET_GAP_DEN;
+        assert!(
+            gaps.iter().all(|&d| d >= gap),
+            "air between the caret and the head: {gaps:?} (at least {gap})"
+        );
+        let (trailed, _) = run(false);
+        assert!(
+            !trailed.is_empty(),
+            "control: the follower trails the head into the caret"
+        );
+
+        // The right margin: no room ahead, so the head is lifted clear of the
+        // caret's row; the follower's state moves with it.
+        let caret = (3, g.cols - 1);
+        let mut wd = WordDecorations::default();
+        let mut placement = wd
+            .prepare_kitty_cursor_placement(
+                still_layout(g, caret),
+                settled_at(t0),
+                crate::kitty_cursor::CatPose::STILL,
+            )
+            .expect("placeable companion");
+        let rect = placement.drawn_footprint().expect("drawn");
+        assert!(
+            !over(rect, caret, caret.1).is_empty(),
+            "the margin's seat lies on the caret before it is kept off"
+        );
+        let settle = placement.drawn.and_then(|d| d.settle);
+        placement.keep_off_letters(g, caret, ink_to(caret.1));
+        let lifted = placement.drawn_footprint().expect("drawn");
+        assert!(over(lifted, caret, caret.1).is_empty(), "{lifted:?}");
+        assert!(lifted.y + i32::from(lifted.h) <= i32::from(caret.0) * ch);
+        assert_eq!(lifted.x, rect.x, "lifted straight up, not across");
+        if let (Some(before), Some(after)) = (settle, placement.drawn.and_then(|d| d.settle)) {
+            assert_eq!(after.1 - before.1, (lifted.y - rect.y) as f32);
+        }
+    }
+
+    /// looks10 round 3 (the judges' low): the head kept off the caret's cell
+    /// still touched it. Glided flush beside the caret it laid its whiskers on
+    /// it (`split.bfly`), and lifted at the right margin it sat a pixel over
+    /// the caret's top, perched on it (`burst.t0`). The head now keeps a ring
+    /// of air round the caret's cell, the same share of its lead it keeps
+    /// beside it, and a head that only grazes the ring steps out of it by the
+    /// least move, never across the caret. Control: `HEAD_CARET_RING_OFF`
+    /// keeps only the cell, as round 2 did.
+    #[test]
+    fn the_flying_head_keeps_air_round_the_caret() {
+        let g = geom20();
+        let (cw, ch) = (i32::from(g.cell_w), i32::from(g.cell_h));
+        let gap = WordDecorations::kitty_cursor_lead_px(g.cell_w) / HEAD_CARET_GAP_DEN;
+        assert!(gap >= 2, "a ring of {gap} px");
+        let t0 = Instant::now();
+        // Row 3 is lettered from column 0 up to the caret.
+        let ink_to = |end: u16| move |row: u16, col: u16| Some(row == 3 && col < end);
+        // The air between the caret's cell and the head, along x and along y
+        // (negative where they overlap on that axis).
+        let air = |rect: CatFootprint, caret: (u16, u16)| -> (i32, i32) {
+            let (c0, c1) = (i32::from(caret.1) * cw, (i32::from(caret.1) + 1) * cw);
+            let (r0, r1) = (i32::from(caret.0) * ch, (i32::from(caret.0) + 1) * ch);
+            let (x1, y1) = (rect.x + i32::from(rect.w), rect.y + i32::from(rect.h));
+            ((rect.x - c1).max(c0 - x1), (rect.y - r1).max(r0 - y1))
+        };
+        // The head drawn at `at` (None: where the follower put it) for the
+        // caret, given its rect and the caret cell's left, right and top
+        // edges, then kept off; the head before and after.
+        type At = fn(CatFootprint, (i32, i32, i32)) -> (i32, i32);
+        let keep = |caret: (u16, u16), at: Option<At>, ring: bool| {
+            HEAD_CARET_RING_OFF.with(|c| c.set(!ring));
+            let mut wd = WordDecorations::default();
+            let mut placement = wd
+                .prepare_kitty_cursor_placement(
+                    still_layout(g, caret),
+                    settled_at(t0),
+                    crate::kitty_cursor::CatPose::STILL,
+                )
+                .expect("placeable companion");
+            if let (Some(at), Some(draw)) = (at, placement.drawn.as_mut()) {
+                let cell = (
+                    i32::from(caret.1) * cw,
+                    (i32::from(caret.1) + 1) * cw,
+                    i32::from(caret.0) * ch,
+                );
+                let (x, y) = at(draw.rect, cell);
+                draw.rect.x = x;
+                draw.rect.y = y;
+            }
+            let before = placement.drawn_footprint().expect("drawn");
+            placement.keep_off_letters(g, caret, ink_to(caret.1));
+            let after = placement.drawn_footprint().expect("drawn");
+            HEAD_CARET_RING_OFF.with(|c| c.set(false));
+            (before, after)
+        };
+        let caret = (3, 5);
+        // Flush beside the caret, astride its row's top.
+        let flush: At = |r, (_, right, top)| (right, top - i32::from(r.h) / 2);
+        let (before, kept) = keep(caret, Some(flush), true);
+        assert_eq!(
+            air(before, caret).0,
+            0,
+            "the head starts flush beside the caret: {before:?}"
+        );
+        assert_eq!(
+            air(kept, caret).0,
+            gap,
+            "stepped out beside it, not lifted: {kept:?}"
+        );
+        assert_eq!(kept.y, before.y);
+        let (_, glued) = keep(caret, Some(flush), false);
+        assert_eq!(
+            air(glued, caret).0,
+            0,
+            "control: round 2 leaves it on the caret's side"
+        );
+        // A pixel over the caret's top, straight over it.
+        let perched: At = |r, (left, right, top)| {
+            (
+                (left + right - i32::from(r.w)) / 2,
+                top - i32::from(r.h) - 1,
+            )
+        };
+        let (before, kept) = keep(caret, Some(perched), true);
+        assert!(before.y >= 0 && air(before, caret).1 == 1, "{before:?}");
+        assert_eq!(
+            kept.x, before.x,
+            "a grazing head is not thrown across the caret"
+        );
+        assert_eq!(air(kept, caret).1, gap + 1, "{kept:?}");
+        let (_, sat) = keep(caret, Some(perched), false);
+        assert_eq!(air(sat, caret).1, 1, "control: round 2 leaves it perched");
+        // The right margin: the follower's seat lies on the caret; there is no
+        // room ahead, so it is lifted, now over the ring.
+        let caret = (3, g.cols - 1);
+        let (before, lifted) = keep(caret, None, true);
+        assert!(
+            air(before, caret).0 < 0 && air(before, caret).1 < 0,
+            "{before:?}"
+        );
+        assert_eq!(lifted.x, before.x, "lifted straight up");
+        assert_eq!(air(lifted, caret).1, gap + 1, "{lifted:?}");
+        let (_, low) = keep(caret, None, false);
+        assert_eq!(
+            air(low, caret).1,
+            1,
+            "control: round 2 lifts it a pixel over the caret"
+        );
     }
 
     #[test]

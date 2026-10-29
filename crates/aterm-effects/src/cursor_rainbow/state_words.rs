@@ -119,12 +119,9 @@ mod tests {
             cfg: RainbowConfig {
                 enabled: true,
                 intensity: 1.0,
-                blinking: false,
-                base: None,
-                head_rgb: None,
                 paint: Some(0.5),
                 ground: Some(0x0011_1318),
-                flare_at: None,
+                ..RainbowConfig::default()
             },
             paint_prev: None,
             sample_dt: 0.016,

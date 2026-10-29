@@ -246,13 +246,16 @@ pub const fn classify(i: &SchedInputs) -> Starvation {
             qos: i.qos,
         };
     }
-    if i.nominal_dt_us > 0 && i.sampling_hole_us > 2 * i.nominal_dt_us {
+    if i.nominal_dt_us > 0 && (i.sampling_hole_us as u128) > 2 * (i.nominal_dt_us as u128) {
         return Starvation::CadenceBlown {
             hole_us: i.sampling_hole_us,
             nominal_us: i.nominal_dt_us,
         };
     }
-    if i.budget_us > 0 && i.wall_us * BUDGET_PRESSURE_DEN >= i.budget_us * BUDGET_PRESSURE_NUM {
+    if i.budget_us > 0
+        && (i.wall_us as u128) * (BUDGET_PRESSURE_DEN as u128)
+            >= (i.budget_us as u128) * (BUDGET_PRESSURE_NUM as u128)
+    {
         return Starvation::BudgetPressure {
             wall_us: i.wall_us,
             budget_us: i.budget_us,
@@ -312,17 +315,17 @@ impl SchedReading {
     pub fn book(&mut self, deadline: Duration, woke: Duration, in_window: bool) {
         let late = micros(woke.saturating_sub(deadline));
         let at = micros(deadline);
-        self.ticks += 1;
-        self.late_total_us += late;
+        self.ticks = self.ticks.saturating_add(1);
+        self.late_total_us = self.late_total_us.saturating_add(late);
         if late > self.late_max_us {
             self.late_max_us = late;
             self.late_max_at_us = at;
         }
         if in_window {
-            self.win_ticks += 1;
+            self.win_ticks = self.win_ticks.saturating_add(1);
             self.win_first_at_us.get_or_insert(at);
             self.win_last_at_us = Some(at);
-            self.win_late_total_us += late;
+            self.win_late_total_us = self.win_late_total_us.saturating_add(late);
             self.win_late_max_us = self.win_late_max_us.max(late);
         }
     }

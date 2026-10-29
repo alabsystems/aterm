@@ -1944,6 +1944,30 @@ fn installed_section_rows(
 /// Brew's tty-only info metadata lines: a pinned note (with the
 /// pin symlink's mtime) and, for an uninstalled formula that
 /// would build, `Installs from source: yes`.
+fn pinned_metadata_line(prefix: &Prefix, name: &str, cask: bool) -> Option<String> {
+    let (version, pin) = if cask {
+        (
+            prefix.cask_pinned_version(name)?,
+            prefix.root.join("var/homebrew/pinned_casks").join(name),
+        )
+    } else {
+        (
+            prefix.pinned_version(name)?,
+            prefix.root.join("Pinned").join(name),
+        )
+    };
+    let mut line = format!("Pinned: {version}");
+    if let Some(secs) = std::fs::symlink_metadata(&pin)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+    {
+        line.push_str(&format!(" on {}", format_epoch_local(secs)));
+    }
+    Some(line)
+}
+
 fn print_metadata_lines(
     prefix: &Prefix,
     name: &str,
@@ -1954,22 +1978,7 @@ fn print_metadata_lines(
     if !super::tty::stdout_tty() {
         return;
     }
-    let pinned = if cask {
-        prefix.cask_pinned_version(name)
-    } else {
-        prefix.pinned_version(name)
-    };
-    if let Some(version) = pinned {
-        let mut line = format!("Pinned: {version}");
-        let pin = prefix.root.join("Pinned").join(name);
-        if let Some(secs) = std::fs::symlink_metadata(&pin)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-        {
-            line.push_str(&format!(" on {}", format_epoch_local(secs)));
-        }
+    if let Some(line) = pinned_metadata_line(prefix, name, cask) {
         println!("{line}");
     }
     if !cask && !installed && installs_from_source {
@@ -10620,7 +10629,7 @@ fn bundle_file(
         let result: Result<(), install::InstallError> = match entry {
             bundle::BrewfileEntry::Tap(n) => {
                 if dry {
-                    let have = tap::list(prefix).iter().any(|t| t.name() == *n);
+                    let have = bundle::entry_installed(prefix, entry);
                     missing |= !have;
                     println!("tap {n}: {}", if have { "present" } else { "missing" });
                     Ok(())
@@ -10635,9 +10644,7 @@ fn bundle_file(
                 }
             }
             bundle::BrewfileEntry::Brew(n) => {
-                let have = prefix
-                    .installed_one(Kind::Formula, Formula::short_name(n))
-                    .is_some();
+                let have = bundle::entry_installed(prefix, entry);
                 if dry {
                     missing |= !have;
                     println!("brew {n}: {}", if have { "present" } else { "missing" });
@@ -10649,20 +10656,24 @@ fn bundle_file(
                 }
             }
             bundle::BrewfileEntry::Cask(n) => {
-                let have = prefix
-                    .installed_one(Kind::Cask, super::api::canonical_cask_token(n))
-                    .is_some();
+                let have = bundle::entry_installed(prefix, entry);
                 if dry {
                     missing |= !have;
                     println!("cask {n}: {}", if have { "present" } else { "missing" });
                     Ok(())
                 } else if !have {
-                    match api.cask(n) {
-                        Ok(c) => {
-                            cask::install_with_deps(api, prefix, &c, false, false, false, false)
-                                .map(|_| ())
+                    if n.contains('/') && !n.starts_with("homebrew/cask/") {
+                        Err(install::InstallError::Unsupported(format!(
+                            "qualified cask {n} needs its tap recipe"
+                        )))
+                    } else {
+                        match api.cask(n) {
+                            Ok(c) => {
+                                cask::install_with_deps(api, prefix, &c, false, false, false, false)
+                                    .map(|_| ())
+                            }
+                            Err(e) => return failed(&e),
                         }
-                        Err(e) => return failed(&e),
                     }
                 } else {
                     Ok(())
@@ -10908,6 +10919,8 @@ mod tests {
         assert!(query("get").hits_any(&["wget"]).unwrap());
         assert!(!query("^get").hits_any(&["wget"]).unwrap());
         assert!(query("^lib.*@\\d$").hits_any(&["libfoo@3"]).unwrap());
+        assert!(query("^py").hits_any(&["py-spy"]).unwrap());
+        assert!(!query("^py").hits_any(&["airspy"]).unwrap());
         assert!(query("").hits_any(&["anything"]).unwrap());
         assert!(!query("HTTP").hits_any(&["wget"]).unwrap());
         assert!(query("HTTP").hits_any(&["wget", "HTTP client"]).unwrap());
@@ -11880,19 +11893,6 @@ mod tests {
     }
 
     #[test]
-    fn search_regex_anchors_match_brew() {
-        let re = compile_search_regex("^py").unwrap();
-        assert!(re.try_is_match("py-spy").unwrap());
-        assert!(!re.try_is_match("airspy").unwrap());
-        assert!(
-            compile_search_regex("wget")
-                .unwrap()
-                .try_is_match("wget2")
-                .unwrap()
-        );
-    }
-
-    #[test]
     fn spell_correct_matches_did_you_mean() {
         let dict: Vec<String> = ["zsxd", "zstd", "firefox", "firefly", "hello"]
             .iter()
@@ -12676,5 +12676,28 @@ mod tests {
             ExitCode::SUCCESS
         );
         assert!(p.installed_one(Kind::Cask, "caffeine").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_metadata_line_reads_cask_pin_timestamp_from_pinned_casks() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let p = Prefix::at(tmp.path());
+        p.ensure().unwrap();
+        let cask_dir = p.cask_dir("demo", "2.4");
+        std::fs::create_dir_all(&cask_dir).unwrap();
+        p.write_receipt(
+            &cask_dir,
+            &[
+                ("installed_by", "abrew"),
+                ("token", "demo"),
+                ("version", "2.4"),
+            ],
+        )
+        .unwrap();
+        p.pin_cask("demo").unwrap();
+        let line = pinned_metadata_line(&p, "demo", true).expect("pinned cask metadata");
+        assert!(line.starts_with("Pinned: 2.4 on "), "{line}");
+        assert!(pinned_metadata_line(&p, "demo", false).is_none());
     }
 }

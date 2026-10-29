@@ -19,14 +19,14 @@ const FRESH_DEFAULT_SEED: u64 = 0x5eed_a7e2_f2e5_0001;
 const FRESH_CASES: u32 = 400;
 
 fn fresh_cases() -> u32 {
-    let Ok(v) = std::env::var("PROPTEST_CASES") else {
+    let Ok(v) = std::env::var("ATERM_FRESH_FUZZ_CASES") else {
         return FRESH_CASES;
     };
     match v.trim().parse::<u32>() {
         Ok(n) => n.max(FRESH_CASES),
         Err(e) => {
             eprintln!(
-                "PROPTEST_CASES={v:?} is not a case count ({e}); running the default \
+                "ATERM_FRESH_FUZZ_CASES={v:?} is not a case count ({e}); running the default \
                  {FRESH_CASES}"
             );
             FRESH_CASES
@@ -63,7 +63,7 @@ fn fresh_run(test: &str, lane: u64) -> (u64, u32) {
     let deep = if cases == FRESH_CASES {
         String::new()
     } else {
-        format!(" PROPTEST_CASES={cases}")
+        format!(" ATERM_FRESH_FUZZ_CASES={cases}")
     };
     eprintln!(
         "{name}: seed {seed:#018x}, {cases} cases; replay with \

@@ -264,7 +264,7 @@ pub(super) fn customize_row(
     } else {
         (column_width - RESET_ICON_WIDTH - COLOUR_ROW_GAP).max(0.0)
     };
-    let generic = finish_setting_row_narrowed(
+    let generic = setting_row_controls_narrowed(
         state,
         index,
         field,
@@ -621,7 +621,12 @@ pub(super) fn palette_blocks(
             "Reset color",
             StyleRef::Quiet,
             ControlState::default(),
-            Some(hug_width("Reset color")),
+            // Focused, it is no wider than the column: cut at a side, it is not whole (R2).
+            Some(if focused(state, PALETTE_SLOT_RESET) {
+                hug_width("Reset color").min(column_width)
+            } else {
+                hug_width("Reset color")
+            }),
         ));
         controls.push(button(
             PALETTE_SLOT_CLOSE,
@@ -663,33 +668,56 @@ pub(super) fn palette_blocks(
         },
         Some(hug_width("Reset palette")),
     );
-    let fixed: f32 = controls
-        .iter()
-        .chain([&reset_all])
-        .map(|node| match node.layout.width {
-            Length::Fixed(width) => width + 6.0,
-            _ => 0.0,
-        })
-        .sum::<f32>()
-        - 6.0;
-    let own_row = field.is_some() && fixed > column_width;
-    let mut reset_row = None;
-    if own_row {
-        let spacer = UiNode::new(
-            "settings/showcase/palette-reset-row/spacer",
-            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-        )
-        .layout(Layout::default().width(Length::Fill).height(Length::Fill));
-        reset_row = Some(control_row(
-            "settings/showcase/palette-reset-row",
-            "Reset palette",
-            vec![spacer, reset_all],
-        ));
-    } else {
-        controls.push(reset_all);
+    let width = |node: &UiNode| match node.layout.width {
+        Length::Fixed(width) => width,
+        _ => 0.0,
+    };
+    // Focused, Close wraps under Reset color where a line puts it over 0.5pt past the column (R2).
+    let wraps = field.is_some() && focused(state, PALETTE_SLOT_CLOSE);
+    let mut lines: Vec<(Vec<UiNode>, f32)> = Vec::new();
+    for node in controls {
+        let wide = width(&node);
+        match lines.last_mut() {
+            Some((line, used)) if !wraps || *used + 6.0 + wide <= column_width + 0.5 => {
+                *used += 6.0 + wide;
+                line.push(node);
+            }
+            _ => lines.push((vec![node], wide)),
+        }
     }
-    let (tools, tools_height) =
-        control_row("settings/showcase/palette-tools", "Palette color", controls);
+    // Reset palette ends the tools' one line where it fits, else it takes a row of its own.
+    let mut reset_row = None;
+    match lines.as_mut_slice() {
+        [(line, used)]
+            if field.is_none() || *used + 6.0 + width(&reset_all) <= column_width + 0.01 =>
+        {
+            line.push(reset_all);
+        }
+        _ => {
+            let spacer = UiNode::new(
+                "settings/showcase/palette-reset-row/spacer",
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            )
+            .layout(Layout::default().width(Length::Fill).height(Length::Fill));
+            reset_row = Some(control_row(
+                "settings/showcase/palette-reset-row",
+                "Reset palette",
+                vec![spacer, reset_all],
+            ));
+        }
+    }
+    let mut lines = lines.into_iter().enumerate().map(|(at, (line, _))| {
+        if at == 0 {
+            return control_row("settings/showcase/palette-tools", "Palette color", line);
+        }
+        control_row(
+            &format!("settings/showcase/palette-tools/{at}"),
+            "Palette color",
+            line,
+        )
+    });
+    let (tools, tools_height) = lines.next().expect("the first line of tools");
+    let rest: Vec<(UiNode, f32)> = lines.collect();
     let caption = caption_height() + 4.0;
     // THE OPEN SLOT'S PICKER IS PART OF ITS EDITOR wherever the two share a screen under the
     // section's caption: right under its chips' row, field and tools, one stop with them, so
@@ -725,7 +753,10 @@ pub(super) fn palette_blocks(
             );
             // The editor holds the open slot's chips' row where the picker still shares the
             // screen with it, else starts at the field, the chips' row a row of its own over it.
-            let tools_part = slot_height + 6.0 + tools_height;
+            let tools_part = slot_height
+                + 6.0
+                + tools_height
+                + rest.iter().map(|(_, height)| height + 6.0).sum::<f32>();
             let with_chips = chip_height + 6.0 + tools_part;
             let shared = |editor: f32| (room - caption - editor - 6.0).min(colour_picker_room());
             let (chips_inside, picker) = match picker_in(shared(with_chips)) {
@@ -745,6 +776,7 @@ pub(super) fn palette_blocks(
                 lead = Some((chip_row(open), chip_height));
             }
             parts.extend([slot_row, tools]);
+            parts.extend(rest.into_iter().map(|(row, _)| row));
             let mut next = None;
             match picker {
                 Some((picker, height)) => {
@@ -974,6 +1006,17 @@ fn colour_picker_room() -> f32 {
 
 /// The least list the sheet keeps, `column_width` wide: COLORS over one whole colour row (a screen that starts in the section repeats its caption), and an open picker, a colour row's or the palette slot's, whole in its least form on a screen of its own ([`sheet_blocks`]).
 pub(super) fn sheet_list_least(state: &SettingsViewState, column_width: f32) -> f32 {
+    weighed(
+        |bars| &mut bars.sheet,
+        column_width.to_bits(),
+        || sheet_list_least_laid(state, column_width),
+    )
+}
+
+/// [`sheet_list_least`] laid out: each open picker built in its least form, which no seat moves.
+fn sheet_list_least_laid(state: &SettingsViewState, column_width: f32) -> f32 {
+    #[cfg(test)]
+    crate::work_counts::sheet_least_laid();
     let captioned_row =
         caption_height() + 4.0 + colour_row_height(colour_rows_on_one_line(column_width));
     let colour_picker = state
@@ -991,12 +1034,11 @@ pub(super) fn sheet_sized_by_room(state: &SettingsViewState) -> bool {
     state.open_color_picker().is_some() || state.showcase.slot.is_some()
 }
 
-/// The sheet's blocks, in order: the colour rows under COLORS (each on one line, or its name over its field, as `one_line` says), the palette under PALETTE, then Save as theme, for a list `room` tall: an open colour picker is sized so its block is one stop of it, with the row (or the palette slot) it sets.
+/// The sheet: `colour_rows`, the palette, Save as theme; an open picker one stop of `room`.
 pub(super) fn sheet_blocks(
     state: &SettingsViewState,
-    column_width: f32,
-    room: f32,
-    one_line: bool,
+    (column_width, room): (f32, f32),
+    colour_rows: &[Option<(UiNode, f32)>],
 ) -> Vec<(UiNode, f32)> {
     let mut blocks = Vec::new();
     let picker = |key: &str, room: f32| {
@@ -1011,8 +1053,8 @@ pub(super) fn sheet_blocks(
         .is_none_or(|(_, height)| height <= under + 0.5);
     if captioned {
         let mut rows: Vec<(UiNode, f32)> = Vec::new();
-        for key in SHOWCASE_COLOR_KEYS {
-            let Some(row) = customize_row(state, key, column_width, one_line) else {
+        for (key, row) in SHOWCASE_COLOR_KEYS.into_iter().zip(colour_rows) {
+            let Some(row) = row.clone() else {
                 continue;
             };
             let shared = (under - row.1 - 4.0).min(colour_picker_room());
@@ -1033,8 +1075,8 @@ pub(super) fn sheet_blocks(
         }
     } else {
         let mut first = true;
-        for key in SHOWCASE_COLOR_KEYS {
-            let Some(row) = customize_row(state, key, column_width, one_line) else {
+        for (key, row) in SHOWCASE_COLOR_KEYS.into_iter().zip(colour_rows) {
+            let Some(row) = row.clone() else {
                 continue;
             };
             let block = if first {
@@ -1060,9 +1102,7 @@ pub(super) fn sheet_blocks(
 
 /// The text contrast the person's colors leave the theme of the side the page does not show, while the theme follows the system — where that is under 3:1 and the theme alone is not, so these edits did it: (the words the sheet shows, what a reader hears).
 pub(super) fn other_side_contrast(state: &SettingsViewState) -> Option<(String, String)> {
-    if prefs::theme_mode(state.raw_value(prefs::EDIT_THEME).as_deref())
-        != prefs::ThemeMode::FollowSystem
-    {
+    if !state.theme_follows_system() {
         return None;
     }
     let other = match theme_visible_side(state, state.presented_motion.get().system_dark) {

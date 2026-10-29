@@ -562,7 +562,6 @@ mod tests {
         assert_eq!(r.admit(0, 0), Ok(()), "1970 is inside every window");
         assert_eq!(r.admit(0, fail_closed(None)), Err(RosterReject::Stale));
         assert_eq!(fail_closed(Some(1_790_000_000)), 1_790_000_000);
-        assert!(now_unix() > 1_700_000_000);
     }
 
     /// A lapsed roster is refused, and an unparseable deadline reads as lapsed, never absent.

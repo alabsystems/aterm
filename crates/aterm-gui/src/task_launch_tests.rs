@@ -813,7 +813,7 @@ fn a_pooled_worker_runs_on_its_rows_login_alone() {
     );
 }
 
-/// A fake store of on-demand programs: what it holds, holds back, and was asked, in order.
+/// A fake store of worker programs: what it holds, holds back, and was asked, in order.
 struct FakeStore {
     present: std::cell::Cell<bool>,
     held: Option<&'static str>,
@@ -842,15 +842,17 @@ impl ProgramStore for FakeStore {
     }
 }
 
-/// A GROK WORKER'S LAUNCHER ASKS THE SIGN-IN BEFORE IT INSTALLS, AND SAYS WHAT IT DOES.
-/// - Signed out, it refuses with `why=signin` and the store is never asked. Installing `grok`
-///   would lay `agents/grok` on every shell's `PATH`, signed out.
-/// - Signed in, an absent `grok` is installed once by atpkg's verified install. The launch record
-///   says it is installing, then installed, and the installing mark stands exactly while the
-///   install runs.
-/// - A present `grok` installs nothing and says nothing.
-/// - A failed install, or a held program, is `why=install` with atpkg's or the hold's words.
-/// - A row the default set keeps never touches the store.
+/// A WORKER'S LAUNCHER ASKS THE SIGN-IN BEFORE IT INSTALLS, AND SAYS WHAT IT DOES.
+/// - Signed out, a Grok worker is refused with `why=signin` and the store is never asked.
+///   Installing `grok` would lay `agents/grok` on every shell's `PATH`, signed out.
+/// - Signed in, an absent `grok` is installed once by atpkg's verified install, as an absent
+///   program of any row atpkg ships is (a fresh Mac before atpkg's update pass lands it). The
+///   launch record says it is installing, then installed, and the installing mark stands exactly
+///   while the install runs.
+/// - CONTROLS: a present program installs nothing and says nothing; a held one (`[packages]
+///   exclude`, a removal, a no to installs) installs nothing and is admitted carrying the hold's
+///   words; a failed
+///   install is `why=install` carrying atpkg's words.
 /// - The install is atpkg's `install <program>` verb, waiting its turn behind a running pass.
 #[test]
 fn a_grok_workers_launcher_asks_the_sign_in_before_it_installs() {
@@ -878,7 +880,7 @@ fn a_grok_workers_launcher_asks_the_sign_in_before_it_installs() {
             self.0.borrow_mut().push("mark dropped".to_string());
         }
     }
-    let admit = |store: &FakeStore| {
+    let admit_on = |cli: &aterm_agent::harness::worker::WorkerCli, store: &FakeStore| {
         admit_worker(
             cli,
             cli.plain(),
@@ -891,6 +893,7 @@ fn a_grok_workers_launcher_asks_the_sign_in_before_it_installs() {
             store,
         )
     };
+    let admit = |store: &FakeStore| admit_on(cli, store);
 
     let signed_out = store(false, None, true);
     let refused = admit(&signed_out).expect_err("signed out");
@@ -914,20 +917,26 @@ fn a_grok_workers_launcher_asks_the_sign_in_before_it_installs() {
     assert_eq!(marks.get(), 1);
     assert_eq!(
         admitted.readiness(),
-        aterm_agent::harness::worker::Readiness::Installed
+        &aterm_agent::harness::worker::Readiness::Installed
     );
     let said = notes.take();
-    assert_eq!(said.len(), 2, "{said:?}");
-    assert!(
-        said[0].starts_with("installing grok by atpkg's verified install"),
-        "{said:?}"
-    );
-    assert!(said[1].starts_with("installed grok"), "{said:?}");
+    assert_eq!(said.len(), 2, "installing, then installed: {said:?}");
+    assert!(said.iter().all(|n| n.contains("grok")), "{said:?}");
 
     let there = store(true, None, true);
-    assert!(admit(&there).is_ok());
+    assert_eq!(admit(&there).expect("present").kept_off(), None, "CONTROL");
     assert_eq!(*there.asked.borrow(), ["present"]);
     assert!(notes.take().is_empty());
+
+    let hold = "`[packages] exclude` in aterm.toml names it";
+    let held = store(false, Some(hold), true);
+    let admitted = admit(&held).expect("held: admitted, installing nothing");
+    assert_eq!(*held.asked.borrow(), ["present", "held"], "CONTROL: held");
+    assert!(
+        admitted.kept_off().is_some_and(|said| said.contains(hold)),
+        "{admitted:?}"
+    );
+    assert!(notes.take().is_empty() && marks.get() == 1);
 
     let failing = store(false, None, false);
     let err = admit(&failing).expect_err("a failed install");
@@ -938,20 +947,25 @@ fn a_grok_workers_launcher_asks_the_sign_in_before_it_installs() {
         "the mark goes with a failed install too"
     );
 
-    let held = store(
-        false,
-        Some("`[packages] exclude` in aterm.toml names it"),
-        true,
-    );
-    let err = admit(&held).expect_err("held back");
-    assert!(err.why().contains("exclude"), "{err:?}");
-    assert_eq!(refused_why(&err), crate::task_record::WHY_INSTALL);
-    assert_eq!(*held.asked.borrow(), ["present", "held"]);
-
     let claude = aterm_agent::harness::worker::worker_cli(Program::Claude).expect("claude row");
-    let untouched = store(false, None, false);
-    assert!(admit_worker(claude, claude.plain(), None, &note, &|| (), &untouched).is_ok());
-    assert!(untouched.asked.borrow().is_empty());
+    let fresh_mac = store(false, None, true);
+    notes.take();
+    let admitted = admit_on(claude, &fresh_mac).expect("claude installed");
+    assert_eq!(
+        *fresh_mac.asked.borrow(),
+        [
+            "present",
+            "held",
+            "install claude",
+            "mark dropped",
+            "present"
+        ],
+        "a default-set row atpkg's pass has not landed yet is installed too"
+    );
+    assert_eq!(
+        admitted.readiness(),
+        &aterm_agent::harness::worker::Readiness::Installed
+    );
 
     let layout = atpkg::store::Layout {
         prefix: PathBuf::from("/p/pkg"),
@@ -970,6 +984,132 @@ fn a_grok_workers_launcher_asks_the_sign_in_before_it_installs() {
     );
     assert_eq!(argv[4], "--progress-file");
     assert_eq!(Path::new(&argv[5]), layout.progress_file());
+}
+
+/// A scratch store of worker programs whose holds are [`AtpkgStore`]'s own reading of an
+/// aterm.toml's `[packages]` and a store ([`held_in`]), and whose install is a stand-in that lays
+/// the program: what a spawn does under a person's offs, with no network and no real atpkg.
+struct ConsentStore<'a> {
+    cfg: atpkg::config::PackagesConfig,
+    layout: &'a atpkg::store::Layout,
+    installs: std::cell::Cell<u32>,
+}
+
+impl ConsentStore<'_> {
+    fn laid(&self, program: &str) -> PathBuf {
+        self.layout.prefix.join("laid").join(program)
+    }
+}
+
+impl ProgramStore for ConsentStore<'_> {
+    fn present(&self, program: &str) -> bool {
+        self.laid(program).is_file()
+    }
+
+    fn held(&self, program: &str) -> Option<String> {
+        held_in(program, &self.cfg, Some(self.layout))
+    }
+
+    fn install(&self, program: &str) -> Result<(), String> {
+        self.installs.set(self.installs.get() + 1);
+        let laid = self.laid(program);
+        std::fs::create_dir_all(laid.parent().expect("its folder")).map_err(|e| e.to_string())?;
+        std::fs::write(laid, "the stand-in's build\n").map_err(|e| e.to_string())
+    }
+}
+
+/// A SPAWN INSTALLS NO AGENT A PERSON SAID NO TO INSTALLING, BY ATPKG'S OWN READING OF THAT NO:
+/// the reading atpkg's update pass completes the default set by
+/// ([`atpkg::adoption::unattended_install_off`]).
+/// - `[packages] auto_install = false` (Settings ▸ Packages ▸ "Install ALab tools" off), a
+///   decline `aterm pkg uninstall --all` recorded on the store, `[packages] enabled = false`
+///   (Settings ▸ Packages ▸ "Keep ALab tools up to date" off), a `[packages] prefix` this
+///   build ignores and a `[packages] exclude` naming the program each install nothing: the
+///   worker is admitted, and its launch note names that off.
+/// - CONTROLS: the default table on a fresh store, and an exclude naming another program,
+///   install the absent program once, by the stand-in installer, and it is then present.
+#[test]
+fn a_spawn_installs_no_agent_where_a_person_said_no_to_installs() {
+    use aterm_agent::harness::worker::Readiness;
+    let cli = aterm_agent::harness::worker::worker_cli(Program::Claude).expect("claude row");
+    let program = cli.atpkg_program().expect("atpkg ships claude");
+    assert!(
+        atpkg::vendor_direct::served_here(program),
+        "PRECONDITION: atpkg serves {program} on this machine"
+    );
+    let d = aterm_tempfile::Builder::new()
+        .prefix("aterm-spawn-consent")
+        .tempdir()
+        .expect("scratch dir");
+    let home = d.path().join("home");
+    let admit = |case: &str, cfg: atpkg::config::PackagesConfig, declined: bool| {
+        let layout = atpkg::store::Layout {
+            prefix: d.path().join(case).join("pkg"),
+        };
+        std::fs::create_dir_all(&layout.prefix).expect("the store");
+        if declined {
+            std::fs::write(layout.declined(), "# declined\n").expect("the decline marker");
+        }
+        let store = ConsentStore {
+            cfg,
+            layout: &layout,
+            installs: std::cell::Cell::new(0),
+        };
+        let admitted = admit_worker(cli, cli.plain(), None, &|_| {}, &|| (), &store)
+            .unwrap_or_else(|refused| panic!("{case}: {refused:?}"));
+        (admitted, store.installs.get(), store.present(program))
+    };
+    let parsed = |text: &str| atpkg::config::parse_packages_at(text, false, Some(home.as_path()));
+
+    let other = if program == "codex" {
+        "claude"
+    } else {
+        "codex"
+    };
+    for (case, cfg) in [
+        ("default", parsed("[packages]\n")),
+        (
+            "other-excluded",
+            parsed(&format!("[packages]\nexclude = [\"{other}\"]\n")),
+        ),
+    ] {
+        let (admitted, installs, present) = admit(case, cfg, false);
+        assert_eq!(
+            (admitted.readiness(), installs, present),
+            (&Readiness::Installed, 1, true),
+            "CONTROL {case}: the absent program is installed once"
+        );
+    }
+
+    let foreign = d.path().join("elsewhere");
+    let prefix = format!("[packages]\nprefix = \"{}\"\n", foreign.display());
+    let excluded = format!("[packages]\nexclude = [\"{program}\"]\n");
+    for (case, cfg, declined, words) in [
+        (
+            "auto-install-off",
+            parsed("[packages]\nauto_install = false\n"),
+            false,
+            "auto_install = false",
+        ),
+        ("declined", parsed("[packages]\n"), true, "uninstall --all"),
+        (
+            "updates-off",
+            parsed("[packages]\nenabled = false\n"),
+            false,
+            atpkg::adoption::UPDATES_OFF,
+        ),
+        ("ignored-prefix", parsed(&prefix), false, "prefix"),
+        ("excluded", parsed(&excluded), false, "`[packages] exclude`"),
+    ] {
+        let (admitted, installs, present) = admit(case, cfg, declined);
+        assert_eq!((installs, present), (0, false), "{case}: nothing installed");
+        assert!(
+            admitted
+                .kept_off()
+                .is_some_and(|said| said.contains(words) && said.contains(program)),
+            "{case}: the launch note names the off ({words:?}): {admitted:?}"
+        );
+    }
 }
 
 /// A LAUNCHER'S INSTALLING MARK LIVES ON ITS SESSION'S TIMELINE WHILE IT STANDS, AND GOES WHEN
@@ -1002,7 +1142,8 @@ fn pooled_starter_rotates_children_of_a_pooled_manager_and_preserves_custom_home
     }
     let c1 = root.join("logins/codex/codex-1");
     let c2 = root.join("logins/codex/codex-2");
-    for dir in [&c1, &c2] {
+    // `main`, the default row, is signed in on this machine.
+    for dir in [&c1, &c2, &home.join(".codex")] {
         std::fs::create_dir_all(dir).expect("login dir");
         std::fs::write(dir.join("auth.json"), "{}").expect("auth");
     }
@@ -1023,7 +1164,8 @@ fn pooled_starter_rotates_children_of_a_pooled_manager_and_preserves_custom_home
         home: &home,
         now: NOW,
     };
-    let no_usage = |_: Cli, _: &Path, _: i64| -> Option<Usage> { None };
+    let no_usage = |_: Cli, _: &Path, _: Option<&str>, _: i64| -> Option<Usage> { None };
+    let alab = aterm_agent::harness::codex_alab::lay_package(&root.join("codex-alab"), true);
 
     // Wall `main` and `codex-1` so the pool's next usable row is `codex-2`.
     let mut note = None;
@@ -1043,7 +1185,7 @@ fn pooled_starter_rotates_children_of_a_pooled_manager_and_preserves_custom_home
         .expect("wall main + codex-1");
 
     let starter_on = |pairs: &[(&str, &str)]| Starter {
-        exe: PathBuf::from("/opt/twin/codex"),
+        exe: alab.clone(),
         env: pairs
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
@@ -1089,8 +1231,9 @@ fn pooled_starter_rotates_children_of_a_pooled_manager_and_preserves_custom_home
     // 3. CONTROL: a custom scratch `CODEX_HOME` outside the bound roster, a non-default CLI home
     //    (`GROK_HOME`), or an explicit credential override (`CODEX_API_KEY`, with or without
     //    `CODEX_AUTH_PATH`) is left untouched without reading usage.
-    let panic_read =
-        |_: Cli, _: &Path, _: i64| -> Option<Usage> { panic!("custom home must not read usage") };
+    let panic_read = |_: Cli, _: &Path, _: Option<&str>, _: i64| -> Option<Usage> {
+        panic!("custom home must not read usage")
+    };
     let custom_dir = root.join("custom-scratch-codex").display().to_string();
     let custom = starter_on(&[("CODEX_HOME", &custom_dir)]);
     assert_eq!(
@@ -1198,6 +1341,624 @@ fn pooled_starter_rotates_children_of_a_pooled_manager_and_preserves_custom_home
     );
 }
 
+/// A CODEX WORKER ON A ROW OF ITS OWN STARTS ONLY ON A PROGRAM THAT KEEPS `CODEX_AUTH_PATH`'S
+/// LOGIN ITS OWN: OpenAI's builds, and codex-alab before the variable, read and refresh
+/// `$CODEX_HOME/auth.json` whatever it names (measured 2026-10-27, `codex_alab::auth_path_unread`),
+/// so the worker would run on the machine's default login while the pool counted it as the
+/// row's. Each such program is refused before anything is typed, whether the row is the pool's
+/// pick or one the starter carried; the default row's pick needs no such program.
+#[test]
+fn a_codex_row_of_its_own_is_refused_on_a_program_that_ignores_codex_auth_path() {
+    use aterm_agent::harness::accounts::{self, Cli};
+    use aterm_agent::harness::accounts_pool::Seat;
+    use aterm_agent::harness::codex_alab::lay_package;
+    use aterm_agent::harness::codex_app_login::Usage;
+    use aterm_agent::harness::worker::Starter;
+
+    const NOW: i64 = 1_792_700_000;
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().canonicalize().expect("canonical");
+    let (cfg, state, home) = (root.join("cfg"), root.join("state"), root.join("home"));
+    for dir in [&cfg, &state, &home] {
+        std::fs::create_dir_all(dir).expect("dir");
+    }
+    let work = root.join("logins/codex/work");
+    std::fs::create_dir_all(&work).expect("login dir");
+    std::fs::write(work.join("auth.json"), "{}").expect("auth");
+    // The default row is signed in here: its login is the default home's.
+    std::fs::create_dir_all(home.join(".codex")).expect("default home");
+    std::fs::write(home.join(".codex/auth.json"), "{}").expect("default login");
+    std::fs::write(
+        cfg.join("accounts-codex.toml"),
+        format!(
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
+             [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
+            work.display()
+        ),
+    )
+    .expect("roster");
+    let seat = Seat {
+        config_dir: &cfg,
+        state: &state,
+        home: &home,
+        now: NOW,
+    };
+    let no_usage = |_: Cli, _: &Path, _: Option<&str>, _: i64| -> Option<Usage> { None };
+    let mut note = None;
+    seat.store(Cli::Codex)
+        .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |s| {
+            Ok(accounts::note_wall(
+                s,
+                "main",
+                "seven_day",
+                Some(NOW + 3600),
+                NOW,
+                NOW,
+            ))
+        })
+        .expect("wall main so the pool picks `work`");
+    let on = |exe: PathBuf| Starter {
+        exe,
+        env: Vec::new(),
+        args: Ok(Vec::new()),
+        unset: Vec::new(),
+    };
+    let reads = lay_package(&root.join("store/codex/new"), true);
+    let before = lay_package(&root.join("store/codex/old"), false);
+    let vendor = lay_package(&root.join("store/codex-old/vendor"), true);
+    std::fs::remove_file(root.join("store/codex-old/vendor/alab-build.json"))
+        .expect("an OpenAI package carries no marker");
+    let twin = root.join("agents-codex");
+    std::fs::write(
+        &twin,
+        format!("#!/bin/sh\nexec '{}' \"$@\"\n", before.display()),
+    )
+    .expect("an atpkg launcher of the old build");
+    let refused = [
+        PathBuf::from("codex"),
+        vendor.clone(),
+        before.clone(),
+        twin.clone(),
+    ];
+    for exe in &refused {
+        super::pooled_starter_in(on(exe.clone()), Cli::Codex, &seat, &no_usage, 1)
+            .expect_err("no worker starts on a program that ignores CODEX_AUTH_PATH");
+    }
+    let work_auth = work.join("auth.json").display().to_string();
+    let started = super::pooled_starter_in(on(reads.clone()), Cli::Codex, &seat, &no_usage, 2)
+        .expect("a codex-alab that keeps CODEX_AUTH_PATH's login starts on the row");
+    assert_eq!(
+        started.env,
+        vec![("CODEX_AUTH_PATH".to_string(), work_auth.clone())]
+    );
+
+    // With rotation off and no pin the pool picks nothing, and a starter that carries the bound
+    // row's variable hands it on as it is: that too needs a program that keeps its login.
+    std::fs::write(cfg.join("aterm.toml"), "[harness]\naccounts = \"off\"\n").expect("aterm.toml");
+    let carrying = |exe: PathBuf| Starter {
+        env: vec![("CODEX_AUTH_PATH".to_string(), work_auth.clone())],
+        ..on(exe)
+    };
+    for exe in &refused {
+        super::pooled_starter_in(carrying(exe.clone()), Cli::Codex, &seat, &no_usage, 4)
+            .expect_err("a carried row of its own is held to the same program");
+    }
+    let carried = carrying(reads.clone());
+    assert_eq!(
+        super::pooled_starter_in(carried.clone(), Cli::Codex, &seat, &no_usage, 5),
+        Ok(carried)
+    );
+    std::fs::remove_file(cfg.join("aterm.toml")).expect("rotation back on");
+    seat.store(Cli::Codex)
+        .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |s| {
+            s.active = Some("main".to_string());
+            s.pinned = true;
+            s.proven = true;
+            Ok(Vec::new())
+        })
+        .expect("pin the default row");
+    let default_row = super::pooled_starter_in(on(vendor.clone()), Cli::Codex, &seat, &no_usage, 3)
+        .expect("the default row's pick runs on any build");
+    assert!(default_row.env.is_empty(), "{:?}", default_row.env);
+}
+
+/// UNDER ROTATION OFF WITH NO PIN, A CODEX WORKER WHOSE STARTER CARRIES A ROW'S OWN
+/// `CODEX_AUTH_PATH`, ON A PROGRAM THAT IGNORES IT, while a sign-in moved the row that was on
+/// this machine's own login onto a login of its own, is refused with a way back that works
+/// there: it never says to turn rotation off, which it is already, and a starter that carries no
+/// row's variable starts on this machine's own login. Under rotation on with Codex's login kept
+/// in the OS keyring, where the pool picks no row either, the same refusal never says rotation
+/// is off, and under rotation off with that keyring and an account pinned, where the keyring and
+/// not rotation off is why no row is picked, it never says no account is pinned.
+#[test]
+fn a_carried_codex_row_under_rotation_off_is_told_a_way_back_that_works_there() {
+    use aterm_agent::harness::accounts::{self, Cli};
+    use aterm_agent::harness::accounts_pool::Seat;
+    use aterm_agent::harness::codex_alab::{AUTH_PATH_ENV, lay_package};
+    use aterm_agent::harness::codex_app_login::Usage;
+    use aterm_agent::harness::worker::Starter;
+
+    const NOW: i64 = 1_792_700_000;
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().canonicalize().expect("canonical");
+    let (cfg, state, home) = (root.join("cfg"), root.join("state"), root.join("home"));
+    for dir in [&cfg, &state, &home.join(".codex")] {
+        std::fs::create_dir_all(dir).expect("dir");
+    }
+    std::fs::write(home.join(".codex/auth.json"), "{}").expect("default login");
+    let work = root.join("logins/codex/work");
+    let staging = root.join("logins/codex/main+1");
+    for dir in [&work, &staging] {
+        std::fs::create_dir_all(dir).expect("login dir");
+        std::fs::write(dir.join("auth.json"), "{}").expect("auth");
+    }
+    std::fs::write(
+        cfg.join("accounts-codex.toml"),
+        format!(
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
+             [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
+            work.display()
+        ),
+    )
+    .expect("roster");
+    std::fs::write(cfg.join("aterm.toml"), "[harness]\naccounts = \"off\"\n").expect("aterm.toml");
+    let seat = Seat {
+        config_dir: &cfg,
+        state: &state,
+        home: &home,
+        now: NOW,
+    };
+    let mut note = None;
+    seat.store(Cli::Codex)
+        .transact_logins(NOW, &mut note, |state, logins| {
+            Ok(accounts::note_renewed(
+                state,
+                logins,
+                "main",
+                None,
+                &staging.display().to_string(),
+                None,
+                NOW,
+            ))
+        })
+        .expect("a sign-in binds `main` to its own login");
+    let no_usage = |_: Cli, _: &Path, _: Option<&str>, _: i64| -> Option<Usage> { None };
+    let old = lay_package(&root.join("store/codex/old"), false);
+    let on = |env: Vec<(String, String)>| Starter {
+        exe: old.clone(),
+        env,
+        args: Ok(Vec::new()),
+        unset: Vec::new(),
+    };
+    let work_auth = work.join("auth.json").display().to_string();
+    let refused = super::pooled_starter_in(
+        on(vec![(AUTH_PATH_ENV.to_string(), work_auth)]),
+        Cli::Codex,
+        &seat,
+        &no_usage,
+        1,
+    )
+    .expect_err("`work`'s turns would run on the default login");
+    assert!(
+        refused.contains("`main`, the row that login was listed as"),
+        "{refused}"
+    );
+    assert!(
+        !refused.contains("[harness] accounts"),
+        "rotation is off already: {refused}"
+    );
+    assert!(
+        refused.contains("with rotation off and no account pinned, as here"),
+        "{refused}"
+    );
+    let plain = on(Vec::new());
+    assert_eq!(
+        super::pooled_starter_in(plain.clone(), Cli::Codex, &seat, &no_usage, 2),
+        Ok(plain.clone()),
+        "the way back it names starts"
+    );
+    std::fs::write(cfg.join("aterm.toml"), "").expect("rotation on");
+    std::fs::write(
+        home.join(".codex/config.toml"),
+        "cli_auth_credentials_store = \"auto\"\n",
+    )
+    .expect("the OS keyring holds Codex's login");
+    assert!(seat.keyring_held(Cli::Codex));
+    let work_auth = work.join("auth.json").display().to_string();
+    let keyring = super::pooled_starter_in(
+        on(vec![(AUTH_PATH_ENV.to_string(), work_auth)]),
+        Cli::Codex,
+        &seat,
+        &no_usage,
+        3,
+    )
+    .expect_err("`work`'s turns would run on the default login");
+    assert!(
+        keyring.contains("the pool picks no row for a Codex launch here"),
+        "{keyring}"
+    );
+    assert!(
+        !keyring.contains("rotation off"),
+        "rotation is on here: {keyring}"
+    );
+    assert_eq!(
+        super::pooled_starter_in(plain.clone(), Cli::Codex, &seat, &no_usage, 4),
+        Ok(plain.clone()),
+        "the way back it names starts"
+    );
+    std::fs::write(cfg.join("aterm.toml"), "[harness]\naccounts = \"off\"\n").expect("aterm.toml");
+    seat.store(Cli::Codex)
+        .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |s| {
+            s.active = Some("work".to_string());
+            s.pinned = true;
+            Ok(Vec::new())
+        })
+        .expect("pin `work`");
+    assert!(seat.keyring_held(Cli::Codex) && seat.mode() == accounts::Mode::Off);
+    let work_auth = work.join("auth.json").display().to_string();
+    let pinned = super::pooled_starter_in(
+        on(vec![(AUTH_PATH_ENV.to_string(), work_auth)]),
+        Cli::Codex,
+        &seat,
+        &no_usage,
+        5,
+    )
+    .expect_err("`work`'s turns would run on the default login");
+    assert!(
+        pinned.contains("the pool picks no row for a Codex launch here"),
+        "{pinned}"
+    );
+    assert!(
+        !pinned.contains("no account pinned"),
+        "an account is pinned: {pinned}"
+    );
+    assert_eq!(
+        super::pooled_starter_in(plain.clone(), Cli::Codex, &seat, &no_usage, 6),
+        Ok(plain),
+        "the way back it names starts"
+    );
+}
+
+/// A Codex pool of `main` (this machine's own login, signed in in the default home) and `work`
+/// (a row of its own, signed in), whose `main` the usage reader shows at its five-hour limit
+/// until `reset` and `work` usable.
+struct CodexPool {
+    _tmp: aterm_tempfile::TempDir,
+    root: PathBuf,
+    cfg: PathBuf,
+    state: PathBuf,
+    home: PathBuf,
+    work_auth: String,
+}
+
+const POOL_NOW: i64 = 1_792_700_000;
+
+/// What [`CodexPool::launch`]'s usage reader reads for `main`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainReads {
+    /// Empty: usable.
+    Empty,
+    /// At its five-hour limit before [`POOL_RESET`].
+    Walled,
+    /// Nothing (no usage read answers, as for a login that cannot be read).
+    Unread,
+}
+const POOL_RESET: i64 = POOL_NOW + 4 * 3600;
+
+impl CodexPool {
+    fn new() -> Self {
+        let tmp = aterm_tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonical");
+        let (cfg, state, home) = (root.join("cfg"), root.join("state"), root.join("home"));
+        for dir in [&cfg, &state, &home.join(".codex")] {
+            std::fs::create_dir_all(dir).expect("dir");
+        }
+        std::fs::write(home.join(".codex/auth.json"), "{}").expect("default login");
+        let work = root.join("logins/codex/work");
+        std::fs::create_dir_all(&work).expect("login dir");
+        std::fs::write(work.join("auth.json"), "{}").expect("auth");
+        std::fs::write(
+            cfg.join("accounts-codex.toml"),
+            format!(
+                "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
+                 [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
+                work.display()
+            ),
+        )
+        .expect("roster");
+        let work_auth = work.join("auth.json").display().to_string();
+        Self {
+            _tmp: tmp,
+            root,
+            cfg,
+            state,
+            home,
+            work_auth,
+        }
+    }
+
+    fn seat(&self, now: i64) -> aterm_agent::harness::accounts_pool::Seat<'_> {
+        aterm_agent::harness::accounts_pool::Seat {
+            config_dir: &self.cfg,
+            state: &self.state,
+            home: &self.home,
+            now,
+        }
+    }
+
+    /// A worker launch of `exe` at `now` through the pool, reading `main` as `main` says, and
+    /// `work` empty.
+    fn launch(
+        &self,
+        exe: &Path,
+        now: i64,
+        main: MainReads,
+    ) -> Result<aterm_agent::harness::worker::Starter, String> {
+        use aterm_agent::harness::accounts::{self, Cli};
+        use aterm_agent::harness::codex_app_login::Usage;
+        let default_home = self.home.join(".codex");
+        let read = |_: Cli, at: &Path, _: Option<&str>, now: i64| -> Option<Usage> {
+            if at == default_home && main == MainReads::Unread {
+                return None;
+            }
+            let walled = main == MainReads::Walled && at == default_home && now < POOL_RESET;
+            Some(Usage {
+                sample: accounts::Sample {
+                    session_pct: Some(if walled { 100 } else { 0 }),
+                    session_reset: Some(POOL_RESET),
+                    at: now,
+                    ..accounts::Sample::default()
+                },
+                walls: walled
+                    .then_some((accounts::SESSION_LIMIT, Some(POOL_RESET)))
+                    .into_iter()
+                    .collect(),
+            })
+        };
+        let starter = aterm_agent::harness::worker::Starter {
+            exe: exe.to_path_buf(),
+            env: Vec::new(),
+            args: Ok(Vec::new()),
+            unset: Vec::new(),
+        };
+        super::pooled_starter_in(starter, Cli::Codex, &self.seat(now), &read, 1)
+    }
+
+    /// The owner's pin (`aterm harness accounts use <label> --cli codex`) at `now`.
+    fn pin(&self, label: &str, now: i64) -> Result<(), String> {
+        use aterm_agent::harness::accounts::{self, Cli};
+        let seat = self.seat(now);
+        let roster = seat.bound_roster(Cli::Codex)?;
+        let enrolled = accounts::enrolled_for(Cli::Codex, &roster);
+        seat.store(Cli::Codex)
+            .transact_within(&accounts::LOCK_LADDER, now, &mut None, |s| {
+                accounts::pin(s, &roster, &enrolled, label, now).map(|e| vec![e])
+            })
+            .map(|_| ())
+    }
+
+    fn pinned(&self, now: i64) -> bool {
+        use aterm_agent::harness::accounts::Cli;
+        self.seat(now)
+            .store(Cli::Codex)
+            .load(now)
+            .expect("state")
+            .0
+            .pinned
+    }
+}
+
+fn auth_path_of(starter: &aterm_agent::harness::worker::Starter) -> Option<&str> {
+    starter
+        .env
+        .iter()
+        .find(|(name, _)| name == "CODEX_AUTH_PATH")
+        .map(|(_, value)| value.as_str())
+}
+
+/// ON A CODEX PROGRAM THAT KEEPS NO ROW'S LOGIN ITS OWN, A WALLED DEFAULT ROW IS THE ANSWER, NOT A
+/// PIN THE NEXT USAGE READ ENDS: the pool never picks `work` there (its turns would run on the
+/// default login), so the launch is refused with `main`'s own limit and reset, and the same
+/// answer comes back after the sample goes stale and is read again. The owner's pin on `main`
+/// still starts it (a pin overrides the budget) and is charged to `main`, the row it runs under;
+/// that pin ends at the next read of the wall, and the answer is the first one again.
+#[test]
+fn a_walled_default_on_a_program_that_ignores_codex_auth_path_refuses_alike_across_usage_reads() {
+    use aterm_agent::harness::accounts_pool::USAGE_FRESH_S;
+    use aterm_agent::harness::usage::rfc3339_utc;
+    let pool = CodexPool::new();
+    let old = aterm_agent::harness::codex_alab::lay_package(&pool.root.join("store/old"), false);
+
+    let first = pool
+        .launch(&old, POOL_NOW, MainReads::Walled)
+        .expect_err("no Codex account runs here while `main` is walled");
+    assert!(first.contains("five_hour"), "{first}");
+    assert!(first.contains(&rfc3339_utc(POOL_RESET)), "{first}");
+    assert!(first.contains("aterm pkg update codex"), "{first}");
+    assert!(
+        !first.contains("accounts use"),
+        "no pin is offered: {first}"
+    );
+
+    pool.pin("main", POOL_NOW + 1)
+        .expect("the owner pins `main`");
+    let pinned = pool
+        .launch(&old, POOL_NOW + 2, MainReads::Walled)
+        .expect("the owner's pin on the default row starts it");
+    assert_eq!(auth_path_of(&pinned), None, "{:?}", pinned.env);
+
+    let stale = POOL_NOW + 2 + USAGE_FRESH_S + 1;
+    let again = pool
+        .launch(&old, stale, MainReads::Walled)
+        .expect_err("the wall read again ends the pin");
+    assert!(!pool.pinned(stale), "the read ended the pin");
+    assert_eq!(again, first, "the same honest answer, never `work`");
+    assert_eq!(
+        pool.launch(&old, stale + 1, MainReads::Walled),
+        Err(first),
+        "and again, while the wall stands"
+    );
+}
+
+/// A SIGNED-OUT DEFAULT ROW ON SUCH A PROGRAM NAMES CODEX'S OWN SIGN-IN IN THE DEFAULT HOME
+/// (`aterm ai login codex`), never the pool's staged sign-in of it (which would move it onto a
+/// login of its own that build never runs) nor a pin of it (which the pool refuses for a
+/// signed-out row), however usable `work` is.
+#[test]
+fn a_signed_out_default_on_a_program_that_ignores_codex_auth_path_names_its_sign_in() {
+    use aterm_agent::harness::accounts::{self, Cli};
+    let pool = CodexPool::new();
+    let old = aterm_agent::harness::codex_alab::lay_package(&pool.root.join("store/old"), false);
+    pool.seat(POOL_NOW)
+        .store(Cli::Codex)
+        .transact_within(&accounts::LOCK_LADDER, POOL_NOW, &mut None, |s| {
+            Ok(accounts::note_auth(
+                s,
+                "main",
+                accounts::Auth::SignedOut,
+                POOL_NOW,
+            ))
+        })
+        .expect("sign `main` out");
+    let refused = pool
+        .launch(&old, POOL_NOW + 10, MainReads::Unread)
+        .expect_err("no Codex account runs here while `main` is signed out");
+    assert!(refused.contains("`aterm ai login codex`"), "{refused}");
+    assert!(!refused.contains("harness accounts login"), "{refused}");
+    assert!(!refused.contains("accounts use"), "{refused}");
+    assert!(
+        pool.pin("main", POOL_NOW + 11).is_err(),
+        "the pin is refused"
+    );
+
+    // No login file in the default home is no login of `main` here either, whatever the
+    // records say: the same sign-in, never a start on a home with nothing to sign in with.
+    pool.seat(POOL_NOW + 12)
+        .store(Cli::Codex)
+        .transact_within(&accounts::LOCK_LADDER, POOL_NOW + 12, &mut None, |s| {
+            Ok(accounts::note_auth(
+                s,
+                "main",
+                accounts::Auth::Ok,
+                POOL_NOW + 12,
+            ))
+        })
+        .expect("clear `main`'s sign-out");
+    std::fs::remove_file(pool.home.join(".codex/auth.json")).expect("drop the default login");
+    let missing = pool
+        .launch(&old, POOL_NOW + 13, MainReads::Empty)
+        .expect_err("no Codex account runs here while `main` has no login");
+    assert!(missing.contains("`aterm ai login codex`"), "{missing}");
+    assert!(!missing.contains("harness accounts login"), "{missing}");
+    assert!(!missing.contains("accounts use"), "{missing}");
+}
+
+/// ON SUCH A PROGRAM A SPAWN REFUSED FOR THE DEFAULT ROW'S WALL IS HELD UNTIL THAT WALL ENDS, NOT
+/// STALLED AFTER ITS RETRIES: `work` is usable, but that build never runs it, so the pool's
+/// opening for the worker's starter ([`super::pool_opening`], the one `pooled_starter_held`
+/// waits on) is `main`'s (the instant the refusal names), and the launch starts on `main`, the
+/// default login, once that instant passes.
+#[test]
+fn a_spawn_refused_for_a_walled_default_on_a_program_that_ignores_codex_auth_path_is_held() {
+    use aterm_agent::harness::usage::rfc3339_utc;
+    use std::cell::Cell;
+    let pool = CodexPool::new();
+    let old = aterm_agent::harness::codex_alab::lay_package(&pool.root.join("store/old"), false);
+    let starter = aterm_agent::harness::worker::Starter {
+        exe: old.clone(),
+        env: Vec::new(),
+        args: Ok(Vec::new()),
+        unset: Vec::new(),
+    };
+    let codex = aterm_agent::harness::worker::worker_cli(Program::Codex).expect("codex row");
+    let clock = Cell::new(POOL_NOW);
+    let refusals = RefCell::new(Vec::new());
+    let waits = RefCell::new(Vec::new());
+    let got = pool_attempts(
+        || {
+            pool.launch(&old, clock.get(), MainReads::Walled)
+                .inspect_err(|why| refusals.borrow_mut().push(why.clone()))
+        },
+        || super::pool_opening(&pool.seat(clock.get()), &starter, codex),
+        || Some(clock.get()),
+        |wait| {
+            waits.borrow_mut().push(wait.clone());
+            if let PoolWait::Hold { until, .. } = wait {
+                clock.set(clock.get().max(*until) + 1);
+            }
+            waits.borrow().len() < 16
+        },
+    );
+    let waits = waits.take();
+    let [PoolWait::Hold { until, .. }] = waits.as_slice() else {
+        panic!("one hold, no retries: {waits:?}");
+    };
+    assert!(*until >= POOL_RESET, "held until `main`'s reset: {until}");
+    let refusals = refusals.take();
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert!(
+        refusals[0].contains(&format!("until {}", rfc3339_utc(*until))),
+        "the hold ends when the refusal says: {}",
+        refusals[0]
+    );
+    let started = got.expect("the launch starts once `main` serves");
+    assert_eq!(auth_path_of(&started), None, "on `main`: {:?}", started.env);
+}
+
+/// THE OWNER'S PIN ON A ROW OF ITS OWN IS JUDGED ON THE USAGE THE LAUNCH READS, NOT ON THE
+/// RECORDS BEFORE IT: with `work` pinned and nothing yet on record for `main`, the read shows
+/// `main` walled, so the refusal names that wall, and since the pin on `work` refuses every
+/// launch after it too, it names that pin's end and offers the pin of `main` for once that wall
+/// ends (an earlier one the next read of the wall would end).
+#[test]
+fn a_pin_on_a_row_of_its_own_on_a_program_that_ignores_codex_auth_path_reads_the_default_first() {
+    use aterm_agent::harness::accounts::Cli;
+    use aterm_agent::harness::codex_alab::{DefaultRow, UNPIN_FIX, unread_fix};
+    use aterm_agent::harness::usage::rfc3339_utc;
+    let pool = CodexPool::new();
+    let old = aterm_agent::harness::codex_alab::lay_package(&pool.root.join("store/old"), false);
+    pool.pin("work", POOL_NOW).expect("the owner pins `work`");
+    let refused = pool
+        .launch(&old, POOL_NOW + 1, MainReads::Walled)
+        .expect_err("a pin on a row of its own does not run on an older build");
+    assert!(refused.contains("five_hour"), "{refused}");
+    let Ok(DefaultRow::Walled { until, .. }) =
+        aterm_agent::harness::accounts_pool::default_row_now(&pool.seat(POOL_NOW + 1), Cli::Codex)
+    else {
+        panic!("the read put `main`'s wall on record: {refused}");
+    };
+    let pin = unread_fix(Some("main"));
+    assert!(
+        refused.contains(&pin) && refused.contains(&rfc3339_utc(until)),
+        "the pin of `main`, for once the wall ends: {refused}"
+    );
+    assert!(refused.contains(UNPIN_FIX), "the pin's end: {refused}");
+}
+
+/// CONTROL: A PROGRAM THAT KEEPS `CODEX_AUTH_PATH`'S LOGIN ITS OWN still rotates past the walled
+/// default onto `work`. On one that does not, the owner's pin on `work` is refused, and since
+/// `main` can serve, the answer is the pin of `main`.
+#[test]
+fn a_program_that_keeps_codex_auth_path_still_rotates_to_work() {
+    let pool = CodexPool::new();
+    let reads = aterm_agent::harness::codex_alab::lay_package(&pool.root.join("store/new"), true);
+    let old = aterm_agent::harness::codex_alab::lay_package(&pool.root.join("store/old"), false);
+    let started = pool
+        .launch(&reads, POOL_NOW, MainReads::Walled)
+        .expect("a codex-alab that keeps the row's login starts on it");
+    assert_eq!(auth_path_of(&started), Some(pool.work_auth.as_str()));
+
+    let later = POOL_RESET + 3600;
+    pool.pin("work", later).expect("the owner pins `work`");
+    let refused = pool
+        .launch(&old, later + 1, MainReads::Empty)
+        .expect_err("a pin on a row of its own does not run on an older build");
+    assert!(
+        refused.contains("aterm harness accounts use main --cli codex"),
+        "{refused}"
+    );
+}
+
 #[test]
 fn a_relative_login_file_is_not_rotated_as_the_default_worker() {
     use aterm_agent::harness::accounts::{self, Cli};
@@ -1246,7 +2007,14 @@ fn a_relative_login_file_is_not_rotated_as_the_default_worker() {
                     args: Ok(Vec::new()),
                     unset: Vec::new(),
                 };
-                let no_usage = |_, _: &Path, _| panic!("an unbound file must not poll pool usage");
+                let no_usage =
+                    |_: Cli,
+                     _: &Path,
+                     _: Option<&str>,
+                     _: i64|
+                     -> Option<aterm_agent::harness::codex_app_login::Usage> {
+                        panic!("an unbound file must not poll pool usage")
+                    };
                 let actual =
                     super::pooled_starter_in(starter.clone(), cli, &seat, &no_usage, 0).unwrap();
                 assert_eq!(actual, starter, "{cli:?}: {value}, broken={broken}");
@@ -1257,4 +2025,137 @@ fn a_relative_login_file_is_not_rotated_as_the_default_worker() {
             );
         }
     }
+}
+
+#[test]
+fn a_refused_pooled_launch_is_tried_again_and_held_while_every_row_is_at_its_limit() {
+    use std::cell::Cell;
+    // Another process's turn at the accounts lock passes: the launch is tried again.
+    let tries = Cell::new(0);
+    let waits = RefCell::new(Vec::new());
+    let got = pool_attempts(
+        || {
+            tries.set(tries.get() + 1);
+            if tries.get() < 3 {
+                Err(aterm_agent::harness::accounts::LOCK_HELD.to_string())
+            } else {
+                Ok("started")
+            }
+        },
+        || None,
+        || Some(1_792_700_000),
+        |wait| {
+            waits.borrow_mut().push(wait.clone());
+            true
+        },
+    );
+    assert_eq!(got, Ok("started"));
+    assert_eq!(
+        waits.take(),
+        [
+            PoolWait::Retry(POOL_RETRY_PAUSE),
+            PoolWait::Retry(POOL_RETRY_PAUSE * 2)
+        ]
+    );
+
+    // Every row at its limit, the first opening in three days, and nothing changes: the launch
+    // is held, never counted against the retries, until that row opens, looking at the pool
+    // again at least every POOL_HOLD_LOOK.
+    let start = 1_792_700_000_i64;
+    let until = start + 3 * 86_400;
+    let clock = Cell::new(start);
+    let tries = Cell::new(0);
+    let looks = RefCell::new(Vec::new());
+    let walled = || clock.get() < until;
+    let got = pool_attempts(
+        || {
+            tries.set(tries.get() + 1);
+            if walled() {
+                Err("codex account pool has no usable account".to_string())
+            } else {
+                Ok(clock.get())
+            }
+        },
+        || walled().then_some(until),
+        || Some(clock.get()),
+        |wait| hold_one_look(wait, until, &clock, &looks),
+    );
+    assert_eq!(got, Ok(until), "started when the first row opened");
+    assert_eq!(tries.get(), 2);
+    assert!(looks.borrow().iter().all(|look| *look <= POOL_HOLD_LOOK));
+
+    // CONTROL: a refusal that stands stalls the launch once the retries are spent, and a
+    // session that ended stops a hold at once.
+    let tries = Cell::new(0);
+    let standing = pool_attempts(
+        || -> Result<(), String> {
+            tries.set(tries.get() + 1);
+            Err("roster unreadable".to_string())
+        },
+        || None,
+        || Some(start),
+        |_| true,
+    );
+    assert_eq!(standing, Err("roster unreadable".to_string()));
+    assert_eq!(tries.get(), 1 + POOL_RETRIES);
+    let ended = pool_attempts(
+        || -> Result<(), String> { Err("walled".to_string()) },
+        || Some(until),
+        || Some(start),
+        |_| false,
+    );
+    assert_eq!(ended, Err("walled".to_string()));
+}
+
+/// One look of a held launch on a test clock: the hold names `until`, and its wait passes `look`.
+fn hold_one_look(
+    wait: &PoolWait,
+    until: i64,
+    clock: &std::cell::Cell<i64>,
+    looks: &RefCell<Vec<Duration>>,
+) -> bool {
+    let PoolWait::Hold {
+        until: held, look, ..
+    } = wait
+    else {
+        panic!("a held launch pauses for no retry: {wait:?}");
+    };
+    assert_eq!(*held, until);
+    looks.borrow_mut().push(*look);
+    clock.set(clock.get() + i64::try_from(look.as_secs()).expect("seconds"));
+    true
+}
+
+#[test]
+fn a_held_pooled_launch_starts_once_a_row_frees_partway_through_its_hold() {
+    use std::cell::Cell;
+    // Every row is at a weekly wall that ends in three days; two and a half minutes in, the
+    // owner signs in another row (or pins one, or switches rotation off), and the pool serves.
+    let start = 1_792_700_000_i64;
+    let until = start + 3 * 86_400;
+    let freed = start + 150;
+    let clock = Cell::new(start);
+    let tries = Cell::new(0);
+    let looks = RefCell::new(Vec::new());
+    let serves = || clock.get() >= freed;
+    let got = pool_attempts(
+        || {
+            tries.set(tries.get() + 1);
+            if serves() {
+                Ok(clock.get())
+            } else {
+                Err("codex account pool has no usable account".to_string())
+            }
+        },
+        || (!serves()).then_some(until),
+        || Some(clock.get()),
+        |wait| hold_one_look(wait, until, &clock, &looks),
+    );
+    let started = got.expect("the launch starts");
+    let look = i64::try_from(POOL_HOLD_LOOK.as_secs()).expect("seconds");
+    assert!(
+        (freed..freed + look).contains(&started),
+        "started at {started}: the row served from {freed}, the wall ends at {until}"
+    );
+    assert_eq!(tries.get(), 2, "tried at the refusal and once a row served");
 }

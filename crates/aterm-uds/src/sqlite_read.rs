@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 /// Maximum assembled payload bytes for a single B-tree cell across overflow pages.
@@ -28,7 +29,7 @@ const WAL_FRAME_HEADER_LEN: usize = 24;
 
 /// Decoded column value from a SQLite record.
 #[derive(Clone, Debug, PartialEq)]
-pub enum SqlValue {
+pub enum SqlValue<'a> {
     /// SQL `NULL`.
     Null,
     /// Signed 64-bit integer (`INTEGER`).
@@ -36,17 +37,17 @@ pub enum SqlValue {
     /// IEEE-754 floating-point number (`REAL`).
     Float(f64),
     /// Decoded UTF-8 text (`TEXT`).
-    Text(String),
+    Text(Cow<'a, str>),
     /// Raw byte slice (`BLOB`).
-    Blob(Vec<u8>),
+    Blob(Cow<'a, [u8]>),
 }
 
-impl SqlValue {
+impl SqlValue<'_> {
     /// Borrows a text value when this cell is `TEXT`.
     #[must_use]
     pub fn as_str(&self) -> Option<&str> {
         match self {
-            Self::Text(s) => Some(s.as_str()),
+            Self::Text(s) => Some(s.as_ref()),
             Self::Null | Self::Int(_) | Self::Float(_) | Self::Blob(_) => None,
         }
     }
@@ -67,8 +68,32 @@ impl SqlValue {
             Self::Null => String::new(),
             Self::Int(n) => n.to_string(),
             Self::Float(f) => f.to_string(),
-            Self::Text(s) => s.clone(),
+            Self::Text(s) => s.as_ref().to_owned(),
             Self::Blob(b) => String::from_utf8_lossy(b).into_owned(),
+        }
+    }
+
+    /// Compares the `sqlite3 -list` representation of this cell against `expected` without
+    /// allocating on `NULL`, `TEXT`, or valid UTF-8 `BLOB` cells.
+    #[must_use]
+    pub fn list_field_eq(&self, expected: &str) -> bool {
+        match self {
+            Self::Null => expected.is_empty(),
+            Self::Text(s) => s.as_ref() == expected,
+            Self::Blob(b) => String::from_utf8_lossy(b).as_ref() == expected,
+            Self::Int(_) | Self::Float(_) => self.to_list_field() == expected,
+        }
+    }
+
+    /// Converts any borrowed backing slice into an owned `'static` value.
+    #[must_use]
+    pub fn into_owned(self) -> SqlValue<'static> {
+        match self {
+            Self::Null => SqlValue::Null,
+            Self::Int(n) => SqlValue::Int(n),
+            Self::Float(f) => SqlValue::Float(f),
+            Self::Text(s) => SqlValue::Text(Cow::Owned(s.into_owned())),
+            Self::Blob(b) => SqlValue::Blob(Cow::Owned(b.into_owned())),
         }
     }
 }
@@ -84,7 +109,7 @@ enum TextEncoding {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TableSchema {
     columns: Vec<String>,
-    defaults: Vec<SqlValue>,
+    defaults: Vec<SqlValue<'static>>,
     rowid_alias_col: Option<usize>,
     disk_to_table: Option<Vec<usize>>,
 }
@@ -202,7 +227,7 @@ pub fn scan_table<R>(
     db: &[u8],
     wal: Option<&[u8]>,
     table_name: &str,
-    mut on_row: impl FnMut(&TableSchema, &[SqlValue]) -> Option<R>,
+    mut on_row: impl FnMut(&TableSchema, &[SqlValue<'_>]) -> Option<R>,
 ) -> Option<Vec<R>> {
     let snap = Snapshot::open(db, wal)?;
     let (rootpage, create_sql) = find_table_in_schema(&snap, table_name)?;
@@ -219,7 +244,7 @@ pub fn scan_table_with<P, R>(
     wal: Option<&[u8]>,
     table_name: &str,
     prepare: impl FnOnce(&TableSchema) -> Option<P>,
-    mut on_row: impl FnMut(&P, &[SqlValue]) -> Option<R>,
+    mut on_row: impl FnMut(&P, &[SqlValue<'_>]) -> Option<R>,
 ) -> Option<Vec<R>> {
     let snap = Snapshot::open(db, wal)?;
     let (rootpage, create_sql) = find_table_in_schema(&snap, table_name)?;
@@ -228,52 +253,109 @@ pub fn scan_table_with<P, R>(
     scan_table_rows(&snap, rootpage, &schema, |row| on_row(&proj, row))
 }
 
-fn scan_table_rows<R>(
-    snap: &Snapshot<'_>,
+fn borrow_default<'a>(v: &'a SqlValue<'static>) -> SqlValue<'a> {
+    match v {
+        SqlValue::Null => SqlValue::Null,
+        SqlValue::Int(n) => SqlValue::Int(*n),
+        SqlValue::Float(f) => SqlValue::Float(*f),
+        SqlValue::Text(s) => SqlValue::Text(Cow::Borrowed(s.as_ref())),
+        SqlValue::Blob(b) => SqlValue::Blob(Cow::Borrowed(b.as_ref())),
+    }
+}
+
+fn materialize_row<'p>(
+    rowid: Option<i64>,
+    record_bytes: &'p [u8],
+    encoding: TextEncoding,
+    schema: &'p TableSchema,
+    disk_buf: &mut Vec<SqlValue<'p>>,
+    row_buf: &mut Vec<SqlValue<'p>>,
+) -> Option<()> {
+    if let Some(perm) = &schema.disk_to_table {
+        decode_record_into(record_bytes, encoding, disk_buf)?;
+        row_buf.clear();
+        row_buf.extend(schema.defaults.iter().map(borrow_default));
+        for (disk_idx, val) in disk_buf.drain(..).enumerate() {
+            if let Some(&table_idx) = perm.get(disk_idx)
+                && let Some(slot) = row_buf.get_mut(table_idx)
+            {
+                *slot = val;
+            }
+        }
+    } else {
+        decode_record_into(record_bytes, encoding, row_buf)?;
+        for col_idx in row_buf.len()..schema.columns.len() {
+            row_buf.push(
+                schema
+                    .defaults
+                    .get(col_idx)
+                    .map_or(SqlValue::Null, borrow_default),
+            );
+        }
+    }
+    if let Some(rowid) = rowid
+        && let Some(alias) = schema.rowid_alias_col
+        && matches!(row_buf.get(alias), Some(SqlValue::Null))
+    {
+        row_buf[alias] = SqlValue::Int(rowid);
+    }
+    Some(())
+}
+
+fn scan_table_rows<'a, R>(
+    snap: &Snapshot<'a>,
     rootpage: u32,
-    schema: &TableSchema,
-    mut on_row: impl FnMut(&[SqlValue]) -> Option<R>,
+    schema: &'a TableSchema,
+    mut on_row: impl FnMut(&[SqlValue<'_>]) -> Option<R>,
 ) -> Option<Vec<R>> {
     let mut out = Vec::new();
     let mut rows_seen = 0usize;
-    scan_btree(snap, rootpage, |rowid, record_bytes| {
+    let mut row_buf: Vec<SqlValue<'a>> = Vec::with_capacity(schema.columns.len());
+    let mut disk_buf: Vec<SqlValue<'a>> = Vec::with_capacity(if schema.disk_to_table.is_some() {
+        schema.columns.len()
+    } else {
+        0
+    });
+    scan_btree(snap, rootpage, |rowid, payload| {
         rows_seen = rows_seen.saturating_add(1);
         if rows_seen > MAX_VISITED_ROWS {
             return false;
         }
-        let Some(disk_values) = decode_record(record_bytes, snap.encoding) else {
-            return false;
-        };
-        let mut values = if let Some(perm) = &schema.disk_to_table {
-            let mut ordered = schema.defaults.clone();
-            for (disk_idx, val) in disk_values.into_iter().enumerate() {
-                if let Some(&table_idx) = perm.get(disk_idx)
-                    && let Some(slot) = ordered.get_mut(table_idx)
+        let item = match payload {
+            Cow::Borrowed(record_bytes) => {
+                if materialize_row(
+                    rowid,
+                    record_bytes,
+                    snap.encoding,
+                    schema,
+                    &mut disk_buf,
+                    &mut row_buf,
+                )
+                .is_none()
                 {
-                    *slot = val;
+                    return false;
                 }
+                on_row(&row_buf)
             }
-            ordered
-        } else {
-            let mut values = disk_values;
-            for col_idx in values.len()..schema.columns.len() {
-                values.push(
-                    schema
-                        .defaults
-                        .get(col_idx)
-                        .cloned()
-                        .unwrap_or(SqlValue::Null),
-                );
+            Cow::Owned(ovf_bytes) => {
+                let mut ovf_disk = Vec::new();
+                let mut ovf_row = Vec::with_capacity(schema.columns.len());
+                if materialize_row(
+                    rowid,
+                    &ovf_bytes,
+                    snap.encoding,
+                    schema,
+                    &mut ovf_disk,
+                    &mut ovf_row,
+                )
+                .is_none()
+                {
+                    return false;
+                }
+                on_row(&ovf_row)
             }
-            values
         };
-        if let Some(rowid) = rowid
-            && let Some(alias) = schema.rowid_alias_col
-            && matches!(values.get(alias), Some(SqlValue::Null))
-        {
-            values[alias] = SqlValue::Int(rowid);
-        }
-        if let Some(item) = on_row(&values) {
+        if let Some(item) = item {
             if out.len() >= MAX_COLLECTED_ROWS {
                 return false;
             }
@@ -284,12 +366,10 @@ fn scan_table_rows<R>(
     Some(out)
 }
 
-fn find_table_in_schema(snap: &Snapshot<'_>, table_name: &str) -> Option<(u32, String)> {
+fn find_table_in_schema<'a>(snap: &Snapshot<'a>, table_name: &str) -> Option<(u32, String)> {
     let mut found: Option<(u32, String)> = None;
-    scan_btree(snap, 1, |_rowid, record_bytes| {
-        let Some(cols) = decode_record(record_bytes, snap.encoding) else {
-            return false;
-        };
+    let mut cols: Vec<SqlValue<'a>> = Vec::with_capacity(5);
+    let check = |cols: &[SqlValue<'_>], found: &mut Option<(u32, String)>| {
         let is_table = cols.first().and_then(SqlValue::as_str) == Some("table");
         let matches = cols
             .get(1)
@@ -302,19 +382,35 @@ fn find_table_in_schema(snap: &Snapshot<'_>, table_name: &str) -> Option<(u32, S
             };
             let sql = cols.get(4).and_then(SqlValue::as_str).map(str::to_owned);
             if let (Some(root), Some(sql)) = (root, sql) {
-                found = Some((root, sql));
+                *found = Some((root, sql));
             }
         }
-        true
+    };
+    scan_btree(snap, 1, |_rowid, payload| match payload {
+        Cow::Borrowed(record_bytes) => {
+            if decode_record_into(record_bytes, snap.encoding, &mut cols).is_none() {
+                return false;
+            }
+            check(&cols, &mut found);
+            true
+        }
+        Cow::Owned(ovf_bytes) => {
+            let mut ovf_cols = Vec::with_capacity(5);
+            if decode_record_into(&ovf_bytes, snap.encoding, &mut ovf_cols).is_none() {
+                return false;
+            }
+            check(&ovf_cols, &mut found);
+            true
+        }
     })?;
     found
 }
 
 /// Iterative B-tree scan supporting both rowid tables (`0x0d`/`0x05`) and `WITHOUT ROWID` tables (`0x0a`/`0x02`).
-fn scan_btree(
-    snap: &Snapshot<'_>,
+fn scan_btree<'a>(
+    snap: &Snapshot<'a>,
     root_pgno: u32,
-    mut visit: impl FnMut(Option<i64>, &[u8]) -> bool,
+    mut visit: impl FnMut(Option<i64>, Cow<'a, [u8]>) -> bool,
 ) -> Option<()> {
     enum Step {
         Page(u32),
@@ -330,7 +426,7 @@ fn scan_btree(
                 let page = snap.page(pgno)?;
                 let usable = page.get(..snap.usable_size)?;
                 let payload = read_index_cell_payload(snap, usable, cell_offset)?;
-                if !visit(None, &payload) {
+                if !visit(None, payload) {
                     return None;
                 }
             }
@@ -360,7 +456,7 @@ fn scan_btree(
                                 return None;
                             }
                             let (rowid, payload) = read_table_leaf_cell(snap, usable, cell_off)?;
-                            if !visit(Some(rowid), &payload) {
+                            if !visit(Some(rowid), payload) {
                                 return None;
                             }
                         }
@@ -398,7 +494,7 @@ fn scan_btree(
                                 return None;
                             }
                             let payload = read_index_cell_payload(snap, usable, cell_off)?;
-                            if !visit(None, &payload) {
+                            if !visit(None, payload) {
                                 return None;
                             }
                         }
@@ -434,11 +530,11 @@ fn scan_btree(
     Some(())
 }
 
-fn read_table_leaf_cell(
-    snap: &Snapshot<'_>,
-    usable: &[u8],
+fn read_table_leaf_cell<'a>(
+    snap: &Snapshot<'a>,
+    usable: &'a [u8],
     cell_offset: usize,
-) -> Option<(i64, Vec<u8>)> {
+) -> Option<(i64, Cow<'a, [u8]>)> {
     let tail = usable.get(cell_offset..)?;
     let (payload_u64, n1) = read_varint(tail)?;
     let payload_len = usize::try_from(payload_u64)
@@ -458,11 +554,11 @@ fn read_table_leaf_cell(
     Some((rowid, bytes))
 }
 
-fn read_index_cell_payload(
-    snap: &Snapshot<'_>,
-    usable: &[u8],
+fn read_index_cell_payload<'a>(
+    snap: &Snapshot<'a>,
+    usable: &'a [u8],
     cell_offset: usize,
-) -> Option<Vec<u8>> {
+) -> Option<Cow<'a, [u8]>> {
     let tail = usable.get(cell_offset..)?;
     let (payload_u64, n1) = read_varint(tail)?;
     let payload_len = usize::try_from(payload_u64)
@@ -475,17 +571,17 @@ fn read_index_cell_payload(
     assemble_payload(snap, usable, body_start, payload_len, max_local, min_local)
 }
 
-fn assemble_payload(
-    snap: &Snapshot<'_>,
-    usable: &[u8],
+fn assemble_payload<'a>(
+    snap: &Snapshot<'a>,
+    usable: &'a [u8],
     body_start: usize,
     payload_len: usize,
     max_local: usize,
     min_local: usize,
-) -> Option<Vec<u8>> {
+) -> Option<Cow<'a, [u8]>> {
     if payload_len <= max_local {
         let end = body_start.checked_add(payload_len)?;
-        return Some(usable.get(body_start..end)?.to_vec());
+        return Some(Cow::Borrowed(usable.get(body_start..end)?));
     }
     let span = snap.usable_size.checked_sub(4).filter(|&s| s > 0)?;
     let k = min_local.checked_add(payload_len.checked_sub(min_local)? % span)?;
@@ -508,7 +604,7 @@ fn assemble_payload(
         let take = need.min(chunk.len());
         out.extend_from_slice(chunk.get(..take)?);
     }
-    Some(out)
+    Some(Cow::Owned(out))
 }
 
 #[allow(clippy::type_complexity)]
@@ -641,22 +737,22 @@ fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     Some((acc, 9))
 }
 
-fn decode_record(payload: &[u8], encoding: TextEncoding) -> Option<Vec<SqlValue>> {
+fn decode_record_into<'a>(
+    payload: &'a [u8],
+    encoding: TextEncoding,
+    values: &mut Vec<SqlValue<'a>>,
+) -> Option<()> {
+    values.clear();
     let (hdr_len_u64, mut hdr_pos) = read_varint(payload)?;
     let hdr_len = usize::try_from(hdr_len_u64).ok()?;
     if hdr_len < hdr_pos || hdr_len > payload.len() {
         return None;
     }
-    let mut serial_types = Vec::new();
-    while hdr_pos < hdr_len {
-        let (st, used) = read_varint(payload.get(hdr_pos..hdr_len)?)?;
-        serial_types.push(st);
-        hdr_pos = hdr_pos.checked_add(used)?;
-    }
 
     let mut body_pos = hdr_len;
-    let mut values = Vec::with_capacity(serial_types.len());
-    for st in serial_types {
+    while hdr_pos < hdr_len {
+        let (st, used) = read_varint(payload.get(hdr_pos..hdr_len)?)?;
+        hdr_pos = hdr_pos.checked_add(used)?;
         let val = match st {
             0 => SqlValue::Null,
             1 => {
@@ -722,7 +818,7 @@ fn decode_record(payload: &[u8], encoding: TextEncoding) -> Option<Vec<SqlValue>
                 let end = body_pos.checked_add(len)?;
                 let slice = payload.get(body_pos..end)?;
                 body_pos = end;
-                SqlValue::Blob(slice.to_vec())
+                SqlValue::Blob(Cow::Borrowed(slice))
             }
             n if n >= 13 => {
                 let len = usize::try_from((n - 13) / 2).ok()?;
@@ -735,19 +831,19 @@ fn decode_record(payload: &[u8], encoding: TextEncoding) -> Option<Vec<SqlValue>
         };
         values.push(val);
     }
-    Some(values)
+    Some(())
 }
 
-fn decode_text(bytes: &[u8], encoding: TextEncoding) -> Option<String> {
+fn decode_text<'a>(bytes: &'a [u8], encoding: TextEncoding) -> Option<Cow<'a, str>> {
     match encoding {
-        TextEncoding::Utf8 => Some(String::from_utf8_lossy(bytes).into_owned()),
+        TextEncoding::Utf8 => Some(String::from_utf8_lossy(bytes)),
         TextEncoding::Utf16Le => {
             let (chunks, rem) = bytes.as_chunks::<2>();
             if !rem.is_empty() {
                 return None;
             }
             let units: Vec<u16> = chunks.iter().copied().map(u16::from_le_bytes).collect();
-            Some(String::from_utf16_lossy(&units))
+            Some(Cow::Owned(String::from_utf16_lossy(&units)))
         }
         TextEncoding::Utf16Be => {
             let (chunks, rem) = bytes.as_chunks::<2>();
@@ -755,7 +851,7 @@ fn decode_text(bytes: &[u8], encoding: TextEncoding) -> Option<String> {
                 return None;
             }
             let units: Vec<u16> = chunks.iter().copied().map(u16::from_be_bytes).collect();
-            Some(String::from_utf16_lossy(&units))
+            Some(Cow::Owned(String::from_utf16_lossy(&units)))
         }
     }
 }
@@ -946,7 +1042,7 @@ fn build_without_rowid_perm(
     )
 }
 
-fn extract_column_default(item: &str) -> SqlValue {
+fn extract_column_default(item: &str) -> SqlValue<'static> {
     let rest = skip_ws_and_comments(item);
     let bytes = rest.as_bytes();
     let Some(&first) = bytes.first() else {
@@ -1020,7 +1116,7 @@ fn extract_column_default(item: &str) -> SqlValue {
     SqlValue::Null
 }
 
-fn parse_sql_default_literal(src: &str, mut in_parens: bool) -> Option<SqlValue> {
+fn parse_sql_default_literal(src: &str, mut in_parens: bool) -> Option<SqlValue<'static>> {
     let mut cur = skip_ws_and_comments(src);
     for _ in 0..8 {
         if !cur.starts_with('(') {
@@ -1041,14 +1137,20 @@ fn parse_sql_default_literal(src: &str, mut in_parens: bool) -> Option<SqlValue>
             return None;
         }
         let inner = cur.get(1..end - 1)?;
-        (SqlValue::Text(inner.replace("''", "'")), cur.get(end..)?)
+        (
+            SqlValue::Text(Cow::Owned(inner.replace("''", "'"))),
+            cur.get(end..)?,
+        )
     } else if matches!(first, b'x' | b'X') && bytes.get(1) == Some(&b'\'') {
         let end = skip_quoted(bytes, 1, b'\'');
         if end < 3 || bytes.get(end - 1) != Some(&b'\'') {
             return None;
         }
         let hex = cur.get(2..end - 1)?;
-        (SqlValue::Blob(decode_hex_blob(hex)?), cur.get(end..)?)
+        (
+            SqlValue::Blob(Cow::Owned(decode_hex_blob(hex)?)),
+            cur.get(end..)?,
+        )
     } else if matches!(first, b'+' | b'-') || first.is_ascii_digit() || first == b'.' {
         let (sign, num_src) = if matches!(first, b'+' | b'-') {
             (first == b'-', skip_ws_and_comments(cur.get(1..)?))

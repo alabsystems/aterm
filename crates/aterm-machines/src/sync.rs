@@ -5,10 +5,16 @@
 //! state after an update, a network move or half an hour (docs/DESIGN-init-on-by-default-
 //! 2026-10-25.md §8.5, the one converge entry its sync kinds act through).
 //!
-//! A pass is [`due`] on a build that ran none (or a new [`SPEC`]), when this Mac's routes moved,
-//! or once [`RECHECK`] passed since the last attempt; [`converge`] runs one under a try-lock
-//! (`<state_dir>/converge/align.lock`), records it in `<state_dir>/converge/aligned.json`
-//! ([`Record`]) beside the change journal, and writes one aterm.log line. Its items reach the
+//! Its triggers decide when a pass runs: the vault's subscriber as it starts, after each version
+//! it applies and once its own recheck or a route move says so (`aterm_secrets::converge::Due`),
+//! the window's lane at launch and every 30 minutes, the first-launch Secrets stage as it ends,
+//! and a person. [`converge`] runs the one it is asked for, under a try-lock
+//! (`<state_dir>/converge/align.lock`, one pass at a time), records it in
+//! `<state_dir>/converge/aligned.json` ([`Record`]) beside the change journal, and writes one
+//! aterm.log line, a refused pass included. The record names why the pass was [`due`] (a build
+//! that ran none or a new [`SPEC`], moved routes, [`RECHECK`] since the last attempt, or none),
+//! a word the ledger line carries; no row and no trigger reads it, and each row is decided by
+//! its own probe. The base layer keeps its own record ([`BaseRecord`]). Its items reach the
 //! machine only through [`Ports`], so each has an inert test arm. The pass applies the Relay and
 //! Install classes alone: a Person, Preference, Elevate or Asked item is probed and planned,
 //! never applied, and nothing asks. The base layer is the installed release app's alone, laid
@@ -25,8 +31,10 @@ use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 /// The desired state's revision: a pass is due on the same build once it moves, as when an item
-/// joins the pass.
-pub const SPEC: u32 = 1;
+/// joins or leaves the pass (3: `sync.identity`; 4: the ALab steward's fleet item; 5:
+/// `sync.steward.revoke`; 6: `sync.node`; 7: `sync.steward.lease` and
+/// `sync.steward.server.standby`; 8: the steward's fleet item retired).
+pub const SPEC: u32 = 8;
 
 /// The pass's record, in `<state_dir>/converge` ([`FileJournal::DIR`]).
 pub const RECORD: &str = "aligned.json";
@@ -36,6 +44,15 @@ pub const LOCK: &str = "align.lock";
 
 /// How long after a pass's attempt the next one is due on the same build and routes.
 pub const RECHECK: Duration = Duration::from_secs(30 * 60);
+
+/// Maximum random jitter before an automatic pass's first `sync.fleet` attempt (§7.1, C18).
+pub const FLEET_JOIN_JITTER_MAX: Duration = Duration::from_secs(120);
+
+/// Total wait budget (initial jitter plus capacity retries) for one `sync.fleet` apply (§12.3, C18).
+pub const FLEET_JOIN_RETRY_BUDGET: Duration = Duration::from_secs(10 * 60);
+
+/// Per-retry backoff caps when the fleet listener or resolver is at capacity.
+const FLEET_CAPACITY_BACKOFF_SECS: &[u64] = &[2, 4, 8, 16, 32, 60, 60, 60, 60, 60, 60];
 
 /// The family every sync row carries (the `--only` merge key).
 pub const FAMILY: &str = "sync";
@@ -47,16 +64,31 @@ pub const BUILDS_KEPT: usize = 8;
 pub const PEERS: &str = "sync.peers";
 /// `sync.vault`: the vault's subscriber (report only).
 pub const VAULT: &str = "sync.vault";
+/// `sync.identity`: this Mac's swarm label in `[ai] machine` and `[fleet] machine`.
+pub const IDENTITY: &str = "sync.identity";
 /// `sync.base`: the row that stands for the base layer a pass leaves to `aterm doctor`.
 pub const BASE: &str = "sync.base";
+/// `sync.steward.revoke`: the ALab steward finishes any revoke cascade left half done.
+pub const STEWARD_REVOKE: &str = "sync.steward.revoke";
+/// `sync.steward.lease`: the always-on ALab steward claims, renews, or takes over `aterm-swarm-lease`.
+pub const STEWARD_LEASE: &str = "sync.steward.lease";
+/// `sync.steward.server.standby`: the always-on ALab steward runs its standby vault server.
+pub const STEWARD_SERVER_STANDBY: &str = "sync.steward.server.standby";
 /// `sync.fleet`: the default ALab fleet.
 pub const FLEET: &str = "sync.fleet";
-/// `sync.shared-data`: ALab Commons (report only).
+/// `sync.node`: the `systems.alab.aterm-node` background job (`aterm node serve`, C20).
+pub const NODE: &str = "sync.node";
+/// `sync.shared-data`: ALab Commons, founded by the vault's only admin where it has none.
 pub const SHARED_DATA: &str = "sync.shared-data";
+/// `sync.requests`: this Mac's credential requests on the lab's table.
+pub const REQUESTS: &str = "sync.requests";
 /// `sync.accounts`: the AI accounts roster.
 pub const ACCOUNTS: &str = "sync.accounts";
-/// `sync.fabric`: the message bus's broker.
+/// `sync.fabric`: the message bus (fabric), on by default, and its broker renewed on a new build.
 pub const FABRIC: &str = "sync.fabric";
+
+/// What every sync row says when `[swarm] enabled = false` turns swarm participation off.
+pub use aterm_secrets::swarm::SWARM_OFF;
 
 /// The classes a pass applies: what re-lays without a person, and the network.
 const APPLIES: &[Class] = &[Class::Relay, Class::Install];
@@ -185,9 +217,10 @@ pub struct RecordRow {
     pub why: Option<String>,
 }
 
-/// Whether a pass is due, and why: a build no remembered pass ran on, or a new [`SPEC`] (or no
-/// record), then routes that moved, then [`RECHECK`] since the last attempt (or a clock now
-/// behind it, which leaves the record's age unknown).
+/// Why a pass would be due by its record: a build no remembered pass ran on, or a new [`SPEC`]
+/// (or no record), then routes that moved, then [`RECHECK`] since the last attempt (or a clock
+/// now behind it, which leaves the record's age unknown). It labels a pass (the ledger line's
+/// word, [`Pass::due`]); whether a pass runs is its trigger's, and what each row does its probe's.
 #[must_use]
 pub fn due(record: Option<&Record>, build: &str, routes: &[String], now_ms: u64) -> Due {
     let Some(record) = record else {
@@ -261,6 +294,22 @@ pub enum VaultRead {
     Idle(String),
 }
 
+/// What this Mac's swarm label in `aterm.toml` reads as (`sync.identity`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityRead {
+    /// No swarm label applies on this Mac (no ALab vault or swarm roster, or swarm is off): why.
+    NotApplicable(String),
+    /// `[ai] machine` and `[fleet] machine` already carry the resolved label: what they read.
+    Current(String),
+    /// One or both keys differ from the resolved label: what they read now and what a pass writes.
+    Due {
+        /// What `aterm.toml` reads now.
+        from: String,
+        /// What a pass writes.
+        to: String,
+    },
+}
+
 /// What the default ALab fleet reads as before a sync (`sync.fleet`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FleetRead {
@@ -279,17 +328,120 @@ pub enum FleetDone {
     Synced(String),
     /// It left the fleet this Mac holds as it is: why, and what a person does about it.
     Blocked(String),
+    /// Every dialled listener or the DNS resolver was at connection capacity: why.
+    AtCapacity(String),
 }
 
-/// What ALab Commons reads as (`sync.shared-data`, report only: the member enrolls itself).
+/// What `systems.alab.aterm-node` reads as (`sync.node`, C20).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeRead {
+    /// Not applicable on this Mac (turned off, not in a fleet, CI, or no installed binary): why.
+    NotApplicable(String),
+    /// Installed and running the expected release binary: what it runs.
+    Current(String),
+    /// Missing, stopped, or running a replaced binary: what it reads now and what a pass installs.
+    Due {
+        /// Current state.
+        from: String,
+        /// Target state after `sync.node` applies.
+        to: String,
+    },
+}
+
+/// Whose network a pass's publication to the vault goes out on (the steward's revoke repair or
+/// lease, a founding of Commons), which decides whether macOS's Local Network answer stands
+/// before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Publisher {
+    /// The vault subscriber's launchd job, whose runner this pass is: the job's own rounds reach
+    /// the vault, so a publication to it raises no question they did not, whatever aterm.app
+    /// last heard of Local Network.
+    Subscriber,
+    /// aterm's own (a window's pass, the first launch's, a person's `aterm init --converge`,
+    /// or a subscriber pass handed to the installed app): Local Network as aterm last heard it.
+    Aterm,
+}
+
+/// What the ALab steward's revoke-repair step reads as (`sync.steward.revoke`, §7.6, C25).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StewardRevokeRead {
+    /// Not applicable on this Mac (not an ALab steward, or vault sync is off).
+    Idle(String),
+    /// Every revoked Mac's roster and pool cascade is already complete.
+    Current(String),
+    /// A half-done revoke cascade was found and will be finished on apply.
+    Due {
+        /// What it finds unfinished.
+        found: String,
+        /// What its apply publishes.
+        makes: String,
+    },
+    /// It would finish the cascade once Local Network permission is granted: why.
+    Deferred(String),
+}
+
+/// What the always-on ALab steward's lease step reads as (`sync.steward.lease`, §3.4, §8.3, C7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StewardLeaseRead {
+    /// Not applicable on this Mac (not an `always_on` steward, off the ALab network, or no policy).
+    Idle(String),
+    /// Existing lease stands (`>= 3 h` remaining for holder, or unexpired for standby).
+    Current(String),
+    /// A claim, renewal, or takeover publish is due.
+    Due {
+        /// What it finds.
+        found: String,
+        /// What its apply publishes.
+        makes: String,
+    },
+    /// It would publish once Local Network permission is granted: why.
+    Deferred(String),
+}
+
+/// What the always-on ALab steward's standby server step reads as (`sync.steward.server.standby`, §8.3, C7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StewardStandbyServerRead {
+    /// Not applicable on this Mac (not an `always_on` steward, off the ALab network, or no policy).
+    Idle(String),
+    /// A vault server job is already running on this steward.
+    Current(String),
+    /// No vault server job is running on this always-on steward yet.
+    Due {
+        /// What it finds.
+        found: String,
+        /// What its apply starts.
+        makes: String,
+    },
+}
+
+/// What ALab Commons reads as (`sync.shared-data`): a member enrolls itself once the control
+/// record reaches it, and an open vault's only admin founds the vault's Commons where it has
+/// none ([`Ports::found_commons`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SharedRead {
     /// `[commons] enabled = false`.
     Off,
-    /// No control record reaches this Mac: why.
+    /// No control record reaches this Mac, and it is not this Mac's to found: why.
     Unavailable(String),
+    /// This Mac, its open vault's only admin, founds the vault's Commons: what it finds.
+    Foundable(String),
+    /// It would, once a person gives what the founding waits on (Local Network, or an approver
+    /// that shares the Commons root on an open approval): why. It is never asked here.
+    Deferred(String),
     /// The control record is here: what it reads, in one line.
     Visible(String),
+}
+
+/// What this Mac's credential requests read as (`sync.requests`,
+/// docs/DESIGN-credential-requests-2026-10-27.md §9.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestsRead {
+    /// A pass cannot reach the lab's table here (Commons off, not visible, or this Mac not a
+    /// Writer): why, and where its needs stand.
+    Idle(String),
+    /// A pass posts this Mac's needs, takes in the lab's answers and sweeps the other Macs'
+    /// requests: where its needs stand, in one line.
+    Due(String),
 }
 
 /// What the AI accounts roster reads as (`sync.accounts`).
@@ -305,15 +457,21 @@ pub enum AccountsRead {
     Due(String),
 }
 
-/// What the message bus's broker reads as (`sync.fabric`; the pass never turns the fabric on).
+/// What the message bus reads as (`sync.fabric`): on by default, as `aterm fabric on` turns it on,
+/// where the person never turned it off.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FabricRead {
-    /// Nothing of the broker is this pass's: why (the fabric is off, say).
+    /// Nothing of the fabric is this pass's: why (the person turned it off, say).
     NotApplicable(String),
     /// The broker runs this build: what it reads.
     Current(String),
-    /// The broker runs a build an update replaced: which.
-    Replaced(String),
+    /// The broker is due a restart by the job `aterm fabric on` installed: it runs a build an
+    /// update replaced, or none holds its socket while that job is not loaded or runs none (an
+    /// update's restart that left it unloaded): which.
+    Due(String),
+    /// It is off and the person never turned it off (no `aterm fabric off` record): what was
+    /// found. A pass with an aterm window turns it on ([`Ports::turn_on_fabric`]).
+    Unset(String),
 }
 
 /// What this Mac's vault membership reads as (`sync.peers`).
@@ -361,12 +519,25 @@ pub trait Ports: Sync {
     fn routes(&self) -> Vec<String>;
     /// Now, in ms since the epoch.
     fn now_ms(&self) -> u64;
+    /// Draw a uniform random wait in `0..=max` for `sync.fleet`'s join jitter and capacity
+    /// backoff. Overridden in tests for deterministic virtual-clock simulation.
+    fn random_wait(&self, max: Duration) -> Duration {
+        random_duration_up_to(max, self.now_ms())
+    }
+    /// Pause this pass for `duration` (real sleep in `Live`, recorded or virtual-clock in tests).
+    fn sleep(&self, duration: Duration);
     /// Whether this process is the installed release aterm.app's (not a build, a renamed or held
     /// copy): only it re-lays the base layer.
     fn installed_release(&self) -> bool;
     /// Whether an aterm window runs for this login now: its upkeep then keeps the AI accounts
     /// roster, so the subscriber's pass leaves it alone.
     fn window_runs(&self) -> bool;
+    /// Whether `[swarm] enabled` in `aterm.toml` leaves swarm participation on: `false` makes
+    /// every sync row read `NotApplicable` before touching its subsystem.
+    ///
+    /// # Errors
+    /// `aterm.toml` cannot be read or has an invalid `[swarm]` section.
+    fn swarm_enabled(&self) -> Result<bool, String>;
     /// The base layer's repair items, the store lock as `lock` says.
     fn base(&self, lock: BaseLock) -> Base;
     /// `sync.vault`'s read.
@@ -374,6 +545,17 @@ pub trait Ports: Sync {
     /// # Errors
     /// The vault's local state cannot be read.
     fn vault(&self) -> Result<VaultRead, String>;
+    /// `sync.identity`'s read.
+    ///
+    /// # Errors
+    /// The vault's local state, swarm roster or `aterm.toml` cannot be read.
+    fn identity(&self) -> Result<IdentityRead, String>;
+    /// `sync.identity`'s apply: writes the resolved swarm label into `[ai] machine` and `[fleet]
+    /// machine` in `aterm.toml`.
+    ///
+    /// # Errors
+    /// The label could not be resolved or `aterm.toml` could not be updated.
+    fn sync_identity(&self) -> Result<String, String>;
     /// `sync.fleet`'s read.
     ///
     /// # Errors
@@ -384,11 +566,102 @@ pub trait Ports: Sync {
     /// # Errors
     /// The sync did not finish (the issuer did not answer, say).
     fn sync_fleet(&self) -> Result<FleetDone, String>;
-    /// `sync.shared-data`'s read.
+
+    /// `sync.node`'s read (`systems.alab.aterm-node`, C20).
+    ///
+    /// # Errors
+    /// Local state or supervisor status cannot be read.
+    fn node(&self) -> Result<NodeRead, String> {
+        Ok(NodeRead::NotApplicable(
+            "this Mac is in no fleet (sync.fleet)".to_owned(),
+        ))
+    }
+
+    /// `sync.node`'s apply: install, update, or start `systems.alab.aterm-node`.
+    ///
+    /// # Errors
+    /// Writing or starting the LaunchAgent/systemd user unit failed.
+    fn ensure_node(&self) -> Result<String, String> {
+        Ok("nothing changed".to_owned())
+    }
+
+    /// What the steward's revoke-repair step finds (`sync.steward.revoke`), writing nothing; `by`
+    /// says whose network its publish goes out on.
+    ///
+    /// # Errors
+    /// Local vault state, roster, or pool entries cannot be read.
+    fn steward_revoke(&self, _by: Publisher) -> Result<StewardRevokeRead, String> {
+        Ok(StewardRevokeRead::Idle(
+            "this Mac holds no admin key of the ALab vault".to_owned(),
+        ))
+    }
+
+    /// Finish any half-done revoke cascade in one vault publish (`sync.steward.revoke`).
+    ///
+    /// # Errors
+    /// Vault open or publication did not finish, for the next pass.
+    fn apply_steward_revoke(&self) -> Result<String, String> {
+        Ok("every revoked Mac's roster and pool cascade is complete".to_owned())
+    }
+
+    /// What the always-on steward's lease step finds (`sync.steward.lease`), writing nothing; `by`
+    /// says whose network its publish goes out on.
+    ///
+    /// # Errors
+    /// Local vault state, policy, or lease entry cannot be read.
+    fn steward_lease(&self, _by: Publisher) -> Result<StewardLeaseRead, String> {
+        Ok(StewardLeaseRead::Idle(
+            "this Mac holds no admin key of the ALab vault".to_owned(),
+        ))
+    }
+
+    /// Claim, renew, or take over `aterm-swarm-lease` via parent-digest CAS (`sync.steward.lease`).
+    ///
+    /// # Errors
+    /// Vault open or CAS publication did not finish, for the next pass.
+    fn apply_steward_lease(&self) -> Result<String, String> {
+        Ok("lease stands".to_owned())
+    }
+
+    /// What the always-on steward's standby vault server step finds (`sync.steward.server.standby`).
+    ///
+    /// # Errors
+    /// Local vault state, policy, or service state cannot be read.
+    fn steward_standby_server(&self) -> Result<StewardStandbyServerRead, String> {
+        Ok(StewardStandbyServerRead::Idle(
+            "this Mac holds no admin key of the ALab vault".to_owned(),
+        ))
+    }
+
+    /// Ensure the standby vault server runs on this always-on steward (`sync.steward.server.standby`).
+    ///
+    /// # Errors
+    /// Service installation or startup did not finish, for the next pass.
+    fn apply_steward_standby_server(&self) -> Result<String, String> {
+        Ok("standby vault server runs".to_owned())
+    }
+    /// `sync.shared-data`'s read; `by` says whose network a founding's publish goes out on.
     ///
     /// # Errors
     /// The Commons setting or the vault's copy cannot be read.
-    fn shared_data(&self) -> Result<SharedRead, String>;
+    fn shared_data(&self, by: Publisher) -> Result<SharedRead, String>;
+    /// `sync.requests`'s read: the need ledger and whether this Mac is a Commons Writer.
+    ///
+    /// # Errors
+    /// The Commons setting or the need ledger cannot be read.
+    fn requests(&self) -> Result<RequestsRead, String>;
+    /// `sync.requests`'s apply: this Mac's pass over the lab's table, and the custodian's on a
+    /// Mac that can sign with the vault's key.
+    ///
+    /// # Errors
+    /// The table or the ledger cannot be read or written.
+    fn pass_requests(&self) -> Result<String, String>;
+    /// `sync.shared-data`'s apply: the founding of the vault's Commons by its only admin, under
+    /// the authority the admin already holds; what it did, naming each Mac it approved.
+    ///
+    /// # Errors
+    /// The founding did not finish (the vault did not take the publication, say).
+    fn found_commons(&self) -> Result<String, String>;
     /// `sync.accounts`'s read.
     ///
     /// # Errors
@@ -404,11 +677,18 @@ pub trait Ports: Sync {
     /// # Errors
     /// The fabric's config or broker cannot be read.
     fn fabric(&self) -> Result<FabricRead, String>;
-    /// `sync.fabric`'s apply: the broker renewed on this build.
+    /// `sync.fabric`'s apply where the broker is [`FabricRead::Due`]: the broker renewed on this
+    /// build.
     ///
     /// # Errors
     /// The renewal failed.
     fn renew_broker(&self) -> Result<String, String>;
+    /// `sync.fabric`'s apply where the fabric is [`FabricRead::Unset`]: `aterm fabric on`'s steps,
+    /// which ask nothing.
+    ///
+    /// # Errors
+    /// A step failed.
+    fn turn_on_fabric(&self) -> Result<String, String>;
     /// `sync.peers`'s read; `look` says whether it may look for the open vault on this network
     /// (the window's pass, the one that joins it, where Local Network is aterm.app's, when it
     /// applies: a look keeps what it heard, which a plan never writes).
@@ -421,6 +701,18 @@ pub trait Ports: Sync {
     /// # Errors
     /// The join did not finish.
     fn join_peers(&self) -> Result<PeersDone, String>;
+    /// Write `line` to aterm.log: a pass's ledger line, or why it was refused.
+    fn log(&self, line: &str);
+    /// The installed release aterm.app's program where it is installed and this process is not
+    /// it (a held copy a vault subscriber's job runs, say): the subscriber's pass runs from there
+    /// (`aterm init --converge`'s hand-off), so the rows a held copy applies are the installed
+    /// app's, as the window's are. `None` where this process is it, or none is found.
+    fn installed_release_elsewhere(&self) -> Option<PathBuf>;
+    /// Run `program` with `args` and wait for it: its exit status, `None` where a signal ended it.
+    ///
+    /// # Errors
+    /// It could not be started or waited for.
+    fn run_elsewhere(&self, program: &Path, args: &[String]) -> Result<Option<i32>, String>;
 }
 
 /// Lower the calling thread, and the threads it starts after, to the utility QoS class (macOS;
@@ -439,8 +731,14 @@ pub fn background_self() {
 enum Kind {
     Peers,
     Vault,
+    Identity,
+    StewardRevoke,
+    StewardLease,
+    StewardServerStandby,
     Fleet,
+    Node,
     SharedData,
+    Requests,
     Accounts,
     Fabric,
 }
@@ -476,6 +774,25 @@ impl<'a> Synced<'a> {
     fn stand_aside(&self, aside: StoodAside) {
         *self.aside.lock().unwrap_or_else(PoisonError::into_inner) = Some(aside);
     }
+
+    /// Whether this pass turns on a fabric nobody turned off: one an aterm window runs beside,
+    /// never the vault subscriber's. That program can be a held copy (on the vault's admin Mac,
+    /// a snapshot outside any app), which must never become the fabric's program, and a Mac with
+    /// no window has no bridge for a broker to serve. Headless, CI and private-state-root
+    /// instances start no window's pass, and a pass refuses a private state root outright.
+    fn turns_fabric_on(&self) -> bool {
+        self.trigger != Trigger::Subscriber && self.ports.window_runs()
+    }
+
+    /// Whose network this runner's publications use: a held subscriber fallback keeps its
+    /// job's network; the installed app uses aterm's, even with a subscriber trigger.
+    fn publisher(&self) -> Publisher {
+        if self.trigger == Trigger::Subscriber && !self.ports.installed_release() {
+            Publisher::Subscriber
+        } else {
+            Publisher::Aterm
+        }
+    }
 }
 
 fn not_applicable(why: impl Into<String>) -> Probe {
@@ -486,13 +803,70 @@ fn read<T>(read: Result<T, String>, probe: impl FnOnce(T) -> Probe) -> Probe {
     read.map_or_else(|why| Probe::Unusable { why }, probe)
 }
 
+fn random_duration_up_to(max: Duration, fallback_seed: u64) -> Duration {
+    let max_ms = u64::try_from(max.as_millis()).unwrap_or(u64::MAX);
+    if max_ms == 0 {
+        return Duration::ZERO;
+    }
+    let mut bytes = [0u8; 8];
+    let raw = if aterm_uds::rand::fill(&mut bytes).is_ok() {
+        u64::from_le_bytes(bytes)
+    } else {
+        fallback_seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    };
+    let span = max_ms.saturating_add(1);
+    let pick = if span == 0 { raw } else { raw % span };
+    Duration::from_millis(pick)
+}
+
+fn sync_fleet_with_retry(ports: &dyn Ports, trigger: Trigger) -> Result<FleetDone, String> {
+    let mut waited = Duration::ZERO;
+    if trigger != Trigger::Init {
+        let jitter = ports
+            .random_wait(FLEET_JOIN_JITTER_MAX)
+            .min(FLEET_JOIN_JITTER_MAX);
+        if !jitter.is_zero() {
+            ports.sleep(jitter);
+            waited += jitter;
+        }
+    }
+    let mut attempt = 0;
+    loop {
+        match ports.sync_fleet() {
+            Ok(FleetDone::AtCapacity(why)) => {
+                let remaining = FLEET_JOIN_RETRY_BUDGET.saturating_sub(waited);
+                let Some(&cap_secs) = FLEET_CAPACITY_BACKOFF_SECS.get(attempt) else {
+                    return Err(why);
+                };
+                if remaining.is_zero() {
+                    return Err(why);
+                }
+                let cap = Duration::from_secs(cap_secs);
+                let half = cap / 2;
+                let extra = ports.random_wait(cap - half).min(cap - half);
+                let delay = (half + extra).min(remaining);
+                ports.sleep(delay);
+                waited += delay;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
 impl Item for Synced<'_> {
     fn id(&self) -> String {
         match self.kind {
             Kind::Peers => PEERS,
             Kind::Vault => VAULT,
+            Kind::Identity => IDENTITY,
+            Kind::StewardRevoke => STEWARD_REVOKE,
+            Kind::StewardLease => STEWARD_LEASE,
+            Kind::StewardServerStandby => STEWARD_SERVER_STANDBY,
             Kind::Fleet => FLEET,
+            Kind::Node => NODE,
             Kind::SharedData => SHARED_DATA,
+            Kind::Requests => REQUESTS,
             Kind::Accounts => ACCOUNTS,
             Kind::Fabric => FABRIC,
         }
@@ -509,8 +883,15 @@ impl Item for Synced<'_> {
 
     fn class(&self) -> Class {
         match self.kind {
-            Kind::Vault | Kind::SharedData | Kind::Fabric => Class::Relay,
-            Kind::Peers | Kind::Fleet | Kind::Accounts => Class::Install,
+            Kind::Vault
+            | Kind::Identity
+            | Kind::StewardRevoke
+            | Kind::StewardLease
+            | Kind::StewardServerStandby
+            | Kind::Node
+            | Kind::Requests
+            | Kind::Fabric => Class::Relay,
+            Kind::Peers | Kind::Fleet | Kind::SharedData | Kind::Accounts => Class::Install,
         }
     }
 
@@ -518,15 +899,26 @@ impl Item for Synced<'_> {
         match self.kind {
             Kind::Peers => "this Mac's vault",
             Kind::Vault => "the vault's subscriber",
+            Kind::Identity => "this Mac's swarm label",
+            Kind::StewardRevoke => "the revoke cascade, finished by the ALab steward",
+            Kind::StewardLease => "the ALab steward lease",
+            Kind::StewardServerStandby => "the standby ALab vault server",
             Kind::Fleet => "the default ALab fleet",
+            Kind::Node => "the fleet and swarm node job",
             Kind::SharedData => "shared data (ALab Commons)",
+            Kind::Requests => "this Mac's credential requests",
             Kind::Accounts => "the AI accounts roster",
-            Kind::Fabric => "the message bus's broker",
+            Kind::Fabric => "the message bus (fabric)",
         }
         .to_owned()
     }
 
     fn probe(&self) -> Probe {
+        match self.ports.swarm_enabled() {
+            Ok(true) => {}
+            Ok(false) => return not_applicable(SWARM_OFF),
+            Err(why) => return Probe::Unusable { why },
+        }
         match self.kind {
             Kind::Peers => {
                 // Only the window's pass joins, so only it looks for an open vault, and only
@@ -560,6 +952,52 @@ impl Item for Synced<'_> {
                     ),
                 },
             }),
+            Kind::Identity => read(self.ports.identity(), |identity| match identity {
+                IdentityRead::NotApplicable(why) => not_applicable(why),
+                IdentityRead::Current(now) => Probe::Ok { now },
+                IdentityRead::Due { from, to } => Probe::Change { from, to },
+            }),
+            Kind::StewardRevoke => {
+                read(
+                    self.ports.steward_revoke(self.publisher()),
+                    |revoke| match revoke {
+                        StewardRevokeRead::Idle(why) => not_applicable(why),
+                        StewardRevokeRead::Current(now) => Probe::Ok { now },
+                        StewardRevokeRead::Due { found, makes } => Probe::Change {
+                            from: found,
+                            to: makes,
+                        },
+                        StewardRevokeRead::Deferred(why) => Probe::Deferred { why },
+                    },
+                )
+            }
+            Kind::StewardLease => {
+                read(
+                    self.ports.steward_lease(self.publisher()),
+                    |lease| match lease {
+                        StewardLeaseRead::Idle(why) => not_applicable(why),
+                        StewardLeaseRead::Current(now) => Probe::Ok { now },
+                        StewardLeaseRead::Due { found, makes } => Probe::Change {
+                            from: found,
+                            to: makes,
+                        },
+                        StewardLeaseRead::Deferred(why) => Probe::Deferred { why },
+                    },
+                )
+            }
+            Kind::StewardServerStandby => {
+                read(
+                    self.ports.steward_standby_server(),
+                    |standby| match standby {
+                        StewardStandbyServerRead::Idle(why) => not_applicable(why),
+                        StewardStandbyServerRead::Current(now) => Probe::Ok { now },
+                        StewardStandbyServerRead::Due { found, makes } => Probe::Change {
+                            from: found,
+                            to: makes,
+                        },
+                    },
+                )
+            }
             Kind::Fleet => read(self.ports.fleet(), |fleet| match fleet {
                 FleetRead::Idle(why) => not_applicable(why),
                 FleetRead::Current(now) => Probe::Ok { now },
@@ -568,10 +1006,31 @@ impl Item for Synced<'_> {
                     to: "in the vault's default fleet".to_owned(),
                 },
             }),
-            Kind::SharedData => read(self.ports.shared_data(), |shared| match shared {
-                SharedRead::Off => not_applicable("off: [commons] enabled = false"),
-                SharedRead::Unavailable(why) => not_applicable(why),
-                SharedRead::Visible(now) => Probe::Ok { now },
+            Kind::Node => read(self.ports.node(), |node| match node {
+                NodeRead::NotApplicable(why) => not_applicable(why),
+                NodeRead::Current(now) => Probe::Ok { now },
+                NodeRead::Due { from, to } => Probe::Change { from, to },
+            }),
+            Kind::SharedData => read(
+                self.ports.shared_data(self.publisher()),
+                |shared| match shared {
+                    SharedRead::Off => not_applicable("off: [commons] enabled = false"),
+                    SharedRead::Unavailable(why) => not_applicable(why),
+                    SharedRead::Foundable(from) => Probe::Change {
+                        from,
+                        to: "founded by this Mac, under the authority it holds".to_owned(),
+                    },
+                    SharedRead::Deferred(why) => Probe::Deferred { why },
+                    SharedRead::Visible(now) => Probe::Ok { now },
+                },
+            ),
+            Kind::Requests => read(self.ports.requests(), |requests| match requests {
+                RequestsRead::Idle(why) => not_applicable(why),
+                RequestsRead::Due(now) if self.detail().is_some() => Probe::Ok { now },
+                RequestsRead::Due(from) => Probe::Change {
+                    from,
+                    to: "posted, answered and swept on the lab's table".to_owned(),
+                },
             }),
             Kind::Accounts if self.trigger.in_window() => {
                 not_applicable("the aterm window's upkeep keeps the roster in step")
@@ -592,10 +1051,23 @@ impl Item for Synced<'_> {
             Kind::Fabric => read(self.ports.fabric(), |fabric| match fabric {
                 FabricRead::NotApplicable(why) => not_applicable(why),
                 FabricRead::Current(now) => Probe::Ok { now },
-                FabricRead::Replaced(from) => Probe::Change {
+                FabricRead::Due(from) => Probe::Change {
                     from,
-                    to: "the broker runs this build".to_owned(),
+                    to: "the broker runs this build, under the job `aterm fabric on` installed"
+                        .to_owned(),
                 },
+                FabricRead::Unset(from) if self.turns_fabric_on() => Probe::Change {
+                    from,
+                    to: "on, as `aterm fabric on` turns it on".to_owned(),
+                },
+                FabricRead::Unset(from) => not_applicable(format!(
+                    "{from}: a pass an aterm window starts turns it on (this one runs {})",
+                    if self.trigger == Trigger::Subscriber {
+                        "from the vault's subscriber"
+                    } else {
+                        "with no aterm window"
+                    }
+                )),
             }),
         }
     }
@@ -609,18 +1081,52 @@ impl Item for Synced<'_> {
                     return Ok(());
                 }
             },
-            Kind::Fleet => match self.ports.sync_fleet() {
+            Kind::Identity => self.ports.sync_identity()?,
+            Kind::StewardRevoke => self
+                .ports
+                .apply_steward_revoke()
+                .map_err(|why| format!("{why}; the next pass tries again"))?,
+            Kind::StewardLease => self
+                .ports
+                .apply_steward_lease()
+                .map_err(|why| format!("{why}; the next pass tries again"))?,
+            Kind::StewardServerStandby => self
+                .ports
+                .apply_steward_standby_server()
+                .map_err(|why| format!("{why}; the next pass tries again"))?,
+            Kind::Fleet => match sync_fleet_with_retry(self.ports, self.trigger) {
                 Ok(FleetDone::Synced(said)) => said,
                 Ok(FleetDone::Blocked(why)) => {
                     self.stand_aside(StoodAside::Waiting(why));
                     return Ok(());
                 }
-                Err(why) => return Err(format!("{why}; the next pass tries again")),
+                Ok(FleetDone::AtCapacity(why)) | Err(why) => {
+                    return Err(format!("{why}; the next pass tries again"));
+                }
             },
+            Kind::Node => self
+                .ports
+                .ensure_node()
+                .map_err(|why| format!("{why}; the next pass tries again"))?,
+            Kind::Requests => self
+                .ports
+                .pass_requests()
+                .map_err(|why| format!("{why}; the next pass tries again"))?,
+            Kind::SharedData => self
+                .ports
+                .found_commons()
+                .map_err(|why| format!("{why}; the next pass tries again"))?,
             Kind::Accounts => self.ports.resync_accounts()?,
-            Kind::Fabric => self.ports.renew_broker()?,
-            // Report only: their probes never plan a change.
-            Kind::Vault | Kind::SharedData => return Ok(()),
+            // Read again: the probe planned one of the two, and only it changes the fabric.
+            Kind::Fabric => match self.ports.fabric()? {
+                FabricRead::Due(_) => self.ports.renew_broker()?,
+                FabricRead::Unset(_) if self.turns_fabric_on() => self.ports.turn_on_fabric()?,
+                FabricRead::Unset(_) | FabricRead::Current(_) | FabricRead::NotApplicable(_) => {
+                    return Ok(());
+                }
+            },
+            // Report only: its probe never plans a change.
+            Kind::Vault => return Ok(()),
         };
         self.say(said);
         Ok(())
@@ -640,8 +1146,14 @@ impl Item for Synced<'_> {
         let remedy = match self.kind {
             Kind::Peers => Remedy::Command("aterm init".to_owned()),
             Kind::Vault => Remedy::Command("aterm secrets agent on".to_owned()),
+            Kind::Identity => Remedy::Command("aterm init --converge".to_owned()),
+            Kind::StewardRevoke => Remedy::Command("aterm init --converge".to_owned()),
+            Kind::StewardLease => Remedy::Command("aterm init --converge".to_owned()),
+            Kind::StewardServerStandby => Remedy::Command("aterm init --converge".to_owned()),
             Kind::Fleet => Remedy::Command("aterm fleet sync".to_owned()),
+            Kind::Node => Remedy::Command("aterm node on".to_owned()),
             Kind::SharedData => Remedy::None,
+            Kind::Requests => Remedy::Command("aterm secrets need pass".to_owned()),
             Kind::Accounts => Remedy::Init {
                 only: "base.ai.accounts".to_owned(),
             },
@@ -838,8 +1350,14 @@ fn sync_items<'a>(ports: &'a dyn Ports, trigger: Trigger, mode: Mode) -> Items<'
     [
         Kind::Peers,
         Kind::Vault,
+        Kind::Identity,
+        Kind::StewardRevoke,
+        Kind::StewardLease,
+        Kind::StewardServerStandby,
         Kind::Fleet,
+        Kind::Node,
         Kind::SharedData,
+        Kind::Requests,
         Kind::Accounts,
         Kind::Fabric,
     ]
@@ -877,8 +1395,34 @@ pub struct Pass {
 ///
 /// # Errors
 /// [`Stop::Held`] while another pass runs; [`Stop::Refused`] outside the account's own login,
-/// where its context or state directory cannot be read, or when the items cannot be ordered.
+/// where its context or state directory cannot be read, or when the items cannot be ordered. A
+/// refused [`Mode::Apply`] pass writes its own aterm.log line (`refusal`): a runner's stderr goes
+/// nowhere, so a Mac whose every pass is refused leaves that trace.
 pub fn converge(
+    ports: &dyn Ports,
+    trigger: Trigger,
+    mode: Mode,
+    on_row: &mut dyn FnMut(&ItemReport),
+) -> Result<Pass, Stop> {
+    let pass = run_pass(ports, trigger, mode, on_row);
+    if mode == Mode::Apply
+        && let Err(Stop::Refused(why)) = &pass
+    {
+        ports.log(&refusal(&ports.build(), trigger, why));
+    }
+    pass
+}
+
+/// A refused pass's one aterm.log line: the build, the trigger and why.
+fn refusal(build: &str, trigger: Trigger, why: &str) -> String {
+    format!(
+        "converge build={build} trigger={} refused: {why}",
+        trigger.word()
+    )
+}
+
+/// [`converge`]'s pass.
+fn run_pass(
     ports: &dyn Ports,
     trigger: Trigger,
     mode: Mode,
@@ -960,8 +1504,7 @@ pub fn converge(
         base,
     };
     let unrecorded = write_record(&state.join(FileJournal::DIR), &record).err();
-    let line = ledger(&build, trigger, due, &rows, unrecorded.as_deref());
-    aterm_log::info!("{line}");
+    ports.log(&ledger(&build, trigger, due, &rows, unrecorded.as_deref()));
     Ok(Pass {
         due,
         rows,
@@ -969,12 +1512,31 @@ pub fn converge(
     })
 }
 
-/// The most rows the ledger line names, and the longest why it gives each.
+/// The most rows the ledger line names, and the longest why it gives each: a failed row's is
+/// longer, since its error is what the line is read for.
 const LEDGER_ROWS: usize = 6;
 const LEDGER_WHY: usize = 160;
+const LEDGER_FAILED_WHY: usize = 480;
+
+/// `why` in `max` chars at most: whole where it fits, else its head and its tail around ` … `,
+/// so the error a long why ends on (a step's lines, then what failed it) is kept.
+fn clipped(why: &str, max: usize) -> String {
+    const CUT: &str = " … ";
+    let chars = why.chars().count();
+    if chars <= max {
+        return why.to_owned();
+    }
+    let keep = max.saturating_sub(CUT.chars().count());
+    let head = keep / 4;
+    let mut out: String = why.chars().take(head).collect();
+    out.push_str(CUT);
+    out.extend(why.chars().skip(chars - (keep - head)));
+    out
+}
 
 /// A pass's one aterm.log line: the build and trigger, a tally, and the rows that did not end
-/// right, each with its why (`[sync.fleet: the issuer did not answer | ...]`).
+/// right, each with its why (`[sync.fleet: the issuer did not answer | ...]`), [`clipped`] to
+/// [`LEDGER_WHY`] chars, or [`LEDGER_FAILED_WHY`] for a failed row's.
 fn ledger(
     build: &str,
     trigger: Trigger,
@@ -997,13 +1559,12 @@ fn ledger(
         })
         .take(LEDGER_ROWS)
         .map(|row| {
-            let why: String = row
-                .why
-                .as_deref()
-                .unwrap_or("no reason given")
-                .chars()
-                .take(LEDGER_WHY)
-                .collect();
+            let max = if row.outcome.is_failure() {
+                LEDGER_FAILED_WHY
+            } else {
+                LEDGER_WHY
+            };
+            let why = clipped(row.why.as_deref().unwrap_or("no reason given"), max);
             format!("{}: {why}", row.id)
         })
         .collect();

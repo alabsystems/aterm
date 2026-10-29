@@ -34,6 +34,6 @@ aterm-uds = { workspace = true }
 # escaped cwd decodes to the bytes the program sent). Workspace crate; serde is
 # its one dependency, already in the graph.
 aterm-json = { workspace = true }
-# The hang detector `park`'s tests wait under. Already a dev-dependency of the
-# crates above this one.
+# The hang detector `park`'s and `conformance`'s tests wait under. Already a
+# dev-dependency of the crates above this one.
 aterm-spec = { workspace = true }

@@ -24,32 +24,41 @@ use aterm_uds::spawnfd::Stdio;
 use crate::instance::{take_flag, take_value};
 use crate::mac::{NOT_RUN, PERSON_HELPER, POLL, ROW, STEP, Vm, not_run};
 use crate::mac_nux_guest::{
-    HidProof, STALL_MS, Stall, Waited, click_latencies, completed_at, dialogs, hid_proof,
-    read_census, read_person, read_record, read_watch, setup_field, stage_name, stage_starts,
+    Add, DEVTOOLS_CANCEL, DEVTOOLS_GOTO, DEVTOOLS_OPEN, DevtoolsActs, HidProof, Procs,
+    ReopenPresses, STALL_MS, Stall, Typed, Waited, Went, acts, click_latencies, completed_at,
+    devtools_acts, dialogs, first_session, hid_proof, read_census, read_person, read_procs,
+    read_record, read_watch, reopen_presses, runs, setup_field, stage_name, stage_starts,
 };
 use crate::paths::paths;
 use crate::{Fail, LAB, Res, stop};
 
 pub const USAGE: &str = "\
-  nux [--app PATH] [--scenario ROW,...] [--standard-user] [--person] [--no-clt | --vanilla] [--repeat N]
-      [--image REF] [--keep] [--record [FILE]]
+  nux [--app PATH] [--scenario ROW,...] [--standard-user] [--person [--later]] [--no-clt | --vanilla]
+      [--repeat N] [--image REF] [--keep] [--record [FILE]]
                 what a person meets on a new Mac, each row in a fresh clone of REF's prepared base (as dmg):
                 the app built here (ship dev-app made release-shaped: aterm.app, com.aterm.aterm, hardened
                 runtime, signed ad hoc) or --app PATH (read, never changed), unpacked into the guest's
                 /Applications (--standard-user: a non-admin account logged in at the console, and its
                 ~/Applications). --person: the person base, whose guest helper (aterm-lab-guest, granted
-                Accessibility and event posting while the image's SIP is off) is the person at the
-                console: a pointer move every 5 s, Allow and OK pressed in dialogs, the account's password
-                typed into a password field, System Settings switches naming aterm turned on, each input
-                with the HIDIdleTime it left (a row whose input did not reset it says NOT MEASURED).
+                Accessibility and event posting by its signing identifier while the image's SIP is off,
+                so each run installs its own build) is the person at the console: a pointer move every
+                5 s, Allow and OK pressed in dialogs, the account's password typed into a password field
+                (--standard-user: the image's administrator's name and password into a dialog that asks for
+                an administrator), System Settings switches naming aterm turned on, System Settings'
+                Quit & Reopen sheet answered with Quit & Reopen (--later: Later) and then the app's own
+                question before it quits answered with Quit, on System Settings' Developer Tools page
+                aterm added to the list (the helper panel's tile dragged onto it, else + and the app chosen
+                in the open panel) and its switch turned on, each input with the HIDIdleTime it left (a
+                row whose input did not reset it says NOT MEASURED).
                 --no-clt: a base with the Command Line Tools removed (xcode-select -p fails); --vanilla:
                 REF's cirruslabs -vanilla image (NOT RUN when it must be pulled with under 71 GB free).
                 --repeat N: each row N times, each in its own clone. Every row also reads the dialog census
                 (each window owner that appears, the guest helper polling the window list every 250 ms with
                 no Screen Recording grant), tccd's consent prompts, xcode-select -p, and the ALab guard:
                 alab-secrets.local unreached and no _alab-vault._tcp advert in the guest, none from a guest
-                on this Mac's tart bridge (the vault port is null-routed in every guest but to loopback and
-                tart's own network). Rows (default all), each step under a 300 s hang detector:
+                on this Mac's tart bridge (an advert whose host resolves to this Mac's own addresses is this
+                Mac's, named and never a failure; the vault port is null-routed in every guest but to
+                loopback and tart's own network). Rows (default all), each step under a 300 s hang detector:
                   init-apply       aterm init --json on a terminal, each prompt answered with its default
                                    (a vault join password with none): first byte, end, prompts, lines,
                                    exit, every row's elapsed_ms (the slowest named), Dock/Finder/
@@ -77,15 +86,23 @@ pub const USAGE: &str = "\
                                    disk grown to 100 GB first)
                   first-launch     the app opened, then watched until the guest's own aterm ctl status says
                                    setup=done (the progress record's completion on a build without the
-                                   field), or until setup stood still a minute: first prompt, first
+                                   field), or until setup stood still a minute with no new press by the
+                                   person and no app process starting or going: first prompt, first
                                    present, each stage's start (a guest-side watch of initial-setup.json)
                                    and the first one's after first present, n_present and present and
                                    input p50/p95/p99 while setup ran, aterm's state folder at boot and at
                                    window focus, WARN lines, consent dialogs (with a ~/Desktop control),
+                                   which process macOS held back to ask its Local Network question and
+                                   when, beside System State's own ask (the unified log's
+                                   networkextension lines, each pid's command as ps reads it),
                                    folder dialogs after Full Disk Access was granted (target 0), the
                                    toolset pass, the setup lines and hand-overs in order, the mDNS
                                    questions for the ALab vault, change-journal records, defaults and
-                                   killall execs, relaunches (the guest's disk grown to 100 GB first)
+                                   killall execs, relaunches; the Quit & Reopen sheet's press and the
+                                   app's processes (a guest-side watch of the kernel's process table
+                                   every 50 ms): the quit, the reopen with its pid, the reopened
+                                   pid's first aterm.log line, setup followed across it (the guest's
+                                   disk grown to 100 GB first)
                   terminal-launch  a bare aterm on a terminal (Terminal.app's shape) to its shell's first
                                    prompt, cold then warm
                   app-launch       the app opened to its first tab's prompt, cold then warm
@@ -97,6 +114,23 @@ pub const USAGE: &str = "\
                                    second identity that approves joins: aterm init --only workstation
                                    --vault <it> with its join password typed: to the password prompt,
                                    typed to a synced secret on disk, typed to the end
+                  vault-phrase     a new Mac let in by a member's Allow and the phrase it shows (F10), on
+                                   the guest's loopback alone: a seed identity founds a vault on
+                                   127.0.0.1 (never advertised) with a synthetic GitHub token, publish
+                                   token and AI accounts list in [everyone] and runs its approver; a
+                                   second identity, a member that is no admin (asked, approved by the
+                                   seed, enrolled in its Commons), allows (the guest helper running
+                                   F10's members desk on its custody behind an ask-only listener on
+                                   127.0.0.1, which presses Allow for the first Mac that asks; the
+                                   phrase read off its record, never a window); a third runs aterm
+                                   members join --no-wait --at <the member> (install.sh's ask), aterm
+                                   members join with the phrase typed at its prompt, then its
+                                   subscriber: the ask to the member's row, to the phrase shown and
+                                   typed, to each file on disk, to members status reading In; FAILED
+                                   unless the phrase came from that member, every file is the seed's
+                                   value, the joiner reads In, every aterm listener is on loopback, and
+                                   every _alab-vault._tcp and _alab._tcp browse, in the guest and on
+                                   this Mac, ran and heard no guest advert
                   successor        install.sh --version N (the release before the latest), then the
                                    updater to the latest with a window open, and the successor's setup
                                    and Full Disk Access lines in its first 30 s
@@ -139,8 +173,10 @@ pub const USAGE: &str = "\
                 run, no tart)
 ";
 
-/// The guest folder the drivers and every record live in (outside the share).
-const GUEST_NUX: &str = "/tmp/aterm-nux";
+/// The guest folder the drivers and every record live in (outside the share). Not `/tmp`, which
+/// macOS empties at boot: a kept clone (`--keep`) still holds its rows' records when it boots
+/// again.
+const GUEST_NUX: &str = "/var/tmp/aterm-nux";
 
 /// The guest helper's file name (`src/guest/main.rs`), in the share and in [`GUEST_NUX`].
 const GUEST_HELPER: &str = "aterm-lab-guest";
@@ -148,6 +184,9 @@ const GUEST_HELPER: &str = "aterm-lab-guest";
 /// The launchd labels of the census and the person, agents of the account's GUI session.
 const CENSUS_AGENT: &str = "com.aterm.nux.census";
 const PERSON_AGENT: &str = "com.aterm.nux.person";
+
+/// The app's process watch's record, in [`GUEST_NUX`].
+const PROCS_RECORD: &str = "procs.txt";
 
 /// The progress record setup keeps (`initial.rs`), under the account's home.
 const SETUP_RECORD: &str = "Library/Application Support/aterm/doctor/initial-setup.json";
@@ -166,7 +205,8 @@ block return out quick proto tcp from any to any port 7484
 ";
 
 /// The ceiling of `first-launch`'s wait on setup: past it the wait ends even while setup still
-/// moves (it ends sooner once setup is done, or stood still a minute).
+/// moves (it ends sooner once setup is done, or stood still a minute with nothing new from the
+/// person or in the app's processes).
 const WATCH: Duration = Duration::from_secs(600);
 
 /// The disk `first-launch` and `install-sh` grow their clone to: the toolset pass refuses under
@@ -183,6 +223,11 @@ const TOOLSET_WATCH: Duration = Duration::from_secs(180);
 const STANDARD_USER: &str = "nux";
 const STANDARD_PASSWORD: &str = "nux-lane-2026";
 
+/// The image's administrator (cirruslabs' `admin`) and its password: what a person at the standard
+/// account gives a dialog that asks for an administrator.
+const ADMIN_USER: &str = "admin";
+const ADMIN_PASSWORD: &str = "admin";
+
 /// The public release pointer install.sh reads first.
 const LATEST_POINTER: &str =
     "https://github.com/alabsystems/aterm/releases/latest/download/aterm-appcast.toml";
@@ -194,7 +239,8 @@ const ALAB_SERVICE: &str = "_alab-vault._tcp";
 /// The pty driver: `drive.exp <record> <limit_s> <cmd> [arg...]`. A known prompt is answered at
 /// once; any other partial line left 1.5 s is a prompt, answered with Enter (its default). Each
 /// prompt's record names when it came and how long the command was silent before it.
-/// `$NUX_JOIN` answers a vault join password (default `none`), `$NUX_SUDO` a sudo password. With
+/// `$NUX_JOIN` answers a vault join password (default `none`), `$NUX_PHRASE` the join phrase
+/// `aterm members join` asks for (`vault-phrase`), `$NUX_SUDO` a sudo password. With
 /// `$NUX_SHELL` (a shell session's run), the first [`SHELL_READY`] line is its shell's first
 /// prompt: recorded, then answered with `exit`; nothing unknown is answered.
 pub const DRIVE: &str = r#"set record [lindex $argv 0]
@@ -204,6 +250,8 @@ proc rec {args} { global f; puts $f [join $args " "]; flush $f }
 proc ms {} { global t0; expr {[clock milliseconds] - $t0} }
 set join none
 if {[info exists env(NUX_JOIN)]} { set join $env(NUX_JOIN) }
+set phrase ""
+if {[info exists env(NUX_PHRASE)]} { set phrase $env(NUX_PHRASE) }
 set sudo admin
 if {[info exists env(NUX_SUDO)]} { set sudo $env(NUX_SUDO) }
 set shell [info exists env(NUX_SHELL)]
@@ -243,6 +291,7 @@ while {1} {
         }
         -re {[^\r\n]*Vault join password[^\r\n]*: $} { answer $expect_out(0,string) $join }
         -re {[^\r\n]*Retype the join password[^\r\n]*: $} { answer $expect_out(0,string) $join }
+        -re {[^\r\n]*The phrase [^\r\n]* shows: $} { answer $expect_out(0,string) $phrase }
         -re {[^\r\n]*\(Enter keeps [^\r\n]*\): $} { answer $expect_out(0,string) "" }
         -re {[^\r\n]*\[y/N\] $} { answer $expect_out(0,string) "" }
         -re {[^\r\n]*[Pp]assword[^\r\n]*: $} { answer $expect_out(0,string) $sudo }
@@ -318,6 +367,7 @@ pub enum Scenario {
     AppLaunch,
     Vault,
     VaultLocal,
+    VaultPhrase,
     Successor,
     InstallSh,
     KillStage,
@@ -336,7 +386,7 @@ pub enum Scenario {
 }
 
 /// Every row, in the order a run takes them.
-pub const ALL: [Scenario; 13] = [
+pub const ALL: [Scenario; 14] = [
     Scenario::InitApply,
     Scenario::InitNotty,
     Scenario::InitSsh,
@@ -348,6 +398,7 @@ pub const ALL: [Scenario; 13] = [
     Scenario::AppLaunch,
     Scenario::Vault,
     Scenario::VaultLocal,
+    Scenario::VaultPhrase,
     Scenario::Successor,
     Scenario::InstallSh,
 ];
@@ -391,6 +442,7 @@ impl Scenario {
             Scenario::AppLaunch => "app-launch",
             Scenario::Vault => "vault",
             Scenario::VaultLocal => "vault-local",
+            Scenario::VaultPhrase => "vault-phrase",
             Scenario::Successor => "successor",
             Scenario::InstallSh => "install-sh",
             Scenario::KillStage => "kill-stage",
@@ -481,6 +533,8 @@ pub struct Ask {
     pub standard_user: bool,
     /// The person base: the guest helper acting as the person at the console.
     pub person: bool,
+    /// The person answers System Settings' Quit & Reopen sheet with Later (else Quit & Reopen).
+    pub later: bool,
     /// A base with the Command Line Tools removed.
     pub no_clt: bool,
     /// The image is REF's `-vanilla` sibling.
@@ -527,6 +581,12 @@ pub fn parse(args: &[String], image: String) -> Result<Ask, Fail> {
     };
     let standard_user = take_flag(&mut a, "--standard-user");
     let person = take_flag(&mut a, "--person");
+    let later = take_flag(&mut a, "--later");
+    if later && !person {
+        return Err(Fail::usage(
+            "mac nux: --later is the person's answer to the Quit & Reopen sheet: it needs --person",
+        ));
+    }
     let no_clt = take_flag(&mut a, "--no-clt");
     let vanilla = take_flag(&mut a, "--vanilla");
     if no_clt && vanilla {
@@ -577,6 +637,7 @@ pub fn parse(args: &[String], image: String) -> Result<Ask, Fail> {
         scenarios,
         standard_user,
         person,
+        later,
         no_clt,
         vanilla,
         repeat,
@@ -766,6 +827,11 @@ pub fn read_drive(record: &str) -> Drive {
 /// A row's cells from its driver's record, each name after `label` (one run of several); a hang,
 /// a driver that did not start or one that left no record fails it.
 fn drive_cells(row: &mut Row, label: &str, d: &Drive) {
+    drive_cells_within(row, label, d, ROW);
+}
+
+/// [`drive_cells`] of a run whose hang detector was `limit`.
+fn drive_cells_within(row: &mut Row, label: &str, d: &Drive, limit: Duration) {
     if let Some(why) = &d.spawn_failed {
         row.fail(format!(
             "{label}the driver could not start the command: {why}"
@@ -773,7 +839,7 @@ fn drive_cells(row: &mut Row, label: &str, d: &Drive) {
     } else if let Some(at) = &d.hang {
         row.fail(format!(
             "{label}the {} s hang detector fired ({at})",
-            ROW.as_secs()
+            limit.as_secs()
         ));
     } else if d.start_epoch_ms.is_none() {
         row.fail(format!("{label}the driver left no record"));
@@ -1041,6 +1107,23 @@ fn ms_value(v: f64) -> u64 {
     v.max(0.0).round() as u64
 }
 
+/// Main to first present in `aterm ctl metrics`' line (`rust_main_to_first_present_ms`): `Err`
+/// when the line has no such field, `Ok(None)` while it reads 0, as it does until the window's
+/// first terminal present (a window System State fronts from its launch has none).
+fn first_present(metrics: &str) -> Result<Option<u64>, ()> {
+    let ms = metric(metrics, "rust_main_to_first_present_ms").ok_or(())?;
+    Ok((ms > 0.0).then(|| ms_value(ms)))
+}
+
+/// [`first_present`] as a cell's value.
+fn first_present_value(metrics: &str) -> Value {
+    match first_present(metrics) {
+        Err(()) => Value::Missing("aterm ctl metrics did not answer".into()),
+        Ok(None) => Value::Missing("no terminal frame presented yet".into()),
+        Ok(Some(ms)) => Value::Ms(ms),
+    }
+}
+
 /// The processes (`<name> <pid>` lines) whose pid changed or that went away between `before` and
 /// `after`: what restarted.
 #[must_use]
@@ -1165,6 +1248,35 @@ pub fn tcc_prompt_events(log: &str) -> Vec<TccPrompt> {
         .collect()
 }
 
+/// macOS's Local Network checks that held a process back to ask its person, from
+/// `log show --style ndjson` of UserEventAgent's `Got local network blocked notification: pid: <n>,
+/// …`: when (epoch ms, from the event's `timestamp`) and the pid, in order.
+#[must_use]
+pub fn local_network_blocks(log: &str) -> Vec<(Option<u64>, u32)> {
+    log.lines()
+        .filter_map(|line| {
+            let message = crate::mac::event_message(line);
+            let (_, rest) = message.split_once("local network blocked notification: pid: ")?;
+            let pid = rest.split([',', ' ']).next()?.parse().ok()?;
+            let at_ms = aterm_json::from_str::<aterm_json::Value>(line)
+                .ok()
+                .and_then(|v| v.get("timestamp")?.as_str().and_then(log_timestamp_ms));
+            Some((at_ms, pid))
+        })
+        .collect()
+}
+
+/// Each process `ps -o pid=,command=` listed: its pid and command line.
+#[must_use]
+pub fn ps_commands(ps: &str) -> BTreeMap<u32, String> {
+    ps.lines()
+        .filter_map(|line| {
+            let (pid, command) = line.trim_start().split_once(' ')?;
+            Some((pid.parse().ok()?, command.trim().to_owned()))
+        })
+        .collect()
+}
+
 /// The folder (TCC) dialogs tccd put up for the app at or after `since_ms` (epoch ms): a
 /// `SystemPolicy…` service other than Full Disk Access itself, asked for a subject naming aterm
 /// (never the guest agent's ~/Desktop control).
@@ -1242,6 +1354,8 @@ pub struct Launch {
     pub handovers: Vec<(u64, String)>,
     /// The grant of Full Disk Access, as aterm observed it.
     pub fda_granted_ms: Option<u64>,
+    /// System State's own Local Network step handing its question to macOS.
+    pub local_network_asked_ms: Option<u64>,
     /// Every setup line ([`SETUP_LINES`]), in order.
     pub setup: Vec<(u64, String)>,
     pub toolset: Option<(u64, String)>,
@@ -1278,6 +1392,10 @@ pub fn read_launch(log: &str, open_ms: u64) -> Launch {
             })
             .collect(),
         fda_granted_ms: first(&|l| l.message.contains("full disk access observed granted")),
+        local_network_asked_ms: first(&|l| {
+            l.message
+                .starts_with("system state: Local Network asked for")
+        }),
         setup: lines
             .iter()
             .filter(|l| SETUP_LINES.iter().any(|p| l.message.starts_with(p)))
@@ -1607,12 +1725,23 @@ impl Guest {
 
     /// `cmd` (a shell word list) under [`DRIVE`] on a terminal; its record and output under `tag`.
     fn drive(&self, tag: &str, env: &str, cmd: &str) -> Result<(Drive, String), Fail> {
+        self.drive_within(tag, env, cmd, ROW)
+    }
+
+    /// [`Self::drive`] with `limit` its hang detector.
+    fn drive_within(
+        &self,
+        tag: &str,
+        env: &str,
+        cmd: &str,
+        limit: Duration,
+    ) -> Result<(Drive, String), Fail> {
         self.run(
             &format!(
                 "cd {GUEST_NUX} && {env} /usr/bin/expect -f drive.exp {tag}.rec {} {cmd} > {tag}.out 2>&1",
-                ROW.as_secs()
+                limit.as_secs()
             ),
-            ROW + STEP,
+            limit + STEP,
         )?;
         Ok((
             read_drive(&self.read(&format!("{GUEST_NUX}/{tag}.rec"))?),
@@ -1622,12 +1751,17 @@ impl Guest {
 
     /// `cmd` under [`NOTTY`]; its record and output under `tag`.
     fn notty(&self, tag: &str, cmd: &str) -> Result<(Drive, String), Fail> {
+        self.notty_within(tag, cmd, ROW)
+    }
+
+    /// [`Self::notty`] with `limit` its hang detector.
+    fn notty_within(&self, tag: &str, cmd: &str, limit: Duration) -> Result<(Drive, String), Fail> {
         self.run(
             &format!(
                 "cd {GUEST_NUX} && /usr/bin/perl notty.pl {tag}.rec {} {cmd} > {tag}.out 2>&1",
-                ROW.as_secs()
+                limit.as_secs()
             ),
-            ROW + STEP,
+            limit + STEP,
         )?;
         Ok((
             read_drive(&self.read(&format!("{GUEST_NUX}/{tag}.rec"))?),
@@ -1684,7 +1818,7 @@ impl Guest {
         if self.standard {
             STANDARD_PASSWORD
         } else {
-            "admin"
+            ADMIN_PASSWORD
         }
     }
 
@@ -1817,6 +1951,29 @@ impl Guest {
             STEP,
         )?;
         Ok(())
+    }
+
+    /// Watch the app's processes with the guest helper's `procs` (the watch before it stopped),
+    /// its record a fresh [`PROCS_RECORD`]: each process running the app's executable with no
+    /// argument, as it starts and goes.
+    fn watch_procs(&self) -> Result<(), Fail> {
+        self.sh(
+            &format!(
+                "pkill -f '{GUEST_HELPER} procs' || true; : > {GUEST_NUX}/{PROCS_RECORD}; \
+                 ({GUEST_NUX}/{GUEST_HELPER} procs '{}' {GUEST_NUX}/{PROCS_RECORD} </dev/null >/dev/null 2>&1 &); sleep 0.3",
+                self.aterm
+            ),
+            STEP,
+        )?;
+        Ok(())
+    }
+
+    /// Stop the process watch and read its record.
+    fn procs_read(&self) -> Result<Procs, Fail> {
+        self.run(&format!("pkill -f '{GUEST_HELPER} procs' || true"), STEP)?;
+        Ok(read_procs(
+            &self.read(&format!("{GUEST_NUX}/{PROCS_RECORD}"))?,
+        ))
     }
 }
 
@@ -1962,29 +2119,67 @@ fn dialog_text(dialogs: &[crate::mac_nux_guest::Dialog]) -> String {
         .join("; ")
 }
 
-/// The person at the guest's console: the helper at [`PERSON_HELPER`] run as an agent of the
-/// account's GUI session, the account's password its answer to a password field.
-fn person_start(g: &Guest) -> Result<(), Fail> {
+/// The person at the guest's console: the helper this run built (the row's copy in
+/// [`GUEST_NUX`]), put at [`PERSON_HELPER`] as root and signed with the identifier the base's
+/// grants require, run as an agent of the account's GUI session, the account's password its
+/// answer to a password field. In a standard account's row it also has the image's administrator
+/// (`--admin`), whose name and password it gives a dialog that asks for an administrator, as a
+/// person at that account does with the administrator at hand. With `later`, it answers System
+/// Settings' Quit & Reopen sheet with Later; else Quit & Reopen, and then the app's own question
+/// before it quits, in a window of a process running the app's executable.
+fn person_start(g: &Guest, later: bool) -> Result<(), Fail> {
+    g.sh(
+        &g.as_root(&crate::mac::person_install(&format!(
+            "{GUEST_NUX}/{GUEST_HELPER}"
+        ))),
+        STEP,
+    )?;
     let out = format!("{GUEST_NUX}/person.txt");
+    let args = person_args(&out, g.standard, later, &g.aterm);
     g.agent_start(
         PERSON_AGENT,
-        &[
-            PERSON_HELPER,
-            "person",
-            &out,
-            "--password",
-            g.sudo_password(),
-        ],
+        &args.iter().map(String::as_str).collect::<Vec<_>>(),
     )?;
     g.await_line(&out, PERSON_AGENT).map_err(Fail::die)
 }
 
+/// The person's arguments, writing `out`: the administrator's credentials only in a standard
+/// account's row (`standard`), `--sheet later` when it answers the Quit & Reopen sheet with Later
+/// (`later`), and the app's executable (`app`), whose question before it quits the person answers
+/// after its own Quit & Reopen (never with `--sheet later`).
+fn person_args(out: &str, standard: bool, later: bool, app: &str) -> Vec<String> {
+    let mut args = vec![
+        PERSON_HELPER.to_owned(),
+        "person".to_owned(),
+        out.to_owned(),
+    ];
+    if standard {
+        args.extend([
+            "--password".to_owned(),
+            STANDARD_PASSWORD.to_owned(),
+            "--admin".to_owned(),
+            format!("{ADMIN_USER}:{ADMIN_PASSWORD}"),
+        ]);
+    } else {
+        args.extend(["--password".to_owned(), ADMIN_PASSWORD.to_owned()]);
+    }
+    if later {
+        args.extend(["--sheet".to_owned(), "later".to_owned()]);
+    }
+    args.extend(["--app".to_owned(), app.to_owned()]);
+    args
+}
+
 /// Stop the person and read what it did: its grants, whether its input reset `HIDIdleTime` (the
 /// proof every person stage needs, else NOT MEASURED), each press with its latency, and the
-/// passwords it typed.
+/// passwords it typed, whose each was (the controls of each dialog it typed into printed for the
+/// run's record).
 fn person_cells(g: &Guest, row: &mut Row) -> Result<HidProof, Fail> {
     g.agent_stop(PERSON_AGENT);
     let p = read_person(&g.read(&format!("{GUEST_NUX}/person.txt"))?);
+    for (_, kind, reading) in &p.dialogs {
+        println!("mac nux: the person's dialog ({kind}): {reading}");
+    }
     let word = |v: Option<bool>| match v {
         Some(true) => "yes",
         Some(false) => "no",
@@ -2025,29 +2220,80 @@ fn person_cells(g: &Guest, row: &mut Row) -> Result<HidProof, Fail> {
                 .join("; ")
         }),
     );
-    row.cell("passwords typed", Value::Count(p.typed.len() as u64));
+    let skipped = p
+        .dialogs
+        .iter()
+        .filter(|(_, kind, _)| kind == "skip")
+        .count();
+    row.cell("passwords typed", typed_cell(&p.typed, skipped));
     Ok(proof)
 }
 
-/// Where setup stands in the guest, in one look: `setup=` from its own `aterm ctl status` and the
-/// progress record.
+/// The `passwords typed` cell: how many, and for each the owner, whose password it was, the
+/// dialog's name field (as shown, then `>` what it read once the administrator's name went in) and
+/// whether the dialog went after the Return (an administrator's dialog, the one watched); then how
+/// many tries typed nothing (`skipped`: the focus read a text field not secure).
+fn typed_cell(typed: &[Typed], skipped: usize) -> Value {
+    if typed.is_empty() && skipped == 0 {
+        return Value::Count(0);
+    }
+    let mut each = typed
+        .iter()
+        .map(|t| {
+            let name = if t.name == "-" {
+                String::new()
+            } else {
+                format!(" (name field {})", t.name)
+            };
+            let went = match t.went {
+                Went::Unwatched => String::new(),
+                Went::Stayed => ", the dialog stayed".to_owned(),
+                Went::After(ms) => format!(", the dialog went {ms} ms after Return"),
+            };
+            format!("{}, the {}'s{name}{went}", t.owner, t.whose)
+        })
+        .collect::<Vec<_>>();
+    if skipped > 0 {
+        each.push(format!(
+            "{skipped} {} typed nothing (the focus read a text field not secure)",
+            if skipped == 1 { "try" } else { "tries" }
+        ));
+    }
+    Value::Text(format!("{}: {}", typed.len(), each.join("; ")))
+}
+
+/// Where setup stands in the guest, in one look: `setup=` from its own `aterm ctl status` of the
+/// first session `ctl ls` lists, and the progress record. A bare `status` from outside every tab
+/// reads the window's active terminal, which a window System State fronts does not have. With
+/// them, the person's presses and the app's processes so far (`acts`), which move a first launch
+/// on while both stand still: the person at System Settings' Full Disk Access page, its sheet and
+/// the app's question, and the app's quit and reopen (2026-10-28's 20:00 first-launch row:
+/// setup= stood still from 154.6 s, and the wait ended at 219.3 s, mid-password, so the sheet's
+/// press at 263.5 s and the reopen came after the row stopped looking).
 fn setup_reading(g: &Guest) -> Result<crate::mac_nux_guest::Reading, Fail> {
+    let sessions = g.run(&format!("{} ctl ls 2>/dev/null", g.aterm), STEP)?;
+    let at = first_session(&sessions).map_or_else(String::new, |sid| format!("@{sid} "));
     let out = g.run(
         &format!(
-            "{} ctl status 2>/dev/null | head -1; echo '--- record'; cat \"$HOME/{SETUP_RECORD}\" 2>/dev/null",
+            "{} ctl {at}status 2>/dev/null | head -1; echo '--- record'; cat \"$HOME/{SETUP_RECORD}\" 2>/dev/null; \
+             echo; echo '--- acts'; cat {GUEST_NUX}/person.txt {GUEST_NUX}/{PROCS_RECORD} 2>/dev/null \
+             | grep -E '^(click|typed|up|down) '; true",
             g.aterm
         ),
         STEP,
     )?;
-    let (status, record) = out.split_once("--- record").unwrap_or((&out, ""));
+    let (status, rest) = out.split_once("--- record").unwrap_or((&out, ""));
+    let (record, moved) = rest.split_once("--- acts").unwrap_or((rest, ""));
     Ok(crate::mac_nux_guest::Reading {
         setup: setup_field(status).map(str::to_owned),
         record: read_record(record),
+        acts: acts(moved),
     })
 }
 
 /// Wait for setup: until `setup=done` (the record's completion on a build without the field),
-/// until it stood still for [`STALL_MS`] (the one-minute no-progress hang detector), or until
+/// until it stood still for [`STALL_MS`] with nothing new from the person or in the app's
+/// processes either (the one-minute no-progress hang detector, [`setup_reading`]), or until
 /// [`WATCH`]; its cell under `label` counts from `from_ms` (ms before the wait began). The time
 /// it ended, in ms after `from_ms`, once done.
 fn wait_setup(g: &Guest, row: &mut Row, label: &str, from_ms: u64) -> Result<Option<u64>, Fail> {
@@ -2067,7 +2313,7 @@ fn wait_setup(g: &Guest, row: &mut Row, label: &str, from_ms: u64) -> Result<Opt
                 row.cell(
                     format!("{label}setup done"),
                     Value::Missing(format!(
-                        "it stood at {stood} from {} ms to {at} ms, and the one-minute no-progress hang detector ended the wait",
+                        "it stood at {stood} from {} ms to {at} ms, with no new press by the person and no aterm process starting or going, and the one-minute no-progress hang detector ended the wait",
                         from_ms + since_ms
                     )),
                 );
@@ -2186,63 +2432,114 @@ pub fn xcode_select_text(out: &str) -> String {
 
 /// What the guest saw of the ALab vault: `alab-secrets.local`'s address (`none` unresolved), the
 /// HTTP status of a GET of its URL (`000`: no answer), and the `_alab-vault._tcp` adverts it
-/// heard. Unreached when nothing answered; why not, else.
+/// heard, placed ([`guest_heard`]: why its browse shows none, where it did not run). Unreached
+/// when nothing answered and every advert heard is this Mac's own (its port refused by the
+/// guest's [`PF_GUARD`]); why not, else.
 ///
 /// # Errors
-/// The guest reached it: the row must not go on.
-pub fn alab_probe_verdict(address: &str, http: &str, adverts: u32) -> Result<String, String> {
-    if http.trim() != "000" || adverts > 0 {
+/// The guest reached it, heard an advert that is not this Mac's, or its browse did not run, so no
+/// advert is unproven: the row must not go on.
+pub fn alab_probe_verdict(
+    address: &str,
+    http: &str,
+    adverts: &Result<advert::Split, String>,
+) -> Result<String, String> {
+    let adverts = adverts.as_ref().map_err(|why| {
+        format!(
+            "the guest's browse of {ALAB_SERVICE} did not run ({why}), so no advert is unproven"
+        )
+    })?;
+    if http.trim() != "000" || !adverts.others.is_empty() {
         return Err(format!(
-            "the guest reached an ALab vault (alab-secrets.local {address}, HTTP {}, {adverts} {ALAB_SERVICE} advert(s))",
-            http.trim()
+            "the guest reached an ALab vault (alab-secrets.local {address}, HTTP {}, {} {ALAB_SERVICE} advert(s){})",
+            http.trim(),
+            adverts.others.len(),
+            if adverts.others.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", adverts.others.join(", "))
+            }
         ));
     }
+    let own = adverts.this_macs_text();
     Ok(format!(
-        "Unreached (alab-secrets.local {}, no answer, no {ALAB_SERVICE} advert)",
+        "Unreached (alab-secrets.local {}, no answer, no {ALAB_SERVICE} advert{})",
         if address == "none" {
             "unresolved"
         } else {
             address
+        },
+        if own.is_empty() {
+            String::new()
+        } else {
+            format!(" but {own}")
         }
     ))
 }
 
-/// The `_alab-vault._tcp` adverts a `dns-sd -B` on this Mac heard over a tart bridge (a vmnet
-/// `bridge1NN`): a guest's. `name_of` names an interface index.
-#[must_use]
-pub fn guest_adverts(browse: &str, name_of: &dyn Fn(u32) -> Option<String>) -> Vec<String> {
-    browse
+/// Whether a `dns-sd -B` transcript shows a browse that ran: its `...STARTING...` line, which
+/// `dns-sd` prints once its browse call succeeded, and no failed call (`DNSService call failed`,
+/// mDNSResponder unreachable) or error code. A browse that hears nothing prints no line after
+/// `...STARTING...` (the `Timestamp … Instance Name` header comes with the first answer), so
+/// that line is the proof it looked.
+///
+/// # Errors
+/// Why the transcript shows no browse that ran.
+pub fn browse_ran(transcript: &str) -> Result<(), String> {
+    if let Some(line) = transcript
         .lines()
-        .filter_map(|l| {
-            let f: Vec<&str> = l.split_whitespace().collect();
-            if f.get(1) != Some(&"Add") {
-                return None;
-            }
-            let name = name_of(f.get(3)?.parse().ok()?)?;
-            let vmnet = name
-                .strip_prefix("bridge")
-                .and_then(|n| n.parse::<u32>().ok())
-                .is_some_and(|n| n >= 100);
-            vmnet.then(|| {
-                format!(
-                    "{} on {name}",
-                    f.get(6..).map(|i| i.join(" ")).unwrap_or_default()
-                )
+        .map(|l| l.trim_matches(|c: char| c.is_whitespace() || c.is_control()))
+        .find(|l| l.contains("DNSService call failed") || l.contains("Error code"))
+    {
+        return Err(format!("dns-sd failed: {}", squeeze(line, 80)));
+    }
+    if transcript.lines().any(|l| l.contains("...STARTING...")) {
+        return Ok(());
+    }
+    let first = transcript
+        .lines()
+        .map(|l| l.trim_matches(|c: char| c.is_whitespace() || c.is_control()))
+        .find(|l| !l.is_empty());
+    Err(match first {
+        None => "its transcript is empty".to_owned(),
+        Some(line) => format!("no browse started: {}", squeeze(line, 80)),
+    })
+}
+
+/// The adverts (`Add` rows) a `dns-sd -B` transcript heard ([`advert::heard`]).
+///
+/// # Errors
+/// It shows no browse that ran ([`browse_ran`]): its count would prove nothing.
+pub fn browse_adds(transcript: &str) -> Result<Vec<advert::Heard>, String> {
+    browse_ran(transcript)?;
+    Ok(advert::heard(transcript))
+}
+
+/// The adverts a `dns-sd -B` on this Mac heard over a tart bridge (a vmnet `bridge1NN`): a
+/// guest's, or this Mac's own registration announced there too ([`host_guests`] tells which).
+/// `name_of` names an interface index.
+#[must_use]
+pub fn bridge_heard(browse: &str, name_of: &dyn Fn(u32) -> Option<String>) -> Vec<advert::Heard> {
+    advert::heard(browse)
+        .into_iter()
+        .filter(|h| {
+            name_of(h.interface).is_some_and(|name| {
+                name.strip_prefix("bridge")
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .is_some_and(|n| n >= 100)
             })
         })
         .collect()
 }
 
 /// The ALab guard every row ends with: the guest's look at the ALab vault ([`alab_probe_verdict`])
-/// and this Mac's for a guest's production advert ([`guest_adverts`]); either one failing fails
+/// and this Mac's for a guest's production advert ([`host_guests`]); either one failing fails
 /// the row.
 fn alab_guard(g: &Guest, run: &Path, row: &mut Row) -> Result<(), Fail> {
     let seen = g.run(
         &format!(
             "/usr/bin/python3 -c \"import socket\ntry: print(socket.getaddrinfo('{ALAB_HOST}', 7484)[0][4][0])\nexcept Exception: print('none')\"; \
-             curl -s -o /dev/null -m 3 -w '%{{http_code}}\\n' '{url}'; \
-             script -q {GUEST_NUX}/guard.txt dns-sd -B {ALAB_SERVICE} >/dev/null 2>&1 & sleep 3; pkill -x dns-sd; sleep 0.3; \
-             grep -c ' Add ' {GUEST_NUX}/guard.txt || true",
+             curl -s -o /dev/null -m 3 -w '%{{http_code}}\\n' '{url}'",
             url = aterm_types::macos_setup::DEFAULT_VAULT_URL
         ),
         STEP,
@@ -2250,37 +2547,132 @@ fn alab_guard(g: &Guest, run: &Path, row: &mut Row) -> Result<(), Fail> {
     let mut lines = seen.lines().map(str::trim);
     let address = lines.next().unwrap_or("none").to_owned();
     let http = lines.next().unwrap_or("000").to_owned();
-    let adverts = lines.next_back().and_then(|n| n.parse().ok()).unwrap_or(0);
-    match alab_probe_verdict(&address, &http, adverts) {
+    let adverts = guest_heard(g, ALAB_SERVICE)?;
+    match alab_probe_verdict(&address, &http, &adverts) {
         Ok(text) => row.cell("ALab probe", Value::Text(text)),
         Err(why) => row.fail(why),
     }
-    let file = run.join("host-browse.txt");
-    let _ = std::fs::remove_file(&file);
-    let mut browse = aterm_uds::spawnfd::command("/usr/bin/script")
-        .arg("-q")
-        .arg(&file)
-        .args(["/usr/bin/dns-sd", "-B", ALAB_SERVICE, "local."])
+    match host_guests(run, ALAB_SERVICE)? {
+        Err(why) => row.fail(format!(
+            "this Mac's browse of {ALAB_SERVICE} did not run ({why}), so no advert from a guest is unproven"
+        )),
+        Ok(heard) if heard.others.is_empty() => {
+            let own = heard.this_macs_text();
+            row.cell(
+                "production adverts from guests",
+                Value::Text(if own.is_empty() {
+                    "none".into()
+                } else {
+                    format!("none ({own})")
+                }),
+            );
+        }
+        Ok(heard) => row.fail(format!(
+            "this Mac heard a guest advertise {ALAB_SERVICE}: {}",
+            heard.others.join(", ")
+        )),
+    }
+    Ok(())
+}
+
+/// How long each browse listens, in the guest and on this Mac.
+const BROWSE_SECS: u64 = 3;
+
+/// The transcript of a [`BROWSE_SECS`] `dns-sd -B <service> local.` in the guest (the guest
+/// helper's `browse`, `src/guest/steps.rs`), for [`guest_heard`]: "" when it left none.
+fn guest_browse(g: &Guest, service: &str) -> Result<String, Fail> {
+    g.sh(
+        &format!("{GUEST_NUX}/{GUEST_HELPER} browse {BROWSE_SECS} {GUEST_NUX} {service}"),
+        STEP,
+    )?;
+    g.read(&format!("{GUEST_NUX}/heard{service}.txt"))
+}
+
+/// The adverts of `service` the guest heard ([`guest_browse`]), each placed ([`advert::split`]):
+/// resolved in the guest on the interface it came over (the guest helper's `dns-sd`), against
+/// this Mac's own addresses, so this Mac's own registration the guest hears over tart's bridge is
+/// named apart from one the guest made. `Err` says why its browse shows none, where it did not
+/// run ([`browse_ran`]).
+fn guest_heard(g: &Guest, service: &str) -> Result<Result<advert::Split, String>, Fail> {
+    let heard = match browse_adds(&guest_browse(g, service)?) {
+        Ok(heard) => heard,
+        Err(why) => return Ok(Err(why)),
+    };
+    let out = format!("{GUEST_NUX}/resolved{service}.txt");
+    let split = advert::split(
+        &heard,
+        service,
+        &|index| Some(format!("the guest's interface {index}")),
+        &advert::this_macs_addresses(),
+        &mut |args: &[String]| {
+            let words: Vec<String> = args.iter().map(|a| crate::util::shell_quote(a)).collect();
+            g.sh(
+                &format!(
+                    "{GUEST_NUX}/{GUEST_HELPER} dns-sd {} {out} {}",
+                    advert::RESOLVE_SECS,
+                    words.join(" ")
+                ),
+                STEP,
+            )?;
+            g.read(&out)
+        },
+    )?;
+    Ok(Ok(split))
+}
+
+/// What a [`BROWSE_SECS`] `dns-sd -B <service> local.` on this Mac heard (its transcript, under
+/// `run`), for [`host_guests`]; `Err` says why it shows no browse that ran ([`browse_ran`]).
+fn host_heard(run: &Path, service: &str) -> Result<Result<String, String>, Fail> {
+    let heard = host_dns_sd(
+        &run.join(format!("host-browse{service}.txt")),
+        &["-B".to_owned(), service.to_owned(), "local.".to_owned()],
+        BROWSE_SECS,
+    )?;
+    Ok(browse_ran(&heard).map(|()| heard))
+}
+
+/// The adverts of `service` this Mac heard over a tart bridge ([`host_heard`], [`bridge_heard`]),
+/// each placed ([`advert::split`]): resolved here on the bridge it came over, against this Mac's
+/// own addresses. Another's is a guest's; this Mac's own is a registration of its own that
+/// mDNSResponder announces on the bridge as on every interface. `Err` says why this Mac's browse
+/// shows none, where it did not run.
+fn host_guests(run: &Path, service: &str) -> Result<Result<advert::Split, String>, Fail> {
+    let transcript = match host_heard(run, service)? {
+        Ok(transcript) => transcript,
+        Err(why) => return Ok(Err(why)),
+    };
+    let file = run.join(format!("host-resolved{service}.txt"));
+    let split = advert::split(
+        &bridge_heard(&transcript, &crate::sys::interface_name),
+        service,
+        &crate::sys::interface_name,
+        &advert::this_macs_addresses(),
+        &mut |args: &[String]| host_dns_sd(&file, args, advert::RESOLVE_SECS),
+    )?;
+    Ok(Ok(split))
+}
+
+/// One `dns-sd ARGS...` on this Mac for `secs`, under `script -q -t 0` into `file`, then its
+/// group killed: its transcript ("" when it left none). `script -t 0` writes the transcript at
+/// each line: with its default 30 s flush, the group's kill left it empty, which read as
+/// "nothing heard" (measured 2026-10-28).
+fn host_dns_sd(file: &Path, args: &[String], secs: u64) -> Result<String, Fail> {
+    let _ = std::fs::remove_file(file);
+    let mut child = aterm_uds::spawnfd::command("/usr/bin/script")
+        .args(["-q", "-t", "0"])
+        .arg(file)
+        .arg("/usr/bin/dns-sd")
+        .args(args)
         .setsid(true)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| Fail::die(format!("dns-sd on this Mac: {e}")))?;
-    stop::sleep(Duration::from_secs(3))?;
-    let _ = crate::sys::kill_group(i32::try_from(browse.id()).unwrap_or(0), libc::SIGTERM);
-    crate::mac::reap_within(&mut browse, STEP);
-    let heard = std::fs::read_to_string(&file).unwrap_or_default();
-    let from_guests = guest_adverts(&heard, &crate::sys::interface_name);
-    if from_guests.is_empty() {
-        row.cell("production adverts from guests", Value::Text("none".into()));
-    } else {
-        row.fail(format!(
-            "this Mac heard a guest advertise {ALAB_SERVICE}: {}",
-            from_guests.join(", ")
-        ));
-    }
-    Ok(())
+    stop::sleep(Duration::from_secs(secs))?;
+    let _ = crate::sys::kill_group(i32::try_from(child.id()).unwrap_or(0), libc::SIGTERM);
+    crate::mac::reap_within(&mut child, STEP);
+    Ok(std::fs::read_to_string(file).unwrap_or_default())
 }
 
 /// What a step changed in the account: the processes init and setup restart, the Dock's pins,
@@ -2381,9 +2773,9 @@ pub const SHELL_READY: &str = "nux-shell-ready";
 /// The account's shell prompt marker: each zsh prompt appends `<epoch seconds> <pid>
 /// <TERM_PROGRAM>` to `prompts` and prints [`SHELL_READY`].
 const PROMPT_MARKER: &str =
-    "mkdir -p /tmp/aterm-nux && : > /tmp/aterm-nux/prompts && cat >> ~/.zshrc <<'EOF'
+    "mkdir -p /var/tmp/aterm-nux && : > /var/tmp/aterm-nux/prompts && cat >> ~/.zshrc <<'EOF'
 zmodload zsh/datetime
-nux_prompt() { print -r -- \"$EPOCHREALTIME $$ ${TERM_PROGRAM:-none}\" >> /tmp/aterm-nux/prompts; print -r -- nux-shell-ready }
+nux_prompt() { print -r -- \"$EPOCHREALTIME $$ ${TERM_PROGRAM:-none}\" >> /var/tmp/aterm-nux/prompts; print -r -- nux-shell-ready }
 precmd_functions+=(nux_prompt)
 EOF";
 
@@ -2991,11 +3383,7 @@ fn metrics_cells(g: &Guest, row: &mut Row, label: &str) -> Result<(), Fail> {
     let metrics = g.run(&format!("{} ctl metrics 2>&1", g.aterm), STEP)?;
     row.cell(
         format!("{label}first present"),
-        or_missing(
-            metric(&metrics, "rust_main_to_first_present_ms").map(ms_value),
-            Value::Ms,
-            "aterm ctl metrics did not answer",
-        ),
+        first_present_value(&metrics),
     );
     Ok(())
 }
@@ -3150,14 +3538,16 @@ fn launch_repairs(g: &Guest, row: &mut Row) -> Result<(), Fail> {
 }
 
 /// `first-launch`: the app opened by a person (with `--person`, one at the console), then
-/// watched until setup is done or stood still a minute ([`wait_setup`]).
+/// watched until setup is done or stood still a minute with nothing new from the person or in the
+/// app's processes ([`wait_setup`]).
 fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
     g.sh(PROMPT_MARKER, STEP)?;
     let around = Around::take(g)?;
     state_snapshot(g, row, "boot")?;
     g.watch_record("watch.txt", None)?;
+    g.watch_procs()?;
     if ask.person {
-        person_start(g)?;
+        person_start(g, ask.later)?;
     }
     // What the app asks after the ALab vault while it is watched: System State's watch for the
     // vault looks on a Mac that has none.
@@ -3171,6 +3561,7 @@ fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
     state_snapshot(g, row, "window focus")?;
     let waited_from = g.clock_ms()?.saturating_sub(open_ms);
     let done = wait_setup(g, row, "", waited_from)?;
+    reopen_cells(g, ask, row, open_ms)?;
     percentile_cells(g, row, "during setup: ")?;
     let mdns = stop_mdns(g)?;
     row.cell(
@@ -3206,6 +3597,7 @@ fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
             Err(why) => Value::Missing(format!("control FAILED: {why}")),
         },
     );
+    local_network_cell(g, row, open_ms)?;
     let log = g.log()?;
     if done.is_none() {
         // What the app said while setup did not finish, whole, for the run's record: the cause
@@ -3249,6 +3641,14 @@ fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
         } else {
             Value::Text(timeline(&launch.handovers, usize::MAX))
         },
+    );
+    row.cell(
+        "System State's Local Network ask",
+        or_missing(
+            launch.local_network_asked_ms,
+            Value::Ms,
+            &format!("no `system state: Local Network asked for` line {within}"),
+        ),
     );
     row.cell(
         "Full Disk Access granted",
@@ -3309,6 +3709,436 @@ fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
     Ok(())
 }
 
+/// What a first launch's row saw of System Settings' Quit & Reopen: the person's press on the
+/// sheet, and the app's processes across it ([`reopen_values`]); then what the person did on the
+/// Developer Tools page the walk opens next ([`devtools_value`]).
+fn reopen_cells(g: &Guest, ask: &Ask, row: &mut Row, open_ms: u64) -> Result<(), Fail> {
+    let procs = g.procs_read()?;
+    let person = if ask.person {
+        Some(read_person(&g.read(&format!("{GUEST_NUX}/person.txt"))?))
+    } else {
+        None
+    };
+    let presses = person.as_ref().map(reopen_presses);
+    let end_ms = g.clock_ms()?;
+    let log = g.log()?;
+    for (name, value) in reopen_values(presses.as_ref(), ask.later, &procs, &log, open_ms, end_ms) {
+        row.cell(name, value);
+    }
+    row.cell(
+        "Developer Tools",
+        devtools_value(
+            person.as_ref().map(devtools_acts).as_ref(),
+            &log,
+            open_ms,
+            end_ms,
+        ),
+    );
+    Ok(())
+}
+
+/// The start of aterm's log line for the end of a drag of the helper panel's tile
+/// (`aterm_gui::devtools_helper`): what macOS did with the drop, in its brackets.
+const DRAG_ENDED: &str = "devtools: the owner's drag of aterm ended (";
+
+/// How long after an add of the person's a System Settings password dialog is still that add's,
+/// when it comes after everything the person said of the Developer Tools page: one the page asks
+/// for comes within seconds of the add.
+const ASKED_WITHIN_MS: u64 = 60_000;
+
+/// The `Developer Tools` cell: what the person did on System Settings' Developer Tools page
+/// (`acts`; `None`: no person at the console), each time in ms after the open (`open_ms`, epoch
+/// ms on the guest's clock):
+/// - how aterm came onto the list: `aterm added by drag` (or `by +`) when the page came to hold
+///   aterm for good (the last run of states that hold it, after the person's first add: a state
+///   that held it and then lacked it again is no add), with how long after that add, and for a
+///   drag what aterm's own log (`log`) said the drop did ([`DRAG_ENDED`]; NOT MEASURED when the
+///   log holds no line from the page on); `on the list when the page came` when it held aterm
+///   before any add; or why it is not there by `end_ms` (each add and its steps, and what stopped
+///   a try);
+/// - `no drag` when the person added aterm with + alone, and why (no window showed the tile);
+/// - `password`: each password the person typed into System Settings after its first add (and
+///   before its last word of the page, or within [`ASKED_WITHIN_MS`] of its last add); `asked,
+///   not typed` for a dialog it read there and typed nothing into; `not asked` only when it had
+///   a password to type and read no dialog;
+/// - `switch on`: the person's press of aterm's switch there, or the switch as the page read it;
+/// - `page seen`: when the person first read the page.
+///
+/// A person without Accessibility reads nothing, and a page whose list did not read when the
+/// person last said it (with no add) shows nothing of aterm: both NOT MEASURED. A page the person
+/// never read is `not seen`, with how long the row watched. Pure.
+#[must_use]
+pub fn devtools_value(acts: Option<&DevtoolsActs>, log: &str, open_ms: u64, end_ms: u64) -> Value {
+    let Some(a) = acts else {
+        return Value::Missing("no person at the console (--person puts one there)".into());
+    };
+    match a.trusted {
+        Some(true) => {}
+        Some(false) => {
+            return Value::Missing(
+                "the person had no Accessibility grant, so it read no window".into(),
+            );
+        }
+        None => return Value::Missing("the person's record says none of its grants".into()),
+    }
+    let after = |at: u64| at.saturating_sub(open_ms);
+    let watched = format!("in the {} s watched", after(end_ms) / 1000);
+    let Some((seen, _)) = a.panes.first() else {
+        return Value::Text(format!("not seen {watched}"));
+    };
+    let holds = |state: &str| state.starts_with("list=holds");
+    let first_add = a.adds.first().map(|(at, _)| *at);
+    // The start of the last run of states that hold aterm, when the last state holds it.
+    let listed = {
+        let mut since = None;
+        for (at, state) in a
+            .panes
+            .iter()
+            .filter(|(at, _)| first_add.is_none_or(|t| *at >= t))
+        {
+            since = if holds(state) {
+                since.or(Some(*at))
+            } else {
+                None
+            };
+        }
+        since
+    };
+    let from_page: Vec<_> = log_lines(log)
+        .into_iter()
+        .filter(|l| l.at_ms >= *seen)
+        .collect();
+    // What aterm's log said of a drag's drop.
+    let said = |add: Add| match add {
+        Add::Plus => String::new(),
+        Add::Drag if from_page.is_empty() => {
+            " (aterm's log: NOT MEASURED, no line of it from the page on)".to_owned()
+        }
+        Add::Drag => match from_page.iter().find(|l| l.message.starts_with(DRAG_ENDED)) {
+            Some(l) => {
+                let said = &l.message[DRAG_ENDED.len()..];
+                format!(" (aterm's log: {})", said.strip_suffix(')').unwrap_or(said))
+            }
+            None => " (aterm's log: no drag ended)".to_owned(),
+        },
+    };
+    let mut parts = Vec::new();
+    match (first_add, listed) {
+        (None, Some(at)) if at == *seen => {
+            parts.push("aterm on the list when the page came".into())
+        }
+        (None, Some(at)) => parts.push(format!(
+            "aterm on the list {} ms, with no add by the person",
+            after(at)
+        )),
+        (Some(_), Some(at)) => {
+            let (t, add) = a
+                .adds
+                .iter()
+                .rev()
+                .find(|(t, _)| *t <= at)
+                .copied()
+                .unwrap_or(a.adds[0]);
+            parts.push(format!(
+                "aterm added by {} {} ms, {} ms after the {}{}",
+                add.words(),
+                after(at),
+                at.saturating_sub(t),
+                add.words(),
+                said(add)
+            ));
+        }
+        (Some(_), None) => {
+            let tries = a
+                .adds
+                .iter()
+                .map(|(t, add)| format!("{} pressed {} ms{}", add.words(), after(*t), said(*add)))
+                .chain(a.steps.iter().map(|(t, step)| {
+                    let step = match step.as_str() {
+                        DEVTOOLS_GOTO => "the path's Return",
+                        DEVTOOLS_OPEN => "Open",
+                        DEVTOOLS_CANCEL => "Cancel",
+                        other => other,
+                    };
+                    format!("{step} {} ms", after(*t))
+                }))
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!("aterm not on the list {watched}: {tries}"));
+        }
+        (None, None) => {
+            if let Some(described) = &a.unread {
+                return Value::Missing(format!(
+                    "the page's list did not read (it read {described}); page seen {} ms",
+                    after(*seen)
+                ));
+            }
+            parts.push(format!("aterm not added {watched}"));
+        }
+    }
+    let note = |start: &str| {
+        a.notes
+            .iter()
+            .map(|(_, note)| note.as_str())
+            .find(|note| note.starts_with(start))
+    };
+    if first_add.is_some() && !a.adds.iter().any(|(_, add)| *add == Add::Drag) {
+        parts.push(match note("no-tile: ") {
+            Some(why) => format!("no drag: {}", &why["no-tile: ".len()..]),
+            None => "no drag".to_owned(),
+        });
+    }
+    let why: Vec<&str> = a
+        .notes
+        .iter()
+        .map(|(_, note)| note.as_str())
+        .filter(|note| {
+            [
+                "skip:",
+                "open-panel not seen",
+                "open-panel went",
+                "stray open-panel",
+            ]
+            .iter()
+            .any(|start| note.starts_with(start))
+        })
+        .map(|note| note.split_once(": AX").map_or(note, |(head, _)| head))
+        .collect();
+    if listed.is_none() && !why.is_empty() {
+        parts.push(why.join(", "));
+    }
+    if let Some(t) = first_add {
+        let last_word = a
+            .panes
+            .iter()
+            .map(|(at, _)| *at)
+            .chain(a.notes.iter().map(|(at, _)| *at))
+            .chain(a.steps.iter().map(|(at, _)| *at))
+            .chain(a.switches.iter().copied())
+            .chain(a.adds.iter().map(|(at, _)| *at))
+            .max()
+            .unwrap_or(t);
+        let last_add = a.adds.last().map_or(t, |(at, _)| *at);
+        let its = |at: u64| at >= t && (at <= last_word || at <= last_add + ASKED_WITHIN_MS);
+        let ms = |ats: &[u64]| {
+            ats.iter()
+                .filter(|at| its(**at))
+                .map(|at| format!("{} ms", after(*at)))
+                .collect::<Vec<_>>()
+        };
+        let (typed, asked, skipped) = (ms(&a.passwords), ms(&a.asked), ms(&a.skipped));
+        parts.push(if !typed.is_empty() {
+            format!("password {}", typed.join(", "))
+        } else if a.password != Some(true) {
+            "password NOT MEASURED (the person had none to type)".to_owned()
+        } else if !skipped.is_empty() {
+            format!(
+                "password asked {}, not typed (the focus read a text field not secure)",
+                skipped.join(", ")
+            )
+        } else if !asked.is_empty() {
+            format!("password asked {}, not typed", asked.join(", "))
+        } else {
+            "password not asked".to_owned()
+        });
+    }
+    let last = a.panes.last().map_or("", |(_, state)| state.as_str());
+    let switch = last.split_once("switch=").map_or("?", |(_, s)| s);
+    match a.switches.first() {
+        Some(at) => parts.push(format!(
+            "switch on {} ms{}",
+            after(*at),
+            if switch == "on" {
+                String::new()
+            } else {
+                format!(" (then read {switch})")
+            }
+        )),
+        None if listed.is_some() && switch == "on" => parts.push("switch on already".into()),
+        None if listed.is_some() => parts.push(format!("switch {switch}, not pressed")),
+        None => {}
+    }
+    parts.push(format!("page seen {} ms", after(*seen)));
+    Value::Text(parts.join("; "))
+}
+
+/// The cells of System Settings' Quit & Reopen, each time in ms after the open (`open_ms`, epoch
+/// ms on the guest's clock, as every record's):
+/// - `Quit & Reopen sheet`: each press the person gave it (`presses`; `None`: no person at the
+///   console), and the answer the row asked of it (`later`).
+/// - `aterm's quit question`: each Quit the person pressed in the app's question before it quits,
+///   after its Quit & Reopen press before it; not answered without one (and with `--later`).
+/// - `aterm processes`: each app process the watch (`procs`) saw, its start and its going.
+/// - `aterm quit`: when the first one went, after the person's press before it (on the sheet or
+///   on the app's question).
+/// - `aterm reopened`: the next one's start and pid, after the quit.
+/// - `reopened pid's first log line`: that pid's first line in `aterm.log` (`log`).
+///
+/// A watch with no record, or a process table it could not read, is NOT MEASURED; a quit or
+/// reopen the watch did not see by `end_ms` is said as such, with how long it watched. Pure.
+#[must_use]
+pub fn reopen_values(
+    presses: Option<&ReopenPresses>,
+    later: bool,
+    procs: &Procs,
+    log: &str,
+    open_ms: u64,
+    end_ms: u64,
+) -> Vec<(String, Value)> {
+    let after = |at: u64| at.saturating_sub(open_ms);
+    let watched = format!("in the {} s watched", after(end_ms) / 1000);
+    let answer = if later {
+        "Later (--later)"
+    } else {
+        "Quit & Reopen"
+    };
+    let no_person = || Value::Missing("no person at the console (--person puts one there)".into());
+    // The sheet's button, as `sheet_presses` names its press.
+    let reopen = "Quit & Reopen";
+    // The person's last Quit & Reopen press at or before `at`.
+    let reopened_before = |p: &ReopenPresses, at: u64| {
+        p.sheet
+            .iter()
+            .rev()
+            .find(|(t, what)| *t <= at && what == reopen)
+            .map(|(t, _)| *t)
+    };
+    let mut out = vec![
+        (
+            "Quit & Reopen sheet".to_owned(),
+            match presses.map(|p| p.sheet.as_slice()) {
+                None => no_person(),
+                Some([]) => {
+                    Value::Text(format!("not seen {watched} (the person answers {answer})"))
+                }
+                Some(presses) => Value::Text(format!(
+                    "{} (the person answers {answer})",
+                    presses
+                        .iter()
+                        .map(|(at, what)| format!("{what} pressed {} ms", after(*at)))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )),
+            },
+        ),
+        (
+            "aterm's quit question".to_owned(),
+            match presses {
+                None => no_person(),
+                Some(p) if p.quit.is_empty() && p.sheet.iter().all(|(_, what)| what != reopen) => {
+                    Value::Text(format!(
+                        "not answered: the person answers it only after its own {reopen}"
+                    ))
+                }
+                Some(p) if p.quit.is_empty() => Value::Text(format!("not seen {watched}")),
+                Some(p) => Value::Text(
+                    p.quit
+                        .iter()
+                        .map(|&at| {
+                            let since = reopened_before(p, at).map_or_else(String::new, |t| {
+                                format!(", {} ms after {reopen}", at - t)
+                            });
+                            format!("Quit pressed {} ms{since}", after(at))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                ),
+            },
+        ),
+    ];
+    let names = ["aterm processes", "aterm quit", "aterm reopened"];
+    let missing = match (&procs.error, procs.started) {
+        (Some(why), _) => Some(format!("the process watch: {why}")),
+        (None, None) => Some("the process watch wrote nothing".to_owned()),
+        (None, Some(_)) => None,
+    };
+    if let Some(why) = missing {
+        out.extend(names.map(|n| (n.to_owned(), Value::Missing(why.clone()))));
+        return out;
+    }
+    let runs = runs(procs);
+    let Some(first) = runs.first() else {
+        let why = format!("the process watch saw no aterm app process {watched}");
+        out.extend(names.map(|n| (n.to_owned(), Value::Missing(why.clone()))));
+        return out;
+    };
+    out.push((
+        names[0].to_owned(),
+        Value::Text(
+            runs.iter()
+                .map(|r| {
+                    let down = r
+                        .down_ms
+                        .map_or_else(|| "the end".to_owned(), |d| format!("{} ms", after(d)));
+                    format!("pid {} {} ms to {down}", r.pid, after(r.start_ms))
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+        ),
+    ));
+    let Some(quit) = first.down_ms else {
+        out.push((
+            names[1].to_owned(),
+            Value::Text(format!("none: pid {} ran to the end {watched}", first.pid)),
+        ));
+        out.push((
+            names[2].to_owned(),
+            Value::Text("none: nothing quit".to_owned()),
+        ));
+        return out;
+    };
+    let pressed = presses
+        .and_then(|p| {
+            p.sheet
+                .iter()
+                .map(|(at, what)| (*at, what.as_str()))
+                .chain(p.quit.iter().map(|&at| (at, "Quit on aterm's question")))
+                .filter(|(at, _)| *at <= quit)
+                .max_by_key(|(at, _)| *at)
+        })
+        .map_or_else(String::new, |(at, what)| {
+            format!(", {} ms after {what}", quit - at)
+        });
+    out.push((
+        names[1].to_owned(),
+        Value::Text(format!(
+            "pid {} gone {} ms{pressed}",
+            first.pid,
+            after(quit)
+        )),
+    ));
+    let Some(next) = runs.get(1) else {
+        out.push((
+            names[2].to_owned(),
+            Value::Text(format!(
+                "none: no aterm app process started again {watched}"
+            )),
+        ));
+        return out;
+    };
+    out.push((
+        names[2].to_owned(),
+        Value::Text(format!(
+            "pid {} started {} ms, {} ms after the quit",
+            next.pid,
+            after(next.start_ms),
+            next.start_ms.saturating_sub(quit)
+        )),
+    ));
+    out.push((
+        "reopened pid's first log line".to_owned(),
+        or_missing(
+            log_lines(log)
+                .iter()
+                .find(|l| l.pid == next.pid && l.at_ms >= next.start_ms)
+                .map(|l| after(l.at_ms)),
+            Value::Ms,
+            &format!("aterm.log has no line from pid {} {watched}", next.pid),
+        ),
+    ));
+    out
+}
+
 /// A person-stage row's person: with `--person`, what it did and whether its input reset
 /// `HIDIdleTime` (else the person stages are NOT MEASURED, never a pass); without, that no
 /// person was there.
@@ -3329,10 +4159,59 @@ fn person_stage_cells(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
     Ok(())
 }
 
+/// Which process macOS held back to ask its Local Network question since the open (`open_ms`,
+/// epoch ms), from the guest's unified log, each by its command as `ps` reads it now: the
+/// question System State's step is meant to ask first.
+fn local_network_cell(g: &Guest, row: &mut Row, open_ms: u64) -> Result<(), Fail> {
+    let since_s = g.clock_ms()?.saturating_sub(open_ms) / 1000 + 5;
+    let log = g.sh(
+        &format!(
+            "/usr/bin/log show --last {since_s}s --info --style ndjson --predicate \
+             'subsystem == \"com.apple.networkextension\" AND eventMessage CONTAINS \"local network blocked notification\"' \
+             2>/dev/null || true"
+        ),
+        STEP,
+    )?;
+    let blocks: Vec<(Option<u64>, u32)> = local_network_blocks(&log)
+        .into_iter()
+        .filter(|(at, _)| at.is_none_or(|at| at >= open_ms))
+        .collect();
+    let pids: Vec<String> = blocks.iter().map(|(_, pid)| pid.to_string()).collect();
+    let commands = if pids.is_empty() {
+        BTreeMap::new()
+    } else {
+        ps_commands(&g.sh(
+            &format!("ps -o pid=,command= -p {} || true", pids.join(",")),
+            STEP,
+        )?)
+    };
+    row.cell(
+        "Local Network alert raised by",
+        Value::Text(if blocks.is_empty() {
+            "none".to_owned()
+        } else {
+            blocks
+                .iter()
+                .map(|(at, pid)| {
+                    let who = commands
+                        .get(pid)
+                        .map_or_else(|| format!("pid {pid} (gone)"), |c| squeeze(c, 80));
+                    match at {
+                        Some(at) => format!("{who} {} ms", at.saturating_sub(open_ms)),
+                        None => who,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        }),
+    );
+    Ok(())
+}
+
 /// Main to first present (`rust_main_to_first_present_ms` in `aterm ctl metrics`).
 fn first_present_ms(g: &Guest) -> Result<Option<u64>, Fail> {
     let metrics = g.run(&format!("{} ctl metrics 2>&1", g.aterm), STEP)?;
-    Ok(metric(&metrics, "rust_main_to_first_present_ms").map(ms_value))
+    Ok(first_present(&metrics).ok().flatten())
 }
 
 /// Each stage start the progress record's watch saw, in ms after the open (`open_ms`, epoch ms),
@@ -3878,6 +4757,7 @@ fn run_row(
         Scenario::AppLaunch => app_launch(&g, &mut row),
         Scenario::Vault => vault(&g, &mut row),
         Scenario::VaultLocal => vault_local(&g, &mut row),
+        Scenario::VaultPhrase => phrase::vault_phrase(&g, run, &mut row),
         Scenario::Successor => successor(&g, &mut row),
         Scenario::InstallSh => install_sh(&g, &mut row, None, true),
         Scenario::KillStage => fault::kill_stage(&g, &mut row),
@@ -3924,8 +4804,9 @@ pub fn bin_executable(json_lines: &str, name: &str) -> Option<PathBuf> {
 }
 
 /// Build the guest helper here (`aterm-lab-guest`, this package's other binary) and put it in the
-/// share: the first 12 hex digits of its digest, which name a person base made with it.
-fn build_helper(share: &Path) -> Result<String, Fail> {
+/// share, where a person base's preparation and each person row install it from
+/// ([`crate::mac::person_install`]).
+fn build_helper(share: &Path) -> Result<(), Fail> {
     let out = crate::util::targo(&[
         "--unverified",
         "build",
@@ -3949,8 +4830,7 @@ fn build_helper(share: &Path) -> Result<String, Fail> {
     };
     let copy = share.join(GUEST_HELPER);
     std::fs::copy(&built, &copy).map_err(|e| format!("{}: {e}", built.display()))?;
-    let digest = crate::sys::digest_file(&copy, GUEST_HELPER.as_bytes())?;
-    Ok(digest.hex().chars().take(12).collect())
+    Ok(())
 }
 
 /// Refuse (NOT RUN) to make `base` from `image` when tart must pull the image first and this Mac
@@ -4052,7 +4932,7 @@ pub fn cmd_nux(args: &[String]) -> Res {
     let install = paths().repo.join("tools/install.sh");
     std::fs::copy(&install, share.join("install.sh"))
         .map_err(|e| format!("{}: {e}", install.display()))?;
-    let digest = build_helper(&share)?;
+    build_helper(&share)?;
     let app = if ask.scenarios.iter().any(|s| s.needs_app()) {
         Some(stage_app(ask.app.as_deref(), run, &share)?)
     } else {
@@ -4061,7 +4941,7 @@ pub fn cmd_nux(args: &[String]) -> Res {
     let prep = crate::mac::Prep {
         fda: false,
         no_clt: ask.no_clt,
-        person: ask.person.then(|| (GUEST_HELPER.to_owned(), digest)),
+        person: ask.person.then(|| GUEST_HELPER.to_owned()),
     };
     pull_room(&tart, &ask.image, &crate::mac::prep_name(&ask.image, &prep))?;
     let base =
@@ -4123,8 +5003,14 @@ pub fn cmd_nux(args: &[String]) -> Res {
     Ok(exit_code(&rows))
 }
 
+#[path = "mac_nux_advert.rs"]
+mod advert;
+
 #[path = "mac_nux_fault.rs"]
 mod fault;
+
+#[path = "mac_nux_phrase.rs"]
+mod phrase;
 
 #[cfg(test)]
 mod tests {
@@ -4234,8 +5120,18 @@ mod tests {
             golden.into(),
         )
         .unwrap();
-        assert!(ask.person && ask.no_clt && !ask.vanilla);
+        assert!(ask.person && ask.no_clt && !ask.vanilla && !ask.later);
         assert_eq!((ask.repeat, ask.image.as_str()), (3, golden));
+        // Later is the person's answer: it takes a person.
+        assert!(
+            parse(&args(&["--person", "--later"]), golden.into())
+                .unwrap()
+                .later
+        );
+        assert_eq!(
+            parse(&args(&["--later"]), golden.into()).unwrap_err().code,
+            2
+        );
         // The vanilla image is the -base image's sibling: the same macOS, no Command Line Tools.
         let ask = parse(&args(&["--vanilla"]), golden.into()).unwrap();
         assert_eq!(
@@ -4339,17 +5235,34 @@ mod tests {
 
     #[test]
     fn the_alab_guard_fails_a_row_that_reached_the_vault_or_heard_a_guest_advert() {
-        let unreached = alab_probe_verdict("none", "000\n", 0).unwrap();
+        let none = Ok(advert::Split::default());
+        let unreached = alab_probe_verdict("none", "000\n", &none).unwrap();
         assert!(
             unreached.starts_with("Unreached (alab-secrets.local unresolved"),
             "{unreached}"
         );
-        // A name that resolves but nothing answers (the pf null route) is still unreached.
-        assert!(alab_probe_verdict("192.168.64.1", "000", 0).is_ok());
-        // NEGATIVE CONTROLS: any HTTP answer, or any advert, fails the row.
-        assert!(alab_probe_verdict("192.168.64.1", "200", 0).is_err());
-        assert!(alab_probe_verdict("none", "403", 0).is_err());
-        assert!(alab_probe_verdict("none", "000", 1).is_err());
+        // A name that resolves but nothing answers (the pf null route) is still unreached, and
+        // so is this Mac's own vault heard over the bridge, whose port pf refuses.
+        assert!(alab_probe_verdict("192.168.64.1", "000", &none).is_ok());
+        let this_macs = Ok(advert::Split {
+            others: Vec::new(),
+            this_macs: vec!["alab-secrets heard over the guest's interface 6".into()],
+        });
+        assert!(alab_probe_verdict("192.168.1.242", "000", &this_macs).is_ok());
+        // NEGATIVE CONTROLS: any HTTP answer, any advert that is not this Mac's, or a browse
+        // that did not run fails the row.
+        let another = Ok(advert::Split {
+            others: vec!["nux lab on the guest's interface 1 (nux.local 192.168.64.3)".into()],
+            this_macs: Vec::new(),
+        });
+        assert!(alab_probe_verdict("192.168.64.1", "200", &none).is_err());
+        assert!(alab_probe_verdict("none", "403", &none).is_err());
+        assert!(alab_probe_verdict("none", "000", &another).is_err());
+        assert_eq!(
+            alab_probe_verdict("none", "000", &Err("its transcript is empty".into())).unwrap_err(),
+            "the guest's browse of _alab-vault._tcp did not run (its transcript is empty), so no \
+             advert is unproven"
+        );
 
         let browse = "Browsing for _alab-vault._tcp.local.\n\
                       DATE: ---Mon 26 Oct 2026---\n \
@@ -4365,9 +5278,73 @@ mod tests {
             9 => Some("bridge0".to_owned()),
             _ => None,
         };
-        // The office's own vault on en0 and a Thunderbolt bridge are not a guest's.
-        assert_eq!(guest_adverts(browse, &name_of), ["nux lab on bridge100"]);
-        assert!(guest_adverts(&browse.replace("15 local.", "77 local."), &name_of).is_empty());
+        // The office's own vault on en0 and a Thunderbolt bridge are not on tart's bridge.
+        let on_bridge = bridge_heard(browse, &name_of);
+        assert_eq!(on_bridge.len(), 1, "{on_bridge:?}");
+        assert_eq!(
+            (on_bridge[0].instance.as_str(), on_bridge[0].interface),
+            ("nux lab", 15)
+        );
+        assert!(bridge_heard(&browse.replace("15 local.", "77 local."), &name_of).is_empty());
+    }
+
+    /// A browse counts only once its transcript shows it ran: a quiet one (no header, as `dns-sd`
+    /// prints the header with its first answer) is zero adverts, while an empty transcript (a
+    /// `script` killed before it flushed) or a failed call is no count at all.
+    #[test]
+    fn a_browse_that_did_not_run_proves_no_advert_absent() {
+        // As `script -q -t 0` wrote them on this Mac (2026-10-28): its `^D^H^H` and `\r`s kept.
+        let quiet = "\u{4}\u{8}\u{8}Browsing for _nux-none-t0._tcp.local.\r\n\
+                     DATE: ---Wed 28 Oct 2026---\r\n\
+                     20:23:54.199  ...STARTING...\r\n";
+        assert_eq!(browse_adds(quiet), Ok(Vec::new()));
+        let heard = format!(
+            "{quiet}Timestamp     A/R    Flags  if Domain               Service Type         Instance Name\r\n\
+             20:23:54.300  Add        3  15 local.               _alab._tcp.          nux lab\r\n\
+             20:23:54.301  Rmv        0  15 local.               _alab._tcp.          nux lab\r\n"
+        );
+        assert_eq!(browse_adds(&heard).map(|h| h.len()), Ok(1));
+        assert_eq!(browse_ran(&heard), Ok(()));
+
+        // NEGATIVE CONTROLS: what a browse that never looked leaves reads as unread, never 0.
+        assert_eq!(browse_adds(""), Err("its transcript is empty".to_owned()));
+        assert_eq!(
+            browse_adds("\u{4}\u{8}\u{8}\r\n"),
+            Err("its transcript is empty".to_owned())
+        );
+        assert_eq!(
+            browse_adds("Browsing for _alab._tcp.local.\r\n"),
+            Err("no browse started: Browsing for _alab._tcp.local.".to_owned())
+        );
+        assert_eq!(
+            browse_adds("DNSService call failed -65563\r\n"),
+            Err("dns-sd failed: DNSService call failed -65563".to_owned())
+        );
+        let errored = format!("{quiet}20:23:55.000  Error code -65537\r\n");
+        assert_eq!(
+            browse_adds(&errored),
+            Err("dns-sd failed: 20:23:55.000  Error code -65537".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_local_network_asker_reads_from_the_unified_log_and_ps() {
+        let blocks = [
+            r#"{"timestamp":"2026-10-28 14:18:24.716000+0000","eventMessage":"Got local network blocked notification: pid: 777, uuid: 758D74AB-18EA-3966-BDA9-9DB45651C793, bundle_id: (null)"}"#,
+            r#"{"timestamp":"2026-10-28 14:18:24.716500+0000","eventMessage":"LocalNetwork: found bundle id com.aterm.aterm by PID"}"#,
+        ]
+        .join("\n");
+        assert_eq!(
+            local_network_blocks(&blocks),
+            [(Some(1_793_197_104_716), 777)]
+        );
+        let ps = "  777 /Applications/aterm.app/Contents/MacOS/aterm\n  827 /Applications/aterm.app/Contents/MacOS/aterm acaffiene serve\n";
+        let commands = ps_commands(ps);
+        assert_eq!(
+            commands.get(&777).map(String::as_str),
+            Some("/Applications/aterm.app/Contents/MacOS/aterm")
+        );
+        assert_eq!(commands.len(), 2);
     }
 
     #[test]
@@ -4574,6 +5551,354 @@ mod tests {
     }
 
     #[test]
+    fn the_developer_tools_cell_says_how_aterm_came_onto_the_list_its_password_and_its_switch() {
+        let open = 1_000_000;
+        let raw = |record: &str, log: &str| {
+            devtools_value(
+                Some(&devtools_acts(&read_person(record))),
+                log,
+                open,
+                1_400_000,
+            )
+            .to_string()
+        };
+        let person = "person 1000000 trusted=yes post=yes password=yes\n";
+        let cell = |record: &str, log: &str| raw(&format!("{person}{record}"), log);
+        let page = "devtools 1248000 120 pane list=lacks switch=none\n\
+                    devtools 1248100 120 drag tile=2082 from=1100,300 to=600,420\n\
+                    click 1254000 120 System Settings devtools-drag\n";
+        let taken = "1793243999.000 2082 INFO aterm_gui::devtools_helper: x\n\
+                     1254.000 2082 INFO aterm_gui::devtools_helper: devtools: the owner's drag of aterm ended (operation 1: taken)\n";
+        // The drop took: a password, aterm on the list, its switch read off and pressed on.
+        assert_eq!(
+            cell(
+                &format!(
+                    "{page}typed 1258000 120 account 5 Managed_via_Tart unwatched System Settings\n\
+                     devtools 1259000 120 pane list=holds switch=off\n\
+                     click 1265000 120 System Settings devtools-switch\n\
+                     devtools 1265500 120 pane list=holds switch=on\n"
+                ),
+                taken
+            ),
+            "aterm added by drag 259000 ms, 5000 ms after the drag (aterm's log: operation 1: \
+             taken); password 258000 ms; switch on 265000 ms; page seen 248000 ms"
+        );
+        // On the list with its switch on, no password asked.
+        assert_eq!(
+            cell(
+                &format!("{page}devtools 1255000 120 pane list=holds switch=on\n"),
+                taken
+            ),
+            "aterm added by drag 255000 ms, 1000 ms after the drag (aterm's log: operation 1: \
+             taken); password not asked; switch on already; page seen 248000 ms"
+        );
+        // The drop did not take, and + did: the add is the +'s.
+        let plus = format!(
+            "{page}click 1276000 120 System Settings devtools-plus\n\
+             devtools 1277000 120 open-panel 120 System Settings: AXSheet; AXButton \"Open\"\n\
+             click 1295000 120 System Settings devtools-goto\n\
+             click 1301000 120 System Settings devtools-open\n\
+             devtools 1302000 120 pane list=holds switch=on\n"
+        );
+        let not_taken = "1254.000 2082 INFO aterm_gui::devtools_helper: devtools: the owner's drag of aterm ended (operation 0: not taken)\n";
+        assert_eq!(
+            cell(&plus, not_taken),
+            "aterm added by + 302000 ms, 26000 ms after the +; password not asked; switch on \
+             already; page seen 248000 ms"
+        );
+        // Negative controls. Never on the list: each try, its steps and why it stopped; a drag
+        // aterm's log never ended.
+        assert_eq!(
+            cell(
+                &format!(
+                    "{page}click 1276000 120 System Settings devtools-plus\n\
+                     devtools 1296000 120 open-panel not seen within 20 s of +\n"
+                ),
+                ""
+            ),
+            "aterm not on the list in the 400 s watched: drag pressed 254000 ms (aterm's log: \
+             NOT MEASURED, no line of it from the page on), + pressed 276000 ms; open-panel not \
+             seen within 20 s of +; password not asked; page seen 248000 ms"
+        );
+        // aterm's log read from the page on, with no drag's end in it.
+        assert_eq!(
+            cell(
+                page,
+                "1793243999.000 2082 INFO aterm_gui::devtools_helper: x\n"
+            ),
+            "aterm not on the list in the 400 s watched: drag pressed 254000 ms (aterm's log: no \
+             drag ended); password not asked; page seen 248000 ms"
+        );
+        // A list that read as holding aterm once (an open panel's file view, a sheet closing) and
+        // lacked it again: no add.
+        assert_eq!(
+            cell(
+                &format!(
+                    "{page}devtools 1255000 120 pane list=holds switch=off\n\
+                     devtools 1255250 120 pane list=lacks switch=none\n"
+                ),
+                taken
+            ),
+            "aterm not on the list in the 400 s watched: drag pressed 254000 ms (aterm's log: \
+             operation 1: taken); password not asked; page seen 248000 ms"
+        );
+        // On the list later with no add of the person's, its switch on already.
+        assert_eq!(
+            cell(
+                "devtools 1248000 120 pane list=lacks switch=none\n\
+                 devtools 1250000 120 pane list=holds switch=on\n",
+                ""
+            ),
+            "aterm on the list 250000 ms, with no add by the person; switch on already; page seen \
+             248000 ms"
+        );
+        // Added with + alone, no tile to drag; its switch read off, then pressed and read off.
+        let plus_only = "devtools 1248000 120 pane list=lacks switch=none\n\
+                         devtools 1268000 120 no-tile: no window of the app (1 running) shows the \
+                         helper panel's tile\n\
+                         click 1268100 120 System Settings devtools-plus\n\
+                         click 1275000 120 System Settings devtools-goto\n\
+                         click 1276000 120 System Settings devtools-open\n\
+                         devtools 1277000 120 pane list=holds switch=off\n";
+        assert_eq!(
+            cell(plus_only, ""),
+            "aterm added by + 277000 ms, 8900 ms after the +; no drag: no window of the app (1 \
+             running) shows the helper panel's tile; password not asked; switch off, not pressed; \
+             page seen 248000 ms"
+        );
+        assert_eq!(
+            cell(
+                &format!("{plus_only}click 1280000 120 System Settings devtools-switch\n"),
+                ""
+            ),
+            "aterm added by + 277000 ms, 8900 ms after the +; no drag: no window of the app (1 \
+             running) shows the helper panel's tile; password not asked; switch on 280000 ms \
+             (then read off); page seen 248000 ms"
+        );
+        // A try that stopped: its steps by name; a password dialog read and not typed into; a
+        // password typed on another page long after is not this page's.
+        let stopped = "devtools 1248000 120 pane list=lacks switch=none\n\
+                       click 1268100 120 System Settings devtools-plus\n\
+                       skip 1270000 120 System Settings: the administrator's password not typed\n\
+                       click 1275000 120 System Settings devtools-goto\n\
+                       devtools 1295000 120 skip: the open panel's Open stayed off after the \
+                       path's Return\n\
+                       click 1295100 120 System Settings devtools-cancel\n\
+                       typed 1390000 120 account 5 Managed_via_Tart unwatched System Settings\n";
+        assert_eq!(
+            cell(stopped, ""),
+            "aterm not on the list in the 400 s watched: + pressed 268100 ms, the path's Return \
+             275000 ms, Cancel 295100 ms; no drag; skip: the open panel's Open stayed off after \
+             the path's Return; password asked 270000 ms, not typed (the focus read a text field \
+             not secure); page seen 248000 ms"
+        );
+        assert_eq!(
+            cell(
+                "devtools 1248000 120 pane list=lacks switch=none\n\
+                 click 1268100 120 System Settings devtools-plus\n\
+                 dialog 1269000 120 System Settings: AXSheet; AXTextField/AXSecureTextField \
+                 (secure)\n",
+                ""
+            ),
+            "aterm not on the list in the 400 s watched: + pressed 268100 ms; no drag; password \
+             asked 269000 ms, not typed; page seen 248000 ms"
+        );
+        // A person with no password to type reads no password dialog: never "not asked".
+        assert_eq!(
+            raw(
+                &format!("person 1000000 trusted=yes post=yes password=no\n{plus_only}"),
+                ""
+            ),
+            "aterm added by + 277000 ms, 8900 ms after the +; no drag: no window of the app (1 \
+             running) shows the helper panel's tile; password NOT MEASURED (the person had none \
+             to type); switch off, not pressed; page seen 248000 ms"
+        );
+        // A person without Accessibility, or with no grants line, read nothing.
+        assert_eq!(
+            raw("person 1000000 trusted=no post=yes password=yes\n", ""),
+            "NOT MEASURED (the person had no Accessibility grant, so it read no window)"
+        );
+        assert_eq!(
+            raw(plus_only, ""),
+            "NOT MEASURED (the person's record says none of its grants)"
+        );
+        assert_eq!(
+            cell("devtools 1248000 120 pane list=holds switch=on\n", taken),
+            "aterm on the list when the page came; switch on already; page seen 248000 ms",
+            "on the list before any add: no add, no password said"
+        );
+        assert_eq!(
+            cell(
+                "devtools 1248000 120 pane list=unread switch=none: AXGroup\n",
+                ""
+            ),
+            "NOT MEASURED (the page's list did not read (it read AXGroup); page seen 248000 ms)",
+            "judged from the last state"
+        );
+        assert_eq!(
+            cell(
+                "devtools 1248000 120 pane list=unread switch=none: AXGroup\n\
+                 devtools 1249000 120 pane list=lacks switch=none\n",
+                ""
+            ),
+            "aterm not added in the 400 s watched; page seen 248000 ms",
+            "a list that read in the end"
+        );
+        assert_eq!(
+            cell(
+                "devtools 1248000 120 pane list=lacks switch=none\n\
+                 devtools 1248100 120 skip: no --app, so the person knows no aterm to add\n",
+                ""
+            ),
+            "aterm not added in the 400 s watched; skip: no --app, so the person knows no aterm \
+             to add; page seen 248000 ms"
+        );
+        // Another page's switch and the Full Disk Access password before the page are not it.
+        assert_eq!(
+            cell(
+                "click 1100000 120 System Settings switch:aterm\n\
+                 typed 1120000 120 account 5 Managed_via_Tart unwatched System Settings\n",
+                taken
+            ),
+            "not seen in the 400 s watched"
+        );
+        assert_eq!(
+            devtools_value(None, "", open, 1_400_000).to_string(),
+            "NOT MEASURED (no person at the console (--person puts one there))"
+        );
+    }
+
+    #[test]
+    fn a_quit_and_reopen_reads_as_the_press_the_quit_the_reopen_and_the_new_pids_first_line() {
+        let open = 1_000_000;
+        let procs = read_procs(
+            "procs 999000 every=50 exe=/Applications/aterm.app/Contents/MacOS/aterm\n\
+             up 1000400 793 start=1000300\n\
+             down 1092400 793\n\
+             up 1092600 1201 start=1092550\n",
+        );
+        let log = "1000.500 793 INFO aterm_gui: system state: submitting a plan (Automatic)\n\
+                   1092.300 793 INFO aterm_gui: quit & reopen: pid 1199 opens /Applications/aterm.app once this process is gone\n\
+                   1093.100 1201 INFO aterm_gui: permission walk: Quit & Reopen left fda; they wait for the walk's start\n";
+        let presses = |sheet: &[(u64, &str)], quit: &[u64]| ReopenPresses {
+            sheet: sheet.iter().map(|(at, w)| (*at, (*w).to_owned())).collect(),
+            quit: quit.to_vec(),
+        };
+        // The person's Quit & Reopen, then Quit on aterm's question 6.31 s later (the person waits
+        // its quiet between two inputs), and aterm gone 90 ms after that.
+        let pressed = presses(&[(1_086_000, "Quit & Reopen")], &[1_092_310]);
+        let cells = |presses: Option<&ReopenPresses>, later: bool, procs: &Procs, log: &str| {
+            reopen_values(presses, later, procs, log, open, 1_200_000)
+                .into_iter()
+                .map(|(name, value)| format!("{name} {value}"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            cells(Some(&pressed), false, &procs, log),
+            [
+                "Quit & Reopen sheet Quit & Reopen pressed 86000 ms (the person answers Quit & Reopen)",
+                "aterm's quit question Quit pressed 92310 ms, 6310 ms after Quit & Reopen",
+                "aterm processes pid 793 300 ms to 92400 ms; pid 1201 92550 ms to the end",
+                "aterm quit pid 793 gone 92400 ms, 90 ms after Quit on aterm's question",
+                "aterm reopened pid 1201 started 92550 ms, 150 ms after the quit",
+                "reopened pid's first log line 93100 ms",
+            ]
+        );
+        // A quit with no question answered before it is timed from the sheet's press.
+        assert_eq!(
+            cells(
+                Some(&presses(&[(1_092_310, "Quit & Reopen")], &[])),
+                false,
+                &procs,
+                log
+            )[3],
+            "aterm quit pid 793 gone 92400 ms, 90 ms after Quit & Reopen"
+        );
+        // Negative controls. Later: the app runs on, its question is not answered, and nothing is
+        // said to have quit.
+        let ran = read_procs("procs 999000 every=50 exe=/A/aterm\nup 1000400 793 start=1000300\n");
+        assert_eq!(
+            cells(
+                Some(&presses(&[(1_092_310, "Later")], &[])),
+                true,
+                &ran,
+                log
+            )[1..],
+            [
+                "aterm's quit question not answered: the person answers it only after its own Quit & Reopen",
+                "aterm processes pid 793 300 ms to the end",
+                "aterm quit none: pid 793 ran to the end in the 200 s watched",
+                "aterm reopened none: nothing quit",
+            ]
+        );
+        // Run 15's shape had the person answered no question: Quit & Reopen pressed, aterm never
+        // asked (or asked unseen), and it ran on.
+        assert_eq!(
+            cells(
+                Some(&presses(&[(1_092_310, "Quit & Reopen")], &[])),
+                false,
+                &ran,
+                log
+            )[1..4],
+            [
+                "aterm's quit question not seen in the 200 s watched",
+                "aterm processes pid 793 300 ms to the end",
+                "aterm quit none: pid 793 ran to the end in the 200 s watched",
+            ]
+        );
+        assert!(
+            cells(Some(&presses(&[], &[])), true, &ran, log)[0]
+                .ends_with("not seen in the 200 s watched (the person answers Later (--later))")
+        );
+        // A quit with nothing after it is said, never a reopen; a pid with no log line is NOT
+        // MEASURED, never the first process's line.
+        let gone = read_procs(
+            "procs 999000 every=50 exe=/A/aterm\nup 1000400 793 start=1000300\ndown 1092400 793\n",
+        );
+        assert_eq!(
+            cells(None, false, &gone, log)[4],
+            "aterm reopened none: no aterm app process started again in the 200 s watched"
+        );
+        let unlogged = cells(
+            Some(&pressed),
+            false,
+            &procs,
+            &log.lines().take(2).collect::<Vec<_>>().join("\n"),
+        );
+        assert_eq!(
+            unlogged[5],
+            "reopened pid's first log line NOT MEASURED (aterm.log has no line from pid 1201 in the 200 s watched)"
+        );
+        // No person, no watch record, an unreadable process table: NOT MEASURED, never a guess.
+        let nobody = cells(None, false, &procs, log);
+        for cell in &nobody[..2] {
+            assert!(
+                cell.contains("NOT MEASURED (no person at the console"),
+                "{cell}"
+            );
+        }
+        for (procs, why) in [
+            (read_procs(""), "the process watch wrote nothing"),
+            (
+                read_procs(
+                    "procs 999000 every=50 exe=/A/aterm\nprocs-error 999050 the kernel's process table did not read\n",
+                ),
+                "the process watch: the kernel's process table did not read",
+            ),
+            (
+                read_procs("procs 999000 every=50 exe=/A/aterm\n"),
+                "the process watch saw no aterm app process in the 200 s watched",
+            ),
+        ] {
+            let said = cells(Some(&pressed), false, &procs, log);
+            assert_eq!(said.len(), 5, "{why}");
+            for cell in &said[2..] {
+                assert!(cell.ends_with(&format!("NOT MEASURED ({why})")), "{cell}");
+            }
+        }
+    }
+
+    #[test]
     fn a_first_launch_reads_each_milestone_after_the_open() {
         let open = 1_792_950_909_538;
         let launch = read_launch(LOG, open);
@@ -4635,6 +5960,11 @@ mod tests {
         assert_eq!(metric(m, "first_present_ms"), Some(1312.79));
         assert_eq!(metric(m, "present_ms"), None);
         assert_eq!(metric("ERR no window", "first_present_ms"), None);
+        assert_eq!(first_present(m), Ok(Some(1315)));
+        // 0 until the first terminal present: a guest whose window System State fronts.
+        let none_yet = "OK backend=gpu frames=3688 rust_main_to_first_present_ms=0.00";
+        assert_eq!(first_present(none_yet), Ok(None));
+        assert_eq!(first_present("ERR no window"), Err(()));
 
         let before = "Dock 394\nFinder 401\nSystemUIServer 410\n";
         let after = "Dock 1500\nFinder 401\nSystemUIServer \n";
@@ -4680,6 +6010,107 @@ mod tests {
             crate::util::shell_unquote(word),
             root_command(false, cmd),
             "{standard}"
+        );
+    }
+
+    #[test]
+    fn only_a_standard_accounts_person_has_the_administrator_at_hand() {
+        let out = "/var/tmp/aterm-nux/person.txt";
+        let app = "/Applications/aterm.app/Contents/MacOS/aterm";
+        assert_eq!(
+            person_args(out, false, false, app),
+            [
+                PERSON_HELPER,
+                "person",
+                out,
+                "--password",
+                "admin",
+                "--app",
+                app
+            ]
+        );
+        assert_eq!(
+            person_args(out, false, true, app),
+            [
+                PERSON_HELPER,
+                "person",
+                out,
+                "--password",
+                "admin",
+                "--sheet",
+                "later",
+                "--app",
+                app
+            ]
+        );
+        assert_eq!(
+            person_args(out, true, false, app),
+            [
+                PERSON_HELPER,
+                "person",
+                out,
+                "--password",
+                STANDARD_PASSWORD,
+                "--admin",
+                "admin:admin",
+                "--app",
+                app
+            ]
+        );
+        // The cell names whose password went in and the name field, never a password; the
+        // account's own password is typed once, its dialog not watched.
+        let p = read_person(
+            "dialog 900 812 System Settings: AXSheet; AXTextField \"NUX Standard\"\n\
+             focus 950 812 name AXTextField \"admin\"\n\
+             typed 1000 812 administrator 5 NUX_Standard>admin stayed System Settings\n\
+             focus 1200 812 password AXTextField \"admin\"\n\
+             skip 1210 812 System Settings: the administrator's password not typed (the focus read \
+             a text field not secure)\n\
+             typed 1500 812 administrator 5 admin went:640 System Settings\n\
+             typed 2000 640 account 13 - unwatched SecurityAgent\n",
+        );
+        let skipped = p.dialogs.iter().filter(|(_, k, _)| k == "skip").count();
+        assert_eq!(
+            typed_cell(&p.typed, skipped),
+            Value::Text(
+                "3: System Settings, the administrator's (name field NUX_Standard>admin), the \
+                 dialog stayed; System Settings, the administrator's (name field admin), the \
+                 dialog went 640 ms after Return; SecurityAgent, the account's; 1 try typed \
+                 nothing (the focus read a text field not secure)"
+                    .into()
+            )
+        );
+        assert_eq!(
+            p.typed.iter().map(|t| t.went).collect::<Vec<_>>(),
+            [Went::Stayed, Went::After(640), Went::Unwatched]
+        );
+        assert_eq!(typed_cell(&[], 0), Value::Count(0));
+        assert_eq!(
+            p.dialogs,
+            [
+                (
+                    900,
+                    "dialog".to_owned(),
+                    "System Settings: AXSheet; AXTextField \"NUX Standard\"".to_owned()
+                ),
+                (
+                    950,
+                    "focus".to_owned(),
+                    "name AXTextField \"admin\"".to_owned()
+                ),
+                (
+                    1200,
+                    "focus".to_owned(),
+                    "password AXTextField \"admin\"".to_owned()
+                ),
+                (
+                    1210,
+                    "skip".to_owned(),
+                    "System Settings: the administrator's password not typed (the focus read a \
+                     text field not secure)"
+                        .to_owned()
+                )
+            ]
         );
     }
 
@@ -4832,6 +6263,7 @@ mod tests {
     fn a_shell_session_ends_at_the_marker_its_prompt_prints() {
         // The marker the account's prompt prints is the one the driver waits for.
         assert!(PROMPT_MARKER.contains(&format!("print -r -- {SHELL_READY}")));
+        assert!(PROMPT_MARKER.contains(&format!(">> {GUEST_NUX}/prompts;")));
         assert!(DRIVE.contains(&format!("-re {{{SHELL_READY}}}")));
         let record = "start_epoch_ms 10\nfirst_byte_ms 40\nshell_prompt_ms 812\nend_ms 900\n\
                       prompts 0\nquiet_waited_ms 0\nexit 0\n";

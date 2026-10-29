@@ -169,6 +169,9 @@ pub struct World {
     pub insts: Vec<Inst>,
     /// Keep `<base>` after the teardown (`--keep`).
     pub keep: bool,
+    /// What one world's environment adds to [`world_env`]'s, by its root (`swarm partition`'s
+    /// cut file and fleet seams).
+    pub extra: std::collections::BTreeMap<PathBuf, Vec<(String, String)>>,
 }
 
 /// Returns the isolated environment variables for an instance world rooted at `root`, the
@@ -265,6 +268,7 @@ impl World {
             aterm: aterm.to_path_buf(),
             insts: Vec::new(),
             keep,
+            extra: std::collections::BTreeMap::new(),
         };
         made.map_err(|e| format!("cannot lay out {}: {e}", world.bin.display()))?;
         Ok(world)
@@ -274,6 +278,17 @@ impl World {
     #[must_use]
     pub fn root_of(&self, i: usize) -> PathBuf {
         self.base.join(format!("m{i:02}"))
+    }
+
+    /// The environment of the world at `root`: [`world_env`], then what [`World::extra`] adds
+    /// there.
+    #[must_use]
+    pub fn env_of(&self, root: &Path) -> Vec<(String, String)> {
+        let mut env = world_env(root, &self.bin);
+        if let Some(more) = self.extra.get(root) {
+            env.extend(more.iter().cloned());
+        }
+        env
     }
 
     /// Starts instance `i` on fleet port `port` and waits until its control socket listens.
@@ -291,7 +306,7 @@ impl World {
         let home = root.join("home");
         let mut cmd = limited("fleet-sim-instance", &self.aterm);
         cmd.env_clear()
-            .envs(world_env(&root, &self.bin))
+            .envs(self.env_of(&root))
             .args(["--headless", "--no-reroute"])
             .arg("--control-sock")
             .arg(&sock)
@@ -361,7 +376,7 @@ impl World {
     pub fn aterm_in(&self, root: &Path, args: &[&str], stdin: Option<&str>) -> Out {
         let mut cmd = aterm_uds::spawnfd::command(&self.aterm);
         cmd.env_clear()
-            .envs(world_env(root, &self.bin))
+            .envs(self.env_of(root))
             .args(args)
             .current_dir(root.join("home"));
         finish(&mut cmd, stdin)

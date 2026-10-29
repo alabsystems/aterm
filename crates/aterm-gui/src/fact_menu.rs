@@ -60,6 +60,8 @@ pub(crate) enum FactAct {
     NewTabHere,
     /// The branch's name onto the clipboard.
     CopyBranch,
+    /// Copy the complete observed account-recovery report, including clipped notes.
+    CopyRecovery,
     /// A new tab at the repository's root.
     NewTabAtRoot,
     /// Hide the fact behind its greyed `off`, as a click on it does.
@@ -72,7 +74,7 @@ pub(crate) enum FactAct {
     UseAccount(AccountLabel),
     /// Unpin and return to automatic account rotation (dedicated → pool).
     AutoRotate,
-    /// Open a tab in the folder of the account roster (`accounts.toml`, beside `aterm.toml`).
+    /// Open a terminal tab in aterm's configuration folder.
     AccountSettings,
     /// Inspect this instance's network and shared-service availability.
     NetworkState,
@@ -88,6 +90,7 @@ impl FactAct {
             Self::CopyPath => "copy-path".to_string(),
             Self::NewTabHere => "new-tab-here".to_string(),
             Self::CopyBranch => "copy-branch".to_string(),
+            Self::CopyRecovery => "copy-recovery".to_string(),
             Self::NewTabAtRoot => "new-tab-at-root".to_string(),
             Self::Hide(kind) => format!("hide/{}", Fact::of(kind).key()),
             Self::Show(kind) => format!("show/{}", Fact::of(kind).key()),
@@ -382,6 +385,54 @@ fn item(fact: Fact, glyph: &'static str, label: &str, act: FactAct, enabled: boo
     }
 }
 
+fn recovery_observed_line(at: i64) -> String {
+    if at > 0 {
+        format!("Observed {}", aterm_agent::harness::usage::rfc3339_utc(at))
+    } else {
+        "Observed unknown".into()
+    }
+}
+
+fn recovery_next_line(at: Option<i64>) -> String {
+    at.filter(|at| *at > 0).map_or_else(
+        || "Next event unknown".into(),
+        |at| {
+            format!(
+                "Next event {}",
+                aterm_agent::harness::usage::rfc3339_utc(at)
+            )
+        },
+    )
+}
+
+/// Full observed recovery evidence, without the menu's display-width limit.
+fn recovery_report(progress: &aterm_agent::harness::account_progress::AccountProgress) -> String {
+    let count = |value: Option<usize>| value.map_or_else(|| "unknown".into(), |n| n.to_string());
+    let mut lines = vec![
+        format!(
+            "Recovery: {}",
+            aterm_agent::harness::footer::account_progress_phase(progress)
+        ),
+        format!(
+            "Account: {}",
+            progress.account.as_deref().unwrap_or("unknown")
+        ),
+        format!(
+            "Accounts: {}; eligible: {}",
+            count(progress.known),
+            count(progress.eligible)
+        ),
+        format!(
+            "Limit: {}",
+            progress.wall.as_deref().unwrap_or("not observed")
+        ),
+    ];
+    lines.extend(progress.details.iter().cloned());
+    lines.push(recovery_observed_line(progress.observed_at));
+    lines.push(recovery_next_line(progress.next_at));
+    lines.join("\n")
+}
+
 /// Build the menu rows for `fact` from `facts`.
 #[must_use]
 pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
@@ -479,8 +530,16 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
             if let Some(progress) = &facts.account_progress {
                 let mut summary = progress.clone();
                 summary.details.clear();
+                summary.next_at = summary.next_at.filter(|at| *at > 0);
                 out.push(MenuRow::note(
                     aterm_agent::harness::footer::account_progress_text(&summary, false),
+                ));
+                out.push(item(
+                    fact,
+                    "\u{29c9}",
+                    "Copy recovery details",
+                    FactAct::CopyRecovery,
+                    true,
                 ));
                 if progress.phase == aterm_agent::harness::account_progress::ProgressPhase::Watching
                     && progress.wall.is_none()
@@ -489,18 +548,14 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                         aterm_agent::harness::footer::account_progress_phase(progress),
                     ));
                 }
-                for detail in &progress.details {
+                if let Some(detail) = progress.details.first() {
                     out.push(MenuRow::note(detail.clone()));
                 }
-                out.push(MenuRow::note(format!(
-                    "Observed {}",
-                    aterm_agent::harness::usage::rfc3339_utc(progress.observed_at)
-                )));
-                if let Some(at) = progress.next_at {
-                    out.push(MenuRow::note(format!(
-                        "Next event {}",
-                        aterm_agent::harness::usage::rfc3339_utc(at)
-                    )));
+                // Keep timing visible before a long list of retained route details.
+                out.push(MenuRow::note(recovery_observed_line(progress.observed_at)));
+                out.push(MenuRow::note(recovery_next_line(progress.next_at)));
+                for detail in progress.details.iter().skip(1) {
+                    out.push(MenuRow::note(detail.clone()));
                 }
                 out.push(MenuRow::Item {
                     glyph: "⋯",
@@ -564,8 +619,8 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 out.push(MenuRow::note(format!("Account state unavailable: {why}")));
                 out.push(MenuRow::Item {
                     glyph: "\u{22ef}",
-                    label: "Account settings\u{2026}".to_string(),
-                    spoken: "Account settings".to_string(),
+                    label: "Open configuration folder\u{2026}".to_string(),
+                    spoken: "Open configuration folder".to_string(),
                     act: MenuAct::Fact(fact, FactAct::AccountSettings),
                     enabled: true,
                     checked: false,
@@ -589,8 +644,8 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 out.push(MenuRow::Rule);
                 out.push(MenuRow::Item {
                     glyph: "\u{22ef}",
-                    label: "Account settings\u{2026}".to_string(),
-                    spoken: "Account settings".to_string(),
+                    label: "Open configuration folder\u{2026}".to_string(),
+                    spoken: "Open configuration folder".to_string(),
                     act: MenuAct::Fact(fact, FactAct::AccountSettings),
                     enabled: true,
                     checked: false,
@@ -612,8 +667,8 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 });
                 out.push(MenuRow::Item {
                     glyph: "\u{22ef}",
-                    label: "Account settings\u{2026}".to_string(),
-                    spoken: "Account settings".to_string(),
+                    label: "Open configuration folder\u{2026}".to_string(),
+                    spoken: "Open configuration folder".to_string(),
                     act: MenuAct::Fact(fact, FactAct::AccountSettings),
                     enabled: true,
                     checked: false,
@@ -642,8 +697,8 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
             });
             out.push(MenuRow::Item {
                 glyph: "\u{22ef}",
-                label: "Account settings\u{2026}".to_string(),
-                spoken: "Account settings".to_string(),
+                label: "Open configuration folder\u{2026}".to_string(),
+                spoken: "Open configuration folder".to_string(),
                 act: MenuAct::Fact(fact, FactAct::AccountSettings),
                 enabled: true,
                 checked: false,
@@ -868,7 +923,9 @@ thread_local! {
 /// The account rows of another CLI's pool, read by the account-menu worker: its
 /// roster beside `config` (`accounts-<cli>.toml`), bound to the logins its renewals made, each
 /// row's condition from its own store (`accounts::Store::at_for`); a row is enrolled once its
-/// login file exists (`accounts::enrolled_for`). No roster, or a refused one, is no rows.
+/// login file exists, a default-home row's in the CLI's default home (`accounts::enrolled_in`).
+/// A row with an email offers an automatic sign-in only where the CLI's renewal starts in the
+/// background (`Cli::renews_headlessly`). No roster, or a refused one, is no rows.
 /// # Errors
 /// The roster, state or login bindings could not be read.
 pub(crate) fn pool_menu_rows(
@@ -884,11 +941,12 @@ pub(crate) fn pool_menu_rows(
     let store = accounts::Store::at_for(state_dir, cli, home);
     let roster = store.bound(&roster, now)?;
     let (state, _) = store.load(now)?;
-    let enrolled = accounts::enrolled_for(cli, &roster);
+    let enrolled = accounts::enrolled_in(cli, &roster, home);
     Ok(account_menu_rows_from(
         &roster,
         &state,
         &enrolled,
+        cli.renews_headlessly(),
         session_account,
         session_email,
         SessionWeek::default(),
@@ -952,11 +1010,22 @@ pub(crate) struct SessionWeek {
     pub(crate) left: Option<(u32, String)>,
 }
 
+/// The Account menu's rows of `roster`, each with its condition and quota and whether it can be
+/// chosen. `auto_login` is whether aterm signs a row with an email in by itself (Claude Code's,
+/// and another CLI's whose renewal approves its page headlessly, `Cli::renews_headlessly`): such
+/// a row that is signed out or not enrolled says `(auto-login)` and can be chosen. Where it is
+/// false (Grok Build's, whose background renewal never starts) that row is as one with no email:
+/// it names its condition and cannot be chosen, since a choice would start no sign-in.
 #[must_use]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "menu rows bind the roster, its state and enrolled set, whether rows auto-login, the session's account, email and week, and the clock"
+)]
 pub(crate) fn account_menu_rows_from(
     roster: &aterm_agent::harness::accounts::Roster,
     state: &aterm_agent::harness::accounts::State,
     enrolled: &std::collections::BTreeSet<String>,
+    auto_login: bool,
     session_account: Option<&str>,
     session_email: Option<&str>,
     session: SessionWeek,
@@ -987,7 +1056,7 @@ pub(crate) fn account_menu_rows_from(
         let Some(account) = AccountLabel::new(&row.label) else {
             continue;
         };
-        let is_enrolled = row.dir.is_none() || enrolled.contains(&row.label);
+        let is_enrolled = enrolled.contains(&row.label);
         let cond = accounts::condition(row, state, is_enrolled, now);
         let is_active = active_label == Some(row.label.as_str());
         let pct_left = if matches!(cond, accounts::Condition::Limited { .. }) {
@@ -1022,7 +1091,7 @@ pub(crate) fn account_menu_rows_from(
             accounts::Class::Dedicated => "dedicated",
             accounts::Class::Shared => "pool",
         };
-        let has_email = row.email.is_some();
+        let has_email = auto_login && row.email.is_some();
         let avail = match (cond, pct_left, has_email) {
             (accounts::Condition::Limited { .. }, _, _) => "0% left (limited)".to_string(),
             (_, Some((0, age)), _) => format!("0% left{age} (limited)"),
@@ -1430,6 +1499,18 @@ impl App {
                 .map(|p| p.to_string_lossy().into_owned())
         };
         match act {
+            // A control client's choice (its `key enter` on the open menu) copies nothing.
+            FactAct::CopyRecovery | FactAct::CopyPath | FactAct::CopyBranch
+                if self.refuse_clipboard_gesture("fact-menu copy") => {}
+            FactAct::CopyRecovery => {
+                if let Some(progress) = self
+                    .fact_menu_facts(session, Fact::Account)
+                    .account_progress
+                    && crate::control::pbcopy(&recovery_report(&progress))
+                {
+                    self.note_fact_notice(wid, session, FactNotice::Copied);
+                }
+            }
             FactAct::CopyPath | FactAct::CopyBranch => {
                 let text = if act == FactAct::CopyPath {
                     dir(false)

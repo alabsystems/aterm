@@ -347,8 +347,7 @@ impl ShowcaseCard {
 
     /// The paint-only slab's value.
     pub(crate) fn slab_value(&self, narrow: bool) -> String {
-        use std::fmt::Write as _;
-        let mut value = String::with_capacity(48);
+        let mut value = Vec::with_capacity(60);
         for color in [
             self.bg,
             self.fg,
@@ -357,10 +356,16 @@ impl ShowcaseCard {
             self.ansi[4],
             self.ansi[5],
         ] {
-            let _ = write!(value, "{color:06x} ");
+            // A colour as `{:06x}` spells it, in ASCII with no formatter: a page builds one a row.
+            let mut at = (8 - color.leading_zeros() as usize / 4).max(6);
+            while at > 0 {
+                at -= 1;
+                value.push(b"0123456789abcdef"[(color >> (4 * at)) as usize & 0xf]);
+            }
+            value.push(b' ');
         }
-        value.push_str(if narrow { "narrow" } else { "wide" });
-        value
+        value.extend_from_slice(if narrow { b"narrow" } else { b"wide" });
+        String::from_utf8(value).unwrap_or_default()
     }
 
     /// Whether the lowercased, trimmed filter `query` admits the row at `reach` (`ShowcaseState::reach_for`).
@@ -826,6 +831,7 @@ mod tests {
     fn contrast_figures_round_down_and_grade_by_wcag() {
         assert_eq!(contrast_figure(2.96), "2.9");
         assert_eq!(contrast_figure(7.0), "7");
+        assert_eq!(contrast_figure(11.24), "11.2");
         assert_eq!(contrast_grade(7.0), ContrastGrade::Aaa);
         assert_eq!(contrast_grade(6.99), ContrastGrade::Aa);
         assert_eq!(contrast_grade(4.5), ContrastGrade::Aa);

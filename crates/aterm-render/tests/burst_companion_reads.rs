@@ -10,9 +10,7 @@ use aterm_core::render::RenderInput;
 use aterm_core::terminal::{ClockReading, Terminal};
 use aterm_effects::companion::{CompanionOwner, ContrastFallback, GlowOwnership, PetFacts};
 use aterm_effects::cursor_glow::GlowStyle;
-use aterm_effects::host::{
-    CaptureMode, FrameGeom, HostFrameInput, SingFacts, TerminalFacts, Visibility,
-};
+use aterm_effects::host::{FrameGeom, HostFrameInput, TerminalFacts};
 use aterm_effects::kitty_pet::{PetAction, PetInputKind};
 use aterm_effects::pet_world::{PetPane, PetReserve, PetWorldFacts};
 use aterm_effects::word_decorations::WordDecorations;
@@ -158,38 +156,26 @@ impl Replay {
         self.owner
             .observe_console_reserved(&input, &world, PetPane::full(&input), reserve);
         let facts = TerminalFacts::read(&self.term, 7, false);
-        let host = HostFrameInput {
-            now: self.now,
-            visibility: Visibility::Focused,
-            reduced_motion: false,
-            serious: false,
-            shed_envelope: 1.0,
-            shed_active: false,
-            pointer_px: None,
-            capture: CaptureMode::Present,
-            geometry: FrameGeom {
+        let host = HostFrameInput::new(
+            self.now,
+            FrameGeom {
                 rows: ROWS,
                 cols: COLS,
                 cell_w: cw,
                 cell_h: ch,
                 origin_px: (0, 0),
             },
-        };
+        );
         let tick = self.owner.prepare(
-            PetFacts {
-                facts: &facts,
-                host: &host,
-                glow: GlowOwnership {
+            PetFacts::new(
+                &facts,
+                &host,
+                GlowOwnership {
                     enabled: true,
                     style: GlowStyle::RainbowKitty,
                     style_raw_names_pet: true,
                 },
-                sing: SingFacts::default(),
-                focused: true,
-                obscured: false,
-                pane: None,
-                room: None,
-            },
+            ),
             &mut self.decos,
         );
         let t = self.owner.tick(tick);

@@ -13,7 +13,7 @@ use crate::headless_boot;
 
 use headless_boot::{
     Instance, boot_session, client_command, ctl, ctl_ok, field, status, subscribed, type_line,
-    until_served,
+    until_served, watchers,
 };
 
 /// Boot one headless instance ([`headless_boot::boot`]).
@@ -144,6 +144,7 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
     assert_eq!(field(&before, "agent"), Some("busy"), "{before}");
     let revision = field(&before, "revision").unwrap().to_string();
 
+    let watched = watchers(&inst, &sid);
     let waiter = std::thread::spawn({
         let mut cmd = client_command(
             &inst,
@@ -151,7 +152,12 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
         );
         move || until_served(|| cmd.output().expect("await agent"))
     });
-    std::thread::sleep(Duration::from_millis(200));
+    let armed_by = Instant::now() + HANG;
+    while watchers(&inst, &sid) <= watched {
+        assert!(!waiter.is_finished(), "the await ended before it armed");
+        assert!(Instant::now() < armed_by, "the await never armed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     std::fs::write(&go, b"").expect("create the go file");
     let prompt = status_until(

@@ -107,14 +107,17 @@ pub fn hello_plan(def: &BundleDef, gate: &HelloGate) -> Result<HelloPlan> {
 /// A refusal when nothing names one.
 pub fn derive_version(tools: &dyn Tools, src_repo: &Path, sysroot: &Path) -> Result<String> {
     if let Ok(text) = std::fs::read_to_string(src_repo.join("release/trust-version.toml"))
-        && let Some(v) = text.lines().find_map(|l| {
-            let (k, v) = l.split_once('=')?;
-            (k.trim() == "trust_product_version")
-                .then(|| v.trim().trim_matches('"').to_string())
-                .filter(|v| !v.is_empty())
-        })
+        && let Ok(doc) = text.parse::<aterm_toml::Table>()
+        && let Some(v) = doc
+            .get("release")
+            .and_then(aterm_toml::Value::as_table)
+            .and_then(|t| t.get("trust_product_version"))
+            .or_else(|| doc.get("trust_product_version"))
+            .and_then(aterm_toml::Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
     {
-        return Ok(v);
+        return Ok(v.to_string());
     }
     let trustc = sysroot.join("bin/trustc");
     if trustc.is_file()

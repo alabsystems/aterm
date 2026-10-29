@@ -42,7 +42,7 @@ pub use phase::{
     transcript_end, worker_phase,
 };
 pub use policy::approval::QuestionPriority;
-pub use policy::turn_end::{Outage, WaitKind};
+pub use policy::turn_end::{AgentResumed, Outage, WaitKind};
 pub use report::{DEFAULT_MAX_ROWS, Mark, Marker, Reason, Report, ReportOpts};
 pub use run::{
     ATTENTION_OWNER, ATTENTION_PREFIX, AnswerOpts, ApprovalEnv, CLAIM_HELD, CLAIM_RENEW, Caps, Ctl,

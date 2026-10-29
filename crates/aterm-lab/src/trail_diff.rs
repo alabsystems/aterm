@@ -12,7 +12,11 @@
 //!   drew, whatever its light bits say;
 //! - on a frame where some arm drew (in either build), every stream no arm touched must still be
 //!   equal; the pixels and the deadlines, which every stream feeds, are not compared there, and
-//!   such frames are listed with their arms.
+//!   such frames are listed with their arms;
+//! - the ink ledger's per-frame products (the `ledger` line: the rails it noted, its dims and the
+//!   print of its cuts, all read off the frame's under stream) are compared as a stream, equal
+//!   on every drawn frame where no arm touched `glow_under` or `glow_under_ramps`
+//!   (docs/design/PRISM-GLASS.md §15.9's preamble).
 //!
 //! The light words are never compared. Both builds run the head's scripts, so the harness
 //! closure (the dump, its support files, the rig and the frame reads it drives the App by, every
@@ -77,6 +81,8 @@ frame by frame:
   streams  every RenderInput stream, the CPU pixels and the next deadlines: equal on every frame no light arm drew,
            whatever its light bits; on a frame where some arm drew (in either build), each stream no arm touched
            must still be equal, and the frame is listed with its arms
+  ledger   the ink ledger's per-frame products (its rails, dims and cut notes), compared as a stream: equal on every
+           drawn frame where no arm touched glow_under or glow_under_ramps
 The light words are never compared. It prints the first difference of each script that has one, the frames where
 an arm drew, then scripts= frames= differing_compared= arm_frames= state_differing=.
 
@@ -243,13 +249,110 @@ pub fn closure_differs(
     out
 }
 
-/// The refusal of a head whose closure differs from its base: NOT RUN, naming each member.
+/// How many of the head's changed files lie outside the harness closure: the paths of `changed`
+/// and `untracked` (as [`closure_changes`] takes them) that [`in_closure`] leaves out, each once,
+/// the root `Cargo.toml` among them only when its text differs beyond `[profile.trail-diff]`, and
+/// none whose diff `diff_of` gives only declares a closure file's module
+/// ([`only_declares_a_closure_module`]): that file lands in the H commit with the file it
+/// declares (§15.0.6).
 #[must_use]
-pub fn closure_refusal(members: &[String]) -> Fail {
+pub fn beside_closure(
+    changed: &str,
+    untracked: &str,
+    base_toml: &str,
+    head_toml: &str,
+    diff_of: impl Fn(&str) -> Option<String>,
+) -> usize {
+    let mut paths: Vec<&str> = changed
+        .split('\0')
+        .chain(untracked.split('\0'))
+        .map(|p| p.trim_end_matches('\n'))
+        .filter(|p| !p.is_empty() && !in_closure(p))
+        .collect();
+    paths.sort_unstable();
+    paths.dedup();
+    if beside_profile(base_toml) == beside_profile(head_toml) {
+        paths.retain(|p| *p != "Cargo.toml");
+    }
+    paths.retain(|p| !diff_of(p).is_some_and(|d| only_declares_a_closure_module(&d)));
+    paths.len()
+}
+
+/// Whether a file's `git diff -U0` only declares a closure file's module: every line it changes
+/// is an added one, at least one of them `mod state_words;` (`pub` or `pub(...)` before it
+/// allowed), the rest blank or an attribute (`#[...]`, its `cfg`). A removed or any other added
+/// line, or no hunk, is a change of the file's own.
+#[must_use]
+pub fn only_declares_a_closure_module(diff: &str) -> bool {
+    let is_mod = |l: &str| {
+        let rest = l.strip_prefix("pub").map_or(l, |r| {
+            let r = r.trim_start();
+            match r.strip_prefix('(') {
+                Some(scoped) => scoped.split_once(')').map_or("", |(_, after)| after),
+                None => r,
+            }
+        });
+        rest.trim_start() == "mod state_words;"
+    };
+    let (mut hunks, mut declared) = (false, false);
+    for line in diff.lines() {
+        if line.starts_with("@@") {
+            hunks = true;
+            continue;
+        }
+        if !hunks || line.starts_with('\\') {
+            continue;
+        }
+        let Some(added) = line.strip_prefix('+') else {
+            return false;
+        };
+        let added = added.trim();
+        if is_mod(added) {
+            declared = true;
+        } else if !(added.is_empty() || (added.starts_with("#[") && added.ends_with(']'))) {
+            return false;
+        }
+    }
+    declared
+}
+
+/// A `Cargo.toml`'s lines outside its `[profile.<PROFILE>]` table, trimmed.
+fn beside_profile(toml: &str) -> Vec<&str> {
+    let header = format!("[profile.{PROFILE}]");
+    let mut inside = false;
+    toml.lines()
+        .map(str::trim)
+        .filter(|l| {
+            if l.starts_with('[') {
+                inside = *l == header;
+            }
+            !inside
+        })
+        .collect()
+}
+
+/// The refusal of a head whose closure differs from its base: NOT RUN, naming each member and the
+/// rule (§15.0.6). When the head also changes `beside` files outside the closure
+/// ([`beside_closure`], which leaves out a file that only declares a closure file's module), it
+/// asks for the rule's split.
+#[must_use]
+pub fn closure_refusal(members: &[String], beside: usize) -> Fail {
+    let split = if beside == 0 {
+        String::new()
+    } else {
+        format!(
+            "; the head also changes {beside} file{} outside the closure (a file that only \
+             declares a closure file's module, its `mod state_words;`, is not counted): split the \
+             change into three commits: the API, reading nothing new (proved by --base HEAD~1); \
+             then the closure change alone; then its reader (proved by --base HEAD~1)",
+            if beside == 1 { "" } else { "s" }
+        )
+    };
     not_run(format!(
         "the harness closure differs between the base and the head ({}): both builds run the \
-         head's scripts, so a closure change lands alone, after the API it calls, and is proved \
-         by --control same and --control plant (docs/design/PRISM-GLASS.md section 15.0.6)",
+         head's scripts, so a closure change lands alone, after the API it calls, as an H commit \
+         proved by --control same and --control plant (docs/design/PRISM-GLASS.md section \
+         15.0.6){split}",
         members.join(", ")
     ))
 }
@@ -299,8 +402,11 @@ pub struct Frame {
     pub streams: Vec<(String, String)>,
     /// `px` and `deadline`, which every stream feeds: compared where no arm drew.
     pub drawn: Vec<(String, String)>,
+    /// The `ledger` line's words (`ledger.n`, `ledger.<engine>`): the ink ledger's per-frame
+    /// products, compared as a stream where no arm touched the under stream they were read off.
+    pub ledger: Vec<(String, String)>,
     /// Main's state: `sounds`, each `state` word (`state.n`, `state.<engine>`, `state.bed`) and
-    /// every other line the dump prints but `light` and the `W` detail.
+    /// every other line the dump prints but `light`, `ledger` and the `W` detail.
     pub state: Vec<(String, String)>,
 }
 
@@ -356,6 +462,9 @@ pub fn parse_dump(text: &str) -> Result<Vec<Script>, String> {
                 "W" | "light" => {}
                 "streams" => frame.streams.extend(pairs(body)),
                 "px" | "deadline" => frame.drawn.push((kind.to_string(), body.to_string())),
+                "ledger" => frame
+                    .ledger
+                    .extend(pairs(body).map(|(k, v)| (format!("ledger.{k}"), v))),
                 "state" => frame
                     .state
                     .extend(pairs(body).map(|(k, v)| (format!("state.{k}"), v))),
@@ -422,8 +531,8 @@ fn pairs(body: &str) -> impl Iterator<Item = (String, String)> + '_ {
 /// One word the two dumps print differently.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diff {
-    /// The word: a stream's name, `px`, `deadline`, `sounds`, `state.<word>`, or the frame's
-    /// shape (`frame`, `held`, `run`, `script`).
+    /// The word: a stream's name, `px`, `deadline`, `sounds`, `state.<word>`, `ledger.<word>`,
+    /// or the frame's shape (`frame`, `held`, `run`, `script`).
     pub what: String,
     pub head: String,
     pub base: String,
@@ -441,7 +550,8 @@ pub struct FrameVerdict {
     /// Every arm either build drew, with the streams it touched (each arm once, in the order
     /// the head then the base drew them).
     pub arms: Vec<(String, Vec<String>)>,
-    /// Differences in what is compared as streams (and the frame's shape).
+    /// Differences in what is compared as streams (the ledger's words among them, and the
+    /// frame's shape).
     pub streams: Vec<Diff>,
     /// Differences in main's state.
     pub state: Vec<Diff>,
@@ -489,6 +599,10 @@ pub fn compare_frame(head: &Frame, base: &Frame) -> FrameVerdict {
     let mut streams = differ(&head.streams, &base.streams);
     streams.retain(|d| !touched(&d.what));
     v.streams.extend(streams);
+    // The ledger's products are read off the under stream: an arm that drew there moves them.
+    if !touched("glow_under") && !touched("glow_under_ramps") {
+        v.streams.extend(differ(&head.ledger, &base.ledger));
+    }
     if v.arms.is_empty() {
         v.streams.extend(differ(&head.drawn, &base.drawn));
     }
@@ -894,7 +1008,9 @@ impl BaseTree {
     /// Stand the base at `sha` in `path`: a worktree this repository already lists there (one a
     /// `--keep` run left) is checked out at `sha` with its own changes dropped, else it is added
     /// afresh (`--force`, over a listing whose folder is gone, so no other worktree's listing is
-    /// pruned); then its `vendor/astream` is brought to the base's pin.
+    /// pruned); then its `vendor/astream` is brought to the base's pin. The kept tree's checkout
+    /// leaves the submodule to that update: under `submodule.recurse` a checkout recurses into it
+    /// and fails on a pin its store has not fetched, which only the update fetches.
     fn stand(repo: &Path, path: &Path, sha: &str, keep: bool) -> Result<BaseTree, Fail> {
         let fail = |e: String| not_run(format!("the base worktree: {e}"));
         let listed = git(repo, &["worktree", "list", "--porcelain"]).map_err(fail)?;
@@ -910,7 +1026,18 @@ impl BaseTree {
         };
         let tree = if is_listed && path.is_dir() {
             let tree = tree();
-            git(path, &["checkout", "--quiet", "--detach", "--force", sha]).map_err(fail)?;
+            git(
+                path,
+                &[
+                    "checkout",
+                    "--quiet",
+                    "--no-recurse-submodules",
+                    "--detach",
+                    "--force",
+                    sha,
+                ],
+            )
+            .map_err(fail)?;
             git(path, &["clean", "-ffdq"]).map_err(fail)?;
             tree
         } else {
@@ -1124,7 +1251,14 @@ pub fn cmd_trail_diff(args: &[String]) -> Res {
         .map_err(|e| not_run(format!("the head's Cargo.toml: {e}")))?;
     let members = closure_differs(&changed, &untracked, &base_toml, &head_toml);
     if !members.is_empty() {
-        return Err(closure_refusal(&members));
+        let beside = beside_closure(&changed, &untracked, &base_toml, &head_toml, |path| {
+            git(
+                &head,
+                &["diff", "-U0", "--no-renames", &base_sha, "--", path],
+            )
+            .ok()
+        });
+        return Err(closure_refusal(&members, beside));
     }
     let short = |s: &str| s.get(..10).unwrap_or(s).to_string();
     println!(

@@ -631,3 +631,201 @@ fn a_chosen_name_is_never_an_actor_word() {
     let refs: Vec<&str> = snap.iter().map(String::as_str).collect();
     assert_eq!(Fold::from_snapshot(&refs).err(), Some(SnapError::Line));
 }
+
+/// The words of every observed need a fold holds after `recs`, applied from a fresh fold.
+fn observed_after(recs: &[aterm_slog::Rec]) -> Vec<&'static str> {
+    let mut fold = Fold::new(1);
+    for r in recs {
+        fold.apply(r);
+    }
+    fold.state()
+        .needs
+        .iter()
+        .flatten()
+        .filter(|n| n.observed())
+        .map(|n| n.word)
+        .collect()
+}
+
+/// THE DECLARED OBSERVED NEEDS ARE EXACTLY WHAT RECORDS RAISE (session log Phase 6 fix unit
+/// G2): over every step kind with each box and wall, every run outcome, the session's close and
+/// a need mark of every word by four actors, across every src and conf, the records alone raise
+/// each declared word as an observed need and no other; a snapshot naming any need word seeds
+/// no observed need outside the declaration.
+#[test]
+fn a_fold_names_as_observed_exactly_the_words_it_declares() {
+    use aterm_slog::vocab::{BOX_WORDS, NEED_WORDS, OUT_WORDS, WALL_WORDS};
+    use aterm_slog::{Lvl, Op, Rec, WallKind};
+    use std::collections::BTreeSet;
+
+    let declared: BTreeSet<&str> = aterm_slog::observed_need_words().collect();
+    let producers: BTreeSet<&str> = BoxWord::all()
+        .map(BoxWord::need)
+        .chain(WallKind::ALL.iter().map(|k| k.wire()))
+        .chain(["unresponsive", "failure", "exited", "escalated"])
+        .collect();
+    assert_eq!(
+        declared, producers,
+        "the declaration is every box's need, every wall's, and the four the fold raises itself"
+    );
+    for w in NEED_WORDS {
+        assert_eq!(aterm_slog::may_observe(w), declared.contains(w), "{w}");
+    }
+
+    let rec = |seq: u64, op: Op, node: Node, k: Kind, src: Src, conf: Conf, f: Fields| Rec {
+        seq,
+        t: WALL0 + seq,
+        op,
+        node,
+        par: None,
+        k,
+        src,
+        conf,
+        by: Actor::Aterm,
+        f,
+    };
+    let (run, turn, step) = (
+        Node::new(Lvl::Run, 1),
+        Node::new(Lvl::Turn, 1),
+        Node::new(Lvl::Step, 1),
+    );
+    let head = |src: Src, conf: Conf| {
+        vec![
+            rec(
+                1,
+                Op::Open,
+                Node::SESSION,
+                Kind::Spawn,
+                src,
+                conf,
+                Fields::new(),
+            ),
+            rec(2, Op::Open, run, Kind::Agent, src, conf, Fields::new()),
+            Rec {
+                par: Some(run),
+                ..rec(3, Op::Open, turn, Kind::Turn, src, conf, Fields::new())
+            },
+        ]
+    };
+    let srcs: Vec<Src> = Src::ALL.into_iter().chain([Src::Unknown]).collect();
+    let confs: Vec<Conf> = Conf::ALL.into_iter().chain([Conf::Unknown]).collect();
+    let actors = [Actor::Aterm, Actor::Ctl, Actor::Harness, Actor::Human];
+    let mut from_records: BTreeSet<&str> = BTreeSet::new();
+    let mut from_snapshots: BTreeSet<&str> = BTreeSet::new();
+    let mut cases = 0usize;
+    for &src in &srcs {
+        for &conf in &confs {
+            let mut runs: Vec<Vec<Rec>> = Vec::new();
+            for &k in Kind::ALL {
+                if k.node_level() != Some(Lvl::Step) {
+                    continue;
+                }
+                let mut fields = vec![Fields::new()];
+                fields.extend(
+                    BOX_WORDS
+                        .iter()
+                        .chain(["no-such-box"].iter())
+                        .filter_map(|b| Fields::new().word(Key::Box, b).ok()),
+                );
+                fields.extend(
+                    WALL_WORDS
+                        .iter()
+                        .filter_map(|w| Fields::new().word(Key::Wall, w).ok()),
+                );
+                for f in fields {
+                    let open = Rec {
+                        par: Some(turn),
+                        ..rec(4, Op::Open, step, k, src, conf, f)
+                    };
+                    runs.push(vec![open]);
+                }
+            }
+            for out in OUT_WORDS {
+                let Ok(f) = Fields::new().word(Key::Out, out) else {
+                    continue;
+                };
+                let cmd = Node::new(Lvl::Run, 2);
+                runs.push(vec![
+                    rec(4, Op::Open, cmd, Kind::Cmd, src, conf, Fields::new()),
+                    rec(5, Op::Close, cmd, Kind::Cmd, src, conf, f),
+                ]);
+            }
+            runs.push(vec![rec(
+                4,
+                Op::Close,
+                Node::SESSION,
+                Kind::Spawn,
+                src,
+                conf,
+                Fields::new(),
+            )]);
+            for w in NEED_WORDS.iter().chain(["no-such-need"].iter()) {
+                let Ok(f) = Fields::new().word(Key::Word, w) else {
+                    continue;
+                };
+                for by in actors {
+                    runs.push(vec![Rec {
+                        by,
+                        ..rec(4, Op::Mark, Node::SESSION, Kind::Need, src, conf, f.clone())
+                    }]);
+                }
+            }
+            for tail in runs {
+                let mut recs = head(src, conf);
+                recs.extend(tail);
+                from_records.extend(observed_after(&recs));
+                cases += 1;
+            }
+            for w in NEED_WORDS {
+                for kind in [Kind::Need, Kind::Cmd, Kind::Approval] {
+                    let needs = format!("{w}.-.{}.{}.{}", kind.word(), "aterm", src.word());
+                    let mut f = Fields::new();
+                    f.set(
+                        Key::Needs,
+                        aterm_slog::Val::Tok(
+                            aterm_slog::BoundedToken::new(Key::Needs, &needs)
+                                .expect("a needs list"),
+                        ),
+                    )
+                    .expect("needs");
+                    f.set(Key::N, aterm_slog::Val::U(1)).expect("n");
+                    let snap = rec(
+                        9,
+                        Op::Snap,
+                        Node::SESSION,
+                        Kind::Snap,
+                        Src::Aterm,
+                        Conf::Exact,
+                        f,
+                    );
+                    let mut fold = Fold::new(1);
+                    assert!(fold.seed_snap(&snap), "PRECONDITION: a snapshot seeds");
+                    from_snapshots.extend(
+                        fold.state()
+                            .needs
+                            .iter()
+                            .flatten()
+                            .filter(|n| n.observed())
+                            .map(|n| n.word),
+                    );
+                    cases += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        cases > 10_000,
+        "PRECONDITION: the sweep ran ({cases} cases)"
+    );
+    assert_eq!(
+        from_records, declared,
+        "a record raises each declared word as observed, and no record raises another, whatever \
+         its src and conf spell"
+    );
+    let undeclared: BTreeSet<&str> = from_snapshots.difference(&declared).copied().collect();
+    assert!(
+        undeclared.is_empty(),
+        "a snapshot seeds no observed need outside the declaration, whatever it names: \
+         {undeclared:?}"
+    );
+}

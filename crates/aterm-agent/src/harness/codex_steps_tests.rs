@@ -1263,25 +1263,26 @@ fn a_build_is_said_as_its_release_and_matched_whole() {
     }
 }
 
+/// THE WRITER HOLDS THE ROWS TO ITS BUILD: a rollout's rows are read `On` only while the process
+/// writing them runs a measured build too; a writer that moves onto a build nobody measured reads
+/// on, `Partial` from the move (Claude Code's unmeasured builds' rule), and says the model again
+/// at its own build. NEGATIVE CONTROL: the same rows, the writer never moved, are `On` to the end.
 #[test]
 fn the_writer_holds_the_rows_to_its_build() {
     let text = alab_leg("continue");
     let second = rows(&text)
         .position(|r| r.contains("\"turn_context\"") && r.contains("8000-00000000000b"))
         .expect("the continued turn's context");
-    let fold_by = |writer: &str, moved: Option<&str>, stop: bool| {
+    let fold_by = |writer: &str, moved: Option<&str>| {
         let mut fold = CodexStepFold::new(0);
-        fold.set_writer(writer);
+        fold.set_writer(Some(writer));
         fold.bind(FP, ID, 0);
         let mut end = 0u64;
         for (i, row) in rows(&text).enumerate() {
-            if i == second {
-                if let Some(build) = moved {
-                    fold.set_writer(build);
-                }
-                if stop {
-                    fold.stop(end);
-                }
+            if i == second
+                && let Some(build) = moved
+            {
+                fold.set_writer(Some(build));
             }
             end += row.len() as u64 + 1;
             fold.push(row.as_bytes(), end);
@@ -1293,7 +1294,7 @@ fn the_writer_holds_the_rows_to_its_build() {
         .find(|(leg, _)| *leg == "continue")
         .map(|(_, want)| *want)
         .expect("the continue leg");
-    let batch = fold_by(ALAB, None, false);
+    let batch = fold_by(ALAB, None);
     assert_eq!(saids(&batch)[1..], *golden);
     assert!(batch.steps[1..].iter().all(|s| s.state == StepState::On));
     let at = |release: &str| {
@@ -1302,20 +1303,20 @@ fn the_writer_holds_the_rows_to_its_build() {
             .map(|s| s.replace("0.164.0-dev.12521", release))
             .collect::<Vec<_>>()
     };
-    let batch = fold_by(ALAB_MANAGED, None, false);
+    let batch = fold_by(ALAB_MANAGED, None);
     assert_eq!(
         saids(&batch)[1..],
         at("0.164.0-dev.12479"),
         "the writer's build"
     );
     assert!(batch.steps[1..].iter().all(|s| s.state == StepState::On));
-    let batch = fold_by("0.164.0-dev.99999+g0123abcd", None, false);
+    let batch = fold_by("0.164.0-dev.99999+g0123abcd", None);
     assert_eq!(saids(&batch)[1..], at("0.164.0-dev.99999"));
     assert!(
         batch.steps.iter().all(|s| s.state == StepState::Partial),
         "no row of a writer nobody measured is exact"
     );
-    let moved = saids(&fold_by(ALAB, Some(ALAB_MANAGED), false));
+    let moved = saids(&fold_by(ALAB, Some(ALAB_MANAGED)));
     assert_eq!(
         moved[1..],
         [
@@ -1328,10 +1329,42 @@ fn the_writer_holds_the_rows_to_its_build() {
         ],
         "a writer that moved says the model again"
     );
-    let stopped = saids(&fold_by(ALAB, None, true));
+    let unmeasured = fold_by(ALAB, Some("0.164.0-dev.99999+g0123abcd"));
     assert_eq!(
-        stopped[1..],
-        [golden[0], golden[1], golden[2], "off unmeasured"],
-        "a reader that stops says off once, and folds nothing more"
+        saids(&unmeasured)[1..],
+        [
+            golden[0],
+            golden[1],
+            golden[2],
+            golden[3],
+            "model gpt-5.5 - 0.164.0-dev.99999",
+            golden[4],
+        ],
+        "a writer that moved onto a build nobody measured is read on, and says the model again"
     );
+    let states: Vec<StepState> = unmeasured.steps[1..].iter().map(|s| s.state).collect();
+    assert_eq!(
+        states,
+        [
+            StepState::On,
+            StepState::On,
+            StepState::On,
+            StepState::Partial,
+            StepState::Partial,
+            StepState::Partial,
+        ],
+        "On up to the move, Partial from it"
+    );
+    let mut none = CodexStepFold::new(0);
+    none.set_writer(None);
+    none.bind_build(FP, ID, 0, Some(ALAB));
+    assert_eq!(
+        (none.reads_at(), none.take().steps[0].state),
+        (StepState::Partial, StepState::Partial),
+        "a writer its reader names no build of is no measured one"
+    );
+    let mut named = CodexStepFold::new(0);
+    named.set_writer(Some(ALAB));
+    named.bind_build(FP, ID, 0, Some(ALAB));
+    assert_eq!(named.reads_at(), StepState::On, "NEGATIVE CONTROL");
 }

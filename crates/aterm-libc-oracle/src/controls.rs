@@ -506,6 +506,13 @@ fn si_pid_header(diffs: &[ShapeDiff], side: Side, is_unsafe: bool) -> bool {
     })
 }
 
+fn planted_link_name_caught(diffs: &[SymbolDiff]) -> bool {
+    diffs.iter().any(|diff| {
+        matches!(diff, SymbolDiff::Mismatch { name, shim, .. }
+            if name == "getpid" && shim == PLANTED_SYMBOL)
+    })
+}
+
 fn diff_verdict<D: fmt::Display>(
     diffs: Result<&[D], &ControlFailure>,
     what: &str,
@@ -674,12 +681,7 @@ pub fn run(
         diff_verdict(
             inline.map(Surface::symbol_diffs),
             &format!("getpid bound to `{PLANTED_SYMBOL}`"),
-            |d| {
-                d.iter().any(|diff| {
-                    matches!(diff, SymbolDiff::Mismatch { name, shim, .. }
-                        if name == "getpid" && shim == PLANTED_SYMBOL)
-                })
-            },
+            planted_link_name_caught,
         ),
     );
 
@@ -874,12 +876,6 @@ mod tests {
 
     #[test]
     fn a_symbol_control_needs_its_own_mismatch() {
-        let caught = |d: &[SymbolDiff]| {
-            d.iter().any(|diff| {
-                matches!(diff, SymbolDiff::Mismatch { name, shim, .. }
-                    if name == "getpid" && shim == PLANTED_SYMBOL)
-            })
-        };
         let planted = SymbolDiff::Mismatch {
             name: "getpid".into(),
             shim: PLANTED_SYMBOL.into(),
@@ -889,11 +885,11 @@ mod tests {
             name: "made_up".into(),
         };
         assert_eq!(
-            diff_verdict(Ok(&[other.clone(), planted]), "x", caught),
+            diff_verdict(Ok(&[other.clone(), planted]), "x", planted_link_name_caught),
             Ok(())
         );
         assert!(matches!(
-            diff_verdict(Ok(&[other]), "x", caught),
+            diff_verdict(Ok(&[other]), "x", planted_link_name_caught),
             Err(ControlFailure::Unattributed { .. })
         ));
         let anchor = ControlFailure::Anchor {
@@ -903,7 +899,7 @@ mod tests {
             expected: 1,
         };
         assert_eq!(
-            diff_verdict::<SymbolDiff>(Err(&anchor), "x", caught),
+            diff_verdict::<SymbolDiff>(Err(&anchor), "x", planted_link_name_caught),
             Err(anchor)
         );
     }

@@ -21,8 +21,10 @@ const GLYPHS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123
 
 /// Line `n` of the fill: its number, then 40 glyphs rotated by `n`.
 pub(crate) fn fill_line(n: u64) -> String {
+    let len = GLYPHS.len() as u64;
+    let base = n % len;
     let body: String = (0..40u64)
-        .map(|c| GLYPHS[((n + c) % GLYPHS.len() as u64) as usize] as char)
+        .map(|c| GLYPHS[((base + c) % len) as usize] as char)
         .collect();
     format!("{n} {body}\n")
 }
@@ -235,6 +237,11 @@ mod tests {
         assert_eq!(fill_line(0), "0 abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN\n");
         assert_eq!(fill_line(1), "1 bcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNO\n");
         assert_eq!(fill_line(66), fill_line(0).replacen('0', "66", 1));
+        let max_mod = u64::MAX % 66;
+        assert_eq!(
+            fill_line(u64::MAX),
+            fill_line(max_mod).replacen(&max_mod.to_string(), &u64::MAX.to_string(), 1)
+        );
     }
 
     #[test]

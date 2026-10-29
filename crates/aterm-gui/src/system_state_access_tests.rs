@@ -123,6 +123,69 @@ fn the_lan_target_is_a_private_subnets_other_host() {
     assert_eq!(lan_target(&[]), None);
 }
 
+/// The Local Network step's reason not to run, which the Commons runtime and a window's other
+/// first LAN uses read: `aterm.toml`'s first, then a network with no subnet for the step to name
+/// (public IPv4 addresses only, an IPv6-only one), where the step's own target is none, so
+/// nothing waits for a step that asks nothing. A Mac on no network yet still waits: the step
+/// asks once it joins one with a subnet to name.
+#[test]
+fn a_network_the_local_network_step_cannot_name_holds_nothing_for_it() {
+    use super::{LOCAL_NETWORK_STEP_NO_LAN, local_network_step_off_with};
+    use crate::app_config::LOCAL_NETWORK_STEP_PRIVACY_OFF;
+    let slash24 = ip(255, 255, 255, 0);
+    let public = lan(ip(17, 5, 7, 8), slash24);
+    let home = lan(ip(192, 168, 1, 23), slash24);
+    let tunnel = LanInterface {
+        broadcast: false,
+        ..lan(ip(10, 8, 0, 2), slash24)
+    };
+    let unnamed: [(&[LanInterface], bool, &str); 3] = [
+        (&[public], false, "public IPv4 addresses only"),
+        (&[], true, "an IPv6-only network"),
+        (&[tunnel], true, "an IPv6 network under a VPN's tunnel"),
+    ];
+    for (interfaces, ipv6, why) in unnamed {
+        assert_eq!(
+            local_network_step_off_with(None, interfaces, ipv6),
+            Some(LOCAL_NETWORK_STEP_NO_LAN),
+            "{why}"
+        );
+    }
+    let named_or_none: [(&[LanInterface], bool, &str); 3] = [
+        (&[public, home], true, "a private subnet: the step asks"),
+        (&[], false, "no network yet"),
+        (&[tunnel], false, "a VPN's tunnel and no network"),
+    ];
+    for (interfaces, ipv6, why) in named_or_none {
+        assert_eq!(
+            local_network_step_off_with(None, interfaces, ipv6),
+            None,
+            "{why}"
+        );
+    }
+    assert_eq!(
+        local_network_step_off_with(Some(LOCAL_NETWORK_STEP_PRIVACY_OFF), &[home], false),
+        Some(LOCAL_NETWORK_STEP_PRIVACY_OFF),
+        "aterm.toml's reason comes first"
+    );
+    // On a network, the uses go exactly where the step's own trigger has no target.
+    let networks: [&[LanInterface]; 6] = [
+        &[public],
+        &[home],
+        &[tunnel, home],
+        &[public, lan(ip(169, 254, 3, 4), ip(255, 255, 0, 0))],
+        &[lan(ip(10, 0, 0, 4), ip(255, 255, 255, 254))],
+        &[],
+    ];
+    for interfaces in networks {
+        assert_eq!(
+            local_network_step_off_with(None, interfaces, true).is_some(),
+            lan_target(interfaces).is_none(),
+            "{interfaces:?}"
+        );
+    }
+}
+
 fn observed(subject: Subject, standing: Standing, note: Option<&str>) -> Observation {
     Observation {
         subject,
@@ -1030,6 +1093,132 @@ fn the_local_network_trigger_and_record_own_the_dialog_slot() {
     assert!(!macos_dialog_up());
 }
 
+thread_local! {
+    /// Each hand-over of the LAN to the Commons runtime: its revision, and whether a macOS dialog
+    /// of this process counted as up then.
+    static HANDED: RefCell<Vec<(u64, bool)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn handed() -> Vec<(u64, bool)> {
+    HANDED.with(|handed| handed.borrow().clone())
+}
+
+/// The Local Network step hands this process's LAN to the Commons runtime once its trigger asked
+/// macOS, while its own dialog slot is held (`docs/DESIGN-system-state-2026-10-21.md` §6, step 1),
+/// so Commons' first LAN use never raises the question first: never before the step's moment,
+/// never twice, never for a trigger that asked nothing (only for the retry that does), and never
+/// for a revision the record already holds.
+#[test]
+fn the_local_network_step_hands_the_lan_to_commons_under_its_slot() {
+    use aterm_types::macos_setup::macos_dialog_up;
+
+    let _serial = DIALOG_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(!macos_dialog_up());
+    HANDED.with(|handed| handed.borrow_mut().clear());
+    let reach = StepsReach {
+        hand_lan_over: |revision| {
+            HANDED.with(|handed| handed.borrow_mut().push((revision, macos_dialog_up())));
+        },
+        dialog_up: macos_dialog_up,
+        holds_dialog: true,
+        ..stepping()
+    };
+    let now = Instant::now();
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(StepsReach {
+        quiet: |_, _| false,
+        ..reach
+    });
+    approve(&mut app, 51);
+    app.tick_local_network_step(now);
+    assert_eq!(handed(), [], "not before the step's moment");
+
+    app.access_steps.set_reach(reach);
+    let recorded = records().len();
+    app.tick_local_network_step(now);
+    assert_eq!(handed(), [(51, true)], "handed over under the step's slot");
+    assert_eq!(
+        records()[recorded..],
+        [(51, Access::LocalNetwork, AccessOutcome::Triggered)]
+    );
+    app.settle_access_steps(now);
+    let later = now + LOCAL_NETWORK_ALERT_HOLD;
+    app.tick_local_network_step(later);
+    app.settle_access_steps(later);
+    app.tick_local_network_step(later + super::LOCAL_NETWORK_RETRY);
+    assert_eq!(handed(), [(51, true)], "once");
+    drop(app);
+    assert!(!macos_dialog_up());
+
+    // A trigger that asked nothing hands nothing over; the retry that finds a LAN does, once.
+    HANDED.with(|handed| handed.borrow_mut().clear());
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(StepsReach {
+        trigger_local_network: no_lan,
+        ..reach
+    });
+    approve(&mut app, 52);
+    app.tick_local_network_step(now);
+    assert_eq!(handed(), [], "no LAN was named");
+    assert!(!macos_dialog_up());
+    app.access_steps.set_reach(reach);
+    let retry = now + super::LOCAL_NETWORK_RETRY;
+    app.tick_local_network_step(retry);
+    assert_eq!(handed(), [(52, true)], "the retry asked");
+    app.settle_access_steps(retry);
+    let after = retry + LOCAL_NETWORK_ALERT_HOLD;
+    app.tick_local_network_step(after);
+    app.settle_access_steps(after);
+    app.tick_local_network_step(after + super::LOCAL_NETWORK_RETRY);
+    assert_eq!(handed(), [(52, true)], "once");
+    drop(app);
+    assert!(!macos_dialog_up());
+
+    // A revision the record holds is done: nothing asked, nothing handed over.
+    HANDED.with(|handed| handed.borrow_mut().clear());
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(StepsReach {
+        recorded: |_, _| Some(AccessOutcome::Triggered),
+        ..reach
+    });
+    approve(&mut app, 53);
+    app.tick_local_network_step(now);
+    assert_eq!(handed(), [], "on record");
+    drop(app);
+    assert!(!macos_dialog_up());
+}
+
+/// The `[privacy]` switches that hold System State's steps, and the Local Network step's reason
+/// not to run that the Commons runtime reads: each switch off holds them; `[swarm] enabled =
+/// false` holds only the Local Network step; the defaults hold nothing.
+#[test]
+fn a_privacy_switch_or_swarm_off_says_why_the_local_network_step_will_not_run() {
+    use crate::app_config::{Config, LOCAL_NETWORK_STEP_PRIVACY_OFF, LOCAL_NETWORK_STEP_SWARM_OFF};
+    let read = |text: &str| aterm_toml::from_str::<Config>(text).unwrap();
+    let defaults = read("");
+    assert!(defaults.access_steps_allowed());
+    assert_eq!(defaults.local_network_step_off(), None);
+    for switch in ["enabled", "check", "notice"] {
+        let config = read(&format!("[privacy]\n{switch} = false\n"));
+        assert!(!config.access_steps_allowed(), "{switch}");
+        assert_eq!(
+            config.local_network_step_off(),
+            Some(LOCAL_NETWORK_STEP_PRIVACY_OFF),
+            "{switch}"
+        );
+        let on = read(&format!("[privacy]\n{switch} = true\n"));
+        assert!(on.access_steps_allowed(), "{switch} on");
+    }
+    let swarm_off = read("[swarm]\nenabled = false\n");
+    assert!(swarm_off.access_steps_allowed());
+    assert_eq!(
+        swarm_off.local_network_step_off(),
+        Some(LOCAL_NETWORK_STEP_SWARM_OFF)
+    );
+}
+
 #[cfg(target_os = "macos")]
 fn check_handoff_dialog_slot(page: crate::devtools_helper::Page) {
     use crate::devtools_helper::{HandOver, Origin, test_arms};
@@ -1520,6 +1709,429 @@ fn the_local_network_step_waits_for_its_moment_and_honours_the_opt_outs() {
     approve(&mut app, 5);
     app.tick_local_network_step(now);
     assert_eq!(triggers(), fired, "another macOS dialog is up");
+}
+
+/// A Local Network step held from its moment says in aterm.log what holds it, once per change of
+/// that set and never once per look, on an instance whose step can run: the revision, which part
+/// of System State in front fails, and, with System State in front, which part of the quiet
+/// moment. A lasting hold (no approved revision) is said alone, and System State out of view in
+/// the window last focused is said alone too, so keys typed and focus moved meanwhile say nothing
+/// more. Its moment coming clears it, so a later hold is said again.
+/// NEGATIVE CONTROL: the same App with an instance's inert arms says nothing at all.
+#[test]
+fn a_held_local_network_step_names_its_hold_once_per_change() {
+    let fired = triggers();
+    let mut app = App::headless_for_test();
+    app.devtools_helper.note_cold_start();
+    let now = Instant::now() + crate::devtools_helper::COLD_START_SETTLE;
+    let names = StepsReach {
+        frontmost: App::system_state_frontmost,
+        quiet: App::step_moment_is_quiet,
+        names_holds: true,
+        ..stepping()
+    };
+    app.access_steps.set_reach(StepsReach {
+        names_holds: false,
+        ..names
+    });
+    focus(&mut app, false);
+    app.user_input_recent = |_| true;
+    app.last_keystroke_at = Some(now);
+    app.tick_local_network_step(now);
+    assert_eq!(
+        app.note_local_network_hold(now, None),
+        None,
+        "control: an instance whose step cannot run says nothing"
+    );
+    assert_eq!(app.access_steps.local_network_held, None);
+
+    app.access_steps.set_reach(names);
+    let line = app
+        .note_local_network_hold(now, None)
+        .expect("a step with no approved revision waits");
+    assert_eq!(
+        line,
+        "system state: the Local Network step waits: no approved setup revision admits the \
+         Permissions group",
+        "a lasting hold is said alone"
+    );
+    focus(&mut app, true);
+    app.last_keystroke_at = None;
+    assert_eq!(
+        app.note_local_network_hold(now, None),
+        None,
+        "the same hold is said once, whatever the keys and focus do meanwhile"
+    );
+
+    approve(&mut app, 5);
+    app.last_keystroke_at = Some(now);
+    assert!(app.open_system_state_tab_quietly(), "System State behind");
+    app.tick_local_network_step(now);
+    assert_eq!(triggers(), fired, "held: nothing asked");
+    assert_eq!(
+        app.access_steps.local_network_held.as_deref(),
+        Some(&["System State is not in view in the aterm window last focused".to_owned()][..]),
+        "the revision no longer holds it; out of view, only that is said"
+    );
+    for (focused, typed) in [(false, None), (true, Some(now)), (false, Some(now))] {
+        focus(&mut app, focused);
+        app.last_keystroke_at = typed;
+        assert_eq!(
+            app.note_local_network_hold(now, Some(5)),
+            None,
+            "typing and focus elsewhere say nothing: focused {focused}, typed {typed:?}"
+        );
+    }
+
+    assert!(app.open_system_state_tab(), "System State in front");
+    let wid = app.frontmost_window.expect("a front window");
+    assert!(app.commit_glassless_native_frame(wid));
+    let line = app
+        .note_local_network_hold(now, Some(5))
+        .expect("the hold changed");
+    assert_eq!(
+        line,
+        "system state: the Local Network step waits (revision 5): no aterm window has keyboard \
+         focus",
+        "System State in view: the front's own part, and no quiet part"
+    );
+    focus(&mut app, true);
+    assert!(app.system_state_frontmost(), "precondition: in front");
+    let line = app
+        .note_local_network_hold(now, Some(5))
+        .expect("the hold changed");
+    assert_eq!(
+        line,
+        "system state: the Local Network step waits (revision 5): a key was typed into aterm in \
+         the last 10 s"
+    );
+    assert_eq!(
+        app.note_local_network_hold(now, Some(5)),
+        None,
+        "a look that finds the same says nothing"
+    );
+
+    app.last_keystroke_at = None;
+    app.tick_local_network_step(now);
+    assert_eq!(triggers(), fired + 1, "its moment came");
+    assert_eq!(
+        app.access_steps.local_network_held, None,
+        "the moment clears the hold"
+    );
+}
+
+/// System State out of view in the aterm window last focused holds the Local Network step with
+/// those words alone: behind another tab, a macOS dialog of this process counting up adds
+/// nothing, and laid out beside the active view of a split, the person switching apps adds no
+/// line, focused or not. NEGATIVE CONTROL: with System State that window's active view, the
+/// focus it lacks is named.
+#[test]
+fn system_state_out_of_view_is_the_local_network_steps_one_hold() {
+    use crate::native_settings::{SettingsRoute, SettingsViewState};
+    let reach = StepsReach {
+        frontmost: App::system_state_frontmost,
+        quiet: App::step_moment_is_quiet,
+        names_holds: true,
+        dialog_up: || true,
+        ..stepping()
+    };
+    let fresh = || {
+        let mut app = App::headless_for_test();
+        app.devtools_helper.note_cold_start();
+        app.access_steps.set_reach(reach);
+        app.user_input_recent = |_| true;
+        approve(&mut app, 5);
+        app
+    };
+    let now = Instant::now() + crate::devtools_helper::COLD_START_SETTLE;
+    let said = |app: &App| app.local_network_holds(now);
+
+    let mut behind = fresh();
+    assert!(
+        behind.open_system_state_tab_quietly(),
+        "System State behind"
+    );
+    for focused in [false, true] {
+        focus(&mut behind, focused);
+        assert_eq!(
+            said(&behind),
+            ["System State is not in view in the aterm window last focused"],
+            "behind, a dialog counting up, focused {focused}"
+        );
+    }
+
+    let mut split = fresh();
+    let wid = split.frontmost_window.expect("a window");
+    assert!(split.open_settings_tab(SettingsRoute::Home));
+    let (settings, _) = split.active_native_view(wid).expect("Settings' view");
+    assert!(split.open_system_state_tab(), "System State in front");
+    let state = SettingsViewState::new(&split.config);
+    split
+        .split_active_with_native(
+            wid,
+            crate::tab_model::SplitAxis::Horizontal,
+            settings,
+            crate::native_app::AppViewState::Settings(Box::new(state)),
+        )
+        .expect("split");
+    for focused in [false, true, false] {
+        focus(&mut split, focused);
+        assert_eq!(
+            said(&split),
+            ["System State is not the active view in the aterm window last focused"],
+            "laid out beside the active pane, focused {focused}"
+        );
+    }
+
+    let mut active = fresh();
+    assert!(active.open_system_state_tab(), "System State in front");
+    focus(&mut active, false);
+    assert_eq!(said(&active), ["no aterm window has keyboard focus"]);
+}
+
+/// While System State's Local Network step is still to run and nothing but a lasting reason
+/// holds it, a `[privacy]` switch off, aterm.log says that reason alone, once, however the person
+/// types or moves between windows meanwhile.
+#[test]
+fn a_privacy_switch_off_is_the_local_network_steps_one_hold() {
+    let mut app = App::headless_for_test();
+    app.devtools_helper.note_cold_start();
+    let now = Instant::now() + crate::devtools_helper::COLD_START_SETTLE;
+    app.access_steps.set_reach(StepsReach {
+        quiet: App::step_moment_is_quiet,
+        names_holds: true,
+        ..stepping()
+    });
+    app.user_input_recent = |_| true;
+    app.set_privacy_for_test(switches(Some("notice")));
+    approve(&mut app, 5);
+    focus(&mut app, false);
+    app.tick_local_network_step(now);
+    assert_eq!(
+        app.access_steps.local_network_held.as_deref(),
+        Some(&["a [privacy] switch (enabled, check or notice) is off".to_owned()][..])
+    );
+    for (focused, typed) in [(true, Some(now)), (true, None), (false, None)] {
+        focus(&mut app, focused);
+        app.last_keystroke_at = typed;
+        assert_eq!(
+            app.note_local_network_hold(now, Some(5)),
+            None,
+            "focused {focused}, typed {typed:?}"
+        );
+    }
+}
+
+/// System State's steps' quiet moment reads aterm's own keys at rest, not the pointer: with the
+/// person at the Mac moving the pointer every few seconds (macOS's idle time never past
+/// `QUIET_FOR`, as the lab's person nudges it every 5 s), the Local Network step asks once no key
+/// was typed into aterm for `QUIET_FOR`, and a key typed within it holds the step and is named.
+/// NEGATIVE CONTROL: the control verb's moment, keyboard and pointer both, reads that person as
+/// busy, as the steps' moment did.
+#[test]
+fn the_local_network_step_asks_while_the_person_moves_the_pointer() {
+    use crate::devtools_helper::{COLD_START_SETTLE, QUIET_FOR};
+    let fired = triggers();
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(StepsReach {
+        quiet: StepsReach::live().quiet,
+        names_holds: true,
+        ..stepping()
+    });
+    app.devtools_helper.note_cold_start();
+    focus(&mut app, true);
+    app.user_input_recent = |_| true;
+    approve(&mut app, 5);
+    let now = Instant::now() + COLD_START_SETTLE + Duration::from_secs(1);
+    app.last_keystroke_at = Some(now - Duration::from_secs(3));
+    assert!(
+        !app.devtools_moment_is_quiet(now),
+        "control: the pointer moves, so the keyboard-and-pointer moment never comes"
+    );
+    app.tick_local_network_step(now);
+    assert_eq!(triggers(), fired, "a key 3 s ago holds the step");
+    assert_eq!(
+        app.access_steps.local_network_held.as_deref(),
+        Some(&["a key was typed into aterm in the last 10 s".to_owned()][..])
+    );
+    let later = now + QUIET_FOR;
+    assert!(!app.devtools_moment_is_quiet(later));
+    app.tick_local_network_step(later);
+    assert_eq!(
+        triggers(),
+        fired + 1,
+        "keys at rest, the pointer still moving: the step asks"
+    );
+}
+
+/// The quiet moment's parts in aterm.log's words, the control verb's and the steps', are empty
+/// exactly when that moment is quiet, over focus, input, keys, a focus taken back, and macOS's
+/// idle time read or not.
+#[test]
+fn the_quiet_moments_gaps_are_empty_only_when_it_is_quiet() {
+    let now = Instant::now() + crate::devtools_helper::COLD_START_SETTLE + Duration::from_secs(1);
+    let inputs: [fn(Duration) -> bool; 3] = [
+        |_| true,
+        |_| false,
+        |within| within > crate::devtools_helper::QUIET_FOR,
+    ];
+    let readings: [fn() -> bool; 2] = [|| true, || false];
+    let mut quiet_seen = false;
+    for focused in [false, true] {
+        for input in inputs {
+            for readable in readings {
+                let mut app = App::headless_for_test();
+                app.devtools_helper.note_cold_start();
+                focus(&mut app, focused);
+                app.user_input_recent = input;
+                app.user_input_readable = readable;
+                let quiet = app.devtools_moment_is_quiet(now);
+                quiet_seen |= quiet;
+                assert_eq!(
+                    app.quiet_gaps(now, false).is_empty(),
+                    quiet,
+                    "focused {focused}: {:?}",
+                    app.quiet_gaps(now, false)
+                );
+                for typed in [None, Some(now), Some(now - Duration::from_secs(11))] {
+                    for back in [None, Some(now - Duration::from_secs(1))] {
+                        app.last_keystroke_at = typed;
+                        app.keyboard_focus_back_at = back;
+                        let quiet = app.step_moment_is_quiet(now);
+                        quiet_seen |= quiet;
+                        assert_eq!(
+                            app.step_quiet_gaps(now).is_empty(),
+                            quiet,
+                            "steps, focused {focused}, typed {typed:?}, back {back:?}: {:?}",
+                            app.step_quiet_gaps(now)
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(quiet_seen, "one case is quiet");
+}
+
+/// System State's steps never take macOS's unreadable idle time for a person at the Mac: the live
+/// input reading answers "input just now" when `HIDIdleTime` cannot be read, which holds no step
+/// that reads only aterm's keys, so the step holds and names it until the person is seen in aterm
+/// (a click in an aterm window within `PRESENT_WITHIN`, which aterm sees itself), never for good.
+/// NEGATIVE CONTROL: the idle time read again lets the step ask with no click.
+#[test]
+fn the_steps_wait_while_macos_idle_time_cannot_be_read() {
+    let fired = triggers();
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(StepsReach {
+        quiet: StepsReach::live().quiet,
+        names_holds: true,
+        ..stepping()
+    });
+    app.devtools_helper.note_cold_start();
+    focus(&mut app, true);
+    app.user_input_recent = |_| true;
+    app.user_input_readable = || false;
+    approve(&mut app, 5);
+    let now = Instant::now() + crate::devtools_helper::COLD_START_SETTLE + Duration::from_secs(1);
+    app.last_person_input_at = now.checked_sub(crate::devtools_helper::PRESENT_WITHIN);
+    app.tick_local_network_step(now);
+    assert_eq!(triggers(), fired, "nobody known to be at the Mac: no alert");
+    assert_eq!(
+        app.access_steps.local_network_held.as_deref(),
+        Some(
+            &[
+                "macOS's idle time could not be read, and nobody typed, clicked or scrolled in \
+               aterm in the last 5 min"
+                    .to_owned()
+            ][..]
+        )
+    );
+    let clicked = now + Duration::from_secs(1);
+    app.last_person_input_at = Some(clicked);
+    app.tick_local_network_step(clicked);
+    assert_eq!(triggers(), fired + 1, "a click in aterm: the step asks");
+
+    let mut read = App::headless_for_test();
+    read.access_steps.set_reach(app.access_steps.reach);
+    read.devtools_helper.note_cold_start();
+    focus(&mut read, true);
+    read.user_input_recent = |_| true;
+    approve(&mut read, 5);
+    read.tick_local_network_step(now);
+    assert_eq!(
+        triggers(),
+        fired + 2,
+        "control: the idle time read, no click"
+    );
+}
+
+/// Keys typed while no aterm window had keyboard focus (into another app before a click brought
+/// aterm's System State to the front) are not seen as aterm's keys, so the steps' key rest counts
+/// from the window taking focus back: the Local Network step waits `QUIET_FOR` after that return
+/// and names it. NEGATIVE CONTROL: focus passing for a moment (shorter than `FOCUS_AWAY_FOR`)
+/// holds nothing.
+#[test]
+fn the_steps_key_rest_counts_from_aterm_taking_focus_back() {
+    use crate::devtools_helper::{COLD_START_SETTLE, QUIET_FOR};
+    let fired = triggers();
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(StepsReach {
+        quiet: StepsReach::live().quiet,
+        names_holds: true,
+        ..stepping()
+    });
+    app.devtools_helper.note_cold_start();
+    focus(&mut app, true);
+    app.user_input_recent = |_| true;
+    approve(&mut app, 5);
+    let wid = crate::WindowId(0);
+    let settled = Instant::now() + COLD_START_SETTLE + Duration::from_secs(1);
+
+    // A flick on the test's own clock: focus gone 5 ms, then back.
+    let flick = settled - Duration::from_secs(2);
+    focus(&mut app, false);
+    app.note_keyboard_focus(true, flick);
+    focus(&mut app, true);
+    app.note_keyboard_focus(false, flick + Duration::from_millis(5));
+    assert_eq!(app.keyboard_focus_back_at, None, "a flick is no return");
+    assert!(
+        app.step_moment_is_quiet(settled),
+        "control: a flick of focus holds no typing"
+    );
+
+    // The window's own Focused events note the edges: the time each read is the edge's own.
+    app.window_focus_event(wid, false);
+    assert!(!app.any_os_window_focused(), "precondition: away");
+    let lost = app.keyboard_focus_lost_at.expect("the loss is noted");
+    // The person was in another app, typing, for 20 s.
+    app.keyboard_focus_lost_at = lost.checked_sub(Duration::from_secs(20));
+    app.window_focus_event(wid, true);
+    let back = app
+        .keyboard_focus_back_at
+        .expect("back after 20 s away: the return is noted");
+    let now = back.max(settled);
+    app.tick_local_network_step(now);
+    assert_eq!(
+        triggers(),
+        fired,
+        "keys typed elsewhere may still be coming"
+    );
+    assert_eq!(
+        app.access_steps.local_network_held.as_deref(),
+        Some(
+            &[
+                "an aterm window took keyboard focus back in the last 10 s (keys typed while none \
+               had it were not seen)"
+                    .to_owned()
+            ][..]
+        )
+    );
+    app.tick_local_network_step(back + QUIET_FOR);
+    assert_eq!(
+        triggers(),
+        fired + 1,
+        "at rest since the return: the step asks"
+    );
 }
 
 /// Outcomes are recorded under the approved revision only; an unchanged
@@ -3243,7 +3855,7 @@ fn a_press_while_no_revision_stands_keeps_the_full_disk_access_page_shown_for_it
         static MARK: RefCell<Option<String>> = const { RefCell::new(None) };
     }
     let fda_marked = test_arms::fda_marking(
-        || MARK.with(|mark| mark.borrow().clone().map(|word| (word, 1))),
+        |_| MARK.with(|mark| mark.borrow().clone().map(|word| (word, 1))),
         |word| MARK.with(|mark| *mark.borrow_mut() = Some(word.to_owned())),
     );
     let on_record = StepsReach {
@@ -3287,7 +3899,7 @@ fn a_press_while_no_revision_stands_keeps_the_full_disk_access_page_shown_for_it
 }
 
 /// A Developer Tools reading that finds aterm missing asks for the window's own page only while
-/// the record holds no `handed` for the revision: `aterm doctor --fix` writes the one-line
+/// the record holds no `handed` for the revision: `aterm doctor` writes the one-line
 /// marker under the running version, so the marker alone would ask again.
 #[cfg(target_os = "macos")]
 #[test]
@@ -3565,7 +4177,7 @@ fn an_ask_the_waiting_developer_tools_step_carried_is_judged_when_the_step_is_re
 fn an_ask_the_waiting_full_disk_access_step_carried_is_judged_when_the_step_is_refused() {
     use crate::devtools_helper::{HandOver, Moment, Origin, test_arms};
     use aterm_containment::consent::FdaState;
-    let shown = test_arms::fda_marking(|| Some((atpkg::devtools::revision_key(1), 1)), |_| {});
+    let shown = test_arms::fda_marking(|_| Some((atpkg::devtools::revision_key(1), 1)), |_| {});
     let on_record = StepsReach {
         recorded: |_, access| (access == Access::LocalNetwork).then_some(AccessOutcome::Triggered),
         frontmost: front,
@@ -3663,7 +4275,7 @@ fn the_control_verbs_ask_that_rides_the_step_keeps_its_own_quiet_moment() {
         static RECENT: Cell<bool> = const { Cell::new(false) };
     }
     let mut marking = test_arms::opening();
-    marking.note_opened = |_| RECENT.with(|recent| recent.set(true));
+    marking.note_opened = |_, _| RECENT.with(|recent| recent.set(true));
     marking.opened_within = |_| RECENT.with(Cell::get).then_some(0);
     for (ask, handed) in [(false, false), (true, false), (true, true)] {
         set_front(false);
@@ -3725,6 +4337,367 @@ fn the_control_verbs_ask_that_rides_the_step_keeps_its_own_quiet_moment() {
             "ask {ask}, handed {handed}: the revision's own page, unless it came up already"
         );
     }
+}
+
+/// A control verb's Developer Tools ask, queued alone or riding the window's own step, waits
+/// while the Local Network alert the window raised holds the screen: its moment keeps the steps'
+/// one-gesture rule (`App::control_ask_moment`), so its page does not come up during the alert's
+/// hold, and comes up once the hold is over.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_control_verbs_ask_waits_out_the_local_network_alert() {
+    use crate::devtools_helper::{
+        DevToolsHelperArm, HandOver, Lane, Origin, RECHECK_EVERY, test_arms,
+    };
+    use aterm_containment::DevToolGrant;
+    set_front(true);
+    for riding in [false, true] {
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+        app.access_steps.set_reach(StepsReach {
+            recorded: |_, _| None,
+            ..app.access_steps.reach
+        });
+        app.consent = reread(aterm_containment::consent::FdaState::Granted);
+        test_arms::stand_in(&mut app, test_arms::opening());
+        app.devtools_helper =
+            Lane::windowed_for_test(test_arms::opening(), DevToolsHelperArm::inert());
+        app.devtools_helper.note_reading(
+            test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(2)),
+            Instant::now(),
+        );
+        focus(&mut app, true);
+        app.user_input_recent = |within| within == crate::devtools_helper::PRESENT_WITHIN;
+        let t0 = Instant::now() + crate::consent_card::LAUNCH_SETTLE;
+        assert!(
+            app.devtools_moment_is_quiet(t0),
+            "precondition: the verb's quiet moment"
+        );
+        if riding {
+            assert_eq!(
+                app.hand_devtools_to_owner(Origin::Automatic),
+                HandOver::Queued
+            );
+        }
+        assert_eq!(app.hand_devtools_to_owner(Origin::Ctl), HandOver::Queued);
+        let (opens, asked) = (test_arms::opens(), triggers());
+        let hold = LOCAL_NETWORK_ALERT_HOLD;
+        let mut park = Duration::ZERO;
+        while park < hold {
+            app.tick_consent_lanes(t0 + park);
+            park += RECHECK_EVERY;
+        }
+        assert_eq!(
+            (triggers(), test_arms::opens()),
+            (asked + 1, opens),
+            "riding {riding}: the alert first, and no page beside it"
+        );
+        app.tick_consent_lanes(t0 + hold);
+        assert_eq!(
+            test_arms::opens(),
+            opens + 1,
+            "riding {riding}: the page once the alert's hold is over"
+        );
+    }
+}
+
+/// [`a_control_verbs_ask_waits_out_the_local_network_alert`] for an ask whose own `spctl` run
+/// ends while the alert's hold is up: judged again at the run's end
+/// (`App::devtools_hand_over_after_listing`), it waits, and brings the page up with that run's
+/// answer once the hold is over.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_control_verbs_run_that_ends_under_the_local_network_alert_waits_it_out() {
+    use crate::devtools_helper::{DevToolsHelperArm, HandOver, Lane, Moment, Origin, test_arms};
+    use aterm_containment::DevToolGrant;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    // `spctl` runs on the lane's worker thread.
+    static RUNS: AtomicU32 = AtomicU32::new(0);
+    let mut counted = test_arms::opening();
+    counted.list_terminal = || {
+        RUNS.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    };
+    let run_out = |app: &mut App, at: Instant| {
+        let start = Instant::now();
+        while app.devtools_helper.listing().is_some() {
+            assert!(start.elapsed() < Duration::from_secs(60), "hang");
+            app.tick_devtools_hand_over(at);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    set_front(true);
+    let mut app = new_mac(counted, test_arms::fda_opening());
+    app.access_steps.set_reach(StepsReach {
+        recorded: |_, _| None,
+        ..app.access_steps.reach
+    });
+    app.consent = reread(aterm_containment::consent::FdaState::Granted);
+    test_arms::stand_in(&mut app, counted);
+    app.devtools_helper = Lane::windowed_for_test(counted, DevToolsHelperArm::inert());
+    app.devtools_helper.note_reading(
+        test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(0)),
+        Instant::now(),
+    );
+    focus(&mut app, true);
+    app.user_input_recent = |within| within == crate::devtools_helper::PRESENT_WITHIN;
+    let t0 = Instant::now() + crate::consent_card::LAUNCH_SETTLE;
+    assert_eq!(
+        app.devtools_hand_over(Origin::Ctl, Moment::Quiet),
+        HandOver::Listing
+    );
+    let asked = triggers();
+    app.tick_local_network_step(t0);
+    assert_eq!(
+        triggers(),
+        asked + 1,
+        "the alert comes up while the run is out"
+    );
+    let opens = test_arms::opens();
+    run_out(&mut app, t0);
+    assert_eq!(
+        (test_arms::opens(), app.devtools_helper.queued()),
+        (opens, Some(Origin::Ctl)),
+        "the run's end finds the alert up: the ask waits"
+    );
+    app.tick_consent_lanes(t0 + LOCAL_NETWORK_ALERT_HOLD);
+    run_out(&mut app, t0 + LOCAL_NETWORK_ALERT_HOLD);
+    assert_eq!(
+        (test_arms::opens(), RUNS.load(Ordering::SeqCst)),
+        (opens + 1, 1),
+        "its page once the hold is over, with its own run's answer"
+    );
+}
+
+/// A Developer Tools reading made while no revision stands (the launch read before the first
+/// setup status) takes no version-keyed marker (`aterm doctor`'s) for a revision's page:
+/// it asks, the window's own step waits queued for the revision, and its page comes up at the
+/// step moment once the revision stands.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_developer_tools_reading_with_no_revision_queues_the_step_for_the_revision() {
+    use crate::consent_state::SlotKind;
+    use crate::devtools_helper::{Origin, test_arms};
+    use aterm_containment::consent::FdaState;
+    use aterm_containment::{DevToolProbe, DevToolProbeLabel, DevToolState, ProbeGate};
+    fn not_on(_gate: ProbeGate, _subject: &str) -> DevToolProbe {
+        DevToolProbe {
+            state: DevToolState::Unlisted,
+            label: DevToolProbeLabel::Observed,
+            requests: Some(1),
+            not_allowed: Some(1),
+            answered_at_ms: Some(1),
+        }
+    }
+    fn subject() -> Option<&'static str> {
+        Some(test_arms::SUBJECT)
+    }
+    set_front(true);
+    let doctors = test_arms::marked(|| Some((aterm_types::version::app_version().to_owned(), 1)));
+    let mut app = new_mac(doctors, test_arms::fda_opening());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut consent = reread(FdaState::Granted);
+    consent.set_devtools_arms_for_test(not_on, subject);
+    consent.set_slot_wake(std::sync::Arc::new(move |kind: SlotKind| {
+        if kind == SlotKind::Devtools {
+            let _ = tx.send(());
+        }
+    }));
+    app.consent = consent;
+    focus(&mut app, true);
+    app.set_privacy_for_test(switches(None));
+    app.observe_initial_setup_permissions(None);
+    app.read_devtools_list(Instant::now());
+    rx.recv_timeout(Duration::from_secs(60))
+        .unwrap_or_else(|_| panic!("the launch read runs"));
+    app.on_devtools_probe_ready();
+    assert_eq!(
+        app.devtools_helper.queued(),
+        Some(Origin::Automatic),
+        "the step waits for its revision"
+    );
+    approve(&mut app, 1);
+    let opens = test_arms::opens();
+    let mut t = Instant::now();
+    parks(&mut app, &mut t, 3);
+    assert_eq!(test_arms::opens(), opens + 1, "the revision's own page");
+}
+
+/// The helper panel's Show it is a door the window opens: a page a person's press brought up
+/// before any revision stood, shown again by Show it once a revision is approved, writes the
+/// revision's marker and `handed` and answers the window's own step waiting it out, so that
+/// step does not bring the page up a second time in the revision.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_panels_show_it_puts_its_page_on_record() {
+    use crate::devtools_helper::{HandOver, Origin, PanelEvent, test_arms};
+    use aterm_containment::consent::FdaState;
+    use std::cell::RefCell;
+    thread_local! {
+        static MARK: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+    fn recorded(revision: u64, access: Access) -> Option<AccessOutcome> {
+        if access != Access::DeveloperTools {
+            return Some(AccessOutcome::Triggered);
+        }
+        records()
+            .into_iter()
+            .rev()
+            .find(|&(r, a, _)| (r, a) == (revision, access))
+            .map(|(_, _, outcome)| outcome)
+    }
+    fn handed(revision: u64, access: Access) -> bool {
+        records().contains(&(revision, access, AccessOutcome::Handed))
+    }
+    let mut marking = test_arms::opening();
+    // The panel's own list reads keep aterm off, so only Show it answers the step, and the panel
+    // never turns Done (whose real-time close would race the loop below).
+    marking.read_list = |_, _| test_arms::absent(2);
+    marking.last_opened = || MARK.with(|mark| mark.borrow().clone().map(|word| (word, 1)));
+    marking.note_opened = |word, _| MARK.with(|mark| *mark.borrow_mut() = Some(word.to_owned()));
+    RECORDS.with(|r| r.borrow_mut().clear());
+    set_front(true);
+    let mut app = new_mac(marking, test_arms::fda_opening());
+    app.access_steps.set_reach(StepsReach {
+        recorded,
+        handed,
+        ..app.access_steps.reach
+    });
+    app.consent = reread(FdaState::Granted);
+    test_arms::stand_in(&mut app, marking);
+    app.observe_initial_setup_permissions(None);
+    assert_eq!(
+        app.hand_devtools_to_owner(Origin::Automatic),
+        HandOver::Queued
+    );
+    let pressed = Instant::now();
+    assert_eq!(
+        app.hand_devtools_to_owner(Origin::Settings),
+        HandOver::Opened
+    );
+    approve(&mut app, 1);
+    let mut t = pressed;
+    parks(&mut app, &mut t, 1);
+    assert_eq!(
+        (
+            app.devtools_helper.queued(),
+            handed(1, Access::DeveloperTools)
+        ),
+        (Some(Origin::Automatic), false),
+        "precondition: the step waits out a page that is not the revision's"
+    );
+    let opens = test_arms::opens();
+    app.devtools_helper.press_for_test(PanelEvent::ShowList);
+    let start = Instant::now();
+    while test_arms::opens() == opens {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "Show it brings the page up"
+        );
+        app.tick_devtools_hand_over(Instant::now());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        MARK.with(|mark| mark.borrow().clone()),
+        Some(atpkg::devtools::revision_key(1)),
+        "the revision's marker"
+    );
+    assert!(handed(1, Access::DeveloperTools), "and its `handed`");
+    assert_eq!(app.devtools_helper.queued(), None, "the step is answered");
+    let mut t = pressed + Duration::from_secs(atpkg::devtools::REOPEN_AFTER_S);
+    parks(&mut app, &mut t, 3);
+    assert_eq!(test_arms::opens(), opens + 1, "once in the revision");
+}
+
+/// Show it while no revision stands marks its page as the door does: the marker under the
+/// running version, and nothing on record, so the window's own step waits on for a revision and
+/// brings that revision's page up once the page's ten minutes are out.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_panels_show_it_with_no_revision_marks_its_page_and_leaves_the_step() {
+    use crate::devtools_helper::{HandOver, Origin, PanelEvent, test_arms};
+    use aterm_containment::consent::FdaState;
+    use std::cell::RefCell;
+    thread_local! {
+        static MARK: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+    fn recorded(revision: u64, access: Access) -> Option<AccessOutcome> {
+        if access != Access::DeveloperTools {
+            return Some(AccessOutcome::Triggered);
+        }
+        records()
+            .into_iter()
+            .rev()
+            .find(|&(r, a, _)| (r, a) == (revision, access))
+            .map(|(_, _, outcome)| outcome)
+    }
+    fn handed(revision: u64, access: Access) -> bool {
+        records().contains(&(revision, access, AccessOutcome::Handed))
+    }
+    let mut marking = test_arms::opening();
+    // As in `the_panels_show_it_puts_its_page_on_record`: the panel never turns Done.
+    marking.read_list = |_, _| test_arms::absent(2);
+    marking.last_opened = || MARK.with(|mark| mark.borrow().clone().map(|word| (word, 1)));
+    marking.note_opened = |word, _| MARK.with(|mark| *mark.borrow_mut() = Some(word.to_owned()));
+    RECORDS.with(|r| r.borrow_mut().clear());
+    set_front(true);
+    let mut app = new_mac(marking, test_arms::fda_opening());
+    app.access_steps.set_reach(StepsReach {
+        recorded,
+        handed,
+        ..app.access_steps.reach
+    });
+    app.consent = reread(FdaState::Granted);
+    test_arms::stand_in(&mut app, marking);
+    app.observe_initial_setup_permissions(None);
+    assert_eq!(
+        app.hand_devtools_to_owner(Origin::Automatic),
+        HandOver::Queued
+    );
+    assert_eq!(
+        app.hand_devtools_to_owner(Origin::Settings),
+        HandOver::Opened
+    );
+    MARK.with(|mark| *mark.borrow_mut() = None);
+    let opens = test_arms::opens();
+    app.devtools_helper.press_for_test(PanelEvent::ShowList);
+    let start = Instant::now();
+    while test_arms::opens() == opens {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "Show it brings the page up"
+        );
+        app.tick_devtools_hand_over(Instant::now());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        MARK.with(|mark| mark.borrow().clone()),
+        Some(app.access_marks().devtools),
+        "the marker under the running version, as the door writes it"
+    );
+    assert_ne!(
+        app.access_marks().devtools,
+        atpkg::devtools::revision_key(1),
+        "precondition: no revision's key"
+    );
+    assert_eq!(
+        (
+            app.devtools_helper.queued(),
+            records()
+                .iter()
+                .any(|&(_, access, _)| access == Access::DeveloperTools)
+        ),
+        (Some(Origin::Automatic), false),
+        "the step waits on for a revision, with nothing on record"
+    );
+    approve(&mut app, 1);
+    let mut t = Instant::now() + Duration::from_secs(atpkg::devtools::REOPEN_AFTER_S);
+    let opens = test_arms::opens();
+    parks(&mut app, &mut t, 3);
+    assert_eq!(
+        test_arms::opens(),
+        opens + 1,
+        "the revision's own page, once"
+    );
 }
 
 /// A new access revision's Developer Tools step that waits out a page under ten minutes old
@@ -3792,6 +4765,74 @@ fn a_new_revisions_developer_tools_step_waits_out_a_recent_page_through_a_readin
     );
 }
 
+/// The control verb's ask whose own `spctl` run ended after its quiet moment passed rides the
+/// waiting Developer Tools step with that run's answer, and at its next quiet moment brings the
+/// page up with no run of its own.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_control_verbs_ask_rides_the_step_with_its_own_runs_answer() {
+    use crate::devtools_helper::{
+        DevToolsHelperArm, HandOver, Lane, Moment, Origin, RECHECK_EVERY, test_arms,
+    };
+    use aterm_containment::DevToolGrant;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    // `spctl` runs on the lane's worker thread.
+    static RUNS: AtomicU32 = AtomicU32::new(0);
+    let mut counted = test_arms::opening();
+    counted.list_terminal = || {
+        RUNS.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    };
+    let run_out = |app: &mut App, at: Instant| {
+        let start = Instant::now();
+        while app.devtools_helper.listing().is_some() {
+            assert!(start.elapsed() < Duration::from_secs(60), "hang");
+            app.tick_devtools_hand_over(at);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    set_front(false);
+    let mut app = new_mac(counted, test_arms::fda_opening());
+    app.consent = reread(aterm_containment::consent::FdaState::Granted);
+    test_arms::stand_in(&mut app, counted);
+    app.devtools_helper = Lane::windowed_for_test(counted, DevToolsHelperArm::inert());
+    app.devtools_helper.note_reading(
+        test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(0)),
+        Instant::now(),
+    );
+    focus(&mut app, true);
+    app.user_input_recent = |within| within == crate::devtools_helper::PRESENT_WITHIN;
+    let t0 = Instant::now() + crate::consent_card::LAUNCH_SETTLE;
+    app.observe_initial_setup_permissions(None);
+    assert_eq!(
+        app.hand_devtools_to_owner(Origin::Automatic),
+        HandOver::Queued
+    );
+    assert_eq!(
+        app.devtools_hand_over(Origin::Ctl, Moment::Quiet),
+        HandOver::Listing
+    );
+    // The run ends with no aterm window in front: the verb's moment passed.
+    focus(&mut app, false);
+    run_out(&mut app, t0);
+    let opens = test_arms::opens();
+    assert_eq!(
+        (RUNS.load(Ordering::SeqCst), app.devtools_helper.queued()),
+        (1, Some(Origin::Automatic)),
+        "the ask rides the step"
+    );
+    focus(&mut app, true);
+    for park in 0..3 {
+        app.tick_consent_lanes(t0 + RECHECK_EVERY * park);
+    }
+    run_out(&mut app, t0 + RECHECK_EVERY * 3);
+    assert_eq!(
+        (test_arms::opens(), RUNS.load(Ordering::SeqCst)),
+        (opens + 1, 1),
+        "its page, with its own run's answer"
+    );
+}
+
 /// [`the_control_verbs_ask_that_rides_the_step_keeps_its_own_quiet_moment`] for the Full Disk
 /// Access page: the window's own step waits for a revision, and a person's press on the row
 /// brings the page up meanwhile. The step waits on, and when the same revision is back it brings
@@ -3809,7 +4850,7 @@ fn a_press_with_no_revision_leaves_the_full_disk_access_step_waiting_for_it() {
         static MARK: RefCell<Option<String>> = const { RefCell::new(None) };
     }
     let mut marking = test_arms::fda_marking(
-        || MARK.with(|mark| mark.borrow().clone().map(|word| (word, 1))),
+        |_| MARK.with(|mark| mark.borrow().clone().map(|word| (word, 1))),
         |word| {
             RECENT.with(|recent| recent.set(true));
             MARK.with(|mark| *mark.borrow_mut() = Some(word.to_owned()));
@@ -4154,7 +5195,7 @@ fn an_ask_the_full_disk_access_step_carried_waits_with_it_when_it_waits_again() 
     let reach =
         test_arms::opened(|window| DEVTOOLS_AGO.with(Cell::get).filter(|ago| *ago < window));
     let fda = test_arms::fda_marking(
-        || {
+        |_| {
             SHOWN
                 .with(Cell::get)
                 .then(|| (atpkg::devtools::revision_key(1), 1))
@@ -5364,4 +6405,226 @@ fn a_switch_toggled_twice_brings_the_page_once() {
         assert_eq!(test_arms::fda_counts().0 - opens, 1, "{off}: one page");
         assert!(!app.consent_card_host.launch_held, "{off}: nothing held");
     }
+}
+
+#[test]
+fn local_network_grant_probe_frees_the_dialog_slot_before_recording_granted() {
+    use super::LocalNetworkProbe;
+    use aterm_types::macos_setup::{MacosDialog, macos_dialog_up};
+
+    thread_local! {
+        static PROBE_STARTED: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+        static PROBE_OUTCOME: std::cell::Cell<Option<(u64, LocalNetworkProbe)>> = const { std::cell::Cell::new(None) };
+        static RECORDED_WITH_DIALOG_FREE: std::cell::RefCell<Vec<(u64, Access, AccessOutcome, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    let _serial = DIALOG_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(!macos_dialog_up());
+
+    let reach = StepsReach {
+        start_local_network_probe: |revision| {
+            PROBE_STARTED.with(|v| v.borrow_mut().push(revision));
+        },
+        take_local_network_probe: || PROBE_OUTCOME.with(|c| c.take()),
+        record: |revision, access, outcome| {
+            let dialog_free = MacosDialog::when_none_up(Duration::ZERO).is_some();
+            RECORDED_WITH_DIALOG_FREE.with(|v| {
+                v.borrow_mut()
+                    .push((revision, access, outcome, dialog_free))
+            });
+            Ok(())
+        },
+        dialog_up: macos_dialog_up,
+        holds_dialog: true,
+        ..stepping()
+    };
+
+    PROBE_STARTED.with(|v| v.borrow_mut().clear());
+    PROBE_OUTCOME.with(|c| c.set(None));
+    RECORDED_WITH_DIALOG_FREE.with(|v| v.borrow_mut().clear());
+
+    let now = Instant::now();
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(reach);
+    approve(&mut app, 91);
+
+    app.tick_local_network_step(now);
+    assert_eq!(PROBE_STARTED.with(|v| v.borrow().clone()), [91]);
+    assert!(macos_dialog_up(), "Triggered holds the alert dialog slot");
+
+    // When the 1 s re-probe hears a LAN server (Allow), the dialog slot is freed BEFORE
+    // AccessOutcome::Granted is recorded so the worker's Secrets lane can start immediately.
+    PROBE_OUTCOME.with(|c| c.set(Some((91, LocalNetworkProbe::Granted))));
+    app.on_local_network_probe_ready(now + Duration::from_secs(2));
+    assert!(!macos_dialog_up(), "Granted releases the alert dialog slot");
+    assert_eq!(
+        RECORDED_WITH_DIALOG_FREE.with(|v| v.borrow().clone()),
+        [
+            (91, Access::LocalNetwork, AccessOutcome::Triggered, false),
+            (91, Access::LocalNetwork, AccessOutcome::Granted, true),
+        ]
+    );
+    drop(app);
+
+    // Negative control: Refused / Unanswered (or a stale revision) releases the hold without
+    // recording AccessOutcome::Granted.
+    PROBE_STARTED.with(|v| v.borrow_mut().clear());
+    RECORDED_WITH_DIALOG_FREE.with(|v| v.borrow_mut().clear());
+    let mut control = App::headless_for_test();
+    control.access_steps.set_reach(reach);
+    approve(&mut control, 92);
+    control.tick_local_network_step(now);
+    assert!(macos_dialog_up());
+
+    PROBE_OUTCOME.with(|c| c.set(Some((91, LocalNetworkProbe::Granted))));
+    control.on_local_network_probe_ready(now + Duration::from_secs(1));
+    assert!(macos_dialog_up(), "stale revision is ignored");
+
+    PROBE_OUTCOME.with(|c| c.set(Some((92, LocalNetworkProbe::Refused))));
+    control.on_local_network_probe_ready(now + Duration::from_secs(2));
+    assert!(!macos_dialog_up(), "Refused releases the dialog hold");
+    assert_eq!(
+        RECORDED_WITH_DIALOG_FREE.with(|v| v.borrow().clone()),
+        [(92, Access::LocalNetwork, AccessOutcome::Triggered, false)]
+    );
+    drop(control);
+
+    RECORDED_WITH_DIALOG_FREE.with(|v| v.borrow_mut().clear());
+    let mut unanswered = App::headless_for_test();
+    unanswered.access_steps.set_reach(reach);
+    approve(&mut unanswered, 93);
+    unanswered.tick_local_network_step(now);
+    assert!(macos_dialog_up());
+
+    PROBE_OUTCOME.with(|c| c.set(Some((93, LocalNetworkProbe::Unanswered))));
+    unanswered.on_local_network_probe_ready(now + Duration::from_secs(30));
+    assert!(!macos_dialog_up(), "Unanswered releases the dialog hold");
+    assert_eq!(
+        RECORDED_WITH_DIALOG_FREE.with(|v| v.borrow().clone()),
+        [(93, Access::LocalNetwork, AccessOutcome::Triggered, false)]
+    );
+}
+
+/// Local Network's step tells the LAN readers (the converge lane, whose `sync.peers` read "macOS
+/// has not asked" before) each time the answer moves as the window hears it: once as its question
+/// goes up, after the record says `triggered` (which the access record keeps as asked, so a look
+/// from then on reads past "has not asked"), and once as the re-probe ends, whatever it heard: a
+/// grant, a Don't Allow, or nothing in its 30 s (no ALab vault on this network, as on e2e145, or
+/// an answer after the probe gave up). Another revision's probe tells nothing.
+/// NEGATIVE CONTROL: the rule before this (a nudge only for a heard grant or refusal) fails the
+/// question's case, and the probe's end that heard nothing, the one e2e145 met.
+#[test]
+fn local_network_steps_tell_the_lan_readers_each_time_the_answer_moves() {
+    use super::LocalNetworkProbe;
+
+    type Heard = Option<(u64, LocalNetworkProbe)>;
+    thread_local! {
+        static OUTCOME: std::cell::Cell<Heard> = const { std::cell::Cell::new(None) };
+        static NUDGES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static ASKED_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    let reach = StepsReach {
+        take_local_network_probe: || OUTCOME.with(std::cell::Cell::take),
+        lan_answer_moved: || {
+            NUDGES.with(|count| count.set(count.get() + 1));
+            let asked = RECORDS.with(|records| {
+                records
+                    .borrow()
+                    .contains(&(91, Access::LocalNetwork, AccessOutcome::Triggered))
+            });
+            ASKED_FIRST.with(|first| first.set(asked));
+        },
+        ..stepping()
+    };
+    let now = Instant::now();
+    for probe in [
+        LocalNetworkProbe::Granted,
+        LocalNetworkProbe::Refused,
+        LocalNetworkProbe::Unanswered,
+    ] {
+        let mut app = App::headless_for_test();
+        app.access_steps.set_reach(reach);
+        approve(&mut app, 91);
+        RECORDS.with(|records| records.borrow_mut().clear());
+        NUDGES.with(|count| count.set(0));
+        ASKED_FIRST.with(|first| first.set(false));
+
+        app.tick_local_network_step(now);
+        assert_eq!(
+            NUDGES.with(std::cell::Cell::get),
+            1,
+            "{probe:?}: the question went up"
+        );
+        assert!(
+            ASKED_FIRST.with(std::cell::Cell::get),
+            "{probe:?}: told once the record says asked"
+        );
+
+        OUTCOME.with(|outcome| outcome.set(Some((90, probe))));
+        app.on_local_network_probe_ready(now + Duration::from_secs(1));
+        assert_eq!(
+            NUDGES.with(std::cell::Cell::get),
+            1,
+            "{probe:?}: another revision's"
+        );
+
+        OUTCOME.with(|outcome| outcome.set(Some((91, probe))));
+        app.on_local_network_probe_ready(now + Duration::from_secs(31));
+        assert_eq!(
+            NUDGES.with(std::cell::Cell::get),
+            2,
+            "{probe:?}: the re-probe ended"
+        );
+    }
+}
+
+#[test]
+fn swarm_off_starts_no_local_network_probe_and_discards_a_ready_grant() {
+    use super::LocalNetworkProbe;
+    use aterm_types::macos_setup::{MacosDialog, macos_dialog_up};
+
+    thread_local! {
+        static STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static RECORDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    let _serial = DIALOG_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = Instant::now();
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(StepsReach {
+        start_local_network_probe: |_| STARTED.with(|count| count.set(count.get() + 1)),
+        take_local_network_probe: || Some((91, LocalNetworkProbe::Granted)),
+        record: |_, _, _| {
+            RECORDED.with(|count| count.set(count.get() + 1));
+            Ok(())
+        },
+        holds_dialog: true,
+        ..stepping()
+    });
+    approve(&mut app, 91);
+    app.config.swarm = Some(crate::app_config::SwarmConfig {
+        enabled: Some(false),
+    });
+    STARTED.with(|count| count.set(0));
+    RECORDED.with(|count| count.set(0));
+    app.tick_local_network_step(now);
+    assert_eq!(STARTED.with(std::cell::Cell::get), 0);
+    assert_eq!(RECORDED.with(std::cell::Cell::get), 0);
+    assert!(
+        app.access_step_moment(now),
+        "independent access steps remain eligible while swarm is Off"
+    );
+
+    // Turning Off while a grant is ready releases the old dialog hold without publishing the
+    // grant that would wake the automatic Secrets lane.
+    app.access_steps.local_network_done = Some(91);
+    app.access_steps.local_network_until = Some(now + Duration::from_secs(30));
+    app.access_steps.dialog = MacosDialog::when_none_up(Duration::ZERO);
+    assert!(macos_dialog_up());
+    app.on_local_network_probe_ready(now);
+    assert!(!macos_dialog_up());
+    assert_eq!(RECORDED.with(std::cell::Cell::get), 0);
 }

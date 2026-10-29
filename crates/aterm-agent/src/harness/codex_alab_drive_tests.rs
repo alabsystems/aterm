@@ -584,6 +584,7 @@ impl Rig {
             usage_credits: false,
             usage_tap: None,
             instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
+            press: None,
             timings: crate::harness::Timings::FAST,
             agents_off: Vec::new(),
             land: false,
@@ -659,6 +660,19 @@ impl Rig {
 
     fn state(&self) -> St {
         load(&self.opts, &key(TAB)).expect("a state")
+    }
+
+    /// Writes the twin as atpkg's launcher of a codex-alab package laid beside it
+    /// ([`crate::harness::codex_alab::lay_package`]), one that holds the auth-path mark where
+    /// `marked`.
+    fn twin_to_build(&self, marked: bool) {
+        let exe = crate::harness::codex_alab::lay_package(&self.dir.join("store/codex/1"), marked);
+        std::fs::create_dir_all(self.twin.parent().expect("the twin's folder")).expect("agents");
+        std::fs::write(
+            &self.twin,
+            format!("#!/bin/sh\nexec '{}' \"$@\"\n", exe.display()),
+        )
+        .expect("launcher");
     }
 
     fn asked(&self) -> Vec<String> {
@@ -1379,6 +1393,7 @@ fn prune_opts(dir: &Path) -> Opts {
         usage_credits: false,
         usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
+        press: None,
         timings: crate::harness::Timings::FAST,
         agents_off: Vec::new(),
         land: false,
@@ -1722,7 +1737,9 @@ fn self_claimed_after_exit_refuses_malformed_resume_and_closes_mismatched_in_fli
     assert!(rig.typed().is_empty());
 
     // Defer an in-flight relaunch under auth-A, then resume under auth-B: the deferred
-    // auth-A state must not be reused with the old CODEX_AUTH_PATH.
+    // auth-A state must not be reused with the old CODEX_AUTH_PATH. The launcher names a
+    // codex-alab that keeps the variable's login its own.
+    rig.twin_to_build(true);
     let mut auth_a = rig.resume(None);
     auth_a.codex_auth_path = Some("/Users//me/.aterm/accounts-codex/acct-a/auth.json".to_string());
     *rig.status_extra.lock().expect("status") = " human_ms=500".to_string();
@@ -1744,4 +1761,37 @@ fn self_claimed_after_exit_refuses_malformed_resume_and_closes_mismatched_in_fli
         "relaunch must carry acct-b, not stale in-flight acct-a: {typed:#?}"
     );
     assert!(!typed[0].contains("acct-a"), "{typed:#?}");
+}
+
+/// A CRASH RELAUNCH ON A ROW OF ITS OWN TYPES NOTHING WHERE THE LAUNCHER NOW RUNS A BUILD THAT
+/// WOULD NOT KEEP `CODEX_AUTH_PATH`'S LOGIN ITS OWN (a rollback, a vendor pin): that build would
+/// run on `$CODEX_HOME/auth.json` while the pool counted the session as the row's. The same
+/// relaunch with no row of its own still resumes on that build.
+#[test]
+fn a_crash_relaunch_on_a_row_of_its_own_is_refused_on_a_build_that_ignores_codex_auth_path() {
+    let rig = Rig::new("self-claim-auth-unread", &["zsh: killed     codex"]);
+    rig.twin_to_build(false);
+    let mut own = rig.resume(None);
+    own.codex_auth_path = Some("/Users//me/.aterm/accounts-codex/work/auth.json".to_string());
+    let r = self_claimed_after_exit(
+        &rig.opts,
+        &rig.snap(None),
+        &own,
+        ExitCause::Exit,
+        &rig.kernel,
+    );
+    assert_eq!(r.step, "failed:auth-path-unread", "{r:?}");
+    assert!(rig.typed().is_empty(), "{:#?}", rig.asked());
+
+    let rig = Rig::new("self-claim-auth-default", &["zsh: killed     codex"]);
+    rig.twin_to_build(false);
+    let r = self_claimed_after_exit(
+        &rig.opts,
+        &rig.snap(None),
+        &rig.resume(None),
+        ExitCause::Exit,
+        &rig.kernel,
+    );
+    assert_eq!(r.step, "done:resumed", "{r:?}");
+    assert_eq!(rig.typed().len(), 1, "{:#?}", rig.asked());
 }

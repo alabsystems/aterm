@@ -664,6 +664,99 @@ fn toolset_planned() -> ItemReport {
     row
 }
 
+/// `aterm init`'s `base.pkg.toolset` READS DOCTOR'S TOOLSET ROW BESIDE ATPKG'S CONSENT AND THE
+/// AUTOMATIC UPDATES SWITCH: a row that wants programs is missing them where atpkg may install
+/// them and the switch is on, and off, the refusal said before the row's words, under
+/// `auto_install = false`, an ignored prefix, a build with no root key or the switch off (a
+/// window's launch lane stands by then); a decline is off in the row's own words; a complete
+/// row (an excluded vendor CLI only said) is complete whatever the consent or the switch, and
+/// an unread row or none is unread.
+#[cfg(unix)]
+#[test]
+fn the_toolset_item_reads_doctors_row_beside_atpkgs_consent() {
+    use aterm_machines::init_toolset::Found;
+    use atpkg::Adoption;
+    let planned = toolset_planned();
+    let words = planned.from.clone().unwrap();
+    let reads = |row: &ItemReport, adoption, enabled| {
+        super::toolset_reads(Some(row), adoption, enabled, None)
+    };
+    assert_eq!(
+        reads(&planned, Adoption::Consented, true),
+        Found::Missing(words.clone())
+    );
+    for (adoption, enabled, names) in [
+        (Adoption::Consented, false, "[packages].enabled"),
+        (Adoption::AutoInstallOff, true, "[packages].auto_install"),
+        (Adoption::IgnoredPrefix, true, "prefix"),
+        (Adoption::ManagerDisabled, true, "root key"),
+    ] {
+        let Found::Off(why) = reads(&planned, adoption, enabled) else {
+            panic!("{adoption:?} with the switch {enabled} installs nothing");
+        };
+        let (named, carried) = (why.find(names), why.rfind(&words));
+        assert!(named.is_some() && named < carried, "{why}");
+    }
+    let ignored = std::path::Path::new("/Volumes/old/pkg");
+    let Found::Off(why) =
+        super::toolset_reads(Some(&planned), Adoption::IgnoredPrefix, true, Some(ignored))
+    else {
+        unreachable!()
+    };
+    assert!(
+        why.starts_with(&atpkg::config::ignored_prefix_note(ignored)),
+        "{why}"
+    );
+
+    let declined = ItemReport {
+        outcome: Outcome::NotApplicable,
+        from: None,
+        to: None,
+        why: Some("removed on this machine".to_owned()),
+        ..planned.clone()
+    };
+    for (adoption, enabled) in [
+        (Adoption::Declined, true),
+        (Adoption::Consented, true),
+        (Adoption::Declined, false),
+    ] {
+        assert_eq!(
+            reads(&declined, adoption, enabled),
+            Found::Off(declined.why.clone().unwrap())
+        );
+    }
+
+    let complete = ItemReport {
+        outcome: Outcome::Ok,
+        from: None,
+        to: Some("6 active; codex left out".to_owned()),
+        ..planned.clone()
+    };
+    for (adoption, enabled) in [
+        (Adoption::Consented, true),
+        (Adoption::Consented, false),
+        (Adoption::AutoInstallOff, true),
+        (Adoption::Declined, true),
+    ] {
+        assert_eq!(
+            reads(&complete, adoption, enabled),
+            Found::Complete(complete.to.clone().unwrap())
+        );
+    }
+    let unread = ItemReport {
+        outcome: Outcome::Unknown,
+        ..planned.clone()
+    };
+    assert!(matches!(
+        reads(&unread, Adoption::Consented, true),
+        Found::Unread(_)
+    ));
+    assert!(matches!(
+        super::toolset_reads(None, Adoption::Consented, true, None),
+        Found::Unread(_)
+    ));
+}
+
 /// NOBODY AT THE TERMINAL LEAVES THE INSTALL PASS ITS OWN ITEMS: with the pass holding
 /// `store.lock`, each relay and install row reads `NotApplicable` (the running install pass lays
 /// these), the rc row included though it follows the hooks and the packages' toolset row the
@@ -1972,9 +2065,10 @@ fn outside_the_account_s_own_shell_no_develop_layer_is_read() {
 }
 
 /// `base.ai.accounts` names each other CLI's pool this machine keeps after Claude Code's
-/// (`…; other CLIs: codex 1, kimi 1`), and stands on those pools alone where Claude Code has no
-/// source. CONTROL: a machine with Claude Code's pool alone reads Claude Code's probe word for
-/// word.
+/// (`…; other CLIs: codex 1, kimi 1`), stands on those pools alone where Claude Code has no
+/// source, and is a change where Codex's pool, which syncs by default, has a row of this
+/// machine's in the vault and no roster here yet. CONTROL: a machine with Claude Code's pool
+/// alone reads Claude Code's probe word for word.
 #[cfg(target_os = "macos")]
 #[test]
 fn base_ai_accounts_names_each_kept_pool_after_claudes() {
@@ -2015,6 +2109,7 @@ fn base_ai_accounts_names_each_kept_pool_after_claudes() {
         codex_thread: None,
         agy_conversation: None,
         codex_home: None,
+        codex_login: None,
         now: 1_792_660_000,
         tz_s: 0,
         sid: String::new(),
@@ -2056,6 +2151,43 @@ fn base_ai_accounts_names_each_kept_pool_after_claudes() {
             }
         ),
         "CONTROL: Claude Code's pool alone reads as it always did"
+    );
+
+    // Codex's pool syncs by default: the vault's Codex fleet listing a row of m16's with no
+    // roster here is a change `aterm init` applies. CONTROL: one listing m9's alone is not.
+    let secrets = home.join(".secrets");
+    aterm_types::fs_restricted::ensure_private_dir(&secrets).unwrap();
+    let codex_fleet = |machine: &str| {
+        std::fs::write(
+            secrets.join("ai-accounts-codex.toml"),
+            format!(
+                "[[account]]\nlabel = \"codex-{machine}\"\nemail = \"codex@example.com\"\n\
+                 machines = [\"{machine}\"]\n"
+            ),
+        )
+        .unwrap();
+    };
+    codex_fleet("m9");
+    assert_eq!(
+        format!("{:?}", super::ai_accounts_probe(&env)),
+        format!(
+            "{:?}",
+            Probe::Ok {
+                now: claude.clone()
+            }
+        ),
+        "CONTROL: a Codex fleet that lists no row of m16's changes nothing"
+    );
+    codex_fleet("m16");
+    assert_eq!(
+        format!("{:?}", super::ai_accounts_probe(&env)),
+        format!(
+            "{:?}",
+            Probe::Change {
+                from: claude.clone(),
+                to: "codex rows synced from the vault".to_owned()
+            }
+        )
     );
 
     for cli in ["codex", "kimi"] {
@@ -2112,6 +2244,36 @@ fn base_ai_accounts_names_each_kept_pool_after_claudes() {
             }
         ),
         "the other pools stand alone where Claude Code has no source"
+    );
+    // With no source of Claude Code's and Codex's sync due, the item is Codex's to apply, and
+    // Claude Code's want of a source is no failure of it (a failed Codex sync is what it says).
+    std::fs::remove_file(config.join("accounts-codex.toml")).unwrap();
+    assert_eq!(
+        format!("{:?}", super::ai_accounts_probe(&env)),
+        format!(
+            "{:?}",
+            Probe::Change {
+                from: "no codex roster".to_owned(),
+                to: "codex rows synced from the vault; other CLIs: kimi 1".to_owned()
+            }
+        )
+    );
+    assert!(super::ai_accounts_others_only(&env));
+    // `[harness] accounts = "off"` turns the accounts' sync off, so the item has nothing to
+    // apply (its apply would refuse) where the line above read the pools it would sync.
+    std::fs::write(
+        config.join("aterm.toml"),
+        "[fleet]\nmachine = \"m16\"\n[harness]\naccounts = \"off\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        format!("{:?}", super::ai_accounts_probe(&env)),
+        format!(
+            "{:?}",
+            Probe::NotApplicable {
+                why: aterm_agent::harness::accounts_sync::ACCOUNTS_SYNC_OFF.to_owned()
+            }
+        )
     );
 }
 
@@ -2326,6 +2488,7 @@ fn every_init_line_doctor_prints_is_one_init_takes() {
         items: vec![Box::new(super::AiAccountsItem)],
         held: None,
         clt: super::command_line_tools(),
+        toolset: None,
         targo: None,
     };
     assert!(base.clt.is_some(), "the test binary names itself");

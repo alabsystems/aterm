@@ -53,6 +53,7 @@ fn key(program: aterm_phase::Program, len: usize, palette: Option<CardPalette>) 
         clip: aterm_core::render::PxRect::EVERYWHERE,
         mark_hover: false,
         title_gen: 0,
+        chip: TopChip::NONE,
     }
 }
 
@@ -227,4 +228,90 @@ fn a_pane_footer_recomposes_its_top_line_when_the_goal_moves() {
     );
     assert_eq!(goal_term(None), 0);
     assert_ne!(goal_term(Some("a")), goal_term(Some("b")));
+}
+
+/// THE CHIP'S CELLS STAND CLEAR OF THE GOAL AND THE HOVER TITLE: on a line that keeps cells for
+/// its Autopilot chip ([`TopChip`]), at every width whose line with no goal holds them, the
+/// vendor's glass starts at the lockup's end and holds every one of those cells, the goal is laid
+/// after them
+/// (the glass then those cells alone, never the goal's), and with the pointer on the lockup its
+/// title (`<product> <version>`) is laid only where it leaves them after it; with the pointer or
+/// the keyboard on the chip, the goal gives its room to the chip's title. CONTROL: a line that
+/// keeps none lays the goal two cells after the lockup.
+#[test]
+fn the_chips_cells_stand_clear_of_the_goal_and_the_hover_title() {
+    let chip = TopChip {
+        cells: CHIP_LEAD + 1 + CHIP_TAIL,
+        titled: false,
+    };
+    let (mut beside, mut grown) = (0, 0);
+    for len in 30..=200 {
+        let bare = key(aterm_phase::Program::Codex, len, None);
+        let kept = TopKey { chip, ..bare };
+        let hovered = TopKey {
+            mark_hover: true,
+            ..kept
+        };
+        let alone = composed(&kept, None);
+        if alone.switch.is_none() || alone.glass.len() < chip.cells {
+            continue;
+        }
+        let mut titled = ComposedTop::default();
+        compose_top(
+            &hovered,
+            &mut titled,
+            Some("0.1.0-dev.14157"),
+            Some(VISION),
+            &[],
+        );
+        for (top, at) in [
+            (composed(&kept, Some(VISION)), "a goal"),
+            (titled, "the lockup hovered"),
+        ] {
+            let glass = top.col + top.glass.start..top.col + top.glass.end;
+            assert_eq!(glass.start, top.lockup.end, "{len}: {at}: after the lockup");
+            assert!(
+                glass.len() >= chip.cells,
+                "{len}: {at}: the chip's cells: {glass:?}"
+            );
+            if let Some(cols) = &top.goal_cols {
+                assert_eq!(
+                    glass.end,
+                    top.lockup.end + chip.cells,
+                    "{len}: {at}: the glass is the chip's cells"
+                );
+                assert!(
+                    cols.start >= glass.end,
+                    "{len}: {at}: the goal after them: {cols:?}"
+                );
+                beside += 1;
+            }
+            grown += usize::from(top.lockup.end > alone.lockup.end);
+        }
+        let lit = TopKey {
+            chip: TopChip {
+                titled: true,
+                ..chip
+            },
+            ..bare
+        };
+        let lit_top = composed(&lit, Some(VISION));
+        if lit_top.switch.is_some() && !lit_top.lockup.is_empty() {
+            assert_eq!(
+                lit_top.goal_cols, None,
+                "{len}: the chip's title takes the goal's room"
+            );
+        }
+        if let Some(cols) = composed(&bare, Some(VISION)).goal_cols {
+            assert_eq!(
+                cols.start,
+                composed(&bare, None).lockup.end + GOAL_RULE,
+                "{len}: CONTROL: no chip, the goal after the lockup"
+            );
+        }
+    }
+    assert!(
+        beside > 100 && grown > 100,
+        "{beside} beside, {grown} grown"
+    );
 }

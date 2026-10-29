@@ -108,7 +108,9 @@ fn handoff_arbiter_linearizes_commit_and_reject_interleavings() {
     assert_eq!(failed_state["parent_exited"], 0);
 }
 
-fn arm_outgoing_handoff(app: &mut App) -> std::sync::mpsc::Receiver<()> {
+/// Test fixture: an overlap update handoff in flight over `app`'s current
+/// layout; the receiver hears the cancel a deferred teardown sends.
+pub(crate) fn arm_outgoing_handoff(app: &mut App) -> std::sync::mpsc::Receiver<()> {
     let layout = app.capture_restore_manifest();
     let layout_digest = crate::seamless::layout_digest(&layout).expect("canonical layout");
     let live: Vec<_> = app
@@ -445,7 +447,7 @@ fn a_deferred_split_settings_close_replays_behind_the_front_tab() {
     assert!(matches!(
         app.pending_update_handoff.as_ref().map(|pending| &pending.teardown),
         Some(crate::DeferredHandoffTeardown::Mutations(mutations))
-            if mutations.contains(&crate::DeferredHandoffMutation::CloseView {
+            if mutations.contains_key(&crate::DeferredHandoffMutation::CloseView {
                 window: wid,
                 tab: settings_tab,
                 view: settings,
@@ -559,7 +561,7 @@ fn a_deferred_pane_close_replays_behind_the_front_tab() {
     assert!(matches!(
         app.pending_update_handoff.as_ref().map(|pending| &pending.teardown),
         Some(crate::DeferredHandoffTeardown::Mutations(mutations))
-            if mutations.contains(&crate::DeferredHandoffMutation::CloseView {
+            if mutations.contains_key(&crate::DeferredHandoffMutation::CloseView {
                 window: wid,
                 tab: split,
                 view: closing_view,
@@ -599,6 +601,85 @@ fn a_deferred_pane_close_replays_behind_the_front_tab() {
         crate::focus_report_tests::drain(pipe),
         crate::focus_report_tests::FOCUS_OUT.to_vec(),
         "control: a real switch away does blur it"
+    );
+    assert_eq!(app.structural_invariant_violation(), None);
+}
+
+/// The `(reason, by)` the session log journaled for `session`'s exit.
+fn exit_of(app: &App, session: u64) -> Option<(crate::session_store::ExitReason, String)> {
+    let g = app.store.read().unwrap_or_else(|p| p.into_inner());
+    g.closed_logs()
+        .exits_since(0)
+        .rfind(|e| e.local_id == session)
+        .map(|e| (e.reason, e.actor.as_wire().to_string()))
+}
+
+#[test]
+fn a_deferred_close_replays_under_the_attribution_it_was_asked_under() {
+    use crate::session_store::{CloseAttribution, ExitActor, ExitReason};
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let by_ctl = app.focused_session_id(wid).expect("tab A's pane");
+    let by_person = app.split_active_stub_tab(wid);
+    let split = app.windows[&wid].tab_set.active_id().unwrap();
+    let person_view = leaf_of(&app, wid, split, by_person);
+    let front = app.next_session_id;
+    app.push_stub_tab(wid, stub_session(front));
+    let lone = app.next_session_id;
+    let lone_session = stub_session(lone);
+    App::register_session(&app.store, &lone_session, None);
+    let other = app.insert_logical_window(lone_session, 24, 80);
+    let _cancelled = arm_outgoing_handoff(&mut app);
+
+    {
+        let _closing = CloseAttribution::enter(ExitReason::CtlClose, ExitActor::Ctl);
+        assert!(
+            app.close_session_by_id(by_ctl).is_err(),
+            "the ctl close waits for the handoff"
+        );
+        assert_eq!(
+            app.close_active_tab_in(other),
+            None,
+            "an `invoke close` of a window's last pane waits too"
+        );
+    }
+    {
+        let _closing = CloseAttribution::enter(ExitReason::UiClose, ExitActor::Human);
+        assert!(app.defer_pending_update_handoff_teardown(
+            crate::DeferredHandoffTeardown::mutation(crate::DeferredHandoffMutation::CloseView {
+                window: wid,
+                tab: split,
+                view: person_view,
+            })
+        ));
+    }
+    let Some(crate::DeferredHandoffTeardown::Mutations(mutations)) = app
+        .pending_update_handoff
+        .take()
+        .map(|pending| pending.teardown)
+    else {
+        panic!("the closes wait as deferred mutations");
+    };
+
+    assert_eq!(
+        app.replay_deferred_handoff_mutations(mutations),
+        crate::CloseOutcome::Stay
+    );
+    assert!(
+        !app.windows.contains_key(&other),
+        "the replay closes the window the ctl close emptied"
+    );
+    for session in [by_ctl, lone] {
+        assert_eq!(
+            exit_of(&app, session),
+            Some((ExitReason::CtlClose, "ctl".into())),
+            "a replayed ctl close stays a ctl close"
+        );
+    }
+    assert_eq!(
+        exit_of(&app, by_person),
+        Some((ExitReason::UiClose, "human".into())),
+        "control: the person's close stays theirs"
     );
     assert_eq!(app.structural_invariant_violation(), None);
 }
@@ -799,7 +880,7 @@ fn pending_handoff_defers_every_tab_close_without_dropping_pty_ownership() {
                 matches!(
                     app.pending_update_handoff.as_ref().map(|pending| &pending.teardown),
                     Some(crate::DeferredHandoffTeardown::Mutations(mutations))
-                        if mutations.contains(&mutation)
+                        if mutations.contains_key(&mutation)
                 ),
                 "{closer}"
             );
@@ -841,8 +922,8 @@ fn pending_handoff_defers_last_and_non_last_window_teardown_then_quit_dominates(
     assert!(matches!(
         app.pending_update_handoff.as_ref().map(|pending| &pending.teardown),
         Some(crate::DeferredHandoffTeardown::Mutations(mutations))
-            if mutations.contains(&crate::DeferredHandoffMutation::CloseWindow(WindowId(0)))
-                && mutations.contains(&crate::DeferredHandoffMutation::CloseWindow(second))
+            if mutations.contains_key(&crate::DeferredHandoffMutation::CloseWindow(WindowId(0)))
+                && mutations.contains_key(&crate::DeferredHandoffMutation::CloseWindow(second))
     ));
 
     assert!(
@@ -1209,8 +1290,11 @@ fn a_focus_loss_after_input_was_queued_for_the_window_marks_it_incoherent() {
     let mut app = App::headless_for_test();
     app.winit_to_window.insert(this, WindowId(0));
     app.incoming_handoff_pending = false;
-    app.handoff_deferred_input
-        .push((this, WindowEvent::ModifiersChanged(Default::default())));
+    app.handoff_deferred_input.push((
+        this,
+        WindowEvent::ModifiersChanged(Default::default()),
+        false,
+    ));
     app.on_focus(WindowId(0), false);
     assert!(
         !app.handoff_deferred_input_incoherent,

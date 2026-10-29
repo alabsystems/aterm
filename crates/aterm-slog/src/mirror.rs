@@ -569,7 +569,11 @@ impl Log {
                 .needs
                 .iter()
                 .flatten()
-                .filter(|n| n.node.lvl != crate::vocab::Lvl::Step || is_bus_step(n.kind))
+                .filter(|n| {
+                    n.node.lvl != crate::vocab::Lvl::Step
+                        || is_bus_step(n.kind)
+                        || n.kind == Kind::Need
+                })
                 .map(|n| (n.word, n.node, n.kind, n.by, n.src))
                 .collect();
             items.push((

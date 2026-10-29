@@ -2022,8 +2022,13 @@ pub(crate) struct DebuggerStepFacts {
     pub(crate) warmup: bool,
     /// System State is frontmost (`App::system_state_frontmost`).
     pub(crate) frontmost: bool,
+    /// System State's Local Network step is still to run in this process
+    /// ([`StepMoment::local_network_pending`]).
+    pub(crate) local_network_pending: bool,
     /// A macOS dialog this process put up is up ([`aterm_types::macos_setup::macos_dialog_up`]).
     pub(crate) dialog_up: bool,
+    /// System Settings asks something of the person ([`StepMoment::settings_asks`]).
+    pub(crate) settings_asks: bool,
     /// The owner declined a Security gesture recently (`OwnerQuiet`).
     pub(crate) owner_quiet: bool,
 }
@@ -2121,7 +2126,9 @@ pub(crate) enum StepWait {
     BehindDeveloperTools,
     BehindPage,
     BehindWarmup,
+    BehindLocalNetwork,
     DialogUp,
+    SettingsAsks,
     NotFrontmost,
     OwnerQuiet,
     ProbeStale,
@@ -2143,7 +2150,9 @@ impl StepWait {
             Self::BehindDeveloperTools => "behind_developer_tools",
             Self::BehindPage => "behind_page",
             Self::BehindWarmup => "behind_warmup",
+            Self::BehindLocalNetwork => "behind_local_network",
             Self::DialogUp => "dialog_up",
+            Self::SettingsAsks => "settings_asks",
             Self::NotFrontmost => "not_frontmost",
             Self::OwnerQuiet => "owner_quiet",
             Self::ProbeStale => "probe_stale",
@@ -2162,7 +2171,8 @@ impl StepWait {
             | Self::Announced
             | Self::Recording
             | Self::NotFrontmost
-            | Self::DialogUp => crate::devtools_helper::PANEL_TICK,
+            | Self::DialogUp
+            | Self::SettingsAsks => crate::devtools_helper::PANEL_TICK,
             _ => crate::devtools_helper::RECHECK_EVERY,
         }
     }
@@ -2277,7 +2287,9 @@ pub(crate) fn admit_debugger_step(facts: &DebuggerStepFacts) -> StepVerdict {
         (!facts.devtools_decided, StepWait::BehindDeveloperTools),
         (facts.page, StepWait::BehindPage),
         (facts.warmup, StepWait::BehindWarmup),
+        (facts.local_network_pending, StepWait::BehindLocalNetwork),
         (facts.dialog_up, StepWait::DialogUp),
+        (facts.settings_asks, StepWait::SettingsAsks),
         (!facts.frontmost, StepWait::NotFrontmost),
         (facts.owner_quiet, StepWait::OwnerQuiet),
         (!facts.probe_fresh, StepWait::ProbeStale),
@@ -2488,6 +2500,9 @@ struct AccessLine {
     dir: PathBuf,
     revision: u64,
     outcome: AccessOutcome,
+    /// Written only while the record holds no debugger outcome for `revision`
+    /// ([`DebuggerStepQueue::record_unless_settled`]).
+    unless_settled: bool,
     warned: bool,
 }
 
@@ -2495,11 +2510,19 @@ impl AccessWriter {
     const RETRY: Duration = Duration::from_secs(1);
 
     /// Queue one line; start the drain unless it is running or backing off.
-    fn append(&self, dir: PathBuf, revision: u64, outcome: AccessOutcome, now: Instant) {
+    fn append(
+        &self,
+        dir: PathBuf,
+        revision: u64,
+        outcome: AccessOutcome,
+        unless_settled: bool,
+        now: Instant,
+    ) {
         self.queue.lock_or_recover().lines.push_back(AccessLine {
             dir,
             revision,
             outcome,
+            unless_settled,
             warned: false,
         });
         self.retry(now);
@@ -2535,6 +2558,16 @@ impl AccessWriter {
                 let Some(mut line) = next else {
                     return;
                 };
+                if line.unless_settled
+                    && aterm_types::macos_setup::access_record::latest(
+                        &line.dir,
+                        line.revision,
+                        aterm_types::macos_setup::Access::Debugger,
+                    )
+                    .is_some()
+                {
+                    continue;
+                }
                 if let Err(error) = aterm_types::macos_setup::access_record::append(
                     &line.dir,
                     line.revision,
@@ -2620,6 +2653,15 @@ pub(crate) struct StepMoment {
     pub(crate) page: Option<(crate::WindowId, u64)>,
     /// A macOS dialog or page this process put up is up.
     pub(crate) dialog_up: bool,
+    /// System State's Local Network step, first in the run, is still to run in this process: the
+    /// debugger step comes after it, as every later step does, even after a permission walk that
+    /// went first (`permission_walk::LOCAL_NETWORK_WAIT`) handed it the debugger, and after a
+    /// relaunch that resumed an admitted run before that step ran.
+    pub(crate) local_network_pending: bool,
+    /// System Settings asks something of the person (`App::system_settings_asks`: a window of its
+    /// own over its main one, such as Quit & Reopen's sheet, or a quit of this process), so
+    /// macOS's administrator dialog would come up beside that question.
+    pub(crate) settings_asks: bool,
 }
 
 /// The least time the page names macOS's dialog before the change puts it up: long enough to
@@ -2890,7 +2932,18 @@ impl DebuggerStepQueue {
     pub(crate) fn record(&self, revision: u64, outcome: AccessOutcome) {
         if let Some(dir) = &self.access_dir {
             self.access_writer
-                .append(dir.clone(), revision, outcome, Instant::now());
+                .append(dir.clone(), revision, outcome, false, Instant::now());
+        }
+    }
+
+    /// [`Self::record`], but only while the access record holds no debugger outcome for
+    /// `revision`, read as the line's turn comes: a step this process judges over for a revision
+    /// an earlier process already settled (its change granted or handed, then a relaunch that
+    /// resumed the run and admitted it again) leaves that outcome as it stands.
+    pub(crate) fn record_unless_settled(&self, revision: u64, outcome: AccessOutcome) {
+        if let Some(dir) = &self.access_dir {
+            self.access_writer
+                .append(dir.clone(), revision, outcome, true, Instant::now());
         }
     }
 
@@ -2899,6 +2952,12 @@ impl DebuggerStepQueue {
     #[cfg(test)]
     pub(crate) fn record_written_for_test(&self) {
         self.access_writer.drained_for_test();
+    }
+
+    /// What the step waits on now ([`Self::wait`]), `None` when it waits on nothing.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) const fn waiting_for_test(&self) -> Option<StepWait> {
+        self.waiting
     }
 
     /// Save completed outcomes again without starting another debugger change.
@@ -4529,7 +4588,9 @@ mod tests {
             page: false,
             warmup: false,
             frontmost: true,
+            local_network_pending: false,
             dialog_up: false,
+            settings_asks: false,
             owner_quiet: false,
         }
     }
@@ -4686,9 +4747,19 @@ mod tests {
                 Wait(StepWait::BehindWarmup),
             ),
             (
+                "the Local Network step still to run",
+                |f| f.local_network_pending = true,
+                Wait(StepWait::BehindLocalNetwork),
+            ),
+            (
                 "a macOS dialog up",
                 |f| f.dialog_up = true,
                 Wait(StepWait::DialogUp),
+            ),
+            (
+                "System Settings asks something",
+                |f| f.settings_asks = true,
+                Wait(StepWait::SettingsAsks),
             ),
             (
                 "System State not frontmost",
@@ -4742,7 +4813,9 @@ mod tests {
             Wait(StepWait::BehindDeveloperTools),
             Wait(StepWait::BehindPage),
             Wait(StepWait::BehindWarmup),
+            Wait(StepWait::BehindLocalNetwork),
             Wait(StepWait::DialogUp),
+            Wait(StepWait::SettingsAsks),
             Wait(StepWait::NotFrontmost),
             Wait(StepWait::OwnerQuiet),
             Wait(StepWait::ProbeStale),
@@ -5062,6 +5135,7 @@ mod tests {
             StepWait::Recording,
             StepWait::NotFrontmost,
             StepWait::DialogUp,
+            StepWait::SettingsAsks,
         ];
         for why in soon {
             assert_eq!(why.look_again(), PANEL_TICK, "{why:?}");
@@ -5076,6 +5150,7 @@ mod tests {
             StepWait::BehindDeveloperTools,
             StepWait::BehindPage,
             StepWait::BehindWarmup,
+            StepWait::BehindLocalNetwork,
             StepWait::OwnerQuiet,
             StepWait::ProbeUnread,
         ];
@@ -5560,19 +5635,27 @@ mod tests {
             },
             ..AccessWriter::default()
         };
-        writer.append(root.path().to_owned(), revision, AccessOutcome::Handed, now);
+        writer.append(
+            root.path().to_owned(),
+            revision,
+            AccessOutcome::Handed,
+            false,
+            now,
+        );
         let due = writer.next_deadline(now).unwrap();
         assert_eq!(due, now + AccessWriter::RETRY);
         writer.append(
             root.path().to_owned(),
             revision,
             AccessOutcome::Declined,
+            false,
             now,
         );
         writer.append(
             root.path().to_owned(),
             revision - 1,
             AccessOutcome::Granted,
+            false,
             now,
         );
         assert_eq!(SPAWNS.with(std::cell::Cell::get), 1);

@@ -131,16 +131,12 @@ const HI_ROWS: [&str; 3] = [
 const HI_LONG_PATH: &str =
     "/private/tmp/at.dFeo/proj/a-working-directory-whose-name-runs-on-past-the-trail";
 
-const LINE_CRUISE: &str = "enhanced by alab claude harness v0.4 \u{b7} autopilot \u{221e} cruise";
-const LINE_LAND: &str = "enhanced by alab claude harness v0.4 \u{b7} autopilot \u{2913} land";
-const LINE_OFF: &str = "enhanced by alab claude harness v0.4 \u{b7} autopilot \u{25cb} off";
+/// The card's line, the same under every palette: the harness's brand and version, then the
+/// site's name (a link on the glass).
+const LINE: &str = "enhanced by alab claude harness v0.4 \u{b7} alab.systems";
 
-fn line_of(palette: CardPalette) -> &'static str {
-    match palette {
-        CardPalette::Cruise => LINE_CRUISE,
-        CardPalette::Land => LINE_LAND,
-        CardPalette::Off => LINE_OFF,
-    }
+const fn line_of(_palette: CardPalette) -> &'static str {
+    LINE
 }
 
 const fn wand_at(top: usize) -> Option<(u16, u16)> {

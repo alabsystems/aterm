@@ -716,7 +716,7 @@ pub fn login_method(env: &[String], user_home: &Path) -> Option<aterm_phase::Log
 }
 
 /// The profile Claude Code reads for the home `env` names ([`effective`], [`path_of`]).
-fn effective_of(env: &[String], user_home: &Path) -> Option<PathBuf> {
+pub(super) fn effective_of(env: &[String], user_home: &Path) -> Option<PathBuf> {
     let var = |name: &str| {
         env.iter()
             .filter_map(|kv| kv.split_once('='))
@@ -743,20 +743,93 @@ fn effective_of(env: &[String], user_home: &Path) -> Option<PathBuf> {
 #[must_use]
 pub fn answers_to(env: &[String], user_home: &Path, email: &str) -> Option<bool> {
     let path = effective_of(env, user_home)?;
+    answers_to_path(&path, email)
+}
+
+/// Email comparison and full provider ID derived from one captured profile.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IdentityObservation {
+    pub email_matches: Option<bool>,
+    pub principal: Option<[u8; 32]>,
+}
+
+/// Read retained sign-in identity evidence once, including legacy-path precedence.
+/// Missing or unreadable claims remain unknown; this does not authenticate credentials.
+#[must_use]
+pub fn identity_in_home(home: &Path, email: &str) -> IdentityObservation {
+    identity_in_home_with(home, email, || {})
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountIdentitySnapshot",
+        action = "Observe",
+        project = "aterm_agent::harness::profile::tests::identity_snapshot_transition"
+    )
+)]
+fn identity_in_home_with(
+    home: &Path,
+    email: &str,
+    after_read: impl FnOnce(),
+) -> IdentityObservation {
+    let path = effective(&home.join(".claude.json"), Some(home), false);
     read_with(&path, |bytes| {
-        let Obj(raw) =
-            aterm_json::from_slice::<Obj<RawWho>>(bytes).map_err(|_| NoProfile::Unreadable)?;
-        let Some(Address(Some(address))) = raw.and_then(|who| who.oauth.0).map(|o| o.address)
-        else {
-            return Ok(None);
-        };
-        let answers = super::accounts::email_matches(email, &address);
-        let mut kept = address.into_bytes();
-        wipe(&mut kept);
-        Ok(Some(answers))
+        after_read();
+        // Keep field-level failures independent: an invalid UUID must not hide
+        // a known email contradiction, or a malformed email erase a usable ID.
+        Ok(IdentityObservation {
+            email_matches: answers_from_bytes(bytes, email).ok().flatten(),
+            principal: principal_from_bytes(bytes).ok().flatten(),
+        })
     })
-    .ok()
-    .flatten()
+    .unwrap_or_default()
+}
+
+/// The fixture chooses captured fields, a later file change and legacy precedence.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountIdentitySnapshot",
+        action = "Kind",
+        reason = "The native fixture supplies matching, contradictory, partial or malformed profile bytes."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountIdentitySnapshot",
+        action = "Change",
+        reason = "The native fixture replaces, truncates or changes the effective profile after capture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountIdentitySnapshot",
+        action = "Legacy",
+        reason = "The native fixture selects an existing legacy profile or the ordinary profile."
+    )
+)]
+#[doc(hidden)]
+pub fn account_identity_snapshot_environment() {}
+
+fn answers_to_path(path: &Path, email: &str) -> Option<bool> {
+    read_with(path, |bytes| answers_from_bytes(bytes, email))
+        .ok()
+        .flatten()
+}
+
+fn answers_from_bytes(bytes: &[u8], email: &str) -> Result<Option<bool>, NoProfile> {
+    let Obj(raw) =
+        aterm_json::from_slice::<Obj<RawWho>>(bytes).map_err(|_| NoProfile::Unreadable)?;
+    let Some(Address(Some(address))) = raw.and_then(|who| who.oauth.0).map(|o| o.address) else {
+        return Ok(None);
+    };
+    let answers = super::accounts::email_matches(email, &address);
+    let mut kept = address.into_bytes();
+    wipe(&mut kept);
+    Ok(Some(answers))
 }
 
 /// The key of the account signed in to the profile Claude Code reads for the home `env` names
@@ -782,17 +855,19 @@ pub fn account_of(env: &[String], user_home: &Path) -> Option<AccountKey> {
 /// profile file alone is not provider authentication or a capability.
 #[must_use]
 pub fn principal_at(path: &Path) -> Option<[u8; 32]> {
-    read_with(path, |bytes| {
-        let Obj(raw) = aterm_json::from_slice::<Obj<RawPrincipal>>(bytes)
-            .map_err(|_| NoProfile::Unreadable)?;
-        let Some(Address(Some(id))) = raw.and_then(|file| file.oauth.0).map(|oauth| oauth.id)
-        else {
-            return Ok(None);
-        };
-        Ok(principal_id(&id))
-    })
-    .ok()
-    .flatten()
+    read_with(path, principal_from_bytes).ok().flatten()
+}
+
+fn principal_from_bytes(bytes: &[u8]) -> Result<Option<[u8; 32]>, NoProfile> {
+    let Obj(raw) =
+        aterm_json::from_slice::<Obj<RawPrincipal>>(bytes).map_err(|_| NoProfile::Unreadable)?;
+    let Some(Address(Some(id))) = raw.and_then(|file| file.oauth.0).map(|oauth| oauth.id) else {
+        return Ok(None);
+    };
+    let principal = principal_id(&id);
+    let mut kept = id.into_bytes();
+    wipe(&mut kept);
+    Ok(principal)
 }
 
 /// Stable full-width representation of an explicit provider identifier. This
@@ -2071,14 +2146,16 @@ fn agy_exe_for(argv: &[String], env: &[String], user_home: &Path) -> Option<Path
     launched_exe_for(argv, env, user_home, "agy")
 }
 
-/// agy's `/usage` doc, read whole within `LAUNCH_READ_BUDGET` ([`super::align::capture_bounded`],
-/// as the quota store reads it): at the budget agy and whatever it started that still holds its
-/// stdout are killed, and there is no doc.
+/// agy's `/usage` doc, read whole within `budget` ([`super::align::capture_bounded`], as the
+/// quota store reads it; a running agy's subscription read spends
+/// [`super::agy_quota_store::LAUNCH_READ_BUDGET`], the budget a launch's own read has): at the
+/// budget agy and whatever it started that still holds its stdout are killed, and there is no doc.
 fn fetch_agy_usage_doc(
     exe: &Path,
     argv: &[String],
     cfg_var: Option<&str>,
     home: &Path,
+    budget: std::time::Duration,
 ) -> Option<Vec<u8>> {
     let mut cmd = aterm_uds::spawnfd::command(exe);
     cmd.args(super::upgrade_agy::config_flags(argv))
@@ -2089,12 +2166,7 @@ fn fetch_agy_usage_doc(
     if let Some(cfg) = cfg_var {
         cmd.env("AGY_CLI_CONFIG_DIR", cfg);
     }
-    let got = super::align::capture_bounded(
-        cmd,
-        super::agy_quota_store::LAUNCH_READ_BUDGET,
-        super::agy_quota::MAX_STDOUT,
-    )
-    .ok()?;
+    let got = super::align::capture_bounded(cmd, budget, super::agy_quota::MAX_STDOUT).ok()?;
     got.success().then_some(got.stdout)
 }
 
@@ -2234,8 +2306,13 @@ fn agy_subscription_with_store(
                 if matches!(lock, Some(None)) {
                     fallback
                 } else if let Some(exe) = agy_exe_for(argv, env, user_home) {
-                    let bytes =
-                        fetch_agy_usage_doc(&exe, argv, var("AGY_CLI_CONFIG_DIR"), &home_dir);
+                    let bytes = fetch_agy_usage_doc(
+                        &exe,
+                        argv,
+                        var("AGY_CLI_CONFIG_DIR"),
+                        &home_dir,
+                        super::agy_quota_store::LAUNCH_READ_BUDGET,
+                    );
                     let fetched = bytes
                         .as_deref()
                         .and_then(|b| parse_agy_usage_json(b, third_party, now));
@@ -2475,7 +2552,7 @@ pub fn read(path: &Path) -> Result<Profile, NoProfile> {
 }
 
 /// [`read`]'s file handling, its bytes handed to `parse` before they are zeroed.
-fn read_with<T>(
+pub(super) fn read_with<T>(
     path: &Path,
     parse: impl FnOnce(&[u8]) -> Result<T, NoProfile>,
 ) -> Result<T, NoProfile> {
@@ -2942,7 +3019,7 @@ struct RawEnabled {
     enabled: Leaf,
 }
 
-fn drain_seq<'de, A: SeqAccess<'de>>(mut seq: A) -> Result<(), A::Error> {
+pub(super) fn drain_seq<'de, A: SeqAccess<'de>>(mut seq: A) -> Result<(), A::Error> {
     while seq.next_element::<IgnoredAny>()?.is_some() {}
     Ok(())
 }
@@ -3054,7 +3131,7 @@ struct RawAddress {
 
 /// An address: a string, else nothing (any other value read past, unkept).
 #[derive(Default)]
-struct Address(Option<String>);
+pub(super) struct Address(pub(super) Option<String>);
 
 impl<'de> Deserialize<'de> for Address {
     fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -3096,7 +3173,7 @@ impl<'de> Deserialize<'de> for Address {
     }
 }
 
-struct Obj<T>(Option<T>);
+pub(super) struct Obj<T>(pub(super) Option<T>);
 
 impl<T> Default for Obj<T> {
     fn default() -> Self {
@@ -3159,7 +3236,7 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for List<T> {
 /// One scalar of the allowlist, whatever its type turned out to be: an array or an object where a
 /// scalar was expected is read past, unkept.
 #[derive(Default)]
-enum Leaf {
+pub(super) enum Leaf {
     /// The key was not there.
     #[default]
     Absent,
@@ -3183,14 +3260,14 @@ impl Leaf {
         }
     }
 
-    const fn num(&self) -> Option<f64> {
+    pub(super) const fn num(&self) -> Option<f64> {
         match self {
             Leaf::Num(n) => Some(*n),
             _ => None,
         }
     }
 
-    const fn flag(&self) -> Option<bool> {
+    pub(super) const fn flag(&self) -> Option<bool> {
         match self {
             Leaf::Flag(b) => Some(*b),
             _ => None,

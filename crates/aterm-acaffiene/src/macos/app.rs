@@ -6,6 +6,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use aterm_objc::send::{
     send_bool_isize, send_f64, send_id, send_id_idptr_usize,
@@ -21,6 +22,7 @@ use super::login_items;
 use super::term;
 use super::ui::{self, StatusUi};
 use super::watch::Watch;
+use crate::instance::Instance;
 use crate::launchd::{self, Startup, StartupDoors};
 use crate::menu::{self, Click, MenuAction, Row};
 use crate::model::{Clocks, Mode};
@@ -79,6 +81,9 @@ impl Exit {
 enum Next {
     /// Look again in this many seconds.
     Tick(u64),
+    /// Look again when the tick already armed comes: what was done changed no mode, and a tick
+    /// armed again would hold back the time the menu bar shows by up to a minute.
+    Keep,
     /// End the app.
     Stop(Exit),
 }
@@ -161,6 +166,12 @@ struct Mug {
     watch: Option<Watch>,
     /// How the app ends, once that is decided.
     exit: Option<Exit>,
+    /// The person's Quit saved off, so a mode on saved in the file as the mug lets go of its lock
+    /// is a writer's from after it ([`let_go`]).
+    quit_off: bool,
+    /// What [`Mug::apply`] last gave the item in the menu bar to show, kept with no item too: the
+    /// full mug while the activity is held (`true`), else the empty one, and the tooltip.
+    shown: Option<(bool, String)>,
 }
 
 impl Mug {
@@ -207,11 +218,11 @@ impl Mug {
                 }
             }
         }
-        let lit = self.awake.is_some();
-        let tip = menu::tooltip(self.mode, now);
+        let face = (self.awake.is_some(), menu::tooltip(self.mode, now));
         if let Some(ui) = self.ui.as_mut() {
-            ui.show(lit, &tip);
+            ui.show(face.0, &face.1);
         }
+        self.shown = Some(face);
         true
     }
 
@@ -236,10 +247,10 @@ impl Mug {
             MenuAction::Activate(choice) => self.set(Mode::chosen(choice, now), now),
             MenuAction::ToggleStartup => {
                 let shown = self.startup() == Startup::On;
-                self.set_startup(!shown, now)
+                self.set_startup(!shown)
             }
             MenuAction::Quit => {
-                let _ = self.set(Mode::Off, now);
+                self.quit_off = matches!(self.set(Mode::Off, now), Next::Tick(_));
                 Next::Stop(Exit::Quit)
             }
         }
@@ -250,8 +261,8 @@ impl Mug {
         launchd::startup(&self.paths, &self.label, &self.doors)
     }
 
-    /// Turn Enable at Startup on or off.
-    fn set_startup(&mut self, on: bool, now: Clocks) -> Next {
+    /// Turn Enable at Startup on or off, leaving the tick armed as it is ([`Next::Keep`]).
+    fn set_startup(&mut self, on: bool) -> Next {
         if let Err(err) = launchd::set_startup(&self.paths, &self.label, &self.origin, on) {
             let verb = if on { "turn on" } else { "turn off" };
             aterm_log::warn!("acaffiene: could not {verb} Enable at Startup: {err}");
@@ -268,11 +279,12 @@ impl Mug {
         if on && self.startup() == Startup::Blocked {
             (self.open_login_items)();
         }
-        Next::Tick(next_tick_secs(self.mode, now))
+        Next::Keep
     }
 
     /// The tick, and a wake from sleep. A timed mode that has ended is taken from the file again
-    /// ([`Mug::reload`]): the mug's own reads off, and a writer's change not yet notified is kept.
+    /// ([`Mug::reload`]): the mug's own returns to forever ([`state::restore`]), and a writer's
+    /// change not yet notified is kept.
     fn tick(&mut self, now: Clocks, menu_open: bool) -> Next {
         if self.mode.settled(now) == self.mode {
             if !self.apply(now) {
@@ -306,8 +318,8 @@ impl Mug {
     }
 
     /// Save a timed mode again once the date has changed since its save ([`state::refresh`]), so
-    /// a build that reads the end on the wall clock alone reads the mug's end within a tick. A
-    /// failure is logged and the mug runs on: readers of `ends` are right either way.
+    /// the file's `deadline` says the mug's end on the wall clock within a tick. A failure is
+    /// logged and the mug runs on: every build reads `ends`, which is right either way.
     fn refresh(&self, now: Clocks) {
         let file = self.paths.state_file();
         if let Err(err) = state::refresh(&file, self.mode, now) {
@@ -321,13 +333,24 @@ impl Mug {
     /// Take the saved mode at `now`, saving it back when the file is one to ([`state::take`]), so
     /// no later read of it (`status`, a bridge, the next mug) is off the mug's mode by more than
     /// [`state::DRIFT_SECS`]; a writer's change that lands first is taken instead
-    /// ([`state::take_saving`]). Whether the save, if one was due, was made; when not, the mug
-    /// keeps its own mode, settled at `now`.
+    /// ([`state::take_saving`]). Whether the mug runs on what it took: the save, if one was due,
+    /// was made, or it failed on a file that reads forever as it stands (the mug's own ended span,
+    /// say), which `status`, a bridge and the next mug read as forever too, so the mug holds
+    /// forever. Otherwise the mug keeps its own mode, settled at `now`.
     fn take(&mut self, now: Clocks) -> bool {
         let file = self.paths.state_file();
         match (self.take_saved)(&file, now) {
             Ok(mode) => {
                 self.mode = mode;
+                true
+            }
+            Err(err) if state::load(&file, now) == Mode::Forever => {
+                aterm_log::warn!(
+                    "acaffiene: could not save {} again: {err}; it reads forever as it is, and the \
+                     mug keeps this Mac awake",
+                    file.display()
+                );
+                self.mode = Mode::Forever;
                 true
             }
             Err(err) => {
@@ -337,9 +360,10 @@ impl Mug {
         }
     }
 
-    /// Take the file's mode, a writer's or the mug's own, and apply it even when the take's save
-    /// fails and the mug stops, so an ended span lets go of the activity at once rather than when
-    /// the app stops, which waits for an open menu ([`schedule_stop`]).
+    /// Take the file's mode, a writer's or the mug's own ([`Mug::take`]), and apply it. When the
+    /// take could not save and the mug stops, the mug's own mode settled at `now` is applied
+    /// first, so a span of its own that has ended lets go of the activity at once rather than
+    /// when the app stops, which waits for an open menu ([`schedule_stop`]).
     fn reload(&mut self, now: Clocks) -> Next {
         let took = self.take(now);
         if !self.apply(now) || !took {
@@ -368,6 +392,20 @@ impl Mug {
     /// The menu's rows at `now`.
     fn rows(&self, now: Clocks) -> Vec<Row> {
         menu::compose(self.mode, now, self.startup(), &self.version)
+    }
+
+    /// Show the mode at `now` in the open menu ([`StatusUi::retitle_menu`]), unless how the app
+    /// ends is decided: a tick, a wake or a writer's change that lands while the menu is open
+    /// moves its checkmark and its time left there too, rather than when it next opens. Rows of
+    /// another shape wait for that opening, which rebuilds the menu.
+    fn retitle_open_menu(&mut self, now: Clocks) {
+        if self.exit.is_some() {
+            return;
+        }
+        let rows = self.rows(now);
+        if let Some(ui) = self.ui.as_mut() {
+            let _ = ui.retitle_menu(rows);
+        }
     }
 }
 
@@ -446,12 +484,12 @@ aterm_objc::declare_class! {
             let Some(action) = MenuAction::from_tag(tag) else {
                 return;
             };
-            let now = now();
             if action == MenuAction::ToggleStartup {
                 // SAFETY: as `-tag`; `-state` is `q16@0:8`.
                 let shown = unsafe { send_isize(sender, sel!(state)) } == CONTROL_STATE_ON;
-                self.handle_choice(|mug| mug.set_startup(!shown, now));
+                self.handle_choice(|mug| mug.set_startup(!shown));
             } else {
+                let now = now();
                 self.handle_choice(|mug| mug.choose(action, now));
             }
         }
@@ -521,9 +559,18 @@ aterm_objc::declare_class! {
 }
 
 impl CaffeineTarget {
-    /// Run `f` on the mug.
+    /// Run `f` on the mug, and while the menu is open show what it did there
+    /// ([`Mug::retitle_open_menu`]).
     fn handle(&self, f: impl FnOnce(&mut Mug) -> Next) {
-        let next = autoreleasepool(|_| self.ivars().mug.try_borrow_mut().ok()?.handled(f));
+        let open = self.ivars().tracking.get();
+        let next = autoreleasepool(|_| {
+            let mut mug = self.ivars().mug.try_borrow_mut().ok()?;
+            let next = mug.handled(f);
+            if open {
+                mug.retitle_open_menu(now());
+            }
+            next
+        });
         self.follow(next);
     }
 
@@ -548,7 +595,7 @@ impl CaffeineTarget {
         match next {
             Some(Next::Tick(secs)) => arm_tick(self.as_id(), secs),
             Some(Next::Stop(_)) => schedule_stop(self.as_id()),
-            None => {}
+            Some(Next::Keep) | None => {}
         }
     }
 
@@ -830,7 +877,8 @@ fn refuse(paths: &Paths, why: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Run the menu-bar mug until Quit (exit 0) or an update restart ([`launchd::EXIT_RESTART`]).
+/// Run the menu-bar mug until Quit (exit 0) or an update restart ([`launchd::EXIT_RESTART`]),
+/// which also ends, as its launchd job, a Quit that a writer's on overtook ([`let_go`]).
 pub(super) fn run(ctx: ServeContext) -> ExitCode {
     let Some(main) = MainThread::new() else {
         return refuse(
@@ -848,7 +896,8 @@ pub(super) fn run(ctx: ServeContext) -> ExitCode {
     } = ctx;
     let running = std::env::current_exe().unwrap_or_else(|_| origin.clone());
     let watch = restart_on_update.then(|| Watch::start(origin.clone(), &running));
-    let code_dir = paths.code_dir();
+    let ending = paths.clone();
+    let job = restart_on_update.then(|| label.clone());
     let mug = Mug {
         mode: Mode::Off,
         paths,
@@ -865,34 +914,166 @@ pub(super) fn run(ctx: ServeContext) -> ExitCode {
         ui: None,
         watch,
         exit: None,
+        quit_off: false,
+        shown: None,
     };
-    let code = autoreleasepool(|_| run_app(main, mug));
-    if code == ExitCode::SUCCESS {
-        discard_own_copy(&code_dir);
-    }
+    let Ended { code, quit_off } = autoreleasepool(|_| run_app(main, mug));
+    let_go(code, job.as_deref(), quit_off, instance, &ending, now)
+}
+
+/// How the mug that ended its run with `code` lets go of its lock (`instance`), and the code it
+/// exits with. An update restart ([`Exit::Restart`]) leaves its pid and label in the lock
+/// ([`Instance::release_named`]); every other end removes the copy the mug ran from, on a clean
+/// exit ([`discard_own_copy`]), then empties the lock and lets go. A mug that is the launchd job
+/// `job` ([`super::ServeContext::restart_on_update`]) ending after the person's Quit saved off
+/// (`quit_off`) first takes the turn a window's start, `on` and `quit` take
+/// ([`crate::cli::change`]), and holds it while it removes its copy, lets go, and reads the mode
+/// saved in [`Paths::state_file`] as written ([`state::saved_on`]) at `now()`: on, a writer's from
+/// after the Quit, it ends for a restart, and launchd starts the job again, which reads that mode;
+/// it names the job in the lock again first ([`name_again`]), as an update restart leaves it, so
+/// a `quit` of another build run before the new mug holds the lock still finds the job and boots
+/// it out. A writer that looked for a mug before the turn found this one, its copy still there,
+/// holding the lock, and started nothing, and its on, saved before the read, ends this mug for
+/// the restart; one after it finds the lock free, waits for this process to end, and starts the
+/// job if launchd has not (the verbs' `ensure`). A writer that takes no turn (an older build) and
+/// saves between the let-go and the read is read as well. A mug run by hand has no job to start it
+/// again and ends as it would; a Quit whose save failed leaves the file's earlier mode, no
+/// writer's. `aterm acaffiene quit` boots the job out, which no restart survives and whose SIGTERM
+/// ends the mug before this read: that verb reads the file again itself.
+fn let_go(
+    code: ExitCode,
+    job: Option<&str>,
+    quit_off: bool,
+    instance: Instance,
+    paths: &Paths,
+    now: impl FnOnce() -> Clocks,
+) -> ExitCode {
+    let_go_with(
+        code,
+        job,
+        quit_off,
+        instance,
+        paths,
+        Ending {
+            now,
+            turn: || crate::cli::change(paths, |why| aterm_log::warn!("acaffiene: {why}")),
+            discard: || discard_own_copy(&paths.code_dir()),
+            pause: || std::thread::sleep(NAME_POLL),
+        },
+    )
+}
+
+/// What [`let_go_with`] reads the clocks with (`now`), takes the turn with (`turn`), removes the
+/// mug's copy with (`discard`) and waits with between tries of the lock (`pause`).
+struct Ending<N, T, D, P> {
+    now: N,
+    turn: T,
+    discard: D,
+    pause: P,
+}
+
+/// [`let_go`], through `ending`.
+fn let_go_with(
+    code: ExitCode,
+    job: Option<&str>,
+    quit_off: bool,
+    instance: Instance,
+    paths: &Paths,
+    ending: Ending<
+        impl FnOnce() -> Clocks,
+        impl FnOnce() -> Option<state::Held>,
+        impl FnOnce(),
+        impl FnMut(),
+    >,
+) -> ExitCode {
+    let Ending {
+        now,
+        turn,
+        discard,
+        pause,
+    } = ending;
     if code == Exit::Restart.code() {
         instance.release_named();
-    } else {
-        drop(instance);
+        return code;
     }
-    code
+    let after_quit = job.filter(|_| code == ExitCode::SUCCESS && quit_off);
+    let _turn = after_quit.and_then(|_| turn());
+    if code == ExitCode::SUCCESS {
+        discard();
+    }
+    drop(instance);
+    let Some(label) = after_quit else {
+        return code;
+    };
+    if !state::saved_on(&paths.state_file(), now()) {
+        return code;
+    }
+    aterm_log::info!("acaffiene: the mode was set on while the mug quit; launchd starts it again");
+    name_again(&paths.lock_file(), label, pause);
+    Exit::Restart.code()
+}
+
+/// How long a mug ending for a restart tries to take its lock again ([`name_again`]): another's
+/// probe holds it for an instant, another build's mug for good.
+const NAME_AGAIN: Duration = Duration::from_secs(1);
+
+/// How often [`name_again`] tries the lock.
+const NAME_POLL: Duration = Duration::from_millis(20);
+
+/// Take the lock at `lock` again, up to [`NAME_AGAIN`] with `pause` between tries, and let go of
+/// it with this process's pid and the job `label` in it ([`Instance::release_named`]), for a mug
+/// that let go emptied and then found it must end for a restart. A lock another mug holds is left
+/// to it, as is one whose file cannot be taken or rewritten (a failed rewrite lets go emptied).
+fn name_again(lock: &Path, label: &str, mut pause: impl FnMut()) {
+    let until = Instant::now() + NAME_AGAIN;
+    loop {
+        match Instance::try_hold(lock) {
+            Ok(Some(mut again)) => {
+                if again.set_label(label).is_ok() {
+                    again.release_named();
+                }
+                return;
+            }
+            Ok(None) if Instant::now() < until => pause(),
+            Ok(None) | Err(_) => return,
+        }
+    }
 }
 
 /// Remove the copy under `code_dir` this mug runs from, with every other one that may go
-/// ([`crate::code::discard_copies`]), when it runs from one; a failure is said on stderr.
+/// ([`crate::code::discard_copies`]), when it runs from one; a copy kept and a failure are said
+/// on stderr.
 fn discard_own_copy(code_dir: &Path) {
-    if crate::code::runs_from_copy(code_dir)
-        && let Err(e) = crate::code::discard_copies(code_dir)
-    {
-        eprintln!("aterm acaffiene: {}: {e}", code_dir.display());
+    if !crate::code::runs_from_copy(code_dir) {
+        return;
+    }
+    match crate::code::discard_copies(code_dir) {
+        Ok(kept) => kept.say(),
+        Err(e) => eprintln!("aterm acaffiene: {}: {e}", code_dir.display()),
+    }
+}
+
+/// How [`run_app`] ended.
+struct Ended {
+    code: ExitCode,
+    /// The person's Quit saved off ([`Mug::quit_off`]).
+    quit_off: bool,
+}
+
+impl From<ExitCode> for Ended {
+    fn from(code: ExitCode) -> Self {
+        Self {
+            code,
+            quit_off: false,
+        }
     }
 }
 
 /// [`run`]'s AppKit half.
-fn run_app(main: MainThread, mug: Mug) -> ExitCode {
+fn run_app(main: MainThread, mug: Mug) -> Ended {
     let app = shared_app();
     if app.is_null() {
-        return refuse(&mug.paths, "AppKit gave no application");
+        return refuse(&mug.paths, "AppKit gave no application").into();
     }
     // SAFETY: `-setActivationPolicy:` is `B24@0:8q16`.
     let _ =
@@ -906,7 +1087,7 @@ fn run_app(main: MainThread, mug: Mug) -> ExitCode {
             tracking: Cell::new(false),
         },
     ) else {
-        return refuse(&paths, "the runtime refused the mug's target");
+        return refuse(&paths, "the runtime refused the mug's target").into();
     };
     let changed = {
         let target = target.clone_retained();
@@ -923,10 +1104,10 @@ fn run_app(main: MainThread, mug: Mug) -> ExitCode {
     let now = now();
     let first_tick = {
         let Ok(mut mug) = target.ivars().mug.try_borrow_mut() else {
-            return ExitCode::FAILURE;
+            return ExitCode::FAILURE.into();
         };
         if !mug.take(now) {
-            return refuse(&mug.paths, "the mug could not save the mode it read");
+            return refuse(&mug.paths, "the mug could not save the mode it read").into();
         }
         let rows = mug.rows(now);
         mug.ui = ui::install(
@@ -937,10 +1118,10 @@ fn run_app(main: MainThread, mug: Mug) -> ExitCode {
             rows,
         );
         if mug.ui.is_none() {
-            return refuse(&mug.paths, "the menu bar refused the mug");
+            return refuse(&mug.paths, "the menu bar refused the mug").into();
         }
         if !mug.begin(now) {
-            return Exit::Quit.code();
+            return Exit::Quit.code().into();
         }
         next_tick_secs(mug.mode, now)
     };
@@ -968,11 +1149,14 @@ fn run_app(main: MainThread, mug: Mug) -> ExitCode {
         stop_observing_wake(target.as_id());
     }
     drop(changed);
-    let exit = match target.ivars().mug.try_borrow_mut() {
-        Ok(mut mug) => mug.leave(),
-        Err(_) => None,
+    let (exit, quit_off) = match target.ivars().mug.try_borrow_mut() {
+        Ok(mut mug) => (mug.leave(), mug.quit_off),
+        Err(_) => (None, false),
     };
-    exit.unwrap_or(Exit::Quit).code()
+    Ended {
+        code: exit.unwrap_or(Exit::Quit).code(),
+        quit_off,
+    }
 }
 
 #[cfg(test)]
@@ -1070,6 +1254,215 @@ mod tests {
         assert_eq!(Exit::Restart.code(), ExitCode::from(launchd::EXIT_RESTART));
     }
 
+    #[test]
+    fn only_a_writers_on_after_a_saved_quit_restarts_the_mug() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let quit = ExitCode::SUCCESS;
+        let restart = Exit::Restart.code();
+        let mut mug = scratch_mug(dir.path());
+        let (file, lock, job) = (mug.paths.state_file(), mug.paths.lock_file(), Some(LABEL));
+        let held = || Instance::try_hold(&lock).expect("hold").expect("free");
+        assert!(
+            mug.handled(|m| m.choose(MenuAction::Activate(Choice::Forever), NOW))
+                .is_some()
+        );
+        assert_eq!(
+            mug.handled(|m| m.choose(MenuAction::Quit, NOW)),
+            Some(Next::Stop(Exit::Quit))
+        );
+        assert!(mug.quit_off, "the Quit saved off");
+        assert_eq!(
+            let_go(quit, job, mug.quit_off, held(), &mug.paths, || NOW),
+            quit,
+            "nobody wrote since"
+        );
+        state::save_at(&file, Mode::Forever, NOW + 1).expect("a window's forever");
+        assert_eq!(
+            let_go(quit, job, mug.quit_off, held(), &mug.paths, || NOW + 1),
+            restart
+        );
+        assert_eq!(
+            let_go(quit, None, mug.quit_off, held(), &mug.paths, || NOW + 1),
+            quit,
+            "a mug run by hand has no job to start it again"
+        );
+        let unbooted = |mode| state::encode(&state::Saved { mode, boot: None }, NOW);
+        std::fs::write(&file, unbooted(Mode::Off)).expect("an off with no boot");
+        assert_eq!(
+            let_go(quit, job, mug.quit_off, held(), &mug.paths, || NOW + 1),
+            quit,
+            "the Quit's own off, saved with no boot id, is read as off, not restored to forever"
+        );
+        std::fs::write(&file, unbooted(Mode::Forever)).expect("a forever with no boot");
+        assert_eq!(
+            let_go(quit, job, mug.quit_off, held(), &mug.paths, || NOW + 1),
+            restart
+        );
+
+        let mut mug = scratch_mug(dir.path());
+        assert!(
+            mug.handled(|m| m.choose(MenuAction::Activate(Choice::Forever), NOW))
+                .is_some()
+        );
+        let state_dir = file.parent().expect("state dir");
+        std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o555)).expect("ro");
+        let ended = mug.handled(|m| m.choose(MenuAction::Quit, NOW));
+        std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o755)).expect("rw");
+        assert_eq!(ended, Some(Next::Stop(Exit::Quit)));
+        assert!(!mug.quit_off, "the Quit's save failed");
+        assert_eq!(saved(&mug), Some(Mode::Forever), "the earlier mode stands");
+        assert_eq!(
+            let_go(quit, job, mug.quit_off, held(), &mug.paths, || NOW),
+            quit,
+            "the mug's own earlier forever is no writer's"
+        );
+
+        let mut mug = scratch_mug(dir.path());
+        mug.origin_serves = |_| Some(false);
+        std::fs::write(&mug.origin, b"build 1").expect("exe");
+        mug.watch = Some(Watch::start(mug.origin.clone(), &mug.origin));
+        std::fs::write(&mug.origin, b"build two").expect("exe");
+        assert!(
+            mug.handled(|m| m.choose(MenuAction::Activate(Choice::Forever), NOW))
+                .is_some()
+        );
+        assert_eq!(
+            mug.handled(|m| m.tick(NOW + 1, false)),
+            Some(Next::Stop(Exit::Quit)),
+            "an origin with no acaffiene verb retires the mug"
+        );
+        assert!(!mug.quit_off, "a retirement is no person's Quit");
+        assert_eq!(
+            let_go(quit, job, mug.quit_off, held(), &mug.paths, || NOW + 1),
+            quit
+        );
+    }
+
+    /// A job's mug ending after the person's Quit takes the turn while it still holds its lock,
+    /// then, under the turn, removes its copy, empties and lets go of the lock, and reads the mode
+    /// ([`let_go`]): an on saved just after the let-go, when a writer's start finds no mug in the
+    /// lock and waits for this one to end, still ends it for a restart, and the lock names the job
+    /// again for it, past another's hold, as it does for an update restart. Every other end
+    /// empties the lock, reads nothing, and a failure keeps its code.
+    #[test]
+    fn a_quitting_job_lets_go_of_its_lock_before_it_reads_the_mode() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let paths = scratch_mug(dir.path()).paths;
+        let (lock, file, session) = (paths.lock_file(), paths.state_file(), paths.session_dir());
+        let held = || {
+            let mut held = Instance::try_hold(&lock).expect("hold").expect("free");
+            held.set_label(LABEL).expect("label");
+            held
+        };
+        let named = || crate::instance::last_holder(&lock);
+        let label = || named().and_then(|holder| holder.label);
+        let turn_free = || {
+            std::fs::create_dir_all(&session).expect("session folder");
+            state::hold_dir(&session, Duration::ZERO, || {})
+                .expect("turn")
+                .is_some()
+        };
+        let lock_held = || Instance::try_hold_unnamed(&lock).expect("probe").is_none();
+        state::save_at(&file, Mode::Off, NOW).expect("the Quit's off");
+        let seen = RefCell::new(Vec::new());
+        let another = RefCell::new(None);
+        let code = let_go_with(
+            ExitCode::SUCCESS,
+            Some(LABEL),
+            true,
+            held(),
+            &paths,
+            Ending {
+                turn: || {
+                    seen.borrow_mut().push(("turn", turn_free(), lock_held()));
+                    crate::cli::change(&paths, |why| panic!("{why}"))
+                },
+                discard: || {
+                    seen.borrow_mut()
+                        .push(("discard", turn_free(), lock_held()))
+                },
+                now: || {
+                    seen.borrow_mut().push(("read", turn_free(), lock_held()));
+                    assert_eq!(named(), None, "let go naming no mug");
+                    state::save_at(&file, Mode::Forever, NOW + 1).expect("a writer's on");
+                    *another.borrow_mut() = Instance::try_hold_unnamed(&lock).expect("probe");
+                    NOW + 1
+                },
+                pause: || {
+                    let held = another.borrow_mut().take().is_some();
+                    seen.borrow_mut().push(("pause", turn_free(), held));
+                },
+            },
+        );
+        assert_eq!(
+            *seen.borrow(),
+            [
+                ("turn", true, true),
+                ("discard", false, true),
+                ("read", false, false),
+                ("pause", false, true),
+            ],
+            "the turn taken with the lock held; under it the copy removed, the lock let go and \
+             the mode read, then the lock tried again past another's hold"
+        );
+        assert_eq!(code, Exit::Restart.code(), "the on after the let-go");
+        assert_eq!(
+            label().as_deref(),
+            Some(LABEL),
+            "the job named again for the restart"
+        );
+        assert!(
+            Instance::try_hold_unnamed(&lock).expect("hold").is_some(),
+            "and let go"
+        );
+        assert!(turn_free(), "the turn let go");
+
+        state::save_at(&file, Mode::Off, NOW).expect("the Quit's off");
+        let read_in_turn = std::cell::Cell::new(None);
+        assert_eq!(
+            let_go(ExitCode::SUCCESS, Some(LABEL), true, held(), &paths, || {
+                read_in_turn.set(Some(!turn_free()));
+                NOW
+            }),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            read_in_turn.get(),
+            Some(true),
+            "the real let_go reads under the verbs' turn"
+        );
+        assert!(turn_free(), "and lets it go");
+        assert_eq!(named(), None, "emptied, read off");
+        assert_eq!(
+            let_go(
+                Exit::Restart.code(),
+                Some(LABEL),
+                false,
+                held(),
+                &paths,
+                || NOW
+            ),
+            Exit::Restart.code()
+        );
+        assert_eq!(label().as_deref(), Some(LABEL), "an update restart");
+        for (code, job, quit_off) in [
+            (ExitCode::SUCCESS, Some(LABEL), false),
+            (ExitCode::SUCCESS, None, true),
+            (ExitCode::FAILURE, Some(LABEL), true),
+        ] {
+            state::save_at(&file, Mode::Forever, NOW).expect("on");
+            assert_eq!(
+                let_go(code, job, quit_off, held(), &paths, || panic!("no read")),
+                code
+            );
+            assert_eq!(named(), None, "emptied");
+        }
+    }
+
+    /// The label of a job in tests: a dev bundle's, which [`crate::launchd::is_label`] accepts.
+    const LABEL: &str = "com.aterm.aterm.acaffiene.dev.0123abcd";
+
     fn scratch_mug(dir: &std::path::Path) -> Mug {
         Mug {
             paths: Paths {
@@ -1095,6 +1488,8 @@ mod tests {
             ui: None,
             watch: None,
             exit: None,
+            quit_off: false,
+            shown: None,
         }
     }
 
@@ -1117,6 +1512,22 @@ mod tests {
     }
 
     #[test]
+    fn a_click_on_a_span_that_has_just_ended_turns_it_off() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let mut mug = scratch_mug(dir.path());
+        let _ = mug.choose(MenuAction::Activate(Choice::Hours1), NOW);
+        assert!(mug.awake.is_some());
+        // Past the deadline, before the tick that takes the span again: the mug is still lit,
+        // and the span is the forever it ends in.
+        let end = NOW + HOUR;
+        assert!(matches!(mug.mode, Mode::Until { .. }));
+        assert_eq!(mug.toggle(end), Next::Tick(TICK_SECS));
+        assert_eq!(mug.mode, Mode::Off);
+        assert!(mug.awake.is_none());
+        assert_eq!(saved(&mug), Some(Mode::Off));
+    }
+
+    #[test]
     fn a_refused_activity_is_off_in_the_mug_file_tooltip_and_status() {
         for requested in [Mode::Forever, Mode::activate(Some(HOUR), NOW)] {
             let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -1126,9 +1537,18 @@ mod tests {
             assert_eq!(mug.mode, Mode::Off, "no assertion must never appear on");
             assert!(mug.awake.is_none());
             assert_eq!(saved(&mug), Some(Mode::Off));
+            let off_tip = menu::tooltip(Mode::Off, NOW);
+            assert_ne!(menu::tooltip(requested, NOW), off_tip);
+            assert_eq!(
+                mug.shown,
+                Some((false, off_tip)),
+                "the empty mug, saying off"
+            );
+            let read = state::load(&mug.paths.state_file(), NOW);
             assert!(
-                crate::cli::status_text(mug.mode, NOW, Some(42), Startup::Off, "l.x")
-                    .starts_with("acaffiene=off\nuntil=-\n")
+                crate::cli::status_text(read, NOW, Some(42), Startup::Off, "l.x")
+                    .starts_with("acaffiene=off\nuntil=-\n"),
+                "`status` reads the file"
             );
             mug.awake_begin = |_| panic!("a refused request does not retry without a new choice");
             assert_eq!(mug.tick(NOW + TICK_SECS, false), Next::Tick(TICK_SECS));
@@ -1284,7 +1704,7 @@ mod tests {
     /// A file with no `ends`, taken at the start or from a writer, is saved back on the boot clock,
     /// so a read after the date moves a day has the time the mug holds.
     #[test]
-    fn an_earlier_builds_file_is_saved_back_on_the_boot_clock() {
+    fn a_file_with_no_ends_is_saved_back_on_the_boot_clock() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         let mut mug = scratch_mug(dir.path());
         let file = mug.paths.state_file();
@@ -1301,7 +1721,7 @@ mod tests {
             } else {
                 "at the start"
             };
-            std::fs::write(&file, &earlier).expect("an earlier build's file");
+            std::fs::write(&file, &earlier).expect("a file with no ends");
             let taken = if from_writer {
                 mug.reload(NOW) == Next::Tick(TICK_SECS)
             } else {
@@ -1472,69 +1892,113 @@ mod tests {
         }
     }
 
-    /// A span whose save-back fails with the menu open lets go of the activity on the tick
-    /// itself, not at the stop, which waits for the menu to close.
+    /// [`state::take_saving`] whose save-back, which must be due, fails for real: the state folder
+    /// is moved aside and a file put in its place for the save, then put back.
+    fn take_with_a_failed_save(path: &Path, now: Clocks) -> std::io::Result<Mode> {
+        let (mode, was) = state::take(path, now);
+        let was = was.expect("a file to save back");
+        struct RestoreParent {
+            path: PathBuf,
+            kept: PathBuf,
+            moved: bool,
+        }
+        impl RestoreParent {
+            fn restore(&mut self) -> std::io::Result<()> {
+                if self.moved {
+                    match std::fs::remove_file(&self.path) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => return Err(err),
+                    }
+                    std::fs::rename(&self.kept, &self.path)?;
+                    self.moved = false;
+                }
+                Ok(())
+            }
+        }
+        impl Drop for RestoreParent {
+            fn drop(&mut self) {
+                let _ = self.restore();
+            }
+        }
+        let parent = path.parent().expect("private state directory");
+        let mut restore = RestoreParent {
+            path: parent.to_path_buf(),
+            kept: parent.with_extension("preserved"),
+            moved: false,
+        };
+        assert!(!restore.kept.exists(), "the preservation path is new");
+        std::fs::rename(&restore.path, &restore.kept).expect("preserve the state directory");
+        restore.moved = true;
+        std::fs::write(&restore.path, b"not a directory").expect("obstruct the save parent");
+        let failed = state::save_over(path, mode, &was, now);
+        assert!(
+            failed.is_err(),
+            "the real save must fail even with elevated privileges"
+        );
+        restore.restore().expect("restore the state directory");
+        failed.map(|_| mode)
+    }
+
+    /// The tick that ends the mug's own span, with the menu open, whose save-back of forever
+    /// fails: the file as it stands reads forever (the span has ended), so the mug holds forever
+    /// and runs on, and the file is left as it was.
     #[test]
-    fn a_span_that_ends_on_a_failed_save_lets_go_at_once() {
+    fn a_span_that_ends_on_a_failed_save_keeps_the_mac_awake() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         let mut mug = scratch_mug(dir.path());
         let _ = mug.choose(MenuAction::Activate(Choice::Hours1), NOW);
         assert!(mug.awake.is_some());
         let file = mug.paths.state_file();
         let before = std::fs::read(&file).expect("the saved span");
-        mug.take_saved = |path, now| {
-            let (mode, was) = state::take(path, now);
-            assert_eq!(mode, Mode::Forever, "the saved span has ended");
-            let was = was.expect("the expired span needs a corrective save");
-            struct RestoreParent {
-                path: PathBuf,
-                kept: PathBuf,
-                moved: bool,
-            }
-            impl RestoreParent {
-                fn restore(&mut self) -> std::io::Result<()> {
-                    if self.moved {
-                        match std::fs::remove_file(&self.path) {
-                            Ok(()) => {}
-                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(err) => return Err(err),
-                        }
-                        std::fs::rename(&self.kept, &self.path)?;
-                        self.moved = false;
-                    }
-                    Ok(())
-                }
-            }
-            impl Drop for RestoreParent {
-                fn drop(&mut self) {
-                    let _ = self.restore();
-                }
-            }
-            let parent = path.parent().expect("private state directory");
-            let mut restore = RestoreParent {
-                path: parent.to_path_buf(),
-                kept: parent.with_extension("preserved"),
-                moved: false,
-            };
-            assert!(!restore.kept.exists(), "the preservation path is new");
-            std::fs::rename(&restore.path, &restore.kept).expect("preserve the state directory");
-            restore.moved = true;
-            std::fs::write(&restore.path, b"not a directory").expect("obstruct the save parent");
-            let failed = state::save_over(path, mode, &was, now);
-            assert!(
-                failed.is_err(),
-                "the real save must fail even with elevated privileges"
-            );
-            restore.restore().expect("restore the state directory");
-            failed.map(|_| mode)
-        };
-        let next = mug.tick(NOW + HOUR + 1, true);
-        assert_eq!(next, Next::Stop(Exit::Quit));
-        assert_eq!(mug.mode, Mode::Off);
-        assert!(mug.awake.is_none());
+        mug.take_saved = take_with_a_failed_save;
+        let end = NOW + HOUR + 1;
+        assert_eq!(
+            state::load(&file, end),
+            Mode::Forever,
+            "the saved span has ended"
+        );
+        assert_eq!(mug.tick(end, true), Next::Tick(TICK_SECS));
+        assert_eq!(mug.mode, Mode::Forever);
+        assert!(mug.awake.is_some());
         assert_eq!(
             std::fs::read(&file).expect("the original state file"),
             before
+        );
+        assert!(!mug.paths.state_dir.with_extension("preserved").exists());
+    }
+
+    /// The same tick with a writer's span in the file, not yet notified, that the save-back would
+    /// bring in to its hour (a deadline a day off): it reads a span, not forever, so the mug, which
+    /// could not save it, stops, and lets go of its own ended span on the tick itself, not at the
+    /// stop, which waits for the menu to close.
+    #[test]
+    fn a_failed_save_of_a_writers_span_as_the_mugs_ends_lets_go_at_once() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let mut mug = scratch_mug(dir.path());
+        let _ = mug.choose(MenuAction::Activate(Choice::Hours1), NOW);
+        assert!(mug.awake.is_some());
+        let file = mug.paths.state_file();
+        let end = NOW + HOUR + 1;
+        let far = format!(
+            "mode=until\nends={}\nspan={HOUR}\ndeadline={}\nboot={}\n",
+            end.since_boot + 24 * HOUR,
+            end.wall + 24 * HOUR,
+            state::boot_text(crate::instance::boot_id().expect("this boot"))
+        );
+        std::fs::write(&file, &far).expect("a writer's far deadline");
+        mug.take_saved = take_with_a_failed_save;
+        assert_eq!(
+            state::load(&file, end).remaining(end),
+            Some(HOUR),
+            "it reads a span"
+        );
+        assert_eq!(mug.tick(end, true), Next::Stop(Exit::Quit));
+        assert_eq!(mug.mode, Mode::Off);
+        assert!(mug.awake.is_none());
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("the writer's file"),
+            far
         );
         assert!(!mug.paths.state_dir.with_extension("preserved").exists());
     }
@@ -1557,10 +2021,7 @@ mod tests {
             })
         };
         assert!(!checked(&mug));
-        assert_eq!(
-            mug.choose(MenuAction::ToggleStartup, NOW),
-            Next::Tick(TICK_SECS)
-        );
+        assert_eq!(mug.choose(MenuAction::ToggleStartup, NOW), Next::Keep);
         let text = std::fs::read_to_string(&plist).expect("the login plist");
         assert!(
             text.contains(&format!("<string>{}</string>", mug.origin.display())),
@@ -1572,8 +2033,8 @@ mod tests {
         let _ = mug.choose(MenuAction::ToggleStartup, NOW);
         assert!(!plist.exists());
         assert!(!checked(&mug));
-        let _ = mug.set_startup(true, NOW);
-        assert_eq!(mug.set_startup(true, NOW), Next::Tick(TICK_SECS));
+        let _ = mug.set_startup(true);
+        assert_eq!(mug.set_startup(true), Next::Keep);
         assert!(checked(&mug), "asked on, stays on");
         let _ = mug.choose(MenuAction::ToggleStartup, NOW);
         assert!(!checked(&mug), "the control");
@@ -1589,7 +2050,7 @@ mod tests {
         mug.doors.blocks = |_| true;
         mug.open_login_items = || OPENED.with(|n| n.set(n.get() + 1));
         let plist = mug.paths.startup_plist(&mug.label);
-        assert_eq!(mug.set_startup(true, NOW), Next::Tick(TICK_SECS));
+        assert_eq!(mug.set_startup(true), Next::Keep);
         assert!(plist.is_file());
         assert_eq!(mug.startup(), Startup::Blocked);
         assert_eq!(OPENED.with(Cell::get), 1);
@@ -1609,10 +2070,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let agents = plist.parent().expect("LaunchAgents").to_path_buf();
         std::fs::set_permissions(&agents, std::fs::Permissions::from_mode(0o555)).expect("ro");
-        let _ = mug.set_startup(true, NOW);
+        let _ = mug.set_startup(true);
         std::fs::set_permissions(&agents, std::fs::Permissions::from_mode(0o755)).expect("rw");
         assert_eq!(OPENED.with(Cell::get), 3, "a failed write still opens it");
-        let _ = mug.set_startup(false, NOW);
+        let _ = mug.set_startup(false);
         assert!(!plist.exists());
         assert_eq!(mug.startup(), Startup::Off);
         assert_eq!(OPENED.with(Cell::get), 3, "off opens nothing");
@@ -1647,7 +2108,7 @@ mod tests {
         let _ = mug.choose(MenuAction::ToggleStartup, NOW);
         assert_eq!(LIFTED.with(Cell::get), 1);
         assert_eq!(mug.startup(), Startup::On);
-        let _ = mug.set_startup(true, NOW);
+        let _ = mug.set_startup(true);
         assert_eq!(LIFTED.with(Cell::get), 1, "nothing to lift once on");
     }
 

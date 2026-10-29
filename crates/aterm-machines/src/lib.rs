@@ -8,6 +8,8 @@
 
 #[cfg(test)]
 aterm_durable::plain_durable_flushes_in_tests!();
+#[cfg(test)]
+aterm_secrets::memoized_x25519_in_tests!();
 
 pub mod agent;
 pub mod askpass;
@@ -35,13 +37,13 @@ pub mod init_observe;
 pub mod init_preferences;
 pub mod init_secrets;
 pub mod init_spotlight;
+pub mod init_toolset;
 pub mod init_trackpad;
 pub mod items;
 pub mod model;
 pub mod plist;
 pub mod port;
 pub mod protocol;
-pub mod remote_control;
 pub mod sessions;
 pub mod sync;
 

@@ -58,6 +58,7 @@ pub const NOVA_PALETTES: [(u32, u32); 8] = [
 
 /// The `(core, fringe)` pair for a Gray-decoded palette index.
 #[inline]
+#[must_use]
 pub const fn palette(idx: u8) -> (u32, u32) {
     NOVA_PALETTES[(idx & 7) as usize]
 }
@@ -75,6 +76,7 @@ pub enum NovaPhase {
 }
 
 #[inline]
+#[must_use]
 pub const fn phase(t_ms: i64, d_ms: u32) -> NovaPhase {
     let d = d_ms as i64;
     match t_ms {
@@ -90,6 +92,7 @@ pub const fn phase(t_ms: i64, d_ms: u32) -> NovaPhase {
 
 /// The Dip's ink envelope multiplier at `t`: `1 − 0.35·smoothstep(p)` inside the dip window, `1.0` outside (rides the ink channel, no quads).
 #[inline]
+#[must_use]
 pub const fn dip_envelope(t_ms: u64) -> f32 {
     const INV_DIP_MS: f32 = 1.0 / DIP_MS as f32;
     if t_ms >= DIP_MS {
@@ -219,6 +222,7 @@ const fn ease_out(q: f32) -> f32 {
 
 /// Ring radius + fade envelope at `t`, or `None` outside the ring window.
 #[inline]
+#[must_use]
 pub const fn ring_radius(t_ms: u64, r_max: f32, singularity: bool) -> Option<(f32, f32)> {
     const INV_RING_SPAN_MS: f32 = 1.0 / (RING_END_MS - FLASH_END_MS) as f32;
     if t_ms < FLASH_END_MS || t_ms >= RING_END_MS {
@@ -236,8 +240,12 @@ pub const fn ring_radius(t_ms: u64, r_max: f32, singularity: bool) -> Option<(f3
 
 /// Ring/debris visibility floor: dark palette fringes (ion `#6c8cff`, emerald `#7cd83c`, …) under-read as additive light on dark glass, so lift the fringe's relative luminance to ≥ 0.42 by stepping toward the palette's own core (never white, keeping the pair's identity).
 #[inline]
+#[must_use]
 pub const fn vivid_fringe(core: u32, fringe: u32) -> u32 {
     const FLOOR: f32 = 0.42;
+    if fringe == core {
+        return fringe;
+    }
     let table = crate::color_math::relative_luminance_table();
     let mut c = fringe;
     let mut k = 1u32;
@@ -253,6 +261,7 @@ pub const fn vivid_fringe(core: u32, fringe: u32) -> u32 {
 
 /// Band count: exactly [`RING_BANDS`] when the extent admits ≥ 2 px bands (`2r ≥ 60 px`, true from `cell_h = 14` at genome radii); below that `⌊2r/2⌋`, fewer quads, so the closed form still bounds.
 #[inline]
+#[must_use]
 pub const fn ring_band_count(extent_px: f32) -> usize {
     if extent_px >= 2.0 * RING_BANDS as f32 {
         RING_BANDS
@@ -430,6 +439,10 @@ fn emit_rays(
     let (cxf, cyf) = (env.cx as f32, env.cy as f32);
     let core = env.core;
     let inv_samples = 1.0 / samples as f32;
+    let fade_intensity = fade * env.intensity;
+    if fade_intensity <= 0.0 {
+        return 0;
+    }
     let rot_turn = f32::from(env.feats.rot) * 0.0625;
     let nrays_f = nrays as f32;
     let mut emitted_samples = 0usize;
@@ -463,7 +476,7 @@ fn emit_rays(
             }
             let quads_before = sink.out.len();
             let th = 2.5 - 1.5 * sf;
-            let cov = (fade * (1.0 - 0.65 * sf) * env.intensity).clamp(0.0, 1.0);
+            let cov = (fade_intensity * (1.0 - 0.65 * sf)).clamp(0.0, 1.0);
             let mm = 0.5 * (m0 + m1);
             if major_x {
                 let xa = cxf + ux * m0;
@@ -510,7 +523,6 @@ fn emit_rays(
 fn emit_crown(sink: &mut QuadSink<'_>, env: &NovaEnv, t_ms: u64) {
     const INV_FLASH_SPAN_MS: f32 = 1.0 / (FLASH_END_MS - DIP_MS) as f32;
     const SEG_SPANS: [(f32, f32); 2] = [(0.0, 0.45), (0.45, 1.0)];
-    const SIDES: [f32; 2] = [-1.0, 1.0];
     let e = (t_ms.saturating_sub(DIP_MS)) as f32 * INV_FLASH_SPAN_MS;
     let envl = crate::supernova::sin_cos_f32(std::f32::consts::PI * e.clamp(0.0, 1.0)).0;
     let ch = env.cell_h as f32;
@@ -518,6 +530,9 @@ fn emit_crown(sink: &mut QuadSink<'_>, env: &NovaEnv, t_ms: u64) {
     let r = 1.3 * ch;
     let beam = 0.30 * ch;
     let env_int = envl * env.intensity;
+    if env_int <= 0.0 {
+        return;
+    }
     let r_minus_beam = r - beam;
     let mut si = 0;
     while si < SEG_SPANS.len() {
@@ -531,28 +546,16 @@ fn emit_crown(sink: &mut QuadSink<'_>, env: &NovaEnv, t_ms: u64) {
         let x1 = cxf + hw;
         let off0 = beam + r_minus_beam * f0;
         let off1 = beam + r_minus_beam * f1;
-        let mut s_idx = 0;
-        while s_idx < SIDES.len() {
-            let side = SIDES[s_idx];
-            s_idx += 1;
-            let ya = cyf + side * off0;
-            let yb = cyf + side * off1;
-            let (y0, y1) = if ya <= yb { (ya, yb) } else { (yb, ya) };
-            sink.chord(x0, x1, y0 as i32, y1 as i32, color, cov);
-        }
+        sink.chord(x0, x1, (cyf - off1) as i32, (cyf - off0) as i32, color, cov);
+        sink.chord(x0, x1, (cyf + off0) as i32, (cyf + off1) as i32, color, cov);
     }
     let color = mix_rgb(env.core, 0x00FF_FFFF, 0.7);
     let cov = env_int * 0.85;
     let x0 = cxf - 1.05 * ch;
     let x1 = cxf + 1.05 * ch;
-    let mut s_idx = 0;
-    while s_idx < SIDES.len() {
-        let side = SIDES[s_idx];
-        s_idx += 1;
-        let yb = cyf + side * beam;
-        let (y0, y1) = if cyf <= yb { (cyf, yb) } else { (yb, cyf) };
-        sink.chord(x0, x1, y0 as i32, y1 as i32, color, cov);
-    }
+    let cy_i = cyf as i32;
+    sink.chord(x0, x1, (cyf - beam) as i32, cy_i, color, cov);
+    sink.chord(x0, x1, cy_i, (cyf + beam) as i32, color, cov);
 }
 
 /// Debris: 8–20 motes on analytic ballistic arcs (position is a closed form of age) on the wdeco Add stream, twinkling on the shared ≥ 350 ms phase grid (§6.4).
@@ -577,7 +580,6 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
     if rows <= 0 || cols <= 0 {
         return;
     }
-    let fringe = vivid_fringe(env.core, env.fringe);
     const INV_2_TWINKLE_GRID_MS: f32 = 1.0 / (2.0 * TWINKLE_GRID_MS as f32);
     let tw_base = t_ms as f32 * INV_2_TWINKLE_GRID_MS;
     let tw_sin = crate::supernova::sin_cos_f32(std::f32::consts::TAU * tw_base).0;
@@ -590,6 +592,7 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
     if alpha_pair[0] <= 0.01 && alpha_pair[1] <= 0.01 {
         return;
     }
+    let fringe = vivid_fringe(env.core, env.fringe);
     let alpha_u8_pair = [
         (alpha_pair[0] * 255.0).round() as u8,
         (alpha_pair[1] * 255.0).round() as u8,
@@ -598,6 +601,8 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
     let ch_f = env.cell_h as f32;
     let grav_drop = 0.5 * (2.2 * ch_f) * age * age;
     let (cxf, cyf) = (env.cx as f32, env.cy as f32);
+    let cyf_grav = cyf + grav_drop;
+    let vy_bias = -0.6 * ch_f;
     let (grid_wf, grid_hf) = (env.grid_w as f32, env.grid_h as f32);
     let (half_cw, half_ch) = (env.cell_w / 2, env.cell_h / 2);
     const INV_65535: f32 = 1.0 / 65535.0;
@@ -624,8 +629,8 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
             (cxf + cos_a * rr, cyf + sin_a * rr)
         } else {
             let speed = (0.4 + 1.2 * r1) * ch_f;
-            let (vx, vy) = (cos_a * speed, sin_a * speed - 0.6 * ch_f);
-            (cxf + vx * age, cyf + vy * age + grav_drop)
+            let (vx, vy) = (cos_a * speed, sin_a * speed + vy_bias);
+            (cxf + vx * age, cyf_grav + vy * age)
         };
         if x < 0.0 || y < 0.0 || x >= grid_wf || y >= grid_hf {
             continue;
@@ -664,6 +669,10 @@ pub fn emit_ring_arc(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, ca
     if r < 1.0 {
         return;
     }
+    let alpha = (150.0 * fade * env.intensity).clamp(0.0, 255.0) as u8;
+    if alpha == 0 {
+        return;
+    }
     let (rows, cols) = (
         env.grid_h / env.cell_h.max(1),
         env.grid_w / env.cell_w.max(1),
@@ -677,7 +686,6 @@ pub fn emit_ring_arc(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, ca
     let row1 = ((env.cy as f32 + r) as i32 / env.cell_h).min(rows - 1);
     let col0 = ((env.cx as f32 - r) as i32 / env.cell_w).max(0);
     let col1 = ((env.cx as f32 + r) as i32 / env.cell_w).min(cols - 1);
-    let alpha = (150.0 * fade * env.intensity).clamp(0.0, 255.0) as u8;
     let (cxf, cyf) = (env.cx as f32, env.cy as f32);
     let (half_cw, half_ch) = (env.cell_w / 2, env.cell_h / 2);
     let mut emitted = 0usize;
@@ -721,6 +729,7 @@ pub fn emit_ring_arc(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, ca
 
 /// When the expanding (or contracting) ring first crosses `dist` px from the centre, in ms since ignition: the analytic inverse of [`ring_radius`]'s ease-out, so the pulse needs no stored state.
 #[inline]
+#[must_use]
 pub const fn crossing_ms(dist: f32, r_max: f32, singularity: bool) -> Option<u64> {
     if !(dist >= 0.0 && dist <= r_max) || r_max <= 0.0 {
         return None;
@@ -741,6 +750,7 @@ pub const fn crossing_ms(dist: f32, r_max: f32, singularity: bool) -> Option<u64
 
 /// The ~150 ms smoothstep in/out pulse envelope at `t` for a crossing at `cross_ms`; `None` outside the window.
 #[inline]
+#[must_use]
 pub const fn pulse_env(t_ms: u64, cross_ms: u64) -> Option<f32> {
     const INV_PULSE_MS: f32 = 1.0 / PULSE_MS as f32;
     if t_ms < cross_ms || t_ms >= cross_ms + PULSE_MS {
@@ -752,8 +762,25 @@ pub const fn pulse_env(t_ms: u64, cross_ms: u64) -> Option<f32> {
 
 /// Constant-luminance pairing by construction: take `target`'s hue and saturation, then bisect value (and, where the hue cannot reach a bright anchor at full value, saturation toward white) until the WCAG relative luminance matches `anchor`'s.
 #[inline]
+#[must_use]
 pub const fn constant_lum_toward(anchor: u32, target: u32) -> u32 {
-    let table = crate::color_math::relative_luminance_table();
+    constant_lum_toward_with(
+        crate::color_math::relative_luminance_table(),
+        anchor,
+        target,
+    )
+}
+
+#[inline]
+#[must_use]
+pub(crate) const fn constant_lum_toward_with(
+    table: &crate::color_math::RelativeLuminanceTable,
+    anchor: u32,
+    target: u32,
+) -> u32 {
+    if (anchor & 0x00FF_FFFF) == (target & 0x00FF_FFFF) {
+        return target & 0x00FF_FFFF;
+    }
     let want = crate::color_math::relative_luminance_with(table, anchor);
     let (h, s, _) = rgb2hsv(target);
     let full_v = hsv2rgb(h, s, 1.0);
@@ -809,12 +836,34 @@ pub const fn constant_lum_toward(anchor: u32, target: u32) -> u32 {
 
 /// The applied pulse colour: the anchor's hue/saturation shifted toward `fringe` at amplitude `amp` (≤ [`PULSE_AMP`]), then luminance-matched back to the anchor, so |ΔL| ≤ 5% by construction.
 #[inline]
+#[must_use]
 pub const fn pulse_color(anchor: u32, fringe: u32, amp: f32) -> u32 {
-    constant_lum_toward(anchor, mix_rgb(anchor, fringe, amp.clamp(0.0, PULSE_AMP)))
+    pulse_color_with(
+        crate::color_math::relative_luminance_table(),
+        anchor,
+        fringe,
+        amp,
+    )
+}
+
+#[inline]
+#[must_use]
+pub(crate) const fn pulse_color_with(
+    table: &crate::color_math::RelativeLuminanceTable,
+    anchor: u32,
+    fringe: u32,
+    amp: f32,
+) -> u32 {
+    constant_lum_toward_with(
+        table,
+        anchor,
+        mix_rgb(anchor, fringe, amp.clamp(0.0, PULSE_AMP)),
+    )
 }
 
 /// §6.1 ember ink anchors: the settled gradient shifted to the palette's ember tone; the Singularity ends in a dim violet ember instead.
 #[inline]
+#[must_use]
 pub const fn ember_pair(pair: (u32, u32), magic: Option<NovaMagic>) -> (u32, u32) {
     if matches!(magic, Some(NovaMagic::Singularity)) {
         return (0x002A_2040, 0x005A_48A8);

@@ -238,7 +238,7 @@ impl Resources {
             ));
         }
         self.with_store(false, |session, store, _| {
-            self.pin(false)?;
+            self.pin(session, store, false)?;
             session.writer()?;
             let ledger = ledger::Ledger::read(&self.allocation, session, store)?;
             if let Some(old) = ledger.request(&session.actor(), &request) {
@@ -250,7 +250,7 @@ impl Resources {
                 return Ok(Admission::Existing(report(session, store, old)?));
             }
             let debit = self.new_debit(session, &ledger, request, cost)?;
-            let receipt = store.commit_catalog(session, &debit.encode_attempt(operation))?;
+            let receipt = store.commit_liability(session, &debit.encode_attempt(operation))?;
             Ok(Admission::Fresh(Permit {
                 request,
                 cost,
@@ -287,7 +287,7 @@ impl Resources {
         };
         let operation = attempt.operation;
         let recorded = self.with_store(false, |session, store, _| {
-            self.pin(false)?;
+            self.pin(session, store, false)?;
             session.writer()?;
             let ledger = ledger::Ledger::read(&self.allocation, session, store)?;
             let old = ledger
@@ -302,7 +302,7 @@ impl Resources {
                     return Err(Error::new("dispatch already has a different observation"));
                 }
             } else {
-                store.commit_catalog(
+                store.commit_liability(
                     session,
                     &ledger::Completion {
                         allocation: self.allocation.id(),
@@ -339,8 +339,8 @@ impl Resources {
         if request == [0; 16] {
             return Err(Error::new("dispatch lookup requires a nonzero request"));
         }
-        self.with_store(false, |session, store, _| {
-            self.pin(false)?;
+        self.observe_store(|session, store, _| {
+            self.pin(session, store, false)?;
             let ledger = ledger::Ledger::read(&self.allocation, session, store)?;
             ledger
                 .request(&session.actor(), &request)

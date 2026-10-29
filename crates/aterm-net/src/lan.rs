@@ -21,6 +21,37 @@ pub use listener::Listener;
 pub(crate) use listener::Witness as ListenerWitness;
 pub use multicast::Multicast;
 
+/// Why a [`Listener::try_bind`] or a [`Multicast::try_bind`] made no socket, and whether it
+/// `reached` its socket first: past its checks of the address and its attachment, it created
+/// one and may have bound, joined or listened on the LAN before a later step (the attachment's
+/// re-check among them) refused. An OS that asks before an app's first LAN use (macOS's Local
+/// Network question) may have asked at that syscall; one that failed before it asked nothing.
+#[derive(Debug)]
+pub struct BindFailure {
+    /// What refused.
+    pub error: io::Error,
+    /// The bind made its socket before it failed.
+    pub reached: bool,
+}
+
+impl BindFailure {
+    /// A failure at the checks, before any socket.
+    const fn before(error: io::Error) -> Self {
+        Self {
+            error,
+            reached: false,
+        }
+    }
+
+    /// A failure once the socket was made.
+    const fn after(error: io::Error) -> Self {
+        Self {
+            error,
+            reached: true,
+        }
+    }
+}
+
 /// Loopback is an explicit local/test transport, never inferred as a LAN.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
@@ -80,23 +111,42 @@ impl Connection {
     /// Inspect an accepted or already connected socket without sending bytes.
     /// A production listener calls this before its TLS handshake.
     pub fn admit(stream: TcpStream, scope: Scope) -> io::Result<Self> {
+        let proof = Self::admit_proof(&stream, scope, None)?;
+        Ok(Self { stream, proof })
+    }
+
+    pub(crate) fn admit_proof(
+        stream: &TcpStream,
+        scope: Scope,
+        listener: Option<ListenerWitness>,
+    ) -> io::Result<Proof> {
+        if let Some(witness) = &listener {
+            witness.recheck()?;
+        }
         let until = native::deadline();
-        if scope == Scope::Loopback {
-            return Self::connected(stream, scope, None, until);
+        let bound = if scope == Scope::Loopback {
+            None
+        } else {
+            let local = stream.local_addr()?;
+            let peer = stream.peer_addr()?;
+            endpoints(Some(local), peer)?;
+            let mut candidates = attachments(Some(local), peer, None)?;
+            if candidates.len() != 1 {
+                return Err(refuse("accepted source has no unique LAN attachment"));
+            }
+            let attachment = candidates.remove(0);
+            if !ready(&attachment) {
+                return Err(refuse("accepted source is not a live physical LAN"));
+            }
+            native::ensure_binding(stream, attachment.index, &attachment.name)?;
+            Some(attachment.index)
+        };
+        let has_listener = listener.is_some();
+        let proof = Self::connected_proof(stream, scope, bound, until, listener)?;
+        if has_listener {
+            proof.recheck()?;
         }
-        let local = stream.local_addr()?;
-        let peer = stream.peer_addr()?;
-        endpoints(Some(local), peer)?;
-        let mut candidates = attachments(Some(local), peer, None)?;
-        if candidates.len() != 1 {
-            return Err(refuse("accepted source has no unique LAN attachment"));
-        }
-        let attachment = candidates.remove(0);
-        if !ready(&attachment) {
-            return Err(refuse("accepted source is not a live physical LAN"));
-        }
-        native::ensure_binding(&stream, attachment.index, &attachment.name)?;
-        Self::connected(stream, scope, Some(attachment.index), until)
+        Ok(proof)
     }
 
     fn connected(
@@ -105,26 +155,34 @@ impl Connection {
         bound: Option<u32>,
         until: Instant,
     ) -> io::Result<Self> {
-        aterm_uds::keep_out_of_children(&stream)?;
+        let proof = Self::connected_proof(&stream, scope, bound, until, None)?;
+        Ok(Self { stream, proof })
+    }
+
+    fn connected_proof(
+        stream: &TcpStream,
+        scope: Scope,
+        bound: Option<u32>,
+        until: Instant,
+        listener: Option<ListenerWitness>,
+    ) -> io::Result<Proof> {
+        aterm_uds::keep_out_of_children(stream)?;
         let local = stream.local_addr()?;
         let peer = stream.peer_addr()?;
         if scope == Scope::Lan {
-            native::restrict_hops(&stream)?;
+            native::restrict_hops(stream)?;
         }
-        native::socket_policy(&stream, bound, scope == Scope::Lan)?;
+        native::socket_policy(stream, bound, scope == Scope::Lan)?;
         let observation = observe(local, peer, scope, bound, until)?;
         let witness = stream.try_clone()?;
         aterm_uds::keep_out_of_children(&witness)?;
-        Ok(Self {
-            stream,
-            proof: Proof {
-                witness,
-                scope,
-                bound,
-                observation,
-                withdrawn: AtomicBool::new(false),
-                listener: None,
-            },
+        Ok(Proof {
+            witness,
+            scope,
+            bound,
+            observation,
+            withdrawn: AtomicBool::new(false),
+            listener,
         })
     }
 
@@ -133,11 +191,8 @@ impl Connection {
         scope: Scope,
         witness: ListenerWitness,
     ) -> io::Result<Self> {
-        witness.recheck()?;
-        let mut connection = Self::admit(stream, scope)?;
-        connection.proof.listener = Some(witness);
-        connection.proof.recheck()?;
-        Ok(connection)
+        let proof = Self::admit_proof(&stream, scope, Some(witness))?;
+        Ok(Self { stream, proof })
     }
 
     /// Check the selected route before dialing, then verify the actual socket.
@@ -179,7 +234,7 @@ impl Connection {
             Scope::Loopback => {}
         }
         Self::connected(
-            TcpStream::connect_timeout(&peer, within)?,
+            crate::tcp_connect::connect_timeout_kept(peer, within)?,
             scope,
             None,
             until,

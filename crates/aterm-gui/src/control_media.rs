@@ -220,6 +220,16 @@ pub(crate) fn call_main<T>(
     make: impl FnOnce(std::sync::mpsc::Sender<T>) -> Wake,
 ) -> Result<T, MainHopError> {
     let (rx, _hop) = post_main(proxy, make)?;
+    recv_main(&rx)
+}
+
+/// Waits up to the default allowance (30 s) for a main-thread reply.
+///
+/// # Errors
+///
+/// The reply did not arrive within the allowance, or the main thread dropped its channel
+/// unanswered.
+pub(crate) fn recv_main<T>(rx: &std::sync::mpsc::Receiver<T>) -> Result<T, MainHopError> {
     match rx.recv_timeout(MAIN_THREAD_REPLY_TIMEOUT) {
         Ok(v) => Ok(v),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(MainHopError::Reason(
@@ -227,6 +237,59 @@ pub(crate) fn call_main<T>(
         )),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             Err(MainHopError::Reason("main-thread reply dropped"))
+        }
+    }
+}
+
+/// One main-thread request decided exactly once: the main thread takes it ([`Claim::take`]) or
+/// the lane that posted it gives it up ([`Claim::give_up`]), whichever comes first, so a request
+/// whose lane answered its client without it never acts.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Claim(Arc<AtomicBool>);
+
+impl Claim {
+    /// Whether the main thread takes the request: `false` once its lane gave it up.
+    pub(crate) fn take(&self) -> bool {
+        !self.0.swap(true, Ordering::AcqRel)
+    }
+
+    /// Whether the lane gives the request up: `false` once the main thread took it, whose answer
+    /// then follows on the request's reply channel.
+    pub(crate) fn give_up(&self) -> bool {
+        !self.0.swap(true, Ordering::AcqRel)
+    }
+}
+
+/// How a parked lane stopped waiting for the main thread's answer ([`park_for_answer`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Waited<T> {
+    Answer(T),
+    HungUp,
+    Deadline,
+    /// The main thread dropped the channel unanswered (the event loop ended).
+    Dropped,
+}
+
+/// Wait on `answer` until `deadline`, re-checking `hung_up` between slices.
+pub(crate) fn park_for_answer<T>(
+    answer: &std::sync::mpsc::Receiver<T>,
+    deadline: std::time::Instant,
+    hung_up: &mut dyn FnMut() -> bool,
+    park: fn(std::time::Duration) -> std::time::Duration,
+) -> Waited<T> {
+    loop {
+        if hung_up() {
+            return Waited::HungUp;
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match answer.recv_timeout(park(left)) {
+            Ok(answer) => return Waited::Answer(answer),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Waited::Dropped,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if std::time::Instant::now() >= deadline {
+                    return Waited::Deadline;
+                }
+            }
         }
     }
 }
@@ -870,8 +933,7 @@ impl crate::App {
             AuxTarget::AutopilotMenu | AuxTarget::FactMenu => {
                 self.autopilot_menu.as_ref().is_some_and(|m| {
                     Some(m.wid) == self.frontmost_window
-                        && (m.owner == crate::autopilot_menu::MenuOwner::Autopilot)
-                            == (target == AuxTarget::AutopilotMenu)
+                        && m.owner.is_autopilot() == (target == AuxTarget::AutopilotMenu)
                 })
             }
             AuxTarget::Overview => self.front().is_some_and(|ws| ws.overview().is_some()),
@@ -990,6 +1052,148 @@ mod window_target_refusal_tests {
         }
         assert_eq!(super::fact_menu_operand("autopilot-menu"), None);
         assert_eq!(super::fact_menu_operand("fact-menus"), None);
+    }
+
+    /// `@<sid> open autopilot-menu at=<row>,<col> [by=pointer|keys]` takes the aimed session, a
+    /// 0-based cell of its screen and how it was asked for, in either order. NEGATIVE CONTROLS:
+    /// the same words unaimed, and every malformed `at=` or `by=` (a missing, signed, wide or
+    /// third index, a word beside them, either given twice), answer the aimed form's usage;
+    /// without an `at=` or `by=` the words stay the bare form's ([`super::open_target`]).
+    #[test]
+    fn open_autopilot_menu_at_a_cell_takes_its_aim_and_nothing_else() {
+        use crate::app_introspect::AuxTarget;
+        for (words, cell, keyboard) in [
+            ("autopilot-menu at=20,40", (20, 40), false),
+            ("autopilot-menu at=0,0 by=keys", (0, 0), true),
+            ("autopilot-menu by=pointer at=23,99", (23, 99), false),
+            ("AUTOPILOT-MENU  at=65535,7", (65_535, 7), false),
+        ] {
+            assert_eq!(
+                super::program_menu_operand(Some(7), words),
+                Some(Ok(crate::autopilot_menu::ProgramMenu {
+                    session: 7,
+                    cell,
+                    keyboard
+                })),
+                "{words}"
+            );
+        }
+        let usage = "ERR usage: @<sid> open autopilot-menu at=<row>,<col> [by=pointer|keys]\n";
+        assert_eq!(
+            super::program_menu_operand(None, "autopilot-menu at=20,40 by=keys"),
+            Some(Err(usage.to_string())),
+            "unaimed"
+        );
+        for refused in [
+            "autopilot-menu at=",
+            "autopilot-menu at=20",
+            "autopilot-menu at=20,",
+            "autopilot-menu at=,40",
+            "autopilot-menu at=-1,40",
+            "autopilot-menu at=+1,40",
+            "autopilot-menu at=20,40,1",
+            "autopilot-menu at=a,b",
+            "autopilot-menu at=65536,0",
+            "autopilot-menu at=20, 40",
+            "autopilot-menu at=20,40 at=1,1",
+            "autopilot-menu at=20,40 by=",
+            "autopilot-menu at=20,40 by=mouse",
+            "autopilot-menu at=20,40 by=Keys",
+            "autopilot-menu at=20,40 by=keys by=keys",
+            "autopilot-menu at=20,40 by=keys by=pointer",
+            "autopilot-menu by=keys",
+            "autopilot-menu at=20,40 close",
+            "autopilot-menu close at=20,40",
+            "autopilot-menu at=20,40 BY=keys",
+        ] {
+            assert_eq!(
+                super::program_menu_operand(Some(7), refused),
+                Some(Err(usage.to_string())),
+                "{refused}"
+            );
+        }
+        for bare in [
+            "autopilot-menu",
+            "autopilot-menu close",
+            "autopilot-menu bogus",
+            "fact-menu at=20,40",
+            "menu at=20,40",
+            "autopilot-menus at=20,40",
+        ] {
+            assert_eq!(super::program_menu_operand(Some(7), bare), None, "{bare}");
+            assert_eq!(super::program_menu_operand(None, bare), None, "{bare}");
+        }
+        assert_eq!(
+            super::open_target("autopilot-menu"),
+            Ok((AuxTarget::AutopilotMenu, false)),
+            "the bare form opens the front window's focused session's menu as before"
+        );
+    }
+
+    /// `open`'s words reach the main thread as [`super::open_route`] reads them, the program's
+    /// aimed `autopilot-menu at=…` ahead of the bare `<target> [close]`, which would refuse its
+    /// operand: the aimed session, the cell and `by=keys` reach the request whole. NEGATIVE
+    /// CONTROLS: unaimed, the same words answer the aimed form's usage, never `open`'s, which
+    /// codex-alab reads as an aterm without the form; the bare form, `close`, `fact-menu` and
+    /// `app` route as before.
+    #[test]
+    fn open_routes_a_programs_aimed_menu_ahead_of_the_bare_target() {
+        use super::OpenRoute;
+        use crate::app_introspect::AuxTarget;
+        use crate::autopilot_menu::ProgramMenu;
+        for (rest, cell, keyboard) in [
+            (" autopilot-menu at=20,40 by=keys ", (20, 40), true),
+            ("autopilot-menu at=3,7 by=pointer", (3, 7), false),
+            ("autopilot-menu at=0,0", (0, 0), false),
+        ] {
+            assert_eq!(
+                super::open_route(Some(9), rest),
+                OpenRoute::ProgramMenu(ProgramMenu {
+                    session: 9,
+                    cell,
+                    keyboard
+                }),
+                "{rest:?}"
+            );
+        }
+        assert_eq!(
+            super::open_route(None, "autopilot-menu at=20,40 by=keys"),
+            OpenRoute::Refused(super::PROGRAM_MENU_USAGE.to_string()),
+            "unaimed: the aimed form's usage"
+        );
+        assert_eq!(
+            super::open_route(Some(9), "autopilot-menu at=20,40 by=mouse"),
+            OpenRoute::Refused(super::PROGRAM_MENU_USAGE.to_string()),
+            "malformed: the aimed form's usage"
+        );
+        for (rest, target, close) in [
+            ("autopilot-menu", AuxTarget::AutopilotMenu, false),
+            ("autopilot-menu close", AuxTarget::AutopilotMenu, true),
+            ("tab-menu", AuxTarget::TabMenu, false),
+        ] {
+            for session in [None, Some(9)] {
+                assert_eq!(
+                    super::open_route(session, rest),
+                    OpenRoute::Aux { target, close },
+                    "{rest:?} aimed at {session:?}"
+                );
+            }
+        }
+        assert_eq!(
+            super::open_route(Some(9), "fact-menu close"),
+            OpenRoute::FactMenu(None)
+        );
+        assert_eq!(
+            super::open_route(Some(9), "app about"),
+            OpenRoute::App(crate::app_control::OpenRequest::About)
+        );
+        assert!(
+            matches!(
+                super::open_route(Some(9), "autopilot-menu bogus"),
+                OpenRoute::Refused(refusal) if refusal.starts_with("ERR usage: open <")
+            ),
+            "a bare operand it does not know keeps open's usage"
+        );
     }
 
     /// One list writes an exhaustive `match` over `Fact` and the facts `Fact::EVERY` is held
@@ -2006,50 +2210,154 @@ fn fact_menu_operand(trimmed: &str) -> Option<Result<Option<crate::claude_lights
     })
 }
 
-/// Handles `open <target> [close]`, opening or closing a native tab or auxiliary surface.
-pub(crate) fn cmd_open(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+/// The refusal of a malformed or unaimed [`program_menu_operand`].
+const PROGRAM_MENU_USAGE: &str =
+    "ERR usage: @<sid> open autopilot-menu at=<row>,<col> [by=pointer|keys]\n";
+
+/// `autopilot-menu at=<row>,<col> [by=pointer|keys]` aimed at `session`: the Autopilot menu a
+/// program asks for at a 0-based cell of its own screen, `by=keys` lighting the first row as the
+/// bare form does. `None` where no word after the target starts `at=` or `by=` (the bare form,
+/// [`open_target`]'s), else the request, or [`PROGRAM_MENU_USAGE`] for any other words beside
+/// them or for no aimed session.
+fn program_menu_operand(
+    session: Option<u64>,
+    trimmed: &str,
+) -> Option<Result<crate::autopilot_menu::ProgramMenu, String>> {
+    use crate::app_introspect::AuxTarget;
+    let mut words = trimmed.split_whitespace();
+    if AuxTarget::parse(words.next()?) != Some(AuxTarget::AutopilotMenu) {
+        return None;
+    }
+    let words: Vec<&str> = words.collect();
+    if !words
+        .iter()
+        .any(|w| w.starts_with("at=") || w.starts_with("by="))
+    {
+        return None;
+    }
+    let (mut cell, mut keyboard) = (None, None);
+    for word in words {
+        match word.split_once('=') {
+            Some(("at", at)) if cell.is_none() => {
+                cell = Some(
+                    at.split_once(',')
+                        .and_then(|(row, col)| Some((cell_index(row)?, cell_index(col)?))),
+                );
+            }
+            Some(("by", "pointer")) if keyboard.is_none() => keyboard = Some(false),
+            Some(("by", "keys")) if keyboard.is_none() => keyboard = Some(true),
+            _ => return Some(Err(PROGRAM_MENU_USAGE.to_string())),
+        }
+    }
+    Some(
+        cell.flatten()
+            .zip(session)
+            .map(|(cell, session)| crate::autopilot_menu::ProgramMenu {
+                session,
+                cell,
+                keyboard: keyboard.unwrap_or(false),
+            })
+            .ok_or_else(|| PROGRAM_MENU_USAGE.to_string()),
+    )
+}
+
+/// A 0-based cell index: decimal digits alone, no wider than a terminal's `u16` side.
+fn cell_index(digits: &str) -> Option<usize> {
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u16>().ok().map(usize::from)
+}
+
+/// What an `open` line asks of the main thread, read off its words before any hop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum OpenRoute {
+    /// `open app <…>` ([`crate::app_control::parse_open`]).
+    App(crate::app_control::OpenRequest),
+    /// `open fact-menu <fact>` (`Some`) or `open fact-menu close` (`None`) ([`fact_menu_operand`]).
+    FactMenu(Option<crate::claude_lights::Fact>),
+    /// `@<sid> open autopilot-menu at=…` ([`program_menu_operand`]).
+    ProgramMenu(crate::autopilot_menu::ProgramMenu),
+    /// `open <target> [close]` ([`open_target`]).
+    Aux {
+        target: crate::app_introspect::AuxTarget,
+        close: bool,
+    },
+    /// The client's answer, with no hop made.
+    Refused(String),
+}
+
+/// Route `open`'s words `rest` aimed at `session` (`None` unaimed): `app`, then `fact-menu`,
+/// then the program's `autopilot-menu at=…`, ahead of the bare `<target> [close]` that would
+/// refuse its operand.
+pub(crate) fn open_route(session: Option<u64>, rest: &str) -> OpenRoute {
     let trimmed = rest.trim();
     if trimmed.split_whitespace().next() == Some("app") {
-        let request = match crate::app_control::parse_open(trimmed) {
-            Ok(request) => request,
-            Err(error) => return format!("ERR {error}\n"),
-        };
-        return match call_main(proxy, |reply| Wake::OpenApp { request, reply }) {
-            Ok(Ok(message)) => format!("OK {message}\n"),
-            Ok(Err(error)) => format!("ERR {error}\n"),
-            Err(error) => format!("ERR {error}\n"),
+        return match crate::app_control::parse_open(trimmed) {
+            Ok(request) => OpenRoute::App(request),
+            Err(error) => OpenRoute::Refused(format!("ERR {error}\n")),
         };
     }
     if let Some(operand) = fact_menu_operand(trimmed) {
-        let fact = match operand {
-            Ok(fact) => fact,
-            Err(refusal) => return refusal,
-        };
-        return match call_main(proxy, |reply| Wake::OpenFactMenu { fact, reply }) {
+        return operand.map_or_else(OpenRoute::Refused, OpenRoute::FactMenu);
+    }
+    if let Some(request) = program_menu_operand(session, trimmed) {
+        return request.map_or_else(OpenRoute::Refused, OpenRoute::ProgramMenu);
+    }
+    open_target(trimmed).map_or_else(OpenRoute::Refused, |(target, close)| OpenRoute::Aux {
+        target,
+        close,
+    })
+}
+
+/// Handles `open` as [`open_route`] read it: a native tab or auxiliary surface opened or closed,
+/// or the Autopilot menu a program asks for at its own cell.
+pub(crate) fn cmd_open(proxy: &EventLoopProxy<Wake>, route: OpenRoute) -> String {
+    match route {
+        OpenRoute::Refused(refusal) => refusal,
+        OpenRoute::App(request) => {
+            match call_main(proxy, |reply| Wake::OpenApp { request, reply }) {
+                Ok(Ok(message)) => format!("OK {message}\n"),
+                Ok(Err(error)) => format!("ERR {error}\n"),
+                Err(error) => format!("ERR {error}\n"),
+            }
+        }
+        OpenRoute::FactMenu(fact) => {
+            match call_main(proxy, |reply| Wake::OpenFactMenu { fact, reply }) {
+                Ok(Ok(())) => format!(
+                    "OK {} fact-menu\n",
+                    if fact.is_none() { "closed" } else { "opened" }
+                ),
+                Ok(Err(msg)) => format!("ERR {msg}\n"),
+                Err(e) => format!("ERR {e}\n"),
+            }
+        }
+        OpenRoute::ProgramMenu(request) => {
+            match call_main(proxy, |reply| Wake::OpenProgramAutopilotMenu {
+                request,
+                reply,
+            }) {
+                Ok(Ok(())) => format!(
+                    "OK opened {}\n",
+                    crate::app_introspect::AuxTarget::AutopilotMenu.keyword()
+                ),
+                Ok(Err(msg)) => format!("ERR {msg}\n"),
+                Err(e) => format!("ERR {e}\n"),
+            }
+        }
+        OpenRoute::Aux { target, close } => match call_main(proxy, |tx| Wake::OpenAuxWindow {
+            target,
+            close,
+            reply: tx,
+        }) {
             Ok(Ok(())) => format!(
-                "OK {} fact-menu\n",
-                if fact.is_none() { "closed" } else { "opened" }
+                "OK {} {}\n",
+                if close { "closed" } else { "opened" },
+                target.keyword()
             ),
             Ok(Err(msg)) => format!("ERR {msg}\n"),
             Err(e) => format!("ERR {e}\n"),
-        };
-    }
-    let (target, close) = match open_target(trimmed) {
-        Ok(taken) => taken,
-        Err(refusal) => return refusal,
-    };
-    match call_main(proxy, |tx| Wake::OpenAuxWindow {
-        target,
-        close,
-        reply: tx,
-    }) {
-        Ok(Ok(())) => format!(
-            "OK {} {}\n",
-            if close { "closed" } else { "opened" },
-            target.keyword()
-        ),
-        Ok(Err(msg)) => format!("ERR {msg}\n"),
-        Err(e) => format!("ERR {e}\n"),
+        },
     }
 }
 
@@ -2149,6 +2457,25 @@ pub(crate) fn cmd_settings_overlay(proxy: &EventLoopProxy<Wake>, rest: &str) -> 
             Err(e) => format!("ERR {e}\n"),
         };
     }
+    if word == "card" {
+        let clean = match tail {
+            "" => false,
+            "clean" => true,
+            _ => return "ERR usage: settings card [clean]\n".to_string(),
+        };
+        return match call_main(proxy, |tx| Wake::SettingsCard { clean, reply: tx }) {
+            Ok(Ok(lines)) => {
+                let mut out = format!("OK {}\n", lines.len());
+                for line in lines {
+                    out.push_str(&line);
+                    out.push('\n');
+                }
+                out
+            }
+            Ok(Err(e)) => format!("ERR {e}\n"),
+            Err(e) => format!("ERR {e}\n"),
+        };
+    }
     if word == "section" {
         let Some(route) = parse_settings_section_route(tail) else {
             return format!("ERR unknown section (use: {})\n", settings_section_usage());
@@ -2169,7 +2496,7 @@ pub(crate) fn cmd_settings_overlay(proxy: &EventLoopProxy<Wake>, rest: &str) -> 
         other => {
             return format!(
                 "ERR unsupported {other:?} (use: open|on|show | close|off|hide | toggle | \
-                 section <name> | set <key> <value…> | unset <key>)\n"
+                 section <name> | set <key> <value…> | unset <key> | card [clean])\n"
             );
         }
     };
@@ -2210,11 +2537,17 @@ pub(crate) fn invoke_refusal(name: &str) -> Option<String> {
     })
 }
 
-/// Returns whether `invoke <name>` counts as a user-initiated action in development builds.
+/// Returns whether `invoke <name>` counts as a user-initiated action in development builds: a
+/// person-only action, or a copy or paste ([`crate::menu::InvokeAuthority::ClipboardWrite`]),
+/// whose clipboard is the person's own, under `ATERM_DEBUG_PERSON_INVOKE=1`.
 pub(crate) fn person_invoke_act(name: &str) -> bool {
+    use crate::menu::InvokeAuthority;
     person_seam_armed()
         && crate::menu::MenuAction::from_invoke_name(name.trim()).is_some_and(|action| {
-            action.invoke_authority() == crate::menu::InvokeAuthority::PersonOnly
+            matches!(
+                action.invoke_authority(),
+                InvokeAuthority::PersonOnly | InvokeAuthority::ClipboardWrite
+            )
         })
 }
 
@@ -2567,12 +2900,14 @@ pub(crate) fn cmd_tone(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
 }
 
-/// Parsed `trail` control query (`Status`, or `Admissions(n)`: the last `n` admission records,
-/// all when `n` is omitted).
+/// Parsed `trail` control query (`Status`, `Light`, or `Admissions(n)`: the last `n` admission
+/// records, all when `n` is omitted).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TrailForm {
     Admissions(Option<usize>),
     Status,
+    /// The front window's light latch (`docs/design/PRISM-GLASS.md` §15.2 1.3).
+    Light,
 }
 
 /// Parses the argument tail of the `trail` control verb.
@@ -2580,19 +2915,27 @@ pub(crate) fn parse_trail_form(rest: &str) -> Result<TrailForm, String> {
     match rest.trim() {
         "" => Ok(TrailForm::Admissions(None)),
         "status" => Ok(TrailForm::Status),
+        "light" => Ok(TrailForm::Light),
         n => n
             .parse::<usize>()
             .map(|n| TrailForm::Admissions(Some(n)))
-            .map_err(|_| "usage: trail [status|<n>]".to_string()),
+            .map_err(|_| "usage: trail [status|light|<n>]".to_string()),
     }
 }
 
-/// Handles `trail [status|<n>]`, reporting cursor-trail diagnostics for the focused window.
+/// Handles `trail [status|light|<n>]`, reporting cursor-trail diagnostics for the focused window.
 pub(crate) fn cmd_trail(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     let count = match parse_trail_form(rest) {
         Ok(TrailForm::Admissions(count)) => count,
         Ok(TrailForm::Status) => {
             return match call_main(proxy, |tx| Wake::TrailStatus { reply: tx }) {
+                Ok(Ok(msg)) => format!("OK 1\n{msg}\n"),
+                Ok(Err(e)) => format!("ERR {e}\n"),
+                Err(e) => format!("ERR {e}\n"),
+            };
+        }
+        Ok(TrailForm::Light) => {
+            return match call_main(proxy, |tx| Wake::TrailLight { reply: tx }) {
                 Ok(Ok(msg)) => format!("OK 1\n{msg}\n"),
                 Ok(Err(e)) => format!("ERR {e}\n"),
                 Err(e) => format!("ERR {e}\n"),
@@ -3484,6 +3827,7 @@ impl crate::App {
             model: worker.order.model,
             trusted_cwd: worker.order.trusted_cwd,
             caller,
+            chrome: worker.order.chrome,
         })
     }
 
@@ -3665,12 +4009,18 @@ mod trail_parse_tests {
     fn the_status_keyword_and_a_ring_count_are_separate_forms() {
         assert_eq!(parse_trail_form("status"), Ok(TrailForm::Status));
         assert_eq!(parse_trail_form("  status  "), Ok(TrailForm::Status));
+        assert_eq!(parse_trail_form("light"), Ok(TrailForm::Light));
+        assert_eq!(parse_trail_form(" light "), Ok(TrailForm::Light));
         assert_eq!(parse_trail_form(""), Ok(TrailForm::Admissions(None)));
         assert_eq!(parse_trail_form("   "), Ok(TrailForm::Admissions(None)));
         assert_eq!(parse_trail_form("8"), Ok(TrailForm::Admissions(Some(8))));
         assert_eq!(parse_trail_form("0"), Ok(TrailForm::Admissions(Some(0))));
-        for bad in ["stats", "Status", "on", "-1", "3 4"] {
-            assert!(parse_trail_form(bad).is_err(), "{bad:?} must be refused");
+        for bad in ["stats", "Status", "Light", "lights", "on", "-1", "3 4"] {
+            assert_eq!(
+                parse_trail_form(bad),
+                Err("usage: trail [status|light|<n>]".to_string()),
+                "{bad:?} must be refused"
+            );
         }
     }
 }
@@ -4541,6 +4891,7 @@ mod worker_start_app_tests {
                 trusted_cwd: None,
                 fact_line: true,
                 autopilot: crate::task_launch::WORKER_AUTOPILOT,
+                chrome: false,
             },
             from: crate::task_record::FROM_CTL.to_string(),
             caller: None,
@@ -5370,31 +5721,6 @@ mod video_parse_tests {
                 path.display()
             )
         );
-    }
-
-    #[test]
-    fn video_frames_before_any_recording_says_none_was_found() {
-        const INSTANCE: &str = "p303-fresh";
-        let tmp = video_test_dir("fresh");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let expected = "ERR video frames: no finished recording found";
-        let out = video_frames_for_instance(
-            &tmp,
-            INSTANCE,
-            std::iter::empty(),
-            &crate::control::ArtifactBudgets::shipping(),
-        );
-        assert!(out.starts_with(expected), "no video/ dir: {out:?}");
-        std::fs::create_dir_all(tmp.join(super::control_auth::VIDEO_DIR)).unwrap();
-        let out = video_frames_for_instance(
-            &tmp,
-            INSTANCE,
-            std::iter::empty(),
-            &crate::control::ArtifactBudgets::shipping(),
-        );
-        assert!(out.starts_with(expected), "no instance dir: {out:?}");
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

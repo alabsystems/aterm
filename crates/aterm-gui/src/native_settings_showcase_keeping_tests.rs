@@ -60,8 +60,16 @@ const PALETTE_FIRST: &str = "settings/showcase/palette/0";
 const SEARCH: &str = "settings/search";
 const BACKGROUND_WELL: &str = "settings/color-open/background";
 const PALETTE_SLOT: &str = "settings/showcase/palette/9";
-/// What the walks press: Customize, Done, a colour well, a palette slot and Save as.
-const PRESSES: [&str; 5] = [CUSTOMIZE, DONE, BACKGROUND_WELL, PALETTE_SLOT, SAVE_AS];
+const MOCHA: &str = "settings/showcase/card/catppuccin-mocha";
+/// What the walks press: Customize, Done, a colour well, a palette slot, Save as and a theme's row.
+const PRESSES: [&str; 6] = [
+    CUSTOMIZE,
+    DONE,
+    BACKGROUND_WELL,
+    PALETTE_SLOT,
+    SAVE_AS,
+    MOCHA,
+];
 const WARNING: &str = "aterm.toml reload rejected: repair the invalid authored value before \
                        automatic reload can resume.";
 const REFUSED: &str = "/Volumes/Shared Drive/Users//someone/dotfiles/config/aterm \
@@ -76,13 +84,11 @@ enum Keyboard {
     SheetDrawn,
     SheetClosed,
     Side,
-    /// This theme's row, put there before the first frame: one next to the
-    /// theme in use's.
+    /// This theme's row, put there before the first frame: one next to the theme in use's.
     Row(&'static str),
     /// This control of the chooser, put there before the first frame.
     On(&'static str),
-    /// This control of the Customize sheet, put there once Customize is
-    /// pressed on the drawn page.
+    /// This control of the Customize sheet, put there once Customize is pressed on the drawn page.
     Sheet(&'static str),
 }
 
@@ -112,14 +118,11 @@ impl std::fmt::Display for Scenario {
 enum Walks {
     /// Every walk from every start ([`walk_from`]), and random walks from this seed.
     Every(u64),
-    /// Only the walks whose frames the theme in use's row decides: the list opened and drawn
-    /// through every change before the person's first event (R1, R3), and the keyboard put on its
-    /// control (R2). The four Off sweeps differ in that row alone, so Off on Nord's other walks
-    /// stand for the other three's.
+    /// Only walks the landing's row decides: the opening (R1, R3) and the keyboard put on it (R2).
     Opening,
     /// Only the regression walks ([`reviewed`]).
     Reviewed,
-    /// The walks the keyboard's control decides ([`walk_from`]), and random walks from this seed.
+    /// The walks the keyboard's control decides ([`walk_from`]), and random walks.
     Control(u64),
 }
 
@@ -132,8 +135,7 @@ enum Step {
     Status,
     Wheel(i32),
     Focus,
-    /// Up, Down, an "o" typed and Backspace, Left and Right, each the
-    /// person's key.
+    /// Up, Down, an "o" typed and Backspace, Left and Right, each the person's key.
     Up,
     Down,
     Type,
@@ -273,6 +275,8 @@ struct Frame {
     paints: bool,
     list_top: f32,
     room: f32,
+    /// How wide the list is: a control no wider is never cut at a side.
+    list_wide: f32,
     /// The chooser's first row under its filter: its first result.
     first_row: Option<String>,
     /// The chrome the page drew in: one it chose, or held.
@@ -288,10 +292,35 @@ impl Frame {
                 .is_some_and(|plan| plan.stop_of(&UiKey::new(key)).is_some())
     }
 
-    /// How much of `key` the screen paints, and how tall it is laid out;
-    /// `None` where the screen does not lay it out.
+    /// How much of `key` the screen paints, and how tall it is laid out; `None` where not laid out.
     fn shown(&self, key: &str) -> Option<(f32, f32)> {
-        laid_of(&self.screen, key).map(|(rect, shown)| (shown, rect.height))
+        laid_of(&self.screen, key).map(|(rect, shown)| (shown * self.across(key), rect.height))
+    }
+
+    /// The share of `key`'s width the screen paints: a control cut at a side is not whole.
+    fn across(&self, key: &str) -> f32 {
+        let node = self
+            .screen
+            .paint
+            .iter()
+            .find(|node| node.key.as_str() == key);
+        node.filter(|node| node.rect.width > 0.0)
+            .map_or(1.0, |node| {
+                let wide = node.rect.right().min(node.clip.right()) - node.rect.x.max(node.clip.x);
+                if wide + 0.5 >= node.rect.width {
+                    1.0
+                } else {
+                    wide.max(0.0) / node.rect.width
+                }
+            })
+    }
+
+    /// The width of `key` painted where a side cuts it though the list is as wide; else `None`.
+    fn cut_across(&self, key: &str) -> Option<f32> {
+        let (rect, shown) = laid_of(&self.screen, key)?;
+        let across = self.across(key);
+        (shown > 0.5 && across < 1.0 && rect.width <= self.list_wide + 0.5)
+            .then_some(across * rect.width)
     }
 
     fn kept(&self, key: &str) -> Kept {
@@ -306,33 +335,7 @@ impl Frame {
     }
 
     fn in_list(&self, key: &str) -> bool {
-        self.chooser() && whole_in_list(&self.screen, key)
-    }
-
-    /// Whether no screen of the list can show the row `landing` whole and `kept` of the control
-    /// `key` with it: both listed, and what the two need of the list taller than its room.
-    /// Measured on this frame's laid-out rects: the list holds every row it has, one off its
-    /// screen at the bounds scrolling gives it ([`crate::native_ui::ListRoom`]), so what lies
-    /// between the two is the same on every screen.
-    fn apart(&self, landing: &str, key: &str, kept: Kept) -> bool {
-        let (Some((row, _)), Some((control, _))) =
-            (laid_of(&self.screen, landing), laid_of(&self.screen, key))
-        else {
-            return false;
-        };
-        if !self.listed(landing) || !self.listed(key) {
-            return false;
-        }
-        let part = match kept {
-            Kept::Whole => control.height,
-            Kept::Part(part) => part.min(control.height),
-        };
-        let (top, bottom) = if control.y >= row.y {
-            (row.y, (control.y + part).max(row.bottom()))
-        } else {
-            ((control.bottom() - part).min(row.y), row.bottom())
-        };
-        bottom - top > self.room + 0.5
+        self.chooser() && whole_in_list(&self.screen, key) && self.across(key) >= 1.0
     }
 
     fn first(&self) -> Option<UiKey> {
@@ -340,10 +343,7 @@ impl Frame {
         plan.identities(top).next().cloned()
     }
 
-    /// Where the list lays `key` out on this screen: its laid-out rect's top
-    /// under the list's top, off the screen too, its height, and how much of
-    /// it the screen paints ([`Self::kept`]'s measure). `None` where it is not
-    /// a stop of the list (pinned around it, or not drawn).
+    /// Where the list lays `key` out here: its top, height and how much is painted; none off it.
     fn placed(&self, key: &str) -> Option<Place> {
         let (rect, shown) = laid_of(&self.screen, key)?;
         self.listed(key)
@@ -359,9 +359,7 @@ impl Frame {
     }
 }
 
-/// What one screen of the list shows: how much of the keyboard's control, whether the theme in
-/// use's row and the chooser's first row are whole in the list, and where the list lays the
-/// control, the landing and the first row out on it ([`Frame::placed`]), under a room that tall.
+/// One screen of a reach: how much of the control, landing and first row it shows, and where.
 #[derive(Clone, Copy, Debug)]
 struct Screenful {
     control: Option<Kept>,
@@ -378,13 +376,8 @@ struct Screenful {
     chrome: Chrome,
 }
 
-/// Every screen a list can draw that shows what a rule reads, as a frame measures it: the list
-/// drawn at its scrolls in a view opened as the walk's was (window, text size, bars, keyboard,
-/// filter, trial and pending reveal alike), keyed by the scroll each screen drew. It measures the
-/// screens and never asks the code that seats the list. Only around the listed stops its rule
-/// reads ([`Reads`]), out to the first screen on each side that lays them wholly past the room: a
-/// list moves its rows up as it scrolls, so no screen past those shows them ([`Sweep::measure`]
-/// looks at every scroll where the screens drawn do not hold to this).
+/// EVERY SCREEN A LIST DRAWS SHOWING WHAT A RULE READS, held at each scroll ([`Sweep::measure`]).
+#[derive(Clone)]
 struct Reach {
     screens: BTreeMap<usize, Screenful>,
     /// Scrolls asked for that drew another, or none.
@@ -396,16 +389,14 @@ struct Reach {
     bar: Option<StatusBar>,
     /// Whether a status docked in the compact toolbar on its screens.
     docked: bool,
-    /// Whether the keyboard's control is pinned around the list, not a stop
-    /// of it.
+    /// Whether the keyboard's control is pinned around the list, not a stop of it.
     pinned: bool,
-    /// How much of the keyboard's control the screens not drawn show: none
-    /// of a listed one (wholly past the room), as much as every drawn screen
-    /// does of one pinned around the list.
+    /// What undrawn screens show of the control: none of a listed one; of a pinned one, as drawn.
     elsewhere: Option<Kept>,
-    /// The chrome its screens are held in ([`PAGE_CHROME_HELD`]): the one
-    /// the key names, else the one the page chose for its first frame.
+    /// The chrome its screens are held in ([`PAGE_CHROME_HELD`]): the key's, else the first's.
     chrome: PageChrome,
+    /// The screen the first frame of the freshly opened page seats.
+    seated: Screenful,
 }
 
 /// A plain status's bar under the page as a frame draws it, and the least it can be. The bar's
@@ -420,8 +411,7 @@ struct StatusBar {
 }
 
 impl StatusBar {
-    /// The bar `screen` draws for its plain status, if it draws one:
-    /// measured with the view as that frame drew it.
+    /// The bar `screen` draws for its plain status, if any, measured with the view its frame drew.
     fn of(
         runtime: &mut NativeRuntime,
         view: crate::native_app::ViewId,
@@ -452,15 +442,13 @@ impl StatusBar {
         })
     }
 
-    /// Whether the page drew it otherwise than at its least: taller, or
-    /// docked in the toolbar, where it takes the toolbar's controls' place.
+    /// Whether the page drew it otherwise than at its least: taller, or docked in the toolbar.
     fn not_least(self) -> bool {
         self.docked || self.tall > self.least + 0.5
     }
 }
 
-/// Every chrome the page can draw a frame at `drawn` in: each rung of its ladder and, under a
-/// bar, each with the bars' room given.
+/// EVERY CHROME A FRAME AT `drawn` CAN BE DRAWN IN: each rung, and under a bar each giving room.
 fn rungs(drawn: Drawn) -> Vec<PageChrome> {
     set_text_scale(f32::from(drawn.scale));
     let cx = cx_of(drawn);
@@ -485,8 +473,7 @@ impl Reach {
             .map(|(scroll, _)| *scroll)
     }
 
-    /// The screen that shows the most of the keyboard's control, and how
-    /// much.
+    /// The screen that shows the most of the keyboard's control, and how much.
     fn most(&self) -> Option<(usize, Kept)> {
         let mut best: Option<(usize, Kept)> = None;
         for (scroll, screen) in &self.screens {
@@ -500,8 +487,7 @@ impl Reach {
         best
     }
 
-    /// What R2 asks of the keyboard's control on these screens: `owed`
-    /// where one shows it so, else as much as the one that shows the most.
+    /// What R2 asks of the control here: `owed` where a screen shows it so, else the most shown.
     fn asked(&self, owed: Kept) -> Kept {
         if self.covering(owed).is_some() {
             return owed;
@@ -509,8 +495,7 @@ impl Reach {
         self.most().map_or(Kept::Part(0.0), |(_, most)| most)
     }
 
-    /// A scroll whose screen shows the theme in use's row whole in the list,
-    /// and the keyboard's control as `asked`.
+    /// A scroll whose screen shows the landing's row whole in the list and the control as `asked`.
     fn landing_with(&self, asked: Option<Kept>) -> Option<usize> {
         self.find(|screen| {
             screen.landing
@@ -518,16 +503,20 @@ impl Reach {
         })
     }
 
-    /// A scroll whose screen shows the chooser's first row whole in the
-    /// list, and the keyboard's control as `asked`.
+    /// Whether the seated screen shows the landing's row whole and the control as `asked`.
+    fn seats_landing_with(&self, asked: Option<Kept>) -> bool {
+        self.seated.landing
+            && asked.is_none_or(|asked| self.seated.control.is_some_and(|kept| kept.covers(asked)))
+    }
+
+    /// A scroll whose screen shows the first row whole in the list and the control as `asked`.
     fn first_row_with(&self, asked: Kept) -> Option<usize> {
         self.find(|screen| {
             screen.first_row && screen.control.is_some_and(|kept| kept.covers(asked))
         })
     }
 
-    /// How much of the keyboard's control the screen at `scroll` shows:
-    /// none where a scroll looked at drew another.
+    /// How much of the control the screen at `scroll` shows: none where that scroll drew another.
     fn control_at(&self, scroll: usize) -> Option<Kept> {
         match self.screens.get(&scroll) {
             Some(screen) => screen.control,
@@ -536,8 +525,7 @@ impl Reach {
         }
     }
 
-    /// The scrolls whose screens were drawn in another chrome than the
-    /// reach's: none, or the reach measures no one page.
+    /// Scrolls whose screens were drawn in a chrome not the reach's: none, or no page is measured.
     fn mixed(&self) -> Vec<usize> {
         self.screens
             .iter()
@@ -555,12 +543,7 @@ impl Reach {
             .collect()
     }
 
-    /// Why no screen shows what a rule asks of a stop of the list where `at` lays it out, by the
-    /// laid-out rects (whether the room holds it) and the paint ([`Frame::kept`]): the frame draws
-    /// no list; no screen lays it out in the list; it is taller than the list's room; or, owed a
-    /// part, it is taller than the room and at best starts a screen at the list's top. `Err`
-    /// otherwise, or where a scroll drew no screen to measure: no geometry says why, a fault.
-    /// That the list scrolls by stops is no cause.
+    /// Why no screen shows `at`'s place as `owed` asks, by geometry; `Err` (a fault) if it fits.
     fn cause(&self, at: Placed, owed: Kept) -> Result<String, String> {
         if !self.list {
             return Ok("no list: the frame's room holds none of its stops".to_string());
@@ -625,34 +608,29 @@ struct ReachOf {
     keyboard: Option<String>,
     reveal: Option<UiKey>,
     least: bool,
-    /// Whether a compact window's statuses stack under the page, never
-    /// docked in the toolbar ([`STATUS_UNDOCKED`]).
+    /// Whether compact window statuses stack under the page, never docked ([`STATUS_UNDOCKED`]).
     undocked: bool,
-    /// The chooser's filter, and the theme on trial.
+    /// The chooser's filter.
     filter: String,
-    trial: Option<String>,
     /// What else the walk's view held that lays the page out.
     held: Held,
-    /// The chrome the screens are held in ([`PAGE_CHROME_HELD`]), or none
-    /// for the chrome the page chooses.
+    /// The chrome screens are held in ([`PAGE_CHROME_HELD`]), or none for the page's own choice.
     chrome: Option<Chrome>,
     /// The row its rule reads besides the keyboard's control.
     reads: Reads,
 }
 
-/// The row a rule reads a reach for besides the keyboard's control: none
-/// (R2, R4), the theme in use's (R3) or the chooser's first (R5).
+/// The row a rule reads beside the control: none (R2, R4), the landing (R3) or first (R5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Reads {
     Control,
     Landing,
     FirstRow,
+    /// The landing's row beside the control as much as asked: the screens that show the control.
+    Beside(Option<u32>),
 }
 
-/// What a walk's view holds that lays the page out, past what the scenario opened it with and
-/// [`ReachOf`]'s other fields: the sheet open or shut, the Community disclosure, the Keep menu, an
-/// open picker, the side the segment highlights (read only while the theme follows the system),
-/// the drafts typed in the sheet's fields, and Settings' search.
+/// WHAT A WALK'S VIEW HOLDS THAT LAYS THE PAGE OUT past the scenario and [`ReachOf`]'s fields.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Held {
     search: String,
@@ -666,6 +644,14 @@ struct Held {
     highlight_side: Option<aterm_types::Appearance>,
     editing_field: Option<String>,
     field_inputs: BTreeMap<String, String>,
+    /// Each key an edit laid over the config: its field's value and its authored one.
+    laid_over: BTreeMap<String, (Option<String>, Option<String>)>,
+    /// The theme on trial, and what its Keeps and settling left the chooser.
+    trial: ShowcaseTrial,
+    settled: Option<showcase_page::Settled>,
+    pending_select: Option<showcase_page::PendingSelect>,
+    pending_keep: Option<showcase_page::PendingKeep>,
+    error: Option<String>,
 }
 
 impl std::hash::Hash for Held {
@@ -692,6 +678,19 @@ impl Held {
                 .iter()
                 .map(|(field, input)| (field.clone(), input.value().to_string()))
                 .collect(),
+            laid_over: state
+                .underlay
+                .keys()
+                .map(|key| {
+                    let seed = state.field_by_key(key).and_then(|field| field.seed.clone());
+                    (key.clone(), (seed, state.raw_value(key)))
+                })
+                .collect(),
+            trial: state.showcase.trial.clone(),
+            settled: state.showcase.settled.clone(),
+            pending_select: state.showcase.pending_select.clone(),
+            pending_keep: state.showcase.pending_keep.clone(),
+            error: state.showcase.error.clone(),
         }
     }
 
@@ -709,6 +708,14 @@ impl Held {
         state.showcase.slot.clone_from(&self.slot);
         state.showcase.save.clone_from(&self.save);
         state.showcase.highlight_side = self.highlight_side;
+        state.showcase.trial.clone_from(&self.trial);
+        state.showcase.settled.clone_from(&self.settled);
+        state
+            .showcase
+            .pending_select
+            .clone_from(&self.pending_select);
+        state.showcase.pending_keep.clone_from(&self.pending_keep);
+        state.showcase.error.clone_from(&self.error);
         state.editing_field.clone_from(&self.editing_field);
         state.field_inputs = self
             .field_inputs
@@ -720,6 +727,20 @@ impl Held {
                 )
             })
             .collect();
+        for (key, (seed, raw)) in &self.laid_over {
+            let under = crate::native_settings::Underlay {
+                raw: state.raw_value(key),
+                seed: state.field_by_key(key).map(|field| field.seed.clone()),
+            };
+            state.underlay.insert(key.clone(), under);
+            match raw {
+                Some(raw) => state.raw_values.insert(key.clone(), raw.clone()),
+                None => state.raw_values.remove(key),
+            };
+            if let Some(index) = state.field_index_of(key) {
+                state.legacy.fields[index].seed.clone_from(seed);
+            }
+        }
         state.invalidate_result_page_limit();
     }
 }
@@ -742,8 +763,7 @@ impl std::hash::Hash for Chrome {
     }
 }
 
-/// A scenario's sweep: its landing and control, and the reaches it has
-/// measured.
+/// A scenario's sweep: its landing and control, and the reaches it has measured.
 struct Sweep {
     scenario: Scenario,
     landing: String,
@@ -752,11 +772,13 @@ struct Sweep {
     /// The scenario's configuration, read once: every view opens on it.
     snapshot: crate::native_config_service::ConfigSnapshot,
     seen: Mutex<HashMap<ReachOf, Arc<OnceLock<Arc<Reach>>>>>,
+    /// Reaches measured, keyed by the list their chrome lays out: key less chrome, plan and bar.
+    alike: Mutex<HashMap<String, Arc<Reach>>>,
     /// The screens its reaches drew.
     screens: AtomicUsize,
 }
 
-/// Where a screen lays one stop out ([`Place`]), `None` where it is no stop of the list.
+/// Where a screen lays a stop under the list's top: its top, its height and how much is painted.
 type Placed = fn(&Screenful) -> Option<Place>;
 
 /// Where a stop is laid out under the list's top: its top, its height, and how much of it the
@@ -790,12 +812,12 @@ impl Sweep {
             control,
             snapshot: service.snapshot(),
             seen: Mutex::new(HashMap::new()),
+            alike: Mutex::new(HashMap::new()),
             screens: AtomicUsize::new(0),
         }
     }
 
-    /// A view on the scenario's theme with the keyboard where it says: a
-    /// press on the drawn page after a frame at `start`.
+    /// A view on the scenario's theme, the keyboard where it says: a press on the page at `start`.
     fn opened(&self, start: Drawn) -> Opened {
         set_text_scale(f32::from(start.scale));
         let mut state = SettingsViewState::from_snapshot(&self.snapshot).expect("snapshot");
@@ -849,9 +871,7 @@ impl Sweep {
         cell.get_or_init(|| Arc::new(self.measure(key))).clone()
     }
 
-    /// Where `reach`'s status's bar is not at its least, the reach `key`
-    /// names under the bar at its least, and why: measured only where a
-    /// rule asks what `reach` does not show.
+    /// Where `reach`'s bar is not at its least, the reach `key` names under its least, and why.
     fn at_least(&self, key: &ReachOf, reach: &Reach) -> Option<(Arc<Reach>, String)> {
         reach.bar.filter(|bar| bar.not_least()).map(|bar| {
             let least = self.reach(&ReachOf {
@@ -868,9 +888,7 @@ impl Sweep {
         })
     }
 
-    /// The screens of a frame drawn in `chrome`: the reach `key` names in the chrome the page
-    /// chooses and, where the frame drew another (one it held), the reach in the frame's, with the
-    /// page's as the choice the code had too, as the bar at its least is ([`Sweep::at_least`]).
+    /// THE SCREENS OF A FRAME DRAWN IN `chrome`: the page's choice, and the frame's if it held one.
     fn framed(&self, key: &ReachOf, chrome: PageChrome) -> (Arc<Reach>, Option<Arc<Reach>>) {
         let chosen = self.reach(key);
         if chosen.chrome == chrome {
@@ -883,10 +901,84 @@ impl Sweep {
         (held, Some(chosen))
     }
 
-    /// R2 and R5 of a frame that shows `now` of the keyboard's control where it owes `owed`, drawn
-    /// in `chrome`: `Err` names a screen that shows it so (in any chrome the page can draw,
-    /// [`rungs`], and under the bar at its least too) or, where none does, one that shows more of
-    /// it than the frame; `Ok` names the geometry that excepts it.
+    /// EVERY CHROME A FRAME AT `key` CAN BE DRAWN IN, visited until `visit` takes one ([`rungs`]).
+    fn each_reach(
+        &self,
+        key: &ReachOf,
+        chrome: PageChrome,
+        stacked: bool,
+        narrowed: impl Fn(&ReachOf) -> ReachOf,
+        mut visit: impl FnMut(&str, &Reach) -> bool,
+    ) -> bool {
+        let (_, chosen) = self.framed(key, chrome);
+        let held = |rung: PageChrome| ReachOf {
+            chrome: Some(Chrome(rung)),
+            ..key.clone()
+        };
+        let mut keys = vec![(
+            String::new(),
+            chosen
+                .as_ref()
+                .map_or_else(|| key.clone(), |_| held(chrome)),
+            false,
+        )];
+        let mut drawn = vec![chrome];
+        if let Some(chosen) = chosen {
+            keys.push((
+                format!(
+                    "the page held its chrome, {chrome:?}: in the one it chooses, {:?}, ",
+                    chosen.chrome
+                ),
+                key.clone(),
+                false,
+            ));
+            drawn.push(chosen.chrome);
+        }
+        keys.extend(
+            rungs(key.drawn)
+                .into_iter()
+                .filter(|rung| !drawn.contains(rung))
+                .map(|rung| {
+                    (
+                        format!(
+                            "the page drew it in {chrome:?}: in {rung:?}, a rung of its ladder, "
+                        ),
+                        held(rung),
+                        true,
+                    )
+                }),
+        );
+        let mut at = 0;
+        while let Some((said, of, rung)) = keys.get(at).cloned() {
+            at += 1;
+            let of = if rung { narrowed(&of) } else { of };
+            let reach = self.reach(&of);
+            if visit(&said, &reach) {
+                return true;
+            }
+            if let Some((least, under)) = self.at_least(&of, &reach)
+                && visit(&format!("{said}{under}: at its least "), &least)
+            {
+                return true;
+            }
+            if stacked && at == 1 && reach.docked {
+                keys.insert(
+                    1,
+                    (
+                        "a status docked in the toolbar: stacked under the page, ".to_string(),
+                        ReachOf {
+                            undocked: true,
+                            ..of
+                        },
+                        false,
+                    ),
+                );
+            }
+        }
+        false
+    }
+
+    /// R2 AND R5 OF A FRAME SHOWING `now` of the control, owing `owed`: `Err` names one with more.
     fn judge(
         &self,
         key: &ReachOf,
@@ -894,83 +986,40 @@ impl Sweep {
         now: Kept,
         owed: Kept,
     ) -> Result<String, String> {
-        let (reach, chosen) = self.framed(key, chrome);
-        if let Some(scroll) = reach.covering(owed) {
-            return Err(format!("though the screen at scroll {scroll} shows it so"));
-        }
-        if let Some(scroll) = chosen.as_ref().and_then(|chosen| chosen.covering(owed)) {
-            return Err(format!(
-                "the page held its chrome, {:?}: in the one it chooses, {:?}, the screen at \
-                 scroll {scroll} shows it so",
-                chrome,
-                chosen.as_ref().map(|chosen| chosen.chrome)
-            ));
-        }
-        let least = self.at_least(key, &reach);
-        if let Some((least, under)) = least.as_ref()
-            && let Some(scroll) = least.covering(owed)
-        {
-            return Err(format!(
-                "{under}: at its least the screen at scroll {scroll} shows it so"
-            ));
-        }
-        // A status docked in the toolbar takes its controls' place: stacked
-        // under the page instead, as the page can draw it.
-        if reach.docked {
-            let undocked = ReachOf {
-                undocked: true,
-                ..key.clone()
-            };
-            let stacked = self.reach(&undocked);
-            let at_least = self.at_least(&undocked, &stacked);
-            if let Some(scroll) = stacked.covering(owed).or_else(|| {
-                at_least
-                    .as_ref()
-                    .and_then(|(least, _)| least.covering(owed))
-            }) {
-                return Err(format!(
-                    "a status docked in the toolbar: stacked under the page, the screen at \
-                     scroll {scroll} shows it so"
-                ));
+        let mut covered = None;
+        let mut most: Option<(String, usize, Kept)> = None;
+        self.each_reach(key, chrome, true, ReachOf::clone, |said, reach| {
+            if let Some(scroll) = reach.covering(owed) {
+                covered = Some(format!("{said}the screen at scroll {scroll} shows it so"));
+                return true;
             }
-        }
-        let measured = [Some(chrome), chosen.as_ref().map(|chosen| chosen.chrome)];
-        for rung in rungs(key.drawn) {
-            if measured.contains(&Some(rung)) {
-                continue;
-            }
-            let held = ReachOf {
-                chrome: Some(Chrome(rung)),
-                ..key.clone()
-            };
-            let other = self.reach(&held);
-            if let Some(scroll) = other.covering(owed) {
-                return Err(format!(
-                    "the page drew it in {chrome:?}: in {rung:?}, a rung of its ladder, the \
-                     screen at scroll {scroll} shows it so"
-                ));
-            }
-            if let Some((least, under)) = self.at_least(&held, &other)
-                && let Some(scroll) = least.covering(owed)
+            if let Some((scroll, kept)) = reach.most()
+                && most.as_ref().is_none_or(|(_, _, best)| !best.covers(kept))
             {
-                return Err(format!(
-                    "the page drew it in {chrome:?}: in {rung:?}, a rung of its ladder, with \
-                     {under}, at its least the screen at scroll {scroll} shows it so"
-                ));
+                most = Some((said.to_string(), scroll, kept));
             }
+            false
+        });
+        if let Some(covered) = covered {
+            return Err(covered);
         }
-        let (base, under) = match least {
-            Some((least, under)) => (least, format!(", with {under}")),
-            None => (reach, String::new()),
-        };
-        if let Some((scroll, most)) = base.most()
+        if let Some((said, scroll, most)) = most
             && !now.covers(most)
         {
             return Err(format!(
-                "no screen shows it so, but the screen at scroll {scroll} shows {most} of \
-                 it{under}: not the screen that shows the most"
+                "no screen shows it so, but {said}the screen at scroll {scroll} shows {most} of \
+                 it: not the screen that shows the most"
             ));
         }
+        let (reach, chosen) = self.framed(key, chrome);
+        let held = ReachOf {
+            chrome: chosen.map(|_| Chrome(chrome)),
+            ..key.clone()
+        };
+        let (base, under) = match self.at_least(&held, &reach) {
+            Some((least, under)) => (least, format!(", with {under}")),
+            None => (reach, String::new()),
+        };
         if base.pinned {
             return Ok(format!(
                 "pinned around the list, {} of it on every screen in every chrome the page can \
@@ -1007,14 +1056,39 @@ impl Sweep {
                 crate::native_text_input::TextInputState::new(key.filter.clone());
             state.invalidate_result_page_limit();
         }
-        if let Some(id) = key.trial.as_deref() {
-            let _ = state.highlight_card(id);
-        }
         let first = draw(&mut runtime, instance, view, drawn);
+        // The most room the list can have in this chrome: its body under the bar at its least.
+        let body_least = matches!(key.reads, Reads::Beside(_)).then(|| {
+            let state = view_state(&mut runtime, view);
+            let cx = cx_of(drawn);
+            let most = state.status_bar_most.replace(Some(0.0));
+            let body = settings_list_body_height(
+                state,
+                SettingsWidth::for_viewport(cx.viewport.width),
+                cx.viewport,
+            );
+            state.status_bar_most.set(most);
+            body
+        });
         // Every screen in one chrome: the key's, else the page's choice.
         let chrome = key.chrome.map_or(first.chrome, |chrome| chrome.0);
         PAGE_CHROME_HELD.with(|held| held.set(Some(chrome)));
         let control = key.keyboard.as_deref();
+        let screen_of = |frame: &Frame| Screenful {
+            control: control.map(|key| frame.kept(key)),
+            landing: frame.in_list(&self.landing),
+            first_row: frame
+                .first_row
+                .as_deref()
+                .is_some_and(|row| frame.in_list(row)),
+            control_at: control.and_then(|key| frame.placed(key)),
+            landing_at: frame.placed(&self.landing),
+            first_row_at: frame.first_row.as_deref().and_then(|row| frame.placed(row)),
+            room: frame.room,
+            list_top: frame.list_top,
+            listed: frame.list_drawn(),
+            chrome: Chrome(frame.chrome),
+        };
         let mut reach = Reach {
             screens: BTreeMap::new(),
             strays: Vec::new(),
@@ -1026,9 +1100,9 @@ impl Sweep {
             pinned: false,
             elsewhere: None,
             chrome,
+            seated: screen_of(&first),
         };
-        // The plan a held screen measures, which the first, drawn before the
-        // reveal held the list, need not.
+        // The plan a held screen measures; one drawn before the reveal held the list need not.
         let held = std::cell::RefCell::new(None);
         let mut look = |top: usize, reach: &mut Reach| -> Option<Screenful> {
             if !reach.looked.insert(top) {
@@ -1063,33 +1137,122 @@ impl Sweep {
                 .is_some();
             held.borrow_mut()
                 .get_or_insert_with(|| frame.plan.clone().filter(|_| frame.list));
-            let screen = Screenful {
-                control: control.map(|key| frame.kept(key)),
-                landing: frame.in_list(&self.landing),
-                first_row: frame
-                    .first_row
-                    .as_deref()
-                    .is_some_and(|row| frame.in_list(row)),
-                control_at: control.and_then(|key| frame.placed(key)),
-                landing_at: frame.placed(&self.landing),
-                first_row_at: frame.first_row.as_deref().and_then(|row| frame.placed(row)),
-                room: frame.room,
-                list_top: frame.list_top,
-                listed: frame.list_drawn(),
-                chrome: Chrome(frame.chrome),
-            };
+            let screen = screen_of(&frame);
             Some(*reach.screens.entry(at?).or_insert(screen))
         };
-        let _ = look(0, &mut reach);
+        // No screen in a chrome whose list cannot hold the row and the control both shows them.
+        if let Reads::Beside(part) = key.reads
+            && let Some((plan, control)) = first.plan.as_ref().filter(|_| first.list).zip(control)
+            && plan
+                .room_beside(
+                    &UiKey::new(self.landing.as_str()),
+                    &UiKey::new(control),
+                    part.map(f32::from_bits),
+                )
+                .zip(body_least)
+                .is_some_and(|(need, body)| need > body + 1.0)
+        {
+            STATUS_BAR_LEAST.with(|least| least.set(false));
+            STATUS_UNDOCKED.with(|undocked| undocked.set(false));
+            PAGE_CHROME_HELD.with(|held| held.set(None));
+            return reach;
+        }
+        // The row whole on the screen at its stop, and beside the control on the upper of the two.
+        let tops = |plan: &scroll::ScrollPlan| {
+            let listed = |row: &str| plan.stop_of(&UiKey::new(row));
+            let (limit, row) = (plan.limit(), listed(&self.landing)?);
+            let alone = (key.reads == Reads::Landing).then_some(row.min(limit));
+            Some((
+                control
+                    .and_then(listed)
+                    .map_or(row, |stop| stop.min(row))
+                    .min(limit),
+                alone,
+            ))
+        };
+        let looked =
+            |(upper, alone): (usize, Option<usize>)| [Some(upper), alone].into_iter().flatten();
+        // These first where the first frame lists the row: held ones listing it alike need none.
+        let early = match key.reads {
+            Reads::Landing | Reads::Beside(_) => {
+                first.plan.as_ref().filter(|_| first.list).and_then(&tops)
+            }
+            _ => None,
+        };
+        for top in early.into_iter().flat_map(looked) {
+            let _ = look(top, &mut reach);
+        }
+        let early = early.filter(|asked| {
+            reach.strays.is_empty()
+                && held
+                    .borrow()
+                    .as_ref()
+                    .and_then(Option::as_ref)
+                    .and_then(&tops)
+                    == Some(*asked)
+        });
+        if early.is_none() {
+            let _ = look(0, &mut reach);
+        }
         let plan = held.borrow_mut().take().flatten();
+        // A chrome that lays the list out as one measured already draws its screens alike.
+        let first_screen = format!("{:?}", reach.screens.get(&0));
+        let alike = early.is_none().then(|| {
+            format!(
+                "{:?}|{plan:?}|{}|{:?}|{}",
+                ReachOf {
+                    chrome: None,
+                    ..key.clone()
+                },
+                first_screen.split(", chrome:").next().unwrap_or_default(),
+                reach.bar,
+                reach.docked
+            )
+        });
+        let seen = alike.as_ref().and_then(|alike| {
+            self.alike
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(alike)
+                .cloned()
+        });
+        if let Some(seen) = seen {
+            STATUS_BAR_LEAST.with(|least| least.set(false));
+            STATUS_UNDOCKED.with(|undocked| undocked.set(false));
+            PAGE_CHROME_HELD.with(|held| held.set(None));
+            let seated = reach.seated;
+            let mut reach = Reach::clone(&seen);
+            for screen in reach.screens.values_mut() {
+                screen.chrome = Chrome(chrome);
+            }
+            reach.chrome = chrome;
+            reach.seated = seated;
+            return reach;
+        }
         let limit = plan.as_ref().map_or(0, scroll::ScrollPlan::limit);
         reach.limit = limit;
         let listed =
             |row: Option<&str>| row.and_then(|row| plan.as_ref()?.stop_of(&UiKey::new(row)));
+        let beside = early.or_else(|| {
+            plan.as_ref()
+                .filter(|_| matches!(key.reads, Reads::Landing | Reads::Beside(_)))
+                .and_then(&tops)
+                .filter(|asked| {
+                    looked(*asked).all(|top| look(top, &mut reach).is_some())
+                        && reach.strays.is_empty()
+                })
+        });
+        // A row read beside the control shows beside it only on the screens that show the row.
         let scans: [(Option<usize>, Placed); 3] = [
-            (listed(control), |screen| screen.control_at),
             (
-                listed(Some(&self.landing)).filter(|_| key.reads == Reads::Landing),
+                listed(control).filter(|_| key.reads != Reads::Landing),
+                |screen| screen.control_at,
+            ),
+            (
+                listed(Some(&self.landing)).filter(|_| {
+                    key.reads == Reads::Landing
+                        || (matches!(key.reads, Reads::Beside(_)) && listed(control).is_none())
+                }),
                 |screen| screen.landing_at,
             ),
             (
@@ -1097,12 +1260,9 @@ impl Sweep {
                 |screen| screen.first_row_at,
             ),
         ];
-        // Out from the screen that starts at each listed stop, while the
-        // stop's rect lies in the room and its rows move up as the scroll
-        // goes on; where they do not, or a scroll draws no screen of its
-        // own, every scroll.
+        // From each listed stop's screen while its rect is in the room, rising; else every scroll.
         let mut every = plan.is_none();
-        for (stop, at) in scans {
+        for (stop, at) in scans.map(|(stop, at)| (stop.filter(|_| beside.is_none()), at)) {
             let Some(stop) = stop else {
                 continue;
             };
@@ -1142,12 +1302,10 @@ impl Sweep {
                 }
             }
         }
-        // A control the list does not hold, pinned around it, shows alike on
-        // every screen: the list's last screen too, and every scroll where
-        // the screens drawn show it otherwise or list it.
-        let pinned = control.is_some() && scans[0].0.is_none();
+        // A pinned control shows alike on every screen, the last too, and where drawn ones differ.
+        let pinned = control.is_some() && listed(control).is_none();
         reach.pinned = pinned;
-        if pinned {
+        if pinned && beside.is_none() {
             let _ = look(limit, &mut reach);
             let one = reach
                 .screens
@@ -1176,6 +1334,13 @@ impl Sweep {
         STATUS_BAR_LEAST.with(|least| least.set(false));
         STATUS_UNDOCKED.with(|undocked| undocked.set(false));
         PAGE_CHROME_HELD.with(|held| held.set(None));
+        if let Some(alike) = alike {
+            self.alike
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(alike)
+                .or_insert_with(|| Arc::new(reach.clone()));
+        }
         reach
     }
 }
@@ -1184,8 +1349,7 @@ impl Sweep {
 struct Findings {
     faults: Vec<(Rule, String)>,
     exceptions: Vec<String>,
-    /// Each frame a reach of its own key draws another list for, and how
-    /// many frames were held to one.
+    /// Each frame a reach of its own key draws another list for, and how many were held to one.
     unlike: Vec<String>,
     compared: usize,
     frames: usize,
@@ -1252,6 +1416,7 @@ fn draw(
         paints,
         list_top: list.map_or(0.0, |list| list.y),
         room: list.map_or(0.0, |list| list.height),
+        list_wide: list.map_or(0.0, |list| list.width),
         first_row: state
             .showcase
             .listed()
@@ -1259,14 +1424,6 @@ fn draw(
             .map(|slug| format!("{ROW}{slug}")),
         chrome: state.page_chrome.get(),
         screen,
-    }
-}
-
-/// The theme on trial, if one is.
-fn trying(state: &SettingsViewState) -> Option<String> {
-    match &state.showcase.trial {
-        ShowcaseTrial::Trying { id } => Some(id.clone()),
-        _ => None,
     }
 }
 
@@ -1284,14 +1441,11 @@ struct Wheeled {
     first: Option<UiKey>,
     kept: Option<Kept>,
     place: Option<(scroll::ScrollPlan, usize)>,
-    /// The keyboard's control, where its stop is one the screen shows
-    /// ([`scroll::ScrollPlan::shown`]), and how many stops under its first:
-    /// what holds the place ([`SettingsViewState::seat_scroll`]).
+    /// The keyboard's control where the screen shows its stop, and how many stops under its first.
     held: Option<(String, usize)>,
 }
 
-/// `screen` but the settings sidebar, which scrolls on its own: what of it a
-/// wheel on the list places.
+/// `screen` but the settings sidebar, which scrolls on its own: what a wheel on the list places.
 fn but_the_sidebar(screen: &crate::native_ui::CompiledUi) -> crate::native_ui::CompiledUi {
     let mut screen = screen.clone();
     screen
@@ -1312,8 +1466,7 @@ fn but_the_sidebar(screen: &crate::native_ui::CompiledUi) -> crate::native_ui::C
     screen
 }
 
-/// How far from `place` the nearest scroll up to `limit` is whose screen
-/// `shows` what R2 asks, and those that do, where `place`'s does not.
+/// How far `place` is from the nearest scroll up to `limit` that `shows` what R2 asks, and which.
 fn nearest(
     limit: usize,
     place: usize,
@@ -1368,8 +1521,7 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
         if let Some(event) = event {
             let _ = dispatch(&mut runtime, instance, view, event);
         }
-        // A press lands only on a control the last frame laid out, painted
-        // or not (an accessibility press reaches one scrolled away).
+        // A press lands only on a control the last frame laid out, painted or not.
         let pressed = match step {
             Some(Step::Press(key)) => last
                 .as_ref()
@@ -1382,8 +1534,7 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
         }
         let persons = step.is_some_and(Step::persons)
             && (pressed.is_some() || !matches!(step, Some(Step::Press(_))));
-        // The keyboard where the person's event left it: put on a control
-        // it was not on, or left on the one it was.
+        // The keyboard where the event left it: put on a new control, or left where it was.
         let mut moved = false;
         if persons {
             let now = state(&runtime, view)
@@ -1405,7 +1556,6 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
             .zip(step)
             .map_or(start, |(last, step)| last.drawn.after(step));
         let frame = draw(&mut runtime, instance, view, drawn);
-        let bar = StatusBar::of(&mut runtime, view, drawn, &frame.screen);
         found.frames += 1;
         let walked_state = state(&runtime, view);
         let reveal = walked_state.page_reveal.clone();
@@ -1416,7 +1566,6 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
             least: false,
             undocked: false,
             filter: walked_state.showcase.filter.value().to_string(),
-            trial: trying(walked_state),
             held: Held::of(walked_state),
             chrome: None,
             reads: Reads::Control,
@@ -1437,8 +1586,7 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
         let mut fault = |rule: Rule, said: String| {
             found.faults.push((rule, format!("{}: {said}", at_frame())));
         };
-        // The reaches this frame's rules read, in its chrome, each with
-        // its key.
+        // The reaches this frame's rules read, in its chrome, each with its key.
         let judged = std::cell::RefCell::new(Vec::<(ReachOf, Arc<Reach>)>::new());
         let framed = |key: &ReachOf| {
             let (reach, chosen) = sweep.framed(key, frame.chrome);
@@ -1481,7 +1629,14 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
                 "pinned"
             };
             let _ = framed(&kept_reach_of);
+            // A pinned head shorter than the control excuses nothing: unpinned, the list holds it.
+            let head_pinned =
+                frame.chooser() && frame.shown(FILTER).is_some() && !frame.listed(FILTER);
             match sweep.judge(&kept_reach_of, frame.chrome, frame.kept(key), *owed) {
+                Ok(cause) if head_pinned && cause.starts_with("taller than the room") => fault(
+                    *rule,
+                    format!("{key} ({how}) {owed} as {why}, under a pinned head: {cause}"),
+                ),
                 Ok(cause) => found
                     .exceptions
                     .push(format!("{rule:?} at {drawn}: {key} {owed}, {cause}")),
@@ -1495,28 +1650,56 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
                 ),
             }
         }
-        // R5: a filter change shows the filter and then the first results,
-        // wherever a screen shows the first result whole with the filter as
-        // R5 asks.
+        // R2: the keyboard's listed control, painted at all, is whole across in a list as wide.
+        if let Some(key) = control.as_deref()
+            && frame.listed(key)
+            && let Some(wide) = frame.cut_across(key)
+        {
+            fault(
+                Rule::R2,
+                format!(
+                    "{key} (listed) cut at a side: {wide}pt of it across in a list {}pt wide",
+                    frame.list_wide
+                ),
+            );
+        }
+        // R5: a filter change shows the filter, then its first result whole where both can show.
         if typed
             && control.as_deref() == Some(FILTER)
-            && frame.listed(FILTER)
             && let Some(first) = frame.first_row.as_deref()
             && !frame.in_list(first)
             && let Some((owed, _, _)) = owed.as_ref()
         {
-            let (reach, chosen) = framed(&ReachOf {
+            let first_of = ReachOf {
                 reads: Reads::FirstRow,
                 ..kept_reach_of.clone()
-            });
+            };
+            let (reach, chosen) = framed(&first_of);
             let shows = |reach: &Reach| reach.first_row_with(reach.asked(*owed));
+            // Judged over the rungs as R3 is: another rung, or the bar at its least, at any seat.
+            let rungs = || {
+                let mut found = None;
+                sweep.each_reach(
+                    &first_of,
+                    frame.chrome,
+                    false,
+                    ReachOf::clone,
+                    |said, reach| {
+                        found = shows(reach)
+                            .map(|scroll| format!("{said}the screen at scroll {scroll}"));
+                        found.is_some()
+                    },
+                );
+                found
+            };
             let screen = shows(&reach)
                 .map(|scroll| format!("the screen at scroll {scroll}"))
                 .or_else(|| {
                     chosen.as_deref().and_then(shows).map(|scroll| {
                         format!("in the chrome the page chooses, the screen at scroll {scroll}")
                     })
-                });
+                })
+                .or_else(rungs);
             if let Some(screen) = screen {
                 fault(
                     Rule::R5,
@@ -1529,43 +1712,47 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
                 );
             }
         }
-        // R3: the theme in use whole on every frame before the person's first event, wherever a
-        // screen shows it so with the keyboard's control as R2 asks and the status's bar at its
-        // least. None does where this one shows the control so, its bar at its least, and the two
-        // lie further apart than the room.
-        let apart = !bar.is_some_and(StatusBar::not_least)
-            && owed
-                .as_ref()
-                .zip(control.as_deref())
-                .is_some_and(|((owed, _, _), key)| {
-                    frame.kept(key).covers(*owed) && frame.apart(landing, key, *owed)
-                });
-        if opening && !apart && frame.listed(landing) && frame.chooser() && !frame.in_list(landing)
-        {
+        // R3: before any event the landing's row whole wherever a rung shows it so by the control.
+        if opening && frame.listed(landing) && frame.chooser() && !frame.in_list(landing) {
             let landing_of = ReachOf {
                 reads: Reads::Landing,
                 ..reach_of.clone()
             };
-            let (reach, chosen) = framed(&landing_of);
-            let asks = |reach: &Reach| owed.as_ref().map(|(owed, _, _)| reach.asked(*owed));
-            let shows = |reach: &Reach| reach.landing_with(asks(reach));
-            let mut least = None;
-            let both = shows(&reach)
-                .map(|scroll| format!("the screen at scroll {scroll}"))
-                .or_else(|| {
-                    chosen.as_deref().and_then(shows).map(|scroll| {
-                        format!("in the chrome the page chooses, the screen at scroll {scroll}")
-                    })
-                })
-                .or_else(|| {
-                    least = sweep.at_least(&landing_of, &reach);
-                    least.as_ref().and_then(|(least, under)| {
-                        shows(least).map(|scroll| {
-                            format!("{under}: at its least the screen at scroll {scroll}")
-                        })
-                    })
+            let _ = framed(&landing_of);
+            let asks = owed
+                .as_ref()
+                .zip(control.as_deref())
+                .map(|((owed, _, _), key)| {
+                    let now = frame.kept(key);
+                    if now.covers(*owed) { *owed } else { now }
                 });
-            let base = least.as_ref().map_or(&reach, |(least, _)| least);
+            let (mut both, alone) = (None, Cell::new(false));
+            // Once a screen shows the landing alone, only screens showing the control are measured.
+            let beside = |of: &ReachOf| ReachOf {
+                reads: match asks {
+                    Some(Kept::Whole) if alone.get() => Reads::Beside(None),
+                    Some(Kept::Part(part)) if alone.get() && part > 1.5 => {
+                        Reads::Beside(Some(part.to_bits()))
+                    }
+                    _ => of.reads,
+                },
+                ..of.clone()
+            };
+            sweep.each_reach(&landing_of, frame.chrome, false, beside, |said, reach| {
+                alone.set(alone.get() || reach.landing_with(None).is_some());
+                // The frame's chrome at any seat; another by the screen it seats (a give-way).
+                both = if said.is_empty() {
+                    reach
+                        .landing_with(asks)
+                        .map(|scroll| format!("the screen at scroll {scroll}"))
+                } else {
+                    reach
+                        .seats_landing_with(asks)
+                        .then(|| format!("{said}the screen it seats"))
+                };
+                both.is_some()
+            });
+            let alone = alone.get();
             if let Some(both) = both {
                 fault(
                     Rule::R3,
@@ -1574,14 +1761,15 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
                          (shown, tall), not whole in the list, though {both} shows it whole with \
                          the keyboard's control as R2 asks ({})",
                         frame.shown(landing),
-                        asks(base).map_or("nothing".to_string(), |owed| format!(
+                        asks.map_or("nothing".to_string(), |owed| format!(
                             "{owed} of {}",
                             control.as_deref().unwrap_or_default()
                         ))
                     ),
                 );
-            } else if base.landing_with(None).is_none() {
-                match base.cause(|screen| screen.landing_at, Kept::Whole) {
+            } else if !alone {
+                let (reach, _) = sweep.framed(&landing_of, frame.chrome);
+                match reach.cause(|screen| screen.landing_at, Kept::Whole) {
                     Ok(cause) => found
                         .exceptions
                         .push(format!("R3 at {drawn}: {landing}, {cause}")),
@@ -1596,11 +1784,7 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
                 }
             }
         }
-        // R4: back where the wheel turned, no event of the person's since, the wheel's screen;
-        // where it shows the keyboard's control less than R2 asks (what it owes where a screen
-        // shows that, else the most a screen shows), the nearest of the screens that show it so.
-        // Where only a screen seated partway into the control's own stop shows it as R2 asks (a
-        // stop taller than the room), the frame that starts there.
+        // R4 holds a frame at the control's stop, taller than the room, that no screen beats.
         let into_its_stop = |owed: Kept| {
             control.as_deref().is_some_and(|key| {
                 frame.kept(key).covers(owed)
@@ -1660,12 +1844,7 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
                 );
             }
         }
-        // R4 in between: in another window, text size or bars, no event of the person's since,
-        // the list at the wheel's place, clamped at the list's end. The place is held as
-        // [`SettingsViewState::seat_scroll`] reads it: by the keyboard's control where the wheel's
-        // screen showed its stop, as many stops under the screen's top; else by the screen's
-        // first stop, and at the list's top where the wheel left it there. Where that screen
-        // shows the keyboard's control less than R2 asks and another shows it so, the nearest.
+        // R4 after a re-layout: the wheel's place as seat_scroll reads it, or the nearest R2 takes.
         if let Some(wheel) = wheeled.as_ref()
             && drawn != wheel.drawn
             && frame.list
@@ -1734,11 +1913,7 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
                 );
             }
         }
-        // A reach judges a frame by its list: each one a rule read for this frame lists the stops
-        // the frame lists, as tall, drew every screen in the frame's chrome, and at the frame's
-        // scroll leaves the list the frame's room; else its key left out something the view
-        // holds. Under a status, a reach for another reveal sizes the bar, and so the list, for
-        // that, so it is judged by the reach its key names for the frame's reveal.
+        // A REACH JUDGES A FRAME BY ITS LIST: each reach read lists its stops as tall, in its room.
         if frame.list
             && let Some(top) = frame.top
         {
@@ -1824,15 +1999,7 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
     found
 }
 
-/// The walk from `start`: through the windows that follow it round `windows` (half the others,
-/// so each change between two windows is walked once, from one of them), the other text size, the
-/// warning and a status, and back, in each of the ways `taken` names, then the keys on the
-/// keyboard's control. One walk, so a start opens one view: its ways are ordered so each leaves
-/// the keyboard where a walk of its own would start it. Each change is drawn again, by nothing or
-/// by a reply the person did not cause, as are half the wheels; a wheel's place is held through
-/// two changes and back, and under the text size or a bar through another. A wheel, or the
-/// keyboard put on its control, in another window is walked from that window's own start; only
-/// the text size and the bars, which no walk starts in, are wheeled and focused in from here.
+/// THE WALK FROM `start` through each change `taken` names and back, each drawn again, in one view.
 fn walk_from(start: Drawn, windows: &[Size], keyboard: Keyboard, taken: Walks) -> Vec<Step> {
     use Step::{Again, Down, Focus, Left, Right, Status, Type, Up, Warning, Wheel};
     let at = windows
@@ -1852,8 +2019,7 @@ fn walk_from(start: Drawn, windows: &[Size], keyboard: Keyboard, taken: Walks) -
     let mut focus = vec![Focus, Again];
     let mut there = Vec::new();
     let mut refocus = Vec::new();
-    // Which change of each wheel's pair is drawn again: the first in the
-    // walks from every other window, the second in the rest.
+    // Which of each wheel's pair is drawn again: the first from every other window, else the other.
     let carried = at % 2;
     let mut turned = at;
     let mut turn = |lines: i32| {
@@ -1903,10 +2069,7 @@ fn walk_from(start: Drawn, windows: &[Size], keyboard: Keyboard, taken: Walks) -
             return again;
         }
         Walks::Control(_) => {
-            // The keyboard left on its control through each change and
-            // back, a window's under a status every other time; the wheels
-            // from one text size's start in each window and the changes under
-            // them from the other's; the bars, and the keys.
+            // The keyboard on its control through each change and back, then wheels, bars and keys.
             let mut walk = vec![Again];
             for (index, &change) in changes.iter().enumerate() {
                 let back = change.back(start);
@@ -1935,9 +2098,7 @@ fn walk_from(start: Drawn, windows: &[Size], keyboard: Keyboard, taken: Walks) -
     }
     walk.extend(refocus);
     walk.extend(focus);
-    // R2 under a status: the bar over the warning and alone, the keyboard
-    // put on its control under it, and gone, where a short window's room is
-    // shorter than the control.
+    // R2 under a status: the bar over the warning and alone, keyboard on its control, short window.
     walk.extend([
         Focus, Warning, Status, Again, Status, Status, Warning, Focus, Status,
     ]);
@@ -1946,10 +2107,7 @@ fn walk_from(start: Drawn, windows: &[Size], keyboard: Keyboard, taken: Walks) -
     walk
 }
 
-/// `count` walks of `length` steps, each step drawn at random from every
-/// kind and half the wheels drawn again: every third walk in the windows the
-/// sweep draws and odd ones, the rest in windows of any size, seeded so the
-/// walks are the same each run.
+/// `count` seeded walks of `length` random steps from any bars, half the wheels drawn again.
 fn random_walks(seed: u64, count: usize, length: usize) -> Vec<(Drawn, Vec<Step>)> {
     let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     let mut next = move |below: usize| {
@@ -1969,14 +2127,18 @@ fn random_walks(seed: u64, count: usize, length: usize) -> Vec<(Drawn, Vec<Step>
                 if walk % 3 == 0 {
                     return all[next(all.len())];
                 }
-                let width = next(1_270) + 170;
+                let width = next(2_800) + 170;
                 let height = next(800) + 150;
                 (
                     u16::try_from(width).unwrap_or(u16::MAX),
                     u16::try_from(height).unwrap_or(u16::MAX),
                 )
             };
-            let start = Drawn::bare(window(&mut next), [1, 2][next(2)]);
+            let start = Drawn {
+                warning: next(3) == 0,
+                status: next(2) == 0,
+                ..Drawn::bare(window(&mut next), [1, 2][next(2)])
+            };
             let mut steps = Vec::with_capacity(length + 1);
             while steps.len() < length {
                 let step = match next(100) {
@@ -2143,9 +2305,300 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
         keyboard: Keyboard::On(SEARCH),
         ..filter
     };
+    let mocha = Scenario {
+        keyboard: Keyboard::On(MOCHA),
+        ..filter
+    };
+    let one_dark = Scenario {
+        keyboard: Keyboard::Row("One Dark"),
+        ..drawn
+    };
+    let solarized = Scenario {
+        keyboard: Keyboard::Row("Solarized Dark"),
+        ..filter
+    };
+    let nord_over_dracula = Scenario {
+        keyboard: Keyboard::Row("Nord"),
+        ..first
+    };
     let w380x300 = (380, 300);
     let at = Drawn::bare;
+    let warned = |window, scale| Drawn {
+        warning: true,
+        ..at(window, scale)
+    };
+    let statused = |window, scale| Drawn {
+        status: true,
+        ..at(window, scale)
+    };
+    let warned_statused = |window, scale| Drawn {
+        warning: true,
+        ..statused(window, scale)
+    };
     vec![
+        // Before any event, the rung showing the landing whole with the keyboard's control (R3).
+        (row_default, at(w864x292, 1), vec![]),
+        (row, at((520, 691), 2), vec![Status]),
+        // The chooser's pins leave the list a stop of what a status's bar at its most leaves (R3).
+        (row, statused((244, 440), 1), vec![]),
+        // A status under a held give-way chrome leaves it to the page, the landing whole (R3).
+        (row_after, at((238, 668), 2), vec![Status]),
+        // A theme row pressed twice is kept, which the reaches hold too.
+        (
+            row,
+            Drawn {
+                warning: true,
+                ..statused((307, 539), 2)
+            },
+            vec![Press(MOCHA), Press(MOCHA), Window((173, 394))],
+        ),
+        // The rungs that give a status's bar room are R3's rungs with no bar up too.
+        (row, warned((244, 440), 1), vec![Warning]),
+        (latte, warned((244, 440), 1), vec![Warning]),
+        // The chooser's pins read a status's bar at its most, which no settling moves (R1).
+        (filter_tokyo, statused((244, 440), 1), vec![Down, Tick]),
+        (
+            pack,
+            at(w864x292, 1),
+            vec![
+                Again,
+                Window(w864x500),
+                Tick,
+                Window(w864x292),
+                Window(w1095x700),
+                Again,
+                Window(w864x292),
+                Window(w1284x714),
+            ],
+        ),
+        // Where no rung shows the keyboard's control as owed, the one showing the most of it (R2).
+        (
+            drawn,
+            at((380, 318), 1),
+            vec![Status, Press(BACKGROUND_WELL)],
+        ),
+        // A filter just changed, its first result cut, yields to the rung that shows it whole (R5).
+        (filter_tokyo, warned((2_937, 226), 1), vec![Type, Erase]),
+        // A first result shown whole at the list's top stays revealed when drawn again (R1).
+        (
+            filter_tokyo,
+            at((178, 348), 2),
+            vec![Type, Window((980, 420)), Erase, Again],
+        ),
+        // A pinned filter's change shows its first result beside it in a rung giving way (R5).
+        (
+            filter,
+            warned((2_884, 321), 1),
+            vec![
+                Wheel(-8),
+                Warning,
+                Window((2_336, 701)),
+                Window((2_172, 268)),
+                Refresh,
+                Window((1_320, 805)),
+                Again,
+                Window((387, 789)),
+                Focus,
+                Wheel(12),
+                Again,
+                Focus,
+                Right,
+                Window((2_474, 564)),
+                Wheel(-8),
+                Window((1_619, 225)),
+                Wheel(-8),
+                Press(BACKGROUND_WELL),
+                Refresh,
+                Warning,
+                Type,
+                Tick,
+                Wheel(1),
+                Erase,
+            ],
+        ),
+        // A warning over a press's status gives way for the control its bar's side cuts (R2).
+        (
+            drawn,
+            warned((2_765, 332), 2),
+            vec![
+                Right,
+                Down,
+                Focus,
+                Text,
+                Window((2_329, 175)),
+                Press(PALETTE_SLOT),
+                Window((1_027, 703)),
+                Warning,
+                Press(PALETTE_SLOT),
+                Window((2_241, 919)),
+                Window((2_111, 270)),
+                Status,
+                Warning,
+            ],
+        ),
+        // A wheel's place gives way to the screen showing the most of the keyboard's control (R2).
+        (
+            closed,
+            at((1_407, 841), 2),
+            vec![Status, Wheel(-12), Window((189, 200))],
+        ),
+        // A rung whose stop-led screens paint a wheel no more is searched where R2 seats partway.
+        (
+            pack,
+            warned_statused((413, 1_050), 1),
+            vec![
+                Text,
+                Window((1_356, 130)),
+                Press(CUSTOMIZE),
+                Warning,
+                Press(CURSOR_COLOR),
+                Warning,
+                Text,
+                Status,
+            ],
+        ),
+        (
+            background,
+            warned((2_598, 662), 1),
+            vec![
+                Text,
+                Warning,
+                Text,
+                Window((1_408, 176)),
+                Status,
+                Text,
+                Press(CURSOR_COLOR),
+                Warning,
+                Text,
+            ],
+        ),
+        // A text size's change owes what the last screen showed, as the new size lays it out (R2).
+        (folder, at((1_411, 151), 2), vec![Warning, Text]),
+        (import, at((1_411, 151), 2), vec![Warning, Text]),
+        (import_light, at((1_411, 151), 2), vec![Warning, Text]),
+        (save_as, at((1_240, 151), 2), vec![Warning, Text]),
+        (
+            save_as,
+            at((1_240, 151), 2),
+            vec![Warning, Wheel(3), Again, Text],
+        ),
+        (filter, warned((1_411, 151), 2), vec![Text]),
+        (folder, warned((1_411, 151), 2), vec![Text]),
+        (background, warned((1_411, 151), 2), vec![Text]),
+        (row, warned((1_411, 151), 2), vec![Text]),
+        // A press that moves the keyboard after the opening shows the control it moved to (R2).
+        (
+            first,
+            at(w864x292, 1),
+            vec![Type, Window((1_268, 165)), Press(DONE)],
+        ),
+        // A status docks only where that leaves the keyboard's row as much as stacking does (R2).
+        (mocha, at((244, 440), 1), vec![Warning, Status]),
+        // A filter's change shows its first result in a chrome whose list holds a row (R5).
+        (
+            filter_tokyo,
+            at((654, 788), 1),
+            vec![
+                Status,
+                Warning,
+                Status,
+                Text,
+                Status,
+                Window((1_094, 193)),
+                Wheel(2),
+                Text,
+                Type,
+            ],
+        ),
+        // The chooser pins its head only where a status's bar leaves the list a stop under it (R2).
+        (
+            import_light,
+            at((300, 360), 2),
+            vec![Status, Wheel(3), Text],
+        ),
+        (
+            filter_tokyo,
+            statused((989, 715), 2),
+            vec![Window((363, 309)), Text],
+        ),
+        // Pins and stacked rows keep the tallest row as the list's width lays it out (R2, R3).
+        (row, statused((368, 438), 2), vec![]),
+        (row, statused((210, 350), 1), vec![]),
+        (
+            import_light,
+            at((562, 396), 1),
+            vec![
+                Window((2_571, 815)),
+                Status,
+                Focus,
+                Down,
+                Text,
+                Erase,
+                Window((2_570, 815)),
+                Window((373, 472)),
+            ],
+        ),
+        // An open picker a status's bar would cut is sized so the bar leaves its wheel whole (R2).
+        (
+            save_as,
+            statused((2_218, 159), 2),
+            vec![Press(BACKGROUND_WELL)],
+        ),
+        (
+            well,
+            statused((1_421, 946), 2),
+            vec![Press(BACKGROUND_WELL), Window((2_945, 164))],
+        ),
+        (
+            customize,
+            Drawn {
+                warning: true,
+                ..statused((419, 267), 2)
+            },
+            vec![
+                Press(CUSTOMIZE),
+                Press(BACKGROUND_WELL),
+                Up,
+                Window((2_452, 198)),
+                Warning,
+            ],
+        ),
+        // A bar gone and none up, a rung giving its room is tried after every rung keeping it (R2).
+        (
+            save_as,
+            statused((1_593, 928), 2),
+            vec![Window((2_875, 138)), Status],
+        ),
+        // A reach holds the sheet's edits as the walked view does.
+        (
+            side,
+            at((1_044, 672), 2),
+            vec![
+                Text,
+                Press(CUSTOMIZE),
+                Press(BACKGROUND_WELL),
+                Text,
+                Right,
+                Text,
+                Wheel(-8),
+                Window((556, 449)),
+            ],
+        ),
+        // The palette slot editor's tools inside a narrow window's list (R2).
+        (
+            palette,
+            Drawn {
+                status: true,
+                ..warned(w178x348, 2)
+            },
+            vec![Press(PALETTE_SLOT), Down, Down],
+        ),
+        // A focused Close 0.5pt past the column keeps its line; a point past, it wraps (R2).
+        (
+            palette_first,
+            warned((299, 1_422), 2),
+            vec![Press(PALETTE_SLOT), Down, Down, Window((298, 1_422))],
+        ),
         (filter, at(w864x292, 1), vec![Wheel(4), Warning]),
         (
             filter,
@@ -2451,16 +2904,14 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Warning,
             ],
         ),
-        // A status over a pinned control (the filter, and the strip's Done beside the sheet),
-        // judged by its paint, not its clipped rect.
+        // A status over a pinned control (filter, strip's Done), counted whole by its clipped rect.
         (filter, at(w444x420, 2), vec![Focus, Status]),
         (filter, at(w444x420, 2), vec![Wheel(8), Status]),
         (first, at((640, 480), 2), vec![Status]),
-        // A status that takes the keyboard's control out of view.
+        // A status took the control out of view, the list sent where no wheel had put it.
         (closed, at(w444x292, 2), vec![Window((600, 200)), Status]),
         (row, at((600, 200), 1), vec![Window((380, 300)), Status]),
-        // The keyboard on the row next to the theme in use's before the first frame, which a
-        // screen shows with it (R3), under the bar at its least too.
+        // The keyboard on the row next to the landing's before the first frame, shown with it (R3).
         (row, at(w1284x714, 2), vec![Again]),
         (row, at(w178x348, 1), vec![Status, Text]),
         // Reaches in windows no rule was tuned on.
@@ -2474,8 +2925,7 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
         (closed, at(w300x160, 1), vec![Up]),
         (side, at(w444x180, 1), vec![Up, Up]),
         (filter, at(w178x348, 1), vec![Down, Type]),
-        // The keyboard on a row by the theme in use's before the first frame, the landing held
-        // off the screen by the keyboard's row on a frame measured again (R3).
+        // The keyboard by the landing's row before the first frame, the landing a frame late (R3).
         (
             row_after,
             at(w1284x714, 2),
@@ -2485,14 +2935,12 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
         (row_after, at(w178x348, 2), vec![Text]),
         (row_default, at(w444x292, 2), vec![Window((980, 420))]),
         (pack, at((1_440, 900), 2), vec![Text]),
-        // A status over a row taller than the room, which the bar at its least shows 64pt of, its
-        // words whole (R2).
+        // A status over a row taller than the room: the least bar shows 64pt, words whole (R2).
         (row_after, at(w178x348, 2), vec![Focus, Warning, Status]),
         (row_after, at(w178x348, 2), vec![Warning, Status, Focus]),
         (closed, at(w178x348, 2), vec![Focus, Warning, Status]),
         (closed, at(w178x348, 2), vec![Status, Status]),
-        // A filter change under the chrome the short list of results chose, the long list back
-        // with less room (R5).
+        // A filter change held a short result list's chrome, the long list back in less room (R5).
         (
             filter,
             at(w444x292, 1),
@@ -2528,8 +2976,7 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
             at(w584x348, 1),
             vec![Down, Type, Window((380, 300)), Erase, Again, Warning],
         ),
-        // A long name wrapped at 2× text, its row in the list's faded foot, judged by the paint
-        // (R3, R4).
+        // A long name wrapped at 2x in the faded foot, counted shown by code, not paint (R3, R4).
         (latte, at((330, 260), 1), vec![Text, Status]),
         (
             latte,
@@ -2565,7 +3012,7 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Window(w178x348),
             ],
         ),
-        // Up on Customize, which the last screen showed cut (R5).
+        // Up on Customize, which the last screen showed cut, scrolled it out of view (R5).
         (closed, at((600, 200), 2), vec![Status, Focus, Up]),
         (
             closed,
@@ -2593,9 +3040,7 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Warning,
             ],
         ),
-        // What a view holds past the scenario's opening that lays the page out (the Community
-        // disclosure Left shuts and Right opens, a draft in the sheet's foreground field), which a
-        // reach must hold too ([`Held`]).
+        // What a view holds past the opening that lays the page out, as a reach does ([`Held`]).
         (
             pack,
             at(w444x292, 1),
@@ -2653,10 +3098,7 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Window(w178x348),
             ],
         ),
-        // A control the room holds, whole on no screen of a list that scrolls by stops: foreground
-        // under the caption COLORS repeats over every screen of its rows (R2, R5), and under a
-        // status the built-in section's caption over its first theme, a stop grouped for the room
-        // before the bar, 64pt in 48pt (R2, R3).
+        // A control the room holds, whole on no screen of a list scrolling by stops (R2, R3, R5).
         (drawn, at(w444x292, 2), vec![Down, Window(w444x180)]),
         (drawn, at(w444x180, 2), vec![Down, Again]),
         (drawn, at(w178x348, 2), vec![Down, Type]),
@@ -2678,7 +3120,7 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
             at(w178x348, 1),
             vec![Wheel(4), Window(w584x348), Window(w178x348)],
         ),
-        // Again after a wheel back to the list's top, the page's chrome chosen again (R1).
+        // Round 9: Again after a wheel back to the top, which chose the page's chrome again (R1).
         (background, at(w444x420, 1), vec![Wheel(-12), Again]),
         (drawn, at((900, 260), 1), vec![Warning, Wheel(-12), Again]),
         (palette, at((260, 500), 1), vec![Warning, Wheel(-12), Again]),
@@ -2688,8 +3130,7 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
             at((380, 300), 1),
             vec![Status, Warning, Wheel(-12), Again],
         ),
-        // The chooser's footer under the bars: a switch under its label that no stop the room
-        // holds shows, and one the list's edge cuts (R2, R5).
+        // Round 9: the footer under bars, a switch no stop showed or the edge cut (R2, R5).
         (follow, at(w178x348, 2), vec![Warning, Status]),
         (follow, at(w178x348, 2), vec![Warning, Status, Left]),
         (folder, at(w178x348, 2), vec![Warning, Status]),
@@ -2704,12 +3145,11 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
             at((700, 250), 2),
             vec![Status, Window((480, 360))],
         ),
-        // A wheel's place under a status, the keyboard on Done outside the list, moved by the
-        // warning (R4).
+        // Round 9: a wheel's place under a status, the keyboard on Done, moved by the warning (R4).
         (drawn, at((380, 300), 1), vec![Status, Wheel(-4), Warning]),
-        // A reach whose screens were drawn in another chrome than the frame's.
+        // Round 9's review: a reach whose screens were drawn in another chrome than the frame's.
         (save_as, at((380, 300), 1), vec![Wheel(1), Status]),
-        // A row the list draws as a picture, its cause measured as shown.
+        // Round 9's review: a row the list draws as a picture, its cause measured as shown.
         (
             pack,
             at((980, 420), 2),
@@ -2729,10 +3169,10 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Window(w444x180),
             ],
         ),
-        // A colour row's well and the one over it in the room a status leaves (R2, R5).
+        // Round 9: a colour row's well and the one over it in the room a status leaves (R2, R5).
         (well, at((380, 300), 1), vec![Status]),
         (field, at(w444x420, 2), vec![Status, Up]),
-        // The text size there and back after a wheel, the sheet's chrome chosen again (R4).
+        // Round 10: text size there and back after a wheel, choosing the sheet's chrome again (R4).
         (palette, at(w444x420, 1), vec![Wheel(-2), Text, Text]),
         (background, at(w444x420, 1), vec![Wheel(-2), Text, Text]),
         (field, at(w444x420, 1), vec![Wheel(-2), Text, Text]),
@@ -2749,15 +3189,14 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
             vec![Wheel(2), Wheel(-4), Text, Again, Text],
         ),
         (palette, at(w444x420, 1), vec![Text, Text]),
-        // A chrome kept, or chosen again, that cuts the keyboard's control under a bar (R2).
+        // Round 10: a chrome kept or chosen again that cut the keyboard's control under a bar (R2).
         (
             background,
             at((1_385, 640), 1),
             vec![Window((1_268, 165)), Refresh, Up, Warning, Tick, Again],
         ),
         (drawn, at((1_195, 191), 2), vec![Warning, Text]),
-        // The pack row under its heading at 2× text, and the theme in use under a status before
-        // the first event (R2, R3).
+        // Round 10: the pack row at 2x text, and the landing under a status at first (R2, R3).
         (
             pack,
             at((590, 727), 2),
@@ -2778,7 +3217,7 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
             at((320, 340), 2),
             vec![Window((339, 920)), Warning, Status],
         ),
-        // Walks at any window size.
+        // Round 10's walks at any window size (each goes on from where the one before left).
         (
             follow,
             at((756, 310), 2),
@@ -3348,10 +3787,7 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Window((1_209, 180)),
             ],
         ),
-        // Walks at any window size: the landing under a status before the first event (R3), a
-        // reveal for a stop the chosen screen did not draw (R1, R2), a key under a held chrome and
-        // a colour row taller than the room the bars leave (R2), and the settings sidebar, which
-        // scrolls on its own, under a wheel's place (R4).
+        // Round 10: a landing under a status, undrawn reveals, held chromes, tall rows, sidebar.
         (
             row,
             at((520, 691), 2),
@@ -3531,8 +3967,7 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Warning,
             ],
         ),
-        // A window back at a size it was drawn at, where the chrome it drew there cuts the
-        // keyboard's control and another rung keeps it whole (R2).
+        // Round 11: a window back at a drawn size, recalling a chrome that cut the control (R2).
         (
             save_as,
             at(w380x300, 1),
@@ -3574,8 +4009,7 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Window(w380x300),
             ],
         ),
-        // A chrome that cuts the keyboard's control where a richer rung, or a leaner one seated
-        // partway into the control's stop, shows it whole (R2).
+        // Round 11's review: a chrome that cut the control where another rung showed it whole (R2).
         (well, at((931, 186), 1), vec![Status, Warning]),
         (well, at((931, 186), 1), vec![Warning, Status]),
         (well, at((931, 186), 1), vec![Focus, Status, Warning]),
@@ -3590,14 +4024,12 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
             at(w380x300, 1),
             vec![Press(CUSTOMIZE), Status, Press(SAVE_AS)],
         ),
-        // The keyboard on Settings' search in the toolbar, under a status's bar or the toolbar's
-        // dock (R2).
+        // Round 11: the keyboard on Settings' search, under a status's bar or docked over (R2).
         (search, at(w178x348, 2), vec![Focus, Warning, Status]),
         (search, at(w178x348, 2), vec![Wheel(8), Warning, Status]),
         (search, at(w178x348, 2), vec![Wheel(1), Warning]),
         (search, at(w444x420, 1), vec![Warning, Status]),
-        // A colour well, which no words name, crossed by the list's floor or bottom edge, owed
-        // what it painted (R2).
+        // Round 11: a colour well crossed by the list's floor or edge, owed what it painted (R2).
         (
             drawn,
             at((380, 164), 1),
@@ -3620,9 +4052,7 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Window((444, 262)),
             ],
         ),
-        // A rung that shows a cut control no less than the screen before did, where none shows it
-        // whole, and a status docked in the compact toolbar that took more of the window than its
-        // bars stacked at their least (R2).
+        // Round 11, widened: no rung shows a cut control less; a docked status takes no more (R2).
         (
             drawn,
             at((380, 318), 1),
@@ -3655,8 +4085,7 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Again,
             ],
         ),
-        // A walk at any window size: the pack row, taller than the room a
-        // status leaves, owed more of it than a stop's screen shows (R2).
+        // Any window: the pack row taller than a status's room, owed more than a stop shows (R2).
         (
             import_light,
             at((876, 803), 1),
@@ -3687,9 +4116,7 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Window((1_371, 214)),
             ],
         ),
-        // Random walks: back at the wheel's window and bars, the list where
-        // the wheel left it and the sidebar scrolled on its own, its rows off
-        // its screen counted among the list's stops (R4).
+        // Random walks: back at the wheel's window and bars, the sidebar scrolled on its own (R4).
         (
             drawn,
             at((1_259, 213), 1),
@@ -3749,15 +4176,668 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Warning,
             ],
         ),
+        // Round 8b: a give-way judged by the control painted never cuts a pinned Import (R3, R5).
+        (import, at((994, 328), 1), vec![Status]),
+        (import_light, statused((2_194, 443), 2), vec![]),
+        // Before any event a give-way takes the judge's rung, told as its own list seats it (R3).
+        (customize, warned((2_792, 278), 1), vec![]),
+        (filter_tokyo, warned((980, 263), 1), vec![]),
+        (row_after, at((1_282, 153), 1), vec![]),
+        (mocha, at((240, 589), 1), vec![]),
+        (latte, at((1_002, 150), 1), vec![]),
+        (import_light, at((1_355, 735), 2), vec![]),
+        // An open picker that its sheet's room overflows, docked or stacked (R2).
+        (
+            filter_tokyo,
+            at((443, 672), 1),
+            vec![
+                Press(CUSTOMIZE),
+                Window((351, 398)),
+                Status,
+                Warning,
+                Press(BACKGROUND_WELL),
+            ],
+        ),
+        // Held through Done, a chrome yields to a rung (bar room or not) showing Customize (R2).
+        (
+            background,
+            at((173, 251), 2),
+            vec![
+                Press(BACKGROUND_WELL),
+                Up,
+                Erase,
+                Again,
+                Window((172, 251)),
+                Press(PALETTE_SLOT),
+                Focus,
+                Press(DONE),
+            ],
+        ),
+        // The rung whose told screen shows the most more of a long name is the one seated (R2).
+        (latte, at((1_003, 573), 2), vec![Window((299, 536)), Status]),
+        // A filter pinned around the list is revealed where the chrome chosen again lists it (R5).
+        (
+            filter_tokyo,
+            Drawn {
+                warning: true,
+                ..statused((2_193, 260), 2)
+            },
+            vec![Window((2_192, 260)), Warning, Focus, Type],
+        ),
+        // Round 8d: a row a gutter narrower, and shorter, tells no rung too short (R3).
+        (one_dark, at((294, 1_005), 2), vec![]),
+        (one_dark, statused((268, 552), 1), vec![Window((213, 705))]),
+        (one_dark, statused((213, 705), 1), vec![]),
+        (
+            pack,
+            Drawn {
+                warning: true,
+                ..statused((2_179, 575), 2)
+            },
+            vec![
+                Status,
+                Text,
+                Window((1_939, 1_483)),
+                Wheel(-30),
+                Down,
+                Wheel(2),
+                Window((214, 1_028)),
+            ],
+        ),
+        // Round 8e: a give-way's told seat and the judge's seat of one rung disagreed (R3).
+        (latte, statused((460, 380), 2), vec![Text]),
+        (row, at((275, 572), 1), vec![Status, Text]),
+        // Round 8f: a stop fitting its list under the bar can overrun it calm, the page reshaped.
+        (first, warned((864, 292), 1), vec![Press(BACKGROUND_WELL)]),
+        (
+            foreground,
+            at((2_083, 294), 1),
+            vec![Warning, Window((2_411, 216)), Press(BACKGROUND_WELL)],
+        ),
+        // Under a bar, a rung keeping its room can show the reveal the chrome giving it cut (R3).
+        (off, statused((204, 166), 1), vec![]),
+        (off, statused((216, 246), 2), vec![]),
+        // A held chrome's choice is judged by the screen it seats, which a give-way reads too (R3).
+        (folder, warned_statused((2_094, 249), 2), vec![Text]),
+        (folder, warned_statused((1_558, 248), 2), vec![Text]),
+        (folder, warned_statused((223, 155), 1), vec![Status]),
+        (import_light, warned_statused((2_022, 244), 2), vec![Text]),
+        (filter, warned_statused((1_771, 250), 2), vec![Again, Text]),
+        (row_after, warned_statused((2_064, 154), 2), vec![Warning]),
+        (row_after, warned_statused((2_345, 169), 2), vec![Warning]),
+        // Round 8g: a key on a control the landing's chrome pinned keeps it in view, re-laid (R5).
+        (customize, warned_statused((312, 688), 2), vec![Up]),
+        (
+            customize,
+            warned_statused((312, 688), 2),
+            vec![Status, Status, Down],
+        ),
+        // Round 8g: a wheel at the list's end holds its screen, not the landing's before it (R4).
+        (
+            import,
+            warned_statused((222, 1_231), 1),
+            vec![Wheel(2), Window((993, 597))],
+        ),
+        (
+            folder,
+            warned_statused((222, 1_231), 1),
+            vec![Wheel(2), Window((993, 597))],
+        ),
+        (
+            import_light,
+            statused((698, 671), 1),
+            vec![
+                Tick,
+                Window((2_092, 726)),
+                Warning,
+                Window((272, 729)),
+                Text,
+                Wheel(1),
+                Text,
+                Window((713, 483)),
+                Status,
+            ],
+        ),
+        // Walks once known to fault here and on main, which neither breaks now.
+        (import_light, warned_statused((802, 868), 2), vec![]),
+        (mocha, warned((371, 356), 2), vec![]),
+        (mocha, warned_statused((435, 850), 2), vec![]),
+        (mocha, warned_statused((490, 844), 2), vec![]),
+        (row_after, warned_statused((325, 739), 2), vec![]),
+        (following, warned_statused((342, 709), 1), vec![]),
+        (
+            row,
+            warned_statused((1_897, 219), 1),
+            vec![Window((2_904, 439)), Window((258, 495))],
+        ),
+        (
+            import_light,
+            warned_statused((1_477, 133), 1),
+            vec![Window((1_476, 133)), Window((2_813, 285))],
+        ),
+        (
+            folder,
+            warned_statused((282, 287), 2),
+            vec![Window((1_980, 296))],
+        ),
+        (
+            follow,
+            warned_statused((2_438, 221), 2),
+            vec![
+                Text,
+                Window((2_438, 220)),
+                Text,
+                Window((2_438, 219)),
+                Again,
+                Press(DONE),
+                Again,
+                Status,
+            ],
+        ),
+        (
+            off,
+            statused((1_480, 1_153), 1),
+            vec![
+                Right,
+                Down,
+                Wheel(4),
+                Again,
+                Focus,
+                Again,
+                Wheel(-4),
+                Again,
+                Erase,
+                Warning,
+                Wheel(-2),
+                Down,
+                Wheel(8),
+                Status,
+                Window((2_874, 1_046)),
+                Window((158, 871)),
+                Text,
+                Window((158, 870)),
+                Press(SAVE_AS),
+                Wheel(30),
+                Again,
+                Wheel(2),
+                Down,
+                Window((157, 870)),
+                Status,
+                Warning,
+                Press(MOCHA),
+            ],
+        ),
+        (row_after, statused((224, 812), 1), vec![Text]),
+        (nord_over_dracula, statused((382, 729), 2), vec![]),
+        (
+            row_after,
+            warned((578, 490), 2),
+            vec![Press(MOCHA), Window((365, 417))],
+        ),
+        (
+            foreground,
+            warned((231, 621), 2),
+            vec![
+                Press(DONE),
+                Warning,
+                Warning,
+                Press(MOCHA),
+                Window((371, 380)),
+            ],
+        ),
+        (
+            off,
+            statused((1_776, 633), 1),
+            vec![Focus, Warning, Down, Text, Down, Window((369, 421))],
+        ),
+        (
+            side,
+            statused((1_320, 1_446), 1),
+            vec![Text, Press(MOCHA), Warning, Window((370, 404))],
+        ),
+        // Once a known fault here and on main; now main (c5ef831d7f) alone breaks it (R2).
+        (pack, warned((173, 139), 2), vec![Window((173, 138))]),
+        // A sheet not taking the listed toolbar draws the rung it leans on, no list under it (R2).
+        (field, statused((930, 148), 1), vec![Text]),
+        (
+            first,
+            statused((1_121, 146), 1),
+            vec![Down, Status, Text, Status, Window((1_121, 147))],
+        ),
+        (
+            foreground,
+            statused((1_426, 1_026), 2),
+            vec![Window((713, 148))],
+        ),
+        // A frame giving way lays rows out in the whole panel, as R3's shape-only bounds read it.
+        (latte, warned_statused((164, 386), 1), vec![]),
+        (latte, warned_statused((178, 348), 2), vec![Warning]),
+        // R2's search skips a rung for its rooms only where it lays its rows out as the chrome's.
+        (solarized, statused((308, 156), 2), vec![]),
+        // A key keeping its control, in another chrome, owes what the chrome drawn showed (R5).
+        (foreground, warned((718, 125), 2), vec![Up, Up]),
+        // A press's status keeps the chrome; a warning or window still gives way for it (R2).
+        (
+            search,
+            at((2_892, 422), 2),
+            vec![
+                Warning,
+                Window((1_438, 142)),
+                Text,
+                Press(MOCHA),
+                Warning,
+                Status,
+                Press(MOCHA),
+                Text,
+                Warning,
+            ],
+        ),
+        // The keyboard off the chooser, the filter is pinned under a status's bar as on main (R1).
+        (search, at((178, 538), 1), vec![Status, Refresh]),
+        (
+            search,
+            warned((178, 538), 1),
+            vec![Warning, Status, Refresh],
+        ),
+        (search, warned((178, 538), 1), vec![Warning, Status, Tick]),
+        // A give-way is remembered only at its window's width; R2's search for more is not.
+        (
+            follow,
+            warned((1_782, 680), 2),
+            vec![
+                Window((2_466, 680)),
+                Window((1_395, 930)),
+                Wheel(4),
+                Again,
+                Focus,
+                Press(PALETTE_SLOT),
+                Window((778, 460)),
+                Press(BACKGROUND_WELL),
+                Wheel(8),
+                Wheel(3),
+                Window((2_633, 737)),
+                Again,
+                Warning,
+                Down,
+                Again,
+                Text,
+                Warning,
+                Window((1_188, 478)),
+                Window((2_113, 596)),
+                Warning,
+                Up,
+                Wheel(-12),
+                Again,
+                Status,
+                Window((1_320, 390)),
+                Wheel(-4),
+                Right,
+                Wheel(4),
+                Right,
+                Warning,
+            ],
+        ),
+        (
+            import,
+            statused((1_367, 544), 2),
+            vec![
+                Again,
+                Window((1_708, 1_197)),
+                Up,
+                Wheel(-5),
+                Again,
+                Wheel(20),
+                Again,
+                Warning,
+                Window((1_708, 1_196)),
+                Window((1_046, 1_270)),
+                Window((1_046, 1_271)),
+                Up,
+                Warning,
+                Warning,
+                Warning,
+                Window((2_040, 215)),
+                Window((2_040, 216)),
+                Type,
+                Window((2_039, 216)),
+                Window((2_040, 216)),
+                Warning,
+                Type,
+                Status,
+                Again,
+                Status,
+                Status,
+                Right,
+                Focus,
+                Wheel(-1),
+                Again,
+            ],
+        ),
+        // A rung is tried giving bar room only under bars, or in R2 from a chrome giving it (R4).
+        (
+            import,
+            at((2_652, 574), 2),
+            vec![
+                Warning,
+                Refresh,
+                Wheel(-3),
+                Again,
+                Left,
+                Again,
+                Wheel(-1),
+                Wheel(2),
+                Again,
+                Status,
+                Warning,
+                Erase,
+                Wheel(1),
+                Wheel(-4),
+                Status,
+                Status,
+            ],
+        ),
+        // A start held for a stop shifted in at the top is let go where no rung shows it so (R2).
+        (
+            drawn,
+            at((172, 142), 2),
+            vec![
+                Text,
+                Focus,
+                Warning,
+                Focus,
+                Wheel(3),
+                Wheel(5),
+                Again,
+                Text,
+                Warning,
+                Up,
+                Left,
+                Window((173, 142)),
+                Window((173, 141)),
+                Erase,
+                Press(PALETTE_FIRST),
+                Down,
+                Type,
+                Text,
+                Down,
+                Window((174, 141)),
+                Again,
+                Status,
+                Press(PALETTE_SLOT),
+            ],
+        ),
+        // Under a bar the listed toolbar is a last resort: main faults R3 asked of each rung.
+        (row_after, statused((190, 247), 2), vec![]),
+        // A status then two resizes under a bar: main's screens, which keep R3.
+        (
+            latte,
+            at((1_433, 246), 2),
+            vec![Status, Window((310, 566)), Window((193, 301))],
+        ),
+        // A focused card scrolls clear of a status's bar: the filter stays pinned as on main.
+        (
+            mocha,
+            at((190, 868), 1),
+            vec![
+                Warning,
+                Press(MOCHA),
+                Warning,
+                Again,
+                Wheel(-3),
+                Again,
+                Text,
+                Text,
+                Status,
+                Text,
+            ],
+        ),
+        (mocha, statused((244, 440), 1), vec![]),
+        // 8e8c292e8b's review: a start held for a stop shifted in at the top, as on main (R2).
+        (
+            cursor_color,
+            statused(w1095x700, 1),
+            vec![
+                Window(w444x292),
+                Window((1_268, 165)),
+                Press(MOCHA),
+                Press(BACKGROUND_WELL),
+            ],
+        ),
+        // 8e8c292e8b's review: a new first result cut where drawn gives way, as main does not (R5).
+        (
+            filter_tokyo,
+            statused((760, 330), 1),
+            vec![Window((230, 420)), Wheel(-3), Text, Type],
+        ),
+        // 8e8c292e8b's review: a first result shown whole gives the bar back to the reveal (R5).
+        (
+            filter_tokyo,
+            statused((600, 200), 1),
+            vec![
+                Warning,
+                Warning,
+                Wheel(8),
+                Wheel(-2),
+                Again,
+                Right,
+                Window((640, 480)),
+                Left,
+                Type,
+                Warning,
+                Window((700, 250)),
+                Window((600, 200)),
+                Wheel(4),
+                Again,
+                Erase,
+                Window(w178x348),
+            ],
+        ),
+        // 8e8c292e8b's review: a focused Close wraps where main cuts it at a side in 28pt (R2).
+        (
+            foreground,
+            statused((2_548, 814), 2),
+            vec![
+                Press(PALETTE_SLOT),
+                Up,
+                Down,
+                Down,
+                Down,
+                Window((262, 505)),
+            ],
+        ),
     ]
 }
 
-/// The workers each scenario's walks share: more than other sweeps', so the
-/// scenario whose list is longest (Pack's) is not the run's long pole.
+/// Walks that break a keeping rule on main (c5ef831d7f) as here: walked and printed, failing none.
+fn known_faults() -> Vec<(Scenario, Drawn, Vec<Step>)> {
+    use Step::{Down, Erase, Press, Status, Text, Type, Up, Warning, Wheel, Window};
+    let on = |keyboard, theme| Scenario {
+        keyboard,
+        theme,
+        in_use: theme,
+    };
+    let nord = |keyboard| on(keyboard, "Nord");
+    let mocha = nord(Keyboard::On(MOCHA));
+    let following = Scenario {
+        keyboard: Keyboard::On(FOLLOW),
+        theme: "dark:Dracula,light:GitHub Light",
+        in_use: "GitHub Light",
+    };
+    let palette = on(Keyboard::Sheet(PALETTE_SLOT), "GitHub Light");
+    let well = on(
+        Keyboard::Sheet("settings/color-open/selection_foreground"),
+        "GitHub Light",
+    );
+    let background = nord(Keyboard::Sheet("settings/control/background"));
+    let cursor = nord(Keyboard::Sheet(CURSOR_COLOR));
+    let import_light = on(Keyboard::On(IMPORT), "GitHub Light");
+    let row_default = nord(Keyboard::Row("Default"));
+    let one_dark = on(Keyboard::Row("One Dark"), "GitHub Light");
+    let foreground = on(Keyboard::Sheet(FOREGROUND), "Dracula");
+    let latte = on(Keyboard::Row("Catppuccin Latte"), "GitHub Light");
+    [
+        // R3 before the first event: the give-way finds no rung where the judge finds one.
+        (mocha, "470x487@1+warning+status", vec![]),
+        (mocha, "1847x363@2+warning+status", vec![Window((376, 901))]),
+        (row_default, "229x509@1+warning+status", vec![]),
+        (row_default, "381x486@1+warning", vec![Status]),
+        (row_default, "514x702@1+status", vec![Text]),
+        (import_light, "385x485@1+warning+status", vec![]),
+        (import_light, "537x917@2+warning+status", vec![]),
+        (
+            import_light,
+            "1719x860@2+warning+status",
+            vec![Warning, Warning, Window((850, 893))],
+        ),
+        (
+            one_dark,
+            "2601x543@2+warning+status",
+            vec![Window((462, 877))],
+        ),
+        (
+            one_dark,
+            "2422x423@1+warning",
+            vec![Warning, Status, Warning, Window((504, 881)), Text],
+        ),
+        (
+            nord(Keyboard::Row("Solarized Dark")),
+            "1120x749@2+warning+status",
+            vec![Window((416, 875))],
+        ),
+        // R3 on round 8k's rules seeds, shortest walks; main c5ef831d7f breaks it on each too.
+        (row_default, "2565x201@2", vec![Window((398, 720)), Status]),
+        (latte, "349x758@2+status", vec![]),
+        (following, "502x724@2", vec![Status]),
+        (mocha, "472x702@2+status", vec![]),
+        // R5 after typing.
+        (background, "1552x137@2+warning+status", vec![Warning, Type]),
+        (foreground, "2763x175@2+status", vec![Type]),
+        (foreground, "1842x156@2+status", vec![Type]),
+        (
+            on(
+                Keyboard::Sheet("settings/control/selection_foreground"),
+                "GitHub Light",
+            ),
+            "2845x189@2+status",
+            vec![Type],
+        ),
+        (
+            nord(Keyboard::Sheet("settings/control/background")),
+            "2606x142@1+status",
+            vec![Type],
+        ),
+        (
+            nord(Keyboard::Pack),
+            "1002x180@1",
+            vec![Press(CUSTOMIZE), Window((2_860, 155)), Down, Status, Type],
+        ),
+        // R2: main's chrome cuts the keyboard's control on these walks too (round 8k seeds).
+        (
+            on(Keyboard::SheetFirst, "Dracula"),
+            "1268x165@2+warning",
+            vec![Window((444, 240)), Wheel(8), Press(PALETTE_SLOT)],
+        ),
+        (palette, "417x156@2", vec![Text, Press(PALETTE_SLOT)]),
+        (palette, "435x209@2+status", vec![Press(PALETTE_SLOT)]),
+        (well, "204x770@2+status", vec![Press(SAVE_AS), Down, Down]),
+        (
+            well,
+            "476x975@1+status",
+            vec![Text, Press(SAVE_AS), Window((210, 818)), Erase, Down],
+        ),
+        (
+            background,
+            "2770x1310@2+warning+status",
+            vec![
+                Window((1_480, 209)),
+                Press(SAVE_AS),
+                Wheel(-2),
+                Press(PALETTE_SLOT),
+            ],
+        ),
+        (
+            cursor,
+            "1855x1182@2+warning",
+            vec![Press(SAVE_AS), Erase, Window((179, 156)), Down],
+        ),
+        // Rules seeds 997001-3, 997777, 998001-3 and 998777 at 400, shrunk; main breaks each too.
+        // R2 across: Cancel cut at a side by Save beside it in a narrow sheet.
+        (
+            on(
+                Keyboard::Sheet("settings/control/selection_foreground"),
+                "GitHub Light",
+            ),
+            "1499x1376@1+warning+status",
+            vec![Press(SAVE_AS), Text, Erase, Window((211, 593)), Down],
+        ),
+        // R2: the theme's name field owed what a frame left, through 1pt resizes and bars.
+        (
+            on(Keyboard::SheetDrawn, "GitHub Light"),
+            "2995x139@2+status",
+            vec![
+                Press(SAVE_AS),
+                Window((2_996, 140)),
+                Status,
+                Warning,
+                Warning,
+                Window((2_995, 140)),
+                Window((2_996, 140)),
+            ],
+        ),
+        // R3 before the first event, the keyboard on Nord over Dracula.
+        (
+            on(Keyboard::Row("Nord"), "Dracula"),
+            "1197x238@1+status",
+            vec![Window((428, 154)), Text, Status],
+        ),
+        // R4: a wheel's place moved by a warning leaving and a resize.
+        (
+            latte,
+            "2273x902@2+warning",
+            vec![
+                Status,
+                Status,
+                Press(MOCHA),
+                Text,
+                Text,
+                Text,
+                Status,
+                Text,
+                Text,
+                Press(MOCHA),
+                Text,
+                Wheel(-3),
+                Warning,
+                Window((417, 746)),
+            ],
+        ),
+        // R5: the dark and light segment's filter change cuts its first result.
+        (
+            Scenario {
+                keyboard: Keyboard::Side,
+                theme: "dark:Dracula,light:GitHub Light",
+                in_use: "GitHub Light",
+            },
+            "215x401@2+status",
+            vec![Text, Up, Type],
+        ),
+        // Panics: a chrome told to cut the control cuts it short; a seat leaves over what was told.
+        (
+            nord(Keyboard::Row("Solarized Dark")),
+            "252x152@1+status",
+            vec![Warning, Text],
+        ),
+        (latte, "2568x529@1+warning+status", vec![Window((184, 406))]),
+    ]
+    .into_iter()
+    .map(|(scenario, start, steps)| (scenario, drawn_of(start), steps))
+    .collect()
+}
+
+/// The workers each scenario's walks share, so Pack's longest list is not the run's long pole.
 const KEEPING_WORKERS: usize = 12;
 
-/// `scenario`'s frames held to the keeping rules: the walks through every change and back
-/// ([`walk_from`]) that `taken` names, random walks, and the regression walks ([`reviewed`]).
+/// `scenario`'s frames held to the rules ([`walk_from`], [`reviewed`]); [`known_faults`] printed.
 fn sweep(scenario: Scenario, taken: Walks) {
     let started = std::time::Instant::now();
     let sweep = Sweep::new(scenario);
@@ -3782,8 +4862,15 @@ fn sweep(scenario: Scenario, taken: Walks) {
             .filter(|(seen, _, _)| *seen == scenario)
             .map(|(_, start, steps)| (start, steps)),
     );
-    let reviewed_from = &walks[walked..];
+    let known = known_faults()
+        .into_iter()
+        .filter(|(seen, _, _)| *seen == scenario)
+        .map(|(_, start, steps)| (start, steps))
+        .collect::<Vec<_>>();
+    walks.extend(known.iter().cloned());
+    let reviewed_from = &walks[walked..walks.len() - known.len()];
     let found = Mutex::new(Findings::default());
+    let still = Mutex::new(Vec::new());
     on_n_workers(
         KEEPING_WORKERS,
         &walks,
@@ -3794,6 +4881,51 @@ fn sweep(scenario: Scenario, taken: Walks) {
                 .iter()
                 .any(|(was, seen)| was == start && seen == steps);
             BAR_STEPS_SEATED.with(|seated| seated.set(reviewed));
+            if known
+                .iter()
+                .any(|(was, seen)| was == start && seen == steps)
+            {
+                // A known walk runs cold on a thread of its own: its panic, main's too, is printed.
+                let preferences = crate::native_appearance::current_preferences();
+                let walked = std::thread::scope(|scope| {
+                    std::thread::Builder::new()
+                        .stack_size(8 << 20)
+                        .spawn_scoped(scope, || {
+                            crate::native_appearance::install_preferences(preferences);
+                            walk(&sweep, *start, steps)
+                        })
+                        .expect("a known walk's thread")
+                        .join()
+                });
+                let said = match walked {
+                    // Its reaches that draw another list are main's too: printed with its fault.
+                    Ok(walked) => std::iter::once(walked.faults.first().map_or_else(
+                        || format!("{start} {steps:?} no longer faults"),
+                        |(rule, said)| format!("{rule:?}: {said}"),
+                    ))
+                    .chain(
+                        walked
+                            .unlike
+                            .into_iter()
+                            .map(|said| format!("UNLIKE: {said}")),
+                    )
+                    .collect::<Vec<_>>()
+                    .join("\n  "),
+                    Err(panic) => format!(
+                        "PANIC: {start} {steps:?}: {}",
+                        panic
+                            .downcast_ref::<String>()
+                            .map(String::as_str)
+                            .or_else(|| panic.downcast_ref::<&str>().copied())
+                            .unwrap_or("a non-text panic")
+                    ),
+                };
+                still
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(said);
+                return;
+            }
             let walked = walk(&sweep, *start, steps);
             let mut found = found.lock().unwrap_or_else(PoisonError::into_inner);
             found.faults.extend(walked.faults);
@@ -3804,6 +4936,15 @@ fn sweep(scenario: Scenario, taken: Walks) {
         },
     );
     let mut found = found.into_inner().unwrap_or_else(PoisonError::into_inner);
+    let mut still = still.into_inner().unwrap_or_else(PoisonError::into_inner);
+    still.sort_unstable();
+    if !still.is_empty() {
+        eprintln!(
+            "{scenario}: known faults, main's too ({}):\n  {}",
+            still.len(),
+            still.join("\n  ")
+        );
+    }
     found.faults.sort_by_key(|(rule, _)| *rule);
     let mut excepted = found.exceptions.clone();
     excepted.sort_unstable();
@@ -3973,6 +5114,18 @@ fn import_takes_the_keyboard() -> bool {
         );
     }
     available
+}
+
+#[test]
+fn the_keeping_rules_hold_with_the_keyboard_on_one_dark_over_github_light() {
+    sweep(
+        Scenario {
+            keyboard: Keyboard::Row("One Dark"),
+            theme: "GitHub Light",
+            in_use: "GitHub Light",
+        },
+        Walks::Reviewed,
+    );
 }
 
 #[test]
@@ -4221,8 +5374,7 @@ fn the_keeping_rules_hold_off_the_list_on_nord() {
     );
 }
 
-/// A redraw seats its bar where the frame before left it settled; a test build settles it again,
-/// uncounted, to check it.
+/// A redraw seats its bar where the last frame settled it; a test build settles again, uncounted.
 #[test]
 fn a_redraw_seats_its_bar_where_the_frame_before_settled_it() {
     let taken = || BAR_SEATED.with(std::cell::Cell::get);
@@ -4248,6 +5400,100 @@ fn a_redraw_seats_its_bar_where_the_frame_before_settled_it() {
         taken() - before,
         3,
         "each redraw of the settled page seated its bar where the frame before settled it"
+    );
+}
+
+#[test]
+fn the_keeping_rules_hold_with_the_keyboard_on_a_tall_row_under_a_docked_status() {
+    sweep(
+        Scenario {
+            keyboard: Keyboard::On(MOCHA),
+            theme: "Nord",
+            in_use: "Nord",
+        },
+        Walks::Reviewed,
+    );
+}
+
+#[test]
+fn the_keeping_rules_hold_with_the_keyboard_on_nord_over_dracula() {
+    sweep(
+        Scenario {
+            keyboard: Keyboard::Row("Nord"),
+            theme: "Dracula",
+            in_use: "Dracula",
+        },
+        Walks::Reviewed,
+    );
+}
+
+#[test]
+fn the_keeping_rules_hold_with_the_keyboard_on_solarized_dark() {
+    sweep(
+        Scenario {
+            keyboard: Keyboard::Row("Solarized Dark"),
+            theme: "Nord",
+            in_use: "Nord",
+        },
+        Walks::Reviewed,
+    );
+}
+
+/// A revealed row is measured at the width its list lays it out: under a terminal face whose
+/// check is wider ([`WIDER_CHECK`]), the chooser's frame gives way at 291x177 and Solarized Dark's
+/// row is taller there than at the framed width (the sweep's faces draw it alike at both).
+#[cfg(target_os = "macos")]
+#[test]
+fn the_keeping_rules_hold_on_solarized_dark_in_a_wider_checked_terminal_face() {
+    use Step::{Again, Down, Erase, Focus, Text, Tick, Up, Warning, Wheel, Window};
+    crate::tray_raster::set_chrome_fonts(Some((WIDER_CHECK.into(), 0)), None, None);
+    let sweep = Sweep::new(Scenario {
+        keyboard: Keyboard::Row("Solarized Dark"),
+        theme: "Nord",
+        in_use: "Nord",
+    });
+    let found = walk(
+        &sweep,
+        Drawn::bare((1_431, 1_503), 1),
+        &[
+            Window((1_430, 1_503)),
+            Focus,
+            Window((2_038, 638)),
+            Again,
+            Tick,
+            Again,
+            Down,
+            Window((2_038, 637)),
+            Window((1_294, 1_478)),
+            Window((1_137, 300)),
+            Text,
+            Wheel(-2),
+            Text,
+            Wheel(-40),
+            Again,
+            Text,
+            Window((1_137, 301)),
+            Wheel(3),
+            Window((1_137, 302)),
+            Focus,
+            Window((290, 178)),
+            Window((290, 177)),
+            Text,
+            Warning,
+            Erase,
+            Tick,
+            Wheel(-40),
+            Text,
+            Up,
+            Window((291, 177)),
+        ],
+    );
+    assert_eq!(found.frames, 31, "every step drawn");
+    assert!(
+        found.faults.is_empty() && found.unlike.is_empty(),
+        "{:?} {:?}",
+        found.faults,
+        found.unlike
     );
 }
 
@@ -4287,15 +5533,15 @@ fn the_keeping_rules_hold_off_the_list_on_one_dark() {
     );
 }
 
-/// A frame of a walk whose page work is counted: drawn after a step, or drawn again unchanged.
+/// A frame of a walk whose page work is counted: after a step, unchanged, or untouched at a window.
 #[derive(Clone, Copy)]
 enum Then {
     Step(Step),
     Redraw,
+    Untouched(Size),
 }
 
-/// The page work of each frame of a walk from `start`, the first the page opened at, its bar's
-/// told steps also seated one by one, uncounted, to check them.
+/// Page work of each frame of a walk from `start`, its bar's told steps checked seated, uncounted.
 fn page_work(
     scenario: Scenario,
     start: Drawn,
@@ -4306,7 +5552,7 @@ fn page_work(
     let (mut runtime, instance, view) = sweep.opened(start);
     let _ = crate::work_counts::take_settings_page_work();
     let mut drawn = start;
-    let _ = draw(&mut runtime, instance, view, drawn);
+    let mut last = draw(&mut runtime, instance, view, drawn);
     let mut work = vec![(
         format!("opened at {drawn}"),
         crate::work_counts::take_settings_page_work(),
@@ -4324,18 +5570,34 @@ fn page_work(
                     Step::Type => {
                         Some(AppEvent::TextInput(TextInputEvent::Commit("o".to_string())))
                     }
+                    Step::Erase => Some(AppEvent::TextInput(TextInputEvent::Backspace)),
+                    Step::Left => Some(AppEvent::TextInput(TextInputEvent::Left { extend: false })),
+                    Step::Right => {
+                        Some(AppEvent::TextInput(TextInputEvent::Right { extend: false }))
+                    }
                     _ => None,
                 };
                 if let Some(event) = event {
                     let _ = dispatch(&mut runtime, instance, view, event);
                 }
+                // A press lands only on a control the last frame laid out, as the sweep's does.
+                if let Step::Press(key) = step
+                    && last.screen.semantic(&UiKey::new(key)).is_some()
+                {
+                    let _ = act(&mut runtime, instance, view, key, None);
+                }
                 drawn = drawn.after(step);
-                let _ = draw(&mut runtime, instance, view, drawn);
+                last = draw(&mut runtime, instance, view, drawn);
                 format!("{step} to {drawn}")
             }
             Then::Redraw => {
                 let _ = compile_settings_view(&runtime, instance, view, &cx_of(drawn));
                 format!("redrawn at {drawn}")
+            }
+            Then::Untouched(window) => {
+                drawn = drawn.after(Step::Window(window));
+                let _ = compile_settings_view(&runtime, instance, view, &cx_of(drawn));
+                format!("drawn untouched at {drawn}")
             }
         };
         work.push((frame, crate::work_counts::take_settings_page_work()));
@@ -4343,12 +5605,14 @@ fn page_work(
     work
 }
 
-/// A walk from a start, each frame held to at most `[pages, lists measured, docks, bars]`.
-type WorkWalk = (Scenario, Drawn, Vec<(Option<Then>, [usize; 4])>);
+/// A walk, each frame held to at most `[pages, lists measured, docks, bars, lists seated]`.
+type WorkWalk = (Scenario, Drawn, Vec<(Option<Then>, [usize; 5])>);
 
-/// The walks [`these_frames_build_the_themes_page_and_its_bars_no_more_than_006cded90b`] holds.
+/// The walks [`these_frames_build_the_themes_page_and_its_bars_no_more_than_c5ef831d7f`] holds.
 fn work_walks() -> Vec<WorkWalk> {
-    use Step::{Again, Down, Status, Type, Warning, Wheel, Window};
+    use Step::{
+        Again, Down, Erase, Left, Press, Right, Status, Text, Type, Up, Warning, Wheel, Window,
+    };
     let on = |keyboard, theme| Scenario {
         keyboard,
         theme,
@@ -4363,187 +5627,787 @@ fn work_walks() -> Vec<WorkWalk> {
     let status = |window, scale| at(window, scale, false, true);
     let step = |step| Some(Then::Step(step));
     let redraw = Some(Then::Redraw);
-    let mocha = || nord(Keyboard::On("settings/showcase/card/catppuccin-mocha"));
+    let untouched = |window| Some(Then::Untouched(window));
+    let mocha = || nord(Keyboard::On(MOCHA));
+    let latte = || on(Keyboard::Row("Catppuccin Latte"), "GitHub Light");
     vec![
         (
             nord(Keyboard::Filter),
             at((300, 360), 2, true, true),
             vec![
-                (None, [2, 5, 13, 9]),
-                (redraw, [1, 0, 9, 6]),
-                (redraw, [1, 0, 9, 6]),
-                (redraw, [1, 0, 9, 6]),
-                (step(Again), [1, 4, 13, 9]),
-                (redraw, [1, 0, 9, 6]),
+                (None, [1, 3, 3, 1, 2]),
+                (redraw, [1, 0, 3, 1, 1]),
+                (redraw, [1, 0, 3, 1, 1]),
+                (redraw, [1, 0, 3, 1, 1]),
+                (step(Again), [1, 2, 3, 1, 2]),
+                (redraw, [1, 0, 3, 1, 1]),
             ],
         ),
         (
             nord(Keyboard::Filter),
             at((300, 360), 2, true, true),
             vec![
-                (None, [2, 5, 13, 9]),
-                (step(Window((299, 360))), [2, 5, 13, 9]),
-                (step(Window((298, 360))), [2, 5, 13, 9]),
-                (step(Window((297, 360))), [2, 5, 13, 9]),
-                (redraw, [1, 0, 9, 6]),
-                (redraw, [1, 0, 9, 6]),
+                (None, [1, 3, 3, 1, 2]),
+                (redraw, [1, 0, 3, 1, 1]),
+                (untouched((299, 360)), [1, 3, 3, 1, 2]),
+                (untouched((300, 360)), [1, 2, 3, 1, 2]),
+                (redraw, [1, 0, 3, 1, 1]),
             ],
         ),
         (
-            nord(Keyboard::On("settings/search")),
-            status((444, 292), 1),
+            nord(Keyboard::Filter),
+            at((300, 360), 2, true, true),
             vec![
-                (None, [4, 2, 8, 6]),
-                (redraw, [1, 0, 8, 5]),
-                (redraw, [1, 0, 8, 5]),
-                (redraw, [1, 0, 8, 5]),
-                (step(Again), [1, 2, 8, 6]),
-                (redraw, [1, 0, 8, 5]),
+                (None, [1, 3, 3, 1, 2]),
+                (step(Window((299, 360))), [1, 3, 3, 1, 2]),
+                (step(Window((298, 360))), [1, 3, 3, 1, 2]),
+                (step(Window((297, 360))), [1, 3, 3, 1, 2]),
+                (redraw, [1, 0, 3, 1, 1]),
+                (redraw, [1, 0, 3, 1, 1]),
             ],
         ),
         (
             nord(Keyboard::On(IMPORT)),
             at((1_411, 151), 1, true, false),
             vec![
-                (None, [5, 6, 0, 0]),
-                (step(Window((1_410, 151))), [5, 6, 0, 0]),
-                (step(Window((1_409, 151))), [5, 6, 0, 0]),
-                (step(Window((1_408, 151))), [5, 6, 0, 0]),
-                (redraw, [1, 0, 0, 0]),
-                (redraw, [1, 0, 0, 0]),
-            ],
-        ),
-        (
-            mocha(),
-            status((244, 440), 1),
-            vec![
-                (None, [7, 7, 0, 4]),
-                (step(Wheel(3)), [2, 1, 0, 3]),
-                (redraw, [1, 0, 0, 3]),
-                (step(Down), [1, 7, 0, 5]),
-                (redraw, [1, 0, 0, 3]),
-                (step(Type), [2, 1, 0, 3]),
-                (redraw, [1, 0, 0, 3]),
-                (step(Again), [2, 1, 0, 3]),
-                (step(Window((243, 440))), [7, 5, 0, 5]),
-                (step(Window((242, 440))), [7, 5, 0, 5]),
+                (None, [1, 7, 0, 0, 3]),
+                (step(Window((1_410, 151))), [1, 7, 0, 0, 3]),
+                (step(Window((1_409, 151))), [1, 7, 0, 0, 3]),
+                (step(Window((1_408, 151))), [1, 7, 0, 0, 3]),
+                (redraw, [1, 0, 0, 0, 1]),
+                (redraw, [1, 0, 0, 0, 1]),
             ],
         ),
         (
             mocha(),
             status((230, 420), 2),
             vec![
-                (None, [2, 3, 5, 4]),
-                (step(Window((229, 420))), [2, 3, 5, 4]),
-                (step(Window((228, 420))), [2, 3, 5, 4]),
-                (step(Window((227, 420))), [2, 3, 5, 4]),
-                (redraw, [1, 0, 4, 3]),
-                (redraw, [1, 0, 4, 3]),
+                (None, [1, 2, 2, 1, 2]),
+                (step(Window((229, 420))), [1, 2, 2, 1, 2]),
+                (step(Window((228, 420))), [1, 2, 2, 1, 2]),
+                (step(Window((227, 420))), [1, 2, 2, 1, 2]),
+                (redraw, [1, 0, 2, 1, 1]),
+                (redraw, [1, 0, 2, 1, 1]),
             ],
         ),
         (
             nord(Keyboard::Off),
             Drawn::bare((864, 500), 1),
-            vec![(None, [1, 0, 0, 0]), (redraw, [1, 0, 0, 0])],
+            vec![(None, [1, 0, 0, 0, 1]), (redraw, [1, 0, 0, 0, 1])],
         ),
         (
             nord(Keyboard::Pack),
             status((864, 500), 1),
             vec![
-                (None, [2, 1, 0, 3]),
-                (step(Again), [1, 1, 0, 3]),
-                (redraw, [1, 0, 0, 2]),
-                (redraw, [1, 0, 0, 2]),
+                (None, [1, 1, 0, 1, 2]),
+                (step(Again), [1, 1, 0, 1, 2]),
+                (redraw, [1, 0, 0, 1, 1]),
+                (redraw, [1, 0, 0, 1, 1]),
             ],
         ),
         (
             nord(Keyboard::Pack),
             status((444, 420), 1),
             vec![
-                (None, [3, 2, 0, 3]),
-                (step(Again), [1, 2, 0, 3]),
-                (redraw, [1, 0, 0, 2]),
-                (redraw, [1, 0, 0, 2]),
+                (None, [1, 4, 0, 1, 2]),
+                (step(Again), [1, 2, 0, 1, 2]),
+                (redraw, [1, 0, 0, 1, 1]),
+                (redraw, [1, 0, 0, 1, 1]),
             ],
         ),
         (
             nord(Keyboard::Sheet("settings/control/background")),
             status((444, 420), 2),
             vec![
-                (None, [1, 4, 7, 4]),
-                (step(Window((443, 420))), [2, 2, 6, 3]),
-                (step(Window((442, 420))), [2, 2, 6, 3]),
-                (redraw, [1, 0, 6, 3]),
-                (redraw, [1, 0, 6, 3]),
+                (None, [1, 1, 2, 1, 2]),
+                (step(Window((443, 420))), [1, 1, 2, 1, 2]),
+                (step(Window((442, 420))), [1, 1, 2, 1, 2]),
+                (redraw, [1, 0, 2, 1, 1]),
+                (redraw, [1, 0, 2, 1, 1]),
             ],
         ),
         (
-            mocha(),
-            Drawn::bare((244, 440), 1),
-            vec![
-                (None, [6, 0, 0, 0]),
-                (step(Warning), [1, 7, 0, 0]),
-                // Two more measures: the status docks beside the warning on the toolbar's row,
-                // its words scrolling there, where they grew the toolbar over the page.
-                (step(Status), [1, 10, 6, 4]),
-                (redraw, [1, 0, 4, 3]),
-                (redraw, [1, 0, 4, 3]),
-                (step(Status), [1, 7, 0, 0]),
-            ],
+            nord(Keyboard::Sheet("settings/control/background")),
+            status((1_284, 714), 1),
+            vec![(None, [1, 1, 0, 1, 2])],
         ),
         (
             nord(Keyboard::Row("Dracula")),
             Drawn::bare((300, 360), 1),
             vec![
-                (None, [3, 0, 4, 0]),
-                (step(Status), [1, 6, 7, 4]),
-                (step(Again), [1, 2, 6, 4]),
-                (redraw, [1, 0, 6, 3]),
-                (redraw, [1, 0, 6, 3]),
-                (step(Status), [1, 0, 4, 0]),
+                (None, [1, 0, 1, 0, 1]),
+                (step(Status), [1, 1, 2, 1, 2]),
+                (step(Again), [1, 1, 2, 1, 2]),
+                (redraw, [1, 0, 2, 1, 1]),
+                (redraw, [1, 0, 2, 1, 1]),
+                (step(Status), [1, 0, 1, 0, 1]),
             ],
         ),
         (
             nord(Keyboard::Row("Dracula")),
             at((244, 440), 2, true, true),
-            // Two more bars: the warning's bar sets its words on the lines half the window
-            // holds (it cut them to one), so the status's bar beside it shortens further.
+            // The warning's words fill half the window, so the status's bar by it shortens more.
             vec![
-                (None, [2, 5, 9, 9]),
-                (step(Window((243, 440))), [2, 5, 9, 9]),
+                (None, [1, 5, 3, 1, 2]),
+                (step(Window((243, 440))), [1, 5, 3, 1, 2]),
             ],
         ),
         (
             on(Keyboard::Row("Catppuccin Latte"), "GitHub Light"),
             at((300, 360), 2, true, true),
             vec![
-                (None, [2, 5, 13, 9]),
-                (step(Window((299, 360))), [2, 5, 13, 9]),
+                (None, [1, 2, 3, 1, 2]),
+                (step(Window((299, 360))), [2, 4, 3, 1, 5]),
+            ],
+        ),
+        (
+            nord(Keyboard::On(IMPORT)),
+            Drawn::bare((244, 440), 1),
+            vec![(None, [1, 0, 0, 0, 1]), (step(Status), [1, 2, 0, 1, 2])],
+        ),
+        // Frames a 1pt resize or a bar arriving leaves showing what they showed.
+        (
+            nord(Keyboard::Row("Dracula")),
+            at((864, 292), 1, true, true),
+            vec![
+                (None, [1, 2, 0, 1, 2]),
+                (untouched((863, 292)), [1, 2, 0, 1, 2]),
+                (untouched((864, 292)), [1, 1, 0, 1, 2]),
+            ],
+        ),
+        (
+            mocha(),
+            at((864, 292), 1, true, false),
+            vec![(None, [1, 2, 0, 0, 2])],
+        ),
+        (
+            nord(Keyboard::Filter),
+            status((380, 318), 1),
+            vec![(None, [1, 2, 2, 1, 2])],
+        ),
+        (
+            nord(Keyboard::Row("Dracula")),
+            at((380, 318), 1, true, false),
+            vec![(None, [1, 2, 3, 0, 2])],
+        ),
+        (
+            nord(Keyboard::Filter),
+            at((1_268, 165), 1, true, false),
+            vec![(None, [1, 4, 0, 0, 2]), (step(Status), [1, 1, 0, 1, 2])],
+        ),
+        (
+            nord(Keyboard::Filter),
+            at((300, 160), 2, true, false),
+            vec![
+                (None, [1, 2, 3, 0, 3]),
+                (untouched((299, 160)), [1, 2, 3, 0, 3]),
+                (untouched((300, 160)), [1, 1, 1, 0, 2]),
+                (step(Window((299, 160))), [1, 1, 1, 0, 2]),
+            ],
+        ),
+        (
+            mocha(),
+            at((1_240, 151), 1, true, false),
+            vec![
+                (None, [1, 7, 0, 0, 3]),
+                (step(Window((1_239, 151))), [1, 7, 0, 0, 3]),
+                (step(Window((1_240, 151))), [1, 1, 0, 0, 2]),
+            ],
+        ),
+        // An opening whose give-way found no rung is not told again untouched.
+        (
+            nord(Keyboard::Pack),
+            at((520, 691), 1, false, false),
+            vec![
+                (None, [1, 0, 0, 0, 1]),
+                (untouched((519, 691)), [1, 0, 0, 0, 1]),
+                (untouched((520, 691)), [1, 0, 0, 0, 1]),
+            ],
+        ),
+        (
+            nord(Keyboard::On(IMPORT)),
+            at((1_094, 193), 1, false, false),
+            vec![
+                (None, [1, 1, 0, 0, 1]),
+                (step(Window((1_093, 193))), [1, 0, 0, 0, 1]),
+                (step(Window((1_094, 193))), [1, 0, 0, 0, 1]),
+            ],
+        ),
+        (
+            nord(Keyboard::On(FOLLOW)),
+            at((1_094, 193), 1, true, false),
+            vec![(None, [1, 3, 0, 0, 2]), (step(Warning), [1, 0, 0, 0, 1])],
+        ),
+        (
+            on(Keyboard::SheetClosed, "Dracula"),
+            at((1_094, 193), 1, false, false),
+            vec![
+                (None, [1, 0, 0, 0, 1]),
+                (untouched((1_093, 193)), [1, 0, 0, 0, 1]),
+                (untouched((1_094, 193)), [1, 0, 0, 0, 1]),
+            ],
+        ),
+        // A trial keeping no room for a status's bar its bars cover lays out no dock to say so.
+        (
+            nord(Keyboard::On(SEARCH)),
+            at((189, 200), 2, true, false),
+            vec![
+                (None, [1, 3, 2, 0, 2]),
+                (untouched((189, 199)), [1, 3, 2, 0, 2]),
+                (untouched((189, 200)), [1, 1, 1, 0, 2]),
+            ],
+        ),
+        // A give-way no rung's room satisfies is untried on opening, a height step or bar leaving.
+        (
+            nord(Keyboard::Pack),
+            at((520, 691), 1, false, false),
+            vec![
+                (None, [1, 0, 0, 0, 1]),
+                (step(Window((520, 690))), [1, 0, 0, 0, 1]),
+                (step(Window((520, 689))), [1, 0, 0, 0, 1]),
+                (untouched((520, 688)), [1, 0, 0, 0, 1]),
+                (untouched((520, 689)), [1, 0, 0, 0, 1]),
+            ],
+        ),
+        (
+            nord(Keyboard::On(IMPORT)),
+            at((1_094, 193), 1, false, false),
+            vec![
+                (None, [1, 1, 0, 0, 1]),
+                (step(Window((1_094, 192))), [1, 0, 0, 0, 1]),
+                (step(Window((1_094, 191))), [1, 0, 0, 0, 1]),
+                (untouched((1_094, 190)), [1, 0, 0, 0, 1]),
+                (untouched((1_094, 191)), [1, 0, 0, 0, 1]),
+            ],
+        ),
+        (
+            nord(Keyboard::Row("Default")),
+            at((1_240, 151), 1, true, false),
+            vec![(None, [1, 7, 0, 0, 3]), (step(Warning), [1, 0, 0, 0, 1])],
+        ),
+        (
+            nord(Keyboard::On(IMPORT)),
+            at((1_411, 151), 1, true, false),
+            vec![
+                (None, [1, 7, 0, 0, 3]),
+                (step(Warning), [1, 0, 0, 0, 1]),
+                (step(Warning), [1, 1, 0, 0, 2]),
+            ],
+        ),
+        // A give-way too short once the warning goes is left to the chrome it left, seated once.
+        (
+            nord(Keyboard::Row("Dracula")),
+            at((244, 440), 1, true, false),
+            vec![(None, [1, 2, 0, 0, 2]), (step(Warning), [1, 0, 0, 0, 1])],
+        ),
+        (
+            on(Keyboard::Row("Catppuccin Latte"), "GitHub Light"),
+            at((244, 440), 1, true, false),
+            vec![(None, [1, 2, 0, 0, 2]), (step(Warning), [1, 0, 0, 0, 1])],
+        ),
+        (
+            nord(Keyboard::Row("Tokyo Night")),
+            at((244, 440), 1, true, false),
+            vec![(None, [1, 2, 0, 0, 2]), (step(Warning), [1, 0, 0, 0, 1])],
+        ),
+        // Held under a row's caption, a screen tells no rung unable to show landing and control.
+        (
+            nord(Keyboard::Row("Solarized Dark")),
+            Drawn::bare((864, 292), 1),
+            vec![
+                (None, [1, 0, 0, 0, 1]),
+                (untouched((863, 292)), [1, 0, 0, 0, 1]),
+                (untouched((864, 292)), [1, 0, 0, 0, 1]),
+            ],
+        ),
+        // A bar leaving a compact window lays out no dock to tell a trial's room.
+        (
+            nord(Keyboard::Filter),
+            at((189, 200), 2, true, false),
+            vec![(None, [1, 3, 3, 0, 2]), (step(Warning), [1, 0, 0, 0, 1])],
+        ),
+        (
+            nord(Keyboard::On(FOLLOW)),
+            at((300, 160), 2, true, false),
+            vec![(None, [1, 2, 3, 0, 3]), (step(Warning), [1, 0, 0, 0, 1])],
+        ),
+        // A warning leaving once a status came and went keeps the chrome these inputs drew.
+        (
+            nord(Keyboard::Row("Dracula")),
+            at((244, 440), 1, true, false),
+            vec![
+                (None, [1, 2, 0, 0, 2]),
+                (step(Status), [1, 1, 1, 1, 2]),
+                (redraw, [1, 0, 1, 1, 1]),
+                (step(Status), [1, 1, 0, 0, 2]),
+                (step(Warning), [1, 0, 0, 0, 1]),
+            ],
+        ),
+        // A warning coming and going over Pack, and a status leaving, tell no rung main does not.
+        (
+            nord(Keyboard::Pack),
+            at((1_284, 714), 1, true, true),
+            vec![(None, [1, 2, 0, 1, 2]), (step(Status), [1, 1, 0, 0, 2])],
+        ),
+        // A revealed stop fitting the list under a status's bar is not told again calm.
+        (
+            nord(Keyboard::Filter),
+            status((1_284, 714), 2),
+            vec![
+                (None, [1, 1, 0, 1, 2]),
+                (step(Type), [1, 1, 0, 1, 1]),
+                (step(Erase), [1, 1, 0, 1, 1]),
+                (step(Status), [1, 0, 0, 0, 1]),
+                (step(Warning), [1, 1, 0, 0, 1]),
+            ],
+        ),
+        // A sheet's screen seated after the first event cuts no landing: no rung is told ahead.
+        (
+            on(Keyboard::SheetClosed, "Dracula"),
+            Drawn::bare((1_240, 151), 1),
+            vec![
+                (None, [1, 0, 0, 0, 1]),
+                (untouched((1_239, 151)), [2, 0, 0, 0, 2]),
+                (untouched((1_240, 151)), [1, 0, 0, 0, 1]),
+                (untouched((1_240, 150)), [2, 0, 0, 0, 2]),
+                (untouched((1_240, 151)), [1, 0, 0, 0, 1]),
+            ],
+        ),
+        (
+            on(Keyboard::SheetFirst, "Dracula"),
+            Drawn::bare((1_240, 151), 1),
+            vec![
+                (None, [4, 0, 0, 0, 4]),
+                (untouched((1_239, 151)), [4, 0, 0, 0, 4]),
+                (untouched((1_240, 151)), [1, 0, 0, 0, 1]),
+                (untouched((1_240, 150)), [4, 0, 0, 0, 4]),
+                (untouched((1_240, 151)), [1, 0, 0, 0, 1]),
+            ],
+        ),
+        // A field the warning cuts after typing tells no rung whose list paints none of it.
+        (
+            nord(Keyboard::Sheet("settings/control/background")),
+            at((1_268, 165), 1, true, false),
+            vec![
+                (None, [1, 1, 0, 0, 2]),
+                (step(Type), [1, 1, 0, 0, 2]),
+                (step(Erase), [1, 1, 0, 0, 2]),
+            ],
+        ),
+        // A rung keeping a status's bar room the chrome gives is not laid out, its dock unlaid.
+        (
+            nord(Keyboard::Filter),
+            status((189, 200), 2),
+            vec![
+                (None, [1, 6, 2, 1, 2]),
+                (step(Type), [1, 5, 2, 1, 2]),
+                (step(Erase), [1, 5, 2, 1, 2]),
+                (step(Status), [1, 0, 0, 0, 1]),
+            ],
+        ),
+        // A give-way none of whose rungs was told to show it is not told again untouched.
+        (
+            nord(Keyboard::On(CUSTOMIZE)),
+            status((178, 348), 1),
+            vec![
+                (None, [1, 3, 2, 1, 2]),
+                (untouched((177, 348)), [1, 3, 2, 1, 2]),
+                (untouched((178, 348)), [1, 2, 2, 1, 2]),
+                (untouched((178, 347)), [1, 3, 2, 1, 2]),
+                (untouched((178, 348)), [1, 2, 2, 1, 2]),
+            ],
+        ),
+        // The memo's control: unread, each step back to 178x348 lays out a dock again.
+        (
+            nord(Keyboard::On(CUSTOMIZE)),
+            status((178, 348), 2),
+            vec![
+                (None, [1, 4, 2, 1, 2]),
+                (untouched((177, 348)), [1, 4, 2, 1, 2]),
+                (untouched((178, 348)), [1, 3, 2, 1, 2]),
+                (untouched((178, 347)), [1, 4, 2, 1, 2]),
+                (untouched((178, 348)), [1, 3, 2, 1, 2]),
+            ],
+        ),
+        // A row two from the theme in use, opened or a bar leaving, measures no stop main does not.
+        (
+            latte(),
+            Drawn::bare((230, 420), 1),
+            vec![
+                (None, [1, 0, 0, 0, 1]),
+                (untouched((229, 420)), [1, 0, 0, 0, 1]),
+                (untouched((230, 420)), [1, 0, 0, 0, 1]),
+                (untouched((230, 419)), [1, 0, 0, 0, 1]),
+                (untouched((230, 420)), [1, 0, 0, 0, 1]),
+            ],
+        ),
+        (
+            latte(),
+            at((230, 420), 1, true, false),
+            vec![(None, [1, 2, 0, 0, 2]), (step(Warning), [1, 0, 0, 0, 1])],
+        ),
+        (
+            nord(Keyboard::Pack),
+            Drawn::bare((189, 200), 1),
+            vec![
+                (None, [1, 0, 1, 0, 1]),
+                (step(Text), [4, 0, 1, 0, 4]),
+                (untouched((188, 200)), [3, 0, 1, 0, 3]),
+                (untouched((189, 200)), [1, 0, 0, 0, 1]),
+            ],
+        ),
+        // A status leaving, a text size, a key typed: one walk per trade round 8f timed slower.
+        (
+            latte(),
+            status((275, 572), 2),
+            vec![(None, [1, 1, 2, 1, 2]), (step(Status), [1, 0, 1, 0, 1])],
+        ),
+        (
+            nord(Keyboard::Row("Solarized Dark")),
+            status((178, 348), 1),
+            vec![(None, [1, 3, 2, 1, 2]), (step(Status), [1, 0, 1, 0, 1])],
+        ),
+        (
+            latte(),
+            Drawn::bare((275, 572), 1),
+            vec![(None, [1, 0, 0, 0, 1]), (step(Text), [1, 0, 1, 0, 1])],
+        ),
+        (
+            on(Keyboard::SheetClosed, "Dracula"),
+            Drawn::bare((215, 318), 2),
+            vec![(None, [1, 0, 1, 0, 1]), (step(Type), [1, 0, 1, 0, 1])],
+        ),
+        // A give-way whose told rungs show no more of the control keeps its chrome; main breaks R2.
+        (
+            on(Keyboard::Row("One Dark"), "GitHub Light"),
+            at((2_852, 267), 2, true, true),
+            vec![
+                (None, [1, 5, 0, 1, 3]),
+                (step(Warning), [1, 1, 0, 1, 2]),
+                (step(Status), [1, 0, 0, 0, 1]),
+                (step(Wheel(-1)), [1, 0, 0, 0, 1]),
+                (step(Window((529, 726))), [1, 0, 0, 0, 1]),
+                (step(Window((2_749, 184))), [2, 0, 0, 0, 2]),
+                (step(Up), [1, 0, 0, 0, 1]),
+                (step(Warning), [1, 9, 0, 0, 6]),
+            ],
+        ),
+        // A calm rung that would hold is seated untold, no rung passed over before it.
+        (
+            on(
+                Keyboard::Sheet("settings/control/selection_foreground"),
+                "GitHub Light",
+            ),
+            Drawn::bare((1_707, 238), 2),
+            vec![
+                (None, [1, 0, 0, 0, 1]),
+                (step(Status), [1, 1, 0, 1, 1]),
+                (step(Status), [1, 0, 0, 0, 1]),
+                (step(Left), [1, 0, 0, 0, 1]),
+                (step(Text), [2, 0, 0, 0, 2]),
+            ],
+        ),
+        // A stale filter reveal, a press off a landing, a key on a pinned control reveal no more.
+        (
+            on(Keyboard::Filter, "Tokyo Night"),
+            at((1_211, 985), 1, true, true),
+            vec![
+                (None, [1, 2, 0, 1, 2]),
+                (step(Window((1_210, 985))), [1, 2, 0, 1, 2]),
+                (step(Up), [1, 1, 0, 1, 2]),
+                (step(Window((1_209, 985))), [1, 2, 0, 1, 2]),
+                (step(Warning), [1, 1, 0, 1, 2]),
+                (step(Status), [1, 0, 0, 0, 1]),
+                (step(Again), [1, 0, 0, 0, 1]),
+                (step(Type), [1, 0, 0, 0, 1]),
+                (step(Type), [1, 0, 0, 0, 1]),
+                (step(Right), [1, 0, 0, 0, 1]),
+                (step(Window((457, 749))), [1, 0, 0, 0, 1]),
+                (step(Warning), [1, 1, 0, 0, 1]),
+            ],
+        ),
+        (
+            on(Keyboard::SheetFirst, "Dracula"),
+            at((1_606, 717), 2, true, false),
+            vec![
+                (None, [1, 2, 0, 0, 2]),
+                (step(Window((2_255, 799))), [1, 2, 0, 0, 2]),
+                (step(Warning), [1, 0, 0, 0, 1]),
+                (step(Again), [1, 0, 0, 0, 1]),
+                (step(Status), [1, 1, 0, 1, 2]),
+                (step(Press(SAVE_AS)), [1, 1, 0, 1, 2]),
+                (step(Warning), [1, 1, 0, 1, 1]),
+                (step(Again), [1, 0, 0, 1, 1]),
+            ],
+        ),
+        (
+            nord(Keyboard::On(FOLLOW)),
+            status((1_208, 718), 1),
+            vec![
+                (None, [1, 1, 0, 1, 2]),
+                (step(Status), [1, 0, 0, 0, 1]),
+                (step(Warning), [1, 1, 0, 0, 2]),
+                (step(Down), [1, 0, 0, 0, 1]),
+            ],
+        ),
+        // Openings timed against main: Pack telling no rung, a field under a status, Follow System.
+        (
+            nord(Keyboard::Pack),
+            Drawn::bare((947, 649), 1),
+            vec![
+                (None, [1, 0, 0, 0, 1]),
+                (untouched((946, 649)), [1, 0, 0, 0, 1]),
+                (untouched((947, 649)), [1, 0, 0, 0, 1]),
+                (untouched((947, 648)), [1, 0, 0, 0, 1]),
+                (untouched((947, 649)), [1, 0, 0, 0, 1]),
+            ],
+        ),
+        (
+            on(
+                Keyboard::Sheet("settings/control/selection_foreground"),
+                "GitHub Light",
+            ),
+            status((189, 200), 2),
+            vec![(None, [1, 2, 1, 1, 2]), (step(Status), [1, 0, 0, 0, 1])],
+        ),
+        // A status leaving the follow switch's page measures no list again.
+        (
+            Scenario {
+                keyboard: Keyboard::On(FOLLOW),
+                theme: "dark:Dracula,light:GitHub Light",
+                in_use: "GitHub Light",
+            },
+            status((184, 662), 2),
+            vec![(None, [1, 3, 1, 1, 3]), (step(Status), [1, 0, 0, 0, 1])],
+        ),
+        // A footer's pinned control told by what a status's bar covers of its panel's foot (R3).
+        (
+            nord(Keyboard::On(OPEN_FOLDER)),
+            status((1_499, 413), 1),
+            vec![
+                (None, [1, 1, 0, 1, 2]),
+                (step(Window((2_923, 358))), [1, 1, 0, 1, 2]),
+            ],
+        ),
+        // Walks whose screens parted from 2dbd55ec43's and keep c5ef831d7f's.
+        (
+            mocha(),
+            Drawn::bare((244, 440), 1),
+            vec![
+                (None, [1, 0, 0, 0, 1]),
+                (step(Warning), [1, 1, 0, 0, 2]),
+                (step(Status), [1, 2, 1, 1, 2]),
+                (redraw, [1, 0, 1, 1, 1]),
+                (redraw, [1, 0, 1, 1, 1]),
+                (step(Status), [1, 1, 0, 0, 2]),
             ],
         ),
         (
             mocha(),
             at((244, 440), 1, true, false),
             vec![
-                (None, [7, 7, 0, 0]),
-                (step(Window((243, 440))), [7, 7, 0, 0]),
+                (None, [1, 2, 0, 0, 2]),
+                (step(Window((243, 440))), [1, 2, 0, 0, 2]),
             ],
         ),
         (
-            nord(Keyboard::On(IMPORT)),
-            Drawn::bare((244, 440), 1),
-            vec![(None, [6, 0, 0, 0]), (step(Status), [1, 7, 0, 5])],
+            on(Keyboard::SheetClosed, "Dracula"),
+            status((189, 200), 2),
+            vec![
+                (None, [1, 3, 1, 1, 2]),
+                (untouched((189, 199)), [1, 5, 2, 1, 2]),
+                (untouched((189, 200)), [1, 3, 1, 1, 2]),
+                (step(Window((189, 199))), [1, 3, 1, 1, 2]),
+            ],
+        ),
+        (
+            nord(Keyboard::On(FOLLOW)),
+            status((189, 200), 2),
+            vec![(None, [1, 6, 2, 1, 2]), (step(Status), [1, 0, 0, 0, 1])],
+        ),
+        // A key or a bar after an opening at 189x200@2, where 2dbd55ec43 broke R2.
+        (
+            nord(Keyboard::Row("Tokyo Night")),
+            Drawn::bare((189, 200), 2),
+            vec![(None, [2, 0, 1, 0, 2]), (step(Down), [1, 0, 0, 0, 1])],
+        ),
+        (
+            nord(Keyboard::On(CUSTOMIZE)),
+            Drawn::bare((189, 200), 2),
+            vec![(None, [2, 0, 1, 0, 2]), (step(Warning), [1, 1, 2, 0, 2])],
+        ),
+        // Openings under a status, and the keys and resizes after, that draw main's screens.
+        (
+            mocha(),
+            status((244, 440), 1),
+            vec![
+                (None, [1, 4, 0, 1, 2]),
+                (redraw, [1, 0, 0, 1, 1]),
+                (untouched((243, 440)), [1, 4, 0, 1, 2]),
+                (untouched((244, 440)), [1, 3, 0, 1, 2]),
+            ],
+        ),
+        (
+            nord(Keyboard::On("settings/search")),
+            status((444, 292), 1),
+            vec![
+                (None, [1, 4, 2, 1, 2]),
+                (redraw, [1, 0, 2, 1, 1]),
+                (redraw, [1, 0, 2, 1, 1]),
+                (redraw, [1, 0, 2, 1, 1]),
+                (step(Again), [1, 2, 2, 1, 2]),
+                (redraw, [1, 0, 2, 1, 1]),
+            ],
+        ),
+        (
+            mocha(),
+            status((244, 440), 1),
+            vec![
+                (None, [1, 4, 0, 1, 2]),
+                (step(Wheel(3)), [1, 2, 0, 1, 1]),
+                (redraw, [1, 0, 0, 1, 1]),
+                (step(Down), [1, 1, 0, 1, 2]),
+                (redraw, [1, 0, 0, 1, 1]),
+                (step(Type), [1, 1, 0, 1, 1]),
+                (redraw, [1, 0, 0, 1, 1]),
+                (step(Again), [1, 1, 0, 1, 1]),
+                (step(Window((243, 440))), [1, 2, 0, 1, 2]),
+                (step(Window((242, 440))), [1, 2, 0, 1, 2]),
+            ],
+        ),
+        // A warning back over a held give-way: the chrome these inputs drew, keeping the control.
+        (
+            nord(Keyboard::On(CUSTOMIZE)),
+            at((1_411, 151), 1, true, false),
+            vec![
+                (None, [1, 7, 0, 0, 3]),
+                (step(Warning), [1, 0, 0, 0, 1]),
+                (untouched((1_411, 150)), [2, 0, 0, 0, 2]),
+                (untouched((1_411, 151)), [1, 0, 0, 0, 1]),
+                (step(Warning), [1, 1, 0, 0, 2]),
+            ],
+        ),
+        // Held under a row's caption, a screen tells no rung unable to show landing and control.
+        (
+            on(Keyboard::On(IMPORT), "GitHub Light"),
+            Drawn::bare((864, 292), 1),
+            vec![
+                (None, [1, 0, 0, 0, 1]),
+                (untouched((863, 292)), [1, 0, 0, 0, 1]),
+                (untouched((864, 292)), [1, 0, 0, 0, 1]),
+                (untouched((864, 291)), [1, 0, 0, 0, 1]),
+                (untouched((864, 292)), [1, 0, 0, 0, 1]),
+            ],
+        ),
+        // A rung whose told rooms twin those of one told to show no more is passed over untold.
+        (
+            nord(Keyboard::Pack),
+            at((2_881, 214), 2, true, true),
+            vec![(None, [1, 7, 0, 1, 3])],
+        ),
+        // A chrome whose rows built unlike under another bar is measured with its own rows after.
+        (
+            mocha(),
+            at((226, 857), 2, true, true),
+            vec![(None, [2, 10, 1, 1, 6]), (step(Again), [1, 4, 1, 1, 2])],
+        ),
+        // A rung told in the chrome's own rooms, the wheel no more shown, is passed over.
+        (
+            on(Keyboard::Sheet(PALETTE_SLOT), "GitHub Light"),
+            at((2_290, 195), 2, true, false),
+            vec![
+                (None, [1, 5, 0, 0, 3]),
+                (step(Press(BACKGROUND_WELL)), [1, 2, 0, 0, 2]),
+            ],
+        ),
+        (
+            on(
+                Keyboard::Sheet("settings/control/selection_foreground"),
+                "GitHub Light",
+            ),
+            at((1_752, 1_051), 2, true, true),
+            vec![
+                (None, [1, 1, 0, 1, 2]),
+                (step(Type), [1, 1, 0, 0, 1]),
+                (step(Down), [1, 2, 0, 0, 1]),
+                (step(Window((2_458, 243))), [1, 8, 0, 0, 3]),
+                (step(Type), [1, 0, 0, 0, 1]),
+                (step(Press(BACKGROUND_WELL)), [1, 2, 0, 0, 2]),
+            ],
+        ),
+        // A first result shown whole is owed no more: the reveal it gave back tells no rung (R5).
+        (
+            nord(Keyboard::Filter),
+            Drawn::bare((1_095, 700), 1),
+            vec![
+                (None, [1, 0, 0, 0, 1]),
+                (step(Status), [1, 1, 0, 1, 2]),
+                (step(Text), [1, 1, 0, 1, 2]),
+                (step(Type), [1, 1, 0, 1, 1]),
+                (step(Status), [1, 0, 0, 0, 1]),
+                (step(Right), [1, 0, 0, 0, 1]),
+                (step(Window((230, 420))), [1, 0, 1, 0, 1]),
+            ],
         ),
     ]
 }
 
-/// THESE FRAMES BUILD THE THEMES PAGE, AND LAY OUT ITS DOCKS AND BARS, NO MORE THAN 006cded90b
-/// DID AT THE SAME INPUTS: each frame at most this branch's work, a redraw measuring no list.
-/// (At 244x440 the strip keeps a tried theme's whole name beside its buttons on two lines where
-/// 006cded90b stacked it under a first word cut short, so five frames there measure the list for
-/// that strip one to five times more.)
+/// A walk whose screens part from c5ef831d7f's, its frames' work in total at most `[pages, …]`.
+type DivergedWalk = (Scenario, Drawn, Vec<Then>, [usize; 5]);
+
+/// The walks [`these_frames_build_the_themes_page_and_its_bars_no_more_than_c5ef831d7f`] totals.
+fn diverged_walks() -> Vec<DivergedWalk> {
+    use Step::{Status, Warning};
+    let on = |keyboard, theme| Scenario {
+        keyboard,
+        theme,
+        in_use: theme,
+    };
+    let nord = |keyboard| on(keyboard, "Nord");
+    let at = |window, scale, warning, status| Drawn {
+        warning,
+        status,
+        ..Drawn::bare(window, scale)
+    };
+    let status = |window, scale| at(window, scale, false, true);
+    let step = Then::Step;
+    vec![
+        // A status leaving a held give-way chrome not too short keeps it, seating no chrome first.
+        (
+            nord(Keyboard::Row("Default")),
+            status((864, 292), 1),
+            vec![step(Status)],
+            [3, 2, 0, 1, 6],
+        ),
+        // Pack under a status, a warning coming and going, opened on the landing main cuts (R3).
+        (
+            nord(Keyboard::Pack),
+            Drawn::bare((1_284, 714), 1),
+            vec![step(Status), step(Status), step(Warning)],
+            [4, 6, 0, 1, 10],
+        ),
+        (
+            nord(Keyboard::Pack),
+            at((1_284, 714), 1, true, false),
+            vec![step(Status), step(Status), step(Warning), step(Warning)],
+            [5, 8, 0, 1, 12],
+        ),
+        // A warning leaving a landing's held rung under a bar seats no page before giving way.
+        (
+            on(Keyboard::Row("One Dark"), "GitHub Light"),
+            at((640, 480), 1, true, true),
+            vec![step(Status), step(Status), step(Warning)],
+            [5, 7, 0, 3, 13],
+        ),
+    ]
+}
+
+/// Each frame at most its pinned page work; each walk parting from c5ef831d7f's at most its total.
 #[test]
-fn these_frames_build_the_themes_page_and_its_bars_no_more_than_006cded90b() {
+fn these_frames_build_the_themes_page_and_its_bars_no_more_than_c5ef831d7f() {
+    let counts = |work: crate::work_counts::SettingsPageWork| {
+        [work.pages, work.measures, work.docks, work.bars, work.seats]
+    };
     let mut over = Vec::new();
     for (scenario, start, frames) in work_walks() {
         let thens = frames
@@ -4551,27 +6415,227 @@ fn these_frames_build_the_themes_page_and_its_bars_no_more_than_006cded90b() {
             .filter_map(|(then, _)| *then)
             .collect::<Vec<_>>();
         let work = page_work(scenario, start, &thens);
-        for ((frame, work), (_, [pages, measures, docks, bars])) in work.into_iter().zip(&frames) {
-            let at_most = crate::work_counts::SettingsPageWork {
-                pages: *pages,
-                measures: *measures,
-                docks: *docks,
-                bars: *bars,
-            };
-            if work.pages > at_most.pages
-                || work.measures > at_most.measures
-                || work.docks > at_most.docks
-                || work.bars > at_most.bars
+        for ((frame, work), (_, at_most)) in work.into_iter().zip(&frames) {
+            if counts(work)
+                .iter()
+                .zip(at_most)
+                .any(|(did, most)| did > most)
             {
                 over.push(format!(
-                    "{scenario}, {frame}: {work:?}, at most {at_most:?}"
+                    "{scenario}, {frame}: {:?}, at most {at_most:?}",
+                    counts(work)
                 ));
             }
+        }
+    }
+    for (scenario, start, frames, at_most) in diverged_walks() {
+        let total =
+            page_work(scenario, start, &frames)
+                .into_iter()
+                .fold([0; 5], |total, (_, work)| {
+                    let mut sum = total;
+                    for (into, did) in sum.iter_mut().zip(counts(work)) {
+                        *into += did;
+                    }
+                    sum
+                });
+        if total.iter().zip(at_most).any(|(did, most)| *did > most) {
+            over.push(format!(
+                "{scenario} from {start}, in total: {total:?}, at most {at_most:?}"
+            ));
         }
     }
     assert!(
         over.is_empty(),
         "frames over their page work:\n{}",
         over.join("\n")
+    );
+}
+
+/// A colour well pressed on the sheet lays its least list once a column width, not once a rung.
+#[test]
+fn a_colour_well_pressed_on_the_sheet_lays_its_least_list_once_a_width() {
+    use Step::{Down, Press, Type, Window};
+    let light = |keyboard| Scenario {
+        keyboard,
+        theme: "GitHub Light",
+        in_use: "GitHub Light",
+    };
+    let mut over = Vec::new();
+    for (scenario, start, steps, at_most) in [
+        (
+            light(Keyboard::Sheet(PALETTE_SLOT)),
+            "2290x195@2+warning",
+            vec![Press(BACKGROUND_WELL)],
+            2,
+        ),
+        (
+            light(Keyboard::Sheet("settings/control/selection_foreground")),
+            "1752x1051@2+warning+status",
+            vec![
+                Type,
+                Down,
+                Window((2_458, 243)),
+                Type,
+                Press(BACKGROUND_WELL),
+            ],
+            2,
+        ),
+    ] {
+        let frames = steps.into_iter().map(Then::Step).collect::<Vec<_>>();
+        let work = page_work(scenario, drawn_of(start), &frames);
+        let (frame, pressed) = work.last().expect("a walk draws its press");
+        if pressed.sheet_leasts > at_most {
+            over.push(format!(
+                "{scenario}, {frame}: {}, at most {at_most}",
+                pressed.sheet_leasts
+            ));
+        }
+    }
+    assert!(
+        over.is_empty(),
+        "sheets laid over their pins:\n{}",
+        over.join("\n")
+    );
+}
+
+/// First frames drawn whole by eb53a9b243 and by 2dbd55ec43 or here: control (`true`) or landing.
+const FIRST_WHOLE: [(Keyboard, &str, bool, &str); 13] = [
+    (Keyboard::Filter, "Nord", false, "230x420@1+status"),
+    (Keyboard::Filter, "Tokyo Night", false, "230x420@1+status"),
+    (
+        Keyboard::Row("Dracula"),
+        "Nord",
+        true,
+        "215x342@1 244x440@1 210x350@1+status 215x318@1+status 220x350@1+status \
+         368x534@2+status 368x558@2+status 368x582@2+status 368x606@2+status",
+    ),
+    (Keyboard::Filter, "Nord", true, "215x318@1+status"),
+    (
+        Keyboard::On(IMPORT),
+        "Nord",
+        true,
+        "215x318@1+status 368x534@2+status 368x558@2+status 368x582@2+status \
+         368x606@2+status",
+    ),
+    (
+        Keyboard::On(IMPORT),
+        "GitHub Light",
+        true,
+        "215x318@1+status 368x534@2+status 368x558@2+status 368x582@2+status \
+         368x606@2+status",
+    ),
+    (Keyboard::On(MOCHA), "Nord", true, "215x318@1+status"),
+    (
+        Keyboard::Row("Tokyo Night"),
+        "Nord",
+        true,
+        "215x318@1+status 179x678@2 368x534@2+status 368x558@2+status 368x582@2+status \
+         368x606@2+status",
+    ),
+    (
+        Keyboard::Row("Dracula"),
+        "Nord",
+        false,
+        "215x342@1 215x390@1 215x414@1 215x438@1 215x462@1 244x440@1 215x390@1+status \
+         215x414@1+status 215x438@1+status 215x462@1+status 215x462@1+warning \
+         215x510@1+warning 215x318@1+warning+status 215x414@1+warning+status \
+         215x438@1+warning+status 215x534@1+warning+status 215x558@1+warning+status",
+    ),
+    (Keyboard::On(IMPORT), "GitHub Light", false, "215x318@1"),
+    (Keyboard::On(MOCHA), "Nord", false, "215x318@1"),
+    (
+        Keyboard::Off,
+        "Nord",
+        false,
+        "215x318@1+status 368x534@2+status 368x558@2+status 368x582@2+status \
+         368x606@2+status",
+    ),
+    (
+        Keyboard::Row("Tokyo Night"),
+        "Nord",
+        false,
+        "215x342@1 215x390@1 215x414@1 215x438@1 215x462@1 215x390@1+status \
+         215x414@1+status 215x438@1+status 215x462@1+status 215x462@1+warning \
+         215x510@1+warning 215x318@1+warning+status 215x414@1+warning+status \
+         215x438@1+warning+status 215x534@1+warning+status 215x558@1+warning+status \
+         179x726@2+status 179x750@2+status 188x726@2+status 188x750@2+status",
+    ),
+];
+
+/// A start as [`Drawn`]'s display writes it.
+fn drawn_of(spec: &str) -> Drawn {
+    let mut parts = spec.split('+');
+    let (size, scale) = parts
+        .next()
+        .and_then(|head| head.split_once('@'))
+        .expect("a start names its window and scale");
+    let (width, height) = size.split_once('x').expect("a window is wide x tall");
+    let mut drawn = Drawn::bare(
+        (
+            width.parse().expect("a width"),
+            height.parse().expect("a height"),
+        ),
+        scale.parse().expect("a scale"),
+    );
+    for bar in parts {
+        match bar {
+            "warning" => drawn.warning = true,
+            "status" => drawn.status = true,
+            other => panic!("no bar {other}"),
+        }
+    }
+    drawn
+}
+
+#[test]
+fn first_frames_show_whole_what_eb53a9b243_showed_whole() {
+    let frames: Vec<(Scenario, Drawn, bool)> = FIRST_WHOLE
+        .iter()
+        .flat_map(|&(keyboard, theme, control, starts)| {
+            let scenario = Scenario {
+                keyboard,
+                theme,
+                in_use: theme,
+            };
+            starts
+                .split_whitespace()
+                .map(move |start| (scenario, drawn_of(start), control))
+        })
+        .collect();
+    let cut = Mutex::new(Vec::new());
+    on_n_workers(
+        KEEPING_WORKERS,
+        &frames,
+        "first frames",
+        |&(scenario, drawn, control)| {
+            let sweep = Sweep::new(scenario);
+            let (mut runtime, instance, view) = sweep.opened(drawn);
+            let frame = draw(&mut runtime, instance, view, drawn);
+            let focus = state(&runtime, view).common.last_focus.clone();
+            let whole = if control {
+                focus.is_some_and(|key| frame.kept(key.as_str()) == Kept::Whole)
+            } else {
+                frame.in_list(&sweep.landing)
+            };
+            if !whole {
+                let what = if control {
+                    "the keyboard's control"
+                } else {
+                    "the theme in use"
+                };
+                cut.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(format!("{scenario} at {drawn}: {what}"));
+            }
+        },
+    );
+    let cut = cut.into_inner().unwrap_or_else(PoisonError::into_inner);
+    assert!(
+        cut.is_empty(),
+        "{} of {} first frames cut what eb53a9b243 showed whole:\n{}",
+        cut.len(),
+        frames.len(),
+        cut.join("\n")
     );
 }

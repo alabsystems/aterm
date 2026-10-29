@@ -694,6 +694,39 @@ pub fn write_manifest(
     sign::write_sig(pkg, &sig).map(Some)
 }
 
+/// Sign a bottle manifest's exact bytes when a signer is given, verify the pair and hold the parsed document to what was packed, and only then write the manifest and its signature.
+/// # Errors
+/// The signer's or the self-check's refusal; neither file is written after one, and a signature an earlier run left is removed (it covers other bytes).
+pub fn write_bottle_manifest(
+    ctx: &Ctx,
+    doc: &pkgdoc::Doc,
+    header: &Header,
+    row: &pkgdoc::BottleRow,
+    pkg: &Path,
+    signer: Option<&Signer>,
+) -> Result<Option<PathBuf>> {
+    let _ = std::fs::remove_file(sign::sig_path(pkg));
+    let sig = match signer {
+        Some(s) => {
+            let (sig, parsed) = sign::sign_checked(&s.key, doc.bytes(), &s.authority)?;
+            pkgdoc::check_parsed_bottle(&parsed, header, row)?;
+            Some(sig)
+        }
+        None => None,
+    };
+    std::fs::write(pkg, doc.bytes())
+        .map_err(|e| Error::io(format!("write {}", pkg.display()), &e))?;
+    let Some(sig) = sig else {
+        eprintln!(
+            "atpkg-publish: wrote {} UNSIGNED — no client accepts it until a rostered \
+             machine runs `atpkg-publish sign` over these exact bytes",
+            ctx.shown(pkg)
+        );
+        return Ok(None);
+    };
+    sign::write_sig(pkg, &sig).map(Some)
+}
+
 /// [`Pack`] over explicit tools — the seam the tests drive.
 /// # Errors
 /// Any gate's refusal; nothing is signed or uploaded after one.

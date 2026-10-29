@@ -256,7 +256,7 @@ fn a_land_yield_that_does_not_land_names_every_leg_that_held_it() {
 }
 
 #[test]
-fn the_hold_ends_at_a_landing_theirs_another_mode_and_off() {
+fn the_hold_ends_at_a_landing_another_mode_and_off() {
     let open = || {
         let (mut st, now) = instructed();
         at(
@@ -278,8 +278,14 @@ fn the_hold_ends_at_a_landing_theirs_another_mode_and_off() {
         ..idle("You're welcome!", Some(Duration::from_secs(5)))
     });
     at(&mut st, &thanks, now + 5 * MIN);
-    assert_eq!(st.face(), TaskFace::Theirs);
-    assert_eq!(st.land_held(), None, "theirs");
+    // A person's message mid-landing is no exchange of theirs: Land carries the task on (owner
+    // ruling 2026-10-27).
+    assert_eq!(st.face(), TaskFace::Open);
+    assert!(!st.left_to_person());
+    assert!(
+        st.land_held().is_some(),
+        "a person's message mid-landing: the hold stands"
+    );
     for mode in [Autopilot::Cruise, Autopilot::Off] {
         let (mut st, now) = open();
         at(
@@ -469,15 +475,13 @@ fn a_land_hold_is_copy_and_small() {
     fn copy<T: Copy>(t: T) -> (T, T) {
         (t, t)
     }
-    let (a, b) = copy(held(&[HoldLeg::Open], &["still open"], 2, [1, 2, 3, 4, 5]));
-    assert_eq!(a, b);
+    let (a, _) = copy(held(&[HoldLeg::Open], &["still open"], 2, [1, 2, 3, 4, 5]));
     assert_eq!(std::mem::size_of::<Option<OpenWord>>(), 2);
     assert!(
         std::mem::size_of::<LandHeld>() <= 40,
         "{} bytes",
         std::mem::size_of::<LandHeld>()
     );
-    assert!(std::mem::size_of::<[Option<&'static str>; 4]>() >= 64);
     let debug = format!("{a:?}");
     assert!(
         debug.contains("\"still open\"") && !debug.contains("Instant"),

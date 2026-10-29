@@ -14,6 +14,8 @@ pub const MAX_ENVELOPE: usize = 16 << 20;
 pub const MAX_LOCKERS: usize = 64;
 /// The most handoff pairs accepted: one per key rotation in the vault's life.
 pub const MAX_HANDOFF: usize = 64;
+/// The most parent digests accepted on one envelope (one per diverged server head merged).
+pub const MAX_PARENTS: usize = 64;
 
 /// The armor's first line (C2SP age.md).
 pub const ARMOR_BEGIN: &str = "-----BEGIN AGE ENCRYPTED FILE-----";
@@ -48,6 +50,8 @@ pub struct Envelope {
     pub signer: [u8; 32],
     /// The handoff chain: every key `signer` replaced, oldest first, each with its endorsement of the key after it (the last one's, of `signer`).
     pub handoff: Vec<([u8; 32], [u8; 64])>,
+    /// SHA-256 digests of the prior envelope head(s) this version descends from (`seq >= 2`).
+    pub parents: Vec<[u8; 32]>,
     /// The lockers, in file order.
     pub lockers: Vec<Locker>,
     /// The signature.
@@ -67,6 +71,8 @@ pub struct Unsigned {
     pub time: u64,
     /// The handoff chain, oldest first ([`Envelope::handoff`]).
     pub handoff: Vec<([u8; 32], [u8; 64])>,
+    /// SHA-256 digests of the prior envelope head(s) this version descends from (`seq >= 2`).
+    pub parents: Vec<[u8; 32]>,
     /// The lockers.
     pub lockers: Vec<Locker>,
 }
@@ -402,6 +408,29 @@ pub fn parse(bytes: &[u8]) -> crate::Result<Envelope> {
             _ => break,
         }
     }
+    let mut parents: Vec<[u8; 32]> = Vec::new();
+    while let Some((number, _, line)) = lines.peek() {
+        if !line.starts_with("parent:") {
+            break;
+        }
+        if seq == 1 {
+            return Err(Error::new(format!(
+                "envelope line {number}: `parent:` is not allowed at seq 1"
+            )));
+        }
+        if parents.len() == MAX_PARENTS {
+            return Err(Error::new(format!(
+                "envelope line {number}: more than {MAX_PARENTS} parents"
+            )));
+        }
+        let parent = key_bytes::<32>(lines.header("parent")?, "parent")?;
+        if parents.contains(&parent) {
+            return Err(Error::new(format!(
+                "envelope line {number}: duplicate `parent:` digest"
+            )));
+        }
+        parents.push(parent);
+    }
     let mut lockers: Vec<Locker> = Vec::new();
     while let Some((number, _, line)) = lines.peek() {
         let Some(label) = line.strip_prefix("locker: ") else {
@@ -473,6 +502,7 @@ pub fn parse(bytes: &[u8]) -> crate::Result<Envelope> {
         time,
         signer,
         handoff,
+        parents,
         lockers,
         signature,
         raw: bytes.to_vec(),
@@ -513,6 +543,22 @@ pub(crate) fn sign_unchecked(unsigned: &Unsigned, seed: &[u8; 32]) -> crate::Res
             "envelope: more than {MAX_HANDOFF} handoffs; a vault whose key rotated that often is made again with aterm secrets create"
         )));
     }
+    if unsigned.seq == 1 && !unsigned.parents.is_empty() {
+        return Err(Error::new("envelope: seq 1 cannot name parents"));
+    }
+    if unsigned.parents.len() > MAX_PARENTS {
+        return Err(Error::new(format!(
+            "envelope: more than {MAX_PARENTS} parents"
+        )));
+    }
+    for (index, parent) in unsigned.parents.iter().enumerate() {
+        if unsigned.parents[..index].contains(parent) {
+            return Err(Error::new(format!(
+                "envelope: parent {} repeats an earlier parent digest",
+                index + 1
+            )));
+        }
+    }
     for (index, locker) in unsigned.lockers.iter().enumerate() {
         if !valid_label(&locker.label) {
             return Err(Error::new(format!(
@@ -552,6 +598,9 @@ pub(crate) fn sign_unchecked(unsigned: &Unsigned, seed: &[u8; 32]) -> crate::Res
             "endorsement: {}\n",
             b64::encode_padded(endorsement)
         ));
+    }
+    for parent in &unsigned.parents {
+        text.push_str(&format!("parent: {}\n", b64::encode_padded(parent)));
     }
     for locker in &unsigned.lockers {
         text.push_str(&format!("locker: {}\n", locker.label));
@@ -944,6 +993,7 @@ mod tests {
             seq,
             time: 1_792_530_000,
             handoff: Vec::new(),
+            parents: Vec::new(),
             lockers: lockers(),
         }
     }
@@ -1656,5 +1706,38 @@ mod tests {
         for bad in ["", "0", "01", "Admin", "1a", "-1"] {
             assert!(!valid_label(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn parents_round_trip_are_signed_and_forbid_seq_one_or_duplicates() {
+        let p1 = [0x11u8; 32];
+        let p2 = [0x22u8; 32];
+        let mut u = unsigned(2);
+        u.parents = vec![p1, p2];
+        let bytes = sign(&u, &OLD).expect("signed with two parents");
+        let parsed = parse(&bytes).expect("parsed");
+        assert_eq!(parsed.parents, vec![p1, p2]);
+        parsed.verify_signature().expect("signature covers parents");
+
+        // Negative control 1: mutating a `parent:` byte invalidates the Ed25519 signature.
+        let text = String::from_utf8(bytes).expect("utf-8");
+        let tampered = text.replacen(
+            &format!("parent: {}\n", b64::encode_padded(&p1)),
+            &format!("parent: {}\n", b64::encode_padded(&[0x33u8; 32])),
+            1,
+        );
+        let tampered_env = parse(tampered.as_bytes()).expect("structure still parses");
+        assert!(
+            tampered_env.verify_signature().is_err(),
+            "tampered parent must fail signature verification"
+        );
+
+        // Negative control 2: `seq == 1` with parents and duplicate parents are refused.
+        let mut seq1 = unsigned(1);
+        seq1.parents = vec![p1];
+        assert!(sign(&seq1, &OLD).is_err(), "seq 1 cannot carry parents");
+        let mut dup = unsigned(2);
+        dup.parents = vec![p1, p1];
+        assert!(sign(&dup, &OLD).is_err(), "duplicate parents refused");
     }
 }

@@ -5,6 +5,7 @@
 
 use std::ops::Range;
 
+use super::command::CommandAuthority;
 use super::minibuffer::Minibuffer;
 use super::projection::clamp_to_char_boundary;
 use super::view::{EditorBufferView, Selection};
@@ -50,20 +51,47 @@ impl EditorWorkspace {
         Ok(matched)
     }
 
+    /// The query the input being reduced last accepted in `view`, which `C-s C-s` and
+    /// search-next recall: the person's ([`EditorBufferView::last_search_query`]) for input that
+    /// carries [`CommandAuthority::Clipboard`], else the guest's, as the kill ring is picked
+    /// ([`Self::kills`]). A query is what was typed (a token checked for and not found, say), so
+    /// input without that authority (in aterm, a control client's) never recalls the person's
+    /// into a minibuffer it reads, nor steps the selection to its matches.
+    pub(super) fn remembered_search<'v>(&self, view: &'v EditorBufferView) -> &'v str {
+        if self.granted.contains(&CommandAuthority::Clipboard) {
+            &view.last_search_query
+        } else {
+            &view.guest_last_search_query
+        }
+    }
+
+    /// Keep `query` as the one the input being reduced accepted in `view`
+    /// ([`Self::remembered_search`]).
+    pub(super) fn remember_search(&self, view: &mut EditorBufferView, query: &str) {
+        let slot = if self.granted.contains(&CommandAuthority::Clipboard) {
+            &mut view.last_search_query
+        } else {
+            &mut view.guest_last_search_query
+        };
+        slot.clear();
+        slot.push_str(query);
+    }
+
     pub(super) fn navigate_search(
         &self,
         store: &DocumentStore,
         view: &mut EditorBufferView,
         forward: bool,
     ) -> Result<Vec<EditorEffect>, EditorError> {
+        let remembered = self.remembered_search(view).to_owned();
         let query = match &mut view.minibuffer {
             Minibuffer::Search { query, .. } => {
                 if query.is_empty() {
-                    query.clone_from(&view.last_search_query);
+                    *query = remembered;
                 }
                 query.clone()
             }
-            Minibuffer::Inactive => view.last_search_query.clone(),
+            Minibuffer::Inactive => remembered,
             _ => return Ok(vec![EditorEffect::Bell]),
         };
         if query.is_empty() {
@@ -204,6 +232,88 @@ mod tests {
         let after = store.snapshot(document).unwrap();
         assert_eq!(after.seq, original.seq);
         assert_eq!(after.text, original.text);
+    }
+
+    /// A REMEMBERED SEARCH IS RECALLED ONLY BY THE INPUT THAT ACCEPTED IT: the query the person
+    /// accepted is what they typed (a token checked for, found or not), as private as their
+    /// kills, so input without clipboard authority (in aterm, a control client's) recalls a query
+    /// of its own. Its `C-s C-s` never puts the person's query in the minibuffer it reads, its
+    /// search-next never steps the selection to the person's matches, its own accepted query
+    /// never replaces theirs, and the person's `C-s C-s` still recalls their own.
+    /// NEGATIVE CONTROL: against main's code at this leaf (`147b22abdc`), one query served both:
+    /// the guest's search-next stepped the selection to the person's match (`4..11`); so it did
+    /// again with `remembered_search` mutated to pick the person's query for every input.
+    #[test]
+    fn a_remembered_search_is_recalled_only_by_the_input_that_accepted_it() {
+        fn press(
+            store: &mut DocumentStore,
+            workspace: &mut EditorWorkspace,
+            view: &mut EditorBufferView,
+            keys: &str,
+        ) -> Vec<EditorEffect> {
+            let mut effects = Vec::new();
+            for key in keys.split_whitespace() {
+                effects.extend(
+                    workspace
+                        .handle_chord(store, view, KeyChord::parse(key).unwrap())
+                        .unwrap(),
+                );
+            }
+            effects
+        }
+        let recalled = |view: &EditorBufferView| match &view.minibuffer {
+            Minibuffer::Search { query, .. } => Some(query.clone()),
+            _ => None,
+        };
+        let guest = || {
+            vec![
+                CommandAuthority::Read,
+                CommandAuthority::Edit,
+                CommandAuthority::Save,
+            ]
+        };
+        let (mut store, mut workspace, mut view, _) = editor("one hunter2 two");
+
+        press(&mut store, &mut workspace, &mut view, "C-s");
+        workspace
+            .insert_text(&mut store, &mut view, "hunter2")
+            .unwrap();
+        workspace.submit_minibuffer(&mut store, &mut view).unwrap();
+        assert_eq!(
+            view.primary_selection().range(),
+            4..11,
+            "PRECONDITION: the person's search found it"
+        );
+
+        workspace.granted = guest();
+        view.selections = vec![Selection::caret(0)];
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::SearchNext)
+            .unwrap();
+        assert_eq!(
+            view.primary_selection(),
+            &Selection::caret(0),
+            "the guest's search-next"
+        );
+        press(&mut store, &mut workspace, &mut view, "C-s C-s");
+        assert_eq!(recalled(&view).as_deref(), Some(""), "the guest's C-s C-s");
+        workspace.insert_text(&mut store, &mut view, "two").unwrap();
+        workspace.submit_minibuffer(&mut store, &mut view).unwrap();
+        press(&mut store, &mut workspace, &mut view, "C-s C-s");
+        assert_eq!(
+            recalled(&view).as_deref(),
+            Some("two"),
+            "the guest's own query"
+        );
+        press(&mut store, &mut workspace, &mut view, "C-g");
+
+        workspace.granted = CommandAuthority::ALL.to_vec();
+        press(&mut store, &mut workspace, &mut view, "C-s C-s");
+        assert_eq!(
+            recalled(&view).as_deref(),
+            Some("hunter2"),
+            "the person's C-s C-s"
+        );
     }
 
     /// On Windows `C-s` saves and isearch is `M-s`: in a search, `M-s`

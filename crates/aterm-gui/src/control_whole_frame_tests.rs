@@ -526,6 +526,38 @@ fn text_json_stamps_the_person_after_its_wait() {
     assert!(reply.contains(",\"inputs\":[1,1],"), "{reply}");
 }
 
+/// `text --json`'s `"title"` is read after the frame wait, in the hold that reads the rows: a
+/// title set as the frame closes rides with that frame's rows. CONTROL: `title`, which reads no
+/// row, answers during the frame with the title from before it, beside rows it never saw.
+#[test]
+fn text_json_reads_the_title_with_the_whole_frame() {
+    const RUNNING: &str = "\x1b]2;\u{25d0} Claude Code\x07";
+    const RESTED: &str = "\x1b]2;\u{2733} Claude Code\x07";
+    let h = session(registered_session(0, -1, b""), EVENTUALLY);
+    burst(&h, WHOLE);
+    burst(&h, RUNNING);
+    burst(&h, HALF);
+    let reply = std::thread::scope(|s| {
+        let reading = s.spawn(|| cmd_text_json_opt(&h.term, TextArgs::default()));
+        aterm_spec::wait::until_within(EVENTUALLY, "the read waiting", || {
+            (h.ctx.watchers.count() == 1).then_some(())
+        });
+        assert_eq!(
+            control_query::cmd_title(&h.term),
+            "OK \u{25d0} Claude Code\n",
+            "CONTROL: `title` answers inside the frame"
+        );
+        burst(&h, &format!("{RESTED}{REST}"));
+        reading.join().expect("the read")
+    });
+    assert!(
+        reply.contains(",\"title\":\"\u{2733} Claude Code\","),
+        "the title the frame closed with: {reply}"
+    );
+    assert!(reply.contains(",\"❯ ready\""), "beside its rows: {reply}");
+    assert!(!reply.contains("\"frame\":\"open\""), "{reply}");
+}
+
 #[test]
 fn the_host_verbs_say_frame_open_on_a_frame_unfinished_at_their_bound() {
     let h = session(registered_session(0, -1, b""), Duration::from_millis(1));

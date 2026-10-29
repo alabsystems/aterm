@@ -67,10 +67,9 @@ fn history_scroll_is_rescued_and_stays_byte_identical_to_a_full_repaint() {
             );
         }
     }
-    assert!(
-        rescued >= 14,
-        "the scroll-blit rescue barely fired ({rescued}/{checked} notches) — the \
-         byte-identity gate above is not testing it"
+    assert_eq!(
+        rescued, 20,
+        "all 20 cursor-hidden scroll notches must be rescued ({rescued}/{checked})"
     );
     eprintln!("gpu scroll-blit: {rescued}/{checked} notches rescued");
 }
@@ -105,35 +104,79 @@ fn a_visible_cursor_rides_the_rescue_and_stays_byte_identical() {
     let mut gpu = fresh_gpu();
     let mut term = scrollback_term(false);
     let mut win = WindowGpu::new();
-    let input = term.cell_frame(ROWS, COLS);
-    let warm = gpu.present_input_readback(&mut win, &input);
+    let mut warm_input = term.cell_frame(ROWS, COLS);
+    warm_input.cursor_visible = true;
+    warm_input.cursor_row = 4;
+    warm_input.cursor_col = 5;
+    let warm = gpu.present_input_readback(&mut win, &warm_input);
     assert_eq!(
         warm.pixels,
-        fresh_render(&input),
+        fresh_render(&warm_input),
         "warm frame != full repaint"
     );
 
-    let mut rescued = 0u64;
+    // Hold a visible stationary cursor across all 12 viewport notches so `cur_shown == true`
+    // exercises `scroll_shift_plan`'s cursor + ghost-row dirtying on both +da and -da.
+    let mut shown_rescued = 0u64;
     for (notches, step) in [(6, 3i32), (6, -2i32)] {
+        for n in 0..notches {
+            term.scroll_display(step);
+            let mut input = term.cell_frame(ROWS, COLS);
+            input.cursor_visible = true;
+            input.cursor_row = 4;
+            input.cursor_col = 5;
+            let before = gpu.scroll_rescues();
+            let got = gpu.present_input_readback(&mut win, &input);
+            let delta = gpu.scroll_rescues() - before;
+            assert_eq!(
+                delta, 1,
+                "stationary visible-cursor scroll notch (step {step}, notch {n}) must be rescued"
+            );
+            shown_rescued += delta;
+            assert_eq!(
+                got.pixels,
+                fresh_render(&input),
+                "visible-cursor scrolled frame (step {step}, notch {n}) != a full repaint"
+            );
+        }
+    }
+    assert_eq!(shown_rescued, 12);
+
+    // Also pin `Terminal::cell_frame`'s natural `cursor_visible` transitions across `display_offset`:
+    // leaving 0 (`true -> false`) and returning to 0 (`false -> true`) refuse rescue, while every
+    // interior scroll (`false -> false`) rescues.
+    term.scroll_to_bottom();
+    let mut gpu = fresh_gpu();
+    let mut win = WindowGpu::new();
+    let live = term.cell_frame(ROWS, COLS);
+    assert!(live.cursor_visible);
+    let _ = gpu.present_input_readback(&mut win, &live);
+
+    let mut toggle_rescued = 0u64;
+    for (notches, step) in [(6, 3i32), (6, -2i32), (1, -6i32)] {
         for n in 0..notches {
             term.scroll_display(step);
             let input = term.cell_frame(ROWS, COLS);
             let before = gpu.scroll_rescues();
             let got = gpu.present_input_readback(&mut win, &input);
-            rescued += gpu.scroll_rescues() - before;
+            let delta = gpu.scroll_rescues() - before;
+            let expected = u64::from(!((step == 3 && n == 0) || step == -6));
+            assert_eq!(
+                delta, expected,
+                "cursor-toggle notch (step {step}, notch {n}): expected rescue={expected}, got {delta}"
+            );
+            toggle_rescued += delta;
             assert_eq!(
                 got.pixels,
                 fresh_render(&input),
-                "cursor-visible scrolled frame (step {step}, notch {n}) != a full repaint"
+                "cursor-toggled scrolled frame (step {step}, notch {n}) != a full repaint"
             );
         }
     }
-    assert!(
-        rescued >= 8,
-        "the rescue barely fired with a visible cursor ({rescued}) — the ghost-row \
-         handling above is not being tested"
+    assert_eq!(toggle_rescued, 11);
+    eprintln!(
+        "gpu scroll-blit (cursor shown): {shown_rescued}/12 stationary-cursor + {toggle_rescued}/13 toggle notches rescued"
     );
-    eprintln!("gpu scroll-blit (cursor shown): {rescued} notches rescued");
 }
 
 #[cfg(target_os = "macos")]
@@ -167,10 +210,9 @@ fn a_rescued_scroll_present_parks_on_no_command_buffer_of_its_own() {
     }
 
     let rescued = gpu.scroll_rescues() - rescues_before;
-    assert!(
-        rescued >= 8,
-        "the rescue barely fired ({rescued} notches) — the no-wait contract \
-         below is not being tested"
+    assert_eq!(
+        rescued, 12,
+        "all 12 cursor-hidden scroll notches must be rescued ({rescued})"
     );
     assert_eq!(
         gpu.metal_encode_band_shifts() - shifts_before,

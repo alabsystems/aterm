@@ -55,6 +55,10 @@ struct World {
     /// The preflight's own blocks: R's commit-only gates and the engine's readiness.
     blocks: Vec<Refusal>,
     audits: VecDeque<Vec<Finding>>,
+    /// Each audit's `dry`, in order.
+    audited_dry: Vec<bool>,
+    /// The explicit profile handed to each audit, rather than an unrelated default.
+    audited_profiles: Vec<Option<PathBuf>>,
     verify_code: i32,
     verify_passes: bool,
     stage_stages: bool,
@@ -160,6 +164,8 @@ impl World {
             machine_refusals: Vec::new(),
             blocks: Vec::new(),
             audits: VecDeque::new(),
+            audited_dry: Vec::new(),
+            audited_profiles: Vec::new(),
             verify_code: 0,
             verify_passes: true,
             stage_stages: true,
@@ -564,8 +570,10 @@ impl Backend for World {
         self.fixtures_on_main = true;
         Ok(format!("v{}'s handoff fixtures landed on main", c.version))
     }
-    fn audit(&mut self, _id: &str) -> Vec<Finding> {
+    fn audit(&mut self, _id: &str, profile: Option<&Path>, dry: bool) -> Vec<Finding> {
         self.calls.push("audit".into());
+        self.audited_dry.push(dry);
+        self.audited_profiles.push(profile.map(Path::to_path_buf));
         if self.audits.len() > 1 {
             self.audits.pop_front().unwrap_or_default()
         } else {
@@ -830,6 +838,12 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
         ]
     );
     assert_eq!(w.count("audit"), 2, "{:?}", w.calls);
+    assert_eq!(w.audited_profiles, [None, None]);
+    assert_eq!(
+        w.audited_dry,
+        [false, false],
+        "a real run's audit may test-sign"
+    );
     let j = w.journal().unwrap();
     assert_eq!((j.version.as_str(), j.commit.as_str()), ("0.6.0", BUMP));
     for fact in [
@@ -1069,6 +1083,11 @@ fn a_dry_run_changes_nothing_and_asks_nobody() {
     ] {
         assert_eq!(w.count(call), 0, "{call}: {:?}", w.calls);
     }
+    assert!(
+        !w.audited_dry.is_empty() && w.audited_dry.iter().all(|dry| *dry),
+        "a dry run's audit writes nothing: {:?}",
+        w.audited_dry
+    );
     assert!(
         !w.calls
             .iter()
@@ -1847,6 +1866,28 @@ fn forget_takes_no_flag_it_would_ignore() {
         parse(&["release", "--forget", "--verbose", "--engine", "/e"]),
         Ok(crate::cli::Cmd::Release(o)) if o.forget && o.verbose
     ));
+}
+
+#[test]
+fn explicit_credentials_reach_preflight_and_publish_audits() {
+    for dry in [false, true] {
+        let mut w = World::new();
+        let profile = PathBuf::from("/existing-release-profile.toml");
+        let (code, last) = w.run(ReleaseOptions {
+            release_credentials: Some(profile.clone()),
+            dry_run: dry,
+            ..bump()
+        });
+        assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+        assert!(!w.audited_profiles.is_empty());
+        assert!(
+            w.audited_profiles
+                .iter()
+                .all(|p| p.as_ref() == Some(&profile)),
+            "{dry}: {:?}",
+            w.audited_profiles
+        );
+    }
 }
 
 #[test]

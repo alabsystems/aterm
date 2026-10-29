@@ -331,6 +331,213 @@ fn a_taken_temporary_name_is_never_opened() {
     assert_eq!(missing.kind(), io::ErrorKind::NotFound);
 }
 
+/// Set the time `file` was last written to `at`.
+fn date(file: &Path, at: std::time::SystemTime) {
+    std::fs::File::options()
+        .write(true)
+        .open(file)
+        .expect("open")
+        .set_modified(at)
+        .expect("date");
+}
+
+/// A sweep takes a temporary name of the file's own once it is old and its pid names no live
+/// process, and nothing else.
+#[test]
+fn a_sweep_takes_a_gone_writers_old_temporaries_and_nothing_else() {
+    let scratch = Scratch::new("sweep");
+    let path = scratch.0.join("key");
+    write(&path, b"kept\n", 0o600).expect("write");
+    let (made, _) = create_temp_beside(&path, 0o600).expect("a temporary");
+    let named = |name: &str| scratch.0.join(name);
+    for name in [
+        ".key.tmp.7.0123abcd",
+        ".key.tmp.8.0123abcd",
+        ".key.tmp.4294967295.0123abcd",
+        ".key.tmp.7.76543210",
+        ".key.tmp.7.0123abcg",
+        ".key.tmp.7.0123abc",
+        ".key.tmp.7.0123abcde",
+        ".key.tmp.7.0123ABCE",
+        ".key.tmp..0123abcd",
+        ".key.tmp.7x.0123abcd",
+        ".key.tmp.+7.0123abcd",
+        ".other.tmp.7.0123abcd",
+        "key.tmp.7.0123abcd",
+    ] {
+        std::fs::write(named(name), "").expect("plant");
+    }
+    std::fs::create_dir(named(".key.tmp.7.89abcdef")).expect("a folder");
+    std::os::unix::fs::symlink(&path, named(".key.tmp.7.fedcba98")).expect("a link");
+    let hour = Duration::from_secs(3600);
+    let now = std::time::SystemTime::now();
+    let ahead = named(".key.tmp.7.76543210");
+    date(&ahead, now + 3 * hour);
+    let remove = |temp: &Path| std::fs::remove_file(temp);
+    let gone = |_: u32| false;
+    assert_eq!(
+        sweep_temps_with(&path, hour, now, gone, remove).expect("sweep"),
+        0,
+        "none an hour old"
+    );
+
+    let unborn = named(".key.tmp.4294967295.0123abcd");
+    date(&made, now - 2 * hour);
+    date(&unborn, now - 2 * hour);
+    assert_eq!(sweep_temps_beside(&path, hour).expect("sweep"), 1);
+    assert!(!unborn.exists(), "a pid no process has");
+    assert!(made.exists(), "this process's own");
+
+    let alive = |pid: u32| pid == 8;
+    assert_eq!(
+        sweep_temps_with(&path, hour, now + 2 * hour, alive, remove).expect("sweep"),
+        2
+    );
+    assert!(!made.exists(), "a name the writer made, its pid now gone");
+    let mut left: Vec<String> = std::fs::read_dir(&scratch.0)
+        .expect("list")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .into_string()
+                .expect("utf-8")
+        })
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        [
+            ".key.tmp.+7.0123abcd",
+            ".key.tmp..0123abcd",
+            ".key.tmp.7.0123ABCE",
+            ".key.tmp.7.0123abc",
+            ".key.tmp.7.0123abcde",
+            ".key.tmp.7.0123abcg",
+            ".key.tmp.7.76543210",
+            ".key.tmp.7.89abcdef",
+            ".key.tmp.7.fedcba98",
+            ".key.tmp.7x.0123abcd",
+            ".key.tmp.8.0123abcd",
+            ".other.tmp.7.0123abcd",
+            "key",
+            "key.tmp.7.0123abcd",
+        ]
+    );
+    assert_eq!(std::fs::read(&path).expect("read"), b"kept\n");
+
+    let none = sweep_temps_with(&scratch.0.join("missing/key"), hour, now, gone, remove);
+    assert_eq!(none.expect("no folder, nothing to remove"), 0);
+    let unlisted = sweep_temps_with(&path.join("key"), hour, now, gone, remove);
+    assert_eq!(
+        unlisted.expect_err("a file is no folder").raw_os_error(),
+        Some(20),
+        "ENOTDIR"
+    );
+}
+
+/// A due temporary that cannot be removed leaves the sweep going: every other due one is
+/// tried, one another sweep took first is no error, and the first failure is the answer.
+#[test]
+fn a_sweep_answers_its_first_failure_once_every_other_was_tried() {
+    let scratch = Scratch::new("sweep-fail");
+    let path = scratch.0.join("key");
+    for salt in ["0000000a", "0000000b", "0000000c", "0000000d"] {
+        std::fs::write(scratch.0.join(format!(".key.tmp.7.{salt}")), "").expect("plant");
+    }
+    let tried = std::cell::RefCell::new(Vec::new());
+    let remove = |temp: &Path| {
+        let name = temp.file_name().expect("a name").to_string_lossy();
+        tried.borrow_mut().push(name.to_string());
+        match name.as_bytes().last() {
+            Some(b'a') => Err(io::Error::from_raw_os_error(1)),
+            Some(b'b') => Err(io::Error::from_raw_os_error(13)),
+            Some(b'c') => Err(io::ErrorKind::NotFound.into()),
+            _ => std::fs::remove_file(temp),
+        }
+    };
+    let hour = Duration::from_secs(3600);
+    let later = std::time::SystemTime::now() + 2 * hour;
+    let failed = sweep_temps_with(&path, hour, later, |_| false, remove).expect_err("two stay");
+    let tried = tried.take();
+    assert_eq!(tried.len(), 4, "every due one was tried: {tried:?}");
+    let first = tried
+        .iter()
+        .find(|name| name.ends_with('a') || name.ends_with('b'))
+        .expect("a failure");
+    let code = if first.ends_with('a') { 1 } else { 13 };
+    assert_eq!(failed.raw_os_error(), Some(code), "{tried:?}");
+    assert!(!scratch.0.join(".key.tmp.7.0000000d").exists());
+
+    let raced = |_: &Path| Err(io::ErrorKind::NotFound.into());
+    assert_eq!(
+        sweep_temps_with(&path, hour, later, |_| false, raced).expect("none"),
+        0,
+        "every one taken first"
+    );
+}
+
+/// A temporary's name gives its writer's pid only when it is one [`create_temp_beside`] makes
+/// for that file.
+#[test]
+fn a_temporary_names_its_writer() {
+    let path = Path::new("/state/key");
+    let pid = |name: &str| temp_writer(path, std::ffi::OsStr::new(name));
+    assert_eq!(pid(".key.tmp.4321.89abcdef"), Some(4321));
+    assert_eq!(pid(".key.tmp.4294967296.89abcdef"), None, "past u32");
+    assert_eq!(pid(".keys.tmp.4321.89abcdef"), None, "another file's");
+    assert_eq!(pid(".key.tmp.4321.89abcdef.x"), None, "more after the salt");
+    let odd = <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b".key.tmp.4321.\xff");
+    assert_eq!(temp_writer(path, odd), None, "not UTF-8");
+    assert_eq!(
+        temp_writer(Path::new("/"), std::ffi::OsStr::new("..tmp.4321.89abcdef")),
+        None,
+        "a path with no name"
+    );
+}
+
+#[test]
+fn a_temporary_names_the_file_it_stands_in_for() {
+    fn target(name: &str) -> Option<&str> {
+        temp_target(std::ffi::OsStr::new(name))
+    }
+    assert_eq!(target(".key.tmp.4321.89abcdef"), Some("key"));
+    assert_eq!(
+        target(".l.x.plist.tmp.4321.89abcdef"),
+        Some("l.x.plist"),
+        "a name with dots"
+    );
+    assert_eq!(
+        target(".a.tmp.b.tmp.4321.89abcdef"),
+        Some("a.tmp.b"),
+        "the last .tmp. is the temporary's"
+    );
+    for other in [
+        "key.tmp.4321.89abcdef",
+        ".key.tmp.4321.89ABCDEF",
+        ".key.tmp.4321.89abcde",
+        ".key.tmp.43x1.89abcdef",
+        ".key.tmp..89abcdef",
+        ".key.tmp.4321.89abcdef.x",
+        ".key.tmp.4294967296.89abcdef",
+        "..tmp.4321.89abcdef",
+        ".key.4321.89abcdef",
+        ".key",
+    ] {
+        assert_eq!(target(other), None, "{other:?}");
+    }
+    let odd =
+        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b".\xff.tmp.4321.89abcdef");
+    assert_eq!(temp_target(odd), None, "not UTF-8");
+    let made = Scratch::new("target");
+    let (tmp, _file) = create_temp_beside(&made.0.join("job.plist"), 0o600).expect("temporary");
+    assert_eq!(
+        temp_target(tmp.file_name().expect("name")),
+        Some("job.plist"),
+        "the creator's own name"
+    );
+}
+
 #[test]
 fn the_write_lock_waits_refuses_past_its_wait_and_is_let_go() {
     let scratch = Scratch::new("lock");

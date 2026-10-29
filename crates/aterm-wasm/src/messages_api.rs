@@ -491,11 +491,11 @@ fn read_kept(text: &str) -> Kept {
     }
 }
 
-struct WebDesk {
+pub(crate) struct WebDesk {
     /// The wall clock at the export.
-    now_unix_ms: u64,
+    pub(crate) now_unix_ms: u64,
     /// The page's local offset from UTC, in seconds.
-    utc_offset_s: i64,
+    pub(crate) utc_offset_s: i64,
 }
 
 impl page::Host for WebDesk {

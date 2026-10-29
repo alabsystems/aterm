@@ -1431,7 +1431,9 @@ pub fn usage_text_at(facts: &UsageFacts, grain: UsageGrain) -> Option<String> {
     };
     parts.extend((!tokens.is_empty()).then_some(tokens));
     match (facts.unread, facts.unread_more) {
+        // The rule says no count it does not know; the hover and `aterm harness usage` do.
         (0, false) => {}
+        (0, true) if grain == UsageGrain::Rule => {}
         (0, true) => parts.push("+? unread".to_owned()),
         (n, more) => parts.push(format!("+{n}{} unread", if more { "+" } else { "" })),
     }

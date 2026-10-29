@@ -179,7 +179,9 @@ fn no_proxy_matches(target: &Uri, value: Option<String>) -> bool {
         if entry == "*" {
             return true;
         }
-        let (entry_host, entry_port) = split_no_proxy_entry(&entry);
+        let Some((entry_host, entry_port)) = split_no_proxy_entry(&entry) else {
+            continue;
+        };
         if entry_port.is_some_and(|port| port != target.port()) {
             continue;
         }
@@ -204,26 +206,37 @@ fn no_proxy_matches(target: &Uri, value: Option<String>) -> bool {
     false
 }
 
-/// The port follows the last colon only when that colon is not the address's
-/// own: a bare IPv6 literal (`2001:db8::5`) has no port, and a bracketed one
-/// (`[2001:db8::5]:8443`) ends at its bracket.
-fn split_no_proxy_entry(entry: &str) -> (&str, Option<u16>) {
-    let (host, port) = if let Some((host, tail)) = entry
-        .strip_prefix('[')
-        .and_then(|rest| rest.split_once(']'))
-    {
-        (host, tail.strip_prefix(':'))
-    } else if entry.parse::<Ipv6Addr>().is_ok() {
-        (entry, None)
-    } else {
-        match entry.rsplit_once(':') {
-            Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
-                (host, Some(port))
-            }
-            _ => (entry, None),
+fn parse_no_proxy_port(text: &str) -> Option<u16> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse::<u16>().ok().filter(|&p| p != 0)
+}
+
+/// The port follows the colon only when that colon is not an IPv6 literal's
+/// own: a bare IPv6 literal (`2001:db8::5`) has no port, a bracketed one
+/// (`[2001:db8::5]:8443`) ends at its bracket, and a malformed bracket/port
+/// tail (`other.test:99999`, `[2001:db8::5]:bad`, `[2001:db8::5]x`) is
+/// rejected as `None` rather than stripped into a wildcard over all ports.
+fn split_no_proxy_entry(entry: &str) -> Option<(&str, Option<u16>)> {
+    if let Some(rest) = entry.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        if host.parse::<Ipv6Addr>().is_err() {
+            return None;
         }
-    };
-    (host, port.and_then(|port| port.parse::<u16>().ok()))
+        if tail.is_empty() {
+            return Some((host, None));
+        }
+        let port = tail.strip_prefix(':').and_then(parse_no_proxy_port)?;
+        return Some((host, Some(port)));
+    }
+    if entry.parse::<Ipv6Addr>().is_ok() {
+        return Some((entry, None));
+    }
+    match entry.split_once(':') {
+        None => Some((entry, None)),
+        Some((host, port)) => Some((host, Some(parse_no_proxy_port(port)?))),
+    }
 }
 
 #[cfg(test)]
@@ -527,6 +540,18 @@ mod tests {
         assert_eq!(proxy_host(&env, "https://a.example.test/"), None);
         assert_eq!(proxy_host(&env, "https://other.test:8443/"), None);
         assert!(proxy_host(&env, "https://other.test/").is_some());
+        for bad in [
+            "other.test:99999",
+            "other.test:0",
+            "other.test:abc",
+            "other.test:",
+        ] {
+            let env = FakeEnv::with(&[("HTTPS_PROXY", "http://p.test:1"), ("NO_PROXY", bad)]);
+            assert!(
+                proxy_host(&env, "https://other.test/").is_some(),
+                "NO_PROXY={bad} must not exempt all ports of other.test"
+            );
+        }
     }
 
     #[test]
@@ -557,6 +582,9 @@ mod tests {
         }
         for (entry, target) in [
             ("[2001:db8::5]:8443", "https://[2001:db8::5]/v1"),
+            ("[2001:db8::5]:99999", "https://[2001:db8::5]/v1"),
+            ("[2001:db8::5]:abc", "https://[2001:db8::5]/v1"),
+            ("[2001:db8::5]garbage", "https://[2001:db8::5]/v1"),
             ("0.0.7", "https://10.0.0.7/v1"),
             ("::5", "https://[2001:db8::5]/v1"),
         ] {

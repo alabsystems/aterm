@@ -8,25 +8,34 @@ use super::Repair;
 use crate::{Error, Result};
 use astream_wire::sync::Actor;
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     ops::{Deref, DerefMut},
-    sync::Mutex,
+    sync::{Condvar, Mutex},
+    time::Instant,
 };
 
 const CAPACITY: usize = 64;
 
 #[derive(Default)]
 struct Pool {
-    active: BTreeSet<Actor>,
+    active: BTreeMap<Actor, bool>,
     idle: VecDeque<(Actor, Repair)>,
 }
 
 /// One endpoint, hence one pinned trust context. Oldest idle hints are evicted
 /// at capacity; a live lease is never evicted or shared by competing rounds.
 #[derive(Default)]
-pub(super) struct Cache(Mutex<Pool>);
+pub(super) struct Cache(Mutex<Pool>, Condvar);
 
 impl Cache {
+    pub(super) fn acquire<'a>(&'a self, actor: Actor, repair: &'a mut Repair) -> Result<Lease<'a>> {
+        self.acquire_on(actor, repair, false, Instant::now())
+    }
+
+    /// Only competing authenticated channels use the preference. A lone
+    /// channel in either direction always proceeds. Both endpoints derive the
+    /// same preferred physical channel from their authenticated actor ordering.
+    /// Waiting releases the cache mutex and holds no journal or network guard.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -51,12 +60,49 @@ impl Cache {
             project = "aterm_db::control::peers::tests::cache_transition"
         )
     )]
-    pub(super) fn acquire<'a>(&'a self, actor: Actor, repair: &'a mut Repair) -> Result<Lease<'a>> {
+    pub(super) fn acquire_on<'a>(
+        &'a self,
+        actor: Actor,
+        repair: &'a mut Repair,
+        preferred: bool,
+        deadline: Instant,
+    ) -> Result<Lease<'a>> {
+        self.acquire_on_with(actor, repair, preferred, deadline, || {
+            #[cfg(test)]
+            super::tests::peer_cache_stage(super::tests::PeerCacheStage::Waiting);
+        })
+    }
+
+    fn acquire_on_with<'a>(
+        &'a self,
+        actor: Actor,
+        repair: &'a mut Repair,
+        preferred: bool,
+        deadline: Instant,
+        mut waiting: impl FnMut(),
+    ) -> Result<Lease<'a>> {
         let mut pool = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
-        if pool.active.contains(&actor) {
-            return Err(Error::new(
-                "Commons peer already has an active repair round",
-            ));
+        while let Some(active_preferred) = pool.active.get(&actor) {
+            if !preferred || *active_preferred {
+                return Err(Error::new(
+                    "Commons peer already has an active repair round",
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::new(
+                    "Commons preferred repair waited until its exchange deadline",
+                ));
+            }
+            waiting();
+            // In crossed dials the other endpoint rejects its nonpreferred
+            // contender, closing this active round's socket. Its ordinary
+            // completion releases the lease; no channel is forcibly revoked.
+            let (next, _) = self
+                .1
+                .wait_timeout(pool, remaining)
+                .unwrap_or_else(|poison| poison.into_inner());
+            pool = next;
         }
         if let Some(index) = pool.idle.iter().position(|(id, _)| *id == actor) {
             let (_, saved) = pool.idle.remove(index).unwrap();
@@ -65,7 +111,7 @@ impl Cache {
         {
             return Err(Error::new("Commons peer repair capacity is busy"));
         }
-        pool.active.insert(actor);
+        pool.active.insert(actor, preferred);
         Ok(Lease {
             cache: self,
             actor,
@@ -134,6 +180,8 @@ impl Lease<'_> {
             .unwrap_or_else(|poison| poison.into_inner());
         pool.active.remove(&self.actor);
         pool.idle.push_back((self.actor, saved));
+        drop(pool);
+        self.cache.1.notify_all();
     }
 }
 

@@ -6,6 +6,7 @@
 //! [`OutputStreak::note_output_cells`](crate::output_streak::OutputStreak::note_output_cells),
 //! [`OutputStreak::rebase`](crate::output_streak::OutputStreak::rebase),
 //! [`ECHO_DISCOUNT_MS`](crate::output_streak::ECHO_DISCOUNT_MS),
+//! [`UNWATCHED_MS`](crate::output_streak::UNWATCHED_MS),
 //! [`TypingMomentum`](crate::typing_momentum::TypingMomentum),
 //! [`SPAWN_MIN_GAP_MS`](crate::output_streak::SPAWN_MIN_GAP_MS),
 //! [`MAX_COMETS`](crate::output_streak::MAX_COMETS),
@@ -43,6 +44,12 @@ pub const SOUND_MIN_GAP_MS: u64 = 1_500;
 pub const COMET_MS_MIN: u32 = 420;
 /// Upper end of the sweep band (see [`COMET_MS_MIN`]).
 pub const COMET_MS_MAX: u32 = 900;
+
+/// Output a frame first sees longer than this after the screen drew it mints nothing: a watched
+/// comet minted at its arrival would already have finished its longest sweep
+/// ([`COMET_MS_MAX`]), so the light would date a landing nobody watched to the frame that
+/// shows it (an occluded window's first frame back, a headless capture).
+pub const UNWATCHED_MS: u64 = COMET_MS_MAX as u64;
 
 /// Tail length band in cells.
 pub const TAIL_MIN: u16 = 4;
@@ -184,8 +191,8 @@ struct Comet {
     to_col: i32,
     /// Sweep progress `0..=1`.
     progress: f32,
-    /// Seconds the whole sweep takes.
-    dur_s: f32,
+    /// Reciprocal of sweep duration (`1.0 / dur_s`).
+    inv_dur_s: f32,
     tail: u16,
     /// Spectrum entry phase `0..1`.
     hue: f32,
@@ -288,6 +295,8 @@ pub struct OutputStreak {
     observed_viewport: Option<(usize, usize)>,
     /// Last accepted editor-input stamp, for the echo discount.
     last_key: Option<Instant>,
+    /// When the screen last changed, as the host's terminal clocked it ([`Self::note_drawn_at`]).
+    drawn_at: Option<Instant>,
     /// Newest licensed span awaiting a spawn decision.
     pending: Option<Pending>,
     /// Stamp of the last licensed output (drives the ribbon and the idle drain).
@@ -328,6 +337,7 @@ impl OutputStreak {
             observed_rows: Vec::new(),
             observed_viewport: None,
             last_key: None,
+            drawn_at: None,
             pending: None,
             last_output: None,
             last_spawn: None,
@@ -421,6 +431,16 @@ impl OutputStreak {
         self.last_key = Some(now);
     }
 
+    /// When the screen the next observation reads last changed (the host terminal's
+    /// `drawn_at`), or `None` when the host cannot say: output older than [`UNWATCHED_MS`] at
+    /// that observation mints nothing. A host stamps it only on the clock its frames' `now`
+    /// reads (the native window's; the page pipeline's injected clock is not the parse's, so it
+    /// stamps nothing).
+    #[inline]
+    pub const fn note_drawn_at(&mut self, drawn_at: Option<Instant>) {
+        self.drawn_at = drawn_at;
+    }
+
     /// A submitted turn boundary at `now`.
     #[inline]
     pub fn note_turn_boundary(&mut self, now: Instant) {
@@ -449,7 +469,7 @@ impl OutputStreak {
         let Some(&(row, left, right)) = spans.last() else {
             return false;
         };
-        if input_hot || self.within_echo_window(now) {
+        if input_hot || self.within_echo_window(now) || self.unwatched(now) {
             return false;
         }
         self.momentum.advance(now);
@@ -488,6 +508,7 @@ impl OutputStreak {
         let span = if !baseline
             && !input_hot
             && !self.within_echo_window(now)
+            && !self.unwatched(now)
             && let Some(row) = visible.get(anchor_row)
         {
             let old_anchor = &self.observed_rows[anchor_row];
@@ -546,12 +567,7 @@ impl OutputStreak {
             let old = &mut self.observed_rows[r];
             let row = &visible[r];
             old.clear();
-            old.reserve(row.len());
-            let mut c = 0;
-            while c < row.len() {
-                old.push(ObservedGlyph::of(&row[c]));
-                c += 1;
-            }
+            old.extend(row.iter().map(ObservedGlyph::of));
             r += 1;
         }
         if baseline {
@@ -660,6 +676,16 @@ impl OutputStreak {
         )
     }
 
+    /// Whether the screen this observation reads was drawn longer than [`UNWATCHED_MS`] before
+    /// `now`: a landing no frame watched.
+    #[inline]
+    fn unwatched(&self, now: Instant) -> bool {
+        matches!(
+            self.drawn_at,
+            Some(at) if now.saturating_duration_since(at) > Duration::from_millis(UNWATCHED_MS)
+        )
+    }
+
     /// Advance one frame at `now` and append this frame's light to `out`.
     #[inline]
     pub fn tick(
@@ -698,6 +724,11 @@ impl OutputStreak {
             self.last_output = None;
             self.drawing = false;
             return StreakFrame { fp: 0, cue };
+        }
+
+        if self.pending.is_none() && self.no_comets() && self.ribbon.is_none() && !self.in_episode {
+            self.drawing = false;
+            return StreakFrame::default();
         }
 
         let m = self.momentum.value(now);
@@ -769,7 +800,7 @@ impl OutputStreak {
             from_col,
             to_col,
             progress: 0.0,
-            dur_s: dur_ms as f32 / 1000.0,
+            inv_dur_s: 1000.0 / (dur_ms.max(1) as f32),
             tail: tail.min(cfg.tail.clamp(TAIL_MIN, TAIL_MAX)),
             hue,
         });
@@ -851,10 +882,11 @@ impl OutputStreak {
     /// decides where the comet's head enters the arc; the genome jitters within that stop.
     #[inline]
     const fn hue_for(&self, pending: Pending, cfg: &StreakConfig) -> f32 {
+        const INV_255_X2: f32 = 2.0 / 255.0;
         let named = nearest_spectrum_stop_by_hue(cfg.theme_cursor);
         let anchor = spectrum_stop_position(named);
         let key = genome::mix(self.seed ^ (pending.row as u64));
-        let jitter = (genome::field(key, 0, 8) as f32 / 255.0 * 2.0 - 1.0)
+        let jitter = (genome::field(key, 0, 8) as f32 * INV_255_X2 - 1.0)
             * spectrum_stop_jitter_radius(named);
         (anchor + jitter).clamp(0.0, 1.0)
     }
@@ -896,7 +928,7 @@ impl OutputStreak {
         let mut i = 0;
         while i < MAX_COMETS {
             if let Some(c) = &mut self.comets[i] {
-                c.progress += dt / c.dur_s.max(0.001);
+                c.progress += dt * c.inv_dur_s;
                 if c.progress >= 1.0 {
                     self.comets[i] = None;
                 }
@@ -925,6 +957,9 @@ impl OutputStreak {
 
     #[inline]
     fn emit(&self, geom: Geom, cfg: &StreakConfig, out: &mut Vec<GlowQuad>) -> u64 {
+        if self.no_comets() && self.ribbon.is_none() {
+            return 0;
+        }
         let peak = (ALPHA_DEFAULT * cfg.intensity.clamp(0.0, 1.0)).min(ALPHA_CLAMP);
         let amp = if cfg.dark_theme { peak } else { peak * 0.5 };
         if amp <= 0.0 {
@@ -933,6 +968,8 @@ impl OutputStreak {
         let before = out.len();
         let mut fp: u64 = 0;
         let ch_i = geom.ch as i32;
+        let max_col = (geom.cols as i32).saturating_sub(1);
+        let amp_255 = amp * 255.0;
 
         let mut ci = 0;
         while ci < MAX_COMETS {
@@ -942,26 +979,32 @@ impl OutputStreak {
             };
             ci += 1;
             let life = 1.0 - c.progress;
-            let head = c.from_col as f32 + (c.to_col - c.from_col) as f32 * c.progress;
-            let tail_f = f32::from(c.tail);
-            let inv_tail_denom = 1.0 / tail_f.max(1.0);
-            let tail_start = (head - tail_f).max(c.from_col as f32);
             let y = i32::from(c.row) * ch_i;
-            let mut col = tail_start.floor() as i32;
-            let col_end = head.round() as i32;
-            while col <= col_end {
-                let u = ((head - col as f32) * inv_tail_denom).clamp(0.0, 1.0);
-                let shape = (1.0 - u) * (1.0 - u);
-                Self::push_cell(
-                    out,
-                    geom,
-                    cfg,
-                    amp,
-                    (y, col),
-                    c.hue + u * HUE_SPAN,
-                    shape * life,
-                );
-                col += 1;
+            if y >= 0 && life > 0.0 {
+                let head = c.from_col as f32 + (c.to_col - c.from_col) as f32 * c.progress;
+                let col_end = (head.round() as i32).min(max_col);
+                let tail_f = f32::from(c.tail);
+                let tail_start = (head - tail_f).max(c.from_col as f32);
+                let mut col = (tail_start.floor() as i32).max(0);
+                if col <= col_end {
+                    let inv_tail_denom = 1.0 / tail_f.max(1.0);
+                    while col <= col_end {
+                        let u = ((head - col as f32) * inv_tail_denom).clamp(0.0, 1.0);
+                        let shape = (1.0 - u) * (1.0 - u) * life;
+                        let a = (amp_255 * shape.clamp(0.0, 1.0)).round() as u8;
+                        if a > 0 {
+                            Self::push_cell_alpha(
+                                out,
+                                geom,
+                                cfg,
+                                (y, col),
+                                c.hue + u * HUE_SPAN,
+                                a,
+                            );
+                        }
+                        col += 1;
+                    }
+                }
             }
             fp = fp
                 .wrapping_mul(1_000_003)
@@ -975,11 +1018,15 @@ impl OutputStreak {
             let hue_step = HUE_SPAN / geom.cols.max(1) as f32;
             let y = i32::from(r.row) * ch_i;
             let shape = 0.55 * fade;
-            let mut col = r.from_col;
-            while col <= r.to_col {
-                let t = r.hue + col as f32 * hue_step;
-                Self::push_cell(out, geom, cfg, amp, (y, col), t, shape);
-                col += 1;
+            let a = (amp_255 * shape.clamp(0.0, 1.0)).round() as u8;
+            if y >= 0 && shape > 0.0 && a > 0 {
+                let mut col = r.from_col.max(0);
+                let col_end = r.to_col.min(max_col);
+                while col <= col_end {
+                    let t = r.hue + col as f32 * hue_step;
+                    Self::push_cell_alpha(out, geom, cfg, (y, col), t, a);
+                    col += 1;
+                }
             }
             fp = fp
                 .wrapping_mul(31)
@@ -995,22 +1042,14 @@ impl OutputStreak {
 
     /// One cell of streak light.
     #[inline]
-    fn push_cell(
+    fn push_cell_alpha(
         out: &mut Vec<GlowQuad>,
         geom: Geom,
         cfg: &StreakConfig,
-        amp: f32,
         (y, col): (i32, i32),
         hue_t: f32,
-        shape: f32,
+        a: u8,
     ) {
-        if y < 0 || col < 0 || shape <= 0.0 {
-            return;
-        }
-        let a = (amp * shape.clamp(0.0, 1.0) * 255.0).round() as u8;
-        if a == 0 {
-            return;
-        }
         let (w, h) = (geom.cw as i32, geom.ch as i32);
         let base = spectrum(hue_t - hue_t.floor());
         let x = col * w;
@@ -1123,24 +1162,31 @@ const fn spectrum_stop_jitter_radius(index: usize) -> f32 {
 /// A colour's circular HSV hue turn (`0..1`).
 #[inline]
 const fn hue_position_of(rgb: u32) -> f32 {
-    let r = ((rgb >> 16) & 0xff) as f32 / 255.0;
-    let g = ((rgb >> 8) & 0xff) as f32 / 255.0;
-    let b = (rgb & 0xff) as f32 / 255.0;
+    let r_b = (rgb >> 16) & 0xff;
+    let g_b = (rgb >> 8) & 0xff;
+    let b_b = rgb & 0xff;
+    if r_b == g_b && g_b == b_b {
+        return 0.0;
+    }
+    let r = r_b as f32 * (1.0 / 255.0);
+    let g = g_b as f32 * (1.0 / 255.0);
+    let b = b_b as f32 * (1.0 / 255.0);
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     let d = max - min;
     if d <= f32::EPSILON {
         return 0.0;
     }
+    let inv_d = 1.0 / d;
     let h = if max == r {
-        let raw = (g - b) / d;
+        let raw = (g - b) * inv_d;
         if raw < 0.0 { raw + 6.0 } else { raw }
     } else if max == g {
-        (b - r) / d + 2.0
+        (b - r) * inv_d + 2.0
     } else {
-        (r - g) / d + 4.0
+        (r - g) * inv_d + 4.0
     };
-    let turn = h / 6.0;
+    let turn = h * (1.0 / 6.0);
     if turn >= 1.0 { turn - 1.0 } else { turn }
 }
 

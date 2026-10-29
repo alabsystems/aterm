@@ -193,7 +193,20 @@ fn a_press_refused_or_warned_input_unread_reads_status_before_it_presses_again()
             .iter()
             .position(|r| r.starts_with("text --json"))
             .expect("the next look's read");
-        assert_eq!(after.get(read_at + 1), Some(&"status"), "{tag}: {after:#?}");
+        // A press taken queues its act, which the wait for the box to leave sends first (fix E3).
+        let want: &[&str] = if refused {
+            &["status"]
+        } else {
+            &[
+                "mark - act word=approve rule=read-only.classify-v10",
+                "status",
+            ]
+        };
+        assert_eq!(
+            after.get(read_at + 1..read_at + 1 + want.len()),
+            Some(want),
+            "{tag}: {after:#?}"
+        );
         assert!(
             journal.iter().any(|l| l.starts_with("FROZEN")),
             "{tag}: {journal:#?}"
@@ -290,9 +303,15 @@ fn a_continuation_warned_input_unread_reads_status_at_the_next_look() {
     assert_eq!(writes(&m).len(), 1, "one turn: {:#?}", m.requests);
     let after = after_turn(&m);
     assert_eq!(
-        after.first().map(String::as_str),
-        Some("status"),
-        "the warned turn's wait reads status first: {after:#?}"
+        after.get(..2),
+        Some(
+            &[
+                "mark - act word=continue rule=continue.v1".to_string(),
+                "status".to_string()
+            ][..]
+        ),
+        "the turn's act reaches the session log as the wait starts (fix E3), and the warned \
+         turn's wait reads status first: {after:#?}"
     );
     assert!(
         journal.iter().any(|l| l.starts_with("FROZEN")),

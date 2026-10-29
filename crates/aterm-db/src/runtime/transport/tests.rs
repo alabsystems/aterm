@@ -169,8 +169,13 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
         dial: Instant::now(),
         rotate: Instant::now() + Duration::from_secs(300),
         scope: Scope::Loopback,
+        port: 0,
         contacts: Vec::new(),
+        completed: VecDeque::new(),
         failed: false,
+        bound: false,
+        stand_in: None,
+        permission: None,
         observed: std::collections::BTreeMap::new(),
     };
     let control = transport.workers[0].channel.clone();
@@ -239,7 +244,7 @@ fn repeated_listener_restarts_do_not_pin_failed_verified_discovery_ports() {
             Repair::default(),
         )
         .unwrap();
-        let (_, repair, success) = client.task.join().unwrap();
+        let (_, repair, success, _) = client.task.join().unwrap();
         assert!(server.task.join().unwrap().2);
         assert!(success);
         hints.finish(address, repair, success, now);
@@ -261,7 +266,7 @@ fn repeated_listener_restarts_do_not_pin_failed_verified_discovery_ports() {
             repair,
         )
         .unwrap();
-        let (_, repair, success) = client.task.join().unwrap();
+        let (_, repair, success, _) = client.task.join().unwrap();
         assert!(!success);
         hints.finish(address, repair, success, retry);
     }
@@ -294,6 +299,27 @@ fn repeated_listener_restarts_do_not_pin_failed_verified_discovery_ports() {
 fn loopback(endpoint: Arc<Endpoint>, port: u16, token: [u8; 32]) -> Transport {
     loopback_mode(Some(endpoint), port, token)
 }
+
+#[test]
+fn completed_round_metadata_is_bounded_and_discloses_every_eviction() {
+    let mut transport = Transport::isolated(None, 0, None).unwrap();
+    for _ in 0..100 {
+        transport.retain_report(RepairRound::panicked(None));
+    }
+    let reports: Vec<_> = transport.reports().collect();
+    assert_eq!(reports.len(), 64);
+    assert_eq!(
+        reports
+            .iter()
+            .map(|report| report.dropped_before)
+            .sum::<usize>(),
+        36
+    );
+    assert!(transport.reports().next().is_none());
+    let error = bounded_error("λ".repeat(1000));
+    assert!(error.len() <= 512);
+    assert!(error.ends_with('…'));
+}
 fn loopback_mode(endpoint: Option<Arc<Endpoint>>, port: u16, token: [u8; 32]) -> Transport {
     let listener = if endpoint
         .as_ref()
@@ -311,6 +337,7 @@ fn loopback_mode(endpoint: Option<Arc<Endpoint>>, port: u16, token: [u8; 32]) ->
             source: Ipv4Addr::LOCALHOST.into(),
             listener,
             hints,
+            permission: None,
         }],
         hints: Hints::new(token),
         workers: vec![],
@@ -318,8 +345,13 @@ fn loopback_mode(endpoint: Option<Arc<Endpoint>>, port: u16, token: [u8; 32]) ->
         dial: now,
         rotate: now + Duration::from_secs(300),
         scope: Scope::Loopback,
+        port,
         contacts: Vec::new(),
+        completed: VecDeque::new(),
         failed: false,
+        bound: false,
+        stand_in: None,
+        permission: None,
         observed: std::collections::BTreeMap::new(),
     }
 }
@@ -463,6 +495,145 @@ fn converge(
 }
 
 #[test]
+fn authenticated_transport_contacts_become_unconfirmed_retained_network_history() {
+    use crate::{
+        catalog::Directory,
+        network_state::{ObservationHandle, Observer, read_history},
+        table::{Session, store::Store},
+    };
+    use aterm_secrets::commons::roster::Role;
+    use aterm_types::network_state::{HistoryState, Reachability, Visibility};
+
+    let lab = crate::table::tests::Lab::new(&[Role::Writer, Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    let remote = lab.bootstrap(1);
+    let expected = super::super::machine_identity(remote.request().unwrap().binding());
+    let directory = Directory::new(&lab.paths[0], bootstrap.trust());
+    let session = Session::open(&bootstrap).unwrap();
+    let scope = directory
+        .open_application(&session, "accounts", "proposals", 1)
+        .unwrap();
+    Store::open(&session, &directory.path(scope).unwrap(), scope)
+        .unwrap()
+        .commit_catalog(&session, b"contact observation")
+        .unwrap();
+    drop(session);
+    let endpoint = |n| {
+        Arc::new(
+            Endpoint::from_bootstrap(&lab.bootstrap(n))
+                .unwrap()
+                .unwrap()
+                .with_commons(lab.paths[n].clone(), lab.paths[n].home.join("config"))
+                .unwrap(),
+        )
+    };
+    let mut a = loopback(endpoint(0), 0, [81; 32]);
+    let port = a.links[0].hints.port();
+    let mut b = loopback(endpoint(1), port, [82; 32]);
+    converge(
+        &mut a,
+        &mut b,
+        scope.digest(),
+        1,
+        "authenticated observer contact",
+    );
+    let until = Instant::now() + Duration::from_secs(60);
+    while !a.workers.is_empty() || !b.workers.is_empty() {
+        a.tick(Instant::now()).unwrap();
+        b.tick(Instant::now()).unwrap();
+        assert!(
+            Instant::now() < until,
+            "authenticated exchanges did not finish"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    let contacts = a.take_contacts();
+    assert!(
+        contacts
+            .iter()
+            .any(|(actor, _, _)| *actor == remote.request().unwrap().binding().actor())
+    );
+    let (actor, at, said) = contacts.into_iter().max_by_key(|(_, at, _)| *at).unwrap();
+    assert_eq!(actor, remote.request().unwrap().binding().actor());
+    // The completed round traded signed versions (C26).
+    assert_eq!(
+        said,
+        aterm_secrets::commons::hearing::Said::Version(
+            aterm_secrets::commons::hearing::Version::own()
+        )
+    );
+    let contact = (actor, at);
+    // Drive freshness from the real exchange's timestamp, not test execution speed.
+    let at = contact.1;
+    let wall = 100_000;
+
+    let config = lab.paths[0].home.join("network-contact-test.toml");
+    let published = ObservationHandle::default();
+    let mut observer = Observer::open(&config, published.clone()).unwrap();
+    observer
+        .local(
+            super::super::machine_identity(bootstrap.request().unwrap().binding()),
+            bootstrap.trust(),
+        )
+        .unwrap();
+    super::super::observe_contacts(&bootstrap, &mut observer, vec![([0xff; 48], at)], || {
+        (wall, at)
+    });
+    observer.observe(
+        Visibility::Active,
+        0,
+        "Authenticated test observation",
+        wall,
+        at,
+    );
+    assert!(published.snapshot().peers.is_empty());
+    super::super::observe_contacts(&bootstrap, &mut observer, vec![contact], || (wall, at));
+    observer.observe(
+        Visibility::Active,
+        0,
+        "Authenticated test observation",
+        wall,
+        at,
+    );
+    let live = published.snapshot();
+    assert_eq!(live.peers.len(), 1);
+    assert_eq!(live.peers[0].identity, expected);
+    assert_eq!(live.peers[0].reachability, Reachability::Reachable);
+    let slot = live.peers[0].slot;
+    let last_contact = live.peers[0].last_seen_ms;
+    assert_eq!(last_contact, wall);
+
+    drop(b);
+    drop(a);
+    observer.observe(
+        Visibility::Offline,
+        0,
+        "Transport stopped",
+        wall + 16_000,
+        at + Duration::from_secs(16),
+    );
+    let offline = published.snapshot();
+    assert_ne!(offline.peers[0].reachability, Reachability::Reachable);
+    assert_eq!(offline.peers[0].last_seen_ms, last_contact);
+    drop(observer);
+    let retained = read_history(&config).unwrap();
+    assert_eq!(retained.history, HistoryState::Ready);
+    assert_eq!(retained.peers[0].identity, expected);
+    assert_eq!(retained.peers[0].slot, slot);
+    assert_eq!(retained.peers[0].last_seen_ms, last_contact);
+    assert_eq!(retained.peers[0].reachability, Reachability::Unknown);
+    assert_eq!(retained.peers[0].last_checked_ms, None);
+    let reopened = Observer::open(&config, published.clone()).unwrap();
+    let restored = published.snapshot();
+    assert_eq!(restored.observer, None);
+    assert_eq!(restored.peers[0].identity, expected);
+    assert_eq!(restored.peers[0].slot, slot);
+    assert_eq!(restored.peers[0].last_seen_ms, last_contact);
+    assert_eq!(restored.peers[0].reachability, Reachability::Unknown);
+    drop(reopened);
+}
+
+#[test]
 fn discovered_commons_tables_repair_without_a_peer_list_and_rejoin_after_offline_writes() {
     use crate::{
         catalog::Directory,
@@ -574,7 +745,7 @@ fn native_discovery_repairs_two_replicas_and_an_offline_replica_rejoins() {
     assert!(
         a.take_contacts()
             .iter()
-            .any(|(actor, _)| actor[32..] == [4; 16]),
+            .any(|(actor, _, _)| actor[32..] == [4; 16]),
         "completed authenticated exchanges, not beacon addresses, feed the observer"
     );
     drop(b);
@@ -639,6 +810,206 @@ fn failed_discovery_link_does_not_withdraw_the_healthy_listener() {
 }
 
 #[test]
+fn failed_transport_observation_replaces_the_active_reason_and_retains_history() {
+    use super::super::{ObservationMode, observe_transport};
+    use crate::network_state::{ObservationHandle, Observer};
+    use aterm_types::network_state::{MachineIdentity, Reachability, Visibility};
+
+    let root = aterm_tempfile::tempdir().unwrap();
+    let handle = ObservationHandle::default();
+    let mut observer = Observer::open(&root.path().join("config"), handle.clone()).unwrap();
+    let identity = MachineIdentity {
+        machine_id: [23; 16],
+        incarnation: [7; 16],
+        label: None,
+    };
+    let contact_ms = aterm_time::unix_millis().unwrap();
+    observer.contact(identity.clone(), contact_ms, Instant::now());
+    let mut transport = loopback_mode(None, 0, [3; 32]);
+    let modes = [
+        ObservationMode::Repair,
+        ObservationMode::Enrollment,
+        ObservationMode::Discovery,
+    ];
+    let active: Vec<_> = modes
+        .iter()
+        .map(|mode| {
+            observe_transport(&mut observer, &transport, *mode, false);
+            let state = handle.snapshot();
+            assert_eq!(state.visibility, Visibility::Active);
+            state.detail
+        })
+        .collect();
+    transport.links[0].hints.withdraw();
+    transport.tick(Instant::now()).unwrap();
+    assert!(transport.unavailable());
+    let unavailable: Vec<_> = modes
+        .iter()
+        .enumerate()
+        .map(|(index, mode)| {
+            observe_transport(&mut observer, &transport, *mode, false);
+            let state = handle.snapshot();
+            assert_eq!(state.visibility, Visibility::Unavailable);
+            assert!(!state.detail.is_empty());
+            assert_ne!(state.detail, active[index]);
+            assert_eq!(state.peers[0].identity, identity);
+            assert_eq!(state.peers[0].last_seen_ms, contact_ms);
+            assert_eq!(state.peers[0].reachability, Reachability::Unknown);
+            observe_transport(&mut observer, &transport, *mode, true);
+            let refused = handle.snapshot();
+            assert_eq!(
+                refused.visibility,
+                Visibility::Unavailable,
+                "a heard refusal"
+            );
+            assert!(
+                refused.detail.starts_with(super::super::LAN_REFUSED),
+                "failed links with a refusal heard: {}",
+                refused.detail
+            );
+            assert_eq!(refused.peers[0].identity, identity);
+            state.detail
+        })
+        .collect();
+    assert!(unavailable.windows(2).all(|pair| pair[0] != pair[1]));
+    transport.refresh(&[]);
+    assert!(!transport.unavailable());
+    for (index, mode) in modes.iter().enumerate() {
+        observe_transport(&mut observer, &transport, *mode, false);
+        let state = handle.snapshot();
+        assert_eq!(state.visibility, Visibility::Offline);
+        assert_ne!(state.detail, active[index]);
+        assert_ne!(state.detail, unavailable[index]);
+        assert_eq!(state.peers[0].identity, identity);
+        assert_eq!(state.peers[0].last_seen_ms, contact_ms);
+        observe_transport(&mut observer, &transport, *mode, true);
+        let heard = handle.snapshot();
+        assert_eq!(heard.visibility, Visibility::Offline, "a heard refusal");
+        assert_eq!(
+            heard.detail, state.detail,
+            "with no address, no usable interface is the cause, whatever the records heard"
+        );
+    }
+}
+
+/// The OS refuses an app the LAN by failing its sends (EHOSTUNREACH) while its sockets bind. Once
+/// the person turns aterm off, the link's next beacon fails and the link is dropped; each poll's
+/// refresh binds it again, and it fails its first beacon there, so between a refresh and the next
+/// tick it never reads as a usable interface. A refused transport stays Unavailable through every
+/// poll, saying the refusal its records hear, and a retained peer's presence history takes no
+/// sample from it. Once the OS allows the sends again, the next refresh opens the link.
+#[test]
+fn a_refused_link_never_reads_active_between_its_refresh_and_its_send() {
+    use super::super::{LAN_REFUSED, ObservationMode, TICK, observe_transport};
+    use crate::network_state::{ObservationHandle, Observer};
+    use aterm_types::network_state::{MachineIdentity, Visibility};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let permission = Arc::new(AtomicBool::new(true));
+    let mut transport = Transport::isolated(None, 0, Some(permission.clone())).unwrap();
+    assert_eq!(
+        transport.interfaces(),
+        1,
+        "allowed: its first beacon went out"
+    );
+    let root = aterm_tempfile::tempdir().unwrap();
+    let handle = ObservationHandle::default();
+    let mut observer = Observer::open(&root.path().join("config"), handle.clone()).unwrap();
+    let identity = MachineIdentity {
+        machine_id: [29; 16],
+        incarnation: [5; 16],
+        label: None,
+    };
+    observer.contact(identity, aterm_time::unix_millis().unwrap(), Instant::now());
+    permission.store(false, Ordering::Release);
+    transport.tick(Instant::now() + BEACON).unwrap();
+    assert!(transport.unavailable(), "its next beacon refused");
+    observe_transport(&mut observer, &transport, ObservationMode::Discovery, true);
+    let samples = handle.snapshot().peers[0].samples.clone();
+    let loopback = [SocketAddr::from((Ipv4Addr::LOCALHOST, 0))];
+    for poll in 0..3 {
+        // As the owner's loop runs a poll: `now` first, then the refresh, then the ticks.
+        let now = Instant::now();
+        transport.refresh(&loopback);
+        for tick in 0..2 {
+            transport.tick(now + TICK * tick).unwrap();
+            observe_transport(&mut observer, &transport, ObservationMode::Discovery, true);
+            let state = handle.snapshot();
+            assert_eq!(
+                state.visibility,
+                Visibility::Unavailable,
+                "poll {poll}, tick {tick}: {}",
+                state.detail
+            );
+            assert!(state.detail.starts_with(LAN_REFUSED), "{}", state.detail);
+            assert_eq!(
+                state.peers[0].samples, samples,
+                "poll {poll}, tick {tick}: no presence sample"
+            );
+        }
+    }
+    permission.store(true, Ordering::Release);
+    let now = Instant::now();
+    transport.refresh(&loopback);
+    transport.tick(now).unwrap();
+    assert_eq!(
+        transport.interfaces(),
+        1,
+        "allowed: the next refresh opens it"
+    );
+    observe_transport(&mut observer, &transport, ObservationMode::Discovery, true);
+    assert_eq!(handle.snapshot().visibility, Visibility::Active);
+}
+
+/// Peers a repairing transport heard before the OS refused it the LAN mid-session (the person
+/// turned aterm off in System Settings) do not hide that refusal: with no link left nothing is
+/// heard now, and with no link to dial them the transport keeps their hints for good. From its
+/// first failed beacon on, through every later poll, its observation says the refusal its records
+/// hear.
+#[test]
+fn a_refusal_made_mid_session_is_said_whatever_peers_were_heard_before_it() {
+    use super::super::{LAN_REFUSED, ObservationMode, POLL, observe_transport};
+    use crate::network_state::{ObservationHandle, Observer};
+    use aterm_types::network_state::Visibility;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let lab = Lab::new();
+    let permission = Arc::new(AtomicBool::new(true));
+    let mut transport = Transport::unopened(None, Scope::Loopback, 0).unwrap();
+    transport.endpoint = Some(lab.endpoints[0].clone());
+    transport.permission = Some(permission.clone());
+    let loopback = [SocketAddr::from((Ipv4Addr::LOCALHOST, 0))];
+    transport.refresh(&loopback);
+    assert_eq!(transport.interfaces(), 1, "allowed: its link opened");
+    let now = Instant::now();
+    transport.hints.observe(
+        &Hints::new([9; 32]).wire(1234),
+        "127.0.0.1:1".parse().unwrap(),
+        now,
+    );
+    assert_eq!(transport.peers(), 1, "a peer heard while allowed");
+    let root = aterm_tempfile::tempdir().unwrap();
+    let handle = ObservationHandle::default();
+    let mut observer = Observer::open(&root.path().join("config"), handle.clone()).unwrap();
+    permission.store(false, Ordering::Release);
+    transport.tick(now + BEACON).unwrap();
+    assert!(transport.unavailable(), "its next beacon refused");
+    assert_eq!(transport.peers(), 1, "the hint outlives the link");
+    for poll in 0..4u32 {
+        // Past every hint's expiry by the last poll.
+        let at = now + BEACON + POLL * poll + Duration::from_secs(300) * poll;
+        if poll > 0 {
+            transport.refresh(&loopback);
+            transport.tick(at).unwrap();
+        }
+        observe_transport(&mut observer, &transport, ObservationMode::Repair, true);
+        let state = handle.snapshot();
+        assert_eq!(state.visibility, Visibility::Unavailable, "poll {poll}");
+        assert_eq!(state.detail, LAN_REFUSED, "poll {poll}");
+    }
+}
+
+#[test]
 fn panicked_worker_releases_the_hint_slot_for_retry() {
     let lab = Lab::new();
     let mut transport = loopback(lab.endpoints[0].clone(), 0, [1; 32]);
@@ -667,4 +1038,18 @@ fn panicked_worker_releases_the_hint_slot_for_retry() {
             .next(now + Duration::from_secs(10))
             .is_some()
     );
+}
+
+/// A bind that failed once its socket was made is a LAN use ([`Transport::bound`]): its bind or
+/// join ran, and the OS may have asked its Local Network question there, as when an attachment
+/// changes between the join and its re-check. Its link opens nothing, yet the transport reached
+/// the LAN, so a host that held a dialog slot for that use keeps holding it for the question.
+#[test]
+fn a_bind_that_failed_after_its_socket_reached_the_lan() {
+    // A socket with no address reuse holds the group's port: the join's socket binds and fails.
+    let held = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let transport = Transport::isolated(None, held.local_addr().unwrap().port(), None).unwrap();
+    assert_eq!(transport.interfaces(), 0, "no link opened");
+    assert!(transport.bound(), "its socket was made: a LAN use");
+    drop(held);
 }

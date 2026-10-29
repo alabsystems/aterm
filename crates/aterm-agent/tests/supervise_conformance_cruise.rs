@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 use aterm_agent::harness::repo_work::RepoWork;
 use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::turn_end::{
-    Composer, DONE_CHECK, RULE_API_CUTOFF, RULE_CONTINUE, RULE_DONE_CHECK, TurnEndAction,
-    TurnEndReading, TurnEndState, WaitKind, decide_turn_end, done_check_words, is_answer_rule,
-    open_work_suffix, own_repo_work_suffix,
+    Composer, DONE_CHECK, Outage, RULE_API_CUTOFF, RULE_CONTINUE, RULE_DONE_CHECK, Reach,
+    TurnEndAction, TurnEndReading, TurnEndState, UNREACHABLE_HOLD, WaitKind, decide_turn_end,
+    done_check_words, is_answer_rule, open_work_suffix, own_repo_work_suffix,
 };
 use aterm_agent::supervise::{Autopilot, SupervisorConfig};
 use aterm_models_harness::supervisor_cruise_model;
@@ -74,13 +74,15 @@ fn finding() -> RepoWork {
 /// ending on `said` after [`crate::common::earlier`]'s `earlier` — or on an over-long
 /// reply's wall ([`OVERLONG`]); `over_shell`, the BUSY screen of a turn that ended while a shell it
 /// left runs on; `dirty`, the host's probe finds the session's repository
-/// holds work no remote main has ([`finding`]).
+/// holds work no remote main has ([`finding`]); `reach`, what the host measured of the API's
+/// reach, as the loop reads it there.
 fn point(
     (said, earlier): (&str, usize),
     walled: bool,
     over_shell: bool,
     worked: Option<Duration>,
     dirty: bool,
+    reach: Reach,
 ) -> TurnEndReading {
     TurnEndReading {
         phase: if over_shell { Phase::Busy } else { Phase::Idle },
@@ -127,7 +129,7 @@ fn point(
         conversation: aterm_agent::supervise::policy::turn_end::Conversation::Hostless,
         notice_elsewhere: false,
         reset_clock: None,
-        reach: Default::default(),
+        reach,
         program: aterm_phase::Program::Claude,
         seat: Default::default(),
         account: None,
@@ -151,6 +153,7 @@ fn point(
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::of_found(dirty.then(finding)),
         fact: None,
+        wake: None,
     }
 }
 
@@ -162,6 +165,8 @@ enum Verdict {
     Answer,
     WallAct,
     Wait,
+    /// The measured outage holds the act ([`UNREACHABLE_HOLD`]).
+    Held,
     Nothing,
 }
 
@@ -182,6 +187,15 @@ fn verdict(a: &TurnEndAction) -> Verdict {
             wait: WaitKind::BackOff { .. },
             ..
         } if why.contains("back-off") => Verdict::Wait,
+        TurnEndAction::WaitUntil {
+            why,
+            wait:
+                WaitKind::Outage {
+                    wall: Outage::Connection,
+                    tries: true,
+                },
+            ..
+        } if why == UNREACHABLE_HOLD => Verdict::Held,
         TurnEndAction::Nothing => Verdict::Nothing,
         other => panic!("an act the model has no word for: {other:?}"),
     }
@@ -204,6 +218,9 @@ fn defend_prompt(st: &State, real: &TurnEndState) -> String {
     }
 }
 
+/// The acts a measured outage holds (`down` = 1, `capped` = 0: its cap not yet passed).
+const HELD: [&str; 3] = ["Continue", "Check", "Answer"];
+
 fn expected(m: &Model, st: &State) -> Verdict {
     for (action, word) in [
         ("Continue", Verdict::Continue),
@@ -216,7 +233,12 @@ fn expected(m: &Model, st: &State) -> Verdict {
         }
     }
     if m.action_enabled("BackoffDue", st) {
-        Verdict::Wait
+        return Verdict::Wait;
+    }
+    let mut back = st.clone();
+    back.insert("down", 2);
+    if st["down"] == 1 && HELD.iter().any(|act| m.action_enabled(act, &back)) {
+        Verdict::Held
     } else {
         Verdict::Nothing
     }
@@ -225,7 +247,8 @@ fn expected(m: &Model, st: &State) -> Verdict {
 /// The real side: the decider's state, the loop's clock, and the last words
 /// of the point it stands at (with the [`crate::common::earlier`] words before them, whether
 /// it shows the wall, whether it is the busy screen over a running shell, and
-/// whether the probe finds work in the repository there).
+/// whether the probe finds work in the repository there), and since when the host measured the
+/// API down, while it does.
 #[derive(Clone)]
 struct Real {
     st: TurnEndState,
@@ -235,20 +258,39 @@ struct Real {
     walled: bool,
     over_shell: bool,
     dirty: bool,
+    down: Option<Instant>,
+    /// A decider that ignores the measured outage (the negative control): its readings never
+    /// carry the Down.
+    blind: bool,
 }
 
 impl Real {
-    /// The decision at the point now, the wall's own wait run through (its
-    /// ladder's clock, which the model does not count) — never the short
-    /// back-off's, which the model's `BackoffDue` moves.
-    fn decide(&mut self) -> TurnEndAction {
-        let r = point(
+    /// The reach a point's reading carries.
+    fn reach(&self) -> Reach {
+        match self.down {
+            Some(since) if !self.blind => Reach::Down { since },
+            _ => Reach::Unknown,
+        }
+    }
+
+    /// The point now, as the loop reads it.
+    fn reading(&self, worked: Option<Duration>) -> TurnEndReading {
+        point(
             (self.said, self.earlier),
             self.walled,
             self.over_shell,
-            None,
+            worked,
             self.dirty,
-        );
+            self.reach(),
+        )
+    }
+
+    /// The decision at the point now, the wall's own wait run through (its
+    /// ladder's clock, which the model does not count) — never the short
+    /// back-off's, which the model's `BackoffDue` moves, nor the measured outage's hold, which
+    /// its `NetUp` or `OutageCapDue` ends.
+    fn decide(&mut self) -> TurnEndAction {
+        let r = self.reading(None);
         self.st.observe(&r, self.now);
         let cfg = SupervisorConfig::default();
         for _ in 0..4 {
@@ -280,10 +322,7 @@ impl Real {
         self.walled = walled;
         self.over_shell = false;
         self.dirty = dirty;
-        self.st.observe(
-            &point((said, self.earlier), walled, false, Some(worked), dirty),
-            self.now,
-        );
+        self.st.observe(&self.reading(Some(worked)), self.now);
     }
 
     /// A turn that claimed done while a shell it left runs on: the busy
@@ -296,16 +335,7 @@ impl Real {
         self.walled = false;
         self.over_shell = true;
         self.dirty = false;
-        self.st.observe(
-            &point(
-                (FINISHED_OVER_SHELL, self.earlier),
-                false,
-                true,
-                None,
-                false,
-            ),
-            self.now,
-        );
+        self.st.observe(&self.reading(None), self.now);
         assert_eq!(
             self.st.point_number(),
             before,
@@ -315,13 +345,17 @@ impl Real {
 
     /// The shell ends: the idle screen it leaves, the turn's work as the busy
     /// reads measured it — the claim's point.
+    /// The measured outage's cap passes (`OutageCapDue`): the clock moves to when the hold of
+    /// the outage standing ends (`TurnEndTiming::outage_holds_until`), the reach still Down.
+    fn outage_cap_passes(&mut self) {
+        let since = self.down.expect("an outage stands");
+        self.now = self.now.max(since + self.st.timing.outage_cap);
+    }
+
     fn shell_ends(&mut self) {
         self.now += LONG;
         self.over_shell = false;
-        self.st.observe(
-            &point((self.said, self.earlier), false, false, Some(LONG), false),
-            self.now,
-        );
+        self.st.observe(&self.reading(Some(LONG)), self.now);
     }
 }
 
@@ -335,19 +369,19 @@ fn mirror(action: &str, before: &State, real: &mut Real) {
         "OtherTurnDirtyClaim" | "YieldDirtyClaim" => real.turn(FINISHED, false, LONG, true),
         "OtherTurnClaimBg" | "YieldClaimBg" => real.turn_over_shell(),
         "BackgroundEnds" => real.shell_ends(),
+        "NetDown" => real.down = Some(real.now),
+        "NetUp" => real.down = None,
+        "OutageCapDue" => real.outage_cap_passes(),
         "Continue" | "Check" | "Answer" | "WallAct" => {
             let a = real.decide();
             assert!(
-                !matches!(verdict(&a), Verdict::Nothing | Verdict::Wait),
+                !matches!(
+                    verdict(&a),
+                    Verdict::Nothing | Verdict::Wait | Verdict::Held
+                ),
                 "{action} at {before:?}: {a:?}"
             );
-            let r = point(
-                (real.said, real.earlier),
-                real.walled,
-                false,
-                None,
-                real.dirty,
-            );
+            let r = real.reading(None);
             real.st.acted(&a, &r, real.now);
         }
         "BackoffDue" => real.now += real.st.short_wait().expect("a back-off runs"),
@@ -378,11 +412,10 @@ fn start(base: Instant) -> Real {
         walled: false,
         over_shell: false,
         dirty: false,
+        down: None,
+        blind: false,
     };
-    real.st.observe(
-        &point((PROGRESS, 0), false, false, Some(LONG), false),
-        real.now,
-    );
+    real.st.observe(&real.reading(Some(LONG)), real.now);
     real
 }
 
@@ -470,7 +503,9 @@ fn tier1_the_real_decider_defends_every_claim_and_never_rests() {
             queue.push_back((next, r));
         }
     }
-    for word in ["Continue", "Check", "Answer", "WallAct", "Wait", "Nothing"] {
+    for word in [
+        "Continue", "Check", "Answer", "WallAct", "Wait", "Held", "Nothing",
+    ] {
         assert!(
             verdicts.contains_key(word),
             "{word} never occurred: {verdicts:?}"
@@ -565,6 +600,69 @@ fn tier1_the_buggy_model_is_refuted_by_the_real_decider() {
     let (_, real) = walk(&m, &["OtherTurnClaimBg", "BackgroundEnds"], base);
     assert!(!real.st.task_done());
     assert_eq!(verdict(&real.clone().decide()), Verdict::Check);
+}
+
+/// A MEASURED OUTAGE HOLDS THE ACT AND ITS RETURN OR ITS CAP TYPES IT: where the model's `down`
+/// holds Continue, Check or Answer, the real decider waits on the outage ([`UNREACHABLE_HOLD`]),
+/// and once `NetUp` fires, or `OutageCapDue` with the reach still Down, it types the act it held.
+/// NEGATIVE CONTROLS: the `Buggy = 3` model, which types into the outage before its cap, breaks
+/// NoContinuationIsTypedIntoAMeasuredOutageBeforeItsCap (and nothing else), and a decider whose
+/// readings ignore the Down types the very act the model holds. Run against a decider with no
+/// `outage_hold`, this test and the full walk fail; against one whose hold has no cap (run: the
+/// `outage_cap` passing changes nothing), the cap's leg here and the full walk fail.
+#[test]
+fn tier1_a_measured_outage_holds_the_act_and_its_return_types_it() {
+    let m = supervisor_cruise_model();
+    let mistyped = aterm_spec::interp::with_buggy(&m, 3);
+    assert!(m.mutant_dials().contains(&3), "{:?}", m.mutant_dials());
+    assert_eq!(
+        aterm_spec::interp::violated_invariants(&mistyped),
+        BTreeSet::from(["NoContinuationIsTypedIntoAMeasuredOutageBeforeItsCap"]),
+    );
+    let base = Instant::now() + Duration::from_secs(3600);
+    let asked = ["Tasked", "Continue", "YieldAsk", "NetDown"];
+    for (path, act, word) in [
+        (&["NetDown"][..], "Continue", Verdict::Continue),
+        (&["OtherTurnClaim", "NetDown"][..], "Check", Verdict::Check),
+        (&asked[..], "Answer", Verdict::Answer),
+    ] {
+        let (st, real) = walk(&m, path, base);
+        assert!(!m.action_enabled(act, &st), "{path:?}");
+        assert_eq!(expected(&m, &st), Verdict::Held, "{path:?}");
+        assert_eq!(verdict(&real.clone().decide()), Verdict::Held, "{path:?}");
+        let mut b = st.clone();
+        assert!(mistyped.fire(act, &mut b), "{path:?}");
+        assert!(
+            !mistyped.check_invariant("NoContinuationIsTypedIntoAMeasuredOutageBeforeItsCap", &b),
+            "{path:?}"
+        );
+        let blind = Real {
+            blind: true,
+            ..real.clone()
+        };
+        assert_eq!(
+            verdict(&blind.clone().decide()),
+            word,
+            "a decider blind to the outage types into it: {path:?}"
+        );
+        let back = [path, &["NetUp"][..]].concat();
+        let (st, real) = walk(&m, &back, base);
+        assert!(m.action_enabled(act, &st), "{back:?}");
+        assert_eq!(verdict(&real.clone().decide()), word, "{back:?}");
+        let capped = [path, &["OutageCapDue"][..]].concat();
+        let (st, real) = walk(&m, &capped, base);
+        assert_eq!(st["down"], 1, "{capped:?}");
+        assert!(m.action_enabled(act, &st), "{capped:?}");
+        assert!(
+            matches!(real.reach(), Reach::Down { .. }),
+            "the reach still reads Down: {capped:?}"
+        );
+        assert_eq!(
+            verdict(&real.clone().decide()),
+            word,
+            "the cap's end types the act: {capped:?}"
+        );
+    }
 }
 
 /// The words this bind hands the decider read as the over-long reply the model's wall stands for.

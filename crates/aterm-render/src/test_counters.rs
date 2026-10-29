@@ -66,3 +66,31 @@ pub(crate) fn count_budget_ruling() {
 pub fn take_budget_rulings() -> usize {
     BUDGET_RULINGS.with(|n| n.replace(0))
 }
+
+thread_local! {
+    static WEDGE_SLABS: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(crate) fn count_wedge_slab() {
+    WEDGE_SLABS.with(|n| n.set(n.get() + 1));
+}
+
+/// This thread's ribbon slabs laid as wedges ([`crate::ribbon_wedge_into`])
+/// since the last take, zeroed.
+pub fn take_wedge_slabs() -> usize {
+    WEDGE_SLABS.with(|n| n.replace(0))
+}
+
+thread_local! {
+    static GLASS_SLABS: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(crate) fn count_glass_slab() {
+    GLASS_SLABS.with(|n| n.set(n.get() + 1));
+}
+
+/// This thread's ribbon slabs laid as the light glass ([`crate::ribbon_glass_into`]) since the
+/// last take, zeroed.
+pub fn take_glass_slabs() -> usize {
+    GLASS_SLABS.with(|n| n.replace(0))
+}

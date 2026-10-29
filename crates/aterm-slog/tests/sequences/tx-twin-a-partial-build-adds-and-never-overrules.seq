@@ -1,8 +1,12 @@
 seq v=1 rig=transcript program=claude build=2.1.0
-# Twin of a_partial_build_adds_and_never_overrules (S9).
+# Twin of a_partial_build_adds_and_never_overrules (S9, narrowed by fix E1): a
+# partial build adds at strong, opens the turn the screen missed (t2) and ends
+# or supersedes only a turn it opened itself; it never overrules the screen,
+# which closes its own t1, and never confirms a wall.
 state partial
 bind 0
 see busy
+expect open t1 turn par=r1 src=screen conf=strong
 tx prompt v1
 tx tool c1
 tx result c1
@@ -16,10 +20,12 @@ see idle
 wait 1000
 tx endwall usage-session
 tx prompt v2
+expect open t2 turn par=r1 vref=v2 src=transcript conf=strong
 state on
 see busy
 tx prompt v3
+expect open t3 turn par=r1 vref=v3 src=transcript conf=exact
 tx end
 expect close t1 turn out=done src=screen
-expect close t2 turn out=superseded by=vendor src=transcript
+expect close t2 turn out=superseded by=vendor src=transcript conf=exact
 expect close t3 turn out=done by=vendor src=transcript

@@ -15,6 +15,8 @@
 
 #[cfg(test)]
 aterm_durable::plain_durable_flushes_in_tests!();
+#[cfg(all(test, unix))]
+aterm_secrets::memoized_x25519_in_tests!();
 
 /// The crate's durability flush ([`durable::sync_all`]).
 mod durable;
@@ -25,25 +27,41 @@ use std::io::{Read, Write};
 pub mod ai;
 /// The `aterm drive` CLI, callable in-process.
 pub mod drive_cli;
+/// Swarm census (`aterm fleet census`, `FleetOp::Census`, and `/monitor`'s single-steward read).
+#[cfg(unix)]
+pub mod fleet_census;
 /// The `aterm fleet` CLI, callable in-process.
 pub mod fleet_cli;
+/// Fleet admission as this Mac's membership log says it (F17).
+#[cfg(unix)]
+pub mod fleet_log;
 /// `aterm fleet init|join|peers|allow|leave`: this machine's membership in a fleet.
 #[cfg(unix)]
 mod fleet_member;
+/// `aterm members`: Macs joining ALab and the members that let them in.
+#[cfg(unix)]
+pub mod members_cli;
 /// `aterm ctl survey --fleet | --host`: the fleet's peers; `aterm ctl --host <h> …`: another Mac
 /// driven over it.
 #[cfg(unix)]
 pub use fleet_member::{
-    FleetCheck, FleetSync, check_from_cache, drive_fleet, survey_fleet, sync_from_cache,
+    FleetCheck, FleetSync, FleetSyncError, check_from_cache, drive_fleet, survey_fleet,
+    sync_from_cache, try_sync_from_cache,
 };
 /// The harness core.
 pub mod harness;
+/// The `systems.alab.aterm-node` background job (`aterm node serve | status | on | off`, C20–C23).
+#[cfg(unix)]
+pub mod node_service;
 /// The launcher's half of `aterm --headless --ready-fd <n>`.
 #[cfg(unix)]
 pub mod ready;
 /// The supervisor: the loop the window's own host runs on every agent session, its policy,
 /// command classifier, journal, ledger and tapes.
 pub mod supervise;
+/// Swarm survey facts (C16): host label, window liveness, per-row account health, SSH host-key
+/// fingerprint and vault-server subscriber last-heard records.
+pub mod survey_facts;
 
 /// The verb the one binary answers a control request on: `aterm ctl …`.
 pub const CTL_VERB: &str = "ctl";
@@ -146,7 +164,7 @@ fn is_ok_reply(header: &str) -> bool {
     header == "OK" || header.starts_with("OK ")
 }
 
-fn reply_count(header: &str) -> std::io::Result<Option<usize>> {
+pub(crate) fn reply_count(header: &str) -> std::io::Result<Option<usize>> {
     let Some(token) = header
         .strip_prefix("OK ")
         .and_then(|rest| rest.split_whitespace().next())
@@ -495,11 +513,24 @@ COMMANDS
                        `survey`, …), bare `meta` and `task`, and drive's `phase`,
                        `classify` and `ledger` without `--out` read; `meta set`,
                        `task mark`, `spawn` and `answer` write.
+                       Then refuses what the classifier vets only against a list, as the
+                       harness's rules and a box's `classify` word do: any assignment,
+                       `env`, `export` or `xargs` itself, a `for` or `select` loop, an
+                       unquoted glob in the words of a program off the glob-safe list
+                       (`sort *.txt`; `ls *.txt | sort` is a read), and blanks the
+                       screen may draw otherwise than the shell reads them (a
+                       here-document; a backslash before a tab, a newline or the
+                       line's end, or before a blank that another blank follows or
+                       that ends the line).
                        Then refuses a read of a path the default secret list names
                        (`~/.ssh`, `~/.aws`, `.env`, `*.pem`, `id_rsa*`, `credentials*`,
                        `~/.config/gh`, `~/Library`, …, under this shell's HOME), but not
                        a pattern, a filter or a file `ls`/`wc` only lists or measures:
-                       `not-read-only a read of a secret (<rule>) …`.
+                       `not-read-only a read of a secret (<rule>) …`. A relative path
+                       is read against the line's own `cd` targets (the verb knows no
+                       session's cwd), a glob as any name it may expand to, and
+                       `grep -r`, `rg` or `find -exec` by the trees they descend; a
+                       path built at run time (`\"$VAR\"`, `$(…)`) is refused.
     phase [@sid] [--allow-python GLOB]...
                        Read @sid (default: the active tab) once with its program's reader
                        (`status program=`, else the screen) and print its phase,

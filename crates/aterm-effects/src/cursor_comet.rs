@@ -69,6 +69,9 @@ pub struct CometConfig {
     pub accent: u32,
     /// The ground is dark (the coma is light) or light (the coma is ink under the letters).
     pub dark_theme: bool,
+    /// The frame's light (`docs/design/PRISM-GLASS.md` §15.2 1.3, `GlowConfig::light`): what a
+    /// light arm will read. Off on every dark ground; nothing reads it yet.
+    pub light: crate::cursor_glow::Light,
     /// The theme's text and paper.
     pub theme_fg: u32,
     pub theme_bg: u32,
@@ -111,6 +114,10 @@ pub struct CursorComet {
     light_ink_memo: Option<((u32, u32, u32), u32)>,
     /// Cached `(color, theme_bg, e.to_bits())` fill for the light-page nucleus.
     light_fill_memo: Option<((u32, u32, u32), u32)>,
+    /// Test-only: the coma's rim twinkles four `+` glints, as it did until
+    /// looks10 L9 (its negative control).
+    #[cfg(test)]
+    rim_glints: bool,
 }
 
 impl Default for CursorComet {
@@ -131,6 +138,8 @@ impl CursorComet {
             blaze: 0.0,
             light_ink_memo: None,
             light_fill_memo: None,
+            #[cfg(test)]
+            rim_glints: false,
         }
     }
 
@@ -186,8 +195,17 @@ impl CursorComet {
             + 0.35 * crate::supernova::sin_cos_f32(phase).0
             + 0.15 * crate::supernova::sin_cos_f32(phase * 2.3 + 0.9).0;
 
+        let mut dark_stops = (0u32, 0u32);
         let styled = if cfg.dark_theme {
-            ice_ramp(cfg.color, 0.34 + 0.40 * e + 0.05 * (breathe - 0.5))
+            let dimmed = lerp_rgb(cfg.color, 0x0000_0000, 0.50);
+            let whitened = lerp_rgb(cfg.color, ICE_WHITE, 0.55);
+            dark_stops = (dimmed, whitened);
+            ice_ramp_with(
+                cfg.color,
+                dimmed,
+                whitened,
+                0.34 + 0.40 * e + 0.05 * (breathe - 0.5),
+            )
         } else {
             let key = (
                 cfg.color & 0x00FF_FFFF,
@@ -219,7 +237,7 @@ impl CursorComet {
             && (cc as usize) < geom.cols
         {
             if cfg.dark_theme {
-                self.emit_coma(cr, cc, e, breathe, phase, geom, cfg, out);
+                self.emit_coma(cr, cc, e, breathe, phase, dark_stops, geom, cfg, out);
             } else {
                 self.emit_coma_light(cr, cc, e, breathe, geom, cfg, under);
             }
@@ -292,7 +310,11 @@ impl CursorComet {
         push_ink_ellipse(under, geom, centre, (rx, rx), ch * 0.46, ink, peak, budget);
     }
 
-    /// Emit the coma + rim glints as premultiplied additive quads (dark page).
+    /// Emit the coma as premultiplied additive quads (dark page). Its rim
+    /// twinkled four `+` glints, a grey cross beside the caret in every
+    /// frame of the trail gallery's dark Comet (`split.b0`, `cjk.t0`), a
+    /// star the Sparkle style owns: the coma is round light alone (looks10
+    /// L9).
     #[allow(
         clippy::too_many_arguments,
         reason = "cursor cell + blaze/breathe/phase + geometry/config; one internal call site"
@@ -305,6 +327,7 @@ impl CursorComet {
         e: f32,
         breathe: f32,
         phase: f32,
+        (dimmed, whitened): (u32, u32),
         geom: Geom,
         cfg: &CometConfig,
         out: &mut Vec<GlowQuad>,
@@ -319,8 +342,6 @@ impl CursorComet {
         let cov_core =
             (COV_IDLE + (COV_MAX - COV_IDLE) * e) * cfg.intensity * (0.86 + 0.14 * breathe);
 
-        let dimmed = lerp_rgb(cfg.color, 0x0000_0000, 0.50);
-        let whitened = lerp_rgb(cfg.color, ICE_WHITE, 0.55);
         let mut discs = [(0.0f32, 0.0f32, 0.0f32, 0u32); 4];
         let mut di = 0;
         while di < 4 {
@@ -394,38 +415,48 @@ impl CursorComet {
                 }
                 i += 1;
             }
-            let top = (cy - outer).floor() as i32;
-            let bot = (cy + outer).ceil() as i32;
-            let mut y = cell_y0 - (cell_y0 - top).div_euclid(slab) * slab - slab;
-            while y < bot {
-                let mut h = slab;
-                if y < cell_y1 && y + h > cell_y1 {
-                    h = cell_y1 - y;
+            if ring_premul[3] != 0 {
+                let top = (cy - outer).floor() as i32;
+                let bot = (cy + outer).ceil() as i32;
+                let mut y = cell_y0 - (cell_y0 - top).div_euclid(slab) * slab - slab;
+                while y < bot {
+                    let mut h = slab;
+                    if y < cell_y1 && y + h > cell_y1 {
+                        h = cell_y1 - y;
+                    }
+                    if y + h > top {
+                        let in_band = y >= cell_y0 && y < cell_y1;
+                        ring_row(
+                            &discs,
+                            &ring_premul,
+                            (cx, cy),
+                            (y, h),
+                            (wob_freq, wob_phase),
+                            in_band,
+                            (cell_x0, cell_x1),
+                            geom,
+                            out,
+                        );
+                    }
+                    y += h;
                 }
-                if y + h > top {
-                    let in_band = y >= cell_y0 && y < cell_y1;
-                    ring_row(
-                        &discs,
-                        &ring_premul,
-                        (cx, cy),
-                        (y, h),
-                        (wob_freq, wob_phase),
-                        in_band,
-                        (cell_x0, cell_x1),
-                        geom,
-                        out,
-                    );
-                }
-                y += h;
             }
         }
 
+        #[cfg(test)]
+        let rim_glints = self.rim_glints;
+        #[cfg(not(test))]
+        let rim_glints = false;
+        if !rim_glints {
+            return;
+        }
         const GLINT_TW_PHASES: [f32; GLINTS as usize] = [0.0, 2.4, 4.8, 7.2];
         const INV_GLINT_TW_SPAN: f32 = 1.0 / 0.45;
         let glint_r = radius * 0.72;
         let arm = ((ch * 0.11) as i32).max(1);
         let two_arm_plus_1 = 2 * arm + 1;
         let cov_base = cov_core * (0.35 + 0.65 * e);
+        let cov_scale = cov_base * INV_GLINT_TW_SPAN;
         let phase2 = phase * 2.0;
         let (sin_p, cos_p) = crate::supernova::sin_cos_f32(phase * 0.55);
         let glint_dirs: [(f32, f32); GLINTS as usize] = [
@@ -436,17 +467,18 @@ impl CursorComet {
         ];
         let mut gi = 0;
         while gi < GLINTS as usize {
-            let tw_off = GLINT_TW_PHASES[gi];
-            let (sin_a, cos_a) = glint_dirs[gi];
+            let cur_gi = gi;
             gi += 1;
+            let tw_off = GLINT_TW_PHASES[cur_gi];
             let tw = 0.5 + 0.5 * crate::supernova::sin_cos_f32(phase2 + tw_off).0;
             if tw < 0.55 {
                 continue;
             }
-            let cov = (cov_base * (tw - 0.55) * INV_GLINT_TW_SPAN).min(GLINT_BUDGET) as u8;
+            let cov = ((tw - 0.55) * cov_scale).min(GLINT_BUDGET) as u8;
             if cov == 0 {
                 continue;
             }
+            let (sin_a, cos_a) = glint_dirs[cur_gi];
             let gx = (cx + cos_a * glint_r) as i32;
             let gy = (cy + sin_a * glint_r * 0.9) as i32;
             let spark = premul_rgb(ICE_WHITE, cov);
@@ -494,27 +526,26 @@ fn ring_row(
         return;
     }
     let mut hw = [hw0, 0.0, 0.0, 0.0];
-    let d2_1 = discs[1].1 - ym2;
-    if d2_1 > 0.0 {
-        hw[1] = crate::color_math::sqrt_f32(d2_1) * wob;
-        let d2_2 = discs[2].1 - ym2;
-        if d2_2 > 0.0 {
-            hw[2] = crate::color_math::sqrt_f32(d2_2) * wob;
-            let d2_3 = discs[3].1 - ym2;
-            if d2_3 > 0.0 {
-                hw[3] = crate::color_math::sqrt_f32(d2_3) * wob;
-            }
-        }
-    }
     let cx_round = cx.round() as i32;
     let mut x_edges = [(cx_round, cx_round); 4];
-    let mut i = 0;
-    while i < 4 {
-        let w = hw[i];
-        if w != 0.0 {
-            x_edges[i] = ((cx - w).round() as i32, (cx + w).round() as i32);
+    x_edges[0] = ((cx - hw0).round() as i32, (cx + hw0).round() as i32);
+    let d2_1 = discs[1].1 - ym2;
+    if d2_1 > 0.0 {
+        let w1 = crate::color_math::sqrt_f32(d2_1) * wob;
+        hw[1] = w1;
+        x_edges[1] = ((cx - w1).round() as i32, (cx + w1).round() as i32);
+        let d2_2 = discs[2].1 - ym2;
+        if d2_2 > 0.0 {
+            let w2 = crate::color_math::sqrt_f32(d2_2) * wob;
+            hw[2] = w2;
+            x_edges[2] = ((cx - w2).round() as i32, (cx + w2).round() as i32);
+            let d2_3 = discs[3].1 - ym2;
+            if d2_3 > 0.0 {
+                let w3 = crate::color_math::sqrt_f32(d2_3) * wob;
+                hw[3] = w3;
+                x_edges[3] = ((cx - w3).round() as i32, (cx + w3).round() as i32);
+            }
         }
-        i += 1;
     }
     let mut i = 0;
     while i < discs.len() {
@@ -557,16 +588,6 @@ fn ring_row(
 /// The ice ramp off the trail's base hue, `t` 0 (cold, dim) to 1 (sunlit,
 /// near-white): dimmed hue, pure hue, whitened hue, [`ICE_WHITE`].
 #[inline]
-const fn ice_ramp(color: u32, t: f32) -> u32 {
-    ice_ramp_with(
-        color,
-        lerp_rgb(color, 0x0000_0000, 0.50),
-        lerp_rgb(color, ICE_WHITE, 0.55),
-        t,
-    )
-}
-
-#[inline]
 const fn ice_ramp_with(color: u32, dimmed: u32, whitened: u32, t: f32) -> u32 {
     const INV_045: f32 = 1.0 / 0.45;
     const INV_033: f32 = 1.0 / 0.33;
@@ -602,6 +623,7 @@ mod tests {
     }
     const fn cfg() -> CometConfig {
         CometConfig {
+            light: crate::cursor_glow::Light::OFF,
             enabled: true,
             intensity: 1.0,
             color: 0x009E_D6FF,
@@ -1072,6 +1094,51 @@ mod tests {
         assert!(
             heart_max as f32 > OVER_INK_COV_CAP,
             "control: the stacked heart inside the caret ({heart_max}) exceeds the budget"
+        );
+    }
+
+    /// looks10 L9, THE COMA IS ROUND LIGHT ALONE: through a second and a
+    /// half of a charged caret on a dark page, the coma lays no cross (a bar
+    /// one pixel tall with a stroke one pixel wide standing on it or hanging
+    /// from it inside its span). Negative control: its rim's twinkling
+    /// glints (`rim_glints`), the grey `+` beside the caret in the trail
+    /// gallery's dark Comet, lay crosses.
+    #[test]
+    fn the_coma_twinkles_no_cross() {
+        let g = geom();
+        let crosses = |glints: bool| {
+            let mut nc = CursorComet {
+                rim_glints: glints,
+                ..CursorComet::default()
+            };
+            let t = Instant::now();
+            let mut n = 0usize;
+            for i in 0..90u64 {
+                let mut out = Vec::new();
+                nc.tick(
+                    Some((3, 20)),
+                    t + Duration::from_millis(16 * i),
+                    1.0,
+                    g,
+                    &cfg(),
+                    &mut out,
+                    &mut Vec::new(),
+                );
+                for bar in out.iter().filter(|q| q.h == 1 && q.w >= 3) {
+                    let (x0, x1, y) = (bar.x, bar.x + bar.w, bar.y);
+                    if out.iter().any(|s| {
+                        s.w == 1 && s.x > x0 && s.x + 1 < x1 && (s.y + s.h == y || s.y == y + 1)
+                    }) {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        assert_eq!(crosses(false), 0, "the coma lays a cross");
+        assert!(
+            crosses(true) > 0,
+            "control: the rim's twinkling glints lay no cross"
         );
     }
 

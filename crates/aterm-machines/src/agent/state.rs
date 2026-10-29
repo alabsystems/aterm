@@ -254,30 +254,6 @@ pub fn take_lock(sys: &dyn System, layout: &Layout, run: &str, pid: u32) -> Resu
     Ok(Lock::Taken)
 }
 
-/// Hand the lock for `run` to `pid` (the detached job).
-/// # Errors
-/// One line.
-pub fn hand_lock(sys: &dyn System, layout: &Layout, run: &str, pid: u32) -> Result<(), String> {
-    let start = started(sys, pid);
-    let _guard = guard(sys, layout)?;
-    match holder(sys, layout) {
-        Some(h) if h.run == run => {}
-        other => {
-            return Err(format!(
-                "the run lock names {} instead of run {run}",
-                other.map_or_else(|| "nothing".to_owned(), |h| h.run)
-            ));
-        }
-    }
-    let to = Holder {
-        pid,
-        run: run.to_owned(),
-        start,
-    };
-    sys.write_file(&layout.lock(), to.text().as_bytes(), 0o644)
-        .map_err(|e| format!("{}: {e}", layout.lock().display()))
-}
-
 /// Hand only the exact observed holder to a known, still-uncommitted child.
 /// # Errors
 /// The holder changed, the child lacks a start identity, or the atomic write failed.
@@ -334,16 +310,6 @@ pub(super) fn job_holder(
         return Err("the run lock does not name this exact job process".into());
     }
     Ok(expected)
-}
-
-/// Release the lock if it names `run`.
-pub fn release_lock(sys: &dyn System, layout: &Layout, run: &str) {
-    let Ok(_guard) = guard(sys, layout) else {
-        return;
-    };
-    if holder(sys, layout).is_some_and(|h| h.run == run) {
-        let _ = sys.remove(&layout.lock());
-    }
 }
 
 /// The newest finished run.
@@ -463,14 +429,10 @@ mod tests {
             Lock::Busy { run: "1-1".into() }
         );
         assert_eq!(busy(&fake, &layout()).as_deref(), Some("1-1"));
-        hand_lock(&fake, &layout(), "1-1", 12).unwrap();
+        fake.file("/A/state/run.lock", b"pid=12 run=1-1\n");
         assert_eq!(busy(&fake, &layout()), None);
         assert_eq!(take_lock(&fake, &layout(), "3-3", 13).unwrap(), Lock::Taken);
         assert_eq!(holder(&fake, &layout()).unwrap().run, "3-3");
-        release_lock(&fake, &layout(), "1-1");
-        assert!(holder(&fake, &layout()).is_some());
-        release_lock(&fake, &layout(), "3-3");
-        assert!(holder(&fake, &layout()).is_none());
     }
 
     #[test]
@@ -601,13 +563,6 @@ mod tests {
                 .count()
         });
         assert_eq!(taken, 1);
-    }
-
-    #[test]
-    fn the_lock_is_handed_only_for_its_own_run() {
-        let fake = Fake::root();
-        take_lock(&fake, &layout(), "1-1", 10).unwrap();
-        assert!(hand_lock(&fake, &layout(), "9-9", 11).is_err());
     }
 
     #[test]

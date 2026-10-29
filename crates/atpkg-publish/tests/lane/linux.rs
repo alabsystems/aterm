@@ -195,8 +195,7 @@ fn a_dry_run_sees_every_served_target_and_plans_the_missing_rows() {
         "{ay}"
     );
     assert!(
-        ay.contains("pack aarch64-unknown-linux-gnu,")
-            || ay.contains("pack aarch64-unknown-linux-gnu"),
+        ay.contains("pack aarch64-unknown-linux-gnu") && !ay.contains("x86_64-unknown-linux-gnu"),
         "{ay}"
     );
     let clean = table_row(&tx, "clean");
@@ -436,7 +435,7 @@ fn a_keyed_box_signs_uploads_to_both_owners_and_publishes_the_follow_up_index() 
     let ready = w.ready();
     assert!(
         ready.contains(
-            "Signed and published by this run with the machine key at ~/.aterm/machine.key:"
+            "Signed and published by this run with the machine key at ~/.aterm/release-ring/machine.key:"
         ),
         "{ready}"
     );

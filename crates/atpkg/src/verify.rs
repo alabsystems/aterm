@@ -46,6 +46,16 @@ impl StagedFrom {
 /// The result of verifying one program's active build against its recorded signed root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyOutcome {
+    /// An active development link, whose bytes have no signed store attestation.
+    DevLinked {
+        /// The checkout whose executable tools the shims run.
+        checkout: std::path::PathBuf,
+    },
+    /// A recorded development link could not be read or no longer resolves to its tools.
+    DevLinkUnavailable {
+        /// The read or resolution failure.
+        error: String,
+    },
     /// The recomputed store tree matches the recorded signed `tree_root`.
     Match {
         /// The active build audited.
@@ -65,7 +75,7 @@ pub enum VerifyOutcome {
         /// The active build, if any.
         build: Option<u64>,
     },
-    /// The program has no active build.
+    /// The program has no selected store build or recorded development link.
     NotInstalled,
     /// The on-disk tree could not be read to recompute its root.
     Unreadable {
@@ -114,6 +124,20 @@ impl VerifyOutcome {
 #[must_use]
 pub fn verify_program(layout: &Layout, program: &str) -> VerifyOutcome {
     let active = crate::ops::active_builds(layout).get(program).copied();
+    let store_selected = crate::ops::which(layout, program)
+        .and_then(|path| crate::ops::program_build_of_target(&path))
+        .is_some_and(|(name, build)| name == program && Some(build) == active);
+    match crate::linkmode::live_linked_checkout(layout, program) {
+        Ok(Some(checkout)) => return VerifyOutcome::DevLinked { checkout },
+        Err(error) if !store_selected => {
+            return VerifyOutcome::DevLinkUnavailable {
+                error: error.to_string(),
+            };
+        }
+        // A store shim that actually runs still verifies its store build even if a stale
+        // link marker describes a different selection.
+        Ok(None) | Err(_) => {}
+    }
     let st = crate::status::read(layout);
     let ps = st.as_ref().and_then(|s| s.programs.get(program));
     let recorded_build = ps.and_then(|p| p.installed_build);
@@ -202,15 +226,30 @@ fn verify_vendor_build(layout: &Layout, program: &str, build: u64) -> VerifyOutc
     }
 }
 
-/// Verify every active program on PATH.
+/// Verify active store programs and report development links without signed attestation.
 #[must_use]
 pub fn verify_all(layout: &Layout) -> Vec<(String, VerifyOutcome)> {
-    crate::ops::active_builds(layout)
-        .into_keys()
+    let mut programs: std::collections::BTreeSet<_> =
+        crate::ops::active_builds(layout).into_keys().collect();
+    let error = match crate::linkmode::linked_programs_checked(layout) {
+        Ok(linked) => {
+            programs.extend(linked);
+            None
+        }
+        Err(error) => Some((
+            "*links*".to_string(),
+            VerifyOutcome::DevLinkUnavailable {
+                error: error.to_string(),
+            },
+        )),
+    };
+    programs
+        .into_iter()
         .map(|p| {
             let o = verify_program(layout, &p);
             (p, o)
         })
+        .chain(error)
         .collect()
 }
 
@@ -557,6 +596,18 @@ mod tests {
             drift,
         };
         for (o, pass) in [
+            (
+                V::DevLinked {
+                    checkout: PathBuf::from("checkout"),
+                },
+                false,
+            ),
+            (
+                V::DevLinkUnavailable {
+                    error: "unreadable".into(),
+                },
+                false,
+            ),
             (V::Match { build: 1 }, true),
             (V::WiredSysroot { build: 1 }, true),
             (vendor(None), true),
@@ -595,6 +646,52 @@ mod tests {
         let l = layout("notinstalled");
         assert_eq!(verify_program(&l, "ghost"), VerifyOutcome::NotInstalled);
         let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    #[test]
+    fn a_development_link_is_not_a_signed_tree_or_an_absent_program() {
+        let l = layout("linked");
+        let store = install(&l, "ay", 18);
+        record(&l, "ay", Some(18), &signed_root(&store, "ay"));
+        let checkout = l.prefix.join("checkout");
+        let rel = PathBuf::from("bin").join(exe_name("ay"));
+        let exe = checkout.join(&rel);
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"development bytes, never executed").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        crate::linkmode::link(&l, "ay", &checkout, &[rel]).unwrap();
+        let linked = verify_program(&l, "ay");
+        assert_eq!(
+            linked,
+            VerifyOutcome::DevLinked {
+                checkout: checkout.canonicalize().unwrap()
+            }
+        );
+        assert!(!linked.passes());
+        assert_eq!(verify_all(&l), vec![("ay".into(), linked)]);
+
+        std::fs::remove_file(&exe).unwrap();
+        assert!(matches!(
+            verify_program(&l, "ay"),
+            VerifyOutcome::DevLinkUnavailable { .. }
+        ));
+        std::fs::write(l.link_marker("ay"), "invalid = [").unwrap();
+        assert!(matches!(
+            verify_program(&l, "ay"),
+            VerifyOutcome::DevLinkUnavailable { .. }
+        ));
+
+        install_shims(&l, &store, &["ay".into()], crate::Aliases::Off).unwrap();
+        assert_eq!(
+            verify_program(&l, "ay"),
+            VerifyOutcome::Match { build: 18 },
+            "the actual store shim still verifies despite the stale marker"
+        );
+        assert_eq!(verify_program(&l, "ghost"), VerifyOutcome::NotInstalled);
     }
 
     /// A missing declared-mode record is `Unreadable` only where the inode stores no mode bits.

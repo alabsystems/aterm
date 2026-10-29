@@ -20,9 +20,7 @@ use crate::cursor_momentum::MOMENTUM_GLOW_TAU_S;
 use crate::cursor_trail::TrailConfig;
 #[cfg(test)]
 use crate::host::Wake;
-use crate::host::{
-    CaptureMode, FrameGeom, HostFrameInput, PressOutcome, SingFacts, TerminalFacts, Visibility,
-};
+use crate::host::{FrameGeom, HostFrameInput, PressOutcome, TerminalFacts, Visibility};
 use crate::kitty_pet::{PetInputKind, PetSpecies};
 use crate::matrix_rain::{
     MatrixRain, RAIN_ALPHA_CAP, RAIN_ALPHA_FLOOR, RainClock, RainConfig, RainFrame, RainHue,
@@ -223,6 +221,12 @@ pub struct EffectsPipeline {
     /// The cursor family.
     cursor: CursorFx,
     glow_cfg: GlowConfig,
+    /// The instant of the last native cursor step and the light its config carried: the frame
+    /// light ([`Self::frame_light`]).
+    frame_light: Option<(Instant, crate::cursor_glow::Light)>,
+    /// The instant of the last composed word pass and each of its panes' light, by session
+    /// ([`Self::pane_word_light`]).
+    pane_lights: (Option<Instant>, Vec<(u64, crate::cursor_glow::Light)>),
     /// The page's trail colour setting.
     glow_trail_color: crate::cursor_fx::TrailColor,
     /// The page set an accent of its own.
@@ -302,6 +306,8 @@ pub struct EffectsPipeline {
     streak: Option<Box<OutputStreak>>,
     /// The streak knobs, kept across off/on toggles.
     streak_cfg: StreakConfig,
+    /// Host reduce-motion gate specific to the output streak (`set_output_streak_reduced_motion`).
+    streak_reduced_motion: bool,
     /// The page's streak seed (`set_output_streak`), the one its engine is built with.
     streak_seed: u64,
 
@@ -327,6 +333,9 @@ pub struct EffectsPipeline {
     pane_ink: Vec<InkCell>,
     pane_free: Vec<FreeSprite>,
     pane_nova: Vec<GlowQuad>,
+    /// The flying head's body drawn into [`Self::pane_free`], pane pixels,
+    /// until [`Self::place_pane_sprites`] places it in the window grid.
+    pane_head: Option<(i32, i32, i32, i32)>,
     /// Output streak per visible terminal pane of a composed frame, keyed `(session, pane slot)`.
     streak_panes: std::collections::BTreeMap<(u64, usize), OutputStreak>,
 }
@@ -340,6 +349,7 @@ impl Default for EffectsPipeline {
 
 impl EffectsPipeline {
     /// Everything off; no lexicon is compiled until sparkle words are enabled.
+    #[inline]
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -369,10 +379,13 @@ impl EffectsPipeline {
                 ring: true,
                 beam: true,
                 head_dx: 0.5,
+                light: crate::cursor_glow::Light::OFF,
             },
             glow_trail_color: crate::cursor_fx::TrailColor::Automatic,
             glow_explicit_accent: false,
             glow_request: None,
+            frame_light: None,
+            pane_lights: (None, Vec::new()),
             trail_cfg: TrailConfig {
                 enabled: false,
                 duration: Duration::from_millis(260),
@@ -414,6 +427,7 @@ impl EffectsPipeline {
             pet_style_named: false,
             streak: None,
             streak_cfg: StreakConfig::default(),
+            streak_reduced_motion: false,
             streak_seed: 0,
             rain: None,
             rain_cfg: RainConfig::default(),
@@ -431,6 +445,7 @@ impl EffectsPipeline {
             pane_ink: Vec::new(),
             pane_free: Vec::new(),
             pane_nova: Vec::new(),
+            pane_head: None,
             streak_panes: std::collections::BTreeMap::new(),
         }
     }
@@ -914,6 +929,22 @@ impl EffectsPipeline {
         }
     }
 
+    /// A test's negative control: no bed's rail lies in its own row's foot
+    /// band (`CursorGlow::set_bed_row_rails`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_bed_row_rails(&mut self, on: bool) {
+        self.cursor.glow.set_bed_row_rails(on);
+    }
+
+    /// A test's negative control: the host's post passes take light from
+    /// beside the letters too (`CursorGlow::set_bloom_spares_letters`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_bloom_spares_letters(&mut self, on: bool) {
+        self.cursor.glow.set_bloom_spares_letters(on);
+    }
+
     /// A test's negative control: the cursor lights drawn without the letter
     /// guard (`CursorGlow::set_letter_guard`).
     #[cfg(any(test, debug_assertions))]
@@ -954,6 +985,23 @@ impl EffectsPipeline {
     #[inline]
     pub const fn set_letter_guard_classic_paper(&mut self, on: bool) {
         self.cursor.glow.set_letter_guard_classic_paper(on);
+    }
+
+    /// A test's negative control: Classic's paper landing ring laid over the
+    /// letters as it was (`CursorGlow::set_classic_paper_ring_cut`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_classic_paper_ring_cut(&mut self, on: bool) {
+        self.cursor.glow.set_classic_paper_ring_cut(on);
+    }
+
+    /// A test's negative control: Classic's one-colour shade up a dim page
+    /// laid faint and cut with the lights, as it was
+    /// (`CursorGlow::set_classic_faint_shade`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_classic_faint_shade(&mut self, on: bool) {
+        self.cursor.glow.set_classic_faint_shade(on);
     }
 
     /// A test's negative control: the guard on, but no page veil under the
@@ -1494,7 +1542,7 @@ impl EffectsPipeline {
     /// Reduced motion for the streak.
     #[inline]
     pub const fn set_output_streak_reduced_motion(&mut self, reduced: bool) {
-        self.streak_cfg.intensity = if reduced { 0.0 } else { 1.0 };
+        self.streak_reduced_motion = reduced;
     }
 
     /// Forward one keystroke to the streak's echo discount.
@@ -1619,6 +1667,12 @@ impl EffectsPipeline {
     }
 
     /// Run every enabled effect for the current injected instant and fill the overlay channels.
+    ///
+    /// The web host's frame latches no light scheme (`docs/design/PRISM-GLASS.md` §15.2 1.11):
+    /// its glow config's light stays [`crate::cursor_glow::Light::OFF`] on every page, light
+    /// ones included, so it draws main's frame and no light arm, and its frame light
+    /// ([`Self::frame_light`]) is OFF.
+    #[inline]
     pub fn apply(
         &mut self,
         term: &mut Terminal,
@@ -1661,6 +1715,8 @@ impl EffectsPipeline {
             }
             input.cursor_fill_override = None;
             input.cursor_effect_style_override = None;
+            // The last lit frame's gate goes with its light (a terminal that never lit one reads Open).
+            input.bloom_gate = aterm_core::render::BloomGate::Open;
             input.word_decorations.clear();
             input.ink.clear();
             self.sprite_layers.withdraw(&mut input.fx_layers);
@@ -1702,6 +1758,8 @@ impl EffectsPipeline {
         } else {
             None
         };
+        // Main's page, and no light: the web host latches no scheme (§15.2 1.11), so nothing
+        // here writes `glow_cfg.light`, which stays OFF as `new` and `resolve_glow` leave it.
         self.glow_cfg.dark_theme =
             input.default_bg == aterm_core::render::COLOR_UNSET || theme_is_dark(input.default_bg);
         self.glow_cfg.theme_fg = input.default_fg;
@@ -1752,10 +1810,12 @@ impl EffectsPipeline {
         };
         let pending_keys = std::mem::take(&mut self.pending_keys);
         let term_cursor_color = terminal_cursor_color(term);
+        // The frame light, as `cursor_step` records it (the step borrows `self.cursor` alone).
+        self.frame_light = Some((now, self.glow_cfg.light));
         let step = native::step_cursor_family(
             &mut self.cursor,
-            &native::CursorStep {
-                input: CursorFxInput {
+            &native::CursorStep::new(
+                CursorFxInput {
                     now,
                     cur,
                     live_viewport,
@@ -1781,26 +1841,24 @@ impl EffectsPipeline {
                     user_tinted: self.glow_trail_color.chosen(),
                     accent_pinned: self.glow_explicit_accent,
                 },
-                glow: &self.glow_cfg,
-                trail: trail_cfg,
-                animate,
-                frame_cells: Some(&input.cells),
-                frame_cells_at: (0, 0),
-                row_probe: match probe_row {
-                    Some((row, caret)) => Some(native::RowProbe {
-                        row,
-                        caret,
-                        trust: crate::cursor_glow::ProbeTrust::Full,
-                        cols: &self.row_probe_scratch,
-                        flanks: None,
-                    }),
-                    None => None,
-                },
-                pending_keys,
-                print_anchor: None,
-                print_anchor_glyph: None,
-                caret_drawn: input.cursor_visible,
-            },
+                &self.glow_cfg,
+                trail_cfg,
+            )
+            .with_animate(animate)
+            .with_frame_cells(Some(&input.cells))
+            .with_frame_cells_cols(input.cols)
+            .with_row_probe(match probe_row {
+                Some((row, caret)) => Some(native::RowProbe {
+                    row,
+                    caret,
+                    trust: crate::cursor_glow::ProbeTrust::Full,
+                    cols: &self.row_probe_scratch,
+                    flanks: None,
+                }),
+                None => None,
+            })
+            .with_pending_keys(pending_keys)
+            .with_caret_drawn(input.cursor_visible),
             std::iter::empty(),
         );
         let fx = step.frame;
@@ -1847,20 +1905,9 @@ impl EffectsPipeline {
         } else {
             facts.display_offset
         };
-        let host = HostFrameInput {
+        let host = HostFrameInput::new(
             now,
-            visibility: match self.rain_visibility {
-                RainVisibility::Focused => Visibility::Focused,
-                RainVisibility::VisibleUnfocused => Visibility::VisibleUnfocused,
-                RainVisibility::Hidden => Visibility::Hidden,
-            },
-            reduced_motion: !animate,
-            serious: self.serious,
-            shed_envelope: 1.0,
-            shed_active: false,
-            pointer_px: None,
-            capture: CaptureMode::Present,
-            geometry: FrameGeom {
+            FrameGeom {
                 rows: geom.rows,
                 cols: geom.cols,
                 cell_w: geom.cell_w,
@@ -1872,7 +1919,14 @@ impl EffectsPipeline {
                         + i32::from(self.host_rows_px),
                 ),
             },
-        };
+        )
+        .with_visibility(match self.rain_visibility {
+            RainVisibility::Focused => Visibility::Focused,
+            RainVisibility::VisibleUnfocused => Visibility::VisibleUnfocused,
+            RainVisibility::Hidden => Visibility::Hidden,
+        })
+        .with_reduced_motion(!animate)
+        .with_serious(self.serious);
         if self.pet_style_named && self.glow_cfg.enabled && self.companion.enabled() {
             let pet_world = crate::pet_world::PetWorldFacts::read(term, term.render_identity());
             let _ = self.companion.observe_console(
@@ -1882,20 +1936,18 @@ impl EffectsPipeline {
                 &[],
             );
         }
-        let pet = self.pet_prepare(PetFacts {
-            facts: &facts,
-            host: &host,
-            glow: GlowOwnership {
-                enabled: self.glow_cfg.enabled,
-                style: self.glow_cfg.style,
-                style_raw_names_pet: self.pet_style_named,
-            },
-            sing: SingFacts::default(),
-            focused,
-            obscured: false,
-            pane: None,
-            room: None,
-        });
+        let pet = self.pet_prepare(
+            PetFacts::new(
+                &facts,
+                &host,
+                GlowOwnership {
+                    enabled: self.glow_cfg.enabled,
+                    style: self.glow_cfg.style,
+                    style_raw_names_pet: self.pet_style_named,
+                },
+            )
+            .with_focused(focused),
+        );
         if self.companion.grieving() {
             self.cursor.glow.hush_fanfare(now);
         }
@@ -1931,24 +1983,26 @@ impl EffectsPipeline {
                         None
                     };
                     let fp = self
-                        .word_grid(&WordGrid {
-                            now,
-                            lexicon: &rs.lexicon,
-                            cfg: &rs.cfg,
-                            geom,
-                            cells: &input.cells,
-                            line_sizes: &input.line_sizes,
-                            base_y: input.base_y,
-                            default_bg,
-                            epoch,
-                            rescan,
-                            companion_at: pet.companion,
-                            sel: SelView {
-                                sel: term.text_selection(),
-                                display_offset: term.grid().display_offset() as i32,
-                            },
-                            focused,
-                        })
+                        .word_grid(
+                            &WordGrid::new(
+                                now,
+                                &rs.lexicon,
+                                &rs.cfg,
+                                geom,
+                                &input.cells,
+                                &input.line_sizes,
+                                SelView {
+                                    sel: term.text_selection(),
+                                    display_offset: term.grid().display_offset() as i32,
+                                },
+                            )
+                            .with_base_y(input.base_y)
+                            .with_default_bg(default_bg)
+                            .with_epoch(epoch)
+                            .with_rescan(rescan)
+                            .with_companion_at(pet.companion)
+                            .with_focused(focused),
+                        )
                         .fp;
                     close_open_damage_session(term);
                     damage_consumed = true;
@@ -2016,7 +2070,11 @@ impl EffectsPipeline {
         self.veil_pet_letters(input);
         let streak_fp = if let Some(streak) = self.streak.as_deref_mut() {
             let mut cfg = self.streak_cfg;
-            cfg.intensity *= cursor_motion.amplitude(MotionEffect::OutputStreak);
+            if self.streak_reduced_motion {
+                cfg.intensity = 0.0;
+            } else {
+                cfg.intensity *= cursor_motion.amplitude(MotionEffect::OutputStreak);
+            }
             streak.note_output_cells(
                 &input.cells,
                 (input.cursor_row, input.cursor_col),
@@ -3955,12 +4013,140 @@ mod tests {
             "leaving DECSCNM restores the dark OSC 11 ground"
         );
 
+        term.process(b"\x1b]11;rgb:80/80/80\x07");
+        term.cell_frame_into(&mut input, 2, 8);
+        stamp_effective_terminal_background(&term, &mut input);
+        pipeline.apply(&mut term, &mut input, 10, 19);
+        assert_eq!(
+            pipeline.glow_cfg.dark_theme,
+            aterm_render::theme_is_dark(input.default_bg),
+            "mid-gray uses the same polarity as the rendered chrome"
+        );
+
         input.default_bg = aterm_core::render::COLOR_UNSET;
         pipeline.apply(&mut term, &mut input, 10, 19);
         assert!(
             pipeline.glow_cfg.dark_theme,
             "an unstamped legacy host retains the dark-ground fallback"
         );
+    }
+
+    /// The web host latches no light scheme (§15.2 1.11): typed on with the tall rainbow kitty
+    /// on Default Light's page, every frame's config and frame light stay OFF, no light arm
+    /// draws and no light words are left. The negative control: a light the config carried
+    /// would be the frame's light.
+    #[test]
+    fn the_web_pipeline_draws_no_light_on_a_light_page() {
+        use crate::cursor_glow::{Light, Live};
+
+        let mut pipeline = EffectsPipeline::new();
+        pipeline.set_cursor_glow(
+            true,
+            "rainbow kitty tall",
+            crate::cursor_fx::TrailColor::Automatic,
+            None,
+            650,
+            24,
+            1.0,
+            0.6,
+            true,
+            0x0050_FA7B,
+        );
+        let mut term = Terminal::new(4, 24);
+        term.process(b"\x1b]10;rgb:2b/2d/33\x07\x1b]11;rgb:f6/f7/f9\x07");
+        let mut input = term.cell_frame(4, 24);
+        let mut frame = |pipeline: &mut EffectsPipeline, term: &mut Terminal, key: u8| {
+            assert!(pipeline.note_committed_char(term, &input, char::from(key)));
+            term.process(&[key]);
+            pipeline.advance(16.0);
+            term.cell_frame_into(&mut input, 4, 24);
+            stamp_effective_terminal_background(term, &mut input);
+            pipeline.apply(term, &mut input, 10, 19);
+            pipeline.now()
+        };
+        for &key in b"light page" {
+            let now = frame(&mut pipeline, &mut term, key);
+            assert!(
+                !pipeline.glow_cfg.dark_theme,
+                "Default Light's page is light"
+            );
+            assert_eq!(pipeline.glow_cfg.light, Light::OFF);
+            assert_eq!(pipeline.frame_light(now), Light::OFF);
+            assert!(pipeline.light_arms().is_empty());
+            assert!(pipeline.light_words(pipeline.t0).words().is_empty());
+        }
+
+        pipeline.glow_cfg.light = Light::at(Live::Glass);
+        let now = frame(&mut pipeline, &mut term, b'!');
+        assert_eq!(pipeline.frame_light(now), Light::at(Live::Glass));
+    }
+
+    #[test]
+    fn native_streak_polarity_tracks_live_background() {
+        let mut pipeline = EffectsPipeline::for_window();
+        let mut term = Terminal::new(2, 8);
+        let mut input = term.cell_frame(2, 8);
+        let place = crate::pane::PanePlace {
+            row_off: 0,
+            col_off: 0,
+            rows: 2,
+            cols: 8,
+            win_rows: 2,
+            win_cols: 8,
+            cell_w: 10,
+            cell_h: 20,
+        };
+        let t0 = std::time::Instant::now();
+        let mut knobs = StreakKnobs {
+            now: t0,
+            intensity: 1.0,
+            tail: 9,
+            max_streaks: 3,
+            idle_secs: 10.0,
+        };
+        let mut quads = Vec::new();
+        let mut frame = |input: &RenderInput, content_seq, knobs| {
+            quads.clear();
+            pipeline.streak_pane(
+                &StreakPane {
+                    session: 17,
+                    slot: 0,
+                    place,
+                    echo: StreakEcho::default(),
+                    snapshot: input,
+                    content_seq,
+                    sound: false,
+                },
+                knobs,
+                NovaInto::Staged(&mut quads),
+            );
+            quads.clone()
+        };
+        assert!(
+            frame(&input, 1, knobs).is_empty(),
+            "a blank baseline draws nothing"
+        );
+        term.process(b"hello");
+        term.cell_frame_into(&mut input, 2, 8);
+        knobs.now = t0 + Duration::from_millis(350);
+        for bg in [
+            0x0001_0203,
+            0x00FF_FFFF,
+            aterm_core::render::COLOR_UNSET,
+            0x0080_8080,
+        ] {
+            input.default_bg = bg;
+            let drawn = frame(&input, 2, knobs);
+            assert!(!drawn.is_empty(), "the actual arrival draws at {bg:#010x}");
+            if aterm_render::theme_is_dark(bg) {
+                assert!(drawn.iter().all(|q| q.alpha == 0), "dark is additive");
+            } else {
+                assert!(
+                    drawn.iter().any(|q| q.alpha > 0),
+                    "light chrome at {bg:#010x} gets visible source-over streaks"
+                );
+            }
+        }
     }
 
     fn stamp_cursor_color(term: &Terminal, input: &mut RenderInput, fallback: u32) {
@@ -5630,6 +5816,43 @@ mod tests {
             restored,
             "clearing reduced motion restores the configured streak"
         );
+
+        p.set_output_streak(true, 0.35, 9, 3, 10, false, 7);
+        assert!((p.streak_cfg.intensity - 0.35).abs() < f32::EPSILON);
+        p.set_output_streak_reduced_motion(true);
+        assert!(
+            (p.streak_cfg.intensity - 0.35).abs() < f32::EPSILON,
+            "streak reduced-motion gate must not clobber configured intensity"
+        );
+        p.set_output_streak(true, 0.4, 9, 3, 10, false, 7);
+        for i in 120..140 {
+            p.advance(40.0);
+            term.process(format!("line {i}\r\n").as_bytes());
+            term.cell_frame_into(&mut input, 24, 80);
+            p.apply(&mut term, &mut input, 10, 20);
+            assert!(
+                input.nova_add.is_empty(),
+                "set_output_streak while reduced must stay dark"
+            );
+            assert!(!p.is_active(), "reduced streak must stay disarmed");
+        }
+        p.set_output_streak_reduced_motion(false);
+        assert!(
+            (p.streak_cfg.intensity - 0.4).abs() < f32::EPSILON,
+            "clearing streak reduced-motion restores configured intensity rather than 1.0"
+        );
+        let mut restored_dim = false;
+        for i in 140..180 {
+            p.advance(40.0);
+            term.process(format!("line {i}\r\n").as_bytes());
+            term.cell_frame_into(&mut input, 24, 80);
+            p.apply(&mut term, &mut input, 10, 20);
+            restored_dim |= !input.nova_add.is_empty();
+        }
+        assert!(
+            restored_dim,
+            "clearing streak reduced-motion restores emission"
+        );
     }
 
     #[test]
@@ -5953,6 +6176,112 @@ mod tests {
         assert!(
             p.cursor_mut().glow.take_companion_impulse().is_none(),
             "apply must drain v2's companion impulse after offering it to the resident pet"
+        );
+    }
+
+    /// looks10 L10, THE FLYING HEAD NAMES ITS BODY: nyan's kitty, earned at the
+    /// ribbon's head, drew no box `trail status` named, so `lab trail-companion`
+    /// could not hold it off the letters and the caret as it holds the pet. The
+    /// head notes the body it drew ([`crate::cursor_glow::CursorGlow::note_head_body`]):
+    /// on the window's canvas the sprite's own box, on a pane's once the pane's
+    /// sprites are placed in the window grid, moved with them. Negative
+    /// controls: the next frame's word pass opens with none, and a head drawn
+    /// at no opacity names none.
+    #[test]
+    fn the_flying_head_names_the_body_it_drew() {
+        use crate::word_decorations::{EffectGeom, KittyCursorFrame, KittyCursorLayout};
+        let g = EffectGeom {
+            cell_w: 10,
+            cell_h: 20,
+            rows: 6,
+            cols: 20,
+        };
+        let cursor = (3u16, 5u16);
+        let frame = |alpha: u8| KittyCursorFrame {
+            geom: g,
+            cursor,
+            look: crate::kitty_registry::KittyLook::default(),
+            colors: crate::cat_baker::CatColorKey::default(),
+            bob: 0.0,
+            lift: 0.0,
+            alpha,
+            pose: crate::kitty_cursor::CatPose::STILL,
+            sing: 0.0,
+            notes: [None; crate::kitty_sing::MAX_NOTES],
+        };
+        let mut p = EffectsPipeline::default();
+        let draw = |p: &mut EffectsPipeline, ink: CanvasInk, alpha: u8| {
+            let placement = p
+                .decos_mut()
+                .prepare_kitty_cursor_placement(
+                    KittyCursorLayout {
+                        geom: g,
+                        cursor,
+                        look: crate::kitty_registry::KittyLook::default(),
+                        bob: 0.0,
+                        lift: 0.0,
+                    },
+                    crate::kitty_cursor::CursorCatPlacementFrame {
+                        sampled_at: Instant::now(),
+                        fold: None,
+                        facing_left: false,
+                    },
+                    crate::kitty_cursor::CatPose::STILL,
+                )
+                .expect("a placeable head");
+            p.draw_flying_head(ink, frame(alpha), placement)
+        };
+        let sprite_box = |s: &FreeSprite| (s.x, s.x + i32::from(s.w), s.y, s.y + i32::from(s.h));
+        p.open_words();
+        assert!(
+            draw(&mut p, CanvasInk::Window, 255).is_some(),
+            "the head draws"
+        );
+        let body = p
+            .free_scratch
+            .last()
+            .map(sprite_box)
+            .expect("its body sprite");
+        assert_eq!(p.cursor().glow.head_body_window_box(), Some(body));
+        p.open_words();
+        assert_eq!(
+            p.cursor().glow.head_body_window_box(),
+            None,
+            "control: the next word pass opens with no head"
+        );
+        p.clear_pane_sprites();
+        assert!(
+            draw(&mut p, CanvasInk::Pane, 255).is_some(),
+            "the pane's head draws"
+        );
+        assert_eq!(
+            p.cursor().glow.head_body_window_box(),
+            None,
+            "a pane's head waits for its place"
+        );
+        p.place_pane_sprites(crate::pane::PanePlace {
+            row_off: 2,
+            col_off: 30,
+            rows: 6,
+            cols: 20,
+            win_rows: 10,
+            win_cols: 60,
+            cell_w: 10,
+            cell_h: 20,
+        });
+        let placed = p
+            .free_scratch
+            .last()
+            .map(sprite_box)
+            .expect("the placed body");
+        assert_eq!(p.cursor().glow.head_body_window_box(), Some(placed));
+        assert_eq!((placed.0 - body.0, placed.2 - body.2), (300, 40));
+        p.open_words();
+        let _ = draw(&mut p, CanvasInk::Window, 0);
+        assert_eq!(
+            p.cursor().glow.head_body_window_box(),
+            None,
+            "control: a head at no opacity names no body"
         );
     }
 }

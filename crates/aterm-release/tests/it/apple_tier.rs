@@ -23,6 +23,7 @@ fn placeholder_identity() -> DevIdIdentity {
     DevIdIdentity {
         sha1: FAKE_SHA1.to_string(),
         common_name: format!("Developer ID Application: Placeholder Org ({FAKE_TEAM})"),
+        keychain: None,
     }
 }
 
@@ -413,11 +414,11 @@ fn a_cut_without_a_notary_credential_is_refused() {
     let root = std::env::temp_dir().join(format!("aterm-apple-refusal-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let (home, repo) = (root.join("home"), root.join("repo"));
-    std::fs::create_dir_all(home.join(".aterm")).unwrap();
+    std::fs::create_dir_all(home.join(atpkg_keys::provision::RELEASE_RING_REL)).unwrap();
     std::fs::create_dir_all(&repo).unwrap();
     let pkcs8 =
         ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
-    let key = home.join(".aterm/machine.key");
+    let key = home.join(atpkg_keys::provision::MACHINE_KEY_REL);
     std::fs::write(&key, pkcs8.as_ref()).unwrap();
     std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
 

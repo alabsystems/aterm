@@ -25,6 +25,7 @@ pub struct CursorCatMotionPulse {
 
 impl CursorCatMotionPulse {
     /// Whether this pulse advances [`crate::kitty_cursor::CursorCat`]'s canonical momentum.
+    #[inline]
     #[must_use]
     #[cfg(test)]
     pub const fn advances_momentum(self) -> bool {
@@ -51,6 +52,7 @@ impl CursorGlow {
     }
 
     /// Read and clear this tick's forward momentum pulse.
+    #[inline]
     #[must_use]
     #[cfg(test)]
     pub const fn take_momentum_pulse(&mut self) -> Option<Instant> {
@@ -112,6 +114,25 @@ impl CursorGlow {
         self.v2.note_pet_body(body);
     }
 
+    /// The flying head's drawn body this frame, grid pixels `(x0, x1, y0, y1)`
+    /// as the word pass's icons are ([`Self::note_word_icons`]); `None` when no
+    /// head is on glass. Every frame's word pass opens with none.
+    #[inline]
+    pub const fn note_head_body(&mut self, body: Option<(i32, i32, i32, i32)>) {
+        self.head_body = body;
+    }
+
+    /// The flying head's drawn body ([`Self::note_head_body`]), window pixels
+    /// `(x0, x1, y0, y1)`: `trail status`'s `head_body=`, which the trail
+    /// gallery keeps per frame for `lab trail-companion` (looks10 L10).
+    #[inline]
+    #[must_use]
+    pub fn head_body_window_box(&self) -> Option<(i32, i32, i32, i32)> {
+        let (ox, oy) = self.keep_geom.map_or((0, 0), |(ox, oy, _)| (ox, oy));
+        self.head_body
+            .map(|(x0, x1, y0, y1)| (x0 + ox, x1 + ox, y0 + oy, y1 + oy))
+    }
+
     /// A test's stand-in pet: every frame's [`Self::note_pet_body`] notes
     /// `body` (window pixels) in place of the box its pet offered (`None`:
     /// the offered box), so a host's frames veil the letters under it with
@@ -125,6 +146,7 @@ impl CursorGlow {
     /// The pet's body box the frame's offer noted, window pixels
     /// ([`Self::note_pet_body`]).
     #[cfg(any(test, debug_assertions))]
+    #[inline]
     #[must_use]
     pub const fn pet_body_box(&self) -> Option<(i32, i32, i32, i32)> {
         self.pet_body
@@ -133,6 +155,7 @@ impl CursorGlow {
     /// The pet's body box the sky last drew no star on, window pixels
     /// (`None`: off glass, or no frame offered one).
     #[cfg(any(test, debug_assertions))]
+    #[inline]
     #[must_use]
     pub const fn pet_shade(&self) -> Option<(i32, i32, i32, i32)> {
         self.v2.pet_shade()
@@ -141,6 +164,7 @@ impl CursorGlow {
     /// The boxes the sky and the ribbon last kept off, window pixels
     /// ([`Self::keep_out_boxes`]).
     #[cfg(any(test, debug_assertions))]
+    #[inline]
     #[must_use]
     pub const fn keep_out(&self) -> &[(i32, i32, i32, i32)] {
         self.v2.keep_out()
@@ -157,6 +181,17 @@ impl CursorGlow {
         self.word_icons_unshaded = true;
     }
 
+    /// The word icons on glass ([`Self::note_word_icons`]), window pixels
+    /// `(x0, x1, y0, y1)`: `trail status`'s `word_icons=`, which the trail
+    /// gallery keeps per frame for `lab trail-companion`.
+    #[inline]
+    pub fn word_icon_window_boxes(&self) -> impl Iterator<Item = (i32, i32, i32, i32)> + '_ {
+        let (ox, oy) = self.keep_geom.map_or((0, 0), |(ox, oy, _)| (ox, oy));
+        self.word_icons
+            .iter()
+            .map(move |&(x0, x1, y0, y1)| (x0 + ox, x1 + ox, y0 + oy, y1 + oy))
+    }
+
     #[inline]
     pub(crate) fn clear_word_icons(&mut self) {
         self.word_icons.clear();
@@ -168,6 +203,7 @@ impl CursorGlow {
     /// window pixels: the word icons, and each run of lettered or filled
     /// cells (a ground that is not the page) of every row of the frame's
     /// text but the caret's.
+    #[inline]
     pub(super) fn keep_out_boxes(&mut self, cfg: &GlowConfig, geom: Geom, cur: Option<(u16, u16)>) {
         let (ox, oy) = (i32::from(geom.origin_x), i32::from(geom.origin_y));
         let (cw, ch) = (geom.cw as i32, geom.ch as i32);
@@ -180,6 +216,17 @@ impl CursorGlow {
         rows.clear();
         let mut filled = std::mem::take(&mut self.keep_filled_scratch);
         filled.clear();
+        let mut letters = std::mem::take(&mut self.keep_letters_scratch);
+        letters.clear();
+        // A short glyph's box begins where its ink may ([`super::emit::SHORT_GLYPH_TOP_CH`]):
+        // the in-row rail dips into its cell's blank top under a descender above it.
+        let short_top = (super::emit::SHORT_GLYPH_TOP_CH * ch as f32).floor() as i32;
+        #[cfg(test)]
+        let short_top = if self.letters_whole_cells {
+            0
+        } else {
+            short_top
+        };
         let mut last_ground: Option<(u32, bool)> = None;
         let mut i = 0;
         while i < ft.rows.len() {
@@ -189,12 +236,15 @@ impl CursorGlow {
                 continue;
             }
             let y0 = oy + row * ch;
+            let y1 = y0 + ch;
+            let y0_short = y0 + short_top;
             let row_pairs = match ft.pairs.get(i * ft.cols..(i + 1) * ft.cols) {
                 Some(s) => s,
                 None => &[],
             };
             let mut run: Option<i32> = None;
             let mut fill_run: Option<i32> = None;
+            let mut letter_run: Option<(i32, bool)> = None;
             let mut span: Option<(i32, i32)> = None;
             let mut idx = 0;
             while idx < row_pairs.len() {
@@ -223,7 +273,7 @@ impl CursorGlow {
                 match (held, run) {
                     (true, None) => run = Some(col),
                     (false, Some(c0)) => {
-                        boxes.push((ox + c0 * cw, ox + col * cw, y0, y0 + ch));
+                        boxes.push((ox + c0 * cw, ox + col * cw, y0, y1));
                         span = Some(match span {
                             Some((a, _)) => (a, col),
                             None => (c0, col),
@@ -235,22 +285,37 @@ impl CursorGlow {
                 match (fill, fill_run) {
                     (true, None) => fill_run = Some(col),
                     (false, Some(c0)) => {
-                        filled.push((ox + c0 * cw, ox + col * cw, y0, y0 + ch));
+                        filled.push((ox + c0 * cw, ox + col * cw, y0, y1));
                         fill_run = None;
                     }
+                    _ => {}
+                }
+                let lettered = matches!(pair, Some((Some(_), _)));
+                let short = lettered && ft.short(row, col);
+                match letter_run {
+                    Some((c0, was_short)) if !lettered || was_short != short => {
+                        let top = if was_short { y0_short } else { y0 };
+                        letters.push((ox + c0 * cw, ox + col * cw, top, y1));
+                        letter_run = lettered.then_some((col, short));
+                    }
+                    None if lettered => letter_run = Some((col, short)),
                     _ => {}
                 }
             }
             let end = ft.col0 + row_pairs.len() as i32;
             if let Some(c0) = run {
-                boxes.push((ox + c0 * cw, ox + end * cw, y0, y0 + ch));
+                boxes.push((ox + c0 * cw, ox + end * cw, y0, y1));
                 span = Some(match span {
                     Some((a, _)) => (a, end),
                     None => (c0, end),
                 });
             }
             if let Some(c0) = fill_run {
-                filled.push((ox + c0 * cw, ox + end * cw, y0, y0 + ch));
+                filled.push((ox + c0 * cw, ox + end * cw, y0, y1));
+            }
+            if let Some((c0, was_short)) = letter_run {
+                let top = if was_short { y0_short } else { y0 };
+                letters.push((ox + c0 * cw, ox + end * cw, top, y1));
             }
             // For a dark train the span reaches a cell past the row's last
             // letter, where its caret stood when it was typed: a Return's
@@ -258,7 +323,7 @@ impl CursorGlow {
             // after the line as a brown stub (looks6 round 3). A paper train
             // keeps to the letters (`KeepOut::past`).
             if let Some((c0, c1)) = span {
-                rows.push((ox + c0 * cw, ox + c1 * cw, y0, y0 + ch));
+                rows.push((ox + c0 * cw, ox + c1 * cw, y0, y1));
             }
             i += 1;
         }
@@ -279,9 +344,10 @@ impl CursorGlow {
             (ox, oy),
             &boxes,
             (&rows, cw),
-            &filled,
+            (&filled, &letters),
             (&feet, &sole_boxes[..n]),
         );
+        self.keep_letters_scratch = letters;
         self.keep_feet_scratch = feet;
         self.keep_out_scratch = boxes;
         self.keep_rows_scratch = rows;
@@ -293,7 +359,8 @@ impl CursorGlow {
     /// whose ink may reach under the baseline (a descender, a wide or
     /// non-ASCII glyph, a letter the probe did not name) into `feet`, and
     /// each such row's box into `soles` ([`rk::companion::KeepOut::foot_share`]).
-    fn foot_boxes(
+    #[inline]
+    pub(super) fn foot_boxes(
         &self,
         geom: Geom,
         feet: &mut Vec<(i32, i32, i32, i32)>,
@@ -325,23 +392,24 @@ impl CursorGlow {
             let mut run: Option<i32> = None;
             let mut col = 0;
             while col <= cols {
-                let foot = col < cols
-                    && match self.frame_text.pair(row, col) {
-                        Some((None, _)) => false,
-                        _ => {
-                            let c = col as usize;
-                            match chars.get(c) {
-                                Some(' ') => false,
-                                Some(&g) => {
-                                    g == '\0'
-                                        || chars.get(c + 1) == Some(&'\0')
-                                        || !g.is_ascii()
-                                        || super::emit::is_descender_glyph(g)
-                                }
-                                None => true,
-                            }
+                // A cell is a foot where the probe names a glyph that may
+                // descend, or where it names none and the frame's own cells
+                // hold ink: the probe may be a frame behind the frame, and
+                // read by it alone the newest `q` was a blank and a rail in
+                // its row's foot band ran under its tail (looks10 L2).
+                let foot = col < cols && {
+                    let c = col as usize;
+                    let frame_inked = matches!(self.frame_text.pair(row, col), Some((Some(_), _)));
+                    match chars.get(c) {
+                        Some(' ') | None => frame_inked,
+                        Some(&g) => {
+                            g == '\0'
+                                || chars.get(c + 1) == Some(&'\0')
+                                || !g.is_ascii()
+                                || super::emit::is_descender_glyph(g)
                         }
-                    };
+                    }
+                };
                 match (foot, run) {
                     (true, None) => run = Some(col),
                     (false, Some(c0)) => {
@@ -404,6 +472,7 @@ impl CursorGlow {
     }
 
     /// Pin typing momentum to at least `drive` during a live celebration ([`crate::kitty_sing`]).
+    #[inline]
     pub fn celebrate(&mut self, now: Instant, drive: f32) {
         self.unsettle();
         let drive = if drive.is_finite() {
@@ -428,6 +497,7 @@ impl CursorGlow {
     }
 
     /// Zero typing momentum and close flow while the pet is grieving.
+    #[inline]
     pub fn hush_fanfare(&mut self, now: Instant) {
         self.unsettle();
         self.momentum.set_value(now, 0.0);

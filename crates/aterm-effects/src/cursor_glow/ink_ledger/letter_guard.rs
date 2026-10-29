@@ -83,6 +83,20 @@ pub(crate) const RIM_UNDER_LETTERS: f32 = 0.2;
 /// left and the grid's bottom its lower half). The landing's veil marks it
 /// there instead.
 pub(crate) const RIM_SHOWN_SHARE: f32 = 0.5;
+/// The core coverage at and over which the guard judges a letter's ink as
+/// its colour whole ([`Judge::cover`]): within a hair of it, the solid ink
+/// the guard reads already lies under the core.
+const CORE_SOLID: f32 = 0.995;
+
+/// What the face lays of a letter's core ([`aterm_render::GlyphInk`]): its coverage `c` in
+/// linear light, and where in the cell its glyph lays ink (`[x0, y0, x1, y1]` from the
+/// cell's top left, end exclusive; `None`: anywhere in the cell).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Cover {
+    c: f32,
+    seat: Option<[i16; 4]>,
+}
+
 /// Bisection steps for a cell's share.
 const STEPS: usize = 7;
 /// The greatest share under the whole the bisection reaches (`127 / 128`),
@@ -274,6 +288,9 @@ struct FrameMemo {
     text: (i32, usize, i32),
     text_rows: Vec<Option<(i32, i32)>>,
     text_pairs: Vec<Option<(Option<u32>, u32)>>,
+    /// Its cells' glyphs and the face's ink for them ([`CursorGlow::observe_glyph_ink`]).
+    text_glyphs: Vec<u8>,
+    ink: Option<std::sync::Arc<aterm_render::GlyphInk>>,
     /// The streams as they came: the under quads, the over quads, the
     /// halos, the under ramps and the over ramps.
     seen: (
@@ -286,6 +303,10 @@ struct FrameMemo {
     /// The frame's rails as the guard read them, sorted: the under stream's
     /// quad spans and its ramp spans ([`InkLedger::note_rail`]).
     rails: (RailSpans, RailSpans),
+    /// The frame's light-owned spans as the guard read them: the under
+    /// stream's quad spans and its ramp spans
+    /// ([`InkLedger::note_light_owned_laid`]).
+    owned: (Vec<super::OwnedSpan>, Vec<super::OwnedSpan>),
     /// The streams as the guard left them, in the same order.
     made: (
         Vec<GlowQuad>,
@@ -296,6 +317,19 @@ struct FrameMemo {
     ),
     /// The frame's print.
     print: u64,
+}
+
+/// Whether two frames read their letters by the same face's ink.
+#[inline]
+fn same_ink(
+    a: Option<&std::sync::Arc<aterm_render::GlyphInk>>,
+    b: Option<&std::sync::Arc<aterm_render::GlyphInk>>,
+) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// Copy `src` into `dst`, keeping `dst`'s room.
@@ -344,6 +378,10 @@ pub(crate) struct LetterGuard {
     /// the ground under every light, and the ink under the over-text ones.
     px_ground: Vec<u32>,
     px_ink: Vec<u32>,
+    /// Where the letter's glyph lays less than its colour whole ([`Judge::cover`]): its colour
+    /// under the over-text lights, and that colour's luminance per inner ring box pixel.
+    px_fg: Vec<u32>,
+    cover_lum: Vec<f32>,
     /// The ring box's ground luminance per pixel, and per pixel the least
     /// and greatest of it within [`RING`] columns.
     lum: Vec<f32>,
@@ -412,6 +450,10 @@ pub(crate) struct LetterGuard {
     /// on paper too, as it did before looks8 round 2.
     #[cfg(any(test, debug_assertions))]
     pub(crate) classic_paper_off: bool,
+    /// A test's negative control: the post passes take light from beside the
+    /// letters too, as before looks10 ([`CursorGlow::bloom_spares_letters`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) bloom_on_letters: bool,
 }
 
 impl LetterGuard {
@@ -429,6 +471,8 @@ impl LetterGuard {
         bare_lum: (0.0, 0.0),
         px_ground: Vec::new(),
         px_ink: Vec::new(),
+        px_fg: Vec::new(),
+        cover_lum: Vec::new(),
         lum: Vec::new(),
         ring_lo: Vec::new(),
         ring_hi: Vec::new(),
@@ -466,6 +510,8 @@ impl LetterGuard {
         no_room: false,
         #[cfg(any(test, debug_assertions))]
         classic_paper_off: false,
+        #[cfg(any(test, debug_assertions))]
+        bloom_on_letters: false,
     };
 }
 
@@ -592,6 +638,19 @@ struct Judge {
     ground: u32,
     l_ink: f32,
     l_ground: f32,
+    /// The letter's colour and its luminance.
+    fg: u32,
+    l_fg: f32,
+    /// Where the face's raster lays the glyph's core at less than its colour whole
+    /// ([`aterm_render::GlyphInk::core`]): that coverage `c` in linear light, and the bar its
+    /// core keeps ([`letter_bar`] of its bare reading). Every pixel short of full coverage
+    /// shows the light laid under it, as the renderer blends text ([`aterm_render::blend_text`]),
+    /// so the core's ink reads `c` of the colour and `1 - c` of the ground lit beneath it: the
+    /// core is judged against each ground of its ring as lit by that ground's own light.
+    cover: Option<(f32, f32)>,
+    /// The ring box's pixels the core is judged at, `[x0, y0, x1, y1]` from its top left: where
+    /// the glyph lays ink, a pixel either side, within the cell.
+    core_box: [i32; 4],
 }
 
 #[inline]
@@ -723,8 +782,10 @@ fn row_lights(
         (y as i32) < ry1 && (y as i32) + (h as i32) > ry0
     }
     // The under stream's rails in their rows' foot bands are never weighed
-    // ([`InkLedger::note_foot_rail`]), quads or ramps.
+    // ([`InkLedger::note_foot_rail`]), quads or ramps, nor are its
+    // light-owned lights ([`InkLedger::note_light_owned_laid`]).
     let (mut foot_q, mut foot_r) = (0usize, 0usize);
+    let (mut owned_q, mut owned_r) = (0usize, 0usize);
     ramps.in_order(quads.len(), |at| match at {
         Laid::Quads(r) => {
             let mut k = r.start;
@@ -733,7 +794,9 @@ fn row_lights(
                 if lit(q)
                     && band_meets_y(q.y, q.h, ry0, ry1)
                     && !match feet {
-                        Some(l) => l.in_foot_rail(k, &mut foot_q),
+                        Some(l) => {
+                            l.in_foot_rail(k, &mut foot_q) || l.in_light_owned(k, &mut owned_q)
+                        }
                         None => false,
                     }
                 {
@@ -747,7 +810,9 @@ fn row_lights(
             if r.w == 0
                 || !band_meets_y(r.y, r.h, ry0, ry1)
                 || match feet {
-                    Some(l) => l.in_foot_ramp(k, &mut foot_r),
+                    Some(l) => {
+                        l.in_foot_ramp(k, &mut foot_r) || l.in_light_owned_ramp(k, &mut owned_r)
+                    }
                     None => false,
                 }
             {
@@ -944,6 +1009,8 @@ impl LetterGuard {
         let n = w * (j.y1 - j.y0) as usize;
         let mut ground = std::mem::take(&mut self.px_ground);
         let mut ink = std::mem::take(&mut self.px_ink);
+        let mut fg = std::mem::take(&mut self.px_fg);
+        let fg_too = has_over && j.cover.is_some();
         let whole = s >= 1.0;
         let share = Share::of(s);
         // Only the lit rows' spans: every other pixel is the bare ground or
@@ -963,6 +1030,17 @@ impl LetterGuard {
             layer(
                 &mut ink[..n],
                 (j.ink, w),
+                &self.first_ink[..n],
+                &self.more_ink,
+                rows,
+                share,
+            );
+        }
+        if fg_too {
+            fg.resize(n, j.fg);
+            layer(
+                &mut fg[..n],
+                (j.fg, w),
                 &self.first_ink[..n],
                 &self.more_ink,
                 rows,
@@ -1000,11 +1078,17 @@ impl LetterGuard {
                             if has_over {
                                 ink[k] = aterm_render::add_sat(ink[k], p);
                             }
+                            if fg_too {
+                                fg[k] = aterm_render::add_sat(fg[k], p);
+                            }
                         } else {
                             let a = wt.min(cap);
                             ground[k] = aterm_render::over_rgb(ground[k], c, a);
                             if has_over {
                                 ink[k] = aterm_render::over_rgb(ink[k], c, a);
+                            }
+                            if fg_too {
+                                fg[k] = aterm_render::over_rgb(fg[k], c, a);
                             }
                         }
                     }
@@ -1015,6 +1099,7 @@ impl LetterGuard {
         }
         self.px_ground = ground;
         self.px_ink = ink;
+        self.px_fg = fg;
     }
 
     /// Whether every light that reaches the cell adds (no source-over
@@ -1311,6 +1396,10 @@ impl LetterGuard {
             self.px_ink.resize(n, j.ink);
             self.ink_lum.clear();
             self.ink_lum.resize(n, self.bare_lum.1);
+            if j.cover.is_some() {
+                self.px_fg.clear();
+                self.px_fg.resize(n, j.fg);
+            }
         }
         let (wu, hu, r) = (w as u32, h as u32, RING as u32);
         let mut unlit = (false, false);
@@ -1358,6 +1447,8 @@ impl LetterGuard {
         }
         let px_ground = std::mem::take(&mut self.px_ground);
         let px_ink = std::mem::take(&mut self.px_ink);
+        let px_fg = std::mem::take(&mut self.px_fg);
+        let mut cover_lum = std::mem::take(&mut self.cover_lum);
         let mut lum = std::mem::take(&mut self.lum);
         let mut ink_lum = std::mem::take(&mut self.ink_lum);
         let mut ring_lo = std::mem::take(&mut self.ring_lo);
@@ -1375,6 +1466,7 @@ impl LetterGuard {
         if has_over {
             (li_lo, li_hi) = (f32::INFINITY, f32::NEG_INFINITY);
             let mut last_ink: Option<([u16; 3], f32)> = None;
+            let mut last_ink_px = (j.ink, j.l_ink);
             let mut y = r;
             while y < h - r {
                 let (k0, k1) = (y * w + r, y * w + w - r);
@@ -1407,7 +1499,14 @@ impl LetterGuard {
                     let (k0, k1) = (k0.max(y * w + lo as usize), k1.min(y * w + hi as usize));
                     let mut k = k0;
                     while k < k1 {
-                        let li = crate::color_math::relative_luminance_with(table, px_ink[k]);
+                        let px = px_ink[k];
+                        let li = if px == last_ink_px.0 {
+                            last_ink_px.1
+                        } else {
+                            let l = crate::color_math::relative_luminance_with(table, px);
+                            last_ink_px = (px, l);
+                            l
+                        };
                         ink_lum[k] = li;
                         li_lo = li_lo.min(li);
                         li_hi = li_hi.max(li);
@@ -1461,13 +1560,21 @@ impl LetterGuard {
             // Each row's lit span; the pixels no light reaches read the bare
             // ground `lay_lights` left in `lum`.
             let lit_rows = self.lit_rows.as_slice();
+            let mut last_ground_px = (j.ground, j.l_ground);
             let mut y = 0;
             while y < lit_rows.len() {
                 let (lo, hi) = lit_rows[y];
                 let (a, b) = (y * w + lo as usize, y * w + hi as usize);
                 let mut k = a;
                 while k < b {
-                    let v = crate::color_math::relative_luminance_with(table, px_ground[k]);
+                    let px = px_ground[k];
+                    let v = if px == last_ground_px.0 {
+                        last_ground_px.1
+                    } else {
+                        let l = crate::color_math::relative_luminance_with(table, px);
+                        last_ground_px = (px, l);
+                        l
+                    };
                     lum[k] = v;
                     near |= v > dark && v < light;
                     k += 1;
@@ -1477,7 +1584,58 @@ impl LetterGuard {
             let bare = self.bare_lum.0;
             near |= self.unlit.0 && bare > dark && bare < light;
         }
-        let clear = !near;
+        // The core's colour per inner pixel, as the over-text lights leave it. The core reads
+        // `c` of it and `1 - c` of the ground lit beneath it, so it moves with its ground and
+        // no bound on the ground alone clears it.
+        let core = j.cover;
+        if core.is_some() {
+            cover_lum.resize(n, 0.0);
+            let mut last_fg: Option<(u32, f32)> = None;
+            let mut last_lift: Option<([u16; 3], f32)> = None;
+            let mut y = r;
+            while y < h - r {
+                let mut k = y * w + r;
+                let k1 = y * w + w - r;
+                while k < k1 {
+                    let l_fg = if !has_over {
+                        j.l_fg
+                    } else if additive {
+                        let b = self.lift_over[k];
+                        if b == [0; 3] {
+                            j.l_fg
+                        } else if let Some((prev, l)) = last_lift
+                            && prev == b
+                        {
+                            l
+                        } else {
+                            let l = crate::color_math::relative_luminance_with(
+                                table,
+                                lift_rgb(j.fg, b, s),
+                            );
+                            last_lift = Some((b, l));
+                            l
+                        }
+                    } else {
+                        let px = px_fg[k];
+                        if px == j.fg {
+                            j.l_fg
+                        } else if let Some((prev, l)) = last_fg
+                            && prev == px
+                        {
+                            l
+                        } else {
+                            let l = crate::color_math::relative_luminance_with(table, px);
+                            last_fg = Some((px, l));
+                            l
+                        }
+                    };
+                    cover_lum[k] = l_fg;
+                    k += 1;
+                }
+                y += 1;
+            }
+        }
+        let clear = !near && core.is_none();
         let mut holds = true;
         if !clear {
             // Each ink pixel against the least and greatest ground of its
@@ -1579,12 +1737,36 @@ impl LetterGuard {
                         x += 1;
                     }
                 }
+                let [bx0, by0, bx1, by1] = j.core_box;
+                if let Some((c, bar_c)) = core
+                    && (y as i32) >= by0
+                    && (y as i32) < by1
+                {
+                    // Where the glyph lays ink, each ground of the ring against the core laid
+                    // over that ground's own light, as a light under the letter lies under its
+                    // core and the ground beside it alike: the reading falls as the ground
+                    // nears the core's colour from either side, so the ring's least and
+                    // greatest settle it, and a ring that spans the colour holds a ground the
+                    // core cannot leave.
+                    let colours = &cover_lum[row_at..row_at + iw];
+                    let mut x = (bx0 - r as i32).max(0) as usize;
+                    let x_end = ((bx1 - r as i32).max(0) as usize).min(iw);
+                    while x < x_end {
+                        let f = colours[x];
+                        let (lo, hi) = ring_minmax(&los, &his, x);
+                        let on = |g: f32| ratio(c * f + (1.0 - c) * g, g);
+                        fail |= (lo <= f && f <= hi) || on(lo) < bar_c || on(hi) < bar_c;
+                        x += 1;
+                    }
+                }
                 holds = !fail;
                 y += 1;
             }
         }
         self.px_ground = px_ground;
         self.px_ink = px_ink;
+        self.px_fg = px_fg;
+        self.cover_lum = cover_lum;
         self.lum = lum;
         self.ink_lum = ink_lum;
         self.ring_lo = ring_lo;
@@ -1644,22 +1826,6 @@ impl LetterGuard {
         let table = crate::color_math::relative_luminance_table();
         let share = Share::Of128(top);
         let d = [ch(j.ground, 0), ch(j.ground, 1), ch(j.ground, 2)];
-        // Per pixel the shares at `s` of the lights past its first, and
-        // how many there are.
-        let mut stacked = std::mem::take(&mut self.stacked);
-        stacked.clear();
-        stacked.resize(w * h, [0; 4]);
-        let more_ground = self.more_ground.as_slice();
-        let mut mi = 0;
-        while mi < more_ground.len() {
-            let m = more_ground[mi];
-            let sum = &mut stacked[m.k as usize];
-            sum[0] = sum[0].saturating_add(share.scale(ch(m.v, 0)) as u16);
-            sum[1] = sum[1].saturating_add(share.scale(ch(m.v, 1)) as u16);
-            sum[2] = sum[2].saturating_add(share.scale(ch(m.v, 2)) as u16);
-            sum[3] = sum[3].saturating_add(1);
-            mi += 1;
-        }
         let first = self.first_ground.as_slice();
         let more = self.more_ground.as_slice();
         #[inline(always)]
@@ -1730,8 +1896,47 @@ impl LetterGuard {
             }
             true
         }
-        let mut every = true;
         let lit_rows = self.lit_rows.as_slice();
+        if more.is_empty() {
+            let mut y = 0;
+            while y < lit_rows.len() {
+                let (lo, hi) = lit_rows[y];
+                let (a, b) = (y * w + lo as usize, y * w + hi as usize);
+                let mut k = a;
+                while k < b {
+                    if !pixel_clears(
+                        table,
+                        (j.ground, d),
+                        share,
+                        mids,
+                        dark,
+                        (first[k], [0; 4], self.px_ground[k]),
+                        (more, k),
+                    ) {
+                        return false;
+                    }
+                    k += 1;
+                }
+                y += 1;
+            }
+            return true;
+        }
+        // Per pixel the shares at `s` of the lights past its first, and
+        // how many there are.
+        let mut stacked = std::mem::take(&mut self.stacked);
+        stacked.clear();
+        stacked.resize(w * h, [0; 4]);
+        let mut mi = 0;
+        while mi < more.len() {
+            let m = more[mi];
+            let sum = &mut stacked[m.k as usize];
+            sum[0] = sum[0].saturating_add(share.scale(ch(m.v, 0)) as u16);
+            sum[1] = sum[1].saturating_add(share.scale(ch(m.v, 1)) as u16);
+            sum[2] = sum[2].saturating_add(share.scale(ch(m.v, 2)) as u16);
+            sum[3] = sum[3].saturating_add(1);
+            mi += 1;
+        }
+        let mut every = true;
         let mut y = 0;
         'rows: while y < lit_rows.len() {
             let (lo, hi) = lit_rows[y];
@@ -1822,6 +2027,7 @@ impl LetterGuard {
         &self,
         (x0, y0, x1, y1): (i32, i32, i32, i32),
         (ink, ground): (u32, u32),
+        cover: Option<Cover>,
         no_room: bool,
         streams: Streams<'_>,
     ) -> u64 {
@@ -1832,6 +2038,12 @@ impl LetterGuard {
             ),
             (ink as u64) | (ground as u64) << 24 | (no_room as u64) << 48,
         );
+        if let Some(Cover { c, seat }) = cover {
+            h = fold(h, c.to_bits() as u64 | 1 << 32);
+            if let Some([x0, y0, x1, y1]) = seat {
+                h = fold(h, pack_u16x4(x0 as u16, y0 as u16, x1 as u16, y1 as u16));
+            }
+        }
         let halos = streams.halos;
         let cell_slice = self.cell.as_slice();
         let mut ci = 0;
@@ -1920,12 +2132,16 @@ impl LetterGuard {
     /// in the ring box `(x0, y0, x1, y1)` keeps (`1.0` uncut): none of them
     /// cut where their brightest sum keeps its bar, else [`Self::share`].
     /// `solid` memoises the last pair's solid ink, luminances and bar.
+    /// `cover`: where the face lays the letter's core at less than its
+    /// colour whole, that coverage and where the glyph lays ink
+    /// ([`Judge::cover`], [`Judge::core_box`]), its core judged too.
     #[inline]
     fn judge(
         &mut self,
         (x0, y0, x1, y1): (i32, i32, i32, i32),
         (ink, ground): (u32, u32),
         solid: &mut Option<SolidMemo>,
+        cover: Option<Cover>,
         no_room: bool,
         streams: Streams<'_>,
     ) -> f32 {
@@ -1933,17 +2149,18 @@ impl LetterGuard {
         const fn lum_ratio(la: f32, lb: f32) -> f32 {
             (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
         }
-        let lum = crate::color_math::relative_luminance;
+        let table = crate::color_math::relative_luminance_table();
         #[cfg(any(test, debug_assertions))]
         {
             self.judged += 1;
         }
+        let fg = ink;
         let (ink, l_ink, l_ground, bar) = match *solid {
             Some((pair, cached)) if pair == (ink, ground) => cached,
             _ => {
-                let s = solid_ink(ink, ground);
-                let l_i = lum(s);
-                let l_g = lum(ground);
+                let l_g = crate::color_math::relative_luminance_with(table, ground);
+                let s = solid_ink_with(table, ink, ground, l_g);
+                let l_i = crate::color_math::relative_luminance_with(table, s);
                 // The bare page's reading: every light at share 0 composes
                 // to the ground and the ink themselves.
                 let b = letter_bar(lum_ratio(l_i, l_g), no_room);
@@ -1951,6 +2168,25 @@ impl LetterGuard {
                 *solid = Some(((ink, ground), cached));
                 cached
             }
+        };
+        let l_fg = crate::color_math::relative_luminance_with(table, fg);
+        // The core's bare reading: its coverage of the colour over the bare ground.
+        let seat = cover.and_then(|cover| cover.seat);
+        let cover = cover.map(|Cover { c, .. }| {
+            let l_c = c * l_fg + (1.0 - c) * l_ground;
+            (c, letter_bar(lum_ratio(l_c, l_ground), no_room))
+        });
+        // The ring box's inner pixels (the cell) where the glyph lays ink, a pixel either side.
+        let r = RING;
+        let (w, h) = (x1 - x0, y1 - y0);
+        let core_box = match seat {
+            Some([sx0, sy0, sx1, sy1]) => [
+                (r + sx0 as i32 - 1).max(r),
+                (r + sy0 as i32 - 1).max(r),
+                (r + sx1 as i32 + 1).min(w - r),
+                (r + sy1 as i32 + 1).min(h - r),
+            ],
+            None => [r, r, w - r, h - r],
         };
         let j = Judge {
             x0,
@@ -1961,18 +2197,39 @@ impl LetterGuard {
             ground,
             l_ink,
             l_ground,
+            fg,
+            l_fg,
+            cover,
+            core_box,
         };
         if let Some((on_ink, all)) = self.bound(j, streams) {
             // Light ink on a dark page reads worst against the
             // brightest ground the lights can make; dark ink on
             // paper, lifted the most, against the page itself.
             let clear = if l_ink >= l_ground {
-                let lg = lum(lifted(ground, all));
+                let lg = crate::color_math::relative_luminance_with(table, lifted(ground, all));
                 lg < l_ink && lum_ratio(l_ink, lg) >= bar
             } else {
-                let l_i = lum(lifted(ink, on_ink));
+                let l_i = crate::color_math::relative_luminance_with(table, lifted(ink, on_ink));
                 l_i < l_ground && lum_ratio(l_i, l_ground) >= bar
             };
+            // The core alike: its least ink (the bare core: an added light only lifts it)
+            // against the brightest ground, or its most (the colour lifted over the ink and
+            // its ground's share lifted by every light) against the page itself.
+            let clear = clear
+                && cover.is_none_or(|(c, bar_c)| {
+                    let l_c = c * l_fg + (1.0 - c) * l_ground;
+                    let lg = crate::color_math::relative_luminance_with(table, lifted(ground, all));
+                    if l_c >= l_ground {
+                        lg < l_c && lum_ratio(l_c, lg) >= bar_c
+                    } else {
+                        let l_top = c * crate::color_math::relative_luminance_with(
+                            table,
+                            lifted(fg, on_ink),
+                        ) + (1.0 - c) * lg;
+                        l_top < l_ground && lum_ratio(l_top, l_ground) >= bar_c
+                    }
+                });
             if clear {
                 return 1.0;
             }
@@ -2009,7 +2266,11 @@ impl LetterGuard {
         // composite shows ([`Self::vouch`]), every mid the bisection tries
         // holds, and its answer is that share.
         let mut near_whole = None;
-        if !additive && !has_over && self.near_whole.binary_search(&box_at(j.x0, j.y0)).is_ok() {
+        if !additive
+            && !has_over
+            && j.cover.is_none()
+            && self.near_whole.binary_search(&box_at(j.x0, j.y0)).is_ok()
+        {
             let held = self.holds(j, NEAR_WHOLE, bar, flags);
             if held && self.vouch(j, NEAR_WHOLE, bar) {
                 return NEAR_WHOLE;
@@ -2176,35 +2437,49 @@ const fn lifted(c: u32, lift: [u32; 3]) -> u32 {
 
 /// The solid ink of a letter drawn in `ink` on `ground`: the colour on the
 /// way from `ink` to `ground` that reads [`SOLID_SHARE`] of the clean ratio.
+#[cfg(test)]
 #[inline]
 const fn solid_ink(ink: u32, ground: u32) -> u32 {
-    let lg = crate::color_math::relative_luminance(ground);
+    let table = crate::color_math::relative_luminance_table();
+    let lg = crate::color_math::relative_luminance_with(table, ground);
+    solid_ink_with(table, ink, ground, lg)
+}
+
+#[inline]
+const fn solid_ink_with(
+    table: &crate::color_math::RelativeLuminanceTable,
+    ink: u32,
+    ground: u32,
+    lg: f32,
+) -> u32 {
     #[inline]
-    const fn ratio(lg: f32, a: u32) -> f32 {
-        let la = crate::color_math::relative_luminance(a);
+    const fn ratio(table: &crate::color_math::RelativeLuminanceTable, lg: f32, a: u32) -> f32 {
+        let la = crate::color_math::relative_luminance_with(table, a);
         (la.max(lg) + 0.05) / (la.min(lg) + 0.05)
     }
     #[inline]
-    const fn mix_ch(ink: u32, ground: u32, sh: u32, t: f32) -> u32 {
-        let (a, b) = (((ink >> sh) & 0xff) as f32, ((ground >> sh) & 0xff) as f32);
-        let u = (a + (b - a) * t).round() as u32;
+    const fn mix_ch(a: f32, diff: f32, t: f32) -> u32 {
+        let u = (a + diff * t).round() as u32;
         if u < 255 { u } else { 255 }
     }
-    #[inline]
-    const fn mix(ink: u32, ground: u32, t: f32) -> u32 {
-        (mix_ch(ink, ground, 16, t) << 16)
-            | (mix_ch(ink, ground, 8, t) << 8)
-            | mix_ch(ink, ground, 0, t)
-    }
-    let want = SOLID_SHARE * ratio(lg, ink);
+    let ink_r = ((ink >> 16) & 0xff) as f32;
+    let ink_g = ((ink >> 8) & 0xff) as f32;
+    let ink_b = (ink & 0xff) as f32;
+    let dr = ((ground >> 16) & 0xff) as f32 - ink_r;
+    let dg = ((ground >> 8) & 0xff) as f32 - ink_g;
+    let db = (ground & 0xff) as f32 - ink_b;
+    let want = SOLID_SHARE * ratio(table, lg, ink);
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     let (mut lo_rgb, mut hi_rgb) = (ink & 0x00FF_FFFF, ground & 0x00FF_FFFF);
     let mut hi_checked = false;
     let mut step = 0;
     while step < 10 {
         let mid = 0.5 * (lo + hi);
-        let mid_rgb = mix(ink, ground, mid);
-        if mid_rgb == lo_rgb || ((!hi_checked || mid_rgb != hi_rgb) && ratio(lg, mid_rgb) >= want) {
+        let mid_rgb =
+            (mix_ch(ink_r, dr, mid) << 16) | (mix_ch(ink_g, dg, mid) << 8) | mix_ch(ink_b, db, mid);
+        if mid_rgb == lo_rgb
+            || ((!hi_checked || mid_rgb != hi_rgb) && ratio(table, lg, mid_rgb) >= want)
+        {
             lo = mid;
             lo_rgb = mid_rgb;
         } else {
@@ -2227,13 +2502,15 @@ impl InkLedger {
     /// `rails` (the under stream), a light of a rail laid clear of its row's
     /// ring ([`Self::note_rail`]) is cut only where it meets a dimmed cell's
     /// box, and a rail in its row's foot band ([`Self::note_foot_rail`]) is
-    /// never cut.
+    /// never cut, nor is a light-owned light
+    /// ([`Self::note_light_owned_laid`]).
     #[inline]
     fn guard_mask_stream(&mut self, quads: &mut Vec<GlowQuad>, ramps: &mut GlowRamps, rails: bool) {
         if ramps.is_empty() {
             self.guard_mask_quads::<false>(quads, &mut [], rails);
             if rails {
                 self.rail_ramps.clear();
+                self.light_owned_ramps.clear();
             }
             return;
         }
@@ -2247,7 +2524,8 @@ impl InkLedger {
     /// drawn after every quad). With `rails`, a quad of a rail laid clear of
     /// its row's ring ([`Self::note_rail`]) is cut only where it meets a
     /// dimmed cell's box, and a quad of a rail in its row's foot band
-    /// ([`Self::note_foot_rail`]) is never cut.
+    /// ([`Self::note_foot_rail`]) is never cut, nor is a light-owned quad
+    /// ([`Self::note_light_owned_laid`]).
     #[inline]
     fn guard_mask_quads<const RAMPS: bool>(
         &mut self,
@@ -2255,6 +2533,12 @@ impl InkLedger {
         ramps: &mut [GlowRamp],
         rails: bool,
     ) {
+        let owned = if rails {
+            std::mem::take(&mut self.light_owned)
+        } else {
+            Vec::new()
+        };
+        let mut owned_at = 0usize;
         let (bx0, by0, bx1, by1) = self.dims_bounds();
         let feather = self.feather();
         #[cfg(any(test, debug_assertions))]
@@ -2292,6 +2576,7 @@ impl InkLedger {
             }
             let rail = span < spans.len() && spans[span].0 as usize <= i;
             if (rail && feet_whole && spans[span].2)
+                || Self::in_owned_span(&owned, i, &mut owned_at)
                 || q.w == 0
                 || q.h == 0
                 || x1 <= bx0
@@ -2397,6 +2682,11 @@ impl InkLedger {
             self.rails = spans;
             self.rails.clear();
         }
+        if rails {
+            // Kept whole, the light-owned lights moved with the cuts too.
+            self.light_owned = owned;
+            self.light_owned.clear();
+        }
     }
 
     /// Whether the window px box `[x0, x1) × [y0, y1)` meets a dimmed
@@ -2428,9 +2718,16 @@ impl InkLedger {
     /// pieces are one light apiece (a run of each slice's ramp), as the
     /// quad's are. With `rails`, a ramp of a rail laid clear of its row's
     /// ring ([`Self::note_rail_laid`]) has a row (a run, its one quad) cut
-    /// only where it meets a dimmed cell's box, as its quad would be.
+    /// only where it meets a dimmed cell's box, as its quad would be, and a
+    /// light-owned ramp ([`Self::note_light_owned_laid`]) is never cut.
     #[inline]
     fn guard_mask_ramps(&mut self, ramps: &mut GlowRamps, rails: bool) {
+        let owned = if rails {
+            std::mem::take(&mut self.light_owned_ramps)
+        } else {
+            Vec::new()
+        };
+        let mut owned_at = 0usize;
         let (bx0, by0, bx1, by1) = self.dims_bounds();
         let feather = self.feather();
         #[cfg(any(test, debug_assertions))]
@@ -2472,6 +2769,7 @@ impl InkLedger {
                 out.ends.extend_from_slice(r.kept_ends(ends));
             }
             if (rail && feet_whole && spans[span].2)
+                || Self::in_owned_span(&owned, k, &mut owned_at)
                 || r.w == 0
                 || x1 <= bx0
                 || x0 >= bx1
@@ -2679,6 +2977,11 @@ impl InkLedger {
             self.rail_ramps = spans;
             self.rail_ramps.clear();
         }
+        if rails {
+            // Kept whole, the light-owned lights moved with the cuts too.
+            self.light_owned_ramps = owned;
+            self.light_owned_ramps.clear();
+        }
     }
 
     /// Cut every halo of `halos` to the guard's dims: an additive halo's
@@ -2781,11 +3084,44 @@ impl CursorGlow {
         {
             return held;
         }
-        let li = crate::color_math::relative_luminance(solid_ink(key.0, key.1));
-        let lg = crate::color_math::relative_luminance(key.1);
+        let table = crate::color_math::relative_luminance_table();
+        let lg = crate::color_math::relative_luminance_with(table, key.1);
+        let li = crate::color_math::relative_luminance_with(
+            table,
+            solid_ink_with(table, key.0, key.1, lg),
+        );
         let held = (li.max(lg) + 0.05) / (li.min(lg) + 0.05) < LETTER_FLOOR;
         self.letter_guard.bloom_memo = Some((key, held));
         held
+    }
+
+    /// Whether the host's post passes (the GPU's bloom and the SDR crown,
+    /// [`aterm_core::render::BloomGate::SparesLetters`]) keep their source off
+    /// the frame's lettered cells. The guard weighs each letter on the light
+    /// the frame composites, and the passes blur and screen the over-text
+    /// light as far as [`aterm_render::bloom::reach_px`] past it: on the dark
+    /// page Lumen's newest letter, at 6.25:1 on the composited light, read
+    /// 4.37 bloomed (looks10 L1; Phaser and Sparkle 4.37 and 4.38 at an Enter
+    /// at the bottom row, Beam 4.48 in the gallery). Withheld from beside the
+    /// text, the spill lays no light on a letter, and the trail's own light is
+    /// drawn whole. Classic's spectrum face on a dark theme keeps its v0.28
+    /// look, bloom and all ([`Self::classic_keeps_its_bytes`]).
+    #[inline]
+    #[must_use]
+    pub const fn bloom_spares_letters(&self, style: GlowStyle) -> bool {
+        #[cfg(any(test, debug_assertions))]
+        if self.letter_guard.bloom_on_letters {
+            return false;
+        }
+        !self.classic_keeps_its_bytes(style)
+    }
+
+    /// A test's negative control: the post passes take light from beside the
+    /// letters too ([`Self::bloom_spares_letters`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_bloom_spares_letters(&mut self, on: bool) {
+        self.letter_guard.bloom_on_letters = !on;
     }
 
     /// Whether this frame's lights are Classic's spectrum face on a dark
@@ -2847,6 +3183,10 @@ impl CursorGlow {
         #[cfg(not(any(test, debug_assertions)))]
         let paper_spared = false;
         let spared = self.classic_keeps_its_bytes(style) || paper_spared;
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.ink_ledger.guard_judged = self.guard_judges(over, geom, spared);
+        }
         let frame = (
             caret,
             (
@@ -2872,9 +3212,13 @@ impl CursorGlow {
             && memo.seen.4 == self.out_ramps
             && memo.rails.0 == self.ink_ledger.rails
             && memo.rails.1 == self.ink_ledger.rail_ramps
+            && memo.owned.0 == self.ink_ledger.light_owned
+            && memo.owned.1 == self.ink_ledger.light_owned_ramps
             && memo.text == (text.lo, text.cols, text.col0)
             && memo.text_rows == text.rows
             && memo.text_pairs == text.pairs
+            && memo.text_glyphs == text.glyph
+            && same_ink(memo.ink.as_ref(), self.glyph_ink.as_ref())
         {
             self.under_out.clone_from(&memo.made.0);
             over.clone_from(&memo.made.1);
@@ -2893,6 +3237,8 @@ impl CursorGlow {
         memo.text = (text.lo, text.cols, text.col0);
         memo.text_rows.clone_from(&text.rows);
         memo.text_pairs.clone_from(&text.pairs);
+        memo.text_glyphs.clone_from(&text.glyph);
+        memo.ink.clone_from(&self.glyph_ink);
         memo.seen.0.clone_from(&self.under_out);
         memo.seen.1.clone_from(over);
         memo.seen.2.clone_from(&self.halo_out);
@@ -2900,6 +3246,8 @@ impl CursorGlow {
         copy_ramps(&mut memo.seen.4, &self.out_ramps);
         memo.rails.0.clone_from(&self.ink_ledger.rails);
         memo.rails.1.clone_from(&self.ink_ledger.rail_ramps);
+        memo.owned.0.clone_from(&self.ink_ledger.light_owned);
+        memo.owned.1.clone_from(&self.ink_ledger.light_owned_ramps);
         let print = self.guard_letters_inner(over, caret, geom, spared);
         memo.made.0.clone_from(&self.under_out);
         memo.made.1.clone_from(over);
@@ -2910,6 +3258,31 @@ impl CursorGlow {
         memo.kept = true;
         self.letter_guard.memo = Some(memo);
         print
+    }
+
+    /// Whether [`Self::guard_letters`] judges this frame's lights against its
+    /// letters: the style does not pass it by (`spared`), the frame holds
+    /// text and some light, and the grid has cells.
+    #[inline]
+    fn guard_judges(&self, over: &[GlowQuad], geom: Geom, spared: bool) -> bool {
+        !spared
+            && !self.frame_text.rows.is_empty()
+            && !(over.is_empty()
+                && self.under_out.is_empty()
+                && self.halo_out.is_empty()
+                && self.under_ramps.is_empty()
+                && self.out_ramps.is_empty())
+            && geom.cw as i32 > 0
+            && geom.ch as i32 > 0
+    }
+
+    /// Whether the last cursor step's letter guard judged its lights against
+    /// its letters ([`InkLedger::guard_judged`]). Debug and test builds only.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    #[must_use]
+    pub const fn guard_judged(&self) -> bool {
+        self.ink_ledger.guard_judged
     }
 
     /// [`Self::guard_letters`] on a frame it has not kept; `spared` when
@@ -2923,20 +3296,10 @@ impl CursorGlow {
         geom: Geom,
         spared: bool,
     ) -> u64 {
-        if spared
-            || self.frame_text.rows.is_empty()
-            || (over.is_empty()
-                && self.under_out.is_empty()
-                && self.halo_out.is_empty()
-                && self.under_ramps.is_empty()
-                && self.out_ramps.is_empty())
-        {
+        if !self.guard_judges(over, geom, spared) {
             return 0;
         }
         let (cw, ch) = (geom.cw as i32, geom.ch as i32);
-        if cw <= 0 || ch <= 0 {
-            return 0;
-        }
         let (ox, oy) = (i32::from(geom.origin_x), i32::from(geom.origin_y));
         let mut guard = std::mem::take(&mut self.letter_guard);
         #[cfg(any(test, debug_assertions))]
@@ -3016,6 +3379,31 @@ impl CursorGlow {
         let mut ramp_rows = std::mem::take(&mut guard.ramp_rows);
         let mut print = 0u64;
         let mut solid = None;
+        // What the face lays of each letter's core ([`CursorGlow::observe_glyph_ink`]), by the
+        // cell's glyph and colours: `None` where it lays the colour whole (or no host said).
+        let inks = self.glyph_ink.as_deref();
+        let mut cover_memo: Option<((u8, u32, u32), Option<Cover>)> = None;
+        let mut core_of = |glyph: u8, ink: u32, ground: u32| -> Option<Cover> {
+            let inks = inks?;
+            if let Some((key, c)) = cover_memo
+                && key == (glyph, ink, ground)
+            {
+                return c;
+            }
+            let c = inks
+                .core(
+                    glyph,
+                    aterm_render::linear_luminance(ink),
+                    aterm_render::linear_luminance(ground),
+                )
+                .filter(|&c| c < CORE_SOLID)
+                .map(|c| Cover {
+                    c,
+                    seat: inks.cell_box(glyph),
+                });
+            cover_memo = Some(((glyph, ink, ground), c));
+            c
+        };
         #[inline]
         const fn meets_y(y: u16, h: u16, ry0: i32, ry1: i32) -> bool {
             let y0 = y as i32;
@@ -3042,13 +3430,14 @@ impl CursorGlow {
             // reads as the guard read it before ramps.
             if ry1 > u_y0 && ry0 < u_y1 {
                 if self.under_ramps.is_empty() {
-                    let mut foot = 0usize;
+                    let (mut foot, mut owned) = (0usize, 0usize);
                     let mut k = 0;
                     while k < under.len() {
                         let q = &under[k];
                         if lit(q)
                             && meets_y(q.y, q.h, ry0, ry1)
                             && !ledger.in_foot_rail(k, &mut foot)
+                            && !ledger.in_light_owned(k, &mut owned)
                         {
                             push_row_light(
                                 &mut guard.row,
@@ -3198,7 +3587,9 @@ impl CursorGlow {
                 };
                 // A cell whose ring box, text and lights are the last
                 // frame's keeps the last frame's verdict.
-                let key = guard.cell_key((cx0, ry0, cx1, ry1), (ink, ground), no_room, streams);
+                let cover = core_of(text.glyph(row, col), ink, ground);
+                let key =
+                    guard.cell_key((cx0, ry0, cx1, ry1), (ink, ground), cover, no_room, streams);
                 let share = if let Some(share) = guard.verdict(key) {
                     share
                 } else {
@@ -3206,6 +3597,7 @@ impl CursorGlow {
                         (cx0, ry0, cx1, ry1),
                         (ink, ground),
                         &mut solid,
+                        cover,
                         no_room,
                         streams,
                     );
@@ -3363,7 +3755,8 @@ impl CursorGlow {
         #[inline]
         const fn solve_veil(ink: u32, ground: u32) -> Option<u8> {
             let table = crate::color_math::relative_luminance_table();
-            let solid = solid_ink(ink, ground);
+            let lg = crate::color_math::relative_luminance_with(table, ground);
+            let solid = solid_ink_with(table, ink, ground, lg);
             let la = crate::color_math::relative_luminance_with(table, solid);
             #[inline]
             const fn ratio_ink(
@@ -3374,7 +3767,7 @@ impl CursorGlow {
                 let lb = crate::color_math::relative_luminance_with(table, b);
                 (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
             }
-            let bare = ratio_ink(table, la, ground);
+            let bare = (la.max(lg) + 0.05) / (la.min(lg) + 0.05);
             if bare >= PET_VEIL_THEME_BARE {
                 return None;
             }
@@ -3482,17 +3875,21 @@ impl CursorGlow {
                 (a0, a1): (u8, u8),
                 (k0, k1): (i32, i32),
             ) {
+                let (xk0, xk1) = (x0.max(k0), x1.min(k1));
+                if x1 <= x0 || xk1 <= xk0 || y1 <= y0 {
+                    return;
+                }
+                let dx = x1 - x0;
+                let (ia0, da) = (i32::from(a0), i32::from(a1) - i32::from(a0));
                 let mut bi = 0;
                 while bi < bands.len() {
                     let (cx0, cx1, cy0, cy1) = bands[bi];
-                    let (c0, c1) = (x0.max(cx0).max(k0), x1.min(cx1).min(k1));
+                    let (c0, c1) = (xk0.max(cx0), xk1.min(cx1));
                     let (t0, t1) = (y0.max(cy0), y1.min(cy1));
                     if c1 <= c0 || t1 <= t0 {
                         bi += 1;
                         continue;
                     }
-                    let dx = (x1 - x0).max(1);
-                    let (ia0, da) = (i32::from(a0), i32::from(a1) - i32::from(a0));
                     let s = (ia0 + da * (c0 - x0) / dx).clamp(0, 255) as u8;
                     let e = (ia0 + da * (c1 - x0) / dx).clamp(0, 255) as u8;
                     crate::effect_util::push_fx_ramp(
@@ -4014,12 +4411,83 @@ impl CursorGlow {
         self.dark_rim_fragments = on;
     }
 
+    /// A test's negative control: a particle the effects box cuts at its edge
+    /// is drawn cut, not left out whole ([`Self::emit_particles`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_motes_cut(&mut self, on: bool) {
+        self.motes_cut = on;
+    }
+
+    /// A test's negative control: a particle the effects box's edge cut is
+    /// judged afresh each frame, not left out for the rest of its life
+    /// ([`Self::emit_particles`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_edge_cut_each_frame(&mut self, on: bool) {
+        self.edge_cut_each_frame = on;
+    }
+
+    /// A test's negative control: the edge's latch is held by each cut
+    /// particle's birth and origin, as it was, not by the particle, so a
+    /// scroll (which moves the origin) lets a cut particle back and a cut
+    /// particle holds out every sibling born with it at its origin
+    /// ([`Self::emit_particles`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub fn set_edge_cut_by_origin(&mut self, on: bool) {
+        self.edge_cut_by_origin = on.then(Vec::new);
+    }
+
+    /// A test's negative control: a light that rises past the effects box's
+    /// top (the rainbow ribbon's body, Fire's cores and paper tongues) is cut
+    /// flat there by the box's clip, not laid shorter inside it
+    /// ([`super::super::RISE_CLEAR_PX`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub fn set_rise_cut(&mut self, on: bool) {
+        self.rise_cut = on;
+        self.v2.ribbon_mut().rise_cut = on;
+    }
+
+    /// The highest window y a rising light reaches in `geom`
+    /// ([`Geom::rise_ceiling`]; with [`Self::set_rise_cut`], none: the box's
+    /// clip cuts it).
+    #[inline]
+    pub(crate) const fn rise_ceiling(&self, geom: &Geom) -> f32 {
+        #[cfg(any(test, debug_assertions))]
+        if self.rise_cut {
+            return f32::NEG_INFINITY;
+        }
+        geom.rise_ceiling()
+    }
+
     /// A test's negative control: Classic's spectrum face passes the guard by
     /// on paper too ([`LetterGuard::classic_paper_off`]).
     #[cfg(any(test, debug_assertions))]
     #[inline]
     pub const fn set_letter_guard_classic_paper(&mut self, on: bool) {
         self.letter_guard.classic_paper_off = !on;
+    }
+
+    /// A test's negative control: Classic's paper landing ring laid at its
+    /// growing size wherever it lands, over the letters, and cut where the
+    /// letter floor cuts it, as it was before looks10 L12
+    /// ([`crate::classic_wake::ClassicWake::ring_cut`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_classic_paper_ring_cut(&mut self, on: bool) {
+        self.classic.ring_cut = on;
+    }
+
+    /// A test's negative control: Classic's one-colour tracer up a dim page
+    /// lays its shade under the letters at its own share of its light and
+    /// weighed and cut with the lights in its cells, as looks10 round 2 laid
+    /// it ([`crate::classic_wake::ClassicWake::tracer_up_faint_shade`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_classic_faint_shade(&mut self, on: bool) {
+        self.classic.tracer_up_faint_shade = on;
     }
 
     /// A test's negative control: a word gap climbs the ramp's slope from
@@ -4454,6 +4922,12 @@ mod tests {
         FirstLightOnly,
         /// No halo.
         NoHalos,
+        /// No core reading ([`Judge::cover`]): the solid ink alone.
+        NoCore,
+        /// The core read in the bare colour, as if no light lay over the text.
+        BareFg,
+        /// The core read at every pixel of the cell, not only where its glyph lays ink.
+        WholeCell,
     }
 
     /// The share the guard's first form weighed: at each share the
@@ -4596,6 +5070,25 @@ mod tests {
                     if ratio(li, lo) < bar || ratio(li, hi) < bar {
                         return false;
                     }
+                    // The core: its coverage of the colour under the over-text lights, the
+                    // rest each ring ground's own lit ground.
+                    let [bx0, by0, bx1, by1] = j.core_box;
+                    let seated =
+                        (bx0..bx1).contains(&(x - j.x0)) && (by0..by1).contains(&(y - j.y0));
+                    if let Some((c, bar_c)) = j.cover
+                        && lapse != Lapse::NoCore
+                        && (seated || lapse == Lapse::WholeCell)
+                    {
+                        let f = if has_over && lapse != Lapse::BareFg {
+                            lum(px(j.fg, x, y, false, s))
+                        } else {
+                            j.l_fg
+                        };
+                        let on = |g: f32| ratio(c * f + (1.0 - c) * g, g);
+                        if (lo <= f && f <= hi) || on(lo) < bar_c || on(hi) < bar_c {
+                            return false;
+                        }
+                    }
                 }
             }
             true
@@ -4730,10 +5223,28 @@ mod tests {
         let solid = solid_ink(ink, ground);
         let lum = crate::color_math::relative_luminance;
         let (l_ink, l_ground) = (lum(solid), lum(ground));
-        let bar = letter_bar(
-            (l_ink.max(l_ground) + 0.05) / (l_ink.min(l_ground) + 0.05),
-            mix.chance(2),
-        );
+        let ratio = |a: f32, b: f32| (a.max(b) + 0.05) / (a.min(b) + 0.05);
+        let no_room = mix.chance(2);
+        let bar = letter_bar(ratio(l_ink, l_ground), no_room);
+        // Half the cells' faces lay the core at a share of the colour, read at its own bar.
+        let l_fg = lum(ink);
+        let cover = mix.chance(5).then(|| {
+            let c = 0.3 + 0.69 * (mix.below(1000) as f32 / 1000.0);
+            let l_c = c * l_fg + (1.0 - c) * l_ground;
+            (c, letter_bar(ratio(l_c, l_ground), no_room))
+        });
+        // Where the glyph lays ink: some box of the cell, or the whole of it.
+        let (iw, ih) = ((w - 2 * RING).max(1), (h - 2 * RING).max(1));
+        let core_box = if mix.chance(7) {
+            let (bx, by) = (mix.below(iw as u32) as i32, mix.below(ih as u32) as i32);
+            let (bw, bh) = (
+                1 + mix.below((iw - bx) as u32) as i32,
+                1 + mix.below((ih - by) as u32) as i32,
+            );
+            [RING + bx, RING + by, RING + bx + bw, RING + by + bh]
+        } else {
+            [RING, RING, w - RING, h - RING]
+        };
         let j = Judge {
             x0,
             y0,
@@ -4743,20 +5254,27 @@ mod tests {
             ground,
             l_ink,
             l_ground,
+            fg: ink,
+            l_fg,
+            cover,
+            core_box,
         };
         (j, bar, quads, halos, cell)
     }
 
     /// The guard's share for a cell, laid once and read row by row at each
     /// share, is the share the first form weighed composing every pixel
-    /// of the ring box light by light, over randomized cells; each negative
-    /// control (a reading that drops the stacked lights, or the halos)
-    /// differs from it on some cell, so the cells exercise both.
+    /// of the ring box light by light, over randomized cells, the core of
+    /// a face that lays it at a share of the colour read too where its glyph
+    /// lays ink; each negative control (a reading that drops the stacked
+    /// lights, the halos, the core, or the over-text lights on the core's
+    /// colour, or reads the core over the whole cell) differs from it on some
+    /// cell, so the cells exercise each.
     #[test]
     fn the_guard_s_share_is_the_share_of_every_pixel_composited() {
         let mut mix = Mix(0x6C65_7474_6572);
         let mut guard = LetterGuard::default();
-        let (mut cut, mut lapses) = (0, [0usize; 2]);
+        let (mut cut, mut lapses) = (0, [0usize; 5]);
         let cases = 1500;
         for case in 0..cases {
             let (j, bar, quads, halos, cell) = random_cell(&mut mix);
@@ -4774,12 +5292,21 @@ mod tests {
                 "case {case}: the guard's share {got} against every pixel's {want}"
             );
             cut += usize::from(got < 1.0);
-            for (k, lapse) in [Lapse::FirstLightOnly, Lapse::NoHalos]
-                .into_iter()
-                .enumerate()
+            for (k, lapse) in [
+                Lapse::FirstLightOnly,
+                Lapse::NoHalos,
+                Lapse::NoCore,
+                Lapse::BareFg,
+                Lapse::WholeCell,
+            ]
+            .into_iter()
+            .enumerate()
             {
-                let off = share_by_every_pixel(j, bar, &cell, streams, lapse);
-                lapses[k] += usize::from(off.to_bits() != want.to_bits());
+                // A control is shown once it misreads one cell; more decide nothing.
+                if lapses[k] == 0 {
+                    let off = share_by_every_pixel(j, bar, &cell, streams, lapse);
+                    lapses[k] += usize::from(off.to_bits() != want.to_bits());
+                }
             }
         }
         assert!(
@@ -4791,6 +5318,15 @@ mod tests {
             "control: no cell's share read its stacked lights"
         );
         assert!(lapses[1] > 0, "control: no cell's share read its halos");
+        assert!(lapses[2] > 0, "control: no cell's share read its core");
+        assert!(
+            lapses[3] > 0,
+            "control: no cell's core read the lights over the text"
+        );
+        assert!(
+            lapses[4] > 0,
+            "control: no cell's core read only where its glyph lays ink"
+        );
     }
 
     /// A quad's light read with no division ([`quad_light`]) is the
@@ -5277,5 +5813,103 @@ mod tests {
             gathered_ramps < gathered_quads,
             "premise: the ramps gathered their near dims {gathered_ramps} times, their quads {gathered_quads}"
         );
+    }
+
+    /// §15.2 1.9: the letter guard never weighs nor cuts the light-owned glass
+    /// ([`InkLedger::note_light_owned_laid`]): the yield cuts it to the words
+    /// (`glass_yield`). A dark glass under a row of paper's letters, laid as
+    /// quads and as ramps, keeps every light it was laid with, while a light
+    /// laid after it on the same letters, not light-owned, is cut as before.
+    /// Negative control: the glass not noted, the guard cuts it.
+    #[test]
+    fn the_letter_guard_never_cuts_light_owned_glass() {
+        use aterm_render::{BeamRows, RampCost, RampSink};
+        let g = Geom {
+            cw: 8,
+            ch: 16,
+            rows: 6,
+            cols: 40,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 320,
+            win_h: 96,
+            head: 0,
+        };
+        let row = 2u16;
+        let paper = aterm_core::terminal::RenderCell {
+            fg: [0x2B, 0x2D, 0x33],
+            bg: [0xF6, 0xF7, 0xF9],
+            ..aterm_core::terminal::RenderCell::default()
+        };
+        let mut cells = vec![vec![paper; g.cols]; g.rows];
+        for (col, ch) in [(2, 'e'), (3, 'c'), (4, 'h'), (5, 'o'), (7, 'h'), (8, 'i')] {
+            cells[usize::from(row)][col].ch = ch;
+        }
+        // The glass across the row's letters, a dark source-over light, then
+        // a light after it on the same letters.
+        fn lay<S: BeamRows>(out: &mut S, row: u16) -> (S::Mark, S::Mark) {
+            let from = out.mark();
+            out.slab();
+            for y in row * 16..row * 16 + 16 {
+                out.row(
+                    i32::from(row),
+                    row,
+                    (0, y, 96),
+                    (0x0030_0838, 0xC8),
+                    (0x0008_3030, 0xC0),
+                );
+            }
+            let to = out.mark();
+            out.slab();
+            out.rect(
+                i32::from(row),
+                row,
+                (8, row * 16 + 4, 64, 8),
+                (0x0020_2020, 0xB0),
+            );
+            (from, to)
+        }
+        let guard = |owned: bool, ramped: bool| {
+            let mut glow = CursorGlow::default();
+            glow.observe_frame_text(Some((row, 30)), &cells, Instant::now());
+            let (mut quads, mut ramps) = (Vec::new(), GlowRamps::default());
+            let (from, to) = if ramped {
+                let mut sink = RampSink::new(&mut quads, &mut ramps).costed(RampCost::ALWAYS);
+                lay(&mut sink, row)
+            } else {
+                let (from, to) = lay(&mut quads, row);
+                ((from, ramps.mark()), (to, ramps.mark()))
+            };
+            if owned {
+                glow.ink_ledger.note_light_owned_laid(from, to);
+            }
+            let mut laid = Vec::new();
+            ramps.expand_into(&quads, &mut laid);
+            let glass_n = laid.len() - 1;
+            glow.under_out = quads;
+            glow.under_ramps = ramps;
+            let mut over = Vec::new();
+            let _ = glow.guard_letters(&mut over, Some((row, 30)), g, GlowStyle::RainbowKitty);
+            let mut got = Vec::new();
+            glow.under_ramps.expand_into(&glow.under_out, &mut got);
+            (laid, got, glass_n)
+        };
+        for ramped in [false, true] {
+            let (laid, got, n) = guard(true, ramped);
+            assert!(
+                got.len() >= n && got[..n] == laid[..n],
+                "ramped {ramped}: the light-owned glass is laid whole: {got:?}"
+            );
+            assert_ne!(
+                got[n..],
+                laid[n..],
+                "ramped {ramped}: the light after the glass is cut as before"
+            );
+            let (laid, got, n) = guard(false, ramped);
+            assert!(
+                got.len() < n || got[..n] != laid[..n],
+                "ramped {ramped}, control: the glass not light-owned is cut"
+            );
+        }
     }
 }

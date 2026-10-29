@@ -292,7 +292,9 @@ impl DeadReason {
 }
 
 /// The words a help text names after `mirror=`, whether as `<a|b>`, `a|b` or one word: the
-/// seam the tests holding `help fabric` and `aterm help fabric` to [`MirrorState`] read.
+/// seam the tests holding `help fabric` and `aterm help fabric` to [`MirrorState`] read. Each
+/// hands it only the text's reply slots (`help fabric`'s `OK ...` span, the page's `aterm ctl
+/// fabric status` row), since prose that repeats a word would stand in for a dropped slot.
 #[cfg(any(test, debug_assertions))]
 #[must_use]
 pub fn mirror_words_named(text: &str) -> std::collections::BTreeSet<&str> {
@@ -376,13 +378,23 @@ mod tests {
     }
 
     /// `help fabric` names exactly the words `fabric status` prints after `mirror=`: every
-    /// [`MirrorState`], one generated list with its word table.
+    /// [`MirrorState`], one generated list with its word table. The words are read only from
+    /// the help's quoted `fabric status` reply (the backticked span that starts `OK `) and its
+    /// `mirror=` slots, so the prose that repeats a word (`mirror=unserved` when no bridge
+    /// named `log=`) never stands in for one the reply's template dropped.
     #[test]
     fn help_fabric_names_exactly_the_mirror_words_fabric_status_prints() {
         let help = crate::control_verbs::spec("fabric")
             .expect("the fabric verb")
             .help_line();
-        let named = mirror_words_named(&help);
+        let reply = help
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|span| span.starts_with("OK "))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let named = mirror_words_named(&reply);
         let printed: std::collections::BTreeSet<&str> =
             MirrorState::ALL.iter().map(|s| s.word()).collect();
         assert_eq!(

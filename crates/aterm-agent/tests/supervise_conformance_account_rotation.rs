@@ -806,6 +806,7 @@ fn turn_end(worked: Option<Duration>) -> TurnEndReading {
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::Clean,
         fact: None,
+        wake: None,
     }
 }
 

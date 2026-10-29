@@ -16,6 +16,15 @@ pub(crate) const LONG_HOLD: Duration = Duration::from_secs(30 * 60);
 
 const LONG_HOLD_RESTATE: Duration = Duration::from_secs(60);
 
+/// Why a control client's copy or paste did nothing ([`App::refuse_clipboard_gesture`]).
+pub(crate) const CLIPBOARD_REFUSED: &str = "the clipboard is the person's own: a control client \
+     cannot copy to it or paste from it (send text with the `paste` verb)";
+
+/// Log that a control client's `what` (a copy or a paste) was refused.
+pub(crate) fn note_clipboard_refused(what: &str) {
+    aterm_log::info!("{what} refused: {CLIPBOARD_REFUSED}");
+}
+
 #[cfg(test)]
 thread_local! {
     /// Test clock of [`hold_unix_now`]: `Some(unix seconds)` stands in for the wall clock on
@@ -59,8 +68,8 @@ pub(crate) struct AgentsState {
     /// Test record: how many looks walked the holds.
     #[cfg(test)]
     pub(crate) long_hold_walks: u32,
-    /// The gesture being dispatched is a control client's: a `key`, `text` or `pointer` verb
-    /// driving an open overlay (the palette, Overview, the tab menu).
+    /// The gesture being dispatched is a control client's: any input verb (`key`, `text`,
+    /// `paste`, `mouse`) through [`App::input_to_session`], a `pointer`, `act` or `invoke`.
     pub(crate) controller_gesture: bool,
     /// How many control-client gestures were dispatched in this process
     /// ([`App::with_gesture_source`] with `controller` set), anywhere. System
@@ -779,6 +788,37 @@ impl App {
         let out = f(self);
         self.agents.controller_gesture = prior;
         out
+    }
+
+    /// Run `f` with the dispatch marked as a control client's when `controller` is set, keeping a
+    /// mark an enclosing dispatch already set, and restoring the mark after. Unlike
+    /// [`Self::with_gesture_source`] it counts no gesture in `controller_gestures`: it marks a
+    /// control client's whole input dispatch ([`App::input_to_session`]), so a person-only act
+    /// anywhere in it refuses the client, while only the surfaces that count a gesture (an
+    /// overlay, the tab menu, a native view) count one.
+    pub(crate) fn with_controller_mark<R>(
+        &mut self,
+        controller: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let marked = controller || self.agents.controller_gesture;
+        let prior = std::mem::replace(&mut self.agents.controller_gesture, marked);
+        let out = f(self);
+        self.agents.controller_gesture = prior;
+        out
+    }
+
+    /// Whether a control client's gesture is being dispatched, so `what` (a copy to, or a paste
+    /// from, the person's clipboard) refuses it: `selection.copy` and `selection.paste` ask for
+    /// [`crate::command_registry::ActionAuthority::Clipboard`], which no control client reaches.
+    /// A refusal is logged and answers an `invoke` with [`CLIPBOARD_REFUSED`].
+    pub(crate) fn refuse_clipboard_gesture(&mut self, what: &str) -> bool {
+        if !self.person_gesture_refused() {
+            return false;
+        }
+        note_clipboard_refused(what);
+        self.pending_action_refusal = Some(CLIPBOARD_REFUSED.to_string());
+        true
     }
 
     fn person_hold_session(&mut self, session: u64, on: bool) -> Result<(), String> {

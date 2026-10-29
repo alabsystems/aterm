@@ -28,14 +28,14 @@ impl CellCoord {
 
 mod extra_flags {
     /// Underline color is present (bytes 0-2 of colors array).
-    pub(crate) const HAS_UNDERLINE_COLOR: u16 = 1 << 0;
+    pub(crate) const HAS_UNDERLINE_COLOR: u32 = 1 << 0;
     /// Foreground RGB is present (bytes 3-5 of colors array).
-    pub(crate) const HAS_FG_RGB: u16 = 1 << 1;
+    pub(crate) const HAS_FG_RGB: u32 = 1 << 1;
     /// Background RGB is present (bytes 6-8 of colors array).
-    pub(crate) const HAS_BG_RGB: u16 = 1 << 2;
+    pub(crate) const HAS_BG_RGB: u32 = 1 << 2;
     /// Mask for color presence flags.
-    pub(crate) const COLOR_MASK: u16 = HAS_UNDERLINE_COLOR | HAS_FG_RGB | HAS_BG_RGB;
-    /// Bits 3-15 are available for extended flags.
+    pub(crate) const COLOR_MASK: u32 = HAS_UNDERLINE_COLOR | HAS_FG_RGB | HAS_BG_RGB;
+    /// Bits 3-18 store the full 16-bit extended flags word without truncating bits 13-15.
     pub(crate) const EXTENDED_SHIFT: u32 = 3;
 }
 
@@ -78,8 +78,8 @@ pub const MAX_IMAGE_LAYERS: usize = 16;
 /// Rare cell attributes stored outside the packed 8-byte `Cell`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CellExtra {
-    /// Bitflags: bits 0-2 track color presence, bits 3-15 for extended flags.
-    flags: u16,
+    /// Bitflags: bits 0-2 track color presence, bits 3-18 store 16-bit extended flags.
+    flags: u32,
     /// Packed RGB.
     colors: [u8; 9],
     /// Indexed underline color.
@@ -107,19 +107,19 @@ impl CellExtra {
             || self.underline_color_idx.is_some()
     }
 
-    /// Get extended flags (bits 3-15 of flags field).
+    /// Get extended flags (bits 3-18 of flags field).
     #[must_use]
     #[inline]
     #[cfg(test)]
     pub const fn extended_flags(&self) -> u16 {
-        self.flags >> extra_flags::EXTENDED_SHIFT
+        (self.flags >> extra_flags::EXTENDED_SHIFT) as u16
     }
 
-    /// Set extended flags (bits 3-15 of flags field).
+    /// Set extended flags (bits 3-18 of flags field, preserving all 16 bits of `ext_flags`).
     #[inline]
     pub const fn set_extended_flags(&mut self, ext_flags: u16) {
-        self.flags =
-            (self.flags & extra_flags::COLOR_MASK) | (ext_flags << extra_flags::EXTENDED_SHIFT);
+        self.flags = (self.flags & extra_flags::COLOR_MASK)
+            | ((ext_flags as u32) << extra_flags::EXTENDED_SHIFT);
     }
 
     /// Get the hyperlink URL.
@@ -172,7 +172,7 @@ impl CellExtra {
     /// Get a packed RGB color by array offset and presence flag.
     #[must_use]
     #[inline]
-    const fn get_color(&self, offset: usize, flag: u16) -> Option<[u8; 3]> {
+    const fn get_color(&self, offset: usize, flag: u32) -> Option<[u8; 3]> {
         if self.flags & flag != 0 {
             Some([
                 self.colors[offset],
@@ -186,7 +186,7 @@ impl CellExtra {
 
     /// Set a packed RGB color by array offset and presence flag.
     #[inline]
-    const fn set_color(&mut self, offset: usize, flag: u16, rgb: Option<[u8; 3]>) {
+    const fn set_color(&mut self, offset: usize, flag: u32, rgb: Option<[u8; 3]>) {
         match rgb {
             Some([r, g, b]) => {
                 self.colors[offset] = r;
@@ -214,22 +214,22 @@ impl CellExtra {
         self.underline_color_idx = None;
     }
 
-    /// Set the underline color from packed u32 format (0xTT_XXXXXX).
+    /// Set the underline color from packed u32 format (`0x01_RRGGBB` RGB, `0x00`/`0x02` indexed, `0xFF`/other reset).
     #[inline]
     pub const fn set_underline_color_u32(&mut self, color: Option<u32>) {
         match color {
-            Some(c) if (c >> 24) & 0xFF == 0x02 => {
+            Some(c) if matches!((c >> 24) & 0xFF, 0x00 | 0x02) => {
                 let index = (c & 0xFF) as u8;
                 self.underline_color_idx = Some(index);
                 self.flags &= !extra_flags::HAS_UNDERLINE_COLOR;
             }
-            Some(c) => {
+            Some(c) if (c >> 24) & 0xFF == 0x01 => {
                 let r = ((c >> 16) & 0xFF) as u8;
                 let g = ((c >> 8) & 0xFF) as u8;
                 let b = (c & 0xFF) as u8;
                 self.set_underline_color(Some([r, g, b]));
             }
-            None => {
+            Some(_) | None => {
                 self.flags &= !extra_flags::HAS_UNDERLINE_COLOR;
                 self.underline_color_idx = None;
             }
@@ -465,7 +465,7 @@ pub struct UniformExtras<'a> {
     pub bg_rgb: Option<[u8; 3]>,
     /// Underline color as packed u32 (0xTT_RRGGBB).
     pub underline_color: Option<u32>,
-    /// Extended flags (bits 3-15 of CellExtra flags field).
+    /// Extended flags (bits 3-18 of CellExtra flags field).
     pub extended_flags: u16,
     /// Hyperlink URL (OSC 8).
     pub hyperlink: Option<&'a Arc<str>>,
@@ -473,14 +473,16 @@ pub struct UniformExtras<'a> {
     pub hyperlink_id: Option<&'a Arc<str>>,
 }
 
-/// Encode a packed `0xTT_XXXXXX` underline colour as an SGR 58 parameter.
+/// Encode a packed `0xTT_XXXXXX` underline colour as an SGR 58/59 parameter.
 #[must_use]
 pub fn underline_color_sgr(packed: u32) -> String {
-    if (packed >> 24) & 0xFF == 0x02 {
-        format!("58:5:{}", packed & 0xFF)
-    } else {
-        let (r, g, b) = ((packed >> 16) & 0xFF, (packed >> 8) & 0xFF, packed & 0xFF);
-        format!("58:2::{r}:{g}:{b}")
+    match (packed >> 24) & 0xFF {
+        0x00 | 0x02 => format!("58:5:{}", packed & 0xFF),
+        0x01 => {
+            let (r, g, b) = ((packed >> 16) & 0xFF, (packed >> 8) & 0xFF, packed & 0xFF);
+            format!("58:2::{r}:{g}:{b}")
+        }
+        _ => "59".to_string(),
     }
 }
 

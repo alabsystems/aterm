@@ -6,7 +6,7 @@
 
 use super::{
     Key, KeyEventType, KeyboardMode, Modifiers, NamedKey, encode_key, encode_key_with_layout,
-    encode_key_with_text, typed_character,
+    encode_key_with_text, layout_letter_twin, typed_character,
 };
 
 const SHIFT: Modifiers = Modifiers::SHIFT;
@@ -288,4 +288,17 @@ fn a_chord_on_a_non_us_layout_takes_the_layouts_character() {
     );
     assert_eq!(ctrl('х', CTRL, kitty(1), Some('[')), b"\x1b[1093;5u");
     assert_eq!(ctrl('х', CTRL, kitty(5), Some('[')), b"\x1b[1093::91;5u");
+}
+
+#[test]
+fn layout_letter_twin_matches_non_ascii_letters_with_ascii_letter_base_keys() {
+    assert_eq!(layout_letter_twin('с', Some('c')), Some('c'));
+    assert_eq!(layout_letter_twin('ψ', Some('c')), Some('c'));
+    assert_eq!(layout_letter_twin('ב', Some('C')), Some('C'));
+    assert_eq!(layout_letter_twin('a', Some('q')), None);
+    assert_eq!(layout_letter_twin('Z', Some('y')), None);
+    assert_eq!(layout_letter_twin('№', Some('n')), None);
+    assert_eq!(layout_letter_twin('é', Some('2')), None);
+    assert_eq!(layout_letter_twin('б', Some(',')), None);
+    assert_eq!(layout_letter_twin('с', None), None);
 }

@@ -5,7 +5,7 @@
 
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::Terminal;
-use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
+use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig};
 use aterm_effects::rainbow_kitty::TypedClass;
 use aterm_effects::rainbow_kitty::ribbon::RETRACT_FADE_S;
 use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
@@ -31,15 +31,8 @@ const LIFTED: std::ops::RangeInclusive<usize> = 55..=61;
 
 fn cfg() -> GlowConfig {
     GlowConfig {
-        classic_mono: false,
-        ribbon_tall: true,
-        ribbon_flat: false,
-        enabled: true,
-        dark_theme: true,
         theme_fg: 0x00D0_D0D0,
         theme_bg: 0x0011_1318,
-        style: GlowStyle::RainbowKitty,
-        color: 0x0050_FA7B,
         accent: 0x007A_A2F7,
         duration: Duration::from_millis(240),
         length: 18,
@@ -47,8 +40,7 @@ fn cfg() -> GlowConfig {
         audible: true,
         radius: 0.6,
         ring: true,
-        beam: false,
-        head_dx: 0.5,
+        ..Default::default()
     }
 }
 

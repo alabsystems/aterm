@@ -83,6 +83,12 @@ impl WarmHint {
             if slot.is_some() {
                 return None;
             }
+            if value.is_empty()
+                || !value.bytes().all(|b| b.is_ascii_digit())
+                || (value.len() > 1 && value.starts_with('0'))
+            {
+                return None;
+            }
             *slot = Some(value.parse::<u32>().ok()?);
         }
         Some(Self {
@@ -170,6 +176,11 @@ mod tests {
             "w1;windows=1;sessions=1;cols=80",
             "w1;windows=1;sessions=1;cols=80;rows=24;rows=25",
             "w1;windows=-1;sessions=1;cols=80;rows=24",
+            "w1;windows=+1;sessions=1;cols=80;rows=24",
+            "w1;windows=01;sessions=1;cols=80;rows=24",
+            "w1;windows=00;sessions=1;cols=80;rows=24",
+            "w1;windows=1;sessions=1;cols=80;rows=24;px=+28000;reset=24000",
+            "w1;windows=1;sessions=1;cols=80;rows=24;px=028000;reset=24000",
             "w1;windows=1;sessions=1;cols=70000;rows=24",
             "w1;windows=1;sessions=1;cols=80;rows=24;px",
             "w1;windows=1;sessions=1;cols=80;rows=24;px=abc;reset=1",

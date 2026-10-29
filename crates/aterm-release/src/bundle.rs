@@ -94,12 +94,12 @@ pub fn staging_dir_name(build: u64) -> String {
     format!("cut-{build}.noindex")
 }
 
-/// Whether `name` names a cut staging directory, `cut-<digits>.noindex`.
+/// Whether `name` names a cut staging directory, `cut-<build>.noindex` (`build` a canonical `u64`).
 #[must_use]
 pub fn is_staging_dir_name(name: &str) -> bool {
     name.strip_prefix("cut-")
         .and_then(|rest| rest.strip_suffix(".noindex"))
-        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .is_some_and(|n| n.parse::<u64>().is_ok_and(|k| k.to_string() == n))
 }
 
 /// Where this cut's bundle is signed, notarized and packaged: `dist/cut-<build>.noindex/aterm.app`.
@@ -520,13 +520,16 @@ mod staging_tests {
             staged_app_path(Path::new("/r/dist"), 2),
             "two claims never share a staging bundle"
         );
-        for name in ["cut-1.noindex", "cut-1790000000.noindex"] {
+        for name in ["cut-0.noindex", "cut-1.noindex", "cut-1790000000.noindex"] {
             assert!(is_staging_dir_name(name), "{name}");
         }
         for name in [
             "cut-app",
             "cut-state.toml",
             "cut-.noindex",
+            "cut-007.noindex",
+            "cut-+7.noindex",
+            "cut-999999999999999999999.noindex",
             "cut-12x.noindex",
             "cut-app-old",
             "aterm.app",

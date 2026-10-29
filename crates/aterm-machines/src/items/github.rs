@@ -63,10 +63,17 @@ pub const SYSTEM_GIT: &str = "/usr/bin/git";
 /// The git installed for the runs here. On a Mac never `/usr/bin/git` (macOS's shim, which asks
 /// a person to install the Command Line Tools): the tools' own ([`CLT_GIT`]), else, on a Mac with
 /// Xcode and not the tools, the git of the developer directory `xcode-select -p` names (the one a
-/// person chose, else Xcode's). Elsewhere the distribution's ([`SYSTEM_GIT`]). Read without a
-/// child process; `None` when none is there.
+/// person chose, else Xcode's), else a live `git` build in the account's `atpkg` store. Elsewhere
+/// the distribution's ([`SYSTEM_GIT`]). Read without a child process; `None` when none is there.
 #[must_use]
 pub fn installed_git(sys: &dyn System) -> Option<PathBuf> {
+    installed_git_for(sys, None)
+}
+
+/// [`installed_git`] restricted to the system / Apple Developer paths without `atpkg`'s store
+/// (used first by [`installed_git`] and as the negative-control baseline in tests).
+#[must_use]
+pub fn installed_git_without_atpkg(sys: &dyn System) -> Option<PathBuf> {
     let file = |path: &Path| sys.stat(path).is_ok_and(|stat| !stat.dir);
     if !sys.macos() {
         return file(Path::new(SYSTEM_GIT)).then(|| SYSTEM_GIT.into());
@@ -81,6 +88,90 @@ pub fn installed_git(sys: &dyn System) -> Option<PathBuf> {
         .chain([PathBuf::from(XCODE_DEVELOPER)])
         .map(|dir| dir.join("usr/bin/git"))
         .find(|git| file(git))
+}
+
+/// [`installed_git`] checking `user_home`'s `atpkg` store (when given) before falling back to
+/// [`System::identity`]'s home.
+#[must_use]
+pub fn installed_git_for(sys: &dyn System, user_home: Option<&Path>) -> Option<PathBuf> {
+    if let Some(git) = installed_git_without_atpkg(sys) {
+        return Some(git);
+    }
+    if !sys.macos() {
+        return None;
+    }
+    if let Some(home) = user_home
+        && let Some(git) = atpkg_installed_git(sys, home)
+    {
+        return Some(git);
+    }
+    let id_home = sys.account_home()?;
+    if user_home == Some(id_home.as_path()) {
+        return None;
+    }
+    atpkg_installed_git(sys, &id_home)
+}
+
+fn atpkg_prefix_for(sys: &dyn System, home: &Path) -> PathBuf {
+    let cfg = home.join(".config/aterm/aterm.toml");
+    if let Ok(bytes) = sys.read_file(&cfg)
+        && let Ok(text) = std::str::from_utf8(&bytes)
+        && let Some(configured) = aterm_toolchain::configured_prefix_in(text, home)
+    {
+        return configured;
+    }
+    if sys.macos() {
+        home.join("Library/Application Support/aterm/pkg")
+    } else {
+        aterm_toolchain::default_atpkg_prefix(home)
+    }
+}
+
+fn physical(sys: &dyn System, store_git: &Path, current: &Path) -> Option<String> {
+    let link = sys.read_link(current).ok()?;
+    let build = if link.is_absolute() {
+        let rel = link.strip_prefix(store_git).ok()?;
+        let mut comps = rel.components();
+        let std::path::Component::Normal(name) = comps.next()? else {
+            return None;
+        };
+        if comps.next().is_some() {
+            return None;
+        }
+        name.to_str()?.to_owned()
+    } else {
+        let mut comps = link.components();
+        let std::path::Component::Normal(name) = comps.next()? else {
+            return None;
+        };
+        if comps.next().is_some() {
+            return None;
+        }
+        name.to_str()?.to_owned()
+    };
+    (!build.is_empty() && build.bytes().all(|b| b.is_ascii_digit())).then_some(build)
+}
+
+fn atpkg_installed_git(sys: &dyn System, home: &Path) -> Option<PathBuf> {
+    if !home.is_absolute() {
+        return None;
+    }
+    let prefix = atpkg_prefix_for(sys, home);
+    let store_git = prefix.join("store/git");
+    let build = physical(sys, &store_git, &store_git.join("current"))?;
+    let reg_file = |p: &Path| sys.stat(p).is_ok_and(|s| !s.dir && !s.symlink);
+    let exec_file = |p: &Path| {
+        sys.stat(p)
+            .is_ok_and(|s| !s.dir && !s.symlink && (s.mode & 0o111) != 0)
+    };
+    if !reg_file(&store_git.join(format!("{build}.ready"))) {
+        return None;
+    }
+    if !exec_file(&store_git.join(&build).join("bin/git")) {
+        return None;
+    }
+    let shim = prefix.join("bin/git");
+    exec_file(&shim).then_some(shim)
 }
 
 /// [`installed_git`], or where none is installed the one it looks for first ([`CLT_GIT`],
@@ -559,7 +650,7 @@ impl Item for GitItem {
     }
 
     fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
-        let Some(program) = installed_git(sys) else {
+        let Some(program) = installed_git_for(sys, Some(Path::new(&self.user.home))) else {
             return Probe::Waits {
                 on: CLT_ITEM.to_owned(),
                 why: format!(
@@ -1189,5 +1280,49 @@ mod tests {
             [(true, true); 4],
             "all unknown/invalid reads refuse and retain every original byte"
         );
+    }
+
+    #[test]
+    fn installed_git_accepts_live_atpkg_git_without_clt_and_refuses_stub_or_without_arm() {
+        let exec = Stat {
+            mode: 0o755,
+            ..FILE
+        };
+        let prefix = "/Users//alice/Library/Application Support/aterm/pkg";
+        let shim = format!("{prefix}/bin/git");
+        let sys = Fake::root();
+        sys.logged_in(&alice());
+
+        // Stub / tombstone alone at `bin/git` (no `store/git/current` + `.ready`) is NOT a live git.
+        sys.stat_of(&shim, exec);
+        assert_eq!(installed_git(&sys), None);
+        assert_eq!(git_program(&sys), PathBuf::from(CLT_GIT));
+
+        // Activate build 12 in `store/git`: `current -> 12`, `12.ready`, and `12/bin/git`.
+        sys.link(&format!("{prefix}/store/git/current"), "12");
+        sys.stat_of(&format!("{prefix}/store/git/12.ready"), FILE);
+        sys.stat_of(&format!("{prefix}/store/git/12/bin/git"), exec);
+
+        // Positive: `installed_git` and `git_program` now select atpkg's `bin/git`, and
+        // `GitItem::probe` runs without waiting on CLT.
+        assert_eq!(installed_git(&sys), Some(PathBuf::from(&shim)));
+        assert_eq!(git_program(&sys), PathBuf::from(&shim));
+        // Negative control (C8): `installed_git_without_atpkg` returns `None` on the same machine.
+        assert_eq!(installed_git_without_atpkg(&sys), None);
+
+        let quoted_shim = crate::port::shell_word(&shim);
+        sys.on(
+            &format!("alice$ {quoted_shim} config --global --get user.name"),
+            Ran::exit(1, ""),
+        );
+        let item = by_id("github.git-name@alice");
+        assert!(
+            matches!(item.probe(&sys, &ctx()), Probe::Change { .. }),
+            "GitItem must proceed with atpkg git instead of waiting on CLT"
+        );
+
+        // Once CLT is installed too, CLT still takes precedence over atpkg's shim.
+        sys.stat_of(CLT_GIT, exec);
+        assert_eq!(installed_git(&sys), Some(PathBuf::from(CLT_GIT)));
     }
 }

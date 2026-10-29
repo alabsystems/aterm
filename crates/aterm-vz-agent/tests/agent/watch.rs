@@ -75,13 +75,14 @@ fn hello_then_booting_while_jobs_run_then_ready_degraded_then_beats() {
     host.send(&Frame::Clock { unix_ns: clock });
 
     let mut booting = Vec::new();
-    let ready = loop {
-        match host.frame() {
-            Some(Frame::Booting(jobs)) => booting.push(jobs),
-            Some(Frame::Ready(r)) => break r,
-            other => panic!("before Ready: {other:?}"),
+    let ready = until("Ready", || match host.frame() {
+        Some(Frame::Booting(jobs)) => {
+            booting.push(jobs);
+            None
         }
-    };
+        Some(Frame::Ready(r)) => Some(r),
+        other => panic!("before Ready: {other:?}"),
+    });
     assert_eq!(
         ready,
         Ready {
@@ -135,18 +136,31 @@ fn hello_then_booting_while_jobs_run_then_ready_degraded_then_beats() {
         .expect("hung: the watch outlived its host");
 }
 
+/// A boot systemd already calls over is `Ready`, `running` with no failed unit, after empty
+/// `Booting` frames: one, and one more each tick the boot thread's first answer takes to
+/// arrive (on a loaded host it can miss the first tick).
 #[test]
 fn a_boot_that_was_over_is_ready_running_with_no_failed_unit() {
     let fake = Arc::new(Fake::new());
     let (mut host, _ended) = watching(&fake);
     assert_eq!(host.frame(), Some(Frame::Hello(hello())));
-    assert_eq!(host.frame(), Some(Frame::Booting(Vec::new())));
+    let mut booting = 0;
+    let ready = until("Ready", || match host.frame() {
+        Some(Frame::Booting(jobs)) => {
+            assert_eq!(jobs, Vec::new(), "no job runs in a boot that was over");
+            booting += 1;
+            None
+        }
+        Some(Frame::Ready(ready)) => Some(ready),
+        other => panic!("before Ready: {other:?}"),
+    });
+    assert!(booting > 0, "Booting comes before Ready");
     assert_eq!(
-        host.frame(),
-        Some(Frame::Ready(Ready {
+        ready,
+        Ready {
             state: "running".into(),
             failed_units: Vec::new(),
-        }))
+        }
     );
     assert!(matches!(host.frame(), Some(Frame::Beat { .. })));
     assert_eq!(
@@ -164,16 +178,15 @@ fn a_ready_that_waits_on_the_lane_users_bus_says_why_once() {
     let (mut host, _ended) = watching(&fake);
     assert_eq!(host.frame(), Some(Frame::Hello(hello())));
     let mut waited = 0;
-    let ready = loop {
-        match host.frame() {
-            Some(Frame::Booting(jobs)) => {
-                assert!(jobs.is_empty(), "{jobs:?}");
-                waited += 1;
-            }
-            Some(Frame::Ready(r)) => break r,
-            other => panic!("before Ready: {other:?}"),
+    let ready = until("Ready", || match host.frame() {
+        Some(Frame::Booting(jobs)) => {
+            assert!(jobs.is_empty(), "{jobs:?}");
+            waited += 1;
+            None
         }
-    };
+        Some(Frame::Ready(r)) => Some(r),
+        other => panic!("before Ready: {other:?}"),
+    });
     assert_eq!(ready.state, "running");
     assert!(waited >= 6, "{waited} Booting frames");
     let said = fake.said();

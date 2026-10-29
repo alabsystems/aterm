@@ -646,4 +646,29 @@ mod tests {
             assert_eq!(rfc3339_to_unix(bad), None, "{bad:?}");
         }
     }
+
+    #[test]
+    fn completed_older_index_pass_requires_settled_matching_attempt_below_published() {
+        let stamps = Stamps::parse(
+            "last_pass_at = \"2026-09-10T06:40:53.000000000Z\"\n\
+             last_pass = \"ok\"\n\
+             last_pass_attempted_at = \"2026-09-10T06:40:53.000000000Z\"\n\
+             last_pass_attempted_index_build = 100\n",
+        );
+        assert!(stamps.completed_older_index_pass(101));
+        assert!(!stamps.completed_older_index_pass(100));
+        assert!(!stamps.completed_older_index_pass(99));
+
+        let mut in_flight = stamps;
+        in_flight.in_flight = true;
+        assert!(!in_flight.completed_older_index_pass(101));
+
+        let mut no_outcome = stamps;
+        no_outcome.last_outcome = None;
+        assert!(!no_outcome.completed_older_index_pass(101));
+
+        let mut superseded_attempt = stamps;
+        superseded_attempt.last_attempt = stamps.last_attempt.map(|t| t + 10);
+        assert!(!superseded_attempt.completed_older_index_pass(101));
+    }
 }

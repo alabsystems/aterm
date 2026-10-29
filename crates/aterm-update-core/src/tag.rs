@@ -25,7 +25,7 @@ pub enum TagKind {
 pub fn parse_release_tag(tag: &str) -> Result<TagKind, TagError> {
     let version = tag.strip_prefix('v').ok_or(TagError::Malformed)?;
     let components: Vec<&str> = version.split('.').collect();
-    if components.len() < 2 {
+    if !(2..=3).contains(&components.len()) {
         return Err(TagError::Malformed);
     }
     let mut parsed = Vec::with_capacity(components.len());
@@ -79,6 +79,7 @@ mod tests {
             ("v00.10.0", Err(Malformed)),
             ("v0.010.0", Err(Malformed)),
             ("v0.10.00", Err(Malformed)),
+            ("v1.2.3.99999999999999999999", Err(Malformed)),
             ("v1.2.99999999999999999999", Err(Overflow)),
         ];
         for (tag, want) in rows {

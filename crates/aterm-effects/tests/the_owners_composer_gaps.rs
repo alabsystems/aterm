@@ -5,7 +5,7 @@
 
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::Terminal;
-use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
+use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig};
 use aterm_effects::rainbow_kitty::TypedClass;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -28,15 +28,8 @@ const TEXT_PEN: &str = "\x1b[39m";
 
 fn cfg() -> GlowConfig {
     GlowConfig {
-        classic_mono: false,
-        ribbon_tall: true,
-        ribbon_flat: false,
-        enabled: true,
-        dark_theme: true,
         theme_fg: 0x00D0_D0D0,
         theme_bg: 0x0011_1318,
-        style: GlowStyle::RainbowKitty,
-        color: 0x0050_FA7B,
         accent: 0x007A_A2F7,
         duration: Duration::from_millis(240),
         length: 18,
@@ -44,8 +37,7 @@ fn cfg() -> GlowConfig {
         audible: true,
         radius: 0.6,
         ring: true,
-        beam: false,
-        head_dx: 0.5,
+        ..Default::default()
     }
 }
 
@@ -249,6 +241,7 @@ pub struct Sim {
     /// `(key index, ms)`: split the render for that key before its park, the rest landing `ms`
     /// later.
     pub tear: Option<(usize, u64)>,
+    syntax_highlight: bool,
 }
 
 impl Sim {
@@ -294,6 +287,7 @@ impl Sim {
             last_decl_seq: 0,
             cov: None,
             tear: None,
+            syntax_highlight: false,
         };
         let b = s.comp.render();
         s.term.process(&b);
@@ -471,7 +465,24 @@ impl Sim {
             self.comp.text.insert(self.comp.caret, ch);
             self.comp.caret += 1;
         }
-        let b = self.comp.render();
+        let mut b = self.comp.render();
+        if self.syntax_highlight && self.comp.text.ends_with(&['a', 'l', 's', 'o', ':', ' ']) {
+            let (rows, (cr, cc)) = self.comp.rows_for();
+            for (r, row, _) in rows {
+                if let Some(col) = row.windows(5).position(|w| w == ['a', 'l', 's', 'o', ':']) {
+                    b.extend_from_slice(
+                        format!(
+                            "\x1b[{};{}H\x1b[38;2;166;226;46malso:\x1b[39m\x1b[{};{}H",
+                            r + 1,
+                            col + 1,
+                            cr + 1,
+                            cc + 1
+                        )
+                        .as_bytes(),
+                    );
+                }
+            }
+        }
         if torn {
             let park = format!("\x1b[{ROWS};1H");
             let cut = b
@@ -1091,6 +1102,43 @@ fn a_glyph_replaced_after_its_erase_echoed_claims_no_key() {
         !laid_after(&s, row, glyph_col, at),
         "a replacement after the erase's echo claimed the Space"
     );
+}
+
+#[test]
+fn the_space_after_a_colon_in_the_owners_kimi_prompt_stays_lit() {
+    for gap in [40u64, 80, 140] {
+        for delay in [2u64, 100] {
+            for pause in [0u64, 6_000, 26_000] {
+                let mut s = Sim::new("");
+                s.verbose = true;
+                s.syntax_highlight = true;
+                let prefix = "disable the request for feedback from the kimi harness.";
+                s.preload(prefix, prefix.chars().count());
+                let (row, start) = s.caret();
+                let mut keys = keys_of(" also: look! at ", s.ms() + 100, gap);
+                for key in &mut keys[7..] {
+                    key.0 += pause;
+                }
+                let renders = renders_for(&keys, |i| if i == 6 { delay } else { 2 });
+                s.run(&keys, &renders);
+                s.idle(120);
+                assert_eq!(
+                    s.caret().0,
+                    row,
+                    "gap {gap} delay {delay}: the prompt wrapped"
+                );
+                let live = s.live(row);
+                let dark: Vec<u16> = (start + 6..start + 16)
+                    .filter(|c| !live.contains(c))
+                    .collect();
+                assert!(
+                    dark.is_empty() && s.holes_seen.is_empty(),
+                    "gap {gap} delay {delay} pause {pause}: dark cells {dark:?}, live {live:?}, holes {:?}",
+                    s.holes_seen
+                );
+            }
+        }
+    }
 }
 
 /// The shipping single-pane present as a harness, its live takes, and the open families' reports.

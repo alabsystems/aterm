@@ -4,7 +4,7 @@
 //! Settings ▸ Themes layout across Beside, Short, and Stacked modes ([`scroll::ListFoot::Whole`]).
 
 use super::customize::{
-    caption_height, colour_rows_least_column, colour_rows_on_one_line, sheet_blocks,
+    caption_height, colour_rows_least_column, colour_rows_on_one_line, customize_row, sheet_blocks,
     sheet_list_least, sheet_sized_by_room,
 };
 use super::*;
@@ -60,12 +60,13 @@ pub(super) fn name_floor(state: &SettingsViewState, role: SemanticRole, style: S
     let showcase = &state.showcase;
     let key = (
         std::sync::Arc::as_ptr(&showcase.cards).cast::<()>() as usize,
-        settings_text_scale().to_bits(),
+        (settings_text_scale().to_bits(), measured_in()),
         role == SemanticRole::Heading,
     );
-    let cached = showcase.name_floors.borrow().iter().find_map(|entry| {
-        ((entry.cards, entry.scale, entry.heading) == key).then_some(entry.floor)
-    });
+    let cached =
+        showcase.name_floors.borrow().iter().find_map(|entry| {
+            ((entry.cards, entry.text, entry.heading) == key).then_some(entry.floor)
+        });
     if let Some(floor) = cached {
         return floor;
     }
@@ -85,10 +86,11 @@ pub(super) fn name_floor(state: &SettingsViewState, role: SemanticRole, style: S
         .fold(0.0_f32, f32::max)
         .min(COMPACT_INLINE_LABEL_MIN);
     let mut floors = showcase.name_floors.borrow_mut();
-    floors.retain(|entry| entry.cards == key.0);
+    // Faces once replaced are not measured in again.
+    floors.retain(|entry| entry.cards == key.0 && entry.text.1 == key.1.1);
     floors.push(NameFloor {
         cards: key.0,
-        scale: key.1,
+        text: key.1,
         heading: key.2,
         floor,
     });
@@ -171,7 +173,7 @@ fn short_or_stacked(
     let Some(chooser) = short_chooser(state, page_width) else {
         return Shape::Stacked;
     };
-    let (_, strip) = strip_node(state, page_width);
+    let strip = strip_tall(state, page_width);
     let demo = stacked_demo(state, room, strip, frame);
     let list = stacked_rest(room, demo, strip) - short_head(state);
     if list + 0.01 < SHORT_ROWS * row_height()
@@ -247,8 +249,58 @@ thread_local! {
     static LAYING: RefCell<Option<Option<scroll::ListLaid>>> = const { RefCell::new(None) };
     /// Whether the page measured pins the keyboard's control around its list ([`pin`]).
     static KEYBOARD_PINNED: Cell<bool> = const { Cell::new(false) };
+    /// The keyboard's control pinned round the list: how tall, what a bar leaves ([`pin`]).
+    static KEYBOARD_PIN: Cell<Option<(f32, f32)>> = const { Cell::new(None) };
     /// The lists' items built this render, while [`BlocksShared`] is open ([`shared_items`]).
     static ITEMS: RefCell<Option<Vec<SharedItems>>> = const { RefCell::new(None) };
+    /// The footer's rows built this render, while [`BlocksShared`] is open ([`footer_rows`]).
+    static FOOTERS: RefCell<Option<Vec<SharedFooter>>> = const { RefCell::new(None) };
+    /// The faces chrome text measures in as this render first asked, while [`BlocksShared`] is
+    /// open ([`measured_in`]).
+    static FACES: Cell<Option<Option<u64>>> = const { Cell::new(None) };
+}
+
+/// The faces chrome text measures in ([`crate::tray_raster::chrome_measure_epoch`]), weighed once
+/// a render while [`BlocksShared`] is open: the theme names' floors and the chooser's rows are keyed
+/// by them. A face that lands later in the render keys what it measures under the faces before it,
+/// which the next render measures again.
+fn measured_in() -> u64 {
+    FACES.with(|faces| match faces.get() {
+        Some(Some(epoch)) => epoch,
+        open => {
+            let epoch = crate::tray_raster::chrome_measure_epoch();
+            if open.is_some() {
+                faces.set(Some(Some(epoch)));
+            }
+            epoch
+        }
+    })
+}
+
+/// Rows' names as [`strip_names`] measured them by room, size and face, where every width was kept.
+static NAMES_MEASURED: std::sync::Mutex<Option<aterm_hash::FxHashMap<NamesAt, NamesMeasured>>> =
+    std::sync::Mutex::new(None);
+
+/// Where [`strip_names`] measured rows' names: the title's rooms, and its size and face.
+type NamesAt = ((u32, u32, bool), u32, crate::widget::TextFace);
+
+/// The rows [`strip_names`] measured there, the font it measured them in, and the measure.
+type NamesMeasured = (
+    std::sync::Arc<[crate::settings_preview::theme_card::ShowcaseCard]>,
+    Option<std::sync::Arc<aterm_render::font::Font>>,
+    NamesMeasure,
+);
+
+/// The most places [`NAMES_MEASURED`] keeps a measure for.
+const NAMES_MEASURED_MOST: usize = 1024;
+
+/// Drop every name [`strip_names`] measured, in every view: for the macOS font-change tests.
+#[cfg(all(test, target_os = "macos"))]
+pub(in crate::native_settings) fn forget_strip_names() {
+    NAMES_MEASURED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
 }
 
 /// A list's items built this render and what they were built of.
@@ -306,6 +358,7 @@ pub(in crate::native_settings) struct ListRoom {
     room: f32,
     extra: f32,
     keyboard_pinned: bool,
+    pin: Option<(f32, f32)>,
 }
 
 impl ListRoom {
@@ -319,9 +372,19 @@ impl ListRoom {
         self.room
     }
 
+    /// What a status's bar takes of the list's room.
+    pub(in crate::native_settings) const fn extra(self) -> f32 {
+        self.extra
+    }
+
     /// Whether the keyboard's control is pinned around the list, so the list never cuts it.
     pub(in crate::native_settings) const fn pins_keyboard(self) -> bool {
         self.keyboard_pinned
+    }
+
+    /// The keyboard's control where the page pins it round the list: how tall, what a bar leaves.
+    pub(in crate::native_settings) const fn keyboard_pin(self) -> Option<(f32, f32)> {
+        self.pin
     }
 
     /// Whether the list lays its stops out as `other` does: as wide, pinned and led the same.
@@ -374,19 +437,19 @@ fn lay(list: scroll::ListLaid) {
     });
 }
 
-/// Note `node`, pinned around the list, and whether it holds the keyboard's control.
-fn pin(state: &SettingsViewState, node: &UiNode) {
-    fn holds(node: &UiNode, key: &UiKey) -> bool {
-        node.key == *key || node.children.iter().any(|child| holds(child, key))
-    }
-    if measuring()
-        && state
-            .common
-            .last_focus
-            .as_ref()
-            .is_some_and(|key| holds(node, key))
+/// Note `node` pinned round the list for the keyboard's control, `tall` high, `clear` of the foot.
+fn pin(state: &SettingsViewState, node: &UiNode, (tall, clear): (f32, f32)) {
+    if state
+        .common
+        .last_focus
+        .as_ref()
+        .is_some_and(|key| holds(node, key))
     {
-        KEYBOARD_PINNED.with(|pinned| pinned.set(true));
+        if measuring() {
+            KEYBOARD_PINNED.with(|pinned| pinned.set(true));
+        }
+        let cover = (state.status_extra.get() - clear).clamp(0.0, tall);
+        KEYBOARD_PIN.with(|pin| pin.set(Some((tall, tall - cover))));
     }
 }
 
@@ -396,6 +459,7 @@ fn measured(state: &SettingsViewState, room: ListRoom) -> bool {
     let room = ListRoom {
         extra: state.status_extra.get(),
         keyboard_pinned: measuring() && KEYBOARD_PINNED.with(Cell::get),
+        pin: KEYBOARD_PIN.with(Cell::get),
         ..room
     };
     MEASURING.with(|measuring| {
@@ -408,18 +472,166 @@ fn measured(state: &SettingsViewState, room: ListRoom) -> bool {
     })
 }
 
-/// The page: the heading, then the chooser beside the demo and strip.
-pub(crate) fn themes_page(
+/// How [`themes_page`] lays its list's panel out in a room under its heading.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PanelLaid {
+    shape: Shape,
+    width: f32,
+    height: f32,
+    demo: f32,
+    led: bool,
+}
+
+impl PanelLaid {
+    fn at(
+        state: &SettingsViewState,
+        page_width: f32,
+        room: f32,
+        frame: Option<&SettingsPreviewSpec>,
+    ) -> Self {
+        let pinned = ChooserPins {
+            head: true,
+            footer: true,
+        };
+        let shape = match Shape::for_width(page_width) {
+            Shape::Beside { chooser } if !beside_fits(state, chooser, page_width, room, frame) => {
+                Shape::Stacked
+            }
+            Shape::Beside { chooser } if list_rows(state, room, pinned) < SHORT_ROWS => {
+                Shape::Short { chooser }
+            }
+            Shape::Stacked => short_or_stacked(state, page_width, room, frame),
+            shape => shape,
+        };
+        if let Shape::Beside { chooser } | Shape::Short { chooser } = shape {
+            let pins = ChooserPins {
+                head: true,
+                footer: matches!(shape, Shape::Beside { .. }),
+            };
+            return Self {
+                shape,
+                width: panel_width(chooser, page_width),
+                height: whole_rows_height(state, room, pins),
+                demo: 0.0,
+                led: false,
+            };
+        }
+        let strip = strip_tall(state, page_width);
+        let rest = |room: f32, demo: f32| stacked_rest(room, demo, strip);
+        let rows = (!state.showcase.sheet_open).then(|| {
+            chooser_rows_tallest(
+                state,
+                (page_width - 2.0 * PANEL_INSET).max(0.0),
+                chooser_is_narrow(page_width),
+            )
+        });
+        let least = match rows {
+            Some(rows) => chooser_least(state, rows),
+            None => sheet_least(state, page_width),
+        };
+        let demo_at = |room: f32| {
+            let demo = stacked_demo(state, room, strip, frame);
+            match frame {
+                Some(frame) if rest(room, demo) < least => (1..6)
+                    .rev()
+                    .map(|rows| frame.demo_height(rows))
+                    .find(|&height| rest(room, height) >= least)
+                    .unwrap_or_else(|| frame.demo_height(1))
+                    .min(demo),
+                _ => demo,
+            }
+        };
+        let demo = demo_at(room);
+        let panel_height = rest(room, demo).max(0.0);
+        let floor = match rows {
+            Some(rows) => chooser_floor(state, rows),
+            None => sheet_floor(state, page_width),
+        };
+        let led = frame.is_some() && panel_height + 0.5 < floor;
+        let pins = ChooserPins {
+            head: true,
+            footer: false,
+        };
+        // A panel fitting its pinned filter over the tallest row keeps it, else lists it, floored.
+        let height = if led {
+            room
+        } else if rows.is_none() || panel_height + 0.5 >= least {
+            whole_rows_height(state, panel_height, pins)
+                .max(least)
+                .min(panel_height)
+        } else {
+            whole_rows_height(state, panel_height, ChooserPins::NONE)
+                .max(floor)
+                .min(panel_height)
+        };
+        Self {
+            shape,
+            width: page_width,
+            height,
+            demo,
+            led,
+        }
+    }
+}
+
+/// Heading, width, list body, demo frame, the chooser's lead name and a toolbar leading the list.
+type PageRoom = (
+    Vec<UiNode>,
+    f32,
+    f32,
+    std::rc::Rc<DemoBuilt>,
+    (Option<&'static str>, Option<(UiNode, f32)>),
+);
+
+/// The heading as a chrome heads it, toolbar listed or not, at a gap: its height and lead rows.
+pub(in crate::native_settings) type SharedHeading = (
+    ((bool, bool), bool, u32),
+    (Vec<UiNode>, f32, Vec<(UiNode, f32)>),
+);
+
+/// [`pinned_heading`], once a render for each way the chrome heads it, in [`BlocksShared`].
+fn heading_shared(
+    state: &SettingsViewState,
+    width: SettingsWidth,
+    viewport: LogicalRect,
+    gap: f32,
+) -> (Vec<UiNode>, f32) {
+    let at = (
+        page_chrome(state, width, viewport),
+        super::compact_toolbar_lists(state, viewport),
+        gap.to_bits(),
+    );
+    let built = state
+        .showcase_heading
+        .borrow()
+        .as_ref()
+        .and_then(|shared| shared.iter().find(|(seen, _)| *seen == at))
+        .map(|(_, heading)| heading.clone());
+    if let Some((out, used, head)) = built {
+        state.list_head.replace(head);
+        return (out, used);
+    }
+    let (out, used) = pinned_heading(state, width, viewport, gap, SHOWCASE_TITLE, "");
+    if let Some(shared) = state.showcase_heading.borrow_mut().as_mut() {
+        let head = state.list_head.borrow().clone();
+        shared.push((at, (out.clone(), used, head)));
+    }
+    (out, used)
+}
+
+/// Heading, width, list body, demo frame and chooser's lead name at `state`'s chrome and bars.
+fn page_room(
     state: &SettingsViewState,
     width: SettingsWidth,
     cx: &ViewCx<'_>,
-) -> Vec<UiNode> {
+    body: Option<f32>,
+) -> PageRoom {
     let viewport = cx.viewport;
     let gap = settings_page_gap(state, width, viewport);
     let maximum = PageLayout::Stage.maximum(width);
     let page_width = settings_page_content_width(viewport.width, width, maximum);
-    let (mut out, mut used) = pinned_heading(state, width, viewport, gap, SHOWCASE_TITLE, "");
-    let body = settings_list_body_height(state, width, viewport);
+    let (mut out, mut used) = heading_shared(state, width, viewport, gap);
+    let body = body.unwrap_or_else(|| settings_list_body_height(state, width, viewport));
     // Its chooser lists in a panel beside or under the demo, so the page's name, where nothing
     // else names it, is pinned over the page where the body still holds the chooser's filter
     // under it, as short windows shed chrome before content; else the chooser's list leads with
@@ -460,41 +672,179 @@ pub(crate) fn themes_page(
         used += height + gap;
     }
     let name = name.is_some().then_some(SHOWCASE_TITLE);
-    let (spec, frame) = demo_spec_and_frame(
+    let demo = demo_shared(
         state,
         cx.animation_phase_ms,
         cx.motion,
         cx.terminal_font_px,
         cx.terminal_scale,
         cx.semantic_font.as_ref(),
+    );
+    (
+        out,
+        page_width,
+        (body - used).max(0.0),
+        demo,
+        (name, toolbar),
     )
-    .unzip();
-    let room = (body - used).max(0.0);
-    let pinned = ChooserPins {
-        head: true,
-        footer: true,
-    };
-    let shape = match Shape::for_width(page_width) {
-        Shape::Beside { chooser }
-            if !beside_fits(state, chooser, page_width, room, frame.as_ref()) =>
-        {
-            Shape::Stacked
+}
+
+/// How the page lays its list's panel out at `state`'s chrome and bars, as its shape alone tells.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::native_settings) struct PanelAt(PanelLaid, f32);
+
+impl PanelAt {
+    /// Its list's body `body` where given, else as laid out.
+    pub(in crate::native_settings) fn of(
+        state: &SettingsViewState,
+        width: SettingsWidth,
+        cx: &ViewCx<'_>,
+        body: Option<f32>,
+    ) -> Self {
+        // Measured, the page leaves whether its list took the toolbar as the page last built it.
+        let taken = state.toolbar_head_taken.get();
+        let (_, page_width, room, demo, _) = page_room(state, width, cx, body);
+        state.toolbar_head_taken.set(taken);
+        let laid = PanelLaid::at(
+            state,
+            page_width,
+            room,
+            demo.as_ref().as_ref().map(|(_, frame)| frame),
+        );
+        Self(laid, room)
+    }
+
+    /// How wide its panel lays out.
+    pub(in crate::native_settings) const fn width(self) -> f32 {
+        self.0.width
+    }
+
+    /// The most room a list under its heading has; a chooser's frame gives way for its tallest row.
+    pub(in crate::native_settings) fn room_most(self, state: &SettingsViewState) -> f32 {
+        let framed = (self.1 - 2.0 * PANEL_INSET).max(0.0);
+        if state.showcase.sheet_open {
+            return framed;
         }
-        Shape::Beside { chooser } if list_rows(state, room, pinned) < SHORT_ROWS => {
-            Shape::Short { chooser }
+        let inner = (self.0.width - 2.0 * PANEL_INSET).max(0.0);
+        let tallest = chooser_rows_tallest(state, inner, chooser_is_narrow(self.0.width));
+        framed.max(self.0.height - 2.0 * chooser_inset(state, tallest, self.0.height))
+    }
+
+    /// Whether its chooser keeps its frame, which its rows lay out inside ([`ChooserFit::inset`]).
+    pub(in crate::native_settings) fn framed(self, state: &SettingsViewState) -> bool {
+        if state.showcase.sheet_open {
+            return true;
         }
-        Shape::Stacked => short_or_stacked(state, page_width, room, frame.as_ref()),
-        shape => shape,
-    };
-    match shape {
-        Shape::Beside { chooser } | Shape::Short { chooser } => {
-            let pins = ChooserPins {
-                head: true,
-                footer: matches!(shape, Shape::Beside { .. }),
+        let inner = (self.0.width - 2.0 * PANEL_INSET).max(0.0);
+        let tallest = chooser_rows_tallest(state, inner, chooser_is_narrow(self.0.width));
+        chooser_inset(state, tallest, self.0.height) > 0.0
+    }
+
+    /// How tall its rows lay out the block holding `key`, alike with the gutter and without.
+    pub(in crate::native_settings) fn block_holding(
+        self,
+        state: &SettingsViewState,
+        key: &UiKey,
+    ) -> Option<u32> {
+        if state.showcase.sheet_open {
+            return None;
+        }
+        let inset = if self.framed(state) { PANEL_INSET } else { 0.0 };
+        let inner = (self.0.width - 2.0 * inset).max(0.0);
+        let narrow = chooser_is_narrow(self.0.width);
+        let query = state.showcase.query();
+        let [wide, thin] = [inner, (inner - THUMB_GUTTER).max(0.0)].map(|width| {
+            with_blocks(state, (width, narrow, &query), false, |entry| {
+                entry
+                    .blocks
+                    .iter()
+                    .find(|(node, _, _)| holds(node, key))
+                    .map(|(_, height, _)| height.to_bits())
+            })
+        });
+        wide.filter(|_| wide == thin)
+    }
+
+    /// How far its panel stands over its list's body's foot.
+    pub(in crate::native_settings) fn below(self) -> f32 {
+        self.1 - self.0.height
+    }
+
+    /// The room its list lays out in and what stands apart from it, as the pins `fits` choose.
+    pub(in crate::native_settings) fn list_room(
+        self,
+        state: &SettingsViewState,
+        fits: &ChooserFits,
+    ) -> (f32, Held) {
+        let strip = !self.0.led;
+        if state.showcase.sheet_open {
+            let held = Held {
+                head: false,
+                footer: false,
+                strip,
+                captions: false,
             };
+            return ((self.0.height - 2.0 * PANEL_INSET).max(0.0), held);
+        }
+        let at = (
+            self.0.width.to_bits(),
+            !matches!(self.0.shape, Shape::Beside { .. }),
+            self.0.led,
+        );
+        let known = fits.borrow().iter().any(|(seen, _)| *seen == at);
+        if !known {
+            let inner = (self.0.width - 2.0 * PANEL_INSET).max(0.0);
+            let footer = footer_rows(state, inner, chooser_is_narrow(self.0.width));
+            let fit = ChooserFit::at(state, self.0.width, (at.1, at.2), &footer);
+            fits.borrow_mut().push((at, fit));
+        }
+        let fits = fits.borrow();
+        let (_, fit) = fits
+            .iter()
+            .find(|(seen, _)| *seen == at)
+            .expect("kept above");
+        // A led list pins nothing, whatever its lead.
+        let pins = fit.pins(state, self.0.height, |_| 0.0);
+        let room = fit.room(state, self.0.height, pins);
+        let held = Held {
+            head: pins.head,
+            footer: pins.footer,
+            strip,
+            captions: room + 0.5 >= captions_from(fit.rows(state, self.0.height).tallest_row),
+        };
+        (room, held)
+    }
+}
+
+/// What stands apart from a chooser's list ([`PanelAt::list_room`]); whether it captions rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::native_settings) struct Held {
+    pub(in crate::native_settings) head: bool,
+    pub(in crate::native_settings) footer: bool,
+    pub(in crate::native_settings) strip: bool,
+    pub(in crate::native_settings) captions: bool,
+}
+
+/// The chooser's pin measures by panel width, stacked or not, led or not ([`PanelAt::list_room`]).
+pub(in crate::native_settings) type ChooserFits = RefCell<Vec<((u32, bool, bool), ChooserFit)>>;
+
+/// The page: the heading, then the chooser beside the demo and strip.
+pub(crate) fn themes_page(
+    state: &SettingsViewState,
+    width: SettingsWidth,
+    cx: &ViewCx<'_>,
+) -> Vec<UiNode> {
+    KEYBOARD_PIN.with(|pin| pin.set(None));
+    let gap = settings_page_gap(state, width, cx.viewport);
+    let (mut out, page_width, room, demo, (name, toolbar)) = page_room(state, width, cx, None);
+    let (spec, frame) = Option::clone(&demo).unzip();
+    let laid = PanelLaid::at(state, page_width, room, frame.as_ref());
+    let shape = laid.shape;
+    match shape {
+        Shape::Beside { .. } | Shape::Short { .. } => {
             let body = room;
-            let room = whole_rows_height(state, room, pins);
-            let chooser = panel_width(chooser, page_width);
+            let room = laid.height;
+            let chooser = laid.width;
             let demo_width = (page_width - chooser - COLUMN_GAP).max(0.0);
             let (strip_box, strip) = strip_node(state, demo_width);
             // The strip stands over a status's bar: the demo gives up what the bar
@@ -503,20 +853,25 @@ pub(crate) fn themes_page(
             let cover = (state.status_extra.get() - (body - room)).max(0.0);
             let demo_height = (room - cover - DEMO_STRIP_GAP - strip).max(0.0);
             state.note_pinned_status_room(&strip_box, body - DEMO_STRIP_GAP - strip);
-            pin(state, &strip_box);
-            if measuring() {
-                let _ = if state.showcase.sheet_open {
+            pin(state, &strip_box, (strip, body - DEMO_STRIP_GAP - strip));
+            let panel = || {
+                if state.showcase.sheet_open {
                     sheet_panel(state, chooser, room, (Vec::new(), None))
                 } else {
-                    chooser_panel(state, chooser, room, shape, (Vec::new(), None), name)
-                };
+                    chooser_panel(
+                        state,
+                        (chooser, room, body - room),
+                        shape,
+                        (Vec::new(), None),
+                        name,
+                    )
+                }
+            };
+            if measuring() {
+                let _ = panel();
                 return out;
             }
-            let left = if state.showcase.sheet_open {
-                sheet_panel(state, chooser, room, (Vec::new(), None))
-            } else {
-                chooser_panel(state, chooser, room, shape, (Vec::new(), None), name)
-            };
+            let left = panel();
             let right = UiNode::new(
                 "settings/showcase/stage-column",
                 UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
@@ -544,36 +899,9 @@ pub(crate) fn themes_page(
         }
         Shape::Stacked => {
             let (strip_box, strip) = strip_node(state, page_width);
-            let rest = |room: f32, demo: f32| stacked_rest(room, demo, strip);
-            let mut demo_height = stacked_demo(state, room, strip, frame.as_ref());
-            let rows = (!state.showcase.sheet_open).then(|| {
-                chooser_rows_tallest(
-                    state,
-                    (page_width - 2.0 * PANEL_INSET).max(0.0),
-                    chooser_is_narrow(page_width),
-                )
-            });
-            let least = match rows {
-                Some(rows) => chooser_least(state, rows),
-                None => sheet_least(state, page_width),
-            };
-            if rest(room, demo_height) < least
-                && let Some(frame) = frame.as_ref()
-            {
-                demo_height = (1..6)
-                    .rev()
-                    .map(|rows| frame.demo_height(rows))
-                    .find(|&height| rest(room, height) >= least)
-                    .unwrap_or_else(|| frame.demo_height(1))
-                    .min(demo_height);
-            }
-            let panel_height = rest(room, demo_height).max(0.0);
-            let floor = match rows {
-                Some(rows) => chooser_floor(state, rows),
-                None => sheet_floor(state, page_width),
-            };
+            let demo_height = laid.demo;
             match (spec, frame.as_ref()) {
-                (Some(spec), Some(frame)) if panel_height + 0.5 < floor => {
+                (Some(spec), Some(frame)) if laid.led => {
                     let inner = (page_width - 2.0 * PANEL_INSET - THUMB_GUTTER).max(0.0);
                     let list_room = (room - 2.0 * PANEL_INSET).max(0.0);
                     let (strip_box, strip) = strip_node(state, inner);
@@ -599,8 +927,7 @@ pub(crate) fn themes_page(
                     } else {
                         chooser_panel(
                             state,
-                            page_width,
-                            room,
+                            (page_width, room, 0.0),
                             Shape::Stacked,
                             (lead, Some(sizing)),
                             name,
@@ -608,34 +935,22 @@ pub(crate) fn themes_page(
                     });
                 }
                 (spec, _) => {
+                    let above = spec.as_ref().map_or(0.0, |_| demo_height + gap);
                     if let Some(spec) = spec {
                         out.push(demo_node(spec, demo_height));
                     }
-                    let pins = ChooserPins {
-                        head: true,
-                        footer: false,
-                    };
-                    // A panel that holds its pinned filter over its tallest row keeps that room;
-                    // one that does not lists the filter, its rows whole, at least its floor.
-                    let panel_height = if rows.is_none() || panel_height + 0.5 >= least {
-                        whole_rows_height(state, panel_height, pins)
-                            .max(least)
-                            .min(panel_height)
-                    } else {
-                        whole_rows_height(state, panel_height, ChooserPins::NONE)
-                            .max(floor)
-                            .min(panel_height)
-                    };
+                    let panel_height = laid.height;
+                    // The panel's clearance over the page's foot, the column laid out top down.
+                    let below = room - above - strip - gap - panel_height;
                     state.note_pinned_status_room(&strip_box, panel_height);
-                    pin(state, &strip_box);
+                    pin(state, &strip_box, (strip, panel_height + gap + below));
                     out.push(strip_box);
                     out.push(if state.showcase.sheet_open {
                         sheet_panel(state, page_width, panel_height, (Vec::new(), None))
                     } else {
                         chooser_panel(
                             state,
-                            page_width,
-                            panel_height,
+                            (page_width, panel_height, below.max(0.0)),
                             Shape::Stacked,
                             (Vec::new(), None),
                             name,
@@ -717,7 +1032,7 @@ fn beside_fits(
 ) -> bool {
     let demo = frame.map_or(0.0, |frame| frame.demo_height(1));
     let panel_width = panel_width(chooser, page_width);
-    let (_, strip) = strip_node(state, (page_width - panel_width - COLUMN_GAP).max(0.0));
+    let strip = strip_tall(state, (page_width - panel_width - COLUMN_GAP).max(0.0));
     let panel = if state.showcase.sheet_open {
         sheet_floor(state, panel_width)
     } else {
@@ -782,25 +1097,133 @@ const EVERY_ROW: &str = "\u{0}every row";
 /// it, which wraps a name a line taller (Catppuccin Mocha in a 244pt window), so a pinned filter
 /// never leaves a room one row tall over a row two rows tall, drawn as no row at all; and of every
 /// row the list can list, the closed Community section's too, so opening it, or trying a theme
-/// in it, never reshapes the page under the person.
+/// in it, never reshapes the page under the person. Measured once for what the rows are laid out
+/// from ([`ShowcaseState::rows_tallest`]): every row built again at two widths, up to three times
+/// a render, was a third of a Themes frame.
 fn chooser_rows_tallest(state: &SettingsViewState, inner: f32, narrow: bool) -> f32 {
-    [inner, (inner - THUMB_GUTTER).max(0.0)]
-        .into_iter()
-        .map(|width| {
+    // Built once while its inputs hold, not each render: every rung tried reads it at its width.
+    let showcase = &state.showcase;
+    let at = rows_tallest_at(state, inner, narrow);
+    let known = showcase
+        .rows_tallest
+        .borrow()
+        .iter()
+        .find(|(was, _)| *was == at)
+        .map(|(_, (tallest, _))| *tallest);
+    if let Some(tallest) = known {
+        return tallest;
+    }
+    let [(wide, wide_rows), (thin, thin_rows)] =
+        [inner, (inner - THUMB_GUTTER).max(0.0)].map(|width| {
             with_blocks(state, (width, narrow, EVERY_ROW), false, |entry| {
-                entry
+                let tallest = entry
                     .blocks
                     .iter()
                     .map(|(_, height, _)| *height)
-                    .fold(0.0, f32::max)
+                    .fold(0.0, f32::max);
+                // Every theme's row, in the cards' order: the blocks with a slug.
+                let rows = entry
+                    .blocks
+                    .iter()
+                    .filter(|(_, _, slug)| slug.is_some())
+                    .map(|(_, height, _)| *height)
+                    .collect::<Vec<_>>();
+                (tallest, rows)
             })
+        });
+    let tallest = wide.max(thin);
+    let rows = wide_rows
+        .into_iter()
+        .zip(thin_rows)
+        .map(|(wide, thin)| [wide, thin])
+        .collect();
+    let mut kept = showcase.rows_tallest.borrow_mut();
+    kept.insert(0, (at, (tallest, rows)));
+    kept.truncate(ROWS_TALLEST_KEPT);
+    tallest
+}
+
+/// The widths [`chooser_rows_tallest`] keeps its measures for: a resize's few, each window's rungs.
+const ROWS_TALLEST_KEPT: usize = 16;
+
+/// What [`chooser_rows_tallest`] reads at a panel `inner` wide.
+fn rows_tallest_at(state: &SettingsViewState, inner: f32, narrow: bool) -> RowsTallestAt {
+    let showcase = &state.showcase;
+    RowsTallestAt {
+        cards: std::sync::Arc::as_ptr(&showcase.cards).cast::<()>() as usize,
+        in_use: state.configured_theme_id(),
+        attention: std::sync::Arc::as_ptr(&showcase.attention).cast::<()>() as usize,
+        inner: inner.to_bits(),
+        narrow,
+        scale: settings_text_scale().to_bits(),
+        faces: crate::tray_raster::strip_band_font_epoch(),
+        measured: measured_in(),
+    }
+}
+
+/// Each theme row's height at `width` where [`chooser_rows_tallest`] kept them, as rows now read.
+fn rows_kept_at(
+    state: &SettingsViewState,
+    width: f32,
+    narrow: bool,
+) -> Option<(std::sync::Arc<[[f32; 2]]>, usize)> {
+    let now = rows_tallest_at(state, 0.0, narrow);
+    state
+        .showcase
+        .rows_tallest
+        .borrow()
+        .iter()
+        .find_map(|(at, (_, rows))| {
+            let inner = f32::from_bits(at.inner);
+            let measured = [inner, (inner - THUMB_GUTTER).max(0.0)];
+            let side = measured
+                .iter()
+                .position(|at| at.to_bits() == width.to_bits())?;
+            (RowsTallestAt {
+                inner: 0,
+                ..at.clone()
+            } == now
+                && rows.len() == state.showcase.cards.len())
+            .then(|| (rows.clone(), side))
         })
-        .fold(0.0, f32::max)
 }
 
 /// A head field's height where the chooser lists it: a row less the gap under it.
 fn listed_head_field_height() -> f32 {
     (row_height() - PANEL_GAP).max(0.0)
+}
+
+/// How tall the keyboard's chooser row lays out in a panel `inner` wide, or a gutter narrower.
+fn keyboard_row_tallest(state: &SettingsViewState, inner: f32, narrow: bool) -> f32 {
+    let Some(slug) = state
+        .common
+        .last_focus
+        .as_ref()
+        .and_then(|key| key.as_str().strip_prefix(CARD_PREFIX))
+    else {
+        return 0.0;
+    };
+    let showcase = &state.showcase;
+    let Some(card) = showcase
+        .visible_for("")
+        .into_iter()
+        .map(|index| &showcase.cards[index])
+        .find(|card| card.slug == slug)
+    else {
+        return 0.0;
+    };
+    let width = (inner - THUMB_GUTTER).max(0.0);
+    let slab = slab_column(state, width, narrow);
+    let in_use = state.configured_theme_id().eq_ignore_ascii_case(&card.id);
+    let selected = state.highlighted_slug().as_deref() == Some(card.slug.as_str());
+    row_node(
+        state,
+        card,
+        (width, narrow, slab, TagWidths::now()),
+        (in_use, selected),
+        false,
+    )
+    .1
 }
 
 fn chooser_tallest_stop(state: &SettingsViewState, pins: ChooserPins, rows: f32) -> f32 {
@@ -947,8 +1370,7 @@ fn sheet_least(state: &SettingsViewState, panel_width: f32) -> f32 {
 }
 
 fn follows_system(state: &SettingsViewState) -> bool {
-    prefs::theme_mode(state.raw_value(prefs::EDIT_THEME).as_deref())
-        == prefs::ThemeMode::FollowSystem
+    state.theme_follows_system()
 }
 
 fn demo_node(spec: SettingsPreviewSpec, height: f32) -> UiNode {
@@ -978,8 +1400,10 @@ pub(crate) fn demo_spec(
 }
 
 /// The demo's spec and frame at what they are built at, shared while [`BlocksShared`] is open.
-pub(in crate::native_settings) type SharedDemo =
-    (DemoAt, Option<(SettingsPreviewSpec, SettingsPreviewSpec)>);
+pub(in crate::native_settings) type SharedDemo = (DemoAt, std::rc::Rc<DemoBuilt>);
+
+/// The demo's spec and the frame it is laid out in, where the page shows one.
+type DemoBuilt = Option<(SettingsPreviewSpec, SettingsPreviewSpec)>;
 
 /// What the demo is built at: the phase, motion, type size and scale, and the prepared font.
 type DemoAt = (
@@ -998,7 +1422,26 @@ fn demo_spec_and_frame(
     terminal_font_px: f32,
     terminal_scale: f32,
     prepared_font: Option<&crate::tray_raster::PreparedSemanticFont>,
-) -> Option<(SettingsPreviewSpec, SettingsPreviewSpec)> {
+) -> DemoBuilt {
+    Option::clone(&demo_shared(
+        state,
+        phase_ms,
+        motion,
+        terminal_font_px,
+        terminal_scale,
+        prepared_font,
+    ))
+}
+
+/// [`demo_spec_and_frame`] as the render shares it, which a page's shape reads without a copy.
+fn demo_shared(
+    state: &SettingsViewState,
+    phase_ms: u64,
+    motion: crate::native_app::ViewMotionCx,
+    terminal_font_px: f32,
+    terminal_scale: f32,
+    prepared_font: Option<&crate::tray_raster::PreparedSemanticFont>,
+) -> std::rc::Rc<DemoBuilt> {
     let at = (
         phase_ms,
         motion,
@@ -1011,18 +1454,18 @@ fn demo_spec_and_frame(
         .borrow()
         .as_ref()
         .and_then(|shared| shared.iter().find(|(seen, _)| *seen == at))
-        .map(|(_, demo)| demo.clone());
+        .map(|(_, demo)| std::rc::Rc::clone(demo));
     built.unwrap_or_else(|| {
-        let demo = build_demo_spec_and_frame(
+        let demo = std::rc::Rc::new(build_demo_spec_and_frame(
             state,
             phase_ms,
             motion,
             terminal_font_px,
             terminal_scale,
             prepared_font,
-        );
+        ));
         if let Some(shared) = state.showcase_demo.borrow_mut().as_mut() {
-            shared.push((at, demo.clone()));
+            shared.push((at, std::rc::Rc::clone(&demo)));
         }
         demo
     })
@@ -1198,6 +1641,18 @@ fn painted_facts(facts: &[StripFact]) -> String {
 /// The strip and its height at a width, shared while [`BlocksShared`] is open.
 pub(in crate::native_settings) type SharedStrip = (u32, (UiNode, f32));
 
+/// How tall [`strip_node`] lays the strip out at a width, read where shared without a node copy.
+fn strip_tall(state: &SettingsViewState, width: f32) -> f32 {
+    let at = width.to_bits();
+    let known = state
+        .showcase_strip
+        .borrow()
+        .as_ref()
+        .and_then(|shared| shared.iter().find(|(seen, _)| *seen == at))
+        .map(|(_, (_, height))| *height);
+    known.unwrap_or_else(|| strip_node(state, width).1)
+}
+
 /// [`build_strip_node`], built once a render for each width while [`BlocksShared`] is open.
 fn strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
     let at = width.to_bits();
@@ -1222,8 +1677,7 @@ fn build_strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
     let in_use = showcase.label_of(&configured);
     let button_height = strip_button_height();
     let sized = hug_width;
-    let following = prefs::theme_mode(state.raw_value(prefs::EDIT_THEME).as_deref())
-        == prefs::ThemeMode::FollowSystem;
+    let following = state.theme_follows_system();
     let side = theme_visible_side(state, state.presented_motion.get().system_dark);
     let overrides = override_count(&state.showcase_colors());
     let mut buttons: Vec<UiNode> = Vec::new();
@@ -1707,18 +2161,7 @@ fn strip_name_lines(name: &str, width: f32) -> Vec<String> {
     })
 }
 
-/// THE STRIP'S NAMES, every one it can show — each row's (a trial's title)
-/// and `in_use`'s (the theme the configuration draws, which a row may not
-/// name) — in the room its title has: `plain` beside a trial's Revert and
-/// Keep, `typed` beside those and Keep ▾ too, which only a trial that can
-/// change the type in force shows (the tried theme sets type, or the theme
-/// it replaces does: Keep colors only needs a type change). The most
-/// lines a name takes there, and whether a word of one is wider than its
-/// room. The strip sits its title beside its buttons only where every name
-/// takes a line or two there, whole words each, and keeps as many lines as
-/// the longest takes, so neither a trial nor the highlight moving changes
-/// its form or its height, and no name is cut ([`strip_node`]). The rows'
-/// share is measured once a frame for its rows, text scale and rooms.
+/// The most lines the strip's names take beside its buttons, and whether a word outgrows its room.
 fn strip_names(
     state: &SettingsViewState,
     in_use: &str,
@@ -1728,12 +2171,9 @@ fn strip_names(
     let under_typed = showcase
         .card(&state.theme_id_under_trial())
         .is_some_and(|card| card.typography.is_some());
-    let key = (
-        std::sync::Arc::as_ptr(&showcase.cards).cast::<()>() as usize,
-        settings_text_scale().to_bits(),
-        (plain.to_bits(), typed.to_bits(), under_typed),
-    );
+    let rooms = (plain.to_bits(), typed.to_bits(), under_typed);
     let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Heading, StyleRef::Plain);
+    let font = crate::tray_raster::ui_font_of(face);
     let measure = |name: &str, room: f32| NamesMeasure {
         lines: strip_name_lines(name, room).len().max(1),
         broken: name.split_whitespace().any(|word| {
@@ -1745,45 +2185,77 @@ fn strip_names(
         lines: a.lines.max(b.lines),
         broken: a.broken || b.broken,
     };
-    let cached = showcase.strip_names.borrow().iter().find_map(|entry| {
-        ((entry.cards, entry.scale, entry.rooms) == key).then_some(NamesMeasure {
-            lines: entry.lines,
-            broken: entry.broken,
-        })
-    });
-    let rows = cached.unwrap_or_else(|| {
-        let rows = showcase
-            .cards
-            .iter()
-            .map(|card| {
-                let room = if under_typed || card.typography.is_some() {
-                    typed
-                } else {
-                    plain
-                };
-                measure(&card.label, room)
-            })
-            .fold(
-                NamesMeasure {
-                    lines: 1,
-                    broken: false,
-                },
-                most,
-            );
-        let mut entries = showcase.strip_names.borrow_mut();
-        entries.retain(|entry| entry.cards == key.0 && entry.scale == key.1);
-        // Two rooms a frame (beside the buttons, the strip's width), and a
-        // window resized by hand passes through many.
-        if entries.len() >= 8 {
-            entries.remove(0);
-        }
-        entries.push(StripNames {
-            cards: key.0,
-            scale: key.1,
-            rooms: key.2,
-            lines: rows.lines,
-            broken: rows.broken,
+    let at = (rooms, px.to_bits(), face);
+    // Rows naming the same themes, each with type or without, measure alike in every view.
+    let alike = |(rows, held, _): &NamesMeasured| {
+        let in_font = match (held, &font) {
+            (Some(held), Some(font)) => std::sync::Arc::ptr_eq(held, font),
+            (None, None) => true,
+            _ => false,
+        };
+        in_font
+            && (std::sync::Arc::ptr_eq(rows, &showcase.cards)
+                || rows.len() == showcase.cards.len()
+                    && rows.iter().zip(showcase.cards.iter()).all(|(was, card)| {
+                        was.label == card.label
+                            && was.typography.is_some() == card.typography.is_some()
+                    }))
+    };
+    let known = NAMES_MEASURED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(|kept| kept.get(&at).cloned());
+    let cached = known
+        .filter(|measured| alike(measured))
+        .map(|(cards, _, rows)| {
+            // A hit by label keeps the current cards, so the next frame's hit is by pointer.
+            if !std::sync::Arc::ptr_eq(&cards, &showcase.cards)
+                && let Some(kept) = NAMES_MEASURED
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_mut()
+                    .and_then(|kept| kept.get_mut(&at))
+            {
+                kept.0 = std::sync::Arc::clone(&showcase.cards);
+            }
+            rows
         });
+    let rows = cached.unwrap_or_else(|| {
+        let (rows, whole) = crate::tray_raster::ui_measures_whole(|| {
+            showcase
+                .cards
+                .iter()
+                .map(|card| {
+                    let room = if under_typed || card.typography.is_some() {
+                        typed
+                    } else {
+                        plain
+                    };
+                    measure(&card.label, room)
+                })
+                .fold(
+                    NamesMeasure {
+                        lines: 1,
+                        broken: false,
+                    },
+                    most,
+                )
+        });
+        if whole {
+            let mut kept = NAMES_MEASURED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let kept = kept.get_or_insert_with(aterm_hash::FxHashMap::default);
+            // Two rooms a frame, and a hand resize passes many: past the most, measures start over.
+            if kept.len() >= NAMES_MEASURED_MOST {
+                kept.clear();
+            }
+            kept.insert(
+                at,
+                (std::sync::Arc::clone(&showcase.cards), font.clone(), rows),
+            );
+        }
         rows
     });
     most(rows, measure(in_use, plain))
@@ -1897,82 +2369,174 @@ const fn appearance_label(side: aterm_types::Appearance) -> &'static str {
     }
 }
 
+/// What a chooser panel's pins are chosen by, bar its height ([`chooser_panel`]).
+pub(in crate::native_settings) struct ChooserFit {
+    forms: &'static [ChooserPins],
+    panel_width: f32,
+    framed: FitRows,
+    /// Its rows laid out to the panel's edges, where its frame gives way ([`Self::inset`]).
+    edge: std::cell::OnceCell<FitRows>,
+}
+
+/// A chooser's rows at a width: whether its footer pins, its tallest row, and its tallest stop.
+#[derive(Clone, Copy)]
+struct FitRows {
+    footer_pins: bool,
+    tallest_row: f32,
+    rows: f32,
+}
+
+impl FitRows {
+    fn at(state: &SettingsViewState, inner: f32, narrow: bool, footer: &[(UiNode, f32)]) -> Self {
+        // The footer pins as two field-high rows ([`footer_height`]); one wrapping more is listed.
+        let footer_pins = footer.len() == 2
+            && footer
+                .iter()
+                .all(|(_, height)| *height <= field_height() + 0.01);
+        let tallest_row = chooser_rows_tallest(state, inner, narrow);
+        // A pinned head leaves room for the keyboard's row as the list lays it out (R2).
+        let rows = tallest_row
+            .max(keyboard_row_tallest(state, inner, narrow))
+            .max(footer.iter().map(|(_, height)| *height).fold(0.0, f32::max));
+        Self {
+            footer_pins,
+            tallest_row,
+            rows,
+        }
+    }
+}
+
+impl ChooserFit {
+    fn at(
+        state: &SettingsViewState,
+        panel_width: f32,
+        (stacked, led): (bool, bool),
+        footer: &[(UiNode, f32)],
+    ) -> Self {
+        let inner = (panel_width - 2.0 * PANEL_INSET).max(0.0);
+        let narrow = chooser_is_narrow(panel_width);
+        let forms: &[ChooserPins] = if led {
+            &[ChooserPins::NONE]
+        } else if stacked {
+            &[
+                ChooserPins {
+                    head: true,
+                    footer: false,
+                },
+                ChooserPins::NONE,
+            ]
+        } else {
+            &[
+                ChooserPins {
+                    head: true,
+                    footer: true,
+                },
+                ChooserPins {
+                    head: true,
+                    footer: false,
+                },
+                ChooserPins::NONE,
+            ]
+        };
+        Self {
+            forms,
+            panel_width,
+            framed: FitRows::at(state, inner, narrow, footer),
+            edge: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Its rows in a panel `height` tall: in its frame, or to its edges where that gives way.
+    fn rows(&self, state: &SettingsViewState, height: f32) -> FitRows {
+        if self.inset(state, height) > 0.0 {
+            return self.framed;
+        }
+        *self.edge.get_or_init(|| {
+            let narrow = chooser_is_narrow(self.panel_width);
+            let footer = footer_rows(state, self.panel_width, narrow);
+            FitRows::at(state, self.panel_width, narrow, &footer)
+        })
+    }
+
+    /// Pins a `height` panel takes: the first whose list holds its tallest stop and its lead's.
+    fn pins(
+        &self,
+        state: &SettingsViewState,
+        height: f32,
+        lead_tallest: impl Fn(f32) -> f32,
+    ) -> ChooserPins {
+        let fit = self.rows(state, height);
+        self.forms
+            .iter()
+            .copied()
+            .filter(|pins| fit.footer_pins || !pins.footer)
+            .find(|&pins| {
+                let room = self.room(state, height, pins);
+                room + 0.5 >= chooser_tallest_stop(state, pins, fit.rows).max(lead_tallest(room))
+            })
+            .unwrap_or(ChooserPins::NONE)
+    }
+}
+
+impl ChooserFit {
+    /// THE FRAME GIVES WAY BEFORE A ROW OUTGROWS ITS LIST: the list takes the panel to its edges.
+    fn inset(&self, state: &SettingsViewState, height: f32) -> f32 {
+        chooser_inset(state, self.framed.tallest_row, height)
+    }
+
+    /// The room a panel `height` tall leaves its list with `pins` pinned, in its frame.
+    fn room(&self, state: &SettingsViewState, height: f32, pins: ChooserPins) -> f32 {
+        (height - 2.0 * self.inset(state, height) - chooser_pinned_height(state, pins)).max(0.0)
+    }
+}
+
+/// Chooser's frame in a `height` panel whose tallest row is `tallest_row` ([`ChooserFit::inset`]).
+fn chooser_inset(state: &SettingsViewState, tallest_row: f32, height: f32) -> f32 {
+    if tallest_row
+        > height - 2.0 * PANEL_INSET - chooser_pinned_height(state, ChooserPins::NONE) + 0.5
+    {
+        0.0
+    } else {
+        PANEL_INSET
+    }
+}
+
+/// The least room a list leads a section with its caption in, its tallest row `tallest_row` tall.
+fn captions_from(tallest_row: f32) -> f32 {
+    on_grid(caption_height() + SECTION_ABOVE) + tallest_row.max(row_height())
+}
+
 /// The theme chooser: its filter and footer pinned where its room holds them over whole rows,
 /// else listed, its list led by `lead`, and by the page's name (`name`) where nothing over the
 /// page names it and the list leads with its filter too.
 fn chooser_panel(
     state: &SettingsViewState,
-    panel_width: f32,
-    height: f32,
+    (panel_width, height, below): (f32, f32, f32),
     shape: Shape,
     (lead, sizing): Lead,
     name: Option<&str>,
 ) -> UiNode {
     let stacked = !matches!(shape, Shape::Beside { .. });
     let narrow = chooser_is_narrow(panel_width);
-    // THE CHOOSER'S FRAME GIVES WAY BEFORE A ROW OUTGROWS ITS LIST: where its tallest row is
-    // taller than the list its frame leaves, the list takes the panel to its edges (at 1.5x in
-    // 164x98 a two-line name and Community, 84pt, in an 82pt list, the frame's 8pt the
-    // difference).
     let framed = (panel_width - 2.0 * PANEL_INSET).max(0.0);
-    let inset = if chooser_rows_tallest(state, framed, narrow)
-        > height - 2.0 * PANEL_INSET - chooser_pinned_height(state, ChooserPins::NONE) + 0.5
-    {
-        0.0
-    } else {
-        PANEL_INSET
-    };
+    let fit = ChooserFit::at(
+        state,
+        panel_width,
+        (stacked, !lead.is_empty()),
+        &footer_rows(state, framed, narrow),
+    );
+    let inset = fit.inset(state, height);
     let inner = (panel_width - 2.0 * inset).max(0.0);
-    let forms: &[ChooserPins] = if !lead.is_empty() {
-        &[ChooserPins::NONE]
-    } else if stacked {
-        &[
-            ChooserPins {
-                head: true,
-                footer: false,
-            },
-            ChooserPins::NONE,
-        ]
-    } else {
-        &[
-            ChooserPins {
-                head: true,
-                footer: true,
-            },
-            ChooserPins {
-                head: true,
-                footer: false,
-            },
-            ChooserPins::NONE,
-        ]
-    };
-    let room_for =
-        |pins: ChooserPins| (height - 2.0 * inset - chooser_pinned_height(state, pins)).max(0.0);
     let footer = footer_rows(state, inner, narrow);
-    // The pinned footer is its two rows of a field each ([`footer_height`]): one whose words or
-    // links wrap to more rows is listed.
-    let footer_pins = footer.len() == 2
-        && footer
-            .iter()
-            .all(|(_, height)| *height <= field_height() + 0.01);
-    let tallest_row = chooser_rows_tallest(state, inner, narrow);
-    let rows = tallest_row.max(footer.iter().map(|(_, height)| *height).fold(0.0, f32::max));
+    let tallest_row = fit.rows(state, height).tallest_row;
     let lead_items: Vec<ListItem> = lead
         .iter()
         .cloned()
         .map(|(node, height)| lead_item(node, height, DEMO_STRIP_GAP, inner))
         .collect();
     let lead_tallest = |room: f32| scroll::tallest_span(&lead_items, 0.0, room);
-    let pins = forms
-        .iter()
-        .copied()
-        .filter(|pins| footer_pins || !pins.footer)
-        .find(|&pins| {
-            let room = room_for(pins);
-            room + 0.5 >= chooser_tallest_stop(state, pins, rows).max(lead_tallest(room))
-        })
-        .unwrap_or(ChooserPins::NONE);
-    let room = room_for(pins);
+    let pins = fit.pins(state, height, lead_tallest);
+    let room = fit.room(state, height, pins);
     let lead: Vec<(UiNode, f32)> = match name.filter(|_| !pins.head) {
         // Under the toolbar where it leads the list.
         Some(title) => {
@@ -1995,6 +2559,7 @@ fn chooser_panel(
         room,
         extra: 0.0,
         keyboard_pinned: false,
+        pin: None,
     };
     let head = if pins.head {
         chooser_head(state, inner)
@@ -2006,12 +2571,17 @@ fn chooser_panel(
         .fold(height - inset + PANEL_GAP, |under, (_, tall)| {
             under - tall - PANEL_GAP
         });
-    for (node, _) in &head {
+    let mut over = height - inset;
+    for (node, tall) in &head {
         state.note_pinned_status_room(node, under_head);
-        pin(state, node);
+        over -= tall;
+        pin(state, node, (*tall, over + below));
+        over -= PANEL_GAP;
     }
-    for (node, _) in footer.iter().filter(|_| pins.footer) {
-        pin(state, node);
+    let mut over = inset;
+    for (node, tall) in footer.iter().filter(|_| pins.footer).rev() {
+        pin(state, node, (*tall, over + below));
+        over += tall + PANEL_GAP;
     }
     let unbuilt = || {
         UiNode::new(
@@ -2037,7 +2607,7 @@ fn chooser_panel(
             .page_rows
             .set(((room / row_height()).floor() as usize).max(1));
     }
-    let captions_from = on_grid(caption_height() + SECTION_ABOVE) + tallest_row.max(row_height());
+    let captions_from = captions_from(tallest_row);
     let captions = room + 0.5 >= captions_from;
     let led = lead_at(&lead);
     let items_at = |width: f32, painted: bool| {
@@ -2084,8 +2654,13 @@ fn chooser_panel(
         lay(scroll::ListLaid::new(items, 0.0, rows));
         return unbuilt();
     }
-    let mut list =
-        scroll::list_page_whole(state, (SHOWCASE_LIST, "Themes"), items, (room, 0.0), rows);
+    let mut list = scroll::list_page_whole(
+        state,
+        (SHOWCASE_LIST, "Themes"),
+        items,
+        (room, 0.0),
+        (rows, KEYBOARD_PIN.with(Cell::get)),
+    );
     set_role(&mut list, SHOWCASE_LIST, SemanticRole::ListBox);
     transparent_sections(&mut list);
     if pins.footer {
@@ -2134,6 +2709,39 @@ fn sheet_list_room(height: f32) -> f32 {
     (height - 2.0 * PANEL_INSET - field_height() - PANEL_GAP).max(0.0)
 }
 
+/// The word naming the section a block heads: a section's heading or the open Community disclosure.
+fn section_word(node: &UiNode) -> Option<&str> {
+    if matches!(node.key.as_str(), PACK | "settings/showcase/pack-row") {
+        return Some(Section::Community.word());
+    }
+    node.key
+        .as_str()
+        .strip_prefix("settings/showcase/section/")?
+        .strip_suffix("/inset")
+}
+
+/// The caption over block `index` of a captioned list and its section's tallest row; none unheaded.
+fn caption_over(blocks: &[(UiNode, f32, Option<String>)], index: usize) -> Option<(f32, f32)> {
+    let row = |at: usize| blocks[at].0.key.as_str().starts_with(CARD_PREFIX);
+    if !row(index) {
+        return None;
+    }
+    let heading = (0..index).rev().find(|at| !row(*at))?;
+    section_word(&blocks[heading].0)?;
+    let tallest = blocks[heading + 1..]
+        .iter()
+        .take_while(|(node, _, _)| node.key.as_str().starts_with(CARD_PREFIX))
+        .map(|(_, height, _)| *height)
+        .fold(0.0, f32::max);
+    Some((blocks[heading].1, tallest))
+}
+
+/// The caption over a row as the list lays it out at two widths: the heading and its tallest row.
+fn caption_at_both(wide: Option<(f32, f32)>, thin: Option<(f32, f32)>) -> Option<(f32, f32)> {
+    let ((lead, wide), (_, thin)) = (wide?, thin?);
+    Some((lead, wide.max(thin)))
+}
+
 /// The chooser's blocks as list items: each captioned section (NEEDS ATTENTION, ATERM, BUILT IN,
 /// YOURS, COMMUNITY) one card listed row by row under its caption ([`scroll::SplitCard`]), so a
 /// screen that starts inside a section repeats its caption over its first row there (with
@@ -2148,7 +2756,6 @@ pub(in crate::native_settings) fn section_items(
     row_width: f32,
     captions: bool,
 ) -> Vec<ListItem> {
-    const SECTION_PREFIX: &str = "settings/showcase/section/";
     let mut items = Vec::new();
     let mut blocks = blocks.into_iter().peekable();
     while let Some((mut node, height, _)) = blocks.next() {
@@ -2156,15 +2763,7 @@ pub(in crate::native_settings) fn section_items(
         let disclosure = matches!(node.key.as_str(), PACK | "settings/showcase/pack-row");
         let Some(word) = captions
             .then_some(&node)
-            .and_then(|node| {
-                if disclosure {
-                    return Some(Section::Community.word());
-                }
-                node.key
-                    .as_str()
-                    .strip_prefix(SECTION_PREFIX)?
-                    .strip_suffix("/inset")
-            })
+            .and_then(section_word)
             .map(str::to_string)
         else {
             items.push(ListItem::Card(Box::new(node), height));
@@ -2226,6 +2825,7 @@ fn sheet_panel(
         room,
         extra: 0.0,
         keyboard_pinned: false,
+        pin: None,
     };
     let unbuilt = || {
         UiNode::new(
@@ -2309,7 +2909,7 @@ fn sheet_panel(
         ("settings/showcase/sheet-list", &label),
         items,
         (room, gap),
-        rows,
+        (rows, KEYBOARD_PIN.with(Cell::get)),
     );
     let mut children = Vec::with_capacity(2);
     if pin_title {
@@ -2491,10 +3091,34 @@ fn rule_node(key: &str) -> UiNode {
     .paint_only()
 }
 
+/// The footer's rows at a width, narrow or not, built this render.
+type SharedFooter = ((u32, bool), Vec<(UiNode, f32)>);
+
+/// [`build_footer_rows`], built once a render for each width while [`BlocksShared`] is open.
 fn footer_rows(state: &SettingsViewState, width: f32, narrow: bool) -> Vec<(UiNode, f32)> {
+    let at = (width.to_bits(), narrow);
+    let known = FOOTERS.with(|footers| {
+        footers.borrow().as_ref().and_then(|footers| {
+            footers
+                .iter()
+                .find(|(seen, _)| *seen == at)
+                .map(|(_, rows)| rows.clone())
+        })
+    });
+    known.unwrap_or_else(|| {
+        let rows = build_footer_rows(state, width, narrow);
+        FOOTERS.with(|footers| {
+            if let Some(footers) = footers.borrow_mut().as_mut() {
+                footers.push((at, rows.clone()));
+            }
+        });
+        rows
+    })
+}
+
+fn build_footer_rows(state: &SettingsViewState, width: f32, narrow: bool) -> Vec<(UiNode, f32)> {
     let height = field_height();
-    let following = prefs::theme_mode(state.raw_value(prefs::EDIT_THEME).as_deref())
-        == prefs::ThemeMode::FollowSystem;
+    let following = state.theme_follows_system();
     let switch_width = 52.0 * settings_text_scale().min(1.4);
     let visible = if narrow {
         "Follow system"
@@ -2666,24 +3290,358 @@ pub(in crate::native_settings) fn list_blocks(
     )
 }
 
+/// Every block's key and height unpainted at `inner` and a gutter less: measured, or `kept` read.
+#[cfg(test)]
+pub(in crate::native_settings) fn list_heights(
+    state: &SettingsViewState,
+    (inner, narrow): (f32, bool),
+    kept: Option<fn(f32) -> f32>,
+) -> Vec<Vec<(String, f32)>> {
+    state.showcase.rows_tallest.borrow_mut().clear();
+    if let Some(read) = kept {
+        let _ = chooser_rows_tallest(state, inner, narrow);
+        for (_, (_, rows)) in state.showcase.rows_tallest.borrow_mut().iter_mut() {
+            *rows = rows.iter().map(|row| row.map(read)).collect();
+        }
+    }
+    let query = state.showcase.query();
+    [inner, (inner - THUMB_GUTTER).max(0.0)]
+        .into_iter()
+        .map(|width| {
+            with_blocks(state, (width, narrow, &query), false, |entry| {
+                entry
+                    .blocks
+                    .iter()
+                    .map(|(node, height, _)| (node.key.as_str().to_string(), *height))
+                    .collect()
+            })
+        })
+        .collect()
+}
+
+/// Where the page holds the keyboard's control: listed, or in the head, footer or strip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::native_settings) enum Place {
+    Listed,
+    Head,
+    Footer,
+    Strip,
+}
+
+/// Rows between two of the chooser's at the inside and a gutter narrower, and the second's place.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::native_settings) struct Between {
+    /// At each width: the rows strictly between, the first's row and the second.
+    at: [(f32, f32, f32); 2],
+    /// The list's rows at the inside: a list shorter scrolls, its rows a thumb's gutter narrower.
+    rows: f32,
+    /// Per width, the row a captioned list stops with the second heading a section under the first.
+    joined: [f32; 2],
+    pub(in crate::native_settings) place: Place,
+    /// The caption over the first, and its section's tallest row.
+    pub(in crate::native_settings) over: Option<(f32, f32)>,
+    /// How far the second's row stands over its panel's foot where a footer pins it.
+    pub(in crate::native_settings) foot: f32,
+}
+
+impl Between {
+    /// The rows between, the first's and the second's in `room`: as a scroll lays them, else least.
+    pub(in crate::native_settings) fn in_room(self, room: f32) -> (f32, f32, f32) {
+        let [(between, from, to), thin] = self.at;
+        if self.rows > room + 0.01 {
+            thin
+        } else {
+            (between.min(thin.0), from.min(thin.1), to.min(thin.2))
+        }
+    }
+
+    /// The row a captioned list `room` tall stops with the second heading a section past the first.
+    pub(in crate::native_settings) fn joined_in(self, room: f32) -> f32 {
+        let [wide, thin] = self.joined;
+        if self.rows > room + 0.01 {
+            thin
+        } else {
+            wide.min(thin)
+        }
+    }
+}
+
+/// The rows strictly between `from`'s and `to`'s, and theirs, in a panel so wide and framed.
+pub(in crate::native_settings) fn blocks_between(
+    state: &SettingsViewState,
+    (page_width, panel_width, framed): (f32, f32, bool),
+    from: &UiKey,
+    to: &UiKey,
+) -> Option<Between> {
+    let inset = if framed { PANEL_INSET } else { 0.0 };
+    let inner = (panel_width - 2.0 * inset).max(0.0);
+    let query = state.showcase.query();
+    let narrow = chooser_is_narrow(panel_width);
+    let head = chooser_head(state, inner)
+        .iter()
+        .any(|(node, _)| holds(node, to));
+    let pinned = footer_rows(state, inner, narrow);
+    let footer_at_inner = pinned.iter().position(|(node, _)| holds(node, to));
+    let footer = footer_at_inner.is_some();
+    // A pinned footer stacks its rows up from its panel's inset, `to`'s over the rows after it.
+    let foot = footer_at_inner.map_or(0.0, |at| {
+        inset
+            + pinned[at + 1..]
+                .iter()
+                .map(|(_, tall)| tall + PANEL_GAP)
+                .sum::<f32>()
+    });
+    let strip = !head && !footer && holds(&strip_node(state, page_width).0, to);
+    let between = |width: f32| {
+        with_blocks(state, (width, narrow, &query), false, |entry| {
+            let at = |key: &UiKey| {
+                entry
+                    .blocks
+                    .iter()
+                    .position(|(node, _, _)| holds(node, key))
+            };
+            let from = at(from)?;
+            let (skip, take, first, to) = if head || strip {
+                (0, from, None, None)
+            } else if footer {
+                (from + 1, entry.blocks.len(), Some(from), None)
+            } else {
+                let to = at(to)?;
+                (from != to).then_some((
+                    from.min(to) + 1,
+                    from.max(to),
+                    Some(from.min(to)),
+                    Some(to),
+                ))?
+            };
+            let height = |at: usize| entry.blocks[at].1;
+            let joined = to
+                .filter(|to| *to > from && section_word(&entry.blocks[*to].0).is_some())
+                .and_then(|to| entry.blocks.get(to + 1))
+                .filter(|(node, _, _)| node.key.as_str().starts_with(CARD_PREFIX))
+                .map_or(0.0, |(_, height, _)| *height);
+            let rows = entry
+                .blocks
+                .iter()
+                .take(take)
+                .skip(skip)
+                .map(|(_, height, _)| *height)
+                .sum::<f32>();
+            let all = entry
+                .blocks
+                .iter()
+                .map(|(_, height, _)| *height)
+                .sum::<f32>();
+            Some((
+                (rows, height(from), to.map_or(0.0, height)),
+                first.and_then(|first| caption_over(&entry.blocks, first)),
+                all,
+                joined,
+            ))
+        })
+    };
+    // The footer's rows a listed footer lays out before `to`'s, and `to`'s.
+    let footer_at = |width: f32| {
+        let rows = footer_rows(state, width, narrow);
+        let at = rows.iter().position(|(node, _)| holds(node, to))?;
+        Some((
+            rows[..at].iter().map(|(_, height)| *height).sum::<f32>(),
+            rows[at].1,
+        ))
+    };
+    // A narrower list can lay its rows out shorter, where a row's slab gives way to its name.
+    let narrower = (inner - THUMB_GUTTER).max(0.0);
+    let ((wide, over, rows, joined), (thin, thin_over, _, thin_joined)) =
+        (between(inner)?, between(narrower)?);
+    let over = caption_at_both(over, thin_over);
+    // Only a chooser beside the demo pins its footer; a leading strip leads its head too, unpinned.
+    let place = if head {
+        Place::Head
+    } else if strip {
+        Place::Strip
+    } else if footer && matches!(Shape::for_width(page_width), Shape::Beside { .. }) {
+        Place::Footer
+    } else {
+        Place::Listed
+    };
+    let at = |(rows, from, to): (f32, f32, f32), width: f32| {
+        Some(if head {
+            (rows, from, field_height())
+        } else if strip {
+            (
+                rows + chooser_head_heights(state).iter().sum::<f32>(),
+                from,
+                strip_button_height(),
+            )
+        } else if footer {
+            let (before, to) = footer_at(width)?;
+            (rows + before, from, to)
+        } else {
+            (rows, from, to)
+        })
+    };
+    Some(Between {
+        at: [at(wide, inner)?, at(thin, narrower)?],
+        rows,
+        joined: [joined, thin_joined],
+        place,
+        over,
+        foot,
+    })
+}
+
+/// The caption over `key`'s row in a captioned list by panel width and frame, and its tallest row.
+pub(in crate::native_settings) fn caption_over_row(
+    state: &SettingsViewState,
+    (panel_width, framed): (f32, bool),
+    key: &UiKey,
+) -> Option<(f32, f32)> {
+    let inner = (panel_width - if framed { 2.0 * PANEL_INSET } else { 0.0 }).max(0.0);
+    let query = state.showcase.query();
+    let narrow = chooser_is_narrow(panel_width);
+    let over = |width: f32| {
+        with_blocks(state, (width, narrow, &query), false, |entry| {
+            let at = entry
+                .blocks
+                .iter()
+                .position(|(node, _, _)| holds(node, key))?;
+            caption_over(&entry.blocks, at)
+        })
+    };
+    caption_at_both(over(inner), over((inner - THUMB_GUTTER).max(0.0)))
+}
+
+/// Whether `node` is `key`'s or holds it.
+fn holds(node: &UiNode, key: &UiKey) -> bool {
+    node.key == *key || node.children.iter().any(|child| holds(child, key))
+}
+
+/// Whether the chooser's filter leaves theme row `key` out of a panel by width and frame.
+pub(in crate::native_settings) fn row_filtered_out(
+    state: &SettingsViewState,
+    (panel_width, framed): (f32, bool),
+    key: &UiKey,
+) -> bool {
+    let inner = (panel_width - if framed { 2.0 * PANEL_INSET } else { 0.0 }).max(0.0);
+    let query = state.showcase.query();
+    key.as_str().starts_with(CARD_PREFIX)
+        && with_blocks(
+            state,
+            (inner, chooser_is_narrow(panel_width), &query),
+            false,
+            |entry| !entry.blocks.iter().any(|(node, _, _)| holds(node, key)),
+        )
+}
+
+/// How tall `key`'s row lays out by panel width and frame, scrolling or not, captioned if `captions`.
+pub(in crate::native_settings) fn row_under_caption(
+    state: &SettingsViewState,
+    (panel_width, framed): (f32, bool),
+    key: &UiKey,
+    captions: bool,
+) -> Option<f32> {
+    let inner = (panel_width - if framed { 2.0 * PANEL_INSET } else { 0.0 }).max(0.0);
+    let query = state.showcase.query();
+    let narrow = chooser_is_narrow(panel_width);
+    let tall = |width: f32| {
+        with_blocks(state, (width, narrow, &query), false, |entry| {
+            let at = entry
+                .blocks
+                .iter()
+                .position(|(node, _, _)| holds(node, key))?;
+            let (node, row, _) = &entry.blocks[at];
+            let over = captions
+                .then(|| caption_over(&entry.blocks, at))
+                .flatten()
+                .map_or(0.0, |(lead, _)| lead);
+            node.key
+                .as_str()
+                .starts_with(CARD_PREFIX)
+                .then_some(row + over)
+        })
+    };
+    Some(tall(inner)?.max(tall((inner - THUMB_GUTTER).max(0.0))?))
+}
+
+/// The least a demo-led list's first screen needs: the demo at one row, then the strip's buttons.
+pub(in crate::native_settings) fn led_first_screen_least(
+    state: &SettingsViewState,
+    cx: &ViewCx<'_>,
+) -> Option<f32> {
+    let demo = demo_shared(
+        state,
+        cx.animation_phase_ms,
+        cx.motion,
+        cx.terminal_font_px,
+        cx.terminal_scale,
+        cx.semantic_font.as_ref(),
+    );
+    let (_, frame) = demo.as_ref().as_ref()?;
+    Some(frame.demo_height(1) + strip_button_height())
+}
+
+/// The least listed `key` lays out to at any width: a theme row or the pack; else nothing.
+pub(in crate::native_settings) fn listed_least(state: &SettingsViewState, key: &UiKey) -> f32 {
+    let key = key.as_str();
+    let row = key == PACK
+        || key
+            .strip_prefix(CARD_PREFIX)
+            .is_some_and(|slug| state.showcase.cards.iter().any(|card| card.slug == slug));
+    if row { row_height() } else { 0.0 }
+}
+
 /// The chooser's rows at a width, narrow or not, under a query, painted or not.
+#[derive(Debug)]
 pub(in crate::native_settings) struct SharedBlocks {
     at: (u32, bool, String),
     blocks: Vec<(UiNode, f32, Option<String>)>,
     painted: bool,
+    /// What else unpainted rows were built of: kept across renders while it holds.
+    from: Option<BlocksFrom>,
 }
 
-/// THE PAGE'S SEATS SHARE THE CHOOSER'S ROWS, the demo and the strip: while open, each width's are
-/// built once a render.
+/// What unpainted rows read besides width and query: rows, faces, disclosure, focus, filter words.
+#[derive(Debug, PartialEq)]
+struct BlocksFrom {
+    rows: RowsTallestAt,
+    pack_open: bool,
+    focus: Option<String>,
+    filter: String,
+}
+
+/// The [`BlocksFrom`] unpainted rows `narrow` or not would be built of now.
+fn blocks_from(state: &SettingsViewState, narrow: bool) -> BlocksFrom {
+    BlocksFrom {
+        rows: rows_tallest_at(state, 0.0, narrow),
+        pack_open: state.showcase.pack_open,
+        focus: state
+            .common
+            .last_focus
+            .as_ref()
+            .map(|focus| focus.as_str().to_string()),
+        filter: state.showcase.filter.value().to_string(),
+    }
+}
+
+/// The most unpainted lists [`ShowcaseState::blocks_kept`] keeps, the latest renders' first.
+const BLOCKS_KEPT: usize = 16;
+
+/// THE PAGE'S SEATS SHARE THE CHOOSER'S ROWS, demo, strip and colours: built once a render a width.
 pub(in crate::native_settings) struct BlocksShared<'a>(&'a SettingsViewState);
 
 impl<'a> BlocksShared<'a> {
     pub(in crate::native_settings) fn open(state: &'a SettingsViewState) -> Self {
         ITEMS.with(|items| items.replace(Some(Vec::new())));
+        FOOTERS.with(|footers| footers.replace(Some(Vec::new())));
+        FACES.with(|faces| faces.set(Some(None)));
         state.showcase_blocks.replace(Some(Vec::new()));
         state.showcase_sheet.replace(Some(Vec::new()));
+        state.showcase_sheet_rows.replace(Some(Vec::new()));
         state.showcase_demo.replace(Some(Vec::new()));
         state.showcase_strip.replace(Some(Vec::new()));
+        state.showcase_heading.replace(Some(Vec::new()));
+        state.colors_shared.replace(Some(Vec::new()));
+        state.follows_shared.set(Some(None));
         Self(state)
     }
 }
@@ -2691,10 +3649,25 @@ impl<'a> BlocksShared<'a> {
 impl Drop for BlocksShared<'_> {
     fn drop(&mut self) {
         ITEMS.with(|items| items.replace(None));
-        self.0.showcase_blocks.replace(None);
+        FOOTERS.with(|footers| footers.replace(None));
+        FACES.with(|faces| faces.set(None));
+        let built = self.0.showcase_blocks.replace(None).unwrap_or_default();
+        let mut kept = self.0.showcase.blocks_kept.borrow_mut();
+        let mut latest: Vec<SharedBlocks> = built
+            .into_iter()
+            .filter(|entry| entry.from.is_some())
+            .collect();
+        latest.append(&mut kept);
+        latest.truncate(BLOCKS_KEPT);
+        *kept = latest;
+        drop(kept);
         self.0.showcase_sheet.replace(None);
+        self.0.showcase_sheet_rows.replace(None);
         self.0.showcase_demo.replace(None);
         self.0.showcase_strip.replace(None);
+        self.0.showcase_heading.replace(None);
+        self.0.colors_shared.replace(None);
+        self.0.follows_shared.set(None);
     }
 }
 
@@ -2705,6 +3678,50 @@ pub(in crate::native_settings) type SharedSheet = (SheetAt, (usize, usize), Vec<
 /// What the sheet's rows are built at: the width, the room where an open picker reads it, colour
 /// rows on one line or not, and how tall rows stand too tall to stack.
 type SheetAt = (u32, Option<u32>, bool, Option<u32>);
+
+/// Sheet colour rows by width, one-line and too-tall flags, with the lines a field had and wanted.
+pub(in crate::native_settings) type SharedSheetRows = (
+    (u32, bool, Option<u32>),
+    (usize, usize),
+    std::rc::Rc<[Option<(UiNode, f32)>]>,
+);
+
+/// The sheet's colour rows ([`customize_row`]), once a render a width in [`BlocksShared`].
+fn sheet_colour_rows(
+    state: &SettingsViewState,
+    width: f32,
+    one_line: bool,
+) -> std::rc::Rc<[Option<(UiNode, f32)>]> {
+    let (tall, most) = crate::native_settings::seat_row_rooms();
+    let at = (width.to_bits(), one_line, tall);
+    // Rows whose fields all fit the lines left them are built alike under any as many.
+    let built = state
+        .showcase_sheet_rows
+        .borrow()
+        .as_ref()
+        .and_then(|shared| {
+            shared
+                .iter()
+                .find(|(seen, (left, wanted), _)| {
+                    *seen == at && (*left == most || (*wanted <= *left && *wanted <= most))
+                })
+                .map(|(_, (_, wanted), rows)| (*wanted, rows.clone()))
+        });
+    if let Some((wanted, rows)) = built {
+        crate::native_settings::field_lines_noted(wanted);
+        return rows;
+    }
+    let (rows, wanted) = crate::native_settings::field_lines_wanted(|| {
+        SHOWCASE_COLOR_KEYS
+            .into_iter()
+            .map(|key| customize_row(state, key, width, one_line))
+            .collect::<std::rc::Rc<[_]>>()
+    });
+    if let Some(shared) = state.showcase_sheet_rows.borrow_mut().as_mut() {
+        shared.push((at, (most, wanted), rows.clone()));
+    }
+    rows
+}
 
 /// `read` of [`sheet_blocks`], built once a render for each width and room while [`BlocksShared`]
 /// is open, and which of the render's they are.
@@ -2731,8 +3748,10 @@ fn with_sheet_blocks<R>(
         return read(index, &shared[index].2);
     }
     drop(shared);
-    let (blocks, wanted) =
-        crate::native_settings::field_lines_wanted(|| sheet_blocks(state, width, room, one_line));
+    let (blocks, wanted) = crate::native_settings::field_lines_wanted(|| {
+        let rows = sheet_colour_rows(state, width, one_line);
+        sheet_blocks(state, (width, room), &rows)
+    });
     if let Some(shared) = state.showcase_sheet.borrow_mut().as_mut() {
         shared.push((at, (most, wanted), blocks));
     } else {
@@ -2748,7 +3767,7 @@ fn with_sheet_blocks<R>(
 }
 
 /// `read` of the rows [`build_list_blocks`] builds, `painted` or any, shared while
-/// [`BlocksShared`] is open.
+/// [`BlocksShared`] is open; unpainted, kept for later renders ([`ShowcaseState::blocks_kept`]).
 fn with_blocks<R>(
     state: &SettingsViewState,
     (width, narrow, query): (f32, bool, &str),
@@ -2756,14 +3775,15 @@ fn with_blocks<R>(
     read: impl FnOnce(&SharedBlocks) -> R,
 ) -> R {
     let at = (width.to_bits(), narrow, query.to_string());
-    let build = |at| SharedBlocks {
+    let build = |at, from| SharedBlocks {
         blocks: build_list_blocks(state, width, narrow, query, painted),
         at,
         painted,
+        from,
     };
     let mut shared = state.showcase_blocks.borrow_mut();
     let Some(shared) = shared.as_mut() else {
-        return read(&build(at));
+        return read(&build(at, None));
     };
     let index = match shared
         .iter()
@@ -2771,7 +3791,19 @@ fn with_blocks<R>(
     {
         Some(index) => index,
         None => {
-            shared.push(build(at));
+            let from = (!painted).then(|| blocks_from(state, narrow));
+            let mut kept = state.showcase.blocks_kept.borrow_mut();
+            let known = from.as_ref().and_then(|from| {
+                kept.iter()
+                    .position(|entry| entry.at == at && entry.from.as_ref() == Some(from))
+            });
+            shared.push(match known {
+                Some(index) => kept.remove(index),
+                None => {
+                    drop(kept);
+                    build(at, from)
+                }
+            });
             shared.len() - 1
         }
     };
@@ -2791,8 +3823,8 @@ fn build_list_blocks(
     // Every row the list can list, the Community section's too, as an empty filter lists them.
     let every = query == EVERY_ROW;
     let query = if every { "" } else { query };
-    let slab = slab_column(state, width, narrow);
-    let tags = TagWidths::now();
+    // The slab and tags a built row lays out by, measured once a row is built: kept rows need none.
+    let measures = std::cell::OnceCell::new();
     let mut blocks: Vec<(UiNode, f32, Option<String>)> = Vec::new();
     let reach = showcase.reach_for(query);
     let attention: Vec<&AttentionRow> = showcase
@@ -2815,11 +3847,12 @@ fn build_list_blocks(
             ));
         }
     }
-    let visible = if every {
+    let visible: Vec<usize> = if every {
         (0..showcase.cards.len()).collect()
     } else {
         showcase.visible_for(query)
     };
+    blocks.reserve(visible.len() + 2);
     let community_total = showcase
         .cards
         .iter()
@@ -2827,6 +3860,10 @@ fn build_list_blocks(
         .count();
     let configured = state.configured_theme_id();
     let highlighted = state.highlighted_slug();
+    // Rows as tall without at a width kept ([`chooser_rows_tallest`]) are not measured again.
+    let kept = (!painted)
+        .then(|| rows_kept_at(state, width, narrow))
+        .flatten();
     let mut section = None;
     let mut rows_before = !blocks.is_empty();
     for index in &visible {
@@ -2841,13 +3878,23 @@ fn build_list_blocks(
         }
         let in_use = configured.eq_ignore_ascii_case(&card.id);
         let selected = highlighted.as_deref() == Some(card.slug.as_str());
-        let (row, height) = row_node(
-            state,
-            card,
-            (width, narrow, slab, tags),
-            (in_use, selected),
-            painted,
-        );
+        let (row, height) = match kept.as_ref().map(|(rows, side)| rows[*index][*side]) {
+            Some(height) => (
+                unbuilt_row(format!("{CARD_PREFIX}{}", card.slug), height),
+                height,
+            ),
+            None => {
+                let (slab, tags) =
+                    *measures.get_or_init(|| (slab_column(state, width, narrow), TagWidths::now()));
+                row_node(
+                    state,
+                    card,
+                    (width, narrow, slab, tags),
+                    (in_use, selected),
+                    painted,
+                )
+            }
+        };
         blocks.push((row, height, Some(card.slug.clone())));
         rows_before = true;
     }
@@ -2995,8 +4042,20 @@ fn pack_row(
     (node, band, None)
 }
 
-/// A theme's row and its height; `painted`, with what it paints (its name, tags, slab and file
-/// buttons), else its control alone at that height, all a list measures its stops by.
+/// A theme row `height` tall read for its key and height alone: no control is built.
+fn unbuilt_row(key: String, height: f32) -> UiNode {
+    UiNode::new(
+        key,
+        UiContent::Group(GroupSpec::unlabeled(SemanticRole::ListBoxOption)),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fill)
+            .height(Length::Fixed(height)),
+    )
+}
+
+/// A theme's row and height; `painted`, its control with its paint, else its key alone, as tall.
 fn row_node(
     state: &SettingsViewState,
     card: &ShowcaseCard,
@@ -3006,23 +4065,6 @@ fn row_node(
 ) -> (UiNode, f32) {
     let key = format!("{CARD_PREFIX}{}", card.slug);
     let height = row_height();
-    let trying = state
-        .showcase
-        .trial_id()
-        .is_some_and(|id| id.eq_ignore_ascii_case(&card.id));
-    let mut spec = ButtonSpec::new(card.label.clone()).visual_label("");
-    spec.description = (!card.description.is_empty()).then(|| card.description.clone());
-    let option = UiContent::Button(
-        Control::new(spec, ActionId::new(key.clone()))
-            .value(SemanticValue::Text(card.row_value(in_use, trying)))
-            .state(ControlState {
-                selected,
-                focused: focused(state, &key),
-                ..ControlState::default()
-            })
-            .style(StyleRef::Navigation)
-            .role(SemanticRole::ListBoxOption),
-    );
     let yours = card.section == Section::Yours;
     let typed = card.typography.is_some();
     let low =
@@ -3066,23 +4108,27 @@ fn row_node(
     .map(|width| width + 6.0)
     .sum();
     let mut name_width = (width - TEXT_INSET - ROW_END - trailing_width).max(0.0);
-    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
-    let measure = |text: &str| crate::tray_raster::ui_text_width_for(face, text, px);
-    let check = in_use || pieces_fit(&card.label, name_width, &measure);
+    let metrics = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
+    let check = in_use || ui_pieces_fit(&card.label, (metrics.1, metrics.0), name_width);
     if !check {
         name_width += check_width + 6.0;
     }
     let words = (SemanticRole::Text, StyleRef::Primary);
-    let lines = wrapped_words_lines(&card.label, words, name_width);
-    let one_line = lines.len() <= 1;
-    let row = |height: f32| {
-        UiNode::new(key.clone(), option).layout(
+    // Only a painted row sets its name's lines; one as tall without counts them.
+    let lines = painted.then(|| wrapped_words_lines(&card.label, words, name_width));
+    let line_count = lines.as_ref().map_or_else(
+        || wrapped_words_line_count(&card.label, words, name_width),
+        Vec::len,
+    );
+    let one_line = line_count <= 1;
+    let row = |content: UiContent, height: f32| {
+        UiNode::new(key.clone(), content).layout(
             Layout::default()
                 .width(Length::Fill)
                 .height(Length::Fixed(height)),
         )
     };
-    let lines_height = lines.len().max(1) as f32 * row_name_line_height();
+    let lines_height = line_count.max(1) as f32 * row_name_line_height();
     let tall = if one_line {
         height
     } else {
@@ -3090,9 +4136,27 @@ fn row_node(
         // grid ([`on_grid`]), its lines and its slab centred in it.
         on_grid(height.max(lines_height + 2.0 * ROW_NAME_PAD))
     };
+    // Rows as tall without are read for their keys and heights alone: none builds their control.
     if !painted {
-        return (row(tall), tall);
+        return (unbuilt_row(key.clone(), tall), tall);
     }
+    let trying = state
+        .showcase
+        .trial_id()
+        .is_some_and(|id| id.eq_ignore_ascii_case(&card.id));
+    let mut spec = ButtonSpec::new(card.label.clone()).visual_label("");
+    spec.description = (!card.description.is_empty()).then(|| card.description.clone());
+    let option = UiContent::Button(
+        Control::new(spec, ActionId::new(key.clone()))
+            .value(SemanticValue::Text(card.row_value(in_use, trying)))
+            .state(ControlState {
+                selected,
+                focused: focused(state, &key),
+                ..ControlState::default()
+            })
+            .style(StyleRef::Navigation)
+            .role(SemanticRole::ListBoxOption),
+    );
     let tag = |suffix: &str, text: &str, style: StyleRef, tag_width: f32| {
         UiNode::new(
             format!("{key}/{suffix}"),
@@ -3164,7 +4228,7 @@ fn row_node(
         &format!("{key}/name"),
         &card.label,
         words,
-        lines,
+        lines.unwrap_or_default(),
         row_name_line_height(),
     );
     let name = if one_line {
@@ -3209,7 +4273,7 @@ fn row_node(
     if yours {
         children.push(file_actions(state, card, &key, slab));
     }
-    (row(tall).children(children), tall)
+    (row(option, tall).children(children), tall)
 }
 
 fn row_name_line_height() -> f32 {

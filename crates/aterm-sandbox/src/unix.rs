@@ -46,12 +46,18 @@ pub(crate) fn set_limit(
         rlim_max: 0,
     };
     // SAFETY: valid resource id + a valid out-param for the call's duration.
-    let hard = if unsafe { libc::getrlimit(resource, &mut cur) } == 0 {
-        cur.rlim_max
-    } else {
-        v as libc::rlim_t
-    };
-    let soft = core::cmp::min(v as libc::rlim_t, hard);
+    if unsafe { libc::getrlimit(resource, &mut cur) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let hard = cur.rlim_max;
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::unnecessary_cast,
+        reason = "rlim_t width and signedness vary across Unix targets"
+    )]
+    let capped = v.min(libc::rlim_t::MAX as u64) as libc::rlim_t;
+    let soft = core::cmp::min(capped, hard);
     let lim = libc::rlimit {
         rlim_cur: soft,
         rlim_max: if binding { soft } else { hard },

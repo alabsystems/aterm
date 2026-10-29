@@ -20,10 +20,10 @@ use crate::logid::{Lineage, LogIdentity};
 use crate::proto::{
     append_commit_frame, append_frame, append_publish_frame, append_retire_frame,
     decode_response_with_bt, encode_request, foreign_protocol, read_frame, Request, Response,
-    WireStats, CAP_EXPIRED_PREFIX, ERR_BAD_FILTER, ERR_BAD_SUBJECT, ERR_PROTOCOL,
+    WireStats, CAP_EXPIRED_PREFIX, ERR_BAD_FILTER, ERR_BAD_SUBJECT, ERR_PROTOCOL, ERR_RATE_LIMITED,
     ERR_RECORD_REFUSED, ERR_REFUSED, ERR_RETIRE_REFUSED, ERR_SUBJECT_BOUND, ERR_UNAUTHORIZED,
-    LOG_POISONED_PREFIX, PROTO_VERSION, RETAINED_FROM_PREFIX, RETIRE_CHARGED_PREFIX,
-    RETIRE_CUT_PREFIX, RETIRE_LOG_PREFIX, RETIRE_WILL_PREFIX,
+    LOG_POISONED_PREFIX, PROTO_VERSION, RATE_LIMITED_PREFIX, RETAINED_FROM_PREFIX,
+    RETIRE_CHARGED_PREFIX, RETIRE_CUT_PREFIX, RETIRE_LOG_PREFIX, RETIRE_WILL_PREFIX,
 };
 use crate::proto::{Gap, NonceExt, ServedInfo};
 use astream_wire::frame::decode_frame_header_bytes;
@@ -2963,6 +2963,40 @@ impl BrokerRefusal {
     pub fn is_retire_cut(&self) -> bool {
         self.code == ERR_RECORD_REFUSED && self.msg.starts_with(RETIRE_CUT_PREFIX)
     }
+
+    /// Whether a publish or `ProcessAndProduce` was refused by the broker's per-principal /
+    /// per-producer monotone token-bucket rate limiter ([`ERR_RATE_LIMITED`],
+    /// `DESIGN-aterm-fabric` T9 & T17).
+    ///
+    /// NOT [`is_permanent`](Self::is_permanent): nothing was appended, and the identical
+    /// request lands once the bucket refills (see [`retry_after_ms`](Self::retry_after_ms)).
+    #[must_use]
+    pub const fn is_rate_limited(&self) -> bool {
+        self.code == ERR_RATE_LIMITED
+    }
+
+    /// Minimum wait in milliseconds (`>= 1`) advertised in an [`ERR_RATE_LIMITED`] refusal
+    /// starting with [`RATE_LIMITED_PREFIX`]`<ms>`, or `None` for any other refusal.
+    #[must_use]
+    pub fn retry_after_ms(&self) -> Option<u64> {
+        if self.code != ERR_RATE_LIMITED {
+            return None;
+        }
+        let rest = self.msg.strip_prefix(RATE_LIMITED_PREFIX)?;
+        let raw = rest.as_bytes();
+        let mut n = 0usize;
+        while let Some(&b) = raw.get(n) {
+            if b.is_ascii_digit() {
+                n = n.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+        if n == 0 {
+            return None;
+        }
+        rest.get(..n)?.parse().ok()
+    }
 }
 
 impl std::fmt::Display for BrokerRefusal {
@@ -4101,6 +4135,30 @@ fn connect_handshake(
         io::ErrorKind::Unsupported,
         "Transport::Handshake needs astream-broker built with the `handshake` feature",
     ))
+}
+
+#[cfg(feature = "identity")]
+pub(crate) fn connect_identity(
+    endpoint: &str,
+    identity: &astream_aead::IdentityKeypair,
+    expected_server: &[u8; astream_aead::ID_PUB_LEN],
+    connect_timeout: Option<Duration>,
+) -> io::Result<(AnyClient, Closer)> {
+    if connect_timeout == Some(Duration::ZERO) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a zero connect timeout bounds nothing: pass None for the OS default, or a positive duration",
+        ));
+    }
+    let stream = dial_tcp(endpoint, connect_timeout)?;
+    let hs_timeout = connect_timeout.unwrap_or(Duration::from_secs(10));
+    stream.set_read_timeout(Some(hs_timeout))?;
+    stream.set_write_timeout(Some(hs_timeout))?;
+    let sealed = astream_aead::client_identity_handshake(stream, identity, expected_server)?;
+    sealed.get_ref().set_read_timeout(None)?;
+    sealed.get_ref().set_write_timeout(None)?;
+    let closer = Closer::tcp(sealed.get_ref())?;
+    Ok(erase(sealed, closer))
 }
 
 #[cfg(test)]

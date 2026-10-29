@@ -1,0 +1,18 @@
+seq v=1 rig=transcript program=claude build=2.1.311
+# Fix E1 (E2E-1): a reply too fast for the screen. The screen samples its word
+# at most every 250 ms and takes no look while output keeps arriving, so it
+# never saw this turn busy. The prompt, read at partial (an unmeasured build),
+# opens the turn at strong, dated and attributed by the input that submitted
+# it, and the turn end closes the turn it opened.
+state partial
+bind 0
+see idle
+pass 400
+input ctl
+pass 100
+tx prompt v1
+expect open t1 turn par=r1 vref=v1 by=ctl src=transcript conf=strong
+tx end
+expect close t1 turn out=done by=vendor src=transcript conf=strong
+expect amend t1 turn vdur_ms=4200 tok_in=900 by=vendor src=transcript conf=strong
+expect turn=none

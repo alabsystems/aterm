@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use aterm_grapheme::GraphemeClusters;
 use aterm_secrets::SecretBytes;
 use aterm_types::macos_setup::{
-    Access, FailureKind, Group, Observation, PassOutcome, Plan, PutBack, RestoreOutcome, Selection,
-    Setting, Standing, Subject, SyncKind, TRIED_TWICE, Unfinished,
+    Access, BASE_PLAN, FailureKind, Group, Observation, PassOutcome, Plan, PutBack, RestoreOutcome,
+    SYNC_OFF, Selection, Setting, Standing, Subject, SyncKind, TRIED_TWICE, Unfinished,
 };
 
 use crate::native_app::{
@@ -112,6 +112,9 @@ pub struct SetupStatus {
 /// ([`SetupStatus::developer_tools`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolsInstall {
+    /// `Install…` was pressed while a macOS permission gesture held the dialog slot: the tab
+    /// opens once that step finishes and System State is in front.
+    Queued,
     /// Its terminal tab waits for the person's password: they are needed now, and typing it is
     /// the one thing that changes the outcome.
     Password,
@@ -1543,23 +1546,28 @@ fn row_view_as(
     let tools = (!review && subject == Subject::Setting(Setting::Repositories))
         .then(|| status.tools_wait(reading))
         .flatten();
-    let standing = if tools == Some(ToolsWait::Installing) {
-        note = Some(INSTALLING_TOOLS_NOTE.to_owned());
-        Some(Standing::Waiting)
-    } else {
-        standing
+    let standing = match tools {
+        Some(ToolsWait::Installing) => {
+            note = Some(INSTALLING_TOOLS_NOTE.to_owned());
+            Some(Standing::Waiting)
+        }
+        Some(ToolsWait::Queued) => {
+            note = Some(TOOLS_QUEUED_NOTE.to_owned());
+            Some(Standing::Waiting)
+        }
+        _ => standing,
     };
     let open = match subject {
         Subject::Access(access) if standing == Some(Standing::NeedsYou) && !asking => Some(access),
         _ => None,
     };
-    // A setting read in place at a value other than aterm's is the person's
-    // opt-out (the vault's Sync off): its row turns it back on, quietly, unless it reads as what
-    // Apply will do, which acts on nothing yet.
+    // The vault read in place at Sync off is the person's opt-out: its row turns it back on,
+    // quietly, unless it reads as what Apply will do, which acts on nothing yet. The base plan's
+    // vault read in place not joined, where none answers, has no sync to turn on.
     let turn_on_sync = !review
         && subject == Subject::Setting(Setting::Secrets)
         && standing == Some(Standing::InPlace)
-        && wanted != subject.wanted();
+        && wanted == SYNC_OFF;
     // A step the last run said of this row (§3.6): one the page says failed takes the failed
     // chip, though the row reads in place, and one aterm tries again by itself the waiting one,
     // as the headline and the village say them. A step whose row needs a person says nothing of
@@ -1795,6 +1803,12 @@ pub(crate) const TOOLS_RECOVERED_HEADLINE: &str = "Continue in the Command Line 
 pub(crate) const TOOLS_RECOVERED_NOTE: &str =
     "Installer tab restored. Continue there, or close it to retry.";
 
+/// The GitHub repositories row's calm note while `Install…` is queued behind a macOS permission
+/// gesture ([`ToolsInstall::Queued`]): nobody needs to press `Install…` again, and the tab opens
+/// once that step finishes.
+pub(crate) const TOOLS_QUEUED_NOTE: &str =
+    "Queued until the current macOS permission step finishes";
+
 /// The GitHub repositories row's calm note while Apple's Command Line Tools install
 /// ([`ToolsInstall::Installing`]): nobody needs to act, and the row moves on once they arrive.
 pub(crate) const INSTALLING_TOOLS_NOTE: &str = "Installing Apple's Command Line Tools…";
@@ -1809,6 +1823,8 @@ pub(crate) const INSTALL_TOOLS: &str = "system-state/row/repositories/install";
 pub(crate) enum ToolsWait {
     /// Nothing installs them: the row's Install… opens their tab.
     Missing,
+    /// `Install…` is queued behind a macOS permission step holding the dialog slot.
+    Queued,
     /// Their tab asks for the person's password.
     Password,
     /// Their live tab was restored; no particular prompt is known.
@@ -1828,6 +1844,7 @@ impl SetupStatus {
                 == Some(aterm_types::macos_setup::COMMAND_LINE_TOOLS_MISSING))
         .then_some(match self.developer_tools {
             None => ToolsWait::Missing,
+            Some(ToolsInstall::Queued) => ToolsWait::Queued,
             Some(ToolsInstall::Password) => ToolsWait::Password,
             Some(ToolsInstall::Recovered) => ToolsWait::Recovered,
             Some(ToolsInstall::Installing) => ToolsWait::Installing,
@@ -1967,6 +1984,9 @@ pub(crate) struct Headline {
     /// Its Set up now button runs the plan again: managed rows differ and
     /// nothing is going (a stopped run, a step that could not finish).
     pub(crate) start: bool,
+    /// It says the Mac is set up (§3.2: nothing differs in a managed group), which `setup=`
+    /// reads as done ([`crate::system_state_access::setup_field`]).
+    pub(crate) set_up: bool,
 }
 
 impl Headline {
@@ -1976,6 +1996,7 @@ impl Headline {
             open: None,
             show: None,
             start: false,
+            set_up: false,
         }
     }
 
@@ -2270,20 +2291,30 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
             ))
         };
     }
-    let only_permissions = rows
+    // A plan that manages aterm's permissions and nothing beyond the base plan (a non-ALab Mac,
+    // its profile left as is, §3.2) names the permissions: beside them it sets up only what every
+    // Mac gets, the vault where one answers and Rust in Spotlight, and leaves the person's
+    // preferences, Dock, repositories and accounts as is, which `This Mac is set up` would claim.
+    let base_plan = rows
         .iter()
-        .filter(|row| row.managed)
-        .all(|row| row.subject.group() == Group::Access);
-    let set_up = if only_permissions {
+        .any(|row| row.managed && row.subject.group() == Group::Access)
+        && rows
+            .iter()
+            .filter(|row| row.managed)
+            .all(|row| BASE_PLAN.contains(row.subject.setting()));
+    let set_up = if base_plan {
         "Permissions are set up"
     } else {
         "This Mac is set up"
     };
-    Headline::line(if steps.check_failed {
-        format!("{set_up}, {AS_LAST_READ}")
-    } else {
-        set_up.to_owned()
-    })
+    Headline {
+        set_up: true,
+        ..Headline::line(if steps.check_failed {
+            format!("{set_up}, {AS_LAST_READ}")
+        } else {
+            set_up.to_owned()
+        })
+    }
 }
 
 /// What a set-up headline adds after a Check that failed as a whole: the rows show what aterm
@@ -2915,10 +2946,30 @@ impl SystemStateApp {
             && !self.vault_draft()
     }
 
+    /// Whether the page can take the offer of the plan an earlier process admitted
+    /// ([`OfferKind::Resume`]): no other offer waits and nothing the page sent waits for the
+    /// worker. The run it resumes may be going, and a vault draft stays: its answer is the
+    /// offered plan, never the page's groups or fields.
+    pub(crate) fn can_offer_resume(&self) -> bool {
+        !self.request.as_ref().is_some_and(Request::pending) && self.awaiting.is_none()
+    }
+
     pub(crate) fn offer(&mut self, request: Request) -> bool {
-        if !request.pending() || !self.can_offer() {
+        let resume = matches!(request.kind(), OfferKind::Resume);
+        let can = if resume {
+            self.can_offer_resume()
+        } else {
+            self.can_offer()
+        };
+        if !request.pending() || !can {
             request.finish(WorkstationSetupDecision::Unavailable);
             return false;
+        }
+        if resume {
+            // The page goes on as it reads: the plan, its fields and the run's status stay.
+            self.request = Some(request);
+            self.answer_waits = true;
+            return true;
         }
         self.plan = request.initial().clone();
         self.plan_known = true;
@@ -2926,7 +2977,7 @@ impl SystemStateApp {
         // worker holds: a Cancel leaves its groups as they are (§3.5). The vault it offers is the
         // worker's, never a draft of the person's.
         self.submitted = match request.kind() {
-            OfferKind::Launch => self.plan.clone(),
+            OfferKind::Launch | OfferKind::Resume => self.plan.clone(),
             OfferKind::Widen { in_force } => Plan {
                 selection: in_force.selection,
                 vault_url: self.plan.vault_url.clone(),
@@ -2985,7 +3036,7 @@ impl SystemStateApp {
     /// vault address being typed stays as typed.
     pub(crate) fn publish(&mut self, status: SetupStatus) -> bool {
         let mut changed = self.status != status;
-        if self.request.is_none()
+        if (self.request.is_none() || self.resuming())
             && self.awaiting.is_none()
             && let Some(plan) = &status.plan
         {
@@ -3023,9 +3074,46 @@ impl SystemStateApp {
         self.by_person = by_person;
     }
 
-    /// Whether the offer up still waits for the page's own answer ([`Self::answer_waits`]).
+    /// Whether the offer up still waits for the page's own answer ([`Self::answer_waits`]), and
+    /// is a review: the offer of a plan an earlier process admitted is none
+    /// ([`Self::resume_waits`]).
     fn reviewing(&self) -> bool {
-        self.pending() && self.answer_waits
+        self.pending() && self.answer_waits && !self.resuming()
+    }
+
+    /// Whether the offer up is the one of the plan an earlier process admitted, whose run this
+    /// launch resumes ([`OfferKind::Resume`]).
+    fn resuming(&self) -> bool {
+        self.pending()
+            && self
+                .request
+                .as_ref()
+                .is_some_and(|request| matches!(request.kind(), OfferKind::Resume))
+    }
+
+    /// Whether the offer of the plan an earlier process admitted still waits for the page's own
+    /// answer.
+    fn resume_waits(&self) -> bool {
+        self.resuming() && self.answer_waits
+    }
+
+    /// The page's own answer to the offer of the plan an earlier process admitted (design §3.3,
+    /// §6): that plan as offered, whatever the page shows or a person typed, so it changes
+    /// nothing of the plan, chooses nothing and sends no credential. It is this window's own
+    /// admission of the plan whose run goes on; the worker admits nothing new for it.
+    fn answer_resume(&mut self) {
+        let Some(plan) = self
+            .request
+            .as_ref()
+            .map(|request| request.initial().clone())
+        else {
+            return;
+        };
+        self.answer_waits = false;
+        self.actions.push_back(SystemStateAction::Apply(
+            WorkstationSetupDecision::Begin(plan).into(),
+            Admission::Automatic,
+        ));
     }
 
     /// A withdrawn offer is let go. An offer that waits for its answer is answered by the page
@@ -3033,13 +3121,19 @@ impl SystemStateApp {
     /// keyboard, mouse or trackpad used within the last minute, and the screen neither locked
     /// nor switched away), focused, shown or not, whatever was clicked or typed meanwhile:
     /// no review, no countdown, no confirmation (design revision 4); a status that says the page
-    /// is busy holds it until it is not. While a setup run goes and the page is `shown` (the
+    /// is busy holds it until it is not, but for the offer of a plan an earlier process admitted,
+    /// whose run is what keeps it busy ([`Self::answer_resume`]). While a setup run goes and the page is `shown` (the
     /// visible view of a window), the village's kitties walk a step. `walks` says whether a shown
     /// view's last render showed a walking village ([`SystemStateViewState::village_walks`]).
     /// `true` when the page changed: a page nobody sees, one Check again or Restore keeps busy,
     /// or one whose shown views draw no walking village owes no repaint for the walk.
     pub(crate) fn tick(&mut self, present: bool, shown: bool, walks: bool) -> bool {
-        let before = (self.request.is_some(), self.status.busy, self.reviewing());
+        let before = (
+            self.request.is_some(),
+            self.status.busy,
+            self.reviewing(),
+            self.resume_waits(),
+        );
         if self
             .request
             .as_ref()
@@ -3056,12 +3150,24 @@ impl SystemStateApp {
             .is_some_and(|widened| self.widen_review(widened));
         if self.reviewing() && present && !self.status.busy {
             self.apply(Admission::Automatic, Submission::Offer, None);
+        } else if self.resume_waits() && present && !self.stopping {
+            // The run it resumes is going: its busy status holds nothing here. A Stop asked of
+            // that run is no run to go on with, so the page gives no answer after one.
+            self.answer_resume();
         }
         let walked = self.status.running() && shown && {
             self.anim_ticks = self.anim_ticks.wrapping_add(1);
             walks
         };
-        walked || widened || before != (self.request.is_some(), self.status.busy, self.reviewing())
+        walked
+            || widened
+            || before
+                != (
+                    self.request.is_some(),
+                    self.status.busy,
+                    self.reviewing(),
+                    self.resume_waits(),
+                )
     }
 
     pub(crate) fn pending(&self) -> bool {
@@ -3419,7 +3525,7 @@ impl SystemStateApp {
     /// still waiting for its answer may be. A press then is sent even where it leaves the
     /// groups as they are, or the widen would set a group the person chose to leave as is.
     fn may_widen(&self) -> bool {
-        self.status.provisional || self.pending()
+        self.status.provisional || (self.pending() && !self.resuming())
     }
 
     /// Whether the vault's fields show: as the person last set the
@@ -5633,8 +5739,8 @@ impl<'a, 'b> Page<'a, 'b> {
                     .height(Length::Fixed(m.control_h)),
             )
         };
-        let blank = "Leave the password blank to join an open vault at once, or to wait for \
-                     an admin Mac to approve this one.";
+        let blank = "Leave the password blank to join without one; the Secrets row then says \
+                     what lets this Mac in.";
         // The hint wraps under the field rather than lose its words on a narrow page.
         let (help, help_h) = crate::native_settings::wrapped_copy_node(
             "system-state/vault/password-help",
@@ -5933,8 +6039,10 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
         "running" => {
             status.busy = true;
             status.running = vec![Setting::Dock];
-            // As `macos_doctor` reads a vault the plan names but this network
-            // does not answer for, and the repositories that wait on it.
+            // As `macos_doctor` reads a vault the plan names but this network does not answer
+            // for, on a Join the person typed a password for that the run still holds for a try
+            // (aterm's own join reads Not joined in place there, as `non-alab` does), and the
+            // repositories that wait on it.
             let mut secrets_waiting = setting(Setting::Secrets, Waiting, Some("Not joined"));
             secrets_waiting.note = Some("The ALab vault did not answer on this network".to_owned());
             status.observed = with(
@@ -5981,15 +6089,18 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             status.observed = with(in_place(), vec![fda, tools, vault]);
         }
         "vault" => {
-            // No vault answers on this network: the vault waits for an address, which its
-            // disclosure's fields take, and the repositories for its token.
+            // A Join the person typed a password for found no vault at the ALab address: while
+            // the run holds that password for a try, the vault waits for that vault or another
+            // address, which its disclosure's fields take, and the repositories for its token.
+            // aterm's own join reads Not joined in place here (§3.2).
             let mut vault = setting(Setting::Secrets, Waiting, Some("Not joined"));
             vault.note = Some("No vault on this network".to_owned());
             status.observed = with(in_place(), vec![vault, token_waiting()]);
         }
         "vault-unreached" => {
-            // Idle after a run whose vault did not answer: the worker tries again by itself
-            // when this Mac's network changes, so nothing is a failure meanwhile.
+            // Idle after a pass whose Join, typed with a password the run still holds, found the
+            // vault not answering: the worker tries again by itself when this Mac's network
+            // changes, so nothing is a failure meanwhile.
             status.retrying = true;
             let mut vault = setting(Setting::Secrets, Waiting, Some("Not joined"));
             vault.note = Some("The ALab vault did not answer on this network".to_owned());
@@ -6042,9 +6153,15 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             );
         }
         "non-alab" => {
-            let mut selection = Selection::none();
-            selection.set(Setting::Permissions, true);
-            status.plan = Some(Plan::from(selection));
+            // The base plan aterm admits by itself on a Mac with no ALab signal (§3.5), set up
+            // where the ALab vault did not answer: aterm's permissions and Spotlight in place,
+            // and the vault not joined, which `macos_doctor` reads in place where no join the
+            // person typed waits on it, with what the probe heard. The profile is left as is.
+            status.plan = Some(Plan::from(BASE_PLAN));
+            status.provisional = true;
+            let mut vault = setting(Setting::Secrets, InPlace, Some("Not joined"));
+            "Not joined".clone_into(&mut vault.wanted);
+            vault.note = Some("The ALab vault did not answer on this network".to_owned());
             status.observed = with(
                 in_place(),
                 vec![
@@ -6057,8 +6174,7 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                     setting(Setting::Dock, Differs, Some("14 apps")),
                     setting(Setting::Messages, Differs, Some("Signed in")),
                     setting(Setting::FaceTime, Differs, Some("Signed in")),
-                    setting(Setting::Spotlight, Differs, Some("Docs indexed")),
-                    setting(Setting::Secrets, Differs, Some("Not joined")),
+                    vault,
                     setting(Setting::Repositories, Unknown, None),
                 ],
             );
@@ -6533,20 +6649,29 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                  privacy dialogs. Only you can switch it on, in System Settings."
                     .to_owned(),
             );
-            status.observed = with(status.observed, vec![fda]);
+            // Read for that plan, which manages neither Spotlight nor the vault.
+            status.observed = with(
+                status.observed,
+                vec![
+                    fda,
+                    setting(Setting::Spotlight, Differs, Some("Docs indexed")),
+                    setting(Setting::Secrets, Differs, Some("Not joined")),
+                ],
+            );
         }
-        "clt-password" | "clt-recovered" | "clt-installing" | "clt-missing" => {
+        "clt-queued" | "clt-password" | "clt-recovered" | "clt-installing" | "clt-missing" => {
             // The GitHub repositories wait on Apple's Command Line Tools (§3.3), which the
             // window installs in a terminal tab of its own: the tab asking for the password
             // (`clt-password`), its restored live tab (`clt-recovered`), Apple's installer
             // running (`clt-installing`), or the tools
             // missing with no tab open and nothing installing them (`clt-missing`), where the
-            // row offers Install….
+            // row offers Install…. `clt-queued` shows `Install…` queued behind a permission step.
             let mut repositories = setting(Setting::Repositories, NeedsYou, None);
             repositories.note =
                 Some(aterm_types::macos_setup::COMMAND_LINE_TOOLS_MISSING.to_owned());
             status.observed = with(in_place(), vec![untold_lan(), repositories]);
             status.developer_tools = match name {
+                "clt-queued" => Some(ToolsInstall::Queued),
                 "clt-password" => Some(ToolsInstall::Password),
                 "clt-recovered" => Some(ToolsInstall::Recovered),
                 "clt-installing" => Some(ToolsInstall::Installing),

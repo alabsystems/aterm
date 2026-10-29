@@ -407,7 +407,8 @@ impl CoalRow {
 #[must_use]
 pub fn deferred_pm(deferred: i64, qos: i64) -> Option<u16> {
     (qos > 0).then(|| {
-        let pm = (deferred.clamp(0, qos) * 1000 + qos / 2) / qos;
+        let pm =
+            (i128::from(deferred.clamp(0, qos)) * 1000 + i128::from(qos) / 2) / i128::from(qos);
         u16::try_from(pm.min(1000)).unwrap_or(1000)
     })
 }

@@ -1609,6 +1609,200 @@ fn full_provider_identity_survives_email_changes_and_never_falls_back_to_another
     assert_eq!(principal_in_home(&first), None);
 }
 
+fn identity_snapshot_case(kind: i64, change: i64, legacy: bool) -> [(&'static str, i64); 3] {
+    let tmp = tmp_dir("identity-snapshot-model");
+    let home = tmp.path();
+    let plain = home.join(".claude.json");
+    let old = home.join(".config.json");
+    let selected = if legacy { &old } else { &plain };
+    let first = match kind {
+        0 => r#"{"oauthAccount":{"emailAddress":"account@example.test","accountUuid":"first"}}"#,
+        1 => r#"{"oauthAccount":{"emailAddress":"other@example.test","accountUuid":"second"}}"#,
+        2 => r#"{"oauthAccount":{"accountUuid":"first"}}"#,
+        3 => r#"{"oauthAccount":{"emailAddress":"account@example.test"}}"#,
+        4 => "malformed",
+        _ => panic!("unknown profile kind"),
+    };
+    let second = r#"{"oauthAccount":{"emailAddress":"other@example.test","accountUuid":"second"}}"#;
+    if legacy {
+        std::fs::write(&plain, second).unwrap();
+    }
+    std::fs::write(selected, first).unwrap();
+    let paths = [
+        &plain,
+        &old,
+        &home.join("replacement"),
+        &home.join("previous"),
+    ];
+    let images = || paths.map(|p| std::fs::read(p).ok());
+    let mut after_change = None;
+    let observed = identity_in_home_with(home, "account@example.test", || {
+        match change {
+            0 => {}
+            1 => {
+                std::fs::write(paths[2], second).unwrap();
+                std::fs::rename(paths[2], selected).unwrap();
+            }
+            2 if legacy => std::fs::rename(&old, paths[3]).unwrap(),
+            2 => std::fs::write(&old, second).unwrap(),
+            3 => std::fs::write(selected, "malformed").unwrap(),
+            _ => panic!("unknown replacement"),
+        }
+        after_change = Some(images());
+    });
+    let principal = match observed.principal {
+        None => 0,
+        Some(p) if Some(p) == principal_id("first") => 1,
+        Some(p) if Some(p) == principal_id("second") => 2,
+        _ => panic!("unexpected principal"),
+    };
+    [
+        (
+            "email",
+            match observed.email_matches {
+                None => 0,
+                Some(true) => 1,
+                Some(false) => 2,
+            },
+        ),
+        ("principal", principal),
+        ("intact", i64::from(after_change == Some(images()))),
+    ]
+}
+
+pub(crate) fn identity_snapshot_transition(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    let mut next = state.clone();
+    match action {
+        "Kind" => {
+            next.insert("kind", state["kind"] + 1);
+        }
+        "Change" => {
+            next.insert("change", state["change"] + 1);
+        }
+        "Legacy" => {
+            next.insert("legacy", 1);
+        }
+        "Observe" => {
+            next.insert("phase", 1);
+            for (name, value) in
+                identity_snapshot_case(state["kind"], state["change"], state["legacy"] == 1)
+            {
+                next.insert(name, value);
+            }
+        }
+        _ => panic!("unknown identity action"),
+    }
+    next
+}
+
+#[test]
+fn identity_snapshot_conforms_and_detects_mixed_reads() {
+    let model = aterm_models_harness::account_identity_snapshot_model();
+    assert_eq!(model.mutant_dials(), (1..=5).collect::<Vec<_>>());
+    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 80);
+    for state in aterm_spec::interp::reachable_states(&model) {
+        for action in &model.actions {
+            if model.action_enabled(action.name, &state) {
+                let next = identity_snapshot_transition(&state, action.name);
+                assert!(
+                    model.successors(action.name, &state).contains(&next),
+                    "{}: {state:?} -> {next:?}",
+                    action.name
+                );
+            }
+        }
+    }
+    let after = identity_snapshot_transition(&model.init_state(), "Observe");
+    for (field, value, law) in [
+        ("email", 2, "Email"),
+        ("principal", 2, "Principal"),
+        ("intact", 0, "ReadOnly"),
+    ] {
+        let mut corrupted = after.clone();
+        corrupted.insert(field, value);
+        assert!(!model.check_invariant(law, &corrupted), "{law}");
+    }
+}
+
+#[test]
+fn identity_observation_keeps_partial_field_failures_independent() {
+    let tmp = tmp_dir("identity-partial");
+    let path = tmp.path().join(".claude.json");
+    for (text, email_matches, id) in [
+        (
+            r#"{"oauthAccount":{"emailAddress":"other@example.test","accountUuid":42}}"#,
+            Some(false),
+            None,
+        ),
+        (
+            r#"{"oauthAccount":{"emailAddress":42,"accountUuid":"first"}}"#,
+            None,
+            Some("first"),
+        ),
+        (
+            r#"{"oauthAccount":{"emailAddress":"other@example.test","accountUuid":"first","accountUuid":"second"}}"#,
+            Some(false),
+            None,
+        ),
+        (
+            r#"{"oauthAccount":{"emailAddress":"other@example.test","emailAddress":"account@example.test","accountUuid":"first"}}"#,
+            None,
+            Some("first"),
+        ),
+        (
+            r#"{"oauthAccount":{"emailAddress":"","accountUuid":""}}"#,
+            Some(false),
+            None,
+        ),
+        (
+            r#"{"oauthAccount":{"emailAddress":" ACCOUNT@EXAMPLE.TEST ","accountUuid":"first"},"ignored":"private"}"#,
+            Some(true),
+            Some("first"),
+        ),
+        ("[]", None, None),
+        ("null", None, None),
+        ("malformed", None, None),
+    ] {
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(
+            identity_in_home(tmp.path(), "account@example.test"),
+            IdentityObservation {
+                email_matches,
+                principal: id.and_then(principal_id),
+            },
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn identity_observation_rejects_nonregular_and_oversized_inputs() {
+    let tmp = tmp_dir("identity-file-boundary");
+    assert_eq!(
+        identity_in_home(tmp.path(), "account@example.test"),
+        IdentityObservation::default()
+    );
+    let path = tmp.path().join(".claude.json");
+    std::fs::create_dir(&path).unwrap();
+    assert_eq!(
+        identity_in_home(tmp.path(), "account@example.test"),
+        IdentityObservation::default()
+    );
+    let big = tmp.path().join("big");
+    std::fs::create_dir(&big).unwrap();
+    std::fs::File::create(big.join(".claude.json"))
+        .unwrap()
+        .set_len(PROFILE_MAX + 1)
+        .unwrap();
+    assert_eq!(
+        identity_in_home(&big, "account@example.test"),
+        IdentityObservation::default()
+    );
+}
+
 /// THE USAGE CACHE SERVES A LANDED READING WITHOUT A FETCH only while it is
 /// current, treats a plan-only landing as landed for the same window, and holds
 /// a failed attempt for the host's mint bound — never erasing a good reading.
@@ -1841,8 +2035,9 @@ fn a_bare_launch_name_resolves_on_the_supervised_process_path() {
 }
 
 /// agy's usage fetch is bounded whole: an agy that prints its doc and exits while a child of
-/// its own still holds stdout open ends the read at `LAUNCH_READ_BUDGET` with no doc and that
-/// child gone, never a read that waits on the child.
+/// its own still holds stdout open ends the read at its budget (one second here,
+/// `LAUNCH_READ_BUDGET` in a running agy's subscription read) with no doc and that child gone,
+/// never a read that waits on the child.
 #[cfg(unix)]
 #[test]
 fn an_agy_usage_fetch_is_bounded_whole() {
@@ -1860,7 +2055,8 @@ fn an_agy_usage_fetch_is_bounded_whole() {
     let (exe, home) = (agy.clone(), tmp.path().to_path_buf());
     let (tx, fetched) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(fetch_agy_usage_doc(&exe, &[], None, &home));
+        let budget = std::time::Duration::from_secs(1);
+        let _ = tx.send(fetch_agy_usage_doc(&exe, &[], None, &home, budget));
     });
     let got = fetched.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
     // A stand-in the budget cut before it wrote its receipt left no child to look for.

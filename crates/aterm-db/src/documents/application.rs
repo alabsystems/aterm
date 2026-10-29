@@ -16,8 +16,10 @@ pub(crate) fn with_store<T>(
     descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
     action: impl FnOnce(&Session<'_>, &mut Store, Scope) -> Result<T>,
 ) -> Result<T> {
-    let bootstrap = Bootstrap::required(paths).map_err(crate::table::failure)?;
-    let session = Session::open(&bootstrap)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let (bootstrap, journal) =
+        Bootstrap::required_with_journal_until(paths, deadline).map_err(crate::table::failure)?;
+    let session = Session::from_admitted_journal(&bootstrap, journal)?;
     let descriptor = descriptor(&bootstrap)?;
     let directory = Directory::new(paths, bootstrap.trust());
     if create {
@@ -44,4 +46,39 @@ pub(crate) fn with_store<T>(
         descriptor.scope,
     )?;
     action(&session, &mut store, descriptor.scope)
+}
+
+/// Observe an initialized application without acquiring either journal's writer.
+/// The immutable store exposes only its verified custody-witnessed prefix.
+pub(crate) fn observe_store<T>(
+    paths: &Paths,
+    descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
+    action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
+) -> Result<T> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let bootstrap = Bootstrap::required_until(paths, deadline).map_err(crate::table::failure)?;
+    let session = Session::observe(&bootstrap)?;
+    let descriptor = descriptor(&bootstrap)?;
+    let directory = Directory::new(paths, bootstrap.trust());
+    let snapshot = directory.snapshot_existing(&session)?;
+    let entry = snapshot
+        .entries
+        .get(&descriptor.scope.digest())
+        .ok_or_else(|| Error::new("application table is not initialized"))?;
+    if entry.state != State::Subscribed
+        || entry
+            .declarations
+            .iter()
+            .any(|declaration| declaration.descriptor != descriptor)
+    {
+        return Err(Error::new(
+            "application table has an incompatible or unavailable descriptor",
+        ));
+    }
+    let store = Store::observe(
+        &session,
+        &directory.path(descriptor.scope)?,
+        descriptor.scope,
+    )?;
+    action(&session, &store, descriptor.scope)
 }

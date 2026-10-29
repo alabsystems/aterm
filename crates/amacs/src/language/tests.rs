@@ -84,6 +84,11 @@ fn detect_table() {
         ),
         ("From", "From me to you", Language::Plain),
         ("notes.txt", "", Language::Plain),
+        ("/Users//me/accounts.csv", "computer,email", Language::Csv),
+        ("file:///tmp/My%20List.CSV", "", Language::Csv),
+        ("export.tsv", "", Language::Tsv),
+        ("export.tab", "", Language::Tsv),
+        (".csv", "", Language::Plain),
         ("Makefile", "all:", Language::Plain),
         ("", "", Language::Plain),
     ];
@@ -116,6 +121,14 @@ fn names_labels_and_defaults() {
     let labels: std::collections::HashSet<_> = Language::ALL.map(Language::label).into();
     assert_eq!(labels.len(), Language::ALL.len());
     assert_eq!(Language::default(), Language::Plain);
+    for language in Language::ALL {
+        let expected = match language {
+            Language::Csv => Some(crate::table::Delimiter::Comma),
+            Language::Tsv => Some(crate::table::Delimiter::Tab),
+            _ => None,
+        };
+        assert_eq!(language.delimiter(), expected, "{language:?}");
+    }
 }
 
 #[test]
@@ -139,7 +152,12 @@ fn comment_syntax_table() {
         assert_eq!(hash.comment().line, Some("# "), "{hash:?}");
         assert_eq!(hash.comment().block, None, "{hash:?}");
     }
-    for none in [Language::Plain, Language::Diff] {
+    for none in [
+        Language::Plain,
+        Language::Diff,
+        Language::Csv,
+        Language::Tsv,
+    ] {
         assert_eq!(
             none.comment(),
             CommentSyntax {

@@ -434,12 +434,39 @@ mod offload_tests {
         t
     }
 
-    /// A width-change offload on the primary screen preserves scrollback across detach, reflow, and re-attach.
+    fn visible_rows(t: &Terminal) -> Vec<String> {
+        (0..t.rows())
+            .map(|r| {
+                t.get_line_text(i32::from(r), None)
+                    .unwrap_or_default()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn retained_rows(t: &Terminal) -> Vec<String> {
+        let grid = t.grid();
+        let mut rows: Vec<String> = (0..grid.scrollback_lines())
+            .map(|i| {
+                grid.get_history_line(i)
+                    .map(|l| l.to_string().trim_end().to_string())
+                    .unwrap_or_default()
+            })
+            .collect();
+        rows.extend(visible_rows(t));
+        rows
+    }
+
+    /// A width-change offload on the primary screen equals a synchronous resize across detach, reflow, and re-attach.
     #[test]
     fn offloaded_resize_primary_preserves_scrollback() {
         let mut t = term_with_history(24, 80, 500);
+        let mut sync = term_with_history(24, 80, 500);
         let before = t.grid.scrollback_lines();
         assert!(before > 100, "precondition: deep history ({before} lines)");
+
+        sync.resize(24, 40);
 
         let pending = t
             .resize_offloading_scrollback(24, 40)
@@ -456,20 +483,33 @@ mod offload_tests {
             "widths agree — no convergence pass expected"
         );
 
-        let after = t.grid.scrollback_lines();
-        assert!(
-            after > 100,
-            "history preserved across the offload (before={before}, after={after})"
+        assert_eq!(
+            t.grid.scrollback_lines(),
+            sync.grid.scrollback_lines(),
+            "offloaded primary history line count matches synchronous resize"
+        );
+        assert_eq!(
+            retained_rows(&t),
+            retained_rows(&sync),
+            "offloaded primary history and visible rows match synchronous resize"
+        );
+        assert_eq!(
+            (t.grid.cursor_row(), t.grid.cursor_col()),
+            (sync.grid.cursor_row(), sync.grid.cursor_col()),
+            "offloaded primary cursor matches synchronous resize"
         );
     }
 
-    /// An alt-screen resize offloads and preserves the saved primary's scrollback.
+    /// An alt-screen resize offloads and matches a synchronous resize on both screens.
     #[test]
     fn offloaded_resize_alt_screen_preserves_saved_primary() {
         let mut t = term_with_history(24, 80, 500);
-        let before = t.grid.scrollback_lines();
-        assert!(before > 100);
-        t.process(b"\x1b[?1049h"); // enter alt screen (primary saved off)
+        let mut sync = term_with_history(24, 80, 500);
+        assert!(t.grid.scrollback_lines() > 100);
+        t.process(b"\x1b[?1049halt-row"); // enter alt screen (primary saved off)
+        sync.process(b"\x1b[?1049halt-row");
+
+        sync.resize(24, 40);
 
         let pending = t
             .resize_offloading_scrollback(24, 40)
@@ -479,13 +519,28 @@ mod offload_tests {
             t.finish_resize_offload(reflowed).is_none(),
             "widths agree — no convergence pass expected"
         );
+        assert_eq!(visible_rows(&t), visible_rows(&sync));
+        assert_eq!(
+            (t.grid.cursor_row(), t.grid.cursor_col()),
+            (sync.grid.cursor_row(), sync.grid.cursor_col())
+        );
 
         t.process(b"\x1b[?1049l"); // exit alt → saved primary is active again
-        let after = t.grid.scrollback_lines();
-        assert!(
-            after > 100,
-            "saved-primary history preserved across an alt-screen offload \
-             (before={before}, after={after})"
+        sync.process(b"\x1b[?1049l");
+        assert_eq!(
+            t.grid.scrollback_lines(),
+            sync.grid.scrollback_lines(),
+            "saved-primary history line count matches synchronous resize"
+        );
+        assert_eq!(
+            retained_rows(&t),
+            retained_rows(&sync),
+            "saved-primary history and visible rows match synchronous resize"
+        );
+        assert_eq!(
+            (t.grid.cursor_row(), t.grid.cursor_col()),
+            (sync.grid.cursor_row(), sync.grid.cursor_col()),
+            "restored primary cursor matches synchronous resize"
         );
     }
 

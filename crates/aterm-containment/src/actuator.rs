@@ -121,12 +121,6 @@ fn decide_on(mode: ContainmentMode, sandbox_available: bool, home: Option<&str>)
                 home_scoped,
             }
         }
-        #[allow(unreachable_patterns)]
-        _ => {
-            let reason = "process capability denies fork/exec";
-            log_denial(SUBSYSTEM, "spawn initial shell", mode, reason);
-            SpawnDecision::Deny { mode, reason }
-        }
     }
 }
 
@@ -156,21 +150,6 @@ mod tests {
                 "{mode} permits network — must NOT be OS-network-sandboxed"
             );
         }
-    }
-
-    #[test]
-    fn every_mode_permits_the_initial_shell_where_its_sandbox_exists() {
-        for mode in [ContainmentMode::User, ContainmentMode::Safety] {
-            let d = decide(mode);
-            assert!(
-                d.is_permitted(),
-                "the initial shell must be permitted in {mode} mode, got {d:?}"
-            );
-        }
-        assert_eq!(
-            decide(ContainmentMode::Containment).is_permitted(),
-            os_sandbox_actuated()
-        );
     }
 
     #[test]
@@ -322,7 +301,7 @@ mod tests {
         let port_s = port.to_string();
         let nc_args = ["-G", "2", "-w", "2", "-z", "127.0.0.1", port_s.as_str()];
 
-        let control = std::process::Command::new("/usr/bin/nc")
+        let control = aterm_uds::spawnfd::command("/usr/bin/nc")
             .args(nc_args)
             .output()
             .expect("run nc control");
@@ -355,8 +334,11 @@ mod tests {
     fn enforcement_proof_file_read_deny_yields_operation_not_permitted() {
         use std::io::Write;
 
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("aterm-sbpl-enforce-{}.txt", std::process::id()));
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-sbpl-enforce-")
+            .tempdir()
+            .expect("create temp dir");
+        let path = dir.path().join("probe.txt");
         {
             let mut f = std::fs::File::create(&path).expect("create temp file");
             f.write_all(b"SECRET-ENFORCE-PROBE")
@@ -365,7 +347,7 @@ mod tests {
         let canon = std::fs::canonicalize(&path).expect("canonicalize temp path");
         let canon_s = canon.to_str().expect("utf8 path").to_string();
 
-        let control = std::process::Command::new("/bin/cat")
+        let control = aterm_uds::spawnfd::command("/bin/cat")
             .arg(&canon_s)
             .output()
             .expect("run cat control");
@@ -384,7 +366,7 @@ mod tests {
         let stderr = String::from_utf8_lossy(&sandboxed.stderr);
         let stdout = String::from_utf8_lossy(&sandboxed.stdout);
 
-        let _ = std::fs::remove_file(&path);
+        drop(dir);
 
         assert!(
             !sandboxed.status.success(),
@@ -411,9 +393,17 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_the_vaults_secret_files_are_unreadable_and_shell_d_is_not() {
-        let home = std::env::temp_dir().join(format!("aterm-sbpl-vault-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
-        for dir in [".config/git", ".aterm/apple", ".aterm/shell.d"] {
+        let home_dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-sbpl-vault-")
+            .tempdir()
+            .expect("create temp home");
+        let home = home_dir.path();
+        for dir in [
+            ".config/git",
+            ".aterm/apple",
+            ".aterm/release-ring",
+            ".aterm/shell.d",
+        ] {
             std::fs::create_dir_all(home.join(dir)).expect("create a home directory");
         }
         let secrets = [
@@ -423,6 +413,9 @@ mod tests {
             ".aterm/.machine.key.tmp.4242.0badcafe",
             ".aterm/release-credentials.toml",
             ".aterm/release-credentials.toml.atpkg-keys.4242.1.tmp",
+            ".aterm/release-ring/machine.key",
+            ".aterm/release-ring/machine.toml",
+            ".aterm/release-ring/release-credentials.toml",
             ".aterm/apple/devid-m0.key",
         ];
         let readable = [
@@ -458,7 +451,7 @@ mod tests {
                 (*file, out.status.code(), out.status.success() && seen)
             })
             .collect();
-        let _ = std::fs::remove_dir_all(&home);
+        drop(home_dir);
         for (file, ok, leaked) in read {
             assert!(
                 !ok && !leaked,
@@ -511,34 +504,18 @@ mod tests {
         );
     }
 
-    /// Proof 4 (targeted secret deny): under the exact `Containment` profile,
-    /// (a) a probe file inside `$HOME/.aws` is not readable (EPERM), and (b)
-    /// `/etc/hosts` still is, so the deny targets the secret set rather than
-    /// the filesystem.
+    /// Proof 4 (targeted secret deny): under the exact `Containment` profile
+    /// scoped to a scratch `$HOME`, (a) a probe file inside `$HOME/.aws` is not
+    /// readable (EPERM), and (b) `/etc/hosts` still is, so the deny targets the
+    /// secret set rather than the filesystem.
     #[cfg(target_os = "macos")]
     #[test]
     fn secret_deny_full_containment_profile_blocks_secret_but_allows_nonsecret() {
         use std::io::Write;
 
-        let home = std::env::var("HOME").unwrap_or_default();
-        if home.is_empty() {
-            aterm_spec::host::could_not_run("HOME is unset or empty: no secret-deny proof");
-        }
-
-        let decision = decide(ContainmentMode::Containment);
-        let SpawnDecision::Permit {
-            os_sandbox: true,
-            sbpl: Some(profile),
-            ..
-        } = decision
-        else {
-            panic!("Containment on macOS must actuate the OS sandbox; got {decision:?}");
-        };
-
-        let canon_home = std::fs::canonicalize(&home).expect("canonicalize HOME");
-        let secret_dir = canon_home.join(".aws");
-        let dir_pre_existed = secret_dir.exists();
-        std::fs::create_dir_all(&secret_dir).expect("create $HOME/.aws for probe");
+        let home = scratch_home_outside_writable_roots("secret-deny");
+        let secret_dir = home.join(".aws");
+        std::fs::create_dir_all(&secret_dir).expect("create scratch $HOME/.aws for probe");
         let secret_probe = secret_dir.join(format!("aterm_probe_{}", std::process::id()));
         {
             let mut f = std::fs::File::create(&secret_probe).expect("create secret probe");
@@ -547,7 +524,22 @@ mod tests {
         }
         let secret_probe_s = secret_probe.to_str().expect("utf8 path").to_string();
 
-        let control = std::process::Command::new("/bin/cat")
+        let decision = decide_on(
+            ContainmentMode::Containment,
+            os_sandbox_actuated(),
+            home.to_str(),
+        );
+        let SpawnDecision::Permit {
+            os_sandbox: true,
+            sbpl: Some(profile),
+            home_scoped: true,
+            ..
+        } = decision
+        else {
+            panic!("Containment on macOS must actuate a home-scoped OS sandbox; got {decision:?}");
+        };
+
+        let control = aterm_uds::spawnfd::command("/bin/cat")
             .arg(&secret_probe_s)
             .output()
             .expect("run cat control on secret probe");
@@ -564,11 +556,6 @@ mod tests {
             .output()
             .expect("run cat on /etc/hosts under Containment profile");
         let allowed_ok = allowed.status.success();
-
-        let _ = std::fs::remove_file(&secret_probe);
-        if !dir_pre_existed {
-            let _ = std::fs::remove_dir(&secret_dir);
-        }
 
         assert!(
             control_ok,
@@ -638,41 +625,54 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_containment_confines_writes() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| {
-            aterm_spec::host::could_not_run("HOME is unset: no write-confinement proof")
-        });
-        let home = std::fs::canonicalize(&home).unwrap_or_else(|e| {
-            aterm_spec::host::could_not_run(format!(
-                "HOME does not resolve ({e}): no write-confinement proof"
-            ))
-        });
-        let profile = containment_profile();
+        let home = scratch_home_outside_writable_roots("confines-writes");
+        std::fs::write(home.join(".zshrc"), "export SAFE=1\n").expect("seed scratch .zshrc");
+        std::fs::create_dir_all(home.join("Library")).expect("seed scratch Library");
+        let decision = decide_on(
+            ContainmentMode::Containment,
+            os_sandbox_actuated(),
+            home.to_str(),
+        );
+        let SpawnDecision::Permit {
+            os_sandbox: true,
+            sbpl: Some(profile),
+            home_scoped: true,
+            ..
+        } = decision
+        else {
+            panic!("Containment on macOS must actuate a home-scoped OS sandbox; got {decision:?}");
+        };
         let pid = std::process::id();
+
+        let launch_agents = home.join("Library/LaunchAgents");
+        let agents_made =
+            sandboxed_sh_ok(&profile, &format!("mkdir '{}'", launch_agents.display()));
+        std::fs::create_dir_all(&launch_agents)
+            .expect("create scratch LaunchAgents for file probe");
 
         let mut denied = vec![
             home.join(format!(".aterm_write_probe_{pid}")),
             home.join(".zshrc"),
+            launch_agents.join(format!("aterm_write_probe_{pid}")),
         ];
-        let launch_agents = home.join("Library/LaunchAgents");
-        let agents_existed = launch_agents.is_dir();
-        if agents_existed {
-            denied.push(launch_agents.join(format!("aterm_write_probe_{pid}")));
-        }
         let tmp = std::fs::canonicalize(std::env::temp_dir()).expect("canonical TMPDIR");
         let user_cache = crate::sbpl::user_temp_root(&tmp)
             .parent()
             .map(|per_user| per_user.join("C"));
+        let mut cache_probe = None;
         if tmp.starts_with(crate::sbpl::USER_TEMP_PARENT)
             && let Some(cache) = user_cache.filter(|c| c.is_dir())
         {
-            denied.push(cache.join(format!("aterm_write_probe_{pid}")));
+            let probe = cache.join(format!("aterm_write_probe_{pid}"));
+            cache_probe = Some((probe.clone(), probe.exists()));
+            denied.push(probe);
         }
         let allowed = [
             tmp.join(format!("aterm_write_probe_{pid}")),
             std::path::PathBuf::from(format!("/private/tmp/aterm_write_probe_{pid}")),
         ];
+        let allowed_existed: Vec<bool> = allowed.iter().map(|p| p.exists()).collect();
 
-        let existed: Vec<bool> = denied.iter().chain(&allowed).map(|p| p.exists()).collect();
         let denied_ok: Vec<bool> = denied
             .iter()
             .map(|p| sandboxed_append_ok(&profile, p))
@@ -681,13 +681,13 @@ mod tests {
             .iter()
             .map(|p| sandboxed_append_ok(&profile, p))
             .collect();
-        let agents_made = !agents_existed
-            && sandboxed_sh_ok(&profile, &format!("mkdir '{}'", launch_agents.display()));
         let control_ok = sandboxed_append_ok(crate::sbpl::BASE_PROFILE, &denied[0]);
-        if agents_made {
-            let _ = std::fs::remove_dir(&launch_agents);
+        if let Some((probe, pre)) = cache_probe
+            && !pre
+        {
+            let _ = std::fs::remove_file(probe);
         }
-        for (path, pre) in denied.iter().chain(&allowed).zip(&existed) {
+        for (path, pre) in allowed.iter().zip(&allowed_existed) {
             if !pre {
                 let _ = std::fs::remove_file(path);
             }

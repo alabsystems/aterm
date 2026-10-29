@@ -75,6 +75,10 @@ fn the_effect_lane_presents_strictly_slower_than_the_panel_refreshes() {
         super::effect_present_interval_with(Some(Duration::ZERO), 2),
         MIN_EFFECT_TICK_INTERVAL * 2
     );
+    assert_eq!(
+        super::effect_present_interval_with(Some(Duration::MAX), 2),
+        Duration::MAX
+    );
 }
 
 #[test]

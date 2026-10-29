@@ -197,7 +197,7 @@ impl TerminalHandler<'_> {
 
     fn esc_dispatch_hash_intermediate(&mut self, final_byte: u8) {
         match final_byte {
-            b'3' | b'4' | b'5' | b'6' => {
+            b'3'..=b'6' => {
                 let size = match final_byte {
                     b'3' => LineSize::DoubleHeightTop,    // DECDHL top half
                     b'4' => LineSize::DoubleHeightBottom, // DECDHL bottom half
@@ -205,12 +205,7 @@ impl TerminalHandler<'_> {
                     _ => LineSize::DoubleWidth,           // DECDWL
                 };
                 let row = self.grid.cursor().row;
-                let mut changed = false;
-                if let Some(row_data) = self.grid.row_mut(row) {
-                    changed = row_data.line_size() != size;
-                    row_data.set_line_size(size);
-                }
-                if changed {
+                if self.grid.set_row_line_size(row, size) {
                     self.grid.mark_content_cell(row, 0);
                 }
                 let cols = self.grid.cols();
@@ -220,7 +215,6 @@ impl TerminalHandler<'_> {
                         | LineSize::DoubleHeightTop
                         | LineSize::DoubleHeightBottom
                 ) {
-                    self.grid.mark_has_double_width();
                     let half = (cols / 2).max(1);
                     if half < cols {
                         self.grid.erase_rect(row, half, row, cols.saturating_sub(1));

@@ -500,15 +500,84 @@ mod tests {
         let _out = compress(input);
     }
 
+    fn read_ext_len(bytes: &[u8], pos: &mut usize) -> usize {
+        let mut extra = 0usize;
+        loop {
+            let b = bytes[*pos];
+            *pos += 1;
+            extra += b as usize;
+            if b != 0xFF {
+                return extra;
+            }
+        }
+    }
+
+    fn assert_conformant_block(compressed: &[u8], expected: &[u8]) {
+        assert_eq!(
+            crate::block::decompress(compressed, expected.len()).unwrap(),
+            expected
+        );
+        let mut pos = 0usize;
+        let mut decoded_pos = 0usize;
+        loop {
+            assert!(
+                pos < compressed.len(),
+                "block must end on a literal sequence"
+            );
+            let token = compressed[pos];
+            pos += 1;
+            let mut lit_len = (token >> 4) as usize;
+            if lit_len == 15 {
+                lit_len += read_ext_len(compressed, &mut pos);
+            }
+            assert!(pos + lit_len <= compressed.len());
+            pos += lit_len;
+            decoded_pos += lit_len;
+            if pos == compressed.len() {
+                if expected.len() >= LZ4_MIN_LENGTH {
+                    assert!(
+                        lit_len >= crate::block::LAST_LITERALS,
+                        "last sequence must carry >= {} literals, got {lit_len}",
+                        crate::block::LAST_LITERALS
+                    );
+                }
+                break;
+            }
+            assert!(
+                expected.len() - decoded_pos >= MFLIMIT,
+                "match at {decoded_pos} starts fewer than {MFLIMIT} bytes before end {}",
+                expected.len()
+            );
+            assert!(pos + 2 <= compressed.len());
+            let offset = u16::from_le_bytes([compressed[pos], compressed[pos + 1]]) as usize;
+            pos += 2;
+            assert!(
+                (1..=MAX_DISTANCE).contains(&offset) && offset <= decoded_pos,
+                "invalid match offset {offset} at {decoded_pos}"
+            );
+            let mut match_len = MINMATCH + ((token & 0x0F) as usize);
+            if (token & 0x0F) == 15 {
+                match_len += read_ext_len(compressed, &mut pos);
+            }
+            decoded_pos += match_len;
+        }
+        assert_eq!(decoded_pos, expected.len());
+    }
+
     #[test]
     fn test_conformant_last_block() {
-        let aaas: &[u8] = b"aaaaaaaaaaaaaaa";
+        let aaas: &[u8] = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-        let out = compress(&aaas[..12]);
-        assert!(out.len() > 12, "12 bytes: {} out", out.len());
-        for n in 13..=15 {
+        for n in 0..LZ4_MIN_LENGTH {
             let out = compress(&aaas[..n]);
-            assert!(out.len() <= n, "{n} bytes: {} out", out.len());
+            assert_eq!(out.len(), n + 1, "short literal block length for {n}");
+            assert_eq!(out[0], (n as u8) << 4, "short literal token for {n}");
+            assert_eq!(&out[1..], &aaas[..n], "short literal payload for {n}");
+            assert_conformant_block(&out, &aaas[..n]);
+        }
+        for n in LZ4_MIN_LENGTH..=aaas.len() {
+            let out = compress(&aaas[..n]);
+            assert_conformant_block(&out, &aaas[..n]);
         }
     }
 }

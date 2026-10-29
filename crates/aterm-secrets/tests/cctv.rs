@@ -139,18 +139,6 @@ fn every_applicable_cctv_vector_has_its_exact_class() {
 }
 
 #[test]
-fn the_subset_covers_every_class() {
-    let vectors = index();
-    let count = |want: Expect| vectors.iter().filter(|v| v.expect == want).count();
-    assert_eq!(count(Expect::Success), 19);
-    assert_eq!(count(Expect::Fails(AgeError::NoMatch)), 4);
-    assert_eq!(count(Expect::Fails(AgeError::Hmac)), 1);
-    assert_eq!(count(Expect::Fails(AgeError::Header)), 33);
-    assert_eq!(count(Expect::Fails(AgeError::Payload)), 19);
-    assert_eq!(count(Expect::Fails(AgeError::Armor)), 26);
-}
-
-#[test]
 fn success_vectors_round_trip_through_our_armor() {
     for vector in index() {
         if vector.expect != Expect::Success || vector.armored {

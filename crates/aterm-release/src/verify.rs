@@ -806,7 +806,7 @@ const fn signing_requirement() -> &'static str {
         }
         (true, false) => {
             "a cut needs a rostered machine key (--release-credentials <profile.toml>, or \
-             ~/.aterm/machine.key)"
+             ~/.aterm/release-ring/machine.key)"
         }
         (false, true) => {
             "a cut needs --release-credentials <profile.toml> with a notary credential; update \

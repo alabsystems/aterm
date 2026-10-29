@@ -256,9 +256,11 @@ fn count(path: &[String], dir: &Path) -> usize {
 #[test]
 fn inside_aterm_the_hook_puts_reroute_then_agents_first_and_outside_neither() {
     let fx = Fixture::new("order");
-    let rest = |path: &[String]| -> Vec<String> {
+    let rest_inside = |path: &[String]| -> Vec<String> {
         path.iter()
-            .filter(|e| Path::new(e) != fx.reroute && Path::new(e) != fx.agents)
+            .filter(|e| {
+                Path::new(e) != fx.reroute && Path::new(e) != fx.agents && Path::new(e) != fx.bin
+            })
             .cloned()
             .collect()
     };
@@ -269,15 +271,23 @@ fn inside_aterm_the_hook_puts_reroute_then_agents_first_and_outside_neither() {
         for &marker in atpkg::hooks::AGENTS_MARKERS {
             let inside = sourced_path(&fx, shell, &hook, 1, &[(marker, "1")]);
             assert_eq!(
-                inside[..2],
-                [Fixture::s(&fx.reroute), Fixture::s(&fx.agents)],
-                "{who} with {marker}: PATH starts reroute:agents — {inside:?}"
+                inside[..3],
+                [
+                    Fixture::s(&fx.reroute),
+                    Fixture::s(&fx.agents),
+                    Fixture::s(&fx.bin),
+                ],
+                "{who} with {marker}: PATH starts reroute:agents:bin — {inside:?}"
             );
             assert_eq!(count(&inside, &fx.reroute), 1, "{who}: {inside:?}");
             assert_eq!(count(&inside, &fx.agents), 1, "{who}: {inside:?}");
-            let mut want = rest(&inherited);
-            want.push(Fixture::s(&fx.bin).to_owned());
-            assert_eq!(rest(&inside), want, "{who} with {marker}: {inside:?}");
+            assert_eq!(count(&inside, &fx.bin), 1, "{who}: {inside:?}");
+            let want = rest_inside(&inherited);
+            assert_eq!(
+                rest_inside(&inside),
+                want,
+                "{who} with {marker}: {inside:?}"
+            );
             assert_eq!(
                 sourced_path(&fx, shell, &hook, 2, &[(marker, "1")]),
                 inside,
@@ -293,8 +303,12 @@ fn inside_aterm_the_hook_puts_reroute_then_agents_first_and_outside_neither() {
                 &[("ATERM_CHILD", "1"), (PASSTHROUGH_ENV, value)],
             );
             assert_eq!(
-                inside[..2],
-                [Fixture::s(&fx.reroute), Fixture::s(&fx.agents)],
+                inside[..3],
+                [
+                    Fixture::s(&fx.reroute),
+                    Fixture::s(&fx.agents),
+                    Fixture::s(&fx.bin),
+                ],
                 "{who}: a passthrough marker of {value:?} is not engaged — {inside:?}"
             );
         }
@@ -313,12 +327,13 @@ fn inside_aterm_the_hook_puts_reroute_then_agents_first_and_outside_neither() {
         let passthrough = [("ATERM_CHILD", "1"), (PASSTHROUGH_ENV, "1")];
         let escaped = sourced_path(&fx, shell, &hook, 1, &passthrough);
         assert_eq!(
-            escaped[0],
-            Fixture::s(&fx.agents),
-            "{who}: the managed agents still lead under --no-reroute — {escaped:?}"
+            escaped[..2],
+            [Fixture::s(&fx.agents), Fixture::s(&fx.bin)],
+            "{who}: the managed agents and bin still lead under --no-reroute — {escaped:?}"
         );
         assert_eq!(count(&escaped, &fx.reroute), 0, "{who}: {escaped:?}");
         assert_eq!(count(&escaped, &fx.agents), 1, "{who}: {escaped:?}");
+        assert_eq!(count(&escaped, &fx.bin), 1, "{who}: {escaped:?}");
         assert_eq!(
             sourced_path(&fx, shell, &hook, 2, &passthrough),
             escaped,
@@ -566,4 +581,147 @@ fn a_missing_trust_tool_and_z3_run_upstream_and_strict_restores_the_refusals() {
             Some(i32::from(atpkg::reroute::REFUSAL_EXIT))
         )
     );
+}
+
+#[test]
+fn inside_aterm_managed_git_and_gh_lead_ahead_of_clt_stubs_and_outside_stay_behind() {
+    let fx = Fixture::new("git-gh");
+    let layout = atpkg::store::Layout {
+        prefix: atpkg::store::default_prefix(&fx.home),
+    };
+    write_executable(
+        &fx.usr_local.join("git"),
+        &format!(
+            "#!/bin/sh\necho \"xcode-select: note: no developer tools were found\" >&2\nexit {FAKE_EXIT}\n"
+        ),
+    );
+    write_executable(
+        &fx.usr_local.join("gh"),
+        &format!("#!/bin/sh\necho \"upstream gh shadow: $*\" >&2\nexit {FAKE_EXIT}\n"),
+    );
+    for stub in ["git", "gh"] {
+        let warmed =
+            aterm_spec::wait::past_text_busy(|| Command::new(fx.usr_local.join(stub)).output())
+                .unwrap();
+        assert_eq!(warmed.status.code(), Some(FAKE_EXIT), "{warmed:?}");
+    }
+
+    let git_build = layout.build_dir("git", 1);
+    let git_core = git_build.join("libexec/git-core");
+    let git_tpl = git_build.join("share/git-core/templates");
+    std::fs::create_dir_all(&git_core).unwrap();
+    std::fs::create_dir_all(&git_tpl).unwrap();
+    std::fs::create_dir_all(git_build.join("bin")).unwrap();
+    write_executable(
+        &git_core.join("git"),
+        "#!/bin/sh\nprintf 'atpkg-git exec=%s tpl=%s nosys=%s args=%s\\n' \"${GIT_EXEC_PATH:-}\" \"${GIT_TEMPLATE_DIR:-}\" \"${GIT_ATTR_NOSYSTEM:-}\" \"$*\"\n",
+    );
+    write_executable(
+        &git_build.join("bin/git"),
+        "#!/bin/sh\n\
+         __atpkg_bin_dir=$(CDPATH='' cd -- \"$(dirname -- \"$0\")\" && pwd -P) || exit 1\n\
+         __atpkg_root=$(dirname -- \"$__atpkg_bin_dir\")\n\
+         export GIT_EXEC_PATH=\"${GIT_EXEC_PATH:-$__atpkg_root/libexec/git-core}\"\n\
+         if [ -d \"$__atpkg_root/share/git-core/templates\" ]; then\n\
+           export GIT_TEMPLATE_DIR=\"${GIT_TEMPLATE_DIR:-$__atpkg_root/share/git-core/templates}\"\n\
+         fi\n\
+         exec \"$__atpkg_root/libexec/git-core/git\" \"$@\"\n",
+    );
+    atpkg::activate::activate_build(&layout, &git_build).unwrap();
+    let git_env = atpkg::shim_env::ShimEnv::admit(&["GIT_ATTR_NOSYSTEM=1".to_owned()]).unwrap();
+    let refused_git = atpkg::activate::install_shims_env(
+        &layout,
+        &git_build,
+        &["git".to_owned()],
+        atpkg::activate::Aliases::Alab,
+        &git_env,
+    )
+    .unwrap();
+    assert!(refused_git.is_empty(), "{refused_git:?}");
+
+    let gh_build = layout.build_dir("gh", 1);
+    std::fs::create_dir_all(gh_build.join("bin")).unwrap();
+    write_executable(
+        &gh_build.join("bin/gh"),
+        "#!/bin/sh\nprintf 'atpkg-gh args=%s\\n' \"$*\"\n",
+    );
+    atpkg::activate::activate_build(&layout, &gh_build).unwrap();
+    let refused_gh = atpkg::activate::install_shims_env(
+        &layout,
+        &gh_build,
+        &["gh".to_owned()],
+        atpkg::activate::Aliases::Alab,
+        &atpkg::shim_env::ShimEnv::NONE,
+    )
+    .unwrap();
+    assert!(refused_gh.is_empty(), "{refused_gh:?}");
+
+    let canonical_build = std::fs::canonicalize(&git_build).unwrap();
+    let expected_inside = format!(
+        "atpkg-git exec={}/libexec/git-core tpl={}/share/git-core/templates nosys=1 args=clone https://example.invalid/repo.git\natpkg-gh args=auth status\n",
+        canonical_build.display(),
+        canonical_build.display(),
+    );
+
+    let lanes = posix_shells();
+    for shell in &lanes {
+        let hook = fx.lay_hook(shell.ext);
+        let inside = run(
+            &fx,
+            &shell.exe,
+            shell.args,
+            ". \"$ATPKG_TEST_HOOK\"; git clone https://example.invalid/repo.git && gh auth status",
+            &hook,
+            &fx.inherited_path(),
+            &[("ATERM_CHILD", "1")],
+        );
+        assert!(
+            inside.status.success(),
+            "{}: inside failed: stdout={:?} stderr={:?}",
+            shell.name,
+            String::from_utf8_lossy(&inside.stdout),
+            String::from_utf8_lossy(&inside.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&inside.stdout),
+            expected_inside,
+            "{}",
+            shell.name
+        );
+
+        // Negative control: outside aterm, pkg/bin stays behind the preceding stub, while
+        // alab-git and alab-gh still reach the managed builds directly.
+        let outside = run(
+            &fx,
+            &shell.exe,
+            shell.args,
+            ". \"$ATPKG_TEST_HOOK\"; git clone https://example.invalid/repo.git",
+            &hook,
+            &fx.inherited_path(),
+            &[],
+        );
+        assert_eq!(outside.status.code(), Some(FAKE_EXIT), "{}", shell.name);
+        assert!(
+            String::from_utf8_lossy(&outside.stderr).contains("xcode-select"),
+            "{}: stderr={:?}",
+            shell.name,
+            String::from_utf8_lossy(&outside.stderr)
+        );
+
+        let alab_alias = run(
+            &fx,
+            &shell.exe,
+            shell.args,
+            ". \"$ATPKG_TEST_HOOK\"; alab-git --version && alab-gh auth status",
+            &hook,
+            &fx.inherited_path(),
+            &[],
+        );
+        assert!(
+            alab_alias.status.success(),
+            "{}: alab-* failed: {:?}",
+            shell.name,
+            String::from_utf8_lossy(&alab_alias.stderr)
+        );
+    }
 }

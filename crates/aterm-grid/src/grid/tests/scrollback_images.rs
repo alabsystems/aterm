@@ -216,3 +216,150 @@ fn history_image_removal_releases_ring_and_cached_staged_payloads() {
         assert_eq!(Arc::strong_count(&image), 1);
     }
 }
+
+#[test]
+fn image_carry_roundtrips_visible_ring_staged_and_hot_history_and_preserves_z_order() {
+    let build_plain_tiers = || {
+        let sb = aterm_scrollback::Scrollback::new(100, 1000, 100_000_000);
+        let mut g = Grid::with_tiered_scrollback(4, 12, 2, sb);
+        g.set_compress_offload_active(true);
+        for tag in ['H', 'L', 'P', 'R'] {
+            g.set_cursor(0, 0);
+            g.write_char(tag);
+            g.scroll_up(1);
+        }
+        // Promote oldest ('H', rev=3) to hot tier, leave 'L' (rev=2) staged, and 'P'/'R' (rev=1/0) in ring.
+        assert_eq!(g.drain_lazy_bounded(1), 1);
+        assert_eq!(g.storage.ring_buffer_scrollback(), 2);
+        assert_eq!(g.lazy_backlog_len(), 1);
+        assert_eq!(g.storage.scrollback.as_ref().unwrap().line_count(), 1);
+        g.set_cursor(1, 0);
+        g.write_char('V');
+        g
+    };
+
+    let mut src = Grid::with_tiered_scrollback(
+        4,
+        12,
+        2,
+        aterm_scrollback::Scrollback::new(100, 1000, 100_000_000),
+    );
+    src.set_compress_offload_active(true);
+    let hot_img = placement(1, 3);
+    let lazy_img = placement(1, 2);
+    let ring_img = placement(1, 4);
+    for (tag, img) in [
+        ('H', Some((&hot_img, 3u16))),
+        ('L', Some((&lazy_img, 2))),
+        ('P', None),
+        ('R', Some((&ring_img, 4))),
+    ] {
+        src.set_cursor(0, 0);
+        src.write_char(tag);
+        if let Some((image, cols)) = img {
+            stamp(&mut src, 0, image, 0, cols);
+        }
+        src.scroll_up(1);
+    }
+    assert_eq!(src.drain_lazy_bounded(1), 1);
+    src.set_cursor(1, 0);
+    src.write_char('V');
+
+    // Stamp two overlapping non-Kitty layers across all 12 columns, with the upper layer ending
+    // earlier (col 6) than the lower layer (col 12): tests both birth-order z preservation and
+    // multi-layer 'img_flag budgeting (`cols * MAX_IMAGE_LAYERS`).
+    let under = placement(2, 12);
+    let over = placement(1, 6);
+    for col in 0..12u16 {
+        src.stack_cell_image(
+            1,
+            col,
+            ImageRef {
+                image: Arc::clone(&under),
+                cell_row: 0,
+                cell_col: col,
+                kitty: None,
+            },
+        );
+    }
+    for col in 0..6u16 {
+        src.stack_cell_image(
+            1,
+            col,
+            ImageRef {
+                image: Arc::clone(&over),
+                cell_row: 0,
+                cell_col: col,
+                kitty: None,
+            },
+        );
+    }
+
+    let carry = src.capture_image_carry(usize::MAX);
+    assert_eq!(carry.visible.len(), 1);
+    assert_eq!(carry.visible[0].0, 1);
+    assert_eq!(
+        carry
+            .history_rev
+            .iter()
+            .map(|(r, _)| *r)
+            .collect::<Vec<_>>(),
+        vec![0, 2, 3],
+    );
+
+    let mut dst = build_plain_tiers();
+    assert!(!dst.extras().any_image());
+    assert!(!dst.history_any_image(&|_| true));
+    // Materialize the lazy line before applying carry to prove cached materializations invalidate.
+    assert_eq!(dst.history_line_rev(2).unwrap().image_count(), 0);
+
+    dst.apply_image_carry(&carry);
+    dst.storage.ring_extras.assert_running_sums();
+
+    for col in 0..12u16 {
+        assert!(
+            dst.cell(1, col).unwrap().has_extras(),
+            "col {col} must mark has_extras across full width"
+        );
+        let stack = dst.extras().get(CellCoord::new(1, col)).unwrap().images();
+        if col < 6 {
+            assert_eq!(stack.len(), 2, "overlap at col {col}");
+            assert!(
+                Arc::ptr_eq(&stack[0].image, &under) && Arc::ptr_eq(&stack[1].image, &over),
+                "birth z-order preserved at col {col}"
+            );
+        } else {
+            assert_eq!(stack.len(), 1, "tail at col {col}");
+            assert!(Arc::ptr_eq(&stack[0].image, &under));
+        }
+    }
+    assert!(Arc::ptr_eq(
+        &dst.history_line_rev(0).unwrap().images().unwrap()[0].image,
+        &ring_img
+    ));
+    assert!(dst.history_line_rev(1).unwrap().images().is_none());
+    assert!(Arc::ptr_eq(
+        &dst.history_line_rev(2).unwrap().images().unwrap()[0].image,
+        &lazy_img
+    ));
+    assert!(Arc::ptr_eq(
+        &dst.history_line_rev(3).unwrap().images().unwrap()[0].image,
+        &hot_img
+    ));
+    assert_eq!(dst.capture_image_carry(usize::MAX), carry);
+
+    // Bounded carry truncates history_rev cleanly; empty carry clears all tiers and visible cells.
+    assert_eq!(
+        carry
+            .bounded(3)
+            .history_rev
+            .iter()
+            .map(|(r, _)| *r)
+            .collect::<Vec<_>>(),
+        vec![0, 2]
+    );
+    dst.apply_image_carry(&crate::GridImageCarry::default());
+    dst.storage.ring_extras.assert_running_sums();
+    assert!(dst.capture_image_carry(usize::MAX).is_empty());
+    assert!(!dst.history_any_image(&|_| true));
+}

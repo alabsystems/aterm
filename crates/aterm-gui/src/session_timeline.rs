@@ -141,6 +141,28 @@ pub(crate) struct SessionMeta {
     pub(crate) attention_owners: AttentionOwners,
     pub(crate) supervisor: Option<SupervisorClaim>,
     pub(crate) supervisor_revision: u64,
+    /// The connections proven claims were bound to, with each claim's proof
+    /// ([`SupervisorClaim::identity`]), kept past the claim's end until the connection closes
+    /// ([`Self::close_connection`]): a `kind=wait` written on one is its claimant's own.
+    pub(crate) claimant_conn: Vec<(u64, crate::self_claim::Proven)>,
+    /// The stop a proven self-claim told of its own typing (`meta set harness_held`), with that
+    /// claim's proof: its claimant's own, so it lapses where a wait written under the claim does
+    /// ([`Self::set_supervisor`], [`Self::close_connection`]), and at the same proof's next claim
+    /// once the claim that told it lapsed by its `ttl=`, and is read only while that claim stands
+    /// ([`Self::self_held`]).
+    pub(crate) claim_held: Option<(
+        crate::self_claim::Proven,
+        aterm_agent::harness::acts::HeldBy,
+    )>,
+    /// The Land hold a proven self-claim told of its own landing (`meta set harness_land`), on
+    /// the glass with its `since` stamped once, with that claim's proof: kept and lapsing exactly
+    /// as [`Self::claim_held`] is, and read only while that claim stands ([`Self::self_land`]).
+    pub(crate) claim_land: Option<(crate::self_claim::Proven, crate::harness_glass::HeldGlass)>,
+    /// The NEEDS YOU sets a proven self-claim told of its own `owner=needs` entry (`meta set
+    /// harness_needs`), told as aterm's own loop's are ([`crate::needs::ToldNeeds::tell`]) but kept
+    /// apart from them, with that claim's proof: kept and lapsing exactly as [`Self::claim_held`]
+    /// is, and read only while that claim stands ([`Self::self_needs`]).
+    pub(crate) claim_needs: Option<(crate::self_claim::Proven, crate::needs::ToldNeeds)>,
     pub questions: Option<String>,
     pub autopilot: Option<String>,
     pub(crate) land_at: Option<i64>,
@@ -160,6 +182,10 @@ impl PartialEq for SessionMeta {
             attention_owners: _,
             supervisor: _,
             supervisor_revision: _,
+            claimant_conn: _,
+            claim_held: _,
+            claim_land: _,
+            claim_needs: _,
             questions,
             autopilot,
             land_at,
@@ -282,6 +308,10 @@ impl SessionMeta {
             attention_owners: AttentionOwners::default(),
             supervisor: None,
             supervisor_revision: 0,
+            claimant_conn: Vec::new(),
+            claim_held: None,
+            claim_land: None,
+            claim_needs: None,
             questions: self.presentation_value("questions"),
             autopilot,
             land_at,
@@ -319,8 +349,25 @@ impl SessionMeta {
         value: Option<String>,
         kind: Option<aterm_types::needs::AttentionKind>,
     ) -> Result<AttentionMove, AttentionOwnersFull> {
+        self.set_attention_under(owner, value, kind, None)
+    }
+
+    /// [`Self::set_attention_kind`], the entry written under `under`, the proven claim a wait
+    /// lapses with ([`AttentionOwners::lapse_under`]); `None`, or an entry that is no wait, outlives
+    /// every claim. A write of the `owner=needs` entry settles a self-claim's outgoing NEEDS YOU
+    /// set against it ([`crate::needs::ToldNeeds::settle`]).
+    pub(crate) fn set_attention_under(
+        &mut self,
+        owner: &str,
+        value: Option<String>,
+        kind: Option<aterm_types::needs::AttentionKind>,
+        under: Option<crate::self_claim::Proven>,
+    ) -> Result<AttentionMove, AttentionOwnersFull> {
         self.adopt_literal_attention();
-        let entry = self.attention_owners.put(owner, value, kind)?;
+        let entry = self.attention_owners.put(owner, value, kind, under)?;
+        if owner == crate::harness_host::NEEDS_ATTENTION_OWNER {
+            self.settle_self_needs();
+        }
         let effective = self.attention_owners.effective().map(str::to_owned);
         let changed = self.attention != effective;
         self.attention = effective;
@@ -343,8 +390,18 @@ impl SessionMeta {
         {
             let _ = self
                 .attention_owners
-                .put(BARE_ATTENTION_OWNER, Some(value), None);
+                .put(BARE_ATTENTION_OWNER, Some(value), None, None);
         }
+    }
+
+    /// The attention a `sessions`, `task` or `await task` row shows: the newest entry that asks,
+    /// else [`Self::attention`] (the newest entry, a wait). A wait's words never hide an ask raised
+    /// before it.
+    #[must_use]
+    pub(crate) fn row_attention(&self) -> Option<&str> {
+        self.attention_owners
+            .newest_ask()
+            .or(self.attention.as_deref())
     }
 
     /// The supervisor's holder name while its claim is live at `now_us`
@@ -362,10 +419,267 @@ impl SessionMeta {
             .filter(|claim| claim.expires_us.is_none_or(|at| at > now_us))
     }
 
-    fn set_supervisor(&mut self, claim: Option<SupervisorClaim>) -> u64 {
+    /// The proof of the proven claim `conn` was bound to last ([`Self::claimant_conn`]), whether
+    /// that claim stands or ended while `conn` stayed open.
+    fn claimant_on(&self, conn: Option<u64>) -> Option<&crate::self_claim::Proven> {
+        let conn = conn?;
+        self.claimant_conn
+            .iter()
+            .find(|(bound, _)| *bound == conn)
+            .map(|(_, proven)| proven)
+    }
+
+    /// Put `claim` in the supervisor slot at `now_us` and move [`Self::supervisor_revision`],
+    /// which it returns beside what the claim's end moved in the attention map: every wait written
+    /// under a proven claim other than `claim`'s ([`AttentionOwners::lapse_except`]) goes; a stop,
+    /// a Land hold or a NEEDS YOU set told under one goes too ([`Self::self_held`],
+    /// [`Self::self_land`], [`Self::self_needs`]), and so does one `claim` does not renew, where
+    /// the claim live at `now_us` is not of the proof that told it (its `ttl=` lapsed, the same
+    /// process claiming again included, so a stop, a hold or a set its claimant could not lift
+    /// during the lapse never comes back); a proven claim bound to a connection is recorded in
+    /// [`Self::claimant_conn`] until that connection closes, and an unproven claim bound to a
+    /// connection clears any earlier proof recorded for that connection.
+    fn set_supervisor(
+        &mut self,
+        claim: Option<SupervisorClaim>,
+        now_us: u64,
+    ) -> (u64, AttentionMove) {
+        if let Some(claim) = claim.as_ref()
+            && let Some(conn) = claim.conn
+        {
+            match claim.identity() {
+                Some(proven) => match self
+                    .claimant_conn
+                    .iter_mut()
+                    .find(|(bound, _)| *bound == conn)
+                {
+                    Some((_, slot)) => *slot = proven.clone(),
+                    None => self.claimant_conn.push((conn, proven.clone())),
+                },
+                None => self.claimant_conn.retain(|(bound, _)| *bound != conn),
+            }
+        }
+        let keep = claim.as_ref().and_then(SupervisorClaim::identity);
+        let lapsed = self.lapse_except(keep);
+        let renewed = self.live_claim(now_us).and_then(SupervisorClaim::identity);
+        let lapses = |told: &crate::self_claim::Proven| Some(told) != keep || Some(told) != renewed;
+        let held = self
+            .claim_held
+            .as_ref()
+            .is_some_and(|(told, _)| lapses(told));
+        let land = self
+            .claim_land
+            .as_ref()
+            .is_some_and(|(told, _)| lapses(told));
+        let needs = self
+            .claim_needs
+            .as_ref()
+            .is_some_and(|(told, _)| lapses(told));
+        if held {
+            self.claim_held = None;
+        }
+        if land {
+            self.claim_land = None;
+        }
+        if needs {
+            self.claim_needs = None;
+        }
         self.supervisor = claim;
         self.supervisor_revision = self.supervisor_revision.wrapping_add(1);
-        self.supervisor_revision
+        (self.supervisor_revision, lapsed)
+    }
+
+    /// Connection `conn` closed at `now_us`: the waits written on it under the proven claim it was
+    /// bound to ([`Self::claimant_conn`]) go unless that same proven claim still stands live on
+    /// the session (for instance after a `ttl=` renewal) or on another open connection (a
+    /// reconnected claim socket whose new claim arrived before `conn`'s EOF), though that claim
+    /// ended before it (a person's release, the image leaving the foreground), since a closed
+    /// claim connection with no remaining live hold is a claimant gone. A stop, a Land hold and a
+    /// NEEDS YOU set told under that claim ([`Self::self_held`], [`Self::self_land`],
+    /// [`Self::self_needs`]) go at the same point; the second value says whether any did.
+    pub(crate) fn close_connection(&mut self, conn: u64, now_us: u64) -> (AttentionMove, bool) {
+        let Some(at) = self
+            .claimant_conn
+            .iter()
+            .position(|(bound, _)| *bound == conn)
+        else {
+            return (AttentionMove::default(), false);
+        };
+        let (_, proven) = self.claimant_conn.remove(at);
+        if self.live_claim(now_us).and_then(SupervisorClaim::identity) == Some(&proven)
+            || self.claimant_conn.iter().any(|(_, other)| *other == proven)
+        {
+            return (AttentionMove::default(), false);
+        }
+        let held = self
+            .claim_held
+            .take_if(|(told, _)| *told == proven)
+            .is_some();
+        let land = self
+            .claim_land
+            .take_if(|(told, _)| *told == proven)
+            .is_some();
+        let needs = self
+            .claim_needs
+            .take_if(|(told, _)| *told == proven)
+            .is_some();
+        (self.lapse_under(&proven), held || land || needs)
+    }
+
+    /// The stop the proven self-claim live at `now_us` told of its own typing (`meta set
+    /// harness_held`, [`Self::tell_self_held`]): `None` with no such claim, and where the claim
+    /// that told it is not the one standing, whatever is kept.
+    #[must_use]
+    pub(crate) fn self_held(&self, now_us: u64) -> Option<aterm_agent::harness::acts::HeldBy> {
+        let (told, arm) = self.claim_held.as_ref()?;
+        (self.live_claim(now_us)?.proven.as_ref() == Some(told)).then_some(*arm)
+    }
+
+    /// Keep `held` as the stop the proven claim `proven` told (`None`: its typing goes on):
+    /// whether the kept stop moved.
+    pub(crate) fn tell_self_held(
+        &mut self,
+        proven: &crate::self_claim::Proven,
+        held: Option<aterm_agent::harness::acts::HeldBy>,
+    ) -> bool {
+        let told = held.map(|arm| (proven.clone(), arm));
+        if self.claim_held == told {
+            return false;
+        }
+        self.claim_held = told;
+        true
+    }
+
+    /// The Land hold the proven self-claim live at `now_us` told of its own landing (`meta set
+    /// harness_land`, [`Self::tell_self_land`]): `None` with no such claim, and where the claim
+    /// that told it is not the one standing, whatever is kept.
+    #[must_use]
+    pub(crate) fn self_land(&self, now_us: u64) -> Option<crate::harness_glass::HeldGlass> {
+        let (told, hold) = self.claim_land.as_ref()?;
+        (self.live_claim(now_us)?.proven.as_ref() == Some(told)).then_some(*hold)
+    }
+
+    /// Keep `held` as the Land hold the proven claim `proven` told (`None`: it holds no landing),
+    /// its `since` stamped once ([`crate::harness_glass::HeldGlass::of`] over the hold that proof
+    /// told last): whether the kept hold moved.
+    pub(crate) fn tell_self_land(
+        &mut self,
+        proven: &crate::self_claim::Proven,
+        held: Option<aterm_agent::harness::acts::LandHeld>,
+    ) -> bool {
+        let kept = self
+            .claim_land
+            .as_ref()
+            .map(|(told, hold)| (told, hold.held));
+        if kept == held.map(|held| (proven, held)) {
+            return false;
+        }
+        let was = self
+            .claim_land
+            .as_ref()
+            .filter(|(told, _)| told == proven)
+            .map(|(_, hold)| *hold);
+        self.claim_land = held.map(|held| {
+            (
+                proven.clone(),
+                crate::harness_glass::HeldGlass::of(held, was),
+            )
+        });
+        true
+    }
+
+    /// THE NEEDS YOU SETS A PROVEN SELF-CLAIM TOLD OF ITS OWN ENTRY, read only while it stands
+    /// (`meta set harness_needs`, [`Self::tell_self_needs`]): where the claim live at `now_us` is
+    /// a proven self-claim (codex-alab's, which aterm's own harness never holds), what that claim
+    /// told, empty where it told none, so a set aterm's own loop left on the timeline is never
+    /// read in its place; `None` where no such claim stands (none, an unproven or a rostered
+    /// harness's claim, one past its `ttl=`), and a reader then reads aterm's own
+    /// ([`crate::needs::told_of`]).
+    #[must_use]
+    pub(crate) fn self_needs(&self, now_us: u64) -> Option<crate::needs::ToldNeeds> {
+        let standing = self.live_claim(now_us)?.proven.as_ref()?;
+        Some(
+            self.claim_needs
+                .as_ref()
+                .filter(|(told, _)| told == standing)
+                .map(|(_, needs)| needs.clone())
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Tell `told` as the NEEDS YOU set the proven claim `proven` told of its own `owner=needs`
+    /// entry (`None`: it took the entry down), as aterm's own loop's set is told
+    /// ([`crate::needs::ToldNeeds::tell`] beside that entry as stored now: a set told before its
+    /// entry stands waits for it, and the outgoing one keeps describing the entry it was told
+    /// with while that entry stands, [`Self::settle_self_needs`]): whether what a reader reads
+    /// beside the standing entry moved.
+    pub(crate) fn tell_self_needs(
+        &mut self,
+        proven: &crate::self_claim::Proven,
+        told: Option<Arc<crate::needs::HarnessNeeds>>,
+    ) -> bool {
+        let mut kept = match self.claim_needs.take() {
+            Some((by, needs)) if by == *proven => needs,
+            _ => crate::needs::ToldNeeds::default(),
+        };
+        let standing = self
+            .attention_owners
+            .get(crate::harness_host::NEEDS_ATTENTION_OWNER);
+        let moved = kept.tell(told, standing);
+        self.claim_needs =
+            (kept != crate::needs::ToldNeeds::default()).then(|| (proven.clone(), kept));
+        moved
+    }
+
+    /// THE SELF-CLAIM'S OUTGOING SET GOES WITH THE ENTRY IT DESCRIBED: settle [`Self::claim_needs`]
+    /// against the `owner=needs` entry as stored now ([`crate::needs::ToldNeeds::settle`]), so an
+    /// entry taken down, or replaced by one the outgoing set does not describe, takes that set,
+    /// and the same text set again before the claimant's next tell reads its entry's own words,
+    /// never a set it took down; a set kept for nothing is dropped.
+    fn settle_self_needs(&mut self) {
+        let standing = self
+            .attention_owners
+            .get(crate::harness_host::NEEDS_ATTENTION_OWNER);
+        if let Some((_, needs)) = self.claim_needs.as_mut() {
+            needs.settle(standing);
+        }
+        if self
+            .claim_needs
+            .as_ref()
+            .is_some_and(|(_, needs)| *needs == crate::needs::ToldNeeds::default())
+        {
+            self.claim_needs = None;
+        }
+    }
+
+    /// Remove the waits written under any proven claim other than `keep`
+    /// ([`AttentionOwners::lapse_except`]) and re-project [`Self::attention`].
+    fn lapse_except(&mut self, keep: Option<&crate::self_claim::Proven>) -> AttentionMove {
+        if !self.attention_owners.lapse_except(keep) {
+            return AttentionMove::default();
+        }
+        let effective = self.attention_owners.effective().map(str::to_owned);
+        let changed = self.attention != effective;
+        self.attention = effective;
+        AttentionMove {
+            effective: changed,
+            entry: true,
+        }
+    }
+
+    /// Remove the waits written under `ended` ([`AttentionOwners::lapse_under`]) and re-project
+    /// [`Self::attention`].
+    fn lapse_under(&mut self, ended: &crate::self_claim::Proven) -> AttentionMove {
+        if !self.attention_owners.lapse_under(ended) {
+            return AttentionMove::default();
+        }
+        let effective = self.attention_owners.effective().map(str::to_owned);
+        let changed = self.attention != effective;
+        self.attention = effective;
+        AttentionMove {
+            effective: changed,
+            entry: true,
+        }
     }
 
     /// Whether the live claim at `now_us` is a proven codex-alab self-claim (contract v2,
@@ -435,6 +749,7 @@ impl SessionMeta {
             .in_write_order()
             .into_iter()
             .filter(|(owner, _, _)| *owner != crate::input_stall::SERVER_ATTENTION_OWNER)
+            .filter(|(owner, _, _)| !self.attention_owners.held_under_a_claim(owner))
             .map(|(owner, text, kind)| {
                 let text = crate::control::pct_encode(text);
                 match kind.filter(|_| owner != BARE_ATTENTION_OWNER) {
@@ -510,6 +825,19 @@ struct AttentionEntry {
     text: String,
     kind: Option<aterm_types::needs::AttentionKind>,
     stamp: u64,
+    /// The proven claim a `kind=wait` entry was written under, on the connection that claim was
+    /// bound to ([`SessionMeta::claimant_conn`]): the wait is its claimant's own, so it lapses
+    /// when that claim ends or that connection closes ([`AttentionOwners::lapse_under`]) and never
+    /// crosses an update, which no proven claim does. Only a wait carries one
+    /// ([`AttentionOwners::put`]).
+    under: Option<crate::self_claim::Proven>,
+}
+
+impl AttentionEntry {
+    /// Whether the entry asks for someone: every kind but `kind=wait` (no kind is an ask).
+    fn asks(&self) -> bool {
+        self.kind != Some(aterm_types::needs::AttentionKind::Wait)
+    }
 }
 
 /// A new owner found the map at [`ATTENTION_OWNERS_MAX`]: nothing was stored.
@@ -560,6 +888,52 @@ impl AttentionOwners {
             .map(|entry| entry.text.as_str())
     }
 
+    /// `owner`'s entry, if it holds one that asks ([`AttentionEntry::asks`]): a `kind=wait`
+    /// entry asks nothing.
+    #[must_use]
+    pub(crate) fn ask(&self, owner: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|entry| entry.owner == owner && entry.asks())
+            .map(|entry| entry.text.as_str())
+    }
+
+    /// The most recently written entry's text that asks ([`AttentionEntry::asks`]).
+    #[must_use]
+    pub(crate) fn newest_ask(&self) -> Option<&str> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.asks())
+            .max_by_key(|entry| entry.stamp)
+            .map(|entry| entry.text.as_str())
+    }
+
+    /// Remove every entry written under `ended` ([`AttentionEntry::under`]), whose claim ended or
+    /// whose claim connection closed: whether any was.
+    fn lapse_under(&mut self, ended: &crate::self_claim::Proven) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|entry| entry.under.as_ref() != Some(ended));
+        self.entries.len() != before
+    }
+
+    /// Remove every entry written under a proven claim ([`AttentionEntry::under`]) other than
+    /// `keep`: whether any was.
+    fn lapse_except(&mut self, keep: Option<&crate::self_claim::Proven>) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|entry| entry.under.is_none() || entry.under.as_ref() == keep);
+        self.entries.len() != before
+    }
+
+    /// Whether `owner`'s entry was written under a proven claim ([`AttentionEntry::under`]).
+    #[cfg(any(unix, test))]
+    fn held_under_a_claim(&self, owner: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.owner == owner && entry.under.is_some())
+    }
+
     /// The most recently written entry's text.
     #[must_use]
     pub(crate) fn effective(&self) -> Option<&str> {
@@ -570,6 +944,12 @@ impl AttentionOwners {
     #[must_use]
     pub(crate) fn effective_owner(&self) -> Option<&str> {
         self.top().map(|entry| entry.owner.as_str())
+    }
+
+    /// The kind the effective entry's writer named (`kind=`), `None` when it named none.
+    #[must_use]
+    pub(crate) fn effective_kind(&self) -> Option<aterm_types::needs::AttentionKind> {
+        self.top().and_then(|entry| entry.kind)
     }
 
     fn top(&self) -> Option<&AttentionEntry> {
@@ -640,12 +1020,15 @@ impl AttentionOwners {
         owner: &str,
         value: Option<String>,
         kind: Option<aterm_types::needs::AttentionKind>,
+        under: Option<crate::self_claim::Proven>,
     ) -> Result<bool, AttentionOwnersFull> {
         let kind = if owner == BARE_ATTENTION_OWNER {
             Some(aterm_types::needs::AttentionKind::Ask)
         } else {
             kind
         };
+        // The stored kind decides: an ask, the bare one included, outlives every claim.
+        let under = under.filter(|_| kind == Some(aterm_types::needs::AttentionKind::Wait));
         let at = self.entries.iter().position(|entry| entry.owner == owner);
         match (at, value) {
             (Some(at), None) => {
@@ -656,6 +1039,7 @@ impl AttentionOwners {
             (Some(at), Some(text)) => {
                 let kind_moved = self.entries[at].kind != kind;
                 self.entries[at].kind = kind;
+                self.entries[at].under = under;
                 let text_moved = self.entries[at].text != text;
                 if text_moved {
                     self.next_stamp += 1;
@@ -683,6 +1067,7 @@ impl AttentionOwners {
                     text,
                     kind,
                     stamp: self.next_stamp,
+                    under,
                 });
                 Ok(true)
             }
@@ -1134,7 +1519,10 @@ pub(crate) fn write_attention_owned(
     write_attention_kind(ctx, owner, edit, None, by)
 }
 
-/// [`write_attention_owned`] with the entry's kind (`kind=`, `None` when the writer named none).
+/// [`write_attention_owned`] with the entry's kind (`kind=`, `None` when the writer named none). A
+/// move of the `owner=needs` entry settles aterm's own loop's outgoing NEEDS YOU set against it
+/// ([`SessionTimeline::settle_harness_needs`]), as the meta settles a self-claim's
+/// ([`SessionMeta::set_attention_under`]).
 pub(crate) fn write_attention_kind(
     ctx: &crate::SessionCtx,
     owner: &str,
@@ -1149,16 +1537,29 @@ pub(crate) fn write_attention_kind(
     if crate::control::caller_hung_up() {
         return Err(AttentionWriteError::Meta(MetaWriteError::HungUp));
     }
+    // A wait written on the connection a proven claim was bound to is its claimant's own, though
+    // the claim ended first: it lapses with that claim or that connection
+    // ([`AttentionOwners::lapse_under`]); `put` tags a wait alone.
+    let under = meta
+        .claimant_on(crate::control::serving_connection())
+        .cloned();
     let moved = meta
-        .set_attention_kind(owner, value, kind)
+        .set_attention_under(owner, value, kind, under)
         .map_err(|AttentionOwnersFull| AttentionWriteError::OwnersFull)?;
     let changed = moved.effective;
     meta.driver_writes |= MetaField::Attention.bit();
     let supervisor = crate::task_record::owner_moves_task(owner)
         .then(|| crate::task_record::supervisor_attention(&meta));
+    let needs_moved = moved.entry && owner == crate::harness_host::NEEDS_ATTENTION_OWNER;
     let (mut task_moved, mut log_owed) = (false, false);
-    if changed || supervisor.is_some() {
+    if changed || supervisor.is_some() || needs_moved {
         let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        if needs_moved {
+            timeline.settle_harness_needs(
+                meta.attention_owners
+                    .get(crate::harness_host::NEEDS_ATTENTION_OWNER),
+            );
+        }
         if changed {
             let change = MetaChange::written_by(
                 MetaField::Attention.wire_name(),
@@ -1358,18 +1759,25 @@ fn claim_supervisor_with(
     let now_proven = identity.is_some();
     let renewed_identity_changed =
         rule == ClaimRule::Renew && standing.as_ref().is_some_and(|(_, old)| *old != identity);
-    let revision = meta.set_supervisor(Some(SupervisorClaim {
-        holder: holder.to_string(),
-        conn,
-        expires_us,
-        proven,
-        scoped,
-    }));
-    let changed = match rule {
+    let (revision, lapsed) = meta.set_supervisor(
+        Some(SupervisorClaim {
+            holder: holder.to_string(),
+            conn,
+            expires_us,
+            proven,
+            scoped,
+        }),
+        now_us,
+    );
+    let supervisor_changed = match rule {
         ClaimRule::Renew => was_proven != now_proven,
         ClaimRule::Take | ClaimRule::Replace | ClaimRule::Busy => true,
     };
-    if changed {
+    // A lapse takes waits alone, which move no task record: only the effective text is recorded.
+    if lapsed.effective {
+        record_attention(ctx, &meta, by);
+    }
+    if supervisor_changed {
         record_supervisor(ctx, &meta, Some(holder), by);
     } else if renewed_identity_changed {
         ctx.timeline
@@ -1377,6 +1785,7 @@ fn claim_supervisor_with(
             .unwrap_or_else(|p| p.into_inner())
             .forget_holder_acts();
     }
+    let changed = supervisor_changed || renewed_identity_changed || lapsed.any();
     if crate::holder_image::DEV_ROWS && matches!(rule, ClaimRule::Take | ClaimRule::Replace) {
         ctx.timeline
             .lock()
@@ -1516,6 +1925,18 @@ pub(crate) fn release_supervisor(
     })
 }
 
+/// Connection `conn` closed at `now_us`: take the waits its proven claimant wrote on it and the
+/// stop and the Land hold it told ([`SessionMeta::close_connection`]) and record the attention
+/// `meta-change` when the shown entry moved; whether anything moved.
+pub(crate) fn close_claim_connection(ctx: &crate::SessionCtx, conn: u64, now_us: u64) -> bool {
+    let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    let (lapsed, held) = meta.close_connection(conn, now_us);
+    if lapsed.effective {
+        record_attention(ctx, &meta, aterm_slog::Actor::Aterm);
+    }
+    lapsed.any() || held
+}
+
 /// `meta unset supervisor holder=<h>`.
 pub(crate) fn release_supervisor_held_by(
     ctx: &crate::SessionCtx,
@@ -1540,8 +1961,14 @@ fn release_supervisor_if(
         return false;
     }
     let was_live = meta.live_supervisor(now_us).is_some();
-    let proven = meta.supervisor.take().and_then(|claim| claim.proven);
-    let revision = meta.set_supervisor(None);
+    let proven = meta
+        .supervisor
+        .as_ref()
+        .and_then(|claim| claim.proven.clone());
+    let (revision, lapsed) = meta.set_supervisor(None, now_us);
+    if lapsed.effective {
+        record_attention(ctx, &meta, by);
+    }
     if was_live {
         record_supervisor(ctx, &meta, None, by);
     }
@@ -1550,7 +1977,7 @@ fn release_supervisor_if(
         crate::self_claim::released(ctx, &proven, revision);
     }
     crate::harness_host::note_claim_released();
-    was_live
+    was_live || lapsed.any()
 }
 
 /// Remove a `ttl=` claim lapsed at `now_us` and record `meta-change field=supervisor value=-`,
@@ -1560,8 +1987,14 @@ pub(crate) fn lapse_supervisor(ctx: &crate::SessionCtx, now_us: u64) -> bool {
     if meta.supervisor_expiry().is_none_or(|at| at > now_us) {
         return false;
     }
-    let proven = meta.supervisor.take().and_then(|claim| claim.proven);
-    let revision = meta.set_supervisor(None);
+    let proven = meta
+        .supervisor
+        .as_ref()
+        .and_then(|claim| claim.proven.clone());
+    let (revision, lapsed) = meta.set_supervisor(None, now_us);
+    if lapsed.effective {
+        record_attention(ctx, &meta, aterm_slog::Actor::Aterm);
+    }
     record_supervisor(ctx, &meta, None, aterm_slog::Actor::Aterm);
     drop(meta);
     if let Some(proven) = proven {
@@ -1637,13 +2070,16 @@ pub(crate) fn seed_carried_claims(
             .is_ok_and(|moved| moved.effective);
     }
     if let Some((holder, ms)) = claim {
-        meta.set_supervisor(Some(SupervisorClaim {
-            holder: holder.to_string(),
-            conn: None,
-            expires_us: Some(now_us.saturating_add(ms.saturating_mul(1000))),
-            proven: None,
-            scoped: None,
-        }));
+        meta.set_supervisor(
+            Some(SupervisorClaim {
+                holder: holder.to_string(),
+                conn: None,
+                expires_us: Some(now_us.saturating_add(ms.saturating_mul(1000))),
+                proven: None,
+                scoped: None,
+            }),
+            now_us,
+        );
     }
     let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
     let by = aterm_slog::Actor::Aterm;
@@ -1847,6 +2283,83 @@ pub(crate) struct ForegroundStamp {
     agent: aterm_phase::Program,
 }
 
+/// Foreground custody and accepted word state before an upgrade view reads records off-thread.
+/// Unlike an input stamp this also names an unclassified foreground, and the last accepted word
+/// rejects an older read even when requests repeat within the same recorded second. A local
+/// revision distinguishes accepted operations without changing the process's stable owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UpgradeStamp {
+    generation: u64,
+    pgid: i32,
+    holder: Option<u64>,
+    agent: Option<aterm_phase::Program>,
+    conversation: Option<String>,
+    word: Option<(aterm_agent::harness::upgrade::Request, u64)>,
+    word_revision: u64,
+}
+
+/// The stable owner admitted with an upgrade row. Departing and returning to the foreground
+/// changes the publication generation, but the unchanged process keeps its image token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UpgradeOwner {
+    pgid: i32,
+    holder: Option<u64>,
+    agent: aterm_phase::Program,
+}
+
+impl UpgradeStamp {
+    pub(crate) fn is_current(&self, timeline: &SessionTimeline) -> bool {
+        self.generation < u64::MAX
+            && self.word_revision < u64::MAX
+            && *self == timeline.upgrade_stamp()
+    }
+
+    /// Bind a row only where this captured foreground actually names the lane's agent.
+    pub(crate) fn owner(
+        &self,
+        row: &aterm_agent::harness::upgrade_drive::Row,
+    ) -> Option<UpgradeOwner> {
+        use aterm_agent::harness::upgrade_drive::NOT_FOREGROUND;
+        (self.pgid > 0
+            && self.agent == Some(row.agent.program())
+            && self
+                .conversation
+                .as_deref()
+                .is_none_or(|session| session == row.session)
+            && row.aside != NOT_FOREGROUND
+            && row.wait != NOT_FOREGROUND)
+            .then_some(UpgradeOwner {
+                pgid: self.pgid,
+                holder: self.holder,
+                agent: row.agent.program(),
+            })
+    }
+}
+
+impl UpgradeOwner {
+    fn fronts(
+        self,
+        timeline: &SessionTimeline,
+        row: &aterm_agent::harness::upgrade_drive::Row,
+    ) -> bool {
+        self.pgid == timeline.agent.program_pgid
+            && self.holder.is_none_or(|token| {
+                timeline
+                    .current_holder_image()
+                    .and_then(|image| image.token)
+                    == Some(token)
+            })
+            && crate::harness_host::identified_agent(&timeline.agent)
+                .is_none_or(|agent| agent == self.agent)
+            && timeline
+                .upgrade_conversation()
+                .is_none_or(|session| row.session.is_empty() || session == row.session)
+    }
+}
+
+/// How long the outputs after a holder's first look for Claude's effort hint keep reading the
+/// live screen for it ([`SessionTimeline::effort_hint_looks`]).
+pub(crate) const EFFORT_HINT_LOOK: std::time::Duration = std::time::Duration::from_secs(60);
 /// A session's lifecycle state under one lock: its session log, whose rows are the timeline
 /// ([`crate::session_timeline_view`]), and what the session publishes beside it.
 #[derive(Default)]
@@ -1866,20 +2379,41 @@ pub(crate) struct SessionTimeline {
         aterm_agent::harness::footer::FactsOwner,
         aterm_phase::LaunchCard,
     )>,
+    /// The effort the footer last showed, with the conversation (its session id) and the model it
+    /// was shown for: a relaunch of that conversation takes it ([`Self::carried_card`]).
+    claude_effort: Option<(String, String, String)>,
+    /// The holder's token and the level its effort hint named on the live screen at an output,
+    /// frame or not ([`Self::note_effort_hint`]).
+    effort_hint: Option<(u64, &'static str)>,
+    /// The holder's token and when an output's read first looked for its effort hint
+    /// ([`Self::effort_hint_looks`]).
+    effort_hint_look: Option<(u64, std::time::Instant)>,
     path: Option<PathReading>,
     leader_copy: Option<(i32, &'static str)>,
     leader_no_harness: Option<i32>,
     leader_no_harness_applied: Option<i32>,
-    upgrade: Option<aterm_agent::harness::upgrade_drive::Row>,
+    upgrade: Option<(
+        aterm_agent::harness::upgrade_drive::Row,
+        Option<UpgradeOwner>,
+    )>,
+    /// The live-upgrade row the host last sent before it sent none, retaining the owner admitted
+    /// with its publication ([`Self::upgrade_kept`]).
+    upgrade_kept: Option<(
+        aterm_agent::harness::upgrade_drive::Row,
+        Option<UpgradeOwner>,
+    )>,
+    upgrade_word_revision: u64,
     resizes: crate::resize_ledger::ResizeLedger,
     #[cfg(any(unix, test))]
     handoff_ceiling: Option<u64>,
     task: Option<crate::task_record::TaskRecord>,
     worker_launch: Option<(std::time::Instant, String)>,
-    /// The worker's launcher is installing its program now (`task_launch::InstallingMark`).
+    /// The worker's launcher is installing its program, or holding its launch for a pool row,
+    /// now (`task_launch::InstallingMark`).
     worker_installing: bool,
     claude_excerpts: Option<(i32, crate::survey::ClaudeExcerpts)>,
     codex_survey: Option<(i32, crate::survey::CodexSurvey)>,
+    codex_build: Option<(i32, String)>,
     program_shown: Option<ShownProgram>,
     program_episodes: u64,
     claude_side: Option<(i32, std::sync::Arc<crate::claude_footer::FactSide>)>,
@@ -1890,6 +2424,11 @@ pub(crate) struct SessionTimeline {
     need: crate::needs::Verdict,
     last_act: Option<String>,
     pending_self_tasks: VecDeque<aterm_agent::harness::acts::TaskFace>,
+    /// Admitted self-claim acts the window has yet to put on its glass ([`Self::queue_self_act`]).
+    pending_self_acts: VecDeque<SelfAct>,
+    /// The last act a face that stands until another turn was told by ([`Self::self_act_resent`]):
+    /// the act, its holder and the program's turns it arrived at.
+    standing_self_act: Option<(String, String, u64)>,
     upgrade_recorded: bool,
     self_reexec_since_us: Option<u64>,
     landing_mark: Option<LandingMark>,
@@ -2094,6 +2633,16 @@ pub(crate) struct LandingMark {
     pub(crate) program_turns: u64,
 }
 
+/// AN ADMITTED SELF-CLAIM ACT, AS THE WINDOW'S GLASS TAKES IT (`HarnessFact::SelfAct`): the
+/// chip's act it is ([`aterm_agent::harness::acts::self_claim_sort`]; `None` where the chip
+/// lights nothing for it, which still owes Settings ▸ Harness a reading) and the holder of the
+/// proven claim that recorded it, who did it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SelfAct {
+    pub(crate) act: Option<aterm_agent::harness::acts::Act>,
+    pub(crate) holder: String,
+}
+
 /// How long after the first read that finds a session's grid resized a text change counts as
 /// the re-grid's.
 pub(crate) const REGRID_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -2239,7 +2788,59 @@ impl SessionTimeline {
 
     /// Queue the face of an admitted act in the hold that commits its row.
     pub(crate) fn queue_self_task(&mut self, face: aterm_agent::harness::acts::TaskFace) {
+        if self.pending_self_tasks.len() >= 64 {
+            self.pending_self_tasks.pop_front();
+        }
         self.pending_self_tasks.push_back(face);
+    }
+
+    /// Queue an admitted self-claim act for the window's glass (`HarnessFact::SelfAct`): what the
+    /// chip and the trail show of it, and its holder, who did it.
+    pub(crate) fn queue_self_act(&mut self, act: SelfAct) {
+        if self.pending_self_acts.len() >= 64 {
+            self.pending_self_acts.pop_front();
+        }
+        self.pending_self_acts.push_back(act);
+    }
+
+    /// Take the self-claim acts queued before this read, oldest first.
+    pub(crate) fn take_self_acts(&mut self) -> VecDeque<SelfAct> {
+        std::mem::take(&mut self.pending_self_acts)
+    }
+
+    /// A SELF-CLAIM'S ACT TOLD AGAIN IS ONE ACT: whether `act`, recorded by `holder` with the
+    /// program at `turns` begun, repeats the face that stands until another turn the last such act
+    /// told — the same act by the same holder at the same count, no act that reopens the work
+    /// between — as a holder's retry does after a write whose answer it never read (codex-alab
+    /// sends `left-to-person@v1` again after a failed or timed-out send). An act of a standing
+    /// face is remembered; an act that opens the work forgets it; an act with no face (a re-exec)
+    /// leaves it, and one whose count is unknown never repeats.
+    pub(crate) fn self_act_resent(
+        &mut self,
+        act: &str,
+        holder: &str,
+        face: Option<aterm_agent::harness::acts::TaskFace>,
+        turns: Option<u64>,
+    ) -> bool {
+        match face {
+            Some(face) if crate::harness_task::holds_until_another_turn(face) => {
+                let Some(turns) = turns else {
+                    self.standing_self_act = None;
+                    return false;
+                };
+                let resent = self
+                    .standing_self_act
+                    .as_ref()
+                    .is_some_and(|(a, h, t)| a == act && h == holder && *t == turns);
+                self.standing_self_act = Some((act.to_string(), holder.to_string(), turns));
+                resent
+            }
+            Some(_) => {
+                self.standing_self_act = None;
+                false
+            }
+            None => false,
+        }
     }
 
     /// Take the finite batch committed before this read.
@@ -2285,6 +2886,7 @@ impl SessionTimeline {
     /// The claim moved, or a renewal changed its proof: drop the queued acts and the typed turn.
     pub(crate) fn forget_holder_acts(&mut self) {
         self.pending_self_tasks.clear();
+        self.standing_self_act = None;
         self.typed_turn = None;
     }
 
@@ -2302,6 +2904,18 @@ impl SessionTimeline {
         let at = self.slog.now();
         self.slog.observe_program(shown, at);
         self.record(PROGRAM_STATE);
+    }
+
+    /// The edges of the program's turns no shown move claims
+    /// ([`crate::program_state::ProgramStateGate::observe_fed`]), into the log's claimed turns at
+    /// their own times ([`crate::session_log::SessionLog::observe_program_edges`]): no episode,
+    /// shown report or `program-state` row moves, and the watchers are rung when a turn record
+    /// was written, so `await log close=turn` hears it on this wake.
+    pub(crate) fn note_program_edges(&mut self, fed: &[crate::program_state::FedEdge]) {
+        let at = self.slog.now();
+        if self.slog.observe_program_edges(fed, at) {
+            self.ring();
+        }
     }
 
     /// A `kind` row's writer wrote its session log mark in this hold (the mark is the row,
@@ -2345,7 +2959,8 @@ impl SessionTimeline {
 
     /// Wake the session's watchers iff the view's head moved since they were last rung, as it
     /// does for a row a mark wrote outside this timeline's writers (a person's burst,
-    /// [`crate::session_log::SessionLog::person_input`]).
+    /// [`crate::session_log::SessionLog::person_input`]; a program state the status sweep's tick
+    /// wrote, [`crate::session_log::SessionLog::program_tick`]).
     pub(crate) fn ring_rows(&mut self) {
         if self.slog.row_head() != self.rows_rung {
             self.ring();
@@ -2385,8 +3000,11 @@ impl SessionTimeline {
     /// The one `meta-change` writer, under the meta → timeline hold its caller already takes
     /// (`meta` is the store as the write left it).
     pub(crate) fn record_meta_change(&mut self, change: MetaChange<'_>, meta: &SessionMeta) {
-        let escalated = meta.attention_owners.effective_owner()
-            == Some(aterm_agent::supervise::run::ATTENTION_OWNER);
+        let owners = &meta.attention_owners;
+        let escalated = crate::session_log::observed::Escalated::of(
+            owners.effective_owner() == Some(aterm_agent::supervise::run::ATTENTION_OWNER),
+            owners.effective_kind(),
+        );
         let at = self.slog.now();
         self.slog.observe_meta(change, escalated, at);
         self.ring();
@@ -2690,6 +3308,44 @@ impl SessionTimeline {
         })
     }
 
+    /// The cached foreground and accepted word state captured before reading upgrade records.
+    pub(crate) fn upgrade_stamp(&self) -> UpgradeStamp {
+        UpgradeStamp {
+            generation: self.foreground_generation,
+            pgid: self.agent.program_pgid,
+            holder: self.current_holder_image().and_then(|image| image.token),
+            agent: crate::harness_host::identified_agent(&self.agent),
+            conversation: self.upgrade_conversation().map(str::to_owned),
+            word: self.upgrade_word(),
+            word_revision: self.upgrade_word_revision,
+        }
+    }
+
+    fn upgrade_word(&self) -> Option<(aterm_agent::harness::upgrade::Request, u64)> {
+        self.upgrade
+            .as_ref()
+            .or(self.upgrade_kept.as_ref())
+            .filter(|(row, _)| {
+                row.request_at != 0 || row.request != aterm_agent::harness::upgrade::Request::None
+            })
+            .map(|(row, _)| (row.request.clone(), row.request_at))
+    }
+
+    /// An already admitted footer can identify a different conversation within the same image.
+    fn upgrade_conversation(&self) -> Option<&str> {
+        if let Some(image) = self
+            .current_holder_image()
+            .filter(|image| image.drawer.is_some())
+        {
+            return self
+                .registry_owner(image)
+                .map(|owner| owner.session_id.as_str());
+        }
+        self.claude_footer()
+            .and_then(|facts| facts.owner.as_ref())
+            .map(|owner| owner.session_id.as_str())
+    }
+
     const fn advance_foreground_generation(&mut self) {
         self.foreground_generation = self.foreground_generation.saturating_add(1);
     }
@@ -2717,14 +3373,15 @@ impl SessionTimeline {
         self.worker_launch.as_ref()
     }
 
-    /// Note whether the worker's launcher is installing its program now
-    /// (`task_launch::InstallingMark`).
+    /// Note whether the worker's launcher is installing its program, or holding its launch for
+    /// a pool row, now (`task_launch::InstallingMark`).
     pub(crate) fn set_worker_installing(&mut self, installing: bool) {
         self.worker_installing = installing;
     }
 
-    /// Whether the worker's launcher is installing its program now. The startup deadline does
-    /// not judge the worker while it is (`harness_host::look_at_startups`).
+    /// Whether the worker's launcher is installing its program, or holding its launch for a pool
+    /// row, now. The startup deadline does not judge the worker while it is
+    /// (`harness_host::look_at_startups`).
     pub(crate) const fn worker_installing(&self) -> bool {
         self.worker_installing
     }
@@ -2911,6 +3568,9 @@ impl SessionTimeline {
             pgid: self.agent.program_pgid,
         };
         let _ = self.slog.agent_moved(moved, at);
+        // A box the verdict closed with no answer and opened again keeps the supervisor's
+        // standing ask (fix E3 review).
+        self.slog.carry_escalation(at);
         self.record("agent-change");
         true
     }
@@ -3127,6 +3787,14 @@ impl SessionTimeline {
         &self,
         image: &crate::holder_image::HolderImage,
     ) -> Option<atpkg::vendor_direct::Version> {
+        self.registry_owner(image)?;
+        self.claude_footer_build
+    }
+
+    fn registry_owner(
+        &self,
+        image: &crate::holder_image::HolderImage,
+    ) -> Option<&aterm_agent::harness::footer::FactsOwner> {
         let (pgid, _, facts) = self.claude_footer.as_ref()?;
         let owner = facts.owner.as_ref()?;
         if *pgid != image.pgid
@@ -3140,7 +3808,7 @@ impl SessionTimeline {
         {
             return None;
         }
-        self.claude_footer_build
+        Some(owner)
     }
 
     /// Return the published Claude launch-card image token for process group `pgid`.
@@ -3454,6 +4122,18 @@ impl SessionTimeline {
                 self.claude_card = None;
             }
         }
+        // A process that takes up the conversation the footer last showed an effort for (the
+        // relaunch an update or a restart makes resumes it with the same settings) runs at that
+        // effort until its own word: where its facts leave the effort open for the same model,
+        // the level is its card's, so `◆` keeps it where no frame read Claude's start-up hint
+        // (a background tab, an occluded window, another Space).
+        if self.claude_card.is_none()
+            && !is_muse_or_agy
+            && let Some((np, ns, facts)) = &next
+            && let Some((owner, card)) = self.carried_card(facts)
+        {
+            self.claude_card = Some((*np, *ns, owner, card));
+        }
         self.claude_footer = next;
         self.claude_footer_image = self
             .holder_image
@@ -3465,7 +4145,50 @@ impl SessionTimeline {
             .as_ref()
             .and_then(|(_, _, facts)| facts.version.as_deref())
             .and_then(atpkg::vendor_direct::Version::parse);
+        self.note_shown_effort();
         true
+    }
+
+    /// The launch card that carries the effort the footer last showed for `facts`' conversation
+    /// ([`Self::note_shown_effort`]) to the process `facts` were read for, and whose it is:
+    /// `None` unless they leave the effort open for the model it was shown with.
+    fn carried_card(
+        &self,
+        facts: &aterm_agent::harness::footer::FooterFacts,
+    ) -> Option<(
+        aterm_agent::harness::footer::FactsOwner,
+        aterm_phase::LaunchCard,
+    )> {
+        let (conversation, model, effort) = self.claude_effort.as_ref()?;
+        let owner = facts.owner.as_ref()?;
+        let to = facts.effort_for.as_ref().or(facts.model.as_ref())?;
+        (facts.effort_open && owner.session_id == *conversation && to == model).then(|| {
+            (
+                owner.clone(),
+                aterm_phase::LaunchCard {
+                    version: facts.version.clone().unwrap_or_default(),
+                    model: model.clone(),
+                    effort: Some(effort.clone()),
+                },
+            )
+        })
+    }
+
+    /// Keep the effort the footer shows for the facts in front, with their conversation and the
+    /// model it is shown for ([`Self::carried_card`]); what it kept stands while none is shown.
+    fn note_shown_effort(&mut self) {
+        let shown = self.claude_footer().and_then(|facts| {
+            let owner = facts.owner.as_ref()?;
+            let (model, effort) = facts.filled_model_effort(self.claude_card());
+            Some((
+                owner.session_id.clone(),
+                model?.to_owned(),
+                effort?.to_owned(),
+            ))
+        });
+        if shown.is_some() {
+            self.claude_effort = shown;
+        }
     }
 
     /// Store the composed Claude launch card for the foreground process group.
@@ -3490,7 +4213,38 @@ impl SessionTimeline {
             let at = self.slog.now();
             self.slog.observe_card(card, at);
         }
+        self.note_shown_effort();
         true
+    }
+
+    /// Keep `level`, the effort Claude's own hint names on a row the holder `token` drew, read off
+    /// the live screen at an output (`App::read_claude_effort_hint`), frame or not: the footer
+    /// pass takes it for that holder where no frame read the hint.
+    pub(crate) const fn note_effort_hint(&mut self, token: u64, level: &'static str) {
+        self.effort_hint = Some((token, level));
+    }
+
+    /// Whether an output at `now` still looks for holder `token`'s effort hint on the live screen:
+    /// for [`EFFORT_HINT_LOOK`] from the first output that looked for it, the time Claude's
+    /// start-up hint is up in (it shows some 10 s after a launch). A holder whose hint was never
+    /// read (a mode row too narrow for it, a launch that draws none) is looked for no longer.
+    pub(crate) fn effort_hint_looks(&mut self, token: u64, now: std::time::Instant) -> bool {
+        match self.effort_hint_look {
+            Some((looked, since)) if looked == token => {
+                now.saturating_duration_since(since) < EFFORT_HINT_LOOK
+            }
+            _ => {
+                self.effort_hint_look = Some((token, now));
+                true
+            }
+        }
+    }
+
+    /// The level [`Self::note_effort_hint`] kept for holder `token`.
+    pub(crate) fn effort_hint(&self, token: u64) -> Option<&'static str> {
+        self.effort_hint
+            .filter(|(kept, _)| *kept == token)
+            .map(|(_, level)| level)
     }
 
     /// The process the stored footer facts were read for.
@@ -3515,6 +4269,7 @@ impl SessionTimeline {
     /// Forget the footer facts.
     pub(crate) fn clear_claude_footer(&mut self) -> bool {
         self.claude_card = None;
+        self.claude_effort = None;
         self.claude_excerpts = None;
         self.claude_side = None;
         self.claude_footer_read = None;
@@ -3564,6 +4319,20 @@ impl SessionTimeline {
         self.program_shown
     }
 
+    /// The agent word a surface shows and how long it has held, in ms: the reader's, or where the
+    /// reader names no state (`unknown`, codex's) and the program says itself (OSC 7501), the
+    /// program's word ([`crate::program_state::survey_word`]) and its report's age. Render-time
+    /// only: `agent=` stays the reader's.
+    pub(crate) fn shown_agent_word(&self) -> (&'static str, u64) {
+        match self.program_shown.filter(|_| self.agent.word == "unknown") {
+            Some(shown) => (
+                crate::program_state::survey_word(shown.state),
+                shown.age_ms(),
+            ),
+            None => (self.agent.word, self.agent.age_ms()),
+        }
+    }
+
     /// The rollout tap's facts for the codex process in group `pgid` ([`crate::codex_rollout_tap`]),
     /// taken only while that group is in front: whether they were.
     pub(crate) fn set_codex_survey(
@@ -3574,13 +4343,18 @@ impl SessionTimeline {
         if self.agent.program_pgid != pgid {
             return false;
         }
+        let (ctx, goal) = (survey.facts.ctx_left_pct, survey.goal.is_some());
         self.codex_survey = Some((pgid, survey));
+        let at = self.slog().now();
+        self.slog_mut().observe_codex_facts(ctx, Some(goal), at);
         true
     }
 
-    /// Forget the rollout tap's facts: its tap went. Returns whether any facts were cleared.
+    /// Forget the rollout tap's facts and the build it named: its tap went. Returns whether any
+    /// were cleared.
     pub(crate) fn clear_codex_survey(&mut self) -> bool {
-        self.codex_survey.take().is_some()
+        let facts = self.codex_survey.take().is_some();
+        self.codex_build.take().is_some() || facts
     }
 
     /// The codex facts the survey shows, or `None` when the program in front is not the one they
@@ -3590,6 +4364,26 @@ impl SessionTimeline {
             .as_ref()
             .filter(|(pgid, _)| *pgid == self.agent.program_pgid)
             .map(|(_, survey)| survey)
+    }
+
+    /// The product version the codex process in group `pgid` runs, as the rollout tap read it off its
+    /// image ([`aterm_agent::harness::codex_alab::product_version`]), taken only while that group is in
+    /// front: whether it was. Apart from [`Self::codex_survey`], which a build alone never makes.
+    pub(crate) fn set_codex_build(&mut self, pgid: i32, build: Option<String>) -> bool {
+        if self.agent.program_pgid != pgid {
+            return false;
+        }
+        self.codex_build = build.map(|build| (pgid, build));
+        true
+    }
+
+    /// The build [`Self::set_codex_build`] took, or `None` when the program in front is not the
+    /// one it was read for.
+    pub(crate) fn codex_build(&self) -> Option<&str> {
+        self.codex_build
+            .as_ref()
+            .filter(|(pgid, _)| *pgid == self.agent.program_pgid)
+            .map(|(_, build)| build.as_str())
     }
 
     /// The footer resolver's side for `pgid`, applied only while that group is in front.
@@ -3783,21 +4577,92 @@ impl SessionTimeline {
             .map(|(_, c)| c)
     }
 
-    /// Replace this tab's live-upgrade row; whether it moved.
+    /// Synchronous fixture publication. Older layout fixtures deliberately leave the process
+    /// or program unnamed; production publications must supply their captured custody.
+    #[cfg(test)]
     pub(crate) fn set_upgrade(
         &mut self,
         row: Option<aterm_agent::harness::upgrade_drive::Row>,
     ) -> bool {
+        let row = row.map(|row| {
+            let owner = UpgradeOwner {
+                pgid: self.agent.program_pgid,
+                holder: self.current_holder_image().and_then(|image| image.token),
+                agent: crate::harness_host::identified_agent(&self.agent)
+                    .unwrap_or(row.agent.program()),
+            };
+            (row, Some(owner))
+        });
+        self.set_upgrade_owned(row)
+    }
+
+    /// Replace the row with its admitted producer's stable owner; a clear retains that owner,
+    /// never the foreground program at delivery time.
+    pub(crate) fn set_upgrade_owned(
+        &mut self,
+        row: Option<(
+            aterm_agent::harness::upgrade_drive::Row,
+            Option<UpgradeOwner>,
+        )>,
+    ) -> bool {
         if self.upgrade == row {
             return false;
         }
+        let previous_word = self.upgrade_word();
+        if row.is_some() {
+            self.upgrade_kept = None;
+        } else {
+            self.upgrade_kept = self.upgrade.take();
+        }
         self.upgrade = row;
+        if self.upgrade_word() != previous_word {
+            self.upgrade_word_revision = self.upgrade_word_revision.saturating_add(1);
+        }
         true
     }
 
+    /// An admitted successful reply is a new operation even when its value was already cached.
+    pub(crate) fn upgrade_word_accepted(&mut self, row: &aterm_agent::harness::upgrade_drive::Row) {
+        if self
+            .upgrade
+            .as_ref()
+            .or(self.upgrade_kept.as_ref())
+            .is_some_and(|(current, _)| crate::upgrade_host::same_move(current, row))
+        {
+            self.upgrade_word_revision = self.upgrade_word_revision.saturating_add(1);
+        }
+    }
+
     /// This tab's live-upgrade row, or `None`.
-    pub(crate) const fn upgrade(&self) -> Option<&aterm_agent::harness::upgrade_drive::Row> {
-        self.upgrade.as_ref()
+    pub(crate) fn upgrade(&self) -> Option<&aterm_agent::harness::upgrade_drive::Row> {
+        self.upgrade
+            .as_ref()
+            .filter(|(row, owner)| owner.is_some_and(|owner| owner.fronts(self, row)))
+            .map(|(row, _)| row)
+    }
+
+    /// Reapply a record with its accepted run's owner. A target, phase, wait or source change
+    /// grants no new custody; a newly recorded process birth can admit a new foreground owner.
+    pub(crate) fn accepted_upgrade_owner(
+        &self,
+        row: &aterm_agent::harness::upgrade_drive::Row,
+    ) -> Option<UpgradeOwner> {
+        self.upgrade
+            .as_ref()
+            .or(self.upgrade_kept.as_ref())
+            .filter(|(old, _)| crate::upgrade_host::same_upgrade_run(old, row))
+            .and_then(|(_, owner)| *owner)
+    }
+
+    /// The row the host last sent for this tab before it sent none (a host stood down, its
+    /// harness switched off): what the top rule's ⬆️ still says of a build waiting while the
+    /// harness is off. A live row clears it, and it is none while another foreground group than
+    /// the one in front when it was kept is: the program it was minted for has left the front.
+    pub(crate) fn upgrade_kept(&self) -> Option<&aterm_agent::harness::upgrade_drive::Row> {
+        self.upgrade_kept
+            .as_ref()
+            .filter(|(row, owner)| owner.is_some_and(|owner| owner.fronts(self, row)))
+            .map(|(row, _)| row)
     }
 
     /// Replace the task's face ([`Self::task_face()`]).
@@ -3882,8 +4747,16 @@ impl SessionTimeline {
         self.harness_needs.tell(told, standing)
     }
 
+    /// Settle aterm's own loop's NEEDS YOU sets against `standing`, the `owner=needs` entry just
+    /// written ([`crate::needs::ToldNeeds::settle`]): the outgoing set goes the moment that entry
+    /// moves off the text it was told with or is cleared.
+    pub(crate) fn settle_harness_needs(&mut self, standing: Option<&str>) {
+        self.harness_needs.settle(standing);
+    }
+
     /// The worker's NEEDS YOU sets as its loop told this window's host, whole, each with the
-    /// entry's text it was told with.
+    /// entry's text it was told with: aterm's own loop's only, which a reader reads through
+    /// [`crate::needs::told_of`] (a proven self-claim's own sets in their place while it stands).
     pub(crate) fn harness_needs(&self) -> crate::needs::ToldNeeds {
         self.harness_needs.clone()
     }
@@ -3907,7 +4780,7 @@ impl SessionTimeline {
         let (path, evidence) = path_columns(mark, self.path_reading());
         let upgrade = self.upgrade.as_ref().map_or_else(
             || "-".to_string(),
-            |row| {
+            |(row, _)| {
                 let mut row = row.clone();
                 row.reread(now_s);
                 row.column(now_s)
@@ -4418,6 +5291,29 @@ mod account_progress_tests {
         assert!(timeline.set_account_progress(42, Some(100), Some("two"), Some(progress)));
         timeline.set_claude_footer(42, Some(102), Some(facts("two")));
         assert_eq!(timeline.claude_footer().unwrap().account_progress, None);
+    }
+
+    #[test]
+    fn recovery_control_snapshot_follows_the_current_foreground_owner() {
+        use crate::harness_recovery_verb::snapshot;
+        let mut timeline = SessionTimeline::for_test();
+        assert_eq!(snapshot(&timeline), None);
+        timeline.agent.program_pgid = 42;
+        timeline.set_claude_footer(42, Some(100), Some(facts("one")));
+        let progress = AccountProgress::unknown(101);
+        timeline.set_account_progress(42, Some(100), Some("one"), Some(progress.clone()));
+        assert_eq!(snapshot(&timeline), Some(progress.clone()));
+        timeline.agent.program_pgid = 43;
+        assert_eq!(snapshot(&timeline), None, "old foreground must not leak");
+        timeline.agent.program_pgid = 42;
+        timeline.set_claude_footer(42, Some(102), Some(facts("two")));
+        assert_eq!(
+            snapshot(&timeline),
+            None,
+            "new process has no observation yet"
+        );
+        assert!(!timeline.set_account_progress(42, Some(100), Some("one"), Some(progress)));
+        assert_eq!(snapshot(&timeline), None);
     }
 }
 

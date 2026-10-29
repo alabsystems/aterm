@@ -267,7 +267,8 @@ impl Candidate {
 /// Whether `covers_mc` passes the floor of a subject `busy_mc` busy.
 #[must_use]
 pub fn above_floor(covers_mc: i64, busy_mc: i64) -> bool {
-    covers_mc >= FLOOR_MC && covers_mc * 1000 >= busy_mc * FLOOR_PM
+    covers_mc >= FLOOR_MC
+        && i128::from(covers_mc) * 1000 >= i128::from(busy_mc) * i128::from(FLOOR_PM)
 }
 
 /// The machine's throttle, where it holds: thermal at `light` or above, or Low Power Mode.
@@ -554,18 +555,20 @@ fn rows_of<'a>(facts: &'a WhyFacts, c: &Candidate) -> impl Iterator<Item = &'a C
 /// [`STARTUP_BORN_MS`] of its start, weighted by CPU (never by count).
 fn startup(facts: &WhyFacts, c: &Candidate) -> Option<Evidence> {
     let start = facts.userspace_ms?;
-    if facts.at_unix_ms - start >= STARTUP_AGE_MS || c.covers_mc <= 0 {
+    let age = facts.at_unix_ms.checked_sub(start)?;
+    if !(0..STARTUP_AGE_MS).contains(&age) || c.covers_mc <= 0 {
         return None;
     }
+    let born_end = start.saturating_add(STARTUP_BORN_MS);
     let early: i64 = rows_of(facts, c)
         .filter(|r| {
             r.lead
                 .as_ref()
-                .is_some_and(|l| (start..=start + STARTUP_BORN_MS).contains(&l.birth_ms))
+                .is_some_and(|l| (start..=born_end).contains(&l.birth_ms))
         })
         .map(covered)
-        .sum();
-    (early * 2 >= c.covers_mc).then(|| Evidence::Startup {
+        .fold(0_i64, i64::saturating_add);
+    (i128::from(early) * 2 >= i128::from(c.covers_mc)).then(|| Evidence::Startup {
         userspace_ms: start,
         wake: wake_fact(facts),
     })
@@ -574,8 +577,15 @@ fn startup(facts: &WhyFacts, c: &Candidate) -> Option<Evidence> {
 /// `wake` for `c` (with no `startup`): the wake under [`WAKE_AGE_MS`] old
 /// and at least [`WAKE_DEFERRED_MC`] of deferred work in `c`.
 fn wake(facts: &WhyFacts, c: &Candidate) -> Option<WakeFact> {
-    let w = wake_fact(facts).filter(|w| facts.at_unix_ms - w.at_ms < WAKE_AGE_MS)?;
-    let deferred: i64 = rows_of(facts, c).map(|r| r.deferred_mc).sum();
+    let w = wake_fact(facts).filter(|w| {
+        facts
+            .at_unix_ms
+            .checked_sub(w.at_ms)
+            .is_some_and(|age| (0..WAKE_AGE_MS).contains(&age))
+    })?;
+    let deferred: i64 = rows_of(facts, c)
+        .map(|r| r.deferred_mc)
+        .fold(0_i64, i64::saturating_add);
     (deferred >= WAKE_DEFERRED_MC).then_some(w)
 }
 
@@ -588,7 +598,8 @@ fn wake_fact(facts: &WhyFacts) -> Option<WakeFact> {
         reason: t.wake_reason.clone(),
         slept_s: t
             .sleep_ms
-            .filter(|s| *s <= at_ms)
-            .and_then(|s| u64::try_from((at_ms - s) / 1000).ok()),
+            .and_then(|s| at_ms.checked_sub(s))
+            .filter(|d| *d >= 0)
+            .and_then(|d| u64::try_from(d / 1000).ok()),
     })
 }

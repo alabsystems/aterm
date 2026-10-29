@@ -848,7 +848,14 @@ fn the_rail_lies_in_the_leading_under_the_run() {
             continue;
         }
         assert!(!below.is_empty(), "{style:?}: no rail under the run");
-        let reach = (g.ch as f32 * 0.2).ceil() as i32;
+        // Over this bare row Comet's icy tail takes its depth, to the icy
+        // rail's floor (looks9 round 2's Q2,
+        // `comet_s_icy_tail_takes_its_depth_over_a_bare_row`).
+        let reach = if matches!(style, GlowStyle::Comet) {
+            crate::cursor_glow::bed::icy_rail_floor(g.ch as f32).ceil() as i32
+        } else {
+            (g.ch as f32 * 0.2).ceil() as i32
+        };
         let mut brightest = 0.0f32;
         for q in &below {
             assert!(
@@ -2006,9 +2013,12 @@ fn phaser_s_dark_bed_lays_no_vivid_knot_in_a_word_gap() {
 /// on `#002b36`, and a dim letter keeps 97% of its own reading under the
 /// lights) no style's bed lays a shade. Typing the line, every frame, every
 /// pixel the beds lay under the line's cells (the rails below the row, their
-/// soft top in its last two pixel rows, are light in the leading) keeps seven
-/// tenths of the page's luminance (a soft edge's sRGB mix of the page and a
-/// hue at its luminance) and none rises over it by more than a byte's
+/// soft top in its last two pixel rows, are light in the leading, and over a
+/// row below that is no air a rail kept in its own foot band
+/// ([`crate::cursor_glow::bed::BedShape::row_rail`], looks10 L2) is light in
+/// the row's last three) keeps seven tenths of the page's luminance (a soft
+/// edge's sRGB mix of the page and a hue at its luminance) and none rises
+/// over it by more than a byte's
 /// rounding, and the bed wears its hue: some pixel stands well off the page.
 /// Negative controls: held to the letters' budget alone, the bed solves to
 /// black and lays the gallery's black smoke (Beam's tube, Phaser's word gaps,
@@ -2061,9 +2071,11 @@ fn a_lit_page_s_beds_lay_no_shade() {
         text[0] = '$';
         let mut t = Instant::now();
         let (mut low, mut high, mut far) = (f32::INFINITY, 0.0f32, 0.0f32);
+        // The foot band a rail may lie in, or a rail's soft top below it.
+        let foot = ((crate::rainbow_kitty::ribbon::ROW_RAIL_CH * g.ch as f32) as usize).max(2);
         let (y0, y1) = (
             g.origin_y as usize + usize::from(ROW) * g.ch,
-            g.origin_y as usize + usize::from(ROW + 1) * g.ch - 2,
+            g.origin_y as usize + usize::from(ROW + 1) * g.ch - foot,
         );
         for (k, ch) in std::iter::once(' ').chain(LINE.chars()).enumerate() {
             if k > 0 {
@@ -2133,6 +2145,376 @@ fn a_lit_page_s_beds_lay_no_shade() {
             "control: {style:?}'s air read by each sample's own cell lays no light under the line ({alone:.4} on the page's {lp:.4})"
         );
     }
+}
+
+/// looks10 L2, COMET'S TAIL IN ITS OWN ROW READS AS ITS TAIL: laid in the
+/// typed row's foot band over a selection's fill ([`a_tail_with_no_air_below_lies_in_its_own_row`]),
+/// Comet's icy tail was a soft line two pixels deep that fell off with its
+/// taper, a hairline under the last word that did not read as a comet.
+/// Laid whole down to the band's last pixel row and falling off with its
+/// taper's square root ([`crate::cursor_glow::bed::BedScratch::row_tail_faint`]),
+/// on the reference dark and on Solarized Dark its last frame lights the band
+/// at least three cells back from the caret, its last pixel row too.
+/// Negative control: laid as round 1 laid it (`comet_row_tail_faint`), it
+/// lays under five sevenths of that light and leaves the band's last pixel
+/// row dark.
+#[test]
+fn comet_s_tail_in_its_own_row_reads_as_its_tail() {
+    use crate::cursor_fx::{GlowKnobs, GlowSpelling, resolve_glow_config};
+    const FILL: u32 = 0x0026_4F78;
+    let g = tall_geom();
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let (cw, ch) = (g.cw, g.ch);
+    let foot = (crate::rainbow_kitty::ribbon::ROW_RAIL_CH * ch as f32) as usize;
+    // (cells behind the caret whose foot band reads lit, the band's light
+    // over the line behind the caret)
+    let lay = |(page, ink): (u32, u32), faint: bool| {
+        let c = resolve_glow_config(
+            GlowKnobs {
+                enabled: true,
+                color: None,
+                accent: None,
+                duration_ms: 260,
+                length: 24,
+                intensity: crate::cursor_fx::default_trail_intensity(Some(GlowStyle::Comet), false),
+                radius: 0.6,
+                ring: true,
+            },
+            GlowSpelling {
+                style: Some(GlowStyle::Comet),
+                beam: true,
+                ribbon_tall: true,
+                ribbon_flat: false,
+                classic_mono: false,
+            },
+            CURSOR,
+            true,
+            ink,
+            page,
+            0.5,
+        );
+        let mut glow = CursorGlow {
+            comet_row_tail_faint: faint,
+            ..CursorGlow::default()
+        };
+        let mut out = Vec::new();
+        let mut text = vec![' '; g.cols];
+        let mut t = Instant::now();
+        let mut caret = (ROW, START);
+        for (k, letter) in std::iter::once(' ').chain(LINE.chars()).enumerate() {
+            if k > 0 {
+                t += Duration::from_millis(60);
+                text[START as usize + k - 1] = letter;
+                glow.note_synthetic_typed(t, 1);
+            }
+            caret = (ROW, START + k as u16);
+            let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+            for (r, line) in rows.iter_mut().enumerate() {
+                for (col, cell) in line.iter_mut().enumerate() {
+                    let ground = if r == usize::from(ROW + 1) {
+                        FILL
+                    } else {
+                        page
+                    };
+                    (cell.fg, cell.bg) = (rgb(ink), rgb(ground));
+                    if r == usize::from(ROW) {
+                        cell.ch = text[col];
+                    }
+                }
+            }
+            glow.observe_row(caret.0, caret.1, &text, t);
+            glow.observe_frame_text(Some(caret), &rows, t);
+            glow.tick(Some(caret), t, &c, g, &mut out);
+        }
+        let mut glass = Glass::new(g, page);
+        glass.add_quads(glow.under_quads());
+        let bottom = usize::from(ROW + 1) * ch;
+        let head = usize::from(caret.1) * cw;
+        let (mut cells, mut light) = (0usize, 0.0f32);
+        for cell in 1..=8usize {
+            let x0 = head - cell * cw;
+            let mut deepest = 0.0f32;
+            for y in bottom - foot..bottom {
+                for x in x0..x0 + cw {
+                    let d = crate::color_math::oklab_distance(glass.px[y * glass.w + x], page);
+                    deepest = deepest.max(d);
+                    light += d;
+                }
+            }
+            if deepest > 0.12 {
+                cells += 1;
+            }
+        }
+        // The band's last pixel row at its deepest over the two cells
+        // behind the one before the caret.
+        let last_row = (head - 3 * cw..head - cw)
+            .map(|x| crate::color_math::oklab_distance(glass.px[(bottom - 1) * glass.w + x], page))
+            .fold(0.0f32, f32::max);
+        (cells, light, last_row)
+    };
+    for theme in [(BG, FG), (0x0000_2B36, 0x0083_9496)] {
+        let page = theme.0;
+        let (cells, light, last_row) = lay(theme, false);
+        assert!(
+            cells >= 3 && last_row >= 0.3,
+            "on {page:06x} the tail lights {cells} cells of its band, its last pixel row {last_row:.2}"
+        );
+        let (_, faint_light, faint_last_row) = lay(theme, true);
+        assert!(
+            light >= 1.4 * faint_light && faint_last_row < 0.1,
+            "control: on {page:06x} round 1's tail laid {faint_light:.1} of the whole's {light:.1}, \
+             its last pixel row {faint_last_row:.2}"
+        );
+    }
+}
+
+/// What [`lay_row_rail`] lights: (lit pixels, summed OKLab distance off the
+/// page) in the foot band behind the caret, in the cell before it, under the
+/// `q`, in the fill below, and in the three pixel rows over the band behind
+/// the caret, where the letters' feet stand.
+struct RowRailLit {
+    behind: (usize, f32),
+    before: (usize, f32),
+    under_q: (usize, f32),
+    below: (usize, f32),
+    over_band: (usize, f32),
+}
+
+/// [`LINE`] typed in `style` on `(page, ink)` over a selection's fill
+/// (`context`), its rail in its own row's foot band when `rails`
+/// ([`CursorGlow::set_bed_row_rails`]), a swollen one lifted over the band
+/// when `lifts` ([`CursorGlow::set_bed_row_rail_swell_lifts`]): what its last
+/// frame's under stream lights.
+fn lay_row_rail(style: GlowStyle, (page, ink): (u32, u32), rails: bool, lifts: bool) -> RowRailLit {
+    use crate::cursor_fx::{GlowKnobs, GlowSpelling, resolve_glow_config};
+    const FILL: u32 = 0x0026_4F78;
+    let g = tall_geom();
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let (cw, ch) = (g.cw, g.ch);
+    let foot = (crate::rainbow_kitty::ribbon::ROW_RAIL_CH * ch as f32) as usize;
+    let q = usize::from(START) + LINE.find('q').expect("the line has a q");
+    {
+        let c = resolve_glow_config(
+            GlowKnobs {
+                enabled: true,
+                color: None,
+                accent: None,
+                duration_ms: 260,
+                length: 24,
+                intensity: crate::cursor_fx::default_trail_intensity(Some(style), false),
+                radius: 0.6,
+                ring: true,
+            },
+            GlowSpelling {
+                style: Some(style),
+                beam: true,
+                ribbon_tall: true,
+                ribbon_flat: false,
+                classic_mono: style == GlowStyle::Classic,
+            },
+            CURSOR,
+            true,
+            ink,
+            page,
+            0.5,
+        );
+        let mut glow = CursorGlow::default();
+        glow.set_bed_row_rails(rails);
+        glow.set_bed_row_rail_swell_lifts(lifts);
+        let mut out = Vec::new();
+        let mut text = vec![' '; g.cols];
+        let mut t = Instant::now();
+        let mut glass = Glass::new(g, page);
+        let mut caret = (ROW, START);
+        for (k, letter) in std::iter::once(' ').chain(LINE.chars()).enumerate() {
+            if k > 0 {
+                t += Duration::from_millis(60);
+                text[START as usize + k - 1] = letter;
+                glow.note_synthetic_typed(t, 1);
+            }
+            caret = (ROW, START + k as u16);
+            let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+            for (r, line) in rows.iter_mut().enumerate() {
+                for (col, cell) in line.iter_mut().enumerate() {
+                    let ground = if r == usize::from(ROW + 1) {
+                        FILL
+                    } else {
+                        page
+                    };
+                    (cell.fg, cell.bg) = (rgb(ink), rgb(ground));
+                    if r == usize::from(ROW) {
+                        cell.ch = text[col];
+                    }
+                }
+            }
+            glow.observe_row(caret.0, caret.1, &text, t);
+            glow.observe_frame_text(Some(caret), &rows, t);
+            glow.tick(Some(caret), t, &c, g, &mut out);
+            glass = Glass::new(g, page);
+            glass.add_quads(glow.under_quads());
+        }
+        let bottom = usize::from(ROW + 1) * ch;
+        let lit = |ys: std::ops::Range<usize>, xs: std::ops::Range<usize>, ground: u32| {
+            let mut n = 0usize;
+            let mut sum = 0.0f32;
+            for y in ys {
+                for x in xs.clone() {
+                    let px = glass.px[y * glass.w + x];
+                    let d = crate::color_math::oklab_distance(px, ground);
+                    if d > 0.03 {
+                        n += 1;
+                    }
+                    sum += d;
+                }
+            }
+            (n, sum)
+        };
+        let band = bottom - foot..bottom;
+        let head = usize::from(caret.1) * cw;
+        RowRailLit {
+            behind: lit(band.clone(), usize::from(START) * cw..head - cw, page),
+            before: lit(band.clone(), head - cw..head, page),
+            under_q: lit(band.clone(), q * cw..(q + 1) * cw, page),
+            below: lit(bottom..bottom + ch, usize::from(START) * cw..head, page),
+            over_band: lit(
+                band.start - 3..band.start,
+                usize::from(START) * cw..head,
+                page,
+            ),
+        }
+    }
+}
+
+/// looks10 L2, A TAIL WITH NO AIR BELOW LIES IN ITS OWN ROW: in the trail
+/// gallery's `context` (a selection's fill under the typed line, a powerline
+/// bar over it) Comet's icy tail and Sparkle's gold rail found no air to lie
+/// in and drew nothing behind the caret but its glow. Over a row below that
+/// is no air, the rail lies in the typed row's own foot band
+/// ([`crate::cursor_glow::bed::BedShape::row_rail`]); on Solarized Dark, whose
+/// letters take no light, so does the rail of Beam, Lumen and Water (drawing
+/// only their caret there), of Phaser (a faint wash) and of Classic's one
+/// colour face (classic pink, its caret alone; looks10 round 2):
+/// typing the line on the reference dark and on Solarized Dark over a selection's fill, its last
+/// frame lights that band under the letters behind the caret and into the
+/// cell before it, keeps it dark under the `q`'s tail, and lays nothing in
+/// the fill below. Negative control: kept out of its row
+/// ([`CursorGlow::set_bed_row_rails`]), the rail lies at the leading's depth in
+/// the fill, as looks9 laid it, and Comet's foot band stays dark.
+#[test]
+fn a_tail_with_no_air_below_lies_in_its_own_row() {
+    let cw = tall_geom().cw;
+    const SOLARIZED: (u32, u32) = (0x0000_2B36, 0x0083_9496);
+    let cases = [
+        GlowStyle::Comet,
+        GlowStyle::Sparkle,
+        GlowStyle::Phaser,
+        GlowStyle::Classic,
+    ]
+    .into_iter()
+    .flat_map(|style| [(style, (BG, FG)), (style, SOLARIZED)])
+    .chain(
+        [GlowStyle::Beam, GlowStyle::Lumen, GlowStyle::Water]
+            .into_iter()
+            .map(|style| (style, SOLARIZED)),
+    );
+    for (style, theme) in cases {
+        {
+            let RowRailLit {
+                behind,
+                before,
+                under_q,
+                below,
+                ..
+            } = lay_row_rail(style, theme, true, false);
+            let page = theme.0;
+            // Water's rail is foam, broken over its swell's troughs: the cell
+            // before the caret holds a piece of it, not a whole cell's run.
+            let reaches = if style == GlowStyle::Water {
+                before.0 > 0
+            } else {
+                before.0 >= cw
+            };
+            assert!(
+                reaches && behind.0 + before.0 >= 3 * cw,
+                "{style:?} on {page:06x}: the foot band behind the caret lights {behind:?} px, \
+                 {before:?} in the cell before it"
+            );
+            assert_eq!(
+                under_q.0, 0,
+                "{style:?} on {page:06x}: the rail runs under the q's tail"
+            );
+            assert!(
+                below.1 < 0.5,
+                "{style:?} on {page:06x}: the rail spills into the fill below ({below:?})"
+            );
+            let RowRailLit {
+                behind: off_behind,
+                before: off_before,
+                below: off_below,
+                ..
+            } = lay_row_rail(style, theme, false, false);
+            assert!(
+                off_below.0 >= 3 * cw,
+                "control: {style:?} on {page:06x} kept out of its row lays its rail in the fill \
+                 ({off_below:?})"
+            );
+            if style == GlowStyle::Comet {
+                assert!(
+                    off_behind.0 + off_before.0 < cw,
+                    "control: Comet on {page:06x} kept out of its row lights its foot band \
+                     ({off_behind:?}, {off_before:?})"
+                );
+            }
+        }
+    }
+}
+
+/// looks10 round 2, A RAIL IN ITS ROW KEEPS UNDER THE LETTERS: a rail laid in
+/// its own row's foot band ([`crate::cursor_glow::bed::BedShape::row_rail`])
+/// keeps to the band, Water's swollen foam included (its crests at the band's
+/// top, the rail thinned by its swell's fall): over the three pixel rows over
+/// the band, where the letters' feet stand, it lights no more than the same
+/// line typed with its rail kept out of its row
+/// ([`CursorGlow::set_bed_row_rails`]), on Solarized Dark or the reference
+/// dark. Negative control: lifted over the band by its swell's fall
+/// ([`CursorGlow::set_bed_row_rail_swell_lifts`]), Water's crests lay on the
+/// letters' feet (in the round's gallery the `o` of `fox` read 1.39:1
+/// against its own 4.28 in `context`).
+#[test]
+fn a_rail_in_its_row_keeps_under_the_letters() {
+    const SOLARIZED: (u32, u32) = (0x0000_2B36, 0x0083_9496);
+    let over_its_band = |style: GlowStyle, theme: (u32, u32), lifts: bool| {
+        let laid = lay_row_rail(style, theme, true, lifts);
+        let kept_out = lay_row_rail(style, theme, false, false);
+        (
+            laid.over_band.0.saturating_sub(kept_out.over_band.0),
+            laid.over_band.1 - kept_out.over_band.1,
+        )
+    };
+    for style in [
+        GlowStyle::Comet,
+        GlowStyle::Sparkle,
+        GlowStyle::Phaser,
+        GlowStyle::Classic,
+        GlowStyle::Beam,
+        GlowStyle::Lumen,
+        GlowStyle::Water,
+    ] {
+        for theme in [(BG, FG), SOLARIZED] {
+            let (px, light) = over_its_band(style, theme, false);
+            assert!(
+                px == 0 && light < 0.05,
+                "{style:?} on {:06x}: its rail lights {px} px ({light:.2}) over its foot band, \
+                 at the letters' feet",
+                theme.0
+            );
+        }
+    }
+    let (px, _) = over_its_band(GlowStyle::Water, SOLARIZED, true);
+    assert!(
+        px >= 20,
+        "control: Water's foam lifted over its band lights only {px} px more at the letters' feet"
+    );
 }
 
 /// looks7 round 3, LUMEN KEEPS A GREY CURSOR GREY: Lumen's light is the cursor's, and its bed
@@ -2248,9 +2630,16 @@ fn a_chosen_colour_keeps_its_chroma_in_the_bed() {
                 glow.note_synthetic_typed(t, 1);
             }
             let caret = (ROW, START + k as u16);
+            // Every row on the page's ground: the row below is air, where the
+            // rail lies ([`BedShape::row_rail`]).
             let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+            for line in &mut rows {
+                for cell in line.iter_mut() {
+                    (cell.fg, cell.bg) = (rgb(TEXT), rgb(PAGE));
+                }
+            }
             for (col, cell) in rows[usize::from(ROW)].iter_mut().enumerate() {
-                (cell.fg, cell.bg, cell.ch) = (rgb(TEXT), rgb(PAGE), text[col]);
+                cell.ch = text[col];
             }
             glow.observe_row(caret.0, caret.1, &text, t);
             glow.observe_frame_text(Some(caret), &rows, t);

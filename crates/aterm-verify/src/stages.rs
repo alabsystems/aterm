@@ -282,9 +282,6 @@ pub fn tippy_gated_args(scope: &Scope, gated: &[(String, String)]) -> Option<Vec
     Some(a)
 }
 
-/// The `census` check's walks, by their `aterm_census::CENSUSES` names: the five L0 censuses (main-loop reach, lock order, wasm reach, scope cardinality, lazy-init reentrancy) and the source guards, so the `dev` set runs each walk once.
-pub const CENSUS_WALKS: [&str; 6] = ["mainloop", "locks", "wasm", "scope", "lazy-init", "guards"];
-
 /// The package of the one shipped executable, which `ship` builds `--release`.
 pub const SHIPPED: &str = "aterm";
 
@@ -1202,20 +1199,12 @@ fn in_checkout(ctx: &Ctx, r: &mut Report, what: &str) -> bool {
     here
 }
 
-fn walks(ctx: &Ctx, r: &mut Report, check: &str, names: &[&str]) {
+/// Every walk of [`aterm_census::CENSUSES`], each once.
+fn walks(ctx: &Ctx, r: &mut Report, check: &str) {
     if !in_checkout(ctx, r, check) {
         return;
     }
-    let selected: Vec<&aterm_census::Census> = aterm_census::CENSUSES
-        .iter()
-        .filter(|c| names.contains(&c.name))
-        .collect();
-    for gone in names
-        .iter()
-        .filter(|n| !selected.iter().any(|c| c.name == **n))
-    {
-        r.cannot_run(format!("{check} — aterm-census has no walk named `{gone}`"));
-    }
+    let selected: Vec<&aterm_census::Census> = aterm_census::CENSUSES.iter().collect();
     let root = ctx.root.clone();
     let outcomes = match exec::bounded(ctx.child_ceiling, move || {
         aterm_census::run_censuses(&root, &selected)
@@ -1341,7 +1330,7 @@ fn libc_oracle(ctx: &Ctx, r: &mut Report) {
 }
 
 fn census(ctx: &Ctx, r: &mut Report) {
-    walks(ctx, r, "census", &CENSUS_WALKS);
+    walks(ctx, r, "census");
 }
 
 /// `targo --unverified run --profile test -q -p aterm-models --bin spec-check`, in the main target once the test compile is done ([`MAIN_PROFILE`]; the bin links every domain's models through `aterm_models::link_all`); under `release` with `-- --full`, which adds the minutes-class `ay` row.
@@ -2184,6 +2173,7 @@ mod tests {
             lane: crate::plan::Lane::MainTarget,
             exclusive: false,
             after_stages: Vec::new(),
+            mem: 0,
         };
         let tmp = crate::mktemp_dir("atv-doc-scope").expect("mktemp");
         let documented = tmp.join("crates/documented");
@@ -2645,6 +2635,7 @@ mod tests {
                     lane: crate::plan::Lane::MainTarget,
                     exclusive: false,
                     after_stages: Vec::new(),
+                    mem: 0,
                 },
             );
             let outcomes: Vec<_> = r.outcomes().collect();

@@ -188,6 +188,8 @@ pub(super) struct TransientState {
     pub(super) kitty_commands: u64,
     /// Monotonic count of Kitty unscrolls (`CSI n + T`) run on the main screen, where they pull history onto it; never reset.
     pub(super) kitty_unscrolls: u64,
+    /// Monotonic count of live host query answers (`OSC 52 ; ?` clipboard reads and `WindowCallback` responses) that pure replay cannot reproduce; never reset.
+    pub(super) host_io_ordinal: u64,
 }
 
 impl TransientState {
@@ -262,6 +264,7 @@ impl TransientState {
             print_anchor_seq: 0,
             kitty_commands: 0,
             kitty_unscrolls: 0,
+            host_io_ordinal: 0,
         }
     }
 
@@ -502,7 +505,7 @@ pub(super) enum KittyPlayState {
 }
 
 /// One re-laid-out copy of a Kitty image (see `TransientState::kitty_variants`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct KittyVariant {
     /// The image (frame) it was cut from: a variant is reused only for the same source and layout.
     pub(super) source: Arc<ImageData>,

@@ -194,9 +194,9 @@ impl Insets {
     }
 
     fn is_valid(self) -> bool {
-        [self.top, self.right, self.bottom, self.left]
-            .into_iter()
-            .all(|v| v.is_finite() && v >= 0.0)
+        // Spelled out: every node's layout asks this, and an iterator costs a debug build more.
+        let side = |v: f32| v.is_finite() && v >= 0.0;
+        side(self.top) && side(self.right) && side(self.bottom) && side(self.left)
     }
 }
 
@@ -1464,6 +1464,9 @@ pub(crate) struct TextViewportSpec {
     pub(crate) document_key: String,
     pub(crate) selectable: bool,
     pub(crate) projection: Option<crate::native_editor::EditorViewportProjection>,
+    /// A table's grid face, drawn in place of `projection` (which is then `None`); boxed, as
+    /// the face most viewports never draw.
+    pub(crate) grid: Option<Box<crate::native_editor::GridProjection>>,
     pub(crate) preedit: String,
     pub(crate) preedit_caret: Option<usize>,
     pub(crate) status: Option<String>,
@@ -2002,6 +2005,9 @@ pub(crate) struct EditorToolbar {
     pub(crate) problem_navigation: bool,
     pub(crate) reload: bool,
     pub(crate) edit_header: bool,
+    /// A table's view chip: `Some(true)` while it shows the grid (the chip offers the text),
+    /// `Some(false)` while it shows the text, `None` for a file that is not a table.
+    pub(crate) grid: Option<bool>,
 }
 
 /// One button of the editor's toolbar.
@@ -2038,6 +2044,28 @@ pub(crate) fn editor_toolbar_items(toolbar: EditorToolbar) -> Vec<EditorToolbarI
             item("editor/commands-button", "Commands", "Commands", None)
         },
     ];
+    match toolbar.grid {
+        Some(true) => {
+            items.push(item("editor/grid-toggle-button", "Text view", "Text", None));
+            // The row buttons keep their words (a shorter face would not be a word of the
+            // name, which Label in Name asks) and give way after Find when the bar is narrow:
+            // C-o and C-S-Backspace still reach them.
+            items.push(item(
+                "editor/grid-insert-row-button",
+                "Add Row",
+                "Add Row",
+                Some(3),
+            ));
+            items.push(item(
+                "editor/grid-delete-row-button",
+                "Delete Row",
+                "Delete Row",
+                Some(4),
+            ));
+        }
+        Some(false) => items.push(item("editor/grid-toggle-button", "Grid view", "Grid", None)),
+        None => {}
+    }
     if toolbar.problem_navigation {
         items.push(item(
             "editor/config-problem-previous-button",
@@ -2838,13 +2866,16 @@ impl UiNode {
 
     /// [`Self::paint_only`] for this node and everything under it.
     pub(crate) fn paint_only_tree(mut self) -> Self {
-        self.paint_only = true;
-        self.children = self
-            .children
-            .into_iter()
-            .map(Self::paint_only_tree)
-            .collect();
+        self.mark_paint_only();
         self
+    }
+
+    /// [`Self::paint_only_tree`] in place: marked where they lie, so no child moves.
+    fn mark_paint_only(&mut self) {
+        self.paint_only = true;
+        for child in &mut self.children {
+            child.mark_paint_only();
+        }
     }
 
     /// Make this clipped column a scrolling list whose room is the first `height` of it.
@@ -2978,6 +3009,15 @@ impl UiTree {
             node.children.iter().find_map(find_default)
         }
         let default_action = find_default(&self.root);
+        // Paint, semantics and keys seen hold about one entry per node: sized once, not regrown.
+        fn count(node: &UiNode) -> usize {
+            1 + node.children.iter().map(count).sum::<usize>()
+        }
+        let nodes = count(&self.root);
+        compiler.seen.reserve(nodes);
+        let output = &mut compiler.output;
+        output.paint.reserve(nodes);
+        output.semantics.reserve(nodes);
         compiler.node(self.root, viewport, viewport, None, None)?;
         compiler.output.default_action = default_action;
         Ok(compiler.output)
@@ -3468,10 +3508,48 @@ fn cuts_own_words(key: &UiKey, content: &UiContent, rect: LogicalRect, edges: Cu
     dropped.iter().any(|dropped| *dropped)
 }
 
-/// The band, from its top, that the words and icons of control `content` laid out `height` tall
-/// paint in: an edge of a list that crosses it draws the control as a picture only
-/// ([`cuts_own_words`]).
-pub(crate) fn words_band(key: &UiKey, content: &UiContent, height: f32) -> Option<(f32, f32)> {
+/// How many of a control's words' and icons' bands [`WordBands`] keeps apart.
+const WORD_BANDS: usize = 4;
+
+/// THE BANDS A CONTROL'S WORDS AND ICONS PAINT IN, from its top, apart as [`cut_marks`] drops them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct WordBands {
+    bands: [(f32, f32); WORD_BANDS],
+    len: usize,
+}
+
+impl WordBands {
+    fn of(bands: impl Iterator<Item = (f32, f32)>) -> Option<Self> {
+        let mut sorted: Vec<(f32, f32)> = bands.collect();
+        sorted.sort_by(|one, other| one.0.total_cmp(&other.0));
+        let mut out = Self {
+            bands: [(0.0, 0.0); WORD_BANDS],
+            len: 0,
+        };
+        for (top, bottom) in sorted {
+            match out.len {
+                0 => {}
+                len if top <= out.bands[len - 1].1 + CLIP_EDGE_EPSILON || len == WORD_BANDS => {
+                    let last = &mut out.bands[len - 1];
+                    last.1 = last.1.max(bottom);
+                    continue;
+                }
+                _ => {}
+            }
+            out.bands[out.len] = (top, bottom);
+            out.len += 1;
+        }
+        (out.len > 0).then_some(out)
+    }
+
+    /// Each band, from the control's top.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (f32, f32)> + '_ {
+        self.bands[..self.len].iter().copied()
+    }
+}
+
+/// The bands from the top that `key`'s words and icons paint in, laid out `height` tall.
+pub(crate) fn words_bands(key: &UiKey, content: &UiContent, height: f32) -> Option<WordBands> {
     let theme = aterm_render::Theme::default();
     let roles = crate::settings::Roles::from_theme(theme);
     let rect = LogicalRect::new(0.0, 0.0, 4096.0, height);
@@ -3500,9 +3578,7 @@ pub(crate) fn words_band(key: &UiKey, content: &UiContent, height: f32) -> Optio
             .reduce(|one, other| one.union(other))
             .map(|ink| (ink.y, ink.bottom()))
     });
-    words
-        .chain(inks)
-        .reduce(|(top, bottom), (from, to)| (top.min(from), bottom.max(to)))
+    WordBands::of(words.chain(inks))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3726,6 +3802,26 @@ impl CompiledUi {
                 let geometry = spec.geometry(node.rect);
                 if spec.minibuffer_caret.is_some() {
                     return editor_minibuffer_caret_rect(spec, node.rect, &geometry)?
+                        .intersect(node.clip)?
+                        .intersect(self.bounds);
+                }
+                // A grid composes at its open cell editor's caret, in the panel.
+                if let Some(grid) = spec.grid.as_ref() {
+                    let (line, column) = grid.panel.caret?;
+                    let (_, panel_slot) = editor_grid_slots(&geometry, grid);
+                    let caret = LogicalRect::new(
+                        geometry.text_x + column as f32 * geometry.cell_w,
+                        geometry.body_y + (panel_slot + 1 + line) as f32 * geometry.line_h + 2.0,
+                        1.0,
+                        geometry.line_h - 4.0,
+                    );
+                    return editor_composition_caret_rect(caret, spec)
+                        .intersect(LogicalRect::new(
+                            node.rect.x,
+                            geometry.body_y,
+                            node.rect.width,
+                            geometry.body_h,
+                        ))?
                         .intersect(node.clip)?
                         .intersect(self.bounds);
                 }
@@ -4428,22 +4524,44 @@ fn hash_semantic_node<H: std::hash::Hasher>(node: &SemanticNode, hash: &mut H) {
 fn hash_text_viewport<H: std::hash::Hasher>(spec: &TextViewportSpec, hash: &mut H) {
     use std::hash::Hash;
 
-    spec.label.hash(hash);
-    spec.document_key.hash(hash);
-    spec.selectable.hash(hash);
-    spec.preedit.hash(hash);
-    spec.preedit_caret.hash(hash);
-    spec.status.hash(hash);
-    spec.semantic_status.hash(hash);
-    spec.minibuffer.hash(hash);
-    spec.minibuffer_caret.hash(hash);
-    spec.cursor_label.hash(hash);
-    spec.dirty.hash(hash);
-    spec.saving.hash(hash);
-    spec.focused.hash(hash);
-    spec.focus_visible.hash(hash);
-    spec.action.hash(hash);
-    let Some(projection) = spec.projection.as_ref() else {
+    // Every field, named: a field added to the spec and left out here fails to compile rather
+    // than leaving a stale frame on screen.
+    let TextViewportSpec {
+        label,
+        document_key,
+        selectable,
+        projection,
+        grid,
+        preedit,
+        preedit_caret,
+        status,
+        semantic_status,
+        minibuffer,
+        minibuffer_caret,
+        cursor_label,
+        dirty,
+        saving,
+        focused,
+        focus_visible,
+        action,
+    } = spec;
+    label.hash(hash);
+    document_key.hash(hash);
+    selectable.hash(hash);
+    preedit.hash(hash);
+    preedit_caret.hash(hash);
+    status.hash(hash);
+    semantic_status.hash(hash);
+    minibuffer.hash(hash);
+    minibuffer_caret.hash(hash);
+    cursor_label.hash(hash);
+    dirty.hash(hash);
+    saving.hash(hash);
+    focused.hash(hash);
+    focus_visible.hash(hash);
+    action.hash(hash);
+    grid.hash(hash);
+    let Some(projection) = projection.as_ref() else {
         0_u8.hash(hash);
         return;
     };
@@ -7532,7 +7650,7 @@ fn paint_text_viewport(
     prims.push(text_prim(
         header.badge_x,
         header_baseline,
-        "EDIT".to_string(),
+        if spec.grid.is_some() { "GRID" } else { "EDIT" }.to_string(),
         caption,
         TextWeight::Bold,
         TextFace::UiBold,
@@ -7576,6 +7694,9 @@ fn paint_text_viewport(
         w: rect.width,
         h: body_h,
     });
+    if let Some(grid) = spec.grid.as_ref() {
+        paint_editor_grid(prims, rect, &geometry, grid, spec, roles);
+    }
     if let Some(projection) = spec.projection.as_ref() {
         let visible = whole_editor_rows(&geometry).min(projection.lines.len());
         for (row, line) in projection.lines.iter().take(visible).enumerate() {
@@ -7764,6 +7885,438 @@ fn paint_text_viewport(
             width: 1.0,
             color: rgba(roles.accent, 210),
         });
+    }
+}
+
+/// The grid slot (body row) of each part of a grid face in `geometry`: the pinned header is
+/// slot 0, the data rows follow, then the panel's label and its lines.
+fn editor_grid_slots(
+    geometry: &TextViewportGeometry,
+    grid: &crate::native_editor::GridProjection,
+) -> (usize, usize) {
+    let rows = whole_editor_rows(geometry);
+    let data = grid
+        .rows_layout
+        .data
+        .min(grid.rows.len())
+        .min(rows.saturating_sub(1));
+    (data, 1 + grid.rows_layout.data.min(rows.saturating_sub(1)))
+}
+
+/// What a press on a grid face lands on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GridHit {
+    /// A cell: its record and column.
+    Cell(usize, usize),
+    /// A `◂` (-1) or `▸` (+1) mark: scroll the columns one that way.
+    Scroll(i32),
+    /// A line of the cell panel: the byte of the value it shows nearest the press
+    /// ([`crate::native_editor::GridProjection::panel_byte`]).
+    Panel(usize),
+}
+
+/// Where a grid face in `rect` draws its `◂` and `▸` marks, as each one's left edge, when it
+/// draws them: `◂` in the padding cell of the first scrolled column after a pinned first column,
+/// else just left of the grid; `▸` at the right edge.
+fn editor_grid_marks(
+    rect: LogicalRect,
+    geometry: &TextViewportGeometry,
+    grid: &crate::native_editor::GridProjection,
+) -> (Option<f32>, Option<f32>) {
+    let left = grid
+        .hidden_left
+        .then(|| match grid.shown.get(1).filter(|_| grid.pinned) {
+            Some(first) => geometry.text_x + first.x as f32 * geometry.cell_w,
+            None => geometry.text_x - geometry.cell_w,
+        });
+    let right = grid
+        .hidden_right
+        .then(|| (rect.right() - geometry.cell_w - 2.0).max(geometry.text_x));
+    (left, right)
+}
+
+/// What a press at logical point `x`, `y` of a viewport in `rect` that draws a grid lands on: a
+/// `◂`/`▸` mark on the header row (a cell and a half either side of it), a line of the cell
+/// panel, else a cell.
+pub(crate) fn editor_grid_hit(
+    spec: &TextViewportSpec,
+    rect: LogicalRect,
+    x: f32,
+    y: f32,
+) -> Option<GridHit> {
+    let grid = spec.grid.as_ref()?;
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    let geometry = spec.geometry(rect);
+    if y >= geometry.body_y && y < geometry.body_y + geometry.line_h {
+        let (left, right) = editor_grid_marks(rect, &geometry, grid);
+        let near =
+            |mark: f32| x >= mark - geometry.cell_w * 0.5 && x < mark + geometry.cell_w * 1.5;
+        if left.is_some_and(near) {
+            return Some(GridHit::Scroll(-1));
+        }
+        if right.is_some_and(near) {
+            return Some(GridHit::Scroll(1));
+        }
+    }
+    if let Some(byte) = editor_grid_panel_byte_at(spec, rect, x, y) {
+        return Some(GridHit::Panel(byte));
+    }
+    editor_grid_cell_at(spec, rect, x, y).map(|(record, column)| GridHit::Cell(record, column))
+}
+
+/// The byte of the value a grid's cell panel shows nearest logical point `x`, `y` of a viewport
+/// in `rect`, when the point is on one of the panel's shown lines: the line under it, and the
+/// character boundary nearest it across (the offset goes over in half cells, rounded once, so
+/// the near half of a wide character lands before it).
+pub(crate) fn editor_grid_panel_byte_at(
+    spec: &TextViewportSpec,
+    rect: LogicalRect,
+    x: f32,
+    y: f32,
+) -> Option<usize> {
+    let grid = spec.grid.as_ref()?;
+    if !x.is_finite() || !y.is_finite() || x < rect.x || x >= rect.right() {
+        return None;
+    }
+    let geometry = spec.geometry(rect);
+    if y < geometry.body_y || y >= geometry.body_y + geometry.body_h {
+        return None;
+    }
+    let (_, panel_slot) = editor_grid_slots(&geometry, grid);
+    let slot = ((y - geometry.body_y) / geometry.line_h).floor() as usize;
+    let line = slot.checked_sub(panel_slot + 1)?;
+    let half_cells = ((x - geometry.text_x) / geometry.cell_w * 2.0)
+        .floor()
+        .max(0.0) as usize;
+    grid.panel_byte(line, half_cells)
+}
+
+/// The grid cell under logical point `x`, `y` of a viewport in `rect` that draws a grid, as its
+/// record and column.
+pub(crate) fn editor_grid_cell_at(
+    spec: &TextViewportSpec,
+    rect: LogicalRect,
+    x: f32,
+    y: f32,
+) -> Option<(usize, usize)> {
+    let grid = spec.grid.as_ref()?;
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    let geometry = spec.geometry(rect);
+    if x < geometry.text_x
+        || x >= rect.right()
+        || y < geometry.body_y
+        || y >= geometry.body_y + geometry.body_h
+    {
+        return None;
+    }
+    let slot = ((y - geometry.body_y) / geometry.line_h).floor() as usize;
+    let (data, _) = editor_grid_slots(&geometry, grid);
+    let record = match slot {
+        0 => grid.header.record,
+        slot if slot <= data => grid.rows.get(slot - 1)?.record,
+        _ => return None,
+    };
+    let cells = ((x - geometry.text_x) / geometry.cell_w).floor() as usize;
+    let column = grid
+        .shown
+        .iter()
+        .find(|shown| cells >= shown.x && cells < shown.x + shown.width + 2)?
+        .index;
+    Some((record, column))
+}
+
+/// What a screen reader hears for a grid's current cell: its row, its header and its value.
+pub(crate) fn editor_grid_cell_words(grid: &crate::native_editor::GridProjection) -> String {
+    let cursor = &grid.cursor;
+    let header = amacs::table::first_line(&cursor.header);
+    let column = if header.trim().is_empty() || cursor.record == 0 {
+        format!("column {}", cursor.column + 1)
+    } else {
+        header.to_string()
+    };
+    let value = if cursor.missing {
+        "no cell".to_string()
+    } else if cursor.value.is_empty() {
+        "empty".to_string()
+    } else {
+        cursor.value.clone()
+    };
+    format!("Row {}, {column}: {value}", cursor.record + 1)
+}
+
+/// Paint a table's grid face in the body of a viewport: the pinned header band, the rows with
+/// their numbers, the cursor cell, dim missing cells, the column rules, and the panel that shows
+/// (and edits) the current cell in full.
+fn paint_editor_grid(
+    prims: &mut Vec<crate::widget::DrawPrim>,
+    rect: LogicalRect,
+    geometry: &TextViewportGeometry,
+    grid: &crate::native_editor::GridProjection,
+    spec: &TextViewportSpec,
+    roles: crate::settings::Roles,
+) {
+    use crate::tray_raster::row_baseline;
+    use crate::type_scale::TypeStep;
+    use crate::widget::{DrawPrim, TextFace, TextWeight, rgba, text_prim};
+
+    let caption = native_type_px(TypeStep::Caption);
+    let secondary = native_type_px(TypeStep::Secondary);
+    let line_h = geometry.line_h;
+    let cell_w = geometry.cell_w;
+    let text_x = geometry.text_x;
+    let body_left = rect.x + geometry.gutter_w + 1.0;
+    let body_w = (rect.right() - body_left).max(0.0);
+    let row_y = |slot: usize| geometry.body_y + slot as f32 * line_h;
+    let cell_x = |cells: usize| text_x + cells as f32 * cell_w;
+    let (data, panel_slot) = editor_grid_slots(geometry, grid);
+    let number_color = rgba(mix_rgb(roles.text_tertiary, roles.text_secondary, 0.5), 255);
+
+    prims.push(DrawPrim::Panel {
+        x: body_left,
+        y: row_y(0),
+        w: body_w,
+        h: line_h,
+        radius: 0.0,
+        fill: rgba(mix_rgb(roles.surface, roles.elevated, 0.8), 255),
+    });
+    let cursor_slot = if grid.cursor.record == grid.header.record {
+        Some(0)
+    } else {
+        grid.rows
+            .iter()
+            .take(data)
+            .position(|row| row.record == grid.cursor.record)
+            .map(|index| index + 1)
+    };
+    if let Some(slot) = cursor_slot.filter(|slot| *slot > 0) {
+        prims.push(DrawPrim::Panel {
+            x: body_left,
+            y: row_y(slot),
+            w: body_w,
+            h: line_h,
+            radius: 0.0,
+            fill: rgba(roles.accent, 18),
+        });
+    }
+    let rows = std::iter::once((0, &grid.header)).chain(
+        grid.rows
+            .iter()
+            .take(data)
+            .enumerate()
+            .map(|(index, row)| (index + 1, row)),
+    );
+    for (slot, row) in rows {
+        let y = row_y(slot);
+        let number = (row.record + 1).to_string();
+        let number_w = number.len() as f32 * cell_w;
+        prims.push(text_prim(
+            (rect.x + geometry.gutter_w - 10.0 - number_w).max(rect.x + 4.0),
+            row_baseline(y, line_h, caption.get()),
+            number,
+            caption,
+            TextWeight::Regular,
+            TextFace::Mono,
+            number_color,
+        ));
+        for (shown, cell) in grid.shown.iter().zip(&row.cells) {
+            let x = cell_x(shown.x);
+            let w = (shown.width + 2) as f32 * cell_w;
+            let current = cursor_slot == Some(slot) && shown.index == grid.cursor.column;
+            if current {
+                prims.push(DrawPrim::Panel {
+                    x,
+                    y: y + 1.0,
+                    w,
+                    h: line_h - 2.0,
+                    radius: 2.0,
+                    fill: rgba(roles.accent, 86),
+                });
+                if grid.panel.editing {
+                    prims.push(DrawPrim::Stroke {
+                        x,
+                        y: y + 1.0,
+                        w,
+                        h: line_h - 2.0,
+                        radius: 2.0,
+                        width: 1.5,
+                        color: rgba(roles.accent, 255),
+                    });
+                }
+            }
+            if cell.missing {
+                if !current {
+                    prims.push(DrawPrim::Panel {
+                        x: x + 1.0,
+                        y: y + 2.0,
+                        w: (w - 2.0).max(0.0),
+                        h: (line_h - 4.0).max(0.0),
+                        radius: 2.0,
+                        fill: rgba(mix_rgb(roles.surface, roles.text_tertiary, 0.12), 255),
+                    });
+                }
+                continue;
+            }
+            if cell.text.is_empty() {
+                continue;
+            }
+            prims.push(text_prim(
+                cell_x(shown.x + 1),
+                row_baseline(y, line_h, secondary.get()),
+                cell.text.clone(),
+                secondary,
+                if slot == 0 {
+                    TextWeight::Bold
+                } else {
+                    TextWeight::Regular
+                },
+                TextFace::Mono,
+                rgba(
+                    if slot == 0 {
+                        roles.text_secondary
+                    } else {
+                        roles.text_primary
+                    },
+                    255,
+                ),
+            ));
+        }
+    }
+    let rules_bottom = row_y(data + 1);
+    for (at, shown) in grid.shown.iter().enumerate() {
+        // The pinned first column's rule is firmer: the columns past it scroll.
+        let pinned = grid.pinned && at == 0;
+        prims.push(DrawPrim::Stroke {
+            x: cell_x(shown.x + shown.width + 2) - 0.5,
+            y: row_y(0),
+            w: 1.0,
+            h: (rules_bottom - row_y(0)).max(0.0),
+            radius: 0.0,
+            width: if pinned { 2.0 } else { 1.0 },
+            color: rgba(roles.separator, if pinned { 230 } else { 110 }),
+        });
+    }
+    prims.push(DrawPrim::Stroke {
+        x: body_left,
+        y: row_y(1),
+        w: body_w,
+        h: 1.0,
+        radius: 0.0,
+        width: 1.0,
+        color: rgba(roles.separator, 150),
+    });
+    let (mark_left, mark_right) = editor_grid_marks(rect, geometry, grid);
+    for (x, mark) in [(mark_left, "◂"), (mark_right, "▸")] {
+        let Some(x) = x else {
+            continue;
+        };
+        prims.push(text_prim(
+            x,
+            row_baseline(row_y(0), line_h, secondary.get()),
+            mark.to_string(),
+            secondary,
+            TextWeight::Regular,
+            TextFace::Mono,
+            rgba(roles.accent, 255),
+        ));
+    }
+
+    let panel_y = row_y(panel_slot);
+    let body_bottom = geometry.body_y + geometry.body_h;
+    if panel_y >= body_bottom {
+        return;
+    }
+    prims.push(DrawPrim::Panel {
+        x: rect.x,
+        y: panel_y,
+        w: rect.width,
+        h: (body_bottom - panel_y).max(0.0),
+        radius: 0.0,
+        fill: rgba(mix_rgb(roles.surface, roles.elevated, 0.6), 255),
+    });
+    prims.push(DrawPrim::Stroke {
+        x: rect.x,
+        y: panel_y,
+        w: rect.width,
+        h: 1.0,
+        radius: 0.0,
+        width: 1.0,
+        color: rgba(roles.separator, 150),
+    });
+    let label = if grid.panel.editing {
+        format!("{} — editing", grid.panel.label)
+    } else if grid.panel.total_lines > grid.panel.lines.len() + grid.panel.first_line {
+        format!(
+            "{} — {} more lines",
+            grid.panel.label,
+            grid.panel.total_lines - grid.panel.lines.len() - grid.panel.first_line
+        )
+    } else {
+        grid.panel.label.clone()
+    };
+    prims.push(text_prim(
+        text_x,
+        row_baseline(panel_y, line_h, caption.get()),
+        label,
+        caption,
+        TextWeight::Bold,
+        TextFace::Ui,
+        rgba(readable_secondary(&roles), 255),
+    ));
+    for (index, line) in grid.panel.lines.iter().enumerate() {
+        let y = row_y(panel_slot + 1 + index);
+        if y >= body_bottom {
+            break;
+        }
+        prims.push(text_prim(
+            text_x,
+            row_baseline(y, line_h, secondary.get()),
+            line.clone(),
+            secondary,
+            TextWeight::Regular,
+            TextFace::Mono,
+            rgba(roles.text_primary, 255),
+        ));
+    }
+    if let Some((line, column)) = grid.panel.caret {
+        let y = row_y(panel_slot + 1 + line);
+        let x = cell_x(column);
+        prims.push(DrawPrim::Stroke {
+            x,
+            y: y + 2.0,
+            w: 1.0,
+            h: (line_h - 4.0).max(1.0),
+            radius: 0.0,
+            width: 1.0,
+            color: rgba(roles.accent, 255),
+        });
+        if !spec.preedit.is_empty() {
+            let preedit = spec.preedit.replace(['\r', '\n'], "↵");
+            let width = crate::native_editor::editor_display_column(&preedit, preedit.len(), 0)
+                .max(1) as f32
+                * cell_w;
+            prims.push(text_prim(
+                x + 2.0,
+                row_baseline(y, line_h, secondary.get()),
+                preedit,
+                secondary,
+                TextWeight::Regular,
+                TextFace::Mono,
+                rgba(roles.accent, 255),
+            ));
+            prims.push(DrawPrim::Stroke {
+                x: x + 2.0,
+                y: y + line_h - 2.0,
+                w: width.max(2.0),
+                h: 1.0,
+                radius: 0.0,
+                width: 1.0,
+                color: rgba(roles.accent, 255),
+            });
+        }
     }
 }
 
@@ -8599,7 +9152,14 @@ pub(crate) fn visible_label_in_name(visual: &str, name: &str) -> bool {
     // word's own) or after a `/`, joins the word again; a code identifier broken with no mark
     // (an aterm.toml key) joins as it is; and a label with both joins each break as the name
     // writes the two halves ([`joined_as_named`]).
-    if visual.contains('\n') {
+    if !visual.contains('\n') {
+        // A line with no letter or digit, or the uncut name, is in the name with no words built.
+        if !visual.chars().any(char::is_alphanumeric)
+            || (visual == name && !visual.contains(['.', '\u{2026}']))
+        {
+            return true;
+        }
+    } else {
         let joined = |hyphen: &str| {
             visual
                 .replace("-\n", hyphen)
@@ -10731,6 +11291,7 @@ pub(crate) mod tests {
                         },
                     ],
                 }),
+                grid: None,
                 preedit: "λ".to_string(),
                 preedit_caret: None,
                 status: Some("Saved".to_string()),
@@ -10771,6 +11332,7 @@ pub(crate) mod tests {
                     diagnostics: Vec::new(),
                 }],
             }),
+            grid: None,
             preedit: String::new(),
             preedit_caret: None,
             status: None,
@@ -10784,6 +11346,272 @@ pub(crate) mod tests {
             focus_visible: true,
             action: Some(ActionId::new("editor/focus-buffer")),
         }
+    }
+
+    /// A grid viewport of `text` (a `.csv`) laid out for `rect`, its cursor moved by `moves`
+    /// arrow keys (right, then down).
+    fn grid_viewport(text: &str, rect: LogicalRect, moves: (usize, usize)) -> TextViewportSpec {
+        use crate::native_editor::{EditorWorkspace, project_grid};
+        use aterm_types::keyboard::{Key, Modifiers, NamedKey};
+        let mut store = crate::test_document_store();
+        let document = store.open("file:///tmp/grid.csv".to_string(), text.to_string());
+        let mut workspace = EditorWorkspace::new();
+        let mut view = workspace
+            .attach(
+                &mut store,
+                document,
+                crate::document_store::DocumentViewId(1),
+            )
+            .unwrap();
+        workspace
+            .set_face(&store, &mut view, Some(amacs::table::Delimiter::Comma))
+            .unwrap();
+        let arrows = std::iter::repeat_n(NamedKey::ArrowRight, moves.0)
+            .chain(std::iter::repeat_n(NamedKey::ArrowDown, moves.1));
+        for arrow in arrows {
+            workspace
+                .handle_input(
+                    &mut store,
+                    &mut view,
+                    amacs::input::EditorInput::Key {
+                        key: Key::Named(arrow),
+                        mods: Modifiers::empty(),
+                        text: None,
+                    },
+                )
+                .unwrap();
+        }
+        let mut spec = one_line_viewport(0..0, 0, "");
+        spec.projection = None;
+        let geometry = spec.geometry(rect);
+        let rows = whole_editor_rows(&geometry);
+        let cells = ((rect.right() - geometry.text_x) / geometry.cell_w).floor() as usize;
+        let table = amacs::table::Table::scan(text, amacs::table::Delimiter::Comma).unwrap();
+        spec.grid = Some(Box::new(project_grid(text, &table, &view, rows, cells)));
+        spec
+    }
+
+    /// A press on a grid's `◂` or `▸` mark scrolls its columns that way; a press on a drawn header
+    /// cell away from them still lands on the cell (the review found the marks did nothing).
+    #[test]
+    fn a_press_on_a_grid_mark_scrolls_its_columns() {
+        let header = (1..=12)
+            .map(|n| format!("header {n:02}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let row = (1..=12)
+            .map(|n| format!("value {n:02}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let text = format!("{header}\n{row}\n");
+        let rect = LogicalRect::new(0.0, 0.0, 520.0, 360.0);
+        let spec = grid_viewport(&text, rect, (6, 1));
+        let grid = spec.grid.clone().unwrap();
+        assert!(
+            grid.pinned && grid.hidden_left && grid.hidden_right,
+            "{grid:?}"
+        );
+        let geometry = spec.geometry(rect);
+        let (left, right) = editor_grid_marks(rect, &geometry, &grid);
+        let header_y = geometry.body_y + geometry.line_h * 0.5;
+        let half = geometry.cell_w * 0.5;
+        assert_eq!(
+            editor_grid_hit(&spec, rect, left.unwrap() + half, header_y),
+            Some(GridHit::Scroll(-1))
+        );
+        assert_eq!(
+            editor_grid_hit(&spec, rect, right.unwrap() + half, header_y),
+            Some(GridHit::Scroll(1))
+        );
+        // The pinned column's header, and a cell on a data row under a mark, are cells.
+        let pinned_x = geometry.text_x + geometry.cell_w * 2.0;
+        assert_eq!(
+            editor_grid_hit(&spec, rect, pinned_x, header_y),
+            Some(GridHit::Cell(0, 0))
+        );
+        let first = &grid.shown[1];
+        let row_y = header_y + geometry.line_h;
+        assert_eq!(
+            editor_grid_hit(&spec, rect, left.unwrap() + half, row_y),
+            Some(GridHit::Cell(1, first.index))
+        );
+        // NEGATIVE CONTROL: a grid with nothing hidden has no marks to press.
+        let narrow = grid_viewport("a,b\n1,2\n", rect, (0, 0));
+        let narrow_grid = narrow.grid.clone().unwrap();
+        assert_eq!(
+            editor_grid_marks(rect, &narrow.geometry(rect), &narrow_grid),
+            (None, None)
+        );
+    }
+
+    /// G2: a press on a line of the cell panel lands on the value's boundary nearest it (the
+    /// second line's, for a press on the second line), and a press on the panel's label or the
+    /// grid's rows is not the panel's.
+    #[test]
+    fn a_press_in_the_grid_panel_lands_on_a_boundary_of_its_value() {
+        let text = "name,note\nm1,\"Two reasons: first\nthe phone prompt\"\n";
+        let rect = LogicalRect::new(0.0, 0.0, 520.0, 360.0);
+        let spec = grid_viewport(text, rect, (1, 1));
+        let grid = spec.grid.clone().unwrap();
+        assert_eq!(grid.panel_value(), "Two reasons: first\nthe phone prompt");
+        let geometry = spec.geometry(rect);
+        let (_, panel_slot) = editor_grid_slots(&geometry, &grid);
+        let line_y = |line: usize| {
+            geometry.body_y
+                + (panel_slot + 1 + line) as f32 * geometry.line_h
+                + geometry.line_h * 0.5
+        };
+        // Four cells and a little in: the boundary after "the ".
+        let x = geometry.text_x + geometry.cell_w * 4.2;
+        assert_eq!(
+            editor_grid_hit(&spec, rect, x, line_y(1)),
+            Some(GridHit::Panel(23))
+        );
+        assert_eq!(
+            editor_grid_hit(&spec, rect, x, line_y(0)),
+            Some(GridHit::Panel(4))
+        );
+        // Past the right half of a cell, the boundary after it.
+        let x = geometry.text_x + geometry.cell_w * 4.6;
+        assert_eq!(
+            editor_grid_hit(&spec, rect, x, line_y(0)),
+            Some(GridHit::Panel(5))
+        );
+        // NEGATIVE CONTROL: the panel's label row and the cursor's row are not the panel.
+        let label_y = geometry.body_y + panel_slot as f32 * geometry.line_h + 1.0;
+        assert!(!matches!(
+            editor_grid_hit(&spec, rect, x, label_y),
+            Some(GridHit::Panel(_))
+        ));
+        let row_y = geometry.body_y + geometry.line_h * 1.5;
+        assert!(matches!(
+            editor_grid_hit(&spec, rect, x, row_y),
+            Some(GridHit::Cell(1, _))
+        ));
+    }
+
+    /// G2 review: a press in the near half of a double-width character in the cell panel lands
+    /// before it, and one in its far half after it, the offset rounded once. *Control:* rounding
+    /// to a whole cell first put a press 0.7 cells in after `日` (byte 3) and one 2.6 cells in
+    /// after `本` (byte 6).
+    #[test]
+    fn a_press_in_the_grid_panel_rounds_a_wide_character_once() {
+        let text = "name,note\nm1,日本\n";
+        let rect = LogicalRect::new(0.0, 0.0, 520.0, 360.0);
+        let spec = grid_viewport(text, rect, (1, 1));
+        let grid = spec.grid.clone().unwrap();
+        assert_eq!(grid.panel_value(), "日本");
+        let geometry = spec.geometry(rect);
+        let (_, panel_slot) = editor_grid_slots(&geometry, &grid);
+        let y = geometry.body_y + (panel_slot + 1) as f32 * geometry.line_h + geometry.line_h * 0.5;
+        let at =
+            |cells: f32| editor_grid_hit(&spec, rect, geometry.text_x + geometry.cell_w * cells, y);
+        assert_eq!(at(0.2), Some(GridHit::Panel(0)));
+        assert_eq!(at(0.7), Some(GridHit::Panel(0)), "the near half of 日");
+        assert_eq!(at(1.3), Some(GridHit::Panel(3)), "the far half of 日");
+        assert_eq!(at(2.6), Some(GridHit::Panel(3)), "the near half of 本");
+        assert_eq!(at(3.4), Some(GridHit::Panel(6)), "the far half of 本");
+    }
+
+    const GRID_TEXT: &str = concat!(
+        "computer,AI login email,services,your correction\n",
+        "m1,alice@example.test,\"Claude, GitHub\",\n",
+        "m2,bob@example.test,Claude\n",
+        "m3,carol@example.test,Claude,\"say \"\"hi\"\"\"\n",
+    );
+
+    /// T9: a grid paints its header band, its cells, its row numbers and its badge; a press on a
+    /// drawn cell lands on that cell, and a press in the panel or the gutter on none; and a cursor
+    /// move alone changes the viewport's fingerprint, so the frame repaints.
+    #[test]
+    fn t9_the_grid_paints_its_cells_and_a_press_lands_on_the_cell_drawn() {
+        let rect = LogicalRect::new(0.0, 0.0, 900.0, 420.0);
+        let spec = grid_viewport(GRID_TEXT, rect, (0, 0));
+        let grid = spec.grid.clone().unwrap();
+        let geometry = spec.geometry(rect);
+        assert_eq!(grid.shown.len(), 4, "{grid:?}");
+
+        let texts: Vec<String> = UiTree::new(UiNode::new(
+            "editor/buffer",
+            UiContent::TextViewport(spec.clone()),
+        ))
+        .compile(rect)
+        .unwrap()
+        .tray(aterm_render::Theme::default(), 13.0)
+        .prims
+        .into_iter()
+        .filter_map(|prim| match prim {
+            crate::widget::DrawPrim::Text { s, .. } => Some(s),
+            _ => None,
+        })
+        .collect();
+        for drawn in [
+            "GRID",
+            "computer",
+            "alice@example.test",
+            "Claude, GitHub",
+            "say \"hi\"",
+            "1",
+            "4",
+        ] {
+            assert!(texts.iter().any(|text| text == drawn), "{drawn}: {texts:?}");
+        }
+        assert!(!texts.iter().any(|text| text == "EDIT"), "{texts:?}");
+
+        let rows = std::iter::once(&grid.header).chain(&grid.rows);
+        for (slot, row) in rows.enumerate() {
+            let y = geometry.body_y + (slot as f32 + 0.5) * geometry.line_h;
+            for shown in &grid.shown {
+                for cells in [shown.x, shown.x + shown.width + 1] {
+                    let x = geometry.text_x + (cells as f32 + 0.5) * geometry.cell_w;
+                    assert_eq!(
+                        editor_grid_cell_at(&spec, rect, x, y),
+                        Some((row.record, shown.index)),
+                        "slot {slot} column {} at cell {cells}",
+                        shown.index
+                    );
+                }
+            }
+        }
+        let panel_y = geometry.body_y + (grid.rows_layout.data as f32 + 1.5) * geometry.line_h;
+        assert_eq!(
+            editor_grid_cell_at(&spec, rect, geometry.text_x + 4.0, panel_y),
+            None
+        );
+        assert_eq!(
+            editor_grid_cell_at(
+                &spec,
+                rect,
+                geometry.text_x - 4.0,
+                geometry.body_y + geometry.line_h * 1.5
+            ),
+            None
+        );
+
+        let moved = grid_viewport(GRID_TEXT, rect, (3, 1));
+        assert_eq!(
+            moved
+                .grid
+                .as_ref()
+                .map(|grid| (grid.cursor.record, grid.cursor.column)),
+            Some((1, 3))
+        );
+        assert_eq!(
+            TextViewportSpec {
+                grid: None,
+                ..moved.clone()
+            },
+            TextViewportSpec {
+                grid: None,
+                ..spec.clone()
+            },
+            "premise: only the grid differs"
+        );
+        assert_ne!(
+            text_viewport_fingerprint(&moved),
+            text_viewport_fingerprint(&spec),
+            "a cursor move repaints"
+        );
     }
 
     /// THE EDITOR PAINTS, COUNTS AND EXPOSES ONLY THE ROWS IT SHOWS WHOLE (audit r20 ED2, ED3): a
@@ -12524,6 +13352,7 @@ pub(crate) mod tests {
             problem_navigation: true,
             reload: false,
             edit_header: false,
+            grid: None,
         };
         let items = editor_toolbar_items(toolbar);
         let gap = 4.0;
@@ -12604,6 +13433,7 @@ pub(crate) mod tests {
                         problem_navigation,
                         reload,
                         edit_header,
+                        grid: None,
                     })
                 })
         });
@@ -12704,6 +13534,7 @@ pub(crate) mod tests {
                 problem_navigation: true,
                 reload: true,
                 edit_header: false,
+                grid: Some(true),
             },
             EditorToolbar {
                 edit_header: true,

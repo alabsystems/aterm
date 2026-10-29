@@ -1377,6 +1377,10 @@ struct GrantBody {
     parked_for: Option<Duration>,
 }
 
+fn is_canonical_decimal(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && (s.len() == 1 || !s.starts_with('0'))
+}
+
 fn parse_grant_body(body: &str, expected_nonce: &str) -> Result<GrantBody, RendezvousError> {
     let Some((nonce, rest)) = body.split_once('\n') else {
         return Err(RendezvousError::Grant("no nonce line".to_string()));
@@ -1394,7 +1398,7 @@ fn parse_grant_body(body: &str, expected_nonce: &str) -> Result<GrantBody, Rende
         Some((entries, park)) => {
             let micros = park
                 .strip_prefix(GRANT_PARK_KEY)
-                .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                .filter(|digits| is_canonical_decimal(digits))
                 .and_then(|digits| digits.parse::<u64>().ok())
                 .ok_or_else(|| RendezvousError::Grant(format!("malformed park stamp {park}")))?;
             (entries, Some(Duration::from_micros(micros)))
@@ -1411,6 +1415,9 @@ fn parse_grant_body(body: &str, expected_nonce: &str) -> Result<GrantBody, Rende
         let Some((local_id, pid)) = entry.split_once(':') else {
             return Err(RendezvousError::Grant(format!("malformed entry {entry}")));
         };
+        if !is_canonical_decimal(local_id) || !is_canonical_decimal(pid) {
+            return Err(RendezvousError::Grant(format!("malformed entry {entry}")));
+        }
         let (Ok(local_id), Ok(pid)) = (local_id.parse::<u64>(), pid.parse::<i32>()) else {
             return Err(RendezvousError::Grant(format!("malformed entry {entry}")));
         };
@@ -2119,6 +2126,14 @@ mod tests {
             format!("{TEST_NONCE}\n1:y\n"),
             format!("{TEST_NONCE}\n1:0\n"),
             format!("{TEST_NONCE}\n1:-4\n"),
+            format!("{TEST_NONCE}\n+7:42\n"),
+            format!("{TEST_NONCE}\n07:42\n"),
+            format!("{TEST_NONCE}\n00:42\n"),
+            format!("{TEST_NONCE}\n7:+42\n"),
+            format!("{TEST_NONCE}\n7:042\n"),
+            format!("{TEST_NONCE}\n1:2\npark_us=00\n"),
+            format!("{TEST_NONCE}\n1:2\npark_us=01500\n"),
+            format!("{TEST_NONCE}\n1:2\npark_us=+1500\n"),
             format!("{TEST_NONCE}\n1:2,1:3\n"),
         ] {
             assert!(
@@ -2461,8 +2476,7 @@ mod tests {
     }
 
     #[cfg(target_vendor = "apple")]
-    #[test]
-    fn exec_dialer_stand_in() {
+    fn exec_dialer_stand_in_if_asked() -> bool {
         use std::os::unix::process::CommandExt as _;
         if std::env::var_os(EXEC_DIALER_FD).is_some() {
             let stream = CtlStream::from(crate::test_alone::handed(EXEC_DIALER_FD));
@@ -2472,14 +2486,14 @@ mod tests {
                 "{EXEC_DIALER_RECEIVED} {} DESCRIPTORS",
                 count_until_closed(&stream)
             );
-            return;
+            return true;
         }
         let (Some(path), Ok(claim), Some(go)) = (
             std::env::var_os(EXEC_DIALER_PATH),
             std::env::var(EXEC_DIALER_CLAIM),
             std::env::var_os(EXEC_DIALER_GO),
         ) else {
-            return;
+            return false;
         };
         let stream = dial_for_test(Path::new(&path), &claim).expect("dial and claim");
         let go = PathBuf::from(go);
@@ -2494,7 +2508,7 @@ mod tests {
                 "{EXEC_DIALER_RECEIVED} {} DESCRIPTORS",
                 count_until_closed(&stream)
             );
-            return;
+            return true;
         }
         let fd = stream.into_raw_fd();
         let mut image = std::process::Command::new(std::env::current_exe().expect("this binary"));
@@ -2507,12 +2521,17 @@ mod tests {
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_grant_is_not_sent_once_the_dialers_image_changed() {
+        if exec_dialer_stand_in_if_asked() {
+            return;
+        }
         for stays in [true, false] {
             let rendezvous = bind_for_test();
             let scratch = aterm_tempfile::TempDir::new().expect("a scratch dir");
             let (go, execd) = (scratch.path().join("go"), scratch.path().join("execd"));
-            let mut stand_in =
-                crate::test_alone::StandIn::helper(module_path!(), "exec_dialer_stand_in");
+            let mut stand_in = crate::test_alone::StandIn::helper(
+                module_path!(),
+                "a_grant_is_not_sent_once_the_dialers_image_changed",
+            );
             stand_in
                 .command()
                 .env(EXEC_DIALER_PATH, rendezvous.path())

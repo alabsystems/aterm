@@ -15,13 +15,13 @@ use super::{SettingsRoute, SettingsViewState};
 pub(super) const PEEK_MIN: f32 = crate::native_ui::LIST_PEEK_MIN;
 
 /// The keyboard's control, and for each height a stop lays it out, the words it paints itself.
-type WatchedWords = (UiKey, Vec<(f32, Option<(f32, f32)>)>);
+type WatchedWords = (UiKey, Vec<(f32, Option<crate::native_ui::WordBands>)>);
 
 /// The words whose cut makes a list draw a control as a picture, as bands from its top.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Words {
-    /// Its own, which an edge crossing them cuts.
-    Own(f32, f32),
+    /// Its own, which an edge crossing one of their lines or icons cuts.
+    Own(crate::native_ui::WordBands),
     /// Its named row's, which a cut of the control leaves out of view.
     Row(f32, f32),
     /// None: a cut paints what is in view.
@@ -92,7 +92,7 @@ fn shared_plan(
 
 /// While a page is built, what a screen shows of the keyboard's control is what it paints of
 /// it: a list's edge that crosses its words draws it as a picture only
-/// ([`ScrollPlan::painted_of_span`]).
+/// ([`ScrollPlan::painted_of_span_on`]).
 pub(super) struct KeyboardWords;
 
 impl KeyboardWords {
@@ -116,7 +116,7 @@ impl KeyboardWords {
                 .find(|(tall, _)| (tall - height).abs() < 0.01)
                 .map(|(_, own)| *own);
             Some(known.unwrap_or_else(|| {
-                let own = crate::native_ui::words_band(key, &node.content, height);
+                let own = crate::native_ui::words_bands(key, &node.content, height);
                 owns.push((height, own));
                 own
             }))
@@ -127,10 +127,7 @@ impl KeyboardWords {
                     .map(|(from, to)| Words::Row(at + from - top, at + to - top))
             })
         };
-        let words = own.map_or_else(
-            || row().unwrap_or(Words::Nothing),
-            |(from, to)| Words::Own(from, to),
-        );
+        let words = own.map_or_else(|| row().unwrap_or(Words::Nothing), Words::Own);
         Some((node.key.clone(), words))
     }
 }
@@ -163,14 +160,14 @@ pub(super) enum ListFoot {
 /// A page measured as stops ([`ScrollPlan::card`], [`ScrollPlan::row`]) and the room its list has.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct ScrollPlan {
-    heights: Vec<f32>,
-    groups: Vec<Option<usize>>,
-    heads: Vec<f32>,
-    leads: Vec<f32>,
-    captions: Vec<Option<(f32, f32)>>,
-    card_captions: Vec<Option<CardCaption>>,
-    notes: Vec<bool>,
-    row_gaps: Vec<f32>,
+    heights: Shared<f32>,
+    groups: Shared<Option<usize>>,
+    heads: Shared<f32>,
+    leads: Shared<f32>,
+    captions: Shared<Option<(f32, f32)>>,
+    card_captions: Shared<Option<CardCaption>>,
+    notes: Shared<bool>,
+    row_gaps: Shared<f32>,
     keys: Shared<Vec<UiKey>>,
     ids: Shared<Vec<UiKey>>,
     within: Shared<Vec<UiKey>>,
@@ -179,9 +176,9 @@ pub(super) struct ScrollPlan {
     drawn_bands: Shared<Vec<DrawnPart>>,
     spans: Shared<Vec<(UiKey, f32, f32)>>,
     words: Shared<Option<(UiKey, Words)>>,
-    ink: Vec<f32>,
-    ink_top: Vec<f32>,
-    first_controls: Vec<Option<f32>>,
+    ink: Shared<f32>,
+    ink_top: Shared<f32>,
+    first_controls: Shared<Option<f32>>,
     room: f32,
     overhang: f32,
     given: f32,
@@ -193,11 +190,37 @@ pub(super) struct ScrollPlan {
     /// ([`Self::segment_place`]).
     segment_sets: Shared<Vec<UiKey>>,
     foot: ListFoot,
+    /// The pinned keyboard's control: how tall, and what a status's bar leaves ([`Left::pinned`]).
+    pin: Option<(f32, f32)>,
+    kept_limit: KeptLimit,
 }
 
-/// A plan's per-stop lists of keys and spans, shared by the copies a render keeps of it (a seat
-/// restores the last screen's plan once per chrome rung) and copied only by a copy that changes
-/// them.
+/// [`ScrollPlan::limit`] once worked out, asked many times a render: every change to the plan
+/// through its methods forgets it. The seat the render chose ([`ScrollPlan::seated`], set in
+/// place) is no part of it.
+#[derive(Clone, Default)]
+struct KeptLimit(std::cell::Cell<Option<usize>>);
+
+impl KeptLimit {
+    const fn forget(&mut self) {
+        *self.0.get_mut() = None;
+    }
+}
+
+/// A kept answer is no part of the plan: plans that differ by it alone are equal.
+impl PartialEq for KeptLimit {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for KeptLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("KeptLimit")
+    }
+}
+
+/// Per-stop and per-group lists, shared by a render's copies and copied only by one changing them.
 type Shared<T> = std::sync::Arc<Vec<T>>;
 
 /// Where the render seated a screen off its stops ([`ScrollPlan::seated`]).
@@ -282,6 +305,15 @@ pub(super) struct TopCaption {
     pub(super) kept: bool,
 }
 
+/// Where the list's last screen is seated ([`ScrollPlan::last_seat`]), as its [`Screen`] is.
+struct LastSeat {
+    top: usize,
+    drawn: Range<usize>,
+    offset: f32,
+    caption: Option<TopCaption>,
+    bare: bool,
+}
+
 impl ScrollPlan {
     pub(super) fn new(gap: f32) -> Self {
         Self {
@@ -290,24 +322,80 @@ impl ScrollPlan {
         }
     }
 
+    /// [`Self::new`] with room for `stops` stops, so a plan built stop by stop does not regrow.
+    fn with_stops(gap: f32, stops: usize) -> Self {
+        fn shared<T>(stops: usize) -> Shared<T> {
+            std::sync::Arc::new(Vec::with_capacity(stops))
+        }
+        Self {
+            heights: shared(stops),
+            groups: shared(stops),
+            card_captions: shared(stops),
+            notes: shared(stops),
+            keys: shared(stops),
+            ids: shared(stops),
+            within: shared(stops),
+            previews: shared(stops),
+            control_rows: shared(stops),
+            spans: shared(stops),
+            words: shared(stops),
+            ink: shared(stops),
+            ink_top: shared(stops),
+            first_controls: shared(stops),
+            ..Self::new(gap)
+        }
+    }
+
     /// The height the list has.
     pub(super) const fn set_room(&mut self, room: f32) {
+        self.kept_limit.forget();
         self.room = room;
     }
 
     /// How the list's screens end at its bottom edge ([`ListFoot`]).
     pub(super) const fn set_foot(&mut self, foot: ListFoot) {
+        self.kept_limit.forget();
         self.foot = foot;
+    }
+
+    /// Say the page pins the keyboard's control, `pin` its height and what a status's bar leaves.
+    pub(super) const fn pin_keyboard(&mut self, pin: Option<(f32, f32)>) {
+        self.kept_limit.forget();
+        self.pin = pin;
     }
 
     /// Say that the list's room is `given` shorter than the page kept it.
     pub(super) const fn give_to_status(&mut self, given: f32) {
+        self.kept_limit.forget();
         self.given = given.max(0.0);
+    }
+
+    /// The strip kept under the list for a status bar that is not up ([`seat_room`]).
+    const fn set_overhang(&mut self, overhang: f32) {
+        self.kept_limit.forget();
+        self.overhang = overhang;
+    }
+
+    /// Hold the last screen at its first stop as it sat ([`HeldStart`]), or hold none.
+    const fn hold_start(&mut self, held: Option<HeldStart>) {
+        self.kept_limit.forget();
+        self.held_start = held;
     }
 
     /// Whether the list's screens give room up to a plain status's taller bar.
     pub(super) fn gives_to_status(&self) -> bool {
         self.given > 0.01
+    }
+
+    /// This plan's stops and room as measured, with no screen seated on them.
+    pub(super) fn unseated(&self) -> Self {
+        let mut plan = Self {
+            seated: None,
+            ..self.clone()
+        };
+        // The limit reads the held start: the kept one goes with it.
+        plan.hold_start(None);
+        plan
     }
 
     #[cfg(test)]
@@ -341,7 +429,7 @@ impl ScrollPlan {
         self.ink[index] > self.ink_top[index] + 0.01
     }
 
-    pub(super) const fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         self.heights.len()
     }
 
@@ -368,15 +456,16 @@ impl ScrollPlan {
 
     /// A stop that is a whole card, `height` tall, holding `keys`.
     pub(super) fn card(&mut self, height: f32, keys: Vec<UiKey>) -> usize {
-        self.heights.push(height);
-        self.ink.push(height);
-        self.ink_top.push(0.0);
-        self.first_controls
+        self.kept_limit.forget();
+        std::sync::Arc::make_mut(&mut self.heights).push(height);
+        std::sync::Arc::make_mut(&mut self.ink).push(height);
+        std::sync::Arc::make_mut(&mut self.ink_top).push(0.0);
+        std::sync::Arc::make_mut(&mut self.first_controls)
             .push((!keys.is_empty()).then_some(height));
         std::sync::Arc::make_mut(&mut self.previews).push(Vec::new());
-        self.card_captions.push(None);
-        self.notes.push(false);
-        self.groups.push(None);
+        std::sync::Arc::make_mut(&mut self.card_captions).push(None);
+        std::sync::Arc::make_mut(&mut self.notes).push(false);
+        std::sync::Arc::make_mut(&mut self.groups).push(None);
         std::sync::Arc::make_mut(&mut self.control_rows).push(if keys.is_empty() {
             Vec::new()
         } else {
@@ -393,16 +482,17 @@ impl ScrollPlan {
 
     /// [`Self::card`] put in at stop `index`, before the stops there.
     pub(super) fn insert_card(&mut self, index: usize, height: f32, keys: Vec<UiKey>) {
+        self.kept_limit.forget();
         let index = index.min(self.heights.len());
-        self.heights.insert(index, height);
-        self.ink.insert(index, height);
-        self.ink_top.insert(index, 0.0);
-        self.first_controls
+        std::sync::Arc::make_mut(&mut self.heights).insert(index, height);
+        std::sync::Arc::make_mut(&mut self.ink).insert(index, height);
+        std::sync::Arc::make_mut(&mut self.ink_top).insert(index, 0.0);
+        std::sync::Arc::make_mut(&mut self.first_controls)
             .insert(index, (!keys.is_empty()).then_some(height));
         std::sync::Arc::make_mut(&mut self.previews).insert(index, Vec::new());
-        self.card_captions.insert(index, None);
-        self.notes.insert(index, false);
-        self.groups.insert(index, None);
+        std::sync::Arc::make_mut(&mut self.card_captions).insert(index, None);
+        std::sync::Arc::make_mut(&mut self.notes).insert(index, false);
+        std::sync::Arc::make_mut(&mut self.groups).insert(index, None);
         std::sync::Arc::make_mut(&mut self.control_rows).insert(
             index,
             if keys.is_empty() {
@@ -421,16 +511,18 @@ impl ScrollPlan {
 
     /// A group card.
     pub(super) fn group(&mut self, head: f32, lead: f32) -> usize {
-        self.heads.push(head);
-        self.leads.push(lead.max(0.0));
-        self.captions.push(None);
-        self.row_gaps.push(0.0);
+        self.kept_limit.forget();
+        std::sync::Arc::make_mut(&mut self.heads).push(head);
+        std::sync::Arc::make_mut(&mut self.leads).push(lead.max(0.0));
+        std::sync::Arc::make_mut(&mut self.captions).push(None);
+        std::sync::Arc::make_mut(&mut self.row_gaps).push(0.0);
         self.heads.len() - 1
     }
 
     /// Say that `group`'s card sets `gap` between its rows.
     pub(super) fn set_row_gap(&mut self, group: usize, gap: f32) {
-        if let Some(row_gap) = self.row_gaps.get_mut(group) {
+        self.kept_limit.forget();
+        if let Some(row_gap) = std::sync::Arc::make_mut(&mut self.row_gaps).get_mut(group) {
             *row_gap = gap.max(0.0);
         }
     }
@@ -442,7 +534,8 @@ impl ScrollPlan {
 
     /// Say that `group`'s card paints a caption from `top` under its top.
     pub(super) fn set_caption(&mut self, group: usize, top: f32, bottom: f32) {
-        if let Some(caption) = self.captions.get_mut(group) {
+        self.kept_limit.forget();
+        if let Some(caption) = std::sync::Arc::make_mut(&mut self.captions).get_mut(group) {
             *caption = Some((top.max(0.0), bottom.max(top)));
         }
     }
@@ -461,7 +554,8 @@ impl ScrollPlan {
 
     /// Say where the controls of the last stop added sit.
     pub(super) fn set_control_rows(&mut self, rows: Vec<(f32, f32, f32)>) {
-        if let Some(first) = self.first_controls.last_mut() {
+        self.kept_limit.forget();
+        if let Some(first) = std::sync::Arc::make_mut(&mut self.first_controls).last_mut() {
             *first = rows.first().map(|(_, at, height)| at + height);
         }
         if let Some(last) = std::sync::Arc::make_mut(&mut self.control_rows).last_mut() {
@@ -471,6 +565,7 @@ impl ScrollPlan {
 
     /// Say what the last stop added draws, band by band ([`drawn_bands_in`]).
     pub(super) fn set_drawn_bands(&mut self, bands: Vec<DrawnPart>) {
+        self.kept_limit.forget();
         if let Some(last) = std::sync::Arc::make_mut(&mut self.drawn_bands).last_mut() {
             *last = bands;
         }
@@ -478,28 +573,41 @@ impl ScrollPlan {
 
     /// Say how far under its top the last stop added has its first row of controls end.
     pub(super) fn set_first_controls(&mut self, end: Option<f32>) {
-        if let (Some(first), Some(end)) = (self.first_controls.last_mut(), end) {
+        self.kept_limit.forget();
+        if let (Some(first), Some(end)) = (
+            std::sync::Arc::make_mut(&mut self.first_controls).last_mut(),
+            end,
+        ) {
             *first = Some(first.map_or(end, |was| was.min(end)));
         }
     }
 
     /// Say how far under its top what the last stop added draws ends.
     pub(super) fn set_ink(&mut self, ink: f32) {
-        if let (Some(last), Some(height)) = (self.ink.last_mut(), self.heights.last()) {
+        self.kept_limit.forget();
+        if let (Some(last), Some(height)) = (
+            std::sync::Arc::make_mut(&mut self.ink).last_mut(),
+            self.heights.last(),
+        ) {
             *last = ink.clamp(0.0, *height);
         }
     }
 
     /// Say how far under its top what the last stop added draws begins.
     pub(super) fn set_ink_top(&mut self, top: f32) {
-        if let (Some(last), Some(ink)) = (self.ink_top.last_mut(), self.ink.last()) {
+        self.kept_limit.forget();
+        if let (Some(last), Some(ink)) = (
+            std::sync::Arc::make_mut(&mut self.ink_top).last_mut(),
+            self.ink.last(),
+        ) {
             *last = top.clamp(0.0, *ink);
         }
     }
 
     /// Say that the last stop added is a note on the rows over it.
     pub(super) fn set_note(&mut self, note: bool) {
-        if let Some(last) = self.notes.last_mut() {
+        self.kept_limit.forget();
+        if let Some(last) = std::sync::Arc::make_mut(&mut self.notes).last_mut() {
             *last = note;
         }
     }
@@ -531,6 +639,7 @@ impl ScrollPlan {
 
     /// Say where each control the last stop added holds sits in it.
     pub(super) fn set_control_spans(&mut self, spans: Vec<(UiKey, f32, f32)>) {
+        self.kept_limit.forget();
         if let Some(last) = std::sync::Arc::make_mut(&mut self.spans).last_mut() {
             *last = spans;
         }
@@ -538,6 +647,7 @@ impl ScrollPlan {
 
     /// Say which words name the keyboard's control where the last stop added lays it out.
     pub(super) fn set_keyboard_words(&mut self, words: Option<(UiKey, Words)>) {
+        self.kept_limit.forget();
         if let Some(last) = std::sync::Arc::make_mut(&mut self.words).last_mut() {
             *last = words;
         }
@@ -565,6 +675,7 @@ impl ScrollPlan {
 
     /// Measure the last stop added from `node`, laid out `height` tall.
     pub(super) fn measure(&mut self, node: &UiNode, height: f32) {
+        self.kept_limit.forget();
         let mut within = Vec::new();
         keys_within(node, &mut within);
         self.set_within(within);
@@ -577,7 +688,7 @@ impl ScrollPlan {
         let content = content_extent(node, height);
         self.set_ink(content.map_or(0.0, |(top, tall)| top + tall));
         self.set_ink_top(content.map_or(0.0, |(top, _)| top));
-        if let Some(last) = self.card_captions.last_mut() {
+        if let Some(last) = std::sync::Arc::make_mut(&mut self.card_captions).last_mut() {
             *last = caption_extent(node);
         }
     }
@@ -632,15 +743,16 @@ impl ScrollPlan {
 
     /// A row of `group`, `height` tall with its share of the card's gaps.
     pub(super) fn row(&mut self, group: usize, height: f32, keys: Vec<UiKey>) -> usize {
-        self.heights.push(height);
-        self.ink.push(height);
-        self.ink_top.push(0.0);
-        self.first_controls
+        self.kept_limit.forget();
+        std::sync::Arc::make_mut(&mut self.heights).push(height);
+        std::sync::Arc::make_mut(&mut self.ink).push(height);
+        std::sync::Arc::make_mut(&mut self.ink_top).push(0.0);
+        std::sync::Arc::make_mut(&mut self.first_controls)
             .push((!keys.is_empty()).then_some(height));
         std::sync::Arc::make_mut(&mut self.previews).push(Vec::new());
-        self.card_captions.push(None);
-        self.notes.push(false);
-        self.groups.push(Some(group));
+        std::sync::Arc::make_mut(&mut self.card_captions).push(None);
+        std::sync::Arc::make_mut(&mut self.notes).push(false);
+        std::sync::Arc::make_mut(&mut self.groups).push(Some(group));
         std::sync::Arc::make_mut(&mut self.control_rows).push(if keys.is_empty() {
             Vec::new()
         } else {
@@ -692,9 +804,22 @@ impl ScrollPlan {
 
     /// The height `range` takes on screen, the gaps between its runs included.
     pub(super) fn span(&self, range: Range<usize>) -> f32 {
-        let runs = self.runs(range);
-        runs.iter().map(|run| self.run_height(run)).sum::<f32>()
-            + runs.len().saturating_sub(1) as f32 * self.gap
+        // [`Self::runs`] summed run by run as [`Self::run_height`] sums each, building no list.
+        let (mut span, mut runs, mut k) = (0.0, 0usize, range.start);
+        while k < range.end {
+            let start = k;
+            k += 1;
+            if let Some(group) = self.groups[start] {
+                while k < range.end && self.groups[k] == Some(group) {
+                    k += 1;
+                }
+                span += self.heads[group] + self.heights[start..k].iter().sum::<f32>();
+            } else {
+                span += self.heights[start];
+            }
+            runs += 1;
+        }
+        span + runs.saturating_sub(1) as f32 * self.gap
     }
 
     /// The height `range` takes on screen down to what its last stop draws: the blank a stop
@@ -737,39 +862,87 @@ impl ScrollPlan {
             && at + self.ink[index] <= room + self.overhang + 0.01
     }
 
-    /// The last first stop the list scrolls to.
+    /// The last first stop the list scrolls to, worked out once for the plan as it stands
+    /// ([`KeptLimit`]).
     pub(super) fn limit(&self) -> usize {
+        if let Some(limit) = self.kept_limit.0.get() {
+            return limit;
+        }
+        let limit = self.limit_now();
+        self.kept_limit.0.set(Some(limit));
+        limit
+    }
+
+    fn limit_now(&self) -> usize {
         let n = self.len();
         if n == 0 {
             return 0;
         }
+        // Where the last screen stands its end is the same whatever its first stop: weighed once.
+        let anchor = (self.foot != ListFoot::Whole).then(|| self.last_anchor());
         let mut top = n - 1;
-        while top > 0 && self.ends_on(top - 1) {
+        while top > 0 && self.ends_on_at(top - 1, anchor) {
             top -= 1;
         }
         top
     }
 
+    /// [`Self::ends_on_at`], the last screen's anchor weighed here.
+    #[cfg(test)]
+    pub(super) fn ends_on(&self, top: usize) -> bool {
+        self.ends_on_at(
+            top,
+            (self.foot != ListFoot::Whole).then(|| self.last_anchor()),
+        )
+    }
+
     /// Whether the screen whose first stop is `top`, drawn as the list's
     /// last screen, shows `top` and every stop after it ([`Self::limit`]),
     /// the caption of the run it starts in kept as that stop's own seat
-    /// keeps it ([`Self::starts_bare`]).
-    pub(super) fn ends_on(&self, top: usize) -> bool {
+    /// keeps it ([`Self::starts_bare`]). The caller weighs where that screen's end stands,
+    /// `anchor` ([`Self::last_anchor`], none where the list's foot is whole); this reads the
+    /// screen's seat alone, no live band.
+    fn ends_on_at(&self, top: usize, anchor: Option<f32>) -> bool {
         let n = self.len();
-        if self.foot == ListFoot::Whole {
+        let Some(anchor) = anchor else {
             return self.view(top).end >= n;
-        }
-        let screen = self.last_screen(top);
-        if screen.bare && !self.starts_bare(top) {
+        };
+        let seat = self.last_seat(top, anchor);
+        if seat.bare && !self.starts_bare(top) {
             return false;
         }
-        let shown = self.shown_on(&screen.drawn, screen.offset, screen.caption);
+        let shown = self.shown_on(&seat.drawn, seat.offset, seat.caption);
         !shown.is_empty() && shown.start <= top && shown.end >= n
     }
 
     fn last_screen(&self, top: usize) -> Screen {
+        let LastSeat {
+            top,
+            drawn,
+            offset,
+            caption,
+            bare,
+        } = self.last_seat(top, self.last_anchor());
+        let reach = self.room + self.overhang;
+        let bottom = self.span(drawn.clone());
+        let height = (bottom - offset).min(reach).max(self.room.min(bottom));
+        Screen {
+            view: top..self.len(),
+            live: self.live_on(&drawn, offset, caption, self.room),
+            drawn,
+            offset,
+            height,
+            fades: false,
+            whole: false,
+            caption,
+            edge_caption: None,
+            bare,
+        }
+    }
+
+    /// How far down the list its last screen stands the list's end ([`Self::last_screen`]).
+    fn last_anchor(&self) -> f32 {
         let n = self.len();
-        let top = top.min(n - 1);
         let reach = self.room + self.overhang;
         // WHAT THE LAST STOP DRAWS WINS OVER THE BLANK UNDER IT: where the room cannot hold the
         // last stop from its first words to its card's end, the blank under what it draws (its
@@ -780,7 +953,7 @@ impl ScrollPlan {
         let tail = (self.end_under(n - 1) - content).max(0.0);
         // A last stop taller than the room is seated at its top, as any stop is: the screens
         // under it step down it ([`Self::tall_steps`]).
-        let anchor = if self.taller_than_room(n - 1) {
+        if self.taller_than_room(n - 1) {
             self.span(n - 1..n)
         } else if self.end_under(n - 1) - self.ink_top[n - 1] > reach + 0.01 {
             self.room + tail
@@ -788,7 +961,14 @@ impl ScrollPlan {
             (self.room + self.end_under(n - 1) - self.controls_of(n - 1).1)
                 .min(reach)
                 .max(self.room.min(reach))
-        };
+        }
+    }
+
+    /// Where the list's last screen whose first stop is `top` is seated, its end at `anchor`
+    /// ([`Self::last_anchor`]).
+    fn last_seat(&self, top: usize, anchor: f32) -> LastSeat {
+        let n = self.len();
+        let top = top.min(n - 1);
         let mut start = top;
         while start > 0 && self.span(start..n) + 0.5 < anchor {
             start -= 1;
@@ -848,19 +1028,11 @@ impl ScrollPlan {
         } else {
             (flush, caption)
         };
-        let drawn = start..n;
-        let bottom = self.span(drawn.clone());
-        let height = (bottom - offset).min(reach).max(self.room.min(bottom));
-        Screen {
-            view: top..n,
-            live: self.live_on(&drawn, offset, caption, self.room),
-            drawn,
+        LastSeat {
+            top,
+            drawn: start..n,
             offset,
-            height,
-            fades: false,
-            whole: false,
             caption,
-            edge_caption: None,
             bare,
         }
     }
@@ -880,11 +1052,13 @@ impl ScrollPlan {
     }
 
     fn controls_of(&self, index: usize) -> (f32, f32) {
-        self.control_rows[index]
-            .iter()
-            .map(|(_, at, height)| (*at, at + height))
-            .reduce(|(top, bottom), (at, end)| (top.min(at), bottom.max(end)))
-            .unwrap_or((0.0, self.ink[index]))
+        // A loop, not an iterator chain: every screen a plan views asks this of each stop.
+        let mut span: Option<(f32, f32)> = None;
+        for (_, at, height) in &self.control_rows[index] {
+            let end = at + height;
+            span = Some(span.map_or((*at, end), |(top, bottom)| (top.min(*at), bottom.max(end))));
+        }
+        span.unwrap_or((0.0, self.ink[index]))
     }
 
     /// The room the first screen needs to show its first stop and the first row of controls
@@ -1022,6 +1196,7 @@ impl ScrollPlan {
                 walk(child, out, sets);
             }
         }
+        self.kept_limit.forget();
         walk(
             node,
             std::sync::Arc::make_mut(&mut self.segments),
@@ -1165,18 +1340,15 @@ impl ScrollPlan {
             .is_some_and(|(at, floor, live)| at + from >= floor - 0.01 && at + to <= live + 0.01)
     }
 
-    /// How much of control `key`'s `span` in stop `index` the screen whose first stop is `top`
-    /// paints: none where that is a sliver, or where a cut leaves out the words naming it
-    /// ([`KeyboardWords`]; all of it where they are not known), which the list draws as a picture.
-    fn painted_of_span(
+    /// What `screen` paints of `key`'s `span` in stop `index`: none for a sliver or a cut word.
+    fn painted_of_span_on(
         &self,
+        screen: &Screen,
         index: usize,
-        top: usize,
         key: &UiKey,
         (from, to): (f32, f32),
     ) -> f32 {
-        let screen = self.screen(top.min(self.limit()));
-        let Some((at, floor, _)) = self.live_band(&screen, index) else {
+        let Some((at, floor, _)) = self.live_band(screen, index) else {
             return 0.0;
         };
         let bottom = if self.gives_to_status() || self.foot == ListFoot::Whole {
@@ -1208,7 +1380,9 @@ impl ScrollPlan {
             .map(|(_, words)| *words);
         let picture = match words {
             None => cut((start, end)),
-            Some(Words::Own(top, under)) => cut((start + top, start + under)),
+            Some(Words::Own(bands)) => bands
+                .iter()
+                .any(|(top, under)| cut((start + top, start + under))),
             Some(Words::Row(top, under)) => {
                 cut((start, end))
                     && (start + top < floor - 0.01 || (!fades && start + under > bottom + 0.01))
@@ -1256,6 +1430,29 @@ impl ScrollPlan {
     /// reveals it.
     pub(super) fn shows_landing(&self, index: usize, top: usize) -> bool {
         self.shows_revealed(index, top, Reveal::Keep)
+    }
+
+    /// Least room a screen needs for `landing`'s row whole beside `part` of `key` (all where none).
+    #[cfg(test)]
+    pub(super) fn room_beside(
+        &self,
+        landing: &UiKey,
+        key: &UiKey,
+        part: Option<f32>,
+    ) -> Option<f32> {
+        let (row, control) = (self.stop_holding(landing)?, self.stop_of(key)?);
+        if row == control {
+            return None;
+        }
+        let (top, bottom) = self.controls_of(row);
+        let (from, to) = self
+            .control_span(control, key)
+            .unwrap_or_else(|| self.controls_of(control));
+        let part = part.map_or(to - from, |part| (part - 0.5).max(0.0));
+        let between: f32 = self.heights[row.min(control) + 1..row.max(control)]
+            .iter()
+            .sum();
+        Some(bottom - top + between + part)
     }
 
     /// Whether the screen whose first stop is `top` shows stop `index`'s controls whole.
@@ -2293,6 +2490,7 @@ impl ScrollPlan {
 
     /// Say what the last stop added lists.
     pub(super) fn set_ids(&mut self, ids: Vec<UiKey>) {
+        self.kept_limit.forget();
         if let Some(last) = self.ids.len().checked_sub(1) {
             self.set_ids_of(last, ids);
         }
@@ -2300,6 +2498,7 @@ impl ScrollPlan {
 
     /// [`Self::set_ids`] for stop `index`.
     pub(super) fn set_ids_of(&mut self, index: usize, ids: Vec<UiKey>) {
+        self.kept_limit.forget();
         if let Some(stop) = std::sync::Arc::make_mut(&mut self.ids).get_mut(index) {
             *stop = ids;
         }
@@ -2307,6 +2506,7 @@ impl ScrollPlan {
 
     /// Say what else the last stop added draws ([`Self::within`]).
     pub(super) fn set_within(&mut self, within: Vec<UiKey>) {
+        self.kept_limit.forget();
         if let Some(last) = std::sync::Arc::make_mut(&mut self.within).last_mut() {
             *last = within;
         }
@@ -2320,6 +2520,12 @@ impl ScrollPlan {
             .flatten()
             .chain(self.keys.get(index).into_iter().flatten())
             .chain(self.within.get(index).into_iter().flatten())
+    }
+
+    /// Whether stop `index` is `was`'s there, not one moved in by stops added or dropped above.
+    fn holds_stop_of(&self, was: &Self, index: usize) -> bool {
+        let mut known = was.identities(index).peekable();
+        known.peek().is_none() || known.any(|id| self.identities(index).any(|now| now == id))
     }
 
     /// The stop that lists node `id` or holds control `id`, else the one that draws it.
@@ -2348,6 +2554,7 @@ impl ScrollPlan {
                 collect(child, out);
             }
         }
+        self.kept_limit.forget();
         let mut keys = Vec::new();
         for node in nodes {
             collect(node, &mut keys);
@@ -2528,6 +2735,8 @@ pub(super) struct Left {
     key: UiKey,
     whole: bool,
     part: f32,
+    /// Whether the screen painted all of the control's own span, though not all its stop reveals.
+    own: bool,
 }
 
 impl Left {
@@ -2537,38 +2746,102 @@ impl Left {
             key: key.clone(),
             whole: true,
             part: 0.0,
+            own: true,
         }
     }
 
     /// What the screen whose first stop is `top` shows of `key` on `plan`.
     fn on(plan: &ScrollPlan, key: &UiKey, top: usize) -> Self {
-        let (whole, part) = plan.stop_of(key).map_or((true, 0.0), |stop| {
+        let (whole, part, own) = plan.stop_of(key).map_or((true, 0.0, true), |stop| {
             let span = plan.span_of(stop, Some(key), Reveal::Pressed);
             let control = plan
                 .control_span(stop, key)
                 .unwrap_or_else(|| plan.controls_of(stop));
+            // One screen, as it draws, for both.
+            let screen = plan.screen(top.min(plan.limit()));
+            let part = plan.painted_of_span_on(&screen, stop, key, control);
             (
-                plan.shows_span(stop, top, span),
-                plan.painted_of_span(stop, top, key, control),
+                plan.shows_span_on(&screen, stop, span),
+                part,
+                part + 0.5 >= control.1 - control.0,
             )
         });
         Self {
             key: key.clone(),
             whole,
             part,
+            own,
+        }
+    }
+
+    /// `key` pinned around the list `tall` high, `shown` of it left by a status's bar.
+    fn pinned(key: &UiKey, (tall, shown): (f32, f32)) -> Self {
+        Self {
+            key: key.clone(),
+            whole: shown + 0.5 >= tall,
+            part: shown,
+            own: shown + 0.5 >= tall,
         }
     }
 
     /// Whether `now` shows the person no less of the control than this.
-    fn kept_by(&self, now: &Self) -> bool {
-        now.whole || (!self.whole && now.part + 0.5 >= self.part)
+    pub(super) fn kept_by(&self, now: &Self) -> bool {
+        // A control painted all of it, laid out taller since, is owed all of it again (R2).
+        now.whole || (!self.whole && now.part + 0.5 >= self.part && (now.own || !self.own))
+    }
+
+    /// Whether `now` shows the person no less of the keyboard's control than `was`.
+    pub(super) fn kept(was: Option<&Self>, now: Option<&Self>) -> bool {
+        match (was, now) {
+            (Some(was), Some(now)) => was.kept_by(now),
+            (None, Some(now)) => now.whole,
+            (_, None) => true,
+        }
+    }
+
+    /// How much of the control this shows.
+    pub(super) const fn part(&self) -> f32 {
+        self.part
     }
 
     /// Whether this shows any of the control.
-    fn shows(&self) -> bool {
+    pub(super) fn shows(&self) -> bool {
         self.whole || self.part > 0.0
     }
+
+    /// Whether this painted all of the control, laid out `tall` since: it is owed all of it.
+    fn grown(&self, tall: f32) -> bool {
+        self.own && tall > self.part + 0.5
+    }
+
+    /// The least a screen shows of a control `span` tall to show no less ([`Self::kept_by`]).
+    pub(super) fn owed_least(&self, span: f32) -> f32 {
+        if self.whole || self.grown(span) {
+            span
+        } else {
+            span.min((self.part - 0.5).max(0.0))
+        }
+    }
 }
+
+/// What a screen paints of the keyboard's listed control: how tall it is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Peek {
+    tall: f32,
+}
+
+impl Peek {
+    /// Whether `room` paints more than `beyond` of the control: no sliver, more as far as it shows.
+    pub(super) fn paints_in(self, room: f32, beyond: f32) -> bool {
+        room + 0.01 >= PEEK_MIN.min(self.tall).max(beyond + 0.51)
+    }
+
+    /// Whether the control fits whole in `room`.
+    pub(super) fn fits_in(self, room: f32) -> bool {
+        self.tall <= room + 0.01
+    }
+}
+
 /// Which list a record measured.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ScrollContext {
@@ -2644,6 +2917,12 @@ pub(super) struct ScrollRecord {
     left: Option<Left>,
     /// The keyboard's control as this screen found it ([`SettingsViewState::seat_scroll`]).
     keyboard: Option<UiKey>,
+    /// Whether the list's top showed `first_beside`'s first result whole, so none reveals it.
+    beside_shown: bool,
+    /// Whether this screen revealed what that first result replaced, as each after it does.
+    beside_spent: bool,
+    /// Whether it held the start of a stop moved in at its top, which a let-go seats anew.
+    moved_start: bool,
     hold: bool,
     /// The plan and scroll the screen held, kept across re-measurements
     /// ([`SettingsViewState::seat_scroll`], [`SettingsViewState::settle_page_scroll`],
@@ -2662,6 +2941,17 @@ impl ScrollRecord {
         self.keyboard.as_ref()
     }
 
+    /// Whether this screen held the start of a stop moved in at its top, which a let-go seats anew.
+    pub(super) const fn holds_moved_start(&self) -> bool {
+        self.moved_start
+    }
+
+    /// Forget that the list's top showed a pinned filter's first result whole.
+    pub(super) const fn forget_beside(&mut self) {
+        self.beside_shown = false;
+        self.beside_spent = false;
+    }
+
     /// Whether `state` shows the list this record was drawn for.
     pub(super) fn same_context(&self, state: &SettingsViewState) -> bool {
         self.context == state.scroll_context()
@@ -2670,6 +2960,15 @@ impl ScrollRecord {
     fn unscrolled(&self, state: &SettingsViewState) -> bool {
         self.context == state.scroll_context()
             && self.top == state.scroll_now().min(self.plan.limit())
+    }
+
+    /// What this screen showed of `key`: `listed` where its list holds it, else as pinned.
+    fn shown_of(&self, key: &UiKey, listed: Left) -> Option<Left> {
+        if self.plan.stop_of(key).is_some() {
+            Some(listed)
+        } else {
+            self.plan.pin.map(|pin| Left::pinned(key, pin))
+        }
     }
 
     /// What the person was left with of `key`, the keyboard's control
@@ -2748,12 +3047,12 @@ impl SettingsViewState {
     /// - R3: Before the first event the theme in use (the landing) is shown whole wherever that
     ///   keeps R2; where both can be shown whole, both are, first frame included. Where both
     ///   cannot, the keyboard's control wins. Where it is pinned, landing costs it nothing, so
-    ///   the list lands.
+    ///   the list lands. It is judged over R2's rungs: a give-way may show both whole.
     /// - R4: A wheel's place holds until an event moves it, except as far as R2 needs.
     /// - R5: A key that leaves the keyboard on the same control keeps that control in view
     ///   (typing in the chooser's filter, Up or Down on it, keys on Customize). A filter change
     ///   shows the filter and then the first results, never the page's top while the filter is
-    ///   listed.
+    ///   listed. It is judged over R2's rungs as R3 is: a give-way may show both whole.
     ///
     /// A status never covers what the person is on: the bar shortens, down to its one line of
     /// words, for the keyboard's control, listed or pinned, and the pinned strip lays out above
@@ -2770,6 +3069,8 @@ impl SettingsViewState {
     /// An event is one the person sent (a press, a key, the wheel, a focus move); a
     /// projection's reply (a Messages tick, a refresh) is none.
     pub(super) fn seat_scroll(&self, plan: &mut ScrollPlan) -> Range<usize> {
+        #[cfg(test)]
+        crate::work_counts::list_seated();
         let limit = plan.limit();
         let mut top = self.scroll_now().min(limit);
         let focus = self.common.last_focus.as_ref();
@@ -2789,11 +3090,17 @@ impl SettingsViewState {
             let stop = was.stop_of(key)?;
             was.shown(at).contains(&stop).then_some((at, stop))
         };
+        // A control pinned round the list showed whatever the scroll: a scroll leaves it owed (R5).
         let owed = |key: &UiKey| {
             let record = self.scroll_record.borrow();
             record
                 .as_ref()
-                .filter(|record| record.unscrolled(self))
+                .filter(|record| {
+                    record.unscrolled(self)
+                        || (record.context == self.scroll_context()
+                            && record.plan.stop_of(key).is_none()
+                            && record.plan.pin.is_some())
+                })
                 .map(|record| record.left_of(key))
         };
         let owes = |key: &UiKey, now: &ScrollPlan, top: usize| {
@@ -2808,17 +3115,25 @@ impl SettingsViewState {
                     && record.top == top
                     && (record.plan.room - plan.room).abs() < 0.5
             })
-            .map(|record| record.plan.held_seat(record.top));
-        plan.held_start = held_start;
+            .map(|record| {
+                let moved = !plan.holds_stop_of(&record.plan, top);
+                (record.plan.held_seat(record.top), moved)
+            });
+        // A stop moved in by stops added or dropped above holds the seat too, unless let go (R2).
+        plan.hold_start(None);
+        let moved_start = held_start
+            .is_some_and(|(held, moved)| moved && plan.held_seat(top) != held)
+            .then_some(!self.start_let_go.get());
+        let held_start = held_start
+            .filter(|_| moved_start != Some(false))
+            .map(|(held, _)| held);
+        plan.hold_start(held_start);
         let first_screen = self
             .scroll_record
             .borrow()
             .as_ref()
             .is_none_or(|record| record.context != self.scroll_context());
-        let opening = first_screen
-            || self.scroll_record.borrow().as_ref().is_some_and(|record| {
-                record.opening && record.drawn.is_some() && record.context == self.scroll_context()
-            });
+        let opening = self.seats_opening();
         let carried = self
             .scroll_record
             .borrow()
@@ -2861,9 +3176,10 @@ impl SettingsViewState {
             .map(|record| (record.landed.clone(), record.yielded));
         let (drawn_landing, mut yielded) = drawn_landing.unwrap_or_default();
         let landing = land && drawn_landing.is_none();
-        let revealing = self
-            .page_reveal
-            .as_ref()
+        let given_back = self.beside_given_back(plan, self.scroll_record.borrow().as_ref());
+        let beside_spent = given_back.is_some();
+        let revealing = given_back
+            .unwrap_or(self.page_reveal.as_ref())
             .filter(|_| self.reveal_as != Reveal::Hold && drawn_landing.is_none());
         let kept_in_view = revealing.or(focus);
         let held_in_view = kept_in_view.and_then(last_shown);
@@ -2922,7 +3238,7 @@ impl SettingsViewState {
         if keyboard_stop.is_some() && !first_screen {
             top = self.page_scroll.min(limit);
             plan.seated = None;
-            plan.held_start = None;
+            plan.hold_start(None);
         }
         // Where a screen shows both, the landing gives way to nothing (R3): the keyboard's
         // control whole with the landing, on the screen nearest the landing's.
@@ -3109,9 +3425,10 @@ impl SettingsViewState {
             .is_none()
             .then(|| {
                 let record = self.scroll_record.borrow();
+                // A screen scrolled since, the list no further, holds no place of its own (R4).
                 record
                     .as_ref()
-                    .filter(|record| record.unscrolled(self))
+                    .filter(|record| record.unscrolled(self) && record.hold)
                     .map(|record| {
                         record
                             .place
@@ -3120,6 +3437,12 @@ impl SettingsViewState {
                     })
             })
             .flatten();
+        let beside_shown = beside_spent
+            || self.first_beside().is_some_and(|(key, _)| {
+                plan.stop_holding(key).is_some_and(|index| {
+                    plan.shows_span(index, 0, plan.span_of(index, Some(key), Reveal::Keep))
+                })
+            });
         let view = plan.screen(top).view;
         self.record_result_page_limit(limit);
         self.page_window.set(Some(plan.shown(top).len().max(1)));
@@ -3133,6 +3456,9 @@ impl SettingsViewState {
             opening,
             left,
             keyboard: focus.cloned(),
+            beside_shown,
+            beside_spent,
+            moved_start: moved_start == Some(true) && plan.held_start.is_some(),
             landed,
             hold: true,
             place,
@@ -3185,6 +3511,7 @@ impl SettingsViewState {
         let Some(top) = record.drawn.take() else {
             return;
         };
+        self.page_events = true;
         self.page_scroll = top;
         record.place = None;
         let landed = record.landed.take();
@@ -3456,7 +3783,44 @@ impl SettingsViewState {
             .then_some(key)
     }
 
-    /// Whether the list last seated lists the keyboard's control and no screen shows it whole.
+    /// A pinned filter's first result revealed beside the filter, and the reveal it replaced.
+    fn first_beside(&self) -> Option<&(UiKey, Option<UiKey>)> {
+        self.first_beside.as_ref().filter(|(key, _)| {
+            self.reveal_as == Reveal::Keep
+                && self.page_reveal.as_ref() == Some(key)
+                && self.common.last_focus.as_ref() != Some(key)
+        })
+    }
+
+    /// The reveal a first result gives back once shown whole at the top and then re-laid (R5, R1).
+    fn beside_given_back(
+        &self,
+        plan: &ScrollPlan,
+        record: Option<&ScrollRecord>,
+    ) -> Option<Option<&UiKey>> {
+        let (_, before) = self.first_beside()?;
+        let record = record.filter(|record| record.context == self.scroll_context())?;
+        let relaid = !(record.drawn.is_some()
+            && (record.plan.room - plan.room).abs() < 0.5
+            && record.plan.heights == plan.heights);
+        (record.beside_spent || (record.beside_shown && relaid)).then_some(before.as_ref())
+    }
+
+    /// Whether the reveal is the control `record`'s screen pinned, the seat's to keep (R5).
+    pub(super) fn reveals_pinned(&self, record: Option<&ScrollRecord>) -> bool {
+        self.reveal_as == Reveal::Keep
+            && self.page_reveal.is_some()
+            && self.page_reveal == self.common.last_focus
+            && record.is_some_and(|record| {
+                record.plan.pin.is_some()
+                    && self
+                        .page_reveal
+                        .as_ref()
+                        .is_some_and(|key| record.plan.stop_of(key).is_none())
+            })
+    }
+
+    /// Whether the last list cuts the keyboard's control, or pins it where a bar covers some.
     pub(super) fn keyboard_cut(&self) -> bool {
         let Some(key) = self.common.last_focus.as_ref() else {
             return false;
@@ -3469,7 +3833,7 @@ impl SettingsViewState {
             .is_some_and(|record| {
                 let plan = &record.plan;
                 let Some(index) = plan.stop_of(key) else {
-                    return false;
+                    return plan.pin.is_some_and(|pin| !Left::pinned(key, pin).whole);
                 };
                 let (from, to) = plan
                     .control_span(index, key)
@@ -3488,6 +3852,19 @@ impl SettingsViewState {
                     && !(0..=plan.limit()).any(|top| whole(plan, top))
                     && partway() != Some(true)
             })
+    }
+
+    /// Whether a screen seated now precedes the first event, as [`Self::landing_cut`] reads it.
+    pub(super) fn seats_opening(&self) -> bool {
+        let context = self.scroll_context();
+        self.scroll_record.borrow().as_ref().is_none_or(|record| {
+            record.context != context || (record.opening && record.drawn.is_some())
+        })
+    }
+
+    /// Whether no event has arrived since the page opened, whatever its list's context since (R3).
+    pub(super) const fn landing_untouched(&self) -> bool {
+        !self.page_events
     }
 
     /// Whether the list lands on the theme in use, which [`Self::landing_cut`] reads.
@@ -3510,6 +3887,64 @@ impl SettingsViewState {
                     .plan
                     .stop_holding(landing)
                     .is_some_and(|index| !record.plan.shows_landing(index, record.top))
+            })
+    }
+
+    /// What the list reveals: the landing (R3), or a first result or the reveal it gave back (R5).
+    pub(super) fn reveal_owed(&self) -> Option<&UiKey> {
+        let spent = || {
+            self.scroll_record.borrow().as_ref().is_some_and(|record| {
+                record.context == self.scroll_context() && record.beside_spent
+            })
+        };
+        let reveal = match self.first_beside() {
+            Some((_, before)) if spent() => before.as_ref(),
+            _ => self.page_reveal.as_ref(),
+        };
+        reveal.filter(|key| {
+            self.landing_owed()
+                || (self.reveal_as == Reveal::Keep && self.common.last_focus.as_ref() != Some(*key))
+        })
+    }
+
+    /// Whether the screen last seated cuts what the list reveals beside the keyboard's control.
+    pub(super) fn reveal_cut(&self) -> bool {
+        if self.landing_owed() {
+            return self.landing_cut();
+        }
+        let Some(reveal) = self.reveal_owed() else {
+            return false;
+        };
+        let context = self.scroll_context();
+        let record = self.scroll_record.borrow();
+        record
+            .as_ref()
+            .filter(|record| record.context == context)
+            .is_some_and(|record| {
+                record
+                    .plan
+                    .stop_holding(reveal)
+                    .is_some_and(|index| !record.plan.shows_landing(index, record.top))
+            })
+    }
+
+    /// Whether the screen last seated paints any of what the list reveals beside the keyboard.
+    pub(super) fn reveal_painted(&self) -> bool {
+        let Some(reveal) = self.reveal_owed() else {
+            return false;
+        };
+        let context = self.scroll_context();
+        let record = self.scroll_record.borrow();
+        record
+            .as_ref()
+            .filter(|record| record.context == context)
+            .is_some_and(|record| {
+                let plan = &record.plan;
+                plan.stop_holding(reveal).is_some_and(|index| {
+                    let screen = plan.screen(record.top.min(plan.limit()));
+                    let span = plan.revealed_span(index, Reveal::Keep);
+                    plan.painted_of_span_on(&screen, index, reveal, span) > 0.0
+                })
             })
     }
 
@@ -3561,6 +3996,15 @@ impl SettingsViewState {
             .map(|_| Left::on(&record.plan, key, record.top))
     }
 
+    /// What the screen last seated shows of the keyboard's control, listed or else pinned.
+    pub(super) fn keyboard_on_page(&self) -> Option<Left> {
+        let key = self.common.last_focus.as_ref()?;
+        let context = self.scroll_context();
+        let record = self.scroll_record.borrow();
+        let record = record.as_ref().filter(|record| record.context == context)?;
+        record.shown_of(key, Left::on(&record.plan, key, record.top))
+    }
+
     /// Whether the screen last seated shows the keyboard's control less than `record`'s (R2).
     pub(super) fn keyboard_short_of(&self, record: Option<&ScrollRecord>) -> bool {
         self.common.last_focus.is_some() && !self.keyboard_kept(self.keyboard_was(record).as_ref())
@@ -3570,18 +4014,28 @@ impl SettingsViewState {
     /// screen before, showed of it where that was cut, else all of it (R2 of
     /// [`Self::seat_scroll`]).
     pub(super) fn keyboard_owed(&self, record: Option<&ScrollRecord>) -> Option<f32> {
+        let tall = self.keyboard_height();
         match self.keyboard_was(record) {
-            Some(left) if !left.whole => Some(left.part),
-            _ => self.keyboard_height(),
+            Some(left) if !left.whole && !tall.is_some_and(|tall| left.grown(tall)) => {
+                Some(left.part)
+            }
+            _ => tall,
         }
     }
 
-    /// What `record` left the person of the keyboard's control, where it was drawn for it.
+    /// What `record` left of the keyboard's control where it was drawn for it, listed or pinned.
     fn keyboard_was(&self, record: Option<&ScrollRecord>) -> Option<Left> {
         let key = self.common.last_focus.as_ref()?;
         record
             .filter(|record| record.same_context(self) && record.keyboard.as_ref() == Some(key))
-            .map(|record| record.left_of(key))
+            .and_then(|record| record.shown_of(key, record.left_of(key)))
+    }
+
+    /// What screens paint of the keyboard's listed control, as the list last seated lays it out.
+    pub(super) fn keyboard_peek(&self) -> Option<Peek> {
+        Some(Peek {
+            tall: self.keyboard_height()?,
+        })
     }
 
     /// How tall the list last seated lays the keyboard's listed control out.
@@ -3600,6 +4054,25 @@ impl SettingsViewState {
         Some(to - from)
     }
 
+    /// Whether the last list lays the keyboard's listed control out unlike `record`'s screen.
+    pub(super) fn keyboard_relaid(&self, record: Option<&ScrollRecord>) -> bool {
+        let Some(key) = self.common.last_focus.as_ref() else {
+            return false;
+        };
+        let was = record
+            .filter(|record| record.same_context(self))
+            .and_then(|record| {
+                let plan = &record.plan;
+                let index = plan.stop_of(key)?;
+                let (from, to) = plan
+                    .control_span(index, key)
+                    .unwrap_or_else(|| plan.controls_of(index));
+                Some(to - from)
+            });
+        was.zip(self.keyboard_height())
+            .is_some_and(|(was, now)| (was - now).abs() > 0.5)
+    }
+
     /// How tall the list last seated lays the keyboard's listed control out, where its screen
     /// shows it whole.
     pub(super) fn keyboard_whole(&self) -> Option<f32> {
@@ -3609,13 +4082,14 @@ impl SettingsViewState {
             .flatten()
     }
 
-    /// Whether the screen last seated shows the keyboard's control no less than `was` did.
+    /// Whether the screen last seated shows the keyboard's control more than `was` did.
+    pub(super) fn keyboard_shows_more(&self, was: &Left) -> bool {
+        self.keyboard_left().is_some_and(|now| !now.kept_by(was))
+    }
+
+    /// Whether the last screen shows the keyboard's control, listed or pinned, no less than `was`.
     pub(super) fn keyboard_kept(&self, was: Option<&Left>) -> bool {
-        match (was, self.keyboard_left()) {
-            (Some(was), Some(now)) => was.kept_by(&now),
-            (None, Some(now)) => now.whole,
-            (_, None) => true,
-        }
+        Left::kept(was, self.keyboard_on_page().as_ref())
     }
 
     /// Keep `key` in view at the next render, its whole stop.
@@ -3846,8 +4320,8 @@ impl SettingsViewState {
         false
     }
 
-    /// A press keeps its control in view, however the press came.
-    pub(super) fn reveal_press(&mut self, key: &UiKey, before: Option<&UiKey>) {
+    /// A press however it came keeps its control in view where it left the keyboard (`kept`).
+    pub(super) fn reveal_press(&mut self, key: &UiKey, before: Option<&UiKey>, kept: bool) {
         if self.page_reveal.as_ref() != before {
             return;
         }
@@ -3858,8 +4332,11 @@ impl SettingsViewState {
             .as_ref()
             .filter(|record| record.context == context)
             .is_some_and(|record| record.plan.stop_of(key).is_some());
-        if listed {
+        if listed && kept {
             self.reveal_pressed(key.clone());
+        } else if listed && self.landing_owed() {
+            // A press moving the keyboard ends the landing: R3 owes it only before the first event.
+            self.page_reveal = None;
         }
     }
 
@@ -3931,10 +4408,13 @@ impl SettingsViewState {
     /// Whether the stop holding the control the list keeps in view ([`Self::page_reveal`])
     /// fits the list's room.
     pub(super) fn revealed_stop_fits(&self) -> bool {
-        let Some(key) = self.page_reveal.as_ref() else {
-            return true;
-        };
-        self.scroll_plan().is_none_or(|plan| {
+        self.scroll_plan()
+            .is_none_or(|plan| self.revealed_stop_fits_in(&plan))
+    }
+
+    /// Whether that stop fits the room of `plan`, a list's plan told unseated.
+    pub(super) fn revealed_stop_fits_in(&self, plan: &ScrollPlan) -> bool {
+        self.page_reveal.as_ref().is_none_or(|key| {
             plan.stop_holding(key)
                 .or_else(|| plan.stop_of(key))
                 .is_none_or(|stop| plan.drawn_span(stop..stop + 1) <= plan.room() + 0.01)
@@ -3991,7 +4471,9 @@ impl SettingsViewState {
         if self.measuring_calm.get() {
             return;
         }
-        let overrun = self.status_overrun_of(plan, room, self.status_slack.get());
+        let record = self.scroll_record.borrow();
+        let overrun = self.status_overrun_of(plan, room, self.status_slack.get(), record.as_ref());
+        drop(record);
         if overrun > 0.01 {
             self.status_overrun
                 .set(self.status_overrun.get().max(overrun));
@@ -4000,7 +4482,13 @@ impl SettingsViewState {
 
     /// How far a status's bar must shorten over `plan`, seated in `room` with `slack` more the bar
     /// could give back ([`Self::note_status_room`]).
-    fn status_overrun_of(&self, plan: &ScrollPlan, room: f32, slack: f32) -> f32 {
+    fn status_overrun_of(
+        &self,
+        plan: &ScrollPlan,
+        room: f32,
+        slack: f32,
+        record: Option<&ScrollRecord>,
+    ) -> f32 {
         let (given, room) = (plan.given + slack, room + slack);
         if given <= 0.01 {
             return 0.0;
@@ -4018,7 +4506,10 @@ impl SettingsViewState {
             }
         };
         let focus = self.common.last_focus.as_ref();
-        let spans: Vec<(usize, (f32, f32))> = [self.page_reveal.as_ref(), focus]
+        let reveal = self
+            .beside_given_back(plan, record)
+            .unwrap_or(self.page_reveal.as_ref());
+        let spans: Vec<(usize, (f32, f32))> = [reveal, focus]
             .into_iter()
             .flatten()
             .filter_map(|key| {
@@ -4145,8 +4636,14 @@ impl SettingsViewState {
 
     /// How far a status's bar over a list `room` tall, with `slack` more it could give back, must
     /// shorten: `plan` ([`ListLaid::planned`]) seated there, with no page built.
-    pub(super) fn overrun_under(&self, plan: &ScrollPlan, room: f32, slack: f32) -> f32 {
-        self.status_overrun_of(plan, room, slack)
+    pub(super) fn overrun_under(
+        &self,
+        plan: &ScrollPlan,
+        room: f32,
+        slack: f32,
+        record: Option<&ScrollRecord>,
+    ) -> f32 {
+        self.status_overrun_of(plan, room, slack, record)
     }
 
     /// A status never covers a control pinned around the list either: the bar shortens for the
@@ -4779,16 +5276,15 @@ pub(super) fn seat_room(plan: &mut ScrollPlan, room: f32, overhang: Overhang) {
         && (0..n).all(|stop| plan.whole_by(0, stop) <= room + 0.01);
     if fits {
         plan.set_room(room + now);
-        plan.overhang = 0.0;
+        plan.set_overhang(0.0);
     } else {
         plan.set_room(room);
-        plan.overhang = now;
+        plan.set_overhang(now);
     }
 }
 
-/// The room a list `room` tall that ends as `foot` fits and groups its stops for: under a
-/// status, a whole-stop list's room the bar leaves.
-fn stops_room(state: &SettingsViewState, room: f32, foot: ListFoot) -> f32 {
+/// The room a list `room` tall ending as `foot` groups stops for: under a status, the bar's rest.
+pub(super) fn stops_room(state: &SettingsViewState, room: f32, foot: ListFoot) -> f32 {
     match foot {
         ListFoot::Whole => (room - state.status_extra.get()).max(0.0),
         ListFoot::Peek => room,
@@ -5111,31 +5607,36 @@ fn is_heading(node: &UiNode) -> bool {
 }
 
 impl SplitCard {
-    /// A column card authored whole.
-    pub(super) fn from_column(node: &UiNode) -> Option<Self> {
+    /// A column card authored whole, its rows moved out; `Err` gives back a boxed non-card node.
+    pub(super) fn from_column(node: UiNode) -> Result<Self, Box<UiNode>> {
         let UiContent::Group(spec) = &node.content else {
-            return None;
+            return Err(Box::new(node));
         };
         if node.layout.flow != Flow::Column || node.children.is_empty() {
-            return None;
+            return Err(Box::new(node));
         }
-        let mut rows = node
+        let heights = node
             .children
             .iter()
             .map(|child| match child.layout.height {
-                Length::Fixed(height) => Some((child.clone(), height)),
+                Length::Fixed(height) => Some(height),
                 _ => None,
             })
-            .collect::<Option<Vec<_>>>()?;
+            .collect::<Option<Vec<_>>>();
+        let Some(heights) = heights else {
+            return Err(Box::new(node));
+        };
+        let spec = spec.clone();
+        let mut rows: Vec<(UiNode, f32)> = node.children.into_iter().zip(heights).collect();
         let leads = rows.len() > 1 && is_heading(&rows[0].0);
         let head = if leads {
             vec![rows.remove(0)]
         } else {
             Vec::new()
         };
-        Some(Self {
+        Ok(Self {
             key: node.key.as_str().to_string(),
-            spec: spec.clone(),
+            spec,
             padding: node.layout.padding,
             gap: node.layout.gap,
             head,
@@ -5145,10 +5646,15 @@ impl SplitCard {
     }
 
     fn height_of(&self, rows: Range<usize>) -> f32 {
-        let children = self.head.len() + rows.len();
+        self.height_under(&self.head, rows)
+    }
+
+    /// How tall the card's `rows` stand under `head`.
+    fn height_under(&self, head: &[(UiNode, f32)], rows: Range<usize>) -> f32 {
+        let children = head.len() + rows.len();
         self.padding.top
             + self.padding.bottom
-            + self.head.iter().map(|(_, height)| height).sum::<f32>()
+            + head.iter().map(|(_, height)| height).sum::<f32>()
             + self.rows[rows]
                 .iter()
                 .map(|(_, height)| height)
@@ -5318,14 +5824,10 @@ impl SplitCard {
                     })
                 )
         };
-        let notes: Vec<bool> = self
-            .rows
-            .iter()
-            .enumerate()
-            .map(|(row, (node, _))| {
-                controls[..row].iter().any(|control| *control) && notes_rows_over(node)
-            })
-            .collect();
+        // Read only for a stop's first row the rows after it could join.
+        let notes = |row: usize| {
+            controls[..row].iter().any(|control| *control) && notes_rows_over(&self.rows[row].0)
+        };
         // A row that draws nothing (a note's lines kept empty) ends the stop before it, as a
         // blank part ends its row ([`row_parts`]): a stop of its own, it was the last screen of
         // Text & Fonts at 2x in 178x152, a band of empty card.
@@ -5344,7 +5846,7 @@ impl SplitCard {
                 Some(stop)
                     if !has_control(stop)
                         && !under_control(stop.start)
-                        && !notes[stop.start]
+                        && !notes(stop.start)
                         && controls[row..].iter().any(|control| *control)
                         && height(stop.start..row + 1) <= room + 0.01 =>
                 {
@@ -5373,11 +5875,16 @@ impl SplitCard {
         } else {
             &self.head
         };
+        self.node_under(head, rows)
+    }
+
+    /// The card holding `rows` under `head`.
+    fn node_under(&self, head: &[(UiNode, f32)], rows: Range<usize>) -> UiNode {
         UiNode::new(self.key.clone(), UiContent::Group(self.spec.clone()))
             .layout(
                 Layout::column()
                     .width(Length::Fill)
-                    .height(Length::Fixed(self.height_of(rows.clone())))
+                    .height(Length::Fixed(self.height_under(head, rows.clone())))
                     .padding(self.padding)
                     .gap(self.gap)
                     .clipped(),
@@ -5697,14 +6204,14 @@ pub(super) enum ListItem {
 impl ListItem {
     /// A card node listed row by row where it is a column of fixed rows, whole where it is not.
     pub(super) fn of(node: UiNode, height: f32) -> Self {
-        match SplitCard::from_column(&node) {
-            Some(card) => Self::Split(card),
-            None => Self::Card(Box::new(node), height),
+        match SplitCard::from_column(node) {
+            Ok(card) => Self::Split(card),
+            Err(node) => Self::Card(node, height),
         }
     }
 }
 
-type ItemStops = Vec<(usize, Option<Range<usize>>)>;
+pub(super) type ItemStops = Vec<(usize, Option<Range<usize>>)>;
 
 fn plan_items(items: &[ListItem], gap: f32, room: f32) -> (ScrollPlan, ItemStops) {
     plan_items_measured(items, gap, room, true)
@@ -5723,8 +6230,15 @@ fn plan_items_measured(
     room: f32,
     measured: bool,
 ) -> (ScrollPlan, ItemStops) {
-    let mut plan = ScrollPlan::new(gap);
-    let mut stops: ItemStops = Vec::new();
+    let stops_at_most = items
+        .iter()
+        .map(|item| match item {
+            ListItem::Split(card) => card.rows.len().max(1),
+            _ => 1,
+        })
+        .sum();
+    let mut plan = ScrollPlan::with_stops(gap, stops_at_most);
+    let mut stops: ItemStops = Vec::with_capacity(stops_at_most);
     let keys = |node: &UiNode| {
         if measured {
             focus_keys(node)
@@ -5981,16 +6495,12 @@ impl SeatedList {
                     let last = stops.get(rows.end - 1)?.1.clone()?.end;
                     // Off the screen a part lists its rows alone, but for a head that is a control
                     // over its first row, which stays in the tree with it as every control does.
-                    let part = SplitCard {
-                        head: if first == 0 && !card.repeat.is_empty() {
-                            card.head.clone()
-                        } else {
-                            Vec::new()
-                        },
-                        repeat: Vec::new(),
-                        ..card.clone()
+                    let head: &[(UiNode, f32)] = if first == 0 && !card.repeat.is_empty() {
+                        &card.head
+                    } else {
+                        &[]
                     };
-                    let mut node = part.node(first..last).offscreen();
+                    let mut node = card.node_under(head, first..last).offscreen();
                     node.key = UiKey::new(format!("{}/{side}", card.key));
                     Some(node)
                 }
@@ -6010,20 +6520,21 @@ impl SeatedList {
     }
 }
 
-/// [`list_page`] whose rows off the screen are in the tree too ([`UiNode::offscreen`]).
+/// [`list_page`] with offscreen rows in the tree, the keyboard's control pinned as `pin` says.
 pub(super) fn list_page_whole(
     state: &SettingsViewState,
     (key, label): (&str, &str),
     items: std::rc::Rc<[ListItem]>,
     (room, gap): (f32, f32),
-    rows: ListRows,
+    (rows, pin): (ListRows, Option<(f32, f32)>),
 ) -> UiNode {
     let given = state.status_extra.get();
     let fitted = fit_rows(&items, stops_room(state, room, ListFoot::Whole));
     let planned = shared_plan(&items, (gap, room, given), || {
         plan_under_status(&fitted, gap, room, given, Overhang::NONE, ListFoot::Whole)
     });
-    let (plan, stops) = (*planned).clone();
+    let (mut plan, stops) = (*planned).clone();
+    plan.pin_keyboard(pin);
     let seated = SeatedList::seated(state, plan, stops, room);
     let drawn = seated.drawn.clone();
     let above = seated.offscreen_children(&fitted, 0..drawn.start, "above");

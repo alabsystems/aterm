@@ -35,6 +35,10 @@ pub struct Report {
     pub left: Vec<String>,
     /// Not written, or not removed: the name and why (never the value).
     pub failed: Vec<(String, String)>,
+    /// Never written, as no vault carries an AI CLI's login file ([`text::cli_login_refusal`]),
+    /// which a vault an older admin wrote may hold: the name and why. The rest of the vault is
+    /// applied all the same.
+    pub refused: Vec<(String, String)>,
 }
 
 /// The directory under `~/.secrets` that moved-aside files go to.
@@ -63,6 +67,11 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 pub fn target_path(home: &Path, name: &str) -> crate::Result<PathBuf> {
     if crate::reserved_name(name) {
         return Err(Error::new("a reserved entry has no plaintext file path"));
+    }
+    // A vault an older admin wrote one into still opens; its file is never written, nor taken
+    // back once the entry goes, since the CLI's own login stands there ([`Report::refused`]).
+    if let Some(why) = text::cli_login_refusal(name) {
+        return Err(Error::new(why));
     }
     written_path(home, name)
 }
@@ -141,14 +150,21 @@ pub fn apply_resuming(
         .filter(|(name, _)| crate::reserved_name(name))
         .map(|(name, digest)| (name.clone(), digest.clone()))
         .collect();
-    let ordinary;
-    let entries = if entries
+    // An AI CLI's login file is never the vault's: an entry naming one is refused, never
+    // written, and a file a build that did not refuse it wrote there is the CLI's own login now,
+    // neither taken back nor kept in the manifest.
+    let refused: Vec<(String, String)> = entries
         .iter()
-        .any(|entry| crate::reserved_name(&entry.name))
-    {
+        .filter_map(|entry| {
+            text::cli_login_refusal(&entry.name).map(|why| (entry.name.clone(), why))
+        })
+        .collect();
+    let set_apart = |name: &str| crate::reserved_name(name) || text::cli_login(name).is_some();
+    let ordinary;
+    let entries = if entries.iter().any(|entry| set_apart(&entry.name)) {
         ordinary = entries
             .iter()
-            .filter(|entry| !crate::reserved_name(&entry.name))
+            .filter(|entry| !set_apart(&entry.name))
             .cloned()
             .collect::<Vec<_>>();
         ordinary.as_slice()
@@ -159,7 +175,7 @@ pub fn apply_resuming(
         files: held
             .files
             .iter()
-            .filter(|(name, _)| !crate::reserved_name(name))
+            .filter(|(name, _)| !set_apart(name))
             .map(|(name, digest)| (name.clone(), digest.clone()))
             .collect(),
     };
@@ -205,7 +221,10 @@ pub fn apply_resuming(
         ahead(&kept, &pending)?;
     }
     let mut manifest = Manifest::default();
-    let mut report = Report::default();
+    let mut report = Report {
+        refused,
+        ..Report::default()
+    };
     let mut claimed: BTreeMap<(u64, u64), String> = BTreeMap::new();
     let mut spared: BTreeSet<(u64, u64)> = BTreeSet::new();
     let mut withdrawn: Vec<(String, String)> = Vec::new();
@@ -1148,6 +1167,60 @@ mod tests {
             assert!(target_path(home, bad).is_err(), "{bad}");
         }
         assert_eq!(aside_name("~/.aterm/x.toml", 9), "~%2F.aterm%2Fx.toml.9");
+    }
+
+    #[test]
+    fn a_vault_entry_naming_a_cli_login_is_never_written_nor_taken_back() {
+        const LOGIN: &str = "~/.codex/auth.json";
+        let home = scratch();
+        let login = home.path().join(".codex").join("auth.json");
+        std::fs::create_dir(home.path().join(".codex")).expect("dir");
+        plant(&login, b"this machine's own login", 0o600);
+        let (_, report) = apply(
+            home.path(),
+            &[entry(LOGIN, b"another machine's login"), entry("t", b"v")],
+            &Manifest::default(),
+            1,
+        )
+        .expect("applied");
+        assert_eq!(read(&login), b"this machine's own login");
+        assert_eq!(report.written, ["t"]);
+        assert!(report.moved_aside.is_empty(), "{:?}", report.moved_aside);
+        assert!(
+            report.failed.is_empty(),
+            "the rest applied: {:?}",
+            report.failed
+        );
+        assert_eq!(
+            report
+                .refused
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            [LOGIN]
+        );
+        // An older build wrote it, and the vault no longer names it: the login standing there
+        // is the CLI's own now, never the vault's to remove.
+        plant(&login, b"written by an older build", 0o600);
+        let held = Manifest {
+            files: [(LOGIN.to_string(), digest_hex(b"written by an older build"))].into(),
+        };
+        let (manifest, report) = apply(home.path(), &[], &held, 2).expect("dropped");
+        assert!(report.removed.is_empty(), "{:?}", report.removed);
+        assert_eq!(read(&login), b"written by an older build");
+        assert!(manifest.files.is_empty(), "{manifest:?}");
+        // Still in the vault, it leaves the manifest too, so no later pass counts it as a file
+        // the vault wrote.
+        let (manifest, report) = apply(
+            home.path(),
+            &[entry(LOGIN, b"another machine's login")],
+            &held,
+            3,
+        )
+        .expect("applied");
+        assert!(manifest.files.is_empty(), "{manifest:?}");
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert_eq!(read(&login), b"written by an older build");
     }
 
     #[test]

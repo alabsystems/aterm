@@ -100,6 +100,12 @@ fn driver(
                     bytes,
                 );
                 s.push_str(&format!(
+                    "{{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\"{name}\",\"kind\":[\"bin\"]}},\"profile\":{{\"test\":true}},\"executable\":\"/ignored/deps/{name}-test\"}}\n"
+                ));
+                s.push_str(&format!(
+                    "{{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\"{name}\",\"kind\":[\"lib\"]}},\"executable\":\"/ignored/deps/lib{name}\"}}\n"
+                ));
+                s.push_str(&format!(
                     "{{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\"{name}\",\"kind\":[\"bin\"]}},\"executable\":\"{}\"}}\n",
                     exe.display()
                 ));

@@ -164,6 +164,10 @@ pub(crate) mod consts {
     /// `CGWindow.h:145,160`.
     pub(crate) const CG_WINDOW_LIST_ON_SCREEN_NON_DESKTOP: u32 = 0x01 | 0x10;
 
+    /// `CGWindow.h` — `kCGWindowListOptionAll` (0) `| kCGWindowListExcludeDesktopElements`
+    /// (`1 << 4`): every window, on screen or not (another Space, hidden, minimized, ordered out).
+    pub(crate) const CG_WINDOW_LIST_ALL_NON_DESKTOP: u32 = 0x10;
+
     /// `CGWindow.h:42` — `#define kCGNullWindowID ((CGWindowID)0)`.
     pub(crate) const CG_NULL_WINDOW_ID: u32 = 0;
 }

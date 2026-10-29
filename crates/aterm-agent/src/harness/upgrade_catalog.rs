@@ -338,11 +338,15 @@ pub fn parse_facts(text: &str) -> Option<BuildFacts> {
 /// Returns the target binary path from the last `exec '<path>' "$@"` line of a managed twin shim.
 #[must_use]
 pub fn twin_binary(twin_text: &str) -> Option<std::path::PathBuf> {
-    twin_text.lines().rev().find_map(|l| {
-        let rest = l.trim().strip_prefix("exec '")?;
-        let (path, tail) = rest.split_once('\'')?;
-        (tail.trim() == "\"$@\"" && path.starts_with('/')).then(|| std::path::PathBuf::from(path))
-    })
+    if !twin_text.starts_with("#!/bin/sh\n") {
+        return None;
+    }
+    let last = twin_text.lines().rev().find(|l| !l.trim().is_empty())?;
+    let quoted = last
+        .trim()
+        .strip_prefix("exec '")?
+        .strip_suffix("' \"$@\"")?;
+    (!quoted.contains('\'') && quoted.starts_with('/')).then(|| std::path::PathBuf::from(quoted))
 }
 
 /// Returns the baked catalog of `binary`, cached under `cache_dir` by path, size, and mtime.
@@ -454,5 +458,17 @@ mod tests {
         );
         assert_eq!(twin_binary("exec 'relative/claude' \"$@\""), None);
         assert_eq!(twin_binary("#!/bin/sh\n"), None);
+        for other in [
+            "#!/bin/bash\nexec '/P/store/claude/b/bin/claude' \"$@\"\n",
+            "#!/bin/sh/not-an-interpreter\nexec '/P/store/claude/b/bin/claude' \"$@\"\n",
+            "#!/bin/sh\r\nexec '/P/store/claude/b/bin/claude' \"$@\"\n",
+            "#!/bin/sh -e\nexec '/P/store/claude/b/bin/claude' \"$@\"\n",
+            "#!/bin/sh\nexec 'relative/claude' \"$@\"\n",
+            "#!/bin/sh\nexec '/a'\"'\"'b/claude' \"$@\"\n",
+            "#!/bin/sh\nexec '/P/store/claude/b/bin/claude' \"$@\"\necho after\n",
+            "#!/bin/sh\nexec /P/store/claude/b/bin/claude \"$@\"\n",
+        ] {
+            assert_eq!(twin_binary(other), None, "{other}");
+        }
     }
 }

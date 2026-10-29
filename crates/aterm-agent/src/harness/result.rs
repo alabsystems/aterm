@@ -51,6 +51,11 @@ enum Item {
     Prompt(String),
     /// A turn's start whose prompt is absent or not yet read.
     Boundary,
+    /// A Codex rollout's user message read while no turn's opening waits for its prompt (one
+    /// steered into a running turn, or one before every turn's start the read holds): no turn's
+    /// start, and none of its report; [`thread_of`] (`result full` over a rollout,
+    /// [`rollout_reply`]) shows it as a prompt is shown.
+    Steered(String),
     /// One assistant message, its rows merged by `message.id`.
     Said {
         id: Option<String>,
@@ -102,7 +107,7 @@ fn last_block_calls(content: Option<&Value>) -> Option<bool> {
 fn ends_in_call(items: &[Item]) -> bool {
     items.iter().rev().find_map(|i| match i {
         Item::Said { calls, .. } => Some(*calls),
-        Item::Prompt(_) | Item::Boundary => None,
+        Item::Prompt(_) | Item::Boundary | Item::Steered(_) => None,
     }) == Some(Some(true))
 }
 
@@ -252,7 +257,7 @@ fn worker_turns(items: &[Item]) -> Vec<TurnRows<'_>> {
         let next_prompt = match item {
             Item::Prompt(words) => Some(words.as_str()),
             Item::Boundary => None,
-            Item::Said { .. } => continue,
+            Item::Said { .. } | Item::Steered(_) => continue,
         };
         // An empty turn still separates its landing from an older report.
         if at > 0 {
@@ -710,12 +715,17 @@ fn by_turn(newest: &TurnRows<'_>) -> Result<Report, &'static str> {
 /// The whole exchange since the task's user row, and whether the read holds that row.
 #[must_use]
 pub fn thread(jsonl: &str) -> (String, bool) {
-    let items = items(jsonl);
+    thread_of(&items(jsonl))
+}
+
+/// [`thread`] over a conversation's `items`: each prompt (and each message steered into a turn)
+/// quoted `> `, each message's words as they are.
+fn thread_of(items: &[Item]) -> (String, bool) {
     let start = items.iter().position(Item::is_prompt);
     let mut out = String::new();
     for item in &items[start.unwrap_or(0)..] {
         let block = match item {
-            Item::Prompt(t) => t
+            Item::Prompt(t) | Item::Steered(t) => t
                 .lines()
                 .map(|l| {
                     if l.is_empty() {
@@ -763,13 +773,29 @@ pub enum Source {
         turn: String,
         rollout: Option<PathBuf>,
     },
+    /// No result of a Codex rollout ([`snapshot_rollout`]), and why ([`report`]'s word, or
+    /// `no-transcript` where no rollout was read), with what [`reread`] reads it again by: the
+    /// conversation, the turn the landing read where the rollout named it, the rollout where one
+    /// was read, the `$CODEX_HOME` the conversation's rollout is found under where the landing
+    /// knew it, and when the landing was seen (unix ms).
+    RolloutUnavailable {
+        why: String,
+        thread: String,
+        turn: Option<String>,
+        rollout: Option<PathBuf>,
+        home: Option<PathBuf>,
+        landed: Option<i64>,
+    },
 }
 
 impl Source {
     /// The sidecar line: `source=transcript session=<pct> uuid=<pct>`, `source=none why=<word>`
-    /// (with ` turn=<pct>` where it names the turn), `source=screen program=<word>` or
-    /// `source=rollout thread=<pct> turn=<pct>` (with ` rollout=<pct>`), then
-    /// ` transcript=<pct>` when a transcript was read.
+    /// (with ` turn=<pct>` where it names the turn), `source=screen program=<word>`,
+    /// `source=rollout thread=<pct> turn=<pct>` (with ` rollout=<pct>`) or, for a rollout's
+    /// missing result, `source=none why=<word> thread=<pct>` (with ` turn=<pct>`, ` rollout=<pct>`,
+    /// ` home=<pct>` and ` landed=<ms>` where it has them), then ` transcript=<pct>` when a
+    /// transcript was read. A reader that predates the rollout's `source=none` fields reads that
+    /// line as a `source=none` with no transcript: the same unavailable result, never read again.
     #[must_use]
     pub fn line(&self) -> String {
         let pct = aterm_codec::pct::encode;
@@ -814,6 +840,31 @@ impl Source {
                 }
                 (line, &none)
             }
+            Source::RolloutUnavailable {
+                why,
+                thread,
+                turn,
+                rollout,
+                home,
+                landed,
+            } => {
+                let mut line = format!("source=none why={} thread={}", pct(why), pct(thread));
+                if let Some(turn) = turn {
+                    line.push_str(" turn=");
+                    line.push_str(&pct(turn));
+                }
+                for (key, path) in [(" rollout=", rollout), (" home=", home)] {
+                    if let Some(path) = path {
+                        line.push_str(key);
+                        line.push_str(&pct(&path.to_string_lossy()));
+                    }
+                }
+                if let Some(ms) = landed {
+                    line.push_str(" landed=");
+                    line.push_str(&ms.to_string());
+                }
+                (line, &none)
+            }
         };
         if let Some(path) = transcript {
             out.push_str(" transcript=");
@@ -837,11 +888,25 @@ impl Source {
                 uuid: field("uuid")?,
                 transcript,
             }),
-            "none" => Some(Source::Unavailable {
-                why: field("why").filter(|w| is_word(w))?,
-                transcript,
-                turn: field("turn"),
-            }),
+            "none" => {
+                let why = field("why").filter(|w| is_word(w))?;
+                let turn = field("turn");
+                Some(match field("thread") {
+                    None => Source::Unavailable {
+                        why,
+                        transcript,
+                        turn,
+                    },
+                    Some(thread) => Source::RolloutUnavailable {
+                        why,
+                        thread,
+                        turn,
+                        rollout: field("rollout").map(PathBuf::from),
+                        home: field("home").map(PathBuf::from),
+                        landed: field("landed").and_then(|ms| ms.parse().ok()),
+                    },
+                })
+            }
             "screen" => Some(Source::Screen {
                 program: field("program").filter(|w| is_word(w))?,
             }),
@@ -1107,7 +1172,7 @@ fn head_lines(text: &str, max: usize, path: &Path) -> Vec<String> {
     lines
 }
 
-fn tail_lines(text: &str, max: usize, transcript: &Path, whole: bool) -> Vec<String> {
+fn tail_lines(text: &str, max: usize, file: &Path, noun: &str, whole: bool) -> Vec<String> {
     let skip = text.chars().count().saturating_sub(max);
     let at = text
         .char_indices()
@@ -1117,8 +1182,8 @@ fn tail_lines(text: &str, max: usize, transcript: &Path, whole: bool) -> Vec<Str
     let mut lines = Vec::new();
     if skip > 0 || !whole {
         lines.push(format!(
-            "… earlier turns cut; the transcript: {}",
-            transcript.display()
+            "… earlier turns cut; the {noun}: {}",
+            file.display()
         ));
     }
     lines.extend(
@@ -1145,22 +1210,17 @@ fn tail_of(path: &Path, bytes: u64) -> Option<(String, bool)> {
 pub fn answer(path: &Path, full: bool) -> String {
     match source_of(path) {
         None => unavailable("no-snapshot"),
-        Some(Source::Unavailable { why, .. }) => unavailable(&why),
-        Some(Source::Screen { .. } | Source::Rollout { .. }) if full => {
-            unavailable("no-transcript")
+        Some(Source::Unavailable { why, .. } | Source::RolloutUnavailable { why, .. }) => {
+            unavailable(&why)
         }
-        Some(Source::Rollout { thread, turn, .. }) => {
-            let Some(text) = super::footer::read_small(path, RESULT_READ_BYTES) else {
-                return unavailable("unreadable");
-            };
-            let pct = aterm_codec::pct::encode;
-            framed(
-                &format!("source=rollout thread={} turn={}", pct(&thread), pct(&turn)),
-                text.len(),
-                "",
-                &head_lines(&text, RESULT_MAX_CHARS, path),
-            )
-        }
+        Some(Source::Screen { .. }) if full => unavailable("no-transcript"),
+        Some(Source::Rollout {
+            thread,
+            turn,
+            rollout,
+        }) => rollout_reply(&thread, &turn, rollout.as_deref(), path, full, || {
+            super::footer::read_small(path, RESULT_READ_BYTES)
+        }),
         Some(Source::Screen { program }) => {
             let Some(text) = super::footer::read_small(path, RESULT_READ_BYTES) else {
                 return unavailable("unreadable");
@@ -1229,8 +1289,68 @@ fn reply(
         &stamp,
         thread.len(),
         " full=1",
-        &tail_lines(&thread, RESULT_MAX_CHARS, file, whole && began),
+        &tail_lines(
+            &thread,
+            RESULT_MAX_CHARS,
+            file,
+            "transcript",
+            whole && began,
+        ),
     )
+}
+
+/// [`reply`] for a Codex rollout's result: `result` frames the snapshot's `text` under
+/// `source=rollout`, and `result full` the whole exchange the `rollout` holds since the task's
+/// prompt, read at request time and bounded as a transcript's is (`no-prompt` where the rollout
+/// was read whole and holds none); `no-transcript` where the snapshot names no rollout or it
+/// does not read.
+fn rollout_reply(
+    thread: &str,
+    turn: &str,
+    rollout: Option<&Path>,
+    path: &Path,
+    full: bool,
+    text: impl FnOnce() -> Option<String>,
+) -> String {
+    let pct = aterm_codec::pct::encode;
+    let stamp = format!("source=rollout thread={} turn={}", pct(thread), pct(turn));
+    if !full {
+        let Some(text) = text() else {
+            return unavailable("unreadable");
+        };
+        return framed(
+            &stamp,
+            text.len(),
+            "",
+            &head_lines(&text, RESULT_MAX_CHARS, path),
+        );
+    }
+    let Some(file) = rollout else {
+        return unavailable("no-transcript");
+    };
+    let Some((jsonl, whole)) = tail_of(file, TRANSCRIPT_READ_BYTES) else {
+        return unavailable("no-transcript");
+    };
+    let (exchange, began) = thread_of(&codex_items(&jsonl, thread));
+    if whole && !began {
+        return unavailable("no-prompt");
+    }
+    framed(
+        &stamp,
+        exchange.len(),
+        " full=1",
+        &tail_lines(&exchange, RESULT_MAX_CHARS, file, "rollout", whole && began),
+    )
+}
+
+/// What a result is read from, and so the reader [`reread`] and `result full` read it with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Conversation {
+    /// A Claude Code transcript ([`items`]).
+    Transcript,
+    /// A Codex rollout ([`codex_items`]): the report's `session` is its thread, its `uuid` the
+    /// turn.
+    Rollout,
 }
 
 /// A result the done edge missed, found when its turn was read again ([`reread`]).
@@ -1238,8 +1358,10 @@ fn reply(
 pub struct Reread {
     /// The report, as its turn's rule reads it now.
     pub report: Report,
-    /// The transcript it was read from.
+    /// The transcript (or rollout, [`Self::from`]) it was read from.
     pub transcript: PathBuf,
+    /// What that file is.
+    pub from: Conversation,
 }
 
 impl Reread {
@@ -1250,10 +1372,17 @@ impl Reread {
     }
 
     fn source(&self) -> Source {
-        Source::Transcript {
-            session: self.report.session.clone(),
-            uuid: self.report.uuid.clone(),
-            transcript: Some(self.transcript.clone()),
+        match self.from {
+            Conversation::Transcript => Source::Transcript {
+                session: self.report.session.clone(),
+                uuid: self.report.uuid.clone(),
+                transcript: Some(self.transcript.clone()),
+            },
+            Conversation::Rollout => Source::Rollout {
+                thread: self.report.session.clone(),
+                turn: self.report.uuid.clone(),
+                rollout: Some(self.transcript.clone()),
+            },
         }
     }
 
@@ -1274,27 +1403,62 @@ impl Reread {
     /// snapshot at `path`.
     #[must_use]
     pub fn answer(&self, path: &Path, full: bool) -> String {
-        reply(
-            &self.report.session,
-            &self.report.uuid,
-            Some(&self.transcript),
-            path,
-            full,
-            || Some(self.report.text.clone()),
-        )
+        let (session, uuid) = (&self.report.session, &self.report.uuid);
+        let text = || Some(self.report.text.clone());
+        match self.from {
+            Conversation::Transcript => {
+                reply(session, uuid, Some(&self.transcript), path, full, text)
+            }
+            Conversation::Rollout => {
+                rollout_reply(session, uuid, Some(&self.transcript), path, full, text)
+            }
+        }
     }
 }
 
 /// Reads again, for its turn alone, a result the done edge missed because the turn's reply was
 /// not yet written (`no-reply` or `no-marker`); `None` where there is no such miss, or the
-/// transcript no longer holds the turn's row or still has no report.
+/// transcript no longer holds the turn's row or still has no report. A Codex rollout's miss is
+/// read again by [`reread_rollout`], with no claim to name a conversation its landing knew none
+/// of ([`reread_with`]).
 #[must_use]
 pub fn reread(path: &Path) -> Option<Reread> {
+    reread_with(path, || None)
+}
+
+/// [`reread`] with the worker's `claim` as it stands now: the `$CODEX_HOME` and the thread a
+/// Codex landing's resolver names (its first step, the claim's conversation), asked only where
+/// the landing read no rollout and knew no conversation to find one by.
+#[must_use]
+pub fn reread_with(
+    path: &Path,
+    claim: impl FnOnce() -> Option<(PathBuf, String)>,
+) -> Option<Reread> {
+    let source = source_of(path);
+    if let Some(Source::RolloutUnavailable {
+        why,
+        thread,
+        turn,
+        rollout,
+        home,
+        landed,
+    }) = source
+    {
+        return reread_rollout(
+            &why,
+            &thread,
+            turn.as_deref(),
+            rollout,
+            home.as_deref(),
+            landed,
+            claim,
+        );
+    }
     let Some(Source::Unavailable {
         why,
         transcript: Some(transcript),
         turn: Some(turn),
-    }) = source_of(path)
+    }) = source
     else {
         return None;
     };
@@ -1305,13 +1469,120 @@ pub fn reread(path: &Path) -> Option<Reread> {
     let end = end_of(&jsonl, &Opener::Row(turn));
     end.upto?;
     let report = read(&upto(jsonl, end), DoneBy::Turn).report.ok()?;
-    Some(Reread { report, transcript })
+    Some(Reread {
+        report,
+        transcript,
+        from: Conversation::Transcript,
+    })
+}
+
+/// A CODEX LANDING'S MISSED RESULT, READ AGAIN FOR ITS TURN ALONE: a miss because the turn's
+/// reply was not yet written (`no-reply`, `no-marker`) is read from the `rollout` the landing
+/// read, and one with no rollout read (`no-transcript`) from the rollout the landing's resolver
+/// finds now ([`super::codex_tap::rollout_path`]): of `thread` under `home` where the landing knew
+/// them, else of the conversation the worker's `claim` names now (a thread id, the landing's own
+/// where it named one). The rollout is read up to the end of the landing's turn
+/// ([`codex_turn_upto`]) by its turn's rule, so a later turn's reply is never taken. `None` for
+/// any other miss, no conversation to find, a rollout that does not read, a landing's turn the
+/// read no longer holds (a conversation begun after the landing holds none), or a turn with still
+/// no report.
+fn reread_rollout(
+    why: &str,
+    thread: &str,
+    turn: Option<&str>,
+    rollout: Option<PathBuf>,
+    home: Option<&Path>,
+    landed: Option<i64>,
+    claim: impl FnOnce() -> Option<(PathBuf, String)>,
+) -> Option<Reread> {
+    let is_thread_id = super::codex_rollout::is_thread_id;
+    let (file, thread) = match why {
+        "no-transcript" => {
+            let (home, thread) = match home.filter(|_| is_thread_id(thread)) {
+                Some(home) => (home.to_path_buf(), thread.to_string()),
+                None => claim().filter(|(_, named)| {
+                    is_thread_id(named) && (!is_thread_id(thread) || named == thread)
+                })?,
+            };
+            (super::codex_tap::rollout_path(&home, &thread)?, thread)
+        }
+        why if LAG_MISSES.contains(&why) => (rollout?, thread.to_string()),
+        _ => return None,
+    };
+    let jsonl = super::codex_rollout::tail_of(&file, TRANSCRIPT_READ_BYTES)?;
+    let end = codex_turn_upto(&jsonl, turn, landed)?;
+    let report = read_items(&codex_items(&jsonl[..end], &thread), DoneBy::Turn)
+        .1
+        .ok()?;
+    Some(Reread {
+        report,
+        transcript: file,
+        from: Conversation::Rollout,
+    })
+}
+
+/// Where the landing's turn ends in the Codex rollout tail `jsonl` (a line's start: the next
+/// `task_started` after its own, else the read's end): the turn whose `task_started` names
+/// `turn`, or, where the landing named none, the newest one begun by `landed` (unix ms, its row's
+/// `timestamp`). `None` where the read holds no such start.
+fn codex_turn_upto(jsonl: &str, turn: Option<&str>, landed: Option<i64>) -> Option<usize> {
+    let mut at = 0;
+    let mut from = None;
+    let mut upto = None;
+    for line in jsonl.split_inclusive('\n') {
+        let next = at + line.len();
+        if let Some((id, stamp)) = codex_start(line) {
+            if from.is_some() && upto.is_none() {
+                upto = Some(at);
+            }
+            let ours = match turn {
+                Some(turn) => id.as_deref() == Some(turn),
+                None => landed
+                    .zip(stamp)
+                    .is_some_and(|(landed, began)| began <= landed),
+            };
+            if ours {
+                (from, upto) = (Some(next), None);
+            }
+        }
+        at = next;
+    }
+    from?;
+    Some(upto.unwrap_or(jsonl.len()))
+}
+
+/// A Codex rollout row that starts a turn (`task_started`): the turn it names, and when it was
+/// written (its row's `timestamp`, unix ms).
+fn codex_start(line: &str) -> Option<(Option<String>, Option<i64>)> {
+    if !line.contains("\"task_started\"") {
+        return None;
+    }
+    let v = aterm_json::from_str::<Value>(line.trim_end()).ok()?;
+    let payload = v.get("payload")?;
+    (v.get("type").and_then(Value::as_str) == Some("event_msg")
+        && payload.get("type").and_then(Value::as_str) == Some("task_started"))
+    .then(|| {
+        (
+            payload
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            v.get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(stamp_ms),
+        )
+    })
+}
+
+/// The newest turn the Codex rollout tail `jsonl` names a start of ([`codex_start`]).
+fn codex_newest_turn(jsonl: &str) -> Option<String> {
+    jsonl.lines().rev().find_map(codex_start)?.0
 }
 
 /// A Codex rollout's conversation `thread` as [`items`] reads a transcript's: each turn opens at
 /// its `task_started`, its prompt is the first user message that is no context Codex added
-/// ([`codex_context`]), and each assistant message is its words (a `commentary` one marks a turn
-/// that goes on past it).
+/// ([`codex_context`]), a later user message's words are steered into it ([`Item::Steered`]), and
+/// each assistant message is its words (a `commentary` one marks a turn that goes on past it).
 fn codex_items(jsonl: &str, thread: &str) -> Vec<Item> {
     let mut out = Vec::new();
     let mut turn = String::from("-");
@@ -1354,17 +1625,19 @@ fn codex_items(jsonl: &str, thread: &str) -> Vec<Item> {
                 opening = Some(out.len());
                 out.push(Item::Boundary);
             }
-            (Some("response_item"), Some("message"), Some("user")) if opening.is_some() => {
+            (Some("response_item"), Some("message"), Some("user")) => {
                 let mut parts = texts("input_text");
                 parts.retain(|p| !codex_media_label(p));
                 if parts.iter().any(|p| codex_context(p)) {
                     continue;
                 }
                 let words = parts.join("\n").trim().to_string();
-                if !words.is_empty()
-                    && let Some(at) = opening.take()
-                {
-                    out[at] = Item::Prompt(words);
+                if words.is_empty() {
+                    continue;
+                }
+                match opening.take() {
+                    Some(at) => out[at] = Item::Prompt(words),
+                    None => out.push(Item::Steered(words)),
                 }
             }
             (Some("response_item"), Some("message"), Some("assistant")) => {
@@ -1455,8 +1728,13 @@ pub fn codex_turn_ended(jsonl: &str) -> bool {
     true
 }
 
-/// Snapshots a Codex worker's result at its landing's done edge: its report in the tail of its
-/// `rollout` (the file and the text read from it) of conversation `thread`.
+/// Snapshots a Codex worker's result at its landing's done edge, seen at `landed` (unix ms): its
+/// report in the tail of its `rollout` (the file and the text read from it) of conversation
+/// `thread`, whose rollout is found under `home` (its `$CODEX_HOME`, where the landing knew it).
+/// A missing result keeps what [`reread`] reads it again by ([`Source::RolloutUnavailable`]): the
+/// rollout and the turn its tail names last, or with no rollout read, the thread and its home
+/// (`-` and none where the landing knew no conversation, found then by the worker's claim at
+/// [`reread_with`]).
 ///
 /// # Errors
 /// As [`snapshot`].
@@ -1465,23 +1743,28 @@ pub fn snapshot_rollout(
     stem: &str,
     rollout: Option<(&Path, &str)>,
     thread: &str,
+    home: Option<&Path>,
+    landed: i64,
     by: DoneBy,
 ) -> std::io::Result<Snapshot> {
     check_stem(stem)?;
-    let none = |why: &'static str, by: DoneBy| {
+    let none = |why: &'static str, read: Option<(&Path, &str)>, by: DoneBy| {
         (
             String::new(),
-            Source::Unavailable {
+            Source::RolloutUnavailable {
                 why: why.to_string(),
-                transcript: None,
-                turn: None,
+                thread: thread.to_string(),
+                turn: read.and_then(|(_, jsonl)| codex_newest_turn(jsonl)),
+                rollout: read.map(|(file, _)| file.to_path_buf()),
+                home: home.map(Path::to_path_buf),
+                landed: Some(landed),
             },
             Some(why),
             by,
         )
     };
     let (text, source, unavailable, by) = match rollout {
-        None => none("no-transcript", by),
+        None => none("no-transcript", None, by),
         Some((file, jsonl)) => match read_items(&codex_items(jsonl, thread), by) {
             (by, Ok(r)) => (
                 r.text,
@@ -1493,7 +1776,7 @@ pub fn snapshot_rollout(
                 None,
                 by,
             ),
-            (by, Err(why)) => none(why, by),
+            (by, Err(why)) => none(why, rollout, by),
         },
     };
     write_snapshot(tasks, stem, &text, &source, unavailable, by)

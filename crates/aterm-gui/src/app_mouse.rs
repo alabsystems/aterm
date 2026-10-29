@@ -433,7 +433,7 @@ pub(crate) struct CitationProbe {
 impl CitationProbe {
     fn new(t: &Terminal, span: crate::path_link::PathSpan) -> Self {
         use crate::cwd_native::ReportedCwd as _;
-        let running = crate::session_status::executing_detail(t);
+        let running = crate::session_status::executing_candidate(t);
         let shell_reads_local = shell_reads_local(
             t.current_block().is_some() && crate::quit_safety::shell_reports_commands(t),
             running.as_deref(),
@@ -1621,13 +1621,17 @@ impl App {
         }
     }
 
-    /// Cmd-C: copy the selected text to the system clipboard (`pbcopy`), leaving the selection so repeated copies work.
+    /// Cmd-C: copy the selected text to the system clipboard (`pbcopy`), leaving the selection so repeated copies work. A control client's gesture copies nothing (copy-on-select included), and the refusal is logged ([`crate::app_take_over::note_clipboard_refused`]).
     pub(crate) fn copy_selection_in(&self, wid: WindowId) -> bool {
         if self
             .windows
             .get(&wid)
             .is_none_or(|ws| ws.overlay_open() || ws.rename_edit.is_some())
         {
+            return false;
+        }
+        if self.person_gesture_refused() {
+            crate::app_take_over::note_clipboard_refused("copy");
             return false;
         }
         // A pinned or keyboard lens's ⌘C copies its instrument's sentence.
@@ -1643,6 +1647,54 @@ impl App {
             return false;
         };
         !text.is_empty() && control::pbcopy(&text)
+    }
+
+    /// ⌘C, a Copy binding and Edit ▸ Copy: a grid with no cell open copies its cell through the
+    /// editor's `kill-ring-save`, so the value reaches the kill ring (`C-y`) as well as the
+    /// clipboard; anything else is [`Self::copy_selection_in`]. A control client's gesture has no
+    /// clipboard authority (`selection.copy` asks for it), so the editor refuses its
+    /// `kill-ring-save` with a status, anything else (a terminal, a text view, an open grid cell)
+    /// copies nothing for it and answers its `invoke` with why
+    /// ([`Self::refuse_clipboard_gesture`]), and the clipboard keeps what it held. Whether
+    /// anything was copied.
+    pub(crate) fn copy_in(&mut self, wid: WindowId) -> bool {
+        if !self.editor_grid_copies(wid) {
+            if self.refuse_clipboard_gesture("copy") {
+                return false;
+            }
+            return self.copy_selection_in(wid);
+        }
+        let copied = self.native_has_selection(wid) && !self.person_gesture_refused();
+        self.dispatch_native_event(
+            wid,
+            crate::native_app::AppEvent::EditorCommand(
+                crate::native_editor::EditorCommand::KillRingSave,
+            ),
+        )
+        .is_ok()
+            && copied
+    }
+
+    /// Whether a copy in window `wid` is a grid's, through its editor: the active view draws a
+    /// grid with no cell open and no prompt, and nothing in front of it owns Copy.
+    fn editor_grid_copies(&self, wid: WindowId) -> bool {
+        if self
+            .windows
+            .get(&wid)
+            .is_none_or(|ws| ws.overlay_open() || ws.rename_edit.is_some())
+            || self.stats_lens_copy_ready(wid).is_some()
+        {
+            return false;
+        }
+        let Some((_, view)) = self.active_native_view(wid) else {
+            return false;
+        };
+        matches!(
+            self.native_runtime.view_state(view),
+            Some(crate::native_app::AppViewState::Editor(state)) if state.buffer.as_ref().is_some_and(|buffer| {
+                buffer.grid().is_some() && buffer.grid_draft().is_none() && !buffer.minibuffer_active()
+            })
+        )
     }
 
     /// The text of window `wid`'s live selection, resolved across panes.
@@ -1675,10 +1727,9 @@ impl App {
         None
     }
 
-    /// [`Self::copy_selection_in`] against the frontmost window.
-    pub(crate) fn copy_selection(&self) -> bool {
-        self.frontmost_window
-            .is_some_and(|wid| self.copy_selection_in(wid))
+    /// Edit ▸ Copy: [`Self::copy_in`] against the frontmost window.
+    pub(crate) fn copy_selection(&mut self) -> bool {
+        self.frontmost_window.is_some_and(|wid| self.copy_in(wid))
     }
 
     /// Map a pixel position to a 0-based `(row, col)` terminal grid cell of window `wid`, clamped to the grid.
@@ -1886,6 +1937,12 @@ impl App {
                 | PointerAction::Wheel { .. }
         ) {
             let _ = self.commit_glassless_native_frame(wid);
+        }
+        if matches!(
+            action,
+            PointerAction::Move { .. } | PointerAction::MoveChrome { .. } | PointerAction::Click
+        ) {
+            let _ = self.lay_glassless_terminal_chrome(wid);
         }
         match action {
             PointerAction::MoveNative(target) => {
@@ -2278,17 +2335,14 @@ impl App {
         let geom = self.pointer_geometry(wid);
         let (cw, ch) = geom.cell;
         let chrome = usize::from(self.chrome_rows(wid));
-        if cw > 0 && ch > 0 && chrome > 0 {
+        let chrome_height = geom.head.saturating_add(chrome.saturating_mul(ch));
+        if cw > 0 && ch > 0 && chrome_height > 0 {
             let (x, y) = ws.last_cursor_px;
             #[allow(
                 clippy::cast_precision_loss,
                 reason = "window pixel coordinates; the f64 mantissa covers every representable window size"
             )]
-            let (top, band_h, pad) = (
-                (geom.pad_top + geom.head) as f64,
-                (chrome * ch) as f64,
-                geom.pad as f64,
-            );
+            let (top, band_h, pad) = (geom.pad_top as f64, chrome_height as f64, geom.pad as f64);
             let fy = self.window_to_frame_y_signed(wid, geom, y) - top;
             if (0.0..band_h).contains(&fy) {
                 let (fx, _) = self.window_to_frame_with(wid, geom, x, y);
@@ -2297,14 +2351,14 @@ impl App {
                     clippy::cast_sign_loss,
                     reason = "non-negative, and bounded by the chrome rows and the columns"
                 )]
-                let (k, col) = (
-                    (fy / ch as f64) as usize,
+                let (up, col) = (
+                    ((band_h - fy) / ch as f64).ceil() as usize,
                     ((fx - pad).max(0.0) / cw as f64) as usize,
                 );
                 let col = u16::try_from(col)
                     .unwrap_or(u16::MAX)
                     .min(ws.cols.saturating_sub(1));
-                let up = i32::try_from(chrome - k.min(chrome - 1)).unwrap_or(i32::MAX);
+                let up = i32::try_from(up).unwrap_or(i32::MAX);
                 return Some((-up, col));
             }
         }
@@ -2314,8 +2368,7 @@ impl App {
 
     fn chrome_cell_centre_px(&self, wid: WindowId, up: u16, col: u16) -> Option<(f64, f64)> {
         let cols = self.windows.get(&wid).map(|ws| ws.cols)?;
-        let chrome = self.chrome_rows(wid);
-        if up == 0 || up > chrome || col >= cols {
+        if up == 0 || col >= cols {
             return None;
         }
         let geom = self.pointer_geometry(wid);
@@ -2323,10 +2376,20 @@ impl App {
         if cw == 0 || ch == 0 {
             return None;
         }
+        let height = geom
+            .head
+            .saturating_add(usize::from(self.chrome_rows(wid)).saturating_mul(ch));
+        let up = usize::from(up);
+        if up > height.div_ceil(ch) {
+            return None;
+        }
         let (ox, oy) = self.frame_origin_with(wid, geom);
-        let k = usize::from(chrome - up);
         let fx = usize::from(col) * cw + cw / 2 + geom.pad;
-        let fy = k * ch + ch / 2 + geom.pad_top + geom.head;
+        // Bands count upward from the grid, preserving existing message-band
+        // positions. The top band may contain only part of a cell's height.
+        let bottom = height.saturating_sub((up - 1).saturating_mul(ch));
+        let top = height.saturating_sub(up.saturating_mul(ch));
+        let fy = top + (bottom - top) / 2 + geom.pad_top;
         #[allow(
             clippy::cast_precision_loss,
             reason = "window pixel coordinates; the f64 mantissa covers every representable window size"
@@ -3026,14 +3089,14 @@ impl App {
             }
             crate::claude_lights::OverChips::No => {}
         }
-        if let Some((session, url)) = self.claude_notice_at(wid, px, py) {
+        if let Some((session, url)) = self.claude_glass_hit_at(wid, px, py) {
             let mods = self.windows.get(&wid).map(|ws| ws.mods).unwrap_or_default();
             let held = link_modifier_held(mods);
             let tracking = self
                 .pool
                 .get(session)
                 .is_some_and(|owner| owner.ctx.modes.mouse_tracking_enabled());
-            // The hand where a press opens the link (`press_claude_notice`): with the link
+            // The hand where a press opens the link (`press_claude_glass_hit`): with the link
             // modifier, or with no modifier in the focused pane.
             if url.is_some() && (held || (mods.is_empty() && self.session_is_front(wid, session))) {
                 self.set_hover_cursor(wid, CursorIcon::Pointer, true, false);
@@ -3219,6 +3282,10 @@ impl App {
         let crate::native_ui::UiContent::TextViewport(spec) = &node.content else {
             return None;
         };
+        // A grid places its cursor by cell ([`Self::native_editor_grid_target`]), not by byte.
+        if spec.grid.is_some() {
+            return None;
+        }
         let geometry = spec.geometry(node.rect);
         if x < geometry.text_x
             || x >= node.rect.right()
@@ -3230,6 +3297,183 @@ impl App {
         let visible_lines = (geometry.body_h / geometry.line_h).ceil().max(1.0) as usize;
         let byte = crate::native_ui::text_viewport_byte_at(spec, node.rect, x, y);
         Some((artifact.view, byte, visible_lines))
+    }
+
+    /// What the pointer is over in the active Editor view, when that view draws a grid: its view,
+    /// and the cell or `◂`/`▸` mark there.
+    fn native_editor_grid_target(
+        &self,
+        wid: WindowId,
+        x: f64,
+        y: f64,
+    ) -> Option<(crate::tab_model::ViewId, crate::native_ui::GridHit)> {
+        let (_, active_view) = self.active_native_view(wid)?;
+        let (artifact, x, y) = self.retained_native_leaf_at_pointer(wid, x, y)?;
+        if artifact.view != active_view
+            || self.native_runtime.view_generation(artifact.view) != Some(artifact.generation)
+        {
+            return None;
+        }
+        let node = artifact.compiled.paint.iter().rev().find(|node| {
+            node.rect.contains(x, y)
+                && matches!(&node.content, crate::native_ui::UiContent::TextViewport(_))
+        })?;
+        let crate::native_ui::UiContent::TextViewport(spec) = &node.content else {
+            return None;
+        };
+        let hit = crate::native_ui::editor_grid_hit(spec, node.rect, x, y)?;
+        Some((artifact.view, hit))
+    }
+
+    /// Scroll the grid of Editor view `view` `columns` whole columns sideways (a sideways wheel
+    /// or swipe, a press on a `◂`/`▸` mark); whether its grid took it.
+    fn native_editor_grid_scroll(
+        &mut self,
+        wid: WindowId,
+        view: crate::tab_model::ViewId,
+        columns: i32,
+    ) -> bool {
+        let Some(crate::tab_model::View::Native(native)) = self.view_store.get(view).copied()
+        else {
+            return false;
+        };
+        let handled = self
+            .dispatch_editor_event(
+                native.instance,
+                view,
+                &crate::native_app::AppEvent::EditorInput(amacs::input::EditorInput::GridScroll {
+                    columns,
+                }),
+            )
+            .is_ok_and(|result| result.is_some());
+        if handled {
+            self.invalidate_native_ui_cache(wid);
+            self.request_redraw_all_windows();
+        }
+        handled
+    }
+
+    /// A sideways wheel or swipe over native view `view`, when it is an Editor drawing a grid:
+    /// a wheel's notch is a column, and a swipe's cells bank toward one
+    /// ([`GRID_SWIPE_CELLS`]). Whether the grid took it.
+    fn native_editor_grid_sideways(
+        &mut self,
+        wid: WindowId,
+        view: crate::tab_model::ViewId,
+        right: bool,
+        notches: i32,
+        precise: bool,
+    ) -> bool {
+        let Some(crate::native_app::AppViewState::Editor(state)) =
+            self.native_runtime.view_state_mut(view)
+        else {
+            return false;
+        };
+        if !state
+            .buffer
+            .as_ref()
+            .is_some_and(|buffer| buffer.grid().is_some())
+        {
+            return false;
+        }
+        let signed = if right { notches } else { -notches };
+        let columns = if precise {
+            // A swipe that turns back starts its bank afresh.
+            if state.grid_swipe.signum() * signed.signum() < 0 {
+                state.grid_swipe = 0;
+            }
+            state.grid_swipe = state.grid_swipe.saturating_add(signed);
+            let columns = state.grid_swipe / GRID_SWIPE_CELLS;
+            state.grid_swipe %= GRID_SWIPE_CELLS;
+            columns
+        } else {
+            signed
+        };
+        if columns != 0 {
+            let _ = self.native_editor_grid_scroll(wid, view, columns);
+        }
+        true
+    }
+
+    /// A press at `at` on cell `record`, `column` of grid view `expected_view`: a click places
+    /// the cursor there, and a second click on the same cell within a double click's interval
+    /// opens its editor.
+    fn native_editor_grid_press(
+        &mut self,
+        wid: WindowId,
+        expected_view: crate::tab_model::ViewId,
+        (record, column): (usize, usize),
+        at: std::time::Instant,
+    ) -> bool {
+        let Some((instance, view)) = self.active_native_view(wid) else {
+            return false;
+        };
+        if view != expected_view {
+            return false;
+        }
+        let Some(crate::native_app::AppViewState::Editor(state)) =
+            self.native_runtime.view_state_mut(view)
+        else {
+            return false;
+        };
+        let open = state
+            .grid_press
+            .is_some_and(|(then, pressed_record, pressed_column)| {
+                (pressed_record, pressed_column) == (record, column)
+                    && at.saturating_duration_since(then).as_millis() <= crate::multi_click_ms()
+            });
+        state.grid_press = (!open).then_some((at, record, column));
+        let handled = self
+            .dispatch_editor_event(
+                instance,
+                view,
+                &crate::native_app::AppEvent::EditorInput(amacs::input::EditorInput::GridPointer {
+                    record,
+                    column,
+                    open,
+                }),
+            )
+            .is_ok_and(|result| result.is_some());
+        if handled {
+            self.invalidate_native_ui_cache(wid);
+            self.request_redraw_all_windows();
+        }
+        handled
+    }
+
+    /// A press on the cell panel of grid view `expected_view` at byte `byte` of the value it
+    /// shows: the caret goes there, the cell's editor opening first when it was closed.
+    fn native_editor_grid_panel_press(
+        &mut self,
+        wid: WindowId,
+        expected_view: crate::tab_model::ViewId,
+        byte: usize,
+    ) -> bool {
+        let Some((instance, view)) = self.active_native_view(wid) else {
+            return false;
+        };
+        if view != expected_view {
+            return false;
+        }
+        if let Some(crate::native_app::AppViewState::Editor(state)) =
+            self.native_runtime.view_state_mut(view)
+        {
+            state.grid_press = None;
+        }
+        let handled = self
+            .dispatch_editor_event(
+                instance,
+                view,
+                &crate::native_app::AppEvent::EditorInput(
+                    amacs::input::EditorInput::GridPanelPointer { byte },
+                ),
+            )
+            .is_ok_and(|result| result.is_some());
+        if handled {
+            self.invalidate_native_ui_cache(wid);
+            self.request_redraw_all_windows();
+        }
+        handled
     }
 
     fn native_editor_pointer_select(
@@ -3590,9 +3834,12 @@ impl App {
         let Some((term, _)) = self.front_shown(wid) else {
             return;
         };
+        let controller = self.person_gesture_refused();
         let Some(fws) = self.windows.get_mut(&wid) else {
             return;
         };
+        // A control client's move steers the selection the button's release would copy.
+        fws.sel_by_controller |= controller;
         let (sel_row, col) = {
             let mut term = term_lock(&term);
             let (col, doubled_side) = pointer_char(&term, row, col);
@@ -3903,10 +4150,14 @@ impl App {
 
     /// Keep a completed double/triple-click selection draggable while the button stays down.
     pub(crate) fn arm_gesture_drag(&mut self, wid: WindowId, sel_row: i32, col: u16) {
+        let pane = self.focused_pane_rect(wid);
+        let controller = self.person_gesture_refused();
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
         ws.selecting = true;
+        ws.sel_by_controller = controller;
+        ws.drag_pane = pane;
         ws.sel_dragged = true;
         ws.sel_press_cell = (sel_row, col);
         if let Some(w) = &ws.os_window {
@@ -3919,6 +4170,8 @@ impl App {
         let Some((term, _)) = self.front_shown(wid) else {
             return;
         };
+        let pane = self.focused_pane_rect(wid);
+        let controller = self.person_gesture_refused();
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -3933,6 +4186,8 @@ impl App {
             (sel_row, col)
         };
         ws.selecting = true;
+        ws.sel_by_controller = controller;
+        ws.drag_pane = pane;
         ws.sel_dragged = false;
         ws.sel_press_cell = (sel_row, col);
         ws.gesture = None;
@@ -3941,6 +4196,11 @@ impl App {
         }
     }
 
+    /// End the text-selection gesture in flight: a drag or a multi-click completes its selection,
+    /// a bare click clears it. With `copy_on_select` on, a completed selection is copied unless
+    /// `suppress_copy_on_select`, and a control client's gesture (one it started or dragged,
+    /// `sel_by_controller`, or its release) copies nothing ([`Self::copy_selection_in`] refuses
+    /// it under the client's mark) and sets no Linux PRIMARY. Whether the copy was due.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -3981,9 +4241,13 @@ impl App {
         let Some((term, _)) = self.front_shown(wid) else {
             return false;
         };
+        let released_by_controller = self.person_gesture_refused();
         let Some(ws) = self.windows.get_mut(&wid) else {
             return false;
         };
+        // A selection a control client started, dragged or let go of is the client's: its end
+        // copies nothing on select, even at the person's release.
+        let by_controller = std::mem::take(&mut ws.sel_by_controller) || released_by_controller;
         let completed = ws.sel_dragged;
         {
             let mut term = term_lock(&term);
@@ -4003,11 +4267,13 @@ impl App {
         }
         let fired = completed && self.copy_on_select && !suppress_copy_on_select;
         if fired {
-            self.copy_selection_in(wid);
+            // Under the client's mark, `copy_selection_in` refuses it and logs why.
+            self.with_controller_mark(by_controller, |app| app.copy_selection_in(wid));
         }
         #[cfg(target_os = "linux")]
         if completed
             && !suppress_copy_on_select
+            && !by_controller
             && let Some(text) = term_lock(&term).selection_to_string()
             && !text.is_empty()
         {
@@ -4033,7 +4299,7 @@ impl App {
             return None;
         }
         let (px, py) = ws.last_cursor_px;
-        if let Some((_, url)) = self.claude_notice_at(wid, px, py) {
+        if let Some((_, url)) = self.claude_glass_hit_at(wid, px, py) {
             return url.map(|url| (url.to_owned(), false));
         }
         let term = term_lock(&ws.front_terminal()?.term);
@@ -4062,7 +4328,7 @@ impl App {
             return None;
         }
         let (px, py) = ws.last_cursor_px;
-        if self.claude_notice_at(wid, px, py).is_some() {
+        if self.claude_glass_hit_at(wid, px, py).is_some() {
             return None;
         }
         let front = ws.front_terminal()?;
@@ -4737,6 +5003,7 @@ impl App {
                     self.settle_rename_edit(wid);
                 }
                 let editor_target = self.native_editor_pointer_target(wid, px, py);
+                let grid_target = self.native_editor_grid_target(wid, px, py);
                 let press = self.retained_native_leaf_at_pointer(wid, px, py).and_then(
                     |(artifact, x, y)| {
                         let (_, active_view) = self.active_native_view(wid)?;
@@ -4857,6 +5124,23 @@ impl App {
                             visible_lines,
                         );
                     }
+                    match grid_target {
+                        Some((target_view, crate::native_ui::GridHit::Cell(record, column))) => {
+                            let _ = self.native_editor_grid_press(
+                                wid,
+                                target_view,
+                                (record, column),
+                                at,
+                            );
+                        }
+                        Some((target_view, crate::native_ui::GridHit::Scroll(columns))) => {
+                            let _ = self.native_editor_grid_scroll(wid, target_view, columns);
+                        }
+                        Some((target_view, crate::native_ui::GridHit::Panel(byte))) => {
+                            let _ = self.native_editor_grid_panel_press(wid, target_view, byte);
+                        }
+                        None => {}
+                    }
                 } else if let Some((_, view)) = self.active_native_view(wid)
                     && let Some(state) = self.native_runtime.view_state_mut(view)
                 {
@@ -4898,12 +5182,12 @@ impl App {
             if self.glass_swallows_at(wid, px, py) {
                 return None;
             }
-            if self.claude_glass_at(wid, px, py).is_some_and(|(_, at)| {
-                !matches!(
-                    at,
-                    crate::claude_lights::GlassAt::Mark | crate::claude_lights::GlassAt::Label
-                )
-            }) {
+            // Every button on the glass is the glass's (the harness label's included, which
+            // opens nothing); only the lockup's mark passes its presses to the pane.
+            if self
+                .claude_glass_at(wid, px, py)
+                .is_some_and(|(_, at)| !matches!(at, crate::claude_lights::GlassAt::Mark))
+            {
                 #[cfg(windows)]
                 if button == WinitMouseButton::Right
                     && let Some(ws) = self.windows.get_mut(&wid)
@@ -5374,6 +5658,17 @@ impl App {
             return;
         };
         let vertical_up = dir.vertical_up();
+        // A sideways wheel or swipe over a grid shows the columns off to that side.
+        if vertical_up.is_none()
+            && !(palette || overview || seam_owned)
+            && let Some(view) = native_view
+        {
+            let precise = matches!(delta, MouseScrollDelta::PixelDelta(_));
+            let right = matches!(dir, WheelDir::Right);
+            if self.native_editor_grid_sideways(wid, view, right, lines, precise) {
+                return;
+            }
+        }
         if vertical_up.is_none() && (palette || overview || native_page) {
             return;
         }
@@ -5652,6 +5947,9 @@ pub(crate) enum WheelAxis {
     Horizontal,
     Vertical,
 }
+
+/// The cells of a sideways swipe over a grid that scroll it one column.
+const GRID_SWIPE_CELLS: i32 = 6;
 
 /// Classify a raw `(x, y)` wheel delta.
 pub(crate) fn wheel_axis(x: f64, y: f64, floor: f64) -> Option<WheelAxis> {
@@ -9017,6 +9315,55 @@ mod tests {
             right_press_plan(false, false, false, false),
             RightPressPlan::Seam
         );
+    }
+
+    #[test]
+    fn pointer_reaches_reserved_header_pixels_without_regridding() {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let (_, ch) = app.win_cell_size(wid);
+        let head = 18 * ch + ch / 3;
+        app.windows.get_mut(&wid).unwrap().metrics.head = head;
+        app.backend.set_head(head);
+        let before = (
+            app.windows[&wid].rows,
+            app.windows[&wid].cols,
+            app.chrome_rows(wid),
+        );
+        let rows = (head + usize::from(before.2) * ch).div_ceil(ch);
+        for up in 1..=rows {
+            let up = u16::try_from(up).unwrap();
+            assert_eq!(
+                app.pointer_cmd(PointerAction::MoveChrome { up, col: 3 }),
+                Ok(Some((-i32::from(up), 3))),
+            );
+            let y = app.windows[&wid].last_cursor_px.1;
+            assert!(y >= app.win_pad_top(wid) as f64);
+            assert!(y < (app.win_pad_top(wid) + head + usize::from(before.2) * ch) as f64);
+        }
+        assert!(
+            app.pointer_cmd(PointerAction::MoveChrome {
+                up: u16::try_from(rows + 1).unwrap(),
+                col: 3,
+            })
+            .is_err()
+        );
+        assert_eq!(
+            (
+                app.windows[&wid].rows,
+                app.windows[&wid].cols,
+                app.chrome_rows(wid)
+            ),
+            before
+        );
+        let id = app.post_message(toolchain_row());
+        let col = u16::try_from(capsule_col(&app, wid)).unwrap();
+        assert_eq!(
+            app.pointer_cmd(PointerAction::MoveChrome { up: 1, col }),
+            Ok(Some((-1, col))),
+        );
+        app.pointer_cmd(PointerAction::Click).unwrap();
+        assert_eq!(acted(&app, id), Some(aterm_messages::ActionIndex(0)));
     }
 
     #[test]

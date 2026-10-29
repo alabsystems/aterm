@@ -171,7 +171,7 @@ impl<'a> PolicyHost<'a> {
     fn run(&self, mode: i64) {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        if mode == 1 {
+        let _exit = if mode == 1 {
             run_accounts_login_for(
                 self.world.cli,
                 &self.world.env,
@@ -179,7 +179,7 @@ impl<'a> PolicyHost<'a> {
                 "main",
                 &mut out,
                 &mut err,
-            );
+            )
         } else {
             run_accounts_renew_for(
                 self.world.cli,
@@ -188,8 +188,8 @@ impl<'a> PolicyHost<'a> {
                 (&["main".into()], false, None),
                 &mut out,
                 &mut err,
-            );
-        }
+            )
+        };
         assert!(self.called.get(), "{}", String::from_utf8_lossy(&err));
     }
 }
@@ -514,7 +514,7 @@ fn observation_case(cli: Cli, operation: i64, fault: i64) -> [bool; 6] {
             accounts::note_sign_in_task(
                 &mut expected,
                 "main",
-                if operation == 2 {
+                if operation == 2 && cli.renews_headlessly() {
                     accounts::SignInAction::Browser
                 } else {
                     accounts::SignInAction::Login

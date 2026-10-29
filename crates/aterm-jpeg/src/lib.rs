@@ -154,8 +154,11 @@ impl<'a> Decoder<'a> {
                 0xDB => self.quant_tables()?,
                 0xDD => {
                     let payload = self.segment()?;
+                    if payload.len() != 2 {
+                        return None;
+                    }
                     self.restart_interval =
-                        usize::from(u16::from_be_bytes([*payload.first()?, *payload.get(1)?]));
+                        usize::from(u16::from_be_bytes([payload[0], payload[1]]));
                 }
                 0xDA => {
                     let done = self.scan()?;
@@ -194,7 +197,7 @@ impl<'a> Decoder<'a> {
         while let Some((&info, rest)) = payload.split_first() {
             let precision = info >> 4;
             let id = usize::from(info & 15);
-            if id > 3 {
+            if id > 3 || precision > 1 {
                 return None;
             }
             let mut table = [0u16; 64];
@@ -250,14 +253,19 @@ impl<'a> Decoder<'a> {
             || width > self.max_dimension
             || height > self.max_dimension
             || !matches!(count, 1 | 3 | 4)
+            || payload.len() != 6 + 3 * count
         {
             return None;
         }
-        let mut specs = Vec::with_capacity(count);
+        let mut specs: Vec<(u8, usize, usize, usize)> = Vec::with_capacity(count);
         for c in 0..count {
             let spec = payload.get(6 + 3 * c..9 + 3 * c)?;
             let (h, v) = (usize::from(spec[1] >> 4), usize::from(spec[1] & 15));
-            if !(1..=4).contains(&h) || !(1..=4).contains(&v) || spec[2] > 3 {
+            if !(1..=4).contains(&h)
+                || !(1..=4).contains(&v)
+                || spec[2] > 3
+                || specs.iter().any(|&(seen, ..)| seen == spec[0])
+            {
                 return None;
             }
             specs.push((spec[0], h, v, usize::from(spec[2])));
@@ -312,7 +320,11 @@ impl<'a> Decoder<'a> {
         let frame = self.frame.as_ref()?;
         let progressive = frame.progressive;
         let count = usize::from(*payload.first()?);
-        if count == 0 || count > 4 {
+        if count == 0
+            || count > 4
+            || count > self.components.len()
+            || payload.len() != 4 + 2 * count
+        {
             return None;
         }
         let mut members = Vec::with_capacity(count);
@@ -322,6 +334,9 @@ impl<'a> Decoder<'a> {
                 .components
                 .iter()
                 .position(|component| component.id == spec[0])?;
+            if members.contains(&index) {
+                return None;
+            }
             let component = &mut self.components[index];
             component.dc_table = usize::from(spec[1] >> 4);
             component.ac_table = usize::from(spec[1] & 15);
@@ -334,12 +349,15 @@ impl<'a> Decoder<'a> {
         let (start, end) = (usize::from(tail[0]), usize::from(tail[1]));
         let (high, low) = (u32::from(tail[2] >> 4), u32::from(tail[2] & 15));
         if progressive {
-            // T.81 G.1.1.1.1: DC alone or one component's AC band.
+            // T.81 G.1.1.1.1: DC alone or one component's AC band, with valid
+            // successive-approximation bit positions (Ah == 0 or Ah == Al + 1, <= 13).
             if end > 63
                 || start > end
                 || (start == 0 && end != 0)
                 || (start > 0 && count != 1)
                 || low > 13
+                || high > 13
+                || (high != 0 && high != low + 1)
             {
                 return None;
             }

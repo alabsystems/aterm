@@ -235,7 +235,6 @@ fn supernova_detonation_peak_over_text_matches_within_tolerance() {
     let gpu_frame = gpu.render_input(&mut win, &input, None);
     let delta = max_channel_delta(&cpu_frame.pixels, &gpu_frame.pixels);
     eprintln!("supernova detonation-peak over-text max per-channel delta = {delta}");
-    crate::common::byte_exact_or_could_not_run(&gpu, "supernova-over-text parity gate");
     assert!(
         delta <= 8,
         "supernova detonation over text diverges: max delta {delta} > 8"

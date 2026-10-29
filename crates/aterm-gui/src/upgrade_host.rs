@@ -23,6 +23,42 @@ pub(crate) fn now_s() -> u64 {
 /// How long `Not today` holds an upgrade (`--defer`): a day.
 pub(crate) const NOT_TODAY_S: u64 = 24 * 3_600;
 
+/// Cached foreground custody captured before the background view reads upgrade records. These
+/// stamps travel with the publication, so its delivery cannot adopt the program then in front.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UpgradeSources(Vec<(String, crate::session_timeline::UpgradeStamp)>);
+
+impl UpgradeSources {
+    pub(crate) fn capture(store: &crate::session_store::Store) -> Self {
+        let handles = store.read().unwrap_or_else(|p| p.into_inner()).snapshot();
+        let mut sources: Vec<_> = handles
+            .iter()
+            .map(|handle| {
+                let timeline = handle
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                (handle.sid.as_str().to_owned(), timeline.upgrade_stamp())
+            })
+            .collect();
+        sources.sort_by(|a, b| a.0.cmp(&b.0));
+        Self(sources)
+    }
+
+    fn current(
+        &self,
+        tab: &str,
+        timeline: &crate::session_timeline::SessionTimeline,
+    ) -> Option<crate::session_timeline::UpgradeStamp> {
+        self.0
+            .iter()
+            .find(|(sid, _)| sid == tab)
+            .map(|(_, stamp)| stamp.clone())
+            .filter(|stamp| stamp.is_current(timeline))
+    }
+}
+
 /// An upgrade action pressed by the owner on a tab.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WordAsk {
@@ -34,6 +70,21 @@ pub(crate) struct WordAsk {
     pub(crate) word: UpgradeWord,
     /// The conversation of the tab's row for `to` at the press.
     pub(crate) session: String,
+    /// The owner pressed the top rule's ⬆️ ([`Self::pressed`]); `None` for a word of the tab
+    /// menu, a capsule or Settings.
+    pub(crate) press: Option<PressAsk>,
+    /// The source identity of that displayed row, checked again when the word is written.
+    pub(crate) scope: Option<upgrade_drive::AskScope>,
+}
+
+/// The owner's press of a Claude Code tab's ⬆️ ([`WordAsk::pressed`]): a one-shot Now its own
+/// lane moves ([`App::start_press_lane`], [`upgrade_drive::press`]), past an Autopilot or an
+/// agent switched off and the agent's own background work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PressAsk {
+    /// The tab's harness or its Autopilot is off: the restart types only its relaunch line
+    /// ([`upgrade_drive::PressOpts::off`]).
+    pub(crate) off: bool,
 }
 
 impl WordAsk {
@@ -44,11 +95,28 @@ impl WordAsk {
             to,
             word,
             session: String::new(),
+            press: None,
+            scope: None,
+        }
+    }
+
+    /// The owner's press of `tab`'s ⬆️ for build `to`, its harness or Autopilot `off`.
+    pub(crate) const fn pressed(tab: String, to: String, off: bool) -> Self {
+        Self {
+            tab,
+            to,
+            word: UpgradeWord::Now,
+            session: String::new(),
+            press: Some(PressAsk { off }),
+            scope: None,
         }
     }
 
     /// Convert this action into the harness [`Ask`].
     pub(crate) const fn ask(&self) -> Ask {
+        if self.press.is_some() {
+            return Ask::Press;
+        }
         match self.word {
             UpgradeWord::Now => Ask::Now,
             UpgradeWord::NotToday => Ask::Defer(NOT_TODAY_S),
@@ -140,22 +208,161 @@ pub(crate) fn live_word_writer(sock: Option<String>) -> WordWriter {
 pub(crate) fn word_writer_at(home: PathBuf, state: PathBuf, sock: Option<String>) -> WordWriter {
     WordWriter::new(move |ask: &WordAsk| {
         // The word only records the request and wakes the host's lane
-        // (`upgrade_drive::ask_for`), dialling no socket; the relaunch line that
+        // (`upgrade_drive::ask_for_scope`), dialling no socket; the relaunch line that
         // lane types arms the tap itself (`harness_host::window_drive_opts`).
         let opts = upgrade_drive::Opts {
             only_sid: Some(ask.tab.clone()),
             aterm_state: None,
             ..crate::harness_host::window_drive_opts(home.clone(), state.clone(), sock.clone())
         };
-        upgrade_drive::ask_for(&opts, &ask.tab, ask.ask(), &ask.to, &ask.session)
+        match &ask.scope {
+            Some(scope) => upgrade_drive::ask_for_scope(
+                &opts,
+                &ask.tab,
+                ask.ask(),
+                &ask.to,
+                &ask.session,
+                scope,
+            ),
+            None => upgrade_drive::ask_for(&opts, &ask.tab, ask.ask(), &ask.to, &ask.session),
+        }
     })
+}
+
+/// One step of a press's lane for its tab ([`App::start_press_lane`]): the word of what
+/// [`upgrade_drive::press`] did, and the tab's upgrade row after it where its record reads.
+type PressFn = dyn Fn(&WordAsk) -> (String, Option<Row>) + Send + Sync;
+
+/// What steps a press's lane ([`App::start_press_lane`]).
+#[derive(Clone)]
+pub(crate) struct Presser(Arc<PressFn>);
+
+impl Presser {
+    /// Wrap a step function.
+    pub(crate) fn new(
+        f: impl Fn(&WordAsk) -> (String, Option<Row>) + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(f))
+    }
+
+    fn step(&self, ask: &WordAsk) -> (String, Option<Row>) {
+        (self.0)(ask)
+    }
+}
+
+impl Default for Presser {
+    fn default() -> Self {
+        Self::new(|_| (upgrade_drive::PRESS_LAPSED.to_string(), None))
+    }
+}
+
+impl std::fmt::Debug for Presser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Presser")
+    }
+}
+
+/// Production [`Presser`] over the user's home and harness state.
+pub(crate) fn live_presser(sock: Option<String>) -> Presser {
+    match aterm_primer::home_dir().zip(crate::harness_host::harness_state()) {
+        Some((home, state)) => presser_at(home, state, sock),
+        None => Presser::default(),
+    }
+}
+
+/// [`Presser`] over `home`, `state`, and control socket `sock`: the acting lane's opts for the
+/// pressed tab alone, its relaunch line arming the usage tap as the host's own step does.
+pub(crate) fn presser_at(home: PathBuf, state: PathBuf, sock: Option<String>) -> Presser {
+    Presser::new(move |ask: &WordAsk| {
+        let opts = upgrade_drive::Opts {
+            only_sid: Some(ask.tab.clone()),
+            ..crate::harness_host::window_drive_opts_with_tap(
+                home.clone(),
+                state.clone(),
+                sock.clone(),
+                crate::harness_host::usage_tap_on(),
+            )
+        };
+        let r = upgrade_drive::press(&opts, ask.press.is_some_and(|p| p.off));
+        if r.is_act() {
+            aterm_log::info!("harness @{}: the press's lane: {}", ask.tab, r.line());
+        }
+        let row = upgrade_drive::rows(&opts)
+            .into_iter()
+            .find(|row| row.tab == ask.tab && row.session == r.session);
+        (r.step, row)
+    })
+}
+
+/// How long a press's lane steps its tab at most: the press stands [`upgrade::PRESS_S`], and a
+/// restart it began is seen through as long again.
+const PRESS_LANE_MAX: std::time::Duration =
+    std::time::Duration::from_secs(2 * aterm_agent::harness::upgrade::PRESS_S);
+
+/// The pause before a press's lane's next step, `elapsed` since it began: close at first, where
+/// the owner who pressed is watching (a draft sent, a box answered, a turn ended), then calmer.
+fn press_pace(elapsed: std::time::Duration) -> std::time::Duration {
+    if elapsed < std::time::Duration::from_secs(60) {
+        std::time::Duration::from_secs(2)
+    } else {
+        std::time::Duration::from_secs(10)
+    }
+}
+
+/// Whether a press's lane ends after a step that said `step`, `elapsed` since it began: its
+/// press stands no longer and no move it began is in flight ([`upgrade_drive::PRESS_LAPSED`]),
+/// the tab has no record to move or is on its build, the record cannot be written, or the
+/// lane's span is spent ([`PRESS_LANE_MAX`]).
+fn press_lane_ends(step: &str, elapsed: std::time::Duration) -> bool {
+    step == upgrade_drive::PRESS_LAPSED
+        || step == "current"
+        || step.starts_with("skip:")
+        || upgrade_drive::after(step, 0) == upgrade_drive::After::Broken
+        || elapsed >= PRESS_LANE_MAX
+}
+
+/// Steps `ask`'s press through `presser` until its lane ends ([`press_lane_ends`]), handing
+/// each row it reads to `deliver` and pausing `pace` between steps; `lanes` holds its tab while
+/// it runs.
+fn run_press_lane(
+    ask: &WordAsk,
+    presser: &Presser,
+    lanes: &std::sync::Mutex<BTreeSet<String>>,
+    pace: impl Fn(std::time::Duration) -> std::time::Duration,
+    deliver: impl Fn(Row),
+) {
+    let began = std::time::Instant::now();
+    loop {
+        let (step, row) = presser.step(ask);
+        if let Some(row) = row {
+            deliver(row);
+        }
+        if press_lane_ends(&step, began.elapsed()) {
+            break;
+        }
+        std::thread::sleep(pace(began.elapsed()));
+    }
+    lanes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&ask.tab);
+}
+
+pub(crate) fn same_upgrade_run(a: &Row, b: &Row) -> bool {
+    a.tab == b.tab
+        && a.session == b.session
+        && a.agent == b.agent
+        && a.from == b.from
+        && a.proc_start == b.proc_start
+}
+
+pub(crate) fn same_move(a: &Row, b: &Row) -> bool {
+    same_upgrade_run(a, b) && a.source == b.source && a.to == b.to
 }
 
 fn laid_in(shown: &[Row], row: Row, now: u64) -> Option<Vec<Row>> {
     let mut rows = shown.to_vec();
-    let at = rows
-        .iter()
-        .position(|r| r.tab == row.tab && r.session == row.session)?;
+    let at = rows.iter().position(|r| same_move(r, &row))?;
     let mut row = row;
     row.keep_aside(&rows[at], now);
     rows[at] = row;
@@ -265,13 +472,21 @@ pub(crate) struct UpgradeView {
     /// The managed-current wire text last posted, so a change in the rows
     /// re-derives its words (`App::post_managed_current` records only news).
     managed_text: Option<String>,
-    /// The tabs the host's last rows left as they stand ([`App::apply_host_upgrades`]):
+    /// The tabs the host's last rows left as they stand ([`App::apply_host_upgrades_from`]):
     /// their record could not be read, so what the window shows of them is kept.
     kept: BTreeSet<String>,
     /// What writes the owner's word ([`WordWriter`]).
     writer: WordWriter,
     /// Where a press's word goes to be written off the winit thread.
     queue: WordQueue,
+    /// What steps a press of the ⬆️ ([`Presser`]).
+    presser: Presser,
+    /// The tabs a press's lane steps now ([`App::start_press_lane`]): one lane a tab.
+    pressing: Arc<std::sync::Mutex<BTreeSet<String>>>,
+    /// Whether each press this window sent was made with its tab's harness or Autopilot off
+    /// ([`PressAsk::off`]), by tab: a lane started for it from the host's rows, which can
+    /// come before the press's own answer, types what the press asked.
+    pressed_off: BTreeMap<String, bool>,
     /// Each tab's menu section as last composed from the rows
     /// ([`UpgradeView::menu_for`]), and its revision: the tab chrome's
     /// cache epoch for it (`CachedChrome::upgrade_revision`), bumped — and
@@ -293,6 +508,12 @@ impl UpgradeView {
         self.writer = writer;
     }
 
+    /// What steps a press of the ⬆️ from here on, as a test fakes it.
+    #[cfg(test)]
+    pub(crate) fn set_presser(&mut self, presser: Presser) {
+        self.presser = presser;
+    }
+
     fn look_again(&mut self) {
         #[cfg(test)]
         {
@@ -302,13 +523,10 @@ impl UpgradeView {
     }
 
     fn word_landed(&mut self, row: &Row) {
-        if row.request_at != 0 {
-            let pressed_on = self
-                .rows
-                .iter()
-                .find(|r| r.tab == row.tab && r.session == row.session)
-                .map(|r| r.phase.clone())
-                .filter(|phase| *phase != row.phase);
+        if row.request_at != 0
+            && let Some(shown) = self.rows.iter().find(|r| same_move(r, row))
+        {
+            let pressed_on = (shown.phase != row.phase).then(|| shown.phase.clone());
             self.worded.insert(
                 row.tab.clone(),
                 (row.clone(), std::time::Instant::now(), pressed_on),
@@ -317,31 +535,45 @@ impl UpgradeView {
     }
 
     fn words_landed(&mut self, rows: &mut [Row]) {
+        let now = now_s();
         self.worded.retain(|tab, (word, at, pressed_on)| {
             at.elapsed() < WORD_LAG
                 && rows.iter().any(|r| {
                     r.tab == *tab
-                        && r.session == word.session
-                        && same_build(&r.to, &word.to)
+                        && same_move(r, word)
                         && (r.phase == word.phase || pressed_on.as_ref() == Some(&r.phase))
-                        && r.request_at < word.request_at
+                        && (r.request_at < word.request_at || r.pressed_at < word.pressed_at)
                 })
         });
         for r in rows.iter_mut() {
             if let Some((word, _, _)) = self.worded.get(&r.tab)
-                && r.session == word.session
-                && r.request_at < word.request_at
+                && same_move(r, word)
             {
-                r.request = word.request.clone();
-                r.request_at = word.request_at;
+                let mut moved = false;
+                if r.request_at < word.request_at {
+                    r.request = word.request.clone();
+                    r.request_at = word.request_at;
+                    moved = true;
+                }
+                if r.pressed_at < word.pressed_at {
+                    r.pressed_at = word.pressed_at;
+                    r.pressed_to.clone_from(&word.pressed_to);
+                    moved = true;
+                }
+                if moved {
+                    r.lift_passed_aside(word, now);
+                    r.reread(now);
+                }
             }
         }
     }
 
-    /// Create a view that writes owner actions through `writer`.
-    pub(crate) fn with_writer(writer: WordWriter) -> Self {
+    /// Create a view that writes owner actions through `writer` and steps a press of the ⬆️
+    /// through `presser`.
+    pub(crate) fn with_writer(writer: WordWriter, presser: Presser) -> Self {
         Self {
             writer,
+            presser,
             ..Self::default()
         }
     }
@@ -398,9 +630,39 @@ const fn seen_through(record: &aterm_messages::LogRecord) -> bool {
 }
 
 impl App {
+    /// Synchronous fixture publication; the production host captures before its off-thread read.
+    #[cfg(test)]
+    pub(crate) fn apply_host_upgrades(&mut self, rows: Vec<Row>, kept: Vec<String>) {
+        let sources = UpgradeSources::capture(&self.store);
+        self.apply_host_upgrades_from(rows, kept, sources);
+    }
+
     /// Apply `Wake::AgentUpgrade` rows from the harness host.
-    pub(crate) fn apply_host_upgrades(&mut self, mut rows: Vec<Row>, kept: Vec<String>) {
-        let kept: BTreeSet<String> = kept.into_iter().collect();
+    pub(crate) fn apply_host_upgrades_from(
+        &mut self,
+        mut rows: Vec<Row>,
+        kept: Vec<String>,
+        sources: UpgradeSources,
+    ) {
+        let mut kept: BTreeSet<String> = kept.into_iter().collect();
+        // A late batch leaves each changed foreground's previous publication untouched. This
+        // applies to the menus and messages too, rather than only hiding its arrow afterward.
+        let handles = self
+            .store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .snapshot();
+        for handle in &handles {
+            let timeline = handle
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if sources.current(handle.sid.as_str(), &timeline).is_none() {
+                kept.insert(handle.sid.as_str().to_owned());
+                rows.retain(|row| row.tab != handle.sid.as_str());
+            }
+        }
         let held: Vec<Row> = self
             .upgrade_view
             .rows
@@ -409,16 +671,52 @@ impl App {
             .cloned()
             .collect();
         if !held.is_empty() {
-            rows.extend(held);
+            rows.extend(held.iter().cloned());
             rows.sort_by(|a, b| a.session.cmp(&b.session));
         }
         self.upgrade_view.kept = kept;
         self.upgrade_view.words_landed(&mut rows);
-        self.apply_agent_upgrades(rows);
+        // A press that stands with no lane stepping it (pressed in another window, or before
+        // this one started) gets one; where this window did not send it, its restart types only
+        // the relaunch line, since whether the tab's harness was on is not in the record.
+        let now = now_s();
+        let unstepped: Vec<WordAsk> = rows
+            .iter()
+            .filter(|r| r.press_stands(now))
+            .map(|r| {
+                let off = self
+                    .upgrade_view
+                    .pressed_off
+                    .get(&r.tab)
+                    .copied()
+                    .unwrap_or(true);
+                WordAsk {
+                    session: r.session.clone(),
+                    ..WordAsk::pressed(r.tab.clone(), r.to.clone(), off)
+                }
+            })
+            .collect();
+        self.apply_agent_upgrades_owned(rows, Some(&sources), &held);
+        for ask in &unstepped {
+            self.start_press_lane(ask);
+        }
     }
 
-    /// Update live tab upgrade states, band capsules, and standing messages from `rows`.
+    /// Synchronous fixture publication through the same custody admission as the queued host.
+    #[cfg(test)]
     pub(crate) fn apply_agent_upgrades(&mut self, rows: Vec<Row>) {
+        let sources = UpgradeSources::capture(&self.store);
+        self.apply_agent_upgrades_owned(rows, Some(&sources), &[]);
+    }
+
+    /// Update upgrade state and messages. Fresh rows use producer stamps; kept records and word
+    /// replies inherit the accepted row's owner. Neither path captures custody at delivery.
+    fn apply_agent_upgrades_owned(
+        &mut self,
+        rows: Vec<Row>,
+        sources: Option<&UpgradeSources>,
+        inherited: &[Row],
+    ) {
         let now = now_s();
         let before = self.tabs_behind();
         let shown = upgrade_drive::tab_rows(&rows);
@@ -439,7 +737,36 @@ impl App {
                 t.upgrade().map(crate::claude_footer::TopUp::of)
             };
             let was = arrow(&timeline);
-            timeline.set_upgrade(row);
+            let next = match row {
+                Some(row) => {
+                    let retained =
+                        sources.is_none() || inherited.iter().any(|old| same_move(old, &row));
+                    let stamp = if retained {
+                        None
+                    } else {
+                        let Some(stamp) =
+                            sources.and_then(|sources| sources.current(h.sid.as_str(), &timeline))
+                        else {
+                            continue;
+                        };
+                        Some(stamp)
+                    };
+                    let owner = timeline
+                        .accepted_upgrade_owner(&row)
+                        .or_else(|| stamp.and_then(|stamp| stamp.owner(&row)));
+                    Some((row, owner))
+                }
+                None => {
+                    if sources
+                        .and_then(|sources| sources.current(h.sid.as_str(), &timeline))
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    None
+                }
+            };
+            timeline.set_upgrade_owned(next);
             let arrow_moved = arrow(&timeline) != was;
             if arrow_moved {
                 noted.push(h.local_id);
@@ -999,14 +1326,87 @@ impl App {
         }
     }
 
+    /// Starts the lane of the owner's press `ask` ([`upgrade_drive::press`]) off the winit
+    /// thread, where no lane steps its tab yet: it steps the tab until the press lapses or the
+    /// move it began lands, each row it reads coming back as `Wake::AgentUpgradePress`. Without
+    /// an event loop (a test's app) one step runs here.
+    pub(crate) fn start_press_lane(&mut self, ask: &WordAsk) {
+        let lanes = Arc::clone(&self.upgrade_view.pressing);
+        if !lanes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(ask.tab.clone())
+        {
+            return;
+        }
+        let presser = self.upgrade_view.presser.clone();
+        let Some(proxy) = self.proxy.clone() else {
+            let (_, row) = presser.step(ask);
+            if let Some(row) = row {
+                self.apply_press_row(row);
+            }
+            lanes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&ask.tab);
+            return;
+        };
+        let tab = ask.tab.clone();
+        let ask = ask.clone();
+        let lane = Arc::clone(&lanes);
+        let started = crate::qos::spawn_lane_thread(
+            "aterm-upgrade-press".to_string(),
+            crate::qos::Role::Responsive,
+            move || {
+                run_press_lane(&ask, &presser, &lane, press_pace, |row| {
+                    let _ = proxy.send_event(crate::Wake::AgentUpgradePress { row });
+                });
+            },
+        );
+        if let Err(e) = started {
+            aterm_log::warn!("harness @{tab}: the press's lane did not start: {e}");
+            lanes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&tab);
+        }
+    }
+
+    /// Apply a row a press's lane read (`Wake::AgentUpgradePress`): laid over the tab's row as
+    /// shown, or added where the window shows none (the host stood down with the harness off).
+    /// Like a word's reply it inherits the accepted owner of its run (the row the press was
+    /// made on, shown or kept), capturing no custody at delivery.
+    pub(crate) fn apply_press_row(&mut self, row: Row) {
+        let now = now_s();
+        let rows = laid_in(&self.upgrade_view.rows, row.clone(), now).unwrap_or_else(|| {
+            let mut rows: Vec<Row> = self
+                .upgrade_view
+                .rows
+                .iter()
+                .filter(|r| r.tab != row.tab)
+                .cloned()
+                .collect();
+            rows.push(row);
+            rows.sort_by(|a, b| a.session.cmp(&b.session));
+            rows
+        });
+        self.apply_agent_upgrades_owned(rows, None, &[]);
+    }
+
     /// Queue an owner upgrade action from a band capsule, Settings button, or tab menu.
     pub(crate) fn send_upgrade_word(&mut self, mut ask: WordAsk) -> bool {
+        if let Some(press) = ask.press {
+            self.upgrade_view
+                .pressed_off
+                .insert(ask.tab.clone(), press.off);
+        }
         if let Some(row) = self
             .upgrade_view
             .row_for(&ask.tab)
             .filter(|r| same_build(&r.to, &ask.to))
         {
             ask.session.clone_from(&row.session);
+            ask.scope = Some(upgrade_drive::AskScope::from(row));
         }
         let writer = self.upgrade_view.writer.clone();
         let Some(proxy) = self.proxy.clone() else {
@@ -1042,6 +1442,11 @@ impl App {
         let place = spot.place.clone();
         match result {
             Ok(row) => {
+                let posted = posted.filter(|_| {
+                    self.upgrade_view
+                        .row_for(&ask.tab)
+                        .is_some_and(|shown| same_move(shown, &row))
+                });
                 aterm_log::info!(
                     "harness @{}: the owner's word from the window: {} ({})",
                     ask.tab,
@@ -1052,8 +1457,13 @@ impl App {
                     .upgrade_view
                     .row_for(&ask.tab)
                     .is_some_and(message_reporters::upgrade_now_asks_again);
-                let said =
-                    message_reporters::agent_upgrade_worded(&row, ask.word, &place, asked_again);
+                let said = message_reporters::agent_upgrade_worded(
+                    &row,
+                    ask.word,
+                    ask.press.is_some(),
+                    &place,
+                    asked_again,
+                );
                 self.upgrade_view.word_landed(&row);
                 let answer = |app: &mut App, id: MessageId| {
                     let stall_title = app.messages.live(id).map(|l| l.msg.title.clone());
@@ -1077,8 +1487,22 @@ impl App {
                 } else {
                     self.record_message(said);
                 }
-                if let Some(rows) = laid_in(&self.upgrade_view.rows, row, now_s()) {
-                    self.apply_agent_upgrades(rows);
+                if let Some(rows) = laid_in(&self.upgrade_view.rows, row.clone(), now_s()) {
+                    self.apply_agent_upgrades_owned(rows, None, &[]);
+                    if let Some(local) =
+                        self.local_session_of(&aterm_session::SessionId::new(&row.tab))
+                        && let Some(handle) = self.pool.get(local)
+                    {
+                        handle
+                            .ctx
+                            .timeline
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .upgrade_word_accepted(&row);
+                    }
+                }
+                if ask.press.is_some() {
+                    self.start_press_lane(ask);
                 }
             }
             Err(why) => {
@@ -1087,6 +1511,9 @@ impl App {
                     ask.tab,
                     ask.word.as_str()
                 );
+                if ask.press.is_some() {
+                    self.upgrade_view.pressed_off.remove(&ask.tab);
+                }
                 if ask.word == UpgradeWord::Now
                     && let Some(local) =
                         self.local_session_of(&aterm_session::SessionId::new(&ask.tab))
@@ -1464,6 +1891,15 @@ mod tests {
             .sid
             .as_str()
             .to_string();
+        crate::claude_footer::probe::drawer(&app, local, 4343, "claude", "2.1.281");
+        app.pool
+            .get(local)
+            .unwrap()
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .set_program(4343, Some("claude".into()));
         let now = now_s();
         let finished = Row {
             session: "2d28d268-0000-4000-8000-000000000001".to_string(),
@@ -1656,6 +2092,8 @@ mod tests {
                 to: ended.to.clone(),
                 word: UpgradeWord::Now,
                 session: String::new(),
+                press: None,
+                scope: None,
             },
             Err("busy:another-sweep".to_string()),
         );
@@ -1886,6 +2324,8 @@ mod tests {
             to: "2.1.282".to_string(),
             word: UpgradeWord::NotToday,
             session: String::new(),
+            press: None,
+            scope: None,
         };
         let kept = |app: &App| {
             app.upgrade_view
@@ -2941,6 +3381,119 @@ mod tests {
     }
 
     #[test]
+    fn an_equal_second_old_batch_cannot_undo_a_later_accepted_word() {
+        const N: u64 = 1_790_001_234;
+        let mut app = App::headless_for_test();
+        let local = app.focused_session_id(crate::WindowId(0)).unwrap();
+        let tab = app.session_sid(local).unwrap();
+        crate::claude_footer::probe::drawer(&app, local, 4343, "claude", "2.1.281");
+        let ctx = app.pool.get(local).unwrap().ctx.clone();
+        ctx.timeline
+            .lock()
+            .unwrap()
+            .set_program(4343, Some("claude".into()));
+        let baseline = row(&tab, 60);
+        app.apply_agent_upgrades(vec![baseline.clone()]);
+        let now = Row {
+            request: Request::Now,
+            request_at: N,
+            ..baseline.clone()
+        };
+        app.apply_upgrade_word(
+            &WordAsk::new(tab.clone(), now.to.clone(), UpgradeWord::Now),
+            Ok(now.clone()),
+        );
+        let state = |app: &App| {
+            let timeline = ctx.timeline.lock().unwrap();
+            (
+                app.upgrade_view.row_for(&tab).unwrap().request.clone(),
+                timeline.upgrade().unwrap().request.clone(),
+            )
+        };
+        assert_eq!(state(&app), (Request::Now, Request::Now));
+        // The host's read starts before the next accepted word, within the same recorded second.
+        let before_latest_word = UpgradeSources::capture(&app.store);
+        let defer = Request::DeferUntil(N + NOT_TODAY_S);
+        app.apply_upgrade_word(
+            &WordAsk::new(tab.clone(), now.to.clone(), UpgradeWord::NotToday),
+            Ok(Row {
+                request: defer.clone(),
+                request_at: N,
+                ..baseline.clone()
+            }),
+        );
+        assert_eq!(state(&app), (defer.clone(), defer.clone()));
+        app.apply_host_upgrades_from(vec![now], Vec::new(), before_latest_word);
+        assert_eq!(
+            state(&app),
+            (defer.clone(), defer),
+            "an older read cannot roll back the later accepted word just because the seconds tie"
+        );
+
+        let now = Row {
+            request: Request::Now,
+            request_at: N,
+            ..baseline.clone()
+        };
+        let ask_now = WordAsk::new(tab.clone(), now.to.clone(), UpgradeWord::Now);
+        app.apply_upgrade_word(&ask_now, Ok(now.clone()));
+        let before_round_trip = UpgradeSources::capture(&app.store);
+        let old_defer = Row {
+            request: Request::DeferUntil(N + NOT_TODAY_S),
+            request_at: N,
+            ..baseline.clone()
+        };
+        app.apply_upgrade_word(
+            &WordAsk::new(tab.clone(), now.to.clone(), UpgradeWord::NotToday),
+            Ok(old_defer.clone()),
+        );
+        // That read can obtain the deferred row before the person accepts Now again.
+        app.apply_upgrade_word(&ask_now, Ok(now.clone()));
+        assert_eq!(state(&app), (Request::Now, Request::Now));
+        app.apply_host_upgrades_from(vec![old_defer], Vec::new(), before_round_trip);
+        assert_eq!(
+            state(&app),
+            (Request::Now, Request::Now),
+            "returning to the same word in one second cannot make an earlier read current"
+        );
+
+        let before_same_word = UpgradeSources::capture(&app.store);
+        app.apply_upgrade_word(&ask_now, Ok(now));
+        app.apply_host_upgrades_from(
+            vec![Row {
+                request: Request::DeferUntil(N + NOT_TODAY_S),
+                request_at: N,
+                ..baseline.clone()
+            }],
+            Vec::new(),
+            before_same_word,
+        );
+        assert_eq!(
+            state(&app),
+            (Request::Now, Request::Now),
+            "an accepted same-valued reply also ends the earlier read's authority"
+        );
+
+        // A read begun after that acceptance is current, even when its different choice has N too.
+        let current = UpgradeSources::capture(&app.store);
+        let skip = Request::Skip(baseline.to.clone());
+        app.apply_host_upgrades_from(
+            vec![Row {
+                request: skip.clone(),
+                request_at: N,
+                ..baseline
+            }],
+            Vec::new(),
+            current,
+        );
+        assert_eq!(
+            state(&app),
+            (skip.clone(), skip),
+            "a genuinely current external choice at the same second remains authoritative"
+        );
+    }
+
+    #[test]
     fn a_words_answer_never_brings_back_a_row_the_host_dropped() {
         let mut app = App::headless_for_test();
         let deferred = |tab: &str| Row {
@@ -2953,6 +3506,8 @@ mod tests {
             to: "2.1.282".to_string(),
             word: UpgradeWord::NotToday,
             session: String::new(),
+            press: None,
+            scope: None,
         };
         app.apply_agent_upgrades(vec![row("s-a", 60), row("s-b", 60)]);
         app.apply_agent_upgrades(vec![row("s-b", 60)]);
@@ -3001,6 +3556,8 @@ mod tests {
             to: "2.1.282".to_string(),
             word,
             session: String::new(),
+            press: None,
+            scope: None,
         };
         let mut queue = WordQueue::default();
         queue
@@ -3137,6 +3694,106 @@ mod tests {
         let written = std::fs::read_to_string(&file).expect("state file");
         assert!(written.contains(r#""request":"skip:2.1.283""#), "{written}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_queued_word_cannot_cross_a_source_build_change_at_the_same_target() {
+        use std::sync::{Mutex, mpsc};
+        use std::time::Duration;
+
+        let mut failures = Vec::new();
+        // Without birth stamps the source build itself must bound the queued choice.
+        for (old_start, new_start) in [("", ""), ("A", "B")] {
+            for word in [UpgradeWord::Now, UpgradeWord::NotToday, UpgradeWord::Skip] {
+                let dir = aterm_tempfile::TempDir::new().expect("owned harness state");
+                let (home, state) = (dir.path().join("home"), dir.path().join("state"));
+                std::fs::create_dir_all(state.join("upgrade")).expect("state");
+                let file = state.join("upgrade/conv-s-a.json");
+                let initial = format!(
+                    concat!(
+                        r#"{{"phase":"pending","from":"2.1.281","to":"2.1.284","#,
+                        r#""source":"managed","tab":"s-a","proc_start":"{}","salt":5}}"#,
+                    ),
+                    old_start,
+                );
+                std::fs::write(&file, initial).expect("old scope");
+                let opts = upgrade_drive::Opts {
+                    aterm_state: None,
+                    ..crate::harness_host::window_drive_opts(home.clone(), state.clone(), None)
+                };
+                let real = word_writer_at(home, state.clone(), None);
+                let (entered, waiting) = mpsc::channel();
+                let (release, gate) = mpsc::channel();
+                let gate = Mutex::new(gate);
+                let gated = WordWriter::new(move |ask| {
+                    entered.send(()).expect("the writer started");
+                    gate.lock()
+                        .expect("gate")
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("the replacement was saved");
+                    real.write(ask)
+                });
+                let mut app = App::headless_for_test();
+                let (capture, pressed) = recording(|_| Err("queued".to_string()));
+                app.upgrade_view.writer = capture;
+                app.apply_agent_upgrades(vec![Row {
+                    to: "2.1.284".to_string(),
+                    proc_start: old_start.to_string(),
+                    ..row("s-a", 60)
+                }]);
+                assert!(app.send_upgrade_word(WordAsk::new(
+                    "s-a".to_string(),
+                    "2.1.284".to_string(),
+                    word,
+                )));
+                // Capture through the real press path, then use the window's actual queue and
+                // writer. The gate admits a completed sweep before the backend takes its lock.
+                let ask = pressed
+                    .try_recv()
+                    .expect("the displayed scope was captured");
+                assert_eq!(ask.session, "conv-s-a");
+                let (answered, answer) = mpsc::channel();
+                let mut queue = WordQueue::default();
+                queue
+                    .send(ask, &gated, move |_, result| {
+                        answered.send(result).expect("the window awaits its reply");
+                    })
+                    .expect("queued");
+                waiting
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("writer at the gate");
+                upgrade_drive::retarget_pending_for_test(&opts, "conv-s-a", "2.1.282", new_start)
+                    .expect("a real pending retarget under the sweep lock");
+                let fresh = std::fs::read(&file).expect("new scope saved at the same key");
+                let body = std::str::from_utf8(&fresh).expect("state JSON");
+                assert!(body.contains(r#""from":"2.1.282""#), "{body}");
+                assert!(body.contains(r#""to":"2.1.284""#), "{body}");
+                assert!(body.contains(r#""request":"-""#), "{body}");
+                assert!(
+                    body.contains(&format!(r#""proc_start":"{new_start}""#)),
+                    "{body}"
+                );
+                assert!(!upgrade_drive::ledger_path(&opts).exists());
+                assert!(!upgrade_drive::word_marker(&state).exists());
+                release
+                    .send(())
+                    .expect("let the queued press reach the backend");
+                let result = answer
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("the real writer completed");
+                let unchanged = std::fs::read(&file).expect("state after the reply") == fresh;
+                let no_ledger = !upgrade_drive::ledger_path(&opts).exists();
+                let no_marker = !upgrade_drive::word_marker(&state).exists();
+                if result.is_ok() || !unchanged || !no_ledger || !no_marker {
+                    failures.push(format!(
+                        "{word:?} ({old_start:?} -> {new_start:?}): reply={result:?}, \
+                         fresh_file_unchanged={unchanged}, no_ledger={no_ledger}, \
+                         no_word_marker={no_marker}"
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]
@@ -3313,6 +3970,8 @@ mod tests {
                 to: "2.1.282".to_string(),
                 word: Skip,
                 session: String::new(),
+                press: None,
+                scope: None,
             })
         );
         let tab = app.windows[&wid].tab_set.tabs()[0].id;
@@ -3353,6 +4012,8 @@ mod tests {
             to: "2.1.282".to_string(),
             word: aterm_messages::UpgradeWord::NotToday,
             session: String::new(),
+            press: None,
+            scope: None,
         }));
         assert!(row_of(&app, "s-a").is_none(), "answered");
         let deferred = Row {
@@ -3403,6 +4064,8 @@ mod tests {
             to: "2.1.282".to_string(),
             word: UpgradeWord::NotToday,
             session: String::new(),
+            press: None,
+            scope: None,
         }));
         assert!(row_of(&app, "s-a").is_none(), "held: no stall");
         assert!(
@@ -4380,5 +5043,159 @@ mod tests {
             outcomes, [true; 5],
             "PANE_WORDS_REQUIRE_THE_PAGES_ADMITTED_WATCHERS"
         );
+    }
+
+    /// A press's lane steps its tab until the press lapses, handing back each row it reads and
+    /// pausing between steps, and lets its tab go when it ends; a step that only waits (a draft,
+    /// another sweep's lock) or acts goes on. NEGATIVE CONTROL: a record with no press standing
+    /// ends the lane at its first step.
+    #[test]
+    fn a_press_lane_steps_until_the_press_lapses() {
+        let lanes = std::sync::Mutex::new(BTreeSet::from(["s-a".to_string()]));
+        let ask = WordAsk::pressed("s-a".to_string(), "2.1.282".to_string(), false);
+        let script = |steps: Vec<&'static str>| {
+            let steps = std::sync::Mutex::new(steps.into_iter());
+            Presser::new(move |_| {
+                let step = steps
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .next()
+                    .unwrap_or(upgrade_drive::PRESS_LAPSED);
+                (step.to_string(), Some(row("s-a", 60)))
+            })
+        };
+        let run = |presser: &Presser| {
+            let delivered = std::cell::Cell::new(0);
+            let paused = std::cell::Cell::new(0);
+            run_press_lane(
+                &ask,
+                presser,
+                &lanes,
+                |_| {
+                    paused.set(paused.get() + 1);
+                    std::time::Duration::ZERO
+                },
+                |_| delivered.set(delivered.get() + 1),
+            );
+            (delivered.get(), paused.get())
+        };
+        let presser = script(vec![
+            "wait:draft",
+            "busy:another-sweep",
+            "terminated:SIGTERM",
+            upgrade_drive::PRESS_LAPSED,
+        ]);
+        assert_eq!(run(&presser), (4, 3), "four steps, three pauses");
+        assert!(
+            lanes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "the tab let go"
+        );
+        assert_eq!(
+            run(&script(vec![upgrade_drive::PRESS_LAPSED])),
+            (1, 0),
+            "CONTROL: no press, one step"
+        );
+        for step in ["current", "skip:no-record", "busy:state-unwritable"] {
+            assert!(press_lane_ends(step, std::time::Duration::ZERO), "{step}");
+        }
+        assert!(
+            press_lane_ends("wait:draft", PRESS_LANE_MAX),
+            "the span spent"
+        );
+        assert!(
+            !press_lane_ends(
+                "wait:draft",
+                PRESS_LANE_MAX - std::time::Duration::from_secs(1)
+            ),
+            "CONTROL: within the span a wait goes on"
+        );
+        assert!(
+            press_pace(std::time::Duration::from_secs(5))
+                < press_pace(std::time::Duration::from_secs(300)),
+            "close at first, then calmer"
+        );
+    }
+
+    /// A press that stands in the host's rows with no lane stepping it gets one, typing what this
+    /// window's press asked (the harness on) or, for a press this window did not send, only the
+    /// relaunch line; one lane a tab. NEGATIVE CONTROL: a row with no press standing starts none.
+    #[test]
+    fn a_standing_press_with_no_lane_gets_one_from_the_hosts_rows() {
+        let mut app = App::headless_for_test();
+        let (tx, asked) = std::sync::mpsc::channel::<WordAsk>();
+        app.upgrade_view.set_presser(Presser::new(move |ask| {
+            let _ = tx.send(ask.clone());
+            (upgrade_drive::PRESS_LAPSED.to_string(), None)
+        }));
+        let now = now_s();
+        let pressed = |tab: &str| Row {
+            request: Request::Now,
+            request_at: now - 5,
+            pressed_at: now - 5,
+            pressed_to: "2.1.282".to_string(),
+            ..row(tab, 60)
+        };
+        app.apply_host_upgrades(vec![row("s-a", 60)], Vec::new());
+        assert!(asked.try_recv().is_err(), "CONTROL: no press, no lane");
+        app.apply_host_upgrades(vec![pressed("s-a")], Vec::new());
+        let ask = asked.try_recv().expect("a lane for the standing press");
+        assert_eq!(
+            (ask.tab.as_str(), ask.session.as_str(), ask.press),
+            ("s-a", "conv-s-a", Some(PressAsk { off: true })),
+            "a press this window did not send types only the relaunch line"
+        );
+        app.upgrade_view
+            .pressed_off
+            .insert("s-b".to_string(), false);
+        app.apply_host_upgrades(vec![pressed("s-b")], Vec::new());
+        let ask = asked.try_recv().expect("a lane for this window's press");
+        assert_eq!(
+            ask.press,
+            Some(PressAsk { off: false }),
+            "what the press asked"
+        );
+        app.upgrade_view
+            .pressing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert("s-b".to_string());
+        app.apply_host_upgrades(vec![pressed("s-b")], Vec::new());
+        assert!(asked.try_recv().is_err(), "one lane a tab");
+
+        // A stale host batch read before a press (including on a tab whose Autopilot was off
+        // and whose request_at already matched the press's second) keeps the press standing
+        // and its off-aside cleared on the glass.
+        let stale_off = Row {
+            request: Request::Now,
+            request_at: now,
+            pressed_at: 0,
+            pressed_to: String::new(),
+            aside: "autopilot-off".to_string(),
+            wait: "autopilot-off".to_string(),
+            ..row("s-c", 60)
+        };
+        app.apply_host_upgrades(vec![stale_off.clone()], Vec::new());
+        let pressed_reply = Row {
+            request: Request::Now,
+            request_at: now,
+            pressed_at: now,
+            pressed_to: "2.1.282".to_string(),
+            aside: String::new(),
+            wait: "draft".to_string(),
+            ..row("s-c", 60)
+        };
+        app.apply_upgrade_word(
+            &WordAsk::pressed("s-c".to_string(), "2.1.282".to_string(), true),
+            Ok(pressed_reply),
+        );
+        let _ = asked.try_recv();
+        app.apply_host_upgrades(vec![stale_off], Vec::new());
+        let shown = app.upgrade_view.row_for("s-c").expect("s-c shown");
+        assert!(shown.press_stands(now), "press survives stale host batch");
+        assert_eq!(shown.aside, "", "off-aside remains cleared");
+        assert_eq!(shown.wait, "draft", "underlying wait restored");
     }
 }

@@ -516,7 +516,7 @@ impl RelaunchBrake {
         }
     }
 
-    /// The relaunched window lived [`HEALTHY_MS`]: the streak resets.
+    /// The relaunched window lived [`HEALTHY_MS`]: the brake resets.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -527,6 +527,7 @@ impl RelaunchBrake {
     )]
     pub fn healthy(&mut self) {
         self.streak = 0;
+        self.held = false;
     }
 
     /// A launch the keeper did not cause said HELLO: the brake resets.
@@ -2441,7 +2442,14 @@ mod tests {
         assert_eq!((b.streak(), b.held()), (0, false));
         assert_eq!(b.decide(600, false), BrakeDecision::RelaunchAt(600));
         b.healthy();
-        assert_eq!(b.streak(), 0);
+        assert_eq!((b.streak(), b.held()), (0, false));
+        for t in [700, 800, 900] {
+            let _ = b.decide(t, false);
+        }
+        assert_eq!(b.decide(1000, false), BrakeDecision::Hold);
+        assert!(b.held());
+        b.healthy();
+        assert_eq!((b.streak(), b.held()), (0, false));
     }
 
     #[test]
@@ -3519,7 +3527,7 @@ mod late_hello_tests {
             }
             if braked {
                 assert!(
-                    relaunches <= u64::from(MAX_STREAK) + 1,
+                    relaunches <= u64::from(MAX_STREAK),
                     "{row}: relaunched {relaunches} times: the brake never held"
                 );
             } else {

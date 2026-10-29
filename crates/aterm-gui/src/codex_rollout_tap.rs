@@ -12,13 +12,15 @@ use std::time::{Duration, Instant};
 use aterm_agent::harness::codex_facts::CodexFactsTail;
 use aterm_agent::harness::codex_tap::{Refusal, RolloutTap, rollout_path};
 use aterm_agent::harness::footer::{FOLD_BUDGET, GitHeadRead, read_git_head};
+use aterm_agent::harness::steps::StepState;
 
 use crate::claude_footer::LogWake;
-use crate::self_claim::RolloutTarget;
+use crate::self_claim::{TapTarget, Tapped, Untapped};
 use crate::session_log::transcript::{Applied, RolloutWord, Source, TapRun, apply_rollout_batch};
 use crate::session_timeline::SessionTimeline;
 
-/// Minimum interval between rollout reads while a `codex-alab` session is in front.
+/// Minimum interval between rollout reads while a `codex-alab` session is in front: a read-only
+/// target's record is read again on the same cadence ([`crate::self_claim::tapped`]).
 pub(crate) const RECHECK: Duration = Duration::from_secs(1);
 
 /// Per-session rollout cadence state.
@@ -36,8 +38,8 @@ pub(crate) enum Ask {
     /// Not due, or nothing to request.
     Nothing,
     /// Request a rollout read for the target.
-    Read(RolloutTarget),
-    /// Stop the session's tap once after its claim disappears.
+    Read(TapTarget),
+    /// Stop the session's tap once after its target disappears.
     Stop,
 }
 
@@ -45,7 +47,7 @@ pub(crate) enum Ask {
 pub(crate) fn due(
     asked: &mut HashMap<u64, RolloutAsk>,
     session: u64,
-    target: Option<RolloutTarget>,
+    target: Option<TapTarget>,
     now: Instant,
 ) -> Ask {
     let Some(target) = target else {
@@ -78,12 +80,18 @@ pub(crate) struct Image {
     pub(crate) start: fn(u32) -> Option<String>,
     /// Process start timestamp in wall milliseconds.
     pub(crate) born_ms: fn(u32) -> Option<u64>,
-    /// Running ALab package version for `pid`.
+    /// Client build for rollout binding ([`aterm_agent::harness::codex_alab::alab_build`]).
     pub(crate) build: fn(u32) -> Option<String>,
+    /// Product version from this running image's package, for display and upgrade comparison.
+    pub(crate) version: fn(u32) -> Option<String>,
     /// Process group of `pid`.
     pub(crate) group: fn(u32) -> Option<i32>,
     /// The worker task `pid` was spawned on ([`crate::survey::task_prompt_of_env`]).
     pub(crate) task: fn(u32) -> Option<String>,
+    /// The session record of `(pid, start)` under a `$CODEX_HOME`, read while that identity is
+    /// live ([`aterm_agent::harness::self_claimed::read_seen`]): a read-only target's, at each ask.
+    pub(crate) record:
+        fn(&std::path::Path, u32, &str) -> Option<aterm_agent::harness::self_claimed::Seen>,
 }
 
 impl Image {
@@ -92,17 +100,19 @@ impl Image {
         start: aterm_agent::harness::restart_stamp::kernel_start,
         born_ms,
         build: running_build,
+        version: running_version,
         group: live_group,
         task: spawned_task,
+        record: aterm_agent::harness::self_claimed::read_seen,
     };
 }
 
-/// One ask: the session, its timeline, what its claim names, what a moved
+/// One ask: the session, its timeline, what its claim or read-only copy names, what a moved
 /// log wakes, and how the claimant's process is looked at.
 struct Job {
     session: u64,
     ctx: Weak<crate::SessionCtx>,
-    target: RolloutTarget,
+    target: TapTarget,
     run: TapRun,
     wake: LogWake,
     image: Image,
@@ -114,18 +124,18 @@ impl Job {
     fn capture_job(
         session: u64,
         ctx: &Arc<crate::SessionCtx>,
-        target: RolloutTarget,
+        target: TapTarget,
         wake: &LogWake,
         image: Image,
     ) -> Option<Self> {
-        let _claim = crate::self_claim::hold_rollout(ctx, &target)?;
+        let _claim = crate::self_claim::hold_target(ctx, &target)?;
         let run = ctx
             .timeline
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .slog()
             .transcript_arm(Source::Rollout)
-            .filter(|arm| arm.run.claimed_by(target.pid))?
+            .filter(|arm| arm.run.led_by(target.pid()))?
             .run;
         Some(Self {
             session,
@@ -175,7 +185,7 @@ pub(crate) fn follow_ask_as(
 pub(crate) fn request_as(
     session: u64,
     ctx: &Arc<crate::SessionCtx>,
-    target: RolloutTarget,
+    target: TapTarget,
     wake: &LogWake,
     image: Image,
 ) {
@@ -224,9 +234,9 @@ fn send_stop(session: u64, timeline: Option<Arc<Mutex<SessionTimeline>>>) {
     }
 }
 
-/// One session's tap, what it was made for, and the refusal last logged.
+/// One session's tap, the rollout it was made for, and the refusal last logged.
 struct Held {
-    target: RolloutTarget,
+    tapped: Tapped,
     run: TapRun,
     tap: RolloutTap,
     said: Option<Refusal>,
@@ -236,6 +246,8 @@ struct Held {
     task: Option<String>,
     /// What [`publish_facts`] last published from it.
     shown: Option<crate::survey::CodexSurvey>,
+    /// The ALab build [`publish_build`] last published for the claimant's image.
+    build: Option<String>,
 }
 
 /// The taps by session.
@@ -279,7 +291,7 @@ fn stop_tap(taps: &mut Taps, session: u64, timeline: Option<&Arc<Mutex<SessionTi
 fn drop_held(taps: &mut Taps, session: u64, ctx: Option<&crate::SessionCtx>) {
     if taps
         .remove(&session)
-        .is_some_and(|held| held.shown.is_some())
+        .is_some_and(|held| held.shown.is_some() || held.build.is_some())
         && let Some(ctx) = ctx
         && ctx
             .timeline
@@ -313,6 +325,12 @@ fn running_build(pid: u32) -> Option<String> {
     aterm_agent::harness::codex_alab::alab_build(&exe)
 }
 
+/// The product version of the package whose image `pid` runs; never the selected package.
+fn running_version(pid: u32) -> Option<String> {
+    let exe = aterm_uds::sudo::exe_path(i32::try_from(pid).ok()?)?;
+    aterm_agent::harness::codex_alab::product_version(&exe)
+}
+
 /// ONE ASK: arm, read on, apply, and then, in a hold of its
 /// own, count the ask answered with its word
 /// (`SessionLog::rollout_answered`, `status rollout= rollout_asks=`): every
@@ -335,26 +353,43 @@ fn read_once_after(taps: &mut Taps, job: &Job, after_read: impl FnOnce()) -> Opt
     applied
 }
 
-/// [`read_once`]'s guarded arm, read and apply, and the answer ([`RolloutWord`]): bound, the
-/// tap's refusal, unbound, no thread, or stale when the queued claim, copied target, run or
+/// [`read_once`]'s guarded arm, read and apply, and the answer ([`RolloutWord`]): bound (read
+/// `on`) or partial, the tap's refusal, unbound, no thread (a read-only target's record naming
+/// none among them), or stale when the queued claim or copy, the thread it names, the run or the
 /// sampled process image no longer matches.
 fn read_on(
     taps: &mut Taps,
     job: &Job,
     after_read: impl FnOnce(),
 ) -> (Option<Applied>, RolloutWord) {
+    let tapped = job.ctx.upgrade().map_or(Err(Untapped::Moved), |ctx| {
+        crate::self_claim::tapped(&ctx, &job.target, job.image.record)
+    });
+    let tapped = match tapped {
+        Ok(tapped) => tapped,
+        Err(why) => {
+            drop_held(taps, job.session, job.ctx.upgrade().as_deref());
+            return (
+                None,
+                match why {
+                    Untapped::Moved => RolloutWord::Stale,
+                    Untapped::Unnamed => RolloutWord::NoThread,
+                },
+            );
+        }
+    };
+    let (pid, start) = (job.target.pid(), job.target.start());
     let read = || {
         let ctx = job.ctx.upgrade()?;
         let arm = {
-            let _claim = crate::self_claim::hold_rollout(&ctx, &job.target)?;
+            let _claim = crate::self_claim::hold_rollout(&ctx, &tapped)?;
             let timeline = ctx.timeline.lock().unwrap_or_else(PoisonError::into_inner);
             timeline
                 .slog()
                 .transcript_arm(Source::Rollout)
                 .filter(|arm| arm.run == job.run)?
         };
-        ((job.image.start)(job.target.pid).as_deref() == Some(job.target.start.as_str()))
-            .then_some((ctx, arm))
+        ((job.image.start)(pid).as_deref() == Some(start)).then_some((ctx, arm))
     };
     let Some((ctx, arm)) = read() else {
         drop_held(taps, job.session, job.ctx.upgrade().as_deref());
@@ -362,31 +397,31 @@ fn read_on(
     };
     if taps
         .get(&job.session)
-        .is_some_and(|held| held.target != job.target || held.run != job.run)
+        .is_some_and(|held| held.tapped != tapped || held.run != job.run)
     {
         drop_held(taps, job.session, Some(&ctx));
     }
     let held = match taps.entry(job.session) {
         Entry::Occupied(e) => e.into_mut(),
         Entry::Vacant(e) => {
-            let Some(tap) = RolloutTap::new(&job.target.thread, &job.target.home) else {
+            let Some(tap) = RolloutTap::new(&tapped.thread, tapped.target.home()) else {
                 return (None, RolloutWord::NoThread);
             };
             e.insert(Held {
-                target: job.target.clone(),
+                tapped: tapped.clone(),
                 run: job.run,
                 tap,
                 said: None,
                 facts: None,
-                task: (job.image.task)(job.target.pid),
+                task: (job.image.task)(pid),
                 shown: None,
+                build: None,
             })
         }
     };
-    let floor = arm
-        .floor_ms
-        .max((job.image.born_ms)(job.target.pid).unwrap_or(0));
-    let running = (job.image.build)(job.target.pid);
+    let floor = arm.floor_ms.max((job.image.born_ms)(pid).unwrap_or(0));
+    let running = (job.image.build)(pid);
+    let version = (job.image.version)(pid);
     held.tap.arm(floor, arm.given, running.as_deref());
     let _ = held.tap.read(FOLD_BUDGET);
     let refused = held.tap.refused();
@@ -400,36 +435,42 @@ fn read_on(
             );
         }
     }
-    let word = match (held.tap.is_bound(), refused) {
-        (true, _) => RolloutWord::Bound,
-        (false, Some(refusal)) => RolloutWord::Refused(refusal),
-        (false, None) => RolloutWord::Unbound,
+    let word = match (held.tap.reads_at(), refused) {
+        (Some(StepState::On), _) => RolloutWord::Bound,
+        (Some(StepState::Partial), _) => RolloutWord::Partial,
+        (None, Some(refusal)) => RolloutWord::Refused(refusal),
+        (None, None) => RolloutWord::Unbound,
     };
     let batch = held.tap.take();
-    let survey = read_facts(held, &job.target);
+    let survey = read_facts(held, &tapped);
     after_read();
-    if (job.image.start)(job.target.pid).as_deref() != Some(job.target.start.as_str())
-        || (job.image.build)(job.target.pid) != running
+    if (job.image.start)(pid).as_deref() != Some(start)
+        || (job.image.build)(pid) != running
+        || (job.image.version)(pid) != version
     {
         drop_held(taps, job.session, Some(&ctx));
         return (None, RolloutWord::Stale);
     }
-    let applied = apply_rollout_batch(&ctx, &job.target, job.run, &batch, held.tap.is_bound());
+    let applied = apply_rollout_batch(&ctx, &tapped, job.run, &batch, held.tap.is_bound());
     if applied.disarm {
         drop_held(taps, job.session, Some(&ctx));
         return (Some(applied), RolloutWord::Stale);
     }
     if let Some(survey) = survey {
-        publish_facts(&ctx, job, held, survey);
+        publish_facts(&ctx, job, &tapped, held, survey);
+    }
+    if held.build != version {
+        publish_build(&ctx, job, &tapped, held, version);
     }
     (Some(applied), word)
 }
 
-/// The survey's facts from `held`'s rollout, whatever build wrote it (the tap's steps are
-/// measured builds' only, these facts any codex's), when they differ from those last shown.
-fn read_facts(held: &mut Held, target: &RolloutTarget) -> Option<crate::survey::CodexSurvey> {
+/// The survey's facts from `held`'s rollout, whatever build wrote it (the tap's steps refuse a
+/// `session_meta` of a shape the fold does not know, these facts are any codex's), when they
+/// differ from those last shown.
+fn read_facts(held: &mut Held, tapped: &Tapped) -> Option<crate::survey::CodexSurvey> {
     if held.facts.is_none()
-        && let Some(path) = rollout_path(&target.home, &target.thread)
+        && let Some(path) = rollout_path(tapped.target.home(), &tapped.thread)
     {
         held.facts = Some(CodexFactsTail::new(path));
     }
@@ -445,9 +486,9 @@ fn read_facts(held: &mut Held, target: &RolloutTarget) -> Option<crate::survey::
         _ => None,
     };
     let goal = aterm_agent::harness::self_claimed::read_record_goal(
-        &target.home,
-        target.pid,
-        &target.thread,
+        tapped.target.home(),
+        tapped.target.pid(),
+        &tapped.thread,
     );
     if held.facts.is_none() && held.task.is_none() && goal.is_none() && held.shown.is_none() {
         return None;
@@ -461,30 +502,64 @@ fn read_facts(held: &mut Held, target: &RolloutTarget) -> Option<crate::survey::
     (held.shown.as_ref() != Some(&survey)).then_some(survey)
 }
 
-/// Publishes `survey` for the claimant's group while its claim stands; kept as shown only once
-/// the timeline took it, so a group not in front is offered it again at the next read.
+/// Publishes `survey` for the claimant's group while its claim or read-only copy still names
+/// `tapped`; kept as shown only once the timeline took it, so a group not in front is offered it
+/// again at the next read.
 fn publish_facts(
     ctx: &crate::SessionCtx,
     job: &Job,
+    tapped: &Tapped,
     held: &mut Held,
     survey: crate::survey::CodexSurvey,
 ) {
-    let Some(group) = (job.image.group)(job.target.pid) else {
-        return;
+    if publish(ctx, job, tapped, |timeline, group| {
+        timeline.set_codex_survey(group, survey.clone())
+    }) {
+        held.shown = Some(survey);
+    }
+}
+
+/// Publishes the ALab `build` the claimant's image runs, as the top rule's label names it, on its
+/// own slot: a build alone is no survey fact, so a tab with no rollout keeps its screen's read.
+/// Kept as shown only once the timeline took it, as [`publish_facts`] keeps its facts.
+fn publish_build(
+    ctx: &crate::SessionCtx,
+    job: &Job,
+    tapped: &Tapped,
+    held: &mut Held,
+    build: Option<String>,
+) {
+    if publish(ctx, job, tapped, |timeline, group| {
+        timeline.set_codex_build(group, build.clone())
+    }) {
+        held.build = build;
+    }
+}
+
+/// Runs `set` on the timeline for the claimant's group while its claim or read-only copy still
+/// names `tapped`, and says the footer changed when it took: whether it did.
+fn publish(
+    ctx: &crate::SessionCtx,
+    job: &Job,
+    tapped: &Tapped,
+    set: impl FnOnce(&mut SessionTimeline, i32) -> bool,
+) -> bool {
+    let Some(group) = (job.image.group)(job.target.pid()) else {
+        return false;
     };
     let took = {
-        let Some(_claim) = crate::self_claim::hold_rollout(ctx, &job.target) else {
-            return;
+        let Some(_claim) = crate::self_claim::hold_rollout(ctx, tapped) else {
+            return false;
         };
-        ctx.timeline
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .set_codex_survey(group, survey.clone())
+        set(
+            &mut ctx.timeline.lock().unwrap_or_else(PoisonError::into_inner),
+            group,
+        )
     };
     if took {
-        held.shown = Some(survey);
         crate::claude_footer::post_changed(job.session);
     }
+    took
 }
 
 /// Synchronous rollout tap harness for tests.
@@ -499,10 +574,10 @@ impl Host {
         &mut self,
         session: u64,
         ctx: &Arc<crate::SessionCtx>,
-        target: RolloutTarget,
+        target: impl Into<TapTarget>,
         image: Image,
     ) -> Option<Applied> {
-        let job = Job::capture_job(session, ctx, target, &LogWake::default(), image)?;
+        let job = Job::capture_job(session, ctx, target.into(), &LogWake::default(), image)?;
         read_once(&mut self.0, &job)
     }
 
@@ -510,11 +585,11 @@ impl Host {
         &mut self,
         session: u64,
         ctx: &Arc<crate::SessionCtx>,
-        target: RolloutTarget,
+        target: impl Into<TapTarget>,
         image: Image,
         schedule: (impl FnOnce(), impl FnOnce()),
     ) -> Option<Applied> {
-        let job = Job::capture_job(session, ctx, target, &LogWake::default(), image)?;
+        let job = Job::capture_job(session, ctx, target.into(), &LogWake::default(), image)?;
         schedule.0();
         read_once_after(&mut self.0, &job, schedule.1)
     }
@@ -524,10 +599,11 @@ impl Host {
         &mut self,
         session: u64,
         ctx: &Arc<crate::SessionCtx>,
-        target: RolloutTarget,
+        target: impl Into<TapTarget>,
         image: Image,
     ) -> &'static str {
-        let Some(job) = Job::capture_job(session, ctx, target, &LogWake::default(), image) else {
+        let Some(job) = Job::capture_job(session, ctx, target.into(), &LogWake::default(), image)
+        else {
             return RolloutWord::Stale.word();
         };
         read_on(&mut self.0, &job, || {}).1.word()
@@ -543,14 +619,15 @@ impl Host {
 mod tests {
     use super::*;
 
-    fn target(thread: &str) -> RolloutTarget {
-        RolloutTarget {
+    fn target(thread: &str) -> TapTarget {
+        crate::self_claim::RolloutTarget {
             revision: 1,
             pid: 4242,
             start: "Mon Oct 20 16:37:58 2026".to_string(),
             thread: thread.to_string(),
             home: std::path::PathBuf::from("/private/tmp/x/codex-home"),
         }
+        .into()
     }
 
     /// THE CADENCE: a proven claimant in front is asked for at once, then

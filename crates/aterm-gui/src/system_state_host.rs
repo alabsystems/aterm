@@ -128,7 +128,14 @@ impl InitialSetupApplyReceipt {
     /// points, and the answer it sends ([`Self::accept`], or `false` dropped).
     #[cfg(any(test, debug_assertions))]
     pub fn detached(chosen: bool) -> (Self, Receiver<bool>) {
-        Self::new(Admission::Person, chosen, None, None)
+        Self::detached_as(Admission::Person, chosen)
+    }
+
+    /// [`Self::detached`] for an Apply whose word on whose it is is `admission`: the page's own
+    /// answer to an offer ([`Admission::Automatic`]), say.
+    #[cfg(any(test, debug_assertions))]
+    pub fn detached_as(admission: Admission, chosen: bool) -> (Self, Receiver<bool>) {
+        Self::new(admission, chosen, None, None)
     }
 
     /// The settings the page changed since it last took the plan in force, which the worker
@@ -526,11 +533,14 @@ impl App {
     }
 
     pub(crate) fn offer_system_state(&mut self, request: Request) {
+        if self.resume_offer_moot(&request) {
+            return;
+        }
         let quiet = self.system_state_host.review_shown
-            || matches!(request.kind(), OfferKind::Widen { .. });
+            || matches!(request.kind(), OfferKind::Widen { .. } | OfferKind::Resume);
         if !request.pending()
             || self.headless
-            || !self.can_offer_system_state()
+            || !self.can_offer_system_state(request.kind())
             || !(if quiet {
                 self.open_system_state_tab_quietly()
             } else {
@@ -543,25 +553,47 @@ impl App {
         self.attach_system_state_offer(request);
     }
 
-    fn can_offer_system_state(&self) -> bool {
+    fn can_offer_system_state(&self, kind: &OfferKind) -> bool {
         // The host keeps accepted work and admissions after their final view
         // closes. A queued startup offer must yield before opening a new
         // review, just as it does while a busy controller survives (§3.3).
+        // The offer of a plan an earlier process admitted yields to the same
+        // work, but not to that plan's own run going (§3.3, §6), and to a
+        // Stop or a choice the window holds setup for, which no answer of it
+        // may take the place of.
+        let resume = matches!(kind, OfferKind::Resume);
         self.system_state_host.operation.is_none()
+            && (!resume || self.workstation_setup.setup_unheld())
             && !self.system_state_host.awaiting_run
-            && !self.system_state_host.latest_status.busy
+            && (resume || !self.system_state_host.latest_status.busy)
             && self.system_state_host.pending.is_none()
             && self.system_state_host.pending_apply.is_none()
             && self
                 .native_runtime
                 .instance_by_kind(AppKind::SystemState)
                 .is_none_or(|instance| {
-                    matches!(self.native_runtime.app(instance), Some(NativeApp::SystemState(state)) if state.can_offer())
+                    matches!(self.native_runtime.app(instance), Some(NativeApp::SystemState(state))
+                        if if resume { state.can_offer_resume() } else { state.can_offer() })
                 })
     }
 
+    /// The offer of a plan an earlier process admitted is moot while this window holds its own
+    /// admission of the plan in force (a press's, or an answer to an earlier offer): it goes for
+    /// this launch, finished as closed, and nothing answers it for that admission (§6). Whether
+    /// `request` was that offer, now finished.
+    fn resume_offer_moot(&self, request: &Request) -> bool {
+        let moot = matches!(request.kind(), OfferKind::Resume) && self.own_admission_stands();
+        if moot {
+            request.finish(WorkstationSetupDecision::Closed);
+        }
+        moot
+    }
+
     fn attach_system_state_offer(&mut self, request: Request) {
-        if !request.pending() || !self.can_offer_system_state() {
+        if self.resume_offer_moot(&request) {
+            return;
+        }
+        if !request.pending() || !self.can_offer_system_state(request.kind()) {
             request.finish(WorkstationSetupDecision::Unavailable);
             return;
         }
@@ -570,11 +602,21 @@ impl App {
             return;
         }
         // The review of the groups the ALab signal adds holds none of aterm's own permissions:
-        // they are in the plan in force, whose run carries them (design §3.5).
-        let widen = matches!(request.kind(), OfferKind::Widen { .. });
+        // they are in the plan in force, whose run carries them (design §3.5). Nor does the offer
+        // of a plan an earlier process admitted: its run goes on, its access steps with it, and
+        // the page reads as it did; nor does its answer (§3.3, §6).
+        let launch = matches!(request.kind(), OfferKind::Launch);
+        let resume = matches!(request.kind(), OfferKind::Resume);
         self.system_state_host.pending = Some(request);
+        if resume {
+            self.system_state_host.action_refusal = None;
+            self.system_state_host.next_tick = None;
+            self.system_state_host.next_status = Some(Instant::now());
+            self.request_redraw_all_windows();
+            return;
+        }
         self.system_state_host.review_shown = true;
-        if !widen {
+        if launch {
             self.hold_initial_setup_permissions();
         }
         self.refresh_system_state_tab_indicators();
@@ -700,6 +742,30 @@ impl App {
     /// it. The status poll is left as it was.
     pub(crate) fn republish_system_state_access_step(&mut self) {
         if self.system_state_host.access_step == self.system_state_access_step() {
+            return;
+        }
+        let (in_flight, next) = (
+            self.system_state_host.status_in_flight,
+            self.system_state_host.next_status,
+        );
+        self.publish_system_state(self.system_state_host.latest_status.clone());
+        self.system_state_host.status_in_flight = in_flight;
+        self.system_state_host.next_status = next;
+    }
+
+    /// Republish System State when [`Self::developer_tools_install_step`] moved since the last
+    /// publish (for example, `Install…` was queued behind a macOS permission gesture or started),
+    /// leaving the status poll as it was.
+    pub(crate) fn republish_system_state_developer_tools(&mut self) {
+        if self.system_state_host.showing_fixture()
+            || self
+                .system_state_host
+                .latest_status
+                .repositories_tools_wait()
+                .is_none()
+            || self.system_state_host.latest_status.developer_tools
+                == self.developer_tools_install_step()
+        {
             return;
         }
         let (in_flight, next) = (
@@ -989,8 +1055,16 @@ impl App {
         {
             return;
         }
-        self.system_state_host.pending = None;
-        self.recheck_initial_setup_permissions();
+        // The offer of a plan an earlier process admitted held nothing, so its going releases
+        // nothing either.
+        if !self
+            .system_state_host
+            .pending
+            .take()
+            .is_some_and(|request| matches!(request.kind(), OfferKind::Resume))
+        {
+            self.recheck_initial_setup_permissions();
+        }
         self.system_state_host.generation = self.system_state_host.generation.wrapping_add(1);
         self.system_state_host.status_in_flight = false;
         self.system_state_host.next_status = Some(now);
@@ -1046,6 +1120,73 @@ impl App {
                             .active_visible_leaf_plan(wid)
                             .is_some_and(|plan| plan.leaf(view).is_some())
                     })
+        })
+    }
+
+    /// Which part of [`Self::system_state_frontmost`] fails, in aterm.log's words: `None` while a
+    /// window has System State frontmost. Read in the aterm window that last had keyboard focus:
+    /// while System State is not in view there (closed, behind another tab, or only in another
+    /// window), or in view but not its active view (a terminal pane of a split active beside it),
+    /// that alone is said, whatever the focus, so keys typed and windows or apps switched to there
+    /// change nothing said; once it is that window's active view, the part that fails next
+    /// (keyboard focus, occlusion, an overlay, the visible layout) is said.
+    pub(crate) fn system_state_front_gap(&self) -> Option<&'static str> {
+        if self.system_state_frontmost() {
+            return None;
+        }
+        let Some(wid) = self
+            .frontmost_window
+            .filter(|wid| self.system_state_laid_out_in(*wid))
+        else {
+            return Some("System State is not in view in the aterm window last focused");
+        };
+        let Some((_, view)) = self.active_native_view(wid).filter(|(instance, _)| {
+            matches!(
+                self.native_runtime.app(*instance),
+                Some(crate::native_app::NativeApp::SystemState(_))
+            )
+        }) else {
+            return Some("System State is not the active view in the aterm window last focused");
+        };
+        let Some(window) = self
+            .windows
+            .get(&wid)
+            .filter(|window| crate::os_window_focused(window))
+        else {
+            return Some("no aterm window has keyboard focus");
+        };
+        if window.occluded {
+            return Some(
+                "macOS reads the focused window occluded (covered, minimized, or the screen \
+                 locked or asleep)",
+            );
+        }
+        if window.overlay.is_some() {
+            return Some("the focused window has the palette or the Overview up");
+        }
+        if !self
+            .active_visible_leaf_plan(wid)
+            .is_some_and(|plan| plan.leaf(view).is_some())
+        {
+            return Some("System State's view is not in the focused window's visible layout");
+        }
+        Some("System State is not the visible view of a focused window")
+    }
+
+    /// Whether a System State view is a leaf of window `wid`'s active tab's visible layout,
+    /// active or not, on screen or not.
+    fn system_state_laid_out_in(&self, wid: crate::WindowId) -> bool {
+        let Some(instance) = self
+            .native_runtime
+            .instance_by_kind(crate::native_app::AppKind::SystemState)
+        else {
+            return false;
+        };
+        self.active_visible_leaf_plan(wid).is_some_and(|plan| {
+            plan.leaves.iter().any(|leaf| {
+                matches!(self.view_store.get(leaf.view),
+                    Some(crate::tab_model::View::Native(native)) if native.instance == instance)
+            })
         })
     }
 
@@ -1296,6 +1437,18 @@ impl App {
                 if let Some(handlers) = handlers {
                     (handlers.stop)();
                 }
+                // A stopped run has nothing to go on with: the offer of its plan goes, once the
+                // worker's Stop is raised, so the offer's thread wakes to a run already stopped,
+                // and the window, stopped, takes no offer of it again.
+                if self
+                    .system_state_host
+                    .pending
+                    .as_ref()
+                    .is_some_and(|request| matches!(request.kind(), OfferKind::Resume))
+                    && let Some(request) = self.system_state_host.pending.take()
+                {
+                    request.finish(WorkstationSetupDecision::Unavailable);
+                }
             }
             SystemStateAction::OpenAccess { access, by_person } => {
                 let press = self.take_system_state_press();
@@ -1341,11 +1494,40 @@ impl App {
                 if admission != Admission::Automatic && answer.changed.is_some() {
                     self.resolve_withdrawn_system_state_offer(Instant::now());
                 }
+                // The page's own answer to the offer of a plan an earlier process admitted holds
+                // nothing (§3.3, §6): it admits nothing new, so it neither withdraws the window's
+                // own admission nor turns a Stop a person's row press may go past into one it may
+                // not. It is moot while the window holds its own admission already.
+                let resume_answer = admission == Admission::Automatic
+                    && self
+                        .system_state_host
+                        .pending
+                        .as_ref()
+                        .is_some_and(|request| matches!(request.kind(), OfferKind::Resume));
+                if resume_answer
+                    && self.own_admission_stands()
+                    && let Some(request) = self.system_state_host.pending.take()
+                {
+                    request.finish(WorkstationSetupDecision::Closed);
+                    return;
+                }
+                // A press answers for itself, never for the offer of a plan an earlier process
+                // admitted (§6): that offer goes, and the press is the manual choice it is.
+                if admission != Admission::Automatic
+                    && self
+                        .system_state_host
+                        .pending
+                        .as_ref()
+                        .is_some_and(|request| matches!(request.kind(), OfferKind::Resume))
+                    && let Some(request) = self.system_state_host.pending.take()
+                {
+                    request.finish(WorkstationSetupDecision::Unavailable);
+                }
                 // A run going now, or a plan still being admitted, stops for
                 // this one at its next step (§3.3): the worker does that as it
                 // takes the plan, so the window never sends a Stop that could
                 // reach this plan's own run.
-                self.begin_system_state_action(true, true);
+                self.begin_system_state_action(true, !resume_answer);
                 self.note_system_state_apply(admission);
                 self.system_state_host.operation = None;
                 aterm_log::info!("system state: submitting a plan ({admission:?})");

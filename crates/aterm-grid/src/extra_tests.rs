@@ -122,6 +122,22 @@ fn underline_color_u32_roundtrip() {
         None,
         "storing an index clears the RGB slot on purpose"
     );
+
+    extra.set_underline_color_u32(Some(0x00_000009));
+    assert_eq!(extra.underline_color_u32(), Some(0x02_000009));
+    assert_eq!(extra.underline_color_index(), Some(9));
+    assert_eq!(extra.underline_color(), None);
+
+    extra.set_underline_color_u32(Some(0xFF_000000));
+    assert_eq!(extra.underline_color_u32(), None);
+    assert_eq!(extra.underline_color_index(), None);
+    assert_eq!(extra.underline_color(), None);
+    assert!(!extra.has_data());
+
+    assert_eq!(crate::underline_color_sgr(0x00_000009), "58:5:9");
+    assert_eq!(crate::underline_color_sgr(0x02_000005), "58:5:5");
+    assert_eq!(crate::underline_color_sgr(0x01_FF8040), "58:2::255:128:64");
+    assert_eq!(crate::underline_color_sgr(0xFF_000000), "59");
 }
 
 #[test]
@@ -146,8 +162,8 @@ fn has_data_tracks_every_field_independently() {
     extra.set_underline_color(Some([10, 20, 30]));
     extra.set_fg_rgb(Some([40, 50, 60]));
     extra.set_bg_rgb(Some([70, 80, 90]));
-    extra.set_extended_flags(0x1234);
-    extra.set_extended_flags(0x0567);
+    extra.set_extended_flags(0xF234);
+    extra.set_extended_flags(0xA567);
     assert_eq!(
         fields(&extra),
         (
@@ -156,7 +172,7 @@ fn has_data_tracks_every_field_independently() {
             Some([10, 20, 30]),
             Some([40, 50, 60]),
             Some([70, 80, 90]),
-            0x0567
+            0xA567
         )
     );
     extra.set_hyperlink(None);
@@ -170,7 +186,7 @@ fn has_data_tracks_every_field_independently() {
             Some([10, 20, 30]),
             None,
             Some([70, 80, 90]),
-            0x0567
+            0xA567
         )
     );
     extra.set_underline_color(None);
@@ -178,6 +194,16 @@ fn has_data_tracks_every_field_independently() {
     assert!(extra.has_data(), "the extended flags alone are data");
     extra.set_extended_flags(0);
     assert!(!extra.has_data());
+
+    for high_flag in [crate::CellFlags::CURLY_UNDERLINE.bits(), 0x8000, u16::MAX] {
+        let mut high = CellExtra::default();
+        high.set_extended_flags(high_flag);
+        assert_eq!(high.extended_flags(), high_flag);
+        assert!(
+            high.has_data(),
+            "extended flag {high_flag:#06x} must survive"
+        );
+    }
 
     #[expect(clippy::type_complexity, reason = "a test's case table")]
     let setters: [Box<dyn Fn(&mut CellExtra)>; 7] = [
@@ -507,12 +533,12 @@ fn hyperlink_upper_bound_never_under_counts() {
     check(&extras, "row clear");
 
     for _ in 0..300 {
-        extras.shift_rows_up_by(0, 1);
+        extras.shift_rows_up_by(1);
     }
     check(&extras, "offset scroll + compaction");
 
     extras.set_range_uniform(3, 0, 10, &vals, 24, 80);
-    extras.shift_rows_up_by(1, 1);
+    extras.shift_region_up_by(1, 23, 1);
     check(&extras, "region scroll");
     extras.shift_cols_right(2, 0, 2, 80);
     check(&extras, "ICH column shift");
@@ -545,7 +571,7 @@ fn scroll_compound_cost_amortized_o1() {
     let _ = take_extras_shift_ops(); // reset
     let scroll_count = 50;
     for _ in 0..scroll_count {
-        extras.shift_rows_up_by(0, 1);
+        extras.shift_rows_up_by(1);
     }
     let total_ops = take_extras_shift_ops();
 
@@ -557,6 +583,90 @@ fn scroll_compound_cost_amortized_o1() {
     assert_eq!(extras.row_offset(), 50);
 
     assert_eq!(extras.len(), 0, "all entries should have scrolled off");
+    assert!(
+        extras.is_empty(),
+        "is_empty must agree with len() == 0 once every entry has scrolled off"
+    );
+}
+
+#[test]
+fn is_empty_agrees_with_len_across_offset_scrolls_and_removals() {
+    let mut extras = CellExtras::new();
+    assert!(extras.is_empty());
+    extras
+        .get_or_create(CellCoord::new(0, 0))
+        .set_fg_rgb(Some([1, 2, 3]));
+    extras
+        .get_or_create(CellCoord::new(6, 2))
+        .add_combining('\u{0301}');
+
+    extras.shift_rows_up_by(3);
+    assert_eq!(extras.row_offset(), 3);
+    assert_eq!(extras.len(), 1);
+    assert!(!extras.is_empty());
+    assert!(
+        extras.get(CellCoord::new(u16::MAX, 0)).is_none(),
+        "external row u16::MAX must never wrap onto a stale scrolled-off entry"
+    );
+
+    assert!(extras.remove(CellCoord::new(3, 2)));
+    assert_eq!(extras.len(), 0);
+    assert!(
+        extras.is_empty(),
+        "removing the last live entry while stale entries remain must report empty"
+    );
+    assert!(
+        extras.clone().is_empty(),
+        "cloning preserves the max-row cache state"
+    );
+
+    extras
+        .get_or_create(CellCoord::new(u16::MAX, 4))
+        .set_bg_rgb(Some([9, 8, 7]));
+    assert_eq!(extras.row_offset(), 0, "writing u16::MAX compacts first");
+    assert_eq!(extras.len(), 1);
+    assert!(!extras.is_empty());
+    assert_eq!(
+        extras
+            .get(CellCoord::new(u16::MAX, 4))
+            .and_then(CellExtra::bg_rgb),
+        Some([9, 8, 7])
+    );
+}
+
+#[test]
+fn complex_ring_clears_and_overwrites_never_shadow_restored_clusters() {
+    let mut grid = crate::Grid::new(4, 10);
+    grid.extras_mut()
+        .set_complex_char_ring(1, 0, '\u{1F680}', 4, 10);
+    grid.extras_mut().clear_row(1);
+    grid.write_char('x');
+    grid.set_cell_complex_char(1, 0, "\u{1F469}\u{200D}\u{1F4BB}");
+    let mut out = String::new();
+    assert!(grid.extras().push_complex_char(1, 0, &mut out));
+    assert_eq!(out, "\u{1F469}\u{200D}\u{1F4BB}");
+
+    grid.extras_mut()
+        .set_complex_char_ring(0, 0, '\u{1F680}', 4, 10);
+    grid.set_cell_complex_char(0, 0, "e\u{0301}");
+    assert_eq!(grid.extras().complex_codepoint_for(0, 0), Some('e'));
+
+    grid.extras_mut()
+        .get_or_create(CellCoord::new(0, 2))
+        .set_hyperlink(Some(Arc::from("https://stale-row0.example")));
+    grid.extras_mut()
+        .get_or_create(CellCoord::new(2, 0))
+        .set_hyperlink(Some(Arc::from("https://stale-row2.example")));
+    grid.restore_visible_from_lines(&[aterm_scrollback::Line::from("clean")]);
+    assert!(
+        grid.extras().get(CellCoord::new(0, 2)).is_none(),
+        "fill_row_from_line must clear prior extras on overwritten rows"
+    );
+    assert!(
+        grid.extras().get(CellCoord::new(2, 0)).is_none(),
+        "restore_visible_from_lines must clear extras on trailing blank rows"
+    );
+    assert!(grid.extras().is_empty());
 }
 
 #[path = "extra_tests/overflow.rs"]

@@ -190,9 +190,9 @@ pub(crate) struct SessionRow {
     pub end: Option<EndRow>,
     /// Its Autopilot chip's face is LANDED (`ChipFace::Landed`: under Land, a clean `Nothing left:` defense, and no repository check found work left to land), seen or not, whether or not an end was told: This Mac counts it `landed`, a worker or a plain Land tab.
     pub landed: bool,
-    /// It is LANDING (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.4.3 item 1): its Autopilot is Land, its chip wears `⤓ land` (the task open or unknown), and a hold stands — Land's instruction has been typed to it (`App::shown_hold`).
+    /// It is LANDING (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.4.3 item 1): its Autopilot is Land, its chip wears `⤓ land` (the task open or unknown), and a hold stands — Land's instruction has been typed to it, by aterm or by a codex-alab under its own proven claim (`App::shown_hold`, §14.3.3).
     pub landing: bool,
-    /// What holds the landing, where a land act's yield did not land or nudges were typed, led by the stop where aterm stopped typing into it in any mode: its worker row's tip, in the hold's and the stop's words with no clock (`stopped typing: the same reply twice, no work · not landed yet: 2 unpushed commits · 3 nudges`, `harness_glass::stop_words`' and `hold_words`' tip forms; a stopped Cruise tab's is the stop alone) — the menu keeps ages, composed at paint, and never a clock that would go stale.
+    /// What holds the landing, where a land act's yield did not land or nudges were typed, led by the stop where whoever drives it stopped typing into it in any mode (aterm, or a codex-alab under its own proven claim: `App::shown_stop`): its worker row's tip, in the hold's and the stop's words with no clock (`stopped typing: the same reply twice, no work · not landed yet: 2 unpushed commits · 3 nudges`, `ShownStop::words`' and `ShownHold::words`' tip forms; a codex-alab's stop in its name, `codex-alab stopped typing: …`, and its hold too where no stop named it first, `codex-alab: not landed yet: …`; a stopped Cruise tab's is the stop alone) — the menu keeps ages, composed at paint, and never a clock that would go stale.
     pub landing_tip: Option<String>,
     /// Its need is all that holds its landing (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.7): it is [`Self::landing`], its hold's yield was read, and the hold's one leg is its needs (`HoldLeg::Needs`, [`crate::harness_glass::HeldGlass::need_alone`]) — no repository work, no open words, no missing defense, no cut. Its report row's tip then says `<Program>'s landing waits on this alone` where any other says `<Program> carries on meanwhile`.
     pub need_alone: bool,
@@ -3030,6 +3030,12 @@ fn mac_row(
             mac.left_out
         )));
     }
+    if mac.instances_unread > 0 {
+        rows.push(StatusRow::Info(format!(
+            "1 of {} aterm instances read",
+            mac.instances_unread.saturating_add(1)
+        )));
+    }
     rows.push(StatusRow::Separator);
     rows.push(act(
         format!("Read {} in Full", mac.name),
@@ -3069,6 +3075,7 @@ fn mac_row(
         ));
     }
     let what = match (mac.needs.len(), mac.working) {
+        (0, 0) if mac.instances_unread > 0 => "other instances unread".to_string(),
         (0, 0) => "quiet".to_string(),
         (0, w) => format!("{w} working"),
         (n, w) if mac.unproven => format!("{n} need{} \u{b7} {w} working", plural(n)),
@@ -3090,16 +3097,21 @@ fn mac_row(
     } else {
         String::new()
     };
+    let partial = if mac.instances_unread > 0 && (!mac.needs.is_empty() || mac.working > 0) {
+        " \u{b7} partial read"
+    } else {
+        ""
+    };
     StatusRow::Submenu {
         label: fold_clip(
-            &format!("{} \u{2014} {mark}{what}{carried}", mac.name),
+            &format!("{} \u{2014} {mark}{what}{partial}{carried}", mac.name),
             LINE_MAX,
         ),
         rows,
     }
 }
 
-/// Compose the Fleet submenu from the fleet glance's slot, ages as of `now_unix` — pure, at the submenu's own `menuNeedsUpdate:`: the degrade lines; the Macs that need you or work, needs first; the quiet ones, the ones that did not answer, the ones whose key is not proven (an older one among them stands with the older) and the older ones each folded into one row; and Read the Fleet Now.
+/// Compose the Fleet submenu from the fleet glance's slot, ages as of `now_unix` — pure, at the submenu's own `menuNeedsUpdate:`: the degrade lines; the Macs that need you, work or were only partly read, needs first; the quiet ones with no other instances reported, the ones that did not answer, the ones whose key is not proven (an older one among them stands with the older) and the older ones each folded into one row; and Read the Fleet Now.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn compose_fleet_menu(
     slot: &crate::fleet_glance::FleetSlot,
@@ -3126,7 +3138,9 @@ pub(crate) fn compose_fleet_menu(
                 .macs
                 .iter()
                 .enumerate()
-                .filter(|(_, m)| m.counts() && (!m.needs.is_empty() || m.working > 0))
+                .filter(|(_, m)| {
+                    m.counts() && (!m.needs.is_empty() || m.working > 0 || m.instances_unread > 0)
+                })
                 .collect();
             active.sort_by_key(|(i, m)| {
                 (
@@ -3140,7 +3154,9 @@ pub(crate) fn compose_fleet_menu(
                 .macs
                 .iter()
                 .enumerate()
-                .filter(|(_, m)| m.counts() && m.needs.is_empty() && m.working == 0)
+                .filter(|(_, m)| {
+                    m.counts() && m.needs.is_empty() && m.working == 0 && m.instances_unread == 0
+                })
                 .filter_map(|(i, m)| row(i, m))
                 .collect();
             if !quiet.is_empty() {
@@ -5249,7 +5265,7 @@ mod tests {
         };
         let read = |unbound: Option<&str>| {
             let mut slot = fleet_slot(vec![unproven("lab-mini"), unproven("studio")], read_at);
-            slot.book.issuer = false;
+            slot.book.minted = false;
             slot.book.unbound_issuer = unbound.map(str::to_string);
             let g = Glance::build(&[], &[], Some(&slot), unix_ms(now), None);
             assert_eq!(g.need_count(), 0, "nothing of theirs counts either way");
@@ -6633,7 +6649,7 @@ mod tests {
             })),
             book: crate::fleet_glance::BookFacts {
                 in_fleet: true,
-                issuer: true,
+                minted: true,
                 issuer_label: None,
                 unbound_issuer: None,
             },
@@ -6668,6 +6684,45 @@ mod tests {
                 })
                 .collect(),
             ..crate::fleet_glance::FleetMac::default()
+        }
+    }
+
+    #[test]
+    fn a_partly_read_fleet_mac_is_not_folded_among_quiet_macs() {
+        for (instances, needs) in [(1, "-"), (2, "-"), (2, "ask")] {
+            let wire = aterm_json::json!([{
+                "label":"m7.local", "fleet":true,
+                "instance":{
+                    "node":"peer-node", "host":"m7.local", "level":"facts",
+                    "sessions":"1", "instances":instances.to_string()
+                },
+                "sessions":[{
+                    "sid":"s-peer", "state":"alive", "program":"sh",
+                    "program_kind":"shell", "needs":needs
+                }]
+            }]);
+            let snapshot = crate::fleet_glance::parse(&wire.to_string(), false, None, 10_000)
+                .expect("a peer's reported instance coverage");
+            let slot = crate::fleet_glance::FleetSlot {
+                generation: 3,
+                snapshot: Some(std::sync::Arc::new(snapshot)),
+                book: crate::fleet_glance::BookFacts {
+                    in_fleet: true,
+                    ..crate::fleet_glance::BookFacts::default()
+                },
+                ..crate::fleet_glance::FleetSlot::default()
+            };
+            let rows = compose_fleet_menu(&slot, 10);
+            // A directly listed Mac has its own read action. A quiet group holds
+            // another submenu layer, so this tests coverage grouping, not prose.
+            let directly_listed = rows.iter().any(|row| {
+                matches!(row, StatusRow::Submenu { rows, .. }
+                    if rows.iter().any(|row|
+                        matches!(row, StatusRow::Action { action: StatusAction::MacRead(_), .. })))
+            });
+            assert_eq!(directly_listed, instances > 1 || needs == "ask", "{rows:?}");
+            let glance = Glance::build(&[], &[], Some(&slot), 10_000, None);
+            assert_eq!(glance.need_count(), usize::from(needs == "ask"));
         }
     }
 

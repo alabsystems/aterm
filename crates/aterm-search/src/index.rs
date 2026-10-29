@@ -270,7 +270,6 @@ impl SearchIndex {
         };
         aterm_regex::RegexBuilder::new(&pattern)
             .size_limit(REGEX_SIZE_LIMIT)
-            .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
             .step_limit(REGEX_STEP_LIMIT)
             .build()
             .map_err(|e| SearchOptionsError::InvalidRegex(e.to_string()))
@@ -1133,9 +1132,6 @@ const MAX_REGEX_PATTERN_LEN: usize = 1024;
 
 /// Maximum compiled regex size (bytes) passed to `RegexBuilder::size_limit`: 128 KiB, 2,048 instructions at `aterm-regex`'s 64 bytes per instruction, well below the engine's 10 MiB default.
 pub(crate) const REGEX_SIZE_LIMIT: usize = 128 * 1024;
-
-/// Maximum DFA size (bytes) passed to `RegexBuilder::dfa_size_limit`.
-pub(crate) const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20;
 
 /// Scan budget (work units) for one line up to a full-width row, passed to `aterm_regex::RegexBuilder::step_limit` and the floor of every line's budget ([`regex_line_budget`]); about 4.8 ms of matching in release.
 pub(crate) const REGEX_STEP_LIMIT: u64 = 1 << 22;

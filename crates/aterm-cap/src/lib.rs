@@ -41,18 +41,6 @@ impl Tier {
             Tier::Certified => 2,
         }
     }
-
-    /// Decode a [`Tier`] from its canonical rank byte (`0..=2`).
-    #[inline]
-    #[must_use]
-    pub const fn from_rank(rank: u8) -> Option<Self> {
-        match rank {
-            0 => Some(Tier::Untrusted),
-            1 => Some(Tier::Trusted),
-            2 => Some(Tier::Certified),
-            _ => None,
-        }
-    }
 }
 
 /// A capability authorizing effect marker `E`, at a trust [`Tier`].
@@ -169,143 +157,6 @@ impl std::fmt::Display for Denied {
 }
 impl std::error::Error for Denied {}
 
-/// Wire size in bytes of an encoded capability grant audit frame (`"CAPG"`).
-pub const CAP_GRANT_WIRE_BYTES: usize = 16;
-
-/// Wire size in bytes of an encoded capability denial audit frame (`"CAPD"`).
-pub const CAP_DENIED_WIRE_BYTES: usize = 16;
-
-/// Encode a 16-byte capability grant audit wire frame (`"CAPG"`).
-#[inline]
-#[must_use]
-pub const fn encode_cap_grant_wire(
-    tier: Tier,
-    min_tier: Tier,
-    effect_id: u32,
-    principal_id: u32,
-) -> [u8; CAP_GRANT_WIRE_BYTES] {
-    let satisfied = if tier.rank() >= min_tier.rank() {
-        1u8
-    } else {
-        0u8
-    };
-    [
-        b'C',
-        b'A',
-        b'P',
-        b'G',
-        tier.rank(),
-        min_tier.rank(),
-        satisfied,
-        0,
-        effect_id as u8,
-        (effect_id >> 8) as u8,
-        (effect_id >> 16) as u8,
-        (effect_id >> 24) as u8,
-        principal_id as u8,
-        (principal_id >> 8) as u8,
-        (principal_id >> 16) as u8,
-        (principal_id >> 24) as u8,
-    ]
-}
-
-/// Decode a 16-byte capability grant audit wire frame produced by [`encode_cap_grant_wire`].
-#[inline]
-#[must_use]
-pub const fn decode_cap_grant_wire(bytes: &[u8]) -> Option<(Tier, Tier, bool, u32, u32)> {
-    if bytes.len() < CAP_GRANT_WIRE_BYTES {
-        return None;
-    }
-    if bytes[0] != b'C' || bytes[1] != b'A' || bytes[2] != b'P' || bytes[3] != b'G' {
-        return None;
-    }
-    if bytes[7] != 0 {
-        return None;
-    }
-    let Some(tier) = Tier::from_rank(bytes[4]) else {
-        return None;
-    };
-    let Some(min_tier) = Tier::from_rank(bytes[5]) else {
-        return None;
-    };
-    let satisfied = match bytes[6] {
-        0 => false,
-        1 => true,
-        _ => return None,
-    };
-    if satisfied != (tier.rank() >= min_tier.rank()) {
-        return None;
-    }
-    let effect_id = (bytes[8] as u32)
-        | ((bytes[9] as u32) << 8)
-        | ((bytes[10] as u32) << 16)
-        | ((bytes[11] as u32) << 24);
-    let principal_id = (bytes[12] as u32)
-        | ((bytes[13] as u32) << 8)
-        | ((bytes[14] as u32) << 16)
-        | ((bytes[15] as u32) << 24);
-    Some((tier, min_tier, satisfied, effect_id, principal_id))
-}
-
-/// Encode a 16-byte capability denial audit wire frame (`"CAPD"`).
-#[inline]
-#[must_use]
-pub const fn encode_cap_denied_wire(
-    denied: Denied,
-    effect_id: u16,
-    seq: u64,
-) -> [u8; CAP_DENIED_WIRE_BYTES] {
-    [
-        b'C',
-        b'A',
-        b'P',
-        b'D',
-        denied.have.rank(),
-        denied.need.rank(),
-        effect_id as u8,
-        (effect_id >> 8) as u8,
-        seq as u8,
-        (seq >> 8) as u8,
-        (seq >> 16) as u8,
-        (seq >> 24) as u8,
-        (seq >> 32) as u8,
-        (seq >> 40) as u8,
-        (seq >> 48) as u8,
-        (seq >> 56) as u8,
-    ]
-}
-
-/// Decode a 16-byte capability denial audit wire frame produced by [`encode_cap_denied_wire`].
-#[inline]
-#[must_use]
-pub const fn decode_cap_denied_wire(bytes: &[u8]) -> Option<(Denied, u16, u64)> {
-    if bytes.len() < CAP_DENIED_WIRE_BYTES {
-        return None;
-    }
-    if bytes[0] != b'C' || bytes[1] != b'A' || bytes[2] != b'P' || bytes[3] != b'D' {
-        return None;
-    }
-    let Some(have) = Tier::from_rank(bytes[4]) else {
-        return None;
-    };
-    let Some(need) = Tier::from_rank(bytes[5]) else {
-        return None;
-    };
-    if have.rank() >= need.rank() {
-        return None;
-    }
-    let effect_id = (bytes[6] as u16) | ((bytes[7] as u16) << 8);
-    let seq = (bytes[8] as u64)
-        | ((bytes[9] as u64) << 8)
-        | ((bytes[10] as u64) << 16)
-        | ((bytes[11] as u64) << 24)
-        | ((bytes[12] as u64) << 32)
-        | ((bytes[13] as u64) << 40)
-        | ((bytes[14] as u64) << 48)
-        | ((bytes[15] as u64) << 56);
-    Some((Denied { have, need }, effect_id, seq))
-}
-
 /// Zero-size effect markers naming a privileged effect a [`Cap`] authorizes.
 pub mod effects {
     /// Authorizes spawning a child process (the PTY shell).
@@ -348,30 +199,5 @@ mod tests {
 
         let certified: Cap<Spawn> = authority.grant(Tier::Certified);
         assert_eq!(require(&certified, Tier::Trusted), Ok(()));
-    }
-
-    #[test]
-    fn cap_grant_and_denied_wire_roundtrip() {
-        let gw = encode_cap_grant_wire(Tier::Trusted, Tier::Trusted, 7, 42);
-        assert_eq!(
-            decode_cap_grant_wire(&gw),
-            Some((Tier::Trusted, Tier::Trusted, true, 7, 42))
-        );
-        let mut forged = gw;
-        forged[6] = 0;
-        assert!(decode_cap_grant_wire(&forged).is_none());
-
-        let denied = Denied {
-            have: Tier::Untrusted,
-            need: Tier::Certified,
-        };
-        let dw = encode_cap_denied_wire(denied, 9, 1024);
-        assert_eq!(decode_cap_denied_wire(&dw), Some((denied, 9, 1024)));
-        let invalid_denied = Denied {
-            have: Tier::Certified,
-            need: Tier::Trusted,
-        };
-        let bad_dw = encode_cap_denied_wire(invalid_denied, 9, 1024);
-        assert!(decode_cap_denied_wire(&bad_dw).is_none());
     }
 }

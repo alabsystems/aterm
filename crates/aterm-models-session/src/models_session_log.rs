@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The session log's formal models (`docs/DESIGN-session-log-2026-10-15.md` §9): the per-session ring with its open/close discipline and level-aware eviction, a reader's cursor over it, the turn tracker over screen verdict words, the disk journal's reader view, the mark quota, the program share, the timeline rows, the fold and its claims, the transcript join and the mail link.
+//! The session log's formal models (`docs/DESIGN-session-log-2026-10-15.md` §9): the per-session ring with its open/close discipline and level-aware eviction, a reader's cursor over it, the turn tracker over screen verdict words, the disk journal's reader view, the mark quota, the program share, the timeline rows, the fold and its claims, the transcript join, the claimed turn edges and the mail link.
 
 use aterm_spec::derive::*;
 
 /// SESSION LOG RING: one session's bounded ring of records, evicting level-aware (§5.1), over the open path of one run, its turn and the turn's step.
+///
+/// THE RIDER (fix unit H4): `AmendRun` names the open run after its open (`detail=`, `model=`); the amend rides the run's open (`rid`, then `orid` once the run closes) and `RiderLivesWithItsOpen` holds it to the opens that were named (`named`, `onamed`): pinned with an open run's open, evicted only with a closed run's (`EvictClosedOpenRider`), carried with it. The mutant `EvictRiderAsDetail` takes a closed run's rider alone, as detail.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn session_log_ring_model() -> Model {
@@ -51,6 +53,10 @@ pub fn session_log_ring_model() -> Model {
             var ocl = 0;
             var cls = 0;
             var tcl = 0;
+            var rid = 0;
+            var named = 0;
+            var orid = 0;
+            var onamed = 0;
             var nw = 0;
             var ev = 0;
 
@@ -60,7 +66,7 @@ pub fn session_log_ring_model() -> Model {
                 prun = 1;
                 seq = seq + 1;
                 nw = 0;
-                ev = if (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) + 1 > Cap { 1 } else { 0 };
+                ev = if (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) + 1 > Cap { 1 } else { 0 };
             }
             action OpenTurn when (ev == 0 && run == 1 && turn == 0 && seq + 1 <= (if ep == 0 { MaxSeq } else { hseq + After })) {
                 moved = 1;
@@ -72,7 +78,7 @@ pub fn session_log_ring_model() -> Model {
                 fturn = 1;
                 seq = seq + 1;
                 nw = 0;
-                ev = if (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) + 1 > Cap { 1 } else { 0 };
+                ev = if (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) + 1 > Cap { 1 } else { 0 };
             }
             action OpenStep when (ev == 0 && turn == 1 && step == 0 && seq + 1 <= (if ep == 0 { MaxSeq } else { hseq + After })) {
                 moved = 1;
@@ -81,7 +87,7 @@ pub fn session_log_ring_model() -> Model {
                 pstep = 1;
                 seq = seq + 1;
                 nw = 0;
-                ev = if (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) + 1 > Cap { 1 } else { 0 };
+                ev = if (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) + 1 > Cap { 1 } else { 0 };
             }
             action OpenOrphanStep when (ev == 0 && run == 1 && turn == 0 && step == 0 && seq + 1 <= (if ep == 0 { MaxSeq } else { hseq + After })) {
                 moved = 1;
@@ -91,7 +97,7 @@ pub fn session_log_ring_model() -> Model {
                 pstep = 1;
                 seq = seq + 1;
                 nw = 0;
-                ev = if (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) + 1 > Cap { 1 } else { 0 };
+                ev = if (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) + 1 > Cap { 1 } else { 0 };
             }
             action CloseStep when (ev == 0 && step == 1 && seq + 1 <= (if ep == 0 { MaxSeq } else { hseq + After })) {
                 moved = 1;
@@ -104,7 +110,7 @@ pub fn session_log_ring_model() -> Model {
                 dold = if sorph == 1 { dold + oold } else { dold };
                 seq = seq + 1;
                 nw = if sorph == 0 { 1 } else { 2 };
-                ev = if (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) + 1 > Cap { 1 } else { 0 };
+                ev = if (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) + 1 > Cap { 1 } else { 0 };
             }
             action CloseTurn when (ev == 0 && turn == 1 && (step == 0 || sorph == 1) && seq + 1 <= (if ep == 0 { MaxSeq } else { hseq + After })) {
                 moved = 1;
@@ -122,7 +128,7 @@ pub fn session_log_ring_model() -> Model {
                 oold = step;
                 seq = seq + 1;
                 nw = 3;
-                ev = if (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) + 1 > Cap { 1 } else { 0 };
+                ev = if (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) + 1 > Cap { 1 } else { 0 };
             }
             action CloseTurnCascade when (ev == 0 && turn == 1 && step == 1 && sorph == 0 && seq + 2 <= (if ep == 0 { MaxSeq } else { hseq + After })) {
                 moved = 1;
@@ -141,24 +147,32 @@ pub fn session_log_ring_model() -> Model {
                 dout = 0;
                 seq = seq + 2;
                 nw = 3;
-                ev = if (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) + 2 > Cap { 1 } else { 0 };
+                ev = if (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) + 2 > Cap { 1 } else { 0 };
             }
             action CloseRun when (ev == 0 && run == 1 && turn == 0 && step == 0 && seq + 1 <= (if ep == 0 { MaxSeq } else { hseq + After })) {
                 moved = 1;
                 run = 0;
                 prun = 0;
+                rid = 0;
+                named = 0;
+                orid = orid + rid;
+                onamed = onamed + named;
                 ocl = ocl + 1;
                 cls = cls + 1;
                 dold = dold + dout;
                 dout = 0;
                 seq = seq + 1;
                 nw = 4;
-                ev = if (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) + 1 > Cap { 1 } else { 0 };
+                ev = if (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) + 1 > Cap { 1 } else { 0 };
             }
             action CloseRunCascade when (ev == 0 && run == 1 && 1 <= turn + step && seq + 1 + turn + step <= (if ep == 0 { MaxSeq } else { hseq + After })) {
                 moved = 1;
                 run = 0;
                 prun = 0;
+                rid = 0;
+                named = 0;
+                orid = orid + rid;
+                onamed = onamed + named;
                 turn = 0;
                 pturn = 0;
                 step = 0;
@@ -176,54 +190,67 @@ pub fn session_log_ring_model() -> Model {
                 dout = 0;
                 seq = seq + 1 + turn + step;
                 nw = 4;
-                ev = if (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) + 1 + turn + step > Cap { 1 } else { 0 };
+                ev = if (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) + 1 + turn + step > Cap { 1 } else { 0 };
             }
             action Mark when (ev == 0 && seq + 1 <= (if ep == 0 { MaxSeq } else { hseq + After })) {
                 dturn = if turn == 1 { dturn + 1 } else { dturn };
                 dout = if turn == 0 { dout + 1 } else { dout };
                 seq = seq + 1;
                 nw = if turn == 1 { 1 } else { 2 };
-                ev = if (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) + 1 > Cap { 1 } else { 0 };
+                ev = if (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) + 1 > Cap { 1 } else { 0 };
             }
             action MarkOutside when (ev == 0 && seq + 1 <= (if ep == 0 { MaxSeq } else { hseq + After })) {
                 dout = dout + 1;
                 seq = seq + 1;
                 nw = 2;
-                ev = if (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) + 1 > Cap { 1 } else { 0 };
+                ev = if (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) + 1 > Cap { 1 } else { 0 };
             }
-            action EvictOldDetail when (ev == 1 && (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) > (if cv == 1 { CarryCap } else { Low }) && dold > 0) {
+            action AmendRun when (ev == 0 && run == 1 && named == 0 && seq + 1 <= (if ep == 0 { MaxSeq } else { hseq + After })) {
+                rid = 1;
+                named = 1;
+                seq = seq + 1;
+                nw = 0;
+                ev = if (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) + 1 > Cap { 1 } else { 0 };
+            }
+            action EvictOldDetail when (ev == 1 && (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) > (if cv == 1 { CarryCap } else { Low }) && dold > 0) {
                 dold = dold - 1;
                 lost = lost + 1;
             }
-            action EvictTurnDetail when (ev == 1 && (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) > (if cv == 1 { CarryCap } else { Low }) && tdet > 0) {
+            action EvictTurnDetail when (ev == 1 && (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) > (if cv == 1 { CarryCap } else { Low }) && tdet > 0) {
                 tdet = tdet - 1;
                 lost = lost + 1;
             }
-            action EvictClosedOpen when (ev == 1 && (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) > (if cv == 1 { CarryCap } else { Low }) && dold + tdet <= 0 && ocl > 0) {
+            action EvictClosedOpen when (ev == 1 && (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) > (if cv == 1 { CarryCap } else { Low }) && dold + tdet <= 0 && ocl > onamed) {
                 ocl = ocl - 1;
                 lost = lost + 1;
             }
-            action EvictClose when (ev == 1 && (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) > (if cv == 1 { CarryCap } else { Low }) && dold + tdet <= 0 && ocl <= 0 && ((nw <= 3 && cls > tcl) || (nw == 4 && cls > tcl + 1)) && (cls + cls > Cap || (if (((nw == 1 && dturn > 1) || ((nw <= 0 || nw > 1) && dturn > 0)) || ((nw == 2 && dout > 1) || ((nw <= 1 || nw > 2) && dout > 0))) { 1 } else { 0 }) == 0)) {
+            action EvictClosedOpenRider when (ev == 1 && (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) > (if cv == 1 { CarryCap } else { Low }) && dold + tdet <= 0 && onamed > 0) {
+                ocl = ocl - 1;
+                orid = orid - 1;
+                onamed = onamed - 1;
+                lost = lost + 2;
+            }
+            action EvictClose when (ev == 1 && (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) > (if cv == 1 { CarryCap } else { Low }) && dold + tdet <= 0 && ocl <= 0 && ((nw <= 3 && cls > tcl) || (nw == 4 && cls > tcl + 1)) && (cls + cls > Cap || (if (((nw == 1 && dturn > 1) || ((nw <= 0 || nw > 1) && dturn > 0)) || ((nw == 2 && dout > 1) || ((nw <= 1 || nw > 2) && dout > 0))) { 1 } else { 0 }) == 0)) {
                 cls = cls - 1;
                 lost = lost + 1;
             }
-            action EvictTurnClose when (ev == 1 && (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) > (if cv == 1 { CarryCap } else { Low }) && dold + tdet <= 0 && ocl <= 0 && (tcl == 1 && (nw <= 2 || nw == 4)) && (cls + cls > Cap || (if (((nw == 1 && dturn > 1) || ((nw <= 0 || nw > 1) && dturn > 0)) || ((nw == 2 && dout > 1) || ((nw <= 1 || nw > 2) && dout > 0))) { 1 } else { 0 }) == 0)) {
+            action EvictTurnClose when (ev == 1 && (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) > (if cv == 1 { CarryCap } else { Low }) && dold + tdet <= 0 && ocl <= 0 && (tcl == 1 && (nw <= 2 || nw == 4)) && (cls + cls > Cap || (if (((nw == 1 && dturn > 1) || ((nw <= 0 || nw > 1) && dturn > 0)) || ((nw == 2 && dout > 1) || ((nw <= 1 || nw > 2) && dout > 0))) { 1 } else { 0 }) == 0)) {
                 cls = cls - 1;
                 tcl = 0;
                 lost = lost + 1;
             }
-            action EvictCurrent when (ev == 1 && (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) > (if cv == 1 { CarryCap } else { Low }) && dold + tdet <= 0 && ocl <= 0 && (if cls + cls > Cap && (((nw <= 3 && cls > tcl) || (nw == 4 && cls > tcl + 1)) || (tcl == 1 && (nw <= 2 || nw == 4))) { 1 } else { 0 }) == 0 && ((nw == 1 && dturn > 1) || ((nw <= 0 || nw > 1) && dturn > 0))) {
+            action EvictCurrent when (ev == 1 && (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) > (if cv == 1 { CarryCap } else { Low }) && dold + tdet <= 0 && ocl <= 0 && (if cls + cls > Cap && (((nw <= 3 && cls > tcl) || (nw == 4 && cls > tcl + 1)) || (tcl == 1 && (nw <= 2 || nw == 4))) { 1 } else { 0 }) == 0 && ((nw == 1 && dturn > 1) || ((nw <= 0 || nw > 1) && dturn > 0))) {
                 dturn = dturn - 1;
                 lost = lost + 1;
             }
-            action EvictCurrentOut when (ev == 1 && (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) > (if cv == 1 { CarryCap } else { Low }) && dold + tdet <= 0 && ocl <= 0 && (if cls + cls > Cap && (((nw <= 3 && cls > tcl) || (nw == 4 && cls > tcl + 1)) || (tcl == 1 && (nw <= 2 || nw == 4))) { 1 } else { 0 }) == 0 && ((nw == 2 && dout > 1) || ((nw <= 1 || nw > 2) && dout > 0))) {
+            action EvictCurrentOut when (ev == 1 && (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) > (if cv == 1 { CarryCap } else { Low }) && dold + tdet <= 0 && ocl <= 0 && (if cls + cls > Cap && (((nw <= 3 && cls > tcl) || (nw == 4 && cls > tcl + 1)) || (tcl == 1 && (nw <= 2 || nw == 4))) { 1 } else { 0 }) == 0 && ((nw == 2 && dout > 1) || ((nw <= 1 || nw > 2) && dout > 0))) {
                 dout = dout - 1;
                 lost = lost + 1;
             }
-            action EvictDone when (ev == 1 && cv == 0 && ((prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) <= Low || (dold + tdet <= 0 && ocl <= 0 && (if (((nw <= 3 && cls > tcl) || (nw == 4 && cls > tcl + 1)) || (tcl == 1 && (nw <= 2 || nw == 4))) { 1 } else { 0 }) == 0 && (if (((nw == 1 && dturn > 1) || ((nw <= 0 || nw > 1) && dturn > 0)) || ((nw == 2 && dout > 1) || ((nw <= 1 || nw > 2) && dout > 0))) { 1 } else { 0 }) == 0))) {
+            action EvictDone when (ev == 1 && cv == 0 && ((prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) <= Low || (dold + tdet <= 0 && ocl <= 0 && (if (((nw <= 3 && cls > tcl) || (nw == 4 && cls > tcl + 1)) || (tcl == 1 && (nw <= 2 || nw == 4))) { 1 } else { 0 }) == 0 && (if (((nw == 1 && dturn > 1) || ((nw <= 0 || nw > 1) && dturn > 0)) || ((nw == 2 && dout > 1) || ((nw <= 1 || nw > 2) && dout > 0))) { 1 } else { 0 }) == 0))) {
                 ev = 0;
             }
-            action CarryDone when (ev == 1 && cv == 1 && ((prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) <= CarryCap || (dold + tdet <= 0 && ocl <= 0 && (if (((nw <= 3 && cls > tcl) || (nw == 4 && cls > tcl + 1)) || (tcl == 1 && (nw <= 2 || nw == 4))) { 1 } else { 0 }) == 0 && (if (((nw == 1 && dturn > 1) || ((nw <= 0 || nw > 1) && dturn > 0)) || ((nw == 2 && dout > 1) || ((nw <= 1 || nw > 2) && dout > 0))) { 1 } else { 0 }) == 0))) {
+            action CarryDone when (ev == 1 && cv == 1 && ((prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) <= CarryCap || (dold + tdet <= 0 && ocl <= 0 && (if (((nw <= 3 && cls > tcl) || (nw == 4 && cls > tcl + 1)) || (tcl == 1 && (nw <= 2 || nw == 4))) { 1 } else { 0 }) == 0 && (if (((nw == 1 && dturn > 1) || ((nw <= 0 || nw > 1) && dturn > 0)) || ((nw == 2 && dout > 1) || ((nw <= 1 || nw > 2) && dout > 0))) { 1 } else { 0 }) == 0))) {
                 hi = seq;
                 holes = holes + ceil - seq;
                 seq = ceil + 1;
@@ -237,7 +264,7 @@ pub fn session_log_ring_model() -> Model {
                 ceil = 0;
                 cv = 0;
                 moved = 0;
-                ev = if (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) + 1 > Cap { 1 } else { 0 };
+                ev = if (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) + 1 > Cap { 1 } else { 0 };
             }
 
             action Draw when (ev == 0 && drawn == 0 && ep == 0) {
@@ -248,7 +275,7 @@ pub fn session_log_ring_model() -> Model {
                 ceil = 0;
                 drawn = 0;
             }
-            action HandoffCarried when (ev == 0 && drawn == 1 && ep == 0 && seq <= ceil && prun + pturn + pstep + (if nw > 0 { 1 } else { 0 }) <= CarryCap) {
+            action HandoffCarried when (ev == 0 && drawn == 1 && ep == 0 && seq <= ceil && prun + rid + pturn + pstep + (if nw > 0 { 1 } else { 0 }) <= CarryCap) {
                 ev = 1;
                 cv = 1;
                 cpath = 1 + run + turn + turn + step + step + step + step;
@@ -275,6 +302,10 @@ pub fn session_log_ring_model() -> Model {
                 ocl = 0;
                 cls = 0;
                 tcl = 0;
+                rid = 0;
+                named = 0;
+                orid = 0;
+                onamed = 0;
                 nw = 2;
                 drawn = 0;
                 ceil = 0;
@@ -308,6 +339,10 @@ pub fn session_log_ring_model() -> Model {
                 ocl = 0;
                 cls = 0;
                 tcl = 0;
+                rid = 0;
+                named = 0;
+                orid = 0;
+                onamed = 0;
                 nw = 2;
                 drawn = 0;
                 ceil = 0;
@@ -319,7 +354,7 @@ pub fn session_log_ring_model() -> Model {
                 adoptions = 1;
                 ep = 1;
             }
-            action AppendNoEvict when (Buggy == 1 && ev == 0 && (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) + 1 > Cap && seq + 1 <= (if ep == 0 { MaxSeq } else { hseq + After })) {
+            action AppendNoEvict when (Buggy == 1 && ev == 0 && (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) + 1 > Cap && seq + 1 <= (if ep == 0 { MaxSeq } else { hseq + After })) {
                 dout = dout + 1;
                 seq = seq + 1;
                 nw = 2;
@@ -350,7 +385,7 @@ pub fn session_log_ring_model() -> Model {
                 dout = 0;
                 seq = seq + 1;
                 nw = 3;
-                ev = if (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) + 1 > Cap { 1 } else { 0 };
+                ev = if (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) + 1 > Cap { 1 } else { 0 };
             }
             action StepUnderClosedTurn when (Buggy == 1 && ev == 0 && run == 1 && turn == 0 && step == 0 && tclose == 1 && seq + 1 <= (if ep == 0 { MaxSeq } else { hseq + After })) {
                 step = 1;
@@ -358,14 +393,14 @@ pub fn session_log_ring_model() -> Model {
                 pstep = 1;
                 seq = seq + 1;
                 nw = 0;
-                ev = if (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) + 1 > Cap { 1 } else { 0 };
+                ev = if (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) + 1 > Cap { 1 } else { 0 };
             }
             action CloseTwice when (Buggy == 1 && ev == 0 && turn == 0 && tclose == 1 && seq + 1 <= (if ep == 0 { MaxSeq } else { hseq + After })) {
                 tclose = 2;
                 cls = cls + 1;
                 seq = seq + 1;
                 nw = 4;
-                ev = if (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) + 1 > Cap { 1 } else { 0 };
+                ev = if (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) + 1 > Cap { 1 } else { 0 };
             }
             action HandoffReuse when (Buggy == 1 && ev == 0 && drawn == 1 && ep == 0) {
                 hi = seq;
@@ -389,6 +424,10 @@ pub fn session_log_ring_model() -> Model {
                 ocl = 0;
                 cls = 0;
                 tcl = 0;
+                rid = 0;
+                named = 0;
+                orid = 0;
+                onamed = 0;
                 nw = 2;
                 drawn = 0;
                 ceil = 0;
@@ -400,10 +439,12 @@ pub fn session_log_ring_model() -> Model {
                 hseq = 1;
                 holes = 0;
             }
-            action HandoffForgetsOpen when (Buggy == 1 && ev == 0 && drawn == 1 && ep == 0 && seq <= ceil && run == 1 && prun + pturn + pstep + (if nw > 0 { 1 } else { 0 }) <= CarryCap) {
+            action HandoffForgetsOpen when (Buggy == 1 && ev == 0 && drawn == 1 && ep == 0 && seq <= ceil && run == 1 && prun + rid + pturn + pstep + (if nw > 0 { 1 } else { 0 }) <= CarryCap) {
                 cpath = 1 + run + turn + turn + step + step + step + step;
                 moved = 0;
-                lost = lost + prun + pturn + pstep;
+                lost = lost + prun + rid + pturn + pstep;
+                rid = 0;
+                named = 0;
                 run = 0;
                 turn = 0;
                 step = 0;
@@ -450,6 +491,10 @@ pub fn session_log_ring_model() -> Model {
                 ocl = 0;
                 cls = 0;
                 tcl = 0;
+                rid = 0;
+                named = 0;
+                orid = 0;
+                onamed = 0;
                 nw = 2;
                 drawn = 0;
                 ceil = 0;
@@ -464,18 +509,23 @@ pub fn session_log_ring_model() -> Model {
             action RefoldFromRing when (Buggy == 1 && lost > 0 && fturns > 0) {
                 fturns = fturns - 1;
             }
+            action EvictRiderAsDetail when (Buggy == 1 && ev == 1 && orid > 0) {
+                orid = orid - 1;
+                lost = lost + 1;
+            }
 
-            invariant Bounded: ev == 1 || (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) <= Cap || (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) <= (prun + pturn + pstep) + 1;
+            invariant Bounded: ev == 1 || (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) <= Cap || (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) <= (prun + rid + pturn + pstep) + 1;
             invariant OpenPathRetained: prun == run && pturn == turn && pstep == step;
             invariant RollupOutlivesDetail: tcl == 1 || tdet <= 0;
-            invariant NoSilentLoss: lost + (prun + pturn + pstep + dturn + dout + tdet + dold + ocl + cls) + first + holes == seq + 1;
+            invariant NoSilentLoss: lost + (prun + rid + pturn + pstep + dturn + dout + tdet + dold + ocl + orid + cls) + first + holes == seq + 1;
             invariant WellNested: turn <= run && step <= run && sorph <= step && (sorph == 1 || step <= turn);
             invariant CloseOnce: tclose <= 1;
             invariant ProjectionIndependentOfEviction: fturn == turn && fturns == tn;
             invariant SeqNeverReused: hi <= seq;
             invariant EpochGrows: adoptions == 0 || ep > eplast;
+            invariant RiderLivesWithItsOpen: rid == named && orid == onamed;
             invariant CarryKeepsOpenPath: cpath == 0 || moved == 1 || cpath == 1 + run + turn + turn + step + step + step + step;
-            bound StateBounded: seq <= MaxSeq + Reserve + After + 1 && first <= MaxSeq + Reserve + 1 && hseq <= MaxSeq + Reserve + 1 && holes <= Reserve && cpath <= 8 && moved <= 1 && cv <= 1 && eplast <= 1 && adoptions <= 1 && ceil <= MaxSeq + Reserve && hi <= MaxSeq + Reserve && ep <= 1 && lost <= MaxSeq + Reserve + After + 1 && tn <= MaxSeq && dturn <= MaxSeq + Reserve + After + 1 && dout <= MaxSeq + Reserve + After + 1 && tdet <= MaxSeq + Reserve + After + 1 && dold <= MaxSeq + Reserve + After + 1 && ocl <= MaxSeq + Reserve + After + 1 && cls <= MaxSeq + Reserve + After + 1 && nw <= 4 && tclose <= 2;
+            bound StateBounded: seq <= MaxSeq + Reserve + After + 1 && first <= MaxSeq + Reserve + 1 && hseq <= MaxSeq + Reserve + 1 && holes <= Reserve && cpath <= 8 && moved <= 1 && cv <= 1 && eplast <= 1 && adoptions <= 1 && ceil <= MaxSeq + Reserve && hi <= MaxSeq + Reserve && ep <= 1 && lost <= MaxSeq + Reserve + After + 1 && tn <= MaxSeq && dturn <= MaxSeq + Reserve + After + 1 && dout <= MaxSeq + Reserve + After + 1 && tdet <= MaxSeq + Reserve + After + 1 && dold <= MaxSeq + Reserve + After + 1 && ocl <= MaxSeq + Reserve + After + 1 && cls <= MaxSeq + Reserve + After + 1 && nw <= 4 && tclose <= 2 && rid <= 1 && named <= 1 && orid <= MaxSeq && onamed <= MaxSeq;
 
         }
     }
@@ -1923,6 +1973,7 @@ pub fn transcript_join_model() -> Model {
             var rf = 0;
             var ts = 0;
             var vc = 0;
+            var own = 0;
             var g = 0;
 
             action ScreenBusy {
@@ -1930,6 +1981,7 @@ pub fn transcript_join_model() -> Model {
                 old = if lt == 0 { 0 } else { old };
                 vm = if lt == 0 && ve == 0 && (vm == 2 || (vm == 3 && vo == 0)) { 1 } else { vm };
                 vc = if lt == 0 { if ve == 0 && vm == 2 { 1 } else { 0 } } else { vc };
+                own = if lt == 0 { 0 } else { own };
                 ss = 0;
                 wr = 0;
                 pend = 0;
@@ -1950,6 +2002,7 @@ pub fn transcript_join_model() -> Model {
             }
             action ScreenRest when (lt > 0 && ss == 0 && pend == 0) {
                 lt = 0;
+                own = 0;
                 lc = if lt == 1 && old == 0 { 1 } else { 0 };
                 lv = if lt == 1 { 1 } else { 0 };
                 old = 0;
@@ -1962,6 +2015,7 @@ pub fn transcript_join_model() -> Model {
             }
             action WallRest when (lt > 0 && ss == 2 && pend == 1) {
                 lt = 0;
+                own = 0;
                 lc = if lt == 1 && old == 0 { 1 } else { 0 };
                 lv = if lt == 1 { 1 } else { 0 };
                 old = 0;
@@ -2013,14 +2067,15 @@ pub fn transcript_join_model() -> Model {
                 ve = 0;
                 vo = 0;
             }
-            action PromptShare when (wm == 1 && (lt == 2 || (lt == 1 && old == 1)) && (ss > 0 || pt == 1)) {
+            action PromptShare when (wm == 1 && (lt == 2 || (lt == 1 && old == 1)) && (ss > 0 || (pt == 1 && own == 0))) {
                 vm = 1;
                 vc = 0;
                 ve = 0;
                 vo = 0;
             }
-            action PromptSupersede when (wm == 1 && (lt == 2 || (lt == 1 && old == 1)) && ss == 0 && pt == 0) {
+            action PromptSupersede when (wm == 1 && (lt == 2 || (lt == 1 && old == 1)) && ss == 0 && (pt == 0 || own == 1)) {
                 lt = 2;
+                own = 1;
                 old = 0;
                 lc = 0;
                 lv = if lt == 1 { 1 } else { 0 };
@@ -2052,14 +2107,15 @@ pub fn transcript_join_model() -> Model {
                 ve = 0;
                 vo = 0;
             }
-            action PromptUnmapped when (wm == 1 && lt == 0 && lc == 0 && pt == 1) {
+            action CarriedUnmapped when (wm == 1 && lt == 0 && lc == 0 && pt == 1) {
                 vm = 3;
                 vc = 0;
                 ve = 0;
                 vo = 0;
             }
-            action PromptOpens when (wm == 1 && lt == 0 && lc == 0 && pt == 0) {
+            action PromptOpens when (wm == 1 && lt == 0 && lc == 0) {
                 lt = 2;
+                own = 1;
                 old = 0;
                 vm = 1;
                 vc = 0;
@@ -2072,8 +2128,9 @@ pub fn transcript_join_model() -> Model {
             action ToolResult when (wm == 1 && ts > 0) {
                 ts = ts - 1;
             }
-            action TxEndCloses when (wm == 1 && vm == 1 && ve == 0 && ss == 0 && pt == 0) {
+            action TxEndCloses when (wm == 1 && vm == 1 && ve == 0 && ss == 0 && (pt == 0 || own == 1)) {
                 lt = 0;
+                own = 0;
                 lc = if lt == 1 && old == 0 { 1 } else { 0 };
                 lv = if lt == 1 { 1 } else { 0 };
                 old = 0;
@@ -2088,7 +2145,7 @@ pub fn transcript_join_model() -> Model {
                 ve = 1;
                 vc = 0;
             }
-            action TxEndHeld when (wm == 1 && vm > 0 && ve == 0 && (vm > 1 || ss > 0 || pt == 1)) {
+            action TxEndHeld when (wm == 1 && vm > 0 && ve == 0 && (vm > 1 || ss > 0 || (pt == 1 && own == 0))) {
                 ve = 1;
             }
             action Interrupt when (wm == 1 && vm > 0 && ve == 0) {
@@ -2125,6 +2182,7 @@ pub fn transcript_join_model() -> Model {
             }
             action RestLeavesSteps when (Buggy == 1 && g == 0 && lt > 0 && ts > 0 && ss == 0 && pend == 0) {
                 lt = 0;
+                own = 0;
                 lc = 0;
                 lv = if lt == 1 { 1 } else { 0 };
                 old = 0;
@@ -2182,6 +2240,7 @@ pub fn transcript_join_model() -> Model {
             }
             action TxCloseTakesWall when (Buggy == 1 && g == 0 && wm == 1 && pt == 0 && vm == 1 && ve == 0 && ss == 2) {
                 lt = 0;
+                own = 0;
                 lc = 0;
                 lv = if lt == 1 { 1 } else { 0 };
                 old = 0;
@@ -2197,8 +2256,9 @@ pub fn transcript_join_model() -> Model {
                 ss = 0;
                 rf = 1;
             }
-            action PartialCloses when (Buggy == 1 && g == 0 && wm == 1 && pt == 1 && vm == 1 && ve == 0 && ss == 0) {
+            action PartialCloses when (Buggy == 1 && g == 0 && wm == 1 && pt == 1 && vm == 1 && ve == 0 && ss == 0 && own == 0) {
                 lt = 0;
+                own = 0;
                 lc = 0;
                 lv = if lt == 1 { 1 } else { 0 };
                 old = 0;
@@ -2210,6 +2270,7 @@ pub fn transcript_join_model() -> Model {
             }
             action EarlyEndClosesCont when (Buggy == 1 && g == 0 && wm == 1 && vm == 1 && vc == 1 && ve == 0 && ss == 0 && pt == 0) {
                 lt = 0;
+                own = 0;
                 lc = if lt == 1 && old == 0 { 1 } else { 0 };
                 lv = if lt == 1 { 1 } else { 0 };
                 old = 0;
@@ -2233,7 +2294,108 @@ pub fn transcript_join_model() -> Model {
             invariant PartialNeverOverrules: 8 > g || g > 8;
             invariant PromptNamesNearestTurn: 9 > g || g > 9;
             invariant EndClosesOnlyItsOwnTurn: 10 > g || g > 10;
-            bound StateBounded: lt <= 2 && lv <= 1 && vm <= 3 && vc <= 1 && vo <= 1 && ss <= 2 && ts <= 2 && g <= 10;
+            bound StateBounded: lt <= 2 && lv <= 1 && vm <= 3 && vc <= 1 && vo <= 1 && ss <= 2 && ts <= 2 && own <= 1 && g <= 10;
+        }
+    }
+}
+
+/// CLAIMED TURN EDGES (ATERM-KI-1029-1): what `aterm_slog::TurnTracker::claim_edge` and a transcript read `state=partial` make of two vendor turns of a codex-alab run, each its own span, whichever source reads a turn first.
+///
+/// The engine parses each turn's beginning and end in order (`d`: B1 E1 B2 E2), the host feeds them in that order (`f`, never past `d`), and the rollout tap reads each turn's prompt and end rows in order (`p`: P1 T1 P2 T2). `c1`, `c2` are the claim's turns of spans 1 and 2 and `x1`, `x2` the transcript's (0 none, 1 open, 2 closed); `u1`, `u2` say a transcript turn is still on the untaken list no beginning took (a row end that closes it leaves it there); `n1`, `n2` say a prompt named a claim turn; the ghost `xc2` is set when a claim's end closed `x2`. A beginning closes the claim's own turn still open (its end was lost; this feed loses no edge, so here that never fires), then, with no turn running or only an untaken one, takes the oldest untaken turn as its span's, does nothing while another turn runs, and else opens a claim turn. An end closes the turn running unless it is untaken. A prompt names the claim's turn open, or closed and named by none, and else opens its own turn (fix E1), untaken; a row end closes the transcript's own open turn. Laws: no span holds two turns (`NoSpanTwice`), each turn whose edges were fed is in the log (`EveryFedTurnLogged`), and a claim closes the second span's transcript turn only at that span's own end (`ClaimClosesOnlyAFedEnd`). ASSUMPTION (residual R4): the tap reads the second prompt only once the engine parsed the first turn's end and the host fed its beginning, as a parse not stalled across a turn boundary past the tap's recheck gives (`Prompt2`'s guard). Mutants: Buggy=1, a beginning ignores the untaken list (`BeginSkipsFifo`); Buggy=2, the host feeds no beginning, as before the fix (`BeginUnfed`); Buggy=3, an end closes an untaken turn (`EndClosesUntaken`).
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn claimed_turn_edges_model() -> Model {
+    aterm_spec::ty_model! {
+        ClaimedTurnEdges {
+            const Buggy = 0;
+            var d = 0;
+            var f = 0;
+            var p = 0;
+            var c1 = 0;
+            var c2 = 0;
+            var x1 = 0;
+            var x2 = 0;
+            var u1 = 0;
+            var u2 = 0;
+            var n1 = 0;
+            var n2 = 0;
+            var xc2 = 0;
+
+            action Parse when (d <= 3) {
+                d = d + 1;
+            }
+            action FeedBegin1 when (f == 0 && d > f) {
+                f = 1;
+                u1 = if (c1 == 0 || c1 == 2) && (c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2 || u1 == 1) && (x2 == 0 || x2 == 2 || u2 == 1) && u1 == 1 { 0 } else { u1 };
+                u2 = if (c1 == 0 || c1 == 2) && (c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2 || u1 == 1) && (x2 == 0 || x2 == 2 || u2 == 1) && u1 == 0 && u2 == 1 { 0 } else { u2 };
+                c1 = if (c1 == 0 || c1 == 2) && (c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2 || u1 == 1) && (x2 == 0 || x2 == 2 || u2 == 1) && u1 == 0 && u2 == 0 { 1 } else { c1 };
+            }
+            action FeedEnd1 when (f == 1 && d > f) {
+                f = 2;
+                c1 = if c1 == 1 { 2 } else { c1 };
+                c2 = if c2 == 1 { 2 } else { c2 };
+                x1 = if x1 == 1 && u1 == 0 { 2 } else { x1 };
+                x2 = if x2 == 1 && u2 == 0 { 2 } else { x2 };
+                xc2 = if x2 == 1 && u2 == 0 { 1 } else { xc2 };
+            }
+            action FeedBegin2 when (f == 2 && d > f) {
+                f = 3;
+                c1 = if c1 == 1 { 2 } else { c1 };
+                u1 = if (c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2 || u1 == 1) && (x2 == 0 || x2 == 2 || u2 == 1) && u1 == 1 { 0 } else { u1 };
+                u2 = if (c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2 || u1 == 1) && (x2 == 0 || x2 == 2 || u2 == 1) && u1 == 0 && u2 == 1 { 0 } else { u2 };
+                c2 = if (c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2 || u1 == 1) && (x2 == 0 || x2 == 2 || u2 == 1) && u1 == 0 && u2 == 0 { 1 } else { c2 };
+            }
+            action FeedEnd2 when (f == 3 && d > f) {
+                f = 4;
+                c1 = if c1 == 1 { 2 } else { c1 };
+                c2 = if c2 == 1 { 2 } else { c2 };
+                x1 = if x1 == 1 && u1 == 0 { 2 } else { x1 };
+                x2 = if x2 == 1 && u2 == 0 { 2 } else { x2 };
+                xc2 = if x2 == 1 && u2 == 0 { 1 } else { xc2 };
+            }
+            action Prompt1 when (p == 0) {
+                p = 1;
+                n1 = if c1 > 0 { 1 } else { n1 };
+                x1 = if c1 == 0 { 1 } else { x1 };
+                u1 = if c1 == 0 { 1 } else { u1 };
+            }
+            action RowEnd1 when (p == 1) {
+                p = 2;
+                x1 = if x1 == 1 { 2 } else { x1 };
+            }
+            action Prompt2 when (p == 2 && p <= d && f > 0) {
+                p = 3;
+                n1 = if c1 == 1 || (c2 == 0 && c1 == 2 && n1 == 0) { 1 } else { n1 };
+                n2 = if (c1 == 0 || c1 == 2) && c2 > 0 { 1 } else { n2 };
+                x2 = if (c1 == 0 || (c1 == 2 && n1 == 1)) && c2 == 0 { 1 } else { x2 };
+                u2 = if (c1 == 0 || (c1 == 2 && n1 == 1)) && c2 == 0 { 1 } else { u2 };
+            }
+            action RowEnd2 when (p == 3) {
+                p = 4;
+                x2 = if x2 == 1 { 2 } else { x2 };
+            }
+
+            action BeginSkipsFifo when (Buggy == 1 && (f == 0 || f == 2) && d > f) {
+                f = f + 1;
+                c1 = if c1 == 1 && f == 2 { 2 } else { if f == 0 && (c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2) && (x2 == 0 || x2 == 2) { 1 } else { c1 } };
+                c2 = if f == 2 && (c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2) && (x2 == 0 || x2 == 2) { 1 } else { c2 };
+            }
+            action BeginUnfed when (Buggy == 2 && (f == 0 || f == 2) && d > f) {
+                f = f + 1;
+            }
+            action EndClosesUntaken when (Buggy == 3 && (f == 1 || f == 3) && d > f) {
+                f = f + 1;
+                c1 = if c1 == 1 { 2 } else { c1 };
+                c2 = if c2 == 1 { 2 } else { c2 };
+                x1 = if x1 == 1 { 2 } else { x1 };
+                x2 = if x2 == 1 { 2 } else { x2 };
+                xc2 = if x2 == 1 { 1 } else { xc2 };
+            }
+
+            invariant NoSpanTwice: (c1 == 0 || x1 == 0) && (c2 == 0 || x2 == 0);
+            invariant EveryFedTurnLogged: (f <= 1 || c1 + x1 > 0) && (f <= 3 || c2 + x2 > 0);
+            invariant ClaimClosesOnlyAFedEnd: xc2 == 0 || f > 3;
+            bound StateBounded: d <= 4 && f <= 4 && p <= 4 && c1 <= 2 && c2 <= 2 && x1 <= 2 && x2 <= 2 && u1 <= 1 && u2 <= 1 && n1 <= 1 && n2 <= 1 && xc2 <= 1;
         }
     }
 }
@@ -2399,6 +2561,84 @@ pub fn session_log_mail_link_model() -> Model {
             invariant OnlyTaskLinks: gn == 0;
             invariant AmbiguityLinksNone: gm == 0;
             bound StateBounded: cands <= 2 && old <= 1 && t <= 2 && lk <= 1 && lc <= 2 && ex <= 1 && th <= 1 && amb <= 1 && hm <= 1 && notes <= 1 && lm <= 1 && ga <= 1 && gw <= 1 && g2 <= 1 && gn <= 1 && gm <= 1;
+        }
+    }
+}
+
+/// SESSION LOG ESCALATION (design §7.1; fix E3, finding E2E-3): what `aterm_slog::Fold::apply` makes of the harness's escalation of one decision step (an approval box or a question) while a tool step the transcript opened stands beside it, and what the producer (`SessionLog::observe_meta`) chooses to name: an ask the harness raised while the step is open is THAT step's need and ends with its close; a wait, or an ask with no step open, is the session's; the harness's clear lifts either.
+///
+/// `s` is the decision step (0 none, 1 open, 2 closed), `e` the escalation (0 none, 1 the step's, 2 the session's), `a` the harness's standing ask, `about` the ghost of an ask raised on the open step, and `top` the fold's top observed need (0 none, 1 the step's own, 2 escalated). `Reraise` is the ask the harness moves to another box with no unset between, once the first box's close ended its escalation. Each law is the first to break under one mutant: `CloseStepKeepsBinding` (a close that leaves the step's escalation standing), `ClearUncovers` (a clear that uncovers what it lifted) and `EscalateOnTheSession` (the pre-fix producer and fold, which bound every escalation to the session).
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn session_log_escalation_model() -> Model {
+    aterm_spec::ty_model! {
+        SessionLogEscalation {
+            const Buggy = 0;
+            var s = 0;
+            var e = 0;
+            var a = 0;
+            var about = 0;
+            var top = 0;
+
+            action OpenStep when (s == 0 || s == 2) {
+                s = 1;
+                top = 1;
+            }
+            action Escalate when (a == 0) {
+                a = 1;
+                e = if s == 1 { 1 } else { 2 };
+                about = if s == 1 { 1 } else { 0 };
+                top = if s == 1 { 1 } else { 2 };
+            }
+            action EscalateWait when (a == 0) {
+                a = 1;
+                e = 2;
+                about = 0;
+                top = if s == 1 { 1 } else { 2 };
+            }
+            action Reraise when (a == 1 && e == 0) {
+                e = if s == 1 { 1 } else { 2 };
+                about = if s == 1 { 1 } else { 0 };
+                top = if s == 1 { 1 } else { 2 };
+            }
+            action ReraiseWait when (a == 1 && e == 0) {
+                e = 2;
+                about = 0;
+                top = if s == 1 { 1 } else { 2 };
+            }
+            action CloseStep when (s == 1) {
+                s = 2;
+                e = if e == 1 { 0 } else { e };
+                about = 0;
+                top = if e == 2 { 2 } else { 0 };
+            }
+            action HarnessClear when (a == 1) {
+                a = 0;
+                e = 0;
+                about = 0;
+                top = if s == 1 { 1 } else { 0 };
+            }
+            action CloseStepKeepsBinding when (Buggy == 1 && s == 1 && e == 1) {
+                s = 2;
+                top = 0;
+            }
+            action ClearUncovers when (Buggy == 1 && a == 1 && s == 1 && e == 1) {
+                a = 0;
+                e = 0;
+                about = 0;
+                top = 2;
+            }
+            action EscalateOnTheSession when (Buggy == 1 && a == 0 && s == 1) {
+                a = 1;
+                e = 2;
+                about = 1;
+                top = 1;
+            }
+
+            invariant EscalationEndsWithItsStep: e == 0 || e == 2 || s == 1;
+            invariant NoUncoveredEscalation: top <= 1 || e == 2;
+            invariant AskOnAStepIsTheSteps: about == 0 || e == 1;
+            bound StateBounded: s <= 2 && e <= 2 && a <= 1 && about <= 1 && top <= 2;
         }
     }
 }

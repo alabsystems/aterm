@@ -1759,6 +1759,13 @@ impl Drop for CloseAttribution {
     }
 }
 
+/// The `(ExitReason, ExitActor)` scope open on the current thread, if any, for a close
+/// that runs later (a teardown a pending update handoff defers) to re-enter.
+#[must_use]
+pub(crate) fn open_close_attribution() -> Option<(ExitReason, ExitActor)> {
+    CLOSE_ATTRIBUTION.with(|slot| slot.borrow().clone())
+}
+
 /// Returns the active `(ExitReason, ExitActor)` attribution on the current thread.
 #[must_use]
 pub(crate) fn current_close_attribution() -> (ExitReason, ExitActor) {
@@ -1821,6 +1828,22 @@ pub(crate) fn test_handle_with(local_id: u64, term: Arc<Mutex<Terminal>>) -> Ses
     )
 }
 
+/// Creates a test [`SessionHandle`] over `term` whose ran log is `ran` (a test's file table).
+#[cfg(all(test, unix))]
+pub(crate) fn test_handle_ran(
+    local_id: u64,
+    term: Arc<Mutex<Terminal>>,
+    ran: Arc<crate::command_ran::Ran>,
+) -> SessionHandle {
+    handle_ran(
+        local_id,
+        None,
+        term,
+        aterm_session::sink::SinkWriter::new(-1),
+        ran,
+    )
+}
+
 /// Creates a test [`SessionHandle`] whose sink owns `master`.
 #[cfg(all(test, unix))]
 pub(crate) fn test_handle_owning(local_id: u64, master: std::os::fd::OwnedFd) -> SessionHandle {
@@ -1850,6 +1873,17 @@ fn handle_over(
     parent: Option<SessionId>,
     term: Arc<Mutex<Terminal>>,
     sink: aterm_session::sink::SinkWriter,
+) -> SessionHandle {
+    handle_ran(local_id, parent, term, sink, Arc::default())
+}
+
+#[cfg(test)]
+fn handle_ran(
+    local_id: u64,
+    parent: Option<SessionId>,
+    term: Arc<Mutex<Terminal>>,
+    sink: aterm_session::sink::SinkWriter,
+    ran: Arc<crate::command_ran::Ran>,
 ) -> SessionHandle {
     use aterm_session::EdgeTable;
     crate::prime_test_timing();
@@ -1890,6 +1924,7 @@ fn handle_over(
         bells: Default::default(),
         screen_moves: Default::default(),
         job_feed: Default::default(),
+        ran,
         box_banner: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,

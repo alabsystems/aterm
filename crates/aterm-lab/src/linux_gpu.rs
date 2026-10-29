@@ -108,8 +108,16 @@ pub fn arches(named: Vec<Arch>, verb: &str) -> Result<Vec<Arch>, Fail> {
 /// Where krunkit is looked for: Homebrew's prefixes, then the search path.
 pub const KRUNKIT_AT: [&str; 2] = ["/opt/homebrew/bin/krunkit", "/usr/local/bin/krunkit"];
 
-/// How a person installs krunkit (user level, Homebrew).
-pub const KRUNKIT_REMEDY: &str = "brew tap slp/krun && brew install slp/krun/krunkit (measured: krunkit 1.3.2, libkrun 1.19.7, virglrenderer 0.10.4e)";
+/// What the GPU instance says when it finds no krunkit: where it looked, and that aterm provides
+/// none, with no install command (DESIGN-init-system §6.5, as rows 26 and 32 apply it to the lab).
+fn no_krunkit() -> String {
+    format!(
+        "no krunkit at {} or on PATH: the GPU instance runs on your own krunkit (measured: krunkit \
+         1.3.2, libkrun 1.19.7, virglrenderer 0.10.4e), and aterm provides none (no check set runs \
+         this lane)",
+        KRUNKIT_AT.join(" or ")
+    )
+}
 
 /// The LunarG Vulkan SDK whose loader and KosmicKrisp driver krunkit's virglrenderer loads.
 pub struct Sdk {
@@ -182,7 +190,7 @@ pub fn host_env(kk: &Path, krunkit: &Path, path: Option<&str>) -> Vec<(String, S
 /// krunkit on this Mac.
 ///
 /// # Errors
-/// NOT RUN: none, with how to install it.
+/// NOT RUN: none, naming where it looked, with no install command.
 pub fn krunkit() -> Result<PathBuf, Fail> {
     let on_path = std::env::var("PATH").unwrap_or_default();
     KRUNKIT_AT
@@ -195,9 +203,7 @@ pub fn krunkit() -> Result<PathBuf, Fail> {
                 .map(|d| Path::new(d).join("krunkit")),
         )
         .find(|p| crate::sys::executable(&p.to_string_lossy()))
-        .ok_or_else(|| {
-            crate::linux::not_run(format!("the GPU instance needs krunkit: {KRUNKIT_REMEDY}"))
-        })
+        .ok_or_else(|| crate::linux::not_run(no_krunkit()))
 }
 
 /// The GPU instance's `limactl` environment ([`host_env`]), once krunkit and KosmicKrisp are here.
@@ -675,6 +681,22 @@ pub fn prove(sh: &dyn Fn(&[String]) -> crate::linux::Out) -> Result<(String, f64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A missing krunkit is named with where it was looked for and no install command.
+    #[test]
+    fn a_missing_krunkit_is_named_without_an_install_command() {
+        let why = no_krunkit();
+        let (looked, rest) = why.split_once(": ").expect("where it looked, then why");
+        assert_eq!(
+            looked,
+            "no krunkit at /opt/homebrew/bin/krunkit or /usr/local/bin/krunkit or on PATH"
+        );
+        assert!(rest.contains("aterm provides none"), "{why}");
+        assert!(
+            !rest.contains("install") && !rest.contains("brew"),
+            "no remedy installs anything: {why}"
+        );
+    }
 
     #[test]
     fn the_gpu_instance_runs_aarch64_alone_and_refuses_x86_64_by_name() {

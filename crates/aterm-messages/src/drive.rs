@@ -181,6 +181,8 @@ pub struct View {
     motion: Option<BandMotion>,
     /// [`Self::motion`]'s fingerprint (0 when nothing moves).
     motion_fp: u64,
+    /// Monotone generation bumped whenever prepared `motion.rows` structurally changes.
+    motion_gen: u64,
     /// The look [`Self::motion`] was drawn in.
     look: Option<Look>,
     /// The next painted change from that frame (a visible bar can take
@@ -218,6 +220,9 @@ impl View {
         };
         let motion = center.motion(p, now, look);
         let mfp = motion.fingerprint();
+        if self.motion.as_ref().map(|m| &m.rows) != Some(&motion.rows) {
+            self.motion_gen = self.motion_gen.wrapping_add(1);
+        }
         self.motion = Some(motion);
         self.motion_fp = mfp;
         self.look = Some(look);
@@ -360,14 +365,7 @@ impl View {
             return (painted || stale).then(Vec::new);
         }
         let c = inks();
-        let ink_key = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            c.hash(&mut h);
-            forced.hash(&mut h);
-            h.finish()
-        };
-        let key: BandKey = (fp, cols, ink_key, hover, geom, self.motion_fp);
+        let key: BandKey = (fp, cols, c, forced, hover, geom, self.motion_gen);
         if self.key == Some(key) && !self.stale {
             return None;
         }

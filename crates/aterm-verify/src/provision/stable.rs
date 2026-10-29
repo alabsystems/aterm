@@ -4,6 +4,10 @@
 //! `verify provision`'s rustup row for stock stable and the wasm32 pin, driven by the rustup
 //! the `rustup` row of [`aterm_uds::host::TOOLS`] resolves (the row's stamped copy, once
 //! placed).
+//!
+//! STOCK EXCEPTION: the Trust sysroot carries only its host's std, so `verify cells` compiles
+//! and lints its cells ([`CELL_TARGETS`]) on stock stable, and the wasm32 target rides the pin
+//! `publish/config.sh` names; this row installs both toolchains and their targets.
 
 use std::path::{Path, PathBuf};
 

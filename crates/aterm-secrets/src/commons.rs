@@ -14,6 +14,8 @@ pub mod binding;
 pub mod bootstrap;
 pub mod constraints;
 #[cfg(unix)]
+pub mod hearing;
+#[cfg(unix)]
 pub mod history;
 #[cfg(unix)]
 pub mod journal;
@@ -53,8 +55,10 @@ pub fn reserved_name(name: &str) -> bool {
 /// vault. Fields are immutable so a caller cannot relabel its authority/version.
 /// This establishes custody, not the Commons payload schema, membership roles or
 /// network policy: a consumer must validate those before granting access.
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct Snapshot {
+    #[cfg(unix)]
+    source_config: Box<crate::client::Config>,
     vault: String,
     signer: [u8; 32],
     followed: Vec<[u8; 32]>,
@@ -64,21 +68,51 @@ pub struct Snapshot {
     control: SecretBytes,
 }
 
+impl std::fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Snapshot")
+            .field("vault", &self.vault)
+            .field("sequence", &self.sequence)
+            .field("digest", &self.digest)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Snapshot {
     #[cfg(unix)]
     pub(crate) fn verified(
-        vault: String,
+        config: crate::client::Config,
         envelope: &crate::envelope::Envelope,
-        followed: Vec<[u8; 32]>,
         recipient: Recipient,
         control: SecretBytes,
     ) -> Self {
         Self {
-            vault,
+            vault: config.name.clone(),
             signer: envelope.signer,
-            followed,
+            followed: config.followed.clone(),
+            source_config: Box::new(config),
             sequence: envelope.seq,
             digest: envelope.digest(),
+            recipient,
+            control,
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn verified_from_log(
+        config: crate::client::Config,
+        signer: [u8; 32],
+        log_digest: [u8; 32],
+        recipient: Recipient,
+        control: SecretBytes,
+    ) -> Self {
+        Self {
+            vault: config.name.clone(),
+            signer,
+            followed: config.followed.clone(),
+            source_config: Box::new(config),
+            sequence: 1,
+            digest: log_digest,
             recipient,
             control,
         }
@@ -119,6 +153,22 @@ impl Snapshot {
     pub fn control(&self) -> &[u8] {
         self.control.as_slice()
     }
+
+    #[cfg(unix)]
+    /// Whether both authenticated observations name the exact same configured
+    /// source, signing pin/lineage, applied version, recipient and control bytes.
+    /// Equal envelope digests alone do not establish the same local source
+    /// context. This compares observations; it grants no ongoing authorization.
+    pub fn same_observation(&self, other: &Self) -> bool {
+        self.source_config == other.source_config
+            && self.vault == other.vault
+            && self.signer == other.signer
+            && self.followed == other.followed
+            && self.sequence == other.sequence
+            && self.digest == other.digest
+            && self.recipient == other.recipient
+            && self.control.as_slice() == other.control.as_slice()
+    }
 }
 
 /// Read an authenticated control record offline, without creating an identity,
@@ -139,6 +189,44 @@ pub fn cached(paths: &crate::client::Paths) -> crate::Result<Option<Snapshot>> {
 #[cfg(unix)]
 pub fn observe(paths: &crate::client::Paths) -> crate::Result<Observation> {
     crate::client::observe_commons(paths)
+}
+
+/// Observe fresh offline control, waiting only for a busy vault until `deadline`.
+/// Call before acquiring Commons or journal custody: waiting while holding those
+/// locks could prevent the vault writer from finishing. Every attempt reads the
+/// current source and applied state; no previous snapshot grants admission.
+///
+/// # Errors
+/// Returns [`observe`]'s errors. A vault still busy at the deadline remains
+/// [`Unavailable::Busy`]; other unavailable reasons return immediately.
+#[cfg(unix)]
+pub fn observe_until(
+    paths: &crate::client::Paths,
+    deadline: std::time::Instant,
+) -> crate::Result<Observation> {
+    observe_until_with(paths, deadline, || {})
+}
+
+#[cfg(unix)]
+pub(crate) fn observe_until_with(
+    paths: &crate::client::Paths,
+    deadline: std::time::Instant,
+    mut held: impl FnMut(),
+) -> crate::Result<Observation> {
+    let mut backoff = std::time::Duration::from_millis(1);
+    loop {
+        let observation = observe(paths)?;
+        if !matches!(observation, Observation::Unavailable(Unavailable::Busy)) {
+            return Ok(observation);
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(observation);
+        }
+        held();
+        std::thread::sleep(backoff.min(remaining));
+        backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
+    }
 }
 
 #[cfg(test)]

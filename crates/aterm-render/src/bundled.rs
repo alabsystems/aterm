@@ -549,13 +549,7 @@ pub const fn selectable_families() -> &'static [&'static str] {
     }
 }
 
-fn normalize(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| !ch.is_whitespace() && *ch != '-' && *ch != '_')
-        .flat_map(char::to_lowercase)
-        .collect()
-}
+use crate::normalize_family as normalize;
 
 #[cfg(test)]
 mod tests {
@@ -924,8 +918,20 @@ mod tests {
         assert_eq!(admitted, [Some(id.to_string()), Some(bold_id.to_string())]);
         assert!(crate::list_fonts().iter().any(|f| f == family), "{family}");
         let info = crate::face_info(family).expect("face_info resolves the bundle");
+        let probe = Renderer::from_system_with_family(
+            Some(family),
+            crate::FaceInfo::PROBE_PX,
+            Theme::default(),
+        )
+        .expect("probe renderer resolves the bundle");
         assert_eq!(info.path, id);
         assert_eq!((info.cell_width, info.cell_height), cell, "{family}");
+        assert_eq!(
+            (info.cell_width, info.cell_height),
+            probe.cell_size(),
+            "{family}"
+        );
+        assert_eq!(info.baseline, probe.baseline(), "{family}");
     }
 
     #[test]
@@ -936,7 +942,7 @@ mod tests {
             JETBRAINS_FAMILY,
             JETBRAINS_ID,
             JETBRAINS_BOLD_ID,
-            (10, 22),
+            (10, 21),
         );
     }
 

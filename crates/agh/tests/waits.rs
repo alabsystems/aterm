@@ -500,7 +500,12 @@ fn every_condition_form_round_trips() {
         "digest=X:sha256:zz",
         "anon-visible=",
         "anon-visible=..",
+        "anon-visible=a/../b",
+        "anon-visible=/lead",
+        "anon-visible=a//b",
         "asset=.",
+        "asset=a/../b",
+        "asset=trail/",
         "latest=1",
     ] {
         let error = ReleaseCond::parse(bad).expect_err(bad);
@@ -783,6 +788,21 @@ fn a_library_anon_visible_wait_on_a_bad_tag_is_usage_before_any_request() {
             .err()
             .unwrap_or_else(|| panic!("tag {tag:?} is refused"));
         assert_eq!(error.kind, Kind::Usage, "{tag:?}: {error:?}");
+    }
+    for cond in [
+        ReleaseCond::AnonVisible("..".to_string()),
+        ReleaseCond::AnonVisible("a/../b".to_string()),
+        ReleaseCond::AnonVisible("/lead".to_string()),
+        ReleaseCond::Asset(vec!["a.bin".to_string(), "a//b".to_string()]),
+    ] {
+        let label = cond.slug();
+        let mut condition =
+            agh::wait::release_condition(&slug, "v1.0.0", cond, agh::github::How::read());
+        let error = condition
+            .check(&gh)
+            .err()
+            .unwrap_or_else(|| panic!("condition {label:?} is refused"));
+        assert_eq!(error.kind, Kind::Usage, "{label:?}: {error:?}");
     }
     assert!(fake.seen().is_empty(), "{:?}", fake.seen());
 }

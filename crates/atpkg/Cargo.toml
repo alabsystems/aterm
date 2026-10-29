@@ -57,8 +57,10 @@ ring = { workspace = true, features = ["alloc"] }
 # trailing bits, so a pinned key has exactly one spelling.
 aterm-codec = { workspace = true }
 # The workspace's one FNV-1a/64, for `root_key_fingerprint`'s operator-facing
-# digest (never a security primitive). First-party; its one dependency is
-# astream-wire (dependency-free, vendor/astream), whose byte loop it runs.
+# digest and `admit_disk::dirs_tag`, the stable tag a footprint record keeps of
+# the directories a run measured (never a security primitive). First-party; its
+# one dependency is astream-wire (dependency-free, vendor/astream), whose byte
+# loop it runs.
 aterm-hash = { workspace = true }
 libc = { workspace = true }
 # How each write is finished: durable (F_FULLFSYNC) or ordered (F_BARRIERFSYNC).
@@ -85,6 +87,8 @@ aterm-capacity = { workspace = true }
 # high-water floor's read-compare-write, so concurrent atpkg processes cannot move it down
 # (anti-rollback, CWE-362). Also `pick_slug`/`is_valid_slug` for `resolve_account()`.
 aterm-update-core = { workspace = true }
+# `aterm_log::words`: what a host's aterm.log keeps of a notice that quotes aterm.toml (`notice`).
+aterm-log = { workspace = true }
 # Parse index.toml / pkg-*.toml only after signature verification: the parsers take
 # `&sig::VerifiedBytes` (no public constructor), so parsing unverified bytes does not
 # type-check. aterm-toml rejects duplicate keys; `SUPPORTED_SCHEMA` rejects a newer schema
@@ -130,6 +134,13 @@ aterm-tempfile = { workspace = true }
 # aterm-json and aterm-durable, which it adds, atpkg links already.
 aterm-converge = { workspace = true }
 
+# The build cache's remover (`build_cache::remove::tree`) walks by descriptor: each folder
+# opened from the one holding it (openat O_NOFOLLOW), each entry read, chmodded and removed by
+# its name there (fstatat, fchmodat, unlinkat), as `remove_dir_all` walks on Unix. First-party,
+# libc only, already in the `aterm` binary's graph through aterm-agent and aterm-gui.
+[target.'cfg(unix)'.dependencies]
+aterm-dirfd = { workspace = true }
+
 # On Windows, the one reader of another process's environment block
 # (`aterm_sysprobe::peb::parameters`), which `caller_shell::process_args`
 # splits, and the case fold a variable's name is looked up by
@@ -169,7 +180,7 @@ workspace = true
 name = "atpkg_suite"
 path = "tests/atpkg_suite.rs"
 
-# Alone: re-executes itself with `--exact concurrent_appender_child`.
+# Alone: re-executes itself with `--exact two_processes_appending_at_once_interleave_whole_lines`.
 [[test]]
 name = "packages_log_lanes"
 path = "tests/packages_log_lanes.rs"

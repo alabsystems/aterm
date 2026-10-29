@@ -60,16 +60,17 @@ pub fn read_bytes_up_to(path: &str, cap: u64) -> std::io::Result<Vec<u8>> {
         ])));
     }
     let mut bytes = Vec::new();
-    f.take(cap + 1).read_to_end(&mut bytes)?;
+    f.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > cap {
+        let mib = 1024 * 1024;
+        let limit = if cap >= mib && cap.is_multiple_of(mib) {
+            concat(&[&(cap / mib).to_string(), " MiB"])
+        } else {
+            concat(&[&cap.to_string(), "-byte"])
+        };
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            concat(&[
-                path,
-                " exceeds the ",
-                &(cap / (1024 * 1024)).to_string(),
-                " MiB read cap",
-            ]),
+            concat(&[path, " exceeds the ", &limit, " read cap"]),
         ));
     }
     Ok(bytes)
@@ -362,10 +363,13 @@ mod tests {
         std::fs::write(&path, b"12345678").unwrap();
         assert_eq!(read_bytes_up_to(&path, 8).unwrap(), b"12345678");
         std::fs::write(&path, b"123456789").unwrap();
-        assert_eq!(
-            read_bytes_up_to(&path, 8).unwrap_err().kind(),
-            std::io::ErrorKind::InvalidData
-        );
+        let err = read_bytes_up_to(&path, 8).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("8-byte read cap"), "{err}");
+        assert_eq!(read_bytes_up_to(&path, u64::MAX).unwrap(), b"123456789");
+        std::fs::write(&path, vec![b'x'; (READ_CAP as usize) + 1]).unwrap();
+        let mib_err = read_bytes(&path).unwrap_err();
+        assert!(mib_err.to_string().contains("1 MiB read cap"), "{mib_err}");
         assert!(read_bytes(dir.to_str().unwrap()).is_err(), "a directory");
     }
 

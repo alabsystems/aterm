@@ -266,6 +266,12 @@ pub(crate) struct EditorViewState {
     pub(crate) reveal_status: Option<String>,
     /// The header row of an `edit` ticket's own view (`app_edit`): who asked for the edit and how to answer it.
     pub(crate) edit_header: Option<EditHeader>,
+    /// The last press on a grid cell (when, record, column): a second press on it within a
+    /// double click's interval opens its editor.
+    pub(crate) grid_press: Option<(std::time::Instant, usize, usize)>,
+    /// The cells of a sideways swipe over the grid not yet a whole column
+    /// (`App::native_editor_grid_sideways`), signed: positive toward the right.
+    pub(crate) grid_swipe: i32,
 }
 
 /// The header row of an `edit` ticket's view (`app_edit`).
@@ -336,6 +342,46 @@ impl EditHeader {
 pub(crate) const EDIT_DONE_WORDS: &str = "C-c C-c done";
 /// The header row's abort part, as it reads on the glass.
 pub(crate) const EDIT_ABORT_WORDS: &str = "C-c C-k abort";
+
+/// The header row's notice that a buffer's file changed on disk under it
+/// (`app_document_watch`): a choice in which neither side is lost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DiskNotice {
+    /// The file's text changed: Reload or Keep Mine.
+    Changed,
+    /// The file is gone: Keep Mine, and Save writes it again.
+    Gone,
+}
+
+impl DiskNotice {
+    /// The row's words, before its parts.
+    pub(crate) const fn words(self) -> &'static str {
+        match self {
+            Self::Changed => "The file changed on disk under your unsaved edits",
+            Self::Gone => "The file was deleted on disk; your text is still here",
+        }
+    }
+
+    /// Whether the row offers Reload (a deleted file has nothing to load).
+    pub(crate) const fn offers_reload(self) -> bool {
+        matches!(self, Self::Changed)
+    }
+
+    /// The keep part's spoken label.
+    const fn keep_label(self) -> &'static str {
+        match self {
+            Self::Changed => "Keep Mine: keep your edits, for Save to write over the file on disk",
+            Self::Gone => "Keep Mine: keep your text, for Save to write the file again",
+        }
+    }
+}
+
+/// The disk notice's reload part, as it reads on the glass.
+pub(crate) const DISK_RELOAD_WORDS: &str = "Reload";
+/// The disk notice's reload part, spoken.
+const DISK_RELOAD_LABEL: &str = "Reload: take the file on disk; C-/ brings your edits back";
+/// The disk notice's keep part, as it reads on the glass.
+pub(crate) const DISK_KEEP_WORDS: &str = "Keep Mine";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RecoveryViewState {
@@ -2227,6 +2273,12 @@ pub(crate) enum PackagesRequest {
     UninstallAll,
     /// `atpkg machine apply`.
     MachineApply,
+    /// `atpkg serve-units --on` or `--off`: Settings ▸ Packages ▸ [`atpkg::peers::SERVE_SWITCH`]
+    /// flipped by a person, so atpkg's own `peers::turn_on` or `peers::turn_off` records it.
+    ServeUnits {
+        /// On (`--on`) or the person's off (`--off`).
+        on: bool,
+    },
 }
 
 /// Synchronous admission outcome for a [`PackagesRequest`] (the worker's real results arrive later through the packages projection's revision fan-out, exactly like update checks).
@@ -3401,6 +3453,25 @@ impl NativeRuntime {
                 editor.disk_conflict = disk_conflict;
             }
         }
+    }
+
+    /// Set every editor of `document`'s disk notice; whether any changed.
+    pub(crate) fn set_document_disk_notice(
+        &mut self,
+        document: DocumentId,
+        notice: Option<DiskNotice>,
+    ) -> bool {
+        let mut changed = false;
+        for app in self.instances.values_mut() {
+            if let NativeApp::Editor(editor) = app
+                && editor.document == document
+                && editor.disk_notice != notice
+            {
+                editor.disk_notice = notice;
+                changed = true;
+            }
+        }
+        changed
     }
 
     pub(crate) fn set_editor_history_availability(
@@ -6205,6 +6276,9 @@ pub(crate) struct EditorApp {
     pub(crate) checkpoint_pending: bool,
     /// The saver baseline no longer matches disk.
     pub(crate) disk_conflict: bool,
+    /// The header row's notice of a change on disk ([`DiskNotice`]), while
+    /// the person has not chosen.
+    pub(crate) disk_notice: Option<DiskNotice>,
     pub(crate) recovery_status: Option<String>,
     pub(crate) can_undo: bool,
     pub(crate) can_redo: bool,
@@ -6222,6 +6296,9 @@ pub(crate) struct EditorApp {
     >,
     /// The [`LineIndexMemo`] for the last rendered revision.
     line_index_cache: std::cell::RefCell<LineIndexMemo>,
+    /// The scan a grid view of the last rendered revision draws ([`EditorApp::grid_table`]);
+    /// boxed, so the Editor stays one of the small document apps in [`NativeApp`].
+    table_cache: std::cell::RefCell<Box<amacs::table::TableMemo>>,
 }
 
 /// `(document id, document seq, line-start index)`: the memo behind
@@ -6237,16 +6314,25 @@ impl EditorApp {
                     .config_analysis
                     .as_ref()
                     .is_some_and(|analysis| analysis.diagnostic_count() > 0),
-            reload: self.disk_conflict && self.dirty,
-            edit_header: false,
+            reload: self.disk_conflict && self.dirty && self.disk_notice.is_none(),
+            edit_header: self.disk_notice.is_some(),
+            grid: amacs::language::Language::detect(&self.canonical_uri, "")
+                .delimiter()
+                .map(|_| false),
         }
     }
 
     /// [`Self::toolbar`] as view `view` draws it: an `edit` ticket's view adds its header row ([`EditHeader`]).
     pub(crate) fn toolbar_in(&self, view: &EditorViewState) -> crate::native_ui::EditorToolbar {
+        let toolbar = self.toolbar();
         crate::native_ui::EditorToolbar {
-            edit_header: view.edit_header.is_some(),
-            ..self.toolbar()
+            edit_header: view.edit_header.is_some() || self.disk_notice.is_some(),
+            grid: toolbar.grid.map(|_| {
+                view.buffer
+                    .as_ref()
+                    .is_some_and(|buffer| buffer.grid().is_some())
+            }),
+            ..toolbar
         }
     }
 
@@ -6268,6 +6354,7 @@ impl EditorApp {
             dirty: false,
             checkpoint_pending: false,
             disk_conflict: false,
+            disk_notice: None,
             recovery_status: None,
             can_undo: false,
             can_redo: false,
@@ -6277,17 +6364,60 @@ impl EditorApp {
             config_host_requested_revision: None,
             config_assist_cache: std::cell::RefCell::new(Vec::new()),
             line_index_cache: std::cell::RefCell::new(None),
+            table_cache: std::cell::RefCell::default(),
         }
     }
 
+    /// The scan of `snapshot` that view `buffer`'s grid draws, built once per document revision:
+    /// `None` for a view drawn as text, or for a table grown past the grid's limits (which then
+    /// draws as text until it shrinks).
+    fn grid_table(
+        &self,
+        snapshot: &crate::document_store::DocumentSnapshot,
+        buffer: &crate::native_editor::EditorBufferView,
+    ) -> Option<std::sync::Arc<amacs::table::Table>> {
+        let delimiter = buffer.grid()?.delimiter;
+        self.table_cache
+            .borrow_mut()
+            .table(snapshot.id, snapshot.seq, delimiter, &snapshot.text)
+            .ok()
+    }
+
+    /// What a copy takes from a view drawing a grid, when it shows one: the open cell editor's
+    /// text, else the current cell's value (never its quoted bytes); `None` for an empty or
+    /// missing cell, a view drawn as text, or a prompt that owns the input.
+    pub(crate) fn grid_cell_text(
+        &self,
+        view: &EditorViewState,
+        snapshot: &crate::document_store::DocumentSnapshot,
+    ) -> Option<String> {
+        let buffer = view.buffer.as_ref()?;
+        if buffer.minibuffer_active() {
+            return None;
+        }
+        if let Some(draft) = buffer.grid_draft() {
+            return (!draft.text.is_empty()).then(|| draft.text.clone());
+        }
+        let table = self.grid_table(snapshot, buffer)?;
+        let (record, column) = crate::native_editor::current_cell(&table, buffer);
+        let value = table.cell(record, column)?.value(&snapshot.text);
+        (!value.is_empty()).then(|| value.into_owned())
+    }
+
     /// Whether this editor view can save its current changes without interrupting a prompt that owns its input.
+    /// An open grid cell holding changed text counts as a change: Save keeps the cell, then saves.
     pub(crate) fn can_save(&self, view: &EditorViewState) -> bool {
         let config_valid = !self.config_editor
             || self
                 .config_analysis
                 .as_ref()
                 .is_some_and(|analysis| !analysis.has_errors());
-        self.dirty
+        let cell_changed = view
+            .buffer
+            .as_ref()
+            .and_then(crate::native_editor::EditorBufferView::grid_draft)
+            .is_some_and(|draft| draft.text != draft.original);
+        (self.dirty || cell_changed)
             && !self.checkpoint_pending
             && !self.disk_conflict
             && config_valid
@@ -6549,7 +6679,19 @@ impl NativeAppModel for EditorApp {
         let column_capacity = ((editor_rect.right() - editor_geometry.text_x).max(1.0)
             / editor_geometry.cell_w)
             .floor() as usize;
-        let mut projection = cx.document.and_then(|snapshot| {
+        // A table's grid face draws its records in place of the text lines.
+        let grid = cx.document.and_then(|snapshot| {
+            let buffer = view.buffer.as_ref()?;
+            let table = self.grid_table(snapshot, buffer)?;
+            Some(crate::native_editor::project_grid(
+                &snapshot.text,
+                &table,
+                buffer,
+                line_capacity,
+                column_capacity,
+            ))
+        });
+        let mut projection = cx.document.filter(|_| grid.is_none()).and_then(|snapshot| {
             view.buffer.as_ref().map(|buffer| {
                 let starts = self.line_index(snapshot);
                 let lines = match starts.as_deref() {
@@ -6574,6 +6716,9 @@ impl NativeAppModel for EditorApp {
             crate::native_config_language::decorate_projection(projection, analysis);
         }
         let cursor_label = cx.document.and_then(|snapshot| {
+            if let Some(grid) = grid.as_ref() {
+                return Some(editor_grid_cursor_label(grid));
+            }
             view.buffer.as_ref().map(|buffer| {
                 let starts = self.line_index(snapshot);
                 let lines = match starts.as_deref() {
@@ -6647,6 +6792,7 @@ impl NativeAppModel for EditorApp {
         let focused = view.common.last_focus.as_ref() == Some(&UiKey::new("editor/buffer"));
         let buffer_ready = view.buffer.is_some();
         let can_navigate_config_diagnostics = self.can_navigate_config_diagnostics(view);
+        let grid_rows_ready = editor_grid_rows_ready(view);
         let command_button = |key: &'static str,
                               visual_label: &'static str,
                               width: f32,
@@ -6726,6 +6872,25 @@ impl NativeAppModel for EditorApp {
                     "editor/config-problem-next",
                     can_navigate_config_diagnostics,
                 ),
+                "editor/grid-toggle-button" => (
+                    if toolbar.grid == Some(true) {
+                        "Text view: show the file's text (Cmd-E or C-c C-t)"
+                    } else {
+                        "Grid view: show the table's cells (Cmd-E or C-c C-t)"
+                    },
+                    "editor/grid-toggle",
+                    buffer_ready && !minibuffer_active,
+                ),
+                "editor/grid-insert-row-button" => (
+                    "Add Row: an empty row below this one (C-o)",
+                    "editor/grid-insert-row",
+                    grid_rows_ready,
+                ),
+                "editor/grid-delete-row-button" => (
+                    "Delete Row: this row (C-S-Backspace)",
+                    "editor/grid-delete-row",
+                    grid_rows_ready,
+                ),
                 _ => (
                     "Commands: run a command by name (M-x)",
                     "editor/commands",
@@ -6740,34 +6905,88 @@ impl NativeAppModel for EditorApp {
             command_gap,
             shell.command_row_cap,
         );
-        let edit_header_row = view.edit_header.as_ref().map(|header| {
-            let part = |key: &'static str,
-                        words: &'static str,
-                        label: String,
-                        action: &'static str,
-                        enabled: bool| {
+        let part = |key: &'static str,
+                    words: &'static str,
+                    label: String,
+                    action: &'static str,
+                    enabled: bool| {
+            UiNode::new(
+                key,
+                UiContent::Button(
+                    Control::new(
+                        ButtonSpec::new(label).visual_label(words),
+                        ActionId::new(action),
+                    )
+                    .state(ControlState {
+                        enabled,
+                        ..ControlState::default()
+                    })
+                    .style(StyleRef::Secondary),
+                ),
+            )
+            .layout(
+                Layout::default()
+                    .width(Length::Fixed(
+                        crate::native_ui::editor_toolbar_button_width(words),
+                    ))
+                    .height(Length::Fill),
+            )
+        };
+        let disk_notice_row = self.disk_notice.map(|notice| {
+            let enabled = buffer_ready && !minibuffer_active && !self.checkpoint_pending;
+            let mut parts = Vec::new();
+            if notice.offers_reload() {
+                parts.push(part(
+                    "editor/disk-reload",
+                    DISK_RELOAD_WORDS,
+                    DISK_RELOAD_LABEL.to_string(),
+                    "editor/revert",
+                    enabled,
+                ));
+            }
+            parts.push(part(
+                "editor/disk-keep",
+                DISK_KEEP_WORDS,
+                notice.keep_label().to_string(),
+                "editor/keep-local",
+                enabled,
+            ));
+            let parts_width: f32 = notice
+                .offers_reload()
+                .then_some(DISK_RELOAD_WORDS)
+                .into_iter()
+                .chain(std::iter::once(DISK_KEEP_WORDS))
+                .map(|words| command_gap + crate::native_ui::editor_toolbar_button_width(words))
+                .sum();
+            let words = notice.words();
+            let mut children = vec![
                 UiNode::new(
-                    key,
-                    UiContent::Button(
-                        Control::new(
-                            ButtonSpec::new(label).visual_label(words),
-                            ActionId::new(action),
-                        )
-                        .state(ControlState {
-                            enabled,
-                            ..ControlState::default()
-                        })
-                        .style(StyleRef::Secondary),
-                    ),
+                    "editor/disk-notice-words",
+                    UiContent::Text(crate::native_ui::TextSpec {
+                        text: crate::native_ui::fit_native_status_label(
+                            words,
+                            (shell.command_bar_width - parts_width).max(0.0),
+                        ),
+                        role: SemanticRole::Status,
+                        style: StyleRef::Quiet,
+                    }),
                 )
-                .layout(
-                    Layout::default()
-                        .width(Length::Fixed(
-                            crate::native_ui::editor_toolbar_button_width(words),
-                        ))
-                        .height(Length::Fill),
-                )
-            };
+                .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
+            ];
+            children.extend(parts);
+            UiNode::new(
+                "editor/disk-notice",
+                UiContent::Group(GroupSpec::new(words)),
+            )
+            .layout(
+                Layout::row()
+                    .gap(command_gap)
+                    .width(Length::Fill)
+                    .height(Length::Fixed(shell.command_button_height)),
+            )
+            .children(children)
+        });
+        let edit_header_row = view.edit_header.as_ref().map(|header| {
             let mut parts = vec![part(
                 "editor/finish",
                 EDIT_DONE_WORDS,
@@ -6816,7 +7035,10 @@ impl NativeAppModel for EditorApp {
             )
             .children(children)
         });
-        let command_rows: Vec<UiNode> = edit_header_row
+        // One header row: the disk notice while it stands (a Done could not
+        // save under it), the edit ticket's otherwise.
+        let command_rows: Vec<UiNode> = disk_notice_row
+            .or(edit_header_row)
             .into_iter()
             .chain(plan.rows.iter().enumerate().map(|(index, row)| {
                 UiNode::new(
@@ -7258,6 +7480,7 @@ impl NativeAppModel for EditorApp {
                     document_key,
                     selectable: true,
                     projection,
+                    grid: grid.map(Box::new),
                     preedit: document_preedit,
                     preedit_caret: view.preedit_caret,
                     status,
@@ -7349,6 +7572,37 @@ impl NativeAppModel for EditorApp {
                 enabled: self.dirty && !minibuffer_active && !self.checkpoint_pending,
             },
         ]);
+        if let Some(grid) = self.toolbar_in(view).grid {
+            out.push(Command {
+                id: ActionId::new("editor/grid-toggle"),
+                title: if grid { "Text View" } else { "Grid View" }.to_string(),
+                shortcut: Some(if cfg!(windows) { "C-c C-t" } else { "Cmd-E" }.to_string()),
+                enabled: buffer_ready && !minibuffer_active,
+            });
+            if grid {
+                let rows_ready = editor_grid_rows_ready(view);
+                out.push(Command {
+                    id: ActionId::new("editor/grid-insert-row"),
+                    title: "Add Row Below".to_string(),
+                    shortcut: Some("C-o".to_string()),
+                    enabled: rows_ready,
+                });
+                out.push(Command {
+                    id: ActionId::new("editor/grid-delete-row"),
+                    title: "Delete Row".to_string(),
+                    shortcut: Some("C-S-Backspace".to_string()),
+                    enabled: rows_ready,
+                });
+            }
+        }
+        if self.disk_notice.is_some() {
+            out.push(Command {
+                id: ActionId::new("editor/keep-local"),
+                title: "Keep My Edits over the File on Disk".to_string(),
+                shortcut: None,
+                enabled: !minibuffer_active && !self.checkpoint_pending,
+            });
+        }
         if let Some(header) = &view.edit_header {
             out.push(Command {
                 id: ActionId::new("editor/finish"),
@@ -7501,10 +7755,9 @@ fn editor_prompt_projection(
 }
 
 /// What a document whose file changed under an unsaved draft says.
-pub(crate) const DISK_CONFLICT_RECOVERY: &str = "File changed on disk; Save is blocked. Copy any local edits you need to keep, then choose ‘Discard Changes and Reload from Disk’";
+pub(crate) const DISK_CONFLICT_RECOVERY: &str = "File changed on disk; Save is blocked until you choose: Reload takes the disk's text (C-/ brings your edits back), Keep Mine keeps your edits for Save to write";
 /// The recovery line for a draft whose file was deleted, or appeared, on disk since it was opened (the file watcher's and the save refusal's).
-pub(crate) const DISK_EXISTENCE_RECOVERY: &str =
-    "File was deleted or replaced on disk; Save is blocked. Copy any local edits you need to keep.";
+pub(crate) const DISK_EXISTENCE_RECOVERY: &str = "File was deleted or replaced on disk; Save is blocked until you choose Keep Mine, which keeps your text for Save to write";
 
 /// The editor footer of `app`'s view `view` in an editor in `editor_rect`: the status
 /// sentence, the lines it paints on ([`crate::native_ui::editor_footer_lines`]), and the rows
@@ -7532,11 +7785,17 @@ fn editor_footer(
                 None => crate::native_editor::EditorLines::scanning(&snapshot.text).total(),
             }
         });
+    let grid = document.and_then(|snapshot| {
+        let buffer = view.buffer.as_ref()?;
+        let table = app.grid_table(snapshot, buffer)?;
+        Some(GridPlace::of(&snapshot.text, &table, buffer))
+    });
     let forms = editor_status_forms(
         app,
         view,
         total_lines,
         document.is_some_and(|snapshot| snapshot.text.is_empty()),
+        grid.as_ref(),
     );
     let semantic = forms.first().cloned();
     let lines = if forms.is_empty() {
@@ -7594,9 +7853,77 @@ fn editor_status_message(
     total_lines: usize,
     empty: bool,
 ) -> Option<String> {
-    editor_status_forms(app, view, total_lines, empty)
+    editor_status_forms(app, view, total_lines, empty, None)
         .into_iter()
         .next()
+}
+
+/// Where a grid view's cursor stands, for its footer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GridPlace {
+    /// 1-based, the header being row 1, as the gutter numbers them.
+    row: usize,
+    rows: usize,
+    column: usize,
+    columns: usize,
+    /// The 1-based text line the cell starts on.
+    line: usize,
+    editing: bool,
+    problem_line: Option<usize>,
+}
+
+impl GridPlace {
+    fn of(
+        text: &str,
+        table: &amacs::table::Table,
+        view: &crate::native_editor::EditorBufferView,
+    ) -> Self {
+        let (record, column) = crate::native_editor::current_cell(table, view);
+        Self {
+            row: record.saturating_add(1),
+            rows: table.records.len(),
+            column: column.saturating_add(1),
+            columns: table.columns().max(column.saturating_add(1)),
+            line: amacs::table::line_of(text, table.caret_for(record, column)),
+            editing: view.grid_draft().is_some(),
+            problem_line: table.first_problem_line(text),
+        }
+    }
+
+    /// The first problem the scan noted, as the footer names it.
+    fn problem(&self) -> Option<String> {
+        self.problem_line.map(|line| {
+            format!("Line {line} has a stray or unclosed quote · {TEXT_VIEW_KEY} shows the text")
+        })
+    }
+
+    /// `Row R of N · Col C of M · Ln L`.
+    fn words(&self) -> String {
+        format!(
+            "Row {} of {} · Col {} of {} · Ln {}",
+            self.row, self.rows, self.column, self.columns, self.line
+        )
+    }
+}
+
+/// Whether a grid's row buttons and commands may run: a grid is shown, no prompt owns the input,
+/// and no cell is open (its text is kept or dropped first).
+fn editor_grid_rows_ready(view: &EditorViewState) -> bool {
+    view.buffer.as_ref().is_some_and(|buffer| {
+        buffer.grid().is_some() && !buffer.minibuffer_active() && buffer.grid_draft().is_none()
+    })
+}
+
+/// A grid view's header label: the cursor's row and the header name over its column.
+fn editor_grid_cursor_label(grid: &crate::native_editor::GridProjection) -> String {
+    let cursor = &grid.cursor;
+    let header = amacs::table::first_line(&cursor.header);
+    let column = if header.trim().is_empty() {
+        format!("Col {}", cursor.column + 1)
+    } else {
+        header.to_string()
+    };
+    format!("Row {} of {} · {column}", cursor.record + 1, grid.records)
 }
 
 /// The editor's status as the whole sentence first, then shorter forms that leave out what
@@ -7607,6 +7934,7 @@ fn editor_status_forms(
     view: &EditorViewState,
     total_lines: usize,
     empty: bool,
+    grid: Option<&GridPlace>,
 ) -> Vec<String> {
     let lines = total_lines.max(1);
     let line_noun = if lines == 1 { "line" } else { "lines" };
@@ -7652,9 +7980,45 @@ fn editor_status_forms(
     {
         return with_watcher(forms);
     } else if let Some(status) = view.status.as_deref().filter(|status| {
-        !status.is_empty() && !(app.dirty && matches!(*status, "Saved" | "No unsaved changes"))
+        !status.is_empty()
+            && !(app.dirty && matches!(*status, "Saved" | "No unsaved changes"))
+            // An open cell holds text no save or journal has yet: nothing may say it is saved.
+            && !(grid.is_some_and(|grid| grid.editing)
+                && matches!(*status, "Saved" | "No unsaved changes" | "Draft autosaved"))
     }) {
+        // A grid keeps its place, and a problem the scan noted, beside a status; a narrow
+        // footer drops them first.
+        if let Some(grid) = grid {
+            let place = grid.words();
+            let mut forms = vec![format!("{status} · {place}"), status.to_string()];
+            if let Some(problem) = grid.problem() {
+                forms.insert(0, format!("{status} · {problem} · {place}"));
+            }
+            return with_watcher(forms);
+        }
         status.to_string()
+    } else if let Some(grid) = grid {
+        let place = grid.words();
+        let problem = grid.problem();
+        let save = if cfg!(windows) { "C-s" } else { "Cmd-S" };
+        let mut forms = if grid.editing {
+            vec![
+                format!("Return keeps · Esc drops · {NEW_LINE_KEY} new line · {place}"),
+                format!("Return keeps · Esc drops · {place}"),
+            ]
+        } else if app.dirty {
+            vec![
+                format!("Modified · {save} to save · {place}"),
+                format!("Modified · {place}"),
+            ]
+        } else {
+            vec![format!("{place} · Ready")]
+        };
+        if let Some(problem) = problem {
+            forms.insert(0, format!("{} · {problem}", forms[0]));
+        }
+        forms.push(place);
+        return with_watcher(forms);
     } else if app.dirty {
         let save = if cfg!(windows) { "C-s" } else { "Cmd-S" };
         format!("Modified · {save} to save · {lines} {line_noun}")
@@ -7665,6 +8029,16 @@ fn editor_status_forms(
     };
     with_watcher(vec![label])
 }
+
+/// The key that flips an editor between its text and grid views, as its footer names it.
+const TEXT_VIEW_KEY: &str = if cfg!(windows) { "C-c C-t" } else { "Cmd-E" };
+
+/// The key that puts a line break in an open grid cell, as its footer names it.
+const NEW_LINE_KEY: &str = if cfg!(target_os = "macos") {
+    "Option-Return"
+} else {
+    "M-Return"
+};
 
 fn command_palette_status(matches: usize, compact: bool) -> String {
     if compact && matches == 0 {
@@ -9363,12 +9737,14 @@ mod markdown_reader_tests {
                 problem_navigation: true,
                 reload: true,
                 edit_header: false,
+                grid: None,
             },
             // An `edit` ticket's header row (Done and Abort) left one row under M-x at 2x.
             EditorToolbar {
                 problem_navigation: false,
                 reload: false,
                 edit_header: true,
+                grid: None,
             },
         ];
         for scale in [0.85_f32, 1.0, 1.25, 1.5, 1.75, 2.0] {
@@ -10533,6 +10909,92 @@ mod markdown_reader_tests {
             Some("editor/revert")
         );
         assert!(reload.state.is_some_and(|state| state.enabled));
+    }
+
+    /// The disk notice takes the header row: a changed file offers Reload
+    /// (Discard's action) and Keep Mine, a deleted one Keep Mine alone, and
+    /// the toolbar's own Reload steps aside for it. No notice, no row (the
+    /// negative control).
+    #[test]
+    fn the_disk_notice_takes_the_header_row_with_its_choice() {
+        let (mut app, view, snapshot) = editor_fixture("first\nsecond\n", "notes.md");
+        app.dirty = true;
+        app.disk_conflict = true;
+        let viewport = LogicalRect::new(0.0, 0.0, 804.0, 582.0);
+        let compile = |app: &EditorApp| {
+            app.view(&view, &cx(viewport, Some(&snapshot)))
+                .compile(viewport)
+                .unwrap()
+        };
+        let action = |compiled: &crate::native_ui::CompiledUi, key: &str| {
+            compiled
+                .semantic(&UiKey::new(key))
+                .and_then(|node| node.action.as_ref().map(|id| id.as_str().to_string()))
+        };
+
+        let compiled = compile(&app);
+        assert!(
+            compiled
+                .semantic(&UiKey::new("editor/disk-notice"))
+                .is_none()
+        );
+        assert_eq!(
+            action(&compiled, "editor/revert-button").as_deref(),
+            Some("editor/revert")
+        );
+
+        app.disk_notice = Some(DiskNotice::Changed);
+        let compiled = compile(&app);
+        assert!(
+            compiled
+                .semantic(&UiKey::new("editor/disk-notice"))
+                .is_some()
+        );
+        assert_eq!(
+            action(&compiled, "editor/disk-reload").as_deref(),
+            Some("editor/revert")
+        );
+        assert_eq!(
+            action(&compiled, "editor/disk-keep").as_deref(),
+            Some("editor/keep-local")
+        );
+        assert!(
+            compiled
+                .semantic(&UiKey::new("editor/revert-button"))
+                .is_none(),
+            "the notice's Reload stands for the toolbar's"
+        );
+        compiled.validate_parity().unwrap();
+        let mut commands = Vec::new();
+        app.commands(&view, &mut commands);
+        assert!(command(&commands, "editor/keep-local").enabled);
+
+        app.disk_notice = Some(DiskNotice::Gone);
+        let compiled = compile(&app);
+        assert!(
+            compiled
+                .semantic(&UiKey::new("editor/disk-reload"))
+                .is_none(),
+            "a deleted file has nothing to reload"
+        );
+        assert_eq!(
+            action(&compiled, "editor/disk-keep").as_deref(),
+            Some("editor/keep-local")
+        );
+        assert_eq!(
+            crate::native_ui::editor_text_viewport_rect_with_palette(
+                viewport,
+                crate::native_ui::EditorPalette::None,
+                app.toolbar(),
+            )
+            .height,
+            compiled
+                .semantic(&UiKey::new("editor/buffer"))
+                .expect("the buffer")
+                .rect
+                .height,
+            "the layout gives the notice its row"
+        );
     }
 
     #[test]

@@ -158,6 +158,152 @@ fn the_grammar_hands_over_terms_levels_and_an_absolute_volume() {
 }
 
 #[test]
+fn low_free_boundaries_do_not_overflow_or_acquire_admission() {
+    for threshold in [0, 68 * GIB, u64::MAX] {
+        for free in [
+            threshold.saturating_sub(1),
+            threshold,
+            threshold.saturating_add(1),
+        ] {
+            for (operator, expected) in [("<", free < threshold), ("<=", free <= threshold)] {
+                let wait = parse(&format!("sys free{operator}{threshold}B")).unwrap();
+                let row = home_row(free);
+                assert_eq!(
+                    holds(&wait, &row),
+                    expected,
+                    "{free} {operator} {threshold}"
+                );
+                assert_eq!(largest_need(&wait, &row), None);
+            }
+        }
+    }
+    // Defense beyond parsing: a directly constructed mixed wait is still an
+    // observation and cannot acquire a cleanup demand.
+    let mut mixed = parse("sys free<68GiB").unwrap();
+    mixed.terms.push(Term::Free {
+        strict: false,
+        need: Need::Room,
+    });
+    assert_eq!(largest_need(&mixed, &home_row(0)), None);
+}
+
+#[test]
+fn low_free_reads_fresh_at_arm_without_watch_settings_or_cleanup() {
+    let shelf = shelf_at(5 * GIB);
+    shelf.publish(|b| {
+        b.watched = false;
+        b.volumes[0].room = None;
+    });
+    let reads = AtomicU32::new(0);
+    let read = |_: &Path| {
+        reads.fetch_add(1, Ordering::SeqCst);
+        Ok(reading(80 * GIB))
+    };
+    let env = Env {
+        read: &read,
+        poke: &|_| panic!("observer requested cleanup"),
+        settings: &|| panic!("observer read cleanup settings"),
+        lines: &default_lines,
+        hung_up: &|| false,
+        exited: &|| false,
+    };
+    let wait = parse("sys free<68GiB timeout=0").unwrap();
+    assert_eq!(run(&shelf, &wait, &owner(), &env), "OK timeout\n");
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "fresh cached low space is not authority"
+    );
+    assert!(shelf.board_lock().demands.is_empty());
+
+    let read = |_: &Path| Ok(reading(67 * GIB));
+    let env = Env { read: &read, ..env };
+    let reply = run(&shelf, &wait, &owner(), &env);
+    assert!(
+        reply.starts_with("OK sys free_bytes=71940702208 "),
+        "{reply}"
+    );
+    assert!(reply.contains("freed_bytes=0 "), "{reply}");
+    assert!(shelf.board_lock().demands.is_empty());
+}
+
+#[test]
+fn low_free_arms_on_the_requested_volume_instead_of_the_low_home_cache() {
+    let shelf = shelf_at(5 * GIB);
+    let path = PathBuf::from(abs("/Volumes/guard/repo"));
+    let read = |requested: &Path| {
+        assert_eq!(requested, path);
+        let mut actual = reading(80 * GIB);
+        actual.mount = PathBuf::from(abs("/Volumes/guard"));
+        actual.key = VolumeKey::Container("guard".into());
+        Ok(actual)
+    };
+    let env = Env {
+        read: &read,
+        poke: &|_| panic!("observer requested cleanup"),
+        settings: &|| panic!("observer read cleanup settings"),
+        lines: &default_lines,
+        hung_up: &|| false,
+        exited: &|| false,
+    };
+    let wait = parse(&format!("sys free<68GiB vol={} timeout=0", path.display())).unwrap();
+    assert_eq!(run(&shelf, &wait, &owner(), &env), "OK timeout\n");
+    assert!(
+        shelf
+            .board_lock()
+            .row_keyed(&VolumeKey::Container("guard".into()))
+            .is_some()
+    );
+    assert!(shelf.board_lock().demands.is_empty());
+}
+
+#[test]
+fn low_free_park_refreshes_stale_hits_and_refuses_volume_replacement() {
+    for replacement in [false, true] {
+        let shelf = shelf_at(5 * GIB);
+        shelf.publish(|b| b.volumes[0].as_of = Instant::now() - FRESH - Duration::from_secs(1));
+        let path = PathBuf::from(abs("/Volumes/requested/repo"));
+        let read = |requested: &Path| {
+            assert_eq!(requested, path);
+            let mut value = reading(80 * GIB);
+            if replacement {
+                value.key = VolumeKey::Container("replacement".into());
+            }
+            Ok(value)
+        };
+        let env = Env {
+            read: &read,
+            poke: &|_| panic!("observer requested cleanup"),
+            settings: &|| panic!("observer read cleanup settings"),
+            lines: &default_lines,
+            hung_up: &|| false,
+            exited: &|| false,
+        };
+        let wait = parse("sys free<=68GiB").unwrap();
+        let armed = Instant::now();
+        let reply = park(
+            &shelf,
+            &wait,
+            &key(),
+            &path,
+            (None, None, None),
+            armed,
+            armed,
+            &env,
+        );
+        assert_eq!(
+            reply,
+            if replacement {
+                "ERR unavailable free why=unreadable\n"
+            } else {
+                "OK timeout\n"
+            }
+        );
+        assert!(shelf.board_lock().demands.is_empty());
+    }
+}
+
+#[test]
 fn a_condition_already_true_answers_at_once() {
     let shelf = shelf_at(500 * GIB);
     let world = World::new(500 * GIB);

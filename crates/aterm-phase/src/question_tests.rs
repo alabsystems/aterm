@@ -847,9 +847,13 @@ fn a_cut_question_is_head_off_screen_never_idle() {
     assert!(!parse_prompt_v2(&r[rule..]).expect("whole").head_off_screen);
 }
 
-/// A multi-select whose policy text wraps over more rows than a read's top leaves of the dialog is read with its head off the screen.
+/// A multi-select whose policy text wraps over many rows at 41 columns is read whole: typed
+/// (41x60), the free-text row focused, checked and holding the whole text; after `down`
+/// (the kept 41-column frame), still checked with the focus gone to `Submit`. Its cuts are
+/// `a_multi_select_cut_at_any_row_under_its_head_is_head_off_screen`'s and
+/// `a_multi_select_cut_under_its_head_is_head_off_screen_at_every_swept_width`'s.
 #[test]
-fn a_multi_select_cut_inside_its_free_text_row_is_head_off_screen() {
+fn a_multi_select_free_text_wrapped_at_41_columns_reads_whole() {
     let grid = screen(QUESTION_MULTI_TYPED_41X60_2_1_302);
     assert_eq!(grid.len(), 53, "PRECONDITION: the grid from its row 7");
     let (_, whole, d) = read(QUESTION_MULTI_TYPED_41X60_2_1_302);
@@ -858,50 +862,20 @@ fn a_multi_select_cut_inside_its_free_text_row_is_head_off_screen() {
     assert!(free.focused && free.checked == Some(true) && !free.pristine);
     assert!(free.text.starts_with("Decide yourself: choose the option"));
     assert!(free.text.ends_with("The user was not asked.)"));
-    let cut_at = |rows: &[String], from: usize, what: &str| {
-        let t = rows[from..].to_vec();
-        let p = parse_prompt_v2(&t).unwrap_or_else(|| panic!("{what}: no box"));
-        assert!(p.head_off_screen, "{what}: {:?}", p.question_dialog);
-        assert_eq!(p.kind, PromptKind::Question, "{what}");
-        assert_eq!(
-            why(&p.question_dialog.expect("the dialog")),
-            HEAD_CUT,
-            "{what}"
-        );
-        assert_eq!(worker_phase(&t), Phase::Prompt, "{what}");
-    };
-    let tail = grid.len() - 40;
-    assert!(
-        grid[tail].starts_with("         ") && tail > free.row,
-        "PRECONDITION: the tail begins inside the text: {:?}",
-        grid[tail]
-    );
-    cut_at(&grid, tail, "the 40-row tail");
-    let button = row_of(&grid, "Submit");
-    for from in free.row + 1..=button + 1 {
-        cut_at(&grid, from, &format!("typed, from row {from}"));
-    }
     let (cols, kept) = QUESTION_MULTI_REFLOW_LONG_KEPT_2_1_302[1];
     assert_eq!(cols, 41);
-    let (r, _, d) = read(kept);
+    let (_, _, d) = read(kept);
     let free = free_row(&d);
     assert!(!free.focused && free.checked == Some(true));
-    let button = row_of(&r, "❯    Submit");
-    assert!(
-        r[free.row + 1].starts_with("        o"),
-        "PRECONDITION: column 8"
-    );
-    for from in free.row + 1..=button + 1 {
-        cut_at(&r, from, &format!("after down, from row {from}"));
-    }
 }
 
 /// A multi-select cut at ANY row from its first option down to its divider
 /// is the dialog with its head off the screen, wherever the focus is: on an
-/// option (the pristine dialog at 37, 41 and 80 columns), in the typed text
-/// (41x60), or on `Submit` after `down` (the nine widths of
-/// `QUESTION_MULTI_REFLOW_LONG_KEPT_2_1_302`), all measured on Claude Code
-/// 2.1.302, and the 2.1.283 captures at 120 columns.
+/// option (the pristine dialog at 37, 41 and 80 columns) or in the typed text
+/// (41x60), all measured on Claude Code 2.1.302, and the 2.1.283 captures at
+/// 120 columns, one with the focus on `Submit`. The nine 2.1.302 widths with
+/// the focus on `Submit` after `down` are cut by
+/// `a_multi_select_cut_under_its_head_is_head_off_screen_at_every_swept_width`.
 #[test]
 fn a_multi_select_cut_at_any_row_under_its_head_is_head_off_screen() {
     let mut frames: Vec<(String, &str)> = vec![
@@ -925,9 +899,6 @@ fn a_multi_select_cut_at_any_row_under_its_head_is_head_off_screen() {
     for (cols, capture) in QUESTION_MULTI_PRISTINE_2_1_302 {
         frames.push((format!("pristine at {cols}"), capture));
     }
-    for (cols, capture) in QUESTION_MULTI_REFLOW_LONG_KEPT_2_1_302 {
-        frames.push((format!("Submit at {cols}"), capture));
-    }
     let mut buttons = 0;
     let mut misread: Vec<String> = Vec::new();
     for (what, capture) in frames {
@@ -948,8 +919,8 @@ fn a_multi_select_cut_at_any_row_under_its_head_is_head_off_screen() {
         );
     }
     assert_eq!(
-        buttons, 10,
-        "PRECONDITION: the focus on `Submit` in ten frames"
+        buttons, 1,
+        "PRECONDITION: the focus on `Submit` in one frame (2.1.283)"
     );
     assert!(
         misread.is_empty(),

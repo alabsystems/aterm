@@ -340,9 +340,6 @@ pub const fn heat_ic_stops(dark: bool) -> &'static [Rgb] {
 /// The heat steps' lower edges as fractions of max.
 pub const HEAT_EDGES: [f32; 6] = [0.05, 0.20, 0.40, 0.60, 0.80, 0.95];
 
-/// Hysteresis margin past a heat step's edge.
-pub const HEAT_HOLD: f32 = 0.01;
-
 /// The heat step (`0..=6`) of `v`, a fraction of max.
 #[inline]
 #[must_use]
@@ -355,21 +352,6 @@ pub fn heat_step(v: f32) -> u8 {
         }
     }
     step
-}
-
-/// The hysteresis-held heat step of `v` from `prev`.
-#[inline]
-#[must_use]
-pub fn heat_step_held(v: f32, prev: u8) -> u8 {
-    let up = heat_step(v - HEAT_HOLD);
-    let down = heat_step(v + HEAT_HOLD);
-    if up > prev {
-        up
-    } else if down < prev {
-        down
-    } else {
-        prev
-    }
 }
 
 /// Heat cell height in device px for `step` under Differentiate Without Color.
@@ -842,19 +824,6 @@ mod tests {
     const NORD_BAND: Rgb = [0x49, 0x4F, 0x5B];
 
     #[test]
-    fn equal_inks_hash_equally() {
-        use std::hash::BuildHasher;
-        let state =
-            std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
-        let a = vitals_inks(DEFAULT_DARK_BAND, DEFAULT_FG, DEFAULT_ACCENT);
-        let b = vitals_inks(DEFAULT_DARK_BAND, DEFAULT_FG, DEFAULT_ACCENT);
-        assert_eq!(a, b);
-        assert_eq!(state.hash_one(a), state.hash_one(b));
-        let light = vitals_inks(LIGHT_BAND, LIGHT_FG, LIGHT_ACCENT);
-        assert_ne!(state.hash_one(a), state.hash_one(light));
-    }
-
-    #[test]
     fn oklab_round_trips_srgb() {
         for c in [
             [0, 0, 0],
@@ -1041,12 +1010,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "not a reading")]
-    fn a_nan_is_never_a_held_heat_step() {
-        let _ = heat_step_held(f32::NAN, 3);
-    }
-
-    #[test]
     fn dwc_heights_follow_the_table() {
         for (cell, want) in [
             (8, [2, 3, 4, 5, 6, 7, 8]),
@@ -1067,23 +1030,6 @@ mod tests {
                     "cell {cell} step {k}"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn a_held_step_moves_only_a_point_past_an_edge() {
-        for v in [0.395, 0.40, 0.405] {
-            assert_eq!(heat_step_held(v, 2), 2, "{v} from 2");
-            assert_eq!(heat_step_held(v, 3), 3, "{v} from 3");
-        }
-        assert_eq!(heat_step_held(0.415, 2), 3);
-        assert_eq!(heat_step_held(0.385, 3), 2);
-        assert_eq!(heat_step_held(0.955, 0), 5);
-        assert_eq!(heat_step_held(0.97, 0), 6);
-        assert_eq!(heat_step_held(0.02, 6), 0);
-        assert_eq!(heat_step_held(0.045, 6), 1);
-        for v in [0.1, 0.3, 0.5, 0.7, 0.9] {
-            assert_eq!(heat_step_held(v, heat_step(v)), heat_step(v), "{v}");
         }
     }
 

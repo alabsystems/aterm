@@ -203,6 +203,7 @@ crates/aterm-json/tests/json.rs	value_display_is_compact	value-encoding
 crates/aterm-json/tests/json.rs	our_float_parsing_is_correctly_rounded	float-parse-correctly-rounded	
 crates/aterm-json/tests/json.rs	json_pointer	json-pointer-rfc6901	
 crates/aterm-json/tests/json.rs	index_sugar_is_total	index-total	
+crates/aterm-json/src/lib.rs	json_const_helpers_round_trip	recursion-limit	json-accepts-exactly-grammar
 ```
 
 ## 3. Coverage
@@ -232,19 +233,14 @@ crate's migration.)
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **Duplicate keys are mislabelled, and the crate doc overclaims.**
-   - The `deny_unknown_fields_denies` row `{"a":1,"b":"x","a":2}` ⇒ false has no unknown field.
-     serde_derive refuses it because the field is duplicated.
-   - The `{"v":1,"v":2}` row of `typed_deserialization_verdicts_and_values_are_pinned` is the same case.
-   - `src/lib.rs` says "duplicate keys are last-wins, which is serde_json's rule and what
-     `#[derive(Deserialize)]` does". Last-wins holds only for `Value`/`Map` (BTreeMap insert). Derived
-     structs refuse duplicates. Correct the doc and rename or relabel the rows. `deserializer-faithful` (b)
-     states the real rule: the Deserializer shows every key, and the visitor decides.
-2. **The recursion bound is off by one in the prose.** The test doc says "128 levels", and `lib.rs`
-   says "nesting is bounded (RECURSION_LIMIT, 128)". `Deserializer::enter` in `src/de.rs`
-   accepts 127 nested containers and refuses 128. The code comment says so too. The digest hides which
-   one the test asserts. `recursion-limit` states 127, and the crate docs should say "at most 127
-   nested containers".
+1. **Duplicate-key labelling clarified (resolved 2026-10-27).**
+   - `deny_unknown_fields_denies` documents that `{"a":1,"b":"x","a":2}` fails through the derived
+     struct visitor's duplicate-field guard rather than an unknown field.
+   - `deserializer-faithful` (b) states the real rule: the Deserializer shows every key, and the
+     visitor decides (`Value`/`Map` is last-wins; derived structs reject duplicates).
+2. **Recursion bound prose aligned with `127` (resolved 2026-10-27).** `de::RECURSION_LIMIT` (`128`)
+   and `lib::recursion_limit()` (`127`) both state that at most `127` nested containers are accepted
+   and `128` is refused, matching `recursion-limit`.
 3. **The digest sweeps pin agreement with a reference that is gone.** Each digest was "recorded
    when every verdict and every byte matched serde_json", but serde_json is no longer in the tree.
    - The spec those tests imply, agreement with serde_json, has no reference to state it against.
@@ -252,9 +248,9 @@ crate's migration.)
    - `json-accepts-exactly-grammar`, the float writers, `typed-integer-targets` and
      `string-escape-roundtrip` restate that agreement as grammar and denotation properties. The
      digests are not specs.
-4. **The lossless check cannot see the sign of zero.** The `parse` helper compares with `Value`'s
-   derived `PartialEq`, which treats 0.0 and -0.0 as equal. So it cannot catch a lost `-0.0`, which
-   the code calls load-bearing (`Num::NegZero`). `value-roundtrip` states bitwise float equality.
+4. **Lossless check now preserves `-0.0` sign bits (resolved 2026-10-27).** The `parse` helper in
+   `tests/json.rs` now recursively compares number classifications and `f64::to_bits` alongside
+   `PartialEq`, catching any loss of `-0.0` (`Num::NegZero`) as stated by `value-roundtrip`.
 5. **The shortest-digits sweep is close to a tautology, and one doc claim is unproved.**
    - In `a_power_of_two_gets_the_shortest_digits`, the digit-count assertion follows from the
      construction. `shortest_f64`/`shortest_f32` take their precision from `{:e}` and use the closest
@@ -271,13 +267,10 @@ crate's migration.)
    formatter. That needs Clean models of integer parsing, a correctly rounded dec2flt and shortest
    float formatting. Add a row to the audit §7 table (std numeric parse and format models), or factor
    the parse onto first-party code that Trust can import.
-7. **`-0` is not refused for every integer width, and a code doc overclaims.** The previous revision
-   of this file said `-0` is Err for every integer target. For `i128` it is not: `deserialize_wide`
-   (`src/de.rs`) runs `text.parse::<i128>()` on `-0` and calls `visit_i128(0)` before the NegZero
-   dispatch. `u128` still refuses it, because Rust's unsigned parse rejects `-`. The behaviour matches
-   serde_json and is pinned in the `scalar_integer_targets_are_pinned` digest, so `typed-integer-targets`
-   now states the i128 exception. The doc on `visit_number` ("`-0` goes to the visitor as the FLOAT
-   negative zero in every context, typed or not") overclaims and should name the i128 path.
+7. **`-0` `i128` path documented in `de.rs` and `typed-integer-targets` (resolved 2026-10-27).**
+   `deserialize_wide` (`src/de.rs`) parses `-0` as `i128` `0` before the `NegZero` dispatch (matching
+   `serde_json`), while `u128` and narrower integer targets reject `-0`. Both `visit_number`'s doc
+   and `typed-integer-targets` state the `i128` path explicitly.
 
 ## 6. The specs I would prove first (easiest, high value)
 

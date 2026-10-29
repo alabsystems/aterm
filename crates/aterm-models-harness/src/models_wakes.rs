@@ -14,6 +14,18 @@
 //! The callers judge what the book cannot: the need and `unless=` at the tell, the loop's guards
 //! at a claim, and a turn heard.
 //!
+//! A claim's line may be LEFT in the composer (the slice-2 plan's 2.9b): written and not
+//! submitted (`WriteLeft`), the claim stays the door's (`lk`), so no second claim is granted and
+//! no door writes over the draft (`comp`). The person or the policy's draft step sends it
+//! (`SubmitLeft`, the line typed, the session's submit count risen, `sub`), or it is cleared
+//! (`ClearLeft`); the loop's next look settles it: sent, told (`Write`); cleared unsent, the claim
+//! given back (`Release`), so `await wake` answers it. A successor that finds the claim's last row
+//! left keeps the claim for its own first look (`KeepLeft`); it cannot weigh its predecessor's
+//! count (each host process counts its own submits), so `sub = 2`: its look at a clear composer
+//! tells the claim whether the line was sent or cleared (`LeftWrite`'s `LookUncounted`), never
+//! gives it back. A send's count stops at 3, past what `OneTypedLine` allows, so
+//! `ReleaseOnLeft`'s loop stays a small graph.
+//!
 //! The room (`WakeRoom`): three sessions and one free build slot, their holds aged a < b < c. A
 //! line or an answer that needs a slot reserves it, the oldest waiting hold first; a holder's
 //! re-ask is granted against its own reservation and renews nothing; a reservation ends at its
@@ -54,6 +66,9 @@ pub fn wake_book_model() -> Model {
             var deaf = 0;
             var sneed = 0;
             var sfrom = 0;
+            var lk = 0;
+            var comp = 0;
+            var sub = 0;
 
             action DeclareOwn when (st == 0) { st = 1; }
             action DeclareOther {}
@@ -72,21 +87,27 @@ pub fn wake_book_model() -> Model {
             action Expire when (st > 0 && 6 > st) {
                 st = if (st == 4) { 6 } else { 7 };
                 blip = 0;
+                lk = 0;
+                sub = 0;
             }
             action Rm when (st > 0 && 7 > st) {
                 st = 7;
                 blip = 0;
+                lk = 0;
+                sub = 0;
             }
             action Take when (st > 0 && 7 > st) {
                 st = 7;
                 blip = 0;
+                lk = 0;
+                sub = 0;
             }
             action TurnRuns when (st == 4 && ran == 0) { ran = 1; }
             action WriteFails when (st == 3 && fails == 0) {
                 st = 2;
                 fails = 1;
             }
-            action CrashMidWrite when (st == 5 && midwrite == 0) {
+            action CrashMidWrite when (st == 5 && midwrite == 0 && lk == 0) {
                 st = if (answers > 0) { 4 } else { 2 };
                 typed = typed + 1;
                 midwrite = 1;
@@ -112,21 +133,38 @@ pub fn wake_book_model() -> Model {
             action Heard when (st == 4 && ran == 1) { st = 6; }
             action Claim when (
                 (st == 2 || (st == 4 && ran == 0)) && need == 1 && unl == 0 && Prompt == 1
-                    && Managed == 0 && door == 1 && brake == 0 && Hosted == 1
+                    && Managed == 0 && door == 1 && brake == 0 && Hosted == 1 && comp == 0
             ) {
                 st = 5;
                 sneed = need;
                 sfrom = 2;
             }
-            action Write when (st == 5) {
+            action Write when (st == 5 && (lk == 0 || (comp == 0 && sub > 0))) {
+                st = 6;
+                typed = if (lk == 0) { typed + 1 } else { typed };
+                lk = 0;
+                sub = 0;
+            }
+            action Release when (st == 5 && (lk == 0 || (lk == 1 && comp == 0 && sub == 0))) {
+                st = if (answers > 0) { 4 } else { 2 };
+                lk = 0;
+            }
+            action Reconcile when (st == 5 && lk == 0) {
                 st = 6;
                 typed = typed + 1;
             }
-            action Release when (st == 5) { st = if (answers > 0) { 4 } else { 2 }; }
-            action Reconcile when (st == 5) {
-                st = 6;
-                typed = typed + 1;
+            action WriteLeft when (st == 5 && lk == 0) {
+                lk = 1;
+                comp = 1;
+                sub = 0;
             }
+            action SubmitLeft when (comp == 1) {
+                comp = 0;
+                typed = if (3 > typed) { typed + 1 } else { typed };
+                sub = if (lk == 0) { 0 } else { if (sub == 2) { 2 } else { 1 } };
+            }
+            action ClearLeft when (comp == 1) { comp = 0; }
+            action KeepLeft when (st == 5 && lk == 1) { sub = 2; }
             action Unless when (unl == 1 && (st == 1 || st == 2)) {
                 st = 7;
                 blip = 0;
@@ -211,6 +249,14 @@ pub fn wake_book_model() -> Model {
                 sfrom = 2;
             }
 
+            action ReleaseOnLeft when (Buggy == 16 && st == 5 && lk == 0) {
+                st = if (answers > 0) { 4 } else { 2 };
+                comp = 1;
+            }
+            action KeepOnClear when (Buggy == 1 && st == 5 && lk == 1 && comp == 0 && sub == 0) {
+                lk = 2;
+            }
+
             invariant OnlyItsOwnTree: foreign == 0;
             invariant OneParkedWait: parked <= 1;
             invariant NeedAtTheTell: answers + typed == 0 || sneed == 1;
@@ -223,6 +269,7 @@ pub fn wake_book_model() -> Model {
             invariant NothingTypedUnderObserve: Prompt == 1 || typed == 0;
             invariant NoMissedEdge: missed == 0;
             invariant NoDeafWaiter: deaf == 0;
+            invariant AClearedLineGivesItsClaimBack: 2 > lk;
         }
     }
 }
@@ -246,6 +293,27 @@ pub fn wake_book_liveness() -> Liveness {
         weak: vec!["Answer", "WriteOk"],
         strong: vec![],
         mutants: vec!["ParkDeaf"],
+    }
+}
+
+/// `TheLeftClaimComesBack`, `[]<>(lk == 0 || comp == 1 || sub == 1)`: a claim whose line
+/// was left and then cleared unsent is given back at the next look, so the book reads the wake
+/// ready again and a parked `await wake` can be answered; one a successor cannot weigh is told
+/// there, so it never stands claimed.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+#[aterm_spec::liveness(wake_book_model)]
+pub fn wake_book_left_liveness() -> Liveness {
+    use aterm_spec::derive::{eq, int, or_, var};
+    Liveness {
+        name: "TheLeftClaimComesBack",
+        goal: or_(
+            or_(eq(var("lk"), int(0)), eq(var("comp"), int(1))),
+            eq(var("sub"), int(1)),
+        ),
+        weak: vec!["Release", "Write"],
+        strong: vec![],
+        mutants: vec!["KeepOnClear"],
     }
 }
 

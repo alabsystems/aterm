@@ -4075,9 +4075,14 @@ mod tests {
     fn random_token_is_64_hex_chars() {
         let t = random_token_hex().expect("entropy available");
         assert_eq!(t.len(), 64);
-        assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
-        let t2 = random_token_hex().expect("entropy available");
-        assert_ne!(t, t2);
+        assert!(
+            t.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        );
+        assert_eq!(
+            check_auth_line(&format!("AUTH {t}"), &t),
+            AuthOutcome::Ok(None)
+        );
     }
 
     /// `AUTH <token>` and `TOKEN <token> [verb]` admit the exact token only
@@ -5020,21 +5025,19 @@ mod tests {
             "younger than the margin: neither real socket is probed or touched"
         );
 
-        let mut orphan_gone = false;
-        for _ in 0..40 {
-            let report = sweep_stale_socket_files(&dir, Duration::ZERO, true).expect("dir listed");
-            assert!(
-                !report.removed.iter().any(|n| n == "live.sock"),
-                "a live listener is never swept"
-            );
-            if report.removed.iter().any(|n| n == "orphan.sock") {
-                orphan_gone = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        let orphan_name = orphan_path.to_string_lossy().into_owned();
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the dropped listener's socket refuses connections",
+            || (!socket_is_live(&orphan_name)).then_some(()),
+        );
+        let report = sweep_stale_socket_files(&dir, Duration::ZERO, true).expect("dir listed");
         assert!(
-            orphan_gone,
+            !report.removed.iter().any(|n| n == "live.sock"),
+            "a live listener is never swept"
+        );
+        assert!(
+            report.removed.iter().any(|n| n == "orphan.sock"),
             "a dropped listener's leftover must go once stale"
         );
         assert!(!present(&orphan_path));

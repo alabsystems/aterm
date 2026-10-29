@@ -495,23 +495,6 @@ pub enum Force {
     Normalized(f64),
 }
 
-impl Force {
-    /// Returns the force normalized to `0.0..=1.0`.
-    #[inline]
-    pub fn normalized(&self) -> f64 {
-        match self {
-            Force::Calibrated { force, max_possible_force, altitude_angle } => {
-                let force = match altitude_angle {
-                    Some(altitude_angle) => force / altitude_angle.sin(),
-                    None => *force,
-                };
-                force / max_possible_force
-            },
-            Force::Normalized(force) => *force,
-        }
-    }
-}
-
 /// Identifier for a specific analog axis on some device.
 pub type AxisId = u32;
 
@@ -681,22 +664,5 @@ mod tests {
                 assert_eq!(event2, Ok(expected), "variant and payload survive mapping");
             }
         })
-    }
-
-    #[test]
-    fn test_force_normalize() {
-        let force = event::Force::Normalized(0.0);
-        assert_eq!(force.normalized(), 0.0);
-
-        let force2 =
-            event::Force::Calibrated { force: 5.0, max_possible_force: 2.5, altitude_angle: None };
-        assert_eq!(force2.normalized(), 2.0);
-
-        let force3 = event::Force::Calibrated {
-            force: 5.0,
-            max_possible_force: 2.5,
-            altitude_angle: Some(std::f64::consts::PI / 2.0),
-        };
-        assert_eq!(force3.normalized(), 2.0);
     }
 }

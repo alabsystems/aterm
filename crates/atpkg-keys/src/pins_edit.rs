@@ -76,7 +76,7 @@ pub fn vet_key(key: &str) -> Result<(), String> {
             &key.len().to_string(),
         ]));
     }
-    if !key.ends_with('=') {
+    if !key.ends_with('=') || key[..KEY_B64_LEN - 1].contains('=') {
         return Err(concat(&[
             "refusing to write \"",
             key,
@@ -329,6 +329,9 @@ pub fn append_member(
 
     let mut entry = String::new();
     for line in comment {
+        if line.contains(['\r', '\n']) {
+            return Err("refusing a comment line containing a line break".to_string());
+        }
         entry.push_str(&anchor.indent);
         entry.push_str("// ");
         entry.push_str(line);
@@ -757,6 +760,14 @@ mod tests {
         assert_eq!(unpadded.len(), 44, "the fixture must be the right length");
         assert!(append_member(&src, FIXTURE, unpadded, &[], 4).is_err());
 
+        let double_padded = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+        assert_eq!(double_padded.len(), 44);
+        assert!(append_member(&src, FIXTURE, double_padded, &[], 4).is_err());
+
+        let interior_pad = "A=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        assert_eq!(interior_pad.len(), 44);
+        assert!(append_member(&src, FIXTURE, interior_pad, &[], 4).is_err());
+
         let bad_alphabet = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA \"=";
         assert_eq!(bad_alphabet.len(), 44);
         let err = append_member(&src, FIXTURE, bad_alphabet, &[], 4).unwrap_err();
@@ -805,6 +816,7 @@ mod tests {
         assert!(err.contains("could not be read back"), "{err}");
 
         assert!(append_member(&src, FIXTURE, NEW, &["two\nlines"], FIXTURE_MAX).is_err());
+        assert!(append_member(&src, FIXTURE, NEW, &["two\rlines"], FIXTURE_MAX).is_err());
     }
 
     #[test]

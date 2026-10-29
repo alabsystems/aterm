@@ -68,6 +68,12 @@ fn a_huge_map_hint_does_not_size_the_table() {
     ]);
     assert_eq!(m.get("k"), Some(&1));
     assert_eq!(m.len(), 1);
+    let max_buckets = (MAX_PREALLOC_BYTES / size_of::<(String, u32)>()) * 2;
+    assert!(
+        m.capacity() <= max_buckets,
+        "capacity {} came from the hint",
+        m.capacity()
+    );
 }
 
 #[derive(Debug, PartialEq, Deserialize)]
@@ -85,5 +91,11 @@ fn a_huge_hint_into_the_untagged_buffer_preallocates_at_most_the_cap() {
         Token::U8(7),
         Token::SeqEnd,
     ]);
+    let Buffered::Seq(ref inner) = v;
+    assert!(
+        inner.capacity() <= MAX_PREALLOC_BYTES,
+        "capacity {} came from the hint",
+        inner.capacity()
+    );
     assert_eq!(v, Buffered::Seq(vec![7]));
 }

@@ -102,11 +102,15 @@ fn deccolm_ignored_when_mode_40_is_reset() {
         (0, 3),
         "no cursor home when DECCOLM is gated off"
     );
-    let s2 = run(b"\x1b[?3h\x1b[1;999H");
+
+    let mut t = Terminal::new(24, 132);
+    t.process(b"\x1b[?3h");
+    let _ = t.take_response();
+    t.process(b"\x1b[?3$p");
     assert_eq!(
-        s2.cursor(),
-        (0, 79),
-        "still 80 columns when DECCOLM is gated off"
+        t.take_response().as_deref(),
+        Some(b"\x1b[?3;2$y".as_slice()),
+        "DECRQM reports 132-column mode still reset when ?40h was not set"
     );
 }
 
@@ -211,6 +215,14 @@ fn cht_forward_and_cbt_backward_tab_stops() {
 
 #[test]
 fn cbt_stops_at_the_left_margin_only_under_decom() {
+    let mut s = Screen::new(3, 40);
+    s.feed(b"\x1b[1;13H\x1b[Z");
+    assert_eq!(
+        s.cursor(),
+        (0, 8),
+        "DECLRMM reset, DECOM reset: CBT reaches the tab stop at column 8"
+    );
+
     let armed = b"\x1b[?69h\x1b[11;31s";
 
     let mut s = Screen::new(3, 40);
@@ -219,7 +231,15 @@ fn cbt_stops_at_the_left_margin_only_under_decom() {
     assert_eq!(
         s.cursor(),
         (0, 8),
-        "DECOM reset: CBT is unclamped and reaches the tab stop at column 8"
+        "DECLRMM set, DECOM reset: CBT is unclamped and reaches the tab stop at column 8"
+    );
+
+    let mut s = Screen::new(3, 40);
+    s.feed(b"\x1b[?69l\x1b[?6h\x1b[1;13H\x1b[Z");
+    assert_eq!(
+        s.cursor(),
+        (0, 8),
+        "DECLRMM reset, DECOM set: CBT is unclamped without DECLRMM and reaches column 8"
     );
 
     let mut s = Screen::new(3, 40);
@@ -228,7 +248,24 @@ fn cbt_stops_at_the_left_margin_only_under_decom() {
     assert_eq!(
         s.cursor(),
         (0, 10),
-        "DECOM set: CBT stops at the left margin instead of the stop at column 8"
+        "DECLRMM and DECOM both set: CBT clamps at the left margin instead of column 8"
+    );
+
+    // At the left margin (col 10) and strictly left of it (col 9, placed via VT52 direct
+    // cursor address while keeping DECLRMM and DECOM set), `back_tab_margin` stands still.
+    let mut s = Screen::new(3, 40);
+    s.feed(armed);
+    s.feed(b"\x1b[?6h\x1b[Z");
+    assert_eq!(
+        s.cursor(),
+        (0, 10),
+        "cursor at the left margin stands still under DECLRMM + DECOM"
+    );
+    s.feed(b"\x1b[?2l\x1bY\x20\x29\x1b<\x1b[Z");
+    assert_eq!(
+        s.cursor(),
+        (0, 9),
+        "cursor left of the margin (col 9 > stop 8) stands still under DECLRMM + DECOM"
     );
 }
 

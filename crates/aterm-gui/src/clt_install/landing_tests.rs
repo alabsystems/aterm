@@ -18,6 +18,7 @@ mod recovery_tests;
 thread_local! {
     static INSTALL_LAN_TRIGGERS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static INSTALL_EXTERNAL_PROBES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static INSTALL_FDA_DIALOG_UP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn external_installer_running() -> bool {
@@ -726,4 +727,252 @@ fn clt_landing_install_opens_the_tab_on_a_press() {
     assert!(!app.press_developer_tools_install(), "one tab at a time");
     app.headless = true;
     assert_eq!(tabs(&app), before + 1);
+}
+
+/// A person's Install… never waits behind a helper panel they cannot see (e2e145: with aterm in
+/// front the Accessibility panel was gone, its dialog guard held, and the press sat queued with
+/// nothing on screen to answer): the panel gives way, the guard (this process's real count of
+/// macOS dialogs) goes, and the press goes on at once.
+/// NEGATIVE CONTROL: an Install… that does not meet the panel first, or a give-way that keeps the
+/// guard, queues the press behind it (`Install::PressedQueued`).
+#[cfg(target_os = "macos")]
+#[test]
+fn clt_landing_a_press_never_waits_behind_a_panel_out_of_sight() {
+    use crate::devtools_helper::{Lane, Origin, Page, Reading, Show, Wake, test_arms};
+    use aterm_types::macos_setup::macos_dialog_up;
+    use std::time::Instant;
+
+    if !crate::test_alone::alone() {
+        return;
+    }
+    assert!(!macos_dialog_up());
+    let dir = aterm_tempfile::tempdir().expect("a config directory");
+    let mark = dir.path().join("command-line-tools-tab");
+    std::fs::write(&mark, "opened\n").expect("a mark from an earlier launch");
+    let (mut app, _) = page();
+    // No install of the run's own is due once the guard frees: the press alone opens the tab.
+    app.workstation_setup.developer_tools_mark = Mark::at(mark);
+    app.workstation_setup.developer_tools_probe = Some(|| false);
+    app.access_steps.set_reach(StepsReach {
+        holds_dialog: true,
+        dialog_up: macos_dialog_up,
+        ..StepsReach::INERT
+    });
+    // System Settings is not the active app: aterm is, where the press is made.
+    app.devtools_helper = Lane::windowed_with_fda_for_test(
+        test_arms::opening(),
+        test_arms::fda_opening(),
+        test_arms::counted(|_, _| true, |_| {}, || {}, || false),
+    );
+    let wake: Wake = std::sync::Arc::new(|| {});
+    let accessibility = Show {
+        page: Page::Accessibility,
+        origin: Origin::Settings,
+        reading: Reading::UNREAD,
+        listed: None,
+        bundle: None,
+        skips: false,
+        step: None,
+    };
+    assert!(
+        app.devtools_helper
+            .show(accessibility, Instant::now(), wake)
+    );
+    assert!(app.reserve_hand_over_dialog(Origin::Settings));
+    assert!(macos_dialog_up(), "the panel holds the window's guard");
+
+    app.headless = false;
+    let pressed = app.press_developer_tools_install();
+    app.headless = true;
+    assert!(app.devtools_helper.panel().is_none(), "it gave way");
+    assert!(
+        pressed
+            && matches!(
+                app.workstation_setup.developer_tools,
+                Install::Pressed | Install::Opened
+            ),
+        "{pressed}: {:?}",
+        app.workstation_setup.developer_tools
+    );
+}
+
+/// Pressing Install… while Full Disk Access holds the dialog slot queues the press, updates the
+/// Repositories row with why it waits, and opens the tab once the slot frees; negative control:
+/// the pre-C2 drop-press policy returns false, leaves no reason on the row, and opens nothing.
+#[test]
+fn clt_landing_a_press_during_full_disk_access_queues_with_reason_and_runs_once_the_slot_frees() {
+    use aterm_types::macos_setup::{
+        Access, COMMAND_LINE_TOOLS_MISSING, Observation, Standing, Subject,
+    };
+
+    let dir = aterm_tempfile::tempdir().expect("a config directory");
+    let mark = dir.path().join("command-line-tools-tab");
+    std::fs::write(&mark, "opened\n").expect("a mark from an earlier launch");
+    let (mut app, wid) = page();
+    app.workstation_setup.developer_tools_mark = Mark::at(mark);
+    app.access_steps.set_reach(StepsReach {
+        dialog_up: || INSTALL_FDA_DIALOG_UP.with(std::cell::Cell::get),
+        ..StepsReach::INERT
+    });
+    INSTALL_FDA_DIALOG_UP.with(|up| up.set(true));
+
+    let plan = Plan::default();
+    let mut status = app.system_state_host.latest_status().clone();
+    status.plan = Some(plan.clone());
+    status.observed_vault_url = Some(plan.vault_url.clone());
+    status.observed = vec![
+        Observation {
+            subject: Subject::Access(Access::FullDiskAccess),
+            standing: Standing::NeedsYou,
+            now: Some("Not confirmed".into()),
+            after_login: None,
+            wanted: Subject::Access(Access::FullDiskAccess).wanted().to_owned(),
+            note: None,
+            detail: None,
+        },
+        Observation {
+            subject: Subject::Setting(Setting::Repositories),
+            standing: Standing::NeedsYou,
+            now: None,
+            after_login: None,
+            wanted: Subject::Setting(Setting::Repositories).wanted().to_owned(),
+            note: Some(COMMAND_LINE_TOOLS_MISSING.into()),
+            detail: None,
+        },
+    ];
+    app.publish_system_state(status);
+    assert_eq!(
+        app.system_state_host.latest_status().developer_tools,
+        None,
+        "before the press, the row offers Install…"
+    );
+
+    // Negative control: dropping the press while a dialog is up refuses the press, leaves
+    // `developer_tools` at `None` (no reason on the row), and opens 0 tabs when the slot frees.
+    let drop_press = |dialog_up: bool| -> Option<ToolsInstall> {
+        if dialog_up {
+            None
+        } else {
+            Some(ToolsInstall::Password)
+        }
+    };
+    assert_eq!(
+        drop_press(true),
+        None,
+        "CONTROL: dropping the press gives no queued state or reason"
+    );
+
+    let before = tabs(&app);
+    app.headless = false;
+    assert!(
+        app.press_developer_tools_install(),
+        "a press during Full Disk Access is queued, not dropped"
+    );
+    assert!(
+        !app.press_developer_tools_install(),
+        "a second press while queued starts no duplicate request"
+    );
+    app.headless = true;
+
+    assert_eq!(tabs(&app), before, "no tab opens while FDA holds the slot");
+    assert_eq!(
+        app.workstation_setup.developer_tools,
+        Install::PressedQueued { wanted: Some(4) }
+    );
+    assert_eq!(
+        app.developer_tools_install_step(),
+        Some(ToolsInstall::Queued)
+    );
+    assert_eq!(
+        app.system_state_host.latest_status().developer_tools,
+        Some(ToolsInstall::Queued),
+        "System State republishes immediately so the Repositories row says why it waits"
+    );
+    assert!(
+        app.begin_developer_tools_install(|| Some(LINE.into()))
+            .is_none(),
+        "still held while Full Disk Access owns the dialog slot"
+    );
+
+    // Full Disk Access releases the dialog slot: the queued press runs even with `Mark::opened`.
+    INSTALL_FDA_DIALOG_UP.with(|up| up.set(false));
+    let (window, ask, then) = app
+        .begin_developer_tools_install(|| Some(LINE.into()))
+        .expect("the queued press dispatches once the dialog slot frees");
+    assert_eq!(window, wid);
+    assert_eq!(app.workstation_setup.developer_tools, Install::Pressed);
+    let id = test_support::book_as(&mut app, wid, &ask, then);
+    let (landed, read) = land(&mut app, wid, id);
+    assert!(landed);
+    assert_eq!(tabs(&app), before + 1);
+    assert_eq!(drain(&read), format!("exec {LINE}; exit $?\r").as_bytes());
+    assert_eq!(app.workstation_setup.developer_tools, Install::Opened);
+    assert_eq!(
+        app.developer_tools_install_step(),
+        Some(ToolsInstall::Password)
+    );
+    assert_eq!(
+        app.system_state_host.latest_status().developer_tools,
+        Some(ToolsInstall::Password)
+    );
+}
+
+/// A press queued behind another macOS dialog is no longer this moment's press, and its tab takes
+/// the window's keys: once the dialog slot frees, it still waits while the person types, and
+/// starts its one shell after 2.5 s of quiet keyboard, as the automatic tab does.
+/// NEGATIVE CONTROL: a queued press that ignores the keyboard dispatches while a key was just
+/// typed.
+#[test]
+fn clt_landing_a_queued_press_waits_for_a_quiet_keyboard_once_the_slot_frees() {
+    let dir = aterm_tempfile::tempdir().expect("a config directory");
+    let mark = dir.path().join("command-line-tools-tab");
+    std::fs::write(&mark, "opened\n").expect("a mark from an earlier launch");
+    let (mut app, wid) = page();
+    app.workstation_setup.developer_tools_mark = Mark::at(mark);
+    app.access_steps.set_reach(StepsReach {
+        dialog_up: || INSTALL_FDA_DIALOG_UP.with(std::cell::Cell::get),
+        ..StepsReach::INERT
+    });
+    INSTALL_FDA_DIALOG_UP.with(|up| up.set(true));
+    app.headless = false;
+    assert!(app.press_developer_tools_install(), "queued, not dropped");
+    app.headless = true;
+    assert_eq!(
+        app.workstation_setup.developer_tools,
+        Install::PressedQueued { wanted: Some(4) }
+    );
+
+    // The slot frees while the person types on the page.
+    INSTALL_FDA_DIALOG_UP.with(|up| up.set(false));
+    let before = tabs(&app);
+    let now = std::time::Instant::now();
+    app.last_keystroke_at = Some(now);
+    assert!(
+        app.begin_developer_tools_install(|| Some(LINE.into()))
+            .is_none(),
+        "a key typed just now holds the queued press"
+    );
+    assert_eq!(
+        app.workstation_setup.developer_tools,
+        Install::PressedQueued { wanted: Some(4) },
+        "the press stays queued"
+    );
+    assert_eq!(
+        app.developer_tools_install_step(),
+        Some(ToolsInstall::Queued)
+    );
+
+    // The keyboard rests: the queued press books its one shell, which lands once.
+    app.last_keystroke_at = now.checked_sub(std::time::Duration::from_secs(3));
+    let (window, ask, then) = app
+        .begin_developer_tools_install(|| Some(LINE.into()))
+        .expect("the queued press dispatches once the keyboard is quiet");
+    assert_eq!(window, wid);
+    assert_eq!(app.workstation_setup.developer_tools, Install::Pressed);
+    let id = test_support::book_as(&mut app, wid, &ask, then);
+    let (landed, read) = land(&mut app, wid, id);
+    assert!(landed);
+    assert_eq!(tabs(&app), before + 1);
+    assert_eq!(drain(&read), format!("exec {LINE}; exit $?\r").as_bytes());
+    assert_eq!(app.workstation_setup.developer_tools, Install::Opened);
 }

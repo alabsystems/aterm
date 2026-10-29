@@ -29,6 +29,7 @@ fn the_sparkle_glitter_train_outlives_the_keystroke_that_follows_it() {
             hue: 0.5,
             cov_scale: 1.0,
             born: t1,
+            edge_cut: false,
         });
     }
     let (rx, ry) = g.cell_center(2, 9);
@@ -42,6 +43,7 @@ fn the_sparkle_glitter_train_outlives_the_keystroke_that_follows_it() {
         hue: 0.5,
         cov_scale: 1.0,
         born: t1,
+        edge_cut: false,
     });
     let mut rewritten = row;
     rewritten[6] = 's';

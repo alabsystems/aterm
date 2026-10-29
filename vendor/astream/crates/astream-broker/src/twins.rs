@@ -251,6 +251,50 @@ pub const fn tail_skip_clamp(cand_skip: u64, vis_head: u64) -> u64 {
     }
 }
 
+/// `rate_tokens_clamp` as `rate_island.rs` defines it in Clean:
+/// `if cand_tokens < burst then cand_tokens else burst`.
+#[must_use]
+pub const fn rate_tokens_clamp(cand_tokens: u64, burst: u64) -> u64 {
+    if cand_tokens < burst {
+        cand_tokens
+    } else {
+        burst
+    }
+}
+
+/// `rate_clock_advance` as `rate_island.rs` defines it in Clean:
+/// `if prev_ms < now_ms then now_ms else prev_ms`.
+#[must_use]
+pub const fn rate_clock_advance(prev_ms: u64, now_ms: u64) -> u64 {
+    if prev_ms < now_ms {
+        now_ms
+    } else {
+        prev_ms
+    }
+}
+
+/// `federation_cursor_advance` as `federation_island.rs` defines it in Clean:
+/// `if cur_cursor < next_cursor then next_cursor else cur_cursor`.
+#[must_use]
+pub const fn federation_cursor_advance(cur_cursor: u64, next_cursor: u64) -> u64 {
+    if cur_cursor < next_cursor {
+        next_cursor
+    } else {
+        cur_cursor
+    }
+}
+
+/// `federation_seq_clamp` as `federation_island.rs` defines it in Clean:
+/// `if src_offset < max_seq then src_offset else max_seq`.
+#[must_use]
+pub const fn federation_seq_clamp(src_offset: u64, max_seq: u64) -> u64 {
+    if src_offset < max_seq {
+        src_offset
+    } else {
+        max_seq
+    }
+}
+
 #[cfg(test)]
 #[path = "../../astream-wire/twin_answers.rs"]
 mod twin_answers;
@@ -364,6 +408,16 @@ mod tests {
         assert_eq!(answers(|[a, b]| super::at_rest_version_advance(a, b)), want);
         assert_eq!(answers(|[a, b]| crate::tail_wake_head_advance(a, b)), want);
         assert_eq!(answers(|[a, b]| super::tail_wake_head_advance(a, b)), want);
+        assert_eq!(answers(|[a, b]| crate::rate_clock_advance(a, b)), want);
+        assert_eq!(answers(|[a, b]| super::rate_clock_advance(a, b)), want);
+        assert_eq!(
+            answers(|[a, b]| crate::federation_cursor_advance(a, b)),
+            want
+        );
+        assert_eq!(
+            answers(|[a, b]| super::federation_cursor_advance(a, b)),
+            want
+        );
         let want = "000011012";
         assert_eq!(answers(|[a, b]| crate::sharded_clamp_index(a, b)), want);
         assert_eq!(answers(|[a, b]| super::sharded_clamp_index(a, b)), want);
@@ -371,6 +425,10 @@ mod tests {
         assert_eq!(answers(|[a, b]| super::broker_batch_clamp(a, b)), want);
         assert_eq!(answers(|[a, b]| crate::tail_skip_clamp(a, b)), want);
         assert_eq!(answers(|[a, b]| super::tail_skip_clamp(a, b)), want);
+        assert_eq!(answers(|[a, b]| crate::rate_tokens_clamp(a, b)), want);
+        assert_eq!(answers(|[a, b]| super::rate_tokens_clamp(a, b)), want);
+        assert_eq!(answers(|[a, b]| crate::federation_seq_clamp(a, b)), want);
+        assert_eq!(answers(|[a, b]| super::federation_seq_clamp(a, b)), want);
     }
 
     // Not vacuous: `group_commit_monotone` with its branches swapped answers otherwise.

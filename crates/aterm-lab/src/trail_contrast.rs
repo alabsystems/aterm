@@ -38,10 +38,10 @@ usage: targo --unverified lab trail-contrast <png> [--find TEXT]... [--cells ROW
          [--newest N] [--min X] [--newest-min X] [--caret-min X] [--dims FILE | --origin X,Y --cell WxH]
          [--text FILE] [--clean PNG | --no-clean] [--cursor FILE | --caret ROW,COL] [--page RRGGBB]
 
-The WCAG contrast of the cells of an aterm capture, as JSON: the grid (from the frame's <stem>.dims.txt sidecar, --dims,
-or --origin and --cell), the page colour, one line per measured glyph cell (--find: each glyph of every occurrence of
-TEXT in the screen text; --cells and --row: cells by number; none: every glyph on screen), the caret cell against the
-page with the --newest N (3) glyphs left of it, and diff_vs_clean, the pixels the effects changed outside the caret cell.
+The WCAG contrast of the cells of an aterm capture, as JSON: the grid (from the frame's own <stem>.<frame>.dims.txt or its <stem>.dims.txt sidecar, --dims,
+or --origin and --cell), the page colour (the grid's most common colour, or --page), one line per measured glyph cell (--find: each glyph of every occurrence of
+TEXT in the screen text; --cells and --row: cells by number; none: every glyph on screen), the caret (its ink against the
+closer of the page and the halo it sits in) with the --newest N (3) glyphs left of it, and diff_vs_clean, the pixels the effects changed outside the caret cell.
 With the frame's clean twin (<stem>.<frame>.clean.png, `image clean`) a glyph's ink and ground are the pixels that are
 glyph core and pure ground in the twin, read from the frame, so a halo or a ribbon under the glyph counts against it;
 clean_contrast is the same glyph with no effect drawn. local_contrast judges each solid ink pixel against the ground next
@@ -52,8 +52,8 @@ counts where the whole cell's median ground would hide it; local_min is its wors
 twin (--no-clean) the coarser `extreme` method is used.
 The sidecars trail-gallery writes (.text.txt, .cursor.txt, .clean.png, .dims.txt) are read when present.
 
-exit: 0; 1 a threshold failed (--min: a selected cell, --newest-min: a glyph left of the caret, --caret-min: the caret
-against the page; each named in `failures`); 2 a usage, file or decoding error
+exit: 0; 1 a threshold failed (--min: a selected cell, --newest-min: a glyph left of the caret, --caret-min: the caret's
+ink against its ground; each named in `failures`); 2 a usage, file or decoding error
 ";
 
 /// An sRGB colour.
@@ -254,6 +254,20 @@ impl Image {
     pub fn most_common(&self) -> Rgb {
         mode(self.px.iter().copied()).unwrap_or([0, 0, 0])
     }
+}
+
+/// The page the cells lie on: the most common colour of the grid's own pixels, else the frame's.
+/// A terminal's grid fills its frame, so the two agree; a Settings frame's grid is its cursor
+/// scene card, a small part of a window whose most common colour is the window's chrome.
+#[must_use]
+pub fn grid_page(frame: &Image, grid: &Grid) -> Rgb {
+    let cells = PxBox {
+        x0: grid.ox,
+        y0: grid.oy,
+        x1: grid.ox + grid.cols * grid.cw,
+        y1: grid.oy + grid.rows * grid.ch,
+    };
+    mode(frame.region(cells)).unwrap_or_else(|| frame.most_common())
 }
 
 /// Where the cells are, in pixels.
@@ -653,6 +667,17 @@ fn judged(cell: &J) -> Option<f64> {
     )
 }
 
+/// The least share of the caret's cell its ink must cover to be read as the caret: under it (a speck,
+/// a thin tail) the caret reads as every lit pixel of the cell, as a plain wash does.
+pub const CARET_INK_SHARE: f64 = 0.125;
+
+/// The caret's reading. Its ink is the lit pixels within the geometric half of the peak's ratio to the page
+/// (`sqrt(peak)`), when they cover [`CARET_INK_SHARE`] of the cell; its ground is the median of the cell's
+/// other pixels when they outnumber the ink (a halo the ink sits in), else the page (they are the ink's own
+/// soft edge). `contrast` is the ink's median against the closer of page and ground, so an icon caret
+/// (Laser's bolt) reads by the bolt and not by the halo round it, and still reads low when its halo nearly
+/// matches it. `wash_contrast` is the median of every lit pixel against the page (the reading before the
+/// ink was told from its halo).
 fn measure_caret(frame: &Image, grid: &Grid, row: i64, col: i64, page: Rgb) -> J {
     let pixels = frame.region(grid.cell_box(row, col, 1));
     let lit: Vec<Rgb> = pixels
@@ -666,22 +691,35 @@ fn measure_caret(frame: &Image, grid: &Grid, row: i64, col: i64, page: Rgb) -> J
         ("col", J::Int(col)),
         ("coverage", J::Float(round_to(coverage, 3))),
     ]);
-    match median(&lit) {
-        None => {
-            out.set("colour", J::Null);
-            out.set("contrast", J::Null);
-            out.set("peak_contrast", J::Null);
+    let Some(wash) = median(&lit) else {
+        for k in ["colour", "contrast", "peak_contrast", "wash_contrast"] {
+            out.set(k, J::Null);
         }
-        Some(colour) => {
-            let peak = lit
-                .iter()
-                .map(|&p| contrast(p, page))
-                .fold(f64::MIN, f64::max);
-            out.set("colour", J::s(hex(colour)));
-            out.set("contrast", J::Float(round_to(contrast(colour, page), 2)));
-            out.set("peak_contrast", J::Float(round_to(peak, 2)));
+        return out;
+    };
+    let peak = lit
+        .iter()
+        .map(|&p| contrast(p, page))
+        .fold(f64::MIN, f64::max);
+    let ink_floor = peak.sqrt().max(CARET_DIFF);
+    let (ink, rest): (Vec<Rgb>, Vec<Rgb>) = pixels
+        .iter()
+        .partition(|&&p| contrast(p, page) >= ink_floor);
+    let share = ink.len() as f64 / pixels.len().max(1) as f64;
+    let (colour, ground, share) = match median(&ink) {
+        Some(c) if share >= CARET_INK_SHARE => {
+            let halo = (rest.len() > ink.len()).then(|| median(&rest)).flatten();
+            (c, halo.unwrap_or(page), share)
         }
-    }
+        _ => (wash, page, coverage),
+    };
+    let reading = contrast(colour, page).min(contrast(colour, ground));
+    out.set("colour", J::s(hex(colour)));
+    out.set("ground", J::s(hex(ground)));
+    out.set("ink_share", J::Float(round_to(share, 3)));
+    out.set("contrast", J::Float(round_to(reading, 2)));
+    out.set("peak_contrast", J::Float(round_to(peak, 2)));
+    out.set("wash_contrast", J::Float(round_to(contrast(wash, page), 2)));
     out
 }
 
@@ -718,6 +756,13 @@ pub fn diff_vs_clean(frame: &Image, clean: &Image, caret: Option<PxBox>) -> J {
             bbox.map_or(J::Null, |b| J::Arr(b.iter().map(|&v| J::Int(v)).collect())),
         ),
     ])
+}
+
+/// The dims reply that places `png`'s cells: its own (`<stem>.<frame>.dims.txt`, a grid that is the frame's alone,
+/// as a settings page's cursor scene card is), else its capture's (`<stem>.dims.txt`); only when one exists.
+#[must_use]
+pub fn frame_dims(png: &Path) -> Option<PathBuf> {
+    sidecar(png, ".dims.txt", true).or_else(|| sidecar(png, ".dims.txt", false))
 }
 
 /// `<stem>.<frame>.png` -> `<stem>.<frame><suffix>` (`per_frame`), else `<stem><suffix>`; only when that file exists.
@@ -961,7 +1006,7 @@ pub fn report(a: &Args) -> Result<J, String> {
         .dims
         .as_deref()
         .map(|d| PathBuf::from(from_caller(d)))
-        .or_else(|| sidecar(&png, ".dims.txt", false));
+        .or_else(|| frame_dims(&png));
     let grid = frame_grid(&frame, a.origin.as_deref(), a.cell.as_deref(), dims)?;
 
     let clean = if a.no_clean {
@@ -1004,7 +1049,7 @@ pub fn report(a: &Args) -> Result<J, String> {
 
     let page = match &a.page {
         Some(p) => parse_hex(p)?,
-        None => frame.most_common(),
+        None => grid_page(&frame, &grid),
     };
 
     let mut targets: Vec<Target> = Vec::new();

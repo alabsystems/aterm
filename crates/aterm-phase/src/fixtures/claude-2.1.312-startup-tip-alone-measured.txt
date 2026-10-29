@@ -1,0 +1,11 @@
+# claude-code 2.1.312 · MEASURED 2026-10-27, `aterm ctl text` of aterm's jailed real-Claude lab (100x50, aterm 0.145.0 dev build e725d40263, Autopilot Cruise) running the real Claude Code 2.1.312 against a stub API: the emergency tip (persistent, color warning) with no slot at all; cachedGrowthBookFeatures = {tengu-top-of-feed-tip: {tip, color warning, persistent true}} alone; no startup announcement, no companyAnnouncements, no DISABLE_PROMPT_CACHING
+ ▐▛███▛█   Claude Code v2.1.312
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.AyU2/proj
+
+  Lab emergency tip: a persistent warning-colored tip whose words wrap at sixty columns.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                           ◐ medium · /effort

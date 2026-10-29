@@ -32,29 +32,33 @@ impl XConnection {
         let atoms = self.atoms();
 
         let owner = self.request(xproto::get_selection_owner(xsettings_screen))?;
+        if owner.owner == aterm_x11::proto::NONE {
+            return Ok(None);
+        }
 
         let data: Vec<u8> =
             self.get_property(owner.owner, atoms[_XSETTINGS_SETTINGS], atoms[_XSETTINGS_SETTINGS])?;
 
-        let dpi_setting = read_settings(&data)?
-            .find(|res| res.as_ref().map_or(true, |s| s.name == DPI_NAME))
-            .transpose()?;
-        if let Some(dpi_setting) = dpi_setting {
-            let base_dpi = match dpi_setting.data {
-                SettingData::Integer(dpi) => dpi as f64,
-                SettingData::String(_) => {
-                    return Err(ParserError::BadType(SettingType::String).into())
-                },
-                SettingData::Color(_) => {
-                    return Err(ParserError::BadType(SettingType::Color).into())
-                },
-            };
-
-            Ok(Some(base_dpi / DPI_MULTIPLIER))
-        } else {
-            Ok(None)
-        }
+        Ok(dpi_from_settings(&data)?)
     }
+}
+
+fn dpi_from_settings(data: &[u8]) -> Result<Option<f64>> {
+    let dpi_setting = read_settings(data)?
+        .find(|res| res.as_ref().map_or(true, |s| s.name == DPI_NAME))
+        .transpose()?;
+    let Some(dpi_setting) = dpi_setting else {
+        return Ok(None);
+    };
+    let dpi = match dpi_setting.data {
+        SettingData::Integer(dpi) => dpi,
+        SettingData::String(_) => return Err(ParserError::BadType(SettingType::String)),
+        SettingData::Color(_) => return Err(ParserError::BadType(SettingType::Color)),
+    };
+    if dpi <= 0 {
+        return Ok(None);
+    }
+    Ok(Some(f64::from(dpi) / DPI_MULTIPLIER))
 }
 
 fn read_settings(data: &[u8]) -> Result<impl Iterator<Item = Result<Setting<'_>>> + '_> {
@@ -94,8 +98,8 @@ impl<'a> Setting<'a> {
         let ty: SettingType = parser.i8()?.try_into()?;
         parser.advance(1)?;
 
-        let name_len = parser.i16()?;
-        let name = parser.advance(name_len as usize)?;
+        let name_len = usize::from(parser.u16()?);
+        let name = parser.advance(name_len)?;
         parser.pad(name.len(), 4)?;
 
         parser.advance(4)?;
@@ -105,7 +109,9 @@ impl<'a> Setting<'a> {
 
             SettingType::String => {
                 let data_len = parser.i32()?;
-                let data = parser.advance(data_len as usize)?;
+                let data_len =
+                    usize::try_from(data_len).map_err(|_| ParserError::NegativeCount(data_len))?;
+                let data = parser.advance(data_len)?;
                 parser.pad(data.len(), 4)?;
 
                 SettingData::String(data)
@@ -194,6 +200,16 @@ impl<'a> Parser<'a> {
             match self.endianness {
                 Endianness::Big => i16::from_be_bytes(*bytes),
                 Endianness::Little => i16::from_le_bytes(*bytes),
+            }
+        })
+    }
+
+    fn u16(&mut self) -> Result<u16> {
+        self.advance(2).map(|s| {
+            let bytes: &[u8; 2] = s.try_into().unwrap();
+            match self.endianness {
+                Endianness::Big => u16::from_be_bytes(*bytes),
+                Endianness::Little => u16::from_le_bytes(*bytes),
             }
         })
     }
@@ -307,6 +323,44 @@ mod tests {
         assert_string(&rgba.data, "rgb");
         let lcd = settings.iter().find(|s| s.name == b"Xft/Lcdfilter").unwrap();
         assert_string(&lcd.data, "lcddefault");
+        assert_eq!(dpi_from_settings(&data).unwrap(), Some(96.0));
+    }
+
+    #[test]
+    fn negative_or_zero_dpi_and_malformed_lengths_are_handled() {
+        for raw_dpi in [-1i32, 0] {
+            let mut buf = vec![LITTLE_ENDIAN, 0, 0, 0, 0, 0, 0, 0];
+            buf.extend_from_slice(&1i32.to_le_bytes());
+            buf.extend_from_slice(&[0, 0]); // SettingType::Integer + pad
+            buf.extend_from_slice(&(DPI_NAME.len() as u16).to_le_bytes());
+            buf.extend_from_slice(DPI_NAME);
+            buf.push(0); // pad to 4
+            buf.extend_from_slice(&0u32.to_le_bytes()); // serial
+            buf.extend_from_slice(&raw_dpi.to_le_bytes());
+            assert_eq!(dpi_from_settings(&buf).unwrap(), None);
+        }
+
+        // Unsigned CARD16 name_len >= 0x8000 reports its true expected byte count rather than sign-extending.
+        let mut big_name = vec![LITTLE_ENDIAN, 0, 0, 0, 0, 0, 0, 0];
+        big_name.extend_from_slice(&1i32.to_le_bytes());
+        big_name.extend_from_slice(&[0, 0]);
+        big_name.extend_from_slice(&0x8000u16.to_le_bytes());
+        let mut settings = read_settings(&big_name).unwrap();
+        assert!(matches!(
+            settings.next(),
+            Some(Err(ParserError::NoMoreBytes { expected, found: 0 })) if expected.get() == 0x8000
+        ));
+
+        // Negative i32 string length is rejected as NegativeCount rather than sign-extending.
+        let mut neg_str = vec![LITTLE_ENDIAN, 0, 0, 0, 0, 0, 0, 0];
+        neg_str.extend_from_slice(&1i32.to_le_bytes());
+        neg_str.extend_from_slice(&[1, 0]); // SettingType::String + pad
+        neg_str.extend_from_slice(&4u16.to_le_bytes());
+        neg_str.extend_from_slice(b"test");
+        neg_str.extend_from_slice(&0u32.to_le_bytes()); // serial
+        neg_str.extend_from_slice(&(-1i32).to_le_bytes());
+        let mut settings = read_settings(&neg_str).unwrap();
+        assert!(matches!(settings.next(), Some(Err(ParserError::NegativeCount(-1)))));
     }
 
     fn assert_string(dat: &SettingData<'_>, s: &str) {

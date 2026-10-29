@@ -10,7 +10,7 @@ use serde::de::{self, IntoDeserializer as _, Visitor};
 
 use crate::error::{Error, Result};
 
-/// Maximum container nesting depth (`128`, matching `serde_json`).
+/// Container recursion threshold (`128`, matching `serde_json`); at most `127` nested containers are accepted.
 pub const RECURSION_LIMIT: u32 = 128;
 
 /// JSON deserializer over a byte slice.
@@ -362,6 +362,7 @@ impl<'de> Deserializer<'de> {
     }
 
     /// Hand a parsed number to `visitor`.
+    /// Note that `i128` targets go through [`Self::deserialize_wide`], which accepts `-0` as `0` before [`Self::dispatch`].
     fn visit_number<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value> {
         let parsed = self.parse_number()?;
         Self::dispatch(parsed.value, visitor)

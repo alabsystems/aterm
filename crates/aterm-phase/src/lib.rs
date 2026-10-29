@@ -6,6 +6,7 @@
 pub mod agents_panel;
 pub mod agy;
 pub mod anchors;
+pub mod announcement;
 pub mod auto_mode;
 pub mod autocompact;
 pub mod codex;
@@ -37,9 +38,14 @@ mod vendor_drift;
 mod vendor_files;
 
 pub use anchors::{ANCHORS, anchor, anchor_text};
+pub use announcement::{
+    AnnouncementPlace, AnnouncementScan, BAR as ANNOUNCEMENT_BAR, announcement_scan,
+    announcement_scrolled, announcement_unmoved,
+};
 pub use autocompact::{Offer, OfferFocus};
 pub use harness_version::{
-    CliHarness, HarnessVersion, SHARED_LANE, cli_version_core, cli_version_later,
+    CliHarness, HarnessVersion, SHARED_LANE, cli_build_later, cli_version_build, cli_version_core,
+    cli_version_later, cli_version_offered,
 };
 pub use login::{
     LoginAtWall, LoginMethod, LoginScreen, Picker as LoginPicker, login_at_wall, login_interrupted,
@@ -70,8 +76,8 @@ pub use reader::{
 };
 pub use reset::{
     ConfirmRead, ResetConfirm, ResetKind, ResetLine, ResetPending, ResetRow, reset_confirm,
-    reset_limit_name, reset_line, reset_pending, reset_row, reset_title, spends_reset,
-    uses_a_reset,
+    reset_limit_name, reset_limit_names, reset_line, reset_pending, reset_row, reset_title,
+    spends_reset, uses_a_reset,
 };
 pub use survey::{SurveyBlock, SurveyKind, survey_block};
 pub use turn::{

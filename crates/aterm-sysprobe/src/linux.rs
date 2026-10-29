@@ -62,7 +62,7 @@ pub fn swap_pages(vmstat: &str) -> Option<u64> {
     Some(keyed(vmstat, "pswpin")?.saturating_add(keyed(vmstat, "pswpout")?))
 }
 
-/// One value of a binary auxiliary vector (`/proc/self/auxv`).
+/// One value of a binary auxiliary vector (`/proc/self/auxv`), ended by `AT_NULL` (`0`).
 #[must_use]
 pub fn auxv_value(bytes: &[u8], key: u64) -> Option<u64> {
     const W: usize = std::mem::size_of::<usize>();
@@ -72,10 +72,13 @@ pub fn auxv_value(bytes: &[u8], key: u64) -> Option<u64> {
         u64::try_from(usize::from_ne_bytes(a)).unwrap_or(u64::MAX)
     };
     let (pairs, _) = bytes.as_chunks::<{ 2 * W }>();
-    pairs.iter().find_map(|pair| {
-        let k = word(&pair[..W]);
-        (k == key).then(|| word(&pair[W..]))
-    })
+    pairs
+        .iter()
+        .take_while(|pair| word(&pair[..W]) != 0)
+        .find_map(|pair| {
+            let k = word(&pair[..W]);
+            (k == key).then(|| word(&pair[W..]))
+        })
 }
 
 /// The process group (`pgrp`, the fifth field) of a `/proc/<pid>/stat` line.
@@ -514,9 +517,9 @@ pub fn parse_inet_diag_rtts_seq(
     rtts: &mut Vec<f32>,
 ) -> Option<bool> {
     let mut off = 0usize;
-    while off + NLMSG_HDRLEN <= buf.len() {
+    while off <= buf.len() && buf.len() - off >= NLMSG_HDRLEN {
         let nlmsg_len = u32::from_ne_bytes(buf.get(off..off + 4)?.try_into().ok()?) as usize;
-        if nlmsg_len < NLMSG_HDRLEN || off + nlmsg_len > buf.len() {
+        if nlmsg_len < NLMSG_HDRLEN || nlmsg_len > buf.len() - off {
             return None;
         }
         let nlmsg_type = u16::from_ne_bytes(buf.get(off + 4..off + 6)?.try_into().ok()?);
@@ -564,11 +567,11 @@ pub fn parse_inet_diag_rtts_seq(
                 _ => {}
             }
         }
-        let step = nlmsg_len.next_multiple_of(4);
-        if off.saturating_add(step) <= off {
+        let step = nlmsg_len.checked_next_multiple_of(4)?;
+        if step > buf.len() - off {
             break;
         }
-        off = off.saturating_add(step);
+        off += step;
     }
     Some(false)
 }
@@ -979,12 +982,24 @@ pub fn throttle_level(zones: &[Zone], counters_rose: Option<bool>) -> Result<Thr
     })
 }
 
-/// A process's memory from `/proc/<pid>/status`.
+/// A process's memory from `/proc/<pid>/status`: its anonymous pages in memory and swapped
+/// (`RssAnon + VmSwap`), bytes.
 #[must_use]
 pub fn status_footprint(text: &str) -> Option<u64> {
+    status_memory(text).map(|(footprint, _)| footprint)
+}
+
+/// A process's memory from `/proc/<pid>/status`, bytes: its footprint ([`status_footprint`])
+/// and its anonymous pages in memory now (`RssAnon`), its resident figure: below the footprint
+/// by what was swapped. `None` where it names no anonymous memory (a kernel thread).
+#[must_use]
+pub fn status_memory(text: &str) -> Option<(u64, u64)> {
     let anon = keyed(text, "RssAnon")?;
     let swap = keyed(text, "VmSwap").unwrap_or(0);
-    Some(anon.saturating_add(swap).saturating_mul(1024))
+    Some((
+        anon.saturating_add(swap).saturating_mul(1024),
+        anon.saturating_mul(1024),
+    ))
 }
 
 /// The most bytes of one `/proc/<pid>/status` [`Root::processes`] reads.
@@ -1472,21 +1487,21 @@ impl Root {
         (pick < readings.len()).then(|| readings.swap_remove(pick))
     }
 
-    /// Process `pid`'s footprint from its `status` ([`status_footprint`]):
-    /// `Some(Some(bytes))`; `Some(None)` when the file is past
-    /// [`STATUS_CAP`] (the footprint is unknown, and no other figure stands
-    /// in for it); `None` when it is unreadable or names no anonymous
-    /// memory (a kernel thread), for the caller's fallback.
-    fn status_footprint(&self, pid: u32) -> Option<Option<u64>> {
+    /// Process `pid`'s footprint and resident anonymous pages from its `status`
+    /// ([`status_memory`]): `Some(Some(bytes))`; `Some(None)` when the file is past
+    /// [`STATUS_CAP`] (both are unknown, and no other figure stands in for
+    /// them); `None` when it is unreadable or names no anonymous memory (a
+    /// kernel thread), for the caller's fallback.
+    fn status_memory(&self, pid: u32) -> Option<Option<(u64, u64)>> {
         let path = self.at(&format!("proc/{pid}/status"));
         let mut buf = [0u8; crate::READ_CAP];
         let (n, cut) = crate::read_into(&path, &mut buf).ok()?;
         if !cut {
-            return status_footprint(crate::utf8_prefix(&buf[..n])).map(Some);
+            return status_memory(crate::utf8_prefix(&buf[..n])).map(Some);
         }
         let mut whole = vec![0u8; STATUS_CAP];
         match crate::read_into(&path, &mut whole).ok()? {
-            (n, false) => status_footprint(crate::utf8_prefix(&whole[..n])).map(Some),
+            (n, false) => status_memory(crate::utf8_prefix(&whole[..n])).map(Some),
             (_, true) => Some(None),
         }
     }
@@ -1519,14 +1534,19 @@ impl Root {
             let read_at = Some(std::time::Instant::now());
             let ticks = stat.utime.saturating_add(stat.stime);
             let ns = u128::from(ticks) * 1_000_000_000 / u128::from(hz);
-            let footprint = if stat.kernel_thread() {
-                Some(0)
+            let (footprint, resident) = if stat.kernel_thread() {
+                (Some(0), None)
             } else {
-                let footprint = self.status_footprint(pid).unwrap_or_else(|| {
-                    self.read(&format!("proc/{pid}/statm"), parse_statm_resident)
-                        .flatten()
-                        .map(|pages| pages.saturating_mul(page_bytes))
-                });
+                let (footprint, resident) = match self.status_memory(pid) {
+                    Some(Some((footprint, anon))) => (Some(footprint), Some(anon)),
+                    Some(None) => (None, None),
+                    None => (
+                        self.read(&format!("proc/{pid}/statm"), parse_statm_resident)
+                            .flatten()
+                            .map(|pages| pages.saturating_mul(page_bytes)),
+                        None,
+                    ),
+                };
                 let Some(confirm) = self.read(&format!("proc/{pid}/stat"), parse_stat).flatten()
                 else {
                     continue;
@@ -1534,7 +1554,7 @@ impl Root {
                 if confirm.start != stat.start {
                     continue;
                 }
-                footprint
+                (footprint, resident)
             };
             let start = u64::try_from(u128::from(stat.start) * 1_000_000_000 / u128::from(hz)).ok();
             procs.push(ProcessReading {
@@ -1546,6 +1566,7 @@ impl Root {
                 cpu_ns: Some(u64::try_from(ns).unwrap_or(u64::MAX)),
                 child_cpu_ns: None,
                 footprint,
+                resident,
                 disk_read: None,
                 disk_written: None,
                 name: stat.name,

@@ -165,6 +165,12 @@ impl WarmBlock {
         self.decompress_failures.get() >= QUARANTINE_THRESHOLD
     }
 
+    /// Consecutive decompression failure count.
+    #[cfg(test)]
+    pub(crate) const fn failure_count(&self) -> u8 {
+        self.decompress_failures.get()
+    }
+
     /// Record a decompression failure.
     #[cfg(test)]
     pub(crate) fn record_failure(&self) -> bool {

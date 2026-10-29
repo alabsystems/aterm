@@ -359,11 +359,16 @@ fn unattended_targo_under(
         }
         None => Command::new(&targo),
     };
+    // SHELL is named, not inherited: the pending stub is a `#!/bin/sh` script, and macOS's
+    // bash looks the account up (getpwuid) when SHELL is unset, which traps (SIGTRAP, "Unable
+    // to get the unique pid") under a sandbox that denies process-info-pidinfo, before the stub
+    // runs a line. A runner whose environment had no SHELL failed the sandboxed row by that.
     let mut child = command
         .arg("--version")
         .env("HOME", &fx.home)
         .env("XDG_CONFIG_HOME", fx.root.path().join("config"))
         .env("PATH", "/usr/bin:/bin")
+        .env("SHELL", "/bin/sh")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -930,4 +935,57 @@ fn a_sandboxed_stub_that_cannot_read_the_owners_start_time_still_waits() {
     let (done, stdout) = exit_and_stdout(child);
     assert!(done.success(), "{done:?} stdout {stdout}");
     assert_eq!(stdout, "ran targo --version\n");
+}
+
+/// A pass whose stderr the window copies into its aterm.log (the package lanes set
+/// [`atpkg::notice::STDERR_IS_HOST_LOG_ENV`]) prints an aterm.toml that is not TOML by its
+/// position, never the line that did not parse: the line is the person's config (DESIGN §3.6). A
+/// seed a person types still prints the line.
+#[test]
+fn a_hosts_pass_says_an_unparsed_aterm_toml_by_its_position() {
+    let fx = Fixture::new("host-read-stderr");
+    let config = fx.root.path().join("config");
+    std::fs::create_dir_all(config.join("aterm")).unwrap();
+    std::fs::write(
+        config.join("aterm/aterm.toml"),
+        "[packages]\nauto_install = false\nfont_family = \"QZP7E7L1\n",
+    )
+    .unwrap();
+    let seed = |copied: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_atpkg"));
+        cmd.arg("seed")
+            .env("HOME", &fx.home)
+            .env("XDG_CONFIG_HOME", &config)
+            .env(
+                "ATPKG_REGISTRY",
+                format!("dir:{}", fx.root.path().join("registry").display()),
+            )
+            .env_remove("RUSTUP_HOME")
+            .env_remove("ATERM_CHILD")
+            .env_remove(atpkg::notice::STDERR_IS_HOST_LOG_ENV)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if copied {
+            cmd.env(atpkg::notice::STDERR_IS_HOST_LOG_ENV, "1");
+        }
+        let out = cmd.output().expect("run dev atpkg seed");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let copied = seed(true);
+    assert!(
+        copied.lines().any(|line| line
+            .starts_with("atpkg: aterm.toml is not valid TOML (TOML error at line 3, column ")),
+        "the host's copy names the error by its position: {} lines",
+        copied.lines().count()
+    );
+    assert!(
+        !copied.contains("QZP7E7L"),
+        "a pass the host's log reads printed aterm.toml's line"
+    );
+    // CONTROL: the seed a person types prints the line that did not parse.
+    assert!(
+        seed(false).contains("QZP7E7L1"),
+        "a typed seed says the line whole"
+    );
 }

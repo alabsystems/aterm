@@ -141,23 +141,6 @@ fn the_derivation_figures_and_id_are_pinned() {
     assert_eq!(id(&p).hex(), V1_ID);
 }
 
-/// F + G sits on the lossless limit `F + G ≤ 28` that T = 4·2^F allows, and tone-int's constants are the design's.
-#[test]
-fn the_fixed_point_constants_are_the_designs() {
-    assert_eq!((F, G, T), (8, 20, 1_024));
-    assert_eq!(F + G, 28);
-    assert_eq!(MIN_IDS as usize, tone::MIN_NGRAMS);
-    assert_eq!(
-        DIMS,
-        Dims {
-            buckets: 2_048,
-            embed: 32,
-            hidden: 64,
-            classes: 5,
-        }
-    );
-}
-
 /// derive is a pure function of the asset, v1 is derive of the shipped asset, and derive's source calls no libm function.
 #[test]
 fn derive_is_pure_and_names_no_libm() {

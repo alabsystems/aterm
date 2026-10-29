@@ -928,7 +928,7 @@ macro_rules! mask_probe {
         probe
             .args([
                 "--exact",
-                "spawnfd::command_tests::signal_mask_probe_stage",
+                "spawnfd::command_tests::a_child_starts_with_no_signal_blocked_and_std_s_dispositions",
                 "--nocapture",
                 "--test-threads=1",
             ])
@@ -937,10 +937,9 @@ macro_rules! mask_probe {
     }};
 }
 
-#[test]
-fn signal_mask_probe_stage() {
+fn signal_mask_probe_stage_if_asked() -> bool {
     if std::env::var(STAGE_ENV).as_deref() != Ok(MASK_PROBE) {
-        return;
+        return false;
     }
     let mut mask = sigset_of(&[]);
     // SAFETY: a null `set` only reads this thread's mask into a live local.
@@ -949,6 +948,7 @@ fn signal_mask_probe_stage() {
         0
     );
     println!("\nMASK={}", sigset_bits(&mask));
+    true
 }
 
 fn sigset_bits(set: &SigSet) -> String {
@@ -1044,6 +1044,9 @@ fn staged_signals() {
 fn a_child_starts_with_no_signal_blocked_and_std_s_dispositions() {
     const NAME: &str =
         "spawnfd::command_tests::a_child_starts_with_no_signal_blocked_and_std_s_dispositions";
+    if signal_mask_probe_stage_if_asked() {
+        return;
+    }
     if std::env::var(STAGE_ENV).is_ok() {
         staged_signals();
         return;
@@ -1132,6 +1135,31 @@ fn a_dropped_handle_of_an_exited_child_leaves_no_zombie() {
     assert_eq!(
         ours_left, -1,
         "the dropped handle collected its exited child"
+    );
+
+    let (read, write) = std::io::pipe().expect("pipe");
+    let running = command("/bin/sh")
+        .args(["-c", "read _ || :"])
+        .stdin(Stdio::from(read))
+        .spawn()
+        .expect("spawn running child");
+    let running_pid = running.id();
+    drop(running);
+    drop(write);
+    let until = Instant::now() + Duration::from_secs(60);
+    while !state_of(running_pid).is_empty() {
+        assert!(
+            Instant::now() < until,
+            "the dropped running child ({running_pid}) was never reaped"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // SAFETY: a non-blocking probe; `raw` is a live local.
+    let running_left =
+        unsafe { waitpid(i32::try_from(running_pid).expect("pid"), &mut raw, WNOHANG) };
+    assert_eq!(
+        running_left, -1,
+        "the reaper collected the child dropped while still running"
     );
 }
 

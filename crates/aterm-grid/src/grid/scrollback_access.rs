@@ -68,6 +68,41 @@ impl Grid {
         self.storage.tiered_scrollback_lines()
     }
 
+    /// Whether the tiered scrollback store is currently detached for an off-thread reflow.
+    #[must_use]
+    #[inline]
+    pub const fn has_detached_scrollback(&self) -> bool {
+        self.storage.scrollback_detached_for_reflow
+    }
+
+    /// Monotonic count of history pullbacks or deep rewraps that reached older than the bounded replay suffix.
+    #[must_use]
+    #[inline]
+    pub const fn deep_history_pullback_ordinal(&self) -> u64 {
+        self.storage.deep_history_pullback_ordinal
+    }
+
+    /// Advance `deep_history_pullback_ordinal` by `delta` (preserving monotonicity across checkpoint adoption).
+    #[inline]
+    pub fn advance_deep_history_pullback_ordinal_by(&mut self, delta: u64) {
+        self.storage.deep_history_pullback_ordinal = self
+            .storage
+            .deep_history_pullback_ordinal
+            .wrapping_add(delta);
+    }
+
+    /// Clamp the carried history suffix after a bounded replay step (`max_lines`).
+    #[inline]
+    pub fn clamp_replay_carried_history(&self, max_lines: usize) {
+        self.storage.clamp_replay_carried_history(max_lines);
+    }
+
+    /// Seed the carried history suffix from a keyframe bounded to `max_lines`.
+    #[inline]
+    pub fn seed_replay_carried_history(&self, max_lines: usize) {
+        self.storage.seed_replay_carried_history(max_lines);
+    }
+
     /// Returns a history line by index (`0` = oldest), or `Ok(None)` when out of bounds.
     pub fn try_get_history_line(
         &self,

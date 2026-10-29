@@ -228,6 +228,7 @@ mod tests {
             host: host.to_string(),
             code: mc.code.clone(),
             at: None,
+            allowed: None,
             proof: None,
         };
         let pending = [request("mc"), request(&"a-name-a-lan-host-chose".repeat(2))];

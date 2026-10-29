@@ -12,9 +12,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use aterm_agent::harness::footer::FooterFacts;
-use aterm_agent::harness::profile::{AccountKey, Bucket, PlanUsage, WeeklyFigure};
+use aterm_agent::harness::profile::{AccountKey, Bucket, PlanUsage};
 use aterm_sysprobe::jobs::RunState;
 use aterm_sysprobe::volumes::VolumeKey;
+use aterm_vitals::Peaks;
 use aterm_vitals::explain::{
     CoalLane, CoalSample, CoalUsage, IdMap, IdSet, LeadIdentity, TimelineSample,
 };
@@ -23,11 +24,10 @@ use aterm_vitals::model::{
     AccountIx, ClusterSpec, CommitSample, DiskFacts, DiskLevel, GpuSample, Hog, LinkKind,
     LinkSample, MemCounters, MemSample, PlanFact, Pressure, ProcLimits, ProcSample, ProcState,
     Sample, SavedStrip, Snapshot, StripEvent, StripEventKind, TabRoot, TabTokens, Thermal,
-    Throttle, Ticks, VolumeSample, WeekFact,
+    Throttle, Ticks, VolumeSample,
 };
 use aterm_vitals::ring::{GapKind, SavedRing, TimeGap};
 use aterm_vitals::sys::Machine;
-use aterm_vitals::{Peaks, PlanDay};
 
 use crate::disk_board::{Clock, DiskFactsRaw, Shelf};
 use crate::disk_where::Where;
@@ -48,10 +48,16 @@ const PEAKS_MAX_BYTES: u64 = 16 * 1024;
 /// point of up to 1024 bytes is under [`PEAKS_MAX_BYTES`].
 const FREE_FILE: &str = "vitals-free.json";
 const FREE_SCHEMA: u32 = 1;
-/// The 1-hour multi-scale strip rings, gaps and event markers, checkpointed every 10 s bucket and
-/// on clean stop so restarts and crashes retain pre-crash history.
+/// The 1-hour multi-scale strip rings, gaps and event markers, checkpointed on a reading at least
+/// 10 s after the last write, at the start of a lock holder that restored an unclean checkpoint
+/// ([`restore_strip`]) and at the thread's stop (clean only at a quit, [`VitalsHost::stopping`]) so
+/// restarts and crashes retain pre-crash history. A start's first checkpoint is due at once, and so
+/// is the first reading's after a write at the start.
 const STRIP_EVERY: Duration = Duration::from_secs(10);
 const STRIP_FILE: &str = "vitals-strip.json";
+/// The lock beside [`STRIP_FILE`] whose holder is the one aterm of a state home that writes it and
+/// [`PEAKS_FILE`] ([`StripLock`]).
+const STRIP_LOCK: &str = "vitals-strip.lock";
 const STRIP_SCHEMA: u32 = 1;
 const STRIP_MAX_BYTES: u64 = 512 * 1024;
 /// Raw anomaly evidence is saved by the existing probe thread, separately from live state.
@@ -319,21 +325,10 @@ pub(crate) struct Request {
     pub(crate) tokens: Vec<TokenRow>,
     /// The front tab's plan usage, while current.
     pub(crate) plan: Option<PlanFact>,
-    /// Every account the panes' footers read, each once.
-    pub(crate) weeks: Vec<WeekRow>,
     /// Discontinuity gaps queued on the host to record on the next reading.
     pub(crate) note_gaps: Vec<aterm_vitals::TimeGap>,
     /// Strip events (crash, restart, sleep/wake, spike) queued on the host.
     pub(crate) note_events: Vec<aterm_vitals::StripEvent>,
-}
-
-/// One account a pane's footer read, and its weekly figure where the footer shows one.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct WeekRow {
-    pub(crate) account: AccountKey,
-    /// Whether a pane of the front tab runs under it.
-    pub(crate) front: bool,
-    pub(crate) figure: Option<WeeklyFigure>,
 }
 
 /// One agent session's token totals and when the footer's resolver last read them.
@@ -622,6 +617,13 @@ pub(crate) struct VitalsHost {
     sent_layout: Option<u64>,
     layout_looked: Option<Instant>,
     sys: Option<&'static crate::sys_host::Shared>,
+    /// Set by [`Self::stop_at_exit`], which the app's quit runs once its event loop has ended: the
+    /// probe thread writes its stop clean only where this is set when the host hangs up ([`run`]).
+    /// A main thread's panic before the quit unwinds out of the event loop past it, so a run it
+    /// takes down leaves its strip unclean, however its probe thread ends. One later in the quit,
+    /// once this is set, leaves a clean stop where the probe thread writes it after that panic's
+    /// crash file (a thread still reading when the quit's wait for it ran out), and that crash
+    /// draws as a pause.
     stopping: Arc<AtomicBool>,
     thread: Option<(std::thread::JoinHandle<()>, Receiver<()>)>,
     tried: bool,
@@ -679,6 +681,24 @@ pub(crate) struct VitalsHost {
     #[cfg(target_os = "macos")]
     cpu_policy_generation: Option<(u64, u64)>,
     pending_events: Vec<aterm_vitals::StripEvent>,
+    /// Whether the run before this one handed it its place (a seamless adoption, a relaunch of
+    /// the running app for an update, or Windows' update spawn) and the startup scan found no
+    /// kill evidence, so that run stopped on purpose, perhaps without its final strip write:
+    /// [`open_strip`] reads its unclean checkpoint as a stop, never a crash, unless a crash file
+    /// is newer than it ([`Self::crashed_at`]). Set before the probe thread starts
+    /// ([`Self::note_handed_off_start`]).
+    handed_off: bool,
+    /// When the run before this one crashed, by its crash file, where the startup scan found one
+    /// (`vitals_startup::PriorStop::Crashed` or `CrashedAndKilled`): [`open_strip`] dates the
+    /// crash from it where the kept strip is older than it and no live peer holds [`STRIP_LOCK`],
+    /// in time order with a killed run's launch ([`Self::killed_since`]). Set before the probe
+    /// thread starts ([`Self::note_crash_at`]).
+    crashed_at: Option<i64>,
+    /// When the run before this one launched, where the startup scan found it killed
+    /// (`vitals_startup::PriorStop::Killed` or `CrashedAndKilled`): [`open_strip`] dates the kill
+    /// from it where the kept strip holds no checkpoint of that run and no live peer holds
+    /// [`STRIP_LOCK`]. Set before the probe thread starts ([`Self::note_killed_run_launch`]).
+    killed_since: Option<i64>,
     survey: Arc<Where>,
     board: &'static crate::vitals_jobs::JobsBoard,
     proc_edge: &'static ProcEdge,
@@ -724,6 +744,9 @@ impl Default for VitalsHost {
             pending_cpu_policy: None,
             #[cfg(target_os = "macos")]
             cpu_policy_generation: None,
+            handed_off: false,
+            crashed_at: None,
+            killed_since: None,
             survey: Arc::default(),
             board: &crate::vitals_jobs::BOARD,
             proc_edge: if cfg!(test) {
@@ -902,13 +925,28 @@ impl VitalsHost {
         let (tx, rx) = std::sync::mpsc::sync_channel(2);
         let (ended, done) = std::sync::mpsc::channel::<()>();
         let latest = Arc::clone(&self.latest);
-        let workers = sys.map(|shared| (shared, tx.clone(), Arc::clone(&self.stopping)));
+        let workers = sys.map(|shared| (shared, tx.clone()));
+        let stopping = Arc::clone(&self.stopping);
+        let prior = PriorRun {
+            handed_off: self.handed_off,
+            crashed_at: self.crashed_at,
+            killed_since: self.killed_since,
+        };
         match crate::qos::spawn_lane_thread(
             "aterm-vitals",
             crate::qos::Role::Background,
             move || {
                 let _ended = ended;
-                run(&rx, &latest, &post, source(), peaks, workers);
+                run(
+                    &rx,
+                    &latest,
+                    &post,
+                    source(),
+                    peaks,
+                    workers,
+                    &stopping,
+                    prior,
+                );
             },
         ) {
             Ok(handle) => {
@@ -948,9 +986,22 @@ impl VitalsHost {
         }
     }
 
-    /// Queues a discontinuity gap (such as a previous run's crash gap) for the next reading.
-    pub(crate) fn note_time_gap(&mut self, gap: aterm_vitals::TimeGap) {
-        self.pending_gaps.push(gap);
+    /// Notes that the run before this one stopped on purpose, an update's or a relaunch's
+    /// predecessor ([`Self::handed_off`]); it counts only before the probe thread starts.
+    pub(crate) fn note_handed_off_start(&mut self) {
+        self.handed_off = true;
+    }
+
+    /// Notes that the run before this one crashed at `crash_ms`, by its crash file
+    /// ([`Self::crashed_at`]); it counts only before the probe thread starts.
+    pub(crate) fn note_crash_at(&mut self, crash_ms: i64) {
+        self.crashed_at = Some(crash_ms);
+    }
+
+    /// Notes that the run before this one was killed and launched at `launched_ms`
+    /// ([`Self::killed_since`]); it counts only before the probe thread starts.
+    pub(crate) fn note_killed_run_launch(&mut self, launched_ms: i64) {
+        self.killed_since = Some(launched_ms);
     }
 
     /// Queues a special time-series event marker (crash, restart, sleep/wake, spike) for the next
@@ -1066,19 +1117,21 @@ impl Asked {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the thread's channels, its source and files, and what the host told it at its start"
+)]
 fn run(
     rx: &Receiver<Msg>,
     latest: &Mutex<Handover>,
     post: &dyn Fn() -> bool,
     mut source: impl Source,
     peaks: Option<PathBuf>,
-    workers: Option<(
-        &'static crate::sys_host::Shared,
-        SyncSender<Msg>,
-        Arc<AtomicBool>,
-    )>,
+    workers: Option<(&'static crate::sys_host::Shared, SyncSender<Msg>)>,
+    stopping: &AtomicBool,
+    prior: PriorRun,
 ) {
-    let sys = workers.map(|(shared, pulls, stopping)| {
+    let sys = workers.map(|(shared, pulls)| {
         shared.install(pulls);
         if stopping.load(Ordering::Acquire) {
             shared.uninstall();
@@ -1088,14 +1141,14 @@ fn run(
     let free = peaks.as_deref().map(|p| p.with_file_name(FREE_FILE));
     let strip = peaks.as_deref().map(|p| p.with_file_name(STRIP_FILE));
     let report = peaks.as_deref().map(|p| p.with_file_name(CPU_REPORT_FILE));
+    let mut writer = StripLock::take(peaks.as_deref().map(|p| p.with_file_name(STRIP_LOCK)));
     let open_at = Instant::now();
     let open_ms = unix_ms_now();
     let (mut peaks, restored) = PeakFile::open(peaks, open_at);
     source.model().restore_peaks(restored);
     let (mut free, kept) = FreeFile::open(free, open_at, open_ms);
     source.model().restore_free_history(kept);
-    let (mut strip, kept_strip) = StripFile::open(strip, open_at);
-    source.model().restore_strip_history(kept_strip, open_ms);
+    let mut strip = restore_strip(strip, open_at, open_ms, prior, &mut writer, source.model());
     let (mut report, prior_report) = CpuReportFile::open(report, open_at, open_ms);
     source.model().restore_cpu_report(prior_report);
     let mut current_report = None;
@@ -1144,23 +1197,45 @@ fn run(
             sys.publish(snap, source.machine().unwrap_or(&no_machine));
         }
         if (asked.read || jobs_moved) && !post() {
+            // The event loop is gone, at a quit or as a main thread's panic unwinds out of it. The
+            // thread takes no more readings (a cold one begun now could outlast `stop_at_exit`'s
+            // bound), takes the workers' sender back so they answer from what they hold, and waits
+            // for the host to hang up: `stop_at_exit` at a quit, or its drop in the unwind, when
+            // `stopping` says which it was.
+            if let Some(sys) = sys {
+                sys.uninstall();
+            }
+            while rx.recv().is_ok() {}
             break;
         }
         let kept_at = Instant::now();
         if current_report.is_some() {
             report.keep(&current_report, kept_at, policy_changed);
         }
-        peaks.keep(source.model().peaks(), kept_at, false);
+        peaks.keep_owned(source.model().peaks(), kept_at, false, &mut writer);
         free.keep(source.model().free_history(), kept_at, false);
-        strip.keep(&source.model().saved_strip(false), kept_at, false);
+        strip.keep_owned(
+            &source.model().saved_strip(false),
+            kept_at,
+            false,
+            &mut writer,
+        );
     }
     let stop_at = Instant::now();
+    let quit = stopping.load(Ordering::Acquire);
     if current_report.is_some() {
         report.keep(&current_report, stop_at, true);
     }
-    peaks.keep(source.model().peaks(), stop_at, true);
+    peaks.keep_owned(source.model().peaks(), stop_at, true, &mut writer);
     free.keep(source.model().free_history(), stop_at, true);
-    strip.keep(&source.model().saved_strip(true), stop_at, true);
+    strip.keep_owned(
+        &source.model().saved_strip(quit),
+        stop_at,
+        true,
+        &mut writer,
+    );
+    // The lock goes only after the stop's write, so the aterm that takes it next writes after it.
+    drop(writer);
 }
 
 /// A worker's pull: a whole reading, or a cold one's pair [`COLD_PAIR`] apart, with the thread's
@@ -1303,9 +1378,6 @@ fn hardware_sample(s: aterm_sysprobe::cpu_hardware::Sample) -> aterm_vitals::har
         },
     }
 }
-
-/// The local zone's offset from UTC at an instant, unix seconds.
-pub(crate) type OffsetProbe = fn(i64) -> Option<i64>;
 
 fn platform_thermal() -> Option<Thermal> {
     #[cfg(target_os = "macos")]
@@ -1910,8 +1982,6 @@ impl WhyFixture {
             disk: live.disk.clone(),
             tokens: live.tokens.clone(),
             plan: live.plan.clone(),
-            weeks: live.weeks.clone(),
-            local_day: live.local_day,
             note_events: live.note_events.clone(),
             note_gaps: live.note_gaps.clone(),
             ..scene
@@ -1945,6 +2015,9 @@ pub(crate) struct Reader {
     vitals: aterm_vitals::Vitals,
     jobs: crate::vitals_jobs::JobsPass,
     epoch: Instant,
+    /// The pass's clock ([`Request::tab_reads`]): the machine's, or a test's own, which no load
+    /// spaces.
+    clock: fn() -> Instant,
     home: PathBuf,
     scratch: Vec<u8>,
     uid: Option<u32>,
@@ -1952,7 +2025,6 @@ pub(crate) struct Reader {
     job_watch: aterm_vitals::events::JobWatch,
     watched: Option<Arc<aterm_vitals::jobs::JobsView>>,
     thermal: ThermalProbe,
-    offset_at: OffsetProbe,
     counter_throttle: Option<(Instant, Option<Thermal>)>,
     slots: aterm_sysprobe::slots::SlotReader,
     /// The split set's lane and what it keeps between split ticks.
@@ -2091,6 +2163,7 @@ impl Reader {
             vitals: aterm_vitals::Vitals::new(),
             jobs: crate::vitals_jobs::JobsPass::new(),
             epoch: Instant::now(),
+            clock: Instant::now,
             slots: aterm_sysprobe::slots::SlotReader::new(aterm_sysprobe::slots::default_dir(
                 &home,
             )),
@@ -2104,11 +2177,6 @@ impl Reader {
                 || None
             } else {
                 platform_thermal
-            },
-            offset_at: if cfg!(test) {
-                |_| Some(0)
-            } else {
-                crate::presence::local_offset_at
             },
             counter_throttle: None,
             split,
@@ -2178,7 +2246,7 @@ impl Reader {
 
     /// Takes one full reading (machine counters, process sweep, split set if due, and jobs pass).
     pub(crate) fn read(&mut self, req: &Request) -> Snapshot {
-        let reads = req.tab_reads(self.epoch, Instant::now);
+        let reads = req.tab_reads(self.epoch, self.clock);
         let now = Instant::now();
         let split = self.split.due(req, now);
         let live_split = split && self.fixture.is_none();
@@ -2236,7 +2304,9 @@ impl Reader {
         }
         // Preserve the existing core/process capture window: optional native
         // discovery can be slow, so it runs only after those readings finish.
-        attach_hardware(&mut sample, &mut self.hardware, self.hardware_read);
+        if req.deck || req.pull {
+            attach_hardware(&mut sample, &mut self.hardware, self.hardware_read);
+        }
         let scene = self.fixture.as_mut().map(|fixture| {
             if split {
                 self.split.last = Some(now);
@@ -2386,8 +2456,6 @@ impl Reader {
                 })
                 .collect(),
             plan: req.plan.clone(),
-            weeks: week_facts(&req.weeks, self.offset_at),
-            local_day: local_day(at_unix_ms.div_euclid(1000), self.offset_at),
             procs_truncated: false,
             coalitions: None,
             leads: Vec::new(),
@@ -2738,56 +2806,6 @@ fn each_session_once(mut rows: Vec<TokenRow>) -> Vec<TokenRow> {
     rows
 }
 
-/// The account `facts` name, with its weekly figure where it has one.
-fn week_row(facts: &FooterFacts, front: bool) -> Option<WeekRow> {
-    let shown = facts.subscription.as_ref()?;
-    Some(WeekRow {
-        account: shown.account?,
-        front,
-        figure: shown.weekly_figure,
-    })
-}
-
-/// One row per account, in the order first read: front where any of its panes is, with
-/// the newest of its figures.
-fn each_account_once(rows: Vec<WeekRow>) -> Vec<WeekRow> {
-    let mut once: Vec<WeekRow> = Vec::with_capacity(rows.len());
-    for row in rows {
-        match once.iter_mut().find(|kept| kept.account == row.account) {
-            Some(kept) => {
-                kept.front |= row.front;
-                kept.figure = WeeklyFigure::newer(kept.figure, row.figure);
-            }
-            None => once.push(row),
-        }
-    }
-    once
-}
-
-/// The model's [`WeekFact`]s of `rows`, each figure on the local day it was read.
-fn week_facts(rows: &[WeekRow], offset_at: OffsetProbe) -> Vec<WeekFact> {
-    rows.iter()
-        .map(|row| WeekFact {
-            account: row.account.to_string(),
-            front: row.front,
-            reading: row.figure.and_then(|f| {
-                Some(PlanDay {
-                    day: local_day(f.at, offset_at),
-                    used_x10: u16::try_from(f.used_x10).ok()?,
-                    resets_at: f.resets_at,
-                    at: f.at,
-                })
-            }),
-        })
-        .collect()
-}
-
-/// The day of `unix_s`, unix days in the local zone (UTC where its offset is unread).
-fn local_day(unix_s: i64, offset_at: OffsetProbe) -> u32 {
-    let local = unix_s.saturating_add(offset_at(unix_s).unwrap_or(0));
-    u32::try_from(local.div_euclid(86_400)).unwrap_or(0)
-}
-
 fn plan_fact(plan: &PlanUsage, accounts: &[AccountKey], now: i64) -> Option<PlanFact> {
     if !plan.current_at(now) {
         return None;
@@ -2863,10 +2881,33 @@ impl<T: Clone + Default + PartialEq> KeptFile<T> {
     }
 
     fn keep(&mut self, value: &T, now: Instant, stopping: bool) {
-        if (!stopping && now.saturating_duration_since(self.at) < self.every) || *value == self.held
-        {
-            return;
+        if self.due(value, now, stopping) {
+            self.write(value, now);
         }
+    }
+
+    /// [`Self::keep`] for a file only [`STRIP_LOCK`]'s holder writes: a write that is due first
+    /// tries a live peer's lock again, and while the peer still holds it nothing is written and the
+    /// write stays due, for the next reading's checkpoint to try.
+    fn keep_owned(&mut self, value: &T, now: Instant, stopping: bool, lock: &mut StripLock) {
+        if self.due(value, now, stopping) && lock.writes() {
+            self.write(value, now);
+        }
+    }
+
+    /// Sets the file's clock one `every` before `now`, as [`StripFile::open`] arms it, so the next
+    /// value that changed is due at once.
+    fn arm(&mut self, now: Instant) {
+        self.at = now.checked_sub(self.every).unwrap_or(now);
+    }
+
+    /// Whether `value` is to be written at `now`: it changed, and `every` has passed since the last
+    /// write or the thread is stopping.
+    fn due(&self, value: &T, now: Instant, stopping: bool) -> bool {
+        (stopping || now.saturating_duration_since(self.at) >= self.every) && *value != self.held
+    }
+
+    fn write(&mut self, value: &T, now: Instant) {
         let (Some(path), Some(text)) = (self.path.as_deref(), (self.json)(value)) else {
             return;
         };
@@ -2913,8 +2954,9 @@ impl KeptFile<FreeHistory> {
 }
 
 impl KeptFile<SavedStrip> {
-    /// Open [`STRIP_FILE`], arming `at` one [`STRIP_EVERY`] in the past so the first live sample
-    /// immediately checkpoints `clean_stop = false` to disk.
+    /// Open [`STRIP_FILE`], arming `at` one [`STRIP_EVERY`] in the past so the first checkpoint,
+    /// `clean_stop = false`, is due at once: at the start of a lock holder that restored an
+    /// unclean checkpoint ([`restore_strip`]), else at the first live sample.
     fn open(path: Option<PathBuf>, now: Instant) -> (Self, SavedStrip) {
         let armed = now.checked_sub(STRIP_EVERY).unwrap_or(now);
         Self::read(
@@ -2927,6 +2969,195 @@ impl KeptFile<SavedStrip> {
             strip_of,
         )
     }
+}
+
+/// What a launch knew of how the run before it stopped, which [`open_strip`] reads the kept
+/// checkpoint by.
+#[derive(Clone, Copy, Debug, Default)]
+struct PriorRun {
+    /// [`VitalsHost::handed_off`].
+    handed_off: bool,
+    /// [`VitalsHost::crashed_at`].
+    crashed_at: Option<i64>,
+    /// [`VitalsHost::killed_since`].
+    killed_since: Option<i64>,
+}
+
+/// [`StripFile::open`] at `now` (`now_ms` on the wall clock) for a start that knows how the run
+/// before it stopped (`prior`): whether it stopped on purpose ([`VitalsHost::handed_off`]), when a
+/// crashed one crashed ([`VitalsHost::crashed_at`]), and when a killed one launched
+/// ([`VitalsHost::killed_since`]). A checkpoint whose writer still runs, another aterm of this
+/// state home holding [`STRIP_LOCK`] (`lock` [`StripLock::Peer`]), is marked clean, so the restore
+/// treats that stop as a graceful one: a pause where it spans a 10 s bucket, and never a crash.
+/// That writer has not stopped at all (a holder whose restore drew the run before it as a crash
+/// writes its own checkpoint as soon as it has restored, [`restore_strip`], so a start beside it
+/// finds that crash in the holder's checkpoint). Otherwise, after a kill, a kept strip that holds
+/// no checkpoint of the killed run gains one at its launch
+/// ([`crate::vitals_startup::date_unseen_kill`]), and a crash file newer than the kept strip as
+/// read dates the crash by its time ([`crate::vitals_startup::date_crash`]), the two in the order
+/// they came (one older than the launch is an earlier run's, which the killed run never took), and
+/// the crash file after a handoff too: no checkpoint says the run went on past that file, so a
+/// panic it caught and survived in the seconds between its last checkpoint and its handoff reads as
+/// a crash too. A strip is newer than the file by its last reading, and a clean one also by its
+/// file's last write: a quit's clean write takes no reading of its own, so a run that survived a
+/// panic (on any thread but the probe's) after its last reading and then quit wrote its clean stop
+/// after the crash file, and only a quit writes a stop clean ([`VitalsHost::stopping`], which names
+/// the one late panic that still leaves one), never a probe thread that outlives the event loop of
+/// a run its main thread's panic takes down. A panic on the probe thread ends it with no stop
+/// written, so its run's quit leaves the last checkpoint, unclean, and that crash draws. A seamless
+/// update's predecessor `_exit`s at its Commit (`seamless::commit_and_exit`) and a relaunch's may
+/// still be running when this opens, so neither leaves `clean_stop = true`, and a handoff's start
+/// with no crash file that new marks the kept checkpoint clean the same way. A crash file no newer
+/// than the kept strip dates nothing: the strip's writer ran past it (a panic it caught and
+/// survived, or another aterm's crash).
+fn open_strip(
+    path: Option<PathBuf>,
+    now: Instant,
+    now_ms: i64,
+    prior: PriorRun,
+    lock: &StripLock,
+) -> (StripFile, SavedStrip) {
+    let written_ms = path
+        .as_deref()
+        .and_then(crate::vitals_startup::written_ms)
+        .unwrap_or(0);
+    let (file, mut kept) = StripFile::open(path, now);
+    if lock.peer_holds() {
+        kept.clean_stop = true;
+        return (file, kept);
+    }
+    let newer = if kept.clean_stop {
+        kept.last_wall_ms.max(written_ms)
+    } else {
+        kept.last_wall_ms
+    };
+    let crash_ms = prior
+        .crashed_at
+        .filter(|&crash_ms| newer < crash_ms && crash_ms < now_ms);
+    // The stops are dated in the order they came. A crash file older than the killed run's launch
+    // is an earlier run's, which that run, killed before its startup scan, never took; the kill
+    // dated after it moves the strip past the crash, so the crash's call below changes nothing.
+    if let Some(crash_ms) = crash_ms.filter(|&ms| {
+        prior
+            .killed_since
+            .is_some_and(|launched_ms| ms < launched_ms)
+    }) {
+        crate::vitals_startup::date_crash(&mut kept, crash_ms, now_ms);
+    }
+    if let Some(launched_ms) = prior.killed_since {
+        crate::vitals_startup::date_unseen_kill(&mut kept, launched_ms, now_ms);
+    }
+    if let Some(crash_ms) = crash_ms {
+        crate::vitals_startup::date_crash(&mut kept, crash_ms, now_ms);
+    } else if prior.handed_off {
+        kept.clean_stop = true;
+    }
+    (file, kept)
+}
+
+/// [`open_strip`]'s kept strip restored into `model` at `now` (`now_ms` on the wall clock), and the
+/// file it is kept in. Where that strip is unclean and this thread holds [`STRIP_LOCK`], its
+/// checkpoint is written at once, before any reading: until then the file holds the dead run's
+/// unclean checkpoint, which an aterm started beside this live holder would mark clean and draw as
+/// a pause where the restore here draws a crash. The checkpoint written carries that crash gap and
+/// its "aterm crash" event, with the open as its last reading, so such a start draws the crash and
+/// then a pause from the open. An unclean strip whose last reading is older than the strips' six
+/// hours draws no crash here or beside, and is written back as restored, with that reading still
+/// its last. After that write the file's clock is armed again, as at its open, so the first
+/// reading's checkpoint, which carries the marks the launch noted (its "restarted" event), is due
+/// at once too. A clean kept strip (one that stopped clean on disk, or one [`open_strip`] marked
+/// clean for a handoff or a live peer) is not written at once, and its first checkpoint waits for
+/// the first reading: one written at once, after a stop under a 10 s bucket ago, would give the
+/// earlier run's last reading as this run's unclean one. After a handoff the file keeps the
+/// predecessor's unclean checkpoint until that first reading's checkpoint, so a kill before it
+/// draws the handoff's span as a crash ([`crate::vitals_startup::date_unseen_kill`]), as before the
+/// lock.
+fn restore_strip(
+    path: Option<PathBuf>,
+    now: Instant,
+    now_ms: i64,
+    prior: PriorRun,
+    lock: &mut StripLock,
+    model: &mut aterm_vitals::Vitals,
+) -> StripFile {
+    let (mut file, kept) = open_strip(path, now, now_ms, prior, lock);
+    let crashed = !kept.clean_stop;
+    model.restore_strip_history(kept, now_ms);
+    if crashed && matches!(lock, StripLock::Held { .. }) {
+        file.keep_owned(&model.saved_strip(false), now, false, lock);
+        file.arm(now);
+    }
+    file
+}
+
+/// Whether this probe thread writes [`STRIP_FILE`] and [`PEAKS_FILE`]. Every aterm of one state
+/// home reads them (an installed app and a dev app beside it, an update's successor while its
+/// predecessor runs), and only the one whose probe thread holds [`STRIP_LOCK`] writes them. A
+/// writer that crashes or is killed lets go with its process.
+enum StripLock {
+    /// This thread holds the lock, until it drops this after its stop's write.
+    Held {
+        _guard: crate::native_document_host::HeldAdvisoryLock,
+    },
+    /// Another live aterm holds it: its checkpoint is no crash ([`open_strip`]), and this thread
+    /// writes neither file until a later checkpoint takes the lock, on this kept description.
+    Peer(std::fs::File),
+    /// No lock to be had (no state folder, a lock file that would not open, a filesystem without
+    /// locks): this thread writes as though it held one.
+    Unlocked,
+}
+
+impl StripLock {
+    /// The lock at `path` taken without waiting.
+    fn take(path: Option<PathBuf>) -> Self {
+        path.and_then(|p| open_strip_lock(&p).ok())
+            .map_or(Self::Unlocked, Self::try_take)
+    }
+
+    /// `file`'s lock taken without waiting: held, a live peer's (`WouldBlock`), or, on any other
+    /// refusal, none.
+    fn try_take(file: std::fs::File) -> Self {
+        match crate::native_document_host::HeldAdvisoryLock::try_lock_keeping(file) {
+            Ok(guard) => Self::Held { _guard: guard },
+            Err((file, std::fs::TryLockError::WouldBlock)) => Self::Peer(file),
+            Err((_, std::fs::TryLockError::Error(_))) => Self::Unlocked,
+        }
+    }
+
+    const fn peer_holds(&self) -> bool {
+        matches!(self, Self::Peer(_))
+    }
+
+    /// Whether this thread may write now, trying a peer's lock again first.
+    fn writes(&mut self) -> bool {
+        *self = match std::mem::replace(self, Self::Unlocked) {
+            Self::Peer(file) => Self::try_take(file),
+            kept => kept,
+        };
+        !self.peer_holds()
+    }
+}
+
+/// [`STRIP_LOCK`] opened to be locked, read and write and created when missing; on unix created
+/// 0600, never through a link and never waiting on what is there. Anything but a regular file is
+/// refused.
+fn open_strip_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open.mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = open.open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the strip lock is not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 impl CpuReportFile {
@@ -3115,35 +3346,12 @@ fn read_bounded(path: &Path, max_bytes: u64) -> Option<String> {
     (text.len() as u64 <= max_bytes).then_some(text)
 }
 
+/// The peaks file. A `plan` array an earlier build wrote beside the peaks is an unknown field,
+/// which the reader skips.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct PeaksDoc {
     schema: u32,
     peaks: Vec<PeakDoc>,
-    /// Absent from a file written before it; a reader that does not know it skips it.
-    #[serde(default, deserialize_with = "plan_docs")]
-    plan: Vec<PlanDoc>,
-}
-
-/// One account's [`aterm_vitals::PlanWeek`].
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct PlanDoc {
-    account: String,
-    /// `(day, used_x10, resets_at, at)`, as [`PlanDay`] names them.
-    days: Vec<(u32, u16, i64, i64)>,
-}
-
-/// The plan entries of a peaks file that read as [`PlanDoc`]s: an entry this build cannot
-/// read costs the file nothing else.
-fn plan_docs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<PlanDoc>, D::Error> {
-    let aterm_json::Value::Array(entries) =
-        <aterm_json::Value as serde::Deserialize>::deserialize(d)?
-    else {
-        return Ok(Vec::new());
-    };
-    Ok(entries
-        .into_iter()
-        .filter_map(|entry| aterm_json::from_value(entry).ok())
-        .collect())
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -3165,18 +3373,6 @@ fn peaks_json(peaks: &Peaks) -> Option<String> {
                 days,
             })
             .collect(),
-        plan: peaks
-            .plan
-            .iter()
-            .map(|week| PlanDoc {
-                account: week.account.clone(),
-                days: week
-                    .days
-                    .iter()
-                    .map(|d| (d.day, d.used_x10, d.resets_at, d.at))
-                    .collect(),
-            })
-            .collect(),
     };
     aterm_json::to_string(&doc).ok()
 }
@@ -3184,31 +3380,11 @@ fn peaks_json(peaks: &Peaks) -> Option<String> {
 fn peaks_of(text: &str) -> Option<Peaks> {
     let doc: PeaksDoc = aterm_json::from_str(text).ok()?;
     (doc.schema == PEAKS_SCHEMA).then(|| {
-        let plan: Vec<(&str, Vec<PlanDay>)> = doc
-            .plan
-            .iter()
-            .filter(|p| AccountKey::parse(&p.account).is_some())
-            .map(|p| {
-                let days = p
-                    .days
-                    .iter()
-                    .map(|&(day, used_x10, resets_at, at)| PlanDay {
-                        day,
-                        used_x10,
-                        resets_at,
-                        at,
-                    });
-                (p.account.as_str(), days.collect())
-            })
-            .collect();
-        Peaks {
-            plan: Peaks::plan_from_rows(plan.iter().map(|(a, days)| (*a, days.as_slice()))),
-            ..Peaks::from_pairs(
-                doc.peaks
-                    .iter()
-                    .map(|p| (p.name.as_str(), p.read_s, p.days.as_slice())),
-            )
-        }
+        Peaks::from_pairs(
+            doc.peaks
+                .iter()
+                .map(|p| (p.name.as_str(), p.read_s, p.days.as_slice())),
+        )
     })
 }
 
@@ -4026,7 +4202,6 @@ impl crate::App {
         let mut tokens = Vec::new();
         let mut accounts: Vec<AccountKey> = Vec::new();
         let mut front_plan = None;
-        let mut weeks = Vec::new();
         // A pane shown in two tabs (Open Active Session in New Window) is one root, in the tab
         // listed first; each tab then takes the least key of the panes it keeps, so a split tab
         // whose least pane a twin listed first shows keeps its other panes under their own.
@@ -4074,7 +4249,6 @@ impl crate::App {
                     let key = focused.unwrap_or(pane);
                     tokens
                         .extend(facts.and_then(|f| tab_tokens(key, f, tl.claude_footer_read_at())));
-                    weeks.extend(facts.and_then(|f| week_row(f, in_front)));
                     if let Some(p) = facts.and_then(|f| f.plan) {
                         if !accounts.contains(&p.account) {
                             accounts.push(p.account);
@@ -4150,7 +4324,6 @@ impl crate::App {
             deck: self.deck_in_view(),
             tokens: each_session_once(tokens),
             plan: front_plan.and_then(|p| plan_fact(&p, &accounts, now)),
-            weeks: each_account_once(weeks),
             note_gaps: Vec::new(),
             note_events: Vec::new(),
         }

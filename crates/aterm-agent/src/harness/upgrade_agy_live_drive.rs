@@ -338,11 +338,14 @@ pub(super) fn read_summaries(config: &Path, conversation: &str) -> Result<String
                     ))
                 },
                 |&(id_i, st_i, nfi_i, par_i), row| {
-                    let id = row.get(id_i)?.to_list_field();
-                    let parent = row.get(par_i)?.to_list_field();
-                    if id != conversation && parent != conversation {
+                    let id_cell = row.get(id_i)?;
+                    let par_cell = row.get(par_i)?;
+                    if !id_cell.list_field_eq(conversation) && !par_cell.list_field_eq(conversation)
+                    {
                         return None;
                     }
+                    let id = id_cell.to_list_field();
+                    let parent = par_cell.to_list_field();
                     let status = row.get(st_i)?.to_list_field();
                     let nfi = row.get(nfi_i)?.to_list_field();
                     if [&id, &status, &nfi, &parent]
@@ -482,6 +485,7 @@ pub(super) fn claim_record(
         cwd: snap.cwd.clone(),
         twin: mv.twin.to_string_lossy().into_owned(),
         pid: snap.pid,
+        proc_start: snap.start.clone(),
         shell: snap.shell,
         tab: snap.tab.clone(),
         from: mv.running.clone(),
@@ -514,13 +518,16 @@ pub(super) fn upgrade_visit(
         to: "-".to_string(),
         step: String::new(),
     };
-    if let Some(st) = load(opts, &session_key).filter(|st| st.agent == Agent::Agy && st.in_flight())
+    let prior = load(opts, &session_key);
+    if let Some(st) = prior
+        .as_ref()
+        .filter(|st| st.agent == Agent::Agy && st.in_flight())
     {
         let r = report(leader(tabs, &tab, k).unwrap_or(st.pid));
         if opts.background {
             return Some(said(r, AT_BREAK));
         }
-        return Some(carry_in_flight_with(opts, r, st, &session_key, k));
+        return Some(carry_in_flight_with(opts, r, st.clone(), &session_key, k));
     }
     let pid = leader(tabs, &tab, k)?;
     let r = report(pid);
@@ -574,6 +581,19 @@ pub(super) fn upgrade_visit(
     let (Some(lock), Some(conversation)) = (run.lock.clone(), snap.session.clone()) else {
         return Some(said(r, "wait:no-session"));
     };
+    if rotation.is_none()
+        && let Some(word) = prior.as_ref().and_then(|st| {
+            st.held_managed_move(
+                Agent::Agy,
+                &tab,
+                &conversation,
+                (&mv.running, &mv.target),
+                now_s(),
+            )
+        })
+    {
+        return Some(said(r, format!("wait:{word}")));
+    }
     let (config, started_ms) = (run.config.clone(), run.started_ms);
     let Ok(mut c) = connect(opts, &tab) else {
         return Some(said(r, "wait:no-socket"));
@@ -613,7 +633,6 @@ pub(super) fn upgrade_visit(
     let Some(mut hand) = Hand::take(&mut c, &tab) else {
         return Some(said(r, "wait:held"));
     };
-    let prior = load(opts, &session_key);
     if save_checked(opts, &session_key, &st).is_err() {
         hand.give_back(&mut c);
         return Some(said(r, "wait:claim-unwritten"));

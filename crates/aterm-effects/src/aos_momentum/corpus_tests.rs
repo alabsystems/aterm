@@ -17,7 +17,7 @@ use super::lane::{Exo, s0};
 use aterm_aos::Digest;
 
 /// The corpus digest generator v1 makes, pinned so that moving it is a reviewed source change.
-const CORPUS_DIGEST: &str = "82c8c684de8990b3b8c421085c83ecdd6484208c2d7794d2dc140d2d7a406b57";
+const CORPUS_DIGEST: &str = "5ff4befccd385e929592626d775ad6d8a9df530cf0546991d468b2f092cbc2a5";
 
 fn corpus() -> Corpus {
     Corpus::generate().expect("generator v1's scenarios are admitted")

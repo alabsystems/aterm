@@ -79,6 +79,34 @@ impl Error {
     pub fn message_text(&self) -> &str {
         &self.message
     }
+
+    /// What an app log may keep of this error: `TOML error at line L, column C`, or
+    /// `TOML error` where it has no position. Never the offending line ([`Display`](fmt::Display)
+    /// prints it whole) and never the message, which can quote the value (a serde
+    /// `invalid value: string "…"`): the file holds both, and a person reads them where the
+    /// error is shown to them.
+    #[inline]
+    #[must_use]
+    pub const fn log_words(&self) -> LogWords {
+        LogWords {
+            line_col: self.line_col,
+        }
+    }
+}
+
+/// [`Error::log_words`]: an error's position, and nothing of its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogWords {
+    line_col: Option<(usize, usize)>,
+}
+
+impl fmt::Display for LogWords {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.line_col {
+            Some((line, col)) => write!(f, "TOML error at line {line}, column {col}"),
+            None => f.write_str("TOML error"),
+        }
+    }
 }
 
 /// The largest char boundary at or below `i`. `Display` must not panic whatever span it is

@@ -4,7 +4,7 @@
 //! Lane handlers for the `edit` and `await edit` control verbs.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use amacs::protocol::edit::{AwaitEdit, AwaitKey, EditRequest, Ticket};
@@ -12,7 +12,7 @@ use aterm_window::event_loop::EventLoopProxy;
 
 use crate::Wake;
 use crate::control::Scope;
-use crate::control::control_media::MainPost;
+use crate::control::control_media::{MainPost, Waited, park_for_answer};
 
 pub(crate) mod hold;
 
@@ -194,40 +194,6 @@ pub(crate) fn serve_await_edit(
         Waited::HungUp => crate::control::HUNG_UP_REPLY.to_string(),
         Waited::Deadline => "OK timeout\n".to_string(),
         Waited::Dropped => "ERR edit waiter was dropped\n".to_string(),
-    }
-}
-
-/// How a parked lane stopped waiting.
-#[derive(Debug, PartialEq, Eq)]
-enum Waited {
-    Answer(String),
-    HungUp,
-    Deadline,
-    /// The main thread dropped the channel unanswered (the event loop ended).
-    Dropped,
-}
-
-/// Wait on `answer` until `deadline`, re-checking `hung_up` between slices.
-fn park_for_answer(
-    answer: &Receiver<String>,
-    deadline: Instant,
-    hung_up: &mut dyn FnMut() -> bool,
-    park: fn(Duration) -> Duration,
-) -> Waited {
-    loop {
-        if hung_up() {
-            return Waited::HungUp;
-        }
-        let left = deadline.saturating_duration_since(Instant::now());
-        match answer.recv_timeout(park(left)) {
-            Ok(line) => return Waited::Answer(line),
-            Err(RecvTimeoutError::Disconnected) => return Waited::Dropped,
-            Err(RecvTimeoutError::Timeout) => {
-                if Instant::now() >= deadline {
-                    return Waited::Deadline;
-                }
-            }
-        }
     }
 }
 

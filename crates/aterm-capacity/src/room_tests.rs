@@ -149,3 +149,16 @@ fn the_rooms_persist_in_the_harness_state_directory() {
     let back = Rooms::load(tmp.path());
     assert_eq!(back.meters["fsid:7"].days(), rooms.meters["fsid:7"].days());
 }
+
+#[test]
+fn extreme_negative_clocks_never_underflow_window_or_day_pruning() {
+    let mut m = RoomMeter::new();
+    m.observe(i64::MIN, gib(400));
+    m.observe(i64::MIN + 60, gib(320));
+    assert_eq!(m.days().len(), 1);
+    assert_eq!(m.room(i64::MIN, TOTAL), room_bounds(TOTAL).0);
+    m.observe(i64::MIN + D, gib(400));
+    m.observe(i64::MIN + D + 60, gib(310));
+    assert_eq!(m.room(i64::MIN + D + 60, TOTAL), gib(80));
+    assert_eq!(m.room(i64::MAX, TOTAL), room_bounds(TOTAL).0);
+}

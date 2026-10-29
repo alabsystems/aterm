@@ -421,10 +421,30 @@ fn every_scenario_of_the_expectation_table_reads_as_the_table_says() {
     ] {
         assert!(rows.contains(want), "row {want} has no fixture");
     }
-    let mut bad = Vec::new();
-    for s in &all {
-        let t = scenarios::run(s, None);
-        bad.extend(scenarios::check(s, &t));
+    // Each scenario is a world of its own, so they run on every core, their lines back in table
+    // order. deadlock.setsid (26 h at 2 s ticks) holds half the ticks and sets the wall time.
+    let checked = aterm_spec::check::each(&all, |s| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            scenarios::check(s, &scenarios::run(s, None))
+        }))
+    });
+    let (mut bad, mut panicked) = (Vec::new(), None);
+    for (s, lines) in all.iter().zip(checked) {
+        match lines {
+            Ok(lines) => bad.extend(lines),
+            Err(panic) => {
+                bad.push(format!("{} ({}) panicked", s.name, s.row));
+                panicked.get_or_insert(panic);
+            }
+        }
+    }
+    if let Some(panic) = panicked {
+        eprintln!(
+            "{} expectation(s) failed:\n  {}",
+            bad.len(),
+            bad.join("\n  ")
+        );
+        std::panic::resume_unwind(panic);
     }
     assert!(
         bad.is_empty(),

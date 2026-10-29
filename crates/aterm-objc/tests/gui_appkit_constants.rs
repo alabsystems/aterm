@@ -86,6 +86,10 @@ const ROWS: &[(&str, &str)] = &[
         "CG_WINDOW_LIST_ON_SCREEN_NON_DESKTOP",
         "(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements)",
     ),
+    (
+        "CG_WINDOW_LIST_ALL_NON_DESKTOP",
+        "(kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements)",
+    ),
     ("CG_NULL_WINDOW_ID",                     "kCGNullWindowID"),
 ];
 

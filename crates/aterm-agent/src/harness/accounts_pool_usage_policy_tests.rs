@@ -45,7 +45,7 @@ pub(crate) fn usage_transition(
                 store.ledger_path(),
                 store.wake_path(),
             ];
-            let read = |_: Cli, home: &Path, _: i64| {
+            let read = |_: Cli, home: &Path, _: Option<&str>, _: i64| {
                 if home != work {
                     return None;
                 }
@@ -119,7 +119,10 @@ pub(crate) fn usage_transition(
                     Some(files.each_ref().map(|path| std::fs::read(path).ok()));
                 matches!(state["case"], 1 | 3 | 5 | 7 | 9 | 10 | 13 | 15).then(|| Usage {
                     sample: near_wall(),
-                    wall: (state["case"] > 2).then_some(("five_hour", Some(NOW + HOUR))),
+                    walls: (state["case"] > 2)
+                        .then_some(("five_hour", Some(NOW + HOUR)))
+                        .into_iter()
+                        .collect(),
                 })
             };
             let result = super::super::launch_env(&world.seat(), Cli::Codex, &read);
@@ -177,7 +180,7 @@ fn a_public_usage_poll_with_no_result_still_refuses_changed_policy() {
     let enrolled = accounts::enrolled_for(Cli::Codex, &roster);
     let store = seat.store(Cli::Codex);
     let before = std::fs::read(store.state_file()).unwrap();
-    let read = |_: Cli, home: &Path, _: i64| {
+    let read = |_: Cli, home: &Path, _: Option<&str>, _: i64| {
         if home == work {
             std::fs::write(world.cfg.join(Cli::Codex.accounts().roster_file), "").unwrap();
         }

@@ -416,8 +416,9 @@ k = 2
     assert!(doc.get("missing").is_none());
     assert!(
         doc["missing"].is_none(),
-        "indexing an absent key must vivify to the vacant item"
+        "shared Index on an absent key returns the static vacant item"
     );
+    assert!(doc.get("missing").is_none());
     assert!(matches!(doc.get("scalar"), Some(Item::Value(_))));
     assert!(matches!(doc.get("explicit"), Some(Item::Table(_))));
     assert!(matches!(doc.get("aot"), Some(Item::ArrayOfTables(_))));

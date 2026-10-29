@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! `<state_dir>/converge/journal.ndjson`: one line per change, flushed to stable media before
-//! applying.
+//! applying, and one per item an apply run ended failed.
 
 use crate::engine::Journal;
 use serde::Serialize;
@@ -11,8 +11,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// Bounded NDJSON change journal (`{"time", "id", "from", "to", "revert"}`) with single-rotation
-/// locking.
+/// Bounded NDJSON change journal (`{"time", "id", "from", "to", "revert"}`, and `{"time", "id",
+/// "failed"}` for an item an apply run ended failed) with single-rotation locking.
 #[derive(Debug, Clone)]
 pub struct FileJournal {
     dir: PathBuf,
@@ -28,6 +28,19 @@ struct Line<'a> {
     to: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     revert: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct Failed<'a> {
+    time: u64,
+    id: &'a str,
+    failed: &'a str,
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 impl FileJournal {
@@ -122,15 +135,23 @@ impl Journal for FileJournal {
         to: &str,
         revert: Option<&str>,
     ) -> Result<(), String> {
-        let time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
         let mut line = aterm_json::to_string(&Line {
-            time,
+            time: now_secs(),
             id,
             from,
             to,
             revert,
+        })
+        .map_err(|e| e.to_string())?;
+        line.push('\n');
+        self.append(line.as_bytes())
+    }
+
+    fn failed(&mut self, id: &str, why: &str) -> Result<(), String> {
+        let mut line = aterm_json::to_string(&Failed {
+            time: now_secs(),
+            id,
+            failed: why,
         })
         .map_err(|e| e.to_string())?;
         line.push('\n');
@@ -252,6 +273,11 @@ mod tests {
         }
     }
 
+    /// Each change's line is on disk before its apply runs, and an item the run ended failed (an
+    /// apply that failed, or one whose read-back still reads the old value) gets a line naming
+    /// why after its change's line.
+    /// NEGATIVE CONTROL: an engine that records no failure leaves the journal without the
+    /// `failed` lines.
     #[test]
     fn the_line_is_on_disk_before_the_apply_runs_and_a_failed_apply_keeps_it() {
         let scratch = aterm_tempfile::tempdir().unwrap();
@@ -274,21 +300,48 @@ mod tests {
                 journal: journal.path(),
                 seen: Arc::clone(&seen),
             }),
+            Box::new(Scripted {
+                id: "sync.fabric",
+                ..Scripted::new(vec![change(), change()], Ok(()))
+            }),
         ];
         let rows = run(&items, Mode::Apply, &mut journal).unwrap();
         assert_eq!(rows[0].outcome, Outcome::Changed);
         assert_eq!(rows[1].outcome, Outcome::Failed);
+        assert_eq!(rows[2].outcome, Outcome::Failed);
         let seen = seen.lock().unwrap();
         assert!(seen[0].contains("\"id\":\"base.shell.rc\""), "{}", seen[0]);
         assert!(seen[1].contains("\"id\":\"base.clt\""), "{}", seen[1]);
         let kept = lines(&journal.path());
-        assert_eq!(kept.len(), 2, "one line per change, the failed one too");
-        for (line, id) in kept.iter().zip(["base.shell.rc", "base.clt"]) {
-            assert_eq!(line["id"].as_str(), Some(id));
+        let ids: Vec<&str> = kept.iter().filter_map(|line| line["id"].as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "base.shell.rc",
+                "base.clt",
+                "base.clt",
+                "sync.fabric",
+                "sync.fabric"
+            ],
+            "one line per change, and one per failure after it: {kept:?}"
+        );
+        for line in [&kept[0], &kept[1], &kept[3]] {
             assert_eq!(line["from"].as_str(), Some("a"));
             assert_eq!(line["to"].as_str(), Some("b"));
             assert_eq!(line["revert"].as_str(), Some("undo"));
-            assert!(line["time"].as_u64().is_some_and(|t| t > 0));
+            assert!(line["failed"].is_null(), "{line:?}");
+        }
+        assert_eq!(kept[2]["failed"].as_str(), Some("softwareupdate said no"));
+        assert_eq!(
+            kept[4]["failed"].as_str(),
+            rows[2].why.as_deref(),
+            "a read-back that still reads the old value: {kept:?}"
+        );
+        for line in &kept {
+            assert!(line["time"].as_u64().is_some_and(|t| t > 0), "{line:?}");
+        }
+        for line in [&kept[2], &kept[4]] {
+            assert!(line["from"].is_null() && line["to"].is_null(), "{line:?}");
         }
     }
 

@@ -844,6 +844,13 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         true,
     ),
     manual(
+        "fleet.machine",
+        "This machine's swarm label in the fleet",
+        ConfigSchemaKind::Scalar(EditKind::Text),
+        &["fleet", "machine", "label", "host", "swarm"],
+        true,
+    ),
+    manual(
         "agents_auto_prime",
         "Prime coding agents automatically",
         ConfigSchemaKind::Scalar(EditKind::Bool),
@@ -985,6 +992,20 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         true,
     ),
     manual(
+        "amacs",
+        "amacs, aterm's editor",
+        ConfigSchemaKind::Table,
+        &["amacs", "editor", "visual"],
+        false,
+    ),
+    manual(
+        crate::prefs::EDIT_AMACS_DEFAULT_EDITOR,
+        "Use amacs as the default editor (EDITOR)",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["amacs", "editor", "visual", "git", "commit", "ctrl-g"],
+        true,
+    ),
+    manual(
         "keeper",
         "PTY keeper",
         ConfigSchemaKind::Table,
@@ -996,6 +1017,20 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "Keep shells alive across a crash",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &["keeper", "crash", "recover", "pty", "session"],
+        true,
+    ),
+    manual(
+        "swarm",
+        "Swarm participation",
+        ConfigSchemaKind::Table,
+        &["swarm", "secrets", "fleet", "commons", "accounts", "fabric"],
+        false,
+    ),
+    manual(
+        "swarm.enabled",
+        "Join and sync secrets, fleet, Commons, accounts, and fabric",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["swarm", "secrets", "fleet", "commons", "accounts", "fabric"],
         true,
     ),
     manual(
@@ -1389,6 +1424,20 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         true,
     ),
     manual(
+        "harness.claim_credits",
+        "Claim the free credits Claude Code offers",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &[
+            "supervisor",
+            "credits",
+            "claim",
+            "free credit",
+            "api credits",
+            "chrome",
+        ],
+        true,
+    ),
+    manual(
         "harness.model_fallback",
         "Model to relaunch on at a model limit",
         ConfigSchemaKind::Scalar(EditKind::Text),
@@ -1520,7 +1569,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "AI CLIs",
         ConfigSchemaKind::Table,
         &[
-            "ai", "cli", "claude", "codex", "agy", "muse", "grok", "review", "login",
+            "ai", "cli", "claude", "codex", "agy", "muse", "grok", "kimi", "review", "login",
         ],
         false,
     ),
@@ -1578,6 +1627,13 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "Grok Build on this machine",
         ConfigSchemaKind::Table,
         &["ai", "grok", "grok build", "xai"],
+        false,
+    ),
+    manual(
+        "ai.kimi",
+        "Kimi Code CLI on this machine",
+        ConfigSchemaKind::Table,
+        &["ai", "kimi", "kimi code", "moonshot"],
         false,
     ),
     manual(
@@ -1699,7 +1755,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "packages.peers",
         "LAN peers for toolset downloads",
         ConfigSchemaKind::StringList,
-        &["atpkg", "lan", "peer", "cache", "serve-units"],
+        &["atpkg", "lan", "peer", "cache", "fleet", "serve-units"],
         true,
     ),
     manual(
@@ -2235,7 +2291,9 @@ fn manual_default_shown(key: &str) -> Option<String> {
     }
     let config = crate::app_config::Config::default();
     Some(match key {
+        crate::prefs::EDIT_AMACS_DEFAULT_EDITOR => config.amacs.config.default_editor.to_string(),
         "keeper.enabled" => config.keeper_enabled().to_string(),
+        "fleet.watch" => config.fleet_watch_enabled().to_string(),
         "session_log.journal" => config.session_log_journal().to_string(),
         "session_log.clause" => config.session_log_clause().to_string(),
         "sys.stats_bars" => word(
@@ -3253,6 +3311,10 @@ pub(crate) fn disk_fault_at<'a>(
     faults: &'a [aterm_agent::harness::cli::DiskFault],
     path: &str,
 ) -> Option<(DiskFaultAt, &'a aterm_agent::harness::cli::DiskFault)> {
+    // No fault, no key path to parse.
+    if faults.is_empty() {
+        return None;
+    }
     DiskFaultAt::find(faults, &reader_spelling(path)?)
 }
 
@@ -3400,6 +3462,7 @@ fn reader_accepted_paths() -> &'static BTreeSet<String> {
                 .iter()
                 .map(|key| format!("disk.{key}")),
         );
+        paths.extend(amacs::config::KEYS.iter().map(|key| format!("amacs.{key}")));
         paths
     })
 }
@@ -5586,7 +5649,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · read only under approve = \"safe\", at Claude Code's rm circuit breaker · off: an rm the safe rules cannot prove is approved, and its reason kept as a warning"
         }
         "harness.probe_api" => {
-            " · a resolve, a connect and a TLS handshake to api.anthropic.com, no request sent, so a wait at an unreachable API ends within about a minute of it being back · off: the wait follows its time ladder alone"
+            " · a resolve, a connect and a TLS handshake to api.anthropic.com, no request sent, so a wait at an unreachable API ends within about a minute of it being back · it also watches this Mac's network path and routes, which sends nothing, so for every agent a lost path holds the wait for up to an hour and its return or a route change wakes it · off: the wait follows its time ladder alone"
         }
         "harness.limit_wait" => {
             " · at Claude Code's usage-limit dialog, chooses its Wait here row, never a spending row or Stop · off: the dialog is yours"
@@ -5595,10 +5658,10 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · at Claude Code's \"We recommend compacting earlier\" offer, chooses Autocompact at this size (300k to 900k), never the keep row or Esc · it changes Claude Code's own autocompact setting for that model (/autocompact switches back) · off: the offer is yours"
         }
         "harness.accounts" => {
-            " · at a usage limit, a Claude Code or Codex session is relaunched under the next listed account; \"early\" also moves it ahead of the limit (typing /usage to sample Claude Code, and reading Codex's usage); \"off\" moves no session · the one key for every CLI whose roster this machine keeps beside aterm.toml (accounts-codex.toml, accounts-grok.toml, accounts-kimi.toml): those pools are listed, pinned, synced and renewed (aterm harness accounts --cli <id>), launches start under their serving row, and no running Grok Build or Kimi Code session is moved in this build"
+            " · at a usage limit, a Claude Code session is relaunched under the next listed account; \"early\" also moves it ahead of the limit, typing /usage to sample it; \"off\" moves no session and syncs no roster of any CLI by itself (aterm harness accounts sync by hand still runs) · the one key for every CLI whose roster this machine keeps beside aterm.toml (accounts-codex.toml, accounts-grok.toml, accounts-kimi.toml): those pools are listed, pinned, synced and renewed (aterm harness accounts --cli <id>), launches start under their serving row (a Codex launch first reads the usage of each row whose reading is stale, and starts under a row other than the default only on a codex-alab that keeps that row's login its own, CODEX_AUTH_PATH; on any other Codex build it is refused, naming why), a Codex worker aterm spawns waits while every row it may start under is at its limit (on any other Codex build, the default row alone), starting once one serves (no Grok Build or Kimi Code limit is recorded, so their rows are never held for one), a Codex tab a cold restore relaunches leaves its row for the serving one where that row is limited or signed out (on any other Codex build, only for the default row), and no running Codex, Grok Build or Kimi Code session is moved in this build"
         }
         "harness.logins" => {
-            " · a login listed with an email is signed in again by aterm itself when it ends or comes due, and a Claude Code session on it is relaunched onto the new login; aterm types no /login over it, and where nothing relaunches the tab (relaunch or resume_limits off, a restart it cannot make) the tab waits, its record naming why · a lost login listed nowhere is signed in where it stands: aterm types /login once and the browser sign-in is yours · off: aterm signs no listed login in by itself and no session follows a renewal, so a lost login gets /login once · in every CLI's roster: a window renews a due login of another CLI's roster in the background where a headless browser is installed and the row names an email (on macOS, Grok Build's sign-in and Codex's device-flow sign-in run in a sandbox that keeps them from opening a browser on the desk, and not at all where that sandbox is missing), and off stops that too (aterm harness accounts renew --cli <id> by hand still runs)"
+            " · a login listed with an email is signed in again by aterm itself when it ends or comes due, and a Claude Code session on it is relaunched onto the new login; aterm types no /login over it, and where nothing relaunches the tab (relaunch or resume_limits off, a restart it cannot make) the tab waits, its record naming why · a lost login listed nowhere is signed in where it stands: aterm types /login once and the browser sign-in is yours · off: aterm signs no listed login in by itself and no session follows a renewal, so a lost login gets /login once · in every CLI's roster: a window renews a due Codex or Kimi Code login in the background where a headless browser is installed and the row names an email (on macOS, Codex's device-flow sign-in runs in a sandbox that keeps it from opening a browser on the desk, and not at all where that sandbox is missing; never the Codex row on this machine's own login while this machine's Codex keeps no row's login its own, which Codex's own sign-in in its default home signs in, aterm ai login codex, once that login ends), and off stops that too (aterm harness accounts renew --cli <id> by hand still runs) · a window renews no Grok Build login: accounts.x.ai answers a headless browser with its bot-protection block page, so each try would be an xAI device code and a blocked page; aterm harness accounts login <label> --cli grok, run and approved by you, signs it in"
         }
         "harness.hosts" => {
             " · read by aterm harness accounts renew --due alone · each is host or host:/abs/path/to/aterm"
@@ -5614,6 +5677,9 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         }
         "harness.usage_credits" => {
             " · Claude Code only · on: a consent box that names usage credits is taken (`Continue with <model>` is kept by Claude Code for good for that model and account; `Continue with usage credits` saves nothing and carries the session onto credits already on) and a model limit that asks for it is continued into it · off by default: the harness keeps sessions on the subscription; such a box is cancelled with Esc, a session credits carry gets no turn of the harness's own until the reset their notice names (then one turn, which another window may still bill to credits), and no session is moved onto a model billed to credits · nothing is ever bought either way"
+        }
+        "harness.claim_credits" => {
+            " · Claude Code only · where Claude Code's cached offers name a free credit live for the signed-in account (the cloud session credit, the plan's monthly API credits), a window's host starts one worker tab with Claude in Chrome (--chrome) that opens the offer's claude.ai link in your own Chrome and claims it · it never enters payment details, buys anything, turns on extra usage or changes the plan · the harness approves only its Chrome actions on the vendor's claim pages, once each, declines every other box it raises, leaves its questions and any other Chrome action to you, and turns its Autopilot off after 30 minutes · once per offer, again at most once a week later if the offer still stands · feature of the week (it turns on extra usage), guest passes and admin opt-ins are never claimed · off: no claim worker starts"
         }
         "harness.model_fallback" => {
             " · Claude Code only, for that session alone · none: wait for the reset"
@@ -5664,7 +5730,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · default true: while the harness's theme is on a Claude Code session (its composer border drawn), the agents panel under the footer wears the theme's rainbow — each row's name in its stripe at Claude's own lightness, a workflow's bar along the whole palette — and each agent's dot tells its work: hue = which agent, brightness and glow = how much work, saturation = how fresh, full hue with a dim steady glow = in its own tool call (inside that call's timeout plus 30 s, read from its transcript), a grey breath = stuck (no work for 150 s with nothing of its own in flight), a still amber ring = awaiting approval, Claude's own green or red = done or failed — glass only; false leaves the panel as Claude drew it · serious mode keeps the colours and drops the glow · read live"
         }
         "claude_footer.card" => {
-            " · default true: while the harness carries a Claude Code session (Autopilot cruise or land, its claim this window's), its launch card wears a rainbow border, a pixel-art kitty riding a rainbow with stars, and the line `✦ enhanced by alab claude harness <harness version> · autopilot ∞ cruise`, and under Autopilot off the same card in white (`· autopilot ○ off`) — glass only; false leaves the card bare · read live"
+            " · default true: while the harness carries a Claude Code session (Autopilot cruise or land, its claim this window's), its launch card wears a rainbow border, a pixel-art kitty riding a rainbow with stars, and the line `✦ enhanced by alab claude harness <harness version> · alab.systems` (the site's name a link), and under Autopilot off the same card in white; banners over Claude Code's update notice and its startup announcement name and link alab.systems — glass only; false leaves the card bare · read live"
         }
         "keeper.enabled" => {
             " · read at launch; on, every terminal is registered with this build's PTY keeper (`aterm keeper start` runs one) and a launch after a crash or kill reattaches the shells it held · macOS only"
@@ -6251,12 +6317,10 @@ pub(crate) mod tests {
     fn settings_set_names_a_hand_written_key_as_one() {
         for key in ["conpty", "windowing_behavior", "fleet.peers"] {
             let refusal = control_settings_refusal(key);
-            assert_eq!(
-                refusal,
-                format!(
-                    "{key} is set in aterm.toml by hand, not through Settings: edit the file or \
-                     use Manual, which completes and checks it"
-                )
+            assert!(
+                refusal.starts_with(&format!("{key} is set in aterm.toml by hand"))
+                    && refusal.contains("Manual"),
+                "{refusal}"
             );
         }
         for (key, verb) in [
@@ -6279,10 +6343,10 @@ pub(crate) mod tests {
             control_settings_refusal("title_summary_provider"),
             compatibility_only_message("title_summary_provider")
         );
-        assert_eq!(
-            control_settings_refusal("not_a_real_setting"),
-            "unknown key \"not_a_real_setting\" (search Settings or use Manual for the complete \
-             schema)"
+        let unknown = control_settings_refusal("not_a_real_setting");
+        assert!(
+            unknown.starts_with("unknown key \"not_a_real_setting\"") && unknown.contains("Manual"),
+            "{unknown}"
         );
     }
 

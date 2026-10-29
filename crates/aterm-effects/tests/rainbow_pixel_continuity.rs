@@ -357,24 +357,19 @@ fn make_glow_cfg(style: GlowStyle, ribbon_flat: bool, dark_theme: bool) -> GlowC
         (0x001E_2028, 0x00F7_F5EE)
     };
     GlowConfig {
-        classic_mono: false,
         ribbon_tall: !ribbon_flat && style == GlowStyle::RainbowKitty,
         ribbon_flat,
-        enabled: true,
         dark_theme,
         theme_fg,
         theme_bg,
         style,
-        color: 0x0050_FA7B,
         accent: 0x007A_A2F7,
         duration: Duration::from_millis(240),
         length: 18,
         intensity: 0.7,
-        audible: false,
         radius: 0.6,
         ring: true,
-        beam: false,
-        head_dx: 0.5,
+        ..Default::default()
     }
 }
 
@@ -557,8 +552,8 @@ impl NativeHarness {
 
         let (anchor, glyph) = motion_print_anchor(&self.term);
         self.fx.cursor_step(
-            &CursorStep {
-                input: CursorFxInput {
+            &CursorStep::new(
+                CursorFxInput {
                     now: self.now,
                     cur,
                     live_viewport: self.term.grid().display_offset() == 0,
@@ -577,8 +572,8 @@ impl NativeHarness {
                     user_tinted: false,
                     accent_pinned: false,
                 },
-                glow: &self.cfg,
-                trail: TrailConfig {
+                &self.cfg,
+                TrailConfig {
                     enabled: false,
                     duration: self.cfg.duration,
                     max_len: self.cfg.length,
@@ -586,15 +581,11 @@ impl NativeHarness {
                     intensity: self.cfg.intensity,
                     warmth: 0.0,
                 },
-                animate: true,
-                row_probe: probe,
-                pending_keys: 0,
-                print_anchor: anchor,
-                print_anchor_glyph: glyph,
-                caret_drawn: visible,
-                frame_cells: None,
-                frame_cells_at: (0, 0),
-            },
+            )
+            .with_row_probe(probe)
+            .with_print_anchor(anchor)
+            .with_print_anchor_glyph(glyph)
+            .with_caret_drawn(visible),
             std::iter::empty(),
         );
 
@@ -960,11 +951,22 @@ fn pixel_continuity_across_owners_phrase_and_word_boundary_pauses() {
     let pause_ms_cases = [
         0u64, 17, 50, 100, 160, 220, 260, 310, 380, 450, 550, 700, 900, 1200,
     ];
-    let mut failures = Vec::new();
-
+    // Each case drives harnesses of its own, so the cases run side by side on the suite's
+    // replay pool, each under `attempt`: a case that panics is reported beside every other
+    // case's gaps.
+    let mut cases = Vec::new();
     for &pause_at_space_ms in &pause_ms_cases {
-        for &coalesce_after_space in &[1usize, 2, 3, 4] {
-            for &flat in &[false, true] {
+        for coalesce_after_space in [1usize, 2, 3, 4] {
+            for flat in [false, true] {
+                cases.push((pause_at_space_ms, coalesce_after_space, flat));
+            }
+        }
+    }
+    let runs = crate::common::par_map(
+        &cases,
+        |&(pause_at_space_ms, coalesce_after_space, flat)| {
+            aterm_spec::check::attempt(|| {
+                let mut failures = Vec::new();
                 let cfg = make_glow_cfg(GlowStyle::RainbowKitty, flat, true);
                 let mut h = NativeHarness::new(53, 113, 15, 28, cfg, false);
                 h.feed(b"\x1b[?1049h\x1b[2J\x1b[H");
@@ -1069,9 +1071,21 @@ fn pixel_continuity_across_owners_phrase_and_word_boundary_pauses() {
                 if !h.gaps.is_empty() {
                     failures.extend(h.gaps.into_iter().take(3));
                 }
-            }
-        }
-    }
+                failures
+            })
+        },
+    );
+    let failures: Vec<String> = cases
+        .iter()
+        .zip(runs)
+        .flat_map(|(&(pause, coalesce, flat), run)| {
+            run.unwrap_or_else(|why| {
+                vec![format!(
+                    "pause={pause}ms coal={coalesce} flat={flat}: the case panicked: {why}"
+                )]
+            })
+        })
+        .collect();
 
     assert!(
         failures.is_empty(),

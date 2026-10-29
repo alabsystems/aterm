@@ -269,6 +269,8 @@ fn a_row_added_beside_a_local_fleet_survives_the_next_sync() {
             fetch: &fetch_source_text,
             ladder: &[],
             fleet_snapshots: &[],
+            heal: None,
+            allow_empty_pool: false,
         },
     );
     assert_eq!(
@@ -425,4 +427,217 @@ fn a_local_accounts_source_is_synced_again_each_time_it_changes() {
             .iter()
             .any(|r| r.email.as_deref() == Some("sun.m27.2@example.test"))
     );
+}
+
+/// THE CONVERGE READ OF A RESYNC is due wherever the resync syncs: a roster that is missing,
+/// before the first sync and again once removed, never reads as in step; after each sync that
+/// wrote it, the read in the same process reads nothing left. CONTROL: `[harness] accounts =
+/// "off"` reads nothing due over the same missing roster.
+/// NEGATIVE CONTROL: a read that leaves the missing roster to `needs_init_accounts_sync` reads
+/// the removed roster as in step.
+#[test]
+fn the_converge_read_is_due_where_the_resync_syncs_a_missing_roster() {
+    let desk = discovered_desk();
+    let fetch = |_: &Env, source: &str| -> Result<String, String> {
+        Err(format!("no fetch in a test: {source}"))
+    };
+    let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
+    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let read = Mutex::new(Rediscovery::default());
+    let due = |now: i64| resync_due_with(&desk.home, &desk.state, &desk.roster(), now, &read);
+    // Each runner is a process of its own: a resync with fresh effects, as the pass's apply.
+    let resync = |now: i64| {
+        let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
+        let fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
+        resync_with(&desk.home, &desk.state, (&desk.roster(), now, false), &fx)
+    };
+
+    assert!(
+        due(NOW).is_some_and(|why| why.contains("the roster is missing")),
+        "no roster yet"
+    );
+    let first = resync(NOW);
+    assert!(first.synced && first.changed, "{first:?}");
+    assert_eq!(
+        due(NOW + 1),
+        None,
+        "the read after the sync reads it in step"
+    );
+
+    fs::remove_file(desk.roster()).unwrap();
+    assert!(
+        due(NOW + 2).is_some_and(|why| why.contains("the roster is missing")),
+        "a removed roster is never read as in step"
+    );
+    let back = resync(NOW + 3);
+    assert!(back.synced && desk.roster().is_file(), "{back:?}");
+    assert_eq!(due(NOW + 4), None);
+
+    fs::remove_file(desk.roster()).unwrap();
+    fs::write(
+        desk.config.join("aterm.toml"),
+        "[fleet]\nmachine = \"m27\"\n[harness]\naccounts = \"off\"\n",
+    )
+    .unwrap();
+    assert_eq!(due(NOW + 5), None, "CONTROL: off reads nothing due");
+}
+
+#[test]
+fn a_kimi_only_resync_reaches_current_without_a_claude_roster_or_source() {
+    let desk = Desk::new("m16");
+    let config = desk.config.join("aterm.toml");
+    let kimi = accounts::roster_beside_for(&config, Cli::Kimi).unwrap();
+    fs::write(&kimi, "").unwrap();
+    let secrets = desk.home.join(".secrets");
+    aterm_types::fs_restricted::ensure_private_dir(&secrets).unwrap();
+    let source = secrets.join(cli_fleet_file(Cli::Kimi));
+    let fleet = "[[account]]\nlabel='kimi-1'\nemail='kimi-one@example.test'\n\
+                 machines=['m16']\nregion='global'\n";
+    fs::write(&source, fleet).unwrap();
+    assert!(!desk.roster().exists() && !desk.fleet_file().exists());
+    assert!(!has_init_accounts_source(
+        &desk.home,
+        &desk.state,
+        &desk.roster(),
+        NOW
+    ));
+    assert!(has_resync_accounts_source(
+        &desk.home,
+        &desk.state,
+        &desk.roster(),
+        NOW
+    ));
+
+    let read = Mutex::new(Rediscovery::default());
+    let due = |now| resync_due_with(&desk.home, &desk.state, &desk.roster(), now, &read);
+    assert!(due(NOW).is_some_and(|why| why.contains("kimi")));
+    let fetch = |_: &Env, source: &str| -> Result<String, String> {
+        Err(format!("no fetch in a test: {source}"))
+    };
+    let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
+    let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
+    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
+    let synced = resync_with(&desk.home, &desk.state, (&desk.roster(), NOW, false), &fx);
+    let after = due(NOW + 1);
+
+    assert!(synced.synced && synced.changed, "{synced:?}");
+    assert!(fs::read_to_string(&kimi).unwrap().contains("kimi-1"));
+    assert_eq!(
+        cli_sync_due(Cli::Kimi, &desk.home, &desk.state, &config, NOW + 1),
+        Ok(Vec::new())
+    );
+    assert!(synced.cli_failed.is_empty(), "{synced:?}");
+    assert!(!desk.roster().exists() && !desk.fleet_file().exists());
+    assert_eq!(fs::read_to_string(source).unwrap(), fleet);
+    assert!(
+        synced.failed.is_none() && after.is_none(),
+        "resync={synced:?}; read after actual pool sync={after:?}"
+    );
+}
+
+#[test]
+fn a_missing_claude_roster_keeps_its_unannotated_local_source_and_its_refusal() {
+    for valid in [true, false] {
+        let desk = Desk::new("m16");
+        let source = if valid {
+            "[[account]]\nlabel='claude-1'\nemail='claude-one@example.test'\nmachines=['m16']\n"
+        } else {
+            "[[account]\n"
+        };
+        fs::write(desk.fleet_file(), source).unwrap();
+        assert!(!desk.roster().exists());
+        assert!(!has_init_accounts_source(
+            &desk.home,
+            &desk.state,
+            &desk.roster(),
+            NOW
+        ));
+        let read = Mutex::new(Rediscovery::default());
+        let due = |now| resync_due_with(&desk.home, &desk.state, &desk.roster(), now, &read);
+        assert!(due(NOW).is_some_and(|why| why.contains("the roster is missing")));
+        let fetch = |_: &Env, source: &str| -> Result<String, String> {
+            Err(format!("no fetch in a test: {source}"))
+        };
+        let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
+        let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
+        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
+        let synced = resync_with(&desk.home, &desk.state, (&desk.roster(), NOW, false), &fx);
+        assert!(synced.synced, "{synced:?}");
+        if valid {
+            assert!(synced.changed && synced.failed.is_none(), "{synced:?}");
+            assert!(
+                fs::read_to_string(desk.roster())
+                    .unwrap()
+                    .contains("claude-1")
+            );
+            assert_eq!(due(NOW + 1), None);
+        } else {
+            assert!(synced.failed.is_some(), "{synced:?}");
+            assert!(!desk.roster().exists());
+            assert_eq!(fs::read_to_string(desk.fleet_file()).unwrap(), source);
+            assert!(due(NOW + 1).is_some());
+        }
+    }
+}
+
+#[test]
+fn an_ai_pool_without_claude_accounts_for_this_machine_reaches_current() {
+    let desk = Desk::new("m16");
+    let config = desk.config.join("aterm.toml");
+    let codex = accounts::roster_beside_for(&config, Cli::Codex).unwrap();
+    let secrets = desk.home.join(".secrets");
+    aterm_types::fs_restricted::ensure_private_dir(&secrets).unwrap();
+    fs::write(
+        secrets.join(super::super::ai_pool::AI_POOL_FILE),
+        "version = 1\n\n[[account]]\nprovider = \"codex\"\nemail = \"codex-one@example.test\"\nwarm = [\"m16\"]\n",
+    )
+    .unwrap();
+    assert!(has_resync_accounts_source(
+        &desk.home,
+        &desk.state,
+        &desk.roster(),
+        NOW
+    ));
+    assert_eq!(
+        cli_pools_due(&config, &desk.state, &desk.home, NOW),
+        vec![Cli::Codex]
+    );
+
+    let read = Mutex::new(Rediscovery::default());
+    let due = |now| resync_due_with(&desk.home, &desk.state, &desk.roster(), now, &read);
+    assert!(
+        due(NOW)
+            .as_deref()
+            .is_some_and(|why| why.contains("codex's pool has accounts to add (codex-m16)")),
+        "before sync: {:?}",
+        due(NOW)
+    );
+    let fetch = |_: &Env, source: &str| -> Result<String, String> {
+        Err(format!("no fetch in a test: {source}"))
+    };
+    let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
+    let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
+    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
+    let synced = resync_with(&desk.home, &desk.state, (&desk.roster(), NOW, false), &fx);
+    assert!(
+        synced.synced && synced.changed && synced.failed.is_none() && synced.cli_failed.is_empty(),
+        "{synced:?}"
+    );
+    assert!(!desk.roster().exists(), "no Claude accounts for m16");
+    assert!(fs::read_to_string(&codex).unwrap().contains("codex-m16"));
+    assert_eq!(
+        due(NOW + 1),
+        None,
+        "empty Claude pool is settled and Codex pool is synced"
+    );
+    let quiet = resync_with(
+        &desk.home,
+        &desk.state,
+        (&desk.roster(), NOW + 60, false),
+        &fx,
+    );
+    assert!(!quiet.changed && quiet.failed.is_none(), "{quiet:?}");
 }

@@ -247,9 +247,14 @@ fn a_footprints_payload_leaves_the_byte_budget_when_its_rows_cross() {
         sb.push_line(image_row(&image, row, 4));
     }
     let with_picture = sb.total_memory_used();
+    let budgeted_with_picture = sb.budgeted_memory_used();
     assert!(
         with_picture >= PAYLOAD,
         "a retained footprint must be charged its raster: {with_picture} < {PAYLOAD}"
+    );
+    assert!(
+        budgeted_with_picture >= PAYLOAD,
+        "a retained footprint must charge budgeted_memory_used(): {budgeted_with_picture} < {PAYLOAD}"
     );
 
     for i in 0..8 {
@@ -257,8 +262,13 @@ fn a_footprints_payload_leaves_the_byte_budget_when_its_rows_cross() {
     }
     assert_eq!(sb.image_rows_dropped_by_compression(), ROWS.into());
     let after = sb.total_memory_used();
+    let budgeted_after = sb.budgeted_memory_used();
     assert!(
         after < PAYLOAD / 2,
-        "the raster must leave the budget with the rows that crossed: {after}"
+        "the raster must leave total_memory_used() with the rows that crossed: {after}"
+    );
+    assert!(
+        budgeted_after < PAYLOAD / 2,
+        "the raster must leave budgeted_memory_used() with the rows that crossed: {budgeted_after}"
     );
 }

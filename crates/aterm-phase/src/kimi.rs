@@ -16,7 +16,7 @@ use crate::wall::{Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 4, "0.4");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 5, "0.5");
 
 /// The usage limit is spent: Kimi Code's own quota patterns (lowercase).
 const QUOTA: [&str; 3] = [

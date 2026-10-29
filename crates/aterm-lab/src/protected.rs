@@ -243,6 +243,8 @@ mod tests {
             "/Users//o/.aterm",
             "/Users//o/.aterm/machine.key",
             "/Users//o/.aterm/release-credentials.toml",
+            "/Users//o/.aterm/release-ring/machine.key",
+            "/Users//o/.aterm/release-ring/release-credentials.toml",
             "/Users//o/.aterm/shell.d/zsh.zsh",
             "/Users//o/.secrets",
             "/Users//o/.secrets/token",

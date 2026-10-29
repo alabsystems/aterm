@@ -281,7 +281,7 @@ pub(super) mod legacy {
     /// Emulate an old admin's complete signed publication, including loss of the
     /// independent Commons field. This is deliberately unavailable in production.
     pub(in crate::client) fn publish_legacy(paths: &Paths, admin: &Admin) {
-        let bytes = client::seal(
+        let bytes = client::seal_with_admissions_and_parents(
             &admin.config.name,
             admin.seq() + 1,
             &admin.seed,
@@ -289,6 +289,10 @@ pub(super) mod legacy {
             admin.commons_bound,
             &admin.doc,
             &admin.handoff,
+            &admin.opened_heads,
+            &crate::client::admission::Ledger::default()
+                .retained(&admin.doc)
+                .unwrap(),
         )
         .unwrap();
         let parsed = envelope::parse(&bytes).unwrap();
@@ -302,6 +306,7 @@ pub(super) mod legacy {
                 seq: parsed.seq,
                 time: parsed.time,
                 handoff: parsed.handoff.clone(),
+                parents: parsed.parents.clone(),
                 lockers,
             },
             &admin.seed,

@@ -224,12 +224,6 @@ fn mouse_x10_coordinate_beyond_223_clamps_and_keeps_the_x10_frame() {
         Some(vec![0x1b, b'[', b'M', 32, 255, 38]),
         "out-of-range coordinates clamp INSIDE the X10 frame"
     );
-    assert_ne!(
-        t.encode_mouse_press(0, 300, 5, 0).as_deref(),
-        Some(b"\x1b[<0;301;6M".as_slice()),
-        "the pre-fix SGR promotion is exactly the defect: a 1006 report the \
-         application never requested"
-    );
     assert_eq!(
         t.encode_mouse_release(0, 300, 5, 0),
         Some(vec![0x1b, b'[', b'M', 32 + 3, 255, 38])

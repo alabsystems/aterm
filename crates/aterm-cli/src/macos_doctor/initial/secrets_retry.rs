@@ -80,6 +80,9 @@ pub(super) struct Pace {
     pub(super) inputs: Option<Inputs>,
     /// A coherent local materialization reading; unknown never erases a known one.
     pub(super) materialization: Option<MaterializationMark>,
+    /// The network it was read on ([`network`]), which the try's record keeps for System State's
+    /// reading of what the try heard ([`last_rows`]); never a cue to try again.
+    pub(super) network: Option<String>,
     /// Now, in seconds since the epoch.
     pub(super) now: u64,
 }
@@ -92,6 +95,13 @@ impl Pace {
             (Some(current), Some(previous)) => current.known_matches(previous),
             _ => self.marks.is_none() || self.marks == before.marks,
         };
+        let same_routes = match (&self.inputs, &before.inputs) {
+            (Some(current), Some(previous)) => current
+                .routes
+                .as_ref()
+                .is_none_or(|routes| previous.routes.as_ref() == Some(routes)),
+            _ => compatible,
+        };
         if let (Some(current), Some(previous)) = (&mut self.inputs, &before.inputs) {
             current.retain_known_from(previous);
         }
@@ -100,6 +110,9 @@ impl Pace {
         }
         if self.materialization.is_none() {
             self.materialization = before.materialization;
+        }
+        if self.network.is_none() && same_routes {
+            self.network.clone_from(&before.network);
         }
     }
 }
@@ -112,10 +125,20 @@ pub(super) trait Reads {
     fn now(&self) -> u64;
     /// Stable local interface facts as text.
     fn routes(&self) -> Option<String>;
+    /// The key a kept look at the ALab vault is held to ([`aterm_secrets::heard::network_key`]:
+    /// the default gateway's hardware address and the IPv4 subnets), `None` where it cannot be
+    /// formed.
+    fn network_key(&self) -> Option<String> {
+        None
+    }
     /// Vault handle for the single console account, if any.
     fn vault(&self) -> Option<Arc<dyn SecretsOps>>;
     /// Local vault files, when this reader can observe materialization.
     fn paths(&self) -> Option<aterm_secrets::client::Paths> {
+        None
+    }
+    /// Clone into a `Send` reader for the concurrent Secrets lane, when supported.
+    fn boxed_clone(&self) -> Option<Box<dyn Reads + Send>> {
         None
     }
 }
@@ -123,6 +146,7 @@ pub(super) trait Reads {
 /// The pace `reads` reads now.
 pub(super) fn pace(reads: &dyn Reads) -> Pace {
     let (marks, inputs) = marks(reads);
+    let network = network_or(reads, || inputs.routes.clone());
     Pace {
         build: reads.build(),
         marks,
@@ -132,6 +156,7 @@ pub(super) fn pace(reads: &dyn Reads) -> Pace {
                 .ok()
                 .flatten()
         }),
+        network,
         now: reads.now(),
     }
 }
@@ -194,6 +219,7 @@ pub(super) fn subscriber_running(state: aterm_secrets::service::State) -> bool {
 }
 
 /// This Mac, now.
+#[derive(Clone, Copy)]
 pub(super) struct Live;
 
 impl Reads for Live {
@@ -212,6 +238,10 @@ impl Reads for Live {
         Some(format!("{:?}", Some(interfaces)))
     }
 
+    fn network_key(&self) -> Option<String> {
+        aterm_secrets::heard::network_key()
+    }
+
     fn vault(&self) -> Option<Arc<dyn SecretsOps>> {
         let ctx =
             aterm_machines::init::initial_setup_context(&aterm_machines::port::Live::new()).ok()?;
@@ -227,6 +257,10 @@ impl Reads for Live {
             ))),
             _ => None,
         }
+    }
+
+    fn boxed_clone(&self) -> Option<Box<dyn Reads + Send>> {
+        Some(Box::new(*self))
     }
 }
 
@@ -245,6 +279,8 @@ struct Attempt {
     marks: Option<String>,
     inputs: Option<Inputs>,
     materialization: Option<MaterializationMark>,
+    /// The network the try ran on ([`Pace::network`]); a try an older build recorded keeps none.
+    network: Option<String>,
     tries: u32,
     /// How many of the last tries in a row failed (an error row: a change not made).
     failures: u32,
@@ -290,6 +326,7 @@ impl Attempt {
             materialization: record["materialization"]
                 .as_str()
                 .and_then(MaterializationMark::from_cache_key),
+            network: record["network"].as_str().map(str::to_owned),
             tries: count("tries")?,
             failures: count("failures")?,
             at: record["at"].as_u64()?,
@@ -314,6 +351,13 @@ impl Attempt {
                 .as_object_mut()
                 .unwrap()
                 .insert("inputs".into(), inputs.to_record());
+        }
+        // A field older builds do not read, and drop when they write the record again.
+        if let Some(network) = &self.network {
+            record
+                .as_object_mut()
+                .unwrap()
+                .insert("network".into(), network.as_str().into());
         }
         write_json(&root.join(RECORD), &record)
     }
@@ -342,6 +386,19 @@ impl Attempt {
 
     const fn held(&self) -> bool {
         self.failures >= TRIES
+    }
+
+    /// The rows this try left, as the stage gave them with its pause's note.
+    fn rows(self) -> Vec<Row> {
+        self.rows
+            .into_iter()
+            .map(|(name, status, detail)| Row {
+                name,
+                status,
+                detail,
+                elapsed_ms: None,
+            })
+            .collect()
     }
 }
 
@@ -395,19 +452,57 @@ pub(super) fn paused(root: &Path, revision: u64, pace: &Pace) -> Option<Vec<Row>
         let _ = last.save(root);
     }
     let due = last.at.saturating_add(pause(last.tries).as_secs());
-    (last.unchanged(revision, pace) && (last.held() || (last.at..due).contains(&pace.now))).then(
-        || {
-            last.rows
-                .into_iter()
-                .map(|(name, status, detail)| Row {
-                    name,
-                    status,
-                    detail,
-                    elapsed_ms: None,
-                })
-                .collect()
-        },
-    )
+    (last.unchanged(revision, pace) && (last.held() || (last.at..due).contains(&pace.now)))
+        .then(|| last.rows())
+}
+
+/// The network `reads` reads now, as a try keeps the one it ran on ([`Pace::network`]) and System
+/// State tells a look at the ALab vault there from one elsewhere: the key a kept look is held to
+/// ([`Reads::network_key`]), which an address that comes and goes on the same network (an IPv6
+/// one, AirDrop's link) leaves as it was, or where none can be formed, its routes
+/// ([`Inputs::routes`]); fingerprinted, `None` where neither can be read.
+pub(super) fn network(reads: &dyn Reads) -> Option<String> {
+    network_or(reads, || routes(reads))
+}
+
+/// [`network`], with the routes' fingerprint `routes` gives where no key can be formed.
+fn network_or(reads: &dyn Reads, routes: impl FnOnce() -> Option<String>) -> Option<String> {
+    reads
+        .network_key()
+        .map(|key| fingerprint("network", &key))
+        .or_else(routes)
+}
+
+/// The fingerprint of the routes `reads` reads now, as a try keeps them ([`Inputs::routes`]).
+fn routes(reads: &dyn Reads) -> Option<String> {
+    reads.routes().map(|routes| fingerprint("routes", &routes))
+}
+
+/// Whether what a look at the ALab vault heard on the network `heard_on` ([`network`]) speaks for
+/// the network `reads` reads now: the same network, both read. A look heard only its own network,
+/// so one on another, or one whose network or this one cannot be read, says nothing here.
+pub(super) fn on_network(heard_on: Option<&str>, reads: &dyn Reads) -> bool {
+    heard_on.is_some_and(|heard_on| network(reads).as_deref() == Some(heard_on))
+}
+
+/// The rows the last unfinished Secrets try of `revision` left, paused or not, which System
+/// State's vault row reads where this process heard nothing of the ALab vault on this network
+/// ([`super::scope::heard_at`]): only where that try ran on the network `reads` reads now
+/// ([`on_network`]), or for a try an older build recorded, which kept only its routes, where they
+/// are the routes read now. A stopped run keeps its record and asks nothing again, so a launch on
+/// another network has heard nothing there.
+pub(super) fn last_rows(root: &Path, revision: u64, reads: &dyn Reads) -> Option<Vec<Row>> {
+    let last = Attempt::load(root).filter(|last| last.revision == revision)?;
+    let heard_here = match last.network.as_deref() {
+        Some(network) => on_network(Some(network), reads),
+        None => last
+            .inputs
+            .as_ref()?
+            .routes
+            .as_ref()
+            .is_some_and(|ran| routes(reads).as_ref() == Some(ran)),
+    };
+    heard_here.then(|| last.rows())
 }
 
 /// The deadline of a retryable try now due, for a parked worker. A row that
@@ -440,6 +535,14 @@ fn retry_window(root: &Path, revision: u64) -> Option<(u64, u64)> {
         return None;
     }
     Some((last.at, last.at.saturating_add(pause(last.tries).as_secs())))
+}
+
+/// Clear any recorded unfinished Secrets pause in `root` (for example, when a fresh Local Network
+/// grant lifts a pre-grant `UNREACHED` hold).
+pub(super) fn clear_at(root: &Path) {
+    if std::fs::remove_file(root.join(RECORD)).is_ok() {
+        let _ = durable_directory(root);
+    }
 }
 
 /// Records the outcome of a Secrets attempt for `revision` at `pace`.
@@ -492,6 +595,21 @@ pub(super) fn record(
             .filter(|last| last.revision == revision)
             .and_then(|last| last.materialization)
     });
+    let network = pace.network.clone().or_else(|| {
+        previous
+            .as_ref()
+            .filter(|last| {
+                last.revision == revision
+                    && match (&pace.inputs, &last.inputs) {
+                        (Some(current), Some(before)) => current
+                            .routes
+                            .as_ref()
+                            .is_none_or(|routes| before.routes.as_ref() == Some(routes)),
+                        _ => last.same_inputs(pace),
+                    }
+            })
+            .and_then(|last| last.network.clone())
+    });
     let (tries, failures, builds) = match previous.filter(|l| l.same_row(revision, pace)) {
         Some(last) if last.builds.contains(&pace.build) => {
             (last.tries.saturating_add(1), last.failures, last.builds)
@@ -532,6 +650,7 @@ pub(super) fn record(
         marks,
         inputs,
         materialization,
+        network,
         tries,
         failures,
         at: pace.now,
@@ -613,6 +732,7 @@ mod tests {
             marks: Some(marks.into()),
             inputs: None,
             materialization: None,
+            network: None,
             now,
         }
     }

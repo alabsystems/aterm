@@ -1,0 +1,15 @@
+# claude-code 2.1.312 · MEASURED 2026-10-27, `aterm ctl text` of aterm's jailed real-Claude lab (100x50, aterm 0.145.0 dev build e725d40263, Autopilot Cruise) running the real Claude Code 2.1.312 against a stub API: one warning (prompt caching off) above a barred companyAnnouncements slot that outranks the startup announcement, so a hidden-count row stands under it; settings.json env DISABLE_PROMPT_CACHING=1 and companyAnnouncements = [one string]; cachedGrowthBookFeatures.tengu_startup_announcements = [{id lab-barred-c, accentBar true, priority 0}]
+ ▐▛███▛█   Claude Code v2.1.312
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.AyU2/proj
+
+⚠ Prompt caching off (DISABLE_PROMPT_CACHING), requests will be slower and cost more · unset it to
+  re-enable
+
+▎ Lab company announcement: a barred org-priority notice whose words wrap at sixty columns.
+  1 more notice hidden
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                           ◐ medium · /effort

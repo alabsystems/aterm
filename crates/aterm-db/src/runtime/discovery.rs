@@ -11,7 +11,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MAX_PEERS: usize = 64;
+/// Room for every member of a full Commons roster, so a steward can dial each one and hear
+/// whether it is silent or which aterm it runs (C26).
+const MAX_PEERS: usize = aterm_secrets::commons::roster::MAX_MEMBERS + 1;
+/// Each cache can retain a full roster's worth of unverified hints independently.
+pub(crate) const MAX_UNVERIFIED_ENDPOINTS: usize = 2 * MAX_PEERS;
 const PER_IP: usize = 2;
 const EXPIRES: Duration = Duration::from_secs(45);
 const VERIFIED_EXPIRES: Duration = Duration::from_secs(600);
@@ -23,6 +27,27 @@ fn retry_delay(own: &[u8; 32], attempt: u64) -> Duration {
     let hash = aterm_digest::Sha256::digest(&seed);
     let jitter = u64::from(u16::from_be_bytes([hash[0], hash[1]])) % 2000;
     Duration::from_millis(3000 + jitter)
+}
+
+fn follow_up_delay(own: &[u8; 32], attempt: u64) -> Duration {
+    let mut seed = own.to_vec();
+    seed.extend_from_slice(&attempt.to_be_bytes());
+    let hash = aterm_digest::Sha256::digest(&seed);
+    let jitter = u64::from(u16::from_be_bytes([hash[2], hash[3]])) % 300;
+    Duration::from_millis(200 + jitter)
+}
+
+fn repair_transferred(repair: &Repair) -> bool {
+    repair.membership().is_some_and(|r| r.sent + r.received > 0)
+        || repair.application().is_some_and(|r| {
+            r.sent
+                + r.received
+                + r.keys_sent
+                + r.keys_received
+                + r.conflicts_sent
+                + r.conflicts_received
+                > 0
+        })
 }
 
 #[derive(Debug)]
@@ -238,8 +263,14 @@ impl Hints {
     ) {
         // A slow exchange may have outlived the delay chosen at its start.
         // Start the quiet interval at completion so paired owners cannot keep
-        // immediately redialing and colliding on their local custody locks.
-        let delay = retry_delay(&self.own, self.attempt);
+        // immediately redialing and colliding on their local custody locks;
+        // when this round transferred new membership or application records, use
+        // a short jittered follow-up so newly discovered tables sync promptly.
+        let delay = if success && repair_transferred(&repair) {
+            follow_up_delay(&self.own, self.attempt)
+        } else {
+            retry_delay(&self.own, self.attempt)
+        };
         if let Some(peer) = self.peers.get_mut(&address) {
             peer.next = now + delay;
             if success && repair.actor().is_some() {
@@ -248,9 +279,6 @@ impl Hints {
             }
             peer.busy = false;
             peer.failed = !success;
-            if !success && !peer.verified {
-                peer.seen = now;
-            }
             peer.repair = repair;
         }
     }
@@ -321,10 +349,12 @@ mod tests {
         hints.observe(&bad, "10.1.1.2:1".parse().unwrap(), now);
         hints.observe(&hints.wire(1234), "10.1.1.2:1".parse().unwrap(), now);
         assert_eq!(hints.count(), 0);
-        for n in 1..=100 {
-            hints.observe(&wire(1234), SocketAddr::from(([10, 1, 2, n], 999)), now);
+        for n in 0..MAX_PEERS + 36 {
+            let ip = [10, 1, 2 + (n / 200) as u8, 1 + (n % 200) as u8];
+            hints.observe(&wire(1234), SocketAddr::from((ip, 999)), now);
         }
         assert_eq!(hints.count(), MAX_PEERS);
+        const { assert!(MAX_PEERS > aterm_secrets::commons::roster::MAX_MEMBERS) };
         // Every queued candidate gets a turn even when a slow handshake would
         // put it past the failed-candidate expiry before it was tried.
         hints.expire(now + EXPIRES);
@@ -334,6 +364,64 @@ mod tests {
         }
         hints.expire(now + EXPIRES);
         assert_eq!(hints.count(), 0);
+    }
+
+    #[test]
+    fn producer_hint_capacity_remains_readable_over_the_local_observer_relay() {
+        let mut hints = hints();
+        let now = Instant::now();
+        for index in 0..MAX_PEERS {
+            let index = u32::try_from(index).unwrap();
+            let mut token = [5; 32];
+            token[..4].copy_from_slice(&index.to_be_bytes());
+            let remote = Hints::new(token);
+            hints.observe(
+                &remote.wire(1234),
+                SocketAddr::from((std::net::Ipv4Addr::from(0x0a01_0001 + index), 1)),
+                now,
+            );
+            hints.observe_presence(
+                &remote.presence_wire(),
+                SocketAddr::from((std::net::Ipv4Addr::from(0x0a02_0001 + index), 1)),
+                now,
+            );
+        }
+        let count = hints.unverified_count();
+        assert_eq!(count, MAX_UNVERIFIED_ENDPOINTS);
+        let root = aterm_tempfile::Builder::new()
+            .prefix("hint-relay-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let config = root.path().join("aterm.toml");
+        let handle = crate::network_state::ObservationHandle::default();
+        let mut owner = crate::network_state::Observer::open(&config, handle.clone()).unwrap();
+        owner.observe(
+            aterm_types::network_state::Visibility::Active,
+            0,
+            "discovery hints",
+            aterm_time::unix_millis().unwrap(),
+            Instant::now(),
+        );
+        let control = crate::network_state::read_live_observation(&config)
+            .expect("the same owner must serve a zero-count control");
+        assert_eq!(control.via_local_process, Some(std::process::id()));
+        assert_eq!(control.unverified_endpoints, 0);
+        owner.observe(
+            aterm_types::network_state::Visibility::Active,
+            count,
+            "discovery hints",
+            aterm_time::unix_millis().unwrap(),
+            Instant::now(),
+        );
+        let relayed = crate::network_state::read_live_observation(&config)
+            .expect("a producer's full hint count must remain readable");
+        assert_eq!(relayed.via_local_process, Some(std::process::id()));
+        assert_eq!(relayed.unverified_endpoints, count);
+        assert!(
+            relayed.peers.is_empty(),
+            "hints manufactured trusted machines"
+        );
+        drop(owner);
     }
     #[test]
     fn beacons_cannot_reset_backoff_or_duplicate_an_active_dial() {
@@ -365,6 +453,41 @@ mod tests {
         assert!(hints.next(finished).is_none());
         assert!(hints.next(finished + Duration::from_secs(2)).is_none());
         assert!(hints.next(finished + Duration::from_secs(10)).is_some());
+    }
+
+    #[test]
+    fn failed_retries_do_not_keep_a_vanished_unverified_endpoint_alive() {
+        let mut hints = hints();
+        let now = Instant::now();
+        hints.observe(&wire(1234), "10.1.1.2:1".parse().unwrap(), now);
+        for seconds in [0, 10, 20, 30, 40] {
+            let tried = now + Duration::from_secs(seconds);
+            let (address, repair) = hints.next(tried).expect("candidate still has its turn");
+            hints.finish(address, repair, false, tried);
+        }
+        assert!(
+            hints.next(now + Duration::from_secs(46)).is_none(),
+            "connection failures kept an endpoint with no new announcement alive"
+        );
+        assert_eq!(hints.count(), 0);
+    }
+
+    #[test]
+    fn an_untried_candidate_gets_one_round_even_after_its_announcement_expires() {
+        let mut hints = hints();
+        let now = Instant::now();
+        let source = "10.1.1.2:1".parse().unwrap();
+        hints.observe(&wire(1234), source, now);
+        let tried = now + Duration::from_secs(60);
+        let (address, repair) = hints.next(tried).expect("untried candidate kept its turn");
+        hints.expire(tried);
+        assert_eq!(hints.count(), 1, "an active round must remain tracked");
+        hints.finish(address, repair, false, tried);
+        assert!(hints.next(tried + Duration::from_secs(10)).is_none());
+
+        // A new announcement grants a fresh attempt after the stale slot has expired.
+        hints.observe(&wire(1234), source, tried + Duration::from_secs(11));
+        assert!(hints.next(tried + Duration::from_secs(11)).is_some());
     }
     #[test]
     fn verified_and_busy_entries_survive_untrusted_floods() {

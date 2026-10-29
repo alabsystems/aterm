@@ -1381,6 +1381,9 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         let Some(rec) = &self.live.recording else {
             return;
         };
+        if !(self.max_events > 0 && self.live.pair.head.input_cursor < u64::MAX) {
+            return;
+        }
         let cause = if rec.log.broken().is_some() {
             Retire::Broken
         } else if rec.log.len() < rec.log.max_events() {

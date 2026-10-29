@@ -329,6 +329,7 @@ pub(crate) fn admit(row: &SyntheticArtifact, vouch: &Vouch) -> Result<(), FlowEr
 
 /// The staging name `spec`'s payload of `version` downloads to on `triple` ([`asset_name`],
 /// [`payload_of`]).
+#[cfg(test)]
 pub(crate) fn staging_asset(spec: &VendorSpec, version: Version, triple: &str) -> String {
     asset_name(
         spec.program,
@@ -336,6 +337,23 @@ pub(crate) fn staging_asset(spec: &VendorSpec, version: Version, triple: &str) -
         triple,
         payload_of(spec.anchor, triple),
     )
+}
+
+/// Every local staging name `spec`'s payload of `version` may download to on `triple`
+/// ([`asset_name`], [`payload_of`], [`verify_codex`]).
+pub(crate) fn staging_assets(spec: &VendorSpec, version: Version, triple: &str) -> Vec<String> {
+    if spec.anchor == Anchor::OpenAiTwoHost && triple.contains("-windows-") {
+        return vec![
+            asset_name(spec.program, version, triple, "zip"),
+            asset_name(spec.program, version, triple, "tar-gz"),
+        ];
+    }
+    vec![asset_name(
+        spec.program,
+        version,
+        triple,
+        payload_of(spec.anchor, triple),
+    )]
 }
 
 fn payload_of(anchor: Anchor, triple: &str) -> &'static str {
@@ -1521,6 +1539,17 @@ mod tests {
                 "codex-package-aarch64-pc-windows-msvc.zip",
                 "codex-package-aarch64-pc-windows-msvc.tar.gz"
             ]
+        );
+        assert_eq!(
+            staging_assets(spec("codex"), v("0.156.0"), "aarch64-pc-windows-msvc"),
+            [
+                "codex-0.156.0-aarch64-pc-windows-msvc.zip",
+                "codex-0.156.0-aarch64-pc-windows-msvc.tar.gz"
+            ]
+        );
+        assert_eq!(
+            staging_assets(spec("codex"), v("0.156.0"), "x86_64-apple-darwin"),
+            ["codex-0.156.0-x86_64-apple-darwin.tar.gz"]
         );
         assert_eq!(
             codex_candidates("x86_64-apple-darwin"),

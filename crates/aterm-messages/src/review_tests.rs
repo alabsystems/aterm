@@ -330,7 +330,7 @@ fn text_shapers_never_panic_and_respect_caps() {
                 assert!(p.chars().count() <= cap, "shape_path({s:?}, {cap}) = {p:?}");
             }
             let t = trim_words(&s, cap);
-            assert!(t.chars().count() <= cap.max(s.chars().count()));
+            assert!(t.chars().count() <= cap, "trim_words({s:?}, {cap}) = {t:?}");
             let _ = sanitize(&s, cap);
         }
     }

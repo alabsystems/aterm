@@ -47,6 +47,18 @@ pub(crate) struct AiCli {
     pub(crate) path: Option<String>,
     /// The installed version.
     pub(crate) version: Option<String>,
+    /// Whether its row offers a fix ([`aterm_agent::ai::state::Row::fix`]): none where nothing
+    /// here signs it in, as for a Codex row on this machine's own login that another Mac's warm
+    /// set or claim keeps from this Mac (a claim elsewhere, or claims this Mac cannot record
+    /// where it is not the row's home), or one whose login still works and
+    /// only Codex's own sign-in renews, and none where a person must do something else before
+    /// its sign-in starts anything ([`aterm_agent::ai::state::Row::mend`]: a Claude Code row
+    /// whose accounts.toml is refused, say), whose fact says why.
+    pub(crate) offers_fix: bool,
+    /// What a person does before its sign-in starts anything, one sanitized line
+    /// ([`aterm_agent::ai::state::Row::mend`]): its row then offers no Sign in, but it still
+    /// needs you ([`Self::needs_person`]) and its row says this step.
+    pub(crate) mend: Option<String>,
 }
 
 fn named_path(fact: &str, foreign: Option<&Path>) -> Option<String> {
@@ -56,10 +68,18 @@ fn named_path(fact: &str, foreign: Option<&Path>) -> Option<String> {
 }
 
 impl AiCli {
-    /// Whether a definite install or sign-in action is needed.
+    /// Whether a definite install or sign-in action is needed, aterm's own or a person's, and its
+    /// row offers one ([`Self::offers_fix`]).
     #[must_use]
     pub(crate) const fn needs_you(&self) -> bool {
-        self.state.needs_person(self.wanted)
+        self.offers_fix && self.state.needs_act(self.wanted)
+    }
+
+    /// Whether a person must act: its row offers the act ([`Self::needs_you`]), or a person
+    /// does something else first ([`Self::mend`]), which no button starts.
+    #[must_use]
+    pub(crate) const fn needs_person(&self) -> bool {
+        (self.offers_fix || self.mend.is_some()) && self.state.needs_act(self.wanted)
     }
 
     /// The act its row offers where it needs a person.
@@ -114,6 +134,8 @@ impl AiReading {
                     path: named_path(&fact, foreign),
                     fact,
                     version: row.version.as_deref().map(one_line),
+                    offers_fix: row.fix.is_some(),
+                    mend: row.mend.as_deref().map(one_line),
                 }
             })
             .collect();
@@ -389,7 +411,7 @@ impl AiState {
         let needing: Vec<&str> = reading
             .clis
             .iter()
-            .filter(|cli| cli.needs_you() && self.choices.wants(cli.id))
+            .filter(|cli| cli.needs_person() && self.choices.wants(cli.id))
             .map(|cli| cli.product)
             .collect();
         let words = match needing.as_slice() {
@@ -427,7 +449,13 @@ impl AiState {
                             Some(version) => format!("{} {version}{tag}", c.product),
                             None => format!("{}{tag}", c.product),
                         },
-                        detail: detail_words(cli.state.word(), &cli.fact),
+                        detail: match cli.mend.as_deref().filter(|_| cli.needs_person()) {
+                            Some(mend) => format!(
+                                "{} \u{b7} {mend}",
+                                detail_words(cli.state.word(), &cli.fact)
+                            ),
+                            None => detail_words(cli.state.word(), &cli.fact),
+                        },
                         path: cli.path.clone(),
                         act: self.actionable_cli(c.id).and_then(AiCli::act),
                         use_from_fleet,
@@ -846,22 +874,24 @@ impl App {
 
     /// Ask for a look now (the page's Refresh and arrival), and republish so Refresh shows busy.
     pub(crate) fn ask_ai_look(&mut self) {
-        if self.config.ai.enabled()
-            && let Some(asks) = &self.ai_screen.asks
-        {
-            self.ai_screen.generation = self.ai_screen.generation.wrapping_add(1);
-            self.ai_screen.looking = asks.send(AiAsk::Look(self.ai_screen.generation)).is_ok();
+        if self.config.ai.enabled() {
+            self.start_ai_looks();
+            if let Some(asks) = &self.ai_screen.asks {
+                self.ai_screen.generation = self.ai_screen.generation.wrapping_add(1);
+                self.ai_screen.looking = asks.send(AiAsk::Look(self.ai_screen.generation)).is_ok();
+            }
         }
         self.publish_native_harness_state();
     }
 
     /// Fetch the fleet document from its URL now, then look, and republish so the page shows busy.
     pub(crate) fn ask_ai_fetch(&mut self) {
-        if self.config.ai.enabled()
-            && let Some(asks) = &self.ai_screen.asks
-        {
-            self.ai_screen.generation = self.ai_screen.generation.wrapping_add(1);
-            self.ai_screen.looking = asks.send(AiAsk::Fetch(self.ai_screen.generation)).is_ok();
+        if self.config.ai.enabled() {
+            self.start_ai_looks();
+            if let Some(asks) = &self.ai_screen.asks {
+                self.ai_screen.generation = self.ai_screen.generation.wrapping_add(1);
+                self.ai_screen.looking = asks.send(AiAsk::Fetch(self.ai_screen.generation)).is_ok();
+            }
         }
         self.publish_native_harness_state();
     }

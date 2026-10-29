@@ -384,6 +384,24 @@ fn wake_holds_after_a_wake_when_start_up_does_not() {
         c.deferred_mc = 880;
     }
     assert_eq!(causes(&snap(&scene)), [SPOTLIGHT]);
+
+    // Future wake/userspace timestamps (backward wall-clock step) must not
+    // pass the age window or overflow i64, and extreme figures must not panic.
+    let mut skewed = wrapped_1218();
+    let skewed_at = skewed.at_ms.expect("a wall clock");
+    for p in skewed.procs.iter_mut().filter(|p| p.pid > 1) {
+        p.birth_ms = skewed_at + 5_000;
+    }
+    for l in &mut skewed.leads {
+        l.birth_ms = skewed_at + 5_000;
+    }
+    if let Some(t) = skewed.timeline.as_mut() {
+        t.wake_ms = Some(skewed_at + 5_000);
+    }
+    let skewed_causes = causes(&snap(&skewed));
+    assert_eq!(skewed_causes, [SPOTLIGHT]);
+    assert!(crate::explain::detect::above_floor(i64::MAX, i64::MAX));
+    assert_eq!(crate::explain::deferred_pm(i64::MAX, i64::MAX), Some(1000));
 }
 
 /// `startup` is weighed by CPU, never by count: Spotlight with

@@ -637,12 +637,40 @@ fn a_panic_inside_the_restore_is_fenced_from_the_crash_report() {
     assert_eq!(seam::fenced(), Some(true));
 }
 
+/// A panic inside the restore can quote the recovered screen (std's slice panics quote the row
+/// they cut): aterm.log names its kind and length, never its text (DESIGN §3.6).
+#[test]
+fn a_panic_inside_the_restore_reaches_the_log_by_its_kind() {
+    let rig = Rig::new(6, 40);
+    rig.slice(b"a session whose restore panics\r\n");
+    let text = "byte index 2 is not a char boundary; it is inside 'é' of `QZP7E7M1 row`";
+    seam::arm_panic_saying(text);
+    let logged = crate::test_log::logged_while(|| {
+        assert!(rig.restore(0).is_err(), "the META rung");
+    });
+    seam::arm_panic(false);
+    assert!(
+        logged.iter().any(|line| line
+            .starts_with("crash restore: the restore of a recovered session panicked at ")
+            && line.contains(&format!(
+                " (str-slice panic ({}B)); it takes the META rung",
+                text.len()
+            ))),
+        "the panic is logged by its kind: {} lines",
+        logged.len()
+    );
+    assert!(
+        !logged.iter().any(|line| line.contains("QZP7E7M")),
+        "the log keeps the panic's text"
+    );
+}
+
 /// The replay's test seam: `restore_offered` calls [`seam::replay_reached`] where its scratch engine is built, inside `recover`.
 pub(super) mod seam {
     use std::cell::Cell;
 
     std::thread_local! {
-        static PANIC: Cell<bool> = const { Cell::new(false) };
+        static PANIC: Cell<Option<&'static str>> = const { Cell::new(None) };
         static FENCED: Cell<Option<bool>> = const { Cell::new(None) };
         static LOOKALIKE: Cell<Option<usize>> = const { Cell::new(None) };
     }
@@ -650,14 +678,18 @@ pub(super) mod seam {
     /// Note whether the screen reader's fence is up here, and panic when armed.
     pub(crate) fn replay_reached() {
         FENCED.with(|f| f.set(Some(crate::reader_guard::inside())));
-        assert!(
-            !PANIC.with(Cell::get),
-            "a replay that panics (the crash-restore test seam)"
-        );
+        if let Some(text) = PANIC.with(Cell::get) {
+            panic!("{text}");
+        }
     }
 
     pub(super) fn arm_panic(on: bool) {
-        PANIC.with(|p| p.set(on));
+        PANIC.with(|p| p.set(on.then_some("a replay that panics (the crash-restore test seam)")));
+    }
+
+    /// [`arm_panic`] with the panic's own text.
+    pub(super) fn arm_panic_saying(text: &'static str) {
+        PANIC.with(|p| p.set(Some(text)));
     }
 
     /// What the last [`replay_reached`] on this thread saw, taken.

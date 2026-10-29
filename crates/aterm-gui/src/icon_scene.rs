@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Private Lab scenes that exercise chrome icon dispatch in the real frame renderer.
+//! Private Lab scenes that exercise chrome in the real frame renderer.
 
 use std::sync::{Arc, OnceLock};
 
@@ -11,6 +11,8 @@ use aterm_core::terminal::RenderCell;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Scene {
     BandIcons,
+    #[cfg(any(debug_assertions, feature = "dev-seams"))]
+    HarnessLayouts,
 }
 
 /// The shipped app never reads this seam. A private Lab instance selects a scene once.
@@ -20,12 +22,30 @@ fn configured() -> Option<Scene> {
         aterm_types::dev_seam!("ATERM_DEBUG_SCENE")
             .as_deref()
             .and_then(|s| s.to_str())
-            .filter(|s| *s == "band-icons")
-            .map(|_| Scene::BandIcons)
+            .and_then(|s| match s {
+                "band-icons" => Some(Scene::BandIcons),
+                #[cfg(any(debug_assertions, feature = "dev-seams"))]
+                "harness-layouts" => Some(Scene::HarnessLayouts),
+                _ => None,
+            })
     })
 }
 
-pub(crate) fn apply(input: &mut RenderInput) {
+/// Whether an explicit private scene was selected; ordinary frames need no scene metrics.
+pub(crate) fn active() -> bool {
+    configured().is_some()
+}
+
+pub(crate) fn apply(input: &mut RenderInput, cell: (u16, u16)) {
+    #[cfg(any(debug_assertions, feature = "dev-seams"))]
+    if configured() == Some(Scene::HarnessLayouts) {
+        crate::claude_footer::layout_scene::paint(
+            input,
+            (usize::from(cell.0), usize::from(cell.1)),
+        );
+        return;
+    }
+    let _ = cell;
     paint(configured(), input);
 }
 

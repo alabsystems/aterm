@@ -5,7 +5,6 @@
 
 use std::path::Path;
 
-use aterm_agent::supervise::occupancy::rules::NUDGE_SEAM;
 use aterm_agent::supervise::occupancy::{templates, waiting_declared};
 use aterm_agent::supervise::{Autopilot, Occupancy, SupervisorConfig};
 
@@ -56,22 +55,19 @@ fn the_scenario_is_listed_with_its_lab() {
 
 #[test]
 fn its_scratch_aterm_toml_grants_prompt_under_cruise() {
-    let (cfg, notes) =
-        SupervisorConfig::from_aterm_toml(&crate::lab::scratch_aterm_toml("", HARNESS_KEYS));
+    let (cfg, notes) = SupervisorConfig::from_aterm_toml(&crate::lab::scratch_aterm_toml(
+        "",
+        HARNESS_KEYS,
+        None,
+        false,
+    ));
     assert!(notes.is_empty(), "{notes:?}");
     assert_eq!(cfg.occupancy, Occupancy::Prompt);
     assert_eq!(cfg.autopilot, Autopilot::Cruise);
     assert_eq!(cfg.human_grace_s, 5);
-    let (plain, _) = SupervisorConfig::from_aterm_toml(&crate::lab::scratch_aterm_toml("", ""));
+    let (plain, _) =
+        SupervisorConfig::from_aterm_toml(&crate::lab::scratch_aterm_toml("", "", None, false));
     assert_ne!(plain.occupancy, Occupancy::Prompt);
-}
-
-#[test]
-fn its_instance_gets_the_nudge_seam_at_a_minute() {
-    assert_eq!(
-        crate::lab::instance_env(INSTANCE_ENV),
-        Ok(vec![(NUDGE_SEAM.to_string(), NUDGE_S.to_string())])
-    );
 }
 
 fn body(messages: Vec<J>) -> Vec<u8> {

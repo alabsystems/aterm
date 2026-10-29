@@ -114,6 +114,7 @@ impl SetupStartup for Startup<'_> {
 
     fn admission(&mut self) -> Result<Option<SetupAdmission>, String> {
         Ok(self.setup.admission()?.map(|admitted| SetupAdmission {
+            plan: admitted.plan,
             revision: admitted.revision,
             completed: admitted.completed,
         }))

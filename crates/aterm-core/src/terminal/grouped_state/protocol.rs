@@ -15,6 +15,8 @@ pub(in crate::terminal) enum DcsType {
     Sixel,
     /// XTGETTCAP - xterm termcap/terminfo query (DCS + q).
     Xtgettcap,
+    /// DECRSPS cursor-information restore; any dropped byte makes the whole payload inert.
+    Decrsps { discarded: bool },
     /// Unknown or unsupported DCS sequence.
     Unknown,
 }

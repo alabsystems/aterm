@@ -57,6 +57,19 @@ impl LanAnswer {
 /// ([`hear_answer`]).
 static HEARD: Mutex<Option<(LanAnswer, u64)>> = Mutex::new(None);
 
+/// Wakes any concurrent Secrets lane waiting for the Local Network access step's answer.
+static LOCAL_NETWORK_WAKE: (Mutex<u64>, std::sync::Condvar) =
+    (Mutex::new(0), std::sync::Condvar::new());
+
+/// Wake waiters blocked in [`wait_for_local_network_grant`].
+pub(super) fn notify_local_network_waiters() {
+    let (lock, cvar) = &LOCAL_NETWORK_WAKE;
+    if let Ok(mut seq) = lock.lock() {
+        *seq = seq.wrapping_add(1);
+    }
+    cvar.notify_all();
+}
+
 /// The record, in aterm's doctor state, of the last answer a LAN look heard: a later launch reads
 /// Local Network from it, since a joined ALab Mac's launch looks for nothing and a Mac with no
 /// ALab vault on its LAN hears no answer to a look.
@@ -81,6 +94,7 @@ pub(super) fn lan_answered(answer: LanAnswer) {
             hear_answer(&HEARD, answer, 0);
         }
     }
+    notify_local_network_waiters();
 }
 
 /// Note `answer` as this process's last, numbered after both the last answer it heard and
@@ -110,11 +124,14 @@ pub(super) fn local_network_step(outcome: AccessOutcome) {
     // formed before it, so the next look re-probes under the grant
     // (`docs/DESIGN-init-on-by-default-2026-10-25.md` §8.2). A step that only confirms a grant
     // already heard keeps the record, so the 24 h cache is not wiped on every launch.
-    if answer == LanAnswer::Reached
-        && last_answer() != Some(LanAnswer::Reached)
-        && let Ok(paths) = aterm_secrets::client::Paths::live()
-    {
-        aterm_secrets::heard::forget(&paths);
+    if answer == LanAnswer::Reached && last_answer() != Some(LanAnswer::Reached) {
+        if let Ok(paths) = aterm_secrets::client::Paths::live() {
+            aterm_secrets::heard::forget(&paths);
+        }
+        super::UNANSWERED_PROBE_JOINED.store(false, std::sync::atomic::Ordering::Release);
+        if let Ok(root) = super::state_root() {
+            super::secrets_retry::clear_at(&root);
+        }
     }
     lan_answered(answer);
 }
@@ -134,6 +151,17 @@ const fn step_answer(outcome: AccessOutcome) -> Option<LanAnswer> {
 /// question is the window's to raise, at a quiet moment.
 pub(super) fn lan_asked_before() -> bool {
     last_answer().is_some()
+}
+
+/// The last answer a LAN look or the window's Local Network step heard in this process
+/// ([`lan_answered`]), whatever a record an earlier launch kept says: [`LanAnswer::Asked`] here
+/// means this process's own step raised macOS's question.
+pub(super) fn heard_here() -> Option<LanAnswer> {
+    HEARD
+        .lock()
+        .ok()
+        .and_then(|heard| *heard)
+        .map(|(answer, _)| answer)
 }
 
 /// Note `answer`, heard at `at` (Unix seconds, kept for an older aterm, which orders answers by
@@ -190,6 +218,65 @@ pub(super) fn last_answer() -> Option<LanAnswer> {
     let heard = HEARD.lock().ok().and_then(|heard| *heard);
     let kept = super::state_root().ok().and_then(|root| kept_answer(&root));
     latest([heard, kept])
+}
+
+/// Local Network answer observed at `root` for `access_revision`: combines [`kept_answer`] (plus
+/// [`HEARD`] when `root` is the live state root) with `access_record`'s latest Local Network step.
+pub(super) fn answer_at(root: &Path, access_revision: u64) -> Option<LanAnswer> {
+    let heard = super::state_root()
+        .ok()
+        .filter(|live| live == root)
+        .and_then(|_| HEARD.lock().ok().and_then(|heard| *heard));
+    let kept = latest([heard, kept_answer(root)]);
+    let recorded = (access_revision != 0)
+        .then(|| access_record::latest(root, access_revision, Access::LocalNetwork))
+        .flatten()
+        .and_then(step_answer);
+    match (recorded, kept) {
+        (_, Some(LanAnswer::Reached)) => Some(LanAnswer::Reached),
+        (_, Some(LanAnswer::Refused)) => Some(LanAnswer::Refused),
+        (Some(LanAnswer::Reached), None | Some(LanAnswer::Asked)) => Some(LanAnswer::Reached),
+        (Some(LanAnswer::Asked), None) | (_, Some(LanAnswer::Asked)) => Some(LanAnswer::Asked),
+        _ => None,
+    }
+}
+
+/// Wait until [`answer_at`] reports a definite LAN outcome (`Reached` or `Refused`) or `stop`
+/// returns `true`. Wakes immediately via [`notify_local_network_waiters`] when a step is recorded.
+pub(super) fn wait_for_local_network_grant(
+    root: &Path,
+    access_revision: u64,
+    mut stop: impl FnMut() -> bool,
+) -> Option<LanAnswer> {
+    let (lock, cvar) = &LOCAL_NETWORK_WAKE;
+    loop {
+        let seen = lock.lock().ok().map(|guard| *guard);
+        match answer_at(root, access_revision) {
+            Some(answer @ (LanAnswer::Reached | LanAnswer::Refused)) => return Some(answer),
+            _ if stop() => return None,
+            _ => {}
+        }
+        let Ok(guard) = lock.lock() else {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            continue;
+        };
+        if seen.is_some_and(|before| *guard != before) {
+            continue;
+        }
+        let _ = cvar.wait_timeout(guard, std::time::Duration::from_millis(25));
+    }
+}
+
+#[cfg(test)]
+pub(super) fn record_step_isolated_at(root: &Path, revision: u64, outcome: AccessOutcome) {
+    let _ = access_record::append(root, revision, Access::LocalNetwork, outcome);
+    if let Some(answer) = step_answer(outcome) {
+        if answer == LanAnswer::Reached {
+            super::secrets_retry::clear_at(root);
+        }
+        let _ = keep_answer(root, &Mutex::new(None), answer, 0);
+    }
+    notify_local_network_waiters();
 }
 
 /// The answer heard last of `answers`, each with its number in the order of answers: the higher

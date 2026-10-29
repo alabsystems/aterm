@@ -9,18 +9,20 @@
 use super::constraints::Constraints;
 use super::node::{Kind, Node};
 use crate::{Error, Result, SecretBytes, age::Identity};
+use astream_broker::BrokerRecord;
 use astream_wire::{
     Offset,
     sync::{Digest, Index},
 };
-use aterm_journal::{Limits, Log};
+use aterm_journal::{Acknowledged, Committed, Limits, Log, Prefix};
 #[cfg(test)]
 use aterm_uds::private_file;
 #[cfg(test)]
 use std::fs::OpenOptions;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, PoisonError},
 };
 
 /// Maximum retained control records, including pending and competing branches.
@@ -32,6 +34,16 @@ const RECOVERY_NODES: usize = MAX_NODES.div_ceil(astream_wire::sync::MAX_PARENTS
 const MAX_RECOVERY_BYTES: usize = 4 + 16 + 32 + 2 + 64 * 32 + 32 + 8 + 2 + 4 + 64 + 256;
 const RECOVERY_BYTES: usize = RECOVERY_NODES * MAX_RECOVERY_BYTES;
 const SUBJECT: &str = "commons/control/1";
+const NAME: &str = "control";
+/// How long a writer open waits for another local writer to let go. Writers do
+/// no network I/O and hold the lock for local work only, so one that outlasts
+/// this is stuck or one of many back to back: the open is refused as busy.
+const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+const LIMITS: Limits = Limits {
+    records: MAX_NODES,
+    bytes: MAX_BYTES,
+    record_bytes: super::node::MAX_NODE + 8,
+};
 
 /// Exact independent trust anchor. Obtain this from authenticated enrollment,
 /// never from a peer advertisement. Root handoff requires a separate protocol;
@@ -97,117 +109,323 @@ pub struct Current {
     pub constraints: Constraints,
 }
 
-/// Bounded strict astream log and its disposable causal index. Open, append and
-/// close locally; do not hold this exclusive writer across peer network IO.
-pub struct Journal {
-    trust: Trust,
+/// The verified replay of one acknowledged prefix: every node passed
+/// [`verify`] and the causal index admitted its header, in offset order.
+#[derive(Clone)]
+struct View {
     index: Index,
     nodes: BTreeMap<Digest, Node>,
     receipts: BTreeMap<Digest, Receipt>,
-    log: Log,
+}
+impl View {
+    fn new() -> Self {
+        Self {
+            index: Index::new(MAX_NODES),
+            nodes: BTreeMap::new(),
+            receipts: BTreeMap::new(),
+        }
+    }
+
+    /// Authenticate each record exactly as a full replay does before adding it.
+    /// A refusal leaves this view partly extended: callers discard it.
+    fn replay<'a>(
+        &mut self,
+        trust: Trust,
+        records: impl IntoIterator<Item = &'a BrokerRecord>,
+    ) -> Result<()> {
+        for record in records {
+            if record.subject != SUBJECT || record.body.len() < 8 {
+                return Err(Error::new("foreign record in control journal"));
+            }
+            let received_ms = u64::from_le_bytes(
+                record.body[..8]
+                    .try_into()
+                    .map_err(|_| Error::new("invalid control receipt"))?,
+            );
+            let node = verify(trust, &record.body[8..])?;
+            self.index
+                .insert(node.header())
+                .map_err(|_| Error::new("control journal index refused a record"))?;
+            let id = node.id();
+            self.nodes.entry(id).or_insert(node);
+            self.receipts.entry(id).or_insert(Receipt {
+                id,
+                received_ms,
+                offset: record.seq.0,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Verified views kept per directory and trust, so a long-lived process
+/// authenticates each acknowledged record once rather than on every read. A
+/// view is reused only for the exact prefix it was built from, extended only by
+/// records that pass the same verification, and rebuilt for anything else.
+struct Views {
+    /// Most recently requested first. Only lookup and eviction hold this lock.
+    kept: Mutex<Vec<Arc<Entry>>>,
+    capacity: usize,
+}
+struct Entry {
+    dir: PathBuf,
+    trust: Trust,
+    cached: Mutex<Option<Cached>>,
+}
+struct Cached {
+    prefix: Prefix,
+    view: Arc<View>,
+}
+/// Views one process keeps: a running app reads one journal. A test binary
+/// reads one per test, and a test counting verifications needs its view kept
+/// while other tests read theirs.
+#[cfg(not(test))]
+const VIEWS_KEPT: usize = 4;
+#[cfg(test)]
+const VIEWS_KEPT: usize = 4096;
+static VIEWS: Views = Views::new(VIEWS_KEPT);
+impl Views {
+    const fn new(capacity: usize) -> Self {
+        Self {
+            kept: Mutex::new(Vec::new()),
+            capacity,
+        }
+    }
+
+    fn entry(&self, dir: &Path, trust: Trust) -> Arc<Entry> {
+        let (entry, retired) = {
+            let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+            let entry = if let Some(at) = kept
+                .iter()
+                .position(|entry| entry.dir == dir && entry.trust == trust)
+            {
+                kept.remove(at)
+            } else {
+                Arc::new(Entry {
+                    dir: dir.into(),
+                    trust,
+                    cached: Mutex::new(None),
+                })
+            };
+            kept.insert(0, Arc::clone(&entry));
+            let end = self.capacity.min(kept.len());
+            (entry, kept.split_off(end))
+        };
+        // An evicted view can own a large verified history. Release it after
+        // the lookup lock, just as physical reads and replay run outside it.
+        drop(retired);
+        entry
+    }
+
+    /// The verified view of `dir`'s acknowledged prefix under `trust`, and the
+    /// prefix it covers. Takes no journal lock; a refused record leaves the kept
+    /// view as it was. A slow read or replay holds only its own entry's mutex.
+    fn read(&self, dir: &Path, trust: Trust) -> Result<(Arc<View>, Acknowledged)> {
+        let entry = self.entry(dir, trust);
+        let mut cached = entry.cached.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(test)]
+        tests::before_view();
+        let committed = aterm_journal::read_committed(
+            dir,
+            NAME,
+            &trust.bytes(),
+            LIMITS,
+            cached.as_ref().map(|cached| &cached.prefix),
+        )?;
+        let unknown = || Error::new("control journal view extended an unknown prefix");
+        let (prefix, view) = match committed {
+            Committed::Unchanged => {
+                let cached = cached.as_ref().ok_or_else(unknown)?;
+                return Ok((Arc::clone(&cached.view), cached.prefix.acknowledged()));
+            }
+            Committed::Extended { records, prefix } => {
+                let mut view = View::clone(&cached.as_ref().ok_or_else(unknown)?.view);
+                view.replay(trust, &records)?;
+                (prefix, Arc::new(view))
+            }
+            Committed::Rebuilt { records, prefix } => {
+                let mut view = View::new();
+                view.replay(trust, &records)?;
+                (prefix, Arc::new(view))
+            }
+        };
+        let acknowledged = prefix.acknowledged();
+        *cached = Some(Cached {
+            prefix,
+            view: Arc::clone(&view),
+        });
+        Ok((view, acknowledged))
+    }
+}
+
+fn verify(trust: Trust, wire: &[u8]) -> Result<Node> {
+    #[cfg(test)]
+    tests::VERIFIED.with(|count| count.set(count.get() + 1));
+    let node = Node::verify(wire, trust.network, trust.authority)?;
+    if node.kind() == Kind::Genesis && node.id() != trust.genesis {
+        return Err(Error::new("control node names another genesis"));
+    }
+    Ok(node)
+}
+
+/// Bounded strict astream log and its disposable causal index. A writer opens,
+/// appends and closes locally; never hold it across peer network IO. A reader
+/// ([`Journal::read_existing`]) takes no lock and cannot append.
+pub struct Journal {
+    dir: PathBuf,
+    trust: Trust,
+    view: Arc<View>,
+    /// The exclusive writer; `None` for a read-only view.
+    log: Option<Log>,
 }
 impl Journal {
+    /// Local custody directory of this control observation.
+    /// Callers transferring an observation must match it to their bootstrap's
+    /// directory as well as its immutable trust context.
+    pub fn directory(&self) -> &Path {
+        &self.dir
+    }
+
     /// Immutable network, authority and genesis pinned when this journal opened.
     pub const fn trust(&self) -> Trust {
         self.trust
     }
     /// Replay all authenticated ciphertext under the exact immutable anchor.
     /// A missing anchor file can be restored only to the caller's independently
-    /// trusted value; replay still verifies every event against it.
+    /// trusted value; replay still verifies every event against it. Another
+    /// local writer is waited for at most a second; one that holds the
+    /// journal longer refuses this as [`crate::ErrorKind::JournalBusy`].
     pub fn open(dir: &Path, trust: Trust) -> Result<Self> {
-        Self::open_mode(dir, trust, false)
+        Self::open_mode(dir, trust, false, None)
     }
 
     /// Reopen an established journal. Missing anchor/log/checkpoint state is
     /// damage, not permission to initialize an empty history. An outer durable
     /// bootstrap pin uses this after the journal has first been initialized.
+    /// Another writer is waited for as [`Journal::open`] does.
     pub fn open_existing(dir: &Path, trust: Trust) -> Result<Self> {
-        Self::open_mode(dir, trust, true)
+        Self::open_mode(dir, trust, true, None)
     }
 
-    fn open_mode(dir: &Path, trust: Trust, established: bool) -> Result<Self> {
-        let log = Log::open(
-            dir,
-            "control",
-            &trust.bytes(),
-            established,
-            Limits {
-                records: MAX_NODES,
-                bytes: MAX_BYTES,
-                record_bytes: super::node::MAX_NODE + 8,
-            },
-        )?;
-        let mut journal = Self {
+    /// [`Self::open`], waiting for an actual local writer until `deadline`.
+    /// A preverified view is reused only if it matches the exact acknowledged
+    /// prefix under the acquired lock; otherwise replay validates that history.
+    /// A timeout obtains no current authorization observation.
+    pub fn open_until(dir: &Path, trust: Trust, deadline: std::time::Instant) -> Result<Self> {
+        Self::open_mode(dir, trust, false, Some(deadline))
+    }
+
+    /// [`Self::open_existing`] with a bounded wait for the local writer lock.
+    /// Returns `JournalBusy` if the writer remains active at `deadline`.
+    pub fn open_existing_until(
+        dir: &Path,
+        trust: Trust,
+        deadline: std::time::Instant,
+    ) -> Result<Self> {
+        Self::open_mode(dir, trust, true, Some(deadline))
+    }
+
+    /// A read-only verified view of an established journal that takes no lock,
+    /// so it succeeds while a writer holds the journal. It sees exactly the
+    /// prefix the checkpoint acknowledged when it was read, authenticated as
+    /// [`Journal::open_existing`] replays it, and never repairs or writes.
+    /// Within one process, records already verified for this directory and
+    /// trust are not verified again; [`Journal::ingest`] refuses on this view.
+    pub fn read_existing(dir: &Path, trust: Trust) -> Result<Self> {
+        let (view, _) = VIEWS.read(dir, trust)?;
+        Ok(Self {
+            dir: dir.into(),
             trust,
-            index: Index::new(MAX_NODES),
-            nodes: BTreeMap::new(),
-            receipts: BTreeMap::new(),
-            log,
-        };
-        let mut offset = Offset::ZERO;
-        loop {
-            let batch = journal.log.read_range(offset, 256)?;
-            if batch.is_empty() {
-                break;
-            }
-            for record in batch {
-                if record.subject != SUBJECT || record.body.len() < 8 {
-                    return Err(Error::new("foreign record in control journal"));
-                }
-                let received_ms = u64::from_le_bytes(
-                    record.body[..8]
-                        .try_into()
-                        .map_err(|_| Error::new("invalid control receipt"))?,
-                );
-                let node = journal.verify(&record.body[8..])?;
-                journal
-                    .index
-                    .insert(node.header())
-                    .map_err(|_| Error::new("control journal index refused a record"))?;
-                let id = node.id();
-                journal.nodes.entry(id).or_insert(node);
-                journal.receipts.entry(id).or_insert(Receipt {
-                    id,
-                    received_ms,
-                    offset: record.seq.0,
-                });
-                offset = Offset(
-                    record
-                        .seq
-                        .0
-                        .checked_add(1)
-                        .ok_or_else(|| Error::new("control journal offset exhausted"))?,
-                );
-            }
-        }
-        journal.log.finish_open()?;
-        Ok(journal)
+            view,
+            log: None,
+        })
     }
 
-    fn verify(&self, wire: &[u8]) -> Result<Node> {
-        let node = Node::verify(wire, self.trust.network, self.trust.authority)?;
-        if node.kind() == Kind::Genesis && node.id() != self.trust.genesis {
-            return Err(Error::new("control node names another genesis"));
-        }
-        Ok(node)
+    /// Whether this handle holds the exclusive writer, not a read-only view.
+    pub const fn is_writer(&self) -> bool {
+        self.log.is_some()
+    }
+
+    fn open_mode(
+        dir: &Path,
+        trust: Trust,
+        established: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Self> {
+        // Verify before taking the writer, so that when no other writer
+        // appends meanwhile, neither verification nor the view cache's mutex
+        // lengthens the lock. A refusal here is decided again under the lock,
+        // by the replay below.
+        let before = VIEWS.read(dir, trust).ok();
+        #[cfg(test)]
+        tests::before_lock();
+        let deadline = deadline.unwrap_or_else(|| std::time::Instant::now() + WRITER_WAIT);
+        let mut log = Log::open_until(dir, NAME, &trust.bytes(), established, LIMITS, deadline)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    Error::of_kind(crate::ErrorKind::JournalBusy, error.to_string())
+                } else {
+                    Error::from(error)
+                }
+            })?;
+        // The held writer fixes its acknowledged prefix. A verified view of
+        // exactly those bytes stands in for replaying them. If another writer
+        // appended meanwhile, the view is read again under the lock, which
+        // verifies only its records but waits on the cache's mutex; if that
+        // still differs, everything is replayed here.
+        let held = log.acknowledged();
+        let view = match before
+            .filter(|(_, acknowledged)| *acknowledged == held)
+            .map_or_else(|| VIEWS.read(dir, trust), Ok)
+        {
+            Ok((view, acknowledged)) if acknowledged == held => view,
+            _ => {
+                let mut view = View::new();
+                let mut offset = Offset::ZERO;
+                loop {
+                    let batch = log.read_range(offset, 256)?;
+                    let Some(last) = batch.last() else {
+                        break;
+                    };
+                    offset = Offset(
+                        last.seq
+                            .0
+                            .checked_add(1)
+                            .ok_or_else(|| Error::new("control journal offset exhausted"))?,
+                    );
+                    view.replay(trust, batch.iter().map(|record| &**record))?;
+                }
+                Arc::new(view)
+            }
+        };
+        log.finish_open()?;
+        Ok(Self {
+            dir: dir.into(),
+            trust,
+            view,
+            log: Some(log),
+        })
     }
 
     /// Authenticate and persist exact bytes before acknowledging them. Duplicates
     /// return their original receipt. A failed flush poisons this handle until
     /// reopen: callers retain the prepared bytes and retry those same bytes.
     pub fn ingest(&mut self, wire: &[u8]) -> Result<Receipt> {
-        if self.log.is_poisoned() {
+        let Some(log) = &self.log else {
+            return Err(Error::new("a read-only control journal view cannot append"));
+        };
+        if log.is_poisoned() {
             return Err(Error::new(
                 "uncertain control append: reopen and retry the exact prepared bytes",
             ));
         }
-        let node = self.verify(wire)?;
+        let node = verify(self.trust, wire)?;
         let id = node.id();
-        if let Some(receipt) = self.receipts.get(&id) {
+        if let Some(receipt) = self.view.receipts.get(&id) {
             return Ok(*receipt);
         }
-        let next_bytes = self.log.bytes().saturating_add(wire.len() + 256);
-        let (data_nodes, data_bytes) = data_usage(self.nodes.values());
+        let next_bytes = log.bytes().saturating_add(wire.len() + 256);
+        let (data_nodes, data_bytes) = data_usage(self.view.nodes.values());
         if node.kind() != Kind::Recovery
             && (data_nodes >= MAX_NODES - RECOVERY_NODES
                 || data_bytes.saturating_add(wire.len() + 256) > MAX_BYTES - RECOVERY_BYTES)
@@ -216,7 +434,7 @@ impl Journal {
                 "control data capacity exhausted; remaining space is reserved for recovery",
             ));
         }
-        let mut proposed = self.index.clone();
+        let mut proposed = self.view.index.clone();
         proposed.insert(node.header()).map_err(|_| {
             Error::new("control journal record capacity exhausted or header refused")
         })?;
@@ -226,7 +444,7 @@ impl Journal {
         let required = frontier
             .saturating_sub(1)
             .div_ceil(astream_wire::sync::MAX_PARENTS - 1);
-        if self.nodes.len() + 1 + required > MAX_NODES
+        if self.view.nodes.len() + 1 + required > MAX_NODES
             || next_bytes.saturating_add(required * MAX_RECOVERY_BYTES) > MAX_BYTES
         {
             return Err(Error::new(
@@ -237,15 +455,20 @@ impl Journal {
             .ok_or_else(|| Error::new("system clock cannot represent a receipt timestamp"))?;
         let mut body = received_ms.to_le_bytes().to_vec();
         body.extend_from_slice(wire);
-        let offset = self.log.append(SUBJECT, body)?.0;
+        let log = self
+            .log
+            .as_mut()
+            .ok_or_else(|| Error::new("a read-only control journal view cannot append"))?;
+        let offset = log.append(SUBJECT, body)?.0;
         let receipt = Receipt {
             id,
             received_ms,
             offset,
         };
-        self.index = proposed;
-        self.nodes.insert(id, node);
-        self.receipts.insert(id, receipt);
+        let view = Arc::make_mut(&mut self.view);
+        view.index = proposed;
+        view.nodes.insert(id, node);
+        view.receipts.insert(id, receipt);
         Ok(receipt)
     }
 
@@ -283,20 +506,21 @@ impl Journal {
         )
     )]
     pub fn state(&self) -> State {
-        if self.log.is_poisoned() {
+        if self.log.as_ref().is_some_and(Log::is_poisoned) {
             return State::Uncertain;
         }
-        if self.nodes.is_empty() {
+        if self.view.nodes.is_empty() {
             return State::Empty;
         }
-        let projection = self.index.project();
+        let projection = self.view.index.project();
         let complete =
-            self.nodes.contains_key(&self.trust.genesis) && projection.pending.is_empty();
+            self.view.nodes.contains_key(&self.trust.genesis) && projection.pending.is_empty();
         let invalid: Vec<_> = self
+            .view
             .nodes
             .values()
             .filter(|node| {
-                node.kind() == Kind::Recovery && related_parents(&self.index, node.parents())
+                node.kind() == Kind::Recovery && related_parents(&self.view.index, node.parents())
             })
             .map(Node::id)
             .collect();
@@ -311,13 +535,13 @@ impl Journal {
             return State::Conflict { heads };
         }
         let head = heads[0];
-        if !self.index.observes(&head, &self.trust.genesis) {
+        if !self.view.index.observes(&head, &self.trust.genesis) {
             return State::Pending;
         }
         let mut basis = head;
         // Every selection is a parent, so complete acyclic ancestry terminates.
-        for _ in 0..self.nodes.len() {
-            let Some(node) = self.nodes.get(&basis) else {
+        for _ in 0..self.view.nodes.len() {
+            let Some(node) = self.view.nodes.get(&basis) else {
                 return State::Pending;
             };
             match node.selected() {
@@ -384,6 +608,7 @@ impl Journal {
             return Ok(None);
         };
         let node = self
+            .view
             .nodes
             .get(&basis)
             .ok_or_else(|| Error::new("current control basis missing"))?;
@@ -398,7 +623,7 @@ impl Journal {
                 self.trust.network,
                 self.trust.authority,
                 head,
-                self.nodes.values(),
+                self.view.nodes.values(),
             )?,
         }))
     }
@@ -426,6 +651,54 @@ impl Journal {
         })
     }
 
+    pub(crate) fn retained_historical(&self, id: Digest, identity: &Identity) -> Result<Current> {
+        let (node, constraints) = self.retained_historical_source(id)?;
+        Ok(Current {
+            head: id,
+            basis: id,
+            payload: node.open(identity)?,
+            constraints,
+        })
+    }
+
+    pub(crate) fn retained_historical_with_key(
+        &self,
+        id: Digest,
+        key: &[u8; 16],
+    ) -> Result<Current> {
+        let (node, constraints) = self.retained_historical_source(id)?;
+        Ok(Current {
+            head: id,
+            basis: id,
+            payload: node.open_history_key(key)?,
+            constraints,
+        })
+    }
+
+    fn retained_historical_source(&self, id: Digest) -> Result<(&Node, Constraints)> {
+        if self.log.as_ref().is_some_and(Log::is_poisoned) {
+            return Err(Error::new(
+                "uncertain control append: reopen before reading history",
+            ));
+        }
+        if matches!(self.state(), State::Ready { .. }) {
+            return self.historical_source(id);
+        }
+        if !self.retained_payload_node(id) {
+            return Err(Error::new("roster is outside the selected control history"));
+        }
+        let ancestors = self.ancestors(id)?;
+        Ok((
+            &self.view.nodes[&id],
+            Constraints::collect(
+                self.trust.network,
+                self.trust.authority,
+                id,
+                ancestors.iter().map(|ancestor| &self.view.nodes[ancestor]),
+            )?,
+        ))
+    }
+
     fn historical_source(&self, id: Digest) -> Result<(&Node, Constraints)> {
         let State::Ready { head, .. } = self.state() else {
             return Err(Error::new(
@@ -437,12 +710,12 @@ impl Journal {
         }
         let ancestors = self.ancestors(id)?;
         Ok((
-            &self.nodes[&id],
+            &self.view.nodes[&id],
             Constraints::collect(
                 self.trust.network,
                 self.trust.authority,
                 id,
-                ancestors.iter().map(|ancestor| &self.nodes[ancestor]),
+                ancestors.iter().map(|ancestor| &self.view.nodes[ancestor]),
             )?,
         ))
     }
@@ -453,6 +726,7 @@ impl Journal {
         while let Some(parent) = pending.pop() {
             if ancestors.insert(parent) {
                 let node = self
+                    .view
                     .nodes
                     .get(&parent)
                     .ok_or_else(|| Error::new("missing historical ancestor"))?;
@@ -475,11 +749,33 @@ impl Journal {
     )]
     pub fn selected_ancestor(&self, ancestor: Digest, descendant: Digest) -> bool {
         let mut cursor = descendant;
-        for _ in 0..self.nodes.len() {
-            let Some(node) = self.nodes.get(&cursor) else {
+        for _ in 0..self.view.nodes.len() {
+            let Some(node) = self.view.nodes.get(&cursor) else {
                 return false;
             };
             if cursor == ancestor && node.has_payload() {
+                return true;
+            }
+            let Some(parent) = node.selected().or_else(|| node.parents().first().copied()) else {
+                return false;
+            };
+            cursor = parent;
+        }
+        false
+    }
+
+    /// Whether `id` is a retained payload-bearing node whose selected path reaches
+    /// `self.trust.genesis` and whose full causal ancestry is present in this journal.
+    pub fn retained_payload_node(&self, id: Digest) -> bool {
+        if !self.view.nodes.get(&id).is_some_and(Node::has_payload) || self.ancestors(id).is_err() {
+            return false;
+        }
+        let mut cursor = id;
+        for _ in 0..self.view.nodes.len() {
+            let Some(node) = self.view.nodes.get(&cursor) else {
+                return false;
+            };
+            if cursor == self.trust.genesis {
                 return true;
             }
             let Some(parent) = node.selected().or_else(|| node.parents().first().copied()) else {
@@ -502,7 +798,28 @@ impl Journal {
             self.trust.network,
             self.trust.authority,
             head,
-            self.nodes.values(),
+            self.view.nodes.values(),
+        )
+    }
+
+    /// Observe retained table cutoffs and retirements across every retained branch even when the
+    /// legacy control journal is forked or incomplete (`F18`).
+    ///
+    /// # Errors
+    /// The journal handle is poisoned or retained nodes fail policy bounds.
+    pub fn retained_constraints(&self) -> Result<Constraints> {
+        if self.log.as_ref().is_some_and(Log::is_poisoned) {
+            return Err(Error::new(
+                "uncertain control append: reopen before reading restrictions",
+            ));
+        }
+        if matches!(self.state(), State::Ready { .. }) {
+            return self.constraints();
+        }
+        Constraints::collect_retained(
+            self.trust.network,
+            self.trust.authority,
+            self.view.nodes.values(),
         )
     }
 
@@ -522,7 +839,7 @@ impl Journal {
             self.trust.network,
             self.trust.authority,
             node.id(),
-            self.nodes.values().chain(std::iter::once(node)),
+            self.view.nodes.values().chain(std::iter::once(node)),
         )
     }
 
@@ -530,7 +847,7 @@ impl Journal {
     /// a later payload observed it. Recovery-only descendants preserve it.
     pub(crate) fn payload_superseded(&self, basis: Digest) -> bool {
         let mut children: BTreeMap<Digest, Vec<&Node>> = BTreeMap::new();
-        for node in self.nodes.values() {
+        for node in self.view.nodes.values() {
             for parent in node.parents() {
                 children.entry(*parent).or_default().push(node);
             }
@@ -558,7 +875,8 @@ impl Journal {
             generation,
             commitment,
         };
-        self.nodes
+        self.view
+            .nodes
             .values()
             .filter(|node| node.facts().contains(&fact))
             .take(2)
@@ -584,7 +902,7 @@ impl Journal {
         };
         ancestors
             .iter()
-            .filter(|id| self.nodes[*id].facts().contains(&fact))
+            .filter(|id| self.view.nodes[*id].facts().contains(&fact))
             .take(2)
             .count()
             == 1
@@ -592,15 +910,15 @@ impl Journal {
 
     /// All retained content identities, including pending and competing branches.
     pub fn inventory(&self) -> impl Iterator<Item = &Digest> {
-        self.nodes.keys()
+        self.view.nodes.keys()
     }
     /// Signed ciphertext for bounded peer repair, without decrypting it.
     pub fn node(&self, id: &Digest) -> Option<&Node> {
-        self.nodes.get(id)
+        self.view.nodes.get(id)
     }
     /// This replica's first durable receipt for an exact node.
     pub fn receipt(&self, id: &Digest) -> Option<Receipt> {
-        self.receipts.get(id).copied()
+        self.view.receipts.get(id).copied()
     }
 }
 

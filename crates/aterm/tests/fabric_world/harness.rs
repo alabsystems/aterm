@@ -45,6 +45,44 @@ pub const FLEET: &str = "f1";
 /// The ceiling on every wait.
 pub const DEADLINE: Duration = aterm_spec::wait::MUST_HAPPEN;
 
+/// How long a test's bridge waits for each broker answer: its `ACK_DEADLINE` seam
+/// (`ATERM_LINK_ACK_DEADLINE_MS`) set to the hang detector, as the bridge's own unit tests
+/// wait (`ACK_DEADLINE` under `cfg(test)`). Set by [`prepare_gui_environment`] and
+/// [`scratch_spawnfd`], so every instance a test starts through them carries it to the bridge
+/// it runs (a world's first boot, a relaunch, a successor, a sibling, a [`Fleet`]'s nodes),
+/// and so does a bridge a test starts through them itself; `owner_ask`'s instances, which
+/// build their own environment, set it beside [`STALE_HORIZON`]. A test's broker runs on the
+/// test's machine, beside every other test, so an answer that comes late is that machine, not
+/// a broker gone silent. Under the product's 5 s, an answer the loaded machine held past it
+/// took the link down (`stalled reason=no-ack`, then `connected` on the same bridge's redial)
+/// under tests whose property is no latency. The test of that verdict names its own deadline
+/// (`link_state::a_broker_that_accepts_but_never_acks_is_stalled_no_ack`).
+pub const ACK_WAIT: (&str, Duration) = ("ATERM_LINK_ACK_DEADLINE_MS", DEADLINE);
+
+/// The bound `aterm fabric` puts on each socket its report and one-shot commands open, the
+/// doctor's read of each local instance among them (`ATERM_FABRIC_IO_TIMEOUT_MS`, the
+/// product's 3 s), for a command whose property is not latency. A world's instance answers on
+/// the test's loaded machine, where `fabric status` can wait past 3 s, and the doctor then
+/// refuses (`1 local instance(s) did not answer`). Half of [`DEADLINE`], so a doctor that does
+/// find an instance mute says which one before the harness's bound on the command
+/// ([`output_within`]) ends the test. Set by [`prepare_gui_environment`] and
+/// [`scratch_spawnfd`]; a test of the refusal removes it, so its doctor has the product's bound.
+pub const FABRIC_IO_WAIT: (&str, Duration) = (
+    "ATERM_FABRIC_IO_TIMEOUT_MS",
+    Duration::from_secs(DEADLINE.as_secs() / 2),
+);
+
+/// How long a test's bridge reads a broker subscription with nothing arriving before it takes
+/// the link for dead: its live read deadline seam (`ATERM_LINK_LIVE_DEADLINE_MS`; astream's
+/// `IDLE_MARK_DEADLINE`, 30 s, in the product) set to the hang detector, beside [`ACK_WAIT`]
+/// and set where it is, for the same reason: the world's broker runs in the test's own process
+/// on the test's loaded machine, so a tail that marks late is that machine. Under the
+/// product's 30 s, a tail that wrote nothing for that long took the link down (`stalled
+/// reason=cut-inbox` or `cut-fleet`, then `connected` on the same bridge's redial) under tests
+/// whose property is no latency. A test's broker that is gone (killed, or dropped with its
+/// world) ends its streams at end of file or with a reset, which no deadline waits for.
+pub const LIVE_WAIT: (&str, Duration) = ("ATERM_LINK_LIVE_DEADLINE_MS", DEADLINE);
+
 const MAX_SOCK_PATH: usize = 100;
 
 fn assert_sock_fits(sock: &str) {
@@ -67,6 +105,27 @@ pub fn until<T>(what: &str, f: impl FnMut() -> Option<T>) -> T {
 
 /// [`until`] with a stated budget, for an observable with a period of its own.
 pub use aterm_spec::wait::until_within;
+
+/// A copy of the program `of` at `dir/name`, signed ad hoc (a copied Apple binary must be): a
+/// program that is its own image, its canonical file name `name`, so the session's process
+/// watch reads `name` whenever it hears it. A link to `/bin/sh` would not do: macOS's `/bin/sh`
+/// re-execs the shell `/private/var/select/sh` names within a few ms, and a drain after that
+/// reads only that shell's names.
+pub fn own_image(dir: &Path, name: &str, of: &str) -> PathBuf {
+    let path = dir.join(name);
+    let _ = std::fs::remove_file(&path);
+    std::fs::copy(of, &path).unwrap_or_else(|error| panic!("copy {of} to {name}: {error}"));
+    let mut sign = aterm_uds::spawnfd::command("/usr/bin/codesign");
+    sign.args(["--force", "--sign", "-"]).arg(&path);
+    let signed = aterm_uds::deadline::output_until(&mut sign, Instant::now() + DEADLINE)
+        .unwrap_or_else(|error| panic!("codesign {name}: {error:?}"));
+    assert!(
+        signed.status.success(),
+        "codesign {name}: {}",
+        String::from_utf8_lossy(&signed.stderr)
+    );
+    path
+}
 
 /// The budget for something the bridge's periodic backstop publishes.
 pub const PERIODIC_DEADLINE: Duration = Duration::from_secs(180);
@@ -330,10 +389,19 @@ pub fn wait_output_within(child: Child, what: &str) -> std::process::Output {
     }
 }
 
+/// `socket`, kept out of every child this process spawns ([`aterm_uds::keep_out_of_children`]),
+/// as [`aterm_link::ctl::dial`] keeps a connection: a stub's listener, or a connection it
+/// accepted, that a child being spawned holds a copy of is drained by a scan of that child, and
+/// every later accept or read of it answers `EBADF`.
+pub fn kept<S: std::os::fd::AsFd>(socket: S) -> S {
+    aterm_uds::keep_out_of_children(&socket).expect("keep the socket out of children");
+    socket
+}
+
 /// Connects a broker client on `sock` with read and write timeouts bounded by [`VERB_DEADLINE`].
 pub fn broker_client(sock: impl AsRef<Path>) -> Client {
     let sock = sock.as_ref();
-    let s = std::os::unix::net::UnixStream::connect(sock)
+    let s = aterm_link::ctl::dial(sock)
         .unwrap_or_else(|e| panic!("connect to the broker at {}: {e}", sock.display()));
     s.set_read_timeout(Some(VERB_DEADLINE))
         .and_then(|()| s.set_write_timeout(Some(VERB_DEADLINE)))
@@ -374,15 +442,22 @@ pub fn node_grants(node: &str) -> Vec<String> {
     aterm_link::enable::node_grants(FLEET, node)
 }
 
-/// Strips inherited `ATERM_*` environment variables and configures test GUI defaults on `cmd`.
+/// Strips inherited `ATERM_*` environment variables and configures test GUI defaults on `cmd`
+/// ([`TEST_WAITS`]).
 pub fn prepare_gui_environment(cmd: &mut Command) {
     for (name, _) in std::env::vars_os() {
         if stripped(&name) {
             cmd.env_remove(&name);
         }
     }
-    cmd.env(STALE_HORIZON.0, STALE_HORIZON.1.as_millis().to_string());
+    for (name, wait) in TEST_WAITS {
+        cmd.env(name, wait.as_millis().to_string());
+    }
 }
+
+/// The bounds every child of a test has in place of the product's ([`prepare_gui_environment`],
+/// [`scratch_spawnfd`]).
+const TEST_WAITS: [(&str, Duration); 4] = [STALE_HORIZON, ACK_WAIT, LIVE_WAIT, FABRIC_IO_WAIT];
 
 /// Owed-answer horizon (`ATERM_FABRIC_STALE_AFTER_MS`) set by [`prepare_gui_environment`].
 pub const STALE_HORIZON: (&str, Duration) = ("ATERM_FABRIC_STALE_AFTER_MS", VERB_DEADLINE);
@@ -520,7 +595,9 @@ pub fn end_bridge(state: &Path, launcher: Launcher) {
 }
 
 /// The config every fixture seeds: no agent auto-prime, updates and packages off, and Universal
-/// Control left as it is.
+/// Control left as it is. Packages off is also atpkg's no to unattended installs
+/// (`atpkg::adoption::unattended_install_off`), so a worker spawned in a fabric world runs the
+/// world's stand-in and never installs its agent CLI from the network.
 pub const FIXTURE_GUI_CONFIG: &str = "agents_auto_prime = false\n\n[update]\nenabled = false\nauto_apply = false\n\n[packages]\nenabled = false\n\n[machine]\nuniversal_control = \"leave\"\n";
 
 /// Seed a private config once; an intentional fixture edit survives relaunch.
@@ -1158,7 +1235,7 @@ impl World {
         read_on(
             &self.watch,
             || {
-                let s = std::os::unix::net::UnixStream::connect(&self.broker_sock)?;
+                let s = aterm_link::ctl::dial(&self.broker_sock)?;
                 s.set_read_timeout(Some(VERB_DEADLINE))?;
                 s.set_write_timeout(Some(VERB_DEADLINE))?;
                 let mut c = Client::from_stream(s);
@@ -1916,7 +1993,9 @@ pub fn scratch_spawnfd<'a>(
             cmd.env_remove(&name);
         }
     }
-    cmd.env(STALE_HORIZON.0, STALE_HORIZON.1.as_millis().to_string());
+    for (name, wait) in TEST_WAITS {
+        cmd.env(name, wait.as_millis().to_string());
+    }
     cmd.envs(scratch_cli_env(tmp))
 }
 
@@ -2285,45 +2364,4 @@ impl Node {
         });
         let _ = std::fs::remove_file(self.state.join("pid"));
     }
-}
-
-/// A wait judged at 50 ms (the timeout branch under test, not a budget) ends COULD NOT RUN naming
-/// the pid when the reader says the child is held, fails naming what never came otherwise, and
-/// returns an item that came.
-#[test]
-fn a_wait_that_runs_out_on_a_held_child_ends_could_not_run_and_any_other_silence_fails() {
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    let pid = 4242;
-    let hang = Duration::from_millis(50);
-    let ended = |held: Option<bool>| {
-        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            recv_judged(
-                &rx,
-                Instant::now(),
-                hang,
-                pid,
-                |p| held.filter(|_| p == pid),
-                || "the child's readiness line".to_owned(),
-            )
-        }));
-        let why = out.expect_err("nothing came");
-        why.downcast_ref::<String>().cloned().unwrap_or_default()
-    };
-    let held = ended(Some(true));
-    assert!(
-        held.starts_with(aterm_uds::host::COULD_NOT_RUN) && held.contains("(pid 4242)"),
-        "expected COULD NOT RUN, got: {held}"
-    );
-    for not in [Some(false), None] {
-        let failed = ended(not);
-        assert!(
-            failed.starts_with("the child's readiness line"),
-            "{not:?}: {failed}"
-        );
-    }
-    tx.send("listening".into()).expect("the channel is open");
-    assert_eq!(
-        recv_judged(&rx, Instant::now(), hang, pid, |_| Some(true), String::new),
-        "listening"
-    );
 }

@@ -88,8 +88,8 @@ fn make_archive_of(dir: &Path, ay_content: &[u8], ay_mode: &[u8; 8], extra: &[&s
     let mut tar = Vec::new();
     tar.extend(tar_entry(&bin_entry("ay"), ay_content, ay_mode));
     tar.extend(tar_entry(
-        &bin_entry("git"),
-        b"#!/bin/true\nnot-really-git",
+        &bin_entry("ssh"),
+        b"#!/bin/true\nnot-really-ssh",
         b"0000755\0",
     ));
     for name in extra {
@@ -187,7 +187,7 @@ fn fixture_from(dir: &Path, kind: &str, archive: PathBuf, signed_root: Option<&s
     );
     let pkg_body = format!(
         "schema = 2\nprogram = \"ay\"\nversion = \"0.1\"\nbuild_number = 18\n\
-         exposes = [\"ay\", \"git\"]\n\
+         exposes = [\"ay\", \"ssh\"]\n\
          [[artifact]]\ntarget = \"{TRIPLE}\"\nkind = \"{kind}\"\nasset = \"ay-18.tar.zst\"\n\
          sha256 = \"{sha}\"\ntree_root = \"{root}\"\nsize = 100\n\
          [artifact.cost]\ndisk_installed = 1048576\n"
@@ -224,7 +224,7 @@ fn fixture_vendor(dir: &Path, row: &str) -> Fake {
     );
     let pkg_body = format!(
         "schema = 2\nprogram = \"ay\"\nversion = \"0.1\"\nbuild_number = 18\n\
-         exposes = [\"ay\", \"git\"]\n\
+         exposes = [\"ay\", \"ssh\"]\n\
          [[artifact]]\ntarget = \"{TRIPLE}\"\n\
          asset = \"ay-18.tar.zst\"\nsha256 = \"{sha}\"\ntree_root = \"{root}\"\n\
          size = {size}\n{row}\
@@ -331,7 +331,7 @@ fn ay_installs_end_to_end_from_a_signed_release() {
     assert_eq!(report.shimmed, vec!["ay".to_string()]);
     assert_eq!(
         report.refused_shims,
-        vec!["git".to_string()],
+        vec!["ssh".to_string()],
         "sensitive shim refused"
     );
     assert_eq!(
@@ -339,7 +339,7 @@ fn ay_installs_end_to_end_from_a_signed_release() {
         tool_bin(&layout.build_dir("ay", 18), "ay")
     );
     assert!(
-        crate::ops::which(&layout, "git").is_none(),
+        crate::ops::which(&layout, "ssh").is_none(),
         "no sensitive shim"
     );
     assert_eq!(
@@ -363,7 +363,7 @@ fn a_manifest_exposing_pwsh_is_refused_a_shim_and_the_doctor_row_names_it() {
         let key = ("ay".to_string(), 18u64);
         let (body, _) = fake.pkg.remove(&key).unwrap();
         let body = String::from_utf8(body).unwrap();
-        let line = "exposes = [\"ay\", \"git\"]";
+        let line = "exposes = [\"ay\", \"ssh\"]";
         assert_eq!(body.matches(line).count(), 1, "the fixture's exposes line");
         let body = body.replacen(line, &format!("exposes = {exposes}"), 1);
         let sig = sign(&RELEASE_SEED, body.as_bytes());
@@ -513,12 +513,11 @@ fn a_group_member_records_its_refused_names_at_stage_and_the_doctor_says_the_cur
         let layout = layout(&dir);
         let installed = live_toolchain(&layout);
         crate::status::record_refused_shims(&layout, "ay", 17, &["zsh".to_string()]).unwrap();
-        assert_eq!(
-            refused_said(&layout),
-            vec![(
-                "base.pkg.refused@ay".to_string(),
-                refused_sentence("ay build 17", "zsh")
-            )]
+        assert_refused_says(
+            &layout,
+            "ay build 17",
+            "zsh",
+            "the live build before the pass",
         );
         if poisoned {
             poison(&dir.join("trust-4821.tar.zst"));
@@ -546,13 +545,11 @@ fn a_group_member_records_its_refused_names_at_stage_and_the_doctor_says_the_cur
         Some(vec!["zsh".to_string()]),
         "the live build's entry is kept beside it"
     );
-    assert_eq!(
-        refused_said(&layout),
-        vec![(
-            "base.pkg.refused@ay".to_string(),
-            refused_sentence("ay build 17", "zsh")
-        )],
-        "the live build's names, never the staged build's"
+    assert_refused_says(
+        &layout,
+        "ay build 17",
+        "zsh",
+        "the live build's names, never the staged build's",
     );
 
     let (_dir, layout, report) = staged("refused-group-apply", false);
@@ -565,21 +562,29 @@ fn a_group_member_records_its_refused_names_at_stage_and_the_doctor_says_the_cur
         std::fs::symlink_metadata(layout.bin_dir().join("pwsh")).is_err(),
         "no bin/pwsh"
     );
-    assert_eq!(
-        refused_said(&layout),
-        vec![(
-            "base.pkg.refused@ay".to_string(),
-            refused_sentence("ay build 18", "pwsh")
-        )]
+    assert_refused_says(
+        &layout,
+        "ay build 18",
+        "pwsh",
+        "the applied build's names alone",
     );
 }
 
-fn refused_sentence(build: &str, name: &str) -> String {
-    format!(
-        "{build} exposes `{name}`, a name no shim may carry (a shell, another core command, or \
-         no tool name) \u{2014} it has no shim here, so typed in a shell it never runs ay's \
-         copy; its signed manifest names it, and nothing on this machine changes that"
-    )
+/// The doctor's one refused row names `build` and its one refused `name`: the singular "a
+/// name" keeps a merged list (`zsh`, `pwsh`, names …) from passing.
+fn assert_refused_says(layout: &Layout, build: &str, name: &str, why: &str) {
+    let said = refused_said(layout);
+    assert_eq!(
+        said.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        ["base.pkg.refused@ay"],
+        "{why}: {said:?}"
+    );
+    assert!(
+        said[0].1.starts_with(&format!(
+            "{build} exposes `{name}`, a name no shim may carry"
+        )),
+        "{why}: {said:?}"
+    );
 }
 
 fn lay_as_older_atpkg(layout: &Layout, from: &Path, name: &str) -> PathBuf {
@@ -735,13 +740,14 @@ fn a_signed_manifest_served_for_another_request_is_refused_at_every_read() {
     }
 }
 
-/// The env that turns [`probe_an_install_under_an_open_umask`] on: the scratch directory
+/// The env that turns [`probe_an_install_under_an_open_umask_if_asked`] on: the scratch directory
 /// it installs under.
 #[cfg(unix)]
 const OPEN_UMASK_ENV: &str = "ATPKG_FLOW_OPEN_UMASK_DIR";
 /// That probe's name, as `--exact` wants it.
 #[cfg(unix)]
-const OPEN_UMASK_PROBE: &str = "flow::tests::probe_an_install_under_an_open_umask";
+const OPEN_UMASK_PROBE: &str =
+    "flow::tests::an_install_under_an_open_umask_leaves_nothing_others_can_write";
 
 /// Every entry under `dir` (never through a link) whose mode lets its group or anyone
 /// else write it, as `<path relative to base> <mode>`.
@@ -768,10 +774,9 @@ fn writable_by_others(base: &Path, dir: &Path, out: &mut Vec<String>) {
 /// under umask `000`, the end-to-end install plus a shim-env sidecar and a stage-refusal
 /// memo leave nothing in the prefix writable by group or others.
 #[cfg(unix)]
-#[test]
-fn probe_an_install_under_an_open_umask() {
+fn probe_an_install_under_an_open_umask_if_asked() -> bool {
     let Some(dir) = std::env::var_os(OPEN_UMASK_ENV) else {
-        return;
+        return false;
     };
     // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail; this process runs this one test (`--exact`), so no other create sees the mask.
     unsafe { libc::umask(0) };
@@ -794,6 +799,7 @@ fn probe_an_install_under_an_open_umask() {
     let mut loose = Vec::new();
     writable_by_others(&layout.prefix, &layout.prefix, &mut loose);
     assert!(loose.is_empty(), "laid writable by others: {loose:#?}");
+    true
 }
 
 /// An install's store must not depend on the umask it runs under: in a root-staged system
@@ -803,6 +809,9 @@ fn probe_an_install_under_an_open_umask() {
 #[cfg(unix)]
 #[test]
 fn an_install_under_an_open_umask_leaves_nothing_others_can_write() {
+    if probe_an_install_under_an_open_umask_if_asked() {
+        return;
+    }
     let d = scratch("open-umask");
     let out = aterm_uds::spawnfd::command(std::env::current_exe().unwrap())
         .args(["--exact", "--nocapture", OPEN_UMASK_PROBE])
@@ -1581,8 +1590,8 @@ fn a_shim_env_manifest_lays_an_exporting_shim_and_a_bad_one_is_refused() {
         let mut fake = fixture_vendor(dir, VENDOR_ROW);
         let (body, _) = fake.pkg.remove(&("ay".to_string(), 18u64)).unwrap();
         let body = String::from_utf8(body).unwrap().replacen(
-            "exposes = [\"ay\", \"git\"]\n",
-            &format!("exposes = [\"ay\", \"git\"]\nshim_env = {list}\n"),
+            "exposes = [\"ay\", \"ssh\"]\n",
+            &format!("exposes = [\"ay\", \"ssh\"]\nshim_env = {list}\n"),
             1,
         );
         fake.pkg.insert(
@@ -1953,7 +1962,7 @@ fn fixture_exposing(dir: &Path, extra: &[&str], exposes: &str) -> Fake {
     let mut fake = fixture_from(dir, "binary", archive, None);
     let key = ("ay".to_string(), 18u64);
     let (body, _) = fake.pkg.remove(&key).unwrap();
-    let line = "exposes = [\"ay\", \"git\"]";
+    let line = "exposes = [\"ay\", \"ssh\"]";
     let body = String::from_utf8(body).unwrap();
     assert_eq!(body.matches(line).count(), 1, "the fixture's exposes line");
     let body = body.replacen(line, &format!("exposes = {exposes}"), 1);
@@ -4725,7 +4734,7 @@ fn dir_fetcher_installs_end_to_end() {
         tool_bin(&layout.build_dir("ay", 18), "ay")
     );
     assert!(
-        crate::ops::which(&layout, "git").is_none(),
+        crate::ops::which(&layout, "ssh").is_none(),
         "sensitive shim refused via dir too"
     );
     let df2 = crate::net::DirFetcher::new(reg);

@@ -556,12 +556,13 @@ fn parse_hex(text: &str) -> Option<u32> {
 }
 
 /// Gather live system telemetry ([`crate::protocol::HostVitals`]) from non-privileged OS
-/// readers (`sysctl`, `vm_stat`, `df -k /`, `ioreg -r -d 1 -c IOAccelerator`).
+/// readers (`sysctl`, `vm_stat`, `df -k <account-home>`, `ioreg -r -d 1 -c IOAccelerator`).
 #[must_use]
 pub fn gather_vitals(sys: &dyn System, facts: &HostFacts) -> Option<crate::protocol::HostVitals> {
     let cpu_cores = line(sys, &Cmd::new("/usr/sbin/sysctl").args(["-n", "hw.ncpu"]))
         .parse::<u32>()
-        .unwrap_or(0);
+        .ok()
+        .filter(|n| *n > 0);
     let load_avg_100 = run(
         sys,
         &Cmd::new("/usr/sbin/sysctl").args(["-n", "vm.loadavg"]),
@@ -588,7 +589,10 @@ pub fn gather_vitals(sys: &dyn System, facts: &HostFacts) -> Option<crate::proto
         "4" => Some("critical".to_owned()),
         _ => None,
     };
-    let df_parsed = run(sys, &Cmd::new("/bin/df").args(["-k", "/"]))
+    let df_parsed = sys
+        .account_home()
+        .filter(|home| home.is_absolute())
+        .and_then(|home| run(sys, &Cmd::new("/bin/df").arg("-k").arg(home)))
         .filter(Ran::success)
         .and_then(|r| parse_df_k(&r.out()));
     let gpu_parsed = run(
@@ -598,27 +602,30 @@ pub fn gather_vitals(sys: &dyn System, facts: &HostFacts) -> Option<crate::proto
     .filter(Ran::success)
     .and_then(|r| parse_ioreg_gpu(&r.out()));
 
-    if cpu_cores == 0
+    let mem_total_bytes = (facts.memory_bytes > 0).then_some(facts.memory_bytes);
+    if cpu_cores.is_none()
         && load_avg_100.is_none()
         && vm_stat_parsed.is_none()
         && df_parsed.is_none()
         && gpu_parsed.is_none()
+        && mem_total_bytes.is_none()
+        && swap_used_bytes.is_none()
+        && mem_pressure.is_none()
     {
         return None;
     }
 
-    let cpu_busy_pct = load_avg_100.and_then(|[l1, _, _]| {
-        (cpu_cores > 0).then(|| (l1.saturating_mul(100) / (cpu_cores * 100)).min(100) as u8)
-    });
     let (mem_used_bytes, mem_wired_bytes, mem_compressed_bytes) = match vm_stat_parsed {
-        Some((used, wired, comp)) => (used, Some(wired), Some(comp)),
-        None => (0, None, None),
+        Some(reading) => (reading.used, reading.wired, reading.compressed),
+        None => (None, None, None),
     };
-    let (disk_total_bytes, disk_used_bytes, disk_avail_bytes) =
-        df_parsed.unwrap_or((facts.disk_bytes, 0, 0));
-    let (gpu_name, gpu_busy_pct) = match gpu_parsed {
-        Some((name, pct)) => (name, pct),
-        None => (None, None),
+    let (disk_total_bytes, disk_used_bytes, disk_avail_bytes) = match df_parsed {
+        Some((total, used, available)) => (Some(total), Some(used), Some(available)),
+        None => (None, None, None),
+    };
+    let (gpu_name, gpu_cores, gpu_busy_pct) = match gpu_parsed {
+        Some(reading) => (reading.name, reading.cores, reading.busy_pct),
+        None => (None, None, None),
     };
     let uptime_secs = (facts.boot_time > 0)
         .then(|| sys.now().saturating_sub(facts.boot_time))
@@ -626,14 +633,16 @@ pub fn gather_vitals(sys: &dyn System, facts: &HostFacts) -> Option<crate::proto
 
     Some(crate::protocol::HostVitals {
         cpu_cores,
-        cpu_busy_pct,
+        // Load averages count runnable work; they are not a CPU-time interval.
+        cpu_busy_pct: None,
         load_avg_100,
         gpu_name,
+        gpu_cores,
         gpu_busy_pct,
         gpu_temp_c: None,
         gpu_power_deciwatts: None,
-        mem_total_bytes: facts.memory_bytes,
-        mem_used_bytes: mem_used_bytes.min(facts.memory_bytes.max(mem_used_bytes)),
+        mem_total_bytes,
+        mem_used_bytes: mem_used_bytes.map(|used| mem_total_bytes.map_or(used, |n| used.min(n))),
         mem_wired_bytes,
         mem_compressed_bytes,
         swap_used_bytes,
@@ -660,26 +669,27 @@ pub fn parse_loadavg(text: &str) -> Option<[u32; 3]> {
     Some([l1, l5, l15])
 }
 
-/// Parse macOS `vm_stat` into `(used_bytes, wired_bytes, compressed_bytes)`.
+/// Memory classes measured by `vm_stat`; omitted classes stay unread.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryVitals {
+    /// App, wired and compressed bytes, where every contributing class was read.
+    pub used: Option<u64>,
+    /// Wired bytes.
+    pub wired: Option<u64>,
+    /// Compressed bytes.
+    pub compressed: Option<u64>,
+}
+
+/// Parse macOS `vm_stat`, preserving absent classes and its measured page size.
 #[must_use]
-pub fn parse_vm_stat(text: &str) -> Option<(u64, u64, u64)> {
-    let mut page_size = 16_384u64;
-    if let Some(first) = text.lines().next()
-        && let Some((_, after)) = first.split_once("page size of ")
-    {
-        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
-        if let Ok(ps) = digits.parse::<u64>()
-            && ps > 0
-        {
-            page_size = ps;
-        }
-    }
-    let mut active = 0u64;
-    let mut wired = 0u64;
-    let mut compressed = 0u64;
-    let mut anonymous = 0u64;
-    let mut purgeable = 0u64;
-    let mut saw_any = false;
+pub fn parse_vm_stat(text: &str) -> Option<MemoryVitals> {
+    let (_, after) = text.lines().next()?.split_once("page size of ")?;
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    let page_size = digits.parse::<u64>().ok().filter(|n| *n > 0)?;
+    let mut wired = None;
+    let mut compressed = None;
+    let mut anonymous = None;
+    let mut purgeable = None;
     for line in text.lines() {
         let Some((k, v)) = line.split_once(':') else {
             continue;
@@ -694,45 +704,39 @@ pub fn parse_vm_stat(text: &str) -> Option<(u64, u64, u64)> {
             continue;
         };
         match k.trim() {
-            "Pages active" => {
-                active = pages;
-                saw_any = true;
-            }
             "Pages wired down" => {
-                wired = pages;
-                saw_any = true;
+                wired = Some(pages);
             }
             "Pages occupied by compressor" => {
-                compressed = pages;
-                saw_any = true;
+                compressed = Some(pages);
             }
             "Anonymous pages" => {
-                anonymous = pages;
-                saw_any = true;
+                anonymous = Some(pages);
             }
             "Pages purgeable" => {
-                purgeable = pages;
+                purgeable = Some(pages);
             }
             _ => {}
         }
     }
-    if !saw_any {
+    if wired.is_none() && compressed.is_none() && anonymous.is_none() {
         return None;
     }
-    let app_pages = if anonymous > 0 {
-        anonymous.saturating_sub(purgeable)
-    } else {
-        active
-    };
-    let used_bytes = app_pages
-        .saturating_add(wired)
-        .saturating_add(compressed)
-        .saturating_mul(page_size);
-    Some((
-        used_bytes,
-        wired.saturating_mul(page_size),
-        compressed.saturating_mul(page_size),
-    ))
+    let app_pages = anonymous
+        .zip(purgeable)
+        .map(|(anonymous, purgeable)| anonymous.saturating_sub(purgeable));
+    Some(MemoryVitals {
+        used: app_pages
+            .zip(wired)
+            .zip(compressed)
+            .map(|((app, wired), compressed)| {
+                app.saturating_add(wired)
+                    .saturating_add(compressed)
+                    .saturating_mul(page_size)
+            }),
+        wired: wired.map(|pages| pages.saturating_mul(page_size)),
+        compressed: compressed.map(|pages| pages.saturating_mul(page_size)),
+    })
 }
 
 /// Parse `sysctl -n vm.swapusage` (`total = 2048.00M  used = 1043.31M  free = 1004.69M`).
@@ -751,24 +755,35 @@ pub fn parse_swapusage(text: &str) -> Option<u64> {
     Some((num.max(0.0) * mult).round() as u64)
 }
 
-/// Parse `df -k /` into `(total_bytes, used_bytes, avail_bytes)`.
+/// Parse `df -k <account-home>` into `(total_bytes, used_bytes, avail_bytes)`.
 #[must_use]
 pub fn parse_df_k(text: &str) -> Option<(u64, u64, u64)> {
     let row = text.lines().skip(1).find(|l| !l.trim().is_empty())?;
     let mut cols = row.split_whitespace();
     let _fs = cols.next()?;
     let total_kb = cols.next()?.parse::<u64>().ok()?;
-    let _used_kb = cols.next()?.parse::<u64>().ok()?;
+    let used_kb = cols.next()?.parse::<u64>().ok()?;
     let avail_kb = cols.next()?.parse::<u64>().ok()?;
     let total = total_kb.saturating_mul(1024);
     let avail = avail_kb.saturating_mul(1024).min(total);
-    let used = total.saturating_sub(avail);
+    let used = used_kb.saturating_mul(1024).min(total);
     Some((total, used, avail))
 }
 
-/// Parse `ioreg -r -d 1 -c IOAccelerator` into `(gpu_name, device_utilization_pct)`.
+/// Independently measured GPU facts from one `ioreg` read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GpuVitals {
+    /// Device model.
+    pub name: Option<String>,
+    /// Device core count.
+    pub cores: Option<u32>,
+    /// Device busy percentage.
+    pub busy_pct: Option<u8>,
+}
+
+/// Parse independently available GPU fields from `ioreg -r -d 1 -c IOAccelerator`.
 #[must_use]
-pub fn parse_ioreg_gpu(text: &str) -> Option<(Option<String>, Option<u8>)> {
+pub fn parse_ioreg_gpu(text: &str) -> Option<GpuVitals> {
     let mut model = None;
     let mut cores = None;
     let mut pct = None;
@@ -796,22 +811,160 @@ pub fn parse_ioreg_gpu(text: &str) -> Option<(Option<String>, Option<u8>)> {
             }
         }
     }
-    if model.is_none() && pct.is_none() {
+    if model.is_none() && cores.is_none() && pct.is_none() {
         return None;
     }
-    let gpu_name = match (model, cores) {
-        (Some(m), Some(c)) => Some(format!("{m} ({c}c)")),
-        (Some(m), None) => Some(m),
-        (None, Some(c)) => Some(format!("GPU ({c}c)")),
-        (None, None) => None,
-    };
-    Some((gpu_name, pct))
+    Some(GpuVitals {
+        name: model,
+        cores,
+        busy_pct: pct,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::port::{Fake, Stat};
+
+    #[test]
+    fn vitals_keep_failed_reads_absent_and_do_not_turn_load_into_utilization() {
+        let sys = Fake::root();
+        sys.on("/usr/sbin/sysctl -n hw.ncpu", Ran::ok("18\n")).on(
+            "/usr/sbin/sysctl -n vm.loadavg",
+            Ran::ok("{ 2.50 3.00 4.00 }\n"),
+        );
+        let facts = HostFacts {
+            memory_bytes: 128 << 30,
+            disk_bytes: 8_000_000_000_000,
+            ..Default::default()
+        };
+        let v = gather_vitals(&sys, &facts).expect("known capacity and load");
+        assert_eq!(v.cpu_cores, Some(18));
+        assert_eq!(v.cpu_busy_pct, None);
+        assert_eq!(v.load_avg_100, Some([250, 300, 400]));
+        assert_eq!(v.mem_total_bytes, Some(128 << 30));
+        assert_eq!(v.mem_used_bytes, None);
+        assert_eq!(v.mem_wired_bytes, None);
+        assert_eq!(v.mem_compressed_bytes, None);
+        assert_eq!(
+            v.disk_total_bytes, None,
+            "a drive is not the root filesystem"
+        );
+        assert_eq!(v.disk_used_bytes, None);
+        assert_eq!(v.disk_avail_bytes, None);
+        let json = aterm_json::to_value(&v).unwrap();
+        for field in [
+            "cpu_busy_pct",
+            "mem_used_bytes",
+            "disk_total_bytes",
+            "disk_used_bytes",
+            "disk_avail_bytes",
+        ] {
+            assert!(json.get(field).is_none(), "{field}: {json}");
+        }
+        assert!(v.format_cpu().contains("load 2.50/3.00/4.00"));
+        assert!(!v.format_cpu().contains('%'));
+        assert_eq!(gather_vitals(&Fake::root(), &HostFacts::default()), None);
+    }
+
+    #[test]
+    fn vitals_keep_measured_zero_reserved_disk_space_and_gpu_capacity() {
+        let sys = Fake::root();
+        sys.logged_in(&User {
+            name: "owner".into(),
+            uid: 501,
+            gid: 20,
+            home: "/Users//owner".into(),
+            shell: "/bin/zsh".into(),
+            admin: true,
+        });
+        sys.on("/usr/sbin/sysctl -n hw.ncpu", Ran::ok("18\n"))
+            .on("/usr/bin/vm_stat", Ran::ok(
+                "Mach Virtual Memory Statistics: (page size of 4096 bytes)\n\
+                 Pages active: 100.\nAnonymous pages: 0.\nPages purgeable: 0.\n\
+                 Pages wired down: 0.\nPages occupied by compressor: 0.\n",
+            ))
+            .on("/bin/df -k /Users//owner", Ran::ok(
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk 1000 600 200 75% /\n",
+            ))
+            .on("/bin/df -k /", Ran::ok(
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/system 1000 10 200 5% /\n",
+            ))
+            .on("/usr/sbin/ioreg -r -d 1 -c IOAccelerator", Ran::ok(
+                "\"model\" = \"Apple M5 Max\"\n\"gpu-core-count\" = 40\n\"Device Utilization %\"=0\n",
+            ));
+        let v = gather_vitals(
+            &sys,
+            &HostFacts {
+                memory_bytes: 128 << 30,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            v.mem_used_bytes,
+            Some(0),
+            "zero anonymous pages must not fall back to active pages"
+        );
+        assert_eq!(v.mem_wired_bytes, Some(0));
+        assert_eq!(v.mem_compressed_bytes, Some(0));
+        assert_eq!(v.disk_total_bytes, Some(1_024_000));
+        assert_eq!(v.disk_used_bytes, Some(614_400));
+        assert_eq!(v.disk_avail_bytes, Some(204_800));
+        assert!(
+            sys.calls()
+                .iter()
+                .any(|call| call == "/bin/df -k /Users//owner")
+        );
+        assert!(!sys.calls().iter().any(|call| call == "/bin/df -k /"));
+        assert_eq!(v.gpu_name.as_deref(), Some("Apple M5 Max"));
+        assert_eq!(v.gpu_cores, Some(40));
+        assert_eq!(v.gpu_busy_pct, Some(0));
+        let wire = aterm_json::to_string(&v).unwrap();
+        assert_eq!(
+            aterm_json::from_str::<crate::protocol::HostVitals>(&wire).unwrap(),
+            v
+        );
+    }
+
+    #[test]
+    fn partial_memory_classes_and_gpu_capacity_stay_independent() {
+        let header = "Mach Virtual Memory Statistics: (page size of 4096 bytes)\n";
+        assert_eq!(
+            parse_vm_stat(&format!("{header}Pages wired down: 3.\n")),
+            Some(MemoryVitals {
+                used: None,
+                wired: Some(12_288),
+                compressed: None,
+            })
+        );
+        assert_eq!(parse_vm_stat("Pages wired down: 3.\n"), None);
+        assert_eq!(
+            parse_vm_stat(&format!("{header}not a measured class\n")),
+            None
+        );
+        assert_eq!(
+            parse_ioreg_gpu("\"gpu-core-count\" = 40\n"),
+            Some(GpuVitals {
+                name: None,
+                cores: Some(40),
+                busy_pct: None,
+            })
+        );
+        assert_eq!(
+            parse_ioreg_gpu("\"Device Utilization %\"=0\n"),
+            Some(GpuVitals {
+                name: None,
+                cores: None,
+                busy_pct: Some(0),
+            })
+        );
+        assert_eq!(parse_ioreg_gpu("unread"), None);
+        assert_eq!(
+            parse_df_k("Filesystem blocks Used Available\n/dev/disk 1000 unread 200\n"),
+            None
+        );
+    }
 
     const VM_HIDUTIL: &str = "Services:\n\
 VendorID ProductID LocationID UsagePage Usage RegistryID       Transport                     Class                    Product              UserClass               Built-In \n\

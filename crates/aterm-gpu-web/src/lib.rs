@@ -855,7 +855,12 @@ impl AtermGpuTerminal {
     }
 
     /// Whether the next `render` would draw.
+    ///
+    /// Applies any pending global scrollback-budget share before reading `damage_epoch`;
+    /// only when scrolled into history with staged lines still unpromoted can `render`'s
+    /// bounded backlog trickle clamp `display_offset` and open a frame afterwards.
     pub fn needs_frame(&mut self) -> bool {
+        self.apply_pending_scrollback_budget();
         let cell_h = self.cpu.cell_size().1;
         let key = FrameGateKey {
             damage_epoch: self.term.damage_epoch(),
@@ -1925,6 +1930,65 @@ mod tests {
         assert!(
             settled,
             "an idle effects pipeline must settle back into the gate"
+        );
+    }
+
+    #[test]
+    fn pending_budget_share_shrink_reopens_the_frame_gate_and_agrees_with_render() {
+        let mut t = crate::system_font_terminal(6, 40, 14.0);
+        for i in 0..3_000 {
+            t.process(format!("tier line {i}\r\n").as_bytes());
+        }
+        while t.drain_scrollback_backlog(0) > 0 {}
+        t.scroll_to_top();
+        assert!(!t.render_headless().expect("initial frame"));
+        assert!(!t.needs_frame(), "settled after rendering scrolled history");
+        assert!(t.render_headless().expect("gated frame"));
+
+        // Non-evicting pending share update (as from raising the global budget).
+        t.budget_share.set_configured(128 * 1024 * 1024);
+        assert!(
+            !t.needs_frame(),
+            "a non-evicting pending share leaves damage_epoch untouched"
+        );
+        assert!(
+            t.render_headless().expect("still gated"),
+            "render_headless agrees with needs_frame == false"
+        );
+
+        let before = t
+            .term
+            .scrollback()
+            .map_or(0, aterm_core::scrollback::ScrollbackStorage::line_count);
+        assert!(before > 0);
+
+        // Evicting pending share shrink (as from lowering the global budget).
+        t.budget_share.set_configured(4_096);
+        assert!(
+            t.needs_frame(),
+            "an evicting pending share enforces budget and reopens the frame gate"
+        );
+        let after = t
+            .term
+            .scrollback()
+            .map_or(0, aterm_core::scrollback::ScrollbackStorage::line_count);
+        assert!(
+            after < before,
+            "needs_frame applied the shrunk budget and evicted store lines ({before} -> {after})"
+        );
+        assert_eq!(
+            t.term
+                .scrollback()
+                .map(aterm_core::scrollback::ScrollbackStorage::memory_budget),
+            Some(4_096)
+        );
+        assert!(
+            !t.render_headless().expect("eviction repaint"),
+            "render_headless agrees with needs_frame == true"
+        );
+        assert!(
+            !t.needs_frame(),
+            "re-settled after presenting the clamped view"
         );
     }
 

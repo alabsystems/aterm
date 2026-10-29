@@ -512,6 +512,10 @@ struct RowWords {
     bar: Option<BarFill>,
     /// The row's figure run at the end of its bar ([`words::glance_run`]), longest first.
     run: Vec<Txt>,
+    /// Visible hardware/capacity figures where no ordinary amount column fits.
+    capacity: Vec<Txt>,
+    /// Available space beside a separate used/total amount column.
+    available: Vec<Txt>,
     state: Option<StateTxt>,
     /// The Details clauses: the glance's, then the other tables' ([`Table::said`]).
     details: [Vec<ClauseTxt>; 2],
@@ -573,6 +577,8 @@ impl DeckPrev {
 pub(crate) struct DeckWords {
     rows: Vec<RowWords>,
     cores: Vec<CoreCluster>,
+    /// Logical CPU cores reported by the snapshot, independent of readable load counters.
+    cpu_total: Option<usize>,
     /// The processor's name for trailing room on the `Cores` row (`Apple M5 Max`, `M5 Max`),
     /// longest first.
     cores_tail_forms: Vec<Txt>,
@@ -649,6 +655,7 @@ impl DeckWords {
         Self {
             rows,
             cores,
+            cpu_total: snap.cpu.as_ref().map(|cpu| cpu.total()).filter(|&n| n > 0),
             cores_tail_forms,
             totals: words::machine_totals(snap),
             time_gaps: snap.time_gaps.clone(),
@@ -672,6 +679,8 @@ impl DeckWords {
                 multi_scale: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
                 bar: None,
                 run: Vec::new(),
+                capacity: Vec::new(),
+                available: Vec::new(),
                 state: None,
                 details: [Vec::new(), Vec::new()],
             })
@@ -679,6 +688,7 @@ impl DeckWords {
         Self {
             rows,
             cores: Vec::new(),
+            cpu_total: None,
             cores_tail_forms: Vec::new(),
             totals: Vec::new(),
             time_gaps: Vec::new(),
@@ -711,7 +721,15 @@ impl RowWords {
     fn new(res: Resource, snap: &Snapshot, panes: &[u64], loc: &Locale, m: &FaceMetrics) -> Self {
         let view = snap.resource(res, panes);
         let strip_text = words::strip_words(res, snap).map(|forms| txts(forms, m));
-        let run = txts(words::glance_run(res, &view, snap, loc), m);
+        let amount = words::monitor_amount(res, snap);
+        let run = txts(
+            if amount.is_empty() {
+                words::glance_run(res, &view, snap, loc)
+            } else {
+                amount
+            },
+            m,
+        );
         let state = words::state(res, snap, loc).map(|st| StateTxt {
             state: st.state,
             clauses: txts(st.clauses, m),
@@ -748,6 +766,8 @@ impl RowWords {
             }),
             bar: bar_fill(res, &view, snap, panes),
             run,
+            capacity: txts(words::monitor_capacity(res, snap), m),
+            available: txts(words::monitor_available(res, snap), m),
             state,
             details,
         }
@@ -1341,10 +1361,12 @@ impl<'a> Deck<'a> {
         cell_h: f64,
         slots: &[HeatSlot],
         live_heat: Option<f32>,
+        cap_inside: bool,
     ) {
-        let cap_room = self
-            .cap_px()
-            .map_or(0.0, |(h, gap)| f64::from(h + gap) / self.s);
+        // A caption's history, and the row below it, keep their over mark inside the strip,
+        // as a 1x strip does. An exterior cap would enter the preceding thin history band.
+        let cap = (!cap_inside).then(|| self.cap_px()).flatten();
+        let cap_room = cap.map_or(0.0, |(h, gap)| f64::from(h + gap) / self.s);
         self.note(
             BoxKind::Strip,
             [strip.x, top - cap_room, strip.end(), top + cell_h],
@@ -1359,7 +1381,6 @@ impl<'a> Deck<'a> {
         }
         let (y, h) = (self.px(top), self.px(cell_h));
         let radius = if self.s < 2.0 { 0.0 } else { 1.0 };
-        let cap = self.cap_px();
         let live_slot = rects.iter().copied().find(|r| r.3);
         // A moving fine band draws inside the span it stands in at rest: its newest box passes
         // under the live box and the entering one comes out from its old end, so neither the
@@ -1529,20 +1550,21 @@ impl<'a> Deck<'a> {
             return;
         }
         // Scale-band gridlines anchor to the X-axis ticks (`lag_px = 0.0`) so band changes (the
-        // live box's edge, `-10s`, `-1m`, `-5m`, `-15m`) never drift off their tick marks during
-        // glide/slide: one in the gap before each band's first box, the live box's band aside.
+        // live box's edge, `-10s`, `-1m`, `-10m`, `-1h`) never drift off their tick marks during
+        // glide/slide: one in the gap before each band's first box, the live box's band aside. A
+        // band is its boxes' period, not their width: neighbouring bands can share a weight.
         let rects = multi_scale_slot_rects(strip, self.s, 0.0);
         let slots = strip.spec.slots();
         let gap_px = self.px(1.0).max(1.0);
         let x0 = self.px(strip.x);
         let spans = Self::strip_spans(y0, y1, holes);
         let grid = self.inks.grid;
-        let mut prev_band: Option<(u16, bool)> = None;
+        let mut prev_band: Option<(i64, bool)> = None;
         for &(idx, sx, _, is_live_now) in &rects {
             let Some(slot) = slots.get(idx) else {
                 continue;
             };
-            let band = (slot.weight, is_live_now);
+            let band = (slot.age_hi_ms - slot.age_lo_ms, is_live_now);
             let boundary = prev_band.is_some_and(|prev| prev != band);
             prev_band = Some(band);
             if !boundary {
@@ -1934,14 +1956,63 @@ impl<'a> Deck<'a> {
             })
     }
 
+    /// Hardware facts share a row with its live history, without consuming causes or alerts in Details.
+    /// The planned columns alone choose the geometry, so changing readings cannot move a bar.
+    fn capacity_col(&self, t: &Table, row: &RowWords) -> Option<Col> {
+        if row.strip_text.is_some()
+            || !matches!(row.res, Resource::Memory | Resource::Disk | Resource::Gpu)
+        {
+            return None;
+        }
+        let end = if row.res == Resource::Gpu || t.meter.run.is_some() {
+            t.strip.end()
+        } else {
+            t.details.map_or(t.end, |col| col.x - 3.0)
+        };
+        Some(Col {
+            x: t.strip.x + 3.0,
+            w: (end - t.strip.x - 3.0).max(0.0),
+        })
+    }
+
+    fn capacity_moves_bar(t: &Table, row: &RowWords) -> bool {
+        row.strip_text.is_none()
+            && matches!(row.res, Resource::Memory | Resource::Disk)
+            && t.meter.run.is_none()
+    }
+
+    fn capacity_forms<'r>(t: &Table, row: &'r RowWords) -> &'r [Txt] {
+        if t.meter.run.is_some() && matches!(row.res, Resource::Memory | Resource::Disk) {
+            &row.available
+        } else {
+            &row.capacity
+        }
+    }
+
+    /// A capacity caption keeps the row's full time axis as a thin live band below its text.
+    /// Its height and foot depend only on the planned row and scale, never on the reading.
+    fn history_band(&self, t: &Table, row: &RowWords, r: u32) -> (f64, f64) {
+        if self.capacity_col(t, row).is_none() {
+            return (t.rows.top(r), t.rows.cell);
+        }
+        let h = self.px(1.0).max(1.0);
+        let y = self.px(t.rows.top(r + 1)) - 1.0 - h;
+        (f64::from(y) / self.s, f64::from(h) / self.s)
+    }
+
     /// The bar's segments a click picks a scope by, pt from its left edge: this tab's fill, and
     /// aterm's past it ([`BarFill::widths_px`], as [`Self::bar`] draws them). A scope that draws
     /// a fill takes at least [`SEGMENT_HIT_MIN`] of the bar, so a tab using little is still a
     /// target and not a pixel or two.
     fn bar_segments(&self, col: Col, fill: &BarFill) -> [(f64, f64, Bar); 2] {
+        self.bar_segments_with_gap(col, fill, 0.0)
+    }
+
+    /// A moved under-bar uses the same one-device-pixel separation as its drawn fills.
+    fn bar_segments_with_gap(&self, col: Col, fill: &BarFill, apart: f32) -> [(f64, f64, Bar); 2] {
         let s = self.s as f32;
         let w = self.px(col.w);
-        let [_, aw, tw] = fill.widths_px(w, s.round().max(1.0), 0.0);
+        let [_, aw, tw] = fill.widths_px(w, s.round().max(1.0), apart);
         let pt = |v: f32| f64::from(v) / self.s;
         let tab = if tw > 0.0 {
             pt(tw).max(SEGMENT_HIT_MIN).min(col.w)
@@ -2041,14 +2112,18 @@ impl<'a> Deck<'a> {
 
     /// How tall the bars under a table's % figures are drawn, device px: [`plan::UNDER_H`], or
     /// as much of it as every row holds between its line's top, [`plan::UNDER_GAP`] below the
-    /// digits' baseline ([`Rows::under`]), and a device px short of the next row's top; a device
-    /// px at least. One height serves every row of the table, so the lines read alike where the
+    /// digits' baseline ([`Rows::under`]), targeting a device px short of the next row's ink
+    /// while keeping a device px of height at least. One height serves every row of the table, so the lines read alike where the
     /// rows' tops round differently: at 1× in Full narrow and slim, whose 10.5 pt pitch leaves
     /// half a point past the line (§5's table), the rows on a half point have room for 1 px, and
     /// every line there is 1 px.
     fn under_h(&self, rows: &Rows) -> f32 {
         (0..rows.count)
-            .map(|r| self.px(rows.top(r + 1)) - 1.0 - self.px(rows.under(r).0))
+            .map(|r| {
+                let ink_top = rows.top(r + 1) + rows.baseline - ASCENT_EM * rows.name_pt;
+                let foot = (ink_top * self.s).floor() as f32 - 1.0;
+                foot - self.px(rows.under(r).0)
+            })
             .fold(self.px(plan::UNDER_H), f32::min)
             .max(1.0)
     }
@@ -2089,9 +2164,20 @@ impl<'a> Deck<'a> {
         t: &Table,
         r: u32,
         row: &RowWords,
+        above: Option<&RowWords>,
         prev_row: Option<(Option<f32>, Option<BarFill>)>,
         reading: bool,
     ) {
+        let capacity = self.capacity_col(t, row);
+        let capacity_above = above.is_some_and(|row| self.capacity_col(t, row).is_some());
+        let moves_bar = Self::capacity_moves_bar(t, row);
+        let capacity_forms = Self::capacity_forms(t, row);
+        let mut layout = *t;
+        if moves_bar {
+            layout.meter = Meter::default();
+            layout.under = t.pct.or(t.under);
+        }
+        let t = &layout;
         let rows = t.rows;
         let top = rows.top(r);
         let base = top + rows.baseline;
@@ -2133,7 +2219,15 @@ impl<'a> Deck<'a> {
             }
             None => {
                 let slots = row.multi_scale_slots(&t.strip);
-                self.strip(&t.strip, top, rows.cell, slots, live_heat);
+                let (history_top, history_h) = self.history_band(t, row, r);
+                self.strip(
+                    &t.strip,
+                    history_top,
+                    history_h,
+                    slots,
+                    live_heat,
+                    capacity.is_some() || capacity_above,
+                );
             }
         }
         if let Some(col) = t.pct {
@@ -2164,12 +2258,21 @@ impl<'a> Deck<'a> {
             }
             _ => None,
         };
+        if moves_bar && let Some(rect) = under {
+            self.live_rects.push((LiveLayer::Values, rect));
+        }
         if let Some(col) = t.meter.run {
             let state = row.state.as_ref().filter(|_| t.details.is_none());
             self.run_cell(col, base, rows.amount_pt, &row.run, state);
         }
         if let Some(col) = t.details {
             self.details(col, base, &row.details[t.said()]);
+        }
+        if let Some(col) = capacity {
+            let pt = 8.5;
+            let caption_base = top + ASCENT_EM * pt;
+            // Alerts keep their existing Details/run/header priority; capacity never displaces one.
+            self.run_cell(col, caption_base, pt, capacity_forms, None);
         }
         if reading {
             return;
@@ -2189,6 +2292,19 @@ impl<'a> Deck<'a> {
         // The bar under the % reaches past the row's band into the gap before the next row: it is
         // still this row's, as the bar's column is.
         if let Some(rect) = under {
+            if moves_bar && let Some(fill) = blended.as_ref() {
+                let col = Col {
+                    x: f64::from(rect.0) / self.s,
+                    w: f64::from(rect.2) / self.s,
+                };
+                for (x0, x1, bar) in self.bar_segments_with_gap(col, fill, 1.0) {
+                    if x1 > x0 {
+                        let from = self.px(x0);
+                        let scoped = (rect.0 + from, rect.1, self.px(x1) - from, rect.3);
+                        self.hits_first.push(Hit::row(scoped, inst, bar));
+                    }
+                }
+            }
             self.hits_first.push(Hit::row(rect, inst, Bar::Global));
         }
         let rect = self.px_rect(t.name.x, y0, t.end, y1);
@@ -2231,6 +2347,22 @@ impl<'a> Deck<'a> {
         let cy = (rows.top(0) + rows.top(last) + rows.cell) / 2.0;
         let slot = [at.x, SLOT_TOP, at.end(), self.h_pt - SLOT_FOOT];
         self.dial((cx, cy), gauge::R_FACE, slot, words);
+        let text = words.cpu_total.map_or_else(
+            || "cores unknown".to_owned(),
+            |n| format!("{n} {}", if n == 1 { "core" } else { "cores" }),
+        );
+        let pt = SMALL_PT.min(SMALL_PT * (at.w - 4.0) / self.m.width(&text, SMALL_PT, false));
+        let width = self.m.width(&text, pt, false);
+        let base = (cy + gauge::R_FACE + SMALL_PT).min(slot[3] - DESCENT_EM * pt);
+        self.text(
+            cx - width / 2.0,
+            base,
+            text,
+            pt,
+            false,
+            self.inks.words2,
+            Some((at.x, at.end())),
+        );
     }
 
     /// The strain gauge at the Folded deck's top left, as large as the band holds, its bloom
@@ -2603,8 +2735,28 @@ impl<'a> Deck<'a> {
             .rows
             .iter()
             .zip(0_u32..)
-            .filter(|(row, _)| row.strip_text.is_some())
-            .map(|(_, r)| (rows.top(r) - gap / 2.0, rows.top(r) + rows.cell + gap / 2.0))
+            .filter_map(|(row, r)| {
+                let end = if row.strip_text.is_some() {
+                    rows.top(r) + rows.cell + gap / 2.0
+                } else if self.capacity_col(&t, row).is_some() {
+                    self.history_band(&t, row, r).0
+                } else {
+                    return None;
+                };
+                let start = rows.top(r) - gap / 2.0;
+                let start = r
+                    .checked_sub(1)
+                    .and_then(|r| {
+                        words.rows.get(r as usize).and_then(|above| {
+                            above.strip_text.is_none().then(|| {
+                                let (top, height) = self.history_band(&t, above, r);
+                                top + height
+                            })
+                        })
+                    })
+                    .map_or(start, |foot| start.max(foot));
+                Some((start, end))
+            })
             .collect();
         let last = rows.top(DECK_RESOURCES.len() as u32 - 1) + rows.cell;
         self.gridlines(&plan.strip, rows.top(0), last, &holes);
@@ -2653,12 +2805,13 @@ impl<'a> Deck<'a> {
             self.live_rects.push((LiveLayer::Values, rect));
         }
         for (row, r) in words.rows.iter().zip(0_u32..) {
+            let above = r.checked_sub(1).and_then(|r| words.rows.get(r as usize));
             let prev_row = words
                 .prev
                 .as_ref()
                 .and_then(|p| p.rows.get(r as usize))
                 .copied();
-            self.row(&t, r, row, prev_row, words.reading);
+            self.row(&t, r, row, above, prev_row, words.reading);
         }
         // After the rows: the foot of a bar under the last row's % reaches the Cores row's band.
         if let Some(rect) = cores_row_hit {
@@ -2748,10 +2901,34 @@ impl<'a> Deck<'a> {
             let holes: Vec<(f64, f64)> = ours
                 .iter()
                 .zip(0_u32..)
-                .filter(|(row, _)| row.strip_text.is_some())
-                .map(|(_, r)| (rows.top(r) - gap, rows.top(r) + rows.cell + gap))
+                .filter_map(|(row, r)| {
+                    let end = if row.strip_text.is_some() {
+                        rows.top(r) + rows.cell + gap
+                    } else if self.capacity_col(&t, row).is_some() {
+                        self.history_band(&t, row, r).0
+                    } else {
+                        return None;
+                    };
+                    let start = rows.top(r) - gap;
+                    let start = r
+                        .checked_sub(1)
+                        .and_then(|r| {
+                            ours.get(r as usize).and_then(|above| {
+                                above.strip_text.is_none().then(|| {
+                                    let (top, height) = self.history_band(&t, above, r);
+                                    top + height
+                                })
+                            })
+                        })
+                        .map_or(start, |foot| start.max(foot));
+                    Some((start, end))
+                })
                 .collect();
-            let last = rows.top(ours.len().saturating_sub(1) as u32) + rows.cell;
+            let last = ours.last().map_or(rows.top(0), |row| {
+                let r = ours.len().saturating_sub(1) as u32;
+                let (top, height) = self.history_band(&t, row, r);
+                top + height
+            });
             self.gridlines(&block.strip, rows.top(0), last, &holes);
             if let Some(bar) = block.meter.bar {
                 let br = self.px_rect(bar.x - 2.0, rows.top(0) - 2.0, bar.end() + 2.0, last + 2.0);
@@ -2763,12 +2940,13 @@ impl<'a> Deck<'a> {
             }
             for (row, r) in ours.iter().zip(0_u32..) {
                 let row_ix = bi * 4 + r as usize;
+                let above = r.checked_sub(1).and_then(|r| ours.get(r as usize)).copied();
                 let prev_row = words
                     .prev
                     .as_ref()
                     .and_then(|p| p.rows.get(row_ix))
                     .copied();
-                self.row(&t, r, row, prev_row, words.reading);
+                self.row(&t, r, row, above, prev_row, words.reading);
             }
             self.strip_axis_and_events(
                 &block.strip,
@@ -3278,6 +3456,9 @@ impl crate::App {
         self.network_snapshot.network.revision.hash(&mut h);
         std::mem::discriminant(&self.network_snapshot.network.visibility).hash(&mut h);
         self.network_snapshot.network.detail.hash(&mut h);
+        self.network_snapshot.network.via_local_process.hash(&mut h);
+        self.network_snapshot.network.retention_limited.hash(&mut h);
+        crate::network_deck::hash_peer_reachability(&self.network_snapshot, &mut h);
         self.network_snapshot.services.hash(&mut h);
         self.vitals
             .prev_snapshot
@@ -3368,6 +3549,7 @@ impl crate::App {
                 self.vitals
                     .needle
                     .set(Some(needle.snapped(std::time::Instant::now())));
+                crate::metrics::note_needle_episode(0);
             }
         }
         prims
@@ -3657,8 +3839,50 @@ fn meter_pct(share: Option<f32>) -> Option<f32> {
     })
 }
 
-/// The deck as a reader meets it: a meter for each resource in the deck's order, then the
-/// cores.
+/// The strain gauge's name to a screen reader (§12): the gauge draws [`Strain`] and no word.
+#[cfg(a11y_tree)]
+const A11Y_GAUGE: &str = "Strain";
+
+/// The strain gauge as a reader meets it (§12): the needle as the meter's value (past capacity
+/// reads 100), then in words the needle now and the bezel's hour, as the dial draws them
+/// ([`gauge::soak_words`]). Every group has it, as every group has the cores, whether or not a
+/// dial is drawn (a deck too narrow for one, or the Network lens alone).
+#[cfg(a11y_tree)]
+fn gauge_meter(snap: &Snapshot) -> crate::a11y_tree::StatsMeter {
+    let meter = |value: Option<f32>, words: String| crate::a11y_tree::StatsMeter {
+        name: A11Y_GAUGE.into(),
+        value,
+        words,
+    };
+    if snap.seq == 0 {
+        return meter(None, format!("{A11Y_GAUGE}: reading."));
+    }
+    let g = Gauge::of(&Strain::of(snap));
+    let (value, mut said) = match g.needle {
+        None => (None, format!("{A11Y_GAUGE}: not read.")),
+        Some(n) if n > 1.0 => (Some(100.0), format!("{A11Y_GAUGE} past capacity now.")),
+        Some(n) => {
+            let pct = words::pct(Some(n));
+            let spoken = match pct.strip_suffix('%') {
+                Some("<1") => "less than 1 percent".to_owned(),
+                Some(p) => format!("{p} percent"),
+                None => pct.clone(),
+            };
+            (
+                meter_pct(Some(n)),
+                format!("{A11Y_GAUGE} {spoken} of capacity now."),
+            )
+        }
+    };
+    if let Some(hour) = gauge::soak_words(g.soak) {
+        said.push(' ');
+        said.push_str(hour);
+    }
+    meter(value, said)
+}
+
+/// The deck as a reader meets it: the strain gauge at its top left, a meter for each resource in
+/// the deck's order, then the cores.
 #[cfg(a11y_tree)]
 pub(crate) fn stats_a11y_group(
     snap: Option<&Snapshot>,
@@ -3707,6 +3931,7 @@ pub(crate) fn stats_a11y_group(
     let n = cores.len();
     StatsGroup {
         name: A11Y_TITLE,
+        gauge: Some(gauge_meter(snap)),
         meters,
         cores_name: format!("{n} CPU {}", if n == 1 { "core" } else { "cores" }),
         cores,
@@ -3787,6 +4012,33 @@ pub(crate) mod tests {
     };
 
     #[test]
+    fn changing_the_relay_source_invalidates_the_resource_deck() {
+        let mut app = crate::App::headless_for_test();
+        let wid = *app.windows.keys().next().expect("window");
+        let frame = app.network_lens_frame(wid).expect("network frame");
+        let before = app.deck_input_key(&frame);
+        let mut snapshot = app.network_snapshot.as_ref().clone();
+        snapshot.network.via_local_process = Some(42);
+        app.network_snapshot = std::sync::Arc::new(snapshot);
+        assert_ne!(app.deck_input_key(&frame), before);
+    }
+
+    #[test]
+    fn retention_boundary_invalidates_the_deck_without_a_revision_change() {
+        let mut app = crate::App::headless_for_test();
+        let wid = *app.windows.keys().next().expect("window");
+        let frame = app.network_lens_frame(wid).expect("network frame");
+        let before = app.deck_input_key(&frame);
+        let original = app.network_snapshot.as_ref().clone();
+        let mut snapshot = original.clone();
+        snapshot.network.retention_limited = !snapshot.network.retention_limited;
+        assert_eq!(snapshot.revision, original.revision);
+        assert_eq!(snapshot.network.revision, original.network.revision);
+        app.network_snapshot = std::sync::Arc::new(snapshot);
+        assert_ne!(app.deck_input_key(&frame), before);
+    }
+
+    #[test]
     fn service_expiry_changes_the_resource_deck_cache_key_without_a_source_revision() {
         let mut app = crate::App::headless_for_test();
         let wid = *app.windows.keys().next().expect("window");
@@ -3800,6 +4052,40 @@ pub(crate) mod tests {
         app.network_snapshot =
             crate::network_deck::fresh_snapshot(app.network_snapshot.clone(), Some(61_001));
         assert_eq!(app.network_snapshot.revision, 0);
+        assert_ne!(app.deck_input_key(&frame), before);
+    }
+
+    #[test]
+    fn peer_expiry_changes_the_resource_deck_cache_key_without_a_source_revision() {
+        use aterm_types::network_state::{
+            MachineIdentity, PeerObservation, Reachability, Visibility,
+        };
+        let mut app = crate::App::headless_for_test();
+        let wid = *app.windows.keys().next().expect("window");
+        let mut snapshot = aterm_types::network_state::NetworkStateSnapshot::default();
+        snapshot.network.visibility = Visibility::Active;
+        snapshot.network.observed_at_ms = 10_000;
+        snapshot.network.peers.push(PeerObservation {
+            slot: 1,
+            identity: MachineIdentity {
+                machine_id: [1; 16],
+                incarnation: [2; 16],
+                label: None,
+            },
+            first_seen_ms: 1_000,
+            last_seen_ms: 2_000,
+            last_checked_ms: Some(2_000),
+            reachability: Reachability::Reachable,
+            instances: None,
+            samples: Vec::new(),
+        });
+        app.network_snapshot = std::sync::Arc::new(snapshot);
+        let frame = app.network_lens_frame(wid).expect("network frame");
+        let before = app.deck_input_key(&frame);
+        app.network_snapshot =
+            crate::network_deck::fresh_snapshot(app.network_snapshot.clone(), Some(17_001));
+        assert_eq!(app.network_snapshot.revision, 0);
+        assert_eq!(app.network_snapshot.network.revision, 0);
         assert_ne!(app.deck_input_key(&frame), before);
     }
 
@@ -4754,6 +5040,271 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn visible_capacity_rows_keep_the_drawn_tab_and_aterm_bar_click_targets() {
+        use crate::stats_paint::HitKind;
+        let m = FaceMetrics::helvetica_neue();
+        let mut moved = 0;
+        for positive in [true, false] {
+            let mut snap = snapshot();
+            let view = &mut snap.resources[Resource::Memory.index()];
+            let total = view.capacity.expect("memory capacity");
+            view.aterm.now = Some(if positive { total * 0.42 } else { 0.0 });
+            view.tabs = vec![(
+                7,
+                ScopeFig {
+                    now: Some(if positive { total * 0.15 } else { 0.0 }),
+                    ..ScopeFig::default()
+                },
+            )];
+            for form in [DeckForm::Full, DeckForm::Folded] {
+                for columns in [80, 120] {
+                    let mut i = input(&snap);
+                    i.form = form;
+                    let g = DeckGeom {
+                        w: columns as f32 * 8.0 * GEOM.scale,
+                        ..GEOM
+                    };
+                    let width = f64::from(g.w / g.scale);
+                    let table = match form {
+                        DeckForm::Full => Table::of_full(&plan::plan_full(width, &m)),
+                        DeckForm::Folded => {
+                            Table::of_block(&plan::plan_folded(width, &m).blocks[0])
+                        }
+                    };
+                    let words = DeckWords::new(&i, &m);
+                    let deck = Deck::new(&g, &i, &m, false);
+                    deck.capacity_col(&table, &words.rows[2])
+                        .expect("visible capacity");
+                    let under = Deck::capacity_moves_bar(&table, &words.rows[2]);
+                    moved += usize::from(positive && under);
+                    let col = if under {
+                        table.pct
+                    } else {
+                        table.meter.bar.or(table.under)
+                    }
+                    .expect("scope bar");
+                    let laid = lay(&g, &i, &words, &m, true);
+                    let said = drawn_row_text(&laid, &table, 2, g.scale);
+                    assert!(
+                        ["17", "32", "15", "avail"].iter().all(|v| said.contains(v)),
+                        "{form:?}/{columns}: memory capacity must be drawn in its row: {said}"
+                    );
+                    let row_top = table.rows.top(2);
+                    let bar = laid
+                        .boxes
+                        .iter()
+                        .find(|b| {
+                            b.kind == BoxKind::Bar
+                                && (b.r[0] - col.x).abs() < 0.6
+                                && b.r[1] >= row_top - 0.6
+                                && b.r[3] <= row_top + table.rows.pitch + 0.6
+                        })
+                        .expect("drawn memory bar");
+                    let scale = g.scale;
+                    let panel = |ink| {
+                        laid.prims.iter().find_map(|p| match p {
+                            DrawPrim::Panel {
+                                x, y, w, h, fill, ..
+                            } if *fill == rgba(ink, 0xFF)
+                                && (*x - bar.r[0] as f32 * scale).abs() < 1.0
+                                && *y >= bar.r[1] as f32 * scale - 0.6
+                                && *y + *h <= bar.r[3] as f32 * scale + 0.6
+                                && *w > 0.0 =>
+                            {
+                                Some((*x, *y, *w, *h))
+                            }
+                            _ => None,
+                        })
+                    };
+                    if !positive {
+                        assert!(panel(i.inks.tab).is_none() && panel(i.inks.aterm).is_none());
+                        assert!(
+                            !laid.hits.iter().any(|h| matches!(
+                                h.kind,
+                                HitKind::Row(Instrument::Memory, Bar::Tab | Bar::Aterm)
+                            )),
+                            "zero fills have no scoped hit"
+                        );
+                        continue;
+                    }
+                    let tab = panel(i.inks.tab).expect("positive tab fill");
+                    let aterm = panel(i.inks.aterm).expect("positive aterm fill");
+                    let y = tab.1 + tab.3 / 2.0;
+                    let aterm_start = (tab.0 + tab.2).max(aterm.0 + SEGMENT_HIT_MIN as f32 * scale);
+                    assert!(
+                        aterm_start < aterm.0 + aterm.2,
+                        "fixture must leave an aterm-only part"
+                    );
+                    for (x, expected) in [
+                        (tab.0 + tab.2 / 2.0, Bar::Tab),
+                        ((aterm_start + aterm.0 + aterm.2) / 2.0, Bar::Aterm),
+                    ] {
+                        let hit = laid
+                            .hits
+                            .iter()
+                            .find(|h| {
+                                let (hx, hy, hw, hh) = h.rect;
+                                x >= hx && x < hx + hw && y >= hy && y < hy + hh
+                            })
+                            .expect("drawn bar hit");
+                        assert_eq!(
+                            hit.kind,
+                            HitKind::Row(Instrument::Memory, expected),
+                            "{form:?}/{columns}, moved={under}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            moved > 0,
+            "the regression must exercise a relocated capacity bar"
+        );
+    }
+
+    /// Text primitives whose baseline belongs to this resource's actual row, including its
+    /// history caption and amount. Another row's header or figure cannot satisfy a capacity fact.
+    fn drawn_row_text(laid: &Laid, table: &Table, r: u32, scale: f32) -> String {
+        let top = table.rows.top(r) as f32 * scale;
+        let foot = table.rows.top(r + 1) as f32 * scale;
+        let left = table.name.x as f32 * scale;
+        let right = table.end as f32 * scale;
+        laid.prims
+            .iter()
+            .filter_map(|p| match p {
+                DrawPrim::Text {
+                    x, baseline: y, s, ..
+                } if *x >= left && *x < right && *y >= top && *y < foot => Some(s.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn normal_width_monitors_draw_used_available_total_and_gpu_identity() {
+        let mut snap = snapshot();
+        let cpu = snap.cpu.as_mut().expect("fixture CPU");
+        let old_count = cpu.total();
+        cpu.cores.resize_with(18, Default::default);
+        cpu.clusters
+            .last_mut()
+            .expect("fixture cluster")
+            .cores
+            .extend(old_count..18);
+        snap.resources[Resource::Cpu.index()].capacity = Some(18.0);
+        let memory = &mut snap.mem.as_mut().expect("fixture memory").sample;
+        memory.total = 128 << 30;
+        memory.app = 80 << 30;
+        memory.wired = 12 << 30;
+        memory.compressed = Some(4 << 30);
+        memory.cached = 24 << 30;
+        memory.free = 8 << 30;
+        let memory_view = &mut snap.resources[Resource::Memory.index()];
+        memory_view.now = Some((96_u64 << 30) as f64);
+        memory_view.capacity = Some((128_u64 << 30) as f64);
+        snap.volume = Some(aterm_vitals::model::VolumeSample {
+            total: 8_000_000_000_000,
+            free: 400_000_000_000,
+            available: 240_000_000_000,
+            mount: "/".into(),
+        });
+        let disk_view = &mut snap.resources[Resource::Disk.index()];
+        disk_view.now = Some(7_760_000_000_000.0);
+        disk_view.capacity = Some(8_000_000_000_000.0);
+        let gpu = snap.facts.gpu.as_mut().expect("fixture GPU");
+        gpu.name = Some("Apple M5 Max".into());
+        gpu.cores = Some(40);
+        gpu.in_use_bytes = Some(13 * (1_u64 << 30) / 10);
+        let m = FaceMetrics::helvetica_neue();
+        for form in [DeckForm::Full, DeckForm::Folded] {
+            for columns in [80, 120] {
+                let mut i = input(&snap);
+                i.form = form;
+                let g = DeckGeom {
+                    w: columns as f32 * 8.0 * GEOM.scale,
+                    ..GEOM
+                };
+                let laid = lay(&g, &i, &DeckWords::new(&i, &m), &m, true);
+                let width = f64::from(g.w / g.scale);
+                let table = match form {
+                    DeckForm::Full => Table::of_full(&plan::plan_full(width, &m)),
+                    DeckForm::Folded => Table::of_block(&plan::plan_folded(width, &m).blocks[0]),
+                };
+                let text = laid
+                    .prims
+                    .iter()
+                    .filter_map(|p| match p {
+                        DrawPrim::Text { s, .. } => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if form == DeckForm::Full {
+                    assert!(
+                        text.contains("18 cores"),
+                        "{form:?}/{columns}: CPU total must be visible: {text}"
+                    );
+                }
+                for (row, facts) in [
+                    (2, ["96", "128", "32", "GiB", "avail"]),
+                    (3, ["7.60", "8", "240", "TB", "avail"]),
+                ] {
+                    let said = drawn_row_text(&laid, &table, row, g.scale);
+                    assert!(
+                        facts.iter().all(|fact| said.contains(fact)),
+                        "{form:?}/{columns}: capacity is not visible in its monitor row: {said}; all text: {text}"
+                    );
+                    assert!(
+                        said.contains("used") && !said.contains("unavailable"),
+                        "{form:?}/{columns}: occupied bytes must be labeled used: {said}"
+                    );
+                }
+                let gpu_text = drawn_row_text(&laid, &table, 1, g.scale);
+                assert!(
+                    gpu_text.contains("M5 Max") && gpu_text.contains("40 cores"),
+                    "{form:?}/{columns}: {text}"
+                );
+                let histories: Vec<_> = laid
+                    .boxes
+                    .iter()
+                    .filter(|b| b.kind == BoxKind::Strip)
+                    .collect();
+                assert_eq!(
+                    histories.len(),
+                    DECK_RESOURCES.len(),
+                    "{form:?}/{columns}: capacity must retain every resource's history"
+                );
+                for row in [1, 2, 3] {
+                    assert!(
+                        histories.iter().any(|b| {
+                            b.r[0] == table.strip.x
+                                && b.r[2] == table.strip.end()
+                                && b.r[1] >= table.rows.top(row)
+                                && b.r[3] < table.rows.top(row + 1)
+                                && b.r[3] > b.r[1]
+                        }),
+                        "{form:?}/{columns}: row {row} keeps its whole time axis below the caption"
+                    );
+                }
+                assert_eq!(g.h, GEOM.h, "capacity text adds no chrome height");
+            }
+        }
+        snap.cpu = None;
+        let mut i = input(&snap);
+        i.form = DeckForm::Full;
+        let g = DeckGeom {
+            w: 80.0 * 8.0 * GEOM.scale,
+            ..GEOM
+        };
+        let (prims, _) = deck_paint(&g, &i);
+        assert!(
+            prims.iter().any(|p| matches!(p, DrawPrim::Text { s, .. } if s.contains("cores") && s.contains("unknown"))),
+            "an unread CPU core count must stay explicit"
+        );
+    }
+
+    #[test]
     fn before_the_first_snapshot_the_deck_says_it_is_reading() {
         let empty = Snapshot::default();
         for form in [DeckForm::Full, DeckForm::Folded] {
@@ -4996,7 +5547,7 @@ pub(crate) mod tests {
         assert_eq!(disk.value, Some(98.0));
         assert_eq!(
             disk.words,
-            "Disk 98 percent of capacity: 1.96 of 2.00 terabytes used. aterm writes 410 \
+            "Disk 98 percent of capacity: 1.96 of 2.00 terabytes unavailable. aterm writes 410 \
              megabytes per second, Tab 2 writes 0.2 megabytes per second. Steady near 98 \
              percent. Disk full in about 34 minutes, filling 1.2 gigabytes per minute. Disk low, \
              41 gigabytes free. aterm freed 12 gigabytes today. Used grew 12 gigabytes in the \

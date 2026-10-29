@@ -1475,6 +1475,19 @@ fn the_glyph_gate_refuses_only_a_known_foreign_glyph() {
         None,
         "a glyph-less press makes the run unknown"
     );
+    assert_eq!(
+        p.foreign_to_live(t0 + ms(10), 'c'),
+        None,
+        "a later glyph-less or multi-cell press makes the pool unknown even when an earlier slot matched"
+    );
+    let mut single_glyphless = PressCredits::default();
+    single_glyphless.bank(t0, 1, Some('c'));
+    single_glyphless.bank(t0 + ms(5), 1, None);
+    assert_eq!(
+        single_glyphless.foreign_to_live(t0 + ms(5), 'c'),
+        None,
+        "order-independent: a later one-cell glyph-less press still returns None"
+    );
     let late = t0 + Duration::from_secs_f32(IN_FLIGHT_PATIENCE_S + 1.0);
     assert_eq!(p.foreign_to_live(late, '_'), None, "no live press: unknown");
 }
@@ -1824,6 +1837,172 @@ fn a_recall_at_the_next_key_leaves_that_key_s_hand_on_its_row() {
     );
 }
 
+/// A key that keeps the hand ([`CursorGlow::clear_typed_keeping_hand`]) while the caret still
+/// stands at a lay's end ends the lay's wait for the caret's rest once the caret moves: the
+/// program's answer that walks the caret back onto the glyph after it is that key's answer, no
+/// keyless torn redisplay, and keeps the lay.
+#[test]
+fn a_caret_that_moved_behind_a_key_keeps_the_lay() {
+    let g = wide_geom();
+    let c = cfg(GlowStyle::RainbowKitty, true);
+    let mut glow = CursorGlow::default();
+    let mut out = Vec::new();
+    let row = |s: &str| -> Vec<char> { s.chars().collect() };
+    let t0 = Instant::now();
+    glow.observe_row(3, 5, &row("p%   "), t0);
+    glow.tick(Some((3, 5)), t0, &c, g, &mut out);
+    let k1 = t0 + ms(200);
+    glow.note_typed_expected(k1, 1, false, rk::TypedClass::Glyph, 'a');
+    let e1 = k1 + ms(8);
+    glow.observe_print_anchor(Some((3, 6, 1)));
+    glow.observe_row(3, 6, &row("p%   a "), e1);
+    glow.tick(Some((3, 6)), e1, &c, g, &mut out);
+    assert!(glow.torn_lay.is_some(), "precondition: the lay waits");
+    let key = e1 + ms(8);
+    glow.clear_typed_keeping_hand(key);
+    let back = key + ms(8);
+    glow.observe_print_anchor(Some((4, 20, 2)));
+    glow.observe_row(3, 5, &row("p%   a "), back);
+    glow.tick(Some((3, 5)), back, &c, g, &mut out);
+    glow.tick(Some((3, 5)), back + ms(40), &c, g, &mut out);
+    assert!(
+        ring_rows(&glow)
+            .iter()
+            .all(|r| r.1 != AdmissionRecord::LICENCE_RECALL),
+        "a caret moved behind a key keeps the lay: {:?}",
+        ring_rows(&glow)
+    );
+}
+
+/// A key that comes once a torn redisplay has walked the caret back, inside its rest, keeps the
+/// lay's wait: a caret that rests where the key found it is recalled, and one that moves on is the
+/// key's answer and keeps the lay. The recall hands back what the lay took and nothing the key or
+/// a frame changed since: the hand it put on its row (a click), less a doubt a navigation key
+/// settled (an arrow), and not over a hand a Return took off the row or a doubt parked elsewhere.
+#[test]
+fn a_key_after_the_walk_back_keeps_the_recall_and_hands_back_only_the_lay_s_own() {
+    let g = wide_geom();
+    let c = cfg(GlowStyle::RainbowKitty, true);
+    let row = |s: &str| -> Vec<char> { s.chars().collect() };
+    let doubt = |row: u16, parked: bool| Some(UnownedCaret { row, parked });
+    for leg in ["click", "arrow", "return", "parked elsewhere", "moves on"] {
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        glow.observe_row(3, 5, &row("p%   "), t0);
+        glow.tick(Some((3, 5)), t0, &c, g, &mut out);
+        let k1 = t0 + ms(200);
+        glow.note_typed_expected(k1, 1, false, rk::TypedClass::Glyph, 'a');
+        let e1 = k1 + ms(8);
+        glow.observe_print_anchor(Some((3, 6, 1)));
+        glow.observe_row(3, 6, &row("p%   a "), e1);
+        glow.tick(Some((3, 6)), e1, &c, g, &mut out);
+        let lay = glow.torn_lay.as_mut().expect("precondition: the lay waits");
+        // What the lay saved before it took the row: another row's hand and a parked doubt on
+        // this one, or (`parked elsewhere`) a doubt on another row that a frame parks meanwhile.
+        lay.hand_before = Some(HandRow::at(7));
+        lay.unowned_before = if leg == "parked elsewhere" {
+            doubt(9, false)
+        } else {
+            doubt(3, true)
+        };
+        if leg == "parked elsewhere" {
+            glow.unowned_caret = doubt(9, true);
+        }
+        let back = e1 + ms(8);
+        glow.observe_print_anchor(Some((4, 20, 2)));
+        glow.observe_row(3, 5, &row("p%   a "), back);
+        glow.tick(Some((3, 5)), back, &c, g, &mut out);
+        let key = back + ms(8);
+        match leg {
+            "arrow" => glow.note_motion(key),
+            "return" => glow.note_return(key),
+            _ => glow.clear_typed_keeping_hand(key),
+        }
+        let rest = back + ms(40);
+        if leg == "moves on" {
+            glow.observe_row(3, 4, &row("p%   a "), key + ms(8));
+            glow.tick(Some((3, 4)), key + ms(8), &c, g, &mut out);
+            glow.tick(Some((3, 4)), rest + ms(40), &c, g, &mut out);
+            assert!(
+                ring_rows(&glow)
+                    .iter()
+                    .all(|r| r.1 != AdmissionRecord::LICENCE_RECALL),
+                "a caret the key moves on keeps the lay: {:?}",
+                ring_rows(&glow)
+            );
+            continue;
+        }
+        glow.tick(Some((3, 5)), rest, &c, g, &mut out);
+        assert!(
+            ring_rows(&glow)
+                .iter()
+                .any(|r| r.1 == AdmissionRecord::LICENCE_RECALL),
+            "{leg}: a caret that rests where the key found it is recalled: {:?}",
+            ring_rows(&glow)
+        );
+        let (hand, doubt) = match leg {
+            "click" => (Some(HandRow::at(7)), Some((3, true))),
+            "arrow" => (Some(HandRow::at(7)), None),
+            "return" => (None, None),
+            _ => (Some(HandRow::at(7)), Some((9, true))),
+        };
+        assert_eq!(
+            (glow.hand_row, glow.unowned_caret.map(|u| (u.row, u.parked))),
+            (hand, doubt),
+            "{leg}: the recall hands back the lay's own and keeps what came since"
+        );
+    }
+}
+
+/// A lift of the hand's line while a lay waits ([`CursorGlow::lift_hand_row`]) carries what the
+/// lay saved of that line with it, as it carries the live hand and doubt, so the recall's doubt
+/// stays on the lay's own row; what it saved of the line the lift replaced goes, and saved state
+/// on any other row stays where it is.
+#[test]
+fn a_lift_during_the_wait_carries_the_lay_s_saved_hand_and_doubt() {
+    let t0 = Instant::now();
+    for (hand, doubt, lifted) in [
+        (4, 4, (Some(HandRow::at(3)), Some((3, true)))),
+        (3, 3, (None, None)),
+        (7, 9, (Some(HandRow::at(7)), Some((9, true)))),
+    ] {
+        let mut glow = CursorGlow {
+            torn_lay: Some(TornLay {
+                row: 4,
+                col0: 5,
+                col1: 6,
+                seen: Some((4, 5)),
+                moved_at: t0,
+                hand_before: Some(HandRow::at(hand)),
+                unowned_before: Some(UnownedCaret {
+                    row: doubt,
+                    parked: true,
+                }),
+                anchor_seq: None,
+                printed_off_row: true,
+                keyed: false,
+            }),
+            ..CursorGlow::default()
+        };
+        glow.lift_hand_row(4, 3);
+        let lay = glow.torn_lay.expect("a lift keeps the lay");
+        assert_eq!(
+            (lay.row, lay.seen),
+            (3, Some((3, 5))),
+            "precondition: the lift moves the lay"
+        );
+        assert_eq!(
+            (
+                lay.hand_before,
+                lay.unowned_before.map(|u| (u.row, u.parked))
+            ),
+            lifted,
+            "saved on rows {hand}/{doubt}: the lift moves its line's and drops the replaced line's"
+        );
+    }
+}
+
 #[test]
 fn a_lay_with_no_live_cell_is_not_recalled() {
     let c = cfg(GlowStyle::RainbowKitty, true);
@@ -1843,6 +2022,7 @@ fn a_lay_with_no_live_cell_is_not_recalled() {
         unowned_before: None,
         anchor_seq: Some(1),
         printed_off_row: true,
+        keyed: false,
     };
     glow.recall_torn_lay(lay, (3, 5), t0 + ms(40));
     assert_eq!(glow.hand_row, Some(HandRow::at(3)));

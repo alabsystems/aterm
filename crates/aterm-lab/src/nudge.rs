@@ -7,7 +7,7 @@ use std::fs;
 use std::io::Write as _;
 
 use crate::LAB;
-use crate::door::Door;
+use crate::door::{Door, Reply};
 use crate::lab::{Launch, UpOpts};
 use crate::pyjson::J;
 use crate::run::{Run, is_run};
@@ -117,6 +117,9 @@ impl Epoch {
     }
 }
 
+/// What `resizes 200` read: the header's fields and the epochs, newest last.
+type Resizes = (Vec<(String, String)>, Vec<Epoch>);
+
 /// `resizes 200`: the header's fields (stderr) and the epochs, newest last (stdout).
 #[must_use]
 pub fn parse_resizes(stdout: &str, stderr: &str) -> (Vec<(String, String)>, Vec<Epoch>) {
@@ -153,36 +156,66 @@ fn hget(h: &[(String, String)], k: &str) -> Option<String> {
     h.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
 }
 
+/// A failed reply as a reason: its exit code and both streams, trimmed.
+fn failed_reply(verb: &str, r: &Reply) -> String {
+    format!(
+        "`{verb}` answered {}: {} {}",
+        r.code,
+        r.stdout.trim(),
+        r.stderr.trim()
+    )
+}
+
+/// `text`'s rows, or why the reply is none: it exited non-zero, said `ERR` or drew nothing.
+fn screen_rows(r: &Reply) -> Result<Vec<String>, String> {
+    if r.code != 0 || r.stdout.starts_with("ERR") || r.stdout.trim().is_empty() {
+        return Err(failed_reply("text", r));
+    }
+    Ok(r.stdout.lines().map(str::to_string).collect())
+}
+
+/// `resizes 200` as [`parse_resizes`] reads it, or why the reply is none: it exited non-zero or
+/// carried no `render=` header.
+fn read_resizes(r: &Reply) -> Result<Resizes, String> {
+    let (head, epochs) = parse_resizes(&r.stdout, &r.stderr);
+    if r.code != 0 || head.is_empty() {
+        return Err(failed_reply("resizes 200", r));
+    }
+    Ok((head, epochs))
+}
+
 struct Lab<'a> {
     door: Door<'a>,
     run: &'a Run,
 }
 
 impl Lab<'_> {
-    fn screen(&self) -> Vec<String> {
-        self.door
-            .out(&["text"])
-            .lines()
-            .map(str::to_string)
-            .collect()
+    /// The screen's rows, or why `text` gave none: a failed read never stands in for a screen
+    /// (a wait skips it, a reading the verdict counts from ends the trial with it).
+    fn screen(&self) -> Result<Vec<String>, String> {
+        screen_rows(&self.door.ctl(&["text"])?)
     }
 
+    /// The screen once two reads running agree, else the last one read after 20; a failed read
+    /// is skipped, and only twenty of them are no screen.
     fn stable_screen(&self) -> R<Vec<String>> {
         let mut prev: Option<Vec<String>> = None;
+        let mut why = String::new();
         for _ in 0..20 {
-            let rows = self.screen();
-            if prev.as_ref() == Some(&rows) {
-                return Ok(rows);
+            match self.screen() {
+                Ok(rows) if prev.as_ref() == Some(&rows) => return Ok(rows),
+                Ok(rows) => prev = Some(rows),
+                Err(e) => why = e,
             }
-            prev = Some(rows);
             stop::sleep(std::time::Duration::from_millis(700))?;
         }
-        Ok(prev.unwrap_or_default())
+        prev.ok_or_else(|| could_not(format!("no `text` read answered in 20 tries: {why}")))
     }
 
-    fn resizes(&self) -> (Vec<(String, String)>, Vec<Epoch>) {
-        let r = self.door.ctl(&["resizes", "200"]).unwrap_or_default();
-        parse_resizes(&r.stdout, &r.stderr)
+    /// aterm's ledger, or why `resizes 200` gave none: as with [`Lab::screen`], a failed read
+    /// never stands in for a header and epochs.
+    fn resizes(&self) -> Result<Resizes, String> {
+        read_resizes(&self.door.ctl(&["resizes", "200"])?)
     }
 
     fn aterm_log(&self) -> Vec<String> {
@@ -195,7 +228,10 @@ impl Lab<'_> {
     fn wait_render_ok(&self, secs: f64) -> R<bool> {
         let end = now() + secs;
         while now() < end {
-            if hget(&self.resizes().0, "render").as_deref() == Some("ok") {
+            if self
+                .resizes()
+                .is_ok_and(|(h, _)| hget(&h, "render").as_deref() == Some("ok"))
+            {
                 return Ok(true);
             }
             stop::sleep(std::time::Duration::from_millis(300))?;
@@ -225,16 +261,35 @@ impl Lab<'_> {
 /// Parse the `[render] repaint_nudge` value from an `aterm.toml`.
 #[must_use]
 pub fn configured_nudge(toml: &str) -> Option<String> {
-    toml.lines().find_map(|l| {
-        let rest = l
-            .trim_start()
-            .strip_prefix("repaint_nudge")?
-            .trim_start()
-            .strip_prefix('=')?
-            .trim_start();
-        let rest = rest.strip_prefix('"')?;
-        rest.find('"').map(|i| rest[..i].trim().to_lowercase())
-    })
+    let mut in_render = false;
+    for l in toml.lines() {
+        let trimmed = l.trim();
+        if let Some(after_open) = trimmed.strip_prefix('[') {
+            let head = after_open
+                .split('#')
+                .next()
+                .unwrap_or(after_open)
+                .trim_end();
+            in_render = head
+                .strip_suffix(']')
+                .is_some_and(|name| !name.starts_with('[') && name.trim() == "render");
+            continue;
+        }
+        if !in_render {
+            continue;
+        }
+        let Some(rest) = trimmed
+            .strip_prefix("repaint_nudge")
+            .and_then(|r| r.trim_start().strip_prefix('='))
+            .and_then(|r| r.trim_start().strip_prefix('"'))
+        else {
+            continue;
+        };
+        if let Some(i) = rest.find('"') {
+            return Some(rest[..i].trim().to_lowercase());
+        }
+    }
+    None
 }
 
 struct Relay {
@@ -468,10 +523,12 @@ fn flap(
         }
         lab.resize(rows - 1, cols);
         if via == "key" {
-            let shrunk = lab.screen();
+            let shrunk = lab
+                .screen()
+                .map_err(|e| could_not(format!("the screen before the key: {e}")))?;
             let _ = lab.door.ctl(&["send", "x"]);
             let end = now() + 5.0;
-            while lab.screen() == shrunk {
+            while lab.screen().ok().is_none_or(|rows| rows == shrunk) {
                 if now() > end {
                     return Ok(Some(NoFrame("Claude Code drew nothing for the key".into())));
                 }
@@ -513,13 +570,20 @@ fn trial(ctx: &mut Ctx, lab: &Lab<'_>, relay: &Relay, k: u32, how: &How<'_>) -> 
         ..Trial::default()
     };
     if !lab.wait_render_ok(15.0)? {
+        let render = match lab.resizes() {
+            Ok((h, _)) => hget(&h, "render").unwrap_or_else(|| "None".into()),
+            Err(why) => why,
+        };
         return Err(could_not(format!(
-            "render is not ok before trial {k} (resizes: {})",
-            hget(&lab.resizes().0, "render").unwrap_or_else(|| "None".into())
+            "render is not ok before trial {k} (resizes: {render})"
         )));
     }
     m.before = lab.stable_screen()?;
-    let (h0, e0) = lab.resizes();
+    // The ledger this trial's nudge count and epoch are taken against: a failed read is no
+    // baseline, never an empty ledger (which would hand the trial the session's whole count).
+    let (h0, e0) = lab
+        .resizes()
+        .map_err(|e| could_not(format!("trial {k}: aterm's ledger before the flap: {e}")))?;
     let (log0, relay0, frames0) = (lab.aterm_log().len(), relay.mark(), ctx.n_frames());
     let epoch0 = e0.iter().map(|e| e.id).max().unwrap_or(0);
     ctx.mark(&format!("trial {k}: flap"), None);
@@ -528,21 +592,27 @@ fn trial(ctx: &mut Ctx, lab: &Lab<'_>, relay: &Relay, k: u32, how: &How<'_>) -> 
     }
     m.t_flap = now();
     ctx.mark(&format!("trial {k}: flap done"), None);
-    m.shot = lab.screen();
+    m.shot = lab
+        .screen()
+        .map_err(|e| could_not(format!("trial {k}: the screen after the flap: {e}")))?;
     loop {
-        let (h, _) = lab.resizes();
+        let read = lab.resizes();
         let rel = now() - m.t_flap;
-        let word = (
-            hget(&h, "render").unwrap_or_else(|| "None".into()),
-            hget(&h, "nudge").unwrap_or_else(|| "None".into()),
-        );
-        if m.series.last().map(|s| &s.1) != Some(&word) {
-            m.series.push(((rel * 10.0).round() / 10.0, word));
+        // A failed read is no word: it records nothing and ends the watch only at the cap.
+        if let Ok((h, _)) = read {
+            let word = (
+                hget(&h, "render").unwrap_or_else(|| "None".into()),
+                hget(&h, "nudge").unwrap_or_else(|| "None".into()),
+            );
+            if m.series.last().map(|s| &s.1) != Some(&word) {
+                m.series.push(((rel * 10.0).round() / 10.0, word));
+            }
+            let nudge = hget(&h, "nudge");
+            if rel >= OBSERVE && (nudge.as_deref() == Some("idle") || nudge.is_none()) {
+                break;
+            }
         }
-        let nudge = hget(&h, "nudge");
-        if (rel >= OBSERVE && (nudge.as_deref() == Some("idle") || nudge.is_none()))
-            || rel >= OBSERVE_CAP
-        {
+        if rel >= OBSERVE_CAP {
             break;
         }
         stop::sleep(std::time::Duration::from_millis(300))?;
@@ -556,8 +626,12 @@ fn trial(ctx: &mut Ctx, lab: &Lab<'_>, relay: &Relay, k: u32, how: &How<'_>) -> 
         let _ = lab.door.ctl(&["key", "backspace"]);
         stop::sleep(std::time::Duration::from_millis(700))?;
     }
-    m.after = lab.screen();
-    let (h1, e1) = lab.resizes();
+    m.after = lab
+        .screen()
+        .map_err(|e| could_not(format!("trial {k}: the screen at the end: {e}")))?;
+    let (h1, e1) = lab
+        .resizes()
+        .map_err(|e| could_not(format!("trial {k}: aterm's ledger at the end: {e}")))?;
     m.status_render = lab.status_render()?;
     let nud = |h: &[(String, String)]| {
         hget(h, "nudged")
@@ -987,14 +1061,19 @@ fn drive(tag: &str, o: &Opts) -> Result<i32, stop::Stopped> {
         }
         let acts = !matches!(word.as_deref(), Some("off" | "log"));
         let gap = if acts { SPACING } else { 4.0 };
-        let nudged0: i64 = hget(&lab.resizes().0, "nudged")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        if acts && nudged0 + i64::from(o.trials) > 3 {
-            println!(
-                "nudge-trial: COULD NOT RUN: this lab's nudge has made {nudged0} attempt(s) and may make 3 per hour: use a fresh lab"
-            );
-            return Ok(3);
+        if acts {
+            let (head, _) = lab
+                .resizes()
+                .map_err(|e| could_not(format!("no count of this lab's nudge attempts: {e}")))?;
+            let nudged0: i64 = hget(&head, "nudged")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            if nudged0 + i64::from(o.trials) > 3 {
+                println!(
+                    "nudge-trial: COULD NOT RUN: this lab's nudge has made {nudged0} attempt(s) and may make 3 per hour: use a fresh lab"
+                );
+                return Ok(3);
+            }
         }
         println!(
             "nudge-trial: Claude Code {} behind the PTY relay in {cols}x{rows}; config {}; expect {expect}; {} trial(s) {gap:.0} s apart; {}",
@@ -1199,10 +1278,44 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_reply_is_no_reading() {
+        let reply = |code, stdout: &str, stderr: &str| Reply {
+            code,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        };
+        let head = "aterm-ctl: OK 0 total=0 render=ok nudge=idle nudged=2\n";
+        let read = read_resizes(&reply(0, "", head));
+        let (h, e) = read.expect("a header and no epochs is a reading");
+        assert_eq!((hget(&h, "nudged").as_deref(), e.len()), (Some("2"), 0));
+        for (code, err) in [(1, "aterm-ctl: ERR busy\n"), (0, ""), (1, head)] {
+            let read = read_resizes(&reply(code, "", err));
+            assert!(read.is_err(), "{code} {err:?}");
+        }
+        assert_eq!(screen_rows(&reply(0, "a\nb\n", "")).ok(), Some(v("a\nb")));
+        for (code, out) in [(1, "a\n"), (0, "ERR busy\n"), (0, "\n\n")] {
+            let rows = screen_rows(&reply(code, out, ""));
+            assert!(rows.is_err(), "{code} {out:?}");
+        }
+    }
+
+    #[test]
     fn the_configured_nudge_is_the_render_tables_word() {
         assert_eq!(
             configured_nudge("[render]\nrepaint_nudge = \"Off\"\n").as_deref(),
             Some("off")
+        );
+        assert_eq!(
+            configured_nudge(
+                "[other]\nrepaint_nudge = \"always\"\n[render]\nrepaint_nudge = \"Off\"\n"
+            )
+            .as_deref(),
+            Some("off")
+        );
+        assert_eq!(
+            configured_nudge("[other]\nrepaint_nudge = \"Off\"\n"),
+            None,
+            "repaint_nudge outside [render] is ignored"
         );
         assert_eq!(configured_nudge("[update]\nenabled = false\n"), None);
     }

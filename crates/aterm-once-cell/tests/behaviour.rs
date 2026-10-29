@@ -105,10 +105,14 @@ fn debug_and_eq_match_the_upstream_shapes() {
     );
 
     let boxed: race::OnceBox<u32> = race::OnceBox::new();
-    assert_eq!(format!("{boxed:?}"), "OnceBox(0x0)");
+    let null_once_box = format!("OnceBox({:?})", core::ptr::null::<u32>());
+    assert_eq!(format!("{boxed:?}"), null_once_box);
     boxed.set(Box::new(1)).expect("empty");
+    let full_once_box = format!("{boxed:?}");
     assert!(
-        format!("{boxed:?}").starts_with("OnceBox(0x") && format!("{boxed:?}") != "OnceBox(0x0)",
+        full_once_box.starts_with("OnceBox(")
+            && full_once_box.ends_with(')')
+            && full_once_box != null_once_box,
         "a full OnceBox prints its address, not null: {boxed:?}"
     );
 }
@@ -159,20 +163,11 @@ impl<T, F> WasmBindgenShapedCell<T, F> {
 }
 
 const _: () = {
+    const fn rus<T: std::panic::RefUnwindSafe>() {}
+    const fn us<T: std::panic::UnwindSafe>() {}
+    const fn sync_bound<T: Sync>() {}
+
     let _ = WasmBindgenShapedCell::<u32>::new(|| 42);
-};
-
-#[test]
-fn lazy_new_is_unbounded_in_f_the_way_wasm_bindgen_needs() {
-    let cell = WasmBindgenShapedCell::<u32>::new(|| 42);
-    assert_eq!(*cell.0, 42);
-}
-
-#[test]
-fn the_unwind_safety_surface_matches_upstream() {
-    fn rus<T: std::panic::RefUnwindSafe>() {}
-    fn us<T: std::panic::UnwindSafe>() {}
-
     rus::<unsync::OnceCell<u32>>();
     rus::<unsync::Lazy<u32>>();
     us::<unsync::OnceCell<u32>>();
@@ -183,15 +178,11 @@ fn the_unwind_safety_surface_matches_upstream() {
     us::<sync::Lazy<u32>>();
     rus::<race::OnceBox<u32>>();
     us::<race::OnceBox<u32>>();
-}
+    sync_bound::<sync::Lazy<u32>>();
+};
 
-#[test]
-fn lazy_is_sync_when_upstream_says_it_is() {
-    fn assert_sync<T: Sync>(_: &T) {}
-    static SHARED: sync::Lazy<u32> = sync::Lazy::new(|| 5);
-    assert_sync(&SHARED);
-    assert_eq!(*SHARED, 5);
-}
+// `sync::Lazy::new` is const, so a `Lazy` can be a static.
+static _SHARED: sync::Lazy<u32> = sync::Lazy::new(|| 5);
 
 #[test]
 fn lazy_forced_concurrently_runs_its_initialiser_once() {
@@ -295,22 +286,47 @@ fn unsync_get_or_try_init_refuses_a_reentrant_initialisation() {
         });
     });
     assert!(by_set.contains("reentrant init"), "got {by_set:?}");
-    let by_get_or_init = panic_message(|| {
-        let cell: unsync::OnceCell<u32> = unsync::OnceCell::new();
-        let _ = cell.get_or_try_init(|| Ok::<u32, ()>(*cell.get_or_init(|| 10) + 1));
-    });
     assert!(
-        by_get_or_init.contains("reentrant init"),
-        "got {by_get_or_init:?}"
+        std::panic::catch_unwind(|| {
+            let cell: unsync::OnceCell<u32> = unsync::OnceCell::new();
+            let _ = cell.get_or_try_init(|| Ok::<u32, ()>(*cell.get_or_init(|| 10) + 1));
+        })
+        .is_err(),
+        "reentrant get_or_init inside get_or_try_init must panic"
     );
-    let control = panic_message(|| {
-        let cell: unsync::OnceCell<u32> = unsync::OnceCell::new();
-        let _ = cell.get_or_init(|| {
-            let _ = cell.set(1);
-            2
-        });
-    });
-    assert!(control.contains("reentrant init"), "got {control:?}");
+    assert!(
+        std::panic::catch_unwind(|| {
+            let cell: unsync::OnceCell<u32> = unsync::OnceCell::new();
+            let _ = cell.get_or_init(|| {
+                let _ = cell.set(1);
+                2
+            });
+        })
+        .is_err(),
+        "reentrant set inside get_or_init must panic"
+    );
+}
+
+#[test]
+fn a_panicking_lazy_initialiser_poisons_the_lazy() {
+    let sync_lazy: sync::Lazy<u32> = sync::Lazy::new(|| panic!("sync init boom"));
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| *sync_lazy)).is_err());
+    assert_eq!(sync::Lazy::get(&sync_lazy), None);
+    let poisoned = panic_message(std::panic::AssertUnwindSafe(|| {
+        let _ = *sync_lazy;
+    }));
+    assert_eq!(poisoned, "Lazy instance has previously been poisoned");
+
+    let unsync_lazy: unsync::Lazy<u32> = unsync::Lazy::new(|| panic!("unsync init boom"));
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| *unsync_lazy)).is_err());
+    assert_eq!(unsync::Lazy::get(&unsync_lazy), None);
+    let poisoned_unsync = panic_message(std::panic::AssertUnwindSafe(|| {
+        let _ = *unsync_lazy;
+    }));
+    assert_eq!(
+        poisoned_unsync,
+        "Lazy instance has previously been poisoned"
+    );
 }
 
 #[test]
@@ -332,4 +348,198 @@ fn a_panicking_initialiser_leaves_the_cell_usable() {
         &5,
         "a later caller must not inherit a poisoned lock"
     );
+}
+
+fn gate_state(
+    [cell, gate, ok_runs, ran_ok1, ran_ok2, p1, p2, obs1, obs2]: [i64; 9],
+) -> aterm_spec::interp::State {
+    std::collections::BTreeMap::from([
+        ("cell", cell),
+        ("gate", gate),
+        ("ok_runs", ok_runs),
+        ("ran_ok1", ran_ok1),
+        ("ran_ok2", ran_ok2),
+        ("p1", p1),
+        ("p2", p2),
+        ("obs1", obs1),
+        ("obs2", obs2),
+    ])
+}
+
+#[test]
+fn sync_once_cell_gate_conformance_and_ungated_negative_control() {
+    use std::sync::{Condvar, Mutex, OnceLock};
+
+    let m = aterm_models_core::once_cell_gate_protocol_model();
+    assert!(aterm_spec::interp::prove_and_catch(&m) > 1);
+    let check_step = |prev: &aterm_spec::interp::State,
+                      next: &aterm_spec::interp::State,
+                      expected: &'static str| {
+        assert_eq!(
+            aterm_spec::interp::admits(&m, prev, next),
+            Some(expected),
+            "step {expected} from {prev:?} to {next:?} must refine OnceCellGateProtocol"
+        );
+        for inv in &m.invariants {
+            assert!(
+                m.check_invariant(inv.name, next),
+                "invariant {} violated at {next:?}",
+                inv.name
+            );
+        }
+    };
+
+    // 1. Conformance binding on real `sync::OnceCell`: failed init leaves cell empty;
+    //    deterministic latch holds caller 1 inside `f` while caller 2 queues at `gate`,
+    //    never invoking caller 2's closure and returning caller 1's value to both.
+    let cell: Arc<sync::OnceCell<i64>> = Arc::new(sync::OnceCell::new());
+    let mut s = m.init_state();
+    assert_eq!(s, gate_state([0, 0, 0, 0, 0, 0, 0, 0, 0]));
+
+    let err_res: Result<&i64, ()> = cell.get_or_try_init(|| {
+        let s1 = gate_state([0, 0, 0, 0, 0, 1, 0, 0, 0]);
+        check_step(&s, &s1, "Call1");
+        let s2 = gate_state([0, 1, 0, 0, 0, 2, 0, 0, 0]);
+        check_step(&s1, &s2, "Enter1");
+        s = s2;
+        Err(())
+    });
+    assert_eq!(err_res, Err(()));
+    assert_eq!(cell.get(), None);
+    let s_after_err = gate_state([0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    check_step(&s, &s_after_err, "InitErr1");
+    s = s_after_err;
+
+    let latch = Arc::new((Mutex::new((false, false)), Condvar::new()));
+    let ok_runs = Arc::new(AtomicUsize::new(0));
+    let t2_entered_call = Arc::new(Barrier::new(2));
+
+    let cell1 = Arc::clone(&cell);
+    let latch1 = Arc::clone(&latch);
+    let runs1 = Arc::clone(&ok_runs);
+    let h1 = thread::spawn(move || {
+        let mut ran = 0i64;
+        let v = *cell1
+            .get_or_try_init(|| {
+                let (mu, cv) = &*latch1;
+                let mut g = mu.lock().unwrap();
+                g.0 = true;
+                cv.notify_all();
+                while !g.1 {
+                    g = cv.wait(g).unwrap();
+                }
+                ran = 1;
+                runs1.fetch_add(1, Ordering::SeqCst);
+                Ok::<i64, ()>(1)
+            })
+            .unwrap();
+        (ran, v)
+    });
+
+    {
+        let (mu, cv) = &*latch;
+        let mut g = mu.lock().unwrap();
+        while !g.0 {
+            g = cv.wait(g).unwrap();
+        }
+    }
+    let s_t1_call = gate_state([0, 0, 0, 0, 0, 1, 0, 0, 0]);
+    check_step(&s, &s_t1_call, "Call1");
+    let s_t1_enter = gate_state([0, 1, 0, 0, 0, 2, 0, 0, 0]);
+    check_step(&s_t1_call, &s_t1_enter, "Enter1");
+    s = s_t1_enter;
+
+    let cell2 = Arc::clone(&cell);
+    let runs2 = Arc::clone(&ok_runs);
+    let bar2 = Arc::clone(&t2_entered_call);
+    let h2 = thread::spawn(move || {
+        bar2.wait();
+        let mut ran = 0i64;
+        let v = *cell2
+            .get_or_try_init(|| {
+                ran = 1;
+                runs2.fetch_add(1, Ordering::SeqCst);
+                Ok::<i64, ()>(2)
+            })
+            .unwrap();
+        (ran, v)
+    });
+    t2_entered_call.wait();
+    assert_eq!(
+        ok_runs.load(Ordering::SeqCst),
+        0,
+        "gate must hold caller 2 out of its closure while caller 1 is running"
+    );
+    let s_t2_call = gate_state([0, 1, 0, 0, 0, 2, 1, 0, 0]);
+    check_step(&s, &s_t2_call, "Call2");
+    s = s_t2_call;
+
+    {
+        let (mu, cv) = &*latch;
+        let mut g = mu.lock().unwrap();
+        g.1 = true;
+        cv.notify_all();
+    }
+    let (ran1, obs1) = h1.join().unwrap();
+    let (ran2, obs2) = h2.join().unwrap();
+    let total_ok = ok_runs.load(Ordering::SeqCst) as i64;
+    let stored = *cell.get().unwrap();
+    assert_eq!(
+        (ran1, ran2, total_ok, stored, obs1, obs2),
+        (1, 0, 1, 1, 1, 1)
+    );
+
+    let s_t1_ok = gate_state([stored, 0, total_ok, ran1, 0, 3, 1, obs1, 0]);
+    check_step(&s, &s_t1_ok, "InitOk1");
+    let s_t2_recheck = gate_state([stored, 0, total_ok, ran1, ran2, 3, 3, obs1, obs2]);
+    check_step(&s_t1_ok, &s_t2_recheck, "Enter2");
+
+    // 2. Deterministic negative control: an ungated cell (check -> compute -> OnceLock::set -> get)
+    //    lets both closures run concurrently and both return Ok, violating all three invariants.
+    let ungated: Arc<OnceLock<i64>> = Arc::new(OnceLock::new());
+    let both_in_closure = Arc::new(Barrier::new(2));
+    let ungated_runs = Arc::new(AtomicUsize::new(0));
+    let spawn_ungated = |id: i64| {
+        let ungated = Arc::clone(&ungated);
+        let bar = Arc::clone(&both_in_closure);
+        let runs = Arc::clone(&ungated_runs);
+        thread::spawn(move || {
+            if let Some(&v) = ungated.get() {
+                return (0i64, v);
+            }
+            bar.wait();
+            runs.fetch_add(1, Ordering::SeqCst);
+            let _ = ungated.set(id);
+            (1i64, *ungated.get().unwrap())
+        })
+    };
+    let u1 = spawn_ungated(1);
+    let u2 = spawn_ungated(2);
+    let (u_ran1, u_obs1) = u1.join().unwrap();
+    let (u_ran2, u_obs2) = u2.join().unwrap();
+    let u_ok = ungated_runs.load(Ordering::SeqCst) as i64;
+    let u_cell = *ungated.get().unwrap();
+    assert_eq!((u_ran1, u_ran2, u_ok), (1, 1, 2));
+
+    let pre_race = gate_state([0, 0, 0, 0, 0, 2, 1, 0, 0]);
+    let race_both_running = gate_state([0, 0, 0, 0, 0, 2, 2, 0, 0]);
+    assert_eq!(
+        aterm_spec::interp::admits(&m, &pre_race, &race_both_running),
+        None,
+        "Buggy=0 must reject concurrent entry into user closures"
+    );
+    let buggy = aterm_spec::interp::with_buggy(&m, 1);
+    assert_eq!(
+        aterm_spec::interp::admits(&buggy, &pre_race, &race_both_running),
+        Some("Enter2"),
+        "Buggy=1 (gate removed) admits concurrent entry"
+    );
+    assert!(!m.check_invariant("AtMostOneRunningInitializer", &race_both_running));
+
+    let race_done = gate_state([u_cell, 0, u_ok, u_ran1, u_ran2, 3, 3, u_obs1, u_obs2]);
+    assert!(!m.check_invariant("AtMostOneSucceededInitializer", &race_done));
+    assert!(!m.check_invariant("SucceededInitializerSetCell", &race_done));
+
+    let split_brain = gate_state([1, 0, 2, 1, 1, 3, 3, 1, 2]);
+    assert!(!m.check_invariant("ReturnedValueMatchesCell", &split_brain));
 }

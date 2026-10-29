@@ -192,7 +192,7 @@ fn a_nul_is_binary_only_where_the_engines_grep_looks_for_one() {
 }
 
 #[test]
-fn a_matching_line_that_is_not_utf8_is_held_whatever_tag_it_carries() {
+fn a_line_that_is_not_utf8_is_read_as_the_engine_decodes_it() {
     let tagged = |e: &[u8]| {
         [
             b"let t = \"tok_abcdefgh\"; // ".as_slice(),
@@ -212,6 +212,15 @@ fn a_matching_line_that_is_not_utf8_is_held_whatever_tag_it_carries() {
     let mut plain = latin1.clone();
     plain.extend_from_slice(b"// caf\xe9, which matches nothing\n");
     plain.extend_from_slice(&[WORD.as_bytes(), b" \xe9\n"].concat());
+    plain.extend_from_slice(b"let t = \"tok_abcdefgh\"; // caf\xe9\n");
+    plain.extend_from_slice(
+        &[
+            b"let t = \"tok_abcdefgh\"; // caf\xe9 quokkaword ".as_slice(),
+            ALLOW_TAG.as_bytes(),
+            b"\n",
+        ]
+        .concat(),
+    );
     let files = [
         file(MANIFEST, "crates\n"),
         file(EXTRA, format!("{WORD}\n")),
@@ -225,17 +234,21 @@ fn a_matching_line_that_is_not_utf8_is_held_whatever_tag_it_carries() {
     assert_eq!(
         spots(&found),
         [
-            "crates/x/late-latin1.dat:1",
-            "crates/x/latin1.txt:1",
             "crates/x/latin1.txt:3",
+            "crates/x/latin1.txt:4",
+            "crates/x/latin1.txt:5",
         ]
         .map(String::from)
         .into(),
-        "{found:#?}"
+        "each line as the engine reads it, its grep matching bytes and its output decoded lossily: \
+         a tagged line is exempt from a credential row, and an untagged credential, or \
+         another row's match on a tagged line, is a hit: {found:#?}"
     );
     assert!(
-        found.iter().all(|f| f.detail.contains("not UTF-8")),
-        "each says why the engine refuses it: {found:#?}"
+        found
+            .iter()
+            .all(|f| f.detail.contains("replace the text") && !f.detail.contains("UTF-8")),
+        "each is an ordinary hit: {found:#?}"
     );
 }
 

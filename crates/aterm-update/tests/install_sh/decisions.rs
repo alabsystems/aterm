@@ -3,7 +3,9 @@
 
 //! The installer's pure decisions: the manifest's identity fields, the official channel's signing-team pin, the app half's idempotence and its signature gate, the container election, which repository a checkout installs from, and the Linux candidate's identity line.
 
-use crate::support::{Lib, Scratch, group_run, install_sh, q, root, s};
+use crate::support::{
+    Lib, Scratch, chmod, group_run, install_sh, installer, q, read, root, s, symlink, write,
+};
 
 /// A required identity field occurs exactly once as a one-line string; an optional one at most once.
 #[test]
@@ -1080,6 +1082,183 @@ fn the_console_owner_is_dev_consoles_uid() {
     assert_eq!(recs[call].out.trim(), owner.to_string());
 }
 
+/// A running aterm, for the app half, is a window of this account's: a bundle's executable
+/// alone or with `--window`. The helpers that run from the same executable (`acaffiene serve`,
+/// the login item that stays when every window is closed; a tether; `aterm ctl`) are none
+/// (round 12: pgrep -f matched them, and another account's aterm, so a run said aterm was
+/// running and left the app it installed closed). An editor open on the executable is none
+/// either, though ps's joined argv reads like a bundle under a spaced folder. The control:
+/// that pgrep pattern matches the helpers' lines.
+#[test]
+fn only_a_window_of_this_account_is_a_running_aterm() {
+    let scratch = Scratch::new();
+    let exe = "Contents/MacOS/aterm";
+    let bundle = scratch.join("Applications/aterm.app");
+    let app = s(&scratch.exe(&format!("Applications/aterm.app/{exe}"), "")).to_owned();
+    let spaced = s(&scratch.exe(&format!("a b/Applications/aterm.app/{exe}"), "")).to_owned();
+    let dev = s(&scratch.exe(&format!("Applications/aterm (dev).app/{exe}"), "")).to_owned();
+    let gone = scratch.join(&format!("gone/aterm.app/{exe}"));
+    let helpers =
+        format!("{app} acaffiene serve\n{app} __tether 88279 /usr/bin/log stream\n{app} ctl ls");
+    let rows: Vec<(String, String)> = vec![
+        (helpers.clone(), String::new()),
+        (format!("{helpers}\n  {app} --window"), s(&bundle).into()),
+        (app.clone(), s(&bundle).into()),
+        (
+            format!("{spaced} --window --new-instance"),
+            s(&scratch.join("a b/Applications/aterm.app")).into(),
+        ),
+        (format!("{dev} --window"), String::new()),
+        (format!("/usr/bin/vim {app}"), String::new()),
+        (format!("{} --window", s(&gone)), String::new()),
+        (format!("{app} --windows"), String::new()),
+        (String::new(), String::new()),
+    ];
+    let mut lib = Lib::new();
+    let calls: Vec<usize> = rows
+        .iter()
+        .map(|(lines, _)| {
+            lib.call(
+                format!(
+                    "account_processes() {{ [[ \"$1\" == 4242 ]] && printf '%s\\n' {}; }}; \
+                     running_app_window 4242",
+                    q(lines)
+                ),
+                &[],
+            )
+        })
+        .collect();
+    let other = lib.call(
+        format!(
+            "account_processes() {{ [[ \"$1\" == 4242 ]] && printf '%s\\n' {}; }}; \
+             running_app_window 4243",
+            q(&format!("{app} --window"))
+        ),
+        &[],
+    );
+    let control = lib.call(
+        format!(
+            "printf '%s\\n' {} | grep -Ec '/aterm\\.app/Contents/MacOS/aterm'",
+            q(&helpers)
+        ),
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    for ((lines, want), i) in rows.iter().zip(calls) {
+        assert_eq!(recs[i].rc, 0, "{lines:?}: {}", recs[i].err);
+        assert_eq!(recs[i].out, *want, "{lines:?}");
+    }
+    assert_eq!(
+        recs[other].out, "",
+        "another account's window is not this one's"
+    );
+    assert_eq!(
+        recs[control].out, "3",
+        "the old pattern matched every helper"
+    );
+}
+
+/// The NOTE `install_app` prints for a window already up names it by what it is: the bundle the
+/// run just replaced (by its path, or by another spelling of it) takes the new version at its next
+/// launch, and another bundle's window is another aterm, quit before opening this one; with none
+/// there is no NOTE and the run may open the app. The rows are each other's controls.
+#[test]
+fn a_running_window_is_named_as_this_bundle_or_another() {
+    let scratch = Scratch::new();
+    let app = scratch.mkdir("Applications/aterm.app");
+    let other = scratch.mkdir("elsewhere/aterm.app");
+    let link = scratch.join("linked");
+    std::os::unix::fs::symlink(scratch.join("Applications"), &link).expect("symlink");
+    let this =
+        "install.sh: NOTE: aterm is running — the new version takes effect when you next open it";
+    let another = format!(
+        "install.sh: NOTE: another aterm is running, from {} — quit it before opening this one",
+        s(&other)
+    );
+    let rows: Vec<(String, u8, String)> = vec![
+        (String::new(), 1, String::new()),
+        (s(&app).into(), 0, this.into()),
+        (s(&link.join("aterm.app")).into(), 0, this.into()),
+        (s(&other).into(), 0, another),
+    ];
+    let mut lib = Lib::new();
+    let calls: Vec<usize> = rows
+        .iter()
+        .map(|(window, _, _)| {
+            lib.call(
+                format!("running_app_note {} {}", q(window), q(s(&app))),
+                &[],
+            )
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    for ((window, rc, said), i) in rows.iter().zip(calls) {
+        assert_eq!(
+            (recs[i].rc, recs[i].out.as_str()),
+            (i32::from(*rc), said.as_str()),
+            "{window:?}: {}",
+            recs[i].err
+        );
+    }
+}
+
+/// `account_processes` reads one account's processes, so a window another login runs is not
+/// this account's: the batch's own shell is among its account's and not among another's. The
+/// control: every account's processes (`ps -ax`, what pgrep -f read) list that shell too.
+#[cfg(target_os = "macos")]
+#[test]
+fn only_this_accounts_processes_are_read() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    let shown = |read: &str| {
+        format!(
+            "me=\"$(ps -o args= -p $$)\"; other=0; if [[ $EUID == 0 ]]; then other=1; fi; \
+             lines=\"$({read})\"; \
+             if grep -Fxq -- \"$me\" <<<\"$lines\"; then echo listed; else echo absent; fi"
+        )
+    };
+    let mine = lib.call(shown("account_processes \"$EUID\""), &[]);
+    let theirs = lib.call(shown("account_processes \"$other\""), &[]);
+    let every = lib.call(shown("ps -ax -o args="), &[]);
+    let recs = lib.run(&scratch);
+    assert_eq!(recs[mine].out, "listed", "{}", recs[mine].err);
+    assert_eq!(recs[theirs].out, "absent", "{}", recs[theirs].err);
+    assert_eq!(recs[every].out, "listed", "{}", recs[every].err);
+}
+
+/// Whose window the NOTE asks about: the installing account's, and in a root run (root runs no
+/// aterm window) the login at this Mac's screen, else the account sudo ran for. Pure. The
+/// control: an account's own run names itself whoever is at the screen.
+#[test]
+fn a_root_run_asks_about_the_window_of_the_person_at_the_screen() {
+    let scratch = Scratch::new();
+    let rows: &[((&str, &str, &str), &str)] = &[
+        (("501", "502", "503"), "501"),
+        (("501", "", ""), "501"),
+        (("0", "501", ""), "501"),
+        (("0", "501", "502"), "501"),
+        (("0", "0", "502"), "502"),
+        (("0", "", "502"), "502"),
+        (("0", "0", ""), "0"),
+        (("0", "", ""), "0"),
+    ];
+    let mut lib = Lib::new();
+    let calls: Vec<usize> = rows
+        .iter()
+        .map(|((euid, console, sudo), _)| {
+            lib.call(
+                format!("window_owner_uid {} {} {}", q(euid), q(console), q(sudo)),
+                &[],
+            )
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    for ((args, want), i) in rows.iter().zip(calls) {
+        assert_eq!(recs[i].rc, 0, "{args:?}: {}", recs[i].err);
+        assert_eq!(recs[i].out.trim(), *want, "{args:?}");
+    }
+}
+
 /// The run opens the app it installed only for a person at this Mac's screen (the installing
 /// account owns `/dev/console`, never root) whose stdout is a terminal, with no SSH session, CI or
 /// `--no-open` (`NO_OPEN`); every other run keeps the printed launch line. An `open` that fails
@@ -1202,6 +1381,270 @@ fn a_run_cut_before_the_opening_still_prints_the_launch_line() {
             *says,
             "{app:?}: {}",
             rec.out
+        );
+    }
+}
+
+/// Lanes with no aterm window (`--no-open`, SSH, CI, piped stdout, non-console, failed `open`,
+/// `--no-app`) run `aterm members join --no-wait` once placement finishes (`aterm secrets join
+/// --no-wait` for an aterm with no members verb, or with `ATERM_INSTALL_VAULT_URL`); a run that
+/// opened `aterm.app`, a root run, or a home with `source.toml` or `subscriber-off` does not (C6,
+/// F10).
+#[test]
+fn lanes_without_a_window_join_secrets_without_waiting() {
+    let scratch = Scratch::new();
+    let stubs = scratch.mkdir("stubs");
+    scratch.stand_in("stubs/open", "#!/bin/sh\nexit \"${OPEN_RC:-0}\"\n");
+    let clean_home = scratch.mkdir("homes/clean");
+    let joined_home = scratch.mkdir("homes/joined");
+    write(
+        &joined_home.join(".config/aterm/secrets/source.toml"),
+        "url = \"http://127.0.0.1:1/v1\"\n",
+    );
+    let linked_source_home = scratch.mkdir("homes/linked-source");
+    std::fs::create_dir_all(linked_source_home.join(".config/aterm/secrets")).expect("mkdir");
+    symlink(
+        "/nonexistent/source.toml",
+        &linked_source_home.join(".config/aterm/secrets/source.toml"),
+    );
+    let off_home = scratch.mkdir("homes/off");
+    write(&off_home.join(".config/aterm/secrets/subscriber-off"), "");
+    let linked_off_home = scratch.mkdir("homes/linked-off");
+    std::fs::create_dir_all(linked_off_home.join(".config/aterm/secrets")).expect("mkdir");
+    symlink(
+        "/nonexistent/subscriber-off",
+        &linked_off_home.join(".config/aterm/secrets/subscriber-off"),
+    );
+
+    let lane_rows: &[(&str, &str, &str, &str, u8, i32)] = &[
+        ("", "501", "501", "1", 0, 1),
+        ("NO_OPEN=1", "501", "501", "1", 0, 0),
+        (
+            "SSH_CONNECTION='10.0.0.2 52000 10.0.0.1 22'",
+            "501",
+            "501",
+            "1",
+            0,
+            0,
+        ),
+        ("SSH_TTY=/dev/ttys004", "501", "501", "1", 0, 0),
+        ("CI=true", "501", "501", "1", 0, 0),
+        ("", "501", "501", "0", 0, 0),
+        ("", "502", "501", "1", 0, 0),
+        ("", "", "501", "1", 0, 0),
+        ("", "501", "501", "1", 1, 0),
+        ("NO_OPEN=1", "0", "0", "1", 0, 1),
+    ];
+    let home_rows = [
+        ("clean", s(&clean_home), 0),
+        ("empty", "", 1),
+        ("source.toml", s(&joined_home), 1),
+        ("source.toml symlink", s(&linked_source_home), 1),
+        ("subscriber-off", s(&off_home), 1),
+        ("subscriber-off symlink", s(&linked_off_home), 1),
+    ];
+
+    let mut lib = Lib::new();
+    lib.env(
+        "PATH",
+        &format!("{}:{}", s(&stubs), crate::support::system_path()),
+    );
+    let lane_calls: Vec<usize> = lane_rows
+        .iter()
+        .map(|(env, console, euid, tty, rc, _)| {
+            lib.call(
+                format!(
+                    "APP_OPENED=0 OPEN_RC={rc}; export OPEN_RC\n\
+                     if {env} app_opens_here '{console}' '{euid}' '{tty}'; then \
+                     open_installed_app /Applications/aterm.app 0 >/dev/null; fi\n\
+                     secrets_join_runs_here \"$APP_OPENED\" '{euid}' {}",
+                    q(s(&clean_home))
+                ),
+                &[],
+            )
+        })
+        .collect();
+    let home_calls: Vec<usize> = home_rows
+        .iter()
+        .map(|(_, h, _)| lib.call(format!("secrets_join_runs_here 0 501 {}", q(h)), &[]))
+        .collect();
+    let recs = lib.run(&scratch);
+    for (row, i) in lane_rows.iter().zip(lane_calls) {
+        assert_eq!(recs[i].rc, row.5, "{row:?}");
+    }
+    for ((label, _, want), i) in home_rows.iter().zip(home_calls) {
+        assert_eq!(recs[i].rc, *want, "{label}");
+    }
+
+    let stub_body = "#!/bin/sh\n\
+        if [ \"$1\" = --version ]; then echo \"aterm 0.146.0\"; exit 0; fi\n\
+        if [ \"$1 $2\" = \"secrets --help\" ]; then echo \"aterm secrets: one credentials file\"; exit 0; fi\n\
+        if [ \"$1 $2\" = \"members --help\" ]; then\n\
+          if [ \"${STUB_NO_MEMBERS:-0}\" = 1 ]; then echo \"aterm: no such command\" >&2; exit 2; fi\n\
+          echo \"aterm members: Macs joining ALab\"; exit 0\n\
+        fi\n\
+        if [ \"$1\" = pkg ]; then exit 0; fi\n\
+        echo \"$*\" >>\"${STUB_JOIN_LOG:?}\"\n\
+        if [ \"${STUB_JOIN_FAIL:-0}\" = 1 ]; then echo \"unreachable\" >&2; exit 1; fi\n\
+        if [ \"$1\" = members ]; then echo \"asked 2 members\"; exit 0; fi\n\
+        echo \"joined: seq 1 (alab-secrets)\"\n";
+
+    let home = scratch.home("headless");
+    let store = scratch.mkdir("headless/store");
+    let bin = scratch.mkdir("headless/bin");
+    let log = scratch.join("headless/join.log");
+    let store_aterm = scratch.stand_in("headless/store/aterm", stub_body);
+    symlink(&store_aterm, &bin.join("aterm"));
+
+    let run = installer(
+        &install_sh(),
+        &home,
+        &[
+            ("ATERM_NO_TOOLCHAIN", ""),
+            ("ATERM_BIN_DIR", s(&bin)),
+            ("ATERM_STORE_DIR", s(&store)),
+            ("ATERM_INSTALL_VAULT_URL", "http://127.0.0.1:8781/v1"),
+            ("STUB_JOIN_LOG", s(&log)),
+        ],
+        &["--no-open", "--no-app", "--no-cli", "--no-path"],
+    );
+    assert_eq!(run.code(), 0, "{}", run.all());
+    assert_eq!(
+        read(&log),
+        "secrets join http://127.0.0.1:8781/v1 --no-wait\n"
+    );
+    assert!(
+        run.stdout
+            .contains("install.sh: secrets: joined: seq 1 (alab-secrets)\n"),
+        "{}",
+        run.all()
+    );
+
+    write(&log, "");
+    let quiet = installer(
+        &install_sh(),
+        &home,
+        &[
+            ("ATERM_NO_TOOLCHAIN", ""),
+            ("ATERM_BIN_DIR", s(&bin)),
+            ("ATERM_STORE_DIR", s(&store)),
+            ("STUB_JOIN_LOG", s(&log)),
+            ("STUB_JOIN_FAIL", "1"),
+        ],
+        &["--no-open", "--no-app", "--no-cli", "--no-path"],
+    );
+    assert_eq!(quiet.code(), 0, "{}", quiet.all());
+    assert_eq!(read(&log), "members join --no-wait\n");
+    assert!(
+        !quiet.all().contains("install.sh: members:"),
+        "no member answering neither fails the install nor prints a join line: {}",
+        quiet.all()
+    );
+
+    // An aterm with no members verb joins as before.
+    write(&log, "");
+    let older = installer(
+        &install_sh(),
+        &home,
+        &[
+            ("ATERM_NO_TOOLCHAIN", ""),
+            ("ATERM_BIN_DIR", s(&bin)),
+            ("ATERM_STORE_DIR", s(&store)),
+            ("STUB_JOIN_LOG", s(&log)),
+            ("STUB_NO_MEMBERS", "1"),
+        ],
+        &["--no-open", "--no-app", "--no-cli", "--no-path"],
+    );
+    assert_eq!(older.code(), 0, "{}", older.all());
+    assert_eq!(read(&log), "secrets join --no-wait\n");
+    assert!(
+        older
+            .stdout
+            .contains("install.sh: secrets: joined: seq 1 (alab-secrets)\n"),
+        "{}",
+        older.all()
+    );
+
+    write(&log, "");
+    write(
+        &home.home.join(".config/aterm/secrets/source.toml"),
+        "url = \"http://127.0.0.1:8781/v1\"\n",
+    );
+    let already = installer(
+        &install_sh(),
+        &home,
+        &[
+            ("ATERM_NO_TOOLCHAIN", ""),
+            ("ATERM_BIN_DIR", s(&bin)),
+            ("ATERM_STORE_DIR", s(&store)),
+            ("STUB_JOIN_LOG", s(&log)),
+        ],
+        &["--no-open", "--no-app", "--no-cli", "--no-path"],
+    );
+    assert_eq!(already.code(), 0, "{}", already.all());
+    assert_eq!(
+        read(&log),
+        "",
+        "an already-configured home does not re-join"
+    );
+
+    // Negative control: a script copy whose main omits join_secrets_headless makes no join call.
+    let orig = read(&install_sh());
+    let no_join_text = orig
+        .replace("\t\tjoin_secrets_headless\n", "")
+        .replace("\njoin_secrets_headless\n", "\n");
+    assert_ne!(
+        no_join_text, orig,
+        "negative control must strip join_secrets_headless"
+    );
+    let no_join_sh = scratch.write("no-join-install.sh", no_join_text);
+    chmod(&no_join_sh, 0o755);
+    let neg_home = scratch.home("neg");
+    let neg_log = scratch.join("neg/join.log");
+    let neg = installer(
+        &no_join_sh,
+        &neg_home,
+        &[
+            ("ATERM_NO_TOOLCHAIN", ""),
+            ("ATERM_BIN_DIR", s(&bin)),
+            ("ATERM_STORE_DIR", s(&store)),
+            ("STUB_JOIN_LOG", s(&neg_log)),
+        ],
+        &["--no-open", "--no-app", "--no-cli", "--no-path"],
+    );
+    assert_eq!(neg.code(), 0, "{}", neg.all());
+    assert_eq!(read(&neg_log), "");
+    assert!(
+        !neg.stdout.contains("install.sh: secrets:")
+            && !neg.stdout.contains("install.sh: members:")
+    );
+
+    if cfg!(target_os = "macos") {
+        let mac_home = scratch.home("mac-bundle");
+        let mac_log = scratch.join("mac-bundle/join.log");
+        let app = mac_home.home.join("Applications/aterm.app");
+        write(
+            &app.join("Contents/Info.plist"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>CFBundleIdentifier</key><string>com.aterm.aterm</string></dict></plist>\n",
+        );
+        scratch.stand_in(
+            "mac-bundle/home/Applications/aterm.app/Contents/MacOS/aterm",
+            stub_body,
+        );
+        let mac_run = installer(
+            &install_sh(),
+            &mac_home,
+            &[("STUB_JOIN_LOG", s(&mac_log))],
+            &["--no-open", "--no-app", "--no-toolchain", "--no-path"],
+        );
+        assert_eq!(mac_run.code(), 0, "{}", mac_run.all());
+        assert_eq!(read(&mac_log), "members join --no-wait\n");
+        assert!(
+            mac_run
+                .stdout
+                .contains("install.sh: members: asked 2 members\n"),
+            "{}",
+            mac_run.all()
         );
     }
 }

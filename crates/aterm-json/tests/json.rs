@@ -42,12 +42,38 @@ impl Golden {
     }
 }
 
+fn assert_lossless_value(back: &aterm_json::Value, v: &aterm_json::Value, input: &str) {
+    assert_eq!(back, v, "re-serialization of {input:?} is lossy");
+    match (back, v) {
+        (aterm_json::Value::Number(a), aterm_json::Value::Number(b)) => {
+            assert_eq!(a.as_u64(), b.as_u64(), "{input:?}: u64 class changed");
+            assert_eq!(a.as_i64(), b.as_i64(), "{input:?}: i64 class changed");
+            assert_eq!(
+                a.as_f64().map(f64::to_bits),
+                b.as_f64().map(f64::to_bits),
+                "{input:?}: float sign or bits changed"
+            );
+        }
+        (aterm_json::Value::Array(xs), aterm_json::Value::Array(ys)) => {
+            for (x, y) in xs.iter().zip(ys.iter()) {
+                assert_lossless_value(x, y, input);
+            }
+        }
+        (aterm_json::Value::Object(xm), aterm_json::Value::Object(ym)) => {
+            for (k, x) in xm {
+                assert_lossless_value(x, &ym[k], input);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn parse(input: &str) -> Result<aterm_json::Value, aterm_json::Error> {
     let result = aterm_json::from_str::<aterm_json::Value>(input);
     if let Ok(v) = &result {
         let text = aterm_json::to_string(v).expect("serialize");
         let back: aterm_json::Value = aterm_json::from_str(&text).expect("re-parse");
-        assert_eq!(&back, v, "re-serialization of {input:?} is lossy");
+        assert_lossless_value(&back, v, input);
     }
     result
 }
@@ -1066,6 +1092,7 @@ fn deny_unknown_fields_denies() {
         (r#"{"a":1,"b":"x"}"#, true),
         (r#"{"a":1,"b":"x","c":2}"#, false),
         (r#"{"b":"x"}"#, false),
+        // Duplicate known field: rejected by the derived struct visitor's duplicate-field guard.
         (r#"{"a":1,"b":"x","a":2}"#, false),
     ] {
         assert_eq!(aterm_json::from_str::<Strict>(input).is_ok(), ok, "{input}");

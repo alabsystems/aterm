@@ -216,10 +216,15 @@ impl TypedStamps {
     /// Wipe every banked stamp (the class-changing supersede / teardown).
     #[inline]
     pub(crate) const fn clear(&mut self) {
-        self.slots = [None; TYPED_STAMP_DEPTH];
+        let mut i = 0;
+        while i < TYPED_STAMP_DEPTH && self.slots[i].is_some() {
+            self.slots[i] = None;
+            i += 1;
+        }
     }
 
     /// Take every stamp banked after `at` out of the bank, keeping the rest packed.
+    #[inline]
     pub(crate) fn split_off_after(&mut self, at: Instant) -> Self {
         let mut kept = Self::EMPTY;
         let mut later = Self::EMPTY;
@@ -243,6 +248,7 @@ impl TypedStamps {
     }
 
     /// Put back what [`Self::split_off_after`] took, behind the remaining earlier stamps.
+    #[inline]
     pub(crate) const fn merge(&mut self, later: Self) {
         let mut n_later = 0;
         while n_later < TYPED_STAMP_DEPTH && later.slots[n_later].is_some() {
@@ -276,6 +282,7 @@ impl TypedStamps {
     }
 
     /// Keep only the stamps `keep` admits, packed oldest-first in their banked order.
+    #[inline]
     pub(super) fn retain(&mut self, keep: impl Fn(Instant) -> bool) {
         let mut write = 0;
         let mut read = 0;
@@ -297,6 +304,7 @@ impl TypedStamps {
     }
 
     /// Remove only the stamp(s) written at `at`.
+    #[inline]
     pub(crate) fn revoke_at(&mut self, at: Instant) {
         self.retain(|t| t != at);
     }
@@ -344,6 +352,7 @@ impl TypedStamps {
     }
 
     /// Consume the oldest still-fresh stamp.
+    #[inline]
     pub(crate) fn take_fresh(&mut self, now: Instant, window: Duration) -> Option<Instant> {
         let mut idx = 0;
         loop {
@@ -375,9 +384,13 @@ pub(super) const ORPHAN_EXACT_KEYS_MAX: usize = 2;
 pub(super) type OrphanExactPressRun = [Option<(Instant, char)>; ORPHAN_EXACT_KEYS_MAX];
 
 /// One live unpaid press as the exact-run proofs collect it.
+type PressCredit = (Instant, u8, Option<char>, Option<char>);
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PressCredits {
-    pub(super) slots: [Option<(Instant, u8, Option<char>)>; TYPED_STAMP_DEPTH],
+    // The fourth field preserves the original wide glyph independently of unpaid cells.
+    // Legacy one-cell proofs inspect only the third field, which stays None for wide keys.
+    pub(super) slots: [Option<PressCredit>; TYPED_STAMP_DEPTH],
     /// Bitmask of occupied slots (`bit i == 1` iff `slots[i].is_some()`).
     pub(super) occupied: u128,
     /// The next slot to write.
@@ -395,6 +408,76 @@ impl Default for PressCredits {
     }
 }
 
+#[cfg(test)]
+mod composer_credit_tests {
+    use super::*;
+
+    #[test]
+    fn a_partly_paid_wide_press_never_becomes_an_exact_narrow_glyph() {
+        let at = Instant::now();
+        let before = at - Duration::from_millis(1);
+        let mut keys = PressCredits::default();
+        keys.bank(at, 2, Some('界'));
+        assert!(keys.exact_echo_run(at, before, &['界', '\0']).is_some());
+        keys.retire_newest_cells(1);
+        assert!(!keys.fresh_glyph(at, TYPE_HINT_FRESH_DUR, '界'));
+        assert_eq!(keys.oldest_fresh_glyph(at, TYPE_HINT_FRESH_DUR), None);
+        assert_eq!(keys.exact_echo_run(at, before, &['界']), None);
+        assert_eq!(keys.exact_echo_run(at, before, &['界', '\0']), None);
+    }
+
+    #[test]
+    fn split_and_merge_keep_the_wide_identity_with_its_press() {
+        let at = Instant::now();
+        let before = at - Duration::from_millis(1);
+        for park in [false, true] {
+            for occupied_destination in [false, true] {
+                let mut source = PressCredits::default();
+                source.bank(at, 2, Some('語'));
+                let later = if park {
+                    source.split_off_for_park(before, 0)
+                } else {
+                    source.split_off_after(before)
+                };
+                let mut destination = PressCredits::default();
+                if occupied_destination {
+                    destination.bank(at, 2, Some('界'));
+                    destination.retire_newest();
+                    destination.bank(at, 1, Some('x'));
+                }
+                destination.merge(later);
+                assert!(
+                    destination
+                        .exact_echo_run(at, before, &['語', '\0'])
+                        .is_some()
+                );
+                assert_eq!(destination.exact_echo_run(at, before, &['界', '\0']), None);
+                assert_eq!(destination.exact_echo_run(at, before, &['語']), None);
+                assert!(source.exact_echo_run(at, before, &['語', '\0']).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn slot_reuse_and_partial_spending_do_not_reinterpret_wide_identity() {
+        let at = Instant::now();
+        let before = at - Duration::from_millis(1);
+        let mut keys = PressCredits::default();
+        keys.bank(at, 2, Some('界'));
+        for _ in 0..TYPED_STAMP_DEPTH {
+            keys.bank(at, 1, Some('x'));
+        }
+        assert_eq!(keys.exact_echo_run(at, before, &['界', '\0']), None);
+        assert!(keys.exact_echo_run(at, before, &['x']).is_some());
+        keys.forget();
+        keys.bank(at, 2, Some('語'));
+        keys.spend_counting(at, 1);
+        assert_eq!(keys.exact_echo_run(at, before, &['語', '\0']), None);
+        assert_eq!(keys.exact_echo_run(at, before, &['語']), None);
+        assert_eq!(keys.oldest_fresh_glyph(at, TYPE_HINT_FRESH_DUR), None);
+    }
+}
+
 impl PressCredits {
     pub(super) const EMPTY: Self = Self {
         slots: [None; TYPED_STAMP_DEPTH],
@@ -407,7 +490,18 @@ impl PressCredits {
     /// Bank one press worth `credits` cells.
     #[inline]
     pub(super) const fn bank(&mut self, now: Instant, credits: u8, glyph: Option<char>) {
-        self.slots[self.head] = Some((now, credits, glyph));
+        self.bank_stored((
+            now,
+            credits,
+            if credits == 1 { glyph } else { None },
+            if credits == 2 { glyph } else { None },
+        ));
+    }
+
+    /// Move an existing press without reinterpreting its remaining credits as its original width.
+    #[inline]
+    const fn bank_stored(&mut self, press: (Instant, u8, Option<char>, Option<char>)) {
+        self.slots[self.head] = Some(press);
         self.occupied |= 1u128 << self.head;
         self.head = (self.head + 1) & STAMP_RING_MASK;
     }
@@ -416,7 +510,7 @@ impl PressCredits {
     #[inline]
     pub(super) const fn slot_at(&self, slot: usize) -> Option<Instant> {
         match self.slots[slot] {
-            Some((at, _, _)) => Some(at),
+            Some((at, _, _, _)) => Some(at),
             None => None,
         }
     }
@@ -449,7 +543,7 @@ impl PressCredits {
         while mask != 0 {
             let i = mask.trailing_zeros() as usize;
             mask &= mask - 1;
-            if let Some((t, c, _)) = self.slots[i]
+            if let Some((t, c, _, _)) = self.slots[i]
                 && self.payable(t, c, now)
                 && keep(t)
             {
@@ -467,7 +561,7 @@ impl PressCredits {
         while mask != 0 {
             let i = mask.trailing_zeros() as usize;
             mask &= mask - 1;
-            if let Some((t, c, _)) = self.slots[i]
+            if let Some((t, c, _, _)) = self.slots[i]
                 && self.payable(t, c, now)
             {
                 total += usize::from(c);
@@ -484,7 +578,7 @@ impl PressCredits {
         while mask != 0 {
             let i = mask.trailing_zeros() as usize;
             mask &= mask - 1;
-            if let Some((t, c, _)) = self.slots[i]
+            if let Some((t, c, _, _)) = self.slots[i]
                 && self.payable(t, c, now)
             {
                 count += 1;
@@ -500,7 +594,7 @@ impl PressCredits {
         while mask != 0 {
             let i = mask.trailing_zeros() as usize;
             mask &= mask - 1;
-            if let Some((t, c, _)) = self.slots[i]
+            if let Some((t, c, _, _)) = self.slots[i]
                 && self.payable(t, c, now)
             {
                 return true;
@@ -517,7 +611,7 @@ impl PressCredits {
         while mask != 0 {
             let i = mask.trailing_zeros() as usize;
             mask &= mask - 1;
-            if let Some((t, c, _)) = self.slots[i]
+            if let Some((t, c, _, _)) = self.slots[i]
                 && self.payable(t, c, now)
             {
                 let slot = if self.held(t) { &mut held } else { &mut free };
@@ -541,7 +635,7 @@ impl PressCredits {
         while mask != 0 {
             let i = mask.trailing_zeros() as usize;
             mask &= mask - 1;
-            if let Some((t, c, _)) = self.slots[i]
+            if let Some((t, c, _, _)) = self.slots[i]
                 && self.payable(t, c, now)
             {
                 newest = Some(match newest {
@@ -560,7 +654,8 @@ impl PressCredits {
         while mask != 0 {
             let i = mask.trailing_zeros() as usize;
             mask &= mask - 1;
-            if let Some((at, c, g)) = self.slots[i]
+            if let Some((at, c, g, _)) = self.slots[i]
+                && c == 1
                 && g == Some(glyph)
                 && self.payable(at, c, now)
                 && now.saturating_duration_since(at) <= freshness
@@ -572,6 +667,7 @@ impl PressCredits {
     }
 
     /// The oldest fresh press's exact glyph, in ring order.
+    #[inline]
     pub(super) fn oldest_fresh_glyph(
         &self,
         now: Instant,
@@ -582,37 +678,47 @@ impl PressCredits {
             let k = mask.trailing_zeros() as usize;
             mask &= mask - 1;
             let i = (self.head + k) & STAMP_RING_MASK;
-            if let Some((at, credits, glyph)) = self.slots[i]
+            if let Some((at, credits, glyph, _)) = self.slots[i]
                 && self.payable(at, credits, now)
                 && now.saturating_duration_since(at) <= freshness
             {
-                return Some((i, glyph?));
+                return (credits == 1).then_some((i, glyph?));
             }
         }
         None
     }
 
     /// Whether `printed` is foreign to every press in flight.
+    #[inline]
     pub(super) fn foreign_to_live(&self, now: Instant, printed: char) -> Option<bool> {
         let mut any = false;
+        let mut matched = false;
         let mut mask = self.occupied;
         while mask != 0 {
             let i = mask.trailing_zeros() as usize;
             mask &= mask - 1;
-            if let Some((t, c, glyph)) = self.slots[i]
+            if let Some((t, c, glyph, _)) = self.slots[i]
                 && self.payable(t, c, now)
             {
                 match glyph {
+                    _ if c != 1 => return None,
                     None => return None,
-                    Some(g) if g == printed => return Some(false),
+                    Some(g) if g == printed => matched = true,
                     Some(_) => any = true,
                 }
             }
         }
-        if any { Some(true) } else { None }
+        if matched {
+            Some(false)
+        } else if any {
+            Some(true)
+        } else {
+            None
+        }
     }
 
     /// The chronological unpaid one-cell keys must spell this whole small observed run.
+    #[inline]
     pub(super) fn exact_unpaid_run(
         &self,
         now: Instant,
@@ -623,6 +729,7 @@ impl PressCredits {
     }
 
     /// The same proof with a caller-selected tail age.
+    #[inline]
     pub(super) fn exact_unpaid_run_with_tail_window(
         &self,
         now: Instant,
@@ -642,7 +749,7 @@ impl PressCredits {
             let k = mask.trailing_zeros() as usize;
             mask &= mask - 1;
             let i = (self.head + k) & STAMP_RING_MASK;
-            let Some((at, credits, glyph)) = self.slots[i] else {
+            let Some((at, credits, glyph, _)) = self.slots[i] else {
                 continue;
             };
             if !self.payable(at, credits, now) {
@@ -690,7 +797,59 @@ impl PressCredits {
         None
     }
 
+    /// An exact unpaid run after a boundary; later queued keys may not have echoed yet.
+    #[inline]
+    fn exact_echo_run(&self, now: Instant, after: Instant, glyphs: &[char]) -> Option<usize> {
+        if self.occupied == 0 || glyphs.is_empty() || glyphs.len() > EXACT_COALESCED_PREFIX_MAX {
+            return None;
+        }
+        let mut units = [(' ', 0u8); EXACT_COALESCED_PREFIX_MAX];
+        let mut unit_count = 0;
+        let mut col = 0;
+        while col < glyphs.len() {
+            let unit = rk::witness::unit_at(glyphs, col as u16);
+            if unit.cont || glyphs[col] == '\0' {
+                return None;
+            }
+            let width = if unit.wide { 2 } else { 1 };
+            units[unit_count] = (unit.ch, width as u8);
+            unit_count += 1;
+            col += width;
+        }
+        let mut live = [None; TYPED_STAMP_DEPTH];
+        let mut count = 0;
+        let mut mask = self.occupied.rotate_right(self.head as u32);
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            let slot = (self.head + k) & STAMP_RING_MASK;
+            if let Some((at, credits, glyph, wide)) = self.slots[slot]
+                && self.payable(at, credits, now)
+            {
+                let expected = if credits == 2 { wide } else { glyph };
+                live[count] = Some((slot, at, credits, expected));
+                count += 1;
+            }
+        }
+        let last_start = count.checked_sub(unit_count)?;
+        for start in 0..=last_start {
+            let exact = units[..unit_count]
+                .iter()
+                .enumerate()
+                .all(|(index, (glyph, width))| {
+                    live[start + index].is_some_and(|(_, at, credits, expected)| {
+                        credits == *width && expected == Some(*glyph) && at > after
+                    })
+                });
+            if exact {
+                return live[start].map(|(slot, ..)| slot);
+            }
+        }
+        None
+    }
+
     /// The slot of the oldest payable press when the payable presses begin, oldest-first.
+    #[inline]
     pub(super) fn exact_run_after(
         &self,
         now: Instant,
@@ -707,7 +866,7 @@ impl PressCredits {
             let k = mask.trailing_zeros() as usize;
             mask &= mask - 1;
             let i = (self.head + k) & STAMP_RING_MASK;
-            let Some((at, credits, glyph)) = self.slots[i] else {
+            let Some((at, credits, glyph, _)) = self.slots[i] else {
                 continue;
             };
             if !self.payable(at, credits, now) {
@@ -729,23 +888,31 @@ impl PressCredits {
     }
 
     /// A later exact content echo proves earlier same-stream keys already appeared.
+    #[inline]
     pub(super) const fn retire_before_slot(&mut self, selected: usize) {
-        let mut k = 0;
-        while k < TYPED_STAMP_DEPTH {
+        if self.occupied == 0 {
+            return;
+        }
+        let stop_k = if selected < TYPED_STAMP_DEPTH {
+            selected.wrapping_sub(self.head) & STAMP_RING_MASK
+        } else {
+            TYPED_STAMP_DEPTH
+        };
+        let mut mask = self.occupied.rotate_right(self.head as u32);
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            if k >= stop_k {
+                break;
+            }
+            mask &= mask - 1;
             let i = (self.head + k) & STAMP_RING_MASK;
-            if i == selected {
-                return;
-            }
-            let bit = 1u128 << i;
-            if self.occupied & bit != 0 {
-                self.slots[i] = None;
-                self.occupied &= !bit;
-            }
-            k += 1;
+            self.slots[i] = None;
+            self.occupied &= !(1u128 << i);
         }
     }
 
     /// Spend `cells` oldest-first, so one pool of typing never funds a second echo.
+    #[inline]
     pub(super) fn spend_counting(&mut self, now: Instant, mut cells: usize) -> usize {
         if cells == 0 || self.occupied == 0 {
             return 0;
@@ -763,7 +930,7 @@ impl PressCredits {
                 let k = mask.trailing_zeros() as usize;
                 mask &= mask - 1;
                 let i = (self.head + k) & STAMP_RING_MASK;
-                let Some((t, c, _)) = self.slots[i] else {
+                let Some((t, c, _, _)) = self.slots[i] else {
                     continue;
                 };
                 if self.held(t) != held || !self.payable(t, c, now) {
@@ -775,7 +942,7 @@ impl PressCredits {
                     self.slots[i] = None;
                     self.occupied &= !(1u128 << i);
                     drained += 1;
-                } else if let Some((_, left, _)) = &mut self.slots[i] {
+                } else if let Some((_, left, _, _)) = &mut self.slots[i] {
                     *left -= take as u8;
                 }
             }
@@ -784,12 +951,13 @@ impl PressCredits {
     }
 
     /// Blank every slot whose press instant `pred` admits, in place.
+    #[inline]
     pub(super) fn blank_where(&mut self, pred: impl Fn(Instant) -> bool) {
         let mut mask = self.occupied;
         while mask != 0 {
             let i = mask.trailing_zeros() as usize;
             mask &= mask - 1;
-            if let Some((t, _, _)) = self.slots[i]
+            if let Some((t, _, _, _)) = self.slots[i]
                 && pred(t)
             {
                 self.slots[i] = None;
@@ -799,11 +967,13 @@ impl PressCredits {
     }
 
     /// Drop every press past [`IN_FLIGHT_PATIENCE_S`].
+    #[inline]
     pub(super) fn retire_stale(&mut self, now: Instant) {
         self.blank_where(|t| now.saturating_duration_since(t) > IN_FLIGHT_PATIENCE_DUR);
     }
 
     /// Revoke the press banked at `at`, for a dispatch that never reached the child.
+    #[inline]
     pub(super) fn revoke_at(&mut self, at: Instant) {
         self.blank_where(|t| t == at);
     }
@@ -820,11 +990,13 @@ impl PressCredits {
     }
 
     /// Retire every press banked at or before `at`.
+    #[inline]
     pub(super) fn retire_through(&mut self, at: Instant) {
         self.blank_where(|t| t <= at);
     }
 
     /// One or two exact one-cell keys dispatched after an insert but banked by its delivery.
+    #[inline]
     pub(super) fn exact_run_between(
         &self,
         now: Instant,
@@ -838,7 +1010,7 @@ impl PressCredits {
             let k = mask.trailing_zeros() as usize;
             mask &= mask - 1;
             let i = (self.head + k) & STAMP_RING_MASK;
-            let Some((at, credits, glyph)) = self.slots[i] else {
+            let Some((at, credits, glyph, _)) = self.slots[i] else {
                 continue;
             };
             if at <= dispatched_at || at > delivered_at || !self.payable(at, credits, now) {
@@ -865,7 +1037,7 @@ impl PressCredits {
         while mask != 0 {
             let i = mask.trailing_zeros() as usize;
             mask &= mask - 1;
-            if let Some((t, c, _)) = self.slots[i]
+            if let Some((t, c, _, _)) = self.slots[i]
                 && t <= at
                 && self.payable(t, c, now)
             {
@@ -876,6 +1048,7 @@ impl PressCredits {
     }
 
     /// Take every press banked after the park (`t > at` or absent from `mask_at_park`) out of the ring at its own index.
+    #[inline]
     pub(super) fn split_off_for_park(&mut self, at: Instant, mask_at_park: u128) -> Self {
         let mut later = Self {
             head: self.head,
@@ -886,7 +1059,7 @@ impl PressCredits {
             let i = mask.trailing_zeros() as usize;
             mask &= mask - 1;
             let bit = 1u128 << i;
-            if let Some((t, _, _)) = self.slots[i]
+            if let Some((t, _, _, _)) = self.slots[i]
                 && (t > at || (mask_at_park & bit) == 0)
             {
                 later.slots[i] = self.slots[i].take();
@@ -898,6 +1071,7 @@ impl PressCredits {
     }
 
     /// Take every press banked after `at` out of the ring at its own index.
+    #[inline]
     pub(super) fn split_off_after(&mut self, at: Instant) -> Self {
         let mut later = Self {
             head: self.head,
@@ -907,7 +1081,7 @@ impl PressCredits {
         while mask != 0 {
             let i = mask.trailing_zeros() as usize;
             mask &= mask - 1;
-            if let Some((t, _, _)) = self.slots[i]
+            if let Some((t, _, _, _)) = self.slots[i]
                 && t > at
             {
                 later.slots[i] = self.slots[i].take();
@@ -920,6 +1094,7 @@ impl PressCredits {
     }
 
     /// Put back what [`Self::split_off_after`] took.
+    #[inline]
     pub(super) const fn merge(&mut self, later: Self) {
         if later.occupied == 0 {
             return;
@@ -930,8 +1105,8 @@ impl PressCredits {
                 let k = mask.trailing_zeros() as usize;
                 mask &= mask - 1;
                 let i = (later.head + k) & STAMP_RING_MASK;
-                if let Some((t, c, glyph)) = later.slots[i] {
-                    self.bank(t, c, glyph);
+                if let Some(press) = later.slots[i] {
+                    self.bank_stored(press);
                 }
             }
             return;
@@ -955,7 +1130,7 @@ impl PressCredits {
         while mask != 0 {
             let i = mask.trailing_zeros() as usize;
             mask &= mask - 1;
-            if let Some((t, _, _)) = self.slots[i]
+            if let Some((t, _, _, _)) = self.slots[i]
                 && !matches!(best, Some((_, bt)) if t < bt)
             {
                 best = Some((i, t));
@@ -981,7 +1156,7 @@ impl PressCredits {
             return;
         }
         if let Some(i) = self.newest()
-            && let Some((_, c, _)) = &mut self.slots[i]
+            && let Some((_, c, _, _)) = &mut self.slots[i]
         {
             *c = c.saturating_sub(cells);
             if *c == 0 {
@@ -1084,6 +1259,9 @@ pub(super) struct TornLay {
     pub(super) anchor_seq: Option<u64>,
     /// A print since the lay ended on another row.
     pub(super) printed_off_row: bool,
+    /// A key came while the lay waited ([`CursorGlow::clear_typed_keeping_hand`]): a later move
+    /// is that key's answer, which keeps the lay.
+    pub(super) keyed: bool,
 }
 
 /// The most presses an [`EraseWitness`] remembers retiring.
@@ -1293,6 +1471,7 @@ impl InsertSeam {
         tally: InsertTally::EMPTY,
     };
     /// Arm a delivered insert of `cells` at `at` on `row`.
+    #[inline]
     pub(super) fn arm(
         &mut self,
         at: Instant,
@@ -1353,6 +1532,7 @@ impl InsertSeam {
     }
 
     /// Revoke the arm stamped at exactly `at` (a queued or failed dispatch).
+    #[inline]
     pub(super) fn revoke_arm_at(&mut self, at: Instant) {
         if matches!(self.armed, Some(i) if i.at == at) {
             self.armed = self.undo.licence.take();
@@ -1395,6 +1575,7 @@ impl InsertSeam {
     }
 
     /// Move the row-addressed members with a scroll or band move under `map`.
+    #[inline]
     pub(super) fn translate_rows(&mut self, map: impl Fn(u16) -> Option<u16>) {
         self.span = None;
         self.pending_hop = None;
@@ -1415,6 +1596,7 @@ impl InsertSeam {
     }
 
     /// Take the refused hop ([`PendingHop`]) if it is the insert `armed` now delivers.
+    #[inline]
     pub(super) fn take_retro_hop(
         &mut self,
         armed: InsertLicence,
@@ -1487,6 +1669,7 @@ impl InsertSeam {
     }
 
     /// Once an unknown insert's hop is old enough for any next-frame echo to have spent its own.
+    #[inline]
     pub(super) fn retire_orphans(&mut self, now: Instant) -> Option<UnknownInsertOrphans> {
         let orphans = self.orphans?;
         if now.saturating_duration_since(orphans.laid_at) > INSERT_REWRITE_FRESH_DUR {
@@ -1529,11 +1712,13 @@ impl InFlightTally {
 
 impl CursorGlow {
     /// Host key hint: one Backspace keypress.
+    #[inline]
     pub fn note_backspace(&mut self, now: Instant) {
         self.note_backspace_erasing(now, None);
     }
 
     /// [`Self::note_backspace`] with the erased glyph's cell width, priced by the host.
+    #[inline]
     pub fn note_backspace_erasing(&mut self, now: Instant, cells: Option<u16>) {
         self.clear_typed_keeping_hand(now);
         let newest = self.type_press_ring.newest();
@@ -1553,7 +1738,7 @@ impl CursorGlow {
             }
         };
         let retired = match (newest, newest_press) {
-            (Some(i), Some((_, _, glyph))) if self.type_press_ring.slots[i].is_none() => glyph,
+            (Some(i), Some((_, 1, glyph, _))) if self.type_press_ring.slots[i].is_none() => glyph,
             _ => None,
         };
         let mut owed = match self.last_erase {
@@ -1589,9 +1774,10 @@ impl CursorGlow {
     }
 
     /// Host key hint: a navigation keypress (Ctrl-a/Ctrl-E, Home/End, arrows, word/line motions).
+    #[inline]
     pub fn note_navigation(&mut self, now: Instant) {
         self.recent_typed_run = None;
-        self.unowned_caret = None;
+        self.settle_doubt();
         self.flush_held_park();
         if self.newline_hint.take().is_some() && self.v2.engaged() {
             self.v2.on_event(rk::Event::CancelComposerNewline, now);
@@ -1606,7 +1792,91 @@ impl CursorGlow {
     /// boundary left on the caret's row, as navigation does, and licenses no move.
     #[inline]
     pub const fn note_composer_inserting(&mut self) {
+        self.settle_doubt();
+    }
+
+    /// Settle the doubt the last generic boundary left on the caret's row ([`UnownedCaret`]),
+    /// and the one a typed lay still waiting for the caret's rest saved ([`TornLay`]), so the
+    /// lay's recall does not hand back a doubt this settled.
+    #[inline]
+    const fn settle_doubt(&mut self) {
         self.unowned_caret = None;
+        if let Some(lay) = &mut self.torn_lay {
+            lay.unowned_before = None;
+        }
+    }
+
+    /// This one frame confirms editable composer mode, but licenses no glyph.
+    /// The tick still requires a changed insertion span and its exact unpaid key run.
+    #[inline]
+    pub const fn note_composer_insert_frame(&mut self, editable: bool) {
+        self.composer_insert_frame = editable;
+    }
+
+    /// The accepted NORMAL-to-INSERT command has no glyph credit of its own.
+    #[inline]
+    pub const fn note_composer_entry(&mut self, at: Option<Instant>) {
+        self.composer_entry_at = at;
+    }
+
+    #[inline]
+    pub(super) fn confirm_composer_echo(&mut self, cur: Option<(u16, u16)>, now: Instant) {
+        let Some(boundary) = self.composer_boundary.filter(|_| self.caret_row_parked()) else {
+            return;
+        };
+        let boundary = self
+            .composer_entry_at
+            .map_or(boundary, |at| at.max(boundary));
+        let (Some(previous), Some(current), Some((row, col))) =
+            (self.row_prev_meta, self.row_cur_meta, cur)
+        else {
+            return;
+        };
+        if previous.row != row
+            || current.row != row
+            || current.caret != col
+            || current.at != now
+            || previous.at >= now
+            || col <= previous.caret
+            || self.row_prev == self.row_cur
+        {
+            return;
+        }
+        let to = usize::from(col);
+        if to > self.row_cur.len() {
+            return;
+        }
+        for from in usize::from(previous.caret)..to {
+            let width = to - from;
+            if width > EXACT_COALESCED_PREFIX_MAX
+                || from > self.row_prev.len()
+                || self.row_prev[..from] != self.row_cur[..from]
+            {
+                continue;
+            }
+            let tail = self
+                .row_prev
+                .len()
+                .min(self.row_cur.len().saturating_sub(width));
+            if from > tail || self.row_prev[from..tail] != self.row_cur[to..tail + width] {
+                continue;
+            }
+            let Some(slot) =
+                self.type_press_ring
+                    .exact_echo_run(now, boundary, &self.row_cur[from..to])
+            else {
+                continue;
+            };
+            self.type_press_ring.retire_before_slot(slot);
+            // An append-mode command may move before the proved insertion. That motion
+            // is not typing: the following tick starts its light at the inserted span.
+            if self.last == Some((row, previous.caret)) {
+                self.last = Some((row, from as u16));
+            }
+            self.note_composer_inserting();
+            self.composer_boundary = None;
+            return;
+        }
     }
 
     /// Whether a generic boundary's doubted caret row is parked, so a key whose echo lands on
@@ -1643,6 +1913,7 @@ impl CursorGlow {
         self.note_typed_glyph_with_expected(now, cells, shifted, class, None);
     }
 
+    #[inline]
     pub(super) fn note_typed_glyph_with_expected(
         &mut self,
         now: Instant,
@@ -1669,7 +1940,7 @@ impl CursorGlow {
         }
     }
 
-    /// The one-cell typed hint with the input glyph's exact identity.
+    /// A typed hint with the input glyph's exact identity and cell width.
     #[inline]
     pub fn note_typed_expected(
         &mut self,
@@ -1679,13 +1950,7 @@ impl CursorGlow {
         class: rk::TypedClass,
         glyph: char,
     ) {
-        self.note_typed_glyph_with_expected(
-            now,
-            cells,
-            shifted,
-            class,
-            if cells == 1 { Some(glyph) } else { None },
-        );
+        self.note_typed_glyph_with_expected(now, cells, shifted, class, Some(glyph));
     }
 
     /// Record a main-screen Enter classifier stamp, the bare-Enter licence for the jump arm.
@@ -1696,6 +1961,7 @@ impl CursorGlow {
     }
 
     /// [`Self::note_return`] for an Enter into a foreground program's composer.
+    #[inline]
     pub fn note_return_keeping_hand(&mut self, now: Instant) {
         self.recent_typed_run = None;
         self.flush_held_park();
@@ -1705,10 +1971,11 @@ impl CursorGlow {
         if self.v2.engaged() {
             self.v2.on_event(rk::Event::Return, now);
         }
-        self.unowned_caret = None;
+        self.settle_doubt();
     }
 
     /// Record a Tab / scripted-gesture classifier boundary.
+    #[inline]
     pub fn note_user_gesture(&mut self, now: Instant) {
         self.flush_held_park();
         self.supersede_typed_press();
@@ -1769,6 +2036,7 @@ impl CursorGlow {
 
     /// [`Self::note_insert_delivered_from`] for a test that has no dispatch instant to hand.
     #[cfg(test)]
+    #[inline]
     pub fn note_insert_delivered(&mut self, at: Instant, width: InsertWidth) {
         self.deliver_insert(at, None, width);
     }
@@ -1784,6 +2052,7 @@ impl CursorGlow {
         self.deliver_insert(at, Some(dispatched_at), width);
     }
 
+    #[inline]
     pub(super) fn deliver_insert(
         &mut self,
         at: Instant,
@@ -1819,6 +2088,7 @@ impl CursorGlow {
     }
 
     /// The arm shared by [`Self::deliver_insert`] and [`Self::note_insert_armed`].
+    #[inline]
     pub(super) fn arm_insert(
         &mut self,
         at: Instant,
@@ -1943,6 +2213,7 @@ impl CursorGlow {
     }
 
     /// The line insert's echo across its break ([`InsertWidth::Line`]).
+    #[inline]
     pub(super) fn line_insert_echo(
         &self,
         (pr, pc): (u16, u16),
@@ -1974,6 +2245,7 @@ impl CursorGlow {
     }
 
     /// Whether a fresher press class owns this same-row forward hop.
+    #[inline]
     pub(super) fn fresher_class_owns_hop(
         &self,
         hop: usize,
@@ -2038,6 +2310,7 @@ impl CursorGlow {
     }
 
     /// Lay a delivered insert's echo `pc → cc` on `row`.
+    #[inline]
     pub(super) fn lay_insert(
         &mut self,
         pr: u16,
@@ -2119,6 +2392,7 @@ impl CursorGlow {
     }
 
     /// Retract a delivered insert's span to the program's new caret.
+    #[inline]
     pub(super) fn retract_insert(&mut self, row: u16, col: u16, cells: u16, now: Instant) {
         self.unsettle();
         if self.v2.engaged() {
@@ -2157,6 +2431,7 @@ impl CursorGlow {
     }
 
     /// A composer newline landed.
+    #[inline]
     pub fn note_newline_break(&mut self, now: Instant) {
         self.recent_typed_run = None;
         self.unsettle();
@@ -2167,6 +2442,7 @@ impl CursorGlow {
     }
 
     /// Record a grid-geometry classifier boundary.
+    #[inline]
     pub fn note_reflow(&mut self, now: Instant) {
         self.recent_typed_run = None;
         self.clear_typed(now);
@@ -2175,9 +2451,10 @@ impl CursorGlow {
     }
 
     /// A user motion press: a key whose purpose is moving the cursor.
+    #[inline]
     pub fn note_motion(&mut self, now: Instant) {
         self.recent_typed_run = None;
-        self.unowned_caret = None;
+        self.settle_doubt();
         self.clear_typed_keeping_hand(now);
         self.unsettle();
         self.nav_hint = Some(now);
@@ -2185,6 +2462,7 @@ impl CursorGlow {
     }
 
     /// Explicit scripted preview/test provenance.
+    #[inline]
     #[doc(hidden)]
     pub fn note_synthetic_move(&mut self, now: Instant) {
         self.recent_typed_run = None;
@@ -2220,6 +2498,7 @@ impl CursorGlow {
     }
 
     /// Whether the unpaid presses pay for the same-row forward hop `pc → cc` on `row`.
+    #[inline]
     pub(super) fn typed_share_paid(&self, row: u16, pc: u16, cc: u16, now: Instant) -> bool {
         let credits = self.typed_credits_within(now);
         if credits < 2 {
@@ -2238,6 +2517,7 @@ impl CursorGlow {
 
     /// How many columns of the same-row run `[from_col, to_col)` are wide continuations (`'\0'`
     /// in the row probe, as `Terminal::row_cols_into` spells them).
+    #[inline]
     pub(super) fn swept_wide_continuations(
         &self,
         row: u16,
@@ -2275,6 +2555,7 @@ impl CursorGlow {
     }
 
     /// Forget every in-flight press on an observed edge the presses cannot explain.
+    #[inline]
     pub(super) fn forget_typed_credits(&mut self, now: Instant) {
         self.insert.orphans = None;
         self.insert.orphan_exact = None;
@@ -2289,6 +2570,7 @@ impl CursorGlow {
     }
 
     /// Whether this move is a same-row forward echo with an unpaid press behind it.
+    #[inline]
     #[allow(
         clippy::too_many_arguments,
         reason = "from/to cursor cells + clock + config + geometry; the seam's one predicate, called from four sites"
@@ -2366,6 +2648,7 @@ impl CursorGlow {
     }
 
     /// The soft-wrapped caret.
+    #[inline]
     pub(super) fn soft_wrapped_caret(
         &self,
         pr: u16,
@@ -2460,6 +2743,7 @@ impl CursorGlow {
     }
 
     /// Whether the forward echo from a soft-wrapped caret's landing carried the wrap key's word.
+    #[inline]
     pub(super) const fn carried_word_left(
         &self,
         sw: rk::ribbon::SoftWrap,
@@ -2489,6 +2773,7 @@ impl CursorGlow {
     }
 
     /// The lifted word (the reverse re-wrap).
+    #[inline]
     pub(super) const fn lifted_word(&self, pr: u16, pc: u16, cr: u16, cc: u16) -> Option<u16> {
         let Some(cur) = self.row_cur_meta else {
             return None;
@@ -2622,6 +2907,7 @@ impl CursorGlow {
     }
 
     /// Host key hint: one kill keypress (Ctrl-K/U/W, Alt-D, word-delete Backspace, forward Delete).
+    #[inline]
     pub fn note_kill(&mut self, now: Instant, moves_cursor: bool) {
         self.recent_typed_run = None;
         self.flush_held_park();
@@ -2664,8 +2950,15 @@ impl CursorGlow {
             }
         }
         self.clear_typed_keeping_hand(now);
+        // A typed lay still waiting for its caret to rest is never recalled across this
+        // boundary: vim's Escape right after an echo steps the caret back behind it, and the rest
+        // that follows is that key's answer, not a torn redisplay, so a recall would take back a
+        // real echo's light (cd3b7f73f6 caught it unparking the row the Escape's repaint parked,
+        // which lit NORMAL's motions).
+        self.torn_lay = None;
         self.hand_row = None;
         self.unowned_caret = unparked(self.last);
+        self.composer_boundary = Some(now);
     }
 
     /// A licensed echo of the hand's own input landed on `row`.
@@ -2680,7 +2973,17 @@ impl CursorGlow {
     }
 
     /// [`Self::clear_typed`] for a press that cannot take the hand off its row.
+    #[inline]
     pub fn clear_typed_keeping_hand(&mut self, now: Instant) {
+        self.composer_insert_frame = false;
+        self.composer_entry_at = None;
+        // A key ends the last typed lay's wait for the caret's rest ([`TornLay`]) once the caret
+        // moves: a move behind the key is the key's answer and keeps the lay, and a caret that
+        // rests where the key found it is still recalled. The key does not restart the rest,
+        // which is timed from the caret's last move.
+        if let Some(lay) = &mut self.torn_lay {
+            lay.keyed = true;
+        }
         self.flush_held_park();
         if self.newline_hint.is_some() && self.v2.engaged() {
             self.v2.on_event(rk::Event::CancelComposerNewline, now);
@@ -2690,6 +2993,7 @@ impl CursorGlow {
     }
 
     /// The non-typed half of [`Self::clear_typed`].
+    #[inline]
     pub(super) fn clear_non_typed_hints(&mut self, now: Instant) {
         self.user_gesture_hint = None;
         self.nav_hint = None;
@@ -2711,6 +3015,7 @@ impl CursorGlow {
     }
 
     /// Revoke the classifier cohort armed by the input dispatch at `at`, licence terms included.
+    #[inline]
     pub fn revoke_input_hints_at(&mut self, at: Instant) {
         #[inline]
         fn clear(slot: &mut Option<Instant>, at: Instant) {
@@ -2745,6 +3050,7 @@ impl CursorGlow {
     }
 
     /// Consume every one-shot classifier at a completed hidden→visible boundary where `spawn`.
+    #[inline]
     pub(super) fn retire_hidden_movement_provenance(&mut self, now: Instant) {
         // A held park is spared while fresh, like the typed bank: Ink brackets
         // its park and rewrite in DECTCEM hides, so a boundary can complete
@@ -2774,6 +3080,7 @@ impl CursorGlow {
     }
 
     /// The unconditional twin of [`Self::retire_hidden_movement_provenance`] for the unseeded.
+    #[inline]
     pub(super) fn retire_all_movement_provenance(&mut self) {
         self.flush_held_park();
         self.type_hint.clear();
@@ -2789,6 +3096,7 @@ impl CursorGlow {
     }
 
     /// A hidden→visible relocation the bounded ConPTY bridge declined never reaches `spawn`.
+    #[inline]
     pub(super) fn retire_declined_hidden_relocation(&mut self, cur: (u16, u16)) {
         self.retire_all_movement_provenance();
         self.drop_row_probe();

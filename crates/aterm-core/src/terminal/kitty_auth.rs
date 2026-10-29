@@ -11,6 +11,8 @@
 //! installed a resolver ([`super::Terminal::set_kitty_file_resolver`], and none since
 //! [`super::Terminal::clear_kitty_file_resolver`]).
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use super::kitty_graphics::KittyMedium;
 
 /// The host's resolver for a Kitty non-direct medium: the bytes `name` holds, or `None`.
@@ -26,12 +28,28 @@ pub(super) struct KittyMediumCapability {
 /// The host's Kitty medium resolver, when one is installed.
 pub(super) struct KittyResolverSlot {
     resolver: Option<KittyFileResolver>,
+    loaded: AtomicU64,
 }
 
 impl KittyResolverSlot {
     #[inline]
     pub(super) const fn new() -> Self {
-        Self { resolver: None }
+        Self {
+            resolver: None,
+            loaded: AtomicU64::new(0),
+        }
+    }
+
+    /// Record that a non-direct medium payload built an image on the live engine.
+    #[inline]
+    pub(super) fn note_loaded(&self) {
+        self.loaded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Monotonic count of non-direct medium payloads that built an image on this engine.
+    #[inline]
+    pub(super) fn loaded_count(&self) -> u64 {
+        self.loaded.load(Ordering::Relaxed)
     }
 
     #[inline]

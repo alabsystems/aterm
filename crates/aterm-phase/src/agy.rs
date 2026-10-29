@@ -16,7 +16,7 @@ use crate::wall::{ApiCause, Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 4, "0.4");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 5, "0.5");
 
 const SPINNER: std::ops::RangeInclusive<char> = '\u{2801}'..='\u{28FF}';
 
@@ -192,15 +192,6 @@ pub fn split_agent_token(s: &str) -> Option<(&str, &str)> {
         .filter(|s| !s.is_empty())
         .unwrap_or(inside);
     Some((name, &body[close + 1..]))
-}
-
-/// Unwrap `agy`'s `Agent(<type>: <role>)` or `Agent(<name>)` token into its
-/// display name (`<role>` for `self: <role>`, `<type>: <role>` or `<name>`
-/// otherwise).
-#[must_use]
-pub fn unwrap_agent_token(token: &str) -> Option<&str> {
-    let (name, rest) = split_agent_token(token)?;
-    rest.is_empty().then_some(name)
 }
 
 /// Split an `agy` subagent panel item into its display name and activity at the

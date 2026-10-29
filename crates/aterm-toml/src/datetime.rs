@@ -324,6 +324,11 @@ impl<'de> serde::Deserialize<'de> for Datetime {
                 })?;
                 let DatetimeKey = key;
                 let text: String = map.next_value()?;
+                if map.next_key::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "unexpected trailing field in date-time",
+                    ));
+                }
                 text.parse().map_err(serde::de::Error::custom)
             }
 

@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use super::Rig;
 use super::instance::{
-    Budget, CouldNotRun, Instance, Scratch, World, could_not_run, field, uint_field, unanswered,
+    Budget, CouldNotRun, Ctl, Instance, Scratch, World, could_not_run, field, uint_field,
+    unanswered,
 };
 use super::starvation::ShapeVerdict;
 
@@ -28,10 +29,13 @@ pub enum SpinScene {
     /// it opens holds the focus.
     Windowed,
     /// [`Self::Windowed`] at full motion under the shipped cursor style, the rainbow kitty pet,
-    /// measured once the pet is in deep sleep ([`PET_DEEP_SLEEP`]). A pet asleep past its breath
-    /// window takes no frame and offers no deadline, and a window without the focus neither
-    /// animates its pet nor asks it for one: either way the cursor-effect lane fires none,
-    /// whichever focus the window gets.
+    /// measured once the pet is in deep sleep ([`PET_DEEP_SLEEP`], read as `pet_deep` as the window
+    /// opens). A pet asleep past its breath window takes no frame and offers no deadline, so the
+    /// cursor-effect lane fires none while its window keeps the focus and takes no event. A window
+    /// that loses the focus retires its pet, which fades back in over 0.30 s when the focus
+    /// returns (about 18 frames at a 120 Hz panel's 16.7 ms effect interval), and a pointer over
+    /// its pane heats the pet's gaze, so the scene's take decides only with no window event other
+    /// than a redraw ([`os_events_unidle`]) and a pet that asks for no frame as the window opens.
     PetAsleep,
 }
 
@@ -53,9 +57,18 @@ pub struct SpinRow {
     pub max_timer_wakes: Option<u64>,
     /// Deadline owners whose timer wakes in the window (`deadline_fires_by_owner`) the row
     /// bounds, each by its own count: the cursor-effect lane ([`EFFECT_LANE`]: the pet's frame
-    /// train and offers, and the glow's and trail's) and the stats deck's needle
-    /// ([`NEEDLE_LANE`]). An owner the row names but the metrics leave unreported passes nothing.
+    /// train and offers, and the glow's and trail's). An owner the row names but the metrics
+    /// leave unreported passes nothing.
     pub max_owner_fires: &'static [(&'static str, u64)],
+    /// Whether the row bounds the stats deck's dial needle ([`NEEDLE_LANE`]) by the frames the
+    /// app's readings owed it: its fires in the window at most the frames owed by the readings
+    /// in the window (`needle_frames_owed`) and what the episode in flight as it opened had left
+    /// to fire (`needle_episode_left`), and the wakes those fires take
+    /// ([`WAKES_PER_NEEDLE_FRAME`] each)
+    /// left out of [`Self::max_wakes`]. The dial reads the Mac's own CPU, so how far and how
+    /// often it sweeps is the machine's, and that it asks no frame its sweeps do not owe is
+    /// aterm's. A bound whose counts the metrics leave unreported passes nothing.
+    pub needle_owed: bool,
     /// Every loop wake in the window (`event_wakes`).
     pub max_wakes: u64,
 }
@@ -68,6 +81,12 @@ pub const EFFECT_LANE: &str = "cursor_effect";
 /// The deadline owner the stats deck's dial needle fires as while it sweeps to a reading.
 pub const NEEDLE_LANE: &str = "stats_needle";
 
+/// The loop wakes one needle frame takes: its deadline's timer wake and the `GpuSurfaceReady`
+/// wake its present brings. Three pet takes on 2026-10-28 counted 19, 34 and 46 needle fires
+/// beside 129, 160 and 184 wakes, as many `GpuSurfaceReady` wakes as frames: 91 or 92 wakes
+/// besides the needle's in each.
+pub const WAKES_PER_NEEDLE_FRAME: u64 = 2;
+
 /// How long the pet scene waits on a quiet prompt before its window opens: past the pet's deep
 /// sleep, which `kitty_pet.rs` begins `SLEEP_AFTER` (22 s) and `BREATH_WINDOW` (10 s) after the
 /// caret last moved (a lab instance showed it about 34 s after the last key), with room.
@@ -78,25 +97,35 @@ pub const PET_DEEP_SLEEP: Duration = Duration::from_secs(40);
 const PET_STYLE: &str = "rainbow kitty pet";
 
 /// The `trail status` fields a pet take records: the style, the focus and motion its effects saw,
-/// and the pet's state.
-const PET_FIELDS: [&str; 6] = [
+/// the pet's state, why it is in it, and its console events so far, which differ between the
+/// window's edges where an event reached the pet between them.
+const PET_FIELDS: [&str; 11] = [
     "resolved",
     "focused",
+    "motion",
     "motion_stage",
+    "shed",
     "pet_active",
     "pet_action",
+    "pet_deep",
     "pet_pose",
+    "pet_reason",
+    "pet_event_seq",
 ];
 
 /// What a pet take's `trail status` must read for its bound to decide anything: the pet drawn, in
-/// a focused window at full motion, asleep. A window without the focus moves its pet at reduced
-/// motion and asks it for no frame, so a 0 read there passes any pet.
-const PET_READY: [(&str, &str); 5] = [
+/// a focused window at full motion, in deep sleep. A window without the focus moves its pet at
+/// reduced motion and asks it for no frame, so a 0 read there passes any pet, and a pet still in
+/// its breath window (one the focus reached late: its quiet gains at most 5 s without the focus)
+/// draws its breaths and z's, as one still fading back in from a focus lost and regained draws
+/// its fade and one a pointer warmed draws its gaze (`pet_deep` reads none of them).
+const PET_READY: [(&str, &str); 6] = [
     ("resolved", "rainbow-kitty"),
     ("focused", "true"),
     ("motion_stage", "full"),
     ("pet_active", "true"),
     ("pet_action", "sleep"),
+    ("pet_deep", "true"),
 ];
 
 /// The first [`PET_READY`] field a `trail status` reply does not read as a pet take needs, as
@@ -108,10 +137,23 @@ fn pet_unready(line: &str) -> Option<String> {
         .map(|(key, _)| format!("{key}={}", field(line, key).unwrap_or("?")))
 }
 
-/// The most window events beyond its redraws a windowed take may see and still be idle: a focus
-/// or occlusion change is one or two, and a pointer over the window or a key typed into it is
-/// many, which make the take a refusal, never a finding.
+/// The most window events other than a redraw (`ctl metrics os_window_events`) a windowed take may
+/// see and still be idle: a focus or occlusion change is one or two, and a pointer over the window
+/// or a key typed into it is many, which make the take a refusal, never a finding.
 pub const MAX_OS_EVENTS: u64 = 30;
+
+/// Why `scene`'s take cannot decide after `input` window events other than a redraw, or `None`
+/// when it can: more than [`MAX_OS_EVENTS`] for a windowed scene, and any for
+/// [`SpinScene::PetAsleep`], whose pet answers each (a focus lost and regained, two events, fades
+/// it back in over 0.30 s, about 18 cursor-effect frames at a 16.7 ms effect interval; a pointer
+/// over its pane heats its gaze; a resize can move its seat).
+fn os_events_unidle(scene: SpinScene, input: u64) -> Option<&'static str> {
+    if scene == SpinScene::PetAsleep {
+        (input > 0).then_some("its pet may answer any of them")
+    } else {
+        (input > MAX_OS_EVENTS).then_some("more than an idle window takes")
+    }
+}
 
 /// A take's wall-clock limit: every wait and request on the instance ends with it.
 pub const BUDGET_SECS: u64 = 90;
@@ -135,10 +177,17 @@ pub struct SpinReport {
     /// The timer wakes in the window of each owner the row bounds
     /// ([`SpinRow::max_owner_fires`]), as the metrics read them.
     pub owner_fires: Vec<(&'static str, Option<u64>)>,
+    /// The dial's needle in the window, as the metrics read it.
+    pub needle: NeedleCounts,
+    /// A pet take's [`PET_FIELDS`] as the window opened.
+    pub pet_open: Option<String>,
     /// A pet take's [`PET_FIELDS`] at the end of the window.
     pub pet: Option<String>,
-    /// A windowed take's window events beyond its redraws (at most [`MAX_OS_EVENTS`]).
+    /// A windowed take's window events other than a redraw (at most [`MAX_OS_EVENTS`]; none for
+    /// the pet scene).
     pub os_events: Option<u64>,
+    /// A windowed take's `os_window_events_by_kind`: what those events were (`focus:2`).
+    pub os_event_kinds: Option<String>,
     /// The status reasons at the end of the window.
     pub reasons: Option<String>,
     pub verdict: ShapeVerdict,
@@ -152,8 +201,12 @@ impl std::fmt::Display for SpinReport {
             f,
             "SPIN scene={:?} window={:?} past_deadline_arms={} max_arms={} stale_arm_heals={:?} \
              frames={:?} timer_wakes={:?} max_timer_wakes={:?} wakes={:?} max_wakes={} \
-             owner_fires={:?} max_owner_fires={:?} wait_cancelled_wakes={:?} turns={:?} \
-             wakes_by_variant={:?} fires_by_owner={:?} os_events={:?} pet={:?} reasons={:?} \
+             owner_fires={:?} max_owner_fires={:?} needle_fires={:?} needle_sweeps={:?} \
+             needle_frames_owed={:?} needle_episode_left={:?} needle_owed={} \
+             wait_cancelled_wakes={:?} turns={:?} \
+             wakes_by_variant={:?} fires_by_owner={:?} os_events={:?} os_event_kinds={:?} \
+             pet_open={:?} pet={:?} \
+             reasons={:?} \
              verdict={:?} {}",
             self.row.scene,
             self.row.window,
@@ -167,11 +220,18 @@ impl std::fmt::Display for SpinReport {
             self.row.max_wakes,
             self.owner_fires,
             self.row.max_owner_fires,
+            self.needle.fires,
+            self.needle.sweeps,
+            self.needle.owed,
+            self.needle.carried,
+            self.row.needle_owed,
             self.wait_cancelled_wakes,
             self.turns,
             self.wakes_by_variant,
             self.fires_by_owner,
             self.os_events,
+            self.os_event_kinds,
+            self.pet_open,
             self.pet,
             self.reasons,
             self.verdict,
@@ -187,7 +247,19 @@ pub struct Counts<'a> {
     pub timer_wakes: Option<u64>,
     /// The timer wakes of each owner the metrics reported ([`owner_fires`]).
     pub owner_fires: &'a [(&'static str, Option<u64>)],
+    pub needle: NeedleCounts,
     pub wakes: Option<u64>,
+}
+
+/// The dial's needle in a window: its owner's fires ([`NEEDLE_LANE`]), the readings in the
+/// window that set it sweeping (`needle_sweeps`) and the frames they owed (`needle_frames_owed`),
+/// and what the episode in flight as the window opened had left to fire (`needle_episode_left`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NeedleCounts {
+    pub fires: Option<u64>,
+    pub sweeps: Option<u64>,
+    pub owed: Option<u64>,
+    pub carried: Option<u64>,
 }
 
 /// `n` within an optional bound `max`: no bound passes anything, and a bounded count that was
@@ -201,8 +273,9 @@ const fn within(max: Option<u64>, n: Option<u64>) -> bool {
 }
 
 /// The row's bounds against the window's counters: past-deadline arms, timer wakes, each
-/// bounded owner's fires ([`SpinRow::max_owner_fires`]), and every loop wake (`wakes`), which an
-/// unreported count never passes.
+/// bounded owner's fires ([`SpinRow::max_owner_fires`]), the needle's fires by the frames its
+/// readings owed ([`SpinRow::needle_owed`]), and every loop wake (`wakes`) beyond the needle's
+/// own, which an unreported count never passes.
 #[must_use]
 pub fn judge(row: &SpinRow, c: Counts<'_>) -> ShapeVerdict {
     let owners = row.max_owner_fires.iter().all(|&(owner, max)| {
@@ -213,22 +286,31 @@ pub fn judge(row: &SpinRow, c: Counts<'_>) -> ShapeVerdict {
             .and_then(|&(_, n)| n);
         within(Some(max), fired)
     });
+    // The needle's fires, once within what its readings owed; `None` past it or unreported.
+    let needle = if row.needle_owed {
+        match (c.needle.fires, c.needle.owed, c.needle.carried) {
+            (Some(fires), Some(owed), Some(carried)) if fires <= owed.saturating_add(carried) => {
+                Some(fires)
+            }
+            _ => None,
+        }
+    } else {
+        Some(0)
+    };
+    let wakes = needle.and_then(|fires| {
+        c.wakes
+            .map(|n| n.saturating_sub(fires.saturating_mul(WAKES_PER_NEEDLE_FRAME)))
+    });
     if c.arms <= row.max_arms
         && within(row.max_timer_wakes, c.timer_wakes)
         && owners
-        && within(Some(row.max_wakes), c.wakes)
+        && needle.is_some()
+        && within(Some(row.max_wakes), wakes)
     {
         ShapeVerdict::Pass
     } else {
         ShapeVerdict::Fail
     }
-}
-
-/// `root`'s booked turns in a `metrics percentiles` line's `turns_by_root` (`root:n/p50/p95/p99`
-/// pairs); 0 for a root that booked none.
-#[must_use]
-pub fn root_turns(line: &str, root: &str) -> Option<u64> {
-    pair_count(line, "turns_by_root", root)
 }
 
 /// `owner`'s timer wakes in a `metrics` line's `deadline_fires_by_owner` (`owner:n` pairs); 0 for
@@ -254,6 +336,52 @@ fn pair_count(line: &str, key: &str, name: &str) -> Option<u64> {
     )
 }
 
+/// `owner`'s timer wakes between the `ctl metrics` lines read as the window `opened` and as it
+/// `ended`; `None` where either does not report them.
+#[must_use]
+pub fn fires_between(opened: &str, ended: &str, owner: &str) -> Option<u64> {
+    Some(owner_fires(ended, owner)?.saturating_sub(owner_fires(opened, owner)?))
+}
+
+/// The needle's counts in the window, from the `ctl metrics` lines read as it `opened` and as it
+/// `ended`: its fires, sweeps and owed frames between the two, and what the episode in flight had
+/// left as it opened.
+#[must_use]
+pub fn needle_counts(opened: &str, ended: &str) -> NeedleCounts {
+    let between =
+        |key: &str| Some(uint_field(ended, key)?.saturating_sub(uint_field(opened, key)?));
+    NeedleCounts {
+        fires: fires_between(opened, ended, NEEDLE_LANE),
+        sweeps: between("needle_sweeps"),
+        owed: between("needle_frames_owed"),
+        carried: uint_field(opened, "needle_episode_left"),
+    }
+}
+
+/// The pet scene's [`PET_FIELDS`] as its window `edge` (opened, ended), refusing the take where
+/// its `trail status` does not read a focused window's deeply sleeping pet at full motion
+/// ([`PET_READY`]): a pet that is awake, still breathing or still fading in as the window opens
+/// fires frames the scene does not measure.
+fn pet_take(ctl: &Ctl, edge: &str) -> Result<String, CouldNotRun> {
+    let trail = ctl.call(&["trail", "status"]);
+    if !trail.ok() {
+        return could_not_run(format!(
+            "the pet scene's window did not hold the focus as its window {edge}, so its pet asked \
+             for nothing (trail status: {} {})",
+            trail.stdout.trim(),
+            trail.stderr.trim()
+        ));
+    }
+    let fields = pet_fields(&trail.stdout);
+    if let Some(off) = pet_unready(&trail.stdout) {
+        return could_not_run(format!(
+            "the pet scene's window read {off} as its window {edge}, not a focused window's \
+             deeply sleeping pet at full motion ({fields})"
+        ));
+    }
+    Ok(fields)
+}
+
 /// The [`PET_FIELDS`] of a `trail status` reply, space-separated.
 fn pet_fields(line: &str) -> String {
     PET_FIELDS
@@ -267,9 +395,10 @@ fn pet_fields(line: &str) -> String {
 /// # Errors
 /// [`CouldNotRun`] when the instance did not start, a counter is missing, the
 /// claude scene was not the shape it claims (off the alt screen, or its output
-/// moved the grid), the window took more than [`MAX_OS_EVENTS`] events
-/// beyond its redraws (a person's pointer or keys: not idle), or the pet scene's
-/// window was not a focused window's sleeping pet at full motion ([`PET_READY`]).
+/// moved the grid), the window took more than [`MAX_OS_EVENTS`] events other than
+/// a redraw (a person's pointer or keys: not idle) or the pet scene's took any
+/// ([`os_events_unidle`]), or the pet scene's window was not a focused window's
+/// deeply sleeping pet at full motion ([`PET_READY`]) as it opened or as it ended.
 pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
     let _one = super::ONE_TAKE
         .lock()
@@ -318,8 +447,20 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
         }
     }
     ctl.ok(&["metrics", "reset"])?;
-    let before = ctl
-        .field(&["metrics"], "past_deadline_arms")?
+    // Window events count from the reset, and the owners' fires from the metrics read after the
+    // pet: what an event before the reset left the pet doing (its fade back in, its gaze's heat)
+    // either reads here as a pet asking for frames or ended before the fires' count opened. The
+    // read's own wake lands in the window, which its wake bound has room for.
+    let pet_open = if row.scene == SpinScene::PetAsleep {
+        Some(pet_take(ctl, "opened")?)
+    } else {
+        None
+    };
+    let opened = ctl.ok(&["metrics"])?;
+    let before = field(&opened, "past_deadline_arms")
+        .ok_or_else(|| {
+            CouldNotRun::Unanswered("ctl metrics does not report past_deadline_arms".into())
+        })?
         .parse::<u64>()
         .map_err(|_| CouldNotRun::Refused("past_deadline_arms is not a count".into()))?;
     if row.scene == SpinScene::ClaudeShaped {
@@ -352,41 +493,25 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
         }
     }
     let metrics = ctl.ok(&["metrics"])?;
-    let mut pet = None;
-    if row.scene == SpinScene::PetAsleep {
-        let trail = ctl.call(&["trail", "status"]);
-        if !trail.ok() {
-            return could_not_run(format!(
-                "the pet scene's window never held the focus, so its pet asked for nothing \
-                 (trail status: {} {})",
-                trail.stdout.trim(),
-                trail.stderr.trim()
-            ));
-        }
-        let fields = pet_fields(&trail.stdout);
-        if let Some(off) = pet_unready(&trail.stdout) {
-            return could_not_run(format!(
-                "the pet scene's window read {off}, not a focused window's sleeping pet at full \
-                 motion ({fields})"
-            ));
-        }
-        pet = Some(fields);
-    }
+    let pet = if row.scene == SpinScene::PetAsleep {
+        Some(pet_take(ctl, "ended")?)
+    } else {
+        None
+    };
     let mut os_events = None;
+    let mut os_event_kinds = None;
     if row.scene.windowed() {
-        let roots = ctl.ok(&["metrics", "percentiles"])?;
-        let events = root_turns(&roots, "window_event").ok_or_else(|| {
-            CouldNotRun::Unanswered("ctl metrics percentiles does not report turns_by_root".into())
+        let input = uint_field(&metrics, "os_window_events").ok_or_else(|| {
+            CouldNotRun::Unanswered("ctl metrics does not report os_window_events".into())
         })?;
-        let redraws = uint_field(&metrics, "redraw_attempts").ok_or_else(|| {
-            CouldNotRun::Unanswered("ctl metrics does not report redraw_attempts".into())
-        })?;
-        let input = events.saturating_sub(redraws);
+        let kinds = field(&metrics, "os_window_events_by_kind");
         os_events = Some(input);
-        if input > MAX_OS_EVENTS {
+        os_event_kinds = kinds.map(str::to_string);
+        if let Some(why) = os_events_unidle(row.scene, input) {
+            let events = if input == 1 { "event" } else { "events" };
             return could_not_run(format!(
-                "the window took {input} events beyond its {redraws} redraws in {:?} ({events} \
-                 window_event turns): a pointer or keys reached it, so it was not idle",
+                "the window took {input} {events} other than a redraw ({}) in {:?}: {why}",
+                kinds.unwrap_or("kinds unreported"),
                 row.window
             ));
         }
@@ -405,10 +530,16 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
     let fired: Vec<(&'static str, Option<u64>)> = row
         .max_owner_fires
         .iter()
-        .map(|&(owner, _)| (owner, owner_fires(&metrics, owner)))
+        .map(|&(owner, _)| (owner, fires_between(&opened, &metrics, owner)))
         .collect();
     if fired.iter().any(|(_, n)| n.is_none()) {
         return unanswered("ctl metrics does not report deadline_fires_by_owner");
+    }
+    let needle = needle_counts(&opened, &metrics);
+    if row.needle_owed && (needle.owed.is_none() || needle.carried.is_none()) {
+        return unanswered(
+            "ctl metrics does not report needle_frames_owed and needle_episode_left",
+        );
     }
     let arms = after.saturating_sub(before);
     Ok(SpinReport {
@@ -422,8 +553,10 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
         turns: uint_field(&metrics, "turns"),
         wakes_by_variant: field(&metrics, "wakes_by_variant").map(str::to_string),
         fires_by_owner: field(&metrics, "deadline_fires_by_owner").map(str::to_string),
+        pet_open,
         pet,
         os_events,
+        os_event_kinds,
         reasons,
         verdict: judge(
             row,
@@ -431,10 +564,12 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
                 arms,
                 timer_wakes,
                 owner_fires: &fired,
+                needle,
                 wakes,
             },
         ),
         owner_fires: fired,
+        needle,
         checks: super::instance::replay_checks(ctl),
     })
 }
@@ -449,13 +584,16 @@ mod tests {
         max_arms: 100,
         max_timer_wakes: Some(12),
         max_owner_fires: &[],
+        needle_owed: false,
         max_wakes: 400,
     };
 
     const PET: SpinRow = SpinRow {
         scene: SpinScene::PetAsleep,
         max_timer_wakes: None,
-        max_owner_fires: &[(EFFECT_LANE, 0), (NEEDLE_LANE, 20)],
+        max_owner_fires: &[(EFFECT_LANE, 0)],
+        needle_owed: true,
+        max_wakes: 200,
         ..CLAUDE
     };
 
@@ -464,7 +602,28 @@ mod tests {
             arms,
             timer_wakes,
             owner_fires: &[],
+            needle: NeedleCounts {
+                fires: Some(0),
+                sweeps: Some(0),
+                owed: Some(0),
+                carried: Some(0),
+            },
             wakes,
+        }
+    }
+
+    /// A pet take whose needle fired `fires` times against the frames its window's readings owed
+    /// and what the episode in flight as it opened had left, among `wakes` loop wakes.
+    const fn needle(fires: u64, (owed, carried): (u64, u64), wakes: u64) -> Counts<'static> {
+        Counts {
+            owner_fires: &[(EFFECT_LANE, Some(0))],
+            needle: NeedleCounts {
+                fires: Some(fires),
+                sweeps: None,
+                owed: Some(owed),
+                carried: Some(carried),
+            },
+            ..counts(0, None, Some(wakes))
         }
     }
 
@@ -509,13 +668,13 @@ mod tests {
 
     #[test]
     fn a_sleeping_pets_lane_fails_its_row_on_one_fire_or_none_reported() {
-        let calm = [(EFFECT_LANE, Some(0)), (NEEDLE_LANE, Some(0))];
+        let calm = [(EFFECT_LANE, Some(0))];
         let quiet = Counts {
             owner_fires: &calm,
             ..counts(0, Some(20), Some(80))
         };
         assert_eq!(judge(&PET, quiet), ShapeVerdict::Pass);
-        let pet = [(EFFECT_LANE, Some(1)), (NEEDLE_LANE, Some(0))];
+        let pet = [(EFFECT_LANE, Some(1))];
         assert_eq!(
             judge(
                 &PET,
@@ -527,7 +686,7 @@ mod tests {
             ShapeVerdict::Fail,
             "a pet that fires in deep sleep, under every other bound"
         );
-        let unread = [(EFFECT_LANE, None), (NEEDLE_LANE, Some(0))];
+        let unread = [(EFFECT_LANE, None)];
         assert_eq!(
             judge(
                 &PET,
@@ -545,59 +704,123 @@ mod tests {
         );
     }
 
-    /// The pet row bounds the dial's needle as well as the pet: a quiet machine's drift and one
-    /// real swing pass it, and a needle that asks more frames than that (three or more at each
-    /// of the window's ten readings) fails it under every other bound, as a needle lane the
-    /// metrics leave out does.
+    /// The pet row bounds the dial's needle by the frames its readings owed, which the Mac's
+    /// load sets: a busy take passes where its readings owed its fires, as does an episode in
+    /// flight as the window opened, and the wakes the needle's fires take are its own. A needle
+    /// that fires one frame more than its readings owed fails under every other bound, as a wake
+    /// beyond the needle's own does, and as an unreported count does; the sweeps alone are a
+    /// record, not a bound.
     #[test]
-    fn a_needle_past_a_quiet_machines_drift_fails_the_pet_row() {
-        let calm = [(EFFECT_LANE, Some(0)), (NEEDLE_LANE, Some(3))];
-        let quiet = Counts {
-            owner_fires: &calm,
-            ..counts(0, Some(45), Some(98))
-        };
-        assert_eq!(judge(&PET, quiet), ShapeVerdict::Pass);
-        let swing = [(EFFECT_LANE, Some(0)), (NEEDLE_LANE, Some(20))];
-        assert_eq!(
-            judge(
-                &PET,
-                Counts {
-                    owner_fires: &swing,
-                    ..quiet
-                }
+    fn the_pet_row_bounds_the_needle_by_the_frames_its_readings_owed() {
+        for (what, c, verdict) in [
+            ("a quiet take", needle(0, (0, 0), 92), ShapeVerdict::Pass),
+            (
+                "a quiet take's drift",
+                needle(3, (3, 0), 98),
+                ShapeVerdict::Pass,
             ),
-            ShapeVerdict::Pass,
-            "drift and one swing"
-        );
-        for needle in [Some(21), Some(30), None] {
-            let fired = [(EFFECT_LANE, Some(0)), (NEEDLE_LANE, needle)];
+            (
+                "a busy Mac's take",
+                needle(46, (51, 0), 184),
+                ShapeVerdict::Pass,
+            ),
+            (
+                "an episode in flight",
+                needle(46, (30, 16), 184),
+                ShapeVerdict::Pass,
+            ),
+            (
+                "one frame past",
+                needle(47, (30, 16), 186),
+                ShapeVerdict::Fail,
+            ),
+            (
+                "a needle that owes nothing",
+                needle(1, (0, 0), 94),
+                ShapeVerdict::Fail,
+            ),
+            (
+                "its own two wakes a frame",
+                needle(20, (20, 0), 240),
+                ShapeVerdict::Pass,
+            ),
+            (
+                "one wake beyond them",
+                needle(20, (20, 0), 241),
+                ShapeVerdict::Fail,
+            ),
+        ] {
+            assert_eq!(judge(&PET, c), verdict, "{what}");
+        }
+        let busy = needle(46, (51, 0), 184);
+        for unread in [
+            NeedleCounts {
+                fires: None,
+                ..busy.needle
+            },
+            NeedleCounts {
+                owed: None,
+                ..busy.needle
+            },
+            NeedleCounts {
+                carried: None,
+                ..busy.needle
+            },
+        ] {
             assert_eq!(
                 judge(
                     &PET,
                     Counts {
-                        owner_fires: &fired,
-                        ..quiet
+                        needle: unread,
+                        ..busy
                     }
                 ),
                 ShapeVerdict::Fail,
-                "{needle:?} needle fires"
+                "{unread:?}"
             );
         }
+        assert_eq!(
+            judge(
+                &CLAUDE,
+                Counts {
+                    needle: NeedleCounts {
+                        fires: Some(100),
+                        owed: Some(100),
+                        ..busy.needle
+                    },
+                    ..counts(0, Some(5), Some(401))
+                }
+            ),
+            ShapeVerdict::Fail,
+            "a row that bounds no needle leaves none of its wakes out"
+        );
+        let opened = "OK past_deadline_arms=3 deadline_fires_by_owner=stats_needle:2 \
+                      needle_sweeps=1 needle_frames_owed=8 needle_episode_left=6";
+        let ended = "OK past_deadline_arms=3 deadline_fires_by_owner=stats_live:30,stats_needle:11 \
+                     needle_sweeps=2 needle_frames_owed=20 needle_episode_left=0";
+        assert_eq!(
+            needle_counts(opened, ended),
+            NeedleCounts {
+                fires: Some(9),
+                sweeps: Some(1),
+                owed: Some(12),
+                carried: Some(6),
+            },
+            "what was left as the window opened, the rest between its edges"
+        );
+        assert_eq!(
+            needle_counts("OK", ended),
+            NeedleCounts::default(),
+            "an opening read that reports nothing leaves every count unreported"
+        );
+        assert_eq!(
+            fires_between("OK deadline_fires_by_owner=none", ended, EFFECT_LANE),
+            Some(0)
+        );
         let line = "OK timer_wakes=46 deadline_fires_by_owner=stats_live:30,stats_needle:4,\
                     system_vitals:10 wakes_by_variant=none";
         assert_eq!(owner_fires(line, NEEDLE_LANE), Some(4));
         assert_eq!(owner_fires(line, EFFECT_LANE), Some(0));
-    }
-
-    #[test]
-    fn a_roots_turns_are_read_from_its_pair_and_an_absent_root_booked_none() {
-        let line = "OK n_input=0 turns_by_root=window_event:161/3.93/10.49/11.53,\
-                    user_event:171/0.02/0.02/0.03,new_events:331/0.07/0.23/0.33 n_render=161";
-        assert_eq!(root_turns(line, "window_event"), Some(161));
-        assert_eq!(root_turns(line, "new_events"), Some(331));
-        assert_eq!(root_turns(line, "modal"), Some(0));
-        assert_eq!(root_turns("OK turns_by_root=none", "window_event"), Some(0));
-        assert_eq!(root_turns("OK n_input=0", "window_event"), None);
     }
 
     #[test]
@@ -621,7 +844,8 @@ mod tests {
     #[test]
     fn a_pet_take_decides_only_for_a_focused_windows_sleeping_pet_at_full_motion() {
         let ready = "OK 1\ntrail style=\"rainbow kitty pet\" resolved=rainbow-kitty focused=true \
-                     motion=full motion_stage=full pet_active=true pet_action=sleep pet_pose=sleep_0";
+                     motion=full motion_stage=full pet_active=true pet_action=sleep \
+                     pet_deep=true pet_pose=sleep_0";
         assert_eq!(pet_unready(ready), None);
         for (from, to, off) in [
             ("resolved=rainbow-kitty", "resolved=comet", "resolved=comet"),
@@ -634,6 +858,7 @@ mod tests {
             ("pet_active=true", "pet_active=false", "pet_active=false"),
             ("pet_action=sleep", "pet_action=loaf", "pet_action=loaf"),
             (" pet_action=sleep", "", "pet_action=?"),
+            ("pet_deep=true", "pet_deep=false", "pet_deep=false"),
         ] {
             assert_eq!(
                 pet_unready(&ready.replacen(from, to, 1)).as_deref(),
@@ -644,13 +869,29 @@ mod tests {
     }
 
     #[test]
+    fn a_pet_take_decides_only_with_no_window_event_its_pet_would_answer() {
+        assert!(
+            os_events_unidle(SpinScene::PetAsleep, 2).is_some(),
+            "a focus lost and regained fades the pet back in"
+        );
+        assert!(
+            os_events_unidle(SpinScene::PetAsleep, 1).is_some(),
+            "one event is any"
+        );
+        assert_eq!(os_events_unidle(SpinScene::PetAsleep, 0), None);
+        // CONTROL: the bare windowed scene keeps its allowance.
+        assert_eq!(os_events_unidle(SpinScene::Windowed, 2), None);
+        assert!(os_events_unidle(SpinScene::Windowed, MAX_OS_EVENTS + 1).is_some());
+    }
+
+    #[test]
     fn a_pet_takes_record_names_each_field_and_marks_one_the_reply_lacks() {
         let reply = "OK 1\ntrail style=\"rainbow kitty pet\" resolved=rainbow-kitty focused=true \
                      motion=full motion_stage=full pet_active=true pet_action=sleep";
         assert_eq!(
             pet_fields(reply),
-            "resolved=rainbow-kitty focused=true motion_stage=full pet_active=true \
-             pet_action=sleep pet_pose=?"
+            "resolved=rainbow-kitty focused=true motion=full motion_stage=full shed=? \
+             pet_active=true pet_action=sleep pet_deep=? pet_pose=? pet_reason=? pet_event_seq=?"
         );
     }
 }

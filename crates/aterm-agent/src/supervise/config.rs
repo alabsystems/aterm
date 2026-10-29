@@ -50,6 +50,7 @@ pub const KEYS: &[&str] = &[
     "usage_tap",
     "usage_notes",
     "usage_credits",
+    "claim_credits",
     "logins",
     "hosts",
     "model_fallback",
@@ -295,7 +296,7 @@ pub struct SupervisorConfig {
     /// reply cut off, the server), never with an ask, but for agy's non-retryable 4xx, which go
     /// to a person.
     pub retry_api_errors: bool,
-    /// Let the window's host probe API reachability (`api.anthropic.com` TLS handshake) while a session waits on a network API error.
+    /// Let the window's host probe API reachability (`api.anthropic.com` TLS handshake) while a session waits on a network API error, and watch this Mac's network path and routes (local subscriptions, no traffic), so a lost path holds that wait, for every agent, for up to an hour, and its return or a route change wakes it. Off: the host reads neither, and the wait keeps its retry ladder.
     pub probe_api: bool,
     /// Continue once a session or weekly usage limit has reset.
     pub resume_limits: bool,
@@ -315,6 +316,8 @@ pub struct SupervisorConfig {
     pub usage_notes: bool,
     /// CONTINUING ON USAGE CREDITS: off by default, so a session stays on its subscription; `true` lets the harness carry a session onto paid usage credits.
     pub usage_credits: bool,
+    /// CLAIMING THE FREE CREDITS CLAUDE CODE OFFERS (`crate::harness::credit_offers`): on by default (the owner, 2026-10-26: *"the harness should do this"*), a window's host starts one worker that claims a live offer in the person's own Chrome, never buying, never turning extra usage on; `false` is a limit.
+    pub claim_credits: bool,
     /// THE LOGIN LIFECYCLE (`[harness] logins`, `"renew"` or `"off"`; `docs/DESIGN-claude-accounts-v2-2026-10-15.md` §5).
     pub logins: bool,
     /// The machines `aterm harness accounts renew --due` renews on in one sitting and `aterm ai doctor --fleet` runs on, over SSH (`host` or `host:/abs/path/to/aterm`).
@@ -478,6 +481,7 @@ impl Default for SupervisorConfig {
             usage_tap: true,
             usage_notes: false,
             usage_credits: false,
+            claim_credits: true,
             logins: true,
             hosts: Vec::new(),
             model_fallback: Some("opus".to_string()),
@@ -549,6 +553,7 @@ impl SupervisorConfig {
             "usage_tap" => switch!(usage_tap),
             "usage_notes" => switch!(usage_notes),
             "usage_credits" => switch!(usage_credits),
+            "claim_credits" => switch!(claim_credits),
             "compact_on_context_wall" => switch!(compact_on_context_wall),
             "relaunch" => switch!(relaunch),
             "upgrade" => switch!(upgrade),
@@ -765,6 +770,7 @@ impl SupervisorConfig {
             "usage_tap" => self.usage_tap = false,
             "usage_notes" => self.usage_notes = false,
             "usage_credits" => self.usage_credits = false,
+            "claim_credits" => self.claim_credits = false,
             "model_fallback" => self.model_fallback = None,
             "compact_on_context_wall" => self.compact_on_context_wall = false,
             "relaunch" => self.relaunch = false,
@@ -848,123 +854,262 @@ impl SupervisorConfig {
     /// The reader of aterm.toml's `[harness]` table.
     #[must_use]
     pub fn from_aterm_toml(text: &str) -> (Self, Vec<String>) {
+        match aterm_toml::from_str::<aterm_toml::Value>(text) {
+            Ok(doc) => Self::from_doc_and_text(&doc, text),
+            Err(e) => Self::from_invalid_aterm_toml(text, &e.to_string()),
+        }
+    }
+
+    pub(crate) fn from_parsed_aterm_toml(
+        doc: Option<&aterm_toml::Value>,
+        text: &str,
+    ) -> (Self, Vec<String>) {
+        match doc {
+            Some(doc) => Self::from_doc_and_text(doc, text),
+            None => Self::from_aterm_toml(text),
+        }
+    }
+
+    fn from_doc_and_text(doc: &aterm_toml::Value, text: &str) -> (Self, Vec<String>) {
         let mut cfg = Self::default();
         let mut notes = Vec::new();
-        match aterm_toml::from_str::<aterm_toml::Value>(text) {
-            Ok(doc) => {
-                if let Some(h) = doc.get("harness").filter(|h| h.as_table().is_none()) {
-                    if one_value_text(h).is_some_and(|t| spells_off(&t)) {
-                        cfg.enabled = false;
-                        notes.push(
-                            "harness: written off itself — the master switch is off (write \
-                             `enabled = false` under [harness])"
-                                .to_string(),
-                        );
-                    } else {
-                        notes.push(format!(
-                            "harness: not a table (a TOML {}) — ignored",
-                            h.type_str()
-                        ));
-                    }
-                }
-                let mut misplaced = Vec::new();
-                harness_tables(&doc, String::new(), &mut misplaced);
-                let root = doc.get("harness").and_then(aterm_toml::Value::as_table);
-                let (retired, current): (Vec<_>, Vec<_>) = root
-                    .map(entries)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .partition(|(key, _)| RETIRED_KEYS.contains(&key.as_str()));
-                let disk_notes: Vec<String> = crate::harness::cli::disk_faults(text)
-                    .into_iter()
-                    .filter(|f| f.path == "harness.disk" || f.path.starts_with("harness.disk."))
-                    .map(|f| f.note)
-                    .collect();
-                for (key, value) in current.into_iter().chain(retired) {
-                    if key == "disk" && !disk_notes.is_empty() {
-                        notes.extend(disk_notes.iter().cloned());
-                        continue;
-                    }
-                    if let Err(e) = cfg.set_value(&key, value) {
-                        notes.push(e);
-                    }
-                }
-                for (at, table) in misplaced {
-                    for (key, value) in entries(table) {
-                        let before = cfg.clone();
-                        let refused = cfg.set_value(&key, value).err();
-                        let limits = cfg.limits(&before);
-                        if !limits {
-                            cfg = before;
-                        }
-                        notes.push(misplaced_note(&at, &key, limits, refused));
-                    }
-                }
-                let mut scalars = Vec::new();
-                harness_scalars(&doc, String::new(), &mut scalars);
-                for (at, value) in scalars {
-                    if one_value_text(value).is_some_and(|t| spells_off(&t)) {
-                        cfg.enabled = false;
-                        notes.push(misplaced_note(&at, "enabled", true, None));
-                    }
+        if let Some(h) = doc.get("harness").filter(|h| h.as_table().is_none()) {
+            if one_value_text(h).is_some_and(|t| spells_off(&t)) {
+                cfg.enabled = false;
+                notes.push(
+                    "harness: written off itself — the master switch is off (write \
+                     `enabled = false` under [harness])"
+                        .to_string(),
+                );
+            } else {
+                notes.push(format!(
+                    "harness: not a table (a TOML {}) — ignored",
+                    h.type_str()
+                ));
+            }
+        }
+        let mut misplaced = Vec::new();
+        harness_tables(doc, String::new(), &mut misplaced);
+        let root = doc.get("harness").and_then(aterm_toml::Value::as_table);
+        let (retired, current): (Vec<_>, Vec<_>) = root
+            .map(entries)
+            .unwrap_or_default()
+            .into_iter()
+            .partition(|(key, _)| RETIRED_KEYS.contains(&key.as_str()));
+        let mut disk_notes: Option<Vec<String>> = None;
+        for (key, value) in current.into_iter().chain(retired) {
+            if key == "disk" {
+                let dn = disk_notes.get_or_insert_with(|| {
+                    crate::harness::cli::disk_faults(text)
+                        .into_iter()
+                        .filter(|f| f.path == "harness.disk" || f.path.starts_with("harness.disk."))
+                        .map(|f| f.note)
+                        .collect()
+                });
+                if !dn.is_empty() {
+                    notes.extend(dn.iter().cloned());
+                    continue;
                 }
             }
-            Err(e) => {
-                notes.push(format!(
-                    "aterm.toml is not valid TOML ({}); its [harness] lines were read one by one",
-                    e.to_string().lines().next().unwrap_or("").trim()
-                ));
-                let mut seen: Vec<String> = Vec::new();
-                let (retired, current): (Vec<_>, Vec<_>) =
-                    assignments(text).into_iter().partition(|(path, _)| {
-                        path.last().is_some_and(|key| RETIRED_KEYS.contains(key))
-                    });
-                for (path, value) in current.into_iter().chain(retired) {
-                    let (head, key, one_value): (&[&str], String, String) = match path.as_slice() {
-                        [head @ .., "harness"] if !value.trim_start().starts_with(['[', '{']) => {
-                            if !spells_off(&unquote(value)) {
-                                continue;
+            if let Err(e) = cfg.set_value(&key, value) {
+                notes.push(e);
+            }
+        }
+        for (at, table) in misplaced {
+            for (key, value) in entries(table) {
+                let before = cfg.clone();
+                let refused = cfg.set_value(&key, value).err();
+                let limits = cfg.limits(&before);
+                if !limits {
+                    cfg = before;
+                }
+                notes.push(misplaced_note(&at, &key, limits, refused));
+            }
+        }
+        let mut scalars = Vec::new();
+        harness_scalars(doc, String::new(), &mut scalars);
+        for (at, value) in scalars {
+            if one_value_text(value).is_some_and(|t| spells_off(&t)) {
+                cfg.enabled = false;
+                notes.push(misplaced_note(&at, "enabled", true, None));
+            }
+        }
+        if let Some(swarm) = doc.get("swarm") {
+            match swarm.as_table() {
+                Some(swarm) => {
+                    for (key, value) in entries(swarm) {
+                        if key == "enabled" {
+                            match value.as_bool() {
+                                Some(false) => {
+                                    cfg.accounts = crate::harness::accounts::Mode::Off;
+                                }
+                                Some(true) => {}
+                                None if one_value_text(value).is_some_and(|t| spells_off(&t)) => {
+                                    cfg.accounts = crate::harness::accounts::Mode::Off;
+                                    notes.push(
+                                        "swarm.enabled: expected a boolean (true or false); \
+                                         read as false"
+                                            .to_string(),
+                                    );
+                                }
+                                None => notes.push(
+                                    "swarm.enabled: expected a boolean (true or false)".to_string(),
+                                ),
                             }
-                            (head, "enabled".to_string(), "false".to_string())
+                        } else {
+                            notes.push(format!("swarm.{key}: unknown key — ignored"));
                         }
-                        [head @ .., "harness", key] => (head, key.to_string(), unquote(value)),
-                        [head @ .., "harness", agent, key] if agent_named(agent).is_some() => {
-                            (head, format!("{agent}.{key}"), unquote(value))
-                        }
-                        _ => continue,
-                    };
-                    let key = key.as_str();
-                    let quoted = value.trim_start().starts_with(['"', '\'']);
-                    let before = cfg.clone();
-                    let list = matches!(key, "trust_roots" | "hosts" | "limit_reset_kinds");
-                    let refused = if value.trim_start().starts_with('[') && !list {
-                        Some(no_shape(key, "array"))
-                    } else {
-                        cfg.set_scalar(key, &one_value, quoted || list).err()
-                    };
-                    let limits = cfg.limits(&before);
-                    let repeat = head.is_empty() && seen.iter().any(|k| k == key);
-                    if head.is_empty() {
-                        seen.push(key.to_string());
-                    }
-                    if !(limits || head.is_empty() && !repeat) {
-                        cfg = before;
-                    }
-                    if !head.is_empty() {
-                        let at = head.join(".").replace(".[]", "[]");
-                        notes.push(misplaced_note(&at, key, limits, refused));
-                    } else if repeat && !limits {
-                        notes.push(format!(
-                            "harness.{key}: said again below; a repeat may only limit, so it \
-                             changed nothing"
-                        ));
-                    } else {
-                        notes.extend(refused);
                     }
                 }
+                None if one_value_text(swarm).is_some_and(|t| spells_off(&t)) => {
+                    cfg.accounts = crate::harness::accounts::Mode::Off;
+                    notes.push(
+                        "swarm: written off itself — write `enabled = false` under [swarm]"
+                            .to_string(),
+                    );
+                }
+                None => notes.push(format!(
+                    "swarm: not a table (a TOML {}) — ignored",
+                    swarm.type_str()
+                )),
             }
         }
         (cfg, notes)
+    }
+
+    fn from_invalid_aterm_toml(text: &str, err_msg: &str) -> (Self, Vec<String>) {
+        let mut cfg = Self::default();
+        let mut notes = vec![format!(
+            "aterm.toml is not valid TOML ({}); its [harness] lines were read one by one",
+            err_msg.lines().next().unwrap_or("").trim()
+        )];
+        let mut seen: Vec<String> = Vec::new();
+        let (retired, current): (Vec<_>, Vec<_>) = assignments(text)
+            .into_iter()
+            .partition(|(path, _)| path.last().is_some_and(|key| RETIRED_KEYS.contains(key)));
+        for (path, value) in current.into_iter().chain(retired) {
+            let (head, key, one_value): (&[&str], String, String) = match path.as_slice() {
+                [head @ .., "harness"] if !value.trim_start().starts_with(['[', '{']) => {
+                    if !spells_off(&unquote(value)) {
+                        continue;
+                    }
+                    (head, "enabled".to_string(), "false".to_string())
+                }
+                [head @ .., "harness", key] => (head, key.to_string(), unquote(value)),
+                [head @ .., "harness", agent, key] if agent_named(agent).is_some() => {
+                    (head, format!("{agent}.{key}"), unquote(value))
+                }
+                [head @ .., "swarm"] | [head @ .., "swarm", "enabled"]
+                    if !value.trim_start().starts_with(['[', '{'])
+                        && spells_off(&unquote(value)) =>
+                {
+                    (head, "accounts".to_string(), "off".to_string())
+                }
+                _ => continue,
+            };
+            let key = key.as_str();
+            let quoted = value.trim_start().starts_with(['"', '\'']);
+            let before = cfg.clone();
+            let list = matches!(key, "trust_roots" | "hosts" | "limit_reset_kinds");
+            let refused = if value.trim_start().starts_with('[') && !list {
+                Some(no_shape(key, "array"))
+            } else {
+                cfg.set_scalar(key, &one_value, quoted || list).err()
+            };
+            let limits = cfg.limits(&before);
+            let repeat = head.is_empty() && seen.iter().any(|k| k == key);
+            if head.is_empty() {
+                seen.push(key.to_string());
+            }
+            if !(limits || head.is_empty() && !repeat) {
+                cfg = before;
+            }
+            if !head.is_empty() {
+                let at = head.join(".").replace(".[]", "[]");
+                notes.push(misplaced_note(&at, key, limits, refused));
+            } else if repeat && !limits {
+                notes.push(format!(
+                    "harness.{key}: said again below; a repeat may only limit, so it \
+                     changed nothing"
+                ));
+            } else {
+                notes.extend(refused);
+            }
+        }
+        (cfg, notes)
+    }
+
+    /// What in aterm.toml's `text` turns account rotation off (leaves [`Self::accounts`] at
+    /// [`crate::harness::accounts::Mode::Off`]), in the order [`Self::from_aterm_toml`] reads
+    /// it: `[harness] accounts`, an `accounts` in a `harness` table filed below another table's
+    /// header, and the `[swarm]` switch. Empty where none does.
+    ///
+    /// # Errors
+    ///
+    /// Where `text` is not valid TOML, whose lines [`Self::from_aterm_toml`] reads one by one (its
+    /// notes say what each did): where the parser stopped and why, on one line (`TOML error at
+    /// line 3, column 8: …`).
+    pub fn accounts_off_by(text: &str) -> Result<Vec<AccountsOff>, String> {
+        let doc = aterm_toml::from_str::<aterm_toml::Value>(text).map_err(|why| {
+            let at = why.log_words().to_string();
+            match crate::supervise::limit::one_line(why.message_text()) {
+                reason if reason.is_empty() => at,
+                reason => format!("{at}: {reason}"),
+            }
+        })?;
+        let turns_off = |value: &aterm_toml::Value| {
+            let mut cfg = Self::default();
+            // A refused value may still read as its limit, off.
+            let _ = cfg.set_value("accounts", value);
+            cfg.accounts == crate::harness::accounts::Mode::Off
+        };
+        let mut off = Vec::new();
+        if let Some(value) = doc
+            .get("harness")
+            .and_then(aterm_toml::Value::as_table)
+            .and_then(|harness| harness.get("accounts"))
+            && turns_off(value)
+        {
+            off.push(AccountsOff::Harness(written(value)));
+        }
+        let mut misplaced = Vec::new();
+        harness_tables(&doc, String::new(), &mut misplaced);
+        for (at, table) in misplaced {
+            if let Some(value) = table.get("accounts")
+                && turns_off(value)
+            {
+                off.push(AccountsOff::Misplaced {
+                    at,
+                    value: written(value),
+                });
+            }
+        }
+        // As the reader takes the switch: `false`, or a word that spells off.
+        let swarm_off = |v: &aterm_toml::Value| {
+            v.as_bool().map_or_else(
+                || one_value_text(v).is_some_and(|t| spells_off(&t)),
+                |on| !on,
+            )
+        };
+        if let Some(swarm) = doc.get("swarm") {
+            match swarm.as_table() {
+                Some(table) => {
+                    if let Some(enabled) = table.get("enabled")
+                        && swarm_off(enabled)
+                    {
+                        off.push(AccountsOff::Swarm(format!(
+                            "[swarm] enabled = {}",
+                            written(enabled)
+                        )));
+                    }
+                }
+                None if swarm_off(swarm) => {
+                    off.push(AccountsOff::Swarm(format!("swarm = {}", written(swarm))));
+                }
+                None => {}
+            }
+        }
+        Ok(off)
     }
 
     /// [`Self::from_aterm_toml`] over the file at `path`: no path or no file is the defaults.
@@ -1059,6 +1204,7 @@ impl SupervisorConfig {
             && no_more(self.usage_tap, before.usage_tap)
             && no_more(self.usage_notes, before.usage_notes)
             && no_more(self.usage_credits, before.usage_credits)
+            && no_more(self.claim_credits, before.claim_credits)
             && no_more(self.logins, before.logins)
             && self.hosts.iter().all(|h| before.hosts.contains(h))
             && (self.model_fallback.is_none() || self.model_fallback == before.model_fallback)
@@ -1079,7 +1225,7 @@ impl SupervisorConfig {
 
     /// Every key's value, in [`KEYS`] order, as the text [`Self::set`] takes back.
     #[must_use]
-    pub fn texts(&self) -> [(&'static str, String); 40] {
+    pub fn texts(&self) -> [(&'static str, String); 41] {
         let Self {
             enabled,
             off: _,
@@ -1108,6 +1254,7 @@ impl SupervisorConfig {
             usage_tap,
             usage_notes,
             usage_credits,
+            claim_credits,
             logins,
             hosts,
             model_fallback,
@@ -1154,6 +1301,7 @@ impl SupervisorConfig {
             ("usage_tap", usage_tap.to_string()),
             ("usage_notes", usage_notes.to_string()),
             ("usage_credits", usage_credits.to_string()),
+            ("claim_credits", claim_credits.to_string()),
             ("logins", if *logins { "renew" } else { "off" }.to_string()),
             ("hosts", hosts.join(",")),
             ("model_fallback", model_fallback.clone().unwrap_or_default()),
@@ -1628,6 +1776,51 @@ fn reset_kinds(text: &str) -> Result<Vec<ResetKind>, String> {
 #[must_use]
 pub fn is_unknown_key_note(note: &str) -> bool {
     note.contains(UNKNOWN_KEY)
+}
+
+/// A setting in aterm.toml that turns account rotation off
+/// ([`SupervisorConfig::accounts_off_by`]). Each value is spelled as TOML reads it, which may
+/// differ from the file's own spelling of an equal value (`0x0` reads `0`, `'off'` reads
+/// `"off"`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountsOff {
+    /// `[harness] accounts`, its value as TOML reads it: `"early"` or `"wall"` there turns
+    /// rotation back on, where nothing else turns it off.
+    Harness(String),
+    /// `harness.accounts` filed below the header of the table at `at`, which TOML files as
+    /// `<at>.harness.accounts` and which limits all the same; its value as TOML reads it.
+    Misplaced {
+        /// The table it is filed in.
+        at: String,
+        /// Its value as TOML reads it.
+        value: String,
+    },
+    /// The swarm switch, its value as TOML reads it (`[swarm] enabled = false`).
+    Swarm(String),
+}
+
+impl AccountsOff {
+    /// The setting as aterm.toml says it, in backticks.
+    #[must_use]
+    pub fn words(&self) -> String {
+        match self {
+            Self::Harness(value) => format!("`[harness] accounts = {value}`"),
+            Self::Misplaced { at, value } => format!(
+                "`{at}.harness.accounts = {value}` (a `harness.accounts` below another table's \
+                 header)"
+            ),
+            Self::Swarm(written) => format!("`{written}`"),
+        }
+    }
+}
+
+/// `value` as TOML reads it, in TOML's spelling: a text quoted, a boolean or number bare (a
+/// number in decimal, whatever base the file wrote it in).
+fn written(value: &aterm_toml::Value) -> String {
+    match value {
+        aterm_toml::Value::String(text) => format!("{text:?}"),
+        other => scalar_text(other).unwrap_or_else(|| other.type_str().to_string()),
+    }
 }
 
 fn misplaced_note(at: &str, key: &str, limits: bool, refused: Option<String>) -> String {
@@ -2695,6 +2888,67 @@ mod tests {
         assert!(notes[0].contains("`theme.harness.usage_tap`"), "{notes:?}");
         assert!(
             !read("[theme]\nharness.usage_tap = false\n").usage_tap,
+            "a misplaced off limits all the same"
+        );
+    }
+
+    /// CLAIMING FREE CREDITS SHIPS ON (the owner asked for it): no file, an empty table and
+    /// every other key leave it on, any off spelling in the root table is a limit like any other
+    /// off, and a misplaced off limits all the same.
+    #[test]
+    fn claim_credits_ships_on_and_an_off_limits_it() {
+        let full = SupervisorConfig::default();
+        assert!(full.claim_credits, "the default is on");
+        assert!(read("").claim_credits && read("[harness]\n").claim_credits);
+        assert_eq!(
+            SupervisorConfig::default_shown("claim_credits").as_deref(),
+            Some("true")
+        );
+        for key in KEYS.iter().filter(|k| **k != "claim_credits") {
+            let mut c = full.clone();
+            let _ = c.set(key, "true");
+            assert!(c.claim_credits, "{key} = true");
+            c.limit(key);
+            assert!(c.claim_credits, "{key} at its limit");
+        }
+        let off = SupervisorConfig {
+            claim_credits: false,
+            ..full.clone()
+        };
+        for text in ["false", "\"no\"", "0"] {
+            let (c, notes) =
+                SupervisorConfig::from_aterm_toml(&format!("[harness]\nclaim_credits = {text}\n"));
+            assert_eq!(c, off, "{text}");
+            assert!(notes.is_empty(), "{text}: {notes:?}");
+        }
+        for text in ["true", "\"yes\"", "1"] {
+            assert_eq!(read(&format!("[harness]\nclaim_credits = {text}\n")), full);
+        }
+        assert!(off.limits(&full), "off limits on");
+        assert!(!full.limits(&off), "on is no limit of off");
+        let mut c = full.clone();
+        c.limit("claim_credits");
+        assert_eq!(c, off, "its limit is off");
+        assert_eq!(
+            off.against_default(),
+            Written {
+                limits: vec!["claim_credits: off".to_owned()],
+                own: Vec::new(),
+            }
+        );
+        assert!(
+            off.texts()
+                .contains(&("claim_credits", "false".to_string()))
+        );
+        let (c, notes) =
+            SupervisorConfig::from_aterm_toml("[theme]\nharness.claim_credits = true\n");
+        assert_eq!(c, full, "a misplaced true grants nothing");
+        assert!(
+            notes[0].contains("`theme.harness.claim_credits`"),
+            "{notes:?}"
+        );
+        assert!(
+            !read("[theme]\nharness.claim_credits = false\n").claim_credits,
             "a misplaced off limits all the same"
         );
     }
@@ -3953,6 +4207,91 @@ trust_dialog = false
         );
         for key in ["codex.approve", "no-such-agent.enabled", "codex"] {
             assert_eq!(SupervisorConfig::default_shown(key), None, "{key}");
+        }
+    }
+
+    /// `accounts_off_by` NAMES EXACTLY THE SETTINGS THAT TURN ROTATION OFF: `[harness] accounts`,
+    /// a `harness.accounts` filed below another table's header, and the swarm switch, each where
+    /// it turns rotation off and none where it does not, a `[swarm] enabled = true` or a misplaced
+    /// `harness.accounts = "early"` beside a setting that does included; it names one exactly
+    /// where the reader leaves rotation off; and where the file is not valid TOML it gives where
+    /// the parser stopped and the parser's own reason, on one line.
+    #[test]
+    fn accounts_off_by_names_only_what_turns_rotation_off() {
+        use crate::harness::accounts::Mode;
+        let harness = |value: &str| AccountsOff::Harness(value.to_string());
+        let swarm = |written: &str| AccountsOff::Swarm(written.to_string());
+        for (text, want) in [
+            ("", Vec::new()),
+            ("[harness]\naccounts = \"early\"\n", Vec::new()),
+            ("[harness]\naccounts = \"off\"\n", vec![harness("\"off\"")]),
+            ("[harness]\naccounts = false\n", vec![harness("false")]),
+            ("[harness]\naccounts = 'off'\n", vec![harness("\"off\"")]),
+            (
+                "[harness]\naccounts = \"off\"\n[swarm]\nenabled = true\n",
+                vec![harness("\"off\"")],
+            ),
+            (
+                "[harness]\naccounts = \"off\"\n[theme]\nharness.accounts = \"early\"\n",
+                vec![harness("\"off\"")],
+            ),
+            (
+                "[harness]\naccounts = \"early\"\n[swarm]\nenabled = false\n",
+                vec![swarm("[swarm] enabled = false")],
+            ),
+            ("[swarm]\nenabled = true\n", Vec::new()),
+            ("swarm = false\n", vec![swarm("swarm = false")]),
+            ("swarm = true\n[harness]\naccounts = \"wall\"\n", Vec::new()),
+            (
+                "[theme]\nharness.accounts = \"off\"\n",
+                vec![AccountsOff::Misplaced {
+                    at: "theme".to_string(),
+                    value: "\"off\"".to_string(),
+                }],
+            ),
+            ("[theme]\nharness.accounts = \"early\"\n", Vec::new()),
+            ("[theme]\nswarm = false\n", Vec::new()),
+        ] {
+            let off_by = SupervisorConfig::accounts_off_by(text).expect("valid TOML");
+            assert_eq!(off_by, want, "{text}");
+            assert_eq!(
+                off_by.is_empty(),
+                read(text).accounts != Mode::Off,
+                "{text}: the reader agrees"
+            );
+        }
+        let broken = "[harness]\naccounts = \"off\"\n[broken\n";
+        let why = SupervisorConfig::accounts_off_by(broken).expect_err("not valid TOML");
+        assert!(!why.is_empty() && !why.contains('\n'), "{why:?}");
+        // Where the parser stopped, and the parser's own reason, not the position alone.
+        let parsed = aterm_toml::from_str::<aterm_toml::Value>(broken).expect_err("not valid TOML");
+        let reason = crate::supervise::limit::one_line(parsed.message_text());
+        assert!(!reason.is_empty(), "the parser names a reason");
+        assert!(why.starts_with("TOML error at line 3, column "), "{why:?}");
+        assert!(why.ends_with(&format!(": {reason}")), "{why:?}");
+    }
+
+    #[test]
+    fn swarm_enabled_false_turns_accounts_off_even_beside_harness_accounts_early() {
+        let cfg = read("[swarm]\nenabled = false\n[harness]\naccounts = \"early\"\n");
+        assert_eq!(cfg.accounts, crate::harness::accounts::Mode::Off);
+        // Negative control: `[swarm] enabled = true` leaves `[harness] accounts` in force.
+        let on = read("[swarm]\nenabled = true\n[harness]\naccounts = \"early\"\n");
+        assert_eq!(on.accounts, crate::harness::accounts::Mode::Early);
+        // Broken TOML keeps both supported Off spellings, including beside an early account mode.
+        for raw in [
+            "[swarm]\nenabled = false\n[harness\n",
+            "swarm = false\n[harness\n",
+            "swarm = false\n[harness]\naccounts = 'early'\n[broken\n",
+            "[swarm]\nenabled = false\n[harness]\naccounts = \"early\"\n[harness\n",
+            "swarm = false\n[harness]\naccounts = \"early\"\n[harness\n",
+        ] {
+            let (broken, _) = SupervisorConfig::from_aterm_toml(raw);
+            assert_eq!(
+                broken.accounts,
+                crate::harness::accounts::Mode::Off,
+                "{raw}"
+            );
         }
     }
 }

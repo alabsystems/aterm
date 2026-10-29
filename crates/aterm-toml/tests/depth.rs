@@ -45,34 +45,13 @@ fn deeply_nested_input_returns_an_error_instead_of_overflowing_the_stack() {
             .err()
             .unwrap_or_else(|| panic!("{name}: {FAR_TOO_DEEP} levels were accepted"));
         assert!(
-            error.to_string().contains("nesting") || error.to_string().contains("limit"),
+            error.to_string().contains("limit"),
             "{name}: the error should name the limit, got {error}"
         );
 
         assert!(
             source.parse::<aterm_toml::edit::DocumentMut>().is_err(),
             "{name}: the document half accepted {FAR_TOO_DEEP} levels"
-        );
-    }
-}
-
-#[test]
-fn ordinary_nesting_is_untouched() {
-    for (name, source) in [
-        ("arrays", deep_arrays(32)),
-        ("inline tables", deep_inline_tables(32)),
-        ("dotted keys", deep_dotted_key(32)),
-        ("table headers", deep_header(32)),
-    ] {
-        aterm_toml::from_str::<aterm_toml::Value>(&source)
-            .unwrap_or_else(|e| panic!("{name}: 32 levels should be fine: {e}"));
-        let document: aterm_toml::edit::DocumentMut = source
-            .parse()
-            .unwrap_or_else(|e| panic!("{name}: 32 levels should be fine: {e}"));
-        assert_eq!(
-            document.to_string(),
-            source,
-            "{name}: deep-but-legal must round-trip"
         );
     }
 }
@@ -119,6 +98,46 @@ fn constructs_that_each_fit_the_limit_cannot_stack_past_it() {
             "{name}: the error should name the limit, got {error}"
         );
     }
+}
+
+#[test]
+fn exact_depth_limit_boundary_is_128_below_root() {
+    for (name, at_limit, past_limit) in [
+        ("arrays", deep_arrays(127), deep_arrays(128)),
+        (
+            "inline tables",
+            deep_inline_tables(127),
+            deep_inline_tables(128),
+        ),
+        ("dotted keys", deep_dotted_key(128), deep_dotted_key(129)),
+        ("table headers", deep_header(127), deep_header(128)),
+    ] {
+        let doc: aterm_toml::edit::DocumentMut = at_limit
+            .parse()
+            .unwrap_or_else(|e| panic!("{name}: depth 128 must succeed: {e}"));
+        assert_eq!(doc.to_string(), at_limit, "{name}: depth 128 round-trip");
+        aterm_toml::from_str::<aterm_toml::Value>(&at_limit)
+            .unwrap_or_else(|e| panic!("{name}: Value depth 128 must succeed: {e}"));
+
+        assert!(
+            past_limit.parse::<aterm_toml::edit::DocumentMut>().is_err(),
+            "{name}: depth 129 must fail on DocumentMut"
+        );
+        let err = aterm_toml::from_str::<aterm_toml::Value>(&past_limit)
+            .err()
+            .unwrap_or_else(|| panic!("{name}: depth 129 must fail on Value"));
+        assert!(
+            err.to_string().contains("limit"),
+            "{name}: expected limit error, got {err}"
+        );
+    }
+
+    let standalone_ok = format!("{}1{}", "[".repeat(128), "]".repeat(128));
+    let standalone_err = format!("{}1{}", "[".repeat(129), "]".repeat(129));
+    standalone_ok
+        .parse::<aterm_toml::edit::Value>()
+        .expect("standalone depth 128 must succeed");
+    assert!(standalone_err.parse::<aterm_toml::edit::Value>().is_err());
 }
 
 #[test]

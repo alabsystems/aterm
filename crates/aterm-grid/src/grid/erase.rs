@@ -233,7 +233,7 @@ impl Grid {
     }
 
     /// Recompute the `any_double_width` fast path from the visible rows.
-    fn resync_any_double_width(&mut self) {
+    pub(super) fn resync_any_double_width(&mut self) {
         if !self.storage.any_double_width {
             return;
         }
@@ -335,6 +335,7 @@ impl Grid {
     /// Erase scrollback.
     pub fn erase_scrollback(&mut self) {
         self.storage.scrollback_clear_gen = self.storage.scrollback_clear_gen.wrapping_add(1);
+        self.storage.note_history_cleared();
         let scrollback = self
             .storage
             .total_lines
@@ -1205,10 +1206,7 @@ mod tests {
             if rows > 2 {
                 grid.set_scroll_region(1, rows - 2);
             }
-            if let Some(r) = grid.row_mut(0) {
-                r.set_line_size(crate::LineSize::DoubleWidth);
-            }
-            grid.mark_has_double_width();
+            grid.set_row_line_size(0, crate::LineSize::DoubleWidth);
             grid.move_cursor_to(rows - 1, cols - 1);
             grid.set_pending_wrap(true);
 
@@ -1388,6 +1386,10 @@ mod tests {
         );
         grid.move_cursor_to(3, 0);
         grid.erase_to_end_of_line();
+        assert!(
+            grid.row(1).unwrap().is_wrapped(),
+            "EL 0 on the bottom row leaves row 1's flag and touches no out-of-bounds row + 1"
+        );
     }
 
     #[test]
@@ -2025,61 +2027,76 @@ mod tests {
         );
     }
 
-    /// EL 2 over a DECLRMM-margin row: the orphan just past the right margin
-    /// takes the BCE blank, and the ring follows it.
+    /// Margined DCH and ECH cutting a wide pair at their right boundary: the
+    /// orphaned right-hand continuation one column past the boundary takes the
+    /// BCE blank and truecolor ring entry, while columns beyond it stay intact.
     #[test]
-    fn erase_line_within_margins_gives_the_wide_orphan_the_bce_background_and_ring() {
+    fn margined_dch_and_ech_give_the_wide_orphan_the_bce_background_and_ring() {
         use crate::{Cell, PackedColor};
 
         let (rows, cols) = (2u16, 12u16);
-        let mut grid = Grid::new(rows, cols);
-
         let dead_bg = [7u8, 8, 9];
-        grid.move_cursor_to(0, 6);
-        grid.write_wide_char_styled(
-            '中',
-            PackedColor::DEFAULT_FG,
-            PackedColor::rgb(dead_bg[0], dead_bg[1], dead_bg[2]),
-            CellFlags::empty(),
-        );
-        grid.extras_mut()
-            .set_rgb_ring_range(0, 6, 8, None, Some(dead_bg), rows, cols);
-        assert!(
-            grid.cell(0, 7)
-                .unwrap()
-                .flags()
-                .contains(CellFlags::WIDE_CONTINUATION),
-            "precondition: col 7 is the continuation, one past the right margin"
-        );
-
-        grid.set_horizontal_margins(2, 6);
+        let keep_bg = [88u8, 99, 111];
         let bce_bg = [10u8, 20, 30];
         let fill = Cell::bce_blank_from_bg(PackedColor::rgb(bce_bg[0], bce_bg[1], bce_bg[2]));
-        grid.set_cursor_template(fill, Some(bce_bg));
 
-        grid.move_cursor_to(0, 4);
-        grid.erase_line();
+        let setup_grid = || {
+            let mut grid = Grid::new(rows, cols);
+            grid.move_cursor_to(0, 6);
+            grid.write_wide_char_styled(
+                '中',
+                PackedColor::DEFAULT_FG,
+                PackedColor::rgb(dead_bg[0], dead_bg[1], dead_bg[2]),
+                CellFlags::empty(),
+            );
+            grid.extras_mut()
+                .set_rgb_ring_range(0, 6, 8, None, Some(dead_bg), rows, cols);
+            grid.move_cursor_to(0, 8);
+            grid.write_char_styled(
+                'Z',
+                PackedColor::DEFAULT_FG,
+                PackedColor::rgb(keep_bg[0], keep_bg[1], keep_bg[2]),
+                CellFlags::empty(),
+            );
+            grid.extras_mut()
+                .set_rgb_ring_range(0, 8, 9, None, Some(keep_bg), rows, cols);
+            assert!(
+                grid.cell(0, 7)
+                    .unwrap()
+                    .flags()
+                    .contains(CellFlags::WIDE_CONTINUATION),
+                "precondition: col 7 is the continuation one past col 6"
+            );
+            grid.set_horizontal_margins(2, 6);
+            grid.set_cursor_template(fill, Some(bce_bg));
+            grid
+        };
 
-        let orphan = grid.cell(0, 7).unwrap();
-        assert_eq!(orphan.char(), ' ', "the orphaned continuation is blanked");
-        assert_eq!(
-            orphan.colors(),
-            fill.colors(),
-            "the margin branch must give the orphan the BCE background too — \
-             xterm reaches the same ClearRight -> ClearCells here"
-        );
-        assert_eq!(
-            grid.bg_rgb_at(0, 6),
-            Some(bce_bg),
-            "precondition: the erased span resolves its truecolor background"
-        );
-        assert_eq!(
-            grid.bg_rgb_at(0, 7),
-            Some(bce_bg),
-            "the orphan past the right margin must resolve it too — the ring \
-             has to reach one column past the margin or the orphan keeps the \
-             dead glyph's bytes behind a BCE marker"
-        );
+        // 1. DCH within DECSLRM margins [2..=6] shifts [4..7), cutting '中' at 6..=7.
+        let mut dch_grid = setup_grid();
+        dch_grid.move_cursor_to(0, 4);
+        dch_grid.delete_chars_margin(2, true);
+        let dch_orphan = dch_grid.cell(0, 7).unwrap();
+        assert_eq!(dch_orphan.char(), ' ');
+        assert!(!dch_orphan.flags().contains(CellFlags::WIDE_CONTINUATION));
+        assert_eq!(dch_orphan.colors(), fill.colors());
+        assert_eq!(dch_grid.bg_rgb_at(0, 6), Some(bce_bg));
+        assert_eq!(dch_grid.bg_rgb_at(0, 7), Some(bce_bg));
+        assert_eq!(dch_grid.cell(0, 8).unwrap().char(), 'Z');
+        assert_eq!(dch_grid.bg_rgb_at(0, 8), Some(keep_bg));
+
+        // 2. ECH(3) from col 4 erases [4..7), cutting '中' at 6..=7 and orphaning col 7.
+        let mut ech_grid = setup_grid();
+        ech_grid.move_cursor_to(0, 4);
+        ech_grid.erase_chars(3);
+        let ech_orphan = ech_grid.cell(0, 7).unwrap();
+        assert_eq!(ech_orphan.char(), ' ');
+        assert!(!ech_orphan.flags().contains(CellFlags::WIDE_CONTINUATION));
+        assert_eq!(ech_orphan.colors(), fill.colors());
+        assert_eq!(ech_grid.bg_rgb_at(0, 6), Some(bce_bg));
+        assert_eq!(ech_grid.bg_rgb_at(0, 7), Some(bce_bg));
+        assert_eq!(ech_grid.cell(0, 8).unwrap().char(), 'Z');
+        assert_eq!(ech_grid.bg_rgb_at(0, 8), Some(keep_bg));
     }
 
     /// DECERA clears an orphaned wide half outside the rectangle to `Cell::EMPTY` without applying the BCE background.
@@ -2292,10 +2309,7 @@ mod tests {
     /// Set a row's DEC line attribute the way `ESC#3` / `ESC#4` / `ESC#6` does:
     /// the row flag plus the grid-level fast-path flag.
     fn poison_row(grid: &mut Grid, row: u16, size: crate::LineSize) {
-        if let Some(r) = grid.row_mut(row) {
-            r.set_line_size(size);
-        }
-        grid.mark_has_double_width();
+        grid.set_row_line_size(row, size);
     }
 
     fn line_size_of(grid: &Grid, row: u16) -> crate::LineSize {

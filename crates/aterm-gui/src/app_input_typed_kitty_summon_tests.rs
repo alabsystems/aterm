@@ -271,17 +271,17 @@ pub(super) fn drain(pipe: [i32; 2]) -> Vec<u8> {
 
 /// Frame refresh interval for observing a key edge.
 #[cfg(unix)]
-pub(super) const OBSERVING_FRAME: Duration = Duration::from_millis(16);
+pub(crate) const OBSERVING_FRAME: Duration = Duration::from_millis(16);
 
 /// Clock of the `nth` (1-based) frame after `edge`.
 #[cfg(unix)]
-pub(super) fn observing_frame(edge: Instant, nth: u32) -> Instant {
+pub(crate) fn observing_frame(edge: Instant, nth: u32) -> Instant {
     Instant::now().min(edge + OBSERVING_FRAME * nth)
 }
 
 /// Wait for `receipts` delivery receipts on `wid` and return the latest edge instant.
 #[cfg(unix)]
-pub(super) fn delivery_edge(app: &App, wid: WindowId, receipts: u64) -> Instant {
+pub(crate) fn delivery_edge(app: &App, wid: WindowId, receipts: u64) -> Instant {
     let session = app.front_terminal(wid).expect("a terminal").session;
     let after = app.windows[&wid]
         .delivery_seen
@@ -1346,10 +1346,10 @@ fn a_backspace_into_an_ime_run_gives_back_one_glyphs_credit() {
 #[cfg(unix)]
 #[test]
 fn a_backspace_erasing_a_zero_width_glyph_gives_back_a_priced_nothing() {
-    let mut widths = Vec::new();
-    super::committed_grapheme_cells_into("\u{0301}日本", false, &mut widths);
+    let mut priced = super::ErasePriceMemory::default();
+    priced.price_graphemes("\u{0301}日本", false);
     assert_eq!(
-        widths,
+        priced.widths(),
         [0, 2, 2],
         "the mark is a priced zero inside the run"
     );

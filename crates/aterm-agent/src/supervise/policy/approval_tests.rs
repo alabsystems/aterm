@@ -420,10 +420,10 @@ fn under_zsh_only_a_plain_line_is_a_proven_read() {
         ..git_host(ctx())
     };
     for line in [
-        "echo $x:h",
-        "echo \"$x:h\"",
-        "echo $=x",
-        "echo ${x}[1]",
+        "echo $HOME:h",
+        "echo \"$HOME:h\"",
+        "echo $=HOME",
+        "echo ${HOME}[1]",
         "rg \"fn \\w+\" src",
     ] {
         let b = bash_box(&[line], Some("Look"));
@@ -1964,6 +1964,159 @@ fn no_rule_ever_spends_a_limit_reset() {
     }
 }
 
+/// Claude Code 2.1.312's once-a-week row (`Reset your 5-hour limit now`, 2.1.311's `Reset your
+/// session limit now`) spends a reset: every rule but the reset step's that would choose it is
+/// escalated, and the dialog that holds it, alone or beside a grant row, gets its wait row at every
+/// level, the reset key on or off.
+#[test]
+fn claude_code_2_1_312s_once_a_week_row_is_pressed_by_no_rule() {
+    use aterm_phase::prompt::{Opt, Role};
+    use aterm_phase::reset::fixtures as composed;
+    const WEEKLY_2_1_312: &str = "Reset your 5-hour limit now";
+    let opt = |label: &str| Opt {
+        n: Some(2),
+        label: label.to_string(),
+        role: Role::Other,
+        focused: false,
+        row: 0,
+        kept: false,
+    };
+    for label in [
+        WEEKLY_RESET,
+        WEEKLY_2_1_312,
+        "Reset your 5-hour limit now (1/week)",
+        "reset your 5-hour limit",
+        "Yes, reset your 5-hour limit",
+    ] {
+        assert!(spends(label), "{label}");
+        assert!(buys(&opt(label)), "{label}");
+        assert!(!keeps_reset(&opt(label)), "{label}");
+    }
+    for label in [
+        "Reset your 5-hour",
+        "Reset your 5-hours limit",
+        "Reset the 5-hour view",
+    ] {
+        assert!(!spends(label), "{label}");
+    }
+    let chosen = |rule_id: &'static str, choice: Choice| Decision::Approve {
+        rule_id,
+        choice,
+        guard: String::new(),
+        subject: String::new(),
+        unproven: None,
+    };
+    let focus = |label: &str| Choice::Focus {
+        steps: 0,
+        label: label.to_string(),
+    };
+    for (fixture, wait, steps) in [
+        (composed::DIALOG_WEEKLY_2_1_312, WAIT_OCT_9, 2),
+        (
+            composed::DIALOG_WEEKLY_BESIDE_GRANT_2_1_312,
+            "Wait here, then continue automatically at 3pm",
+            3,
+        ),
+    ] {
+        let rows = phase_fixtures::screen(fixture);
+        let reading = aterm_phase::read(Some("claude"), &rows, None);
+        let p = reading.prompt.as_ref().expect("the dialog");
+        let n = p
+            .options
+            .iter()
+            .find(|o| o.label == WEEKLY_2_1_312)
+            .and_then(|o| o.n)
+            .expect("the once-a-week row, numbered");
+        for choice in [
+            Choice::Digit(n),
+            focus(WEEKLY_2_1_312),
+            Choice::FocusKey {
+                steps: 0,
+                label: WEEKLY_2_1_312.to_string(),
+                key: "enter",
+            },
+        ] {
+            for rule in [RULE_ALLOW_ONCE, RULE_NO_SPEND, RULE_LIMIT_WAIT] {
+                let d = never_spends(&reading, &rows, chosen(rule, choice.clone()));
+                assert!(
+                    reason(&d).contains("which spends a limit reset"),
+                    "{rule} {choice:?}: {d:?}"
+                );
+            }
+        }
+        for c in [
+            ctx(),
+            full(),
+            none(full()),
+            resetting(full()),
+            resetting(ctx()),
+        ] {
+            assert_eq!(
+                pressed(&on_screen(&rows, &c)),
+                (
+                    RULE_LIMIT_WAIT,
+                    Choice::Focus {
+                        steps,
+                        label: wait.to_string(),
+                    }
+                ),
+                "{:?} limit_reset={}",
+                c.approve,
+                c.limit_reset
+            );
+        }
+    }
+}
+
+/// A limit menu read as kind Other (titled other than the usage-limit dialog's `What do you want to
+/// do?`) that shows no purchase row is no usage-limit dialog, yet its once-a-week row, in either
+/// build's words, still counts as a spend: `no-spend@v1` takes its stop-and-wait row, never the
+/// row.
+#[test]
+fn a_retitled_menu_with_the_once_a_week_row_gets_its_wait_row_from_no_spend() {
+    use aterm_phase::reset::fixtures as composed;
+    let base = phase_fixtures::screen(composed::DIALOG_WEEKLY_2_1_312);
+    for weekly in [WEEKLY_RESET, "Reset your 5-hour limit now"] {
+        let rows: Vec<String> = base
+            .iter()
+            .filter(|r| !r.contains("usage credits"))
+            .map(|r| {
+                r.replace("What do you want to do?", "What would you like?")
+                    .replace("Reset your 5-hour limit now", weekly)
+            })
+            .collect();
+        assert!(rows.iter().any(|r| r.contains(weekly)), "{weekly}");
+        let reading = aterm_phase::read(Some("claude"), &rows, None);
+        let p = reading.prompt.as_ref().expect("the menu is a box");
+        assert_eq!(
+            (p.kind, p.head_off_screen),
+            (PromptKind::Other, false),
+            "{weekly}: {p:?}"
+        );
+        assert!(!p.options.iter().any(|o| o.label.contains("usage credits")));
+        assert!(approved(&on_screen(&rows, &ctx())).is_none(), "{weekly}");
+        for c in [full(), resetting(full())] {
+            let (rule, choice) = pressed(&on_screen(&rows, &c));
+            assert_eq!(rule, RULE_NO_SPEND, "{weekly} {:?}", c.approve);
+            let label = match &choice {
+                Choice::Digit(n) => p
+                    .options
+                    .iter()
+                    .find(|o| o.n == Some(*n))
+                    .map(|o| o.label.clone()),
+                Choice::Focus { label, .. } | Choice::FocusKey { label, .. } => Some(label.clone()),
+                other => panic!("{weekly}: {other:?}"),
+            };
+            assert_eq!(
+                label.as_deref(),
+                Some("Stop and wait for limit to reset"),
+                "{weekly} {:?}: {choice:?}",
+                c.approve
+            );
+        }
+    }
+}
+
 fn no_reset_left(rows: &[String]) -> Vec<String> {
     let yes = rows
         .iter()
@@ -3127,16 +3280,16 @@ fn the_no_rule_note_stays_with_a_person_over_what_it_may_stand_for() {
             "an unquoted glob `[` (space reading) beside awk",
         ),
         (
-            "grep foo *.md | awk 'NR<3'",
+            "grep foo README.md | awk 'NR<3' *.md",
             "an unquoted glob `*` (space reading) beside awk",
         ),
         (
-            "echo \"$(ls *.md)\" | awk 'NR<3'",
+            "awk 'NR<3' `ls *.md`",
             "an unquoted glob `*` (space reading) beside awk",
         ),
         (
-            "cd src; ls *.rs",
-            "an unquoted glob `*` (space reading) beside cd",
+            "cd sr?; ls",
+            "an unquoted glob `?` (space reading) beside cd",
         ),
         ("xargs cat < list.txt", "runs xargs (space reading)"),
         (
@@ -3215,6 +3368,9 @@ fn the_no_rule_note_stays_with_a_person_over_what_it_may_stand_for() {
         "wc -l src/*.rs",
         "ls *.md; head -3 *.md",
         "timeout 5 grep foo *.md",
+        "grep foo *.md | awk 'NR<3'",
+        "echo \"$(ls *.md)\" | awk 'NR<3'",
+        "cd src; ls *.rs",
         "awk -v n=3 'NR<n' README.md",
         "grep 'a=b' README.md",
         "awk 'NR<3' README.md",
@@ -3228,7 +3384,8 @@ fn the_no_rule_note_stays_with_a_person_over_what_it_may_stand_for() {
     }
 }
 
-/// Claude Code 2.1.309's Bash boxes over classifier audit 3's folder probes (MEASURED in the real-Claude lab).
+/// Claude Code 2.1.309's Bash boxes over classifier audit 3's folder probes and its review's three
+/// globbed reads (MEASURED in the real-Claude lab).
 const FOLDER_BOXES: &[(&str, &str, &str)] = &[
     (
         "wc",
@@ -3269,6 +3426,21 @@ const FOLDER_BOXES: &[(&str, &str, &str)] = &[
         "assignment-inside",
         "FOO=1 cat README.md",
         include_str!("fixtures/claude-2.1.309-box-bash-note-assignment-inside.txt"),
+    ),
+    (
+        "ls-glob-sort",
+        "ls /etc/*.conf | sort",
+        include_str!("fixtures/claude-2.1.309-box-bash-folder-ls-glob-sort.txt"),
+    ),
+    (
+        "cd-ls-glob",
+        "cd /etc && ls *.conf",
+        include_str!("fixtures/claude-2.1.309-box-bash-folder-cd-ls-glob.txt"),
+    ),
+    (
+        "cat-glob-sort",
+        "cat /etc/host* | sort -u",
+        include_str!("fixtures/claude-2.1.309-box-bash-folder-cat-glob-sort.txt"),
     ),
 ];
 
@@ -3361,7 +3533,7 @@ fn a_note_free_folder_box_is_held_to_the_proof_gaps_as_the_no_rule_note_is() {
             "runs xargs (space reading)",
         ),
         (
-            "cat /etc/host* | awk 'NR<3'",
+            "cat /etc/hosts | awk 'NR<3' /etc/host*",
             "an unquoted glob `*` (space reading) beside awk",
         ),
         (
@@ -3385,11 +3557,19 @@ fn a_note_free_folder_box_is_held_to_the_proof_gaps_as_the_no_rule_note_is() {
             "no-rule, {command}: {r}"
         );
     }
-    for name in ["wc", "awk"] {
-        let d = on_screen(&folder_box(name), &git_host(ctx()));
+    for name in ["wc", "awk", "ls-glob-sort", "cd-ls-glob", "cat-glob-sort"] {
+        let rows = folder_box(name);
+        let p = aterm_phase::prompt::parse_prompt_v2(&rows).expect(name);
+        assert!(
+            p.notes.is_empty(),
+            "{name}: drawn with no note: {:?}",
+            p.notes
+        );
+        let d = on_screen(&rows, &git_host(ctx()));
         assert_eq!(pressed(&d), (RULE_READ_ONLY, Choice::Digit(1)), "{name}");
     }
     for command in [
+        "cat /etc/host* | awk 'NR<3'",
         "cat /etc/host*",
         "awk 'NR<3' '/etc/host*'",
         "awk -v n=3 'NR<n' /etc/hosts",
@@ -3449,6 +3629,25 @@ fn the_advisory_word_refuses_a_secret_and_a_proof_gap() {
     ] {
         assert_eq!(word(line), Ok(()), "{line}");
     }
+}
+
+/// The advisory word resolves the home-rooted secret rules under the `HOME` it runs with.
+#[test]
+fn the_advisory_word_reads_this_process_home() {
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+        .expect("the test runs with a HOME");
+    let word = |line: &str| readings_read_only(&[line.to_string()], &[]);
+    for line in [
+        "cat ~/.config/gh/hosts.yml".to_string(),
+        format!("cat {}/Library/Preferences/x.plist", home.display()),
+    ] {
+        let r = word(&line).expect_err(&line);
+        assert!(r.contains("a read of a secret"), "{line}: {r}");
+    }
+    // NEGATIVE CONTROL
+    assert_eq!(word("cat ~/.config/notes.txt"), Ok(()));
 }
 
 #[test]
@@ -3805,7 +4004,6 @@ fn a_non_secret_read_beside_it_stays_read_only() {
         "head -n5 README.md",
         "jq -r .env deploy.json",
         "grep -c id_rsa <<< ~/.ssh/id_rsa",
-        "cat $(<files.txt)",
     ] {
         let d = on_screen(&bash_box(&[cmd], Some("Read it")), &git_host(ctx()));
         assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{cmd}: {d:?}");
@@ -3815,6 +4013,213 @@ fn a_non_secret_read_beside_it_stays_read_only() {
         &git_host(ctx()),
     );
     assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{d:?}");
+}
+
+/// A read rule holds a line to the secrets as the shell resolves its paths, on the note-free
+/// folder box and the no-rule box alike, and the advisory word with them: a relative path after
+/// a `cd`, a glob by what it may expand to, a recursive reader by the trees it descends, and
+/// `~user` under its owner's home; a path built at run time, and a relative one after a `cd`
+/// this check cannot follow, are refused as unproven.
+#[test]
+fn a_read_is_held_to_the_secrets_as_the_shell_resolves_its_paths() {
+    let home = Path::new("/Users/_owner");
+    let boxes = |line: &str| [folder_box_with(line), no_rule_box(line)];
+    let word = |line: &str| readings_read_only_at(&[line.to_string()], &[], Some(home));
+    for line in [
+        "cd ~ && cat .claude.json",
+        "cd ~/.config && cat gh/hosts.yml",
+        "cd && cat Library/Preferences/x.plist",
+        "cd /Users/_owner && cat .claude.json",
+        "(cd ~ && cat .secrets/x)",
+        "cd ~/.config/aterm; cat secrets/x",
+        "cd ~/proj && cat ../.claude.json",
+        "cd ~ && grep -r token .config/gh",
+        "cat ~_owner/.claude.json",
+        "cat ~/.ss?/config",
+        "cat ~/.[s]sh/config",
+        "cat ~/.*/config",
+        "cat ~/.kub?/config",
+        "cat ~/.config/g?/hosts.yml",
+        "cat ~/Librar?/Preferences/x.plist",
+        "cat ~/.claude.jso?",
+        "head ~/.config/*/hosts.yml",
+        "cat ~/**/hosts.yml",
+        "grep -r token ~/.config",
+        "grep -rn . ~",
+        "rg token ~",
+        "grep -R token /Users",
+        "grep --recursive token ~",
+        "find ~ -name hosts.yml -exec cat {} \\;",
+    ] {
+        for rows in boxes(line) {
+            let r = reason(&on_screen(&rows, &git_host(ctx()))).to_string();
+            assert!(r.contains("a read of a secret"), "{line}: {r}");
+        }
+        let r = word(line).expect_err(line);
+        assert!(r.contains("a read of a secret"), "the word: {line}: {r}");
+    }
+    for (line, why) in [
+        (
+            "cat $(printf '%s/.s%sh/id_r%sa' ~ s s)",
+            "builds at run time",
+        ),
+        ("cat $(<files.txt)", "builds at run time"),
+        ("cd \"$(dirname /etc/hosts)\" && cat hosts", "at run time"),
+        ("cd - && cat .claude.json", "cannot follow"),
+        ("cd -1 && cat .claude.json", "cannot follow"),
+    ] {
+        for rows in boxes(line) {
+            let r = reason(&on_screen(&rows, &git_host(ctx()))).to_string();
+            assert!(r.contains(why), "{line}: {r}");
+        }
+    }
+    // NEGATIVE CONTROL
+    for line in [
+        "cd src && cat README.md",
+        "cd ~/proj && cat README.md",
+        "cd /etc && cat hosts",
+        "cat ~/notes/*.md",
+        "cat ~/.sshrc",
+        "grep -rn token src",
+        "rg token src",
+        "grep -r token .",
+        "ls ~/.ssh",
+        "sed -n '$p' README.md",
+    ] {
+        for rows in boxes(line) {
+            let d = on_screen(&rows, &git_host(ctx()));
+            assert!(approved(&d).is_some(), "{line}: {d:?}");
+        }
+        assert_eq!(word(line), Ok(()), "the word: {line}");
+    }
+}
+
+/// A read that prints a value of the environment, where a token lives as a file's secret does,
+/// proves no box of either kind, and the advisory word refuses it too: a variable off the plain
+/// list (in a braced default too), an indirection, `ps` showing environments, jq's `env` and
+/// `$ENV`, awk's `ENVIRON`, a process's `environ` file.
+#[test]
+fn a_read_that_prints_the_environment_proves_no_box() {
+    let boxes = |line: &str| [folder_box_with(line), no_rule_box(line)];
+    for (line, why) in [
+        ("echo $GITHUB_TOKEN", "expands $GITHUB_TOKEN"),
+        ("echo \"$ANTHROPIC_API_KEY\"", "expands $ANTHROPIC_API_KEY"),
+        ("cat $TOKEN", "expands $TOKEN"),
+        ("echo ${HOME:-$GH_TOKEN}", "expands $GH_TOKEN"),
+        ("echo ${HOME:+$=GITHUB_TOKEN}", "expands $GITHUB_TOKEN"),
+        ("echo ${HOME:+$^NPM_TOKEN}", "expands $NPM_TOKEN"),
+        ("echo $=GITHUB_TOKEN", "expands $GITHUB_TOKEN"),
+        ("echo \"$^NPM_TOKEN\"", "expands $NPM_TOKEN"),
+        ("echo \"$(echo $NPM_TOKEN)\"", "expands $NPM_TOKEN"),
+        ("ps eww", "ps prints the environment"),
+        ("ps -E", "ps prints the environment"),
+        ("ps -p 1 -wwE", "ps prints the environment"),
+        ("ps auxe", "ps prints the environment"),
+        ("jq -n env", "jq prints the environment"),
+        ("jq -n '$ENV'", "jq prints the environment"),
+        ("jq -n '$ENV.PATH'", "jq prints the environment"),
+        (
+            "jq -r '.a | env.TOKEN' data.json",
+            "jq prints the environment",
+        ),
+        (
+            "awk 'BEGIN { print ENVIRON[\"TOKEN\"] }'",
+            "awk prints the environment",
+        ),
+        ("cat /proc/self/environ", "names a process's environment"),
+        ("cd /proc/1 && cat environ", "names a process's environment"),
+    ] {
+        for rows in boxes(line) {
+            let r = reason(&on_screen(&rows, &git_host(ctx()))).to_string();
+            assert!(r.contains(why), "{line}: {r}");
+        }
+        let r = readings_read_only(&[line.to_string()], &[]).expect_err(line);
+        assert!(r.contains(why), "the word: {line}: {r}");
+    }
+    // NEGATIVE CONTROL
+    for line in [
+        "echo $HOME",
+        "echo \"$PATH\"",
+        "echo ${HOME}/notes",
+        "echo $=HOME",
+        "echo $? $1",
+        "echo '$GITHUB_TOKEN'",
+        "echo '${HOME:+$=GITHUB_TOKEN}'",
+        "echo ${HOME:+$=PATH}",
+        "ps aux",
+        "ps -ef",
+        "ps -o pid,user,args",
+        "jq . env.json",
+        "jq -n '.environment'",
+        "awk '{print $1}' README.md",
+    ] {
+        for rows in boxes(line) {
+            let d = on_screen(&rows, &git_host(ctx()));
+            assert!(approved(&d).is_some(), "{line}: {d:?}");
+        }
+        assert_eq!(
+            readings_read_only(&[line.to_string()], &[]),
+            Ok(()),
+            "the word: {line}"
+        );
+    }
+}
+
+/// A relative path is read against the session's cwd and where its Bash tool stands, and a
+/// session whose cwd is unknown reads no relative path; the advisory word, which knows neither,
+/// reads one against the directories the line names alone.
+#[test]
+fn a_relative_read_starts_where_the_session_stands() {
+    let at = |cwd: &str| ApprovalCtx {
+        cwd: PathBuf::from(cwd),
+        ..git_host(ctx())
+    };
+    for (c, line) in [
+        (at("/Users/_owner/proj"), "cat ../.claude.json"),
+        (at("/Users/_owner/proj"), "grep -r token .."),
+        (at("/Users/_owner"), "cat .claude.json"),
+        (at("/Users/_owner"), "rg token"),
+        (at("/Users/_owner"), "grep -r token ."),
+        (
+            at("/Users/_owner/proj"),
+            "cd .. && cat .config/gh/hosts.yml",
+        ),
+        (
+            ApprovalCtx {
+                shell_cwds: vec![PathBuf::from("/Users/_owner")],
+                ..git_host(ctx())
+            },
+            "cat .claude.json",
+        ),
+    ] {
+        let r = reason(&on_screen(&folder_box_with(line), &c)).to_string();
+        assert!(
+            r.contains("a read of a secret"),
+            "{line} in {:?}: {r}",
+            c.cwd
+        );
+        assert_eq!(
+            readings_read_only_at(&[line.to_string()], &[], Some(Path::new("/Users/_owner"))),
+            Ok(()),
+            "the word: {line}"
+        );
+    }
+    let unknown = ApprovalCtx {
+        cwd_known: false,
+        ..git_host(ctx())
+    };
+    let r = reason(&on_screen(&folder_box_with("cat README.md"), &unknown)).to_string();
+    assert!(r.contains("cwd unknown"), "{r}");
+    // NEGATIVE CONTROL
+    for (c, line) in [
+        (at("/Users/_owner/proj"), "cat README.md"),
+        (at("/Users/_owner/proj"), "grep -rn token src"),
+        (at("/Users/_owner"), "cat notes.txt"),
+        (unknown.clone(), "cat /etc/hosts"),
+    ] {
+        let d = on_screen(&folder_box_with(line), &c);
+        assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{line}: {d:?}");
+    }
 }
 
 /// A Windows home (`USERPROFILE`, `C:\Users\name`) keeps the home's secret rules in each of
@@ -4194,7 +4599,7 @@ fn the_too_many_breaker_over_a_proven_read_is_approved_under_its_rule() {
         (
             "a modifier under a shell that may be zsh",
             too_many_box(
-                &sixty_five(&[(12, "echo $(true) $(true) $(true) $(true) $(true) $x:h")]),
+                &sixty_five(&[(12, "echo $(true) $(true) $(true) $(true) $(true) $HOME:h")]),
                 false,
             ),
             ApprovalCtx {
@@ -4206,7 +4611,7 @@ fn the_too_many_breaker_over_a_proven_read_is_approved_under_its_rule() {
         (
             "a split flag under a shell that may be zsh",
             too_many_box(
-                &sixty_five(&[(12, "echo $(true) $(true) $(true) $(true) $(true) $=x")]),
+                &sixty_five(&[(12, "echo $(true) $(true) $(true) $(true) $(true) $=HOME")]),
                 true,
             ),
             ApprovalCtx {
@@ -9415,4 +9820,269 @@ fn an_ordinary_sessions_rm_box_decides_as_before() {
         approved(&on_screen(&ours, &disk_worker(ctx()))),
         Some(RULE_DISK_WORKER)
     );
+}
+
+/// A credit-claim worker's context ([`ApprovalCtx::claim_worker`]) over `base`.
+fn claim_worker(base: ApprovalCtx) -> ApprovalCtx {
+    ApprovalCtx {
+        claim_worker: true,
+        ..base
+    }
+}
+
+/// The cloud credit's claim link, as `credit_offers` builds it.
+const CLAIM_LINK: &str =
+    "https://claude.ai/code/claim-credit/6/0f6c2b8e-1d3a-4c5e-9b7f-2a4d6e8c0b1a";
+
+/// Claude in Chrome's box for a click on `host` at the page `url` (2.1.282's box: `Allow`, the
+/// site-wide grant for the session, `Deny (esc)`, no amend).
+fn chrome_box(host: &str, url: &str) -> Vec<String> {
+    let rows = phase_fixtures::screen(phase_fixtures::BOX_BROWSER);
+    let rows = with_row(
+        &rows,
+        " Claude in Chrome wants to click on github.com",
+        &format!(" Claude in Chrome wants to click on {host}"),
+    );
+    let rows = with_row(&rows, " https://github.com/x", &format!(" {url}"));
+    with_row(
+        &rows,
+        "   2. Allow all actions on github.com for this session",
+        &format!("   2. Allow all actions on {host} for this session"),
+    )
+}
+
+/// `d` as [`RULE_CLAIM_WORKER`]'s decline: the text it types into the box's `No`.
+fn claim_declined(d: &Decision) -> &str {
+    match d {
+        Decision::Decline { rule_id, text, .. } => {
+            assert_eq!(*rule_id, RULE_CLAIM_WORKER, "{d:?}");
+            text
+        }
+        _ => panic!("expected the claim worker's decline, got {d:?}"),
+    }
+}
+
+/// A CLAIM WORKER'S CHROME ACTION ON ITS CLAIM PAGE IS PRESSED ONCE: at full power the box's
+/// `Allow` (option 1) is pressed for a click on the vendor's claim page, on a vendor subdomain
+/// too, as for every session; at `safe` the hand-off to a person stands. The fence keeps only the
+/// one-shot allow: a press of the site-wide grant for the session is no action it keeps, and a
+/// press of `Deny` is a refusal it keeps.
+#[test]
+fn a_claim_workers_chrome_action_on_its_claim_page_is_pressed_once() {
+    for (host, url) in [
+        ("claude.ai", CLAIM_LINK),
+        ("claude.ai", "https://claude.ai/code/claim-credit/6"),
+        ("www.claude.com", "https://www.claude.com/claim/api-credits"),
+        ("platform.claude.com", "https://platform.claude.com/claim"),
+    ] {
+        let rows = chrome_box(host, url);
+        let d = on_screen(&rows, &claim_worker(full()));
+        let (rule, choice, _, _, _) = approval(&d);
+        assert_eq!(rule, RULE_ALLOW_ONCE, "{url}: {d:?}");
+        assert_eq!(*choice, Choice::Digit(1), "{url}: `Allow`, once");
+        assert_eq!(d, on_screen(&rows, &full()), "{url}: as for every session");
+        assert_eq!(
+            on_screen(&rows, &claim_worker(ctx())),
+            on_screen(&rows, &ctx()),
+            "{url}: at safe the hand-off stands"
+        );
+        assert!(approved(&on_screen(&rows, &ctx())).is_none(), "{url}");
+    }
+    let p = aterm_phase::parse_prompt_v2(&chrome_box("claude.ai", CLAIM_LINK)).expect("the box");
+    assert_eq!(p.kind, PromptKind::Browser);
+    assert_eq!(claim_action(&p, &Choice::Digit(1)), Ok(()), "`Allow`");
+    let grant = claim_action(&p, &Choice::Digit(2)).expect_err("the site-wide grant");
+    assert!(grant.contains("not the box's one-shot allow"), "{grant}");
+    assert_eq!(
+        claim_action(&p, &Choice::Digit(3)),
+        Ok(()),
+        "`Deny` is kept"
+    );
+}
+
+/// A CLAIM WORKER'S CHROME ACTION OFF ITS CLAIM PAGES GOES TO A PERSON: a page on another host,
+/// on a host that only begins with the vendor's, behind a user name, over `http://`, on a named
+/// port, or whose path or query names billing, an upgrade or usage, and a box whose title names
+/// another site, are none the fence keeps; Claude in Chrome's box has no `No` to amend, so nothing
+/// is pressed and a person decides. CONTROL: every one of them is pressed at full power for a
+/// session that is no claim worker.
+#[test]
+fn a_claim_workers_chrome_action_off_its_claim_pages_goes_to_a_person() {
+    for (host, url, why) in [
+        (
+            "github.com",
+            "https://github.com/x",
+            "not the vendor's host",
+        ),
+        (
+            "claude.ai.evil.com",
+            "https://claude.ai.evil.com/code/claim-credit/6",
+            "not the vendor's host",
+        ),
+        (
+            "claude.ai.evil.com",
+            "https://user@claude.ai.evil.com/code/claim-credit/6",
+            "a user",
+        ),
+        ("claude.ai", "https://claude.ai@evil.com/x", "a user"),
+        (
+            "claude.ai",
+            "http://claude.ai/code/claim-credit/6",
+            "https://",
+        ),
+        (
+            "claude.ai",
+            "https://claude.ai:8443/code/claim-credit/6",
+            "port",
+        ),
+        (
+            "claude.ai",
+            "https://claude.ai/settings/billing",
+            "`billing`",
+        ),
+        ("claude.ai", "https://claude.ai/upgrade/max", "`upgrade`"),
+        (
+            "claude.ai",
+            "https://claude.ai/claim?next=%2Fsettings%2Fusage",
+            "`usage`",
+        ),
+        ("evil.com", CLAIM_LINK, "names evil.com as the site"),
+    ] {
+        let rows = chrome_box(host, url);
+        assert_eq!(
+            approved(&on_screen(&rows, &full())),
+            Some(RULE_ALLOW_ONCE),
+            "CONTROL {url}: an ordinary session's press"
+        );
+        let d = on_screen(&rows, &claim_worker(full()));
+        let reason = reason(&d);
+        for want in [RULE_CLAIM_WORKER, why, "no `No` to amend"] {
+            assert!(reason.contains(want), "{url}: {want}: {reason}");
+        }
+    }
+}
+
+/// A CLAIM WORKER'S QUESTION IS A PERSON'S: under `answer_questions = true` (the default) a
+/// question is answered with its recommended option for every session, and handed to a person
+/// for a claim worker, at full power and under `approve = "none"` alike.
+#[test]
+fn a_claim_workers_question_goes_to_a_person_whatever_answer_questions_says() {
+    let rows = phase_fixtures::screen(phase_fixtures::QUESTION_RECOMMENDED_SECOND);
+    for base in [full(), ctx(), none(full())] {
+        assert!(base.answer_questions, "the default answers questions");
+        assert_eq!(
+            approved(&on_screen(&rows, &base)),
+            Some(RULE_ANSWER_RECOMMENDED),
+            "CONTROL under {:?}: an ordinary session's answer",
+            base.approve
+        );
+        let d = on_screen(&rows, &claim_worker(base));
+        let reason = reason(&d);
+        assert!(
+            reason.contains(RULE_CLAIM_WORKER) && reason.contains("the person's to answer"),
+            "{reason}"
+        );
+    }
+}
+
+/// A CLAIM WORKER'S OTHER TOOL BOXES ARE DECLINED ON THEIR `No`: a Bash read, an `rm`, another
+/// MCP server's tool and a file write, at `safe` and at full power, with
+/// [`CLAIM_WORKER_TOOLS`]. CONTROL: an ordinary session's read and full-power presses; under
+/// `approve = "none"` every box stays the owner's, and the folder-trust dialog is decided as for
+/// every session.
+#[test]
+fn a_claim_workers_other_tool_boxes_are_declined_on_their_no() {
+    let read = bash_box(&["ls -la ~/.cargo"], None);
+    let rm = bash_box(&["rm -rf ~/x"], None);
+    let tool = phase_fixtures::screen(phase_fixtures::BOX_TOOL);
+    let write = phase_fixtures::screen(phase_fixtures::BOX_WRITE_CREATE_2_1_309);
+    assert_eq!(approved(&on_screen(&read, &ctx())), Some(RULE_READ_ONLY));
+    for (name, rows) in [
+        ("read", &read),
+        ("rm", &rm),
+        ("github tool", &tool),
+        ("write", &write),
+    ] {
+        assert!(
+            approved(&on_screen(rows, &full())).is_some(),
+            "CONTROL {name}: pressed for an ordinary session"
+        );
+        for (level, base) in [("safe", ctx()), ("all", full())] {
+            let d = on_screen(rows, &claim_worker(base));
+            let text = claim_declined(&d);
+            assert!(
+                text.starts_with(DECLINE_PREFIX)
+                    && text.contains(CLAIM_WORKER_TOOLS)
+                    && text.contains("Nothing left: NOT CLAIMED:"),
+                "{name} {level}: {text}"
+            );
+        }
+        assert_eq!(
+            on_screen(rows, &claim_worker(none(ctx()))),
+            on_screen(rows, &none(ctx())),
+            "{name}: approve = none"
+        );
+    }
+    let trust = lines(CAP_TRUST);
+    assert_eq!(
+        on_screen(&trust, &claim_worker(ctx())),
+        on_screen(&trust, &ctx()),
+        "the trust dialog"
+    );
+    let mut steps: Vec<super::super::trace::TraceStep> = Vec::new();
+    let reading = aterm_phase::read(Some("claude"), &rm, None);
+    let d = decide_traced(&reading, &rm, &claim_worker(full()), &mut steps);
+    claim_declined(&d);
+    let last = super::super::trace::deciding(&steps).expect("a deciding step");
+    assert_eq!(
+        (last.check, last.rule),
+        ("claim-worker", Some(RULE_CLAIM_WORKER))
+    );
+}
+
+/// A CLAUDE IN CHROME TOOL'S OWN TOOL BOX IS DECIDED AS FOR EVERY SESSION: its reads and
+/// navigation (its site actions raise Claude in Chrome's box), named as Claude Code names the
+/// built-in server's tools (`Claude in Chrome[navigate]`). CONTROL: another server's tool, one
+/// named `claude-in-chrome` included, is declined.
+#[test]
+fn a_claim_workers_chrome_tool_box_decides_as_for_every_session() {
+    let tool_box = |name: &str| {
+        let rows = phase_fixtures::screen(phase_fixtures::BOX_TOOL);
+        let rows = with_row(
+            &rows,
+            "  github - create_issue Tool: (MCP)",
+            &format!("  {name} Tool: (MCP)"),
+        );
+        let rows = with_row(&rows, "  │ Creates an issue", "  │ Navigates a tab");
+        with_row(
+            &rows,
+            "   2. Yes, and don't ask again for github - create_issue commands in ~/aterm",
+            &format!("   2. Yes, and don't ask again for {name} commands in ~/aterm"),
+        )
+    };
+    let rows = tool_box("Claude in Chrome[navigate]");
+    let p = aterm_phase::parse_prompt_v2(&rows).expect("the box");
+    assert_eq!(p.kind, PromptKind::Tool, "{p:?}");
+    assert!(
+        p.command
+            .starts_with(crate::harness::credit_offers::CHROME_TOOL),
+        "{p:?}"
+    );
+    for base in [full(), ctx()] {
+        assert_eq!(
+            on_screen(&rows, &claim_worker(base.clone())),
+            on_screen(&rows, &base),
+            "{:?}",
+            base.approve
+        );
+    }
+    assert_eq!(
+        approved(&on_screen(&rows, &claim_worker(full()))),
+        Some(RULE_ALLOW_ONCE)
+    );
+    let other = tool_box("claude-in-chrome - navigate");
+    assert_eq!(approved(&on_screen(&other, &full())), Some(RULE_ALLOW_ONCE));
+    let d = on_screen(&other, &claim_worker(full()));
+    let text = claim_declined(&d);
+    assert!(text.contains(CLAIM_WORKER_TOOLS), "{text}");
 }

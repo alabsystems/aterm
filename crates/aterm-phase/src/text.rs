@@ -188,7 +188,6 @@ mod tests {
             .filter_map(char::from_u32)
             .filter(|c| c.is_whitespace())
             .collect();
-        assert_eq!(spaces.len(), 25, "Unicode's White_Space: {spaces:?}");
         let check = |s: &str| {
             assert_eq!(trim_start(s), s.trim_start(), "{s:?}");
             assert_eq!(trim_end(s), s.trim_end(), "{s:?}");

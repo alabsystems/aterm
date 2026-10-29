@@ -161,21 +161,6 @@ fn showcase_try_then_keep_writes_config_once() {
 }
 
 #[test]
-fn showcase_keep_on_a_split_writes_only_the_shown_side() {
-    let (_service, mut runtime, instance, view) =
-        themes_view("theme = \"dark:Nord,light:Solarized Light\"\n");
-    let card = card_action(&runtime, view, "Gruvbox Light");
-    let _ = act(&mut runtime, instance, view, &card, None);
-    let kept = act(&mut runtime, instance, view, "settings/showcase/keep", None);
-    let patches = config_patches(&kept);
-    assert_eq!(patches.len(), 1);
-    assert_eq!(
-        patches[0].0.edits[0].value.as_deref(),
-        Some("dark:Nord,light:Gruvbox Light")
-    );
-}
-
-#[test]
 fn showcase_keep_with_no_theme_writes_the_plain_name() {
     let keep = |source: &str, id: &str| {
         let (mut service, mut runtime, instance, view) = themes_view(source);
@@ -451,22 +436,16 @@ fn every_themes_screen_names_its_section(scale: f32) {
             let _ = act(&mut runtime, instance, view, "settings/showcase/pack", None);
         }
         let cards = state(&runtime, view).showcase.cards.clone();
-        // The list captions its sections where its room holds a caption's band over its tallest
-        // row (`captions` in `section_items`); a shorter one names no section over its rows.
+        let row = showcase_page::chooser_row_height();
         let mut tallest = 0.0_f32;
-        each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
+        let mut screens = Vec::new();
+        each_screen_of(&mut runtime, instance, view, &cx, |state, compiled, top| {
             for node in &compiled.semantics {
                 if node.role == SemanticRole::ListBoxOption && !node.offscreen {
                     tallest = tallest.max(node.rect.height);
                 }
             }
-        });
-        let row = showcase_page::chooser_row_height();
-        each_screen_of(&mut runtime, instance, view, &cx, |state, compiled, top| {
             let list = rect_of(compiled, "settings/showcase/list");
-            if list.height + 0.5 < row + tallest.max(row) {
-                return;
-            }
             // A screen that starts on a row the list holds whole only without its section's
             // caption starts bare ([`scroll::ScrollPlan::starts_bare`]): the whole row wins.
             // Every other screen inside a section names it, whatever row of it does not fit
@@ -507,35 +486,54 @@ fn every_themes_screen_names_its_section(scale: f32) {
                 !node.offscreen && node.rect.y >= list.y - 0.5 && node.rect.y < list.bottom()
             };
             let community_caption = Section::Community.caption().unwrap_or_default();
-            assert!(
-                !(compiled
-                    .semantics
-                    .iter()
-                    .filter(on_screen)
-                    .any(|node| node.key.as_str() == "settings/showcase/pack")
-                    && compiled.semantics.iter().filter(on_screen).any(|node| {
-                        node.role == SemanticRole::Heading && node.label == community_caption
-                    })),
-                "{scale}\u{d7} {width}x{height} screen {top}: Community and COMMUNITY on one screen"
-            );
-            if card.section == Section::Community {
-                community += 1;
-            }
+            let both = compiled
+                .semantics
+                .iter()
+                .filter(on_screen)
+                .any(|node| node.key.as_str() == "settings/showcase/pack")
+                && compiled.semantics.iter().filter(on_screen).any(|node| {
+                    node.role == SemanticRole::Heading && node.label == community_caption
+                });
             let heading = compiled
                 .semantics
                 .iter()
                 .filter(drawn)
                 .any(|node| node.role == SemanticRole::Heading && node.label == caption);
+            let in_community = card.section == Section::Community;
+            screens.push((
+                list.height,
+                top,
+                slug.to_string(),
+                caption,
+                in_community,
+                both,
+                heading || in_community && disclosure,
+                heading && disclosure && in_community,
+            ));
+        });
+        // The list captions its sections where its room holds a caption's band over its tallest
+        // row (`captions` in `section_items`); a shorter one names no section over its rows.
+        for (list_height, top, slug, caption, in_community, both, named, twice) in screens {
+            if list_height + 0.5 < row + tallest.max(row) {
+                continue;
+            }
             assert!(
-                heading || card.section == Section::Community && disclosure,
+                !both,
+                "{scale}\u{d7} {width}x{height} screen {top}: Community and COMMUNITY on one screen"
+            );
+            if in_community {
+                community += 1;
+            }
+            assert!(
+                named,
                 "{scale}\u{d7} {width}x{height} screen {top}: {slug} with no {caption} over it"
             );
             assert!(
-                !(heading && disclosure && card.section == Section::Community),
+                !twice,
                 "{scale}\u{d7} {width}x{height} screen {top}: Community over COMMUNITY"
             );
             inside += 1;
-        });
+        }
     }
     assert!(inside > 0, "some screen starts inside a captioned section");
     assert!(
@@ -3745,6 +3743,197 @@ fn the_keyboards_theme_row_is_whole_under_a_pinned_filter() {
     });
 }
 
+/// The repo's faces for a terminal font change, whatever the host's: a UI face with no row check
+/// or warning (Chewy), and a terminal face whose check is wider than the fallback's (Noto Sans
+/// Symbols 2).
+#[cfg(target_os = "macos")]
+const UI_FACE: &[u8] = include_bytes!("../../aterm-render/assets/game/Chewy-Regular.ttf");
+#[cfg(target_os = "macos")]
+const WIDER_CHECK: &[u8] =
+    include_bytes!("../../aterm-render/assets/bundled/NotoSansSymbols2-Regular.ttf");
+
+/// Theme rows kept at a width ([`ShowcaseState::rows_tallest`]) list as they measure there.
+#[test]
+fn theme_rows_kept_at_a_width_list_as_they_measure() {
+    super::at_each_text_scale(&[1.0, 2.0], "kept theme rows", |scale| {
+        let (_service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
+        for filter in [None, Some("dark")] {
+            if let Some(text) = filter {
+                let _ = act(
+                    &mut runtime,
+                    instance,
+                    view,
+                    "settings/showcase/filter",
+                    Some(text),
+                );
+            }
+            let state = state(&runtime, view);
+            for inner in [148.0, 228.0, 300.0, 944.0] {
+                for narrow in [false, true] {
+                    let at = (inner, narrow);
+                    let measured = showcase_page::list_heights(state, at, None);
+                    assert_eq!(
+                        showcase_page::list_heights(state, at, Some(|height| height)),
+                        measured,
+                        "{scale}\u{d7}, {filter:?}, {inner}pt, narrow {narrow}: kept rows"
+                    );
+                    // Negative control: the list reads the kept rows, not rows measured again.
+                    assert_ne!(
+                        showcase_page::list_heights(state, at, Some(|height| height + 1.0)),
+                        measured,
+                        "{scale}\u{d7}, {filter:?}, {inner}pt, narrow {narrow}: the control"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Each window at `scale` whose Themes frame, once the terminal's face changed, is unlike its
+/// twin's that `forget` dropped what it measured: views opened on `config` and the catalog
+/// `themes` (none: the fixture's), in [`UI_FACE`], the terminal's face none, then
+/// [`WIDER_CHECK`]. Every kept frame is drawn before any twin forgets, as a memo `forget` drops
+/// may be every view's.
+#[cfg(target_os = "macos")]
+fn terminal_font_change_faults(
+    scale: f32,
+    (config, themes): (&str, &[(String, aterm_types::ColorScheme)]),
+    forget: impl Fn(&ShowcaseState),
+) -> Vec<String> {
+    let (_, ui) = aterm_render::shared_parsed_face(UI_FACE, 0).expect("the repo's UI face");
+    let cx_at = |width: f32, height: f32| {
+        let cx = view_cx_at(width, height);
+        crate::tray_raster::set_ui_face_for_test(&ui);
+        cx
+    };
+    let check = || {
+        let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Accent);
+        crate::tray_raster::ui_text_width_for(face, "\u{2713}", px)
+    };
+    let windows: Vec<(f32, f32)> = (164..=482)
+        .step_by(6)
+        .flat_map(|width| [(width as f32, 152.0), (width as f32, 348.0)])
+        .collect();
+    crate::tray_raster::set_chrome_fonts(None, None, None);
+    crate::tray_raster::set_ui_face_for_test(&ui);
+    let before = check();
+    let open = |(width, height): (f32, f32)| {
+        let (mut service, mut runtime, instance, view) = themes_view(config);
+        if !themes.is_empty() {
+            let _ = admit_catalog(&mut service, &mut runtime, instance, view, themes.to_vec());
+        }
+        let _ = compile_settings_view(&runtime, instance, view, &cx_at(width, height));
+        (runtime, instance, view)
+    };
+    let pairs: Vec<_> = windows
+        .iter()
+        .map(|&window| (open(window), open(window)))
+        .collect();
+    crate::tray_raster::set_chrome_fonts(Some((WIDER_CHECK.into(), 0)), None, None);
+    crate::tray_raster::set_ui_face_for_test(&ui);
+    assert!(
+        check() > before + 2.0,
+        "premise: the terminal's face measures the check ({before}pt, then {}pt)",
+        check()
+    );
+    let kept: Vec<_> = windows
+        .iter()
+        .zip(&pairs)
+        .map(|(&(width, height), ((runtime, instance, view), _))| {
+            compile_settings_view(runtime, *instance, *view, &cx_at(width, height))
+        })
+        .collect();
+    let mut faults = Vec::new();
+    for ((&(width, height), (_, (measured, at, dropped))), kept) in
+        windows.iter().zip(&pairs).zip(kept)
+    {
+        let cx = cx_at(width, height);
+        forget(&state(measured, *dropped).showcase);
+        let fresh = compile_settings_view(measured, *at, *dropped, &cx);
+        if kept != fresh {
+            // The first line of the frame that differs, under the last key named over it.
+            let (kept, fresh) = (format!("{kept:#?}"), format!("{fresh:#?}"));
+            let (mut key, mut naming) = ("", false);
+            let moved = kept
+                .lines()
+                .zip(fresh.lines())
+                .find(|(kept, fresh)| {
+                    let line = kept.trim();
+                    if naming {
+                        key = line;
+                    }
+                    naming = line == "key: UiKey(";
+                    kept != fresh
+                })
+                .map_or_else(
+                    || "a part more or less".to_string(),
+                    |(kept, fresh)| format!("{key} {}, fresh {}", kept.trim(), fresh.trim()),
+                );
+            faults.push(format!("{scale}\u{d7} {width}x{height}: {moved}"));
+        }
+    }
+    faults
+}
+
+/// A TERMINAL FONT CHANGE MEASURES THE CHOOSER'S ROWS AGAIN: chrome text measures a char the UI
+/// face lacks in the terminal's face first, so once that face changes a view draws what it draws
+/// with the chooser's kept tallest row dropped ([`terminal_font_change_faults`]).
+/// Negative control: kept by the UI faces alone, the tallest row went stale in 10 of these
+/// windows, the frame unlike its twin's (188x348 kept it 168pt tall, not 224pt, and led its list
+/// with the Built-in caption where its twin led with Default's row).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_terminal_font_change_measures_the_choosers_rows_again() {
+    super::at_each_text_scale(&[2.0], "terminal font", |scale| {
+        let faults = terminal_font_change_faults(scale, ("theme = \"Nord\"\n", &[]), |showcase| {
+            showcase.rows_tallest.borrow_mut().clear();
+            showcase.blocks_kept.borrow_mut().clear();
+        });
+        assert!(
+            faults.is_empty(),
+            "{} windows draw other than with the tallest row measured again:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+    });
+}
+
+/// A TERMINAL FONT CHANGE MEASURES THE THEMES' NAMES AGAIN: where the UI face lacks a char of a
+/// name, the least of it the chooser keeps beside a row's slab and the lines it takes in the
+/// strip are measured in the terminal's face, so once that face changes a view draws what it
+/// draws with every measure of its names dropped ([`terminal_font_change_faults`]).
+/// Negative control: kept by the cards and the text scale alone, they went stale in 34 of these
+/// windows: the page's stops stood up to 36pt off (200x348: the Themes heading's at -568pt, fresh
+/// -604pt), or the list's thumb read otherwise.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_terminal_font_change_measures_the_theme_names_again() {
+    use aterm_types::Appearance::{Dark, Light};
+    let themes = [
+        user_scheme("harbour", Dark),
+        user_scheme("\u{2713}\u{2713}\u{2713}\u{2713} Dusk", Dark),
+        user_scheme(
+            "Paper \u{2713}\u{2713}\u{2713}\u{2713}\u{2713} \u{26a0}\u{26a0}\u{26a0} Light",
+            Light,
+        ),
+    ];
+    super::at_each_text_scale(&[2.0], "terminal font", |scale| {
+        let faults =
+            terminal_font_change_faults(scale, ("theme = \"harbour\"\n", &themes), |showcase| {
+                showcase.name_floors.borrow_mut().clear();
+                showcase_page::forget_strip_names();
+                showcase.rows_tallest.borrow_mut().clear();
+                showcase.blocks_kept.borrow_mut().clear();
+            });
+        assert!(
+            faults.is_empty(),
+            "{} windows draw other than with the names measured again:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+    });
+}
+
 #[test]
 fn highlight_is_the_trial() {
     let (_service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
@@ -4069,7 +4258,9 @@ fn keep_files_a_theme_by_the_side_it_is_made_for() {
     };
     let keep = |runtime: &mut NativeRuntime, instance, view| -> Option<String> {
         let kept = act(runtime, instance, view, "settings/showcase/keep", None);
-        config_patches(&kept)
+        let patches = config_patches(&kept);
+        assert_eq!(patches.len(), 1, "one write a keep");
+        patches
             .first()
             .and_then(|(patch, _)| patch.edits[0].value.clone())
     };

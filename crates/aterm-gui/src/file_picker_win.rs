@@ -88,6 +88,23 @@ struct IShellItem {
     vtbl: *const IShellItemVtbl,
 }
 
+const _: () = {
+    use core::mem::{offset_of, size_of};
+    const W: usize = size_of::<usize>();
+    assert!(size_of::<IFileOpenDialogVtbl>() == 21 * W);
+    assert!(size_of::<IShellItemVtbl>() == 6 * W);
+    assert!(offset_of!(IFileOpenDialogVtbl, release) == 2 * W);
+    assert!(offset_of!(IFileOpenDialogVtbl, show) == 3 * W);
+    assert!(offset_of!(IFileOpenDialogVtbl, set_file_types) == 4 * W);
+    assert!(offset_of!(IFileOpenDialogVtbl, set_options) == 9 * W);
+    assert!(offset_of!(IFileOpenDialogVtbl, get_options) == 10 * W);
+    assert!(offset_of!(IFileOpenDialogVtbl, set_title) == 17 * W);
+    assert!(offset_of!(IFileOpenDialogVtbl, set_ok_button_label) == 18 * W);
+    assert!(offset_of!(IFileOpenDialogVtbl, get_result) == 20 * W);
+    assert!(offset_of!(IShellItemVtbl, release) == 2 * W);
+    assert!(offset_of!(IShellItemVtbl, get_display_name) == 5 * W);
+};
+
 /// `HRESULT_FROM_WIN32(ERROR_CANCELLED)`: what `IModalWindow::Show` returns when the user
 /// dismisses the dialog.
 const HRESULT_CANCELLED: i32 = 0x8007_04C7u32 as i32;
@@ -314,82 +331,10 @@ unsafe fn show_dialog<N: AsRef<str>, S: AsRef<str>>(
 mod tests {
     use super::{
         ALL_FILES, FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM,
-        FOS_NODEREFERENCELINKS, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FilterSpecs,
-        IFileOpenDialogVtbl, IShellItemVtbl, dialog_options, image_rows, is_cancelled,
-        path_from_nul_terminated,
+        FOS_NODEREFERENCELINKS, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FilterSpecs, dialog_options,
+        image_rows, is_cancelled, path_from_nul_terminated,
     };
     use std::path::PathBuf;
-
-    /// Pins the hand-rolled vtables' shape, as `task_dialog_config_layout_matches_the_sdk`
-    /// does for TASKDIALOGCONFIG: a dropped or reordered uncalled slot compiles and turns a
-    /// call into a wild indirect call.
-    #[test]
-    fn com_vtable_layout_matches_the_documented_slot_order() {
-        use std::mem::{offset_of, size_of};
-
-        assert_eq!(
-            size_of::<IFileOpenDialogVtbl>(),
-            21 * size_of::<usize>(),
-            "IFileOpenDialog vtable is IUnknown(3) + IModalWindow(1) + IFileDialog(17)"
-        );
-        assert_eq!(
-            size_of::<IShellItemVtbl>(),
-            6 * size_of::<usize>(),
-            "IShellItem vtable is IUnknown(3) + BindToHandler/GetParent/GetDisplayName"
-        );
-
-        let slot = |bytes: usize| bytes / size_of::<usize>();
-        assert_eq!(
-            slot(offset_of!(IFileOpenDialogVtbl, release)),
-            2,
-            "IUnknown::Release"
-        );
-        assert_eq!(
-            slot(offset_of!(IFileOpenDialogVtbl, show)),
-            3,
-            "IModalWindow::Show"
-        );
-        assert_eq!(
-            slot(offset_of!(IFileOpenDialogVtbl, set_file_types)),
-            4,
-            "IFileDialog::SetFileTypes"
-        );
-        assert_eq!(
-            slot(offset_of!(IFileOpenDialogVtbl, set_options)),
-            9,
-            "SetOptions"
-        );
-        assert_eq!(
-            slot(offset_of!(IFileOpenDialogVtbl, get_options)),
-            10,
-            "GetOptions"
-        );
-        assert_eq!(
-            slot(offset_of!(IFileOpenDialogVtbl, set_title)),
-            17,
-            "SetTitle"
-        );
-        assert_eq!(
-            slot(offset_of!(IFileOpenDialogVtbl, set_ok_button_label)),
-            18,
-            "SetOkButtonLabel"
-        );
-        assert_eq!(
-            slot(offset_of!(IFileOpenDialogVtbl, get_result)),
-            20,
-            "GetResult is LAST"
-        );
-        assert_eq!(
-            slot(offset_of!(IShellItemVtbl, release)),
-            2,
-            "IUnknown::Release"
-        );
-        assert_eq!(
-            slot(offset_of!(IShellItemVtbl, get_display_name)),
-            5,
-            "IShellItem::GetDisplayName is LAST"
-        );
-    }
 
     /// Read one built `COMDLG_FILTERSPEC` row back through its raw pointers, the
     /// way the shell will.

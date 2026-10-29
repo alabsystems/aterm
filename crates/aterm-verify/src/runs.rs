@@ -1156,24 +1156,9 @@ pub fn run_roots(root: &Path, scratch: &Path, target: &Path, built: &[PathBuf]) 
     roots
 }
 
-/// `path` with every link resolved as far as it exists, and the rest appended as written.
-#[must_use]
-pub fn canonical(path: &Path) -> PathBuf {
-    let mut tail = Vec::new();
-    let mut at = path;
-    loop {
-        if let Ok(real) = std::fs::canonicalize(at) {
-            return tail.iter().rev().fold(real, |acc, name| acc.join(name));
-        }
-        match (at.parent(), at.file_name()) {
-            (Some(parent), Some(name)) => {
-                tail.push(name.to_owned());
-                at = parent;
-            }
-            _ => return path.to_path_buf(),
-        }
-    }
-}
+/// `path` with every link resolved as far as it exists, and the rest appended as written: the
+/// spelling disk admission tags a run's directories by too.
+pub use atpkg::admit_disk::canonical;
 
 /// Build the `targo metadata` command for the main lane ([`crate::stages::main_targo`]).
 #[must_use]

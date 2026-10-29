@@ -1,0 +1,19 @@
+seq v=1 rig=transcript program=claude build=2.1.311
+# Fix E1 (E2E-7): the screen's settle closed the turn before the tool's result
+# row was read, so the turn's close cascaded its open step `gone`. The result,
+# read at partial, then gives that step its real outcome at strong: a step's
+# `gone` is its turn's cascade, never an observation.
+state partial
+bind 0
+see busy
+expect open t1 turn par=r1 src=screen conf=strong
+tx prompt v1
+tx tool c1
+expect open p1 tool par=t1 vref=c1 by=vendor src=transcript conf=strong
+see idle
+wait 1000
+expect close p1 tool out=gone src=screen conf=strong
+expect close t1 turn out=done src=screen conf=strong
+expect turn=none
+tx result c1
+expect amend p1 tool out=ok by=vendor src=transcript conf=strong

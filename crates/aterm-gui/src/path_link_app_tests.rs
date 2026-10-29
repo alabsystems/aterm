@@ -508,12 +508,12 @@ fn a_citation_resolves_only_while_the_session_runs_here() {
         b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b]633;E;ssh build-box\x07\x1b]133;C\x07",
     );
     assert_eq!(
-        crate::session_status::executing_detail(&term_lock(
+        crate::session_status::executing_candidate(&term_lock(
             &app.front_terminal(wid).unwrap().term.clone()
         ))
         .as_deref(),
         Some("ssh"),
-        "precondition: detail=ssh"
+        "precondition: the running command reads ssh"
     );
     assert_eq!(press(&app), None, "a remote shell as the running command");
     feed(

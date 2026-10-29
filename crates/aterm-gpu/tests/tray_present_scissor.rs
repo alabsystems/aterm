@@ -38,7 +38,7 @@ fn harvest(
             gpu.present_virtual(&mut win, input, false, None, *tray),
             "the virtual present cannot drop"
         );
-        gpu.video_after_present(&mut win, i as u64 + 1);
+        gpu.video_after_present(&mut win, (i as u64 + 1) * 1_000);
     }
     let take = gpu.video_finish(&mut win).expect("virtual take").settle();
     assert_eq!(

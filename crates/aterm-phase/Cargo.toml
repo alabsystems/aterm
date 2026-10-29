@@ -24,6 +24,7 @@ workspace = true
 aterm-agent-names = { workspace = true }
 
 [dev-dependencies]
+aterm-regex = { workspace = true }
 aterm-tempfile = { workspace = true }
 # The explicit vendor_drift bench resolves managed builds through
 # `aterm pkg which` using the workspace's child builder. The library remains

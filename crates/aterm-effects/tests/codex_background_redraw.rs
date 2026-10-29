@@ -5,7 +5,7 @@
 
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::Terminal;
-use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
+use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig};
 use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
 use std::time::{Duration, Instant};
 
@@ -69,15 +69,8 @@ impl Host {
             self.glow.observe_ribbon_row(*row, &self.buf);
         }
         let cfg = GlowConfig {
-            classic_mono: false,
-            ribbon_tall: true,
-            ribbon_flat: false,
-            enabled: true,
-            dark_theme: true,
             theme_fg: 0x00c8_d3f5,
             theme_bg: 0x001a_1b26,
-            style: GlowStyle::RainbowKitty,
-            color: 0x0050_fa7b,
             accent: 0x007a_a2f7,
             duration: Duration::from_millis(240),
             length: 18,
@@ -85,8 +78,7 @@ impl Host {
             audible: true,
             radius: 0.6,
             ring: true,
-            beam: false,
-            head_dx: 0.5,
+            ..Default::default()
         };
         let geom = Geom {
             cw: 8,

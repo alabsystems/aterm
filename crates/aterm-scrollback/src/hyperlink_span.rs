@@ -56,14 +56,6 @@ impl HyperlinkSpan {
         col >= self.start_col && col < self.end_col
     }
 
-    /// Get the span width in columns.
-    #[inline]
-    #[must_use]
-    #[cfg(test)]
-    pub const fn width(&self) -> u16 {
-        self.end_col.saturating_sub(self.start_col)
-    }
-
     /// Serialized size in bytes for memory accounting, as in the v3 record:
     /// start_col (u16) + end_col (u16) + url_len (u32) + url + id_len (u32) + id.
     #[must_use]

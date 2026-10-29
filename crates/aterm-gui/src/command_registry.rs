@@ -216,6 +216,25 @@ pub(crate) fn native_document_action(action: &str) -> Option<CommandSpec> {
         "editor/goto-line" => spec("document.goto_line", S::Document, A::LocalUi, C::Native),
         "editor/commands" => spec("document.commands", S::Document, A::LocalUi, C::Native),
         "editor/revert" => spec("document.revert", S::Document, A::DocumentWrite, C::Native),
+        "editor/grid-toggle" => spec("document.grid_toggle", S::View, A::LocalUi, C::Native),
+        "editor/grid-insert-row" => spec(
+            "document.grid_insert_row",
+            S::Document,
+            A::DocumentWrite,
+            C::Native,
+        ),
+        "editor/grid-delete-row" => spec(
+            "document.grid_delete_row",
+            S::Document,
+            A::DocumentWrite,
+            C::Native,
+        ),
+        "editor/keep-local" => spec(
+            "document.keep_local",
+            S::Document,
+            A::DocumentWrite,
+            C::Native,
+        ),
         "editor/finish" => spec(
             "document.finish_edit",
             S::Document,
@@ -368,6 +387,27 @@ mod tests {
             menu_command(menu::MenuAction::ToggleSettings).authority
         );
         assert_eq!(system_state.content, ContentRequirement::Any);
+
+        let all_actions: Vec<menu::MenuAction> =
+            (0..=128).filter_map(menu::MenuAction::from_tag).collect();
+        assert!(
+            all_actions.len() >= 78,
+            "expected the full MenuAction table, got {}",
+            all_actions.len()
+        );
+        let mut seen_ids = std::collections::HashSet::with_capacity(all_actions.len());
+        for action in all_actions {
+            let cmd = menu_command(action);
+            assert!(
+                !cmd.id.as_str().is_empty(),
+                "{action:?} has empty command id"
+            );
+            assert!(
+                seen_ids.insert(cmd.id),
+                "duplicate CommandId {:?} on {action:?}",
+                cmd.id
+            );
+        }
     }
 
     #[test]
@@ -400,18 +440,6 @@ mod tests {
         assert!(native_document_action(&out_of_range).is_none());
         assert!(native_document_action("editor/config-completion/0/save").is_none());
         assert!(native_document_action("markdown/unknown/7").is_none());
-    }
-
-    #[test]
-    fn editor_mutations_and_navigation_have_distinct_authority() {
-        assert_eq!(
-            editor_command(crate::native_editor::EditorCommand::GotoLine).authority,
-            ActionAuthority::LocalUi
-        );
-        assert_eq!(
-            editor_command(crate::native_editor::EditorCommand::RevertBuffer).authority,
-            ActionAuthority::DocumentWrite
-        );
     }
 
     #[test]

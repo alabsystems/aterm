@@ -97,9 +97,15 @@ fn file_verdict(
 
 /// Reads `name` inside private directory `dir` up to `max` bytes.
 /// # Errors
-/// Returns [`PrivateFileError`] if `dir` or `name` is missing, symlinked, not private, or too big.
+/// As [`open_private`], and [`PrivateFileError::Malformed`] when the file holds more than
+/// `max` bytes or [`PrivateFileError::Io`] when it cannot be read.
 pub fn read_private(dir: &Path, name: &str, max: usize) -> Result<Vec<u8>, PrivateFileError> {
     let (file, _meta) = open_private(dir, name)?;
+    read_capped(file, max)
+}
+
+/// `file`'s bytes, refused when there are more than `max` ([`read_capped_into`] for a vector).
+fn read_capped(file: std::fs::File, max: usize) -> Result<Vec<u8>, PrivateFileError> {
     let mut bytes = Vec::with_capacity(max.min(64 * 1024) + 1);
     file.take((max as u64).saturating_add(1))
         .read_to_end(&mut bytes)
@@ -126,6 +132,7 @@ fn one_component_io(name: &str) -> io::Result<()> {
     }
 }
 
+#[derive(Clone, Copy)]
 enum DirIs {
     /// There is none.
     Missing,
@@ -168,9 +175,56 @@ fn dir_is(dir: &Path) -> io::Result<DirIs> {
     })
 }
 
+/// A directory judged once under [`open_private`]'s directory rules, so that several of its
+/// files open and read with one directory check between them instead of one each; each file
+/// is still looked up, opened and judged on its open descriptor as [`open_private`] does.
+/// aterm-journal's per-access `intact` check opens four. The verdict is the directory's when
+/// [`JudgedDir::judge`] took it: use it for opens made at once, never across a wait.
+pub struct JudgedDir<'a> {
+    dir: &'a Path,
+    judged: DirIs,
+}
+
+impl<'a> JudgedDir<'a> {
+    /// `dir`'s verdict, taken now. A missing, linked, foreign or open directory is no error
+    /// here: each [`Self::open`] refuses on it as [`open_private`] would.
+    /// # Errors
+    /// [`PrivateFileError::Io`] when the directory could not be judged.
+    pub fn judge(dir: &'a Path) -> Result<Self, PrivateFileError> {
+        Ok(Self {
+            dir,
+            judged: dir_is(dir).map_err(PrivateFileError::Io)?,
+        })
+    }
+
+    /// [`open_private`] of `name` under this verdict.
+    /// # Errors
+    /// As [`open_private`].
+    pub fn open(&self, name: &str) -> Result<(std::fs::File, std::fs::Metadata), PrivateFileError> {
+        if !one_component(name) {
+            return Err(PrivateFileError::Malformed(ONE_COMPONENT));
+        }
+        open_in(self.dir, self.judged, name, Opening::Read).map(|(file, meta, _loose)| (file, meta))
+    }
+
+    /// [`read_private`] of `name` under this verdict.
+    /// # Errors
+    /// As [`read_private`].
+    pub fn read(&self, name: &str, max: usize) -> Result<Vec<u8>, PrivateFileError> {
+        let (file, _meta) = self.open(name)?;
+        read_capped(file, max)
+    }
+}
+
 /// Opens `name` in `dir` under [`read_private`] rules and returns the file and metadata.
 /// # Errors
-/// Returns [`PrivateFileError`] if `dir` or `name` is missing, symlinked, or not owner-private.
+/// [`PrivateFileError::Missing`] when `dir` or `name` is missing; [`PrivateFileError::Symlink`]
+/// when either is a symlink; [`PrivateFileError::NotPrivate`] when either is another user's,
+/// has an access list or a group or other mode bit, or the file has a second link (one replaced
+/// or removed since the open, which has none, opens as it stood then);
+/// [`PrivateFileError::Malformed`] when `name` is more than one path component, `dir` is no
+/// directory or the file no regular file; [`PrivateFileError::Io`] when a lookup, open or
+/// judgement fails otherwise.
 pub fn open_private(
     dir: &Path,
     name: &str,
@@ -187,11 +241,21 @@ fn open_judged(
     name: &str,
     how: Opening,
 ) -> Result<(std::fs::File, std::fs::Metadata, bool), PrivateFileError> {
-    use std::os::unix::fs::MetadataExt as _;
     if !one_component(name) {
         return Err(PrivateFileError::Malformed(ONE_COMPONENT));
     }
     let judged = dir_is(dir).map_err(PrivateFileError::Io)?;
+    open_in(dir, judged, name, how)
+}
+
+/// [`open_judged`] once `name` is known to be one component and `dir` has been judged:
+/// the file looked up, opened and judged under `judged`, `dir`'s verdict.
+fn open_in(
+    dir: &Path,
+    judged: DirIs,
+    name: &str,
+    how: Opening,
+) -> Result<(std::fs::File, std::fs::Metadata, bool), PrivateFileError> {
     match judged {
         DirIs::Missing => return Err(PrivateFileError::Missing),
         DirIs::Symlink => return Err(PrivateFileError::Symlink),
@@ -243,11 +307,28 @@ fn open_judged(
         }
         Err(e) => return Err(PrivateFileError::Io(e)),
     };
-    let (meta, file_loose) = file_verdict(&file, how)?;
-    if meta.nlink() != 1 {
-        return Err(PrivateFileError::NotPrivate(ANOTHER_LINK));
-    }
+    let (file, meta, file_loose) = judge_opened(file, how)?;
     Ok((file, meta, dir_loose || file_loose))
+}
+
+/// `file`, just opened as `how` says, judged on its descriptor ([`file_verdict`]) and by its
+/// links. A second link is another copy of it. None is a name replaced or removed since the
+/// open (an atomic write's rename over it, as each fleet heartbeat's rewrite of the book makes):
+/// a read takes the whole file as it stood at the open, while a read-write opening is
+/// [`PrivateFileError::Missing`], as its writes would reach no name.
+fn judge_opened(
+    file: std::fs::File,
+    how: Opening,
+) -> Result<(std::fs::File, std::fs::Metadata, bool), PrivateFileError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let (meta, file_loose) = file_verdict(&file, how)?;
+    match meta.nlink() {
+        1 => {}
+        0 if how == Opening::ReadWrite => return Err(PrivateFileError::Missing),
+        0 => {}
+        _ => return Err(PrivateFileError::NotPrivate(ANOTHER_LINK)),
+    }
+    Ok((file, meta, file_loose))
 }
 
 /// `path` opened read and write with the extra open `flags`, created when missing and then
@@ -283,7 +364,8 @@ fn open_rw_created_0600(path: &Path, flags: libc::c_int) -> io::Result<std::fs::
 /// # Errors
 ///
 /// As [`read_private`]; a missing file is created exactly 0600 whatever the umask, not
-/// `Missing` (that only for one removed between the creating open and the plain one).
+/// `Missing` (that only for one removed between the creating open and the plain one, or
+/// replaced or removed after its open).
 pub fn open_private_rw(dir: &Path, name: &str) -> Result<std::fs::File, PrivateFileError> {
     open_judged(dir, name, Opening::ReadWrite).map(|(file, _meta, _loose)| file)
 }
@@ -610,6 +692,89 @@ pub fn create_private_dir(dir: &Path) -> io::Result<()> {
     check_private_dir(dir)
 }
 
+/// Acquire an exclusive lock on an already validated file, waiting only for
+/// actual lock contention until `deadline`. A first attempt is always made,
+/// including when the deadline has passed. Other I/O errors return immediately.
+/// The caller must keep the file private, recheck its identity after acquisition,
+/// and explicitly unlock it before closing or transferring ownership.
+///
+/// # Errors
+/// Returns `WouldBlock` with `busy` when the lock remains held at the deadline,
+/// or the original error of attempting the lock.
+pub fn lock_exclusive_until(file: &std::fs::File, deadline: Instant, busy: &str) -> io::Result<()> {
+    lock_exclusive_until_with(file, deadline, busy, || {})
+}
+
+/// [`lock_exclusive_until`], calling `held` after each actual contention result
+/// before waiting. A test may release its holder there without timing assumptions.
+///
+/// # Errors
+/// Returns [`lock_exclusive_until`]'s errors.
+pub fn lock_exclusive_until_with(
+    file: &std::fs::File,
+    deadline: Instant,
+    busy: &str,
+    mut held: impl FnMut(),
+) -> io::Result<()> {
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the caller retains the validated file and explicitly unlocks before close"
+        )]
+        let taken = file.try_lock();
+        match taken {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, busy.to_owned()));
+                }
+                #[cfg(any(test, debug_assertions))]
+                LOCK_WAIT_OBSERVER.with(|observer| {
+                    if let Some(observer) = observer.borrow_mut().as_mut() {
+                        observer(file);
+                    }
+                });
+                held();
+                std::thread::sleep(backoff.min(remaining));
+                backoff = (backoff * 2).min(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+type LockWaitObserver = Box<dyn FnMut(&std::fs::File)>;
+
+#[cfg(any(test, debug_assertions))]
+std::thread_local! {
+    static LOCK_WAIT_OBSERVER: std::cell::RefCell<Option<LockWaitObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test support: observe actual, unexpired lock contention on this thread while
+/// `run` executes. The previous observer is restored even if `run` unwinds.
+/// The observer must not recursively acquire a contended lock on this thread.
+#[cfg(any(test, debug_assertions))]
+pub fn with_lock_wait_observer<T>(
+    observer: impl FnMut(&std::fs::File) + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<LockWaitObserver>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LOCK_WAIT_OBSERVER.with(|observer| {
+                *observer.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let previous = LOCK_WAIT_OBSERVER.with(|current| current.replace(Some(Box::new(observer))));
+    let _restore = Restore(previous);
+    run()
+}
+
 /// An exclusive lock on `<dir>/<name>`, lifted from aterm-net's `fleet_member` (`BookLock`).
 ///
 /// - **How it is opened.** `name` must be one path component, and `dir` must pass
@@ -715,6 +880,39 @@ mod tests {
 
     /// The busy text the lock tests hand [`PrivateLock::take`].
     const BUSY: &str = "another holder has it";
+
+    #[test]
+    fn exclusive_wait_observes_contention_and_acquires_after_release() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let dir = dir_in(root.path(), "state", 0o700);
+        let mut first =
+            Some(PrivateLock::take(&dir, ".lock", std::time::Duration::ZERO, BUSY).unwrap());
+        let (second, _) = super::open_private(&dir, ".lock").unwrap();
+        let mut told = 0;
+        super::lock_exclusive_until_with(
+            &second,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            BUSY,
+            || {
+                told += 1;
+                drop(first.take());
+            },
+        )
+        .unwrap();
+        assert_eq!(told, 1, "only actual lock contention is waited for");
+        let mut retried = false;
+        let refused = super::lock_exclusive_until_with(
+            &super::open_private(&dir, ".lock").unwrap().0,
+            std::time::Instant::now(),
+            BUSY,
+            || retried = true,
+        )
+        .unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(refused.to_string(), BUSY);
+        assert!(!retried, "an expired deadline does not retry a held lock");
+        second.unlock().unwrap();
+    }
 
     /// With one lock held, a second take that does not wait is `WouldBlock` with the busy
     /// text; once the first is dropped, a second take succeeds.
@@ -1065,6 +1263,60 @@ mod tests {
         assert!(matches!(
             read_private_into(&loose, "token", 64, &mut buf),
             Err(PrivateFileError::NotPrivate(_))
+        ));
+    }
+
+    /// A [`super::JudgedDir`] reads and opens each file as `read_private` and `open_private`
+    /// do, refusals included, in a private, an open, a linked and a missing directory.
+    #[test]
+    fn a_judged_directory_reads_as_read_private_does() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let state = dir_in(root.path(), "state", 0o700);
+        file_in(&state, "token", b"x", 0o600);
+        file_in(&state, "loose", b"x", 0o644);
+        std::os::unix::fs::symlink(state.join("token"), state.join("link")).unwrap();
+        let open = dir_in(root.path(), "open", 0o755);
+        file_in(&open, "token", b"x", 0o600);
+        let linked = root.path().join("linked");
+        std::os::unix::fs::symlink(&state, &linked).unwrap();
+        file_in(root.path(), "plain", b"x", 0o600);
+        let said = |read: Result<Vec<u8>, PrivateFileError>| match read {
+            Ok(bytes) => format!("{bytes:?}"),
+            Err(e) => format!("{e:?}"),
+        };
+        let mut verdicts = std::collections::BTreeSet::new();
+        let (plain, gone) = (root.path().join("plain"), root.path().join("gone"));
+        for dir in [state, open, linked, plain, gone] {
+            let judged = super::JudgedDir::judge(&dir).unwrap();
+            for name in ["token", "loose", "link", "missing", "sub/token"] {
+                let want = said(read_private(&dir, name, 64));
+                assert_eq!(said(judged.read(name, 64)), want, "{dir:?} {name}");
+                assert_eq!(
+                    judged.open(name).is_ok(),
+                    super::open_private(&dir, name).is_ok(),
+                    "{dir:?} {name}"
+                );
+                verdicts.insert(want);
+            }
+        }
+        // A read, then refusals for a loose file, an open directory, a link, a missing file,
+        // a name of two components and a directory that is a file.
+        assert_eq!(verdicts.len(), 7, "{verdicts:?}");
+    }
+
+    /// A verdict is the directory's when it was judged: opens under it do not judge the
+    /// directory again, and the next verdict sees what changed.
+    #[test]
+    fn a_judged_directory_is_judged_once() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let state = dir_in(root.path(), "state", 0o700);
+        file_in(&state, "token", b"x", 0o600);
+        let judged = super::JudgedDir::judge(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(judged.read("token", 64).unwrap(), b"x");
+        assert!(matches!(
+            super::JudgedDir::judge(&state).unwrap().read("token", 64),
+            Err(PrivateFileError::NotPrivate(super::DIR_OPEN))
         ));
     }
 
@@ -1434,5 +1686,51 @@ mod tests {
             create_private_dir(&orphan).unwrap_err().kind(),
             std::io::ErrorKind::NotFound
         );
+    }
+
+    /// A NAME REPLACED UNDER AN OPEN READ IS NO SECOND LINK: the descriptor of a file an atomic
+    /// write renamed over has no link left, and reads the whole file as it stood at the open.
+    #[test]
+    fn a_file_replaced_after_its_open_reads_as_it_stood_and_a_second_link_stays_refused() {
+        use std::os::unix::fs::MetadataExt as _;
+        let root = aterm_tempfile::tempdir().unwrap();
+        let dir = dir_in(root.path(), "state", 0o700);
+        let open = |how| {
+            let file = match how {
+                super::Opening::ReadWrite => std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(dir.join("book")),
+                _ => astream_sys::open_nonblocking(&dir.join("book"), astream_sys::Links::Refuse),
+            };
+            file.unwrap()
+        };
+        write_private(&dir, "book", b"old").unwrap();
+        let read = open(super::Opening::Read);
+        write_private(&dir, "book", b"new").unwrap();
+        let (file, meta, _) =
+            super::judge_opened(read, super::Opening::Read).expect("a read of the replaced name");
+        assert_eq!(meta.nlink(), 0, "the rename left the open file no link");
+        assert_eq!(super::read_capped(file, 64).unwrap(), b"old");
+        assert_eq!(read_private(&dir, "book", 64).unwrap(), b"new");
+
+        let written = open(super::Opening::ReadWrite);
+        write_private(&dir, "book", b"newer").unwrap();
+        assert!(matches!(
+            super::judge_opened(written, super::Opening::ReadWrite),
+            Err(PrivateFileError::Missing)
+        ));
+
+        std::fs::hard_link(dir.join("book"), dir.join("copy")).unwrap();
+        for how in [super::Opening::Read, super::Opening::ReadWrite] {
+            assert!(matches!(
+                super::judge_opened(open(how), how),
+                Err(PrivateFileError::NotPrivate(super::ANOTHER_LINK))
+            ));
+        }
+        assert!(matches!(
+            read_private(&dir, "book", 64),
+            Err(PrivateFileError::NotPrivate(super::ANOTHER_LINK))
+        ));
     }
 }

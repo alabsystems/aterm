@@ -44,7 +44,7 @@ const BUILTIN: &[(&str, &str)] = &[
     ),
     (
         "file_path",
-        r"(?:/(?:[a-zA-Z0-9._-]+/)*[a-zA-Z0-9._-]+|\.{1,2}/(?:[a-zA-Z0-9._-]+/)*[a-zA-Z0-9._-]+|[A-Za-z]:[/\\](?:[a-zA-Z0-9._-]+[/\\])*[a-zA-Z0-9._-]+)",
+        r"(?:~|\.{1,2}|[a-zA-Z0-9._-]+)?(?:/[a-zA-Z0-9._-]+)+/?|[A-Za-z]:[/\\](?:[a-zA-Z0-9._-]+[/\\])*[a-zA-Z0-9._-]+",
     ),
     (
         "email",
@@ -180,6 +180,13 @@ fn builtin_patterns_select_what_they_are_for() {
             "at ../crates/aterm-regex/src/lib.rs line 3"
         ),
         Some("../crates/aterm-regex/src/lib.rs".to_string())
+    );
+    assert_eq!(
+        find(
+            by_name("file_path"),
+            "error at crates/aterm-regex/src/pikevm.rs:118:9"
+        ),
+        Some("crates/aterm-regex/src/pikevm.rs".to_string())
     );
     assert_eq!(
         find(by_name("file_path"), "open C:\\Users\\dev\\notes.txt now"),
@@ -944,7 +951,7 @@ fn escape_round_trips() {
     pin(ESCAPE_DIGEST);
 }
 
-const BUILTIN_DIGEST: &str = "87b001a3a4dd7d39";
+const BUILTIN_DIGEST: &str = "736c9a64662e49c0";
 const SYNTAX_DIGEST: &str = "d9526bd496b9392f";
 const PERL_DIGEST: &str = "6212cb3a3e2938ec";
 const FOLD_DIGEST: &str = "b91b2d673464fac8";

@@ -22,7 +22,7 @@ fn refuse(reason: &str) -> ExitCode {
 }
 
 /// The `aterm-askpass` argv0 alias entry (`crates/aterm/src/main.rs`).
-#[must_use]
+#[must_use = "return or inspect the command exit status"]
 pub fn main_entry(_args: Vec<std::ffi::OsString>) -> ExitCode {
     let sudo = aterm_uds::sudo::parent_pid();
     if let Err(why) = aterm_uds::sudo::attest_sudo(sudo) {

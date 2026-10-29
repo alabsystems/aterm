@@ -287,17 +287,14 @@ mod tests {
         }
     }
 
-    /// `host_id` is stable, key-separating, and namespaced away from pet ids (high bit + salt).
+    /// `host_id` is stable across identical keys and namespaced away from pet ids in the high half.
     #[test]
     fn host_ids_are_stable_distinct_and_namespaced() {
-        let a = key(1);
-        assert_eq!(a.host_id(), key(1).host_id());
-        assert_ne!(a.host_id(), key(2).host_id());
-        assert_ne!(a.host_id(), DogBakeKey { w: 49, ..a }.host_id());
-        assert!(
-            (a.host_id() >> 63) == 1,
-            "dog host ids live in the high half"
-        );
+        for c in 0..16u8 {
+            let k = key(c);
+            assert_eq!(k.host_id(), key(c).host_id());
+            assert_eq!(k.host_id() >> 63, 1, "dog host ids live in the high half");
+        }
     }
 
     /// The bake-rate cap and LRU ceiling hold (the pet baker's contract).

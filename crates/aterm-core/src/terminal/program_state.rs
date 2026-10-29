@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! OSC 7501 program lifecycle state reports ([`ProgramStateReport::turns`]).
+//! OSC 7501 program lifecycle state reports ([`ProgramStateReport::turns`],
+//! [`ProgramStateReport::turn_edges`]).
 //!
 //! The program status protocol's wire grammar is `OSC 7501 ; key=value(:key=value)* ST`: `state`
 //! required, `app` the program, `kind` on a `blocked` report, `id` naming a child record (absent:
@@ -141,6 +142,33 @@ impl ProgramState {
     }
 }
 
+/// How many turns a report keeps the edges of ([`ProgramStateReport::turn_edges`]): the newest,
+/// an older one dropped as a newer one begins.
+pub const TURN_EDGES_KEPT: usize = 4;
+
+/// Where a report that began or ended a turn was taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TurnEdge {
+    /// The report's [`ProgramStateReport::seq`].
+    pub seq: u64,
+    /// The wall clock of the parse batch it arrived in, in epoch milliseconds (the
+    /// [`ClockReading::wall_ms`](super::ClockReading::wall_ms) that batch was processed at);
+    /// `None` when that reading had none.
+    pub wall_ms: Option<u64>,
+}
+
+/// One turn the accepted reports drew ([`ProgramStateReport::turn_edges`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProgramTurn {
+    /// The program whose report began it, or ended it when none kept began it.
+    pub app: ProgramApp,
+    /// The report that began it (one [`ProgramStateReport::turns`] counts); `None` for a turn
+    /// already running at a restore, which keeps no edge from before it.
+    pub began: Option<TurnEdge>,
+    /// The rest that ended it (`idle`, `done` or `error`) and its edge; `None` while it runs.
+    pub ended: Option<(ProgramStateWord, TurnEdge)>,
+}
+
 /// The engine's record of OSC 7501.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProgramStateReport {
@@ -159,19 +187,41 @@ pub struct ProgramStateReport {
     pub turns: u64,
     /// The state of the latest report taken, a `clear` or a full reset looked past.
     last: Option<ProgramStateWord>,
+    /// The newest [`TURN_EDGES_KEPT`] turns the reports drew, oldest first, `None` past the
+    /// newest ([`Self::turn_edges`]).
+    edges: [Option<ProgramTurn>; TURN_EDGES_KEPT],
 }
 
 impl ProgramStateReport {
-    /// Take one OSC 7501 body (the text after `7501;`).
+    /// Take one OSC 7501 body (the text after `7501;`) from a batch with no wall clock
+    /// ([`Self::accept_at`] with `None`).
+    #[cfg(test)]
     pub(super) fn accept(&mut self, body: &str) -> bool {
+        self.accept_at(body, None)
+    }
+
+    /// Take one OSC 7501 body (the text after `7501;`) from a parse batch whose wall clock read
+    /// `wall_ms`, which dates the turn edge it draws ([`Self::turn_edges`]).
+    pub(super) fn accept_at(&mut self, body: &str, wall_ms: Option<u64>) -> bool {
         match parse(body) {
             Some(next) => {
                 self.seq = self.seq.wrapping_add(1);
                 let state = match next {
                     Body::Clear => None,
                     Body::Report(state) => {
+                        let edge = TurnEdge {
+                            seq: self.seq,
+                            wall_ms,
+                        };
                         if begins_a_turn(self.last, state.state) {
                             self.turns = self.turns.wrapping_add(1);
+                            self.push_turn(ProgramTurn {
+                                app: state.app,
+                                began: Some(edge),
+                                ended: None,
+                            });
+                        } else if ends_a_turn(self.last, state.state) {
+                            self.end_turn(state, edge);
                         }
                         self.last = Some(state.state);
                         Some(state)
@@ -185,6 +235,41 @@ impl ProgramStateReport {
                 true
             }
             None => false,
+        }
+    }
+
+    /// The turns the accepted reports drew, oldest first: the newest [`TURN_EDGES_KEPT`]. A report
+    /// that begins a turn ([`Self::turns`]) adds one with its edge, and the next rest (`idle`,
+    /// `done`, `error`) after a report in a turn (a `clear` or a full reset looked past) ends the
+    /// newest, or adds one with no beginning when the newest has ended. A re-send, a move within a
+    /// turn, a `clear`, a full reset and a child record's report add and end none. A restore that
+    /// installs a different report clears them, and a checkpoint carries none.
+    #[inline]
+    pub fn turn_edges(&self) -> impl Iterator<Item = ProgramTurn> + '_ {
+        self.edges.iter().flatten().copied()
+    }
+
+    /// Keep `turn` as the newest, dropping the oldest when [`TURN_EDGES_KEPT`] are kept.
+    fn push_turn(&mut self, turn: ProgramTurn) {
+        if let Some(free) = self.edges.iter_mut().find(|slot| slot.is_none()) {
+            *free = Some(turn);
+        } else {
+            self.edges.rotate_left(1);
+            self.edges[TURN_EDGES_KEPT - 1] = Some(turn);
+        }
+    }
+
+    /// End the newest turn at the rest `state` took at `edge`, or keep a turn with no beginning
+    /// when the newest has ended (or none is kept).
+    fn end_turn(&mut self, state: ProgramState, edge: TurnEdge) {
+        let ended = Some((state.state, edge));
+        match self.edges.iter_mut().rev().find_map(Option::as_mut) {
+            Some(newest) if newest.ended.is_none() => newest.ended = ended,
+            _ => self.push_turn(ProgramTurn {
+                app: state.app,
+                began: None,
+                ended,
+            }),
         }
     }
 
@@ -206,7 +291,8 @@ impl ProgramStateReport {
     /// Install the report a checkpoint carried (`body`, [`Self::carried`]), read by this
     /// reader's own parser, as a new report that begins no turn: a later report is judged
     /// against it (a re-send of it keeps where it began). `None`, or a body this reader does not
-    /// take, leaves none standing. The sequence only moves forward.
+    /// take, leaves none standing. The sequence only moves forward. Installing a different report
+    /// clears the turn edges ([`Self::turn_edges`]); restoring the report standing keeps them.
     pub(super) fn restore(&mut self, body: Option<&str>, source_began: Option<u64>) {
         let state = match body.and_then(parse) {
             Some(Body::Report(state)) => Some(state),
@@ -219,6 +305,7 @@ impl ProgramStateReport {
         self.seq = self.seq.wrapping_add(1);
         self.began = self.seq;
         self.state = state;
+        self.edges = [None; TURN_EDGES_KEPT];
         self.restored_from = source_began.filter(|began| *began > 0 && state.is_some());
         if let Some(state) = state {
             self.last = Some(state.state);
@@ -242,6 +329,13 @@ impl ProgramStateReport {
 const fn begins_a_turn(last: Option<ProgramStateWord>, next: ProgramStateWord) -> bool {
     use ProgramStateWord as W;
     matches!(next, W::Working | W::Blocked) && !matches!(last, Some(W::Working | W::Blocked))
+}
+
+/// Whether a report of `next` ends the turn running after `last`: a rest after a report in a turn.
+#[inline]
+const fn ends_a_turn(last: Option<ProgramStateWord>, next: ProgramStateWord) -> bool {
+    use ProgramStateWord as W;
+    matches!(next, W::Idle | W::Done | W::Error) && matches!(last, Some(W::Working | W::Blocked))
 }
 
 /// The longest OSC 7501 body this reader looks at; anything longer is not a report. The
@@ -464,6 +558,89 @@ mod tests {
         assert_eq!((idle.seq, idle.began, idle.state), (2, 2, None));
     }
 
+    /// What one report does to the turn edges ([`ProgramStateReport::turn_edges`]).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Edge {
+        /// Adds a turn it began.
+        Begins,
+        /// Ends the newest turn.
+        Ends,
+        /// Neither.
+        Neither,
+    }
+
+    /// The reports the turn count and the turn edges are judged over: each body, the count after
+    /// it, what it does to the edges, and why.
+    const TURN_ROWS: [(&str, u64, Edge, &str); 17] = [
+        (
+            "state=working:app=codex",
+            1,
+            Edge::Begins,
+            "the first report, in a turn",
+        ),
+        (
+            "state=working:app=codex",
+            1,
+            Edge::Neither,
+            "written again: no move",
+        ),
+        (
+            "state=blocked:app=codex:kind=permission",
+            1,
+            Edge::Neither,
+            "asked within it",
+        ),
+        (
+            "state=working:app=codex",
+            1,
+            Edge::Neither,
+            "answered: the same turn",
+        ),
+        ("state=done:app=codex", 1, Edge::Ends, "the turn ended"),
+        (
+            "state=working:app=codex",
+            2,
+            Edge::Begins,
+            "a turn after done",
+        ),
+        ("state=idle:app=codex", 2, Edge::Ends, "ended"),
+        (
+            "state=blocked:app=codex:kind=question",
+            3,
+            Edge::Begins,
+            "a turn that asked at once",
+        ),
+        ("state=error:app=codex", 3, Edge::Ends, "ended on an error"),
+        (
+            "state=working:app=codex",
+            4,
+            Edge::Begins,
+            "a turn after an error",
+        ),
+        ("state=clear", 4, Edge::Neither, "a handoff mid-turn"),
+        (
+            "state=working:app=codex",
+            4,
+            Edge::Neither,
+            "the terminal taken back: resumed",
+        ),
+        ("state=done:app=codex", 4, Edge::Ends, "ended"),
+        ("state=clear", 4, Edge::Neither, "a handoff at rest"),
+        (
+            "state=done:app=codex",
+            4,
+            Edge::Neither,
+            "taken back: still at rest",
+        ),
+        ("state=clear", 4, Edge::Neither, "a handoff at rest"),
+        (
+            "state=working:app=codex",
+            5,
+            Edge::Begins,
+            "a turn begun across it",
+        ),
+    ];
+
     /// THE TURN COUNT: a turn begins at `working` or `blocked` after a report
     /// at rest (`idle`, `done`, `error`) or as the first report; a report
     /// written again, a move within a turn, and a report written again after
@@ -477,38 +654,7 @@ mod tests {
             assert!(report.accept(body), "{body:?}");
             report.turns
         };
-        let rows: [(&str, u64, &str); 17] = [
-            ("state=working:app=codex", 1, "the first report, in a turn"),
-            ("state=working:app=codex", 1, "written again: no move"),
-            (
-                "state=blocked:app=codex:kind=permission",
-                1,
-                "asked within it",
-            ),
-            ("state=working:app=codex", 1, "answered: the same turn"),
-            ("state=done:app=codex", 1, "the turn ended"),
-            ("state=working:app=codex", 2, "a turn after done"),
-            ("state=idle:app=codex", 2, "ended"),
-            (
-                "state=blocked:app=codex:kind=question",
-                3,
-                "a turn that asked at once",
-            ),
-            ("state=error:app=codex", 3, "ended on an error"),
-            ("state=working:app=codex", 4, "a turn after an error"),
-            ("state=clear", 4, "a handoff mid-turn"),
-            (
-                "state=working:app=codex",
-                4,
-                "the terminal taken back: resumed",
-            ),
-            ("state=done:app=codex", 4, "ended"),
-            ("state=clear", 4, "a handoff at rest"),
-            ("state=done:app=codex", 4, "taken back: still at rest"),
-            ("state=clear", 4, "a handoff at rest"),
-            ("state=working:app=codex", 5, "a turn begun across it"),
-        ];
-        for (body, want, why) in rows {
+        for (body, want, _, why) in TURN_ROWS {
             assert_eq!(turns(body), want, "{why}: {body}");
         }
         report.reset();
@@ -521,6 +667,190 @@ mod tests {
         assert!(!report.accept("state=idle:app=claude"));
         assert!(!report.accept("state=working:app=claude"));
         assert_eq!(report.turns, 6);
+    }
+
+    /// EACH TURN KEEPS THE BATCH TIMES OF ITS EDGES: a turn begins at its first `working`, dated
+    /// at the wall clock of the batch it arrived in, and ends at the next rest, dated at that
+    /// rest's batch and kept with its word. NEGATIVE CONTROLS: the re-send at 1005 and the box
+    /// asked and answered at 1010 and 1012, none of which begins or ends a turn.
+    #[test]
+    fn each_turn_keeps_the_batch_times_of_its_edges() {
+        use ProgramStateWord::*;
+        let edge = |seq, wall_ms| TurnEdge {
+            seq,
+            wall_ms: Some(wall_ms),
+        };
+        let turn = |began, ended| ProgramTurn {
+            app: ProgramApp::Codex,
+            began: Some(began),
+            ended,
+        };
+        let mut report = ProgramStateReport::default();
+        for (body, wall_ms) in [
+            ("state=working:app=codex", 1_000),
+            ("state=working:app=codex", 1_005),
+            ("state=blocked:app=codex:kind=permission", 1_010),
+            ("state=working:app=codex", 1_012),
+        ] {
+            assert!(report.accept_at(body, Some(wall_ms)), "{body}");
+        }
+        assert_eq!(
+            report.turn_edges().collect::<Vec<_>>(),
+            [turn(edge(1, 1_000), None)],
+            "one turn runs, begun at its first report"
+        );
+        for (body, wall_ms) in [
+            ("state=done:app=codex", 1_017),
+            ("state=working:app=codex", 2_000),
+            ("state=error:app=codex", 2_030),
+        ] {
+            assert!(report.accept_at(body, Some(wall_ms)), "{body}");
+        }
+        assert_eq!(
+            report.turn_edges().collect::<Vec<_>>(),
+            [
+                turn(edge(1, 1_000), Some((Done, edge(5, 1_017)))),
+                turn(edge(6, 2_000), Some((Error, edge(7, 2_030)))),
+            ]
+        );
+    }
+
+    /// THE EDGES FOLLOW THE TURN COUNT: over the turn count's reports, each in a batch of its own
+    /// time, a turn is added with its edge exactly where the count moves, and the rows that end a
+    /// turn end the newest: the turn resumed across a `clear` ends on its own entry, the `clear`
+    /// having ended nothing. After a full reset a resumed turn ends on its own entry too, one
+    /// begun across a reset is added, and a report this reader does not take changes nothing; the
+    /// newest four are kept. NEGATIVE CONTROLS: every `Neither` row, `clear`s among them.
+    #[test]
+    fn the_edges_follow_the_turn_count() {
+        fn step(
+            report: &mut ProgramStateReport,
+            want: &mut Vec<ProgramTurn>,
+            body: &str,
+            wall_ms: u64,
+            moves: Edge,
+            why: &str,
+        ) {
+            let turns = report.turns;
+            assert!(report.accept_at(body, Some(wall_ms)), "{why}: {body}");
+            assert_eq!(
+                moves == Edge::Begins,
+                report.turns == turns + 1,
+                "a turn is added where the count moves: {why}: {body}"
+            );
+            let edge = TurnEdge {
+                seq: report.seq,
+                wall_ms: Some(wall_ms),
+            };
+            match moves {
+                Edge::Begins => want.push(ProgramTurn {
+                    app: ProgramApp::Codex,
+                    began: Some(edge),
+                    ended: None,
+                }),
+                Edge::Ends => {
+                    let word = report.state.map(|state| state.state);
+                    let newest = want.last_mut().expect("a turn to end");
+                    assert_eq!(newest.ended, None, "{why}: {body}");
+                    newest.ended = word.map(|word| (word, edge));
+                }
+                Edge::Neither => {}
+            }
+            let kept = want.len().saturating_sub(TURN_EDGES_KEPT);
+            assert_eq!(
+                report.turn_edges().collect::<Vec<_>>(),
+                want[kept..],
+                "{why}: {body}"
+            );
+        }
+        let mut report = ProgramStateReport::default();
+        let mut want = Vec::new();
+        let mut wall_ms = 1_000;
+        for (body, _, moves, why) in TURN_ROWS {
+            wall_ms += 10;
+            step(&mut report, &mut want, body, wall_ms, moves, why);
+        }
+        report.reset();
+        let after_reset = [
+            (
+                "state=working:app=codex",
+                Edge::Neither,
+                "resumed after a reset",
+            ),
+            ("state=idle:app=codex", Edge::Ends, "the resumed turn ended"),
+        ];
+        for (body, moves, why) in after_reset {
+            wall_ms += 10;
+            step(&mut report, &mut want, body, wall_ms, moves, why);
+        }
+        report.reset();
+        wall_ms += 10;
+        let why = "begun across a reset";
+        step(
+            &mut report,
+            &mut want,
+            "state=working:app=codex",
+            wall_ms,
+            Edge::Begins,
+            why,
+        );
+        assert_eq!(want.len(), 6, "six turns ran");
+        let kept: Vec<_> = report.turn_edges().collect();
+        assert!(!report.accept_at("state=idle:app=claude", Some(wall_ms + 10)));
+        assert_eq!(report.turn_edges().collect::<Vec<_>>(), kept);
+    }
+
+    /// THE NEWEST FOUR ARE KEPT, AND A RESTORED TURN ENDS UNBEGUN: of six turns the newest four
+    /// are kept, oldest first. Restoring a different report clears them, and the turn it
+    /// installed running ends on an entry with no beginning that begins no turn. NEGATIVE
+    /// CONTROL: restoring the report standing keeps them.
+    #[test]
+    fn the_newest_four_are_kept_and_a_restored_turn_ends_unbegun() {
+        let mut report = ProgramStateReport::default();
+        for turn in 0..6_u64 {
+            assert!(report.accept_at("state=working:app=codex", Some(1_000 * turn)));
+            assert!(report.accept_at("state=done:app=codex", Some(1_000 * turn + 17)));
+        }
+        let began: Vec<_> = report
+            .turn_edges()
+            .map(|turn| turn.began.and_then(|edge| edge.wall_ms))
+            .collect();
+        assert_eq!(
+            began,
+            [Some(2_000), Some(3_000), Some(4_000), Some(5_000)],
+            "the newest four, oldest first"
+        );
+        let kept: Vec<_> = report.turn_edges().collect();
+        let body = report.carried();
+        report.restore(body.as_deref(), Some(report.began));
+        assert_eq!(
+            report.turn_edges().collect::<Vec<_>>(),
+            kept,
+            "CONTROL: the report standing restored keeps them"
+        );
+        report.restore(Some("state=working:app=codex"), Some(9));
+        assert_eq!(
+            report.turn_edges().count(),
+            0,
+            "a different report restored clears them"
+        );
+        assert!(report.accept_at("state=done:app=codex", Some(7_017)));
+        assert_eq!(
+            report.turn_edges().collect::<Vec<_>>(),
+            [ProgramTurn {
+                app: ProgramApp::Codex,
+                began: None,
+                ended: Some((
+                    ProgramStateWord::Done,
+                    TurnEdge {
+                        seq: report.seq,
+                        wall_ms: Some(7_017),
+                    },
+                )),
+            }],
+            "the restored turn ends on an entry with no beginning"
+        );
+        assert_eq!(report.turns, 6, "and begins none");
     }
 
     /// THE COUNT THROUGH THE PARSER, the bytes codex-alab writes: a turn

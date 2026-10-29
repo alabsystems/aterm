@@ -884,6 +884,7 @@ fn idle_facts() -> Facts {
         ready_superseded: false,
         quiet: false,
         unnoticed: false,
+        press: Press::None,
     }
 }
 
@@ -1775,6 +1776,43 @@ fn the_request_word_round_trips_and_an_unknown_word_asks_for_nothing() {
 }
 
 #[test]
+fn a_saved_skip_uses_its_agents_validated_build_identity() {
+    for agent in Agent::ALL {
+        let vendor = matches!(agent, Agent::Muse | Agent::Agy);
+        for (raw, canonical, valid) in [
+            ("v2.1.310.0", "2.1.310.0", true),
+            (" v1.4.10-R6500.1 ", "1.4.10-R6500.1", vendor),
+            ("1.4.10-R6500.2", "1.4.10-R6500.2", vendor),
+            ("latest", "latest", false),
+            ("vv2.1.310", "2.1.310", false),
+            ("1.4.10-R06500.1", "1.4.10-R06500.1", false),
+            ("0.165.0-dev.4+gabc", "0.165.0-dev.4+gabc", false),
+            (
+                "0.1.0-dev.13764+codex.0.164.0.g4b3a367a0",
+                "0.1.0-dev.13764+codex.0.164.0.g4b3a367a0",
+                false,
+            ),
+            ("", "", false),
+        ] {
+            let parsed = Request::parse_for(agent, &format!("skip:{raw}"));
+            assert_eq!(parsed.is_some(), valid, "{agent:?}: {raw:?}");
+            assert_eq!(
+                same_build(agent, raw, raw),
+                valid,
+                "{agent:?}: raw equality validates nothing"
+            );
+            if let Some(skip) = parsed {
+                assert_eq!(skip, Request::Skip(canonical.to_owned()));
+                assert_eq!(Request::parse_for(agent, &skip.word()), Some(skip.clone()));
+                assert!(skip.skips_for(agent, canonical));
+            }
+        }
+        assert!(same_build(agent, "2.1.310", "2.1.310.0"));
+        assert!(!same_build(agent, "1.4.10-R6500.1", "1.4.10-R6500.2"));
+    }
+}
+
+#[test]
 fn the_agent_word_round_trips_and_an_unknown_word_is_no_agent() {
     use super::super::lanes::{Lanes, lanes};
     use aterm_phase::Program;
@@ -1824,21 +1862,6 @@ fn the_agent_word_round_trips_and_an_unknown_word_is_no_agent() {
     assert_ne!(
         lanes(Agent::Codex.program()),
         Lanes::NONE,
-        "the negative control"
-    );
-}
-
-#[test]
-fn every_agent_is_in_all_once_and_the_others_are_all_but_claude_code() {
-    for (at, agent) in Agent::ALL.into_iter().enumerate() {
-        assert_eq!(agent as usize, at, "{agent:?}");
-        assert_eq!(Agent::parse(agent.word()), Some(agent), "{agent:?}");
-    }
-    assert_eq!(Agent::ALL[0], Agent::Claude);
-    assert_eq!(Agent::others(), &Agent::ALL[1..]);
-    assert!(!Agent::others().contains(&Agent::Claude));
-    assert!(
-        Agent::others().contains(&Agent::Codex),
         "the negative control"
     );
 }
@@ -5733,4 +5756,234 @@ fn every_angled_check_is_the_done_checks_prompt_in_the_transcript() {
     let moved = DONE_CHECK_FIXED_BEFORE.replacen("done is never the end.", "never stop.", 1);
     assert_ne!(moved, DONE_CHECK_FIXED_BEFORE);
     assert!(!is_done_check(&moved), "{moved}");
+}
+
+/// The owner's press of the ⬆️ restarts over what only defers an automatic move: the agent's
+/// background shells, a break its status has not caught up with, a person's recent keys, a
+/// screen not yet settled, and a round never asked; a taskless conversation starts afresh.
+/// NEGATIVE CONTROL: the same facts with no press (the owner's Now alone) wait.
+#[test]
+fn a_press_passes_what_only_defers_it() {
+    let deferring = Facts {
+        status: "shell".to_string(),
+        status_age_s: 0,
+        quiet_s: 0,
+        still_s: 0,
+        background: vec!["sleep".to_string()],
+        background_point: true,
+        attended: true,
+        typing: true,
+        press: Press::Acting,
+        ..idle_facts()
+    };
+    let announced = Phase::Announced { at_s: 100, asks: 1 };
+    for phase in [
+        Phase::Pending,
+        announced.clone(),
+        Phase::Failed(GAVE_UP.to_string()),
+    ] {
+        for ready in [false, true] {
+            assert_eq!(
+                requested_step(&Request::Now, &phase, &deferring, ready, 200, "9.9.9"),
+                Step::Terminate,
+                "{phase:?} ready={ready}"
+            );
+            let unpressed = Facts {
+                press: Press::None,
+                ..deferring.clone()
+            };
+            assert!(
+                matches!(
+                    requested_step(&Request::Now, &phase, &unpressed, ready, 200, "9.9.9"),
+                    Step::Wait(_)
+                ),
+                "CONTROL: the Now alone waits at {phase:?} ready={ready}"
+            );
+        }
+    }
+    let taskless = Facts {
+        taskless: true,
+        ..deferring.clone()
+    };
+    assert_eq!(
+        requested_step(
+            &Request::Now,
+            &Phase::Pending,
+            &taskless,
+            false,
+            200,
+            "9.9.9"
+        ),
+        Step::Fresh
+    );
+    let landed = Facts {
+        press: Press::None,
+        ..deferring.clone()
+    };
+    for phase in [
+        Phase::Exiting { at_s: 150 },
+        Phase::Relaunched { at_s: 150 },
+        Phase::Done,
+    ] {
+        assert_eq!(
+            requested_step(&Request::Now, &phase, &deferring, false, 200, "9.9.9"),
+            requested_step(&Request::Now, &phase, &landed, false, 200, "9.9.9"),
+            "a press of a move under way or landed acts on nothing: {phase:?}"
+        );
+    }
+}
+
+/// A press waits for what a restart would lose or cannot pass: a held tab, a box, a question,
+/// a draft, a usage limit, a login, and a running turn, each in its own word.
+/// NEGATIVE CONTROL: with none of them, the press restarts.
+#[test]
+fn a_press_waits_for_what_would_lose_input() {
+    let pressed = Facts {
+        press: Press::Acting,
+        ..idle_facts()
+    };
+    let holds = [
+        (
+            Facts {
+                held: true,
+                ..pressed.clone()
+            },
+            "held",
+        ),
+        (
+            Facts {
+                approval_box: true,
+                ..pressed.clone()
+            },
+            "box",
+        ),
+        (
+            Facts {
+                status: "waiting".to_string(),
+                ..pressed.clone()
+            },
+            "box",
+        ),
+        (
+            Facts {
+                composer_empty: false,
+                ..pressed.clone()
+            },
+            "draft",
+        ),
+        (
+            Facts {
+                limited: true,
+                ..pressed.clone()
+            },
+            "limited",
+        ),
+        (
+            Facts {
+                login: true,
+                ..pressed.clone()
+            },
+            "login",
+        ),
+        (
+            Facts {
+                busy_footer: true,
+                ..pressed.clone()
+            },
+            "busy",
+        ),
+    ];
+    for (f, word) in holds {
+        assert_eq!(press_gate(&f), Gate::Wait(word), "{f:?}");
+        assert_eq!(
+            requested_step(&Request::Now, &Phase::Pending, &f, false, 200, "9.9.9"),
+            Step::Wait(word),
+            "{f:?}"
+        );
+    }
+    assert_eq!(press_gate(&pressed), Gate::Go, "CONTROL");
+    assert_eq!(
+        requested_step(
+            &Request::Now,
+            &Phase::Pending,
+            &pressed,
+            false,
+            200,
+            "9.9.9"
+        ),
+        Step::Terminate,
+        "CONTROL"
+    );
+}
+
+/// While a press stands, an automatic step (a worker's, the host's) stands aside with
+/// [`PRESSED`]: only the press's lane moves the tab. A move under way is no press's.
+/// NEGATIVE CONTROL: with no press standing, the same step restarts.
+#[test]
+fn an_automatic_step_stands_aside_while_a_press_stands() {
+    let standing = Facts {
+        press: Press::Stands,
+        ..idle_facts()
+    };
+    let announced = Phase::Announced { at_s: 100, asks: 1 };
+    assert_eq!(
+        requested_step(&Request::Now, &announced, &standing, true, 200, "9.9.9"),
+        Step::Wait(PRESSED)
+    );
+    assert_eq!(
+        requested_step(
+            &Request::None,
+            &Phase::Pending,
+            &standing,
+            false,
+            200,
+            "9.9.9"
+        ),
+        Step::Wait(PRESSED)
+    );
+    assert_eq!(
+        requested_step(
+            &Request::Now,
+            &Phase::Exiting { at_s: 150 },
+            &standing,
+            false,
+            200,
+            "9.9.9"
+        ),
+        Step::Wait("in-flight")
+    );
+    let unpressed = Facts {
+        press: Press::None,
+        ..standing
+    };
+    assert_eq!(
+        requested_step(&Request::Now, &announced, &unpressed, true, 200, "9.9.9"),
+        Step::Terminate,
+        "CONTROL"
+    );
+}
+
+/// The owner's Now (the tab menu's, `--now`) is no press: over the agent's background shells it
+/// waits for them, where a press restarts.
+/// NEGATIVE CONTROL: the press over the same shells restarts.
+#[test]
+fn the_owners_now_is_no_press() {
+    let working = Facts {
+        background: vec!["sleep".to_string()],
+        ..idle_facts()
+    };
+    let announced = Phase::Announced { at_s: 100, asks: 1 };
+    assert_eq!(
+        requested_step(&Request::Now, &announced, &working, true, 200, "9.9.9"),
+        Step::Wait("background")
+    );
+    let pressed = Facts {
+        press: Press::Acting,
+        ..working
+    };
+    assert_eq!(
+        requested_step(&Request::Now, &announced, &pressed, true, 200, "9.9.9"),
+        Step::Terminate,
+        "CONTROL"
+    );
 }

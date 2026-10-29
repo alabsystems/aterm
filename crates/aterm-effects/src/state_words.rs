@@ -10,6 +10,14 @@
 //! not hashed until a harness commit names it. A list or a nested record folds into one word
 //! ([`Words::group`]). Debug and test builds only.
 //!
+//! Every `state_words.rs` is in the harness closure `lab trail-diff` holds fixed between its two
+//! builds (§15.0.6: with the dump `aterm-gui/examples/trail_dump.rs`, `examples/support/**`, the
+//! rig `src/trail_rig.rs`, its frame reads `src/trail_frame_reads.rs` and
+//! `[profile.trail-diff]`), so a change here lands alone, as a harness commit: `--base HEAD~1`
+//! refuses it (exit 3), and it is proved by `--control same` (0) and `--control plant` (the
+//! plant). A word for a new field takes three commits: the field, read by nothing new (proved by
+//! `--base HEAD~1`); then the harness commit that names it; then its reader.
+//!
 //! The frame's light report ([`ArmsDrawn`]) lives here too: which light arms drew and which
 //! streams each touched (§15.0.2(b)).
 
@@ -270,8 +278,8 @@ impl Words for Fold {
 }
 
 /// Every stored [`GlowConfig`]'s words, the one helper each copy hashes through (§15.0.2(a)):
-/// each field by name, except the light bit Phase 1 adds (§15.0.4), which stays out so a latched
-/// light never reads as a state difference.
+/// each field by name, except [`GlowConfig::light`] (§15.0.4), which stays out so a latched light
+/// never reads as a state difference.
 #[inline]
 pub fn glow_cfg_words(w: &mut impl Words, cfg: &GlowConfig) {
     w.flag("enabled", cfg.enabled);
@@ -775,6 +783,37 @@ mod tests {
         for (field, cfg) in &mutants {
             assert_ne!(word(cfg), base_word, "{field} moves the config's words");
         }
+    }
+
+    /// [`glow_cfg_words_hashes_every_field`] moves every other field; the light, at every level,
+    /// moves nothing.
+    #[test]
+    fn glow_cfg_words_ignores_only_light() {
+        use crate::cursor_glow::{Light, Live};
+        let t0 = Instant::now();
+        let base = GlowConfig::sample_for_test();
+        let word = |cfg: &GlowConfig| {
+            let mut w = StateWords::new(t0);
+            w.group("cfg", |f| glow_cfg_words(f, cfg));
+            w.get("cfg").expect("the word")
+        };
+        let base_word = word(&base);
+        for live in [Live::Off, Live::Glass, Live::Lip, Live::Marks, Live::Vanish] {
+            let lit = GlowConfig {
+                light: Light::at(live),
+                ..base
+            };
+            assert_ne!(lit, base, "{live:?} is a different config");
+            assert_eq!(word(&lit), base_word, "{live:?} keeps the config's words");
+        }
+        assert_ne!(
+            word(&GlowConfig {
+                dark_theme: !base.dark_theme,
+                ..base
+            }),
+            base_word,
+            "a field beside it still moves them"
+        );
     }
 
     #[test]

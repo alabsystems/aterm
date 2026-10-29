@@ -43,8 +43,8 @@ aterm init --converge [--check] [--json] [--verbose] [--trigger subscriber|windo
   aterm.app's first launch does this setup by itself; init is for SSH and CLI-only Macs,
   and Linux (the base layer, the vault and --clone; each Mac row reads \"macOS only\").
   Run it as yourself, without sudo; safe to run again. Over SSH too: what `aterm doctor`
-  restores, and Apple's Command Line Tools if missing (one sudo password). Then, for a
-  person at this Mac's console (else one deferred row: SSH, an agent, no terminal):
+  restores, the ALab toolset and the Command Line Tools if missing (one sudo password). Then,
+  on this Mac's console account (remote or another login defers; preferences need a person):
     {spotlight}
     {secrets} (asking only the ALab vault's join password, or --vault's)
     {permissions} (a row for each grant to switch on)
@@ -57,7 +57,7 @@ aterm init --converge [--check] [--json] [--verbose] [--trigger subscriber|windo
   the changed, failed and needs-you rows, then a tally); --only runs the ids or families
   named (base, workstation, init.spotlight, ...); --develop records this checkout as a
   develop machine, fetched and provisioned each run, and --no-develop drops it.
-  --converge runs the pass an update or a moved network makes due; it asks nothing.
+  --converge runs one converge pass now, as the subscriber and window do; it asks nothing.
   Exit: 0 done (what waits on an admin or a person at the console included); 75 waits on
   a lock (--no-wait) or a step, 77 a permission, 69 the network; 1 otherwise; 2 usage.
 ",
@@ -134,6 +134,17 @@ impl Options {
         (self.only.is_empty() && self.develop.is_none())
             || !self.station.is_empty()
             || self.only.iter().any(|word| word == "workstation")
+    }
+
+    /// Whether this run converges `base.pkg.toolset` alone: every `--only` word is its id and
+    /// no `--develop` runs. Its passes are `aterm pkg seed` and `aterm pkg update`, which act on
+    /// the store that home's `aterm.toml` names, as they do typed there, so such a run may go
+    /// under another home or a private state root. Every other row reaches past the home (the
+    /// login's keychain, the Mac's Command Line Tools, the account's preferences).
+    fn toolset_alone(&self) -> bool {
+        !self.only.is_empty()
+            && self.develop.is_none()
+            && self.only.iter().all(|word| word == crate::init_toolset::ID)
     }
 
     /// Whether this run may join a vault: a workstation run its `--only` words, if any, do not
@@ -311,10 +322,14 @@ fn vault_reaches(options: &Options) -> Result<(), String> {
 pub struct Base {
     /// The items, in run order.
     pub items: Vec<Box<dyn aterm_converge::Item>>,
-    /// Store lock held while base items run and released before `base.clt` and workstation items.
+    /// Store lock held while base items run and released before `base.clt`, `base.pkg.toolset`
+    /// and workstation items.
     pub held: Option<Box<dyn std::any::Any>>,
     /// `base.clt` ([`crate::init_clt`]), run once the lock is released.
     pub clt: Option<crate::init_clt::CommandLineTools>,
+    /// `base.pkg.toolset` ([`crate::init_toolset`]), run once the lock is released (its passes
+    /// take it) and after `base.clt`.
+    pub toolset: Option<crate::init_toolset::Toolset>,
     /// Toolset `targo` used by `develop.workspace-tools@<path>` ([`crate::init_develop::Targo`]).
     pub targo: Option<crate::init_develop::Targo>,
 }
@@ -327,6 +342,7 @@ impl Base {
             items: Vec::new(),
             held: None,
             clt: None,
+            toolset: None,
             targo: None,
         }
     }
@@ -342,6 +358,10 @@ impl Base {
                     .clt
                     .as_ref()
                     .is_some_and(|_| crate::init_clt::selected(word))
+                    && !self
+                        .toolset
+                        .as_ref()
+                        .is_some_and(|_| crate::init_toolset::selected(word))
             })
             .cloned()
             .collect()
@@ -357,12 +377,15 @@ impl Base {
             items,
             held,
             clt,
+            toolset,
             targo,
         } = self;
         Self {
             items: aterm_converge::select(items, only).0,
             held,
             clt: clt.filter(|_| only.iter().any(|word| crate::init_clt::selected(word))),
+            toolset: toolset
+                .filter(|_| only.iter().any(|word| crate::init_toolset::selected(word))),
             targo,
         }
     }
@@ -392,7 +415,9 @@ pub struct Host<'a> {
     /// aterm's macOS grants, as the Permissions phase reads them ([`Grants`]).
     pub grants: Grants,
     /// Hand the grants the Permissions phase left to the person to the running aterm window's
-    /// permission walk (`permissions walk now <grants>`), for a person at this Mac's console:
+    /// permission walk (`permissions walk now <grants>`), for a person at this Mac's console,
+    /// Full Disk Access and Accessibility only when that window is the app macOS holds
+    /// responsible for the run (they are that app's grants, [`crate::port::responsible_window`]):
     /// the line to print once a walk takes them, `None` where none does (no window, no person
     /// here), and the rows' own words stand.
     pub walk: &'a dyn Fn(&[Access]) -> Option<String>,
@@ -481,6 +506,12 @@ pub fn no_grants(_sign_out: bool) -> Vec<(Access, Grant)> {
     Vec::new()
 }
 
+/// Why `aterm init` refuses a run under another home or a private state root that is not
+/// [`Options::toolset_alone`].
+const AWAY_FROM_HOME: &str = "run in your own login and home directory; under another home \
+                              or a private state root only `--only base.pkg.toolset` runs, \
+                              in that home";
+
 /// Run `aterm init`. Every row carries its time, the JSON's `phases` the run's (this login's
 /// context, the questions, the base and workstation layers), and one aterm.log line says the
 /// same totals.
@@ -517,8 +548,8 @@ pub fn main_entry(args: Vec<OsString>, host: &Host<'_>) -> ExitCode {
         eprintln!("aterm init: {why}\n{}", usage());
         return ExitCode::from(2);
     }
-    if !crate::sessions::is_live_account() {
-        eprintln!("aterm init: run in your own login and home directory");
+    if !crate::sessions::is_live_account() && !options.toolset_alone() {
+        eprintln!("aterm init: {AWAY_FROM_HOME}");
         return ExitCode::FAILURE;
     }
     // The look for the ALab vault overlaps reading the Mac (its context and the develop
@@ -606,16 +637,23 @@ pub fn main_entry(args: Vec<OsString>, host: &Host<'_>) -> ExitCode {
 /// QoS. `--check` probes and writes nothing. Its rows print as init's do, then a tally (or the
 /// JSON report). Exit 0 once it ran with no failed row (what it defers included), 75 while
 /// another pass holds the lock, 1 for a failed row, an unwritten record or a pass that cannot
-/// run here.
+/// run here. A subscriber's pass from a program that is not the installed release app (a held
+/// copy) is the installed app's to run ([`hand_off`]).
 fn converge_entry(options: &Options, ports: &dyn crate::sync::Ports) -> ExitCode {
     ports.background();
+    let trigger = options.trigger.unwrap_or(crate::sync::Trigger::Init);
+    if trigger == crate::sync::Trigger::Subscriber
+        && let Some(program) = ports.installed_release_elsewhere()
+        && let Some(code) = hand_off(options, ports, &program)
+    {
+        return code;
+    }
     let laps = Laps::start();
     let (mode, action) = if options.action == Action::Check {
         (Mode::Plan, Action::Check)
     } else {
         (Mode::Apply, Action::Apply)
     };
-    let trigger = options.trigger.unwrap_or(crate::sync::Trigger::Init);
     let printer = Printer::new(options.verbose, options.json);
     let pass = crate::sync::converge(ports, trigger, mode, &mut |row| printer.row(row));
     printer.flush();
@@ -659,6 +697,56 @@ fn converge_entry(options: &Options, ports: &dyn crate::sync::Ports) -> ExitCode
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// Run the subscriber's pass from `program`, the installed release app, with this run's flags,
+/// and end as it ends: a held copy a vault subscriber's job runs (the snapshot an admin Mac
+/// keeps, a program `agent on --program` named) then applies the installed app's rows, as the
+/// window's pass does, so two builds never take turns undoing each other's writes and a fix in
+/// a later app reaches the subscriber's side. The installed app's run lowers its own QoS and
+/// writes its own ledger line. `None` where it could not be started or waited for, or ended
+/// with a usage error (an installed app older than this copy, with no such pass; each said in
+/// aterm.log): this copy runs the pass itself, as before.
+fn hand_off(options: &Options, ports: &dyn crate::sync::Ports, program: &Path) -> Option<ExitCode> {
+    let mut args = ["init", "--converge", "--trigger"]
+        .map(str::to_owned)
+        .to_vec();
+    args.push(crate::sync::Trigger::Subscriber.word().to_owned());
+    if options.action == Action::Check {
+        args.push("--check".to_owned());
+    }
+    if options.json {
+        args.push("--json".to_owned());
+    }
+    if options.verbose {
+        args.push("--verbose".to_owned());
+    }
+    match ports.run_elsewhere(program, &args) {
+        Ok(Some(2)) => {
+            ports.log(&format!(
+                "converge trigger=subscriber: the installed app ({}) does not take the pass \
+                 (an app older than this copy); this copy runs it",
+                program.display()
+            ));
+            None
+        }
+        Ok(Some(code)) => Some(ExitCode::from(u8::try_from(code).unwrap_or(1))),
+        Ok(None) => {
+            ports.log(&format!(
+                "converge trigger=subscriber: the installed app's pass ({}) ended by a signal",
+                program.display()
+            ));
+            Some(ExitCode::FAILURE)
+        }
+        Err(why) => {
+            ports.log(&format!(
+                "converge trigger=subscriber: the installed app's pass ({}) did not start \
+                 ({why}); this copy runs it",
+                program.display()
+            ));
+            None
+        }
     }
 }
 
@@ -790,7 +878,7 @@ fn tally(rows: &[ItemReport], action: Action) -> String {
         ),
         (
             count(waits_by_itself),
-            "waiting for an admin's approval (it finishes by itself)",
+            "waiting to be let in (it finishes by itself)",
         ),
         (count(waits_on_a_step), "waiting on another step"),
     ] {
@@ -801,6 +889,12 @@ fn tally(rows: &[ItemReport], action: Action) -> String {
     let needs: Vec<&ItemReport> = rows.iter().filter(|row| needs_you(row)).collect();
     if let Some(first) = needs.first() {
         parts.push(format!("{} needs you: {}", needs.len(), first.title));
+    }
+    if rows
+        .iter()
+        .any(|row| row.why.as_deref() == Some(aterm_secrets::swarm::SWARM_OFF))
+    {
+        parts.push("[swarm] enabled = false".to_owned());
     }
     let tail = if action == Action::Plan {
         " (nothing changed)"
@@ -1104,6 +1198,14 @@ pub fn converge_workstation_for_test(
     })
 }
 
+/// Initialization keeps agent ancestry when a tool call has no controlling terminal.
+fn init_presence(sys: &dyn System) -> Presence {
+    match crate::console::presence(sys) {
+        Presence::NoTerminal if sys.agent_ancestor().is_some() => Presence::AgentTab,
+        presence => presence,
+    }
+}
+
 /// Converge the requested base, workstation, and develop layers, each step a phase of `laps`:
 /// this login's context (and the develop layer's profile), the questions asked before any
 /// change (the vault's join password), then the layers ([`run_layers`]).
@@ -1119,13 +1221,17 @@ fn converge(
     } else {
         Mode::Plan
     };
-    // The opt-in flags are a person's picks at this Mac's console: from an agent's tool call, a
-    // script, a launch agent or a remote shell nobody there made them, and the person's own Mac
-    // waits for them anyway, so the run refuses before it reads the Mac. Elsewhere (Linux) only
-    // `--clone` picks anything, and nobody sits at the console.
-    if options.choice.is_some()
+    // Preferences and repository setup remain a person's picks. Account sign-out also runs in
+    // the console user's graphic session with no terminal, but never from SSH or an agent tab.
+    let presence = init_presence(sys);
+    let restricted = options.choice.is_some_and(|choice| {
+        choice.profile
+            || choice.clone
+            || (choice.sign_out && !matches!(presence, Presence::AtConsole | Presence::NoTerminal))
+    });
+    if restricted
         && sys.macos()
-        && let Some(why) = crate::console::presence(sys).why()
+        && let Some(why) = presence.why()
     {
         return Err(Refused::Usage(format!(
             "--profile, --sign-out and --clone are picks for a person at this Mac's console \
@@ -2016,6 +2122,38 @@ pub fn run_initial_secrets_with(
     journal: &mut dyn Journal,
 ) -> Result<Vec<ItemReport>, String> {
     let vault = crate::init_secrets::selected(ctx, ops, source, wait, replaces)?;
+    run_vault_item(vault, sys, ctx, password, journal)
+}
+
+/// The converge pass's join of the ALab vault (`sync.peers`): [`run_initial_secrets_with`]
+/// with no password, except that the subscriber its join puts in place is a repair, never a
+/// person's On (`init_secrets::Vault::keeping_off`), so a turn-off recorded since the pass read
+/// this Mac stays.
+///
+/// # Errors
+/// As [`run_initial_secrets`].
+pub(crate) fn run_converge_join(
+    sys: &dyn System,
+    ctx: &Ctx,
+    ops: Arc<dyn crate::init_secrets::SecretsOps>,
+    source: &str,
+    replaces: crate::init_secrets::Replaces,
+    wait: std::time::Duration,
+    journal: &mut dyn Journal,
+) -> Result<Vec<ItemReport>, String> {
+    let vault = crate::init_secrets::selected(ctx, ops, source, wait, replaces)?.keeping_off();
+    run_vault_item(vault, sys, ctx, &mut None, journal)
+}
+
+/// Run `vault`, the Secrets stage's vault item, as an apply journaled in `journal`, holding
+/// `password` for its join and handing back what the join did not spend.
+fn run_vault_item(
+    vault: crate::init_secrets::Vault,
+    sys: &dyn System,
+    ctx: &Ctx,
+    password: &mut Option<aterm_secrets::SecretBytes>,
+    journal: &mut dyn Journal,
+) -> Result<Vec<ItemReport>, String> {
     vault.hold_password(password.take());
     let bound = crate::engine::bind(
         [(&vault as &dyn Item, workstation_place(Class::Install))],
@@ -2127,7 +2265,8 @@ type Prepare<'a> =
 /// change the person's own Mac: over SSH, or under another login's console, nothing of the
 /// workstation is read; from an agent's tool call or with no terminal, the vault's item is
 /// built as a plan builds it (never a prompt, never the network, `--vault` included) and
-/// [`groups`] leaves the person's rows to them. The vault is read only when this run names its
+/// [`groups`] leaves preferences to them while still building the account sign-out in the
+/// console user's graphic session. The vault is read only when this run names its
 /// item. Every group runs unless a flag names the ones to (nothing asks), and for a person at
 /// the console the Permissions phase lists aterm's grants. A group that cannot be built is one
 /// row saying why ([`Unbuilt`]); the others run.
@@ -2158,7 +2297,7 @@ fn prepare_groups_with(
     if !sys.macos() {
         return elsewhere(sys, ctx, mode, vault, reading, secrets);
     }
-    let presence = crate::console::presence(sys);
+    let presence = init_presence(sys);
     if ctx.console.is_none() {
         return Ok((vec![away_from_console(presence)], Choice::NONE));
     }
@@ -2412,9 +2551,10 @@ fn built(
 /// Workstation item groups in run order, each paired with its [`Place`]: for a person at the
 /// console (`presence`), the groups `choice` picks, Rust in Spotlight and fseventsd's memory
 /// ([`crate::init_fseventsd`], restarted only when the run's `only` words name it),
-/// with the keyboard list unread (`keyboards`) the Caps Lock rows one row saying why; anywhere
-/// else one deferred row stands for the person's own Mac ([`AwayFromConsole`]). Then the vault,
-/// and its GitHub profile (`github`, already built) when `choice` clones.
+/// with the keyboard list unread (`keyboards`) the Caps Lock rows one row saying why; with no
+/// terminal the account sign-out still runs, while preferences and agent or remote runs defer
+/// ([`AwayFromConsole`]). Then the vault, and its GitHub profile (`github`, already built) when
+/// `choice` clones.
 fn groups(
     ctx: &Ctx,
     presence: Presence,
@@ -2426,8 +2566,9 @@ fn groups(
 ) -> Vec<Group> {
     let place = workstation_place;
     let person = presence == Presence::AtConsole;
+    let account_console = person || (choice.sign_out && presence == Presence::NoTerminal);
     let mut groups = Vec::new();
-    if !person {
+    if !account_console {
         groups.push(away_from_console(presence));
     }
     if person && choice.profile {
@@ -2495,7 +2636,7 @@ fn groups(
             crate::init_fseventsd::place(),
         ));
     }
-    if person && choice.sign_out {
+    if account_console && choice.sign_out {
         groups.push((
             built(
                 ACCOUNTS_GROUP,
@@ -2759,6 +2900,13 @@ impl Journal for Shared<'_, '_> {
             .unwrap_or_else(PoisonError::into_inner)
             .before_change(id, from, to, revert)
     }
+
+    fn failed(&mut self, id: &str, why: &str) -> Result<(), String> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .failed(id, why)
+    }
 }
 
 /// Run `base` items, release the store lock, and then run `base.clt`, `groups`, and `develop`
@@ -2792,11 +2940,16 @@ fn run_layers(
         ..aterm_converge::Scope::EVERY
     };
     let Base {
-        items, held, clt, ..
+        items,
+        held,
+        clt,
+        toolset,
+        ..
     } = base;
     let order: Vec<String> = clt
         .iter()
         .map(Item::id)
+        .chain(toolset.iter().map(Item::id))
         .chain(
             groups
                 .iter()
@@ -2825,6 +2978,11 @@ fn run_layers(
         .as_ref()
         .map(|clt| (clt as &dyn Item, crate::init_clt::place()))
         .into_iter()
+        .chain(
+            toolset
+                .as_ref()
+                .map(|toolset| (toolset as &dyn Item, crate::init_toolset::place())),
+        )
         .chain(later)
         .chain(
             develop
@@ -3504,6 +3662,16 @@ mod tests {
                 "unchecked setting queried: {call}"
             );
         }
+        let inventory = crate::facts::hidutil_keyboards().display();
+        sys.on(
+            &inventory,
+            Ran::ok(
+                "Services:\nVendorID ProductID Product  Built-In\n0x5ac    0x1       Keyboard 1\n",
+            ),
+        );
+        let account_only = initial_setup_context(&sys).unwrap();
+        assert!(account_only.facts.keyboards.is_empty());
+        assert!(!sys.calls().contains(&inventory));
     }
 
     fn saved_off(sys: &Fake) {
@@ -4047,6 +4215,7 @@ mod tests {
             })],
             held: Some(Box::new(Held(Arc::clone(&released)))),
             clt: None,
+            toolset: None,
             targo: None,
         };
         let groups = vec![(
@@ -4382,6 +4551,66 @@ mod tests {
         assert!(left.is_empty(), "--check wrote {left:?}");
     }
 
+    /// A subscriber's pass from a held copy is the installed app's: it runs `init --converge
+    /// --trigger subscriber` there with this run's flags, ends with that run's exit, and runs no
+    /// pass here. A window's or a person's pass never hands off, and a hand-off that cannot be
+    /// started, or that an app with no such pass refuses as usage, leaves this copy to run the
+    /// pass, saying so in aterm.log.
+    /// NEGATIVE CONTROL: a runner that never asks `installed_release_elsewhere` runs the
+    /// subscriber's pass here, from the held copy.
+    #[test]
+    fn a_held_copys_subscriber_pass_runs_from_the_installed_app() {
+        let app = PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm");
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let mut ports = crate::sync::tests::Inert::new(scratch.path());
+        ports.elsewhere = Some(app.clone());
+        *ports.elsewhere_exit.lock().unwrap() = Ok(Some(75));
+        assert_eq!(
+            converge_run(&["--converge", "--trigger", "subscriber", "--json"], &ports),
+            exit(75),
+            "the installed app's exit"
+        );
+        let words = |args: &[&str]| args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            *ports.ran_elsewhere.lock().unwrap(),
+            [(
+                app.clone(),
+                words(&["init", "--converge", "--trigger", "subscriber", "--json"])
+            )]
+        );
+        assert!(ports.applies().is_empty(), "no pass here");
+        assert!(crate::sync::read_record(scratch.path()).is_none());
+
+        for args in [&["--converge", "--trigger", "window"][..], &["--converge"]] {
+            assert_eq!(converge_run(args, &ports), exit(0), "{args:?}");
+        }
+        assert_eq!(
+            ports.ran_elsewhere.lock().unwrap().len(),
+            1,
+            "never handed off"
+        );
+
+        for (answer, said) in [
+            (Err("No such file or directory".to_owned()), "did not start"),
+            (Ok(Some(2)), "does not take the pass"),
+        ] {
+            let unstarted = aterm_tempfile::tempdir().unwrap();
+            let mut ports = crate::sync::tests::Inert::new(unstarted.path());
+            ports.elsewhere = Some(app.clone());
+            *ports.elsewhere_exit.lock().unwrap() = answer;
+            assert_eq!(
+                converge_run(&["--converge", "--trigger", "subscriber"], &ports),
+                exit(0)
+            );
+            assert!(!ports.applies().is_empty(), "this copy ran the pass");
+            assert!(
+                ports.logged().iter().any(|line| line.contains(said)),
+                "{:?}",
+                ports.logged()
+            );
+        }
+    }
+
     /// Exit 75 while another pass holds the lock (applying nothing), 1 for a failed row, 2 for
     /// a flag `--converge` does not take, before any port is read.
     #[test]
@@ -4489,6 +4718,7 @@ mod tests {
                 Box::new(|_: &dyn System| crate::init_clt::Found::Present("cc".into())),
                 PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm"),
             )),
+            toolset: None,
             targo: None,
         };
         let alice = crate::items::defaults::tests::user("alice", 501);
@@ -4542,6 +4772,7 @@ mod tests {
                 Box::new(|_: &dyn System| crate::init_clt::Found::Present("cc".into())),
                 PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm"),
             )),
+            toolset: None,
             targo: None,
         };
         assert_eq!(
@@ -4586,6 +4817,7 @@ mod tests {
                 },
                 PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm"),
             )),
+            toolset: None,
             targo: None,
         };
         let alice = user("alice", 501);
@@ -4613,6 +4845,187 @@ mod tests {
             "{saw:?}"
         );
         assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+    }
+
+    /// `base.pkg.toolset` READS ONLY ONCE THE BASE LAYER LET THE STORE LOCK GO (its passes
+    /// take it), after `base.clt` and before the develop layer, whose tools run after it
+    /// whatever it ends as: once it installed the set, and while it installs nothing
+    /// (`auto_install = false`), since their own probe reads the `targo` they need. CONTROL:
+    /// with the toolset complete it runs no pass.
+    #[test]
+    fn the_toolset_installs_once_the_lock_is_let_go_and_the_develop_tools_follow_it() {
+        use crate::init_toolset::{Found, Toolset, WAIT_LOCK};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        struct Held(Arc<AtomicBool>);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        struct Tools(Arc<AtomicU32>);
+        impl Item for Tools {
+            fn id(&self) -> String {
+                "develop.workspace-tools@~/aterm".into()
+            }
+            fn family(&self) -> &'static str {
+                "tooling"
+            }
+            fn title(&self) -> String {
+                self.id()
+            }
+            fn probe(&self, _: &dyn System, _: &Ctx) -> Probe {
+                if self.0.load(Ordering::SeqCst) == 0 {
+                    change()
+                } else {
+                    ok()
+                }
+            }
+            fn apply(&self, _: &dyn System, _: &Ctx) -> Result<(), String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn after(&self) -> Vec<String> {
+                crate::init_develop::TOOLS_AFTER
+                    .iter()
+                    .map(|&id| id.to_owned())
+                    .collect()
+            }
+        }
+        let missing = Found::Missing("none installed".into());
+        let complete = Found::Complete("7 active".into());
+        let off = Found::Off("auto_install off".into());
+        for (reads, outcome, passes) in [
+            (vec![missing, complete.clone()], Outcome::Changed, 2),
+            (vec![off], Outcome::NotApplicable, 0),
+            (vec![complete], Outcome::Ok, 0),
+        ] {
+            let released = Arc::new(AtomicBool::new(false));
+            let saw = Arc::new(Mutex::new(Vec::new()));
+            let ran = Arc::new(Mutex::new(Vec::new()));
+            let toolset = Toolset::new(
+                {
+                    let (released, saw) = (Arc::clone(&released), Arc::clone(&saw));
+                    let reads = Mutex::new(reads);
+                    Box::new(move || {
+                        saw.lock().unwrap().push(released.load(Ordering::SeqCst));
+                        let mut reads = reads.lock().unwrap();
+                        if reads.len() > 1 {
+                            reads.remove(0)
+                        } else {
+                            reads[0].clone()
+                        }
+                    })
+                },
+                {
+                    let ran = Arc::clone(&ran);
+                    Box::new(move |args: &[String], _| {
+                        ran.lock().unwrap().push(args.join(" "));
+                        Ok(Ran::ok(""))
+                    })
+                },
+                Some(WAIT_LOCK),
+                crate::init_toolset::tests::ATPKG,
+            );
+            let base = Base {
+                items: Vec::new(),
+                held: Some(Box::new(Held(Arc::clone(&released)))),
+                clt: Some(crate::init_clt::CommandLineTools::new(
+                    Box::new(|_: &dyn System| crate::init_clt::Found::Present("cc".into())),
+                    PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm"),
+                )),
+                toolset: Some(toolset),
+                targo: None,
+            };
+            let applied = Arc::new(AtomicU32::new(0));
+            let develop: Vec<(Box<dyn Item>, Place)> = vec![(
+                Box::new(Tools(Arc::clone(&applied))),
+                crate::init_develop::place(Class::Install),
+            )];
+            let ctx = Ctx {
+                console: None,
+                ..ctx(&[user("alice", 501)])
+            };
+            let sys = Fake::default();
+            let rows = run_layers(
+                &sys,
+                &ctx,
+                base,
+                &[],
+                &develop,
+                &Narrowing {
+                    only: &[],
+                    record: false,
+                },
+                Mode::Apply,
+                &mut NoJournal,
+                &mut Laps::start(),
+                &Hooks::QUIET,
+            )
+            .unwrap();
+            let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+            assert_eq!(
+                ids,
+                [
+                    crate::init_clt::ID,
+                    crate::init_toolset::ID,
+                    "develop.workspace-tools@~/aterm"
+                ]
+            );
+            assert_eq!(rows[1].outcome, outcome, "{rows:?}");
+            assert_eq!(rows[1].layer, Some(Layer::Base));
+            assert_eq!(rows[1].class, Some(Class::Install));
+            assert_eq!(rows[2].outcome, Outcome::Changed, "{rows:?}");
+            assert_eq!(applied.load(Ordering::SeqCst), 1);
+            let saw = saw.lock().unwrap();
+            assert!(
+                !saw.is_empty() && saw.iter().all(|&released| released),
+                "read only once the lock was let go: {saw:?}"
+            );
+            let ran = ran.lock().unwrap();
+            assert_eq!(ran.len(), passes, "{ran:?}");
+            if passes > 0 {
+                assert_eq!(
+                    *ran,
+                    [
+                        "seed --wait-lock 1800",
+                        "update --defer-busy-flip --wait-lock 1800"
+                    ]
+                );
+            }
+            assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+        }
+    }
+
+    /// A run under another home or a private state root is `base.pkg.toolset`'s alone: never
+    /// a bare run, another base row (`base` takes the keychain's accounts and `base.clt`), the
+    /// workstation or the develop layer.
+    #[test]
+    fn only_the_toolset_row_goes_under_another_home() {
+        let alone = |args: &[&str]| {
+            options(&args.iter().map(OsString::from).collect::<Vec<_>>())
+                .unwrap()
+                .toolset_alone()
+        };
+        for args in [
+            &["--only", "base.pkg.toolset"][..],
+            &["--only", "base.pkg.toolset", "--check"],
+            &["--only", "base.pkg.toolset,base.pkg.toolset", "--plan"],
+        ] {
+            assert!(alone(args), "{args:?}");
+        }
+        for args in [
+            &[][..],
+            &["--check"],
+            &["--only", "base"],
+            &["--only", "pkg"],
+            &["--only", "base.pkg.toolset,base.clt"],
+            &["--only", "workstation"],
+            &["--only", "develop"],
+            &["--only", "base.pkg.toolset", "--develop"],
+        ] {
+            assert!(!alone(args), "{args:?}");
+        }
     }
 
     #[test]
@@ -4664,6 +5077,7 @@ mod tests {
                 })],
                 held: None,
                 clt: None,
+                toolset: None,
                 targo: None,
             };
             let groups = if at_console {
@@ -4761,13 +5175,13 @@ mod tests {
         }
     }
 
-    /// From an agent's tool call (no terminal) or an agent's tab, in the console's own
-    /// session, init runs the base layer and the vault and GitHub profile the person recorded,
-    /// and leaves the person's rows (preferences, Dock, sign-outs, rustup's profile) to them:
-    /// no `killall`, no sign-out, no `rustup set profile`, and the vault is never probed or
-    /// asked. Control: a person at the console gets those rows.
+    /// From an agent's tool call (no terminal), in the console's own session, init runs the
+    /// base layer, account sign-out, and the recorded vault and GitHub profile, but leaves the
+    /// other personal rows to the person. An agent's tab leaves sign-out out too: no `killall`,
+    /// no `rustup set profile`, and the vault is never probed or asked. Control: a person at
+    /// the console gets every row.
     #[test]
-    fn without_a_person_at_the_console_init_leaves_the_persons_rows_to_them() {
+    fn without_a_person_at_the_console_init_runs_only_account_sign_out() {
         let bound_classes = |sys: &Fake, groups: &[Group], ctx: &Ctx| {
             crate::engine::bind(
                 groups.iter().flat_map(|(items, place)| {
@@ -4826,10 +5240,21 @@ mod tests {
                 assert_eq!(vault.probes(), 1, "a person's run looks for the ALab vault");
                 continue;
             }
-            assert!(
-                !bound.iter().any(|(_, class)| personal.contains(class)),
-                "{bound:?}"
-            );
+            let personal_rows = bound
+                .iter()
+                .filter(|(_, class)| personal.contains(class))
+                .collect::<Vec<_>>();
+            if presence == Presence::NoTerminal {
+                assert_eq!(personal_rows.len(), 2, "{bound:?}");
+                assert!(
+                    personal_rows
+                        .iter()
+                        .all(|(id, _)| id.contains(".signed-out@")),
+                    "{bound:?}"
+                );
+            } else {
+                assert!(personal_rows.is_empty(), "{bound:?}");
+            }
             assert_eq!(vault.probes(), 0, "nobody to ask: no look for the vault");
             let rows = run(
                 &sys,
@@ -4840,17 +5265,25 @@ mod tests {
                 &mut NoJournal,
             )
             .unwrap();
-            let away = rows
-                .iter()
-                .find(|row| row.id == AWAY)
-                .expect("the stand-in");
-            assert_eq!(away.outcome, Outcome::Deferred);
-            assert_eq!(away.why, presence.needs_person());
+            let away = rows.iter().find(|row| row.id == AWAY);
+            if presence == Presence::NoTerminal {
+                assert!(away.is_none(), "account sign-out has no stand-in: {rows:?}");
+            } else {
+                let away = away.expect("the stand-in");
+                assert_eq!(away.outcome, Outcome::Deferred);
+                assert_eq!(away.why, presence.needs_person());
+            }
             let calls = sys.calls();
-            for change in ["killall", "osascript", "set profile", "defaults write"] {
+            for change in ["killall", "set profile", "defaults write"] {
                 assert!(
                     !calls.iter().any(|call| call.contains(change)),
                     "{change}: {calls:?}"
+                );
+            }
+            if presence != Presence::NoTerminal {
+                assert!(
+                    !calls.iter().any(|call| call.contains("osascript")),
+                    "{calls:?}"
                 );
             }
         }
@@ -4903,6 +5336,7 @@ mod tests {
                 })],
                 held: None,
                 clt: None,
+                toolset: None,
                 targo: None,
             };
             let rows = run(&sys, &ctx, base, &groups, Mode::Apply, &mut NoJournal).unwrap();
@@ -4989,7 +5423,7 @@ mod tests {
         let lock = || Some(StoodAside::Lock("held".into()));
         let offline = || Some(StoodAside::Offline("down".into()));
         let permission = || Some(StoodAside::Permission("not granted".into()));
-        let waiting = || Some(StoodAside::Waiting("waiting for an admin".into()));
+        let waiting = || Some(StoodAside::Waiting("waiting to be let in".into()));
         let done = row(Outcome::Changed, None);
         assert_eq!(status(std::slice::from_ref(&done), Action::Apply), 0);
         let vault = || ItemReport {
@@ -5971,6 +6405,7 @@ mod tests {
             items: vec![Box::new(MeetsBase(Arc::clone(&meet)))],
             held: None,
             clt: None,
+            toolset: None,
             targo: None,
         };
         let (dock, vault) = (Arc::clone(&meet), Arc::clone(&meet));
@@ -6328,6 +6763,7 @@ mod tests {
             items: vec![Box::new(MeetsBase(Arc::clone(&base_meet)))],
             held: None,
             clt: None,
+            toolset: None,
             targo: None,
         };
         let vault = Arc::clone(&meet);
@@ -6644,11 +7080,10 @@ mod tests {
         );
     }
 
-    /// The opt-in flags are a person's picks at this Mac's console: with no terminal, or from a
-    /// coding agent's tab, the run refuses them, saying why, before it reads the Mac; a person
-    /// at the console runs them.
+    /// Account sign-out runs in the console user's graphic session with no terminal; an agent
+    /// tab stays refused, and preferences still need a person at the console.
     #[test]
-    fn the_opt_in_flags_are_refused_where_no_person_is_at_the_console() {
+    fn sign_out_runs_without_a_terminal_but_not_from_an_agent_tab() {
         let options = Options {
             choice: Some(Choice {
                 sign_out: true,
@@ -6662,30 +7097,64 @@ mod tests {
                 place(Class::Preference),
             )]
         };
-        for (terminal, agent, presence) in [
-            (false, None, Presence::NoTerminal),
-            (true, Some("Claude Code"), Presence::AgentTab),
-            (true, None, Presence::AtConsole),
+        for (terminal, agent, allowed) in [
+            (false, None, true),
+            (false, Some("Claude Code"), false),
+            (false, Some("Codex"), false),
+            (true, Some("Claude Code"), false),
+            (true, None, true),
         ] {
             let mut sys = alice_with_checkout(501, None);
             sys.terminal = terminal;
             sys.agent = agent;
             let ran = converge_with(&sys, &options, &groups, &NoRecords);
-            match presence.why() {
-                None => assert!(ran.is_ok(), "{ran:?}"),
-                Some(why) => {
-                    assert!(
-                        matches!(&ran, Err(Refused::Usage(said)) if said.contains(why)),
-                        "{ran:?}"
-                    );
-                    assert!(
-                        !sys.calls().iter().any(|call| call.contains("/usr/bin/id")),
-                        "the Mac was read: {:?}",
-                        sys.calls()
-                    );
-                }
+            if allowed {
+                assert!(ran.is_ok(), "{ran:?}");
+            } else {
+                assert!(matches!(ran, Err(Refused::Usage(_))), "{ran:?}");
+                assert!(!sys.calls().iter().any(|call| call.contains("/usr/bin/id")));
             }
         }
+        let ctx = ctx(&[user("alice", 501)]);
+        let accounts = self::groups(
+            &ctx,
+            Presence::NoTerminal,
+            crate::init_secrets::Secrets {
+                items: Vec::new(),
+                waited_on: None,
+            },
+            Vec::new(),
+            None,
+            Choice {
+                sign_out: true,
+                ..Choice::NONE
+            },
+            &[],
+        );
+        let ids: Vec<String> = accounts
+            .iter()
+            .flat_map(|(items, _)| items.iter().map(|item| item.id()))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "init.messages.signed-out@alice",
+                "init.facetime.signed-out@alice"
+            ]
+        );
+        let preferences = Options {
+            choice: Some(Choice {
+                profile: true,
+                ..Choice::NONE
+            }),
+            ..Options::default()
+        };
+        let mut sys = alice_with_checkout(501, None);
+        sys.terminal = false;
+        assert!(matches!(
+            converge_with(&sys, &preferences, &groups, &NoRecords),
+            Err(Refused::Usage(_))
+        ));
     }
 
     #[test]
@@ -6718,6 +7187,7 @@ mod tests {
             })],
             held: None,
             clt: None,
+            toolset: None,
             targo: None,
         };
         let rows = run(&sys, &ctx, base, &groups, Mode::Plan, &mut NoJournal).unwrap();
@@ -6794,5 +7264,32 @@ mod tests {
         assert!(counts(person, Action::Apply) && !counts(person, Action::Check));
         assert!(tally(&reported, Action::Apply).ends_with("needs you: Full Disk Access"));
         assert_eq!(status(&reported, Action::Apply), 0, "{reported:?}");
+    }
+
+    #[test]
+    fn tally_names_swarm_enabled_false_in_init_check_summary() {
+        let swarm_off_row = ItemReport {
+            id: "init.secrets@alice".into(),
+            family: "secrets".into(),
+            layer: Some(Layer::Workstation),
+            class: None,
+            title: "Secrets vault (aterm help secrets)".into(),
+            outcome: Outcome::NotApplicable,
+            from: None,
+            to: None,
+            why: Some(aterm_secrets::swarm::SWARM_OFF.into()),
+            revert: None,
+            effect: aterm_converge::Effect::Now,
+            detail: None,
+            explain: None,
+            stood_aside: None,
+            essential: false,
+            elapsed_ms: None,
+        };
+        let line = tally(&[swarm_off_row], Action::Plan);
+        assert_eq!(
+            line,
+            "aterm init: 1 ok \u{b7} [swarm] enabled = false (nothing changed)"
+        );
     }
 }

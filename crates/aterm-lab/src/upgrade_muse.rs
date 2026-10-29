@@ -317,6 +317,73 @@ pub(crate) fn row_at(rows: &[(i64, String, String)], step: &str) -> Option<i64> 
     rows.iter().find(|(_, s, _)| s == step).map(|(t, _, _)| *t)
 }
 
+/// Whether the screen shows `needle`, by `ctl text`; `None` when that read
+/// failed (the client did not run, a nonzero exit, an `ERR` line, nothing
+/// drawn): a failed read is no reading, so a poll skips it and looks again.
+pub(crate) fn shows(door: &Door<'_>, needle: &str) -> Option<bool> {
+    let r = door.ctl(&["text"]).ok()?;
+    if r.code != 0 || r.stdout.starts_with("ERR") || r.stdout.trim().is_empty() {
+        return None;
+    }
+    Some(r.stdout.contains(needle))
+}
+
+/// Whether `text`, a reply, ends with the last tick of the stub's `slow`
+/// reply: the stub sends that tick last, so a reply cut short ends before it.
+pub(crate) fn ends_on_last_tick(text: &str) -> bool {
+    text.trim_end()
+        .ends_with(&format!("tick {}", crate::stub::SLOW_SECONDS))
+}
+
+/// Whether Muse's session record `session` (its `session.jsonl`) holds the
+/// stub's `slow` turn ended whole: a run whose `assistant_message_committed`
+/// text ends with the reply's last tick, and whose `terminal` record then
+/// says `completed`. The run ends there, not at the commit: Muse's
+/// end-of-turn gate runs about half a second between the two, and the
+/// restart's G-M1 holds a run open until its `terminal`.
+fn muse_reply_whole(session: &str) -> bool {
+    let records: Vec<J> = session.lines().filter_map(|l| J::parse(l).ok()).collect();
+    let runs: Vec<(&str, &J)> = records
+        .iter()
+        .filter_map(|r| {
+            let p = r.get("payload")?;
+            if p.get("kind").and_then(J::as_str) != Some("run") {
+                return None;
+            }
+            Some((p.get("run_id").and_then(J::as_str)?, p.get("event")?))
+        })
+        .collect();
+    fn kind(e: &J) -> Option<&str> {
+        e.get("kind").and_then(J::as_str)
+    }
+    runs.iter().any(|(run, e)| {
+        kind(e) == Some("assistant_message_committed")
+            && e.get("text")
+                .and_then(J::as_str)
+                .is_some_and(ends_on_last_tick)
+            && runs.iter().any(|(r, t)| {
+                r == run
+                    && kind(t) == Some("terminal")
+                    && t.get("terminal").and_then(J::as_str) == Some("completed")
+            })
+    })
+}
+
+/// [`muse_reply_whole`] of the session file at `path`; `Err` names a file that could not be read.
+fn slow_reply_whole(path: &Path) -> Result<bool, String> {
+    std::fs::read_to_string(path)
+        .map(|text| muse_reply_whole(&text))
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// A reply-record reading as a leg prints it.
+pub(crate) fn said_whole(r: &Result<bool, String>) -> String {
+    match r {
+        Ok(whole) => whole.to_string(),
+        Err(why) => format!("unread ({why})"),
+    }
+}
+
 /// How often [`held_while`] looks.
 const HELD_POLL: Duration = Duration::from_millis(500);
 
@@ -326,13 +393,19 @@ const HELD_POLL: Duration = Duration::from_millis(500);
 /// restart killed it is never read as work that ended first.
 const STOOD_AFTER: Duration = Duration::from_millis(400);
 
-/// A RESTART HELD WHILE THE WORK RAN, AND NOT TAKEN WITH ITS END: `(held while it ran, when it was seen ended)`, looking every [`HELD_POLL`] for at most `polls` looks, the agent `pid`, the ledger since `since`.
+/// A RESTART HELD WHILE THE WORK RAN, AND NOT TAKEN WITH ITS END: `(held while it ran, when it was seen ended)`, looking every [`HELD_POLL`] for at most `polls` looks, the agent `pid`, the ledger since `since`; `running` says whether the work runs, `None` when its read failed (that look sees nothing, never an end).
+///
+/// A restart taken within one look of the work's end reads as not held, so it
+/// judges only work whose end wakes the agent, which the restart then waits
+/// out (a task's or a subagent's end message to agy, a turn Muse opens when
+/// its shell ends); a turn's end wakes nothing, and its legs read the agent's
+/// record of the reply ([`ends_on_last_tick`]).
 pub(crate) fn held_while(
     run: &Run,
     pid: i32,
     since: i64,
     polls: u32,
-    running: impl FnMut() -> bool,
+    running: impl FnMut() -> Option<bool>,
 ) -> Result<(bool, Option<i64>), Fail> {
     held_while_with(
         polls,
@@ -344,13 +417,13 @@ pub(crate) fn held_while(
 }
 
 /// [`held_while`] over its clock and witnesses: `sleep` waits, `gone` says
-/// whether the agent is ended, `running` whether the work runs, `now` the
-/// time (ms).
+/// whether the agent is ended, `running` whether the work runs (`None`: its
+/// read failed, and that look sees nothing), `now` the time (ms).
 fn held_while_with(
     polls: u32,
     mut sleep: impl FnMut(Duration) -> Result<(), Fail>,
     mut gone: impl FnMut() -> bool,
-    mut running: impl FnMut() -> bool,
+    mut running: impl FnMut() -> Option<bool>,
     mut now: impl FnMut() -> i64,
 ) -> Result<(bool, Option<i64>), Fail> {
     for _ in 0..polls {
@@ -358,7 +431,7 @@ fn held_while_with(
         if gone() {
             return Ok((false, None));
         }
-        if !running() {
+        if running() == Some(false) {
             let end = now();
             sleep(STOOD_AFTER)?;
             if gone() {
@@ -619,7 +692,7 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         backgrounded.is_some()
     );
     let (held_while_running, ended_at) =
-        held_while(&run, m1.pid, t2, 120, || children(m1.pid) > 0)?;
+        held_while(&run, m1.pid, t2, 120, || Some(children(m1.pid) > 0))?;
     println!(
         "  bg ended  {}; the Muse stood while it ran={held_while_running}",
         ended_at.map_or_else(
@@ -670,31 +743,30 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
     store
         .land(&v4)
         .map_err(|e| could_not(&format!("landing {v4}: {e}")))?;
-    println!("  busy      the turn running={busy}; landed {v4} at {b4}");
-    let mut held_mid_turn = true;
-    let mut turn_end = None;
-    for _ in 0..240 {
-        stop::sleep(Duration::from_millis(500))?;
-        if !crate::procs::alive(m2.pid) || row_at(&ledger(&run, t3), "terminated").is_some() {
-            if turn_end.is_none() {
-                held_mid_turn = false;
-            }
-            break;
-        }
-        if turn_end.is_none() && !door.out(&["text"]).contains("esc to interrupt") {
-            turn_end = Some(now_ms());
-        }
-    }
+    // The turn's end wakes nothing, so the restart can follow it before the
+    // next look at the screen, which then cannot say which came first; Muse's
+    // record of the turn can: ended whole after the restart, not at the landing.
+    let record = session_of(&run, m2.pid)
+        .filter(|(s, _)| *s == session)
+        .map(|(_, lock)| lock.with_file_name("session.jsonl"));
+    let whole = |when: &str| match &record {
+        Some(path) => slow_reply_whole(path),
+        None => Err(format!("no session lock of pid {} {when}", m2.pid)),
+    };
+    let open = whole("at the landing");
+    println!(
+        "  busy      the turn running={busy}; landed {v4} at {b4}; the reply whole then={}",
+        said_whole(&open)
+    );
     let moved3 = moved_onto(&run, &store.store(), b4, &session, m2.pid, 180, t3)?;
     if moved3.as_ref().is_some_and(|m| m.lock_names) {
         store.ran(b4);
     }
-    let after_turn = match (&moved3, turn_end) {
-        (Some(m), Some(end)) => {
-            row_at(&m.rows, "terminated").is_some_and(|t| t * 1000 >= end - 999)
-        }
-        _ => false,
-    };
+    let ended = whole("after the restart");
+    println!(
+        "  reply     Muse's session record holds the slow turn ended whole={}",
+        said_whole(&ended)
+    );
     show_held(&run, t3);
     if let Some(m) = &moved3 {
         show_rows(&m.rows);
@@ -706,9 +778,8 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         );
     }
     said(
-        busy && held_mid_turn
-            && turn_end.is_some()
-            && after_turn
+        busy && open == Ok(false)
+            && ended == Ok(true)
             && moved3
                 .as_ref()
                 .is_some_and(|m| m.lock_names && quiet(&m.rows)),
@@ -750,7 +821,7 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
             turns_at_restart = Some(main_turns(&run));
             break;
         }
-        if turn_end4.is_none() && !door.out(&["text"]).contains("esc to interrupt") {
+        if turn_end4.is_none() && shows(&door, "esc to interrupt") == Some(false) {
             turn_end4 = Some(now_ms());
         }
     }
@@ -852,21 +923,82 @@ pub fn cmd_muse_upgrade(args: &[String]) -> Res {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_turn_is_whole_once_muse_committed_its_last_tick_and_its_run_completed() {
+        let record = |run: &str, event: &str| {
+            format!(
+                r#"{{"schema_version":1,"record_type":"event","payload_type":"runtime.session","payload":{{"kind":"run","run_id":"{run}","event":{event}}}}}"#
+            )
+        };
+        let committed = |run: &str, text: &str| {
+            record(
+                run,
+                &format!(r#"{{"kind":"assistant_message_committed","text":"{text}"}}"#),
+            )
+        };
+        let ended = |run: &str, how: &str| {
+            record(run, &format!(r#"{{"kind":"terminal","terminal":"{how}"}}"#))
+        };
+        let ticks = |to: i64| (1..=to).map(|i| format!("tick {i} ")).collect::<String>();
+        let last = crate::stub::SLOW_SECONDS;
+        let whole = ticks(last);
+        let log = |rows: &[String]| rows.join("\n");
+        assert!(muse_reply_whole(&log(&[
+            committed("r1", &whole),
+            ended("r1", "completed")
+        ])));
+        assert!(
+            !muse_reply_whole(&committed("r1", &whole)),
+            "a reply committed whole whose run has not ended: the end-of-turn gate still runs"
+        );
+        assert!(
+            !muse_reply_whole(&log(&[
+                committed("r1", &ticks(last - 1)),
+                ended("r1", "completed")
+            ])),
+            "a reply cut before its last tick"
+        );
+        assert!(
+            !muse_reply_whole(&log(&[committed("r1", &whole), ended("r2", "completed")])),
+            "another run's end"
+        );
+        assert!(
+            !muse_reply_whole(&log(&[committed("r1", &whole), ended("r1", "cancelled")])),
+            "a run that did not complete"
+        );
+        let approval = r#"{"payload":{"kind":"approval_wait_effect","run_id":"r1","record":{"kind":"terminal"}}}"#;
+        assert!(
+            !muse_reply_whole(&log(&[committed("r1", &whole), approval.to_string()])),
+            "another record's terminal"
+        );
+        assert!(
+            !muse_reply_whole(&log(&[
+                record("r1", &format!(r#"{{"kind":"status","text":"{whole}"}}"#)),
+                ended("r1", "completed")
+            ])),
+            "another event's words"
+        );
+        assert!(
+            !ends_on_last_tick(&format!("tick {last}0")),
+            "a longer reply's tick"
+        );
+    }
+
     /// One scripted run of [`held_while_with`] over eight looks: the `gone`
     /// answers in order, one per ask (the confirming ask after the work is
-    /// seen ended takes the next), and the `running` answers likewise; the
-    /// clock one second an ask.
-    fn judged(looks: &[(bool, bool)]) -> (bool, Option<i64>) {
+    /// seen ended takes the next), and the `running` answers likewise (`None`
+    /// a failed read); the clock one second an ask.
+    fn judged(looks: &[(bool, Option<bool>)]) -> (bool, Option<i64>) {
         let gones: std::cell::RefCell<std::collections::VecDeque<bool>> =
             std::cell::RefCell::new(looks.iter().map(|l| l.0).collect());
-        let runs: std::cell::RefCell<std::collections::VecDeque<bool>> =
+        let runs: std::cell::RefCell<std::collections::VecDeque<Option<bool>>> =
             std::cell::RefCell::new(looks.iter().map(|l| l.1).collect());
         let clock = std::cell::Cell::new(0);
         held_while_with(
             8,
             |_| Ok(()),
             || gones.borrow_mut().pop_front().unwrap_or(true),
-            || runs.borrow_mut().pop_front().unwrap_or(false),
+            || runs.borrow_mut().pop_front().unwrap_or(Some(false)),
             || {
                 clock.set(clock.get() + 1000);
                 clock.get()
@@ -880,17 +1012,36 @@ mod tests {
     /// (`(true, Some)`).
     #[test]
     fn work_that_ends_with_the_agent_is_never_read_as_ended_first() {
+        let (ran, ended) = (Some(true), Some(false));
         assert_eq!(
-            judged(&[(false, true), (false, false), (false, true)]),
+            judged(&[(false, ran), (false, ended), (false, ran)]),
             (true, Some(1000))
         );
-        assert_eq!(judged(&[(false, true), (true, false)]), (false, None));
+        assert_eq!(judged(&[(false, ran), (true, ended)]), (false, None));
         assert_eq!(
-            judged(&[(false, true), (false, false), (true, true)]),
+            judged(&[(false, ran), (false, ended), (true, ran)]),
             (false, None)
         );
-        assert_eq!(judged(&[(false, true), (true, true)]), (false, None));
-        assert_eq!(judged(&[(false, true); 8]), (true, None));
+        assert_eq!(judged(&[(false, ran), (true, ran)]), (false, None));
+        assert_eq!(judged(&[(false, ran); 8]), (true, None));
+    }
+
+    /// A FAILED READ IS NO END: a look whose read failed sees nothing, so an
+    /// agent restarted on the next look was restarted while the work ran
+    /// (read as an end, that look would have judged it held and ended); an
+    /// end seen after it still counts, and reads that all fail see none.
+    #[test]
+    fn a_failed_read_is_never_read_as_the_work_ended() {
+        let (ran, ended, failed) = (Some(true), Some(false), None);
+        assert_eq!(
+            judged(&[(false, ran), (false, failed), (false, ran), (true, ran)]),
+            (false, None)
+        );
+        assert_eq!(
+            judged(&[(false, ran), (false, failed), (false, ended), (false, ran)]),
+            (true, Some(1000))
+        );
+        assert_eq!(judged(&[(false, failed); 8]), (true, None));
     }
 
     /// The build id atpkg lays a revision-form version under, as its store

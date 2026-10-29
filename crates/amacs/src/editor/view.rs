@@ -12,6 +12,7 @@ use aterm_grapheme::GraphemeClusters;
 
 use super::chord::KeyChord;
 use super::command::{EditorCommand, PrefixArgument};
+use super::grid::Face;
 use super::minibuffer::Minibuffer;
 use super::projection::{
     EditorLines, byte_at_editor_display_column, clamp_to_char_boundary, line_end, line_start,
@@ -75,8 +76,13 @@ pub struct EditorBufferView {
     pub folds: Vec<Range<usize>>,
     pub minibuffer: Minibuffer,
     input_lifetime: Arc<()>,
-    /// The last accepted query belongs to this view, never to a terminal or another editor view.
+    /// The last accepted query belongs to this view, never to a terminal or another editor view:
+    /// the person's, accepted by input that carries [`super::CommandAuthority::Clipboard`].
     pub(super) last_search_query: String,
+    /// [`Self::last_search_query`] for input without clipboard authority (in aterm, a control
+    /// client's): a query is what was typed, as private as a kill, so neither input recalls the
+    /// other's (`C-s C-s`, search-next: [`super::EditorWorkspace::remembered_search`]).
+    pub(super) guest_last_search_query: String,
     /// `set-mark-command` activates a persistent region anchor.
     pub mark_active: bool,
     pub prefix_hud: Option<String>,
@@ -88,6 +94,8 @@ pub struct EditorBufferView {
     pub(super) last_command: Option<EditorCommand>,
     /// Where `C-l` last put the caret's line: the middle, the top, then the bottom.
     pub(super) recenter_phase: u8,
+    /// How the view draws its document: text, or a table's grid.
+    pub face: Face,
 }
 
 impl EditorBufferView {
@@ -103,6 +111,7 @@ impl EditorBufferView {
             minibuffer: Minibuffer::Inactive,
             input_lifetime: Arc::new(()),
             last_search_query: String::new(),
+            guest_last_search_query: String::new(),
             mark_active: false,
             prefix_hud: None,
             desired_column: None,
@@ -111,6 +120,7 @@ impl EditorBufferView {
             anchor_seq,
             last_command: None,
             recenter_phase: 0,
+            face: Face::Text,
         }
     }
 
@@ -143,12 +153,15 @@ impl EditorBufferView {
         )
     }
 
+    /// Whether Find Next/Previous has a query to step here: the open search's, or one some input
+    /// accepted. A step by input whose own remembered query is empty says there is none to step
+    /// ([`super::EditorWorkspace::remembered_search`]).
     pub const fn has_search_query(&self) -> bool {
+        let remembered =
+            !self.last_search_query.is_empty() || !self.guest_last_search_query.is_empty();
         match &self.minibuffer {
-            Minibuffer::Search { query, .. } => {
-                !query.is_empty() || !self.last_search_query.is_empty()
-            }
-            Minibuffer::Inactive => !self.last_search_query.is_empty(),
+            Minibuffer::Search { query, .. } => !query.is_empty() || remembered,
+            Minibuffer::Inactive => remembered,
             _ => false,
         }
     }
@@ -360,10 +373,16 @@ impl EditorBufferView {
         self.input_lifetime = Arc::new(());
     }
 
-    /// Rebase view-local coordinates after a commit initiated by another controller.
+    /// Rebase view-local coordinates after a commit initiated by another controller, an open
+    /// grid cell's record ([`super::grid::CellDraft::observe`]) included.
     pub fn observe_external(&mut self, seq: Seq, deltas: &[EditDelta]) {
         for selection in &mut self.selections {
             selection.rebase(deltas);
+        }
+        if let Face::Grid(grid) = &mut self.face
+            && let Some(draft) = grid.draft.as_mut()
+        {
+            draft.observe(deltas);
         }
         self.viewport_anchor = rebase_position(self.viewport_anchor, deltas);
         if let Minibuffer::Search { origin, .. } | Minibuffer::GotoLine { origin, .. } =
@@ -1080,11 +1099,34 @@ mod tests {
         let two = one + "one ".len();
         let three = two + "two ".len();
 
+        EDITOR_WORDS_READ.with(|n| n.set(0));
+        assert_eq!(previous_word_boundary(&text, text.len(), 3), one);
+        assert_eq!(
+            EDITOR_WORDS_READ.with(std::cell::Cell::get),
+            4,
+            "previous_word_boundary(count=3) scans the four words once"
+        );
         assert_eq!(previous_word_boundary(&text, text.len(), 1), three);
         assert_eq!(previous_word_boundary(&text, text.len(), 2), two);
-        assert_eq!(previous_word_boundary(&text, text.len(), 3), one);
         assert_eq!(previous_word_boundary(&text, three, 1), two);
         assert_eq!(previous_word_boundary(&text, text.len(), 4), 0);
+
+        let (mut store, mut workspace, mut view, _) = editor(&text);
+        view.selections = vec![Selection::caret(text.len())];
+        view.prefix_argument = Some(PrefixArgument::Numeric {
+            value: 3,
+            open: true,
+        });
+        EDITOR_WORDS_READ.with(|n| n.set(0));
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::MoveWordBackward)
+            .unwrap();
+        assert_eq!(view.primary_selection().head, one);
+        assert_eq!(
+            EDITOR_WORDS_READ.with(std::cell::Cell::get),
+            4,
+            "C-u 3 M-b applies count=3 in one pass over the four words"
+        );
     }
 
     #[test]

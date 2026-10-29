@@ -145,21 +145,14 @@ impl Index {
     }
 
     /// The installable set: every program the index names, less the narrowing-only `[packages].exclude` (R4/§5).
+    /// It is also the default set the passes keep complete: every program, an ALab harness
+    /// ([`crate::harness`]) included, is on unless a person turns it off (owner ruling 2026-10-27).
     #[must_use]
     pub fn installable(&self, exclude: &[String]) -> BTreeSet<String> {
         let mut set: BTreeSet<String> = self.programs.keys().cloned().collect();
         for e in exclude {
             set.remove(e);
         }
-        set
-    }
-
-    /// The default set: the installable set less every program outside it
-    /// ([`crate::harness::in_default_set`]), which installs only when a person names it.
-    #[must_use]
-    pub fn default_set(&self, exclude: &[String]) -> BTreeSet<String> {
-        let mut set = self.installable(exclude);
-        set.retain(|p| crate::harness::in_default_set(p));
         set
     }
 }
@@ -757,11 +750,11 @@ pin = {{ trust = 7100, nn = 108 }}
         assert!(idx.is_program("trust") && idx.is_program("ay") && idx.is_program("aterm"));
     }
 
-    /// A HARNESS IS INSTALLABLE AND OUTSIDE THE DEFAULT SET: the index names it, so a person
-    /// may install it, and the set the passes complete leaves it out; `exclude` still
-    /// narrows the rest.
+    /// A HARNESS IS IN THE DEFAULT SET LIKE ANY PROGRAM: the index names it, so the set the
+    /// passes complete holds it unasked (owner ruling 2026-10-27); `exclude` still narrows it
+    /// out, a harness as well as the rest.
     #[test]
-    fn the_default_set_is_the_installable_set_less_the_harnesses() {
+    fn the_default_set_holds_a_harness_and_exclude_still_narrows_it() {
         let body = full_index().replace(
             "[programs.ay]",
             "[programs.muse-alab]\nrepo = \"muse-alab\"\n\n[programs.ay]",
@@ -769,14 +762,13 @@ pin = {{ trust = 7100, nn = 108 }}
         let idx = parse_index(&verified(&body)).unwrap();
         assert!(idx.is_program("muse-alab"));
         assert!(idx.installable(&[]).contains("muse-alab"));
-        let all = idx.installable(&[]);
-        let mut rest = all.clone();
-        rest.remove("muse-alab");
-        assert_eq!(idx.default_set(&[]), rest);
-        assert!(!idx.default_set(&[]).contains("muse-alab"));
         assert!(
-            !idx.default_set(&["ay".into()]).contains("ay"),
-            "exclude narrows the default set too"
+            !idx.installable(&["muse-alab".into()]).contains("muse-alab"),
+            "a person's exclude keeps a harness out"
+        );
+        assert!(
+            !idx.installable(&["ay".into()]).contains("ay"),
+            "exclude narrows the rest too"
         );
     }
 

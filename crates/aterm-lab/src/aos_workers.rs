@@ -52,10 +52,6 @@ const POLL: Duration = Duration::from_millis(100);
 /// How long shutdown waits for a worker whose pipe has closed to become reapable.
 const REAP_WAIT: Duration = Duration::from_secs(1);
 
-/// A debug fault's delay between result and lie. Which search phase sees it depends on the
-/// workload; this delay is not a causal shutdown barrier.
-const POST_LIE_DELAY: Duration = Duration::from_millis(500);
-
 /// The shell's clock is `Instant`'s, measured from one origin, so the core is never handed an
 /// earlier `now`; a `ClockBackwards` would be a defect here.
 const MONOTONIC: &str = "the shell's clock is monotonic";
@@ -180,6 +176,38 @@ fn frame_step(w: WorkerId, payload: &[u8]) -> String {
     }
 }
 
+/// A stretch of the coordinator's own work on a search once its last claim is in, which
+/// `--frames` says as it begins ([`say`]): a step of the run's, as a worker frame's is, so the
+/// process tests' hang detector holds each stretch rather than all of them from the last claim to
+/// the end, one CPU-bound length a loaded host stretches past it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    /// Step 5's check of the accepted claims (design §11.3).
+    Check,
+    /// The winner's held-out read.
+    HeldOut,
+    /// The winner's bundle verified before it is written.
+    Verify,
+}
+
+impl Phase {
+    /// Its name in the step.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Check => "check",
+            Self::HeldOut => "held-out",
+            Self::Verify => "verify",
+        }
+    }
+}
+
+/// Says on stderr that the coordinator began `phase` of search `serial`: `aos-workers
+/// step=G.<name>`, each at most once a search. Its callers call it under `--frames` only.
+pub fn say(serial: u32, phase: Phase) {
+    eprintln!("aos-workers step={serial}.{}", phase.name());
+}
+
 /// What this binary contributes to its [`ExecIdentity`]: the toolchain and profile `build.rs`
 /// stamped, the digest of its own file, and the faults armed.
 /// # Errors
@@ -217,8 +245,9 @@ pub enum FaultKind {
     Dup,
     /// The result, then a different one.
     DupLie,
-    /// The result, then a different one [`POST_LIE_DELAY`] later.
-    PostLie,
+    /// The result, then a different one once the worker's stdin closes, which the coordinator
+    /// does at its shutdown, after the command's last search: only the shutdown drain reads it.
+    CloseLie,
     /// An admitted plan claimed refused at item 0.
     LieRefusal,
     /// `T` lowered by one on every row of an admitted claim, `P` or `Z` with it, so the claim keeps
@@ -298,7 +327,7 @@ impl Fault {
             ("late-lie", None) => FaultKind::LateLie,
             ("dup", None) => FaultKind::Dup,
             ("dup-lie", None) => FaultKind::DupLie,
-            ("post-lie", None) => FaultKind::PostLie,
+            ("close-lie", None) => FaultKind::CloseLie,
             ("lie-refusal", None) => FaultKind::LieRefusal,
             ("lie-best", None) => FaultKind::LieBest,
             ("inflate", None) => FaultKind::Inflate,
@@ -391,15 +420,31 @@ enum Inbound {
     Cancel(Token),
 }
 
+/// The frames faults hold for the worker's stdin to close, in the order held.
+type Held = Arc<Mutex<Vec<Vec<u8>>>>;
+
 /// The lifeline and the inbound frames: a thread that forwards leases and cancels and ends the
-/// process when stdin closes (the coordinator is gone) or carries a frame no coordinator sends.
-fn inbound() -> Receiver<Inbound> {
+/// process when stdin closes (the coordinator is gone, or done) or carries a frame no coordinator
+/// sends. At the close it first sends the frames `held` holds, in order, under the stdout lock, so
+/// none lands inside one of the main thread's.
+fn inbound(held: Held) -> Receiver<Inbound> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut stdin = io::stdin().lock();
         loop {
             let m = match read_frame(&mut stdin) {
-                Ok(None) => std::process::exit(0),
+                Ok(None) => {
+                    let frames =
+                        std::mem::take(&mut *held.lock().unwrap_or_else(|e| e.into_inner()));
+                    if !frames.is_empty() {
+                        let mut out = io::stdout().lock();
+                        let _ = frames
+                            .iter()
+                            .try_for_each(|bytes| out.write_all(bytes))
+                            .and_then(|()| out.flush());
+                    }
+                    std::process::exit(0)
+                }
                 Ok(Some(p)) => match Msg::decode(&p, Sender::Coordinator) {
                     Ok(Msg::Lease {
                         token,
@@ -437,8 +482,9 @@ fn inbound() -> Receiver<Inbound> {
 
 /// The worker's side of the pipes.
 struct Io {
-    out: io::StdoutLock<'static>,
     rx: Receiver<Inbound>,
+    /// The frames the stdin reader sends at the close ([`inbound`]).
+    held: Held,
     /// Leases that arrived while a job ran.
     queued: VecDeque<Inbound>,
     /// Each finished lease and the rows it judged, so a later `Cancel` is acknowledged.
@@ -455,21 +501,30 @@ impl Io {
     }
 
     fn raw(&mut self, bytes: &[u8]) -> Result<(), Exit> {
-        // A closed stdout means the coordinator is gone: the lifeline, not a fault.
-        if self
-            .out
-            .write_all(bytes)
-            .and_then(|()| self.out.flush())
-            .is_err()
-        {
+        // One stdout lock per frame, so the stdin reader's held frames land between two. A closed
+        // stdout means the coordinator is gone: the lifeline, not a fault.
+        let mut out = io::stdout().lock();
+        if out.write_all(bytes).and_then(|()| out.flush()).is_err() {
             std::process::exit(0);
         }
         Ok(())
     }
 
-    fn fired(&self, kind: FaultKind) {
+    /// Holds `m`, after any frame held before it, for the stdin reader to send at the close.
+    fn hold(&mut self, m: &Msg) -> Result<(), Exit> {
+        let bytes = frame_bytes(&m.encode()).map_err(|e| (3, e.to_string()))?;
+        self.held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(bytes);
+        Ok(())
+    }
+
+    /// Says that `kind` fired on `token`'s lease: each spec of that kind keyed by that lease, and
+    /// no other spec of the kind, so a run that arms a kind twice counts each spec's own firing.
+    fn fired(&self, token: Token, kind: FaultKind) {
         for (spec, f) in &self.faults {
-            if matches!(f, Fault::At { kind: k, .. } if *k == kind) {
+            if f.on(&token) == Some(kind) {
                 eprintln!("aos-worker fault={spec} fired");
             }
         }
@@ -519,7 +574,8 @@ fn hang() -> ! {
 
 fn worker(args: &[String]) -> Result<(), Exit> {
     let opts = WorkerArgs::parse(args).map_err(|e| (2, e))?;
-    let rx = inbound();
+    let held = Held::default();
+    let rx = inbound(Arc::clone(&held));
     let started = Instant::now();
     let ev = Evaluator::v1(LAB_BUILD, started)
         .map_err(|e| (3, format!("the pinned policy is refused: {e}")))?;
@@ -528,8 +584,8 @@ fn worker(args: &[String]) -> Result<(), Exit> {
     let mut identity = ExecIdentity::of(&ev, binary(&specs).map_err(|e| (3, e))?);
     let exec = identity.digest();
     let mut io = Io {
-        out: io::stdout().lock(),
         rx,
+        held,
         queued: VecDeque::new(),
         done: Vec::new(),
         faults: opts.faults,
@@ -627,20 +683,24 @@ fn run_lease(
                     io.send(&result(sent))?;
                 }
                 Some(FaultKind::Dup) => {
-                    io.fired(FaultKind::Dup);
+                    io.fired(token, FaultKind::Dup);
                     io.send(&result(honest.clone()))?;
                     io.send(&result(honest))?;
                 }
-                Some(f @ (FaultKind::DupLie | FaultKind::PostLie)) => {
-                    io.fired(f);
+                Some(FaultKind::DupLie) => {
+                    io.fired(token, FaultKind::DupLie);
                     io.send(&result(honest.clone()))?;
-                    if f == FaultKind::PostLie {
-                        let _ = stop::sleep(POST_LIE_DELAY);
-                    }
-                    io.send(&result(lie(honest, f)))?;
+                    io.send(&result(lie(honest, FaultKind::DupLie)))?;
+                }
+                Some(FaultKind::CloseLie) => {
+                    io.fired(token, FaultKind::CloseLie);
+                    // Held before the result goes: the shutdown closes stdin only once the ledger
+                    // is quiescent, which takes this result, so that close finds the lie.
+                    io.hold(&result(lie(honest.clone(), FaultKind::CloseLie)))?;
+                    io.send(&result(honest))?;
                 }
                 Some(f @ (FaultKind::LieRefusal | FaultKind::LieBest | FaultKind::Inflate)) => {
-                    io.fired(f);
+                    io.fired(token, f);
                     io.send(&result(lie(honest, f)))?;
                 }
                 _ => io.send(&result(honest))?,
@@ -665,20 +725,20 @@ fn keep(
     let progress = Msg::Progress { token, k };
     match fault {
         Some(FaultKind::Kill(n)) if k == n => {
-            io.fired(FaultKind::Kill(n));
+            io.fired(token, FaultKind::Kill(n));
             aterm_uds::process::kill_self_now()
         }
         Some(FaultKind::Hang(n)) if k == n => {
-            io.fired(FaultKind::Hang(n));
+            io.fired(token, FaultKind::Hang(n));
             hang()
         }
         Some(FaultKind::Slow(n)) if k == n && !*cancelled => {
-            io.fired(FaultKind::Slow(n));
+            io.fired(token, FaultKind::Slow(n));
             io.await_cancel(token)?;
             *cancelled = true;
         }
         Some(FaultKind::Garbage) if k == 0 => {
-            io.fired(FaultKind::Garbage);
+            io.fired(token, FaultKind::Garbage);
             let mut bytes = frame_bytes(&progress.encode()).map_err(|e| (3, e.to_string()))?;
             if let Some(b) = bytes.last_mut() {
                 *b ^= 0xff;
@@ -687,7 +747,7 @@ fn keep(
             hang()
         }
         Some(FaultKind::Flood) if k == 0 => {
-            io.fired(FaultKind::Flood);
+            io.fired(token, FaultKind::Flood);
             for _ in 0..64 {
                 io.send(&progress)?;
             }
@@ -695,7 +755,7 @@ fn keep(
         }
         Some(f @ (FaultKind::Late | FaultKind::LateLie)) if k >= 1 => {
             if k == 1 {
-                io.fired(f);
+                io.fired(token, f);
             }
             return Ok(ControlFlow::Continue(()));
         }
@@ -761,23 +821,37 @@ pub struct PoolArgs {
     pub workers: usize,
     /// The lease window, when a debug build overrides it.
     pub lease_ms: Option<u64>,
+    /// How long a worker may take from its spawn to say hello (its evaluator's build and its own
+    /// digest first), when a debug build overrides it: a process test sets it past the run, so a
+    /// loaded host's stall there is its hang detector's to judge, not a `HelloTimeout` loss.
+    pub hello_ms: Option<u64>,
+    /// The drain grace after a `Cancel`, when a debug build overrides it: a process test sets it
+    /// past the run, so a slow worker's late result is judged however loaded the host.
+    pub grace_ms: Option<u64>,
     /// The faults armed on every worker (debug builds).
     pub faults: Vec<String>,
     /// `--frames` (debug builds): each worker frame taken is said on stderr with its step
-    /// ([`frame_step`]), so the process tests' hang detector waits for the run's next new step,
-    /// not for a whole run a loaded host stretches.
+    /// ([`frame_step`]), and each [`Phase`] of the coordinator's as it begins ([`say`]), so the
+    /// process tests' hang detector waits for the run's next new step, not for a whole run a
+    /// loaded host stretches.
     pub frames: bool,
 }
 
 impl PoolArgs {
-    /// The ledger's limits: `LIMITS_V1`, with this pool's size and window.
+    /// The ledger's limits: `LIMITS_V1`, with this pool's size, hello, window and grace.
     #[must_use]
     pub fn limits(&self) -> Limits {
         Limits {
             max_workers: self.workers,
+            hello_ns: self
+                .hello_ms
+                .map_or(LIMITS_V1.hello_ns, |ms| ms.saturating_mul(1_000_000)),
             window_ns: self
                 .lease_ms
                 .map_or(LIMITS_V1.window_ns, |ms| ms.saturating_mul(1_000_000)),
+            grace_ns: self
+                .grace_ms
+                .map_or(LIMITS_V1.grace_ns, |ms| ms.saturating_mul(1_000_000)),
             ..LIMITS_V1
         }
     }
@@ -1033,6 +1107,12 @@ impl Pool {
     #[must_use]
     pub fn serial(&self) -> u32 {
         self.core.as_ref().map_or(0, |c| c.ledger().search())
+    }
+
+    /// Whether this pool says its steps on stderr (`--frames`).
+    #[must_use]
+    pub fn frames(&self) -> bool {
+        self.args.frames
     }
 
     /// Voids the command's distributed work for `why`, found after a search (step 5).

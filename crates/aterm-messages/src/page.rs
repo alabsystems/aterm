@@ -674,6 +674,8 @@ fn still_actionable(intent: &Intent, live: bool, host: &impl Host) -> bool {
         | Intent::ShowSession { .. }
         | Intent::EndRecovered
         | Intent::ApproveJoin { .. }
+        | Intent::AllowJoin { .. }
+        | Intent::IgnoreJoin { .. }
         | Intent::RestartService { .. } => live,
         Intent::ShowTab { .. } => false,
         Intent::ApplyUpdate { build } => host.staged_build() == Some(*build),
@@ -759,6 +761,10 @@ pub fn act_feedback(intent: &Intent, performed: bool, applies: bool) -> String {
             "Approving that Mac; it joins once the vault is published".to_string()
         }
         (Intent::ApproveJoin { .. }, false) => "Could not approve that Mac".to_string(),
+        (Intent::AllowJoin { .. }, true) => "The phrase is on this Mac's screen".to_string(),
+        (Intent::AllowJoin { .. }, false) => "Could not allow that Mac".to_string(),
+        (Intent::IgnoreJoin { .. }, true) => "Ignored that Mac on this Mac".to_string(),
+        (Intent::IgnoreJoin { .. }, false) => "That request is gone".to_string(),
         (Intent::RestartService { .. }, true) => {
             "Opened a tab that asks for your password once".to_string()
         }

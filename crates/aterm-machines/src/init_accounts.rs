@@ -6,7 +6,7 @@
 use crate::items::{Ctx, Item};
 use crate::model::{PValue, Probe, User};
 use crate::plist::{self, Entries};
-use crate::port::{Cmd, System};
+use crate::port::{AccessibilityWalk, Cmd, RunFailed, System};
 use aterm_types::macos_setup::{Selection, Setting};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -97,11 +97,12 @@ const AUTOMATION_OFF: &str = "macOS Automation permission to control System Even
 /// nothing.
 const AUTOMATION_ASK: &str = "tell application id \"com.apple.systemevents\" to count processes";
 
-/// Whether this run asked macOS for Accessibility already, shared by its sign-out items: it
-/// asks once, and waits once.
+/// The run's Accessibility request and Automation answer, shared by its sign-out items: each is
+/// asked for once, and neither wait repeats for the second app.
 #[derive(Default)]
 struct Consent {
     asked: Mutex<bool>,
+    automation: Mutex<Option<bool>>,
 }
 
 struct SignOut {
@@ -238,8 +239,9 @@ impl Item for SignOut {
             "sign-out-requested" if ran.success() => {}
             _ => {
                 return Err(format!(
-                    "{} account Settings controls were unavailable; sign-out remains unverified",
-                    self.service.name()
+                    "{} account Settings controls were unavailable; sign-out remains unverified: {}",
+                    self.service.name(),
+                    ran.describe()
                 ));
             }
         }
@@ -271,8 +273,11 @@ impl SignOut {
     /// aterm window's permission walk when that window is the app responsible for the run (its
     /// panel beside System Settings, [`System::walk_accessibility`]), otherwise macOS's own
     /// consent dialog; then it reads the grant again every [`POLL`] in this process for at most
-    /// [`PATIENCE`], going on the moment it is on. A later sign-out of the same run does not ask
-    /// or wait again. Anywhere else (System State, which asks for it itself) nothing is asked.
+    /// [`PATIENCE`], going on the moment it is on. The window's answer can hold the ask back:
+    /// the owner's Not now on the walk's Accessibility page asks nothing and goes on without it,
+    /// and a walk showing other pages gets no macOS dialog beside them, only the reads. A later
+    /// sign-out of the same run does not ask or wait again. Anywhere else (System State, which
+    /// asks for it itself) nothing is asked.
     fn accessible(&self, sys: &dyn System) -> Result<bool, String> {
         if accessibility_ready(sys)? {
             return Ok(true);
@@ -291,25 +296,47 @@ impl SignOut {
             }
             *asked = true;
         }
-        if sys.walk_accessibility() {
-            say(&format!(
+        match sys.walk_accessibility() {
+            AccessibilityWalk::Taken => say(&format!(
                 "signing out of {} clicks its Sign Out, which needs Accessibility for {}: the \
                  aterm window's panel shows where to switch it on (System Settings \u{25b8} \
                  Privacy & Security \u{25b8} Accessibility), and init goes on the moment it is \
                  on (Ctrl-C stops waiting)",
                 self.service.name(),
                 responsible(sys)
-            ));
-        } else {
-            say(&format!(
-                "signing out of {} clicks its Sign Out, which needs Accessibility for {}: switch \
-                 it on in macOS's dialog (System Settings \u{25b8} Privacy & Security \u{25b8} \
-                 Accessibility), and init goes on the moment it is on (Ctrl-C stops waiting)",
+            )),
+            AccessibilityWalk::NotNow => {
+                say(&format!(
+                    "signing out of {} clicks its Sign Out, which needs Accessibility for {}: \
+                     you said Not now to it in the aterm window, so init asks nothing for it \
+                     (System State's Accessibility row opens it again)",
+                    self.service.name(),
+                    responsible(sys)
+                ));
+                return Ok(false);
+            }
+            AccessibilityWalk::OtherPages => say(&format!(
+                "signing out of {} clicks its Sign Out, which needs Accessibility for {}: the \
+                 aterm window's permission walk has other pages up beside System Settings, or \
+                 had within the last minute, so init raises no macOS dialog beside them; switch \
+                 it on in System Settings \u{25b8} Privacy & Security \u{25b8} Accessibility \
+                 (System State's Accessibility row opens it), and init goes on the moment it is \
+                 on (Ctrl-C stops waiting)",
                 self.service.name(),
                 responsible(sys)
-            ));
-            if request_accessibility(sys)? {
-                return Ok(true);
+            )),
+            AccessibilityWalk::NotTaken => {
+                say(&format!(
+                    "signing out of {} clicks its Sign Out, which needs Accessibility for {}: \
+                     switch it on in macOS's dialog (System Settings \u{25b8} Privacy & \
+                     Security \u{25b8} Accessibility), and init goes on the moment it is on \
+                     (Ctrl-C stops waiting)",
+                    self.service.name(),
+                    responsible(sys)
+                ));
+                if request_accessibility(sys)? {
+                    return Ok(true);
+                }
             }
         }
         for _ in 0..ticks(PATIENCE) {
@@ -362,27 +389,47 @@ impl SignOut {
         Ok(())
     }
 
-    /// Ask macOS's Automation question for System Events once, before any app opens: `false`
-    /// when the person (or a standing answer) refused it.
+    /// Ask macOS's Automation question for System Events once for both sign-outs, before any app
+    /// opens: `false` when the person (or a standing answer) refused it or its wait timed out.
     fn automation(&self, sys: &dyn System) -> Result<bool, String> {
+        let mut answer = self
+            .consent
+            .automation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(answer) = *answer {
+            return Ok(answer);
+        }
+        say(&format!(
+            "signing out of {} clicks its Sign Out through System Events: allow {} in macOS's \
+             Automation dialog (System Settings \u{25b8} Privacy & Security \u{25b8} Automation), \
+             and init goes on when it is allowed (Ctrl-C stops waiting)",
+            self.service.name(),
+            responsible(sys)
+        ));
         let ask = Cmd::new(OSASCRIPT)
             .args(["-e", AUTOMATION_ASK])
             .as_user(&self.user)
             .in_session()
             .budget(PATIENCE);
-        let ran = sys.run(&ask).map_err(|_| {
-            "could not ask for Automation permission to control System Events".to_owned()
-        })?;
-        if ran.success() {
-            return Ok(true);
-        }
-        if ran.err().contains("-1743") {
-            return Ok(false);
-        }
-        Err(format!(
-            "the Automation question for System Events did not answer: {}",
-            ran.describe()
-        ))
+        let allowed = match sys.run(&ask) {
+            Ok(ran) if ran.success() => true,
+            Ok(ran) if ran.err().contains("-1743") => false,
+            Ok(ran) => {
+                return Err(format!(
+                    "the Automation question for System Events did not answer: {}",
+                    ran.describe()
+                ));
+            }
+            Err(RunFailed::TimedOut(_)) => false,
+            Err(why) => {
+                return Err(format!(
+                    "could not ask for Automation permission to control System Events: {why}"
+                ));
+            }
+        };
+        *answer = Some(allowed);
+        Ok(allowed)
     }
 
     /// Whether the account deregistered within `patience`, read every [`POLL`] in this process;
@@ -684,7 +731,7 @@ on run argv
     set signOutNames to paragraphs of item 3 of argv
     set deadline to (current date) + 40
     set my stopAt to deadline
-    with timeout of 3 seconds
+    with timeout of 45 seconds
     if appName is not "Messages" and appName is not "FaceTime" then error "unsupported app"
     set settingsWindow to missing value
     set closeSettings to false
@@ -785,7 +832,7 @@ on run argv
         my restoreApplications(appName, wasRunning, priorApp)
         if errorNumber is -1743 or errorNumber is -25211 then return "permission-blocked"
         if errorNumber is 1001 then return "not-frontmost"
-        error "account sign-out controls unavailable"
+        error errorText
     end try
     my restoreApplications(appName, wasRunning, priorApp)
     return "sign-out-requested"
@@ -1069,7 +1116,7 @@ mod tests {
     fn the_aterm_window_walks_the_runs_accessibility_ask() {
         let (mut sys, ctx, item) = fixture();
         sys.tty = true;
-        sys.walks = true;
+        sys.walks = AccessibilityWalk::Taken;
         sys.trusts(&[false, false, false, true]);
         clicks(&sys, &item, "sign-out-requested");
         signed_in_for(&sys, &item, 2);
@@ -1088,6 +1135,40 @@ mod tests {
         signed_in_for(&sys, &item, 2);
         let _ = engine::run(&[Box::new(item)], Mode::Apply, &sys, &ctx, &mut NoJournal);
         assert_eq!((count(&sys, "ax-walk"), count(&sys, "ax-request")), (1, 1));
+    }
+
+    /// The window's answer holds macOS's own dialog back. The owner's Not now on the walk's
+    /// Accessibility page asks nothing: the app comes forward for the person's own Sign Out
+    /// click, which the run reads. A walk showing other pages gets no dialog beside them: the
+    /// run reads the grant until it flips and signs out. NEGATIVE CONTROL: with no window to
+    /// walk it, macOS is asked (`the_aterm_window_walks_the_runs_accessibility_ask`).
+    #[test]
+    fn a_not_now_on_the_walks_page_or_a_walk_of_other_pages_raises_no_macos_dialog() {
+        let (mut sys, ctx, item) = fixture();
+        sys.tty = true;
+        sys.walks = AccessibilityWalk::NotNow;
+        sys.trusts(&[false]);
+        let open = Cmd::new(OPEN)
+            .args(["-b", "com.apple.MobileSMS"])
+            .as_user(&item.user)
+            .in_session();
+        sys.on(&open.display(), Ran::ok(""));
+        signed_in_for(&sys, &item, 3);
+        item.apply(&sys, &ctx).unwrap();
+        assert_eq!(item.stood_aside(), None, "signed out by the person's click");
+        assert_eq!(count(&sys, "ax-request"), 0, "{:?}", sys.calls());
+        assert_eq!(count(&sys, &open.display()), 1, "the app came forward");
+        assert!(sys.calls().iter().all(|c| !c.contains(AUTOMATION_ASK)));
+
+        let (mut sys, ctx, item) = fixture();
+        sys.tty = true;
+        sys.walks = AccessibilityWalk::OtherPages;
+        sys.trusts(&[false, false, false, true]);
+        clicks(&sys, &item, "sign-out-requested");
+        signed_in_for(&sys, &item, 2);
+        let rows = engine::run(&[Box::new(item)], Mode::Apply, &sys, &ctx, &mut NoJournal);
+        assert_eq!(rows[0].outcome, Outcome::Changed, "{:?}", rows[0]);
+        assert_eq!(count(&sys, "ax-request"), 0, "{:?}", sys.calls());
     }
 
     /// Trust that never flips: after two minutes of reads (480, every 250 ms), the app comes
@@ -1199,6 +1280,47 @@ mod tests {
         );
     }
 
+    /// An unanswered Automation question is a permission block, not a generic failure, and the
+    /// second sign-out does not repeat its two-minute wait.
+    #[test]
+    fn an_automation_timeout_is_shared_by_both_sign_outs() {
+        let (sys, ctx, item) = fixture();
+        sys.trusts(&[true]);
+        sys.time_out(&automation_ask(&item).display());
+        item.apply(&sys, &ctx).unwrap();
+        assert_eq!(
+            item.stood_aside(),
+            Some(aterm_converge::StoodAside::Permission(
+                AUTOMATION_OFF.into()
+            ))
+        );
+        let other = SignOut {
+            service: Service::FaceTime,
+            user: item.user.clone(),
+            blocked: Mutex::new(None),
+            reading: crate::init_observe::LastReading::default(),
+            consent: std::sync::Arc::clone(&item.consent),
+        };
+        other.apply(&sys, &ctx).unwrap();
+        assert_eq!(
+            other.stood_aside(),
+            Some(aterm_converge::StoodAside::Permission(
+                AUTOMATION_OFF.into()
+            ))
+        );
+        assert_eq!(
+            count(&sys, &automation_ask(&item).display()),
+            1,
+            "{:?}",
+            sys.calls()
+        );
+        assert!(
+            sys.calls()
+                .iter()
+                .all(|c| !c.contains("Sign Out") && !c.contains(OPEN))
+        );
+    }
+
     #[test]
     fn a_consent_request_is_answered_in_this_process() {
         for (readings, expected) in [
@@ -1272,6 +1394,8 @@ mod tests {
         assert!(SIGN_OUT.contains("UI elements of containerElement"));
         assert!(SIGN_OUT.contains("description of elementRef as string"));
         assert!(SIGN_OUT.contains("AXMenuItemCmdChar"));
+        assert!(SIGN_OUT.contains("with timeout of 45 seconds"));
+        assert!(SIGN_OUT.contains("error errorText"));
     }
 
     /// The script never types a key, and every click it makes for the sign-out comes right after

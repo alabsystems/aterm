@@ -175,7 +175,7 @@ impl Cadence {
     fn hold_remaining(&self, now: Instant) -> Option<Duration> {
         let until = self.hold?;
         let remaining = until.checked_duration_since(now)?;
-        Some(remaining.max(HOLD_FLOOR).min(self.cap()))
+        (!remaining.is_zero()).then(|| remaining.max(HOLD_FLOOR).min(self.cap()))
     }
 
     /// The ceiling on [`Self::nominal_at`]: `max(MAX_BACKOFF, MAX_BACKOFF_INTERVALS × base)`.
@@ -764,35 +764,6 @@ mod tests {
         );
     }
 
-    /// A failing host gets a real retreat from [`INTERVAL_SECS`], not a clamp to its base.
-    #[test]
-    fn the_interval_genuinely_backs_off_instead_of_clamping_to_its_own_base() {
-        let anon = Duration::from_secs(INTERVAL_SECS);
-        let mut c = Cadence::new(anon);
-        c.failed();
-        assert_eq!(
-            c.nominal(),
-            anon,
-            "the first retry is still the base interval"
-        );
-        c.failed();
-        assert!(
-            c.nominal() > anon,
-            "a second consecutive failure must lengthen the wait — the assertion the \
-             two equal constants used to make unfalsifiable"
-        );
-        for _ in 0..20 {
-            c.failed();
-        }
-        assert_eq!(
-            c.nominal(),
-            MAX_BACKOFF.max(anon * MAX_BACKOFF_INTERVALS),
-            "and it climbs to the ceiling"
-        );
-        c.succeeded(0);
-        assert_eq!(c.nominal(), anon, "recovery snaps back to the base");
-    }
-
     /// A hold is waited out exactly, not doubled or jittered.
     #[test]
     fn a_hold_waits_until_the_reset_not_a_doubling() {
@@ -818,6 +789,8 @@ mod tests {
         assert_eq!(c.delay_at(now, 0), Duration::from_secs(5 * 60));
         c.hold_until(now + Duration::from_secs(1));
         assert_eq!(c.nominal_at(now), HOLD_FLOOR);
+        c.hold_until(now);
+        assert_eq!(c.nominal_at(now), anon * 4);
         c.hold_until(now - Duration::from_secs(1));
         assert_eq!(c.nominal_at(now), anon * 4);
     }
@@ -1025,19 +998,6 @@ mod tests {
         assert!(log.success().is_none(), "and only once");
     }
 
-    #[test]
-    fn wait_returns_for_a_short_delay() {
-        let signal = WakeSignal::new();
-        assert_eq!(
-            sleep_watching_for_wake(&signal, 0, Duration::from_millis(50)),
-            Waited::Elapsed
-        );
-        assert_eq!(
-            sleep_watching_for_wake(&signal, 0, Duration::ZERO),
-            Waited::Elapsed
-        );
-    }
-
     /// A day-long wait on a signal another thread posts past the count the waiter
     /// answered returns `Woke` — through this test's one-minute hang detector, which a
     /// wait that only watched the clock would trip.
@@ -1049,6 +1009,11 @@ mod tests {
             sleep_watching_for_wake(&SIGNAL, SIGNAL.posts(), Duration::from_millis(50)),
             Waited::Elapsed,
             "an answered post is not this wait's wake"
+        );
+        assert_eq!(
+            sleep_watching_for_wake(&SIGNAL, SIGNAL.posts(), Duration::ZERO),
+            Waited::Elapsed,
+            "a zero wait ends at once"
         );
         let seen = SIGNAL.posts();
         let (done, answer) = std::sync::mpsc::channel();

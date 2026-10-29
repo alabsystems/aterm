@@ -78,17 +78,33 @@ fn quit(w: &mut World) {
     let _ = std::fs::remove_file(w.state.join("pid"));
 }
 
-/// **A HANDOFF FLUSHES NOTHING, AND ITS SUCCESSOR'S CLEAN STOP FLUSHES WHAT
-/// THE RUN WROTE.** Eight sessions in use leave sixteen torn-kind files
-/// written with no flush; the instance hands off: its bridge flushes nothing
-/// and leaves the run open, and its successor, on the same dir in the same
-/// boot, establishes its own durable OPEN fence by two full flushes. The
-/// successor then quits,
-/// and its clean stop flushes every one of the sixteen it inherited where it is (nothing
+/// The QA seam that makes an instance's quit say `bye handoff` (`aterm-gui`
+/// `fabric_launch.rs` `QUIT_BYE_SEAM`).
+const QUIT_BYE: (&str, &str) = ("ATERM_DEBUG_QUIT_BYE", "handoff");
+/// What a bridge's start says it did to the run record.
+const START: &str = "aterm-link: the run record says a bridge runs";
+/// What a start that found its record on the media by the proof says (R6, `StateDir::begin_run`).
+const PROVEN_START: &str = "run.durable";
+/// What the mirror says of the floor of the node's total, raised or admitted.
+const FLOOR: &str = "aterm-link: mirror: the floor of the node's total";
+/// What the mirror says of a floor it admitted by the proof (R6, `Bridge::mirror_floor_covers`).
+const PROVEN_FLOOR: &str = "logfloor.durable";
+
+/// **A HANDOFF FLUSHES NOTHING, ITS SUCCESSOR'S START WRITES NOTHING WHERE THE
+/// PROOF SHOWS THE RUN ON THE MEDIA, AND THE QUIT AFTER IT FLUSHES THE RUN.**
+/// Eight sessions in use leave sixteen torn-kind files written with no flush;
+/// the instance hands off: its bridge flushes nothing and leaves the run open.
+/// Its successor, on the same dir in the same boot, finds the OPEN its
+/// predecessor's start published in full and linked as `run.durable`, and
+/// writes nothing (R6); its mirror admits the floor `logfloor.durable` links
+/// without a flush. It hands off in turn, and the test takes both proofs
+/// away: the next successor, the CONTROL, establishes its OPEN fence by two
+/// full flushes, as every successor did before R6. It quits, and its clean
+/// stop flushes every one of the sixteen it inherited where it is (nothing
 /// rewritten), each by the barrier, and ends with one full flush.
 #[test]
 fn a_handoff_flushes_nothing_and_the_quit_after_it_flushes_the_run() {
-    let mut w = World::boot_with("s6-handoff", &[], &[("ATERM_DEBUG_QUIT_BYE", "handoff")]);
+    let mut w = World::boot_with("s6-handoff", &[], &[QUIT_BYE]);
     w.wait_ready();
     use_sessions(&w);
 
@@ -100,46 +116,74 @@ fn a_handoff_flushes_nothing_and_the_quit_after_it_flushes_the_run() {
     assert!(stopped.is_empty(), "a handoff is not the run's end");
     assert_eq!(handed.len(), 1, "it says so once");
     its_first_start_is_marked(&w);
+    eprintln!(
+        "MEASURED the first instance's floor: {:?}",
+        said(&w, 0, FLOOR)
+    );
 
     let successor = log_len(&w);
+    let gui = w
+        .gui
+        .insert(World::relaunch_gui_shipping_flushes_with(&w, &[QUIT_BYE]));
+    w.token = World::wait_for_owned_token_of(&w.ctl_sock, gui, &w.gui_log);
+    w.wait_ready();
+    let began = said(&w, successor, START);
+    eprintln!("MEASURED handoff, the successor's start: {began:?}");
+    let [line] = began.as_slice() else {
+        panic!("one start line, not {began:?}");
+    };
+    assert!(
+        line.contains(PROVEN_START),
+        "over the open run it inherits, which its predecessor's start published in full and \
+         proved, nothing written: {line}"
+    );
+    let before = log_len(&w);
+    quit(&mut w);
+    assert_eq!(
+        said(&w, before, "aterm-link: handed off:").len(),
+        1,
+        "the successor hands off in turn"
+    );
+    let floor = said(&w, successor, FLOOR);
+    eprintln!("MEASURED handoff, the successor's floor: {floor:?}");
+    assert!(
+        !floor.is_empty() && floor.iter().all(|l| l.contains(PROVEN_FLOOR)),
+        "the floor its predecessor raised, admitted by its proof with no flush: {floor:?}"
+    );
+
+    for proof in ["run.durable", "logfloor.durable"] {
+        match std::fs::remove_file(w.state.join(proof)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                panic!("take {proof} away: {e}")
+            }
+            _ => {}
+        }
+    }
+    let bare = log_len(&w);
     let gui = w.gui.insert(World::relaunch_gui_shipping_flushes(&w));
     w.token = World::wait_for_owned_token_of(&w.ctl_sock, gui, &w.gui_log);
     w.wait_ready();
-    let began = said(
-        &w,
-        successor,
-        "aterm-link: the run record says a bridge runs",
-    );
-    eprintln!("MEASURED handoff, the successor's start: {began:?}");
+    let began = said(&w, bare, START);
+    eprintln!("MEASURED handoff with no proof (CONTROL), the successor's start: {began:?}");
+    let [line] = began.as_slice() else {
+        panic!("one start line, not {began:?}");
+    };
     assert_eq!(
-        began.len(),
-        1,
-        "the successor establishes its own OPEN fence"
-    );
-    assert_eq!(
-        (
-            number(&began[0], "barriers"),
-            number(&began[0], "full flushes")
-        ),
+        (number(line, "barriers"), number(line, "full flushes")),
         (0, 2),
-        "over the open run it inherits, in full: {}",
-        began[0]
+        "CONTROL: with no proof, over the open run it inherits, in full: {line}"
     );
-    assert!(ships(&began[0]), "timed as it ships: {}", began[0]);
+    assert!(ships(line), "timed as it ships: {line}");
 
     let before = log_len(&w);
     quit(&mut w);
     let stopped = said(&w, before, "aterm-link: the run stopped cleanly:");
-    eprintln!("MEASURED quit after the handoff, its clean stop: {stopped:?}");
-    let floor = said(
-        &w,
-        successor,
-        "aterm-link: mirror: the floor of the node's total",
-    );
-    eprintln!("MEASURED handoff, the successor's first floor raise: {floor:?}");
+    eprintln!("MEASURED quit after the handoffs, its clean stop: {stopped:?}");
+    let floor = said(&w, bare, FLOOR);
+    eprintln!("MEASURED handoff with no proof (CONTROL), the successor's floor: {floor:?}");
     assert!(
-        floor.iter().all(|l| ships(l)),
-        "timed as it ships: {floor:?}"
+        floor.iter().all(|l| ships(l) && !l.contains(PROVEN_FLOOR)),
+        "CONTROL: with no proof, a floor this open wrote, timed as it ships: {floor:?}"
     );
     let [line] = stopped.as_slice() else {
         panic!("one stop line, not {stopped:?}");

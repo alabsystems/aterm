@@ -1075,11 +1075,17 @@ impl<C: Ctl> Session<'_, C> {
                     .flatten()
             })
             .is_some_and(answered_by_the_network);
-        self.reach_seen = net_wall.then(|| {
-            opts.idle_host
-                .as_ref()
-                .map_or(Reach::Unknown, |h| h.reach())
-        });
+        // A network wall asks the reach (its lease keeps the probe measuring). Every other point
+        // peeks, which takes no lease, and asks only on a Down: a measured outage then holds the
+        // act the policy would type there (`turn_end::outage_hold`), and its edge
+        // (`Session::reach_edge`) decides the point again. A point no measure says is down asks
+        // nothing, so no probe runs for it.
+        let asked = opts.idle_host.as_ref();
+        self.reach_seen = match asked {
+            _ if net_wall => Some(asked.map_or(Reach::Unknown, |h| h.reach())),
+            Some(h) if self.peeks_down(h.as_ref()) => Some(h.reach()),
+            _ => None,
+        };
         let composer = self.composer_read(&reading, screen);
         let r = TurnEndReading::of_slept(
             &reading,
@@ -1427,25 +1433,7 @@ impl<C: Ctl> Session<'_, C> {
             return;
         }
         if let Some(answer) = self.turn_end.account_answer(reading) {
-            let to = self
-                .turn_end
-                .account_move()
-                .map(|m| m.to.clone())
-                .unwrap_or_default();
-            match answer {
-                AccountAnswer::Served => host.account_served(),
-                AccountAnswer::Bad(bad) => host.account_answered(bad),
-            }
-            self.turn_end.account_told(answer);
-            self.account_seen = None;
-            self.roster_seen = None;
-            self.ledger_row(
-                RULE_ACCOUNT,
-                approvals::Outcome::Waiting,
-                &format!("{}{to}", approvals::ACCOUNT_MOVE_COMMAND),
-                &approvals::account_answer_reason(&to, answer),
-                seq,
-            );
+            self.tell_account_answer(host, answer, seq);
         }
         if let Some((at, asked, advice)) = &self.account_seen
             && *at == seq
@@ -1497,7 +1485,15 @@ impl<C: Ctl> Session<'_, C> {
         cfg: Option<&SupervisorConfig>,
         review: &mut dyn Review,
     ) {
-        self.cruise_carry.live(self.turn_end.typed_untaken());
+        // A live turn is a look at any line left in the composer (the read is the loop's last).
+        if self.facts.state.left_lines().next().is_some()
+            && let Some(screen) = self.last.clone().filter(|s| s.seq == seq)
+        {
+            let at = super::occupancy_loop::LookAt::Live;
+            self.left_look_at(&screen, at, cfg, Some(&mut *review));
+        }
+        self.cruise_carry
+            .live(self.turn_end.typed_untaken(), || self.fx.mono());
         self.hold_live(seq, cfg, review);
         if self.turn_end.wake_may_keep_landing()
             && self.stall_host.as_ref().and_then(|h| h.finished()) == Some(true)
@@ -1535,6 +1531,29 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
+    /// Tell the host what answered the move ([`TurnEndState::account_told`]), and book it.
+    fn tell_account_answer(&mut self, host: &Arc<dyn IdleHost>, answer: AccountAnswer, seq: u64) {
+        let to = self
+            .turn_end
+            .account_move()
+            .map(|m| m.to.clone())
+            .unwrap_or_default();
+        match answer {
+            AccountAnswer::Served => host.account_served(),
+            AccountAnswer::Bad(bad) => host.account_answered(bad),
+        }
+        self.turn_end.account_told(answer);
+        self.account_seen = None;
+        self.roster_seen = None;
+        self.ledger_row(
+            RULE_ACCOUNT,
+            approvals::Outcome::Waiting,
+            &format!("{}{to}", approvals::ACCOUNT_MOVE_COMMAND),
+            &approvals::account_answer_reason(&to, answer),
+            seq,
+        );
+    }
+
     /// The point folded in, then the host asked ([`Self::observe_point`],
     /// [`Self::account_advise`]).
     pub(super) fn fold_point(
@@ -1547,7 +1566,22 @@ impl<C: Ctl> Session<'_, C> {
         let host = opts.idle_host.as_ref();
         self.turn_end
             .relaunch_startup(r, now, || host.is_some_and(|h| h.relaunch_owed()));
+        if r.phase != Phase::Busy
+            && let Some(host) = opts.idle_host.as_ref()
+        {
+            self.turn_end.host_agent_resumed(host.agent_resumed());
+        }
         let awaited = self.turn_end.account_answer_awaited(r);
+        // A TURN UNDER THE MOVE, ANSWERED BEFORE ANY READ SAW IT RUN (the act asked under it, or
+        // with no act awaited a prompt someone typed): told before the fold takes the act and
+        // the point's prompt, at the point's own instant ([`TurnEndState::account_answer_unseen`]).
+        if self.turn_end.account_answer_open(r)
+            && let Some(host) = opts.idle_host.as_ref()
+            && (opts.policy.accounts != crate::harness::accounts::Mode::Off || opts.policy.logins)
+            && let Some(answer) = self.turn_end.account_answer_unseen(r, now)
+        {
+            self.tell_account_answer(host, answer, seq);
+        }
         self.point_said = r.said_tail.as_deref().filter(|_| !r.said_cut).map(|tail| {
             (
                 r.program,
@@ -1690,13 +1724,14 @@ impl<C: Ctl> Session<'_, C> {
     /// ([`crate::harness::disk::fence::is_worker_folder`]), and nothing it does
     /// is landed anywhere, so a `cd` into a checkout holding another session's
     /// work neither holds it nor has Land nudge it to land that work
-    /// (`docs/DESIGN-disk-free-ask-2026-10-24.md` §8.4, "Land for a worker").
+    /// (`docs/DESIGN-disk-free-ask-2026-10-24.md` §8.4, "Land for a worker"). A credit-claim
+    /// worker's reads clean so, by its claim folder
+    /// ([`crate::harness::credit_offers::is_claim_folder`]): it lands nothing either.
     fn repo_asked(&mut self, host: &dyn IdleHost) -> Option<crate::harness::repo_work::RepoRead> {
-        if self
-            .trusted_cwd
-            .as_deref()
-            .is_some_and(crate::harness::disk::fence::is_worker_folder)
-        {
+        if self.trusted_cwd.as_deref().is_some_and(|folder| {
+            crate::harness::disk::fence::is_worker_folder(folder)
+                || crate::harness::credit_offers::is_claim_folder(folder)
+        }) {
             return Some(crate::harness::repo_work::RepoRead::Clean);
         }
         loop {
@@ -1903,6 +1938,22 @@ impl<C: Ctl> Session<'_, C> {
         Some(fg)
     }
 
+    /// THE DECISION AT A NEW POINT, ITS READ A LOOK FIRST: any line left in the composer settled
+    /// on the read the point is judged on ([`Self::left_look_at`]) before the policy decides, so it
+    /// decides on the account that read leaves (a line the person cleared released, and free to
+    /// ride this point's act); then [`Self::turn_end_at_point`].
+    pub(super) fn turn_end_looked(
+        &mut self,
+        point: &Turn,
+        worked: Option<Duration>,
+        opts: &SuperviseOpts,
+        review: &mut dyn Review,
+    ) -> Result<TurnEndAction, Fail> {
+        let at = super::occupancy_loop::LookAt::Point;
+        self.left_look_at(&point.screen, at, Some(&opts.policy), Some(review));
+        self.turn_end_at_point(point, worked, opts)
+    }
+
     /// The decision at a new point.
     pub(super) fn turn_end_at_point(
         &mut self,
@@ -1947,7 +1998,7 @@ impl<C: Ctl> Session<'_, C> {
         let now = self.policy_now();
         self.fold_point(&mut r, now, point.screen.seq, opts);
         self.task_seed(opts)?;
-        self.decide_to_act(r, opts, now, &point.screen)
+        self.decide_to_act(r, opts, (now, true), &point.screen)
     }
 
     /// Infer turn work from a Claude Code done row when no intermediate busy read was seen
@@ -2073,14 +2124,20 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// [`decide_turn_end`] on `r` ([`Self::foreground_program`]).
+    /// [`decide_turn_end`] on `r` ([`Self::foreground_program`]): a new point's decision where
+    /// `fresh`, which a declared wake's fact may ride (`Self::wake_ride`), and
+    /// [`Self::turn_end_again`]'s re-decision of the same point otherwise, which it never rides
+    /// (the slice-2 plan's D3). The composer is judged as [`Self::left_composer`] reads it: a
+    /// draft the owner's `prompt` left is aterm's own once `prompt` is no longer in force.
     fn decide_to_act(
         &mut self,
         r: TurnEndReading,
         opts: &SuperviseOpts,
-        now: Instant,
+        (now, fresh): (Instant, bool),
         judged: &Screen,
     ) -> Result<TurnEndAction, Fail> {
+        let mut r = r;
+        self.left_composer(&mut r, &opts.policy);
         self.fx.note(super::super::tape::core::NOTE_TURN_END, || {
             format!("{:?}\n{r:?}", self.turn_end)
         });
@@ -2089,7 +2146,7 @@ impl<C: Ctl> Session<'_, C> {
         let shadow = self.fx.shadow_policy();
         let mut point = shadow.as_ref().map(|_| ShadowPoint::default());
         let (action, limit_draft_holds) =
-            self.decide_to_act_now(r, opts, now, &mut steps, point.as_mut())?;
+            self.decide_to_act_now(r, opts, (now, fresh, judged), &mut steps, point.as_mut())?;
         if let (Some(policy), Some(point)) = (shadow, point) {
             let candidate = point.decide(&self.turn_end, policy, now);
             self.fx
@@ -2129,12 +2186,12 @@ impl<C: Ctl> Session<'_, C> {
         &mut self,
         mut r: TurnEndReading,
         opts: &SuperviseOpts,
-        now: Instant,
+        (now, fresh, judged): (Instant, bool, &Screen),
         trace: &mut Option<Vec<TraceStep>>,
         mut shadow: Option<&mut ShadowPoint>,
     ) -> Result<(TurnEndAction, bool), Fail> {
         self.decided_withheld = host_withholds(opts);
-        self.fact_offer(None, &TurnEndAction::Nothing);
+        self.fact_offer(None, None, &TurnEndAction::Nothing);
         if self.decided_withheld {
             if let Some(point) = shadow {
                 point.withheld = true;
@@ -2187,9 +2244,14 @@ impl<C: Ctl> Session<'_, C> {
             self.program = self.foreground_program()?;
             r.person = self.person_ago(now);
             r.fact = self.fact_for(&action, opts);
+            r.wake = if r.fact.is_none() && fresh {
+                self.wake_ride(&action, opts, now, judged)
+            } else {
+                None
+            };
             action = self.turn_end_decision(&r, &cfg, now, "pass:final", trace);
         }
-        self.fact_offer(r.fact.clone(), &action);
+        self.fact_offer(r.fact.clone(), r.wake.clone(), &action);
         let limit_draft_holds = (r.autopilot != Autopilot::Off)
             && crate::supervise::policy::exception::draft_holds_limit_switch(
                 &self.turn_end,
@@ -2302,7 +2364,10 @@ impl<C: Ctl> Session<'_, C> {
         self.fold_point(&mut r, now, turn.screen.seq, opts);
         self.task_seed(opts)?;
         self.probe_shut(&turn, ProbeGate::NotNew, None, review)?;
-        let action = self.decide_to_act(r, opts, now, &turn.screen)?;
+        // The point read again is a look, as its first read was (`Self::turn_end_looked`).
+        let at = super::occupancy_loop::LookAt::Point;
+        self.left_look_at(&turn.screen, at, Some(&opts.policy), Some(&mut *review));
+        let action = self.decide_to_act(r, opts, (now, false), &turn.screen)?;
         Ok(Some((turn, action)))
     }
 
@@ -2341,13 +2406,8 @@ impl<C: Ctl> Session<'_, C> {
         if self.left_keys.contains(&key) {
             return;
         }
-        self.ledger_row(
-            RULE_LEFT,
-            approvals::Outcome::Skipped,
-            &key,
-            approvals::LEFT_REASON,
-            seq,
-        );
+        let reason = approvals::left_reason(approvals::LEFT_REASON, self.turn_end.exchange_opens());
+        self.ledger_row(RULE_LEFT, approvals::Outcome::Skipped, &key, &reason, seq);
         self.left_keys.push(key);
     }
 
@@ -2368,13 +2428,11 @@ impl<C: Ctl> Session<'_, C> {
         if self.left_keys.contains(&key) {
             return;
         }
-        self.ledger_row(
-            RULE_LEFT,
-            approvals::Outcome::Skipped,
-            &key,
+        let reason = approvals::left_reason(
             approvals::LEFT_AT_WALL_REASON,
-            seq,
+            self.turn_end.exchange_opens(),
         );
+        self.ledger_row(RULE_LEFT, approvals::Outcome::Skipped, &key, &reason, seq);
         self.left_keys.push(key);
     }
 
@@ -2532,6 +2590,9 @@ impl<C: Ctl> Session<'_, C> {
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
         let seq = point.screen.seq;
+        // The point's read was looked at by the decision that chose `action`
+        // (`Self::turn_end_looked`, `Self::turn_end_again`), and nothing was written since: a
+        // second look at that read would settle nothing new.
         self.decision_owed = false;
         self.nothing_decided = matches!(action, TurnEndAction::Nothing);
         let withheld = std::mem::take(&mut self.decided_withheld);
@@ -2665,6 +2726,12 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(());
         }
         let fact = self.fact_intends(&action, seq);
+        let would = self.point_would_owed(&action, &opts.policy, fact.is_some(), review);
+        let (action, ride) = self.point_claims(action, &opts.policy, seq, review);
+        let text = match &action {
+            TurnEndAction::Type { text, .. } if ride.is_none() => one_turn(text),
+            _ => text,
+        };
         // Left: the text, any fact with it, stands in the composer unsent.
         let mut left = false;
         let typed = match &action {
@@ -2683,18 +2750,46 @@ impl<C: Ctl> Session<'_, C> {
             host.login_abandon();
         }
         let typed = typed?;
-        if !typed {
+        if !typed && left {
+            // The act and its fact stand in the composer: settled at the next look.
             if let Some(fact) = &fact {
-                let why = if left { "not-submitted" } else { "not-written" };
-                self.fact_rode(fact, Some(why), seq, review);
+                self.fact_left(fact, seq, review);
+            }
+            if let Some(ride) = ride {
+                self.point_left(ride, seq, review);
             }
             return Ok(());
+        }
+        if !typed {
+            if let Some(fact) = &fact {
+                self.fact_rode(fact, Some("not-written"), seq, review);
+            }
+            if let Some(ride) = ride {
+                self.point_told(ride, Some("not-written"), seq, review);
+            }
+            return Ok(());
+        }
+        if matches!(action, TurnEndAction::Submit { .. }) {
+            // The draft standing went: a line a door left in it is told.
+            let look = super::super::facts::LeftLook::Submitted;
+            self.left_look(look, None, seq, Some(&opts.policy), Some(&mut *review));
         }
         let r = self.turn_end_reread(&point.screen, opts);
         let land = self.turn_end.land_episode().0;
         self.turn_end.acted(&action, &r, self.fx.mono());
+        // The point's reach read is spent by the act it let go (at the outage's cap, or by an arm
+        // that types at any reach): the next decision reads its own (`turn_end_reading_as`), and
+        // until then no break of the turn this act opens is held on it (`Guard::Reach`), whose
+        // write reads the reach afresh (`Session::write_guards`).
+        self.reach_seen = None;
         if let Some(fact) = &fact {
             self.fact_rode(fact, None, seq, review);
+        }
+        if let Some(ride) = ride {
+            self.point_told(ride, None, seq, review);
+        }
+        if let Some(would) = would {
+            self.point_would(would, seq, review);
         }
         if !land && self.turn_end.land_episode().0 {
             self.land_report = self.point_said.clone();
@@ -2840,6 +2935,9 @@ impl<C: Ctl> Session<'_, C> {
                 };
                 let now = self.fx.mono();
                 self.turn_end.restarted(why, true, &r, now);
+                if step.as_deref() == Some("done:fresh") {
+                    self.turn_end.relaunched_afresh();
+                }
                 if word == Some("adopted") && point.screen.submits.is_some() {
                     let after = self.read_once().ok().map(|(screen, _)| screen);
                     let at = after.as_ref().and_then(|s| self.counted_conversation(s));

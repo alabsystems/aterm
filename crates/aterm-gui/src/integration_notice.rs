@@ -448,30 +448,6 @@ mod tests {
         );
     }
 
-    /// A CLAUDE CODE STARTED AS `node` HEALS WITH ITS MOVE: the heal asked the
-    /// published program's NAME, so a `node` the host supervises by its screen
-    /// (`harness_host::agent_of`) was told "a new tab" though the live upgrade
-    /// moves it in the same tab.
-    #[test]
-    fn a_node_hosted_agent_the_host_supervises_heals_with_its_move() {
-        use crate::session_timeline::AgentPublication;
-        use aterm_phase::Program;
-        let node = |reader: Option<Program>| {
-            crate::harness_host::agent_of(&AgentPublication {
-                program: Some("node".to_string()),
-                reader,
-                ..AgentPublication::default()
-            })
-        };
-        assert_eq!(
-            heal_for(false, node(Some(Program::Claude)), true, false),
-            Heal::AgentMoved {
-                agent: "Claude Code"
-            }
-        );
-        assert_eq!(heal_for(false, node(None), true, false), Heal::NewTab);
-    }
-
     #[test]
     fn only_a_changed_reading_moves_and_the_moves_own_flip_is_held() {
         let t = Instant::now();

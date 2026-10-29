@@ -368,7 +368,10 @@ fn the_doctests_run_rustdoc_only_where_a_doctest_lives_over_the_test_compiles_se
     let want = format!(
         "trustdoc ran documented with --crate-name documented --test crates/documented/src/lib.rs: \
          RUSTDOC={} driver=unset skip=unset",
-        fs::canonicalize(&trustdoc).expect("canonical").display()
+        fs::canonicalize(&repo.stage2)
+            .expect("canonical")
+            .join("trustdoc")
+            .display()
     );
     assert!(ladder.contains(&want), "missing {want:?} in:\n{ladder}");
     assert!(!ladder.contains("trustdoc ran plain"), "{ladder}");

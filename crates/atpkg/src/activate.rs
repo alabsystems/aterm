@@ -1506,9 +1506,11 @@ mod tests {
             assert_eq!(&std::fs::read(p).unwrap(), want, "{} re-laid", p.display());
         }
         assert!(shim_is_rendered(&alias, &target, &env));
-        let stamp = |p: &Path| std::fs::symlink_metadata(p).unwrap().modified().unwrap();
+        let stamp = |p: &Path| {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::symlink_metadata(p).unwrap().ino()
+        };
         let before = (stamp(&alias), stamp(&twin));
-        std::thread::sleep(std::time::Duration::from_millis(20));
         reconcile_aliases(&layout, &c1, std::slice::from_ref(&claude), Aliases::Alab).unwrap();
         reconcile_agents(&layout);
         assert_eq!(stamp(&alias), before.0, "a second pass writes no alias");

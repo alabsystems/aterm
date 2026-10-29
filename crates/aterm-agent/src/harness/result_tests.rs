@@ -1847,6 +1847,10 @@ fn a_turn_that_wrote_no_end_row_stops_at_the_next_turns_start() {
 
 const THREAD: &str = "01a15a2c-3732-7b22-9cf1-19657e6444e7";
 
+/// When the fixtures' codex landing was seen (unix ms): five minutes after their rows'
+/// `timestamp` ([`cx`]).
+const LANDED: i64 = 1_792_749_900_000;
+
 fn cx(kind: &str, payload: &str) -> String {
     format!(r#"{{"timestamp":"2026-10-23T10:00:00.000Z","type":"{kind}","payload":{payload}}}"#)
 }
@@ -2189,8 +2193,16 @@ fn a_codex_xml_task_keeps_its_report_separate_from_an_earlier_landing() {
     ]);
     let text = jsonl(&rows);
     let file = Path::new("/c/sessions/rollout-xml-task.jsonl");
-    let snap = snapshot_rollout(&tasks, "s-c1-4", Some((file, &text)), THREAD, DoneBy::Turn)
-        .expect("written");
+    let snap = snapshot_rollout(
+        &tasks,
+        "s-c1-4",
+        Some((file, &text)),
+        THREAD,
+        None,
+        LANDED,
+        DoneBy::Turn,
+    )
+    .expect("written");
     assert_eq!(
         std::fs::read_to_string(&snap.path).expect("the captured result"),
         format!("{report}\n\n{defense}"),
@@ -2214,8 +2226,16 @@ fn an_aborted_codex_task_does_not_reuse_an_earlier_report() {
     ]);
     let text = jsonl(&rows);
     let file = Path::new("/c/sessions/rollout-aborted-task.jsonl");
-    let snap = snapshot_rollout(&tasks, "s-c1-5", Some((file, &text)), THREAD, DoneBy::Turn)
-        .expect("written");
+    let snap = snapshot_rollout(
+        &tasks,
+        "s-c1-5",
+        Some((file, &text)),
+        THREAD,
+        None,
+        LANDED,
+        DoneBy::Turn,
+    )
+    .expect("written");
     assert_eq!(
         std::fs::read_to_string(&snap.path).expect("the captured result"),
         defense,
@@ -2224,16 +2244,24 @@ fn an_aborted_codex_task_does_not_reuse_an_earlier_report() {
 }
 
 /// A codex landing's snapshot names its rollout: `result` answers its text under
-/// `source=rollout`, `result full` reads no transcript of it, a missed result is never read again
-/// as a Claude Code transcript, and no rollout at all is said.
+/// `source=rollout`, `result full` answers `no-transcript` while that rollout does not read, a
+/// missed result whose rollout does not read is not read again, and no rollout at all is said.
 #[test]
 fn a_codex_snapshot_names_its_rollout_and_answers_it() {
     let tasks = ScratchDir::new("result", "codex");
     let defense = "Nothing left: merged.";
     let text = jsonl(&codex_landing(LAND, defense));
     let file = Path::new("/c/sessions/rollout-x.jsonl");
-    let snap = snapshot_rollout(&tasks, "s-c1-2", Some((file, &text)), THREAD, DoneBy::Turn)
-        .expect("written");
+    let snap = snapshot_rollout(
+        &tasks,
+        "s-c1-2",
+        Some((file, &text)),
+        THREAD,
+        None,
+        LANDED,
+        DoneBy::Turn,
+    )
+    .expect("written");
     let want = format!("The parser is fixed; 12 tests pass.\n\n{defense}");
     assert_eq!(
         (snap.by, snap.bytes, snap.unavailable),
@@ -2269,6 +2297,8 @@ fn a_codex_snapshot_names_its_rollout_and_answers_it() {
         "s-c1-4",
         Some((file, &jsonl(&missed))),
         THREAD,
+        None,
+        LANDED,
         DoneBy::Turn,
     )
     .expect("written");
@@ -2285,7 +2315,8 @@ fn a_codex_snapshot_names_its_rollout_and_answers_it() {
         answer(&snap.path, false),
         "ERR result unavailable why=no-reply\n"
     );
-    let none = snapshot_rollout(&tasks, "s-c1-3", None, THREAD, DoneBy::Turn).expect("written");
+    let none = snapshot_rollout(&tasks, "s-c1-3", None, THREAD, None, LANDED, DoneBy::Turn)
+        .expect("written");
     assert_eq!((none.bytes, none.unavailable), (0, Some("no-transcript")));
     assert_eq!(
         answer(&none.path, false),
@@ -2305,5 +2336,598 @@ fn a_codex_snapshot_names_its_rollout_and_answers_it() {
             turn: "t 3".to_string(),
             rollout: None,
         })
+    );
+}
+
+/// `row` ([`cx`]) as written at `stamp` in place of the fixtures' time.
+fn cx_at(row: &str, stamp: &str) -> String {
+    row.replacen("2026-10-23T10:00:00.000Z", stamp, 1)
+}
+
+/// The fixtures' landing's result ([`codex_landing`]): its task's report, then the defense.
+fn codex_landed(defense: &str) -> String {
+    format!("The parser is fixed; 12 tests pass.\n\n{defense}")
+}
+
+/// A person's turn after a codex landing, begun at `stamp`.
+fn codex_person_turn(stamp: &str) -> Vec<String> {
+    vec![
+        cx_at(&cx_started("t-4", "user"), stamp),
+        cx_user("status?"),
+        cx_said("All merged.", "final_answer"),
+        cx_complete("t-4", "All merged."),
+    ]
+}
+
+/// A CODEX LANDING WHOSE REPLY WAS NOT YET WRITTEN IS READ AGAIN AT THE NEXT `result`, FOR ITS
+/// TURN ALONE: the snapshot keeps the rollout and the turn its tail named last, the reply written
+/// after the settle is the result once it is there (written over the snapshot as a rollout's
+/// result, never read again), and the full exchange is framed from it. NEGATIVE CONTROL: with
+/// nothing written since, the result stays unavailable, and a turn that ends with still no report
+/// never takes the person's later turn's reply.
+#[test]
+fn a_codex_landing_missed_at_the_settle_is_read_again_for_its_turn_alone() {
+    let root = ScratchDir::new("result", "codex-reread");
+    let tasks = root.join("tasks");
+    let file = root.join("rollout.jsonl");
+    let defense = "Nothing left: merged.";
+    let mut missed = codex_landing(LAND, defense);
+    missed.truncate(missed.len() - 2);
+    missed.push(cx_said("Merging now.", "commentary"));
+    let first = jsonl(&missed);
+    std::fs::write(&file, &first).expect("rollout");
+    let snap = snapshot_rollout(
+        &tasks,
+        "s-c1-6",
+        Some((&file, &first)),
+        THREAD,
+        None,
+        LANDED,
+        DoneBy::Turn,
+    )
+    .expect("written");
+    assert_eq!((snap.bytes, snap.unavailable), (0, Some("no-reply")));
+    assert_eq!(
+        source_of(&snap.path),
+        Some(Source::RolloutUnavailable {
+            why: "no-reply".to_string(),
+            thread: THREAD.to_string(),
+            turn: Some("t-3".to_string()),
+            rollout: Some(file.clone()),
+            home: None,
+            landed: Some(LANDED),
+        })
+    );
+    assert_eq!(reread(&snap.path), None, "nothing written since");
+    assert_eq!(
+        answer(&snap.path, false),
+        "ERR result unavailable why=no-reply\n"
+    );
+    let mut later = missed.clone();
+    later.extend([
+        cx_said(defense, "final_answer"),
+        cx_complete("t-3", defense),
+    ]);
+    later.extend(codex_person_turn("2026-10-23T10:10:00.000Z"));
+    std::fs::write(&file, jsonl(&later)).expect("rollout");
+    let again = reread(&snap.path).expect("the landing's reply");
+    let want = codex_landed(defense);
+    assert_eq!(
+        (
+            again.report.text.as_str(),
+            again.report.uuid.as_str(),
+            again.report.session.as_str(),
+            again.transcript.as_path(),
+            again.from,
+        ),
+        (
+            want.as_str(),
+            "t-3",
+            THREAD,
+            file.as_path(),
+            Conversation::Rollout
+        )
+    );
+    assert_eq!(again.bytes(), want.len() as u64);
+    let reply = format!(
+        "OK 3 source=rollout thread={THREAD} turn=t-3 bytes={}\n{want}\n",
+        want.len()
+    );
+    assert_eq!(again.answer(&snap.path, false), reply, "answered unwritten");
+    again.write(&snap.path).expect("written over");
+    assert_eq!(answer(&snap.path, false), reply);
+    assert_eq!(
+        source_of(&snap.path),
+        Some(Source::Rollout {
+            thread: THREAD.to_string(),
+            turn: "t-3".to_string(),
+            rollout: Some(file.clone()),
+        })
+    );
+    assert_eq!(reread(&snap.path), None, "a result is never read again");
+    let full = answer(&snap.path, true);
+    let (head, body) = full.split_once('\n').expect("framed");
+    assert_eq!(
+        head,
+        format!(
+            "OK {} source=rollout thread={THREAD} turn=t-3 bytes={} full=1",
+            body.split('\n').count() - 1,
+            body.len() - 1
+        )
+    );
+    assert!(
+        body.starts_with("> Fix the parser.\n") && body.ends_with("> status?\n\nAll merged.\n"),
+        "{full}"
+    );
+    assert_eq!(again.answer(&snap.path, true), full);
+
+    let snap = snapshot_rollout(
+        &tasks,
+        "s-c1-7",
+        Some((&file, &first)),
+        THREAD,
+        None,
+        LANDED,
+        DoneBy::Turn,
+    )
+    .expect("written");
+    let mut aborted = missed;
+    aborted.push(cx(
+        "event_msg",
+        r#"{"type":"turn_aborted","turn_id":"t-3"}"#,
+    ));
+    aborted.extend(codex_person_turn("2026-10-23T10:10:00.000Z"));
+    std::fs::write(&file, jsonl(&aborted)).expect("rollout");
+    assert_eq!(reread(&snap.path), None, "never a later turn's reply");
+    assert_eq!(
+        answer(&snap.path, false),
+        "ERR result unavailable why=no-reply\n"
+    );
+}
+
+/// A CODEX LANDING THAT READ NO ROLLOUT FINDS IT LATER BY ITS THREAD AND HOME: the snapshot keeps
+/// the thread, the `$CODEX_HOME` the claim named and the landing's time, and the next `result`
+/// finds the rollout as the landing's resolver does and reads the newest turn begun by the
+/// landing. NEGATIVE CONTROL: no rollout yet, no home, no thread id, or a landing before every
+/// turn began finds nothing.
+#[test]
+fn a_codex_landing_with_no_rollout_finds_it_later_by_its_thread_and_home() {
+    let root = ScratchDir::new("result", "codex-found");
+    let tasks = root.join("tasks");
+    let home = root.join("codex");
+    let snapshot = |stem: &str, thread: &str, home: Option<&Path>, landed: i64| {
+        snapshot_rollout(&tasks, stem, None, thread, home, landed, DoneBy::Turn).expect("written")
+    };
+    let snap = snapshot("s-c1-8", THREAD, Some(&home), LANDED);
+    assert_eq!((snap.bytes, snap.unavailable), (0, Some("no-transcript")));
+    assert_eq!(
+        source_of(&snap.path),
+        Some(Source::RolloutUnavailable {
+            why: "no-transcript".to_string(),
+            thread: THREAD.to_string(),
+            turn: None,
+            rollout: None,
+            home: Some(home.clone()),
+            landed: Some(LANDED),
+        })
+    );
+    assert_eq!(reread(&snap.path), None, "no rollout yet");
+    let day = home.join("sessions").join("2026").join("10").join("20");
+    std::fs::create_dir_all(&day).expect("sessions");
+    let file = day.join(format!("rollout-2026-10-20T16-36-49-{THREAD}.jsonl"));
+    let defense = "Nothing left: merged.";
+    let mut rows = codex_landing(LAND, defense);
+    rows.extend(codex_person_turn("2026-10-23T10:10:00.000Z"));
+    std::fs::write(&file, jsonl(&rows)).expect("rollout");
+    // The rollout a conversation named `-` would be found by, so only the thread id rule keeps
+    // the `-` landing below from reading it.
+    std::fs::write(day.join("rollout-x--.jsonl"), jsonl(&rows)).expect("rollout");
+    let found = reread(&snap.path).expect("the rollout its home holds now");
+    assert_eq!(
+        (
+            found.report.text,
+            found.report.uuid.as_str(),
+            found.transcript,
+            found.from
+        ),
+        (codex_landed(defense), "t-3", file, Conversation::Rollout)
+    );
+    for (stem, thread, home, landed, label) in [
+        ("s-c1-9", THREAD, None, LANDED, "no home"),
+        ("s-c1-10", "-", Some(home.as_path()), LANDED, "no thread id"),
+        (
+            "s-c1-11",
+            THREAD,
+            Some(home.as_path()),
+            LANDED - 3_600_000,
+            "a landing before every turn began",
+        ),
+    ] {
+        let snap = snapshot(stem, thread, home, landed);
+        assert_eq!(reread(&snap.path), None, "{label}");
+        assert_eq!(
+            answer(&snap.path, false),
+            "ERR result unavailable why=no-transcript\n",
+            "{label}"
+        );
+    }
+}
+
+/// A CODEX LANDING THAT KNEW NO CONVERSATION IS FOUND BY THE WORKER'S CLAIM AT THE NEXT `result`
+/// ([`reread_with`]): the conversation the claim names now, under the home it names, is read for
+/// the newest turn begun by the landing, and the claim is asked only for such a landing (never
+/// for one that knew its conversation, nor for a reply not yet written). NEGATIVE CONTROL: no
+/// claim, a claim that names no thread id, a conversation begun after the landing, or a
+/// conversation other than the one the landing named finds nothing.
+#[test]
+fn a_codex_landing_that_knew_no_conversation_is_found_by_the_workers_claim() {
+    const OTHER: &str = "11111111-2222-4333-8444-555555555555";
+    const LATER: &str = "66666666-7777-4888-9999-aaaaaaaaaaaa";
+    let root = ScratchDir::new("result", "codex-claim");
+    let tasks = root.join("tasks");
+    let home = root.join("codex");
+    let day = home.join("sessions").join("2026").join("10").join("20");
+    std::fs::create_dir_all(&day).expect("sessions");
+    let defense = "Nothing left: merged.";
+    let mut rows = codex_landing(LAND, defense);
+    rows.extend(codex_person_turn("2026-10-23T10:10:00.000Z"));
+    let file = day.join(format!("rollout-2026-10-20T16-36-49-{THREAD}.jsonl"));
+    let begun_later: Vec<String> = rows
+        .iter()
+        .map(|r| cx_at(r, "2026-10-23T10:10:00.000Z"))
+        .collect();
+    for (name, rows) in [
+        (file.clone(), &rows),
+        (
+            day.join(format!("rollout-2026-10-20T09-00-00-{OTHER}.jsonl")),
+            &rows,
+        ),
+        (
+            day.join(format!("rollout-2026-10-23T10-10-00-{LATER}.jsonl")),
+            &begun_later,
+        ),
+        (day.join("rollout-x--.jsonl"), &rows),
+    ] {
+        std::fs::write(name, jsonl(rows)).expect("rollout");
+    }
+    let claim = |thread: &str| {
+        let named = (home.clone(), thread.to_string());
+        move || Some(named)
+    };
+    let unasked = || -> Option<(PathBuf, String)> { panic!("the claim was asked") };
+    let snapshot = |stem: &str, read: Option<(&Path, &str)>, thread: &str, home: Option<&Path>| {
+        snapshot_rollout(&tasks, stem, read, thread, home, LANDED, DoneBy::Turn).expect("written")
+    };
+
+    let snap = snapshot("s-c1-20", None, "-", None);
+    assert_eq!(
+        source_of(&snap.path),
+        Some(Source::RolloutUnavailable {
+            why: "no-transcript".to_string(),
+            thread: "-".to_string(),
+            turn: None,
+            rollout: None,
+            home: None,
+            landed: Some(LANDED),
+        })
+    );
+    assert_eq!(reread(&snap.path), None, "no claim");
+    for (named, label) in [
+        ("-", "no thread id"),
+        (LATER, "a conversation begun after the landing"),
+    ] {
+        assert_eq!(reread_with(&snap.path, claim(named)), None, "{label}");
+    }
+    let found = reread_with(&snap.path, claim(THREAD)).expect("the claim's conversation");
+    let want = codex_landed(defense);
+    assert_eq!(
+        (
+            found.report.text.as_str(),
+            found.report.session.as_str(),
+            found.report.uuid.as_str(),
+            found.transcript.as_path(),
+            found.from,
+        ),
+        (
+            want.as_str(),
+            THREAD,
+            "t-3",
+            file.as_path(),
+            Conversation::Rollout
+        )
+    );
+    assert_eq!(
+        found.answer(&snap.path, false),
+        format!(
+            "OK 3 source=rollout thread={THREAD} turn=t-3 bytes={}\n{want}\n",
+            want.len()
+        )
+    );
+
+    let named = snapshot("s-c1-21", None, THREAD, None);
+    assert_eq!(
+        reread_with(&named.path, claim(OTHER)),
+        None,
+        "a conversation other than the landing's"
+    );
+    assert_eq!(
+        reread_with(&named.path, claim(THREAD)).map(|r| r.report.uuid),
+        Some("t-3".to_string()),
+        "the landing's own, under the home the claim names"
+    );
+
+    let known = snapshot("s-c1-22", None, THREAD, Some(&home));
+    assert_eq!(
+        reread_with(&known.path, unasked).map(|r| r.report.uuid),
+        Some("t-3".to_string()),
+        "a landing that knew its conversation"
+    );
+    let mut missed = codex_landing(LAND, defense);
+    missed.truncate(missed.len() - 2);
+    missed.push(cx_said("Merging now.", "commentary"));
+    let first = jsonl(&missed);
+    let lag = snapshot("s-c1-23", Some((&file, &first)), THREAD, None);
+    assert_eq!(lag.unavailable, Some("no-reply"));
+    assert_eq!(
+        reread_with(&lag.path, unasked).map(|r| r.report.uuid),
+        Some("t-3".to_string()),
+        "a reply not yet written at the landing"
+    );
+}
+
+/// `RESULT FULL` ON A CODEX WORKER FRAMES THE WHOLE EXCHANGE FROM ITS TASK'S PROMPT, as a
+/// transcript's is framed: each prompt and each message steered into a turn quoted, past the
+/// context Codex adds itself, and every message's words, to the rollout's end. NEGATIVE CONTROL:
+/// a rollout result with no rollout named, or a screen's, reads no transcript, and a rollout read
+/// whole with no prompt in it has none.
+#[test]
+fn result_full_on_a_codex_worker_frames_the_whole_exchange_from_its_task() {
+    let root = ScratchDir::new("result", "codex-full");
+    let tasks = root.join("tasks");
+    let file = root.join("rollout.jsonl");
+    let defense = "Nothing left: merged.";
+    let text = jsonl(&codex_landing(LAND, defense));
+    std::fs::write(&file, &text).expect("rollout");
+    let snap = snapshot_rollout(
+        &tasks,
+        "s-c1-12",
+        Some((&file, &text)),
+        THREAD,
+        None,
+        LANDED,
+        DoneBy::Turn,
+    )
+    .expect("written");
+    let quoted = |t: &str| {
+        t.lines()
+            .map(|l| {
+                if l.is_empty() {
+                    ">".to_string()
+                } else {
+                    format!("> {l}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let exchange = [
+        quoted("Fix the parser."),
+        "Reading the parser first.".to_string(),
+        quoted("Also run the suite."),
+        "The parser is fixed; 12 tests pass.".to_string(),
+        quoted(LAND.trim()),
+        "Committed it and pushed; merging next.".to_string(),
+        quoted(LAND.trim()),
+        defense.to_string(),
+    ]
+    .join("\n\n");
+    assert_eq!(
+        answer(&snap.path, true),
+        format!(
+            "OK {} source=rollout thread={THREAD} turn=t-3 bytes={} full=1\n{exchange}\n",
+            exchange.split('\n').count(),
+            exchange.len()
+        )
+    );
+    assert!(
+        !answer(&snap.path, true).contains("environment_context"),
+        "no context Codex adds"
+    );
+
+    let unnamed = tasks.join("s-c1-13.result.md");
+    std::fs::write(&unnamed, codex_landed(defense)).expect("result");
+    let line = Source::Rollout {
+        thread: THREAD.to_string(),
+        turn: "t-3".to_string(),
+        rollout: None,
+    }
+    .line();
+    std::fs::write(sidecar_of(&unnamed), format!("{line}\n")).expect("sidecar");
+    assert!(answer(&unnamed, false).starts_with("OK 3 source=rollout "));
+    assert_eq!(
+        answer(&unnamed, true),
+        "ERR result unavailable why=no-transcript\n"
+    );
+    let screen =
+        snapshot_screen(&tasks, "s-c1-14", "agy", "Fixed it.", DoneBy::Turn).expect("written");
+    assert_eq!(
+        answer(&screen.path, true),
+        "ERR result unavailable why=no-transcript\n"
+    );
+    let promptless = jsonl(&[
+        cx_started("t-1", "user"),
+        cx_user("<environment_context>\n  <cwd>/w</cwd>\n</environment_context>"),
+        cx_said("Nothing to do.", "final_answer"),
+        cx_complete("t-1", "Nothing to do."),
+    ]);
+    let bare = root.join("bare.jsonl");
+    std::fs::write(&bare, &promptless).expect("rollout");
+    let snap = snapshot_rollout(
+        &tasks,
+        "s-c1-15",
+        Some((&bare, &promptless)),
+        THREAD,
+        None,
+        LANDED,
+        DoneBy::Turn,
+    )
+    .expect("written");
+    assert_eq!(snap.unavailable, None);
+    assert_eq!(
+        answer(&snap.path, true),
+        "ERR result unavailable why=no-prompt\n"
+    );
+}
+
+/// `RESULT FULL` ON A CODEX WORKER IS BOUNDED AS A TRANSCRIPT'S IS: an exchange past
+/// [`RESULT_MAX_CHARS`] keeps its end under a first line that names the rollout, and a rollout
+/// read from past its start says so under that line though its exchange fits. NEGATIVE CONTROL:
+/// an exchange of exactly the bound, read whole, is shown whole with no cut line.
+#[test]
+fn result_full_on_a_codex_worker_is_capped_and_names_the_rollout_it_cut() {
+    let root = ScratchDir::new("result", "codex-cap");
+    let tasks = root.join("tasks");
+    let file = root.join("rollout.jsonl");
+    let full_of = |stem: &str, rows: &[String]| {
+        let text = jsonl(rows);
+        std::fs::write(&file, &text).expect("rollout");
+        let snap = snapshot_rollout(
+            &tasks,
+            stem,
+            Some((&file, &text)),
+            THREAD,
+            None,
+            LANDED,
+            DoneBy::Turn,
+        )
+        .expect("written");
+        assert_eq!(snap.unavailable, None, "{stem}");
+        answer(&snap.path, true)
+    };
+    let task = |said: &str| {
+        vec![
+            cx_started("t-1", "user"),
+            cx_user("Fix it."),
+            cx_said(said, "final_answer"),
+            cx_complete("t-1", said),
+        ]
+    };
+    let head = |lines: usize, bytes: usize| {
+        format!("OK {lines} source=rollout thread={THREAD} turn=t-1 bytes={bytes} full=1")
+    };
+    let cut = format!("… earlier turns cut; the rollout: {}", file.display());
+    let prompt = "> Fix it.\n\n";
+
+    let line = "é".repeat(99);
+    let long: Vec<String> = (0..300).map(|i| format!("{i:03}{line}")).collect();
+    let long = long.join("\n");
+    assert!(long.chars().count() > RESULT_MAX_CHARS);
+    let full = full_of("s-c1-24", &task(&long));
+    let mut lines: Vec<&str> = full.lines().collect();
+    assert_eq!(
+        lines.remove(0),
+        head(lines.len(), prompt.len() + long.len())
+    );
+    assert_eq!(lines.remove(0), cut);
+    let shown: usize = lines.iter().map(|l| l.chars().count() + 1).sum();
+    assert_eq!(
+        shown - 1,
+        RESULT_MAX_CHARS,
+        "exactly the bound, newlines counted"
+    );
+    assert!(full.ends_with(&format!("\n299{line}\n")), "the end is kept");
+
+    let exact = "x".repeat(RESULT_MAX_CHARS - prompt.len());
+    assert_eq!(
+        full_of("s-c1-25", &task(&exact)),
+        format!("{}\n{prompt}{exact}\n", head(3, RESULT_MAX_CHARS))
+    );
+
+    let pad = "x".repeat(usize::try_from(TRANSCRIPT_READ_BYTES).expect("a size"));
+    let mut past = vec![cx(
+        "response_item",
+        &format!(r#"{{"type":"reasoning","summary":[],"encrypted_content":"{pad}"}}"#),
+    )];
+    past.extend(task("Fixed it."));
+    let said = format!("{prompt}Fixed it.");
+    assert_eq!(
+        full_of("s-c1-26", &past),
+        format!("{}\n{cut}\n{said}\n", head(4, said.len()))
+    );
+}
+
+/// A SNAPSHOT AN OLDER BUILD WROTE READS AND ANSWERS AS IT DID, AND AN OLDER READER READS A NEW
+/// ONE AS IT READ ITS OWN: a codex miss an older build kept (`source=none why=<word>`, nothing
+/// more) is a plain unavailable result, answered by its word and never read again; a rollout's
+/// missing result reads back whole; and, past the `thread=` an older reader takes no field from,
+/// it is that same plain result (an older reader's `source=none` fields are `why=`, `turn=` and
+/// `transcript=`), with no transcript to read again. NEGATIVE CONTROL: a why that is no word
+/// reads as no line.
+#[test]
+fn an_older_codex_snapshot_reads_as_it_did_and_a_new_one_reads_in_an_older_reader() {
+    let tasks = ScratchDir::new("result", "codex-old");
+    for (stem, why) in [("s-c1-16", "no-reply"), ("s-c1-17", "no-transcript")] {
+        let old = tasks.join(format!("{stem}.result.md"));
+        std::fs::write(&old, "").expect("result");
+        std::fs::write(sidecar_of(&old), format!("source=none why={why}\n")).expect("sidecar");
+        assert_eq!(
+            source_of(&old),
+            Some(Source::Unavailable {
+                why: why.to_string(),
+                transcript: None,
+                turn: None,
+            })
+        );
+        assert_eq!(reread(&old), None, "{why}");
+        assert_eq!(
+            answer(&old, false),
+            format!("ERR result unavailable why={why}\n")
+        );
+        assert_eq!(
+            answer(&old, true),
+            format!("ERR result unavailable why={why}\n")
+        );
+    }
+    let missed = Source::RolloutUnavailable {
+        why: "no-reply".to_string(),
+        thread: THREAD.to_string(),
+        turn: Some("t 3".to_string()),
+        rollout: Some(PathBuf::from("/Users//a b/.codex/sessions/rollout-x.jsonl")),
+        home: Some(PathBuf::from("/Users//a b/.codex")),
+        landed: Some(LANDED),
+    };
+    let bare = Source::RolloutUnavailable {
+        why: "no-transcript".to_string(),
+        thread: "-".to_string(),
+        turn: None,
+        rollout: None,
+        home: None,
+        landed: None,
+    };
+    assert_eq!(
+        bare.line(),
+        "source=none why=no-transcript thread=-",
+        "the fields it has"
+    );
+    for source in [missed.clone(), bare] {
+        assert_eq!(Source::parse(&source.line()), Some(source.clone()));
+    }
+    let line = missed.line();
+    let older: Vec<&str> = line
+        .split(' ')
+        .filter(|t| !t.starts_with("thread="))
+        .collect();
+    assert_eq!(
+        Source::parse(&older.join(" ")),
+        Some(Source::Unavailable {
+            why: "no-reply".to_string(),
+            transcript: None,
+            turn: Some("t 3".to_string()),
+        }),
+        "{line}"
+    );
+    assert_eq!(
+        Source::parse(&format!("source=none why=Not%20a%20word thread={THREAD}")),
+        None
     );
 }

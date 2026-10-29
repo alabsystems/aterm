@@ -17,6 +17,12 @@
 //!  "line":"<the exact line>","turn":<id>|null,"report":<id>|null[,"mark":"<16 hex>"]
 //!  [,"ended":<unix ms>]}
 //! ```
+//!
+//! A line's free-text tail is the agent's screen by construction (a reply's last line, a box's
+//! command, a question's words), so it stays in the harness's drive store, 0600 files in the 0700
+//! `<state>/drive` folder: this journal, the approval ledger beside it (which keeps an act's
+//! command and the answer typed) and tapes when recorded (DESIGN-session-log §3.6). An app log
+//! keeps [`log_words`] of a line: its words, sequence and the tail's length.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -602,6 +608,49 @@ impl JournalRecord {
     }
 }
 
+/// What an app log may keep of a line a loop printed: the head [`JournalRecord::of_line`] reads
+/// (the printed word; an `EVENT`'s or `DISMISSED`'s phase; `seq=`; `complete=`/`rows=` or
+/// `report=`/`rows=`; a `rule=`; `HOLD`'s door, `OCCUPANCY`'s measure, `PROBE`'s what), each
+/// token kept only where it is a word of `[A-Za-z0-9@._:=-]` (else `?`), then ` text=<n>B`, the
+/// free-text tail's length in bytes (none for an empty tail). A line that begins with no [`Word`]
+/// is its [`Noted`] word (`NOT ESCALATED`, `WATCHING`, …) or `other`, then the length of the rest.
+/// The tail is never read again: for a line the loop printed, the result depends on its tail only
+/// through the tail's length.
+#[must_use]
+pub fn log_words(line: &str) -> String {
+    let rec = JournalRecord::of_line(0, None, line, None);
+    let (head, tail) = if Word::of_kind(&rec.kind).is_some() {
+        // `summary` is a suffix of `line` (each reader step takes a slice's rest).
+        let cut = line.len().saturating_sub(rec.summary.len());
+        (line.get(..cut).unwrap_or_default(), rec.summary.len())
+    } else {
+        match Noted::of_line(line) {
+            Some(noted) => {
+                let rest = line.get(noted.printed().len()..).unwrap_or_default();
+                (
+                    noted.printed(),
+                    rest.strip_prefix(' ').unwrap_or(rest).len(),
+                )
+            }
+            None => ("other", line.len()),
+        }
+    };
+    let mut out = String::with_capacity(head.len().saturating_add(16));
+    for token in head.split(' ').filter(|t| !t.is_empty()) {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        let word = token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"@._:=-".contains(&b));
+        out.push_str(if word { token } else { "?" });
+    }
+    if tail > 0 {
+        out.push_str(&format!(" text={tail}B"));
+    }
+    out
+}
+
 /// `s` as a quoted JSON string through the control path's one escape.
 pub fn json_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len().saturating_add(2));
@@ -1049,6 +1098,110 @@ mod tests {
             assert_eq!(r.kind, "other", "{other}");
         }
         assert_eq!(Word::of_kind("other"), None);
+    }
+
+    /// [`log_words`] keeps each line's head as [`JournalRecord::of_line`] reads it and its
+    /// tail's length, never the tail: a tail holding a planted word and an equal-length tail of
+    /// other bytes give the same words, for every [`Word`] (each word's line shape is this
+    /// match's, so a new word does not compile until the test names it), every [`Noted`] word,
+    /// the shapes a real Claude Code run logged, and a line of no word.
+    #[test]
+    fn log_words_keeps_each_words_head_and_never_its_text() {
+        const PLANT: &str = "QZP7WORD5";
+        // The head the loop prints before a line's free text, and whether its grammar reads a
+        // `seq=` there.
+        let shape = |w: Word| -> (&'static str, bool) {
+            match w {
+                Word::Event => ("EVENT idle seq=7", true),
+                Word::Dismissed => ("DISMISSED survey seq=7", true),
+                Word::Mail => ("MAIL", false),
+                Word::Approved => ("APPROVED seq=7", true),
+                Word::Reconnect => ("RECONNECT", false),
+                Word::Timeout => ("TIMEOUT", false),
+                Word::Exit => ("EXIT", false),
+                Word::Extend => ("EXTEND", false),
+                Word::Escalated => ("ESCALATED seq=7", true),
+                Word::Cleared => ("CLEARED seq=7", true),
+                Word::Continued => ("CONTINUED seq=7 rule=usage-resume@v1", true),
+                Word::Typed => ("TYPED seq=7 rule=a-rule@v1", true),
+                Word::Restarted => ("RESTARTED seq=7 rule=a-rule@v1", true),
+                Word::Waiting => ("WAITING seq=7", true),
+                Word::Skipped => ("SKIPPED seq=7 rule=usage-probe@v1", true),
+                Word::Unverified => ("UNVERIFIED seq=7 rule=a-rule@v1", true),
+                Word::Limited => ("LIMITED seq=7 rule=a-rule@v1", true),
+                Word::Unproven => ("UNPROVEN seq=7 rule=a-rule@v1", true),
+                Word::Dialog => ("DIALOG seq=7 rule=a-rule@v1", true),
+                Word::Declined => ("DECLINED seq=7 rule=a-rule@v1", true),
+                Word::Chose => ("CHOSE seq=7 rule=answer-recommended@v1", true),
+                Word::Exception => ("EXCEPTION seq=7", true),
+                Word::Probed => ("PROBED seq=7 rule=usage-probe@v1", true),
+                Word::Reset => ("RESET seq=7 rule=limit-reset@v1", true),
+                Word::Needs => ("NEEDS seq=7", true),
+                Word::Hold => ("HOLD seq=7 point", true),
+                Word::Occupancy => ("OCCUPANCY seq=7 rule=wait-nudge@v1", true),
+                Word::Probe => ("PROBE deferred seq=7", true),
+            }
+        };
+        let mut rows: Vec<(String, bool)> = Word::ALL
+            .into_iter()
+            .map(|w| {
+                let (head, seq) = shape(w);
+                (head.to_string(), seq)
+            })
+            .collect();
+        rows.extend(Noted::ALL.map(|n| (n.printed().to_string(), false)));
+        // The real run's shapes (a reply's last line, a box's classification and command, its
+        // approval, a question's answer), each head read to the end of what the grammar reads.
+        rows.extend(
+            [
+                "EVENT idle seq=7 complete=1 rows=689",
+                "EVENT question seq=7",
+                "EVENT prompt seq=7",
+                "EVENT turn seq=7 report=5 rows=12",
+                "APPROVED seq=7",
+                "CHOSE seq=7 rule=answer-recommended@v1",
+            ]
+            .map(|h| (h.to_string(), true)),
+        );
+        let tails = [
+            format!("⏺ {PLANT} is the reply's last line"),
+            format!("kind=bash classify=not-read-only:touch command=touch {PLANT}"),
+            format!("touch {PLANT}"),
+            format!("policy=recommended {PLANT} (Recommended)"),
+            PLANT.to_string(),
+        ];
+        for (head, seq) in &rows {
+            for tail in &tails {
+                let line = format!("{head} {tail}");
+                let other = format!("{head} {}", "x".repeat(tail.len()));
+                let words = log_words(&line);
+                assert_eq!(
+                    words,
+                    log_words(&other),
+                    "{line}: the tail's bytes reach it"
+                );
+                assert_eq!(
+                    words,
+                    format!("{head} text={}B", tail.len()),
+                    "{line}: its head and the tail's length"
+                );
+                assert!(!words.contains("QZP7WORD"), "{words}");
+                assert_eq!(words.contains(" seq=7 "), *seq, "{words}");
+            }
+            assert_eq!(&log_words(head), head, "an empty tail has no text=");
+        }
+        let word_less = format!("PROBING seq=102 rule=usage-probe@v1 /usage {PLANT}");
+        assert_eq!(
+            log_words(&word_less),
+            format!("other text={}B", word_less.len()),
+            "a line of no word is `other` and its length"
+        );
+        assert_eq!(log_words(""), "other");
+        assert_eq!(
+            log_words(&format!("EVENT ⏺{PLANT} seq=7 x")),
+            "EVENT ? seq=7 text=1B",
+            "a head token that is no word is `?`"
+        );
     }
 
     /// The JSON round-trips, escapes what it must, and prints `null` for what

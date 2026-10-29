@@ -1544,12 +1544,14 @@ fn a_text_in_doubt_is_remembered_and_never_written_again_one_not_written_is_not(
         m.send_replies.push_back(reply);
         m.vanish_after = Some(1);
         if tag == "partial" {
-            m.by_index.insert(12, closed());
+            // After the hand-over's escalate act, which the wait sends first (fix E3).
+            m.by_index.insert(13, closed());
         }
         let _ = hosted_run(&mut m, &hosted_by(LONG), None);
         if tag == "partial" {
             assert!(
-                m.requests[13].starts_with("await gone "),
+                m.requests[13].starts_with("mark - act word=escalate ")
+                    && m.requests[14].starts_with("await gone "),
                 "{tag}: the outage fell on the wait after the hand-over: {:#?}",
                 m.requests
             );

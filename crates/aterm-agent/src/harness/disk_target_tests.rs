@@ -316,6 +316,195 @@ fn in_incremental(rel: &Path) -> bool {
         .any(|c| c.as_os_str() == std::ffi::OsStr::new(INCREMENTAL))
 }
 
+/// Targo's supported build-unit layout: the same profile locks, with
+/// build/<package>/<unit>/{fingerprint,out,run} instead of deps/.fingerprint.
+fn unit_target(tmp: &Tmp) -> PathBuf {
+    let t = synthetic_target(tmp, "target");
+    let p = t.join("debug");
+    std::fs::remove_dir_all(p.join("deps")).expect("no legacy deps");
+    std::fs::remove_dir_all(p.join(".fingerprint")).expect("no legacy fingerprints");
+    let unit = at(&p, "build/lay/2bcb77ac5af7c69c");
+    for d in ["out", "fingerprint", "run"] {
+        std::fs::create_dir_all(unit.join(d)).expect("unit directory");
+    }
+    std::fs::write(at(&unit, "out/liblay.rlib"), vec![7u8; 4096]).expect("unit artifact");
+    for d in ["fingerprint", "run"] {
+        std::fs::write(unit.join(d).join("invoked.timestamp"), b"built").expect("invoked");
+    }
+    std::fs::write(at(&unit, "fingerprint/lib-lay"), b"0123456789abcdef").expect("completed hash");
+    std::fs::write(at(&unit, "run/stdout"), b"completed output").expect("run output");
+    std::fs::write(at(&p, "build/sibling-file"), b"not a package").expect("sibling file");
+    std::fs::write(at(&p, "build/lay/sibling-file"), b"not a unit").expect("sibling file");
+    t
+}
+
+#[test]
+fn unit_layout_reclaim_keeps_compiled_outputs_and_removes_only_incremental() {
+    let tmp = Tmp::new("unit-layout");
+    let t = unit_target(&tmp);
+    let now = now_after_write(STALE + 1);
+    let before = snapshot(&t, &in_incremental);
+    let td = assessed(&t, now);
+    assert_eq!(td.profiles.len(), 1, "{td:?}");
+    assert_eq!(td.profiles[0].path, t.join("debug"));
+    assert_eq!(td.candidates(now, STALE).len(), 1);
+    let done = reclaim(&t, &judge(now)).expect("idle unit layout");
+    assert_eq!(done.units, vec![at(&t, "debug/incremental")]);
+    assert_eq!(snapshot(&t, &in_incremental), before);
+}
+
+#[test]
+fn unit_layout_requires_real_directories_and_any_held_cargo_lock_refuses() {
+    let now = now_after_write(STALE + 1);
+    for lock in CARGO_LOCKS {
+        let tmp = Tmp::new("unit-lock");
+        let t = unit_target(&tmp);
+        let before = snapshot(&t, &|_| false);
+        let hold = take(&t.join("debug").join(lock));
+        let td = assessed(&t, now);
+        assert_eq!(td.profiles.len(), 1);
+        assert!(td.profiles[0].in_use.is_some());
+        assert!(td.candidates(now, STALE).is_empty());
+        reclaim(&t, &judge(now)).expect_err("held unit-layout build");
+        assert_eq!(snapshot(&t, &|_| false), before);
+        drop(hold);
+    }
+    for missing in ["locks", "build", "incremental"] {
+        let tmp = Tmp::new("unit-incomplete");
+        let t = unit_target(&tmp);
+        let p = t.join("debug");
+        if missing == "locks" {
+            for lock in CARGO_LOCKS {
+                std::fs::remove_file(p.join(lock)).expect("remove lock");
+            }
+        } else {
+            std::fs::remove_dir_all(p.join(missing)).expect("remove layout directory");
+            std::fs::write(p.join(missing), b"not a directory").expect("plain file");
+        }
+        let td = assessed(&t, now);
+        assert!(td.profiles.is_empty(), "{missing}: {td:?}");
+        reclaim(&t, &judge(now)).expect_err("not a supported locked profile");
+    }
+}
+
+#[test]
+fn unit_clocks_keep_recent_compilations_even_when_profile_parents_stay_old() {
+    let now = now_after_write(STALE + 1);
+    for channel in [
+        "out",
+        "fingerprint",
+        "run",
+        "fingerprint/invoked.timestamp",
+        "run/invoked.timestamp",
+        "fingerprint/lib-lay",
+        "run/stdout",
+    ] {
+        let tmp = Tmp::new("unit-clock");
+        let t = unit_target(&tmp);
+        let debug = t.join("debug");
+        let unit = at(&debug, "build/lay/2bcb77ac5af7c69c");
+        let old = now - (STALE + 1) * DAY;
+        last_used(&debug, old);
+        set_mtime(&at(&debug, "build/lay"), old);
+        set_mtime(&unit, old);
+        let recent = inside_window(now);
+        set_mtime(&at(&unit, channel), recent);
+        let td = assessed(&t, now);
+        assert_eq!(td.profiles.len(), 1);
+        assert_eq!(td.profiles[0].last_used, Some(recent), "{channel}");
+        assert!(td.candidates(now, STALE).is_empty(), "{channel}");
+        reclaim(&t, &judge(now)).expect_err("recent unit activity");
+        assert!(debug.join(INCREMENTAL).exists());
+    }
+}
+
+#[test]
+fn unit_stamp_changes_are_rechecked_under_locks_for_idle_and_pressure_reclaim() {
+    for pressure in [false, true] {
+        for channel in [
+            "fingerprint/invoked.timestamp",
+            "fingerprint/lib-lay",
+            "run/stdout",
+        ] {
+            let tmp = Tmp::new("unit-clock-race");
+            let t = unit_target(&tmp);
+            let debug = t.join("debug");
+            let stamp = at(&at(&debug, "build/lay/2bcb77ac5af7c69c"), channel);
+            let now = now_after_write(STALE + 1);
+            let seen = assessed(&t, now).profiles[0]
+                .last_used
+                .expect("known clock");
+            let mut update = |stage, _: &Path| {
+                if stage == Stage::Locked {
+                    set_mtime(&stamp, if pressure { seen + 60 } else { now });
+                }
+            };
+            let result = if pressure {
+                reclaim_lru_with(&t, &debug, &judge(now), seen, &mut update)
+            } else {
+                reclaim_with(&t, &judge(now), &mut update)
+            };
+            result.expect_err("unit rebuilt after the survey");
+            assert!(debug.join(INCREMENTAL).exists());
+        }
+    }
+}
+
+#[test]
+fn unit_clocks_refuse_truncation_symlinks_and_nonfile_invocation_stamps() {
+    let tmp = Tmp::new("unit-clock-bounds");
+    let t = unit_target(&tmp);
+    let debug = t.join("debug");
+    assert!(fd::clock(&debug, WalkBudget::SHIPPED).is_some());
+    assert_eq!(
+        fd::clock(
+            &debug,
+            WalkBudget {
+                entries: 0,
+                ..WalkBudget::SHIPPED
+            }
+        ),
+        None
+    );
+    for name in ["fingerprint", "out", "run"] {
+        let tmp = Tmp::new("unit-clock-shape");
+        let t = unit_target(&tmp);
+        let debug = t.join("debug");
+        let fixed = at(&debug, "build/lay/2bcb77ac5af7c69c").join(name);
+        std::fs::remove_dir_all(&fixed).expect("replace fixed clock directory");
+        std::fs::write(&fixed, b"unsupported recently written shape").expect("regular file");
+        let now = now_after_write(STALE + 1);
+        let td = assessed(&t, now);
+        assert_eq!(td.profiles.len(), 1);
+        assert_eq!(td.profiles[0].last_used, None, "{name}");
+        reclaim(&t, &judge(now)).expect_err("fixed clock path is not a directory");
+        assert!(debug.join(INCREMENTAL).exists());
+    }
+    for linked in [false, true] {
+        let tmp = Tmp::new("unit-clock-link");
+        let t = unit_target(&tmp);
+        let debug = t.join("debug");
+        let fingerprint = at(&debug, "build/lay/2bcb77ac5af7c69c/fingerprint");
+        if linked {
+            let outside = tmp.path().join("outside");
+            std::fs::create_dir_all(&outside).expect("outside directory");
+            std::fs::write(outside.join("invoked.timestamp"), b"outside").expect("outside stamp");
+            std::fs::remove_dir_all(&fingerprint).expect("replace fingerprint");
+            link_dir(&outside, &fingerprint);
+        } else {
+            let stamp = fingerprint.join("invoked.timestamp");
+            std::fs::remove_file(&stamp).expect("replace stamp");
+            std::fs::create_dir(&stamp).expect("a directory is not an invocation stamp");
+        }
+        let now = now_after_write(STALE + 1);
+        let td = assessed(&t, now);
+        assert_eq!(td.profiles.len(), 1);
+        assert_eq!(td.profiles[0].last_used, None);
+        reclaim(&t, &judge(now)).expect_err("unknown unit clock");
+        assert!(debug.join(INCREMENTAL).exists());
+    }
+}
+
 /// An idle profile loses only its `incremental/` cache and releases its locks.
 #[test]
 fn an_idle_profile_loses_only_its_incremental_cache_and_everything_else_is_byte_identical() {

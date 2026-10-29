@@ -4,9 +4,41 @@
 
 //! Line-level grid checkpoint projection and visible-row restoration.
 
-use aterm_scrollback::{Line, Scrollback, ScrollbackStorage};
+use aterm_scrollback::{ImageSpan, Line, Scrollback, ScrollbackStorage};
 
 use super::Grid;
+
+/// Inline-image spans carried beside a line-serialized [`Grid`] checkpoint: sparse visible rows (`0..rows`) and reverse-indexed uncompressed history rows (`0` = newest scrollback line).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GridImageCarry {
+    /// Non-empty visible-row span lists `(row, spans)` sorted ascending by `row`.
+    pub visible: Vec<(u16, Vec<ImageSpan>)>,
+    /// Non-empty history-row span lists `(rev_idx, spans)` sorted ascending by `rev_idx` (`0` = newest).
+    pub history_rev: Vec<(u32, Vec<ImageSpan>)>,
+}
+
+impl GridImageCarry {
+    /// Whether this carry holds neither visible nor history image spans.
+    #[must_use]
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.visible.is_empty() && self.history_rev.is_empty()
+    }
+
+    /// Copy with `history_rev` truncated to `rev_idx < max_history`.
+    #[must_use]
+    pub fn bounded(&self, max_history: usize) -> Self {
+        Self {
+            visible: self.visible.clone(),
+            history_rev: self
+                .history_rev
+                .iter()
+                .filter(|(rev, _)| (*rev as usize) < max_history)
+                .cloned()
+                .collect(),
+        }
+    }
+}
 
 impl Grid {
     /// Projects scrollback (oldest first) followed by visible rows into a flat `Vec<Line>`.
@@ -75,6 +107,7 @@ impl Grid {
                 None => {
                     if let Some(row) = self.row_mut(r) {
                         row.clear();
+                        self.storage.extras.clear_row(r);
                     }
                 }
             }
@@ -120,6 +153,13 @@ impl Grid {
         fork.storage.resize_law = storage.resize_law;
         fork.continue_absolute_numbering(self.absolute_row_counter());
         fork.storage.handback = storage.handback;
+        fork.storage.replay_carried_history.store(
+            storage
+                .replay_carried_history
+                .load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        fork.storage.deep_history_pullback_ordinal = storage.deep_history_pullback_ordinal;
         Some(fork)
     }
 
@@ -151,6 +191,142 @@ impl Grid {
     /// Scrolls `lines` (oldest first) through the top row into history.
     pub fn scroll_in_history(&mut self, lines: &[Line]) {
         self.scroll_in(lines);
+    }
+
+    /// Captures inline-image spans across visible rows and at most `max_history` newest scrollback rows (`0` = newest).
+    #[must_use]
+    pub fn capture_image_carry(&self, max_history: usize) -> GridImageCarry {
+        let has_visible = self.extras().any_image();
+        let has_history = max_history > 0 && self.history_any_image(&|_| true);
+        if !has_visible && !has_history {
+            return GridImageCarry::default();
+        }
+        let mut visible = Vec::new();
+        if has_visible {
+            let rows = self.rows();
+            let extras = self.extras();
+            let mut scratch = super::ScrolledRowExtras::default();
+            for r in 0..rows {
+                let Some(row) = self.row_at_screen(r) else {
+                    continue;
+                };
+                scratch.clear();
+                Self::extract_image_spans_into(&mut scratch, row, extras, r);
+                if !scratch.images.is_empty() {
+                    visible.push((r, std::mem::take(&mut scratch.images)));
+                }
+            }
+        }
+        let mut history_rev = Vec::new();
+        if has_history {
+            let total = self.scrollback_lines();
+            let cap = total.min(max_history).min(u32::MAX as usize);
+            let ring = self.storage.ring_buffer_scrollback();
+            let lazy = self.storage.lazy_buffer_lines();
+            let tiered = self
+                .storage
+                .scrollback
+                .as_ref()
+                .map_or(0, ScrollbackStorage::line_count);
+            for rev in 0..cap {
+                let spans = if rev < ring {
+                    let ring_idx = ring - 1 - rev;
+                    self.storage
+                        .ring_history_extras(ring_idx)
+                        .map(|e| e.images.as_slice())
+                        .filter(|s| !s.is_empty())
+                } else {
+                    let after_ring = rev - ring;
+                    if after_ring < lazy {
+                        let lazy_idx = lazy - 1 - after_ring;
+                        self.storage.lazy_buffer.line_images(lazy_idx)
+                    } else {
+                        let store_rev = after_ring - lazy;
+                        if store_rev < tiered {
+                            let store_idx = tiered - 1 - store_rev;
+                            self.storage
+                                .scrollback
+                                .as_ref()
+                                .and_then(|sb| sb.line_images(store_idx))
+                                .filter(|s| !s.is_empty())
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(spans) = spans
+                    && let Ok(rev_u32) = u32::try_from(rev)
+                {
+                    history_rev.push((rev_u32, spans.to_vec()));
+                }
+            }
+        }
+        GridImageCarry {
+            visible,
+            history_rev,
+        }
+    }
+
+    /// Installs inline-image spans captured by [`Self::capture_image_carry`] onto visible and uncompressed history rows.
+    pub fn apply_image_carry(&mut self, carry: &GridImageCarry) {
+        if self.extras().any_image() {
+            let rows = self.rows();
+            let cols = self.cols();
+            let coords: Vec<(u16, u16)> = self
+                .extras()
+                .iter()
+                .filter(|(at, extra)| at.row < rows && at.col < cols && !extra.images().is_empty())
+                .map(|(at, _)| (at.row, at.col))
+                .collect();
+            for (r, c) in coords {
+                self.cell_extra_mut(r, c).retain_images(|_| false);
+            }
+        }
+        if self.history_any_image(&|_| true) {
+            self.retain_history_images(&mut |_| false);
+        }
+        if carry.is_empty() {
+            return;
+        }
+        let rows = self.rows();
+        let cols = self.cols();
+        for (row, spans) in &carry.visible {
+            if *row < rows && !spans.is_empty() {
+                self.stamp_row_image_spans(*row, spans, cols);
+            }
+        }
+        let ring = self.storage.ring_buffer_scrollback();
+        let lazy = self.storage.lazy_buffer_lines();
+        let mut history_changed = false;
+        for (rev_u32, spans) in &carry.history_rev {
+            if spans.is_empty() {
+                continue;
+            }
+            let Ok(rev) = usize::try_from(*rev_u32) else {
+                continue;
+            };
+            if rev < ring {
+                let ring_idx = ring - 1 - rev;
+                history_changed |= self.storage.ring_extras.set_images(ring_idx, spans.clone());
+            } else {
+                let after_ring = rev - ring;
+                if after_ring < lazy {
+                    let lazy_idx = lazy - 1 - after_ring;
+                    history_changed |= self
+                        .storage
+                        .lazy_buffer
+                        .set_line_images(lazy_idx, spans.clone());
+                } else {
+                    let store_rev = after_ring - lazy;
+                    if let Some(store) = self.storage.scrollback.as_mut() {
+                        history_changed |= store.set_hot_line_images(store_rev, spans.clone());
+                    }
+                }
+            }
+        }
+        if history_changed || !carry.visible.is_empty() {
+            self.storage.mark_content_full();
+        }
     }
 
     /// Scrolls `lines` (oldest first) through the top row into history.
@@ -238,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_checkpoint_cost_does_not_scale_with_scrollback() {
+    fn visible_checkpoint_excludes_scrollback_and_restores_visible_rows() {
         let mut g = Grid::with_scrollback(3, 20, 100);
         let mut sb = Scrollback::with_defaults();
         sb.set_line_limit(None);

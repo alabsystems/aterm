@@ -168,7 +168,13 @@ fn manual_renewals_recover_or_refuse_before_dispatching_any_provider() {
                 let host = Host {
                     emails: RefCell::new(Vec::new()),
                 };
-                let (code, err) = bed.run(due, &host);
+                // The lock stays held for the whole run, so no pause of the ladder can take it:
+                // the refusal is the subject, not how long a take waits before it.
+                let (code, err) = if fault == 6 {
+                    accounts::with_store_ladder(&[], || bed.run(due, &host))
+                } else {
+                    bed.run(due, &host)
+                };
                 // The isolated provider stub deliberately fails authentication.
                 assert_eq!(
                     code,

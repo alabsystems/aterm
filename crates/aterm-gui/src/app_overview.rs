@@ -68,12 +68,12 @@ impl App {
         let autopilot = crate::autopilot::word_of(ctx);
         let (verdict, agent_word, agent_age, program, task) = {
             let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-            let a = tl.agent();
+            let (word, age) = tl.shown_agent_word();
             (
                 tl.need().clone(),
-                a.word,
-                a.age_ms(),
-                crate::harness_host::agent_of(a),
+                word,
+                age,
+                crate::harness_host::agent_of(tl.agent()),
                 tl.task().cloned(),
             )
         };
@@ -149,27 +149,28 @@ impl App {
                     None => Driver::WorkerOfElsewhere(short_sid(&t.from)),
                 }
             });
+        // A session the host admits is driven only while aterm's Autopilot carries it
+        // (`autopilot::carried`, the hover's `driven_by_aterm` rule too): a plain codex gets no line.
         let (driven, held) = program
             .filter(|agent| hosting.hosts(h.sid.as_str(), autopilot, *agent))
-            .map_or((None, None), |_| {
+            .and_then(|agent| {
+                let (_, view, supervised, self_proven) = self.session_autopilot_for(
+                    h.local_id,
+                    self.session_agent(h.local_id),
+                    &crate::autopilot::ClaimClock::default(),
+                );
+                crate::autopilot::carried(agent, supervised, self_proven).then_some(view)
+            })
+            .map_or((None, None), |view| {
                 let glass = self.chip_glass(h.local_id);
-                let view = self.session_autopilot(h.local_id).1;
                 let face = crate::claude_lights::ChipFace::of(view, &glass);
                 let held = self
                     .shown_hold(h.local_id)
-                    .filter(|hold| hold.read())
+                    .filter(|hold| hold.hold.read())
                     .and_then(|hold| {
-                        crate::harness_glass::hold_words(
-                            &hold,
-                            None,
-                            crate::harness_glass::HoldForm::Tip,
-                            None,
-                        )
+                        hold.words(None, crate::harness_glass::HoldForm::Tip, None, None)
                     });
-                let stopped = self
-                    .harness_glass
-                    .get(&h.local_id)
-                    .and_then(crate::harness_glass::SessionGlass::stopped);
+                let stopped = self.shown_stop(h.local_id);
                 (
                     crate::app_presence::driven_words(face, &glass, None, landed, stopped),
                     held,
@@ -223,7 +224,8 @@ impl App {
         }
     }
 
-    fn overview_parts(&self) -> (Vec<OverviewGroup>, Vec<Manages>) {
+    /// The Overview's window groups of chips, and who manages whom, as a refresh lays them out.
+    pub(crate) fn overview_parts(&self) -> (Vec<OverviewGroup>, Vec<Manages>) {
         let hosting = self.harness_hosting();
         let handles: Vec<crate::session_store::SessionHandle> = {
             let g = self.store.read().unwrap_or_else(|p| p.into_inner());
@@ -611,10 +613,10 @@ impl App {
         let label = self.tab_label_of_session(session);
         let msg = match &why {
             StopRefused::Gone | StopRefused::NotRunning | StopRefused::Halted(_) => {
-                crate::message_reporters::stop_worker_nothing(&label, &why.words())
+                crate::message_reporters::stop_worker_nothing(session, &label, &why.words())
             }
             StopRefused::NoAgent | StopRefused::Signal(_) => {
-                crate::message_reporters::stop_worker_failed(&label, &why.words())
+                crate::message_reporters::stop_worker_failed(session, &label, &why.words())
             }
         };
         self.post_message(msg);
@@ -1458,6 +1460,207 @@ mod tests {
         assert!(!title(&app).contains("another aterm"), "{}", title(&app));
     }
 
+    /// A CODEX TAB'S OWN REPORT ON THE SURFACES THE PERSON READS: codex's reader names no state
+    /// (`agent=unknown`), so the `working` report codex writes, fed to the tab's real engine and
+    /// folded by the real sweep, is what the Overview chip (`busy`, the working mark), Settings ▸
+    /// Harness's row (`working`) and the tab hover's activity line (`codex working`) say, and the
+    /// hover's cached line's revision moves with it (the status machine settled first, so only the
+    /// report moves it); the hover's state line says the context codex's rollout counts beside the
+    /// report (`ctx 12% left ⚠`); a permission box is `waiting on permission` in Settings, never
+    /// idle; `agent=` stays `unknown`.
+    /// NEGATIVE CONTROLS: the same tab before any report says none of it, and with Tab Status off
+    /// (nothing folds the report) its hover keeps no report standing.
+    #[test]
+    fn a_codex_tabs_own_report_is_its_word_on_the_overview_settings_and_the_hover() {
+        use crate::overview::ChipMark;
+        const WORKING: &[u8] = b"\x1b]7501;state=working:app=codex\x1b\\";
+        let mut app = App::headless_for_test();
+        let local = app.next_session_id;
+        app.push_stub_tab(WindowId(0), crate::stub_session(local));
+        let (term, ctx) = {
+            let pooled = app.pool.get(local).expect("pooled");
+            (pooled.term.clone(), pooled.ctx.clone())
+        };
+        {
+            let mut tl = ctx.timeline.lock().expect("timeline");
+            tl.note_foreground_group(4242);
+            tl.set_program(4242, Some("codex".into()));
+            tl.publish_agent(
+                "unknown",
+                None,
+                None,
+                Some(aterm_phase::Program::Codex),
+                crate::session_timeline::AgentStamp {
+                    generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                    fp: 1,
+                },
+            );
+        }
+        let sid = ctx.self_id.clone();
+        let surfaces = |app: &App| {
+            let (groups, _) = app.overview_parts();
+            let chip = groups
+                .iter()
+                .flat_map(|g| g.chips.iter())
+                .find(|c| c.sid == sid)
+                .cloned()
+                .expect("listed");
+            let row = app
+                .tab_control_state(crate::autopilot::HarnessPosture::default())
+                .tabs
+                .into_iter()
+                .find(|row| row.show_local_id == Some(local))
+                .expect("its row");
+            (
+                chip.mark,
+                chip.doing,
+                row.ai_status,
+                app.session_status_text(local),
+            )
+        };
+        let t0 = std::time::Instant::now();
+        let sweep = |app: &mut App, s: u64| {
+            let _ = app.observe_session_statuses(t0 + std::time::Duration::from_secs(s));
+        };
+        sweep(&mut app, 0);
+        // The status machine's dwell publishes the stub's first reading here, not after the report.
+        sweep(&mut app, 1);
+        let (mark, doing, status, activity) = surfaces(&app);
+        assert_eq!(mark, ChipMark::Quiet, "no report yet: {doing}");
+        assert!(doing.starts_with("unknown "), "{doing}");
+        assert!(!status.starts_with("working"), "{status}");
+        assert_ne!(activity.as_deref(), Some("codex working"));
+        let before = app.session_status_revision(local);
+
+        sweep(&mut app, 2);
+        assert_eq!(
+            app.session_status_revision(local),
+            before,
+            "CONTROL: settled, a sweep with no report leaves the revision"
+        );
+        crate::term_lock(&term).process(WORKING);
+        sweep(&mut app, 3);
+        let (mark, doing, status, activity) = surfaces(&app);
+        assert_eq!(mark, ChipMark::Working, "{doing}");
+        assert!(doing.starts_with("busy "), "{doing}");
+        assert!(status.starts_with("working"), "{status}");
+        assert_eq!(activity.as_deref(), Some("codex working"));
+        assert_ne!(
+            app.session_status_revision(local),
+            before,
+            "the hover's cached line is read again"
+        );
+        assert_eq!(
+            ctx.timeline.lock().expect("timeline").agent().word,
+            "unknown",
+            "the reader's word is never moved"
+        );
+        // The hover says the context codex's rollout counts beside the report, as a Claude tab's
+        // says its own (CONTROL: no figure read yet, none said).
+        let hover = |app: &mut App| {
+            app.refresh_presence_session(local);
+            app.presence_hover(local, None).unwrap_or_default()
+        };
+        let line = hover(&mut app);
+        assert!(line.contains("codex working"), "{line}");
+        assert!(!line.contains("ctx "), "{line}");
+        let survey = crate::survey::CodexSurvey {
+            facts: aterm_agent::harness::codex_facts::CodexFacts {
+                ctx_left_pct: Some(12),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            ctx.timeline
+                .lock()
+                .expect("timeline")
+                .set_codex_survey(4242, survey),
+            "read for the program in front"
+        );
+        let line = hover(&mut app);
+        assert!(
+            line.contains("codex working \u{b7} ctx 12% left \u{26a0}"),
+            "{line}"
+        );
+
+        crate::term_lock(&term).process(b"\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\");
+        sweep(&mut app, 4);
+        let (_, _, status, activity) = surfaces(&app);
+        assert!(status.starts_with("waiting on permission"), "{status}");
+        assert_eq!(activity.as_deref(), Some("codex blocked"));
+
+        app.config.tab_status = Some(false);
+        app.reconfigure_session_status();
+        assert_eq!(
+            app.session_status_text(local),
+            None,
+            "Tab Status off: no report stands in the hover"
+        );
+    }
+
+    /// WHO DRIVES A CODEX TAB, on the Overview and the hover alike (`autopilot::carried`): a host
+    /// that admits codex drives a plain codex in front of it not at all, and a codex-alab that
+    /// proved its own claim under the session's Autopilot is driven by aterm's Autopilot on both.
+    #[test]
+    fn a_codex_is_driven_on_the_overview_and_the_hover_only_under_its_proven_claim() {
+        use crate::overview::Driver;
+        let mut app = App::headless_for_test();
+        let host = crate::harness_host::HostHandle::for_supervised_test(
+            Vec::new(),
+            std::sync::Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
+        );
+        app.harness = Some(host.clone());
+        let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+        {
+            let mut tl = ctx.timeline.lock().expect("timeline");
+            tl.note_foreground_group(7);
+            tl.set_program(7, Some("codex".into()));
+            tl.publish_agent(
+                "unknown",
+                None,
+                None,
+                Some(aterm_phase::Program::Codex),
+                crate::session_timeline::AgentStamp {
+                    generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                    fp: 1,
+                },
+            );
+        }
+        ctx.meta
+            .lock()
+            .expect("meta")
+            .set("autopilot", Some("land".into()));
+        let sid = ctx.self_id.clone();
+        let driver = |app: &App| {
+            let (groups, _) = app.overview_parts();
+            groups
+                .iter()
+                .flat_map(|g| g.chips.iter())
+                .find(|c| c.sid == sid)
+                .and_then(|c| c.driver.clone())
+        };
+        assert_eq!(
+            driver(&app),
+            None,
+            "CONTROL: a plain codex, admitted, unclaimed"
+        );
+        assert_eq!(app.driven_by_aterm(0), None);
+        crate::session_timeline::claim_supervisor_as(
+            &ctx,
+            &format!("codex-alab@{}", std::process::id()),
+            Some(1),
+            None,
+            Some(crate::self_claim::stand_in::running()),
+            crate::metrics::now_us(),
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("the proven claim");
+        let words = app.driven_by_aterm(0).expect("the hover names the driver");
+        assert_eq!(driver(&app), Some(Driver::Aterm(words)));
+        host.shutdown_and_join();
+    }
+
     #[test]
     fn the_overview_names_the_chips_face_and_a_landed_task() {
         use crate::overview::Driver;
@@ -1488,14 +1691,6 @@ mod tests {
             .lock()
             .expect("meta")
             .set("autopilot", Some("land".into()));
-        crate::session_timeline::claim_supervisor(
-            &ctx,
-            &crate::harness_host::holder(),
-            None,
-            None,
-            crate::metrics::now_us(),
-        )
-        .expect("claimed");
         let sid = ctx.self_id.clone();
         let chip = |app: &App| {
             let (groups, _) = app.overview_parts();
@@ -1506,6 +1701,19 @@ mod tests {
                 .cloned()
                 .expect("listed")
         };
+        assert_eq!(
+            chip(&app).driver,
+            None,
+            "a host that admits it but holds no claim drives nothing"
+        );
+        crate::session_timeline::claim_supervisor(
+            &ctx,
+            &crate::harness_host::holder(),
+            None,
+            None,
+            crate::metrics::now_us(),
+        )
+        .expect("claimed");
         assert_eq!(chip(&app).driver, Some(Driver::Aterm("land".to_string())));
         app.apply_harness_fact(sid.as_str(), crate::HarnessFact::Task(Some(TaskFace::Open)));
         app.apply_harness_fact(

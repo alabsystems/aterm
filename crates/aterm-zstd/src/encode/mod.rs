@@ -623,7 +623,9 @@ fn write_header(
 mod tests {
     use std::io::{Read, Write};
 
-    use super::{Encoder, Options, write_header};
+    use super::{
+        Encoder, LEVEL_DEFAULT, LEVEL_MAX, Options, WINDOW_LOG_MAX, WINDOW_LOG_MIN, write_header,
+    };
     use crate::Decoder;
     use crate::decode::header;
     use crate::frame::Checksum;
@@ -894,5 +896,45 @@ mod tests {
         out[4] &= !0x20;
         let h = header::read(&mut &out[4..]);
         assert!(h.is_err() || h.unwrap().content_size != Some(300));
+    }
+
+    #[test]
+    fn options_clamp_to_valid_bounds() {
+        let def = Options::default();
+        assert_eq!(def, Options::new());
+        assert_eq!(def.level, LEVEL_DEFAULT);
+        assert_eq!(def.window_log, None);
+        assert_eq!(def.checksum, Checksum::Xxh64);
+        assert_eq!(def.content_size, None);
+
+        assert_eq!(Options::new().level(0).level, 1);
+        assert_eq!(Options::new().level(1).level, 1);
+        assert_eq!(Options::new().level(LEVEL_MAX).level, LEVEL_MAX);
+        assert_eq!(Options::new().level(u8::MAX).level, LEVEL_MAX);
+
+        assert_eq!(
+            Options::new().window_log(0).window_log,
+            Some(WINDOW_LOG_MIN)
+        );
+        assert_eq!(
+            Options::new().window_log(WINDOW_LOG_MIN).window_log,
+            Some(WINDOW_LOG_MIN)
+        );
+        assert_eq!(
+            Options::new().window_log(WINDOW_LOG_MAX).window_log,
+            Some(WINDOW_LOG_MAX)
+        );
+        assert_eq!(
+            Options::new().window_log(u8::MAX).window_log,
+            Some(WINDOW_LOG_MAX)
+        );
+
+        let custom = Options::new()
+            .checksum(Checksum::Omitted)
+            .content_size(4096);
+        assert_eq!(custom.level, LEVEL_DEFAULT);
+        assert_eq!(custom.window_log, None);
+        assert_eq!(custom.checksum, Checksum::Omitted);
+        assert_eq!(custom.content_size, Some(4096));
     }
 }

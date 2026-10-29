@@ -9,6 +9,11 @@ use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
+#[cfg(all(test, unix))]
+thread_local! {
+    static CHMOD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Our effective uid.
 #[cfg(unix)]
 #[inline]
@@ -33,6 +38,8 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     }
     aterm_types::fs_restricted::create_dir_all_unshared(dir, 0o700)?;
     if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.mode() & 0o7777 == 0o700) {
+        #[cfg(all(test, unix))]
+        CHMOD_CALLS.with(|c| c.set(c.get() + 1));
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     let meta = std::fs::symlink_metadata(dir)?;
@@ -102,39 +109,55 @@ mod tests {
 
     #[test]
     fn an_already_private_dir_is_not_rewritten_and_a_drifted_one_is_hardened() {
-        let dir = std::env::temp_dir().join(format!("atuc-privatedir-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("atuc-privatedir-")
+            .tempdir()
+            .unwrap();
+        let dir = scratch.path().join("private");
         ensure_private_dir(&dir).unwrap();
         let stamp = || {
             let m = std::fs::symlink_metadata(&dir).unwrap();
-            (m.ctime(), m.ctime_nsec(), m.mode() & 0o7777)
+            (
+                m.dev(),
+                m.ino(),
+                m.ctime(),
+                m.ctime_nsec(),
+                m.mode() & 0o7777,
+            )
         };
         let before = stamp();
-        assert_eq!(before.2, 0o700);
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(before.4, 0o700);
+        CHMOD_CALLS.with(|c| c.set(0));
         ensure_private_dir(&dir).unwrap();
+        assert_eq!(
+            CHMOD_CALLS.with(std::cell::Cell::get),
+            0,
+            "an unchanged 0700 directory must not run chmod"
+        );
         assert_eq!(stamp(), before, "an unchanged directory was written");
 
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        CHMOD_CALLS.with(|c| c.set(0));
         ensure_private_dir(&dir).unwrap();
-        assert_eq!(stamp().2, 0o700, "a drifted mode is hardened");
+        assert_eq!(
+            CHMOD_CALLS.with(std::cell::Cell::get),
+            1,
+            "a drifted mode triggers one chmod"
+        );
+        assert_eq!(stamp().4, 0o700, "a drifted mode is hardened");
 
-        let link = dir.with_extension("link");
-        let _ = std::fs::remove_file(&link);
+        let link = scratch.path().join("private.link");
         std::os::unix::fs::symlink(&dir, &link).unwrap();
         assert!(ensure_private_dir(&link).is_err(), "a symlink is refused");
-        let _ = std::fs::remove_file(&link);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     const OPEN_UMASK_ENV: &str = "ATUC_PRIVATEDIR_OPEN_UMASK_DIR";
     const OPEN_UMASK_PROBE: &str =
-        "privatedir::tests::probe_missing_ancestors_are_never_shared_whatever_the_umask";
+        "privatedir::tests::missing_ancestors_are_never_shared_whatever_the_umask";
 
-    #[test]
-    fn probe_missing_ancestors_are_never_shared_whatever_the_umask() {
+    fn probe_missing_ancestors_are_never_shared_whatever_the_umask_if_asked() -> bool {
         let Some(root) = std::env::var_os(OPEN_UMASK_ENV) else {
-            return;
+            return false;
         };
         let mode = |p: &Path| {
             format!(
@@ -163,10 +186,14 @@ mod tests {
             assert_eq!(mode(&leaf), "700", "the leaf under umask {umask:03o}");
         }
         assert_eq!(mode(&existing), "775", "an existing ancestor was rewritten");
+        true
     }
 
     #[test]
     fn missing_ancestors_are_never_shared_whatever_the_umask() {
+        if probe_missing_ancestors_are_never_shared_whatever_the_umask_if_asked() {
+            return;
+        }
         let scratch = aterm_tempfile::Builder::new()
             .prefix("atuc-open-umask-")
             .tempdir()

@@ -9,7 +9,8 @@ use aterm_json::Value;
 
 use crate::harness::accounts::Sample;
 use crate::harness::codex_rollout::{
-    Prefix, TurnReader, first_line, rollouts_by_write, stamp_ms, stream_lines, tail_after,
+    Conversation, META_BYTES, Prefix, Streamed, TurnReader, first_line_into, first_line_of,
+    rollouts_by_write, stamp_ms, stream_open_ends_ref, tail_after_file,
 };
 use crate::harness::profile::{AccountKey, Word};
 
@@ -197,34 +198,101 @@ pub fn opening_account(first_line: &str) -> Option<AccountKey> {
     )
 }
 
-/// Where the rollout at `path`'s own lines begin ([`TurnReader`]).
-fn copy_end(path: &Path, reach: u64) -> Option<u64> {
+/// Where the rollout in `file`'s own lines begin ([`TurnReader`]), plus its opening account when
+/// `with_account` is set.
+fn copy_end_and_account(
+    file: &std::fs::File,
+    reach: u64,
+    with_account: bool,
+    first: &mut Vec<u8>,
+) -> Option<(u64, Option<AccountKey>)> {
+    if reach >= META_BYTES && first_line_into(file, first) {
+        let body_len = first.len() - 1;
+        if body_len <= crate::harness::usage::MAX_LINE_BYTES
+            && let Ok(text) = std::str::from_utf8(&first[..body_len])
+        {
+            let account = if with_account {
+                opening_account(text)
+            } else {
+                None
+            };
+            let line1_end = first.len() as u64;
+            let mut reader = TurnReader::default();
+            let _ = reader.line(text);
+            if reader.prefix == Prefix::Own {
+                return Some((line1_end, account));
+            }
+            let mut own = None;
+            let read = stream_open_ends_ref(
+                file,
+                line1_end,
+                None,
+                reach - line1_end,
+                |start, _, line| {
+                    if let Streamed::Line(Some(text)) = line {
+                        let _ = reader.line(text);
+                    }
+                    if reader.prefix == Prefix::Own {
+                        own = Some(start);
+                        return std::ops::ControlFlow::Break(());
+                    }
+                    std::ops::ControlFlow::Continue(())
+                },
+            );
+            let own_from = own.or_else(|| read.complete.then_some(line1_end + read.read))?;
+            return Some((own_from, account));
+        }
+    }
     let mut reader = TurnReader::default();
     let mut own = None;
-    let read = stream_lines(path, reach, |start, text| {
-        if let Some(text) = text {
-            let _ = reader.line(text);
+    let mut line0_account = None;
+    let mut saw_invalid_line0 = false;
+    let read = stream_open_ends_ref(file, 0, None, reach, |start, _, line| {
+        if let Streamed::Line(text) = line {
+            if start == 0 && with_account {
+                match text {
+                    Some(t) => line0_account = opening_account(t),
+                    None => saw_invalid_line0 = true,
+                }
+            }
+            if let Some(text) = text {
+                let _ = reader.line(text);
+            }
         }
         if reader.prefix == Prefix::Own {
             own = Some(start);
             return std::ops::ControlFlow::Break(());
         }
         std::ops::ControlFlow::Continue(())
-    })?;
-    own.or_else(|| read.complete.then_some(read.read))
+    });
+    let own_from = own.or_else(|| read.complete.then_some(read.read))?;
+    if saw_invalid_line0 {
+        line0_account = first_line_of(file).as_deref().and_then(opening_account);
+    }
+    Some((own_from, line0_account))
 }
 
-/// The usage readings of the rollout at `path` ([`opening_account`]).
-#[must_use]
-pub fn rollout_readings(path: &Path, reach: u64) -> Option<Vec<CodexLimits>> {
-    let own_from = copy_end(path, reach)?;
-    let account = first_line(path).as_deref().and_then(opening_account);
-    let tail = tail_after(path, own_from, TAIL_BYTES)?;
+fn rollout_readings_inner(
+    path: &Path,
+    reach: u64,
+    with_account: bool,
+    scratch: &mut Vec<u8>,
+) -> Option<Vec<CodexLimits>> {
+    let mut file = crate::harness::footer::open_regular(path)?;
+    let (own_from, account) = copy_end_and_account(&file, reach, with_account, scratch)?;
+    let tail = tail_after_file(&mut file, own_from, TAIL_BYTES)?;
     let mut readings = rollout_rate_limits(&tail);
     for r in &mut readings {
         r.account = account;
     }
     Some(readings)
+}
+
+/// The usage readings of the rollout at `path` ([`opening_account`]).
+#[must_use]
+pub fn rollout_readings(path: &Path, reach: u64) -> Option<Vec<CodexLimits>> {
+    let mut scratch = Vec::with_capacity(8 * 1024);
+    rollout_readings_inner(path, reach, true, &mut scratch)
 }
 
 /// One window as [`pick`] read it.
@@ -325,10 +393,11 @@ pub fn pick(rollouts: &[Vec<CodexLimits>], family: &str, now_unix: i64) -> Optio
 /// written last ([`rollout_readings`], [`pick`]).
 #[must_use]
 pub fn home_pick(home: &Path, now_unix: i64) -> Option<Pick> {
+    let mut scratch = Vec::with_capacity(64 * 1024);
     let rollouts: Vec<Vec<CodexLimits>> = rollouts_by_write(home)
         .iter()
         .take(NEWEST_READ)
-        .filter_map(|(path, _)| rollout_readings(path, CONTEXT_REACH))
+        .filter_map(|(path, _)| rollout_readings_inner(path, CONTEXT_REACH, true, &mut scratch))
         .collect();
     pick(&rollouts, CODEX_FAMILY, now_unix)
 }
@@ -384,21 +453,46 @@ pub fn thread_sample(
     if !crate::harness::codex_rollout::is_thread_id(thread) {
         return None;
     }
-    let conv = crate::harness::codex_rollout::conversation_rollouts(home, thread);
-    let rollouts: Vec<Vec<CodexLimits>> = conv
-        .files
-        .iter()
+    let conv = crate::harness::codex_rollout::conversation_rollouts_for_sample(home, thread);
+    let mut scratch = Vec::with_capacity(64 * 1024);
+    let rollouts: Vec<Vec<CodexLimits>> = conversation_reads(&conv)
         .filter_map(|path| {
-            let mut readings = rollout_readings(path, CONTEXT_REACH)?;
+            let mut readings = rollout_readings_inner(path, CONTEXT_REACH, false, &mut scratch)?;
             readings.retain(|r| r.at_unix >= started_unix);
-            for r in &mut readings {
-                r.account = None;
-            }
             (!readings.is_empty()).then_some(readings)
         })
         .collect();
     let pick = pick(&rollouts, CODEX_FAMILY, now_unix)?;
     (now_unix.saturating_sub(pick.newest) <= FRESH_S).then(|| sample_of(&pick))
+}
+
+/// The rollouts of `conv` a usage reading is looked for in: its root rollouts, then the six
+/// (`NEWEST_READ`) of its subagent rollouts written last.
+fn conversation_reads(conv: &Conversation) -> impl Iterator<Item = &std::path::PathBuf> {
+    let root_count = conv.files.len().saturating_sub(conv.subagents);
+    let roots = &conv.files[..root_count];
+    let recent_subs = &conv.files[root_count + conv.subagents.saturating_sub(NEWEST_READ)..];
+    roots.iter().chain(recent_subs.iter())
+}
+
+/// The `codex` family's newest reading with a window in the rollouts of `conv` that
+/// [`thread_sample`] reads too ([`conversation_reads`]), picked alone at `now_unix` ([`pick`]),
+/// whatever its age: its windows as Codex last wrote them, a window whose reset has passed
+/// void.
+///
+/// THE NEWEST READING ALONE, never the largest share of several: the rollout of a conversation
+/// resumed on another login keeps the turns the earlier login read, and nothing in a rollout
+/// says which login wrote a reading, so a share of several could be the earlier login's. A
+/// fork's copied prefix is no reading of its own ([`rollout_readings`]).
+#[must_use]
+pub fn conversation_newest(conv: &Conversation, now_unix: i64) -> Option<Pick> {
+    let mut scratch = Vec::with_capacity(64 * 1024);
+    let newest = conversation_reads(conv)
+        .filter_map(|path| rollout_readings_inner(path, CONTEXT_REACH, false, &mut scratch))
+        .flatten()
+        .filter(|r| r.family.as_str() == CODEX_FAMILY && !r.windows.is_empty())
+        .max_by_key(|r| r.at_ms)?;
+    pick(&[vec![newest]], CODEX_FAMILY, now_unix)
 }
 
 #[cfg(test)]
@@ -1145,5 +1239,19 @@ mod tests {
             thread_sample(home.path(), "not-a-thread-id", started_unix, now_unix),
             None
         );
+
+        let escaped_sub = "01900000-0000-7000-8000-000000000009";
+        let escaped_root = format!("\\u0030{}", &ROOT[1..]);
+        std::fs::write(
+            day.join(format!("rollout-2026-10-16T09-30-00-{escaped_sub}.jsonl")),
+            format!(
+                "{{\"timestamp\":\"2026-08-01T17:36:00.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{escaped_sub}\",\"session_id\":\"{escaped_root}\",\"history_mode\":\"paginated\"}}}}\n{}",
+                rate(now_ms - 20_000, "codex", None, Some((42.0, 10_080, week)))
+            ),
+        )
+        .expect("write escaped sub");
+        let sample =
+            thread_sample(home.path(), ROOT, started_unix, now_unix).expect("escaped sub sample");
+        assert_eq!(sample.week_pct, Some(42));
     }
 }

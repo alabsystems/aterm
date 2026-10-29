@@ -84,8 +84,12 @@ pub fn is_valid_slug(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
+/// The value is the person's aterm.toml, so aterm.log keeps its length (DESIGN §3.6).
 fn warn_invalid(origin: &str, value: &str, default: &str) {
-    aterm_log::warn!("ignoring {origin} = {value:?}: not a valid GitHub name; using {default}");
+    aterm_log::warn!(
+        "ignoring {origin} ({}): not a valid GitHub name; using {default}",
+        aterm_log::words::Len(value)
+    );
 }
 
 #[cfg(test)]
@@ -145,6 +149,54 @@ mod tests {
         assert_eq!(
             pick_slug("[update] owner", Some("a b"), "default"),
             "default"
+        );
+    }
+
+    /// The `aterm_log` records (level and message) written on this thread while `body` runs.
+    fn logged_on_this_thread(body: impl FnOnce()) -> Vec<String> {
+        use std::cell::RefCell;
+        thread_local! {
+            static LINES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+        }
+        struct Capture;
+        impl aterm_log::Log for Capture {
+            fn enabled(&self, _: &aterm_log::Metadata) -> bool {
+                true
+            }
+            fn log(&self, record: &aterm_log::Record<'_>) {
+                LINES.with(|lines| {
+                    if let Some(lines) = lines.borrow_mut().as_mut() {
+                        lines.push(format!("{} {}", record.level(), record.args()));
+                    }
+                });
+            }
+            fn flush(&self) {}
+        }
+        static CAPTURE: Capture = Capture;
+        let _ = aterm_log::set_logger(&CAPTURE);
+        aterm_log::set_max_level(aterm_log::LevelFilter::Trace);
+        LINES.with(|lines| *lines.borrow_mut() = Some(Vec::new()));
+        body();
+        LINES.with(|lines| lines.borrow_mut().take().unwrap_or_default())
+    }
+
+    #[test]
+    fn an_invalid_slug_reaches_the_log_by_its_length() {
+        let logged = logged_on_this_thread(|| {
+            assert_eq!(
+                pick_slug("[update] owner", Some("QZP7E7K/x"), "default"),
+                "default"
+            );
+        });
+        assert!(
+            logged.iter().any(|line| line
+                == "WARN ignoring [update] owner (9B): not a valid GitHub name; using default"),
+            "the line is logged with the value's length: {} lines",
+            logged.len()
+        );
+        assert!(
+            !logged.iter().any(|line| line.contains("QZP7E7K")),
+            "the log keeps the configured value"
         );
     }
 

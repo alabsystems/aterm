@@ -7,7 +7,7 @@
 
 use aterm_lexicon::{Trick, TrickLexicon, TrickRole};
 
-use crate::allocations_during;
+use crate::{allocations_during, peak_bytes_during};
 
 /// The two lanes the English seed lacks: a marked surface (the marks-required gate walks the
 /// token) and a raw no-space-script run.
@@ -71,4 +71,23 @@ fn a_warmed_classify_is_allocation_free_on_every_lane() {
         }
     });
     assert_eq!(allocations, 0, "a warmed classify must not allocate");
+}
+
+/// Every launch compiles the embedded vocabulary (the config worker's `aterm-tricks-compile`
+/// thread), and what that heap peaks at stays dirty in the allocator's regions after it returns:
+/// a run-time TOML decode of the 360 KB file peaked near 7 MB (docs/measured/
+/// idle-memory-2026-10-27.md). Built from the rows the build decoded, it holds little more than
+/// the table it returns.
+#[test]
+fn compiling_the_embedded_vocabulary_peaks_under_2_mib() {
+    for langs in [&["en"][..], &["all"][..]] {
+        let peak = peak_bytes_during(|| {
+            drop(std::hint::black_box(TrickLexicon::with_languages(langs)));
+        });
+        eprintln!("with_languages({langs:?}) peaked at {peak} bytes");
+        assert!(
+            peak <= 2 << 20,
+            "with_languages({langs:?}) peaked at {peak} bytes"
+        );
+    }
 }

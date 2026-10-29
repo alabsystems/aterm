@@ -67,6 +67,7 @@ impl Owned {
             remove_env: &[],
             add_env: &[],
             stage_groups: None,
+            host: &super::tests::INERT,
         };
         let mut command = spawn_command(&command, env, Path::new("/usr/bin/taskpolicy"));
         command

@@ -216,6 +216,9 @@ fn stamps_round_trip_and_a_malformed_one_is_refused() {
     let sha = [0xabu8; 32];
     let s = stamp(4096, &sha, 777);
     assert_eq!(parse_stamp(&s), Some((4096, sha, 777)));
+    let zero = stamp(0, &sha, 0);
+    assert_eq!(parse_stamp(&zero), Some((0, sha, 0)));
+    let hex = aterm_codec::hex::encode_lower(&sha);
     for bad in [
         "",
         "4096",
@@ -223,6 +226,11 @@ fn stamps_round_trip_and_a_malformed_one_is_refused() {
         &s.replace("ab", "AB"),
         &format!("{s} extra"),
         &s.replacen(' ', "  ", 1),
+        &format!("+4096 {hex} 777"),
+        &format!("4096 {hex} +777"),
+        &format!("04096 {hex} 777"),
+        &format!("4096 {hex} 0777"),
+        &format!("00 {hex} 0"),
     ] {
         assert_eq!(parse_stamp(bad), None, "{bad:?}");
     }

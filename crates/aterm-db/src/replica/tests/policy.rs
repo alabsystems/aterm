@@ -287,6 +287,19 @@ fn scenario(policy: i64, receiving: bool, point: u8) -> [(i64, i64, i64); 3] {
     [first, retry, restored]
 }
 
+/// [`scenario`] once per fixture selection: Attempt, Retry and Restore read the three
+/// phases of one real run, so a selection runs once, not once per phase.
+fn scenario_once(policy: i64, receiving: bool, point: u8) -> [(i64, i64, i64); 3] {
+    type Runs = BTreeMap<(i64, bool, u8), [(i64, i64, i64); 3]>;
+    static RUNS: std::sync::Mutex<Runs> = std::sync::Mutex::new(BTreeMap::new());
+    let key = (policy, receiving, point);
+    if let Some(run) = RUNS.lock().unwrap().get(&key) {
+        return *run;
+    }
+    let run = scenario(policy, receiving, point);
+    *RUNS.lock().unwrap().entry(key).or_insert(run)
+}
+
 fn policy_transition(state: &aterm_spec::interp::State, action: &str) -> aterm_spec::interp::State {
     let mut next = state.clone();
     match action {
@@ -305,7 +318,7 @@ fn policy_transition(state: &aterm_spec::interp::State, action: &str) -> aterm_s
                 "Retry" => 1,
                 _ => 2,
             };
-            let (accepted, receipts, retained) = scenario(
+            let (accepted, receipts, retained) = scenario_once(
                 state["policy"],
                 state["receiving"] == 1,
                 state["point"] as u8,
@@ -328,7 +341,26 @@ fn policy_admission_conforms_and_stale_policy_and_false_receipts_are_detected() 
         aterm_spec::interp::fired_actions(&model).len(),
         model.actions.len()
     );
-    for state in aterm_spec::interp::reachable_states(&model) {
+    let states = aterm_spec::interp::reachable_states(&model);
+    // Every selection's real run, each on its own Lab, on every core.
+    let selections: Vec<_> = states
+        .iter()
+        .map(|state| {
+            (
+                state["policy"],
+                state["receiving"] == 1,
+                state["point"] as u8,
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    aterm_spec::check::each_on(
+        aterm_spec::fs_lane::PLACES,
+        &selections,
+        |&(policy, receiving, point)| scenario_once(policy, receiving, point),
+    );
+    for state in states {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
                 let next = policy_transition(&state, action.name);

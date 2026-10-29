@@ -442,6 +442,30 @@ impl Needle {
         f
     }
 
+    /// The frames this episode asks of a window after its first, to rest, in `view`: each a
+    /// `stats_needle` deadline (the first is drawn with the reading's own frame), walked from the
+    /// first a window that last drew the needle at `last` draws ([`Self::first`]). 0 where it
+    /// rests on its target at once (the first reading, the dead-band, no window animating a
+    /// dial). A reading that lands sooner cuts the episode short, and a window drawn late walks
+    /// over the frames it missed, so a window's needle deadlines in the episode are at most this
+    /// while its effect interval comes no shorter than `view`'s (a window moved to a faster
+    /// display mid-episode draws more).
+    pub(crate) fn frames_owed(&self, view: View, last: Option<(f64, f64)>) -> u64 {
+        let mut f = self.first(view, last);
+        let mut owed = 0;
+        for _ in 0..FRAMES_MAX {
+            let Some(at_ns) = self.next_ns(view, f) else {
+                break;
+            };
+            f = Frame {
+                at_ns,
+                k: self.k_at(view, at_ns, f.k),
+            };
+            owed += 1;
+        }
+        owed
+    }
+
     /// `view`'s last frame at or before `now`, walked from the retarget's own, in a window that
     /// drew nothing of the needle before (the tests' window; the app's follow what each drew).
     #[cfg(test)]

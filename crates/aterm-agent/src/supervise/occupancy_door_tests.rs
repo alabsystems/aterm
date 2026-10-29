@@ -1286,11 +1286,16 @@ fn a_tape_from_a_build_with_no_occupancy_door_replays_without_it() {
     };
     let is_said = |i: &Item| matches!(i.record(), Some(EffectRecord::Emit { door, .. }) if door == "host.occupancy_said");
     let is_book = |i: &Item| matches!(i.record(), Some(EffectRecord::Exchange { door, .. }) if door == "host.wakes");
+    // A build with no occupancy door had no reach peek either (a later door).
+    let is_peek = |i: &Item| matches!(i.record(), Some(EffectRecord::Exchange { door, .. }) if door == "host.reach_peek");
     let mut removed = vec![false; items.len()];
-    let (mut journals, mut ledgers, mut saids, mut books) = (0, 0, 0, 0);
+    let (mut journals, mut ledgers, mut saids, mut books, mut peeks) = (0, 0, 0, 0, 0);
     for (at, item) in items.iter().enumerate() {
         if is_board(item) {
             removed[at] = true;
+        } else if is_peek(item) {
+            removed[at] = true;
+            peeks += 1;
         } else if is_book(item) {
             removed[at] = true;
             books += 1;
@@ -1318,10 +1323,12 @@ fn a_tape_from_a_build_with_no_occupancy_door_replays_without_it() {
     assert_eq!(ledgers, 1, "the nudge's would row");
     assert!(saids >= 1, "the door told its host");
     assert!(books >= 1, "the loop read the book at the open hold");
+    assert!(peeks >= 1, "the loop peeked the reach");
     assert_eq!(
         removed.iter().filter(|gone| **gone).count(),
-        asks + books + saids + 2 * (journals + ledgers),
-        "only board exchanges, the book's reads, the host's tells and identified row/stamp pairs"
+        asks + books + saids + peeks + 2 * (journals + ledgers),
+        "only board exchanges, the book's reads, the host's tells, its reach peeks and identified \
+         row/stamp pairs"
     );
     let before_door: Vec<Item> = items
         .iter()
@@ -2074,5 +2081,89 @@ fn a_loop_that_unwinds_tells_its_host_no_hold() {
     assert!(
         kept.last().and_then(|s| s.hold).is_some(),
         "the open hold stays the host's last word: {kept:#?}"
+    );
+}
+
+/// A SLICE-1 TAPE WHOSE DOOR LEFT ITS LINE REPLAYS UNCHANGED (the 2.9b safety review's F1): a
+/// prompt hold door's line written and its Enter refused, recorded as a build before 2.9b booked
+/// it (`ReleaseOnLeft`: the account keeps nothing, `skipped why=not-submitted`), replays on this
+/// build from a header without slice 2's doors, since the account keeps nothing left where the
+/// recording's build had no left lines (`Fx::slice2_recorded`). CONTROL: the same slice-1 tape
+/// with the fault armed. NEGATIVE CONTROL: the recording under this build's own header, slice 2's
+/// doors in it, replayed unarmed keeps the line left and diverges at its row.
+#[test]
+fn a_slice_one_tape_whose_door_left_its_line_replays_unchanged() {
+    use crate::supervise::occupancy::fault::{self, Fault};
+    use crate::supervise::tape::recover::recover;
+    use crate::supervise::tape::replay::{Options, replay};
+    use crate::supervise::tape::report::Verdict;
+    use crate::supervise::tape::testing::written;
+
+    let (dir, ledger) = ledger_at("door-left-slice-one-tape");
+    let board = Board::reading(OccupancyReading::default());
+    let base = hosted(35 * 60);
+    let opts = SuperviseOpts {
+        policy: SupervisorConfig {
+            occupancy: Occupancy::Prompt,
+            continue_policy: false,
+            ..base.policy.clone()
+        },
+        idle_host: Some(Arc::clone(&board) as Arc<dyn IdleHost>),
+        ledger: Some(ledger.clone()),
+        journal: Some(dir.join("journal.jsonl")),
+        ..base
+    };
+    let mut m = Mock::new(vec![break_screen()]);
+    m.stall_sleep = Some(Duration::from_secs(60));
+    m.gen_fence = true;
+    m.sends_gen = true;
+    m.human_seq = Some(7);
+    m.human_ms = Some(60 * MIN.unsigned_abs());
+    m.help = "key [id=<key>] [if=<re>] [if-gen=<e.s>] [if-human=<n>] <name>: send a named \
+              key\nsend [id=<key>] [if=<re>] [if-gen=<e.s>] [if-human=<n>] <text>: write \
+              text\n"
+        .to_string();
+    m.key_replies
+        .push_back(ok("OK skipped reason=person seq=101\n"));
+    let run = fault::with(Fault::ReleaseOnLeft, || {
+        record_watch(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+        })
+    });
+    let body = std::fs::read_to_string(&ledger).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        body.contains("why=not-submitted") && !body.contains(" left"),
+        "the recording left its line, booked as a slice-1 build booked it: {body}"
+    );
+    let header = run.header.encode();
+    let items = recover(&run.tape.reframed(&header)).items;
+    let slice_one = slice_one_items(&items);
+    let older: String = header
+        .lines()
+        .map(|line| match line.strip_prefix("host_doors=") {
+            Some(doors) => {
+                let kept: Vec<&str> = doors
+                    .split(' ')
+                    .filter(|d| !SLICE2_DOORS.contains(d))
+                    .collect();
+                format!("host_doors={}\n", kept.join(" "))
+            }
+            None => format!("{line}\n"),
+        })
+        .collect();
+    assert_ne!(older, header, "the header named slice 2's doors");
+    let replayed = |header: &str, items: &[crate::supervise::tape::codec::Item]| {
+        replay(&written(header, items), &Options::default()).expect("replayed")
+    };
+    let control = fault::with(Fault::ReleaseOnLeft, || replayed(&older, &slice_one));
+    assert_eq!(control.verdict, Verdict::Reproduced, "{}", control.render());
+    let report = replayed(&older, &slice_one);
+    assert_eq!(report.verdict, Verdict::Reproduced, "{}", report.render());
+    let slice2 = replayed(&header, &items);
+    assert!(
+        matches!(slice2.verdict, Verdict::Diverged(_)),
+        "NEGATIVE CONTROL: a slice-2 recording keeps its line left: {}",
+        slice2.render()
     );
 }

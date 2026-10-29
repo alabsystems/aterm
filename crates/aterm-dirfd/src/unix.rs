@@ -201,10 +201,14 @@ flags! {
         RGRP = libc::S_IRGRP;
         /// `S_IWGRP` — 0o020.
         WGRP = libc::S_IWGRP;
+        /// `S_IXGRP` — 0o010.
+        XGRP = libc::S_IXGRP;
         /// `S_IROTH` — 0o004.
         ROTH = libc::S_IROTH;
         /// `S_IWOTH` — 0o002.
         WOTH = libc::S_IWOTH;
+        /// `S_IXOTH` — 0o001.
+        XOTH = libc::S_IXOTH;
     }
 }
 
@@ -256,6 +260,36 @@ pub struct Stat {
     pub st_mode: u32,
     /// Hard-link count.
     pub st_nlink: u64,
+    /// The owner's user id.
+    pub st_uid: u32,
+    /// The 512-byte blocks allocated to it: what its removal gives back once its last name goes.
+    pub st_blocks: u64,
+}
+
+impl Stat {
+    /// The fields read off a raw `struct stat`.
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "android"),
+        expect(
+            clippy::useless_conversion,
+            reason = "st_mode is u32 here and u16 on Apple"
+        )
+    )]
+    #[allow(
+        clippy::unnecessary_cast,
+        reason = "dev_t, ino_t and nlink_t differ in width by target (i32, u64 and u16 on Apple; \
+                  u64, u64 and u32 or u64 on Linux), so a cast one target needs is the same type on another"
+    )]
+    fn of(raw: &libc::stat) -> Self {
+        Self {
+            st_dev: raw.st_dev as u64,
+            st_ino: raw.st_ino as u64,
+            st_mode: u32::from(raw.st_mode),
+            st_nlink: raw.st_nlink as u64,
+            st_uid: raw.st_uid,
+            st_blocks: u64::try_from(raw.st_blocks).unwrap_or(0),
+        }
+    }
 }
 
 /// A file's type, extracted from its mode bits.
@@ -327,18 +361,49 @@ pub fn fstat<Fd: AsFd>(fd: Fd) -> Result<Stat> {
     let mut raw: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: `fd` is live and `raw` is a writable `struct stat`.
     check(unsafe { libc::fstat(fd.as_fd().as_raw_fd(), &raw mut raw) })?;
-    Ok(Stat {
-        st_dev: raw.st_dev as u64,
-        st_ino: raw.st_ino as u64,
-        #[cfg_attr(
-            any(target_os = "linux", target_os = "android"),
-            expect(
-                clippy::useless_conversion,
-                reason = "st_mode is u32 here and u16 on Apple"
+    Ok(Stat::of(&raw))
+}
+
+/// `fstatat(2)`: the entry `name` of the directory `dirfd`, a link at `name` read as itself under
+/// [`AtFlags::SYMLINK_NOFOLLOW`]. `name` is looked up in `dirfd` alone: no path above it is
+/// resolved again.
+///
+/// # Errors
+/// The raw `errno` from the syscall, or [`Errno::INVAL`] for an unusable name.
+pub fn fstatat<Fd: AsFd, P: Arg>(dirfd: Fd, name: P, flags: AtFlags) -> Result<Stat> {
+    name.with_c_str(|name| {
+        // SAFETY: `stat` is a plain C struct with no invalid bit patterns for the fields read, and `fstatat` fills it before it is read.
+        let mut raw: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: live descriptor, NUL-terminated name, writable `struct stat`.
+        check(unsafe {
+            libc::fstatat(
+                dirfd.as_fd().as_raw_fd(),
+                name.as_ptr(),
+                &raw mut raw,
+                flags.bits(),
             )
-        )]
-        st_mode: u32::from(raw.st_mode),
-        st_nlink: raw.st_nlink as u64,
+        })?;
+        Ok(Stat::of(&raw))
+    })
+}
+
+/// `fchmodat(2)`: set the permission bits of the entry `name` of the directory `dirfd`; under
+/// [`AtFlags::SYMLINK_NOFOLLOW`] a link at `name` is never followed (Linux refuses a link then,
+/// and needs `/proc` for anything else).
+///
+/// # Errors
+/// The raw `errno` from the syscall, or [`Errno::INVAL`] for an unusable name.
+pub fn fchmodat<Fd: AsFd, P: Arg>(dirfd: Fd, name: P, mode: Mode, flags: AtFlags) -> Result<()> {
+    name.with_c_str(|name| {
+        // SAFETY: live descriptor, NUL-terminated name.
+        check(unsafe {
+            libc::fchmodat(
+                dirfd.as_fd().as_raw_fd(),
+                name.as_ptr(),
+                mode.bits(),
+                flags.bits(),
+            )
+        })
     })
 }
 
@@ -510,11 +575,15 @@ impl DirEntry {
     }
 }
 
-/// A directory being read, over an independent open file description.
+/// A directory being read: over an independent open file description ([`Dir::read_from`]), or
+/// over the descriptor it was handed ([`Dir::new`]), which it then holds as its own ([`AsFd`]).
 pub struct Dir {
     dirp: *mut libc::DIR,
-    /// Latched by the first failed `readdir` so iteration ends there.
+    /// Latched by the first failed `readdir` so iteration ends there, until [`Dir::rewind`].
     errored: bool,
+    /// A stream over a directory already removed, sharing the caller's file offset: it yields
+    /// nothing, ever (a rewind would move the caller's offset).
+    gone: bool,
 }
 
 // SAFETY: this type owns its `DIR*` exclusively and closes it on drop, so it may
@@ -533,7 +602,7 @@ impl Dir {
         if status < 0 {
             return Err(Errno::last());
         }
-        let mut errored = false;
+        let mut gone = false;
         let owned = match openat(
             borrowed,
             ".",
@@ -542,9 +611,9 @@ impl Dir {
         ) {
             Ok(owned) => owned,
             Err(Errno::NOENT) => {
-                errored = true;
+                gone = true;
                 // SAFETY: `borrowed` is live; F_DUPFD_CLOEXEC returns a new
-                // descriptor. Sharing the offset is harmless because `errored`
+                // descriptor. Sharing the offset is harmless because `gone`
                 // makes the stream yield nothing.
                 let dup = unsafe { libc::fcntl(borrowed.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
                 if dup < 0 {
@@ -565,7 +634,54 @@ impl Dir {
             unsafe { libc::close(raw) };
             return Err(err);
         }
-        Ok(Self { dirp, errored })
+        Ok(Self {
+            dirp,
+            errored: false,
+            gone,
+        })
+    }
+
+    /// A directory stream over `fd` itself, which it takes (`fdopendir`): one descriptor for the
+    /// directory and its listing, as `std::fs::remove_dir_all` holds one per level. The
+    /// descriptor stays the stream's to use for `*at` calls, `fstat`, `fchmod` and the like
+    /// ([`AsFd`]); its file offset is the stream's, so nothing else reads through it.
+    ///
+    /// # Errors
+    /// The raw `errno` from `fdopendir` (`fd` is closed then).
+    pub fn new(fd: OwnedFd) -> Result<Self> {
+        let raw = fd.into_raw_fd();
+        // SAFETY: `raw` is a live descriptor this function owns; on success `fdopendir` takes
+        // ownership of it.
+        let dirp = unsafe { libc::fdopendir(raw) };
+        if dirp.is_null() {
+            let err = Errno::last();
+            // SAFETY: `raw` is a live descriptor this function still owns.
+            unsafe { libc::close(raw) };
+            return Err(err);
+        }
+        Ok(Self {
+            dirp,
+            errored: false,
+            gone: false,
+        })
+    }
+
+    /// Back to the directory's first entry (`rewinddir`), so a directory emptied as it was read
+    /// is read again whole; a failed read no longer ends the stream.
+    pub fn rewind(&mut self) {
+        // SAFETY: `self.dirp` is a live stream owned by this value.
+        unsafe { libc::rewinddir(self.dirp) };
+        self.errored = false;
+    }
+}
+
+impl AsFd for Dir {
+    /// The descriptor the stream reads through, open until the stream is dropped.
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: `self.dirp` is a live stream owned by this value, so `dirfd` names the
+        // descriptor it holds open until `closedir` in `drop`, which the borrow of `self` the
+        // returned value carries cannot outlive.
+        unsafe { BorrowedFd::borrow_raw(libc::dirfd(self.dirp)) }
     }
 }
 
@@ -604,7 +720,7 @@ impl Iterator for Dir {
     type Item = Result<DirEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.errored {
+        if self.errored || self.gone {
             return None;
         }
         let slot = errno_slot();
@@ -616,6 +732,10 @@ impl Iterator for Dir {
         let entry = unsafe { readdir_ffi(self.dirp) };
         if entry.is_null() {
             let err = Errno::last();
+            if err.is_noent() {
+                self.errored = true;
+                return None;
+            }
             return if slot.is_none() || err.0 == 0 {
                 None
             } else {

@@ -12,8 +12,14 @@ use super::transcript;
 use super::usage::{Seen, SeenIds, TokenUsage};
 use crate::supervise::run::wall_confirm::{self, Class, Entry, Row, TranscriptEnd};
 
-/// The Claude Code builds whose transcript rows the lab read, each with its key-only reduction committed.
-pub const MEASURED_BUILDS: &[&str] = &["2.1.303"];
+/// The Claude Code builds whose transcripts the lab measured and reduced (`harness/testdata/steps/<build>.jsonl`):
+/// exactly the builds those reductions' own `# claude <build>` lines name, read by `build.rs` from the files the
+/// checkout holds, as [`super::codex_steps::CODEX_MEASURED_BUILDS`] is. A release builds from a clean clone, so there
+/// a build is listed when its reduction is committed (`lab claude-measure`) and by nothing else; in a working tree an
+/// uncommitted reduction counts too, which is why `lab claude-measure` refuses one HEAD does not hold. Sorted, matched
+/// whole (ruling T8), each named as its transcript rows name it (`version`).
+pub const MEASURED_BUILDS: &[&str] =
+    include!(concat!(env!("OUT_DIR"), "/claude_measured_builds.rs"));
 
 /// The most steps the fold holds between two takes; past it the oldest is dropped and counted.
 pub const STEP_QUEUE: usize = 1024;
@@ -73,6 +79,21 @@ const KEY_META: &str = aterm_phase::anchor!("transcript.isMeta");
 const KEY_PROMPT_ID: &str = aterm_phase::anchor!("transcript.promptId");
 const KEY_PARENT: &str = aterm_phase::anchor!("transcript.parentUuid");
 const KEY_LOCAL_COMMAND: &str = aterm_phase::anchor!("transcript.local_command");
+const KEY_VERSION: &str = aterm_phase::anchor!("transcript.version");
+const KEY_TIMESTAMP: &str = aterm_phase::anchor!("transcript.timestamp");
+const KEY_TYPE: &str = aterm_phase::anchor!("transcript.type");
+const KEY_SUBTYPE: &str = aterm_phase::anchor!("transcript.subtype");
+const KEY_MESSAGE: &str = aterm_phase::anchor!("transcript.message");
+const KEY_MODEL: &str = aterm_phase::anchor!("transcript.model");
+const KEY_USAGE: &str = aterm_phase::anchor!("transcript.usage");
+const KEY_ID: &str = aterm_phase::anchor!("transcript.id");
+const KEY_EFFORT: &str = aterm_phase::anchor!("transcript.effort");
+const KEY_CONTENT: &str = aterm_phase::anchor!("transcript.content");
+const KEY_TEXT: &str = aterm_phase::anchor!("transcript.text");
+const KEY_NAME: &str = aterm_phase::anchor!("transcript.name");
+const KEY_ORIGIN: &str = aterm_phase::anchor!("transcript.origin");
+const KEY_KIND: &str = aterm_phase::anchor!("transcript.kind");
+const KEY_UUID: &str = aterm_phase::anchor!("transcript.uuid");
 
 /// An id as the session log takes one (`aterm_slog::ShortId`'s rule).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -207,7 +228,8 @@ pub struct StepMark {
 pub enum StepState {
     /// A build [`MEASURED_BUILDS`] names: exact.
     On,
-    /// Any other: strong, additive only.
+    /// Any other: strong; it adds, opens the turn the screen missed and ends or supersedes only
+    /// its own, and never overrules the screen (fix E1).
     Partial,
 }
 
@@ -561,16 +583,26 @@ impl Lead {
     }
 }
 
+/// Where the value of the first `"<key>":` in `s` starts.
+fn past_key(s: &str, key: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(at) = s[from..].find(key) {
+        let (start, end) = (from + at, from + at + key.len());
+        if start > 0 && s.as_bytes()[start - 1] == b'"' && s[end..].starts_with("\":") {
+            return Some(end + 2);
+        }
+        from = end;
+    }
+    None
+}
+
 fn lead(line: &str) -> Option<Lead> {
-    let m = line.find("\"message\":")?;
-    let rest = &line[m..];
-    let c = rest.find("\"content\":")?;
-    let after = rest[c + "\"content\":".len()..].trim_start();
+    let rest = &line[past_key(line, KEY_MESSAGE)?..];
+    let after = rest[past_key(rest, KEY_CONTENT)?..].trim_start();
     let (string, body) = if let Some(s) = after.strip_prefix('"') {
         (true, s)
     } else if after.starts_with('[') {
-        let t = after.find("\"text\":")?;
-        let s = after[t + "\"text\":".len()..]
+        let s = after[past_key(after, KEY_TEXT)?..]
             .trim_start()
             .strip_prefix('"')?;
         (false, s)
@@ -758,7 +790,7 @@ enum Ask {
 }
 
 fn vref_of(obj: &Map) -> Option<StepId> {
-    [KEY_PROMPT_ID, "uuid"]
+    [KEY_PROMPT_ID, KEY_UUID]
         .iter()
         .find_map(|k| obj.get(*k).and_then(Value::as_str).and_then(StepId::new))
 }
@@ -992,20 +1024,20 @@ impl StepFold {
             return;
         }
         if let Some(v) = obj
-            .get("version")
+            .get(KEY_VERSION)
             .and_then(Value::as_str)
             .and_then(StepId::new)
         {
             self.version = Some(v);
         }
         let at_ms = obj
-            .get("timestamp")
+            .get(KEY_TIMESTAMP)
             .and_then(Value::as_str)
             .and_then(stamp_ms);
         let opens = obj.get(KEY_PARENT).is_some_and(Value::is_null);
         let mut out: Vec<StepEvent> = Vec::new();
         let mut bad = false;
-        let kind = obj.get("type").and_then(Value::as_str);
+        let kind = obj.get(KEY_TYPE).and_then(Value::as_str);
         let unasked = kind == Some("assistant")
             && self.end.end.last == EndClass::Nothing
             && self.pending.is_none()
@@ -1118,8 +1150,8 @@ impl StepFold {
 
     fn ran(&mut self, obj: &Map) -> Option<(StepId, Option<u64>)> {
         let model = obj
-            .get("message")
-            .and_then(|m| m.get("model"))
+            .get(KEY_MESSAGE)
+            .and_then(|m| m.get(KEY_MODEL))
             .and_then(Value::as_str)
             .is_some_and(super::upgrade::is_model_id);
         if !model {
@@ -1190,14 +1222,14 @@ impl StepFold {
         out: &mut Vec<StepEvent>,
         bad: &mut bool,
     ) -> EndRow {
-        let message = obj.get("message").and_then(Value::as_object);
+        let message = obj.get(KEY_MESSAGE).and_then(Value::as_object);
         if let Some(usage) = message
-            .and_then(|m| m.get("usage"))
+            .and_then(|m| m.get(KEY_USAGE))
             .and_then(Value::as_object)
             .and_then(TokenUsage::from_object)
         {
             let id = message
-                .and_then(|m| m.get("id"))
+                .and_then(|m| m.get(KEY_ID))
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty());
             self.turn.note(id, usage);
@@ -1206,13 +1238,13 @@ impl StepFold {
             return EndRow::Entry(EndClass::Notice, Some(notice_of(line)));
         }
         if let Some(model) = message
-            .and_then(|m| m.get("model"))
+            .and_then(|m| m.get(KEY_MODEL))
             .and_then(Value::as_str)
             .filter(|m| live && super::upgrade::is_model_id(m))
             .and_then(StepId::new)
         {
             let effort = obj
-                .get("effort")
+                .get(KEY_EFFORT)
                 .and_then(Value::as_str)
                 .and_then(StepId::new);
             if self.model != Some((model, effort)) {
@@ -1226,10 +1258,10 @@ impl StepFold {
         }
         out.reserve(parts(message).count());
         for part in parts(message) {
-            if part.get("type").and_then(Value::as_str) != Some(KEY_TOOL_USE) {
+            if part.get(KEY_TYPE).and_then(Value::as_str) != Some(KEY_TOOL_USE) {
                 continue;
             }
-            let Some(id) = part.get("id").and_then(Value::as_str) else {
+            let Some(id) = part.get(KEY_ID).and_then(Value::as_str) else {
                 *bad = true;
                 continue;
             };
@@ -1237,7 +1269,7 @@ impl StepFold {
                 self.lost = self.lost.saturating_add(1);
                 continue;
             };
-            let name = part.get("name").and_then(Value::as_str).unwrap_or("");
+            let name = part.get(KEY_NAME).and_then(Value::as_str).unwrap_or("");
             let (cls, subagent) = tool_class(name);
             out.push(StepEvent::ToolUse {
                 id,
@@ -1259,8 +1291,8 @@ impl StepFold {
         bad: &mut bool,
     ) -> (EndRow, Option<StepId>) {
         let someone = obj
-            .get("origin")
-            .and_then(|o| o.get("kind"))
+            .get(KEY_ORIGIN)
+            .and_then(|o| o.get(KEY_KIND))
             .and_then(Value::as_str)
             .is_some_and(|k| !matches!(k, "human" | "task-notification" | "auto-continuation"));
         let meta = flag(obj, KEY_META);
@@ -1296,10 +1328,10 @@ impl StepFold {
             }
             return (EndRow::None, None);
         }
-        let message = obj.get("message").and_then(Value::as_object);
+        let message = obj.get(KEY_MESSAGE).and_then(Value::as_object);
         let mut results = false;
         for part in parts(message) {
-            if part.get("type").and_then(Value::as_str) != Some(KEY_TOOL_RESULT) {
+            if part.get(KEY_TYPE).and_then(Value::as_str) != Some(KEY_TOOL_RESULT) {
                 continue;
             }
             results = true;
@@ -1331,8 +1363,8 @@ impl StepFold {
             return (EndRow::None, None);
         }
         let asks = obj
-            .get("origin")
-            .and_then(|o| o.get("kind"))
+            .get(KEY_ORIGIN)
+            .and_then(|o| o.get(KEY_KIND))
             .and_then(Value::as_str)
             != Some("task-notification");
         let ask = match lead {
@@ -1367,7 +1399,7 @@ impl StepFold {
     }
 
     fn system(&mut self, obj: &Map, out: &mut Vec<StepEvent>, bad: &mut bool) -> EndRow {
-        match obj.get("subtype").and_then(Value::as_str) {
+        match obj.get(KEY_SUBTYPE).and_then(Value::as_str) {
             Some(KEY_TURN_DURATION) => {
                 match number(obj.get(KEY_DURATION_MS)) {
                     Some(vdur_ms) => out.push(StepEvent::TurnEnd {
@@ -1387,7 +1419,7 @@ impl StepFold {
                 // A local command's output in the newer shape: the command
                 // before it started no turn (`upgrade.rs`'s `TaskScan`).
                 if obj
-                    .get("content")
+                    .get(KEY_CONTENT)
                     .and_then(Value::as_str)
                     .is_some_and(|t| t.trim_start().starts_with(LOCAL_OUTPUT))
                 {
@@ -1410,7 +1442,7 @@ pub(super) fn state_for(measured: &[&str], version: Option<&str>) -> StepState {
 
 fn parts(message: Option<&Map>) -> impl Iterator<Item = &Map> {
     message
-        .and_then(|m| m.get("content"))
+        .and_then(|m| m.get(KEY_CONTENT))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()

@@ -39,6 +39,7 @@ mod shown_term;
 mod slog_inert;
 mod stock_label;
 mod term_write;
+mod win_resources;
 
 /// One violation: where, which rule, and what the rule saw there.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,6 +114,7 @@ pub const GUARDS: &[Rule] = &[
     closure_anchor::CLOSURE_ANCHOR,
     rules::LICENCE_HEADER,
     generated::GENERATED_SEAL,
+    win_resources::WIN_RESOURCES,
 ];
 
 /// The guards' outcome over one tree.
@@ -281,6 +283,9 @@ pub(crate) struct Corpus {
     pub(crate) scripts: Vec<Script>,
     /// Every file of the checkout, root-relative ([`walk`]).
     pub(crate) paths: Vec<String>,
+    /// Every Cargo manifest under [`CORPUS_DIRS`] ([`is_manifest`]), root-relative, with its
+    /// text.
+    pub(crate) manifests: Vec<(String, String)>,
 }
 
 /// The directories whose `.rs` files make the corpus.
@@ -288,7 +293,8 @@ const CORPUS_DIRS: &[&str] = &["crates", "apps"];
 
 impl Corpus {
     /// Every `.rs` under [`CORPUS_DIRS`] at `root` (`target/` and dot directories skipped), in
-    /// path order; then every file of the checkout, and the scripts among them.
+    /// path order; then every file of the checkout, the scripts among them, and the manifests
+    /// among them under [`CORPUS_DIRS`].
     pub(crate) fn read(root: &Path) -> Result<Self, String> {
         let mut paths = Vec::new();
         for dir in CORPUS_DIRS {
@@ -311,23 +317,32 @@ impl Corpus {
         walk(root, "", &Ignored::read(root), &mut paths)?;
         paths.sort();
         let mut scripts = Vec::new();
+        let mut manifests = Vec::new();
         for rel in paths.iter().filter(|rel| !in_dot_dir(rel)) {
             if let Some(script) = Script::read(root, rel)? {
                 scripts.push(script);
+            }
+            if is_manifest(rel) {
+                let text = std::fs::read_to_string(root.join(rel))
+                    .map_err(|e| format!("cannot read {rel}: {e}"))?;
+                manifests.push((rel.clone(), text));
             }
         }
         Ok(Self {
             files,
             scripts,
             paths,
+            manifests,
         })
     }
 
-    /// A corpus of the given `(path, contents)` files, for tests: the `.rs` ones as source, the
-    /// rest as scripts.
+    /// A corpus of the given `(path, contents)` files, for tests: the `.rs` ones as source, each
+    /// [`is_manifest`] one as a manifest, the rest as scripts.
     #[cfg(test)]
     pub(crate) fn of(files: &[(&str, &str)]) -> Self {
         let (rs, other): (Vec<_>, Vec<_>) = files.iter().partition(|(rel, _)| rel.ends_with(".rs"));
+        let (manifests, other): (Vec<_>, Vec<_>) =
+            other.into_iter().partition(|(rel, _)| is_manifest(rel));
         Self {
             files: rs
                 .iter()
@@ -341,6 +356,10 @@ impl Corpus {
                 })
                 .collect(),
             paths: files.iter().map(|(rel, _)| (*rel).to_string()).collect(),
+            manifests: manifests
+                .iter()
+                .map(|(rel, text)| ((*rel).to_string(), (*text).to_string()))
+                .collect(),
         }
     }
 
@@ -443,6 +462,14 @@ fn skipped_dir(name: &str) -> bool {
         || name.starts_with("target-")
         || name.starts_with("target.")
         || name == "node_modules"
+}
+
+/// Is `rel` a Cargo manifest under [`CORPUS_DIRS`]?
+fn is_manifest(rel: &str) -> bool {
+    rel.ends_with("/Cargo.toml")
+        && CORPUS_DIRS
+            .iter()
+            .any(|dir| rel.strip_prefix(dir).is_some_and(|r| r.starts_with('/')))
 }
 
 /// Is `rel` under a dot directory (`.cargo/…`, `crates/<name>/.scratch/…`)?
@@ -791,20 +818,6 @@ impl SourceFile {
             detail,
         }
     }
-}
-
-/// The name an out-of-line module declaration (`pub(crate) mod x;`) declares.
-fn mod_decl(code: &str) -> Option<&str> {
-    let mut rest = code.trim();
-    if let Some(vis) = rest.strip_prefix("pub") {
-        rest = vis.trim_start();
-        if rest.starts_with('(') {
-            rest = rest[rest.find(')')? + 1..].trim_start();
-        }
-    }
-    let rest = rest.strip_prefix("mod ")?.trim_start();
-    let end = rest.bytes().position(|b| !is_word(b)).unwrap_or(rest.len());
-    (end > 0 && rest[end..].trim() == ";").then(|| &rest[..end])
 }
 
 /// The path the attributes of the item whose keyword is at `at` name, if

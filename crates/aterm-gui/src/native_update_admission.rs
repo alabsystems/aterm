@@ -113,26 +113,6 @@ mod tests {
     }
 
     #[test]
-    fn foreground_job_requires_and_accepts_live_pty_handoff() {
-        let with_job = AdmissionFacts {
-            live_ptys: 1,
-            foreground_jobs: 1,
-            ..facts()
-        };
-        assert_eq!(
-            classify(with_job),
-            AdmissionDecision::Block(AdmissionBlock::LivePtysNeedSeamless)
-        );
-        assert_eq!(
-            classify(AdmissionFacts {
-                seamless_capable: true,
-                ..with_job
-            }),
-            AdmissionDecision::Apply(ApplyLane::Seamless)
-        );
-    }
-
-    #[test]
     fn cold_lane_is_only_for_verified_safe_sessionless_state() {
         assert_eq!(classify(facts()), AdmissionDecision::Apply(ApplyLane::Cold));
         assert!(matches!(

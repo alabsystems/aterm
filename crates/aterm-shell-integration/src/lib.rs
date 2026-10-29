@@ -355,6 +355,18 @@ pub const fn has_rekey_hook(shell: ShellType) -> bool {
     matches!(shell, ShellType::Zsh | ShellType::Bash | ShellType::Fish)
 }
 
+/// Whether `shell`'s script reads the default-editor hint (`ATERM_DEFAULT_EDITOR`) once the
+/// person's startup files have run, exporting `EDITOR` from it only when `EDITOR` and `VISUAL`
+/// are both still empty (`__aterm_default_editor`; PowerShell after its profiles).
+#[must_use]
+#[inline]
+pub const fn reads_default_editor_hint(shell: ShellType) -> bool {
+    matches!(
+        shell,
+        ShellType::Zsh | ShellType::Bash | ShellType::Fish | ShellType::PowerShell
+    )
+}
+
 /// Subdirectory under the host's control dir holding warm-spare hold FIFOs (`<control dir>/spare/<sid>`, derived by the shell from [`REKEY_PATH_VAR`]).
 pub const SPARE_DIR: &str = "spare";
 
@@ -509,8 +521,14 @@ fn prepare_cached(
     root: PathBuf,
     written: &Mutex<Option<PathBuf>>,
 ) -> Result<Option<InjectionEnv>, std::io::Error> {
-    let base = ensure_cached(root, written)?;
-    Ok(injection_for(shell, &base))
+    match shell {
+        ShellType::Unknown => Ok(None),
+        ShellType::Cmd => Ok(Some(prepare_cmd())),
+        _ => {
+            let base = ensure_cached(root, written)?;
+            Ok(injection_for(shell, &base))
+        }
+    }
 }
 
 /// Install this build's folder under `root` unless `written` already records it
@@ -759,11 +777,14 @@ fn collect_old_script_sets(root: &Path, now: std::time::SystemTime) {
 
 /// Prepare shell integration into an explicit `base` directory without memoization.
 pub fn prepare_into(shell: ShellType, base: &Path) -> Result<Option<InjectionEnv>, std::io::Error> {
-    if shell == ShellType::Unknown {
-        return Ok(None);
+    match shell {
+        ShellType::Unknown => Ok(None),
+        ShellType::Cmd => Ok(Some(prepare_cmd())),
+        _ => {
+            ensure_scripts(base)?;
+            Ok(injection_for(shell, base))
+        }
     }
-    ensure_scripts(base)?;
-    Ok(injection_for(shell, base))
 }
 
 fn injection_for(shell: ShellType, base: &Path) -> Option<InjectionEnv> {
@@ -820,12 +841,12 @@ fn write_script(path: &Path, contents: &str) -> Result<(), std::io::Error> {
     file.write_all(contents.as_bytes())
 }
 
-/// Normalize CRLF to LF for POSIX shell scripts (borrowing when no `\r` is present)
-/// in case the build checkout had `core.autocrlf=true`.
+/// Normalize CRLF and lone CR line endings to LF for POSIX shell scripts (borrowing when no `\r` is present)
+/// in case the build checkout had `core.autocrlf=true` or CR-only line endings.
 #[inline]
 fn lf_only(contents: &str) -> std::borrow::Cow<'_, str> {
     if contents.contains('\r') {
-        std::borrow::Cow::Owned(contents.replace("\r\n", "\n"))
+        std::borrow::Cow::Owned(contents.replace("\r\n", "\n").replace('\r', "\n"))
     } else {
         std::borrow::Cow::Borrowed(contents)
     }
@@ -1222,9 +1243,12 @@ const CMD_PROMPT_TITLE: &str = "$e]0;$P$e\\";
 const CMD_PROMPT_MODES: &str = "$e[?2004l$e[?2048l";
 
 fn prepare_cmd() -> InjectionEnv {
-    let inherited = std::env::var("PROMPT").ok();
+    prepare_cmd_with_prompt(std::env::var("PROMPT").ok().as_deref())
+}
+
+fn prepare_cmd_with_prompt(inherited: Option<&str>) -> InjectionEnv {
     InjectionEnv {
-        env_add: vec![("PROMPT".to_string(), cmd_prompt(inherited.as_deref()))],
+        env_add: vec![("PROMPT".to_string(), cmd_prompt(inherited))],
         argv_override: None,
     }
 }
@@ -1252,4 +1276,6 @@ mod tests {
     include!("tests_spare.rs");
     include!("tests_pwsh_keys.rs");
     include!("tests_windows_marks.rs");
+    include!("tests_hooks.rs");
+    include!("tests_editor.rs");
 }

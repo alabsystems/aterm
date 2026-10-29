@@ -215,6 +215,38 @@ fn verdict_url(url: &str) -> String {
     }
 }
 
+/// `<url>/records`, the grow-only membership-record endpoint ([`fetch_records`], [`post_records`]).
+fn records_url(url: &str) -> String {
+    let url = base(url);
+    match url.split_once('?') {
+        Some((path, query)) => format!("{path}/records?{query}"),
+        None => format!("{url}/records"),
+    }
+}
+
+/// `<url>/records?have=<frontier>`, naming record digests in lowercase hex: as many of `have`, in
+/// its order ([`crate::membership_log::Store::have`] lists the deepest head first, each head with
+/// a few of its ancestors), as keep the URL within what `aterm-http` sends
+/// ([`aterm_http::uri::MAX_URI_LEN`]). A server answers the records past the ids named that it
+/// holds, a superset of those past every head, and the puller drops the ones it holds, so a
+/// frontier forked past that room (a seated key's records at sequence one, each a head) still
+/// pulls.
+fn records_have_url(url: &str, have: &[crate::membership_log::RecordId]) -> String {
+    let mut target = with_query(&records_url(url), "have=");
+    let start = target.len();
+    for id in have {
+        let comma = usize::from(target.len() > start);
+        if target.len() + comma + 2 * id.len() > aterm_http::uri::MAX_URI_LEN {
+            break;
+        }
+        if comma == 1 {
+            target.push(',');
+        }
+        target.push_str(&aterm_codec::hex::encode_lower(id));
+    }
+    target
+}
+
 /// How human-readable output names a URL: scheme, host and path.
 pub fn describe(url: &str) -> String {
     match Uri::parse(base(url)) {
@@ -276,7 +308,7 @@ fn client(timeout: Duration) -> Client {
 }
 
 /// aterm-http's own connector, which also keeps where a connect found no route to a LAN
-/// address ([`local_network_gate`]) in the error it returns ([`NoRoute`]), for
+/// address ([`no_route_on_the_lan`]) in the error it returns ([`NoRoute`]), for
 /// [`transport_error`] to tell.
 #[derive(Debug)]
 struct LanNoting;
@@ -291,11 +323,11 @@ impl aterm_http::Connect for LanNoting {
         let mut last = None;
         aterm_http::TcpConnector
             .connect_noting(host, port, deadline, &mut |addr, error| {
-                last = local_network_gate(addr.ip(), error).then_some(addr);
+                last = no_route_on_the_lan(addr.ip(), error).then_some(addr);
             })
             .map_err(|error| match last {
                 // The error is that connect's own, not a deadline spent after it.
-                Some(addr) if local_network_gate(addr.ip(), &error) => {
+                Some(addr) if no_route_on_the_lan(addr.ip(), &error) => {
                     std::io::Error::new(error.kind(), NoRoute { addr, error })
                 }
                 _ => error,
@@ -322,11 +354,11 @@ impl std::error::Error for NoRoute {
     }
 }
 
-/// Whether a connect to `ip` that failed with `error` is what macOS's Local Network gate
-/// answers aterm: no route (`EHOSTUNREACH`, `ENETUNREACH`) to a private or link-local
-/// address (IPv4 RFC 1918 or 169.254/16, IPv6 unique local or link-local, either one mapped).
-/// A LAN host that is down answers the same.
-fn local_network_gate(ip: IpAddr, error: &std::io::Error) -> bool {
+/// Whether a connect to `ip` that failed with `error` found no route (`EHOSTUNREACH`,
+/// `ENETUNREACH`) to a private or link-local address (IPv4 RFC 1918 or 169.254/16, IPv6 unique
+/// local or link-local, either one mapped): what macOS's Local Network gate answers aterm, and
+/// what a LAN host that is down, or a LAN this Mac has left, answers too ([`LanGate`]).
+fn no_route_on_the_lan(ip: IpAddr, error: &std::io::Error) -> bool {
     use std::io::ErrorKind::{HostUnreachable, NetworkUnreachable};
     let lan = match ip.to_canonical() {
         IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
@@ -335,17 +367,58 @@ fn local_network_gate(ip: IpAddr, error: &std::io::Error) -> bool {
     lan && matches!(error.kind(), HostUnreachable | NetworkUnreachable)
 }
 
-/// A failure to talk to the server. On macOS, no route to a LAN address is
-/// [`ErrorKind::LocalNetworkPending`], and says where the gate is; a request past its deadline
-/// is [`ErrorKind::TimedOut`].
-fn transport_error(what: &str, url: &str, error: &aterm_http::Error) -> Error {
-    transport_error_on(what, url, error, cfg!(target_os = "macos"))
+/// Where this process reads whether macOS's Local Network switch is known on for aterm
+/// ([`set_local_network_granted`]); unset, it is not known.
+static LOCAL_NETWORK_GRANTED: std::sync::OnceLock<fn() -> bool> = std::sync::OnceLock::new();
+
+/// Read whether macOS's Local Network switch is known on for aterm from `granted` (a look that
+/// reached the LAN heard it on, which System State keeps): once it is, no route to a LAN address
+/// is a vault host that did not answer, not the gate ([`LanGate`]). The first call wins.
+pub fn set_local_network_granted(granted: fn() -> bool) {
+    let _ = LOCAL_NETWORK_GRANTED.set(granted);
 }
 
-/// [`transport_error`] on macOS (`macos`) or elsewhere. Only macOS gates the local network: on
-/// Linux, no route to a LAN address is a host that does not answer (EHOSTUNREACH once its ARP
-/// goes unanswered), any other error, which backs off as one.
-fn transport_error_on(what: &str, url: &str, error: &aterm_http::Error, macos: bool) -> Error {
+/// What no route to a LAN address says here (docs/DESIGN-fluid-swarm-2026-10-28.md F4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LanGate {
+    /// Nothing gates the local network (not macOS): a host that does not answer (EHOSTUNREACH
+    /// once its ARP goes unanswered), any other error, which backs off as one.
+    None,
+    /// macOS's Local Network switch is not known on for aterm: the gate, most likely
+    /// ([`ErrorKind::LocalNetworkPending`]).
+    Unknown,
+    /// The switch is known on: the vault host did not answer (it is down, or this Mac is on
+    /// another network), any other error, which blames no setting.
+    Granted,
+}
+
+/// [`LanGate`] on macOS (`macos`) or elsewhere, `granted` read only on macOS.
+fn lan_gate(macos: bool, granted: impl FnOnce() -> bool) -> LanGate {
+    match (macos, macos && granted()) {
+        (false, _) => LanGate::None,
+        (true, false) => LanGate::Unknown,
+        (true, true) => LanGate::Granted,
+    }
+}
+
+/// A failure to talk to the server. On macOS, no route to a LAN address is
+/// [`ErrorKind::LocalNetworkPending`] and says where the gate is, until the Local Network switch
+/// is known on ([`LanGate`]); a request past its deadline is [`ErrorKind::TimedOut`].
+fn transport_error(what: &str, url: &str, error: &aterm_http::Error) -> Error {
+    transport_error_on(what, url, error, &|| {
+        lan_gate(cfg!(target_os = "macos"), || {
+            LOCAL_NETWORK_GRANTED.get().is_some_and(|granted| granted())
+        })
+    })
+}
+
+/// [`transport_error`], `gate` (read only for no route to a LAN address) saying what that is.
+fn transport_error_on(
+    what: &str,
+    url: &str,
+    error: &aterm_http::Error,
+    gate: &dyn Fn() -> LanGate,
+) -> Error {
     let text = format!(
         "{what} {}: {}",
         describe(url),
@@ -357,13 +430,24 @@ fn transport_error_on(what: &str, url: &str, error: &aterm_http::Error, macos: b
             }
         )
     );
-    if macos && no_route_to_lan(error) {
-        return Error::of_kind(
-            ErrorKind::LocalNetworkPending,
-            format!(
-                "{text}; macOS lets aterm reach the local network only once allowed (Privacy & Security > Local Network)"
-            ),
-        );
+    if no_route_to_lan(error) {
+        match gate() {
+            LanGate::Unknown => {
+                return Error::of_kind(
+                    ErrorKind::LocalNetworkPending,
+                    format!(
+                        "{text}; macOS lets aterm reach the local network only once allowed (Privacy & Security > Local Network)"
+                    ),
+                );
+            }
+            LanGate::Granted => {
+                return Error::new(format!(
+                    "{text}; the vault host did not answer (aterm may reach the local network, \
+                     so the host is down or this Mac is on another network)"
+                ));
+            }
+            LanGate::None => {}
+        }
     }
     if matches!(error, aterm_http::Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut) {
         return Error::of_kind(ErrorKind::TimedOut, text);
@@ -379,13 +463,44 @@ fn no_route_to_lan(error: &aterm_http::Error) -> bool {
     )
 }
 
+/// The header a subscriber's GET sends so the server records when it was last heard (`age1…`).
+pub const SUBSCRIBER_HEADER: &str = "X-Aterm-Subscriber";
+
+/// Header asking a `>= 0.146` server's `?after=<seq>` GET to answer `204` at once instead of
+/// holding a long-poll when `held.seq <= seq` (`DESIGN-fluid-swarm` §4.1 F6).
+pub const NO_WAIT_HEADER: &str = "X-Aterm-No-Wait";
+
+/// Header on a `>= 0.146` server's `/records` GET reply (`"1"`) when the caller's `?have=` frontier
+/// names a record the server's own log does not hold, so the caller posts its records back.
+pub const RECORDS_NEED_HEADER: &str = "X-Aterm-Records-Need";
+
 /// Fetch bytes at `source` ([`FETCH_MARGIN`], [`Fetched::NoNewer`], [`Fetched::Missing`]).
 pub fn fetch(source: &Source, after: Option<u64>, wait: Duration) -> crate::Result<Fetched> {
+    fetch_as(source, after, wait, None)
+}
+
+/// [`fetch`], naming the subscriber's `age1…` recipient in [`SUBSCRIBER_HEADER`] when `Some`.
+pub fn fetch_as(
+    source: &Source,
+    after: Option<u64>,
+    wait: Duration,
+    subscriber: Option<&str>,
+) -> crate::Result<Fetched> {
     match source {
-        Source::Url(url) => match get(url, after, wait)? {
-            Answer::Fetched(fetched) => Ok(fetched),
-            Answer::Foreign(why) => Err(Error::new(why)),
-        },
+        Source::Url(url) => {
+            match get_via(
+                &client(wait.saturating_add(FETCH_MARGIN)),
+                url,
+                after,
+                None,
+                subscriber,
+            )
+            .map_err(|unheard| unheard.why)?
+            {
+                Answer::Fetched(fetched) => Ok(fetched),
+                Answer::Foreign(why) => Err(Error::new(why)),
+            }
+        }
         Source::Path(path) => Ok(read_path(path)?.map_or(Fetched::Missing, Fetched::Body)),
     }
 }
@@ -394,7 +509,43 @@ pub fn fetch(source: &Source, after: Option<u64>, wait: Duration) -> crate::Resu
 /// last byte, within `total`, with no [`FETCH_MARGIN`], so a long-poll the server holds for its
 /// own time ends at `total` too, failing [`ErrorKind::TimedOut`].
 pub fn fetch_within(url: &str, after: Option<u64>, total: Duration) -> crate::Result<Fetched> {
-    match get_via(&client(total), url, after, None).map_err(|unheard| unheard.why)? {
+    fetch_within_as(url, after, total, None)
+}
+
+/// [`fetch_within`], naming the subscriber's `age1…` recipient in [`SUBSCRIBER_HEADER`] when `Some`.
+pub fn fetch_within_as(
+    url: &str,
+    after: Option<u64>,
+    total: Duration,
+    subscriber: Option<&str>,
+) -> crate::Result<Fetched> {
+    match get_via_with(&client(total), url, after, None, subscriber, false)
+        .map_err(|unheard| unheard.why)?
+    {
+        Answer::Fetched(fetched) => Ok(fetched),
+        Answer::Foreign(why) => Err(Error::new(why)),
+    }
+}
+
+/// [`fetch_within`] for server-to-server pull (`DESIGN-fluid-swarm` §4.1 F6): sends `?after=<seq>`
+/// with [`NO_WAIT_HEADER`] so `>= 0.146` peers answer `200` or `204` immediately while `0.145`
+/// peers ignore the header and either answer `200` immediately (when newer) or time out into
+/// [`Fetched::NoNewer`].
+pub fn fetch_after_nowait(
+    url: &str,
+    after: Option<u64>,
+    total: Duration,
+) -> crate::Result<Fetched> {
+    match get_via_with(
+        &client(total),
+        url,
+        after,
+        Some(PROBE_CONNECT.min(total)),
+        None,
+        true,
+    )
+    .map_err(|unheard| unheard.why)?
+    {
         Answer::Fetched(fetched) => Ok(fetched),
         Answer::Foreign(why) => Err(Error::new(why)),
     }
@@ -440,6 +591,7 @@ pub fn get_bounded(
         url,
         after,
         connect,
+        None,
     )
 }
 
@@ -447,8 +599,14 @@ pub fn get_bounded(
 /// no [`FETCH_MARGIN`], its lookup and connect within [`PROBE_CONNECT`] (or `total`, if
 /// shorter).
 pub fn get_within(url: &str, total: Duration) -> crate::Result<Answer> {
-    get_via(&client(total), url, None, Some(PROBE_CONNECT.min(total)))
-        .map_err(|unheard| unheard.why)
+    get_via(
+        &client(total),
+        url,
+        None,
+        Some(PROBE_CONNECT.min(total)),
+        None,
+    )
+    .map_err(|unheard| unheard.why)
 }
 
 /// [`get_bounded`] through `client` (its timeout is the request's deadline).
@@ -457,12 +615,33 @@ fn get_via(
     url: &str,
     after: Option<u64>,
     connect: Option<Duration>,
+    subscriber: Option<&str>,
+) -> Result<Answer, Unheard> {
+    get_via_with(client, url, after, connect, subscriber, false)
+}
+
+fn get_via_with(
+    client: &Client,
+    url: &str,
+    after: Option<u64>,
+    connect: Option<Duration>,
+    subscriber: Option<&str>,
+    no_wait: bool,
 ) -> Result<Answer, Unheard> {
     let target = match after {
         Some(seq) => with_query(url, &format!("after={seq}")),
         None => base(url).to_owned(),
     };
     let request = client.get(&target).limit(MAX_ENVELOPE);
+    let request = match subscriber {
+        Some(subscriber) => request.header(SUBSCRIBER_HEADER, subscriber),
+        None => request,
+    };
+    let request = if no_wait {
+        request.header(NO_WAIT_HEADER, "1")
+    } else {
+        request
+    };
     let request = match connect {
         Some(connect) => request.connect_within(connect),
         None => request,
@@ -555,6 +734,122 @@ fn read_path(path: &std::path::Path) -> crate::Result<Option<Vec<u8>>> {
         "{}: a vault at a path is read on Unix only",
         path.display()
     )))
+}
+
+/// Fetch membership records missing past causal frontier `have` (`GET <url>/records?have=…`,
+/// `docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1 F13).
+///
+/// With `wait = None`, sends [`NO_WAIT_HEADER`] so peers answer immediately; with `wait = Some(w)`,
+/// long-polls up to `w` (`total` bounds the HTTP exchange). Answers `204` and `404` (including
+/// `0.145` servers without `/records`) return an empty byte vector.
+///
+/// # Errors
+/// Transport failure, oversized body, or a non-200/204/404 status from the server.
+pub fn fetch_records(
+    url: &str,
+    have: &[crate::membership_log::RecordId],
+    wait: Option<Duration>,
+    total: Duration,
+    subscriber: Option<&str>,
+) -> crate::Result<Vec<u8>> {
+    fetch_records_sync(url, have, wait, total, subscriber).map(|(bytes, _)| bytes)
+}
+
+/// [`fetch_records`], also returning whether the server signaled [`RECORDS_NEED_HEADER`] (`"1"`)
+/// because it lacks at least one record named in `have`.
+pub(crate) fn fetch_records_sync(
+    url: &str,
+    have: &[crate::membership_log::RecordId],
+    wait: Option<Duration>,
+    total: Duration,
+    subscriber: Option<&str>,
+) -> crate::Result<(Vec<u8>, bool)> {
+    let deadline = match wait {
+        Some(w) => w.saturating_add(FETCH_MARGIN).max(total),
+        None => total,
+    };
+    let target = records_have_url(url, have);
+    let http = client(deadline);
+    let request = http
+        .get(&target)
+        .limit(crate::membership_log::MAX_RECORDS_STREAM);
+    let request = match subscriber {
+        Some(sub) => request.header(SUBSCRIBER_HEADER, sub),
+        None => request,
+    };
+    let request = if wait.is_none() {
+        request
+            .header(NO_WAIT_HEADER, "1")
+            .connect_within(PROBE_CONNECT.min(total))
+    } else {
+        request
+    };
+    let response = match request.send_phased(&[]) {
+        Ok(response) => response,
+        Err(failed) if wait.is_some() && held_past_deadline(&failed) => {
+            return Ok((Vec::new(), false));
+        }
+        Err(aterm_http::SendError { error, .. }) => {
+            return Err(transport_error("fetching records from", url, &error));
+        }
+    };
+    let needs = response.header(RECORDS_NEED_HEADER) == Some("1");
+    match response.status() {
+        200 => Ok((response.body().to_vec(), needs)),
+        204 => Ok((Vec::new(), needs)),
+        404 => Ok((Vec::new(), false)),
+        status => Err(refused(
+            "fetching records from",
+            url,
+            status,
+            response.body(),
+        )),
+    }
+}
+
+/// Post a self-delimiting stream of signed membership records (`POST <url>/records`).
+///
+/// # Errors
+/// `records` exceeds [`crate::membership_log::MAX_RECORDS_STREAM`], transport fails, or the server
+/// refuses the records (`400`, `403`, `507`, …).
+pub fn post_records(url: &str, records: &[u8]) -> crate::Result<()> {
+    post_records_answered(url, records)?
+}
+
+/// [`post_records`], telling a server that judged the records from one that did not: `Ok` holds
+/// the server's verdict (`Ok(())` took the records, `Err` refused them: a record it does not
+/// take, a store or a server at its bound, a vault it keeps for no one here), and `Err` is a
+/// batch too large to send, a POST that heard no answer, or an answer that judged nothing (`408`,
+/// `429`, or a `5xx` but `507`: busy reading other bodies, slow, failing to write), after which
+/// the same POST may land.
+///
+/// # Errors
+/// `records` exceeds [`crate::membership_log::MAX_RECORDS_STREAM`], transport fails, or the server
+/// answers `408`, `429` or a `5xx` other than `507`.
+pub(crate) fn post_records_answered(url: &str, records: &[u8]) -> crate::Result<crate::Result<()>> {
+    let max = crate::membership_log::MAX_RECORDS_STREAM;
+    if records.len() > max {
+        return Err(Error::new(format!(
+            "the record batch is larger than {max} bytes"
+        )));
+    }
+    let target = records_url(url);
+    let response = client(EXCHANGE)
+        .post(&target)
+        .header("Content-Type", "application/octet-stream")
+        .limit(REASON_BODY)
+        .send(records)
+        .map_err(|e| transport_error("posting records to", url, &e))?;
+    if response.is_success() {
+        return Ok(Ok(()));
+    }
+    let status = response.status();
+    let error = refused("posting records to", url, status, response.body());
+    Ok(Err(match status {
+        403 | 507 => Error::of_kind(ErrorKind::Refused, error.0),
+        408 | 429 | 500..=599 => return Err(error),
+        _ => error,
+    }))
 }
 
 /// Publish an envelope (`PUT <url>`).
@@ -846,17 +1141,42 @@ fn write_path_held(path: &std::path::Path, envelope: &[u8]) -> crate::Result<()>
         }
         if let Ok(held) = crate::envelope::parse(&held)
             && held.name == new.name
-            && held.seq >= new.seq
         {
-            return Err(Error::of_kind(
-                crate::ErrorKind::NotStored,
-                format!(
-                    "seq {} is not newer than seq {}, which {} holds",
-                    new.seq,
-                    held.seq,
-                    path.display()
+            let held_followed: Vec<[u8; 32]> = held.handoff.iter().map(|(k, _)| *k).collect();
+            let replaced = matches!(
+                new.check_pin_with(
+                    &held.signer,
+                    &held_followed,
+                    &crate::envelope::Retired::compiled()
                 ),
-            ));
+                Ok(crate::envelope::Pin::Replaced(_))
+            );
+            if !replaced {
+                if held.seq >= new.seq {
+                    return Err(Error::of_kind(
+                        crate::ErrorKind::NotStored,
+                        format!(
+                            "seq {} is not newer than seq {}, which {} holds",
+                            new.seq,
+                            held.seq,
+                            path.display()
+                        ),
+                    ));
+                }
+                let held_head = held.digest();
+                if (!new.parents.is_empty() || !held.parents.is_empty())
+                    && !new.parents.contains(&held_head)
+                {
+                    return Err(Error::of_kind(
+                        crate::ErrorKind::NotStored,
+                        format!(
+                            "head at seq {} in {} is not among the envelope's parents",
+                            held.seq,
+                            path.display()
+                        ),
+                    ));
+                }
+            }
         }
     }
     crate::fsx::write_atomic(path, envelope, 0o644)
@@ -1068,6 +1388,8 @@ pub struct JoinRequest {
     pub code: String,
     /// Unix seconds when the server queued it (listings only).
     pub time: Option<u64>,
+    /// A member's signed Allow of it (`crate::members::Allowed`), padded base64.
+    pub allowed: Option<String>,
     /// The join-password proof it carried (`crate::join`), padded base64.
     pub proof: Option<String>,
 }
@@ -1076,6 +1398,10 @@ impl JoinRequest {
     /// The request line a machine POSTs.
     pub fn line(&self) -> String {
         let mut line = format!("{} {} {}", self.recipient, self.host, self.code);
+        if let Some(allowed) = &self.allowed {
+            line.push_str(" allowed=");
+            line.push_str(allowed);
+        }
         if let Some(proof) = &self.proof {
             line.push_str(" proof=");
             line.push_str(proof);
@@ -1083,7 +1409,8 @@ impl JoinRequest {
         line
     }
 
-    /// The line a server lists: `age1… <host> <code> <time>`, then ` proof=<b64>`.
+    /// The line a server lists: `age1… <host> <code> <time>`, then ` allowed=<b64>` and
+    /// ` proof=<b64>`.
     pub fn listed(&self) -> String {
         let mut line = format!(
             "{} {} {} {}",
@@ -1092,6 +1419,10 @@ impl JoinRequest {
             self.code,
             self.time.unwrap_or(0)
         );
+        if let Some(allowed) = &self.allowed {
+            line.push_str(" allowed=");
+            line.push_str(allowed);
+        }
         if let Some(proof) = &self.proof {
             line.push_str(" proof=");
             line.push_str(proof);
@@ -1113,6 +1444,19 @@ pub fn parse_join_line(line: &str) -> crate::Result<JoinRequest> {
                 ));
             }
             (rest, Some(proof.to_owned()))
+        }
+        None => (line, None),
+    };
+    // An older parser reads ` allowed=` as a fifth field and skips the line: an older
+    // approver never admits by it, and an older server refuses it.
+    let (line, allowed) = match line.rsplit_once(" allowed=") {
+        Some((rest, allowed)) => {
+            if !allowed_ok(allowed) {
+                return Err(Error::new(
+                    "a join request's allowed is not a member's padded base64 Allow",
+                ));
+            }
+            (rest, Some(allowed.to_owned()))
         }
         None => (line, None),
     };
@@ -1153,8 +1497,17 @@ pub fn parse_join_line(line: &str) -> crate::Result<JoinRequest> {
         host: host.to_owned(),
         code: code.to_owned(),
         time,
+        allowed,
         proof,
     })
+}
+
+/// The longest padded base64 an Allow takes (`crate::members::allowed::MAX_TEXT`: 4 + 144 +
+/// 32 + 1 + 63 + 64 bytes); the signature is the approver's to check.
+pub(crate) const MAX_ALLOWED_TEXT: usize = 412;
+
+fn allowed_ok(allowed: &str) -> bool {
+    allowed.len() <= MAX_ALLOWED_TEXT && crate::b64::decode_padded(allowed).is_some()
 }
 
 fn proof_ok(proof: &str) -> bool {
@@ -1399,6 +1752,7 @@ mod tests {
             seq,
             time: 1_792_530_000 + seq,
             handoff: Vec::new(),
+            parents: Vec::new(),
             lockers: vec![Locker {
                 label: "admin".to_owned(),
                 armored: test_armor(body),
@@ -1585,11 +1939,11 @@ mod tests {
         assert!(paused.borrow().is_empty());
     }
 
-    /// The Local Network gate is told by where a connect went and how it failed: no route to a
+    /// No route on the LAN is told by where a connect went and how it failed: no route to a
     /// LAN address, and nothing else.
     #[cfg(unix)]
     #[test]
-    fn no_route_to_a_lan_address_is_the_local_network_gate() {
+    fn no_route_is_told_by_a_lan_address_and_an_unreachable_errno() {
         let lan = [
             "10.0.0.5",
             "172.16.4.2",
@@ -1624,7 +1978,7 @@ mod tests {
                     for &errno in errnos {
                         let error = std::io::Error::from_raw_os_error(errno);
                         assert_eq!(
-                            local_network_gate(ip, &error),
+                            no_route_on_the_lan(ip, &error),
                             on_lan && no_route,
                             "{address} errno {errno}"
                         );
@@ -1646,7 +2000,7 @@ mod tests {
             },
         ));
         let url = "http://alab-secrets.local:7484/v1/alab?token=x";
-        let error = transport_error_on("fetching", url, &gated, true);
+        let error = transport_error_on("fetching", url, &gated, &|| LanGate::Unknown);
         assert_eq!(error.kind(), ErrorKind::LocalNetworkPending);
         assert!(
             error
@@ -1660,12 +2014,12 @@ mod tests {
         // CONTROL: the same failure with no LAN address behind it is any other error.
         let plain = aterm_http::Error::Io(unreachable());
         assert_eq!(
-            transport_error_on("fetching", url, &plain, true).kind(),
+            transport_error_on("fetching", url, &plain, &|| LanGate::Unknown).kind(),
             ErrorKind::Other
         );
         // Off macOS, nothing gates the local network: a LAN host that does not answer is any
         // other error, which still names the address, and blames no macOS setting.
-        let elsewhere = transport_error_on("fetching", url, &gated, false);
+        let elsewhere = transport_error_on("fetching", url, &gated, &|| LanGate::None);
         assert_eq!(elsewhere.kind(), ErrorKind::Other);
         assert!(elsewhere.0.contains("192.168.1.20"), "{elsewhere}");
         assert!(!elsewhere.0.contains("macOS"), "{elsewhere}");
@@ -1673,6 +2027,47 @@ mod tests {
             transport_error("fetching", url, &gated).kind() == ErrorKind::LocalNetworkPending,
             cfg!(target_os = "macos")
         );
+    }
+
+    /// No route to a LAN address is the Local Network gate only until the switch is known on:
+    /// after, it is a vault host that did not answer (a LAN this Mac has left, a host that is
+    /// down), any other error, which still names the address and blames no setting. The switch
+    /// is read only on macOS, and only for no route to a LAN address.
+    /// NEGATIVE CONTROL: the old classification (any no route on macOS is the gate) fails the
+    /// `Granted` half.
+    #[test]
+    fn no_route_to_a_lan_address_is_the_gate_only_before_the_grant_is_known() {
+        let addr: SocketAddr = "192.168.1.20:7484".parse().expect("addr");
+        let unreachable = || std::io::Error::from(std::io::ErrorKind::HostUnreachable);
+        let gated = aterm_http::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::HostUnreachable,
+            NoRoute {
+                addr,
+                error: unreachable(),
+            },
+        ));
+        let url = "http://alab-secrets.local:7484/v1/alab";
+        let before = transport_error_on("fetching", url, &gated, &|| LanGate::Unknown);
+        assert_eq!(before.kind(), ErrorKind::LocalNetworkPending);
+        assert!(before.0.contains("Local Network"), "{before}");
+        let after = transport_error_on("fetching", url, &gated, &|| LanGate::Granted);
+        assert_eq!(after.kind(), ErrorKind::Other);
+        assert!(after.0.contains("the vault host did not answer"), "{after}");
+        assert!(after.0.contains("192.168.1.20"), "{after}");
+        assert!(!after.0.contains("Privacy"), "{after}");
+        // CONTROL: the gate is read only for no route to a LAN address.
+        let timed_out = aterm_http::Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        let read = std::cell::Cell::new(false);
+        let error = transport_error_on("fetching", url, &timed_out, &|| {
+            read.set(true);
+            LanGate::Granted
+        });
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        assert!(!read.get(), "the switch is not read for a timeout");
+        // The switch is read on macOS alone.
+        assert_eq!(lan_gate(false, || panic!("read off macOS")), LanGate::None);
+        assert_eq!(lan_gate(true, || false), LanGate::Unknown);
+        assert_eq!(lan_gate(true, || true), LanGate::Granted);
     }
 
     #[test]
@@ -1794,6 +2189,7 @@ mod tests {
             &url,
             None,
             Some(LOOK_CONNECT),
+            None,
         )
         .expect_err("silent");
         assert!(unanswered.held, "{unanswered:?}");
@@ -1832,7 +2228,8 @@ mod tests {
         let client =
             client(HANG_DETECTOR.saturating_add(FETCH_MARGIN)).with_connector(held.clone());
         let url = "http://alab-secrets.local:7484/v1/alab";
-        let bounded = get_via(&client, url, None, Some(LOOK_CONNECT)).expect_err("held lookup");
+        let bounded =
+            get_via(&client, url, None, Some(LOOK_CONNECT), None).expect_err("held lookup");
         assert!(bounded.held, "{bounded:?}");
         assert!(
             bounded.why.0.starts_with(
@@ -1840,7 +2237,7 @@ mod tests {
             ),
             "{bounded:?}"
         );
-        let unbounded = get_via(&client, url, None, None).expect_err("held lookup");
+        let unbounded = get_via(&client, url, None, None, None).expect_err("held lookup");
         assert!(unbounded.held, "{unbounded:?}");
         let left = held.left.lock().expect("lock").clone();
         assert_eq!(left.len(), 2);

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Non-parking egress spill bound tests.
+//! `write_frame_nonparking` (`Room::NoWait`) spill bound against a wedged peer.
 #![cfg(unix)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -72,9 +72,8 @@ fn nonparking_spill_is_bounded_against_a_wedged_pty() {
         let delta = net() - baseline;
         assert!(
             delta <= HEAP_CEILING,
-            "non-parking spill retained {delta}B (> {HEAP_CEILING}B ceiling) — SPILL_CAP is \
-             bypassed on the wait_for_room=false path, so a wedged foreground grows the spill \
-             without bound (regression of the sink.rs non-parking cap)"
+            "write_frame_nonparking retained {delta}B (> {HEAP_CEILING}B ceiling) — SPILL_CAP is \
+             bypassed on the Room::NoWait path, so a wedged peer grows the spill without bound"
         );
         if delta >= REPRODUCED_FLOOR {
             if delta <= peak {

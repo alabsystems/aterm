@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! "No upgrade stuck forever" as a bounded model (`docs/DESIGN-upgrade-never-stuck-2026-09-28.md` §4).
+//! "No upgrade stuck forever" as a bounded model (`docs/DESIGN-upgrade-never-stuck-2026-09-28.md` §4),
+//! and the owner's press of the ⬆️ (`pressed`): a one-shot Now that passes what only defers a
+//! move (an Autopilot or an agent switched off, the agent's own background work) and waits only
+//! for what a restart would lose (a held tab, a box, a draft), a wall, or a running turn.
 
 use aterm_spec::derive::*;
 
@@ -26,6 +29,10 @@ pub fn harness_upgrade_progress_model() -> Model {
             var blind = 0;
             var keep = 0;
             var slipped = 0;
+            var pressed = 0;
+            var now = 0;
+            var lost = 0;
+            var asnow = 0;
 
             action TurnRuns when (phase <= 2 && posture > 0) {
                 posture = 0;
@@ -58,8 +65,20 @@ pub fn harness_upgrade_progress_model() -> Model {
             action Window when (phase <= 2 && clock == 0) {
                 clock = 1;
             }
+            action Press when (phase <= 2 && pressed == 0) {
+                pressed = 1;
+                now = 1;
+                phase = if phase == 2 { 0 } else { phase };
+            }
+            action PressLapses when (pressed == 1) {
+                pressed = 0;
+            }
+            action OwnerAsks when (phase <= 2 && now == 0) {
+                now = 1;
+                phase = if phase == 2 { 0 } else { phase };
+            }
             action StepAtIdle when (
-                posture == 2 && (
+                pressed == 0 && posture == 2 && (
                     phase == 0 ||
                     (phase == 1 && clock == 1 && (ready == 0 || work == 1)) ||
                     (phase == 2 && clock == 1)
@@ -67,6 +86,7 @@ pub fn harness_upgrade_progress_model() -> Model {
             ) {
                 phase = if phase == 0 { 1 } else if phase == 1 { 2 } else { 0 };
                 rearmed = if phase == 2 { 1 } else { 0 };
+                now = if phase == 1 { 0 } else { now };
                 ready = 0;
                 clock = 0;
                 cause = 3;
@@ -74,7 +94,7 @@ pub fn harness_upgrade_progress_model() -> Model {
                 offpoint = if posture == 0 || posture > 2 { 1 } else { offpoint };
             }
             action RestartAtIdle when (
-                posture == 2 && phase == 1 && ready == 1 && work == 0
+                pressed == 0 && posture == 2 && phase == 1 && ready == 1 && work == 0
             ) {
                 phase = 3;
                 rearmed = 0;
@@ -86,21 +106,36 @@ pub fn harness_upgrade_progress_model() -> Model {
                 offpoint = if posture == 0 || posture > 2 { 1 } else { offpoint };
             }
             action StepAtBreak when (
-                posture == 1 && (phase == 0 || ((phase == 1 || phase == 2) && clock == 1))
+                pressed == 0 && posture == 1 &&
+                (phase == 0 || ((phase == 1 || phase == 2) && clock == 1))
             ) {
                 phase = if phase == 0 { 1 } else if phase == 1 { 2 } else { 0 };
                 rearmed = if phase == 2 { 1 } else { 0 };
+                now = if phase == 1 { 0 } else { now };
                 ready = 0;
                 clock = 0;
                 cause = 3;
                 seen = 3;
                 offpoint = if posture == 0 || posture > 2 { 1 } else { offpoint };
             }
+            action RestartOnPress when (
+                pressed == 1 && phase <= 1 && (posture == 1 || posture == 2) &&
+                (asnow == 0 || work == 0)
+            ) {
+                phase = 3;
+                pressed = 0;
+                rearmed = 0;
+                ready = 0;
+                clock = 0;
+                cause = 3;
+                seen = 3;
+            }
 
             action Watch when (phase <= 2) {
                 cause = if blind == 1 && (posture == 0 || posture > 2) { cause }
                     else if keep == 1 && (
-                            if phase == 0 { posture == 2 }
+                            if pressed == 1 { posture == 1 || posture == 2 }
+                            else if phase == 0 { posture == 2 }
                             else if phase == 1 {
                                 (posture == 2 && ready == 1 && work == 0) ||
                                 (clock == 1 && (posture <= 2 || posture == 4) &&
@@ -108,6 +143,10 @@ pub fn harness_upgrade_progress_model() -> Model {
                             }
                             else { clock == 1 }
                         ) { cause }
+                    else if pressed == 1 && asnow == 0 {
+                        if posture == 4 { 1 } else if posture == 3 { 2 }
+                        else if posture == 0 { 0 } else { 3 }
+                    }
                     else { (
                             if posture == 3 { if phase == 2 { 0 } else { 2 } }
                             else if posture == 4 {
@@ -120,7 +159,11 @@ pub fn harness_upgrade_progress_model() -> Model {
                             else { 0 }
                         ) };
                 clock = if posture == 3 && phase == 1 && reset == 0 && blind == 0 { 0 } else { clock };
-                seen = if posture == 3 { if phase == 2 { 0 } else { 2 } }
+                seen = if pressed == 1 {
+                        if posture == 4 { 1 } else if posture == 3 { 2 }
+                        else if posture == 0 { 0 } else { 3 }
+                    }
+                    else if posture == 3 { if phase == 2 { 0 } else { 2 } }
                     else if posture == 4 {
                         if phase == 0 { 1 } else if phase == 2 { 0 }
                         else if clock == 1 || (ready == 1 && work == 0) { 1 } else { 0 }
@@ -172,18 +215,68 @@ pub fn harness_upgrade_progress_model() -> Model {
                 at_work = work;
                 slipped = 1;
             }
+            action NowAsPress when (
+                Buggy == 1 && slipped == 0 && now == 1 && pressed == 0 && phase <= 1 &&
+                (posture == 1 || posture == 2) && work == 1
+            ) {
+                phase = 3;
+                rearmed = 0;
+                ready = 0;
+                clock = 0;
+                cause = 3;
+                seen = 3;
+                at_work = work;
+                slipped = 1;
+            }
+            action PressPassesInput when (
+                Buggy == 1 && slipped == 0 && pressed == 1 && phase <= 1 && posture == 4
+            ) {
+                phase = 3;
+                pressed = 0;
+                rearmed = 0;
+                ready = 0;
+                clock = 0;
+                cause = 3;
+                seen = 3;
+                lost = 1;
+                slipped = 1;
+            }
+            action PressReadAsNow when (Buggy == 1 && slipped == 0 && asnow == 0) {
+                asnow = 1;
+                slipped = 1;
+            }
 
             invariant NoHandsOffAPoint: offpoint == 0;
             invariant NoStaleLook: cause == seen;
-            invariant NeverEndsRunningWork: at_work == 0;
+            invariant NoAutomaticMoveEndsRunningWork: at_work == 0;
+            invariant NoPressLosesInput: lost == 0;
         }
     }
 }
 
-/// `T` of [`harness_upgrade_progress_model`], the class of what holds the move now.
+/// `T` of [`harness_upgrade_progress_model`], the class of what holds the move now: under a
+/// standing press, what the press waits for (`upgrade::press_gate`), else the loop's.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_upgrade_progress_truth() -> Expr {
+    let is = |v: &'static str, n: i64| eq(var(v), int(n));
+    if_(
+        is("pressed", 1),
+        if_(
+            is("posture", 4),
+            int(1),
+            if_(
+                is("posture", 3),
+                int(2),
+                if_(is("posture", 0), int(0), int(3)),
+            ),
+        ),
+        harness_upgrade_loop_truth(),
+    )
+}
+
+/// The loop's class of what holds the move, with no press standing.
+fn harness_upgrade_loop_truth() -> Expr {
     let is = |v: &'static str, n: i64| eq(var(v), int(n));
     if_(
         is("posture", 3),
@@ -234,5 +327,24 @@ pub fn harness_upgrade_progress_liveness() -> Liveness {
         weak: vec!["Watch"],
         strong: vec![],
         mutants: vec!["NoLookWithoutAPoint", "RecordedWordStands"],
+    }
+}
+
+/// A standing press moves the upgrade past its agent's own running work: unless it lapses, it
+/// restarts the agent at the first break or idle point, whatever runs in the background.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+#[aterm_spec::liveness(harness_upgrade_progress_model)]
+pub fn harness_upgrade_press_liveness() -> Liveness {
+    let is = |v: &'static str, n: i64| eq(var(v), int(n));
+    Liveness {
+        name: "APressMovesPastRunningWork",
+        goal: or_(
+            or_(is("pressed", 0), is("phase", 3)),
+            or_(is("posture", 0), gt(var("posture"), int(2))),
+        ),
+        weak: vec!["RestartOnPress"],
+        strong: vec![],
+        mutants: vec!["PressReadAsNow"],
     }
 }

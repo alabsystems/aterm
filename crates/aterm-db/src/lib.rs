@@ -10,6 +10,11 @@
 
 use std::fmt;
 
+#[cfg(test)]
+aterm_durable::plain_durable_flushes_in_tests!();
+#[cfg(test)]
+aterm_secrets::memoized_x25519_in_tests!();
+
 pub mod accounts;
 #[cfg(unix)]
 pub mod catalog;
@@ -18,6 +23,8 @@ pub mod cli;
 pub mod contacts;
 #[cfg(unix)]
 pub mod control;
+#[cfg(unix)]
+pub mod credentials;
 pub mod crypto;
 pub mod database;
 mod documents;
@@ -44,9 +51,24 @@ pub mod table;
 /// A refusal that identifies the failed boundary without quoting payloads or keys.
 #[derive(Debug)]
 pub struct Error(pub String);
+/// What [`Error::busy`] says.
+const BUSY: &str = "another local writer holds this table; nothing changed, retry shortly";
+const SNAPSHOT_CHANGED: &str = "table witness advanced during observation; reopen and verify";
 impl Error {
     pub(crate) fn new(reason: &str) -> Self {
         Self(reason.into())
+    }
+    /// Another local writer held the store this needed, and nothing changed.
+    pub(crate) fn busy() -> Self {
+        Self(BUSY.into())
+    }
+    /// A newer witness needs fresh verification; the changed handle refuses reads.
+    pub(crate) fn snapshot_changed() -> Self {
+        Self(SNAPSHOT_CHANGED.into())
+    }
+    /// Whether local contention or a newer snapshot requires a fresh observation.
+    pub(crate) fn is_busy(&self) -> bool {
+        self.0 == BUSY || self.0 == SNAPSHOT_CHANGED
     }
 }
 impl fmt::Display for Error {

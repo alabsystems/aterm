@@ -121,6 +121,10 @@ impl ApprovalCtx {
             .trusted_cwd
             .as_deref()
             .is_some_and(crate::harness::disk::fence::is_worker_folder);
+        ctx.claim_worker = facts
+            .trusted_cwd
+            .as_deref()
+            .is_some_and(crate::harness::credit_offers::is_claim_folder);
         ctx.worker_agent = facts.worker_agent;
         if config.withheld.rm_breaker {
             ctx.scratch_roots.clear();

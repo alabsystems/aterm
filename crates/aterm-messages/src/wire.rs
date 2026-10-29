@@ -1680,6 +1680,12 @@ pub fn press_target(
             enc(&press_words(press))
         )
     })?;
+    if !index.is_details() && row.msg.actions[usize::from(index.0)].person_only() {
+        return Err(format!(
+            "ERR notice: {} on message {id} is a person's own press on this Mac's screen",
+            enc(row.msg.actions[usize::from(index.0)].label())
+        ));
+    }
     gate.try_press(now).map_err(Busy::reply)?;
     let label = if index.is_details() {
         Intent::Details.label()

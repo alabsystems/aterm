@@ -21,22 +21,23 @@ mod initial;
 pub use initial::{
     BroughtForward, InitialSetupAdmission, InitialSetupAuthorization, InitialSetupObservation,
     InitialSetupObserved, InitialSetupParkMark, InitialSetupRestart, InitialSetupSnapshot,
-    InitialSetupSnapshotError, InitialSetupUpgrade, LocalNetworkHeard, ParkWatch, SETUP_BUSY,
-    SetAside, SetupHooks, SetupNext, SetupUpgrade, StageEvent, VAULT_SETTINGS_UNREAD, Watches,
-    alab_mac, apply_initial_setup, apply_initial_setup_observed, automatic_plan,
-    bring_forward_restored_setup, bring_forward_restored_setup_observing, check_initial_setup,
-    check_initial_setup_observed, decline_provisional_setup_widen, forget_set_aside_setup,
-    initial_setup_access_revision, initial_setup_access_step, initial_setup_admission,
-    initial_setup_finished, initial_setup_keeps_vault_sync, initial_setup_observation,
-    initial_setup_park_mark, initial_setup_review_revision, initial_setup_revision,
-    initial_setup_snapshot, initial_setup_snapshot_offering, local_network_heard,
-    look_for_the_alab_vault, note_setup_interrupted, observe_initial_setup,
-    probe_local_network_again, provisional_setup_widened, provisional_setup_widens,
-    put_back_held_initial_setup, request_initial_setup_stop, restart_initial_setup,
-    restart_initial_setup_observed, retry_parked_setup_stages, run_initial_setup_pass,
-    set_aside_unreadable_setup, set_aside_unreadable_setup_observing, setup_is_newer,
-    setup_ledger_environment, setup_records_held, validate_initial_setup_plan, vault_config_unread,
-    with_initial_setup_vault_sync,
+    InitialSetupSnapshotError, InitialSetupUpgrade, LocalNetworkFirstUse, LocalNetworkHeard,
+    ParkWatch, PermissionSteps, SETUP_BUSY, SetAside, SetupHooks, SetupNext, SetupUpgrade,
+    StageEvent, VAULT_SETTINGS_UNREAD, Watches, alab_mac, apply_initial_setup,
+    apply_initial_setup_observed, automatic_plan, bring_forward_restored_setup,
+    bring_forward_restored_setup_observing, check_initial_setup, check_initial_setup_observed,
+    decline_provisional_setup_widen, forget_set_aside_setup, initial_setup_access_revision,
+    initial_setup_access_step, initial_setup_admission, initial_setup_finished,
+    initial_setup_keeps_vault_sync, initial_setup_observation, initial_setup_owes_secrets_stage,
+    initial_setup_park_mark, initial_setup_permission_steps, initial_setup_review_revision,
+    initial_setup_revision, initial_setup_snapshot, initial_setup_snapshot_offering,
+    local_network_first_use, local_network_heard, look_for_the_alab_vault, note_setup_interrupted,
+    observe_initial_setup, probe_local_network_again, provisional_setup_widened,
+    provisional_setup_widens, put_back_held_initial_setup, request_initial_setup_stop,
+    restart_initial_setup, restart_initial_setup_observed, retry_parked_setup_stages,
+    run_initial_setup_pass, set_aside_unreadable_setup, set_aside_unreadable_setup_observing,
+    setup_is_newer, setup_ledger_environment, setup_records_held, validate_initial_setup_plan,
+    vault_config_unread, with_initial_setup_vault_sync,
 };
 #[cfg(any(test, debug_assertions))]
 pub use initial::{
@@ -1512,6 +1513,10 @@ impl HeldLock {
 
     fn open_named(root: &Path, name: &str) -> Result<std::fs::File, String> {
         use std::os::unix::fs::OpenOptionsExt as _;
+        // A test takes its file system place before it holds the doctor lock this opens: a wait
+        // for one under the lock would hold up each of the test's threads that takes it.
+        #[cfg(test)]
+        aterm_spec::fs_lane::join();
         std::fs::create_dir_all(root).map_err(|e| format!("{}: {e}", root.display()))?;
         std::fs::OpenOptions::new()
             .read(true)
@@ -2282,6 +2287,10 @@ fn write_json_with_flush(
     value: &Value,
     flush: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<(), String> {
+    // A test whose first file system work is a record write takes its place here; one that took
+    // a doctor lock through `HeldLock::open_named` holds it already.
+    #[cfg(test)]
+    aterm_spec::fs_lane::join();
     let parent = path
         .parent()
         .ok_or("doctor record has no parent directory")?;
@@ -4780,31 +4789,21 @@ mod tests {
             }],
         )
         .unwrap();
-        let holder = HeldLock::take(root.path()).unwrap();
-        let (taken, released) = std::sync::mpsc::channel();
-        let release = std::thread::spawn(move || {
-            let _ = released.recv();
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            drop(holder);
-        });
+        let mut holder = Some(HeldLock::take(root.path()).unwrap());
         let mut host = Fake::default();
         host.values.insert(target.clone(), PValue::Bool(true));
         let mut asked = 0;
         let observed = mutation_observed(&mut host, root.path(), None, Action::Restore, || {
             asked += 1;
-            if asked == 1 {
-                taken.send(()).unwrap();
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-            asked < 400
+            // The other holder's write ends.
+            holder = None;
+            true
         });
-        drop(taken);
-        release.join().unwrap();
         let report = observed
             .result
             .expect("a Restore pressed during a short write runs");
         assert!(!report.needs_attention(), "{}", report.to_text());
-        assert!(asked > 1, "the Restore asked for the lock again");
+        assert_eq!(asked, 1, "the Restore waited once and took the lock again");
         assert_eq!(host.read(&target).unwrap(), Some(PValue::Bool(false)));
 
         let _holder = HeldLock::take(root.path()).unwrap();

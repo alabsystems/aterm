@@ -139,47 +139,6 @@ fn stops_kept(
 const WRAPPED: usize = 80;
 const ROW2: std::ops::Range<usize> = 58..80;
 
-#[test]
-fn a_line_revived_after_a_rest_keeps_its_stops_and_the_key_continues_its_walk() {
-    on_every_ground(|| {
-        let mut broken = Vec::new();
-        for (what, n, row) in [
-            ("one row", LINE_CELLS, 0..LINE_CELLS),
-            ("a wrapped line's second row", WRAPPED, ROW2),
-        ] {
-            let (s, before, after) = revived(n, row.clone(), what);
-            let relit = row.clone().filter(|&i| after[i].is_some()).count();
-            assert!(
-                relit == row.len(),
-                "{what}: the premise — the seam revived the retired run on the key's frame \
-                 ({relit} of {} lit)",
-                row.len()
-            );
-            let moved: Vec<(usize, f32, f32)> = row
-                .clone()
-                .filter_map(|i| {
-                    let (b, a) = (before[i]?, after[i]?);
-                    ((a - b).abs() > 1e-4).then_some((i, b, a))
-                })
-                .collect();
-            let key = after[n].expect("the key's own cell is lit");
-            let want = before[n - 1].expect("the line's last cell was lit") + WALK_LAY_RATE;
-            if !moved.is_empty() || (key - want).abs() >= 1e-4 {
-                broken.push(format!(
-                    "{what}: the revived line changed colour under unchanged text — {} of {} \
-                     lit cells moved, first (text, before, after) {:?}; the key's cell is \
-                     {key:.4} where the walk one step past the line's last cell is {want:.4}\n{}",
-                    moved.len(),
-                    relit,
-                    moved.first(),
-                    s.dump(s.snaps.len() - 1, s.snaps.len() - 1)
-                ));
-            }
-        }
-        assert!(broken.is_empty(), "{}", broken.join("\n"));
-    });
-}
-
 const LATE_ECHO_MS: u64 = 20;
 const FRAME_MS: u64 = 16;
 
@@ -343,13 +302,21 @@ fn a_run_no_key_saw_standing_comes_back_on_its_own_walk() {
 #[test]
 fn a_wrapped_line_revived_after_a_rest_lights_its_second_row_from_its_first_glyph() {
     on_every_ground(|| {
-        let (_, _, after) = revived(LINE_CELLS, 0..LINE_CELLS, "one row");
+        let mut broken = Vec::new();
+        let (s, before, after) = revived(LINE_CELLS, 0..LINE_CELLS, "one row");
         let dark: Vec<usize> = (0..LINE_CELLS).filter(|&i| after[i].is_none()).collect();
         assert!(
             dark.is_empty(),
             "the control: a one-row line comes back whole, dark {dark:?}"
         );
-        let mut broken = Vec::new();
+        broken.extend(stops_kept(
+            &s,
+            LINE_CELLS,
+            0..LINE_CELLS,
+            &before,
+            &after,
+            "one row",
+        ));
         for (what, fold, echo) in [
             ("kernel echo", Fold::Kernel, Echo::After(2)),
             ("readline", Fold::Readline, Echo::After(2)),

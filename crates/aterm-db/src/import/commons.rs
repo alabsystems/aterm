@@ -89,9 +89,8 @@ impl Imports {
         Ok(report(&value, receipt, request))
     }
     pub fn snapshot(&self) -> Result<Snapshot> {
-        crate::documents::application::with_store(
+        crate::documents::application::observe_store(
             &self.paths,
-            false,
             descriptor,
             |session, store, scope| Ok(Log::read_with(session, store, scope, decode)?.snapshot()),
         )

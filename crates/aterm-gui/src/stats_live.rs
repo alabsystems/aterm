@@ -809,21 +809,41 @@ impl crate::App {
 
     /// Retargets the dial's needle at the snapshot just adopted at `now`
     /// ([`Needle::retarget`]), against the finest tip of the windows that animate a dial: with
-    /// none it rests on the reading at once.
-    pub(crate) fn retarget_needle(&self, now: Instant) {
-        let px_per_deg = self
+    /// none it rests on the reading at once. Returns the frames the new episode owes those
+    /// windows ([`Needle::frames_owed`], each from what it last drew, on the shortest effect
+    /// interval its display gives it, so a lane that unparks mid-episode is owed its frames),
+    /// which `ctl metrics` counts (`needle_sweeps`, `needle_frames_owed`, `needle_episode_left`).
+    pub(crate) fn retarget_needle(&self, now: Instant) -> u64 {
+        let views: Vec<(View, Option<Drawn>)> = self
             .windows
-            .keys()
-            .filter_map(|&wid| self.live_facts(wid).filter(|f| f.motion)?.needle)
-            .map(|(_, view)| view.px_per_deg)
+            .iter()
+            .filter_map(|(&wid, ws)| {
+                let facts = self.live_facts(wid).filter(|f| f.motion)?;
+                let view = View {
+                    interval: ws.effect_present_interval_fastest(),
+                    ..facts.needle?.1
+                };
+                Some((view, facts.drawn))
+            })
+            .collect();
+        let px_per_deg = views
+            .iter()
+            .map(|(view, _)| view.px_per_deg)
             .fold(0.0, f64::max);
         let target = self.vitals.snapshot.as_deref().and_then(|snap| {
             crate::stats_gauge::Gauge::of(&aterm_vitals::Strain::of(snap)).target()
         });
         let was = self.vitals.needle.get();
-        self.vitals
-            .needle
-            .set(Needle::retarget(was, now, target, px_per_deg));
+        let next = Needle::retarget(was, now, target, px_per_deg);
+        let owed = next.map_or(0, |n| {
+            views
+                .iter()
+                .map(|(view, drawn)| n.frames_owed(*view, drawn.map(|d| d.at)))
+                .sum()
+        });
+        crate::metrics::note_needle_episode(owed);
+        self.vitals.needle.set(next);
+        owed
     }
 
     /// Asks a frame of each window whose live edge no longer matches what its card last drew.

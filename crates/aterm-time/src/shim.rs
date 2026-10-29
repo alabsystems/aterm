@@ -3,6 +3,10 @@
 
 //! The `wasm32` clock: a monotonic [`Instant`] over `performance.now()` and a
 //! wall-clock [`SystemTime`] over `Date.now()`.
+#![cfg_attr(
+    all(not(all(target_arch = "wasm32", target_os = "unknown")), not(test)),
+    allow(dead_code)
+)]
 
 use core::ops::{Add, AddAssign, Sub, SubAssign};
 use core::time::Duration;
@@ -344,7 +348,7 @@ mod tests {
         let a = duration_from_millis_f64(hour_ms);
         let b = duration_from_millis_f64(hour_ms + 0.1);
         assert!(
-            b > a && b - a >= Duration::from_nanos(90_000),
+            b > a && b - a >= Duration::from_nanos(99_998),
             "0.1ms apart after an hour resolved as {:?}",
             b.saturating_sub(a)
         );
@@ -400,8 +404,8 @@ mod tests {
         let err: SystemTimeError = t0.duration_since(t1).expect_err("backwards");
         assert_eq!(err.duration(), Duration::from_secs(1));
         assert_eq!(err.to_string(), "second time provided was later than self");
-        let boxed: Box<dyn std::error::Error> = Box::new(err);
-        assert!(!boxed.to_string().is_empty());
+        const fn assert_error<E: core::error::Error>() {}
+        assert_error::<SystemTimeError>();
     }
 
     #[test]

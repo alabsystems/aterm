@@ -85,7 +85,21 @@ pub const KERN_ARGMAX: libc::c_int = 8;
 /// `kern.argmax` bytes past the argc (one byte more is `EINVAL`).
 #[must_use]
 pub fn read(pid: u32) -> Option<Vec<u8>> {
-    imp::read(pid)
+    let mut buf = vec![0u8; imp::most()?];
+    let len = read_into(pid, &mut buf)?;
+    buf.truncate(len);
+    Some(buf)
+}
+
+/// `pid`'s `KERN_PROCARGS2` answer read into `buf`, its length, when the whole record fits: a
+/// reader that wants only a short record (the head of an `exec`'s, read for every one) reuses one
+/// buffer and never allocates. A record `buf` cannot hold is no answer: the kernel hands a short
+/// buffer the record's TAIL (the end of its environment), never its head, so a full buffer is
+/// refused, never parsed. The kernel copies the whole record in either way, so a long one costs
+/// it as much as a whole read.
+#[must_use]
+pub fn read_into(pid: u32, buf: &mut [u8]) -> Option<usize> {
+    imp::read_into(pid, buf)
 }
 
 #[cfg(target_os = "macos")]
@@ -119,15 +133,20 @@ mod imp {
         })
     }
 
+    /// The largest buffer the kernel takes: `kern.argmax` bytes past the argc.
+    pub(super) fn most() -> Option<usize> {
+        argmax()?.checked_add(super::ARGC_BYTES)
+    }
+
     #[cfg_attr(trust_verify, trust::skip)]
-    pub(super) fn read(pid: u32) -> Option<Vec<u8>> {
+    pub(super) fn read_into(pid: u32, buf: &mut [u8]) -> Option<usize> {
         let pid = libc::c_int::try_from(pid).ok().filter(|p| *p > 0)?;
-        let cap = argmax()?.checked_add(super::ARGC_BYTES)?;
-        let mut buf = vec![0u8; cap];
+        let cap = buf.len().min(most()?);
         let mut len = cap;
         let mut mib = [libc::CTL_KERN, KERN_PROCARGS2, pid];
-        // SAFETY: `buf` is `cap` writable bytes and `len` says so; the kernel writes at most `len`
-        // and sets it to what it wrote; nothing is written to the kernel (`newp` null).
+        // SAFETY: `buf` is at least `cap` writable bytes and `len` says `cap`; the kernel writes
+        // at most `len` and sets it to what it wrote; nothing is written to the kernel (`newp`
+        // null).
         let rc = unsafe {
             libc::sysctl(
                 mib.as_mut_ptr(),
@@ -138,17 +157,17 @@ mod imp {
                 0,
             )
         };
-        if rc != 0 || len >= cap {
-            return None;
-        }
-        buf.truncate(len);
-        Some(buf)
+        (rc == 0 && len < cap).then_some(len)
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
-    pub(super) fn read(_pid: u32) -> Option<Vec<u8>> {
+    pub(super) const fn most() -> Option<usize> {
+        None
+    }
+
+    pub(super) const fn read_into(_pid: u32, _buf: &mut [u8]) -> Option<usize> {
         None
     }
 }

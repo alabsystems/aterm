@@ -30,34 +30,7 @@ pub(crate) fn live_dev_links(layout: &Layout) -> (std::collections::BTreeSet<Str
         Err(e) => return (live, vec![format!("cannot read development links: {e}")]),
     };
     for program in programs {
-        let checkout =
-            linked_checkout(layout, &program).and_then(|path| fs::canonicalize(path).ok());
-        let tools = linked_tool_names(layout, &program).unwrap_or_default();
-        let healthy = checkout.as_ref().is_some_and(|root| {
-            !tools.is_empty()
-                && tools.iter().all(|name| {
-                    let Some(tool) = crate::store::ToolName::new(name) else {
-                        return false;
-                    };
-                    let Some(target) = crate::platform::resolve_shim(&layout.shim(&tool))
-                        .and_then(|path| fs::canonicalize(path).ok())
-                    else {
-                        return false;
-                    };
-                    let Ok(meta) = fs::metadata(&target) else {
-                        return false;
-                    };
-                    #[cfg(unix)]
-                    let executable = {
-                        use std::os::unix::fs::PermissionsExt as _;
-                        meta.permissions().mode() & 0o111 != 0
-                    };
-                    #[cfg(not(unix))]
-                    let executable = true;
-                    target.starts_with(root) && meta.is_file() && executable
-                })
-        });
-        if healthy {
+        if live_linked_checkout(layout, &program).is_ok_and(|root| root.is_some()) {
             live.insert(program);
         } else {
             problems.push(format!(
@@ -67,6 +40,55 @@ pub(crate) fn live_dev_links(layout: &Layout) -> (std::collections::BTreeSet<Str
         }
     }
     (live, problems)
+}
+
+/// The resolved checkout of a dev link whose recorded tools all still run executable files
+/// inside it. `None` means no marker; it does not mean a recorded link is healthy.
+///
+/// # Errors
+/// The program name is unsafe, the marker cannot be read, the checkout is missing, or a
+/// recorded tool is missing, non-executable, or resolves outside the checkout.
+pub fn live_linked_checkout(layout: &Layout, program: &str) -> std::io::Result<Option<PathBuf>> {
+    if !safe_component(program) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsafe program name",
+        ));
+    }
+    let marker = match read_marker_for_program(layout, program) {
+        Ok(marker) => marker,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let root = fs::canonicalize(marker.checkout)?;
+    let broken = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "development link has a missing, non-executable, or redirected tool",
+        )
+    };
+    if marker.bins.is_empty() || !fs::metadata(&root)?.is_dir() {
+        return Err(broken());
+    }
+    for rel in marker.bins {
+        let tool = bin_tool_name(Path::new(&rel))
+            .and_then(crate::store::ToolName::new)
+            .ok_or_else(broken)?;
+        let target = crate::platform::resolve_shim(&layout.shim(&tool)).ok_or_else(broken)?;
+        let target = fs::canonicalize(target)?;
+        let meta = fs::metadata(&target)?;
+        #[cfg(unix)]
+        let executable = {
+            use std::os::unix::fs::PermissionsExt as _;
+            meta.permissions().mode() & 0o111 != 0
+        };
+        #[cfg(not(unix))]
+        let executable = true;
+        if !target.starts_with(&root) || !meta.is_file() || !executable {
+            return Err(broken());
+        }
+    }
+    Ok(Some(root))
 }
 
 /// Outcome of [`link`] or [`refresh`]: shimmed bin names and refused protected names.
@@ -1229,19 +1251,19 @@ mod tests {
     #[test]
     fn sensitive_bin_name_is_refused_a_link() {
         let l = layout("sensitive");
-        let co = checkout("sensitive", &["ay", "git"]);
+        let co = checkout("sensitive", &["ay", "ssh"]);
         let bins = [
             PathBuf::from("target/release/ay"),
-            PathBuf::from("target/release/git"),
+            PathBuf::from("target/release/ssh"),
         ];
         let out = link(&l, "ay", &co, &bins).unwrap();
         assert_eq!(out.linked, vec!["ay".to_string()]);
-        assert_eq!(out.refused, vec!["git".to_string()]);
-        assert!(crate::store::ToolName::new("git").is_none());
+        assert_eq!(out.refused, vec!["ssh".to_string()]);
+        assert!(crate::store::ToolName::new("ssh").is_none());
         assert!(
             fs::symlink_metadata(
                 l.bin_dir()
-                    .join(format!("git{}", crate::platform::SHIM_SUFFIX))
+                    .join(format!("ssh{}", crate::platform::SHIM_SUFFIX))
             )
             .is_err(),
             "sensitive name never shimmed"

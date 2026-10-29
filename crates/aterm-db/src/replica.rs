@@ -4,7 +4,7 @@
 //! Bounded application repair after the sealed control exchange. Tables and paths
 //! are provisioned locally or discovered through the signed Commons catalog;
 //! peers never choose a local path. Every local batch
-//! reopens secrets custody and checks current peer membership. No journal lock
+//! revalidates secrets custody and checks current peer membership. No journal lock
 //! crosses network I/O. Dynamic subscriptions default on within an enrolled lab.
 
 use crate::{
@@ -31,6 +31,42 @@ const BATCH: usize = 16;
 const PROBE: &[u8] = b"ACTP3";
 const READY: &[u8] = b"ACTA3";
 
+fn admission_deadline() -> std::time::Instant {
+    #[cfg(not(test))]
+    const ADMISSION: std::time::Duration = std::time::Duration::from_secs(2);
+    #[cfg(test)]
+    const ADMISSION: std::time::Duration = std::time::Duration::from_secs(60);
+    std::time::Instant::now() + ADMISSION
+}
+
+/// A bounded operation-ID inventory observed on this authenticated channel.
+/// Equal summaries establish equal ID sets under SHA-256's collision
+/// resistance, not that the peer can currently decrypt or use every operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InventorySummary {
+    pub count: usize,
+    /// SHA-256 over the domain `aterm/commons/table-operation-inventory/1\0`,
+    /// the little-endian u64 count, and the lexicographically sorted 32-byte IDs.
+    /// Local and peer sets use exactly the same encoding.
+    pub fingerprint: Digest,
+}
+impl InventorySummary {
+    /// Summarize an exact operation-ID set with the same canonical encoding as
+    /// authenticated repair reports. Counts alone do not establish equality.
+    pub fn of(ids: &BTreeSet<Digest>) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(b"aterm/commons/table-operation-inventory/1\0");
+        hash.update((ids.len() as u64).to_le_bytes());
+        for id in ids {
+            hash.update(id);
+        }
+        Self {
+            count: ids.len(),
+            fingerprint: hash.finalize(),
+        }
+    }
+}
+
 /// A completed bounded application round, never a claim of global convergence.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Report {
@@ -39,9 +75,25 @@ pub struct Report {
     /// Local retained operation count before this table's positive repair.
     /// This is inventory knowledge, never a claim of complete network history.
     pub retained: usize,
+    /// Local retained operation count after positive operation ingestion in tests.
+    #[cfg(test)]
+    pub(crate) retained_after: usize,
+    /// Exact locally known operation IDs after conflict repair and before any
+    /// positive operation batch. None means the inventory was unavailable.
+    pub local_known: Option<InventorySummary>,
+    /// Locally eligible operation IDs at that same point. These can differ
+    /// from known IDs when retained evidence is ineligible for replication.
+    pub local_offered: Option<InventorySummary>,
+    /// The peer's known operation IDs received before either side sends a
+    /// positive operation batch. This observes one table on one peer, not global
+    /// convergence, and does not disclose the peer's offered subset.
+    pub peer_known: Option<InventorySummary>,
     pub sent: usize,
     pub received: usize,
     pub deferred: usize,
+    /// Encrypted historical handoffs written to the peer in this completed
+    /// round. This is not a separate durable key-receipt acknowledgement.
+    pub keys_sent: usize,
     pub keys_received: usize,
     pub conflicts_sent: usize,
     pub conflicts_received: usize,
@@ -63,6 +115,9 @@ pub struct Replica {
     actor: Actor,
     tables: BTreeMap<Digest, (Scope, PathBuf)>,
     commons: Option<(crate::catalog::Directory, PathBuf)>,
+    /// The clock that places the ring windows, in place of the system's.
+    #[cfg(test)]
+    pub(crate) ring_clock: Option<u64>,
 }
 impl Replica {
     pub fn new(paths: Paths, tables: Vec<(Scope, PathBuf)>) -> Result<Self> {
@@ -72,7 +127,7 @@ impl Replica {
         let bootstrap = Bootstrap::cached(&paths)
             .map_err(crate::table::failure)?
             .ok_or_else(|| Error::new("table repair has no secrets custody"))?;
-        let session = Session::open(&bootstrap)?;
+        let session = Session::observe(&bootstrap)?;
         let trust = bootstrap.trust();
         let actor = session.actor();
         let mut map = BTreeMap::new();
@@ -87,6 +142,8 @@ impl Replica {
             actor,
             tables: map,
             commons: None,
+            #[cfg(test)]
+            ring_clock: None,
         })
     }
     /// Automatic catalog and application subscriptions. Construction performs
@@ -95,40 +152,104 @@ impl Replica {
         let bootstrap = Bootstrap::cached(&paths)
             .map_err(crate::table::failure)?
             .ok_or_else(|| Error::new("Commons repair has no secrets custody"))?;
+        Self::commons_from_bootstrap(paths, config, &bootstrap)
+    }
+
+    /// [`Self::commons`] sharing an absolute local-admission deadline. It still
+    /// caches no grant: every application batch revalidates custody/membership.
+    pub fn commons_until(
+        paths: Paths,
+        config: PathBuf,
+        deadline: std::time::Instant,
+    ) -> Result<Self> {
+        let bootstrap = Bootstrap::cached_until(&paths, deadline)
+            .map_err(crate::table::failure)?
+            .ok_or_else(|| Error::new("Commons repair has no secrets custody"))?;
+        Self::commons_from_bootstrap(paths, config, &bootstrap)
+    }
+
+    fn commons_from_bootstrap(
+        paths: Paths,
+        config: PathBuf,
+        bootstrap: &Bootstrap,
+    ) -> Result<Self> {
         let trust = bootstrap.trust();
         let actor = bootstrap
             .request()
             .map_err(crate::table::failure)?
             .binding()
             .actor();
+        Ok(Self::commons_context(paths, config, trust, actor))
+    }
+
+    pub(crate) fn commons_from_session(
+        paths: Paths,
+        config: PathBuf,
+        session: &Session<'_>,
+    ) -> Result<Self> {
+        let (bootstrap, _) = session.control_context()?;
+        if paths.dir.join("commons/control") != bootstrap.journal_dir() {
+            return Err(Error::new(
+                "Commons subscriptions have another custody path",
+            ));
+        }
+        Ok(Self::commons_context(
+            paths,
+            config,
+            bootstrap.trust(),
+            session.actor(),
+        ))
+    }
+
+    fn commons_context(paths: Paths, config: PathBuf, trust: Trust, actor: Actor) -> Self {
         let directory = crate::catalog::Directory::new(&paths, trust);
-        Ok(Self {
+        Self {
             paths,
             trust,
             actor,
             tables: BTreeMap::new(),
             commons: Some((directory, config)),
-        })
+            #[cfg(test)]
+            ring_clock: None,
+        }
     }
     pub(crate) fn matches(&self, trust: Trust, actor: Actor) -> bool {
         self.trust == trust && self.actor == actor
     }
 
+    /// The clock one exchange places the ring windows by, read once per exchange.
+    fn ring_now(&self) -> Result<u64> {
+        #[cfg(test)]
+        if let Some(now) = self.ring_clock {
+            return Ok(now);
+        }
+        aterm_time::unix_millis()
+            .map(|ms| ms / 1000)
+            .ok_or_else(|| Error::new("system clock cannot place the ring tables"))
+    }
+
     fn observe<T>(
         &self,
+        bootstrap: &Bootstrap,
         peer: Actor,
         expected: Option<[u8; 64]>,
+        write: bool,
         run: impl FnOnce(&Session<'_>) -> Result<T>,
     ) -> Result<T> {
-        let bootstrap = Bootstrap::cached(&self.paths)
-            .map_err(crate::table::failure)?
-            .ok_or_else(|| Error::new("table repair lost secrets custody"))?;
         if bootstrap.trust() != self.trust {
             return Err(Error::new("table repair trust changed"));
         }
         #[cfg(test)]
         tests::session_boundary(0);
-        let session = Session::open(&bootstrap)?;
+        // Both sessions revalidate the exact vault observation and immutable
+        // custody. Only a mutation waits for the control writer; reads use its
+        // acknowledged prefix. No session survives this local batch.
+        let session = if write {
+            Session::open_until(bootstrap, admission_deadline())
+        } else {
+            Session::observe(bootstrap)
+        }
+        .map_err(|error| Error(format!("table repair session admission: {error}")))?;
         #[cfg(test)]
         tests::session_boundary(1);
         if session.actor() != self.actor {
@@ -147,9 +268,17 @@ impl Replica {
             .as_ref()
             .map(|(_, config)| crate::catalog::policy::Policy::read(config))
             .transpose()?;
+        let bootstrap = Bootstrap::cached_until(&self.paths, admission_deadline())
+            .map_err(|error| Error(format!("table repair bootstrap custody admission: {error}")))?
+            .ok_or_else(|| Error::new("table repair lost secrets custody"))?;
+        let observation = self.observe(&bootstrap, peer, None, false, |session| {
+            session.observation()
+        })?;
         Ok(Round {
             replica: self,
-            observation: self.observe(peer, None, |session| session.observation())?,
+            bootstrap,
+            observation,
+            now: self.ring_now()?,
             policy,
             tables: self.tables.clone(),
             active_table: std::cell::Cell::new(None),
@@ -248,7 +377,10 @@ struct Inventory {
 
 struct Round<'a> {
     replica: &'a Replica,
+    bootstrap: Bootstrap,
     observation: [u8; 64],
+    /// The ring windows' clock for this whole exchange.
+    now: u64,
     policy: Option<crate::catalog::policy::Policy>,
     tables: BTreeMap<Digest, (Scope, PathBuf)>,
     active_table: std::cell::Cell<Option<Digest>>,
@@ -262,12 +394,27 @@ impl std::ops::Deref for Round<'_> {
 impl Round<'_> {
     fn store(&self, session: &Session<'_>, id: Digest) -> Result<Store> {
         let (scope, path) = &self.tables[&id];
-        if let Some((directory, _)) = &self.commons {
+        if let Some((directory, _)) = &self.commons
+            && session.has_control_writer()
+        {
             directory.enroll(session, *scope)
         } else {
             Store::open(session, path, *scope)
         }
     }
+
+    fn local<T>(&self, peer: Actor, run: impl FnOnce(&Session<'_>) -> Result<T>) -> Result<T> {
+        self.admit(peer, false, run)
+    }
+
+    fn local_write<T>(
+        &self,
+        peer: Actor,
+        run: impl FnOnce(&Session<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.admit(peer, true, run)
+    }
+
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -292,12 +439,21 @@ impl Round<'_> {
             project = "aterm_db::replica::tests::policy::policy_transition"
         )
     )]
-    fn local<T>(&self, peer: Actor, run: impl FnOnce(&Session<'_>) -> Result<T>) -> Result<T> {
-        self.replica
-            .observe(peer, Some(self.observation), |session| {
+    fn admit<T>(
+        &self,
+        peer: Actor,
+        write: bool,
+        run: impl FnOnce(&Session<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.replica.observe(
+            &self.bootstrap,
+            peer,
+            Some(self.observation),
+            write,
+            |session| {
                 // Custody and journal replay can take time. Read local policy
-                // after opening the locked session, before admitting this batch.
-                // Config writers need not take that lock: later edits take
+                // after admitting the session, before admitting this batch.
+                // Config writers need not take a control lock: later edits take
                 // effect at the next admission, not retroactively on this one.
                 if let Some((directory, config)) = &self.commons {
                     let policy = crate::catalog::policy::Policy::read(config)?;
@@ -318,12 +474,14 @@ impl Round<'_> {
                         session,
                         self.policy.as_ref().expect("Commons policy captured"),
                         id,
+                        self.now,
                     )?
                 {
                     return Err(Error::new("table subscription changed during repair"));
                 }
                 run(session)
-            })
+            },
+        )
     }
 
     fn exchange(
@@ -348,12 +506,34 @@ impl Round<'_> {
         let mut report = Report::default();
         self.keys(stream, peer, side, repair, &mut report)?;
         if let Some((directory, _)) = &self.commons {
-            self.tables = self.local(peer, |session| {
-                directory.subscriptions(
-                    session,
-                    self.policy.as_ref().expect("Commons policy captured"),
-                )
+            let policy = self.policy.as_ref().expect("Commons policy captured");
+            let existing = self.local(peer, |session| {
+                let Some(mut tables) = directory.existing_subscriptions(session, policy)? else {
+                    return Ok(None);
+                };
+                // Ring tables join the catalog's; damaged ring state asks for the writer, whose
+                // retirement rebuilds it. The catalog's tables are repaired whatever the rings
+                // say: the offered tables' window reads a damaged state as none (`ring_view`).
+                match directory.existing_ring_subscriptions(session, policy, self.now) {
+                    Ok(Some(rings)) => {
+                        tables.extend(rings);
+                        Ok(Some(tables))
+                    }
+                    Ok(None) | Err(_) => Ok(None),
+                }
             })?;
+            self.tables = match existing {
+                Some(tables) => tables,
+                None => self.local_write(peer, |session| {
+                    let mut tables = directory.subscriptions(session, policy)?;
+                    tables.extend(
+                        directory
+                            .ring_subscriptions(session, policy, self.now)
+                            .unwrap_or_default(),
+                    );
+                    Ok(tables)
+                })?,
+            };
         }
         repair.records.retain(|id, _| self.tables.contains_key(id));
         repair
@@ -385,6 +565,25 @@ impl Round<'_> {
                 }
             }
         };
+        // A ring table the peer lists and this Mac lacks is taken up for a later round; this
+        // round keeps to the tables both sides listed. One that cannot be taken up now is
+        // offered again next round.
+        if let Some((directory, _)) = &self.commons {
+            let policy = self.policy.as_ref().expect("Commons policy captured");
+            let offered = self.local(peer, |session| {
+                let window = directory.ring_window(session, self.now)?;
+                Ok(remote
+                    .difference(&local)
+                    .filter(|id| window.contains(*id))
+                    .copied()
+                    .collect::<BTreeSet<_>>())
+            })?;
+            if !offered.is_empty() {
+                let _ = self.local_write(peer, |session| {
+                    directory.adopt_ring_tables(session, policy, self.now, &offered)
+                });
+            }
+        }
         let Some(id) = selected else {
             return Ok(report);
         };
@@ -426,12 +625,12 @@ impl Round<'_> {
         let remote = exchange_ids(stream, side, &local, BATCH, || self.local(peer, |_| Ok(())))?;
         match side {
             Side::Initiator => {
-                self.send_keys(stream, peer, &remote)?;
+                self.send_keys(stream, peer, &remote, report)?;
                 self.receive_keys(stream, peer, &local, report)?;
             }
             Side::Responder => {
                 self.receive_keys(stream, peer, &local, report)?;
-                self.send_keys(stream, peer, &remote)?;
+                self.send_keys(stream, peer, &remote, report)?;
             }
         }
         Ok(())
@@ -441,6 +640,7 @@ impl Round<'_> {
         stream: &mut impl Write,
         peer: Actor,
         needs: &BTreeSet<Digest>,
+        report: &mut Report,
     ) -> Result<()> {
         let keys = self.local(peer, |session| {
             session.handoffs(peer, &needs.iter().copied().collect::<Vec<_>>())
@@ -449,6 +649,7 @@ impl Round<'_> {
             stream.write_all(&[u8::from(key.is_some())])?;
             if let Some(key) = key {
                 control::send_frame(stream, &key)?;
+                report.keys_sent += 1;
             }
         }
         stream.flush()?;
@@ -481,7 +682,7 @@ impl Round<'_> {
         }
         // One bounded, fully buffered batch. Validate current membership after
         // its final network read; never hold custody locks while receiving it.
-        let accepted = self.local(peer, |session| {
+        let import = |session: &Session<'_>| {
             Ok(keys
                 .iter()
                 .filter(|(source, key)| {
@@ -489,7 +690,12 @@ impl Round<'_> {
                         .is_some_and(|key| session.import_handoff(*source, key).is_ok())
                 })
                 .count())
-        })?;
+        };
+        let accepted = if keys.iter().any(|(_, key)| key.is_some()) {
+            self.local_write(peer, import)?
+        } else {
+            self.local(peer, import)?
+        };
         report.keys_received += accepted;
         report.deferred += keys.len() - accepted;
         Ok(())
@@ -583,6 +789,21 @@ impl Round<'_> {
         report: &mut Report,
     ) -> Result<()> {
         self.active_table.set(Some(id));
+        if self.commons.is_some() {
+            let (scope, path) = &self.tables[&id];
+            let absent = self.local(peer, |session| {
+                // A damaged established store stays deferred. Only storage with no
+                // enrollment yet (an empty discovery reservation, or a first
+                // enrollment cut short after its pending claim) needs `join`.
+                Ok(matches!(
+                    Store::observe_if_exists(session, path, *scope),
+                    Ok(None)
+                ))
+            })?;
+            if absent {
+                self.local_write(peer, |session| self.store(session, id).map(drop))?;
+            }
+        }
         if !self.conflicts(stream, peer, side, id, repair, report)? {
             return Ok(());
         }
@@ -600,6 +821,13 @@ impl Round<'_> {
             return Ok(());
         };
         report.retained = local.known.len();
+        #[cfg(test)]
+        {
+            report.retained_after = local.known.len();
+        }
+        report.local_known = Some(InventorySummary::of(&local.known));
+        report.local_offered = Some(InventorySummary::of(&local.offered));
+        report.peer_known = Some(InventorySummary::of(&remote));
         let ids: Vec<_> = cycle(&local.offered, repair.records.get(&id).copied())
             .filter(|v| !remote.contains(*v))
             .take(BATCH)
@@ -687,11 +915,16 @@ impl Round<'_> {
             }
             wires.push(wire);
         }
-        let verdicts = self.local(peer, |session| {
+        if wires.is_empty() {
+            self.local(peer, |_| Ok(()))?;
+            stream.flush()?;
+            return Ok(());
+        }
+        let (verdicts, retained_after) = self.local_write(peer, |session| {
             let Ok(mut store) = self.store(session, id) else {
-                return Ok(vec![false; n]);
+                return Ok((vec![false; n], None));
             };
-            Ok(wires
+            let verdicts = wires
                 .iter()
                 .map(|wire| {
                     let receipt = match kind {
@@ -700,8 +933,18 @@ impl Round<'_> {
                     };
                     receipt.is_ok_and(|r| r.id == Sha256::digest(wire))
                 })
-                .collect::<Vec<_>>())
+                .collect::<Vec<_>>();
+            let retained_after = matches!(kind, BatchKind::Operation)
+                .then(|| store.inventory(session).ok().map(Iterator::count))
+                .flatten();
+            Ok((verdicts, retained_after))
         })?;
+        #[cfg(test)]
+        if let Some(count) = retained_after {
+            report.retained_after = count;
+        }
+        #[cfg(not(test))]
+        let _ = retained_after;
         self.local(peer, |_| Ok(()))?;
         for (wire, accepted) in wires.iter().zip(verdicts) {
             stream.write_all(&Sha256::digest(wire))?;
@@ -836,7 +1079,7 @@ fn receive_inventory<const N: usize>(
     aterm_spec_anchor::spec_unmodeled(
         machine = "DbRepairPolicy",
         action = "NextPolicy",
-        reason = "The conformance fixture selects one of eight independent config edits before admission; Round::local observes the resulting policy but does not choose the writer's edit. policy_admission_conforms_and_stale_policy_and_false_receipts_are_detected exercises every selection."
+        reason = "The conformance fixture selects one of eight independent config edits before admission; Round::admit observes the resulting policy but does not choose the writer's edit. policy_admission_conforms_and_stale_policy_and_false_receipts_are_detected exercises every selection."
     )
 )]
 #[cfg_attr(
@@ -844,7 +1087,7 @@ fn receive_inventory<const N: usize>(
     aterm_spec_anchor::spec_unmodeled(
         machine = "DbRepairPolicy",
         action = "Receiving",
-        reason = "The conformance fixture selects an outgoing or incoming batch; the shared Round::local admission does not select its caller's transfer direction. policy_admission_conforms_and_stale_policy_and_false_receipts_are_detected exercises both directions and their retained storage."
+        reason = "The conformance fixture selects an outgoing or incoming batch; the shared Round::admit admission does not select its caller's transfer direction. policy_admission_conforms_and_stale_policy_and_false_receipts_are_detected exercises both directions and their retained storage."
     )
 )]
 #[cfg_attr(
@@ -852,7 +1095,7 @@ fn receive_inventory<const N: usize>(
     aterm_spec_anchor::spec_unmodeled(
         machine = "DbRepairPolicy",
         action = "AfterOpen",
-        reason = "The conformance fixture selects whether the independent config edit runs before or after Session::open; this selector is not a production admission step. policy_admission_conforms_and_stale_policy_and_false_receipts_are_detected exercises both boundaries, whose hook fires only at its selected boundary."
+        reason = "The conformance fixture selects whether the independent config edit runs before or after session admission; this selector is not a production admission step. policy_admission_conforms_and_stale_policy_and_false_receipts_are_detected exercises both boundaries, whose hook fires only at its selected boundary."
     )
 )]
 #[doc(hidden)]

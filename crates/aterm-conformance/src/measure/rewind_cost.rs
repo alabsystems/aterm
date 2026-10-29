@@ -26,7 +26,7 @@ pub enum CostRow {
         pairs: u32,
         min_milli: u64,
     },
-    /// One idle pane, `pairs` ABBA pairs (off, on, on, off), each take a fresh instance: passes when the on arm's median resident size is at most `max_extra_bytes` over the off arm's and, on a bundle that records by default (one more instance with no `temporal_recording` key says), at most [`APP_IDLE_TARGET_BYTES`] ([`idle_verdict`]).
+    /// One idle pane, `pairs` ABBA pairs (off, on, on, off), each take a fresh instance: passes when the on arm's median resident size is at most `max_extra_bytes` over the off arm's and, on a bundle that records by default (one more instance with no `temporal_recording` key says), at most [`APP_IDLE_TARGET_BYTES`] ([`idle_verdict`]). Each take's app memory ([`app_bytes`]) is reported beside it and judges nothing.
     IdleRss { pairs: u32, max_extra_bytes: u64 },
     /// `panes` panes each draining `bytes` at once: passes when recording on adds at most `max_extra_bytes` of resident size over recording off and the pool holds no more than its limit.
     BusyRss {
@@ -125,12 +125,64 @@ impl Take {
 
     /// The instance's resident size in bytes, once its panes are quiet.
     fn settled_rss(&self) -> Result<u64, CouldNotRun> {
+        Ok(self.settled()?.rss)
+    }
+
+    /// The instance's resident size and app memory ([`app_bytes`]), once its panes are quiet.
+    fn settled(&self) -> Result<Settled, CouldNotRun> {
         self.inst
             .ctl
             .ok(&["await", "idle", "2000", "timeout=120000"])?;
         std::thread::sleep(std::time::Duration::from_secs(2));
-        rss_bytes(self.inst.pid())
+        let pid = self.inst.pid();
+        Ok(Settled {
+            rss: rss_bytes(pid)?,
+            app: app_bytes(pid)?,
+        })
     }
+}
+
+/// One settled take's two sizes, in bytes.
+struct Settled {
+    /// `ps`'s resident size ([`rss_bytes`]).
+    rss: u64,
+    /// The app's own memory ([`app_bytes`]).
+    app: u64,
+}
+
+/// The memory `pid` holds for itself, in bytes, which the idle row reports beside `ps`'s resident size. On macOS
+/// that is its physical footprint (`proc_pid_rusage`'s `ri_phys_footprint`, Activity Monitor's
+/// "Memory"): its dirty private pages, compressed ones too, and none of the clean file-backed
+/// pages (aterm's own code, mostly) that `ps`'s resident size also counts, which the kernel
+/// can drop at any time and which move with the rest of the Mac's memory pressure. Elsewhere it
+/// is the resident size.
+#[cfg(target_os = "macos")]
+fn app_bytes(pid: u32) -> Result<u64, CouldNotRun> {
+    let id = libc::c_int::try_from(pid)
+        .map_err(|_| CouldNotRun::Refused(format!("pid {pid} is out of range")))?;
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    // SAFETY: `info` is a zeroed `rusage_info_v4`, the struct `RUSAGE_INFO_V4` fills; the
+    // kernel writes at most its size, and it is read only on success.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            id,
+            libc::RUSAGE_INFO_V4,
+            info.as_mut_ptr().cast::<libc::rusage_info_t>(),
+        )
+    };
+    if rc != 0 {
+        return Err(CouldNotRun::Refused(format!(
+            "proc_pid_rusage named no footprint for {pid}"
+        )));
+    }
+    // SAFETY: zeroed is a valid `rusage_info_v4` (plain integers), and the kernel filled it.
+    Ok(unsafe { info.assume_init() }.ri_phys_footprint)
+}
+
+/// The resident size, where the platform names no footprint.
+#[cfg(not(target_os = "macos"))]
+fn app_bytes(pid: u32) -> Result<u64, CouldNotRun> {
+    rss_bytes(pid)
 }
 
 /// `ps`'s resident size of `pid`, in bytes.
@@ -172,11 +224,12 @@ pub fn added_bytes(off: &[u64], on: &[u64]) -> u64 {
     median(on).saturating_sub(median(off))
 }
 
-/// An idle row's verdict: passes when both arms were taken, recording adds at most `max_extra` bytes ([`added_bytes`]), and, when the bundle records by default, the on arm's median is at most [`APP_IDLE_TARGET_BYTES`]. A bundle that records only when asked is not judged on the app's own size.
+/// An idle row's verdict: passes when both arms were taken, recording adds at most `max_extra` resident bytes ([`added_bytes`]), and, when the bundle records by default, the on arm's median app footprint is at most [`APP_IDLE_TARGET_BYTES`]. A bundle that records only when asked is not judged on the app's own size.
 #[must_use]
 pub fn idle_verdict(
     off: &[u64],
     on: &[u64],
+    on_app: &[u64],
     max_extra: u64,
     records_by_default: bool,
 ) -> ShapeVerdict {
@@ -184,7 +237,8 @@ pub fn idle_verdict(
         !off.is_empty()
             && !on.is_empty()
             && added_bytes(off, on) <= max_extra
-            && (!records_by_default || median(on) <= APP_IDLE_TARGET_BYTES),
+            && (!records_by_default
+                || (!on_app.is_empty() && median(on_app) <= APP_IDLE_TARGET_BYTES)),
     )
 }
 
@@ -229,24 +283,31 @@ pub fn measure(rig: &Rig, row: &CostRow) -> Result<CostReport, CouldNotRun> {
         } => {
             let by_default = Take::records_by_default(rig, budget)?;
             let (mut off, mut on) = (Vec::new(), Vec::new());
+            let (mut off_app, mut on_app) = (Vec::new(), Vec::new());
             for _ in 0..pairs {
                 for record in [false, true, true, false] {
-                    let rss = Take::launch(rig, record, budget)?.settled_rss()?;
-                    if record { &mut on } else { &mut off }.push(rss);
+                    let took = Take::launch(rig, record, budget)?.settled()?;
+                    if record { &mut on } else { &mut off }.push(took.rss);
+                    if record { &mut on_app } else { &mut off_app }.push(took.app);
                 }
             }
             let on_median = median(&on);
+            let on_app_median = median(&on_app);
             Ok(CostReport {
                 line: format!(
                     "COST idle_rss pairs={pairs} off_bytes={off:?} on_bytes={on:?} \
                      off_median_bytes={} on_median_bytes={on_median} extra_bytes={} \
-                     max_extra_bytes={max_extra_bytes} records_by_default={by_default} \
+                     max_extra_bytes={max_extra_bytes} off_app_bytes={off_app:?} \
+                     on_app_bytes={on_app:?} off_app_median_bytes={} \
+                     on_app_median_bytes={} records_by_default={by_default} \
                      app_target_bytes={APP_IDLE_TARGET_BYTES} app_target_met={}",
                     median(&off),
                     added_bytes(&off, &on),
-                    on_median <= APP_IDLE_TARGET_BYTES,
+                    median(&off_app),
+                    on_app_median,
+                    on_app_median <= APP_IDLE_TARGET_BYTES,
                 ),
-                verdict: idle_verdict(&off, &on, max_extra_bytes, by_default),
+                verdict: idle_verdict(&off, &on, &on_app, max_extra_bytes, by_default),
             })
         }
         CostRow::BusyRss {
@@ -341,32 +402,147 @@ mod tests {
         // e11bf220e1's take: the app is twice §7.2's target with recording on and off.
         let (off, on) = ([50_266_112], [50_806_784]);
         assert_eq!(added_bytes(&off, &on), 540_672);
-        assert_eq!(idle_verdict(&off, &on, PANE, false), ShapeVerdict::Pass);
         assert_eq!(
-            idle_verdict(&off, &on, PANE, true),
+            idle_verdict(&off, &on, &[], PANE, false),
+            ShapeVerdict::Pass
+        );
+        assert_eq!(
+            idle_verdict(&off, &on, &on, PANE, true),
             ShapeVerdict::Fail,
             "a bundle that records by default is held to the 25 MB idle target"
         );
         assert_eq!(
-            idle_verdict(&[20_000_000], &[24_000_000], PANE, true),
+            idle_verdict(&[20_000_000], &[24_000_000], &[24_000_000], PANE, true),
             ShapeVerdict::Pass,
             "one that meets it passes"
         );
         assert_eq!(
-            idle_verdict(&off, &[59_000_000], PANE, false),
+            idle_verdict(&off, &[59_000_000], &[], PANE, false),
             ShapeVerdict::Fail,
             "8.7 MB added is past one pane's budget"
         );
         assert_eq!(
-            idle_verdict(&[50_000_000], &[49_000_000], 0, false),
+            idle_verdict(&[50_000_000], &[49_000_000], &[], 0, false),
             ShapeVerdict::Pass,
             "a smaller on arm adds nothing"
         );
-        assert_eq!(idle_verdict(&[], &[1], PANE, false), ShapeVerdict::Fail);
         assert_eq!(
-            idle_verdict(&[1], &[], PANE, false),
+            idle_verdict(&[], &[1], &[], PANE, false),
+            ShapeVerdict::Fail
+        );
+        assert_eq!(
+            idle_verdict(&[1], &[], &[], PANE, false),
             ShapeVerdict::Fail,
             "no take passes nothing"
+        );
+        assert_eq!(
+            idle_verdict(&[35_000_000], &[35_100_000], &[11_000_000], PANE, true),
+            ShapeVerdict::Pass,
+            "clean file-backed pages count toward resident size, not the app footprint"
+        );
+    }
+
+    /// The app reading is the footprint, not the resident size: a 64 MiB file this process
+    /// maps and reads is resident and clean, so `ps` counts it and the footprint does not;
+    /// 64 MiB of memory it writes is dirty, and the footprint counts it. The readings run in a
+    /// child of this test binary that runs this test alone: in the shared test process, the
+    /// other tests' own allocations moved the footprint between two readings by more than the
+    /// bound.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_app_reading_counts_dirty_pages_and_not_clean_file_pages() {
+        const CHILD: &str = "ATERM_TEST_APP_READING_CHILD";
+        const HANG: std::time::Duration = std::time::Duration::from_secs(60);
+        let test = "measure::rewind_cost::tests::the_app_reading_counts_dirty_pages_and_not_clean_file_pages";
+        if std::env::var_os(CHILD).is_none() {
+            let mut cmd =
+                aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"));
+            cmd.args([test, "--exact", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1");
+            let out = aterm_uds::deadline::output_within(&mut cmd, HANG).expect("the child ends");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line.starts_with("test result: ok. 1 passed;")),
+                "the child ran no test:\n{stdout}"
+            );
+            return;
+        }
+        const LEN: usize = 64 << 20;
+        const PAGE: usize = 16 << 10;
+        let pid = std::process::id();
+        let dir = aterm_tempfile::TempDir::new().expect("a scratch directory");
+        let path = dir.path().join("clean.bin");
+        {
+            use std::io::Write as _;
+            let mut out = std::fs::File::create(&path).expect("the file");
+            let chunk = vec![7u8; 1 << 20];
+            for _ in 0..LEN >> 20 {
+                out.write_all(&chunk).expect("the file's bytes");
+            }
+        }
+        let file = std::fs::File::open(&path).expect("the file");
+        let (rss_0, app_0) = (rss_bytes(pid).expect("rss"), app_bytes(pid).expect("app"));
+        // SAFETY: a fresh read-only private mapping of `LEN` bytes of an open file of that
+        // length; it is unmapped below and nothing else holds it.
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                LEN,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                std::os::fd::AsRawFd::as_raw_fd(&file),
+                0,
+            )
+        };
+        assert_ne!(map, libc::MAP_FAILED, "the mapping");
+        let mut sum = 0u64;
+        for off in (0..LEN).step_by(PAGE) {
+            // SAFETY: `off < LEN`, inside the live mapping.
+            sum += u64::from(unsafe { std::ptr::read_volatile(map.cast::<u8>().add(off)) });
+        }
+        assert_eq!(sum, 7 * (LEN / PAGE) as u64, "fixture: every page was read");
+        let (rss_1, app_1) = (rss_bytes(pid).expect("rss"), app_bytes(pid).expect("app"));
+        // SAFETY: the mapping made above, `LEN` long, unmapped once.
+        assert_eq!(unsafe { libc::munmap(map, LEN) }, 0, "the unmap");
+        // Fresh anonymous pages (a heap buffer could reuse pages the file's write dirtied).
+        // SAFETY: a new private anonymous read-write mapping of `LEN` bytes, unmapped below.
+        let anon = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(anon, libc::MAP_FAILED, "the anonymous mapping");
+        for off in (0..LEN).step_by(PAGE) {
+            // SAFETY: `off < LEN`, inside the live writable mapping.
+            unsafe { std::ptr::write_volatile(anon.cast::<u8>().add(off), 1) };
+        }
+        let app_2 = app_bytes(pid).expect("app");
+        // SAFETY: the anonymous mapping made above, `LEN` long, unmapped once.
+        assert_eq!(unsafe { libc::munmap(anon, LEN) }, 0, "the anonymous unmap");
+        assert!(
+            rss_1 >= rss_0 + (48 << 20),
+            "fixture: the read file pages are resident ({rss_0} -> {rss_1})"
+        );
+        assert!(
+            app_1 < app_0 + (16 << 20),
+            "the app reading counted clean file pages ({app_0} -> {app_1})"
+        );
+        assert!(
+            app_2 >= app_1 + (48 << 20),
+            "the app reading missed 64 MiB of written memory ({app_1} -> {app_2})"
         );
     }
 
@@ -380,10 +556,13 @@ mod tests {
             48_170_000, 48_120_000, 37_810_000, 48_840_000, 48_460_000, 48_910_000,
         ];
         assert_eq!(added_bytes(&off, &on), 360_000);
-        assert_eq!(idle_verdict(&off, &on, PANE, false), ShapeVerdict::Pass);
+        assert_eq!(
+            idle_verdict(&off, &on, &[], PANE, false),
+            ShapeVerdict::Pass
+        );
         // fd2a2d37fc's one pair put its on take 12 MB under its off take (26.9 against 38.9 MB); the same spread with the off take low fails a row judged on one pair.
         assert_eq!(
-            idle_verdict(&[26_900_000], &[38_900_000], PANE, false),
+            idle_verdict(&[26_900_000], &[38_900_000], &[], PANE, false),
             ShapeVerdict::Fail
         );
     }

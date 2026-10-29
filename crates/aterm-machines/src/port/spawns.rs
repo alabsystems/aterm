@@ -98,7 +98,7 @@ impl System for Spawns<'_> {
     fn responsible_app(&self) -> Option<String> {
         self.live.responsible_app()
     }
-    fn walk_accessibility(&self) -> bool {
+    fn walk_accessibility(&self) -> super::AccessibilityWalk {
         self.live.walk_accessibility()
     }
     fn remove(&self, path: &Path) -> io::Result<()> {

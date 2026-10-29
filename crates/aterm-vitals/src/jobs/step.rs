@@ -387,7 +387,8 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
             );
         }
         if let Some(pi) = ev.pageins {
-            let wait_per_s = pi * PAGEIN_WAIT_MS * 1000 / ev.dt_ms;
+            let wait_per_s =
+                u128::from(pi) * u128::from(PAGEIN_WAIT_MS) * 1000 / u128::from(ev.dt_ms);
             t.thrash.feed(
                 cx.thrashing && wait_per_s >= 100,
                 !cx.thrashing || wait_per_s < 50,
@@ -491,7 +492,9 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
                     let v = if w.name == WaitName::TtyPassword && cx.consumer == Consumer::PersonFg
                     {
                         Verdict::WaitingYou
-                    } else if follows && t.follow_since.is_some_and(|s| at - s >= NEVER_RETURNS_MS)
+                    } else if follows
+                        && t.follow_since
+                            .is_some_and(|s| at.saturating_sub(s) >= NEVER_RETURNS_MS)
                     {
                         Verdict::NeverReturns
                     } else {
@@ -589,7 +592,9 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
                 }
                 Class::Thrashing => {
                     let share = ev.pageins.map_or(0, |pi| {
-                        (pi * PAGEIN_WAIT_MS * 1000 / ev.dt_ms.max(1)).min(900)
+                        let raw = u128::from(pi) * u128::from(PAGEIN_WAIT_MS) * 1000
+                            / u128::from(ev.dt_ms.max(1));
+                        u64::try_from(raw.min(900)).unwrap_or(900)
                     });
                     mu.saturating_mul(1000) / (1000 - share)
                 }

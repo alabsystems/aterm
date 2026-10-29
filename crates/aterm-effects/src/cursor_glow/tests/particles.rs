@@ -16,6 +16,7 @@ fn grain(x: f32, y: f32, hue: f32, born: Instant) -> Particle {
         hue,
         cov_scale: 1.0,
         born,
+        edge_cut: false,
     }
 }
 
@@ -193,6 +194,126 @@ fn sparkle_s_gold_reads_gold_on_a_tinted_page() {
     );
 }
 
+/// looks10 L11, A MOON THE GUARD CUTS STAYS GOLD: on Solarized Dark's teal a moon is added
+/// to the night ground the frame lays after the letter guard ([`CursorGlow::ground_the_frame`]),
+/// as the shower's grains and stars are, so cut to any share of its light (the guard scales an
+/// added light's colour) no pixel of it reads more than twelve degrees past its gold's hue on
+/// the reference page toward green, short of the page's own cyan (160 degrees; a faint edge
+/// over a partial ground reads the page's slate, `#283331`), over its own ground. Negative control: laid over the teal as it reads on the reference page
+/// ([`CrescentInk::Page`], where no night ground lies) and cut as the guard cuts a source-over
+/// light, colour and opacity alike, the moon let the teal through and its horns read olive
+/// beside the letters (`#68663d`, hue 56, in the replay's `split`).
+#[test]
+fn a_moon_the_guard_cuts_stays_gold_on_a_tinted_page() {
+    use crate::color_math::rgb2hsv;
+    const TEAL: u32 = 0x0000_2B36;
+    let g = retina_geom();
+    let at = Instant::now();
+    let mut c = cfg(GlowStyle::Sparkle, true);
+    c.theme_bg = TEAL;
+    c.color = crate::cursor_glow::style::SPARKLE_DEFAULT_COLOR;
+    let spot = (
+        g.origin_x as f32 + 12.5 * g.cw as f32,
+        g.origin_y as f32 + 0.5 * g.ch as f32,
+    );
+    let moon = |grounded: bool| {
+        let mut glow = probed_glow(&c, g, at);
+        glow.night_ground_off = !grounded;
+        glow.particles.push(grain(spot.0, spot.1, seed_hue(6), at));
+        let (mut out, mut halos, mut under) = (Vec::new(), Vec::new(), Vec::new());
+        glow.emit_particles(
+            at,
+            &c,
+            g,
+            &mut out,
+            &mut halos,
+            &mut crate::cursor_glow::glow_sink(
+                &mut under,
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
+            CursorGlow::MAX_QUADS,
+        );
+        (glow, out)
+    };
+    let gold_hue = {
+        let ch = |sh: u32| {
+            ((0x0011_1318u32 >> sh) & 0xff) + ((CursorGlow::MOON_GOLD >> sh) & 0xff) * 3 / 4
+        };
+        rgb2hsv((ch(16).min(255) << 16) | (ch(8).min(255) << 8) | ch(0).min(255)).0
+    };
+    // The pixels the cut moon moves off the teal whose hue is off its gold's.
+    let off_gold = |glow: &mut CursorGlow, cut: &[GlowQuad]| {
+        glow.under_out.clear();
+        glow.ground_the_frame(&c, g, cut);
+        let mut lit = Glass::new(g, TEAL);
+        lit.add_quads(&glow.under_out);
+        lit.add_quads(cut);
+        let (mut moved, mut off) = (0usize, 0usize);
+        for &p in &lit.px {
+            let p = p & 0x00FF_FFFF;
+            let gap = [16u32, 8, 0]
+                .iter()
+                .any(|&sh| ((p >> sh) & 0xff).abs_diff((TEAL >> sh) & 0xff) > 12);
+            let (h, s, v) = rgb2hsv(p);
+            if !gap || s < 0.2 || v < 0.12 {
+                continue;
+            }
+            moved += 1;
+            off += usize::from(h > gold_hue + 12.0 && h < 160.0);
+        }
+        (moved, off)
+    };
+    let sc = |c: u32, k: f32| {
+        let f = |sh: u32| ((((c >> sh) & 0xff) as f32 * k) as u32) << sh;
+        f(16) | f(8) | f(0)
+    };
+    let (mut glow, laid) = moon(true);
+    assert!(
+        !laid.is_empty() && laid.iter().all(|q| q.alpha == 0 && q.alpha2 == 0),
+        "on the grounded teal the moon is an added light"
+    );
+    for share in [1.0f32, 0.7, 0.5, 0.3, 0.15] {
+        let cut: Vec<GlowQuad> = laid
+            .iter()
+            .map(|q| GlowQuad {
+                color: sc(q.color, share),
+                color2: sc(q.color2, share),
+                ..*q
+            })
+            .collect();
+        let (moved, off) = off_gold(&mut glow, &cut);
+        assert!(
+            moved > 4,
+            "fixture: the moon at {share} lights the page ({moved} px)"
+        );
+        assert_eq!(
+            off, 0,
+            "at {share} of its light {off} of the moon's {moved} px read off its gold"
+        );
+    }
+    let (mut bare, page_laid) = moon(false);
+    assert!(
+        page_laid.iter().any(|q| q.alpha > 0),
+        "control: with no night ground the moon is laid over the teal"
+    );
+    let cut: Vec<GlowQuad> = page_laid
+        .iter()
+        .map(|q| GlowQuad {
+            color: sc(q.color, 0.4),
+            color2: sc(q.color2, 0.4),
+            alpha: (f32::from(q.alpha) * 0.4) as u8,
+            alpha2: (f32::from(q.alpha2) * 0.4) as u8,
+            ..*q
+        })
+        .collect();
+    let (moved, off) = off_gold(&mut bare, &cut);
+    assert!(
+        off * 3 > moved,
+        "control: cut over the teal only {off} of the moon's {moved} px read off its gold"
+    );
+}
+
 #[test]
 fn stardust_is_the_body_the_plus_is_the_accent() {
     let g = geom();
@@ -234,14 +355,16 @@ fn stardust_is_the_body_the_plus_is_the_accent() {
         out.is_empty() && !halos.is_empty(),
         "an undealt comet grain is a round mote at its peak too, with no white core square"
     );
+    // A grain the star accent deals is dust too: its white glint read as a
+    // grey `+` (looks10 L9).
     let dealt = seed_hue(16);
-    let (out, _) = emit_one(&c, g, grain(x, y, dealt, born), peak_age(dealt));
-    assert!(!out.is_empty(), "the dealt comet grain glints at its peak");
-    let (out, halos) = emit_one(&c, g, grain(x, y, dealt, born), peak_age(dealt) + 0.17);
-    assert!(
-        out.is_empty() && !halos.is_empty(),
-        "off its peak the dealt grain is dust"
-    );
+    for age in [peak_age(dealt), peak_age(dealt) + 0.17] {
+        let (out, halos) = emit_one(&c, g, grain(x, y, dealt, born), age);
+        assert!(
+            out.is_empty() && !halos.is_empty(),
+            "the dealt comet grain is a round mote at {age:.2} s, with no glint"
+        );
+    }
 }
 
 /// The particles stop where their stream's lights fill it, the lit rows of
@@ -545,47 +668,25 @@ fn a_full_pool_sheds_the_oldest_grains_never_the_head() {
     );
 }
 
+/// A grain of Comet's dust is a mote of the tail's ice at its twinkle's
+/// peak, on the dark page and on paper: its round body and no star (looks10
+/// L9: its white four-point glint read as a grey `+`, the shower Sparkle
+/// owns). On paper it is ink under the letters.
 #[test]
-fn a_dealt_comet_grain_glints_over_its_body() {
+fn a_dealt_comet_grain_is_a_mote_with_no_glint() {
     let g = geom();
     let born = Instant::now();
     let (x, y) = (100.0, 40.0);
     let dealt = seed_hue(16);
     let peak = peak_age(dealt);
-    let past = peak + 0.88f32.acos() / crate::effect_util::TWINKLE_OMEGA;
     let c = cfg(GlowStyle::Comet, true);
-    let ink = |age: f32| {
-        let (out, halos) = emit_one(&c, g, grain(x, y, dealt, born), age);
-        let mut glass = Glass::new(g, c.theme_bg);
-        glass.add_halos(&halos);
-        glass.add_quads(&out);
-        let off_ground = |px: u32| -> i64 {
-            [16u32, 8, 0]
-                .iter()
-                .map(|&sh| {
-                    (i64::from((px >> sh) & 0xff) - i64::from((c.theme_bg >> sh) & 0xff)).abs()
-                })
-                .sum()
-        };
-        let total: i64 = glass.px.iter().map(|&px| off_ground(px)).sum();
-        (total, off_ground(glass.at(y as i32, x as i32)), out, halos)
-    };
-    let (at_peak, peak_centre, peak_out, peak_halos) = ink(peak);
-    let (just_past, past_centre, past_out, _) = ink(past);
+    let (peak_out, peak_halos) = emit_one(&c, g, grain(x, y, dealt, born), peak);
     let body = |hs: &[RainHalo]| hs.iter().any(|h| (h.cx, h.cy) == (x as u16, y as u16));
     assert!(
         body(&peak_halos),
         "the grain keeps its round body at its peak"
     );
-    assert!(
-        !peak_out.is_empty() && past_out.is_empty(),
-        "the glint fires at the peak only"
-    );
-    assert!(
-        at_peak > just_past && peak_centre >= past_centre,
-        "the glint flares, never dips: {at_peak} (centre {peak_centre}) at the peak vs \
-         {just_past} (centre {past_centre}) just past it"
-    );
+    assert!(peak_out.is_empty(), "the grain lays no glint at its peak");
     let mut light = cfg(GlowStyle::Comet, true);
     light.dark_theme = false;
     light.theme_fg = 0x001F_2328;
@@ -859,7 +960,7 @@ fn the_shower_and_the_stardust_keep_off_the_lines_an_enter_printed() {
     }
     assert!(
         draws(GlowStyle::Comet, true, letter, 5),
-        "control: the comet's debris over the printed line still glints on dark"
+        "control: the comet's dust over the printed line still draws on dark"
     );
 }
 
@@ -900,4 +1001,860 @@ fn a_dark_water_droplet_is_a_soft_round_bead() {
         0.05,
     );
     assert!(!out.is_empty(), "control: a laser spark lays quads");
+}
+
+/// looks9 Q7, SPARKLE'S SHOWER IS GOLD: on a dark page every grain of the
+/// shower (its dust, its stars, its mini comets) is the gold's family, gold,
+/// amber or a warm white, on the default dark and on Solarized Dark; drawn
+/// round the colour wheel, its dust threw green (`#7ae15a`) and pink specks
+/// among the gold stars. Negative control: the wheel's shower
+/// ([`CursorGlow::sparkle_wheel`]) throws grains off the gold.
+#[test]
+fn the_dark_sparkle_shower_is_the_gold_s_family() {
+    let g = geom();
+    let at = Instant::now();
+    let caret = CursorGlow::caret_box(g, 2, 30);
+    let clear = (
+        caret.2 as f32 + 3.0 * g.cw as f32,
+        (caret.1 + caret.3) as f32 * 0.5 - g.ch as f32,
+    );
+    // Whether a drawn colour is the gold's: a warm hue, or a warm white (a
+    // premultiplied light too faint to hold a hue, under 8 of 255, is none).
+    let golden = |rgb: u32| {
+        let (h, s, v) = crate::color_math::rgb2hsv(rgb & 0x00FF_FFFF);
+        v < 8.0 / 255.0 || s < 0.10 || (18.0..=62.0).contains(&h)
+    };
+    let strays = |wheel: bool, page: u32| -> (usize, usize, u32) {
+        let mut c = cfg(GlowStyle::Sparkle, true);
+        (c.color, c.theme_bg) = (SPARKLE_DEFAULT_COLOR, page);
+        let (mut drawn, mut off, mut first) = (0usize, 0usize, 0u32);
+        for seed in (0u32..4096).step_by(13) {
+            let mut glow = probed_glow(&c, g, at);
+            glow.sparkle_wheel = wheel;
+            let hue = seed_hue(seed);
+            glow.particles.push(Particle {
+                vx: 30.0,
+                vy: -20.0,
+                ..grain(clear.0, clear.1, hue, at)
+            });
+            let (mut out, mut halos, mut under) = (Vec::new(), Vec::new(), Vec::new());
+            let t = at + Duration::from_secs_f32(peak_age(hue).min(0.4));
+            glow.emit_particles(
+                t,
+                &c,
+                g,
+                &mut out,
+                &mut halos,
+                &mut crate::cursor_glow::glow_sink(
+                    &mut under,
+                    &mut aterm_render::GlowRamps::default(),
+                    true,
+                ),
+                CursorGlow::MAX_QUADS,
+            );
+            // The light the shower adds (a tinted page's crescent and night
+            // grounds are laid over it, darker than the page's light).
+            let colours = out.iter().filter(|q| q.alpha == 0).map(|q| q.color).chain(
+                halos
+                    .iter()
+                    .filter(|h| h.mode == aterm_render::HaloMode::Add)
+                    .map(|h| h.color),
+            );
+            for rgb in colours {
+                drawn += 1;
+                if !golden(rgb) {
+                    off += 1;
+                    if first == 0 {
+                        first = rgb & 0x00FF_FFFF;
+                    }
+                }
+            }
+        }
+        (drawn, off, first)
+    };
+    for page in [0x0011_1318u32, 0x0000_2B36] {
+        let (drawn, off, first) = strays(false, page);
+        assert!(drawn > 100, "page {page:06x}: the shower draws ({drawn})");
+        assert_eq!(
+            off, 0,
+            "page {page:06x}: {off} of {drawn} shower colours are off the gold (first {first:06x})"
+        );
+        let (_, wheel_off, _) = strays(true, page);
+        assert!(
+            wheel_off > 0,
+            "control: page {page:06x}: the wheel's shower throws grains off the gold"
+        );
+    }
+}
+
+/// The hues (degrees) of every colour Sparkle's shower draws, one grain of
+/// each sampled seed at its twinkle's peak: on the default dark page the
+/// light it adds (the wheel's shower where `wheel`,
+/// [`CursorGlow::sparkle_wheel`]), on paper every mark it inks. A colour too
+/// faint (under 8 of 255) or too grey (under 0.10 saturation) to hold a hue,
+/// a warm white among them, is none.
+fn sparkle_shower_hues(dark: bool, wheel: bool) -> Vec<f32> {
+    let g = geom();
+    let at = Instant::now();
+    let caret = CursorGlow::caret_box(g, 2, 30);
+    let clear = (
+        caret.2 as f32 + 3.0 * g.cw as f32,
+        (caret.1 + caret.3) as f32 * 0.5 - g.ch as f32,
+    );
+    let mut c = cfg(GlowStyle::Sparkle, true);
+    c.color = SPARKLE_DEFAULT_COLOR;
+    if dark {
+        c.theme_bg = 0x0011_1318;
+    } else {
+        c.dark_theme = false;
+        c.theme_fg = 0x001F_2328;
+        c.theme_bg = 0x00FF_FFFF;
+    }
+    let mut hues = Vec::new();
+    for seed in (0u32..4096).step_by(13) {
+        let mut glow = probed_glow(&c, g, at);
+        glow.sparkle_wheel = wheel;
+        let hue = seed_hue(seed);
+        glow.particles.push(Particle {
+            vx: 30.0,
+            vy: -20.0,
+            ..grain(clear.0, clear.1, hue, at)
+        });
+        let (mut out, mut halos, mut under) = (Vec::new(), Vec::new(), Vec::new());
+        let t = at + Duration::from_secs_f32(peak_age(hue).min(0.4));
+        glow.emit_particles(
+            t,
+            &c,
+            g,
+            &mut out,
+            &mut halos,
+            &mut crate::cursor_glow::glow_sink(
+                &mut under,
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
+            CursorGlow::MAX_QUADS,
+        );
+        let colours: Vec<u32> = if dark {
+            out.iter()
+                .filter(|q| q.alpha == 0)
+                .map(|q| q.color)
+                .chain(
+                    halos
+                        .iter()
+                        .filter(|h| h.mode == aterm_render::HaloMode::Add)
+                        .map(|h| h.color),
+                )
+                .collect()
+        } else {
+            out.iter()
+                .chain(&under)
+                .map(|q| q.color)
+                .chain(halos.iter().map(|h| h.color))
+                .collect()
+        };
+        for rgb in colours {
+            let (h, s, v) = crate::color_math::rgb2hsv(rgb & 0x00FF_FFFF);
+            if v >= 8.0 / 255.0 && s >= 0.10 {
+                hues.push(h);
+            }
+        }
+    }
+    hues
+}
+
+/// Whether a colour word holds of `hues` (degrees, [`sparkle_shower_hues`]):
+/// a hue's name of every one, `rainbow` of hues round at least four of the
+/// wheel's six sextants. `None` for a word that names no colour.
+fn colour_word_holds(word: &str, hues: &[f32]) -> Option<bool> {
+    let all_within = |lo: f32, hi: f32| hues.iter().all(|&h| (lo..=hi).contains(&h));
+    Some(match word {
+        "gold" | "golden" | "amber" => all_within(18.0, 62.0),
+        "orange" => all_within(15.0, 45.0),
+        "yellow" => all_within(45.0, 70.0),
+        "green" => all_within(70.0, 170.0),
+        "blue" => all_within(180.0, 260.0),
+        "purple" | "violet" => all_within(260.0, 300.0),
+        "pink" => all_within(300.0, 345.0),
+        "red" => hues.iter().all(|&h| !(15.0..340.0).contains(&h)),
+        "rainbow" | "colourful" | "colorful" | "multicoloured" | "multicolored" => {
+            let sextants: std::collections::BTreeSet<u32> =
+                hues.iter().map(|&h| (h / 60.0) as u32 % 6).collect();
+            sextants.len() >= 4
+        }
+        _ => return None,
+    })
+}
+
+/// The colour words of `blurb`'s shower (the words after its `shower`), each
+/// checked against `hues`: how many it names, or the first that does not hold.
+fn shower_words_hold(blurb: &str, hues: &[f32]) -> Result<usize, String> {
+    let lower = blurb.to_lowercase();
+    let Some((_, shower)) = lower.split_once("shower") else {
+        return Err(format!("{blurb:?} names no shower"));
+    };
+    let mut named = 0;
+    for word in shower.split(|c: char| !c.is_alphabetic()) {
+        match colour_word_holds(word, hues) {
+            Some(true) => named += 1,
+            Some(false) => return Err(word.to_owned()),
+            None => {}
+        }
+    }
+    Ok(named)
+}
+
+/// Settings demo round 3's judges, S3: A STYLE'S BLURB SAYS WHAT IT DRAWS.
+/// Sparkle's blurb, which Settings shows and speaks, names its shower's
+/// colours as the shower draws them, gold (looks9 Q7) on the default dark
+/// and on paper; it read "a shower of rainbow stars" over a shower of gold
+/// stars and crescent moons. Negative controls: that blurb is refused on both
+/// grounds, and the blurb as it stands is refused of the wheel's shower
+/// ([`CursorGlow::sparkle_wheel`]).
+#[test]
+fn the_sparkle_blurb_names_the_colours_its_shower_draws() {
+    let blurb = crate::cursor_glow::spellings::TRAIL_STYLES
+        .iter()
+        .find(|row| row.name == "sparkle")
+        .map(|row| row.blurb)
+        .expect("Sparkle has a row");
+    let dark = sparkle_shower_hues(true, false);
+    let paper = sparkle_shower_hues(false, false);
+    let wheel = sparkle_shower_hues(true, true);
+    let was = "A gold comet with a shower of rainbow stars";
+    for (ground, hues) in [("dark", &dark), ("paper", &paper)] {
+        assert!(
+            hues.len() > 100,
+            "{ground}: the shower draws ({})",
+            hues.len()
+        );
+        let named = shower_words_hold(blurb, hues);
+        assert!(
+            named.as_ref().is_ok_and(|&n| n > 0),
+            "{ground}: {blurb:?} names the shower's colours as drawn: {named:?}"
+        );
+        assert_eq!(
+            shower_words_hold(was, hues),
+            Err("rainbow".to_owned()),
+            "control: {ground}: round 3's blurb is refused"
+        );
+    }
+    assert!(
+        shower_words_hold(blurb, &wheel).is_err(),
+        "control: {blurb:?} is refused of the wheel's shower"
+    );
+}
+
+/// looks9 round 3's review of Q7: A PINNED COLOUR'S SHOWER IS THE PIN'S. A
+/// chosen trail colour is drawn as itself; brought to the gold's chroma, a
+/// trail pinned to `#b0b0c8` (saturation 0.12) showered grains of 0.72
+/// (`#2d2da2`). Pinned to `#b0b0c8` on the default dark and on Solarized
+/// Dark, no colour the shower adds (bright enough to hold a hue) reads over
+/// 0.16 saturation; Sparkle's moon (`MOON_GOLD`) is its own gold, not the
+/// shower's, and is not read. Negative control: brought to the gold's chroma as Q7
+/// laid it (`sparkle_pin_saturated`), the shower throws grains of 0.5 and
+/// more.
+#[test]
+fn a_pinned_colour_s_dark_sparkle_shower_is_the_pin_s() {
+    let g = geom();
+    let at = Instant::now();
+    let caret = CursorGlow::caret_box(g, 2, 30);
+    let clear = (
+        caret.2 as f32 + 3.0 * g.cw as f32,
+        (caret.1 + caret.3) as f32 * 0.5 - g.ch as f32,
+    );
+    let pin = 0x00B0_B0C8u32;
+    // `(drawn, most)`: the colours the shower adds, and the most saturated.
+    let shower = |saturated: bool, page: u32| -> (usize, f32) {
+        let mut c = cfg(GlowStyle::Sparkle, true);
+        (c.color, c.theme_bg) = (pin, page);
+        let (mut drawn, mut most) = (0usize, 0.0f32);
+        for seed in (0u32..4096).step_by(13).filter(|s| s & 7 != 6) {
+            let mut glow = probed_glow(&c, g, at);
+            glow.set_colour_pins(ColourPins {
+                trail: true,
+                accent: false,
+            });
+            glow.sparkle_pin_saturated = saturated;
+            let hue = seed_hue(seed);
+            glow.particles.push(Particle {
+                vx: 30.0,
+                vy: -20.0,
+                ..grain(clear.0, clear.1, hue, at)
+            });
+            let (mut out, mut halos, mut under) = (Vec::new(), Vec::new(), Vec::new());
+            let t = at + Duration::from_secs_f32(peak_age(hue).min(0.4));
+            glow.emit_particles(
+                t,
+                &c,
+                g,
+                &mut out,
+                &mut halos,
+                &mut crate::cursor_glow::glow_sink(
+                    &mut under,
+                    &mut aterm_render::GlowRamps::default(),
+                    true,
+                ),
+                CursorGlow::MAX_QUADS,
+            );
+            let colours = out.iter().filter(|q| q.alpha == 0).map(|q| q.color).chain(
+                halos
+                    .iter()
+                    .filter(|h| h.mode == aterm_render::HaloMode::Add)
+                    .map(|h| h.color),
+            );
+            for rgb in colours {
+                let (_, sat, v) = crate::color_math::rgb2hsv(rgb & 0x00FF_FFFF);
+                drawn += 1;
+                if v >= 24.0 / 255.0 {
+                    most = most.max(sat);
+                }
+            }
+        }
+        (drawn, most)
+    };
+    for page in [0x0011_1318u32, 0x0000_2B36] {
+        let (drawn, most) = shower(false, page);
+        assert!(drawn > 100, "page {page:06x}: the shower draws ({drawn})");
+        assert!(
+            most <= 0.16,
+            "page {page:06x}: the pinned shower reaches saturation {most:.2}"
+        );
+        let (_, old) = shower(true, page);
+        assert!(
+            old >= 0.5,
+            "control: page {page:06x}: at the gold's chroma the shower reaches only {old:.2}"
+        );
+    }
+}
+
+/// Sparkle's or Fire's particles born at once at a caret (row 2, column 20)
+/// whose rows above and below are filled, on `page`, `seams` set on the
+/// glow, emitted half a second on: every box a particle laid,
+/// `(x0, y0, x1, y1)`.
+fn dense_row_marks(
+    style: GlowStyle,
+    page: u32,
+    seams: impl Fn(&mut CursorGlow),
+) -> Vec<(i32, i32, i32, i32)> {
+    use aterm_core::terminal::RenderCell;
+    let g = geom();
+    let (row, caret_col) = (2u16, 20u16);
+    let ch = g.ch as f32;
+    let caret = CursorGlow::caret_box(g, row, caret_col);
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let mut c = cfg(style, true);
+    c.theme_bg = page;
+    if page == 0x00FF_FFFF {
+        (c.dark_theme, c.theme_fg) = (false, 0x001F_2328);
+    }
+    let at = Instant::now();
+    let mut glow = CursorGlow::default();
+    seams(&mut glow);
+    let mut cells = vec![vec![RenderCell::default(); g.cols]; g.rows];
+    let mut typed = vec![' '; g.cols];
+    for (r, line) in cells.iter_mut().enumerate() {
+        for (col, cell) in line.iter_mut().enumerate() {
+            cell.bg = rgb(page);
+            if r == usize::from(row) - 1 || r == usize::from(row) + 1 {
+                (cell.ch, cell.bg) = ('m', rgb(0x0026_4F78));
+            } else if r == usize::from(row) && col < usize::from(caret_col) {
+                cell.ch = 'm';
+                typed[col] = 'm';
+            }
+        }
+    }
+    glow.observe_row(row, caret_col, &typed, at);
+    glow.observe_frame_text(Some((row, caret_col)), &cells, at);
+    let mut out = Vec::new();
+    glow.tick(Some((row, caret_col)), at, &c, g, &mut out);
+    glow.particles.clear();
+    let (cx, cy) = (
+        (caret.0 + caret.2) as f32 * 0.5,
+        (caret.1 + caret.3) as f32 * 0.5,
+    );
+    for k in 0..48u32 {
+        let a = k as f32 * 0.7;
+        glow.particles.push(Particle {
+            vx: a.cos() * 1.5 * ch,
+            vy: -2.0 * ch,
+            life: 2.0,
+            ..grain(cx, cy, seed_hue(k * 83 + 7), at)
+        });
+    }
+    let (mut out, mut halos, mut under) = (Vec::new(), Vec::new(), Vec::new());
+    glow.emit_particles(
+        at + Duration::from_millis(500),
+        &c,
+        g,
+        &mut out,
+        &mut halos,
+        &mut crate::cursor_glow::glow_sink(
+            &mut under,
+            &mut aterm_render::GlowRamps::default(),
+            true,
+        ),
+        CursorGlow::MAX_QUADS,
+    );
+    let boxed = |x: u16, y: u16, w: u16, h: u16| {
+        (
+            i32::from(x),
+            i32::from(y),
+            i32::from(x) + i32::from(w),
+            i32::from(y) + i32::from(h),
+        )
+    };
+    let mut boxes: Vec<_> = out.iter().map(|q| boxed(q.x, q.y, q.w, q.h)).collect();
+    boxes.extend(halos.iter().map(|h| boxed(h.x, h.y, h.w, h.h)));
+    boxes.extend(under.iter().map(|q| boxed(q.x, q.y, q.w, q.h)));
+    boxes
+}
+
+/// looks10 L2, A DENSE ROW SEATS ITS STARS AND EMBERS IN ITS OWN AIR: with a
+/// powerline bar over the typed line and a selection under it (letters on
+/// grounds of their own), Sparkle's stars and moons and Fire's embers fly
+/// out of the row into rows that drop them, and in the gallery's `context`
+/// the two drew a bare glowing caret. Seated in the blank air past the
+/// caret ([`CursorGlow::DENSE_SEAT_CELLS`]), each particle the dense row
+/// draws lies in the caret's row, past the caret's reach, and within the
+/// seats' reach of it, on the reference dark, on Solarized Dark and on paper
+/// (where the gallery's `context` showed only Sparkle's gold wash and Fire's
+/// flame tips, looks10 round 2).
+/// Negative control: flying as over air (`dense_seats_off`), none is drawn.
+#[test]
+fn a_dense_row_seats_its_stars_and_embers_in_its_own_air() {
+    let g = geom();
+    let (row, caret_col) = (2u16, 20u16);
+    let (cw, ch) = (g.cw as f32, g.ch as f32);
+    let caret = CursorGlow::caret_box(g, row, caret_col);
+    // Every box a particle laid: (x0, y0, x1, y1).
+    let seat = |style: GlowStyle, page: u32, off: bool| {
+        dense_row_marks(style, page, |g| g.dense_seats_off = off)
+    };
+    let reach = (ch * 0.30).ceil() as i32;
+    let far = caret.2 + reach + ((CursorGlow::DENSE_SEAT_CELLS + 2.0) * cw).ceil() as i32;
+    for style in [GlowStyle::Sparkle, GlowStyle::Fire] {
+        for page in [0x0011_1318u32, 0x0000_2B36, 0x00FF_FFFF] {
+            let boxes = seat(style, page, false);
+            assert!(
+                boxes.len() >= 3,
+                "{style:?} on {page:06x}: the dense row seats {} marks",
+                boxes.len()
+            );
+            for &(x0, y0, x1, y1) in &boxes {
+                assert!(
+                    y0 >= caret.1 && y1 <= caret.3 && x0 >= caret.2 && x1 <= far,
+                    "{style:?} on {page:06x}: a seated mark at {x0}..{x1} x {y0}..{y1} leaves \
+                     the air past the caret ({}..{far} x {}..{})",
+                    caret.2,
+                    caret.1,
+                    caret.3
+                );
+            }
+            let flown = seat(style, page, true);
+            assert!(
+                flown.is_empty(),
+                "control: {style:?} on {page:06x} flying as over air draws {} marks",
+                flown.len()
+            );
+        }
+    }
+}
+
+/// looks10 round 3, A DENSE ROW'S EMBERS CLIMB AWAY FROM THE CARET: Fire's
+/// embers seated past the caret at a random depth lay level across the row,
+/// and on paper three crisp dots at the letters' height past the caret read
+/// as an ellipsis (the gallery's `context`, round 2's judges). On the
+/// reference dark and on paper, the seated embers farther from the caret
+/// (the outer half, by x) sit higher than the nearer half by at least an
+/// eighth of the row (2.6 and 2.3 px of a 16 px row). Negative control:
+/// seated as round 2 seated them (`dense_embers_level`), the outer half sits
+/// 1.1 px higher.
+#[test]
+fn a_dense_row_s_embers_climb_away_from_the_caret() {
+    let ch = geom().ch as f32;
+    // How far the outer half's mean centre sits above the inner half's, px.
+    let climb = |page: u32, level: bool| {
+        let mut marks: Vec<(f32, f32)> =
+            dense_row_marks(GlowStyle::Fire, page, |g| g.dense_embers_level = level)
+                .iter()
+                .map(|&(x0, y0, x1, y1)| (0.5 * (x0 + x1) as f32, 0.5 * (y0 + y1) as f32))
+                .collect();
+        assert!(
+            marks.len() >= 4,
+            "fixture: {} seated marks on {page:06x}",
+            marks.len()
+        );
+        marks.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let (near, far) = marks.split_at(marks.len() / 2);
+        let mean = |h: &[(f32, f32)]| h.iter().map(|m| m.1).sum::<f32>() / h.len() as f32;
+        mean(near) - mean(far)
+    };
+    for page in [0x0011_1318u32, 0x00FF_FFFF] {
+        let up = climb(page, false);
+        assert!(
+            up >= 0.12 * ch,
+            "on {page:06x}: the outer embers sit {up:.1} px above the inner ones"
+        );
+        let level = climb(page, true);
+        assert!(
+            level < 0.12 * ch,
+            "control: on {page:06x} round 2's embers climb {level:.1} px away from the caret"
+        );
+    }
+}
+
+/// One frame of `glow`'s particles at `now`: what it lays in `out`, as halos
+/// and under the letters.
+fn particle_marks(
+    glow: &mut CursorGlow,
+    now: Instant,
+    c: &GlowConfig,
+    g: Geom,
+) -> (Vec<GlowQuad>, Vec<RainHalo>, Vec<GlowQuad>) {
+    let (mut out, mut halos, mut under) = (Vec::new(), Vec::new(), Vec::new());
+    glow.emit_particles(
+        now,
+        c,
+        g,
+        &mut out,
+        &mut halos,
+        &mut crate::cursor_glow::glow_sink(
+            &mut under,
+            &mut aterm_render::GlowRamps::default(),
+            true,
+        ),
+        CursorGlow::MAX_QUADS,
+    );
+    (out, halos, under)
+}
+
+/// Whether one frame of `glow`'s particles draws any mark ([`particle_marks`]).
+fn particles_drawn(glow: &mut CursorGlow, now: Instant, c: &GlowConfig, g: Geom) -> bool {
+    let (out, halos, under) = particle_marks(glow, now, c, g);
+    out.iter().any(|q| q.alpha > 0) || !halos.is_empty() || under.iter().any(|q| q.alpha > 0)
+}
+
+/// How often `shown` goes from not drawn back to drawn once first drawn: a
+/// blink each.
+fn returns(shown: &[bool]) -> usize {
+    let first = shown.iter().position(|&on| on).unwrap_or(shown.len());
+    shown[first..].windows(2).filter(|w| !w[0] && w[1]).count()
+}
+
+/// Settings demo round 3's review: A DROP THE EDGE CUT STAYS OUT THROUGH A
+/// SCROLL. A drip falling into the grid's bottom edge is drawn, then left
+/// out, and an Enter on the last row scrolls it a row up
+/// (`translate_scroll_state`, which every full scroll runs) 0.64 s on: it
+/// stays out, dark and on paper. Negative control: held by the drop's birth
+/// and origin ([`CursorGlow::set_edge_cut_by_origin`]), which the scroll
+/// rewrites, the latch let it back, drawn, gone, drawn.
+#[test]
+fn a_drop_the_edge_cut_stays_out_through_a_scroll() {
+    let g = tall_geom();
+    for dark in [true, false] {
+        let mut c = cfg(GlowStyle::Water, true);
+        c.intensity = 1.0;
+        c.dark_theme = dark;
+        let run = |by_origin: bool| -> Vec<bool> {
+            let at = Instant::now();
+            let mut glow = CursorGlow::default();
+            glow.set_edge_cut_by_origin(by_origin);
+            let (x, _) = g.cell_center(7, 20);
+            glow.particles.push(Particle {
+                x0: x,
+                y0: g.fx_bot() as f32 - 16.0,
+                vx: 0.0,
+                vy: 4.0,
+                gy: 60.0,
+                life: 2.0,
+                hue: 0.8,
+                cov_scale: 1.0,
+                born: at,
+                edge_cut: false,
+            });
+            (0..=60_u64)
+                .map(|frame| {
+                    if frame == 40 {
+                        glow.translate_scroll_state(1, g.ch as u16);
+                    }
+                    particles_drawn(&mut glow, at + ms(frame * 16), &c, g)
+                })
+                .collect()
+        };
+        let held = run(false);
+        let cut_by = held.iter().position(|&on| !on);
+        assert!(
+            held[0] && cut_by.is_some_and(|f| f < 40),
+            "dark={dark}: fixture: the drop is drawn, then the edge cuts it before the scroll: {held:?}"
+        );
+        assert_eq!(
+            returns(&held),
+            0,
+            "dark={dark}: the drop the edge cut came back after the scroll: {held:?}"
+        );
+        let keyed = run(true);
+        assert!(
+            returns(&keyed) > 0,
+            "negative control: dark={dark}: keyed on its origin, the scrolled drop comes back: {keyed:?}"
+        );
+    }
+}
+
+/// Settings demo round 3's review: A SIBLING THE EDGE CUTS HOLDS OUT ONLY
+/// ITSELF. Water's spray on a leap and Laser's sparks are born together at
+/// one point; of two such drops, one parked mid-grid and one thrown at the
+/// right edge, the parked one is drawn every frame after its sibling meets
+/// the edge. Negative control: held by birth and origin
+/// ([`CursorGlow::set_edge_cut_by_origin`]), the sibling's cut took the
+/// parked drop out with it.
+#[test]
+fn a_sibling_the_edge_cuts_holds_out_only_itself() {
+    let g = tall_geom();
+    let mut c = cfg(GlowStyle::Water, true);
+    c.intensity = 1.0;
+    let (x, y) = g.cell_center(7, 20);
+    // Per frame, whether the parked drop is drawn: a mark within a cell of
+    // it (its sibling, at 600 px/s, is two cells on by the third frame).
+    let run = |by_origin: bool| -> Vec<bool> {
+        let at = Instant::now();
+        let born = |vx: f32, hue: f32| Particle {
+            x0: x,
+            y0: y,
+            vx,
+            vy: 0.0,
+            gy: 0.0,
+            life: 30.0,
+            hue,
+            cov_scale: 1.0,
+            born: at,
+            edge_cut: false,
+        };
+        let mut glow = CursorGlow::default();
+        glow.set_edge_cut_by_origin(by_origin);
+        glow.particles.push(born(0.0, 0.6));
+        glow.particles.push(born(600.0, 0.3));
+        let near = |px: i32| (px - x as i32).abs() < g.cw as i32;
+        (0..60_u64)
+            .map(|frame| {
+                let (out, halos, _) = particle_marks(&mut glow, at + ms(frame * 16), &c, g);
+                halos.iter().any(|h| near(i32::from(h.cx)))
+                    || out.iter().any(|q| q.alpha > 0 && near(i32::from(q.x)))
+            })
+            .collect()
+    };
+    let parked = run(false);
+    assert!(
+        parked.iter().all(|&on| on),
+        "the parked drop went out with its sibling: {parked:?}"
+    );
+    let keyed = run(true);
+    assert!(
+        keyed.iter().any(|&on| !on),
+        "negative control: keyed on their shared origin, the parked drop goes out with its sibling: {keyed:?}"
+    );
+}
+
+/// Settings demo round 3's review: A PAPER COMET GRAIN IS DRAWN WHOLE OR NOT
+/// AT ALL, as every particle is. Its ink is laid under the letters, past the
+/// judge of the marks laid in `out` and as halos: a grain 1.5 px inside the
+/// left edge of a pane 20 px in stood clipped flat there, its quads at the
+/// box's first column the row's full height. Now no quad it lays meets an
+/// edge, and the same grain two cells in is drawn (the fixture). Negative
+/// control: drawn cut ([`CursorGlow::set_motes_cut`]), its ink meets the
+/// edge.
+#[test]
+fn a_paper_comet_grain_at_a_side_edge_is_drawn_whole_or_not_at_all() {
+    let mut g = tall_geom();
+    g.origin_x = 20;
+    g.win_w += 40;
+    let mut c = cfg(GlowStyle::Comet, true);
+    c.intensity = 1.0;
+    c.dark_theme = false;
+    c.theme_bg = 0x00FF_FFFF;
+    c.theme_fg = 0x0020_2020;
+    let (_, y) = g.cell_center(4, 0);
+    let (left, top, right, bottom) = (g.fx_left(), g.fx_top(), g.fx_right(), g.fx_bot());
+    let meets_edge = |quads: &[GlowQuad]| {
+        quads.iter().any(|q| {
+            let (x, y) = (i32::from(q.x), i32::from(q.y));
+            x <= left || y <= top || x + i32::from(q.w) >= right || y + i32::from(q.h) >= bottom
+        })
+    };
+    let ink = |x: f32, cut: bool| -> Vec<GlowQuad> {
+        let at = Instant::now();
+        let mut glow = CursorGlow::default();
+        glow.set_motes_cut(cut);
+        glow.particles.push(Particle {
+            life: 30.0,
+            ..grain(x, y, 0.6, at)
+        });
+        let (_, _, under) = particle_marks(&mut glow, at + ms(16), &c, g);
+        under
+            .into_iter()
+            .filter(|q| q.alpha > 0 || q.alpha2 > 0 || q.color != 0)
+            .collect()
+    };
+    let inside = ink(left as f32 + 2.0 * g.cw as f32, false);
+    assert!(
+        !inside.is_empty() && !meets_edge(&inside),
+        "fixture: the grain two cells in is inked whole: {inside:?}"
+    );
+    let at_edge = ink(left as f32 + 1.5, false);
+    assert!(
+        !meets_edge(&at_edge),
+        "a paper comet grain is inked meeting the box's left edge ({left}): {at_edge:?}"
+    );
+    let cut = ink(left as f32 + 1.5, true);
+    assert!(
+        meets_edge(&cut),
+        "negative control: drawn cut, the grain's ink meets the edge: {cut:?}"
+    );
+}
+
+/// A DENSE ROW'S SEAT IS EACH PARTICLE'S OWN: Sparkle's stars and moons and
+/// Fire's embers born where neither row beside the caret's is air are seated
+/// in the air past the caret ([`CursorGlow::DENSE_SEAT_CELLS`]), and the seat
+/// is read at the column each was born in, so the caret moving on to a column
+/// whose row above is air, and back, leaves every seated mark where it was:
+/// on the reference dark, Solarized Dark and paper, the caret's row draws the
+/// same marks, at least three, on every frame while the caret goes from their
+/// birth column to a gap in the row above and back again (Fire's embers seated level, `dense_embers_level`,
+/// since a climbing ember's height is its distance from the caret's,
+/// [`CursorGlow::DENSE_EMBER_CLIMB`]).
+/// Negative control (`dense_seat_at_caret`, the seat read at the caret's
+/// column every frame as looks10 round 3 read it): at the gap the row draws
+/// other marks than it did beside the letters.
+#[test]
+fn a_dense_row_s_seat_holds_while_the_caret_crosses_a_gap() {
+    use aterm_core::terminal::RenderCell;
+    let g = geom();
+    let (row, born_col, gap_col) = (2u16, 16u16, 4u16);
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    // The marks the caret's row draws on each frame, the caret at each of
+    // `cols` in turn: each box inside the row.
+    let marks = |style: GlowStyle, page: u32, at_caret: bool, cols: &[u16]| {
+        let mut c = cfg(style, true);
+        c.theme_bg = page;
+        if page == 0x00FF_FFFF {
+            (c.dark_theme, c.theme_fg) = (false, 0x001F_2328);
+        }
+        let at = Instant::now();
+        let mut glow = CursorGlow {
+            dense_seat_at_caret: at_caret,
+            dense_embers_level: true,
+            ..CursorGlow::default()
+        };
+        // Row 1 lettered from column 10 on (air above the gap's column), row
+        // 3 a filled bar across, the caret's row typed up to the caret.
+        let frame = |glow: &mut CursorGlow, caret_col: u16, at: Instant| {
+            let mut cells = vec![vec![RenderCell::default(); g.cols]; g.rows];
+            let mut typed = vec![' '; g.cols];
+            for (r, line) in cells.iter_mut().enumerate() {
+                for (col, cell) in line.iter_mut().enumerate() {
+                    cell.bg = rgb(page);
+                    if r == usize::from(row) - 1 && col >= 10 {
+                        cell.ch = 'm';
+                    } else if r == usize::from(row) + 1 {
+                        (cell.ch, cell.bg) = ('m', rgb(0x0026_4F78));
+                    } else if r == usize::from(row) && col < usize::from(caret_col) {
+                        cell.ch = 'm';
+                        typed[col] = 'm';
+                    }
+                }
+            }
+            glow.observe_row(row, caret_col, &typed, at);
+            glow.observe_frame_text(Some((row, caret_col)), &cells, at);
+        };
+        frame(&mut glow, born_col, at);
+        let mut out = Vec::new();
+        glow.tick(Some((row, born_col)), at, &c, g, &mut out);
+        glow.particles.clear();
+        let caret = CursorGlow::caret_box(g, row, born_col);
+        let (cx, cy) = (
+            (caret.0 + caret.2) as f32 * 0.5,
+            (caret.1 + caret.3) as f32 * 0.5,
+        );
+        let ch = g.ch as f32;
+        for k in 0..48u32 {
+            let a = k as f32 * 0.7;
+            glow.particles.push(Particle {
+                vx: a.cos() * 1.5 * ch,
+                vy: -2.0 * ch,
+                life: 2.0,
+                ..grain(cx, cy, seed_hue(k * 83 + 7), at)
+            });
+        }
+        let (top, bottom) = (caret.1, caret.3);
+        let mut seq = Vec::new();
+        for &col in cols {
+            // One instant for every frame, so a seat's own drift through its
+            // life is not read as a move.
+            let t = at + Duration::from_millis(300);
+            frame(&mut glow, col, t);
+            glow.last = Some((row, col));
+            let (mut out, mut halos, mut under) = (Vec::new(), Vec::new(), Vec::new());
+            glow.emit_particles(
+                t,
+                &c,
+                g,
+                &mut out,
+                &mut halos,
+                &mut crate::cursor_glow::glow_sink(
+                    &mut under,
+                    &mut aterm_render::GlowRamps::default(),
+                    true,
+                ),
+                CursorGlow::MAX_QUADS,
+            );
+            let mut boxes: Vec<(i32, i32, i32, i32)> = out
+                .iter()
+                .map(|q| (q.x, q.y, q.w, q.h))
+                .chain(halos.iter().map(|h| (h.x, h.y, h.w, h.h)))
+                .chain(under.iter().map(|q| (q.x, q.y, q.w, q.h)))
+                .map(|(x, y, w, h)| {
+                    (
+                        i32::from(x),
+                        i32::from(y),
+                        i32::from(x) + i32::from(w),
+                        i32::from(y) + i32::from(h),
+                    )
+                })
+                .filter(|&(_, y0, _, y1)| y0 >= top && y1 <= bottom)
+                .collect();
+            boxes.sort_unstable();
+            seq.push(boxes);
+        }
+        seq
+    };
+    let path = [born_col, born_col, gap_col, gap_col, born_col];
+    for style in [GlowStyle::Sparkle, GlowStyle::Fire] {
+        for page in [0x0011_1318u32, 0x0000_2B36, 0x00FF_FFFF] {
+            let seq = marks(style, page, false, &path);
+            assert!(
+                seq[0].len() >= 3,
+                "{style:?} on {page:06x}: the dense row seats {} marks",
+                seq[0].len()
+            );
+            for (k, frame) in seq.iter().enumerate() {
+                assert_eq!(
+                    frame,
+                    &seq[0],
+                    "{style:?} on {page:06x}: with the caret at column {}, the row draws {} \
+                     marks where it drew {} at its birth column",
+                    path[k],
+                    frame.len(),
+                    seq[0].len()
+                );
+            }
+            let old = marks(style, page, true, &path);
+            assert_ne!(
+                old[2],
+                old[0],
+                "negative control: {style:?} on {page:06x} read at the caret's column kept \
+                 the row's {} marks at the gap",
+                old[0].len()
+            );
+        }
+    }
 }

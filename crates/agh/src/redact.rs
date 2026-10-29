@@ -198,16 +198,31 @@ impl Redactor {
     }
 
     fn learned(&self, text: &str) -> String {
-        let mut out = text.to_string();
         let exact = self.exact.lock().unwrap_or_else(PoisonError::into_inner);
         let mut known: Vec<&str> = exact
             .iter()
             .filter_map(|secret| std::str::from_utf8(secret.expose()).ok())
             .collect();
+        if known.is_empty() {
+            return text.to_string();
+        }
         known.sort_by_key(|value| std::cmp::Reverse(value.len()));
-        for value in known {
-            if out.contains(value) {
-                out = out.replace(value, REDACTED_TEXT);
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while !rest.is_empty() {
+            let matched = known.iter().copied().find(|value| rest.starts_with(value));
+            if rest.starts_with(REDACTED_TEXT)
+                && matched.is_none_or(|value| value.len() <= REDACTED_TEXT.len())
+            {
+                out.push_str(REDACTED_TEXT);
+                rest = &rest[REDACTED_TEXT.len()..];
+            } else if let Some(matched) = matched {
+                out.push_str(REDACTED_TEXT);
+                rest = &rest[matched.len()..];
+            } else {
+                let ch = rest.chars().next().expect("rest is non-empty");
+                out.push(ch);
+                rest = &rest[ch.len_utf8()..];
             }
         }
         out

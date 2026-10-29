@@ -125,11 +125,48 @@ pub(crate) fn wall_answer(
 /// at the proven claim and at each `meta-change` of the session — so the
 /// exit is decided and relaunched from what the agent itself left
 /// ([`aterm_agent::harness::self_claimed`]), never from the file as anyone
-/// rewrote it after the agent died.
+/// rewrote it after the agent died. A release while the process runs and its
+/// record shows no end keeps the copy READ ONLY ([`Use::Read`]): the rollout
+/// tap follows its record ([`tap_target`]), and nothing that decides an exit,
+/// relaunches or carries a line sees it ([`copy_of_tab`], [`live_copy`]).
 static COPIES: Mutex<Copies> = Mutex::new(Copies::new());
 
 /// The copies by tab (a `BTreeMap`, so the static needs no lazy init).
-type Copies = std::collections::BTreeMap<String, Copy>;
+type Copies = std::collections::BTreeMap<String, Kept>;
+
+/// A tab's kept copy and what it is kept for.
+#[derive(Clone, Debug)]
+struct Kept {
+    copy: Copy,
+    by: Use,
+}
+
+/// What a kept copy may be used for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Use {
+    /// A live proven claim's read, or its release's while the record showed the end coming or
+    /// the process gone: it decides the exit, relaunches on its line and carries it.
+    Claim,
+    /// A release's read while its process runs on and its record shows no end: the rollout
+    /// tap's only, READ ONLY. Its resume line is withdrawn at the release, and no act path is
+    /// handed it.
+    Read,
+}
+
+impl Kept {
+    /// The copy, when it is a claim's ([`Use::Claim`]): the one every act path reads.
+    fn claims(&self) -> Option<&Copy> {
+        match self.by {
+            Use::Claim => Some(&self.copy),
+            Use::Read => None,
+        }
+    }
+
+    /// The resume line a claim copy publishes to act paths (`None` for [`Use::Read`]).
+    fn line(&self) -> Option<self_claimed::Resume> {
+        self.claims().and_then(|copy| copy.resume.clone().ok())
+    }
+}
 
 /// The line the crash rule last typed in each tab ([`typed`]): what a
 /// codex-alab it started, read before its record's first write, relaunches
@@ -190,12 +227,19 @@ fn refresh_by(
     }
     if let Some(copy) = copy {
         let mut copies = COPIES.lock().unwrap_or_else(PoisonError::into_inner);
-        let copy = self_claimed::fold(copies.get(ctx.self_id.as_str()), copy);
+        let before = copies.get(ctx.self_id.as_str()).map(|kept| &kept.copy);
+        let copy = self_claimed::fold(before, copy);
         let line = copy.resume.clone().ok();
-        let before = copies.insert(ctx.self_id.to_string(), copy);
+        let before = copies.insert(
+            ctx.self_id.to_string(),
+            Kept {
+                copy,
+                by: Use::Claim,
+            },
+        );
         drop(copies);
         drop(meta);
-        if before.and_then(|copy| copy.resume.ok()) != line {
+        if before.as_ref().and_then(Kept::line) != line {
             crate::harness_host::ring();
         }
     }
@@ -225,13 +269,15 @@ pub(crate) fn meta_changed(ctx: &crate::SessionCtx) {
     }
 }
 
-/// Return the kept session-record copy for tab `sid`.
+/// Return the kept session-record copy for tab `sid`: a claim's ([`Use::Claim`]), never the
+/// read-only copy a passive release keeps.
 #[must_use]
 pub(crate) fn copy_of_tab(sid: &str) -> Option<Copy> {
     COPIES
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .get(sid)
+        .and_then(Kept::claims)
         .cloned()
 }
 
@@ -241,11 +287,12 @@ pub(crate) fn live_copy(ctx: &crate::SessionCtx) -> Option<Copy> {
     let meta = ctx.meta.lock().unwrap_or_else(PoisonError::into_inner);
     let proven = meta.live_claim(crate::metrics::now_us())?.proven.as_ref()?;
     let copies = COPIES.lock().unwrap_or_else(PoisonError::into_inner);
-    let copy = copies.get(ctx.self_id.as_str())?;
+    let copy = copies.get(ctx.self_id.as_str())?.claims()?;
     (copy.pid == proven.pid && copy.start == proven.start).then(|| copy.clone())
 }
 
-/// Rollout tap target for a proven `codex-alab` session.
+/// Rollout tap target for a proven `codex-alab` session: what an act path (a landing's report,
+/// `result`) reads, and only ever from a live proven claim's own copy ([`rollout_target`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RolloutTarget {
     /// The live claim revision that admitted this copy.
@@ -293,8 +340,207 @@ pub(crate) fn rollout_target(ctx: &crate::SessionCtx) -> Option<RolloutTarget> {
         meta.live_claim(crate::metrics::now_us())
             .and_then(|claim| claim.proven.as_ref()),
         meta.supervisor_revision,
-        copies.get(ctx.self_id.as_str()),
+        copies.get(ctx.self_id.as_str()).and_then(Kept::claims),
     )
+}
+
+/// What the rollout tap is asked to read for a tab ([`tap_target`]). Only the tap takes one:
+/// nothing turns it into a [`RolloutTarget`], so no act path reads a rollout off it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TapTarget {
+    /// A live proven claim's own copy names the thread, exactly as [`rollout_target`] gives it.
+    Claimed(RolloutTarget),
+    /// READ ONLY: no proven claim stands, and the copy a release left ([`Use::Read`]) is of a
+    /// process alive and leading the tab's front. The tap reads that process's record again at
+    /// each ask and taps the thread it names then ([`tapped`]).
+    Watched(Watched),
+}
+
+/// A released claim's process, which the rollout tap follows by its own record while no claim
+/// stands ([`TapTarget::Watched`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Watched {
+    /// The tab's claim revision when this target was named: any claim or release since names
+    /// another, so a target named before it no longer holds.
+    pub(crate) revision: u64,
+    /// The process's pid and kernel start, as the released claim proved them.
+    pub(crate) pid: u32,
+    pub(crate) start: String,
+    /// The `$CODEX_HOME` its record was read under (canonical).
+    pub(crate) home: std::path::PathBuf,
+}
+
+impl From<RolloutTarget> for TapTarget {
+    fn from(target: RolloutTarget) -> Self {
+        Self::Claimed(target)
+    }
+}
+
+impl TapTarget {
+    /// The process whose rollout is read.
+    pub(crate) const fn pid(&self) -> u32 {
+        match self {
+            Self::Claimed(target) => target.pid,
+            Self::Watched(watched) => watched.pid,
+        }
+    }
+
+    /// That process's kernel start, as its claim proved it.
+    pub(crate) fn start(&self) -> &str {
+        match self {
+            Self::Claimed(target) => &target.start,
+            Self::Watched(watched) => &watched.start,
+        }
+    }
+
+    /// The `$CODEX_HOME` its record was read under (canonical).
+    pub(crate) fn home(&self) -> &std::path::Path {
+        match self {
+            Self::Claimed(target) => &target.home,
+            Self::Watched(watched) => &watched.home,
+        }
+    }
+}
+
+/// The rollout one ask of the tap reads: its [`TapTarget`] and the thread that target names at
+/// the ask ([`tapped`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Tapped {
+    pub(crate) target: TapTarget,
+    pub(crate) thread: String,
+}
+
+/// Why an ask taps no rollout ([`tapped`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Untapped {
+    /// The tab's claim or copy no longer gives the asked target, or its process was not live
+    /// across the record's read.
+    Moved,
+    /// The read-only copy's record, read again, names no thread of its own process.
+    Unnamed,
+}
+
+/// The [`TapTarget`] a tab's standing gives under its `meta` guard and `kept` copy, before the
+/// front is looked at: a live proven claim's own copy's ([`target_of`]); with none, the read-only
+/// copy's process while its record shows no end coming ([`self_claimed::shows_end`]).
+fn standing_of(
+    meta: &crate::session_timeline::SessionMeta,
+    kept: Option<&Kept>,
+) -> Option<TapTarget> {
+    let revision = meta.supervisor_revision;
+    if let Some(proven) = meta
+        .live_claim(crate::metrics::now_us())
+        .and_then(|claim| claim.proven.as_ref())
+    {
+        return target_of(Some(proven), revision, kept.and_then(Kept::claims))
+            .map(TapTarget::Claimed);
+    }
+    let copy = &kept.filter(|kept| kept.by == Use::Read)?.copy;
+    (!self_claimed::shows_end(copy)).then(|| {
+        TapTarget::Watched(Watched {
+            revision,
+            pid: copy.pid,
+            start: copy.start.clone(),
+            home: copy.home.clone(),
+        })
+    })
+}
+
+/// The thread `target` names with `kept` the tab's copy: a claim's, its own; a read-only copy's,
+/// the `sessionId` its record names, when that record is its own process's and the id a
+/// thread's.
+fn thread_of(target: &TapTarget, kept: Option<&Kept>) -> Option<String> {
+    match target {
+        TapTarget::Claimed(target) => Some(target.thread.clone()),
+        TapTarget::Watched(watched) => {
+            let self_claimed::Seen::Present(record) = &kept?.copy.seen else {
+                return None;
+            };
+            if record.pid != watched.pid {
+                return None;
+            }
+            record
+                .session_id
+                .as_deref()
+                .filter(|t| aterm_agent::harness::codex_rollout::is_thread_id(t))
+                .map(str::to_owned)
+        }
+    }
+}
+
+/// THE ROLLOUT TAP'S TARGET for tab `ctx`, whose foreground group the sweep read as
+/// `foreground`: a live proven claim's own copy's, exactly [`rollout_target`]'s; with no proven
+/// claim, READ ONLY, the copy a release left while its process runs on ([`Use::Read`]), and only
+/// while that process leads `foreground` and is alive as the start its claim proved
+/// ([`restart_stamp::alive_as`]).
+#[must_use]
+pub(crate) fn tap_target(ctx: &crate::SessionCtx, foreground: i32) -> Option<TapTarget> {
+    tap_target_by(ctx, foreground, restart_stamp::alive_as)
+}
+
+fn tap_target_by(
+    ctx: &crate::SessionCtx,
+    foreground: i32,
+    alive: impl FnOnce(u32, &str) -> bool,
+) -> Option<TapTarget> {
+    let target = {
+        let meta = ctx.meta.lock().unwrap_or_else(PoisonError::into_inner);
+        let copies = COPIES.lock().unwrap_or_else(PoisonError::into_inner);
+        standing_of(&meta, copies.get(ctx.self_id.as_str()))?
+    };
+    match &target {
+        TapTarget::Claimed(_) => Some(target),
+        TapTarget::Watched(watched) => (i64::from(foreground) == i64::from(watched.pid)
+            && alive(watched.pid, &watched.start))
+        .then_some(target),
+    }
+}
+
+/// THE ASK'S ROLLOUT, on the tap's thread at each ask. A claim's target taps its own thread. A
+/// read-only one first reads its process's record again by `record` (off every lock:
+/// [`self_claimed::read_seen`] live), since codex-alab writes that record whether or not it
+/// holds a claim and a `/new` or `/resume` moves its `sessionId`. Under `meta -> copies`, while
+/// the standing still gives `target`, the copy takes that read (folded, so a record gone after one
+/// was seen reads removed), and the thread is the one the copy names then: a moved thread is
+/// tapped at once and the old one never again. [`Untapped::Moved`] when the standing no longer
+/// gives `target`, before the read or after it, or the identity was not live across the read;
+/// [`Untapped::Unnamed`] when the record names no thread now, which taps nothing until it names
+/// one.
+pub(crate) fn tapped(
+    ctx: &crate::SessionCtx,
+    target: &TapTarget,
+    record: fn(&std::path::Path, u32, &str) -> Option<self_claimed::Seen>,
+) -> Result<Tapped, Untapped> {
+    let seen = match target {
+        TapTarget::Claimed(_) => None,
+        TapTarget::Watched(watched) => {
+            Some(record(&watched.home, watched.pid, &watched.start).ok_or(Untapped::Moved)?)
+        }
+    };
+    let sid = ctx.self_id.as_str();
+    let meta = ctx.meta.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut copies = COPIES.lock().unwrap_or_else(PoisonError::into_inner);
+    if standing_of(&meta, copies.get(sid)).as_ref() != Some(target) {
+        return Err(Untapped::Moved);
+    }
+    if let Some(seen) = seen
+        && let Some(kept) = copies.get_mut(sid)
+    {
+        let read = Copy {
+            seen,
+            ..kept.copy.clone()
+        };
+        kept.copy = self_claimed::fold(Some(&kept.copy), read);
+    }
+    let kept = copies.get(sid);
+    if standing_of(&meta, kept).as_ref() != Some(target) {
+        return Err(Untapped::Moved);
+    }
+    let thread = thread_of(target, kept).ok_or(Untapped::Unnamed)?;
+    Ok(Tapped {
+        target: target.clone(),
+        thread,
+    })
 }
 
 /// Guard holding `meta` and `copies` locks across a bounded timeline hold.
@@ -303,19 +549,35 @@ pub(crate) struct RolloutGuard<'a> {
     _copies: std::sync::MutexGuard<'static, Copies>,
 }
 
-pub(crate) fn hold_rollout<'a>(
+/// Hold `meta -> copies` while the tab's standing still gives `target`, whatever thread it names
+/// (the tap's capture of the run it reads).
+pub(crate) fn hold_target<'a>(
     ctx: &'a crate::SessionCtx,
-    target: &RolloutTarget,
+    target: &TapTarget,
 ) -> Option<RolloutGuard<'a>> {
     let meta = ctx.meta.lock().unwrap_or_else(PoisonError::into_inner);
     let copies = COPIES.lock().unwrap_or_else(PoisonError::into_inner);
-    let current = target_of(
-        meta.live_claim(crate::metrics::now_us())
-            .and_then(|claim| claim.proven.as_ref()),
-        meta.supervisor_revision,
-        copies.get(ctx.self_id.as_str()),
-    );
-    (current.as_ref() == Some(target)).then_some(RolloutGuard {
+    let holds = standing_of(&meta, copies.get(ctx.self_id.as_str())).as_ref() == Some(target);
+    holds.then_some(RolloutGuard {
+        _meta: meta,
+        _copies: copies,
+    })
+}
+
+/// Hold `meta -> copies` while the tab's standing still gives `tapped`'s target and that target
+/// still names `tapped`'s thread.
+pub(crate) fn hold_rollout<'a>(
+    ctx: &'a crate::SessionCtx,
+    tapped: &Tapped,
+) -> Option<RolloutGuard<'a>> {
+    let meta = ctx.meta.lock().unwrap_or_else(PoisonError::into_inner);
+    let copies = COPIES.lock().unwrap_or_else(PoisonError::into_inner);
+    let holds = {
+        let kept = copies.get(ctx.self_id.as_str());
+        standing_of(&meta, kept).as_ref() == Some(&tapped.target)
+            && thread_of(&tapped.target, kept).as_deref() == Some(tapped.thread.as_str())
+    };
+    holds.then_some(RolloutGuard {
         _meta: meta,
         _copies: copies,
     })
@@ -326,28 +588,62 @@ pub(crate) fn take_copy(sid: &str, pid: u32, start: &str) {
     let mut copies = COPIES.lock().unwrap_or_else(PoisonError::into_inner);
     if copies
         .get(sid)
-        .is_some_and(|copy| copy.pid == pid && copy.start == start)
+        .is_some_and(|kept| kept.copy.pid == pid && kept.copy.start == start)
     {
         copies.remove(sid);
     }
 }
 
-/// Drop tab `sid`'s kept record copy if its process has ended.
+/// Drop tab `sid`'s kept record copy, a claim's or a read-only one, if its process has ended.
 pub(crate) fn discard_dead(sid: &str) {
-    let dead = copy_of_tab(sid).filter(|copy| !restart_stamp::alive_as(copy.pid, &copy.start));
-    if let Some(copy) = dead {
-        take_copy(sid, copy.pid, &copy.start);
+    let dead = COPIES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(sid)
+        .map(|kept| (kept.copy.pid, kept.copy.start.clone()))
+        .filter(|(pid, start)| !restart_stamp::alive_as(*pid, start));
+    if let Some((pid, start)) = dead {
+        take_copy(sid, pid, &start);
     }
 }
 
-/// Tests: tab `sid`'s copy is `copy` (`None`: none).
+/// Tests: tab `sid`'s copy is `copy`, a claim's (`None`: none).
 #[cfg(test)]
 pub(crate) fn set_copy_for_test(sid: &str, copy: Option<Copy>) {
     let mut copies = COPIES.lock().unwrap_or_else(PoisonError::into_inner);
     match copy {
-        Some(copy) => copies.insert(sid.to_string(), copy),
+        Some(copy) => copies.insert(
+            sid.to_string(),
+            Kept {
+                copy,
+                by: Use::Claim,
+            },
+        ),
         None => copies.remove(sid),
     };
+}
+
+/// Tests: [`finish_release`] of `proven`'s claim at `revision` on `ctx`, its process `alive` or
+/// not and `copy` the release's own read, as [`released`] runs it on the kernel's word.
+#[cfg(test)]
+pub(crate) fn released_for_test(
+    ctx: &crate::SessionCtx,
+    proven: &Proven,
+    revision: u64,
+    alive: bool,
+    copy: Option<Copy>,
+) -> bool {
+    finish_release(ctx, proven, revision, alive, copy)
+}
+
+/// Tab `sid` closed, whether or not a harness host runs to [`forget`] it: its read-only copy
+/// ([`Use::Read`]), the rollout tap's alone, goes with the tab. A claim's copy stays for the
+/// host, which forgets it on its own pass once the tab is closed and no worker holds it.
+pub(crate) fn forget_read(sid: &str) {
+    let mut copies = COPIES.lock().unwrap_or_else(PoisonError::into_inner);
+    if copies.get(sid).is_some_and(|kept| kept.by == Use::Read) {
+        copies.remove(sid);
+    }
 }
 
 /// Tab `sid` closed: nothing of its agent is read again.
@@ -375,7 +671,42 @@ pub(crate) fn claimed(
     }
 }
 
-/// Refresh or clear the record copy when a proven claim is released on `ctx` and notify the host.
+/// BOOK A PROVEN SELF-CLAIM'S ACT IN ITS SESSION'S LEDGER (`<state>/drive/<sid>.jsonl`): `act`,
+/// recorded by `holder` on session `sid`'s proven claim, as one
+/// [`aterm_agent::supervise::approvals::SelfClaimRow`] through the ledger's one append, the one
+/// aterm's own loop writes its rows through, under the lock the loop's cut of the ledger holds
+/// ([`aterm_agent::supervise::approvals::book_self_claim`]) — the row Settings ▸ Harness counts
+/// as the holder's and `aterm harness ledger @<sid>` lists. Blocking file I/O on the control lane
+/// that admitted the act, with no session lock held; whether the row was written (a failure is
+/// logged).
+pub(crate) fn book_act(sid: &str, holder: &str, act: &str) -> bool {
+    use aterm_agent::supervise::approvals;
+    let Some(path) =
+        aterm_types::dirs::state_dir().and_then(|root| approvals::path_under(&root, Some(sid)))
+    else {
+        aterm_log::info!("self-claim @{sid}: act {act}: no state directory to book it in");
+        return false;
+    };
+    let mut refused = Vec::new();
+    let written = approvals::book_self_claim(
+        &path,
+        Some(sid),
+        aterm_agent::supervise::journal::unix_ms(),
+        &approvals::SelfClaimRow { holder, act },
+        &mut refused,
+    )
+    .is_some();
+    if !written {
+        aterm_log::info!(
+            "self-claim @{sid}: act {act}: not booked: {}",
+            String::from_utf8_lossy(&refused).trim()
+        );
+    }
+    written
+}
+
+/// Refresh the record copy when a proven claim is released on `ctx`, keep it for the exit or read
+/// only ([`keep_to_read`]), and notify the host.
 pub(crate) fn released(ctx: &crate::SessionCtx, proven: &Proven, revision: u64) {
     let typed = typed_for(ctx.self_id.as_str());
     if let Some(alive) = released_by(
@@ -416,22 +747,47 @@ fn finish_release(
     }
     let mut copies = COPIES.lock().unwrap_or_else(PoisonError::into_inner);
     let sid = ctx.self_id.as_str();
+    let before = copies.get(sid).and_then(Kept::line);
     if let Some(copy) = copy {
-        let copy = self_claimed::fold(copies.get(sid), copy);
-        copies.insert(sid.to_string(), copy);
+        let copy = self_claimed::fold(copies.get(sid).map(|kept| &kept.copy), copy);
+        copies.insert(
+            sid.to_string(),
+            Kept {
+                copy,
+                by: Use::Claim,
+            },
+        );
     }
-    if alive
-        && copies
-            .get(sid)
-            .filter(|copy| copy.pid == proven.pid && copy.start == proven.start)
-            .is_none_or(|copy| !self_claimed::shows_end(copy))
-        && copies.remove(sid).is_some_and(|copy| copy.resume.is_ok())
-    {
-        drop(copies);
-        drop(meta);
+    if alive {
+        keep_to_read(&mut copies, sid, proven);
+    }
+    let after = copies.get(sid).and_then(Kept::line);
+    drop(copies);
+    drop(meta);
+    if before != after {
         crate::harness_host::ring();
     }
     true
+}
+
+/// THE PASSIVE RELEASE KEEPS ITS COPY TO READ: what a release of `proven`'s claim leaves in tab
+/// `sid` while that process still runs. A copy of another process goes; one whose record shows
+/// the end coming stays the claim's, for the exit; any other is kept READ ONLY
+/// ([`Use::Read`]), its resume line withdrawn, so nothing decides the exit, relaunches or carries
+/// a line from it, and the rollout tap reads on ([`tap_target`]).
+fn keep_to_read(copies: &mut Copies, sid: &str, proven: &Proven) {
+    let Some(kept) = copies.get_mut(sid) else {
+        return;
+    };
+    if kept.copy.pid != proven.pid || kept.copy.start != proven.start {
+        copies.remove(sid);
+        return;
+    }
+    if self_claimed::shows_end(&kept.copy) {
+        return;
+    }
+    kept.by = Use::Read;
+    kept.copy.resume = Err("released");
 }
 
 /// Stand-in child process helper for self-claim tests.
@@ -486,6 +842,91 @@ pub(crate) mod stand_in {
         Proven {
             pid,
             start: aterm_agent::harness::restart_stamp::kernel_start(pid).expect("its start"),
+        }
+    }
+
+    /// A codex-alab stand-in of a test's own: the kept signed `sleep`, run in place with
+    /// `CODEX_HOME` the test's directory, whose session record the test plants
+    /// ([`Self::plant`]). Killed and reaped when dropped.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) struct Sleeper {
+        child: aterm_uds::spawnfd::Child,
+        home: std::path::PathBuf,
+        /// Its pid and kernel start.
+        pub(crate) proven: Proven,
+    }
+
+    #[cfg(target_vendor = "apple")]
+    impl Sleeper {
+        /// Starts one under `home` (canonical) and waits until it runs from the stand-in.
+        pub(crate) fn under(home: &std::path::Path) -> Self {
+            let sleep = std::fs::canonicalize(aterm_uds::deadline::stand_in(std::path::Path::new(
+                "/bin/sleep",
+            )))
+            .expect("the kept stand-in");
+            let sleep_s = sleep.to_string_lossy().into_owned();
+            let child = aterm_uds::spawnfd::command(&sleep)
+                .arg("60")
+                .env("CODEX_HOME", home)
+                .spawn()
+                .expect("spawn sleep");
+            let pid = child.id();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !atpkg::caller_shell::process_args(pid)
+                .is_some_and(|a| a.argv.first() == Some(&sleep_s))
+            {
+                assert!(std::time::Instant::now() < deadline, "sleep never ran");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let start = aterm_agent::harness::restart_stamp::kernel_start(pid).expect("its start");
+            Self {
+                child,
+                home: home.to_path_buf(),
+                proven: Proven { pid, start },
+            }
+        }
+
+        /// Writes its session record naming `session` (`None`: `sessionId` null), busy and with
+        /// no exit word, as codex-alab's writer does with or without a claim.
+        pub(crate) fn plant(&self, session: Option<&str>) {
+            self.plant_as(self.proven.pid, session, "busy");
+        }
+
+        /// Writes, at its own record's path, a record that says it is `pid`'s, names `session`
+        /// and says `status`, with no exit word.
+        pub(crate) fn plant_as(&self, pid: u32, session: Option<&str>, status: &str) {
+            let path = self.record();
+            std::fs::create_dir_all(path.parent().expect("dir")).expect("sessions dir");
+            let session = session.map_or("null".to_string(), |s| format!("\"{s}\""));
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"v":1,"pid":{pid},"sessionId":{session},"status":"{status}","exit":null}}"#
+                ),
+            )
+            .expect("the record");
+        }
+
+        /// Removes its session record, as codex-alab does at its end.
+        pub(crate) fn unplant(&self) {
+            std::fs::remove_file(self.record()).expect("the record removed");
+        }
+
+        fn record(&self) -> std::path::PathBuf {
+            aterm_agent::harness::self_claimed::record_path(&self.home, self.proven.pid)
+        }
+
+        /// Kills it and waits for its end.
+        pub(crate) fn end(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            self.end();
         }
     }
 }
@@ -615,6 +1056,196 @@ mod tests {
         ] {
             assert_eq!(target_of(Some(&proven), 7, Some(&other)), None, "{other:?}");
         }
+    }
+
+    /// THE PASSIVE RELEASE KEEPS ITS COPY TO READ ([`keep_to_read`]): a proven claim released
+    /// while its process runs and its record shows no end keeps the copy READ ONLY. No act path
+    /// sees it ([`copy_of_tab`], [`live_copy`], [`rollout_target`]) and its resume line is gone
+    /// even from the kept entry; the rollout tap's target stands on it ([`tap_target`]: the same
+    /// process and home, at the release's revision) while that process leads the front and is
+    /// alive as its claim proved it, and the sweep keeps asking (`Ask::Read`, never `Stop`). A
+    /// claim granted again names exactly the claim's target again, at its own revision.
+    /// NEGATIVE CONTROLS: another process leading the front, a process not alive as that start
+    /// (dead, or another start under the pid), the real kernel's word on an identity no process
+    /// has, and a release whose record shows the end coming (the claim's copy kept for the exit)
+    /// name no read-only target; a copy of another process goes at the release.
+    #[test]
+    fn a_passive_release_keeps_its_copy_to_read_and_no_act_path_sees_it() {
+        use crate::codex_rollout_tap::{Ask, RECHECK, due};
+        use crate::session_timeline::{claim_supervisor_as, release_supervisor};
+        const THREAD: &str = "0199f2a4-6c1e-7a52-9d3b-2f6c8e1a4b77";
+        let handle = crate::session_store::test_handle_on(7594, -1);
+        let ctx = handle.ctx.as_ref();
+        let sid = ctx.self_id.as_str();
+        let proven = Proven {
+            pid: 4242,
+            start: "Mon Oct 20 16:37:58 2026".to_string(),
+        };
+        let now = crate::metrics::now_us();
+        let claim = |conn| {
+            claim_supervisor_as(
+                ctx,
+                "codex-alab@4242",
+                Some(conn),
+                None,
+                Some(proven.clone()),
+                now,
+                aterm_slog::Actor::Ctl,
+            )
+            .expect("the proven claim stands")
+            .revision
+        };
+        let lined = || Copy {
+            resume: Ok(self_claimed::Resume {
+                argv: vec!["/opt/alab/bin/codex".into(), "resume".into(), THREAD.into()],
+                session: THREAD.to_string(),
+                codex_home: None,
+                codex_auth_path: None,
+                cwd: None,
+            }),
+            ..copy_of(4242, &proven.start, present(Some(THREAD)))
+        };
+        let revision = ctx.meta.lock().unwrap().supervisor_revision;
+        let release = |copy: Copy, rings_delta: u64| {
+            assert!(release_supervisor(ctx, None, now, aterm_slog::Actor::Ctl));
+            let revision = ctx.meta.lock().unwrap().supervisor_revision;
+            let rings = crate::harness_host::rings_here();
+            assert!(finish_release(ctx, &proven, revision, true, Some(copy)));
+            assert_eq!(crate::harness_host::rings_here(), rings + rings_delta);
+            revision
+        };
+        let alive_as_proven = |pid: u32, start: &str| pid == 4242 && start == proven.start;
+        forget(sid);
+        let first = claim(1);
+        assert!(first > revision);
+        let rings = crate::harness_host::rings_here();
+        assert!(refresh_by(ctx, &proven, first, || Some(lined())));
+        assert_eq!(crate::harness_host::rings_here(), rings + 1);
+        let claimed = rollout_target(ctx).expect("the claim's own target");
+        assert_eq!(
+            tap_target_by(ctx, 4242, alive_as_proven),
+            Some(TapTarget::Claimed(claimed.clone())),
+            "under the claim the tap's target is the claim's, exactly"
+        );
+
+        let released = release(lined(), 1);
+        assert_eq!(copy_of_tab(sid), None, "no act path reads a passive copy");
+        assert_eq!(live_copy(ctx), None);
+        assert_eq!(
+            rollout_target(ctx),
+            None,
+            "a landing or `result` finds none"
+        );
+        assert_eq!(
+            COPIES
+                .lock()
+                .unwrap()
+                .get(sid)
+                .map(|kept| kept.copy.resume.clone()),
+            Some(Err("released")),
+            "the kept entry itself carries no line"
+        );
+        let watched = TapTarget::Watched(Watched {
+            revision: released,
+            pid: 4242,
+            start: proven.start.clone(),
+            home: std::path::PathBuf::from("/private/tmp/x/codex-home"),
+        });
+        assert_eq!(
+            tap_target_by(ctx, 4242, alive_as_proven),
+            Some(watched.clone())
+        );
+        let mut asked = std::collections::HashMap::new();
+        let t0 = std::time::Instant::now();
+        for at in [t0, t0 + RECHECK] {
+            assert_eq!(
+                due(
+                    &mut asked,
+                    7594,
+                    tap_target_by(ctx, 4242, alive_as_proven),
+                    at
+                ),
+                Ask::Read(watched.clone()),
+                "the sweep keeps asking, never stops"
+            );
+        }
+        assert_eq!(
+            tap_target_by(ctx, 4243, alive_as_proven),
+            None,
+            "another process leads the front"
+        );
+        assert_eq!(
+            tap_target_by(ctx, 4242, |_, _| false),
+            None,
+            "the process is not alive as its claim proved it"
+        );
+        assert_eq!(
+            tap_target(ctx, 4242),
+            None,
+            "the kernel knows no process 4242 started then"
+        );
+        assert_eq!(
+            due(&mut asked, 7594, tap_target(ctx, 4242), t0 + RECHECK * 2),
+            Ask::Stop
+        );
+
+        let again = claim(2);
+        assert!(again > released, "the claim moves the revision");
+        assert_eq!(
+            tap_target_by(ctx, 4242, alive_as_proven),
+            None,
+            "a claim no copy was read for names nothing yet, as before the release kept one"
+        );
+        let rings = crate::harness_host::rings_here();
+        assert!(refresh_by(ctx, &proven, again, || Some(lined())));
+        assert_eq!(crate::harness_host::rings_here(), rings + 1);
+        assert_eq!(
+            tap_target_by(ctx, 4242, alive_as_proven),
+            Some(TapTarget::Claimed(RolloutTarget {
+                revision: again,
+                ..claimed
+            }))
+        );
+        assert_eq!(
+            copy_of_tab(sid),
+            Some(lined()),
+            "the claim's copy acts again"
+        );
+
+        let ending = Copy {
+            seen: self_claimed::Seen::Present(self_claimed::Record {
+                status: Some("exited".to_string()),
+                ..match present(Some(THREAD)) {
+                    self_claimed::Seen::Present(record) => record,
+                    _ => unreachable!("present"),
+                }
+            }),
+            ..lined()
+        };
+        let _ = release(ending.clone(), 0);
+        assert_eq!(copy_of_tab(sid), Some(ending), "kept for the exit");
+        assert_eq!(tap_target_by(ctx, 4242, |_, _| true), None);
+
+        let third = claim(3);
+        assert!(refresh_by(ctx, &proven, third, || Some(lined())));
+        let _ = release(copy_of(4242, &proven.start, self_claimed::Seen::Never), 1);
+        assert_eq!(
+            copy_of_tab(sid).map(|copy| (copy.seen, copy.resume)),
+            Some((self_claimed::Seen::Removed, Err("no-record"))),
+            "an orderly exit that removed its record withdraws its resume line and rings the host"
+        );
+
+        let _ = claim(4);
+        set_copy_for_test(
+            sid,
+            Some(copy_of(4243, &proven.start, present(Some(THREAD)))),
+        );
+        let _ = release(copy_of(4243, &proven.start, present(Some(THREAD))), 0);
+        assert!(
+            COPIES.lock().unwrap().get(sid).is_none(),
+            "another process's copy goes"
+        );
+        forget(sid);
     }
 
     /// Only a usage wall, only with the policy in effect and `resume_limits`
@@ -782,7 +1413,10 @@ mod tests {
                 true,
                 Some(standing())
             ));
-            assert!(copy_of_tab(sid).is_none(), "passive handback keeps no copy");
+            assert!(
+                copy_of_tab(sid).is_none(),
+                "passive handback keeps no copy an act path reads"
+            );
             Some(standing())
         }));
         assert!(copy_of_tab(sid).is_none(), "the old read stayed invalid");
@@ -798,6 +1432,52 @@ mod tests {
             aterm_slog::Actor::Ctl,
         )
         .expect("the same identity claims again");
+        assert!(refresh_by(ctx, &proven, next.revision, || Some(copy(
+            self_claimed::Seen::Never
+        ))));
+        assert_eq!(
+            copy_of_tab(sid).unwrap().seen,
+            self_claimed::Seen::Removed,
+            "a passive read-only copy preserves that this identity's record was already seen"
+        );
+        assert!(refresh_by(ctx, &proven, next.revision, || Some(standing())));
+        assert!(release_supervisor(ctx, None, now, aterm_slog::Actor::Ctl));
+        let passive_rev = ctx.meta.lock().unwrap().supervisor_revision;
+        assert!(finish_release(
+            ctx,
+            &proven,
+            passive_rev,
+            true,
+            Some(standing())
+        ));
+        let next = claim_supervisor_as(
+            ctx,
+            holder,
+            Some(2),
+            None,
+            Some(proven.clone()),
+            now,
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("the same identity claims again after passive release");
+        let initializing = || {
+            let mut c = standing();
+            if let self_claimed::Seen::Present(ref mut record) = c.seen {
+                record.initializing = true;
+            }
+            c
+        };
+        assert!(refresh_by(ctx, &proven, next.revision, || Some(
+            initializing()
+        )));
+        assert_eq!(
+            copy_of_tab(sid).map(|c| (c.seen, c.resume)),
+            Some((
+                self_claimed::Seen::Unreadable("record-regressed"),
+                Err("record-regressed")
+            )),
+            "a passive read-only copy prevents a re-claim from regressing to initializing"
+        );
         assert!(refresh_by(ctx, &proven, next.revision, || Some(standing())));
         assert!(!finish_release(
             ctx,
@@ -973,6 +1653,141 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         assert!(!idle_now(ctx, pid, &start), "a dead identity rests nowhere");
+    }
+
+    /// THE READ-ONLY COPY FOLLOWS ITS PROCESS'S OWN RECORD, live: a real stand-in process
+    /// ([`stand_in::Sleeper`], its `CODEX_HOME` the test's directory) whose proven claim is
+    /// released through the real path keeps its copy read only, and its target taps the thread
+    /// the record names, read again at each ask ([`tapped`] over [`self_claimed::read_seen`]): a
+    /// `/new` written into the record moves the tapped thread at once and the old thread is held
+    /// no more ([`hold_rollout`]); a record naming no thread, or one that says it is another
+    /// process's, taps nothing while the target still stands, so the next ask reads it again and
+    /// taps the thread it names then. FAIL CLOSED: a record that shows the end coming (`exited`),
+    /// or is gone after it was seen (folded to removed), ends the target at that ask, and only a
+    /// claim granted and given back again names one. NEGATIVE CONTROLS: another group in front,
+    /// and the process ended, name no target; an ended process's record is not read, and its copy
+    /// goes ([`discard_dead`]).
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_read_only_copy_follows_its_live_processs_own_record() {
+        use crate::session_timeline::{claim_supervisor_as, release_supervisor};
+        const THREAD: &str = "0199f2a4-6c1e-7a52-9d3b-2f6c8e1a4b77";
+        const NEXT: &str = "0199f2a4-6c1e-7a52-9d3b-2f6c8e1a4b78";
+        let dir = aterm_tempfile::TempDir::new().expect("dir");
+        let home = std::fs::canonicalize(dir.path()).expect("canonical");
+        let mut sleeper = stand_in::Sleeper::under(&home);
+        let proven = sleeper.proven.clone();
+        let pid = proven.pid;
+        let group = i32::try_from(pid).expect("a pid");
+        sleeper.plant(Some(THREAD));
+        let handle = crate::session_store::test_handle_on(7595, -1);
+        let ctx = handle.ctx.as_ref();
+        let sid = ctx.self_id.as_str();
+        let now = crate::metrics::now_us();
+        let claim_and_release = || {
+            claim_supervisor_as(
+                ctx,
+                &format!("{SELF_CLAIM_PREFIX}{pid}"),
+                Some(1),
+                None,
+                Some(proven.clone()),
+                now,
+                aterm_slog::Actor::Ctl,
+            )
+            .expect("a claim");
+            meta_changed(ctx);
+            let claimed = rollout_target(ctx).expect("the claim's copy names its thread");
+            assert!(release_supervisor(ctx, None, now, aterm_slog::Actor::Ctl));
+            assert_eq!(copy_of_tab(sid), None, "no act path is handed the copy");
+            let Some(TapTarget::Watched(watched)) = tap_target(ctx, group) else {
+                panic!("a read-only target for the released claim's live process");
+            };
+            (claimed, watched)
+        };
+        let (claimed, watched) = claim_and_release();
+        assert_eq!(
+            (claimed.thread.as_str(), claimed.home.as_path()),
+            (THREAD, home.as_path())
+        );
+        assert_eq!(
+            (watched.pid, watched.start.as_str(), watched.home.as_path()),
+            (pid, proven.start.as_str(), home.as_path())
+        );
+        let target = TapTarget::Watched(watched);
+        let thread = |target: &TapTarget| {
+            tapped(ctx, target, self_claimed::read_seen).map(|tapped| tapped.thread)
+        };
+        let old = tapped(ctx, &target, self_claimed::read_seen).expect("its thread");
+        assert_eq!(old.thread, THREAD);
+        assert!(hold_rollout(ctx, &old).is_some());
+        sleeper.plant(Some(NEXT));
+        assert_eq!(
+            thread(&target),
+            Ok(NEXT.to_string()),
+            "a /new under Off taps the new thread"
+        );
+        assert!(hold_rollout(ctx, &old).is_none(), "never the old one");
+        sleeper.plant(None);
+        assert_eq!(thread(&target), Err(Untapped::Unnamed));
+        assert_eq!(
+            tap_target(ctx, group),
+            Some(target.clone()),
+            "the target stands, so the next ask reads the record again"
+        );
+        sleeper.plant(Some(NEXT));
+        assert_eq!(thread(&target), Ok(NEXT.to_string()));
+        sleeper.plant_as(pid + 1, Some(THREAD), "busy");
+        assert_eq!(
+            thread(&target),
+            Err(Untapped::Unnamed),
+            "a record that says it is another process's names no thread of this one"
+        );
+        assert_eq!(tap_target(ctx, group), Some(target.clone()));
+        sleeper.plant(Some(NEXT));
+        assert_eq!(thread(&target), Ok(NEXT.to_string()));
+
+        sleeper.unplant();
+        assert_eq!(
+            thread(&target),
+            Err(Untapped::Moved),
+            "a record gone after it was seen reads removed: the end"
+        );
+        assert_eq!(tap_target(ctx, group), None);
+        sleeper.plant(Some(NEXT));
+        assert_eq!(
+            thread(&target),
+            Err(Untapped::Moved),
+            "a record written again names no target until a claim reads it"
+        );
+        let (_, watched) = claim_and_release();
+        let target = TapTarget::Watched(watched);
+        assert_eq!(thread(&target), Ok(NEXT.to_string()));
+        sleeper.plant_as(pid, Some(NEXT), "exited");
+        assert_eq!(
+            thread(&target),
+            Err(Untapped::Moved),
+            "a record that shows the end coming ends the target"
+        );
+        assert_eq!(tap_target(ctx, group), None);
+
+        sleeper.plant(Some(NEXT));
+        let (_, watched) = claim_and_release();
+        let target = TapTarget::Watched(watched);
+        assert_eq!(thread(&target), Ok(NEXT.to_string()));
+        assert_eq!(tap_target(ctx, group + 1), None, "another group in front");
+        sleeper.end();
+        assert_eq!(tap_target(ctx, group), None, "the process ended");
+        assert_eq!(
+            thread(&target),
+            Err(Untapped::Moved),
+            "an ended process's record is not read"
+        );
+        discard_dead(sid);
+        assert!(
+            COPIES.lock().unwrap().get(sid).is_none(),
+            "a dead process's copy goes"
+        );
+        forget(sid);
     }
 
     #[cfg(target_vendor = "apple")]

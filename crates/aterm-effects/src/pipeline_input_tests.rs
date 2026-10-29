@@ -254,3 +254,48 @@ fn web_accepted_printables_conform_to_the_existing_input_credit_model() {
         state = projected;
     }
 }
+
+/// A trail turned off takes its letter-sparing bloom gate (looks10 L1,
+/// [`aterm_core::render::BloomGate::SparesLetters`]) with it: the web host's frame then reads
+/// [`aterm_core::render::BloomGate::Open`], as a terminal that never lit a trail does
+/// (aterm-gpu-web's `effects_snapshots_are_deterministic_and_restore_on_off`), both when
+/// nothing else is on (the pipeline's idle arm) and when another effect keeps the frame step
+/// running (the cursor step with its glow off). Control: while the guarded style is on, its
+/// frame spares the letters.
+#[test]
+fn a_trail_turned_off_takes_its_letter_sparing_bloom_gate_with_it() {
+    use aterm_core::render::BloomGate;
+    let off = |host: &mut Host| {
+        host.pipeline.set_cursor_glow(
+            false,
+            "lumen",
+            crate::cursor_fx::TrailColor::Automatic,
+            None,
+            260,
+            24,
+            0.7,
+            0.6,
+            true,
+            0x0050_FA7B,
+        );
+    };
+    for streak in [false, true] {
+        let mut host = Host::new(Instant::now());
+        host.pipeline
+            .set_output_streak(streak, 0.8, 12, 4, 10, false, 7);
+        host.echo('a');
+        assert_eq!(
+            host.input.bloom_gate,
+            BloomGate::SparesLetters,
+            "control (streak {streak}): the guarded style's frame spares its letters"
+        );
+        off(&mut host);
+        assert_eq!(host.pipeline.enabled_any(), streak);
+        host.echo('b');
+        assert_eq!(
+            host.input.bloom_gate,
+            BloomGate::Open,
+            "streak {streak}: the trail is off, and so is its gate"
+        );
+    }
+}

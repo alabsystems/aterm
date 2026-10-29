@@ -100,7 +100,7 @@ pub fn schema_artifact() -> ArtifactId {
     e.str(
         "state: canonical TerminalCheckpoint, canonical PaneStepCarry, canonical TerminalConfig, \
          resize policy, host resync, host alternate scroll, cell_px, canonical security Policy, \
-         hyperlink schemes; inputs Bytes|Resize|Witness|CellPx|Host; \
+         hyperlink schemes, kitty_media_admitted; inputs Bytes|Resize|Witness|CellPx|Host; \
          observations Parsed|Resized|Witnessed|CellPx|Host; replies are effects",
     );
     ArtifactId::new(ArtifactKind::Schema, SCHEMA_NAME, 1, e.as_bytes())
@@ -150,6 +150,8 @@ pub struct PaneEnv {
     pub security_policy: Option<aterm_core::policy::Policy>,
     /// Host-authorized extra OSC 8 URI schemes (lowercased).
     pub hyperlink_schemes: Vec<String>,
+    /// Whether non-direct Kitty graphics media (`t=f`, `t=t`, `t=s`) were admitted by the live host.
+    pub kitty_media_admitted: bool,
 }
 
 /// The task's state: a checkpoint of the engine (history kept to [`PANE_HISTORY_LINES`], the shell nonce carried), its per-slice transient carry, and what it replays under.
@@ -241,6 +243,9 @@ impl PaneState {
         }
         for scheme in &self.env.hyperlink_schemes {
             let _ = term.authorize_hyperlink_scheme(scheme);
+        }
+        if self.env.kitty_media_admitted {
+            term.set_kitty_file_resolver(|_, _| None);
         }
         term.apply_pane_step_carry(&self.carry, origin.monotonic);
         let _ = term.take_response();
@@ -377,10 +382,10 @@ impl PaneSchema {
     /// The clock reading `clock` names on this schema's origin.
     #[must_use]
     pub fn reading(&self, clock: PaneClock) -> ClockReading {
-        ClockReading {
-            monotonic: self.origin.monotonic + Duration::from_nanos(clock.offset_ns),
-            wall_ms: clock.wall_ms,
-        }
+        let mut out =
+            advance_monotonic_saturating(self.origin, Duration::from_nanos(clock.offset_ns));
+        out.wall_ms = clock.wall_ms;
+        out
     }
 
     /// The reading a slice whose clock the recording dropped parses at: the origin, with no wall time.
@@ -391,6 +396,30 @@ impl PaneSchema {
             wall_ms: None,
         }
     }
+}
+
+fn advance_monotonic_saturating(mut reading: ClockReading, delta: Duration) -> ClockReading {
+    if let Some(sum) = reading.monotonic.checked_add(delta) {
+        reading.monotonic = sum;
+        return reading;
+    }
+    for shift in (0..64).rev() {
+        if let Some(next) = reading
+            .monotonic
+            .checked_add(Duration::from_secs(1u64 << shift))
+        {
+            reading.monotonic = next;
+        }
+    }
+    for shift in (0..30).rev() {
+        if let Some(next) = reading
+            .monotonic
+            .checked_add(Duration::from_nanos(1u64 << shift))
+        {
+            reading.monotonic = next;
+        }
+    }
+    reading
 }
 
 const fn canon_fault(f: &CanonFault) -> WireFault {
@@ -472,6 +501,7 @@ fn encode_host_op(e: &mut Enc, op: &HostOp) {
             e.u8(11);
             e.raw(nonce);
         }
+        HostOp::AdvanceKittyAnimations => e.u8(12),
     }
 }
 
@@ -535,6 +565,7 @@ fn decode_host_op(d: &mut Dec<'_>) -> Result<HostOp, WireFault> {
             d,
             "input.host.nonce",
         )?)),
+        12 => Ok(HostOp::AdvanceKittyAnimations),
         tag => Err(WireFault::BadTag {
             field: "input.host.op",
             tag,
@@ -613,6 +644,7 @@ impl Schema for PaneSchema {
             cell_px,
             security_policy,
             hyperlink_schemes,
+            kitty_media_admitted,
         } = &*s.env;
         e.bytes(&config.canonical());
         encode_policy(e, *policy);
@@ -629,6 +661,7 @@ impl Schema for PaneSchema {
         for scheme in hyperlink_schemes {
             e.str(scheme);
         }
+        e.bool(*kitty_media_admitted);
     }
 
     fn decode_state(&self, d: &mut Dec<'_>) -> Result<PaneState, WireFault> {
@@ -684,6 +717,7 @@ impl Schema for PaneSchema {
                 field: "state.hyperlink_schemes",
             });
         }
+        let kitty_media_admitted = d.bool("state.kitty_media_admitted")?;
         Ok(PaneState::with_carry(
             checkpoint,
             carry,
@@ -695,6 +729,7 @@ impl Schema for PaneSchema {
                 cell_px,
                 security_policy,
                 hyperlink_schemes,
+                kitty_media_admitted,
             },
         ))
     }
@@ -890,10 +925,9 @@ impl PaneCode {
             #[cfg(any(test, debug_assertions))]
             PaneCode::DemoClockSkew => {
                 let skew = u64::try_from(DEMO_SKEW.as_millis()).unwrap_or(u64::MAX);
-                ClockReading {
-                    monotonic: reading.monotonic + DEMO_SKEW,
-                    wall_ms: reading.wall_ms.map(|ms| ms.saturating_add(skew)),
-                }
+                let mut skewed = advance_monotonic_saturating(reading, DEMO_SKEW);
+                skewed.wall_ms = reading.wall_ms.map(|ms| ms.saturating_add(skew));
+                skewed
             }
         }
     }
@@ -1011,17 +1045,20 @@ impl Code<PaneSchema> for PrebuiltPane {
                 if *width == 0 || *height == 0 {
                     return Err(refusal(RESIZE_GEOMETRY, format!("{width}x{height}px")));
                 }
-                Arc::make_mut(&mut state.env).cell_px = Some((*width, *height));
                 let mut term = state.engine_on(schema);
+                term.set_cell_pixel_size(*width, *height);
                 let _ = term.take_reports();
-                state.checkpoint = project(&term).ok_or_else(|| {
+                let checkpoint = project(&term).ok_or_else(|| {
                     refusal(
                         UNCARRIED_PARTIAL,
                         "a cell-px update inside a partial sequence".into(),
                     )
                 })?;
-                state.carry =
+                let carry =
                     PaneStepCarry::capture(&term, schema.origin.monotonic, PANE_HISTORY_LINES);
+                Arc::make_mut(&mut state.env).cell_px = Some((*width, *height));
+                state.checkpoint = checkpoint;
+                state.carry = carry;
                 Ok(PaneObservation::CellPx {
                     width: *width,
                     height: *height,
@@ -1130,13 +1167,26 @@ impl Contract<PaneSchema> for FaithfulReplay {
                     PaneInput::Host { op: expected, .. },
                     PaneObservation::Host { op: seen, clocked },
                 ) if expected == seen => {
-                    if matches!(expected, HostOp::LeaveAlternateScreen) && !clocked {
-                        return fail(
-                            cursor,
-                            CLOCK_RECORDED,
-                            "the host alternate-screen leave carries no clock; it ran at the origin"
-                                .into(),
-                        );
+                    if !clocked {
+                        match expected {
+                            HostOp::LeaveAlternateScreen => {
+                                return fail(
+                                    cursor,
+                                    CLOCK_RECORDED,
+                                    "the host alternate-screen leave carries no clock; it ran at the origin"
+                                        .into(),
+                                );
+                            }
+                            HostOp::AdvanceKittyAnimations => {
+                                return fail(
+                                    cursor,
+                                    CLOCK_RECORDED,
+                                    "the Kitty animation step carries no clock; it ran at the origin"
+                                        .into(),
+                                );
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 (PaneInput::Witness { .. }, PaneObservation::Witnessed { live, replayed }) => {
@@ -1167,11 +1217,15 @@ impl Contract<PaneSchema> for FaithfulReplay {
         if let Some((cursor, r)) = &run.refused {
             return fail(*cursor, WITNESS_MATCHES, format!("the replay stopped: {r}"));
         }
-        if run.observations.len() < inputs.len() {
-            let cursor = run
-                .observations
-                .last()
-                .map_or(0, |(c, _)| c.saturating_add(1));
+        if run.observations.len() != inputs.len() {
+            let cursor = run.observations.get(inputs.len()).map_or_else(
+                || {
+                    run.observations
+                        .last()
+                        .map_or(0, |(c, _)| c.saturating_add(1))
+                },
+                |(c, _)| *c,
+            );
             return fail(
                 cursor,
                 WITNESS_MATCHES,

@@ -7,9 +7,10 @@
 //! network.
 //!
 //! The join is System State's own: its Secrets stage's vault item over the unattended port
-//! ([`crate::init::run_initial_secrets_with`]), at the ALab vault's address, with no password and
-//! replacing only the "no vault" the read saw, then a wait of [`JOIN_WAIT`] for the vault to let
-//! this Mac in. An open vault does. A vault that asks a join password or an admin's approval
+//! ([`crate::init::run_initial_secrets_with`]'s, as `crate::init::run_converge_join` runs it),
+//! at the ALab vault's address, with no password and replacing only the "no vault" the read saw,
+//! then a wait of [`JOIN_WAIT`] for the vault to let this Mac in. The subscriber it puts in place
+//! is a repair, never a person's On, so a turn-off recorded since the read stays. An open vault does. A vault that asks a join password or an admin's approval
 //! keeps the request and this Mac waits: no pass joins it again (it reads deferred), and the
 //! subscriber the join installed finishes it once a person gives the rest, as after System
 //! State's own join. Nothing asks macOS's Local Network question: the look runs only once macOS
@@ -53,12 +54,15 @@ pub enum Heard {
 }
 
 /// What stands before a join besides the vault: a person's choice that keeps it out (System
-/// State's plan leaving the Secrets vault out, or a system System State does not run on), and
-/// Local Network as last heard.
+/// State's plan leaving the Secrets vault out, or a system System State does not run on), a run
+/// of System State's that still owes its Secrets stage, and Local Network as last heard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Gate {
     /// Why no vault is joined here, where a choice says so.
     pub off: Option<String>,
+    /// A run System State admitted still owes its Secrets stage, which joins the vault itself
+    /// (`aterm_cli::macos_doctor::initial_setup_owes_secrets_stage`).
+    pub owed: bool,
     /// Local Network as last heard.
     pub lan: Lan,
 }
@@ -72,17 +76,22 @@ pub const LAN_REFUSED: &str = "macOS does not let aterm use the local network (D
 pub const LAN_UNTOLD: &str = "macOS has not asked aterm about the local network yet: System \
      State's Local Network row asks, and no pass raises the question";
 
+/// What it says while a run of System State's still owes its Secrets stage.
+pub const STAGE_OWED: &str = "System State's run has its Secrets stage still to do, and that \
+     stage joins the vault: no pass joins beside it";
+
 /// What it says to a pass that does not look: only the window's does.
 pub const NOT_LOOKED: &str = "no vault is configured: the aterm window's pass looks for the \
      ALab vault and joins it, where Local Network is aterm.app's";
 
 /// `sync.peers`' read over `ops`, the vault as System State's Secrets stage reads it. A vault
-/// configured here reads joined once it let this Mac in, and deferred while it has not (it asks
-/// a join password or an admin's approval, which a pass never gives) or once an admin removed
-/// this Mac from it: a pass never joins it again.
-/// With none, the person's turn-off or `gate`'s choice reads off, and Local Network refused or
-/// untold reads deferred without a look; only then is `look` asked (`None`: this pass does not
-/// look), and the ALab vault answering reads joinable.
+/// configured here reads joined once it let this Mac in, and deferred while it has not (it waits
+/// for a member's Allow, a join password or an admin's approval, which a pass never gives;
+/// [`not_let_in`]) or once this Mac was removed from it: a pass never joins it again.
+/// With none, the person's turn-off or `gate`'s choice reads off, and a run of System State's
+/// that owes its Secrets stage, or Local Network refused or untold, reads deferred without a
+/// look; only then is `look` asked (`None`: this pass does not look), and the ALab vault
+/// answering reads joinable.
 ///
 /// # Errors
 /// The vault's local state cannot be read.
@@ -101,14 +110,14 @@ pub fn read(
             Membership::In { .. } | Membership::Plain => {
                 PeersRead::Joined(format!("in vault {name}"))
             }
-            Membership::Pending => PeersRead::Deferred(format!(
-                "vault {name} has not let this Mac in: it asks a join password or an admin's \
-                 approval, which System State's Secrets row or `aterm init` gives; no pass \
-                 joins it again"
+            Membership::Pending => PeersRead::Deferred(not_let_in(
+                &format!("vault {name}"),
+                waits_for(&status),
+                "no pass joins it again",
             )),
             Membership::Revoked { seq } => PeersRead::Deferred(format!(
-                "an admin removed this Mac from vault {name} at seq {seq}: to rejoin, run aterm \
-                 secrets join and have an admin approve it; no pass joins it again"
+                "this Mac was removed from vault {name} at seq {seq}: to rejoin, run aterm \
+                 members join and press Allow on any Mac in ALab; no pass joins it again"
             )),
             // The configuration went between the two reads: the next pass reads it again.
             Membership::Unconfigured => PeersRead::Deferred(format!(
@@ -125,6 +134,9 @@ pub fn read(
     }
     if let Some(why) = &gate.off {
         return Ok(PeersRead::Off(why.clone()));
+    }
+    if gate.owed {
+        return Ok(PeersRead::Deferred(STAGE_OWED.to_owned()));
     }
     match gate.lan {
         Lan::Refused => return Ok(PeersRead::Deferred(LAN_REFUSED.to_owned())),
@@ -146,8 +158,9 @@ pub fn read(
 
 /// `sync.peers`' apply: System State's join of the ALab vault over `ops`, with no password,
 /// replacing only the "no vault" the read saw, journaled in `journal`, then a wait of
-/// [`JOIN_WAIT`] for the vault to let this Mac in. In: joined. A vault that asks a join password
-/// or an admin's approval leaves this Mac waiting: its request stands, and no pass sends another.
+/// [`JOIN_WAIT`] for the vault to let this Mac in. In: joined. A vault no member's Allow, join
+/// password or admin's approval let this Mac into within the wait leaves it waiting
+/// ([`not_let_in`] says for what): its request stands, and no pass sends another.
 ///
 /// # Errors
 /// The join failed (the vault did not answer it, its subscriber did not start, say).
@@ -157,13 +170,12 @@ pub fn join(
     ops: Arc<dyn SecretsOps>,
     journal: &mut dyn Journal,
 ) -> Result<PeersDone, String> {
-    let rows = crate::init::run_initial_secrets_with(
+    let rows = crate::init::run_converge_join(
         sys,
         ctx,
         Arc::clone(&ops),
         aterm_types::macos_setup::DEFAULT_VAULT_URL,
         Replaces::Read(None),
-        &mut None,
         JOIN_WAIT,
         journal,
     )?;
@@ -174,8 +186,9 @@ pub fn join(
     );
     let inside = match status.membership {
         Membership::In { .. } | Membership::Plain => true,
-        // A join sent with no password waits for nobody: the open vault lets this Mac in
-        // within the wait, and one that asks more never does.
+        // A join sent with no password waits for a person: an open vault lets in no Mac that
+        // only asks (docs/DESIGN-fluid-swarm-2026-10-28.md F10), so the wait sees an Allow or
+        // an approval that lands within it, and otherwise the request stands.
         Membership::Pending => ops.await_approval(JOIN_WAIT, &|| false),
         Membership::Unconfigured | Membership::Revoked { .. } => {
             return Err(rows
@@ -187,12 +200,54 @@ pub fn join(
     Ok(if inside {
         PeersDone::Joined(format!("joined {name}, nothing typed"))
     } else {
-        PeersDone::Waiting(format!(
-            "{name} has not let this Mac in: it asks a join password or an admin's approval, \
-             which System State's Secrets row or `aterm init` gives; its request stands, and no \
-             pass sends another"
+        PeersDone::Waiting(not_let_in(
+            &name,
+            waits_for(&status),
+            "its request stands, and no pass sends another",
         ))
     })
+}
+
+/// What a Mac a vault has not let in waits for ([`waits_for`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Waits {
+    /// The ALab vault: a member's Allow, with the phrase that member shows typed here
+    /// (docs/DESIGN-fluid-swarm-2026-10-28.md §3.3.1), which its approver records once it runs
+    /// on the vault's admin Mac; or the join password or an admin's approval by code, which a
+    /// Mac cannot tell apart from waiting.
+    Approver,
+    /// Any other vault: the join password or an admin's approval.
+    PasswordOrApproval,
+}
+
+/// What the vault `status` names waits for before it lets this Mac in: the ALab vault's Allow
+/// first, any other vault's password or approval.
+fn waits_for(status: &aterm_secrets::client::Status) -> Waits {
+    if status
+        .config
+        .as_ref()
+        .is_some_and(aterm_secrets::client::alab_vault)
+    {
+        Waits::Approver
+    } else {
+        Waits::PasswordOrApproval
+    }
+}
+
+/// What `sync.peers` says of `vault` (`vault alab`) while it has not let this Mac in, waiting
+/// for `waits`, then `then`.
+fn not_let_in(vault: &str, waits: Waits, then: &str) -> String {
+    match waits {
+        Waits::Approver => format!(
+            "{vault} has not let this Mac in yet: {}, or give the join password, which System \
+             State's Secrets row or `aterm init` takes; {then}",
+            crate::init_secrets::LET_IN
+        ),
+        Waits::PasswordOrApproval => format!(
+            "{vault} has not let this Mac in: it asks a join password or an admin's approval, \
+             which System State's Secrets row or `aterm init` gives; {then}"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +260,7 @@ mod tests {
 
     const ALLOWED: Gate = Gate {
         off: None,
+        owed: false,
         lan: Lan::Allowed,
     };
 
@@ -291,7 +347,43 @@ mod tests {
         assert_eq!(ops.joins().len(), 1, "never joined again");
     }
 
-    /// A Mac an admin removed from its vault reads deferred, naming the removal, not joined: no
+    /// A Mac the ALab vault has not let in yet is told to press Allow on any Mac in ALab (or give
+    /// a password or a code), in the join's answer and in every later read; another vault's Mac
+    /// is told its vault asks a password or an approval. No pass joins either again.
+    /// NEGATIVE CONTROL: a [`waits_for`] that ignores the vault tells the ALab Mac its vault asks
+    /// a password or an approval.
+    #[test]
+    fn a_pending_alab_join_waits_for_the_vaults_approver() {
+        let mut alab = configured(Membership::Pending);
+        let signer: [u8; 32] = aterm_secrets::b64::decode_padded(aterm_secrets::ALAB_SIGNER)
+            .and_then(|key| key.try_into().ok())
+            .expect("the ALab signer");
+        alab.config.as_mut().expect("a config").signer = Some(signer);
+        let other = configured(Membership::Pending);
+        for (status, waits) in [(alab, Waits::Approver), (other, Waits::PasswordOrApproval)] {
+            let ops = Scripted::new(vec![Ok(unconfigured())]);
+            ops.joins_as(Some(status.clone()), Ok(pending()));
+            assert_eq!(
+                joined(&ops),
+                Ok(PeersDone::Waiting(not_let_in(
+                    "vault alab",
+                    waits,
+                    "its request stands, and no pass sends another"
+                ))),
+                "{waits:?}"
+            );
+            let ops = Scripted::new(vec![Ok(status)]);
+            let looks = Cell::new(0);
+            assert_eq!(
+                looked(&ops, &ALLOWED, &Heard::Found, &looks),
+                PeersRead::Deferred(not_let_in("vault alab", waits, "no pass joins it again")),
+                "{waits:?}"
+            );
+            assert!(ops.joins().is_empty(), "no pass joins it again");
+        }
+    }
+
+    /// A Mac removed from its vault reads deferred, naming the removal, not joined: no
     /// pass joins it again, and none reports it in.
     /// NEGATIVE CONTROL: a read that takes every membership but a pending one for joined reads
     /// the removed Mac as in its vault.
@@ -304,7 +396,7 @@ mod tests {
             panic!("{read:?}");
         };
         assert!(
-            why.contains("removed this Mac from vault alab at seq 9"),
+            why.contains("this Mac was removed from vault alab at seq 9"),
             "{why}"
         );
         assert_eq!(looks.get(), 0, "a vault configured here is not looked for");
@@ -325,8 +417,8 @@ mod tests {
         let ops = Scripted::new(vec![Ok(unconfigured())]);
         let looks = Cell::new(0);
         let refused = Gate {
-            off: None,
             lan: Lan::Refused,
+            ..ALLOWED
         };
         for _ in 0..2 {
             assert_eq!(
@@ -335,8 +427,8 @@ mod tests {
             );
         }
         let untold = Gate {
-            off: None,
             lan: Lan::Untold,
+            ..ALLOWED
         };
         assert_eq!(
             looked(&ops, &untold, &Heard::Found, &looks),
@@ -364,7 +456,7 @@ mod tests {
         let looks = Cell::new(0);
         let chosen = Gate {
             off: Some("System State's plan leaves the Secrets vault out".to_owned()),
-            lan: Lan::Allowed,
+            ..ALLOWED
         };
         assert!(matches!(
             looked(&ops, &chosen, &Heard::Found, &looks),
@@ -381,5 +473,28 @@ mod tests {
             PeersRead::Off(_)
         ));
         assert_eq!(looks.get(), 2);
+    }
+
+    /// While a run of System State's owes its Secrets stage, the window's pass leaves the join
+    /// to that stage: deferred, with no look; once the stage is done it looks and joins.
+    /// NEGATIVE CONTROL: a read that ignores `owed` looks and reads the vault joinable beside
+    /// the stage.
+    #[test]
+    fn a_run_that_owes_its_secrets_stage_keeps_the_join() {
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        let looks = Cell::new(0);
+        let owed = Gate {
+            owed: true,
+            ..ALLOWED
+        };
+        assert_eq!(
+            looked(&ops, &owed, &Heard::Found, &looks),
+            PeersRead::Deferred(STAGE_OWED.to_owned())
+        );
+        assert_eq!(looks.get(), 0, "no look");
+        assert!(matches!(
+            looked(&ops, &ALLOWED, &Heard::Found, &looks),
+            PeersRead::Joinable(_)
+        ));
     }
 }

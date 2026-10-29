@@ -39,8 +39,9 @@ pub(crate) struct TapRun {
 }
 
 impl TapRun {
-    /// A proven claimant leads the foreground run it reads.
-    pub(crate) fn claimed_by(self, pid: u32) -> bool {
+    /// The rollout's process (a proven claimant, or a released one read only) leads the
+    /// foreground run it reads.
+    pub(crate) fn led_by(self, pid: u32) -> bool {
         i64::from(self.pgid) == i64::from(pid)
     }
 }
@@ -93,11 +94,16 @@ macro_rules! rollout_words {
 }
 
 rollout_words! {
-    /// The tap is bound: the rollout's rows reach the log.
+    /// The tap is bound: the rollout's rows reach the log, read `state=on` (its build and its
+    /// writer's both measured).
     Bound => "bound",
+    /// The tap is bound to a rollout a build nobody measured writes: its rows reach the log read
+    /// `state=partial` (strong: they add, open a turn none runs and end only their own, fix E1),
+    /// as an unmeasured Claude Code's transcript does.
+    Partial => "partial",
     /// Nothing bound yet, and no refusal stands.
     Unbound => "unbound",
-    /// The tap cannot be made for the target's thread.
+    /// The tap cannot be made for the target's thread, or a read-only target's record names none.
     NoThread => "no-thread",
     /// The queued claim, target, run or sampled process image no longer matches.
     Stale => "stale",
@@ -108,7 +114,7 @@ rollout_words! {
 /// `status rollout=` while the tap was never asked for the session ([`SessionLog::rollout_fields`]).
 pub(crate) const ROLLOUT_NEVER_ASKED: &str = "-";
 
-/// WHAT THE ROLLOUT TAP ANSWERED (`status rollout= rollout_asks=`; session log 6D-3b's tap, its fence B5c): how many asks the session's rollout tap answered, each counted in a hold taken AFTER that ask's batch was applied (`crate::codex_rollout_tap`), and the last answer's word: `bound`, or why it bound nothing (a `codex_tap::Refusal`'s word, `unmeasured` among them; `stale` when the captured claim, record, run or sampled process image moved; `no-thread` if the tap cannot be made), or `stopped` once the sweep dropped the tap (the claimant gone from the front, the sweep off) until it asks again.
+/// WHAT THE ROLLOUT TAP ANSWERED (`status rollout= rollout_asks=`; session log 6D-3b's tap, its fence B5c): how many asks the session's rollout tap answered, each counted in a hold taken AFTER that ask's batch was applied (`crate::codex_rollout_tap`), and the last answer's word: `bound` (read `state=on`) or `partial` (a build nobody measured, read `state=partial`), or why it bound nothing (a `codex_tap::Refusal`'s word, `unknown-meta` among them; `stale` when the captured claim or read-only copy, record, run or sampled process image moved; `no-thread` if the tap cannot be made or a read-only copy's record names no thread), or `stopped` once the sweep dropped the tap (the claimant, or a released claim's process read only, gone from the front, the sweep off) until it asks again.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TapAnswers {
     asks: u64,
@@ -121,20 +127,43 @@ pub(crate) struct TapAnswers {
 }
 
 impl SessionLog {
-    /// One ask the rollout tap answered, with its word ([`TapAnswers`]).
-    pub(crate) const fn rollout_answered(&mut self, word: RolloutWord) {
+    /// One ask the rollout tap answered, with its word ([`TapAnswers`]); one that reads no
+    /// rollout now hands the run's turns back to its claims ([`Self::rollout_unread`]).
+    pub(crate) fn rollout_answered(&mut self, word: RolloutWord) {
         self.rollout.asks = self.rollout.asks.saturating_add(1);
         self.rollout.word = Some(word);
+        match word {
+            RolloutWord::Bound | RolloutWord::Partial => {}
+            RolloutWord::Unbound
+            | RolloutWord::NoThread
+            | RolloutWord::Stale
+            | RolloutWord::Stopped
+            | RolloutWord::Refused(_) => self.rollout_unread(),
+        }
         #[cfg(test)]
         {
             self.rollout.counted_at = self.log.last_seq();
         }
     }
 
-    /// The sweep dropped the session's tap ([`TapAnswers`]): a session the tap answered says `stopped`, its count kept; one never asked stays `-`.
-    pub(crate) const fn rollout_stopped(&mut self) {
+    /// The sweep dropped the session's tap ([`TapAnswers`]): a session the tap answered says `stopped`, its count kept; one never asked stays `-`. Its run's turns go back to its claims ([`Self::rollout_unread`]).
+    pub(crate) fn rollout_stopped(&mut self) {
         if self.rollout.word.is_some() {
             self.rollout.word = Some(RolloutWord::Stopped);
+        }
+        self.rollout_unread();
+    }
+
+    /// THE ROLLOUT READS NOTHING NOW (the tap dropped, refused, stale or not bound): the run it
+    /// reads takes its turns from its claims again (`aterm_slog::TurnTracker::tx_stopped`), as
+    /// where no rollout ever bound, until the tap's next fact says it reads again.
+    fn rollout_unread(&mut self) {
+        if let Some(a) = self
+            .agent
+            .as_mut()
+            .filter(|a| reads(a.who, Source::Rollout))
+        {
+            a.tracker.tx_stopped();
         }
     }
 
@@ -166,8 +195,8 @@ pub(crate) enum Source {
 }
 
 /// The tap that reads `who`'s run, if any: Claude Code's transcript and
-/// Codex's rollout (only a codex-alab's is ever bound: the rollout tap's
-/// gate); no other agent's.
+/// Codex's rollout (only a codex-alab's is ever bound: the tap follows a
+/// proven self-claim); no other agent's.
 const fn reader_of(who: aterm_phase::Program) -> Option<Source> {
     match who {
         aterm_phase::Program::Claude => Some(Source::Transcript),
@@ -522,10 +551,10 @@ pub(crate) fn apply_batch_timed(
     apply_batch_guarded(timeline, source, batch, bound, None, now_ns, book)
 }
 
-/// A rollout batch remains owned by the queued claim, record and run at EVERY chunk, including the first hold after its off-lock file read.
+/// A rollout batch remains owned by the queued claim or read-only copy, the thread it names, and the run at EVERY chunk, including the first hold after its off-lock file read.
 pub(crate) fn apply_rollout_batch(
     ctx: &crate::SessionCtx,
-    target: &crate::self_claim::RolloutTarget,
+    target: &crate::self_claim::Tapped,
     run: TapRun,
     batch: &StepBatch,
     bound: bool,
@@ -546,11 +575,7 @@ fn apply_batch_guarded(
     source: Source,
     batch: &StepBatch,
     bound: bool,
-    gate: Option<(
-        &crate::SessionCtx,
-        &crate::self_claim::RolloutTarget,
-        TapRun,
-    )>,
+    gate: Option<(&crate::SessionCtx, &crate::self_claim::Tapped, TapRun)>,
     now_ns: &mut dyn FnMut() -> u64,
     book: &mut dyn FnMut(Hold, u64),
 ) -> Applied {

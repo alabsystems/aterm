@@ -1454,14 +1454,19 @@ pub(crate) fn write_snapshot_artifacts(
     text: &str,
     transaction: &SnapshotTransaction,
 ) -> Result<(), String> {
-    write_snapshot_artifacts_with_hook(encoded, text, transaction, || {})
+    write_snapshot_artifacts_with_hooks(encoded, text, transaction, || {}, || {})
 }
 
-fn write_snapshot_artifacts_with_hook(
+/// [`write_snapshot_artifacts`], with `before_done` run once the payload is
+/// written and `on_done` the moment the `.done` marker is visible: its
+/// appearance is the writer's last call on the directory, so a consumer may
+/// read the payload or remove the directory as soon as it sees the marker.
+fn write_snapshot_artifacts_with_hooks(
     encoded: &CapturePng,
     text: &str,
     transaction: &SnapshotTransaction,
     before_done: impl FnOnce(),
+    on_done: impl FnOnce(),
 ) -> Result<(), String> {
     let generation = transaction.generation;
     let target = &transaction.target;
@@ -1518,16 +1523,20 @@ fn write_snapshot_artifacts_with_hook(
         sha256_hex(png),
         sha256_hex(text.as_bytes())
     );
-    let done_file = match target.dir.write_new_private(&target.done, done.as_bytes()) {
-        Ok(file) => file,
-        Err(error) => {
-            let _ = png_file.remove_exact();
-            let _ = text_file.remove_exact();
-            let _ = target.dir.remove_file_if_exists(&target.done);
-            let _ = target.dir.sync();
-            return Err(format!("completion marker write failed: {error}"));
-        }
-    };
+    let done_file =
+        match target
+            .dir
+            .write_new_private_marker(&target.done, done.as_bytes(), on_done)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = png_file.remove_exact();
+                let _ = text_file.remove_exact();
+                let _ = target.dir.remove_file_if_exists(&target.done);
+                let _ = target.dir.sync();
+                return Err(format!("completion marker write failed: {error}"));
+            }
+        };
     let _commit_guards = (png_file, text_file, done_file);
     Ok(())
 }
@@ -2759,23 +2768,40 @@ impl App {
         Ok(lines)
     }
 
-    /// Sample the selected terminal grid and all main-thread-owned presentation geometry as one event-turn record.
+    /// Sample the selected terminal grid and all main-thread-owned presentation geometry as one
+    /// event-turn record, with the grid's content clock in the frame the selected window's last own
+    /// present drew (`presented_seq`) while that grid ([`crate::app_render::GridKey`]: its terminal,
+    /// screen and grid instance) is still the live one.
     pub(crate) fn try_dims_snapshot(
         &self,
         session: u64,
         term: &Arc<Mutex<Terminal>>,
     ) -> Result<DimsSnapshot, &'static str> {
-        let (rows, cols) = match term.try_lock() {
-            Ok(terminal) => (u32::from(terminal.rows()), u32::from(terminal.cols())),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                let terminal = poisoned.into_inner();
-                (u32::from(terminal.rows()), u32::from(terminal.cols()))
-            }
+        let read = |terminal: &Terminal| {
+            (
+                u32::from(terminal.rows()),
+                u32::from(terminal.cols()),
+                crate::app_render::GridKey::live(terminal),
+            )
+        };
+        let (rows, cols, grid) = match term.try_lock() {
+            Ok(terminal) => read(&terminal),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => read(&poisoned.into_inner()),
             Err(std::sync::TryLockError::WouldBlock) => {
                 return Err("terminal busy; retry dims");
             }
         };
-        Ok(self.dims_snapshot(session, rows, cols))
+        let mut snapshot = self.dims_snapshot(session, rows, cols);
+        snapshot.presented_seq = snapshot
+            .window
+            .and_then(|wid| self.windows.get(&crate::WindowId(wid)))
+            .and_then(|ws| {
+                ws.presented_grids
+                    .iter()
+                    .find(|g| g.session == session && g.grid == grid)
+                    .map(|g| g.content_seq)
+            });
+        Ok(snapshot)
     }
 
     fn detached_scale(&self) -> f64 {
@@ -3019,6 +3045,7 @@ impl App {
             layer_presentation: selected
                 .and_then(|wid| self.windows[&wid].os_window.as_ref())
                 .and_then(|w| self.apprt.window_surface_presentation(w)),
+            presented_seq: None,
         }
     }
 
@@ -3213,40 +3240,40 @@ impl App {
                         rows: r.rows,
                     }),
             );
-        let pet_tick = ws.fx.pet_prepare(aterm_effects::companion::PetFacts {
-            facts: &capture_pet_facts(&exact_focus),
-            host: &aterm_effects::host::HostFrameInput {
-                now,
-                visibility: crate::app_render::pet_visibility(capture_focused),
-                reduced_motion: !pet_motion.animate(crate::motion::MotionEffect::CursorGlow),
-                serious: !cursor_companions_allowed,
-                shed_envelope,
-                shed_active: load_shed,
-                pointer_px: None,
-                capture: capture_mode(windowless),
-                geometry: crate::app_render::pet_frame_geom(
-                    (cell_w, cell_h),
-                    (usize::from(pane_rows), usize::from(pane_cols)),
-                    (
-                        i32::from(origin_x) + pane_origin.0,
-                        i32::from(origin_y) + pane_origin.1,
+        let pet_tick = ws.fx.pet_prepare(
+            aterm_effects::companion::PetFacts::new(
+                &capture_pet_facts(&exact_focus),
+                &aterm_effects::host::HostFrameInput::new(
+                    now,
+                    crate::app_render::pet_frame_geom(
+                        (cell_w, cell_h),
+                        (usize::from(pane_rows), usize::from(pane_cols)),
+                        (
+                            i32::from(origin_x) + pane_origin.0,
+                            i32::from(origin_y) + pane_origin.1,
+                        ),
                     ),
-                ),
-            },
-            glow: aterm_effects::companion::GlowOwnership {
-                enabled: glow_cfg.enabled,
-                style: glow_cfg.style,
-                style_raw_names_pet: pet_mode,
-            },
-            sing: aterm_effects::host::SingFacts {
+                )
+                .with_visibility(crate::app_render::pet_visibility(capture_focused))
+                .with_reduced_motion(!pet_motion.animate(crate::motion::MotionEffect::CursorGlow))
+                .with_serious(!cursor_companions_allowed)
+                .with_shed_envelope(shed_envelope)
+                .with_shed_active(load_shed)
+                .with_capture(capture_mode(windowless)),
+                aterm_effects::companion::GlowOwnership {
+                    enabled: glow_cfg.enabled,
+                    style: glow_cfg.style,
+                    style_raw_names_pet: pet_mode,
+                },
+            )
+            .with_sing(aterm_effects::host::SingFacts {
                 drive: sing_drive,
                 flying_alpha: if kitty_enabled { cat_frame.alpha } else { 0 },
-            },
-            focused: capture_focused,
-            obscured: ws.overlay_open() || ws.tab_menu.is_some() || focus_rewound,
-            pane: Some((focus, pane_origin)),
-            room: None,
-        });
+            })
+            .with_focused(capture_focused)
+            .with_obscured(ws.overlay_open() || ws.tab_menu.is_some() || focus_rewound)
+            .with_pane(Some((focus, pane_origin))),
+        );
         let escort_caret = pet_tick.escort_caret();
         let pet = ws.fx.companion_mut().tick(pet_tick);
         // The split present's offer (`redraw_compose_after_focused_extract`):
@@ -3476,37 +3503,36 @@ impl App {
             cols: cols as u16,
         };
         ws.fx.companion_mut().set_species(pet_species);
-        let pet_tick = ws.fx.pet_prepare(aterm_effects::companion::PetFacts {
-            facts: &capture_pet_facts(&exact_focus),
-            host: &aterm_effects::host::HostFrameInput {
-                now,
-                visibility: crate::app_render::pet_visibility(capture_focused),
-                reduced_motion: !pet_motion.animate(crate::motion::MotionEffect::CursorGlow),
-                serious: !cursor_companions_allowed,
-                shed_envelope,
-                shed_active: load_shed,
-                pointer_px: None,
-                capture: capture_mode(windowless),
-                geometry: crate::app_render::pet_frame_geom(
-                    (cell_w, cell_h),
-                    (rows, cols),
-                    (i32::from(origin_x), i32::from(origin_y)),
-                ),
-            },
-            glow: aterm_effects::companion::GlowOwnership {
-                enabled: glow_cfg.enabled,
-                style: glow_cfg.style,
-                style_raw_names_pet: pet_mode,
-            },
-            sing: aterm_effects::host::SingFacts {
+        let pet_tick = ws.fx.pet_prepare(
+            aterm_effects::companion::PetFacts::new(
+                &capture_pet_facts(&exact_focus),
+                &aterm_effects::host::HostFrameInput::new(
+                    now,
+                    crate::app_render::pet_frame_geom(
+                        (cell_w, cell_h),
+                        (rows, cols),
+                        (i32::from(origin_x), i32::from(origin_y)),
+                    ),
+                )
+                .with_visibility(crate::app_render::pet_visibility(capture_focused))
+                .with_reduced_motion(!pet_motion.animate(crate::motion::MotionEffect::CursorGlow))
+                .with_serious(!cursor_companions_allowed)
+                .with_shed_envelope(shed_envelope)
+                .with_shed_active(load_shed)
+                .with_capture(capture_mode(windowless)),
+                aterm_effects::companion::GlowOwnership {
+                    enabled: glow_cfg.enabled,
+                    style: glow_cfg.style,
+                    style_raw_names_pet: pet_mode,
+                },
+            )
+            .with_sing(aterm_effects::host::SingFacts {
                 drive: sing_drive,
                 flying_alpha: if kitty_enabled { cat_frame.alpha } else { 0 },
-            },
-            focused: capture_focused,
-            obscured: ws.overlay_open() || ws.tab_menu.is_some() || rewound,
-            pane: None,
-            room: None,
-        });
+            })
+            .with_focused(capture_focused)
+            .with_obscured(ws.overlay_open() || ws.tab_menu.is_some() || rewound),
+        );
         let cur = pet_tick.escort_caret();
         let pet = ws.fx.companion_mut().tick(pet_tick);
         // The present's offer (`redraw_window_with_layout`): without it a
@@ -3567,24 +3593,26 @@ impl App {
             now,
         );
         let companion_at = routed.on_glass(cur, pet.body_px);
-        let words = ws.fx.word_grid(&aterm_effects::pipeline::WordGrid {
-            now,
-            lexicon,
-            cfg,
-            geom: effect_geom,
-            cells: &ws.input_scratch.cells,
-            line_sizes: &ws.input_scratch.line_sizes,
-            base_y: ws.input_scratch.base_y,
-            default_bg: ws.input_scratch.default_bg,
-            epoch,
-            rescan,
-            companion_at,
-            sel: crate::word_decorations::SelView {
-                sel: &ws.input_scratch.selection,
-                display_offset: ws.input_scratch.display_offset,
-            },
-            focused: ws.focused,
-        });
+        let words = ws.fx.word_grid(
+            &aterm_effects::pipeline::WordGrid::new(
+                now,
+                lexicon,
+                cfg,
+                effect_geom,
+                &ws.input_scratch.cells,
+                &ws.input_scratch.line_sizes,
+                crate::word_decorations::SelView {
+                    sel: &ws.input_scratch.selection,
+                    display_offset: ws.input_scratch.display_offset,
+                },
+            )
+            .with_base_y(ws.input_scratch.base_y)
+            .with_default_bg(ws.input_scratch.default_bg)
+            .with_epoch(epoch)
+            .with_rescan(rescan)
+            .with_companion_at(companion_at)
+            .with_focused(ws.focused),
+        );
         let suppressed = ws.input_scratch.engine_alt || ws.input_scratch.display_offset != 0;
         let streak_inert = crate::app_render::output_streak_inert(
             streak_enabled,
@@ -3614,6 +3642,7 @@ impl App {
                     cursor: (ws.input_scratch.cursor_row, ws.input_scratch.cursor_col),
                     viewport: (rows, cols),
                     content_seq: exact_focus.content_seq,
+                    drawn_at: ws.input_scratch.drawn_at,
                     geom: crate::cursor_glow::Geom {
                         cw: cell_w,
                         ch: cell_h,
@@ -4586,6 +4615,47 @@ impl App {
             return Err(CaptureDeferral::Nothing);
         }
         Ok((plan, terminal_grid))
+    }
+
+    /// Lay a windowless window's terminal front as its next capture would ([`Self::stage_headless_capture`]),
+    /// presenting nothing and ticking no cursor effect: a windowless instance composes a frame only
+    /// when a capture asks, so a `pointer` that hit-tests the glass (the composer rules' hit lists
+    /// and the grid they were laid on) first lays what that capture shows. A native front is
+    /// [`Self::commit_glassless_native_frame`]'s. Whether a frame's chrome was laid.
+    pub(crate) fn lay_glassless_terminal_chrome(&mut self, wid: WindowId) -> bool {
+        use crate::app_render::{CapturePreparation, ComposedCursorFxClock};
+        if !self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.os_window.is_none() && ws.present.is_none())
+        {
+            return false;
+        }
+        let Some((plan, route)) = self.active_visible_frame_layout(wid) else {
+            return false;
+        };
+        if !matches!(route, crate::VisibleContentRoute::Terminal { .. }) {
+            return false;
+        }
+        let now = Instant::now();
+        self.prepare_band_motion(wid, now);
+        let CapturePreparation::Ready((grid, plan)) = self
+            .prepare_terminal_capture_grid_with_cursor_fx_for_plan_outcome(
+                wid,
+                plan,
+                ComposedCursorFxClock::Retain { observed_at: now },
+            )
+        else {
+            return false;
+        };
+        if grid.focus.is_none() {
+            return false;
+        }
+        self.refresh_pane_headers(wid, &plan);
+        self.paint_pane_headers(wid);
+        self.splice_tab_strip(wid);
+        self.refresh_pane_overlay_for_capture(wid, &plan, now);
+        self.compose_route_chrome(wid, route, &plan).is_some()
     }
 
     fn rerender_capture(
@@ -5651,6 +5721,34 @@ impl App {
                 }
             }
         };
+        // The cursor scene card this frame painted, for `settings card`: at its native page's
+        // place in the window, as the frame composites it (the page's raster at its leaf's
+        // cells inside the window's settings card, as
+        // `App::retained_native_leaf_artifact_from_plan` places it).
+        let (cw, ch) = self.win_cell_size(front);
+        let card_at = self
+            .windows
+            .get(&front)
+            .and_then(|window| window.settings_card.as_ref())
+            .map_or((0, 0), |card| {
+                (
+                    i32::try_from(card.dx).unwrap_or(0),
+                    i32::try_from(card.dy).unwrap_or(0),
+                )
+            });
+        let native_origin = context.plan.leaves.iter().find_map(|leaf| {
+            matches!(
+                self.view_store.get(leaf.view).copied(),
+                Some(crate::tab_model::View::Native(_))
+            )
+            .then(|| {
+                (
+                    card_at.0 + (leaf.rect.origin.x * cw as f32).round().max(0.0) as i32,
+                    card_at.1 + (leaf.rect.origin.y * ch as f32).round().max(0.0) as i32,
+                )
+            })
+        });
+        crate::settings_preview::stash_captured_scene_card(native_origin);
         let metadata = if want_metadata {
             let (width, height) = pixels.dims();
             let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
@@ -8142,6 +8240,107 @@ mod dims_snapshot_tests {
             zoomed.frame_h.saturating_sub(zoomed.surface_h)
         );
     }
+
+    /// `presented_seq=` is the grid's content clock in the frame the window's last own present
+    /// drew: a dropped present leaves it behind the grid, the retry that reaches glass brings it to
+    /// the grid's, a present a capture forces does not move it, another grid (the alternate
+    /// screen, and each new one a `?1049h` builds) reads `none` until a present draws it, and a
+    /// grid `?47` parks and puts back is still the one the frame drew.
+    #[test]
+    fn presented_seq_moves_only_with_the_windows_own_present_that_reached_glass() {
+        use crate::present::scripted::ScriptedOutcome;
+        use crate::scripted_redraw_fixture::{feed, scripted_app, surface};
+
+        let wid = WindowId(0);
+        let mut app = scripted_app();
+        let term = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        let grid = || crate::term_lock(&term).content_seq();
+        let presented = |app: &App| app.try_dims_snapshot(0, &term).expect("dims").presented_seq;
+        assert_eq!(presented(&app), None, "nothing presented yet");
+        app.redraw_window(wid);
+        assert_eq!(
+            presented(&app),
+            Some(grid()),
+            "the first present drew the grid"
+        );
+
+        feed(&app, b"echo");
+        let echoed = grid();
+        surface(&mut app).fail_next(ScriptedOutcome::FailCommit);
+        app.redraw_window(wid);
+        let dropped = presented(&app);
+        assert!(
+            dropped.is_some_and(|seq| seq < echoed),
+            "a dropped present drew nothing: {dropped:?} against the grid's {echoed}"
+        );
+
+        let ws = app.windows.get_mut(&wid).expect("window");
+        let fired = match ws.present_retry.deadline {
+            Some(deadline) => crate::service_due_presentation_clocks(
+                false,
+                &mut ws.present_retry,
+                &mut ws.redraw_pending,
+                ws.last_present_at,
+                std::time::Duration::from_millis(8),
+                deadline,
+            ),
+            None => ws.present_retry.on_external_stimulus(),
+        };
+        assert!(fired, "the retry fires");
+        app.redraw_window(wid);
+        assert_eq!(surface(&mut app).commits(), 2, "the retry presented");
+        assert_eq!(presented(&app), Some(echoed), "the retry drew the echo");
+
+        feed(&app, b" more");
+        let later = grid();
+        app.capture_present_budget = super::CapturePresentBudget::default();
+        app.present_before_capture(wid, None, super::PresentTake::Model)
+            .expect("the capture's present");
+        assert_eq!(
+            presented(&app),
+            Some(echoed),
+            "a capture's forced present leaves the window's own record"
+        );
+        feed(&app, b"!");
+        let last = grid();
+        assert!(last > later);
+        app.redraw_window(wid);
+        assert_eq!(
+            presented(&app),
+            Some(last),
+            "the window's own present drew it"
+        );
+
+        feed(&app, b"\x1b[?1049h");
+        assert_eq!(
+            presented(&app),
+            None,
+            "the alternate screen is another grid, with its own clock"
+        );
+        app.redraw_window(wid);
+        assert_eq!(presented(&app), Some(grid()), "its own present drew it");
+
+        feed(&app, b"\x1b[?1049l\x1b[?1049hnew");
+        assert_eq!(
+            presented(&app),
+            None,
+            "a new alternate screen's clock starts over, so the last one's frame is not its"
+        );
+        app.redraw_window(wid);
+        assert_eq!(presented(&app), Some(grid()), "its own present drew it");
+
+        let drawn = presented(&app);
+        feed(&app, b"\x1b[?47l\x1b[?47h");
+        assert_eq!(
+            presented(&app),
+            drawn,
+            "a grid parked and put back is the grid that frame drew, clock and all"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -8454,18 +8653,45 @@ mod chrome_output_tests {
                  attention=false hovered=false action=Version"
             )
         );
-        let short = strip_version_label(VersionRung::Short, false).expect("a dev short rung");
+        if let Some(short) = strip_version_label(VersionRung::Short, false) {
+            assert_eq!(
+                strip_version_chrome_line(
+                    &[chip, slot(VersionRung::Short, 119, 132)],
+                    true,
+                    StripVersionAbsence::StripFull,
+                    false
+                ),
+                format!(
+                    "strip-version shown=yes rung=short cols=119..132 text={short:?} \
+                     attention=false hovered=true action=Version"
+                )
+            );
+        }
+        let dev_facts = crate::menu::VersionFacts {
+            release: false,
+            version: "1.2.0",
+            dev_commits: "7",
+            commit: "abcdef1",
+        };
         assert_eq!(
-            strip_version_chrome_line(
-                &[chip, slot(VersionRung::Short, 119, 132)],
-                true,
-                StripVersionAbsence::StripFull,
-                false
-            ),
-            format!(
-                "strip-version shown=yes rung=short cols=119..132 text={short:?} \
-                 attention=false hovered=true action=Version"
-            )
+            crate::menu::strip_version_text(dev_facts, VersionRung::Full).as_deref(),
+            Some("v1.2.7")
+        );
+        assert_eq!(
+            crate::menu::strip_version_text(dev_facts, VersionRung::Short).as_deref(),
+            Some("v1.2")
+        );
+        let rel_facts = crate::menu::VersionFacts {
+            release: true,
+            ..dev_facts
+        };
+        assert_eq!(
+            crate::menu::strip_version_text(rel_facts, VersionRung::Full).as_deref(),
+            Some("v1.2")
+        );
+        assert_eq!(
+            crate::menu::strip_version_text(rel_facts, VersionRung::Short),
+            None
         );
         for (absent, reason) in [
             (StripVersionAbsence::NoStrip, "no-strip"),
@@ -11951,7 +12177,7 @@ mod encode_worker_tests {
         let outside_for_hook = outside.clone();
         let moved_for_hook = moved.clone();
 
-        let error = write_snapshot_artifacts_with_hook(
+        let error = write_snapshot_artifacts_with_hooks(
             &encode_frame_png(&frame),
             "private text",
             &transaction,
@@ -11959,6 +12185,7 @@ mod encode_worker_tests {
                 std::fs::rename(&snapshots_for_hook, &moved_for_hook).unwrap();
                 symlink(&outside_for_hook, &snapshots_for_hook).unwrap();
             },
+            || panic!("a replaced ancestor shows no completion marker"),
         )
         .expect_err("a replaced ancestor cannot commit a completion marker");
         assert!(error.contains("identity changed"), "precise error: {error}");
@@ -11974,6 +12201,37 @@ mod encode_worker_tests {
         let _ = std::fs::remove_file(&snapshots);
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(outside);
+    }
+
+    /// `.done` is the writer's last call on its directory: a consumer that
+    /// removes the directory the moment the marker appears (as the route-chrome
+    /// tests drop their tempdir) leaves the writer nothing to fail on.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_done_is_the_writers_last_call_on_its_directory() {
+        let dir = unique_dir("snapshot-done-last");
+        ensure_private_dir(&dir).unwrap();
+        let path = dir.join("snapshot.png");
+        let done = snapshot_sidecar_path(&path, ".done");
+        let transaction = begin_snapshot_generation(&path).unwrap();
+        let frame = Frame {
+            width: 1,
+            height: 1,
+            pixels: vec![0x0011_2233],
+        };
+        let consumer_dir = dir.clone();
+        write_snapshot_artifacts_with_hooks(
+            &encode_frame_png(&frame),
+            "visible text",
+            &transaction,
+            || {},
+            move || {
+                assert!(done.is_file(), "the marker is visible");
+                std::fs::remove_dir_all(&consumer_dir).unwrap();
+            },
+        )
+        .expect("a consumer that removes the directory at the marker fails nothing after it");
+        assert!(!dir.exists());
     }
 
     #[test]
@@ -12047,7 +12305,7 @@ mod encode_worker_tests {
 
         let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
-        write_snapshot_artifacts_with_hook(
+        write_snapshot_artifacts_with_hooks(
             &encode_frame_png(&frame_b),
             "B payload",
             &transaction_b,
@@ -12063,6 +12321,7 @@ mod encode_worker_tests {
                 });
                 attempted_rx.recv().unwrap();
             },
+            || {},
         )
         .expect("B transaction commits");
         let stale = result_rx

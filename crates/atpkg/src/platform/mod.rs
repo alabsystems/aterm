@@ -3295,14 +3295,14 @@ mod sh_shim_tests {
         assert_eq!(sh_yolo_prelude("../claude", &ok, &[]), "");
         let block = sh_yolo_prelude("muse", &crate::yolo::policy_of("muse"), &[]);
         let note = block.lines().next().unwrap();
-        assert_eq!(
-            note,
-            "# atpkg: yolo by default — this name runs muse with every approval \
-             and sandbox off ('--disable-approval' '--disable-sandbox' \
-             '--trust-workspace' '--disable-request-user-input'); `--yolo` ahead \
-             of a literal `--` spells the same, a launch that types its own \
-             posture runs as typed, and the command as run is printed on stderr \
-             (aterm help pkg)."
+        assert!(
+            note.starts_with("# ")
+                && note.contains(" muse ")
+                && note.contains(
+                    "('--disable-approval' '--disable-sandbox' '--trust-workspace' \
+                     '--disable-request-user-input')"
+                ),
+            "{note}"
         );
         assert!(block.contains(crate::yolo::ECHO_PREFIX), "{block}");
         assert!(block.contains(crate::yolo::DEFAULT_ECHO_PREFIX), "{block}");

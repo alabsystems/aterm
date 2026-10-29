@@ -122,10 +122,31 @@ fn atpkg_and_the_harness_give_one_answer_on_every_package_shape() {
         std::fs::rename(root.join(linked), &real).expect("move");
         std::os::unix::fs::symlink(&real, root.join(linked)).expect("link");
         let exe = root.join("bin/codex");
+        assert!(!cx::alab_bytes(&exe), "{name}: the harness");
         assert!(!atpkg::alab::exe_is_alab(&exe), "{name}: atpkg's exe form");
         assert!(
             !atpkg::alab::is_alab_package(&root),
             "{name}: atpkg's root form"
+        );
+    }
+    #[cfg(unix)]
+    {
+        let root = dir.join("linked-in-root-entry");
+        lay(
+            &root,
+            r#"{"layoutVersion":1,"version":"0.164.0-dev.12+gabc","entrypoint":"bin/alias"}"#,
+            Marker::File,
+        );
+        std::os::unix::fs::symlink(root.join("bin/codex"), root.join("bin/alias")).expect("alias");
+        let exe = root.join("bin/codex");
+        assert!(!cx::alab_bytes(&exe), "linked-in-root-entry: the harness");
+        assert!(
+            !atpkg::alab::exe_is_alab(&exe),
+            "linked-in-root-entry: atpkg's exe form"
+        );
+        assert!(
+            !atpkg::alab::is_alab_package(&root),
+            "linked-in-root-entry: atpkg's root form"
         );
     }
 }

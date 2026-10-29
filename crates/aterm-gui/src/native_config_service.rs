@@ -208,9 +208,10 @@ impl VersionedConfigService {
         themes: Arc<crate::app_config::ThemeCatalog>,
         path_feeds_pending: bool,
     ) -> Result<Self, String> {
-        let values = parse_values(&text)?;
+        // Said, never logged: launch prints it to stderr (gui.log).
+        let values = parse_values(&text).map_err(ConfigFailure::into_said)?;
         let disk_faults = parse_disk_faults(&text);
-        let config = parse_config(&text)?;
+        let config = parse_config(&text).map_err(ConfigFailure::into_said)?;
         let assets = if path_feeds_pending {
             config.resolve_preliminary_asset_catalog_with_themes(themes)
         } else {
@@ -287,7 +288,7 @@ impl VersionedConfigService {
     pub(crate) fn prepare_observation(
         observation: ConfigDiskObservation,
         themes: Arc<crate::app_config::ThemeCatalog>,
-    ) -> Result<PreparedConfigObservation, String> {
+    ) -> Result<PreparedConfigObservation, ConfigFailure> {
         let values = parse_values(&observation.text)?;
         let disk_faults = parse_disk_faults(&observation.text);
         let config = parse_config(&observation.text)?;
@@ -434,7 +435,8 @@ impl VersionedConfigService {
         observation: ConfigDiskObservation,
     ) -> Result<ConfigSnapshot, String> {
         let themes = Arc::clone(&self.assets.themes);
-        let prepared = Self::prepare_observation(observation, themes)?;
+        let prepared =
+            Self::prepare_observation(observation, themes).map_err(ConfigFailure::into_said)?;
         self.synchronize_prepared_observation(prepared)
     }
 
@@ -654,13 +656,14 @@ impl VersionedConfigService {
             };
         }
 
+        // A rejected patch answers its writer (Settings, Manual, `ctl settings`); no log keeps it.
         let next_config = match parse_config(&next) {
             Ok(config) => config,
-            Err(message) => return self.rejected(message),
+            Err(failure) => return self.rejected(failure.said),
         };
         let after_values = match parse_values(&next) {
             Ok(values) => values,
-            Err(message) => return self.rejected(message),
+            Err(failure) => return self.rejected(failure.said),
         };
 
         if self.config.sparkle_words != next_config.sparkle_words
@@ -812,9 +815,9 @@ impl VersionedConfigService {
     #[cfg(test)]
     pub(crate) fn replace_external(&mut self, text: String) -> Result<ConfigSnapshot, String> {
         let before = self.values.clone();
-        let after = parse_values(&text)?;
+        let after = parse_values(&text).map_err(ConfigFailure::into_said)?;
         let before_config = Arc::clone(&self.config);
-        let after_config = Arc::new(parse_config(&text)?);
+        let after_config = Arc::new(parse_config(&text).map_err(ConfigFailure::into_said)?);
         let refresh_assets =
             text == self.text || asset_sources_changed(&before_config, &after_config);
         let assets = if refresh_assets {
@@ -888,9 +891,66 @@ impl VersionedConfigService {
     }
 }
 
-fn parse_config(text: &str) -> Result<crate::app_config::Config, String> {
+fn parse_config(text: &str) -> Result<crate::app_config::Config, ConfigFailure> {
     crate::app_config::Config::parse(text)
-        .map_err(|error| format!("aterm.toml is not a valid aterm config: {error}"))
+        .map_err(|error| ConfigFailure::toml("aterm.toml is not a valid aterm config: ", &error))
+}
+
+/// A native-config failure, as a person reads it (Manual's diagnostics, the Messages row, a
+/// rejected request's answer) and as aterm.log keeps it. aterm.toml's own text (the offending
+/// line, the value a serde message quotes: [`aterm_toml::Error`]'s `Display`) is said and never
+/// logged, where the log names its position ([`aterm_toml::Error::log_words`], DESIGN §3.6);
+/// aterm's own words (a path, a worker's state) are both. It has no `Display`, so no `{}` can
+/// log the said form by accident.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConfigFailure {
+    /// What a person reads.
+    pub(crate) said: String,
+    /// What aterm.log keeps.
+    pub(crate) log: String,
+}
+
+impl ConfigFailure {
+    /// aterm.toml's text that did not parse: `head` and the error said, `head` and its position
+    /// logged.
+    pub(crate) fn toml(head: &str, error: &aterm_toml::Error) -> Self {
+        Self {
+            said: format!("{head}{error}"),
+            log: format!("{head}{}", error.log_words()),
+        }
+    }
+
+    /// What a person reads, for a caller that only shows it (a patch's answer, launch's stderr
+    /// line): a call by name, so every flow that drops the log form is one a reader can find.
+    pub(crate) fn into_said(self) -> String {
+        self.said
+    }
+
+    /// `head` before both forms.
+    #[must_use]
+    pub(crate) fn headed(self, head: &str) -> Self {
+        Self {
+            said: format!("{head}{}", self.said),
+            log: format!("{head}{}", self.log),
+        }
+    }
+}
+
+/// A failure in aterm's own words, said and logged alike.
+impl From<String> for ConfigFailure {
+    fn from(words: String) -> Self {
+        Self {
+            log: words.clone(),
+            said: words,
+        }
+    }
+}
+
+/// A failure in aterm's own words, borrowed.
+impl From<&str> for ConfigFailure {
+    fn from(words: &str) -> Self {
+        Self::from(words.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -934,10 +994,10 @@ fn decode_config_bytes(bytes: &[u8], path: &Path) -> Result<String, String> {
         .map_err(|_| format!("{} is not valid UTF-8", path.display()))
 }
 
-fn parse_values(text: &str) -> Result<BTreeMap<String, String>, String> {
+fn parse_values(text: &str) -> Result<BTreeMap<String, String>, ConfigFailure> {
     let document = text
         .parse::<aterm_toml::edit::DocumentMut>()
-        .map_err(|error| format!("existing aterm.toml is not valid TOML: {error}"))?;
+        .map_err(|error| ConfigFailure::toml("existing aterm.toml is not valid TOML: ", &error))?;
     let mut values = BTreeMap::new();
     for (key, item) in document.iter() {
         project_item(&mut values, &join_config_key_path("", key), item);
@@ -1156,7 +1216,7 @@ pub(crate) fn planned_write<'a>(
     edits: &[(&'a str, Option<String>)],
     themes: &crate::app_config::ThemeCatalog,
 ) -> Result<Option<PlannedWrite<'a>>, String> {
-    let held = parse_values(text)?;
+    let held = parse_values(text).map_err(ConfigFailure::into_said)?;
     let elide = crate::prefs::unset_equivalent_edits(text, edits, themes);
     let edits = edits
         .iter()

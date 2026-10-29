@@ -616,6 +616,7 @@ fn fact(blk: u64, start: u64, end: BlockEnd, detail: Option<&str>) -> BlockFact 
         started_ms: Some(WALL0 + start),
         end,
         detail: detail.map(str::to_string),
+        detail_final: true,
     }
 }
 
@@ -796,7 +797,12 @@ fn block_read_reports_every_block_past_the_cursor() {
     term.process(b"false\r\n\x1b]133;C\x1b\\\x1b]133;D;1\x1b\\");
     term.process(prompt);
     term.process(b"sleep 9\r\n\x1b]133;C\x1b\\");
-    let read = crate::session_status::block_read(&term, None, None, Some("sleep".into()));
+    let read = crate::session_status::block_read(
+        &term,
+        None,
+        None,
+        &crate::command_ran::Ran::running(&["sleep"]),
+    );
     let ends: Vec<(u64, Option<i32>, bool)> = read
         .facts
         .iter()
@@ -815,7 +821,12 @@ fn block_read_reports_every_block_past_the_cursor() {
         [(0, Some(0), true), (1, Some(1), true), (2, None, true)]
     );
     assert_eq!(read.facts[2].detail.as_deref(), Some("sleep"));
-    let from_two = crate::session_status::block_read(&term, Some(2), None, Some("sleep".into()));
+    let from_two = crate::session_status::block_read(
+        &term,
+        Some(2),
+        None,
+        &crate::command_ran::Ran::running(&["sleep"]),
+    );
     assert_eq!(
         from_two.facts.iter().map(|f| f.id).collect::<Vec<_>>(),
         [2],
@@ -830,7 +841,12 @@ fn block_read_reports_every_block_past_the_cursor() {
     };
     let began = read.facts[2].started_ms.expect("C stamped");
     term.process_at(prompt, at(began + 1_000));
-    let cut = crate::session_status::block_read(&term, Some(2), None, None);
+    let cut = crate::session_status::block_read(
+        &term,
+        Some(2),
+        None,
+        &crate::command_ran::Ran::default(),
+    );
     assert_eq!(
         cut.facts.iter().map(|f| (f.id, f.end)).collect::<Vec<_>>(),
         [(
@@ -844,11 +860,26 @@ fn block_read_reports_every_block_past_the_cursor() {
         b"make\r\n\x1b]133;C\x1b\\\x1b]133;D;0\x1b\\",
         at(began + 2_000),
     );
-    let at_open = crate::session_status::block_read(&term, Some(3), Some(began + 2_000), None);
+    let at_open = crate::session_status::block_read(
+        &term,
+        Some(3),
+        Some(began + 2_000),
+        &crate::command_ran::Ran::default(),
+    );
     assert_eq!(at_open.facts.iter().map(|f| f.id).collect::<Vec<_>>(), [3]);
-    let before = crate::session_status::block_read(&term, Some(3), Some(began + 2_001), None);
+    let before = crate::session_status::block_read(
+        &term,
+        Some(3),
+        Some(began + 2_001),
+        &crate::command_ran::Ran::default(),
+    );
     assert_eq!((before.facts.len(), before.through), (0, Some(3)));
-    let unended = crate::session_status::block_read(&term, Some(2), Some(began + 1_001), None);
+    let unended = crate::session_status::block_read(
+        &term,
+        Some(2),
+        Some(began + 1_001),
+        &crate::command_ran::Ran::default(),
+    );
     assert_eq!(unended.facts.iter().map(|f| f.id).collect::<Vec<_>>(), [3]);
 }
 
@@ -861,7 +892,8 @@ fn a_finished_block_is_logged_by_its_program_alone() {
     term.process(prompt);
     term.process(b"\x1b]633;E;export QZP6SECRET2=1\x1b\\\r\n\x1b]133;C\x1b\\\x1b]133;D;0\x1b\\");
     term.process(prompt);
-    let read = crate::session_status::block_read(&term, None, None, None);
+    let read =
+        crate::session_status::block_read(&term, None, None, &crate::command_ran::Ran::default());
     assert_eq!(
         read.facts
             .iter()
@@ -883,6 +915,252 @@ fn a_finished_block_is_logged_by_its_program_alone() {
         lines.iter().all(|l| !l.contains("QZP6SECRET")),
         "no later word of a command is logged: {lines:?}"
     );
+}
+
+/// A `cmd` run's `detail=` waits for its program: a block read before the kernel was heard
+/// running it opens with none, and the detail arrives by one amend once it is confirmed (while
+/// it runs, or at its end); a builtin keeps its word at open; a word no program ran under (a
+/// command not found, a script's own name) is never written. The log, the journal (Host) and
+/// the bus (WireMeta) all hold no `QZP7` word. NEGATIVE CONTROL (scratch): `block_read` taking
+/// the text reader's candidate unconfirmed writes `detail=QZP7C1` at open.
+#[test]
+fn a_cmd_runs_detail_waits_for_its_program_and_an_unheard_word_is_never_written() {
+    use crate::command_ran::{Exec, ExecNames, Ran, Table};
+    let clock = |ms: u64| aterm_core::terminal::ClockReading {
+        monotonic: aterm_core::terminal::ClockReading::now().monotonic,
+        wall_ms: Some(WALL0 + ms),
+    };
+    // Each exec is placed in the job of the block `blk`.
+    let heard = |ran: &Ran, ms: u64, pid: i32, name: &str, blk: u64| {
+        ran.note(Exec {
+            at_ms: WALL0 + ms,
+            pid,
+            pgid: pid,
+            names: ExecNames {
+                image: Some(name.into()),
+                exec: None,
+                ..ExecNames::default()
+            },
+            during: crate::command_ran::During::Job(Some(blk)),
+        });
+    };
+    let prompt = b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\";
+    let mut term = aterm_core::terminal::Terminal::new(24, 80);
+    term.process_at(b"\x1b]7;file://localhost/w\x07", clock(90));
+    let ran = Ran::with_files(
+        Box::new(Table::default().script("/w/QZP7C5/run.sh", "/bin/sh")),
+        None,
+    );
+    let (tl, hand) = opened();
+    let sweep = |term: &aterm_core::terminal::Terminal, ms: u64| {
+        let from = tl.lock().unwrap().slog().block_cursor();
+        let read = crate::session_status::block_read(term, from, None, &ran);
+        blocks(&tl, &hand, ms, &read);
+    };
+    term.process_at(prompt, clock(100));
+    term.process_at(b"make test --token QZP7C2\r\n\x1b]133;C\x1b\\", clock(110));
+    sweep(&term, 150);
+    heard(&ran, 120, 901, "make", 0);
+    sweep(&term, 200);
+    sweep(&term, 250);
+    term.process_at(b"\x1b]133;D;0\x1b\\", clock(300));
+    sweep(&term, 400);
+
+    term.process_at(prompt, clock(500));
+    term.process_at(b"QZP7C1 --token QZP7C3\r\n\x1b]133;C\x1b\\", clock(510));
+    sweep(&term, 550);
+    term.process_at(b"\x1b]133;D;127\x1b\\", clock(560));
+    sweep(&term, 600);
+
+    term.process_at(prompt, clock(700));
+    term.process_at(
+        b"cd QZP7C4\r\n\x1b]133;C\x1b\\\x1b]133;D;0\x1b\\",
+        clock(710),
+    );
+    sweep(&term, 750);
+
+    term.process_at(prompt, clock(800));
+    term.process_at(b"./QZP7C5/run.sh\r\n\x1b]133;C\x1b\\", clock(810));
+    sweep(&term, 850);
+    heard(&ran, 820, 904, "sh", 3);
+    term.process_at(b"\x1b]133;D;0\x1b\\", clock(900));
+    sweep(&term, 950);
+
+    let got = lines_of(&tl);
+    let cmds: Vec<&str> = got
+        .iter()
+        .filter(|l| l.contains(" cmd "))
+        .map(|l| l.split(" t=").next().unwrap_or(l))
+        .collect();
+    assert_eq!(
+        cmds,
+        [
+            "2 open r1 cmd par=- blk=0 src=shell conf=strong",
+            "3 amend r1 cmd detail=make%20test src=status conf=strong",
+            "4 close r1 cmd out=ok dur_ms=190 code=0 src=shell conf=exact",
+            "5 open r2 cmd par=- blk=1 src=shell conf=strong",
+            "6 close r2 cmd out=fail dur_ms=50 code=127 src=shell conf=exact",
+            "7 open r3 cmd par=- blk=2 detail=cd src=shell conf=strong",
+            "8 close r3 cmd out=ok dur_ms=0 dur=wall code=0 src=shell conf=exact",
+            "9 open r4 cmd par=- blk=3 src=shell conf=strong",
+            "10 amend r4 cmd detail=sh src=status conf=strong",
+            "11 close r4 cmd out=ok dur_ms=90 code=0 src=shell conf=exact",
+        ],
+        "{got:#?}"
+    );
+    let g = tl.lock().unwrap();
+    let log = g.slog().log();
+    for rec in log.window() {
+        let journal = aterm_slog::encode(rec, Tier::Host).expect("fits");
+        assert!(!journal.contains("QZP7"), "journal: {journal}");
+        if rec.is_bus_class() {
+            let bus = aterm_slog::encode_bus(rec, Tier::WireMeta, 1, None).expect("fits");
+            assert!(!bus.contains("QZP7"), "bus: {bus}");
+        }
+    }
+    assert!(
+        log.window()
+            .any(|r| r.is_bus_class() && r.op == aterm_slog::Op::Amend),
+        "the amend is mirrored like the open it refines"
+    );
+}
+
+/// A stand-in read first (the `time` of `time make`, the `sh` of a script typed by path, before
+/// the program itself was heard) is written, then amended once to the program the kernel later
+/// confirms, and never again; a carried run keeps how far its detail came, so a successor amends
+/// a carried stand-in or a carried bare open too, and a carry line written before the state was
+/// kept amends nothing. NEGATIVE CONTROL (scratch): writing a detail at most once (any written
+/// detail final) fails the first list, which then holds `detail=time` alone; carrying every run
+/// as detailed fails the carried rows.
+#[test]
+fn a_stand_in_detail_is_amended_once_to_the_program_that_ran() {
+    use crate::command_ran::{Exec, ExecNames, Ran, Table, test_id};
+    let clock = |ms: u64| aterm_core::terminal::ClockReading {
+        monotonic: aterm_core::terminal::ClockReading::now().monotonic,
+        wall_ms: Some(WALL0 + ms),
+    };
+    // `sh` heard before its file was read (a stand-in), then the shell macOS's `/bin/sh` stub
+    // re-execs, its file read: the script's interpreter ran.
+    // Each exec is placed in its block's own job (a stand-in is only ever the block's own job's).
+    let heard = |ran: &Ran, ms: u64, pid: i32, name: &str, file: bool| {
+        ran.note(Exec {
+            at_ms: WALL0 + ms,
+            pid,
+            pgid: pid,
+            names: ExecNames {
+                image: Some(name.into()),
+                file: file.then(|| test_id(name)),
+                ..ExecNames::default()
+            },
+            during: crate::command_ran::During::Job(Some(u64::from(ms >= 500))),
+        });
+    };
+    let prompt = b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\";
+    let mut term = aterm_core::terminal::Terminal::new(24, 80);
+    term.process_at(b"\x1b]7;file://localhost/w\x07", clock(90));
+    let ran = Ran::with_files(
+        Box::new(
+            Table::default()
+                .program("/bin/sh", "sh")
+                .program("/private/var/select/sh", "bash")
+                .script("/w/QZP7D2/deploy.sh", "/bin/sh"),
+        ),
+        None,
+    );
+    let (tl, hand) = opened();
+    let sweep = |term: &aterm_core::terminal::Terminal, ms: u64| {
+        let from = tl.lock().unwrap().slog().block_cursor();
+        let read = crate::session_status::block_read(term, from, None, &ran);
+        blocks(&tl, &hand, ms, &read);
+    };
+    term.process_at(prompt, clock(100));
+    term.process_at(b"time make QZP7D1\r\n\x1b]133;C\x1b\\", clock(110));
+    sweep(&term, 150);
+    heard(&ran, 120, 901, "make", false);
+    sweep(&term, 200);
+    sweep(&term, 250);
+    term.process_at(b"\x1b]133;D;0\x1b\\", clock(300));
+    sweep(&term, 400);
+    term.process_at(prompt, clock(500));
+    term.process_at(b"./QZP7D2/deploy.sh\r\n\x1b]133;C\x1b\\", clock(510));
+    heard(&ran, 520, 902, "sh", false);
+    sweep(&term, 550);
+    heard(&ran, 530, 902, "bash", true);
+    term.process_at(b"\x1b]133;D;0\x1b\\", clock(600));
+    sweep(&term, 650);
+    let got = lines_of(&tl);
+    let cmds: Vec<&str> = got
+        .iter()
+        .filter(|l| l.contains(" cmd "))
+        .map(|l| l.split(" t=").next().unwrap_or(l))
+        .collect();
+    assert_eq!(
+        cmds,
+        [
+            "2 open r1 cmd par=- blk=0 detail=time src=shell conf=strong",
+            "3 amend r1 cmd detail=make src=status conf=strong",
+            "4 close r1 cmd out=ok dur_ms=190 code=0 src=shell conf=exact",
+            "5 open r2 cmd par=- blk=1 detail=sh src=shell conf=strong",
+            "6 amend r2 cmd detail=deploy.sh src=status conf=strong",
+            "7 close r2 cmd out=ok dur_ms=90 code=0 src=shell conf=exact",
+        ],
+        "{got:#?}"
+    );
+    assert!(!got.iter().any(|l| l.contains("QZP7")), "{got:#?}");
+
+    for (open, later, amended) in [
+        (None, Some(("sleep", true)), true),
+        (Some(("time", false)), Some(("make", true)), true),
+        (Some(("sleep", true)), Some(("sleep", true)), false),
+    ] {
+        let (p, store, hand) = producer();
+        let first = BlockRead {
+            facts: vec![BlockFact {
+                detail: open.map(|(d, _)| d.to_string()),
+                detail_final: open.is_some_and(|(_, f)| f),
+                ..fact(1, 100, BlockEnd::Running, None)
+            }],
+            ..BlockRead::default()
+        };
+        blocks(&p.ctx.timeline, &hand, 200, &first);
+        let (s, _store2, hand2) = hand_over(&p, &store, 5_000, true);
+        hand2.set(25_100);
+        {
+            let mut g = s.ctx.timeline.lock().unwrap();
+            let next = BlockRead {
+                facts: vec![BlockFact {
+                    detail: later.map(|(d, _)| d.to_string()),
+                    detail_final: later.is_some_and(|(_, f)| f),
+                    ..fact(1, 100, BlockEnd::Running, None)
+                }],
+                ..BlockRead::default()
+            };
+            swept_with(&mut g, &next);
+            swept_with(&mut g, &next);
+        }
+        let got = lines_of(&s.ctx.timeline);
+        let amends: Vec<&String> = got
+            .iter()
+            .filter(|l| l.contains(" amend r1 cmd detail="))
+            .collect();
+        let want = later.filter(|_| amended).map(|(d, _)| d);
+        assert_eq!(
+            amends.len(),
+            usize::from(want.is_some()),
+            "carried {open:?}, then {later:?}: {got:#?}"
+        );
+        if let Some(d) = want {
+            assert!(amends[0].contains(&format!("detail={d} ")), "{got:#?}");
+        }
+    }
+    assert_eq!(
+        Detailed::from_word(None),
+        Detailed::Program,
+        "a carry line from before the state was kept held its detail from the open"
+    );
+    for state in [Detailed::Unwritten, Detailed::StandIn, Detailed::Program] {
+        assert_eq!(Detailed::from_word(Some(state.word())), state);
+    }
 }
 
 #[test]
@@ -1845,7 +2123,16 @@ fn a_command_line_never_reaches_the_log() {
             id: 1,
             started_ms: Some(WALL0),
             end: BlockEnd::Running,
-            detail: crate::session_status::command_detail("git commit -m 'secret message'"),
+            detail: crate::session_status::command_detail(
+                "git commit -m 'secret message'",
+                &crate::command_ran::Heard::of(
+                    &crate::command_ran::Ran::default(),
+                    crate::command_ran::ran_of(&["git"]),
+                    None,
+                    None,
+                ),
+            ),
+            detail_final: true,
         }],
         ..BlockRead::default()
     };
@@ -2343,6 +2630,7 @@ fn a_command_from_before_this_process_measures_its_duration_on_the_wall() {
             started_ms: Some(began),
             end,
             detail: Some("claude".into()),
+            detail_final: true,
         }],
         ..BlockRead::default()
     };
@@ -3303,14 +3591,14 @@ fn a_burst_of_blocks_is_read_oldest_first_and_none_is_lost() {
     let mut term = aterm_core::terminal::Terminal::new(24, 80);
     commands(&mut term, 50);
     let (tl, hand) = opened();
-    let first = block_read(&term, None, None, None);
+    let first = block_read(&term, None, None, &crate::command_ran::Ran::default());
     assert_eq!(first.facts.len(), BLOCK_READ_MAX);
     assert!(first.more, "the rest is owed");
     assert_eq!(first.facts[0].id, 0, "oldest first");
     blocks(&tl, &hand, 100, &first);
     let from = tl.lock().unwrap().slog().block_cursor();
     assert_eq!(from, Some(32));
-    let rest = block_read(&term, from, None, None);
+    let rest = block_read(&term, from, None, &crate::command_ran::Ran::default());
     assert_eq!(rest.facts.len(), 18);
     assert!(!rest.more);
     blocks(&tl, &hand, 200, &rest);
@@ -3328,12 +3616,17 @@ fn a_burst_of_blocks_is_read_oldest_first_and_none_is_lost() {
     term.process(b"true again\r\n\x1b]133;C\x1b\\\x1b]133;D;0\x1b\\");
     let from = tl.lock().unwrap().slog().block_cursor();
     assert_eq!(from, Some(50));
-    let again = block_read(&term, from, None, None);
+    let again = block_read(&term, from, None, &crate::command_ran::Ran::default());
     assert_eq!(again.facts.iter().map(|f| f.id).collect::<Vec<_>>(), [50]);
     blocks(&tl, &hand, 300, &again);
     term.process(prompt);
 
-    let past = block_read(&term, None, Some(u64::MAX), None);
+    let past = block_read(
+        &term,
+        None,
+        Some(u64::MAX),
+        &crate::command_ran::Ran::default(),
+    );
     assert!(past.facts.is_empty() && !past.more);
     assert_eq!(past.through, Some(50));
 
@@ -3341,7 +3634,7 @@ fn a_burst_of_blocks_is_read_oldest_first_and_none_is_lost() {
     commands(&mut big, 1_005);
     let held = big.all_blocks().next().map(|b| b.id).expect("blocks");
     assert!(held > 0);
-    let behind = block_read(&big, Some(0), None, None);
+    let behind = block_read(&big, Some(0), None, &crate::command_ran::Ran::default());
     assert_eq!(behind.dropped, held);
     let (tl, hand) = opened();
     blocks(&tl, &hand, 100, &behind);
@@ -3352,7 +3645,10 @@ fn a_burst_of_blocks_is_read_oldest_first_and_none_is_lost() {
         "{:?}",
         lines_of(&tl)
     );
-    assert_eq!(block_read(&big, Some(held), None, None).dropped, 0);
+    assert_eq!(
+        block_read(&big, Some(held), None, &crate::command_ran::Ran::default()).dropped,
+        0
+    );
 }
 
 fn sweep_term(
@@ -3365,7 +3661,8 @@ fn sweep_term(
         let g = tl.lock().unwrap();
         (g.slog().block_cursor(), g.slog().opened_wall())
     };
-    let read = crate::session_status::block_read(term, from, since, None);
+    let read =
+        crate::session_status::block_read(term, from, since, &crate::command_ran::Ran::default());
     blocks(tl, hand, ms, &read);
 }
 
@@ -3465,7 +3762,12 @@ fn a_cleared_block_history_is_said_once_and_only_when_it_took_a_command() {
     term.process(prompt);
     term.process(b"\x1bc");
     term.process(prompt);
-    let read = crate::session_status::block_read(&term, Some(1), None, None);
+    let read = crate::session_status::block_read(
+        &term,
+        Some(1),
+        None,
+        &crate::command_ran::Ran::default(),
+    );
     assert_eq!(read.dropped, 1);
     let (tl, hand) = opened();
     blocks(&tl, &hand, 100, &read);
@@ -3542,7 +3844,12 @@ fn an_idle_clear_after_a_seen_command_writes_no_gap() {
         let mut g = tl.lock().unwrap();
         let from = g.slog().block_cursor();
         let since = g.slog().opened_wall();
-        let read = crate::session_status::block_read(term, from, since, None);
+        let read = crate::session_status::block_read(
+            term,
+            from,
+            since,
+            &crate::command_ran::Ran::default(),
+        );
         let _ = g.sweep_slog(&read, false, 100, front);
     };
     {
@@ -3594,7 +3901,7 @@ fn the_cap_owes_a_look_only_for_a_block_that_may_yet_be_a_fact() {
             term.process(prompt);
         }
         let (tl, hand) = opened();
-        let read = block_read(&term, None, None, None);
+        let read = block_read(&term, None, None, &crate::command_ran::Ran::default());
         assert_eq!(
             read.facts.len(),
             n.min(BLOCK_READ_MAX),
@@ -3712,7 +4019,8 @@ fn oracle_sweep(
         let g = tl.lock().unwrap();
         (g.slog().block_cursor(), g.slog().opened_wall())
     };
-    let mut read = crate::session_status::block_read(term, from, since, None);
+    let mut read =
+        crate::session_status::block_read(term, from, since, &crate::command_ran::Ran::default());
     mutate(&mut read);
     blocks(tl, hand, seen.ms, &read);
     let g = tl.lock().unwrap();
@@ -4942,7 +5250,12 @@ fn a_carried_block_cursor_meets_the_engine_the_successor_adopted() {
     let sweep = |tl: &Mutex<SessionTimeline>, term: &Mutex<Terminal>| {
         let mut g = tl.lock().unwrap();
         let (from, since) = (g.slog().block_cursor(), g.slog().opened_wall());
-        let read = crate::session_status::block_read(&crate::term_lock(term), from, since, None);
+        let read = crate::session_status::block_read(
+            &crate::term_lock(term),
+            from,
+            since,
+            &crate::command_ran::Ran::default(),
+        );
         let now = g.slog().now();
         g.slog_mut().shell_blocks(&read, None, now);
     };
@@ -6051,6 +6364,7 @@ fn the_always_present_host_lines_fit_the_carry_at_their_worst() {
         node: run,
         wall_from: Some(max),
         child_end: Some(now),
+        detailed: Detailed::StandIn,
     });
     s.fg = Some(FgRun {
         pgid: i32::MIN,

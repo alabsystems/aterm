@@ -198,6 +198,7 @@ fn transcript_readers_keep_allocation_proportional_to_input() {
     });
     assert!(!fold.broken());
     codex_step_rows_materialize_no_text();
+    codex_rollout_scan_and_thread_sample_bound_allocations();
 }
 
 fn codex_step_rows_materialize_no_text() {
@@ -249,4 +250,135 @@ fn codex_step_rows_materialize_no_text() {
     assert_eq!((batch.lost, batch.overflow), (0, 0));
     assert_eq!(batch.steps.len(), 8, "{:?}", batch.steps);
     assert!(!format!("{:?}", batch.steps).contains("SENTINEL"));
+}
+
+fn codex_rollout_scan_and_thread_sample_bound_allocations() {
+    use aterm_agent::ai::codex_limits::thread_sample;
+    use aterm_agent::harness::codex_rollout::conversation_rollouts;
+
+    let tmp = aterm_tempfile::Builder::new()
+        .prefix("codex-alloc-bounds-")
+        .tempdir()
+        .expect("temp dir");
+    let day = tmp.path().join("sessions/2026/10/26");
+    std::fs::create_dir_all(&day).expect("sessions dir");
+
+    let root_id = "01900000-0000-7000-8000-000000000001";
+    let now_unix = 1_790_000_000i64;
+    let started_unix = now_unix - 120;
+    let reset = now_unix + 7200;
+    let ts_open = usage::rfc3339_utc(now_unix - 110).replace('Z', ".000Z");
+    let ts_live = usage::rfc3339_utc(now_unix - 20).replace('Z', ".000Z");
+    let big_instructions = "You are Codex. Keep instructions unmaterialized. ".repeat(1400); // ~68 KB
+
+    // Active root rollout + 12 pre-start subagent rollouts (> NEWEST_READ = 6) + 1 post-start
+    // subagent rollout + 32 unrelated conversation rollouts (~2.9 MiB of `base_instructions`).
+    std::fs::write(
+        day.join(format!("rollout-2026-10-26T10-00-00-{root_id}.jsonl")),
+        format!(
+            r#"{{"timestamp":"{ts_open}","type":"session_meta","payload":{{"id":"{root_id}","session_id":"{root_id}","history_mode":"paginated","base_instructions":{{"text":"{big_instructions}"}}}}}}
+{{"timestamp":"{ts_live}","type":"event_msg","payload":{{"type":"token_count","info":null,"rate_limits":{{"limit_id":"codex","primary":{{"used_percent":41.2,"window_minutes":300,"resets_at":{reset}}},"secondary":null}}}}}}
+"#
+        ),
+    )
+    .expect("root rollout");
+
+    for i in 0..12 {
+        let sub_id = format!("01900000-0000-7000-8000-0000000001{i:02x}");
+        std::fs::write(
+            day.join(format!("rollout-2026-10-26T09-{i:02}-00-{sub_id}.jsonl")),
+            format!(
+                r#"{{"timestamp":"2026-09-21T10:00:00.000Z","type":"session_meta","payload":{{"id":"{sub_id}","session_id":"{root_id}","forked_from_id":"{root_id}","history_mode":"paginated","base_instructions":{{"text":"{big_instructions}"}}}}}}
+{{"timestamp":"2026-09-21T10:05:00.000Z","type":"event_msg","payload":{{"type":"token_count","info":null,"rate_limits":{{"limit_id":"codex","primary":{{"used_percent":99.0,"window_minutes":300,"resets_at":{reset}}},"secondary":null}}}}}}
+"#
+            ),
+        )
+        .expect("old sub rollout");
+    }
+
+    let live_sub = "01900000-0000-7000-8000-0000000002ff";
+    std::fs::write(
+        day.join(format!("rollout-2026-10-26T10-30-00-{live_sub}.jsonl")),
+        format!(
+            r#"{{"timestamp":"{ts_open}","type":"session_meta","payload":{{"id":"{live_sub}","session_id":"{root_id}","forked_from_id":"{root_id}","history_mode":"paginated","base_instructions":{{"text":"{big_instructions}"}}}}}}
+{{"timestamp":"{ts_live}","type":"event_msg","payload":{{"type":"token_count","info":null,"rate_limits":{{"limit_id":"codex","primary":{{"used_percent":62.4,"window_minutes":300,"resets_at":{reset}}},"secondary":null}}}}}}
+"#
+        ),
+    )
+    .expect("live sub rollout");
+
+    for i in 0..32 {
+        let other_id = format!("01900000-0000-7000-8000-000000003{i:03x}");
+        std::fs::write(
+            day.join(format!("rollout-2026-10-26T11-{i:02}-00-{other_id}.jsonl")),
+            format!(
+                r#"{{"timestamp":"{ts_open}","type":"session_meta","payload":{{"id":"{other_id}","session_id":"{other_id}","history_mode":"paginated","base_instructions":{{"text":"{big_instructions}"}}}}}}
+{{"timestamp":"{ts_live}","type":"event_msg","payload":{{"type":"token_count","info":null,"rate_limits":{{"limit_id":"codex","primary":{{"used_percent":5.0,"window_minutes":300,"resets_at":{reset}}},"secondary":null}}}}}}
+"#
+            ),
+        )
+        .expect("other rollout");
+    }
+
+    // 46 rollouts carry >3.1 MiB of `base_instructions`; `conversation_rollouts` reuses one
+    // scratch buffer and borrows `SessionMetaLine` ids (< 384 KiB, < 500 allocations).
+    let conv = within("conversation_rollouts", 384 * 1024, 500, || {
+        conversation_rollouts(tmp.path(), root_id)
+    });
+    assert_eq!(conv.subagents, 13);
+
+    // `thread_sample` reads `roots` + the 6 newest subagents without re-opening `session_meta`
+    // for `opening_account` and picks the live subagent's 62.4% -> 63% share (< 768 KiB, < 1000 calls).
+    let sample = within("thread_sample", 768 * 1024, 1000, || {
+        thread_sample(tmp.path(), root_id, started_unix, now_unix)
+    })
+    .expect("post-start sample");
+    assert_eq!(sample.session_pct, Some(63));
+    #[cfg(target_os = "macos")]
+    sqlite_goal_scan_bounds_allocations();
+}
+
+#[cfg(target_os = "macos")]
+fn sqlite_goal_scan_bounds_allocations() {
+    use aterm_agent::harness::goal::{Store, read_store};
+
+    let tmp = aterm_tempfile::Builder::new()
+        .prefix("sqlite-alloc-bounds-")
+        .tempdir()
+        .expect("temp dir");
+    let dir = std::fs::canonicalize(tmp.path()).expect("canonical");
+    let db = dir.join("goals.db");
+    let target = "019a0000-0000-7000-8000-0000000001f4";
+    let pad = "keep-rows-borrowed-".repeat(20);
+    let mut sql = String::from(
+        "PRAGMA page_size=4096; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;\n\
+         CREATE TABLE goals (session_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL, \
+         objective TEXT NOT NULL, status TEXT NOT NULL, percent_complete INTEGER NOT NULL);\n\
+         BEGIN;\n",
+    );
+    for i in 0..=500u32 {
+        let sid = format!("019a0000-0000-7000-8000-{i:012x}");
+        let st = if sid == target { "active" } else { "complete" };
+        sql.push_str(&format!(
+            "INSERT INTO goals VALUES ('{sid}', 'g-{i}', 'goal {i} {pad}', '{st}', 50);\n"
+        ));
+    }
+    sql.push_str("COMMIT;\n");
+    let out = aterm_uds::deadline::output_until(
+        aterm_uds::spawnfd::command("/usr/bin/sqlite3")
+            .arg(&db)
+            .arg(&sql),
+        std::time::Instant::now() + std::time::Duration::from_secs(60),
+    )
+    .expect("sqlite3 seed");
+    assert!(out.status.success(), "{out:?}");
+
+    // Scanning 500 WAL-backed rows must reuse one row buffer and borrow inline B-tree cells
+    // without per-row allocations (< 128 allocations total).
+    let got = within("goal::read_store", 2 * 1024 * 1024, 128, || {
+        read_store(Store::Muse, &db, target)
+    })
+    .expect("read_store ok")
+    .expect("active goal");
+    assert!(got.starts_with("goal 500 "));
 }

@@ -139,4 +139,34 @@ impl CellSurvey {
         by_name.retain(|_, v| v.len() > 1);
         by_name
     }
+
+    /// Third-party packages whose source directory could not be resolved
+    /// (`root_dir.is_none()`), in ascending [`PkgId`] order.
+    pub fn unmeasured_third_party(&self) -> Vec<&PkgId> {
+        self.third_party()
+            .filter(|p| self.facts.get(*p).is_none_or(|f| f.root_dir.is_none()))
+            .collect()
+    }
+
+    /// Actionable reason when any third-party package in this cell lacks an
+    /// unpacked source directory, or `None` when every third-party package was
+    /// measured on disk.
+    pub fn unmeasured_source_reason(&self) -> Option<String> {
+        let missing = self.unmeasured_third_party();
+        if missing.is_empty() {
+            return None;
+        }
+        let shown: Vec<String> = missing.iter().take(5).map(|p| p.spec()).collect();
+        let tail = if missing.len() > shown.len() {
+            format!(" (+{} more)", missing.len() - shown.len())
+        } else {
+            String::new()
+        };
+        Some(format!(
+            "{} third-party package(s) resolved with no unpacked source directory ({}{tail}); \
+             run `targo fetch --locked` so sources are unpacked instead of counting as 0 LOC",
+            missing.len(),
+            shown.join(", ")
+        ))
+    }
 }

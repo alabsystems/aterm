@@ -402,11 +402,11 @@ impl LogLine {
         out
     }
 
-    /// One line back into a record; forward-compatible (unknown keys are ignored).
+    /// One line back into a record; forward-compatible (unknown `key=value` fields are ignored).
     /// # Errors
     /// [`CodecError`] for a line that is not `m1`, is over the size cap, names an unknown kind,
-    /// lacks a required field, or has no `end=` terminator of its own (it was cut short, perhaps
-    /// with the next line glued on).
+    /// lacks a required field, carries a bare token with no `=`, or has no `end=` terminator of its
+    /// own (it was cut short, perhaps with the next line glued on).
     pub fn decode(line: &str) -> Result<Self, CodecError> {
         let line = line.strip_suffix('\n').unwrap_or(line);
         let line = line.strip_suffix('\r').unwrap_or(line);
@@ -418,7 +418,7 @@ impl LogLine {
             return Err(CodecError::NotM1);
         }
         let fields = Fields::parse(tokens);
-        if fields.0.iter().filter(|(k, _)| k == "kind").count() > 1 {
+        if fields.pairs.iter().filter(|(k, _)| k == "kind").count() > 1 {
             return Err(CodecError::Truncated);
         }
         let decoded = match fields.get("kind") {
@@ -442,7 +442,7 @@ impl LogLine {
             },
             _ => return Err(CodecError::UnknownKind),
         };
-        if fields.get("end").is_none() {
+        if fields.bare || fields.get("end").is_none() {
             return Err(CodecError::Truncated);
         }
         Ok(decoded)
@@ -495,20 +495,27 @@ fn decode_posted(fields: &Fields) -> Result<LogLine, CodecError> {
     }))
 }
 
-struct Fields(Vec<(String, String)>);
+struct Fields {
+    pairs: Vec<(String, String)>,
+    bare: bool,
+}
 
 impl Fields {
     fn parse<'a>(tokens: impl Iterator<Item = &'a str>) -> Self {
-        Self(
-            tokens
-                .filter_map(|t| t.split_once('='))
-                .map(|(k, v)| (k.to_string(), unescape(v)))
-                .collect(),
-        )
+        let mut pairs = Vec::new();
+        let mut bare = false;
+        for token in tokens {
+            if let Some((k, v)) = token.split_once('=') {
+                pairs.push((k.to_string(), unescape(v)));
+            } else {
+                bare = true;
+            }
+        }
+        Self { pairs, bare }
     }
 
     fn get(&self, key: &str) -> Option<&str> {
-        self.0
+        self.pairs
             .iter()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
@@ -800,7 +807,7 @@ impl MessageLog {
     }
 
     /// The records, oldest first.
-    #[must_use]
+    #[must_use = "consume the iterator to read the log records"]
     pub fn records(&self) -> impl DoubleEndedIterator<Item = &LogRecord> {
         self.ring.iter()
     }

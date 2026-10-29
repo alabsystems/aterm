@@ -21,6 +21,8 @@
 
 #[cfg(test)]
 aterm_durable::plain_durable_flushes_in_tests!();
+#[cfg(all(test, unix))]
+aterm_secrets::memoized_x25519_in_tests!();
 
 mod common;
 mod conformance_account_key;
@@ -29,6 +31,7 @@ mod conformance_disk_free_worker;
 mod conformance_disk_pass;
 mod conformance_disk_projected_hold;
 mod conformance_footer_model;
+mod conformance_left;
 mod conformance_login_wall;
 mod conformance_occupancy;
 mod conformance_upgrade_models;

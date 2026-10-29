@@ -308,9 +308,7 @@ pub fn build(spec: &Spec<'_>) -> Vec<u8> {
     h[params::G] = spec.g;
     h[params::T] = spec.t as u32;
     let push_bytes = |out: &mut Vec<u8>, v: &[i8]| {
-        for &x in v {
-            out.push(x as u8);
-        }
+        out.extend(v.iter().map(|&x| x as u8));
     };
     let push_words = |out: &mut Vec<u8>, v: &[i32]| {
         for &x in v {
@@ -590,11 +588,9 @@ pub const fn check(bytes: &[u8]) -> Result<ParamsView<'_>, ParamsError> {
         return Err(ParamsError::MultOutOfRange { mult });
     }
     let stored = word_at(bytes, params::QMAX);
-    if stored != qmax(mult) {
-        return Err(ParamsError::QmaxMismatch {
-            stored,
-            want: qmax(mult),
-        });
+    let want = qmax(mult);
+    if stored != want {
+        return Err(ParamsError::QmaxMismatch { stored, want });
     }
     let (b, e, h, c) = (
         dims.buckets as u64,
@@ -705,7 +701,7 @@ pub const fn check(bytes: &[u8]) -> Result<ParamsView<'_>, ParamsError> {
     let m = ((stored as i64) * (mult as i64)) >> g;
     let mut max_b1 = 0i64;
     let mut k = 0;
-    while k < b1.len() {
+    while k < dims.hidden as usize {
         let v = (b1[k] as i64).abs();
         if v > max_b1 {
             max_b1 = v;
@@ -716,7 +712,7 @@ pub const fn check(bytes: &[u8]) -> Result<ParamsView<'_>, ParamsError> {
         return Err(ParamsError::Lossy { m, max_b1, t });
     }
     let mut class = 0;
-    while class < b2.len() {
+    while class < dims.classes as usize {
         let value = b2[class];
         if (value as i64).abs() >= B2_LIMIT as i64 {
             return Err(ParamsError::B2OutOfRange {
@@ -1265,6 +1261,9 @@ fn pre_activations<A: Arith>(
     }
     let mut a = [0i32; H_CAP];
     for (j, &sj) in s[..e].iter().enumerate() {
+        if sj == 0 {
+            continue;
+        }
         let row = &p.w1[j * h..][..h];
         for (acc, &w) in a[..h].iter_mut().zip(row) {
             *acc = A::add(*acc, A::mul(sj, i32::from(w as i8)));
@@ -1296,6 +1295,9 @@ fn finish<A: Arith>(p: &ParamsView<'_>, pre: &[i32; H_CAP], out: &mut [u32]) {
     let mut logits = [0i32; C_CAP];
     logits[..c].copy_from_slice(&p.b2[..c]);
     for (k, &hk) in hid[..h].iter().enumerate() {
+        if hk == 0 {
+            continue;
+        }
         let row = &p.w2[k * c..][..c];
         for (acc, &w) in logits[..c].iter_mut().zip(row) {
             *acc = A::add(*acc, A::mul(hk, i32::from(w as i8)));

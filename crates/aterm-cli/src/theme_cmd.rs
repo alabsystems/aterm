@@ -252,11 +252,15 @@ fn parse_list_args(args: &[OsString]) -> Result<Option<ThemeListRequest>, String
         appearance: None,
         format: ThemeListFormat::Text,
     };
+    let mut format_given = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let arg = arg
             .to_str()
             .ok_or_else(|| format!("unknown argument {:?}", arg.to_string_lossy()))?;
+        if matches!(arg, "--help" | "-h") {
+            return Ok(None);
+        }
         let (flag, inline) = match arg.split_once('=') {
             Some((flag, value)) if flag.starts_with("--") => (flag, Some(value)),
             _ => (arg, None),
@@ -264,17 +268,28 @@ fn parse_list_args(args: &[OsString]) -> Result<Option<ThemeListRequest>, String
         let mut value = |flag: &str| -> Result<String, String> {
             match inline {
                 Some(value) => Ok(value.to_string()),
-                None => iter
-                    .next()
-                    .and_then(|v| v.to_str())
-                    .map(str::to_string)
-                    .ok_or_else(|| format!("{flag} needs a value")),
+                None => {
+                    let raw = iter.next().ok_or_else(|| format!("{flag} needs a value"))?;
+                    raw.to_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| format!("argument {:?} is not UTF-8", raw.to_string_lossy()))
+                }
             }
         };
         match flag {
-            "--help" | "-h" => return Ok(None),
-            "--appearance" => request.appearance = Some(appearance_value(&value(flag)?)?),
-            "--format" => request.format = format_value(&value(flag)?)?,
+            "--appearance" => {
+                if request.appearance.is_some() {
+                    return Err("list: --appearance is given twice".to_string());
+                }
+                request.appearance = Some(appearance_value(&value(flag)?)?);
+            }
+            "--format" => {
+                if format_given {
+                    return Err("list: --format is given twice".to_string());
+                }
+                request.format = format_value(&value(flag)?)?;
+                format_given = true;
+            }
             other => return Err(format!("list: unknown argument {other:?}")),
         }
     }
@@ -329,11 +344,17 @@ fn parse_import_args(args: &[OsString]) -> Result<Option<ImportArgs>, String> {
             Some("--help" | "-h") => return Ok(None),
             Some("--replace") => replace = true,
             Some("--name") => {
+                if name.is_some() {
+                    return Err("--name is given twice".to_string());
+                }
                 let value = iter.next().ok_or("--name needs a value")?;
                 name = Some(value.to_str().ok_or("--name must be UTF-8")?.to_string());
             }
             Some(flag) if flag.starts_with("--name=") => {
-                name = Some(flag.trim_start_matches("--name=").to_string());
+                if name.is_some() {
+                    return Err("--name is given twice".to_string());
+                }
+                name = flag.strip_prefix("--name=").map(str::to_string);
             }
             Some(flag) if flag.starts_with('-') && flag.len() > 1 => {
                 return Err(format!("unknown option {flag:?}"));
@@ -526,11 +547,26 @@ pub(crate) mod tests {
             vec!["list", "--appearance"],
             vec!["list", "--format", "csv"],
             vec!["list", "--format="],
+            vec!["list", "--help=extra"],
+            vec!["list", "--appearance", "dark", "--appearance", "light"],
+            vec!["list", "--format", "tsv", "--format", "text"],
         ] {
             let out = run(&args(&argv), None, &NEVER_LISTS);
             assert_eq!(out.code, 2, "{argv:?}: {out:?}");
             assert!(out.stderr.contains(USAGE), "{argv:?}");
             assert!(out.stdout.is_empty(), "{argv:?}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            let bad = OsString::from_vec(vec![0xff]);
+            let out = run(
+                &[OsString::from("list"), OsString::from("--appearance"), bad],
+                None,
+                &NEVER_LISTS,
+            );
+            assert_eq!(out.code, 2, "{out:?}");
+            assert!(out.stderr.contains("is not UTF-8"), "{}", out.stderr);
         }
     }
 
@@ -638,7 +674,22 @@ pub(crate) mod tests {
         assert_eq!(replaced.code, 0, "{replaced:?}");
         let parsed = scheme::parse_theme_str(&std::fs::read_to_string(&dest).unwrap()).unwrap();
         assert_eq!(parsed.scheme.name, "mine");
-        assert_eq!(std::fs::read_dir(&themes).unwrap().count(), 1);
+        let literal_prefix = run(
+            &args(&["import", src, "--name=--name=mine"]),
+            Some(&themes),
+            &NEVER_LISTS,
+        );
+        assert_eq!(literal_prefix.code, 0, "{literal_prefix:?}");
+        assert_eq!(
+            scheme::parse_theme_str(
+                &std::fs::read_to_string(themes.join("--name=mine.conf")).unwrap()
+            )
+            .unwrap()
+            .scheme
+            .name,
+            "--name=mine"
+        );
+        assert_eq!(std::fs::read_dir(&themes).unwrap().count(), 2);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -652,6 +703,15 @@ pub(crate) mod tests {
             vec!["import", "/nonexistent/x.conf", "--name", "default"],
             vec!["import", "/nonexistent/x.conf", "--name", "dark:x"],
             vec!["import", "/nonexistent/x.conf", "--name", "a/b"],
+            vec!["import", "/nonexistent/x.conf", "--name="],
+            vec![
+                "import",
+                "/nonexistent/x.conf",
+                "--name",
+                "a",
+                "--name",
+                "b",
+            ],
             vec!["import"],
             vec!["import", "a", "b"],
             vec!["import", "a", "--bogus"],
